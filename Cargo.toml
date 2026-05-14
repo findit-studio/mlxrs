@@ -2,6 +2,7 @@
 members = [
   "mlxrs",
   "mlxrs-sys",
+  "xtask",
 ]
 resolver = "3"
 
@@ -13,7 +14,17 @@ rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-mlxrs-sys = { path = "mlxrs-sys" }
+mlxrs-sys = { path = "mlxrs-sys", version = "0.1" }
+thiserror = "2"
+half = "2"
+smallvec = "1"
+approx = "0.5"
+static_assertions = "1"
+ctor = "1"
+trybuild = "1"
+bindgen = "0.72"
+cmake = "0.1"
+walkdir = "2"
 
 [workspace.lints.rust]
 rust_2018_idioms = "warn"
@@ -22,6 +33,16 @@ unexpected_cfgs = { level = "warn", check-cfg = [
   'cfg(all_tests)',
   'cfg(tarpaulin)',
 ] }
+
+[workspace.lints.clippy]
+redundant_clone = "deny"
+needless_collect = "deny"
+unnecessary_to_owned = "deny"
+redundant_allocation = "deny"
+needless_pass_by_value = "deny"
+large_types_passed_by_value = "deny"
+unnecessary_wraps = "deny"
+map_clone = "deny"
 
 [profile.bench]
 opt-level = 3
