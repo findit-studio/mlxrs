@@ -74,3 +74,14 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc -p mlxrs-sys --no-deps
+
+      # Bindings-drift gate: re-run xtask regen-bindings and assert the
+      # generated file matches what's committed. Catches accidental drift
+      # between the committed bindings.rs and the actual mlx-c headers (e.g.
+      # if someone bumps the vendored submodule but forgets to regen).
+      - name: Bindings-drift gate
+        env:
+          LIBCLANG_PATH: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib
+        run: |
+          cargo run -p xtask -- regen-bindings
+          git diff --exit-code mlxrs-sys/src/generated/bindings.rs
