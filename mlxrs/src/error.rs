@@ -159,7 +159,19 @@ mod init_smoke {
     );
   }
 
-  // failing_op_returns_err_not_abort lives once Array + ops::add are in
-  // place (Phase 3 sub-batches B + C). Adding here would couple this commit
-  // to Array/add, which violates the "foundation modules only" boundary.
+  #[test]
+  fn failing_op_returns_err_not_abort() {
+    // Clear stale TLS first — cargo test runs #[test] fns on the same
+    // thread within a binary; a prior failing op could leave Some(..)
+    // and produce a false-positive pass.
+    super::LAST.with(|c| *c.borrow_mut() = None);
+
+    let r = crate::Array::ones::<f32>(&(2, 2)).and_then(|a| a.reshape(&(3,)));
+
+    assert!(
+      matches!(r, Err(crate::Error::Backend { .. })),
+      "failing op aborted process or produced wrong error variant; \
+       mlx-c++ may have overwritten our handler post-ctor — got: {r:?}"
+    );
+  }
 }

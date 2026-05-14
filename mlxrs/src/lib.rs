@@ -23,6 +23,7 @@ pub use version::version;
 pub mod array;
 pub mod dtype;
 pub mod error;
+pub mod ops;
 pub mod shape;
 pub mod version;
 

@@ -9,6 +9,7 @@ use crate::error::{Result, check};
 
 pub mod construction;
 pub mod conversion;
+pub mod ops_impl;
 
 /// MLX N-dimensional array — RAII handle around an mlx-c `mlx_array`.
 #[repr(transparent)]
