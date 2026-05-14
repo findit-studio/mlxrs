@@ -1,0 +1,30 @@
+[package]
+name = "mlxrs"
+version = "0.0.0"
+edition.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/mlxrs"
+description = "MLX, MLX-LM, and MLX-VLM for Rust"
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+lm = []
+vlm = []
+audio = []
+
+[dependencies]
+
+
+[dev-dependencies]
+criterion = "0.8"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
