@@ -5,16 +5,12 @@ on:
     branches: [main, mlx]
     paths:
       - 'mlxrs-sys/**'
-      - 'vendor/mlx-c/**'
-      - 'wrapper.h'
       - 'xtask/**'
       - 'Cargo.toml'
       - '.github/workflows/mlxrs-sys.yml'
   pull_request:
     paths:
       - 'mlxrs-sys/**'
-      - 'vendor/mlx-c/**'
-      - 'wrapper.h'
       - 'xtask/**'
       - 'Cargo.toml'
       - '.github/workflows/mlxrs-sys.yml'
