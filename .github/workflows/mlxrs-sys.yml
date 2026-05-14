@@ -1,0 +1,76 @@
+name: mlxrs-sys
+
+on:
+  push:
+    branches: [main, mlx]
+    paths:
+      - 'mlxrs-sys/**'
+      - 'xtask/**'
+      - 'Cargo.toml'
+      - '.github/workflows/mlxrs-sys.yml'
+  pull_request:
+    paths:
+      - 'mlxrs-sys/**'
+      - 'xtask/**'
+      - 'Cargo.toml'
+      - '.github/workflows/mlxrs-sys.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: mlxrs-sys-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: build-test
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain (stable)
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      # Cache key uses Cargo.toml (NOT Cargo.lock) by project policy:
+      # Cargo.lock is gitignored; the dep-watch.yml weekly cron is the safety
+      # net for upstream breakage. Coarser key than the conventional
+      # hashFiles('**/Cargo.lock') — accepted trade-off, see project memory
+      # `feedback-no-cargo-lock-in-git` and `feedback-no-dependency-pinning`.
+      # The `target/` cache covers the cmake build artifacts ($OUT_DIR is
+      # under `target/`), so a hit avoids re-downloading + re-compiling MLX.
+      - name: Cache cargo registry + target (incl. cmake $OUT_DIR)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-mlxrs-sys-${{ hashFiles('**/Cargo.toml', 'mlxrs-sys/vendor/mlx-c/CMakeLists.txt', 'mlxrs-sys/build.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-mlxrs-sys-
+
+      - name: cargo fmt
+        run: cargo fmt -p mlxrs-sys -- --check
+
+      - name: cargo clippy -p mlxrs-sys
+        run: cargo clippy -p mlxrs-sys --all-targets -- -D warnings
+
+      - name: cargo build -p mlxrs-sys
+        run: cargo build -p mlxrs-sys
+
+      - name: cargo test -p mlxrs-sys
+        run: cargo test -p mlxrs-sys
+
+      - name: cargo doc -p mlxrs-sys
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p mlxrs-sys --no-deps
