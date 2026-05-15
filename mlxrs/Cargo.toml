@@ -36,3 +36,19 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "arithmetic"
+harness = false
+
+[[bench]]
+name = "reduction"
+harness = false
+
+[[bench]]
+name = "shape"
+harness = false
+
+[[bench]]
+name = "linalg"
+harness = false
