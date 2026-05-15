@@ -1,13 +1,59 @@
-//! Misc ops: argmax (Phase 3.5 template — optional axis tagged union, index output),
-//! plus clip/sort/top_k/cum*/etc. fill in Phase 4.
+//! Misc ops: argmax/argmin (Phase 3.5 optional-axis archetype, U32 output),
+//! cumulative reductions, sort/argsort/topk/partition, clip, *_like
+//! constructors, and astype.
 
 use std::ffi::c_int;
 
 use crate::{
   array::Array,
-  error::{Result, check},
+  dtype::Dtype,
+  error::{Error, Result, check},
   stream::default_stream,
 };
+
+/// RAII guard for a temporary scalar `mlx_array` (e.g. clip bounds, full_like
+/// fill value). Local twin of `array::construction::ScalarGuard`; duplicated
+/// here intentionally so this module stays self-contained — promotion to a
+/// shared helper waits for a 3rd consumer.
+struct ScalarGuard(mlxrs_sys::mlx_array);
+impl Drop for ScalarGuard {
+  fn drop(&mut self) {
+    unsafe {
+      let _ = mlxrs_sys::mlx_array_free(self.0);
+    }
+  }
+}
+
+/// Checked f32 scalar constructor. `mlx_array_new_float32` is a fallible
+/// sentinel-handle FFI: it returns NULL `ctx` on allocation failure (and may
+/// invoke the error handler on the way out). This helper:
+///   1. Installs the safe error handler before the call so a stripped or
+///      disabled `#[ctor]` cannot let the default `printf+exit` fire.
+///   2. Wraps the raw handle in `ScalarGuard` immediately on return — RAII
+///      coverage for the rare panic path between the FFI call and the null
+///      check. `ScalarGuard::drop` calls `mlx_array_free`, which is a defined
+///      no-op on a NULL `ctx` (it dispatches to `delete (T*)nullptr`), so
+///      wrapping a null handle is safe.
+///   3. Checks `ctx.is_null` and drains `error::LAST` into `Err` — the guard
+///      then drops harmlessly.
+///
+/// See `concatenate` in `ops::shape` for the same pattern on `mlx_vector_array`.
+fn checked_scalar_f32(value: f32) -> Result<ScalarGuard> {
+  crate::error::ensure_handler_installed();
+  let raw = unsafe { mlxrs_sys::mlx_array_new_float32(value) };
+  // Wrap first for RAII; see step 2 above.
+  let guard = ScalarGuard(raw);
+  if raw.ctx.is_null() {
+    return Err(
+      crate::error::LAST
+        .with(|c| c.borrow_mut().take())
+        .unwrap_or(Error::Backend {
+          message: "mlx_array_new_float32 returned NULL".into(),
+        }),
+    );
+  }
+  Ok(guard)
+}
 
 /// Index of the maximum value, optionally along `axis`. Output dtype is U32.
 ///
@@ -26,6 +72,252 @@ pub fn argmax(a: &Array, axis: Option<i32>, keepdims: bool) -> Result<Array> {
       }
       None => mlxrs_sys::mlx_argmax(&mut out.0, a.0, keepdims, default_stream()),
     }
+  })?;
+  Ok(out)
+}
+
+/// Index of the minimum value, optionally along `axis`. Output dtype is U32
+/// (same as argmax — mlx returns unsigned indices for both).
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.argmin.html).
+pub fn argmin(a: &Array, axis: Option<i32>, keepdims: bool) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe {
+    match axis {
+      Some(ax) => {
+        mlxrs_sys::mlx_argmin_axis(&mut out.0, a.0, ax as c_int, keepdims, default_stream())
+      }
+      None => mlxrs_sys::mlx_argmin(&mut out.0, a.0, keepdims, default_stream()),
+    }
+  })?;
+  Ok(out)
+}
+
+/// Cumulative sum along `axis`. `reverse` flips the scan direction;
+/// `inclusive` includes the current index in the running total.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.cumsum.html).
+pub fn cumsum(a: &Array, axis: i32, reverse: bool, inclusive: bool) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe {
+    mlxrs_sys::mlx_cumsum(
+      &mut out.0,
+      a.0,
+      axis as c_int,
+      reverse,
+      inclusive,
+      default_stream(),
+    )
+  })?;
+  Ok(out)
+}
+
+/// Cumulative product along `axis`. See [`cumsum`] for `reverse`/`inclusive`.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.cumprod.html).
+pub fn cumprod(a: &Array, axis: i32, reverse: bool, inclusive: bool) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe {
+    mlxrs_sys::mlx_cumprod(
+      &mut out.0,
+      a.0,
+      axis as c_int,
+      reverse,
+      inclusive,
+      default_stream(),
+    )
+  })?;
+  Ok(out)
+}
+
+/// Cumulative maximum along `axis`. See [`cumsum`] for `reverse`/`inclusive`.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.cummax.html).
+pub fn cummax(a: &Array, axis: i32, reverse: bool, inclusive: bool) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe {
+    mlxrs_sys::mlx_cummax(
+      &mut out.0,
+      a.0,
+      axis as c_int,
+      reverse,
+      inclusive,
+      default_stream(),
+    )
+  })?;
+  Ok(out)
+}
+
+/// Cumulative minimum along `axis`. See [`cumsum`] for `reverse`/`inclusive`.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.cummin.html).
+pub fn cummin(a: &Array, axis: i32, reverse: bool, inclusive: bool) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe {
+    mlxrs_sys::mlx_cummin(
+      &mut out.0,
+      a.0,
+      axis as c_int,
+      reverse,
+      inclusive,
+      default_stream(),
+    )
+  })?;
+  Ok(out)
+}
+
+/// Sort the flattened array in ascending order.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.sort.html).
+pub fn sort(a: &Array) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe { mlxrs_sys::mlx_sort(&mut out.0, a.0, default_stream()) })?;
+  Ok(out)
+}
+
+/// Sort along `axis` in ascending order.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.sort.html).
+pub fn sort_axis(a: &Array, axis: i32) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe { mlxrs_sys::mlx_sort_axis(&mut out.0, a.0, axis as c_int, default_stream()) })?;
+  Ok(out)
+}
+
+/// Indices that would sort the flattened array. Output dtype is U32.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.argsort.html).
+pub fn argsort(a: &Array) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe { mlxrs_sys::mlx_argsort(&mut out.0, a.0, default_stream()) })?;
+  Ok(out)
+}
+
+/// Indices that would sort along `axis`. Output dtype is U32.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.argsort.html).
+pub fn argsort_axis(a: &Array, axis: i32) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe { mlxrs_sys::mlx_argsort_axis(&mut out.0, a.0, axis as c_int, default_stream()) })?;
+  Ok(out)
+}
+
+/// Top-`k` elements of the flattened array. Returned values are unsorted
+/// among themselves (matching mlx Python semantics).
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.topk.html).
+pub fn topk(a: &Array, k: i32) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe { mlxrs_sys::mlx_topk(&mut out.0, a.0, k as c_int, default_stream()) })?;
+  Ok(out)
+}
+
+/// Top-`k` elements along `axis`. Returned values are unsorted among themselves.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.topk.html).
+pub fn topk_axis(a: &Array, k: i32, axis: i32) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe {
+    mlxrs_sys::mlx_topk_axis(&mut out.0, a.0, k as c_int, axis as c_int, default_stream())
+  })?;
+  Ok(out)
+}
+
+/// Partition the flattened array around index `kth`: elements at positions
+/// `< kth` are ≤ the `kth`-positioned element; positions `> kth` are ≥. Order
+/// within each side is unspecified.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.partition.html).
+pub fn partition(a: &Array, kth: i32) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe { mlxrs_sys::mlx_partition(&mut out.0, a.0, kth as c_int, default_stream()) })?;
+  Ok(out)
+}
+
+/// Partition along `axis` around index `kth`. See [`partition`].
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.partition.html).
+pub fn partition_axis(a: &Array, kth: i32, axis: i32) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe {
+    mlxrs_sys::mlx_partition_axis(
+      &mut out.0,
+      a.0,
+      kth as c_int,
+      axis as c_int,
+      default_stream(),
+    )
+  })?;
+  Ok(out)
+}
+
+/// Clamp every element of `a` into `[a_min, a_max]`. Bounds are themselves
+/// `mlx_array`s (broadcast against `a`); see [`clip_with_scalar`] for the
+/// scalar-bounds ergonomic form.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.clip.html).
+pub fn clip(a: &Array, a_min: &Array, a_max: &Array) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe { mlxrs_sys::mlx_clip(&mut out.0, a.0, a_min.0, a_max.0, default_stream()) })?;
+  Ok(out)
+}
+
+/// Clamp every element of `a` into `[min, max]` using f32 scalar bounds.
+/// Wraps each scalar in a temporary `mlx_array_new_float32` handle for the
+/// duration of the call.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.clip.html).
+pub fn clip_with_scalar(a: &Array, min: f32, max: f32) -> Result<Array> {
+  let lo = checked_scalar_f32(min)?;
+  let hi = checked_scalar_f32(max)?;
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe { mlxrs_sys::mlx_clip(&mut out.0, a.0, lo.0, hi.0, default_stream()) })?;
+  Ok(out)
+}
+
+/// Array of ones with the same shape and dtype as `a`.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.ones_like.html).
+pub fn ones_like(a: &Array) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe { mlxrs_sys::mlx_ones_like(&mut out.0, a.0, default_stream()) })?;
+  Ok(out)
+}
+
+/// Array of zeros with the same shape and dtype as `a`.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.zeros_like.html).
+pub fn zeros_like(a: &Array) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe { mlxrs_sys::mlx_zeros_like(&mut out.0, a.0, default_stream()) })?;
+  Ok(out)
+}
+
+/// Array filled with `value` (cast to f32 internally), with the same shape
+/// and dtype as `a`. The output dtype is `a`'s dtype; the scalar is cast
+/// during the FFI call.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.full_like.html).
+pub fn full_like(a: &Array, value: f32) -> Result<Array> {
+  let dtype = mlxrs_sys::mlx_dtype::from(a.dtype()?);
+  let scalar = checked_scalar_f32(value)?;
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe { mlxrs_sys::mlx_full_like(&mut out.0, a.0, scalar.0, dtype, default_stream()) })?;
+  Ok(out)
+}
+
+/// Cast `a` to `dtype`. Returns a new array; the source is unchanged.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.astype.html).
+pub fn astype(a: &Array, dtype: Dtype) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe {
+    mlxrs_sys::mlx_astype(
+      &mut out.0,
+      a.0,
+      mlxrs_sys::mlx_dtype::from(dtype),
+      default_stream(),
+    )
   })?;
   Ok(out)
 }
