@@ -210,8 +210,15 @@ pub fn stack_axis(arrays: &[&Array], axis: i32) -> Result<Array> {
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.split.html).
 pub fn split_sections(a: &Array, indices: &[i32], axis: i32) -> Result<Vec<Array>> {
   crate::error::ensure_handler_installed();
+  // Pre-create an empty vector_array so the FFI has a non-null ctx to write
+  // into. mlx_split_sections wraps `mlx_vector_array_set_` (see
+  // vendor/mlx-c/mlx/c/private/vector.h), which on a non-null ctx assigns
+  // INTO the existing `std::vector` rather than replacing the handle —
+  // `vec_out.ctx` is therefore stable across the FFI call and the guard
+  // captured before it correctly frees the populated vector on drop. This
+  // ordering also covers the early-return case: if `check` returns Err, the
+  // guard already owns the (possibly partial) vector and frees it.
   let mut vec_out = unsafe { mlxrs_sys::mlx_vector_array_new() };
-  // RAII-free the C-side vector_array even if a check below early-returns.
   let _vec_guard = VectorArrayGuard(vec_out);
   check(unsafe {
     mlxrs_sys::mlx_split_sections(
