@@ -1,0 +1,141 @@
+name: mlxrs
+
+on:
+  push:
+    branches: [main, mlx]
+    paths:
+      - 'mlxrs/**'
+      - 'mlxrs-sys/**'
+      - 'Cargo.toml'
+      - '.github/workflows/mlxrs.yml'
+  pull_request:
+    paths:
+      - 'mlxrs/**'
+      - 'mlxrs-sys/**'
+      - 'Cargo.toml'
+      - '.github/workflows/mlxrs.yml'
+  workflow_dispatch:
+  schedule:
+    # Coverage runs Mondays @ 04:00 UTC (NOT on every PR — too expensive on macos-14 minutes)
+    - cron: '0 4 * * 1'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: mlxrs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: build-test
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        # Pruned matrix: lm covered by audio (audio = ["lm"]); skipping lm-alone wastes minutes.
+        # `cache_suffix` is paired with `features` so the cache key avoids commas
+        # (GHA disallows them in cache keys).
+        include:
+          - features: ''
+            cache_suffix: 'default'
+          - features: 'vlm'
+            cache_suffix: 'vlm'
+          - features: 'audio'
+            cache_suffix: 'audio'
+          - features: 'lm,vlm,audio,unstable-ops-overload'
+            cache_suffix: 'all'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      # Cache key uses Cargo.toml + cmake inputs (NOT Cargo.lock — gitignored
+      # by project policy; dep-watch.yml weekly cron is the safety net).
+      # The target/ cache covers cmake's $OUT_DIR.
+      - name: Cache cargo registry + target (incl. cmake $OUT_DIR)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Cache key uses matrix.cache_suffix (NOT matrix.features — that
+          # contains commas which GHA disallows in cache keys).
+          key: ${{ runner.os }}-mlxrs-${{ matrix.cache_suffix }}-${{ hashFiles('**/Cargo.toml', 'mlxrs-sys/vendor/mlx-c/CMakeLists.txt', 'mlxrs-sys/build.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-mlxrs-${{ matrix.cache_suffix }}-
+            ${{ runner.os }}-mlxrs-
+
+      - name: cargo fmt
+        run: cargo fmt -p mlxrs -- --check
+
+      - name: cargo clippy -p mlxrs (features=${{ matrix.features }})
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo clippy -p mlxrs --all-targets -- -D warnings
+          else
+            cargo clippy -p mlxrs --all-targets --features "${{ matrix.features }}" -- -D warnings
+          fi
+
+      - name: cargo build -p mlxrs (features=${{ matrix.features }})
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo build -p mlxrs
+          else
+            cargo build -p mlxrs --features "${{ matrix.features }}"
+          fi
+
+      - name: cargo test -p mlxrs (features=${{ matrix.features }})
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo test -p mlxrs
+          else
+            cargo test -p mlxrs --features "${{ matrix.features }}"
+          fi
+
+  docs:
+    name: docs
+    runs-on: macos-14
+    needs: build-test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Rust nightly (for doc_cfg)
+        run: rustup install nightly
+      - name: cargo doc -p mlxrs --all-features
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
+        run: cargo +nightly doc -p mlxrs --all-features --no-deps
+
+  coverage:
+    name: coverage
+    runs-on: macos-14
+    if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: build-test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Rust nightly
+        run: rustup install nightly && rustup default nightly
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin
+      - name: Run tarpaulin
+        env:
+          RUSTFLAGS: --cfg tarpaulin
+        run: cargo tarpaulin -p mlxrs --all-features --out xml
+      - name: Upload to codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
