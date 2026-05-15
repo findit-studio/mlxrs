@@ -12,4 +12,19 @@ impl Array {
   pub fn addmm(&self, c: &Array, rhs: &Array, alpha: f32, beta: f32) -> Result<Array> {
     crate::ops::linalg_basic::addmm(c, self, rhs, alpha, beta)
   }
+
+  /// `self @ rhs`. See [`crate::ops::linalg_basic::matmul`].
+  pub fn matmul(&self, rhs: &Array) -> Result<Array> {
+    crate::ops::linalg_basic::matmul(self, rhs)
+  }
+
+  /// Inner product `self · rhs`. See [`crate::ops::linalg_basic::inner`].
+  pub fn inner(&self, rhs: &Array) -> Result<Array> {
+    crate::ops::linalg_basic::inner(self, rhs)
+  }
+
+  /// Outer product `self ⊗ rhs`. See [`crate::ops::linalg_basic::outer`].
+  pub fn outer(&self, rhs: &Array) -> Result<Array> {
+    crate::ops::linalg_basic::outer(self, rhs)
+  }
 }
