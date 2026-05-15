@@ -12,11 +12,11 @@ links = "mlxc"
 [build-dependencies]
 cmake.workspace = true
 walkdir.workspace = true
-bindgen = { workspace = true, optional = true }
 
-[features]
-default = []
-buildtime_bindgen = ["dep:bindgen"]
+# No buildtime bindgen feature in M1 — pre-committed bindings are the
+# canonical path. Regen via `cargo run -p xtask -- regen-bindings`. M2
+# can re-add `buildtime_bindgen` if a use case appears (would require
+# wiring a bindgen call into build.rs).
 
 [lints]
 workspace = true
