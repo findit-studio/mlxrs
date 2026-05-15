@@ -114,3 +114,52 @@ fn from_slice_rejects_overflowing_shape_product() {
     "expected Err(ShapeMismatch) on overflow, got {r:?}"
   );
 }
+
+#[test]
+fn slice_rejects_empty_axes() {
+  // Empty slice metadata would hand mlx-c a Rust dangling pointer.
+  // Codex PR #5 finding 1.
+  let a = mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let r = mlxrs::ops::indexing::slice(&a, &[], &[], &[]);
+  assert!(
+    matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    "expected Err(ShapeMismatch) on empty axes, got {r:?}"
+  );
+}
+
+#[test]
+fn slice_rejects_mismatched_lengths() {
+  // start/stop/strides must agree on length (one entry per axis).
+  let a = mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let r = mlxrs::ops::indexing::slice(&a, &[0, 0], &[1], &[1, 1]);
+  assert!(
+    matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    "expected Err(ShapeMismatch) on length mismatch, got {r:?}"
+  );
+}
+
+#[test]
+fn sum_axes_empty_returns_clone() {
+  // Empty axes = sum over no axes = identity (numpy/mlx semantics). Must
+  // short-circuit to clone instead of crossing FFI with a dangling pointer.
+  // Codex PR #5 finding 2.
+  let mut a = mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let mut r = mlxrs::ops::reduction::sum_axes(&a, &[], false).unwrap();
+  assert_eq!(r.shape(), a.shape());
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    a.to_vec::<f32>().unwrap(),
+    "sum over no axes should be identity"
+  );
+}
+
+#[test]
+fn concatenate_rejects_empty_input() {
+  // Concatenating zero arrays has no defined result; must reject before FFI.
+  // Codex PR #5 finding 3 / dangling-pointer concern for empty Vec::as_ptr().
+  let r = mlxrs::ops::shape::concatenate(&[], 0);
+  assert!(
+    matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    "expected Err(ShapeMismatch) on empty input, got {r:?}"
+  );
+}

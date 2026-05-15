@@ -4,7 +4,7 @@ use crate::{
   array::Array,
   dtype::{Dtype, Element},
   error::{Error, Result, check, check_handle},
-  shape::{IntoShape, validate_dims},
+  shape::{IntoShape, dim_ptr, validate_dims},
   stream::default_stream,
 };
 
@@ -33,7 +33,7 @@ impl Array {
       check(unsafe {
         mlxrs_sys::mlx_ones(
           &mut out.0,
-          s.as_ptr(),
+          dim_ptr(s),
           s.len(),
           mlxrs_sys::mlx_dtype::from(T::DTYPE),
           default_stream(),
@@ -51,7 +51,7 @@ impl Array {
       check(unsafe {
         mlxrs_sys::mlx_zeros(
           &mut out.0,
-          s.as_ptr(),
+          dim_ptr(s),
           s.len(),
           mlxrs_sys::mlx_dtype::from(T::DTYPE),
           default_stream(),
@@ -73,7 +73,7 @@ impl Array {
       check(unsafe {
         mlxrs_sys::mlx_full(
           &mut out.0,
-          s.as_ptr(),
+          dim_ptr(s),
           s.len(),
           scalar.0,
           mlxrs_sys::mlx_dtype::from(T::DTYPE),
@@ -171,7 +171,7 @@ impl Array {
       let arr = unsafe {
         mlxrs_sys::mlx_array_new_data(
           data.as_ptr().cast::<std::ffi::c_void>(),
-          s.as_ptr(),
+          dim_ptr(s),
           dim_i32,
           mlxrs_sys::mlx_dtype::from(T::DTYPE),
         )

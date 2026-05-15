@@ -15,8 +15,16 @@ use crate::{
 /// CANONICAL REDUCTION TEMPLATE — every reduction (mean, max, min, var, std,
 /// prod) follows this shape; just swap the `mlx_sum_axes` symbol.
 ///
+/// `axes.is_empty()` matches numpy/mlx-python semantics — sum over no axes is
+/// the identity, so we short-circuit to a refcount-sharing clone instead of
+/// crossing FFI with a Rust dangling pointer (Codex PR #5 finding 2).
+///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.sum.html).
 pub fn sum_axes(a: &Array, axes: &[i32], keepdims: bool) -> Result<Array> {
+  if axes.is_empty() {
+    let _ = keepdims; // no-op: nothing was reduced
+    return a.try_clone();
+  }
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe {
     mlxrs_sys::mlx_sum_axes(
