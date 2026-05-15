@@ -78,6 +78,35 @@ fn max_axes_keepdims_preserves_axis() {
   assert_eq!(r.shape(), vec![2, 1]);
 }
 
+#[test]
+fn max_axes_empty_on_zero_size_errors() {
+  // MLX checks size==0 BEFORE the no-axes early return for max/min, so empty
+  // axes on a zero-size array must error (not silently return a clone).
+  // Locks in the Codex PR #6 round-2 fix. Same contract for min_axes.
+  let a = Array::from_slice::<f32>(&[], &[0i32]).unwrap();
+  assert_eq!(a.size(), 0);
+  let r_max = mlxrs::ops::reduction::max_axes(&a, &[], false);
+  assert!(
+    matches!(r_max, Err(mlxrs::Error::Backend { .. })),
+    "expected Err(Backend) for max_axes(zero_size, &[]), got {r_max:?}",
+  );
+  let r_min = mlxrs::ops::reduction::min_axes(&a, &[], false);
+  assert!(
+    matches!(r_min, Err(mlxrs::Error::Backend { .. })),
+    "expected Err(Backend) for min_axes(zero_size, &[]), got {r_min:?}",
+  );
+}
+
+#[test]
+fn max_axes_empty_on_non_zero_size_is_identity() {
+  // For non-zero-size arrays, empty axes is the no-op identity (numpy
+  // semantics) — MLX agrees once it passes the size>0 check.
+  let a = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let mut r = a.max_axes(&[], false).unwrap();
+  assert_eq!(r.shape(), vec![2, 2]);
+  assert_eq!(r.to_vec::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+}
+
 // ───────── min ─────────
 
 #[test]

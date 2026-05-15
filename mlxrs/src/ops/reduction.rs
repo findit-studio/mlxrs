@@ -89,19 +89,23 @@ pub fn mean(a: &Array, keepdims: bool) -> Result<Array> {
   Ok(out)
 }
 
-/// Maximum value along the given axes. Empty `axes` is a no-op; see `sum_axes`.
+/// Maximum value along the given axes.
+///
+/// `max` errors on zero-size inputs (no defined max for an empty set). Unlike
+/// the identity-dtype reductions (`sum`/`prod`), we must NOT short-circuit
+/// `axes.is_empty()` to `try_clone` — MLX checks `a.size() == 0` BEFORE the
+/// no-axes early return, so a clone here would silently accept zero-size
+/// inputs that every other reduction path rejects (Codex PR #6 round 2).
+/// Empty axes route through `mlx_max_axes` with a `dim_ptr` sentinel.
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.max.html).
 pub fn max_axes(a: &Array, axes: &[i32], keepdims: bool) -> Result<Array> {
-  if axes.is_empty() {
-    return a.try_clone();
-  }
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe {
     mlxrs_sys::mlx_max_axes(
       &mut out.0,
       a.0,
-      axes.as_ptr() as *const c_int,
+      dim_ptr(axes),
       axes.len(),
       keepdims,
       default_stream(),
@@ -119,19 +123,19 @@ pub fn max(a: &Array, keepdims: bool) -> Result<Array> {
   Ok(out)
 }
 
-/// Minimum value along the given axes. Empty `axes` is a no-op; see `sum_axes`.
+/// Minimum value along the given axes.
+///
+/// Same contract as `max_axes`: zero-size inputs error, no `try_clone`
+/// short-circuit. See `max_axes` doc for the rationale.
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.min.html).
 pub fn min_axes(a: &Array, axes: &[i32], keepdims: bool) -> Result<Array> {
-  if axes.is_empty() {
-    return a.try_clone();
-  }
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe {
     mlxrs_sys::mlx_min_axes(
       &mut out.0,
       a.0,
-      axes.as_ptr() as *const c_int,
+      dim_ptr(axes),
       axes.len(),
       keepdims,
       default_stream(),
