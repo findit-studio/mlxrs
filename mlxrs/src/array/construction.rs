@@ -138,7 +138,17 @@ impl Array {
   /// Creates an array from a contiguous `&[T]` buffer plus shape. Buffer is COPIED.
   pub fn from_slice<T: Element>(data: &[T], shape: &impl IntoShape) -> Result<Self> {
     shape.with_shape(|s| {
-      let total: usize = s.iter().map(|&d| d as usize).product();
+      // `IntoShape` already rejects negative dims for the i32 paths, so the
+      // `as usize` cast below is well-defined. We still need `checked_mul`
+      // because release builds wrap on overflow, and three or more large
+      // dims can wrap to a small value that matches `data.len()` — handing
+      // mlx-c a buffer smaller than the shape declares.
+      let total: usize = s
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d as usize))
+        .ok_or_else(|| Error::ShapeMismatch {
+          message: format!("from_slice: shape product overflows usize for shape {s:?}"),
+        })?;
       if total != data.len() {
         return Err(Error::ShapeMismatch {
           message: format!(

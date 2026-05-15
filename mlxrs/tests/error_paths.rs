@@ -78,3 +78,39 @@ fn to_vec_works_on_contiguous_array() {
   let v = a.to_vec::<f32>().unwrap();
   assert_eq!(v, vec![1.0, 2.0, 3.0, 4.0]);
 }
+
+#[test]
+fn from_slice_rejects_negative_i32_dims() {
+  // Without the IntoShape negative-dim guard, `-1i32 as usize` becomes
+  // usize::MAX and the shape-product check would multiply that into a value
+  // that may match data.len() — handing mlx-c a buffer smaller than the
+  // shape says. Must surface as ShapeMismatch.
+  let r = mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[-1i32, 3]);
+  assert!(
+    matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    "expected Err(ShapeMismatch), got {r:?}"
+  );
+}
+
+#[test]
+fn from_slice_rejects_negative_i32_slice_dims() {
+  // Same guard for the &[i32] IntoShape path (escape hatch for runtime shapes).
+  let dims: &[i32] = &[2, -3];
+  let r = mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &dims);
+  assert!(
+    matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    "expected Err(ShapeMismatch), got {r:?}"
+  );
+}
+
+#[test]
+fn from_slice_rejects_overflowing_shape_product() {
+  // Three large positive dims whose usize product wraps in release builds.
+  // `i32::MAX^3 ≈ 9.9e27` >> `usize::MAX ≈ 1.8e19`, so wrapping is guaranteed.
+  // Without checked_mul, the wrapped value could match data.len() and pass.
+  let r = mlxrs::Array::from_slice::<f32>(&[1.0], &[i32::MAX, i32::MAX, i32::MAX]);
+  assert!(
+    matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    "expected Err(ShapeMismatch) on overflow, got {r:?}"
+  );
+}

@@ -16,12 +16,14 @@ pub trait IntoShape {
 
 impl IntoShape for &[i32] {
   fn with_shape<R>(&self, f: impl FnOnce(&[c_int]) -> Result<R>) -> Result<R> {
+    reject_negative(self)?;
     f(self)
   }
 }
 
 impl<const N: usize> IntoShape for [i32; N] {
   fn with_shape<R>(&self, f: impl FnOnce(&[c_int]) -> Result<R>) -> Result<R> {
+    reject_negative(self)?;
     f(&self[..])
   }
 }
@@ -30,6 +32,22 @@ fn convert_dim(d: usize) -> Result<c_int> {
   i32::try_from(d).map_err(|_| Error::ShapeMismatch {
     message: format!("dim {d} exceeds i32::MAX ({})", i32::MAX),
   })
+}
+
+/// Reject negative dimensions in caller-supplied i32 shapes. A negative `i32`
+/// silently sign-extends when cast to `usize` (`-1i32 as usize == usize::MAX`),
+/// which would let downstream code multiply it into the shape product and
+/// either overflow (release builds wrap) or hand mlx-c a buffer-vs-shape
+/// mismatch. This is the safe-layer boundary check.
+fn reject_negative(s: &[i32]) -> Result<()> {
+  for (i, &d) in s.iter().enumerate() {
+    if d < 0 {
+      return Err(Error::ShapeMismatch {
+        message: format!("dim[{i}] = {d} is negative; shapes must be non-negative"),
+      });
+    }
+  }
+  Ok(())
 }
 
 impl IntoShape for &[usize] {
