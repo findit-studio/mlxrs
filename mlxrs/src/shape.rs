@@ -2,44 +2,46 @@
 //!
 //! Returns `Result` so we propagate `usize > i32::MAX` as `Error::ShapeMismatch`
 //! instead of silently saturating.
+//!
+//! `IntoShape` is **sealed**: downstream crates cannot implement it. The
+//! single-source-of-truth validation lives at the FFI boundary (callers use
+//! [`validate_dims`] inside their `with_shape` callback before passing the
+//! slice to mlx-c). Sealing prevents a downstream impl from supplying a
+//! callback slice that bypasses the call-site check.
 
 use std::ffi::c_int;
 
 use crate::error::{Error, Result};
 
+mod sealed {
+  pub trait Sealed {}
+  impl Sealed for &[i32] {}
+  impl<const N: usize> Sealed for [i32; N] {}
+  impl Sealed for &[usize] {}
+  impl Sealed for (usize,) {}
+  impl Sealed for (usize, usize) {}
+  impl Sealed for (usize, usize, usize) {}
+  impl Sealed for (usize, usize, usize, usize) {}
+}
+
 /// Types that can supply an mlx-c-shaped `&[c_int]` to a callback without
-/// heap allocation (for ranks ≤ 8).
-pub trait IntoShape {
-  /// Invoke `f` with the shape as `&[c_int]`.
+/// heap allocation (for ranks ≤ 8). Sealed; not implementable downstream.
+pub trait IntoShape: sealed::Sealed {
+  /// Invoke `f` with the shape as `&[c_int]`. The caller MUST run
+  /// [`validate_dims`] on the slice before any unsafe FFI use, even though
+  /// the built-in impls validate eagerly — sealing is defense in depth, not
+  /// a substitute for the boundary check.
   fn with_shape<R>(&self, f: impl FnOnce(&[c_int]) -> Result<R>) -> Result<R>;
 }
 
-impl IntoShape for &[i32] {
-  fn with_shape<R>(&self, f: impl FnOnce(&[c_int]) -> Result<R>) -> Result<R> {
-    reject_negative(self)?;
-    f(self)
-  }
-}
-
-impl<const N: usize> IntoShape for [i32; N] {
-  fn with_shape<R>(&self, f: impl FnOnce(&[c_int]) -> Result<R>) -> Result<R> {
-    reject_negative(self)?;
-    f(&self[..])
-  }
-}
-
-fn convert_dim(d: usize) -> Result<c_int> {
-  i32::try_from(d).map_err(|_| Error::ShapeMismatch {
-    message: format!("dim {d} exceeds i32::MAX ({})", i32::MAX),
-  })
-}
-
-/// Reject negative dimensions in caller-supplied i32 shapes. A negative `i32`
-/// silently sign-extends when cast to `usize` (`-1i32 as usize == usize::MAX`),
-/// which would let downstream code multiply it into the shape product and
-/// either overflow (release builds wrap) or hand mlx-c a buffer-vs-shape
-/// mismatch. This is the safe-layer boundary check.
-fn reject_negative(s: &[i32]) -> Result<()> {
+/// FFI-boundary safety check. Reject negative dimensions before any unsafe
+/// mlx-c call. A negative `i32` silently sign-extends when cast to `usize`
+/// (`-1i32 as usize == usize::MAX`), so an unchecked dim crossing into
+/// mlx-c can produce malformed allocation/copy behavior or invalid array
+/// metadata. Every safe-layer entry point that consumes a shape slice MUST
+/// call this on the slice produced by `IntoShape::with_shape` before
+/// passing to FFI.
+pub fn validate_dims(s: &[c_int]) -> Result<()> {
   for (i, &d) in s.iter().enumerate() {
     if d < 0 {
       return Err(Error::ShapeMismatch {
@@ -48,6 +50,24 @@ fn reject_negative(s: &[i32]) -> Result<()> {
     }
   }
   Ok(())
+}
+
+impl IntoShape for &[i32] {
+  fn with_shape<R>(&self, f: impl FnOnce(&[c_int]) -> Result<R>) -> Result<R> {
+    f(self)
+  }
+}
+
+impl<const N: usize> IntoShape for [i32; N] {
+  fn with_shape<R>(&self, f: impl FnOnce(&[c_int]) -> Result<R>) -> Result<R> {
+    f(&self[..])
+  }
+}
+
+fn convert_dim(d: usize) -> Result<c_int> {
+  i32::try_from(d).map_err(|_| Error::ShapeMismatch {
+    message: format!("dim {d} exceeds i32::MAX ({})", i32::MAX),
+  })
 }
 
 impl IntoShape for &[usize] {

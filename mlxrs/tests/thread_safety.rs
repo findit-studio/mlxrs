@@ -4,3 +4,9 @@ fn array_is_neither_send_nor_sync() {
   t.compile_fail("tests/ui-tests/no_send.rs");
   t.compile_fail("tests/ui-tests/no_sync.rs");
 }
+
+#[test]
+fn into_shape_is_sealed() {
+  let t = trybuild::TestCases::new();
+  t.compile_fail("tests/ui-tests/sealed_into_shape.rs");
+}

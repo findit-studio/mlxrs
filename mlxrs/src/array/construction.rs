@@ -4,7 +4,7 @@ use crate::{
   array::Array,
   dtype::{Dtype, Element},
   error::{Error, Result, check, check_handle},
-  shape::IntoShape,
+  shape::{IntoShape, validate_dims},
   stream::default_stream,
 };
 
@@ -28,6 +28,7 @@ impl Array {
   /// ```
   pub fn ones<T: Element>(shape: &impl IntoShape) -> Result<Self> {
     shape.with_shape(|s| {
+      validate_dims(s)?;
       let mut out = Self(unsafe { mlxrs_sys::mlx_array_new() });
       check(unsafe {
         mlxrs_sys::mlx_ones(
@@ -45,6 +46,7 @@ impl Array {
   /// Creates an array filled with zeros.
   pub fn zeros<T: Element>(shape: &impl IntoShape) -> Result<Self> {
     shape.with_shape(|s| {
+      validate_dims(s)?;
       let mut out = Self(unsafe { mlxrs_sys::mlx_array_new() });
       check(unsafe {
         mlxrs_sys::mlx_zeros(
@@ -65,6 +67,7 @@ impl Array {
   /// the scalar via `mlx_array_new_float32(value)` and frees it on return.
   pub fn full<T: Element>(shape: &impl IntoShape, value: f32) -> Result<Self> {
     shape.with_shape(|s| {
+      validate_dims(s)?;
       let scalar = ScalarGuard(unsafe { mlxrs_sys::mlx_array_new_float32(value) });
       let mut out = Self(unsafe { mlxrs_sys::mlx_array_new() });
       check(unsafe {
@@ -138,11 +141,13 @@ impl Array {
   /// Creates an array from a contiguous `&[T]` buffer plus shape. Buffer is COPIED.
   pub fn from_slice<T: Element>(data: &[T], shape: &impl IntoShape) -> Result<Self> {
     shape.with_shape(|s| {
-      // `IntoShape` already rejects negative dims for the i32 paths, so the
-      // `as usize` cast below is well-defined. We still need `checked_mul`
-      // because release builds wrap on overflow, and three or more large
-      // dims can wrap to a small value that matches `data.len()` — handing
-      // mlx-c a buffer smaller than the shape declares.
+      // FFI safety boundary: validate the slice we're about to hand to
+      // mlx_array_new_data. validate_dims rules out negative dims (so the
+      // `as usize` cast below is well-defined); checked_mul rules out
+      // release-build wrapping on the shape product, which could otherwise
+      // match data.len() and pass the equality guard with an undersized
+      // buffer.
+      validate_dims(s)?;
       let total: usize = s
         .iter()
         .try_fold(1usize, |acc, &d| acc.checked_mul(d as usize))

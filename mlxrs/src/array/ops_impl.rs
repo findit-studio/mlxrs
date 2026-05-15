@@ -5,7 +5,7 @@
 use crate::{
   array::Array,
   error::{Result, check},
-  shape::IntoShape,
+  shape::{IntoShape, validate_dims},
   stream::default_stream,
 };
 
@@ -19,6 +19,7 @@ impl Array {
   /// (the C++ side validates total-element-count equality).
   pub fn reshape(&self, shape: &impl IntoShape) -> Result<Array> {
     shape.with_shape(|s| {
+      validate_dims(s)?;
       let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
       check(unsafe {
         mlxrs_sys::mlx_reshape(&mut out.0, self.0, s.as_ptr(), s.len(), default_stream())
