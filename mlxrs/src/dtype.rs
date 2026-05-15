@@ -1,4 +1,6 @@
-//! `Dtype` enum + sealed `Element` trait. M1 ships impls for 5 types.
+//! `Dtype` enum + sealed `Element` trait. M1 shipped impls for `bool`, `i32`,
+//! `u32`, `f32`, `half::f16`; M2a extends to every non-complex variant
+//! (`u8/u16/u64/i8/i16/i64/f64/half::bf16`).
 
 use crate::error::{Error, Result, check};
 
@@ -85,9 +87,11 @@ impl From<Dtype> for mlxrs_sys::mlx_dtype {
 
 /// Sealed trait for types that can serve as `Array` elements.
 ///
-/// M1 ships impls for `bool`, `i32`, `u32`, `f32`, `half::f16`. The remaining 8
-/// dtypes (`U8/U16/U64/I8/I16/I64/BF16/Complex64`) get `Element` impls in M2a.
-/// `f64` is permanently excluded — Apple silicon Metal has no native f64.
+/// M1 ships impls for `bool`, `i32`, `u32`, `f32`, `half::f16`. M2a adds
+/// `u8`, `u16`, `u64`, `i8`, `i16`, `i64`, `f64`, `half::bf16` — covering
+/// every non-complex `Dtype` variant. `f64` lives in mlx-c's CPU-only path
+/// (Metal has no native f64); use sparingly.
+/// `Complex64` has no native Rust scalar — use `Array::astype` if needed.
 pub trait Element: sealed::Sealed + Copy + 'static {
   /// The mlx dtype this Rust type represents.
   const DTYPE: Dtype;
@@ -121,10 +125,18 @@ mod sealed {
 }
 
 impl sealed::Sealed for bool {}
-impl sealed::Sealed for i32 {}
+impl sealed::Sealed for u8 {}
+impl sealed::Sealed for u16 {}
 impl sealed::Sealed for u32 {}
+impl sealed::Sealed for u64 {}
+impl sealed::Sealed for i8 {}
+impl sealed::Sealed for i16 {}
+impl sealed::Sealed for i32 {}
+impl sealed::Sealed for i64 {}
 impl sealed::Sealed for f32 {}
+impl sealed::Sealed for f64 {}
 impl sealed::Sealed for half::f16 {}
+impl sealed::Sealed for half::bf16 {}
 
 impl Element for bool {
   const DTYPE: Dtype = Dtype::Bool;
@@ -233,6 +245,181 @@ impl Element for half::f16 {
   }
   fn sentinel_ptr() -> *const Self {
     static V: half::f16 = half::f16::ZERO;
+    &V
+  }
+}
+
+impl Element for u8 {
+  const DTYPE: Dtype = Dtype::U8;
+  unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
+    let mut out: u8 = 0;
+    check(unsafe { mlxrs_sys::mlx_array_item_uint8(&mut out, arr) })?;
+    Ok(out)
+  }
+  unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    unsafe {
+      (
+        mlxrs_sys::mlx_array_data_uint8(arr),
+        mlxrs_sys::mlx_array_size(arr),
+      )
+    }
+  }
+  fn sentinel_ptr() -> *const Self {
+    static V: u8 = 0;
+    &V
+  }
+}
+
+impl Element for u16 {
+  const DTYPE: Dtype = Dtype::U16;
+  unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
+    let mut out: u16 = 0;
+    check(unsafe { mlxrs_sys::mlx_array_item_uint16(&mut out, arr) })?;
+    Ok(out)
+  }
+  unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    unsafe {
+      (
+        mlxrs_sys::mlx_array_data_uint16(arr),
+        mlxrs_sys::mlx_array_size(arr),
+      )
+    }
+  }
+  fn sentinel_ptr() -> *const Self {
+    static V: u16 = 0;
+    &V
+  }
+}
+
+impl Element for u64 {
+  const DTYPE: Dtype = Dtype::U64;
+  unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
+    let mut out: u64 = 0;
+    check(unsafe { mlxrs_sys::mlx_array_item_uint64(&mut out, arr) })?;
+    Ok(out)
+  }
+  unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    unsafe {
+      (
+        mlxrs_sys::mlx_array_data_uint64(arr),
+        mlxrs_sys::mlx_array_size(arr),
+      )
+    }
+  }
+  fn sentinel_ptr() -> *const Self {
+    static V: u64 = 0;
+    &V
+  }
+}
+
+impl Element for i8 {
+  const DTYPE: Dtype = Dtype::I8;
+  unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
+    let mut out: i8 = 0;
+    check(unsafe { mlxrs_sys::mlx_array_item_int8(&mut out, arr) })?;
+    Ok(out)
+  }
+  unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    unsafe {
+      (
+        mlxrs_sys::mlx_array_data_int8(arr),
+        mlxrs_sys::mlx_array_size(arr),
+      )
+    }
+  }
+  fn sentinel_ptr() -> *const Self {
+    static V: i8 = 0;
+    &V
+  }
+}
+
+impl Element for i16 {
+  const DTYPE: Dtype = Dtype::I16;
+  unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
+    let mut out: i16 = 0;
+    check(unsafe { mlxrs_sys::mlx_array_item_int16(&mut out, arr) })?;
+    Ok(out)
+  }
+  unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    unsafe {
+      (
+        mlxrs_sys::mlx_array_data_int16(arr),
+        mlxrs_sys::mlx_array_size(arr),
+      )
+    }
+  }
+  fn sentinel_ptr() -> *const Self {
+    static V: i16 = 0;
+    &V
+  }
+}
+
+impl Element for i64 {
+  const DTYPE: Dtype = Dtype::I64;
+  unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
+    let mut out: i64 = 0;
+    check(unsafe { mlxrs_sys::mlx_array_item_int64(&mut out, arr) })?;
+    Ok(out)
+  }
+  unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    unsafe {
+      (
+        mlxrs_sys::mlx_array_data_int64(arr),
+        mlxrs_sys::mlx_array_size(arr),
+      )
+    }
+  }
+  fn sentinel_ptr() -> *const Self {
+    static V: i64 = 0;
+    &V
+  }
+}
+
+impl Element for f64 {
+  const DTYPE: Dtype = Dtype::F64;
+  unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
+    let mut out: f64 = 0.0;
+    check(unsafe { mlxrs_sys::mlx_array_item_float64(&mut out, arr) })?;
+    Ok(out)
+  }
+  unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    unsafe {
+      (
+        mlxrs_sys::mlx_array_data_float64(arr),
+        mlxrs_sys::mlx_array_size(arr),
+      )
+    }
+  }
+  fn sentinel_ptr() -> *const Self {
+    static V: f64 = 0.0;
+    &V
+  }
+}
+
+// half::bf16 — bindgen exposes bfloat16_t as a plain `u16` (not a newtype, see
+// `mlxrs_sys::bfloat16_t = u16`). half::bf16 is a #[repr(transparent)] newtype
+// around u16. Both are 16-bit brain-float with identical layout. transmute_copy
+// matches the f16 pattern and avoids relying on bfloat16_t's internal layout
+// staying a bare u16 across bindgen revs.
+impl Element for half::bf16 {
+  const DTYPE: Dtype = Dtype::BF16;
+  unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
+    let mut raw: mlxrs_sys::bfloat16_t = unsafe { std::mem::zeroed() };
+    check(unsafe { mlxrs_sys::mlx_array_item_bfloat16(&mut raw, arr) })?;
+    // SAFETY: bfloat16_t and half::bf16 are both 16-bit (the former a bindgen
+    // typedef of u16, the latter a #[repr(transparent)] newtype around u16).
+    Ok(unsafe { std::mem::transmute_copy(&raw) })
+  }
+  unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    unsafe {
+      (
+        mlxrs_sys::mlx_array_data_bfloat16(arr) as *const half::bf16,
+        mlxrs_sys::mlx_array_size(arr),
+      )
+    }
+  }
+  fn sentinel_ptr() -> *const Self {
+    static V: half::bf16 = half::bf16::ZERO;
     &V
   }
 }
