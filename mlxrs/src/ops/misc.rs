@@ -26,15 +26,22 @@ impl Drop for ScalarGuard {
 
 /// Checked f32 scalar constructor. `mlx_array_new_float32` is a fallible
 /// sentinel-handle FFI: it returns NULL `ctx` on allocation failure (and may
-/// invoke the error handler on the way out). This helper installs the safe
-/// error handler before the call so a stripped/disabled `#[ctor]` cannot let
-/// the default `printf+exit` fire, drains the captured backend error if the
-/// returned handle is null, and only then wraps in `ScalarGuard`. Codex PR #8
-/// finding — see `concatenate` in `ops::shape` for the same handler-install +
-/// null-ctx-drain pattern on a different fallible constructor.
+/// invoke the error handler on the way out). This helper:
+///   1. Installs the safe error handler before the call so a stripped or
+///      disabled `#[ctor]` cannot let the default `printf+exit` fire.
+///   2. Wraps the raw handle in `ScalarGuard` immediately on return — RAII
+///      coverage for the rare panic path between the FFI call and the null
+///      check. `ScalarGuard::drop` calls `mlx_array_free`, which is a defined
+///      no-op on a NULL `ctx` (it dispatches to `delete (T*)nullptr`), so
+///      wrapping a null handle is safe.
+///   3. Checks `ctx.is_null` and drains `error::LAST` into `Err` — the guard
+///      then drops harmlessly.
+///
+/// See `concatenate` in `ops::shape` for the same pattern on `mlx_vector_array`.
 fn checked_scalar_f32(value: f32) -> Result<ScalarGuard> {
   crate::error::ensure_handler_installed();
   let raw = unsafe { mlxrs_sys::mlx_array_new_float32(value) };
+  // Wrap first for RAII; see step 2 above.
   let guard = ScalarGuard(raw);
   if raw.ctx.is_null() {
     return Err(
@@ -290,7 +297,7 @@ pub fn zeros_like(a: &Array) -> Result<Array> {
 /// and dtype as `a`. The output dtype is `a`'s dtype; the scalar is cast
 /// during the FFI call.
 ///
-/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.full.html).
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.full_like.html).
 pub fn full_like(a: &Array, value: f32) -> Result<Array> {
   let dtype = mlxrs_sys::mlx_dtype::from(a.dtype()?);
   let scalar = checked_scalar_f32(value)?;

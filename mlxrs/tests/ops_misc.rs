@@ -89,6 +89,64 @@ fn argsort_yields_index_permutation_u32() {
   assert_eq!(r.to_vec::<u32>().unwrap(), vec![1, 2, 0]);
 }
 
+// ───────── multi-dim no-axis: flatten contract ─────────
+//
+// The no-axis sort/argsort/topk/partition wrappers document "operating on the
+// flattened array". 1-D inputs can't distinguish flatten-first from
+// axis-default behavior; these tests use 2-D inputs and assert the output
+// shape collapses to 1-D, locking in the flatten semantics. Copilot PR #8.
+
+#[test]
+fn sort_no_axis_flattens_2d() {
+  // 2x3 input must produce a 1-D length-6 result, sorted globally.
+  let a = Array::from_slice(&[3.0_f32, 1.0, 2.0, 6.0, 4.0, 5.0], &(2, 3)).unwrap();
+  let mut r = ops::misc::sort(&a).unwrap();
+  assert_eq!(r.shape(), vec![6]);
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+  );
+}
+
+#[test]
+fn argsort_no_axis_flattens_2d() {
+  // 2x3 input must produce a 1-D length-6 index permutation.
+  let a = Array::from_slice(&[3.0_f32, 1.0, 2.0, 6.0, 4.0, 5.0], &(2, 3)).unwrap();
+  let mut r = ops::misc::argsort(&a).unwrap();
+  assert_eq!(r.shape(), vec![6]);
+  assert_eq!(r.dtype().unwrap(), Dtype::U32);
+  assert_eq!(r.to_vec::<u32>().unwrap(), vec![1, 2, 0, 4, 5, 3]);
+}
+
+#[test]
+fn topk_no_axis_flattens_2d() {
+  // 2x3 input, k=3 → 1-D length-3 result containing the 3 largest globally
+  // (set: {4,5,6}; topk doesn't sort within the result).
+  let a = Array::from_slice(&[3.0_f32, 1.0, 2.0, 6.0, 4.0, 5.0], &(2, 3)).unwrap();
+  let mut r = ops::misc::topk(&a, 3).unwrap();
+  assert_eq!(r.shape(), vec![3]);
+  let mut v = r.to_vec::<f32>().unwrap();
+  v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+  assert_eq!(v, vec![4.0, 5.0, 6.0]);
+}
+
+#[test]
+fn partition_no_axis_flattens_2d() {
+  // 2x3 input, kth=3 (over flattened length-6) → 1-D length-6 result with
+  // index 3 holding the 4th-smallest element of the whole array.
+  let a = Array::from_slice(&[3.0_f32, 1.0, 2.0, 6.0, 4.0, 5.0], &(2, 3)).unwrap();
+  let mut r = ops::misc::partition(&a, 3).unwrap();
+  assert_eq!(r.shape(), vec![6]);
+  let v = r.to_vec::<f32>().unwrap();
+  assert_eq!(v[3], 4.0); // 4th-smallest of {1,2,3,4,5,6} = 4
+  for x in &v[..3] {
+    assert!(*x <= 4.0, "lower side must be ≤ pivot, got {x}");
+  }
+  for x in &v[4..] {
+    assert!(*x >= 4.0, "upper side must be ≥ pivot, got {x}");
+  }
+}
+
 #[test]
 fn argsort_axis_per_row_u32() {
   // [[3,1,2],[6,4,5]] axis=1 → [[1,2,0],[1,2,0]]
