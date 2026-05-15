@@ -1,0 +1,153 @@
+//! Array introspection: shape, dtype, scalar/buffer extraction.
+
+use std::ffi::CStr;
+
+use crate::{
+  array::Array,
+  dtype::{Dtype, Element},
+  error::{Error, Result},
+};
+
+impl Array {
+  /// Number of dimensions.
+  pub fn ndim(&self) -> usize {
+    unsafe { mlxrs_sys::mlx_array_ndim(self.0) }
+  }
+
+  /// Total number of elements.
+  pub fn size(&self) -> usize {
+    unsafe { mlxrs_sys::mlx_array_size(self.0) }
+  }
+
+  /// Element type.
+  pub fn dtype(&self) -> Result<Dtype> {
+    Dtype::try_from(unsafe { mlxrs_sys::mlx_array_dtype(self.0) })
+  }
+
+  /// Shape as a `Vec<usize>`.
+  pub fn shape(&self) -> Vec<usize> {
+    let n = self.ndim();
+    (0..n)
+      .map(|i| unsafe { mlxrs_sys::mlx_array_dim(self.0, i as std::ffi::c_int) as usize })
+      .collect()
+  }
+
+  /// Scalar extraction. Implicitly evaluates the array (mlx requires this for data access).
+  pub fn item<T: Element>(&mut self) -> Result<T> {
+    let actual = self.dtype()?;
+    if actual != T::DTYPE {
+      return Err(Error::DtypeMismatch {
+        expected: T::DTYPE,
+        got: actual,
+      });
+    }
+    self.eval()?;
+    unsafe { T::item(self.0) }
+  }
+
+  /// Materialize the underlying buffer as `Vec<T>`. Forces eval. Errors with
+  /// `Error::NonContiguous` if the array is strided/broadcast: `mlx_array_size`
+  /// (logical element count) can exceed the contiguous storage reachable from
+  /// the data pointer for views, so reading `size` elements would read past
+  /// the allocation. M2 will add `.contiguous()` to materialize strided views.
+  pub fn to_vec<T: Element>(&mut self) -> Result<Vec<T>> {
+    let actual = self.dtype()?;
+    if actual != T::DTYPE {
+      return Err(Error::DtypeMismatch {
+        expected: T::DTYPE,
+        got: actual,
+      });
+    }
+    self.eval()?;
+    if !is_row_contiguous(self.0) {
+      return Err(Error::NonContiguous);
+    }
+    unsafe {
+      let (ptr, len) = T::data(self.0);
+      assert!(!ptr.is_null(), "mlx data pointer NULL after eval");
+      Ok(std::slice::from_raw_parts(ptr, len).to_vec())
+    }
+  }
+
+  /// Borrow the underlying buffer as `&[T]`. Forces eval. Errors with
+  /// `Error::NonContiguous` if the array is strided (post-transpose, etc.).
+  pub fn as_slice<T: Element>(&mut self) -> Result<&[T]> {
+    let actual = self.dtype()?;
+    if actual != T::DTYPE {
+      return Err(Error::DtypeMismatch {
+        expected: T::DTYPE,
+        got: actual,
+      });
+    }
+    self.eval()?;
+    if !is_row_contiguous(self.0) {
+      return Err(Error::NonContiguous);
+    }
+    unsafe {
+      let (ptr, len) = T::data(self.0);
+      assert!(!ptr.is_null(), "mlx data pointer NULL after eval");
+      Ok(std::slice::from_raw_parts(ptr, len))
+    }
+  }
+}
+
+/// Compute row-major contiguity from shape + strides. mlx-c does not expose
+/// `mlx_array_is_contiguous` directly, so we replicate the standard check:
+/// for each dim from innermost to outermost, the stride must equal the running
+/// product of trailing dims. Dims of size 1 are skipped (any stride is fine).
+fn is_row_contiguous(arr: mlxrs_sys::mlx_array) -> bool {
+  let ndim = unsafe { mlxrs_sys::mlx_array_ndim(arr) };
+  if ndim == 0 {
+    return true;
+  }
+  let shape_ptr = unsafe { mlxrs_sys::mlx_array_shape(arr) };
+  let strides_ptr = unsafe { mlxrs_sys::mlx_array_strides(arr) };
+  if shape_ptr.is_null() || strides_ptr.is_null() {
+    return false;
+  }
+  let shape = unsafe { std::slice::from_raw_parts(shape_ptr, ndim) };
+  let strides = unsafe { std::slice::from_raw_parts(strides_ptr, ndim) };
+  let mut expected: usize = 1;
+  for i in (0..ndim).rev() {
+    let dim = shape[i] as usize;
+    if dim == 1 {
+      continue;
+    }
+    if strides[i] != expected {
+      return false;
+    }
+    expected = expected.saturating_mul(dim);
+  }
+  true
+}
+
+impl std::fmt::Debug for Array {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let shape = self.shape();
+    let dtype = self.dtype().ok();
+    write!(f, "Array(shape={shape:?}, dtype={dtype:?})")
+  }
+}
+
+/// RAII guard for a temporary `mlx_string` handle (e.g. the Display buffer).
+struct StringGuard(mlxrs_sys::mlx_string);
+impl Drop for StringGuard {
+  fn drop(&mut self) {
+    unsafe {
+      let _ = mlxrs_sys::mlx_string_free(self.0);
+    }
+  }
+}
+
+impl std::fmt::Display for Array {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    crate::error::ensure_handler_installed();
+    let mut s = StringGuard(unsafe { mlxrs_sys::mlx_string_new() });
+    let rc = unsafe { mlxrs_sys::mlx_array_tostring(&mut s.0, self.0) };
+    if rc != 0 {
+      return write!(f, "Array(<tostring failed: rc={rc}>)");
+    }
+    let cstr = unsafe { CStr::from_ptr(mlxrs_sys::mlx_string_data(s.0)) };
+    write!(f, "{}", cstr.to_string_lossy())
+  }
+}
