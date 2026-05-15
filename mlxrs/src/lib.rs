@@ -60,5 +60,11 @@ pub mod audio;
 #[cfg_attr(docsrs, doc(cfg(feature = "embeddings")))]
 pub mod embeddings;
 
+/// Operator overloads (`&a + &b`, `&a - &b`, `&a * &b`, `&a / &b`, `-&a`).
+/// Gated; OFF by default. Panics on shape/dtype error — see module docs.
+#[cfg(feature = "unstable-ops-overload")]
+#[cfg_attr(docsrs, doc(cfg(feature = "unstable-ops-overload")))]
+pub mod ops_traits;
+
 // ───── internal modules below ─────
 pub(crate) mod stream; // INTERNAL: M2 lifts to public Stream

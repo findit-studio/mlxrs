@@ -19,25 +19,73 @@ MLX, MLX-LM, and MLX-VLM for Rust
 
 ## Installation
 
-- mlx only
+Core only:
 
-  ```toml
-  [dependencies]
-  mlxrs = "0.1"
-  ```
+```toml
+[dependencies]
+mlxrs = "0.1"
+```
 
-- with lm
-  
-  ```toml
-  [dependencies]
-  mlxrs = { version = "0.1", features = ["lm"] }
-  ```
+Or pick exactly one feature variant — each fills in a stub module that lands in M3-M5:
 
-- with vlm
-  
-  ```toml
-  mlxrs = { version = "0.1", features = ["vlm"] }
-  ```
+```toml
+# + LM stub (M3)
+[dependencies]
+mlxrs = { version = "0.1", features = ["lm"] }
+```
+
+```toml
+# + VLM stub (M4)
+[dependencies]
+mlxrs = { version = "0.1", features = ["vlm"] }
+```
+
+```toml
+# + audio stub (M5; implies lm)
+[dependencies]
+mlxrs = { version = "0.1", features = ["audio"] }
+```
+
+```toml
+# + embedding utilities stub (M3)
+[dependencies]
+mlxrs = { version = "0.1", features = ["embeddings"] }
+```
+
+## Platform support
+
+M1 ships `aarch64-apple-darwin` only (Apple silicon). Other platforms
+(`x86_64-apple-darwin`, Linux+CUDA, distributed) are roadmapped for M6+.
+
+## Caveats (M1)
+
+- **`Array` is `!Send` and `!Sync`** — single-thread use only. The underlying
+  C++ `array_desc` is shared by `Clone` (refcount-bumped) and mutates
+  non-atomic state internally, so cross-thread sharing is unsound without
+  external synchronization. M2 will add a `SharedArray` newtype
+  (`Arc<Mutex<Array>>`-style) with a documented cross-thread contract.
+- **GPU work is single-stream serialized per thread** — the internal
+  default-stream is per-thread and maps to one Metal command queue per
+  thread. M2 lifts `Stream` to public API for explicit lifetime + multi-stream
+  control.
+- **Async Metal kernel failures bypass `Result` and abort the process** —
+  the rc/sentinel chain only catches synchronous errors. Recovery via a
+  `set_terminate` shim is M2 work.
+- **Each thread that calls into mlxrs allocates a GPU stream that lives
+  until process exit.** mlxrs is designed for a small, long-lived worker
+  pool — patterns that spawn a fresh OS thread per request will accumulate
+  streams without bound.
+- **Operator overloads (`&a + &b`, `-&a`, etc.)** are gated behind the
+  `unstable-ops-overload` feature flag and **panic** on shape/dtype error.
+  Library authors must NEVER enable it transitively (Cargo features
+  unionize across the dep graph). End-user binaries may opt in for
+  prototyping. The fallible `a.add(&b)?` form is always available and is
+  the load-bearing API.
+- **Per-model architectures** for the `lm` / `vlm` / `audio` / `embeddings`
+  features are added per-usecase rather than bulk-ported from the upstream
+  Python projects. M3-M5 ship the support surface (loaders, tokenizers,
+  pooling, generation loops, processors, audio I/O) — not the model
+  implementations.
 
 #### License
 

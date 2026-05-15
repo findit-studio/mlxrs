@@ -1,0 +1,105 @@
+name: dep-watch
+
+# NOTE: GitHub `on.schedule` runs ONLY from the file present on the
+# *default branch* of the repository. `main` is currently the default and
+# trails the integration branch (`mlx`) until M1 ships. The cron will
+# therefore stay dormant after merging into `mlx` and only activate once
+# this file is also present on `main` (mlx -> main merge at M1 completion,
+# or a one-off cherry-pick of just this workflow to main).
+# `workflow_dispatch` works regardless and is the way to test the cron
+# manually before activation.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'   # Mondays 06:00 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  update-and-test:
+    name: cargo update + workspace test
+    runs-on: macos-14
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+
+      # Cache the cmake $OUT_DIR (libmlx.a from the FetchContent build of
+      # mlx-src — 5-10 minutes per cold rebuild) and the cargo registry.
+      # Same keying scheme as mlxrs.yml: invalidate on Cargo.toml /
+      # cmake-input change. `cargo update` may bump dep versions and force
+      # rustc to recompile dependent units, but the cmake artifact is keyed
+      # on submodule + build.rs (not Cargo.lock), so it stays cacheable
+      # across weekly runs and saves the bulk of the wall-clock cost.
+      - name: Cache cargo registry + target (incl. cmake $OUT_DIR)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-dep-watch-${{ hashFiles('**/Cargo.toml', 'mlxrs-sys/vendor/mlx-c/CMakeLists.txt', 'mlxrs-sys/build.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-dep-watch-
+            ${{ runner.os }}-mlxrs-
+
+      # Force the latest semver-compatible deps; if anything broke upstream,
+      # this is where we find out (the project gitignores Cargo.lock by
+      # policy, so this is the substitute reproducibility check).
+      - name: cargo update --recursive
+        run: cargo update --recursive
+
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      - name: On failure, manage tracking issue
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_TITLE: "dep-watch: weekly cargo update broke the build"
+        run: |
+          # Self-bootstrap the label so the very first weekly breakage isn't
+          # blocked by a missing label. --force = "create if missing, update
+          # if present" — idempotent.
+          gh -R ${{ github.repository }} label create dep-watch \
+            --description "cargo update --recursive caught a regression" \
+            --color B60205 --force
+          # Match the EXACT title (not just the label) so a future workflow
+          # adding other dep-watch-labeled issues can't be conflated with this
+          # specific cron's tracking issue.
+          EXISTING=$(gh -R ${{ github.repository }} issue list --label dep-watch --state open --search "in:title \"$ISSUE_TITLE\"" --json number,title --jq ".[] | select(.title == \"$ISSUE_TITLE\") | .number" | head -1)
+          BODY="Weekly \`cargo update --recursive\` produced a failing build on $(date -u +%F).%0A%0ARun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ -n "$EXISTING" ]; then
+            gh -R ${{ github.repository }} issue comment "$EXISTING" --body "$BODY"
+          else
+            gh -R ${{ github.repository }} issue create --label dep-watch --title "$ISSUE_TITLE" --body "$BODY"
+          fi
+
+      - name: On success, close the tracking issue (scheduled runs only)
+        # Restrict closure to scheduled runs ONLY — a manual workflow_dispatch
+        # from a passing branch must not close an issue opened by the failing
+        # scheduled cron on the default branch. Also match the EXACT title so
+        # we never close some unrelated dep-watch-labeled issue.
+        if: success() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_TITLE: "dep-watch: weekly cargo update broke the build"
+        run: |
+          OPEN=$(gh -R ${{ github.repository }} issue list --label dep-watch --state open --search "in:title \"$ISSUE_TITLE\"" --json number,title --jq ".[] | select(.title == \"$ISSUE_TITLE\") | .number")
+          for n in $OPEN; do
+            gh -R ${{ github.repository }} issue close "$n" --comment "Resolved on $(date -u +%F)."
+          done
