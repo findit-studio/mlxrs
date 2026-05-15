@@ -107,6 +107,13 @@ pub trait Element: sealed::Sealed + Copy + 'static {
   /// `array::conversion::is_row_contiguous` helper) or route through
   /// `Array::as_slice` / `Array::to_vec`, which guard.
   unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize);
+
+  /// Pointer to a real `static Self` for use as an empty-data sentinel at
+  /// FFI boundaries (e.g. `from_slice` with a zero-element shape). Casting a
+  /// `[u8]` allocation to `*const T` is not associated with a real `T`
+  /// allocation and is the same UB class the safe layer is trying to close;
+  /// each impl provides a typed static so the pointer is valid for `+0`.
+  fn sentinel_ptr() -> *const Self;
 }
 
 mod sealed {
@@ -134,6 +141,10 @@ impl Element for bool {
       )
     }
   }
+  fn sentinel_ptr() -> *const Self {
+    static V: bool = false;
+    &V
+  }
 }
 
 impl Element for i32 {
@@ -150,6 +161,10 @@ impl Element for i32 {
         mlxrs_sys::mlx_array_size(arr),
       )
     }
+  }
+  fn sentinel_ptr() -> *const Self {
+    static V: i32 = 0;
+    &V
   }
 }
 
@@ -168,6 +183,10 @@ impl Element for u32 {
       )
     }
   }
+  fn sentinel_ptr() -> *const Self {
+    static V: u32 = 0;
+    &V
+  }
 }
 
 impl Element for f32 {
@@ -184,6 +203,10 @@ impl Element for f32 {
         mlxrs_sys::mlx_array_size(arr),
       )
     }
+  }
+  fn sentinel_ptr() -> *const Self {
+    static V: f32 = 0.0;
+    &V
   }
 }
 
@@ -207,5 +230,9 @@ impl Element for half::f16 {
         mlxrs_sys::mlx_array_size(arr),
       )
     }
+  }
+  fn sentinel_ptr() -> *const Self {
+    static V: half::f16 = half::f16::ZERO;
+    &V
   }
 }

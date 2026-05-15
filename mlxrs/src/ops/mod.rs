@@ -1,7 +1,13 @@
 //! Free-fn form of mlx-c ops. Each submodule corresponds to an ops group.
 //!
-//! Phase 3 ships only `arithmetic::add` as the canonical template. Phase 3.5
-//! adds the other 6 archetypes (sum, reshape, slice, concatenate, addmm, argmax).
-//! Phase 4 fans out the rest of `ops.h` across 4 parallel branches.
+//! Phase 3.5 ships the 7 archetype templates (one per pattern). Phase 4 fans
+//! the rest of `ops.h` out across 4 parallel branches, each owning 2 groups.
 
 pub mod arithmetic;
+pub mod comparison;
+pub mod indexing;
+pub mod linalg_basic;
+pub mod logical;
+pub mod misc;
+pub mod reduction;
+pub mod shape;

@@ -52,6 +52,28 @@ pub fn validate_dims(s: &[c_int]) -> Result<()> {
   Ok(())
 }
 
+/// Static sentinel for FFI calls that would otherwise pass a Rust dangling
+/// pointer (the well-defined `NonNull::dangling()` returned by `<&[i32]>::as_ptr`
+/// on an empty slice). The C++ side calls `std::vector<int>(p, p + n)`; while
+/// `p + 0` is well-defined for any pointer in C++17+, constructing a vector
+/// from a "singular" iterator (one not associated with any allocation) is
+/// strictly UB per `[iterator.requirements.general]`. Routing empty-len cases
+/// through a real static i32 keeps the iterator non-singular without changing
+/// observed behavior — the value is never read because `n == 0`.
+static EMPTY_DIM_SENTINEL: c_int = 0;
+
+/// Returns `s.as_ptr()` for non-empty slices; otherwise a non-singular pointer
+/// into [`EMPTY_DIM_SENTINEL`]. Use at every FFI call site that passes a
+/// `(*const c_int, len)` pair to mlx-c.
+#[inline]
+pub(crate) fn dim_ptr(s: &[c_int]) -> *const c_int {
+  if s.is_empty() {
+    &EMPTY_DIM_SENTINEL as *const c_int
+  } else {
+    s.as_ptr()
+  }
+}
+
 impl IntoShape for &[i32] {
   fn with_shape<R>(&self, f: impl FnOnce(&[c_int]) -> Result<R>) -> Result<R> {
     f(self)

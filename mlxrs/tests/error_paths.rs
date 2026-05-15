@@ -114,3 +114,104 @@ fn from_slice_rejects_overflowing_shape_product() {
     "expected Err(ShapeMismatch) on overflow, got {r:?}"
   );
 }
+
+#[test]
+fn slice_rejects_len_ne_ndim() {
+  // start/stop/strides length must equal a.ndim() — passing empty against a
+  // 2-D array is the "len != ndim" failure mode, not the dangling-pointer
+  // one. (The dangling-pointer concern is now handled by dim_ptr's sentinel,
+  // so the safe-FFI boundary is closed without rejecting 0-D-scalar slicing.)
+  let a = mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let r = mlxrs::ops::indexing::slice(&a, &[], &[], &[]);
+  assert!(
+    matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    "expected Err(ShapeMismatch) on len != ndim, got {r:?}"
+  );
+}
+
+#[test]
+fn slice_rejects_mismatched_lengths() {
+  // start/stop/strides must agree on length (one entry per axis).
+  let a = mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let r = mlxrs::ops::indexing::slice(&a, &[0, 0], &[1], &[1, 1]);
+  assert!(
+    matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    "expected Err(ShapeMismatch) on length mismatch, got {r:?}"
+  );
+}
+
+#[test]
+fn slice_accepts_empty_for_zero_dim_scalar() {
+  // 0-D scalar input → all three slice arrays must be empty (one entry per
+  // axis = zero entries). Empty inputs route through dim_ptr's sentinel,
+  // not rejected. Copilot PR #5 finding.
+  let empty: [i32; 0] = [];
+  let a = mlxrs::Array::from_slice::<f32>(&[42.0], &empty).unwrap();
+  assert_eq!(a.ndim(), 0);
+  let mut r = mlxrs::ops::indexing::slice(&a, &[], &[], &[]).unwrap();
+  assert_eq!(r.shape(), Vec::<usize>::new());
+  assert_eq!(r.item::<f32>().unwrap(), 42.0);
+}
+
+#[test]
+fn sum_axes_empty_returns_clone() {
+  // Empty axes = sum over no axes = identity (numpy/mlx semantics). Must
+  // short-circuit to clone instead of crossing FFI with a dangling pointer.
+  // Codex PR #5 finding 2.
+  let mut a = mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let mut r = mlxrs::ops::reduction::sum_axes(&a, &[], false).unwrap();
+  assert_eq!(r.shape(), a.shape());
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    a.to_vec::<f32>().unwrap(),
+    "sum over no axes should be identity"
+  );
+}
+
+#[test]
+fn concatenate_rejects_empty_input() {
+  // Concatenating zero arrays has no defined result; must reject before FFI.
+  // Codex PR #5 finding 3 / dangling-pointer concern for empty Vec::as_ptr().
+  let r = mlxrs::ops::shape::concatenate(&[], 0);
+  assert!(
+    matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    "expected Err(ShapeMismatch) on empty input, got {r:?}"
+  );
+}
+
+#[test]
+fn from_slice_zero_element_uses_sentinel() {
+  // Zero-element arrays are valid in numpy/mlx. The dangling-pointer concern
+  // for Rust's `<&[T]>::as_ptr()` on an empty slice still needs a sentinel —
+  // this exercises the data_ptr helper. Codex PR #5 round-2 finding.
+  let mut a = mlxrs::Array::from_slice::<f32>(&[], &[0i32]).unwrap();
+  assert_eq!(a.shape(), vec![0]);
+  assert_eq!(a.size(), 0);
+  // 2-D zero-element shape too.
+  let b = mlxrs::Array::from_slice::<f32>(&[], &[2i32, 0]).unwrap();
+  assert_eq!(b.shape(), vec![2, 0]);
+  assert_eq!(b.size(), 0);
+  // to_vec on a zero-element contiguous array is just an empty Vec.
+  assert_eq!(a.to_vec::<f32>().unwrap(), Vec::<f32>::new());
+}
+
+#[test]
+fn from_slice_zero_element_all_element_types() {
+  // Every Element impl provides its own typed sentinel (Codex PR #5 round-3
+  // finding). Verify each compiles + constructs without UB.
+  let mut b = mlxrs::Array::from_slice::<bool>(&[], &[0i32]).unwrap();
+  assert_eq!(b.shape(), vec![0]);
+  assert_eq!(b.to_vec::<bool>().unwrap(), Vec::<bool>::new());
+
+  let mut i = mlxrs::Array::from_slice::<i32>(&[], &[0i32]).unwrap();
+  assert_eq!(i.shape(), vec![0]);
+  assert_eq!(i.to_vec::<i32>().unwrap(), Vec::<i32>::new());
+
+  let mut u = mlxrs::Array::from_slice::<u32>(&[], &[0i32]).unwrap();
+  assert_eq!(u.shape(), vec![0]);
+  assert_eq!(u.to_vec::<u32>().unwrap(), Vec::<u32>::new());
+
+  let mut h = mlxrs::Array::from_slice::<half::f16>(&[], &[0i32]).unwrap();
+  assert_eq!(h.shape(), vec![0]);
+  assert_eq!(h.to_vec::<half::f16>().unwrap(), Vec::<half::f16>::new());
+}

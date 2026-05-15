@@ -1,15 +1,15 @@
-error[E0277]: the trait bound `EvilShape: shape::sealed::Sealed` is not satisfied
+error[E0277]: the trait bound `EvilShape: mlxrs::shape::sealed::Sealed` is not satisfied
  --> tests/ui-tests/sealed_into_shape.rs:8:27
   |
 8 | impl mlxrs::IntoShape for EvilShape {
   |                           ^^^^^^^^^ unsatisfied trait bound
   |
-help: the trait `shape::sealed::Sealed` is not implemented for `EvilShape`
+help: the trait `mlxrs::shape::sealed::Sealed` is not implemented for `EvilShape`
  --> tests/ui-tests/sealed_into_shape.rs:6:1
   |
 6 | struct EvilShape;
   | ^^^^^^^^^^^^^^^^
-  = help: the following other types implement trait `shape::sealed::Sealed`:
+  = help: the following other types implement trait `mlxrs::shape::sealed::Sealed`:
             &[i32]
             &[usize]
             (usize, usize)

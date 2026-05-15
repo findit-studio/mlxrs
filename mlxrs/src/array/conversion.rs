@@ -64,6 +64,12 @@ impl Array {
     }
     unsafe {
       let (ptr, len) = T::data(self.0);
+      // Zero-element arrays (shape `[0]`, `[2,0]`, ...) yield NULL from mlx;
+      // `from_raw_parts(NULL, 0)` is UB per Rust's slice contract, so return
+      // an empty Vec without touching the pointer.
+      if len == 0 {
+        return Ok(Vec::new());
+      }
       assert!(!ptr.is_null(), "mlx data pointer NULL after eval");
       Ok(std::slice::from_raw_parts(ptr, len).to_vec())
     }
@@ -85,6 +91,11 @@ impl Array {
     }
     unsafe {
       let (ptr, len) = T::data(self.0);
+      // Same zero-element guard as `to_vec`: NULL data ptr is legitimate
+      // when `len == 0`, and `from_raw_parts(NULL, 0)` is still UB.
+      if len == 0 {
+        return Ok(&[]);
+      }
       assert!(!ptr.is_null(), "mlx data pointer NULL after eval");
       Ok(std::slice::from_raw_parts(ptr, len))
     }
