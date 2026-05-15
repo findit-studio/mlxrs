@@ -52,8 +52,10 @@ pub enum Error {
   #[error("out of memory")]
   OutOfMemory,
 
-  /// `as_slice` called on a non-contiguous (post-transpose / strided-slice) array.
-  #[error("array is not contiguous; call .contiguous() first or use .to_vec()")]
+  /// `as_slice` or `to_vec` called on a non-contiguous (post-transpose,
+  /// broadcast, or strided-slice) array. M2 will add `.contiguous()` to
+  /// materialize a row-contiguous copy.
+  #[error("array is not contiguous; M2 will add .contiguous() to materialize")]
   NonContiguous,
 
   /// Generic backend error with the message captured from mlx-c.

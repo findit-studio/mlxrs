@@ -1,9 +1,9 @@
 //! `Array` core: RAII handle around `mlxrs_sys::mlx_array`.
 //!
 //! See `docs/superpowers/specs/` §6.2 for design rationale (Drop must not
-//! touch TLS; Clone is cheap-but-not-free; Send-only no Sync per audit).
+//! touch TLS; Clone is cheap-but-not-free; M1 is single-thread only).
 
-use static_assertions::{assert_impl_all, assert_not_impl_any};
+use static_assertions::assert_not_impl_any;
 
 use crate::error::{Result, check};
 
@@ -17,12 +17,20 @@ pub struct Array(pub(crate) mlxrs_sys::mlx_array);
 
 // Compile-time guarantees colocated with the type definition.
 //
-// `assert_not_impl_any!` is canonical in static_assertions 1.1.0.
-assert_not_impl_any!(Array: Copy);
-
-// Send is required across the safe layer. True colocation with the !Copy
-// assertion above (round-5 false-colocation fix per project memory).
-assert_impl_all!(Array: Send);
+// `Array` is intentionally `!Send` and `!Sync` in M1.
+//
+// The Phase-3 entry audit confirmed `array_desc_` is `std::shared_ptr<array_desc>`
+// (atomic refcount) and `set_status const → array_desc_->status = s` (non-atomic
+// mutation through const → `Sync` is unsound). What the audit missed is that
+// `Send` + cheap `Clone` together also break soundness even without `Sync`:
+// `Clone` produces a refcount-sharing handle (separate `Array`, same underlying
+// `array_desc`); if `Array: Send`, two clones can move to two threads where
+// each calls `eval`/`to_vec`/`item` on `&mut self`. Each thread sees a distinct
+// `&mut Array`, so `!Sync` doesn't catch it — but the underlying C++
+// `array_desc->status` write races. To preserve cheap `Clone`, `Send` must go.
+// M2 will provide an explicit cross-thread story (likely `SharedArray =
+// Arc<Mutex<Array>>` newtype with documented contract).
+assert_not_impl_any!(Array: Copy, Send, Sync);
 
 impl Drop for Array {
   fn drop(&mut self) {
@@ -47,16 +55,6 @@ impl Clone for Array {
       .expect("Array::clone: mlx_array_set failed")
   }
 }
-
-// Send: an Array can move between threads. Verified atomic refcount via
-// docs/audits/send-soundness.md (Phase-3-entry audit): array_desc_ is
-// std::shared_ptr<array_desc>, atomic by C++ standard.
-unsafe impl Send for Array {}
-
-// Sync intentionally NOT implemented. mlx C++ mutates non-atomic state
-// through `const` methods (set_status const → array_desc_->status = s);
-// two threads holding `&Array` calling eval/to_vec/item concurrently
-// would race. M2 adds SyncArray<Mutex<...>>.
 
 impl Array {
   /// Refcount-sharing clone. Returns `Result` so callers can handle the

@@ -5,7 +5,7 @@ error[E0277]: `*mut c_void` cannot be shared between threads safely
   |                 ^^^^^^^^^^^^ `*mut c_void` cannot be shared between threads safely
   |
   = help: within `mlxrs::Array`, the trait `Sync` is not implemented for `*mut c_void`
-note: required because it appears within the type `mlxrs_sys::mlx_array_`
+note: required because it appears within the type `mlxrs_sys::generated::mlx_array_`
  --> $WORKSPACE/mlxrs-sys/src/generated/bindings.rs
   |
   | pub struct mlx_array_ {

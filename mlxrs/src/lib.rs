@@ -4,9 +4,10 @@
 //! `docs/superpowers/specs/` for the full design.
 //!
 //! ## Caveats
-//! - `Array` implements `Send` but **not `Sync`** — `arrays.par_iter().map(|a| a.eval())`
-//!   does not compile. Workarounds: clone-per-worker, `Arc<Mutex<Array>>`,
-//!   `into_par_iter` on owned data. M2 adds `SyncArray`.
+//! - `Array` is **`!Send` and `!Sync`** in M1 — single-thread use only. Cross-thread
+//!   sharing requires care: the underlying C++ `array_desc` is shared by `Clone`
+//!   and mutates non-atomic state internally. M2 will provide a `SharedArray`
+//!   newtype (`Arc<Mutex<Array>>`-style) with a documented cross-thread contract.
 //! - **Async Metal kernel failures bypass `Result<T, Error>` and abort the process.**
 //!   The rc/sentinel chain only catches synchronous errors. Recovery via
 //!   `set_terminate` shim is M2 work.

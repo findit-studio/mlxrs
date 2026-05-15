@@ -45,7 +45,11 @@ impl Array {
     unsafe { T::item(self.0) }
   }
 
-  /// Materialize the underlying buffer as `Vec<T>`. Forces eval.
+  /// Materialize the underlying buffer as `Vec<T>`. Forces eval. Errors with
+  /// `Error::NonContiguous` if the array is strided/broadcast: `mlx_array_size`
+  /// (logical element count) can exceed the contiguous storage reachable from
+  /// the data pointer for views, so reading `size` elements would read past
+  /// the allocation. M2 will add `.contiguous()` to materialize strided views.
   pub fn to_vec<T: Element>(&mut self) -> Result<Vec<T>> {
     let actual = self.dtype()?;
     if actual != T::DTYPE {
@@ -55,6 +59,9 @@ impl Array {
       });
     }
     self.eval()?;
+    if !is_row_contiguous(self.0) {
+      return Err(Error::NonContiguous);
+    }
     unsafe {
       let (ptr, len) = T::data(self.0);
       assert!(!ptr.is_null(), "mlx data pointer NULL after eval");
