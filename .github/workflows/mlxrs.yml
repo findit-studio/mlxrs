@@ -35,8 +35,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Pruned matrix: lm covered by audio (audio = ["lm"]); skipping lm-alone wastes minutes
-        features: ['', 'vlm', 'audio', 'lm,vlm,audio,unstable-ops-overload']
+        # Pruned matrix: lm covered by audio (audio = ["lm"]); skipping lm-alone wastes minutes.
+        # `cache_suffix` is paired with `features` so the cache key avoids commas
+        # (GHA disallows them in cache keys).
+        include:
+          - features: ''
+            cache_suffix: 'default'
+          - features: 'vlm'
+            cache_suffix: 'vlm'
+          - features: 'audio'
+            cache_suffix: 'audio'
+          - features: 'lm,vlm,audio,unstable-ops-overload'
+            cache_suffix: 'all'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -58,9 +68,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-mlxrs-${{ matrix.features }}-${{ hashFiles('**/Cargo.toml', 'mlxrs-sys/vendor/mlx-c/CMakeLists.txt', 'mlxrs-sys/build.rs') }}
+          # Cache key uses matrix.cache_suffix (NOT matrix.features — that
+          # contains commas which GHA disallows in cache keys).
+          key: ${{ runner.os }}-mlxrs-${{ matrix.cache_suffix }}-${{ hashFiles('**/Cargo.toml', 'mlxrs-sys/vendor/mlx-c/CMakeLists.txt', 'mlxrs-sys/build.rs') }}
           restore-keys: |
-            ${{ runner.os }}-mlxrs-${{ matrix.features }}-
+            ${{ runner.os }}-mlxrs-${{ matrix.cache_suffix }}-
             ${{ runner.os }}-mlxrs-
 
       - name: cargo fmt
