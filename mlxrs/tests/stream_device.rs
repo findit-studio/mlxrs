@@ -180,15 +180,11 @@ fn device_can_move_to_another_thread() {
   assert_eq!(handle.join().unwrap(), DeviceKind::Cpu);
 }
 
-#[test]
-fn cpu_stream_can_move_to_another_thread() {
-  // Use a CPU stream — GPU streams are per-thread on the mlx-c++ side
-  // (CommandEncoder TLS), so eval would fail cross-thread. The CPU path
-  // does not have that constraint; we exercise it for the Send check.
-  let s = Stream::default_cpu().unwrap();
-  let handle = std::thread::spawn(move || s.device().unwrap().kind().unwrap());
-  assert_eq!(handle.join().unwrap(), DeviceKind::Cpu);
-}
+// NOTE: there is intentionally NO "stream can move to another thread" test.
+// `Stream` is `!Send + !Sync` (mlx-c++ keys CommandEncoders by thread; even
+// the CPU path is not worth exposing as cross-thread-movable when the GPU
+// path silently fails). Compile-fail coverage lives in
+// `tests/ui-tests/stream_no_send.rs` + `stream_no_sync.rs`. Codex PR #13.
 
 #[test]
 fn device_can_be_shared_across_threads() {

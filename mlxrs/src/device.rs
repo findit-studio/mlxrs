@@ -145,9 +145,21 @@ impl Device {
     Ok(out)
   }
 
-  /// Install `self` as the process-wide default device. Subsequent ops that
-  /// don't take an explicit stream/device will use this. Wraps
+  /// Install `self` as the mlx-c++ process-wide default device. Wraps
   /// `mlx_set_default_device`.
+  ///
+  /// **Limitation (read before relying on this):** this sets the *mlx-c++*
+  /// global default, which only affects FFI calls that are passed the
+  /// implicit/global stream. mlxrs's own ops do NOT consult it — every
+  /// safe-layer op routes through an internal per-thread default **GPU**
+  /// stream (`stream::default_stream`) that is created once and never
+  /// re-derived from `Device::current()`. So `Device::gpu().set_default()`
+  /// is a no-op for mlxrs ops (they were already on GPU) and
+  /// `Device::cpu().set_default()` will NOT move existing mlxrs ops to the
+  /// CPU. Explicit per-op device/stream selection is a future-milestone API
+  /// (ops do not yet take a stream argument). This method is provided for
+  /// (a) interop with raw `mlxrs-sys` FFI calls and (b) forward-compat with
+  /// that future API.
   pub fn set_default(&self) -> Result<()> {
     ensure_handler_installed();
     check(unsafe { mlxrs_sys::mlx_set_default_device(self.0) })

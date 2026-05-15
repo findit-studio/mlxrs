@@ -27,7 +27,7 @@
 
 use std::{cell::Cell, ffi::CStr};
 
-use static_assertions::assert_impl_all;
+use static_assertions::assert_not_impl_any;
 
 use crate::{
   device::Device,
@@ -82,25 +82,31 @@ pub(crate) fn default_stream() -> mlxrs_sys::mlx_stream {
 /// [`Stream::new_on`]. Drop calls `mlx_stream_free`.
 ///
 /// ## Threading
-/// `Stream: Send + Sync` is sound (the underlying `mlx::core::Stream` is
-/// `{int, Device}` POD with no mutable shared state — verified in
-/// `docs/audits/send-soundness.md`). However, mlx-c++ stores per-thread
-/// default-stream and command-encoder state, so a GPU stream that was
-/// **constructed on thread A** can only be used to eval on thread A.
-/// Send/Sync covers the wrapper; the runtime invariant is enforced by
-/// mlx-c++ at eval time. Use a fixed-size worker pool, not per-task spawns.
+/// `Stream` is intentionally **`!Send` and `!Sync`**.
+///
+/// The `mlx::core::Stream` struct is a `{DeviceType, int}` POD, so the
+/// Phase-3 audit originally concluded Send/Sync was sound. That conclusion
+/// was layout-only and is wrong in practice: a `Stream` is an *index into
+/// per-thread state*. mlx-c++ stores the default-stream and the per-stream
+/// `CommandEncoder` in C++ thread-local storage, so a GPU stream constructed
+/// on thread A cannot be used to eval (or `synchronize`) on thread B —
+/// mlx-c++ throws `"There is no Stream(gpu, N) in current thread."`. This
+/// was confirmed empirically by the `SharedArray` cross-thread experiment.
+///
+/// This is the same class of bug as the M1 `Array` Send revision: a
+/// trivially-copyable handle whose *referent* has thread-affine state.
+/// Marking the wrapper `Send` would let safe code move the handle across a
+/// thread boundary and hit that failure path. Until a thread-checked or
+/// CPU/GPU-split API exists (future milestone), `Stream` stays single-thread
+/// like `Array`. (`Device` IS `Send + Sync` — it is a pure `{kind, index}`
+/// descriptor with no thread-local referent.)
 #[repr(transparent)]
 pub struct Stream(pub(crate) mlxrs_sys::mlx_stream);
 
-// SAFETY: see the docs/audits/send-soundness.md "Stream — mlx::core::Stream"
-// section. The C++ type is a {DeviceType, int} POD with no mutable shared
-// state. The mlx-c boundary is `mlx_stream { void* ctx }` where ctx points
-// at a heap-allocated `Stream*`; concurrent reads from multiple threads on
-// the wrapper are sound.
-unsafe impl Send for Stream {}
-unsafe impl Sync for Stream {}
-
-assert_impl_all!(Stream: Send, Sync);
+// NO `unsafe impl Send/Sync for Stream`. The raw `mlx_stream` contains a
+// `*mut c_void`, so the auto-traits are already absent; the assertion below
+// locks that in against an accidental future `unsafe impl`.
+assert_not_impl_any!(Stream: Send, Sync);
 
 impl Drop for Stream {
   fn drop(&mut self) {
