@@ -43,5 +43,14 @@ pub mod vlm;
 #[cfg_attr(docsrs, doc(cfg(feature = "audio")))]
 pub mod audio;
 
+/// Embedding utilities — high-level loading, tokenizer integration, pooling, and
+/// similarity for embedding models (BERT/XLM-RoBERTa/ModernBERT/Qwen3 family).
+/// Stub in M1; port lands in M3 alongside tokenizers + model-loading. Per-model
+/// architectures live elsewhere (mlxrs::lm/vlm); this module is the high-level
+/// surface only.
+#[cfg(feature = "embeddings")]
+#[cfg_attr(docsrs, doc(cfg(feature = "embeddings")))]
+pub mod embeddings;
+
 // ───── internal modules below ─────
 pub(crate) mod stream; // INTERNAL: M2 lifts to public Stream

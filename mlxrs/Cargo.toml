@@ -13,6 +13,7 @@ rust-version.workspace = true
 default = []
 lm = []
 vlm = []
+embeddings = []
 audio = ["lm"]                       # mirrors mlx-audio's Python dep on mlx-lm
 unstable-ops-overload = []           # `&a + &b` etc. (panic on shape error). OFF by default.
 

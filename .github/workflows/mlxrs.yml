@@ -45,7 +45,9 @@ jobs:
             cache_suffix: 'vlm'
           - features: 'audio'
             cache_suffix: 'audio'
-          - features: 'lm,vlm,audio,unstable-ops-overload'
+          - features: 'embeddings'
+            cache_suffix: 'embeddings'
+          - features: 'lm,vlm,audio,embeddings,unstable-ops-overload'
             cache_suffix: 'all'
     steps:
       - uses: actions/checkout@v4
