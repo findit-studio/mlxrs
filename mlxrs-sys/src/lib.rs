@@ -1,11 +1,25 @@
 //! Raw FFI bindings for mlx-c. Pre-committed bindgen output.
 //!
-//! Regenerate with `cargo run -p xtask -- regen-bindings` (requires
-//! `LIBCLANG_PATH=$(xcode-select -p)/usr/lib`).
-#![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
-#![allow(clippy::missing_safety_doc, clippy::all)]
+//! Regenerate with:
+//!
+//! ```sh
+//! LIBCLANG_PATH=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib \
+//!   cargo run -p xtask -- regen-bindings
+//! ```
+//!
+//! (CI uses the same path on `macos-14`. `$(xcode-select -p)/usr/lib` does NOT
+//! contain libclang on Xcode 26.x; this is the canonical location.)
 
-include!("generated/bindings.rs");
+// Bindgen output is wrapped in a private module so its lints (clippy::all,
+// missing_safety_doc, naming-convention warnings) are scoped — not bleeding
+// into smoke tests or any future hand-written glue in this crate.
+#[allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
+#[allow(clippy::missing_safety_doc, clippy::all)]
+mod generated {
+  include!("generated/bindings.rs");
+}
+
+pub use generated::*;
 
 #[cfg(test)]
 mod smoke {
