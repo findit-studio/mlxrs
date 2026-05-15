@@ -1,6 +1,11 @@
-//! Reduction ops: sum (Phase 3.5 template), mean/max/min/var/std/prod fill in Phase 4.
+//! Reduction ops: sum (Phase 3.5 template), mean/max/min/prod (Phase 4 Branch A).
 //!
-//! Cum* (cumsum/cumprod/cummax/cummin) live in `misc.rs` per the Phase 4 LoC rebalancing.
+//! Cum* (cumsum/cumprod/cummax/cummin) live in `misc.rs` per the Phase 4 LoC
+//! rebalancing. `var`/`std`/`all`/`any`/`logsumexp` land in Branch B.
+//!
+//! Each `_axes(empty_slice, _)` short-circuits to `try_clone()` (matches numpy
+//! `op(a, axis=())` and mlx-python). `keepdims` has no observable effect in
+//! that case; the documented contract is intentional and Codex-reviewed.
 
 use std::ffi::c_int;
 
@@ -45,5 +50,129 @@ pub fn sum_axes(a: &Array, axes: &[i32], keepdims: bool) -> Result<Array> {
 pub fn sum(a: &Array, keepdims: bool) -> Result<Array> {
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe { mlxrs_sys::mlx_sum(&mut out.0, a.0, keepdims, default_stream()) })?;
+  Ok(out)
+}
+
+/// Mean along the given axes. Empty `axes` is a no-op; see `sum_axes`.
+///
+/// `mean` always promotes int inputs to f32+; mlx handles this.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.mean.html).
+pub fn mean_axes(a: &Array, axes: &[i32], keepdims: bool) -> Result<Array> {
+  if axes.is_empty() {
+    return a.try_clone();
+  }
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe {
+    mlxrs_sys::mlx_mean_axes(
+      &mut out.0,
+      a.0,
+      axes.as_ptr() as *const c_int,
+      axes.len(),
+      keepdims,
+      default_stream(),
+    )
+  })?;
+  Ok(out)
+}
+
+/// Mean of all elements (full reduction).
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.mean.html).
+pub fn mean(a: &Array, keepdims: bool) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe { mlxrs_sys::mlx_mean(&mut out.0, a.0, keepdims, default_stream()) })?;
+  Ok(out)
+}
+
+/// Maximum value along the given axes. Empty `axes` is a no-op; see `sum_axes`.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.max.html).
+pub fn max_axes(a: &Array, axes: &[i32], keepdims: bool) -> Result<Array> {
+  if axes.is_empty() {
+    return a.try_clone();
+  }
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe {
+    mlxrs_sys::mlx_max_axes(
+      &mut out.0,
+      a.0,
+      axes.as_ptr() as *const c_int,
+      axes.len(),
+      keepdims,
+      default_stream(),
+    )
+  })?;
+  Ok(out)
+}
+
+/// Maximum of all elements (full reduction).
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.max.html).
+pub fn max(a: &Array, keepdims: bool) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe { mlxrs_sys::mlx_max(&mut out.0, a.0, keepdims, default_stream()) })?;
+  Ok(out)
+}
+
+/// Minimum value along the given axes. Empty `axes` is a no-op; see `sum_axes`.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.min.html).
+pub fn min_axes(a: &Array, axes: &[i32], keepdims: bool) -> Result<Array> {
+  if axes.is_empty() {
+    return a.try_clone();
+  }
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe {
+    mlxrs_sys::mlx_min_axes(
+      &mut out.0,
+      a.0,
+      axes.as_ptr() as *const c_int,
+      axes.len(),
+      keepdims,
+      default_stream(),
+    )
+  })?;
+  Ok(out)
+}
+
+/// Minimum of all elements (full reduction).
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.min.html).
+pub fn min(a: &Array, keepdims: bool) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe { mlxrs_sys::mlx_min(&mut out.0, a.0, keepdims, default_stream()) })?;
+  Ok(out)
+}
+
+/// Product along the given axes. Empty `axes` is a no-op; see `sum_axes`.
+///
+/// `prod` of int inputs may promote to i64; mlx handles this.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.prod.html).
+pub fn prod_axes(a: &Array, axes: &[i32], keepdims: bool) -> Result<Array> {
+  if axes.is_empty() {
+    return a.try_clone();
+  }
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe {
+    mlxrs_sys::mlx_prod_axes(
+      &mut out.0,
+      a.0,
+      axes.as_ptr() as *const c_int,
+      axes.len(),
+      keepdims,
+      default_stream(),
+    )
+  })?;
+  Ok(out)
+}
+
+/// Product of all elements (full reduction).
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.prod.html).
+pub fn prod(a: &Array, keepdims: bool) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe { mlxrs_sys::mlx_prod(&mut out.0, a.0, keepdims, default_stream()) })?;
   Ok(out)
 }
