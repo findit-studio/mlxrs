@@ -40,12 +40,18 @@ jobs:
           rustup default stable
           rustup component add rustfmt clippy
 
-      # Cache key uses Cargo.toml (NOT Cargo.lock) by project policy:
-      # Cargo.lock is gitignored; the dep-watch.yml weekly cron is the safety
-      # net for upstream breakage. Coarser key than the conventional
-      # hashFiles('**/Cargo.lock') — accepted trade-off, see project memory
-      # `feedback-no-cargo-lock-in-git` and `feedback-no-dependency-pinning`.
-      # The `target/` cache covers the cmake build artifacts ($OUT_DIR is
+      # Capture the mlx-c submodule SHA so the cache key invalidates whenever
+      # the submodule moves — even on a header-only patch that leaves
+      # CMakeLists.txt unchanged. Without this, a stale target/ cache could
+      # restore native artifacts compiled against the previous mlx-c.
+      - name: Compute mlx-c submodule SHA
+        id: mlxc-sha
+        run: echo "sha=$(git -C mlxrs-sys/vendor/mlx-c rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      # Cache key uses Cargo.toml + cmake inputs + mlx-c submodule SHA
+      # (NOT Cargo.lock — gitignored by project policy; the dep-watch.yml
+      # weekly cron is the safety net for upstream Rust-side breakage).
+      # The `target/` cache covers cmake's build artifacts ($OUT_DIR is
       # under `target/`), so a hit avoids re-downloading + re-compiling MLX.
       - name: Cache cargo registry + target (incl. cmake $OUT_DIR)
         uses: actions/cache@v4
@@ -54,8 +60,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-mlxrs-sys-${{ hashFiles('**/Cargo.toml', 'mlxrs-sys/vendor/mlx-c/CMakeLists.txt', 'mlxrs-sys/build.rs') }}
+          key: ${{ runner.os }}-mlxrs-sys-${{ steps.mlxc-sha.outputs.sha }}-${{ hashFiles('**/Cargo.toml', 'mlxrs-sys/vendor/mlx-c/CMakeLists.txt', 'mlxrs-sys/build.rs') }}
           restore-keys: |
+            ${{ runner.os }}-mlxrs-sys-${{ steps.mlxc-sha.outputs.sha }}-
             ${{ runner.os }}-mlxrs-sys-
 
       - name: cargo fmt
@@ -74,3 +81,14 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc -p mlxrs-sys --no-deps
+
+      # Bindings-drift gate: re-run xtask regen-bindings and assert the
+      # generated file matches what's committed. Catches accidental drift
+      # between the committed bindings.rs and the actual mlx-c headers (e.g.
+      # if someone bumps the vendored submodule but forgets to regen).
+      - name: Bindings-drift gate
+        env:
+          LIBCLANG_PATH: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib
+        run: |
+          cargo run -p xtask -- regen-bindings
+          git diff --exit-code mlxrs-sys/src/generated/bindings.rs

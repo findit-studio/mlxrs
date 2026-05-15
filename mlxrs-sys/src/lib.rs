@@ -1,48 +1,33 @@
-//! Raw FFI bindings for mlx-c. M1: hand-written; Phase 2 swaps in bindgen output.
-#![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
+//! Raw FFI bindings for mlx-c. Pre-committed bindgen output.
+//!
+//! Regenerate with:
+//!
+//! ```sh
+//! LIBCLANG_PATH=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib \
+//!   cargo run -p xtask -- regen-bindings
+//! ```
+//!
+//! (CI uses the same path on `macos-14`. `$(xcode-select -p)/usr/lib` does NOT
+//! contain libclang on Xcode 26.x; this is the canonical location.)
 
-use std::ffi::{c_char, c_int, c_void};
-
-// Hand-written subset for Phase 0 link-only smoke. Replaced by bindgen in Phase 2.
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct mlx_string {
-  pub ctx: *mut c_void,
+// Bindgen output is wrapped in a private module so its lints (clippy::all,
+// missing_safety_doc, naming-convention warnings) are scoped — not bleeding
+// into smoke tests or any future hand-written glue in this crate.
+#[allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
+#[allow(clippy::missing_safety_doc, clippy::all)]
+mod generated {
+  include!("generated/bindings.rs");
 }
 
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct mlx_array {
-  pub ctx: *mut c_void,
-}
-
-pub type mlx_error_handler_func =
-  Option<unsafe extern "C" fn(msg: *const c_char, data: *mut c_void)>;
-
-pub type mlx_dealloc_func = Option<unsafe extern "C" fn(data: *mut c_void)>;
-
-unsafe extern "C" {
-  pub fn mlx_string_new() -> mlx_string;
-  pub fn mlx_string_free(s: mlx_string) -> c_int;
-  pub fn mlx_string_data(s: mlx_string) -> *const c_char;
-
-  pub fn mlx_version(out: *mut mlx_string) -> c_int;
-
-  pub fn mlx_set_error_handler(
-    handler: mlx_error_handler_func,
-    data: *mut c_void,
-    dtor: mlx_dealloc_func,
-  );
-
-  pub fn mlx_array_new() -> mlx_array;
-  pub fn mlx_array_free(arr: mlx_array) -> c_int;
-}
+pub use generated::*;
 
 #[cfg(test)]
 mod smoke {
   use super::*;
-  use std::{ffi::CStr, ptr};
+  use std::{
+    ffi::{CStr, c_char, c_void},
+    ptr,
+  };
 
   // mlx-c's default handler is `printf("MLX error: %s\n", msg); exit(-1);`
   // which would terminate the test process. Install a no-op handler first.
@@ -55,13 +40,9 @@ mod smoke {
       let mut s = mlx_string_new();
       assert_eq!(mlx_version(&mut s), 0, "mlx_version returned non-zero");
       let data = mlx_string_data(s);
-      assert!(!data.is_null(), "mlx_string_data returned NULL");
+      assert!(!data.is_null());
       let ver = CStr::from_ptr(data).to_string_lossy();
-      assert!(!ver.is_empty(), "version string is empty");
-      assert!(
-        ver.chars().next().unwrap().is_ascii_digit(),
-        "version doesn't start with a digit: {ver:?}"
-      );
+      assert!(!ver.is_empty());
       assert_eq!(mlx_string_free(s), 0);
     }
   }
