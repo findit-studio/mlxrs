@@ -296,6 +296,13 @@ pub fn pad(
       ),
     });
   }
+  // `low`/`high` are shape extents (counts of padding entries), not axis
+  // indices, so negatives are invalid and must be rejected before they reach
+  // mlx::core::Shape construction (Codex PR #7-target finding). `axes` itself
+  // is an axis-index list — negative axes follow numpy semantics and are
+  // intentionally NOT validated here.
+  crate::shape::validate_dims(low)?;
+  crate::shape::validate_dims(high)?;
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe {
     mlxrs_sys::mlx_pad(

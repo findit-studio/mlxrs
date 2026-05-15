@@ -172,3 +172,23 @@ fn pad_rejects_length_mismatch() {
   let r = ops::shape::pad(&a, &[0], &[2], &[1, 2], &zero, &mode);
   assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })));
 }
+
+#[test]
+fn pad_rejects_negative_low() {
+  // `low`/`high` are shape extents — negatives must be rejected before
+  // reaching mlx::core::Shape construction (Codex review).
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3i32]).unwrap();
+  let zero = Array::from_slice::<f32>(&[0.0], &[0i32; 0]).unwrap();
+  let mode = CString::new("constant").unwrap();
+  let r = ops::shape::pad(&a, &[0], &[-1], &[1], &zero, &mode);
+  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })));
+}
+
+#[test]
+fn pad_rejects_negative_high() {
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3i32]).unwrap();
+  let zero = Array::from_slice::<f32>(&[0.0], &[0i32; 0]).unwrap();
+  let mode = CString::new("constant").unwrap();
+  let r = ops::shape::pad(&a, &[0], &[1], &[-2], &zero, &mode);
+  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })));
+}

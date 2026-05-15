@@ -115,6 +115,19 @@ pub fn gather(a: &Array, indices: &[&Array], axes: &[i32], slice_sizes: &[i32]) 
       ),
     });
   }
+  // slice_sizes is a shape extent (one per dim of `a`); it must be non-negative
+  // and have rank == a.ndim(). Without these guards, negative or wrong-rank
+  // values cross into mlx::core::Shape construction (Codex PR #7-target finding).
+  if slice_sizes.len() != a.ndim() {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "gather: slice_sizes.len() {} != a.ndim() {}",
+        slice_sizes.len(),
+        a.ndim()
+      ),
+    });
+  }
+  crate::shape::validate_dims(slice_sizes)?;
   crate::error::ensure_handler_installed();
   let raw: Vec<mlxrs_sys::mlx_array> = indices.iter().map(|a| a.0).collect();
   let vec = unsafe { mlxrs_sys::mlx_vector_array_new_data(raw.as_ptr(), raw.len()) };

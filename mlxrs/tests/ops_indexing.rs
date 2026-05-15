@@ -65,3 +65,23 @@ fn gather_rejects_indices_axes_length_mismatch() {
   let r = ops::indexing::gather(&a, &[&idx], &[0, 1], &[1, 1]);
   assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })));
 }
+
+#[test]
+fn gather_rejects_negative_slice_size() {
+  // `slice_sizes` is a shape extent — negative values must be rejected before
+  // they can reach mlx::core::Shape construction (Codex review).
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[0], &[1i32]).unwrap();
+  let r = ops::indexing::gather(&a, &[&idx], &[0], &[-1]);
+  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })));
+}
+
+#[test]
+fn gather_rejects_slice_sizes_rank_mismatch() {
+  // slice_sizes.len() must equal a.ndim().
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let idx = Array::from_slice::<i32>(&[0], &[1i32]).unwrap();
+  // a.ndim() == 2 but slice_sizes is rank-1 -> rejected before FFI.
+  let r = ops::indexing::gather(&a, &[&idx], &[0], &[1]);
+  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })));
+}
