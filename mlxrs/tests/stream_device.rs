@@ -195,3 +195,40 @@ fn device_can_be_shared_across_threads() {
   assert_eq!(handle.join().unwrap(), DeviceKind::Cpu);
   assert_eq!(dev.kind().unwrap(), DeviceKind::Cpu);
 }
+
+#[test]
+fn concurrent_set_default_and_current_is_race_free() {
+  // mlx-c++'s default device is a non-atomic function-static. Without the
+  // crate-level lock, hammering set_default + current from many threads is
+  // a C++ data race. With it, this completes deterministically and the
+  // final default is always one of the two valid values. Codex PR #13.
+  use std::thread;
+  let cpu = Device::cpu().unwrap();
+  let gpu_available = Device::gpu().is_ok();
+
+  let handles: Vec<_> = (0..8)
+    .map(|i| {
+      let cpu = cpu.try_clone().unwrap();
+      thread::spawn(move || {
+        for _ in 0..50 {
+          // Alternate writers; readers interleave. Only set CPU if we
+          // can't guarantee GPU is available (set_default(gpu) errors
+          // without a gpu backend).
+          if i % 2 == 0 {
+            cpu.set_default().unwrap();
+          }
+          let _ = Device::current().unwrap();
+        }
+      })
+    })
+    .collect();
+  for h in handles {
+    h.join().unwrap();
+  }
+  // Whatever raced, the final default is still a coherent device.
+  let kind = Device::current().unwrap().kind().unwrap();
+  assert!(
+    kind == DeviceKind::Cpu || (gpu_available && kind == DeviceKind::Gpu),
+    "default device left in an incoherent state: {kind:?}",
+  );
+}

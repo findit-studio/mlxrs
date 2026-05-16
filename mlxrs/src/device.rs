@@ -5,16 +5,31 @@
 //! `mlx::core::Device*` behind `void* ctx`, so this safe wrapper takes
 //! ownership and frees on `Drop`.
 //!
-//! Send + Sync are sound: per the Phase-3-entry refcount audit (see
-//! `docs/audits/send-soundness.md`) `Stream` and `Device` are POD-like with
-//! no mutable shared state — concurrent reads from multiple threads are
-//! race-free, and ownership transfer is trivially safe.
+//! `Device` is `Send + Sync` — the handle is a pure `{kind, index}`
+//! descriptor with no thread-local referent (unlike `Stream`, which indexes
+//! mlx-c++ per-thread CommandEncoder state and is therefore `!Send`).
+//!
+//! HOWEVER: the *mlx-c++ process-global default device* is a plain
+//! non-atomic function-static (`mlx::core::mutable_default_device()` returns
+//! `&static Device`, NOT `thread_local`). `set_default` writes it and
+//! `current` reads it, so concurrent safe-Rust calls would be a C++ data
+//! race. Both are serialized through [`DEFAULT_DEVICE_LOCK`]. (The default
+//! *stream* getters/setters do NOT need this — mlx stores default streams in
+//! `thread_local` storage, so each thread only touches its own.)
 
-use std::ffi::CStr;
+use std::{ffi::CStr, sync::Mutex};
 
 use static_assertions::assert_impl_all;
 
 use crate::error::{Result, check, ensure_handler_installed};
+
+/// Serializes safe-Rust access to mlx-c++'s non-atomic global default
+/// device. `Mutex::new` is const since Rust 1.63 (MSRV is far above that),
+/// so a plain `static` works without `OnceLock`. This only protects callers
+/// going through the safe `Device` API; raw `mlxrs-sys` FFI users that call
+/// `mlx_set_default_device` directly are in `unsafe` territory and must
+/// provide their own synchronization.
+static DEFAULT_DEVICE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Device kind tag — mirrors `mlx_device_type` (`MLX_CPU` / `MLX_GPU`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -138,8 +153,15 @@ impl Device {
 
   /// Returns the current process-wide default device. Wraps
   /// `mlx_get_default_device`.
+  ///
+  /// Serialized against [`Device::set_default`] via [`DEFAULT_DEVICE_LOCK`] —
+  /// reading the non-atomic mlx-c++ global concurrently with a write would
+  /// be a C++ data race.
   pub fn current() -> Result<Self> {
     ensure_handler_installed();
+    let _g = DEFAULT_DEVICE_LOCK
+      .lock()
+      .unwrap_or_else(|p| p.into_inner());
     let mut out = Self(unsafe { mlxrs_sys::mlx_device_new() });
     check(unsafe { mlxrs_sys::mlx_get_default_device(&mut out.0) })?;
     Ok(out)
@@ -160,8 +182,17 @@ impl Device {
   /// (ops do not yet take a stream argument). This method is provided for
   /// (a) interop with raw `mlxrs-sys` FFI calls and (b) forward-compat with
   /// that future API.
+  ///
+  /// Serialized against itself and [`Device::current`] via
+  /// [`DEFAULT_DEVICE_LOCK`]: mlx-c++'s default device is a non-atomic
+  /// function-static, so concurrent safe-Rust mutation would be a C++ data
+  /// race. The lock makes the safe API race-free; raw `mlxrs-sys` callers
+  /// bypass it (their responsibility).
   pub fn set_default(&self) -> Result<()> {
     ensure_handler_installed();
+    let _g = DEFAULT_DEVICE_LOCK
+      .lock()
+      .unwrap_or_else(|p| p.into_inner());
     check(unsafe { mlxrs_sys::mlx_set_default_device(self.0) })
   }
 
