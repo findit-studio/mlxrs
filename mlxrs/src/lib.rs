@@ -16,16 +16,20 @@
 #![cfg_attr(not(test), deny(missing_docs))]
 
 pub use array::Array;
+pub use device::{Device, DeviceKind};
 pub use dtype::{Dtype, Element};
 pub use error::{Error, Result};
 pub use shape::IntoShape;
+pub use stream::Stream;
 pub use version::version;
 
 pub mod array;
+pub mod device;
 pub mod dtype;
 pub mod error;
 pub mod ops;
 pub mod shape;
+pub mod stream;
 pub mod version;
 
 /// Language Model (LM) — text-only inference. Stub in M1; port lands in M3
@@ -65,6 +69,3 @@ pub mod embeddings;
 #[cfg(feature = "unstable-ops-overload")]
 #[cfg_attr(docsrs, doc(cfg(feature = "unstable-ops-overload")))]
 pub mod ops_traits;
-
-// ───── internal modules below ─────
-pub(crate) mod stream; // INTERNAL: M2 lifts to public Stream

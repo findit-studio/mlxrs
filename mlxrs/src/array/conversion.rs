@@ -153,6 +153,14 @@ impl Drop for StringGuard {
 impl std::fmt::Display for Array {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     crate::error::ensure_handler_installed();
+    // mlx_array_tostring → upstream `operator<<(ostream, array)` calls
+    // `a.eval()` before printing, so Display re-enters eval. It must honor
+    // the cleared-thread poison guard like Array::eval does, otherwise
+    // formatting a lazy array on a recycled-cleared worker silently
+    // degrades to `Array(<tostring failed>)` instead of failing fast.
+    // (Debug only reads shape/dtype metadata — no eval — so it is not
+    // guarded; panicking in Debug during a debugger session is hostile.)
+    crate::stream::assert_streams_not_cleared();
     let mut s = StringGuard(unsafe { mlxrs_sys::mlx_string_new() });
     let rc = unsafe { mlxrs_sys::mlx_array_tostring(&mut s.0, self.0) };
     if rc != 0 {

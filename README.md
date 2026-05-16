@@ -66,7 +66,13 @@ M1 ships `aarch64-apple-darwin` only (Apple silicon). Other platforms
   (`Arc<Mutex<Array>>`-style) with a documented cross-thread contract.
 - **GPU work is single-stream serialized per thread** — the internal
   default-stream is per-thread and maps to one Metal command queue per
-  thread. M2 lifts `Stream` to public API for explicit lifetime + multi-stream
+  thread. M2 exposes a public `Stream`/`Device` API, but note `Stream` is a
+  **thread-affine, non-RAII handle**: it is `!Send + !Sync`, `Drop` frees
+  only the mlx-c handle box (mlx has no per-stream teardown), and
+  `Stream::new_on` permanently grows mlx's process-global stream state — so
+  allocate a *bounded* set at startup, never per request/task. The only
+  reclaim path is the bulk, end-of-thread `Stream::clear_current_thread_streams()`
+  (a worker's last mlx action before it exits), not per-value lifetime
   control.
 - **Async Metal kernel failures bypass `Result` and abort the process** —
   the rc/sentinel chain only catches synchronous errors. Recovery via a

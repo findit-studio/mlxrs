@@ -78,6 +78,13 @@ impl Array {
   /// lets the borrow checker enforce "no other reference is alive during eval."
   pub fn eval(&mut self) -> Result<()> {
     crate::error::ensure_handler_installed();
+    // `eval` reaches mlx without going through `default_stream()`, so the
+    // cleared-thread poison guard must be applied here too — otherwise
+    // materializing an existing lazy array on a cleared thread would fail
+    // cryptically in the backend instead of panicking immediately.
+    // `item`/`to_vec`/`as_slice` all funnel through here, so they are
+    // covered transitively.
+    crate::stream::assert_streams_not_cleared();
     check(unsafe { mlxrs_sys::mlx_array_eval(self.0) })
   }
 
