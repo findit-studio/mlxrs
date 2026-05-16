@@ -27,6 +27,7 @@ lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm",
 vlm                  = ["lm"]
 audio                = ["lm"]            # mirrors mlx-audio's Python dep on mlx-lm
 unstable-ops-overload = []               # `&a + &b` etc. (panic on shape error). OFF by default.
+gguf                 = []                                                          # GGUF load/save (mlx-c `mlx_io_gguf*`). OFF: mlxrs-sys does not yet link gguflib.
 
 [dependencies]
 mlxrs-sys.workspace = true
