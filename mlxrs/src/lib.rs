@@ -4,13 +4,17 @@
 //! `docs/superpowers/specs/` for the full design.
 //!
 //! ## Caveats
-//! - `Array` is **`!Send` and `!Sync`** in M1 — single-thread use only. Cross-thread
-//!   sharing requires care: the underlying C++ `array_desc` is shared by `Clone`
-//!   and mutates non-atomic state internally. M2 will provide a `SharedArray`
-//!   newtype (`Arc<Mutex<Array>>`-style) with a documented cross-thread contract.
-//! - **Async Metal kernel failures bypass `Result<T, Error>` and abort the process.**
-//!   The rc/sentinel chain only catches synchronous errors. Recovery via
-//!   `set_terminate` shim is M2 work.
+//! - `Array` is **`!Send` and `!Sync`** — single-thread use only, like MLX's
+//!   own C++/Python/Swift APIs (which deliberately do not share arrays across
+//!   threads). The underlying C++ `array_desc` is refcount-shared by `Clone`
+//!   and mutates non-atomic state internally, and mlx's `eval` is itself not
+//!   concurrency-safe. There is **no shared-array wrapper**: to use array
+//!   data on another thread, extract owned data via [`Array::to_vec`] /
+//!   [`Array::item`] (which yield `Send` values) and move that.
+//! - **Async Metal kernel failures bypass `Result<T, Error>` and abort the
+//!   process.** The rc/sentinel chain only catches synchronous errors. A
+//!   `set_terminate`-style recovery shim is **not implementable** (mlx-c
+//!   exposes no hook) and is deferred to M3+ (diagnostics-only is planned).
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
 #![cfg_attr(not(test), deny(missing_docs))]

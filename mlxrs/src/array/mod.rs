@@ -28,8 +28,9 @@ pub struct Array(pub(crate) mlxrs_sys::mlx_array);
 // each calls `eval`/`to_vec`/`item` on `&mut self`. Each thread sees a distinct
 // `&mut Array`, so `!Sync` doesn't catch it — but the underlying C++
 // `array_desc->status` write races. To preserve cheap `Clone`, `Send` must go.
-// M2 will provide an explicit cross-thread story (likely `SharedArray =
-// Arc<Mutex<Array>>` newtype with documented contract).
+// There is no shared-array wrapper: MLX's C++/Python/Swift APIs deliberately
+// don't share arrays across threads and mlx `eval` is not concurrency-safe.
+// To cross threads, extract owned data via `to_vec`/`item` (`Send`).
 assert_not_impl_any!(Array: Copy, Send, Sync);
 
 impl Drop for Array {
