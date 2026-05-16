@@ -21,6 +21,28 @@ mod generated {
 
 pub use generated::*;
 
+// ───── first-party C++ shims ─────
+//
+// Bridges to `mlx::core` symbols the vendored mlx-c layer does not expose.
+// The C++ sources live in `mlxrs-sys/shim/` and are compiled by build.rs
+// against libmlx. These declarations are HAND-WRITTEN (not bindgen output)
+// on purpose: the shim is first-party, not part of the vendored mlx-c
+// surface, so it must stay out of the `regen-bindings` drift gate.
+//
+// Policy: every entry here is a tracked mlx-c coverage gap to be upstreamed
+// to ml-explore/mlx-c so this block shrinks over time.
+unsafe extern "C" {
+  /// Bridges `mlx::core::clear_streams()` (declared in `mlx/stream.h`),
+  /// which mlx-c does not expose. Destroys all streams created on the
+  /// **current thread**, freeing their Metal command encoders. Returns 0
+  /// on success, non-zero if the underlying C++ call threw.
+  ///
+  /// This is mlx's only stream-teardown primitive — it is thread-wide and
+  /// bulk (no per-stream free), which is why the safe `Stream` wrapper
+  /// cannot reclaim resources via `Drop`.
+  pub fn mlxrs_shim_clear_streams() -> ::std::os::raw::c_int;
+}
+
 #[cfg(test)]
 mod smoke {
   use super::*;

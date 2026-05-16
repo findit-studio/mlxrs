@@ -12,6 +12,7 @@ links = "mlxc"
 [build-dependencies]
 cmake.workspace = true
 walkdir.workspace = true
+cc = "1"                              # compiles the first-party C++ shim (shim/mlxrs_shim.cpp)
 
 # No buildtime bindgen feature in M1 — pre-committed bindings are the
 # canonical path. Regen via `cargo run -p xtask -- regen-bindings`. M2

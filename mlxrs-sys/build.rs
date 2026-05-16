@@ -18,6 +18,7 @@ fn main() {
   println!("cargo:rerun-if-changed=build.rs");
   println!("cargo:rerun-if-changed=wrapper.h");
   println!("cargo:rerun-if-changed=vendor/mlx-c");
+  println!("cargo:rerun-if-changed=shim/mlxrs_shim.cpp");
 
   // Target check — M1 is macOS arm64 only.
   let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
@@ -66,6 +67,29 @@ fn main() {
     )
   });
 
+  // First-party C++ shim for mlx::core APIs that mlx-c does not expose
+  // (currently just `clear_streams`). Compiled against the FetchContent'd
+  // mlx C++ headers and linked alongside libmlx. cc emits its own
+  // `cargo:rustc-link-lib=static=mlxrs_shim` + search-path directives HERE,
+  // i.e. BEFORE the `static=mlx` directive below, so a single-pass linker
+  // (GNU ld) resolves the shim's `mlx::core::clear_streams` reference into
+  // libmlx. macOS ld64 is order-insensitive for archives but we keep the
+  // correct order regardless.
+  let mlx_src = build_dir.join("_deps/mlx-src");
+  if !mlx_src.join("mlx/stream.h").exists() {
+    panic!(
+      "mlx C++ headers not found at {} (expected mlx/stream.h). The shim \
+             needs the FetchContent'd mlx-src tree.",
+      mlx_src.display()
+    );
+  }
+  cc::Build::new()
+    .cpp(true)
+    .std("c++20")
+    .file("shim/mlxrs_shim.cpp")
+    .include(&mlx_src)
+    .compile("mlxrs_shim");
+
   // Link declarations.
   println!("cargo:rustc-link-search=native={}", lib_dir.display());
   println!("cargo:rustc-link-lib=static=mlxc");
@@ -77,11 +101,14 @@ fn main() {
   println!("cargo:rustc-link-lib=framework=Accelerate");
   println!("cargo:rustc-link-lib=dylib=c++");
 
-  // The FFI declarations themselves come from the pre-committed
+  // The mlx-c FFI declarations come from the pre-committed
   // mlxrs-sys/src/generated/bindings.rs (regenerated via
-  // `cargo run -p xtask -- regen-bindings`). This build script's job is
-  // strictly to compile + link libmlxc + libmlx + the Apple frameworks;
-  // it does NOT invoke bindgen.
+  // `cargo run -p xtask -- regen-bindings`); this build script does NOT
+  // invoke bindgen. The first-party shim's declaration is hand-written in
+  // src/lib.rs (intentionally kept out of the bindgen drift gate, since it
+  // is not part of the vendored mlx-c surface). This script's job is to
+  // compile the shim + link libmlxc + libmlx + libmlxrs_shim + the Apple
+  // frameworks.
 }
 
 fn find_libmlx(start: &Path) -> Option<PathBuf> {
