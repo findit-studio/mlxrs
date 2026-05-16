@@ -126,9 +126,15 @@ pub(crate) fn mark_streams_cleared() {
 // from a small, long-lived set of worker threads (a fixed-size thread pool
 // or the main thread). Patterns that spawn a fresh OS thread per request or
 // per task — rayon-with-thread-recycling, std::thread per HTTP request,
-// short-lived spawn loops — will accumulate one mlx_stream per worker over
-// the process lifetime and grow without bound. M2's public `Stream` API
-// (below) provides explicit lifetime control for those cases.
+// short-lived spawn loops — accumulate one mlx_stream per worker over the
+// process lifetime and grow without bound.
+//
+// M2's public `Stream` API does NOT solve this with per-value lifetime
+// control — it cannot (mlx has no per-stream teardown). `Stream` is a
+// thread-affine, non-RAII handle; `Drop` frees only the C handle box. The
+// ONLY reclaim path is `Stream::clear_current_thread_streams()`, called as
+// a worker's final mlx action immediately before that OS thread terminates
+// (NOT before returning the thread to a pool — see its docs).
 
 // ───────────────────────── Public Stream API (M2) ─────────────────────────
 
@@ -326,10 +332,14 @@ impl Stream {
   /// on a worker thread, right before that thread finishes.** Do NOT
   /// continue doing mlx work on the thread afterward.
   ///
-  /// The intended pattern is a fixed worker pool where each worker, before
-  /// being joined/recycled, calls this to release its GPU encoder memory
-  /// deterministically instead of leaking it until process exit (the
-  /// otherwise-unavoidable cost of dynamic [`Stream::new_on`] usage). It is
+  /// The intended pattern is **worker-thread shutdown**: a thread that is
+  /// about to terminate calls this as its final mlx action to release its
+  /// GPU encoder memory deterministically instead of leaking it until
+  /// process exit (the otherwise-unavoidable cost of dynamic
+  /// [`Stream::new_on`] usage). It is explicitly NOT for returning a worker
+  /// to a pool — a successful clear poisons the OS thread, so the next job
+  /// scheduled on a recycled worker panics immediately. Only call it when
+  /// the thread itself is ending. It is
   /// an associated function (not `&self`) because the operation is
   /// thread-wide and bulk — it cannot be scoped to one `Stream`; every
   /// `Stream` previously obtained on this thread (including the per-thread
@@ -405,8 +415,12 @@ impl Stream {
   }
 }
 
-/// Returns the current process-wide default stream for `device`. Wraps
+/// Returns the **calling thread's** default stream for `device`. Wraps
 /// `mlx_get_default_stream`.
+///
+/// mlx stores default streams in `thread_local` storage (see the module
+/// docs), so this is per-thread, NOT process-wide — a default set on one
+/// thread is invisible to others.
 pub fn get_default_stream(device: &Device) -> Result<Stream> {
   ensure_handler_installed();
   assert_streams_not_cleared();
@@ -415,13 +429,15 @@ pub fn get_default_stream(device: &Device) -> Result<Stream> {
   Ok(out)
 }
 
-/// Install `stream` as the process-wide default for the device it targets.
-/// Wraps `mlx_set_default_stream`.
+/// Install `stream` as the **calling thread's** default for the device it
+/// targets. Wraps `mlx_set_default_stream`.
 ///
-/// Note: this does NOT swap the per-thread default-GPU stream cached by
-/// `default_stream()` — internal `ops::*` calls keep using their cached
-/// handle. Use this when interoperating with raw mlx-c calls or with the
-/// `mlx_get_default_stream` API.
+/// mlx default streams are `thread_local`, so this has **no cross-thread
+/// effect** — it does not change any other thread's default, and it does
+/// NOT swap the per-thread default-GPU stream cached by `default_stream()`
+/// (internal `ops::*` calls keep using their cached handle). Use this when
+/// interoperating with raw mlx-c calls or `get_default_stream` on the same
+/// thread.
 pub fn set_default_stream(stream: &Stream) -> Result<()> {
   ensure_handler_installed();
   assert_streams_not_cleared();
