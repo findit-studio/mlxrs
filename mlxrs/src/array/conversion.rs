@@ -106,7 +106,7 @@ impl Array {
 /// `mlx_array_is_contiguous` directly, so we replicate the standard check:
 /// for each dim from innermost to outermost, the stride must equal the running
 /// product of trailing dims. Dims of size 1 are skipped (any stride is fine).
-fn is_row_contiguous(arr: mlxrs_sys::mlx_array) -> bool {
+pub(crate) fn is_row_contiguous(arr: mlxrs_sys::mlx_array) -> bool {
   let ndim = unsafe { mlxrs_sys::mlx_array_ndim(arr) };
   if ndim == 0 {
     return true;

@@ -30,7 +30,8 @@ pub struct Array(pub(crate) mlxrs_sys::mlx_array);
 // `&mut Array`, so `!Sync` doesn't catch it — but the underlying C++
 // `array_desc->status` write races. To preserve cheap `Clone`, `Send` must go.
 // Cross-thread sharing is provided explicitly by `array::shared::SharedArray`
-// (an `Arc<Mutex<Array>>` newtype that serializes every access).
+// (a frozen, immutable `Arc<Array>` view: `Array::freeze` evals once, then
+// every clone shares lock-free read-only access — `bytes::BytesMut::freeze`).
 assert_not_impl_any!(Array: Copy, Send, Sync);
 
 impl Drop for Array {

@@ -6,8 +6,9 @@
 //! ## Caveats
 //! - `Array` is **`!Send` and `!Sync`** — single-thread use only. The underlying
 //!   C++ `array_desc` is shared by `Clone` and mutates non-atomic state
-//!   internally. For cross-thread sharing, use [`SharedArray`] (an
-//!   `Arc<Mutex<Array>>` newtype that serializes access).
+//!   internally. For cross-thread sharing, [`Array::freeze`] evals once and
+//!   returns a [`SharedArray`] — a frozen, immutable `Arc<Array>` whose
+//!   clones share lock-free read-only access.
 //! - **Async Metal kernel failures bypass `Result<T, Error>` and abort the process.**
 //!   The rc/sentinel chain only catches synchronous errors. Recovery via
 //!   `set_terminate` shim is M2 work.
