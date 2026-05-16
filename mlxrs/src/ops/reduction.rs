@@ -1,11 +1,18 @@
-//! Reduction ops: sum (Phase 3.5 template), mean/max/min/prod (Phase 4 Branch A).
+//! Reduction ops: sum (Phase 3.5 template), mean/max/min/prod (Phase 4 Branch A),
+//! var/std/all/any/logsumexp (M2a long-tail).
 //!
 //! Cum* (cumsum/cumprod/cummax/cummin) live in `misc.rs` per the Phase 4 LoC
-//! rebalancing. `var`/`std`/`all`/`any`/`logsumexp` land in Branch B.
+//! rebalancing.
 //!
-//! Each `_axes(empty_slice, _)` short-circuits to `try_clone()` (matches numpy
-//! `op(a, axis=())` and mlx-python). `keepdims` has no observable effect in
-//! that case; the documented contract is intentional and Codex-reviewed.
+//! Identity-dtype reductions (`sum`, `prod`) short-circuit
+//! `_axes(empty_slice, _)` to `try_clone()`: MLX itself returns `a`
+//! unchanged for empty axes (`if (axes.empty()) return a;` in mlx
+//! `ops.cpp`), matching numpy `op(a, axis=())`. Every other reduction
+//! routes empty axes through the `_axes` C entry via a `dim_ptr` sentinel
+//! so MLX's own empty-axes semantics run: `mean`/`var`/`std`/`logsumexp`
+//! for dtype promotion, `max`/`min` for zero-size checks, and `all`/`any`
+//! because their empty-axes result is `astype(a, bool)` — a dtype change,
+//! NOT a no-op (numpy `all(a, axis=())` is bool too).
 
 use std::ffi::c_int;
 
@@ -182,5 +189,166 @@ pub fn prod_axes(a: &Array, axes: &[i32], keepdims: bool) -> Result<Array> {
 pub fn prod(a: &Array, keepdims: bool) -> Result<Array> {
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe { mlxrs_sys::mlx_prod(&mut out.0, a.0, keepdims, default_stream()) })?;
+  Ok(out)
+}
+
+/// Variance along the given axes. `ddof` is the delta-degrees-of-freedom
+/// (numpy convention: variance divides by `n - ddof`).
+///
+/// `var` promotes integer inputs to f32+; routes empty axes through
+/// `mlx_var_axes` with a `dim_ptr` sentinel so the promotion runs uniformly.
+/// See `mean_axes` for the rationale.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.var.html).
+pub fn var_axes(a: &Array, axes: &[i32], keepdims: bool, ddof: i32) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe {
+    mlxrs_sys::mlx_var_axes(
+      &mut out.0,
+      a.0,
+      dim_ptr(axes),
+      axes.len(),
+      keepdims,
+      ddof as c_int,
+      default_stream(),
+    )
+  })?;
+  Ok(out)
+}
+
+/// Variance of all elements (full reduction). `ddof` follows numpy convention.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.var.html).
+pub fn var(a: &Array, keepdims: bool, ddof: i32) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe { mlxrs_sys::mlx_var(&mut out.0, a.0, keepdims, ddof as c_int, default_stream()) })?;
+  Ok(out)
+}
+
+/// Standard deviation along the given axes. `ddof` is the delta-degrees-of-
+/// freedom (numpy convention: divides by `n - ddof`).
+///
+/// `std` promotes integer inputs to f32+; routes empty axes through
+/// `mlx_std_axes` with a `dim_ptr` sentinel (same rationale as `mean_axes`).
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.std.html).
+pub fn std_axes(a: &Array, axes: &[i32], keepdims: bool, ddof: i32) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe {
+    mlxrs_sys::mlx_std_axes(
+      &mut out.0,
+      a.0,
+      dim_ptr(axes),
+      axes.len(),
+      keepdims,
+      ddof as c_int,
+      default_stream(),
+    )
+  })?;
+  Ok(out)
+}
+
+/// Standard deviation of all elements (full reduction). `ddof` follows numpy.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.std.html).
+pub fn std(a: &Array, keepdims: bool, ddof: i32) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe { mlxrs_sys::mlx_std(&mut out.0, a.0, keepdims, ddof as c_int, default_stream()) })?;
+  Ok(out)
+}
+
+/// Logical AND along the given axes. Result dtype is always `bool`.
+///
+/// Empty `axes` is **not** a dtype-preserving no-op: MLX flags the
+/// empty-axes case `is_noop` in `compute_reduce_shape` and returns
+/// `astype(a, bool)` (numpy `all(a, axis=())` is bool too). It therefore
+/// routes through `mlx_all_axes` with a `dim_ptr` sentinel — a `try_clone`
+/// short-circuit (correct for the identity-dtype `sum_axes`/`prod_axes`)
+/// would here wrongly return `a`'s original dtype/values.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.all.html).
+pub fn all_axes(a: &Array, axes: &[i32], keepdims: bool) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe {
+    mlxrs_sys::mlx_all_axes(
+      &mut out.0,
+      a.0,
+      dim_ptr(axes),
+      axes.len(),
+      keepdims,
+      default_stream(),
+    )
+  })?;
+  Ok(out)
+}
+
+/// Logical AND of all elements (full reduction).
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.all.html).
+pub fn all(a: &Array, keepdims: bool) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe { mlxrs_sys::mlx_all(&mut out.0, a.0, keepdims, default_stream()) })?;
+  Ok(out)
+}
+
+/// Logical OR along the given axes. Result dtype is always `bool`.
+///
+/// Empty `axes` routes through `mlx_any_axes` with a `dim_ptr` sentinel for
+/// the same reason as [`all_axes`]: MLX's empty-axes result is
+/// `astype(a, bool)`, not a dtype-preserving no-op.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.any.html).
+pub fn any_axes(a: &Array, axes: &[i32], keepdims: bool) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe {
+    mlxrs_sys::mlx_any_axes(
+      &mut out.0,
+      a.0,
+      dim_ptr(axes),
+      axes.len(),
+      keepdims,
+      default_stream(),
+    )
+  })?;
+  Ok(out)
+}
+
+/// Logical OR of all elements (full reduction).
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.any.html).
+pub fn any(a: &Array, keepdims: bool) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe { mlxrs_sys::mlx_any(&mut out.0, a.0, keepdims, default_stream()) })?;
+  Ok(out)
+}
+
+/// `log(sum(exp(a)))` along the given axes — numerically stable LSE.
+///
+/// `logsumexp` promotes integer inputs to f32+; routes empty axes through
+/// `mlx_logsumexp_axes` with a `dim_ptr` sentinel (same rationale as
+/// `mean_axes`).
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.logsumexp.html).
+pub fn logsumexp_axes(a: &Array, axes: &[i32], keepdims: bool) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe {
+    mlxrs_sys::mlx_logsumexp_axes(
+      &mut out.0,
+      a.0,
+      dim_ptr(axes),
+      axes.len(),
+      keepdims,
+      default_stream(),
+    )
+  })?;
+  Ok(out)
+}
+
+/// `log(sum(exp(a)))` of all elements (full reduction).
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.logsumexp.html).
+pub fn logsumexp(a: &Array, keepdims: bool) -> Result<Array> {
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  check(unsafe { mlxrs_sys::mlx_logsumexp(&mut out.0, a.0, keepdims, default_stream()) })?;
   Ok(out)
 }

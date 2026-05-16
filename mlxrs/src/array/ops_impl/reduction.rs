@@ -52,4 +52,54 @@ impl Array {
   pub fn prod(&self, keepdims: bool) -> Result<Array> {
     crate::ops::reduction::prod(self, keepdims)
   }
+
+  /// Variance along the given axes. See [`crate::ops::reduction::var_axes`].
+  pub fn var_axes(&self, axes: &[i32], keepdims: bool, ddof: i32) -> Result<Array> {
+    crate::ops::reduction::var_axes(self, axes, keepdims, ddof)
+  }
+
+  /// Variance of all elements. See [`crate::ops::reduction::var`].
+  pub fn var(&self, keepdims: bool, ddof: i32) -> Result<Array> {
+    crate::ops::reduction::var(self, keepdims, ddof)
+  }
+
+  /// Standard deviation along the given axes. See [`crate::ops::reduction::std_axes`].
+  pub fn std_axes(&self, axes: &[i32], keepdims: bool, ddof: i32) -> Result<Array> {
+    crate::ops::reduction::std_axes(self, axes, keepdims, ddof)
+  }
+
+  /// Standard deviation of all elements. See [`crate::ops::reduction::std`].
+  pub fn std(&self, keepdims: bool, ddof: i32) -> Result<Array> {
+    crate::ops::reduction::std(self, keepdims, ddof)
+  }
+
+  /// Logical AND along the given axes. See [`crate::ops::reduction::all_axes`].
+  pub fn all_axes(&self, axes: &[i32], keepdims: bool) -> Result<Array> {
+    crate::ops::reduction::all_axes(self, axes, keepdims)
+  }
+
+  /// Logical AND of all elements. See [`crate::ops::reduction::all`].
+  pub fn all(&self, keepdims: bool) -> Result<Array> {
+    crate::ops::reduction::all(self, keepdims)
+  }
+
+  /// Logical OR along the given axes. See [`crate::ops::reduction::any_axes`].
+  pub fn any_axes(&self, axes: &[i32], keepdims: bool) -> Result<Array> {
+    crate::ops::reduction::any_axes(self, axes, keepdims)
+  }
+
+  /// Logical OR of all elements. See [`crate::ops::reduction::any`].
+  pub fn any(&self, keepdims: bool) -> Result<Array> {
+    crate::ops::reduction::any(self, keepdims)
+  }
+
+  /// `log(sum(exp(a)))` along the given axes. See [`crate::ops::reduction::logsumexp_axes`].
+  pub fn logsumexp_axes(&self, axes: &[i32], keepdims: bool) -> Result<Array> {
+    crate::ops::reduction::logsumexp_axes(self, axes, keepdims)
+  }
+
+  /// `log(sum(exp(a)))` of all elements. See [`crate::ops::reduction::logsumexp`].
+  pub fn logsumexp(&self, keepdims: bool) -> Result<Array> {
+    crate::ops::reduction::logsumexp(self, keepdims)
+  }
 }
