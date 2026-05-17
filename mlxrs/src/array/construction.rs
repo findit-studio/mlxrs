@@ -12,6 +12,10 @@ use crate::{
 struct ScalarGuard(mlxrs_sys::mlx_array);
 impl Drop for ScalarGuard {
   fn drop(&mut self) {
+    // SAFETY: frees a handle this guard owns exactly once. Runs during `Drop` /
+    // thread teardown: must not touch TLS, call `check()`, panic, or unwind
+    // across `extern "C"`; the rc is discarded silently per the crate's
+    // Drop convention.
     unsafe {
       let _ = mlxrs_sys::mlx_array_free(self.0);
     }
@@ -43,7 +47,13 @@ impl Array {
   pub fn ones<T: Element>(shape: &impl IntoShape) -> Result<Self> {
     shape.with_shape(|s| {
       validate_dims(s)?;
+      // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+      // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+      // early return / panic frees it, then populated by the following call.
       let mut out = Self(unsafe { mlxrs_sys::mlx_array_new() });
+      // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+      // not retained by mlx past it); the out-param was freshly allocated above
+      // and is written by this call; the backend rc is surfaced via `check()`.
       check(unsafe {
         mlxrs_sys::mlx_ones(
           &mut out.0,
@@ -61,7 +71,13 @@ impl Array {
   pub fn zeros<T: Element>(shape: &impl IntoShape) -> Result<Self> {
     shape.with_shape(|s| {
       validate_dims(s)?;
+      // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+      // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+      // early return / panic frees it, then populated by the following call.
       let mut out = Self(unsafe { mlxrs_sys::mlx_array_new() });
+      // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+      // not retained by mlx past it); the out-param was freshly allocated above
+      // and is written by this call; the backend rc is surfaced via `check()`.
       check(unsafe {
         mlxrs_sys::mlx_zeros(
           &mut out.0,
@@ -82,8 +98,18 @@ impl Array {
   pub fn full<T: Element>(shape: &impl IntoShape, value: f32) -> Result<Self> {
     shape.with_shape(|s| {
       validate_dims(s)?;
+      // SAFETY: fallible sentinel-handle ctor: the error handler is installed before
+      // the call (no default `printf+exit`), the raw handle is wrapped in its
+      // RAII guard before the NULL-ctx check (free is a defined no-op on a
+      // NULL ctx), and the inputs are valid for the duration of the call.
       let scalar = ScalarGuard(unsafe { mlxrs_sys::mlx_array_new_float32(value) });
+      // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+      // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+      // early return / panic frees it, then populated by the following call.
       let mut out = Self(unsafe { mlxrs_sys::mlx_array_new() });
+      // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+      // not retained by mlx past it); the out-param was freshly allocated above
+      // and is written by this call; the backend rc is surfaced via `check()`.
       check(unsafe {
         mlxrs_sys::mlx_full(
           &mut out.0,
@@ -103,7 +129,13 @@ impl Array {
     let n_i32 = i32::try_from(n).map_err(|_| Error::ShapeMismatch {
       message: format!("eye dim {n} exceeds i32::MAX"),
     })?;
+    // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+    // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+    // early return / panic frees it, then populated by the following call.
     let mut out = Self(unsafe { mlxrs_sys::mlx_array_new() });
+    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+    // not retained by mlx past it); the out-param was freshly allocated above
+    // and is written by this call; the backend rc is surfaced via `check()`.
     check(unsafe {
       mlxrs_sys::mlx_eye(
         &mut out.0,
@@ -119,7 +151,13 @@ impl Array {
 
   /// Creates a 1-D f32 array of evenly-spaced values in `[start, stop)`.
   pub fn arange(start: f32, stop: f32, step: f32) -> Result<Self> {
+    // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+    // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+    // early return / panic frees it, then populated by the following call.
     let mut out = Self(unsafe { mlxrs_sys::mlx_array_new() });
+    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+    // not retained by mlx past it); the out-param was freshly allocated above
+    // and is written by this call; the backend rc is surfaced via `check()`.
     check(unsafe {
       mlxrs_sys::mlx_arange(
         &mut out.0,
@@ -138,7 +176,13 @@ impl Array {
     let n_i32 = i32::try_from(num).map_err(|_| Error::ShapeMismatch {
       message: format!("linspace num {num} exceeds i32::MAX"),
     })?;
+    // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+    // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+    // early return / panic frees it, then populated by the following call.
     let mut out = Self(unsafe { mlxrs_sys::mlx_array_new() });
+    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+    // not retained by mlx past it); the out-param was freshly allocated above
+    // and is written by this call; the backend rc is surfaced via `check()`.
     check(unsafe {
       mlxrs_sys::mlx_linspace(
         &mut out.0,
@@ -182,6 +226,10 @@ impl Array {
       let dim_i32 = i32::try_from(s.len()).map_err(|_| Error::ShapeMismatch {
         message: format!("ndim {} exceeds i32::MAX", s.len()),
       })?;
+      // SAFETY: fallible sentinel-handle ctor: the error handler is installed first;
+      // the (data, dims, ndim) triple was validated above (shape product ==
+      // data.len(), non-negative dims, real `T` allocation via `data_ptr`'s
+      // typed sentinel for the empty case); mlx-c copies the buffer in.
       let arr = unsafe {
         mlxrs_sys::mlx_array_new_data(
           data_ptr(data).cast::<std::ffi::c_void>(),

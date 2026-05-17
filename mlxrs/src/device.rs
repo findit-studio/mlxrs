@@ -67,6 +67,9 @@ impl DeviceKind {
   pub fn count(self) -> Result<usize> {
     ensure_handler_installed();
     let mut n: i32 = 0;
+    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+    // not retained by mlx past it); the out-param was freshly allocated above
+    // and is written by this call; the backend rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_device_count(&mut n, self.to_raw()) })?;
     Ok(n.max(0) as usize)
   }
@@ -88,6 +91,9 @@ pub struct Device(pub(crate) mlxrs_sys::mlx_device);
 // read-only after construction (mlx-c provides no mutation API beyond
 // `mlx_device_set`, which fully replaces the handle's ctx).
 unsafe impl Send for Device {}
+// SAFETY: see the Send rationale above — `mlx::core::Device` is a `{kind,
+// index}` POD with no atomics-required mutation, so a shared `&Device`
+// across threads cannot race.
 unsafe impl Sync for Device {}
 
 assert_impl_all!(Device: Send, Sync);
@@ -129,6 +135,9 @@ impl Device {
   /// `Device` value owns it and frees on `Drop`.
   pub fn with_index(kind: DeviceKind, index: i32) -> Result<Self> {
     ensure_handler_installed();
+    // SAFETY: `mlx_device_new_type(kind, index)` builds an owned device handle from
+    // POD scalars; the error handler is installed first and the NULL-ctx
+    // case is checked by the caller before the handle is used.
     let raw = unsafe { mlxrs_sys::mlx_device_new_type(kind.to_raw(), index) };
     if raw.ctx.is_null() {
       return Err(crate::Error::Backend {
@@ -146,7 +155,13 @@ impl Device {
     // `mlx_device_new` returns an empty handle (NULL ctx) intended to be
     // populated by a subsequent set/get call — same out-param convention as
     // `mlx_array_new`. Wrap in `Self` first so RAII covers the fallible set.
+    // SAFETY: `mlx_device_new()` returns a fresh empty out-param handle (NULL ctx)
+    // per the mlx-c convention; wrapped in the RAII newtype FIRST so an early
+    // return frees it, then populated by the following set/get call.
     let mut out = Self(unsafe { mlxrs_sys::mlx_device_new() });
+    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+    // not retained by mlx past it); the out-param was freshly allocated above
+    // and is written by this call; the backend rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_device_set(&mut out.0, self.0) })?;
     Ok(out)
   }
@@ -162,7 +177,13 @@ impl Device {
     let _g = DEFAULT_DEVICE_LOCK
       .lock()
       .unwrap_or_else(|p| p.into_inner());
+    // SAFETY: `mlx_device_new()` returns a fresh empty out-param handle (NULL ctx)
+    // per the mlx-c convention; wrapped in the RAII newtype FIRST so an early
+    // return frees it, then populated by the following set/get call.
     let mut out = Self(unsafe { mlxrs_sys::mlx_device_new() });
+    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+    // not retained by mlx past it); the out-param was freshly allocated above
+    // and is written by this call; the backend rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_get_default_device(&mut out.0) })?;
     Ok(out)
   }
@@ -193,6 +214,9 @@ impl Device {
     let _g = DEFAULT_DEVICE_LOCK
       .lock()
       .unwrap_or_else(|p| p.into_inner());
+    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+    // not retained by mlx past it); the out-param was freshly allocated above
+    // and is written by this call; the backend rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_set_default_device(self.0) })
   }
 
@@ -201,6 +225,9 @@ impl Device {
   pub fn kind(&self) -> Result<DeviceKind> {
     ensure_handler_installed();
     let mut raw: mlxrs_sys::mlx_device_type = 0;
+    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+    // not retained by mlx past it); the out-param was freshly allocated above
+    // and is written by this call; the backend rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_device_get_type(&mut raw, self.0) })?;
     DeviceKind::from_raw(raw)
   }
@@ -211,6 +238,9 @@ impl Device {
   pub fn index(&self) -> Result<i32> {
     ensure_handler_installed();
     let mut idx: i32 = 0;
+    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+    // not retained by mlx past it); the out-param was freshly allocated above
+    // and is written by this call; the backend rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_device_get_index(&mut idx, self.0) })?;
     Ok(idx)
   }
@@ -220,6 +250,9 @@ impl Device {
   pub fn is_available(&self) -> Result<bool> {
     ensure_handler_installed();
     let mut avail = false;
+    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+    // not retained by mlx past it); the out-param was freshly allocated above
+    // and is written by this call; the backend rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_device_is_available(&mut avail, self.0) })?;
     Ok(avail)
   }
@@ -227,6 +260,8 @@ impl Device {
   /// Whether two devices refer to the same `{kind, index}` pair. Wraps
   /// `mlx_device_equal`.
   pub fn equal(&self, other: &Device) -> bool {
+    // SAFETY: pure comparison of two valid borrowed handles; mlx-c does not mutate
+    // or retain either and returns a plain `bool`.
     unsafe { mlxrs_sys::mlx_device_equal(self.0, other.0) }
   }
 
@@ -258,19 +293,35 @@ impl std::fmt::Debug for Device {
     crate::error::ensure_handler_installed();
     // Borrow the raw bytes from mlx_string. RAII via the local guard so a
     // panic in `write!` still frees the string.
+    // SAFETY: `mlx_string_new()` returns a fresh empty out-param `mlx_string`
+    // (NULL ctx) per the mlx-c convention; populated by the following call
+    // and freed via the local guard / explicit `mlx_string_free`.
     let mut s = unsafe { mlxrs_sys::mlx_string_new() };
+    // SAFETY: `self.0` is a valid borrowed handle; `s` is a fresh `mlx_string`
+    // out-param freed via the local guard/explicit free; mlx-c writes the
+    // formatted string into it and the rc is surfaced (checked below).
     let rc = unsafe { mlxrs_sys::mlx_device_tostring(&mut s, self.0) };
     let result = if rc == 0 {
+      // SAFETY: `s` is a live `mlx_string` (freed only after this borrow); mlx-c
+      // returns its internal NUL-terminated buffer, valid until the string is
+      // freed. The returned pointer is NULL-checked before use.
       let p = unsafe { mlxrs_sys::mlx_string_data(s) };
       if p.is_null() {
         write!(f, "Device(<unprintable>)")
       } else {
+        // SAFETY: the pointer was NULL-checked just above and points into the live
+        // `mlx_string` (still owned here, freed only after this borrow); the C
+        // string is NUL-terminated by mlx-c.
         let cs = unsafe { CStr::from_ptr(p) };
         write!(f, "Device({})", cs.to_string_lossy())
       }
     } else {
       write!(f, "Device(<unprintable>)")
     };
+    // SAFETY: frees a handle this guard owns exactly once. Runs during `Drop` /
+    // thread teardown: must not touch TLS, call `check()`, panic, or unwind
+    // across `extern "C"`; the rc is discarded silently per the crate's
+    // Drop convention.
     unsafe {
       let _ = mlxrs_sys::mlx_string_free(s);
     }

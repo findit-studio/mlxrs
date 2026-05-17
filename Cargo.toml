@@ -35,6 +35,11 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 ] }
 
 [workspace.lints.clippy]
+# Every hand-written `unsafe {}` block must carry a `// SAFETY:` comment.
+# Generated bindgen output (mlxrs-sys/src/generated) is exempt via the
+# scoped `#[allow]` on that private module — it has no `unsafe {}` blocks
+# today, but the scoped allow keeps a future regen from tripping this.
+undocumented_unsafe_blocks = "deny"
 redundant_clone = "deny"
 needless_collect = "deny"
 unnecessary_to_owned = "deny"

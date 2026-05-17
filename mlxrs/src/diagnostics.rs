@@ -142,7 +142,13 @@ pub fn install() {
   // SAFETY: pure query — `act` is NULL so no disposition is changed; `prev`
   // is a valid, zeroed, writable `libc::sigaction` out-param. Reentrant /
   // async-signal-safe regardless (it installs nothing).
+  // SAFETY: all-zero is a valid initial `libc::sigaction` (a plain C struct
+  // of integers/pointers + `sa_mask`); it is fully written by the query below
+  // before any field is read.
   let mut prev: libc::sigaction = unsafe { std::mem::zeroed() };
+  // SAFETY: pure query — the new-action ptr is NULL so no disposition is
+  // changed; `prev` is the valid, zeroed, writable out-param above.
+  // `sigaction` is async-signal-safe; failure is surfaced via `rc_q`.
   let rc_q = unsafe { libc::sigaction(libc::SIGABRT, ptr::null(), &mut prev) };
   if rc_q != 0 {
     // Query failed: do NOT install our SIGABRT handler (we have no trusted
@@ -175,8 +181,13 @@ pub fn install() {
   // direct fn-item-to-int cast: that is the idiom rustc's
   // `function_casts_as_integer` lint and clippy's `fn_to_numeric_cast*`
   // both point to, so no lint allow is needed.
+  // SAFETY: all-zero is a valid initial `libc::sigaction`; every field used
+  // (`sa_sigaction`, `sa_mask`, `sa_flags`) is explicitly set below before it
+  // is passed to `sigaction`.
   let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
   act.sa_sigaction = abort_diag_handler as *const () as libc::sighandler_t;
+  // SAFETY: `sigemptyset` initializes the `sa_mask` of the local, exclusively
+  // owned, writable `act`; it touches nothing else and cannot fail here.
   unsafe {
     libc::sigemptyset(&mut act.sa_mask);
   }
