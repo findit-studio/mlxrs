@@ -70,6 +70,29 @@ pub enum Error {
     /// Message captured from mlx-c's error handler.
     message: String,
   },
+
+  /// Tokenizer subsystem error (HF tokenizer load/encode/decode, chat-template
+  /// render, tool-call parse). Only constructed when the `tokenizer` feature
+  /// is enabled. The message carries the underlying cause.
+  #[cfg(feature = "tokenizer")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "tokenizer")))]
+  #[error("tokenizer: {message}")]
+  Tokenizer {
+    /// Human-readable description of the tokenizer failure.
+    message: String,
+  },
+}
+
+#[cfg(feature = "tokenizer")]
+impl Error {
+  /// Construct a [`Error::Tokenizer`] from anything stringifiable. Used
+  /// throughout the `tokenizer` module to funnel HF / minijinja / serde
+  /// failures into the crate's unified error type.
+  pub(crate) fn tokenizer(message: impl Into<String>) -> Self {
+    Self::Tokenizer {
+      message: message.into(),
+    }
+  }
 }
 
 /// Convenience alias for `Result<T, Error>`.

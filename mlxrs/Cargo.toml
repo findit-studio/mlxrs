@@ -11,11 +11,22 @@ rust-version.workspace = true
 
 [features]
 default = []
-lm = []
-vlm = []
-embeddings = []
-audio = ["lm"]                       # mirrors mlx-audio's Python dep on mlx-lm
-unstable-ops-overload = []           # `&a + &b` etc. (panic on shape error). OFF by default.
+# Granular, capability-named tokenizer features (minimize deps).
+tokenizer            = ["dep:tokenizers"]                                          # HfTokenizer load + encode/decode + special tokens from tokenizer.json. NO serde_json/minijinja.
+tokenizer-config     = ["tokenizer", "dep:serde_json"]                             # parse tokenizer_config.json → bos/eos/unk/chat_template/added-tokens
+tokenizer-stream     = ["tokenizer"]                                               # StreamingDetokenizer trait + NaiveStreamingDetokenizer (no serde_json)
+tokenizer-gpt2       = []                                                          # GPT-2 bytes↔unicode table (committed cargo-xtask-codegen artifact)
+tokenizer-bpe        = ["tokenizer-stream", "tokenizer-gpt2", "dep:serde_json"]    # GPT-2 byte-level streaming detok + decoder-class inference
+tokenizer-spm        = ["tokenizer-stream", "dep:serde_json"]                      # SentencePiece (+no-space) streaming detok + decoder-class inference
+tokenizer-chat       = ["tokenizer-config", "dep:minijinja", "dep:minijinja-contrib", "dep:serde", "dep:jiff"]   # jinja apply_chat_template (jiff: strftime_now)
+tokenizer-deepseek-v32 = ["tokenizer-chat"]                                        # the one shipped chat-template override
+tokenizer-tools      = ["tokenizer-config", "dep:serde_json"]                      # tool-call parsers + infer_tool_parser
+# umbrellas (compose only)
+embeddings           = ["tokenizer"]                                               # encode/decode only — pulls ONLY the tokenizers crate
+lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm", "tokenizer-bpe", "tokenizer-chat", "tokenizer-deepseek-v32", "tokenizer-tools"]
+vlm                  = ["lm"]
+audio                = ["lm"]            # mirrors mlx-audio's Python dep on mlx-lm
+unstable-ops-overload = []               # `&a + &b` etc. (panic on shape error). OFF by default.
 
 [dependencies]
 mlxrs-sys.workspace = true
@@ -25,6 +36,24 @@ smallvec.workspace = true
 static_assertions.workspace = true
 ctor.workspace = true
 libc = "0.2"                          # SIGABRT diagnostics handler (diagnostics.rs)
+tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
+minijinja = { version = "2", features = ["loader", "json", "loop_controls", "builtins", "preserve_order"], optional = true }
+minijinja-contrib = { version = "2", features = ["pycompat"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true, features = ["preserve_order"] }
+# `strftime_now` chat-template helper only — pulled SOLELY by `tokenizer-chat`
+# (`dep:jiff`), never by the serde_json-free `tokenizer` core, the
+# stream/bpe/spm features, or `[build-dependencies]`. Local-now formatted per
+# Python `datetime.now().strftime`. Loose caret semver (crates.io current
+# major is 0.2.x — verified 0.2.24); never an exact `=` pin.
+jiff = { version = "0.2", optional = true }
+
+# No [build-dependencies]: ALL tokenizer codegen moved to the `xtask` crate
+# (`cargo xtask-codegen`), so a normal `mlxrs` build never compiles
+# `tokenizers`/`serde_json`/`toml`. build.rs now only does tarpaulin-cfg
+# detection (std-only). Regenerated artifacts are committed source
+# (src/tokenizer/generated.rs, tests/fixtures/*.json); `cargo xtask-codegen
+# --check` is the drift guard against mlxrs/data/tokenizer/.
 
 [dev-dependencies]
 approx.workspace = true

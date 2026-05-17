@@ -1,4 +1,12 @@
 //! xtask: maintainer-only commands. Run via `cargo run -p xtask -- <subcommand>`.
+//!
+//! `regen-bindings` builds with no extra deps. The `codegen` subcommand and
+//! its heavy `tokenizers`/`serde_json`/`toml` deps are gated behind the
+//! optional `codegen` feature; invoke it via `cargo xtask-codegen` (alias
+//! for `cargo run -p xtask --features codegen -- codegen`).
+
+#[cfg(feature = "codegen")]
+mod codegen;
 
 use std::{env, path::PathBuf, process::ExitCode};
 
@@ -7,6 +15,24 @@ fn main() -> ExitCode {
   let cmd = args.next().unwrap_or_else(|| "help".to_string());
   match cmd.as_str() {
     "regen-bindings" => regen_bindings(),
+    "codegen" => {
+      #[cfg(feature = "codegen")]
+      {
+        let check = args.any(|a| a == "--check");
+        codegen::run(check)
+      }
+      #[cfg(not(feature = "codegen"))]
+      {
+        eprintln!(
+          "`codegen` requires the `codegen` feature (it pulls the heavy \
+           tokenizers/serde_json/toml toolchain)."
+        );
+        eprintln!("Run with: cargo xtask-codegen        (alias for");
+        eprintln!("          cargo run -p xtask --features codegen -- codegen)");
+        eprintln!("Drift guard: cargo xtask-codegen --check");
+        ExitCode::FAILURE
+      }
+    }
     "help" | "--help" | "-h" => {
       print_help();
       ExitCode::SUCCESS
@@ -28,6 +54,11 @@ fn print_help() {
   eprintln!("SUBCOMMANDS:");
   eprintln!("  regen-bindings    Re-run bindgen against vendor/mlx-c headers and");
   eprintln!("                    write to mlxrs-sys/src/generated/bindings.rs");
+  eprintln!("  codegen [--check] Regenerate the committed tokenizer artifacts from");
+  eprintln!("                    mlxrs/data/tokenizer/ (--check: diff-only, no writes).");
+  eprintln!("                    Requires the `codegen` feature — invoke as");
+  eprintln!("                    `cargo xtask-codegen [--check]` (alias for");
+  eprintln!("                    `cargo run -p xtask --features codegen -- codegen`).");
   eprintln!("  help              Show this message");
 }
 

@@ -9,6 +9,22 @@ publish = false
 [dependencies]
 bindgen.workspace = true
 walkdir.workspace = true
+# Heavy codegen-only deps, gated behind the optional `codegen` feature so
+# they compile ONLY for `cargo xtask-codegen` (`cargo run -p xtask
+# --features codegen -- codegen`) — never on a normal `mlxrs` build/test,
+# nor on `cargo run -p xtask -- regen-bindings`, nor on a default-member
+# `cargo build --workspace`. Loose semver (cron-CI catches breakage);
+# `tokenizers` carries `onig` here so the C toolchain stays isolated to
+# this crate.
+tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
+serde_json = { version = "1", optional = true }
+toml = { version = "0.8", optional = true }
+
+[features]
+# Pulls the tokenizer-codegen toolchain. Required for the `codegen`
+# subcommand; off by default so routine workspace + `regen-bindings`
+# builds stay light.
+codegen = ["dep:tokenizers", "dep:serde_json", "dep:toml"]
 
 [lints]
 workspace = true

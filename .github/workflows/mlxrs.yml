@@ -3,15 +3,21 @@ name: mlxrs
 on:
   push:
     branches: [main, mlx]
+    # `xtask/**` is included so a codegen-tooling change retriggers the
+    # drift guard below. `mlxrs/**` already covers the codegen
+    # source-of-truth + artifacts (`mlxrs/data/tokenizer/**`,
+    # `mlxrs/src/tokenizer/generated.rs`, `mlxrs/tests/fixtures/**`).
     paths:
       - 'mlxrs/**'
       - 'mlxrs-sys/**'
+      - 'xtask/**'
       - 'Cargo.toml'
       - '.github/workflows/mlxrs.yml'
   pull_request:
     paths:
       - 'mlxrs/**'
       - 'mlxrs-sys/**'
+      - 'xtask/**'
       - 'Cargo.toml'
       - '.github/workflows/mlxrs.yml'
   workflow_dispatch:
@@ -29,6 +35,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Fail-early: the committed tokenizer codegen artifacts
+  # (`mlxrs/src/tokenizer/generated.rs`, `mlxrs/tests/fixtures/*`) must
+  # match a fresh regen from the `mlxrs/data/tokenizer/` source-of-truth.
+  # Runs in parallel with `build-test` (lightweight; no mlx-c submodule /
+  # cmake needed — codegen only reads `mlxrs/data/` + runs `rustfmt`).
+  codegen-drift:
+    name: codegen-drift
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt
+      - name: cargo xtask-codegen --check (drift guard)
+        run: cargo run -p xtask --features codegen -- codegen --check
+
   build-test:
     name: build-test
     runs-on: macos-14

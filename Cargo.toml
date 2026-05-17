@@ -4,6 +4,15 @@ members = [
   "mlxrs-sys",
   "xtask",
 ]
+# `xtask` is a maintainer-only build/codegen helper, not a shipped crate.
+# Excluding it from `default-members` keeps a bare `cargo build` / `cargo
+# test` / CI default invocation from compiling it (and, transitively, its
+# heavy optional codegen deps). It stays a full `members` entry so explicit
+# `cargo run -p xtask -- …` and `--workspace` still build it.
+default-members = [
+  "mlxrs",
+  "mlxrs-sys",
+]
 resolver = "3"
 
 [workspace.package]
