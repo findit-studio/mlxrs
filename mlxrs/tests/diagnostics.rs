@@ -37,8 +37,24 @@ use std::sync::{
   atomic::{AtomicBool, Ordering},
 };
 
+// `std::panic::{set_hook,take_hook}` and `diagnostics::install()`'s one-shot
+// `INSTALLED` guard are process-global. `cargo test` runs this binary's tests
+// concurrently by default, so tests that mutate that shared state must be
+// mutually exclusive or they corrupt each other's observed take/set/restore
+// sequence (a parallel-only flake). Every guarded test fully restores global
+// hook state itself before returning, so a failed assertion (which panics
+// while holding this lock and poisons it) leaves no torn global state — the
+// next serialized test can safely recover the guard via
+// `PoisonError::into_inner` rather than failing with an unrelated panic.
+static DIAG_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn install_is_idempotent() {
+  // Serialized: calls the process-global `install()` (`INSTALLED` guard).
+  let _serial = DIAG_SERIAL
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner);
+
   mlxrs::diagnostics::install();
   mlxrs::diagnostics::install();
   mlxrs::diagnostics::install();
@@ -46,6 +62,12 @@ fn install_is_idempotent() {
 
 #[test]
 fn panic_hook_chains_previous() {
+  // Serialized: mutates the process-global panic hook (`take_hook`/
+  // `set_hook`) and calls `install()`.
+  let _serial = DIAG_SERIAL
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner);
+
   // The default test harness installs its own panic hook; save it so we can
   // restore exactly what was there, leaving the binary's shared state intact
   // for other tests regardless of run order.
