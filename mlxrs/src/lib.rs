@@ -29,6 +29,7 @@ pub use version::version;
 
 pub mod array;
 pub mod device;
+pub mod diagnostics;
 pub mod dtype;
 pub mod error;
 pub mod ops;

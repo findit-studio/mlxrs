@@ -24,11 +24,13 @@ half.workspace = true
 smallvec.workspace = true
 static_assertions.workspace = true
 ctor.workspace = true
+libc = "0.2"                          # SIGABRT diagnostics handler (diagnostics.rs)
 
 [dev-dependencies]
 approx.workspace = true
 trybuild.workspace = true
 criterion = "0.8"
+libc = "0.2"                          # SIGABRT child-process test (tests/diagnostics.rs)
 
 [package.metadata.docs.rs]
 all-features = true

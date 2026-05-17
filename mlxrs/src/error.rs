@@ -79,6 +79,23 @@ thread_local! {
   pub(crate) static LAST: RefCell<Option<Error>> = const { RefCell::new(None) };
 }
 
+/// The most recent backend error recorded on this thread, if any. Used by
+/// [`crate::diagnostics`] to surface mlx context when a panic follows a
+/// backend failure. Non-panicking: `try_with` keeps it safe during thread
+/// teardown, and `try_borrow` keeps it safe when called from inside a panic
+/// hook that interrupted code already holding the `RefCell` borrow — a
+/// borrow conflict yields `None` rather than a (double-)panic.
+pub(crate) fn last_error_message() -> Option<String> {
+  LAST
+    .try_with(|c| {
+      c.try_borrow()
+        .ok()
+        .and_then(|g| g.as_ref().map(|e| e.to_string()))
+    })
+    .ok()
+    .flatten()
+}
+
 /// Set to `true` by the `#[ctor]` install. Read by the static-init smoke test
 /// to verify the eager install ran (vs the lazy fallback rescuing it).
 pub(crate) static INIT_VIA_CTOR: AtomicBool = AtomicBool::new(false);
