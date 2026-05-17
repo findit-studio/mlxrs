@@ -174,6 +174,28 @@ pub(crate) fn check_handle(handle: mlxrs_sys::mlx_array) -> Result<crate::Array>
   }
 }
 
+/// Sentinel-handle pattern for `mlx_vector_array`-returning constructors
+/// (e.g. `mlx_vector_array_new`): they report failure via the error handler
+/// and return a handle with NULL `ctx`. Unlike [`check_handle`] the caller
+/// keeps ownership of its handle (it is passed by value into the subsequent
+/// mlx-c call and freed by its own RAII guard), so this returns `Result<()>`
+/// like [`check`] — draining `LAST` into `Err` when `ctx` is null. Same
+/// install contract as [`check`].
+#[inline]
+pub(crate) fn check_vector_array_handle(handle: mlxrs_sys::mlx_vector_array) -> Result<()> {
+  if handle.ctx.is_null() {
+    Err(
+      LAST
+        .with(|c| c.borrow_mut().take())
+        .unwrap_or(Error::Backend {
+          message: "mlx returned null vector_array handle".into(),
+        }),
+    )
+  } else {
+    Ok(())
+  }
+}
+
 #[cfg(test)]
 mod init_smoke {
   use super::*;

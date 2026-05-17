@@ -30,6 +30,10 @@ thread_local! {
 /// per-thread CPU stream pattern.
 fn random_cpu_stream() -> mlxrs_sys::mlx_stream {
   crate::error::ensure_handler_installed();
+  // Honor the #13 cleared-thread poison contract (as `default_stream()` /
+  // `Stream::default_cpu()` do): a CPU-routed op on a poisoned thread must
+  // fail fast, not continue into mlx with torn-down stream state.
+  crate::stream::assert_streams_not_cleared();
   CPU_STREAM.with(|cell| {
     if let Some(s) = cell.get() {
       return s;
@@ -50,6 +54,14 @@ fn random_cpu_stream() -> mlxrs_sys::mlx_stream {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.random.key.html).
 pub fn key(seed: u64) -> Result<Array> {
+  // No `default_stream()` on this path, so the eager-#[ctor] handler is not
+  // guaranteed installed; install it before the fallible mlx-c call (else a
+  // stripped ctor → mlx-c's default `printf+exit(-1)` aborts from safe Rust).
+  crate::error::ensure_handler_installed();
+  // Honor the #13 cleared-thread poison contract (as `random_cpu_stream()` /
+  // `linalg_cpu_stream()` do): a safe op on a poisoned thread must fail fast,
+  // not enter mlx-c with torn-down stream state.
+  crate::stream::assert_streams_not_cleared();
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe { mlxrs_sys::mlx_random_key(&mut out.0, seed) })?;
   Ok(out)
@@ -60,6 +72,10 @@ pub fn key(seed: u64) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.random.seed.html).
 pub fn seed(seed: u64) -> Result<()> {
+  // Same as `key`: no stream on this path — install the handler first, then
+  // honor the #13 cleared-thread poison contract before entering mlx-c.
+  crate::error::ensure_handler_installed();
+  crate::stream::assert_streams_not_cleared();
   check(unsafe { mlxrs_sys::mlx_random_seed(seed) })
 }
 

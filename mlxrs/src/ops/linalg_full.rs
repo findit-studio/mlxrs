@@ -26,7 +26,7 @@ use std::{
 
 use crate::{
   array::Array,
-  error::{Result, check},
+  error::{Result, check, check_vector_array_handle},
   shape::dim_ptr,
   stream::default_stream,
 };
@@ -41,6 +41,10 @@ thread_local! {
 /// at process exit can crash). `norm` / `cross` use the regular GPU stream.
 fn linalg_cpu_stream() -> mlxrs_sys::mlx_stream {
   crate::error::ensure_handler_installed();
+  // Honor the #13 cleared-thread poison contract (as `default_stream()` /
+  // `Stream::default_cpu()` do): a CPU-routed op on a poisoned thread must
+  // fail fast, not continue into mlx with torn-down stream state.
+  crate::stream::assert_streams_not_cleared();
   CPU_STREAM.with(|cell| {
     if let Some(s) = cell.get() {
       return s;
@@ -127,9 +131,21 @@ pub fn qr(a: &Array) -> Result<(Array, Array)> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.svd.html).
 pub fn svd(a: &Array, compute_uv: bool) -> Result<Vec<Array>> {
+  // Resolve the CPU stream FIRST — `linalg_cpu_stream()` runs the cleared-thread
+  // poison guard (`assert_streams_not_cleared`) and installs the error handler
+  // (`ensure_handler_installed`) before the fallible `mlx_vector_array_new()`
+  // allocation. This is intentionally stronger than test coverage: a poisoned
+  // thread must fail fast (panic) here rather than return `Err` if the
+  // subsequent alloc fails under allocator pressure. No alloc-failure injection
+  // hook exists, so guard order — not a test — enforces the fail-fast contract.
+  let s = linalg_cpu_stream();
   let mut vec_out = unsafe { mlxrs_sys::mlx_vector_array_new() };
+  // `mlx_vector_array_new` is fallible: a null `ctx` means allocation failed
+  // and an error sits in TLS. Validate (draining handler state) BEFORE the
+  // guard so it only ever wraps a non-null handle (no leak / double-free).
+  check_vector_array_handle(vec_out)?;
   let _vec_guard = VectorArrayGuard(vec_out);
-  check(unsafe { mlxrs_sys::mlx_linalg_svd(&mut vec_out, a.0, compute_uv, linalg_cpu_stream()) })?;
+  check(unsafe { mlxrs_sys::mlx_linalg_svd(&mut vec_out, a.0, compute_uv, s) })?;
   drain_vector(vec_out)
 }
 
@@ -138,9 +154,16 @@ pub fn svd(a: &Array, compute_uv: bool) -> Result<Vec<Array>> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.lu.html).
 pub fn lu(a: &Array) -> Result<Vec<Array>> {
+  // See `svd`: resolve the CPU stream FIRST so the cleared-thread poison guard
+  // and handler-install run before the fallible `mlx_vector_array_new()`. A
+  // poisoned thread must panic here, not return `Err` under allocator pressure.
+  let s = linalg_cpu_stream();
   let mut vec_out = unsafe { mlxrs_sys::mlx_vector_array_new() };
+  // See `svd`: validate the fallible allocation (draining handler state)
+  // before the guard so it only ever wraps a non-null handle.
+  check_vector_array_handle(vec_out)?;
   let _vec_guard = VectorArrayGuard(vec_out);
-  check(unsafe { mlxrs_sys::mlx_linalg_lu(&mut vec_out, a.0, linalg_cpu_stream()) })?;
+  check(unsafe { mlxrs_sys::mlx_linalg_lu(&mut vec_out, a.0, s) })?;
   drain_vector(vec_out)
 }
 
