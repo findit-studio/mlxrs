@@ -329,9 +329,9 @@ impl Stream {
     // Synchronizing a stream whose thread was cleared touches dead encoder
     // state — fail fast with the actionable message instead.
     assert_streams_not_cleared();
-    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
-    // not retained by mlx past it); the out-param was freshly allocated above
-    // and is written by this call; the backend rc is surfaced via `check()`.
+    // SAFETY: `self.0` is a valid borrowed stream handle for the duration of
+    // the call, mlx does not retain it past the call, and the backend rc is
+    // surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_synchronize(self.0) })
   }
 
