@@ -142,10 +142,16 @@ impl Element for bool {
   const DTYPE: Dtype = Dtype::Bool;
   unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
     let mut out: bool = false;
+    // SAFETY: trait contract (see `Element::item` # Safety): `arr` is a valid,
+    // evaluated handle whose dtype the caller verified `== Self::DTYPE`;
+    // `out` is a live stack slot; the rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_array_item_bool(&mut out, arr) })?;
     Ok(out)
   }
   unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    // SAFETY: trait contract (see `Element::data` # Safety): `arr` is a valid,
+    // evaluated, dtype-/contiguity-checked handle; the call returns a
+    // borrowed `(ptr, len)` view into mlx's buffer (no retain, no rc).
     unsafe {
       (
         mlxrs_sys::mlx_array_data_bool(arr),
@@ -163,10 +169,16 @@ impl Element for i32 {
   const DTYPE: Dtype = Dtype::I32;
   unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
     let mut out: i32 = 0;
+    // SAFETY: trait contract (see `Element::item` # Safety): `arr` is a valid,
+    // evaluated handle whose dtype the caller verified `== Self::DTYPE`;
+    // `out` is a live stack slot; the rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_array_item_int32(&mut out, arr) })?;
     Ok(out)
   }
   unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    // SAFETY: trait contract (see `Element::data` # Safety): `arr` is a valid,
+    // evaluated, dtype-/contiguity-checked handle; the call returns a
+    // borrowed `(ptr, len)` view into mlx's buffer (no retain, no rc).
     unsafe {
       (
         mlxrs_sys::mlx_array_data_int32(arr),
@@ -184,10 +196,16 @@ impl Element for u32 {
   const DTYPE: Dtype = Dtype::U32;
   unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
     let mut out: u32 = 0;
+    // SAFETY: trait contract (see `Element::item` # Safety): `arr` is a valid,
+    // evaluated handle whose dtype the caller verified `== Self::DTYPE`;
+    // `out` is a live stack slot; the rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_array_item_uint32(&mut out, arr) })?;
     Ok(out)
   }
   unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    // SAFETY: trait contract (see `Element::data` # Safety): `arr` is a valid,
+    // evaluated, dtype-/contiguity-checked handle; the call returns a
+    // borrowed `(ptr, len)` view into mlx's buffer (no retain, no rc).
     unsafe {
       (
         mlxrs_sys::mlx_array_data_uint32(arr),
@@ -205,10 +223,16 @@ impl Element for f32 {
   const DTYPE: Dtype = Dtype::F32;
   unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
     let mut out: f32 = 0.0;
+    // SAFETY: trait contract (see `Element::item` # Safety): `arr` is a valid,
+    // evaluated handle whose dtype the caller verified `== Self::DTYPE`;
+    // `out` is a live stack slot; the rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_array_item_float32(&mut out, arr) })?;
     Ok(out)
   }
   unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    // SAFETY: trait contract (see `Element::data` # Safety): `arr` is a valid,
+    // evaluated, dtype-/contiguity-checked handle; the call returns a
+    // borrowed `(ptr, len)` view into mlx's buffer (no retain, no rc).
     unsafe {
       (
         mlxrs_sys::mlx_array_data_float32(arr),
@@ -229,13 +253,22 @@ impl Element for f32 {
 impl Element for half::f16 {
   const DTYPE: Dtype = Dtype::F16;
   unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
+    // SAFETY: the raw bindgen 16-bit float type is a plain integer newtype; an
+    // all-zero bit pattern is a valid (zero) value, overwritten by the
+    // following `mlx_array_item_*` call before it is read.
     let mut raw: mlxrs_sys::float16_t = unsafe { std::mem::zeroed() };
+    // SAFETY: trait contract (see `Element::item` # Safety): `arr` is a valid,
+    // evaluated handle whose dtype the caller verified `== Self::DTYPE`;
+    // `out` is a live stack slot; the rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_array_item_float16(&mut raw, arr) })?;
     // SAFETY: float16_t and half::f16 are both #[repr(transparent)] newtypes
     // around u16, identical IEEE-754 binary16 representation.
     Ok(unsafe { std::mem::transmute_copy(&raw) })
   }
   unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    // SAFETY: trait contract (see `Element::data` # Safety): `arr` is a valid,
+    // evaluated, dtype-/contiguity-checked handle; the call returns a
+    // borrowed `(ptr, len)` view into mlx's buffer (no retain, no rc).
     unsafe {
       (
         mlxrs_sys::mlx_array_data_float16(arr) as *const half::f16,
@@ -253,10 +286,16 @@ impl Element for u8 {
   const DTYPE: Dtype = Dtype::U8;
   unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
     let mut out: u8 = 0;
+    // SAFETY: trait contract (see `Element::item` # Safety): `arr` is a valid,
+    // evaluated handle whose dtype the caller verified `== Self::DTYPE`;
+    // `out` is a live stack slot; the rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_array_item_uint8(&mut out, arr) })?;
     Ok(out)
   }
   unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    // SAFETY: trait contract (see `Element::data` # Safety): `arr` is a valid,
+    // evaluated, dtype-/contiguity-checked handle; the call returns a
+    // borrowed `(ptr, len)` view into mlx's buffer (no retain, no rc).
     unsafe {
       (
         mlxrs_sys::mlx_array_data_uint8(arr),
@@ -274,10 +313,16 @@ impl Element for u16 {
   const DTYPE: Dtype = Dtype::U16;
   unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
     let mut out: u16 = 0;
+    // SAFETY: trait contract (see `Element::item` # Safety): `arr` is a valid,
+    // evaluated handle whose dtype the caller verified `== Self::DTYPE`;
+    // `out` is a live stack slot; the rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_array_item_uint16(&mut out, arr) })?;
     Ok(out)
   }
   unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    // SAFETY: trait contract (see `Element::data` # Safety): `arr` is a valid,
+    // evaluated, dtype-/contiguity-checked handle; the call returns a
+    // borrowed `(ptr, len)` view into mlx's buffer (no retain, no rc).
     unsafe {
       (
         mlxrs_sys::mlx_array_data_uint16(arr),
@@ -295,10 +340,16 @@ impl Element for u64 {
   const DTYPE: Dtype = Dtype::U64;
   unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
     let mut out: u64 = 0;
+    // SAFETY: trait contract (see `Element::item` # Safety): `arr` is a valid,
+    // evaluated handle whose dtype the caller verified `== Self::DTYPE`;
+    // `out` is a live stack slot; the rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_array_item_uint64(&mut out, arr) })?;
     Ok(out)
   }
   unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    // SAFETY: trait contract (see `Element::data` # Safety): `arr` is a valid,
+    // evaluated, dtype-/contiguity-checked handle; the call returns a
+    // borrowed `(ptr, len)` view into mlx's buffer (no retain, no rc).
     unsafe {
       (
         mlxrs_sys::mlx_array_data_uint64(arr),
@@ -316,10 +367,16 @@ impl Element for i8 {
   const DTYPE: Dtype = Dtype::I8;
   unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
     let mut out: i8 = 0;
+    // SAFETY: trait contract (see `Element::item` # Safety): `arr` is a valid,
+    // evaluated handle whose dtype the caller verified `== Self::DTYPE`;
+    // `out` is a live stack slot; the rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_array_item_int8(&mut out, arr) })?;
     Ok(out)
   }
   unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    // SAFETY: trait contract (see `Element::data` # Safety): `arr` is a valid,
+    // evaluated, dtype-/contiguity-checked handle; the call returns a
+    // borrowed `(ptr, len)` view into mlx's buffer (no retain, no rc).
     unsafe {
       (
         mlxrs_sys::mlx_array_data_int8(arr),
@@ -337,10 +394,16 @@ impl Element for i16 {
   const DTYPE: Dtype = Dtype::I16;
   unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
     let mut out: i16 = 0;
+    // SAFETY: trait contract (see `Element::item` # Safety): `arr` is a valid,
+    // evaluated handle whose dtype the caller verified `== Self::DTYPE`;
+    // `out` is a live stack slot; the rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_array_item_int16(&mut out, arr) })?;
     Ok(out)
   }
   unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    // SAFETY: trait contract (see `Element::data` # Safety): `arr` is a valid,
+    // evaluated, dtype-/contiguity-checked handle; the call returns a
+    // borrowed `(ptr, len)` view into mlx's buffer (no retain, no rc).
     unsafe {
       (
         mlxrs_sys::mlx_array_data_int16(arr),
@@ -358,10 +421,16 @@ impl Element for i64 {
   const DTYPE: Dtype = Dtype::I64;
   unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
     let mut out: i64 = 0;
+    // SAFETY: trait contract (see `Element::item` # Safety): `arr` is a valid,
+    // evaluated handle whose dtype the caller verified `== Self::DTYPE`;
+    // `out` is a live stack slot; the rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_array_item_int64(&mut out, arr) })?;
     Ok(out)
   }
   unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    // SAFETY: trait contract (see `Element::data` # Safety): `arr` is a valid,
+    // evaluated, dtype-/contiguity-checked handle; the call returns a
+    // borrowed `(ptr, len)` view into mlx's buffer (no retain, no rc).
     unsafe {
       (
         mlxrs_sys::mlx_array_data_int64(arr),
@@ -379,10 +448,16 @@ impl Element for f64 {
   const DTYPE: Dtype = Dtype::F64;
   unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
     let mut out: f64 = 0.0;
+    // SAFETY: trait contract (see `Element::item` # Safety): `arr` is a valid,
+    // evaluated handle whose dtype the caller verified `== Self::DTYPE`;
+    // `out` is a live stack slot; the rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_array_item_float64(&mut out, arr) })?;
     Ok(out)
   }
   unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    // SAFETY: trait contract (see `Element::data` # Safety): `arr` is a valid,
+    // evaluated, dtype-/contiguity-checked handle; the call returns a
+    // borrowed `(ptr, len)` view into mlx's buffer (no retain, no rc).
     unsafe {
       (
         mlxrs_sys::mlx_array_data_float64(arr),
@@ -404,13 +479,22 @@ impl Element for f64 {
 impl Element for half::bf16 {
   const DTYPE: Dtype = Dtype::BF16;
   unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
+    // SAFETY: the raw bindgen 16-bit float type is a plain integer newtype; an
+    // all-zero bit pattern is a valid (zero) value, overwritten by the
+    // following `mlx_array_item_*` call before it is read.
     let mut raw: mlxrs_sys::bfloat16_t = unsafe { std::mem::zeroed() };
+    // SAFETY: trait contract (see `Element::item` # Safety): `arr` is a valid,
+    // evaluated handle whose dtype the caller verified `== Self::DTYPE`;
+    // `out` is a live stack slot; the rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_array_item_bfloat16(&mut raw, arr) })?;
     // SAFETY: bfloat16_t and half::bf16 are both 16-bit (the former a bindgen
     // typedef of u16, the latter a #[repr(transparent)] newtype around u16).
     Ok(unsafe { std::mem::transmute_copy(&raw) })
   }
   unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    // SAFETY: trait contract (see `Element::data` # Safety): `arr` is a valid,
+    // evaluated, dtype-/contiguity-checked handle; the call returns a
+    // borrowed `(ptr, len)` view into mlx's buffer (no retain, no rc).
     unsafe {
       (
         mlxrs_sys::mlx_array_data_bfloat16(arr) as *const half::bf16,

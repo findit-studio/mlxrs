@@ -245,6 +245,9 @@ impl Stream {
   pub fn default_gpu() -> Result<Self> {
     ensure_handler_installed();
     assert_streams_not_cleared();
+    // SAFETY: `mlx_default_gpu_stream_new()` returns the thread's default GPU stream
+    // handle; the error handler is installed first and the NULL-ctx case is
+    // checked by the caller before the handle is used.
     let raw = unsafe { mlxrs_sys::mlx_default_gpu_stream_new() };
     if raw.ctx.is_null() {
       return Err(crate::Error::Backend {
@@ -260,6 +263,9 @@ impl Stream {
   pub fn default_cpu() -> Result<Self> {
     ensure_handler_installed();
     assert_streams_not_cleared();
+    // SAFETY: `mlx_default_cpu_stream_new()` returns the thread's default CPU stream
+    // handle; the error handler is installed first and the NULL-ctx case is
+    // checked by the caller before the handle is cached/used.
     let raw = unsafe { mlxrs_sys::mlx_default_cpu_stream_new() };
     if raw.ctx.is_null() {
       return Err(crate::Error::Backend {
@@ -284,6 +290,9 @@ impl Stream {
   pub fn new_on(device: &Device) -> Result<Self> {
     ensure_handler_installed();
     assert_streams_not_cleared();
+    // SAFETY: `mlx_stream_new_device(device.0)` takes a valid borrowed `mlx_device`
+    // and returns a new stream handle; the error handler is installed first
+    // and the NULL-ctx case is checked by the caller.
     let raw = unsafe { mlxrs_sys::mlx_stream_new_device(device.0) };
     if raw.ctx.is_null() {
       return Err(crate::Error::Backend {
@@ -302,7 +311,13 @@ impl Stream {
     // populated by `mlx_stream_set`/`mlx_get_default_stream` — same
     // out-param convention as `mlx_array_new`. Wrap in `Self` first so RAII
     // covers the fallible set.
+    // SAFETY: `mlx_stream_new()` returns a fresh empty out-param handle (NULL ctx)
+    // per the mlx-c convention; wrapped in the RAII newtype FIRST so an early
+    // return frees it, then populated by the following set/get call.
     let mut out = Self(unsafe { mlxrs_sys::mlx_stream_new() });
+    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+    // not retained by mlx past it); the out-param was freshly allocated above
+    // and is written by this call; the backend rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_stream_set(&mut out.0, self.0) })?;
     Ok(out)
   }
@@ -314,6 +329,9 @@ impl Stream {
     // Synchronizing a stream whose thread was cleared touches dead encoder
     // state — fail fast with the actionable message instead.
     assert_streams_not_cleared();
+    // SAFETY: `self.0` is a valid borrowed stream handle for the duration of
+    // the call, mlx does not retain it past the call, and the backend rc is
+    // surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_synchronize(self.0) })
   }
 
@@ -371,6 +389,9 @@ impl Stream {
     // "exempt from the poison guard" paragraph in the doc above. Idempotent
     // by design.
     ensure_handler_installed();
+    // SAFETY: first-party C++ shim with no arguments; the error handler is installed
+    // first so a thrown `clear_streams()` surfaces as an rc rather than the
+    // default `printf+exit`.
     let rc = unsafe { mlxrs_sys::mlxrs_shim_clear_streams() };
     if rc != 0 {
       // The C++ clear_streams() threw before tearing anything down (it just
@@ -392,7 +413,13 @@ impl Stream {
   pub fn device(&self) -> Result<Device> {
     ensure_handler_installed();
     assert_streams_not_cleared();
+    // SAFETY: `mlx_device_new()` returns a fresh empty out-param handle (NULL ctx)
+    // per the mlx-c convention; wrapped in the RAII newtype FIRST so an early
+    // return frees it, then populated by the following set/get call.
     let mut dev = Device(unsafe { mlxrs_sys::mlx_device_new() });
+    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+    // not retained by mlx past it); the out-param was freshly allocated above
+    // and is written by this call; the backend rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_stream_get_device(&mut dev.0, self.0) })?;
     Ok(dev)
   }
@@ -403,6 +430,9 @@ impl Stream {
     ensure_handler_installed();
     assert_streams_not_cleared();
     let mut idx: i32 = 0;
+    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+    // not retained by mlx past it); the out-param was freshly allocated above
+    // and is written by this call; the backend rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_stream_get_index(&mut idx, self.0) })?;
     Ok(idx)
   }
@@ -411,6 +441,8 @@ impl Stream {
   /// `mlx_stream_equal`.
   pub fn equal(&self, other: &Stream) -> bool {
     assert_streams_not_cleared();
+    // SAFETY: pure comparison of two valid borrowed handles; mlx-c does not mutate
+    // or retain either and returns a plain `bool`.
     unsafe { mlxrs_sys::mlx_stream_equal(self.0, other.0) }
   }
 
@@ -434,7 +466,13 @@ impl Stream {
 pub fn get_default_stream(device: &Device) -> Result<Stream> {
   ensure_handler_installed();
   assert_streams_not_cleared();
+  // SAFETY: `mlx_stream_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; wrapped in the RAII newtype FIRST so an early
+  // return frees it, then populated by the following set/get call.
   let mut out = Stream(unsafe { mlxrs_sys::mlx_stream_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe { mlxrs_sys::mlx_get_default_stream(&mut out.0, device.0) })?;
   Ok(out)
 }
@@ -451,6 +489,9 @@ pub fn get_default_stream(device: &Device) -> Result<Stream> {
 pub fn set_default_stream(stream: &Stream) -> Result<()> {
   ensure_handler_installed();
   assert_streams_not_cleared();
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe { mlxrs_sys::mlx_set_default_stream(stream.0) })
 }
 
@@ -475,19 +516,35 @@ impl std::fmt::Debug for Stream {
     // as Array's Debug. Other Stream entry points (which DO touch encoder
     // state) remain poison-guarded.
     crate::error::ensure_handler_installed();
+    // SAFETY: `mlx_string_new()` returns a fresh empty out-param `mlx_string`
+    // (NULL ctx) per the mlx-c convention; populated by the following call
+    // and freed via the local guard / explicit `mlx_string_free`.
     let mut s = unsafe { mlxrs_sys::mlx_string_new() };
+    // SAFETY: `self.0` is a valid borrowed handle; `s` is a fresh `mlx_string`
+    // out-param freed via the local guard/explicit free; mlx-c writes the
+    // formatted string into it and the rc is surfaced (checked below).
     let rc = unsafe { mlxrs_sys::mlx_stream_tostring(&mut s, self.0) };
     let result = if rc == 0 {
+      // SAFETY: `s` is a live `mlx_string` (freed only after this borrow); mlx-c
+      // returns its internal NUL-terminated buffer, valid until the string is
+      // freed. The returned pointer is NULL-checked before use.
       let p = unsafe { mlxrs_sys::mlx_string_data(s) };
       if p.is_null() {
         write!(f, "Stream(<unprintable>)")
       } else {
+        // SAFETY: the pointer was NULL-checked just above and points into the live
+        // `mlx_string` (still owned here, freed only after this borrow); the C
+        // string is NUL-terminated by mlx-c.
         let cs = unsafe { CStr::from_ptr(p) };
         write!(f, "Stream({})", cs.to_string_lossy())
       }
     } else {
       write!(f, "Stream(<unprintable>)")
     };
+    // SAFETY: frees a handle this guard owns exactly once. Runs during `Drop` /
+    // thread teardown: must not touch TLS, call `check()`, panic, or unwind
+    // across `extern "C"`; the rc is discarded silently per the crate's
+    // Drop convention.
     unsafe {
       let _ = mlxrs_sys::mlx_string_free(s);
     }

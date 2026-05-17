@@ -49,6 +49,9 @@ fn linalg_cpu_stream() -> mlxrs_sys::mlx_stream {
     if let Some(s) = cell.get() {
       return s;
     }
+    // SAFETY: `mlx_default_cpu_stream_new()` returns the thread's default CPU stream
+    // handle; the error handler is installed first and the NULL-ctx case is
+    // checked by the caller before the handle is cached/used.
     let s = unsafe { mlxrs_sys::mlx_default_cpu_stream_new() };
     if s.ctx.is_null() {
       panic!(
@@ -68,7 +71,13 @@ fn linalg_cpu_stream() -> mlxrs_sys::mlx_stream {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.inv.html).
 pub fn inv(a: &Array) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe { mlxrs_sys::mlx_linalg_inv(&mut out.0, a.0, linalg_cpu_stream()) })?;
   Ok(out)
 }
@@ -78,7 +87,13 @@ pub fn inv(a: &Array) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.tri_inv.html).
 pub fn tri_inv(a: &Array, upper: bool) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe { mlxrs_sys::mlx_linalg_tri_inv(&mut out.0, a.0, upper, linalg_cpu_stream()) })?;
   Ok(out)
 }
@@ -87,7 +102,13 @@ pub fn tri_inv(a: &Array, upper: bool) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.pinv.html).
 pub fn pinv(a: &Array) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe { mlxrs_sys::mlx_linalg_pinv(&mut out.0, a.0, linalg_cpu_stream()) })?;
   Ok(out)
 }
@@ -97,7 +118,13 @@ pub fn pinv(a: &Array) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.cholesky_inv.html).
 pub fn cholesky_inv(a: &Array, upper: bool) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
     mlxrs_sys::mlx_linalg_cholesky_inv(&mut out.0, a.0, upper, linalg_cpu_stream())
   })?;
@@ -111,7 +138,13 @@ pub fn cholesky_inv(a: &Array, upper: bool) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.cholesky.html).
 pub fn cholesky(a: &Array, upper: bool) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe { mlxrs_sys::mlx_linalg_cholesky(&mut out.0, a.0, upper, linalg_cpu_stream()) })?;
   Ok(out)
 }
@@ -120,8 +153,17 @@ pub fn cholesky(a: &Array, upper: bool) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.qr.html).
 pub fn qr(a: &Array) -> Result<(Array, Array)> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut q = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut r = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe { mlxrs_sys::mlx_linalg_qr(&mut q.0, &mut r.0, a.0, linalg_cpu_stream()) })?;
   Ok((q, r))
 }
@@ -139,12 +181,18 @@ pub fn svd(a: &Array, compute_uv: bool) -> Result<Vec<Array>> {
   // subsequent alloc fails under allocator pressure. No alloc-failure injection
   // hook exists, so guard order — not a test — enforces the fail-fast contract.
   let s = linalg_cpu_stream();
+  // SAFETY: `mlx_vector_array_new()` returns a fresh empty out-param handle (NULL
+  // ctx) per the mlx-c convention; the RAII guard captures it before the
+  // populating call so a partial/early-return vector is still freed.
   let mut vec_out = unsafe { mlxrs_sys::mlx_vector_array_new() };
   // `mlx_vector_array_new` is fallible: a null `ctx` means allocation failed
   // and an error sits in TLS. Validate (draining handler state) BEFORE the
   // guard so it only ever wraps a non-null handle (no leak / double-free).
   check_vector_array_handle(vec_out)?;
   let _vec_guard = VectorArrayGuard(vec_out);
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe { mlxrs_sys::mlx_linalg_svd(&mut vec_out, a.0, compute_uv, s) })?;
   drain_vector(vec_out)
 }
@@ -158,11 +206,17 @@ pub fn lu(a: &Array) -> Result<Vec<Array>> {
   // and handler-install run before the fallible `mlx_vector_array_new()`. A
   // poisoned thread must panic here, not return `Err` under allocator pressure.
   let s = linalg_cpu_stream();
+  // SAFETY: `mlx_vector_array_new()` returns a fresh empty out-param handle (NULL
+  // ctx) per the mlx-c convention; the RAII guard captures it before the
+  // populating call so a partial/early-return vector is still freed.
   let mut vec_out = unsafe { mlxrs_sys::mlx_vector_array_new() };
   // See `svd`: validate the fallible allocation (draining handler state)
   // before the guard so it only ever wraps a non-null handle.
   check_vector_array_handle(vec_out)?;
   let _vec_guard = VectorArrayGuard(vec_out);
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe { mlxrs_sys::mlx_linalg_lu(&mut vec_out, a.0, s) })?;
   drain_vector(vec_out)
 }
@@ -171,8 +225,17 @@ pub fn lu(a: &Array) -> Result<Vec<Array>> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.lu_factor.html).
 pub fn lu_factor(a: &Array) -> Result<(Array, Array)> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out0 = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out1 = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
     mlxrs_sys::mlx_linalg_lu_factor(&mut out0.0, &mut out1.0, a.0, linalg_cpu_stream())
   })?;
@@ -185,7 +248,13 @@ pub fn lu_factor(a: &Array) -> Result<(Array, Array)> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.solve.html).
 pub fn solve(a: &Array, b: &Array) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe { mlxrs_sys::mlx_linalg_solve(&mut out.0, a.0, b.0, linalg_cpu_stream()) })?;
   Ok(out)
 }
@@ -195,7 +264,13 @@ pub fn solve(a: &Array, b: &Array) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.solve_triangular.html).
 pub fn solve_triangular(a: &Array, b: &Array, upper: bool) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
     mlxrs_sys::mlx_linalg_solve_triangular(&mut out.0, a.0, b.0, upper, linalg_cpu_stream())
   })?;
@@ -209,8 +284,17 @@ pub fn solve_triangular(a: &Array, b: &Array, upper: bool) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.eig.html).
 pub fn eig(a: &Array) -> Result<(Array, Array)> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut vals = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut vecs = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe { mlxrs_sys::mlx_linalg_eig(&mut vals.0, &mut vecs.0, a.0, linalg_cpu_stream()) })?;
   Ok((vals, vecs))
 }
@@ -221,8 +305,17 @@ pub fn eig(a: &Array) -> Result<(Array, Array)> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.eigh.html).
 pub fn eigh(a: &Array, uplo: &CStr) -> Result<(Array, Array)> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut vals = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut vecs = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
     mlxrs_sys::mlx_linalg_eigh(
       &mut vals.0,
@@ -239,7 +332,13 @@ pub fn eigh(a: &Array, uplo: &CStr) -> Result<(Array, Array)> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.eigvals.html).
 pub fn eigvals(a: &Array) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe { mlxrs_sys::mlx_linalg_eigvals(&mut out.0, a.0, linalg_cpu_stream()) })?;
   Ok(out)
 }
@@ -248,7 +347,13 @@ pub fn eigvals(a: &Array) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.eigvalsh.html).
 pub fn eigvalsh(a: &Array, uplo: &CStr) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
     mlxrs_sys::mlx_linalg_eigvalsh(&mut out.0, a.0, uplo.as_ptr(), linalg_cpu_stream())
   })?;
@@ -263,7 +368,13 @@ pub fn eigvalsh(a: &Array, uplo: &CStr) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.norm.html).
 pub fn norm(a: &Array, ord: f64, axis: &[i32], keepdims: bool) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
     mlxrs_sys::mlx_linalg_norm(
       &mut out.0,
@@ -282,7 +393,13 @@ pub fn norm(a: &Array, ord: f64, axis: &[i32], keepdims: bool) -> Result<Array> 
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.norm.html).
 pub fn norm_matrix(a: &Array, ord: &CStr, axis: &[i32], keepdims: bool) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
     mlxrs_sys::mlx_linalg_norm_matrix(
       &mut out.0,
@@ -301,7 +418,13 @@ pub fn norm_matrix(a: &Array, ord: &CStr, axis: &[i32], keepdims: bool) -> Resul
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.norm.html).
 pub fn norm_l2(a: &Array, axis: &[i32], keepdims: bool) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
     mlxrs_sys::mlx_linalg_norm_l2(
       &mut out.0,
@@ -321,7 +444,13 @@ pub fn norm_l2(a: &Array, axis: &[i32], keepdims: bool) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.cross.html).
 pub fn cross(a: &Array, b: &Array, axis: i32) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
     mlxrs_sys::mlx_linalg_cross(&mut out.0, a.0, b.0, axis as c_int, default_stream())
   })?;
@@ -332,10 +461,18 @@ pub fn cross(a: &Array, b: &Array, axis: i32) -> Result<Array> {
 
 /// Drain an `mlx_vector_array` into a `Vec<Array>`, copying out each handle.
 fn drain_vector(vec: mlxrs_sys::mlx_vector_array) -> Result<Vec<Array>> {
+  // SAFETY: pure read of a valid populated `mlx_vector_array`; mlx-c does not
+  // mutate or retain it and returns a plain length.
   let n = unsafe { mlxrs_sys::mlx_vector_array_size(vec) };
   let mut parts = Vec::with_capacity(n);
   for i in 0..n {
+    // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+    // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+    // early return / panic frees it, then populated by the following call.
     let mut part = Array(unsafe { mlxrs_sys::mlx_array_new() });
+    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+    // not retained by mlx past it); the out-param was freshly allocated above
+    // and is written by this call; the backend rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_vector_array_get(&mut part.0, vec, i) })?;
     parts.push(part);
   }
@@ -346,6 +483,10 @@ fn drain_vector(vec: mlxrs_sys::mlx_vector_array) -> Result<Vec<Array>> {
 struct VectorArrayGuard(mlxrs_sys::mlx_vector_array);
 impl Drop for VectorArrayGuard {
   fn drop(&mut self) {
+    // SAFETY: frees a handle this guard owns exactly once. Runs during `Drop` /
+    // thread teardown: must not touch TLS, call `check()`, panic, or unwind
+    // across `extern "C"`; the rc is discarded silently per the crate's
+    // Drop convention.
     unsafe {
       let _ = mlxrs_sys::mlx_vector_array_free(self.0);
     }

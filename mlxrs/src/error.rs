@@ -103,6 +103,9 @@ pub(crate) static INIT_VIA_CTOR: AtomicBool = AtomicBool::new(false);
 extern "C" fn handler(msg: *const c_char, _data: *mut c_void) {
   // Panics across `extern "C"` are UB. Wrap everything in catch_unwind.
   let _ = catch_unwind(AssertUnwindSafe(|| {
+    // SAFETY: mlx-c guarantees `msg` is a valid NUL-terminated C string for the
+    // duration of this error-handler callback; the owned `String` copies it
+    // out so nothing escapes the callback.
     let s = unsafe { CStr::from_ptr(msg) }
       .to_string_lossy()
       .into_owned();
@@ -147,6 +150,9 @@ pub(crate) fn ensure_handler_installed() {
 fn ensure_handler_installed_slow() {
   static FALLBACK: OnceLock<()> = OnceLock::new();
   FALLBACK.get_or_init(|| {
+    // SAFETY: `handler` is a valid `extern "C"` fn pointer, the data pointer is
+    // NULL, and no destructor is needed; installs the process-global mlx-c
+    // error handler.
     unsafe {
       mlxrs_sys::mlx_set_error_handler(Some(handler), ptr::null_mut(), None);
     }

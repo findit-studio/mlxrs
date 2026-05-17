@@ -23,7 +23,13 @@ use crate::{
 pub fn reshape(a: &Array, shape: &impl IntoShape) -> Result<Array> {
   shape.with_shape(|s| {
     validate_dims(s)?;
+    // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+    // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+    // early return / panic frees it, then populated by the following call.
     let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+    // not retained by mlx past it); the out-param was freshly allocated above
+    // and is written by this call; the backend rc is surfaced via `check()`.
     check(unsafe {
       mlxrs_sys::mlx_reshape(&mut out.0, a.0, dim_ptr(s), s.len(), default_stream())
     })?;
@@ -56,6 +62,10 @@ pub fn concatenate(arrays: &[&Array], axis: i32) -> Result<Array> {
   // Build a contiguous Vec<mlx_array> (mlx_array is Copy) and pass to
   // mlx_vector_array_new_data. RAII-free the vector_array via guard.
   let raw: Vec<mlxrs_sys::mlx_array> = arrays.iter().map(|a| a.0).collect();
+  // SAFETY: `raw` is a contiguous, live `Vec<mlx_array>` (`mlx_array` is `Copy`);
+  // `(ptr, len)` is a valid pair; mlx-c copies the handles into its own
+  // `std::vector` and does not retain the Rust pointer. The RAII guard
+  // frees the returned vector (NULL ctx is a defined no-op).
   let vec = unsafe { mlxrs_sys::mlx_vector_array_new_data(raw.as_ptr(), raw.len()) };
   let _vec_guard = VectorArrayGuard(vec);
 
@@ -72,7 +82,13 @@ pub fn concatenate(arrays: &[&Array], axis: i32) -> Result<Array> {
     );
   }
 
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe { mlxrs_sys::mlx_concatenate_axis(&mut out.0, vec, axis, default_stream()) })?;
   Ok(out)
 }
@@ -81,7 +97,13 @@ pub fn concatenate(arrays: &[&Array], axis: i32) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.transpose.html).
 pub fn transpose(a: &Array) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe { mlxrs_sys::mlx_transpose(&mut out.0, a.0, default_stream()) })?;
   Ok(out)
 }
@@ -92,7 +114,13 @@ pub fn transpose(a: &Array) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.transpose.html).
 pub fn transpose_axes(a: &Array, axes: &[i32]) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
     mlxrs_sys::mlx_transpose_axes(&mut out.0, a.0, dim_ptr(axes), axes.len(), default_stream())
   })?;
@@ -108,7 +136,13 @@ pub fn expand_dims_axes(a: &Array, axes: &[i32]) -> Result<Array> {
   if axes.is_empty() {
     return a.try_clone();
   }
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
     mlxrs_sys::mlx_expand_dims_axes(&mut out.0, a.0, dim_ptr(axes), axes.len(), default_stream())
   })?;
@@ -123,7 +157,13 @@ pub fn squeeze_axes(a: &Array, axes: &[i32]) -> Result<Array> {
   if axes.is_empty() {
     return a.try_clone();
   }
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
     mlxrs_sys::mlx_squeeze_axes(&mut out.0, a.0, dim_ptr(axes), axes.len(), default_stream())
   })?;
@@ -137,7 +177,13 @@ pub fn squeeze_axes(a: &Array, axes: &[i32]) -> Result<Array> {
 pub fn broadcast_to(a: &Array, shape: &impl IntoShape) -> Result<Array> {
   shape.with_shape(|s| {
     validate_dims(s)?;
+    // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+    // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+    // early return / panic frees it, then populated by the following call.
     let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+    // not retained by mlx past it); the out-param was freshly allocated above
+    // and is written by this call; the backend rc is surfaced via `check()`.
     check(unsafe {
       mlxrs_sys::mlx_broadcast_to(&mut out.0, a.0, dim_ptr(s), s.len(), default_stream())
     })?;
@@ -157,6 +203,10 @@ pub fn stack(arrays: &[&Array]) -> Result<Array> {
   }
   crate::error::ensure_handler_installed();
   let raw: Vec<mlxrs_sys::mlx_array> = arrays.iter().map(|a| a.0).collect();
+  // SAFETY: `raw` is a contiguous, live `Vec<mlx_array>` (`mlx_array` is `Copy`);
+  // `(ptr, len)` is a valid pair; mlx-c copies the handles into its own
+  // `std::vector` and does not retain the Rust pointer. The RAII guard
+  // frees the returned vector (NULL ctx is a defined no-op).
   let vec = unsafe { mlxrs_sys::mlx_vector_array_new_data(raw.as_ptr(), raw.len()) };
   let _vec_guard = VectorArrayGuard(vec);
   if vec.ctx.is_null() {
@@ -168,7 +218,13 @@ pub fn stack(arrays: &[&Array]) -> Result<Array> {
         }),
     );
   }
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe { mlxrs_sys::mlx_stack(&mut out.0, vec, default_stream()) })?;
   Ok(out)
 }
@@ -184,6 +240,10 @@ pub fn stack_axis(arrays: &[&Array], axis: i32) -> Result<Array> {
   }
   crate::error::ensure_handler_installed();
   let raw: Vec<mlxrs_sys::mlx_array> = arrays.iter().map(|a| a.0).collect();
+  // SAFETY: `raw` is a contiguous, live `Vec<mlx_array>` (`mlx_array` is `Copy`);
+  // `(ptr, len)` is a valid pair; mlx-c copies the handles into its own
+  // `std::vector` and does not retain the Rust pointer. The RAII guard
+  // frees the returned vector (NULL ctx is a defined no-op).
   let vec = unsafe { mlxrs_sys::mlx_vector_array_new_data(raw.as_ptr(), raw.len()) };
   let _vec_guard = VectorArrayGuard(vec);
   if vec.ctx.is_null() {
@@ -195,7 +255,13 @@ pub fn stack_axis(arrays: &[&Array], axis: i32) -> Result<Array> {
         }),
     );
   }
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe { mlxrs_sys::mlx_stack_axis(&mut out.0, vec, axis as c_int, default_stream()) })?;
   Ok(out)
 }
@@ -218,8 +284,14 @@ pub fn split_sections(a: &Array, indices: &[i32], axis: i32) -> Result<Vec<Array
   // captured before it correctly frees the populated vector on drop. This
   // ordering also covers the early-return case: if `check` returns Err, the
   // guard already owns the (possibly partial) vector and frees it.
+  // SAFETY: `mlx_vector_array_new()` returns a fresh empty out-param handle (NULL
+  // ctx) per the mlx-c convention; the RAII guard captures it before the
+  // populating call so a partial/early-return vector is still freed.
   let mut vec_out = unsafe { mlxrs_sys::mlx_vector_array_new() };
   let _vec_guard = VectorArrayGuard(vec_out);
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
     mlxrs_sys::mlx_split_sections(
       &mut vec_out,
@@ -230,10 +302,18 @@ pub fn split_sections(a: &Array, indices: &[i32], axis: i32) -> Result<Vec<Array
       default_stream(),
     )
   })?;
+  // SAFETY: pure read of a valid populated `mlx_vector_array`; mlx-c does not
+  // mutate or retain it and returns a plain length.
   let n = unsafe { mlxrs_sys::mlx_vector_array_size(vec_out) };
   let mut parts = Vec::with_capacity(n);
   for i in 0..n {
+    // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+    // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+    // early return / panic frees it, then populated by the following call.
     let mut part = Array(unsafe { mlxrs_sys::mlx_array_new() });
+    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+    // not retained by mlx past it); the out-param was freshly allocated above
+    // and is written by this call; the backend rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_vector_array_get(&mut part.0, vec_out, i) })?;
     parts.push(part);
   }
@@ -245,7 +325,13 @@ pub fn split_sections(a: &Array, indices: &[i32], axis: i32) -> Result<Vec<Array
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.flatten.html).
 pub fn flatten(a: &Array, start_axis: i32, end_axis: i32) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
     mlxrs_sys::mlx_flatten(
       &mut out.0,
@@ -262,7 +348,13 @@ pub fn flatten(a: &Array, start_axis: i32, end_axis: i32) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.swapaxes.html).
 pub fn swapaxes(a: &Array, axis1: i32, axis2: i32) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
     mlxrs_sys::mlx_swapaxes(
       &mut out.0,
@@ -310,7 +402,13 @@ pub fn pad(
   // intentionally NOT validated here.
   crate::shape::validate_dims(low)?;
   crate::shape::validate_dims(high)?;
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
     mlxrs_sys::mlx_pad(
       &mut out.0,
@@ -333,6 +431,10 @@ pub fn pad(
 struct VectorArrayGuard(mlxrs_sys::mlx_vector_array);
 impl Drop for VectorArrayGuard {
   fn drop(&mut self) {
+    // SAFETY: frees a handle this guard owns exactly once. Runs during `Drop` /
+    // thread teardown: must not touch TLS, call `check()`, panic, or unwind
+    // across `extern "C"`; the rc is discarded silently per the crate's
+    // Drop convention.
     unsafe {
       let _ = mlxrs_sys::mlx_vector_array_free(self.0);
     }

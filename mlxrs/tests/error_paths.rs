@@ -45,17 +45,32 @@ fn to_vec_rejects_non_contiguous_view() {
   use mlxrs_sys::{mlx_array, mlx_array_new, mlx_default_gpu_stream_new, mlx_transpose};
 
   let src = mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
-  // SAFETY: from_raw / into_raw round-trip; the stream init mirrors what the
-  // safe layer does internally (stream::default_stream).
+  // SAFETY: `Array::into_raw`'s contract — `src` is a valid owned Array;
+  // ownership of the raw handle transfers to the caller and `Drop` will not
+  // run (the handle is freed manually below).
   let raw_src = unsafe { src.into_raw() };
+  // SAFETY: returns this thread's default GPU stream handle, mirroring
+  // `stream::default_stream`; the test's `#[ctor]`-installed handler is live,
+  // so a failed init surfaces rather than `printf+exit`.
   let stream = unsafe { mlx_default_gpu_stream_new() };
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL
+  // ctx) per the mlx-c convention; it is populated by the `mlx_transpose`
+  // call below before any use.
   let mut out: mlx_array = unsafe { mlx_array_new() };
+  // SAFETY: `raw_src` and `stream` are valid handles (not retained by mlx
+  // past the call); `out` is the fresh out-param allocated above; the rc is
+  // asserted on the next line.
   let rc = unsafe { mlx_transpose(&mut out, raw_src, stream) };
   assert_eq!(rc, 0, "mlx_transpose failed");
+  // SAFETY: `raw_src` is the handle this test owns via `into_raw` (freed
+  // exactly once here); `mlx_transpose` does not retain it.
   unsafe {
     let _ = mlxrs_sys::mlx_array_free(raw_src);
   }
 
+  // SAFETY: `Array::from_raw`'s contract — `out` is a valid handle freshly
+  // produced by `mlx_transpose`, not aliased elsewhere; the safe `Array`
+  // now owns it and frees it on `Drop`.
   let mut view = unsafe { mlxrs::Array::from_raw(out) };
   assert_eq!(view.shape(), vec![3, 2]);
 

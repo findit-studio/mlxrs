@@ -15,6 +15,7 @@
 // into smoke tests or any future hand-written glue in this crate.
 #[allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
 #[allow(clippy::missing_safety_doc, clippy::all)]
+#[allow(clippy::undocumented_unsafe_blocks)]
 mod generated {
   include!("generated/bindings.rs");
 }
@@ -57,6 +58,11 @@ mod smoke {
 
   #[test]
   fn version_round_trip() {
+    // SAFETY: all calls are mlx-c FFI. `noop_handler` is a valid `extern "C"`
+    // fn and the data ptr is null (no dtor needed). `mlx_string_new` yields a
+    // fresh handle that is read via `mlx_string_data` (result null-checked
+    // before `CStr::from_ptr`) and freed exactly once by `mlx_string_free`
+    // within this block. No handle escapes.
     unsafe {
       mlx_set_error_handler(Some(noop_handler), ptr::null_mut(), None);
       let mut s = mlx_string_new();
@@ -71,6 +77,10 @@ mod smoke {
 
   #[test]
   fn array_new_free_round_trip() {
+    // SAFETY: all calls are mlx-c FFI. `noop_handler` is a valid `extern "C"`
+    // fn with a null data ptr. `mlx_array_new` yields a fresh owned handle
+    // that is freed exactly once by `mlx_array_free` within this block; it
+    // does not escape and is not double-freed.
     unsafe {
       mlx_set_error_handler(Some(noop_handler), ptr::null_mut(), None);
       let arr = mlx_array_new();

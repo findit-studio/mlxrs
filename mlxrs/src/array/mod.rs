@@ -64,7 +64,13 @@ impl Array {
     crate::error::ensure_handler_installed();
     // RAII coverage: wrap the fresh handle in `Self` BEFORE the fallible
     // `mlx_array_set` call so panic / early-return drops it via `Drop`.
+    // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+    // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+    // early return / panic frees it, then populated by the following call.
     let mut out = Self(unsafe { mlxrs_sys::mlx_array_new() });
+    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+    // not retained by mlx past it); the out-param was freshly allocated above
+    // and is written by this call; the backend rc is surfaced via `check()`.
     let rc = unsafe { mlxrs_sys::mlx_array_set(&mut out.0, self.0) };
     check(rc)?;
     Ok(out)
@@ -86,6 +92,9 @@ impl Array {
     // `item`/`to_vec`/`as_slice` all funnel through here, so they are
     // covered transitively.
     crate::stream::assert_streams_not_cleared();
+    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+    // not retained by mlx past it); the out-param was freshly allocated above
+    // and is written by this call; the backend rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_array_eval(self.0) })
   }
 

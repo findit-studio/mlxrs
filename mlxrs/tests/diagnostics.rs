@@ -167,6 +167,8 @@ fn sigabrt_chains_previous_handler() {
   if std::env::var_os(SIGABRT_CHAIN_ENV).is_some() {
     // Child role: install our OWN prior SIGABRT handler first, so
     // diagnostics::install() must capture and chain it.
+    // SAFETY: all-zero is a valid initial `libc::sigaction`; the fields used
+    // (`sa_sigaction`, `sa_mask`) are explicitly set before it is registered.
     let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
     act.sa_sigaction = prior_sigabrt_handler as *const () as libc::sighandler_t;
     // SAFETY: registering a valid async-signal-safe handler for SIGABRT.
