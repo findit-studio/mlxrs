@@ -3,11 +3,25 @@
 //! (the primary spec) and cross-checked against mlx-swift-lm's
 //! `MLXLMCommon` samplers.
 //!
-//! The transforms operate on **log-probabilities** (`log_softmax` output
-//! over the last `[..., vocab]` axis) — exactly as the `mlx_lm.sample_utils`
-//! `apply_*` helpers do; the `log_softmax`/normalization is the caller's or
-//! the (deferred) `make_sampler` composition's job (mirroring mlx-swift's
-//! `TopPSampler`, which `logSoftmax`es before the per-transform helpers).
+//! This module has **two input domains**, matching mlx-lm exactly — mixing
+//! them is a correctness bug:
+//!
+//! * **Samplers** — [`apply_top_k`], [`apply_top_p`], [`apply_min_p`],
+//!   [`apply_xtc`], [`categorical_sampling`], [`argmax_sample`] — operate on
+//!   **log-probabilities** (`log_softmax` output over the last `[..., vocab]`
+//!   axis), exactly as `mlx_lm.sample_utils`'s `apply_top_k`/`apply_min_p`/
+//!   `apply_xtc` and `make_sampler` do (cross-checked against mlx-swift's
+//!   `TopPSampler`, which `logSoftmax`es first). The `log_softmax` is the
+//!   caller's or the deferred `make_sampler`'s job.
+//! * **Logits processors** — [`apply_repetition_penalty`],
+//!   [`apply_presence_penalty`], [`apply_frequency_penalty`],
+//!   [`apply_logit_bias`] — operate on **raw logits**, exactly as mlx-lm's
+//!   `make_logits_processors` closures do: in `generate_step` they run
+//!   *before* `logprobs = logits - logsumexp(logits)`. Applying them to
+//!   normalized log-probs changes behavior — e.g.
+//!   `apply_repetition_penalty`'s `logit < 0` sign branch is meaningful only
+//!   on raw (mixed-sign) logits, never on all-negative log-probs.
+//!
 //! Each is a pure composition of [`crate::ops`] returning a `Result<Array>`
 //! — no implicit eval.
 //!
@@ -16,6 +30,18 @@
 //! [`categorical_sampling`] never draws them. Sampler chaining (mlx-lm's
 //! `make_sampler`) is left to the caller — the generation loop is out of
 //! scope for M3 sampling.
+//!
+//! [`apply_xtc`] is the exclude-top-choices sampler (mlx-lm's `apply_xtc`).
+//! The four logits-processor primitives —
+//! [`apply_repetition_penalty`]/[`apply_presence_penalty`]/
+//! [`apply_frequency_penalty`]/[`apply_logit_bias`] — are the **per-call,
+//! pure** transforms behind mlx-lm's `make_repetition/presence/frequency
+//! _penalty`/`logit_bias` closures (cross-checked against mlx-swift's
+//! `RepetitionContext`/`PresencePenaltyContext`/`FrequencyPenaltyContext`).
+//! The stateful recent-token ring + `make_logits_processors` composition and
+//! the generation loop are the caller's job and out of scope here: each
+//! takes the already-sliced recent-token id set (`token_ids`, an integer
+//! `[n]` array) explicitly, exactly as mlx-lm's closures receive `tokens`.
 
 use crate::{
   array::Array,
@@ -199,4 +225,235 @@ pub fn categorical_sampling(logits: &Array, temp: f32, key: &Array) -> Result<Ar
 /// temperature-0 branch of `mlx_lm.sample_utils.make_sampler`.
 pub fn argmax_sample(logits: &Array) -> Result<Array> {
   ops::misc::argmax(logits, Some(-1), false)
+}
+
+/// XTC (exclude-top-choices) sampling.
+///
+/// Port of `mlx_lm.sample_utils.apply_xtc`. With probability
+/// `xtc_probability`, every token whose softmax probability exceeds the
+/// *smallest* probability that is still `> xtc_threshold` is masked to
+/// `-inf` (so [`categorical_sampling`] never draws the over-confident head),
+/// except the `xtc_special_tokens` ids, which are always preserved.
+///
+/// `xtc_threshold` must be finite in `[0, 0.5]` and `xtc_probability` finite
+/// in `[0, 1]` — exactly mlx-lm's `ValueError` bounds (its `threshold` gate
+/// is `[0, 0.5]`, not `[0, 1]`), surfaced via the file's `ShapeMismatch`
+/// idiom plus an explicit finiteness check (a `NaN` bound would slip mlx-lm's
+/// bare `<=` comparison and silently no-op the mask).
+///
+/// `key` seeds the single Bernoulli gate, mirroring mlx-lm's scalar
+/// `mx.random.uniform(0, 1)` (one draw per call, broadcast over all logits),
+/// but threaded explicitly like [`categorical_sampling`] (mlx-lm splits it
+/// off `mx.random.state`; the deferred `make_sampler` owns the split).
+///
+/// mlx-lm reduces with the *scalar* `.min()` because it only ever runs on a
+/// `[1, vocab]` row; the per-row `min` along `-1` (keepdims) below is its
+/// exact equivalent there and the correct generalization for a batched
+/// `[..., vocab]` input.
+pub fn apply_xtc(
+  logits: &Array,
+  xtc_probability: f32,
+  xtc_threshold: f32,
+  xtc_special_tokens: &[i32],
+  key: &Array,
+) -> Result<Array> {
+  if !xtc_threshold.is_finite() || !(0.0..=0.5).contains(&xtc_threshold) {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "`xtc_threshold` has to be a float in the [0, 0.5] interval, but is {xtc_threshold}"
+      ),
+    });
+  }
+  if !xtc_probability.is_finite() || !(0.0..=1.0).contains(&xtc_probability) {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "`xtc_probability` has to be a float in the [0, 1] interval, but is {xtc_probability}"
+      ),
+    });
+  }
+
+  // mlx-lm: `mx.softmax(logits, -1)` — `precise=False` (the mlx default), so
+  // pass `false` here for bit-level parity rather than the higher-precision
+  // accumulation path.
+  let probs = ops::misc::softmax_axis(logits, -1, false)?;
+  // `where(probs > xtc_threshold, probs, +inf).min(-1)` — the smallest prob
+  // still above the threshold; `+inf` neutralizes the sub-threshold tail in
+  // the min. Threshold/`+inf`/`-inf` are built in `probs`/`logits` dtype
+  // (weak-scalar parity), so f16/bf16 stays in-dtype.
+  let thr = scalar_like(xtc_threshold, &probs)?;
+  let pos_inf = scalar_like(f32::INFINITY, &probs)?;
+  let above = ops::comparison::greater(&probs, &thr)?;
+  let candidates = ops::logical::select(&above, &probs, &pos_inf)?;
+  let cutoff = ops::reduction::min_axes(&candidates, &[-1], true)?;
+  let mut mask = ops::comparison::greater(&probs, &cutoff)?;
+
+  // `mask[..., xtc_special_tokens] = False` — scatter `false` at the special
+  // columns (1-D indices broadcast over any leading dims). Skipped when the
+  // set is empty, mirroring mlx-lm's `if xtc_special_tokens:` guard (an empty
+  // index array is a valid but pointless scatter).
+  if !xtc_special_tokens.is_empty() {
+    let special = token_index(logits, xtc_special_tokens)?;
+    let off = Array::full::<bool>(&(1,), 0.0)?;
+    mask = ops::indexing::put_along_axis(&mask, &special, &off, -1)?;
+  }
+
+  // One Bernoulli gate: `where(uniform(0,1) > xtc_probability, logits,
+  // where(mask, -inf, logits))`. mlx-lm's `mx.random.uniform(0, 1)` draws a
+  // single value (Python scalars broadcast to `()`); `scalar_like` builds
+  // `low`/`high` as `[1]`, so the draw shape must be `[1]` (mlx rejects a
+  // `()` request from `(1)`-shaped bounds) — a `[1]` gate broadcasts over
+  // `[…, vocab]` logits identically to mlx-lm's scalar draw.
+  let zero = scalar_like(0.0, logits)?;
+  let one = scalar_like(1.0, logits)?;
+  let u = ops::random::uniform(&zero, &one, &[1i32], logits.dtype()?, key)?;
+  let prob = scalar_like(xtc_probability, logits)?;
+  let gate = ops::comparison::greater(&u, &prob)?;
+  let neg_inf = scalar_like(f32::NEG_INFINITY, logits)?;
+  let masked = ops::logical::select(&mask, &neg_inf, logits)?;
+  ops::logical::select(&gate, logits, &masked)
+}
+
+/// Build an index array (in the int dtype) addressing `n` token-id columns
+/// of the last axis. `put_along_axis`/`take_along_axis`/`scatter_add_axis`
+/// require the index rank to equal the operand's, with the non-axis dims
+/// broadcasting; so the shape is `[1, …, 1, n]` (`like.ndim()` dims, all
+/// leading `1`s broadcast against any `[…, vocab]` logits/mask).
+fn token_index(like: &Array, ids: &[i32]) -> Result<Array> {
+  let ndim = like.ndim().max(1);
+  let mut shape = vec![1i32; ndim];
+  let last = shape.len() - 1;
+  shape[last] = ids.len() as i32;
+  let dims: &[i32] = &shape;
+  Array::from_slice::<i32>(ids, &dims)
+}
+
+/// Sign-aware multiplicative repetition penalty.
+///
+/// Port of `mlx_lm.sample_utils.make_repetition_penalty`'s closure
+/// (cross-checked against mlx-swift `RepetitionContext.process`): for every
+/// id in `token_ids`, `logit < 0 → logit * penalty` else `logit / penalty`,
+/// scattered back into a copy of `logits`. The caller passes the (already
+/// `context_size`-sliced) recent-token id set — the stateful ring is out of
+/// scope. `penalty` must be finite and non-negative (mlx-lm's `ValueError`).
+///
+/// `put_along_axis` is last-write-wins on duplicate ids, exactly matching
+/// mlx-lm's `logits[:, tokens] = selected_logits` fancy-index assignment
+/// (the per-column scaled value is deterministic, so duplicates are a no-op).
+pub fn apply_repetition_penalty(logits: &Array, token_ids: &[i32], penalty: f32) -> Result<Array> {
+  if !penalty.is_finite() || penalty < 0.0 {
+    return Err(Error::ShapeMismatch {
+      message: format!("`penalty` must be a non-negative float, but is {penalty}"),
+    });
+  }
+  if token_ids.is_empty() {
+    return logits.try_clone();
+  }
+  let idx = token_index(logits, token_ids)?;
+  let selected = ops::indexing::take_along_axis(logits, &idx, -1)?;
+  let p = scalar_like(penalty, &selected)?;
+  let scaled_down = ops::arithmetic::multiply(&selected, &p)?;
+  let scaled_up = ops::arithmetic::divide(&selected, &p)?;
+  let is_neg = ops::comparison::less(&selected, &scalar_like(0.0, &selected)?)?;
+  let new_selected = ops::logical::select(&is_neg, &scaled_down, &scaled_up)?;
+  ops::indexing::put_along_axis(logits, &idx, &new_selected, -1)
+}
+
+/// Presence penalty: subtract `penalty` **once** from every logit whose id
+/// occurs in `token_ids`.
+///
+/// Port of `mlx_lm.sample_utils.make_presence_penalty`'s closure (the OpenAI
+/// `presence_penalty`; cross-checked against mlx-swift
+/// `PresencePenaltyContext.process`). The caller supplies the recent-token
+/// id set. Like mlx-lm's `logits[:, tokens] -= penalty` this is a fancy-index
+/// *assignment* (`take` → subtract → `put_along_axis`), so a duplicated id is
+/// penalized once — not once per occurrence (that is the frequency penalty).
+pub fn apply_presence_penalty(logits: &Array, token_ids: &[i32], penalty: f32) -> Result<Array> {
+  if token_ids.is_empty() {
+    return logits.try_clone();
+  }
+  let idx = token_index(logits, token_ids)?;
+  let selected = ops::indexing::take_along_axis(logits, &idx, -1)?;
+  let reduced = ops::arithmetic::subtract(&selected, &scalar_like(penalty, &selected)?)?;
+  ops::indexing::put_along_axis(logits, &idx, &reduced, -1)
+}
+
+/// Frequency penalty: subtract `penalty * occurrence_count` from every
+/// logit, where the count is how many times the id appears in `token_ids`.
+///
+/// Port of `mlx_lm.sample_utils.make_frequency_penalty`'s closure (the OpenAI
+/// `frequency_penalty`), cross-checked against mlx-swift
+/// `FrequencyPenaltyContext`. Implemented by scatter-adding `-penalty`
+/// **directly** onto `logits`, once per occurrence of each id — repeated ids
+/// accumulate, so a token mentioned `k` times gets `-penalty * k`, exactly
+/// mlx-lm's repeated-index `logits.at[:, tokens].subtract(penalty)`. The
+/// earlier dense `logits - histogram * penalty` form is deliberately *not*
+/// used: it arithmetics every column, so a low-precision `0 * penalty` (or
+/// an over-magnitude penalty) NaN-bleeds / flips signed zeros into untouched
+/// logits. `scatter_add_axis` does no arithmetic on non-indexed positions,
+/// so every untouched column is the bitwise-identical input for all
+/// dtypes/penalty magnitudes (see the implementation note below).
+pub fn apply_frequency_penalty(logits: &Array, token_ids: &[i32], penalty: f32) -> Result<Array> {
+  if token_ids.is_empty() {
+    return logits.try_clone();
+  }
+  // Indexed scatter-add of `-penalty` once per occurrence DIRECTLY onto
+  // `logits` (no dense intermediate, mirroring `apply_logit_bias`): repeated
+  // ids accumulate, so a mentioned token gets `-penalty * count` — exactly
+  // mlx-lm's `logits.at[:, tokens].subtract(penalty)`. Crucially,
+  // `scatter_add_axis` performs NO arithmetic on non-indexed positions, so
+  // every UNtouched column is the bitwise-identical input for ALL
+  // dtypes/penalty magnitudes: no `0 * inf` NaN-bleed (the original
+  // `histogram * scalar` bug) AND no signed-zero flip / NaN canonicalization
+  // (a global `logits + delta` would still arithmetic untouched columns).
+  // `idx`/`neg_pen` are rank-matched to `logits` via `token_index` (same as
+  // the sibling penalty transforms), so the non-axis broadcast holds for a
+  // batched `[B, vocab]` input too.
+  let idx = token_index(logits, token_ids)?;
+  let ndim = logits.ndim().max(1);
+  let mut vshape = vec![1i32; ndim];
+  let last = vshape.len() - 1;
+  vshape[last] = token_ids.len() as i32;
+  let vdims: &[i32] = &vshape;
+  let neg_pen = ops::shape::reshape(
+    &ops::misc::astype(
+      &Array::full::<f32>(&(token_ids.len(),), -penalty)?,
+      logits.dtype()?,
+    )?,
+    &vdims,
+  )?;
+  ops::indexing::scatter_add_axis(logits, &idx, &neg_pen, -1)
+}
+
+/// Additive logit bias: add `values[i]` to the logit at column `indices[i]`.
+///
+/// Port of `mlx_lm.sample_utils`' inline `logit_bias_processor`
+/// (`logits.at[:, indices].add(values)`). `indices` (an int `[n]` array) and
+/// `values` (a numeric `[n]` array) are paired by position; duplicate indices
+/// **accumulate** (mlx `.at[].add` semantics), unlike the assignment-based
+/// repetition/presence penalties. A scatter-add over the last axis,
+/// broadcasting `[1, n]` indices/values against `[..., vocab]` logits.
+pub fn apply_logit_bias(logits: &Array, indices: &[i32], values: &Array) -> Result<Array> {
+  // Validate length BEFORE the empty short-circuit: an empty `indices` with
+  // non-empty `values` is a caller length-mismatch, not a no-op (the
+  // shortcut would otherwise silently drop the supplied bias).
+  if values.size() != indices.len() {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "`logit_bias` indices ({}) and values ({}) must have the same length",
+        indices.len(),
+        values.size()
+      ),
+    });
+  }
+  if indices.is_empty() {
+    return logits.try_clone();
+  }
+  let idx = token_index(logits, indices)?;
+  let ndim = logits.ndim().max(1);
+  let mut vshape = vec![1i32; ndim];
+  let last = vshape.len() - 1;
+  vshape[last] = indices.len() as i32;
+  let vdims: &[i32] = &vshape;
+  let v = ops::shape::reshape(&ops::misc::astype(values, logits.dtype()?)?, &vdims)?;
+  ops::indexing::scatter_add_axis(logits, &idx, &v, -1)
 }
