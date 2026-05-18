@@ -67,6 +67,39 @@ fn main() {
     )
   });
 
+  // MLX core's `mlx/io/CMakeLists.txt` compiles `gguf.cpp` into libmlx.a
+  // whenever `MLX_BUILD_GGUF` is ON (its unconditional upstream default — we
+  // don't override it), leaving libmlx.a with undefined `gguf_*` symbols
+  // (`gguf_open`, `gguf_create`, `gguf_get_tensor`, …). The same CMakeLists
+  // FetchContent's antirez/gguf-tools and builds `add_library(gguflib STATIC
+  // fp16.c gguflib.c)` to satisfy them, but links it via
+  // `target_link_libraries(mlx PRIVATE $<BUILD_INTERFACE:gguflib>)` — a
+  // BUILD_INTERFACE-only edge. Since we copy libmlx.a out and link it
+  // standalone (not through MLX's export/usage interface), that edge is
+  // dropped and gguflib never reaches our link line. So locate the already
+  // built libgguflib.a (same buried-archive walk as libmlx.a) and copy it
+  // beside libmlxc.a. This is unconditional (not gated on the `mlxrs` `gguf`
+  // feature, which mlxrs-sys can't observe anyway): libgguflib.a is a
+  // self-contained archive (fp16.c.o + gguflib.c.o; external deps are libc
+  // only), and ld64 only pulls archive members that resolve referenced
+  // symbols — non-gguf binaries reference no `gguf_*`, so its objects are
+  // never pulled and default builds are byte-for-byte unaffected.
+  let libgguflib_src = find_libgguflib(&build_dir).unwrap_or_else(|| {
+    panic!(
+      "could not find libgguflib.a under {} (MLX core builds it from \
+             FetchContent'd gguf-tools when MLX_BUILD_GGUF is ON, its default)",
+      build_dir.display()
+    )
+  });
+  let libgguflib_dst = lib_dir.join("libgguflib.a");
+  std::fs::copy(&libgguflib_src, &libgguflib_dst).unwrap_or_else(|e| {
+    panic!(
+      "failed to copy {} -> {}: {e}",
+      libgguflib_src.display(),
+      libgguflib_dst.display()
+    )
+  });
+
   // First-party C++ shim for mlx::core APIs that mlx-c does not expose
   // (currently just `clear_streams`). Compiled against the FetchContent'd
   // mlx C++ headers and linked alongside libmlx. cc emits its own
@@ -94,6 +127,11 @@ fn main() {
   println!("cargo:rustc-link-search=native={}", lib_dir.display());
   println!("cargo:rustc-link-lib=static=mlxc");
   println!("cargo:rustc-link-lib=static=mlx");
+  // After `static=mlx`: libmlx.a's gguf.cpp references gguflib's `gguf_*`
+  // symbols, so gguflib must follow it for a single-pass linker (GNU ld).
+  // macOS ld64 is order-insensitive for archives, but we keep the correct
+  // order regardless (same convention as the libmlxc → libmlx ordering).
+  println!("cargo:rustc-link-lib=static=gguflib");
   println!("cargo:rustc-link-lib=framework=Metal");
   println!("cargo:rustc-link-lib=framework=MetalPerformanceShaders");
   println!("cargo:rustc-link-lib=framework=Foundation");
@@ -129,6 +167,36 @@ fn find_libmlx(start: &Path) -> Option<PathBuf> {
       "found {} libmlx.a candidates under {}; expected exactly one. \
              Either MLX upstream changed its build layout, or a stale archive \
              was left behind. Candidates:\n  {}",
+      matches.len(),
+      start.display(),
+      matches
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n  "),
+    ),
+  }
+}
+
+fn find_libgguflib(start: &Path) -> Option<PathBuf> {
+  // Same buried-archive walk + exactly-one assertion as find_libmlx: MLX
+  // core's add_library(gguflib STATIC ...) emits a single libgguflib.a under
+  // the mlx-build tree (_deps/mlx-build/mlx/io/). Asserting uniqueness guards
+  // against silently linking a stale archive if MLX upstream ever changes
+  // its gguf build layout.
+  let matches: Vec<PathBuf> = walkdir::WalkDir::new(start)
+    .into_iter()
+    .filter_map(Result::ok)
+    .filter(|e| e.file_name() == "libgguflib.a")
+    .map(|e| e.into_path())
+    .collect();
+  match matches.len() {
+    0 => None,
+    1 => matches.into_iter().next(),
+    _ => panic!(
+      "found {} libgguflib.a candidates under {}; expected exactly one. \
+             Either MLX upstream changed its gguf build layout, or a stale \
+             archive was left behind. Candidates:\n  {}",
       matches.len(),
       start.display(),
       matches
