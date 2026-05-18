@@ -141,6 +141,44 @@ pub fn put_along_axis(a: &Array, indices: &Array, values: &Array, axis: i32) -> 
   Ok(out)
 }
 
+/// Add `values` into `a` at `indices` along `axis`, **accumulating** on
+/// duplicate indices (the additive counterpart of [`put_along_axis`], which
+/// instead overwrites). `indices` and `values` broadcast against the
+/// non-`axis` dims of `a`; returns a new array (the source is unchanged).
+///
+/// mlx's `a.at[..., idx].add(v)` / `mx.scatter_add_axis` — the primitive
+/// behind mlx-swift `FrequencyPenaltyContext`'s `zeros(vocab).at[tokens]
+/// .add(ones)` histogram and mlx-lm's `logits.at[:, idx].add(values)`
+/// logit-bias, where repeated token ids must each contribute.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.scatter_add_axis.html).
+pub fn scatter_add_axis(a: &Array, indices: &Array, values: &Array, axis: i32) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
+  // `mlx_scatter_add_axis` is byte-identical in ownership to the already-
+  // wrapped `mlx_put_along_axis` (verified in vendor mlx/c/ops.cpp): a
+  // try/catch `mlx_array_set_(*res, scatter_add_axis(get_(a), get_(indices),
+  // get_(values), axis, get_(s)))` — `mlx_array_get_` only borrows (throws,
+  // caught → rc, if NULL), `mlx_array_set_` writes into the pre-allocated
+  // out (or allocs on NULL ctx); no input handle is retained or freed.
+  check(unsafe {
+    mlxrs_sys::mlx_scatter_add_axis(
+      &mut out.0,
+      a.0,
+      indices.0,
+      values.0,
+      axis as c_int,
+      default_stream(),
+    )
+  })?;
+  Ok(out)
+}
+
 /// Gather slices of `a` indexed by `indices` along `axes`, with a per-axis
 /// `slice_sizes`. The number of `indices` arrays must match `axes.len()`;
 /// `slice_sizes.len()` must equal `a.ndim()` (one entry per dimension of `a`).
