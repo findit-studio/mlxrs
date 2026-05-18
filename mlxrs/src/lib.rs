@@ -61,10 +61,19 @@ pub mod vlm;
 #[cfg_attr(docsrs, doc(cfg(feature = "audio")))]
 pub mod audio;
 
-/// Embedding utilities — high-level loading, tokenizer integration, pooling,
-/// and similarity. Stub in M1; port lands in M3 alongside tokenizers +
-/// model-loading. Per-model architectures (BERT/XLM-RoBERTa/Qwen3-embed/etc.)
-/// are added per-usecase, not bulk-ported from mlx-embeddings/models/.
+/// Embedding utilities — pooling strategies (+ unified dispatcher),
+/// parameterized normalization, fused post-pool LayerNorm/RMSNorm
+/// (applied to the pooled sentence vector, matching swift `Pooling`'s
+/// `pool → optional layer/rms-norm → optional matryoshka truncation →
+/// optional L2-normalize` pipeline; *not* token-level pre-pool
+/// normalization, which is part of the model architecture and out of
+/// scope), `sentence-transformers` pooling-config parsing, and similarity.
+/// Ported (M3) from `mlx-embeddings` (`models/pooling.py`,
+/// `models/base.py`, `utils.py`) and swift `MLXEmbedders`
+/// (`Pooling.swift`, `MLXArray+Helper.swift`). Per-model architectures
+/// (BERT/XLM-RoBERTa/Qwen3-embed/etc.), loaders, tokenizer integration,
+/// model-id registries, and `generate`/`load` are out of scope
+/// (no-model-arch rule).
 #[cfg(feature = "embeddings")]
 #[cfg_attr(docsrs, doc(cfg(feature = "embeddings")))]
 pub mod embeddings;
