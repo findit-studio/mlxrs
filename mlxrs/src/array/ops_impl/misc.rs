@@ -73,6 +73,21 @@ impl Array {
     crate::ops::misc::partition_axis(self, kth, axis)
   }
 
+  /// Indices that would partition around `kth`. See [`crate::ops::misc::argpartition`].
+  pub fn argpartition(&self, kth: i32) -> Result<Array> {
+    crate::ops::misc::argpartition(self, kth)
+  }
+
+  /// Indices that would partition along `axis` around `kth`. See [`crate::ops::misc::argpartition_axis`].
+  pub fn argpartition_axis(&self, kth: i32, axis: i32) -> Result<Array> {
+    crate::ops::misc::argpartition_axis(self, kth, axis)
+  }
+
+  /// Softmax along `axis` (`precise` = higher-precision accumulation). See [`crate::ops::misc::softmax_axis`].
+  pub fn softmax_axis(&self, axis: i32, precise: bool) -> Result<Array> {
+    crate::ops::misc::softmax_axis(self, axis, precise)
+  }
+
   /// Clamp into `[a_min, a_max]` (array bounds). See [`crate::ops::misc::clip`].
   pub fn clip(&self, a_min: &Array, a_max: &Array) -> Result<Array> {
     crate::ops::misc::clip(self, a_min, a_max)
