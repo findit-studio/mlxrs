@@ -1,5 +1,18 @@
 use std::env::{self, var};
 
+// Tarpaulin cfg detection only. ALL tokenizer codegen moved out of this
+// build script into the `xtask` crate so a normal `mlxrs` build never
+// compiles `tokenizers`/`serde_json`/`toml`. The regenerated artifacts are
+// committed source:
+//   - mlxrs/src/tokenizer/generated.rs
+//   - mlxrs/tests/fixtures/tokenizer.json
+//   - mlxrs/tests/fixtures/tokenizer_config.json
+// `cargo xtask-codegen --check` (alias for
+// `cargo run -p xtask --features codegen -- codegen --check`) is the drift
+// guard against the `mlxrs/data/tokenizer/` source-of-truth. The `codegen`
+// subcommand is gated behind xtask's `codegen` feature, so bare
+// `cargo xtask codegen` intentionally fails ("requires the codegen
+// feature"); use the alias. This script has NO `[build-dependencies]`.
 fn main() {
   // Don't rerun this on changes other than build.rs, as we only depend on
   // the rustc version.

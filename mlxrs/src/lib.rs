@@ -69,6 +69,17 @@ pub mod audio;
 #[cfg_attr(docsrs, doc(cfg(feature = "embeddings")))]
 pub mod embeddings;
 
+/// Tokenizer support — HF `tokenizers` integration, streaming detokenizers,
+/// chat-template rendering, and tool-call parsing. Port lands in M3, ported
+/// from `mlx-lm`'s `tokenizer_utils.py` + `chat_templates/` + `tool_parsers/`
+/// and cross-referenced against `mlx-swift-lm`'s `MLXLMCommon` tokenizer /
+/// tool abstractions. Model-specific tokenizer registration (the Python
+/// `NewlineTokenizer`) is per-model architecture and intentionally out of
+/// scope. Enabled transitively by `lm`, `vlm`, and `embeddings`.
+#[cfg(feature = "tokenizer")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokenizer")))]
+pub mod tokenizer;
+
 /// Operator overloads (`&a + &b`, `&a - &b`, `&a * &b`, `&a / &b`, `-&a`).
 /// Gated; OFF by default. Panics on shape/dtype error — see module docs.
 #[cfg(feature = "unstable-ops-overload")]
