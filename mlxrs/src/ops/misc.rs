@@ -343,6 +343,64 @@ pub fn partition_axis(a: &Array, kth: i32, axis: i32) -> Result<Array> {
   Ok(out)
 }
 
+/// Indices that would partition the flattened array around `kth`. Output
+/// dtype is U32. See [`partition`] for the partition semantics.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.argpartition.html).
+pub fn argpartition(a: &Array, kth: i32) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
+  check(unsafe { mlxrs_sys::mlx_argpartition(&mut out.0, a.0, kth as c_int, default_stream()) })?;
+  Ok(out)
+}
+
+/// Indices that would partition along `axis` around `kth`. Output dtype is
+/// U32. See [`partition`].
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.argpartition.html).
+pub fn argpartition_axis(a: &Array, kth: i32, axis: i32) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
+  check(unsafe {
+    mlxrs_sys::mlx_argpartition_axis(
+      &mut out.0,
+      a.0,
+      kth as c_int,
+      axis as c_int,
+      default_stream(),
+    )
+  })?;
+  Ok(out)
+}
+
+/// Softmax along `axis`. `precise` uses the higher-precision accumulation
+/// path (matches mlx-python's `precise` kwarg).
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.softmax.html).
+pub fn softmax_axis(a: &Array, axis: i32, precise: bool) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
+  check(unsafe {
+    mlxrs_sys::mlx_softmax_axis(&mut out.0, a.0, axis as c_int, precise, default_stream())
+  })?;
+  Ok(out)
+}
+
 /// Clamp every element of `a` into `[a_min, a_max]`. Bounds are themselves
 /// `mlx_array`s (broadcast against `a`); see [`clip_with_scalar`] for the
 /// scalar-bounds ergonomic form.

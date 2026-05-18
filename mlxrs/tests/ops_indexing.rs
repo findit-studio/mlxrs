@@ -85,3 +85,18 @@ fn gather_rejects_slice_sizes_rank_mismatch() {
   let r = ops::indexing::gather(&a, &[&idx], &[0], &[1]);
   assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })));
 }
+
+#[test]
+fn put_along_axis_method_form() {
+  // Inverse of take_along_axis: scatter 9.0 into `a` at per-row column
+  // indices [[2],[0]] along axis 1 → [[1,2,9],[9,5,6]].
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
+  let idx = Array::from_slice::<i32>(&[2, 0], &(2, 1)).unwrap();
+  let vals = Array::from_slice::<f32>(&[9.0, 9.0], &(2, 1)).unwrap();
+  let mut t = a.put_along_axis(&idx, &vals, 1).unwrap();
+  assert_eq!(t.shape(), vec![2, 3]);
+  assert_eq!(
+    t.to_vec::<f32>().unwrap(),
+    vec![1.0, 2.0, 9.0, 9.0, 5.0, 6.0]
+  );
+}

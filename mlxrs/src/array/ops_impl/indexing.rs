@@ -23,6 +23,11 @@ impl Array {
     crate::ops::indexing::take_along_axis(self, indices, axis)
   }
 
+  /// Scatter per-position `values` along `axis`. See [`crate::ops::indexing::put_along_axis`].
+  pub fn put_along_axis(&self, indices: &Array, values: &Array, axis: i32) -> Result<Array> {
+    crate::ops::indexing::put_along_axis(self, indices, values, axis)
+  }
+
   /// Gather slices indexed by `indices` along `axes`. See [`crate::ops::indexing::gather`].
   pub fn gather(&self, indices: &[&Array], axes: &[i32], slice_sizes: &[i32]) -> Result<Array> {
     crate::ops::indexing::gather(self, indices, axes, slice_sizes)

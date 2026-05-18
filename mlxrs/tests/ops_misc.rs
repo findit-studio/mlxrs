@@ -289,3 +289,34 @@ fn astype_method_form_changes_dtype() {
   assert_eq!(r.dtype().unwrap(), Dtype::U32);
   assert_eq!(r.to_vec::<u32>().unwrap(), vec![1, 1, 1]);
 }
+
+// ───────── argpartition / softmax_axis (method-form bridges, #21) ─────────
+
+#[test]
+fn argpartition_method_form() {
+  // [3,1,2], kth=0 → position 0 holds the index of the minimum (1 @ idx 1).
+  let a = Array::from_slice(&[3.0_f32, 1.0, 2.0], &[3]).unwrap();
+  let mut r = a.argpartition(0).unwrap();
+  assert_eq!(r.dtype().unwrap(), Dtype::U32);
+  assert_eq!(r.to_vec::<u32>().unwrap()[0], 1);
+}
+
+#[test]
+fn argpartition_axis_method_form() {
+  // 2×3 [[3,1,2],[6,4,5]], axis=1, kth=0 → each row's position-0 index
+  // points to that row's minimum (column 1 in both rows).
+  let a = Array::from_slice(&[3.0_f32, 1.0, 2.0, 6.0, 4.0, 5.0], &(2, 3)).unwrap();
+  let mut r = a.argpartition_axis(0, 1).unwrap();
+  assert_eq!(r.dtype().unwrap(), Dtype::U32);
+  assert_eq!(r.shape(), vec![2, 3]);
+  let v = r.to_vec::<u32>().unwrap();
+  assert_eq!((v[0], v[3]), (1, 1));
+}
+
+#[test]
+fn softmax_axis_method_form() {
+  // softmax of equal logits along axis=1 is uniform: [0,0] → [0.5, 0.5].
+  let a = Array::from_slice(&[0.0_f32, 0.0], &(1, 2)).unwrap();
+  let mut r = a.softmax_axis(1, false).unwrap();
+  assert_eq!(r.to_vec::<f32>().unwrap(), vec![0.5, 0.5]);
+}
