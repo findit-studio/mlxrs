@@ -44,11 +44,13 @@ use crate::{
   error::{Error, Result},
 };
 
+mod chunked;
 mod mask;
 mod rotating;
 mod standard;
 mod util;
 
+pub use chunked::*;
 pub use mask::{create_attention_mask, create_causal_mask};
 pub use rotating::RotatingKvCache;
 pub use standard::StandardKvCache;
@@ -283,6 +285,22 @@ pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<
           message: "RotatingKvCache: empty state with non-zero offset/idx is invalid".into(),
         });
       }
+      Ok(Box::new(c))
+    }
+    // mlx-lm / mlx-swift-lm `ChunkedKVCache`; `"ChunkedKvCache"` is our own
+    // round-trip alias. mlx-lm reconstructs via `_BaseCache.from_state`
+    // (`cache.py:170-175`): `obj.state = state` THEN `obj.meta_state =
+    // meta_state` — state first (it sets `offset = keys.shape[2]`), then
+    // `set_meta_state` restores `chunk_size`/`start_position`. Unlike
+    // `_BaseCache`, `ChunkedKVCache`'s state setter unpacks `keys, values =
+    // v`, so an empty state is invalid (raises in mlx-lm) and `set_state`
+    // surfaces that as a recoverable `Error`.
+    "ChunkedKVCache" | "ChunkedKvCache" => {
+      // `chunk_size` is overwritten by `set_meta_state`; the placeholder is
+      // never observed.
+      let mut c = ChunkedKvCache::new(None);
+      c.set_state(state)?;
+      c.set_meta_state(meta)?;
       Ok(Box::new(c))
     }
     other => Err(Error::Backend {
