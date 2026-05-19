@@ -100,31 +100,29 @@ fn rotating_update_in_place_rank_invalid_values_errors_no_panic() {
 /// Regression (rank-safety, no panic on a recoverable path): the S>1
 /// `RotatingKvCache::update_concat` dispatch with valid 4-D `keys` but a
 /// rank-invalid `values` must also be a recoverable `Err` (never a panic).
-/// mlx-lm's `_update_concat` (cache.py:447-466) performs NO `values`
-/// validation and never reads `values.shape[3]`; it hands `values` to
-/// `mx.concatenate`, which raises — so faithfully the recoverable error
-/// here is the backend concat error, not a synthetic `ShapeMismatch`
-/// (adding a `head_dim` guard to this path would be a non-faithful
-/// divergence from cache.py). The load-bearing guarantee is identical: a
-/// recoverable `Err`, no out-of-bounds panic, on the `Result` API.
+/// Critically, this must hold on the empty-cache branch too: if an empty
+/// ring accepts rank-invalid `values` via direct assignment/clone, it can
+/// cache a malformed 2-D buffer and only panic later when subsequent valid
+/// updates index cached-value shape as if it were 4-D. The load-bearing
+/// guarantee is identical on the public `Result` API: reject the bad
+/// update recoverably and leave the cache usable.
 #[test]
 fn rotating_update_concat_rank_invalid_values_errors_no_panic() {
   let mut c = RotatingKvCache::new(6, 2);
-  // Seed a populated 4-D ring so the S>1 path takes the non-empty branch
-  // (temporal_order + _trim + concat against the 4-D buffer), where a
-  // rank-invalid `values` reaches `mx.concatenate`.
-  let seed = kv(&[0.0, 1.0]);
-  c.update(&seed, &seed).unwrap();
   // Valid 4-D multi-token `keys` (S == 2) -> the S>1 `_update_concat`.
+  // Use an empty cache so this exercises the empty-cache branch.
   let keys = kv(&[2.0, 3.0]);
   // 2-D `values` (rank < 4).
   let bad_values = Array::from_slice::<f32>(&[2.0, 3.0], &(1usize, 2)).unwrap();
   let r = c.update(&keys, &bad_values);
   assert!(
     r.is_err(),
-    "rank-invalid values on the S>1 path must be a recoverable Err, \
-     got {r:?}"
+    "rank-invalid values on the empty-cache S>1 path must be a recoverable \
+     Err, got {r:?}"
   );
+  // A subsequent valid update must still succeed, proving the failed call
+  // did not store the malformed 2-D values buffer in the cache.
+  c.update(&keys, &keys).unwrap();
 }
 
 /// Regression (rank-safety, `concat_parts` single-part fast path):
