@@ -116,11 +116,54 @@ impl RotatingKvCache {
 
   /// Emulate mlx-lm's in-place `buf[..., a:a+s, :] = new` on an immutable
   /// `Array`: splice `new` over `[a, a+s)`, keeping the surrounding rows.
-  fn set_seq(buf: &Array, a: usize, s: usize, new: &Array) -> Result<Array> {
-    let l = buf.shape()[KV_NDIM - 2];
+  ///
+  /// `name` identifies the target buffer (`"keys"` / `"values"`) for the
+  /// non-seq-axes write-shape compatibility error message.
+  ///
+  /// Structural class-kill (closes #78 P1 iter5): mlx-lm's
+  /// `self.<buf>[..., a:a+s, :] = new` slice-assignment routes through
+  /// `slice_update`, which broadcasts the RHS to the slice shape
+  /// (`mlx/ops.cpp:843` — `broadcast_to(update, upd_shape)`). Our
+  /// write-emulation (`concat_parts([head, new, tail])`) has a full-window
+  /// shortcut that returns `new` after only a rank check, bypassing both the
+  /// non-broadcastable-axes validation AND the size-1 broadcast itself
+  /// (e.g. a `[2, .., .., ..]` buffer with a `[1, .., .., ..]` `new` is
+  /// valid in mlx-lm — broadcast up to keep the buffer shape — but the
+  /// shortcut would silently SHRINK the buffer's batch axis). Route every
+  /// `set_seq` window — partial or full — through `broadcast_write_rhs`,
+  /// which builds the slice shape `[buf[0], buf[1], a+s-a, buf[3]]` and
+  /// broadcasts `new` to it exactly as mlx's `slice_update` does (single
+  /// helper, single tensor — NOT the fenced K/V cross-check). Identity
+  /// broadcasts are no-ops; size-1 broadcasts expand; non-broadcastable
+  /// axes are a recoverable `Err(ShapeMismatch)`. Faithful to mlx-lm for
+  /// every input shape.
+  fn set_seq(name: &str, buf: &Array, a: usize, s: usize, new: &Array) -> Result<Array> {
+    // Mirror `ChunkedKvCache::set_seq`'s rank-safe + overflow-safe entry:
+    // `idx`/`offset` (which feed `a`/`s` at the call sites below) come from
+    // the public `set_meta_state` and a hostile/invalid restored meta can
+    // drive `a` out of range or `a + s` past `usize::MAX`. Without these
+    // guards `seq_slice` would clamp-on-write (silent buffer-length change)
+    // or `a + s` would wrap/panic — neither is the recoverable `Err` the
+    // `Result` API promises. Use the rank-safe `seq_len` helper, compute
+    // `end` via `checked_add`, and reject `end > l` before any splice.
+    // Faithful for valid inputs (the slice/concat path is unchanged).
+    let l = seq_len(name, buf)?;
+    let end = a.checked_add(s).ok_or_else(|| Error::ShapeMismatch {
+      message: format!(
+        "RotatingKvCache::set_seq: {name} write start ({a}) + S ({s}) overflows usize"
+      ),
+    })?;
+    if end > l {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "RotatingKvCache::set_seq: {name} write window [{a}, {end}) extends past buffer length {l}"
+        ),
+      });
+    }
+    let new = super::util::broadcast_write_rhs(name, buf, a, end, new)?;
     let head = seq_slice(buf, 0, a)?;
-    let tail = seq_slice(buf, a + s, l)?;
-    super::util::concat_parts(&[&head, new, &tail])
+    let tail = seq_slice(buf, end, l)?;
+    super::util::concat_parts(&[&head, &new, &tail])
   }
 
   /// mlx-lm `RotatingKVCache._update_concat` (the `S > 1` path): put the
@@ -171,6 +214,23 @@ impl RotatingKvCache {
   /// mlx-lm `RotatingKVCache._update_in_place` (the `S == 1` decode path):
   /// grow the ring while it is below `max_size`, trim/rotate, overwrite the
   /// slot at `_idx`, and return the still-filling prefix or the full ring.
+  ///
+  /// Transactional (closes a #78 follow-up): every grow/trim/cursor-reset
+  /// step is computed into a local; `self.keys`/`self.values`/`self.idx`/
+  /// `self.offset` are committed only after ALL fallible ops (grow concat,
+  /// trim concat, both `set_seq` splices including the new
+  /// `broadcast_write_rhs` validation, and the return slice) succeed. A
+  /// recoverable `Err` from any step leaves the cache byte-identical to its
+  /// pre-update state — no partially-committed trim, no half-rewound `idx`,
+  /// no dropped context that a retry would need (the exact compute-locals-
+  /// then-assign discipline `ChunkedKvCache::update` uses). This becomes
+  /// load-bearing with the hotfix because the new write-shape validation in
+  /// `set_seq` can now fail on a non-broadcastable RHS — previously the
+  /// `[one]` concat shortcut silently accepted any 4-D `new`, so the prior
+  /// "trim then splice" sequence was infallible on the splice step. Faithful
+  /// to mlx-lm for every success path (byte-identical state after a
+  /// successful update; mlx-lm's slice-assignment also has no observable
+  /// half-state on a failure — the model just propagates the IndexError up).
   fn update_in_place(&mut self, keys: &Array, values: &Array) -> Result<(Array, Array)> {
     // Both `keys` and `values` are already rank-validated: `update` runs
     // `seq_len("keys", keys)?` AND the symmetric standalone
@@ -190,17 +250,31 @@ impl RotatingKvCache {
     // Python ints never overflow; a corrupt/hostile prompt cache can restore
     // `offset` near `usize::MAX` via `set_meta_state`, so this single-token
     // bump would wrap (release) / panic (debug). Compute the post-update
-    // offset with `checked_add` BEFORE mutating any ring state (the
-    // grow/trim/rotate reassignments below) so the overflow path performs NO
-    // partial mutation; the value is byte-identical to `self.offset + 1` for
-    // every non-overflowing input, so the ring algorithm outcome is
-    // unchanged.
+    // offset with `checked_add` BEFORE mutating any ring state so the
+    // overflow path performs NO partial mutation; the value is
+    // byte-identical to `self.offset + 1` for every non-overflowing input,
+    // so the ring algorithm outcome is unchanged.
     let new_offset = prev.checked_add(1).ok_or_else(|| Error::ShapeMismatch {
       message: format!("RotatingKvCache update: offset ({prev}) + S (1) overflows usize"),
     })?;
 
+    // ZERO-CLONE TRANSACTIONAL STAGING. The prior pattern `try_cloned`
+    // `self.keys`/`self.values` upfront to give grow/trim/splice mutable
+    // locals — but `Array::try_clone` is a heap alloc + refcount bump
+    // (`mlxrs/src/array/mod.rs:56-63` — "Never `try_clone` in hot paths"),
+    // and this is THE hot path (S==1 per-token decode, per layer). Replace
+    // it with read-only `&Array` borrows of `self.keys`/`self.values` for
+    // every fallible stage: each of `concat_seq` (grow), `trim_buf`,
+    // `set_seq` (splice), `seq_slice` (return) produces a NEW owned
+    // `Array` into a local, so `self` is genuinely untouched until the
+    // final commit — same transactional guarantee, zero upfront clones.
+    // The "effective current buffer" is threaded via `Option<Array>` chains
+    // (`grown_*.as_ref().or(self.<field>.as_ref())`), no allocation.
+
+    // === Stage 1: GROW (read-only on self). ===
     let cur_len = self.keys.as_ref().map_or(0, |k| k.shape()[KV_NDIM - 2]);
-    if self.keys.is_none() || (prev >= cur_len && cur_len < self.max_size) {
+    let need_grow = self.keys.is_none() || (prev >= cur_len && cur_len < self.max_size);
+    let (grown_k, grown_v, idx_after_grow): (Option<Array>, Option<Array>, usize) = if need_grow {
       let new_size = ROTATING_STEP.min(self.max_size.saturating_sub(prev));
       let zk = ops::misc::astype(
         &Array::zeros::<f32>(&(b, h, new_size, k_hd))?,
@@ -210,43 +284,83 @@ impl RotatingKvCache {
         &Array::zeros::<f32>(&(b, h, new_size, v_hd))?,
         values.dtype()?,
       )?;
-      let (nk, nv) = match (&self.keys, &self.values) {
-        (Some(pk), Some(pv)) => (concat_seq(pk, &zk)?, concat_seq(pv, &zv)?),
-        _ => (zk, zv),
-      };
-      self.keys = Some(nk);
-      self.values = Some(nv);
-      self.idx = prev;
-    }
+      match (&self.keys, &self.values) {
+        (Some(pk), Some(pv)) => (Some(concat_seq(pk, &zk)?), Some(concat_seq(pv, &zv)?), prev),
+        _ => (Some(zk), Some(zv), prev),
+      }
+    } else {
+      (None, None, self.idx)
+    };
 
-    let cur_len = self.keys.as_ref().map_or(0, |k| k.shape()[KV_NDIM - 2]);
+    // Effective buffer ref after Stage 1 (grown if Some, else self).
+    let buf_k_after_grow: &Array = grown_k
+      .as_ref()
+      .or(self.keys.as_ref())
+      .expect("buffer is grown-Some on the None-input path, otherwise self.keys is Some");
+    let buf_v_after_grow: &Array = grown_v
+      .as_ref()
+      .or(self.values.as_ref())
+      .expect("values mirrors keys");
+
+    // === Stage 2: TRIM (read against post-grow ref, produces new owned). ===
+    let cur_len = buf_k_after_grow.shape()[KV_NDIM - 2];
     let trim_size = cur_len.saturating_sub(self.max_size);
-    if trim_size > 0 {
-      let tk = self.trim_buf(trim_size, self.keys.as_ref().unwrap(), None)?;
-      let tv = self.trim_buf(trim_size, self.values.as_ref().unwrap(), None)?;
-      self.keys = Some(tk);
-      self.values = Some(tv);
-      self.idx = self.max_size;
-    }
+    let (trimmed_k, trimmed_v, idx_after_trim): (Option<Array>, Option<Array>, usize) =
+      if trim_size > 0 {
+        let tk = self.trim_buf(trim_size, buf_k_after_grow, None)?;
+        let tv = self.trim_buf(trim_size, buf_v_after_grow, None)?;
+        (Some(tk), Some(tv), self.max_size)
+      } else {
+        (None, None, idx_after_grow)
+      };
 
-    if self.idx == self.max_size {
-      self.idx = self.keep;
-    }
+    // Effective buffer ref after Stage 2 (trim > grow > self).
+    let buf_k_ref: &Array = trimmed_k
+      .as_ref()
+      .or(grown_k.as_ref())
+      .or(self.keys.as_ref())
+      .unwrap();
+    let buf_v_ref: &Array = trimmed_v
+      .as_ref()
+      .or(grown_v.as_ref())
+      .or(self.values.as_ref())
+      .unwrap();
 
-    let nk = Self::set_seq(self.keys.as_ref().unwrap(), self.idx, 1, keys)?;
-    let nv = Self::set_seq(self.values.as_ref().unwrap(), self.idx, 1, values)?;
+    let idx = if idx_after_trim == self.max_size {
+      self.keep
+    } else {
+      idx_after_trim
+    };
+
+    // === Stage 3: SPLICE (set_seq; fallible — `broadcast_write_rhs` may
+    // reject a non-broadcastable RHS). Produces new owned arrays; `self`
+    // is still untouched, so a recoverable `Err` here leaves the cache
+    // byte-identical to its pre-update state — no committed trim, no
+    // half-rewound `idx`. ===
+    let nk = Self::set_seq("keys", buf_k_ref, idx, 1, keys)?;
+    let nv = Self::set_seq("values", buf_v_ref, idx, 1, values)?;
+
+    // mlx-lm `cache.py:506-518`: bump `_idx`, then return the still-filling
+    // prefix or the full ring. The returned slice (`seq_slice` /
+    // `try_clone`) is the final fallible step; compute it BEFORE the commit
+    // too so any failure (e.g. OOM on the slice) also leaves `self`
+    // untouched.
+    let new_idx = idx + 1;
+    let ret = if new_offset < self.max_size {
+      (
+        seq_slice(&nk, 0, new_offset)?,
+        seq_slice(&nv, 0, new_offset)?,
+      )
+    } else {
+      (nk.try_clone()?, nv.try_clone()?)
+    };
+
+    // All fallible work succeeded — commit the new state atomically.
     self.keys = Some(nk);
     self.values = Some(nv);
     self.offset = new_offset;
-    self.idx += 1;
-
-    let k = self.keys.as_ref().unwrap();
-    let v = self.values.as_ref().unwrap();
-    if self.offset < self.max_size {
-      Ok((seq_slice(k, 0, self.offset)?, seq_slice(v, 0, self.offset)?))
-    } else {
-      Ok((k.try_clone()?, v.try_clone()?))
-    }
+    self.idx = new_idx;
+    Ok(ret)
   }
 }
 
