@@ -74,6 +74,119 @@ fn standard_wrong_rank_errors() {
   assert!(c.update(&bad, &bad).is_err());
 }
 
+/// Regression (rank-safety, no panic on a recoverable path): the merged
+/// faithful-revert removed the non-faithful K/V seq cross-check, leaving
+/// `RotatingKvCache::update_in_place` (S==1) reading `values.shape()[3]`
+/// raw. A rank-invalid `values` (with valid 4-D `keys`) must surface as a
+/// recoverable `Err(Error::ShapeMismatch{..})` (the faithful equivalent of
+/// mlx-lm `cache.py:478` `values.shape[3]` raising a catchable
+/// `IndexError`), NEVER a Rust slice out-of-bounds panic on the
+/// `Result`-returning public `update`.
+#[test]
+fn rotating_update_in_place_rank_invalid_values_errors_no_panic() {
+  let mut c = RotatingKvCache::new(8, 4);
+  // Valid 4-D single-token `keys` -> the S==1 `_update_in_place` dispatch.
+  let keys = kv(&[0.0]);
+  // 2-D `values` (rank < 4): would hit the raw `values.shape()[3]`.
+  let bad_values = Array::from_slice::<f32>(&[0.0, 1.0], &(1usize, 2)).unwrap();
+  let r = c.update(&keys, &bad_values);
+  assert!(
+    matches!(&r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    "rank-invalid values on the S==1 path must be a recoverable \
+     ShapeMismatch, got {r:?}"
+  );
+}
+
+/// Regression (rank-safety, no panic on a recoverable path): the S>1
+/// `RotatingKvCache::update_concat` dispatch with valid 4-D `keys` but a
+/// rank-invalid `values` must also be a recoverable `Err` (never a panic).
+/// Critically, this must hold on the empty-cache branch too: if an empty
+/// ring accepts rank-invalid `values` via direct assignment/clone, it can
+/// cache a malformed 2-D buffer and only panic later when subsequent valid
+/// updates index cached-value shape as if it were 4-D. The load-bearing
+/// guarantee is identical on the public `Result` API: reject the bad
+/// update recoverably and leave the cache usable.
+#[test]
+fn rotating_update_concat_rank_invalid_values_errors_no_panic() {
+  let mut c = RotatingKvCache::new(6, 2);
+  // Valid 4-D multi-token `keys` (S == 2) -> the S>1 `_update_concat`.
+  // Use an empty cache so this exercises the empty-cache branch.
+  let keys = kv(&[2.0, 3.0]);
+  // 2-D `values` (rank < 4).
+  let bad_values = Array::from_slice::<f32>(&[2.0, 3.0], &(1usize, 2)).unwrap();
+  let r = c.update(&keys, &bad_values);
+  assert!(
+    r.is_err(),
+    "rank-invalid values on the empty-cache S>1 path must be a recoverable \
+     Err, got {r:?}"
+  );
+  // A subsequent valid update must still succeed, proving the failed call
+  // did not store the malformed 2-D values buffer in the cache.
+  c.update(&keys, &keys).unwrap();
+}
+
+/// Regression (rank-safety, `concat_parts` single-part fast path):
+/// `RotatingKvCache::update_concat` with `max_size=1, keep=0` and a
+/// populated cache drops every retained (empty) 4-D piece in `_trim`,
+/// leaving ONLY the rank-invalid external `values` as the lone surviving
+/// part. The `concat_parts` `[one]` fast path must NOT clone that through
+/// (it would `Ok`-store a rank-invalid buffer that a *later* valid update
+/// hits via a raw cached-shape read in `temporal_order`/`set_seq` and
+/// panics); it must surface the same recoverable `Err` mlx-lm's
+/// `mx.concatenate(to_cat, axis=2)` raises on a rank-mismatched lone
+/// element — and a subsequent valid update must still work (no cache
+/// corruption, no panic on the `Result` API).
+#[test]
+fn rotating_update_concat_single_part_fast_path_rank_invalid_no_corruption() {
+  let mut c = RotatingKvCache::new(1, 0);
+  // Seed a valid 1-token ring (offset=1, idx=1, buffer is 4-D len 1).
+  let seed = kv(&[0.0]);
+  c.update(&seed, &seed).unwrap();
+  // S == 2 valid keys -> `_update_concat`; rank-invalid (2-D) values.
+  // `_trim(trim_size>0, ...)` yields empty 4-D `keep`/tail slices that the
+  // rank-safe filter drops, so only `bad_values` survives -> `[one]` arm.
+  let keys = kv(&[1.0, 2.0]);
+  let bad_values = Array::from_slice::<f32>(&[1.0, 2.0], &(1usize, 2)).unwrap();
+  let r = c.update(&keys, &bad_values);
+  assert!(
+    r.is_err(),
+    "rank-invalid lone-surviving values must be a recoverable Err \
+     (mx.concatenate of a single rank-mismatched element raises), got {r:?}"
+  );
+  // The failed update must NOT have stored the rank-invalid buffer: a
+  // subsequent VALID update must succeed without panicking on a raw
+  // cached-shape read (`temporal_order`/`set_seq`).
+  let good = kv(&[3.0]);
+  let r2 = c.update(&good, &good);
+  assert!(
+    r2.is_ok(),
+    "a valid update after a rejected rank-invalid one must succeed (no \
+     cache corruption / no Result-path panic), got {r2:?}"
+  );
+}
+
+/// Regression (rank-safety, no panic): `StandardKvCache::update` with valid
+/// 4-D `keys` but a rank-invalid `values`. It has no raw `values.shape[N]`
+/// metadata read (`keys` is `seq_len`-validated; `values` only flows
+/// through `mx.concatenate`/`try_clone`), so the recoverable error comes
+/// from the backend concat against the seeded 4-D buffer — still a
+/// recoverable `Err`, never a panic, on the `Result` API.
+#[test]
+fn standard_rank_invalid_values_errors_no_panic() {
+  let mut c = StandardKvCache::new();
+  // Seed a 4-D buffer so the next update concatenates (where a rank-invalid
+  // `values` reaches `mx.concatenate`).
+  let seed = kv(&[0.0, 1.0]);
+  c.update(&seed, &seed).unwrap();
+  let keys = kv(&[2.0]);
+  let bad_values = Array::from_slice::<f32>(&[2.0, 3.0], &(1usize, 2)).unwrap();
+  let r = c.update(&keys, &bad_values);
+  assert!(
+    r.is_err(),
+    "rank-invalid values must be a recoverable Err, got {r:?}"
+  );
+}
+
 #[test]
 fn rotating_keeps_prefix_and_window() {
   // max_size=8, keep=4. Feeding 12 single tokens (ids 0..=11) exercises

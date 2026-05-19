@@ -5,7 +5,7 @@ use crate::{
   error::{Error, Result},
   lm::cache::{
     KvCache, MaskMode, mask,
-    util::{KV_NDIM, concat_seq, nbytes, seq_len, seq_slice},
+    util::{KV_NDIM, concat_seq, head_dim, nbytes, seq_len, seq_slice},
   },
   ops,
 };
@@ -172,9 +172,17 @@ impl RotatingKvCache {
   /// grow the ring while it is below `max_size`, trim/rotate, overwrite the
   /// slot at `_idx`, and return the still-filling prefix or the full ring.
   fn update_in_place(&mut self, keys: &Array, values: &Array) -> Result<(Array, Array)> {
+    // `keys` is already rank-validated: `update` runs `seq_len("keys",
+    // keys)?` before dispatching here, so `ks` is exactly 4-D and these
+    // indices cannot panic. `values` has NOT been rank-checked (the merged
+    // faithful-revert removed the K/V seq cross-check, and `seq_len` only
+    // validated `keys`); mlx-lm's `values.shape[3]` (cache.py:478) would
+    // raise a catchable `IndexError` on a rank-invalid `values`, so use the
+    // rank-safe `head_dim` accessor to return a recoverable
+    // `Error::ShapeMismatch` instead of a Rust slice out-of-bounds panic.
     let ks = keys.shape();
     let (b, h, k_hd) = (ks[0], ks[1], ks[3]);
-    let v_hd = values.shape()[3];
+    let v_hd = head_dim("values", values)?;
     let prev = self.offset;
 
     // mlx-lm `cache.py:506`: `self.offset += 1` (the S==1 decode path).

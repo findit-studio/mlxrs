@@ -39,6 +39,25 @@ pub(crate) fn seq_len(name: &str, a: &Array) -> Result<usize> {
   Ok(shape[KV_NDIM - 2])
 }
 
+/// Validate a key/value tensor's rank and return its head dimension
+/// (`shape[-1]`, the last axis). mlx-lm reads `values.shape[3]` /
+/// `values.shape[-1]` directly on the assumed 4-D `[B, n_kv_heads, S,
+/// head_dim]` layout (`cache.py:337`/`cache.py:478`); we check the rank
+/// instead of indexing blindly so a rank-invalid `values` is a recoverable
+/// [`Error::ShapeMismatch`] (the faithful equivalent of Python's
+/// `IndexError`), not a Rust slice out-of-bounds panic.
+pub(crate) fn head_dim(name: &str, a: &Array) -> Result<usize> {
+  let shape = a.shape();
+  if shape.len() != KV_NDIM {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "KV cache expects 4-D {name} [B, n_kv_heads, S, head_dim], got shape {shape:?}"
+      ),
+    });
+  }
+  Ok(shape[KV_NDIM - 1])
+}
+
 /// Slice the sequence axis (`-2`) of a 4-D KV tensor to `[start, end)`,
 /// keeping every other axis full. mlx-lm's `v[..., start:end, :]`.
 pub(crate) fn slice_seq(a: &Array, start: usize, end: usize) -> Result<Array> {
@@ -88,24 +107,64 @@ pub(crate) fn nbytes(a: &Array) -> Result<usize> {
 /// Concatenate the non-empty parts along the sequence axis (an empty part
 /// is a no-op in mlx-lm's `mx.concatenate`; dropping it avoids a redundant
 /// op and any zero-length-concat edge). A single part is returned directly.
+///
+/// The `S > 1` `RotatingKvCache::update_concat` path routes the *external*,
+/// not-yet-rank-validated `keys`/`values` through here (via `_trim`), so a
+/// rank-invalid argument must NOT panic on the raw sequence-axis index.
+/// Only a provably-empty *4-D* part is dropped; a part whose rank is not
+/// `KV_NDIM` is **kept** and flowed into `ops::shape::concatenate`, which
+/// returns a recoverable `Err` — the faithful equivalent of mlx-lm's
+/// `mx.concatenate` itself raising a catchable error on a rank-mismatched
+/// input. Behavior for valid 4-D parts is byte-identical (an empty 4-D part
+/// is still dropped, a non-empty one still kept).
 pub(crate) fn concat_parts(parts: &[&Array]) -> Result<Array> {
   let non_empty: Vec<&Array> = parts
     .iter()
     .copied()
-    .filter(|a| a.shape()[KV_NDIM - 2] > 0)
+    .filter(|a| {
+      let shape = a.shape();
+      // Drop only a provably-empty 4-D part; never index a rank-invalid
+      // part's sequence axis (that would be a slice OOB panic) — keep it
+      // and let `concatenate` surface a recoverable rank error.
+      shape.len() != KV_NDIM || shape[KV_NDIM - 2] > 0
+    })
     .collect();
+  // The `[]` / `[one]` fast paths return a part directly *without* going
+  // through `ops::shape::concatenate`. mlx-lm's `mx.concatenate(to_cat,
+  // axis=2)` validates rank even for a single-element `to_cat` and raises
+  // (catchably) on a rank-mismatched element, and the `update_concat` S>1
+  // path can leave exactly the rank-invalid external `values` as the lone
+  // surviving part (e.g. `max_size=1, keep=0`: the retained 4-D pieces are
+  // empty and dropped). Returning that clone would (a) diverge from
+  // `cache.py` and (b) store a rank-invalid buffer that a *later* valid
+  // update would hit via a raw cached-shape read (`temporal_order` /
+  // `set_seq`) → panic. So a fast-path part must be rank-checked: a
+  // rank-invalid one is the same recoverable `Error::ShapeMismatch`
+  // `mx.concatenate` would raise. A valid 4-D part is byte-identical
+  // (`try_clone`) — `concatenate` of a single 4-D array is identity.
+  let rank_checked = |a: &Array| -> Result<Array> {
+    let shape = a.shape();
+    if shape.len() != KV_NDIM {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "KV cache concat expects 4-D [B, n_kv_heads, S, head_dim] parts, got shape {shape:?}"
+        ),
+      });
+    }
+    a.try_clone()
+  };
   match non_empty.as_slice() {
     // Every part empty: mirror `mx.concatenate`'s result by returning the
     // first (empty) part. Internal callers always pass >= 1 part; an empty
     // `parts` slice has no defined concat result, so it is a recoverable
     // `Error` rather than an indexing panic.
     [] => match parts.first() {
-      Some(first) => first.try_clone(),
+      Some(first) => rank_checked(first),
       None => Err(Error::ShapeMismatch {
         message: "concat_parts: no parts to concatenate".into(),
       }),
     },
-    [one] => one.try_clone(),
+    [one] => rank_checked(one),
     many => ops::shape::concatenate(many, SEQ_AXIS),
   }
 }
