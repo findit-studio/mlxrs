@@ -45,11 +45,15 @@ use crate::{
 };
 
 mod mask;
+pub mod persist;
+pub mod prompt;
 mod rotating;
 mod standard;
 mod util;
 
 pub use mask::{create_attention_mask, create_causal_mask};
+pub use persist::*;
+pub use prompt::*;
 pub use rotating::RotatingKvCache;
 pub use standard::StandardKvCache;
 
