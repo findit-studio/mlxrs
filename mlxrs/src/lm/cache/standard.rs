@@ -45,6 +45,17 @@ impl KvCache for StandardKvCache {
   /// full accumulated `(keys, values)` (mlx-lm `KVCache.update_and_fetch`).
   fn update(&mut self, keys: &Array, values: &Array) -> Result<(Array, Array)> {
     let s = seq_len("keys", keys)?;
+    // Symmetric, STANDALONE per-tensor rank validation on `values` — the
+    // faithful-equivalent of the `seq_len("keys", keys)?` rank check above
+    // (mlx-lm `cache.py` implicitly requires a 4-D `values`). NOT a
+    // keys-vs-values seq-length cross-check (the faithful revert removed
+    // that): `seq_len("values", values)` only checks `values`'s OWN rank.
+    // The empty-cache branch below `try_clone`s `values` directly, so
+    // without this a rank-invalid `values` on a fresh cache would be stored
+    // raw and only surface (feature-combo-dependently) on a later op; the
+    // guard makes it a DETERMINISTIC recoverable `Err(Error::ShapeMismatch)`
+    // on every path (empty/non-empty cache) on entry.
+    let _ = seq_len("values", values)?;
     let (k, v) = match (&self.keys, &self.values) {
       (Some(pk), Some(pv)) => (concat_seq(pk, keys)?, concat_seq(pv, values)?),
       _ => (keys.try_clone()?, values.try_clone()?),
@@ -80,10 +91,17 @@ impl KvCache for StandardKvCache {
         let keys = state.pop().unwrap();
         // mlx-lm `KVCache.state` setter (cache.py:371): `self.keys,
         // self.values = v; self.offset = self.keys.shape[2]` — no K/V
-        // shape-compatibility validation; it assigns and lets MLX error
-        // downstream. We mirror that, only deriving `offset` from `keys`'
-        // own sequence axis.
+        // shape-COMPATIBILITY (cross) validation; it assigns and lets MLX
+        // error downstream. We mirror that (NO keys-vs-values comparison),
+        // only deriving `offset` from `keys`' own sequence axis. Each
+        // stored array is independently rank-validated (a STANDALONE
+        // per-tensor 4-D check, symmetric — `keys` already was via the
+        // `offset`-deriving `seq_len`; `values` likewise — still NOT a K/V
+        // cross-check) so a rank-invalid loaded state is a DETERMINISTIC
+        // recoverable `Err(Error::ShapeMismatch)` here on every feature
+        // combo rather than a (combo-dependent) later op error.
         let sk = seq_len("keys", &keys)?;
+        let _ = seq_len("values", &values)?;
         self.keys = Some(keys);
         self.values = Some(values);
         self.offset = sk;

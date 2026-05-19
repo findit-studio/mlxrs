@@ -172,14 +172,15 @@ impl RotatingKvCache {
   /// grow the ring while it is below `max_size`, trim/rotate, overwrite the
   /// slot at `_idx`, and return the still-filling prefix or the full ring.
   fn update_in_place(&mut self, keys: &Array, values: &Array) -> Result<(Array, Array)> {
-    // `keys` is already rank-validated: `update` runs `seq_len("keys",
-    // keys)?` before dispatching here, so `ks` is exactly 4-D and these
-    // indices cannot panic. `values` has NOT been rank-checked (the merged
-    // faithful-revert removed the K/V seq cross-check, and `seq_len` only
-    // validated `keys`); mlx-lm's `values.shape[3]` (cache.py:478) would
-    // raise a catchable `IndexError` on a rank-invalid `values`, so use the
-    // rank-safe `head_dim` accessor to return a recoverable
-    // `Error::ShapeMismatch` instead of a Rust slice out-of-bounds panic.
+    // Both `keys` and `values` are already rank-validated: `update` runs
+    // `seq_len("keys", keys)?` AND the symmetric standalone
+    // `seq_len("values", values)?` before dispatching here, so each is
+    // exactly 4-D and these indices cannot panic on any feature combo. The
+    // rank-safe `head_dim` accessor below is kept as defense-in-depth (it
+    // is byte-identical to `values.shape[3]` for the now-guaranteed 4-D
+    // `values`, mirroring mlx-lm's `values.shape[3]` at `cache.py:478`); it
+    // would still surface a recoverable `Error::ShapeMismatch` rather than
+    // a slice OOB panic if this private method were ever reached directly.
     let ks = keys.shape();
     let (b, h, k_hd) = (ks[0], ks[1], ks[3]);
     let v_hd = head_dim("values", values)?;
@@ -267,6 +268,19 @@ impl KvCache for RotatingKvCache {
   /// (mlx-lm `RotatingKVCache.update_and_fetch`, dispatching on `S`).
   fn update(&mut self, keys: &Array, values: &Array) -> Result<(Array, Array)> {
     let s = seq_len("keys", keys)?;
+    // Symmetric, STANDALONE per-tensor rank validation on `values` — the
+    // exact faithful-equivalent of the `seq_len("keys", keys)?` rank check
+    // above (mlx-lm `cache.py` implicitly requires a 4-D `[B, n_kv_heads, S,
+    // head_dim]` `values`, indexing `values.shape[3]` at `cache.py:478`). It
+    // is NOT the keys-vs-values seq-length cross-check the faithful revert
+    // deliberately removed — `seq_len("values", values)` only checks
+    // `values`'s OWN rank, never compares it to `keys`. Done BEFORE the S
+    // dispatch so a rank-invalid `values` is a DETERMINISTIC recoverable
+    // `Err(Error::ShapeMismatch)` on EVERY path (empty/non-empty cache,
+    // S==1's `_update_in_place`, S>1's `_update_concat` including the
+    // empty-cache `try_clone` branch) regardless of which downstream MLX op
+    // would otherwise (feature-combo-dependently) catch or miss it.
+    let _ = seq_len("values", values)?;
     if s == 1 {
       self.update_in_place(keys, values)
     } else {
@@ -308,9 +322,21 @@ impl KvCache for RotatingKvCache {
         let values = state.pop().unwrap();
         let keys = state.pop().unwrap();
         // mlx-lm `RotatingKVCache.state` setter (cache.py:295): `self.keys,
-        // self.values = v` — no K/V shape-compatibility validation
-        // (offset/idx come from `set_meta_state`, not the keys); it assigns
-        // and lets MLX error downstream. We mirror that faithfully.
+        // self.values = v` — no K/V shape-COMPATIBILITY (cross) validation
+        // (offset/idx come from `set_meta_state`, not the keys); we mirror
+        // that: NO keys-vs-values comparison. But each stored array must
+        // independently be the assumed 4-D `[B, n_kv_heads, S, head_dim]`:
+        // unlike mlx-lm (where a later op raises a catchable error), our
+        // `update_concat`/`temporal_order` read the cached buffer's
+        // sequence axis with a RAW `v.shape()[KV_NDIM - 2]` index, so a
+        // rank-invalid stored array would be a Rust slice OOB *panic* on a
+        // later valid `update` — not a recoverable error. A STANDALONE
+        // per-tensor rank check on each (symmetric to the `seq_len` rank
+        // check at `update` entry; still NOT a K/V cross-check) makes a
+        // rank-invalid loaded state a DETERMINISTIC recoverable
+        // `Err(Error::ShapeMismatch)` here instead.
+        let _ = seq_len("keys", &keys)?;
+        let _ = seq_len("values", &values)?;
         self.keys = Some(keys);
         self.values = Some(values);
         Ok(())
