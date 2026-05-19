@@ -223,16 +223,6 @@ impl Drop for Stream {
   }
 }
 
-impl Clone for Stream {
-  /// Independent handle that wraps a fresh `mlx_stream` ctx pointing at the
-  /// same underlying `mlx::core::Stream` payload (same `{kind, index}`).
-  fn clone(&self) -> Self {
-    self
-      .try_clone()
-      .expect("Stream::clone: mlx_stream_set failed")
-  }
-}
-
 impl Stream {
   /// The per-thread default GPU stream. Wraps `mlx_default_gpu_stream_new`.
   /// Cheap and repeatable — returns the thread's existing default, so it
@@ -302,8 +292,11 @@ impl Stream {
     Ok(Self(raw))
   }
 
-  /// Refcount-style clone via `mlx_stream_set`. Returns `Result` so callers
-  /// can handle the rare allocation-failure path explicitly.
+  /// Handle duplication: allocates a fresh `mlx_stream` and copies
+  /// `{kind, index}` via `mlx_stream_set` (a new independent handle with a
+  /// copied payload — **not** a refcounted shared payload). Returns `Result`
+  /// because the alloc/set can fail; `Stream` intentionally does not implement
+  /// `Clone`.
   pub fn try_clone(&self) -> Result<Self> {
     ensure_handler_installed();
     assert_streams_not_cleared();

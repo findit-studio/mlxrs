@@ -6,9 +6,11 @@
 //! ## Caveats
 //! - `Array` is **`!Send` and `!Sync`** — single-thread use only, like MLX's
 //!   own C++/Python/Swift APIs (which deliberately do not share arrays across
-//!   threads). The underlying C++ `array_desc` is refcount-shared by `Clone`
-//!   and mutates non-atomic state internally, and mlx's `eval` is itself not
-//!   concurrency-safe. There is **no shared-array wrapper**: to use array
+//!   threads). The underlying C++ `array_desc` is refcount-shared by
+//!   [`Array::try_clone`] and mutates non-atomic state internally, and mlx's
+//!   `eval` is itself not concurrency-safe. `Array` therefore does **not**
+//!   implement `Clone` (the only duplication is the fallible `try_clone`).
+//!   There is **no shared-array wrapper**: to use array
 //!   data on another thread, extract owned data via [`Array::to_vec`] /
 //!   [`Array::item`] (which yield `Send` values) and move that.
 //! - **Async Metal kernel failures bypass `Result<T, Error>` and abort the
