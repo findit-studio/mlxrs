@@ -1,0 +1,527 @@
+//! [`RotatingKvCache`] — the sliding-window (ring) cache.
+
+use crate::{
+  array::Array,
+  error::{Error, Result},
+  lm::cache::{
+    KvCache, MaskMode, mask,
+    util::{KV_NDIM, concat_seq, nbytes, seq_len, seq_slice},
+  },
+  ops,
+};
+
+/// Sliding-window KV cache — the cache for models with a bounded attention
+/// window (`sliding_window` / `max_kv_size`).
+///
+/// Faithful 1:1 port of `mlx_lm.models.cache.RotatingKVCache`. mlx-lm has
+/// two physical paths — `_update_in_place` (single-token decode, `S == 1`)
+/// and `_update_concat` (multi-token prefill, `S > 1`) — and they are
+/// **not** observably interchangeable: once the window is full,
+/// `_update_in_place` overwrites the slot at the `_idx` ring cursor *in
+/// place*, so the returned buffer is in **physical ring order** (e.g.
+/// `max_size=8, keep=4` after ids `0..=8` → `[0,1,2,3,8,5,6,7]`, *not* the
+/// temporal `[0,1,2,3,5,6,7,8]`), while `_update_concat` over-retains
+/// `max_size + S - 1` so every new token still sees `max_size` of context.
+/// An attention mask constructed the mlx-lm way relies on exactly this
+/// layout, so the port mirrors `_idx`, `_temporal_order`, `_trim`, and both
+/// update paths verbatim. Before the window fills, all `offset` tokens are
+/// kept; `keep` pins the prompt prefix (BOS / system tokens) outside the
+/// rotation. The step buffer is emulated with placeholder rows whose values
+/// are provably overwritten or sliced off (`offset < max_size` return)
+/// before any observer — so `keys.shape[2]`, which drives the
+/// grow/trim/rotate branches and `_idx`, stays identical to mlx-lm for
+/// every `S == 1` / `S > 1` mix, while `offset` is the raw uncapped counter.
+pub struct RotatingKvCache {
+  keys: Option<Array>,
+  values: Option<Array>,
+  /// Total tokens ever appended (monotone except via `trim`) — mlx-lm
+  /// `RotatingKVCache.offset`. This is the raw position the attention
+  /// mask / RoPE use; it is *not* capped at `max_size`.
+  offset: usize,
+  /// Physical ring write cursor — mlx-lm `RotatingKVCache._idx`. The next
+  /// in-place single-token write lands at this slot; it wraps back to
+  /// `keep` once it reaches `max_size`.
+  idx: usize,
+  /// Maximum retained window length — mlx-lm `RotatingKVCache.max_size`.
+  max_size: usize,
+  /// Leading tokens never evicted by rotation — mlx-lm
+  /// `RotatingKVCache.keep`.
+  keep: usize,
+}
+
+/// mlx-lm `RotatingKVCache.step` — how many rows the in-place buffer grows
+/// by at a time. Purely an allocation batch size: every grown row is
+/// provably overwritten (or sliced off by the `offset < max_size` return)
+/// before the buffer is ever returned whole, so its value never reaches an
+/// observer. We mirror mlx-lm's `256` so the buffer-length bookkeeping
+/// (`keys.shape[2]`, which *does* drive the grow/trim/rotate branches and
+/// `_idx`) is byte-for-byte the same across every S==1 / S>1 mix.
+const ROTATING_STEP: usize = 256;
+
+impl RotatingKvCache {
+  /// A new, empty rotating cache with window `max_size`, pinning the first
+  /// `keep` tokens (mlx-lm `RotatingKVCache(max_size, keep)`).
+  pub fn new(max_size: usize, keep: usize) -> Self {
+    Self {
+      keys: None,
+      values: None,
+      offset: 0,
+      idx: 0,
+      max_size,
+      keep,
+    }
+  }
+
+  /// The physical ring write cursor — mlx-lm `RotatingKVCache._idx`.
+  /// Crate-internal so the sibling [`from_state`](super::from_state) can
+  /// assert the post-reconstruction invariant `empty ⇒ offset==0 &&
+  /// idx==0` without widening the public [`KvCache`] trait.
+  pub(crate) fn idx(&self) -> usize {
+    self.idx
+  }
+
+  /// mlx-lm `RotatingKVCache._trim`: keep the first `keep` rows then drop
+  /// `trim_size` of the next rows; optionally append `append`.
+  fn trim_buf(&self, trim_size: usize, v: &Array, append: Option<&Array>) -> Result<Array> {
+    let l = v.shape()[KV_NDIM - 2];
+    let mut owned: Vec<Array> = Vec::new();
+    if trim_size > 0 {
+      owned.push(seq_slice(v, 0, self.keep)?);
+      owned.push(seq_slice(v, trim_size + self.keep, l)?);
+    } else {
+      owned.push(v.try_clone()?);
+    }
+    if let Some(a) = append {
+      owned.push(a.try_clone()?);
+    }
+    let refs: Vec<&Array> = owned.iter().collect();
+    super::util::concat_parts(&refs)
+  }
+
+  /// mlx-lm `RotatingKVCache._temporal_order`: rearrange the physical ring
+  /// back into arrival order, slicing off the unwritten tail.
+  fn temporal_order(&self, v: &Array) -> Result<Array> {
+    let l = v.shape()[KV_NDIM - 2];
+    if self.idx == l {
+      v.try_clone()
+    } else if self.idx < self.offset {
+      let head = seq_slice(v, 0, self.keep)?;
+      let recent = seq_slice(v, self.idx, l)?;
+      let mid = seq_slice(v, self.keep, self.idx)?;
+      super::util::concat_parts(&[&head, &recent, &mid])
+    } else {
+      seq_slice(v, 0, self.idx)
+    }
+  }
+
+  /// Emulate mlx-lm's in-place `buf[..., a:a+s, :] = new` on an immutable
+  /// `Array`: splice `new` over `[a, a+s)`, keeping the surrounding rows.
+  fn set_seq(buf: &Array, a: usize, s: usize, new: &Array) -> Result<Array> {
+    let l = buf.shape()[KV_NDIM - 2];
+    let head = seq_slice(buf, 0, a)?;
+    let tail = seq_slice(buf, a + s, l)?;
+    super::util::concat_parts(&[&head, new, &tail])
+  }
+
+  /// mlx-lm `RotatingKVCache._update_concat` (the `S > 1` path): put the
+  /// ring into temporal order, over-retain `max_size + S - 1` so every new
+  /// token still sees `max_size` of context, then append.
+  fn update_concat(&mut self, keys: &Array, values: &Array, s: usize) -> Result<(Array, Array)> {
+    // mlx-lm `cache.py:464`: `self.offset += S`. Python ints never overflow;
+    // a corrupt/hostile prompt cache can restore `offset` near `usize::MAX`
+    // via `set_meta_state`, so a multi-token update here would wrap (release)
+    // / panic (debug). Compute the post-update offset with `checked_add`
+    // BEFORE mutating any ring state (the `self.idx` reassignment below) so
+    // the overflow path performs NO partial mutation; the value is
+    // byte-identical to `self.offset + s` for every non-overflowing input,
+    // so the ring algorithm outcome is unchanged.
+    let off = self.offset;
+    let new_offset = off.checked_add(s).ok_or_else(|| Error::ShapeMismatch {
+      message: format!("RotatingKvCache update: offset ({off}) + S ({s}) overflows usize"),
+    })?;
+    // `temporal_order` clones out so the `&self.keys` borrow ends before the
+    // `self.idx` mutation mlx-lm does at `cache.py:458`.
+    let reordered = match (&self.keys, &self.values) {
+      (Some(pk), Some(pv)) => Some((self.temporal_order(pk)?, self.temporal_order(pv)?)),
+      _ => None,
+    };
+    let (bk, bv) = if let Some((tk, tv)) = reordered {
+      // mlx-lm reassigns `self._idx = self.keys.shape[2]` to the
+      // temporal-order length (cache.py:458) and ONLY THEN computes
+      // `trim_size = self._idx - self.max_size + 1` (cache.py:462) — the
+      // trim window must come from the reordered buffer, not the stale ring
+      // cursor, or a still-active-ring S==1 then S>1 update over-retains.
+      self.idx = tk.shape()[KV_NDIM - 2];
+      let trim_size = (self.idx + 1).saturating_sub(self.max_size);
+      (
+        self.trim_buf(trim_size, &tk, Some(keys))?,
+        self.trim_buf(trim_size, &tv, Some(values))?,
+      )
+    } else {
+      (keys.try_clone()?, values.try_clone()?)
+    };
+    self.offset = new_offset;
+    // mlx-lm `cache.py:466`: `self._idx = self.keys.shape[2]` (final length).
+    self.idx = bk.shape()[KV_NDIM - 2];
+    self.keys = Some(bk.try_clone()?);
+    self.values = Some(bv.try_clone()?);
+    Ok((bk, bv))
+  }
+
+  /// mlx-lm `RotatingKVCache._update_in_place` (the `S == 1` decode path):
+  /// grow the ring while it is below `max_size`, trim/rotate, overwrite the
+  /// slot at `_idx`, and return the still-filling prefix or the full ring.
+  fn update_in_place(&mut self, keys: &Array, values: &Array) -> Result<(Array, Array)> {
+    let ks = keys.shape();
+    let (b, h, k_hd) = (ks[0], ks[1], ks[3]);
+    let v_hd = values.shape()[3];
+    let prev = self.offset;
+
+    // mlx-lm `cache.py:506`: `self.offset += 1` (the S==1 decode path).
+    // Python ints never overflow; a corrupt/hostile prompt cache can restore
+    // `offset` near `usize::MAX` via `set_meta_state`, so this single-token
+    // bump would wrap (release) / panic (debug). Compute the post-update
+    // offset with `checked_add` BEFORE mutating any ring state (the
+    // grow/trim/rotate reassignments below) so the overflow path performs NO
+    // partial mutation; the value is byte-identical to `self.offset + 1` for
+    // every non-overflowing input, so the ring algorithm outcome is
+    // unchanged.
+    let new_offset = prev.checked_add(1).ok_or_else(|| Error::ShapeMismatch {
+      message: format!("RotatingKvCache update: offset ({prev}) + S (1) overflows usize"),
+    })?;
+
+    let cur_len = self.keys.as_ref().map_or(0, |k| k.shape()[KV_NDIM - 2]);
+    if self.keys.is_none() || (prev >= cur_len && cur_len < self.max_size) {
+      let new_size = ROTATING_STEP.min(self.max_size.saturating_sub(prev));
+      let zk = ops::misc::astype(
+        &Array::zeros::<f32>(&(b, h, new_size, k_hd))?,
+        keys.dtype()?,
+      )?;
+      let zv = ops::misc::astype(
+        &Array::zeros::<f32>(&(b, h, new_size, v_hd))?,
+        values.dtype()?,
+      )?;
+      let (nk, nv) = match (&self.keys, &self.values) {
+        (Some(pk), Some(pv)) => (concat_seq(pk, &zk)?, concat_seq(pv, &zv)?),
+        _ => (zk, zv),
+      };
+      self.keys = Some(nk);
+      self.values = Some(nv);
+      self.idx = prev;
+    }
+
+    let cur_len = self.keys.as_ref().map_or(0, |k| k.shape()[KV_NDIM - 2]);
+    let trim_size = cur_len.saturating_sub(self.max_size);
+    if trim_size > 0 {
+      let tk = self.trim_buf(trim_size, self.keys.as_ref().unwrap(), None)?;
+      let tv = self.trim_buf(trim_size, self.values.as_ref().unwrap(), None)?;
+      self.keys = Some(tk);
+      self.values = Some(tv);
+      self.idx = self.max_size;
+    }
+
+    if self.idx == self.max_size {
+      self.idx = self.keep;
+    }
+
+    let nk = Self::set_seq(self.keys.as_ref().unwrap(), self.idx, 1, keys)?;
+    let nv = Self::set_seq(self.values.as_ref().unwrap(), self.idx, 1, values)?;
+    self.keys = Some(nk);
+    self.values = Some(nv);
+    self.offset = new_offset;
+    self.idx += 1;
+
+    let k = self.keys.as_ref().unwrap();
+    let v = self.values.as_ref().unwrap();
+    if self.offset < self.max_size {
+      Ok((seq_slice(k, 0, self.offset)?, seq_slice(v, 0, self.offset)?))
+    } else {
+      Ok((k.try_clone()?, v.try_clone()?))
+    }
+  }
+}
+
+impl KvCache for RotatingKvCache {
+  /// The raw total tokens ever appended — mlx-lm `RotatingKVCache.offset`
+  /// (consistent with [`StandardKvCache::offset`](super::StandardKvCache);
+  /// this is the value the attention mask / RoPE position use, **not** a
+  /// `max_size` cap).
+  fn offset(&self) -> usize {
+    self.offset
+  }
+
+  /// mlx-lm `cache.RotatingKVCache.max_size` — drives windowed masking.
+  fn max_size(&self) -> Option<usize> {
+    Some(self.max_size)
+  }
+
+  /// Append `keys`/`values` and return the retained `(keys, values)`
+  /// (mlx-lm `RotatingKVCache.update_and_fetch`, dispatching on `S`).
+  fn update(&mut self, keys: &Array, values: &Array) -> Result<(Array, Array)> {
+    let s = seq_len("keys", keys)?;
+    if s == 1 {
+      self.update_in_place(keys, values)
+    } else {
+      self.update_concat(keys, values, s)
+    }
+  }
+
+  /// mlx-lm `RotatingKVCache.state` getter (cross-checked vs swift): the
+  /// `offset`-length slice when the buffer over-allocated, else the buffer;
+  /// `[]` when empty.
+  fn state(&self) -> Result<Vec<Array>> {
+    match (&self.keys, &self.values) {
+      (Some(k), Some(v)) => {
+        let l = k.shape()[KV_NDIM - 2];
+        if self.offset < l {
+          Ok(vec![
+            seq_slice(k, 0, self.offset)?,
+            seq_slice(v, 0, self.offset)?,
+          ])
+        } else {
+          Ok(vec![k.try_clone()?, v.try_clone()?])
+        }
+      }
+      _ => Ok(Vec::new()),
+    }
+  }
+
+  /// mlx-lm `RotatingKVCache.state` setter: `keys, values = v` (offset/idx
+  /// come from [`set_meta_state`](KvCache::set_meta_state), not the keys).
+  /// An empty state resets the buffer.
+  fn set_state(&mut self, mut state: Vec<Array>) -> Result<()> {
+    match state.len() {
+      0 => {
+        self.keys = None;
+        self.values = None;
+        Ok(())
+      }
+      2 => {
+        let values = state.pop().unwrap();
+        let keys = state.pop().unwrap();
+        // mlx-lm `RotatingKVCache.state` setter (cache.py:295): `self.keys,
+        // self.values = v` — no K/V shape-compatibility validation
+        // (offset/idx come from `set_meta_state`, not the keys); it assigns
+        // and lets MLX error downstream. We mirror that faithfully.
+        self.keys = Some(keys);
+        self.values = Some(values);
+        Ok(())
+      }
+      n => Err(Error::Backend {
+        message: format!("RotatingKvCache state must have 0 or 2 arrays, got {n}"),
+      }),
+    }
+  }
+
+  /// mlx-lm `RotatingKVCache.meta_state`:
+  /// `(keep, max_size, offset, _idx)` as decimal strings.
+  fn meta_state(&self) -> Vec<String> {
+    vec![
+      self.keep.to_string(),
+      self.max_size.to_string(),
+      self.offset.to_string(),
+      self.idx.to_string(),
+    ]
+  }
+
+  /// mlx-lm `RotatingKVCache.meta_state` setter:
+  /// `self.keep, self.max_size, self.offset, self._idx = map(int, v)`.
+  fn set_meta_state(&mut self, m: &[String]) -> Result<()> {
+    if m.len() != 4 {
+      return Err(Error::Backend {
+        message: format!(
+          "RotatingKvCache meta_state must have 4 values, got {}",
+          m.len()
+        ),
+      });
+    }
+    let parse = |i: usize, name: &str| -> Result<usize> {
+      m[i].parse::<usize>().map_err(|e| Error::Backend {
+        message: format!("RotatingKvCache meta_state {name} ({:?}): {e}", m[i]),
+      })
+    };
+    // Parse ALL four into locals and validate before mutating ANY field, so
+    // a parse error on a later value (e.g. a non-numeric `offset`) leaves
+    // the cache exactly as it was rather than partially corrupted (`keep`
+    // changed though `max_size`/`offset`/`idx` failed). Faithful semantics
+    // are unchanged: same four fields, same order/format as cache.py:531-533
+    // (`self.keep, self.max_size, self.offset, self._idx = map(int, v)`); on
+    // success all four are assigned, so `from_state`'s post-`set_state`
+    // +`set_meta_state` `empty ⇒ offset==0 && idx==0` invariant still sees
+    // the loaded `offset`/`idx`.
+    let keep = parse(0, "keep")?;
+    let max_size = parse(1, "max_size")?;
+    let offset = parse(2, "offset")?;
+    let idx = parse(3, "idx")?;
+    self.keep = keep;
+    self.max_size = max_size;
+    self.offset = offset;
+    self.idx = idx;
+    Ok(())
+  }
+
+  /// Whether the cache can be trimmed — only before the window fills
+  /// (`offset < max_size`), exactly mlx-lm `RotatingKVCache.is_trimmable`.
+  fn is_trimmable(&self) -> bool {
+    self.offset < self.max_size
+  }
+
+  /// Drop the most recent `min(offset, n)` tokens; returns the number
+  /// trimmed (mlx-lm `RotatingKVCache.trim`: it only adjusts `offset` and
+  /// `_idx` — the next in-place update rewrites from the moved cursor — and
+  /// is only valid before the ring fills, see
+  /// [`is_trimmable`](KvCache::is_trimmable)).
+  fn trim(&mut self, n: usize) -> Result<usize> {
+    let trimmed = n.min(self.offset);
+    self.offset -= trimmed;
+    self.idx = self.idx.saturating_sub(trimmed);
+    Ok(trimmed)
+  }
+
+  /// 1:1 port of mlx-lm `RotatingKVCache.make_mask` (`cache.py:554-578`) —
+  /// the rotating cache's **own** override, *not* the generic
+  /// `create_attention_mask`. Two regimes:
+  ///
+  /// - `N > 1` (prefill): `window_size or self.max_size`, the offset capped
+  ///   at `max_size - 1` (mlx-lm's `min(self.max_size-1, self.offset)`; the
+  ///   struct's `offset` is the raw uncapped counter, see
+  ///   [`offset`](KvCache::offset)). If `offset + N > window_size` or
+  ///   `return_array`, a windowed `create_causal_mask`; else the symbolic
+  ///   [`MaskMode::Causal`] (`cache.py:560-563`).
+  /// - `N == 1` (decode): no mask unless a `window_size` is given AND
+  ///   `self.offset >= window_size` AND `self.max_size > window_size`, in
+  ///   which case the rolled physical-ring mask
+  ///   `roll(arange(mask_size) >= mask_size - window_size, idx + 1)` over the
+  ///   ring cursor (`cache.py:565-578`); any other path falls through to
+  ///   [`MaskMode::None`] (mlx-lm's implicit `return None`).
+  ///
+  /// `crate::ops` has no native `roll`; the 1-D roll is composed faithfully
+  /// by `mask::roll_1d` (`out[i] = a[(i-s) mod L]`). The `max_size - 1` /
+  /// `mask_size - window_size` differences are guarded with `saturating_sub`
+  /// — for every real rotating cache (`max_size >= 1`, and the branch
+  /// guarantees `mask_size >= window_size + 1`) this is exactly mlx-lm's
+  /// integer arithmetic; it only avoids an underflow panic on the degenerate
+  /// `max_size == 0` `from_state` placeholder before `set_meta_state`.
+  fn make_mask(
+    &self,
+    n: usize,
+    window_size: Option<usize>,
+    return_array: bool,
+  ) -> Result<MaskMode> {
+    if n > 1 {
+      // `window_size = window_size or self.max_size` (cache.py:558).
+      // Python `or` is truthiness, not None-coalescing: `0` is falsy, so
+      // `Some(0)` must ALSO fall back to `self.max_size` (a plain
+      // `unwrap_or` would keep `0` and yield a wrong all-windowed/empty N>1
+      // mask). `None`/`Some(0)` -> `max_size`; `Some(w != 0)` -> `w`.
+      let ws = window_size.filter(|&w| w != 0).unwrap_or(self.max_size);
+      // `offset = min(self.max_size - 1, self.offset)` (cache.py:559)
+      let offset = self.max_size.saturating_sub(1).min(self.offset);
+      // `offset + N` (cache.py:560). Python ints never overflow; a corrupt
+      // loaded `max_size`/`offset` near `usize::MAX` would here wrap
+      // (release) / panic (debug) BEFORE `create_causal_mask`'s checked-add
+      // can catch it, possibly flipping this decision. Compute it checked
+      // (matching the round-2 `create_causal_mask` fix); the comparison
+      // result is byte-identical to `offset + n` for every non-overflowing
+      // input, so the decision outcome is unchanged.
+      let offset_plus_n = offset.checked_add(n).ok_or_else(|| Error::ShapeMismatch {
+        message: format!("RotatingKvCache::make_mask: offset ({offset}) + N ({n}) overflows usize"),
+      })?;
+      if offset_plus_n > ws || return_array {
+        Ok(MaskMode::Array(mask::create_causal_mask(
+          n,
+          offset,
+          Some(ws),
+        )?))
+      } else {
+        Ok(MaskMode::Causal)
+      }
+    } else {
+      // N == 1
+      match window_size {
+        // `if window_size is None: return None` (cache.py:565-566)
+        None => Ok(MaskMode::None),
+        Some(ws) => {
+          // `if self.offset >= window_size and self.max_size > window_size`
+          // (cache.py:568)
+          if self.offset >= ws && self.max_size > ws {
+            // `idx = self._idx; if idx >= self.max_size: idx = 0`
+            // (cache.py:569-571)
+            let idx = if self.idx >= self.max_size {
+              0
+            } else {
+              self.idx
+            };
+            // `mask_size = self.offset + 1 if self.offset < self.max_size
+            //  else self.max_size` (cache.py:572-575)
+            let mask_size = if self.offset < self.max_size {
+              self.offset + 1
+            } else {
+              self.max_size
+            };
+            // `mask = mx.arange(mask_size) >= (mask_size - window_size)`
+            // (cache.py:576) — built in mask.rs's I32 grid / Bool result
+            // idiom (same as create_causal_mask).
+            let inds = mask::iarange(0, mask_size)?;
+            let bound = mask::scalar_i32((mask_size.saturating_sub(ws)) as i32)?;
+            let m = ops::comparison::greater_equal(&inds, &bound)?;
+            // `mask = mx.roll(mask, shift=idx + 1)` (cache.py:577)
+            let m = mask::roll_1d(&m, idx + 1)?;
+            Ok(MaskMode::Array(m))
+          } else {
+            // Python falls through with no `return` -> None.
+            Ok(MaskMode::None)
+          }
+        }
+      }
+    }
+  }
+
+  /// mlx-lm `RotatingKVCache.nbytes`: `keys.nbytes + values.nbytes`
+  /// (0 if empty).
+  fn nbytes(&self) -> usize {
+    let mut total = 0;
+    if let Some(k) = &self.keys {
+      total += nbytes(k).unwrap_or(0);
+    }
+    if let Some(v) = &self.values {
+      total += nbytes(v).unwrap_or(0);
+    }
+    total
+  }
+
+  /// Whether the cache holds no keys yet (mlx-lm `empty()`).
+  fn is_empty(&self) -> bool {
+    self.keys.is_none()
+  }
+
+  /// An independent copy (mlx-lm `copy.deepcopy` / swift `copy()`).
+  /// Independence comes from MLX value semantics, not buffer duplication:
+  /// arrays are immutable and the cache only ever *reassigns* `keys` /
+  /// `values` to freshly-computed arrays (never mutates a buffer in place),
+  /// so although `Array::try_clone` is a refcount-sharing clone, the copy
+  /// and the original (including the scalar ring fields, copied by value)
+  /// evolve completely independently.
+  ///
+  /// Swift's `copy()` is infallible; here the fallible [`Array::try_clone`]
+  /// is propagated as a `Result` (`try_clone()?`) — a clone failure is
+  /// **never** mapped to `None` (which would yield a cache with the right
+  /// `offset`/`idx` but missing keys/values: silent corruption) and
+  /// **never** panicked.
+  fn copy(&self) -> Result<Box<dyn KvCache>> {
+    Ok(Box::new(Self {
+      keys: match &self.keys {
+        Some(a) => Some(a.try_clone()?),
+        None => None,
+      },
+      values: match &self.values {
+        Some(a) => Some(a.try_clone()?),
+        None => None,
+      },
+      offset: self.offset,
+      idx: self.idx,
+      max_size: self.max_size,
+      keep: self.keep,
+    }))
+  }
+}
