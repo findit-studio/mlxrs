@@ -13,10 +13,11 @@
 //! refinement traits [`QuantizedKvCache`] (swift `QuantizedKVCacheProtocol`)
 //! and [`BatchPositionedKvCache`] (swift `BatchPositionedKVCache`), plus the
 //! [`RopeOffset`] (swift `RoPEOffset`) and [`MaskMode`] (swift
-//! `ScaledDotProductAttentionMaskMode`) enums. The concrete caches beyond
-//! [`StandardKvCache`] / [`RotatingKvCache`] / [`ChunkedKvCache`] /
-//! [`QuantizedKvCacheImpl`] (added by this PR) and prompt / persist (Arrays
-//! / CacheList / Batch land in later PRs); [`from_state`] is left
+//! `ScaledDotProductAttentionMaskMode`) enums. Concrete caches:
+//! [`StandardKvCache`], [`RotatingKvCache`], [`ChunkedKvCache`],
+//! [`QuantizedKvCacheImpl`], plus the prompt-cache/persist surface; and the
+//! composite [`CacheList`] (added by this PR). The remaining kinds
+//! (Arrays / Batch) land in later PRs and [`from_state`] is left
 //! extensible for them.
 //!
 //! [`StandardKvCache`] is the `KVCache` port: mlx-lm's `step`-sized
@@ -45,6 +46,7 @@ use crate::{
   error::{Error, Result},
 };
 
+mod cache_list;
 mod chunked;
 mod mask;
 pub mod persist;
@@ -54,6 +56,7 @@ mod rotating;
 mod standard;
 mod util;
 
+pub use cache_list::CacheList;
 pub use chunked::*;
 pub use mask::{create_attention_mask, create_causal_mask};
 pub use persist::*;
@@ -234,6 +237,44 @@ pub trait KvCache {
   fn as_batch_positioned(&self) -> Option<&dyn BatchPositionedKvCache> {
     None
   }
+
+  /// Downcast to the [`CacheList`] composite, if this cache *is* a
+  /// `CacheList` (swift `cache as? CacheList`). Default: not a CacheList.
+  ///
+  /// `CacheList::update` / `make_mask` are container-illegal (faithful to
+  /// swift's `fatalError` and the absent mlx-lm methods); a hybrid model
+  /// holding a `Box<dyn KvCache>` per layer needs this hook to reach the
+  /// `CacheList`-inherent indexing API ([`CacheList::get`] /
+  /// [`CacheList::get_mut`]) and delegate to the right child cache. Mirrors
+  /// the structural-refinement downcasts above ([`as_quantized`](
+  /// KvCache::as_quantized) / [`as_batch_positioned`](
+  /// KvCache::as_batch_positioned)). Defaulted so every non-CacheList cache
+  /// inherits `None` without change.
+  fn as_cache_list(&self) -> Option<&CacheList> {
+    None
+  }
+
+  /// `&mut` companion to [`as_cache_list`](KvCache::as_cache_list) — the
+  /// indexing API a generation loop needs is mutating
+  /// ([`CacheList::get_mut`] yields `&mut dyn KvCache` for the child's
+  /// `update` / `make_mask`). Default: `None`.
+  fn as_cache_list_mut(&mut self) -> Option<&mut CacheList> {
+    None
+  }
+
+  /// The number of arrays [`state`](KvCache::state) would return, without
+  /// materializing or cloning them. The default reads `self.state()?.len()`
+  /// (preserving every concrete cache's existing behavior exactly); concrete
+  /// caches with an O(1) shortcut (e.g. a fixed `(keys, values)` pair when
+  /// populated) MAY override to avoid the per-call array clone the default
+  /// does just to read its length.
+  ///
+  /// Added so [`CacheList::meta_state`] can frame each child's state-array
+  /// count without `state().map(|s| s.len())` cloning every child's full
+  /// state per call.
+  fn state_count(&self) -> Result<usize> {
+    self.state().map(|s| s.len())
+  }
 }
 
 /// Caches that support efficient quantized operations — mlx-swift-lm's
@@ -284,12 +325,14 @@ pub trait BatchPositionedKvCache: KvCache {
 /// - → [`ChunkedKvCache`]: `"ChunkedKVCache"` | `"ChunkedKvCache"`
 ///   (Rust alias)
 /// - → [`QuantizedKvCacheImpl`]: `"QuantizedKVCache"` |
-///   `"QuantizedKvCacheImpl"` (Rust alias) — added by this PR
+///   `"QuantizedKvCacheImpl"` (Rust alias)
+/// - → [`CacheList`]: `"CacheList"` (the composite — rebuilds each child
+///   recursively through this same dispatcher) — added by this PR
 ///
-/// The other cache kinds (`"ArraysCache"`, `"CacheList"`,
-/// `"BatchKVCache"`, `"BatchRotatingKVCache"`) are added by later PRs, so
-/// an unrecognized `kind` is a recoverable [`Error::Backend`] and the
-/// match is left extensible for those arms.
+/// The other cache kinds (`"ArraysCache"`, `"BatchKVCache"`,
+/// `"BatchRotatingKVCache"`) are added by later PRs, so an unrecognized
+/// `kind` is a recoverable [`Error::Backend`] and the match is left
+/// extensible for those arms.
 pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<dyn KvCache>> {
   match kind {
     // mlx-lm `KVCache` / its documented twin `ConcatenateKVCache` /
@@ -405,6 +448,13 @@ pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<
       c.enforce_offset_len_invariant()?;
       Ok(Box::new(c))
     }
+    // mlx-lm `CacheList` (cache.py:814-902) / mlx-swift-lm `CacheList`
+    // (KVCache.swift:1248-1370). Its flattened `state`/`meta_state`
+    // (`[childCount, (className, stateCount, metaCount, ...meta)*]`)
+    // rebuilds each child recursively through *this* dispatcher keyed on
+    // the child's reference class name — so a nested `"CacheList"` child
+    // recurses (exactly cache.py:898 `globals()["CacheList"]`).
+    "CacheList" => cache_list::cache_list_from_state(state, meta),
     other => Err(Error::Backend {
       message: format!("unknown cache kind: {other}"),
     }),

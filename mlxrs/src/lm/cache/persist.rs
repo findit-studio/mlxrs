@@ -182,6 +182,18 @@ pub const MAX_PROMPT_CACHE_BYTES: u64 = 8 << 30;
 /// (mirroring its new `from_state` arm), exactly as mlx-swift-lm extends
 /// its single `cacheClassName` switch.
 pub fn reference_class_name(cache: &dyn KvCache) -> &'static str {
+  // Prefer the explicit trait downcasts when available (mirrors swift's
+  // `cache as? CacheList` discriminator at KVCache.swift:1381-1392 —
+  // exact type, NOT a meta/max-size heuristic). The `as_cache_list()`
+  // downcast was added by this PR for exactly this purpose: a top-level
+  // `CacheList` prompt cache (added by this PR's `from_state` arm) MUST
+  // serialize as `"CacheList"`, NOT fall through to the
+  // `max_size==None ⇒ KVCache` heuristic — otherwise
+  // `load_prompt_cache` would route to `StandardKvCache::set_state` and
+  // reject the multi-array CacheList state.
+  if cache.as_cache_list().is_some() {
+    return "CacheList";
+  }
   // `RotatingKVCache.meta_state` is `[keep, max_size, offset, _idx]`
   // (cache.py:529-533) and it is the only merged-tree cache that is both
   // window-bounded (`max_size().is_some()`) and emits a 4-element
