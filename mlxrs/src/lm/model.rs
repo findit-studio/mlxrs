@@ -22,8 +22,8 @@ use crate::{array::Array, error::Result, lm::cache::KvCache};
 ///   inference). This also lets one model back many concurrent caches.
 /// - `tokens` — an integer `[B, S]` array (the prompt chunk during prefill, a
 ///   single `[B, 1]` token during decode).
-/// - `cache` — one [`KvCache`] **per decoder layer**, mutated in place by the
-///   attention blocks (`update_and_fetch`); `make_prompt_cache` builds it.
+/// - `cache` — one boxed [`KvCache`] **per decoder layer**, mutated in place
+///   by the attention blocks (`update`); `make_prompt_cache` builds it.
 /// - returns — `[B, S, vocab_size]` logits in the model's compute dtype (the
 ///   loop slices the final position and normalizes; no implicit eval here).
 pub trait Model {
@@ -32,7 +32,7 @@ pub trait Model {
   ///
   /// Errors propagate as [`crate::Error`] (shape/backend); a model never
   /// panics on a recoverable mismatch.
-  fn forward(&self, tokens: &Array, cache: &mut [KvCache]) -> Result<Array>;
+  fn forward(&self, tokens: &Array, cache: &mut [Box<dyn KvCache>]) -> Result<Array>;
 
   /// Optional embeddings entry point for multimodal models (VLM, M4): run the
   /// decoder over pre-computed input embeddings instead of token ids.
@@ -40,7 +40,11 @@ pub trait Model {
   /// Declared, not required — the default returns [`crate::Error::Backend`]
   /// so the text-only loop never depends on it while the seam exists for
   /// later milestones. Text models inherit the default; VLMs override it.
-  fn forward_embeddings(&self, _embeddings: &Array, _cache: &mut [KvCache]) -> Result<Array> {
+  fn forward_embeddings(
+    &self,
+    _embeddings: &Array,
+    _cache: &mut [Box<dyn KvCache>],
+  ) -> Result<Array> {
     Err(crate::error::Error::Backend {
       message: "this model does not implement `forward_embeddings` (VLM seam, M4)".into(),
     })
@@ -83,7 +87,7 @@ impl MockModel {
 
 #[cfg(test)]
 impl Model for MockModel {
-  fn forward(&self, tokens: &Array, cache: &mut [KvCache]) -> Result<Array> {
+  fn forward(&self, tokens: &Array, cache: &mut [Box<dyn KvCache>]) -> Result<Array> {
     // tokens is [B, S]; derive B and S the same way the loop will.
     let shape = tokens.shape();
     let (batch, seq) = match shape.as_slice() {
@@ -109,7 +113,7 @@ impl Model for MockModel {
         &vec![2.0_f32; elems],
         &(batch, self.n_kv_heads, seq, self.head_dim),
       )?;
-      layer.update_and_fetch(&k, &v)?;
+      layer.update(&k, &v)?;
     }
 
     // Logits: tile `canned` across [B, S, vocab].
@@ -145,7 +149,7 @@ mod tests {
     };
     let mut cache = make_prompt_cache(&cfg);
     assert_eq!(cache.len(), 2);
-    assert!(cache.iter().all(KvCache::is_empty));
+    assert!(cache.iter().all(|c| c.is_empty()));
 
     // Step 1: a 3-token prompt chunk -> logits [1, 3, 5]; every layer's
     // cache advances by 3.
@@ -172,7 +176,7 @@ mod tests {
   #[test]
   fn forward_embeddings_default_is_unimplemented_seam() {
     let model = MockModel::new(3);
-    let mut cache: Vec<KvCache> = Vec::new();
+    let mut cache: Vec<Box<dyn KvCache>> = Vec::new();
     let emb = Array::from_slice::<f32>(&[0.0, 1.0], &(1usize, 1, 2)).unwrap();
     // The VLM (M4) seam is declared but not implemented for text models.
     assert!(model.forward_embeddings(&emb, &mut cache).is_err());
@@ -181,7 +185,7 @@ mod tests {
   #[test]
   fn forward_rejects_wrong_token_rank() {
     let model = MockModel::new(3);
-    let mut cache: Vec<KvCache> = Vec::new();
+    let mut cache: Vec<Box<dyn KvCache>> = Vec::new();
     let bad = Array::from_slice::<f32>(&[1.0], &(1usize, 1, 1)).unwrap(); // 3-D
     assert!(model.forward(&bad, &mut cache).is_err());
   }
