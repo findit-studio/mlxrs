@@ -93,9 +93,9 @@ fn device_equal_and_eq_agree() {
 }
 
 #[test]
-fn device_clone_produces_equal_handle() {
+fn device_try_clone_produces_equal_handle() {
   let a = Device::cpu().unwrap();
-  let b = a.clone();
+  let b = a.try_clone().expect("test: device clone");
   assert_eq!(a, b);
 }
 
@@ -142,9 +142,9 @@ fn stream_synchronize_succeeds_on_idle_stream() {
 }
 
 #[test]
-fn stream_clone_equals_source() {
+fn stream_try_clone_equals_source() {
   let s = Stream::default_cpu().unwrap();
-  let t = s.clone();
+  let t = s.try_clone().expect("test: stream clone");
   assert_eq!(s, t);
 }
 

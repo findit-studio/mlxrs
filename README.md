@@ -60,9 +60,11 @@ M1 ships `aarch64-apple-darwin` only (Apple silicon). Other platforms
 ## Caveats (M1)
 
 - **`Array` is `!Send` and `!Sync`** — single-thread use only. The underlying
-  C++ `array_desc` is shared by `Clone` (refcount-bumped) and mutates
-  non-atomic state internally, so cross-thread sharing is unsound without
-  external synchronization. M2 will add a `SharedArray` newtype
+  C++ `array_desc` is shared by `Array::try_clone` (refcount-bumped) and
+  mutates non-atomic state internally, so cross-thread sharing is unsound
+  without external synchronization. `Array` does **not** implement `Clone`;
+  the only duplication is the fallible `try_clone`. M2 will add a
+  `SharedArray` newtype
   (`Arc<Mutex<Array>>`-style) with a documented cross-thread contract.
 - **GPU work is single-stream serialized per thread** — the internal
   default-stream is per-thread and maps to one Metal command queue per

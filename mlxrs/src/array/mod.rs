@@ -1,7 +1,8 @@
 //! `Array` core: RAII handle around `mlxrs_sys::mlx_array`.
 //!
 //! See `docs/superpowers/specs/` §6.2 for design rationale (Drop must not
-//! touch TLS; Clone is cheap-but-not-free; M1 is single-thread only).
+//! touch TLS; the only duplication is the fallible refcount-sharing
+//! [`Array::try_clone`]; M1 is single-thread only).
 
 use static_assertions::assert_not_impl_any;
 
@@ -19,18 +20,26 @@ pub struct Array(pub(crate) mlxrs_sys::mlx_array);
 //
 // `Array` is intentionally `!Send` and `!Sync` in M1.
 //
-// The Phase-3 entry audit confirmed `array_desc_` is `std::shared_ptr<array_desc>`
-// (atomic refcount) and `set_status const → array_desc_->status = s` (non-atomic
-// mutation through const → `Sync` is unsound). What the audit missed is that
-// `Send` + cheap `Clone` together also break soundness even without `Sync`:
-// `Clone` produces a refcount-sharing handle (separate `Array`, same underlying
-// `array_desc`); if `Array: Send`, two clones can move to two threads where
-// each calls `eval`/`to_vec`/`item` on `&mut self`. Each thread sees a distinct
-// `&mut Array`, so `!Sync` doesn't catch it — but the underlying C++
-// `array_desc->status` write races. To preserve cheap `Clone`, `Send` must go.
-// There is no shared-array wrapper: MLX's C++/Python/Swift APIs deliberately
-// don't share arrays across threads and mlx `eval` is not concurrency-safe.
-// To cross threads, extract owned data via `to_vec`/`item` (`Send`).
+// `Array` also intentionally does **not** implement `Clone`. The only
+// supported duplication is `Array::try_clone() -> Result<Self>`: a
+// refcount-sharing handle dup (a fresh `mlx::core::array` over the same
+// underlying `array_desc`, no data copy), fallible because the mlx-c handle
+// alloc/`set` can fail. An infallible `Clone` would have to panic on that
+// failure, so it is not provided.
+//
+// `!Send`/`!Sync` is required by the underlying mlx-c array/backend, NOT to
+// keep any `Clone` cheap. The Phase-3 entry audit confirmed `array_desc_` is
+// `std::shared_ptr<array_desc>` (atomic refcount) but `set_status const →
+// array_desc_->status = s` is a non-atomic mutation through `const` — so a
+// shared `&Array` across threads (`Sync`) would race on `array_desc->status`.
+// The same non-atomic lazy/eval state also makes the handle unsound to move
+// across threads alongside another handle to the same `array_desc`: a
+// `try_clone`d pair on two threads would each call `eval`/`to_vec`/`item`
+// (`&mut self`, so `!Sync` doesn't catch it) and race that `status` write.
+// mlx's `eval` is itself not concurrency-safe. There is no shared-array
+// wrapper: MLX's C++/Python/Swift APIs deliberately don't share arrays across
+// threads. To cross threads, extract owned data via `to_vec`/`item`
+// (`Send`). The `assert_not_impl_any!` below is the actual enforced contract.
 assert_not_impl_any!(Array: Copy, Send, Sync);
 
 impl Drop for Array {
@@ -44,22 +53,13 @@ impl Drop for Array {
   }
 }
 
-impl Clone for Array {
-  /// Independent handle whose underlying buffer is refcount-shared with `self`
-  /// (no data copy). Cost is **tens to hundreds of ns** — heap allocation for
-  /// a fresh `mlx::core::array` instance + refcount bump on the underlying buffer.
-  /// Never `.clone()` in hot paths; pass `&Array` instead. Use `try_clone` if
-  /// you want to handle the failure path explicitly.
-  fn clone(&self) -> Self {
-    self
-      .try_clone()
-      .expect("Array::clone: mlx_array_set failed")
-  }
-}
-
 impl Array {
-  /// Refcount-sharing clone. Returns `Result` so callers can handle the
-  /// rare allocation-failure path explicitly.
+  /// Refcount-sharing clone. Returns `Result` so callers handle the rare
+  /// allocation-failure path explicitly. `Array` intentionally does **not**
+  /// implement `Clone`: a panicking `Clone` impl would hide an FFI failure on
+  /// a recoverable path, and a refcount-sharing handle is cheap-but-not-free
+  /// (**tens to hundreds of ns**: a fresh `mlx::core::array` heap allocation +
+  /// a refcount bump). Never `try_clone` in hot paths; pass `&Array` instead.
   pub fn try_clone(&self) -> Result<Self> {
     crate::error::ensure_handler_installed();
     // RAII coverage: wrap the fresh handle in `Self` BEFORE the fallible

@@ -78,8 +78,11 @@ impl DeviceKind {
 /// MLX compute device — RAII handle around `mlxrs_sys::mlx_device`.
 ///
 /// Constructed via [`Device::cpu`], [`Device::gpu`], [`Device::current`], or
-/// [`Device::with_index`]. Cheap to clone (each clone is a distinct
-/// heap-allocated `mlx::core::Device` with the same `{type, index}` payload).
+/// [`Device::with_index`]. `Device` intentionally does **not** implement
+/// `Clone`; duplication is the explicit fallible [`Device::try_clone`], which
+/// returns `Result<Self>` — a fresh `mlx_device` handle holding the same
+/// `{kind, index}` payload (a new handle with a copied payload, **not** a
+/// shared/refcounted buffer).
 #[repr(transparent)]
 pub struct Device(pub(crate) mlxrs_sys::mlx_device);
 
@@ -106,16 +109,6 @@ impl Drop for Device {
     unsafe {
       let _ = mlxrs_sys::mlx_device_free(self.0);
     }
-  }
-}
-
-impl Clone for Device {
-  /// Independent handle that wraps a fresh heap-allocated `mlx::core::Device`
-  /// with the same `{kind, index}` payload as `self`.
-  fn clone(&self) -> Self {
-    self
-      .try_clone()
-      .expect("Device::clone: mlx_device_set failed")
   }
 }
 
@@ -147,9 +140,11 @@ impl Device {
     Ok(Self(raw))
   }
 
-  /// Refcount-style clone: allocates a fresh `mlx_device` ctx and copies
-  /// `self.0` into it via `mlx_device_set`. Returns `Result` so callers can
-  /// handle the rare allocation-failure path explicitly.
+  /// Handle duplication: allocates a fresh `mlx_device` and copies
+  /// `{kind, index}` into it via `mlx_device_set` (a new independent handle
+  /// with a copied payload — **not** a refcounted shared payload). Returns
+  /// `Result` because the handle alloc/set can fail; `Device` intentionally
+  /// does not implement `Clone`.
   pub fn try_clone(&self) -> Result<Self> {
     ensure_handler_installed();
     // `mlx_device_new` returns an empty handle (NULL ctx) intended to be
