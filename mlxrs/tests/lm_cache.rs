@@ -116,9 +116,10 @@ fn rotating_update_concat_rank_invalid_values_errors_no_panic() {
   let bad_values = Array::from_slice::<f32>(&[2.0, 3.0], &(1usize, 2)).unwrap();
   let r = c.update(&keys, &bad_values);
   assert!(
-    r.is_err(),
-    "rank-invalid values on the empty-cache S>1 path must be a recoverable \
-     Err, got {r:?}"
+    matches!(&r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    "rank-invalid values on the empty-cache S>1 path must be a DETERMINISTIC \
+     recoverable ShapeMismatch (per-tensor rank guard at update entry), got \
+     {r:?}"
   );
   // A subsequent valid update must still succeed, proving the failed call
   // did not store the malformed 2-D values buffer in the cache.
@@ -149,9 +150,10 @@ fn rotating_update_concat_single_part_fast_path_rank_invalid_no_corruption() {
   let bad_values = Array::from_slice::<f32>(&[1.0, 2.0], &(1usize, 2)).unwrap();
   let r = c.update(&keys, &bad_values);
   assert!(
-    r.is_err(),
-    "rank-invalid lone-surviving values must be a recoverable Err \
-     (mx.concatenate of a single rank-mismatched element raises), got {r:?}"
+    matches!(&r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    "rank-invalid lone-surviving values must be a DETERMINISTIC recoverable \
+     ShapeMismatch (per-tensor rank guard at update entry rejects it before \
+     dispatch), got {r:?}"
   );
   // The failed update must NOT have stored the rank-invalid buffer: a
   // subsequent VALID update must succeed without panicking on a raw
@@ -166,24 +168,27 @@ fn rotating_update_concat_single_part_fast_path_rank_invalid_no_corruption() {
 }
 
 /// Regression (rank-safety, no panic): `StandardKvCache::update` with valid
-/// 4-D `keys` but a rank-invalid `values`. It has no raw `values.shape[N]`
-/// metadata read (`keys` is `seq_len`-validated; `values` only flows
-/// through `mx.concatenate`/`try_clone`), so the recoverable error comes
-/// from the backend concat against the seeded 4-D buffer — still a
-/// recoverable `Err`, never a panic, on the `Result` API.
+/// 4-D `keys` but a rank-invalid `values`. `update` now rank-validates
+/// `values` with a STANDALONE per-tensor `seq_len("values", values)?` check
+/// symmetric to the `keys` one (NOT a K/V seq cross-check), so a
+/// rank-invalid `values` is a DETERMINISTIC recoverable
+/// `Err(Error::ShapeMismatch)` on entry — independent of the feature combo
+/// (i.e. no longer dependent on whether the downstream backend concat
+/// happens to reject it) — never a panic on the `Result` API.
 #[test]
 fn standard_rank_invalid_values_errors_no_panic() {
   let mut c = StandardKvCache::new();
-  // Seed a 4-D buffer so the next update concatenates (where a rank-invalid
-  // `values` reaches `mx.concatenate`).
+  // Seed a 4-D buffer so the next update would concatenate (the rank guard
+  // rejects the bad `values` before that path is reached).
   let seed = kv(&[0.0, 1.0]);
   c.update(&seed, &seed).unwrap();
   let keys = kv(&[2.0]);
   let bad_values = Array::from_slice::<f32>(&[2.0, 3.0], &(1usize, 2)).unwrap();
   let r = c.update(&keys, &bad_values);
   assert!(
-    r.is_err(),
-    "rank-invalid values must be a recoverable Err, got {r:?}"
+    matches!(&r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    "rank-invalid values must be a DETERMINISTIC recoverable ShapeMismatch \
+     (per-tensor rank guard at update entry), got {r:?}"
   );
 }
 
