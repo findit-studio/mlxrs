@@ -118,11 +118,15 @@ impl Tokenizer {
   /// reads `tokenizer.json`, then (with `tokenizer-config`)
   /// `tokenizer_config.json` (chat template, tool parser, special tokens).
   ///
-  /// `extra_eos_token_ids` augments the eos set (Python `eos_token_ids`
-  /// argument).
+  /// `eos_token_ids` is the **complete** eos set, mirroring Python
+  /// `TokenizerWrapper`: `set(eos_token_ids) if eos_token_ids is not None
+  /// else {tokenizer.eos_token_id}`. `Some(ids)` REPLACES the
+  /// tokenizer-config default with exactly `ids`; `None` falls back to the
+  /// tokenizer's own `eos_token`. (The loader resolves the precedence
+  /// generation_config-truthy → config.json → `None`.)
   pub fn from_path(
     model_path: impl AsRef<Path>,
-    extra_eos_token_ids: Option<&[u32]>,
+    eos_token_ids: Option<&[u32]>,
   ) -> Result<Self, Error> {
     let dir = model_path.as_ref();
     let tok_file = dir.join("tokenizer.json");
@@ -167,7 +171,7 @@ impl Tokenizer {
       config,
       #[cfg(feature = "tokenizer-stream")]
       detok_class,
-      extra_eos_token_ids,
+      eos_token_ids,
     )
   }
 
@@ -178,7 +182,7 @@ impl Tokenizer {
     hf: HfTokenizer,
     #[cfg(feature = "tokenizer-config")] config: Value,
     #[cfg(feature = "tokenizer-stream")] detok_class: DetokenizerClass,
-    extra_eos_token_ids: Option<&[u32]>,
+    eos_token_ids: Option<&[u32]>,
   ) -> Result<Self, Error> {
     #[cfg(all(feature = "tokenizer-config", feature = "tokenizer-stream"))]
     let clean_up_spaces = config
@@ -195,15 +199,22 @@ impl Tokenizer {
     #[cfg(feature = "tokenizer-config")]
     let pad_token = cfg_str(&config, "pad_token");
 
-    let mut eos_token_ids = std::collections::BTreeSet::new();
+    // Python `TokenizerWrapper`: `self._eos_token_ids = set(eos_token_ids)
+    // if eos_token_ids is not None else {tokenizer.eos_token_id}`. A
+    // supplied set REPLACES the tokenizer-config default entirely (it is
+    // NOT unioned); `None` falls back to the tokenizer's own `eos_token`.
+    // (`if let` rather than `match` — the `None` arm is empty without the
+    // `tokenizer-config` feature, which would trip `clippy::single_match`.)
+    let mut eos_set = std::collections::BTreeSet::new();
+    if let Some(ids) = eos_token_ids {
+      eos_set.extend(ids.iter().copied());
+    }
     #[cfg(feature = "tokenizer-config")]
-    if let Some(ref e) = eos_token
+    if eos_token_ids.is_none()
+      && let Some(ref e) = eos_token
       && let Some(id) = hf.token_to_id(e)
     {
-      eos_token_ids.insert(id);
-    }
-    if let Some(extra) = extra_eos_token_ids {
-      eos_token_ids.extend(extra.iter().copied());
+      eos_set.insert(id);
     }
 
     #[cfg(feature = "tokenizer-config")]
@@ -249,7 +260,7 @@ impl Tokenizer {
       detok_class,
       #[cfg(all(feature = "tokenizer-config", feature = "tokenizer-stream"))]
       clean_up_spaces,
-      eos_token_ids,
+      eos_token_ids: eos_set,
       #[cfg(feature = "tokenizer-chat")]
       chat_template,
       #[cfg(feature = "tokenizer-config")]
@@ -288,9 +299,9 @@ impl Tokenizer {
     _raw: Value,
     config: Value,
     detok_class: DetokenizerClass,
-    extra_eos_token_ids: Option<&[u32]>,
+    eos_token_ids: Option<&[u32]>,
   ) -> Result<Self, Error> {
-    Self::from_loaded(hf, config, detok_class, extra_eos_token_ids)
+    Self::from_loaded(hf, config, detok_class, eos_token_ids)
   }
 
   // --- encode / decode (Swift `Tokenizer` protocol) ----------------------
