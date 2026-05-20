@@ -24,7 +24,7 @@ tokenizer-tools      = ["tokenizer-config", "dep:serde_json"]                   
 # umbrellas (compose only)
 embeddings           = ["tokenizer", "dep:serde_json"]                              # encode/decode (tokenizers crate) + `1_Pooling/config.json` parsing (serde_json, optional-dep gated; NOT in the bare/core or build graph)
 lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm", "tokenizer-bpe", "tokenizer-chat", "tokenizer-deepseek-v32", "tokenizer-tools"]
-vlm                  = ["lm"]
+vlm                  = ["lm", "dep:image"]
 audio                = ["lm"]            # mirrors mlx-audio's Python dep on mlx-lm
 unstable-ops-overload = []               # `&a + &b` etc. (panic on shape error). OFF by default.
 gguf                 = []                                                          # GGUF load/save (mlx-c `mlx_io_gguf*`). OFF: mlxrs-sys does not yet link gguflib.
@@ -48,6 +48,12 @@ serde_json = { version = "1", optional = true, features = ["preserve_order"] }
 # Python `datetime.now().strftime`. Loose caret semver (crates.io current
 # major is 0.2.x — verified 0.2.24); never an exact `=` pin.
 jiff = { version = "0.2", optional = true }
+# Image decode / resize / channel access. Pulled SOLELY by `vlm` (see the
+# umbrella above's `dep:image`); the bare/core / lm / audio / embeddings
+# graphs never compile it. Loose caret semver per
+# `feedback_no_dependency_pinning` (crates.io current major is 0.25.x,
+# verified 0.25.10) — never an exact `=` pin.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
 
 # No [build-dependencies]: ALL tokenizer codegen moved to the `xtask` crate
 # (`cargo xtask-codegen`), so a normal `mlxrs` build never compiles
