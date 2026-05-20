@@ -83,37 +83,53 @@ use crate::{
 /// and
 /// [`resampleBicubic`](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXVLM/MediaProcessing.swift#L110-L132).
 ///
-/// The `image` crate provides four filter kinds; we expose all four and
-/// map them to `image::imageops::FilterType`. The swift reference exposes
-/// `bicubic` (default) and `lanczos`; we add `Nearest` and `Bilinear`
-/// because they appear in the python VLM ecosystem (PIL's `Image.resize`
-/// `resample=` argument that `mlx-vlm`'s `resize_image` uses transitively
-/// at `mlx_vlm/utils.py:835-839`).
+/// Backed by `fast_image_resize` (SIMD-accelerated, 5-15x faster than
+/// `image::imageops::resize`). Filter names match both `fast_image_resize`'s
+/// `FilterType` and (where the kernel is identical) the older
+/// `image::imageops::FilterType` — so existing call-site usage of `Bilinear`,
+/// `Bicubic`, `Lanczos3` is unchanged.
+///
+/// The swift reference exposes `bicubic` (default) and `lanczos`; we add
+/// `Nearest` and `Bilinear` because they appear in the python VLM ecosystem
+/// (PIL's `Image.resize` `resample=` argument that `mlx-vlm`'s
+/// `resize_image` uses transitively at `mlx_vlm/utils.py:835-839`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResizeFilter {
   /// Nearest-neighbor (no smoothing). Cheapest; rarely used for VLM.
   Nearest,
-  /// Bilinear interpolation (`image::imageops::FilterType::Triangle`).
+  /// Bilinear interpolation (triangle kernel — same as the older
+  /// `image::imageops::FilterType::Triangle`).
   Bilinear,
-  /// Bicubic interpolation (`image::imageops::FilterType::CatmullRom`).
+  /// Bicubic interpolation (Catmull-Rom variant — matches
+  /// `image::imageops::FilterType::CatmullRom` and PIL's `Image.BICUBIC`).
   /// Mirrors the swift `resampleBicubic` default
   /// (`MediaProcessing.swift:110-132`); the recommended choice for most
   /// ViT-class encoders.
   Bicubic,
-  /// Lanczos3 interpolation (`image::imageops::FilterType::Lanczos3`).
+  /// Lanczos3 interpolation (window=3 sinc-windowed sinc).
   /// Mirrors the swift `resampleLanczos` (`MediaProcessing.swift:81-103`).
   Lanczos3,
 }
 
 impl ResizeFilter {
-  /// Map to the `image` crate's filter enum. Kept private; the crate's
-  /// types do not leak into our public surface.
-  fn to_image_filter(self) -> ::image::imageops::FilterType {
+  /// Map to `fast_image_resize`'s `ResizeAlg` enum. Kept private; the
+  /// crate's types do not leak into our public surface. Filter parity:
+  ///
+  /// - `Nearest` → `ResizeAlg::Nearest` (no convolution).
+  /// - `Bilinear` → `Convolution(FilterType::Bilinear)`. Same triangle
+  ///   kernel that `image::FilterType::Triangle` implemented.
+  /// - `Bicubic` → `Convolution(FilterType::CatmullRom)`. The
+  ///   Catmull-Rom variant matches `image::FilterType::CatmullRom` and
+  ///   PIL's `Image.BICUBIC`.
+  /// - `Lanczos3` → `Convolution(FilterType::Lanczos3)` (window=3
+  ///   sinc-windowed sinc).
+  fn to_fir_alg(self) -> ::fast_image_resize::ResizeAlg {
+    use ::fast_image_resize::{FilterType, ResizeAlg};
     match self {
-      Self::Nearest => ::image::imageops::FilterType::Nearest,
-      Self::Bilinear => ::image::imageops::FilterType::Triangle,
-      Self::Bicubic => ::image::imageops::FilterType::CatmullRom,
-      Self::Lanczos3 => ::image::imageops::FilterType::Lanczos3,
+      Self::Nearest => ResizeAlg::Nearest,
+      Self::Bilinear => ResizeAlg::Convolution(FilterType::Bilinear),
+      Self::Bicubic => ResizeAlg::Convolution(FilterType::CatmullRom),
+      Self::Lanczos3 => ResizeAlg::Convolution(FilterType::Lanczos3),
     }
   }
 }
@@ -326,12 +342,50 @@ pub fn resize(
   filter: ResizeFilter,
 ) -> ::image::DynamicImage {
   let (height, width) = target;
-  ::image::DynamicImage::ImageRgba8(::image::imageops::resize(
-    img,
-    width,
-    height,
-    filter.to_image_filter(),
-  ))
+  // SIMD-accelerated resize via `fast_image_resize` — 5-15x faster than
+  // `image::imageops::resize` on the same algorithms (used by `wgpu`
+  // examples, `kornia-rs`, etc.). Decode-side stays on `image` (above
+  // in `load_image`); only the resize hot path switches. Public API of
+  // this fn is unchanged.
+  //
+  // Pixel-type: RGBA8 for parity with the prior behavior (image-rs's
+  // `imageops::resize` over a `DynamicImage` projects to `Rgba8`
+  // unconditionally; downstream `image_to_array` drops alpha as before).
+  // `img.to_rgba8()` is a borrow-or-convert (no-copy when the source is
+  // already `ImageRgba8`).
+  let src = img.to_rgba8();
+  let src_view = ::fast_image_resize::images::ImageRef::new(
+    src.width(),
+    src.height(),
+    src.as_raw(),
+    ::fast_image_resize::PixelType::U8x4,
+  )
+  // `ImageRef::new` only errors on `width * height * channels` overflow
+  // or buffer-length mismatch. The former is impossible because the
+  // dimensions came from a successfully-decoded `DynamicImage` (which
+  // image-rs validated in `from_decoder`). The latter is impossible
+  // because `RgbaImage::as_raw().len() == width * height * 4` by
+  // construction.
+  .expect("ImageRef::new: source dims/buffer length validated by image-rs decoder");
+  let mut dst =
+    ::fast_image_resize::images::Image::new(width, height, ::fast_image_resize::PixelType::U8x4);
+  ::fast_image_resize::Resizer::new()
+    .resize(
+      &src_view,
+      &mut dst,
+      &::fast_image_resize::ResizeOptions::new().resize_alg(filter.to_fir_alg()),
+    )
+    // Source + destination pixel types are identical (both `U8x4`) by
+    // construction, so the only error class (`DifferentTypesOfPixelsError`)
+    // is structurally excluded.
+    .expect("Resizer::resize: src/dst PixelType match by construction (both U8x4)");
+  ::image::DynamicImage::ImageRgba8(
+    ::image::ImageBuffer::from_raw(width, height, dst.into_vec())
+      // `Image::new(width, height, U8x4)` allocates exactly
+      // `width * height * 4` bytes — the precise length
+      // `ImageBuffer::from_raw` requires for a `width x height` RGBA buffer.
+      .expect("ImageBuffer::from_raw: dst buffer length matches width * height * 4 by construction"),
+  )
 }
 
 /// Convert a [`image::DynamicImage`] to an `Array` of shape `[H, W, 3]`,
