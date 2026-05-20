@@ -60,10 +60,19 @@ impl KvCache for StandardKvCache {
       (Some(pk), Some(pv)) => (concat_seq(pk, keys)?, concat_seq(pv, values)?),
       _ => (keys.try_clone()?, values.try_clone()?),
     };
+    // CORE-1: stage-then-commit. Compute the return clones BEFORE any
+    // `self.*` mutation, then MOVE `k`/`v` into `self.keys`/`self.values`
+    // (the same transactional discipline `RotatingKvCache::update_in_place`
+    // and `ChunkedKvCache::update` use class-wide). The prior order
+    // mutated `self.offset` first, then ran two fallible `try_clone`s on
+    // top of it — a clone failure left `self.offset` advanced with the
+    // buffer not updated. Same total allocation count (2 clones per side
+    // either way); failure no longer poisons the cache.
+    let (rk, rv) = (k.try_clone()?, v.try_clone()?);
     self.offset += s;
-    self.keys = Some(k.try_clone()?);
-    self.values = Some(v.try_clone()?);
-    Ok((k, v))
+    self.keys = Some(k);
+    self.values = Some(v);
+    Ok((rk, rv))
   }
 
   /// mlx-lm `KVCache.state` getter: `(keys, values)` — here always exactly

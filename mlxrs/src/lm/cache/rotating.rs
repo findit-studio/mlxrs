@@ -82,19 +82,37 @@ impl RotatingKvCache {
 
   /// mlx-lm `RotatingKVCache._trim`: keep the first `keep` rows then drop
   /// `trim_size` of the next rows; optionally append `append`.
+  ///
+  /// Allocation-discipline (CORE-1): the no-trim and the append paths pass
+  /// the source `&Array`s straight through to `concat_parts` (which takes
+  /// `&[&Array]`) instead of cloning them into an owned `Vec<Array>`. The
+  /// trim path stores its two slice results in stack-resident `Option<
+  /// Array>` slots so the `&Array`s borrowed into `refs` outlive the
+  /// `concat_parts` call — no heap `Vec<Array>` either.
   fn trim_buf(&self, trim_size: usize, v: &Array, append: Option<&Array>) -> Result<Array> {
     let l = v.shape()[KV_NDIM - 2];
-    let mut owned: Vec<Array> = Vec::new();
-    if trim_size > 0 {
-      owned.push(seq_slice(v, 0, self.keep)?);
-      owned.push(seq_slice(v, trim_size + self.keep, l)?);
+    let (head_slice, tail_slice): (Option<Array>, Option<Array>) = if trim_size > 0 {
+      (
+        Some(seq_slice(v, 0, self.keep)?),
+        Some(seq_slice(v, trim_size + self.keep, l)?),
+      )
     } else {
-      owned.push(v.try_clone()?);
+      (None, None)
+    };
+    // Refs are populated either from the two owned slices (trim>0) or from
+    // the source `v` itself (trim==0 — no clone needed). The optional
+    // `append` is always added by-ref (never cloned).
+    let mut refs: smallvec::SmallVec<[&Array; 3]> = smallvec::SmallVec::new();
+    match (head_slice.as_ref(), tail_slice.as_ref()) {
+      (Some(h), Some(t)) => {
+        refs.push(h);
+        refs.push(t);
+      }
+      _ => refs.push(v),
     }
     if let Some(a) = append {
-      owned.push(a.try_clone()?);
+      refs.push(a);
     }
-    let refs: Vec<&Array> = owned.iter().collect();
     super::util::concat_parts(&refs)
   }
 
@@ -189,13 +207,19 @@ impl RotatingKvCache {
       _ => None,
     };
     let (bk, bv) = if let Some((tk, tv)) = reordered {
-      // mlx-lm reassigns `self._idx = self.keys.shape[2]` to the
-      // temporal-order length (cache.py:458) and ONLY THEN computes
-      // `trim_size = self._idx - self.max_size + 1` (cache.py:462) — the
-      // trim window must come from the reordered buffer, not the stale ring
-      // cursor, or a still-active-ring S==1 then S>1 update over-retains.
-      self.idx = tk.shape()[KV_NDIM - 2];
-      let trim_size = (self.idx + 1).saturating_sub(self.max_size);
+      // CORE-1 v2 (Codex round-2 fix): compute `trim_size` from the
+      // temporal-order length WITHOUT mutating `self.idx`. Mirrors
+      // mlx-lm's two-step at `cache.py:458 + cache.py:462`
+      // (`self._idx = self.keys.shape[2]`, then
+      // `trim_size = self._idx - self.max_size + 1`) but stages the
+      // length locally — the final `self.idx` assignment must wait until
+      // all fallible ops below (`trim_buf` for K and V, the two return
+      // `try_clone`s) succeed, otherwise a backend/OOM failure leaves
+      // `self.idx` advanced to the temporal-order length with the buffer
+      // unchanged (so a subsequent S==1 decode uses the wrong ring
+      // cursor and over-retains stale context).
+      let temporal_len = tk.shape()[KV_NDIM - 2];
+      let trim_size = (temporal_len + 1).saturating_sub(self.max_size);
       (
         self.trim_buf(trim_size, &tk, Some(keys))?,
         self.trim_buf(trim_size, &tv, Some(values))?,
@@ -203,12 +227,23 @@ impl RotatingKvCache {
     } else {
       (keys.try_clone()?, values.try_clone()?)
     };
+    // CORE-1: stage-then-commit. Clone for the return BEFORE any `self.*`
+    // mutation, then MOVE `bk`/`bv` into `self.keys`/`self.values` (the
+    // same transactional discipline `update_in_place` uses class-wide).
+    // The prior order mutated `self.offset`/`self.idx` first, then ran
+    // two fallible `try_clone`s on top of them — a clone failure left
+    // `offset`/`idx` advanced with the buffer not updated. Same total
+    // allocation count (2 clones per side either way); failure no longer
+    // poisons the cache.
+    let new_idx = bk.shape()[KV_NDIM - 2];
+    let (rk, rv) = (bk.try_clone()?, bv.try_clone()?);
+    // All fallible ops have succeeded — commit infallibly. mlx-lm
+    // `cache.py:466`: `self._idx = self.keys.shape[2]` (final length).
     self.offset = new_offset;
-    // mlx-lm `cache.py:466`: `self._idx = self.keys.shape[2]` (final length).
-    self.idx = bk.shape()[KV_NDIM - 2];
-    self.keys = Some(bk.try_clone()?);
-    self.values = Some(bv.try_clone()?);
-    Ok((bk, bv))
+    self.idx = new_idx;
+    self.keys = Some(bk);
+    self.values = Some(bv);
+    Ok((rk, rv))
   }
 
   /// mlx-lm `RotatingKVCache._update_in_place` (the `S == 1` decode path):

@@ -321,19 +321,18 @@ impl KvCache for ChunkedKvCache {
     // assigned only after ALL fallible work has succeeded (the exact
     // compute-locals-then-assign discipline `maybe_trim_front` uses;
     // byte-identical to mlx-lm for every success path).
-    let (mut buf_k, mut buf_v) = match (&self.keys, &self.values) {
-      (Some(k), Some(v)) => (k.try_clone()?, v.try_clone()?),
-      // `self.keys is None`: no prior buffer (the realloc `else` arm below
-      // installs `new_k`/`new_v`). A half-initialized (only one of keys /
-      // values set) cache is unreachable via the public API; treat it as the
-      // empty case rather than panicking.
-      _ => {
-        // Placeholder; overwritten unconditionally when `need_alloc`, and
-        // `need_alloc` is always true here (`cur_buf == None`).
-        (keys.try_clone()?, values.try_clone()?)
-      }
-    };
-    if need_alloc {
+    // Allocation-discipline (CORE-1): the post-realloc/-passthrough `buf_k`/
+    // `buf_v` are derived in ONE place (the `if need_alloc { ... } else { ... }`
+    // expression). Previously this region eagerly cloned `self.keys`/`self.values`
+    // (or the inputs) into mutable locals and then immediately overwrote them
+    // unconditionally on the `need_alloc=true` path (a class of provably-dead
+    // clones — comment on the old `_ =>` placeholder branch documented the
+    // overwrite). Compute the buffers once: realloc concat in the
+    // `need_alloc=true` branch (matching mlx-lm's `cache.py:759-765`), and
+    // the borrow-through clone in the `need_alloc=false` branch (only
+    // reachable when `self.keys`/`self.values` are `Some`, so the
+    // `.expect`s are infallible).
+    let (buf_k, buf_v) = if need_alloc {
       // `n_steps = (step + S - 1) // step` (`cache.py:753`); `S >= 1` for a
       // real KV update, but guard the subtraction for an empty-seq input
       // (saturating is exact for every `S >= 1`, mlx-lm's domain).
@@ -357,25 +356,41 @@ impl KvCache for ChunkedKvCache {
         (Some(pk), Some(pv)) => {
           // `if prev % step != 0: self.keys = self.keys[..., :prev, :]`
           // (`cache.py:759-761`) — drop the partially-filled tail before
-          // concatenating the fresh zero block.
-          let (bk, bv) = if prev % CHUNKED_STEP != 0 {
-            (seq_slice(pk, 0, prev)?, seq_slice(pv, 0, prev)?)
+          // concatenating the fresh zero block. The `else` branch uses
+          // `pk`/`pv` by reference directly (`concat_seq` takes `&Array`),
+          // so the prior `pk.try_clone()`/`pv.try_clone()` are no longer
+          // needed — `concat_seq(pk, &new_k)` is identity-equivalent to
+          // `concat_seq(&pk.try_clone()?, &new_k)`.
+          let (bk_owned, bv_owned) = if prev % CHUNKED_STEP != 0 {
+            (Some(seq_slice(pk, 0, prev)?), Some(seq_slice(pv, 0, prev)?))
           } else {
-            (pk.try_clone()?, pv.try_clone()?)
+            (None, None)
           };
+          let bk_ref: &Array = bk_owned.as_ref().unwrap_or(pk);
+          let bv_ref: &Array = bv_owned.as_ref().unwrap_or(pv);
           // `self.keys = mx.concatenate([self.keys, new_k], axis=2)`
           // (`cache.py:762-763`) — into locals, NOT `self` (see the
           // transactional note above).
-          buf_k = concat_seq(&bk, &new_k)?;
-          buf_v = concat_seq(&bv, &new_v)?;
+          (concat_seq(bk_ref, &new_k)?, concat_seq(bv_ref, &new_v)?)
         }
         // `else: self.keys, self.values = new_k, new_v` (`cache.py:765`).
-        _ => {
-          buf_k = new_k;
-          buf_v = new_v;
-        }
+        _ => (new_k, new_v),
       }
-    }
+    } else {
+      // `need_alloc=false` implies `cur_buf=Some` (the only path setting
+      // `need_alloc=false` is `Some(buf_len) if prev_plus_s <= buf_len`),
+      // which in turn requires `self.keys`/`self.values` to be `Some`. So
+      // these `.expect`s are infallible — they document the invariant.
+      let pk = self
+        .keys
+        .as_ref()
+        .expect("need_alloc=false implies self.keys is Some");
+      let pv = self
+        .values
+        .as_ref()
+        .expect("need_alloc=false implies self.values is Some");
+      (pk.try_clone()?, pv.try_clone()?)
+    };
 
     // `self.offset += S` (`cache.py:767`). Python ints never overflow; a
     // corrupt restored `offset` near `usize::MAX` would wrap (release) /
