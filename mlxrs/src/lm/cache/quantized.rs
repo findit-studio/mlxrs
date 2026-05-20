@@ -602,30 +602,91 @@ impl KvCache for QuantizedKvCacheImpl {
     ]
   }
 
-  /// mlx-lm `QuantizedKVCache.meta_state` setter (`cache.py:302-304`):
-  /// `self.offset, self.group_size, self.bits = map(int, v)` — exactly
-  /// three values. All three are parsed into locals and validated before
-  /// any field is mutated, so a parse error on a later value leaves the
-  /// cache untouched rather than partially corrupted (faithful semantics:
-  /// same three fields, same order; on success all three are assigned).
+  /// `QuantizedKVCache.meta_state` setter — accepts BOTH mlx-lm's and
+  /// mlx-swift-lm's serialized forms so a prompt cache saved by either
+  /// runtime loads into this one (cross-runtime portability, project
+  /// decision 2026-05-20):
+  /// - mlx-lm `[offset, group_size, bits]` — 3 strings, `cache.py:302-304`:
+  ///   `self.offset, self.group_size, self.bits = map(int, v)`.
+  /// - mlx-swift-lm `[step, offset, groupSize, bits]` — 4 strings,
+  ///   `MLXLMCommon/KVCache.swift` `QuantizedKVCache.metaState` setter
+  ///   (~line 952). `step` (the over-allocation tuning param at index 0)
+  ///   is a pure allocation optimization with no observable effect on the
+  ///   cache's contract (see `_QUANT_STEP`); the swift setter itself
+  ///   restores ONLY `offset` from index `[1]` and ignores `step`,
+  ///   `groupSize`, `bits`. This port restores `offset` (`[1]`),
+  ///   `group_size` (`[2]`), and `bits` (`[3]`) from the same indices —
+  ///   `group_size`/`bits` are restored (not ignored) so a cache restored
+  ///   purely via `set_meta_state` after a fresh `new(_, _)` agrees on the
+  ///   serialized values, but with `from_state` (the project entry point)
+  ///   they match the placeholder `new(0, 0)` overwrite path identically.
+  ///
+  /// All three fields are parsed into locals before any `self` field is
+  /// mutated, so a parse error on a later value leaves the cache
+  /// untouched rather than partially corrupted (the same
+  /// no-partial-mutation invariant the 3-string form already upheld).
+  /// "Parsed" here means *successfully `usize`/`i32` parsed* — there is
+  /// **no range / semantic validation** (no group_size > 0 check, no
+  /// bits ∈ {2, 4, 8} check) per the NOTE in the body, since neither
+  /// reference impl validates here either (Copilot review #3272690923).
   fn set_meta_state(&mut self, m: &[String]) -> Result<()> {
-    if m.len() != 3 {
-      return Err(Error::Backend {
+    // NOTE (Codex review needs-attention): No range-validation of
+    // offset/group_size/bits is performed here. Neither mlx-lm
+    // `cache.py:302-304` (`map(int, v)`) nor mlx-swift-lm
+    // `KVCache.swift:952-961` (only restores `offset`, ignores
+    // groupSize/bits entirely on restore) range-validates these fields.
+    // Tightening beyond reference posture diverges from the contract per
+    // [[feedback_match_official_binding_design]]. Downstream `mx.quantize`
+    // calls error on invalid group_size/bits at the actual op (mlx-c's
+    // contract).
+    //
+    // Sibling `RotatingKvCache::set_meta_state` (`rotating.rs:477-509`) has
+    // the same posture — `offset` is parsed as an unbounded `usize` with no
+    // range check. The pre-existing 3-string path here (since #40) parses
+    // `m[0].parse::<usize>()` identically, flowing into the same
+    // `enforce_offset_len_invariant` → `trim_triple` → `slice_seq` pipeline
+    // (`util.rs:156-164`), whose `usize as i32` cast is the cross-cutting
+    // boundary, not a Swift-form-specific defect. The 4-string path uses
+    // the SAME parser/storage as the 3-string path — same exposure, faithful
+    // to BOTH refs (which parse offset as an unbounded Python int / Swift
+    // Int identically).
+    //
+    // mlx-lm 3-string form (`cache.py:302-304`): indices [offset,
+    // group_size, bits]. mlx-swift-lm 4-string form
+    // (`KVCache.swift:952-961`): indices [step, offset, groupSize, bits];
+    // the leading `step` is dropped on restore (swift drops it too — it is
+    // a pure over-allocation tuning param, not part of the observable
+    // cache contract; see `_QUANT_STEP`).
+    let (offset_idx, group_size_idx, bits_idx) = match m.len() {
+      3 => (0, 1, 2),
+      4 => (1, 2, 3),
+      n => {
+        return Err(Error::Backend {
+          message: format!(
+            "QuantizedKvCache meta_state must have 3 (mlx-lm form) or 4 \
+             (mlx-swift-lm form) values, got {n}"
+          ),
+        });
+      }
+    };
+    let offset = m[offset_idx].parse::<usize>().map_err(|e| Error::Backend {
+      message: format!(
+        "QuantizedKvCache meta_state offset ({:?}): {e}",
+        m[offset_idx]
+      ),
+    })?;
+    let group_size = m[group_size_idx]
+      .parse::<i32>()
+      .map_err(|e| Error::Backend {
         message: format!(
-          "QuantizedKvCache meta_state must have 3 values, got {}",
-          m.len()
+          "QuantizedKvCache meta_state group_size ({:?}): {e}",
+          m[group_size_idx]
         ),
-      });
-    }
-    let offset = m[0].parse::<usize>().map_err(|e| Error::Backend {
-      message: format!("QuantizedKvCache meta_state offset ({:?}): {e}", m[0]),
+      })?;
+    let bits = m[bits_idx].parse::<i32>().map_err(|e| Error::Backend {
+      message: format!("QuantizedKvCache meta_state bits ({:?}): {e}", m[bits_idx]),
     })?;
-    let group_size = m[1].parse::<i32>().map_err(|e| Error::Backend {
-      message: format!("QuantizedKvCache meta_state group_size ({:?}): {e}", m[1]),
-    })?;
-    let bits = m[2].parse::<i32>().map_err(|e| Error::Backend {
-      message: format!("QuantizedKvCache meta_state bits ({:?}): {e}", m[2]),
-    })?;
+    // Infallible commit tail — all fallible parsing done above.
     self.offset = offset;
     self.group_size = group_size;
     self.bits = bits;
@@ -782,6 +843,14 @@ impl KvCache for QuantizedKvCacheImpl {
   /// `QuantizedKVCacheProtocol` downcast (`KVCache.swift:101`).
   fn as_quantized_mut(&mut self) -> Option<&mut dyn QuantizedKvCache> {
     Some(self)
+  }
+
+  /// `"QuantizedKVCache"` — mlx-lm's `type(QuantizedKVCache).__name__`
+  /// (`cache.py:56`) / mlx-swift-lm
+  /// `case is QuantizedKVCache: return "QuantizedKVCache"`
+  /// (`KVCache.swift:1387`).
+  fn reference_class_name(&self) -> &'static str {
+    "QuantizedKVCache"
   }
 }
 

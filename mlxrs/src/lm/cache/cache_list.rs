@@ -131,164 +131,6 @@ impl CacheList {
   }
 }
 
-/// The **reference** class name (`type(c).__name__`, mlx-lm cache.py:841;
-/// Swift `cacheClassName`, KVCache.swift:1381-1392) a child serializes as,
-/// so [`from_state`](super::from_state) reconstructs the right concrete
-/// kind. Derived by trying the crate's structural refinements first (a
-/// quantized cache is a `QuantizedKVCache`), then probing for `CacheList`
-/// via its serialization-stable marker, with the documented default of
-/// `"KVCache"` (Swift's `default: return "KVCache"`).
-///
-/// We cannot use Rust's type id reflection through `dyn KvCache` without a
-/// downcast hook, so the mapping is built from the trait's own structural
-/// queries (`as_quantized`) plus a `CacheList`-only
-/// [`meta_state`](KvCache::meta_state) marker (its first element is the
-/// child count and the framing is unambiguous): every concrete cache emits
-/// its own reference name in its `meta_state`-driven round-trip, so an
-/// exact-name match is unnecessary for the kinds that exist — the only
-/// structural distinctions the loader needs are Quantized (different
-/// `from_state` data shape) and CacheList (recursive framing).
-/// Non-quantized, non-CacheList children round-trip through the
-/// `"KVCache"`/`"RotatingKVCache"` arms via their own
-/// `set_state`/`set_meta_state`, so naming them by their own `meta_state`
-/// shape is exact: a 4-value meta is the Rotating contract
-/// (cache.py:531-533), an empty meta the Standard one (cache.py has no
-/// `KVCache.meta_state`; `_BaseCache.meta_state` is `""`).
-/// Consumes a PRE-COMPUTED `meta_state` to avoid the extra `meta_state()`
-/// allocation that an `(&dyn KvCache) -> &'static str` wrapper would force
-/// (the cache-allocation discipline). `CacheList::meta_state` is the
-/// canonical caller; it already has `meta` in hand.
-fn child_class_name_from_meta(c: &dyn KvCache, meta: &[String]) -> &'static str {
-  if c.as_quantized().is_some() {
-    // mlx-lm `QuantizedKVCache` / Swift `is QuantizedKVCache`. The concrete
-    // type lands in a later PR; naming it correctly now keeps a mixed
-    // CacheList forward-compatible.
-    return "QuantizedKVCache";
-  }
-  // A CacheList child is recursively a CacheList — prefer the dedicated
-  // [`KvCache::as_cache_list`] trait downcast (faithful to swift's
-  // `cache as? CacheList`); the structural [`is_cache_list_meta`] fallback
-  // is retained as a defense in depth for any future cache whose downcast
-  // is not yet wired (the regression test
-  // `keep_one_rotating_child_is_not_misidentified_as_cache_list` exercises
-  // the structural-detection precision).
-  if c.as_cache_list().is_some() || is_cache_list_meta(meta) {
-    return "CacheList";
-  }
-  match meta.len() {
-    // mlx-lm `ChunkedKVCache.meta_state` is `(chunk_size, start_position)`
-    // — exactly 2 (cache.py:796-798). Distinct from Standard (0), Rotating
-    // (4), and a CacheList frame (already returned above via the structural
-    // marker), so `len()==2` uniquely identifies a chunked child. WITHOUT
-    // this arm a CacheList containing a Chunked child silently mis-named
-    // it `"KVCache"` and a round-trip lost `chunk_size`/`start_position`
-    // (the Standard `from_state` arm ignores meta), breaking
-    // mask/trim/update semantics — exactly the defect Codex flagged.
-    2 => "ChunkedKVCache",
-    // mlx-lm `RotatingKVCache.meta_state` is `(keep, max_size, offset,
-    // _idx)` — exactly 4 (cache.py:531-533).
-    4 => "RotatingKVCache",
-    // Standard / `_BaseCache`-style: no scalar meta. mlx-lm
-    // `save_prompt_cache` writes `type(c).__name__` == `"KVCache"`
-    // (cache.py:56); Swift's `default` is also `"KVCache"`
-    // (KVCache.swift:1390).
-    _ => "KVCache",
-  }
-}
-
-/// The set of **reference class names** a real [`CacheList`] child frame
-/// can carry — exactly the names [`child_class_name`] emits and the crate
-/// [`from_state`](super::from_state) dispatches on. **Critically, none of
-/// these parse as an integer**: this is what makes
-/// [`is_cache_list_meta`] able to tell a genuine CacheList frame (whose
-/// `className` slot is one of these) apart from a
-/// [`RotatingKvCache`](super::RotatingKvCache)'s `meta_state`, which is
-/// **four pure decimal integers** `(keep, max_size, offset, _idx)`
-/// (cache.py:531-533) — e.g. `RotatingKvCache::new(max_size, 1)` →
-/// `["1", max_size, "0", "0"]`, which is numerically a well-formed
-/// `childCount=1` frame *unless* the `className` slot is required to be a
-/// known non-numeric name.
-const KNOWN_CHILD_CLASS_NAMES: &[&str] = &[
-  // -> StandardKvCache (mlx-lm `KVCache`/`ConcatenateKVCache`, swift
-  // `KVCacheSimple`, our Rust alias)
-  "KVCache",
-  "ConcatenateKVCache",
-  "KVCacheSimple",
-  "StandardKvCache",
-  // -> RotatingKvCache (mlx-lm/swift `RotatingKVCache`, our Rust alias)
-  "RotatingKVCache",
-  "RotatingKvCache",
-  // -> ChunkedKvCache (mlx-lm/swift `ChunkedKVCache`, our Rust alias)
-  "ChunkedKVCache",
-  "ChunkedKvCache",
-  // -> QuantizedKVCache (later-PR concrete type; named here for a
-  // forward-compatible mixed CacheList)
-  "QuantizedKVCache",
-  // -> CacheList itself (recursive nesting)
-  "CacheList",
-];
-
-/// Whether a `meta_state` is a [`CacheList`]'s flattened framing: a leading
-/// numeric child count `k`, followed by `k` well-formed
-/// `(className, stateCount, metaCount, ...meta)` groups consuming the slice
-/// **exactly** (no trailing/short data), where every `className` slot is a
-/// recognized **non-numeric** reference name ([`KNOWN_CHILD_CLASS_NAMES`]).
-///
-/// The `className`-must-be-known gate is load-bearing for correctness, not
-/// a mere sanity check: without it a valid
-/// [`RotatingKvCache`](super::RotatingKvCache) child whose `meta_state` is
-/// four integers can *accidentally* satisfy the numeric frame shape (e.g.
-/// `RotatingKvCache::new(8, 1)` → `["1","8","0","0"]` parses as
-/// `childCount=1, className="8", stateCount=0, metaCount=0`), which would
-/// misname the child `"CacheList"` and break the prompt-cache round-trip
-/// (`from_state` would then recurse into the rotating integers and fail on
-/// an unknown child kind). Requiring `className ∈ KNOWN_CHILD_CLASS_NAMES`
-/// — none of which parse as integers — makes a real CacheList frame
-/// unambiguous against Rotating's all-integer meta and Standard's empty
-/// meta. Pure parsing — no eval, no allocation beyond the parse.
-fn is_cache_list_meta(meta: &[String]) -> bool {
-  let Some(first) = meta.first() else {
-    return false;
-  };
-  let Ok(child_count) = first.parse::<usize>() else {
-    return false;
-  };
-  // `["0"]` is the empty CacheList (child count 0, no groups). Standard's
-  // meta is `[]` (handled above) and Rotating's is 4 *numeric* values, so a
-  // lone `"0"` can only be an empty CacheList.
-  let mut i = 1usize;
-  for _ in 0..child_count {
-    // Need className, stateCount, metaCount (3 framing fields).
-    if i + 2 >= meta.len() {
-      return false;
-    }
-    // The `className` slot MUST be a recognized reference name. This is
-    // what distinguishes a genuine CacheList frame from a Rotating child's
-    // all-integer `meta_state` (whose would-be `className` slot is a
-    // number, never in `KNOWN_CHILD_CLASS_NAMES`).
-    if !KNOWN_CHILD_CLASS_NAMES.contains(&meta[i].as_str()) {
-      return false;
-    }
-    // stateCount / metaCount must be numeric.
-    let Ok(_state_count) = meta[i + 1].parse::<usize>() else {
-      return false;
-    };
-    let Ok(meta_count) = meta[i + 2].parse::<usize>() else {
-      return false;
-    };
-    i += 3;
-    let Some(end) = i.checked_add(meta_count) else {
-      return false;
-    };
-    if end > meta.len() {
-      return false;
-    }
-    i = end;
-  }
-  // Exact consumption: a genuine CacheList framing uses the slice fully.
-  i == meta.len()
-}
-
 impl KvCache for CacheList {
   /// Composite offset = `max` of the children's [`offset`](KvCache::offset).
   ///
@@ -432,16 +274,15 @@ impl KvCache for CacheList {
   fn meta_state(&self) -> Vec<String> {
     let mut out = vec![self.caches.len().to_string()];
     for c in &self.caches {
-      // `meta_state()` allocates a fresh `Vec<String>` per call and many
+      // `c.meta_state()` allocates a fresh `Vec<String>` per call and many
       // concrete caches' meta is non-trivial (Rotating allocates 4
-      // elements, Quantized 3, CacheList's own framing is O(children));
-      // `child_class_name(c)` internally calls `c.meta_state()` to
-      // discriminate the kind, so compute it AT MOST ONCE here and reuse
-      // for both `child_class_name` (via `child_class_name_from_meta`) and
-      // the final framing (the cache-allocation discipline; this avoids
-      // doubling the meta_state allocs per child per serialization).
+      // elements, Quantized 3, CacheList's own framing is O(children)).
+      // Compute it once here and consume it directly into the framing —
+      // the per-child class name dispatch is the pure trait-method
+      // `c.reference_class_name()` (no `meta_state` argument), so no
+      // helper is needed (the swift-faithful single switch).
       let child_meta = c.meta_state();
-      let class_name = child_class_name_from_meta(c.as_ref(), &child_meta);
+      let class_name = c.reference_class_name();
       // `state_count()` may fail if a concrete cache falls back to the
       // trait default `Ok(self.state()?.len())` and `state()` itself
       // fails. The framing needs an accurate length — fall back to
@@ -640,6 +481,14 @@ impl KvCache for CacheList {
         })?;
     }
     Ok(total)
+  }
+
+  /// `"CacheList"` — mlx-lm's `type(CacheList).__name__` (`cache.py:56`) /
+  /// mlx-swift-lm `case is CacheList: return "CacheList"`
+  /// (`KVCache.swift:1389`). [`super::from_state`] routes `"CacheList"` to
+  /// the recursive `cache_list_from_state` dispatcher.
+  fn reference_class_name(&self) -> &'static str {
+    "CacheList"
   }
 }
 

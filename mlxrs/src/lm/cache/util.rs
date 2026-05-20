@@ -153,13 +153,52 @@ pub(crate) fn broadcast_write_rhs(
 
 /// Slice the sequence axis (`-2`) of a 4-D KV tensor to `[start, end)`,
 /// keeping every other axis full. mlx-lm's `v[..., start:end, :]`.
+///
+/// `start` / `end` arrive as `usize` (callers pass offsets, seq positions,
+/// or restored prompt-cache metadata); the mlx-c slice op takes `i32`
+/// bounds. An unchecked `usize as i32` cast silently wraps on
+/// `usize > i32::MAX` (potentially to a negative `i32`), producing a wrong
+/// slice stop and a mis-spliced state. So we use the checked
+/// `i32::try_from(end)` (and `start`) and surface overflow as a recoverable
+/// [`Error::ShapeMismatch`] at this single integer-wrap boundary —
+/// observably-equivalent for every valid input
+/// (`start, end <= i32::MAX as usize`), which covers every real cache use
+/// case. The shape dims come from an `Array` that mlx itself already
+/// constructed, but the same checked cast is applied for defense-in-depth
+/// and consistency (so any future call that hits this boundary fails
+/// recoverably, never with a silent wrap).
 pub(crate) fn slice_seq(a: &Array, start: usize, end: usize) -> Result<Array> {
   let shape = a.shape();
+  // Rank check — surface a rank-misuse as recoverable `ShapeMismatch`
+  // rather than panicking on the `stops[KV_NDIM - 2]` index below
+  // (Copilot review #3273072304). Surrounding helpers (`seq_len`,
+  // `head_dim`, `concat_parts`) all enforce `KV_NDIM` the same way; the
+  // happy path through the existing callers (Standard/Rotating/Chunked/
+  // Quantized/Batch/BatchRotating) all pre-validate rank before reaching
+  // here, so this is a defense-in-depth guard, not a behavior change.
+  if shape.len() != KV_NDIM {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "slice_seq: expects {KV_NDIM}-D array [B, n_kv_heads, S, head_dim], got shape {shape:?}"
+      ),
+    });
+  }
   let mut starts = vec![0i32; KV_NDIM];
-  let mut stops: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
+  let mut stops: Vec<i32> = shape
+    .iter()
+    .map(|&d| {
+      i32::try_from(d).map_err(|_| Error::ShapeMismatch {
+        message: format!("slice_seq: shape dim {d} exceeds i32::MAX"),
+      })
+    })
+    .collect::<Result<Vec<i32>>>()?;
   let strides = vec![1i32; KV_NDIM];
-  starts[KV_NDIM - 2] = start as i32;
-  stops[KV_NDIM - 2] = end as i32;
+  starts[KV_NDIM - 2] = i32::try_from(start).map_err(|_| Error::ShapeMismatch {
+    message: format!("slice_seq: start offset {start} exceeds i32::MAX"),
+  })?;
+  stops[KV_NDIM - 2] = i32::try_from(end).map_err(|_| Error::ShapeMismatch {
+    message: format!("slice_seq: end offset {end} exceeds i32::MAX"),
+  })?;
   ops::indexing::slice(a, &starts, &stops, &strides)
 }
 
@@ -259,5 +298,101 @@ pub(crate) fn concat_parts(parts: &[&Array]) -> Result<Array> {
     },
     [one] => rank_checked(one),
     many => ops::shape::concatenate(many, SEQ_AXIS),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  //! Regression tests for the checked `usize -> i32` cast at the
+  //! `slice_seq` boundary. A forged/corrupt prompt-cache restore can
+  //! flow a `usize > i32::MAX` through here; the unchecked `as i32` cast
+  //! previously wrapped silently (potentially to a negative `i32`),
+  //! producing a wrong slice stop. The checked cast surfaces overflow as
+  //! a recoverable `Error::ShapeMismatch` at this single source of
+  //! truth — every cache (Standard / Rotating / Chunked / Quantized /
+  //! Batch / BatchRotating) that flows restored offsets through
+  //! `slice_seq` (via `enforce_offset_len_invariant` / `trim_triple` /
+  //! direct callers) shares the same protection.
+  use super::*;
+  use crate::{Error, array::Array};
+  // Minimum 4-D KV-shaped array all tests reuse — `slice_seq` only checks
+  // the rank-implicit way (via `KV_NDIM`) so a `[1, 1, 1, 1]` is enough.
+  fn kv1() -> Array {
+    Array::from_slice::<f32>(&[0.0], &(1usize, 1, 1, 1)).unwrap()
+  }
+
+  #[test]
+  fn slice_seq_rejects_end_above_i32_max() {
+    let a = kv1();
+    let bad_end = (i32::MAX as usize) + 1;
+    let r = slice_seq(&a, 0, bad_end);
+    match r {
+      Err(Error::ShapeMismatch { message }) => {
+        assert!(
+          message.contains("end") && message.contains("i32::MAX"),
+          "expected message to name `end` and `i32::MAX`, got: {message:?}"
+        );
+        assert!(
+          message.contains(&bad_end.to_string()),
+          "expected message to include the offending value {bad_end}, got: {message:?}"
+        );
+      }
+      other => panic!("expected Err(ShapeMismatch), got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn slice_seq_rejects_start_above_i32_max() {
+    let a = kv1();
+    let bad_start = (i32::MAX as usize) + 1;
+    // `end` also overflows here; this test only asserts the start-bound
+    // overflow is surfaced (not that it wins over the end-bound check) —
+    // either error variant is correct, both name an offset > i32::MAX.
+    let r = slice_seq(&a, bad_start, bad_start);
+    match r {
+      Err(Error::ShapeMismatch { message }) => {
+        assert!(
+          message.contains("i32::MAX"),
+          "expected message to mention `i32::MAX`, got: {message:?}"
+        );
+        assert!(
+          message.contains("start") || message.contains("end"),
+          "expected message to name `start` or `end` offset, got: {message:?}"
+        );
+      }
+      other => panic!("expected Err(ShapeMismatch), got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn slice_seq_accepts_zero_window_at_origin() {
+    // Sanity: the checked cast is observably-equivalent for valid inputs.
+    // A `[0, 0)` window on the seq axis is a valid empty slice (mlx-lm's
+    // `v[..., 0:0, :]`) and must succeed unchanged.
+    let a = kv1();
+    let r = slice_seq(&a, 0, 0);
+    assert!(r.is_ok(), "valid zero-window slice must succeed, got {r:?}");
+  }
+
+  #[test]
+  fn slice_seq_rejects_rank_mismatch() {
+    // Defense-in-depth: a rank-misuse must surface as recoverable
+    // ShapeMismatch rather than panicking on the `stops[KV_NDIM - 2]`
+    // index (Copilot review #3273072304). All real callers pre-validate
+    // rank, so this only fires on a programmer-error / misuse path.
+    let a1: Array = Array::from_slice::<f32>(&[0.0, 1.0], &(2usize,)).unwrap(); // rank 1
+    let r = slice_seq(&a1, 0, 0);
+    assert!(
+      matches!(r, Err(Error::ShapeMismatch { .. })),
+      "rank-1 must Err(ShapeMismatch), got {r:?}"
+    );
+    let err_msg = match r {
+      Err(e) => format!("{e}"),
+      Ok(_) => unreachable!(),
+    };
+    assert!(
+      err_msg.contains("4-D") && err_msg.contains("[2]"),
+      "error must name expected rank + got shape; got: {err_msg}"
+    );
   }
 }

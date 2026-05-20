@@ -83,20 +83,16 @@
 //!
 //! mlx-lm derives the kind via `type(c).__name__`; mlx-swift-lm via a
 //! single `cacheClassName(_:)` `switch` over the concrete type. The
-//! `KvCache` trait (as merged, #32) exposes no downcast (`Any`) hook, so
-//! [`reference_class_name`] is the faithful Rust analogue of that *one
-//! central switch*: it maps the two concrete cache types reachable in the
-//! merged tree to their reference names via the **stable serialized
-//! discriminant** the trait already exposes —
-//! `RotatingKvCache.meta_state()` is the 4-tuple `(keep, max_size, offset,
-//! idx)` (cache.py:529-533) and `max_size()` is `Some`, whereas
-//! `StandardKvCache` has an empty `meta_state()` and `max_size() == None`.
-//! That discriminant *is* `RotatingKVCache`'s on-disk identity, so the
-//! mapping is exact and the emitted name (`"KVCache"` /
-//! `"RotatingKVCache"`) is precisely what mlx-lm / mlx-swift expect and
-//! what [`from_state`] keys on. Later-PR cache kinds add
-//! one arm here exactly as they add a `from_state` arm / a swift
-//! `cacheClassName` case.
+//! `KvCache` trait carries the equivalent
+//! [`KvCache::reference_class_name`] method (defaulting to `"KVCache"`,
+//! overridden by every concrete cache to its mlx-lm/mlx-swift name), so
+//! [`reference_class_name`] is a thin dispatch over that trait method —
+//! the emitted name (`"KVCache"` / `"RotatingKVCache"` / `"ChunkedKVCache"`
+//! / `"QuantizedKVCache"` / `"CacheList"` / `"ArraysCache"` /
+//! `"BatchKVCache"` / `"BatchRotatingKVCache"`) is precisely what mlx-lm /
+//! mlx-swift expect and what [`from_state`] keys on. Adding a new cache
+//! kind means overriding [`KvCache::reference_class_name`] on it (and the
+//! corresponding [`from_state`] arm); no change here.
 //!
 //! ## Path-read DoS discipline
 //!
@@ -166,58 +162,20 @@ use crate::{
 pub const MAX_PROMPT_CACHE_BYTES: u64 = 8 << 30;
 
 /// The **reference Python class name** for `cache` (mlx-lm
-/// `type(c).__name__`, cache.py:56 / swift `cacheClassName`).
+/// `type(c).__name__`, cache.py:56 / swift `cacheClassName`,
+/// `KVCache.swift:1381-1392`).
 ///
-/// Discriminates via the trait's stable serialized surface (see the module
-/// docs): a `RotatingKvCache` is the only concrete cache whose
-/// `meta_state()` is the 4-element `(keep, max_size, offset, idx)` tuple
-/// **and** whose `max_size()` is `Some` — that pair is exactly its on-disk
-/// identity, so the mapping to `"RotatingKVCache"` is exact; anything else
-/// is the full-attention `"KVCache"`. The returned string is exactly the
-/// reference class name `from_state` keys on and that mlx-lm / mlx-swift
-/// write, so the *kind labeling and wire format* are cross-tool (subject
-/// to the rotating-cache `meta_state` arity caveat in the module docs:
-/// full mlx-lm round-trip; mlx-swift parity for the wire format +
-/// non-rotating kinds). A future cache kind adds one arm here
-/// (mirroring its new `from_state` arm), exactly as mlx-swift-lm extends
-/// its single `cacheClassName` switch.
+/// Thin forward to [`KvCache::reference_class_name`] (the trait method
+/// that lifts swift's `cacheClassName(_:)` switch onto the concrete cache
+/// itself). The returned string is exactly the reference class name
+/// [`from_state`] keys on and that mlx-lm / mlx-swift write, so the *kind
+/// labeling and wire format* are cross-tool (subject to the rotating-cache
+/// `meta_state` arity caveat in the module docs: full mlx-lm round-trip;
+/// mlx-swift parity for the wire format + non-rotating kinds). Adding a
+/// new cache kind means overriding [`KvCache::reference_class_name`] on
+/// it (and the corresponding [`from_state`] arm); no change here.
 pub fn reference_class_name(cache: &dyn KvCache) -> &'static str {
-  // Prefer the explicit trait downcasts when available (mirrors swift's
-  // `cache as? CacheList` / `cache as? BatchPositionedKVCache`
-  // discriminators at KVCache.swift:1381-1392 — exact type, NOT a
-  // meta/max-size heuristic).
-  //
-  // `CacheList` first (merged in #37): a top-level `CacheList` prompt
-  // cache MUST serialize as `"CacheList"`, NOT fall through to the
-  // `max_size==None ⇒ KVCache` heuristic — otherwise `load_prompt_cache`
-  // would route to `StandardKvCache::set_state` and reject the multi-array
-  // CacheList state.
-  if cache.as_cache_list().is_some() {
-    return "CacheList";
-  }
-  // Then batch caches (added by this PR): `BatchKvCache` and
-  // `BatchRotatingKvCache` both override `as_batch_positioned()`;
-  // distinguish via `max_size()` (`BatchRotating` returns `Some`,
-  // `BatchKv` returns `None`). Same routing rationale as `CacheList`:
-  // multi-array batch state needs the proper class name to load.
-  if cache.as_batch_positioned().is_some() {
-    return if cache.max_size().is_some() {
-      "BatchRotatingKVCache"
-    } else {
-      "BatchKVCache"
-    };
-  }
-  // `RotatingKVCache.meta_state` is `[keep, max_size, offset, _idx]`
-  // (cache.py:529-533) and it is the only merged-tree cache that is both
-  // window-bounded (`max_size().is_some()`) and emits a 4-element
-  // meta_state. `StandardKvCache` (the `KVCache` port) has an empty
-  // meta_state and `max_size() == None`. This is the exact serialized
-  // discriminant `from_state` round-trips on.
-  if cache.max_size().is_some() && cache.meta_state().len() == 4 {
-    "RotatingKVCache"
-  } else {
-    "KVCache"
-  }
+  cache.reference_class_name()
 }
 
 /// Save a pre-computed prompt cache to a `.safetensors` file — port of

@@ -566,6 +566,34 @@ impl KvCache for ArraysCache {
       lengths: self.lengths.clone(),
     }))
   }
+
+  /// `"ArraysCache"` — mlx-lm's `type(ArraysCache).__name__` (`cache.py:56`)
+  /// / mlx-swift-lm `case is ArraysCache: return "ArraysCache"`
+  /// (`KVCache.swift:1385`). mlx-swift-lm's `cacheClassName` switch
+  /// (`KVCache.swift:1381-1390`) returns `"MambaCache"` for the
+  /// `MambaCache: ArraysCache` subclass *before* this arm. mlxrs has no
+  /// separate `MambaCache` struct per the no-per-model-arch-porting rule
+  /// (`MambaCache` is a 2-slot `ArraysCache` adding NO extra state/metadata —
+  /// the only specialization is `super.init(size: 2)`,
+  /// `KVCache.swift:1230-1245`); both kinds reconstruct via the same
+  /// `arrays::from_state_arrays` arm in [`super::from_state`].
+  ///
+  /// **Trade-off, deliberate.** A swift-saved `"MambaCache"` prompt cache
+  /// round-trips through this Rust type as `"ArraysCache"` — load is
+  /// **backwards-compatible** (the `"MambaCache"` arm of [`super::from_state`]
+  /// aliases to `arrays::from_state_arrays`, so the slot state reloads
+  /// correctly), but the *original class label* is lost on save-after-load.
+  /// This is the same kind of trade-off the merged tree already makes (and
+  /// strictly worse without this PR — pre-PR, `ArraysCache` falls through to
+  /// the `meta_state()`/`max_size()` heuristic, which classifies it as
+  /// `"KVCache"` and the load side then fails to reconstruct it as a slot
+  /// cache at all). Preserving the `"MambaCache"` provenance would require
+  /// either a `MambaCache` Rust newtype OR an `ArraysCache::is_mamba`
+  /// constructor flag — both project-rule decisions tracked as a follow-up
+  /// (`docs/rust-golden-standard-followups.md` KVC-9).
+  fn reference_class_name(&self) -> &'static str {
+    "ArraysCache"
+  }
 }
 
 /// `from_state` arm for the `"ArraysCache"` reference class name

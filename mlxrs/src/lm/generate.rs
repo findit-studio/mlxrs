@@ -8,10 +8,11 @@
 //!
 //! Everything is generic over the [`Model`] trait: the loop only ever calls
 //! `model.forward(tokens, &mut cache)`. The decode loop is an idiomatic Rust
-//! [`Iterator`] (the spec's A1) — [`generate_step`] yields one
-//! `(token, logprobs)` per step, [`stream_generate`] maps that through the
-//! #18 streaming detokenizer into [`GenerationResponse`]s, and [`generate`]
-//! collects the whole thing into a `String`.
+//! [`Iterator`] (the spec's A1) — [`generate_step`] yields one [`GenStep`]
+//! per step (the typed step item: `token` + `logprobs`),
+//! [`stream_generate`] maps that through the #18 streaming detokenizer into
+//! [`GenerationResponse`]s, and [`generate`] collects the whole thing into a
+//! `String`.
 //!
 //! **Exact per-step order (mlx-lm `generate_step._step`, lines 396-422):**
 //!
@@ -27,8 +28,8 @@
 //! 5. `token = sampler(logprobs)` — the [`make_sampler`] chain
 //!    (top-k/p, min-p, xtc, categorical) or the default temperature-0
 //!    `argmax`.
-//! 6. yield `(token, logprobs.squeeze(0))`; stop when `token ∈ eos`
-//!    (`finish_reason = "stop"`) or `count == max_tokens`
+//! 6. yield `GenStep { token, logprobs: logprobs.squeeze(0) }`; stop when
+//!    `token ∈ eos` (`finish_reason = "stop"`) or `count == max_tokens`
 //!    (`finish_reason = "length"`).
 //!
 //! **Prefill** is chunked by [`GenConfig::prefill_step_size`] (mlx-lm lines
@@ -410,35 +411,66 @@ fn recent_ids(tokens: &[u32], context_size: usize) -> Vec<i32> {
   tokens[start..].iter().map(|&t| t as i32).collect()
 }
 
-/// One decode token plus its log-probability vector — mlx-lm
-/// `generate_step`'s `yield y.item(), logprobs`.
-pub type Step = (u32, Array);
+/// One decode step — the sampled `token` plus the `[V]` log-probability
+/// vector over the vocabulary that produced it (mlx-lm
+/// `generate_step`'s `yield y.item(), logprobs`).
+///
+/// Replaces the prior `(u32, Array)` tuple item: mlx-lm uses Python's
+/// positional tuple as informal documentation, but Rust callers reading
+/// the iterator item shouldn't have to remember tuple-index conventions —
+/// the struct is self-documenting and a Rust-idiomatic improvement
+/// (prefer idiomatic-Rust ergonomics over verbatim Python mirroring).
+///
+/// # Back-compat
+///
+/// This is **not** drop-in source-compatible with the prior tuple item:
+/// existing `let (tok, lp) = step?;` call sites must add an explicit
+/// `.into()` (`let (tok, lp) = step?.into();`) or pattern-match the
+/// struct (`let GenStep { token, logprobs } = step?;`). The break is
+/// **intentional** — mlxrs is pre-1.0, and the ergonomics + self-
+/// documentation win outweighs a one-line migration per call site. The
+/// `From<GenStep> for (u32, Array)` impl below makes that migration
+/// mechanical.
+#[derive(Debug)]
+pub struct GenStep {
+  /// The sampled token id (mlx-lm `y.item()`).
+  pub token: u32,
+  /// The token's `[V]` log-probability vector (mlx-lm
+  /// `logprobs.squeeze(0)`), kept lazy.
+  pub logprobs: Array,
+}
 
-/// The architecture-agnostic decode iterator (the spec's `GenStep`):
-/// borrows the model, owns the per-layer KV cache, the running token
-/// history, the sampler, and the logits processors. `impl Iterator<Item =
-/// Result<(u32, Array)>>` — a 1:1 port of `mlx_lm.generate.generate_step`.
+impl From<GenStep> for (u32, Array) {
+  fn from(s: GenStep) -> Self {
+    (s.token, s.logprobs)
+  }
+}
+
+/// The architecture-agnostic decode iterator: borrows the model, owns the
+/// per-layer KV cache, the running token history, the sampler, and the
+/// logits processors. `impl Iterator<Item = Result<GenStep>>` — a 1:1 port
+/// of `mlx_lm.generate.generate_step`.
 ///
 /// Construct via [`generate_step`]. The borrow of `&'a M` plus the owned
 /// cache means no aliasing (spec §7.5). The iterator **fuses**: after it
 /// yields `Err` (a step failed) or finishes (eos / `max_tokens`) every
 /// further `next()` is `None` — never a panic, never a poisoned re-entry
 /// (spec §4).
-pub struct GenStep<'a, M: Model> {
+pub struct Generator<'a, M: Model> {
   model: &'a M,
   cache: Vec<Box<dyn KvCache>>,
   sampler: Sampler,
   processors: Vec<LogitsProcessor>,
   /// The full encoded prompt (mlx-lm's `prompt`). Prefill advances
-  /// [`GenStep::prefill_offset`] over this buffer instead of front-draining
-  /// it; the unconsumed tail (`prompt[prefill_offset..]`) starts the first
-  /// decode step.
+  /// [`Generator::prefill_offset`] over this buffer instead of
+  /// front-draining it; the unconsumed tail (`prompt[prefill_offset..]`)
+  /// starts the first decode step.
   prompt: Vec<u32>,
-  /// Cursor into [`GenStep::prompt`]: the count of leading tokens already
-  /// prefilled (mlx-lm's `prompt_processed_tokens`). Advanced by each chunk
-  /// size so prefill is O(P) — no front-removal / tail-shift / realloc per
-  /// chunk (the byte-identical O(P) analogue of mlx-lm's `prompt =
-  /// prompt[n_to_process:]` array slicing).
+  /// Cursor into [`Generator::prompt`]: the count of leading tokens
+  /// already prefilled (mlx-lm's `prompt_processed_tokens`). Advanced by
+  /// each chunk size so prefill is O(P) — no front-removal / tail-shift /
+  /// realloc per chunk (the byte-identical O(P) analogue of mlx-lm's
+  /// `prompt = prompt[n_to_process:]` array slicing).
   prefill_offset: usize,
   /// The running token-id history fed to the logits processors (mlx-lm's
   /// accumulating `tokens` — the step input, not yet the predicted token).
@@ -466,10 +498,10 @@ pub struct GenStep<'a, M: Model> {
   done: bool,
 }
 
-impl<M: Model> GenStep<'_, M> {
+impl<M: Model> Generator<'_, M> {
   /// Run the prompt prefill once: feed the first `total - 1` tokens through
   /// the model in `prefill_step_size` chunks (logits discarded, cache
-  /// filled) by advancing [`GenStep::prefill_offset`] over `self.prompt`,
+  /// filled) by advancing [`Generator::prefill_offset`] over `self.prompt`,
   /// leaving the unconsumed final token(s) (`prompt[prefill_offset..]`) to
   /// start the first decode step — mlx-lm `generate_step` lines 430-451.
   ///
@@ -478,7 +510,7 @@ impl<M: Model> GenStep<'_, M> {
   /// first set inside `_step` to that step's `input_tokens` (the prompt
   /// tail), so the logits-processor context is the prompt *tail* + generated
   /// tokens — exactly mirrored here by accumulating history only in
-  /// [`GenStep::step`].
+  /// [`Generator::step`].
   fn prefill(&mut self) -> Result<()> {
     // mlx-lm: `total = len(prompt); processed = 0; while total - processed >
     // 1: remaining = (total - processed) - 1; n = min(step, remaining);
@@ -500,9 +532,9 @@ impl<M: Model> GenStep<'_, M> {
   /// One decode step — the exact mlx-lm `_step` order
   /// (`generate_step` lines 396-422): forward → last-position slice →
   /// history-accumulate → logits processors → `logits - logsumexp` →
-  /// sampler → `(token, logprobs.squeeze(0))`. No implicit eval except the
-  /// `.item::<u32>()` token boundary.
-  fn step(&mut self, input: &[u32]) -> Result<Step> {
+  /// sampler → `GenStep { token, logprobs: logprobs.squeeze(0) }`. No
+  /// implicit eval except the `.item::<u32>()` token boundary.
+  fn step(&mut self, input: &[u32]) -> Result<GenStep> {
     // 1. forward over `input[None]` (a `[1, S]` window); cache updated in
     //    place.
     let tokens = token_window(input)?;
@@ -540,12 +572,12 @@ impl<M: Model> GenStep<'_, M> {
 
     // mlx-lm returns `logprobs.squeeze(0)` ⇒ a `[V]` vector. Kept lazy.
     let logprobs = ops::shape::squeeze_axes(&logprobs, &[0])?;
-    Ok((token, logprobs))
+    Ok(GenStep { token, logprobs })
   }
 }
 
-impl<M: Model> Iterator for GenStep<'_, M> {
-  type Item = Result<Step>;
+impl<M: Model> Iterator for Generator<'_, M> {
+  type Item = Result<GenStep>;
 
   fn next(&mut self) -> Option<Self::Item> {
     // Fused: a prior Err or a finish ends iteration permanently — no
@@ -601,16 +633,16 @@ impl<M: Model> Iterator for GenStep<'_, M> {
     };
 
     match self.step(&input) {
-      Ok((token, logprobs)) => {
+      Ok(step) => {
         self.produced += 1;
-        self.last = Some(token);
+        self.last = Some(step.token);
         // Spec §3: `generate_step` itself stops on an eos token (it carries
         // the eos set); the eos token IS yielded (mlx-lm yields it, then
         // `stream_generate` breaks) — so yield it, then fuse.
-        if self.eos.contains(&token) {
+        if self.eos.contains(&step.token) {
           self.done = true;
         }
-        Some(Ok((token, logprobs)))
+        Some(Ok(step))
       }
       Err(e) => {
         // A step error is yielded once, then the iterator ends (spec §4).
@@ -680,20 +712,20 @@ fn last_position(logits: &Array) -> Result<Array> {
 /// `generate_step` wiring), so a `cfg`-level sampler / penalty validation
 /// error surfaces here as an `Err`.
 ///
-/// Returns an `Iterator<Item = Result<(u32, Array)>>`: each item is the next
-/// token id plus its `[V]` log-probability vector. The iterator prefills the
-/// prompt (chunked by [`GenConfig::prefill_step_size`]) on its first poll,
-/// then yields one token per step until a sampled token is in
-/// [`GenConfig::eos`] (the eos token is the final yielded item) or
-/// [`GenConfig::max_tokens`] tokens have been produced. A step error is
-/// yielded once as `Err`, after which the iterator ends (spec §4 — no panic,
-/// no poison).
+/// Returns an `Iterator<Item = Result<GenStep>>`: each item is the next
+/// sampled token id plus its `[V]` log-probability vector (the typed step
+/// item — see [`GenStep`]). The iterator prefills the prompt (chunked by
+/// [`GenConfig::prefill_step_size`]) on its first poll, then yields one
+/// token per step until a sampled token is in [`GenConfig::eos`] (the eos
+/// token is the final yielded item) or [`GenConfig::max_tokens`] tokens
+/// have been produced. A step error is yielded once as `Err`, after which
+/// the iterator ends (spec §4 — no panic, no poison).
 pub fn generate_step<'a, M: Model>(
   model: &'a M,
   prompt: &[u32],
   cache: Vec<Box<dyn KvCache>>,
   cfg: GenConfig,
-) -> GenStep<'a, M> {
+) -> Generator<'a, M> {
   // Build sampler + processors up front (mlx-lm's `generate` does this
   // before calling `generate_step`). An empty prompt (mlx-lm raises
   // `ValueError("Either input_embeddings or prompt ... must be provided")`)
@@ -731,7 +763,7 @@ pub fn generate_step<'a, M: Model>(
   })();
 
   match built {
-    Ok((sampler, processors)) => GenStep {
+    Ok((sampler, processors)) => Generator {
       model,
       cache,
       sampler,
@@ -749,7 +781,7 @@ pub fn generate_step<'a, M: Model>(
       pending_err: None,
       done: false,
     },
-    Err(e) => GenStep {
+    Err(e) => Generator {
       model,
       cache,
       // A never-called placeholder sampler; `pending_err` ends the
@@ -860,7 +892,7 @@ pub fn stream_generate<'a, M: Model>(
     if finished {
       return None;
     }
-    let (token, logprobs) = match steps.next()? {
+    let GenStep { token, logprobs } = match steps.next()? {
       Ok(step) => step,
       Err(e) => {
         finished = true;

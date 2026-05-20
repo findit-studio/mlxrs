@@ -282,6 +282,49 @@ pub trait KvCache {
   fn state_count(&self) -> Result<usize> {
     self.state().map(|s| s.len())
   }
+
+  /// The mlx-lm reference class name (`type(c).__name__`) this cache
+  /// serializes as — the **single switch** mlx-swift-lm's
+  /// `cacheClassName(_:)` performs at `KVCache.swift:1381-1392`, lifted onto
+  /// the trait so the kind label is a property of the concrete cache (no
+  /// downstream `meta_state()` / `max_size()` heuristic). Used by
+  /// [`persist::reference_class_name`] and [`from_state`] to round-trip the
+  /// cache through the prompt-cache save/load surface; the returned string
+  /// is exactly what mlx-lm `save_prompt_cache` writes (`cache.py:56`,
+  /// `type(c).__name__`) and what [`from_state`] keys on.
+  ///
+  /// The default returns `"KVCache"` — exactly mirroring mlx-swift-lm's
+  /// `default: return "KVCache"` arm (`KVCache.swift:1390`) and mlx-lm's
+  /// `_BaseCache` (`type(c).__name__` for unknown subclasses falls through
+  /// `from_state`'s class table) — so any *future in-tree* cache that omits
+  /// the override still produces a **parseable** (if generic) round-trip
+  /// rather than an unknown kind. Pure, infallible, zero allocation.
+  ///
+  /// # On the removed heuristic
+  ///
+  /// The pre-PR [`persist::reference_class_name`] was a *workaround*: it
+  /// faked swift's class-identity-switch via
+  /// `as_cache_list()` / `as_batch_positioned()` / `max_size() +
+  /// meta_state().len()` probes — necessary precisely because there was
+  /// **no** `reference_class_name` trait method. This PR's whole purpose is
+  /// to introduce that method (faithful to swift's `cacheClassName`
+  /// switch), at which point the heuristic becomes structurally
+  /// **redundant**, not just stylistically removable. Reinstating it as a
+  /// "fallback" when the trait method returns the default would re-create
+  /// the very hack the trait method replaces — and miss the swift-faithful
+  /// design point that the kind label IS a property of the concrete cache.
+  ///
+  /// **Out-of-tree implementors.** The trait is `pub`, but: (1) per the
+  /// project's `no-per-model-arch-porting` rule, all `KvCache` impls live
+  /// in-crate (we don't ship a downstream KvCache trait for ML models to
+  /// implement); (2) mlxrs is pre-`0.1.0` API-stable; (3) any conceivable
+  /// downstream wrapper around an in-tree cache that wants the wrapped
+  /// kind's label can `forward.reference_class_name()` in one line — the
+  /// same one-liner each in-tree cache writes. So the default-`"KVCache"`
+  /// safety net is exactly swift's `default:` arm, no more.
+  fn reference_class_name(&self) -> &'static str {
+    "KVCache"
+  }
 }
 
 /// Caches that support efficient quantized operations — mlx-swift-lm's

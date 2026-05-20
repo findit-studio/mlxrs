@@ -19,7 +19,7 @@ use mlxrs::{
   lm::{
     cache::{CacheConfig, KvCache, make_prompt_cache},
     generate::{
-      __resolved_unseeded_seed_for_test, GenConfig, generate, generate_step,
+      __resolved_unseeded_seed_for_test, GenConfig, GenStep, generate, generate_step,
       make_logits_processors, make_sampler, stream_generate,
     },
     model::Model,
@@ -213,7 +213,7 @@ fn generate_step_greedy_deterministic_sequence() {
   };
   let prompt = [1u32, 2, 3];
   let toks: Vec<u32> = generate_step(&model, &prompt, cache(2), cfg)
-    .map(|r| r.unwrap().0)
+    .map(|r| r.unwrap().token)
     .collect();
   // argmax of [0,1,2,3,4] == 4 every step; exactly max_tokens of them.
   assert_eq!(toks, vec![4, 4, 4, 4]);
@@ -246,7 +246,7 @@ fn generate_step_stops_on_eos_token() {
     ..GenConfig::default()
   };
   let toks: Vec<u32> = generate_step(&model, &[1u32, 2], cache(1), cfg)
-    .map(|r| r.unwrap().0)
+    .map(|r| r.unwrap().token)
     .collect();
   assert_eq!(toks, vec![4], "eos token yielded once, then iteration ends");
 }
@@ -262,7 +262,10 @@ fn generate_step_yields_logprobs_normalized() {
     eos: vec![],
     ..GenConfig::default()
   };
-  let (tok, mut lp) = generate_step(&model, &[1u32], cache(1), cfg)
+  let GenStep {
+    token: tok,
+    logprobs: mut lp,
+  } = generate_step(&model, &[1u32], cache(1), cfg)
     .next()
     .unwrap()
     .unwrap();
@@ -291,7 +294,7 @@ fn generate_step_prefill_chunks_by_prefill_step_size() {
   };
   let prompt = [1u32, 2, 3, 4, 1];
   let toks: Vec<u32> = generate_step(&model, &prompt, cache(1), cfg)
-    .map(|r| r.unwrap().0)
+    .map(|r| r.unwrap().token)
     .collect();
   assert_eq!(toks, vec![4, 4], "chunked prefill + 2 decode steps");
 }
@@ -321,7 +324,7 @@ fn generate_step_prefill_chunk_boundaries_are_exact() {
   };
   let prompt = [1u32, 2, 3, 4, 1, 2]; // P = 6
   let toks: Vec<u32> = generate_step(&model, &prompt, cache(1), cfg)
-    .map(|r| r.unwrap().0)
+    .map(|r| r.unwrap().token)
     .collect();
   assert_eq!(
     toks,
@@ -349,7 +352,7 @@ fn generate_step_prefill_chunk_boundaries_are_exact() {
   };
   let prompt_b = [1u32, 2, 3, 4, 1, 2, 3]; // P = 7
   let _: Vec<u32> = generate_step(&model_b, &prompt_b, cache(1), cfg_b)
-    .map(|r| r.unwrap().0)
+    .map(|r| r.unwrap().token)
     .collect();
   assert_eq!(
     *model_b.seq_lens.borrow(),
@@ -372,7 +375,7 @@ fn generate_step_prefill_chunk_boundaries_are_exact() {
   };
   let prompt_c = [1u32, 2, 3]; // P = 3
   let _: Vec<u32> = generate_step(&model_c, &prompt_c, cache(1), cfg_c)
-    .map(|r| r.unwrap().0)
+    .map(|r| r.unwrap().token)
     .collect();
   assert_eq!(
     *model_c.seq_lens.borrow(),
@@ -621,7 +624,7 @@ fn stochastic_sampler_independent_runs_and_seed_reproducible() {
       ..GenConfig::default()
     };
     generate_step(&model, &[1u32], cache(1), cfg)
-      .map(|r| r.unwrap().0)
+      .map(|r| r.unwrap().token)
       .collect()
   };
 
@@ -697,12 +700,12 @@ fn generate_step_applies_processors_before_logsumexp_before_sampler() {
     logit_bias: vec![(0, 100.0)], // post-processor argmax == 0
     ..GenConfig::default()
   };
-  let (tok, _lp) = generate_step(&model, &[1u32], cache(1), cfg)
+  let step = generate_step(&model, &[1u32], cache(1), cfg)
     .next()
     .unwrap()
     .unwrap();
   assert_eq!(
-    tok, 0,
+    step.token, 0,
     "logit_bias steered the argmax ⇒ processor ran on raw logits before logsumexp before sampler"
   );
 }
@@ -803,4 +806,96 @@ fn stream_generate_propagates_forward_error() {
     "forward error propagated through stream_generate"
   );
   assert!(it.next().is_none(), "iteration ends after the error");
+}
+
+// ---------------------------------------------------------------------------
+// GenStep typed item — field-equivalence, Debug, and tuple back-compat
+// ---------------------------------------------------------------------------
+
+/// `GenStep.token` matches the value the prior `(u32, Array)` tuple's `.0`
+/// would have carried — the typed-struct refactor (LM-3) is a pure
+/// ergonomics upgrade with **no semantic change** to the iterator's
+/// payload. `MockModel::ramp(5)`'s argmax is always 4 (the last vocab id),
+/// the exact same value the old tuple's `.0` would have yielded.
+#[test]
+fn gen_step_token_field_matches_prior_tuple_zero() {
+  let model = MockModel::ramp(5);
+  let cfg = GenConfig {
+    max_tokens: 1,
+    eos: vec![],
+    ..GenConfig::default()
+  };
+  let step = generate_step(&model, &[1u32], cache(1), cfg)
+    .next()
+    .unwrap()
+    .unwrap();
+  assert_eq!(
+    step.token, 4,
+    "GenStep.token == argmax (ramp(5) ⇒ 4); identical to the prior (u32, Array).0"
+  );
+  // And `.logprobs` carries the [V] vector (prior .1 contract).
+  assert_eq!(step.logprobs.shape(), vec![5]);
+}
+
+/// `GenStep` is `Debug` so test failures stay diagnosable (and the public
+/// API doc-comment promises it via `#[derive(Debug)]`). Enforced via a
+/// compile-time `T: Debug` bound — Rust's `Debug` format string is not
+/// guaranteed stable across compiler versions (Copilot review #3272760827),
+/// so asserting on the formatted *contents* is brittle. The bound check
+/// catches the only regression that matters (the derive being removed).
+#[test]
+fn gen_step_is_debug() {
+  fn assert_debug<T: std::fmt::Debug>() {}
+  assert_debug::<GenStep>();
+
+  // Smoke-call the formatter on a real step too, so a `Debug` impl that
+  // panics at runtime (e.g. an over-clever manual impl that calls into
+  // a fallible path) is caught — but DON'T assert on the resulting
+  // string contents (format is rustc-version-dependent).
+  let model = MockModel::ramp(3);
+  let cfg = GenConfig {
+    max_tokens: 1,
+    eos: vec![],
+    ..GenConfig::default()
+  };
+  let step = generate_step(&model, &[1u32], cache(1), cfg)
+    .next()
+    .unwrap()
+    .unwrap();
+  let _ = format!("{step:?}");
+}
+
+/// `From<GenStep> for (u32, Array)` back-compat: a `GenStep` round-trips
+/// into the prior `(u32, Array)` tuple via `.into()`, so call sites that
+/// preferred tuple destructure (`let (tok, lp) = step.into();`) keep
+/// working unchanged.
+#[test]
+fn gen_step_into_tuple_roundtrip() {
+  let model = MockModel::ramp(5);
+  let cfg = GenConfig {
+    max_tokens: 1,
+    eos: vec![],
+    ..GenConfig::default()
+  };
+  let step = generate_step(&model, &[1u32], cache(1), cfg)
+    .next()
+    .unwrap()
+    .unwrap();
+  // Capture the typed fields before the move so we can cross-check.
+  let expected_token = step.token;
+  let expected_shape = step.logprobs.shape();
+  let (tok, mut lp): (u32, Array) = step.into();
+  assert_eq!(
+    tok, expected_token,
+    "tuple .0 == GenStep.token via From<GenStep>"
+  );
+  assert_eq!(
+    lp.shape(),
+    expected_shape,
+    "tuple .1 carries the same [V] logprobs Array (no clone, no shape change)"
+  );
+  // Sanity: the moved-out logprobs is still the normalized [V] vector
+  // (mlx-lm `logprobs.squeeze(0)`), summing to 1 in prob space.
+  let s: f32 = lp.to_vec::<f32>().unwrap().iter().map(|x| x.exp()).sum();
+  assert!((s - 1.0).abs() < 1e-4, "exp(logprobs) sums to 1, got {s}");
 }

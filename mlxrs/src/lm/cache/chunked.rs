@@ -667,4 +667,12 @@ impl KvCache for ChunkedKvCache {
       start_position: self.start_position,
     }))
   }
+
+  /// `"ChunkedKVCache"` — mlx-lm's `type(ChunkedKVCache).__name__`
+  /// (`cache.py:56`) / mlx-swift-lm
+  /// `case is ChunkedKVCache: return "ChunkedKVCache"`
+  /// (`KVCache.swift:1383`).
+  fn reference_class_name(&self) -> &'static str {
+    "ChunkedKVCache"
+  }
 }

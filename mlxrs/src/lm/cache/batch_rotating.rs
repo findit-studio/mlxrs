@@ -1033,6 +1033,17 @@ impl KvCache for BatchRotatingKvCache {
   fn as_batch_positioned(&self) -> Option<&dyn BatchPositionedKvCache> {
     Some(self)
   }
+
+  /// `"BatchRotatingKVCache"` — mlx-lm's
+  /// `type(BatchRotatingKVCache).__name__` (`cache.py:56`, written by
+  /// `save_prompt_cache`; the load side accepts both this canonical name and
+  /// the Rust alias `"BatchRotatingKvCache"`, see [`super::from_state`]).
+  /// mlx-swift-lm has no `BatchRotatingKVCache` arm in its `cacheClassName`
+  /// switch (`KVCache.swift:1381-1392`) — batch caches are mlx-lm-only — so
+  /// the kind label is taken from mlx-lm verbatim.
+  fn reference_class_name(&self) -> &'static str {
+    "BatchRotatingKVCache"
+  }
 }
 
 impl BatchPositionedKvCache for BatchRotatingKvCache {

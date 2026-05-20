@@ -189,4 +189,14 @@ impl KvCache for StandardKvCache {
       offset: self.offset,
     }))
   }
+
+  /// `"KVCache"` — mlx-lm's `type(KVCache).__name__` (`cache.py:56`) /
+  /// mlx-swift-lm `case is KVCacheSimple: return "KVCache"`
+  /// (`KVCache.swift:1388`). Matches the trait default; overridden here
+  /// explicitly so the kind label is co-located with the concrete cache
+  /// (no inheritance of the generic `"KVCache"` fallback from the trait
+  /// default — same pattern every other concrete cache follows).
+  fn reference_class_name(&self) -> &'static str {
+    "KVCache"
+  }
 }

@@ -672,4 +672,12 @@ impl KvCache for RotatingKvCache {
       keep: self.keep,
     }))
   }
+
+  /// `"RotatingKVCache"` — mlx-lm's `type(RotatingKVCache).__name__`
+  /// (`cache.py:56`) / mlx-swift-lm
+  /// `case is RotatingKVCache: return "RotatingKVCache"`
+  /// (`KVCache.swift:1386`).
+  fn reference_class_name(&self) -> &'static str {
+    "RotatingKVCache"
+  }
 }

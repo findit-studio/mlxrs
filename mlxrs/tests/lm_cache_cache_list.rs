@@ -202,12 +202,13 @@ fn from_state_roundtrip_rebuilds_children() {
 
 /// Regression (adversarial review, [high]): a `RotatingKvCache` whose
 /// `keep == 1` has `meta_state() == ["1", max_size, "0", "0"]`, which is
-/// numerically a well-formed `childCount=1` CacheList frame. The
-/// `className`-must-be-a-known-reference-name gate in `is_cache_list_meta`
-/// must prevent the outer `CacheList` from misnaming this child
-/// `"CacheList"` — it MUST be named `"RotatingKVCache"`, and the prompt
-/// cache MUST round-trip (a misname would make `from_state` recurse into
-/// the rotating integers and fail on an unknown child kind).
+/// numerically a well-formed `childCount=1` CacheList frame. With the
+/// `reference_class_name` trait method, `RotatingKvCache` directly
+/// returns `"RotatingKVCache"` so this misclassification is structurally
+/// impossible (no heuristic to mis-fire). The test pins both the trait
+/// dispatch AND the prompt-cache round-trip (a misname would make
+/// `from_state` recurse into the rotating integers and fail on an
+/// unknown child kind).
 #[test]
 fn keep_one_rotating_child_is_not_misidentified_as_cache_list() {
   // Fresh keep=1 rotating child -> meta_state ["1","8","0","0"] (the

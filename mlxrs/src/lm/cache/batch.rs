@@ -591,6 +591,16 @@ impl KvCache for BatchKvCache {
   fn as_batch_positioned(&self) -> Option<&dyn BatchPositionedKvCache> {
     Some(self)
   }
+
+  /// `"BatchKVCache"` — mlx-lm's `type(BatchKVCache).__name__`
+  /// (`cache.py:56`, written by `save_prompt_cache`; the load side accepts
+  /// both this canonical name and the Rust alias `"BatchKvCache"`, see
+  /// [`super::from_state`]). mlx-swift-lm has no `BatchKVCache` arm in its
+  /// `cacheClassName` switch (`KVCache.swift:1381-1392`) — batch caches are
+  /// mlx-lm-only — so the kind label is taken from mlx-lm verbatim.
+  fn reference_class_name(&self) -> &'static str {
+    "BatchKVCache"
+  }
 }
 
 impl BatchPositionedKvCache for BatchKvCache {

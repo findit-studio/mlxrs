@@ -1148,3 +1148,162 @@ fn from_state_underlength_state_within_triple_asymmetric_bias_less_clamps_to_min
     "values.scales re-trimmed 5 -> 3"
   );
 }
+
+/// `set_meta_state` accepts the mlx-swift-lm 4-string form `[step, offset,
+/// groupSize, bits]` (`MLXLMCommon/KVCache.swift` `QuantizedKVCache.metaState`
+/// setter ~line 952): `step` at index `[0]` is dropped on restore (it is a
+/// pure over-allocation tuning param with no observable effect on the
+/// cache's contract — same as swift, which restores only `offset` from
+/// index `[1]`); `offset`/`group_size`/`bits` are restored from indices
+/// `[1..=3]`. Resolves cross-runtime prompt-cache portability — a cache
+/// saved by mlx-swift-lm now loads into the Rust runtime.
+#[test]
+fn set_meta_state_accepts_swift_4string_form() {
+  // Start from a fresh cache with placeholder group_size/bits; the swift
+  // 4-string meta restores them to the saved values.
+  let mut c = QuantizedKvCacheImpl::new(0, 0);
+  c.set_meta_state(&[
+    "256".to_string(), // step (dropped, NOT stored)
+    "10".to_string(),  // offset
+    "64".to_string(),  // groupSize
+    "4".to_string(),   // bits
+  ])
+  .unwrap();
+  assert_eq!(c.offset(), 10, "offset restored from index [1]");
+  let q = c.as_quantized().unwrap();
+  assert_eq!(q.group_size(), 64, "group_size restored from index [2]");
+  assert_eq!(q.bits(), 4, "bits restored from index [3]");
+}
+
+/// Regression guard for the pre-existing mlx-lm 3-string form `[offset,
+/// group_size, bits]` (`cache.py:302-304`): extending the setter to also
+/// accept the 4-string swift form must not change the 3-string path's
+/// observable behavior.
+#[test]
+fn set_meta_state_accepts_mlx_lm_3string_form() {
+  let mut c = QuantizedKvCacheImpl::new(0, 0);
+  c.set_meta_state(&[
+    "10".to_string(), // offset
+    "64".to_string(), // group_size
+    "4".to_string(),  // bits
+  ])
+  .unwrap();
+  assert_eq!(c.offset(), 10);
+  let q = c.as_quantized().unwrap();
+  assert_eq!(q.group_size(), 64);
+  assert_eq!(q.bits(), 4);
+}
+
+/// Any length other than 3 (mlx-lm) or 4 (mlx-swift-lm) is a recoverable
+/// `Err` — both the 2-string and 5-string forms must be rejected with the
+/// combined message (faithful semantics: same no-partial-mutation
+/// invariant on bad arity).
+#[test]
+fn set_meta_state_rejects_2_or_5_string_form() {
+  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  // Too-short: 2 strings (was always rejected; combined message now lists
+  // both accepted arities).
+  let err2 = c
+    .set_meta_state(&["10".to_string(), "64".to_string()])
+    .unwrap_err()
+    .to_string();
+  assert!(
+    err2.contains("3 (mlx-lm form)") && err2.contains("4 (mlx-swift-lm form)"),
+    "2-string rejection message must list BOTH accepted forms; got: {err2}"
+  );
+  // Too-long: 5 strings.
+  let err5 = c
+    .set_meta_state(&[
+      "10".to_string(),
+      "20".to_string(),
+      "64".to_string(),
+      "4".to_string(),
+      "1".to_string(),
+    ])
+    .unwrap_err()
+    .to_string();
+  assert!(
+    err5.contains("3 (mlx-lm form)") && err5.contains("4 (mlx-swift-lm form)"),
+    "5-string rejection message must list BOTH accepted forms; got: {err5}"
+  );
+  // The cache is unchanged after both failed attempts (no partial mutation).
+  assert_eq!(c.offset(), 0);
+  let q = c.as_quantized().unwrap();
+  assert_eq!(q.group_size(), GROUP_SIZE);
+  assert_eq!(q.bits(), BITS);
+}
+
+/// `from_state("QuantizedKVCache", state, swift_meta)` end-to-end:
+/// reconstructing a cache from honest serialized triples + a 4-string
+/// swift-form meta produces a cache observably equivalent to the same
+/// reconstruction with the 3-string mlx-lm form (the swift `step` field
+/// is dropped on restore — exactly mlx-swift-lm's own setter at
+/// `KVCache.swift:952-961`).
+#[test]
+fn from_state_round_trip_via_swift_form() {
+  // Build an honest 3-step source and capture its serialized state.
+  let mut src = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut k = kv(3);
+  let mut v = kv(3);
+  src.update_quantized(&k, &v).unwrap();
+  let st: Vec<Array> = src
+    .state()
+    .unwrap()
+    .iter()
+    .map(|a| a.try_clone().unwrap())
+    .collect();
+  let st_a: Vec<Array> = st.iter().map(|a| a.try_clone().unwrap()).collect();
+  let st_b: Vec<Array> = st.iter().map(|a| a.try_clone().unwrap()).collect();
+
+  // mlx-lm 3-string meta: [offset, group_size, bits] = [3, 64, 8].
+  let lm_meta = src.meta_state();
+  assert_eq!(
+    lm_meta,
+    vec!["3".to_string(), "64".to_string(), "8".to_string()]
+  );
+
+  // mlx-swift-lm 4-string meta: [step, offset, groupSize, bits] =
+  // [256, 3, 64, 8]. `step` is the swift over-allocation tuning param —
+  // its value here does NOT affect the cache's observable contract.
+  let swift_meta = vec![
+    "256".to_string(),
+    "3".to_string(),
+    "64".to_string(),
+    "8".to_string(),
+  ];
+
+  let c_lm = from_state("QuantizedKVCache", st_a, &lm_meta).unwrap();
+  let c_sw = from_state("QuantizedKVCache", st_b, &swift_meta).unwrap();
+
+  // Same offset / quantization params.
+  assert_eq!(c_lm.offset(), c_sw.offset());
+  assert_eq!(c_lm.offset(), 3);
+  let q_lm = c_lm.as_quantized().unwrap();
+  let q_sw = c_sw.as_quantized().unwrap();
+  assert_eq!(q_lm.group_size(), q_sw.group_size());
+  assert_eq!(q_lm.bits(), q_sw.bits());
+  assert_eq!(q_lm.group_size(), GROUP_SIZE);
+  assert_eq!(q_lm.bits(), BITS);
+
+  // Byte-identical state shapes (same triples, same offset → same
+  // post-`enforce_offset_len_invariant` no-op).
+  let st_lm = c_lm.state().unwrap();
+  let st_sw = c_sw.state().unwrap();
+  assert_eq!(st_lm.len(), st_sw.len());
+  for (a, b) in st_lm.iter().zip(st_sw.iter()) {
+    assert_eq!(a.shape(), b.shape());
+  }
+
+  // Dequantized content is observably equivalent — both reconstructions
+  // recover the original keys/values within the 8-bit affine quant band.
+  let (qk_lm, qv_lm) = q_lm.quantized_state().unwrap().unwrap();
+  let (qk_sw, qv_sw) = q_sw.quantized_state().unwrap().unwrap();
+  let mut dk_lm = dequant(&qk_lm);
+  let mut dv_lm = dequant(&qv_lm);
+  let mut dk_sw = dequant(&qk_sw);
+  let mut dv_sw = dequant(&qv_sw);
+  assert_close(&mut dk_lm, &mut k);
+  assert_close(&mut dv_lm, &mut v);
+  assert_close(&mut dk_sw, &mut k);
+  assert_close(&mut dv_sw, &mut v);
+}
