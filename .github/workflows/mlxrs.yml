@@ -46,9 +46,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
+        # `rustfmt.toml` uses nightly-only directives (`imports_granularity = "Crate"`)
+        # — formatting on stable diverges from local nightly output. Pin nightly
+        # across the whole workflow so `cargo fmt --check` matches local results.
         run: |
-          rustup update stable
-          rustup default stable
+          rustup update nightly
+          rustup default nightly
           rustup component add rustfmt
       - name: cargo xtask-codegen --check (drift guard)
         run: cargo run -p xtask --features codegen -- codegen --check
@@ -79,9 +82,12 @@ jobs:
           submodules: recursive
 
       - name: Install Rust toolchain
+        # `rustfmt.toml` uses nightly-only directives (`imports_granularity = "Crate"`)
+        # — formatting on stable diverges from local nightly output. Pin nightly
+        # across the whole workflow so `cargo fmt --check` matches local results.
         run: |
-          rustup update stable
-          rustup default stable
+          rustup update nightly
+          rustup default nightly
           rustup component add rustfmt clippy
 
       # Cache key uses Cargo.toml + cmake inputs (NOT Cargo.lock — gitignored
