@@ -16,11 +16,10 @@
 //! `ScaledDotProductAttentionMaskMode`) enums. Concrete caches:
 //! [`StandardKvCache`], [`RotatingKvCache`], [`ChunkedKvCache`],
 //! [`QuantizedKvCacheImpl`], plus the prompt-cache/persist surface; the
-//! composite [`CacheList`]; and the batch caches [`BatchKvCache`] /
-//! [`BatchRotatingKvCache`] with the [`dynamic_roll`] helper (added by
-//! this PR). The remaining kinds (Arrays) land in a later PR and
-//! [`from_state`] is left
-//! extensible for them.
+//! composite [`CacheList`]; the batch caches [`BatchKvCache`] /
+//! [`BatchRotatingKvCache`] with the [`dynamic_roll`] helper; and the SSM
+//! slot cache [`ArraysCache`] (added by this PR). [`from_state`] is left
+//! extensible for future cache kinds.
 //!
 //! [`StandardKvCache`] is the `KVCache` port: mlx-lm's `step`-sized
 //! over-allocated buffer is a pure allocation optimization with **no**
@@ -48,6 +47,7 @@ use crate::{
   error::{Error, Result},
 };
 
+pub mod arrays;
 pub mod batch;
 pub mod batch_rotating;
 mod cache_list;
@@ -60,6 +60,7 @@ mod rotating;
 mod standard;
 mod util;
 
+pub use arrays::*;
 pub use batch::*;
 pub use batch_rotating::*;
 pub use cache_list::CacheList;
@@ -335,13 +336,16 @@ pub trait BatchPositionedKvCache: KvCache {
 /// - → [`CacheList`]: `"CacheList"` (the composite — rebuilds each child
 ///   recursively through this same dispatcher)
 /// - → [`BatchKvCache`]: `"BatchKVCache"` | `"BatchKvCache"` (Rust alias)
-///   — added by this PR
 /// - → [`BatchRotatingKvCache`]: `"BatchRotatingKVCache"` |
-///   `"BatchRotatingKvCache"` (Rust alias) — added by this PR
+///   `"BatchRotatingKvCache"` (Rust alias)
+/// - → [`ArraysCache`]: `"ArraysCache"` (the generic SSM slot cache) |
+///   `"MambaCache"` (mlx-swift-lm's `class MambaCache: ArraysCache`,
+///   `KVCache.swift:1229` — a 2-slot `ArraysCache` adding **no** extra
+///   state/metadata; swift saves this kind, `KVCache.swift:1384`, and
+///   reconstructs it identically, `KVCache.swift:1531`) — added by this PR
 ///
-/// The other cache kinds (`"ArraysCache"`) are added by a later PR, so
-/// an unrecognized `kind` is a recoverable [`Error::Backend`] and the
-/// match is left extensible for those arms.
+/// An unrecognized `kind` is a recoverable [`Error::Backend`] and the
+/// match is left extensible for future cache kinds.
 pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<dyn KvCache>> {
   match kind {
     // mlx-lm `KVCache` / its documented twin `ConcatenateKVCache` /
@@ -585,6 +589,22 @@ pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<
       }
       Ok(Box::new(c))
     }
+    // mlx-lm / mlx-swift-lm `ArraysCache` (the generic SSM slot cache).
+    // `_BaseCache.from_state` rebuilds via `__new__` + `state`/`meta_state`
+    // setters (cache.py:168-174). `"MambaCache"` is mlx-swift-lm's
+    // `class MambaCache: ArraysCache` (`KVCache.swift:1229`) — it adds **no**
+    // extra state or metadata, only fixing `size = 2`; swift *saves* the kind
+    // `"MambaCache"` (`KVCache.swift:1384`) and its own load arm rebuilds it
+    // via the identical `restoreFromMetaState` (`KVCache.swift:1531-1533`,
+    // == `ArraysCache(size: 2)`). So a `"MambaCache"`-kind prompt cache holds
+    // pure `ArraysCache` slot state and is faithfully reconstructed by the
+    // exact same path (the persisted slot-aware meta already encodes the slot
+    // count — no size special-casing), exactly analogous to the
+    // `"KVCacheSimple"`/`"ConcatenateKVCache"` → [`StandardKvCache`] aliases
+    // above. This is purely a kind-string alias in the dispatch: no separate
+    // type and no Mamba architecture (the no-per-model-arch-porting rule is
+    // preserved — see `arrays::ArraysCache`'s `# MambaCache` note).
+    "ArraysCache" | "MambaCache" => arrays::from_state_arrays(state, meta),
     other => Err(Error::Backend {
       message: format!("unknown cache kind: {other}"),
     }),
