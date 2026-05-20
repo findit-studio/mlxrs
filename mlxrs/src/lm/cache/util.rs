@@ -58,6 +58,99 @@ pub(crate) fn head_dim(name: &str, a: &Array) -> Result<usize> {
   Ok(shape[KV_NDIM - 1])
 }
 
+/// Prepare a write-emulation RHS tensor `new` for splicing over `[a, end)` of
+/// the target KV buffer `buf`: broadcast `new` to the slice shape `[buf[0],
+/// buf[1], end - a, buf[3]]` (the same shape mlx's `slice_update` builds for
+/// `src[..., a:end, :] = new`, `ops.cpp:843`). This mirrors the implicit
+/// broadcast + shape validation that mlx-lm's `self.<buf>[..., a:a+s, :] =
+/// new` slice-assignment performs at the mlx level:
+///
+/// - a size-`d` `new` axis matches a size-`d` buffer axis (identity);
+/// - a size-`1` `new` axis broadcasts up to a size-`d` buffer axis (size-1
+///   broadcast — mlx `broadcast_to` semantics, called by `slice_update`);
+/// - any other non-seq axis mismatch is non-broadcastable and raises
+///   (mlx `broadcast_to` raises on a non-broadcastable dim mismatch).
+///
+/// `KV_NDIM-2` is the sequence axis: the seq-axis of `new` must equal
+/// `end - a` (the slice window length) — mlx's `broadcast_to(update_shape,
+/// upd_shape)` raises if `update_shape[seq] != upd_shape[seq]` and either
+/// side isn't 1. Our `set_seq` always splices exactly `S` rows so the
+/// caller's `s == new.shape[KV_NDIM-2]` invariant holds for every faithful
+/// trace; we still check it here so a hostile/corrupt input is a recoverable
+/// `Err`, not a downstream concat panic.
+///
+/// In mlxrs's `set_seq` write-emulation (which concatenates `[head, new,
+/// tail]` via [`concat_parts`]), this is required at the entry — otherwise a
+/// full-window write (empty head + empty tail) shortcuts to returning `new`
+/// after only a rank check, BYPASSING both the non-seq-axes broadcast
+/// validation AND the broadcast itself (e.g. a `[1, .., .., ..]` `new`
+/// would silently SHRINK a `[2, .., .., ..]` `buf`'s batch axis on the
+/// full-window fast path, while mlx-lm broadcasts the size-1 axis and keeps
+/// the buffer's shape). Routing every full/partial window through this
+/// helper keeps non-broadcastable mismatches as recoverable `Err` AND
+/// broadcasts a size-1 RHS up exactly as mlx does — byte-identical to mlx-lm
+/// for every faithful input.
+///
+/// `name` identifies the target buffer (`"keys"` / `"values"`) for the
+/// per-target error message. This is a SINGLE-tensor check (`new` vs target
+/// `buf`), NOT the fenced K/V cross-validation (keys vs values).
+pub(crate) fn broadcast_write_rhs(
+  name: &str,
+  buf: &Array,
+  a: usize,
+  end: usize,
+  new: &Array,
+) -> Result<Array> {
+  let bs = buf.shape();
+  let ns = new.shape();
+  if bs.len() != KV_NDIM {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "KV cache expects 4-D {name} [B, n_kv_heads, S, head_dim], got shape {bs:?}"
+      ),
+    });
+  }
+  if ns.len() != KV_NDIM {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "KV cache expects 4-D {name} write RHS [B, n_kv_heads, S, head_dim], got shape {ns:?}"
+      ),
+    });
+  }
+  // Slice window length on the sequence axis — the broadcast target's seq
+  // dim (mlx `slice_update`'s `upd_shape[seq]` is exactly `stop - start`).
+  let win = end.checked_sub(a).ok_or_else(|| Error::ShapeMismatch {
+    message: format!("set_seq: {name} write end ({end}) < start ({a})"),
+  })?;
+  // Per-axis: identity (`d == d`) OR size-1-broadcast (`new == 1`). mlx
+  // `broadcast_to` (called by `slice_update`, `ops.cpp:843`) accepts a size-1
+  // `new` axis broadcast up to the buffer axis; any other mismatch raises.
+  // The seq axis (`KV_NDIM-2`) is also validated — `new[seq]` must equal
+  // `win` (or 1, which mlx broadcasts to `win`).
+  for axis in 0..KV_NDIM {
+    let target = if axis == KV_NDIM - 2 { win } else { bs[axis] };
+    let got = ns[axis];
+    if got != target && got != 1 {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "set_seq: {name} write RHS shape {ns:?} non-broadcastable on axis {axis} \
+           (got {got}, target {target} — mlx-lm slice-assignment raises on \
+           non-broadcastable non-seq axes; seq-axis target is the slice window length)"
+        ),
+      });
+    }
+  }
+  // Build the broadcast target shape `[buf[0], buf[1], win, buf[3]]` and
+  // broadcast `new` to it (mlx `slice_update`'s `broadcast_to(update,
+  // upd_shape)`, `ops.cpp:843`). For a fully matching `new` this is the
+  // identity broadcast (the same shape — mlx's `broadcast_to` no-ops); for a
+  // size-1-broadcast `new` it expands the size-1 axes to match the buffer.
+  let target_shape: Vec<usize> = (0..KV_NDIM)
+    .map(|axis| if axis == KV_NDIM - 2 { win } else { bs[axis] })
+    .collect();
+  ops::shape::broadcast_to(new, &target_shape.as_slice())
+}
+
 /// Slice the sequence axis (`-2`) of a 4-D KV tensor to `[start, end)`,
 /// keeping every other axis full. mlx-lm's `v[..., start:end, :]`.
 pub(crate) fn slice_seq(a: &Array, start: usize, end: usize) -> Result<Array> {

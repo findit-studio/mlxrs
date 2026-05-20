@@ -721,3 +721,183 @@ fn chunked_update_out_of_bounds_values_write_is_err_not_silent_corrupt() {
   assert_eq!(pk.to_vec::<f32>().unwrap(), pre_k);
   assert_eq!(pv.to_vec::<f32>().unwrap(), pre_v);
 }
+
+/// Regression (closes #78 P1 iter5 — structural class-kill at `set_seq`'s
+/// boundary): a full-window `set_seq` write (head AND tail empty) must NOT
+/// shortcut to silently returning `new`, mutating the cached buffer's
+/// non-seq axes (batch / n_kv_heads / head_dim). mlx-lm's
+/// `self.<buf>[..., a:a+s, :] = new` slice-assignment implicitly validates
+/// `new` against the buffer on every non-seq axis (a non-broadcastable
+/// mismatch raises at the mlx level); our write-emulation goes through
+/// `concat_parts([head, new, tail])`, whose `[]` / `[one]` fast path skips
+/// the non-seq-axes shape compatibility check that mlx's concat would
+/// otherwise enforce.
+///
+/// Deterministic trigger via the public API: `set_state` a `[1,1,1,1]`
+/// buffer (`offset = 1`), `trim(1)` so `offset` becomes `0` while the
+/// buffer remains length `1`. The next `update` with a `[B', 1, 1, 1]`
+/// key/value tensor (`B' != 1`) computes `prev = 0 - 0 = 0`, no realloc
+/// (`prev+S = 1 <= buf_len = 1`), and hits a FULL-window `set_seq("keys",
+/// buf=[1,1,1,1], a=0, s=1, new=[B',1,1,1])` → before the fix, `concat_parts`
+/// would short-circuit (empty head + empty tail filtered → `[one]` arm
+/// returning `new.try_clone()`) and silently mutate the cached buffer's
+/// batch axis. The fix validates non-seq axes at the `set_seq` boundary
+/// via `util::broadcast_write_rhs`, so EVERY window — partial or
+/// full — surfaces a recoverable `Err(ShapeMismatch)` on a mismatched
+/// non-seq axis. This is a single-tensor check (`new` vs target `buf`),
+/// NOT the fenced K/V cross-validation (keys vs values).
+#[test]
+fn chunked_set_seq_full_window_rejects_mismatched_batch_dim() {
+  // Mismatched-batch single-token KV (`[2,1,1,1]`); seeded buffer is
+  // `[1,1,1,1]`.
+  let bad_kv2 = Array::from_slice::<f32>(&[9.0, 9.5], &(2usize, 1, 1, 1)).unwrap();
+
+  let mut c = ChunkedKvCache::new(None);
+  // Seed: set_state with [1,1,1,1] sets offset = keys.shape[2] = 1.
+  let seed = kv(&[7.0]);
+  c.set_state(vec![seed.try_clone().unwrap(), seed.try_clone().unwrap()])
+    .unwrap();
+  assert_eq!(c.offset(), 1);
+  // Trim 1 → offset 0; start_position stays 0; buffer still [1,1,1,1].
+  assert_eq!(c.trim(1).unwrap(), 1);
+  assert_eq!(c.offset(), 0);
+  assert_eq!(c.meta_state(), vec!["None", "0"]);
+  // Snapshot the pre-update buffer.
+  let pre = c.state().unwrap();
+  // offset(0) != keys.shape[2](1) -> keys[..., :0, :] -> empty.
+  // We don't need pre's exact value for this regression — only that the
+  // cache buffer is NOT silently rewritten by the failed update below.
+
+  // update: prev = offset(0) - start_position(0) = 0; prev+S = 1 <=
+  // buf_len 1 -> !need_alloc. set_seq("keys", buf=[1,1,1,1], 0, 1,
+  // new=[2,1,1,1]): full-window (head & tail both empty). BEFORE FIX:
+  // silently returned `new` (batch-axis silently mutated). WITH FIX:
+  // Err(ShapeMismatch) at the broadcast_write_rhs boundary.
+  let r = c.update(&bad_kv2, &bad_kv2);
+  assert!(
+    matches!(&r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    "full-window set_seq must reject batch-axis mismatch on the public update API \
+     (closes #78 P1 iter5), got {r:?}"
+  );
+  // Cache must be unchanged (still single-batch). No silent mutation of
+  // the buffer batch dim, no advanced offset, no split-brain.
+  assert_eq!(c.offset(), 0, "offset must not advance on a failed update");
+  let post = c.state().unwrap();
+  assert_eq!(post.len(), pre.len());
+  // Direct buffer batch-shape check via a follow-on operation: a well-formed
+  // [1,1,1,1] update must succeed, demonstrating the buffer's batch axis was
+  // not silently mutated to 2 (which would now reject the well-formed update).
+  let ok = kv(&[42.0]);
+  let (mut ok_k, _) = c.update(&ok, &ok).unwrap();
+  // prev = 0; update at [0,1) of the [1,1,1,1] buffer; new_offset = 1; end = 1;
+  // returns keys[..., :1, :] = [42.0].
+  assert_eq!(c.offset(), 1);
+  assert_eq!(ok_k.shape(), vec![1, 1, 1, 1]);
+  assert_eq!(ok_k.to_vec::<f32>().unwrap(), vec![42.0]);
+}
+
+/// Companion regression for `chunked_set_seq_full_window_rejects_mismatched_batch_dim`:
+/// the same full-window `set_seq` boundary must reject a mismatched
+/// `n_kv_heads` axis (axis 1) and a mismatched `head_dim` axis (axis 3).
+/// All three non-seq axes are guarded by the SAME structural helper at the
+/// boundary (one helper, three axes — class-kill, not per-axis whack-a-mole).
+#[test]
+fn chunked_set_seq_full_window_rejects_mismatched_heads_and_head_dim() {
+  // Mismatched n_kv_heads (axis 1) and head_dim (axis 3) single-token KV.
+  // Seeded buffer is [1, 1, 1, 1] so EITHER mismatch is non-broadcastable.
+  let bad_kv_heads = Array::from_slice::<f32>(&[9.0, 9.5, 9.7], &(1usize, 3, 1, 1)).unwrap();
+  let bad_kv_hd = Array::from_slice::<f32>(&[9.0, 9.5], &(1usize, 1, 1, 2)).unwrap();
+
+  // --- mismatched n_kv_heads (axis 1) ---------------------------------
+  let mut c1 = ChunkedKvCache::new(None);
+  let seed = kv(&[7.0]);
+  c1.set_state(vec![seed.try_clone().unwrap(), seed.try_clone().unwrap()])
+    .unwrap();
+  c1.trim(1).unwrap();
+  let r1 = c1.update(&bad_kv_heads, &bad_kv_heads);
+  assert!(
+    matches!(&r1, Err(mlxrs::Error::ShapeMismatch { .. })),
+    "full-window set_seq must reject n_kv_heads (axis 1) mismatch, got {r1:?}"
+  );
+  // Buffer's n_kv_heads still 1: a well-formed [1,1,1,1] update succeeds.
+  let ok = kv(&[8.0]);
+  c1.update(&ok, &ok).unwrap();
+  assert_eq!(c1.offset(), 1);
+
+  // --- mismatched head_dim (axis 3) -----------------------------------
+  let mut c2 = ChunkedKvCache::new(None);
+  c2.set_state(vec![seed.try_clone().unwrap(), seed.try_clone().unwrap()])
+    .unwrap();
+  c2.trim(1).unwrap();
+  let r2 = c2.update(&bad_kv_hd, &bad_kv_hd);
+  assert!(
+    matches!(&r2, Err(mlxrs::Error::ShapeMismatch { .. })),
+    "full-window set_seq must reject head_dim (axis 3) mismatch, got {r2:?}"
+  );
+  // Buffer's head_dim still 1: a well-formed [1,1,1,1] update succeeds.
+  c2.update(&ok, &ok).unwrap();
+  assert_eq!(c2.offset(), 1);
+}
+
+/// Positive companion to the chunked rejection tests above: mlx-lm's
+/// `self.<buf>[..., a:a+s, :] = new` slice-assignment routes through
+/// `slice_update`, which broadcasts the RHS to the slice shape (`mlx/
+/// ops.cpp:843` — `broadcast_to(update, upd_shape)`). A size-1 `new` axis
+/// MUST broadcast up to a size-`d` buffer axis (`d > 1`) — mlx-lm accepts
+/// this and updates every broadcast row. Our `set_seq` must mirror that
+/// faithfully (NOT over-reject as a "non-seq axis mismatch"). Trigger via
+/// the public API: restore a `[2,1,1,1]` chunked buffer (`offset = 1`),
+/// `trim(1)` so `offset` becomes `0` while the buffer stays `[2,1,1,1]`.
+/// The next `update` with a `[1,1,1,1]` key/value (size-1 batch RHS)
+/// triggers a full-window `set_seq("keys", buf=[2,1,1,1], 0, 1,
+/// new=[1,1,1,1])` — `broadcast_write_rhs` builds slice shape `[2,1,1,1]`
+/// and broadcasts `new` up, preserving the buffer's batch dim 2 (NOT
+/// shrinking to 1).
+///
+/// Faithful to mlx-lm: mlx's `slice_update` returns the broadcast view
+/// directly when the entire src is the slice (`ops.cpp:847`), so the
+/// resulting buffer is a stride-0 broadcast view on the batch axis. That
+/// is byte-identical to what mlx-lm itself would produce; subsequent ops
+/// (matmul, concat, slice) all support strided/broadcast views via mlx's
+/// lazy primitives. We assert shape (the load-bearing claim — the buffer's
+/// batch axis was NOT silently shrunk to 1), and that the cache stays
+/// usable for a follow-on update; value-level readback via `to_vec` would
+/// require materializing the broadcast view (M2-deferred `.contiguous()`)
+/// and is not the load-bearing assertion here.
+#[test]
+fn chunked_set_seq_full_window_broadcasts_size_one_rhs() {
+  // 2-batch [2,1,1,1] seed (values [10, 20]: per-batch distinguishable).
+  let seed2 = Array::from_slice::<f32>(&[10.0, 20.0], &(2usize, 1, 1, 1)).unwrap();
+  // Size-1 batch RHS [1,1,1,1] — broadcasts to [2,1,1,1] (both batches
+  // see the same value, the faithful mlx-lm broadcast outcome).
+  let rhs1 = kv(&[99.0]); // shape [1,1,1,1]
+
+  let mut c = ChunkedKvCache::new(None);
+  c.set_state(vec![seed2.try_clone().unwrap(), seed2.try_clone().unwrap()])
+    .unwrap();
+  assert_eq!(c.offset(), 1); // offset = keys.shape[2] = 1.
+  c.trim(1).unwrap();
+  assert_eq!(c.offset(), 0);
+
+  // Full-window set_seq with size-1 batch RHS. Mlx-lm broadcasts; we
+  // mirror; the result keeps the buffer's batch dim 2 (NOT shrunk to 1
+  // by the prior `[one]`-arm shortcut which would have silently returned
+  // the [1,...] RHS).
+  let (k, v) = c.update(&rhs1, &rhs1).unwrap();
+  assert_eq!(c.offset(), 1);
+  assert_eq!(
+    k.shape(),
+    vec![2, 1, 1, 1],
+    "size-1 batch RHS must broadcast to PRESERVE buffer batch dim 2 \
+     (NOT silently shrink to [1, 1, 1, 1])"
+  );
+  assert_eq!(v.shape(), vec![2, 1, 1, 1]);
+
+  // The cache stays a 2-batch cache for subsequent updates — a follow-on
+  // [2,1,1,1] update succeeds (concat on a non-broadcast batch axis would
+  // fail if the buffer had been silently shrunk to [1,...] by the bug).
+  let rhs2 = Array::from_slice::<f32>(&[7.0, 8.0], &(2usize, 1, 1, 1)).unwrap();
+  let (k2, _) = c.update(&rhs2, &rhs2).unwrap();
+  assert_eq!(c.offset(), 2);
+  assert_eq!(k2.shape(), vec![2, 1, 2, 1]);
+}

@@ -211,9 +211,27 @@ impl ChunkedKvCache {
         ),
       });
     }
+    // Structural class-kill (closes #78 P1 iter5): mlx-lm's
+    // `self.<buf>[..., a:a+s, :] = new` slice-assignment routes through
+    // `slice_update`, which broadcasts the RHS to the slice shape (`mlx/
+    // ops.cpp:843` — `broadcast_to(update, upd_shape)`). Our write-emulation
+    // (`concat_parts([head, new, tail])`) has a full-window shortcut that
+    // returns `new` after only a rank check, bypassing both the
+    // non-broadcastable-axes validation AND the size-1 broadcast itself
+    // (e.g. a `[2, .., .., ..]` buffer with a `[1, .., .., ..]` `new` is
+    // valid in mlx-lm — broadcast up to keep the buffer shape — but the
+    // shortcut would silently SHRINK the buffer's batch axis). Route every
+    // `set_seq` window — partial or full — through `broadcast_write_rhs`,
+    // which builds the slice shape `[buf[0], buf[1], end-a, buf[3]]` and
+    // broadcasts `new` to it exactly as mlx's `slice_update` does (single
+    // helper, single tensor — NOT the fenced K/V cross-check). Identity
+    // broadcasts are no-ops; size-1 broadcasts expand; non-broadcastable
+    // axes are a recoverable `Err(ShapeMismatch)`. Faithful to mlx-lm for
+    // every input shape.
+    let new = super::util::broadcast_write_rhs(name, buf, a, end, new)?;
     let head = seq_slice(buf, 0, a)?;
     let tail = seq_slice(buf, end, l)?;
-    super::util::concat_parts(&[&head, new, &tail])
+    super::util::concat_parts(&[&head, &new, &tail])
   }
 }
 

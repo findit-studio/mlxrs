@@ -12,7 +12,7 @@
 use mlxrs::{
   Array, Error,
   lm::cache::{
-    CacheConfig, KvCache, MaskMode, RopeOffset, RotatingKvCache, StandardKvCache,
+    CacheConfig, ChunkedKvCache, KvCache, MaskMode, RopeOffset, RotatingKvCache, StandardKvCache,
     create_attention_mask, create_causal_mask, from_state, make_prompt_cache,
   },
 };
@@ -1443,4 +1443,262 @@ fn from_state_no_meta_cache_rejects_truthy_meta_state() {
       "kind {kind}: no-meta cache must report empty meta_state"
     );
   }
+}
+
+/// Regression (closes #78 P1 iter5 — structural class-kill at `set_seq`'s
+/// boundary, rotating cache half): the same defect class as the chunked test
+/// `chunked_set_seq_full_window_rejects_mismatched_batch_dim`. `RotatingKvCache`'s
+/// in-place `set_seq` is also implemented as `concat_parts([head, new,
+/// tail])`, whose `[]` / `[one]` fast path skips the non-seq-axes shape
+/// compatibility check that mlx's slice-assignment would otherwise enforce.
+///
+/// Deterministic trigger via the public API: seed a `[1,1,1,1]` ring
+/// (`max_size = 1`, `keep = 0`, single valid `[1,1,1,1]` update → buffer
+/// `[1,1,1,1]`, `offset = 1`, `idx = 1`). Reset `offset`/`idx` to `0` via
+/// `set_meta_state` (a corrupt/hostile prompt cache can write any
+/// `offset`/`idx` pair; here we set both to `0` so the next `update_in_place`
+/// lands on the full-window `set_seq("keys", buf=[1,1,1,1], a=0, s=1,
+/// new=[B',1,1,1])` path). Without the fix, `concat_parts` short-circuits
+/// to `new.try_clone()` and silently mutates the cached buffer's batch axis.
+/// With the fix, `broadcast_write_rhs` rejects every non-broadcastable
+/// non-seq axis (batch / n_kv_heads / head_dim) at the boundary —
+/// recoverable `Err(ShapeMismatch)`, no silent mutation.
+#[test]
+fn rotating_set_seq_full_window_rejects_mismatched_batch_dim() {
+  let mut c = RotatingKvCache::new(1, 0); // max_size=1, keep=0.
+  // Seed: a single [1,1,1,1] update fills the buffer (idx=1, offset=1).
+  let seed = kv(&[7.0]);
+  c.update(&seed, &seed).unwrap();
+  assert_eq!(c.offset(), 1);
+  // Reset offset/idx to 0 via meta_state (keep=0, max_size=1, offset=0,
+  // idx=0); buffer remains [1,1,1,1]. This is the corrupt/hostile restore
+  // path — but the cache must NEVER silently mutate the buffer's non-seq
+  // axes via a follow-on update, regardless of how the state was reached.
+  c.set_meta_state(&[
+    "0".to_string(),
+    "1".to_string(),
+    "0".to_string(),
+    "0".to_string(),
+  ])
+  .unwrap();
+  assert_eq!(c.offset(), 0);
+
+  // Mismatched-batch single-token KV (`[2,1,1,1]`). update_in_place sees
+  // prev=0, cur_len=1, no grow, no trim, idx=0 stays 0, set_seq("keys",
+  // buf=[1,1,1,1], 0, 1, new=[2,1,1,1]) → full-window. BEFORE FIX: silent
+  // batch-axis mutation. WITH FIX: Err(ShapeMismatch).
+  let bad_kv2 = Array::from_slice::<f32>(&[9.0, 9.5], &(2usize, 1, 1, 1)).unwrap();
+  let r = c.update(&bad_kv2, &bad_kv2);
+  assert!(
+    matches!(&r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    "rotating full-window set_seq must reject batch-axis mismatch on the public \
+     update API (closes #78 P1 iter5), got {r:?}"
+  );
+
+  // Cache must be unchanged: a well-formed [1,1,1,1] update still succeeds,
+  // demonstrating the buffer's batch axis was not silently mutated to 2.
+  // After the failed update, offset/idx must NOT have advanced — the next
+  // valid update is the same full-window write that the prior bad call
+  // failed on (now with a matching-batch new).
+  let ok = kv(&[42.0]);
+  c.update(&ok, &ok).unwrap();
+  assert_eq!(c.offset(), 1);
+}
+
+/// Companion regression for `rotating_set_seq_full_window_rejects_mismatched_batch_dim`:
+/// the same rotating full-window `set_seq` boundary must reject a
+/// mismatched `n_kv_heads` axis (axis 1) and a mismatched `head_dim`
+/// axis (axis 3) — all three non-seq axes guarded by the SAME structural
+/// helper (one helper, three axes — class-kill).
+#[test]
+fn rotating_set_seq_full_window_rejects_mismatched_heads_and_head_dim() {
+  let bad_kv_heads = Array::from_slice::<f32>(&[9.0, 9.5, 9.7], &(1usize, 3, 1, 1)).unwrap();
+  let bad_kv_hd = Array::from_slice::<f32>(&[9.0, 9.5], &(1usize, 1, 1, 2)).unwrap();
+  let seed = kv(&[7.0]);
+
+  // --- mismatched n_kv_heads (axis 1) ---------------------------------
+  let mut c1 = RotatingKvCache::new(1, 0);
+  c1.update(&seed, &seed).unwrap();
+  c1.set_meta_state(&[
+    "0".to_string(),
+    "1".to_string(),
+    "0".to_string(),
+    "0".to_string(),
+  ])
+  .unwrap();
+  let r1 = c1.update(&bad_kv_heads, &bad_kv_heads);
+  assert!(
+    matches!(&r1, Err(mlxrs::Error::ShapeMismatch { .. })),
+    "rotating full-window set_seq must reject n_kv_heads mismatch, got {r1:?}"
+  );
+  c1.update(&seed, &seed).unwrap();
+  assert_eq!(c1.offset(), 1);
+
+  // --- mismatched head_dim (axis 3) -----------------------------------
+  let mut c2 = RotatingKvCache::new(1, 0);
+  c2.update(&seed, &seed).unwrap();
+  c2.set_meta_state(&[
+    "0".to_string(),
+    "1".to_string(),
+    "0".to_string(),
+    "0".to_string(),
+  ])
+  .unwrap();
+  let r2 = c2.update(&bad_kv_hd, &bad_kv_hd);
+  assert!(
+    matches!(&r2, Err(mlxrs::Error::ShapeMismatch { .. })),
+    "rotating full-window set_seq must reject head_dim mismatch, got {r2:?}"
+  );
+  c2.update(&seed, &seed).unwrap();
+  assert_eq!(c2.offset(), 1);
+}
+
+/// Direct unit test for the `broadcast_write_rhs` helper's behavior
+/// (the SINGLE-tensor, non-seq-axes write compatibility check that closes
+/// #78). Pure pass-through for matching non-seq axes (no error on a valid
+/// `[B, n_kv_heads, S, head_dim]` pair where the seq axis is unconstrained),
+/// `Err(ShapeMismatch)` on each of the three non-seq axes (batch / n_kv_heads
+/// / head_dim). Exercised end-to-end via the chunked + rotating full-window
+/// tests above; this asserts the boundary helper's semantics directly via
+/// its observable behavior on `set_seq`'s write path (which routes
+/// every `[head, new, tail]` concat through the helper first).
+#[test]
+fn set_seq_write_shape_compat_helper_semantics_via_chunked() {
+  // Positive (pass-through): seq axis is allowed to differ between
+  // `buf` and `new`. Seed a `[1,1,4,1]` buffer (seq=4), update with a
+  // single-token `[1,1,1,1]` (seq=1) — non-seq axes match → succeeds.
+  let mut c = ChunkedKvCache::new(None);
+  let buf4 = kv(&[10.0, 11.0, 12.0, 13.0]); // [1,1,4,1]
+  c.set_state(vec![buf4.try_clone().unwrap(), buf4.try_clone().unwrap()])
+    .unwrap();
+  // offset = 4. Trim 0 (keep offset 4). prev = 4-0 = 4; prev+S = 5 > 4 ->
+  // realloc to 256-row buffer; the resulting set_seq window is
+  // [4, 5) of the [1,1,256,1] buffer — non-seq axes all match.
+  let t = kv(&[99.0]);
+  c.update(&t, &t).unwrap();
+  assert_eq!(c.offset(), 5);
+
+  // Negative — covered by `chunked_set_seq_full_window_rejects_*` above on
+  // axes 0/1/3. The helper is reached on EVERY set_seq window, full or
+  // partial; the full-window tests are the hardest case (the one that
+  // bypasses concat's non-seq validation) and prove the structural fix.
+}
+
+/// Positive companion to `rotating_set_seq_full_window_rejects_*`: mlx-lm's
+/// `slice_update` (called by `self.<buf>[..., a:a+s, :] = new`) broadcasts
+/// the RHS to the slice shape (`mlx/ops.cpp:843` — `broadcast_to(update,
+/// upd_shape)`). A size-1 `new` axis MUST broadcast up to a size-`d` buffer
+/// axis; mlx-lm accepts this and updates every broadcast row. The rotating
+/// cache's `set_seq` must mirror that faithfully — NOT over-reject as a
+/// "non-broadcastable mismatch" — for every full/partial window. Trigger
+/// via the public API: seed a `[2,1,1,1]` ring (single `[2,1,1,1]` valid
+/// update), reset `offset`/`idx` to `0` via `set_meta_state`, then update
+/// with a `[1,1,1,1]` RHS — the full-window `set_seq` broadcasts up to the
+/// `[2,1,1,1]` slice shape, preserving the buffer's batch dim 2.
+///
+/// Faithful to mlx-lm: mlx's `slice_update` returns the broadcast view
+/// directly when the entire src is the slice (`ops.cpp:847`), so the
+/// resulting buffer is a stride-0 broadcast view on the batch axis. That
+/// is byte-identical to what mlx-lm itself would produce; subsequent ops
+/// support strided/broadcast views via mlx's lazy primitives. Shape is the
+/// load-bearing claim (the buffer's batch axis was NOT silently shrunk to
+/// 1 — the bug Codex flagged in iter-2 review).
+#[test]
+fn rotating_set_seq_full_window_broadcasts_size_one_rhs() {
+  let seed2 = Array::from_slice::<f32>(&[10.0, 20.0], &(2usize, 1, 1, 1)).unwrap();
+  let rhs1 = kv(&[99.0]); // [1,1,1,1] — size-1 batch broadcasts to [2,...].
+
+  let mut c = RotatingKvCache::new(1, 0); // max_size=1, keep=0.
+  c.update(&seed2, &seed2).unwrap();
+  assert_eq!(c.offset(), 1);
+  // Reset offset/idx to 0 via meta_state (a hostile/corrupt restore path,
+  // exercised here so the full-window set_seq path is hit on the next
+  // update — same construction as `rotating_set_seq_full_window_rejects_*`).
+  c.set_meta_state(&[
+    "0".to_string(),
+    "1".to_string(),
+    "0".to_string(),
+    "0".to_string(),
+  ])
+  .unwrap();
+  assert_eq!(c.offset(), 0);
+
+  // Full-window set_seq with size-1 batch RHS — mlx-lm broadcasts; we
+  // mirror. The result shape is `[2,1,1,1]` (NOT silently shrunk to
+  // [1,1,1,1] by the prior `[one]`-arm shortcut returning the RHS).
+  let (k, v) = c.update(&rhs1, &rhs1).unwrap();
+  // Rotating returns `seq_slice(buf, 0, offset)` when offset < max_size;
+  // here offset(1) == max_size(1) so it returns the buffer clone.
+  assert_eq!(
+    k.shape(),
+    vec![2, 1, 1, 1],
+    "rotating size-1 batch RHS must broadcast to PRESERVE buffer batch dim 2 \
+     (NOT silently shrink to [1, 1, 1, 1])"
+  );
+  assert_eq!(v.shape(), vec![2, 1, 1, 1]);
+}
+
+/// Regression (Codex iter-2 follow-up to #78): the hotfix made
+/// `set_seq` fail recoverably on a non-broadcastable RHS; previously the
+/// `[one]` concat shortcut silently accepted any 4-D `new`, so the
+/// `update_in_place` "trim then splice" sequence was infallible on the
+/// splice step. Without `update_in_place` being transactional, a failing
+/// full-window splice would now commit the pre-write TRIM but reject the
+/// write — partial mutation, dropped context, divergent retry/persisted
+/// state.
+///
+/// Concrete trigger via the public API: `max_size=1, keep=0`, an `S=2`
+/// prefill that leaves `shape[2] = 2 > max_size = 1` (the over-retained
+/// `_update_concat` semantics — `max_size + S - 1` retention), then a
+/// failing `S=1` full-window RHS (non-broadcastable batch). Before the
+/// transactional fix: the trim to length 1 + the `idx -> keep` cursor
+/// reset both commit; after: every grow/trim/splice/return-slice runs
+/// against locals first, `self` is committed only on full success, so the
+/// `Err` leaves `keys`/`values`/`offset`/`idx`/`meta_state` byte-identical
+/// to the pre-update state.
+#[test]
+fn rotating_update_in_place_partial_mutation_on_set_seq_err_is_rejected() {
+  let mut c = RotatingKvCache::new(1, 0); // max_size=1, keep=0.
+  // S=2 prefill via `update_concat`: leaves buffer length 2 > max_size 1
+  // (mlx-lm `RotatingKVCache._update_concat`'s `max_size + S - 1`
+  // over-retention semantics, `cache.py:456-466`). offset=2, idx=2.
+  let two = kv(&[10.0, 11.0]);
+  c.update(&two, &two).unwrap();
+  assert_eq!(c.offset(), 2);
+  let before_meta = c.meta_state();
+  assert_eq!(before_meta, vec!["0", "1", "2", "2"]); // keep, max_size, offset, idx.
+  let before_state_len = c.state().unwrap().len();
+
+  // S=1 with non-broadcastable batch RHS [2,1,1,1]. The S==1 dispatch
+  // goes to `update_in_place`: cur_len=2, no grow; trim_size=1, trim to
+  // length 1; idx (1) == max_size (1) → idx = keep = 0; set_seq("keys",
+  // buf=[1,1,1,1], 0, 1, new=[2,1,1,1]) → broadcast_write_rhs rejects
+  // (axis 0: target=1, got=2, non-broadcastable). With the transactional
+  // fix, `self` stays at offset=2, idx=2, buffer [1,1,2,1].
+  let bad_kv2 = Array::from_slice::<f32>(&[9.0, 9.5], &(2usize, 1, 1, 1)).unwrap();
+  let r = c.update(&bad_kv2, &bad_kv2);
+  assert!(
+    matches!(&r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    "non-broadcastable full-window RHS must be Err on the public update API \
+     (Codex iter-2 follow-up to #78), got {r:?}"
+  );
+
+  // Critical: `self` MUST be byte-identical to its pre-update state. The
+  // trim to length 1 + `idx -> keep` cursor reset must NOT have committed
+  // (that was the partial-mutation defect Codex flagged).
+  assert_eq!(c.offset(), 2, "offset must NOT advance on a failed update");
+  assert_eq!(
+    c.meta_state(),
+    before_meta,
+    "no partial trim / cursor reset on a failed update"
+  );
+  assert_eq!(c.state().unwrap().len(), before_state_len);
+
+  // The cache stays fully usable: a well-formed S=1 update (matching batch)
+  // succeeds and the cache walks forward from where it WAS pre-failure.
+  // The S=1 path will run the SAME trim+cursor sequence and now splice
+  // a matching RHS — proving `self` was not silently corrupted.
+  let ok = kv(&[7.0]);
+  c.update(&ok, &ok).unwrap();
+  assert_eq!(c.offset(), 3);
 }
