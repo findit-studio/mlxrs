@@ -1,0 +1,700 @@
+//! [`BatchKvCache`] + [`dynamic_roll`] — the left-padded batched
+//! full-attention cache, ported 1:1 from
+//! [`mlx_lm.models.cache`](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/cache.py)
+//! `dynamic_roll` (`cache.py:903-909`) and `BatchKVCache`
+//! (`cache.py:912-1131`).
+//!
+//! mlx-swift-lm has **no** concrete `BatchKVCache` (only the
+//! `BatchPositionedKVCache` protocol in `RoPEApplication.swift:13-22` and
+//! `RoPEOffset.batch`), so mlx-lm is the authoritative algorithm; the swift
+//! cross-check is the `batchOffset` → `.batch(batchOffset[.ellipsis])`
+//! rope-offset contract (already provided by the merged
+//! [`KvCache::rope_offset`] default once
+//! [`as_batch_positioned`](super::KvCache::as_batch_positioned) is `Some`).
+//!
+//! Like [`StandardKvCache`](super::StandardKvCache) vs mlx-lm's
+//! `KVCache` step buffer, `BatchKVCache`'s `step`-sized over-allocation is a
+//! pure allocation optimization with **no** observable effect: every
+//! returned token (`return self.keys[..., :self._idx, :]`,
+//! `cache.py:965`) is a real written token (`self.keys[..., prev:self._idx,
+//! :] = keys`, `cache.py:963`), the zero rows are always sliced off before
+//! return, and there is **no** in-place ring overwrite an observer can see
+//! (unlike [`RotatingKvCache`](super::RotatingKvCache) /
+//! [`BatchRotatingKvCache`](super::BatchRotatingKvCache)). So
+//! `mlxrs::Array` being functional, the buffer is reproduced exactly via
+//! `concatenate`/`slice` — the observable `update_and_fetch` is a
+//! sequence-axis concat of every update, with the per-sequence
+//! `offset`/`left_padding` arrays carried as the RoPE/mask metadata.
+//!
+//! No implicit eval: every op is a pure [`crate::ops`] composition.
+
+use crate::{
+  array::Array,
+  dtype::Dtype,
+  error::{Error, Result},
+  lm::cache::{
+    BatchPositionedKvCache, KvCache, MaskMode,
+    util::{KV_NDIM, concat_seq, nbytes, seq_len, slice_seq},
+  },
+  ops,
+};
+
+/// Rank-safe `keys`/`values` last-axis (head-dim) length, i.e. `shape[-1]`
+/// of a 4-D `[B, n_kv_heads, S, head_dim]` KV state.
+///
+/// mlx-lm reads `values.shape[3]` directly (`cache.py:946`); on the
+/// `mlxrs::Array` `Result` API a raw `.shape()[3]` would **panic** on a
+/// wrong-rank input (the verified [medium] panic class of the merged
+/// single-seq rotating cache). This validates the rank and returns a
+/// recoverable [`Error::ShapeMismatch`] instead, never panicking. Kept
+/// local so this PR is self-contained / panic-free; when the
+/// `util::head_dim` hotfix lands this may switch to it (union-rebase).
+pub(crate) fn batch_head_dim(name: &str, a: &Array) -> Result<usize> {
+  let shape = a.shape();
+  if shape.len() != KV_NDIM {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "batched KV cache expects 4-D {name} [B, n_kv_heads, S, head_dim], got shape {shape:?}"
+      ),
+    });
+  }
+  Ok(shape[KV_NDIM - 1])
+}
+
+/// Validate an `update`'s `keys`/`values` are a compatible KV pair, exactly
+/// mirroring mlx-lm's implicit constraint: `BatchKVCache.update_and_fetch`
+/// builds the V buffer with **keys'** `B`/`n_kv_heads` (only the head_dim
+/// from `values`, `cache.py:945-949`) and then does
+/// `self.values[..., prev:self._idx, :] = values` (`cache.py:964`) — that
+/// in-place assignment **raises in mlx-lm** unless `values` matches the
+/// slot's `[B_keys, n_kv_heads_keys, S_keys, *]`. mlx-lm therefore *does*
+/// fail (inside `update_and_fetch`) on a `B`/`n_kv_heads`/`S`-mismatched
+/// `values`; the only freedom is the head_dim (`v_head_dim =
+/// values.shape[3]`). Our functional port's empty branch would otherwise
+/// just clone the mismatched `values` and return `Ok`, silently
+/// desynchronizing K/V — *less* faithful than mlx-lm. This restores
+/// mlx-lm's exact error point as a recoverable [`Error::ShapeMismatch`]
+/// (both 4-D; `values` `B`/`n_kv_heads`/`S` == `keys`'; head_dim free).
+/// This is faithfulness parity, NOT extra validation beyond the reference.
+pub(crate) fn validate_kv_compat(keys: &Array, values: &Array) -> Result<()> {
+  let ks = keys.shape();
+  let vs = values.shape();
+  if ks.len() != KV_NDIM {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "batched KV cache expects 4-D keys [B, n_kv_heads, S, head_dim], got shape {ks:?}"
+      ),
+    });
+  }
+  if vs.len() != KV_NDIM {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "batched KV cache expects 4-D values [B, n_kv_heads, S, head_dim], got shape {vs:?}"
+      ),
+    });
+  }
+  // mlx-lm couples values to keys' B / n_kv_heads / S (head_dim free) via
+  // the `new_v` buffer + `self.values[..., prev:_idx, :] = values` assign.
+  if ks[0] != vs[0] || ks[1] != vs[1] || ks[2] != vs[2] {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "batched KV cache: values shape {vs:?} must match keys {ks:?} on \
+         [B, n_kv_heads, S] (head_dim may differ) — mlx-lm raises at \
+         `self.values[..., prev:_idx, :] = values` for this mismatch"
+      ),
+    });
+  }
+  Ok(())
+}
+
+/// Build a 1-D `[B]` `I32` array from per-sequence ints (mlx-lm
+/// `mx.array([... for ...])`). The padding/offset metadata are tiny
+/// `[B]` integer vectors.
+pub(crate) fn ivec(values: &[i32]) -> Result<Array> {
+  Array::from_slice::<i32>(values, &(values.len(),))
+}
+
+/// `-l for l in left_padding` as an `I32` `[B]` array — mlx-lm
+/// `self.offset = mx.array([-l for l in left_padding])` (`cache.py:937`).
+fn neg_ivec(values: &[i32]) -> Result<Array> {
+  let negated: Vec<i32> = values.iter().map(|&l| -l).collect();
+  ivec(&negated)
+}
+
+/// Port of `mlx_lm.models.cache.dynamic_roll` (`cache.py:903-909`):
+///
+/// ```text
+/// n = x.shape[axis]
+/// expand_shifts  = (...,) + (None,) * (x.ndim - axis)
+/// expand_indices = expand_shifts[:-1]
+/// idx = (mx.arange(n)[expand_indices] - shifts[expand_shifts]) % n
+/// rolled = mx.take_along_axis(x, idx, axis=axis)
+/// ```
+///
+/// Every batched-cache caller passes a 4-D `x` (`[B, n_kv_heads, S,
+/// head_dim]`), `axis = 2`, and `shifts` already shaped `[B, 1]`
+/// (`padding[:, None]` / `roll[:, None]`, `cache.py:983`/`1187`/`1288`).
+/// Then `expand_shifts = (..., None, None)` makes `shifts[expand_shifts]`
+/// `[B, 1, 1, 1]` and `expand_indices = (..., None)` makes
+/// `arange(n)[expand_indices]` `[S, 1]`, so `idx` broadcasts to
+/// `[B, 1, S, 1]` and `take_along_axis(x, idx, 2)` (mlxrs broadcasts the
+/// non-`axis` dims) yields per-row `out[b,:,i,:] = x[b,:,(i-shift[b])%S,:]`
+/// — exactly `mx.roll` by `+shift[b]` per sequence.
+///
+/// Rank-validated (not raw-indexed): a non-4-D `x` or a mis-shaped
+/// `shifts` is a recoverable [`Error::ShapeMismatch`], never a panic.
+/// `arange` is built through `f32` (the safe ops surface has no integer
+/// `arange`) then cast to `I32`; `S` ≤ a tiny cache length, far below
+/// `2^24`, so the round-trip is exact.
+pub fn dynamic_roll(x: &Array, shifts: &Array, axis: i32) -> Result<Array> {
+  // Callers are fixed (4-D, axis=2); validate rather than raw-index.
+  let xshape = x.shape();
+  if xshape.len() != KV_NDIM || axis != (KV_NDIM as i32) - 2 {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "dynamic_roll: expects 4-D x [B, n_kv_heads, S, head_dim] and axis=2, got shape {xshape:?} axis={axis}"
+      ),
+    });
+  }
+  let sshape = shifts.shape();
+  if sshape.len() != 2 || sshape[1] != 1 {
+    return Err(Error::ShapeMismatch {
+      message: format!("dynamic_roll: expects shifts shaped [B, 1], got {sshape:?}"),
+    });
+  }
+  let n = xshape[KV_NDIM - 2];
+  // `n == 0` is the empty-axis no-op: logically `roll([], k) == []` (mlx-lm
+  // mx.roll on a zero-length axis also returns the input unchanged), and
+  // computing `remainder(idx, 0)` below would be a divide-by-zero. Early
+  // return a clone (Copilot review #3271119572). This is symmetric with
+  // the `n > 2^24` reject below: both are degenerate-`n` guards for cases
+  // the reference's unbounded-int / overflow-defined semantics handle
+  // implicitly but our finite-precision ops require explicit handling for.
+  if n == 0 {
+    return x.try_clone();
+  }
+  // The `Array::arange(0.0, n as f32, 1.0)?` below builds the roll-index
+  // range via f32 and casts to I32. f32 can represent consecutive integers
+  // exactly only up to `2^24` (the mantissa precision limit); beyond that,
+  // successive integers alias to the same f32 value and the cast back to
+  // I32 silently produces wrong roll indices. Same aliasing class as
+  // [`mask::iarange`](super::mask::iarange) and the local
+  // `F32_EXACT_INT_MAX` guard in [`batch_rotating`](super::batch_rotating).
+  // Reject `n > 2^24` up front with a recoverable `Error::ShapeMismatch`
+  // rather than returning silently-wrong indices.
+  const F32_EXACT_INT_MAX: usize = 1usize << 24;
+  if n > F32_EXACT_INT_MAX {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "dynamic_roll: sequence axis n ({n}) exceeds f32 exact-int limit \
+         (2^24 = {F32_EXACT_INT_MAX}); arange/cast would silently alias \
+         indices and produce wrong rolls"
+      ),
+    });
+  }
+  // arange(n) -> [S]; expand_indices = (..., None) -> [S, 1].
+  let ar = ops::misc::astype(&Array::arange(0.0, n as f32, 1.0)?, Dtype::I32)?;
+  let ar = ops::shape::expand_dims_axes(&ar, &[1])?; // [S, 1]
+  // shifts[expand_shifts] = shifts[..., None, None]: [B,1] -> [B,1,1,1].
+  let sh = ops::shape::expand_dims_axes(shifts, &[2, 3])?; // [B,1,1,1]
+  // (arange - shifts) % n  -> broadcasts to [B, 1, S, 1].
+  let diff = ops::arithmetic::subtract(&ar, &sh)?;
+  let nscalar = ops::misc::astype(&Array::full::<f32>(&(1usize,), n as f32)?, Dtype::I32)?;
+  let idx = ops::arithmetic::remainder(&diff, &nscalar)?; // [B,1,S,1]
+  ops::indexing::take_along_axis(x, &idx, axis)
+}
+
+/// Left-padded batched full-attention KV cache — port of
+/// `mlx_lm.models.cache.BatchKVCache` (`cache.py:912-1131`).
+///
+/// Expects inputs **left-padded** so every sequence shares the same length;
+/// `left_padding[i]` is sequence `i`'s pad count. `offset` /
+/// `left_padding` are per-sequence `[B]` arrays (the RoPE / mask metadata);
+/// `_idx` is the scalar logical length. The step buffer is *not*
+/// materialized (see the module docs): the observable `update_and_fetch`
+/// is a sequence-axis concat of every update.
+pub struct BatchKvCache {
+  keys: Option<Array>,
+  values: Option<Array>,
+  /// Per-sequence left-pad counts — mlx-lm `BatchKVCache.left_padding`
+  /// (`[B]`, `I32`).
+  left_padding: Array,
+  /// Per-sequence raw position — mlx-lm `BatchKVCache.offset` (`[B]`,
+  /// `I32`; starts at `-left_padding`, the per-seq RoPE/mask offset).
+  offset: Array,
+  /// Scalar logical sequence length — mlx-lm `BatchKVCache._idx`.
+  idx: usize,
+  /// Deferred right-pad counts set by [`Self::prepare_right_padding`],
+  /// applied by [`Self::finalize`] — mlx-lm `BatchKVCache._right_padding`.
+  right_padding: Option<Array>,
+}
+
+impl BatchKvCache {
+  /// A new empty left-padded batched cache — mlx-lm
+  /// `BatchKVCache(left_padding)` (`cache.py:915-940`): `offset =
+  /// array([-l..])`, `left_padding = array(left_padding)`, `_idx = 0`.
+  ///
+  /// `mx.array([...])` is fallible here only on allocation/backend; a tiny
+  /// `[B]` integer vector cannot realistically fail, so `new` keeps
+  /// mlx-lm's infallible `__init__` signature and on the (unreachable)
+  /// failure falls back to an empty `[0]` array — still **no** panic and
+  /// **no** heap leak on this constructor path (the `[-l..]` map reads the
+  /// caller's own slice directly, never a re-read of the built array).
+  pub fn new(left_padding: &[i32]) -> Self {
+    let lp = ivec(left_padding).unwrap_or_else(|_| empty_ivec());
+    let offset = neg_ivec(left_padding).unwrap_or_else(|_| empty_ivec());
+    Self {
+      keys: None,
+      values: None,
+      left_padding: lp,
+      offset,
+      idx: 0,
+      right_padding: None,
+    }
+  }
+
+  /// mlx-lm `BatchKVCache.prepare(right_padding=...)` (`cache.py:977-978`):
+  /// store a non-zero `right_padding` to be applied by [`Self::finalize`]
+  /// (mlx-lm only stores it when `max(right_padding) > 0`). Left-padding
+  /// `prepare` (`cache.py:968-975`) is the constructor here.
+  pub fn prepare_right_padding(&mut self, right_padding: &[i32]) -> Result<()> {
+    if right_padding.iter().copied().max().unwrap_or(0) > 0 {
+      self.right_padding = Some(ivec(right_padding)?);
+    }
+    Ok(())
+  }
+
+  /// mlx-lm `BatchKVCache.finalize` (`cache.py:980-987`): if a
+  /// `_right_padding` is pending, `dynamic_roll` keys/values right by it,
+  /// `offset -= padding`, `left_padding += padding`, clear it.
+  pub fn finalize(&mut self) -> Result<()> {
+    // Borrow (do NOT `take`) the pending padding so a fallible step does
+    // not consume it on the error path. Stage-then-commit: all fallible
+    // ops compute into locals; `self.*` (including clearing
+    // `right_padding`) is mutated only in the infallible tail. So an `Err`
+    // (e.g. the `values` roll failing on a batch-mismatched restored
+    // cache, after the `keys` roll) leaves keys/values/offset/
+    // left_padding/right_padding EXACTLY as they were — retry-safe, no
+    // keys-rolled-but-values-not desync and no lost `right_padding`.
+    if let Some(padding) = &self.right_padding {
+      // padding[:, None] -> [B, 1].
+      let pad_col = ops::shape::expand_dims_axes(padding, &[1])?;
+      let rolled = match (&self.keys, &self.values) {
+        (Some(k), Some(v)) => Some((dynamic_roll(k, &pad_col, 2)?, dynamic_roll(v, &pad_col, 2)?)),
+        _ => None,
+      };
+      let new_offset = ops::arithmetic::subtract(&self.offset, padding)?;
+      let new_left_padding = ops::arithmetic::add(&self.left_padding, padding)?;
+      // ── Infallible commit tail ────────────────────────────────────
+      if let Some((nk, nv)) = rolled {
+        self.keys = Some(nk);
+        self.values = Some(nv);
+      }
+      self.offset = new_offset;
+      self.left_padding = new_left_padding;
+      self.right_padding = None;
+    }
+    Ok(())
+  }
+
+  /// mlx-lm `BatchKVCache.left_padding` — the per-sequence `[B]` left-pad
+  /// counts (an owned clone; `Array::try_clone` is fallible per #33).
+  pub fn left_padding_arr(&self) -> Result<Array> {
+    self.left_padding.try_clone()
+  }
+
+  /// mlx-lm `BatchKVCache.state` getter `(keys, values)` pair (without the
+  /// `offset`/`left_padding` metadata), `_idx`-sliced when the buffer
+  /// over-allocated (`cache.py:991-995`). Test/inspection convenience.
+  pub fn state_kv(&self) -> Result<(Array, Array)> {
+    match (&self.keys, &self.values) {
+      (Some(k), Some(v)) => Ok((slice_seq(k, 0, self.idx)?, slice_seq(v, 0, self.idx)?)),
+      _ => Err(Error::Backend {
+        message: "BatchKvCache.state_kv on an empty cache".into(),
+      }),
+    }
+  }
+}
+
+/// An empty `[0]`-length `I32` array — the unreachable [`BatchKvCache::new`]
+/// allocation-failure fallback (keeps the constructor panic-free without
+/// changing observable behavior for any realistic input: a `[B]` int
+/// vector build does not fail in practice).
+fn empty_ivec() -> Array {
+  Array::from_slice::<i32>(&[], &(0usize,)).unwrap_or_else(|_| {
+    // Terminal, infallible, no-eval: a fresh empty handle (NULL ctx) — the
+    // exact `mlx_array_new()` out-param idiom the ops use. Reached only on
+    // the impossible double allocation failure; never panics, never evals.
+    // SAFETY: `mlx_array_new()` returns a fresh owned empty handle per the
+    // mlx-c convention; moved straight into the RAII `Array` newtype so it
+    // is freed exactly once on drop.
+    Array(unsafe { mlxrs_sys::mlx_array_new() })
+  })
+}
+
+impl KvCache for BatchKvCache {
+  /// mlx-lm `BatchKVCache.make_mask` uses `offset=self._idx`
+  /// (`cache.py:1013`) and `create_causal_mask`'s scalar grid is built
+  /// from `self._idx`; the scalar `offset()` is therefore `_idx` (the
+  /// per-sequence RoPE position is the `[B]`
+  /// [`BatchPositionedKvCache::batch_offset`] /
+  /// [`rope_offset`](KvCache::rope_offset) `Batch`, not this scalar).
+  fn offset(&self) -> usize {
+    self.idx
+  }
+
+  /// mlx-lm `BatchKVCache.update_and_fetch` (`cache.py:942-965`). The
+  /// step-buffer growth (`cache.py:944-959`) is a pure allocation
+  /// optimization with no observable effect (module docs): every returned
+  /// row is a written row, the zero rows are sliced off, and there is no
+  /// in-place ring overwrite — so the observable result is the sequence
+  /// concat of every update. `offset += S` / `_idx += S` mirror
+  /// `cache.py:961-962`.
+  fn update(&mut self, keys: &Array, values: &Array) -> Result<(Array, Array)> {
+    let s = seq_len("keys", keys)?;
+    // Both 4-D AND `values` B/n_kv_heads/S == keys' (head_dim free) — the
+    // exact constraint mlx-lm's `self.values[..., prev:_idx, :] = values`
+    // (cache.py:964) implicitly asserts; restores mlx-lm's error point
+    // (else the empty branch would clone a mismatched `values` and desync
+    // K/V) and is also the rank-safety guard (no `.shape()[N]` panic).
+    validate_kv_compat(keys, values)?;
+
+    // Stage-then-commit (same class-wide contract as the batch-rotating
+    // cache): every fallible op (`concat_seq`/`checked_add`/`astype`/
+    // `add`/`try_clone`) computes into a local FIRST; `self.*` is mutated
+    // only in the infallible tail. So an `Err` from any step leaves the
+    // cache fully unmutated — no offset-advanced-but-buffer-not desync.
+    let (k, v) = match (&self.keys, &self.values) {
+      (Some(pk), Some(pv)) => (concat_seq(pk, keys)?, concat_seq(pv, values)?),
+      _ => (keys.try_clone()?, values.try_clone()?),
+    };
+
+    // offset += keys.shape[2]; _idx += keys.shape[2] (cache.py:961-962).
+    // `_idx` is bounded by the tiny test/decode lengths; a corrupt restored
+    // `_idx` near usize::MAX could overflow on add, so guard it (the value
+    // is byte-identical to `self.idx + s` for every realistic input).
+    let new_idx = self
+      .idx
+      .checked_add(s)
+      .ok_or_else(|| Error::ShapeMismatch {
+        message: format!(
+          "BatchKvCache update: _idx ({}) + S ({s}) overflows usize",
+          self.idx
+        ),
+      })?;
+    let s_scalar = ops::misc::astype(&Array::full::<f32>(&(1usize,), s as f32)?, Dtype::I32)?;
+    let new_offset = ops::arithmetic::add(&self.offset, &s_scalar)?;
+    let (rk, rv) = (k.try_clone()?, v.try_clone()?);
+    // ── Infallible commit tail ──────────────────────────────────────
+    self.offset = new_offset;
+    self.idx = new_idx;
+    self.keys = Some(k);
+    self.values = Some(v);
+    Ok((rk, rv))
+  }
+
+  /// mlx-lm `BatchKVCache.state` getter (`cache.py:989-995`):
+  /// `[keys[:_idx], values[:_idx], offset, left_padding]`; `[]` when empty
+  /// (mlx-lm returns the four-tuple; an empty cache has `keys=None`).
+  fn state(&self) -> Result<Vec<Array>> {
+    match (&self.keys, &self.values) {
+      (Some(k), Some(v)) => Ok(vec![
+        slice_seq(k, 0, self.idx)?,
+        slice_seq(v, 0, self.idx)?,
+        self.offset.try_clone()?,
+        self.left_padding.try_clone()?,
+      ]),
+      _ => Ok(Vec::new()),
+    }
+  }
+
+  /// mlx-lm `BatchKVCache.state` setter (`cache.py:997-1000`):
+  /// `keys, values, offset, left_padding = v; _idx = keys.shape[2]`. An
+  /// empty state resets the cache.
+  fn set_state(&mut self, mut state: Vec<Array>) -> Result<()> {
+    match state.len() {
+      0 => {
+        // Fully-fresh state, mirroring `BatchKvCache::new(&self.left_padding)`:
+        // an empty `set_state` MUST clear ALL per-seq runtime state, not just
+        // the buffer + `_idx`. Otherwise `offset` (per-seq `[B]` = current
+        // RoPE positions) and `right_padding` (pending finalize) survive as
+        // stale metadata into a logically-fresh cache — the next `update`
+        // mismatches its `[B]` against fresh inputs and the next `finalize`
+        // re-applies a dropped right-pad. `left_padding` is preserved (it is
+        // the constructor *input* — `new(&self.left_padding)` would feed the
+        // same slice). `offset = -left_padding` is reproduced via a pure
+        // `ops::negative` (no eval, no host extraction); the fallible op
+        // is staged BEFORE any `self.*` mutation so a backend `Err` leaves
+        // the cache unmutated.
+        let new_offset = ops::arithmetic::negative(&self.left_padding)?;
+        // ── Infallible commit tail ──────────────────────────────────────
+        self.keys = None;
+        self.values = None;
+        self.idx = 0;
+        self.offset = new_offset;
+        self.right_padding = None;
+        Ok(())
+      }
+      4 => {
+        // [keys, values, offset, left_padding]; pop in reverse.
+        let left_padding = state.pop().unwrap();
+        let offset = state.pop().unwrap();
+        let values = state.pop().unwrap();
+        let keys = state.pop().unwrap();
+        // mlx-lm derives `_idx` from `keys.shape[2]` (cache.py:1000); a
+        // rank-invalid `keys` is a recoverable error, not a panic.
+        // `values` is rank-validated too (NOT done by mlx-lm's numpy
+        // setter, but required here): a hostile/corrupt prompt cache could
+        // otherwise restore a 4-D `keys` with a rank-<3 `values`, which a
+        // later `state()`/`make_mask` would raw-index on the seq axis
+        // (`slice_seq` / `create_causal_mask`) and PANIC on the `Result`
+        // API. We mirror mlx-lm's "no K/V *shape-compatibility*
+        // validation" (the head dim may legitimately differ; we do not
+        // cross-check B/H/S), only enforcing the 4-D rank invariant the
+        // rest of this module relies on so the failure is a recoverable
+        // `Error::ShapeMismatch`, never a panic. Validate BEFORE assigning
+        // any field so a bad `values` leaves the cache unmutated.
+        let sk = seq_len("keys", &keys)?;
+        batch_head_dim("values", &values)?;
+        // ── Infallible commit tail ──────────────────────────────────────
+        self.keys = Some(keys);
+        self.values = Some(values);
+        self.offset = offset;
+        self.left_padding = left_padding;
+        self.idx = sk;
+        // Also clear `right_padding` here, matching the empty-state branch
+        // above (Copilot review #3271560108). `set_state` fully defines
+        // the cache's runtime state: leaving a previously-armed
+        // `right_padding` from a prior `prepare_right_padding` call would
+        // make the next `finalize()` unexpectedly roll the freshly-restored
+        // buffers using stale padding. mlx-lm doesn't have this problem
+        // because its `state` setter (cache.py:940) is called as part of
+        // `from_state`'s fresh-cache reconstruction, so `_right_padding`
+        // is `None` by construction; mlxrs's setter is callable
+        // out-of-band so we explicitly drop the stale field.
+        self.right_padding = None;
+        Ok(())
+      }
+      n => Err(Error::Backend {
+        message: format!("BatchKvCache state must have 0 or 4 arrays, got {n}"),
+      }),
+    }
+  }
+
+  /// mlx-lm `BatchKVCache.is_trimmable` — always `True` (`cache.py:1002`).
+  fn is_trimmable(&self) -> bool {
+    true
+  }
+
+  /// mlx-lm `BatchKVCache.trim` (`cache.py:1005-1009`):
+  /// `n = min(_idx, n); _idx -= n; offset -= n; return n`. Drops the
+  /// stored buffer's tail too so a later [`update`](KvCache::update)
+  /// extends the trimmed prefix (the over-allocation is invisible).
+  fn trim(&mut self, n: usize) -> Result<usize> {
+    let trimmed = n.min(self.idx);
+    if trimmed == 0 {
+      return Ok(0);
+    }
+    // Stage-then-commit: the new `_idx`, the `offset -= n` array, and the
+    // sliced buffers are computed into locals FIRST; `self.*` is mutated
+    // only in the infallible tail. So a fallible-op `Err` (e.g. the
+    // `subtract`/`slice_seq`) leaves `_idx`/`offset`/`keys`/`values`
+    // exactly as they were (no idx-decremented-but-buffer-not desync).
+    let new_idx = self.idx - trimmed;
+    let nscalar = ops::misc::astype(&Array::full::<f32>(&(1usize,), trimmed as f32)?, Dtype::I32)?;
+    let new_offset = ops::arithmetic::subtract(&self.offset, &nscalar)?;
+    let sliced = match (&self.keys, &self.values) {
+      (Some(k), Some(v)) => Some((slice_seq(k, 0, new_idx)?, slice_seq(v, 0, new_idx)?)),
+      _ => None,
+    };
+    // ── Infallible commit tail ──────────────────────────────────────
+    self.idx = new_idx;
+    self.offset = new_offset;
+    if let Some((nk, nv)) = sliced {
+      self.keys = Some(nk);
+      self.values = Some(nv);
+    }
+    Ok(trimmed)
+  }
+
+  /// mlx-lm `BatchKVCache.make_mask` (`cache.py:1011-1014`) — its **own**
+  /// override, NOT the generic `create_attention_mask`:
+  /// `create_causal_mask(N, offset=self._idx, left_padding=self.left_padding,
+  /// window_size=...)`. Returns the per-sequence left-padded causal
+  /// (optionally windowed) `[B, 1, N, _idx + N]` mask, always materialized
+  /// (the `left_padding` term needs the array). A single-token decode
+  /// still produces the left-padded array (mlx-lm does not special-case
+  /// `N == 1` here — it always calls `create_causal_mask`).
+  fn make_mask(
+    &self,
+    n: usize,
+    window_size: Option<usize>,
+    _return_array: bool,
+  ) -> Result<MaskMode> {
+    Ok(MaskMode::Array(create_causal_mask_batched(
+      n,
+      self.idx,
+      window_size,
+      None,
+      Some(&self.left_padding),
+    )?))
+  }
+
+  /// mlx-lm `BatchKVCache.nbytes` (`cache.py:1126-1130`):
+  /// `keys.nbytes + values.nbytes` (0 if empty).
+  fn nbytes(&self) -> usize {
+    let mut total = 0;
+    if let Some(k) = &self.keys {
+      total += nbytes(k).unwrap_or(0);
+    }
+    if let Some(v) = &self.values {
+      total += nbytes(v).unwrap_or(0);
+    }
+    total
+  }
+
+  /// mlx-lm `BatchKVCache.empty` (`cache.py:1123-1124`): `keys is None`.
+  fn is_empty(&self) -> bool {
+    self.keys.is_none()
+  }
+
+  /// An independent copy (mlx-lm `copy.deepcopy`). MLX value semantics:
+  /// arrays are immutable and the cache only ever *reassigns* its arrays
+  /// (never mutates a buffer in place), so a refcount-sharing
+  /// `Array::try_clone` still yields a fully independent cache. The
+  /// fallible clone is propagated as a `Result` — a failure is **never**
+  /// swallowed (silent corruption) and **never** panicked.
+  fn copy(&self) -> Result<Box<dyn KvCache>> {
+    Ok(Box::new(Self {
+      keys: match &self.keys {
+        Some(a) => Some(a.try_clone()?),
+        None => None,
+      },
+      values: match &self.values {
+        Some(a) => Some(a.try_clone()?),
+        None => None,
+      },
+      left_padding: self.left_padding.try_clone()?,
+      offset: self.offset.try_clone()?,
+      idx: self.idx,
+      right_padding: match &self.right_padding {
+        Some(a) => Some(a.try_clone()?),
+        None => None,
+      },
+    }))
+  }
+
+  /// This cache is batch-positioned (swift
+  /// `cache as? BatchPositionedKVCache`); the merged
+  /// [`rope_offset`](KvCache::rope_offset) default then yields
+  /// `RopeOffset::Batch(batch_offset())`.
+  fn as_batch_positioned(&self) -> Option<&dyn BatchPositionedKvCache> {
+    Some(self)
+  }
+}
+
+impl BatchPositionedKvCache for BatchKvCache {
+  /// Per-sequence RoPE offsets `[B]` — mlx-lm `BatchKVCache.offset`
+  /// (swift `batchOffset`); an owned clone (fallible per #33).
+  fn batch_offset(&self) -> Result<Array> {
+    self.offset.try_clone()
+  }
+}
+
+/// Port of `mlx_lm.models.base.create_causal_mask` (`base.py:24-42`) — the
+/// **batched** form the batch caches' `make_mask` overrides need, i.e.
+/// including the `left_padding` / `right_padding` per-sequence terms (the
+/// scalar-only subset is `super::mask::create_causal_mask`):
+///
+/// ```text
+/// rinds = mx.arange(offset + N)
+/// linds = mx.arange(offset, offset + N) if offset else rinds
+/// linds = linds[:, None]; rinds = rinds[None]
+/// mask  = linds >= rinds
+/// if window_size is not None:  mask &= linds < rinds + window_size
+/// if right_padding is not None:
+///     mask &= rinds < expand_dims((offset+N) - right_padding, (1,2,3))
+/// if left_padding is not None:
+///     mask &= expand_dims(left_padding, (1,2,3)) <= rinds
+/// ```
+///
+/// Result `[B, 1, N, offset+N]` (broadcast from the `[1,N,offset+N]`
+/// causal grid against the `[B,1,1,1]` padding terms). `offset + N` is
+/// computed with [`usize::checked_add`] before any range is built so a
+/// hostile restored `offset` is a recoverable [`Error::ShapeMismatch`],
+/// never an overflow panic / silent wrong mask.
+pub(crate) fn create_causal_mask_batched(
+  n: usize,
+  offset: usize,
+  window_size: Option<usize>,
+  right_padding: Option<&Array>,
+  left_padding: Option<&Array>,
+) -> Result<Array> {
+  use crate::lm::cache::mask::{iarange, scalar_i32};
+  let total = offset.checked_add(n).ok_or_else(|| Error::ShapeMismatch {
+    message: format!("create_causal_mask: offset ({offset}) + N ({n}) overflows usize"),
+  })?;
+  let rinds = iarange(0, total)?;
+  let linds = if offset != 0 {
+    iarange(offset, total)?
+  } else {
+    rinds.try_clone()?
+  };
+  // linds[:, None] / rinds[None].
+  let linds = ops::shape::expand_dims_axes(&linds, &[1])?;
+  let rinds = ops::shape::expand_dims_axes(&rinds, &[0])?;
+
+  let mut mask = ops::comparison::greater_equal(&linds, &rinds)?;
+  if let Some(w) = window_size
+    && w < total
+  {
+    // mlx-lm: a `window_size >= total` is the unbounded-Python-int no-op
+    // (every `linds < rinds + w` already holds); skip the term so a huge
+    // `w` cannot lossily cast through `as i32`.
+    //
+    // For `w < total`, also guard against `w` itself exceeding `i32::MAX`
+    // before the cast (`w` is `usize`, on 64-bit it can be > 2^31-1).
+    // Use `i32::try_from(w)` to surface a recoverable `Error::ShapeMismatch`
+    // instead of silently wrapping to a negative value, which would
+    // produce a wrong (inverted) windowed mask. The `w < total <
+    // i32::MAX` invariant *usually* holds (total derives from real seq
+    // lengths), but the defensive cast costs nothing and closes the
+    // wrap-on-cast hole (Copilot review #3271119551).
+    let w_i32 = i32::try_from(w).map_err(|_| Error::ShapeMismatch {
+      message: format!("window_size ({w}) exceeds i32::MAX; cannot fit into a scalar mask offset"),
+    })?;
+    let bound = ops::arithmetic::add(&rinds, &scalar_i32(w_i32)?)?;
+    let windowed = ops::comparison::less(&linds, &bound)?;
+    mask = ops::logical::logical_and(&mask, &windowed)?;
+  }
+  if let Some(rp) = right_padding {
+    // rinds < expand_dims((offset+N) - right_padding, (1,2,3))
+    //
+    // Build the `total` scalar via the integer-exact `scalar_i32` helper
+    // instead of round-tripping through `f32` (Copilot review #3271308731).
+    // For `total > 2^24`, an `f32` cast would lossily round (consecutive
+    // integers alias) and silently produce a wrong right-padding bound,
+    // hence a wrong mask. `scalar_i32` builds the I32 scalar directly with
+    // no f32 intermediate — the same discipline `mask::iarange` and the
+    // windowed `w_i32` cast above already use. Reject `total > i32::MAX`
+    // with a recoverable `Error::ShapeMismatch` so an overflowing prefill
+    // never silently corrupts the mask.
+    let total_i32 = i32::try_from(total).map_err(|_| Error::ShapeMismatch {
+      message: format!(
+        "create_causal_mask_batched: total ({total}) exceeds i32::MAX; cannot fit into a scalar mask offset"
+      ),
+    })?;
+    let total_s = scalar_i32(total_i32)?;
+    let bound = ops::arithmetic::subtract(&total_s, rp)?; // [B]
+    let bound = ops::shape::expand_dims_axes(&bound, &[1, 2, 3])?; // [B,1,1,1]
+    let term = ops::comparison::less(&rinds, &bound)?;
+    mask = ops::logical::logical_and(&mask, &term)?;
+  }
+  if let Some(lp) = left_padding {
+    // expand_dims(left_padding, (1,2,3)) <= rinds
+    let lp = ops::shape::expand_dims_axes(lp, &[1, 2, 3])?; // [B,1,1,1]
+    let term = ops::comparison::greater_equal(&rinds, &lp)?; // lp <= rinds
+    mask = ops::logical::logical_and(&mask, &term)?;
+  }
+  Ok(mask)
+}

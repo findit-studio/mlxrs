@@ -183,16 +183,29 @@ pub const MAX_PROMPT_CACHE_BYTES: u64 = 8 << 30;
 /// its single `cacheClassName` switch.
 pub fn reference_class_name(cache: &dyn KvCache) -> &'static str {
   // Prefer the explicit trait downcasts when available (mirrors swift's
-  // `cache as? CacheList` discriminator at KVCache.swift:1381-1392 —
-  // exact type, NOT a meta/max-size heuristic). The `as_cache_list()`
-  // downcast was added by this PR for exactly this purpose: a top-level
-  // `CacheList` prompt cache (added by this PR's `from_state` arm) MUST
-  // serialize as `"CacheList"`, NOT fall through to the
-  // `max_size==None ⇒ KVCache` heuristic — otherwise
-  // `load_prompt_cache` would route to `StandardKvCache::set_state` and
-  // reject the multi-array CacheList state.
+  // `cache as? CacheList` / `cache as? BatchPositionedKVCache`
+  // discriminators at KVCache.swift:1381-1392 — exact type, NOT a
+  // meta/max-size heuristic).
+  //
+  // `CacheList` first (merged in #37): a top-level `CacheList` prompt
+  // cache MUST serialize as `"CacheList"`, NOT fall through to the
+  // `max_size==None ⇒ KVCache` heuristic — otherwise `load_prompt_cache`
+  // would route to `StandardKvCache::set_state` and reject the multi-array
+  // CacheList state.
   if cache.as_cache_list().is_some() {
     return "CacheList";
+  }
+  // Then batch caches (added by this PR): `BatchKvCache` and
+  // `BatchRotatingKvCache` both override `as_batch_positioned()`;
+  // distinguish via `max_size()` (`BatchRotating` returns `Some`,
+  // `BatchKv` returns `None`). Same routing rationale as `CacheList`:
+  // multi-array batch state needs the proper class name to load.
+  if cache.as_batch_positioned().is_some() {
+    return if cache.max_size().is_some() {
+      "BatchRotatingKVCache"
+    } else {
+      "BatchKVCache"
+    };
   }
   // `RotatingKVCache.meta_state` is `[keep, max_size, offset, _idx]`
   // (cache.py:529-533) and it is the only merged-tree cache that is both

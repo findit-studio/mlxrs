@@ -15,9 +15,11 @@
 //! [`RopeOffset`] (swift `RoPEOffset`) and [`MaskMode`] (swift
 //! `ScaledDotProductAttentionMaskMode`) enums. Concrete caches:
 //! [`StandardKvCache`], [`RotatingKvCache`], [`ChunkedKvCache`],
-//! [`QuantizedKvCacheImpl`], plus the prompt-cache/persist surface; and the
-//! composite [`CacheList`] (added by this PR). The remaining kinds
-//! (Arrays / Batch) land in later PRs and [`from_state`] is left
+//! [`QuantizedKvCacheImpl`], plus the prompt-cache/persist surface; the
+//! composite [`CacheList`]; and the batch caches [`BatchKvCache`] /
+//! [`BatchRotatingKvCache`] with the [`dynamic_roll`] helper (added by
+//! this PR). The remaining kinds (Arrays) land in a later PR and
+//! [`from_state`] is left
 //! extensible for them.
 //!
 //! [`StandardKvCache`] is the `KVCache` port: mlx-lm's `step`-sized
@@ -46,6 +48,8 @@ use crate::{
   error::{Error, Result},
 };
 
+pub mod batch;
+pub mod batch_rotating;
 mod cache_list;
 mod chunked;
 mod mask;
@@ -56,6 +60,8 @@ mod rotating;
 mod standard;
 mod util;
 
+pub use batch::*;
+pub use batch_rotating::*;
 pub use cache_list::CacheList;
 pub use chunked::*;
 pub use mask::{create_attention_mask, create_causal_mask};
@@ -327,12 +333,15 @@ pub trait BatchPositionedKvCache: KvCache {
 /// - → [`QuantizedKvCacheImpl`]: `"QuantizedKVCache"` |
 ///   `"QuantizedKvCacheImpl"` (Rust alias)
 /// - → [`CacheList`]: `"CacheList"` (the composite — rebuilds each child
-///   recursively through this same dispatcher) — added by this PR
+///   recursively through this same dispatcher)
+/// - → [`BatchKvCache`]: `"BatchKVCache"` | `"BatchKvCache"` (Rust alias)
+///   — added by this PR
+/// - → [`BatchRotatingKvCache`]: `"BatchRotatingKVCache"` |
+///   `"BatchRotatingKvCache"` (Rust alias) — added by this PR
 ///
-/// The other cache kinds (`"ArraysCache"`, `"BatchKVCache"`,
-/// `"BatchRotatingKVCache"`) are added by later PRs, so an unrecognized
-/// `kind` is a recoverable [`Error::Backend`] and the match is left
-/// extensible for those arms.
+/// The other cache kinds (`"ArraysCache"`) are added by a later PR, so
+/// an unrecognized `kind` is a recoverable [`Error::Backend`] and the
+/// match is left extensible for those arms.
 pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<dyn KvCache>> {
   match kind {
     // mlx-lm `KVCache` / its documented twin `ConcatenateKVCache` /
@@ -455,6 +464,127 @@ pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<
     // the child's reference class name — so a nested `"CacheList"` child
     // recurses (exactly cache.py:898 `globals()["CacheList"]`).
     "CacheList" => cache_list::cache_list_from_state(state, meta),
+    // mlx-lm `BatchKVCache` (cache.py:912). `_BaseCache.from_state`
+    // (cache.py:170-175) reconstructs without `__init__` then assigns
+    // `state` (`[keys, values, offset, left_padding]`, the setter derives
+    // `_idx = keys.shape[2]`); `BatchKVCache` has no `meta_state` so `meta`
+    // is the `_BaseCache` empty default. The placeholder `left_padding`
+    // (`new(&[])`) is fully overwritten by `set_state`'s 4-array branch.
+    "BatchKVCache" | "BatchKvCache" => {
+      let mut c = BatchKvCache::new(&[]);
+      c.set_state(state)?;
+      c.set_meta_state(meta)?;
+      // (Previous defensive `is_empty && offset != 0` check removed as
+      // unreachable: `BatchKvCache::offset()` returns `_idx`, and
+      // `BatchKvCache::set_state(Vec::new())` deterministically sets
+      // `_idx = 0` (and now also resets `offset`/`right_padding` per the
+      // empty-state-clear fix), while `set_meta_state` is a no-op for
+      // `BatchKvCache`. So after `set_state(state)? + set_meta_state(meta)?`
+      // the condition `is_empty() && offset() != 0` cannot hold — there is
+      // no observable code path to it. The 4-array set_state branch's
+      // rank-validation handles the only remaining recoverable-Err case.)
+      Ok(Box::new(c))
+    }
+    // mlx-lm `BatchRotatingKVCache` (cache.py:1133). Reconstructed without
+    // `__init__`, then `state` (`[keys, values, offset, left_padding]`) +
+    // `meta_state` (`(max_size, _offset, _idx, rotated)`) are assigned; the
+    // placeholder `max_size`/`left_padding` are overwritten by the setters.
+    "BatchRotatingKVCache" | "BatchRotatingKvCache" => {
+      let mut c = BatchRotatingKvCache::new(0, &[]);
+      c.set_state(state)?;
+      c.set_meta_state(meta)?;
+      // STRUCTURAL hostile-restore guard (single chokepoint). `set_state`
+      // /`set_meta_state` stay individually 1:1 with cache.py:1301-1315
+      // (mlx-lm's setters do no validation — but mlx-lm is unbounded-int
+      // numpy where a corrupt `_idx`/`rotated` errors at the *actual op*;
+      // our functional port's `seq_slice` deliberately clamps, so a bad
+      // restored cursor would silently mis-splice instead). Rather than
+      // re-checking each downstream op (the overflow/lossy-cast/splice
+      // symptoms), validate ONCE here that the restored `(state,
+      // meta_state)` is one mlx-lm's own `state` getter
+      // (cache.py:1294-1307) could have produced — closing the entire
+      // corrupt-restored-`_idx`/`_offset`/`rotated` class:
+      //
+      //  * empty buffer ⇒ fully fresh: `_offset==0 && _idx==0 &&
+      //    !rotated` (mlx-lm emits `keys=None` only for an untouched
+      //    cache; a stale flag is NOT self-healing — the empty
+      //    `_update_concat` branch keeps `rotated`, poisoning the next
+      //    `make_mask`);
+      //  * non-empty buffer (`L = keys.shape[-2]`) ⇒ `max_size >= 1`
+      //    (a real rotating cache; `==0` only the pre-setter placeholder),
+      //    `_idx <= L` (the ring write cursor never exceeds the physical
+      //    buffer — rejects the out-of-range-`_idx` mis-splice),
+      //    `rotated ⇒ L == max_size` (the ring only wraps once the buffer
+      //    reached `max_size`), and `L <= _offset` — mlx-lm's getter
+      //    (cache.py:1297-1298) emits `keys[..., :_offset, :]` whenever
+      //    `_offset < buf_len`, so the SERIALIZED keys length is always
+      //    `min(_offset, buf_len) <= _offset`; an `L > _offset` state is
+      //    impossible from a real round-trip and would let
+      //    `_update_in_place` skip growth and surface stale buffer rows.
+      //    `_offset` itself stays uncapped (legitimately `> L`); only the
+      //    `L <= _offset` direction is constrained (its overflow surface
+      //    remains the in-op `checked_add`s). These four conjuncts are the
+      //    EXACT characterization of states mlx-lm's `state` getter can
+      //    produce — the structural class-kill, complete.
+      // Report the EXACT conflict (which invariant failed and the offending
+      // values) so a corrupt prompt-cache file is diagnosable from the
+      // error message alone — Copilot review #3271119609.
+      let (invalid, reason) = if c.is_empty() {
+        let offset = c.offset();
+        let idx = c.ring_idx();
+        let rotated = c.is_rotated();
+        if offset != 0 || idx != 0 || rotated {
+          (
+            true,
+            format!(
+              "empty buffer (keys=None) requires fully-fresh meta: \
+               offset={offset} _idx={idx} rotated={rotated} (need 0/0/false)"
+            ),
+          )
+        } else {
+          (false, String::new())
+        }
+      } else {
+        let l = c.buf_seq_len()?.unwrap_or(0);
+        let max_size = c.max_window();
+        let idx = c.ring_idx();
+        let offset = c.offset();
+        let rotated = c.is_rotated();
+        if max_size == 0 {
+          (
+            true,
+            format!("non-empty buffer requires max_size >= 1, got max_size=0 (L={l})"),
+          )
+        } else if idx > l {
+          (
+            true,
+            format!("_idx ({idx}) > keys seq-len L ({l}): write cursor beyond physical buffer"),
+          )
+        } else if rotated && l != max_size {
+          (
+            true,
+            format!("rotated=true requires L == max_size, got L={l} max_size={max_size}"),
+          )
+        } else if l > offset {
+          (
+            true,
+            format!(
+              "L ({l}) > _offset ({offset}): mlx-lm getter emits keys[:_offset, :], so L <= _offset always"
+            ),
+          )
+        } else {
+          (false, String::new())
+        }
+      };
+      if invalid {
+        return Err(Error::Backend {
+          message: format!(
+            "BatchRotatingKvCache: restored state/meta_state is inconsistent (not a state mlx-lm's own round-trip could produce): {reason}"
+          ),
+        });
+      }
+      Ok(Box::new(c))
+    }
     other => Err(Error::Backend {
       message: format!("unknown cache kind: {other}"),
     }),
