@@ -28,3 +28,4 @@
 
 pub mod dsp;
 pub mod io;
+pub mod stt;
