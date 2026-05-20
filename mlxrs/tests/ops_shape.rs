@@ -192,3 +192,64 @@ fn pad_rejects_negative_high() {
   let r = ops::shape::pad(&a, &[0], &[1], &[-2], &zero, &mode);
   assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })));
 }
+
+#[test]
+fn as_strided_basic_view() {
+  // [0, 1, 2, 3] reshaped via strides (2, 1) into a 2x2 -> [[0, 1], [2, 3]].
+  let a = Array::from_slice::<f32>(&[0.0, 1.0, 2.0, 3.0], &[4i32]).unwrap();
+  // SAFETY: (2*2=4) elements with stride pattern (2,1) + offset 0 reach
+  // index 0..=3 of a 4-element source; entirely in-bounds.
+  let mut v = unsafe { ops::shape::as_strided(&a, &(2usize, 2), &[2, 1], 0) }.unwrap();
+  assert_eq!(v.shape(), vec![2, 2]);
+  assert_eq!(v.to_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0, 3.0]);
+}
+
+#[test]
+fn as_strided_with_offset() {
+  // Same buffer, single-axis 2-element view starting at offset 1 -> [1, 2].
+  let a = Array::from_slice::<f32>(&[0.0, 1.0, 2.0, 3.0], &[4i32]).unwrap();
+  // SAFETY: offset 1 + (2-1)*1 = index 2 < 4; in-bounds.
+  let mut v = unsafe { ops::shape::as_strided(&a, &(2usize,), &[1], 1) }.unwrap();
+  assert_eq!(v.shape(), vec![2]);
+  assert_eq!(v.to_vec::<f32>().unwrap(), vec![1.0, 2.0]);
+}
+
+#[test]
+fn as_strided_accepts_slice_shape() {
+  // The IntoShape pattern accepts `&[i32]` (and `&[usize]`) alongside the
+  // tuple forms — locks in the canonical-shape-archetype ergonomics.
+  let a = Array::from_slice::<f32>(&[0.0, 1.0, 2.0, 3.0], &[4i32]).unwrap();
+  let shape: &[i32] = &[2, 2];
+  // SAFETY: same as `as_strided_basic_view`.
+  let mut v = unsafe { ops::shape::as_strided(&a, &shape, &[2, 1], 0) }.unwrap();
+  assert_eq!(v.shape(), vec![2, 2]);
+  assert_eq!(v.to_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0, 3.0]);
+}
+
+#[test]
+fn as_strided_shape_strides_length_mismatch_errors() {
+  let a = Array::from_slice::<f32>(&[0.0, 1.0, 2.0, 3.0], &[4i32]).unwrap();
+  // SAFETY: the length mismatch is rejected pre-FFI; no buffer access.
+  let r = unsafe { ops::shape::as_strided(&a, &(2usize, 2), &[1i64], 0) };
+  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })));
+}
+
+#[test]
+fn as_strided_rejects_negative_dim() {
+  // Per the docs, `validate_dims` rejects any negative dim before any FFI
+  // call. Locks in the recoverable-error path so a regression that drops
+  // the check (e.g. moves it past `with_shape`) is caught here.
+  // (Lock-in regression test for Copilot review #3272546272.)
+  let a = Array::from_slice::<f32>(&[0.0, 1.0, 2.0, 3.0], &[4i32]).unwrap();
+  // Build the `&[i32]` slice with a negative dim — `&(usize, usize)`
+  // can't express this since `usize` is unsigned, so we use the slice
+  // impl of `IntoShape` directly.
+  let shape: &[i32] = &[-1, 2];
+  // SAFETY: rejection happens via `validate_dims` BEFORE any FFI call;
+  // no buffer access on the error path.
+  let r = unsafe { ops::shape::as_strided(&a, &shape, &[2i64, 1], 0) };
+  assert!(
+    matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    "negative dim must Err(ShapeMismatch), got {r:?}"
+  );
+}
