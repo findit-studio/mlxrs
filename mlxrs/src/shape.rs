@@ -74,6 +74,23 @@ pub(crate) fn dim_ptr(s: &[c_int]) -> *const c_int {
   }
 }
 
+/// `i64` sibling of [`EMPTY_DIM_SENTINEL`] for stride slices. Same rationale:
+/// avoids the singular dangling pointer that `<&[i64]>::as_ptr` returns on an
+/// empty slice when the FFI feeds it into a C++ `std::vector<int64_t>(p, p + n)`
+/// constructor.
+static EMPTY_STRIDE_SENTINEL: i64 = 0;
+
+/// `i64` sibling of [`dim_ptr`] for stride slices passed to mlx-c via a
+/// `(*const i64, len)` pair (e.g. `mlx_as_strided`).
+#[inline]
+pub(crate) fn stride_ptr(s: &[i64]) -> *const i64 {
+  if s.is_empty() {
+    &EMPTY_STRIDE_SENTINEL as *const i64
+  } else {
+    s.as_ptr()
+  }
+}
+
 impl IntoShape for &[i32] {
   fn with_shape<R>(&self, f: impl FnOnce(&[c_int]) -> Result<R>) -> Result<R> {
     f(self)

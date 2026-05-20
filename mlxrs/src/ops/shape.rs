@@ -8,7 +8,7 @@ use std::ffi::c_int;
 use crate::{
   array::Array,
   error::{Error, Result, check},
-  shape::{IntoShape, dim_ptr, validate_dims},
+  shape::{IntoShape, dim_ptr, stride_ptr, validate_dims},
   stream::default_stream,
 };
 
@@ -425,6 +425,74 @@ pub fn pad(
     )
   })?;
   Ok(out)
+}
+
+/// Strided view: reinterpret `a`'s buffer with custom `shape`, `strides`,
+/// and `offset` (in *elements*, not bytes). Mirrors `mx.as_strided` (python)
+/// and `MLX.asStrided(_:_:strides:offset:stream:)` (swift,
+/// `Source/MLX/Ops.swift`).
+///
+/// # Safety
+///
+/// This is `unsafe` because MLX (and the python/swift bindings it backs)
+/// documents `as_strided` as fundamentally unchecked: "It is the user's
+/// responsibility to ensure that the resulting array does not point to
+/// invalid memory." The wrapper does not (and cannot, without duplicating
+/// MLX's internal bounds reasoning) verify that the reachable element range
+/// `offset + Σ (shape[i]−1) · strides[i]` (over both signs) lies inside
+/// `a`'s flattened storage. A view that escapes that range will later
+/// cause invalid native reads when the array is evaluated.
+///
+/// The caller MUST ensure:
+/// - `shape.len() == strides.len()` (also enforced and surfaced as a
+///   recoverable [`Error::ShapeMismatch`] before any FFI call — checking
+///   it here is a redundant convenience, not a substitute for the caller's
+///   own bounds-correctness reasoning).
+/// - every entry of `shape` is non-negative.
+/// - the reachable element range stays inside the flattened input.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.as_strided.html).
+pub unsafe fn as_strided(
+  a: &Array,
+  shape: &impl IntoShape,
+  strides: &[i64],
+  offset: usize,
+) -> Result<Array> {
+  shape.with_shape(|s| {
+    if s.len() != strides.len() {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "as_strided: length mismatch — shape={}, strides={}",
+          s.len(),
+          strides.len()
+        ),
+      });
+    }
+    validate_dims(s)?;
+    // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+    // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+    // early return / panic frees it, then populated by the following call.
+    let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+    // not retained by mlx past it); the out-param was freshly allocated above
+    // and is written by this call; `dim_ptr`/`stride_ptr` route empty slices
+    // through static sentinels so the `(ptr, n)` pair is never singular; the
+    // backend rc is surfaced via `check()`. Element-range / offset bounds are
+    // the caller's responsibility per this fn's `# Safety` contract.
+    check(unsafe {
+      mlxrs_sys::mlx_as_strided(
+        &mut out.0,
+        a.0,
+        dim_ptr(s),
+        s.len(),
+        stride_ptr(strides),
+        strides.len(),
+        offset,
+        default_stream(),
+      )
+    })?;
+    Ok(out)
+  })
 }
 
 /// RAII guard for a temporary `mlx_vector_array`.
