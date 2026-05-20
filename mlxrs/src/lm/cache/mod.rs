@@ -14,8 +14,9 @@
 //! and [`BatchPositionedKvCache`] (swift `BatchPositionedKVCache`), plus the
 //! [`RopeOffset`] (swift `RoPEOffset`) and [`MaskMode`] (swift
 //! `ScaledDotProductAttentionMaskMode`) enums. The concrete caches beyond
-//! [`StandardKvCache`] / [`RotatingKvCache`] (Chunked / Quantized / Arrays /
-//! CacheList / Batch / prompt) land in later PRs; [`from_state`] is left
+//! [`StandardKvCache`] / [`RotatingKvCache`] / [`ChunkedKvCache`] /
+//! [`QuantizedKvCacheImpl`] (added by this PR) and prompt / persist (Arrays
+//! / CacheList / Batch land in later PRs); [`from_state`] is left
 //! extensible for them.
 //!
 //! [`StandardKvCache`] is the `KVCache` port: mlx-lm's `step`-sized
@@ -48,6 +49,7 @@ mod chunked;
 mod mask;
 pub mod persist;
 pub mod prompt;
+mod quantized;
 mod rotating;
 mod standard;
 mod util;
@@ -56,6 +58,7 @@ pub use chunked::*;
 pub use mask::{create_attention_mask, create_causal_mask};
 pub use persist::*;
 pub use prompt::*;
+pub use quantized::*;
 pub use rotating::RotatingKvCache;
 pub use standard::StandardKvCache;
 
@@ -210,6 +213,22 @@ pub trait KvCache {
     None
   }
 
+  /// **Mutable** downcast to the quantized refinement, if this cache is
+  /// quantized — the `&mut` companion of [`as_quantized`](
+  /// KvCache::as_quantized). mlx-swift-lm's quantized fast path needs
+  /// *mutable* access (`cache as? QuantizedKVCacheProtocol` on a
+  /// class-mutable cache, `KVCache.swift:101`), because the quantized
+  /// cache's defining capability
+  /// [`update_quantized`](QuantizedKvCache::update_quantized) takes `&mut
+  /// self`; without this a generation loop holding a `Box<dyn KvCache>` /
+  /// `&mut dyn KvCache` could never reach the quantized fast path through
+  /// the generic API. Default: not quantized (every non-quantized cache
+  /// inherits this `None`, so the addition is purely additive and
+  /// backward-compatible — no sibling cache changes).
+  fn as_quantized_mut(&mut self) -> Option<&mut dyn QuantizedKvCache> {
+    None
+  }
+
   /// Downcast to the batched-position refinement, if applicable (swift
   /// `cache as? BatchPositionedKVCache`). Default: scalar-positioned.
   fn as_batch_positioned(&self) -> Option<&dyn BatchPositionedKvCache> {
@@ -262,12 +281,15 @@ pub trait BatchPositionedKvCache: KvCache {
 ///   `"KVCacheSimple"` (swift) | `"StandardKvCache"` (Rust alias)
 /// - → [`RotatingKvCache`]: `"RotatingKVCache"` | `"RotatingKvCache"`
 ///   (Rust alias)
+/// - → [`ChunkedKvCache`]: `"ChunkedKVCache"` | `"ChunkedKvCache"`
+///   (Rust alias)
+/// - → [`QuantizedKvCacheImpl`]: `"QuantizedKVCache"` |
+///   `"QuantizedKvCacheImpl"` (Rust alias) — added by this PR
 ///
-/// The other cache kinds (`"ChunkedKVCache"`, `"QuantizedKVCache"`,
-/// `"ArraysCache"`, `"CacheList"`, `"BatchKVCache"`,
-/// `"BatchRotatingKVCache"`) are added by later PRs, so an unrecognized
-/// `kind` is a recoverable [`Error::Backend`] and the match is left
-/// extensible for those arms.
+/// The other cache kinds (`"ArraysCache"`, `"CacheList"`,
+/// `"BatchKVCache"`, `"BatchRotatingKVCache"`) are added by later PRs, so
+/// an unrecognized `kind` is a recoverable [`Error::Backend`] and the
+/// match is left extensible for those arms.
 pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<dyn KvCache>> {
   match kind {
     // mlx-lm `KVCache` / its documented twin `ConcatenateKVCache` /
@@ -319,6 +341,68 @@ pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<
       let mut c = ChunkedKvCache::new(None);
       c.set_state(state)?;
       c.set_meta_state(meta)?;
+      Ok(Box::new(c))
+    }
+    // mlx-lm / mlx-swift-lm `QuantizedKVCache`; `"QuantizedKvCacheImpl"` is
+    // our own round-trip alias.
+    "QuantizedKVCache" | "QuantizedKvCacheImpl" => {
+      // mlx-lm reconstructs without __init__ then assigns state/meta_state
+      // (`_BaseCache.from_state`, cache.py:170-175): `set_state` loads the
+      // (4 or 6) packed triple arrays and `set_meta_state` restores
+      // `(offset, group_size, bits)` (cache.py:302-304) afterwards — the
+      // placeholder `group_size`/`bits` here are overwritten by
+      // `set_meta_state` (a serialized prompt cache always carries the
+      // 3-value meta_state).
+      let mut c = QuantizedKvCacheImpl::new(0, 0);
+      c.set_state(state)?;
+      c.set_meta_state(meta)?;
+      // mlx-lm's `QuantizedKVCache.state` setter (cache.py:294-296:
+      // `self.keys, self.values = v`) requires a non-empty `v` to unpack,
+      // so an empty buffer with a non-zero restored `offset` is
+      // unreachable there. Our `set_state` accepts an empty state (resets
+      // to `None`) and `set_meta_state` restores `offset` afterwards,
+      // which would otherwise let `from_state` build an impossible cache
+      // (`keys=None` but `offset>0`): the next `update`/`update_quantized`
+      // would take `prev = self.offset` yet the empty-storage arm of
+      // `compute_appended` stores only the new triple, so `offset` and the
+      // stored sequence length diverge (phantom context in
+      // masks/RoPE/state slicing). Enforce `empty ⇒ offset==0` ONLY here
+      // (so `set_state`/`set_meta_state` stay individually 1:1 with
+      // cache.py:294-304), exactly mirroring the `RotatingKvCache` restore
+      // guard above.
+      if c.is_empty() && c.offset() != 0 {
+        return Err(Error::Backend {
+          message: "QuantizedKvCache: empty state with non-zero offset is invalid".into(),
+        });
+      }
+      // P2 stores the quant triples **exactly `offset`-length** (the
+      // documented `ConcatenateKVCache` / `StandardKvCache` equivalence;
+      // `mlxrs::Array` is functional, no in-place buffer slice). `set_state`
+      // and `set_meta_state` each stay individually 1:1 with mlx-lm
+      // (cache.py:294-296 assigns the triples as-is; cache.py:302-304
+      // restores `offset`), so a *forged / inconsistent* serialized cache
+      // whose restored triple seq-len ≠ restored `offset` would otherwise
+      // violate that invariant in BOTH directions — overlength (triple >
+      // offset) → next `update_quantized` would `concat_seq` onto the
+      // longer stored triple, surfacing stale tokens past the logical
+      // `offset`; underlength (triple < offset) → next `update_quantized`
+      // would land the new token past the storage end, leaving a phantom
+      // gap between storage-len and `offset`. `enforce_offset_len_invariant`
+      // converges both directions to the smaller of `offset` and the actual
+      // stored seq-len (slice triples down to `offset`; then clamp `offset`
+      // down to the post-trim seq-len, since `slice_seq` uses NumPy
+      // `std::min(e, n)` clamping at `mlx/ops.cpp:685`). This is NOT new
+      // validation the reference lacks: mlx-lm's `state` *getter* already
+      // returns `[..., :offset, :]` (cache.py:285-292), which is
+      // `[:min(offset, buf_len)]` under Python slice semantics — so this
+      // converge makes P2's offset-length representation observably
+      // IDENTICAL to mlx-lm's for ALL inputs (including forged ones in
+      // either direction) — repr-equivalence maintenance mirroring mlx-lm's
+      // `[:offset]`, not a reject. A faithfully saved consistent state
+      // (seq-len already == offset, or the full buffer when offset == len)
+      // is unaffected — both the triple slice and the offset clamp are
+      // no-ops for it.
+      c.enforce_offset_len_invariant()?;
       Ok(Box::new(c))
     }
     other => Err(Error::Backend {
