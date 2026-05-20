@@ -25,7 +25,7 @@ tokenizer-tools      = ["tokenizer-config", "dep:serde_json"]                   
 embeddings           = ["tokenizer", "dep:serde_json"]                              # encode/decode (tokenizers crate) + `1_Pooling/config.json` parsing (serde_json, optional-dep gated; NOT in the bare/core or build graph)
 lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm", "tokenizer-bpe", "tokenizer-chat", "tokenizer-deepseek-v32", "tokenizer-tools"]
 vlm                  = ["lm", "dep:image", "dep:fast_image_resize"]
-audio                = ["lm"]            # mirrors mlx-audio's Python dep on mlx-lm
+audio                = ["lm", "dep:symphonia"] # mirrors mlx-audio's Python dep on mlx-lm; symphonia = WAV codec for audio::io
 unstable-ops-overload = []               # `&a + &b` etc. (panic on shape error). OFF by default.
 gguf                 = []                                                          # GGUF load/save (mlx-c `mlx_io_gguf*`). OFF: mlxrs-sys does not yet link gguflib.
 
@@ -62,6 +62,13 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # wgpu / kornia-rs and other production Rust CV stacks. Loose semver
 # ("6") per [[feedback_no_dependency_pinning]].
 fast_image_resize = { version = "6", optional = true }
+# Multi-format audio decoder (pure-Rust, actively maintained; WAV+PCM
+# today, MP3/FLAC/OGG/etc. become opt-in via additional feature flags in
+# future PRs). `default-features = false` keeps the dep tree minimal —
+# only `wav` + `pcm` are enabled for the current core surface. The WAV
+# *encoder* side is roll-our-own (~80 LOC in audio/io.rs::save_wav);
+# symphonia has no public encoder API.
+symphonia = { version = "0.6", optional = true, default-features = false, features = ["wav", "pcm"] }
 
 # No [build-dependencies]: ALL tokenizer codegen moved to the `xtask` crate
 # (`cargo xtask-codegen`), so a normal `mlxrs` build never compiles
