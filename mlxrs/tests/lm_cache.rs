@@ -10,7 +10,7 @@
 #![cfg(feature = "lm")]
 
 use mlxrs::{
-  Array,
+  Array, Error,
   lm::cache::{
     CacheConfig, KvCache, MaskMode, RopeOffset, RotatingKvCache, StandardKvCache,
     create_attention_mask, create_causal_mask, from_state, make_prompt_cache,
@@ -1351,5 +1351,96 @@ fn rope_offset_default_is_scalar_for_non_batch_caches() {
     RopeOffset::Batch(_) => {
       panic!("non-batch Rotating cache must still yield RopeOffset::Scalar")
     }
+  }
+}
+
+/// Regression (#76, P6 cycle-8): the `KvCache::set_meta_state` trait default
+/// must mirror mlx-lm `_BaseCache.meta_state` setter (`cache.py:142-145`):
+/// a no-meta cache that receives a non-empty `meta_state` MUST raise
+/// (`ValueError` upstream → recoverable `Err(Error::Backend)` here), and an
+/// empty `meta_state` is the no-op success path.
+///
+/// `StandardKvCache` is the Rust port of mlx-lm's no-meta `KVCache` /
+/// `ConcatenateKVCache` / mlx-swift-lm's `KVCacheSimple` (`from_state` aliases
+/// all three to `StandardKvCache::new() + set_state + set_meta_state`,
+/// `mod.rs:262-267`); it does NOT override `set_meta_state`, so it inherits
+/// the trait default. Pre-fix the default was a permissive `Ok(())` and a
+/// truthy meta_state silently round-tripped — this test pins the faithful
+/// behaviour for every alias of the no-meta cache and confirms an empty
+/// `meta` still succeeds.
+///
+/// (`RotatingKvCache` / `ChunkedKvCache` override `set_meta_state` with their
+/// own parsing and are unaffected — their meta-validation tests above
+/// continue to pass; the fix is strictly trait-default-only.)
+#[test]
+fn from_state_no_meta_cache_rejects_truthy_meta_state() {
+  // Build a minimally-valid 4-D `[B=1, n_kv_heads=1, S=3, head_dim=1]`
+  // K/V state — the shape mlx-lm `KVCache.state` setter expects
+  // (cache.py:371: `self.offset = self.keys.shape[2]`).
+  fn fresh_state() -> Vec<Array> {
+    vec![kv(&[0.0, 1.0, 2.0]), kv(&[0.0, 1.0, 2.0])]
+  }
+
+  // Every mlx-lm/swift NO-META alias of `StandardKvCache` must reject a
+  // non-empty meta_state (the fix's faithful `_BaseCache` mirror).
+  for kind in &[
+    "KVCache",
+    "ConcatenateKVCache",
+    "KVCacheSimple",
+    "StandardKvCache",
+  ] {
+    let bad = from_state(kind, fresh_state(), &["x".to_string()]);
+    match bad {
+      Err(Error::Backend { message }) => {
+        assert!(
+          message.contains("no meta_state"),
+          "kind {kind}: error message must explain the cause: got {message:?}"
+        );
+      }
+      Err(other) => panic!(
+        "kind {kind}: truthy meta_state must be rejected as Error::Backend (mirroring \
+         mlx-lm _BaseCache.meta_state setter cache.py:142-145), got {other:?}"
+      ),
+      Ok(_) => panic!(
+        "kind {kind}: truthy meta_state must NOT silently round-trip (issue #76 P6 \
+         cycle-8 regression — pre-fix the trait default was a permissive Ok)"
+      ),
+    }
+
+    // A multi-value truthy meta_state is also rejected (the count is
+    // mirrored in the error message verbatim from the trait default).
+    let bad_multi = from_state(
+      kind,
+      fresh_state(),
+      &["x".to_string(), "y".to_string(), "z".to_string()],
+    );
+    assert!(
+      matches!(bad_multi, Err(Error::Backend { .. })),
+      "kind {kind}: multi-value truthy meta_state must also be rejected"
+    );
+  }
+
+  // Empty meta_state must STILL succeed for every alias (the no-op
+  // success path of the new strict default — backward compatible with
+  // `from_state_roundtrip_and_unknown_kind` and every existing call site
+  // that round-trips `c.meta_state() == []`).
+  for kind in &[
+    "KVCache",
+    "ConcatenateKVCache",
+    "KVCacheSimple",
+    "StandardKvCache",
+  ] {
+    let ok = from_state(kind, fresh_state(), &[])
+      .unwrap_or_else(|e| panic!("kind {kind}: empty meta_state must succeed, got {e:?}"));
+    assert_eq!(
+      ok.offset(),
+      3,
+      "kind {kind}: offset restored from state.shape[2]"
+    );
+    assert!(!ok.is_empty(), "kind {kind}: state was non-empty");
+    assert!(
+      ok.meta_state().is_empty(),
+      "kind {kind}: no-meta cache must report empty meta_state"
+    );
   }
 }

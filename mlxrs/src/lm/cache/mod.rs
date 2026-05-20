@@ -152,8 +152,22 @@ pub trait KvCache {
   }
 
   /// Restore scalar metadata (mlx-lm `cache.meta_state` setter). The
-  /// default (no metadata) is a no-op.
-  fn set_meta_state(&mut self, _m: &[String]) -> Result<()> {
+  /// default mirrors mlx-lm `_BaseCache.meta_state` setter
+  /// (`cache.py:142-145`): a no-meta cache that receives a non-empty
+  /// `meta_state` raises (recoverable [`Error::Backend`] here, not a
+  /// panic). An empty `m` is the no-op success path. Concrete caches with
+  /// metadata (`RotatingKvCache`, `ChunkedKvCache`) override this with
+  /// their own parsing logic.
+  fn set_meta_state(&mut self, m: &[String]) -> Result<()> {
+    if !m.is_empty() {
+      return Err(Error::Backend {
+        message: format!(
+          "KvCache has no meta_state but {} value(s) were provided: {m:?} \
+           (mirrors mlx-lm `_BaseCache.meta_state` setter cache.py:142-145)",
+          m.len()
+        ),
+      });
+    }
     Ok(())
   }
 
