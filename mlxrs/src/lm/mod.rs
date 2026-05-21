@@ -13,4 +13,5 @@ pub mod cache;
 pub mod generate;
 pub mod load;
 pub mod model;
+pub mod nn;
 pub mod sample;
