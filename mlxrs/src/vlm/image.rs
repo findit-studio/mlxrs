@@ -378,13 +378,19 @@ pub fn load_image(path: &std::path::Path) -> Result<::image::DynamicImage> {
   // [[feedback_match_official_binding_design]] this primitive mirrors
   // the references' behavior and does not add divergent hardening.
   // `decoder.orientation()` returns `Orientation::NoTransforms` for
-  // formats that don't carry orientation metadata (PNG), so this is
-  // safe for every format we accept. Only JPEG photos here will incur
-  // a real rotation (Copilot review #3272880155 — `mlxrs/Cargo.toml`
-  // enables `image` with only the `png` + `jpeg` features; TIFF/WebP
-  // are NOT in the build). We read orientation here while we still
-  // have a `&mut` borrow on the decoder; once it's consumed by
-  // `from_decoder` below, the metadata can no longer be queried.
+  // formats that don't carry orientation metadata. With the current
+  // `image` features (`png` + `jpeg`; TIFF/WebP NOT in the build,
+  // `mlxrs/Cargo.toml`) BOTH formats may expose EXIF orientation:
+  // JpegDecoder parses APP1/Exif, and image 0.25 PngDecoder exposes
+  // `exif_metadata` which the default `ImageDecoder::orientation`
+  // parses — so 16-bit PNGs with EXIF `Rotate90`/`Rotate270` reach
+  // the rotate path here too (Codex review R8 — was previously
+  // documented as JPEG-only, false for `image` 0.25.10). All rotate
+  // orientations are handled by `apply_orientation_fallible` over
+  // `rotate_buf<T>` covering u8/u16/f32 pixel variants. We read
+  // orientation here while we still have a `&mut` borrow on the
+  // decoder; once it's consumed by `from_decoder` below, the
+  // metadata can no longer be queried.
   let orientation = decoder.orientation().map_err(backend_err)?;
   // Preserve the 512 MiB default allocation guard that
   // `ImageReader::decode()` enforces. Our use of `into_decoder` (so
