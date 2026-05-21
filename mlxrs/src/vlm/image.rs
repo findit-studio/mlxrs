@@ -507,19 +507,35 @@ pub fn center_crop(
 /// differences the bottom / right edge gets the extra row / column,
 /// matching python `Image.new(...).paste(img, ((width - height) // 2,
 /// 0))` which centers the input). If `width == height`, the source is
-/// returned unchanged (no allocation).
+/// returned **unchanged** (the input `DynamicImage` is moved out — no
+/// allocation, no variant conversion).
 ///
-/// **Color order:** `fill` is an `[R, G, B]` u8 triple regardless of the
-/// source dtype — the output is always `Rgb8`. Callers needing
-/// `[0.0, 1.0]` float-space padding should pad after the
-/// [`image_to_array`] + [`rescale`] steps in array space (one `pad` op,
-/// not yet exposed here; per-model concern when needed).
+/// **Ownership / signature:** `img` is taken **by value** so the
+/// already-square fast path can hand the input back without a clone.
+/// `DynamicImage::clone()` deep-copies the entire decoded pixel
+/// buffer; for a near-budget input that buffer can itself be hundreds
+/// of MiB, and Rust's infallible `Clone` would abort the process on
+/// allocator failure — defeating the recoverable-OOM contract the
+/// padded path enforces below. Callers that need to keep the source
+/// alongside the output should clone upstream, where the failure mode
+/// is the caller's to choose.
 ///
-/// **Bounded canvas (fallible by Rust safety, not parity):** the python
+/// **Color order (padded path only):** `fill` is an `[R, G, B]` u8
+/// triple regardless of the source dtype — the *padded* output is
+/// always `Rgb8`. The already-square fast path returns the input
+/// unchanged (any `DynamicImage` variant); callers that need a
+/// uniform output dtype must convert post-hoc (e.g. `out.to_rgb8()`).
+/// Callers needing `[0.0, 1.0]` float-space padding should pad after
+/// the [`image_to_array`] + [`rescale`] steps in array space (one
+/// `pad` op, not yet exposed here; per-model concern when needed).
+///
+/// **End-to-end fallible canvas (Rust safety, not parity):** the python
 /// reference is infallible because `PIL.Image.new(size, size)` raises
 /// `MemoryError` on OOM — an exception that propagates cleanly up the
-/// processor stack. Rust's `RgbImage::from_pixel(size, size, ...)` and
-/// `Vec::with_capacity` *abort* the process on allocator failure. A
+/// processor stack. Rust's `RgbImage::from_pixel(size, size, ...)`,
+/// `Vec::with_capacity`, and `DynamicImage::to_rgb8()` *abort* the
+/// process on allocator failure (the standard `Vec` reallocation and
+/// `image`'s infallible buffer constructors all panic). A
 /// `100_000 x 1` source would otherwise drive a `100_000² × 3` = 30 GiB
 /// canvas allocation. To preserve the exception-like recoverability
 /// the python contract assumes, this function:
@@ -531,18 +547,45 @@ pub fn center_crop(
 ///    a panic-abort;
 /// 3. Uses `image::ImageBuffer::from_raw` on a uniform-fill buffer to
 ///    keep the `RgbImage::from_pixel` semantics without its panicking
-///    backing alloc.
+///    backing alloc;
+/// 4. Writes source pixels into the *already-reserved* canvas slice
+///    in-place — either row-wise `copy_from_slice` when the source is
+///    already `ImageRgb8` (zero intermediate alloc), or via the
+///    `DynamicImage::get_pixel` color-space-converting accessor for
+///    non-`Rgb8` variants (one `Rgba<u8>` per pixel on the stack;
+///    again no intermediate full-image alloc). The prior
+///    `img.to_rgb8()` call materialized a fresh decoded-byte-sized
+///    copy infallibly — a near-budget nonsquare input (e.g.
+///    `13377×13376` RGB ≈ 511 MiB) would pass the canvas gate, then
+///    panic-abort on the ~511 MiB `to_rgb8` clone. The
+///    per-pixel-write path eliminates that second source-sized
+///    allocation entirely.
+///
+/// The [`MAX_DECODED_IMAGE_BYTES`] budget bounds the canvas alone; the
+/// source itself is already-decoded (its own allocation was bounded at
+/// [`load_image`] time, or by the caller if constructed via a custom
+/// path). The per-pixel iteration touches that already-resident memory
+/// without spawning a second copy.
 ///
 /// Oversized inputs return [`Error::ShapeMismatch`] with the requested
 /// vs allowed byte count; allocator failures return
 /// [`Error::OutOfMemory`].
-pub fn pad_to_square(img: &::image::DynamicImage, fill: [u8; 3]) -> Result<::image::DynamicImage> {
-  use ::image::GenericImage as _;
+pub fn pad_to_square(img: ::image::DynamicImage, fill: [u8; 3]) -> Result<::image::DynamicImage> {
+  // `GenericImageView` provides `DynamicImage::get_pixel` (the per-pixel
+  // path below for non-`Rgb8` sources). `DynamicImage::width()`/`height()`
+  // are inherent methods so they resolve without the trait in scope.
+  use ::image::GenericImageView as _;
 
   let w = img.width();
   let h = img.height();
   if w == h {
-    return Ok(img.clone());
+    // Square fast path: return the input unchanged. NOT `img.clone()`
+    // — `DynamicImage::clone()` deep-copies the entire decoded buffer
+    // via the infallible `Vec` clone, which `abort()`s on allocator
+    // failure for near-budget inputs. By taking `img` by value we hand
+    // the same allocation back to the caller; no second source-sized
+    // copy ever happens here.
+    return Ok(img);
   }
   let size = w.max(h);
   // `size * size * 3` byte budget. Use u64 throughout so the check is
@@ -590,29 +633,73 @@ pub fn pad_to_square(img: &::image::DynamicImage, fill: [u8; 3]) -> Result<::ima
     bytes_usize,
     "canvas fill length must equal pre-computed bytes",
   );
-  // `from_raw` only returns `None` when `buf.len() < width * height *
-  // channels`. By construction `canvas_buf.len() == size * size * 3`
-  // (the loop above pushes exactly `bytes_usize / 3` × 3 bytes).
-  let mut canvas: ::image::RgbImage = ::image::ImageBuffer::from_raw(size, size, canvas_buf)
-    .expect("ImageBuffer::from_raw: canvas buffer length matches size * size * 3 by construction");
-  // Project the source onto an Rgb8 view so `copy_from` succeeds
-  // regardless of source variant (Luma8 broadcasts, Rgba* drops alpha
-  // — same projection [`image_to_array`] uses).
-  let src = img.to_rgb8();
   // Symmetric center offset on the shorter axis; longer axis stays at 0.
   let (x_off, y_off) = if w > h {
     (0u32, (w - h) / 2)
   } else {
     ((h - w) / 2, 0u32)
   };
-  canvas
-    .copy_from(&src, x_off, y_off)
-    // `copy_from` only errors when the source extent
-    // `(x_off + src_w, y_off + src_h)` exceeds the destination bounds.
-    // By construction: `x_off + w <= size` (when h > w: `x_off = (h-w)/2`
-    // and `x_off + w <= (h-w) + w = h = size`; when w > h: `x_off = 0`,
-    // `x_off + w = w <= max(w, h) = size`). Identical reasoning for y.
-    .expect("copy_from: src extent fits canvas by construction");
+  // `size` was bounded above (`bytes = size * size * 3 <= 512 MiB`),
+  // so `size <= 13_377` — well within `u32`/`usize` on any 64-bit host.
+  // Cast to `usize` for slice indexing.
+  let size_usize = size as usize;
+  let w_usize = w as usize;
+  let h_usize = h as usize;
+  let x_off_usize = x_off as usize;
+  let y_off_usize = y_off as usize;
+  // Write source pixels directly into the already-reserved canvas
+  // buffer — NO intermediate `to_rgb8` allocation. Two paths:
+  //   - source is `ImageRgb8`: row-wise `copy_from_slice` (one memcpy
+  //     of `w*3` bytes per source row). Zero per-pixel overhead, zero
+  //     intermediate alloc.
+  //   - other variant (Luma8 / Rgba8 / Rgb16 / …): per-pixel
+  //     `DynamicImage::get_pixel(x, y) -> Rgba<u8>` (color-space
+  //     conversion handled by `image`'s `dynamic_map!` dispatch). We
+  //     drop alpha and keep the RGB channels — identical projection
+  //     to `image_to_array` and the prior `to_rgb8()` did.
+  if let Some(src_rgb) = img.as_rgb8() {
+    let src_raw = src_rgb.as_raw();
+    // `src_raw.len() == w * h * 3` by `ImageBuffer<Rgb<u8>>::as_raw`
+    // contract (image 0.25 `ImageBuffer::as_raw` for `P = Rgb<u8>`).
+    // The `dst_stride * src_h` and `src_stride * src_h` bounds below
+    // are therefore both within their respective buffers.
+    let src_stride = w_usize * 3;
+    let dst_stride = size_usize * 3;
+    let dst_x_byte = x_off_usize * 3;
+    for y_src in 0..h_usize {
+      let dst_row_off = (y_off_usize + y_src) * dst_stride + dst_x_byte;
+      let src_row_off = y_src * src_stride;
+      canvas_buf[dst_row_off..dst_row_off + src_stride]
+        .copy_from_slice(&src_raw[src_row_off..src_row_off + src_stride]);
+    }
+  } else {
+    // Per-pixel path for non-`Rgb8` sources. `DynamicImage::get_pixel`
+    // returns an `Rgba<u8>` regardless of the underlying variant
+    // (Luma8 broadcasts grey across all 3 channels, Rgba* / Rgb16 /
+    // Rgb32F all project through `to_rgba()` then `into_color()` —
+    // see image 0.25 `DynamicImage::get_pixel`). We drop alpha and
+    // keep R, G, B — identical to the `to_rgb8()` projection the
+    // prior implementation used, just without materializing the
+    // intermediate `RgbImage`.
+    let dst_stride = size_usize * 3;
+    for y_src in 0..h_usize {
+      let dst_row_off = (y_off_usize + y_src) * dst_stride + x_off_usize * 3;
+      for x_src in 0..w_usize {
+        let p = img.get_pixel(x_src as u32, y_src as u32);
+        let off = dst_row_off + x_src * 3;
+        canvas_buf[off] = p.0[0];
+        canvas_buf[off + 1] = p.0[1];
+        canvas_buf[off + 2] = p.0[2];
+      }
+    }
+  }
+  // `from_raw` only returns `None` when `buf.len() < width * height *
+  // channels`. By construction `canvas_buf.len() == size * size * 3`
+  // (the uniform-fill loop pushed exactly `bytes_usize / 3` × 3 bytes;
+  // the source overlay above writes in place via index assignment and
+  // does not change the buffer length).
+  let canvas: ::image::RgbImage = ::image::ImageBuffer::from_raw(size, size, canvas_buf)
+    .expect("ImageBuffer::from_raw: canvas buffer length matches size * size * 3 by construction");
   Ok(::image::DynamicImage::ImageRgb8(canvas))
 }
 

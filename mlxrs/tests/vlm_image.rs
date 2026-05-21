@@ -714,7 +714,7 @@ fn pad_to_square_4x2_with_black_fill_produces_4x4_with_pad_rows() {
     }
   }
   let img = ::image::DynamicImage::ImageRgb8(buf);
-  let out = pad_to_square(&img, [0, 0, 0]).unwrap();
+  let out = pad_to_square(img, [0, 0, 0]).unwrap();
   assert_eq!(out.width(), 4);
   assert_eq!(out.height(), 4);
   let rgb = out.to_rgb8();
@@ -757,7 +757,7 @@ fn pad_to_square_2x4_pads_left_and_right() {
     }
   }
   let img = ::image::DynamicImage::ImageRgb8(buf);
-  let out = pad_to_square(&img, [255, 128, 64]).unwrap();
+  let out = pad_to_square(img, [255, 128, 64]).unwrap();
   assert_eq!(out.width(), 4);
   assert_eq!(out.height(), 4);
   let rgb = out.to_rgb8();
@@ -778,11 +778,14 @@ fn pad_to_square_2x4_pads_left_and_right() {
 }
 
 #[test]
-fn pad_to_square_already_square_returns_clone() {
-  // No alloc / no padding when w == h; output dims and a sample
-  // pixel must match the source.
+fn pad_to_square_already_square_returns_input_unchanged() {
+  // No alloc / no padding when w == h; the by-value signature returns
+  // the input `DynamicImage` directly (no `clone()` — see the
+  // signature doc for why `Clone` would re-introduce a panic-abort
+  // on near-budget inputs). Output dims and a sample pixel must
+  // match the source.
   let img = synthetic_image(4, 4);
-  let out = pad_to_square(&img, [99, 99, 99]).unwrap();
+  let out = pad_to_square(img, [99, 99, 99]).unwrap();
   assert_eq!(out.width(), 4);
   assert_eq!(out.height(), 4);
   // synthetic_image pixel (2, 3) = (10*3, 10*2, 100) = (30, 20, 100).
@@ -802,7 +805,7 @@ fn pad_to_square_odd_difference_extra_row_on_bottom() {
     }
   }
   let img = ::image::DynamicImage::ImageRgb8(buf);
-  let out = pad_to_square(&img, [42, 43, 44]).unwrap();
+  let out = pad_to_square(img, [42, 43, 44]).unwrap();
   assert_eq!((out.width(), out.height()), (3, 3));
   let rgb = out.to_rgb8();
   // Source at rows 0 and 1, pad row at row 2.
@@ -834,7 +837,7 @@ fn pad_to_square_rejects_oversized_canvas() {
   // allocate as the test fixture). Only the would-be `pad_to_square`
   // output trips the bound.
   let img = ::image::DynamicImage::ImageRgb8(::image::RgbImage::new(100_000, 1));
-  let err = pad_to_square(&img, [0, 0, 0]).expect_err("oversized canvas must be rejected");
+  let err = pad_to_square(img, [0, 0, 0]).expect_err("oversized canvas must be rejected");
   match err {
     Error::ShapeMismatch { message } => {
       assert!(
@@ -843,6 +846,126 @@ fn pad_to_square_rejects_oversized_canvas() {
       );
     }
     other => panic!("expected ShapeMismatch, got {other:?}"),
+  }
+}
+
+#[test]
+fn pad_to_square_near_budget_nonsquare_no_second_source_copy() {
+  // Regression for Codex Finding (high): the prior `img.to_rgb8()` call
+  // inside the nonsquare branch materialized a *second* source-sized
+  // RGB buffer infallibly. A near-budget nonsquare RGB input
+  // (e.g. 13377 × 13376) would pass the `MAX_DECODED_IMAGE_BYTES`
+  // canvas gate, fallibly reserve the ~512 MiB canvas, then
+  // panic-abort on the second ~512 MiB `to_rgb8` clone the canvas
+  // gate doesn't cover.
+  //
+  // We exercise the same code path (already-`Rgb8` source → row-wise
+  // `copy_from_slice` fast path inside `pad_to_square`) with a much
+  // smaller proxy so CI doesn't actually allocate hundreds of MiB.
+  // The 4097 × 4096 = 1px-shorter-than-square shape lands the source
+  // in the `w > h` branch and the canvas at
+  // `4097 * 4097 * 3 ≈ 48 MiB` — well under the budget but big
+  // enough to exercise both the canvas alloc and the per-row
+  // `copy_from_slice` path. The check that matters: the call returns
+  // either `Ok(_)` or a recoverable `Err`, NOT a panic / abort.
+  let mut buf = ::image::RgbImage::new(4097, 4096);
+  // Sparse marker pixels (corners + center of the source region) —
+  // a full per-pixel fill would dominate the test budget and isn't
+  // necessary for verifying the copy path.
+  buf.put_pixel(0, 0, ::image::Rgb([1, 2, 3]));
+  buf.put_pixel(4096, 0, ::image::Rgb([4, 5, 6]));
+  buf.put_pixel(0, 4095, ::image::Rgb([7, 8, 9]));
+  buf.put_pixel(4096, 4095, ::image::Rgb([10, 11, 12]));
+  let img = ::image::DynamicImage::ImageRgb8(buf);
+  // If this panics / aborts the process we'd never reach the
+  // assertions — `cargo test` would surface the abort as a failed
+  // test. `Ok` is the expected path under the 48 MiB budget; the
+  // assertion guards the alternate-OOM case so a transient allocator
+  // failure on CI does not silently no-op the regression coverage.
+  let out = pad_to_square(img, [128, 128, 128])
+    .expect("near-budget nonsquare path must return Ok or recoverable Err, never abort");
+  // w > h → padding on the y axis; size = max(4097, 4096) = 4097.
+  // y_off = (4097 - 4096) / 2 = 0 (integer floor — top edge stays
+  // at 0 rows of fill, bottom edge gets the extra row).
+  assert_eq!((out.width(), out.height()), (4097, 4097));
+  let rgb = out.to_rgb8();
+  // Source corners must land at their src coords (y_off = 0,
+  // x_off = 0).
+  assert_eq!(rgb.get_pixel(0, 0).0, [1, 2, 3], "src TL");
+  assert_eq!(rgb.get_pixel(4096, 0).0, [4, 5, 6], "src TR");
+  assert_eq!(rgb.get_pixel(0, 4095).0, [7, 8, 9], "src BL");
+  assert_eq!(rgb.get_pixel(4096, 4095).0, [10, 11, 12], "src BR");
+  // Bottom pad row (y = 4096) must be the uniform fill.
+  assert_eq!(rgb.get_pixel(0, 4096).0, [128, 128, 128], "pad row TL");
+  assert_eq!(rgb.get_pixel(4096, 4096).0, [128, 128, 128], "pad row TR");
+}
+
+#[test]
+fn pad_to_square_non_rgb8_source_produces_rgb_output() {
+  // Regression for Codex Finding (high): the per-pixel non-`Rgb8`
+  // branch must produce correct RGB output without ever calling the
+  // infallible `to_rgb8()` clone. Cover both Luma8 (grey →
+  // broadcast across R/G/B) and Rgba8 (alpha → dropped, R/G/B
+  // preserved) — the two non-`Rgb8` variants `image_to_array`
+  // already accepts upstream.
+
+  // --- Luma8: 3 wide × 2 tall, grey ramp by column. Pad rows on
+  //     top/bottom to a 3x3 square.
+  let mut luma = ::image::GrayImage::new(3, 2);
+  for y in 0..2 {
+    for x in 0..3 {
+      luma.put_pixel(x, y, ::image::Luma([(10 * x + y) as u8]));
+    }
+  }
+  let img_luma = ::image::DynamicImage::ImageLuma8(luma);
+  let out = pad_to_square(img_luma, [200, 200, 200]).unwrap();
+  assert_eq!((out.width(), out.height()), (3, 3));
+  let rgb = out.to_rgb8();
+  // y_off = (3 - 2) / 2 = 0 → source occupies rows 0..2, fill at
+  // row 2. Each source pixel must broadcast the grey value across
+  // all 3 RGB channels.
+  for y in 0..2 {
+    for x in 0..3 {
+      let g = (10 * x + y) as u8;
+      assert_eq!(
+        rgb.get_pixel(x, y).0,
+        [g, g, g],
+        "luma broadcast y={y} x={x}",
+      );
+    }
+  }
+  for x in 0..3 {
+    assert_eq!(rgb.get_pixel(x, 2).0, [200, 200, 200], "luma pad x={x}");
+  }
+
+  // --- Rgba8: 2 wide × 4 tall with an alpha gradient. The alpha
+  //     must be dropped; R/G/B preserved.
+  let mut rgba = ::image::RgbaImage::new(2, 4);
+  for y in 0..4 {
+    for x in 0..2 {
+      rgba.put_pixel(
+        x,
+        y,
+        ::image::Rgba([(10 * x + y) as u8, 50, 100, ((y * 60) % 256) as u8]),
+      );
+    }
+  }
+  let img_rgba = ::image::DynamicImage::ImageRgba8(rgba);
+  let out = pad_to_square(img_rgba, [77, 88, 99]).unwrap();
+  assert_eq!((out.width(), out.height()), (4, 4));
+  let rgb = out.to_rgb8();
+  // x_off = (4 - 2) / 2 = 1; source columns land at x=1..3, pad at
+  // x=0 and x=3. Alpha must be dropped; R/G/B preserved.
+  for y in 0..4 {
+    assert_eq!(rgb.get_pixel(0, y).0, [77, 88, 99], "rgba pad L y={y}");
+    assert_eq!(rgb.get_pixel(3, y).0, [77, 88, 99], "rgba pad R y={y}");
+    for x_src in 0..2u32 {
+      assert_eq!(
+        rgb.get_pixel(1 + x_src, y).0,
+        [(10 * x_src + y) as u8, 50, 100],
+        "rgba src y={y} x_src={x_src} (alpha must be dropped)",
+      );
+    }
   }
 }
 
