@@ -34,7 +34,11 @@
 //!   plus the unified
 //!   [`PoolingStrategy`](crate::embeddings::PoolingStrategy) enum +
 //!   [`pool`](crate::embeddings::pool) dispatcher (mirrors python
-//!   `pool_by_config` + swift `Pooling.callAsFunction`).
+//!   `pool_by_config` + swift `Pooling.callAsFunction`), plus
+//!   [`pool_post`](crate::embeddings::pool_post) — the shared
+//!   normalize/dimension/layer-norm tail applied to an already-pooled
+//!   vector (a model's trained `pooled_output` on the `cls`/`none`
+//!   paths, swift `inputs.pooledOutput ?? …`).
 //! - Normalization: parameterized
 //!   [`normalize`](crate::embeddings::normalize()) (real
 //!   `mlx_linalg_norm` `ord=p`),
@@ -124,6 +128,6 @@ pub use normalize::{
 };
 pub use pooling::{
   LAYER_NORM_EPS, PoolingStrategy, RMS_NORM_EPS, cls_pooling, first_token_pooling,
-  last_token_pooling, max_pooling, mean_pooling, pool, truncate_last_dim,
+  last_token_pooling, max_pooling, mean_pooling, pool, pool_post, truncate_last_dim,
 };
 pub use similarity::{cosine_similarity, cosine_similarity_matrix};

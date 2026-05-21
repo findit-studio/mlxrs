@@ -109,13 +109,22 @@ pub(crate) struct MockEmbeddingModel {
   /// Per-position hidden rows: `canned[s]` is the `(hidden,)` row emitted at
   /// sequence position `s`. All rows must share the same length (`hidden`).
   pub canned: Vec<Vec<f32>>,
+  /// Optional per-batch-item rows for the model-provided `pooled_output`:
+  /// `pooled[b]` is the `(hidden,)` pooler row for batch item `b`. When
+  /// `Some`, `forward` emits a `(batch, hidden)` `pooled_output` (tiling /
+  /// truncating these rows to the actual batch); when `None`,
+  /// `pooled_output` is `None` (the common encoder case). Used to exercise
+  /// the `Cls`/`None` pooled-output path in [`encode`](super::encode::encode).
+  pub pooled: Option<Vec<Vec<f32>>>,
 }
 
 #[cfg(test)]
 impl MockEmbeddingModel {
   /// Build a mock whose position-`s` hidden row is `canned[s]`. The longest
   /// supplied row defines `hidden`; shorter rows are zero-padded on the right
-  /// so every position has a uniform width (keeps the fixture forgiving).
+  /// so every position has a uniform width (keeps the fixture forgiving). No
+  /// model-provided `pooled_output` (use [`with_pooled`](Self::with_pooled)
+  /// to add one).
   pub(crate) fn new(canned: Vec<Vec<f32>>) -> Self {
     let hidden = canned.iter().map(Vec::len).max().unwrap_or(0);
     let canned = canned
@@ -125,7 +134,28 @@ impl MockEmbeddingModel {
         row
       })
       .collect();
-    Self { canned }
+    Self {
+      canned,
+      pooled: None,
+    }
+  }
+
+  /// Attach a model-provided `pooled_output`: `pooled[b]` is the `(hidden,)`
+  /// pooler row for batch item `b`. `forward` then returns a `(batch, hidden)`
+  /// `pooled_output` whose rows are `pooled` tiled / truncated to the request
+  /// batch (rows are zero-padded on the right to a uniform width, like
+  /// [`new`](Self::new)). Used to test the `Cls`/`None` pooled-output path.
+  pub(crate) fn with_pooled(mut self, pooled: Vec<Vec<f32>>) -> Self {
+    let hidden = pooled.iter().map(Vec::len).max().unwrap_or(0);
+    let pooled = pooled
+      .into_iter()
+      .map(|mut row| {
+        row.resize(hidden, 0.0);
+        row
+      })
+      .collect();
+    self.pooled = Some(pooled);
+    self
   }
 }
 
@@ -161,7 +191,31 @@ impl EmbeddingModel for MockEmbeddingModel {
       }
     }
     let last_hidden_state = Array::from_slice::<f32>(&data, &(batch, seq, hidden))?;
-    Ok(EmbeddingModelOutput::from_hidden_state(last_hidden_state))
+
+    // Optional model-provided pooled output: tile `self.pooled` rows to the
+    // request batch (cycling if fewer rows than batch items were supplied)
+    // and emit a `(batch, pooled_hidden)` array. `None` → no pooler head.
+    let pooled_output = match &self.pooled {
+      None => None,
+      Some(pooled) => {
+        if pooled.is_empty() {
+          return Err(crate::error::Error::ShapeMismatch {
+            message: "MockEmbeddingModel: pooled_output rows must be non-empty".to_string(),
+          });
+        }
+        let pooled_hidden = pooled[0].len();
+        let mut pdata = Vec::with_capacity(batch * pooled_hidden);
+        for b in 0..batch {
+          pdata.extend_from_slice(&pooled[b % pooled.len()]);
+        }
+        Some(Array::from_slice::<f32>(&pdata, &(batch, pooled_hidden))?)
+      }
+    };
+
+    Ok(EmbeddingModelOutput {
+      last_hidden_state,
+      pooled_output,
+    })
   }
 }
 
