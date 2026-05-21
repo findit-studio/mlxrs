@@ -305,6 +305,54 @@ impl GroupNorm {
     }
   }
 
+  /// Validate the input shape against GroupNorm's invariants: rank ≥ 2
+  /// (so there is a feature axis distinct from the batch axis),
+  /// `num_groups > 0`, and the last (feature) axis evenly divisible by
+  /// `num_groups`. Returns the feature dim as `i32` for downstream
+  /// `group_size = dims / num_groups` arithmetic.
+  ///
+  /// Both [`Self::group_norm`] and [`Self::pytorch_group_norm`] call this
+  /// up-front. The references don't run an explicit guard (they rely on
+  /// the user / framework wiring), but in the safe layer skipping it
+  /// produces *silent* activation corruption (e.g. rank-1 `[C]` with
+  /// `num_groups=1` would pass as `[C, 1, 1]` and normalize singleton
+  /// groups to zero; `[1, 3]` with `num_groups=2` would pass the
+  /// element-count divisibility but the 3-wide feature axis isn't
+  /// splittable) — surface the misuse as `Err(ShapeMismatch)` instead.
+  fn validate_input_shape(&self, orig_shape: &[usize]) -> Result<i32> {
+    if orig_shape.len() < 2 {
+      return Err(crate::error::Error::ShapeMismatch {
+        message: format!(
+          "GroupNorm input must have rank >= 2 (at least [batch, dims]), got rank {} shape {orig_shape:?}",
+          orig_shape.len()
+        ),
+      });
+    }
+    if self.num_groups <= 0 {
+      return Err(crate::error::Error::ShapeMismatch {
+        message: format!(
+          "GroupNorm: num_groups ({}) must be positive",
+          self.num_groups
+        ),
+      });
+    }
+    let dims = *orig_shape
+      .last()
+      .expect("rank-≥-2 guarded above ⇒ last() is Some");
+    let dims_i32 = i32::try_from(dims).map_err(|_| crate::error::Error::ShapeMismatch {
+      message: format!("GroupNorm: feature dim {dims} exceeds i32::MAX"),
+    })?;
+    if dims_i32 % self.num_groups != 0 {
+      return Err(crate::error::Error::ShapeMismatch {
+        message: format!(
+          "GroupNorm: feature dim ({dims_i32}) must be evenly divisible by num_groups ({})",
+          self.num_groups
+        ),
+      });
+    }
+    Ok(dims_i32)
+  }
+
   /// Default (`pytorch_compatible = false`) per-group normalize. Mirrors
   /// swift `GroupNorm.groupNorm` / python `GroupNorm._group_norm`:
   /// reshape `[B, ...rest, dims]` → `[B, -1, num_groups]`, mean/var over
@@ -316,6 +364,15 @@ impl GroupNorm {
   /// [`ops::shape::reshape`]'s non-negative `validate_dims` check.
   fn group_norm(&self, x: &Array) -> Result<Array> {
     let orig_shape = x.shape();
+    // Same invariants the pytorch_compatible path checks inline: rank ≥ 2
+    // (need a feature dim, not just a batch dim), num_groups > 0, and the
+    // last (feature) axis must be splittable evenly by num_groups.
+    // Without these the `total / (batch * num_groups)` inference would
+    // silently corrupt activations (e.g. rank-1 `[C]` with num_groups=1
+    // would pass as `[C, 1, 1]` and normalize singleton groups to zero;
+    // `[1, 3]` with num_groups=2 would pass because element count
+    // happens to be divisible but the 3-wide feature axis isn't).
+    self.validate_input_shape(&orig_shape)?;
     let batch = batch_dim(&orig_shape)?;
     let inferred = inferred_dim(&orig_shape, &[batch, self.num_groups])?;
     let three_d: &[i32] = &[batch, inferred, self.num_groups];
@@ -351,23 +408,10 @@ impl GroupNorm {
   /// transpose / reshape to the original shape.
   fn pytorch_group_norm(&self, x: &Array) -> Result<Array> {
     let orig_shape = x.shape();
+    // Shared rank/num_groups/feature-axis invariants — same bug class as
+    // the default path (silent corruption when violated).
+    let dims_i32 = self.validate_input_shape(&orig_shape)?;
     let batch = batch_dim(&orig_shape)?;
-    let dims = *orig_shape
-      .last()
-      .ok_or_else(|| crate::error::Error::ShapeMismatch {
-        message: "GroupNorm input must have rank >= 2 (at least [batch, dims])".into(),
-      })?;
-    let dims_i32 = i32::try_from(dims).map_err(|_| crate::error::Error::ShapeMismatch {
-      message: format!("GroupNorm: feature dim {dims} exceeds i32::MAX"),
-    })?;
-    if self.num_groups <= 0 || dims_i32 % self.num_groups != 0 {
-      return Err(crate::error::Error::ShapeMismatch {
-        message: format!(
-          "GroupNorm: num_groups ({}) must be positive and divide dims ({dims_i32}) evenly",
-          self.num_groups
-        ),
-      });
-    }
     let group_size = dims_i32 / self.num_groups;
 
     // `[B, mid, num_groups, group_size]` where `mid = total / (B *
@@ -444,7 +488,17 @@ fn batch_dim(shape: &[usize]) -> Result<i32> {
 /// numeric so the resulting reshape is trivially auditable (and passes
 /// [`crate::shape::validate_dims`]'s non-negative check).
 fn inferred_dim(shape: &[usize], known_dims: &[i32]) -> Result<i32> {
-  let total: usize = shape.iter().product();
+  // Checked product (same `try_fold` + `checked_mul` pattern as
+  // `Array::from_slice` in `array/construction.rs`): unchecked
+  // `.product()` would silently wrap on a large / broadcast shape,
+  // yielding the wrong inferred dim → either a downstream reshape
+  // boundary failure or, worse, a passing reshape with a corrupted layout.
+  let total: usize = shape
+    .iter()
+    .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+    .ok_or_else(|| crate::error::Error::ShapeMismatch {
+      message: format!("GroupNorm: shape product overflows usize for shape {shape:?}"),
+    })?;
   let mut divisor: usize = 1;
   for &d in known_dims {
     let du = usize::try_from(d).map_err(|_| crate::error::Error::ShapeMismatch {
@@ -757,5 +811,111 @@ mod tests {
     assert_eq!(b.shape(), vec![4]);
     assert_eq!(w.to_vec::<f32>().unwrap(), vec![1.0; 4]);
     assert_eq!(b.to_vec::<f32>().unwrap(), vec![0.0; 4]);
+  }
+
+  // ─── GroupNorm shape-invariant regressions (Codex review) ───
+
+  /// Rank-1 `[C]` with `num_groups=1` used to silently corrupt
+  /// activations (passed as `[C, 1, 1]` and normalized singleton groups
+  /// to zero); now an explicit `Err(ShapeMismatch)`.
+  #[test]
+  fn group_norm_rank1_input_errors() {
+    let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(4,)).unwrap();
+    let gn = GroupNorm::new(1, 4, 1e-5, false, false).unwrap();
+    let err = gn.forward(&x).unwrap_err();
+    match err {
+      crate::error::Error::ShapeMismatch { message } => {
+        assert!(message.contains("rank"), "unexpected message: {message}");
+      }
+      other => panic!("expected ShapeMismatch, got {other:?}"),
+    }
+  }
+
+  /// Rank-2 `[1, 3]` with `num_groups=2` used to silently pass (element
+  /// count is divisible — 6/2 = 3 — but the 3-wide feature axis isn't
+  /// splittable). Now an explicit `Err(ShapeMismatch)`.
+  #[test]
+  fn group_norm_feature_dim_not_divisible_errors() {
+    let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(1, 3)).unwrap();
+    let gn = GroupNorm::new(2, 3, 1e-5, false, false).unwrap();
+    let err = gn.forward(&x).unwrap_err();
+    match err {
+      crate::error::Error::ShapeMismatch { message } => {
+        assert!(
+          message.contains("divisible"),
+          "unexpected message: {message}"
+        );
+      }
+      other => panic!("expected ShapeMismatch, got {other:?}"),
+    }
+  }
+
+  /// Same invariants must hold on the `pytorch_compatible` path: rank-1
+  /// input rejected.
+  #[test]
+  fn group_norm_pytorch_compat_rank1_input_errors() {
+    let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(4,)).unwrap();
+    let gn = GroupNorm::new(1, 4, 1e-5, false, true).unwrap();
+    let err = gn.forward(&x).unwrap_err();
+    match err {
+      crate::error::Error::ShapeMismatch { message } => {
+        assert!(message.contains("rank"), "unexpected message: {message}");
+      }
+      other => panic!("expected ShapeMismatch, got {other:?}"),
+    }
+  }
+
+  /// Same invariants on the `pytorch_compatible` path: non-divisible
+  /// feature dim rejected.
+  #[test]
+  fn group_norm_pytorch_compat_feature_dim_not_divisible_errors() {
+    let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(1, 3)).unwrap();
+    let gn = GroupNorm::new(2, 3, 1e-5, false, true).unwrap();
+    let err = gn.forward(&x).unwrap_err();
+    match err {
+      crate::error::Error::ShapeMismatch { message } => {
+        assert!(
+          message.contains("divisible"),
+          "unexpected message: {message}"
+        );
+      }
+      other => panic!("expected ShapeMismatch, got {other:?}"),
+    }
+  }
+
+  /// Regression: the valid rank-2 case (`[1, 4]` with `num_groups=2`)
+  /// must continue to work after the new validation guards.
+  #[test]
+  fn group_norm_valid_rank2_still_works() {
+    let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(1, 4)).unwrap();
+    let gn = GroupNorm::new(2, 4, 1e-5, false, false).unwrap();
+    let mut y = gn.forward(&x).unwrap();
+    let v = y.to_vec::<f32>().unwrap();
+    assert_eq!(v.len(), 4);
+    assert!(v.iter().all(|x| x.is_finite()));
+  }
+
+  // ─── inferred_dim overflow regression (Codex review) ───
+
+  /// `inferred_dim` used to compute `total = shape.iter().product()`
+  /// unchecked, so a shape whose `usize` product wraps would yield the
+  /// wrong inferred dim (and either a reshape boundary failure or a
+  /// passing reshape on a corrupted layout). Now an `Err(ShapeMismatch)`
+  /// before we ever reach the divisibility check.
+  ///
+  /// `usize::MAX` on its own already wraps on the `* 2` step.
+  #[test]
+  fn inferred_dim_overflow_errors() {
+    let shape: [usize; 2] = [usize::MAX, 2];
+    let err = inferred_dim(&shape, &[1, 1]).unwrap_err();
+    match err {
+      crate::error::Error::ShapeMismatch { message } => {
+        assert!(
+          message.contains("overflow"),
+          "unexpected message: {message}"
+        );
+      }
+      other => panic!("expected ShapeMismatch, got {other:?}"),
+    }
   }
 }
