@@ -8,8 +8,8 @@ use std::f32::consts::PI;
 use mlxrs::{
   Array, Dtype,
   audio::dsp::{
-    LogFloor, hann_window, log_mel_spectrogram, log_mel_spectrogram_with, mel_filter_bank,
-    mel_spectrogram, stft,
+    LogFloor, WindowPad, hann_window, log_mel_spectrogram, log_mel_spectrogram_with,
+    mel_filter_bank, mel_spectrogram, stft,
   },
 };
 
@@ -74,7 +74,7 @@ fn stft_shape_matches_formula() {
   // For n_fft=8, hop=4, samples=16 with center=True (pad=4 each side),
   // padded_len = 24, num_frames = 1 + (24 - 8) / 4 = 5.
   let x = sine_1khz_16samples();
-  let s = stft(&x, 8, 4, None).unwrap();
+  let s = stft(&x, 8, 4, None, WindowPad::Center).unwrap();
   assert_eq!(s.shape(), vec![5, 5]); // (num_frames, n_fft/2 + 1)
   assert_eq!(s.dtype().unwrap(), Dtype::Complex64);
 }
@@ -82,21 +82,21 @@ fn stft_shape_matches_formula() {
 #[test]
 fn stft_rejects_zero_n_fft() {
   let x = sine_1khz_16samples();
-  let r = stft(&x, 0, 4, None);
+  let r = stft(&x, 0, 4, None, WindowPad::Center);
   assert!(matches!(r, Err(mlxrs::Error::Backend { .. })));
 }
 
 #[test]
 fn stft_rejects_zero_hop_length() {
   let x = sine_1khz_16samples();
-  let r = stft(&x, 8, 0, None);
+  let r = stft(&x, 8, 0, None, WindowPad::Center);
   assert!(matches!(r, Err(mlxrs::Error::Backend { .. })));
 }
 
 #[test]
 fn stft_rejects_win_length_greater_than_n_fft() {
   let x = sine_1khz_16samples();
-  let r = stft(&x, 8, 4, Some(16));
+  let r = stft(&x, 8, 4, Some(16), WindowPad::Center);
   assert!(matches!(r, Err(mlxrs::Error::Backend { .. })));
 }
 
@@ -113,7 +113,7 @@ fn stft_minimum_valid_input_boundary_padding_to_index_zero() {
   // we use hop=4 to keep the math obvious: num_frames = 1 + (13 - 8) / 4 = 2.
   let buf: Vec<f32> = (0..5).map(|i| i as f32).collect();
   let x = Array::from_slice::<f32>(&buf, &[5i32]).unwrap();
-  let s = stft(&x, 8, 4, None).unwrap();
+  let s = stft(&x, 8, 4, None, WindowPad::Center).unwrap();
   // Shape proves the suffix was the full 4 elements (otherwise padded_len
   // would have been 12 → num_frames = 2 still, but a value-level check via
   // the reflect-pad output itself is cleaner — assert via shape + dtype
@@ -128,16 +128,16 @@ fn stft_rejects_input_too_short_for_reflect_pad() {
   // n_fft=16, pad=8, but input has only 4 samples — reflect needs len >= pad+1.
   let buf = vec![0.0_f32, 0.1, 0.2, 0.3];
   let x = Array::from_slice::<f32>(&buf, &[4i32]).unwrap();
-  let r = stft(&x, 16, 8, None);
+  let r = stft(&x, 16, 8, None, WindowPad::Center);
   assert!(matches!(r, Err(mlxrs::Error::Backend { .. })));
 }
 
 #[test]
 fn stft_win_length_shorter_than_n_fft_zero_pads_window() {
-  // win_length=4 with n_fft=8 zero-pads the window to length 8 (right side).
-  // Shape stays `(num_frames, n_fft/2+1)`.
+  // win_length=4 with n_fft=8 + WindowPad::Right zero-pads the window to
+  // length 8 on the right side. Shape stays `(num_frames, n_fft/2+1)`.
   let x = sine_1khz_16samples();
-  let s = stft(&x, 8, 4, Some(4)).unwrap();
+  let s = stft(&x, 8, 4, Some(4), WindowPad::Right).unwrap();
   assert_eq!(s.shape(), vec![5, 5]);
 }
 
