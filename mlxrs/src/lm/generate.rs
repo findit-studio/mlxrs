@@ -1295,6 +1295,23 @@ impl<M: Model> Iterator for BatchGenerator<'_, M> {
       return Some(Err(e));
     }
 
+    // Zero-budget guard (mirrors single-seq `Generator::next` at the
+    // analogous slot): mlx-lm yields exactly `max_tokens` tokens with `if n
+    // == max_tokens: break` BEFORE the yield. For batched generation every
+    // row shares one `max_tokens`, so when no row can ever produce a token
+    // the iterator finishes immediately — BEFORE prefill and any model /
+    // cache mutation, matching `GenConfig`'s documented "0 produces nothing"
+    // and the single-seq guard's contract.
+    if self
+      .produced
+      .iter()
+      .zip(self.finished.iter())
+      .all(|(&p, f)| f.is_some() || p >= self.max_tokens)
+    {
+      self.done = true;
+      return None;
+    }
+
     // Prompt prefill runs once, lazily, on the first poll.
     if !self.prefilled {
       self.prefilled = true;
@@ -1907,5 +1924,77 @@ mod batch_tests {
     let mut batch_gen = batch_generate_step(&model, &prompts, 0, cache, GenConfig::default());
     assert!(batch_gen.next().unwrap().is_err());
     assert!(batch_gen.next().is_none());
+  }
+
+  /// `max_tokens = 0` yields zero steps and runs ZERO model / cache
+  /// mutations — exactly mirroring single-seq `Generator::next`'s zero-budget
+  /// guard (`if self.produced >= self.max_tokens: return None` BEFORE
+  /// prefill).
+  ///
+  /// Empty per-row scripts make a successful decode impossible (any
+  /// non-existent `scripts[row][0]` lookup falls through to id `0` rather
+  /// than panicking, but the offset side-effect of prefill on the cache
+  /// would still be observable). To prove no prefill / model mutation ran
+  /// we'd ideally inspect the cache's offset post-iteration; the iterator
+  /// owns its `Vec<Box<dyn KvCache>>` so the cleaner shape is: assert the
+  /// iterator is empty on first poll (the guard fires before prefill), AND
+  /// that no item is ever produced when the guard is the only thing
+  /// returning `None` — which is what `.count() == 0` verifies. The
+  /// empty-script setup is belt-and-braces: even if the guard regressed
+  /// silently, the iterator would attempt to read script idx 0, fall back
+  /// to token `0`, and emit it — failing this test loudly.
+  #[test]
+  fn batch_generate_step_zero_max_tokens_emits_nothing_and_skips_prefill() {
+    let prompts: Vec<&[u32]> = vec![&[1u32, 2, 3], &[7u32]];
+    let left_pad = batch_left_padding(&prompts);
+    let max_len = 3;
+    let model = MockBatchModel::new(16, max_len, vec![vec![], vec![]]);
+    let cache: Vec<Box<dyn crate::lm::cache::KvCache>> =
+      vec![Box::new(BatchKvCache::new(&left_pad))];
+    // Sanity: fresh cache offset is 0; any prefill / decode would advance it.
+    assert_eq!(cache[0].offset(), 0);
+
+    let cfg = GenConfig {
+      max_tokens: 0,
+      eos: vec![5],
+      ..Default::default()
+    };
+
+    let batch_gen = batch_generate_step(&model, &prompts, 0, cache, cfg);
+    // Zero-budget guard fires on the first poll BEFORE prefill: no items.
+    assert_eq!(batch_gen.count(), 0);
+  }
+
+  /// `batch_generate`'s aggregator drains the same iterator as
+  /// `batch_generate_step` and pushes per-row tokens; with `max_tokens = 0`
+  /// the iterator yields nothing, so each row's output Vec is empty.
+  /// Mirrors the aggregator loop directly to avoid spinning up a HF
+  /// `Tokenizer` fixture for a behavior that's fully determined by the
+  /// iterator.
+  #[test]
+  fn batch_generate_zero_max_tokens_returns_empty_vec_per_row() {
+    let prompts: Vec<&[u32]> = vec![&[1u32, 2, 3], &[7u32], &[9u32, 10]];
+    let left_pad = batch_left_padding(&prompts);
+    let max_len = 3;
+    let model = MockBatchModel::new(16, max_len, vec![vec![], vec![], vec![]]);
+    let cache: Vec<Box<dyn crate::lm::cache::KvCache>> =
+      vec![Box::new(BatchKvCache::new(&left_pad))];
+    let cfg = GenConfig {
+      max_tokens: 0,
+      ..Default::default()
+    };
+
+    let b = prompts.len();
+    let mut results: Vec<Vec<u32>> = vec![Vec::new(); b];
+    for step in batch_generate_step(&model, &prompts, 0, cache, cfg) {
+      let step = step.expect("zero-budget guard must not yield Err");
+      // Reproduce the `batch_generate` aggregator: drop EOS-finish tokens,
+      // append everything else. With max_tokens=0 the loop body never runs.
+      match step.finish_reason.as_deref() {
+        Some("stop") => {}
+        _ => results[step.row].push(step.token),
+      }
+    }
+    assert_eq!(results, vec![Vec::<u32>::new(); b]);
   }
 }
