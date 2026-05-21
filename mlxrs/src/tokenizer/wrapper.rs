@@ -30,6 +30,7 @@ use std::path::Path;
 use serde_json::Value;
 use tokenizers::Tokenizer as HfTokenizer;
 
+use super::encode_options::{EncodeOptions, Encoded};
 use crate::Error;
 
 #[cfg(feature = "tokenizer-chat")]
@@ -79,6 +80,16 @@ pub struct Tokenizer {
   #[cfg(all(feature = "tokenizer-config", feature = "tokenizer-stream"))]
   clean_up_spaces: bool,
   eos_token_ids: std::collections::BTreeSet<u32>,
+  /// The PRIMARY EOS id — the one to APPEND when a caller asks for one
+  /// EOS (rather than the full stop-id SET). For caller-supplied
+  /// `eos_token_ids`, this is the first slice element (preserving input
+  /// order, which `BTreeSet` would have sorted away); for the
+  /// `tokenizer-config` fallback this is the `eos_token` resolved to its
+  /// id. `None` when there is no configured primary EOS, including when
+  /// both sources are absent or the caller explicitly supplies an empty
+  /// `eos_token_ids` slice (which suppresses the fallback and leaves the
+  /// set empty; used to error on `encode_with(add_eos=true)`).
+  primary_eos: Option<u32>,
   /// The jinja `chat_template` string. Only consumed by
   /// `apply_chat_template` (so gated on `tokenizer-chat`).
   #[cfg(feature = "tokenizer-chat")]
@@ -206,7 +217,15 @@ impl Tokenizer {
     // (`if let` rather than `match` — the `None` arm is empty without the
     // `tokenizer-config` feature, which would trip `clippy::single_match`.)
     let mut eos_set = std::collections::BTreeSet::new();
+    // Track the PRIMARY eos id (the one to APPEND for `add_eos`) separately
+    // from the full stop set, since `BTreeSet::iter().next()` returns the
+    // numerically smallest entry — wrong when a multi-id stop list contains
+    // a non-EOS pad/unk with a smaller id than the actual EOS.
+    let mut primary_eos: Option<u32> = None;
     if let Some(ids) = eos_token_ids {
+      if let Some(&first) = ids.first() {
+        primary_eos = Some(first);
+      }
       eos_set.extend(ids.iter().copied());
     }
     #[cfg(feature = "tokenizer-config")]
@@ -214,6 +233,7 @@ impl Tokenizer {
       && let Some(ref e) = eos_token
       && let Some(id) = hf.token_to_id(e)
     {
+      primary_eos = Some(id);
       eos_set.insert(id);
     }
 
@@ -261,6 +281,7 @@ impl Tokenizer {
       #[cfg(all(feature = "tokenizer-config", feature = "tokenizer-stream"))]
       clean_up_spaces,
       eos_token_ids: eos_set,
+      primary_eos,
       #[cfg(feature = "tokenizer-chat")]
       chat_template,
       #[cfg(feature = "tokenizer-config")]
@@ -308,12 +329,141 @@ impl Tokenizer {
 
   /// Encode text to token ids. `add_special_tokens` mirrors the Swift /
   /// transformers flag.
+  ///
+  /// This is the short positional form preserved for back-compat: it
+  /// returns the **raw** HF `Encoding` ids verbatim (including any
+  /// HF-applied padding cells when the tokenizer has padding enabled).
+  /// For explicit control over EOS appending, truncation, attention-mask
+  /// emission — and for pad-stripping — use
+  /// [`Tokenizer::encode_with`] with an [`EncodeOptions`] builder.
   pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, Error> {
     let enc = self
       .hf
       .encode(text, add_special_tokens)
       .map_err(|e| Error::tokenizer(format!("encode: {e}")))?;
     Ok(enc.get_ids().to_vec())
+  }
+
+  /// Encode `text` with explicit options.
+  ///
+  /// Exposes the richer surface of the underlying HF `tokenizers` crate that
+  /// the short [`encode`](Self::encode) hides — explicit EOS appending,
+  /// truncation, attention-mask emission, and pad-stripping. The returned
+  /// [`Encoded::attention_mask`] is `Some` exactly when
+  /// [`EncodeOptions::return_attention_mask`] is `true`; when present its
+  /// length equals `ids.len()`.
+  ///
+  /// **Padding stripping.** If the HF tokenizer has padding enabled,
+  /// `encode_with` drops all `mask == 0` cells regardless of position
+  /// (right-pad, left-pad, or sparse). The returned `ids` and
+  /// `attention_mask` describe only the real attended tokens — every
+  /// cell of the returned mask is `1`. This diverges from the legacy
+  /// [`encode`](Self::encode), which preserves HF's raw padded layout.
+  ///
+  /// **EOS placement.** `add_eos: true` appends the **primary EOS** id
+  /// **after** the real attended tokens. The primary EOS is the first
+  /// caller-supplied EOS id (else the `tokenizer-config` `eos_token`)
+  /// tracked at load — NOT `eos_token_ids.iter().next()`, which would be
+  /// the numerically smallest id in the sorted [`Self::eos_token_ids`]
+  /// `BTreeSet` (possibly a non-EOS stop token). If no primary EOS is
+  /// configured it returns an error rather than silently no-op-ing; the
+  /// precondition is validated **before** the underlying `hf.encode`
+  /// call so a configuration gap fails fast.
+  ///
+  /// **EOS + truncation interaction.** When `add_eos` is combined with
+  /// `truncate_to(n)` for `n >= 1`, the EOS is **guaranteed to be the
+  /// last id** in the returned vector: the head is sliced to `n - 1`
+  /// attended ids and the EOS is appended. This matches the typical
+  /// LM-training expectation that "truncate-to-N with EOS" still ends in
+  /// EOS. The `n == 0` edge case is the sole exception — the output must
+  /// be empty, so no EOS is appended (an empty cap dominates `add_eos`).
+  ///
+  /// **Truncation.** `truncate_to: Some(n)` caps the **returned** vectors
+  /// with a bounded slice; HF `Encoding::truncate` is intentionally not
+  /// used because (as of `tokenizers` 0.23) it retains the discarded tail
+  /// in `Encoding::overflowing` and would defeat the cap on long inputs.
+  /// Note that `truncate_to` caps the **output** length only — the
+  /// underlying HF `tokenizer.encode` is still called on the full input,
+  /// so it is not an input-allocation bound. Callers needing an input
+  /// cap should pre-trim `text` themselves.
+  pub fn encode_with(&self, text: &str, opts: &EncodeOptions) -> Result<Encoded, Error> {
+    // Resolve the eos id BEFORE calling `hf.encode`: if the caller asked
+    // for `add_eos` but no primary eos was configured, fail fast on the
+    // configuration error rather than spending tokenizer cost on a doomed
+    // call. Uses `self.primary_eos` (the first user-supplied id, or the
+    // `tokenizer-config` `eos_token`), NOT `eos_token_ids.iter().next()` —
+    // the latter returns the numerically smallest entry in the sorted
+    // set, which can be a non-EOS pad/unk in a multi-id stop list.
+    let eos = if opts.add_eos {
+      Some(self.primary_eos.ok_or_else(|| {
+        Error::tokenizer("encode_with(add_eos=true) requires a configured eos token id")
+      })?)
+    } else {
+      None
+    };
+
+    let enc = self
+      .hf
+      .encode(text, opts.add_special)
+      .map_err(|e| Error::tokenizer(format!("hf.encode: {e}")))?;
+
+    let hf_ids = enc.get_ids();
+    let hf_mask = enc.get_attention_mask();
+    // HF contract: `attention_mask.len() == ids.len()`. Surface any future
+    // shape skew as a clean error rather than panicking on indexed access.
+    if hf_ids.len() != hf_mask.len() {
+      return Err(Error::tokenizer(format!(
+        "HF Encoding shape mismatch: ids.len()={} attention_mask.len()={}",
+        hf_ids.len(),
+        hf_mask.len(),
+      )));
+    }
+
+    // Real attended length = count of all `mask != 0` cells, regardless
+    // of where they sit. This keeps left-padded (`[0,0,1,1]`) and any
+    // sparse-zero masks correct: every attended cell becomes a real
+    // token, every pad cell is dropped (not just the trailing ones).
+    let real_len: usize = hf_mask.iter().filter(|&&m| m != 0).count();
+
+    // Bounded allocation: one Vec sized to the FINAL output length.
+    let extra = usize::from(eos.is_some());
+    let pre_trunc_len = real_len + extra;
+    let final_len = opts
+      .truncate_to
+      .map_or(pre_trunc_len, |n| n.min(pre_trunc_len));
+
+    let mut ids: Vec<u32> = Vec::with_capacity(final_len);
+    // Copy at most `head_cap` attended ids, in HF order, leaving room
+    // for the eos slot when it survives truncation.
+    let head_cap = final_len.saturating_sub(extra).min(real_len);
+    if head_cap > 0 {
+      let mut emitted = 0usize;
+      for (&id, &m) in hf_ids.iter().zip(hf_mask.iter()) {
+        if m == 0 {
+          continue;
+        }
+        ids.push(id);
+        emitted += 1;
+        if emitted == head_cap {
+          break;
+        }
+      }
+    }
+    if let Some(e) = eos
+      && ids.len() < final_len
+    {
+      // Append eos if it still fits after truncation.
+      ids.push(e);
+    }
+
+    // Mask is constant-1 for the returned cells (all attended, including
+    // the appended eos). Single bounded allocation matching `ids.len()`.
+    let attention_mask = opts.return_attention_mask.then(|| vec![1u8; ids.len()]);
+
+    Ok(Encoded {
+      ids,
+      attention_mask,
+    })
   }
 
   /// Encode a batch of texts.
@@ -427,6 +577,10 @@ impl Tokenizer {
     &self.eos_token_ids
   }
   /// Add an eos token by string or numeric-string id (Python `add_eos_token`).
+  /// If no primary EOS was established at construction time (no
+  /// `tokenizer-config` eos and no caller-supplied set), the first id added
+  /// via this method becomes the primary used by [`Self::encode_with`]
+  /// when `add_eos = true`.
   pub fn add_eos_token(&mut self, token: &str) -> Result<(), Error> {
     let id = match token.parse::<u32>() {
       Ok(i) => Some(i),
@@ -434,6 +588,9 @@ impl Tokenizer {
     };
     let id = id.ok_or_else(|| Error::tokenizer(format!("'{token}' is not a token")))?;
     self.eos_token_ids.insert(id);
+    if self.primary_eos.is_none() {
+      self.primary_eos = Some(id);
+    }
     Ok(())
   }
   /// Whether a chat template (jinja or override) is available.
