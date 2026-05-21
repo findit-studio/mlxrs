@@ -52,11 +52,139 @@ use crate::{
   error::{Error, Result},
   lm::{
     factory::{Identifier, ModelConfiguration},
-    load::{self, Config, Weights},
+    load::{self, EosTokenId, Quantization, Weights},
   },
   tokenizer::Tokenizer,
   vlm::{image::ImageProcessorConfig, model::Model as VlmModel},
 };
+
+/// The **minimal** VLM `config.json` subset the VLM load factory needs to
+/// dispatch a checkpoint, mirroring `mlx-swift-lm`'s `BaseConfiguration`
+/// (`MLXLMCommon/BaseConfiguration.swift`):
+///
+/// ```swift
+/// public struct BaseConfiguration: Codable, Sendable {
+///   public let modelType: String
+///   public var eosTokenIds: IntOrIntArray?
+///   var quantizationContainer: QuantizationContainer?
+///   enum CodingKeys: String, CodingKey {
+///     case modelType = "model_type"
+///     case quantizationContainer = "quantization"
+///     case eosTokenIds = "eos_token_id"
+///   }
+/// }
+/// ```
+///
+/// Why this exists separately from [`crate::lm::load::Config`]: real VLM
+/// checkpoints commonly nest the text-model fields (`hidden_size`,
+/// `num_hidden_layers`, `num_attention_heads`, `head_dim`, `vocab_size`)
+/// under `text_config` / `vision_config` and only carry `model_type` (and
+/// optional `eos_token_id` / `quantization`) at the top — exactly mirrored
+/// by `mlx_vlm.utils.load_config`'s `dict`-return + `load_model`'s
+/// `config.setdefault("text_config", config.pop("llm_config", {}))` /
+/// `config.setdefault("vision_config", {})` (`mlx_vlm/utils.py:239-240`).
+/// Going through [`crate::lm::load::Config`] would *fatally* reject every
+/// such checkpoint before any registered VLM constructor sees the raw JSON.
+/// The per-model VLM constructor parses its arch-specific text-model /
+/// vision-model fields off the verbatim
+/// [`config_json`](LoadedVlmModel::config_json), exactly as each swift VLM's
+/// per-model `Codable` init decodes the full config `Data` after the
+/// `BaseConfiguration` is extracted (e.g. `Qwen25VL.ModelConfiguration.init`
+/// at `Models/Qwen25VL.swift:1052`).
+///
+/// **Forward-compatible by design** (no `#[serde(deny_unknown_fields)]`):
+/// every nested block / unknown top-level key is ignored at this layer and
+/// flows to the constructor via the raw JSON — exactly as swift's
+/// `BaseConfiguration` `Codable` does.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct VlmBaseConfig {
+  /// Architecture id (`config.json` `model_type`, e.g. `"qwen2_vl"`,
+  /// `"mistral3"`). The [`VlmTypeRegistry`] dispatch key (after
+  /// [`remap_vlm_model_type`]).
+  pub model_type: String,
+  /// `config.json` `eos_token_id` (a single id or a list). A *truthy*
+  /// `generation_config.json` `eos_token_id` overrides it; the result is
+  /// the tokenizer's COMPLETE eos set (REPLACES the tokenizer-config
+  /// default — see [`load_vlm_base_config`]). `None` ⇒ fall back to the
+  /// tokenizer's own `eos_token`. Optional so a VLM with no top-level
+  /// `eos_token_id` (and a `text_config.eos_token_id`-only layout, which a
+  /// per-model constructor would surface) still parses.
+  #[serde(default)]
+  pub eos_token_id: Option<EosTokenId>,
+  /// Weight-quantization parameters (`config["quantization"]`), if the
+  /// checkpoint carries them at the top level. Optional and forward-
+  /// compatible: a VLM whose quantization sits under
+  /// `text_config.quantization_config` (mlx-vlm's `load_model`
+  /// translation at `mlx_vlm/utils.py:275-301`) parses with this `None`,
+  /// and the per-model constructor extracts its own translation off the
+  /// raw JSON if it needs to. Carried, not applied — same convention as
+  /// [`crate::lm::load::Config::quantization`].
+  #[serde(default)]
+  pub quantization: Option<Quantization>,
+}
+
+impl VlmBaseConfig {
+  /// Parse a [`VlmBaseConfig`] from an in-memory `config.json` string.
+  /// Mirrors the swift `JSONDecoder().decode(BaseConfiguration.self, …)`
+  /// in `VLMModelFactory._load` at `VLMModelFactory.swift:335`. A serde
+  /// failure (malformed JSON or a missing `model_type`) maps to
+  /// [`Error::Backend`] — the codebase config-parse convention.
+  pub fn from_json(json: &str) -> Result<VlmBaseConfig> {
+    serde_json::from_str(json).map_err(|e| Error::Backend {
+      message: format!("invalid VLM base config JSON: {e}"),
+    })
+  }
+}
+
+/// Read `<dir>/config.json` **once** for a VLM checkpoint, returning both
+/// the typed [`VlmBaseConfig`] and the verbatim JSON body it was parsed
+/// from (the same bytes — so the per-model constructor's typed base config
+/// and raw JSON can never come from two different on-disk versions).
+///
+/// VLM analog of [`crate::lm::load::load_config`]: same bounded
+/// `O_NONBLOCK | O_CLOEXEC`, non-regular-reject, `MAX_CONFIG_BYTES`-capped
+/// single read (via the same shared bounded-config-file primitive the LM
+/// loader uses internally), and the SAME `generation_config.json`
+/// `eos_token_id` override applied IN PLACE on the returned config (so a
+/// tokenizer built from the resolved `eos_token_id` reflects the
+/// generation-config override) — exactly mirroring
+/// `mlx_vlm.utils.load_config` at `mlx_vlm/utils.py:506-515`, which has the
+/// identical block.
+///
+/// The verbatim JSON body is returned alongside the typed value so a
+/// per-model constructor can decode its model-specific (nested
+/// `text_config` / `vision_config` / arch-specific) fields without
+/// re-opening the file — exactly how `VLMModelFactory._load` hands each
+/// model the same `configData: Data` at `VLMModelFactory.swift:343-344`.
+/// Every recoverable failure (absent, non-regular, oversized, unreadable,
+/// invalid JSON, missing `model_type`) is an [`Error::Backend`] naming
+/// the offending path.
+pub fn load_vlm_base_config(dir: &Path) -> Result<(VlmBaseConfig, String)> {
+  let path = dir.join("config.json");
+  let Some(text) = load::read_bounded_config_file(&path, "VLM base config")? else {
+    return Err(Error::Backend {
+      message: format!(
+        "cannot open VLM base config {}: file not found",
+        path.display()
+      ),
+    });
+  };
+  let mut config = VlmBaseConfig::from_json(&text)?;
+
+  // mlx-vlm `utils.load_config` (`mlx_vlm/utils.py:506-515`) and
+  // mlx-swift-lm `VLMModelFactory._load` (`VLMModelFactory.swift:351-359`)
+  // both overwrite the base config's `eos_token_id` with the
+  // generation_config.json override IN PLACE — done here on the typed
+  // base config so a tokenizer built from `config.eos_token_id` (via
+  // `load_tokenizer_with_eos`) sees the same resolved set the LM path does
+  // (`crate::lm::load::load_config` makes the same call through
+  // `read_generation_eos`).
+  if let Some(eos_override) = load::read_generation_eos(dir) {
+    config.eos_token_id = Some(eos_override);
+  }
+
+  Ok((config, text))
+}
 
 /// Re-export of [`crate::lm::factory::ModelConfiguration`] under the VLM
 /// alias so the VLM factory matches the LM factory's public shape exactly
@@ -201,20 +329,21 @@ pub fn load_processor_config(dir: &Path) -> Result<(ProcessorConfig, String, &'s
   let preferred_path = dir.join(PREFERRED);
   let fallback_path = dir.join(FALLBACK);
 
-  let (filename, path, body) = match read_optional_config_file(&preferred_path)? {
-    Some(text) => (PREFERRED, preferred_path, text),
-    None => match read_optional_config_file(&fallback_path)? {
-      Some(text) => (FALLBACK, fallback_path, text),
-      None => {
-        return Err(Error::Backend {
-          message: format!(
-            "no processor config found in {}: expected {PREFERRED} (preferred) or {FALLBACK}",
-            dir.display()
-          ),
-        });
-      }
-    },
-  };
+  let (filename, path, body) =
+    match load::read_bounded_config_file(&preferred_path, "processor config")? {
+      Some(text) => (PREFERRED, preferred_path, text),
+      None => match load::read_bounded_config_file(&fallback_path, "processor config")? {
+        Some(text) => (FALLBACK, fallback_path, text),
+        None => {
+          return Err(Error::Backend {
+            message: format!(
+              "no processor config found in {}: expected {PREFERRED} (preferred) or {FALLBACK}",
+              dir.display()
+            ),
+          });
+        }
+      },
+    };
 
   let parsed: ProcessorConfig = serde_json::from_str(&body).map_err(|e| Error::Backend {
     message: format!(
@@ -226,110 +355,41 @@ pub fn load_processor_config(dir: &Path) -> Result<(ProcessorConfig, String, &'s
   Ok((parsed, body, filename))
 }
 
-/// Bounded, TOCTOU-closed read of an OPTIONAL config file at `path`.
-///
-/// - Returns `Ok(Some(body))` on a successful, bounded, valid-UTF-8 read.
-/// - Returns `Ok(None)` if the file is absent (`ENOENT`) — the caller's
-///   "try the next candidate" signal.
-/// - Returns `Err(Error::Backend)` on every other failure (not a regular
-///   file, oversized, unreadable, non-UTF-8) — these are real defects
-///   the caller cannot recover from by trying a different filename.
-///
-/// Same hardened open as [`crate::lm::load::load_config`]: `O_NONBLOCK |
-/// O_CLOEXEC` on unix so a planted FIFO returns immediately instead of
-/// hanging, post-open `is_file()` fstat rejects FIFO/device/directory
-/// targets even when reached via a symlink, bounded by
-/// [`crate::lm::load::MAX_CONFIG_BYTES`].
-fn read_optional_config_file(path: &Path) -> Result<Option<String>> {
-  use std::io::Read;
-
-  #[cfg(unix)]
-  let open_result = {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-      .read(true)
-      .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-      .open(path)
-  };
-  #[cfg(not(unix))]
-  let open_result = std::fs::File::open(path);
-
-  let file = match open_result {
-    Ok(f) => f,
-    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-    Err(e) => {
-      return Err(Error::Backend {
-        message: format!("cannot open processor config {}: {e}", path.display()),
-      });
-    }
-  };
-
-  let meta = file.metadata().map_err(|e| Error::Backend {
-    message: format!(
-      "cannot stat opened processor config {}: {e}",
-      path.display()
-    ),
-  })?;
-  if !meta.is_file() {
-    return Err(Error::Backend {
-      message: format!(
-        "processor config {} is not a regular file; refusing to read",
-        path.display()
-      ),
-    });
-  }
-
-  let mut bytes = Vec::new();
-  file
-    .take(load::MAX_CONFIG_BYTES + 1)
-    .read_to_end(&mut bytes)
-    .map_err(|e| Error::Backend {
-      message: format!("cannot read processor config {}: {e}", path.display()),
-    })?;
-  if bytes.len() as u64 > load::MAX_CONFIG_BYTES {
-    return Err(Error::Backend {
-      message: format!(
-        "processor config {} exceeds the {}-byte cap; refusing to read",
-        path.display(),
-        load::MAX_CONFIG_BYTES
-      ),
-    });
-  }
-
-  let text = String::from_utf8(bytes).map_err(|e| Error::Backend {
-    message: format!(
-      "processor config {} is not valid UTF-8: {e}",
-      path.display()
-    ),
-  })?;
-  Ok(Some(text))
-}
-
 /// Everything [`load()`] resolved from a VLM model directory's *model*
 /// inputs, handed to a [`VlmModelConstructor`] so it can assemble (and,
-/// if [`Config::quantization`] is set, quantize) a concrete VLM
+/// if [`VlmBaseConfig::quantization`] is set, quantize) a concrete VLM
 /// architecture without re-reading the directory.
 ///
 /// Borrowing — the constructor gets `&LoadedVlmModel`; it reads the typed
-/// [`Config`] (and, for keys outside that typed subset, the verbatim
-/// [`config_json`](Self::config_json) text — the analogue of mlx-swift-lm
-/// passing the raw `config.json` `Data` to each model's `Codable` init at
-/// `VLMModelFactory.swift:341-348`) and takes the weight
-/// [`Array`](crate::array::Array)s it needs out of
+/// [`VlmBaseConfig`] (`model_type` / `eos_token_id` / `quantization`) and,
+/// for everything else (nested `text_config` / `vision_config` /
+/// arch-specific fields), the verbatim [`config_json`](Self::config_json)
+/// text — the analogue of mlx-swift-lm passing the raw `config.json` `Data`
+/// to each model's `Codable` init at `VLMModelFactory.swift:341-348` — and
+/// takes the weight [`Array`](crate::array::Array)s it needs out of
 /// [`weights`](Self::weights) **by reference** (no implicit eval; mlx
 /// `Array` is a cheap refcounted handle, so an arch clones only the
-/// handles it keeps). Same shape as [`crate::lm::factory::LoadedModel`].
+/// handles it keeps). Same shape as [`crate::lm::factory::LoadedModel`],
+/// but the typed config is the VLM-minimal [`VlmBaseConfig`] (not the
+/// LM-required [`crate::lm::load::Config`]) — real VLMs nest the
+/// text-model fields under `text_config`, so requiring them at the top
+/// level would reject every real checkpoint before the per-model
+/// constructor saw the raw JSON.
 #[non_exhaustive]
 pub struct LoadedVlmModel {
-  /// The typed `config.json` subset (mlx-vlm's `config` dict / mlx-swift-lm's
-  /// `BaseConfiguration`), with the generation-config eos override already
-  /// applied (see [`crate::lm::load::load_config`]).
-  pub config: Config,
-  /// The verbatim `config.json` body, for model-specific keys outside the
-  /// typed [`Config`] subset (the analogue of mlx-swift-lm handing each
-  /// model's `Codable` init the raw config `Data` at
-  /// `VLMModelFactory.swift:343-344`). Always the bytes the typed
-  /// [`config`](Self::config) was parsed from.
+  /// The typed VLM base config (mlx-swift-lm's `BaseConfiguration`), with
+  /// the generation-config eos override already applied (see
+  /// [`load_vlm_base_config`]). Only the registry-dispatch + tokenizer
+  /// fields are typed here; everything model-specific (nested
+  /// `text_config` / `vision_config` / arch-specific keys) is read off
+  /// [`config_json`](Self::config_json) by the per-model constructor.
+  pub config: VlmBaseConfig,
+  /// The verbatim `config.json` body, for every key outside the typed
+  /// [`VlmBaseConfig`] subset — i.e. the nested `text_config` /
+  /// `vision_config` / arch-specific fields each VLM constructor decodes
+  /// itself, the analogue of mlx-swift-lm handing each model's `Codable`
+  /// init the raw config `Data` at `VLMModelFactory.swift:343-344`. Always
+  /// the bytes the typed [`config`](Self::config) was parsed from.
   pub config_json: String,
   /// The merged, name → [`Array`](crate::array::Array) weight map
   /// (mlx-vlm's `weights` dict). Keys are verbatim — the constructor
@@ -349,9 +409,12 @@ pub struct LoadedVlmModel {
 /// verbatim processor-config JSON (for its per-model `Codable` init) AND
 /// the already-built [`Tokenizer`] (so the processor can splice the
 /// tokenizer's special-token ids into its preprocessing). The
-/// [`config`](Self::config) is the LM-style typed config (so a processor
-/// that needs the model's hidden dim / num_attention_heads / vocab_size
-/// can read it without re-parsing); the
+/// [`config`](Self::config) is the VLM base config (`model_type` /
+/// `eos_token_id` / `quantization`); a processor that needs model-specific
+/// fields beyond those reads them off the verbatim model `config.json`
+/// itself (handed to the *model* constructor as
+/// [`LoadedVlmModel::config_json`]) — the swift processor-construction
+/// signature receives the same `BaseConfiguration` + `Tokenizer` pair. The
 /// [`processor_class`](Self::processor_class) is the registry key the
 /// constructor was dispatched on (after any
 /// `processor_class_override`); the
@@ -371,11 +434,11 @@ pub struct LoadedVlmModel {
 /// no-per-model-arch rule.
 #[non_exhaustive]
 pub struct LoadedProcessor<'a> {
-  /// The typed `config.json` subset — same instance the
+  /// The typed VLM base config — same instance the
   /// [`VlmModelConstructor`] received (the model and processor share the
   /// SAME parsed config, mirroring `VLMModelFactory.swift:333-339`'s
   /// single `baseConfig` decode shared by both creator calls).
-  pub config: &'a Config,
+  pub config: &'a VlmBaseConfig,
   /// The registry key this processor was looked up under (after any
   /// `processor_class_override`) — useful for diagnostics and for a
   /// constructor that wants to assert it was dispatched correctly.
@@ -470,7 +533,7 @@ impl VlmTypeRegistry {
     self.creators.contains_key(remap_vlm_model_type(model_type))
   }
 
-  /// Construct a [`VlmModel`] for `loaded`'s [`Config::model_type`],
+  /// Construct a [`VlmModel`] for `loaded`'s [`VlmBaseConfig::model_type`],
   /// mirroring mlx-swift-lm's `VLMTypeRegistry.createModel(configuration:
   /// modelType:)` call at `VLMModelFactory.swift:343-344`. The id is
   /// canonicalized via [`remap_vlm_model_type`]; an unregistered id is a
@@ -528,7 +591,7 @@ pub trait Processor: Send + Sync {
 /// A registered VLM processor constructor: assemble a
 /// [`Box<dyn Processor>`] from the already-resolved
 /// [`LoadedProcessor`] (parsed processor config + raw processor JSON +
-/// shared [`Config`] + already-built [`Tokenizer`]).
+/// shared [`VlmBaseConfig`] + already-built [`Tokenizer`]).
 ///
 /// Mirrors mlx-swift-lm's `ProcessorTypeRegistry` creator
 /// `(Data, Tokenizer) throws -> UserInputProcessor` at
@@ -615,14 +678,14 @@ impl VlmProcessorTypeRegistry {
 
 /// The product of [`load()`]: a constructed [`VlmModel`] plus the
 /// [`Tokenizer`], the constructed [`Processor`], and the parsed
-/// [`Config`].
+/// [`VlmBaseConfig`].
 ///
 /// Analogue of mlx-swift-lm's `ModelContext` (constructed at
 /// `VLMModelFactory.swift:422-425` — the `(configuration, model, processor,
 /// tokenizer)` tuple every VLM caller receives). Restricted to the
 /// already-modeled fields here; `defaultPrompt` / `extraEOSTokens` /
 /// `toolCallFormat` are intentionally not modeled (the eos set is
-/// already resolved on the [`Tokenizer`] / [`Config`]; prompt and
+/// already resolved on the [`Tokenizer`] / [`VlmBaseConfig`]; prompt and
 /// tool-format are chat-pipeline concerns above this loader, same
 /// boundary [`crate::lm::factory::LoadedModelContext`] holds).
 #[non_exhaustive]
@@ -635,9 +698,13 @@ pub struct LoadedVlmContext {
   /// The constructed VLM processor (from the
   /// [`VlmProcessorTypeRegistry`] constructor).
   pub processor: Box<dyn Processor>,
-  /// The parsed `config.json` subset, returned for callers that need
-  /// the architecture metadata (mlx-vlm's `model.config` access).
-  pub config: Config,
+  /// The parsed VLM base `config.json` subset, returned for callers that
+  /// need the dispatch metadata (`model_type` / `eos_token_id` /
+  /// `quantization`). Model-specific fields (nested `text_config` /
+  /// `vision_config` / arch-specific keys) are NOT carried here — they
+  /// live on the per-model VLM model constructed off the raw `config.json`
+  /// JSON.
+  pub config: VlmBaseConfig,
 }
 
 /// Load a VLM model + tokenizer + processor from a local
@@ -656,9 +723,14 @@ pub struct LoadedVlmContext {
 ///
 /// 1. Resolve the model directory ([`VlmModelConfiguration::model_directory`]
 ///    — local, no Hub download) and read `config.json` **once** via
-///    [`crate::lm::load::load_config`], yielding both the typed
-///    [`Config`] (with the `generation_config.json` eos override applied)
-///    and the verbatim JSON body — exactly as the LM factory does.
+///    [`load_vlm_base_config`], yielding both the typed [`VlmBaseConfig`]
+///    (with the `generation_config.json` eos override applied) and the
+///    verbatim JSON body. The VLM-minimal parse is deliberately NOT
+///    [`crate::lm::load::load_config`] — real VLMs nest the text-model
+///    fields under `text_config`, so requiring them at the top level
+///    would reject every real checkpoint *before* a registered VLM
+///    constructor saw the raw JSON; the swift loader has the same
+///    minimal `BaseConfiguration` (`MLXLMCommon/BaseConfiguration.swift`).
 /// 2. **Validate the `model_type` is registered** (after
 ///    [`remap_vlm_model_type`]) *before* loading anything heavy: an
 ///    unsupported checkpoint is a cheap, recoverable [`Error::Backend`]
@@ -680,13 +752,15 @@ pub struct LoadedVlmContext {
 /// 5. Discover and merge the weights from the model directory via
 ///    [`crate::lm::load::load_weights`].
 /// 6. Build the [`Tokenizer`] EXACTLY ONCE from the selected directory
-///    via [`crate::lm::load::load_tokenizer`] (with the eos set resolved
-///    on the [`Config`] from step 1).
+///    via [`crate::lm::load::load_tokenizer_with_eos`] (with the eos set
+///    already resolved on the [`VlmBaseConfig`] from step 1 — the same
+///    primitive [`crate::lm::load::load_tokenizer`] funnels through, so
+///    LM and VLM share one eos-resolution path).
 /// 7. Construct the model via `model_registry` on the [`LoadedVlmModel`]
-///    (parsed config + raw JSON + weights).
+///    (parsed VLM base config + raw JSON + weights).
 /// 8. Construct the processor via `processor_registry` on the
 ///    [`LoadedProcessor`] (parsed processor config + raw processor JSON +
-///    shared config + tokenizer reference) and return a
+///    shared VLM base config + tokenizer reference) and return a
 ///    [`LoadedVlmContext`].
 ///
 /// Per-model construction is the registries' job (this PR ships no
@@ -699,14 +773,19 @@ pub fn load(
 ) -> Result<LoadedVlmContext> {
   let model_dir = configuration.model_directory();
 
-  // (1) Read config.json ONCE: typed Config (+ generation_config eos
-  // override) AND the verbatim JSON body, from the same bytes. Mirrors
-  // VLMModelFactory.swift:325-339 (single `Data` read shared by both
-  // BaseConfiguration decode and the per-model creator). The constructor
-  // may need model-specific keys outside the typed subset
-  // (mlx-swift-lm hands each model the raw config `Data`); reading once
-  // means they can never come from two different on-disk versions.
-  let (config, config_json) = load::load_config(model_dir)?;
+  // (1) Read config.json ONCE into the VLM-minimal `VlmBaseConfig` (+
+  // generation_config eos override) AND the verbatim JSON body, from the
+  // same bytes. Mirrors VLMModelFactory.swift:325-339 (single `Data` read
+  // shared by both BaseConfiguration decode and the per-model creator).
+  // We deliberately do NOT route through `lm::load::load_config` here —
+  // its required top-level `hidden_size` / `num_hidden_layers` / … would
+  // reject every real VLM checkpoint (those fields live nested under
+  // `text_config`); a per-model constructor needs the raw JSON to decode
+  // them itself (`text_config` / `vision_config` / arch-specific keys
+  // outside the minimal base subset, exactly how mlx-swift-lm hands each
+  // model the raw config `Data`). Reading once means the typed base and
+  // raw text can never come from two different on-disk versions.
+  let (config, config_json) = load_vlm_base_config(model_dir)?;
 
   // (2) Validate the (remapped) model_type is registered BEFORE any
   // weights / tokenizer / processor I/O. An unsupported checkpoint —
@@ -768,8 +847,12 @@ pub fn load(
 
   // (6) Build the tokenizer EXACTLY ONCE from the selected directory,
   // through the shared eos-resolution path (the eos set already resolved
-  // on `config`).
-  let tokenizer = load::load_tokenizer(tokenizer_dir, &config)?;
+  // on `config`). We go through `load_tokenizer_with_eos` since our
+  // `VlmBaseConfig` is not the LM `Config` `load_tokenizer` consumes, but
+  // the underlying primitive — `Tokenizer::from_path(dir, eos)` — is
+  // identical, so LM and VLM resolve the eos set through the same code
+  // path.
+  let tokenizer = load::load_tokenizer_with_eos(tokenizer_dir, config.eos_token_id.as_ref())?;
 
   // (7) Construct the model via the registry (already validated as
   // registered in step 2). The model receives the parsed `config`
@@ -825,24 +908,56 @@ mod tests {
     vlm::image::{ColorOrder, ImageProcessorConfig, ResizeFilter},
   };
 
-  /// A minimal `config.json` for the mock VLM architecture. `model_type`
-  /// is the registry key; the remaining fields are exactly the required
-  /// keys of the typed [`Config`] (so the reused
-  /// [`crate::lm::load::load_config`] parse succeeds). `mock_extra` is a
-  /// model-specific key OUTSIDE the typed subset, used to prove the
-  /// constructor can read [`LoadedVlmModel::config_json`].
+  /// A "flat" mock `config.json` for the mock VLM architecture: the
+  /// dispatch-only key (`model_type`) plus `vocab_size` and `mock_extra`
+  /// at the **top level**. The minimal [`VlmBaseConfig`] only needs
+  /// `model_type`; the mock constructor reads `vocab_size` and
+  /// `mock_extra` off the verbatim [`LoadedVlmModel::config_json`] so
+  /// the registry-dispatch end-to-end path is proven against the same
+  /// raw-JSON model-specific decode every real per-model VLM constructor
+  /// performs (the nested-config layout — `text_config.vocab_size` —
+  /// is exercised separately by [`mock_nested_config_json`] and
+  /// [`load_succeeds_for_nested_vlm_config_with_no_top_level_lm_fields`]).
   fn mock_config_json(model_type: &str) -> String {
     format!(
       r#"{{
         "model_type": "{model_type}",
-        "hidden_size": 8,
-        "num_hidden_layers": 2,
-        "num_attention_heads": 4,
-        "num_key_value_heads": 2,
-        "head_dim": 2,
-        "rope_theta": 10000.0,
         "vocab_size": 5,
-        "tie_word_embeddings": false,
+        "mock_extra": 11
+      }}"#
+    )
+  }
+
+  /// A `config.json` shaped like a **real** VLM checkpoint:
+  /// `model_type` at the top level (the dispatch key, mirroring swift's
+  /// `BaseConfiguration` at `MLXLMCommon/BaseConfiguration.swift:13-16`),
+  /// every text-model field nested under `text_config` (mirroring how
+  /// e.g. Qwen2-VL / LLaVA / Pixtral ship their configs, and how
+  /// `mlx_vlm.utils.load_model:239-240` sets up
+  /// `config.setdefault("text_config", ...)`), and an arbitrary
+  /// `vision_config` block. NO top-level `hidden_size` / `num_hidden_layers`
+  /// / `vocab_size` / etc. — the regression case the
+  /// [`crate::lm::load::Config`] parse would have *fatally rejected*
+  /// before this PR's fix (since those fields are required there).
+  fn mock_nested_config_json(model_type: &str) -> String {
+    format!(
+      r#"{{
+        "model_type": "{model_type}",
+        "text_config": {{
+          "hidden_size": 8,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 2,
+          "head_dim": 2,
+          "rope_theta": 10000.0,
+          "vocab_size": 5,
+          "tie_word_embeddings": false
+        }},
+        "vision_config": {{
+          "hidden_size": 16,
+          "num_hidden_layers": 1,
+          "image_size": 224
+        }},
         "mock_extra": 11
       }}"#
     )
@@ -864,8 +979,11 @@ mod tests {
   /// A trivial VLM [`Model`] returned by the mock constructor. Implements
   /// the LM-side [`crate::lm::model::Model`] (vocab-aware zero logits) and
   /// the VLM-side [`crate::vlm::model::Model`]'s required entry points
-  /// (text-embed lookup, image-encode passthrough); records the typed-
-  /// config `vocab_size` and the raw-config `mock_extra` for assertions.
+  /// (text-embed lookup, image-encode passthrough); records both the
+  /// raw-JSON-decoded `vocab_size` (which the per-model constructor reads
+  /// off `LoadedVlmModel::config_json`, since `VlmBaseConfig` carries
+  /// only the dispatch fields) and the raw-config `mock_extra` for
+  /// assertions.
   struct MockVlmModel {
     vocab: i32,
     #[allow(dead_code)]
@@ -941,10 +1059,17 @@ mod tests {
     }
   }
 
-  /// Build a [`VlmModelConstructor`] for the mock VLM architecture:
-  /// read the typed `vocab_size` off [`LoadedVlmModel::config`], parse
-  /// the model-specific `mock_extra` off [`LoadedVlmModel::config_json`],
-  /// and assert at least one weight tensor arrived.
+  /// Build a [`VlmModelConstructor`] for the mock VLM architecture: read
+  /// the dispatch key off the typed [`LoadedVlmModel::config`]
+  /// (`model_type` is the only field guaranteed by [`VlmBaseConfig`]),
+  /// then decode model-specific fields (`vocab_size`, `mock_extra`) off
+  /// the verbatim [`LoadedVlmModel::config_json`] — mirroring how a real
+  /// per-model VLM constructor's `Codable` init reads its nested
+  /// `text_config` / `vision_config` blocks off the raw JSON
+  /// (`VLMModelFactory.swift:343-348`). `vocab_size` is looked up at the
+  /// top level OR under `text_config` so the same mock works for both the
+  /// "flat" and "nested" fixtures. Asserts at least one weight tensor
+  /// arrived.
   fn mock_vlm_constructor() -> VlmModelConstructor {
     Box::new(|loaded: &LoadedVlmModel| -> Result<Box<dyn VlmModel>> {
       assert!(
@@ -955,16 +1080,27 @@ mod tests {
         serde_json::from_str(&loaded.config_json).map_err(|e| Error::Backend {
           message: format!("mock vlm ctor: bad config json: {e}"),
         })?;
+      // Vocab can be top-level (the "flat" mock fixture) or nested under
+      // text_config (the real-VLM-shaped mock fixture). The per-model
+      // constructor decides how to decode its own model-specific fields;
+      // both are equally legitimate dispatch outputs here, since
+      // `VlmBaseConfig` only requires `model_type` and the rest flows
+      // through the raw JSON.
+      let vocab = raw
+        .get("vocab_size")
+        .or_else(|| raw.get("text_config").and_then(|t| t.get("vocab_size")))
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|x| i32::try_from(x).ok())
+        .ok_or_else(|| Error::Backend {
+          message: "mock vlm ctor: missing vocab_size (top-level or text_config.vocab_size)".into(),
+        })?;
       let mock_extra = raw
         .get("mock_extra")
         .and_then(serde_json::Value::as_i64)
         .ok_or_else(|| Error::Backend {
           message: "mock vlm ctor: missing mock_extra".into(),
         })?;
-      Ok(Box::new(MockVlmModel {
-        vocab: loaded.config.vocab_size,
-        mock_extra,
-      }))
+      Ok(Box::new(MockVlmModel { vocab, mock_extra }))
     })
   }
 
@@ -1102,12 +1238,15 @@ mod tests {
 
     let ctx = load(&config, &model_registry, &processor_registry).expect("load should succeed");
 
-    // The returned config carries the parsed model_type + vocab.
+    // The returned VLM base config carries the dispatch key + (here, no)
+    // top-level eos override. vocab/etc. flow through the raw JSON to the
+    // constructor, which proved them in `logits.shape()` below.
     assert_eq!(ctx.config.model_type, "mockvlm");
-    assert_eq!(ctx.config.vocab_size, 5);
+    assert_eq!(ctx.config.eos_token_id, None);
+    assert_eq!(ctx.config.quantization, None);
 
-    // The constructed model is the mock: drive one forward to confirm
-    // it is wired and saw the right vocab.
+    // The constructed model is the mock: drive one forward to confirm it
+    // is wired and the constructor saw the right vocab off the raw JSON.
     let mut cache: Vec<Box<dyn KvCache>> = Vec::new();
     let tokens = Array::from_slice::<i32>(&[0, 1, 2], &(1usize, 3)).unwrap();
     let logits = LmModel::forward(ctx.model.as_ref(), &tokens, &mut cache).unwrap();
@@ -1410,5 +1549,206 @@ mod tests {
 
     let ctx = load(&config, &model_registry, &processor_registry).expect("load");
     assert_eq!(ctx.processor.image_processor_config().size, (24, 24));
+  }
+
+  #[test]
+  fn load_succeeds_for_nested_vlm_config_with_no_top_level_lm_fields() {
+    // **Regression** for the Codex finding: real VLM `config.json` files
+    // commonly nest the text-model fields (`hidden_size` /
+    // `num_hidden_layers` / `vocab_size` / etc.) under `text_config` and
+    // only carry `model_type` at the top — exactly what
+    // `mock_nested_config_json` shapes. Before the fix, the VLM load path
+    // ran the LM `lm::load::Config` parse upfront, which REQUIRES those
+    // top-level fields → every real VLM checkpoint fatally errored
+    // BEFORE a registered VLM constructor could see the raw JSON. With
+    // the VLM-minimal `VlmBaseConfig` parse, the dispatch goes through,
+    // the per-model constructor reads its nested `text_config.vocab_size`
+    // off the verbatim raw JSON, and the load completes — proven by the
+    // shape of the forward pass driving the registered mock constructor.
+    let dir = fresh_dir("nested-vlm-config");
+    std::fs::write(dir.join("config.json"), mock_nested_config_json("mockvlm")).unwrap();
+    std::fs::write(
+      dir.join("preprocessor_config.json"),
+      mock_preprocessor_config_json("MockProc", 32),
+    )
+    .unwrap();
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "mock.weight".to_owned(),
+      Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2usize, 2)).unwrap(),
+    );
+    crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+    write_tokenizer(&dir);
+
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", mock_processor_constructor());
+    let config = VlmModelConfiguration::from_directory(&dir);
+
+    let ctx = load(&config, &model_registry, &processor_registry)
+      .expect("nested-config VLM should load (no top-level LM fields)");
+
+    // The dispatch key arrived; vocab/hidden_size live under text_config
+    // and are not on `VlmBaseConfig` (faithful to swift's BaseConfiguration).
+    assert_eq!(ctx.config.model_type, "mockvlm");
+
+    // Drive one forward — confirms the mock constructor decoded
+    // `text_config.vocab_size = 5` off the raw JSON and the registry +
+    // weight + tokenizer path all completed against the nested-shaped
+    // config.
+    let mut cache: Vec<Box<dyn KvCache>> = Vec::new();
+    let tokens = Array::from_slice::<i32>(&[0, 1, 2], &(1usize, 3)).unwrap();
+    let logits = LmModel::forward(ctx.model.as_ref(), &tokens, &mut cache).unwrap();
+    assert_eq!(logits.shape(), vec![1, 3, 5]);
+  }
+
+  #[test]
+  fn eos_token_id_on_vlm_config_flows_to_tokenizer() {
+    // `eos_token_id` declared at the TOP LEVEL of a real-VLM-shaped
+    // `config.json` (no top-level LM fields, nested `text_config`) must
+    // be picked up by `VlmBaseConfig` and forwarded to the tokenizer via
+    // `load_tokenizer_with_eos` — REPLACING the tokenizer-config default
+    // (mirroring `TokenizerWrapper`'s `set(eos_token_ids)` semantics).
+    let dir = fresh_dir("eos-from-config");
+    let cfg = r#"{
+      "model_type": "mockvlm",
+      "eos_token_id": [1, 2],
+      "text_config": {
+        "hidden_size": 8,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 2,
+        "rope_theta": 10000.0,
+        "vocab_size": 5,
+        "tie_word_embeddings": false
+      },
+      "mock_extra": 11
+    }"#;
+    std::fs::write(dir.join("config.json"), cfg).unwrap();
+    std::fs::write(
+      dir.join("preprocessor_config.json"),
+      mock_preprocessor_config_json("MockProc", 24),
+    )
+    .unwrap();
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "mock.weight".to_owned(),
+      Array::from_slice::<f32>(&[1.0], &(1usize,)).unwrap(),
+    );
+    crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+    write_tokenizer(&dir);
+
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", mock_processor_constructor());
+    let configuration = VlmModelConfiguration::from_directory(&dir);
+
+    let ctx = load(&configuration, &model_registry, &processor_registry).expect("eos config load");
+
+    // Base config carries the [1, 2] list verbatim (shape-preserving).
+    assert_eq!(
+      ctx.config.eos_token_id,
+      Some(EosTokenId::Many(vec![1, 2])),
+      "base config should carry the top-level eos_token_id list"
+    );
+    // And the tokenizer's COMPLETE eos set is exactly {1, 2} — the
+    // tokenizer-config default was REPLACED (not unioned) by the resolved
+    // list, exactly as `TokenizerWrapper::set(eos_token_ids)` does.
+    let eos_set = ctx.tokenizer.eos_token_ids();
+    assert_eq!(
+      eos_set.iter().copied().collect::<Vec<_>>(),
+      vec![1u32, 2],
+      "tokenizer eos set should be exactly the resolved {{1, 2}}"
+    );
+  }
+
+  #[test]
+  fn generation_config_eos_overrides_vlm_base_config_eos() {
+    // A *truthy* `generation_config.json` `eos_token_id` OVERWRITES the
+    // `config.json` value IN PLACE on the returned `VlmBaseConfig` — same
+    // semantics as mlx-lm and mlx-vlm (`mlx_vlm/utils.py:506-515`). The
+    // override is a scalar `2`; the on-disk config says `1`; the
+    // resulting tokenizer eos set must be {2}.
+    let dir = fresh_dir("eos-generation-override");
+    let cfg = r#"{
+      "model_type": "mockvlm",
+      "eos_token_id": 1,
+      "text_config": {
+        "hidden_size": 8,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 2,
+        "rope_theta": 10000.0,
+        "vocab_size": 5,
+        "tie_word_embeddings": false
+      },
+      "mock_extra": 11
+    }"#;
+    std::fs::write(dir.join("config.json"), cfg).unwrap();
+    std::fs::write(dir.join("generation_config.json"), r#"{"eos_token_id": 2}"#).unwrap();
+    std::fs::write(
+      dir.join("preprocessor_config.json"),
+      mock_preprocessor_config_json("MockProc", 24),
+    )
+    .unwrap();
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "mock.weight".to_owned(),
+      Array::from_slice::<f32>(&[1.0], &(1usize,)).unwrap(),
+    );
+    crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+    write_tokenizer(&dir);
+
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", mock_processor_constructor());
+    let configuration = VlmModelConfiguration::from_directory(&dir);
+
+    let ctx = load(&configuration, &model_registry, &processor_registry)
+      .expect("eos generation override load");
+
+    // The returned base config reflects the generation-config override
+    // (`1` → `2`) — exactly the in-place overwrite mlx-vlm performs.
+    assert_eq!(
+      ctx.config.eos_token_id,
+      Some(EosTokenId::Single(2)),
+      "generation_config.json eos_token_id should override config.json"
+    );
+    // Tokenizer's COMPLETE eos set is the post-override {2}, not the
+    // on-disk {1}.
+    let eos_set = ctx.tokenizer.eos_token_ids();
+    assert_eq!(
+      eos_set.iter().copied().collect::<Vec<_>>(),
+      vec![2u32],
+      "tokenizer eos set should be the overridden {{2}}"
+    );
+  }
+
+  #[test]
+  fn vlm_base_config_parses_without_top_level_lm_fields() {
+    // Pure parse-level proof of the contract: a JSON body with ONLY
+    // `model_type` (no LM-required fields, no eos, no quantization)
+    // parses into a `VlmBaseConfig` — the swift `BaseConfiguration`
+    // shape — and the LM `Config` parse would have rejected the same
+    // body (required `hidden_size` / etc. absent). Guards against a
+    // future regression that re-adds a hard LM field to `VlmBaseConfig`.
+    let cfg = r#"{ "model_type": "qwen2_vl" }"#;
+    let base = VlmBaseConfig::from_json(cfg).expect("VLM base config should parse");
+    assert_eq!(base.model_type, "qwen2_vl");
+    assert_eq!(base.eos_token_id, None);
+    assert_eq!(base.quantization, None);
+
+    // Same body through the LM `Config` parse fails (missing
+    // `hidden_size` and the rest of the required LM subset). This pins
+    // *why* we need a separate VLM base parse.
+    let lm_err = crate::lm::load::Config::from_json(cfg)
+      .expect_err("LM Config should reject a model_type-only body");
+    let msg = lm_err.to_string();
+    assert!(
+      msg.contains("hidden_size") || msg.contains("missing field"),
+      "LM Config parse error should name the missing LM field, got: {msg}"
+    );
   }
 }
