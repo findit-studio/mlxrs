@@ -10,9 +10,10 @@
 //! Everything is generic over the [`Model`] trait
 //! ([`crate::vlm::model::Model`], which itself extends
 //! [`crate::lm::model::Model`]): the loop calls `encode_image` per image,
-//! `embed_tokens` once for the prompt, `merge_embeddings` once to splice,
-//! `forward_embeddings` once for the prefill, and `forward` per decode
-//! step.
+//! then prefills in span-aware chunks — per chunk `embed_tokens` (chunk
+//! text), `merge_embeddings` (chunk image slabs), and
+//! `forward_embeddings_multimodal` (with the chunk's `cache_offset`) —
+//! then `forward` per decode step.
 //!
 //! **Exact per-step order** (faithful to mlx-vlm `generate_step`, lines
 //! 864–963):
@@ -30,11 +31,12 @@
 //!    has no way to thread that mask through to a per-model attention
 //!    layer; instead,
 //!    [`crate::vlm::model::Model::forward_embeddings_multimodal`]
-//!    receives `image_spans` BY VALUE on every prefill call so a
-//!    mask-requiring per-model override builds its mask without any
-//!    `&self` state. A malformed prompt (missing marker, marker
-//!    count mismatch, `num_tokens_per_image == 0`) errors here BEFORE
-//!    any image is loaded / preprocessed / encoded.
+//!    receives chunk-local `image_spans` + a `cache_offset` BY VALUE on
+//!    every prefill chunk so a mask-requiring per-model override builds
+//!    its `[chunk × (past + chunk)]` mask without any `&self` state. A
+//!    malformed prompt (missing marker, marker count mismatch,
+//!    `num_tokens_per_image == 0`) errors here BEFORE any image is
+//!    loaded / preprocessed / encoded.
 //! 2. *Preprocess + encode images.* For each path in `images`,
 //!    `vlm::image::load_image(path) → preprocess(…, &model.image_processor_config())`
 //!    yields `[H, W, 3]` f32; `model.encode_image(image)` lifts each into
@@ -549,14 +551,24 @@ impl<M: Model> VlmDecode<'_, M> {
 
   /// The embed-based prefill (VLM-8 offset-aware chunked design): walk
   /// the assembled prompt in span-aware chunks, embedding then merging
-  /// then forwarding ONE chunk at a time, so peak memory is bounded by
-  /// `prefill_step_size · D` plus the (inherent) vision-feature slabs,
-  /// NOT the full `T · D` merged sequence. Populate the cache to
-  /// position T, then sample the FIRST token from the FINAL chunk's
-  /// last-position logits. Mirrors `_step(input_ids,
-  /// inputs_embeds=inputs_embeds)` at `mlx-vlm/mlx_vlm/generate.py:903`
-  /// extended with the chunked-prefill loop at
-  /// `mlx-vlm/mlx_vlm/generate.py:881-901`.
+  /// then forwarding ONE chunk at a time. Populate the cache to position
+  /// T, then sample the FIRST token from the FINAL chunk's last-position
+  /// logits. Mirrors `_step(input_ids, inputs_embeds=inputs_embeds)` at
+  /// `mlx-vlm/mlx_vlm/generate.py:903` extended with the chunked-prefill
+  /// loop at `mlx-vlm/mlx_vlm/generate.py:881-901`.
+  ///
+  /// **Per-chunk peak memory** is `max(prefill_step_size, W_max) · D`
+  /// for the chunk's text-embed + merged buffer, where `W_max` is the
+  /// widest single image span (`= num_tokens_per_image` for the
+  /// fixed-grid case): invariant 1 keeps each image span whole, so a
+  /// span wider than `prefill_step_size` forces a chunk that wide
+  /// (Codex VLM-8 R1F1 — the bound is NOT `prefill_step_size · D` alone).
+  /// This is still bounded by a model constant, never the full expanded
+  /// `T`; and `W_max · D <= Σ N_i · D`, the vision-feature slab floor
+  /// that is resident regardless (vision encoding can't be chunked). So
+  /// the total is `Σ N_i · D` (inherent image features) plus
+  /// `max(prefill_step_size, W_max) · D` (one chunk) — independent of the
+  /// text length and of the image COUNT beyond the per-image width.
   ///
   /// **Two invariants make chunking correct for mask-requiring VLMs**
   /// (the structural fix VLM-8 escalated to — Codex bundle rounds 1-3):
@@ -597,6 +609,15 @@ impl<M: Model> VlmDecode<'_, M> {
           .into(),
       });
     }
+    // The cache may already hold tokens (a restored / pre-populated
+    // prompt cache, or a model that pre-seeds the cache). Read the
+    // starting offset so each chunk's `cache_offset` is ABSOLUTE
+    // (`initial_offset + cursor`), not just the in-prefill `cursor` —
+    // otherwise a mask-requiring override would size its mask too short
+    // against a non-empty cache (Codex VLM-8 R1F3). All layers share the
+    // same offset (they advance in lockstep); read layer 0. An empty
+    // cache reports 0, the fresh-cache common case.
+    let initial_offset = self.cache.borrow().first().map_or(0, |c| c.offset());
     let step = self.prefill_step_size.max(1);
     let mut cursor: usize = 0;
     let mut last_logits: Option<Array> = None;
@@ -653,13 +674,14 @@ impl<M: Model> VlmDecode<'_, M> {
           .merge_embeddings(&chunk_text_embeds, &chunk_image_embeds, &chunk_spans)?
       };
 
-      // Forward with the cache offset (= cursor) so a mask-requiring
-      // override sizes its mask over past + current keys, and chunk-local
-      // spans so its coordinates line up with `chunk_merged`.
+      // Forward with the ABSOLUTE cache offset (initial + cursor) so a
+      // mask-requiring override sizes its mask over the true past +
+      // current keys, and chunk-local spans so its coordinates line up
+      // with `chunk_merged`.
       let logits = self.model.forward_embeddings_multimodal(
         &chunk_merged,
         &chunk_spans,
-        cursor,
+        initial_offset + cursor,
         &mut self.cache.borrow_mut(),
       )?;
       // Retain only the final chunk's logits — earlier chunks just fill

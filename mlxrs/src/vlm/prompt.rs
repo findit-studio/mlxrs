@@ -517,7 +517,19 @@ pub fn build_multimodal_mask_with_past(
   // Fill row-major: row=q (chunk-local), col=k (absolute over past+chunk).
   // Past keys (k < past_len) are unconditionally attended; current-chunk
   // keys use chunk-local causal + same-image-span.
-  let mut buf = Vec::with_capacity(total);
+  //
+  // Recoverable reservation (Codex VLM-8 R1F2): on late chunks
+  // `total = seq_len * (past_len + seq_len)` grows with the cached
+  // context, so a long prompt's mask can be large. `try_reserve_exact`
+  // surfaces an allocator failure as a recoverable `Error::OutOfMemory`
+  // instead of the `Vec::with_capacity` abort. (The mask is dense by
+  // contract here; a symbolic causal-base + sparse image-overlay
+  // representation is the documented future optimization in VLM-8 — it
+  // does not change this function's observable output.)
+  let mut buf: Vec<bool> = Vec::new();
+  buf
+    .try_reserve_exact(total)
+    .map_err(|_| Error::OutOfMemory)?;
   for (q, &q_blk) in block_id.iter().enumerate() {
     for k in 0..total_keys {
       let attend = if k < past_len {

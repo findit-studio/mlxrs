@@ -1062,6 +1062,84 @@ fn vlm_generate_span_aware_chunking_never_splits_image_span() {
   assert_eq!(calls[2], vec![1_usize, 2, 4]);
 }
 
+#[test]
+fn vlm_generate_threads_cache_offset_and_chunk_local_spans() {
+  // VLM-8 R1F3: each chunk's `forward_embeddings_multimodal` must receive
+  // the ABSOLUTE cache offset (initial + cursor) and CHUNK-LOCAL spans.
+  // With prompt [1,2,99,3,4] (T=7, span (2,5)) at prefill_step_size=2 the
+  // span-aware chunks are [0,2) [2,5) [5,7), so the captured
+  // (cache_offset, chunk_local_spans) per chunk are:
+  //   chunk 0: offset=0, spans=[]
+  //   chunk 1: offset=2, spans=[(0,3)]   (the image span, shifted local)
+  //   chunk 2: offset=5, spans=[]
+  // (The cache starts empty so initial_offset=0; the offsets equal the
+  // cursors.)
+  struct OffsetCapturingModel {
+    inner: MockVlmModel,
+    captured: RefCell<Vec<(usize, Vec<(usize, usize)>)>>,
+  }
+  impl LmModel for OffsetCapturingModel {
+    fn forward(&self, t: &Array, c: &mut [Box<dyn KvCache>]) -> mlxrs::Result<Array> {
+      self.inner.forward(t, c)
+    }
+    fn forward_embeddings(&self, e: &Array, c: &mut [Box<dyn KvCache>]) -> mlxrs::Result<Array> {
+      self.inner.forward_embeddings(e, c)
+    }
+  }
+  impl VlmModel for OffsetCapturingModel {
+    fn embed_tokens(&self, t: &Array) -> mlxrs::Result<Array> {
+      self.inner.embed_tokens(t)
+    }
+    fn encode_image(&self, i: &Array) -> mlxrs::Result<Array> {
+      self.inner.encode_image(i)
+    }
+    fn forward_embeddings_multimodal(
+      &self,
+      embeddings: &Array,
+      image_spans: &[(usize, usize)],
+      cache_offset: usize,
+      cache: &mut [Box<dyn KvCache>],
+    ) -> mlxrs::Result<Array> {
+      self
+        .captured
+        .borrow_mut()
+        .push((cache_offset, image_spans.to_vec()));
+      LmModel::forward_embeddings(self, embeddings, cache)
+    }
+  }
+
+  let model = OffsetCapturingModel {
+    inner: MockVlmModel::new(5, 4, 3),
+    captured: RefCell::new(Vec::new()),
+  };
+  let dir = temp_dir("offset_capture");
+  let img = write_test_image(&dir, "img.png");
+  let prompt = [1_u32, 2, 99, 3, 4];
+  let cfg = VlmGenConfig {
+    lm: GenConfig {
+      max_tokens: 1,
+      prefill_step_size: 2,
+      ..Default::default()
+    },
+    image_token_id: 99,
+    image_marker_id: None,
+    num_tokens_per_image: 3,
+    marker_policy: MarkerPolicy::Required,
+  };
+  let mut it = vlm_generate(&model, &prompt, &[img], mock_cache(), cfg).expect("vlm_generate ok");
+  it.next().expect("step").expect("ok");
+
+  let cap = model.captured.borrow();
+  assert_eq!(cap.len(), 3, "expected 3 chunks");
+  assert_eq!(cap[0], (0, vec![]), "chunk 0: offset 0, no spans");
+  assert_eq!(
+    cap[1],
+    (2, vec![(0, 3)]),
+    "chunk 1: offset 2, chunk-local span (0,3) = the full image"
+  );
+  assert_eq!(cap[2], (5, vec![]), "chunk 2: offset 5, no spans");
+}
+
 // (Pure-text-through-vlm_generate chunking path: covered indirectly by
 // `lm::generate`'s own chunked-prefill tests — the VLM path's chunking
 // loop is feature-identical to lm::generate's when image_spans is empty.
