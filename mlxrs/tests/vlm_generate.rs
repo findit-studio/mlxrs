@@ -1074,9 +1074,12 @@ fn vlm_generate_threads_cache_offset_and_chunk_local_spans() {
   //   chunk 2: offset=5, spans=[]
   // (The cache starts empty so initial_offset=0; the offsets equal the
   // cursors.)
+  //
+  // Per-chunk capture: `(cache_offset, chunk-local image spans)`.
+  type ChunkCapture = (usize, Vec<(usize, usize)>);
   struct OffsetCapturingModel {
     inner: MockVlmModel,
-    captured: RefCell<Vec<(usize, Vec<(usize, usize)>)>>,
+    captured: RefCell<Vec<ChunkCapture>>,
   }
   impl LmModel for OffsetCapturingModel {
     fn forward(&self, t: &Array, c: &mut [Box<dyn KvCache>]) -> mlxrs::Result<Array> {
