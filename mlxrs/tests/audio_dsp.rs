@@ -7,7 +7,10 @@ use std::f32::consts::PI;
 
 use mlxrs::{
   Array, Dtype,
-  audio::dsp::{hann_window, log_mel_spectrogram, mel_filter_bank, mel_spectrogram, stft},
+  audio::dsp::{
+    LogFloor, hann_window, log_mel_spectrogram, log_mel_spectrogram_with, mel_filter_bank,
+    mel_spectrogram, stft,
+  },
 };
 
 /// 16-sample sine at 1 kHz, sample_rate 16 kHz (matches the `mlx-audio`
@@ -216,5 +219,98 @@ fn log_mel_spectrogram_is_finite_for_sine_input() {
   let mut m = log_mel_spectrogram(&x, 8, 4, None, 4, 16_000, 0.0, None).unwrap();
   for v in m.to_vec::<f32>().unwrap() {
     assert!(v.is_finite(), "log-mel must be finite, got {v}");
+  }
+}
+
+#[test]
+fn log_floor_whisper_matches_1e_10() {
+  // Bit-exact comparison: Whisper variant must produce exactly `1e-10_f32`.
+  assert_eq!(LogFloor::Whisper.value(), 1e-10_f32);
+  // Default should also be Whisper.
+  assert_eq!(LogFloor::default().value(), 1e-10_f32);
+}
+
+#[test]
+fn log_floor_kaldi_matches_mlx_audio_1e_8() {
+  // Bit-exact comparison: Kaldi variant must produce exactly `1e-8_f32`,
+  // matching `mlx-audio/mlx_audio/dsp.py:950` (the `get_mel_banks_kaldi`
+  // path). This is deliberately mlx-audio's literal, NOT upstream
+  // kaldi-asr's `f32::EPSILON` — see [`LogFloor::Kaldi`] docs.
+  assert_eq!(LogFloor::Kaldi.value(), 1e-8_f32);
+}
+
+#[test]
+fn log_floor_custom_clamps_nonpositive_and_nonfinite_to_min_positive() {
+  // Negative, zero, NaN, and inf inputs all clamp to `f32::MIN_POSITIVE`
+  // so the resulting `log(floor)` is always finite.
+  assert_eq!(LogFloor::Custom(-1.0).value(), f32::MIN_POSITIVE);
+  assert_eq!(LogFloor::Custom(0.0).value(), f32::MIN_POSITIVE);
+  assert_eq!(LogFloor::Custom(-0.0).value(), f32::MIN_POSITIVE);
+  assert_eq!(LogFloor::Custom(f32::NAN).value(), f32::MIN_POSITIVE);
+  assert_eq!(LogFloor::Custom(f32::INFINITY).value(), f32::MIN_POSITIVE);
+  assert_eq!(
+    LogFloor::Custom(f32::NEG_INFINITY).value(),
+    f32::MIN_POSITIVE
+  );
+
+  // Valid positive customs pass through unchanged.
+  let v = LogFloor::Custom(1e-7).value();
+  assert!((v - 1e-7).abs() < f32::EPSILON);
+}
+
+#[test]
+fn log_mel_spectrogram_whisper_vs_kaldi_differ_at_silence() {
+  // 64 samples of silence — every mel-spec bin is 0, so the floor is the
+  // ONLY input to the final log. Whisper's `ln(1e-10) ≈ -23.0259` is more
+  // negative than Kaldi's `ln(1e-8) ≈ -18.4207`, by `ln(100) ≈ 4.6052`.
+  let zeros = Array::zeros::<f32>(&(64usize,)).unwrap();
+  let mut whisper =
+    log_mel_spectrogram_with(&zeros, 16, 8, None, 4, 16_000, 0.0, None, LogFloor::Whisper).unwrap();
+  let mut kaldi =
+    log_mel_spectrogram_with(&zeros, 16, 8, None, 4, 16_000, 0.0, None, LogFloor::Kaldi).unwrap();
+
+  let w = whisper.to_vec::<f32>().unwrap();
+  let k = kaldi.to_vec::<f32>().unwrap();
+  assert_eq!(w.len(), k.len(), "shape mismatch between floors");
+
+  let expected_w = (1e-10_f32).ln();
+  let expected_k = (1e-8_f32).ln();
+  let expected_delta = expected_k - expected_w; // ≈ +4.6052
+
+  for (wi, ki) in w.iter().zip(k.iter()) {
+    assert!(
+      (wi - expected_w).abs() < 1e-3,
+      "whisper silence entry should equal ln(1e-10)={expected_w}, got {wi}"
+    );
+    assert!(
+      (ki - expected_k).abs() < 1e-3,
+      "kaldi silence entry should equal ln(1e-8)={expected_k}, got {ki}"
+    );
+    assert!(*wi < *ki, "whisper floor must be more negative than kaldi");
+    assert!(
+      ((ki - wi) - expected_delta).abs() < 1e-3,
+      "delta whisper-kaldi should be ~ln(100)={expected_delta}, got {}",
+      ki - wi
+    );
+  }
+}
+
+#[test]
+fn log_mel_spectrogram_default_matches_explicit_whisper() {
+  // Backward-compat guarantee: the parameterless `log_mel_spectrogram`
+  // must be byte-identical to `log_mel_spectrogram_with(.., Whisper)`.
+  let x = sine_1khz_16samples();
+  let mut a = log_mel_spectrogram(&x, 8, 4, None, 4, 16_000, 0.0, None).unwrap();
+  let mut b =
+    log_mel_spectrogram_with(&x, 8, 4, None, 4, 16_000, 0.0, None, LogFloor::Whisper).unwrap();
+  let va = a.to_vec::<f32>().unwrap();
+  let vb = b.to_vec::<f32>().unwrap();
+  assert_eq!(va.len(), vb.len());
+  for (i, (x, y)) in va.iter().zip(vb.iter()).enumerate() {
+    assert_eq!(
+      x.to_bits(),
+      y.to_bits(),
+      "bit-mismatch at {i}: default={x:?} explicit_whisper={y:?}"
+    );
   }
 }
