@@ -85,8 +85,10 @@ pub struct Tokenizer {
   /// `eos_token_ids`, this is the first slice element (preserving input
   /// order, which `BTreeSet` would have sorted away); for the
   /// `tokenizer-config` fallback this is the `eos_token` resolved to its
-  /// id. `None` only when both sources are absent (used to error on
-  /// `encode_with(add_eos=true)`).
+  /// id. `None` when there is no configured primary EOS, including when
+  /// both sources are absent or the caller explicitly supplies an empty
+  /// `eos_token_ids` slice (which suppresses the fallback and leaves the
+  /// set empty; used to error on `encode_with(add_eos=true)`).
   primary_eos: Option<u32>,
   /// The jinja `chat_template` string. Only consumed by
   /// `apply_chat_template` (so gated on `tokenizer-chat`).
