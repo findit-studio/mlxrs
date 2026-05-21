@@ -34,9 +34,11 @@ use crate::{array::Array, error::Result};
 ///   `(batch, hidden)` vector (a BERT-style `pooler_output` / CLS head). Only
 ///   the [`PoolingStrategy::Cls`](super::PoolingStrategy::Cls) and
 ///   [`PoolingStrategy::None`](super::PoolingStrategy::None) paths can consume
-///   it, and the current [`pool`](super::pool) dispatcher derives CLS from the
-///   hidden states directly (python `cls_pooling`), so this is carried for
-///   parity / future use and is `None` for models that do not emit one.
+///   it. The current [`pool`](super::pool) dispatcher still derives CLS from
+///   the hidden states directly (python `cls_pooling`), but
+///   [`encode`](super::encode::encode) will prefer `pooled_output` for
+///   `Cls` / `None` when present (via its post-pooling fast-path). This field
+///   remains `None` for models that do not emit a dedicated pooled vector.
 ///
 /// No implicit eval: the arrays are lazy graph nodes; materialize via
 /// [`Array`] accessors.
@@ -70,10 +72,11 @@ impl EmbeddingModelOutput {
 /// `callAsFunction(_:…:attentionMask:)`. The [`encode`](super::encode::encode)
 /// entry only ever needs [`forward`](Self::forward).
 ///
-/// - `&self` — weights are immutable after load, so encoding never needs
-///   `&mut` on the model (matching the references, where the module is frozen
-///   for inference). One model can therefore back many concurrent encode
-///   calls.
+/// - `&self` — weights are treated as immutable after load, so encoding does
+///   not require `&mut` on the model (matching the references, where the
+///   module is frozen for inference). This documents immutable inference only;
+///   whether a model instance can be used from concurrent encode calls depends
+///   on the concrete model's thread-safety and MLX / [`Array`] constraints.
 /// - `input_ids` — an `I32` `(batch, seq_len)` array of token ids, padded to
 ///   the batch's max length by the caller ([`encode`](super::encode::encode)
 ///   builds it). `I32` is MLX's default index dtype for the embedding
