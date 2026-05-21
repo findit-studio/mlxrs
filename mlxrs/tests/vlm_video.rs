@@ -216,6 +216,62 @@ fn smart_resize_beta_path_accepts_just_under_exact_f64_domain() {
 }
 
 #[test]
+fn smart_resize_scale_up_accepts_huge_max_pixels_sentinel() {
+  // Regression for the Codex "scale-up over-rejects on huge max_pixels"
+  // finding. The scale-UP branch's `beta` ratio is `min_pixels / (height *
+  // width)` — `max_pixels` is NOT an operand. A combined `max_pixels`-keyed
+  // domain guard would over-reject this case even though python returns
+  // (56, 56) exactly; the fix splits `check_beta_domain` per branch so
+  // scale-up only bounds its actual operands (area + min_pixels).
+  //
+  // smart_resize(1, 1, 28, 3136, i64::MAX):
+  //   min_cell = 28*28 = 784 <= i64::MAX -> min_cell guard passes
+  //   hi/lo = 1/1 = 1.0 << MAX_RATIO -> ratio guard passes
+  //   h_bar = w_bar = max(28, round_by_factor(1, 28)) = max(28, 0) = 28
+  //   bar_area = 28*28 = 784;  not > max_pixels (i64::MAX) so not scale-down
+  //   784 < min_pixels (3136) -> SCALE UP
+  //   check_beta_domain_up(1, 1, 3136): area=1, min_pixels=3136 -- both
+  //     << 2^53, so the (now branch-specific) domain guard passes; the old
+  //     combined guard would have fired on `max_pixels = i64::MAX > 2^53`.
+  //   beta = sqrt(3136 / 1) = 56.0
+  //   h_bar = ceil_by_factor_f(1 * 56 = 56, 28) = ceil(2)*28 = 56
+  //   w_bar = ceil_by_factor_f(1 * 56 = 56, 28) = 56
+  //   -> (56, 56)  (matches python smart_resize(1, 1, 28, 3136, sys.maxsize))
+  let (h, w) = smart_resize(1, 1, 28, 3136, i64::MAX)
+    .expect("scale-up with small image + huge max_pixels sentinel must succeed");
+  assert_eq!(
+    (h, w),
+    (56, 56),
+    "must match python's scale-up output (56, 56), not be over-rejected by a \
+     `max_pixels`-keyed combined guard"
+  );
+}
+
+#[test]
+fn smart_resize_scale_up_rejects_oversized_min_pixels() {
+  // The legitimate scale-up rejection: the scale-up branch's actual operands
+  // are `min_pixels / (height * width)`, so `min_pixels > 2^53` (with a small
+  // area) IS the case where the f64 ratio loses bit-exactness with python's
+  // `int / int -> float` and the new `check_beta_domain_up` must fire.
+  //
+  // smart_resize(1, 1, 1, min_pixels = 2^53 + 1, max_pixels = i64::MAX):
+  //   factor = 1 (so min_cell = 1, all the integer guards pass trivially)
+  //   h_bar = w_bar = max(1, round_by_factor(1, 1)) = 1
+  //   bar_area = 1; 1 < min_pixels (2^53 + 1) -> SCALE UP
+  //   check_beta_domain_up(1, 1, 2^53 + 1): area=1 << 2^53 (passes), but
+  //     min_pixels = 2^53 + 1 > 2^53 -> MUST Err.
+  // This is the *correct* scale-up rejection that the split preserves
+  // (scale-up bounds min_pixels, scale-down bounds max_pixels).
+  let oversized_min = (1_i64 << 53) + 1;
+  let r = smart_resize(1, 1, 1, oversized_min, i64::MAX);
+  assert!(
+    r.is_err(),
+    "scale-up with min_pixels > 2^53 must Err on the new per-branch \
+     check_beta_domain_up, got {r:?}"
+  );
+}
+
+#[test]
 fn smart_nframes_rejects_overflow() {
   // Fixed{i64::MAX}: round_by_factor(i64::MAX, FRAME_FACTOR=2) overflows the
   // `quotient * 2` product -> must Err (not panic/wrap into a small count

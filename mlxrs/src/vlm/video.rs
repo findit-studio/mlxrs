@@ -173,23 +173,35 @@ fn check_factor_input(number: i64, op: &str) -> Result<()> {
 /// correctly-rounded big-rational→f64 divider (risky, and out of scope per the
 /// match-the-reference rule).
 ///
-/// Instead we BOUND THE DOMAIN: every integer in `[0, 2^53]` is exactly
-/// f64-representable, so when `height * width` (computed exact in `i128`, no
-/// overflow) and `max_pixels` are both `<= 2^53` the operands lose nothing in
-/// the `as f64` casts and IEEE-754 division is correctly-rounded — i.e. the f64
-/// ratio EQUALS python's `int / int -> float` to the bit. (`min_pixels` needs no
-/// separate bound: `0 <= min_pixels <= max_pixels` is enforced by the caller, so
-/// `max_pixels <= 2^53` gives `min_pixels <= 2^53` for the scale-up dividend.)
-/// Above `2^53` we reject with a recoverable [`Error::ShapeMismatch`] naming the
-/// values rather than emit an imprecisely-rounded size.
+/// Instead we BOUND THE DOMAIN per branch: every integer in `[0, 2^53]` is
+/// exactly f64-representable, so when BOTH operands of the *actual* division on
+/// this branch are `<= 2^53` the `as f64` casts lose nothing and IEEE-754
+/// division is correctly-rounded — i.e. the f64 ratio EQUALS python's
+/// `int / int -> float` to the bit. Above `2^53` we reject with a recoverable
+/// [`Error::ShapeMismatch`] naming the values rather than emit an
+/// imprecisely-rounded size.
+///
+/// **Branch-specific operands** (this is why the helper is per-branch — a
+/// single combined guard over-rejects):
+/// - Scale-DOWN: `beta = sqrt((height * width) / max_pixels)`. The ratio
+///   operands are `height * width` (numerator) and `max_pixels` (denominator);
+///   `min_pixels` does NOT appear. Use [`check_beta_domain_down`].
+/// - Scale-UP: `beta = sqrt(min_pixels / (height * width))`. The ratio operands
+///   are `min_pixels` (numerator) and `height * width` (denominator);
+///   `max_pixels` does NOT appear. Use [`check_beta_domain_up`]. A caller with
+///   a small image, a huge `max_pixels` sentinel, and a normal `min_pixels`
+///   (e.g. `smart_resize(1, 1, 28, 3136, i64::MAX)`) is correctly admitted to
+///   the scale-up branch under this split — under a `max_pixels`-keyed guard
+///   it would be over-rejected even though python returns `(56, 56)`.
 ///
 /// The realistic video domain is unaffected: frame dims run in the thousands,
 /// so `height * width` is in the millions — twenty-plus orders of magnitude
-/// below `2^53` — and `max_pixels` is the `16384 * 28 * 28 ≈ 1.3e7` budget. This
-/// guard therefore always passes (and matches python exactly) for real inputs;
-/// it fires only on the pathological dims/budgets where the f64 path could
-/// silently diverge.
-fn check_beta_domain(height: i64, width: i64, max_pixels: i64) -> Result<()> {
+/// below `2^53` — and `max_pixels` / `min_pixels` are the
+/// `16384 * 28 * 28 ≈ 1.3e7` / `4 * 28 * 28` budgets. Both guards therefore
+/// always pass (and match python exactly) for real inputs; each fires only on
+/// the pathological dims/budgets where its branch's f64 path could silently
+/// diverge.
+fn check_beta_domain_down(height: i64, width: i64, max_pixels: i64) -> Result<()> {
   // EXACT i128 product — `height`/`width` are validated positive `i64`, so
   // `height * width` can exceed `i64` (and is inexact in f64); i128 holds it
   // overflow-free and the comparison is exact.
@@ -197,9 +209,30 @@ fn check_beta_domain(height: i64, width: i64, max_pixels: i64) -> Result<()> {
   if area > F64_EXACT_INT_MAX as i128 || max_pixels > F64_EXACT_INT_MAX {
     return Err(Error::ShapeMismatch {
       message: format!(
-        "smart_resize: height*width (= {area}) or max_pixels (= {max_pixels}) exceeds the \
-         exact-f64 range 2^53 ({F64_EXACT_INT_MAX}); the beta (sqrt) scale is not exactly \
-         computable there and is rejected rather than rounded imprecisely"
+        "smart_resize (scale-down): height*width (= {area}) or max_pixels (= {max_pixels}) \
+         exceeds the exact-f64 range 2^53 ({F64_EXACT_INT_MAX}); the beta (sqrt) scale-down \
+         ratio (height*width / max_pixels) is not exactly computable there and is rejected \
+         rather than rounded imprecisely"
+      ),
+    });
+  }
+  Ok(())
+}
+
+/// Scale-UP companion to [`check_beta_domain_down`]: the scale-up `beta` ratio
+/// is `min_pixels / (height * width)`, so the operands to bound are
+/// `min_pixels` and `area`, NOT `max_pixels`. See [`check_beta_domain_down`]'s
+/// doc for the precision-rationale and the over-rejection case this split
+/// avoids.
+fn check_beta_domain_up(height: i64, width: i64, min_pixels: i64) -> Result<()> {
+  let area = (height as i128) * (width as i128);
+  if area > F64_EXACT_INT_MAX as i128 || min_pixels > F64_EXACT_INT_MAX {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "smart_resize (scale-up): height*width (= {area}) or min_pixels (= {min_pixels}) \
+         exceeds the exact-f64 range 2^53 ({F64_EXACT_INT_MAX}); the beta (sqrt) scale-up \
+         ratio (min_pixels / (height*width)) is not exactly computable there and is rejected \
+         rather than rounded imprecisely"
       ),
     });
   }
@@ -336,17 +369,28 @@ fn round_half_to_even(x: f64) -> i64 {
 /// 4. Else if `h_bar * w_bar < min_pixels`, scale **up** by
 ///    `beta = sqrt(min_pixels / (h*w))` and `ceil_by_factor`.
 ///
-/// # `beta` (sqrt) path exactness — bounded domain
+/// # `beta` (sqrt) path exactness — bounded domain (branch-specific)
 /// Python forms each `beta` ratio as an EXACT arbitrary-precision `int / int`
 /// (then `math.sqrt`). This port's `beta` is **bit-exact** with the reference
-/// **only while `height * width` and `max_pixels` are `<= 2^53`** (every operand
-/// is then f64-representable and IEEE division is correctly-rounded, so the f64
-/// ratio equals python's `int / int -> float` to the bit). Inputs above `2^53`
-/// are **rejected** with [`Error::ShapeMismatch`] rather than computed
-/// imprecisely — a naive `f64 / f64` would double-round and could diverge in the
-/// last bit there, and a correctly-rounded big-rational divider is out of scope.
-/// Every realistic frame size (dims in the thousands, area in the millions) is
-/// far below the bound and so always matches python exactly.
+/// **only while the operands of *that branch's* division are `<= 2^53`** (every
+/// operand is then f64-representable and IEEE division is correctly-rounded, so
+/// the f64 ratio equals python's `int / int -> float` to the bit):
+/// - Scale-DOWN bound: `height * width <= 2^53` AND `max_pixels <= 2^53`
+///   (operands of `(height * width) / max_pixels`).
+/// - Scale-UP bound: `height * width <= 2^53` AND `min_pixels <= 2^53`
+///   (operands of `min_pixels / (height * width)`).
+///
+/// The bounds are **per-branch on purpose**: a single combined `max_pixels`
+/// guard would over-reject scale-up — e.g. `smart_resize(1, 1, 28, 3136,
+/// i64::MAX)` (small image + huge `max_pixels` sentinel + normal `min_pixels`)
+/// enters scale-up, where the actual ratio is `3136 / 1` (both far below
+/// `2^53`), so it must succeed and return `(56, 56)` like python. Inputs above
+/// the relevant bound are **rejected** with [`Error::ShapeMismatch`] rather
+/// than computed imprecisely — a naive `f64 / f64` would double-round and
+/// could diverge in the last bit there, and a correctly-rounded big-rational
+/// divider is out of scope. Every realistic frame size (dims in the thousands,
+/// area in the millions) is far below both bounds and so always matches python
+/// exactly.
 ///
 /// # Aspect-ratio check fidelity
 /// The python reference computes `max(h, w) / min(h, w)` in **float**
@@ -380,12 +424,14 @@ fn round_half_to_even(x: f64) -> i64 {
 ///   **kept**, not rejected: the reference's `floor_by_factor` /
 ///   `ceil_by_factor` do not re-clamp, so re-clamping here would diverge
 ///   from the python output.
-/// - [`Error::ShapeMismatch`] if a rescale (`beta`) is needed but
-///   `height * width` or `max_pixels` exceeds `2^53` — see the *`beta` (sqrt)
-///   path exactness* note above. The f64 ratio cannot be guaranteed bit-exact
-///   with python's `int / int` there, so the value is rejected rather than
-///   computed imprecisely. (Only reached on the scale-up / scale-down branches;
-///   a within-budget input that needs no rescale never trips it.)
+/// - [`Error::ShapeMismatch`] if a rescale (`beta`) is needed but the operands
+///   of *that branch's* division exceed `2^53` — see the *`beta` (sqrt) path
+///   exactness* note above for the per-branch bounds (scale-down: area /
+///   `max_pixels`; scale-up: area / `min_pixels`). The f64 ratio cannot be
+///   guaranteed bit-exact with python's `int / int` past that range, so the
+///   value is rejected rather than computed imprecisely. (Only reached on the
+///   scale-up / scale-down branches; a within-budget input that needs no
+///   rescale never trips it.)
 pub fn smart_resize(
   height: i64,
   width: i64,
@@ -466,9 +512,12 @@ pub fn smart_resize(
   if bar_area > max_pixels as i128 {
     // SCALE DOWN — python: beta = sqrt((height * width) / max_pixels), then
     // floor_by_factor(height / beta, factor). `beta`'s sqrt is the only float
-    // math, mirroring python's `math.sqrt(...)`. Bound the f64 domain first so
-    // that division is bit-exact with the reference (see `check_beta_domain`).
-    check_beta_domain(height, width, max_pixels)?;
+    // math, mirroring python's `math.sqrt(...)`. Bound the f64 domain of THIS
+    // branch's actual operands — `height * width` (numerator) and `max_pixels`
+    // (denominator); `min_pixels` does not appear in the scale-down ratio — so
+    // the division is bit-exact with the reference (see
+    // `check_beta_domain_down`).
+    check_beta_domain_down(height, width, max_pixels)?;
     let hw = height as f64 * width as f64;
     let beta = (hw / max_pixels as f64).sqrt();
     // python: floor_by_factor(height / beta, factor) where the argument is
@@ -478,11 +527,13 @@ pub fn smart_resize(
     w_bar = floor_by_factor_f(width as f64 / beta, factor)?;
   } else if bar_area < min_pixels as i128 {
     // SCALE UP — python: beta = sqrt(min_pixels / (height * width)), then
-    // ceil_by_factor(height * beta, factor). Same bounded-domain guard: the
-    // dividend `min_pixels <= max_pixels` (enforced earlier) is also `<= 2^53`
-    // once `max_pixels <= 2^53`, and the divisor `height * width <= 2^53`, so
-    // the f64 division is bit-exact with python's `int / int -> float`.
-    check_beta_domain(height, width, max_pixels)?;
+    // ceil_by_factor(height * beta, factor). Bound the f64 domain of THIS
+    // branch's actual operands — `min_pixels` (numerator) and `height * width`
+    // (denominator); `max_pixels` does not appear in the scale-up ratio, so a
+    // huge `max_pixels` sentinel must NOT over-reject here (e.g.
+    // `smart_resize(1, 1, 28, 3136, i64::MAX)` is legitimate scale-up that
+    // python returns `(56, 56)` for). See `check_beta_domain_up`.
+    check_beta_domain_up(height, width, min_pixels)?;
     let hw = height as f64 * width as f64;
     let beta = (min_pixels as f64 / hw).sqrt();
     h_bar = ceil_by_factor_f(height as f64 * beta, factor)?;
