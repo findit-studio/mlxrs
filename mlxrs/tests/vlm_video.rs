@@ -163,6 +163,59 @@ fn smart_resize_min_cell_guard_exact_i128_no_f64_bypass_no_overflow() {
 }
 
 #[test]
+fn smart_resize_beta_path_rejects_outside_exact_f64_domain() {
+  // Regression for the Codex "beta path diverges from python for huge dims"
+  // finding: when `height * width` (exact, i128) OR `max_pixels` exceeds the
+  // f64 exact-integer range 2^53, the naive `f64 / f64` ratio double-rounds
+  // and can disagree with python's `int / int -> float` in the last bit.
+  // Faithfully bit-matching python for arbitrary magnitudes would need a
+  // correctly-rounded big-rational divider (out of scope per match-the-
+  // reference); the port instead BOUNDS the domain and rejects with a
+  // recoverable Err.
+  //
+  // Concrete oversized case from the original investigation. Each individual
+  // dim (7.5e15) is BELOW 2^53 (9.007e15), so `check_factor_input` lets
+  // `round_by_factor` through — but the PRODUCT (area = 5.66e31 > 2^53) AND
+  // max_pixels (4.04e17 > 2^53) blow past the exact-f64 range, so the beta
+  // (scale-down) path's f64 division is no longer guaranteed bit-exact.
+  // Must Err recoverably, NOT silently return a wrong size.
+  let r = smart_resize(
+    7_525_505_807_827_768_i64,
+    7_525_505_807_827_768_i64,
+    28,
+    1,
+    403_774_502_723_931_024_i64,
+  );
+  assert!(
+    r.is_err(),
+    "huge dims with area >> 2^53 must Err on the beta path, got {r:?}"
+  );
+}
+
+#[test]
+fn smart_resize_beta_path_accepts_just_under_exact_f64_domain() {
+  // The positive companion to the bound rejection: a realistic-sized input
+  // whose `height * width` and `max_pixels` are BOTH below 2^53 must still
+  // succeed AND match the python reference exactly.
+  //
+  // height=4000, width=4000, factor=28, min=MIN_PIXELS, max=50_000:
+  //   h_bar = w_bar = round_by_factor(4000, 28) = round(142.857)*28 = 4004
+  //   bar_area = 4004 * 4004 = 16_032_016 > 50_000 -> scale DOWN
+  //   area = 4000*4000 = 16_000_000 (<< 2^53), max_pixels=50_000 (<< 2^53)
+  //     -> check_beta_domain passes; f64 division is bit-exact with python.
+  //   beta = sqrt(16_000_000 / 50_000) = sqrt(320) = 17.88854...
+  //   floor_by_factor(4000 / 17.88854 = 223.6068..., 28)
+  //     = floor(7.9859)*28 = 7*28 = 196
+  let (h, w) = smart_resize(4000, 4000, 28, MIN_PIXELS, 50_000)
+    .expect("area and max_pixels far below 2^53 must succeed");
+  assert_eq!((h, w), (196, 196), "must match the python beta-path output");
+  assert!(
+    h * w <= 50_000,
+    "downscaled pixel count stays within max_pixels"
+  );
+}
+
+#[test]
 fn smart_nframes_rejects_overflow() {
   // Fixed{i64::MAX}: round_by_factor(i64::MAX, FRAME_FACTOR=2) overflows the
   // `quotient * 2` product -> must Err (not panic/wrap into a small count

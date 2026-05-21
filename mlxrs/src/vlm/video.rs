@@ -160,6 +160,52 @@ fn check_factor_input(number: i64, op: &str) -> Result<()> {
   Ok(())
 }
 
+/// Bound the `smart_resize` `beta` (sqrt) scale path to the domain where the
+/// f64 ratio is provably bit-exact with the python reference.
+///
+/// Python computes `beta`'s ratio as an EXACT arbitrary-precision `int / int`
+/// (`(height * width) / max_pixels` for scale-down, `min_pixels / (height *
+/// width)` for scale-up) and *then* takes `math.sqrt`. For huge operands that
+/// `int / int -> float` is correctly-rounded straight from the true rational,
+/// whereas a Rust `f64 / f64` double-rounds — each integer rounds to f64 first,
+/// then the division rounds again — and can differ in the last ULP. Reproducing
+/// python's single-rounding for arbitrary magnitudes would need a
+/// correctly-rounded big-rational→f64 divider (risky, and out of scope per the
+/// match-the-reference rule).
+///
+/// Instead we BOUND THE DOMAIN: every integer in `[0, 2^53]` is exactly
+/// f64-representable, so when `height * width` (computed exact in `i128`, no
+/// overflow) and `max_pixels` are both `<= 2^53` the operands lose nothing in
+/// the `as f64` casts and IEEE-754 division is correctly-rounded — i.e. the f64
+/// ratio EQUALS python's `int / int -> float` to the bit. (`min_pixels` needs no
+/// separate bound: `0 <= min_pixels <= max_pixels` is enforced by the caller, so
+/// `max_pixels <= 2^53` gives `min_pixels <= 2^53` for the scale-up dividend.)
+/// Above `2^53` we reject with a recoverable [`Error::ShapeMismatch`] naming the
+/// values rather than emit an imprecisely-rounded size.
+///
+/// The realistic video domain is unaffected: frame dims run in the thousands,
+/// so `height * width` is in the millions — twenty-plus orders of magnitude
+/// below `2^53` — and `max_pixels` is the `16384 * 28 * 28 ≈ 1.3e7` budget. This
+/// guard therefore always passes (and matches python exactly) for real inputs;
+/// it fires only on the pathological dims/budgets where the f64 path could
+/// silently diverge.
+fn check_beta_domain(height: i64, width: i64, max_pixels: i64) -> Result<()> {
+  // EXACT i128 product — `height`/`width` are validated positive `i64`, so
+  // `height * width` can exceed `i64` (and is inexact in f64); i128 holds it
+  // overflow-free and the comparison is exact.
+  let area = (height as i128) * (width as i128);
+  if area > F64_EXACT_INT_MAX as i128 || max_pixels > F64_EXACT_INT_MAX {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "smart_resize: height*width (= {area}) or max_pixels (= {max_pixels}) exceeds the \
+         exact-f64 range 2^53 ({F64_EXACT_INT_MAX}); the beta (sqrt) scale is not exactly \
+         computable there and is rejected rather than rounded imprecisely"
+      ),
+    });
+  }
+  Ok(())
+}
+
 /// Closest integer to `number / factor`, times `factor`.
 ///
 /// Ports python `round_by_factor` (`video_generate.py:51-53`):
@@ -290,6 +336,18 @@ fn round_half_to_even(x: f64) -> i64 {
 /// 4. Else if `h_bar * w_bar < min_pixels`, scale **up** by
 ///    `beta = sqrt(min_pixels / (h*w))` and `ceil_by_factor`.
 ///
+/// # `beta` (sqrt) path exactness — bounded domain
+/// Python forms each `beta` ratio as an EXACT arbitrary-precision `int / int`
+/// (then `math.sqrt`). This port's `beta` is **bit-exact** with the reference
+/// **only while `height * width` and `max_pixels` are `<= 2^53`** (every operand
+/// is then f64-representable and IEEE division is correctly-rounded, so the f64
+/// ratio equals python's `int / int -> float` to the bit). Inputs above `2^53`
+/// are **rejected** with [`Error::ShapeMismatch`] rather than computed
+/// imprecisely — a naive `f64 / f64` would double-round and could diverge in the
+/// last bit there, and a correctly-rounded big-rational divider is out of scope.
+/// Every realistic frame size (dims in the thousands, area in the millions) is
+/// far below the bound and so always matches python exactly.
+///
 /// # Aspect-ratio check fidelity
 /// The python reference computes `max(h, w) / min(h, w)` in **float**
 /// (true division) and compares to `MAX_RATIO`. The swift reference uses
@@ -322,6 +380,12 @@ fn round_half_to_even(x: f64) -> i64 {
 ///   **kept**, not rejected: the reference's `floor_by_factor` /
 ///   `ceil_by_factor` do not re-clamp, so re-clamping here would diverge
 ///   from the python output.
+/// - [`Error::ShapeMismatch`] if a rescale (`beta`) is needed but
+///   `height * width` or `max_pixels` exceeds `2^53` — see the *`beta` (sqrt)
+///   path exactness* note above. The f64 ratio cannot be guaranteed bit-exact
+///   with python's `int / int` there, so the value is rejected rather than
+///   computed imprecisely. (Only reached on the scale-up / scale-down branches;
+///   a within-budget input that needs no rescale never trips it.)
 pub fn smart_resize(
   height: i64,
   width: i64,
@@ -399,13 +463,13 @@ pub fn smart_resize(
   // or skip a needed rescale on an adversarial budget). `i128` holds every
   // `i64 * i64` exactly and overflow-free.
   let bar_area = (h_bar as i128) * (w_bar as i128);
-  // `beta` is the only float math, matching python's `math.sqrt(...)`. Its
-  // `height * width` argument is exact in f64 here: any dimension large enough
-  // to lose precision (> ±2^53) was already rejected by `round_by_factor`'s
-  // input guard above, so this branch only runs on faithfully-representable
-  // dims. Keep the sqrt/`beta` in f64 to reproduce the reference bit-for-bit.
-  let hw = height as f64 * width as f64;
   if bar_area > max_pixels as i128 {
+    // SCALE DOWN — python: beta = sqrt((height * width) / max_pixels), then
+    // floor_by_factor(height / beta, factor). `beta`'s sqrt is the only float
+    // math, mirroring python's `math.sqrt(...)`. Bound the f64 domain first so
+    // that division is bit-exact with the reference (see `check_beta_domain`).
+    check_beta_domain(height, width, max_pixels)?;
+    let hw = height as f64 * width as f64;
     let beta = (hw / max_pixels as f64).sqrt();
     // python: floor_by_factor(height / beta, factor) where the argument is
     // the FLOAT `height / beta` — use the float-input helper so we don't
@@ -413,6 +477,13 @@ pub fn smart_resize(
     h_bar = floor_by_factor_f(height as f64 / beta, factor)?;
     w_bar = floor_by_factor_f(width as f64 / beta, factor)?;
   } else if bar_area < min_pixels as i128 {
+    // SCALE UP — python: beta = sqrt(min_pixels / (height * width)), then
+    // ceil_by_factor(height * beta, factor). Same bounded-domain guard: the
+    // dividend `min_pixels <= max_pixels` (enforced earlier) is also `<= 2^53`
+    // once `max_pixels <= 2^53`, and the divisor `height * width <= 2^53`, so
+    // the f64 division is bit-exact with python's `int / int -> float`.
+    check_beta_domain(height, width, max_pixels)?;
+    let hw = height as f64 * width as f64;
     let beta = (min_pixels as f64 / hw).sqrt();
     h_bar = ceil_by_factor_f(height as f64 * beta, factor)?;
     w_bar = ceil_by_factor_f(width as f64 * beta, factor)?;
