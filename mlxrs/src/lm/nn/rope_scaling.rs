@@ -73,9 +73,65 @@ fn base_pair_freqs(base: f64, dims: i32, half: usize) -> Vec<f64> {
 /// Materialise a host-computed `f64` `freqs` vector as a 1-D `f32` mlx array of
 /// shape `[half]` — the per-dimension inverse-frequency array `mlx_fast_rope`
 /// consumes (mlx-lm stores `self._freqs` as `mx.float32`).
+///
+/// The host-side `freqs` are checked for finiteness *before* the `f32` store:
+/// every scaled-RoPE formula divides and takes `ln`s of config-derived terms,
+/// so a poisoned input or an arithmetic edge (e.g. a zero blend denominator)
+/// can yield a NaN/±Inf element that would otherwise be stored verbatim and
+/// later multiply activations by NaN/Inf. This is the catch-all finiteness gate
+/// for the per-dimension frequencies — it closes any arithmetic edge the
+/// per-input guards do not enumerate. The check is on the narrowed `f32` value:
+/// a non-finite `f64` source stays non-finite after the cast, and a finite
+/// `f64` that overflows the `f32` range (`±Inf` only after narrowing) is caught
+/// too. The original `f64` is reported in the message for diagnosis.
 fn freqs_array(freqs: &[f64]) -> Result<Array> {
-  let buf: Vec<f32> = freqs.iter().map(|&v| v as f32).collect();
+  let mut buf: Vec<f32> = Vec::with_capacity(freqs.len());
+  for &v in freqs {
+    let f = v as f32;
+    if !f.is_finite() {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "scaled RoPE computed a non-finite freq ({v}); check the scaling config \
+           (base / factor / embeddings / betas)"
+        ),
+      });
+    }
+    buf.push(f);
+  }
   Array::from_slice::<f32>(&buf, &(freqs.len(),))
+}
+
+/// Reject a non-finite computed scalar constant (the derived input `scale` /
+/// `mscale`) before it is stored on the variant. The per-input guards already
+/// reject the inputs known to poison the formula, but this is the structural
+/// catch-all: no scaled-RoPE constructor may return `Ok` carrying a NaN/±Inf
+/// scalar that `apply` would later multiply onto activations. `what` names the
+/// constant for the error message.
+fn finite_scalar(value: f64, what: &str) -> Result<f32> {
+  let v = value as f32;
+  if v.is_finite() {
+    Ok(v)
+  } else {
+    Err(Error::ShapeMismatch {
+      message: format!(
+        "scaled RoPE computed a non-finite {what} ({value}); check the scaling config"
+      ),
+    })
+  }
+}
+
+/// Reject a non-finite `f32` config input up front, so a NaN/±Inf never slips
+/// past the positivity/`> 1` comparisons that follow (`NaN <= 0.0` and
+/// `NaN > 1.0` are both `false`, so an unchecked NaN would pass every ordered
+/// guard and poison the arithmetic). `what` names the field for the message.
+fn require_finite_input(value: f32, what: &str) -> Result<()> {
+  if value.is_finite() {
+    Ok(())
+  } else {
+    Err(Error::ShapeMismatch {
+      message: format!("scaled RoPE {what} must be finite, got {value}"),
+    })
+  }
 }
 
 /// Scale the first `dims` features of the last axis of `x` by the scalar
@@ -214,6 +270,23 @@ impl Llama3Rope {
     scaling: Llama3ScalingConfig,
   ) -> Result<Self> {
     let half = freqs_half(dims)?;
+    // Input-finiteness: a NaN/±Inf field would slip past the formula's ordered
+    // comparisons (`wavelen > low_wl`, the band selects) and poison every freq.
+    // The `freqs_array` finiteness gate below is the catch-all, but rejecting
+    // the inputs up front yields a clearer message. The medium-band denominator
+    // also divides by `high_freq_factor - low_freq_factor` and by `factor`, so a
+    // degenerate config (equal factors, or a zero `factor`) is caught by the
+    // computed-output gate.
+    require_finite_input(base, "base")?;
+    require_finite_input(scaling.factor, "factor")?;
+    require_finite_input(scaling.low_freq_factor, "low_freq_factor")?;
+    require_finite_input(scaling.high_freq_factor, "high_freq_factor")?;
+    require_finite_input(
+      scaling.original_max_position_embeddings,
+      "original_max_position_embeddings",
+    )?;
+    // Catch-all: rejects any freq that came out NaN/±Inf (degenerate factors,
+    // zero `factor`, etc.) before it is stored.
     let freqs = freqs_array(&Self::compute_freqs(f64::from(base), dims, half, scaling))?;
     Ok(Self {
       dims,
@@ -317,18 +390,30 @@ impl SuScaledRope {
         ),
       });
     }
+    // Input-finiteness: a NaN/±Inf `base` or `long_factor` entry would multiply
+    // through to a non-finite freq; reject up front (the `freqs_array` gate is
+    // the catch-all, this is the clearer message).
+    require_finite_input(base, "base")?;
+    for &lf in long_factor {
+      require_finite_input(lf, "long_factor entry")?;
+    }
     let base_freqs = base_pair_freqs(f64::from(base), dims, half);
     let freqs: Vec<f64> = base_freqs
       .into_iter()
       .zip(long_factor)
       .map(|(f, &lf)| f64::from(lf) * f)
       .collect();
+    // Catch-all: any non-finite freq is rejected before the store.
     let freqs = freqs_array(&freqs)?;
 
     let scale = match long_mscale {
       // An explicit override skips the derived formula entirely (the embeddings
-      // values are then unused), so accept it verbatim.
-      Some(mscale) => mscale,
+      // values are then unused), so accept it verbatim — but it is still stored
+      // and multiplied onto activations, so it must be finite.
+      Some(mscale) => {
+        require_finite_input(mscale, "long_mscale")?;
+        mscale
+      }
       None => {
         // The derived scale divides by, and takes `ln()` of,
         // `original_max_position_embeddings`, and divides `max_position_embeddings`
@@ -349,8 +434,25 @@ impl SuScaledRope {
         if factor <= 1.0 {
           1.0
         } else {
-          // sqrt(1 + ln(factor) / ln(orig_max))
-          (1.0 + factor.ln() / f64::from(original_max_position_embeddings).ln()).sqrt() as f32
+          // On the derived path with factor > 1 the scale divides by
+          // `ln(orig_max)`. `orig_max == 1` makes `ln(1) == 0` → `+Inf` scale,
+          // and the `> 0` guard above accepts `1`. Reject `orig_max <= 1` on
+          // this path explicitly (the `finite_scalar` gate below would also
+          // catch the resulting `+Inf`, but the message here is precise).
+          if original_max_position_embeddings <= 1 {
+            return Err(Error::ShapeMismatch {
+              message: format!(
+                "SuScaledRoPE original_max_position_embeddings ({original_max_position_embeddings}) \
+                 must be > 1 on the derived-scale path (factor > 1): ln(1) = 0 divides the scale \
+                 to +Inf"
+              ),
+            });
+          }
+          // sqrt(1 + ln(factor) / ln(orig_max)); finiteness is the catch-all.
+          finite_scalar(
+            (1.0 + factor.ln() / f64::from(original_max_position_embeddings).ln()).sqrt(),
+            "input scale",
+          )?
         }
       }
     };
@@ -447,6 +549,18 @@ impl YarnRope {
   /// mscale_all_dim)`.
   pub fn new(dims: i32, base: f32, traditional: bool, config: YarnConfig) -> Result<Self> {
     let half = freqs_half(dims)?;
+
+    // Input-finiteness up front: a NaN/±Inf float field would slip past the
+    // ordered `<= 0` / `<= 1` guards below (`NaN <= 0.0` and `NaN > 1.0` are
+    // both `false`) and poison the correction dims, the ramp, the mscale, or the
+    // freqs. Reject every float input used in the arithmetic first.
+    require_finite_input(base, "base")?;
+    require_finite_input(config.scaling_factor, "scaling_factor")?;
+    require_finite_input(config.beta_fast, "beta_fast")?;
+    require_finite_input(config.beta_slow, "beta_slow")?;
+    require_finite_input(config.mscale, "mscale")?;
+    require_finite_input(config.mscale_all_dim, "mscale_all_dim")?;
+
     let base = f64::from(base);
     let dims_f = f64::from(dims);
     let scaling_factor = f64::from(config.scaling_factor);
@@ -480,6 +594,20 @@ impl YarnRope {
         ),
       });
     }
+    // `scaling_factor` scales the interpolation freqs (`freq_inter =
+    // scaling_factor * base_freqs`). A non-positive value (e.g. `0`) makes
+    // `freq_inter == 0`, which zeroes the blended-freq denominator on the
+    // extrapolation side (`freq_inter * freq_mask + freq_extra * (1 -
+    // freq_mask)` → `0` when `freq_mask == 1`) → `0/0 = NaN` freqs. Reject it
+    // explicitly (the `freqs_array` gate below is the catch-all).
+    if config.scaling_factor <= 0.0 {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "YarnRoPE scaling_factor must be positive, got {}",
+          config.scaling_factor
+        ),
+      });
+    }
 
     // yarn_find_correction_dim(num_rotations)
     let find_correction_dim = |num_rotations: f64| {
@@ -499,8 +627,15 @@ impl YarnRope {
         0.1 * mscale * scale.ln() + 1.0
       }
     };
-    let mscale = (get_mscale(scaling_factor, f64::from(config.mscale))
-      / get_mscale(scaling_factor, f64::from(config.mscale_all_dim))) as f32;
+    // The denominator `get_mscale(scaling_factor, mscale_all_dim)` can be `0`
+    // (e.g. a negative `mscale_all_dim` driving `0.1 * m * ln(scale) + 1` to
+    // zero), giving a non-finite ratio. `finite_scalar` is the catch-all for the
+    // stored mscale — no constructor returns `Ok` with a non-finite scalar.
+    let mscale = finite_scalar(
+      get_mscale(scaling_factor, f64::from(config.mscale))
+        / get_mscale(scaling_factor, f64::from(config.mscale_all_dim)),
+      "mscale",
+    )?;
 
     // freq_extra = base_freqs ; freq_inter = scaling_factor * base_freqs
     // freq_mask = 1 - clip((arange(dims/2) - low) / (high - low), 0, 1)
@@ -792,6 +927,61 @@ mod tests {
   }
 
   #[test]
+  fn su_scaled_rejects_orig_max_one_on_derived_path() {
+    // orig_max == 1 passes the `> 0` guard but makes `ln(orig_max) = ln(1) = 0`
+    // divide the derived scale to +Inf when factor > 1 (max_pos > orig_max). The
+    // ctor must reject it, not store an Inf scale.
+    let r = SuScaledRope::new(8, DEFAULT_BASE, 2, 1, &[1.0; 4], None);
+    assert!(r.is_err(), "orig_max=1 with factor>1 must be rejected");
+    // No accepted ctor carries an Inf scale.
+    if let Ok(r) = r {
+      assert!(r.scale().is_finite(), "stored scale must be finite");
+    }
+  }
+
+  #[test]
+  fn su_scaled_rejects_nonfinite_float_inputs() {
+    // NaN/±Inf floats slip past `<=`/`>` ordered comparisons; the up-front
+    // finiteness guards must reject them so no non-finite constant is stored.
+    assert!(
+      SuScaledRope::new(8, f32::NAN, 16384, 4096, &[1.0; 4], None).is_err(),
+      "NaN base"
+    );
+    assert!(
+      SuScaledRope::new(8, f32::INFINITY, 16384, 4096, &[1.0; 4], None).is_err(),
+      "Inf base"
+    );
+    assert!(
+      SuScaledRope::new(
+        8,
+        DEFAULT_BASE,
+        16384,
+        4096,
+        &[f32::NAN, 1.0, 1.0, 1.0],
+        None
+      )
+      .is_err(),
+      "NaN long_factor entry"
+    );
+    assert!(
+      SuScaledRope::new(8, DEFAULT_BASE, 16384, 4096, &[1.0; 4], Some(f32::INFINITY)).is_err(),
+      "Inf long_mscale override"
+    );
+  }
+
+  #[test]
+  fn su_scaled_valid_inputs_yield_finite_scale_and_freqs() {
+    // Positive control: a well-formed derived-scale config stores a finite scale
+    // and finite freqs (the complement of the rejection tests above).
+    let r = SuScaledRope::new(8, DEFAULT_BASE, 16384, 4096, &[1.0, 2.0, 3.0, 4.0], None).unwrap();
+    assert!(r.scale().is_finite(), "scale must be finite");
+    let mut freqs = r.freqs.try_clone().unwrap();
+    for v in freqs.to_vec::<f32>().unwrap() {
+      assert!(v.is_finite(), "non-finite freq {v}");
+    }
+  }
+
+  #[test]
   fn su_scaled_scale_one_skip_path_matches_plain_freqs() {
     // factor = max_pos/orig_max <= 1 ⇒ scale == 1.0 ⇒ apply must skip the
     // leading-dims rescale and equal a bare freqs-rope (the YaRN-style skip).
@@ -1005,6 +1195,57 @@ mod tests {
     let mut cfg = YarnConfig::new(4.0);
     cfg.beta_slow = -1.0;
     assert!(YarnRope::new(8, DEFAULT_BASE, false, cfg).is_err());
+  }
+
+  #[test]
+  fn yarn_rejects_nonpositive_scaling_factor() {
+    // scaling_factor == 0 ⇒ freq_inter == 0 ⇒ the blended-freq denominator is 0
+    // where freq_mask == 1 ⇒ 0/0 = NaN freqs. The ctor must reject it, not store
+    // NaN freqs.
+    let mut cfg = YarnConfig::new(0.0);
+    assert!(
+      YarnRope::new(8, DEFAULT_BASE, false, cfg).is_err(),
+      "scaling_factor=0 must be rejected"
+    );
+    cfg.scaling_factor = -4.0;
+    assert!(
+      YarnRope::new(8, DEFAULT_BASE, false, cfg).is_err(),
+      "negative scaling_factor must be rejected"
+    );
+  }
+
+  #[test]
+  fn yarn_rejects_nonfinite_float_inputs() {
+    // NaN/±Inf floats slip past the ordered `<= 0` / `<= 1` guards; the up-front
+    // finiteness checks must reject every float field so no non-finite freqs or
+    // mscale is stored.
+    assert!(
+      YarnRope::new(8, f32::NAN, false, YarnConfig::new(4.0)).is_err(),
+      "NaN base"
+    );
+    let mut cfg = YarnConfig::new(f32::INFINITY);
+    assert!(
+      YarnRope::new(8, DEFAULT_BASE, false, cfg).is_err(),
+      "Inf scaling_factor"
+    );
+    cfg = YarnConfig::new(4.0);
+    cfg.beta_fast = f32::NAN;
+    assert!(
+      YarnRope::new(8, DEFAULT_BASE, false, cfg).is_err(),
+      "NaN beta_fast"
+    );
+    cfg = YarnConfig::new(4.0);
+    cfg.mscale = f32::INFINITY;
+    assert!(
+      YarnRope::new(8, DEFAULT_BASE, false, cfg).is_err(),
+      "Inf mscale"
+    );
+    cfg = YarnConfig::new(4.0);
+    cfg.mscale_all_dim = f32::NAN;
+    assert!(
+      YarnRope::new(8, DEFAULT_BASE, false, cfg).is_err(),
+      "NaN mscale_all_dim"
+    );
   }
 
   #[test]
