@@ -26,11 +26,19 @@
 //!
 //! # Scope
 //!
-//! This is the **base** RoPE only. The scaled variants (Llama3 / Su-scaled /
-//! YaRN) precompute a per-dimension `freqs` array and pass it to the same
-//! primitive with `base = None` — per mlx's contract *exactly one of `base`
-//! and `freqs` is `None`* (`python/src/fast.cpp`). They are separate
-//! follow-ups; this module always takes the `base` path (`freqs = None`).
+//! This module owns **both** RoPE primitive paths over `mlx_fast_rope`:
+//!
+//! - the **base** path ([`rope`] / [`rope_dynamic`] / [`Rope`]): `base`
+//!   (theta) present, `freqs = None`.
+//! - the **freqs** path ([`rope_with_freqs`] / [`rope_dynamic_with_freqs`]):
+//!   `base = None`, a precomputed per-dimension `freqs` array present.
+//!
+//! mlx's contract is *exactly one of `base` and `freqs` is `None`*
+//! (`python/src/fast.cpp`); each path supplies the one it owns and the
+//! NULL-ctx placeholder for the other. The scaled variants (Llama3 /
+//! Su-scaled (longrope) / YaRN) live in
+//! [`rope_scaling`](super::rope_scaling): each precomputes its `freqs` from
+//! the published formula and applies it through the freqs path here.
 
 use crate::{
   array::Array,
@@ -243,6 +251,141 @@ pub fn rope_with_offset(
   match offset {
     RopeOffsetRef::Scalar(p) => rope(x, dims, traditional, base, scale, p),
     RopeOffsetRef::Array(arr) => rope_dynamic(x, dims, traditional, base, scale, arr),
+  }
+}
+
+/// Apply rotary position embedding to `x` using a **precomputed per-dimension
+/// `freqs` array** instead of a scalar `base` — the freqs-path counterpart of
+/// [`rope`]. This is the primitive the scaled variants
+/// ([`rope_scaling`](super::rope_scaling): Llama3 / Su-scaled / YaRN) forward
+/// their per-dimension frequencies through; it mirrors swift/python
+/// `mx.fast.rope(x, dims, ..., base=None, scale=1.0, offset, freqs=<array>)`.
+///
+/// mlx's contract is *exactly one of `base` and `freqs` is `None`*
+/// (`python/src/fast.cpp`): here `base` is the absent optional
+/// (`has_value = false`) and `freqs` is the supplied array, the mirror image of
+/// [`rope`]'s `base`-present / `freqs`-null call.
+///
+/// - `freqs`: the per-dimension inverse frequencies, a 1-D **f32** array of
+///   length `dims / 2` — element `i` is the angular frequency of feature pair
+///   `i`. mlx multiplies position `p` by `1 / freqs[i]` (the array is the *base*
+///   `base^(2i/dims)`, i.e. the reciprocal of the angular rate), so a larger
+///   `freqs[i]` rotates pair `i` *slower*. mlx validates the length/dtype and
+///   surfaces a recoverable error on mismatch.
+/// - `scale`: position scale, kept as a parameter for parity with mlx
+///   (`mx.fast.rope`'s `scale`); the scaled variants pass `1.0` and fold any
+///   scaling into `freqs` / an mscale on `x`.
+///
+/// See [`rope`] for the `dims` / `traditional` / `offset` semantics. Returns a
+/// new lazy array (no eval).
+pub fn rope_with_freqs(
+  x: &Array,
+  dims: i32,
+  traditional: bool,
+  scale: f32,
+  offset: i32,
+  freqs: &Array,
+) -> Result<Array> {
+  // Freqs path: `base` is the absent optional and `freqs` is the supplied
+  // array — the inverse of the base path's `base`-present / null-`freqs` call.
+  let base_absent = mlxrs_sys::mlx_optional_float {
+    value: 0.0,
+    has_value: false,
+  };
+  // SAFETY: `mlx_array_new()` yields a fresh empty out-param handle (NULL ctx);
+  // it is wrapped in the RAII newtype FIRST so an early return / panic frees
+  // it, then populated by the following call.
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles, live for the
+  // call and not retained by mlx past it — `x.0` is the input and `freqs.0` is
+  // the borrowed precomputed frequency array (not consumed); the out-param was
+  // freshly allocated above and is written by this call; `base` is the absent
+  // optional so mlx takes the `freqs` branch; the backend rc (incl. mlx's
+  // freqs length/dtype validation) is surfaced via `check()`.
+  check(unsafe {
+    mlxrs_sys::mlx_fast_rope(
+      &mut out.0,
+      x.0,
+      dims,
+      traditional,
+      base_absent,
+      scale,
+      offset,
+      freqs.0,
+      default_stream(),
+    )
+  })?;
+  Ok(out)
+}
+
+/// Apply rotary position embedding to `x` with a precomputed `freqs` array and
+/// a **per-sequence** offset array — the array
+/// (`mlx_fast_rope_dynamic`) counterpart of [`rope_with_freqs`], mirroring
+/// `mx.fast.rope(x, dims, ..., base=None, offset=<array>, freqs=<array>)`.
+///
+/// Identical to [`rope_with_freqs`] except `offset` is an [`Array`] (one
+/// integer position per batch row, shape `[B]` matching `x.shape(0)`, or
+/// `[1]`/scalar broadcast to all rows) rather than a scalar — the batched /
+/// padded-decode path. See [`rope_with_freqs`] for the `freqs` semantics and
+/// [`rope_dynamic`] for the array-`offset` semantics.
+pub fn rope_dynamic_with_freqs(
+  x: &Array,
+  dims: i32,
+  traditional: bool,
+  scale: f32,
+  offset: &Array,
+  freqs: &Array,
+) -> Result<Array> {
+  // Freqs path with an array offset: `base` absent, `freqs` supplied, and the
+  // `_dynamic` entry point for the per-row `offset` array.
+  let base_absent = mlxrs_sys::mlx_optional_float {
+    value: 0.0,
+    has_value: false,
+  };
+  // SAFETY: `mlx_array_new()` yields a fresh empty out-param handle (NULL ctx);
+  // it is wrapped in the RAII newtype FIRST so an early return / panic frees
+  // it, then populated by the following call.
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles, live for the
+  // call and not retained by mlx past it — `x.0` is the input, `offset.0` is
+  // the borrowed per-sequence position array and `freqs.0` the borrowed
+  // precomputed frequency array (neither consumed); the out-param was freshly
+  // allocated above and is written by this call; `base` is the absent optional
+  // so mlx takes the `freqs` branch; the backend rc (incl. mlx's offset and
+  // freqs shape/dtype validation) is surfaced via `check()`.
+  check(unsafe {
+    mlxrs_sys::mlx_fast_rope_dynamic(
+      &mut out.0,
+      x.0,
+      dims,
+      traditional,
+      base_absent,
+      scale,
+      offset.0,
+      freqs.0,
+      default_stream(),
+    )
+  })?;
+  Ok(out)
+}
+
+/// Apply the freqs-path RoPE dispatching on a [`RopeOffsetRef`]: a
+/// [`Scalar`](RopeOffsetRef::Scalar) routes through [`rope_with_freqs`], an
+/// [`Array`](RopeOffsetRef::Array) through [`rope_dynamic_with_freqs`]. The
+/// freqs-path mirror of [`rope_with_offset`] — the single entry the scaled
+/// variants call with a cache's
+/// [`rope_offset`](crate::lm::cache::KvCache::rope_offset).
+pub fn rope_with_freqs_offset(
+  x: &Array,
+  dims: i32,
+  traditional: bool,
+  scale: f32,
+  offset: RopeOffsetRef<'_>,
+  freqs: &Array,
+) -> Result<Array> {
+  match offset {
+    RopeOffsetRef::Scalar(p) => rope_with_freqs(x, dims, traditional, scale, p, freqs),
+    RopeOffsetRef::Array(arr) => rope_dynamic_with_freqs(x, dims, traditional, scale, arr, freqs),
   }
 }
 
@@ -619,5 +762,83 @@ mod tests {
       RopeOffsetRef::Scalar(p) => assert_eq!(p, i32::MAX),
       RopeOffsetRef::Array(_) => unreachable!(),
     }
+  }
+
+  /// The freqs `mlx_fast_rope` consumes is the *base* `base^(2i/dims)` (the
+  /// reciprocal of the angular rate), one entry per feature pair. Feeding the
+  /// base-path freqs explicitly through the freqs primitive must therefore
+  /// reproduce the base path bit-for-bit — this is mlx's own internal identity
+  /// (`base=θ` ≡ `freqs=θ^(arange(0,dims,2)/dims)`) and the foundation every
+  /// scaled variant builds on.
+  fn base_freqs(base: f64, dims: usize) -> Array {
+    let half = dims / 2;
+    let mut f = Vec::with_capacity(half);
+    for i in 0..half {
+      // base ** (arange(0, dims, 2) / dims) — the i-th pair's base.
+      f.push((base.powf((2 * i) as f64 / dims as f64)) as f32);
+    }
+    Array::from_slice::<f32>(&f, &(half,)).unwrap()
+  }
+
+  #[test]
+  fn freqs_path_matches_base_path() {
+    let x = input();
+    let freqs = base_freqs(DEFAULT_BASE as f64, 4);
+    // Non-traditional, offset 2 — must equal the `non_traditional_offset2`
+    // golden produced via the `base` path.
+    let mut via_freqs = rope_with_freqs(&x, 4, false, 1.0, 2, &freqs).unwrap();
+    let mut via_base = rope(&x, 4, false, DEFAULT_BASE, 1.0, 2).unwrap();
+    assert_close(
+      &via_freqs.to_vec::<f32>().unwrap(),
+      &via_base.to_vec::<f32>().unwrap(),
+    );
+  }
+
+  #[test]
+  fn freqs_path_traditional_matches_base_path() {
+    let x = input();
+    let freqs = base_freqs(DEFAULT_BASE as f64, 4);
+    let mut via_freqs = rope_with_freqs(&x, 4, true, 1.0, 0, &freqs).unwrap();
+    let mut via_base = rope(&x, 4, true, DEFAULT_BASE, 1.0, 0).unwrap();
+    assert_close(
+      &via_freqs.to_vec::<f32>().unwrap(),
+      &via_base.to_vec::<f32>().unwrap(),
+    );
+  }
+
+  #[test]
+  fn freqs_dynamic_path_matches_base_dynamic() {
+    let x = batch_input();
+    let freqs = base_freqs(DEFAULT_BASE as f64, 4);
+    let offset = Array::from_slice::<i32>(&[0, 2], &(2,)).unwrap();
+    let mut via_freqs = rope_dynamic_with_freqs(&x, 4, false, 1.0, &offset, &freqs).unwrap();
+    let mut via_base = rope_dynamic(&x, 4, false, DEFAULT_BASE, 1.0, &offset).unwrap();
+    assert_close(
+      &via_freqs.to_vec::<f32>().unwrap(),
+      &via_base.to_vec::<f32>().unwrap(),
+    );
+  }
+
+  #[test]
+  fn freqs_offset_dispatch_matches_both_arms() {
+    let x = batch_input();
+    let freqs = base_freqs(DEFAULT_BASE as f64, 4);
+    // Scalar arm.
+    let mut via_scalar =
+      rope_with_freqs_offset(&x, 4, false, 1.0, RopeOffsetRef::Scalar(2), &freqs).unwrap();
+    let mut via_direct_scalar = rope_with_freqs(&x, 4, false, 1.0, 2, &freqs).unwrap();
+    assert_close(
+      &via_scalar.to_vec::<f32>().unwrap(),
+      &via_direct_scalar.to_vec::<f32>().unwrap(),
+    );
+    // Array arm.
+    let offset = Array::from_slice::<i32>(&[0, 2], &(2,)).unwrap();
+    let mut via_array =
+      rope_with_freqs_offset(&x, 4, false, 1.0, RopeOffsetRef::Array(&offset), &freqs).unwrap();
+    let mut via_direct_array = rope_dynamic_with_freqs(&x, 4, false, 1.0, &offset, &freqs).unwrap();
+    assert_close(
+      &via_array.to_vec::<f32>().unwrap(),
+      &via_direct_array.to_vec::<f32>().unwrap(),
+    );
   }
 }
