@@ -1816,20 +1816,37 @@ const MAX_LFILTER_SAMPLES: usize = crate::audio::io::MAX_DECODED_SAMPLES;
 /// [`Error::Backend`].
 const MAX_LOUDNESS_SAMPLES: usize = crate::audio::io::MAX_DECODED_SAMPLES;
 
-/// Hard ceiling on the **block work** [`integrated_loudness`] performs:
-/// `num_blocks * n_channels` for the per-channel mean-square matrix (and
-/// the per-block gate-index Vecs). Caller-controlled `overlap` close to 1
-/// (e.g. `0.9999`) blows up `num_blocks` for an otherwise-tiny signal
-/// (`step = 1 - overlap → 0`, so `num_blocks ≈ duration / (block_size *
-/// step) → ∞`), driving a multi-GB `mean_square` reservation + gate-index
-/// collect before the per-block loop even starts. Cap the derived
-/// `num_blocks * n_channels` against this ceiling BEFORE any
-/// `num_blocks`-scaled allocation; pathological overlaps return a
-/// recoverable [`Error::Backend`]. Shared element budget with
-/// [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) — the same
-/// 64 Mi-element ceiling that bounds the sample budget bounds the block
-/// budget here.
-const MAX_LOUDNESS_BLOCKS: usize = crate::audio::io::MAX_DECODED_SAMPLES;
+/// Hard byte ceiling on the per-channel `f64` mean-square matrix
+/// [`integrated_loudness`] allocates: `num_blocks * n_channels *
+/// size_of::<f64>() <= MAX_LOUDNESS_BLOCK_BYTES`. The previous revision
+/// capped `num_blocks * n_channels` against the 64 Mi-**element** sample
+/// budget — but the cells are `f64`, so the actual peak bytes were 8× the
+/// element budget (`64 Mi * 8 B = 512 MiB`). A caller-controllable
+/// `overlap` close to 1 (e.g. `0.99999990`) on a small mono input derived
+/// tens of millions of blocks that all passed the element-only cap, then
+/// reserved hundreds of MB / ~2 GiB for the mean-square matrix alone. The
+/// byte cap bounds the dominant block-sized buffer directly: at 64 MiB
+/// the peak `mean_square` footprint is bounded regardless of how the
+/// caller distributes the (`num_blocks`, `n_channels`) product, and the
+/// gate-index iteration that re-reads the same matrix never sees more
+/// cells than this byte budget allows. Pathological overlaps return a
+/// recoverable [`Error::Backend`] BEFORE any allocation.
+const MAX_LOUDNESS_BLOCK_BYTES: usize = 64 * 1024 * 1024;
+/// Hard ceiling on the **total sample-visit work** [`integrated_loudness`]
+/// performs across the per-block mean-square loop: `num_blocks *
+/// block_size_samples <= MAX_LOUDNESS_WORK`. Even when the byte cap above
+/// admits a moderate `num_blocks`, a near-1 overlap combined with a
+/// SMALL block size still drives the per-block CPU sum work to the
+/// trillions of sample-visits — each block re-sums `block_size_samples`
+/// weighted samples, so the visit count is `num_blocks *
+/// block_size_samples` regardless of the matrix byte footprint. Cap the
+/// total visit count at 256 Mi (`block_size = 0.4 s` at 48 kHz =
+/// `19,200 samples/block`, so a default-overlap 256 Mi-visit budget
+/// admits ~13,653 blocks ≈ 91 hours of audio — comfortable for any
+/// realistic loudness analysis, but rejects multi-trillion-visit
+/// pathological cases in microseconds). Pathological work returns a
+/// recoverable [`Error::Backend`] BEFORE the per-block loop.
+const MAX_LOUDNESS_WORK: usize = 256 * 1024 * 1024;
 
 /// Per-channel BS.1770 weighting gains for up to 5 channels: front L/R/C =
 /// `1.0`, surround L/R = `1.41` (~`+1.5 dB`). Matches
@@ -2360,12 +2377,16 @@ fn k_weight_channel(channel: &[f32], rate: u32) -> Result<Vec<f64>> {
 ///     (the cap is on the materialized buffer the `to_vec` reads — not
 ///     just the per-channel sample count — so 2-D inputs like
 ///     `(MAX_DECODED_SAMPLES, 5)` can't bypass it),
-///   - the derived `num_blocks * n_channels` exceeds the per-call work
-///     cap (rejects pathological overlaps very close to 1 BEFORE any
-///     `num_blocks`-scaled allocation; the cap shares the
-///     [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES)
-///     element budget — see the private `MAX_LOUDNESS_BLOCKS` constant
-///     for the exact value),
+///   - the per-channel `f64` mean-square matrix would exceed the
+///     `MAX_LOUDNESS_BLOCK_BYTES` byte cap (64 MiB), OR the total
+///     per-block sum work `num_blocks * block_size_samples` exceeds the
+///     `MAX_LOUDNESS_WORK` sample-visit cap (256 Mi) — together these
+///     reject pathological overlaps very close to 1 BEFORE any
+///     `num_blocks`-scaled allocation OR the per-block loop runs (the
+///     byte cap dominates for normal block sizes; the visit cap catches
+///     near-1 overlaps with small block sizes that fit under the byte
+///     cap but multiply the per-block CPU sum work to multi-trillion
+///     visits),
 ///   - the number of blocks overflows `usize`,
 ///   - any size exceeds `i32::MAX`.
 ///
@@ -2380,8 +2401,12 @@ fn k_weight_channel(channel: &[f32], rate: u32) -> Result<Vec<f64>> {
 ///   boundary; dropped per channel before the next channel's promotion),
 ///   and
 /// - the per-channel mean-square matrix
-///   (`num_blocks * n_channels * 8 bytes`, bounded by the block-work cap
-///   above).
+///   (`num_blocks * n_channels * 8 bytes`, bounded by
+///   `MAX_LOUDNESS_BLOCK_BYTES` = 64 MiB so the peak `mean_square`
+///   footprint is capped regardless of overlap; the gate-index path
+///   iterates `block_loudness` directly with NO intermediate
+///   `Vec<usize>` reservation, so there is no `num_blocks`-sized gate-
+///   index allocation beyond the mean-square matrix itself).
 ///
 /// We do NOT allocate per-channel deinterleaved f32 buffers AND per-
 /// channel weighted f64 buffers all-at-once — the previous revision held
@@ -2507,12 +2532,22 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
     });
   }
   // Reject pathological `num_blocks` BEFORE any `num_blocks`-scaled
-  // allocation. A caller-controlled `overlap` close to 1 (e.g. `0.9999`)
-  // makes `step → 0` and `num_blocks → ∞`. The cap is on
-  // `num_blocks * n_channels` (the mean-square matrix shape) against
-  // [`MAX_LOUDNESS_BLOCKS`]; gate-index Vecs reserved further below also
-  // use `try_reserve_exact` so even a num_blocks-only OOM is recoverable.
-  // The `num_blocks_f64 > usize::MAX as f64` check catches the as-cast
+  // allocation OR the per-block sum loop runs. A caller-controlled
+  // `overlap` close to 1 (e.g. `0.99999990`) makes `step → 0` and
+  // `num_blocks → ∞`, which the previous element-only block-work cap
+  // (`num_blocks * n_channels <= 64 Mi`) admitted at tens of millions of
+  // blocks for a small mono signal — the `mean_square` matrix's actual
+  // BYTE footprint is `8 * num_blocks * n_channels` (`f64`), so the
+  // element cap let multi-hundred-MB / ~2-GiB reservations through, and
+  // the per-block sum loop then re-summed `block_size_samples` per
+  // block for an extreme CPU-time blow-up. The two new caps bound the
+  // ACTUAL peak bytes AND total sum work:
+  //   1. `MAX_LOUDNESS_BLOCK_BYTES` (64 MiB) — bounds the dominant
+  //      block-sized `f64` buffer (`mean_square`).
+  //   2. `MAX_LOUDNESS_WORK` (256 Mi sample-visits) — bounds the per-
+  //      block sum CPU work (`num_blocks * block_size_samples`).
+  // Both use `checked_mul`; arithmetic overflow rejects. The
+  // `num_blocks_f64 > usize::MAX as f64` check catches the as-cast
   // saturation case where the `usize` cast silently clamps.
   if num_blocks_f64 > usize::MAX as f64 {
     return Err(Error::Backend {
@@ -2528,19 +2563,55 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
       message: "integrated_loudness: derived num_blocks == 0".into(),
     });
   }
-  let block_work = num_blocks
+  // Byte cap: `num_blocks * n_channels * sizeof::<f64>() <=
+  // MAX_LOUDNESS_BLOCK_BYTES`. Compute the cell count first, then the
+  // byte product — both `checked_mul` so overflow rejects.
+  let block_cells = num_blocks
     .checked_mul(n_channels)
     .ok_or_else(|| Error::Backend {
       message: format!(
-        "integrated_loudness: block work {num_blocks} * {n_channels} overflows usize \
+        "integrated_loudness: block cells {num_blocks} * {n_channels} overflows usize \
          (overlap={overlap})"
       ),
     })?;
-  if block_work > MAX_LOUDNESS_BLOCKS {
+  let block_bytes = block_cells
+    .checked_mul(std::mem::size_of::<f64>())
+    .ok_or_else(|| Error::Backend {
+      message: format!(
+        "integrated_loudness: block bytes {block_cells} * 8 overflows usize \
+         (overlap={overlap})"
+      ),
+    })?;
+  if block_bytes > MAX_LOUDNESS_BLOCK_BYTES {
     return Err(Error::Backend {
       message: format!(
-        "integrated_loudness: block work {block_work} (num_blocks={num_blocks} * \
-         n_channels={n_channels}) exceeds the {MAX_LOUDNESS_BLOCKS} cap \
+        "integrated_loudness: mean-square byte footprint {block_bytes} \
+         (num_blocks={num_blocks} * n_channels={n_channels} * 8) exceeds the \
+         {MAX_LOUDNESS_BLOCK_BYTES} byte cap (overlap={overlap})"
+      ),
+    });
+  }
+  // Work cap: `num_blocks * block_size_samples <= MAX_LOUDNESS_WORK`.
+  // `block_samples_f64` was already validated finite + >= 1 + <= n_samples
+  // (the audio-length-vs-block-size check above), so it fits in `usize`
+  // for any `n_samples` we accept (bounded by `MAX_LOUDNESS_SAMPLES`).
+  // The `as usize` cast is exact here (block_samples_f64 came from
+  // `block_size * rate` with both finite + positive); `checked_mul`
+  // against `num_blocks` then rejects overflow up-front.
+  let block_samples_usize: usize = block_samples_f64 as usize;
+  let total_work = num_blocks
+    .checked_mul(block_samples_usize)
+    .ok_or_else(|| Error::Backend {
+      message: format!(
+        "integrated_loudness: total work {num_blocks} * {block_samples_usize} overflows \
+         usize (overlap={overlap})"
+      ),
+    })?;
+  if total_work > MAX_LOUDNESS_WORK {
+    return Err(Error::Backend {
+      message: format!(
+        "integrated_loudness: total sample-visit work {total_work} (num_blocks={num_blocks} \
+         * block_samples={block_samples_usize}) exceeds the {MAX_LOUDNESS_WORK} cap \
          (overlap={overlap})"
       ),
     });
@@ -2680,46 +2751,47 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
     block_loudness.push(BS1770_LOUDNESS_OFFSET_LUFS + 10.0 * weighted_sum.log10());
   }
 
-  // First (absolute-only) gate at -70 LUFS. Use `try_reserve_exact` (capped
-  // by `num_blocks`, which is itself bounded by [`MAX_LOUDNESS_BLOCKS`]) so
-  // a pathological-overlap-driven `num_blocks` cannot panic-OOM the
-  // gate-index allocation — it returns a recoverable [`Error::Backend`].
-  let mut gated_blocks_abs: Vec<usize> = Vec::new();
-  gated_blocks_abs
-    .try_reserve_exact(num_blocks)
-    .map_err(|e| Error::Backend {
-      message: format!(
-        "integrated_loudness: reservation for {num_blocks} absolute-gate indices failed: {e}"
-      ),
-    })?;
-  for (i, &l) in block_loudness.iter().enumerate() {
-    if l >= BS1770_ABSOLUTE_THRESHOLD_LUFS {
-      gated_blocks_abs.push(i);
-    }
-  }
-
-  // Helper: average mean_square across a set of block indices, per channel.
-  // Reference: `np.mean([mean_square[c, b] for b in gated_blocks])` per c.
-  // An empty index set produces `NaN` in the reference (np.mean of empty);
-  // we replicate that (then the outer `log10(0)` produces -inf and the
-  // later `nan_to_num` zeros it).
-  let mean_across_blocks = |blocks: &[usize]| -> Vec<f64> {
+  // Per-channel gated mean of `mean_square`, computed directly from
+  // `block_loudness` + `mean_square` WITHOUT materializing a `Vec<usize>`
+  // of gated block indices. The previous revision allocated TWO
+  // `num_blocks`-sized `Vec<usize>` (one per gate pass) via
+  // `try_reserve_exact(num_blocks)` — each `8 * num_blocks` bytes on a
+  // 64-bit target, scaling with `num_blocks` even when very few blocks
+  // survive the gate. The byte/work caps above now bound `num_blocks`,
+  // so this is no longer a multi-GB risk; we still eliminate the
+  // intermediate `Vec`s because they're pure overhead — the gated mean
+  // is a simple filter-fold over `block_loudness.iter().zip(ms_row)` that
+  // visits the same cells either way. Returns NaN for an empty survivor
+  // set (matches the reference's `np.mean([])` = NaN; subsequent
+  // `nan_to_num` or `log10(NaN)` then carries through faithfully).
+  //
+  // `pred(block_loudness[b])` selects survivors; the closure runs once
+  // per channel and computes that channel's gated mean by iterating
+  // `block_loudness` once. `mean_square.iter()` is the per-channel outer
+  // loop — total cell visits are `n_channels * num_blocks`, which is
+  // bounded by the `MAX_LOUDNESS_BLOCK_BYTES` cap (≤ 8 Mi cells).
+  let gated_mean_per_channel = |pred: &dyn Fn(f64) -> bool| -> Vec<f64> {
     let mut out = Vec::with_capacity(n_channels);
     for ms_row in mean_square.iter() {
-      if blocks.is_empty() {
+      let mut acc = 0.0_f64;
+      let mut count: usize = 0;
+      for (b, &l) in block_loudness.iter().enumerate() {
+        if pred(l) {
+          acc += ms_row[b];
+          count += 1;
+        }
+      }
+      if count == 0 {
         out.push(f64::NAN);
       } else {
-        let mut acc = 0.0_f64;
-        for &b in blocks {
-          acc += ms_row[b];
-        }
-        out.push(acc / blocks.len() as f64);
+        out.push(acc / count as f64);
       }
     }
     out
   };
 
-  let gated_mean_square_abs = mean_across_blocks(&gated_blocks_abs);
+  // First (absolute-only) gate at -70 LUFS — reference's `>= -70`.
+  let gated_mean_square_abs = gated_mean_per_channel(&|l| l >= BS1770_ABSOLUTE_THRESHOLD_LUFS);
   // `relative_threshold = -0.691 + 10*log10(sum(gain * gated_ms)) - 10`.
   // Carries through the reference's `log10` of a possibly-zero/NaN sum;
   // that produces a finite -inf / NaN threshold which simply admits no
@@ -2737,26 +2809,12 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
 
   // Second pass: blocks above BOTH the relative threshold AND the absolute
   // threshold (the reference uses `> relative_threshold AND > absolute`,
-  // not `>=`). NaN/-inf relative_threshold simply fails the `>` test. Same
-  // `try_reserve_exact`-bounded allocation pattern as `gated_blocks_abs`.
-  let mut gated_blocks_rel: Vec<usize> = Vec::new();
-  gated_blocks_rel
-    .try_reserve_exact(num_blocks)
-    .map_err(|e| Error::Backend {
-      message: format!(
-        "integrated_loudness: reservation for {num_blocks} relative-gate indices failed: {e}"
-      ),
-    })?;
-  for (i, &l) in block_loudness.iter().enumerate() {
-    if l > relative_threshold && l > BS1770_ABSOLUTE_THRESHOLD_LUFS {
-      gated_blocks_rel.push(i);
-    }
-  }
-
+  // not `>=`). NaN/-inf relative_threshold simply fails the `>` test.
+  let mut gated_mean_square_rel =
+    gated_mean_per_channel(&|l| l > relative_threshold && l > BS1770_ABSOLUTE_THRESHOLD_LUFS);
   // Final per-channel gated mean-square; the reference `nan_to_num`s the
   // NaN-from-empty-set case to 0, which lets us safely add up the weighted
   // sum even when no blocks survived the second gate.
-  let mut gated_mean_square_rel = mean_across_blocks(&gated_blocks_rel);
   for v in gated_mean_square_rel.iter_mut() {
     if v.is_nan() {
       *v = 0.0;
@@ -4015,41 +4073,38 @@ mod tests {
   /// makes `step = 1 - overlap → ~1e-12` and `num_blocks ≈ duration /
   /// (block_size * step) → trillions`, driving a multi-GB `mean_square`
   /// reservation + gate-index collect for an otherwise-tiny signal. The
-  /// `block_work = num_blocks * n_channels` cap against
-  /// [`MAX_LOUDNESS_BLOCKS`] (= 64 Mi-elements) must reject this BEFORE
-  /// any `num_blocks`-scaled allocation. We use a small signal (3 s @
-  /// 48 kHz, well under [`MAX_LOUDNESS_SAMPLES`]) so the rejection is
-  /// *purely* from the BLOCK-COUNT cap (not the sample cap). The overlap
-  /// is intentionally extreme — `0.999_999_999_999` makes
-  /// `num_blocks ≈ 6.5e12` regardless of `n_channels`, so even mono
-  /// (n_channels=1) clears the cap by orders of magnitude; the
-  /// less-extreme `0.999_999` would only produce `num_blocks ≈ 6.5e6`
-  /// for a 3 s signal — under the cap but slow enough to take 20+ min
-  /// per channel, which is no longer "pathological" by the cap definition
-  /// (the cap protects against multi-GB allocations, not against slow
-  /// loops). Asserting `Err` (not panic, not OOM, not multi-minute
-  /// timeout) proves the cap fires up-front BEFORE the per-block loop.
+  /// `MAX_LOUDNESS_BLOCK_BYTES` byte cap (64 MiB on the `f64` mean-
+  /// square matrix) and `MAX_LOUDNESS_WORK` visit cap (256 Mi sample-
+  /// visits on the per-block sum loop) together must reject this BEFORE
+  /// any `num_blocks`-scaled allocation OR the per-block loop runs. We
+  /// use a small signal (3 s @ 48 kHz, well under
+  /// [`MAX_LOUDNESS_SAMPLES`]) so the rejection is *purely* from the
+  /// pathological-overlap caps (not the sample cap). The overlap is
+  /// intentionally extreme — `0.999_999_999_999` makes `num_blocks ≈
+  /// 6.5e12` regardless of `n_channels`, so even mono (n_channels=1)
+  /// clears both caps by orders of magnitude. Asserting `Err` (not
+  /// panic, not OOM, not multi-minute timeout) proves the caps fire
+  /// up-front BEFORE the per-block loop.
   #[test]
   fn integrated_loudness_rejects_pathological_overlap() {
     let rate = 48_000u32;
     // 3 s of audio (way under MAX_DECODED_SAMPLES = 64 Mi samples).
     // block_size = 0.4 s, overlap = 1 - 1e-12 ⇒ step ≈ 1e-12,
     // num_blocks ≈ (3 - 0.4) / (0.4 * 1e-12) ≈ 6.5e12 — orders of
-    // magnitude above the 64 Mi MAX_LOUDNESS_BLOCKS cap. The cap MUST
-    // fire BEFORE the mean_square / gate-index allocation; if it did
+    // magnitude above both new caps. The caps MUST fire BEFORE the
+    // mean_square allocation OR the per-block sum loop; if they did
     // not, this would attempt a >=50 TB mean_square reservation and
     // either OOM or take effectively forever.
     let x = sine_mono(1000.0, 0.5, rate, 3.0);
     let res = integrated_loudness(&x, rate, 0.4, 0.999_999_999_999);
     assert!(
       matches!(res, Err(Error::Backend { .. })),
-      "pathological overlap close to 1 must be rejected by the block-count \
-       cap BEFORE any num_blocks-scaled allocation (got {res:?})"
+      "pathological overlap close to 1 must be rejected by the byte/work \
+       caps BEFORE any num_blocks-scaled allocation (got {res:?})"
     );
-    // Same test with a STEREO input — proves the `block_work = num_blocks
-    // * n_channels` factor in the cap also catches it (the n_channels
-    // factor matters: a less-extreme overlap that produces num_blocks
-    // just under the cap for mono would exceed it for stereo).
+    // Same test with a STEREO input — proves the `n_channels` factor in
+    // the byte cap also catches it (a less-extreme overlap that produces
+    // num_blocks just under the cap for mono would exceed it for stereo).
     let mono_buf = x.try_clone().unwrap().to_vec::<f32>().unwrap();
     let n = mono_buf.len();
     let mut stereo_buf: Vec<f32> = Vec::with_capacity(n * 2);
@@ -4061,8 +4116,43 @@ mod tests {
     let res_stereo = integrated_loudness(&stereo, rate, 0.4, 0.999_999_999_999);
     assert!(
       matches!(res_stereo, Err(Error::Backend { .. })),
-      "pathological-overlap stereo (block_work = num_blocks * n_channels) \
-       must be rejected (got {res_stereo:?})"
+      "pathological-overlap stereo (byte cap factor n_channels) must be \
+       rejected (got {res_stereo:?})"
+    );
+  }
+
+  /// Regression: the *just-below-the-old-element-cap* case Codex flagged.
+  /// The previous revision capped `num_blocks * n_channels` against
+  /// `MAX_DECODED_SAMPLES = 64 Mi-elements` — but each cell is `f64`, so
+  /// `64 Mi cells * 8 B = 512 MiB` of actual `mean_square` allocation
+  /// passed the element-only cap. A near-1 overlap like `0.99999990`
+  /// on a tiny 3 s mono signal produces `num_blocks ≈ (3.0 - 0.4) /
+  /// (0.4 * 1e-7) ≈ 6.5e7` blocks, which sit JUST UNDER the old
+  /// 64 Mi-element cap (so the old guard would NOT reject and the
+  /// `try_reserve_exact` would attempt a ~520 MiB `mean_square` matrix
+  /// reservation followed by a per-block loop that re-sums 19,200
+  /// samples per block — multi-trillion sample visits, hours of CPU).
+  /// The new `MAX_LOUDNESS_BLOCK_BYTES` (64 MiB) cap rejects this case
+  /// at the byte-budget check BEFORE any allocation (block_bytes =
+  /// 6.5e7 * 1 * 8 = 520 MiB > 64 MiB); the visit cap would also catch
+  /// it (6.5e7 * 19200 = 1.25 trillion visits > 256 Mi). Asserting
+  /// `Err` in microseconds proves the byte/work caps fire up-front,
+  /// not the old elements-only cap.
+  #[test]
+  fn integrated_loudness_rejects_overlap_just_below_old_element_cap() {
+    let rate = 48_000u32;
+    // 3 s of audio = 144,000 samples — well below MAX_LOUDNESS_SAMPLES.
+    // overlap = 0.99999990 ⇒ step = 1e-7 ⇒ num_blocks ≈ 6.5e7. The OLD
+    // element cap was 64 Mi ≈ 6.7e7, so 6.5e7 was UNDER the old cap;
+    // the new byte cap (64 MiB / 8 B = 8 Mi cells) rejects num_blocks
+    // > 8 Mi for n_channels=1, and the work cap (256 Mi) rejects
+    // 6.5e7 * 19200 ≈ 1.25e12 visits — both fire well below 6.5e7.
+    let x = sine_mono(1000.0, 0.5, rate, 3.0);
+    let res = integrated_loudness(&x, rate, 0.4, 0.999_999_90);
+    assert!(
+      matches!(res, Err(Error::Backend { .. })),
+      "overlap=0.99999990 (under old elements-only cap; over new byte/work \
+       caps) must be rejected BEFORE allocation (got {res:?})"
     );
   }
 
