@@ -74,25 +74,30 @@ fn base_pair_freqs(base: f64, dims: i32, half: usize) -> Vec<f64> {
 /// shape `[half]` — the per-dimension inverse-frequency array `mlx_fast_rope`
 /// consumes (mlx-lm stores `self._freqs` as `mx.float32`).
 ///
-/// The host-side `freqs` are checked for finiteness *before* the `f32` store:
-/// every scaled-RoPE formula divides and takes `ln`s of config-derived terms,
-/// so a poisoned input or an arithmetic edge (e.g. a zero blend denominator)
-/// can yield a NaN/±Inf element that would otherwise be stored verbatim and
-/// later multiply activations by NaN/Inf. This is the catch-all finiteness gate
-/// for the per-dimension frequencies — it closes any arithmetic edge the
-/// per-input guards do not enumerate. The check is on the narrowed `f32` value:
-/// a non-finite `f64` source stays non-finite after the cast, and a finite
-/// `f64` that overflows the `f32` range (`±Inf` only after narrowing) is caught
-/// too. The original `f64` is reported in the message for diagnosis.
+/// The host-side `freqs` are checked for **strict positive finiteness** *before*
+/// the `f32` store: every scaled-RoPE formula divides and takes `ln`s of
+/// config-derived terms, so a poisoned input or an arithmetic edge (e.g. a zero
+/// blend denominator) can yield a NaN/±Inf element. *And* `mlx_fast_rope`
+/// itself computes `1 / freqs[i]` from this array at apply time, so a `0.0`
+/// element silently becomes `+Inf` inside the kernel and a *negative* element
+/// reverses the rotation direction — both equally catastrophic. The gate
+/// therefore rejects any non-finite OR non-positive value as the catch-all for
+/// the per-dimension frequencies (closing zero, negative, and NaN/Inf in one
+/// check). The check is on the narrowed `f32` value: a non-finite `f64` source
+/// stays non-finite after the cast, a finite `f64` that overflows the `f32`
+/// range (`±Inf` only after narrowing) is caught too, and a positive `f64`
+/// underflowing to `0.0` in `f32` is also caught. The original `f64` is
+/// reported in the message for diagnosis.
 fn freqs_array(freqs: &[f64]) -> Result<Array> {
   let mut buf: Vec<f32> = Vec::with_capacity(freqs.len());
   for &v in freqs {
     let f = v as f32;
-    if !f.is_finite() {
+    if !f.is_finite() || f <= 0.0 {
       return Err(Error::ShapeMismatch {
         message: format!(
-          "scaled RoPE computed a non-finite freq ({v}); check the scaling config \
-           (base / factor / embeddings / betas)"
+          "scaled RoPE computed a non-positive or non-finite freq ({v}); check the scaling \
+           config (base / factor / embeddings / betas) — freqs are inverted as 1/freqs by \
+           mlx_fast_rope, so a zero element would become +Inf at apply time"
         ),
       });
     }
@@ -130,6 +135,22 @@ fn require_finite_input(value: f32, what: &str) -> Result<()> {
   } else {
     Err(Error::ShapeMismatch {
       message: format!("scaled RoPE {what} must be finite, got {value}"),
+    })
+  }
+}
+
+/// Reject a non-finite OR non-positive `f32` config input up front — the
+/// stronger guard for fields that feed the per-dimension `freqs` math, where
+/// `0` is just as poisonous as NaN/Inf (mlx_fast_rope inverts `freqs` as
+/// `1/freqs[i]` so a zero element becomes `+Inf` at apply time, and a negative
+/// element flips the rotation direction). `NaN > 0.0` is `false`, so this
+/// rejects NaN too. `what` names the field for the message.
+fn require_positive_input(value: f32, what: &str) -> Result<()> {
+  if value.is_finite() && value > 0.0 {
+    Ok(())
+  } else {
+    Err(Error::ShapeMismatch {
+      message: format!("scaled RoPE {what} must be a positive finite number, got {value}"),
     })
   }
 }
@@ -270,23 +291,33 @@ impl Llama3Rope {
     scaling: Llama3ScalingConfig,
   ) -> Result<Self> {
     let half = freqs_half(dims)?;
-    // Input-finiteness: a NaN/±Inf field would slip past the formula's ordered
-    // comparisons (`wavelen > low_wl`, the band selects) and poison every freq.
-    // The `freqs_array` finiteness gate below is the catch-all, but rejecting
-    // the inputs up front yields a clearer message. The medium-band denominator
-    // also divides by `high_freq_factor - low_freq_factor` and by `factor`, so a
-    // degenerate config (equal factors, or a zero `factor`) is caught by the
-    // computed-output gate.
-    require_finite_input(base, "base")?;
-    require_finite_input(scaling.factor, "factor")?;
-    require_finite_input(scaling.low_freq_factor, "low_freq_factor")?;
-    require_finite_input(scaling.high_freq_factor, "high_freq_factor")?;
-    require_finite_input(
+    // Input positive-finiteness: every float field feeds the freqs math.
+    //   * `base`: `base ** (2i/dims)` — `0` zeroes every base freq (and a
+    //     zero freq later inverts to `+Inf` in mlx_fast_rope); a negative
+    //     `base` yields `NaN` for non-integer exponents.
+    //   * `factor`: the long-band multiply `f * factor` AND the medium-band
+    //     denominator `(1 - s) / factor + s` — `0` zeroes the long band and
+    //     divides by zero in the medium band.
+    //   * `low_freq_factor` / `high_freq_factor`: `low_wl = old_ctx / low_ff`
+    //     and `high_wl = old_ctx / high_ff` — `0` makes the band threshold
+    //     `+Inf`, and the medium denominator `high_ff - low_ff` divides by
+    //     the difference. A negative factor reverses the band ordering.
+    //   * `original_max_position_embeddings`: drives both wavelength
+    //     thresholds — a `0` collapses them to `0`, a negative flips them.
+    // A NaN/±Inf also slips past the formula's ordered comparisons
+    // (`wavelen > low_wl`, band selects) and poisons every freq. The
+    // `freqs_array` positive-finite gate below is the catch-all, but
+    // rejecting the inputs up front yields a clearer message.
+    require_positive_input(base, "base")?;
+    require_positive_input(scaling.factor, "factor")?;
+    require_positive_input(scaling.low_freq_factor, "low_freq_factor")?;
+    require_positive_input(scaling.high_freq_factor, "high_freq_factor")?;
+    require_positive_input(
       scaling.original_max_position_embeddings,
       "original_max_position_embeddings",
     )?;
-    // Catch-all: rejects any freq that came out NaN/±Inf (degenerate factors,
-    // zero `factor`, etc.) before it is stored.
+    // Catch-all: rejects any freq that came out non-positive or NaN/±Inf
+    // (degenerate factors, equal-band singularities, etc.) before it is stored.
     let freqs = freqs_array(&Self::compute_freqs(f64::from(base), dims, half, scaling))?;
     Ok(Self {
       dims,
@@ -390,12 +421,16 @@ impl SuScaledRope {
         ),
       });
     }
-    // Input-finiteness: a NaN/±Inf `base` or `long_factor` entry would multiply
-    // through to a non-finite freq; reject up front (the `freqs_array` gate is
-    // the catch-all, this is the clearer message).
-    require_finite_input(base, "base")?;
+    // Input positive-finiteness: `base` raises to `2i/dims` (a non-positive
+    // base would yield a zero/NaN base-freq), and each `long_factor` entry
+    // multiplies a base freq directly (a `0` entry zeroes the corresponding
+    // freq — which would later invert to `+Inf` in mlx_fast_rope's `1/freqs`
+    // — and a negative entry flips its rotation direction). The
+    // `freqs_array` positive-finite gate below is the catch-all; this is the
+    // clearer message.
+    require_positive_input(base, "base")?;
     for &lf in long_factor {
-      require_finite_input(lf, "long_factor entry")?;
+      require_positive_input(lf, "long_factor entry")?;
     }
     let base_freqs = base_pair_freqs(f64::from(base), dims, half);
     let freqs: Vec<f64> = base_freqs
@@ -822,6 +857,92 @@ mod tests {
     );
   }
 
+  #[test]
+  fn llama3_rejects_nonpositive_inputs() {
+    // Every float input feeds the freqs math; a zero/negative value either
+    // zeroes a freq (which later inverts to `+Inf` in mlx_fast_rope's
+    // `1/freqs`) or NaNs the band-select arithmetic. The up-front positive
+    // gate must reject these so no `0` or negative reaches `freqs_array`.
+    // `factor = 0` ⇒ medium-band denominator `(1-s)/0 + s` is +Inf, long-band
+    // multiply zeroes the freq.
+    assert!(
+      Llama3Rope::new(
+        8,
+        DEFAULT_BASE,
+        false,
+        Llama3ScalingConfig::new(0.0, 1.0, 4.0, 8192.0)
+      )
+      .is_err(),
+      "factor=0 must be rejected"
+    );
+    // `factor < 0` ⇒ reverses rotation direction on long band.
+    assert!(
+      Llama3Rope::new(
+        8,
+        DEFAULT_BASE,
+        false,
+        Llama3ScalingConfig::new(-8.0, 1.0, 4.0, 8192.0)
+      )
+      .is_err(),
+      "negative factor must be rejected"
+    );
+    // `base = 0` ⇒ `0 ** (2i/dims)` zeroes every base freq.
+    assert!(
+      Llama3Rope::new(8, 0.0, false, Llama3ScalingConfig::with_factor(8.0)).is_err(),
+      "base=0 must be rejected"
+    );
+    // `base < 0` ⇒ `(-x).powf(non-integer)` yields NaN.
+    assert!(
+      Llama3Rope::new(8, -10000.0, false, Llama3ScalingConfig::with_factor(8.0)).is_err(),
+      "negative base must be rejected"
+    );
+    // `low_freq_factor = 0` ⇒ `low_wl = old_ctx / 0 = +Inf`.
+    assert!(
+      Llama3Rope::new(
+        8,
+        DEFAULT_BASE,
+        false,
+        Llama3ScalingConfig::new(8.0, 0.0, 4.0, 8192.0)
+      )
+      .is_err(),
+      "low_freq_factor=0 must be rejected"
+    );
+    // `high_freq_factor = 0` ⇒ `high_wl = old_ctx / 0 = +Inf`.
+    assert!(
+      Llama3Rope::new(
+        8,
+        DEFAULT_BASE,
+        false,
+        Llama3ScalingConfig::new(8.0, 1.0, 0.0, 8192.0)
+      )
+      .is_err(),
+      "high_freq_factor=0 must be rejected"
+    );
+    // `original_max_position_embeddings = 0` ⇒ collapses both wavelength
+    // thresholds to `0`.
+    assert!(
+      Llama3Rope::new(
+        8,
+        DEFAULT_BASE,
+        false,
+        Llama3ScalingConfig::new(8.0, 1.0, 4.0, 0.0)
+      )
+      .is_err(),
+      "original_max_position_embeddings=0 must be rejected"
+    );
+    // `original_max_position_embeddings < 0` ⇒ flips the wavelength thresholds.
+    assert!(
+      Llama3Rope::new(
+        8,
+        DEFAULT_BASE,
+        false,
+        Llama3ScalingConfig::new(8.0, 1.0, 4.0, -8192.0)
+      )
+      .is_err(),
+      "negative original_max_position_embeddings must be rejected"
+    );
+  }
+
   // ───────── SuScaled / longrope ─────────
 
   /// freqs = long_factor * base^(2i/dims). dims=8, base=10000,
@@ -966,6 +1087,31 @@ mod tests {
     assert!(
       SuScaledRope::new(8, DEFAULT_BASE, 16384, 4096, &[1.0; 4], Some(f32::INFINITY)).is_err(),
       "Inf long_mscale override"
+    );
+  }
+
+  #[test]
+  fn su_scaled_rejects_nonpositive_long_factor_or_base() {
+    // `base` and each `long_factor` entry feed the freqs math; a `0` long_factor
+    // entry zeroes the corresponding base freq (which then inverts to `+Inf`
+    // inside `mlx_fast_rope`'s `1/freqs`), and a negative entry flips its
+    // rotation direction. `base = 0` zeroes every base freq. The up-front
+    // positive gate must reject these before they reach `freqs_array`.
+    assert!(
+      SuScaledRope::new(8, DEFAULT_BASE, 16384, 4096, &[0.0, 1.0, 1.0, 1.0], None).is_err(),
+      "zero long_factor entry must be rejected"
+    );
+    assert!(
+      SuScaledRope::new(8, DEFAULT_BASE, 16384, 4096, &[1.0, -2.0, 1.0, 1.0], None).is_err(),
+      "negative long_factor entry must be rejected"
+    );
+    assert!(
+      SuScaledRope::new(8, 0.0, 16384, 4096, &[1.0; 4], None).is_err(),
+      "base=0 must be rejected"
+    );
+    assert!(
+      SuScaledRope::new(8, -10000.0, 16384, 4096, &[1.0; 4], None).is_err(),
+      "negative base must be rejected"
     );
   }
 
