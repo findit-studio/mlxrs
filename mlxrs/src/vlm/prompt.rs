@@ -304,7 +304,13 @@ pub fn insert_image_tokens(
           text_tokens.len()
         ),
       })?;
-    let mut out = Vec::with_capacity(cap);
+    // Recoverable reservation (Codex VLM-8 R3F1): a huge non-overflowing
+    // `cap` (large `num_tokens_per_image` × `image_count`) would abort
+    // the process via `Vec::with_capacity`; `try_reserve_exact` surfaces
+    // it as `Error::OutOfMemory`. `vlm_generate` calls this before any
+    // other recoverable boundary.
+    let mut out: Vec<u32> = Vec::new();
+    out.try_reserve_exact(cap).map_err(|_| Error::OutOfMemory)?;
     out.extend_from_slice(&text_tokens[..run_start]);
     out.extend(std::iter::repeat_n(image_token_id, placeholder_total));
     out.extend_from_slice(&text_tokens[run_end..]);
@@ -332,7 +338,10 @@ pub fn insert_image_tokens(
           text_tokens.len()
         ),
       })?;
-    let mut out = Vec::with_capacity(cap);
+    // Recoverable reservation (Codex VLM-8 R3F1) — see the marker-present
+    // branch above.
+    let mut out: Vec<u32> = Vec::new();
+    out.try_reserve_exact(cap).map_err(|_| Error::OutOfMemory)?;
     out.extend(std::iter::repeat_n(image_token_id, placeholder_total));
     out.extend_from_slice(text_tokens);
     Ok(out)
