@@ -128,6 +128,121 @@ fn image_to_array_drops_alpha_from_rgba() {
   assert!(vclose(&v, &[11.0, 22.0, 33.0]));
 }
 
+#[test]
+fn image_to_array_rgb_preserves_row_major_layout() {
+  // Hand-computed 4x4 RGB image: pixel at (x, y) = ((x + 1) * 10,
+  // (y + 1) * 20, x + y). Channel-last [H=4, W=4, 3] flattens
+  // row-major: index = (y * W + x) * 3 + c. Verifies the
+  // `chunks_exact(3)` + `extend(map(as f32))` buffer fill emits the
+  // exact same byte sequence as the prior per-pixel push form.
+  let (w, h) = (4u32, 4u32);
+  let mut buf = ::image::RgbImage::new(w, h);
+  for y in 0..h {
+    for x in 0..w {
+      let r = ((x + 1) * 10) as u8;
+      let g = ((y + 1) * 20) as u8;
+      let b = (x + y) as u8;
+      buf.put_pixel(x, y, ::image::Rgb([r, g, b]));
+    }
+  }
+  let img = ::image::DynamicImage::ImageRgb8(buf);
+  let mut arr = image_to_array(&img, ColorOrder::Rgb).unwrap();
+  assert_eq!(arr.shape(), vec![h as usize, w as usize, 3]);
+  let v: Vec<f32> = arr.to_vec().unwrap();
+  // Build the expected row-major sequence by hand.
+  let mut expected = Vec::with_capacity((h * w * 3) as usize);
+  for y in 0..h {
+    for x in 0..w {
+      expected.push(((x + 1) * 10) as f32);
+      expected.push(((y + 1) * 20) as f32);
+      expected.push((x + y) as f32);
+    }
+  }
+  assert!(vclose(&v, &expected), "got {v:?}\nexpected {expected:?}");
+}
+
+#[test]
+fn image_to_array_bgr_swaps_channels_correctly() {
+  // Same 4x4 image as above; BGR output must have R and B columns
+  // swapped at every pixel while preserving (H, W, 3) row-major
+  // ordering. Verifies the `chunks_exact(3)` BGR branch produces the
+  // exact byte sequence the prior `pixels()` swap form did.
+  let (w, h) = (4u32, 4u32);
+  let mut buf = ::image::RgbImage::new(w, h);
+  for y in 0..h {
+    for x in 0..w {
+      let r = ((x + 1) * 10) as u8;
+      let g = ((y + 1) * 20) as u8;
+      let b = (x + y) as u8;
+      buf.put_pixel(x, y, ::image::Rgb([r, g, b]));
+    }
+  }
+  let img = ::image::DynamicImage::ImageRgb8(buf);
+  let mut arr = image_to_array(&img, ColorOrder::Bgr).unwrap();
+  assert_eq!(arr.shape(), vec![h as usize, w as usize, 3]);
+  let v: Vec<f32> = arr.to_vec().unwrap();
+  let mut expected = Vec::with_capacity((h * w * 3) as usize);
+  for y in 0..h {
+    for x in 0..w {
+      // BGR: B, G, R per pixel.
+      expected.push((x + y) as f32);
+      expected.push(((y + 1) * 20) as f32);
+      expected.push(((x + 1) * 10) as f32);
+    }
+  }
+  assert!(vclose(&v, &expected), "got {v:?}\nexpected {expected:?}");
+}
+
+// NOTE: `image_to_array` carries a `checked_mul` overflow guard for the
+// `h*w*3` product (defense-in-depth on a 32-bit `usize` target). On the
+// 64-bit targets we build for, triggering that guard would require an
+// `RgbImage` of dimensions whose product overflows `usize` — roughly
+// `u32::MAX * u32::MAX * 3` bytes of decoded pixel data (~50 EB), which
+// is unreachable through the public API. The guard exists to surface
+// the wrap as a recoverable `Error::ShapeMismatch` instead of a silent
+// `Vec::with_capacity` panic, and is covered by the algebraic
+// `checked_mul` operator itself.
+
+#[test]
+fn image_to_array_rgb_overlong_backing_buffer_ignores_tail() {
+  // `ImageBuffer::from_raw(w, h, vec)` accepts a backing Vec longer
+  // than `w * h * 3`; `as_raw()` returns the full backing buffer
+  // (including the tail past the logical extent). The new
+  // `.get(..total)` slice must clip the iteration to exactly H*W*3
+  // bytes — without it, `Vec::extend` would grow `buf` past the
+  // `try_reserve_exact(total)` reservation via infallible allocation,
+  // reintroducing the abort-on-OOM hazard.
+  let mut overlong: Vec<u8> = vec![10, 20, 30]; // 1*1*3 logical pixel
+  overlong.extend_from_slice(&[99, 99, 99, 99]); // 4-byte tail
+  let buf = ::image::RgbImage::from_raw(1, 1, overlong).expect("from_raw 1x1+tail");
+  let img = ::image::DynamicImage::ImageRgb8(buf);
+  let mut arr = image_to_array(&img, ColorOrder::Rgb).unwrap();
+  assert_eq!(arr.shape(), vec![1, 1, 3]);
+  let v: Vec<f32> = arr.to_vec().unwrap();
+  // Tail bytes (99s) MUST NOT appear; only the logical pixel's R=10,G=20,B=30.
+  assert!(
+    vclose(&v, &[10.0, 20.0, 30.0]),
+    "got {v:?}, expected [10,20,30]"
+  );
+}
+
+#[test]
+fn image_to_array_bgr_overlong_backing_buffer_ignores_tail() {
+  let mut overlong: Vec<u8> = vec![10, 20, 30];
+  overlong.extend_from_slice(&[99, 99, 99, 99]);
+  let buf = ::image::RgbImage::from_raw(1, 1, overlong).expect("from_raw 1x1+tail");
+  let img = ::image::DynamicImage::ImageRgb8(buf);
+  let mut arr = image_to_array(&img, ColorOrder::Bgr).unwrap();
+  assert_eq!(arr.shape(), vec![1, 1, 3]);
+  let v: Vec<f32> = arr.to_vec().unwrap();
+  // BGR swap on the logical pixel: B=30, G=20, R=10. Tail bytes (99s)
+  // must NOT contribute to the output.
+  assert!(
+    vclose(&v, &[30.0, 20.0, 10.0]),
+    "got {v:?}, expected [30,20,10]"
+  );
+}
+
 // ---------- rescale ----------
 
 #[test]

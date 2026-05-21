@@ -9,7 +9,7 @@
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{Error, Result},
+  error::{Error, Result, try_with_capacity},
   ops::{
     arithmetic::{divide, maximum, multiply, subtract},
     comparison::equal,
@@ -223,7 +223,8 @@ pub fn last_token_pooling(token_embeddings: &Array, attention_mask: &Array) -> R
   // `take_axis` with the descending index `[seq_len-1, …, 1, 0]` along
   // the sequence axis — numerically identical, contiguous result.
   let mask_i32 = astype(attention_mask, Dtype::I32)?;
-  let rev_idx: Vec<i32> = (0..seq_len as i32).rev().collect();
+  let mut rev_idx: Vec<i32> = try_with_capacity(seq_len)?;
+  rev_idx.extend((0..seq_len as i32).rev());
   let rev_idx = Array::from_slice(&rev_idx, &(seq_len,))?;
   let flipped = take_axis(&mask_i32, &rev_idx, 1)?;
 
@@ -438,7 +439,8 @@ pub fn truncate_last_dim(x: &Array, dimension: usize) -> Result<Array> {
   // index → contiguous gather (same pattern as `cls_pooling`; a `slice`
   // or last-axis `take_axis` view would be strided / fail `to_vec` and
   // downstream materialization).
-  let idx: Vec<i32> = (0..dimension as i32).collect();
+  let mut idx: Vec<i32> = try_with_capacity(dimension)?;
+  idx.extend(0..dimension as i32);
   let mut idx_shape = vec![1_usize; ndim];
   idx_shape[ndim - 1] = dimension;
   let indices = Array::from_slice(&idx, &idx_shape.as_slice())?;

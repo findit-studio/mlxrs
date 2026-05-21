@@ -36,7 +36,7 @@ use std::path::Path;
 use crate::{
   array::Array,
   audio::{dsp, io as audio_io},
-  error::{Error, Result},
+  error::{Error, Result, try_extend_from_slice},
   lm::{
     cache::KvCache,
     generate::{
@@ -346,7 +346,7 @@ impl<M: super::model::Model> SttGenerator<'_, M> {
     //    over the FULL history on RAW logits.
     let mut logits = logits;
     if !self.processors.is_empty() {
-      self.history.push(self.last);
+      try_extend_from_slice(&mut self.history, &[self.last])?;
       for p in &self.processors {
         logits = p(&self.history, &logits)?;
       }

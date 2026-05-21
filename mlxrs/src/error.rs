@@ -98,6 +98,56 @@ impl Error {
 /// Convenience alias for `Result<T, Error>`.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Allocate a `Vec<T>` reserving exactly `cap` capacity, returning
+/// [`Error::OutOfMemory`] instead of aborting the process on allocator
+/// failure (which `Vec::with_capacity` / `vec![…; n]` do). Use for any
+/// REQUEST-SCALED allocation on a hot path (sequence length, token /
+/// image counts) so an oversized or hostile input fails recoverably
+/// rather than terminating the process.
+///
+/// For small fixed-size allocations (a handful of elements) the infallible
+/// `Vec::with_capacity` remains fine — this is for input-proportional
+/// buffers.
+///
+/// Consumed by the `lm`, `vlm`, `audio`, and `embeddings` modules for
+/// request-scaled host-side buffers (the VLM-9 allocation-hardening pass,
+/// now extended across lm/audio/embeddings). Gated to exactly the features
+/// that use it so `cargo hack --each-feature` sees no dead code (`vlm` and
+/// `audio` both enable `lm`).
+#[cfg(any(feature = "lm", feature = "embeddings"))]
+pub(crate) fn try_with_capacity<T>(cap: usize) -> Result<Vec<T>> {
+  let mut v = Vec::new();
+  v.try_reserve_exact(cap).map_err(|_| Error::OutOfMemory)?;
+  Ok(v)
+}
+
+/// Fallible [`slice::to_vec`]: clone `slice` into a freshly-reserved
+/// `Vec`, returning [`Error::OutOfMemory`] instead of aborting on
+/// allocation failure. The recoverable analogue of `slice.to_vec()` for
+/// request-scaled slices. (Only the `vlm` module needs the owned-clone
+/// form; lm/audio/embeddings use `try_with_capacity` + `extend` or
+/// `try_extend_from_slice` directly, hence the narrower gate.)
+#[cfg(feature = "vlm")]
+pub(crate) fn try_to_vec<T: Clone>(slice: &[T]) -> Result<Vec<T>> {
+  let mut v = try_with_capacity(slice.len())?;
+  v.extend_from_slice(slice);
+  Ok(v)
+}
+
+/// Fallible [`Vec::extend_from_slice`]: reserve room for `slice` and append,
+/// returning [`Error::OutOfMemory`] instead of aborting on allocation
+/// failure. Uses the AMORTIZED `try_reserve` (NOT `try_reserve_exact`):
+/// callers grow the same `Vec` repeatedly (processor history accumulates the
+/// prefill prompt, then one token per decode step), so exact reservation
+/// would reallocate on every append and turn an O(n) accumulation into
+/// O(n²). The recoverable analogue of `vec.extend_from_slice(slice)`.
+#[cfg(feature = "lm")]
+pub(crate) fn try_extend_from_slice<T: Clone>(v: &mut Vec<T>, slice: &[T]) -> Result<()> {
+  v.try_reserve(slice.len()).map_err(|_| Error::OutOfMemory)?;
+  v.extend_from_slice(slice);
+  Ok(())
+}
+
 thread_local! {
   pub(crate) static LAST: RefCell<Option<Error>> = const { RefCell::new(None) };
 }

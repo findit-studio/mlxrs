@@ -18,6 +18,17 @@
 //!   primitives ported 1:1 from `mlx-vlm/mlx_vlm/prompt_utils.py`
 //!   (image-token splicing, image-span location, multimodal attention-mask
 //!   construction). Per-model chat templates are out of scope.
+//! - [`crate::vlm::model`] — the `vlm::Model` trait extending
+//!   `lm::Model` with the image-embedding entry points every VLM forward
+//!   needs (vision encode + token embed + image-into-text embed splice).
+//!   Mirrors mlx-vlm's `VisionLanguageModel` protocol and mlx-swift-lm's
+//!   `VLMModel` marker.
+//! - [`crate::vlm::generate`] — the architecture-agnostic multimodal
+//!   generation Iterator, ported from `mlx-vlm/mlx_vlm/generate.py::
+//!   generate_step` (preprocess images → vision encode → embed merge →
+//!   prefill via `forward_embeddings` → per-token decode via `forward`).
 
+pub mod generate;
 pub mod image;
+pub mod model;
 pub mod prompt;

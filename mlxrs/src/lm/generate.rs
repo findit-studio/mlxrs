@@ -58,7 +58,7 @@ use std::cell::RefCell;
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{Error, Result, try_extend_from_slice, try_with_capacity},
   lm::{cache::KvCache, model::Model, sample},
   ops,
 };
@@ -369,8 +369,10 @@ pub fn make_logits_processors(
   // (`indices = mx.array(list(...))`); mirror that — the `values` array is
   // built once here, not rebuilt per step (faithful + no per-step alloc).
   if !logit_bias.is_empty() {
-    let indices: Vec<i32> = logit_bias.iter().map(|&(i, _)| i).collect();
-    let values_vec: Vec<f32> = logit_bias.iter().map(|&(_, v)| v).collect();
+    let mut indices: Vec<i32> = try_with_capacity(logit_bias.len())?;
+    indices.extend(logit_bias.iter().map(|&(i, _)| i));
+    let mut values_vec: Vec<f32> = try_with_capacity(logit_bias.len())?;
+    values_vec.extend(logit_bias.iter().map(|&(_, v)| v));
     let values = Array::from_slice::<f32>(&values_vec, &(values_vec.len(),))?;
     let proc: LogitsProcessor = Box::new(move |_tokens: &[u32], logits: &Array| {
       sample::apply_logit_bias(logits, &indices, &values)
@@ -386,7 +388,7 @@ pub fn make_logits_processors(
   if let Some(p) = repetition_penalty.filter(|&p| p != 0.0) {
     let ctx = repetition_context_size;
     let proc: LogitsProcessor = Box::new(move |tokens: &[u32], logits: &Array| {
-      let ids = recent_ids(tokens, ctx);
+      let ids = recent_ids(tokens, ctx)?;
       sample::apply_repetition_penalty(logits, &ids, p)
     });
     processors.push(proc);
@@ -394,7 +396,7 @@ pub fn make_logits_processors(
   if let Some(p) = presence_penalty.filter(|&p| p != 0.0) {
     let ctx = presence_context_size;
     let proc: LogitsProcessor = Box::new(move |tokens: &[u32], logits: &Array| {
-      let ids = recent_ids(tokens, ctx);
+      let ids = recent_ids(tokens, ctx)?;
       sample::apply_presence_penalty(logits, &ids, p)
     });
     processors.push(proc);
@@ -402,7 +404,7 @@ pub fn make_logits_processors(
   if let Some(p) = frequency_penalty.filter(|&p| p != 0.0) {
     let ctx = frequency_context_size;
     let proc: LogitsProcessor = Box::new(move |tokens: &[u32], logits: &Array| {
-      let ids = recent_ids(tokens, ctx);
+      let ids = recent_ids(tokens, ctx)?;
       sample::apply_frequency_penalty(logits, &ids, p)
     });
     processors.push(proc);
@@ -418,7 +420,7 @@ pub fn make_logits_processors(
 /// slice — so a `0` window penalizes over all accumulated tokens, matching
 /// `sample_utils`'s closures. Any positive `context_size >= tokens.len()`
 /// likewise keeps the whole history (`tokens[-big:] == tokens`).
-fn recent_ids(tokens: &[u32], context_size: usize) -> Vec<i32> {
+fn recent_ids(tokens: &[u32], context_size: usize) -> Result<Vec<i32>> {
   // Python `tokens[-context_size:]`: `context_size == 0` ⇒ `tokens[0:]`
   // (full history); otherwise the last `min(context_size, len)` ids.
   let start = if context_size == 0 {
@@ -426,7 +428,10 @@ fn recent_ids(tokens: &[u32], context_size: usize) -> Vec<i32> {
   } else {
     tokens.len().saturating_sub(context_size)
   };
-  tokens[start..].iter().map(|&t| t as i32).collect()
+  let tail = &tokens[start..];
+  let mut ids = try_with_capacity(tail.len())?;
+  ids.extend(tail.iter().map(|&t| t as i32));
+  Ok(ids)
 }
 
 /// One decode step — the sampled `token` plus the `[V]` log-probability
@@ -570,7 +575,7 @@ impl<M: Model> Generator<'_, M> {
     //    that exactly (and avoid the needless history growth).
     let mut logits = logits;
     if !self.processors.is_empty() && !input.is_empty() {
-      self.history.extend_from_slice(input);
+      try_extend_from_slice(&mut self.history, input)?;
       for p in &self.processors {
         logits = p(&self.history, &logits)?;
       }
@@ -675,7 +680,8 @@ impl<M: Model> Iterator for Generator<'_, M> {
 /// `input_tokens[None]`). `I32` is mlx's default integer dtype for token
 /// ids (embedding `take` indices); the trait only constrains the shape.
 fn token_window(ids: &[u32]) -> Result<Array> {
-  let row: Vec<i32> = ids.iter().map(|&t| t as i32).collect();
+  let mut row: Vec<i32> = try_with_capacity(ids.len())?;
+  row.extend(ids.iter().map(|&t| t as i32));
   Array::from_slice::<i32>(&row, &(1usize, row.len()))
 }
 

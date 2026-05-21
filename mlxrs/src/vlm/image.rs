@@ -453,30 +453,82 @@ pub fn image_to_array(img: &::image::DynamicImage, color_order: ColorOrder) -> R
   // *after* our cast; on a 32-bit usize the multiplication
   // `h_usize * w_usize * 3` can wrap silently. Catch it here with a
   // recoverable `Error::ShapeMismatch` so callers see a clean error rather
-  // than a panic downstream.
+  // than a panic downstream. This MUST run before `Vec::with_capacity`
+  // so a hostile dimension product cannot abort in the allocator.
   let total = h_usize
     .checked_mul(w_usize)
     .and_then(|hw| hw.checked_mul(3))
     .ok_or_else(|| Error::ShapeMismatch {
       message: format!("image_to_array: h*w*3 overflows usize for {h}x{w}"),
     })?;
-  let mut buf: Vec<f32> = Vec::with_capacity(total);
+  // Pre-sized `Vec<f32>` filled from `rgb.as_raw()` (`&[u8]` of length
+  // `H*W*3`, RGB-ordered) — eliminates per-element capacity re-checks
+  // versus the prior `rgb.pixels() + push` form AND lets LLVM
+  // auto-vectorize the u8 → f32 widening (the RGB path is a straight
+  // contiguous cast; the BGR path is a 3-element shuffle that
+  // `chunks_exact(3)` keeps bounded enough for unrolling). See the
+  // golden-standard `VLM-3` tracker entry for the rationale.
+  //
+  // `rgb.as_raw()` is documented to return `&[u8]` of length
+  // `width * height * 3` (image 0.25 `ImageBuffer::as_raw` /
+  // `ImageBuffer<P, Vec<P::Subpixel>>` with `P = Rgb<u8>`), so the
+  // `chunks_exact(3)` iterator yields exactly `H*W` slices of length
+  // 3 with no remainder — the BGR branch's indexed reads never panic.
+  // `image::ImageBuffer::from_raw(w, h, vec)` accepts a backing buffer
+  // whose length is AT LEAST `w * h * channels`; `as_raw()` returns the
+  // full backing Vec (including any tail past the logical extent), while
+  // the safer `pixels()` iterator slices to exactly `w * h` pixels.
+  // Slice `as_raw()` down to the logical `total = H*W*3` bytes here so
+  // the subsequent fill loop iterates the correct extent — without this
+  // slice an overlong-backing-buffer image would grow the `buf` past
+  // the `try_reserve_exact(total)` reservation via infallible allocation,
+  // reintroducing the abort-on-OOM hazard the recoverable reservation
+  // is supposed to remove. A standard `to_rgb8()` output is exactly
+  // `total` long so this is a no-op for the common path.
+  let raw = rgb
+    .as_raw()
+    .get(..total)
+    .ok_or_else(|| Error::ShapeMismatch {
+      message: format!(
+        "image_to_array: rgb backing buffer too short: {} bytes < H*W*3={total} for H={h} W={w}",
+        rgb.as_raw().len()
+      ),
+    })?;
+  // Recoverable OOM at the f32 widening boundary. `Vec::with_capacity`
+  // would `abort()` on a hostile-but-non-overflowing image (the
+  // `checked_mul` only proves `total` fits `usize`, not that the
+  // `total * 4` byte alloc succeeds). `try_reserve_exact` surfaces an
+  // allocator failure as a recoverable `Error::OutOfMemory` so callers
+  // get a typed Err instead of process termination — matches the
+  // allocation-discipline pattern `mlxrs::error::Error::OutOfMemory`
+  // exists for.
+  let mut buf: Vec<f32> = Vec::new();
+  buf
+    .try_reserve_exact(total)
+    .map_err(|_| Error::OutOfMemory)?;
   match color_order {
     ColorOrder::Rgb => {
-      for px in rgb.pixels() {
-        buf.push(px[0] as f32);
-        buf.push(px[1] as f32);
-        buf.push(px[2] as f32);
-      }
+      // Contiguous u8 → f32 widening — LLVM auto-vectorizes this on
+      // both NEON (aarch64) and AVX2 (x86_64) backends.
+      buf.extend(raw.iter().map(|&b| f32::from(b)));
     }
     ColorOrder::Bgr => {
-      for px in rgb.pixels() {
-        buf.push(px[2] as f32);
-        buf.push(px[1] as f32);
-        buf.push(px[0] as f32);
+      // Per-pixel R↔B swap. `chunks_exact(3)` yields `&[u8]` of
+      // guaranteed length 3 (verified by `as_raw().len() == total`
+      // above), keeping the inner-loop indices bounded so LLVM can
+      // unroll the 3-element shuffle.
+      for px in raw.chunks_exact(3) {
+        buf.push(f32::from(px[2]));
+        buf.push(f32::from(px[1]));
+        buf.push(f32::from(px[0]));
       }
     }
   }
+  debug_assert_eq!(
+    buf.len(),
+    total,
+    "buf fill length must equal pre-computed total"
+  );
   Array::from_slice(&buf, &(h_usize, w_usize, 3))
 }
 

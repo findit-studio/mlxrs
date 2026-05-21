@@ -47,7 +47,7 @@
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{Error, Result, try_to_vec, try_with_capacity},
 };
 
 /// Inclusive-start / exclusive-end half-open token-index ranges marking
@@ -213,7 +213,7 @@ pub fn insert_image_tokens(
   policy: MarkerPolicy,
 ) -> Result<Vec<u32>> {
   if image_count == 0 {
-    return Ok(text_tokens.to_vec());
+    return try_to_vec(text_tokens);
   }
 
   // Reject `image_count > 0 && num_tokens_per_image == 0` — a degenerate
@@ -304,7 +304,12 @@ pub fn insert_image_tokens(
           text_tokens.len()
         ),
       })?;
-    let mut out = Vec::with_capacity(cap);
+    // Recoverable reservation (Codex VLM-8 R3F1): a huge non-overflowing
+    // `cap` (large `num_tokens_per_image` × `image_count`) would abort
+    // the process via `Vec::with_capacity`; `try_reserve_exact` surfaces
+    // it as `Error::OutOfMemory`. `vlm_generate` calls this before any
+    // other recoverable boundary.
+    let mut out: Vec<u32> = try_with_capacity(cap)?;
     out.extend_from_slice(&text_tokens[..run_start]);
     out.extend(std::iter::repeat_n(image_token_id, placeholder_total));
     out.extend_from_slice(&text_tokens[run_end..]);
@@ -332,7 +337,9 @@ pub fn insert_image_tokens(
           text_tokens.len()
         ),
       })?;
-    let mut out = Vec::with_capacity(cap);
+    // Recoverable reservation (Codex VLM-8 R3F1) — see the marker-present
+    // branch above.
+    let mut out: Vec<u32> = try_with_capacity(cap)?;
     out.extend(std::iter::repeat_n(image_token_id, placeholder_total));
     out.extend_from_slice(text_tokens);
     Ok(out)
@@ -391,80 +398,136 @@ pub fn insert_image_tokens(
 /// }
 /// ```
 pub fn build_multimodal_mask(seq_len: usize, image_spans: &[(usize, usize)]) -> Result<Array> {
-  // Empty mask: faithful zero-size [1, 1, 0, 0] array (matches the upstream
-  // rank-4 contract). But if the caller passes non-empty `image_spans` with
-  // `seq_len == 0`, that's an inconsistent state — fail closed rather than
-  // silently dropping the spans (the documented validation contract says
-  // out-of-bounds / non-empty spans must error).
+  // The non-chunked / single-forward case is the `past_len == 0`
+  // specialization of the offset-aware builder. Delegate so the
+  // validation + block-id logic lives in one place.
+  build_multimodal_mask_with_past(seq_len, 0, image_spans)
+}
+
+/// Offset-aware variant of [`build_multimodal_mask`] for **chunked prefill**:
+/// build a `[1, 1, seq_len, past_len + seq_len]` bool attention mask for a
+/// chunk of `seq_len` query positions whose keys are the `past_len` already
+/// cached tokens PLUS this chunk's own `seq_len` tokens.
+///
+/// `image_spans` are **chunk-local** — half-open `(start, end)` ranges in
+/// `[0, seq_len)` identifying image runs WITHIN this chunk (the caller shifts
+/// absolute spans by the chunk's start offset). Span-aware chunking
+/// guarantees no image span is split across a chunk boundary, so every
+/// query's bidirectional-within-image partners are in the same chunk — the
+/// past keys never participate in a span's bidirectional block.
+///
+/// Mask semantics for query `q` (chunk-local `0..seq_len`, absolute
+/// `past_len + q`) and key `k` (`0..past_len + seq_len`):
+/// - **`k < past_len` (a cached past key)**: always attend. Past tokens are
+///   strictly before this chunk (`k < past_len <= past_len + q`), so the
+///   causal rule admits them unconditionally; no past key shares a
+///   bidirectional image block with a current-chunk query (spans aren't
+///   split).
+/// - **`k >= past_len` (a current-chunk key)**: chunk-local `k' = k -
+///   past_len`; attend iff `k' <= q` (causal) OR `q` and `k'` are in the
+///   same chunk-local image span (bidirectional-within-image).
+///
+/// With `past_len == 0` this is byte-identical to the original
+/// `[1, 1, seq_len, seq_len]` mask.
+///
+/// # Errors
+///
+/// Same contract as [`build_multimodal_mask`] (empty/out-of-bounds/
+/// overlapping spans; `seq_len`/`past_len` exceeding `i32::MAX`; total
+/// buffer overflow), evaluated against the chunk-local `seq_len`.
+pub fn build_multimodal_mask_with_past(
+  seq_len: usize,
+  past_len: usize,
+  image_spans: &[(usize, usize)],
+) -> Result<Array> {
+  let total_keys = past_len
+    .checked_add(seq_len)
+    .ok_or_else(|| Error::ShapeMismatch {
+      message: format!(
+        "build_multimodal_mask_with_past: past_len ({past_len}) + seq_len ({seq_len}) overflows usize"
+      ),
+    })?;
+
+  // Empty chunk: faithful zero-query [1, 1, 0, past_len] array. Non-empty
+  // spans on a zero-length chunk is an inconsistent state — fail closed.
   if seq_len == 0 {
     if !image_spans.is_empty() {
       return Err(Error::ShapeMismatch {
         message: format!(
-          "build_multimodal_mask: seq_len=0 but image_spans has {} entry(s); \
-           empty sequence cannot contain any image span",
+          "build_multimodal_mask_with_past: seq_len=0 but image_spans has {} entry(s); \
+           empty chunk cannot contain any image span",
           image_spans.len()
         ),
       });
     }
-    return Array::from_slice::<bool>(&[], &(1_usize, 1_usize, 0_usize, 0_usize));
+    return Array::from_slice::<bool>(&[], &(1_usize, 1_usize, 0_usize, total_keys));
   }
 
-  // mlx dimensions are signed 32-bit; reject `seq_len > i32::MAX` BEFORE any
-  // host-side allocation to avoid wasting an O(T*T) buffer that mlx would
-  // immediately reject downstream.
-  if seq_len > i32::MAX as usize {
+  // mlx dimensions are signed 32-bit; reject oversized dims BEFORE any
+  // host-side allocation.
+  if total_keys > i32::MAX as usize {
     return Err(Error::ShapeMismatch {
       message: format!(
-        "build_multimodal_mask: seq_len {seq_len} exceeds i32::MAX (mlx dimension limit)"
+        "build_multimodal_mask_with_past: past_len + seq_len ({total_keys}) exceeds i32::MAX (mlx dimension limit)"
       ),
     });
   }
 
-  // Validate spans before any allocation.
-  // We check: start<end, end<=seq_len, and ordered/non-overlapping
-  // (sorting + walking). Cloning is unavoidable because the input is `&[..]`
-  // — but it's small (one (usize,usize) per image) and one-shot.
-  let mut sorted: Vec<(usize, usize)> = image_spans.to_vec();
+  // Validate chunk-local spans (start<end, end<=seq_len, ordered/non-overlapping).
+  let mut sorted: Vec<(usize, usize)> = try_to_vec(image_spans)?;
   sorted.sort_unstable_by_key(|&(s, _)| s);
   let mut prev_end = 0usize;
   for &(s, e) in &sorted {
     if s >= e {
       return Err(Error::ShapeMismatch {
-        message: format!("build_multimodal_mask: image span ({s}, {e}) is empty (start>=end)"),
+        message: format!(
+          "build_multimodal_mask_with_past: image span ({s}, {e}) is empty (start>=end)"
+        ),
       });
     }
     if e > seq_len {
       return Err(Error::ShapeMismatch {
         message: format!(
-          "build_multimodal_mask: image span ({s}, {e}) end exceeds seq_len {seq_len}"
+          "build_multimodal_mask_with_past: chunk-local image span ({s}, {e}) end exceeds seq_len {seq_len}"
         ),
       });
     }
     if s < prev_end {
       return Err(Error::ShapeMismatch {
         message: format!(
-          "build_multimodal_mask: image span ({s}, {e}) overlaps the previous span ending at {prev_end}"
+          "build_multimodal_mask_with_past: image span ({s}, {e}) overlaps the previous span ending at {prev_end}"
         ),
       });
     }
     prev_end = e;
   }
 
-  // Total buffer size with overflow guard.
+  // Total buffer size with overflow guard: seq_len rows × total_keys cols.
   let total = seq_len
-    .checked_mul(seq_len)
+    .checked_mul(total_keys)
     .ok_or_else(|| Error::ShapeMismatch {
       message: format!(
-        "build_multimodal_mask: seq_len*seq_len overflows usize (seq_len={seq_len})"
+        "build_multimodal_mask_with_past: seq_len*({past_len}+{seq_len}) overflows usize"
       ),
     })?;
 
-  // block_id[i] = 1-indexed image span index for position i; 0 = not in any image.
-  // Computed in O(seq_len + spans.len()) by walking the sorted spans once.
-  // Allocation: a single `Vec<u32>` of length seq_len. Avoiding it would
-  // require a more complex inline lookup per (q, k) pair (O(log spans) per
-  // cell vs O(1)), which is the wrong tradeoff for typical span counts.
-  let mut block_id = vec![0u32; seq_len];
+  // block_id[i] = 1-indexed chunk-local image span index for chunk position
+  // i; 0 = not in any image. Length seq_len (chunk-local). Allocated
+  // fallibly for the same reason as `buf` below: these are the TWO
+  // sequence-scaled buffers (`block_id` is O(seq_len); `buf` is
+  // O(seq_len · total_keys) — the dominant allocation, up to MBs), so a
+  // large valid chunk would otherwise abort in `vec![0u32; seq_len]`
+  // before the recoverable `buf.try_reserve_exact` could report OOM
+  // (Codex VLM-8 R4F1). The small auxiliaries here (`sorted`, a clone of
+  // `image_spans` — O(num_images), a handful of `(usize,usize)` pairs)
+  // follow the crate's standard infallible-`Vec` idiom: they cannot
+  // realistically OOM (model image counts are small constants), and a
+  // blanket try_reserve on every Vec would diverge from the rest of
+  // mlxrs + the python/swift references without a real threat-model gain
+  // (see VLM-9 in docs/rust-golden-standard-followups.md for the
+  // coordinated allocation-policy deferral).
+  let mut block_id: Vec<u32> = try_with_capacity(seq_len)?;
+  block_id.resize(seq_len, 0);
   for (idx, &(s, e)) in sorted.iter().enumerate() {
     let block = (idx + 1) as u32;
     for slot in block_id.iter_mut().take(e).skip(s) {
@@ -472,17 +535,37 @@ pub fn build_multimodal_mask(seq_len: usize, image_spans: &[(usize, usize)]) -> 
     }
   }
 
-  // Fill row-major: row=q, col=k. attend = (k <= q) | (block_id[q]==block_id[k] && in_image).
-  let mut buf = Vec::with_capacity(total);
+  // Fill row-major: row=q (chunk-local), col=k (absolute over past+chunk).
+  // Past keys (k < past_len) are unconditionally attended; current-chunk
+  // keys use chunk-local causal + same-image-span.
+  //
+  // Recoverable reservation (Codex VLM-8 R1F2): on late chunks
+  // `total = seq_len * (past_len + seq_len)` grows with the cached
+  // context, so a long prompt's mask can be large. `try_reserve_exact`
+  // surfaces an allocator failure as a recoverable `Error::OutOfMemory`
+  // instead of the `Vec::with_capacity` abort. (The mask is dense by
+  // contract here; a symbolic causal-base + sparse image-overlay
+  // representation is the documented future optimization in VLM-8 — it
+  // does not change this function's observable output.)
+  let mut buf: Vec<bool> = Vec::new();
+  buf
+    .try_reserve_exact(total)
+    .map_err(|_| Error::OutOfMemory)?;
   for (q, &q_blk) in block_id.iter().enumerate() {
-    for (k, &k_blk) in block_id.iter().enumerate() {
-      let causal = k <= q;
-      let same_image_span = q_blk != 0 && q_blk == k_blk;
-      buf.push(causal || same_image_span);
+    for k in 0..total_keys {
+      let attend = if k < past_len {
+        true
+      } else {
+        let k_local = k - past_len;
+        let causal = k_local <= q;
+        let same_image_span = q_blk != 0 && q_blk == block_id[k_local];
+        causal || same_image_span
+      };
+      buf.push(attend);
     }
   }
 
-  Array::from_slice::<bool>(&buf, &(1_usize, 1_usize, seq_len, seq_len))
+  Array::from_slice::<bool>(&buf, &(1_usize, 1_usize, seq_len, total_keys))
 }
 
 /// End-to-end multimodal prompt assembly result.
@@ -643,7 +726,7 @@ pub fn assemble_multimodal_prompt(
   // pathological inputs as recoverable errors rather than panic.
   let mut image_spans = ImageTokenSpans::new();
   if image_count > 0 && num_tokens_per_image > 0 {
-    image_spans.reserve(image_count);
+    image_spans = try_with_capacity(image_count)?;
     for i in 0..image_count {
       let start = base
         .checked_add(
