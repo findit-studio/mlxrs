@@ -571,11 +571,6 @@ pub fn center_crop(
 /// vs allowed byte count; allocator failures return
 /// [`Error::OutOfMemory`].
 pub fn pad_to_square(img: ::image::DynamicImage, fill: [u8; 3]) -> Result<::image::DynamicImage> {
-  // `GenericImageView` provides `DynamicImage::get_pixel` (the per-pixel
-  // path below for non-`Rgb8` sources). `DynamicImage::width()`/`height()`
-  // are inherent methods so they resolve without the trait in scope.
-  use ::image::GenericImageView as _;
-
   let w = img.width();
   let h = img.height();
   if w == h {
@@ -673,23 +668,21 @@ pub fn pad_to_square(img: ::image::DynamicImage, fill: [u8; 3]) -> Result<::imag
         .copy_from_slice(&src_raw[src_row_off..src_row_off + src_stride]);
     }
   } else {
-    // Per-pixel path for non-`Rgb8` sources. `DynamicImage::get_pixel`
-    // returns an `Rgba<u8>` regardless of the underlying variant
-    // (Luma8 broadcasts grey across all 3 channels, Rgba* / Rgb16 /
-    // Rgb32F all project through `to_rgba()` then `into_color()` —
-    // see image 0.25 `DynamicImage::get_pixel`). We drop alpha and
-    // keep R, G, B — identical to the `to_rgb8()` projection the
-    // prior implementation used, just without materializing the
-    // intermediate `RgbImage`.
+    // Per-pixel path for non-`Rgb8` sources. Reuses
+    // [`dynamic_image_rgb_pixel`] (the shared `to_rgba() -> drop alpha`
+    // projection) so the non-Rgb8 branch and `image_to_array`'s
+    // non-Rgb8 branch produce byte-identical RGB triples — the
+    // structural unification kills the defect class (any future
+    // tweak to the projection lives in one place).
     let dst_stride = size_usize * 3;
     for y_src in 0..h_usize {
       let dst_row_off = (y_off_usize + y_src) * dst_stride + x_off_usize * 3;
       for x_src in 0..w_usize {
-        let p = img.get_pixel(x_src as u32, y_src as u32);
+        let rgb = dynamic_image_rgb_pixel(&img, x_src as u32, y_src as u32);
         let off = dst_row_off + x_src * 3;
-        canvas_buf[off] = p.0[0];
-        canvas_buf[off + 1] = p.0[1];
-        canvas_buf[off + 2] = p.0[2];
+        canvas_buf[off] = rgb[0];
+        canvas_buf[off + 1] = rgb[1];
+        canvas_buf[off + 2] = rgb[2];
       }
     }
   }
@@ -731,36 +724,41 @@ pub fn pad_to_square(img: ::image::DynamicImage, fill: [u8; 3]) -> Result<::imag
 /// `Limits::default().max_alloc` guard before any decoded buffer is
 /// returned, so the `image_to_array` input is already size-bounded when
 /// it comes through that path. The `h * w * 3` f32 buffer allocated
-/// here is `4 * decoded_byte_count` (`Vec::with_capacity` does not yet
-/// allocate eagerly until the first push, and we then push exactly
-/// `total` f32s), so the upper bound is roughly `4 * 512 MiB = 2 GiB`
-/// of f32s for a decoder-default `load_image` source. Callers that
-/// hand a `DynamicImage` from a different source (raw `image::open`,
-/// network decoders, etc.) inherit whatever limit that source imposed;
-/// pre-validating `img.dimensions()` (a cheap O(1) field read) is the
-/// standard escape hatch.
-//
-// NOTE (Codex finding, rounds 1 + 2 + 3): the OOM concern across three
-// rounds. The decode-side bound is now restored at `load_image`
-// (`Limits::default().reserve(total_bytes)?` mirrors what
-// `ImageReader::decode()` does internally). The remaining `Vec<f32>`
-// allocation here is the unavoidable `decoded -> f32` widening — the
-// swift reference allocates the same buffer at `Data(count:
-// w * h * bytesPerPixel)` in `MediaProcessing.swift:176`, and the
-// python `np.asarray(image)` does too. A unilateral Rust gate on this
-// specific `Vec<f32>` would have to come with a matching gate in both
-// references; we surface the f32 allocation as the documented
-// "unavoidable resized-buffer widening" already called out in the
-// module `Conventions` block. This is a documented design choice plus
-// a now-enforced decode-side guard, not an oversight.
+/// here is the unavoidable `decoded -> f32` widening — the swift
+/// reference allocates the same buffer at `Data(count: w * h *
+/// bytesPerPixel)` in `MediaProcessing.swift:176`, and python
+/// `np.asarray(image)` does too. The upper bound is roughly
+/// `4 * 512 MiB = 2 GiB` of f32s for a decoder-default `load_image`
+/// source. Callers that hand a `DynamicImage` from a different source
+/// (raw `image::open`, network decoders, etc.) inherit whatever limit
+/// that source imposed; pre-validating `img.dimensions()` (a cheap
+/// O(1) field read) is the standard escape hatch.
+///
+/// **No infallible source clone (Codex review):** the prior
+/// implementation called `img.to_rgb8()` unconditionally as its first
+/// step. `DynamicImage::to_rgb8()` is documented as "Returns a copy
+/// of this image as an RGB image" (image 0.25
+/// `DynamicImage::to_rgb8`) — it clones the backing buffer for *every*
+/// variant including the already-`Rgb8` case (the buffer is cloned
+/// via the infallible `Vec::clone` because the underlying `RgbImage`
+/// is `Clone`). For a near-budget input (e.g. an `ImageRgb8` whose
+/// decoded buffer is ~512 MiB) this materialized a second source-sized
+/// allocation infallibly before the recoverable `try_reserve_exact`
+/// gate ever ran — `Vec::clone` aborts on allocator failure.
+/// The current implementation eliminates that second source-sized
+/// clone:
+/// 1. Reserve the output f32 buffer first via `try_reserve_exact`.
+/// 2. `as_rgb8()` fast path: read directly from the source's backing
+///    `&[u8]` (no clone) and widen to f32.
+/// 3. Non-`Rgb8` (`Luma8`/`Rgba8`/`Rgb16`/`Rgb32F`/…): per-pixel
+///    `dynamic_image_rgb_pixel` projection (shared private helper) —
+///    one `Rgba<u8>` on the stack per pixel, no intermediate
+///    full-image alloc. The same projection [`pad_to_square`]'s
+///    non-`Rgb8` branch uses, so any future tweak to the per-pixel
+///    RGB extraction lives in one place.
 pub fn image_to_array(img: &::image::DynamicImage, color_order: ColorOrder) -> Result<Array> {
-  // Force decode to an RGB8 view; this dispatches to the most efficient
-  // conversion in the `image` crate for each `DynamicImage` variant
-  // (Luma8 broadcasts grey across all 3 channels, Rgba* drops alpha,
-  // already-Rgb8 is a no-op clone). Alpha-aware variants are
-  // intentionally NOT preserved per the swift reference (line 187).
-  let rgb = img.to_rgb8();
-  let (w, h) = rgb.dimensions();
+  let w = img.width();
+  let h = img.height();
   let w_usize = w as usize;
   let h_usize = h as usize;
   // FFI-bound shape product overflow guard. `Array::from_slice` validates
@@ -768,46 +766,13 @@ pub fn image_to_array(img: &::image::DynamicImage, color_order: ColorOrder) -> R
   // *after* our cast; on a 32-bit usize the multiplication
   // `h_usize * w_usize * 3` can wrap silently. Catch it here with a
   // recoverable `Error::ShapeMismatch` so callers see a clean error rather
-  // than a panic downstream. This MUST run before `Vec::with_capacity`
-  // so a hostile dimension product cannot abort in the allocator.
+  // than a panic downstream. This MUST run before any allocation so a
+  // hostile dimension product cannot abort in the allocator.
   let total = h_usize
     .checked_mul(w_usize)
     .and_then(|hw| hw.checked_mul(3))
     .ok_or_else(|| Error::ShapeMismatch {
       message: format!("image_to_array: h*w*3 overflows usize for {h}x{w}"),
-    })?;
-  // Pre-sized `Vec<f32>` filled from `rgb.as_raw()` (`&[u8]` of length
-  // `H*W*3`, RGB-ordered) — eliminates per-element capacity re-checks
-  // versus the prior `rgb.pixels() + push` form AND lets LLVM
-  // auto-vectorize the u8 → f32 widening (the RGB path is a straight
-  // contiguous cast; the BGR path is a 3-element shuffle that
-  // `chunks_exact(3)` keeps bounded enough for unrolling). See the
-  // golden-standard `VLM-3` tracker entry for the rationale.
-  //
-  // `rgb.as_raw()` is documented to return `&[u8]` of length
-  // `width * height * 3` (image 0.25 `ImageBuffer::as_raw` /
-  // `ImageBuffer<P, Vec<P::Subpixel>>` with `P = Rgb<u8>`), so the
-  // `chunks_exact(3)` iterator yields exactly `H*W` slices of length
-  // 3 with no remainder — the BGR branch's indexed reads never panic.
-  // `image::ImageBuffer::from_raw(w, h, vec)` accepts a backing buffer
-  // whose length is AT LEAST `w * h * channels`; `as_raw()` returns the
-  // full backing Vec (including any tail past the logical extent), while
-  // the safer `pixels()` iterator slices to exactly `w * h` pixels.
-  // Slice `as_raw()` down to the logical `total = H*W*3` bytes here so
-  // the subsequent fill loop iterates the correct extent — without this
-  // slice an overlong-backing-buffer image would grow the `buf` past
-  // the `try_reserve_exact(total)` reservation via infallible allocation,
-  // reintroducing the abort-on-OOM hazard the recoverable reservation
-  // is supposed to remove. A standard `to_rgb8()` output is exactly
-  // `total` long so this is a no-op for the common path.
-  let raw = rgb
-    .as_raw()
-    .get(..total)
-    .ok_or_else(|| Error::ShapeMismatch {
-      message: format!(
-        "image_to_array: rgb backing buffer too short: {} bytes < H*W*3={total} for H={h} W={w}",
-        rgb.as_raw().len()
-      ),
     })?;
   // Recoverable OOM at the f32 widening boundary. `Vec::with_capacity`
   // would `abort()` on a hostile-but-non-overflowing image (the
@@ -816,26 +781,76 @@ pub fn image_to_array(img: &::image::DynamicImage, color_order: ColorOrder) -> R
   // allocator failure as a recoverable `Error::OutOfMemory` so callers
   // get a typed Err instead of process termination — matches the
   // allocation-discipline pattern `mlxrs::error::Error::OutOfMemory`
-  // exists for.
+  // exists for. NO `to_rgb8()` clone runs before this gate.
   let mut buf: Vec<f32> = Vec::new();
   buf
     .try_reserve_exact(total)
     .map_err(|_| Error::OutOfMemory)?;
-  match color_order {
-    ColorOrder::Rgb => {
-      // Contiguous u8 → f32 widening — LLVM auto-vectorizes this on
-      // both NEON (aarch64) and AVX2 (x86_64) backends.
-      buf.extend(raw.iter().map(|&b| f32::from(b)));
+  // Fast path: source is already `ImageRgb8`. Read its backing `&[u8]`
+  // directly (no clone, no per-pixel dispatch) and widen to f32.
+  //
+  // `as_rgb8()` returns `Option<&RgbImage>` (borrow, not clone). When
+  // `Some`, `rgb.as_raw()` is `&[u8]` with length AT LEAST
+  // `width * height * 3` — the `ImageBuffer::as_raw()` contract allows
+  // a backing buffer longer than the logical extent (callers can
+  // construct via `from_raw` with an oversized Vec). Slice to exactly
+  // `total = H*W*3` bytes via `.get(..total)` so the fill loop iterates
+  // the correct extent — without this slice an overlong-backing-buffer
+  // source would grow `buf` past the `try_reserve_exact(total)`
+  // reservation via infallible allocation, reintroducing the
+  // abort-on-OOM hazard.
+  if let Some(rgb) = img.as_rgb8() {
+    let raw = rgb
+      .as_raw()
+      .get(..total)
+      .ok_or_else(|| Error::ShapeMismatch {
+        message: format!(
+          "image_to_array: rgb backing buffer too short: {} bytes < H*W*3={total} for H={h} W={w}",
+          rgb.as_raw().len()
+        ),
+      })?;
+    match color_order {
+      ColorOrder::Rgb => {
+        // Contiguous u8 → f32 widening — LLVM auto-vectorizes this on
+        // both NEON (aarch64) and AVX2 (x86_64) backends.
+        buf.extend(raw.iter().map(|&b| f32::from(b)));
+      }
+      ColorOrder::Bgr => {
+        // Per-pixel R↔B swap. `chunks_exact(3)` yields `&[u8]` of
+        // guaranteed length 3 (verified by `as_raw().len() >= total`
+        // and the `.get(..total)` slice above), keeping the inner-loop
+        // indices bounded so LLVM can unroll the 3-element shuffle.
+        for px in raw.chunks_exact(3) {
+          buf.push(f32::from(px[2]));
+          buf.push(f32::from(px[1]));
+          buf.push(f32::from(px[0]));
+        }
+      }
     }
-    ColorOrder::Bgr => {
-      // Per-pixel R↔B swap. `chunks_exact(3)` yields `&[u8]` of
-      // guaranteed length 3 (verified by `as_raw().len() == total`
-      // above), keeping the inner-loop indices bounded so LLVM can
-      // unroll the 3-element shuffle.
-      for px in raw.chunks_exact(3) {
-        buf.push(f32::from(px[2]));
-        buf.push(f32::from(px[1]));
-        buf.push(f32::from(px[0]));
+  } else {
+    // Non-`Rgb8` source (Luma8 / Rgba8 / Rgb16 / Rgb32F / …):
+    // per-pixel `DynamicImage::get_pixel(x, y)` projection. The
+    // shared [`dynamic_image_rgb_pixel`] helper handles the
+    // alpha-drop / Luma-broadcast / 16-bit-to-8-bit / float-to-u8
+    // conversions via `image`'s `dynamic_map!` dispatch — one
+    // `Rgba<u8>` on the stack per pixel, NO intermediate
+    // source-sized RGB image allocation. Identical projection to
+    // `pad_to_square`'s non-`Rgb8` branch (same helper).
+    for y in 0..h {
+      for x in 0..w {
+        let rgb = dynamic_image_rgb_pixel(img, x, y);
+        match color_order {
+          ColorOrder::Rgb => {
+            buf.push(f32::from(rgb[0]));
+            buf.push(f32::from(rgb[1]));
+            buf.push(f32::from(rgb[2]));
+          }
+          ColorOrder::Bgr => {
+            buf.push(f32::from(rgb[2]));
+            buf.push(f32::from(rgb[1]));
+            buf.push(f32::from(rgb[0]));
+          }
+        }
       }
     }
   }
@@ -1002,6 +1017,62 @@ fn make_channel_broadcast(vals: &[f32; 3], ndim: usize, dtype: Dtype) -> Result<
   let mut buf = [1usize; MAX_NDIM];
   buf[ndim - 1] = 3;
   reshape(&a, &&buf[..ndim])
+}
+
+/// Read a single `[R, G, B]` u8 triple at `(x, y)` from a [`DynamicImage`]
+/// without materializing an intermediate full-image `RgbImage`.
+///
+/// Shared per-pixel projection for the non-`Rgb8` branches of
+/// [`pad_to_square`] and [`image_to_array`]. Both callers used to embed
+/// the same `get_pixel().0[..3]` projection inline; lifting it into one
+/// helper structurally unifies them so any future tweak (alpha
+/// premultiplication, gamma handling, etc.) lives in one place.
+///
+/// **Why not `img.to_rgb8()` once?** `DynamicImage::to_rgb8()` is
+/// documented as "Returns a copy of this image as an RGB image"
+/// (image 0.25 `DynamicImage::to_rgb8`) — it clones the backing buffer
+/// for *every* variant including the already-`Rgb8` case, via the
+/// infallible `Vec::clone`. For a near-budget input that buffer is
+/// itself hundreds of MiB, so the clone aborts the process on allocator
+/// failure — defeating the recoverable-OOM contract the two callers
+/// enforce on their *output* allocations. The per-pixel path here
+/// touches the source's already-resident memory in place (one
+/// `Rgba<u8>` on the stack per pixel) and never spawns a second
+/// source-sized copy.
+///
+/// **Color projection:** `DynamicImage::get_pixel(x, y)` returns
+/// `Rgba<u8>` regardless of the underlying variant — see image 0.25
+/// `dynimage.rs:1499-1501` for the `dynamic_map!(*self, ref p,
+/// p.get_pixel(x, y).to_rgba().into_color())` dispatch. The
+/// per-variant projections this composes through:
+///   - `ImageLuma8`: grey → broadcast to `(L, L, L, 255)`.
+///   - `ImageLumaA8`: grey + alpha → `(L, L, L, A)`.
+///   - `ImageRgb8`: `(R, G, B)` → `(R, G, B, 255)` (we don't take this
+///     path here — see `as_rgb8()` fast path in the callers).
+///   - `ImageRgba8`: identity.
+///   - `ImageRgb16` / `ImageRgba16`: 16-bit → 8-bit via the standard
+///     `Subpixel: ColorConvert` shift-down.
+///   - `ImageRgb32F` / `ImageRgba32F`: float → 8-bit via the standard
+///     clamp + scale.
+///
+/// We drop the alpha channel and return `[R, G, B]` — identical
+/// projection to the prior `to_rgb8()` call, just without the
+/// intermediate full-image allocation.
+///
+/// **Bounds:** caller must guarantee `x < img.width()` and
+/// `y < img.height()` — `DynamicImage::get_pixel` panics on
+/// out-of-bounds indices (the `image` crate documents this; the
+/// `dynamic_map!` dispatch goes through the per-variant
+/// `ImageBuffer::get_pixel` which `panics` rather than returns
+/// `Option`). Both callers iterate `0..h` × `0..w` so this is
+/// trivially satisfied.
+fn dynamic_image_rgb_pixel(img: &::image::DynamicImage, x: u32, y: u32) -> [u8; 3] {
+  // `GenericImageView` is brought into scope locally so `get_pixel`
+  // resolves on the opaque `DynamicImage` type without polluting the
+  // module-level imports.
+  use ::image::GenericImageView as _;
+  let p = img.get_pixel(x, y);
+  [p.0[0], p.0[1], p.0[2]]
 }
 
 /// Patchify `[H, W, C]` into `[H/p * W/p, p, p, C]` (ViT-style flat

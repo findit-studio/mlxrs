@@ -120,6 +120,13 @@ fn image_to_array_rgb_vs_bgr_swap() {
 fn image_to_array_drops_alpha_from_rgba() {
   // 1x1 RGBA pixel with non-trivial alpha; alpha must be dropped (per
   // swift `MediaProcessing.swift:187` `array[..., :3]`).
+  //
+  // Regression for Codex review (high): with the prior
+  // `img.to_rgb8()` clone removed, this test now exercises the
+  // non-`Rgb8` per-pixel `dynamic_image_rgb_pixel` projection rather
+  // than the fast `as_rgb8()` path. The expected `[R, G, B]` triple
+  // is unchanged because the projection is byte-equivalent to
+  // `to_rgb8()` on `Rgba8` inputs (`Rgba.to_rgb()` drops alpha).
   let mut buf = ::image::RgbaImage::new(1, 1);
   buf.put_pixel(0, 0, ::image::Rgba([11, 22, 33, 44]));
   let img = ::image::DynamicImage::ImageRgba8(buf);
@@ -127,6 +134,75 @@ fn image_to_array_drops_alpha_from_rgba() {
   assert_eq!(arr.shape(), vec![1, 1, 3], "alpha channel dropped");
   let v: Vec<f32> = arr.to_vec().unwrap();
   assert!(vclose(&v, &[11.0, 22.0, 33.0]));
+}
+
+#[test]
+fn image_to_array_luma8_broadcasts_grey_across_rgb() {
+  // Regression for Codex review (high): the non-`Rgb8` per-pixel
+  // path replaces the prior infallible `img.to_rgb8()` clone.
+  // Luma8 sources must broadcast the grey value across all three
+  // RGB channels — identical projection to what `to_rgb8()` did
+  // (image-rs's `Luma::to_rgb()` returns `(L, L, L)`).
+  let mut buf = ::image::GrayImage::new(2, 2);
+  buf.put_pixel(0, 0, ::image::Luma([10]));
+  buf.put_pixel(1, 0, ::image::Luma([50]));
+  buf.put_pixel(0, 1, ::image::Luma([100]));
+  buf.put_pixel(1, 1, ::image::Luma([200]));
+  let img = ::image::DynamicImage::ImageLuma8(buf);
+  let mut arr = image_to_array(&img, ColorOrder::Rgb).unwrap();
+  assert_eq!(arr.shape(), vec![2, 2, 3]);
+  let v: Vec<f32> = arr.to_vec().unwrap();
+  // Row-major (H=2, W=2, 3): pixel (x, y) at index `(y * W + x) * 3 + c`.
+  // Each grey value broadcasts across (R, G, B).
+  assert!(
+    vclose(
+      &v,
+      &[
+        10.0, 10.0, 10.0, // (0, 0)
+        50.0, 50.0, 50.0, // (1, 0)
+        100.0, 100.0, 100.0, // (0, 1)
+        200.0, 200.0, 200.0, // (1, 1)
+      ],
+    ),
+    "got {v:?}",
+  );
+}
+
+#[test]
+fn image_to_array_luma8_bgr_path_still_broadcasts_grey() {
+  // BGR on a Luma8 source: since L → (L, L, L), the channel swap is
+  // a no-op. Verifies the non-`Rgb8` branch handles `ColorOrder::Bgr`
+  // correctly (the per-pixel match arms).
+  let mut buf = ::image::GrayImage::new(1, 2);
+  buf.put_pixel(0, 0, ::image::Luma([77]));
+  buf.put_pixel(0, 1, ::image::Luma([200]));
+  let img = ::image::DynamicImage::ImageLuma8(buf);
+  let mut arr = image_to_array(&img, ColorOrder::Bgr).unwrap();
+  assert_eq!(arr.shape(), vec![2, 1, 3]);
+  let v: Vec<f32> = arr.to_vec().unwrap();
+  assert!(
+    vclose(&v, &[77.0, 77.0, 77.0, 200.0, 200.0, 200.0]),
+    "got {v:?}",
+  );
+}
+
+#[test]
+fn image_to_array_rgba8_bgr_swaps_channels_drops_alpha() {
+  // RGBA → BGR via the per-pixel non-`Rgb8` path. Alpha is dropped
+  // and the remaining R/G/B is swapped to B/G/R. Verifies the
+  // per-pixel `ColorOrder::Bgr` arm in the non-`Rgb8` branch.
+  let mut buf = ::image::RgbaImage::new(2, 1);
+  buf.put_pixel(0, 0, ::image::Rgba([10, 20, 30, 99]));
+  buf.put_pixel(1, 0, ::image::Rgba([40, 50, 60, 88]));
+  let img = ::image::DynamicImage::ImageRgba8(buf);
+  let mut arr = image_to_array(&img, ColorOrder::Bgr).unwrap();
+  assert_eq!(arr.shape(), vec![1, 2, 3]);
+  let v: Vec<f32> = arr.to_vec().unwrap();
+  // BGR (alpha dropped): (B=30, G=20, R=10) then (60, 50, 40).
+  assert!(
+    vclose(&v, &[30.0, 20.0, 10.0, 60.0, 50.0, 40.0]),
+    "got {v:?}",
+  );
 }
 
 #[test]
