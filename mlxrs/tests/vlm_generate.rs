@@ -1003,31 +1003,35 @@ fn vlm_generate_marker_count_mismatch_errors_before_any_image_work() {
 // ── Codex round-3: chunked prefill respects cfg.lm.prefill_step_size ──────
 
 #[test]
-fn vlm_generate_image_prompt_runs_single_forward_not_chunked() {
-  // **Bundle #62 Codex rounds 1-3 (VLM-8 escalation)**: chunked prefill
-  // is PURE-TEXT ONLY. For image prompts (image_spans non-empty) the
-  // prefill runs a SINGLE `forward_embeddings_multimodal` over the full
-  // merged sequence regardless of `prefill_step_size`. Correct chunked
-  // multimodal prefill needs a cache-offset-aware trait contract (the
-  // override would otherwise build a `[chunk × chunk]` mask where it
-  // needs `[chunk × (past + chunk)]`) AND incremental per-chunk
-  // embed/merge (the full-sequence embed/merge already incurs the
-  // O(T·D) peak before chunking) — a `Model`-trait redesign tracked +
-  // escalated as VLM-8. Single-forward is correct (full sequence +
-  // absolute spans → full mask) and faithful to mlx-vlm's full-sequence
-  // merge.
+fn vlm_generate_span_aware_chunking_never_splits_image_span() {
+  // **VLM-8 trait redesign (Codex bundle rounds 1-3 → option (b))**:
+  // chunked multimodal prefill is now offset-aware AND span-aware. It
+  // chunks by `prefill_step_size` but (1) never splits an image span
+  // across a chunk boundary — when the natural boundary lands inside a
+  // span, the chunk extends to the span end — and (2) passes
+  // chunk-local spans + `cache_offset` to `forward_embeddings_multimodal`
+  // so a mask builder sizes `[chunk × (past + chunk)]` correctly.
   //
   // prompt [1, 2, 99, 3, 4] with num_tokens_per_image=3 splices to
-  // merged = [1, 2, IMG, IMG, IMG, 3, 4] (T=7), span (2,5). Even with
-  // prefill_step_size=2, image prompts run ONE chunk of width 7.
+  // assembled = [1, 2, IMG, IMG, IMG, 3, 4] (T=7), span (2, 5).
+  // With prefill_step_size=2 the span-aware chunk boundaries are:
+  //   - [0,2): natural end=2 (span starts at 2, not split) → embed 2
+  //   - [2,5): natural end=4 would split span (2<4<5) → extend to 5;
+  //            holds the FULL image span → embed 3 (NOT 2)
+  //   - [5,7): natural end=7 → embed 2
+  // So per-chunk `forward_embeddings_multimodal` embed widths are
+  // [2, 3, 2] — the middle chunk is the full image span, proving it was
+  // never split. (A naive chunker would cut [2,2,2,1], splitting the
+  // span at position 4.) Incremental embed/merge: each chunk embeds only
+  // its own tokens, so the recorded widths are the per-chunk embed sizes.
   let model = MockVlmModel::new(5, 4, 3);
-  let dir = temp_dir("image_prompt_single_forward");
+  let dir = temp_dir("span_aware_chunking");
   let img = write_test_image(&dir, "img.png");
   let prompt = [1_u32, 2, 99, 3, 4]; // T = 7 after splice, span (2,5)
   let cfg = VlmGenConfig {
     lm: GenConfig {
       max_tokens: 1,
-      prefill_step_size: 2, // ignored for image prompts (mask-correctness)
+      prefill_step_size: 2,
       ..Default::default()
     },
     image_token_id: 99,
@@ -1039,17 +1043,23 @@ fn vlm_generate_image_prompt_runs_single_forward_not_chunked() {
   let step = it.next().expect("step").expect("ok");
   assert_eq!(step.token, 4);
 
-  // 1 chunk of width 7 (full merged sequence) — image prompts are NOT
-  // chunked, so the mask-requiring override always sees the full
-  // sequence + absolute spans.
+  // 3 chunks of embed widths [2, 3, 2] — the middle chunk holds the full
+  // 3-token image span (never split). Peak memory bounded by chunk +
+  // image features; mask coordinates correct via cache_offset.
   let calls = model.forward_emb_calls.borrow().clone();
   assert_eq!(
     calls.len(),
-    1,
-    "image prompts run a single forward (not chunked), got {} chunks",
+    3,
+    "expected 3 span-aware chunks [2,3,2], got {} chunks",
     calls.len()
   );
-  assert_eq!(calls[0], vec![1_usize, 7, 4]);
+  assert_eq!(calls[0], vec![1_usize, 2, 4]);
+  assert_eq!(
+    calls[1],
+    vec![1_usize, 3, 4],
+    "middle chunk = full image span (never split)"
+  );
+  assert_eq!(calls[2], vec![1_usize, 2, 4]);
 }
 
 // (Pure-text-through-vlm_generate chunking path: covered indirectly by
@@ -1182,9 +1192,13 @@ fn vlm_generate_threads_per_request_spans_no_cross_iterator_pollution() {
       &self,
       embeddings: &Array,
       image_spans: &[(usize, usize)],
+      _cache_offset: usize,
       cache: &mut [Box<dyn KvCache>],
     ) -> mlxrs::Result<Array> {
-      // Capture the spans this call sees.
+      // Capture the spans this call sees. With prefill_step_size >= T
+      // (the default) each prompt prefills as a single chunk at
+      // cache_offset 0, so the chunk-local spans equal the absolute
+      // spans — A sees [(0,3)], B sees [(2,5)].
       self.captured_spans.borrow_mut().push(image_spans.to_vec());
       // Default dispatch (the trait default body, since this override
       // calls the LM's `forward_embeddings`).

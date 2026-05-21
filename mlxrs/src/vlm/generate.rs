@@ -42,22 +42,26 @@
 //!    is validated to return EXACTLY `[num_tokens_per_image, D]` rows
 //!    — a model with variable-per-image counts must pad/truncate
 //!    inside its own `encode_image` to satisfy this cross-model splice
-//!    contract. The per-image slabs are concatenated along axis 0 to
-//!    `[Σ N_i, D]`.
-//! 3. *Embed + merge.* `text_embeds = model.embed_tokens(tokens_arr)` is
-//!    the LM's token lookup `[1, T, D]`. `merged =
-//!    model.merge_embeddings(text_embeds, image_embeds, image_spans)`
-//!    splices the vision features into the text-embed positions. Both
-//!    steps lazy on the returned `Array`.
-//! 4. *Chunked prefill via embeddings.* The merged sequence is sliced
-//!    along axis 1 by `cfg.lm.prefill_step_size` (mlx-vlm
-//!    `generate.py:881-901`); each chunk is fed through
-//!    `model.forward_embeddings_multimodal(chunk, image_spans, &mut cache)`.
-//!    Peak memory is bounded by `prefill_step_size * D` not `T * D` —
-//!    matters for VLMs where image placeholders inflate `T`
-//!    substantially. The FINAL chunk's last-position logits drive the
-//!    first sampler call (mlx-vlm's `_step(input_ids,
-//!    inputs_embeds=inputs_embeds)` at `generate.py:903`).
+//!    contract. The per-image slabs are kept SEPARATE (one `[N_i, D]`
+//!    Array per image), NOT pre-concatenated — the prefill gathers only
+//!    the slabs whose span falls in the current chunk (step 4).
+//! 3. *(no global embed/merge).* VLM-8: text embedding + image merge are
+//!    NOT done over the full sequence here — they happen INCREMENTALLY
+//!    per chunk in step 4, so peak memory is bounded by `prefill_step_size
+//!    · D` plus the (inherent) vision-feature slabs, not the full
+//!    `T · D` merged sequence (which the image-token expansion inflates).
+//! 4. *Offset-aware, span-aware chunked prefill (VLM-8).* The assembled
+//!    prompt is walked in chunks of `cfg.lm.prefill_step_size` that NEVER
+//!    split an image span (a boundary landing inside a span extends to
+//!    the span end). For each chunk: embed only the chunk's tokens,
+//!    merge only the image slabs whose span falls in the chunk
+//!    (chunk-local coords), then
+//!    `model.forward_embeddings_multimodal(chunk_merged, chunk_spans,
+//!    cache_offset, &mut cache)` — `cache_offset` lets a mask-requiring
+//!    override size its `[chunk × (past + chunk)]` mask correctly (see
+//!    [`crate::vlm::prompt::build_multimodal_mask_with_past`]). The FINAL
+//!    chunk's last-position logits drive the first sampler call (mlx-vlm's
+//!    `_step(input_ids, inputs_embeds=inputs_embeds)` at `generate.py:903`).
 //! 5. *Decode loop.* From token #2 onwards the loop is the standard
 //!    text-only decode — `forward(last_token[1, 1], &mut cache)` → sample →
 //!    yield — exactly the per-step order documented in
@@ -325,32 +329,18 @@ pub fn vlm_generate<'a, M: Model>(
     }
     image_slabs.push(encoded);
   }
-  // Concatenate along axis 0 — `image_embeds` is `[Σ N_i, D]`. Skipping
-  // the concat for the `images.len() == 1` case (one slab is already in
-  // the right shape) is a measurable saving on the typical single-image
-  // request.
-  let image_embeds = if image_slabs.len() == 1 {
-    // Move the one slab out — `Vec::pop` avoids an Array clone (Array
-    // intentionally has no `Clone` impl per
-    // [[feedback_allocation_discipline]] / [[project_rust_conventions]]).
-    image_slabs.pop().expect("len == 1 just confirmed")
-  } else {
-    let refs: Vec<&Array> = image_slabs.iter().collect();
-    ops::shape::concatenate(&refs, 0)?
-  };
-
-  // Build a `[1, T]` int token window for `embed_tokens` (the LM's
-  // standard embed-lookup shape, byte-identical to what
-  // `lm::generate::Generator::step` builds via its private
-  // `token_window`). We reproduce that helper here rather than exposing
-  // it from `lm::generate` because it's a one-liner and exposing it
-  // would broaden the public LM surface without a corresponding gain.
-  let token_window = {
-    let row: Vec<i32> = assembled_tokens.iter().map(|&t| t as i32).collect();
-    Array::from_slice::<i32>(&row, &(1_usize, row.len()))?
-  };
-  let text_embeds = model.embed_tokens(&token_window)?;
-  let merged = model.merge_embeddings(&text_embeds, &image_embeds, &image_spans)?;
+  // VLM-8 (offset-aware chunked multimodal prefill): we DELIBERATELY do
+  // NOT concat the slabs / embed the text / merge the full sequence here.
+  // The embed + merge happen INCREMENTALLY per chunk inside
+  // `prefill_step`, so peak memory is bounded by `prefill_step_size · D`
+  // plus the (inherent) vision-feature slabs — not by the full
+  // `T · D` merged sequence (which the image-token expansion inflates
+  // substantially). The per-image `image_slabs` are kept as-is (one
+  // `[N_i, D]` Array per image) and gathered per-chunk via the
+  // span→image-index correspondence (image `i`'s features occupy
+  // `image_spans[i]`). `encode_image` itself runs once per image above
+  // (vision encoding cannot be chunked), so the slabs' Σ N_i · D is the
+  // inherent floor; everything else is now chunk-bounded.
 
   // Build sampler + processors up front (mlx-vlm `generate_step` does
   // this the same way — see `generate.py:786-796`). Defer any error to
@@ -401,7 +391,7 @@ pub fn vlm_generate<'a, M: Model>(
       prefill_step_size: cfg.lm.prefill_step_size.max(1),
       last: None,
       prefilled: false,
-      merged_embeds: Some(merged),
+      image_slabs: Some(image_slabs),
       // Stash the per-image spans so the prefill `_step` can thread
       // them into [`Model::forward_embeddings_multimodal`] WITHOUT
       // touching `&self` — every iterator owns its own spans, so two
@@ -438,7 +428,7 @@ pub fn vlm_generate<'a, M: Model>(
       prefill_step_size: 1,
       last: None,
       prefilled: true, // skip the prefill — pending_err ends iteration first
-      merged_embeds: None,
+      image_slabs: None,
       image_spans: None,
       prompt_history: None,
       pending_err: Some(e),
@@ -481,17 +471,21 @@ struct VlmDecode<'a, M: Model> {
   /// token via the prefill's last-position logits — exactly mlx-vlm
   /// `_step(input_ids, inputs_embeds=inputs_embeds)`).
   prefilled: bool,
-  /// The merged embed sequence consumed once at prefill; `take()`n so
-  /// the storage is released after the single use (the iterator owns
-  /// only the much smaller per-step state thereafter).
-  merged_embeds: Option<Array>,
-  /// Per-image `(start, end)` spans (in axis 1 of `merged_embeds`) the
-  /// prefill threads into
+  /// Per-image vision-feature slabs (`[N_i, D]` each, output of
+  /// `encode_image`) consumed once at prefill; `take()`n so the storage
+  /// is released after the single use. Kept per-image (NOT pre-concatenated)
+  /// so [`Self::prefill_step`] can gather only the slabs whose span falls
+  /// in the current chunk and merge them incrementally (VLM-8).
+  image_slabs: Option<Vec<Array>>,
+  /// Per-image `(start, end)` ABSOLUTE spans (in the assembled prompt's
+  /// position axis) the prefill threads — shifted to chunk-local
+  /// coordinates per chunk — into
   /// [`crate::vlm::model::Model::forward_embeddings_multimodal`] so a
   /// mask-requiring model can recompute its own multimodal mask from
   /// this iterator's spans (NOT from any per-model `&self` state — that
-  /// would mix masks across concurrent / interleaved iterators). Owned
-  /// by the iterator; consumed once at prefill alongside `merged_embeds`.
+  /// would mix masks across concurrent / interleaved iterators).
+  /// `image_spans[i]` is image `i`'s span and corresponds to
+  /// `image_slabs[i]`. Owned by the iterator; consumed once at prefill.
   image_spans: Option<Vec<(usize, usize)>>,
   /// The assembled prompt token ids — fed into the prefill `_step`'s
   /// processor history (mlx-vlm `generate.py:845` accumulates
@@ -553,137 +547,128 @@ impl<M: Model> VlmDecode<'_, M> {
     Ok(GenStep { token, logprobs })
   }
 
-  /// The embed-based prefill: chunked
-  /// `forward_embeddings_multimodal(merged_embeds, image_spans, cache)`
-  /// calls (slicing the merged sequence along axis 1 by
-  /// `prefill_step_size`) to populate the cache to position T, then
-  /// sample the FIRST token from the FINAL chunk's last-position logits
-  /// and return its [`GenStep`]. Mirrors `_step(input_ids,
+  /// The embed-based prefill (VLM-8 offset-aware chunked design): walk
+  /// the assembled prompt in span-aware chunks, embedding then merging
+  /// then forwarding ONE chunk at a time, so peak memory is bounded by
+  /// `prefill_step_size · D` plus the (inherent) vision-feature slabs,
+  /// NOT the full `T · D` merged sequence. Populate the cache to
+  /// position T, then sample the FIRST token from the FINAL chunk's
+  /// last-position logits. Mirrors `_step(input_ids,
   /// inputs_embeds=inputs_embeds)` at `mlx-vlm/mlx_vlm/generate.py:903`
   /// extended with the chunked-prefill loop at
-  /// `mlx-vlm/mlx_vlm/generate.py:881-901` (so peak memory is bounded
-  /// by `prefill_step_size * D` not `T * D`, matching the LM-only
-  /// chunked-prefill memory discipline for multimodal prompts where
-  /// image placeholders inflate `T` substantially — Codex round-3
-  /// finding).
+  /// `mlx-vlm/mlx_vlm/generate.py:881-901`.
   ///
-  /// **Chunk boundaries vs image spans:** chunking is performed on the
-  /// MERGED embed sequence (post-`merge_embeddings`), so image-feature
-  /// positions are already embedded as ordinary `D`-vectors —
-  /// indistinguishable from text positions at this layer. The full
-  /// `image_spans` is threaded UNCHANGED into every chunk's
-  /// `forward_embeddings_multimodal` call: a mask-requiring per-model
-  /// override sees the iterator's spans and can compute a chunk-local
-  /// mask (it knows which positions in the current chunk fall inside
-  /// which span). For the default
-  /// `forward_embeddings_multimodal` (which dispatches to
-  /// `lm::Model::forward_embeddings` ignoring spans), chunking is a
-  /// pure memory bound — semantics unchanged.
+  /// **Two invariants make chunking correct for mask-requiring VLMs**
+  /// (the structural fix VLM-8 escalated to — Codex bundle rounds 1-3):
+  ///
+  /// 1. **Never split an image span.** When the natural
+  ///    `cursor + prefill_step_size` boundary lands strictly inside a
+  ///    span, the chunk extends to that span's end. Each span's
+  ///    bidirectional-within-image attention therefore stays in one
+  ///    forward; cross-span attention is causal (a later image's query
+  ///    attends to an earlier image whose keys are already cached).
+  /// 2. **Pass `cache_offset` + chunk-local spans.** Each chunk's
+  ///    `forward_embeddings_multimodal` receives the cache offset
+  ///    (`cursor` = tokens already cached) plus spans shifted to
+  ///    chunk-local `(s - cursor, e - cursor)` coordinates, so a
+  ///    mask-building override sizes the attention mask
+  ///    `[chunk_len × (cache_offset + chunk_len)]` over past + current
+  ///    keys (see [`crate::vlm::prompt::build_multimodal_mask_with_past`]).
+  ///
+  /// **Incremental embed/merge:** for each chunk only the chunk's text
+  /// tokens are embedded and only the image slabs whose span falls in
+  /// the chunk are merged — the full merged sequence is never
+  /// materialized. `image_slabs[i]` is image `i`'s `[N_i, D]` features
+  /// and corresponds to `image_spans[i]`.
   ///
   /// `prompt_tokens` is the assembled prompt id sequence — fed as the
   /// `step_inputs` for the prefill `_step`'s processor-history
-  /// accumulation. mlx-vlm's `_step` at `generate.py:845` does
-  /// `tokens = mx.concat([tokens, y.flatten()])` where `y` is
-  /// `input_ids` for the prefill; mirroring that exactly so the FIRST
-  /// multimodal token is subject to repetition/presence/frequency
-  /// penalties + logit-bias just like the LM-only loop and the mlx-vlm
-  /// reference. When no logits processors are configured, the history
-  /// is untouched (mlx-vlm's `if processors and len(y) > 0` guard).
-  fn prefill_step(&self, prompt_tokens: &[u32], image_spans: &[(usize, usize)]) -> Result<GenStep> {
-    let merged = self.merged_embeds.as_ref().ok_or_else(|| Error::Backend {
-      message: "vlm_generate: prefill_step called without a merged_embeds payload (internal \
-                  invariant violated — pending_err should have ended iteration first)"
-        .into(),
-    })?;
-    let shape = merged.shape();
-    let (t, d) = match shape.as_slice() {
-      [_b, t, d] => (*t, *d),
-      _ => {
-        return Err(Error::ShapeMismatch {
-          message: format!(
-            "vlm_generate: merged embeds must be rank-3 [1, T, D] before prefill, got {shape:?}"
-          ),
-        });
-      }
-    };
+  /// accumulation (mlx-vlm `generate.py:845`).
+  fn prefill_step(
+    &self,
+    prompt_tokens: &[u32],
+    image_spans: &[(usize, usize)],
+    image_slabs: &[Array],
+  ) -> Result<GenStep> {
+    let t = prompt_tokens.len();
     if t == 0 {
       return Err(Error::ShapeMismatch {
-        message: "vlm_generate: merged embed sequence is empty (T=0); prefill cannot produce \
-                  logits"
+        message: "vlm_generate: assembled prompt is empty (T=0); prefill cannot produce logits"
           .into(),
       });
     }
-    // Chunked prefill is PURE-TEXT ONLY. For image prompts
-    // (`image_spans` non-empty) the prefill runs a SINGLE
-    // `forward_embeddings_multimodal` over the full merged sequence.
-    //
-    // Why not chunk multimodal prefill (VLM-8 — escalated structural
-    // limitation, Codex bundle-#62 rounds 1-3):
-    //   - A cached chunk at offset `c` needs a `[chunk_len ×
-    //     (past_len + chunk_len)]` attention mask, but the
-    //     `forward_embeddings_multimodal(embeds, spans, cache)` contract
-    //     carries NO cache offset, so a mask-building override can only
-    //     produce a `[chunk_len × chunk_len]` local mask — wrong shape /
-    //     corrupt attention for any image span after a text prefix
-    //     (round-3 finding R3F1).
-    //   - `embed_tokens` + `merge_embeddings` already run on the FULL
-    //     `[1, T, D]` sequence above (faithful to mlx-vlm, which merges
-    //     full-sequence), so the O(T·D) peak is incurred BEFORE the
-    //     chunk loop regardless — chunking the forward alone does not
-    //     bound peak memory (round-3 finding R3F2).
-    // Correct chunked multimodal prefill therefore needs a richer trait
-    // contract (a `cache_offset`/`past_len` param + an offset-aware
-    // multimodal-mask helper + incremental per-chunk embed/merge) — a
-    // `Model`-trait redesign tracked + escalated as VLM-8. Single-forward
-    // for image prompts is correct (the override gets the full sequence
-    // + absolute spans, builds the full mask) and faithful to mlx-vlm's
-    // full-sequence merge; its peak memory equals the reference's.
-    let step = if image_spans.is_empty() {
-      self.prefill_step_size.max(1)
-    } else {
-      t.max(1) // single chunk over the whole sequence
-    };
-    let d_i32 = d as i32;
-    // Process every chunk; the FINAL chunk's last-position logits drive
-    // the first sampler call (matches mlx-vlm's behavior where the
-    // chunked-prefill loop fills the cache and the final `_step` call
-    // samples from the last forward). When `t <= step`, the loop runs
-    // exactly once with `chunk = None` (no slice allocation; pass the
-    // original merged Array by reference). For image prompts `step == t`
-    // so the loop always runs once and `image_spans` are passed
-    // absolute (matching the single full-sequence forward).
+    let step = self.prefill_step_size.max(1);
     let mut cursor: usize = 0;
     let mut last_logits: Option<Array> = None;
     while cursor < t {
-      let end = (cursor + step).min(t);
-      let chunk_owned = if cursor == 0 && end == t {
-        None
-      } else {
-        let start = [0_i32, cursor as i32, 0_i32];
-        let stop = [1_i32, end as i32, d_i32];
-        let strides = [1_i32, 1_i32, 1_i32];
-        Some(ops::indexing::slice(merged, &start, &stop, &strides)?)
+      // Invariant 1: never split a span. If the natural boundary lands
+      // strictly inside a span `(s, e)` (s < end < e), extend `end` to
+      // `e`. image_spans is small (one per image), so the scan is cheap.
+      let mut end = (cursor + step).min(t);
+      for &(s, e) in image_spans {
+        if s < end && end < e {
+          end = end.max(e);
+        }
+      }
+      let end = end.min(t);
+      let chunk_len = end - cursor;
+
+      // Embed ONLY this chunk's tokens — `[1, chunk_len, D]`. (Image
+      // placeholder ids embed to throwaway vectors that the per-chunk
+      // merge overwrites at the chunk-local span positions.)
+      let chunk_window = {
+        let row: Vec<i32> = prompt_tokens[cursor..end]
+          .iter()
+          .map(|&x| x as i32)
+          .collect();
+        Array::from_slice::<i32>(&row, &(1_usize, chunk_len))?
       };
-      let chunk_ref: &Array = chunk_owned.as_ref().unwrap_or(merged);
-      // Image prompts run as a single chunk (step == t), so `chunk_ref`
-      // IS the full merged sequence and `image_spans` are already the
-      // correct absolute coordinates. Pure-text prompts have empty
-      // `image_spans`, so the override (default impl) ignores them.
+      let chunk_text_embeds = self.model.embed_tokens(&chunk_window)?;
+
+      // Invariant 2: chunk-local spans (and the matching slabs). Image
+      // `i` is in this chunk iff `image_spans[i] ⊆ [cursor, end)`
+      // (guaranteed whole by invariant 1). Collect both in index order.
+      let mut chunk_spans: Vec<(usize, usize)> = Vec::new();
+      let mut chunk_slab_refs: Vec<&Array> = Vec::new();
+      for (i, &(s, e)) in image_spans.iter().enumerate() {
+        if cursor <= s && e <= end {
+          chunk_spans.push((s - cursor, e - cursor));
+          chunk_slab_refs.push(&image_slabs[i]);
+        }
+      }
+
+      // Merge ONLY when this chunk carries image features; a pure-text
+      // chunk's text embeds ARE its merged embeds (the default
+      // `merge_embeddings` rejects empty spans by contract).
+      let chunk_merged = if chunk_spans.is_empty() {
+        chunk_text_embeds
+      } else {
+        let chunk_image_embeds = if chunk_slab_refs.len() == 1 {
+          chunk_slab_refs[0].try_clone()?
+        } else {
+          ops::shape::concatenate(&chunk_slab_refs, 0)?
+        };
+        self
+          .model
+          .merge_embeddings(&chunk_text_embeds, &chunk_image_embeds, &chunk_spans)?
+      };
+
+      // Forward with the cache offset (= cursor) so a mask-requiring
+      // override sizes its mask over past + current keys, and chunk-local
+      // spans so its coordinates line up with `chunk_merged`.
       let logits = self.model.forward_embeddings_multimodal(
-        chunk_ref,
-        image_spans,
+        &chunk_merged,
+        &chunk_spans,
+        cursor,
         &mut self.cache.borrow_mut(),
       )?;
       // Retain only the final chunk's logits — earlier chunks just fill
       // the cache. `Option::replace` drops the prior chunk's logits
-      // immediately so peak host/GPU memory stays at one chunk's
-      // worth (mlx-vlm's `mx.clear_cache()` analogue in our
-      // explicit-eval discipline).
+      // immediately so peak host/GPU memory stays at one chunk's worth.
       last_logits = Some(logits);
       cursor = end;
     }
-    // `t > 0` is guarded above so at least one chunk ran and
-    // `last_logits` is `Some`.
+    // `t > 0` is guarded above so at least one chunk ran.
     let logits = last_logits.expect("at least one prefill chunk ran (t > 0 guarded above)");
     self.sample_from_logits(&logits, prompt_tokens)
   }
@@ -727,12 +712,12 @@ impl<M: Model> Iterator for VlmDecode<'_, M> {
       // is dropped.
       let prompt_tokens = self.prompt_history.take().unwrap_or_default();
       let spans = self.image_spans.take().unwrap_or_default();
-      let r = self.prefill_step(&prompt_tokens, &spans);
-      // Free the merged-embed payload AFTER the prefill runs (whether it
-      // succeeded or failed) — the storage isn't needed past this point.
-      // `take()` drops the `Array` (releasing its mlx-c refcount).
-      self.merged_embeds.take();
-      r
+      let slabs = self.image_slabs.take().unwrap_or_default();
+      // Free the per-image slabs AFTER the prefill runs (whether it
+      // succeeded or failed) — `slabs` is moved in and dropped at the
+      // end of this block, releasing the vision-feature Arrays' mlx-c
+      // refcounts once the prefill has consumed them.
+      self.prefill_step(&prompt_tokens, &spans, &slabs)
     } else {
       match self.last {
         Some(t) => self.decode_step(t),

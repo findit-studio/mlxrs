@@ -118,35 +118,44 @@ pub trait Model: crate::lm::model::Model {
     default_merge_embeddings(text_embeds, image_embeds, image_spans)
   }
 
-  /// Run the LM prefill over pre-merged multimodal embeddings, with
-  /// access to the per-image span layout for mask-requiring models.
+  /// Run the LM prefill over one chunk of merged multimodal embeddings,
+  /// with access to the chunk's per-image span layout AND the cache
+  /// offset for mask-requiring models.
   ///
-  /// `embeddings` is the merged sequence `[1, T, D]` (output of
-  /// [`Self::merge_embeddings`]); `image_spans` are the half-open
-  /// per-image `(start, end)` ranges in `embeddings` axis 1 (so
-  /// `Σ (end - start) == Σ encode_image rows`). `cache` is the LM's
-  /// per-layer KV cache, mutated in place.
+  /// `embeddings` is the chunk's merged sequence `[1, chunk_len, D]`
+  /// (output of [`Self::merge_embeddings`] for this chunk).
+  /// `image_spans` are the **chunk-local** half-open `(start, end)`
+  /// ranges in `[0, chunk_len)` — the caller (`vlm_generate`) shifts
+  /// absolute spans by the chunk's start offset and guarantees no span
+  /// is split across a chunk boundary. `cache_offset` is the number of
+  /// tokens ALREADY in `cache` before this chunk (the chunk's absolute
+  /// start position), so a mask-building override can size the
+  /// attention mask `[chunk_len × (cache_offset + chunk_len)]` over
+  /// past + current keys. `cache` is the LM's per-layer KV cache,
+  /// mutated in place.
   ///
   /// **Default**: dispatches to [`crate::lm::model::Model::forward_embeddings`]
-  /// — IGNORING `image_spans`. The vast majority of VLMs (Qwen-VL
-  /// family, LLaVA, Idefics, etc.) consume merged embeddings under a
-  /// pure causal attention mask, exactly like text-only generation: the
-  /// image-span identity is already baked into the merged embeddings
-  /// before the LM sees them, and no further mask work is needed.
+  /// — IGNORING `image_spans` and `cache_offset`. The vast majority of
+  /// VLMs (Qwen-VL family, LLaVA, Idefics, etc.) consume merged
+  /// embeddings under a pure causal attention mask, exactly like
+  /// text-only generation: the image-span identity is already baked into
+  /// the merged embeddings before the LM sees them, the cache's own
+  /// position bookkeeping supplies the causal offset, and no further
+  /// mask work is needed.
   ///
   /// **Override** when the model needs the multimodal mask — e.g.
   /// falcon-ocr-style models that require bidirectional attention
   /// WITHIN each image span (see
-  /// [`crate::vlm::prompt::build_multimodal_mask`] for the formula). The
-  /// per-model override receives `image_spans` directly — it does NOT
-  /// store the spans on `&self` (which would create cross-request /
-  /// interleaved-iterator hazards: two `vlm_generate` iterators
-  /// constructed against the same model with different spans, polled
-  /// out of order, would otherwise swap each other's mask state). The
-  /// override builds the mask via
-  /// [`crate::vlm::prompt::build_multimodal_mask`] and threads it into
-  /// its per-model attention layer through the model's own internal
-  /// API — never via shared mutable state on `&self`.
+  /// [`crate::vlm::prompt::build_multimodal_mask_with_past`] for the
+  /// chunked formula). The override builds the
+  /// `[chunk_len × (cache_offset + chunk_len)]` mask from the
+  /// chunk-local `image_spans` + `cache_offset` and threads it into its
+  /// per-model attention layer through the model's own internal API. It
+  /// does NOT store the spans/offset on `&self` (which would create
+  /// cross-request / interleaved-iterator hazards: two `vlm_generate`
+  /// iterators constructed against the same model, polled out of order,
+  /// would otherwise swap each other's mask state) — every per-chunk
+  /// value arrives by argument.
   ///
   /// Mirrors the per-model `__call__` that consumes
   /// `inputs_embeds=...` plus per-model mask kwargs in mlx-vlm (e.g.
@@ -156,6 +165,7 @@ pub trait Model: crate::lm::model::Model {
     &self,
     embeddings: &Array,
     _image_spans: &[(usize, usize)],
+    _cache_offset: usize,
     cache: &mut [Box<dyn crate::lm::cache::KvCache>],
   ) -> Result<Array> {
     crate::lm::model::Model::forward_embeddings(self, embeddings, cache)

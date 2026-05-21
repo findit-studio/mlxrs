@@ -15,7 +15,7 @@ use mlxrs::{
   Array, Dtype,
   vlm::prompt::{
     MarkerPolicy, MultimodalPrompt, assemble_multimodal_prompt, build_multimodal_mask,
-    insert_image_tokens, locate_image_tokens,
+    build_multimodal_mask_with_past, insert_image_tokens, locate_image_tokens,
   },
 };
 
@@ -271,6 +271,75 @@ fn build_multimodal_mask_bidirectional_within_image_span() {
       assert_eq!(v[q * 6 + k], expect, "q={q} k={k}");
     }
   }
+}
+
+#[test]
+fn build_multimodal_mask_with_past_zero_offset_equals_base() {
+  // VLM-8: `build_multimodal_mask_with_past(seq, 0, spans)` is the
+  // delegation target of `build_multimodal_mask(seq, spans)` — byte
+  // identical at past_len=0.
+  let mut base = build_multimodal_mask(6, &[(2, 5)]).unwrap();
+  let mut with_past = build_multimodal_mask_with_past(6, 0, &[(2, 5)]).unwrap();
+  assert_eq!(with_past.shape(), vec![1, 1, 6, 6]);
+  assert_eq!(flatten_mask(&mut base, 6), flatten_mask(&mut with_past, 6));
+}
+
+#[test]
+fn build_multimodal_mask_with_past_chunk_after_prefix() {
+  // VLM-8: a chunk of seq_len=3 at cache_offset=4 (4 cached past tokens)
+  // with a chunk-local image span (0,3) — the WHOLE chunk is one image.
+  // Mask shape is [1, 1, 3, 7] (3 queries × (4 past + 3 current) keys).
+  //   - past keys (k < 4): ALWAYS attend (causal — past precedes chunk).
+  //   - current keys (k >= 4): chunk-local k'=k-4; attend iff k'<=q
+  //     (causal) OR same image span (here the whole chunk is one span,
+  //     so all 3×3 current cells attend bidirectionally).
+  let past = 4usize;
+  let seq = 3usize;
+  let mut mask = build_multimodal_mask_with_past(seq, past, &[(0, 3)]).unwrap();
+  assert_eq!(mask.shape(), vec![1, 1, seq, past + seq]);
+  let v: Vec<bool> = mask.to_vec().unwrap();
+  let total_keys = past + seq;
+  for q in 0..seq {
+    for k in 0..total_keys {
+      let expect = if k < past {
+        true // past always attended
+      } else {
+        // whole chunk is one image span ⇒ bidirectional within chunk
+        true
+      };
+      assert_eq!(v[q * total_keys + k], expect, "q={q} k={k} past={past}");
+    }
+  }
+}
+
+#[test]
+fn build_multimodal_mask_with_past_text_chunk_after_prefix() {
+  // VLM-8: a pure-text chunk (no spans) of seq_len=3 at cache_offset=2.
+  // Past keys always attend; current keys are causal (k'<=q). No
+  // bidirectional block.
+  let past = 2usize;
+  let seq = 3usize;
+  let mut mask = build_multimodal_mask_with_past(seq, past, &[]).unwrap();
+  assert_eq!(mask.shape(), vec![1, 1, seq, past + seq]);
+  let v: Vec<bool> = mask.to_vec().unwrap();
+  let total_keys = past + seq;
+  for q in 0..seq {
+    for k in 0..total_keys {
+      let expect = if k < past { true } else { (k - past) <= q };
+      assert_eq!(v[q * total_keys + k], expect, "q={q} k={k}");
+    }
+  }
+}
+
+#[test]
+fn build_multimodal_mask_with_past_rejects_chunk_local_span_out_of_bounds() {
+  // A chunk-local span whose end exceeds seq_len is rejected (the
+  // caller's chunk-local shift must keep spans inside [0, seq_len)).
+  let err = build_multimodal_mask_with_past(3, 4, &[(1, 5)]).unwrap_err();
+  assert!(
+    format!("{err}").contains("end exceeds seq_len"),
+    "expected chunk-local out-of-bounds rejection, got: {err}"
+  );
 }
 
 #[test]
