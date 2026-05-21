@@ -614,10 +614,40 @@ impl<M: Model> VlmDecode<'_, M> {
     // starting offset so each chunk's `cache_offset` is ABSOLUTE
     // (`initial_offset + cursor`), not just the in-prefill `cursor` —
     // otherwise a mask-requiring override would size its mask too short
-    // against a non-empty cache (Codex VLM-8 R1F3). All layers share the
-    // same offset (they advance in lockstep); read layer 0. An empty
-    // cache reports 0, the fresh-cache common case.
-    let initial_offset = self.cache.borrow().first().map_or(0, |c| c.offset());
+    // against a non-empty cache (Codex VLM-8 R1F3).
+    //
+    // All layers advance in lockstep during generation and a faithfully
+    // saved/restored prompt cache loads every layer from the same state,
+    // so they MUST share one offset — but the cache API does not enforce
+    // that, and a corrupt/hand-built cache could differ per layer. The
+    // override receives a single scalar `cache_offset`, so a per-layer
+    // mismatch would silently size the mask wrong for some layers.
+    // Validate equality up front and fail closed (Codex VLM-8 R2F1).
+    let initial_offset = {
+      let cache = self.cache.borrow();
+      let mut iter = cache.iter();
+      match iter.next() {
+        None => 0, // no layers (degenerate); treated as offset 0
+        Some(first) => {
+          let off = first.offset();
+          for (i, layer) in iter.enumerate() {
+            if layer.offset() != off {
+              return Err(Error::ShapeMismatch {
+                message: format!(
+                  "vlm_generate: KV cache layers disagree on offset (layer 0 = {off}, layer \
+                   {} = {}); chunked-multimodal prefill needs one consistent cache offset to \
+                   size per-chunk attention masks (a faithfully restored prompt cache has all \
+                   layers at the same offset)",
+                  i + 1,
+                  layer.offset()
+                ),
+              });
+            }
+          }
+          off
+        }
+      }
+    };
     let step = self.prefill_step_size.max(1);
     let mut cursor: usize = 0;
     let mut last_logits: Option<Array> = None;
@@ -677,11 +707,22 @@ impl<M: Model> VlmDecode<'_, M> {
       // Forward with the ABSOLUTE cache offset (initial + cursor) so a
       // mask-requiring override sizes its mask over the true past +
       // current keys, and chunk-local spans so its coordinates line up
-      // with `chunk_merged`.
+      // with `chunk_merged`. `checked_add` guards a near-`usize::MAX`
+      // restored offset (recoverable error, never a debug-panic /
+      // release-wrap before the mask builder could reject it) — Codex
+      // VLM-8 R2F1.
+      let chunk_offset =
+        initial_offset
+          .checked_add(cursor)
+          .ok_or_else(|| Error::ShapeMismatch {
+            message: format!(
+              "vlm_generate: cache offset {initial_offset} + chunk cursor {cursor} overflows usize"
+            ),
+          })?;
       let logits = self.model.forward_embeddings_multimodal(
         &chunk_merged,
         &chunk_spans,
-        initial_offset + cursor,
+        chunk_offset,
         &mut self.cache.borrow_mut(),
       )?;
       // Retain only the final chunk's logits — earlier chunks just fill
