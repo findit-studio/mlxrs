@@ -16,8 +16,14 @@
 //! - Mel filterbank uses the HTK formula
 //!   (`mel = 2595 * log10(1 + hz / 700)`) and returns shape
 //!   **`(n_mels, n_fft / 2 + 1)`**.
-//! - `log_mel_spectrogram` uses `log(max(mel, EPS))` with `EPS = 1e-10`,
-//!   matching the Whisper / mlx-audio default eps for the mel front-end.
+//! - `log_mel_spectrogram` uses `log(max(mel, floor))` with `floor` chosen
+//!   via the [`LogFloor`] enum (default [`LogFloor::Whisper`] = `1e-10`,
+//!   matching the Whisper / mlx-audio front-end). [`LogFloor::Kaldi`] =
+//!   `1e-8` matches the floor literal in `mlx-audio/mlx_audio/dsp.py:950`
+//!   — floor-constant parity only; the upstream mel-filterbank
+//!   `get_mel_banks_kaldi` path is out of scope (see the per-variant
+//!   `LogFloor::Kaldi` docs). Tracks mlx-audio's literal, NOT the
+//!   upstream kaldi-asr `FbankComputer` floor of `f32::EPSILON`.
 
 use std::f32::consts::PI;
 
@@ -29,11 +35,89 @@ use crate::{
   },
 };
 
-/// Floor for `log_mel_spectrogram` (matches Whisper / mlx-audio).
-const LOG_MEL_EPS: f32 = 1e-10;
-/// HTK mel formula constants (`mel = MEL_HZ_DIV * log10(1 + hz / MEL_HZ_BREAK)`).
+/// HTK mel formula scale: `mel = MEL_HZ_DIV * log10(1 + hz / MEL_HZ_BREAK)`.
+/// Matches `mlx-audio/mlx_audio/dsp.py:510` (`hz_to_mel("htk")` branch).
 const MEL_HZ_DIV: f32 = 2595.0;
+/// HTK mel formula break frequency (Hz). Matches `mlx-audio/mlx_audio/dsp.py:510`.
 const MEL_HZ_BREAK: f32 = 700.0;
+/// Log base used by both the HTK forward formula (`log10`) and the inverse
+/// (`10^x`). Centralized so a future Slaney-style mel port stays consistent.
+const MEL_LOG_BASE: f32 = 10.0;
+
+/// Whisper-style log-mel floor used by `mlx-audio`'s Whisper / mlx-audio
+/// front-end path (`mlx-audio/mlx_audio/dsp.py` whisper-style mel path).
+const LOG_FLOOR_WHISPER: f32 = 1e-10;
+/// `mlx-audio`'s "Kaldi-style" log-mel floor: the literal `1e-8` baked into
+/// `mlx-audio/mlx_audio/dsp.py:950` after `get_mel_banks_kaldi`. NOTE this
+/// does NOT match the upstream kaldi-asr `FbankComputer` floor of
+/// `f32::EPSILON` (~`1.19e-7`) — see [`LogFloor::Kaldi`] for the rationale.
+const LOG_FLOOR_KALDI: f32 = 1e-8;
+
+/// The numerical floor applied to mel energies before `log` to avoid
+/// `log(0) = -inf` and to bound the dynamic range of the resulting
+/// log-mel feature.
+///
+/// `mlx-audio` ships two distinct log-floor conventions that differ by
+/// **2 orders of magnitude** with no rationale documented upstream —
+/// `1e-10` in the Whisper-style front-end (deeper floor, wider dynamic
+/// range) vs `1e-8` in the `get_mel_banks_kaldi` path. Mixed pipelines
+/// produce subtly different features, so we expose the choice
+/// explicitly rather than baking in either constant.
+///
+/// Defaults to [`LogFloor::Whisper`] (the mlxrs reference target;
+/// preserves the previous port's behavior byte-identically).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum LogFloor {
+  /// `1e-10` — matches `mlx-audio`'s Whisper-style mel path.
+  #[default]
+  Whisper,
+  /// `1e-8` — matches `mlx-audio/mlx_audio/dsp.py:950`'s literal floor
+  /// (the value clamped before `log` in the `get_mel_banks_kaldi` path).
+  ///
+  /// **Floor-constant parity only.** This variant changes the
+  /// `log(max(mel, floor))` clamp value to `1e-8`; the mel filterbank
+  /// produced by [`mel_filter_bank`] is still the HTK formula (see the
+  /// `# API conventions` section of this module's doc). Selecting
+  /// [`LogFloor::Kaldi`] does NOT route through `get_mel_banks_kaldi`
+  /// or otherwise reproduce the full kaldi-style mel pipeline (that
+  /// path is out of scope for this PR per the module docs).
+  ///
+  /// This deliberately tracks `mlx-audio`'s `1e-8` literal — NOT the
+  /// upstream kaldi-asr `FbankComputer` floor of `f32::EPSILON`
+  /// (~`1.19e-7`). mlxrs is a faithful port of `mlx-audio`, so floor-
+  /// constant parity for mlx-audio's two log-mel paths is the goal of
+  /// this enum.
+  Kaldi,
+  /// A custom user-chosen floor. Useful for pipelines mixing mlx-audio's
+  /// two floor choices, for floor-constant parity with upstream kaldi-asr
+  /// via `LogFloor::Custom(f32::EPSILON)` (subject to the same caveat
+  /// as [`LogFloor::Kaldi`]: this changes only the log clamp, not the
+  /// upstream mel filterbank path), or for other reproducibility-
+  /// sensitive workflows.
+  ///
+  /// Non-finite (`NaN`, `+/-inf`) and non-positive values (`<= 0.0`,
+  /// including `-0.0`) get clamped to [`f32::MIN_POSITIVE`] inside
+  /// [`LogFloor::value`] so the resulting `log(floor)` is always finite.
+  Custom(f32),
+}
+
+impl LogFloor {
+  /// The numeric floor value, guaranteed `> 0.0` and finite so
+  /// `log(floor)` is always finite.
+  pub fn value(self) -> f32 {
+    match self {
+      LogFloor::Whisper => LOG_FLOOR_WHISPER,
+      LogFloor::Kaldi => LOG_FLOOR_KALDI,
+      LogFloor::Custom(x) => {
+        if x.is_finite() && x > 0.0 {
+          x
+        } else {
+          f32::MIN_POSITIVE
+        }
+      }
+    }
+  }
+}
 
 /// Symmetric Hann window: `w[k] = 0.5 * (1 - cos(2π k / (n - 1)))` for
 /// `k in 0..n`. The first and last samples are zero.
@@ -343,7 +427,7 @@ fn hz_to_mel(hz: f32) -> f32 {
 /// Inverse HTK mel scale: `hz = 700 * (10^(mel / 2595) - 1)`.
 #[inline]
 fn mel_to_hz(mel: f32) -> f32 {
-  MEL_HZ_BREAK * (10.0_f32.powf(mel / MEL_HZ_DIV) - 1.0)
+  MEL_HZ_BREAK * (MEL_LOG_BASE.powf(mel / MEL_HZ_DIV) - 1.0)
 }
 
 /// Triangular mel filterbank matrix of shape `(n_mels, n_fft / 2 + 1)`.
@@ -521,11 +605,12 @@ pub fn mel_spectrogram(
   ops::linalg_basic::matmul(&mel, &power_t)
 }
 
-/// Log-mel spectrogram: `log(max(mel_spectrogram, 1e-10))`.
+/// Log-mel spectrogram: `log(max(mel_spectrogram, floor))` with `floor =
+/// [`LogFloor::default`]` (= `1e-10`, Whisper / mlx-audio convention).
 ///
-/// Matches the Whisper / mlx-audio convention of a fixed `EPS = 1e-10` floor
-/// before the natural log, so the output is finite (`log(eps) ≈ -23.03`)
-/// even for silence inputs.
+/// Thin forward to [`log_mel_spectrogram_with`] with the default floor —
+/// output is byte-identical to the pre-`LogFloor` behavior. Use
+/// [`log_mel_spectrogram_with`] to pick a different floor explicitly.
 ///
 /// # Errors
 /// Propagates from [`mel_spectrogram`].
@@ -540,6 +625,43 @@ pub fn log_mel_spectrogram(
   f_min: f32,
   f_max: Option<f32>,
 ) -> Result<Array> {
+  log_mel_spectrogram_with(
+    samples,
+    n_fft,
+    hop_length,
+    win_length,
+    n_mels,
+    sample_rate,
+    f_min,
+    f_max,
+    LogFloor::default(),
+  )
+}
+
+/// Log-mel spectrogram with an explicit log floor — `log(max(mel, floor.value()))`.
+///
+/// Lets the caller pick between [`LogFloor::Whisper`] (`1e-10`, the default
+/// matching the mlx-audio Whisper-style front-end), [`LogFloor::Kaldi`]
+/// (`1e-8`, matching the floor literal in `mlx-audio/mlx_audio/dsp.py:950`),
+/// or [`LogFloor::Custom`] for downstream reproducibility-sensitive
+/// workflows. See [`LogFloor`] for the rationale and the floor-constant-
+/// only scope (the mel filterbank stays the HTK one — `LogFloor::Kaldi`
+/// does NOT swap in `get_mel_banks_kaldi`).
+///
+/// # Errors
+/// Propagates from [`mel_spectrogram`].
+#[allow(clippy::too_many_arguments)]
+pub fn log_mel_spectrogram_with(
+  samples: &Array,
+  n_fft: usize,
+  hop_length: usize,
+  win_length: Option<usize>,
+  n_mels: usize,
+  sample_rate: u32,
+  f_min: f32,
+  f_max: Option<f32>,
+  floor: LogFloor,
+) -> Result<Array> {
   let mel = mel_spectrogram(
     samples,
     n_fft,
@@ -550,9 +672,9 @@ pub fn log_mel_spectrogram(
     f_min,
     f_max,
   )?;
-  // `maximum(mel, eps)` then `log`. Build `eps` as a 0-D scalar so it
-  // broadcasts against `mel`'s `(n_mels, num_frames)` shape.
-  let eps = Array::full::<f32>(&[0i32; 0], LOG_MEL_EPS)?;
+  // `maximum(mel, floor)` then `log`. Build the floor as a 0-D scalar so
+  // it broadcasts against `mel`'s `(n_mels, num_frames)` shape.
+  let eps = Array::full::<f32>(&[0i32; 0], floor.value())?;
   let floored = ops::arithmetic::maximum(&mel, &eps)?;
   floored.log()
 }
