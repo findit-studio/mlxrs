@@ -565,10 +565,20 @@ fn reflect_pad_1d(samples: &Array, padding: usize) -> Result<Array> {
 /// `num_frames = 1 + (padded_len - n_fft) / hop_length`. Matches the
 /// reference layout.
 ///
+/// **`n_fft` must be even.** The one-sided spectrum has
+/// `n_freqs == n_fft / 2 + 1` for BOTH `n_fft = 2k` and `n_fft = 2k + 1`, so
+/// the bin count cannot disambiguate an odd `n_fft` from the adjacent even
+/// length and [`istft`] (which infers `n_fft = (n_freqs - 1) * 2`, the even
+/// case) would silently misdecode an odd-`n_fft` spectrum. To keep the
+/// `stft`/`istft` pair consistently even-only, this forward `stft` rejects odd
+/// `n_fft` up front rather than emitting an un-invertible spectrum.
+///
 /// # Errors
 /// - [`Error::Backend`] when:
 ///   - `samples` is not 1-D,
 ///   - `n_fft == 0`, `hop_length == 0`, or `win_length == 0`,
+///   - `n_fft` is odd (the one-sided spectrum cannot be inverted
+///     unambiguously; see above and [`istft`]),
 ///   - `win_length > n_fft`,
 ///   - the post-pad sample count is too short to fit a single frame
 ///     (matches the reference's `Input is too short` raise),
@@ -583,6 +593,19 @@ pub fn stft(
   if n_fft == 0 {
     return Err(Error::Backend {
       message: "stft: n_fft must be > 0".into(),
+    });
+  }
+  // Reject odd `n_fft` up front (before any framing/FFT work): a one-sided
+  // real-FFT spectrum has `n_freqs == n_fft / 2 + 1` for both `n_fft = 2k` and
+  // `2k + 1`, so `istft` (which infers `n_fft = (n_freqs - 1) * 2`, the even
+  // case) cannot disambiguate odd from the adjacent even length and would
+  // silently misdecode. Keeping the producer even-only closes that path.
+  if !n_fft.is_multiple_of(2) {
+    return Err(Error::Backend {
+      message: format!(
+        "stft requires an even n_fft (got {n_fft}); odd n_fft is unsupported \
+         because the one-sided spectrum cannot be inverted unambiguously."
+      ),
     });
   }
   if hop_length == 0 {
@@ -1721,6 +1744,28 @@ mod tests {
          index 0 and must hit the coverage guard, got {res:?}"
       );
     }
+  }
+
+  #[test]
+  fn stft_rejects_odd_n_fft() {
+    // Producer-side close of the odd-`n_fft` silent-misdecode path: `istft`
+    // infers the even `n_fft = (n_freqs - 1) * 2`, so a spectrum produced from
+    // an odd `n_fft` would be misdecoded. `stft` must therefore reject odd
+    // `n_fft` up front rather than emit an un-invertible spectrum. The signal
+    // is long enough that an even `n_fft` of the same magnitude frames fine, so
+    // the rejection is specifically about parity (not input length).
+    let buf = signal_19();
+    let x = Array::from_slice::<f32>(&buf, &[buf.len() as i32]).unwrap();
+    for n_fft in [9usize, 15] {
+      let res = stft(&x, n_fft, 4, None, WindowPad::Center);
+      assert!(
+        matches!(res, Err(Error::Backend { .. })),
+        "odd n_fft={n_fft} must be rejected up front, got {res:?}"
+      );
+    }
+    // Sanity: an even n_fft (8) of comparable magnitude still succeeds, proving
+    // the rejection is parity-driven and not a length/shape failure.
+    assert!(stft(&x, 8, 4, None, WindowPad::Center).is_ok());
   }
 
   #[test]
