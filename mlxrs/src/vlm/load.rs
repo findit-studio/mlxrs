@@ -171,6 +171,27 @@ pub fn load_vlm_base_config(dir: &Path) -> Result<(VlmBaseConfig, String)> {
   };
   let mut config = VlmBaseConfig::from_json(&text)?;
 
+  // If the top-level `eos_token_id` is absent, real VLM checkpoints
+  // commonly nest it under `text_config` (the canonical mlx-vlm key) or
+  // `llm_config` (the alias mlx-vlm promotes via
+  // `config.setdefault("text_config", config.pop("llm_config", {}))` at
+  // `mlx_vlm/utils.py:239`). The per-model dataclass that mlx-vlm/-swift
+  // surfaces an `eos_token_id` off (see `mlx_vlm/utils.py:419`'s
+  // `getattr(model.config, "eos_token_id", None)`) is not constructed in
+  // this loader, so without this promotion the nested EOS would be
+  // silently dropped and the tokenizer would fall back to its
+  // `tokenizer_config` default — wrong generation stop. We promote the
+  // nested value into [`VlmBaseConfig::eos_token_id`] BEFORE applying the
+  // generation_config override (so the override still wins, exactly as it
+  // does over the top-level value). Only the aliases the references
+  // actually use (`text_config`, `llm_config`) are recognized; truthiness
+  // rules match [`crate::lm::load::read_generation_eos`] (scalar must be
+  // nonzero u32; list must be non-empty), shape-preserving (scalar →
+  // `Single`, list → `Many`).
+  if config.eos_token_id.is_none() {
+    config.eos_token_id = read_nested_eos(&text);
+  }
+
   // mlx-vlm `utils.load_config` (`mlx_vlm/utils.py:506-515`) and
   // mlx-swift-lm `VLMModelFactory._load` (`VLMModelFactory.swift:351-359`)
   // both overwrite the base config's `eos_token_id` with the
@@ -184,6 +205,50 @@ pub fn load_vlm_base_config(dir: &Path) -> Result<(VlmBaseConfig, String)> {
   }
 
   Ok((config, text))
+}
+
+/// Promote a nested `eos_token_id` out of the verbatim `config.json` JSON
+/// when the top-level value is absent: try `text_config.eos_token_id`
+/// first (mlx-vlm's canonical nested home for text-model fields), then
+/// `llm_config.eos_token_id` (the alias mlx-vlm rewrites to `text_config`
+/// via `config.setdefault("text_config", config.pop("llm_config", {}))`
+/// at `mlx_vlm/utils.py:239`). Returns `None` if neither holds a *truthy*
+/// value, matching [`crate::lm::load::read_generation_eos`]'s rules:
+/// scalar must be a nonzero `u32`; list must be non-empty; any other
+/// shape collapses to `None`. Shape is preserved (scalar → `Single`,
+/// list → `Many`). A malformed `config.json` shouldn't reach here — it
+/// would have failed [`VlmBaseConfig::from_json`] — but a re-parse
+/// failure still collapses to `None` so this layer is strictly additive.
+fn read_nested_eos(config_json: &str) -> Option<EosTokenId> {
+  let v = serde_json::from_str::<serde_json::Value>(config_json).ok()?;
+  // `text_config` first (canonical), then `llm_config` (alias) — the same
+  // precedence mlx-vlm imposes with `setdefault(text_config, pop(llm_config))`.
+  ["text_config", "llm_config"]
+    .into_iter()
+    .find_map(|key| v.get(key).and_then(|nested| nested.get("eos_token_id")))
+    .and_then(parse_truthy_eos)
+}
+
+/// Truthy-parse an `eos_token_id` JSON value with the same semantics as
+/// [`crate::lm::load::read_generation_eos`]'s match on the generation
+/// config: scalar must be a nonzero `u32` (a scalar `0` is falsy → `None`);
+/// list must be non-empty (and is preserved verbatim — a `[0, ..]` list
+/// keeps the `0`); any other shape collapses to `None`. Pulled out so the
+/// nested-EOS promotion and a future caller can share one rule.
+fn parse_truthy_eos(value: &serde_json::Value) -> Option<EosTokenId> {
+  match value {
+    serde_json::Value::Number(n) => n
+      .as_u64()
+      .filter(|&x| x != 0)
+      .and_then(|x| u32::try_from(x).ok())
+      .map(EosTokenId::Single),
+    serde_json::Value::Array(a) if !a.is_empty() => Some(EosTokenId::Many(
+      a.iter()
+        .filter_map(|e| e.as_u64().and_then(|x| u32::try_from(x).ok()))
+        .collect(),
+    )),
+    _ => None,
+  }
 }
 
 /// Re-export of [`crate::lm::factory::ModelConfiguration`] under the VLM
@@ -284,6 +349,26 @@ pub struct ProcessorConfig {
   pub processor_class: String,
 }
 
+/// A **tolerant** parse of just the registry-dispatch field
+/// (`processor_class`) off either `preprocessor_config.json` or
+/// `processor_config.json`. Tolerant because a real HF VLM dir's
+/// `preprocessor_config.json` is the *image-preprocessor* file — it
+/// commonly carries only `image_mean` / `image_std` / `crop_size` etc. and
+/// has NO `processor_class` field at all. A strict
+/// `serde_json::from_str::<ProcessorConfig>` on such a file would error
+/// even though the dispatch metadata is sitting one file over in
+/// `processor_config.json` (mlx-vlm's `AutoProcessor` config), so we
+/// instead read this `Option<String>` view and let
+/// [`load_processor_config`] orchestrate the across-files fallback for the
+/// missing dispatch key. Forward-compatible by design — every other
+/// processor-config key (image-preprocessor metadata, model-specific
+/// fields) flows opaquely to the constructor via the raw JSON body.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ProcessorClassOnly {
+  #[serde(default)]
+  processor_class: Option<String>,
+}
+
 /// Read the processor config from `dir`, preferring
 /// `preprocessor_config.json` over `processor_config.json` (mirroring
 /// mlx-swift-lm's `loadProcessorConfig` at `VLMModelFactory.swift:438-454`
@@ -302,13 +387,39 @@ pub struct ProcessorConfig {
 /// messages and the [`LoadedProcessor`] hand-off can name the file the
 /// constructor saw.
 ///
+/// **Processor DISPATCH vs IMAGE-preprocessor metadata.** A real HF VLM
+/// directory's `preprocessor_config.json` is the *image-preprocessor*
+/// file (`image_mean` / `image_std` / `crop_size` / etc.) and commonly
+/// has NO `processor_class` field — the dispatch metadata sits in a
+/// separate `processor_config.json` (the `AutoProcessor` combined
+/// config). To support both layouts the resolution order is:
+///
+/// 1. If `preprocessor_config.json` is **absent**: fall back entirely to
+///    `processor_config.json` — strict-parse it for `processor_class` and
+///    use its body as the constructor JSON. Returns
+///    `(class, body, "processor_config.json")`.
+/// 2. If `preprocessor_config.json` is **present** and tolerant-parses to
+///    a `processor_class`: use that class. Returns
+///    `(class, preprocessor_body, "preprocessor_config.json")` — the
+///    constructor gets the preprocessor body (the image-preprocessor
+///    metadata it expects).
+/// 3. If `preprocessor_config.json` is **present** but has NO
+///    `processor_class` (the image-preprocessor-only layout): read
+///    `processor_class` from `processor_config.json` for dispatch ONLY,
+///    but keep the preprocessor body for the constructor. Returns
+///    `(class_from_proc_config, preprocessor_body,
+///    "preprocessor_config.json")` — dispatch metadata and
+///    image-preprocessor metadata can come from different files, exactly
+///    as real HF VLM checkpoints ship.
+///
 /// The read is bounded by the same `MAX_CONFIG_BYTES` cap
 /// [`crate::lm::load::load_config`] uses for `config.json` and shares the
 /// same TOCTOU-closed `O_NONBLOCK`-on-unix open (a planted FIFO is
 /// rejected immediately, an oversized file is rejected before unbounded
-/// allocation). Every failure path (both files absent, non-regular,
-/// oversized, unreadable, invalid JSON, missing `processor_class`) is a
-/// recoverable [`Error::Backend`] naming the offending path.
+/// allocation). Every failure path (both files absent or both missing
+/// `processor_class`, non-regular, oversized, unreadable, invalid JSON,
+/// missing `processor_class`) is a recoverable [`Error::Backend`] naming
+/// the offending path(s).
 pub fn load_processor_config(dir: &Path) -> Result<(ProcessorConfig, String, &'static str)> {
   // Preference order matches swift `loadProcessorConfig`:
   // `preprocessor_config.json` first, then `processor_config.json`.
@@ -321,38 +432,102 @@ pub fn load_processor_config(dir: &Path) -> Result<(ProcessorConfig, String, &'s
   const PREFERRED: &str = "preprocessor_config.json";
   const FALLBACK: &str = "processor_config.json";
 
-  // The two candidate paths. We do NOT just `fs::metadata().is_file()`
-  // gate then read — that's a TOCTOU on every check — instead we try to
-  // open each in order with the same hardened open as `load_config`,
-  // accepting `ENOENT` (and on unix `ENOTDIR`/symlink-to-missing) as the
-  // "absent" signal that falls through to the next candidate.
   let preferred_path = dir.join(PREFERRED);
   let fallback_path = dir.join(FALLBACK);
 
-  let (filename, path, body) =
-    match load::read_bounded_config_file(&preferred_path, "processor config")? {
-      Some(text) => (PREFERRED, preferred_path, text),
-      None => match load::read_bounded_config_file(&fallback_path, "processor config")? {
-        Some(text) => (FALLBACK, fallback_path, text),
-        None => {
-          return Err(Error::Backend {
-            message: format!(
-              "no processor config found in {}: expected {PREFERRED} (preferred) or {FALLBACK}",
-              dir.display()
-            ),
-          });
-        }
-      },
-    };
+  // (1) Try `preprocessor_config.json` first. The TOCTOU-closed
+  // `O_NONBLOCK`-on-unix open inside `read_bounded_config_file` accepts
+  // `ENOENT` as the "absent" signal that falls through to the
+  // `processor_config.json`-only path; a NON-`ENOENT` IO failure (oversized,
+  // non-regular, planted FIFO, …) is still a hard error here, faithful to
+  // the previous behavior.
+  let preferred_body = load::read_bounded_config_file(&preferred_path, "processor config")?;
 
-  let parsed: ProcessorConfig = serde_json::from_str(&body).map_err(|e| Error::Backend {
+  if let Some(body) = preferred_body {
+    // Tolerant parse — image-preprocessor-only files (no `processor_class`)
+    // are NOT a parse error at this layer; that's the case Fix 2 unblocks.
+    // A truly malformed (non-JSON) preferred file is still an error, since
+    // the constructor would also choke on it.
+    let parsed: ProcessorClassOnly = serde_json::from_str(&body).map_err(|e| Error::Backend {
+      message: format!(
+        "invalid processor config JSON in {}: {e} (expected an OBJECT, optionally with a \
+         `processor_class` string field)",
+        preferred_path.display()
+      ),
+    })?;
+
+    if let Some(processor_class) = parsed.processor_class {
+      // (2) Preferred file has `processor_class` — use it directly. The
+      // constructor receives the same file's body, exactly as before
+      // the fix (regression cases keep working).
+      return Ok((ProcessorConfig { processor_class }, body, PREFERRED));
+    }
+
+    // (3) Preferred file is image-preprocessor-only — keep its body for
+    // the constructor (that's the image-preprocessor metadata the
+    // processor expects), but read `processor_class` from
+    // `processor_config.json` for dispatch.
+    let Some(fallback_body) = load::read_bounded_config_file(&fallback_path, "processor config")?
+    else {
+      return Err(Error::Backend {
+        message: format!(
+          "{PREFERRED} in {} has no `processor_class` field and no {FALLBACK} present to fall back \
+           to for the dispatch class",
+          dir.display()
+        ),
+      });
+    };
+    let fallback_parsed: ProcessorClassOnly =
+      serde_json::from_str(&fallback_body).map_err(|e| Error::Backend {
+        message: format!(
+          "invalid processor config JSON in {}: {e} (expected an OBJECT, optionally with a \
+           `processor_class` string field)",
+          fallback_path.display()
+        ),
+      })?;
+    let Some(processor_class) = fallback_parsed.processor_class else {
+      return Err(Error::Backend {
+        message: format!(
+          "neither {PREFERRED} nor {FALLBACK} in {} has a `processor_class` field for the \
+           dispatch class",
+          dir.display()
+        ),
+      });
+    };
+    // The constructor still sees the PREFERRED body — that's the
+    // image-preprocessor metadata it needs. Filename reflects the body
+    // source, since the constructor decodes off that.
+    return Ok((ProcessorConfig { processor_class }, body, PREFERRED));
+  }
+
+  // (4) `preprocessor_config.json` is absent — fall back entirely to
+  // `processor_config.json` (strict parse for `processor_class`, use its
+  // body as the constructor JSON).
+  let Some(body) = load::read_bounded_config_file(&fallback_path, "processor config")? else {
+    return Err(Error::Backend {
+      message: format!(
+        "no processor config found in {}: expected {PREFERRED} (preferred) or {FALLBACK}",
+        dir.display()
+      ),
+    });
+  };
+  let parsed: ProcessorClassOnly = serde_json::from_str(&body).map_err(|e| Error::Backend {
     message: format!(
-      "invalid processor config JSON in {}: {e} (expected a `processor_class` string field)",
-      path.display()
+      "invalid processor config JSON in {}: {e} (expected an OBJECT, optionally with a \
+       `processor_class` string field)",
+      fallback_path.display()
     ),
   })?;
-
-  Ok((parsed, body, filename))
+  let Some(processor_class) = parsed.processor_class else {
+    return Err(Error::Backend {
+      message: format!(
+        "{FALLBACK} in {} has no `processor_class` field for the dispatch class \
+         (and no {PREFERRED} present to fall back from)",
+        dir.display()
+      ),
+    });
+  };
+  Ok((ProcessorConfig { processor_class }, body, FALLBACK))
 }
 
 /// Everything [`load()`] resolved from a VLM model directory's *model*
@@ -1749,6 +1924,452 @@ mod tests {
     assert!(
       msg.contains("hidden_size") || msg.contains("missing field"),
       "LM Config parse error should name the missing LM field, got: {msg}"
+    );
+  }
+
+  // ────────────────────────────────────────────────────────────────────
+  // Fix 1: nested-EOS promotion regression tests.
+  // ────────────────────────────────────────────────────────────────────
+
+  /// Write a `tokenizer_config.json` that pins the tokenizer-config
+  /// fallback EOS to vocab id 2 (the `"c"` token in [`write_tokenizer`]'s
+  /// 3-token WordLevel vocab). Used by the nested-EOS tests to prove the
+  /// promoted nested EOS REPLACES this fallback (rather than the
+  /// tokenizer silently dropping the nested value and defaulting to id 2).
+  fn write_tokenizer_config_with_eos_c(dir: &Path) {
+    std::fs::write(dir.join("tokenizer_config.json"), r#"{ "eos_token": "c" }"#).unwrap();
+  }
+
+  #[test]
+  fn nested_text_config_eos_promotes_to_tokenizer() {
+    // Real VLM layout: NO top-level `eos_token_id`, but `text_config`
+    // carries a list `[42, 50]`. The tokenizer_config pins a different
+    // fallback EOS (`"c"` → id 2). After load, the tokenizer's COMPLETE
+    // eos set MUST be exactly {42, 50} — the nested promotion happened
+    // and REPLACED the tokenizer-config default. Before Fix 1, the
+    // nested value was silently dropped → eos set = {2}, wrong generation
+    // stop.
+    let dir = fresh_dir("nested-text-config-eos");
+    let cfg = r#"{
+      "model_type": "mockvlm",
+      "text_config": {
+        "hidden_size": 8,
+        "vocab_size": 5,
+        "eos_token_id": [42, 50]
+      },
+      "mock_extra": 11
+    }"#;
+    std::fs::write(dir.join("config.json"), cfg).unwrap();
+    std::fs::write(
+      dir.join("preprocessor_config.json"),
+      mock_preprocessor_config_json("MockProc", 24),
+    )
+    .unwrap();
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "mock.weight".to_owned(),
+      Array::from_slice::<f32>(&[1.0], &(1usize,)).unwrap(),
+    );
+    crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+    write_tokenizer(&dir);
+    write_tokenizer_config_with_eos_c(&dir);
+
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", mock_processor_constructor());
+    let configuration = VlmModelConfiguration::from_directory(&dir);
+
+    let ctx = load(&configuration, &model_registry, &processor_registry)
+      .expect("nested text_config.eos_token_id should promote");
+
+    // Base config carries the promoted [42, 50] list (shape-preserved).
+    assert_eq!(
+      ctx.config.eos_token_id,
+      Some(EosTokenId::Many(vec![42, 50])),
+      "VlmBaseConfig should carry the promoted text_config.eos_token_id list"
+    );
+    // Tokenizer's COMPLETE eos set is exactly {42, 50} — the
+    // tokenizer-config default ({2}) was REPLACED, not unioned.
+    let eos_set = ctx.tokenizer.eos_token_ids();
+    let mut eos_vec: Vec<u32> = eos_set.iter().copied().collect();
+    eos_vec.sort_unstable();
+    assert_eq!(
+      eos_vec,
+      vec![42u32, 50],
+      "tokenizer eos set should be exactly the promoted {{42, 50}}, not the tokenizer-config fallback"
+    );
+  }
+
+  #[test]
+  fn top_level_eos_wins_over_nested_text_config_eos() {
+    // Top-level `eos_token_id = 7` is present AND `text_config.eos_token_id
+    // = [42, 50]` is present — top-level MUST win (the nested promotion
+    // only triggers when the top-level is `None`). Faithful to swift
+    // `BaseConfiguration`'s top-level-only decode (`MLXLMCommon/BaseConfiguration.swift:192-208`).
+    let dir = fresh_dir("top-eos-wins-over-nested");
+    let cfg = r#"{
+      "model_type": "mockvlm",
+      "eos_token_id": 7,
+      "text_config": {
+        "hidden_size": 8,
+        "vocab_size": 5,
+        "eos_token_id": [42, 50]
+      },
+      "mock_extra": 11
+    }"#;
+    std::fs::write(dir.join("config.json"), cfg).unwrap();
+    std::fs::write(
+      dir.join("preprocessor_config.json"),
+      mock_preprocessor_config_json("MockProc", 24),
+    )
+    .unwrap();
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "mock.weight".to_owned(),
+      Array::from_slice::<f32>(&[1.0], &(1usize,)).unwrap(),
+    );
+    crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+    write_tokenizer(&dir);
+
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", mock_processor_constructor());
+    let configuration = VlmModelConfiguration::from_directory(&dir);
+
+    let ctx = load(&configuration, &model_registry, &processor_registry)
+      .expect("top-level eos with nested present");
+
+    assert_eq!(
+      ctx.config.eos_token_id,
+      Some(EosTokenId::Single(7)),
+      "top-level eos_token_id must win over nested text_config.eos_token_id"
+    );
+    let eos_set = ctx.tokenizer.eos_token_ids();
+    assert_eq!(
+      eos_set.iter().copied().collect::<Vec<_>>(),
+      vec![7u32],
+      "tokenizer eos set must be the top-level {{7}}, not nested {{42, 50}}"
+    );
+  }
+
+  #[test]
+  fn generation_config_eos_overrides_promoted_nested_eos() {
+    // Promotion happens BEFORE the generation_config override: nested
+    // `text_config.eos_token_id = [42, 50]` is promoted, but
+    // `generation_config.json eos_token_id = 9` then overrides on top —
+    // exactly the same precedence Python's
+    // `mlx_vlm/utils.py:506-515` block has for the top-level
+    // `eos_token_id`.
+    let dir = fresh_dir("gen-cfg-overrides-promoted-nested");
+    let cfg = r#"{
+      "model_type": "mockvlm",
+      "text_config": {
+        "hidden_size": 8,
+        "vocab_size": 5,
+        "eos_token_id": [42, 50]
+      },
+      "mock_extra": 11
+    }"#;
+    std::fs::write(dir.join("config.json"), cfg).unwrap();
+    std::fs::write(dir.join("generation_config.json"), r#"{"eos_token_id": 9}"#).unwrap();
+    std::fs::write(
+      dir.join("preprocessor_config.json"),
+      mock_preprocessor_config_json("MockProc", 24),
+    )
+    .unwrap();
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "mock.weight".to_owned(),
+      Array::from_slice::<f32>(&[1.0], &(1usize,)).unwrap(),
+    );
+    crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+    write_tokenizer(&dir);
+
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", mock_processor_constructor());
+    let configuration = VlmModelConfiguration::from_directory(&dir);
+
+    let ctx = load(&configuration, &model_registry, &processor_registry)
+      .expect("generation_config override over promoted nested eos");
+
+    assert_eq!(
+      ctx.config.eos_token_id,
+      Some(EosTokenId::Single(9)),
+      "generation_config.json eos_token_id must override the promoted nested value"
+    );
+    let eos_set = ctx.tokenizer.eos_token_ids();
+    assert_eq!(
+      eos_set.iter().copied().collect::<Vec<_>>(),
+      vec![9u32],
+      "tokenizer eos set must be the post-override {{9}}, not the promoted nested set"
+    );
+  }
+
+  #[test]
+  fn nested_llm_config_eos_promotes_when_text_config_absent() {
+    // `llm_config` is the alias mlx-vlm rewrites to `text_config` via
+    // `config.setdefault("text_config", config.pop("llm_config", {}))`
+    // (`mlx_vlm/utils.py:239`). When the checkpoint only has the alias
+    // and no canonical `text_config`, the nested-EOS promotion must still
+    // pick the alias up so the tokenizer's eos set reflects it.
+    let dir = fresh_dir("nested-llm-config-eos");
+    // `vocab_size` at top level since the mock constructor only knows
+    // top-level + `text_config.vocab_size`; the alias key is incidental
+    // to this EOS-promotion test.
+    let cfg = r#"{
+      "model_type": "mockvlm",
+      "vocab_size": 5,
+      "llm_config": {
+        "hidden_size": 8,
+        "eos_token_id": [11, 13]
+      },
+      "mock_extra": 11
+    }"#;
+    std::fs::write(dir.join("config.json"), cfg).unwrap();
+    std::fs::write(
+      dir.join("preprocessor_config.json"),
+      mock_preprocessor_config_json("MockProc", 24),
+    )
+    .unwrap();
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "mock.weight".to_owned(),
+      Array::from_slice::<f32>(&[1.0], &(1usize,)).unwrap(),
+    );
+    crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+    write_tokenizer(&dir);
+
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", mock_processor_constructor());
+    let configuration = VlmModelConfiguration::from_directory(&dir);
+
+    let ctx = load(&configuration, &model_registry, &processor_registry)
+      .expect("nested llm_config.eos_token_id alias should promote");
+
+    assert_eq!(
+      ctx.config.eos_token_id,
+      Some(EosTokenId::Many(vec![11, 13])),
+      "VlmBaseConfig should carry the promoted llm_config.eos_token_id list"
+    );
+  }
+
+  #[test]
+  fn text_config_eos_wins_over_llm_config_alias_when_both_present() {
+    // mlx-vlm's `setdefault(text_config, pop(llm_config))` makes
+    // `text_config` the canonical destination (an existing `text_config`
+    // is preserved, the `llm_config` alias is only consulted as a
+    // fallback). Our promotion mirrors that precedence: when BOTH nested
+    // blocks are present and carry different EOS values, `text_config`
+    // wins.
+    let dir = fresh_dir("text-config-wins-over-llm-config");
+    let cfg = r#"{
+      "model_type": "mockvlm",
+      "text_config": {
+        "hidden_size": 8,
+        "vocab_size": 5,
+        "eos_token_id": [42, 50]
+      },
+      "llm_config": {
+        "eos_token_id": [11, 13]
+      },
+      "mock_extra": 11
+    }"#;
+    std::fs::write(dir.join("config.json"), cfg).unwrap();
+    std::fs::write(
+      dir.join("preprocessor_config.json"),
+      mock_preprocessor_config_json("MockProc", 24),
+    )
+    .unwrap();
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "mock.weight".to_owned(),
+      Array::from_slice::<f32>(&[1.0], &(1usize,)).unwrap(),
+    );
+    crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+    write_tokenizer(&dir);
+
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", mock_processor_constructor());
+    let configuration = VlmModelConfiguration::from_directory(&dir);
+
+    let ctx = load(&configuration, &model_registry, &processor_registry)
+      .expect("text_config should win over llm_config alias when both present");
+
+    assert_eq!(
+      ctx.config.eos_token_id,
+      Some(EosTokenId::Many(vec![42, 50])),
+      "text_config.eos_token_id must take precedence over llm_config.eos_token_id"
+    );
+  }
+
+  #[test]
+  fn falsy_nested_eos_does_not_promote() {
+    // Truthiness rules match `read_generation_eos`: a scalar `0` is
+    // falsy, an empty list is falsy. Either way the promotion must
+    // collapse to `None` and the tokenizer falls back to its own
+    // `eos_token` from `tokenizer_config.json` (id 2 here). Pinning this
+    // protects against a future change that drops the truthy filter and
+    // starts forwarding `0`-shaped EOS to the tokenizer.
+    let dir = fresh_dir("falsy-nested-eos");
+    let cfg = r#"{
+      "model_type": "mockvlm",
+      "text_config": {
+        "hidden_size": 8,
+        "vocab_size": 5,
+        "eos_token_id": 0
+      },
+      "mock_extra": 11
+    }"#;
+    std::fs::write(dir.join("config.json"), cfg).unwrap();
+    std::fs::write(
+      dir.join("preprocessor_config.json"),
+      mock_preprocessor_config_json("MockProc", 24),
+    )
+    .unwrap();
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "mock.weight".to_owned(),
+      Array::from_slice::<f32>(&[1.0], &(1usize,)).unwrap(),
+    );
+    crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+    write_tokenizer(&dir);
+    write_tokenizer_config_with_eos_c(&dir);
+
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", mock_processor_constructor());
+    let configuration = VlmModelConfiguration::from_directory(&dir);
+
+    let ctx = load(&configuration, &model_registry, &processor_registry).expect("falsy eos");
+
+    // Promotion collapses to `None`, tokenizer falls back to its own
+    // `eos_token` ("c" → id 2 from the tokenizer_config above).
+    assert_eq!(
+      ctx.config.eos_token_id, None,
+      "scalar 0 nested eos must not promote (falsy)"
+    );
+    let eos_set = ctx.tokenizer.eos_token_ids();
+    assert_eq!(
+      eos_set.iter().copied().collect::<Vec<_>>(),
+      vec![2u32],
+      "tokenizer should fall back to its tokenizer_config `eos_token` when nested is falsy"
+    );
+  }
+
+  // ────────────────────────────────────────────────────────────────────
+  // Fix 2: preprocessor + processor_config dispatch fallback.
+  // ────────────────────────────────────────────────────────────────────
+
+  /// A minimal **image-preprocessor-only** `preprocessor_config.json` —
+  /// the real HF VLM layout: `image_mean` / `image_std` and a
+  /// model-specific `mock_image_size`, NO `processor_class`. Used by the
+  /// Fix 2 regression case where dispatch metadata must come from
+  /// `processor_config.json` instead.
+  fn mock_image_only_preprocessor_config_json(image_size: u32) -> String {
+    format!(
+      r#"{{
+        "image_mean": [0.5, 0.5, 0.5],
+        "image_std": [0.5, 0.5, 0.5],
+        "mock_image_size": {image_size}
+      }}"#
+    )
+  }
+
+  /// A `processor_config.json` carrying ONLY the dispatch class — the
+  /// `AutoProcessor`-style combined config from real HF VLM checkpoints.
+  fn mock_processor_class_only_config_json(processor_class: &str) -> String {
+    format!(r#"{{ "processor_class": "{processor_class}" }}"#)
+  }
+
+  #[test]
+  fn processor_class_falls_back_to_processor_config_when_preprocessor_has_none() {
+    // **Regression** for Codex Fix 2: real HF VLM dir where the
+    // preprocessor file carries ONLY image-preprocessor metadata (no
+    // `processor_class`) and `processor_config.json` carries the dispatch
+    // class. Before the fix, the strict parse of `preprocessor_config.json`
+    // failed immediately → `processor_config.json` was never tried →
+    // otherwise-loadable VLM dir was rejected. After the fix: dispatch
+    // class comes from `processor_config.json`, but the constructor still
+    // sees the `preprocessor_config.json` body (image-preprocessor
+    // metadata) — its `mock_image_size = 24` round-trips through the
+    // mock processor, proving the constructor body source.
+    let dir = fresh_dir("split-dispatch-preprocessor-no-class");
+    std::fs::write(dir.join("config.json"), mock_config_json("mockvlm")).unwrap();
+    std::fs::write(
+      dir.join("preprocessor_config.json"),
+      mock_image_only_preprocessor_config_json(24),
+    )
+    .unwrap();
+    std::fs::write(
+      dir.join("processor_config.json"),
+      mock_processor_class_only_config_json("MockProc"),
+    )
+    .unwrap();
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "mock.weight".to_owned(),
+      Array::from_slice::<f32>(&[1.0], &(1usize,)).unwrap(),
+    );
+    crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+    write_tokenizer(&dir);
+
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", mock_processor_constructor());
+    let configuration = VlmModelConfiguration::from_directory(&dir);
+
+    let ctx = load(&configuration, &model_registry, &processor_registry)
+      .expect("dispatch class from processor_config.json + body from preprocessor_config.json");
+
+    // The mock processor recorded the `mock_image_size = 24` it decoded
+    // off the body — i.e. the constructor received the
+    // `preprocessor_config.json` body (which has `mock_image_size`), NOT
+    // the `processor_config.json` body (which has only
+    // `processor_class`). Round-trip proof that the split-source
+    // dispatch picked the right body.
+    assert_eq!(
+      ctx.processor.image_processor_config().size,
+      (24, 24),
+      "constructor must see preprocessor_config.json body (image-preprocessor metadata)"
+    );
+  }
+
+  #[test]
+  fn neither_processor_config_file_has_processor_class_is_recoverable_error() {
+    // Both files present, NEITHER has `processor_class`. The error must
+    // be a recoverable `Backend` naming the dir; we additionally check the
+    // message identifies the missing dispatch field so an operator can
+    // diagnose without source-diving.
+    let dir = fresh_dir("neither-has-processor-class");
+    std::fs::write(dir.join("config.json"), mock_config_json("mockvlm")).unwrap();
+    std::fs::write(
+      dir.join("preprocessor_config.json"),
+      mock_image_only_preprocessor_config_json(16),
+    )
+    .unwrap();
+    std::fs::write(
+      dir.join("processor_config.json"),
+      r#"{ "some_other_key": 1 }"#,
+    )
+    .unwrap();
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry = VlmProcessorTypeRegistry::new();
+    let configuration = VlmModelConfiguration::from_directory(&dir);
+
+    let Err(err) = load(&configuration, &model_registry, &processor_registry) else {
+      panic!("missing-processor-class across both files must error");
+    };
+    let msg = err.to_string();
+    assert!(
+      msg.contains("processor_class") || msg.contains("dispatch class"),
+      "error should name the missing dispatch field, got: {msg}"
+    );
+    assert!(
+      msg.contains("preprocessor_config.json") && msg.contains("processor_config.json"),
+      "error should name both candidate filenames, got: {msg}"
     );
   }
 }
