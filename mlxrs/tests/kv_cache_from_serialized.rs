@@ -11,16 +11,19 @@
 //!    with a deliberately malformed `meta`, assert `Err`, then re-read
 //!    `state()` / `meta_state()` and assert they equal the snapshot.
 //!
-//! This file covers concrete cache implementations under their current
-//! `from_serialized` behavior. It does not claim coverage of the trait-
-//! default sequential-setter implementation.
+//! Each concrete cache is tested under its own (overriding)
+//! `from_serialized`. The trait-DEFAULT sequential-setter implementation
+//! — which no concrete cache uses, since all 8 override it — is covered
+//! separately via [`DefaultProbeCache`], a minimal test-only `KvCache`
+//! that inherits the default and records its `set_state` → `set_meta_state`
+//! call order.
 
 #![cfg(feature = "lm")]
 
 use mlxrs::{
   Array,
   lm::cache::{
-    ArraysCache, BatchKvCache, BatchRotatingKvCache, CacheList, ChunkedKvCache, KvCache,
+    ArraysCache, BatchKvCache, BatchRotatingKvCache, CacheList, ChunkedKvCache, KvCache, MaskMode,
     QuantizedKvCache, QuantizedKvCacheImpl, RotatingKvCache, StandardKvCache,
   },
 };
@@ -83,11 +86,72 @@ fn assert_state_eq_mixed_kv_then_i32(
 // 1. The trait default — sequential set_state then set_meta_state.
 // ----------------------------------------------------------------------
 
+/// A minimal `KvCache` that does NOT override `from_serialized`, so the
+/// **trait-default** implementation (sequential `set_state` then
+/// `set_meta_state`) is actually exercised. Every concrete cache now
+/// overrides `from_serialized`, so without this probe the default path
+/// would be untested (Copilot #62 finding). The setters record their
+/// call order so a test can assert the default's sequencing; all other
+/// required methods are unreachable in that single code path.
+#[derive(Default)]
+struct DefaultProbeCache {
+  calls: Vec<&'static str>,
+}
+
+impl KvCache for DefaultProbeCache {
+  fn offset(&self) -> usize {
+    0
+  }
+  fn update(&mut self, _k: &Array, _v: &Array) -> mlxrs::Result<(Array, Array)> {
+    unreachable!("DefaultProbeCache::update is not exercised by the from_serialized default test")
+  }
+  fn state(&self) -> mlxrs::Result<Vec<Array>> {
+    Ok(Vec::new())
+  }
+  fn set_state(&mut self, _state: Vec<Array>) -> mlxrs::Result<()> {
+    self.calls.push("set_state");
+    Ok(())
+  }
+  fn set_meta_state(&mut self, _m: &[String]) -> mlxrs::Result<()> {
+    self.calls.push("set_meta_state");
+    Ok(())
+  }
+  fn make_mask(&self, _n: usize, _w: Option<usize>, _r: bool) -> mlxrs::Result<MaskMode> {
+    unreachable!("DefaultProbeCache::make_mask is not exercised")
+  }
+  fn nbytes(&self) -> usize {
+    0
+  }
+  fn is_empty(&self) -> bool {
+    true
+  }
+  fn copy(&self) -> mlxrs::Result<Box<dyn KvCache>> {
+    unreachable!("DefaultProbeCache::copy is not exercised")
+  }
+}
+
 #[test]
-fn default_impl_calls_set_state_then_meta() {
-  // StandardKvCache has trivial meta (always `[]`) and inherits the
-  // default `from_serialized`. A round-trip via the default verifies the
-  // sequential setter chain matches mlx-lm `cache.py:170-175`.
+fn trait_default_from_serialized_calls_set_state_then_meta() {
+  // The trait-DEFAULT `from_serialized` (used by no concrete cache —
+  // all 8 override it) must call `set_state` THEN `set_meta_state`,
+  // faithful to mlx-lm `cache.py:170-175`. `DefaultProbeCache` is the
+  // only impl that inherits the default, so it's the sole coverage of
+  // this ordering (Copilot #62 finding).
+  let mut probe = DefaultProbeCache::default();
+  probe.from_serialized(vec![kv(&[0.0])], &[]).unwrap();
+  assert_eq!(
+    probe.calls,
+    vec!["set_state", "set_meta_state"],
+    "trait-default from_serialized must call set_state then set_meta_state, in order"
+  );
+}
+
+#[test]
+fn standard_kvcache_from_serialized_round_trip() {
+  // StandardKvCache OVERRIDES `from_serialized` (staged set_state +
+  // set_meta_state, committed on success). This verifies that override's
+  // round-trip; the trait-DEFAULT path is covered separately by
+  // `trait_default_from_serialized_calls_set_state_then_meta` above.
   let mut original = StandardKvCache::new();
   let (_, _) = original
     .update(&kv(&[0.0, 1.0, 2.0, 3.0]), &kv(&[0.0, 1.0, 2.0, 3.0]))
@@ -660,7 +724,9 @@ fn standard_from_serialized_nonempty_meta_leaves_self_unchanged() {
   // serialized state. The override stages + commits, so a non-empty
   // meta now rolls back cleanly.
   let mut cache = StandardKvCache::new();
-  cache.update(&kv(&[10.0, 11.0]), &kv(&[10.0, 11.0])).unwrap();
+  cache
+    .update(&kv(&[10.0, 11.0]), &kv(&[10.0, 11.0]))
+    .unwrap();
   let original_offset = cache.offset();
   let mut original_state = cache.state().unwrap();
 
@@ -670,7 +736,10 @@ fn standard_from_serialized_nonempty_meta_leaves_self_unchanged() {
   let bad_state = vec![kv(&[99.0, 88.0]), kv(&[99.0, 88.0])];
   let bad_meta: Vec<String> = vec!["bogus".into()];
   let result = cache.from_serialized(bad_state, &bad_meta);
-  assert!(result.is_err(), "must reject non-empty meta on StandardKvCache");
+  assert!(
+    result.is_err(),
+    "must reject non-empty meta on StandardKvCache"
+  );
 
   // Cache state is byte-identical to its pre-call configuration.
   assert_eq!(cache.offset(), original_offset);
@@ -693,8 +762,7 @@ fn rotating_from_serialized_empty_state_nonzero_meta_rejected() {
   // structurally impossible from a real round-trip (keys=None ⇒
   // offset==idx==0). `from_state` rejects this; `from_serialized` must too.
   let bad_state: Vec<Array> = Vec::new();
-  let bad_meta: Vec<String> =
-    vec!["4".into(), "8".into(), "5".into(), "5".into()];
+  let bad_meta: Vec<String> = vec!["4".into(), "8".into(), "5".into(), "5".into()];
   let result = cache.from_serialized(bad_state, &bad_meta);
   assert!(result.is_err(), "must reject empty state + non-zero meta");
 
@@ -753,8 +821,7 @@ fn batch_rotating_from_serialized_structural_inconsistency_rejected() {
   // structural guard rejects "_idx > L" — a write cursor past the
   // physical buffer end, impossible from a real round-trip.
   let saved_state = cache.state().unwrap();
-  let bad_meta: Vec<String> =
-    vec!["4".into(), "2".into(), "99".into(), "false".into()];
+  let bad_meta: Vec<String> = vec!["4".into(), "2".into(), "99".into(), "false".into()];
   let result = cache.from_serialized(saved_state, &bad_meta);
   assert!(
     result.is_err(),
