@@ -393,7 +393,7 @@ pub fn pool(
   apply_layer_norm: bool,
   apply_rms_norm: bool,
 ) -> Result<Array> {
-  let mut pooled = match strategy {
+  let pooled = match strategy {
     PoolingStrategy::Mean => mean_pooling(token_embeddings, attention_mask)?,
     PoolingStrategy::Max => max_pooling(token_embeddings, attention_mask)?,
     PoolingStrategy::Last => last_token_pooling(token_embeddings, attention_mask)?,
@@ -402,6 +402,45 @@ pub fn pool(
     PoolingStrategy::None => token_embeddings.try_clone()?,
   };
 
+  pool_post(
+    pooled,
+    normalize,
+    dimension,
+    apply_layer_norm,
+    apply_rms_norm,
+  )
+}
+
+/// Apply the post-pooling tail of [`pool`] to an **already-pooled** vector:
+/// fused LayerNorm/RMSNorm → matryoshka `dimension` truncation → L2-normalize,
+/// in swift `Pooling.callAsFunction`'s order (steps 2–4 of [`pool`]).
+///
+/// This is the shared tail [`pool`] runs after the strategy reduction. It is
+/// factored out so callers that already hold a pooled vector — notably
+/// [`encode`](super::encode::encode) when a model emits a trained
+/// [`pooled_output`](super::model::EmbeddingModelOutput::pooled_output) for
+/// the [`Cls`](PoolingStrategy::Cls) / [`None`](PoolingStrategy::None) paths
+/// (swift `inputs.pooledOutput ?? …`) — apply the *same* normalize / dimension
+/// / layer-norm steps without re-deriving a pooled vector from hidden states.
+///
+/// `pooled` is consumed: when no transform applies it is returned unchanged
+/// (no copy), matching the by-value `pool` tail.
+///
+/// - `pooled`: an already-pooled `(batch, hidden)` (or any-rank) vector
+/// - `normalize`: L2-normalize the result (swift `normalize:`)
+/// - `dimension`: optional matryoshka last-dim truncation (swift
+///   `Pooling.dimension`)
+/// - `apply_layer_norm`: pre-truncation fused LayerNorm (swift
+///   `applyLayerNorm:`)
+/// - `apply_rms_norm`: pre-truncation fused RMSNorm (mlx-c-surfaced variant;
+///   ignored if `apply_layer_norm` is also `true`)
+pub fn pool_post(
+  mut pooled: Array,
+  normalize: bool,
+  dimension: Option<usize>,
+  apply_layer_norm: bool,
+  apply_rms_norm: bool,
+) -> Result<Array> {
   if apply_layer_norm {
     pooled = layer_norm(&pooled, None, None, LAYER_NORM_EPS)?;
   } else if apply_rms_norm {
