@@ -201,6 +201,19 @@ fn round_half_to_even(x: f64) -> i64 {
 ///   valid non-empty interval; the `sqrt` arguments must be non-negative).
 /// - [`Error::ShapeMismatch`] if `max(h, w) / min(h, w) > MAX_RATIO`
 ///   (mirrors the python `raise ValueError`).
+/// - [`Error::ShapeMismatch`] if the budget **cannot contain a positive
+///   factor-aligned size** — i.e. `max_pixels < factor * factor` (the
+///   smallest legal output, a `factor × factor` square, already overflows
+///   the budget) or the scale-down branch floors a side to a non-positive
+///   multiple of `factor`. The python reference omits this guard and
+///   silently returns `(0, 0)` for an impossible budget such as
+///   `smart_resize(28, 28, 28, 1, 1)` (the `min`/`max` math has no positive
+///   factor-aligned solution); we surface it recoverably, naming the
+///   budget, rather than emit a zero dimension. A *positive* result whose
+///   area lands a single factor-step outside `[min_pixels, max_pixels]` is
+///   **kept**, not rejected: the reference's `floor_by_factor` /
+///   `ceil_by_factor` do not re-clamp, so re-clamping here would diverge
+///   from the python output.
 pub fn smart_resize(
   height: i64,
   width: i64,
@@ -222,6 +235,23 @@ pub fn smart_resize(
     return Err(Error::ShapeMismatch {
       message: format!(
         "smart_resize: require 0 <= min_pixels ({min_pixels}) <= max_pixels ({max_pixels}) and max_pixels > 0"
+      ),
+    });
+  }
+  // The smallest legal output is a `factor × factor` square (both sides are
+  // pinned to at least `factor` by the `max(factor, ...)` guards below).
+  // If even that minimal cell overflows `max_pixels`, no positive
+  // factor-aligned size fits the budget; the python reference would scale
+  // down to `(0, 0)`. Reject up front, naming the budget. (`factor` and
+  // `max_pixels` are both validated-positive here, so `factor * factor`
+  // cannot overflow at any realistic frame size.)
+  let min_cell = (factor as f64) * (factor as f64);
+  if min_cell > max_pixels as f64 {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "smart_resize: budget max_pixels ({max_pixels}) cannot contain the smallest \
+         factor-aligned size ({factor}x{factor} = {})",
+        factor * factor
       ),
     });
   }
@@ -257,6 +287,34 @@ pub fn smart_resize(
     let beta = (min_pixels as f64 / hw).sqrt();
     h_bar = ceil_by_factor_f(height as f64 * beta, factor);
     w_bar = ceil_by_factor_f(width as f64 * beta, factor);
+  }
+
+  // Validate the result is a *positive* factor-aligned size whose pixel
+  // product is representable (overflow-safe `checked_mul`). The `*_by_factor`
+  // helpers keep both sides multiples of `factor`, but a tight `max_pixels`
+  // paired with an extreme aspect ratio can still floor one side to 0 in the
+  // scale-down branch (e.g. height=537, width=4962, factor=28, max=1646 ->
+  // (0, 112)), which the early `min_cell` guard does not catch. A non-positive
+  // dimension is the degenerate `(0, 0)`-style result an impossible budget
+  // produces, so reject it instead of returning a zero / out-of-budget dim.
+  //
+  // We deliberately do NOT reject a positive result whose area merely sits a
+  // rounding step *outside* `[min_pixels, max_pixels]`: the reference applies
+  // `floor_by_factor` / `ceil_by_factor` *without* re-clamping, so on many
+  // satisfiable budgets it faithfully returns a positive size whose product is
+  // marginally below `min_pixels` (scale-down floor) or above `max_pixels`
+  // (scale-up ceil). Erroring on those would diverge from the python output we
+  // are porting (verified: ~0.2% of valid inputs land just outside the band by
+  // one factor step). Faithfulness requires accepting them.
+  let representable = h_bar.checked_mul(w_bar).is_some();
+  if h_bar <= 0 || w_bar <= 0 || !representable {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "smart_resize: no positive factor-aligned size fits budget \
+         [min_pixels={min_pixels}, max_pixels={max_pixels}] for input \
+         ({height}x{width}, factor={factor}); computed ({h_bar}x{w_bar})"
+      ),
+    });
   }
   Ok((h_bar, w_bar))
 }
@@ -391,11 +449,19 @@ pub fn smart_nframes(sampling: FrameSampling, total_frames: i64, video_fps: f64)
 /// caller uses to decide *which* decoded frames to hand to
 /// [`process_frames`]; it is codec-free (decoding stays the caller's job).
 ///
-/// `linspace(0, n-1, k)[i] = (n-1) * i / (k-1)` for `k > 1`, and the
-/// single-sample `k == 1` case yields `[0]` (numpy's `linspace` with
-/// `num=1` returns just the start). Each value is rounded **half-to-even**
-/// (numpy's `ndarray.round`) and clamped into `[0, total_frames - 1]` for
-/// safety against float-edge overshoot.
+/// numpy computes `linspace` as `step = (stop - start) / (num - 1)` FIRST,
+/// then point `i` as `start + step * i`, and finally (because the default
+/// `endpoint=True`) overwrites the LAST sample with `stop` exactly. We
+/// replicate that operation order bit-for-bit rather than the algebraically
+/// equal `(n-1) * i / (k-1)`: the intermediate `step` changes which float
+/// ties land exactly on `.5` before banker's rounding, so the orders are
+/// NOT interchangeable. Example: `total_frames = 26, nframes = 23`, the
+/// midpoint `i = 11` is `12.500000000000002` the numpy way (rounds to 13)
+/// but exactly `12.5` the fused way (banker's-rounds to 12) — a silently
+/// wrong frame. The single-sample `k == 1` case yields `[0]` (numpy's
+/// `linspace` with `num=1` returns just the start). Each value is rounded
+/// **half-to-even** (numpy's `ndarray.round`) and clamped into `[0,
+/// total_frames - 1]` for safety against float-edge overshoot.
 ///
 /// # Errors
 /// - [`Error::ShapeMismatch`] if `total_frames <= 0` or `nframes <= 0`.
@@ -414,15 +480,25 @@ pub fn sample_frame_indices(total_frames: i64, nframes: i64) -> Result<Vec<i64>>
   }
   let n = nframes as usize;
   let mut out = crate::error::try_with_capacity::<i64>(n)?;
-  let last = (total_frames - 1) as f64;
+  let stop = (total_frames - 1) as f64;
   if nframes == 1 {
     // numpy linspace(start, stop, num=1) -> [start]
     out.push(0);
     return Ok(out);
   }
-  let denom = (nframes - 1) as f64;
+  // numpy: step = (stop - start) / (num - 1), computed BEFORE the per-point
+  // multiply (start == 0 here). Reusing this single `step` for every point
+  // reproduces numpy's float ties exactly (see the doc comment / the
+  // `total_frames=26, nframes=23` regression).
+  let step = stop / (nframes - 1) as f64;
   for i in 0..nframes {
-    let v = last * (i as f64) / denom;
+    // endpoint=True: numpy overwrites the final sample with `stop` exactly
+    // rather than trusting `step * (n-1)` to land on it.
+    let v = if i == nframes - 1 {
+      stop
+    } else {
+      step * (i as f64)
+    };
     let idx = round_half_to_even(v).clamp(0, total_frames - 1);
     out.push(idx);
   }

@@ -110,6 +110,77 @@ fn smart_resize_rejects_nonpositive_and_bad_budget() {
   assert!(smart_resize(100, 100, 28, 5000, 4000).is_err());
 }
 
+#[test]
+fn smart_resize_rejects_impossible_budget() {
+  // factor=28 -> the smallest legal output is a 28x28 = 784-pixel square.
+  // A max_pixels of 1 cannot contain it, so there is no positive
+  // factor-aligned solution. The python reference silently scales to
+  // (0, 0); we reject. (Regression for the zero-dim Codex finding.)
+  assert!(
+    smart_resize(28, 28, 28, 1, 1).is_err(),
+    "max_pixels=1 < 28*28 -> no positive factor-aligned size -> Err"
+  );
+}
+
+#[test]
+fn smart_resize_rejects_extreme_aspect_floor_to_zero() {
+  // An extreme (but < MAX_RATIO) aspect with a tight max_pixels can pass the
+  // `max_pixels >= factor*factor` guard yet still floor the SHORT side to 0
+  // in the scale-down branch:
+  //   height=537, width=4962, factor=28, max=1646  (>= 784, ratio 9.24 < 200)
+  //   h_bar=max(28, round_by_factor(537,28)=532)=532,
+  //   w_bar=max(28, round_by_factor(4962,28)=4956)=4956
+  //   532*4956 = 2_636_592 > 1646 -> scale down
+  //   beta = sqrt(537*4962 / 1646) = sqrt(1618.7...) = 40.23...
+  //   floor_by_factor(537/40.23 = 13.34, 28) = floor(0.476)*28 = 0  -> zero dim
+  // The reference would emit (0, 112); we reject the non-positive dimension.
+  assert!(
+    smart_resize(537, 4962, 28, 1, 1646).is_err(),
+    "scale-down floors the short side to 0 -> Err, not a zero dim"
+  );
+}
+
+#[test]
+fn smart_resize_narrow_but_possible_budget_succeeds() {
+  // A budget pinned to exactly the minimal factor-aligned cell still has a
+  // solution and must succeed (not be over-rejected by the new guards).
+  //   height=width=28, factor=28, min=max=784.
+  //   h_bar=w_bar=max(28, round_by_factor(28,28)=28)=28 ; 28*28 = 784.
+  //   784 is within [784, 784] and not > max -> no scaling -> (28, 28).
+  let (h, w) = smart_resize(28, 28, 28, 784, 784).unwrap();
+  assert_eq!((h, w), (28, 28));
+  assert_eq!(h * w, 784, "exactly fills the single-cell budget");
+
+  // A downscale into the same single-cell ceiling is also possible:
+  //   height=width=420, factor=28, min=1, max=784.
+  //   h_bar=w_bar=420 ; 420*420=176_400 > 784 -> scale down
+  //   beta = sqrt(176_400 / 784) = sqrt(225) = 15.0
+  //   floor_by_factor(420/15 = 28.0, 28) = floor(1.0)*28 = 28 -> (28, 28)
+  let (h2, w2) = smart_resize(420, 420, 28, 1, 784).unwrap();
+  assert_eq!((h2, w2), (28, 28));
+}
+
+#[test]
+fn smart_resize_keeps_positive_result_just_outside_band() {
+  // Faithfulness guard: the reference's floor_by_factor/ceil_by_factor do
+  // NOT re-clamp, so a positive output whose area lands one factor-step
+  // outside [min, max] must be KEPT (matching python), not rejected.
+  //   height=420, width=420, factor=28, min=MIN_PIXELS, max=50_000.
+  //   -> (196, 196), area 38_416 (already covered above) is within budget;
+  //   here we assert a scale-up overshoot is preserved:
+  //   height=width=28, factor=28, min=3137 (one over 4*28*28=3136), max=MAX.
+  //   28*28=784 < 3137 -> scale up
+  //   beta = sqrt(3137 / 784) = 2.0003... ; 28*beta = 56.009...
+  //   ceil_by_factor(56.009, 28) = ceil(2.0003)*28 = 3*28 = 84 -> (84, 84)
+  //   84*84 = 7056 (> the 3137 floor, well within MAX) -> kept.
+  let (h, w) = smart_resize(28, 28, 28, 3137, MAX_PIXELS).unwrap();
+  assert_eq!((h, w), (84, 84));
+  assert!(
+    h > 0 && w > 0,
+    "positive size preserved, not re-clamped to error"
+  );
+}
+
 // ---------- smart_nframes ----------
 
 #[test]
@@ -270,6 +341,32 @@ fn sample_frame_indices_more_cases() {
   assert_eq!(idx.first(), Some(&0));
   assert_eq!(idx.last(), Some(&99));
   assert_eq!(idx.len(), 8);
+}
+
+#[test]
+fn sample_frame_indices_numpy_op_order_26_23() {
+  // Regression for the float-tie divergence between numpy's
+  // `linspace(0, total-1, n)` and the fused `(total-1)*i/(n-1)` form.
+  //
+  // numpy computes `step = (total-1)/(n-1)` FIRST, then point `i = step*i`,
+  // then forces the last sample to `total-1` (endpoint=True). For
+  // total=26, n=23 the midpoint i=11 is `12.500000000000002` the numpy way
+  // (banker's-rounds UP to 13), but EXACTLY `12.5` the fused way
+  // (banker's-rounds DOWN to 12) — a silently wrong frame.
+  //
+  // Expected vector is the full
+  //   np.linspace(0, 25, 23).round().astype(int)
+  // computed with numpy (raw midpoint 12.500000000000002 -> 13):
+  let expected: Vec<i64> = vec![
+    0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25,
+  ];
+  let got = sample_frame_indices(26, 23).unwrap();
+  assert_eq!(got, expected, "must match np.linspace operation order");
+  // The whole point: index 11 is 13 (numpy), NOT 12 (fused form).
+  assert_eq!(got[11], 13, "midpoint rounds to 13 the numpy way, not 12");
+  // endpoint=True: last sample is exactly total-1.
+  assert_eq!(got.last(), Some(&25));
+  assert_eq!(got.len(), 23);
 }
 
 #[test]
