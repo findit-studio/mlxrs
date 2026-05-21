@@ -8,12 +8,17 @@
 //!   + permission preservation; ~80 LOC in `audio/io.rs::save_wav`).
 //!   Naive linear resampling for the WAV-only surface; sinc/polyphase
 //!   resamplers are planned follow-ups.
-//! - [`crate::audio::dsp`] — Hann window, STFT (over
-//!   [`crate::ops::fft::rfft`] + [`crate::ops::shape::as_strided`]), mel
-//!   filterbank, mel + log-mel spectrogram.
+//! - [`crate::audio::dsp`] — window family (Hann/Hamming/Blackman/Bartlett
+//!   + the `STR_TO_WINDOW_FN`-style [`crate::audio::dsp::window_from_name`]
+//!   dispatch), STFT (over [`crate::ops::fft::rfft`] +
+//!   [`crate::ops::shape::as_strided`]), inverse STFT
+//!   ([`crate::audio::dsp::istft`], overlap-add reconstruction over
+//!   [`crate::ops::fft::irfft`] +
+//!   [`crate::ops::indexing::scatter_add_axis`]), mel filterbank, mel +
+//!   log-mel spectrogram.
 //!
 //! Out of scope for this PR (separate follow-ups per the M5 plan):
-//! - iSTFT (overlap-add reconstruction).
+//! - The `ISTFTCache` batched/cached overlap-add helper.
 //! - High-quality resampling (polyphase sinc, libsamplerate-style).
 //! - Pitch shifting, time stretching, voice activity detection, BS.1770
 //!   loudness, biquad filters, Kaldi-compatible feature extraction.
