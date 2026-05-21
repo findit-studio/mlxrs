@@ -31,9 +31,12 @@ jobs:
           submodules: recursive
 
       - name: Install Rust toolchain
+        # Match `mlxrs.yml` / `mlxrs-sys.yml` on nightly so resolver behavior
+        # (any nightly-only features in transitive deps) and rustfmt parity
+        # are consistent across the cron + PR pipelines.
         run: |
-          rustup update stable
-          rustup default stable
+          rustup update nightly
+          rustup default nightly
 
       # Cache the cmake $OUT_DIR (libmlx.a from the FetchContent build of
       # mlx-src — 5-10 minutes per cold rebuild) and the cargo registry.

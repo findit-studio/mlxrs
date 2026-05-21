@@ -1053,12 +1053,9 @@ fn balanced_brace_end(s: &str) -> Option<usize> {
   while idx < s.len() {
     if s[idx..].starts_with(lit) {
       // skip to closing literal
-      if let Some(close) = s[idx + lit.len()..].find(lit) {
-        idx = idx + lit.len() + close + lit.len();
-        continue;
-      } else {
-        return None;
-      }
+      let close = s[idx + lit.len()..].find(lit)?;
+      idx = idx + lit.len() + close + lit.len();
+      continue;
     }
     match bytes[idx] {
       b'{' => depth += 1,
