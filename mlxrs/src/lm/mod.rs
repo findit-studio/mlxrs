@@ -5,11 +5,14 @@
 //! architecture-agnostic generation foundation — the
 //! [`Model`](crate::lm::model::Model) trait, the KV
 //! [`cache`](crate::lm::cache), the model-load support surface
-//! ([`crate::lm::load`]), and the [`generate`](crate::lm::generate) loop
-//! (`generate_step` / `stream_generate` / `generate` +
-//! `make_sampler` / `make_logits_processors`).
+//! ([`crate::lm::load`]), the local load [`factory`](crate::lm::factory)
+//! (`ModelConfiguration` + `model_type` registry + `load`), and the
+//! [`generate`](crate::lm::generate) loop (`generate_step` /
+//! `stream_generate` / `generate` + `make_sampler` /
+//! `make_logits_processors`).
 
 pub mod cache;
+pub mod factory;
 pub mod generate;
 pub mod load;
 pub mod model;
