@@ -220,7 +220,10 @@ fn image_to_array_rgb_overlong_backing_buffer_ignores_tail() {
   assert_eq!(arr.shape(), vec![1, 1, 3]);
   let v: Vec<f32> = arr.to_vec().unwrap();
   // Tail bytes (99s) MUST NOT appear; only the logical pixel's R=10,G=20,B=30.
-  assert!(vclose(&v, &[10.0, 20.0, 30.0]), "got {v:?}, expected [10,20,30]");
+  assert!(
+    vclose(&v, &[10.0, 20.0, 30.0]),
+    "got {v:?}, expected [10,20,30]"
+  );
 }
 
 #[test]
@@ -234,7 +237,10 @@ fn image_to_array_bgr_overlong_backing_buffer_ignores_tail() {
   let v: Vec<f32> = arr.to_vec().unwrap();
   // BGR swap on the logical pixel: B=30, G=20, R=10. Tail bytes (99s)
   // must NOT contribute to the output.
-  assert!(vclose(&v, &[30.0, 20.0, 10.0]), "got {v:?}, expected [30,20,10]");
+  assert!(
+    vclose(&v, &[30.0, 20.0, 10.0]),
+    "got {v:?}, expected [30,20,10]"
+  );
 }
 
 // ---------- rescale ----------

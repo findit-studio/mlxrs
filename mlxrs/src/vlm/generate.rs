@@ -195,6 +195,21 @@ pub fn vlm_generate<'a, M: Model>(
   cache: Vec<Box<dyn KvCache>>,
   cfg: VlmGenConfig,
 ) -> Result<impl Iterator<Item = Result<GenStep>> + 'a> {
+  // ── max_tokens == 0 SHORT-CIRCUIT ────────────────────────────────────
+  // Mirror the LM-side contract: `lm::generate`'s iterator checks
+  // `produced >= max_tokens` BEFORE running prefill (generate.rs:598),
+  // so a `max_tokens == 0` request yields nothing and runs no model
+  // call. The VLM multimodal path does its vision work (load /
+  // preprocess / encode_image / merge) EAGERLY at construction, so
+  // without this guard a zero-output request would still trigger image
+  // I/O + vision compute + potential decode/OOM errors (Codex bundle-#62
+  // round-2 finding). Short-circuit to an empty iterator BEFORE any
+  // vision work — and before the zero-image split — so both paths are
+  // identically free of work when nothing will be produced.
+  if cfg.lm.max_tokens == 0 {
+    return Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = Result<GenStep>> + 'a>);
+  }
+
   // ── ZERO-IMAGE PASSTHROUGH ───────────────────────────────────────────
   // Faithful to `mlx-vlm`'s `get_input_embeddings`'s `if pixel_values is
   // None: return InputEmbeddingsFeatures(inputs_embeds=embed_tokens(input_ids))`
@@ -598,14 +613,45 @@ impl<M: Model> VlmDecode<'_, M> {
           .into(),
       });
     }
-    let step = self.prefill_step_size.max(1);
+    // Chunked prefill is PURE-TEXT ONLY. For image prompts
+    // (`image_spans` non-empty) the prefill runs a SINGLE
+    // `forward_embeddings_multimodal` over the full merged sequence.
+    //
+    // Why not chunk multimodal prefill (VLM-8 — escalated structural
+    // limitation, Codex bundle-#62 rounds 1-3):
+    //   - A cached chunk at offset `c` needs a `[chunk_len ×
+    //     (past_len + chunk_len)]` attention mask, but the
+    //     `forward_embeddings_multimodal(embeds, spans, cache)` contract
+    //     carries NO cache offset, so a mask-building override can only
+    //     produce a `[chunk_len × chunk_len]` local mask — wrong shape /
+    //     corrupt attention for any image span after a text prefix
+    //     (round-3 finding R3F1).
+    //   - `embed_tokens` + `merge_embeddings` already run on the FULL
+    //     `[1, T, D]` sequence above (faithful to mlx-vlm, which merges
+    //     full-sequence), so the O(T·D) peak is incurred BEFORE the
+    //     chunk loop regardless — chunking the forward alone does not
+    //     bound peak memory (round-3 finding R3F2).
+    // Correct chunked multimodal prefill therefore needs a richer trait
+    // contract (a `cache_offset`/`past_len` param + an offset-aware
+    // multimodal-mask helper + incremental per-chunk embed/merge) — a
+    // `Model`-trait redesign tracked + escalated as VLM-8. Single-forward
+    // for image prompts is correct (the override gets the full sequence
+    // + absolute spans, builds the full mask) and faithful to mlx-vlm's
+    // full-sequence merge; its peak memory equals the reference's.
+    let step = if image_spans.is_empty() {
+      self.prefill_step_size.max(1)
+    } else {
+      t.max(1) // single chunk over the whole sequence
+    };
     let d_i32 = d as i32;
     // Process every chunk; the FINAL chunk's last-position logits drive
     // the first sampler call (matches mlx-vlm's behavior where the
     // chunked-prefill loop fills the cache and the final `_step` call
     // samples from the last forward). When `t <= step`, the loop runs
     // exactly once with `chunk = None` (no slice allocation; pass the
-    // original merged Array by reference).
+    // original merged Array by reference). For image prompts `step == t`
+    // so the loop always runs once and `image_spans` are passed
+    // absolute (matching the single full-sequence forward).
     let mut cursor: usize = 0;
     let mut last_logits: Option<Array> = None;
     while cursor < t {
@@ -619,6 +665,10 @@ impl<M: Model> VlmDecode<'_, M> {
         Some(ops::indexing::slice(merged, &start, &stop, &strides)?)
       };
       let chunk_ref: &Array = chunk_owned.as_ref().unwrap_or(merged);
+      // Image prompts run as a single chunk (step == t), so `chunk_ref`
+      // IS the full merged sequence and `image_spans` are already the
+      // correct absolute coordinates. Pure-text prompts have empty
+      // `image_spans`, so the override (default impl) ignores them.
       let logits = self.model.forward_embeddings_multimodal(
         chunk_ref,
         image_spans,

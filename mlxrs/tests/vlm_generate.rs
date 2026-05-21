@@ -1003,20 +1003,31 @@ fn vlm_generate_marker_count_mismatch_errors_before_any_image_work() {
 // ── Codex round-3: chunked prefill respects cfg.lm.prefill_step_size ──────
 
 #[test]
-fn vlm_generate_chunked_prefill_uses_prefill_step_size() {
-  // The prefill MUST chunk by `cfg.lm.prefill_step_size` instead of
-  // running one big forward over the entire merged sequence. Observe
-  // via the mock's `forward_emb_calls` log: with prefill_step_size = 2
-  // and T = 7 (after splice), we expect ceil(7/2) = 4 chunks of size
-  // [2, 2, 2, 1].
+fn vlm_generate_image_prompt_runs_single_forward_not_chunked() {
+  // **Bundle #62 Codex rounds 1-3 (VLM-8 escalation)**: chunked prefill
+  // is PURE-TEXT ONLY. For image prompts (image_spans non-empty) the
+  // prefill runs a SINGLE `forward_embeddings_multimodal` over the full
+  // merged sequence regardless of `prefill_step_size`. Correct chunked
+  // multimodal prefill needs a cache-offset-aware trait contract (the
+  // override would otherwise build a `[chunk × chunk]` mask where it
+  // needs `[chunk × (past + chunk)]`) AND incremental per-chunk
+  // embed/merge (the full-sequence embed/merge already incurs the
+  // O(T·D) peak before chunking) — a `Model`-trait redesign tracked +
+  // escalated as VLM-8. Single-forward is correct (full sequence +
+  // absolute spans → full mask) and faithful to mlx-vlm's full-sequence
+  // merge.
+  //
+  // prompt [1, 2, 99, 3, 4] with num_tokens_per_image=3 splices to
+  // merged = [1, 2, IMG, IMG, IMG, 3, 4] (T=7), span (2,5). Even with
+  // prefill_step_size=2, image prompts run ONE chunk of width 7.
   let model = MockVlmModel::new(5, 4, 3);
-  let dir = temp_dir("chunked_prefill");
+  let dir = temp_dir("image_prompt_single_forward");
   let img = write_test_image(&dir, "img.png");
-  let prompt = [1_u32, 2, 99, 3, 4]; // T = 7 after splice
+  let prompt = [1_u32, 2, 99, 3, 4]; // T = 7 after splice, span (2,5)
   let cfg = VlmGenConfig {
     lm: GenConfig {
       max_tokens: 1,
-      prefill_step_size: 2,
+      prefill_step_size: 2, // ignored for image prompts (mask-correctness)
       ..Default::default()
     },
     image_token_id: 99,
@@ -1028,14 +1039,28 @@ fn vlm_generate_chunked_prefill_uses_prefill_step_size() {
   let step = it.next().expect("step").expect("ok");
   assert_eq!(step.token, 4);
 
-  // We expect 4 chunks of widths [2, 2, 2, 1] (T=7, step=2).
+  // 1 chunk of width 7 (full merged sequence) — image prompts are NOT
+  // chunked, so the mask-requiring override always sees the full
+  // sequence + absolute spans.
   let calls = model.forward_emb_calls.borrow().clone();
-  assert_eq!(calls.len(), 4, "expected 4 prefill chunks (T=7, step=2)");
-  assert_eq!(calls[0], vec![1_usize, 2, 4]);
-  assert_eq!(calls[1], vec![1_usize, 2, 4]);
-  assert_eq!(calls[2], vec![1_usize, 2, 4]);
-  assert_eq!(calls[3], vec![1_usize, 1, 4]);
+  assert_eq!(
+    calls.len(),
+    1,
+    "image prompts run a single forward (not chunked), got {} chunks",
+    calls.len()
+  );
+  assert_eq!(calls[0], vec![1_usize, 7, 4]);
 }
+
+// (Pure-text-through-vlm_generate chunking path: covered indirectly by
+// `lm::generate`'s own chunked-prefill tests — the VLM path's chunking
+// loop is feature-identical to lm::generate's when image_spans is empty.
+// A direct vlm_generate(&[]) pure-text test is awkward because the
+// marker insertion / splice logic requires at least one image for the
+// per-image-token expansion to be coherent; constructing a contrived
+// "0-images-but-marker-prepended" prompt only exercises the splice
+// short-circuit and adds little signal over the image-prompt test
+// above + lm::generate's existing chunked-prefill coverage.)
 
 #[test]
 fn vlm_generate_single_chunk_when_prefill_step_size_ge_t() {
@@ -1062,6 +1087,57 @@ fn vlm_generate_single_chunk_when_prefill_step_size_ge_t() {
   let calls = model.forward_emb_calls.borrow().clone();
   assert_eq!(calls.len(), 1);
   assert_eq!(calls[0], vec![1_usize, 7, 4]);
+}
+
+#[test]
+fn vlm_generate_max_tokens_zero_does_no_image_work() {
+  // **Bundle #62 Codex round-2 finding fix**: `max_tokens == 0` must
+  // yield an empty iterator and do ZERO model/vision work — mirroring
+  // the LM-side contract where `lm::generate`'s iterator checks
+  // `produced >= max_tokens` BEFORE prefill. The VLM multimodal path
+  // does its vision pipeline (load / preprocess / encode_image /
+  // embed_tokens / merge) eagerly at construction, so without the
+  // top-of-function short-circuit a zero-output request would still
+  // trigger image I/O + vision compute. Assert NO encode / embed /
+  // merge / forward call was recorded.
+  let model = MockVlmModel::new(5, 4, 3);
+  let dir = temp_dir("max_tokens_zero");
+  let img = write_test_image(&dir, "img.png");
+  let prompt = [1_u32, 2, 99, 3, 4];
+  let cfg = VlmGenConfig {
+    lm: GenConfig {
+      max_tokens: 0,
+      ..Default::default()
+    },
+    image_token_id: 99,
+    image_marker_id: None,
+    num_tokens_per_image: 3,
+    marker_policy: MarkerPolicy::Required,
+  };
+  let mut it = vlm_generate(&model, &prompt, &[img], mock_cache(), cfg).expect("vlm_generate ok");
+  assert!(
+    it.next().is_none(),
+    "max_tokens=0 must yield an empty iterator"
+  );
+
+  // No vision or model work happened at construction.
+  assert_eq!(
+    model.encode_calls.borrow().len(),
+    0,
+    "no encode_image calls"
+  );
+  assert_eq!(model.embed_calls.borrow().len(), 0, "no embed_tokens calls");
+  assert_eq!(
+    model.merge_calls.borrow().len(),
+    0,
+    "no merge_embeddings calls"
+  );
+  assert_eq!(
+    model.forward_emb_calls.borrow().len(),
+    0,
+    "no forward_embeddings calls"
+  );
+  assert_eq!(model.forward_calls.borrow().len(), 0, "no forward calls");
 }
 
 // ─── Codex round-2 finding: mask handoff via per-request spans, not &self ──

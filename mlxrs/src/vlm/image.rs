@@ -503,7 +503,9 @@ pub fn image_to_array(img: &::image::DynamicImage, color_order: ColorOrder) -> R
   // allocation-discipline pattern `mlxrs::error::Error::OutOfMemory`
   // exists for.
   let mut buf: Vec<f32> = Vec::new();
-  buf.try_reserve_exact(total).map_err(|_| Error::OutOfMemory)?;
+  buf
+    .try_reserve_exact(total)
+    .map_err(|_| Error::OutOfMemory)?;
   match color_order {
     ColorOrder::Rgb => {
       // Contiguous u8 → f32 widening — LLVM auto-vectorizes this on
