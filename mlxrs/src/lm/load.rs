@@ -5,10 +5,12 @@
 //!
 //! This module ports **only** the arch-agnostic pieces of `mlx_lm.utils`:
 //!
-//! - [`Config::from_json`] mirrors `utils.load_config` — read `config.json`,
-//!   parse the JSON into a typed subset (forward-compatible: unknown keys are
-//!   ignored, so a checkpoint's `quantization_config`/`text_config`/etc. never
-//!   break the parse).
+//! - [`load_config`] mirrors `utils.load_config` — read `config.json` **once**
+//!   and return both the typed [`Config`] subset and the verbatim JSON body
+//!   (forward-compatible: unknown keys are ignored, so a checkpoint's
+//!   `quantization_config`/`text_config`/etc. never break the parse), with the
+//!   `generation_config.json` `eos_token_id` override applied. The pure-parse
+//!   step is [`Config::from_json`].
 //! - [`load_weights`] mirrors the weight-discovery + merge of
 //!   `utils.load_model`: `glob("model*.safetensors")`, `mx.load` each, then
 //!   `weights.update(...)` to merge — plus a single-`*.gguf` fallback
@@ -52,7 +54,10 @@ use crate::{
 /// `embeddings::config`'s `MAX_ST_POOLING_CONFIG_BYTES`. A real model's
 /// `config.json` is well under 1 MiB; a hostile model dir cannot make us
 /// allocate unbounded memory by planting a huge `config.json`.
-const MAX_CONFIG_BYTES: u64 = 1 << 20;
+///
+/// `pub(crate)` so the [`crate::lm::factory`] load path shares the *one* bound
+/// (rather than restating it) — both read `config.json` through the same cap.
+pub(crate) const MAX_CONFIG_BYTES: u64 = 1 << 20;
 
 /// Quantization parameters from a checkpoint's `config.json` `quantization`
 /// block (mlx-lm `utils.py` `config["quantization"]`: `{ "group_size": int,
@@ -258,7 +263,7 @@ fn collect_sorted(dir: &Path, pred: impl Fn(&str) -> bool) -> Result<Vec<std::pa
     // but HF Hub snapshot dirs store `model*.safetensors` as symlinks into
     // `blobs/<hash>` (mlx-lm's `glob(...) + mx.load(wf)` follows them) — so
     // resolve via `fs::metadata` (follows symlinks) and gate on the target,
-    // exactly as `read_config` does for `config.json`. The original
+    // exactly as `load_config` does for `config.json`. The original
     // (possibly-symlink) path is passed through; the IO loader opens it,
     // following the link.
     match std::fs::metadata(entry.path()) {
@@ -275,15 +280,26 @@ fn collect_sorted(dir: &Path, pred: impl Fn(&str) -> bool) -> Result<Vec<std::pa
   Ok(out)
 }
 
-/// Read and parse `<dir>/config.json` into a [`Config`].
+/// Read `<dir>/config.json` **once**, returning both the typed [`Config`] and
+/// the verbatim JSON body it was parsed from (the exact same bytes).
 ///
-/// Mirrors `mlx_lm.utils.load_config`'s `open(model_path / "config.json")`.
+/// Mirrors `mlx_lm.utils.load_config`'s `open(model_path / "config.json")`,
+/// and additionally applies the `generation_config.json` `eos_token_id`
+/// override in place (see below) so the returned [`Config`] is the one the
+/// generation loop / tokenizer should use — exactly `load(return_config=True)`.
+///
+/// Returning the raw text alongside the typed value closes a TOCTOU/divergence
+/// hole the [`crate::lm::factory`] loader otherwise hit: a single open means a
+/// constructor that consumes both the typed [`Config`] and the raw
+/// [`String`](for model-specific keys outside the typed subset) can never get
+/// them from two different on-disk versions of `config.json`.
+///
 /// The read is bounded against an untrusted model directory exactly as
 /// `embeddings::config`'s pooling-config read: open **once** (closing the
 /// stat-then-read TOCTOU window), reject a non-regular file (FIFO / device /
 /// directory / symlink-to-special — all of which a pre-read size check would
 /// see as `len() == 0` yet still stream unbounded data) **before any read**,
-/// and cap the body at [`MAX_CONFIG_BYTES`] via `Read::take`. On Unix the
+/// and cap the body at `MAX_CONFIG_BYTES` via `Read::take`. On Unix the
 /// open carries `O_NONBLOCK | O_CLOEXEC` so a planted FIFO returns
 /// immediately instead of hanging the caller; symlinks are intentionally
 /// followed (HF Hub caches store `config.json` as a symlink into
@@ -291,7 +307,16 @@ fn collect_sorted(dir: &Path, pred: impl Fn(&str) -> bool) -> Result<Vec<std::pa
 /// the post-open `is_file()` fstat enforces the guarantee on the *resolved*
 /// target. Every failure path (absent, non-regular, oversized, unreadable,
 /// invalid/incomplete JSON) is a recoverable [`Error::Backend`].
-fn read_config(dir: &Path) -> Result<Config> {
+///
+/// The eos override: a *truthy* `generation_config.json` `eos_token_id`
+/// OVERWRITES `config["eos_token_id"]` IN PLACE
+/// (`if eos_token_id := generation_config.get("eos_token_id", False):
+/// config["eos_token_id"] = eos_token_id`), so the returned `Config`'s
+/// `eos_token_id` is the tokenizer's COMPLETE set; `None` ⇒ the tokenizer's
+/// own `eos_token`. The raw JSON [`String`] is the literal `config.json` body
+/// and is **not** rewritten — it carries the on-disk model-specific keys
+/// verbatim for a constructor's `Codable`-style init.
+pub fn load_config(dir: &Path) -> Result<(Config, String)> {
   use std::io::Read;
 
   let path = dir.join("config.json");
@@ -341,10 +366,21 @@ fn read_config(dir: &Path) -> Result<Config> {
     });
   }
 
-  let text = std::str::from_utf8(&bytes).map_err(|e| Error::Backend {
+  let text = String::from_utf8(bytes).map_err(|e| Error::Backend {
     message: format!("model config {} is not valid UTF-8: {e}", path.display()),
   })?;
-  Config::from_json(text)
+  let mut config = Config::from_json(&text)?;
+
+  // mlx-lm `utils.load_config`: a *truthy* `generation_config.json`
+  // `eos_token_id` OVERWRITES `config["eos_token_id"]` IN PLACE, so the
+  // RETURNED config (and any tokenizer eos set derived from it) reflects the
+  // generation-config override (`load(return_config=True)` parity). The raw
+  // `text` is left untouched (it is the on-disk `config.json` verbatim).
+  if let Some(eos_override) = read_generation_eos(dir) {
+    config.eos_token_id = Some(eos_override);
+  }
+
+  Ok((config, text))
 }
 
 /// The *truthy* `eos_token_id` override from optional
@@ -356,8 +392,8 @@ fn read_config(dir: &Path) -> Result<Config> {
 /// json.JSONDecodeError: pass`, so an absent / malformed / missing-key /
 /// non-regular / oversized file simply yields `None` (never errors — this is
 /// optional metadata). Same bounded / `O_NONBLOCK` / non-regular-reject
-/// discipline as [`read_config`] so a planted FIFO `generation_config.json`
-/// cannot hang or OOM the loader. The caller writes this back into the
+/// discipline as [`load_config`] so a planted FIFO `generation_config.json`
+/// cannot hang or OOM the loader. [`load_config`] writes this back into the
 /// returned `Config.eos_token_id` (exactly Python's in-place overwrite) so
 /// the returned config and the tokenizer's eos set always agree.
 fn read_generation_eos(dir: &Path) -> Option<EosTokenId> {
@@ -442,26 +478,30 @@ fn read_generation_eos(dir: &Path) -> Option<EosTokenId> {
 ///
 /// [`Tokenizer`]: crate::tokenizer::Tokenizer
 pub fn load(dir: &Path) -> Result<(Config, Weights, crate::tokenizer::Tokenizer)> {
-  let mut config = read_config(dir)?;
+  // Thin wrapper over the finer pieces, in model-directory order: parse the
+  // config once (which also applies the `generation_config.json` eos override,
+  // so the returned config and the tokenizer's eos set always agree —
+  // `load(return_config=True)` parity), discover/merge the weights, then build
+  // the tokenizer from the SAME directory with the resolved eos set. The
+  // post-override `config.eos_token_id` is the tokenizer's COMPLETE set —
+  // `TokenizerWrapper` `set(eos_token_ids)` REPLACES the tokenizer-config
+  // default (NOT unioned); `None` ⇒ the tokenizer's own `eos_token`.
+  let (config, _config_json) = load_config(dir)?;
   let weights = load_weights(dir)?;
-  // mlx-lm `utils.load_config`: a *truthy* `generation_config.json`
-  // `eos_token_id` OVERWRITES `config["eos_token_id"]` IN PLACE
-  // (`if eos_token_id := generation_config.get("eos_token_id", False):
-  // config["eos_token_id"] = eos_token_id`), so the RETURNED config and the
-  // tokenizer's eos set always agree (`load(return_config=True)` parity).
-  // The post-override `config.eos_token_id` is then the tokenizer's
-  // COMPLETE set — `TokenizerWrapper` `set(eos_token_ids)` REPLACES the
-  // tokenizer-config default (NOT unioned); `None` ⇒ the tokenizer's own
-  // `eos_token`.
-  if let Some(eos_override) = read_generation_eos(dir) {
-    config.eos_token_id = Some(eos_override);
-  }
-  let resolved_eos = config.eos_token_id.clone().map(EosTokenId::into_ids);
-  let tokenizer =
-    crate::tokenizer::Tokenizer::from_path(dir, resolved_eos.as_deref()).map_err(|e| {
-      Error::Backend {
-        message: format!("cannot load tokenizer from {}: {e}", dir.display()),
-      }
-    })?;
+  let tokenizer = load_tokenizer(dir, &config)?;
   Ok((config, weights, tokenizer))
+}
+
+/// Build the #18 [`Tokenizer`](crate::tokenizer::Tokenizer) from `dir` with
+/// the eos set already resolved on `config` (its post-override
+/// `eos_token_id` — see [`load_config`]). Factored out of [`load`] so the
+/// [`crate::lm::factory`] loader builds the tokenizer from its
+/// (optionally separate) tokenizer directory through the *same* eos-resolution
+/// path. A tokenizer-load failure is a recoverable [`Error::Backend`] naming
+/// the directory.
+pub fn load_tokenizer(dir: &Path, config: &Config) -> Result<crate::tokenizer::Tokenizer> {
+  let resolved_eos = config.eos_token_id.clone().map(EosTokenId::into_ids);
+  crate::tokenizer::Tokenizer::from_path(dir, resolved_eos.as_deref()).map_err(|e| Error::Backend {
+    message: format!("cannot load tokenizer from {}: {e}", dir.display()),
+  })
 }

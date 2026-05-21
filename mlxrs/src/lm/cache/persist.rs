@@ -559,7 +559,7 @@ pub fn load_prompt_cache(path: &Path) -> Result<(Vec<Box<dyn KvCache>>, HashMap<
     // The fd is now proven a *regular file*, so the fstat `len()` is its
     // exact, O(1), authoritative size — reject an oversized file here,
     // before `crate::io`/mlx-c maps it, without reading (or double-reading)
-    // a single byte. (Unlike `lm::load::read_config`, which `Read::take`s
+    // a single byte. (Unlike `lm::load::load_config`, which `Read::take`s
     // because it *consumes* the config bytes, this loader never needs the
     // bytes — mlx-c reads the file itself — so a streaming size probe would
     // be a wasteful, itself-DoS-prone 2x read of a multi-GB cache.)
