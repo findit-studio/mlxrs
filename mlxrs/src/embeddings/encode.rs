@@ -280,6 +280,12 @@ pub fn encode(
   texts: &[&str],
   cfg: &EncodeConfig,
 ) -> Result<Array> {
+  // Fail fast on a cleared/poisoned worker thread (and install the mlx-c error
+  // handler) before any work, since `model.forward` + the pooling ops touch
+  // per-thread stream/TLS state. Mirrors the crate's other safe entry points
+  // (e.g. `stream::default_stream`), which install the handler before asserting.
+  crate::error::ensure_handler_installed();
+  crate::stream::assert_streams_not_cleared();
   let (input_ids, attention_mask, _seq_len) = tokenize_and_pad(
     tokenizer,
     texts,
