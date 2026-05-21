@@ -95,6 +95,71 @@ pub const FPS_MIN_FRAMES: i64 = 4;
 /// frame count.
 pub const FPS_MAX_FRAMES: i64 = 768;
 
+/// Largest `i64` magnitude that survives an `i64 → f64 → i64` round-trip
+/// without precision loss: f64's mantissa holds 53 bits, so every integer in
+/// `[-2^53, 2^53]` is exactly representable but beyond it consecutive
+/// integers collapse onto the same f64. The `*_by_factor` family below does
+/// `op(number / factor) * factor` in f64; for an `|number| > 2^53` the very
+/// first `number as f64` is already a *different* value, so the result is
+/// silently wrong (not merely overflowing). We reject such inputs up front
+/// rather than emit a plausible-looking but corrupt size — every real image
+/// dimension / frame count is many orders of magnitude below this.
+const F64_EXACT_INT_MAX: i64 = 1 << 53;
+
+/// `i64::MAX + 1 == 2^63` as the smallest `f64` strictly above the `i64`
+/// range. `i64::MAX` itself is not f64-representable (`i64::MAX as f64`
+/// rounds UP to `2^63`), so an `f64 < this` bound guarantees the subsequent
+/// `as i64` cast is exact and in range.
+const F64_TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+
+/// Multiply a (already factor-divided + rounded, integral) `quotient` float
+/// by an `i64` `factor`, returning [`Error::ShapeMismatch`] instead of
+/// panicking (debug) or silently wrapping (release) on overflow.
+///
+/// The `*_by_factor` family computes `op(number / factor) * factor`. The
+/// final `quotient * factor` can blow past `i64` for a legitimately large
+/// float `number` (the `_f` scale variants pass `height * beta` etc.). We
+/// funnel every such product through this one checked path so NO caller can
+/// panic or wrap — overflow surfaces recoverably, naming the operands.
+///
+/// `quotient` arrives as the post-`round`/`ceil`/`floor` `f64`, so it is
+/// integral (or `±inf`/`NaN` on a degenerate input). We reject non-finite
+/// quotients and any quotient outside the exactly-representable `i64` range
+/// before the cast, then `checked_mul` (== an i128 product bounds-checked to
+/// fit `i64`) the validated integer by `factor`.
+fn factor_product(quotient: f64, factor: i64, op: &str) -> Result<i64> {
+  if !quotient.is_finite() || quotient >= F64_TWO_POW_63 || quotient < i64::MIN as f64 {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "{op}_by_factor: quotient ({quotient}) out of i64 range before scaling by factor ({factor})"
+      ),
+    });
+  }
+  (quotient as i64)
+    .checked_mul(factor)
+    .ok_or_else(|| Error::ShapeMismatch {
+      message: format!("{op}_by_factor: quotient ({quotient}) * factor ({factor}) overflows i64"),
+    })
+}
+
+/// Guard an integer-input `*_by_factor` call before its lossy f64 division:
+/// reject a `number` whose magnitude exceeds [`F64_EXACT_INT_MAX`] (the f64
+/// round-trip would corrupt it) — see that constant. Normal frame-sized
+/// inputs pass untouched.
+fn check_factor_input(number: i64, op: &str) -> Result<()> {
+  // `unsigned_abs` (not `i64::abs`) — `i64::MIN.abs()` itself overflows/panics,
+  // and a hostile caller can pass `i64::MIN` (e.g. `FrameSampling::Fixed`).
+  if number.unsigned_abs() > F64_EXACT_INT_MAX as u64 {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "{op}_by_factor: number ({number}) exceeds the f64 exact-integer range \
+         (±2^53); the float division would lose precision and corrupt the result"
+      ),
+    });
+  }
+  Ok(())
+}
+
 /// Closest integer to `number / factor`, times `factor`.
 ///
 /// Ports python `round_by_factor` (`video_generate.py:51-53`):
@@ -104,27 +169,48 @@ pub const FPS_MAX_FRAMES: i64 = 768;
 /// `round_by_factor(14, 28)` → `round(0.5) = 0`) matches the reference
 /// rather than diverging like the swift `Int(round(...))`
 /// (round-half-away-from-zero) would.
-#[must_use]
-pub fn round_by_factor(number: i64, factor: i64) -> i64 {
-  round_half_to_even(number as f64 / factor as f64) * factor
+///
+/// # Errors
+/// [`Error::ShapeMismatch`] for an adversarial near-`i64::MAX` `number`: the
+/// f64 division/`* factor` cannot represent it faithfully (precision loss
+/// past ±2^53 or `i64` product overflow). The reference assumes frame-sized
+/// inputs and never trips this; we surface it recoverably rather than panic
+/// (debug) or silently wrap to a small valid-looking size (release).
+pub fn round_by_factor(number: i64, factor: i64) -> Result<i64> {
+  check_factor_input(number, "round")?;
+  factor_product(
+    round_half_to_even_f(number as f64 / factor as f64),
+    factor,
+    "round",
+  )
 }
 
 /// Smallest multiple of `factor` that is `>= number`.
 ///
 /// Ports python `ceil_by_factor` (`video_generate.py:56-58`):
 /// `ceil(number / factor) * factor`.
-#[must_use]
-pub fn ceil_by_factor(number: i64, factor: i64) -> i64 {
-  (number as f64 / factor as f64).ceil() as i64 * factor
+///
+/// # Errors
+/// [`Error::ShapeMismatch`] when `number` cannot be faithfully scaled in f64
+/// (precision loss past ±2^53 or `i64` product overflow) — see
+/// [`round_by_factor`].
+pub fn ceil_by_factor(number: i64, factor: i64) -> Result<i64> {
+  check_factor_input(number, "ceil")?;
+  factor_product((number as f64 / factor as f64).ceil(), factor, "ceil")
 }
 
 /// Largest multiple of `factor` that is `<= number`.
 ///
 /// Ports python `floor_by_factor` (`video_generate.py:61-63`):
 /// `floor(number / factor) * factor`.
-#[must_use]
-pub fn floor_by_factor(number: i64, factor: i64) -> i64 {
-  (number as f64 / factor as f64).floor() as i64 * factor
+///
+/// # Errors
+/// [`Error::ShapeMismatch`] when `number` cannot be faithfully scaled in f64
+/// (precision loss past ±2^53 or `i64` product overflow) — see
+/// [`round_by_factor`].
+pub fn floor_by_factor(number: i64, factor: i64) -> Result<i64> {
+  check_factor_input(number, "floor")?;
+  factor_product((number as f64 / factor as f64).floor(), factor, "floor")
 }
 
 /// Float-input variant of [`ceil_by_factor`]: `ceil(number / factor) *
@@ -133,17 +219,19 @@ pub fn floor_by_factor(number: i64, factor: i64) -> i64 {
 /// factor)` with the FLOAT `height * beta` (`video_generate.py:92`).
 /// Kept separate from the integer entry so the public `ceil_by_factor`
 /// stays the faithful 1:1 of the integer call sites
-/// (`smart_nframes`/`fetch_video`).
-fn ceil_by_factor_f(number: f64, factor: i64) -> i64 {
-  (number / factor as f64).ceil() as i64 * factor
+/// (`smart_nframes`/`fetch_video`). Product overflow is caught by
+/// [`factor_product`].
+fn ceil_by_factor_f(number: f64, factor: i64) -> Result<i64> {
+  factor_product((number / factor as f64).ceil(), factor, "ceil")
 }
 
 /// Float-input variant of [`floor_by_factor`]: `floor(number / factor) *
 /// factor` with a real-valued `number`. Used by [`smart_resize`]'s
 /// scale-down branch (python `floor_by_factor(height / beta, factor)`
-/// with the FLOAT `height / beta`, `video_generate.py:88`).
-fn floor_by_factor_f(number: f64, factor: i64) -> i64 {
-  (number / factor as f64).floor() as i64 * factor
+/// with the FLOAT `height / beta`, `video_generate.py:88`). Product overflow
+/// is caught by [`factor_product`].
+fn floor_by_factor_f(number: f64, factor: i64) -> Result<i64> {
+  factor_product((number / factor as f64).floor(), factor, "floor")
 }
 
 /// Round half to even (banker's rounding) — the behavior of python's
@@ -151,19 +239,39 @@ fn floor_by_factor_f(number: f64, factor: i64) -> i64 {
 /// on. `round(0.5) == 0`, `round(1.5) == 2`, `round(2.5) == 2`,
 /// `round(-0.5) == 0`. Rust's `f64::round` rounds half *away from zero*
 /// (`0.5_f64.round() == 1.0`), so we cannot use it directly for parity.
-fn round_half_to_even(x: f64) -> i64 {
+///
+/// Returns the rounded value as an `f64` (still integral) so callers that
+/// must multiply by a factor can range-check before the `i64` cast — see
+/// [`factor_product`]. The exactly-`.5` tie-break inspects the floor's
+/// integer parity; for a non-finite or out-of-`i64`-range floor that parity
+/// is meaningless, so we treat such inputs as "not a tie" and round toward
+/// the floor, letting [`factor_product`]'s range-check reject them.
+fn round_half_to_even_f(x: f64) -> f64 {
   let floor = x.floor();
   let diff = x - floor;
-  let rounded = if diff < 0.5 {
+  if diff < 0.5 {
     floor
   } else if diff > 0.5 {
     floor + 1.0
   } else {
-    // Exactly .5 — pick the even neighbor.
-    let floor_i = floor as i64;
-    if floor_i % 2 == 0 { floor } else { floor + 1.0 }
-  };
-  rounded as i64
+    // Exactly .5 — pick the even neighbor. Parity is only meaningful for a
+    // floor that fits i64; outside that, fall through to `floor` (the value
+    // is rejected downstream by `factor_product` anyway).
+    if floor.is_finite() && floor >= i64::MIN as f64 && floor < F64_TWO_POW_63 {
+      let floor_i = floor as i64;
+      if floor_i % 2 == 0 { floor } else { floor + 1.0 }
+    } else {
+      floor
+    }
+  }
+}
+
+/// `i64`-returning banker's rounding for the frame-index picker, where the
+/// input is always a bounded `linspace` point in `[0, total_frames - 1]`
+/// (no factor multiply, so no overflow path). Thin wrapper over
+/// [`round_half_to_even_f`].
+fn round_half_to_even(x: f64) -> i64 {
+  round_half_to_even_f(x) as i64
 }
 
 /// Compute a factor-aligned `(height, width)` that preserves aspect ratio
@@ -267,26 +375,33 @@ pub fn smart_resize(
     });
   }
 
-  let mut h_bar = factor.max(round_by_factor(height, factor));
-  let mut w_bar = factor.max(round_by_factor(width, factor));
+  // Compute the factor-aligned bars BEFORE the branch decision. The
+  // `*_by_factor` helpers are overflow-safe (`?`-propagating
+  // [`Error::ShapeMismatch`]): an adversarial near-`i64::MAX` `height`/
+  // `width` with `factor=28` would otherwise panic (debug) or wrap negative
+  // (release) inside `round_by_factor`, after which `factor.max(..)` would
+  // promote the wrapped value to a small valid-looking size and the late
+  // `checked_mul` would never see the overflow. Surfacing it here, before
+  // any `h_bar * w_bar` comparison, closes that silent-corruption path.
+  let mut h_bar = factor.max(round_by_factor(height, factor)?);
+  let mut w_bar = factor.max(round_by_factor(width, factor)?);
 
   // `h*w` and `h_bar*w_bar` are products of (validated-positive) frame
-  // dimensions; on the i64 domain used here a realistic frame
-  // (≤ ~100k per side) cannot overflow, but compute the pixel-budget
-  // comparison in f64 to mirror the python float arithmetic exactly and
-  // to keep the `sqrt` domain in floats throughout.
+  // dimensions; compute the pixel-budget comparison in f64 to mirror the
+  // python float arithmetic exactly and to keep the `sqrt` domain in floats
+  // throughout (the bars themselves are already overflow-checked above).
   let hw = height as f64 * width as f64;
   if (h_bar as f64) * (w_bar as f64) > max_pixels as f64 {
     let beta = (hw / max_pixels as f64).sqrt();
     // python: floor_by_factor(height / beta, factor) where the argument is
     // the FLOAT `height / beta` — use the float-input helper so we don't
     // truncate before the `floor(_ / factor)` (a double-floor would diverge).
-    h_bar = floor_by_factor_f(height as f64 / beta, factor);
-    w_bar = floor_by_factor_f(width as f64 / beta, factor);
+    h_bar = floor_by_factor_f(height as f64 / beta, factor)?;
+    w_bar = floor_by_factor_f(width as f64 / beta, factor)?;
   } else if (h_bar as f64) * (w_bar as f64) < min_pixels as f64 {
     let beta = (min_pixels as f64 / hw).sqrt();
-    h_bar = ceil_by_factor_f(height as f64 * beta, factor);
-    w_bar = ceil_by_factor_f(width as f64 * beta, factor);
+    h_bar = ceil_by_factor_f(height as f64 * beta, factor)?;
+    w_bar = ceil_by_factor_f(width as f64 * beta, factor)?;
   }
 
   // Validate the result is a *positive* factor-aligned size whose pixel
@@ -395,7 +510,9 @@ pub fn smart_nframes(sampling: FrameSampling, total_frames: i64, video_fps: f64)
     });
   }
   let nframes = match sampling {
-    FrameSampling::Fixed { nframes } => round_by_factor(nframes, FRAME_FACTOR),
+    // Overflow-safe `?`: an adversarial near-`i64::MAX` `nframes` would
+    // otherwise panic (debug) / wrap (release) inside `round_by_factor`.
+    FrameSampling::Fixed { nframes } => round_by_factor(nframes, FRAME_FACTOR)?,
     FrameSampling::Fps {
       fps,
       min_frames,
@@ -416,19 +533,23 @@ pub fn smart_nframes(sampling: FrameSampling, total_frames: i64, video_fps: f64)
           message: format!("smart_nframes: fps ({fps}) must be a positive finite number"),
         });
       }
-      let min_frames = ceil_by_factor(min_frames, FRAME_FACTOR);
+      // Overflow-safe `?` on every factor-rounding (the clamp bounds and the
+      // final round): an adversarial `min_frames`/`max_frames`/derived count
+      // near `i64::MAX` would otherwise panic/wrap in the `*_by_factor` math.
+      let min_frames = ceil_by_factor(min_frames, FRAME_FACTOR)?;
       // python: max_frames default = min(FPS_MAX_FRAMES, total_frames).
       let max_frames_raw = max_frames.unwrap_or_else(|| FPS_MAX_FRAMES.min(total_frames));
-      let max_frames = floor_by_factor(max_frames_raw, FRAME_FACTOR);
+      let max_frames = floor_by_factor(max_frames_raw, FRAME_FACTOR)?;
       // python: nframes = total_frames / video_fps * fps   (float)
       let raw = total_frames as f64 / video_fps * fps;
       // python: min(min(max(nframes, min_frames), max_frames), total_frames)
-      // performed in float, THEN floor_by_factor.
+      // performed in float, THEN floor_by_factor. The clamp pins the result
+      // into [min_frames, total_frames] before the (overflow-checked) round.
       let clamped = raw
         .max(min_frames as f64)
         .min(max_frames as f64)
         .min(total_frames as f64);
-      floor_by_factor(clamped.floor() as i64, FRAME_FACTOR)
+      floor_by_factor(clamped.floor() as i64, FRAME_FACTOR)?
     }
   };
   if !(FRAME_FACTOR <= nframes && nframes <= total_frames) {

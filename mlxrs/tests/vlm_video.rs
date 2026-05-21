@@ -28,23 +28,120 @@ use mlxrs::vlm::{
 fn round_by_factor_banker_rounding_edges() {
   // python `round_by_factor(n, f) = round(n / f) * f` with round-HALF-TO-
   // EVEN (python built-in `round`). Half-quotient cases must pick the even
-  // neighbor, NOT round-away-from-zero.
-  assert_eq!(round_by_factor(14, 28), 0); // 0.5  -> 0 (even)
-  assert_eq!(round_by_factor(42, 28), 56); // 1.5 -> 2 (even) -> 56
-  assert_eq!(round_by_factor(70, 28), 56); // 2.5 -> 2 (even) -> 56
-  assert_eq!(round_by_factor(98, 28), 112); // 3.5 -> 4 (even) -> 112
-  assert_eq!(round_by_factor(800, 28), 812); // 28.571 -> 29 -> 812
-  assert_eq!(round_by_factor(1280, 28), 1288); // 45.714 -> 46 -> 1288
+  // neighbor, NOT round-away-from-zero. (Now `Result`-returning for
+  // overflow safety; sane inputs always `Ok`.)
+  assert_eq!(round_by_factor(14, 28).unwrap(), 0); // 0.5  -> 0 (even)
+  assert_eq!(round_by_factor(42, 28).unwrap(), 56); // 1.5 -> 2 (even) -> 56
+  assert_eq!(round_by_factor(70, 28).unwrap(), 56); // 2.5 -> 2 (even) -> 56
+  assert_eq!(round_by_factor(98, 28).unwrap(), 112); // 3.5 -> 4 (even) -> 112
+  assert_eq!(round_by_factor(800, 28).unwrap(), 812); // 28.571 -> 29 -> 812
+  assert_eq!(round_by_factor(1280, 28).unwrap(), 1288); // 45.714 -> 46 -> 1288
 }
 
 #[test]
 fn ceil_floor_by_factor_edges() {
   // ceil_by_factor(n, f) = ceil(n / f) * f ; floor_by_factor = floor(...) * f
-  assert_eq!(ceil_by_factor(10, 2), 10); // ceil(5.0) * 2
-  assert_eq!(ceil_by_factor(9, 2), 10); // ceil(4.5) = 5 -> 10
-  assert_eq!(floor_by_factor(9, 2), 8); // floor(4.5) = 4 -> 8
-  assert_eq!(floor_by_factor(10, 2), 10); // floor(5.0) -> 10
-  assert_eq!(ceil_by_factor(4, 2), 4); // ceil(2.0) -> 4
+  assert_eq!(ceil_by_factor(10, 2).unwrap(), 10); // ceil(5.0) * 2
+  assert_eq!(ceil_by_factor(9, 2).unwrap(), 10); // ceil(4.5) = 5 -> 10
+  assert_eq!(floor_by_factor(9, 2).unwrap(), 8); // floor(4.5) = 4 -> 8
+  assert_eq!(floor_by_factor(10, 2).unwrap(), 10); // floor(5.0) -> 10
+  assert_eq!(ceil_by_factor(4, 2).unwrap(), 4); // ceil(2.0) -> 4
+}
+
+// ---------- *_by_factor / smart_resize / smart_nframes overflow safety ----------
+
+#[test]
+fn factor_helpers_reject_overflow_instead_of_panic_or_wrap() {
+  // Regression for the Codex "factor rounding can overflow before
+  // validation" finding. `round/ceil/floor_by_factor(i64::MAX, 28)` would
+  // compute `quotient * 28`, which overflows i64: debug builds PANIC,
+  // release WRAPS negative. All three must instead return a recoverable
+  // Err (NOT a panic, NOT a wrapped/garbage value).
+  assert!(
+    round_by_factor(i64::MAX, 28).is_err(),
+    "round_by_factor near i64::MAX must Err, not panic/wrap"
+  );
+  assert!(
+    ceil_by_factor(i64::MAX, 28).is_err(),
+    "ceil_by_factor near i64::MAX must Err, not panic/wrap"
+  );
+  assert!(
+    floor_by_factor(i64::MAX, 28).is_err(),
+    "floor_by_factor near i64::MAX must Err, not panic/wrap"
+  );
+  // An oversized factor against a large-but-not-max number also overflows
+  // the product (quotient ~= i64::MAX/2, times the same factor).
+  assert!(
+    round_by_factor(i64::MAX / 2, i64::MAX).is_err(),
+    "oversized factor must Err on product overflow"
+  );
+  // Sanity: a normal input still rounds correctly through the new path.
+  assert_eq!(round_by_factor(800, 28).unwrap(), 812);
+}
+
+#[test]
+fn smart_resize_rejects_overflow_dimension() {
+  // The Codex finding's exact silent-corruption scenario: a positive
+  // near-i64::MAX height/width with factor=28. Before the fix this
+  // overflowed inside `round_by_factor` (panic debug / wrap release), and
+  // on release the wrapped-negative bar was promoted by `factor.max(..)` to
+  // a small valid-looking size so `smart_resize` returned a bogus small
+  // (h, w) instead of erroring. It must now Err recoverably (NOT panic, NOT
+  // a small wrapped size). Square dims keep aspect ratio = 1 so the failure
+  // is the overflow, not the ratio guard.
+  let r = smart_resize(i64::MAX, i64::MAX, 28, MIN_PIXELS, MAX_PIXELS);
+  assert!(
+    r.is_err(),
+    "near-i64::MAX dims must Err on overflow, got {r:?}"
+  );
+  // Asymmetric near-i64::MAX dims (ratio still ~1 < MAX_RATIO so the failure
+  // is the factor-product overflow, not the ratio guard) must also Err
+  // rather than silently corrupt. Both bars overflow `round_by_factor`; the
+  // first `?` is enough — we only assert the recoverable Err.
+  let r2 = smart_resize(i64::MAX - 56, i64::MAX, 28, MIN_PIXELS, MAX_PIXELS);
+  assert!(r2.is_err(), "overflowing dims must Err, got {r2:?}");
+}
+
+#[test]
+fn smart_nframes_rejects_overflow() {
+  // Fixed{i64::MAX}: round_by_factor(i64::MAX, FRAME_FACTOR=2) overflows the
+  // `quotient * 2` product -> must Err (not panic/wrap into a small count
+  // that could then pass the [FRAME_FACTOR, total_frames] check).
+  let r = smart_nframes(FrameSampling::Fixed { nframes: i64::MAX }, 100, 30.0);
+  assert!(
+    r.is_err(),
+    "Fixed near-i64::MAX nframes must Err, got {r:?}"
+  );
+  // Fps with a near-i64::MAX min_frames: ceil_by_factor(min_frames, 2)
+  // overflows -> Err (caught before the clamp / final range check).
+  let r2 = smart_nframes(
+    FrameSampling::Fps {
+      fps: 2.0,
+      min_frames: i64::MAX,
+      max_frames: None,
+    },
+    100,
+    30.0,
+  );
+  assert!(
+    r2.is_err(),
+    "Fps near-i64::MAX min_frames must Err, got {r2:?}"
+  );
+  // Fps with a near-i64::MAX explicit max_frames: floor_by_factor(max, 2)
+  // overflows -> Err.
+  let r3 = smart_nframes(
+    FrameSampling::Fps {
+      fps: 2.0,
+      min_frames: 4,
+      max_frames: Some(i64::MAX),
+    },
+    100,
+    30.0,
+  );
+  assert!(
+    r3.is_err(),
+    "Fps near-i64::MAX max_frames must Err, got {r3:?}"
+  );
 }
 
 // ---------- smart_resize ----------
