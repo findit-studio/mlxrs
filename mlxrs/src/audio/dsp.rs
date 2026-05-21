@@ -10,9 +10,10 @@
 //!
 //! ## API conventions
 //! - Window construction is **symmetric** (`periodic=False` in `mlx-audio`):
-//!   the first and last samples are zero. This matches scipy's
-//!   `windows.hann(N, sym=True)` and the `mlx-audio` default for STFT. The
-//!   string→window dispatch ([`window_from_name`]) mirrors `mlx-audio`'s
+//!   the first and last samples are zero for Hann/Blackman/Bartlett (Hamming
+//!   is the exception — its endpoints are `0.08`, not zero). This matches
+//!   scipy's `windows.hann(N, sym=True)` and the `mlx-audio` default for STFT.
+//!   The string→window dispatch ([`window_from_name`]) mirrors `mlx-audio`'s
 //!   `STR_TO_WINDOW_FN` table (`"hann"`/`"hanning"`/`"hamming"`/`"blackman"`/
 //!   `"bartlett"`).
 //! - STFT mirrors `mlx_audio.dsp.stft` defaults: `center=True`,
@@ -607,8 +608,8 @@ pub fn hann_window(n: usize) -> Result<Array> {
 ///
 /// # Errors
 /// Same as [`hann_window`].
-pub fn hamming(n: usize) -> Result<Array> {
-  symmetric_window("hamming", n, |k, denom| {
+pub fn hamming_window(n: usize) -> Result<Array> {
+  symmetric_window("hamming_window", n, |k, denom| {
     let theta = 2.0 * PI * (k as f32) / denom;
     0.54 - 0.46 * theta.cos()
   })
@@ -616,14 +617,15 @@ pub fn hamming(n: usize) -> Result<Array> {
 
 /// Symmetric Blackman window:
 /// `w[k] = 0.42 - 0.5 * cos(2π k / (n - 1)) + 0.08 * cos(4π k / (n - 1))`
-/// for `k in 0..n`. Endpoints are zero (modulo f32 rounding ~`-1.4e-17`).
+/// for `k in 0..n`. Endpoints are zero (modulo f32 rounding of the
+/// `0.42`/`0.5`/`0.08` literals, on the order of `1e-8`).
 ///
 /// Matches `mlx_audio.dsp.blackman(n, periodic=False)`.
 ///
 /// # Errors
 /// Same as [`hann_window`].
-pub fn blackman(n: usize) -> Result<Array> {
-  symmetric_window("blackman", n, |k, denom| {
+pub fn blackman_window(n: usize) -> Result<Array> {
+  symmetric_window("blackman_window", n, |k, denom| {
     let theta = 2.0 * PI * (k as f32) / denom;
     0.42 - 0.5 * theta.cos() + 0.08 * (2.0 * theta).cos()
   })
@@ -637,8 +639,8 @@ pub fn blackman(n: usize) -> Result<Array> {
 ///
 /// # Errors
 /// Same as [`hann_window`].
-pub fn bartlett(n: usize) -> Result<Array> {
-  symmetric_window("bartlett", n, |k, denom| {
+pub fn bartlett_window(n: usize) -> Result<Array> {
+  symmetric_window("bartlett_window", n, |k, denom| {
     1.0 - 2.0 * (k as f32 - denom / 2.0).abs() / denom
   })
 }
@@ -647,9 +649,9 @@ pub fn bartlett(n: usize) -> Result<Array> {
 /// table. The lookup is case-insensitive (matching the reference's
 /// `window.lower()` in `stft`/`istft`):
 /// - `"hann"` / `"hanning"` → [`hann_window`]
-/// - `"hamming"` → [`hamming`]
-/// - `"blackman"` → [`blackman`]
-/// - `"bartlett"` → [`bartlett`]
+/// - `"hamming"` → [`hamming_window`]
+/// - `"blackman"` → [`blackman_window`]
+/// - `"bartlett"` → [`bartlett_window`]
 ///
 /// All windows are the symmetric (`periodic=False`) form, as in `mlx-audio`.
 ///
@@ -661,9 +663,9 @@ pub fn bartlett(n: usize) -> Result<Array> {
 pub fn window_from_name(name: &str, n: usize) -> Result<Array> {
   match name.to_ascii_lowercase().as_str() {
     "hann" | "hanning" => hann_window(n),
-    "hamming" => hamming(n),
-    "blackman" => blackman(n),
-    "bartlett" => bartlett(n),
+    "hamming" => hamming_window(n),
+    "blackman" => blackman_window(n),
+    "bartlett" => bartlett_window(n),
     other => Err(Error::Backend {
       message: format!("window_from_name: unknown window function: {other}"),
     }),
@@ -1789,7 +1791,7 @@ mod tests {
     // 0.54 - 0.46 cos(2π k / 4) for k in 0..5:
     // k=0: 0.54-0.46 = 0.08; k=1: 0.54-0; wait cos(π/2)=0 → 0.54; k=2:
     // cos(π)=-1 → 1.0; k=3: 0.54; k=4: 0.08.
-    let v = to_vec(&hamming(5).unwrap());
+    let v = to_vec(&hamming_window(5).unwrap());
     let expected = [0.08_f32, 0.54, 1.0, 0.54, 0.08];
     for (i, (g, e)) in v.iter().zip(expected.iter()).enumerate() {
       assert!((g - e).abs() < WIN_TOL, "hamming[{i}]: got {g}, want {e}");
@@ -1799,7 +1801,7 @@ mod tests {
   #[test]
   fn hamming_endpoints_are_0_08() {
     // Distinguishing feature vs Hann: Hamming endpoints are 0.08, not 0.
-    let v = to_vec(&hamming(8).unwrap());
+    let v = to_vec(&hamming_window(8).unwrap());
     assert!((v[0] - 0.08).abs() < WIN_TOL, "first: {}", v[0]);
     assert!((v[7] - 0.08).abs() < WIN_TOL, "last: {}", v[7]);
   }
@@ -1809,7 +1811,7 @@ mod tests {
     // 0.42 - 0.5 cos(2π k/4) + 0.08 cos(4π k/4):
     // k=0: 0.42-0.5+0.08 = 0.0; k=1: 0.42-0+(-0.08)=0.34; k=2:
     // 0.42+0.5+0.08=1.0; k=3: 0.34; k=4: 0.0.
-    let v = to_vec(&blackman(5).unwrap());
+    let v = to_vec(&blackman_window(5).unwrap());
     let expected = [0.0_f32, 0.34, 1.0, 0.34, 0.0];
     for (i, (g, e)) in v.iter().zip(expected.iter()).enumerate() {
       assert!((g - e).abs() < WIN_TOL, "blackman[{i}]: got {g}, want {e}");
@@ -1819,13 +1821,13 @@ mod tests {
   #[test]
   fn bartlett_matches_closed_form_n5_and_n4() {
     // n=5 (odd): triangle peaking at 1.0 in the center, 0 at the ends.
-    let v5 = to_vec(&bartlett(5).unwrap());
+    let v5 = to_vec(&bartlett_window(5).unwrap());
     let e5 = [0.0_f32, 0.5, 1.0, 0.5, 0.0];
     for (i, (g, e)) in v5.iter().zip(e5.iter()).enumerate() {
       assert!((g - e).abs() < WIN_TOL, "bartlett5[{i}]: got {g}, want {e}");
     }
     // n=4 (even): 1 - 2|k - 1.5|/3 → [0, 2/3, 2/3, 0].
-    let v4 = to_vec(&bartlett(4).unwrap());
+    let v4 = to_vec(&bartlett_window(4).unwrap());
     let e4 = [0.0_f32, 2.0 / 3.0, 2.0 / 3.0, 0.0];
     for (i, (g, e)) in v4.iter().zip(e4.iter()).enumerate() {
       assert!((g - e).abs() < WIN_TOL, "bartlett4[{i}]: got {g}, want {e}");
@@ -1835,11 +1837,11 @@ mod tests {
   #[test]
   fn windows_reject_n_lt_2() {
     for r in [
-      hamming(0),
-      hamming(1),
-      blackman(1),
-      bartlett(0),
-      bartlett(1),
+      hamming_window(0),
+      hamming_window(1),
+      blackman_window(1),
+      bartlett_window(0),
+      bartlett_window(1),
     ] {
       assert!(matches!(r, Err(Error::Backend { .. })));
     }
@@ -2115,10 +2117,13 @@ mod tests {
 
   #[test]
   fn stft_rejects_odd_n_fft() {
-    // Producer-side close of the odd-`n_fft` silent-misdecode path: `istft`
-    // infers the even `n_fft = (n_freqs - 1) * 2`, so a spectrum produced from
-    // an odd `n_fft` would be misdecoded. `stft` must therefore reject odd
-    // `n_fft` up front rather than emit an un-invertible spectrum. The signal
+    // Producer-side close of the odd-`n_fft` silent-misdecode path: a
+    // one-sided spectrum has `n_freqs == n_fft / 2 + 1` for both `n_fft = 2k`
+    // and `2k + 1`, so the bin count alone cannot disambiguate the parity.
+    // `Spectrum` carries `n_fft` in the type (no inference), so keeping odd
+    // `n_fft` off the producer means a `Spectrum` can never carry one: `stft`
+    // must therefore reject odd `n_fft` up front rather than emit an
+    // un-invertible spectrum. The signal
     // is long enough that an even `n_fft` of the same magnitude frames fine, so
     // the rejection is specifically about parity (not input length).
     let buf = signal_19();
