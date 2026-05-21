@@ -44,10 +44,15 @@ use mlxrs::{
 
 // ─────────────────────────── test infrastructure ─────────────────────────
 
+/// A list of half-open `(start, end)` image spans (the shape the
+/// `vlm::Model` trait passes around). Aliased for readability so the
+/// capture types below aren't deeply-nested raw tuples.
+type ImageSpans = Vec<(usize, usize)>;
+
 /// `(text_embeds shape, image_embeds shape, image_spans)` — captured by
 /// the mock's `merge_embeddings` override for per-call splice-contract
 /// assertions.
-type MergeCallSnapshot = (Vec<usize>, Vec<usize>, Vec<(usize, usize)>);
+type MergeCallSnapshot = (Vec<usize>, Vec<usize>, ImageSpans);
 
 /// Process- and case-scoped temp dir for test image fixtures.
 fn temp_dir(name: &str) -> PathBuf {
@@ -1075,8 +1080,15 @@ fn vlm_generate_threads_cache_offset_and_chunk_local_spans() {
   // (The cache starts empty so initial_offset=0; the offsets equal the
   // cursors.)
   //
-  // Per-chunk capture: `(cache_offset, chunk-local image spans)`.
-  type ChunkCapture = (usize, Vec<(usize, usize)>);
+  // One captured prefill chunk — named (vs a bare nested
+  // `(usize, Vec<(usize, usize)>)` tuple) for readability.
+  #[derive(Debug, PartialEq)]
+  struct ChunkCapture {
+    /// The absolute cache offset the chunk was forwarded at.
+    cache_offset: usize,
+    /// The chunk-local image spans the chunk received.
+    spans: ImageSpans,
+  }
   struct OffsetCapturingModel {
     inner: MockVlmModel,
     captured: RefCell<Vec<ChunkCapture>>,
@@ -1103,10 +1115,10 @@ fn vlm_generate_threads_cache_offset_and_chunk_local_spans() {
       cache_offset: usize,
       cache: &mut [Box<dyn KvCache>],
     ) -> mlxrs::Result<Array> {
-      self
-        .captured
-        .borrow_mut()
-        .push((cache_offset, image_spans.to_vec()));
+      self.captured.borrow_mut().push(ChunkCapture {
+        cache_offset,
+        spans: image_spans.to_vec(),
+      });
       LmModel::forward_embeddings(self, embeddings, cache)
     }
   }
@@ -1134,13 +1146,30 @@ fn vlm_generate_threads_cache_offset_and_chunk_local_spans() {
 
   let cap = model.captured.borrow();
   assert_eq!(cap.len(), 3, "expected 3 chunks");
-  assert_eq!(cap[0], (0, vec![]), "chunk 0: offset 0, no spans");
+  assert_eq!(
+    cap[0],
+    ChunkCapture {
+      cache_offset: 0,
+      spans: vec![]
+    },
+    "chunk 0: offset 0, no spans"
+  );
   assert_eq!(
     cap[1],
-    (2, vec![(0, 3)]),
+    ChunkCapture {
+      cache_offset: 2,
+      spans: vec![(0, 3)]
+    },
     "chunk 1: offset 2, chunk-local span (0,3) = the full image"
   );
-  assert_eq!(cap[2], (5, vec![]), "chunk 2: offset 5, no spans");
+  assert_eq!(
+    cap[2],
+    ChunkCapture {
+      cache_offset: 5,
+      spans: vec![]
+    },
+    "chunk 2: offset 5, no spans"
+  );
 }
 
 // (Pure-text-through-vlm_generate chunking path: covered indirectly by
@@ -1252,7 +1281,7 @@ fn vlm_generate_threads_per_request_spans_no_cross_iterator_pollution() {
   // equal capture[0] (B's spans).
   struct SpanCapturingModel {
     inner: MockVlmModel,
-    captured_spans: RefCell<Vec<Vec<(usize, usize)>>>,
+    captured_spans: RefCell<Vec<ImageSpans>>,
   }
   impl LmModel for SpanCapturingModel {
     fn forward(&self, t: &Array, c: &mut [Box<dyn KvCache>]) -> mlxrs::Result<Array> {
