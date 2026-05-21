@@ -12,8 +12,9 @@
 //! `MLXLMCommon/RoPEUtils.swift`) are deliberately **out of scope here**:
 //! they precompute a per-dimension `freqs` array and forward it through the
 //! same `mlx_fast_rope` primitive with `base = None`. They will land as
-//! sibling modules under `lm::nn` that reuse [`rope::rope`]'s freqs path,
-//! so this module is structured to grow into them without churn.
+//! sibling modules under `lm::nn`; adding them will extend the shared
+//! `mlx_fast_rope` wrapper with a `freqs`-based entry point (today
+//! [`rope::rope`] exposes only the `base` path).
 
 pub mod rope;
 

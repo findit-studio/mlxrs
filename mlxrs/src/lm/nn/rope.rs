@@ -72,14 +72,15 @@ pub enum RopeOffsetRef<'a> {
 }
 
 impl<'a> From<&'a RopeOffset> for RopeOffsetRef<'a> {
-  /// Borrow a cache's owned [`RopeOffset`]
-  /// without cloning the `Batch` array. The owned scalar is `usize`; it is
-  /// narrowed to the `i32` mlx-c offset (`as`, saturating semantics are
-  /// irrelevant in practice — positions never approach `i32::MAX`, and mlx
-  /// itself takes `int`).
+  /// Borrow a cache's owned [`RopeOffset`] without cloning the `Batch` array.
+  /// The owned scalar is `usize`; it is narrowed to the `i32` mlx-c offset
+  /// **saturating** at `i32::MAX` (via `i32::try_from`) rather than wrapping —
+  /// token positions never realistically approach `i32::MAX` and mlx itself
+  /// takes `int`, but saturation keeps a pathological position a large positive
+  /// offset instead of silently flipping it negative.
   fn from(offset: &'a RopeOffset) -> Self {
     match offset {
-      RopeOffset::Scalar(p) => RopeOffsetRef::Scalar(*p as i32),
+      RopeOffset::Scalar(p) => RopeOffsetRef::Scalar(i32::try_from(*p).unwrap_or(i32::MAX)),
       RopeOffset::Batch(arr) => RopeOffsetRef::Array(arr),
     }
   }
@@ -601,5 +602,22 @@ mod tests {
       &via_scalar_bridge.to_vec::<f32>().unwrap(),
       &via_scalar.to_vec::<f32>().unwrap(),
     );
+  }
+
+  #[test]
+  fn rope_offset_ref_scalar_saturates_instead_of_wrapping() {
+    // `usize -> i32` must saturate at `i32::MAX`, not wrap to a negative offset
+    // (Copilot review: the prior `as` cast wrapped). A position past `i32::MAX`
+    // is pathological but must never silently rotate at a negative position.
+    let huge = RopeOffset::Scalar(usize::MAX);
+    match (&huge).into() {
+      RopeOffsetRef::Scalar(p) => assert_eq!(p, i32::MAX),
+      RopeOffsetRef::Array(_) => panic!("scalar offset must map to a scalar ref"),
+    }
+    let at_max = RopeOffset::Scalar(i32::MAX as usize);
+    match (&at_max).into() {
+      RopeOffsetRef::Scalar(p) => assert_eq!(p, i32::MAX),
+      RopeOffsetRef::Array(_) => unreachable!(),
+    }
   }
 }
