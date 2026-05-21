@@ -1017,3 +1017,895 @@ pub fn generate<M: Model>(
   }
   Ok(text)
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+//   Batched generation (L1) — left-padded prefill + per-row independent EOS.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// One batched decode step (per-row sampled `token` + the `[V]` log-probability
+/// vector that produced it) for **one** row of a [`batch_generate`] /
+/// [`batch_stream_generate`] run — the batched analogue of [`GenStep`].
+///
+/// `row` is the 0-based row index in the original `prompts` slice; `token` is
+/// the just-sampled id; `logprobs` is the `[V]` per-row log-probability vector
+/// (kept lazy — the only materialization is the per-row token id, mirroring
+/// single-seq [`GenStep`]); `finish_reason` is `None` while the row is still
+/// generating, `Some("stop")` once the row sampled an EOS token, `Some(
+/// "length")` when the row hit [`GenConfig::max_tokens`].
+#[derive(Debug)]
+pub struct BatchGenStep {
+  /// 0-based row index in the original `prompts` slice — mlx-lm
+  /// `GenerationBatch.Response.uid` (uids are assigned in insertion order,
+  /// so `uid == row index` here).
+  pub row: usize,
+  /// The sampled token id for this row at this step (mlx-lm `Response.token`).
+  pub token: u32,
+  /// The `[V]` per-row log-probability vector that produced `token` (mlx-lm
+  /// `Response.logprobs`).
+  pub logprobs: Array,
+  /// `None` while still generating; `Some("stop")` on an EOS token,
+  /// `Some("length")` on `max_tokens` — exactly mlx-lm `Response.finish_reason`.
+  pub finish_reason: Option<String>,
+}
+
+/// Streaming batched-generation iterator: one [`BatchGenStep`] per row per
+/// step, yielding rows in row-index order within each step. Stops when every
+/// row has finished (EOS / `max_tokens`).
+///
+/// The decode loop runs ONE forward over the full `[B, 1]` batch per step
+/// (mirroring mlx-lm `GenerationBatch._step`, `generate.py:1320-1378` —
+/// "Forward pass: logits = self.model(inputs[:, None], cache=...)"), then
+/// per-row samples / appends. Rows finish independently: once a row hits EOS
+/// or `max_tokens`, it is marked done but the batch shape stays `[B, ...]`
+/// (the underlying batch caches do not support mid-run row removal; finished
+/// rows feed `pad_token_id` and their sampled outputs are discarded).
+///
+/// The iterator **fuses**: after it yields `Err` (a step failed) or finishes
+/// (every row done) every further `next()` is `None` — never a panic, never a
+/// poisoned re-entry (spec §4).
+pub struct BatchGenerator<'a, M: Model> {
+  model: &'a M,
+  cache: Vec<Box<dyn KvCache>>,
+  sampler: Sampler,
+  processors: Vec<LogitsProcessor>,
+  /// The left-padded prompt `[B, max_len]` (mlx-lm `_left_pad_prompts`,
+  /// `generate.py:802-805`). Prefill advances [`Self::prefill_offset`] over
+  /// this buffer; the unconsumed final column starts the first decode step.
+  /// Stored as `Vec<Vec<u32>>` rather than the materialized `Array` so the
+  /// prefill chunk slicing is host-side (the `Array` slice would still need
+  /// rebuilding per chunk; this avoids the per-chunk `slice` op).
+  padded_rows: Vec<Vec<u32>>,
+  max_len: usize,
+  prefill_offset: usize,
+  /// Per-row running history fed to the logits processors (mlx-lm
+  /// `GenerationBatch._token_context`). Each row's `_step` slice is `inputs[
+  /// i:i+1]` so each row's history grows by the per-step input token.
+  history: Vec<Vec<u32>>,
+  /// The most-recent per-row sampled token (mlx-lm's `inputs` fed into the
+  /// next `_step`); `None` before the first decode step. A finished row's
+  /// slot stays at `pad_token_id` for every subsequent step.
+  last: Vec<u32>,
+  /// Per-row "tokens generated so far" counter (mlx-lm `Response`'s
+  /// generation count); compared against `max_tokens` per row.
+  produced: Vec<usize>,
+  /// Per-row finish reason: `None` while still generating, `Some("stop")`
+  /// once EOS sampled, `Some("length")` at `max_tokens`. Mirrors mlx-lm's
+  /// per-row `Response.finish_reason` semantics. A row stops contributing
+  /// output the step it transitions from `None` to `Some(_)` (the EOS token
+  /// itself is yielded with `finish_reason="stop"` but NOT appended to the
+  /// row's running output by `batch_generate`, mirroring mlx-lm
+  /// `generate.py:1945-1946`).
+  finished: Vec<Option<String>>,
+  /// 0-based row indices yet to emit at the current step (drained in order
+  /// by `next()`). Empty between steps; refilled when a new forward runs.
+  pending_emit: std::collections::VecDeque<BatchGenStep>,
+  pad_token_id: u32,
+  max_tokens: usize,
+  prefill_step_size: usize,
+  eos: Vec<u32>,
+  /// `true` once prompt prefill has run (it runs on the first `next()`).
+  prefilled: bool,
+  /// `true` until the first decode step has run (it feeds the unconsumed
+  /// prompt tail; later steps feed back `last`).
+  first_step: bool,
+  /// A deferred sampler / processor / cache validation error (from
+  /// [`batch_generate_step`]); yielded as the iterator's first (and only)
+  /// `Err` before any step runs, keeping the public surface a pure
+  /// `Iterator`.
+  pending_err: Option<Error>,
+  /// Fused: set after a yielded `Err` or all-rows-done so the iterator
+  /// never re-enters mlx-c / re-runs the model.
+  done: bool,
+}
+
+impl<M: Model> BatchGenerator<'_, M> {
+  fn batch_size(&self) -> usize {
+    self.padded_rows.len()
+  }
+
+  /// One chunked-prefill pass over the left-padded `[B, max_len-1]` window —
+  /// mirrors single-seq [`Generator::prefill`] but emits `[B, S]` token
+  /// windows. Logits are discarded; only the cache is filled.
+  fn prefill(&mut self) -> Result<()> {
+    while self.max_len - self.prefill_offset > 1 {
+      let remaining = (self.max_len - self.prefill_offset) - 1;
+      let n = self.prefill_step_size.min(remaining);
+      let chunk = batch_token_window(
+        &self.padded_rows,
+        self.prefill_offset,
+        self.prefill_offset + n,
+      )?;
+      // logits discarded — the chunk only fills the cache.
+      let _ = self.model.forward(&chunk, &mut self.cache)?;
+      self.prefill_offset += n;
+    }
+    Ok(())
+  }
+
+  /// One batched decode step — the batched analogue of [`Generator::step`].
+  /// Returns the per-row [`BatchGenStep`] vector (one entry per row, in row
+  /// order), with each row's `finish_reason` updated for this step's
+  /// transition (newly-finished rows get `Some("stop")`/`Some("length")`).
+  ///
+  /// Mirrors mlx-lm `GenerationBatch._step` (`generate.py:1320-1378`): single
+  /// `[B, 1]` forward → `logits[:, -1, :]` → optional per-row processors →
+  /// `logsumexp` normalize → sampler → per-row token extract. Finished rows
+  /// pre-step are still fed (their `last` slot is `pad_token_id`) but their
+  /// sampled-token contribution is NOT appended to the running output (the
+  /// per-row `BatchGenStep` for an already-finished row carries the
+  /// finalized `finish_reason` and a dummy token, exactly like mlx-lm where
+  /// a removed row produces no further `Response`s — but our batch shape
+  /// can't shrink, so we surface the no-op as `finish_reason=Some(prior)`).
+  fn step(&mut self, input: &[u32]) -> Result<Vec<BatchGenStep>> {
+    let b = self.batch_size();
+    // 1. forward over `input[B, S]`; cache updated in place.
+    let tokens = batch_full_window(input, b, input.len() / b)?;
+    let logits = self.model.forward(&tokens, &mut self.cache)?;
+
+    // 2. `logits = logits[:, -1, :]` ⇒ `[B, V]`.
+    let mut logits = last_position(&logits)?;
+
+    // 3. Per-row logits processors (mlx-lm `_step` lines 1336-1349): if any
+    //    processors, split the per-step input into per-row `[1]` slices,
+    //    grow each row's history by that token, run each processor over the
+    //    row's history on the row's `[1, V]` logit slice, then concat back
+    //    to `[B, V]`. mlx-lm only runs this block when any processor exists
+    //    AND the input is non-empty; mirror that exactly (avoid the needless
+    //    per-row history growth in the no-processors path).
+    if !self.processors.is_empty() && !input.is_empty() {
+      let s = input.len() / b;
+      let mut row_logits: Vec<Array> = try_with_capacity(b)?;
+      for (row, hist) in self.history.iter_mut().enumerate().take(b) {
+        // Per-row input slice for this step (the row's S tokens from the
+        // window; mlx-lm `inputs[i:i+1]` is shape-equivalent — both extend
+        // the row's running history by S tokens).
+        let row_input = &input[row * s..(row + 1) * s];
+        try_extend_from_slice(hist, row_input)?;
+        // Per-row logit slice `logits[row:row+1, :]` ⇒ `[1, V]`.
+        let v = logits.shape()[1] as i32;
+        let row_logit =
+          ops::indexing::slice(&logits, &[row as i32, 0], &[(row + 1) as i32, v], &[1, 1])?;
+        let mut row_l = row_logit;
+        for p in &self.processors {
+          row_l = p(hist, &row_l)?;
+        }
+        row_logits.push(row_l);
+      }
+      // concat the `[1, V]` rows back to `[B, V]` on axis 0.
+      let row_refs: Vec<&Array> = row_logits.iter().collect();
+      logits = ops::shape::concatenate(&row_refs, 0)?;
+    }
+
+    // 4. `logprobs = logits - logsumexp(logits, keepdims=True)` (mlx-lm
+    //    `_step` line 1352). The full-axes `logsumexp` matches the
+    //    single-seq path: every `[B, V]` row gets normalized independently
+    //    because the reduction is per-row when `keepdims=True` broadcasts.
+    //
+    //    Note: mlx-lm's `_step` calls `mx.logsumexp(logits, axis=-1,
+    //    keepdims=True)` here (explicit `axis=-1`), whereas the single-seq
+    //    path passes no `axis` (full reduction). For `[B, V]` the two
+    //    differ — `axis=-1` per-row normalizes to `[B, 1]`, full reduction
+    //    is `[1, 1]`. The single-seq path's full reduction is correct
+    //    because B=1; for batch we MUST use axis=-1 per-row.
+    let lse = ops::reduction::logsumexp_axes(&logits, &[-1], true)?;
+    let logprobs = ops::arithmetic::subtract(&logits, &lse)?;
+
+    // 5. `sampled = sampler(logprobs)` (mlx-lm `_step` lines 1354-1363).
+    //    A single global sampler is applied to the full `[B, V]`; argmax /
+    //    categorical / the make_sampler chain all reduce over axis=-1 and
+    //    yield `[B]` U32. Per-row samplers (mlx-lm's `samplers[e]` list)
+    //    are not exposed by [`GenConfig`] — mirrors mlx-lm's fallback path.
+    let mut sampled = (self.sampler)(&logprobs)?;
+
+    // 6. token boundary: ONE materialization for the whole batch (mlx-lm
+    //    materializes `inputs.tolist()` once per step, line 1375); the
+    //    logprobs stay lazy.
+    let tokens: Vec<u32> = sampled.to_vec::<u32>()?;
+    if tokens.len() != b {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "batch_generate: sampler returned {} tokens, expected {b} (one per row)",
+          tokens.len()
+        ),
+      });
+    }
+
+    // Build per-row step results. The full per-row logprob slice `[V]` is
+    // sliced lazily (the only materialization above was the token batch).
+    let mut steps: Vec<BatchGenStep> = try_with_capacity(b)?;
+    let v = logprobs.shape()[1] as i32;
+    for (row, &tok) in tokens.iter().enumerate() {
+      // logprobs[row, :] ⇒ `[V]` (slice + squeeze axis 0).
+      let row_lp =
+        ops::indexing::slice(&logprobs, &[row as i32, 0], &[(row + 1) as i32, v], &[1, 1])?;
+      let row_lp = ops::shape::squeeze_axes(&row_lp, &[0])?;
+      // Decide per-row transition (None ⇒ Some on EOS / max_tokens).
+      // Already-finished rows keep their prior reason (the loop won't emit
+      // them again, but we still build the result so per-row order is
+      // preserved if a caller streams them).
+      let prior = self.finished[row].clone();
+      let new_reason: Option<String> = if prior.is_some() {
+        prior
+      } else if self.eos.contains(&tok) {
+        Some("stop".to_string())
+      } else {
+        // Pre-bump check: this step's token will be the `produced[row] + 1`th
+        // generated token; mlx-lm reports "length" when `produced == max_tokens`
+        // BEFORE yielding the would-be next token (`generate_step` line 421:
+        // `if n == max_tokens: break` is BEFORE the yield).
+        // BUT mlx-lm's single-seq path yields the LAST token with no
+        // finish_reason and breaks; the next iteration sees `n ==
+        // max_tokens` and stops. Here for batch we lump them: the
+        // `(produced+1) == max_tokens` token gets `Some("length")` to surface
+        // the per-row termination in ONE step (the caller would otherwise
+        // need a separate "length" sentinel after this token).
+        if self.produced[row] + 1 >= self.max_tokens {
+          Some("length".to_string())
+        } else {
+          None
+        }
+      };
+      steps.push(BatchGenStep {
+        row,
+        token: tok,
+        logprobs: row_lp,
+        finish_reason: new_reason,
+      });
+    }
+    Ok(steps)
+  }
+}
+
+impl<M: Model> Iterator for BatchGenerator<'_, M> {
+  type Item = Result<BatchGenStep>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    // Drain any pending per-row step results from the most-recent forward
+    // before running another model call.
+    if let Some(step) = self.pending_emit.pop_front() {
+      return Some(Ok(step));
+    }
+    if self.done {
+      return None;
+    }
+    // A deferred sampler / processor construction error is the iterator's
+    // first (and only) item, before any model call.
+    if let Some(e) = self.pending_err.take() {
+      self.done = true;
+      return Some(Err(e));
+    }
+
+    // Prompt prefill runs once, lazily, on the first poll.
+    if !self.prefilled {
+      self.prefilled = true;
+      if let Err(e) = self.prefill() {
+        self.done = true;
+        return Some(Err(e));
+      }
+    }
+
+    // Build the next step's `[B, S]` input window. First step consumes the
+    // unconsumed prompt tail (post-prefill); every later step feeds back the
+    // per-row `last` (finished rows feed `pad_token_id`).
+    let b = self.batch_size();
+    let input: Vec<u32> = if self.first_step {
+      self.first_step = false;
+      let tail_len = self.max_len - self.prefill_offset;
+      // `[B, tail_len]` left-padded tail in row-major order.
+      let mut buf = match try_with_capacity::<u32>(b * tail_len) {
+        Ok(b) => b,
+        Err(e) => {
+          self.done = true;
+          return Some(Err(e));
+        }
+      };
+      for row in &self.padded_rows {
+        buf.extend_from_slice(&row[self.prefill_offset..self.prefill_offset + tail_len]);
+      }
+      buf
+    } else {
+      self.last.clone()
+    };
+
+    let steps = match self.step(&input) {
+      Ok(s) => s,
+      Err(e) => {
+        self.done = true;
+        return Some(Err(e));
+      }
+    };
+
+    // Apply per-row transitions BEFORE queueing emits: update `last`,
+    // `produced`, `finished`. A row already-finished pre-step has its
+    // `last` reset to `pad_token_id` (no effect on already-finished rows;
+    // the cache still advances but the model never "sees" a meaningful
+    // continuation for that row — its sampled-token output is dropped by
+    // the `batch_generate` aggregator).
+    for step in &steps {
+      let row = step.row;
+      // Already finished rows: preserve `last` as pad; ignore sampled token.
+      if self.finished[row].is_some() {
+        self.last[row] = self.pad_token_id;
+        continue;
+      }
+      // Newly-decided rows: update bookkeeping.
+      self.last[row] = step.token;
+      self.produced[row] += 1;
+      if let Some(ref reason) = step.finish_reason {
+        self.finished[row] = Some(reason.clone());
+        // mlx-lm batch_generate (generate.py:1945-1946) excludes "stop"
+        // tokens from the per-row output; the EOS token feeds the cache
+        // for this step but should NOT propagate into the next-step input
+        // (the row's `last` is reset to pad so a parallel still-running
+        // row drives a deterministic dummy column).
+        if reason == "stop" {
+          self.last[row] = self.pad_token_id;
+        }
+      }
+    }
+
+    // Queue per-row emits and stop if every row finished.
+    for step in steps {
+      self.pending_emit.push_back(step);
+    }
+    if self.finished.iter().all(|r| r.is_some()) {
+      self.done = true;
+    }
+
+    // Yield the first queued emit; subsequent `next()` calls drain the
+    // queue before running another forward.
+    self.pending_emit.pop_front().map(Ok)
+  }
+}
+
+/// Build a left-padded `[B, max_len]` `I32` token matrix from `rows` —
+/// mlx-lm `_left_pad_prompts` (`generate.py:802-805`,
+/// `mx.array([[pad]*(max_len-len(p)) + p for p in prompts])`).
+fn left_pad_rows(prompts: &[&[u32]], pad_token_id: u32) -> Result<(Vec<Vec<u32>>, usize)> {
+  if prompts.is_empty() {
+    return Err(Error::ShapeMismatch {
+      message: "batch_generate: prompts must be non-empty".into(),
+    });
+  }
+  let max_len = prompts.iter().map(|p| p.len()).max().unwrap_or(0);
+  if max_len == 0 {
+    return Err(Error::ShapeMismatch {
+      message: "batch_generate: every prompt must be non-empty".into(),
+    });
+  }
+  let mut padded: Vec<Vec<u32>> = try_with_capacity(prompts.len())?;
+  for p in prompts {
+    if p.is_empty() {
+      return Err(Error::ShapeMismatch {
+        message: "batch_generate: every prompt must be non-empty".into(),
+      });
+    }
+    let mut row: Vec<u32> = try_with_capacity(max_len)?;
+    for _ in 0..(max_len - p.len()) {
+      row.push(pad_token_id);
+    }
+    try_extend_from_slice(&mut row, p)?;
+    padded.push(row);
+  }
+  Ok((padded, max_len))
+}
+
+/// Build a `[B, end-start]` `I32` window from the left-padded row
+/// representation — the batched analogue of [`token_window`].
+fn batch_token_window(rows: &[Vec<u32>], start: usize, end: usize) -> Result<Array> {
+  let b = rows.len();
+  let s = end - start;
+  let mut buf: Vec<i32> = try_with_capacity(b * s)?;
+  for row in rows {
+    buf.extend(row[start..end].iter().map(|&t| t as i32));
+  }
+  Array::from_slice::<i32>(&buf, &(b, s))
+}
+
+/// Build a `[B, S]` `I32` window from a row-major `[B*S]` token slice — used
+/// for the first decode step's left-padded prompt tail and subsequent
+/// single-token-per-row decode windows.
+fn batch_full_window(flat: &[u32], b: usize, s: usize) -> Result<Array> {
+  let mut buf: Vec<i32> = try_with_capacity(flat.len())?;
+  buf.extend(flat.iter().map(|&t| t as i32));
+  Array::from_slice::<i32>(&buf, &(b, s))
+}
+
+/// Per-row left-pad counts (`max_len - len(row)`) — the input to
+/// [`crate::lm::cache::BatchKvCache::new`] /
+/// [`crate::lm::cache::BatchRotatingKvCache::new`] so the cache's per-sequence
+/// mask/RoPE metadata matches the left-padding chosen by [`batch_generate`].
+///
+/// Exposed as a public helper so a caller building their own batch cache
+/// outside [`batch_generate`] (e.g. with [`crate::lm::cache::BatchRotatingKvCache`])
+/// can reuse the exact left-pad scheme [`batch_generate`] uses internally.
+pub fn batch_left_padding(prompts: &[&[u32]]) -> Vec<i32> {
+  let max_len = prompts.iter().map(|p| p.len()).max().unwrap_or(0);
+  prompts.iter().map(|p| (max_len - p.len()) as i32).collect()
+}
+
+/// Start a batched generation run — the batched analogue of [`generate_step`]
+/// (mlx-lm `GenerationBatch.__init__` + `_step` driven by `BatchGenerator`).
+///
+/// `prompts` is the per-row encoded token ids (must be non-empty, every row
+/// non-empty); `pad_token_id` is the id used to left-pad shorter rows
+/// (mlx-lm `_left_pad_prompts` uses `0`, but the caller chooses — the
+/// project's `Tokenizer` may not always have a fixed pad id, so it is
+/// surfaced explicitly); `cache` is the per-layer batch KV cache (typically
+/// [`crate::lm::cache::BatchKvCache::new`] /
+/// [`crate::lm::cache::BatchRotatingKvCache::new`] with `left_padding` =
+/// [`batch_left_padding`]); `cfg` is the [`GenConfig`].
+///
+/// Returns an `Iterator<Item = Result<BatchGenStep>>`: one yield per row per
+/// step, in row order within each step. Each row finishes independently on
+/// EOS (`finish_reason = Some("stop")`) or `max_tokens` (`finish_reason =
+/// Some("length")`); the iterator ends when every row has finished. A step
+/// error is yielded once as `Err`, after which the iterator ends — never a
+/// panic, never a poisoned re-entry (spec §4).
+///
+/// **Per-row logits processors.** Mirrors mlx-lm `GenerationBatch._step`
+/// lines 1336-1349: when processors exist, the per-step `[B, V]` logits are
+/// sliced per-row, each row's running history is extended by that step's
+/// per-row input token, and the processors run on the per-row history +
+/// per-row `[1, V]` slice before being concatenated back to `[B, V]` for
+/// normalization + sampling. The `GenConfig`-built processors (repetition /
+/// presence / frequency penalties) are shared across rows but their context
+/// is per-row.
+///
+/// **Cache contract.** The supplied `cache` MUST be built with `left_padding
+/// = [max_len - len(p_i)]` for `max_len = max(len(p) for p in prompts)`
+/// (use [`batch_left_padding`]) — the per-row mask uses that exact term.
+/// `cache.len()` must match the model's decoder-layer count (the same as
+/// single-seq [`generate_step`]).
+pub fn batch_generate_step<'a, M: Model>(
+  model: &'a M,
+  prompts: &[&[u32]],
+  pad_token_id: u32,
+  cache: Vec<Box<dyn KvCache>>,
+  cfg: GenConfig,
+) -> BatchGenerator<'a, M> {
+  type Built = (Vec<Vec<u32>>, usize, Sampler, Vec<LogitsProcessor>);
+  let built = (|| -> Result<Built> {
+    let (padded_rows, max_len) = left_pad_rows(prompts, pad_token_id)?;
+    let sampler = make_sampler(
+      cfg.temp,
+      cfg.top_p,
+      cfg.min_p,
+      cfg.min_tokens_to_keep,
+      cfg.top_k,
+      cfg.xtc_probability,
+      cfg.xtc_threshold,
+      &cfg.xtc_special_tokens,
+      cfg.seed,
+    )?;
+    let processors = make_logits_processors(
+      &cfg.logit_bias,
+      cfg.repetition_penalty,
+      cfg.repetition_context_size,
+      cfg.presence_penalty,
+      cfg.presence_context_size,
+      cfg.frequency_penalty,
+      cfg.frequency_context_size,
+    )?;
+    Ok((padded_rows, max_len, sampler, processors))
+  })();
+
+  match built {
+    Ok((padded_rows, max_len, sampler, processors)) => {
+      let b = padded_rows.len();
+      BatchGenerator {
+        model,
+        cache,
+        sampler,
+        processors,
+        padded_rows,
+        max_len,
+        prefill_offset: 0,
+        history: vec![Vec::new(); b],
+        last: vec![pad_token_id; b],
+        produced: vec![0; b],
+        finished: vec![None; b],
+        pending_emit: std::collections::VecDeque::new(),
+        pad_token_id,
+        max_tokens: cfg.max_tokens,
+        prefill_step_size: cfg.prefill_step_size.max(1),
+        eos: cfg.eos,
+        prefilled: false,
+        first_step: true,
+        pending_err: None,
+        done: false,
+      }
+    }
+    Err(e) => BatchGenerator {
+      model,
+      cache,
+      // A never-called placeholder sampler; `pending_err` ends the iterator
+      // on its first poll before any step runs.
+      sampler: Box::new(|_| {
+        Err(Error::Backend {
+          message: "batch_generate: sampler construction failed".into(),
+        })
+      }),
+      processors: Vec::new(),
+      padded_rows: Vec::new(),
+      max_len: 0,
+      prefill_offset: 0,
+      history: Vec::new(),
+      last: Vec::new(),
+      produced: Vec::new(),
+      finished: Vec::new(),
+      pending_emit: std::collections::VecDeque::new(),
+      pad_token_id,
+      max_tokens: cfg.max_tokens,
+      prefill_step_size: 1,
+      eos: Vec::new(),
+      prefilled: true,
+      first_step: false,
+      pending_err: Some(e),
+      done: false,
+    },
+  }
+}
+
+/// Stream batched generation for `prompts` — the batched analogue of
+/// [`stream_generate`]. Iterates over [`BatchGenStep`] items (one per row per
+/// step, in row order within each step), using the tokenizer's EOS set
+/// (overriding any `cfg.eos`, mirroring [`stream_generate`]) so per-row
+/// `finish_reason` matches single-seq generation exactly.
+///
+/// See [`batch_generate_step`] for the iteration contract; this just wires
+/// `cfg.eos = tokenizer.eos_token_ids()` before constructing the underlying
+/// [`BatchGenerator`].
+pub fn batch_stream_generate<'a, M: Model>(
+  model: &'a M,
+  tokenizer: &'a crate::tokenizer::Tokenizer,
+  prompts: &[&[u32]],
+  pad_token_id: u32,
+  cache: Vec<Box<dyn KvCache>>,
+  cfg: GenConfig,
+) -> BatchGenerator<'a, M> {
+  let mut cfg = cfg;
+  cfg.eos = tokenizer.eos_token_ids().iter().copied().collect();
+  batch_generate_step(model, prompts, pad_token_id, cache, cfg)
+}
+
+/// Generate per-row token sequences for a batch of prompts — the batched
+/// analogue of [`generate`] and a 1:1 port of `mlx_lm.generate.batch_generate`
+/// (`generate.py:1887-1963`).
+///
+/// Drives [`batch_stream_generate`] to completion, collecting each row's
+/// sampled tokens into the returned `Vec<Vec<u32>>` (one entry per input
+/// prompt, in input order). EOS tokens (`finish_reason="stop"`) are EXCLUDED
+/// from each row's output, mirroring mlx-lm `batch_generate`
+/// (`generate.py:1945-1946`: `if r.finish_reason != "stop":
+/// results[r.uid].append(r.token)`); a `"length"` finish includes the token.
+///
+/// Any step error short-circuits the collection as `Err` (the
+/// [`batch_stream_generate`] Iterator-`Err` contract is preserved).
+///
+/// # Arguments
+///
+/// - `model` — the [`Model`] implementation.
+/// - `tokenizer` — provides the EOS set (overriding `cfg.eos`, like
+///   [`stream_generate`]).
+/// - `prompts` — per-row encoded prompt ids (must be non-empty, every row
+///   non-empty; ragged lengths are left-padded with `pad_token_id`).
+/// - `pad_token_id` — left-pad id for shorter rows (use
+///   [`crate::tokenizer::Tokenizer::pad_token_id`] when available, else any
+///   in-vocab id such as `0`).
+/// - `cache` — per-layer batch KV cache (typically
+///   [`crate::lm::cache::BatchKvCache::new`] /
+///   [`crate::lm::cache::BatchRotatingKvCache::new`] with `left_padding`
+///   from [`batch_left_padding`]).
+/// - `cfg` — [`GenConfig`] (its `eos` is overridden by the tokenizer's set).
+///
+/// # Returns
+///
+/// `Vec<Vec<u32>>` — one per-row token sequence (input row order). Each
+/// row's length is `produced - int(finish_reason == "stop")` ⇒ at most
+/// `cfg.max_tokens`. A `"stop"` finish drops the trailing EOS; a `"length"`
+/// finish keeps the final token.
+pub fn batch_generate<M: Model>(
+  model: &M,
+  tokenizer: &crate::tokenizer::Tokenizer,
+  prompts: &[&[u32]],
+  pad_token_id: u32,
+  cache: Vec<Box<dyn KvCache>>,
+  cfg: GenConfig,
+) -> Result<Vec<Vec<u32>>> {
+  let b = prompts.len();
+  let mut results: Vec<Vec<u32>> = try_with_capacity(b)?;
+  for _ in 0..b {
+    results.push(Vec::new());
+  }
+  for step in batch_stream_generate(model, tokenizer, prompts, pad_token_id, cache, cfg) {
+    let step = step?;
+    // mlx-lm batch_generate (generate.py:1945-1946): drop EOS tokens from
+    // per-row output; keep `"length"`-finish tokens; keep all in-progress
+    // tokens. An already-finished row's emit (finish_reason carried from a
+    // prior step, but the iterator only emits the once-per-row transition
+    // — see `step()`'s prior-vs-new finish_reason logic) is never re-added.
+    let row = step.row;
+    if row >= results.len() {
+      // Defensive: a sampler / model returning an out-of-range row index
+      // would corrupt results; surface as a recoverable Err rather than a
+      // panic.
+      return Err(Error::Backend {
+        message: format!("batch_generate: step row {row} out of range for {b} prompts"),
+      });
+    }
+    match step.finish_reason.as_deref() {
+      Some("stop") => {
+        // EOS: drop the token, do NOT append.
+      }
+      _ => {
+        // None ("still going") or Some("length") or any other reason: append.
+        results[row].push(step.token);
+      }
+    }
+  }
+  Ok(results)
+}
+
+#[cfg(test)]
+mod batch_tests {
+  //! L1 tests — [`MockBatchModel`] + `batch_generate` over a 2-3 row batch
+  //! with different prompt lengths, finishing rows at different times.
+
+  use super::*;
+  use crate::lm::{cache::BatchKvCache, model::Model};
+
+  /// A deterministic batched model: each row gets a canned "next token" at
+  /// each *decode* step from `scripts[row]`, with the script index derived
+  /// from the post-forward cache `offset()` and the prompt's `max_len`
+  /// (`script_idx = cache_offset - max_len`). Logits are crafted so
+  /// `argmax` returns the canned id (all others get `0.0`, the canned id
+  /// gets `+10.0`). Cache wiring is minimal — pushes a placeholder
+  /// `[B, 1, S, 1]` KV step into every layer so cache `offset()` advances
+  /// exactly like the real `MockModel`.
+  ///
+  /// `vocab` controls the logits axis; `max_len` is the (left-padded)
+  /// prompt length the generator was given (cache `offset()` reaches this
+  /// value at the end of prefill, then advances by 1 per decode step);
+  /// `scripts` is the per-row sequence of (argmax) next tokens — at decode
+  /// step `t` (0-based, first decode after prefill) row `r` predicts
+  /// `scripts[r][t]`. Prefill (`S > 1` or the trailing post-prefill
+  /// `cache_offset <= max_len - 1` chunks) returns arbitrary logits (the
+  /// loop discards them); the script cursor is read from cache state, so
+  /// the first decode token always reads `scripts[r][0]` regardless of
+  /// prefill chunking. Test-only, no public API.
+  struct MockBatchModel {
+    canned: Vec<f32>, // length == vocab; baseline `0.0`s.
+    vocab: usize,
+    max_len: usize,
+    scripts: Vec<Vec<u32>>,
+  }
+
+  impl MockBatchModel {
+    fn new(vocab: usize, max_len: usize, scripts: Vec<Vec<u32>>) -> Self {
+      Self {
+        canned: vec![0.0; vocab],
+        vocab,
+        max_len,
+        scripts,
+      }
+    }
+  }
+
+  impl Model for MockBatchModel {
+    fn forward(
+      &self,
+      tokens: &Array,
+      cache: &mut [Box<dyn crate::lm::cache::KvCache>],
+    ) -> Result<Array> {
+      let shape = tokens.shape();
+      let (batch, seq) = match shape.as_slice() {
+        [b, s] => (*b, *s),
+        other => {
+          return Err(Error::ShapeMismatch {
+            message: format!("MockBatchModel::forward expects [B, S] tokens, got {other:?}"),
+          });
+        }
+      };
+
+      // Advance cache so `offset` increments (mirrors the single-seq
+      // MockModel's wiring; batch caches use a [B, n_kv_heads, S, head_dim]
+      // KV step). `n_kv_heads=1`, `head_dim=1` for the smallest possible.
+      for layer in cache.iter_mut() {
+        let elems = batch * seq;
+        let k = Array::from_slice::<f32>(&vec![1.0_f32; elems], &(batch, 1usize, seq, 1usize))?;
+        let v = Array::from_slice::<f32>(&vec![2.0_f32; elems], &(batch, 1usize, seq, 1usize))?;
+        layer.update(&k, &v)?;
+      }
+
+      // Build per-row logits whose argmax is `scripts[row][script_idx]`,
+      // where `script_idx = cache.offset() - max_len`. Cache offset after
+      // the layer.update above reaches `max_len` exactly at the end of the
+      // prefill chain + first decode forward; subsequent decode steps add
+      // 1. So `script_idx` is `0` on the FIRST decode-call output (the
+      // first generation token), `1` on the second, etc. Prefill chunks
+      // yield negative `script_idx` arithmetically (cache_offset < max_len);
+      // for those the logits are discarded by the loop, so any vocab id
+      // suffices (we use the `0` fallback for safety).
+      let cache_offset = cache.first().map(|c| c.offset()).unwrap_or(0);
+      let script_idx = cache_offset.checked_sub(self.max_len);
+
+      let mut data: Vec<f32> = Vec::with_capacity(batch * seq * self.vocab);
+      for row in 0..batch {
+        let pred = script_idx
+          .and_then(|i| self.scripts.get(row).and_then(|s| s.get(i).copied()))
+          .unwrap_or(0);
+        // Every (row, seq) position gets the same logits; argmax picks `pred`.
+        for _ in 0..seq {
+          let mut row_logits = self.canned.clone();
+          if (pred as usize) < self.vocab {
+            row_logits[pred as usize] = 10.0;
+          }
+          data.extend_from_slice(&row_logits);
+        }
+      }
+
+      Array::from_slice::<f32>(&data, &(batch, seq, self.vocab))
+    }
+  }
+
+  /// 2-row batch: row 0 has prompt `[1, 2, 3]`, row 1 has `[7]` (length 1).
+  /// After left-padding with `pad=0`, both rows have length 3:
+  /// `[[0, 0, 7], [1, 2, 3]]` — wait, swap: row 0 longer, row 1 shorter ⇒
+  /// `[[1, 2, 3], [0, 0, 7]]`. Each row's script picks distinct tokens so
+  /// argmax sequences diverge per row.
+  #[test]
+  fn batch_generate_left_pads_and_emits_per_row_sequences() {
+    // vocab = 16; EOS = 5.
+    let scripts = vec![
+      // row 0 — produces [11, 12, 13, 14, 15] (no EOS in 5 steps).
+      vec![11, 12, 13, 14, 15],
+      // row 1 — produces [21, 22] then EOS 5 at step 2 (counter starts at 1
+      // after the prefill bump, so script idx 0 == first decode token).
+      vec![21, 22, 5, 99, 99],
+    ];
+    let prompts: Vec<&[u32]> = vec![&[1u32, 2, 3], &[7u32]];
+    let left_pad = batch_left_padding(&prompts);
+    // [max_len-3, max_len-1] = [0, 2].
+    assert_eq!(left_pad, vec![0, 2]);
+    let max_len = 3; // max(3, 1)
+    let model = MockBatchModel::new(32, max_len, scripts);
+
+    let cache: Vec<Box<dyn crate::lm::cache::KvCache>> =
+      vec![Box::new(BatchKvCache::new(&left_pad))];
+
+    let cfg = GenConfig {
+      max_tokens: 5,
+      eos: vec![5],
+      ..Default::default()
+    };
+
+    let batch_gen = batch_generate_step(&model, &prompts, 0, cache, cfg);
+
+    // Drain all per-row steps; collect per-row tokens (excluding EOS).
+    let mut rows: Vec<Vec<u32>> = vec![Vec::new(); 2];
+    let mut last_step_per_row: Vec<Option<String>> = vec![None; 2];
+    for item in batch_gen {
+      let step = item.expect("step error");
+      // Track per-row outputs the same way `batch_generate` aggregator does
+      // (mlx-lm: exclude "stop" tokens from output, include everything else).
+      match step.finish_reason.as_deref() {
+        Some("stop") => {}
+        _ => rows[step.row].push(step.token),
+      }
+      if let Some(r) = step.finish_reason {
+        last_step_per_row[step.row] = Some(r);
+      }
+    }
+
+    // Row 0: 5 tokens at max_tokens, no EOS — full [11, 12, 13, 14, 15].
+    assert_eq!(rows[0], vec![11, 12, 13, 14, 15]);
+    assert_eq!(last_step_per_row[0].as_deref(), Some("length"));
+    // Row 1: EOS at script idx 2; output is [21, 22] (the EOS-token-bearing
+    // step is dropped). finished = "stop".
+    assert_eq!(rows[1], vec![21, 22]);
+    assert_eq!(last_step_per_row[1].as_deref(), Some("stop"));
+  }
+
+  /// 3-row batch, ragged lengths: prompts of length 4 / 2 / 1. Asserts the
+  /// left-pad scheme matches `[0, 2, 3]` and the model sees a `[3, 4]`
+  /// prefill window.
+  #[test]
+  fn batch_left_padding_three_ragged_rows() {
+    let prompts: Vec<&[u32]> = vec![&[1u32, 2, 3, 4], &[5u32, 6], &[7u32]];
+    let left_pad = batch_left_padding(&prompts);
+    assert_eq!(left_pad, vec![0, 2, 3]);
+  }
+
+  /// 3-row batch: rows finish at different times — row 0 hits `max_tokens`
+  /// quickly, row 1 EOS mid-way, row 2 runs the whole max. Verifies
+  /// independent per-row termination and EOS-token exclusion from output.
+  #[test]
+  fn batch_generate_per_row_eos_independent_finish() {
+    let scripts = vec![
+      // row 0 — `max_tokens = 3`: emits [10, 11, 12], terminates "length".
+      vec![10, 11, 12, 99, 99],
+      // row 1 — EOS at step 1: emits [20] then EOS=5, terminates "stop".
+      vec![20, 5, 99, 99, 99],
+      // row 2 — emits [30, 31, 32], terminates "length".
+      vec![30, 31, 32, 99, 99],
+    ];
+    let prompts: Vec<&[u32]> = vec![&[1u32, 2], &[3u32, 4], &[5u32]];
+    let left_pad = batch_left_padding(&prompts);
+    assert_eq!(left_pad, vec![0, 0, 1]); // max_len = 2 ⇒ [0, 0, 1].
+    let max_len = 2; // max(2, 2, 1)
+    let model = MockBatchModel::new(64, max_len, scripts);
+
+    let cache: Vec<Box<dyn crate::lm::cache::KvCache>> =
+      vec![Box::new(BatchKvCache::new(&left_pad))];
+
+    let cfg = GenConfig {
+      max_tokens: 3,
+      eos: vec![5],
+      ..Default::default()
+    };
+
+    let mut rows: Vec<Vec<u32>> = vec![Vec::new(); 3];
+    let mut last_step_per_row: Vec<Option<String>> = vec![None; 3];
+    for item in batch_generate_step(&model, &prompts, 0, cache, cfg) {
+      let step = item.expect("step error");
+      match step.finish_reason.as_deref() {
+        Some("stop") => {}
+        _ => rows[step.row].push(step.token),
+      }
+      if let Some(r) = step.finish_reason {
+        last_step_per_row[step.row] = Some(r);
+      }
+    }
+
+    assert_eq!(rows[0], vec![10, 11, 12]);
+    assert_eq!(last_step_per_row[0].as_deref(), Some("length"));
+    assert_eq!(rows[1], vec![20]); // EOS at idx 1 dropped.
+    assert_eq!(last_step_per_row[1].as_deref(), Some("stop"));
+    assert_eq!(rows[2], vec![30, 31, 32]);
+    assert_eq!(last_step_per_row[2].as_deref(), Some("length"));
+  }
+
+  /// Empty / malformed prompt inputs surface as a deferred `Err` on first
+  /// `next()` (the iterator-Err contract, mirroring single-seq
+  /// [`generate_step`]).
+  #[test]
+  fn batch_generate_step_empty_prompts_is_err() {
+    let model = MockBatchModel::new(8, 0, vec![]);
+    let prompts: Vec<&[u32]> = vec![];
+    let cache: Vec<Box<dyn crate::lm::cache::KvCache>> = Vec::new();
+    let mut batch_gen = batch_generate_step(&model, &prompts, 0, cache, GenConfig::default());
+    assert!(batch_gen.next().unwrap().is_err());
+    assert!(batch_gen.next().is_none()); // fuses
+  }
+
+  #[test]
+  fn batch_generate_step_empty_row_is_err() {
+    let model = MockBatchModel::new(8, 0, vec![vec![]]);
+    let prompts: Vec<&[u32]> = vec![&[]];
+    let cache: Vec<Box<dyn crate::lm::cache::KvCache>> = Vec::new();
+    let mut batch_gen = batch_generate_step(&model, &prompts, 0, cache, GenConfig::default());
+    assert!(batch_gen.next().unwrap().is_err());
+    assert!(batch_gen.next().is_none());
+  }
+}
