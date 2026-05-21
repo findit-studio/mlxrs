@@ -176,14 +176,20 @@ fn audio_path_to_mel<M: super::model::Model>(
     });
   }
 
-  // 3. Resample. `mel_config().sample_rate` is what the model's feature
-  //    extractor was trained on; `resample_linear` is a verbatim copy when
-  //    the rates match (no FP drift) and a naive linear pass otherwise (the
-  //    `mlx-audio` default for Whisper-style models). `auto_resample` off +
-  //    mismatched rates surfaces as a recoverable `Error::Backend` so a
+  // Snapshot the model's mel config ONCE (Codex #64 finding): it drives
+  // both the resample target rate (step 3) and the log-mel parameters
+  // (step 6). Calling `model.mel_config()` twice risks subtle skew if a
+  // model computes it dynamically, and duplicates the work.
+  let mc = model.mel_config();
+
+  // 3. Resample. `mc.sample_rate` is what the model's feature extractor
+  //    was trained on; `resample_linear` is a verbatim copy when the
+  //    rates match (no FP drift) and a naive linear pass otherwise (the
+  //    `mlx-audio` default for Whisper-style models). `auto_resample` off
+  //    + mismatched rates surfaces as a recoverable `Error::Backend` so a
   //    misconfigured pipeline cannot silently feed wrong-rate mels to the
   //    model.
-  let target_sr = model.mel_config().sample_rate;
+  let target_sr = mc.sample_rate;
   let samples: Vec<f32> = if src_sr == target_sr {
     samples
   } else if cfg.auto_resample {
@@ -237,8 +243,8 @@ fn audio_path_to_mel<M: super::model::Model>(
   //    `model.encode_audio`. Threads `mc.log_floor` through the
   //    `_with` variant so a Kaldi/Custom-floor model (AUDIO-5 LogFloor)
   //    is encoded with its own floor instead of the hard-coded Whisper
-  //    `1e-10` (Codex bundle-#64 finding).
-  let mc = model.mel_config();
+  //    `1e-10` (Codex bundle-#64 finding). Reuses the `mc` snapshot
+  //    taken once at the top of this function.
   dsp::log_mel_spectrogram_with(
     &samples_arr,
     mc.n_fft,
@@ -299,11 +305,6 @@ pub struct SttGenerator<'a, M: super::model::Model> {
   /// whisper's `<|endoftext|>` plus a custom timestamp-end marker — without
   /// dropping the model's own EOS).
   eos: Vec<u32>,
-  /// A deferred sampler / processor *construction* error, yielded as the
-  /// iterator's first (and only) `Err` before any step runs (mirrors the
-  /// LM loop's `pending_err` pattern; keeps the public surface a pure
-  /// `Iterator`).
-  pending_err: Option<Error>,
   /// Fused: set after a yielded `Err` or a finish so the iterator never
   /// re-enters the model.
   done: bool,
@@ -381,14 +382,6 @@ impl<M: super::model::Model> Iterator for SttGenerator<'_, M> {
       return None;
     }
 
-    // A deferred sampler / processor construction error is the iterator's
-    // first (and only) item, before any model call (same pattern as the
-    // LM loop's `pending_err`).
-    if let Some(e) = self.pending_err.take() {
-      self.done = true;
-      return Some(Err(e));
-    }
-
     // Exactly `max_tokens` tokens (LM loop's "length" finish):
     // `if n == max_tokens: break` BEFORE the yield.
     if self.produced >= self.max_tokens {
@@ -460,73 +453,60 @@ pub fn stt_generate<'a, M: super::model::Model>(
   cache: Vec<Box<dyn KvCache>>,
   cfg: SttGenConfig,
 ) -> Result<SttGenerator<'a, M>> {
-  // 1-6 of the pipeline doc above: build the mel, encode it. Up-front
-  // (not deferred via `pending_err`) so the audio-pipeline errors surface
-  // as a `Result` from the constructor — callers shouldn't have to call
-  // `.next()` to observe "WAV file not found" / "audio too long".
+  // Build the sampler / logits-processor chain FIRST — BEFORE the
+  // expensive audio load + resample + mel + `encode_audio` pipeline, so a
+  // gen config that `make_sampler` / `make_logits_processors` rejects at
+  // BUILD time (e.g. a logit_bias index/value-arity mismatch) fails fast
+  // from the constructor without paying the audio/encode cost (Codex #64
+  // finding). NOTE: `make_sampler` validates only some constraints
+  // eagerly; purely-scalar bounds (`temp < 0`, `min_p > 1`,
+  // `xtc_probability` out of range, a negative penalty) are checked
+  // INSIDE the sampler/processor closure when it first runs against
+  // logits — so those still surface on the iterator's first decode step,
+  // exactly as in `lm::generate::generate_step` (the STT loop mirrors the
+  // LM loop's deferred-runtime-validation behavior, NOT a divergent
+  // audio-only eager pass). A fully-eager `GenConfig::validate()` shared
+  // by both loops is tracked as a coordinated follow-up (AUDIO-12). Built
+  // by reference from `cfg.lm` so `cfg` stays intact for
+  // `audio_path_to_mel`; the owned fields are moved out afterward.
+  let (sampler, processors) = {
+    let lm = &cfg.lm;
+    let sampler = make_sampler(
+      lm.temp,
+      lm.top_p,
+      lm.min_p,
+      lm.min_tokens_to_keep,
+      lm.top_k,
+      lm.xtc_probability,
+      lm.xtc_threshold,
+      &lm.xtc_special_tokens,
+      lm.seed,
+    )?;
+    let processors = make_logits_processors(
+      &lm.logit_bias,
+      lm.repetition_penalty,
+      lm.repetition_context_size,
+      lm.presence_penalty,
+      lm.presence_context_size,
+      lm.frequency_penalty,
+      lm.frequency_context_size,
+    )?;
+    (sampler, processors)
+  };
+
+  // Now the (potentially expensive) audio pipeline — steps 1-6 of the doc
+  // above. Eager (not deferred) so audio errors surface as the
+  // constructor's `Result` ("WAV file not found" / "audio too long")
+  // without the caller having to poll `.next()`.
   let mel = audio_path_to_mel(model, audio_path, &cfg)?;
   let encoder_states = model.encode_audio(&mel)?;
 
-  // Destructure `cfg` so the LM-loop's owned fields (the `Vec<u32>` eos
-  // override, `Vec<i32>` xtc-special-tokens, `Vec<(i32, f32)>` logit-bias)
-  // can be MOVED into the iterator without per-call clones — same
-  // by-value-consume style as the LM `generate_step` (`cfg.eos`
-  // moved-then-dropped).
-  let SttGenConfig {
-    lm,
-    auto_resample: _,
-    max_audio_seconds: _,
-  } = cfg;
-  let GenConfig {
-    max_tokens,
-    prefill_step_size: _,
-    temp,
-    top_p,
-    min_p,
-    min_tokens_to_keep,
-    top_k,
-    xtc_probability,
-    xtc_threshold,
-    xtc_special_tokens,
-    logit_bias,
-    repetition_penalty,
-    repetition_context_size,
-    presence_penalty,
-    presence_context_size,
-    frequency_penalty,
-    frequency_context_size,
-    eos: cfg_eos,
-    seed,
-  } = lm;
-
-  // Sampler / processor construction. Any error from the LM loop's
-  // `make_sampler` / `make_logits_processors` (an out-of-range top-k
-  // build, a logit_bias index/values mismatch, …) is captured into
-  // `pending_err` and yielded as the iterator's first item — same pattern
-  // the LM loop uses, so the public surface is a pure `Iterator`.
-  let built = (|| -> Result<(Sampler, Vec<LogitsProcessor>)> {
-    let sampler = make_sampler(
-      temp,
-      top_p,
-      min_p,
-      min_tokens_to_keep,
-      top_k,
-      xtc_probability,
-      xtc_threshold,
-      &xtc_special_tokens,
-      seed,
-    )?;
-    let processors = make_logits_processors(
-      &logit_bias,
-      repetition_penalty,
-      repetition_context_size,
-      presence_penalty,
-      presence_context_size,
-      frequency_penalty,
-      frequency_context_size,
-    )?;
-    Ok((sampler, processors))
-  })();
+  // Move the owned LM fields out of `cfg` for the iterator (the eos
+  // override `Vec<u32>` consumed without a clone — by-value-consume style
+  // matching the LM `generate_step`). The earlier `&cfg.lm` borrow + the
+  // `&cfg` audio borrow have both ended, so this partial move is sound.
+  let max_tokens = cfg.lm.max_tokens;
+  let cfg_eos = cfg.lm.eos;
 
   // EOS union: model.eos_token() ∪ cfg.lm.eos. The model's EOS is always
   // a stop token (no way for the caller to opt out — the model's own
@@ -539,43 +519,18 @@ pub fn stt_generate<'a, M: super::model::Model>(
     eos.push(model_eos);
   }
 
-  let bos = model.bos_token();
-
-  Ok(match built {
-    Ok((sampler, processors)) => SttGenerator {
-      model,
-      encoder_states,
-      cache,
-      sampler,
-      processors,
-      history: Vec::new(),
-      last: bos,
-      produced: 0,
-      max_tokens,
-      eos,
-      pending_err: None,
-      done: false,
-    },
-    Err(e) => SttGenerator {
-      model,
-      encoder_states,
-      cache,
-      // A never-called placeholder sampler; `pending_err` ends the
-      // iterator on its first poll before any step runs.
-      sampler: Box::new(|_| {
-        Err(Error::Backend {
-          message: "stt_generate: sampler construction failed".into(),
-        })
-      }),
-      processors: Vec::new(),
-      history: Vec::new(),
-      last: bos,
-      produced: 0,
-      max_tokens,
-      eos,
-      pending_err: Some(e),
-      done: false,
-    },
+  Ok(SttGenerator {
+    model,
+    encoder_states,
+    cache,
+    sampler,
+    processors,
+    history: Vec::new(),
+    last: model.bos_token(),
+    produced: 0,
+    max_tokens,
+    eos,
+    done: false,
   })
 }
 

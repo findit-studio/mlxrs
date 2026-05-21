@@ -169,16 +169,17 @@ pub struct MelConfig {
   /// Upper mel band edge (Hz); `None` ⇒ `sample_rate / 2` (Nyquist), the
   /// `mel_filter_bank` default.
   pub f_max: Option<f32>,
-  /// Numerical floor applied to mel energies before `log10`
+  /// Numerical floor applied to mel energies before the **natural log**
+  /// (`ln`, the `log_mel_spectrogram_with` `.log()` step)
   /// ([`crate::audio::dsp::LogFloor`]). Whisper frontends expect
   /// `1e-10` ([`LogFloor::Whisper`](crate::audio::dsp::LogFloor::Whisper),
   /// the default); Kaldi-style frontends expect `1e-8`
   /// ([`LogFloor::Kaldi`](crate::audio::dsp::LogFloor::Kaldi)). A model
   /// whose feature extractor uses the Kaldi floor MUST set this in its
   /// `mel_config` override — otherwise low-energy / silence bins are
-  /// shifted by ~4.6 natural-log units, silently degrading transcription
-  /// quality. Threaded through [`super::generate::stt_generate`]'s
-  /// `audio_path_to_mel` via
+  /// shifted by `ln(1e-8) - ln(1e-10) = ln(100) ≈ 4.6` natural-log
+  /// units, silently degrading transcription quality. Threaded through
+  /// [`super::generate::stt_generate`]'s `audio_path_to_mel` via
   /// [`crate::audio::dsp::log_mel_spectrogram_with`].
   pub log_floor: crate::audio::dsp::LogFloor,
 }

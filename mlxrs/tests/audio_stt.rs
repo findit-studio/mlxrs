@@ -67,10 +67,12 @@ struct MockSttModel {
   /// auto-resample / mel-config-override paths drove a different mel size.
   last_mel_shape: std::cell::RefCell<Option<Vec<usize>>>,
   /// Records the MIN value of every `encode_audio` mel — the log-floor
-  /// choice (`LogFloor::Whisper` 1e-10 ⇒ log10 floor ≈ -10 vs
-  /// `LogFloor::Kaldi` 1e-8 ⇒ ≈ -8) is observable as a shift in the
-  /// floor of silence/low-energy bins, so a test can prove the floor
-  /// was actually threaded through `audio_path_to_mel`.
+  /// choice (`LogFloor::Whisper` 1e-10 ⇒ natural-log floor `ln(1e-10) ≈
+  /// -23.0` vs `LogFloor::Kaldi` 1e-8 ⇒ `ln(1e-8) ≈ -18.4`) is
+  /// observable as a shift in the floor of silence/low-energy bins
+  /// (`log_mel_spectrogram_with` applies `.log()` = natural log), so a
+  /// test can prove the floor was actually threaded through
+  /// `audio_path_to_mel`.
   last_mel_min: std::cell::RefCell<Option<f32>>,
   /// Counts `decode_step` invocations — distinguishes "iterator empty for
   /// 0-second audio" from "iterator yielded 0 tokens by some other path".
@@ -496,9 +498,10 @@ fn stt_generate_threads_mel_config_log_floor() {
   // Kaldi-style model gets the 1e-8 floor instead of the hard-coded
   // Whisper 1e-10. Run the SAME audio through two models differing only
   // in `log_floor` and assert the resulting mel's MIN differs by the
-  // expected ~2 log10-units (log10(1e-8) = -8 vs log10(1e-10) = -10):
-  // the Kaldi floor clamps low-energy bins HIGHER, so its mel min is
-  // strictly greater than the Whisper floor's.
+  // expected `ln(100) ≈ 4.6` natural-log units (`log_mel_spectrogram_with`
+  // applies `.log()` = natural log: `ln(1e-8) ≈ -18.4` vs
+  // `ln(1e-10) ≈ -23.0`): the Kaldi floor clamps low-energy bins
+  // HIGHER, so its mel min is strictly greater than the Whisper floor's.
   let path = make_wav("log_floor", 16_000, ONE_SECOND_16K);
 
   let cfg = || SttGenConfig {
@@ -534,10 +537,10 @@ fn stt_generate_threads_mel_config_log_floor() {
     .expect("kaldi mel min recorded");
 
   // The Kaldi floor (1e-8) clamps low-energy bins higher than the
-  // Whisper floor (1e-10): the per-bin floor differs by log10(1e-8) -
-  // log10(1e-10) = 2 units. The observed mel min must reflect the
-  // higher Kaldi floor (strictly greater) — proving the floor was
-  // actually threaded, not silently defaulted to Whisper.
+  // Whisper floor (1e-10): the per-bin floor differs by `ln(1e-8) -
+  // ln(1e-10) = ln(100) ≈ 4.6` natural-log units. The observed mel min
+  // must reflect the higher Kaldi floor (strictly greater) — proving the
+  // floor was actually threaded, not silently defaulted to Whisper.
   assert!(
     kaldi_min > whisper_min,
     "Kaldi floor (1e-8) must lift the mel min above the Whisper floor (1e-10): \
