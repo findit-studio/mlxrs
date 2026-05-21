@@ -450,7 +450,7 @@ impl Tokenizer {
     if let Some(e) = eos
       && ids.len() < final_len
     {
-      // The eos slot survived truncation (i.e. `final_len > real_len`).
+      // Append eos if it still fits after truncation.
       ids.push(e);
     }
 
@@ -577,8 +577,8 @@ impl Tokenizer {
   /// Add an eos token by string or numeric-string id (Python `add_eos_token`).
   /// If no primary EOS was established at construction time (no
   /// `tokenizer-config` eos and no caller-supplied set), the first id added
-  /// via this method becomes the primary used by
-  /// [`Self::encode_with`]`(add_eos = true)`.
+  /// via this method becomes the primary used by [`Self::encode_with`]
+  /// when `add_eos = true`.
   pub fn add_eos_token(&mut self, token: &str) -> Result<(), Error> {
     let id = match token.parse::<u32>() {
       Ok(i) => Some(i),

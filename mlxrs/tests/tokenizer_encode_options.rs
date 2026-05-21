@@ -422,9 +422,9 @@ fn legacy_encode_preserves_hf_padding_layout() {
 fn encode_with_add_eos_errors_without_calling_hf_encode() {
   // Per Codex round-2 finding 3: the `add_eos` precondition is validated
   // BEFORE the underlying `hf.encode` call. We can't observe "did hf.encode
-  // run" directly, but we can use a clearly-invalid-byte payload that would
-  // succeed in normal tokenization (HF is lenient over UTF-8 input). Empty
-  // eos set + add_eos=true must error fast on any input.
+  // run" directly, but we can use a large valid input that would be
+  // comparatively expensive to tokenize. Empty eos set + add_eos=true must
+  // error fast regardless of input size/content.
   let dir = std::env::temp_dir().join(format!(
     "mlxrs-tok-encode-opts-noeos-fastfail-{}",
     std::process::id()
