@@ -184,6 +184,51 @@ pub trait KvCache {
     Ok(())
   }
 
+  /// Restore the cache from a serialized `(state, meta)` pair. The
+  /// default implementation calls
+  /// [`set_state`](KvCache::set_state) then
+  /// [`set_meta_state`](KvCache::set_meta_state) sequentially — faithful
+  /// to `mlx_lm/models/cache.py:170-175` (`obj.state = state; obj.meta_state
+  /// = meta_state`) and mlx-swift-lm's
+  /// `MLXLMCommon/KVCache.swift::restoreFromMetaState`. The default is the
+  /// 2-step Python pattern verbatim — so a `set_meta_state` failure *after*
+  /// `set_state` has already mutated `self` leaves the cache half-restored
+  /// (exactly the Python behavior).
+  ///
+  /// Concrete caches with non-trivial meta parsing / multi-field state
+  /// mutation SHOULD override this with the transactional discipline
+  /// [`ArraysCache::set_meta_state`] already follows: every fallible parse
+  /// and allocation runs on locals while `self` is untouched, and `self`
+  /// is committed by a single infallible block at the end. The contract
+  /// for overrides is: if `from_serialized` returns `Err`, `self` is
+  /// byte-identical to its pre-call state ("leaves self unchanged on
+  /// error"). The default does **not** provide that guarantee — overrides
+  /// do.
+  ///
+  /// **Implementers — override unless your cache is meta-less AND has no
+  /// state invariants**. The default impl is non-transactional by design
+  /// (it mirrors mlx-lm `_BaseCache.from_state` cache.py:170-175 exactly),
+  /// so if your impl has (a) any fallible meta parsing, OR (b) any
+  /// post-setter invariant the canonical `super::from_state` loader
+  /// enforces (e.g. `empty ⇒ offset==0`, `_idx <= L`,
+  /// `enforce_offset_len_invariant`), you MUST override `from_serialized`
+  /// to stage on a fresh placeholder + apply the same post-setter check +
+  /// commit via `*self = staged` only on success. All 8 in-tree
+  /// concrete caches do this; see e.g. `RotatingKvCache::from_serialized`
+  /// for the canonical pattern. Using the default in those cases
+  /// silently reintroduces the half-restore failure mode the override
+  /// closes.
+  ///
+  /// `state` is consumed (taken by value, like `set_state`); `meta` is
+  /// borrowed because it's typically a small `Vec<String>` of decimal
+  /// tokens that an impl may want to parse multiple times.
+  #[allow(clippy::wrong_self_convention)] // mirrors mlx-lm `from_state` / swift `restoreFromMetaState`
+  fn from_serialized(&mut self, state: Vec<Array>, meta: &[String]) -> Result<()> {
+    self.set_state(state)?;
+    self.set_meta_state(meta)?;
+    Ok(())
+  }
+
   /// Whether the cache can be trimmed (mlx-lm `cache.is_trimmable`).
   fn is_trimmable(&self) -> bool {
     false

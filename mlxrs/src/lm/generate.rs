@@ -299,21 +299,39 @@ pub fn make_sampler(
       *k = next;
       (k_xtc, k_cat)
     };
-    let mut x = if do_top_p {
-      sample::apply_top_p(logprobs, top_p)?
+    // CORE-1: thread an `Option<Array>` through the optional stages so the
+    // "no-op stage" path is a pure borrow of `logprobs` (no clone), and a
+    // taken stage moves its owned result into `x`. The prior structure
+    // unconditionally cloned `logprobs` when `do_top_p=false`, so a pure
+    // temperature-sampling step (every `do_*` flag false) wasted one clone
+    // per token (`apply_top_p` returns owned, so the `do_top_p=true` path
+    // is unaffected). Same observable behavior; one fewer hot-path clone
+    // per token in the common case.
+    let mut x: Option<Array> = if do_top_p {
+      Some(sample::apply_top_p(logprobs, top_p)?)
     } else {
-      logprobs.try_clone()?
+      None
     };
     if do_min_p {
-      x = sample::apply_min_p(&x, min_p, min_tokens_to_keep)?;
+      x = Some(sample::apply_min_p(
+        x.as_ref().unwrap_or(logprobs),
+        min_p,
+        min_tokens_to_keep,
+      )?);
     }
     if do_xtc {
-      x = sample::apply_xtc(&x, xtc_probability, xtc_threshold, &xtc_special, &k_xtc)?;
+      x = Some(sample::apply_xtc(
+        x.as_ref().unwrap_or(logprobs),
+        xtc_probability,
+        xtc_threshold,
+        &xtc_special,
+        &k_xtc,
+      )?);
     }
     if do_top_k {
-      x = sample::apply_top_k(&x, top_k)?;
+      x = Some(sample::apply_top_k(x.as_ref().unwrap_or(logprobs), top_k)?);
     }
-    sample::categorical_sampling(&x, temp, &k_cat)
+    sample::categorical_sampling(x.as_ref().unwrap_or(logprobs), temp, &k_cat)
   };
   Ok(Box::new(sampler))
 }

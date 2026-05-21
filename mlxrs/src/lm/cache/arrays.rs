@@ -167,7 +167,15 @@ impl ArraysCache {
   /// metadata, `lengths` stays `None` (it is transient — set by
   /// [`prepare`](ArraysCache::prepare), never serialized; mlx-lm doesn't put
   /// it in `state`).
-  fn from_serialized(state: Vec<Array>, meta: &[String]) -> Result<Self> {
+  ///
+  /// Constructor-style helper (returns `Result<Self>`) shared with the
+  /// trait-method override [`KvCache::from_serialized`] (which delegates
+  /// here, then `*self = ..`-commits) and with the `from_state_arrays`
+  /// dispatch entry (which wraps in `Box<dyn KvCache>`). Both fallible
+  /// steps run on the freshly-`Self::new(0)`-built local, so the caller's
+  /// own `self` (the trait-method override) is *never* mutated on an
+  /// error path — the leaves-self-unchanged guarantee, end to end.
+  fn build_from_serialized(state: Vec<Array>, meta: &[String]) -> Result<Self> {
     let mut c = Self::new(0);
     c.set_state(state)?;
     c.set_meta_state(meta)?;
@@ -594,6 +602,29 @@ impl KvCache for ArraysCache {
   fn reference_class_name(&self) -> &'static str {
     "ArraysCache"
   }
+
+  /// Transactional override of [`KvCache::from_serialized`] — leaves `self`
+  /// byte-identical to its pre-call state on every recoverable error
+  /// (`set_state` is infallible aside from `try_clone` paths it doesn't
+  /// reach; `set_meta_state`'s slot-aware parse can fail on a malformed
+  /// CSV, a non-numeric `slotCount`, or a hostile huge `slotCount` whose
+  /// buffer can't be allocated — `Error::Backend` / `Error::OutOfMemory`,
+  /// never a panic). The full restore is built into a fresh local via
+  /// `ArraysCache::build_from_serialized` — the same constructor-style
+  /// path `super::from_state`'s `"ArraysCache"` arm uses — and `self` is
+  /// committed by a single infallible move only after that whole local
+  /// build succeeds. `set_meta_state` is already itself transactional
+  /// (Copilot review #3271554056 hardened it), but this override extends
+  /// the leaves-self-unchanged guarantee across the *combined* `set_state`
+  /// and `set_meta_state` sequence — closing the (today narrow, since
+  /// the `set_state` body cannot fail without a `try_clone` it doesn't
+  /// issue) 2-step window the default trait impl would leave open if
+  /// `set_state` ever grew a fallible step.
+  #[allow(clippy::wrong_self_convention)] // see KvCache::from_serialized
+  fn from_serialized(&mut self, state: Vec<Array>, meta: &[String]) -> Result<()> {
+    *self = ArraysCache::build_from_serialized(state, meta)?;
+    Ok(())
+  }
 }
 
 /// `from_state` arm for the `"ArraysCache"` reference class name
@@ -601,5 +632,5 @@ impl KvCache for ArraysCache {
 /// of [`super::from_state`]'s body so this file owns the whole port; the
 /// module's `match` adds one additive arm delegating here.
 pub(super) fn from_state_arrays(state: Vec<Array>, meta: &[String]) -> Result<Box<dyn KvCache>> {
-  Ok(Box::new(ArraysCache::from_serialized(state, meta)?))
+  Ok(Box::new(ArraysCache::build_from_serialized(state, meta)?))
 }
