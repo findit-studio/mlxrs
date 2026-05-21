@@ -852,6 +852,43 @@ impl KvCache for QuantizedKvCacheImpl {
   fn reference_class_name(&self) -> &'static str {
     "QuantizedKVCache"
   }
+
+  /// Transactional override of [`KvCache::from_serialized`] — leaves `self`
+  /// byte-identical to its pre-call state on every recoverable error
+  /// (`set_state` arity failures; the 3-string mlx-lm / 4-string
+  /// mlx-swift-lm meta parse of `offset`/`group_size`/`bits`). All
+  /// fallible work runs on a fresh placeholder
+  /// `QuantizedKvCacheImpl::new(0, 0)` (the exact placeholder the existing
+  /// [`super::from_state`] dispatch uses); `self` is committed by a single
+  /// infallible move only after both setters succeed. The default trait
+  /// impl would mutate `self.keys`/`self.values` via `set_state` first and
+  /// a later meta-parse failure (e.g. a non-numeric `bits`) would leave
+  /// the cache half-restored.
+  fn from_serialized(&mut self, state: Vec<Array>, meta: &[String]) -> Result<()> {
+    let mut staged = QuantizedKvCacheImpl::new(0, 0);
+    staged.set_state(state)?;
+    staged.set_meta_state(meta)?;
+    // Post-setter invariant guards — must match `super::from_state`'s
+    // dispatcher arm (`cache/mod.rs:503` + `:535`). The two setters
+    // stay individually 1:1 with `mlx_lm/models/cache.py:294-304`; the
+    // canonical loader applies (a) `empty ⇒ offset==0` rejection and
+    // (b) `enforce_offset_len_invariant` (slice triples down to `offset`,
+    // then clamp `offset` down to the post-trim seq-len — repr-equivalent
+    // to mlx-lm's `state` getter's `[..., :offset, :]` slice). Both must
+    // be enforced here too, otherwise a corrupt `(state, meta)` could
+    // commit a cache whose next `update_quantized` treats `self.offset`
+    // as `prev` while the empty-storage arm of `compute_appended` only
+    // stores the new triple — phantom context / stale tokens. Run BOTH
+    // checks on `staged` so a failure leaves `self` byte-identical.
+    if staged.is_empty() && staged.offset() != 0 {
+      return Err(Error::Backend {
+        message: "QuantizedKvCache: empty state with non-zero offset is invalid".into(),
+      });
+    }
+    staged.enforce_offset_len_invariant()?;
+    *self = staged;
+    Ok(())
+  }
 }
 
 impl QuantizedKvCache for QuantizedKvCacheImpl {

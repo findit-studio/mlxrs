@@ -490,6 +490,38 @@ impl KvCache for CacheList {
   fn reference_class_name(&self) -> &'static str {
     "CacheList"
   }
+
+  /// Transactional override of [`KvCache::from_serialized`] — leaves `self`
+  /// byte-identical to its pre-call state on every recoverable error
+  /// (malformed framing, non-numeric child count / `stateCount` /
+  /// `metaCount`, oversized child count, declared-vs-available
+  /// `stateCount`/`metaCount` mismatch, nested-depth overflow, any failing
+  /// child rebuild).
+  ///
+  /// **Highest-payoff override on this trait.** `CacheList` is the most
+  /// error-prone meta consumer in the cache module: its flattened
+  /// `[childCount, (className, stateCount, metaCount, ...meta)*]` framing
+  /// must be parsed *and* every child must be rebuilt through
+  /// [`super::from_state`] (which itself can fail per kind), all before any
+  /// of `self.caches` is touched. The default trait impl would call
+  /// `set_state` first (which itself stages onto copies — see
+  /// [`KvCache::set_state`] for `CacheList` — and is internally
+  /// transactional) and then `set_meta_state`, which is hard-coded to
+  /// reject any direct call (Swift's `assertionFailure`); so the default
+  /// impl is *unconditionally* broken for `CacheList` (every call would
+  /// return `Err`). This override is what makes [`from_serialized`](
+  /// KvCache::from_serialized) work on `CacheList` at all, AND it does so
+  /// while preserving the leaves-self-unchanged contract: the entire
+  /// children rebuild (`build_cache_list_children` — class-name dispatch,
+  /// recursive nested `CacheList`s, depth-budget) runs into a local
+  /// `Vec<Box<dyn KvCache>>` with `self.caches` untouched; only on
+  /// `Ok(children)` is `self` committed via one infallible move.
+  #[allow(clippy::wrong_self_convention)] // see KvCache::from_serialized
+  fn from_serialized(&mut self, state: Vec<Array>, meta: &[String]) -> Result<()> {
+    let children = build_cache_list_children(state, meta, CACHE_LIST_MAX_NESTING_DEPTH)?;
+    *self = CacheList::new(children);
+    Ok(())
+  }
 }
 
 /// Reconstruct a [`CacheList`] from its flattened `state` + `meta_state` —
@@ -564,8 +596,36 @@ fn cache_list_from_state_bounded(
   meta: &[String],
   depth_budget: usize,
 ) -> Result<Box<dyn KvCache>> {
+  let children = build_cache_list_children(state, meta, depth_budget)?;
+  Ok(Box::new(CacheList::new(children)))
+}
+
+/// The atomic, fallible inner build of a `CacheList`'s children
+/// `Vec<Box<dyn KvCache>>` from its flattened `(state, meta)` — every
+/// validation, allocation, and recursive child build happens here BEFORE
+/// any caller's `self` is touched. Shared by:
+///
+/// - [`cache_list_from_state_bounded`] (which boxes the result into a
+///   `CacheList`-as-`KvCache` for the [`super::from_state`] dispatch path);
+/// - [`CacheList::from_serialized`] (the trait-method override, which
+///   commits the children Vec into `self.caches` via a single infallible
+///   `*self = CacheList::new(children)` only after this returns `Ok`).
+///
+/// Factoring this out is what makes the override's leaves-self-unchanged
+/// guarantee load-bearing for the highest-payoff override on this trait:
+/// the full multi-child framing parse / class-name dispatch / recursive
+/// nested-CacheList build all run on locals; the caller's `self.caches`
+/// is replaced atomically only on success. A malformed framing /
+/// out-of-range `stateCount` / nested-depth overflow / failing child
+/// rebuild leaves the parent `CacheList` byte-identical to its pre-call
+/// state.
+fn build_cache_list_children(
+  state: Vec<Array>,
+  meta: &[String],
+  depth_budget: usize,
+) -> Result<Vec<Box<dyn KvCache>>> {
   let err = |m: &str| Error::Backend {
-    message: format!("CacheList::from_state: {m}"),
+    message: format!("CacheList: {m}"),
   };
 
   // Reject the over-deep chain BEFORE parsing this level's frame: a forged
@@ -701,5 +761,5 @@ fn cache_list_from_state_bounded(
     )));
   }
 
-  Ok(Box::new(CacheList::new(children)))
+  Ok(children)
 }

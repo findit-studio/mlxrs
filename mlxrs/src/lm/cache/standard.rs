@@ -60,10 +60,19 @@ impl KvCache for StandardKvCache {
       (Some(pk), Some(pv)) => (concat_seq(pk, keys)?, concat_seq(pv, values)?),
       _ => (keys.try_clone()?, values.try_clone()?),
     };
+    // CORE-1: stage-then-commit. Compute the return clones BEFORE any
+    // `self.*` mutation, then MOVE `k`/`v` into `self.keys`/`self.values`
+    // (the same transactional discipline `RotatingKvCache::update_in_place`
+    // and `ChunkedKvCache::update` use class-wide). The prior order
+    // mutated `self.offset` first, then ran two fallible `try_clone`s on
+    // top of it — a clone failure left `self.offset` advanced with the
+    // buffer not updated. Same total allocation count (2 clones per side
+    // either way); failure no longer poisons the cache.
+    let (rk, rv) = (k.try_clone()?, v.try_clone()?);
     self.offset += s;
-    self.keys = Some(k.try_clone()?);
-    self.values = Some(v.try_clone()?);
-    Ok((k, v))
+    self.keys = Some(k);
+    self.values = Some(v);
+    Ok((rk, rv))
   }
 
   /// mlx-lm `KVCache.state` getter: `(keys, values)` — here always exactly
@@ -198,5 +207,26 @@ impl KvCache for StandardKvCache {
   /// default — same pattern every other concrete cache follows).
   fn reference_class_name(&self) -> &'static str {
     "KVCache"
+  }
+
+  /// Transactional override of [`KvCache::from_serialized`] — leaves
+  /// `self` byte-identical to its pre-call state on every recoverable
+  /// error. `StandardKvCache` has no meta (`meta_state() -> []` by
+  /// default), so a caller passing non-empty `meta` here triggers the
+  /// trait default `set_meta_state`'s rejection (mirrors mlx-lm
+  /// `_BaseCache.meta_state` setter, `cache.py:142-145`). Without this
+  /// override the default impl would call `set_state(state)?` first —
+  /// mutating `self.keys`/`self.values`/`self.offset` to the new state —
+  /// THEN error in `set_meta_state(meta)?`, leaving the cache holding
+  /// the rejected serialized state. Stage on a fresh placeholder and
+  /// commit only on success so the rollback contract holds for the
+  /// most common cache kind too.
+  #[allow(clippy::wrong_self_convention)] // see KvCache::from_serialized
+  fn from_serialized(&mut self, state: Vec<Array>, meta: &[String]) -> Result<()> {
+    let mut staged = StandardKvCache::new();
+    staged.set_state(state)?;
+    staged.set_meta_state(meta)?;
+    *self = staged;
+    Ok(())
   }
 }

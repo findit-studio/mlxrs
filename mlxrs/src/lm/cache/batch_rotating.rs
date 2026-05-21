@@ -1044,6 +1044,90 @@ impl KvCache for BatchRotatingKvCache {
   fn reference_class_name(&self) -> &'static str {
     "BatchRotatingKVCache"
   }
+
+  /// Transactional override of [`KvCache::from_serialized`] — leaves `self`
+  /// byte-identical to its pre-call state on every recoverable error
+  /// (`set_state` arity/rank failures; the 4-field meta parse of
+  /// `max_size`/`_offset`/`_idx`/`rotated`). All fallible work runs on a
+  /// fresh placeholder `BatchRotatingKvCache::new(0, &[])` (the exact
+  /// placeholder the existing [`super::from_state`] dispatch uses; the
+  /// `max_size`/`left_padding`/etc. are overwritten by the two setters);
+  /// `self` is committed by a single infallible move only after both
+  /// setters succeed. The default trait impl would mutate
+  /// `self.keys`/`self.values`/`self.offset`/`self.left_padding` via
+  /// `set_state` first, and a later malformed `rotated` boolean would then
+  /// leave the cache half-restored.
+  fn from_serialized(&mut self, state: Vec<Array>, meta: &[String]) -> Result<()> {
+    let mut staged = BatchRotatingKvCache::new(0, &[]);
+    staged.set_state(state)?;
+    staged.set_meta_state(meta)?;
+    // STRUCTURAL invariant guard — must match `super::from_state`'s
+    // dispatcher arm (`cache/mod.rs:610-663`). The setters stay 1:1
+    // with `cache.py:1301-1315` (no validation); the canonical loader
+    // validates that the restored `(state, meta_state)` is one that
+    // mlx-lm's own `state` getter (cache.py:1294-1307) could have
+    // produced — closes the entire corrupt-restored-`_idx`/`_offset`/
+    // `rotated` class. Empty buffer ⇒ fully fresh (offset=idx=0,
+    // !rotated). Non-empty buffer ⇒ max_size>=1 ∧ idx<=L ∧
+    // (rotated ⇒ L==max_size) ∧ L<=offset. Apply on `staged` so a
+    // failure leaves `self` byte-identical to its pre-call state.
+    let (invalid, reason) = if staged.is_empty() {
+      let offset = staged.offset();
+      let idx = staged.ring_idx();
+      let rotated = staged.is_rotated();
+      if offset != 0 || idx != 0 || rotated {
+        (
+          true,
+          format!(
+            "empty buffer (keys=None) requires fully-fresh meta: \
+             offset={offset} _idx={idx} rotated={rotated} (need 0/0/false)"
+          ),
+        )
+      } else {
+        (false, String::new())
+      }
+    } else {
+      let l = staged.buf_seq_len()?.unwrap_or(0);
+      let max_size = staged.max_window();
+      let idx = staged.ring_idx();
+      let offset = staged.offset();
+      let rotated = staged.is_rotated();
+      if max_size == 0 {
+        (
+          true,
+          format!("non-empty buffer requires max_size >= 1, got max_size=0 (L={l})"),
+        )
+      } else if idx > l {
+        (
+          true,
+          format!("_idx ({idx}) > keys seq-len L ({l}): write cursor beyond physical buffer"),
+        )
+      } else if rotated && l != max_size {
+        (
+          true,
+          format!("rotated=true requires L == max_size, got L={l} max_size={max_size}"),
+        )
+      } else if l > offset {
+        (
+          true,
+          format!(
+            "L ({l}) > _offset ({offset}): mlx-lm getter emits keys[:_offset, :], so L <= _offset always"
+          ),
+        )
+      } else {
+        (false, String::new())
+      }
+    };
+    if invalid {
+      return Err(Error::Backend {
+        message: format!(
+          "BatchRotatingKvCache: restored state/meta_state is inconsistent (not a state mlx-lm's own round-trip could produce): {reason}"
+        ),
+      });
+    }
+    *self = staged;
+    Ok(())
+  }
 }
 
 impl BatchPositionedKvCache for BatchRotatingKvCache {

@@ -601,6 +601,29 @@ impl KvCache for BatchKvCache {
   fn reference_class_name(&self) -> &'static str {
     "BatchKVCache"
   }
+
+  /// Transactional override of [`KvCache::from_serialized`] — leaves `self`
+  /// byte-identical to its pre-call state on every recoverable error
+  /// (`set_state` arity/rank failures; the no-meta default rejects a
+  /// non-empty `meta`). All fallible work runs on a fresh placeholder
+  /// `BatchKvCache::new(&[])` (the exact placeholder the existing
+  /// [`super::from_state`] dispatch uses; the per-seq `[B]` arrays
+  /// `offset`/`left_padding` are overwritten by `set_state`'s 4-array
+  /// branch). `self` is committed by a single infallible move only after
+  /// both setters succeed. The default trait impl would mutate the fresh
+  /// state arrays via `set_state` first; even though `BatchKvCache` has no
+  /// custom meta parser (the default `set_meta_state` only errors on a
+  /// non-empty meta), the override is still important so a corrupt prompt
+  /// cache that hands `BatchKVCache` a non-empty `meta` cannot leave the
+  /// (otherwise valid) restored state assigned while the cache is reported
+  /// as having errored.
+  fn from_serialized(&mut self, state: Vec<Array>, meta: &[String]) -> Result<()> {
+    let mut staged = BatchKvCache::new(&[]);
+    staged.set_state(state)?;
+    staged.set_meta_state(meta)?;
+    *self = staged;
+    Ok(())
+  }
 }
 
 impl BatchPositionedKvCache for BatchKvCache {
