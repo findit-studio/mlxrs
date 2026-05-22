@@ -463,6 +463,10 @@ enum TripleClass {
   ///   number of bits-wide elements packed per `uint32` lane
   ///   (`mlx/backend/metal/kernels/quantized.h:705`,
   ///   `mlx/backend/cpu/quantized.cpp:249`).
+  /// - `.biases` arity matches the resolved mode (`mlx/ops.cpp:4908-4951`):
+  ///   `affine` REQUIRES `.biases` (3-output `affine_quantize`,
+  ///   `mlx/ops.cpp:4793-4798`); `mxfp4` / `mxfp8` / `nvfp4` MUST NOT
+  ///   carry `.biases` (2-output `fp_quantize`, `mlx/ops.cpp:4890,4898-4904`).
   /// - If `.biases` is present (affine), it has the same shape and
   ///   dtype as `.scales` — `affine_quantize` writes `scales` and
   ///   `biases` from the same template (`mlx/mlx/ops.cpp:4780-4786`,
@@ -568,6 +572,48 @@ fn classify_triple(
           }
         },
       };
+      // Per-mode `.biases` arity: mlx `quantize` dispatches on mode and
+      // the resulting triple's bias slot is fully determined by it
+      // (`mlx/ops.cpp:4908-4951`):
+      //   - `affine` → `affine_quantize` returns `{w_q, scales, biases}`
+      //     (3 outputs, `mlx/ops.cpp:4793-4798`); `.biases` is REQUIRED.
+      //   - `mxfp4` / `mxfp8` / `nvfp4` → `fp_quantize` returns
+      //     `{w_q, scales}` (2 outputs, `mlx/ops.cpp:4890,4898-4904`);
+      //     `.biases` MUST be absent — these are scale-only formats.
+      // A shape/dtype-aligned `.biases` next to a `mxfp*`/`nvfp4` triple
+      // is a stale sibling from a different mode and would silently
+      // corrupt `dequantize`; an `affine` triple with no `.biases` is
+      // structurally incomplete and would crash mlx's `affine_dequantize`.
+      // Validate the arity BEFORE the per-array shape/dtype checks so the
+      // failure cites the offending mode, not a downstream shape mismatch.
+      match (q.mode, b_opt) {
+        (QuantMode::Affine, None) => {
+          return TripleClass::Invalid(format!(
+            "quantize_weights: layer {layer_path}: `affine` mode \
+             (bits={}, group_size={}) requires `{biases_key}` alongside \
+             `{scales_key}` (mlx `affine_quantize` always writes \
+             `{{w_q, scales, biases}}`, `mlx/ops.cpp:4793-4798`), but the \
+             input carries no `.biases` — this is a structurally incomplete \
+             affine triple",
+            q.bits, q.group_size
+          ));
+        }
+        (QuantMode::Mxfp4 | QuantMode::Mxfp8 | QuantMode::Nvfp4, Some(_)) => {
+          return TripleClass::Invalid(format!(
+            "quantize_weights: layer {layer_path}: `{}` mode is scale-only \
+             (mlx `fp_quantize` writes `{{w_q, scales}}` with no biases, \
+             `mlx/ops.cpp:4890,4898-4904`), but the input carries a stale \
+             `{biases_key}` — refusing to silently retain a bias from a \
+             different (affine) mode",
+            q.mode.as_mlx_str()
+          ));
+        }
+        // `(Affine, Some(_))` falls through to the existing
+        // shape/dtype validation against `.scales` below.
+        // `(Mxfp4 | Mxfp8 | Nvfp4, None)` is the expected scale-only
+        // layout and proceeds to the `.weight` / `.scales` checks below.
+        _ => {}
+      }
       // `.weight` dtype must be `uint32` — both `affine_quantize`
       // (`mlx/ops.cpp:4795`) and `fp_quantize` (`mlx/ops.cpp:4900`)
       // write a `uint32` packed matrix. A float `.weight` means this
@@ -1477,24 +1523,30 @@ mod tests {
   }
 
   /// Fix 4 (this PR): a dense `.weight` (float dtype) next to a stale
-  /// `.scales` orphan (no matching `.biases`, no valid quantized layout)
-  /// → [`TripleClass::Invalid`] → `Err(Backend)` naming the layer and
-  /// the offending `.scales`. This is the case the Codex review surfaced:
-  /// the old presence-only `is_already_quantized` check would have
-  /// classified this as "already quantized" and silently passed through,
-  /// leaving a dense `.weight` next to a corrupt `.scales` for
-  /// `dequantize_weights` to choke on.
+  /// `.scales` orphan (no valid quantized layout) → [`TripleClass::Invalid`]
+  /// → `Err(Backend)` naming the layer and the offending `.scales`. This is
+  /// the case the Codex review surfaced: the old presence-only
+  /// `is_already_quantized` check would have classified this as "already
+  /// quantized" and silently passed through, leaving a dense `.weight` next
+  /// to a corrupt `.scales` for `dequantize_weights` to choke on.
+  ///
+  /// `.biases` is included so the triple advances past Fix 6's affine-arity
+  /// check and reaches the `.weight` dtype check (the regression this
+  /// fixture is asserting); a separate fixture covers the missing-`.biases`
+  /// arity case under `affine`.
   #[test]
   fn quantize_weights_orphan_scales_with_dense_weight_errors() {
     let group_size = 64_usize;
     let n_rows = 2_usize;
     // Dense f32 `.weight` (NOT a quantized uint32 packed matrix).
     let w = arr_f32(&vec![0.5_f32; n_rows * group_size], &[n_rows, group_size]);
-    // Stale orphan `.scales` next to it; no matching `.biases`.
+    // Stale orphan `.scales` + matching `.biases` next to it.
     let stale_scales = arr_f32(&vec![1.0_f32; n_rows], &[n_rows, 1]);
+    let stale_biases = arr_f32(&vec![0.0_f32; n_rows], &[n_rows, 1]);
     let mut weights: Weights = HashMap::new();
     weights.insert("model.foo.weight".to_string(), w);
     weights.insert("model.foo.scales".to_string(), stale_scales);
+    weights.insert("model.foo.biases".to_string(), stale_biases);
 
     let cfg = PerLayerQuantization::from_global(Quantization::affine(group_size as i32, 4));
     let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
@@ -1532,9 +1584,13 @@ mod tests {
     // `.scales` with a different leading dim ([3, 1] vs `.weight`
     // leading dim of [2]).
     let bad_scales = arr_f32(&[1.0_f32; 3], &[3, 1]);
+    // `.biases` matching `.scales` so the triple advances past Fix 6's
+    // affine-arity check and reaches the leading-dim mismatch check.
+    let biases = arr_f32(&[0.0_f32; 3], &[3, 1]);
     let mut weights: Weights = HashMap::new();
     weights.insert("model.foo.weight".to_string(), w);
     weights.insert("model.foo.scales".to_string(), bad_scales);
+    weights.insert("model.foo.biases".to_string(), biases);
 
     let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
     let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
@@ -1602,9 +1658,13 @@ mod tests {
     // quantized triple.
     let w = arr_u32(&[0_u32, 0, 0, 0], &[4]);
     let scales = arr_u32(&[1_u32], &[1]);
+    // `.biases` matching `.scales` shape/dtype so the triple advances past
+    // Fix 6's affine-arity check and reaches the rank-≥-2 check.
+    let biases = arr_u32(&[0_u32], &[1]);
     let mut weights: Weights = HashMap::new();
     weights.insert("model.bad.weight".to_string(), w);
     weights.insert("model.bad.scales".to_string(), scales);
+    weights.insert("model.bad.biases".to_string(), biases);
 
     let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
     let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
@@ -1637,9 +1697,13 @@ mod tests {
     let w = arr_u32(&vec![0_u32; n_rows * 8], &[n_rows, 8]);
     // BAD `.scales` last-axis: 2 instead of the expected 1.
     let scales = arr_f32(&vec![1.0_f32; n_rows * 2], &[n_rows, 2]);
+    // `.biases` matching `.scales` so the triple advances past Fix 6's
+    // affine-arity check and reaches the scales last-axis check.
+    let biases = arr_f32(&vec![0.0_f32; n_rows * 2], &[n_rows, 2]);
     let mut weights: Weights = HashMap::new();
     weights.insert("model.foo.weight".to_string(), w);
     weights.insert("model.foo.scales".to_string(), scales);
+    weights.insert("model.foo.biases".to_string(), biases);
 
     let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
     let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
@@ -1664,17 +1728,20 @@ mod tests {
   }
 
   /// Fix 5 regression: a CORRECT `.weight` `[2, 8]` packed at
-  /// `bits=4, group_size=64` with `.scales` `[2, 1]`. The tightened
-  /// last-axis check must not regress this valid layout
+  /// `bits=4, group_size=64` with `.scales` `[2, 1]` (+ `.biases`
+  /// matching `.scales` shape/dtype — Fix 6 enforces affine-arity).
+  /// The tightened last-axis check must not regress this valid layout
   /// (`expected = 8 * 32 / 4 / 64 = 1` = actual).
   #[test]
   fn quantize_weights_valid_triple_with_correct_last_axis_skipped() {
     let n_rows = 2_usize;
     let w = arr_u32(&vec![0_u32; n_rows * 8], &[n_rows, 8]);
     let scales = arr_f32(&vec![1.0_f32; n_rows], &[n_rows, 1]);
+    let biases = arr_f32(&vec![0.0_f32; n_rows], &[n_rows, 1]);
     let mut weights: Weights = HashMap::new();
     weights.insert("model.foo.weight".to_string(), w);
     weights.insert("model.foo.scales".to_string(), scales);
+    weights.insert("model.foo.biases".to_string(), biases);
 
     let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
     let out =
@@ -1684,12 +1751,13 @@ mod tests {
     assert_eq!(w_out.dtype().unwrap(), crate::dtype::Dtype::U32);
     let s_out = out.get("model.foo.scales").expect(".scales");
     assert_eq!(s_out.shape(), vec![n_rows, 1]);
+    assert!(out.contains_key("model.foo.biases"));
   }
 
   /// Fix 5 regression on a different shape: `.weight` `[2, 16]` packed
-  /// at `bits=4, group_size=64` with `.scales` `[2, 2]`
-  /// (`expected = 16 * 32 / 4 / 64 = 2` = actual). Confirms the formula
-  /// matches multiple shapes, not just the minimal one.
+  /// at `bits=4, group_size=64` with `.scales` `[2, 2]` (+ `.biases`
+  /// matching) (`expected = 16 * 32 / 4 / 64 = 2` = actual). Confirms
+  /// the formula matches multiple shapes, not just the minimal one.
   #[test]
   fn quantize_weights_valid_triple_multi_group_passes() {
     let n_rows = 2_usize;
@@ -1697,9 +1765,11 @@ mod tests {
     // group_size=64 groups along the last axis → scales last-axis = 2.
     let w = arr_u32(&vec![0_u32; n_rows * 16], &[n_rows, 16]);
     let scales = arr_f32(&vec![1.0_f32; n_rows * 2], &[n_rows, 2]);
+    let biases = arr_f32(&vec![0.0_f32; n_rows * 2], &[n_rows, 2]);
     let mut weights: Weights = HashMap::new();
     weights.insert("model.foo.weight".to_string(), w);
     weights.insert("model.foo.scales".to_string(), scales);
+    weights.insert("model.foo.biases".to_string(), biases);
 
     let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
     let out =
@@ -1742,5 +1812,135 @@ mod tests {
       }
       other => panic!("expected Error::Backend, got: {other:?}"),
     }
+  }
+
+  // ──────────────── Fix 6 (this PR): per-mode bias arity ────────────────
+
+  /// Fix 6: an `affine` triple with NO `.biases` (only `.weight` + `.scales`)
+  /// is structurally incomplete. mlx `affine_quantize` emits
+  /// `{w_q, scales, biases}` unconditionally (`mlx/ops.cpp:4793-4798`); a
+  /// matching shape/dtype on `.scales` is not enough — the resolved mode
+  /// dictates the bias arity. Classified as [`TripleClass::Invalid`].
+  #[test]
+  fn quantize_weights_affine_triple_missing_biases_errors() {
+    let n_rows = 2_usize;
+    // Packed `.weight` `[2, 8]` u32 + `.scales` `[2, 1]` f32 — a layout
+    // that matches the affine weight/scales invariant except for the
+    // missing `.biases`.
+    let w = arr_u32(&vec![0_u32; n_rows * 8], &[n_rows, 8]);
+    let scales = arr_f32(&vec![1.0_f32; n_rows], &[n_rows, 1]);
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.affine_missing.weight".to_string(), w);
+    weights.insert("model.affine_missing.scales".to_string(), scales);
+
+    let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
+    let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("model.affine_missing"),
+          "error should name the incomplete layer, got: {message}"
+        );
+        assert!(
+          message.contains(".biases"),
+          "error should name the missing `.biases` sibling, got: {message}"
+        );
+        assert!(
+          message.contains("affine"),
+          "error should call out the `affine` mode requirement, got: {message}"
+        );
+        // The arity message also names `bits` / `group_size` (the cfg
+        // that fixed the resolved mode).
+        assert!(
+          message.contains("bits=4"),
+          "error should name the resolved bits, got: {message}"
+        );
+        assert!(
+          message.contains("group_size=64"),
+          "error should name the resolved group_size, got: {message}"
+        );
+      }
+      other => panic!("expected Error::Backend, got: {other:?}"),
+    }
+  }
+
+  /// Fix 6: an `mxfp4` triple with `.biases` present is a stale sibling
+  /// from a different mode. mlx `fp_quantize` emits `{w_q, scales}`
+  /// only — never `.biases` (`mlx/ops.cpp:4890,4898-4904`). Even if
+  /// shape/dtype happen to align with `.scales`, the bias slot MUST be
+  /// absent. Classified as [`TripleClass::Invalid`].
+  #[test]
+  fn quantize_weights_mxfp4_triple_with_stale_biases_errors() {
+    let n_rows = 2_usize;
+    // `mxfp4` requires `group_size=32`, `bits=4` (`mlx/ops.cpp:4808-4823`).
+    // Unpacked last = packed_last * 32 / bits = 4 * 8 = 32 = group_size,
+    // so scales last-axis = 32 / 32 = 1 — a structurally well-formed
+    // `mxfp4` `.weight`/`.scales` pair.
+    let w = arr_u32(&vec![0_u32; n_rows * 4], &[n_rows, 4]);
+    let scales = arr_f32(&vec![1.0_f32; n_rows], &[n_rows, 1]);
+    // Stale `.biases` from a different (affine) mode — same shape/dtype
+    // as `.scales` so it looks valid to a shape-only check.
+    let stale_biases = arr_f32(&vec![0.0_f32; n_rows], &[n_rows, 1]);
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.mxfp4_stale.weight".to_string(), w);
+    weights.insert("model.mxfp4_stale.scales".to_string(), scales);
+    weights.insert("model.mxfp4_stale.biases".to_string(), stale_biases);
+
+    let cfg = PerLayerQuantization::from_global(Quantization {
+      group_size: 32,
+      bits: 4,
+      mode: QuantMode::Mxfp4,
+    });
+    let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("model.mxfp4_stale"),
+          "error should name the offending layer, got: {message}"
+        );
+        assert!(
+          message.contains("mxfp4"),
+          "error should call out the offending `mxfp4` mode, got: {message}"
+        );
+        assert!(
+          message.contains(".biases"),
+          "error should name the stale `.biases` sibling, got: {message}"
+        );
+      }
+      other => panic!("expected Error::Backend, got: {other:?}"),
+    }
+  }
+
+  /// Fix 6 regression: a structurally valid `mxfp4` triple
+  /// (`.weight` u32 + `.scales` matching, NO `.biases`) — the scale-only
+  /// layout `fp_quantize` actually writes (`mlx/ops.cpp:4890,4898-4904`).
+  /// Must pass through unchanged: the new arity check accepts the
+  /// `(Mxfp4 | Mxfp8 | Nvfp4, None)` arm.
+  #[test]
+  fn quantize_weights_valid_mxfp4_scales_only_triple_passes() {
+    let n_rows = 2_usize;
+    // `mxfp4` invariants: group_size=32, bits=4. Packed `.weight` `[2, 4]`
+    // u32 → unpacks to `[2, 32]` (1 group per row) → `.scales` `[2, 1]`.
+    let w = arr_u32(&vec![0_u32; n_rows * 4], &[n_rows, 4]);
+    let scales = arr_f32(&vec![1.0_f32; n_rows], &[n_rows, 1]);
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.mxfp4_ok.weight".to_string(), w);
+    weights.insert("model.mxfp4_ok.scales".to_string(), scales);
+
+    let cfg = PerLayerQuantization::from_global(Quantization {
+      group_size: 32,
+      bits: 4,
+      mode: QuantMode::Mxfp4,
+    });
+    let out = quantize_weights(weights, &cfg, &default_eligible)
+      .expect("scale-only mxfp4 triple passes through");
+    // `.weight` and `.scales` preserved verbatim; `.biases` is NOT
+    // synthesized (scale-only mode).
+    let w_out = out.get("model.mxfp4_ok.weight").expect(".weight");
+    assert_eq!(w_out.shape(), vec![n_rows, 4]);
+    assert_eq!(w_out.dtype().unwrap(), crate::dtype::Dtype::U32);
+    let s_out = out.get("model.mxfp4_ok.scales").expect(".scales");
+    assert_eq!(s_out.shape(), vec![n_rows, 1]);
+    assert!(!out.contains_key("model.mxfp4_ok.biases"));
   }
 }
