@@ -46,3 +46,4 @@ pub mod dsp;
 pub mod features;
 pub mod io;
 pub mod stt;
+pub mod tts;
