@@ -2,11 +2,13 @@
 //!
 //! M5 ships the core IO + DSP primitives ported faithfully from
 //! `mlx-audio` ([`audio_io.py`] + [`dsp.py`]):
-//! - [`crate::audio::io`] — WAV load (via the `symphonia` crate, WAV +
-//!   PCM features only) + WAV save (roll-our-own pure-Rust 16-bit PCM
-//!   mono encoder with atomic-rename via tempfile + fsync-before-rename
-//!   + permission preservation; ~80 LOC in `audio/io.rs::save_wav`).
-//!   Naive linear resampling for the WAV-only surface; sinc/polyphase
+//! - [`crate::audio::io`] — multi-format audio **load** (WAV / MP3 /
+//!   FLAC / OGG-Vorbis, format auto-detected via the `symphonia`
+//!   crate's probe — the four formats `mlx_audio.audio_io.read`
+//!   decodes in-process via `miniaudio`) + WAV **save** (roll-our-own
+//!   pure-Rust 16-bit PCM mono encoder with atomic-rename via tempfile
+//!   + fsync-before-rename + permission preservation; ~80 LOC in
+//!   `audio/io.rs::save_wav`). Naive linear resampling; sinc/polyphase
 //!   resamplers are planned follow-ups.
 //! - [`crate::audio::dsp`] — window family (Hann/Hamming/Blackman/Bartlett
 //!   + the `STR_TO_WINDOW_FN`-style [`crate::audio::dsp::window_from_name`]
@@ -32,9 +34,15 @@
 //! Out of scope for this PR (separate follow-ups per the M5 plan):
 //! - High-quality resampling (polyphase sinc, libsamplerate-style).
 //! - Pitch shifting, time stretching, voice activity detection, biquad filters.
-//! - MP3/FLAC/OGG codecs (additional symphonia feature flags become
-//!   opt-in in future PRs; the `symphonia` crate already supports them,
-//!   we just don't enable them yet to keep the dep tree minimal).
+//! - **Decode** of M4A/AAC, Opus, and WebM. `mlx_audio.audio_io.read`
+//!   routes those through an external `ffmpeg` subprocess, and Opus has
+//!   no pure-Rust `symphonia` codec in 0.6 (no `opus` feature / no
+//!   `symphonia-codec-opus` crate — an open upstream issue). Adding any
+//!   of them needs a heavy `libopus`/`ffmpeg` C dependency, which the
+//!   minimal-deps project rule scopes out; see [`crate::audio::io`].
+//! - **Encode** of any non-WAV format. `mlx-audio` shells out to
+//!   `ffmpeg` for MP3/FLAC/OGG/Opus encoding; mlxrs's save path stays
+//!   pure-Rust 16-bit PCM mono WAV (no encoder crate / `ffmpeg` dep).
 //! - Per-model architectures (Whisper, Sesame, CSM, etc.) — see the
 //!   "no per-model arch porting" project rule.
 //!

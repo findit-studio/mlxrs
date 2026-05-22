@@ -290,7 +290,7 @@ fn stt_generate_stops_on_eos() {
 /// drives `decode_step` once per step. The `last_mel_shape` is the
 /// post-resample-driven `(n_mels, T)`, so its `T` axis is much smaller than
 /// the no-resample case (proves the resample path ran without inspecting
-/// the exact sample count, which depends on `audio_io::load_wav`'s rounded
+/// the exact sample count, which depends on `audio_io::load_audio`'s rounded
 /// sample count).
 #[test]
 fn stt_generate_resamples_when_sr_mismatch() {
@@ -392,7 +392,7 @@ fn stt_generate_rejects_audio_longer_than_max() {
 
 /// Regression (Codex adversarial-review round 1, high): the
 /// `max_audio_seconds` cap is checked against the **source** duration —
-/// the load_wav `(samples, src_sr)` pair — BEFORE the resample pass
+/// the load_audio `(samples, src_sr)` pair — BEFORE the resample pass
 /// allocates a second buffer. A 2-second 44.1 kHz source (88200 samples)
 /// at a 16 kHz-target model with a 1-second cap MUST reject without
 /// resampling. The encoder never being called is the proxy for the

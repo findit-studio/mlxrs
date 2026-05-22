@@ -1,22 +1,48 @@
-//! WAV file IO + naive linear resampling.
+//! Multi-format audio file IO + naive linear resampling.
 //!
-//! Faithful 1:1 port of the [`mlx_audio.audio_io.read`] / [`mlx_audio.audio_io.write`]
-//! core (WAV-only — MP3/FLAC/OGG/Opus opt-in via additional `symphonia`
-//! features in future PRs). Resampling is a naive linear-interpolation
-//! pass mirroring the `mlx-audio` utilities used by Whisper-style models;
-//! high-quality polyphase / sinc resampling is a planned follow-up.
+//! Faithful port of the [`mlx_audio.audio_io.read`] /
+//! [`mlx_audio.audio_io.write`] core. [`load_audio`] decodes **WAV, MP3,
+//! FLAC, and OGG/Vorbis** — the exact set `mlx_audio.audio_io.read`
+//! decodes through its in-process `miniaudio` path (WAV / MP3 / FLAC /
+//! Vorbis). Resampling is a naive linear-interpolation pass mirroring
+//! the `mlx-audio` utilities used by Whisper-style models; high-quality
+//! polyphase / sinc resampling is a planned follow-up.
 //!
-//! WAV *decoding* goes through the pure-Rust [`symphonia`] crate (active
-//! multi-format library, `wav` + `pcm` features only for now). WAV
-//! *encoding* is roll-our-own pure-Rust 16-bit PCM mono — symphonia
+//! *Decoding* goes through the pure-Rust [`symphonia`] crate (active
+//! multi-format library). The format is auto-detected by symphonia's
+//! probe — [`load_audio`] does not branch on the file extension to pick
+//! a codec, it dispatches on the probed container. The decode →
+//! `f32`-samples path (`push_samples`) is fully format-agnostic: every
+//! codec hands symphonia's PCM decoder a typed [`GenericAudioBufferRef`]
+//! and the same per-variant normalization applies regardless of source
+//! format. Output is always normalized to `f32` in `[-1.0, 1.0]`.
+//!
+//! **Formats scoped out of the in-process decoder:** M4A/AAC, Opus, and
+//! WebM. `mlx_audio.audio_io.read` decodes those by shelling out to an
+//! external `ffmpeg` subprocess (not an in-process codec). Opus in
+//! particular has **no pure-Rust symphonia codec** in `symphonia 0.6`
+//! (there is no `opus` feature and no `symphonia-codec-opus` crate — it
+//! is an open upstream issue), and every alternative needs a heavy
+//! `libopus` / `ffmpeg` C dependency. Per the minimal-deps project
+//! rule, mlxrs decodes the four formats symphonia covers natively and
+//! leaves M4A/AAC/Opus/WebM to a future PR (which would have to add the
+//! external-process or C-FFI dependency mlx-audio uses).
+//!
+//! *Encoding* is roll-our-own pure-Rust 16-bit PCM mono WAV — symphonia
 //! exposes no encoder API and the entire RIFF/WAVE/fmt/data spec fits in
 //! ~80 LOC, letting us control eval discipline and add atomic-rename
-//! without a crate-side change. This first cut is **mono-only**:
-//! multi-channel input is rejected with [`Error::Backend`] (the
-//! `Vec<f32>` return shape cannot faithfully carry the reference's 2-D
-//! `(samples, channels)` layout). A `load_wav_multichannel` variant
-//! returning `(Vec<f32>, u32, u16)` is a planned follow-up. Output is
-//! always normalized to `f32` in `[-1.0, 1.0]`.
+//! without a crate-side change. **Save stays WAV-only**: `mlx-audio`
+//! encodes MP3/FLAC/OGG/Opus by shelling out to `ffmpeg`, and adding an
+//! MP3/FLAC encoder crate (or the `ffmpeg` process dependency) is a
+//! heavy dep mlxrs does not take on for the save path — callers needing
+//! a compressed output format must post-process the WAV. This is the
+//! same "scope out the heavy-dep formats" decision as the decode side.
+//!
+//! Both load and save are **mono-only**: multi-channel input is rejected
+//! with [`Error::Backend`] (the `Vec<f32>` return shape cannot
+//! faithfully carry the reference's 2-D `(samples, channels)` layout). A
+//! multi-channel variant returning `(Vec<f32>, u32, u16)` is a planned
+//! follow-up.
 //!
 //! [`mlx_audio.audio_io.read`]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/audio_io.py
 //! [`mlx_audio.audio_io.write`]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/audio_io.py
@@ -31,7 +57,11 @@ use symphonia::core::{
   audio::{Audio, GenericAudioBufferRef},
   codecs::audio::AudioDecoderOptions,
   errors::Error as SymphoniaError,
-  formats::{FormatOptions, TrackType, probe::Hint},
+  formats::{
+    FormatOptions, TrackType,
+    probe::Hint,
+    well_known::{FORMAT_ID_FLAC, FORMAT_ID_WAVE},
+  },
   io::MediaSourceStream,
   meta::MetadataOptions,
 };
@@ -47,44 +77,83 @@ const I16_DIV: f32 = 32768.0;
 const I16_MUL: f32 = 32767.0;
 
 /// Public-input-driven Vec allocation cap. Hard ceiling on the number of
-/// f32 samples [`load_wav`] / [`resample_linear`] will materialize from
+/// f32 samples [`load_audio`] / [`resample_linear`] will materialize from
 /// caller-controllable parameters. 64 Mi-samples ≈ 256 MiB at 4 B / f32
 /// — about 30 min of mono 44.1 kHz audio — well above any realistic
 /// "load entire file into memory" use case, and well below "abort the
 /// host" territory. Crafted-attacker / fuzzer inputs above the cap get
 /// a recoverable [`Error::Backend`] instead of a Rust allocator abort.
+///
+/// For **lossy** formats (MP3 / OGG-Vorbis) this is the *primary* memory
+/// bound: a container's declared frame count is treated only as a
+/// capacity hint and an upfront over-cap rejection, never as a hard
+/// per-decode ceiling, because lossy encoders routinely declare an
+/// estimate (MP3 Xing/Info header) that differs from the true decoded
+/// length. For **exact-count** formats — uncompressed WAV (header frame
+/// count is sample-exact) and FLAC carrying a STREAMINFO total
+/// (`track_num_frames`, also sample-exact) — the declared count is the
+/// hard cap and additionally drives a strict post-decode count
+/// cross-check, so a truncated WAV/FLAC surfaces as an error rather than
+/// silently returning short audio.
+///
+/// The cap is enforced *per decoded buffer*, not per individual sample:
+/// before a packet's samples are appended, [`load_audio`] rejects the
+/// buffer if it would push `out.len()` past the cap and then
+/// `try_reserve`s exactly the buffer's sample count under the cap — so
+/// `out` never grows through Rust's infallible (abort-on-OOM) allocator
+/// path and never exceeds the cap, even when a compressed header
+/// under-estimates the true decoded length.
 pub const MAX_DECODED_SAMPLES: usize = 64 * 1024 * 1024;
 /// See [`MAX_DECODED_SAMPLES`] — same cap, applied to [`resample_linear`].
 pub const MAX_RESAMPLED_SAMPLES: usize = MAX_DECODED_SAMPLES;
 
-/// Load a mono WAV file and return `(samples, sample_rate)`.
+/// Load a mono audio file and return `(samples, sample_rate)`.
+///
+/// Decodes **WAV, MP3, FLAC, and OGG/Vorbis** — the format is
+/// auto-detected by [`symphonia`]'s probe (the file extension is only a
+/// *hint* that speeds detection; the actual codec is chosen from the
+/// container magic, so a `.bin` containing a valid MP3 still decodes).
+/// This is the exact format set `mlx_audio.audio_io.read` decodes via
+/// its in-process `miniaudio` path; M4A/AAC/Opus/WebM (which mlx-audio
+/// routes through an external `ffmpeg` process — symphonia has no
+/// pure-Rust Opus codec) are out of scope. See the module doc.
 ///
 /// Returns `f32` samples in `[-1.0, 1.0]`. Integer-PCM inputs are divided
 /// by `2^(bits-1)` (16-bit → 32768.0, matching `mlx_audio.audio_io.read`'s
-/// `dtype="float32"` arm exactly). Float WAVs are passed through unchanged.
+/// `dtype="float32"` arm exactly). Float / already-decoded samples are
+/// passed through unchanged. The per-format decoder (MP3 / FLAC / Vorbis)
+/// produces a typed [`GenericAudioBufferRef`] that the shared
+/// `push_samples` normalizer handles identically — there is no
+/// per-format sample path.
 ///
-/// **Multi-channel WAVs are rejected** with [`Error::Backend`] — the
+/// **Multi-channel files are rejected** with [`Error::Backend`] — the
 /// reference `mlx_audio.audio_io.read` returns a 2-D `(samples, channels)`
 /// array, but the `Vec<f32>` return shape here cannot faithfully carry that
 /// information. Callers needing stereo / 5.1 / etc. must either preprocess
 /// (downmix or split channels) before calling this fn, or use the planned
-/// `load_wav_multichannel` follow-up.
+/// multi-channel follow-up.
 ///
 /// # Errors
-/// - [`Error::Backend`] if the file cannot be opened, the format is invalid,
-///   the input has `channels != 1`, the codec is unsupported, or any
-///   sample is non-finite (NaN/inf in the source f32 PCM).
-pub fn load_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
+/// - [`Error::Backend`] if the file cannot be opened, the format cannot be
+///   probed / is unsupported (e.g. an Opus or M4A file — scoped out, see
+///   the module doc), the input has `channels != 1`, the codec is
+///   unsupported, the declared frame count exceeds the
+///   [`MAX_DECODED_SAMPLES`] cap, decoding produces more than the cap, an
+///   uncompressed WAV's decoded sample count disagrees with its header,
+///   or any sample is non-finite (NaN/inf in the decoded PCM).
+pub fn load_audio(path: &Path) -> Result<(Vec<f32>, u32)> {
   // Open + wrap in symphonia's MediaSourceStream. Box<File> is required by
-  // the MediaSource trait; the allocation is one-per-load_wav (fine — file
-  // IO dominates the cost).
+  // the MediaSource trait; the allocation is one-per-load_audio (fine —
+  // file IO dominates the cost).
   let file = File::open(path).map_err(|e| Error::Backend {
-    message: format!("load_wav: open {} failed: {e}", path.display()),
+    message: format!("load_audio: open {} failed: {e}", path.display()),
   })?;
   let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
   // Hint with the file extension if present — lets the probe skip
-  // format-detection backtracking for known extensions.
+  // format-detection backtracking for known extensions. The hint is only
+  // an optimization: symphonia still verifies the container magic, so a
+  // mislabelled / extensionless file is detected by content, not name.
   let mut hint = Hint::new();
   if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
     hint.with_extension(ext);
@@ -98,13 +167,33 @@ pub fn load_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
       MetadataOptions::default(),
     )
     .map_err(|e| Error::Backend {
-      message: format!("load_wav: probe {} failed: {e}", path.display()),
+      message: format!(
+        "load_audio: probe {} failed: {e} (unsupported or corrupt format; \
+         WAV/MP3/FLAC/OGG-Vorbis are supported, M4A/AAC/Opus/WebM are not)",
+        path.display()
+      ),
     })?;
+
+  // Probed container id. Two formats carry a *sample-exact* declared
+  // frame count and so qualify for the strict post-decode count
+  // cross-check + the header-count-as-hard-cap path:
+  //   - WAV: the header `num_frames` is sample-exact by construction.
+  //   - FLAC: STREAMINFO carries an EXACT total sample count, which
+  //     symphonia surfaces as `Track::num_frames` (combined with the
+  //     `track_num_frames.is_some()` check below — a FLAC without a
+  //     declared total stays relaxed).
+  // Genuinely-estimated lossy formats (MP3 Xing/Info, Vorbis granule
+  // rounding) use `MAX_DECODED_SAMPLES` as the hard cap and skip the
+  // equality check. Captured BEFORE the mutable `format.next_packet`
+  // borrows below.
+  let format_id = format.format_info().format;
+  let is_wav = format_id == FORMAT_ID_WAVE;
+  let is_flac = format_id == FORMAT_ID_FLAC;
 
   let track = format
     .default_track(TrackType::Audio)
     .ok_or_else(|| Error::Backend {
-      message: format!("load_wav: {} has no audio track", path.display()),
+      message: format!("load_audio: {} has no audio track", path.display()),
     })?;
   let track_id = track.id;
   // `Track::num_frames` is the per-channel frame count from the
@@ -113,11 +202,22 @@ pub fn load_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
   // of the immutable `track` borrow below.
   let track_num_frames = track.num_frames;
 
+  // Does this track carry a sample-EXACT declared frame count? True for
+  // WAV (always exact) and for FLAC *when* STREAMINFO declared a total
+  // (`track_num_frames` present) — symphonia surfaces the STREAMINFO
+  // total as `num_frames` for FLAC, and that value is exact, so a
+  // truncated FLAC that decodes fewer frames is real corruption. Lossy
+  // codecs (MP3 Xing/Info, Vorbis) are NOT exact: their declared count
+  // is an estimate, so they stay relaxed (hint-only) regardless. Drives
+  // both the hard cap (`cap` below) and the strict post-decode equality
+  // cross-check.
+  let exact_count = is_wav || (is_flac && track_num_frames.is_some());
+
   let codec_params = track.codec_params.as_ref().ok_or_else(|| Error::Backend {
-    message: format!("load_wav: {} has no codec parameters", path.display()),
+    message: format!("load_audio: {} has no codec parameters", path.display()),
   })?;
   let audio_params = codec_params.audio().ok_or_else(|| Error::Backend {
-    message: format!("load_wav: {} default track is not audio", path.display()),
+    message: format!("load_audio: {} default track is not audio", path.display()),
   })?;
 
   // Channel count: reject non-mono UPFRONT before any decode work. Using
@@ -128,64 +228,94 @@ pub fn load_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
     .as_ref()
     .map(|c| c.count())
     .ok_or_else(|| Error::Backend {
-      message: format!("load_wav: {} has no channel layout", path.display()),
+      message: format!("load_audio: {} has no channel layout", path.display()),
     })?;
   if nchannels == 0 {
     return Err(Error::Backend {
-      message: "load_wav: WAV header reports 0 channels".into(),
+      message: format!("load_audio: {} reports 0 channels", path.display()),
     });
   }
   if nchannels != 1 {
     return Err(Error::Backend {
       message: format!(
-        "load_wav: multi-channel input not supported (got {nchannels} channels); \
+        "load_audio: multi-channel input not supported (got {nchannels} channels); \
          this API returns mono Vec<f32>. Downmix or split channels before calling."
       ),
     });
   }
 
   let sample_rate = audio_params.sample_rate.ok_or_else(|| Error::Backend {
-    message: format!("load_wav: {} has no sample_rate", path.display()),
+    message: format!("load_audio: {} has no sample_rate", path.display()),
   })?;
 
   let mut decoder = symphonia::default::get_codecs()
     .make_audio_decoder(audio_params, &AudioDecoderOptions::default())
     .map_err(|e| Error::Backend {
-      message: format!("load_wav: make_audio_decoder failed: {e}"),
+      message: format!("load_audio: make_audio_decoder failed: {e}"),
     })?;
 
-  // Capped allocation. `num_frames` is the WAV-header-declared sample
-  // count per channel; for mono that equals the total f32 output length.
+  // Capped allocation. `num_frames` is the container-declared per-channel
+  // frame count; for mono that equals the total f32 output length.
   // `Vec::with_capacity` is infallible (aborts on allocator OOM), so we
   // fall back to `try_reserve_exact` against `MAX_DECODED_SAMPLES`.
   //
   // - If the container declares `num_frames`, reject upfront if it
-  //   exceeds `MAX_DECODED_SAMPLES` and pre-reserve exactly that much
-  //   (matches the prior hound-based path: one allocation per call,
-  //   rejection before any decode work).
-  // - If the container omits `num_frames`, reserve 0 and grow lazily.
-  //   In that mode the per-push cap (`MAX_DECODED_SAMPLES` checked in
-  //   `push_one` below) is what bounds the allocation; an unbounded
-  //   stream therefore cannot exceed the cap.
+  //   exceeds `MAX_DECODED_SAMPLES` — that rejection is format-agnostic
+  //   (a 10-GB-claiming MP3 header is refused exactly like a 10-GB WAV
+  //   header), since it bounds the *reservation* and a wildly oversized
+  //   declared length is never a valid file.
+  // - WAV: `num_frames` is sample-EXACT, so pre-reserve exactly that
+  //   much (one allocation per call; matches the prior hound-based path).
+  // - MP3 / FLAC / OGG-Vorbis: `num_frames` is an ESTIMATE (MP3
+  //   Xing/Info header) or subject to decoder delay/granule rounding.
+  //   It is used only as a capacity HINT — pre-reserve it (clamped to
+  //   the cap) to avoid reallocation churn, but the *hard* per-push
+  //   ceiling below is `MAX_DECODED_SAMPLES`, not the header value, so
+  //   a slight under-estimate does not spuriously fail a valid decode.
+  // - If the container omits `num_frames`, reserve 0 and grow lazily;
+  //   the per-push cap (`MAX_DECODED_SAMPLES` checked in `push_one`
+  //   below) bounds the allocation so an unbounded stream cannot exceed
+  //   the cap.
   let header_len_opt = track_num_frames.and_then(|n| usize::try_from(n).ok());
   if let Some(header_len) = header_len_opt
     && header_len > MAX_DECODED_SAMPLES
   {
     return Err(Error::Backend {
       message: format!(
-        "load_wav: header declares {header_len} samples (>{MAX_DECODED_SAMPLES} cap); \
-         refuse to allocate. Crafted/oversized WAV inputs require a streaming \
+        "load_audio: container declares {header_len} samples (>{MAX_DECODED_SAMPLES} cap); \
+         refuse to allocate. Crafted/oversized inputs require a streaming \
          decoder API (planned follow-up)."
       ),
     });
   }
-  let reserve_len = header_len_opt.unwrap_or(0);
+  // For WAV the header count is the exact length; for compressed formats
+  // it is a hint clamped to the cap (it was already rejected above if it
+  // exceeded the cap, so this clamp is a belt-and-braces no-op there).
+  let reserve_len = header_len_opt.unwrap_or(0).min(MAX_DECODED_SAMPLES);
   let mut out: Vec<f32> = Vec::new();
   out
     .try_reserve_exact(reserve_len)
     .map_err(|e| Error::Backend {
-      message: format!("load_wav: reservation for {reserve_len} samples failed: {e}"),
+      message: format!("load_audio: reservation for {reserve_len} samples failed: {e}"),
     })?;
+
+  // `cap` is the hard upper bound on `out.len()` enforced per decoded
+  // buffer by `push_samples`.
+  // - Exact-count formats (WAV, FLAC-with-STREAMINFO-total): the header
+  //   `num_frames` is sample-exact, so the cap is that count —
+  //   over-running it means a malformed/corrupt file.
+  // - Lossy MP3 / OGG-Vorbis (and a FLAC without a declared total): the
+  //   header count (if any) is only an estimate, so the cap is the
+  //   global `MAX_DECODED_SAMPLES` ceiling; using the estimate as a hard
+  //   cap would spuriously fail a valid file whose true length slightly
+  //   exceeds an under-estimating Xing/Info header.
+  // Reaching `cap` makes `push_samples` return `Error::Backend` rather
+  // than re-grow into the infallible-alloc path.
+  let cap = if exact_count {
+    header_len_opt.unwrap_or(MAX_DECODED_SAMPLES)
+  } else {
+    MAX_DECODED_SAMPLES
+  };
 
   // Decode loop. End-of-stream is signalled by `Ok(None)` from
   // `next_packet`. Some symphonia format readers surface end-of-stream
@@ -199,67 +329,143 @@ pub fn load_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
       Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
         // Some symphonia format readers surface end-of-stream as an
         // UnexpectedEof error rather than `Ok(None)` — treat both as
-        // clean end-of-stream so a properly-terminated WAV decodes
+        // clean end-of-stream so a properly-terminated file decodes
         // identically regardless of which path the reader takes.
         break;
       }
+      Err(SymphoniaError::ResetRequired) => {
+        // A chained / multi-segment stream (most commonly a chained
+        // OGG file) whose track list changes mid-stream. Faithfully
+        // handling it would require re-examining tracks and rebuilding
+        // the decoder; this mono single-stream loader does not support
+        // that, so fail loud rather than silently truncating at the
+        // segment boundary.
+        return Err(Error::Backend {
+          message: format!(
+            "load_audio: {} is a chained/multi-segment stream (ResetRequired); \
+             only single-stream audio is supported",
+            path.display()
+          ),
+        });
+      }
       Err(e) => {
         return Err(Error::Backend {
-          message: format!("load_wav: next_packet failed: {e}"),
+          message: format!("load_audio: next_packet failed: {e}"),
         });
       }
     };
     if packet.track_id != track_id {
       continue;
     }
-    // Fail-loud on ANY decode error — the prior hound-based path
-    // returned `Error::Backend` for every per-sample decode failure,
-    // and a silent "skip the bad packet" path would let a truncated
-    // or malformed WAV come back as `Ok` with missing audio. That
-    // mismatch with the strict-integer-PCM contract is exactly the
-    // silent-corruption surface the load_wav contract excludes.
+    // Fail-loud on ANY decode error — a silent "skip the bad packet"
+    // path would let a truncated or malformed file come back as `Ok`
+    // with missing audio, exactly the silent-corruption surface the
+    // load_audio contract excludes.
     let audio_buf = decoder.decode(&packet).map_err(|e| Error::Backend {
-      message: format!("load_wav: decode failed: {e}"),
+      message: format!("load_audio: decode failed: {e}"),
     })?;
 
     // Push interleaved f32 samples into `out`. We match on the typed
     // GenericAudioBufferRef variant + apply our own `/2^(bits-1)`
-    // divisor so the f32 values are byte-identical to the prior
-    // hound-based path (symphonia's built-in `Sample::to_sample::<f32>`
-    // for i16 divides by `i16::MAX = 32767`, not `32768.0` — a 1-LSB
-    // drift that the round-trip tolerance would absorb but that we
-    // can avoid entirely by going through the raw integer samples).
-    //
-    // `cap` is the hard upper bound on `out.len()`: the
-    // header-declared count if the container provided one, else the
-    // global `MAX_DECODED_SAMPLES` ceiling. Reaching `cap` causes
-    // `push_one` to return `Error::Backend` rather than re-grow into
-    // the infallible-alloc path.
-    let cap = header_len_opt.unwrap_or(MAX_DECODED_SAMPLES);
+    // divisor for integer-PCM variants (symphonia's built-in
+    // `Sample::to_sample::<f32>` for i16 divides by `i16::MAX = 32767`,
+    // not `32768.0` — a 1-LSB drift from `mlx_audio.audio_io.read`'s
+    // `int16 / 32768.0` convention that we avoid by going through the
+    // raw integer samples). MP3 / Vorbis decoders hand us an already-
+    // decoded f32 buffer; that arm is pass-through.
     push_samples(&audio_buf, &mut out, cap)?;
   }
 
   // Cross-check decoded sample count against the header-declared length
-  // when the container provided one. A short read (truncated WAV) would
-  // otherwise return `Ok` with missing audio — that's the same silent
-  // corruption surface the per-packet fail-loud above closes, but at
-  // the stream-level. We tolerate `out.len() > header_len` (over-declared
-  // headers; that path was already cap-rejected above) only because the
-  // `push_one` cap is exactly `header_len` when known, which prevents
-  // this branch from ever being reached with `out.len() > header_len`.
-  if let Some(header_len) = header_len_opt
+  // — for **exact-count formats only** (WAV always, FLAC when STREAMINFO
+  // declared a total). Their declared `num_frames` is sample-EXACT, so a
+  // short read (truncated WAV / truncated FLAC that hit a clean EOF after
+  // partial frames) would otherwise return `Ok` with missing audio — the
+  // same silent-corruption surface the per-packet fail-loud above closes,
+  // but at the stream level. `out.len() > header_len` cannot be reached
+  // here for these formats because the per-buffer cap is exactly
+  // `header_len` when known.
+  //
+  // For lossy MP3 / OGG-Vorbis (and a FLAC without a declared total) this
+  // check is deliberately SKIPPED: a lossy encoder's declared frame count
+  // is an estimate (MP3 Xing/Info header) and granule/decoder-delay
+  // rounding means even an "accurate" count routinely differs from
+  // `out.len()` by a handful of samples. Enforcing equality there would
+  // reject perfectly valid compressed files. The `MAX_DECODED_SAMPLES`
+  // cap (enforced per buffer above) remains the bound that protects
+  // against an unbounded/oversized compressed stream.
+  if exact_count
+    && let Some(header_len) = header_len_opt
     && out.len() != header_len
   {
     return Err(Error::Backend {
       message: format!(
-        "load_wav: decoded {} samples but header declared {header_len} \
-         (truncated or malformed WAV)",
+        "load_audio: decoded {} samples but container header declared {header_len} \
+         (truncated or malformed exact-count file: WAV or FLAC)",
         out.len()
       ),
     });
   }
 
   Ok((out, sample_rate))
+}
+
+/// Bound + reserve room for `n` more samples in `out` BEFORE appending
+/// them, so the subsequent appends cannot grow the `Vec` through Rust's
+/// infallible (abort-on-OOM) allocator path.
+///
+/// Two guards, in order:
+/// 1. **Cap.** Reject if `n` would push `out.len()` past `cap` — the hard
+///    ceiling, either an exact-count header's frame count (WAV /
+///    FLAC-with-STREAMINFO) or [`MAX_DECODED_SAMPLES`] (lossy /
+///    no-declared-count path). Computed as `n > cap - out.len()` with the
+///    subtraction order chosen so it cannot underflow (`out.len() <= cap`
+///    is the invariant every caller maintains by routing each decoded
+///    buffer through this guard). Returns [`Error::Backend`] (the existing
+///    over-cap error).
+/// 2. **Cap-limited fallible reserve.** Grow capacity to fit `n` more
+///    samples while STILL under the cap, mapping a
+///    [`std::collections::TryReserveError`] to [`Error::OutOfMemory`].
+///    After this returns `Ok`, the caller's `out.push` calls for these `n`
+///    samples land in reserved capacity and cannot trigger an infallible
+///    (abort-on-OOM) `Vec` regrowth.
+///
+/// The reserve keeps an amortized-doubling growth strategy (avoids
+/// quadratic reallocation when a compressed header under-estimates the true
+/// length) BUT clamps the *target capacity* at `cap`. A plain
+/// `Vec::try_reserve(n)` is amortized too, but it can grow capacity to
+/// ~2× the *current* capacity even when only a few samples remain under the
+/// cap — so a near-cap header hint (reserved upfront by `try_reserve_exact`
+/// in [`load_audio`]) plus a final in-cap packet would make the reservation
+/// itself attempt FAR more than [`MAX_DECODED_SAMPLES`], defeating the
+/// advertised memory ceiling (and spuriously failing an in-cap decode under
+/// memory pressure, since the oversized reserve fails). Clamping `target`
+/// at `cap` keeps the doubling shape while guaranteeing the reservation
+/// never asks for more than the cap.
+fn reserve_under_cap(out: &mut Vec<f32>, n: usize, cap: usize) -> Result<()> {
+  // `out.len() <= cap` always holds on entry (every prior buffer went
+  // through this guard), so `cap - out.len()` does not underflow. This is
+  // the hard cap enforcement and stays BEFORE the growth logic below.
+  if n > cap - out.len() {
+    return Err(Error::Backend {
+      message: format!("load_audio: stream produced more than the {cap}-sample cap"),
+    });
+  }
+  // The over-cap check above guarantees `out.len() + n <= cap`, so `needed`
+  // does not overflow and is itself `<= cap`.
+  let needed = out.len() + n;
+  if out.capacity() < needed {
+    // Amortized doubling, but clamped at the cap: a plain `try_reserve(n)`
+    // could grow to ~2× the current capacity (potentially past `cap`),
+    // whereas this never targets more than `cap`. `needed <= cap`, so the
+    // `max` keeps `target <= cap` while still allowing the doubling shape
+    // when there is headroom under the cap.
+    let target = needed.max(out.capacity().saturating_mul(2).min(cap));
+    out
+      .try_reserve_exact(target - out.len())
+      .map_err(|_| Error::OutOfMemory)?;
+  }
+  Ok(())
 }
 
 /// Append the interleaved samples in `buf` to `out`, normalizing to
@@ -271,18 +477,32 @@ pub fn load_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
 /// coded samples up to the buffer's intrinsic width — see the per-arm
 /// comments and `read_pcm_*!` in `symphonia-codec-pcm`.
 ///
-/// Enforces a hard upper bound `cap` on the running `out` length so the
-/// stream-vs-header / unbounded-stream paths are rejected before any
-/// further allocation.
+/// This normalizer is **format-agnostic** — it is the single decode →
+/// `f32` path for WAV, MP3, FLAC, and OGG/Vorbis alike. Compressed
+/// codecs (MP3 / Vorbis) decode to the f32 / f64 arms (pass-through);
+/// PCM/WAV and FLAC decode to the integer arms (`/2^(bits-1)`).
+///
+/// Enforces a hard upper bound `cap` on the running `out` length and,
+/// critically, does so *before* any append can grow the `Vec`. For each
+/// decoded buffer the count `n` of interleaved samples is known upfront
+/// (`Audio::samples_interleaved`), so we (1) reject the buffer if it would
+/// push `out.len()` past `cap` and (2) `try_reserve(n)` the room while
+/// still under the cap — mapping a reservation failure to
+/// [`Error::OutOfMemory`]. The subsequent per-sample `out.push` calls then
+/// land in already-reserved capacity and CANNOT trigger Rust's infallible
+/// (abort-on-OOM) `Vec` growth. This is the bound that protects against an
+/// attacker-controlled compressed file whose header under-estimates the
+/// true decoded length (the header is only a HINT for lossy formats), so
+/// `out` never grows infallibly and never exceeds the cap.
 fn push_samples(buf: &GenericAudioBufferRef<'_>, out: &mut Vec<f32>, cap: usize) -> Result<()> {
-  /// Reject a non-finite f32 (NaN/inf) before pushing — matches
-  /// `load_wav`'s prior hound-based Float arm.
+  /// Reject a non-finite f32 (NaN/inf) before pushing — a NaN/inf in the
+  /// decoded PCM would silently poison every downstream DSP stage.
   fn check_finite(s: f32) -> Result<f32> {
     if s.is_finite() {
       Ok(s)
     } else {
       Err(Error::Backend {
-        message: "load_wav: non-finite f32 PCM sample".into(),
+        message: "load_audio: non-finite f32 PCM sample".into(),
       })
     }
   }
@@ -299,28 +519,14 @@ fn push_samples(buf: &GenericAudioBufferRef<'_>, out: &mut Vec<f32>, cap: usize)
       32 => 2_147_483_648.0,
       n => {
         return Err(Error::Backend {
-          message: format!("load_wav: int_divisor: unexpected bits={n} (programmer error)"),
+          message: format!("load_audio: int_divisor: unexpected bits={n} (programmer error)"),
         });
       }
     })
   }
-  /// Push a single sample after enforcing the cap. The cap is the
-  /// hard ceiling — either the header-declared length (one-allocation
-  /// pre-reserve path) or `MAX_DECODED_SAMPLES` (lazy-grow path).
-  /// Exceeding the cap returns `Error::Backend` rather than letting
-  /// the Vec re-grow into the infallible-alloc path.
-  fn push_one(out: &mut Vec<f32>, sample: f32, cap: usize) -> Result<()> {
-    if out.len() >= cap {
-      return Err(Error::Backend {
-        message: format!("load_wav: stream produced more than the {cap}-sample cap"),
-      });
-    }
-    out.push(sample);
-    Ok(())
-  }
-
-  // Float WAVs are pass-through (already `[-1, 1]` f32). Integer-PCM
-  // WAVs are normalized by `2^(bits-1)` against the variant's intrinsic
+  // Float buffers (f32/f64 — MP3/Vorbis decoders, float WAVs) are
+  // pass-through (already `[-1, 1]`). Integer-PCM buffers (PCM WAV,
+  // FLAC) are normalized by `2^(bits-1)` against the variant's intrinsic
   // bit-width, NOT `bits_per_coded_sample` — the symphonia PCM decoder
   // has already up-shifted any coded-sample bits below the intrinsic
   // width via `shift = decoded_width - coded_width` in `read_pcm_*!`,
@@ -334,15 +540,25 @@ fn push_samples(buf: &GenericAudioBufferRef<'_>, out: &mut Vec<f32>, cap: usize)
   // built-in `Sample::to_sample::<f32>` for i16 divides by `i16::MAX =
   // 32767` (a 1-LSB drift from mlx-audio's 32768.0), so we deliberately
   // bypass it and apply our own divisor.
+  //
+  // Each arm bounds + reserves the buffer's interleaved sample count
+  // (`b.samples_interleaved() == num_planes * frames`, exactly what
+  // `iter_interleaved` yields) ONCE via `reserve_under_cap` before the
+  // push loop. After that reservation the per-sample `out.push` calls
+  // land in reserved capacity and cannot trigger an infallible `Vec`
+  // regrowth — so the cap is a true bound even when a compressed header
+  // under-estimated the decoded length.
   match buf {
     GenericAudioBufferRef::F32(b) => {
+      reserve_under_cap(out, b.samples_interleaved(), cap)?;
       for s in b.iter_interleaved() {
-        push_one(out, check_finite(s)?, cap)?;
+        out.push(check_finite(s)?);
       }
     }
     GenericAudioBufferRef::F64(b) => {
+      reserve_under_cap(out, b.samples_interleaved(), cap)?;
       for s in b.iter_interleaved() {
-        push_one(out, check_finite(s as f32)?, cap)?;
+        out.push(check_finite(s as f32)?);
       }
     }
     GenericAudioBufferRef::U8(b) => {
@@ -350,26 +566,29 @@ fn push_samples(buf: &GenericAudioBufferRef<'_>, out: &mut Vec<f32>, cap: usize)
       // Recenter via `i16::from(s) - 128` to land in `[-128, 127]`,
       // then divide by `2^7 = 128.0`.
       let divisor = int_divisor(8)?;
+      reserve_under_cap(out, b.samples_interleaved(), cap)?;
       for s in b.iter_interleaved() {
         let signed = i16::from(s) - 128;
-        push_one(out, f32::from(signed) / divisor, cap)?;
+        out.push(f32::from(signed) / divisor);
       }
     }
     GenericAudioBufferRef::U16(b) => {
       // Offset-binary unsigned 16-bit (range [0, 65536), midpoint 32768).
       let divisor = int_divisor(16)?;
+      reserve_under_cap(out, b.samples_interleaved(), cap)?;
       for s in b.iter_interleaved() {
         let signed = i32::from(s) - 32_768;
-        push_one(out, signed as f32 / divisor, cap)?;
+        out.push(signed as f32 / divisor);
       }
     }
     GenericAudioBufferRef::U24(b) => {
       // Offset-binary unsigned 24-bit (range [0, 2^24), midpoint 2^23).
       // `u24.inner()` returns the `[0, 2^24)` value as `u32`.
       let divisor = int_divisor(24)?;
+      reserve_under_cap(out, b.samples_interleaved(), cap)?;
       for s in b.iter_interleaved() {
         let signed = s.inner() as i32 - 0x80_0000;
-        push_one(out, signed as f32 / divisor, cap)?;
+        out.push(signed as f32 / divisor);
       }
     }
     GenericAudioBufferRef::U32(b) => {
@@ -377,34 +596,39 @@ fn push_samples(buf: &GenericAudioBufferRef<'_>, out: &mut Vec<f32>, cap: usize)
       // Use `wrapping_sub` to stay in i32 wraparound semantics — the
       // result is the i32 reinterpretation of `(s - 2^31)`.
       let divisor = int_divisor(32)?;
+      reserve_under_cap(out, b.samples_interleaved(), cap)?;
       for s in b.iter_interleaved() {
         let signed = s.wrapping_sub(0x8000_0000) as i32;
-        push_one(out, signed as f32 / divisor, cap)?;
+        out.push(signed as f32 / divisor);
       }
     }
     GenericAudioBufferRef::S8(b) => {
       let divisor = int_divisor(8)?;
+      reserve_under_cap(out, b.samples_interleaved(), cap)?;
       for s in b.iter_interleaved() {
-        push_one(out, f32::from(s) / divisor, cap)?;
+        out.push(f32::from(s) / divisor);
       }
     }
     GenericAudioBufferRef::S16(b) => {
       let divisor = int_divisor(16)?;
+      reserve_under_cap(out, b.samples_interleaved(), cap)?;
       for s in b.iter_interleaved() {
-        push_one(out, f32::from(s) / divisor, cap)?;
+        out.push(f32::from(s) / divisor);
       }
     }
     GenericAudioBufferRef::S24(b) => {
       // `i24.inner()` returns the `[-2^23, 2^23)` value as `i32`.
       let divisor = int_divisor(24)?;
+      reserve_under_cap(out, b.samples_interleaved(), cap)?;
       for s in b.iter_interleaved() {
-        push_one(out, s.inner() as f32 / divisor, cap)?;
+        out.push(s.inner() as f32 / divisor);
       }
     }
     GenericAudioBufferRef::S32(b) => {
       let divisor = int_divisor(32)?;
+      reserve_under_cap(out, b.samples_interleaved(), cap)?;
       for s in b.iter_interleaved() {
-        push_one(out, s as f32 / divisor, cap)?;
+        out.push(s as f32 / divisor);
       }
     }
   }
@@ -804,7 +1028,7 @@ pub fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<
 
   // Hard cap on the output buffer — defends against `from_rate=1,
   // to_rate=u32::MAX` (or similar adversarial ratios) that would attempt
-  // a tens-of-GB allocation. The cap matches `load_wav`'s
+  // a tens-of-GB allocation. The cap matches `load_audio`'s
   // `MAX_DECODED_SAMPLES` (64 Mi-samples ≈ 256 MiB of f32).
   if out_len > MAX_RESAMPLED_SAMPLES {
     return Err(Error::Backend {
@@ -841,4 +1065,155 @@ pub fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<
     out.push(a + (b - a) * frac as f32);
   }
   Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Fix 1 (bounded compressed decode): `reserve_under_cap` is the single
+  /// gate every decoded buffer passes through before its samples are
+  /// appended. A buffer that would push `out` past `cap` — the exact
+  /// scenario a compressed header under-estimating the cap creates (header
+  /// reserves `cap`, the decoder yields one more valid sample) — must
+  /// return a recoverable `Error::Backend`, and must NOT have grown `out`
+  /// past `cap` (no infallible `Vec` regrowth, no allocator abort).
+  #[test]
+  fn reserve_under_cap_rejects_buffer_that_would_exceed_cap() {
+    // Small synthetic cap so the test allocates nothing large. `out` is
+    // pre-filled to exactly one below the cap, mirroring "header reserved
+    // up to `cap`, decoder produced one more sample than fits".
+    let cap = 8usize;
+    let mut out: Vec<f32> = vec![0.0; cap - 1];
+    let cap_before = out.capacity();
+
+    // A single extra sample exactly fills the cap — allowed.
+    assert!(reserve_under_cap(&mut out, 1, cap).is_ok());
+    // (We do not push here; we only assert the reservation/cap math.)
+
+    // From the now-full-capacity position, any further buffer (even one
+    // sample) must be rejected, NOT pushed through an infallible regrowth.
+    out.resize(cap, 0.0); // out.len() == cap now (the "decoded up to cap" state)
+    let r = reserve_under_cap(&mut out, 1, cap);
+    assert!(
+      matches!(r, Err(Error::Backend { .. })),
+      "over-cap buffer must return a recoverable Backend error, got {r:?}"
+    );
+    // The Vec must not have been grown past the cap by the rejected call.
+    assert!(
+      out.len() <= cap,
+      "out grew past cap on the rejected path: len={} cap={cap}",
+      out.len()
+    );
+    // Capacity sanity: the rejection happened before any reallocation that
+    // would push capacity wildly above the cap (it may be >= cap from the
+    // earlier successful reserve, but the reject path added nothing).
+    assert!(
+      out.capacity() >= cap_before,
+      "capacity unexpectedly shrank: {} < {cap_before}",
+      out.capacity()
+    );
+  }
+
+  /// A buffer larger than the entire remaining room (multi-sample
+  /// over-cap, the realistic decoded-packet case) is rejected up front
+  /// with no growth.
+  #[test]
+  fn reserve_under_cap_rejects_oversized_buffer_against_empty_out() {
+    let cap = 16usize;
+    let mut out: Vec<f32> = Vec::new();
+    // A packet claiming more samples than the whole cap.
+    let r = reserve_under_cap(&mut out, cap + 1, cap);
+    assert!(
+      matches!(r, Err(Error::Backend { .. })),
+      "buffer larger than the cap must be rejected, got {r:?}"
+    );
+    assert_eq!(
+      out.len(),
+      0,
+      "rejected reservation must not append anything"
+    );
+    assert!(
+      out.capacity() <= cap,
+      "rejected reservation must not allocate past the cap: capacity={}",
+      out.capacity()
+    );
+  }
+
+  /// An exactly-fitting buffer is accepted and reserves the room (so the
+  /// caller's subsequent pushes cannot regrow).
+  #[test]
+  fn reserve_under_cap_accepts_and_reserves_up_to_cap() {
+    let cap = 32usize;
+    let mut out: Vec<f32> = Vec::new();
+    reserve_under_cap(&mut out, cap, cap).expect("filling exactly to cap must succeed");
+    assert!(
+      out.capacity() >= cap,
+      "reservation did not provide cap room: capacity={} cap={cap}",
+      out.capacity()
+    );
+    // Pushing the reserved `cap` samples cannot reallocate (capacity was
+    // reserved), so this loop never hits the infallible-growth path.
+    for i in 0..cap {
+      out.push(i as f32);
+    }
+    assert_eq!(out.len(), cap);
+  }
+
+  /// Codex review (cap-limited reserve growth): a plain amortized
+  /// `Vec::try_reserve(n)` can grow capacity to ~2× the *current* capacity
+  /// even when only a few samples remain under `cap`. With a near-cap
+  /// header hint (capacity already reserved up to `cap` by
+  /// `try_reserve_exact` in `load_audio`) plus a final in-cap packet, that
+  /// doubling would attempt an allocation FAR larger than the cap —
+  /// defeating the [`MAX_DECODED_SAMPLES`] memory ceiling (and, under
+  /// memory pressure, spuriously failing an in-cap decode because the
+  /// oversized reserve fails). The cap-limited growth must (a) accept the
+  /// in-cap packet and (b) NOT grow capacity past `cap`.
+  #[test]
+  fn reserve_under_cap_growth_does_not_exceed_cap() {
+    let cap = 64usize;
+    // `out` already holds capacity == cap (the near-cap header-hint state)
+    // and is filled to one below the cap, so a 1-sample packet still fits
+    // under the cap but the *needed* capacity (cap) equals current
+    // capacity — the case where a plain `try_reserve` would otherwise
+    // double to ~2*cap.
+    let mut out: Vec<f32> = Vec::with_capacity(cap);
+    out.resize(cap - 1, 0.0);
+    assert_eq!(out.capacity(), cap, "precondition: capacity == cap");
+
+    // A final packet that still fits under the cap is accepted.
+    reserve_under_cap(&mut out, 1, cap).expect("in-cap final packet must be accepted");
+
+    // The reservation must NOT have doubled capacity past the cap.
+    assert!(
+      out.capacity() <= cap,
+      "reserve grew capacity past the cap: capacity={} cap={cap}",
+      out.capacity()
+    );
+
+    // Also exercise the headroom case: capacity == cap - packet_len with
+    // plenty of slack below the cap. Growth is still clamped at the cap.
+    let packet = 8usize;
+    let mut out2: Vec<f32> = Vec::with_capacity(cap - packet);
+    out2.resize(cap - packet, 0.0);
+    let cap2_before = out2.capacity();
+    reserve_under_cap(&mut out2, packet, cap).expect("packet filling exactly to cap must succeed");
+    assert!(
+      out2.capacity() <= cap,
+      "reserve grew capacity past the cap: capacity={} cap={cap}",
+      out2.capacity()
+    );
+    assert!(
+      out2.capacity() >= cap2_before + packet,
+      "reserve did not provide room for the packet: capacity={} need>={}",
+      out2.capacity(),
+      cap2_before + packet
+    );
+    // The reserved room is real: pushing the packet cannot reallocate.
+    for i in 0..packet {
+      out2.push(i as f32);
+    }
+    assert_eq!(out2.len(), cap);
+  }
 }

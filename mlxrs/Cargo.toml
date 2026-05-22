@@ -34,7 +34,7 @@ tokenizer-tools      = ["tokenizer-config", "dep:serde_json"]                   
 embeddings           = ["tokenizer", "dep:smol_str", "dep:memspan"]                 # encode/decode (tokenizers crate) + `1_Pooling/config.json` parsing (HAND-ROLLED strict-JSON scanner per EMB-1; NO DIRECT `mlxrs::dep:serde_json` — `tokenizers v0.23` still pulls `serde_json` transitively for its `tokenizer.json` parse, so `embeddings` BUILDS but does not OWN `serde_json` after EMB-1. `tokenizer-config`/`tokenizer-bpe`/`tokenizer-spm`/`tokenizer-tools` continue to pull it directly). `smol_str` inlines short keys/values (≤23 bytes) into the JVal payload. `memspan` SIMD-accelerates `skip_ws` (AVX2/AVX-512/NEON dispatch) and the per-string `skip-until-quote-or-backslash` chunk scan, plus enables a no-escape fast path that copies the source slice directly into SmolStr with zero intermediate Vec.
 lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm", "tokenizer-bpe", "tokenizer-chat", "tokenizer-deepseek-v32", "tokenizer-tools"]
 vlm                  = ["lm", "dep:image"]
-audio                = ["lm", "dep:symphonia"] # mirrors mlx-audio's Python dep on mlx-lm; symphonia = WAV codec for audio::io. The always-compiled `mlxrs::simd` module accelerates the integrated_loudness sum-of-squares (NEON on aarch64, scalar fallback elsewhere) — no feature gate needed.
+audio                = ["lm", "dep:symphonia"] # mirrors mlx-audio's Python dep on mlx-lm; symphonia = WAV/MP3/FLAC/OGG-Vorbis codecs for audio::io. The always-compiled `mlxrs::simd` module accelerates the integrated_loudness sum-of-squares (NEON on aarch64, scalar fallback elsewhere) — no feature gate needed.
 unstable-ops-overload = []               # `&a + &b` etc. (panic on shape error). OFF by default.
 gguf                 = []                                                          # GGUF load/save (mlx-c `mlx_io_gguf*`). OFF: mlxrs-sys does not yet link gguflib.
 
@@ -86,13 +86,34 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # `Result`. The own kernel is fully `try_reserve_exact`-fallible, NEON-
 # accelerated on aarch64 (scalar fallback always compiled), and bit-exact
 # with PIL `Image.resize` (the reference mlx-vlm preprocessing expects).
-# Multi-format audio decoder (pure-Rust, actively maintained; WAV+PCM
-# today, MP3/FLAC/OGG/etc. become opt-in via additional feature flags in
-# future PRs). `default-features = false` keeps the dep tree minimal —
-# only `wav` + `pcm` are enabled for the current core surface. The WAV
-# *encoder* side is roll-our-own (~80 LOC in audio/io.rs::save_wav);
-# symphonia has no public encoder API.
-symphonia = { version = "0.6", optional = true, default-features = false, features = ["wav", "pcm"] }
+# Multi-format audio decoder (pure-Rust, actively maintained).
+# `default-features = false` keeps the dep tree minimal — we enable
+# exactly the codecs/containers `mlx_audio.audio_io.read` decodes
+# without an external `ffmpeg` process:
+#   - `wav`  + `pcm`    — RIFF/WAVE container + PCM codec (WAV)
+#   - `mp3`             — MPEG-1/2 Layer III (`symphonia-bundle-mp3`)
+#   - `flac`            — FLAC (`symphonia-bundle-flac`)
+#   - `ogg` + `vorbis`  — OGG container + Vorbis codec (the `.ogg`/
+#                         `vorbis` arm of mlx-audio's miniaudio path).
+#                         BOTH are required: `ogg` is the container
+#                         demuxer, `vorbis` is the audio codec.
+# mlx-audio additionally routes M4A/AAC/Opus/WebM through an external
+# `ffmpeg` subprocess; Opus in particular has NO pure-Rust symphonia
+# codec in 0.6.0 (no `opus` feature, no `symphonia-codec-opus` crate —
+# it remains an open upstream issue), and the alternatives all need a
+# heavy `libopus`/`ffmpeg` C dependency. Per the minimal-deps project
+# rule those formats are deliberately scoped OUT of mlxrs's in-process
+# decoder — see `audio/io.rs` and `audio/mod.rs` for the fence.
+# The WAV *encoder* side is roll-our-own (~80 LOC in
+# audio/io.rs::save_wav); symphonia has no public encoder API.
+symphonia = { version = "0.6", optional = true, default-features = false, features = [
+  "wav",
+  "pcm",
+  "mp3",
+  "flac",
+  "ogg",
+  "vorbis",
+] }
 
 # No [build-dependencies]: ALL tokenizer codegen moved to the `xtask` crate
 # (`cargo xtask-codegen`), so a normal `mlxrs` build never compiles

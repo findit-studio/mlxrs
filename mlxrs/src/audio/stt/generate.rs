@@ -1,4 +1,4 @@
-//! End-to-end STT generation: load WAV → optional resample → log-mel
+//! End-to-end STT generation: load audio → optional resample → log-mel
 //! spectrogram → encoder → token-by-token cross-attention decode loop.
 //!
 //! Ported in shape from mlx-audio's [`stt/generate.py`][stt-gen] (the model-
@@ -9,7 +9,7 @@
 //! in per-model code per the
 //! [`project_no_per_model_arch_porting`][noarch] rule).
 //!
-//! [`stt_generate`] composes [`crate::audio::io::load_wav`],
+//! [`stt_generate`] composes [`crate::audio::io::load_audio`],
 //! [`crate::audio::io::resample_linear`],
 //! [`crate::audio::dsp::log_mel_spectrogram`], the
 //! [`super::model::Model`] trait, and the LM's sampler / logits-processor
@@ -66,10 +66,10 @@ pub const DEFAULT_MAX_AUDIO_SECONDS: f32 = 30.0;
 /// - `max_audio_seconds` — reject inputs longer than this (recoverable
 ///   [`Error::Backend`]). Default [`DEFAULT_MAX_AUDIO_SECONDS`] = 30 s. The
 ///   check runs against the **source** duration immediately after
-///   `load_wav`, BEFORE the resample, mel-spectrogram, and encoder passes
+///   `load_audio`, BEFORE the resample, mel-spectrogram, and encoder passes
 ///   allocate — so a crafted / fuzz input claiming long audio cannot drive
 ///   a multi-GB allocation through the STT pipeline. The **load-stage
-///   ceiling** is a separate cap inside `audio::io::load_wav`
+///   ceiling** is a separate cap inside `audio::io::load_audio`
 ///   (`MAX_DECODED_SAMPLES` = 64 Mi samples ≈ 256 MiB, ~17 min of 16 kHz
 ///   mono) — `max_audio_seconds` is the layered STT-pipeline cap on top
 ///   of that, NOT a replacement for it.
@@ -124,12 +124,15 @@ fn audio_path_to_mel<M: super::model::Model>(
     });
   }
 
-  // 1. Load. The mlxrs pipeline uses a **layered resource cap**:
-  //    - `load_wav` rejects upfront (via the WAV-header `num_frames`
-  //      check) when declared samples exceed `MAX_DECODED_SAMPLES` =
-  //      64 Mi samples ≈ 256 MiB at 4 B / f32 (~17 minutes of 16 kHz
-  //      mono, ~25 minutes of 44.1 kHz mono). That is the absolute
-  //      load-stage ceiling shared with `mlx-audio`'s WAV loader.
+  // 1. Load. `load_audio` decodes WAV / MP3 / FLAC / OGG-Vorbis (the
+  //    format is auto-detected from the file content). The mlxrs
+  //    pipeline uses a **layered resource cap**:
+  //    - `load_audio` rejects upfront when a container's declared frame
+  //      count exceeds `MAX_DECODED_SAMPLES` = 64 Mi samples ≈ 256 MiB
+  //      at 4 B / f32 (~17 minutes of 16 kHz mono, ~25 minutes of
+  //      44.1 kHz mono), and caps the running decoded length at that
+  //      same ceiling for compressed inputs that omit / under-estimate
+  //      their length. That is the absolute load-stage ceiling.
   //    - `max_audio_seconds` (default 30 s, the whisper segment size)
   //      is the STT-pipeline cap; it rejects audio whose source
   //      duration exceeds the per-utterance limit before the resample
@@ -143,12 +146,10 @@ fn audio_path_to_mel<M: super::model::Model>(
   //    mirrors mlx-audio's behavior: the python loader loads first,
   //    then the per-model code checks duration. A stricter pre-load
   //    cap (e.g. a sample-count-aware loader variant) is a planned
-  //    `audio::io` follow-up, not an STT-loop concern (separation of
-  //    layer caps; doing it here would duplicate WAV-header parsing or
-  //    require an `audio::io` API change out of this PR's scope).
-  let (samples, src_sr) = audio_io::load_wav(audio_path)?;
+  //    `audio::io` follow-up, not an STT-loop concern.
+  let (samples, src_sr) = audio_io::load_audio(audio_path)?;
 
-  // 2. Duration cap — checked against the **source** duration (load_wav's
+  // 2. Duration cap — checked against the **source** duration (load_audio's
   //    `samples.len() / src_sr`) BEFORE resampling allocates a second
   //    buffer. The source duration is the ground truth: resampling can
   //    only refactor the same audio span into a different sample count, so
@@ -158,7 +159,7 @@ fn audio_path_to_mel<M: super::model::Model>(
   //    `floor(in * to / from)` and silently pass.
   //
   //    f64 arithmetic for the comparison (cap is `f32`, but the
-  //    `samples_len * sr` product can reach `~10^14` at the load_wav cap;
+  //    `samples_len * sr` product can reach `~10^14` at the load_audio cap;
   //    `f64` mantissa carries it exactly, `f32` would round it). The
   //    `> cfg.max_audio_seconds as f64` lift keeps both sides in f64 for
   //    the comparison.
@@ -228,7 +229,7 @@ fn audio_path_to_mel<M: super::model::Model>(
   }
 
   // 5. Build an Array from the f32 buffer. `samples.len()` fits i32 because
-  //    `load_wav`'s `MAX_DECODED_SAMPLES = 64 Mi` and `resample_linear`'s
+  //    `load_audio`'s `MAX_DECODED_SAMPLES = 64 Mi` and `resample_linear`'s
   //    `MAX_RESAMPLED_SAMPLES = 64 Mi` are both well below `i32::MAX`.
   let n_samples = i32::try_from(samples.len()).map_err(|_| Error::Backend {
     message: format!(
@@ -420,7 +421,7 @@ impl<M: super::model::Model> Iterator for SttGenerator<'_, M> {
 /// Start an end-to-end STT generation run.
 ///
 /// Pipeline (mlx-audio whisper / parakeet shape):
-/// 1. [`crate::audio::io::load_wav`] (mono `Vec<f32>` in `[-1, 1]`).
+/// 1. [`crate::audio::io::load_audio`] (mono `Vec<f32>` in `[-1, 1]`).
 /// 2. Optional [`crate::audio::io::resample_linear`] when the source sample
 ///    rate differs from [`super::model::Model::mel_config`]'s `sample_rate`
 ///    (gated by [`SttGenConfig::auto_resample`]).

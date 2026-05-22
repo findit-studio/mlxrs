@@ -14,7 +14,7 @@
 //!
 //! ## Pipeline
 //!
-//! 1. [`crate::audio::io::load_wav`] — mono `Vec<f32>` in `[-1, 1]`.
+//! 1. [`crate::audio::io::load_audio`] — mono `Vec<f32>` in `[-1, 1]`.
 //! 2. Optional [`crate::audio::io::resample_linear`] when the source rate
 //!    differs from [`model::Model::mel_config`].
 //! 3. [`generate::SttGenConfig::max_audio_seconds`] cap (BEFORE allocation).

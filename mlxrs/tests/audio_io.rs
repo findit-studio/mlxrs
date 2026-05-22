@@ -1,8 +1,17 @@
-//! Happy-path + edge-case tests for `mlxrs::audio::io` (WAV load/save +
-//! naive linear resample).
+//! Happy-path + edge-case tests for `mlxrs::audio::io` (WAV/MP3/FLAC/
+//! OGG-Vorbis load + WAV save + naive linear resample).
 //!
 //! NO disk I/O outside `std::env::temp_dir() + process::id()` (matches the
 //! existing `tests/io.rs` convention; tempfile is not a workspace dep yet).
+//!
+//! Compressed-format tests decode tiny real fixtures committed under
+//! `tests/fixtures/audio_tone.{mp3,flac,ogg}` — each a ~0.25 s 8 kHz mono
+//! 440 Hz tone (<5 KB) generated once via ffmpeg / libsndfile. The bytes
+//! are `include_bytes!`-embedded and written to a temp file per test, so
+//! the suite needs no encoder dependency and no ffmpeg at test time —
+//! only `mlxrs`'s symphonia *decoder*. Sample-count asserts use a
+//! tolerance band (not an exact count) because lossy decoders differ in
+//! how they handle encoder delay / padding.
 
 #![cfg(feature = "audio")]
 
@@ -13,12 +22,72 @@ use std::{
   process,
 };
 
-use mlxrs::audio::io::{load_wav, resample_linear, save_wav};
+use mlxrs::audio::io::{load_audio, resample_linear, save_wav};
+
+/// Tiny committed fixtures: ~0.25 s 8 kHz mono 440 Hz tone, one per
+/// newly-enabled compressed format. See the module doc for provenance.
+const FIXTURE_MP3: &[u8] = include_bytes!("fixtures/audio_tone.mp3");
+const FIXTURE_FLAC: &[u8] = include_bytes!("fixtures/audio_tone.flac");
+const FIXTURE_OGG_VORBIS: &[u8] = include_bytes!("fixtures/audio_tone.ogg");
+
+/// Expected source duration of every fixture (0.25 s @ 8 kHz = 2000
+/// frames). Decoders disagree by a few hundred samples on encoder
+/// delay/padding, so callers assert a band around this, never equality.
+const FIXTURE_SR: u32 = 8000;
+const FIXTURE_NOMINAL_SAMPLES: usize = 2000;
 
 fn temp_wav(name: &str) -> PathBuf {
   let mut p = std::env::temp_dir();
   p.push(format!("mlxrs_audio_io_{}_{}.wav", process::id(), name));
   p
+}
+
+/// A temp path with an arbitrary `ext` (used to prove `load_audio`
+/// dispatches on file *content*, not the extension).
+fn temp_path(name: &str, ext: &str) -> PathBuf {
+  let mut p = std::env::temp_dir();
+  p.push(format!("mlxrs_audio_io_{}_{}.{}", process::id(), name, ext));
+  p
+}
+
+/// Write `bytes` to a fresh temp file at `path`, returning a guard-free
+/// path (callers `fs::remove_file` in the test body, matching the
+/// existing convention).
+fn write_fixture(path: &std::path::Path, bytes: &[u8]) {
+  let mut f = File::create(path).unwrap();
+  f.write_all(bytes).unwrap();
+  f.flush().unwrap();
+}
+
+/// Shared assertions for a decoded compressed fixture: correct sample
+/// rate, a sane sample-count band around the 2000-frame nominal length
+/// (tolerant of per-decoder encoder-delay handling), all-finite, and
+/// not silently all-zero (proves real audio came through, not an empty
+/// buffer).
+fn assert_decoded_tone(samples: &[f32], sr: u32, fmt: &str) {
+  assert_eq!(sr, FIXTURE_SR, "{fmt}: sample rate mismatch");
+  // Tolerance band: at least half the nominal length, at most ~2.5x
+  // (covers MP3 decoders that prepend ~1000+ samples of encoder delay
+  // and a final partial frame).
+  assert!(
+    samples.len() >= FIXTURE_NOMINAL_SAMPLES / 2
+      && samples.len() <= FIXTURE_NOMINAL_SAMPLES * 5 / 2,
+    "{fmt}: decoded {} samples, expected ~{FIXTURE_NOMINAL_SAMPLES}",
+    samples.len()
+  );
+  assert!(
+    samples.iter().all(|s| s.is_finite()),
+    "{fmt}: decoded a non-finite sample"
+  );
+  assert!(
+    samples.iter().any(|&s| s.abs() > 1e-4),
+    "{fmt}: decoded an all-(near-)zero buffer (codec likely not wired)"
+  );
+  // Normalized PCM is always in [-1, 1].
+  assert!(
+    samples.iter().all(|&s| (-1.0..=1.0).contains(&s)),
+    "{fmt}: decoded a sample outside [-1, 1]"
+  );
 }
 
 /// Roll-own stereo i16 PCM WAV writer for the `load_wav_rejects_multichannel`
@@ -61,7 +130,7 @@ fn wav_round_trip_preserves_samples_within_quantization() {
     .map(|i| ((i as f32) / 16.0 - 1.0).clamp(-1.0, 1.0))
     .collect();
   save_wav(&path, &samples, 16_000).unwrap();
-  let (got, sr) = load_wav(&path).unwrap();
+  let (got, sr) = load_audio(&path).unwrap();
   assert_eq!(sr, 16_000);
   assert_eq!(got.len(), samples.len());
   // 16-bit PCM round-trip quantization step is 1 / 32768; allow a slightly
@@ -81,7 +150,7 @@ fn wav_round_trip_preserves_sample_rate_44100() {
   let path = temp_wav("sr44100");
   let samples = vec![0.0_f32; 8];
   save_wav(&path, &samples, 44_100).unwrap();
-  let (_, sr) = load_wav(&path).unwrap();
+  let (_, sr) = load_audio(&path).unwrap();
   assert_eq!(sr, 44_100);
   let _ = fs::remove_file(&path);
 }
@@ -91,7 +160,7 @@ fn save_clips_out_of_range_samples() {
   // Samples > 1.0 should be clipped to +1 (which quantizes to 32767 → ≈ +0.99997).
   let path = temp_wav("clip");
   save_wav(&path, &[2.0_f32, -3.0, 0.0], 8_000).unwrap();
-  let (got, _) = load_wav(&path).unwrap();
+  let (got, _) = load_audio(&path).unwrap();
   assert_eq!(got.len(), 3);
   assert!(got[0] > 0.999, "+2 should clip to ~+1, got {}", got[0]);
   assert!(got[1] < -0.999, "-3 should clip to ~-1, got {}", got[1]);
@@ -140,7 +209,7 @@ fn load_wav_rejects_multichannel() {
   // 4 interleaved L/R sample pairs = 8 i16 samples.
   let interleaved: &[i16] = &[100, -100, 200, -200, 300, -300, 400, -400];
   write_pcm16_wav(&path, interleaved, 16_000, 2);
-  let r = load_wav(&path);
+  let r = load_audio(&path);
   assert!(matches!(r, Err(mlxrs::Error::Backend { .. })));
   let _ = fs::remove_file(&path);
 }
@@ -209,7 +278,7 @@ fn load_wav_missing_file_returns_backend_error() {
   // Make absolutely sure it doesn't exist (a stale file from a prior run
   // would mask the test).
   let _ = fs::remove_file(&path);
-  let r = load_wav(&path);
+  let r = load_audio(&path);
   assert!(matches!(r, Err(mlxrs::Error::Backend { .. })));
 }
 
@@ -238,7 +307,7 @@ fn save_wav_atomic_no_tempfile_remains_after_successful_save() {
     "found stray tempfile(s) after successful save: {stray_tempfiles:?}"
   );
   // Sanity: the destination is the new file (load works).
-  let (got, _) = load_wav(&path).unwrap();
+  let (got, _) = load_audio(&path).unwrap();
   assert_eq!(got.len(), samples.len());
   let _ = fs::remove_file(&path);
 }
@@ -255,7 +324,7 @@ fn save_wav_atomically_replaces_existing_file() {
   save_wav(&path, &samples, 16_000).unwrap();
   // Loading via symphonia must succeed (would fail if the marker bytes
   // were still at the destination, since they aren't a valid WAV).
-  let (got, sr) = load_wav(&path).unwrap();
+  let (got, sr) = load_audio(&path).unwrap();
   assert_eq!(sr, 16_000);
   assert_eq!(got.len(), samples.len());
   // Confirm the raw bytes start with "RIFF" — proving it's the new
@@ -311,7 +380,7 @@ fn load_wav_rejects_truncated_wav() {
   }
   f.flush().unwrap();
   drop(f);
-  let r = load_wav(&path);
+  let r = load_audio(&path);
   assert!(
     matches!(r, Err(mlxrs::Error::Backend { .. })),
     "load_wav must reject a truncated WAV; got {r:?}"
@@ -397,7 +466,7 @@ fn load_wav_decodes_24bit_pcm_mono_wav() {
   f.write_all(&[0x01, 0x00, 0x80]).unwrap();
   f.flush().unwrap();
   drop(f);
-  let (got, sr) = load_wav(&path).unwrap();
+  let (got, sr) = load_audio(&path).unwrap();
   assert_eq!(sr, 16_000);
   assert_eq!(got.len(), 3);
   // 24-bit divisor = 2^23 = 8388608. Expected: 8388607/8388608, 0, -8388607/8388608.
@@ -422,7 +491,7 @@ fn load_wav_via_symphonia_roundtrip_matches_save_wav_output() {
     .map(|i| ((i as f32) / 32.0 - 1.0).clamp(-1.0, 1.0))
     .collect();
   save_wav(&path, &samples, 22_050).unwrap();
-  let (got, sr) = load_wav(&path).unwrap();
+  let (got, sr) = load_audio(&path).unwrap();
   assert_eq!(sr, 22_050);
   assert_eq!(got.len(), samples.len());
   for (g, w) in got.iter().zip(samples.iter()) {
@@ -432,4 +501,184 @@ fn load_wav_via_symphonia_roundtrip_matches_save_wav_output() {
     );
   }
   let _ = fs::remove_file(&path);
+}
+
+// -------- New tests: MP3 / FLAC / OGG-Vorbis decode (A6) --------
+
+#[test]
+fn load_audio_decodes_mp3() {
+  // Decode a real (tiny) MP3 fixture through the public `load_audio` API
+  // — proves the `mp3` symphonia feature is enabled and the lossy-decode
+  // → f32 pass-through arm works end to end.
+  let path = temp_path("mp3_decode", "mp3");
+  write_fixture(&path, FIXTURE_MP3);
+  let (samples, sr) = load_audio(&path).unwrap();
+  assert_decoded_tone(&samples, sr, "mp3");
+  let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn load_audio_decodes_flac() {
+  // Decode a real FLAC fixture — proves the `flac` symphonia feature is
+  // enabled. FLAC decodes to the integer-PCM arm (lossless), so this
+  // also exercises the `/2^(bits-1)` normalization on a non-WAV source.
+  let path = temp_path("flac_decode", "flac");
+  write_fixture(&path, FIXTURE_FLAC);
+  let (samples, sr) = load_audio(&path).unwrap();
+  assert_decoded_tone(&samples, sr, "flac");
+  let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn load_audio_flac_decodes_exact_streaminfo_sample_count() {
+  // Fix 2 (FLAC exact-count): FLAC's STREAMINFO carries an EXACT total
+  // sample count, which symphonia surfaces as the track's `num_frames`.
+  // `load_audio` now treats FLAC-with-a-declared-total like WAV (an
+  // exact-count format) and applies the strict post-decode equality
+  // cross-check — so the intact fixture must decode to EXACTLY its
+  // declared 2000 samples (not merely a tolerance band). If this drifts
+  // off 2000, either the fixture or the exact-count gate changed.
+  let path = temp_path("flac_exact", "flac");
+  write_fixture(&path, FIXTURE_FLAC);
+  let (samples, sr) = load_audio(&path).unwrap();
+  assert_eq!(sr, FIXTURE_SR, "flac: sample rate mismatch");
+  assert_eq!(
+    samples.len(),
+    FIXTURE_NOMINAL_SAMPLES,
+    "flac: exact STREAMINFO total must decode to exactly {FIXTURE_NOMINAL_SAMPLES} samples"
+  );
+  let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn load_audio_rejects_truncated_flac() {
+  // Fix 2 (FLAC exact-count): a FLAC truncated mid-stream declares (via
+  // STREAMINFO) more samples than survive in the truncated byte buffer.
+  // Symphonia can hit a clean EOF after the partial frames; the old
+  // WAV-only gate would then return `Ok` with missing audio (silent
+  // corruption). With FLAC promoted to an exact-count format, the
+  // post-decode `out.len() == declared` cross-check (or an earlier decode
+  // error) must surface `Error::Backend` instead.
+  //
+  // We truncate to the first half of the fixture bytes, which keeps the
+  // STREAMINFO header (so `num_frames` = 2000 is known) but drops the
+  // tail audio frames.
+  let path = temp_path("flac_truncated", "flac");
+  let cut = FIXTURE_FLAC.len() / 2;
+  write_fixture(&path, &FIXTURE_FLAC[..cut]);
+  let r = load_audio(&path);
+  assert!(
+    matches!(r, Err(mlxrs::Error::Backend { .. })),
+    "truncated FLAC must be rejected (count mismatch / corruption), got {r:?}"
+  );
+  let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn load_audio_decodes_ogg_vorbis() {
+  // Decode a real mono OGG/Vorbis fixture — proves BOTH the `ogg`
+  // (container demux) AND `vorbis` (audio codec) symphonia features are
+  // enabled and that Vorbis audio packets decode to finite f32 samples.
+  let path = temp_path("ogg_decode", "ogg");
+  write_fixture(&path, FIXTURE_OGG_VORBIS);
+  let (samples, sr) = load_audio(&path).unwrap();
+  assert_decoded_tone(&samples, sr, "ogg/vorbis");
+  let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn load_audio_autodetects_format_ignoring_extension() {
+  // Format dispatch is by CONTENT, not file extension: write the MP3
+  // fixture bytes to a file with a misleading `.flac` extension and a
+  // FLAC fixture to a `.wav` extension; both must still decode correctly
+  // via symphonia's probe (the extension is only a probe *hint*).
+  let mp3_as_flac = temp_path("mislabeled_mp3", "flac");
+  write_fixture(&mp3_as_flac, FIXTURE_MP3);
+  let (samples, sr) = load_audio(&mp3_as_flac).unwrap();
+  assert_decoded_tone(&samples, sr, "mp3-labeled-flac");
+  let _ = fs::remove_file(&mp3_as_flac);
+
+  let flac_as_wav = temp_path("mislabeled_flac", "wav");
+  write_fixture(&flac_as_wav, FIXTURE_FLAC);
+  let (samples, sr) = load_audio(&flac_as_wav).unwrap();
+  assert_decoded_tone(&samples, sr, "flac-labeled-wav");
+  let _ = fs::remove_file(&flac_as_wav);
+}
+
+#[test]
+fn load_audio_autodetects_format_with_no_extension() {
+  // No extension at all (no hint) — symphonia must still detect the
+  // container from its magic bytes. Exercises each newly-enabled format.
+  for (name, bytes, fmt) in [
+    ("noext_mp3", FIXTURE_MP3, "mp3"),
+    ("noext_flac", FIXTURE_FLAC, "flac"),
+    ("noext_ogg", FIXTURE_OGG_VORBIS, "ogg/vorbis"),
+  ] {
+    let mut p = std::env::temp_dir();
+    p.push(format!("mlxrs_audio_io_{}_{}", process::id(), name));
+    write_fixture(&p, bytes);
+    let (samples, sr) = load_audio(&p).unwrap();
+    assert_decoded_tone(&samples, sr, fmt);
+    let _ = fs::remove_file(&p);
+  }
+}
+
+#[test]
+fn load_audio_rejects_unsupported_opus_like_garbage() {
+  // A buffer that is not any supported container must surface a
+  // recoverable Err (probe failure), never a panic. This stands in for
+  // the scoped-out formats (Opus/M4A/AAC/WebM): mlxrs has no in-process
+  // decoder for them, so they fail the probe like any other unknown
+  // container. Use a non-trivial byte pattern so the probe actually runs
+  // its format detection rather than short-circuiting on an empty file.
+  let path = temp_path("unsupported", "opus");
+  let garbage: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
+  write_fixture(&path, &garbage);
+  let r = load_audio(&path);
+  assert!(
+    matches!(r, Err(mlxrs::Error::Backend { .. })),
+    "unsupported/garbage input must return Backend error, got {r:?}"
+  );
+  let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn load_audio_truncated_compressed_is_bounded_and_recoverable() {
+  // Bounded-memory / robustness: a compressed stream truncated mid-file
+  // must NEVER panic, hang, or allocate unboundedly. It returns either a
+  // recoverable Err (the common case — decode error / failed page CRC /
+  // short read) OR `Ok` with a sample count bounded by
+  // `MAX_DECODED_SAMPLES`. Both are acceptable; the invariant under test
+  // is "completes with a bounded Result". (We deliberately do NOT
+  // require `Err`: MP3 is frame-resync tolerant and a cut on a frame
+  // boundary can legitimately decode a shorter clean clip.)
+  //
+  // The strict-Err truncation guarantee is covered for the sample-exact
+  // WAV path by `load_wav_rejects_truncated_wav`; the cap mechanism is
+  // covered by `resample_rejects_oversized_output_cap`.
+  for (name, bytes, ext) in [
+    ("trunc_mp3", FIXTURE_MP3, "mp3"),
+    ("trunc_flac", FIXTURE_FLAC, "flac"),
+    ("trunc_ogg", FIXTURE_OGG_VORBIS, "ogg"),
+  ] {
+    let path = temp_path(name, ext);
+    let cut = (bytes.len() * 2) / 5; // ~40%
+    write_fixture(&path, &bytes[..cut]);
+    match load_audio(&path) {
+      Err(mlxrs::Error::Backend { .. }) => { /* recoverable error: ok */ }
+      Ok((samples, _)) => {
+        assert!(
+          samples.len() <= mlxrs::audio::io::MAX_DECODED_SAMPLES,
+          "{ext}: truncated decode returned {} samples (> cap)",
+          samples.len()
+        );
+        assert!(
+          samples.iter().all(|s| s.is_finite()),
+          "{ext}: truncated decode returned a non-finite sample"
+        );
+      }
+      Err(other) => panic!("{ext}: unexpected error variant: {other:?}"),
+    }
+    let _ = fs::remove_file(&path);
+  }
 }
