@@ -217,6 +217,24 @@ impl VisionFeatureCache {
   /// Build a cache holding at most `max_size` entries — matches
   /// `VisionFeatureCache(max_size=...)` (`vision_cache.py:31`).
   ///
+  /// # Capacity grows lazily
+  ///
+  /// The backing containers are created **empty** — `max_size` is stored
+  /// purely as the LRU eviction bound, never pre-reserved. They grow
+  /// naturally as entries are inserted and the existing LRU eviction
+  /// (see [`put`](Self::put)) caps live entries at `max_size`, so the map
+  /// never exceeds `max_size` entries regardless of upfront reservation.
+  ///
+  /// This is deliberate: pre-reserving the raw `max_size` would allocate
+  /// memory proportional to a caller-, config-, or request-derived size
+  /// *before any entry exists*, so a large-but-allocatable `max_size`
+  /// (e.g. a hostile config value) could exhaust memory on an otherwise
+  /// successful construction — a DoS class. Empty-init removes that
+  /// entirely; the cost is a few reallocations as the cache fills to its
+  /// actual working set (which is `<= max_size`, and usually far smaller).
+  /// Incremental growth is itself fallible — see [`put`](Self::put)'s
+  /// `try_reserve(1)`, so even map growth cannot abort the process.
+  ///
   /// # Errors
   ///
   /// - [`Error::ShapeMismatch`] if `max_size == 0`. The reference does not
@@ -224,15 +242,6 @@ impl VisionFeatureCache {
   ///   every [`put`](Self::put) would store then immediately self-evict its
   ///   own entry, so [`get`](Self::get) could never hit. mlxrs surfaces the
   ///   misuse instead of silently building a cache that can hold nothing.
-  /// - [`Error::OutOfMemory`] if pre-reserving `max_size` slots fails. The
-  ///   pre-reserve is via the fallible [`try_reserve`](HashMap::try_reserve)
-  ///   (not the infallible `with_capacity`) precisely so a caller-,
-  ///   config-, or request-derived `max_size` cannot abort the process on a
-  ///   capacity-overflow or allocator failure: an oversized cap fails
-  ///   recoverably here rather than panicking before this constructor can
-  ///   return. (Capacity is only an optimization — the cache is correct at
-  ///   any reservation — but the *infallible* reserve is the abort path the
-  ///   `Result` API would otherwise leak around.)
   pub fn with_max_size(max_size: usize) -> Result<Self> {
     if max_size == 0 {
       return Err(Error::ShapeMismatch {
@@ -241,25 +250,21 @@ impl VisionFeatureCache {
           .into(),
       });
     }
-    // Reserve the final size up front (the cache never grows past
-    // `max_size`, so this avoids rehash / reallocation churn) but via the
-    // FALLIBLE `try_reserve`: an oversized `max_size` (huge config value,
-    // hostile request) would make the infallible `with_capacity` panic on
-    // capacity overflow or abort on allocator failure BEFORE this fn could
-    // return `Err`, turning any size knob into a process-DoS. `try_reserve`
-    // maps that to a recoverable [`Error::OutOfMemory`] instead.
-    let mut entries = HashMap::new();
-    entries
-      .try_reserve(max_size)
-      .map_err(|_| Error::OutOfMemory)?;
-    let mut recency = VecDeque::new();
-    recency
-      .try_reserve(max_size)
-      .map_err(|_| Error::OutOfMemory)?;
+    // Create the containers EMPTY — do NOT pre-reserve the raw `max_size`.
+    // `max_size` is caller-/config-/request-derived; reserving it up front
+    // would consume memory proportional to an untrusted size before a
+    // single entry exists, so a large-but-allocatable cap would exhaust
+    // memory on an otherwise-successful `Ok` (a DoS converted from abort to
+    // memory-exhaustion-on-success). The LRU already self-bounds live
+    // entries to `max_size` via eviction in `put`, so the map never exceeds
+    // `max_size` entries — the upfront reserve was only an optimization.
+    // The containers grow lazily as entries are inserted (each growth made
+    // fallible by `put`'s `try_reserve(1)`), bounded to the actual working
+    // set (<= max_size, usually much smaller).
     Ok(Self {
       max_size,
-      entries,
-      recency,
+      entries: HashMap::new(),
+      recency: VecDeque::new(),
     })
   }
 
@@ -331,28 +336,56 @@ impl VisionFeatureCache {
   ///
   /// # Errors
   ///
-  /// [`Error::OutOfMemory`] (or another backend error) if the
-  /// [`Array::try_clone`] of `features` fails. On error the cache is
-  /// **unchanged** — the clone happens before any map mutation, so a
-  /// failed `put` neither inserts, overwrites, nor evicts.
+  /// - [`Error::OutOfMemory`] (or another backend error) if the
+  ///   [`Array::try_clone`] of `features` fails.
+  /// - [`Error::OutOfMemory`] if growing a backing container to admit a
+  ///   **new** key fails. Capacity grows lazily (the constructor pre-reserves
+  ///   nothing — see [`with_max_size`](Self::with_max_size)), so a new
+  ///   insertion may need one growth step; that step is the fallible
+  ///   [`try_reserve(1)`](HashMap::try_reserve), so it cannot abort the
+  ///   process on an allocator failure. The overwrite path reuses an existing
+  ///   slot and never grows, so it never hits this.
+  ///
+  /// On any error the cache is **unchanged** — the clone and the
+  /// reservation both happen before any structural mutation, so a failed
+  /// `put` neither inserts, overwrites, nor evicts.
   pub fn put(&mut self, key: Key, features: &Array) -> Result<()> {
     // Clone FIRST — before any mutation — so a clone failure leaves the
     // cache (entries + recency + the would-be-evicted victim) untouched.
     let stored = features.try_clone()?;
 
     if self.entries.contains_key(&key) {
-      // Overwrite path: replace the value, refresh recency. Count is
-      // unchanged so this never evicts (mirrors the reference's
-      // `move_to_end` then `self._cache[key] = features`).
+      // Overwrite path: replace the value, refresh recency. The key already
+      // exists so `insert` reuses its slot — no growth, no eviction (mirrors
+      // the reference's `move_to_end` then `self._cache[key] = features`).
       self.entries.insert(key.clone(), stored);
       self.touch(&key);
       return Ok(());
     }
 
-    // New key: evict the LRU entry first if at capacity. `>=` (not `==`)
-    // matches the reference's `len(self._cache) >= self.max_size`; with
-    // the invariant `len <= max_size` always holding, this evicts exactly
-    // one entry, and only when full.
+    // New key. Containers were constructed empty (no upfront reserve), so
+    // admitting a new key may grow them by one. Reserve that one slot
+    // FALLIBLY, BEFORE any structural mutation (and before the eviction
+    // below) — so a reservation failure leaves the cache *exactly* as it
+    // was: no insert, no overwrite, and crucially no premature eviction.
+    // Incremental growth thus stays recoverable (`Error::OutOfMemory`) and
+    // can never abort the process the way an infallible `insert`-triggered
+    // realloc could. Reserving one slot of headroom on the current length is
+    // always enough: the optional eviction below only ever *shrinks* the
+    // containers before the single push/insert.
+    self
+      .recency
+      .try_reserve(1)
+      .map_err(|_| Error::OutOfMemory)?;
+    self
+      .entries
+      .try_reserve(1)
+      .map_err(|_| Error::OutOfMemory)?;
+
+    // At capacity: evict the LRU entry first. `>=` (not `==`) matches the
+    // reference's `len(self._cache) >= self.max_size`; with the invariant
+    // `len <= max_size` always holding, this evicts exactly one entry, and
+    // only when full.
     if self.entries.len() >= self.max_size
       && let Some(lru_key) = self.recency.pop_front()
     {

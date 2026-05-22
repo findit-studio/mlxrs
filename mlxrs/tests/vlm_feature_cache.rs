@@ -367,20 +367,54 @@ fn zero_max_size_is_rejected() {
   );
 }
 
-/// A pathological `max_size` (here `usize::MAX`) must fail RECOVERABLY with
-/// [`Error::OutOfMemory`], never panic on capacity overflow or abort on
-/// allocator failure. `with_max_size` pre-reserves `max_size` slots via the
-/// fallible `try_reserve`; reserving `usize::MAX` slots overflows the
-/// capacity * size_of computation, which `try_reserve` reports as an `Err`
-/// instead of the process-killing infallible `with_capacity` path. (The
-/// zero-capacity `ShapeMismatch` guard runs first, so a non-zero
-/// pathological value reaches — and is caught by — the reserve.)
+/// A pathological `max_size` (here `usize::MAX`) must construct cheaply.
+///
+/// CHANGED (Codex review): the constructor no longer pre-reserves the raw
+/// `max_size`, so it allocates nothing proportional to it — the LRU eviction
+/// self-bounds live entries to `max_size`, making the upfront reserve
+/// unnecessary. Before this change the constructor `try_reserve`d `max_size`
+/// slots, so `usize::MAX` overflowed the `capacity * size_of` computation and
+/// returned `Err(OutOfMemory)`. With empty-init nothing is reserved, so
+/// `usize::MAX` is just a (huge) eviction bound and construction succeeds
+/// *without* allocating — the abort/DoS class is gone because nothing is
+/// pre-allocated. (The zero-capacity `ShapeMismatch` guard still runs first;
+/// `usize::MAX` is non-zero, so it passes the guard and constructs `Ok`.)
 #[test]
-fn with_max_size_pathological_capacity_returns_err_not_abort() {
-  let err = VisionFeatureCache::with_max_size(usize::MAX).unwrap_err();
-  assert!(
-    matches!(err, Error::OutOfMemory),
-    "an oversized max_size must return OutOfMemory, not abort, got {err:?}"
+fn with_max_size_pathological_capacity_is_cheap_not_abort() {
+  let cache = VisionFeatureCache::with_max_size(usize::MAX)
+    .expect("usize::MAX max_size must construct (empty-init reserves nothing)");
+  // Nothing was allocated for the bound: the cache is empty and the huge
+  // value is retained verbatim as the eviction bound.
+  assert_eq!(cache.len(), 0, "no entries are pre-allocated");
+  assert_eq!(
+    cache.max_size(),
+    usize::MAX,
+    "the requested (pathological) max_size is kept as the eviction bound"
+  );
+}
+
+/// A large-but-allocatable `max_size` must NOT eagerly allocate memory
+/// proportional to it (Codex review — DoS-on-success guard).
+///
+/// `1 << 40` (~1 trillion) is allocatable as a *number* but reserving that
+/// many HashMap/VecDeque slots would consume terabytes — the exact
+/// "converted from abort to memory-exhaustion-on-success" hazard the
+/// empty-init fix removes. With empty-init the constructor reserves nothing,
+/// so this returns `Ok` immediately and cheaply: an empty cache whose
+/// `max_size` is the requested value, ready to grow lazily (bounded by LRU
+/// eviction) only as real entries arrive. Pre-fix this line would either
+/// OOM-abort or consume gigabytes before returning.
+#[test]
+fn with_max_size_large_value_does_not_eagerly_allocate() {
+  let big = 1usize << 40;
+  let cache = VisionFeatureCache::with_max_size(big)
+    .expect("a large max_size must construct cheaply with no upfront reserve");
+  assert_eq!(cache.len(), 0, "empty-init: no entries pre-allocated");
+  assert!(cache.is_empty());
+  assert_eq!(
+    cache.max_size(),
+    big,
+    "the requested max_size is the (lazily applied) eviction bound"
   );
 }
 
