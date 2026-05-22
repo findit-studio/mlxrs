@@ -1,37 +1,57 @@
-//! Mixture-of-Experts (MoE) **Switch** primitives: [`SwitchLinear`] and
-//! [`QuantizedSwitchLinear`].
+//! Mixture-of-Experts (MoE) **Switch** layers: the per-expert routed linear
+//! primitives [`SwitchLinear`] / [`QuantizedSwitchLinear`], and the
+//! gate-up-down MoE blocks [`SwitchGLU`] / [`SwitchMLP`] composed on top of
+//! them.
 //!
-//! A 1:1 port of mlx-lm's `SwitchLinear` / `QuantizedSwitchLinear`
-//! (`mlx-lm/mlx_lm/models/switch_layers.py:93` and `:27`). Each holds a
-//! per-expert weight stack of shape `[num_experts, output_dims, input_dims]`
-//! plus an optional per-expert bias of shape `[num_experts, output_dims]`, and
-//! routes each input token through one (or `k`) experts indexed by a
-//! caller-supplied `indices` array. The forward pass collapses to a single
-//! fused mlx-c kernel — [`ops::linalg_basic::gather_mm`](crate::ops::linalg_basic::gather_mm)
-//! for the dense layer, [`ops::quantized::gather_qmm`](crate::ops::quantized::gather_qmm)
-//! for the quantized one — instead of `take`+`matmul`.
+//! A 1:1 port of mlx-lm's `switch_layers.py` (and mlx-swift's
+//! `MLXLMCommon/SwitchLayers.swift`):
+//!
+//! - [`SwitchLinear`] / [`QuantizedSwitchLinear`] (`switch_layers.py:93` /
+//!   `:27`) — each holds a per-expert weight stack of shape `[num_experts,
+//!   output_dims, input_dims]` plus an optional per-expert bias of shape
+//!   `[num_experts, output_dims]`, and routes each input token through one
+//!   (or `k`) experts indexed by a caller-supplied `indices` array. The
+//!   forward pass collapses to a single fused mlx-c kernel —
+//!   [`ops::linalg_basic::gather_mm`](crate::ops::linalg_basic::gather_mm)
+//!   for the dense layer,
+//!   [`ops::quantized::gather_qmm`](crate::ops::quantized::gather_qmm) for the
+//!   quantized one — instead of `take`+`matmul`.
+//! - [`SwitchGLU`] / [`SwitchMLP`] (`switch_layers.py:160` / `:202`) — the
+//!   MoE expert blocks. [`SwitchGLU`] is the gated `down(activation(gate(x))
+//!   · up(x))` structure (three [`SwitchLinear`]s — `gate_proj` / `up_proj` /
+//!   `down_proj`); [`SwitchMLP`] is the plain `fc2(activation(fc1(x)))` two-
+//!   projection block. Both `expand_dims` the input to add the `(top-k, M=1)`
+//!   matmul axes, and — when routing ≥ 64 index slots — sort tokens by expert
+//!   id (`_gather_sort`) so each expert's rows are contiguous for the fused
+//!   kernel, then unsort the result (`_scatter_unsort`). Their activations
+//!   come from [`crate::lm::nn::activations`].
+//!
+//! Each block is a struct that holds its sub-layers (and a boxed activation
+//! closure) with a `forward(&self, x, indices)` that returns a new lazy
+//! [`Array`] — the same config-struct pattern as [`crate::lm::nn::rope::Rope`]
+//! / [`crate::lm::nn::norm::RMSNorm`]; eval stays an explicit `&mut` step.
 //!
 //! # Scope
 //!
-//! Only the two `SwitchLinear` shapes are ported here. The higher-level
-//! `SwitchMLP` / `SwitchGLU` MoE blocks (same file, `:202` / `:160`) compose
-//! `SwitchLinear` with an activation (`gelu` / `swiglu`) and the
-//! `_gather_sort` / `_scatter_unsort` rebatching helpers. Porting them
-//! requires the activation surface (`gelu` / `silu` / `swiglu`) under
-//! [`crate::lm::nn`], which doesn't exist yet — they are deliberate
-//! follow-ups, not in this PR's scope (mirrors the rope-only scope of #N1).
+//! mlx-swift's `FusedGateUpSwitchGLU` (a `SwitchGLU` variant for models
+//! shipping a single fused `gate_up_proj` weight — `SwitchLayers.swift`,
+//! noted there as "Used by Gemma 4 26B MoE") is a per-model construct with no
+//! python-reference analogue, so it is deliberately out of scope here; it
+//! belongs with the per-model architecture code that consumes it.
 //!
-//! mlx-swift does not expose a `SwitchLinear` layer at all (the `MLXNN`
-//! surface has no MoE module — only the underlying `gatherMM` /
-//! `gatherQuantizedMM` ops in `Source/MLX/Ops.swift`). This port follows the
-//! python reference, which is the canonical home of the layer.
+//! mlx-swift does not expose `QuantizedSwitchLinear` construction the same way
+//! python does (it derives it from a dense `SwitchLinear` via `toQuantized`);
+//! the [`QuantizedSwitchLinear`] port follows the python reference, which is
+//! the canonical home of the from-quantized-arrays constructor.
 
 use crate::{
   array::Array,
   dtype::Dtype,
   error::Result,
-  ops::{indexing, linalg_basic, quantized, shape},
+  ops::{arithmetic, indexing, linalg_basic, misc, quantized, shape},
 };
+
+use super::activations::silu;
 
 /// Per-expert linear layer: holds `num_experts` independent `(output_dims,
 /// input_dims)` weight matrices stacked into a single tensor `[E, O, I]`, plus
@@ -585,6 +605,499 @@ impl QuantizedSwitchLinear {
       out = out.add(&broadcastable)?;
     }
     Ok(out)
+  }
+}
+
+// ───────── MoE block rebatching helpers ─────────
+
+/// Type of the per-block activation closure: a pure `&Array -> Result<Array>`
+/// element-wise function (e.g. [`activations::silu`](super::activations::silu)
+/// / [`activations::gelu_approx`](super::activations::gelu_approx)).
+///
+/// Mirrors mlx-swift's `activation: (MLXArray) -> MLXArray` `SwitchGLU` /
+/// `SwitchMLP` field — a single-argument squashing function the block applies
+/// to the gate (`SwitchGLU`) or to the `fc1` output (`SwitchMLP`). The python
+/// reference instead passes a `SwiGLU` *module* whose `__call__(x, gate)` is
+/// two-argument; the math is identical (`SwiGLU(x, gate) == silu(gate) * x`),
+/// and the one-argument closure is the more Rust-natural shape — `SwitchGLU`
+/// recovers the python form by multiplying `activation(gate)` by `up`.
+///
+/// Boxed (rather than a generic `F: Fn(..)` type parameter) so the block
+/// structs stay non-generic — matching how [`crate::lm::generate`] boxes its
+/// `Sampler` / `LogitsProcessor` runtime-configurable callables.
+pub type Activation = Box<dyn Fn(&Array) -> Result<Array>>;
+
+/// Sort the routed tokens by expert id so each expert's rows are contiguous,
+/// enabling [`SwitchLinear`]'s faster `sorted_indices` `gather_mm` path.
+///
+/// 1:1 port of mlx-lm's `_gather_sort` (`switch_layers.py:12`) and mlx-swift's
+/// `gatherSort` (`SwitchLayers.swift`):
+///
+/// ```text
+/// M = indices.shape[-1]                  # top-k count
+/// indices = indices.flatten()            # → 1-D, length B*M
+/// order = argsort(indices)               # permutation sorting by expert id
+/// inv_order = argsort(order)             # its inverse (undoes the sort)
+/// return x.flatten(0, -3)[order // M], indices[order], inv_order
+/// ```
+///
+/// `x` is the post-`expand_dims(x, (-2, -3))` input — rank ≥ 3, trailing dims
+/// `(1, 1, D)`. `flatten(0, -3)` collapses every leading axis up to and
+/// including `-3` into one, yielding `[B', 1, D]`; gathering that along axis 0
+/// with `order // M` (integer-divide each sorted `(token, k)` slot back to its
+/// token row) replicates each token's row once per top-k slot, in expert
+/// order. Returns `(x_sorted, indices_sorted, inv_order)`; the caller threads
+/// `inv_order` into [`scatter_unsort`] to restore the original order.
+fn gather_sort(x: &Array, indices: &Array) -> Result<(Array, Array, Array)> {
+  // `M = indices.shape[-1]` — the top-k count. `gather_sort` is only ever
+  // reached for a non-empty `indices` (the `do_sort` gate requires
+  // `size >= 64`), so the shape is non-empty.
+  let m = *indices
+    .shape()
+    .last()
+    .expect("gather_sort: indices must have at least one axis");
+  // `indices.flatten()` — collapse to 1-D. `flatten(_, 0, -1)` over every
+  // axis is mlx's argument-less `.flatten()`.
+  let indices_flat = shape::flatten(indices, 0, -1)?;
+  // `order = argsort(indices)` — the permutation that sorts the flattened
+  // expert ids; `inv_order = argsort(order)` is its inverse (the permutation
+  // that undoes the sort), exactly as the reference computes it.
+  let order = misc::argsort(&indices_flat)?;
+  let inv_order = misc::argsort(&order)?;
+  // `x.flatten(0, -3)` — collapse all leading axes up to `-3` into one,
+  // leaving `[B', 1, D]` (the trailing `(1, D)` are the matmul `(M=1, K=D)`
+  // pair `expand_dims` added).
+  let x_flat = shape::flatten(x, 0, -3)?;
+  // `order // M` maps each sorted `(token, top-k-slot)` slot back to its
+  // token row index; `m_arr` is the shape-`[1]` broadcast divisor.
+  let m_u32 = u32::try_from(m).map_err(|_| crate::Error::ShapeMismatch {
+    message: format!("gather_sort: top-k count {m} exceeds u32::MAX"),
+  })?;
+  let m_arr = Array::from_slice::<u32>(&[m_u32], &(1usize,))?;
+  let token_rows = arithmetic::floor_divide(&order, &m_arr)?;
+  // `x.flatten(0, -3)[order // M]` — fancy-index along axis 0: each sorted
+  // slot pulls its token's row. `indices[order]` reorders the expert ids the
+  // same way so they line up with `x_sorted` row-for-row.
+  let x_sorted = indexing::take_axis(&x_flat, &token_rows, 0)?;
+  let indices_sorted = indexing::take_axis(&indices_flat, &order, 0)?;
+  Ok((x_sorted, indices_sorted, inv_order))
+}
+
+/// Undo [`gather_sort`]: restore the original token order and (optionally)
+/// reshape axis 0 back to the routing `indices` shape.
+///
+/// 1:1 port of mlx-lm's `_scatter_unsort` (`switch_layers.py:20`) and
+/// mlx-swift's `scatterUnsort` (`SwitchLayers.swift`):
+///
+/// ```text
+/// x = x[inv_order]                       # undo the expert-order sort
+/// if shape is not None:
+///     x = unflatten(x, 0, shape)         # axis-0 → the routing shape
+/// ```
+///
+/// `x[inv_order]` is a fancy-index along axis 0 by the inverse permutation.
+/// `unflatten(x, 0, shape)` reshapes the single leading axis (of size
+/// `prod(shape)`) into `shape`, keeping the trailing dims — `mlx.unflatten`
+/// of one axis into many is exactly a [`reshape`](crate::ops::shape::reshape)
+/// of axis 0, so the port uses `reshape` rather than introducing a new op
+/// wrapper.
+fn scatter_unsort(x: &Array, inv_order: &Array, shape: &[usize]) -> Result<Array> {
+  // `x[inv_order]` — fancy-index along axis 0 by the inverse permutation,
+  // putting each row back at its pre-sort position.
+  let unsorted = indexing::take_axis(x, inv_order, 0)?;
+  // `unflatten(x, 0, shape)` — expand the leading axis (size `prod(shape)`)
+  // into `shape`, retaining the trailing dims. mlx's `unflatten` of one axis
+  // into several == `reshape` with `shape ++ trailing_dims`.
+  let trailing = &unsorted.shape()[1..];
+  let mut target: Vec<usize> = Vec::with_capacity(shape.len() + trailing.len());
+  target.extend_from_slice(shape);
+  target.extend_from_slice(trailing);
+  shape::reshape(&unsorted, &target.as_slice())
+}
+
+// ───────── SwitchGLU ─────────
+
+/// Gated MoE expert block: `down_proj(activation(gate_proj(x)) · up_proj(x))`,
+/// routed per-token through `num_experts` experts.
+///
+/// 1:1 port of mlx-lm's `SwitchGLU` (`switch_layers.py:160`) and mlx-swift's
+/// `SwitchGLU` (`MLXLMCommon/SwitchLayers.swift`). Three [`SwitchLinear`]
+/// sub-layers — `gate_proj` / `up_proj` (`input_dims → hidden_dims`) and
+/// `down_proj` (`hidden_dims → input_dims`) — plus an [`Activation`] applied
+/// to the gate branch.
+///
+/// The python reference's default activation is the two-argument `SwiGLU`
+/// module (`silu(gate) * x`); mlx-swift's is the one-argument `silu`. This
+/// port follows the swift shape — a one-argument [`Activation`] closure — and
+/// [`SwitchGLU::default_activation`] supplies [`silu`]
+/// as the default. The forward pass multiplies `activation(x_gate)` by
+/// `x_up`, which for `activation == silu` is exactly `swiglu(x_gate, x_up)`,
+/// matching the python `SwiGLU` math.
+///
+/// # Shape contract
+///
+/// `forward(x, indices)` takes `x` of shape `[..batch.., input_dims]` and
+/// `indices` of shape `[..batch.., k]` (the per-token top-`k` expert ids).
+/// Internally the input is `expand_dims`'d to `[..batch.., 1, 1, input_dims]`
+/// so the trailing dims are the matmul `(M=1, K=input_dims)` pair and the
+/// `k` axis materializes by broadcasting against `indices`. The result is
+/// `[..batch.., k, input_dims]`.
+pub struct SwitchGLU {
+  /// `input_dims → hidden_dims` gate projection (`SwitchLinear`). Its output
+  /// is squashed by [`Self::activation`] before the elementwise gate.
+  gate_proj: SwitchLinear,
+  /// `input_dims → hidden_dims` up projection (`SwitchLinear`). Multiplied
+  /// (un-activated) by `activation(gate_proj(x))`.
+  up_proj: SwitchLinear,
+  /// `hidden_dims → input_dims` down projection (`SwitchLinear`), applied to
+  /// the gated hidden state.
+  down_proj: SwitchLinear,
+  /// Element-wise activation applied to the gate branch. Defaults to
+  /// [`silu`] (see [`Self::default_activation`]),
+  /// matching mlx-swift's `SwitchGLU` default and — composed with the `· up`
+  /// multiply — the python `SwiGLU` default.
+  activation: Activation,
+}
+
+impl SwitchGLU {
+  /// The default [`SwitchGLU`] activation: [`silu`].
+  ///
+  /// Matches mlx-swift's `activation: @escaping (MLXArray) -> MLXArray =
+  /// MLXNN.silu` default; composed with the block's `· up_proj(x)` multiply
+  /// it reproduces the python reference's `SwiGLU` (`silu(gate) * x`) default.
+  /// Exposed so callers can pass it explicitly, or wrap it.
+  pub fn default_activation() -> Activation {
+    Box::new(silu)
+  }
+
+  /// Construct a [`SwitchGLU`] from its three already-built [`SwitchLinear`]
+  /// projections and an [`Activation`].
+  ///
+  /// The python / swift constructors allocate the three `SwitchLinear`s
+  /// internally from `(input_dims, hidden_dims, num_experts, bias)`; here the
+  /// caller supplies them directly so a loaded checkpoint's weights flow in
+  /// without an intermediate random-init + assignment. Pass
+  /// [`Self::default_activation`] for the reference default.
+  ///
+  /// Verifies the inter-projection shape contract: `gate_proj` and `up_proj`
+  /// must share `[input_dims, hidden_dims]`, and `down_proj` must be the
+  /// `[hidden_dims, input_dims]` inverse — a mismatch (e.g. a `down_proj`
+  /// whose `input_dims` is not the shared `hidden_dims`) surfaces as a
+  /// recoverable [`Error::ShapeMismatch`](crate::Error::ShapeMismatch) rather
+  /// than failing deep inside the FFI on the first `forward`.
+  pub fn new(
+    gate_proj: SwitchLinear,
+    up_proj: SwitchLinear,
+    down_proj: SwitchLinear,
+    activation: Activation,
+  ) -> Result<Self> {
+    check_glu_shapes(&gate_proj, &up_proj, &down_proj)?;
+    Ok(Self {
+      gate_proj,
+      up_proj,
+      down_proj,
+      activation,
+    })
+  }
+
+  /// Read-only accessor for the gate projection.
+  pub fn gate_proj(&self) -> &SwitchLinear {
+    &self.gate_proj
+  }
+
+  /// Read-only accessor for the up projection.
+  pub fn up_proj(&self) -> &SwitchLinear {
+    &self.up_proj
+  }
+
+  /// Read-only accessor for the down projection.
+  pub fn down_proj(&self) -> &SwitchLinear {
+    &self.down_proj
+  }
+
+  /// Forward pass — port of python `SwitchGLU.__call__` (`switch_layers.py:176`)
+  /// and swift `SwitchGLU.callAsFunction`.
+  ///
+  /// `x`: `[..batch.., input_dims]`. `indices`: `[..batch.., k]` integer
+  /// expert ids. Returns `[..batch.., k, input_dims]`.
+  ///
+  /// Steps (verbatim from the reference):
+  /// 1. `x = expand_dims(x, (-2, -3))` — add the `(top-k, M=1)` axes.
+  /// 2. `do_sort = indices.size >= 64` — for many routed slots, sort tokens by
+  ///    expert id (`gather_sort`) so each expert's rows are contiguous.
+  /// 3. `x_up = up_proj(x)`, `x_gate = gate_proj(x)`, then
+  ///    `x = down_proj(activation(x_gate) · x_up)` — all three `SwitchLinear`s
+  ///    run with `sorted_indices = do_sort`.
+  /// 4. If sorted, `scatter_unsort` restores the original token order.
+  /// 5. `x.squeeze(-2)` drops the `M=1` axis.
+  ///
+  /// The python reference additionally `stop_gradient`s the indices when
+  /// `self.training`; `mlxrs` is an inference port with no training mode (and
+  /// integer routing indices carry no gradient), so that branch has no
+  /// analogue. Returns a new lazy [`Array`] (no implicit eval).
+  pub fn forward(&self, x: &Array, indices: &Array) -> Result<Array> {
+    // `x = mx.expand_dims(x, (-2, -3))` — insert the top-k and `M=1` axes,
+    // taking `[..batch.., D]` to `[..batch.., 1, 1, D]`.
+    let mut x = shape::expand_dims_axes(x, &[-2, -3])?;
+
+    // `do_sort = indices.size >= 64`: with many routed slots, sorting tokens
+    // by expert id makes each expert's rows contiguous for the fused kernel.
+    let do_sort = indices.size() >= 64;
+    // `idx` is the (possibly sorted) expert-id array fed to the projections;
+    // `inv_order` is `Some` only on the sorted path, to undo the reorder.
+    let mut idx = indices.try_clone()?;
+    let mut inv_order: Option<Array> = None;
+    if do_sort {
+      let (x_sorted, idx_sorted, inv) = gather_sort(&x, indices)?;
+      x = x_sorted;
+      idx = idx_sorted;
+      inv_order = Some(inv);
+    }
+
+    // `x_up = self.up_proj(x, idx)`, `x_gate = self.gate_proj(x, idx)` — the
+    // two `input_dims → hidden_dims` projections of the routed input.
+    let x_up = self.up_proj.apply(&x, &idx, do_sort)?;
+    let x_gate = self.gate_proj.apply(&x, &idx, do_sort)?;
+    // `self.down_proj(self.activation(x_up, x_gate), idx)`: the python
+    // `SwiGLU` activation is `silu(gate) * x`; with the one-argument closure
+    // that is `activation(x_gate) · x_up` — applied, then projected back down.
+    let gated = (self.activation)(&x_gate)?.multiply(&x_up)?;
+    x = self.down_proj.apply(&gated, &idx, do_sort)?;
+
+    // `if do_sort: x = _scatter_unsort(x, inv_order, indices.shape)` — undo
+    // the expert-order sort and restore the routing-`indices` leading shape.
+    if let Some(inv) = &inv_order {
+      x = scatter_unsort(&x, inv, &indices.shape())?;
+    }
+
+    // `return x.squeeze(-2)` — drop the `M=1` matmul axis.
+    shape::squeeze_axes(&x, &[-2])
+  }
+}
+
+impl std::fmt::Debug for SwitchGLU {
+  /// Hand-written (the boxed [`Activation`] closure is not [`Debug`]); reports
+  /// the three projections and elides the activation as `<fn>`.
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("SwitchGLU")
+      .field("gate_proj", &self.gate_proj)
+      .field("up_proj", &self.up_proj)
+      .field("down_proj", &self.down_proj)
+      .field("activation", &"<fn>")
+      .finish()
+  }
+}
+
+/// Validate [`SwitchGLU`]'s inter-projection shape contract: `gate_proj` and
+/// `up_proj` share `[input_dims → hidden_dims]`, and `down_proj` is the
+/// `[hidden_dims → input_dims]` inverse. Surfaces a mismatch as a recoverable
+/// [`Error::ShapeMismatch`](crate::Error::ShapeMismatch).
+fn check_glu_shapes(
+  gate_proj: &SwitchLinear,
+  up_proj: &SwitchLinear,
+  down_proj: &SwitchLinear,
+) -> Result<()> {
+  let (gi, gh, ge) = (
+    gate_proj.input_dims(),
+    gate_proj.output_dims(),
+    gate_proj.num_experts(),
+  );
+  let (ui, uh, ue) = (
+    up_proj.input_dims(),
+    up_proj.output_dims(),
+    up_proj.num_experts(),
+  );
+  let (di, dh, de) = (
+    down_proj.input_dims(),
+    down_proj.output_dims(),
+    down_proj.num_experts(),
+  );
+  // `gate_proj` and `up_proj` are both `input_dims → hidden_dims`.
+  if gi != ui || gh != uh {
+    return Err(crate::Error::ShapeMismatch {
+      message: format!(
+        "SwitchGLU: gate_proj [{gi}→{gh}] and up_proj [{ui}→{uh}] must share \
+         [input_dims→hidden_dims]"
+      ),
+    });
+  }
+  // `down_proj` is `hidden_dims → input_dims` — the inverse of the shared
+  // gate/up projection shape.
+  if di != gh || dh != gi {
+    return Err(crate::Error::ShapeMismatch {
+      message: format!(
+        "SwitchGLU: down_proj [{di}→{dh}] must be the [hidden_dims={gh}→input_dims={gi}] \
+         inverse of gate_proj/up_proj [{gi}→{gh}]"
+      ),
+    });
+  }
+  // Every projection routes the same expert population.
+  if ge != ue || ge != de {
+    return Err(crate::Error::ShapeMismatch {
+      message: format!(
+        "SwitchGLU: all projections must have the same num_experts \
+         (gate_proj={ge}, up_proj={ue}, down_proj={de})"
+      ),
+    });
+  }
+  Ok(())
+}
+
+// ───────── SwitchMLP ─────────
+
+/// Plain (un-gated) MoE expert block: `fc2(activation(fc1(x)))`, routed
+/// per-token through `num_experts` experts.
+///
+/// 1:1 port of mlx-lm's `SwitchMLP` (`switch_layers.py:202`) and mlx-swift's
+/// `SwitchMLP`. Two [`SwitchLinear`] sub-layers — `fc1` (`input_dims →
+/// hidden_dims`) and `fc2` (`hidden_dims → input_dims`) — with an
+/// [`Activation`] between them. Unlike [`SwitchGLU`] there is no gate branch:
+/// the activation is applied to `fc1(x)` directly.
+///
+/// The python reference's default activation is `nn.GELU(approx="precise")` —
+/// the `tanh` approximation, i.e.
+/// [`gelu_approx`](super::activations::gelu_approx);
+/// [`SwitchMLP::default_activation`] supplies exactly that.
+///
+/// # Shape contract
+///
+/// Same as [`SwitchGLU`]: `forward(x, indices)` takes `x` of shape
+/// `[..batch.., input_dims]` and `indices` of `[..batch.., k]`, and returns
+/// `[..batch.., k, input_dims]`.
+pub struct SwitchMLP {
+  /// `input_dims → hidden_dims` first projection (`SwitchLinear`); its output
+  /// is squashed by [`Self::activation`].
+  fc1: SwitchLinear,
+  /// `hidden_dims → input_dims` second projection (`SwitchLinear`), applied
+  /// to the activated hidden state.
+  fc2: SwitchLinear,
+  /// Element-wise activation applied between `fc1` and `fc2`. Defaults to
+  /// [`gelu_approx`](super::activations::gelu_approx) (see
+  /// [`Self::default_activation`]), matching the python reference's
+  /// `nn.GELU(approx="precise")`.
+  activation: Activation,
+}
+
+impl SwitchMLP {
+  /// The default [`SwitchMLP`] activation:
+  /// [`gelu_approx`](super::activations::gelu_approx).
+  ///
+  /// Matches the python reference's `activation=nn.GELU(approx="precise")` —
+  /// `approx="precise"` selects the `tanh` GELU approximation, which is
+  /// `gelu_approx`. Exposed so callers can pass it explicitly, or wrap it.
+  pub fn default_activation() -> Activation {
+    Box::new(super::activations::gelu_approx)
+  }
+
+  /// Construct a [`SwitchMLP`] from its two already-built [`SwitchLinear`]
+  /// projections and an [`Activation`].
+  ///
+  /// The python / swift constructors allocate the two `SwitchLinear`s
+  /// internally; here the caller supplies them directly so a loaded
+  /// checkpoint's weights flow in without a random-init + assignment. Pass
+  /// [`Self::default_activation`] for the reference default.
+  ///
+  /// Verifies the inter-projection shape contract: `fc2` must be the
+  /// `[hidden_dims, input_dims]` inverse of `fc1`'s `[input_dims,
+  /// hidden_dims]`, and both must route the same expert population — a
+  /// mismatch surfaces as a recoverable
+  /// [`Error::ShapeMismatch`](crate::Error::ShapeMismatch).
+  pub fn new(fc1: SwitchLinear, fc2: SwitchLinear, activation: Activation) -> Result<Self> {
+    // `fc2` is `hidden_dims → input_dims` — the inverse of `fc1`'s
+    // `input_dims → hidden_dims`.
+    if fc2.input_dims() != fc1.output_dims() || fc2.output_dims() != fc1.input_dims() {
+      return Err(crate::Error::ShapeMismatch {
+        message: format!(
+          "SwitchMLP: fc2 [{}→{}] must be the [hidden_dims={}→input_dims={}] inverse of \
+           fc1 [{}→{}]",
+          fc2.input_dims(),
+          fc2.output_dims(),
+          fc1.output_dims(),
+          fc1.input_dims(),
+          fc1.input_dims(),
+          fc1.output_dims(),
+        ),
+      });
+    }
+    if fc1.num_experts() != fc2.num_experts() {
+      return Err(crate::Error::ShapeMismatch {
+        message: format!(
+          "SwitchMLP: fc1 and fc2 must have the same num_experts (fc1={}, fc2={})",
+          fc1.num_experts(),
+          fc2.num_experts(),
+        ),
+      });
+    }
+    Ok(Self {
+      fc1,
+      fc2,
+      activation,
+    })
+  }
+
+  /// Read-only accessor for the first projection.
+  pub fn fc1(&self) -> &SwitchLinear {
+    &self.fc1
+  }
+
+  /// Read-only accessor for the second projection.
+  pub fn fc2(&self) -> &SwitchLinear {
+    &self.fc2
+  }
+
+  /// Forward pass — port of python `SwitchMLP.__call__` (`switch_layers.py:217`)
+  /// and swift `SwitchMLP.callAsFunction`.
+  ///
+  /// `x`: `[..batch.., input_dims]`. `indices`: `[..batch.., k]` integer
+  /// expert ids. Returns `[..batch.., k, input_dims]`.
+  ///
+  /// Identical rebatching skeleton to [`SwitchGLU::forward`] — `expand_dims`,
+  /// the `indices.size >= 64` `gather_sort` / `scatter_unsort` pair, the
+  /// trailing `squeeze(-2)` — but the body is the un-gated
+  /// `fc2(activation(fc1(x)))` rather than a gate·up product. The
+  /// training-only `stop_gradient` has no analogue (inference port). Returns
+  /// a new lazy [`Array`] (no implicit eval).
+  pub fn forward(&self, x: &Array, indices: &Array) -> Result<Array> {
+    // `x = mx.expand_dims(x, (-2, -3))` — add the top-k and `M=1` axes.
+    let mut x = shape::expand_dims_axes(x, &[-2, -3])?;
+
+    // `do_sort = indices.size >= 64` — sort tokens by expert id when many
+    // slots are routed (see [`gather_sort`]).
+    let do_sort = indices.size() >= 64;
+    let mut idx = indices.try_clone()?;
+    let mut inv_order: Option<Array> = None;
+    if do_sort {
+      let (x_sorted, idx_sorted, inv) = gather_sort(&x, indices)?;
+      x = x_sorted;
+      idx = idx_sorted;
+      inv_order = Some(inv);
+    }
+
+    // `x = self.fc1(x, idx)`; `x = self.activation(x)`; `x = self.fc2(x, idx)`
+    // — the plain un-gated two-projection body.
+    x = self.fc1.apply(&x, &idx, do_sort)?;
+    x = (self.activation)(&x)?;
+    x = self.fc2.apply(&x, &idx, do_sort)?;
+
+    // `if do_sort: x = _scatter_unsort(x, inv_order, indices.shape)`.
+    if let Some(inv) = &inv_order {
+      x = scatter_unsort(&x, inv, &indices.shape())?;
+    }
+
+    // `return x.squeeze(-2)`.
+    shape::squeeze_axes(&x, &[-2])
+  }
+}
+
+impl std::fmt::Debug for SwitchMLP {
+  /// Hand-written (the boxed [`Activation`] closure is not [`Debug`]); reports
+  /// the two projections and elides the activation as `<fn>`.
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("SwitchMLP")
+      .field("fc1", &self.fc1)
+      .field("fc2", &self.fc2)
+      .field("activation", &"<fn>")
+      .finish()
   }
 }
 
@@ -1173,5 +1686,352 @@ mod tests {
     // here from inside `super::` would compile (same module), so we don't
     // try — the visibility guarantee is what the regression turns on, not
     // a runtime check.
+  }
+
+  // ─── SwitchGLU / SwitchMLP block tests ───
+  //
+  // Hand-traced over a tiny known expert set (E=2, I=H=2). The projections
+  // are built from explicit per-expert weight stacks so the forward math is
+  // exactly reproducible by hand; `silu`/identity activations keep the
+  // reference value closed-form.
+
+  /// Logistic sigmoid — the reference scalar formula.
+  fn sigmoid_ref(v: f32) -> f32 {
+    1.0 / (1.0 + (-v).exp())
+  }
+
+  /// `silu(v) = v · σ(v)` — the reference scalar formula.
+  fn silu_ref(v: f32) -> f32 {
+    v * sigmoid_ref(v)
+  }
+
+  /// Per-element near-equality (f32 op-graph vs f64-ish reference).
+  fn assert_close(got: &[f32], want: &[f32]) {
+    assert_eq!(
+      got.len(),
+      want.len(),
+      "length mismatch: {got:?} vs {want:?}"
+    );
+    for (g, w) in got.iter().zip(want.iter()) {
+      assert!(
+        (g - w).abs() <= 1e-5 + 1e-5 * w.abs(),
+        "block output mismatch: got {g}, want {w} (full got {got:?}, want {want:?})"
+      );
+    }
+  }
+
+  /// A `[E=2, O=2, I=2]` weight stack: expert 0 is the 2×2 identity, expert 1
+  /// is the 2×2 swap `[[0,1],[1,0]]`. Routing token 0 → expert 0 leaves its
+  /// features in place; routing → expert 1 swaps them — so a forward result
+  /// reveals which expert each token was routed through.
+  fn identity_then_swap_weight() -> Array {
+    Array::from_slice::<f32>(
+      &[
+        // expert 0: identity
+        1.0, 0.0, //
+        0.0, 1.0, //
+        // expert 1: swap
+        0.0, 1.0, //
+        1.0, 0.0, //
+      ],
+      &(2, 2, 2),
+    )
+    .unwrap()
+  }
+
+  /// A `[E=2, O=2, I=2]` all-identity weight stack — both experts are the 2×2
+  /// identity, so the projection is a no-op `y = x` regardless of routing.
+  fn all_identity_weight() -> Array {
+    Array::from_slice::<f32>(
+      &[
+        1.0, 0.0, 0.0, 1.0, // expert 0: identity
+        1.0, 0.0, 0.0, 1.0, // expert 1: identity
+      ],
+      &(2, 2, 2),
+    )
+    .unwrap()
+  }
+
+  #[test]
+  fn switch_glu_hand_traced_two_experts() {
+    // gate_proj routes through identity (expert 0) / swap (expert 1);
+    // up_proj and down_proj are pure identity. With the `silu` activation the
+    // block computes `down(silu(gate(x)) · up(x)) = silu(gate_e(x)) · x`.
+    let gate_proj = SwitchLinear::from_parts(identity_then_swap_weight(), None).unwrap();
+    let up_proj = SwitchLinear::from_parts(all_identity_weight(), None).unwrap();
+    let down_proj = SwitchLinear::from_parts(all_identity_weight(), None).unwrap();
+    let glu = SwitchGLU::new(
+      gate_proj,
+      up_proj,
+      down_proj,
+      SwitchGLU::default_activation(), // silu
+    )
+    .unwrap();
+
+    // Two tokens [1, 2] and [3, 4]; token 0 → expert 0, token 1 → expert 1.
+    let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+    let indices = Array::from_slice::<u32>(&[0, 1], &(2, 1)).unwrap();
+    let mut out = glu.forward(&x, &indices).unwrap();
+    // forward(x) returns [N=2, k=1, I=2].
+    assert_eq!(out.shape(), vec![2, 1, 2]);
+    let got = out.to_vec::<f32>().unwrap();
+    // Token 0 via expert 0 (identity gate): silu([1,2]) · [1,2]
+    //   = [silu(1)·1, silu(2)·2].
+    // Token 1 via expert 1 (swap gate): silu(swap([3,4])) · [3,4]
+    //   = silu([4,3]) · [3,4] = [silu(4)·3, silu(3)·4].
+    let want = vec![
+      silu_ref(1.0) * 1.0,
+      silu_ref(2.0) * 2.0,
+      silu_ref(4.0) * 3.0,
+      silu_ref(3.0) * 4.0,
+    ];
+    assert_close(&got, &want);
+  }
+
+  #[test]
+  fn switch_glu_routing_selects_the_indexed_expert() {
+    // Same block, but route BOTH tokens through expert 1 (swap). Every token
+    // must show the swapped-gate math — proving `indices` actually selects
+    // the expert rather than e.g. always using expert 0.
+    let glu = SwitchGLU::new(
+      SwitchLinear::from_parts(identity_then_swap_weight(), None).unwrap(),
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      SwitchGLU::default_activation(),
+    )
+    .unwrap();
+    let x = Array::from_slice::<f32>(&[1.0, 2.0, 5.0, 6.0], &(2, 2)).unwrap();
+    let indices = Array::from_slice::<u32>(&[1, 1], &(2, 1)).unwrap();
+    let mut out = glu.forward(&x, &indices).unwrap();
+    let got = out.to_vec::<f32>().unwrap();
+    // Both via expert 1 (swap gate): silu(swap(x)) · x.
+    //   token 0: silu([2,1]) · [1,2] = [silu(2)·1, silu(1)·2].
+    //   token 1: silu([6,5]) · [5,6] = [silu(6)·5, silu(5)·6].
+    let want = vec![
+      silu_ref(2.0) * 1.0,
+      silu_ref(1.0) * 2.0,
+      silu_ref(6.0) * 5.0,
+      silu_ref(5.0) * 6.0,
+    ];
+    assert_close(&got, &want);
+  }
+
+  #[test]
+  fn switch_glu_sorted_path_matches_hand_trace() {
+    // `do_sort` triggers at `indices.size() >= 64`. Route 64 tokens through
+    // alternating experts (0, 1, 0, 1, …): the block sorts them by expert id
+    // internally and must `scatter_unsort` the result back so each token's
+    // output lands at its original position. A wrong unsort would scramble
+    // the per-token values and fail the assertion below.
+    let glu = SwitchGLU::new(
+      SwitchLinear::from_parts(identity_then_swap_weight(), None).unwrap(),
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      SwitchGLU::default_activation(),
+    )
+    .unwrap();
+    let n = 64usize;
+    // Token t has features [t, t + 1]; expert id alternates 0 / 1.
+    let mut x_data = Vec::with_capacity(n * 2);
+    let mut idx_data = Vec::with_capacity(n);
+    for t in 0..n {
+      x_data.push(t as f32);
+      x_data.push(t as f32 + 1.0);
+      idx_data.push((t % 2) as u32);
+    }
+    let x = Array::from_slice::<f32>(&x_data, &(n, 2usize)).unwrap();
+    let indices = Array::from_slice::<u32>(&idx_data, &(n, 1usize)).unwrap();
+    assert!(indices.size() >= 64, "test must exercise the sorted path");
+    let mut out = glu.forward(&x, &indices).unwrap();
+    assert_eq!(out.shape(), vec![n, 1, 2]);
+    let got = out.to_vec::<f32>().unwrap();
+    // Reference: per token, silu(gate_e(x)) · x — expert 0 keeps features,
+    // expert 1 swaps them.
+    let mut want = Vec::with_capacity(n * 2);
+    for t in 0..n {
+      let (x0, x1) = (t as f32, t as f32 + 1.0);
+      if t % 2 == 0 {
+        // expert 0 (identity gate)
+        want.push(silu_ref(x0) * x0);
+        want.push(silu_ref(x1) * x1);
+      } else {
+        // expert 1 (swap gate): gate sees [x1, x0]
+        want.push(silu_ref(x1) * x0);
+        want.push(silu_ref(x0) * x1);
+      }
+    }
+    assert_close(&got, &want);
+  }
+
+  #[test]
+  fn switch_glu_new_rejects_mismatched_projection_shapes() {
+    // down_proj must be the [hidden→input] inverse of gate/up [input→hidden].
+    // Here gate/up are [2→2] but down is [2→3] (wrong output_dims) — rejected.
+    let bad_down_weight =
+      Array::from_slice::<f32>(&[0.0f32; 2 * 3 * 2], &(2usize, 3usize, 2usize)).unwrap();
+    let err = SwitchGLU::new(
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      SwitchLinear::from_parts(bad_down_weight, None).unwrap(),
+      SwitchGLU::default_activation(),
+    )
+    .unwrap_err();
+    assert!(
+      matches!(err, crate::Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch on mismatched down_proj, got {err:?}"
+    );
+  }
+
+  #[test]
+  fn switch_glu_new_rejects_mismatched_num_experts() {
+    // gate/up have E=2; a down_proj with E=3 is rejected.
+    let down_e3 =
+      Array::from_slice::<f32>(&[1.0f32; 3 * 2 * 2], &(3usize, 2usize, 2usize)).unwrap();
+    let err = SwitchGLU::new(
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      SwitchLinear::from_parts(down_e3, None).unwrap(),
+      SwitchGLU::default_activation(),
+    )
+    .unwrap_err();
+    assert!(
+      matches!(err, crate::Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch on mismatched num_experts, got {err:?}"
+    );
+  }
+
+  #[test]
+  fn switch_mlp_hand_traced_two_experts() {
+    // fc1 routes through identity (expert 0) / swap (expert 1); fc2 is
+    // identity. With a `square` activation the block computes
+    // `fc2(square(fc1(x))) = (fc1_e(x))²`.
+    let fc1 = SwitchLinear::from_parts(identity_then_swap_weight(), None).unwrap();
+    let fc2 = SwitchLinear::from_parts(all_identity_weight(), None).unwrap();
+    // Explicit closed-form activation so the trace is exact integer arithmetic
+    // (the block's wiring is what's under test here; the reference activation
+    // formulas are covered in `activations::tests`).
+    let square: Activation = Box::new(|a: &Array| a.multiply(a));
+    let mlp = SwitchMLP::new(fc1, fc2, square).unwrap();
+
+    let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+    let indices = Array::from_slice::<u32>(&[0, 1], &(2, 1)).unwrap();
+    let mut out = mlp.forward(&x, &indices).unwrap();
+    assert_eq!(out.shape(), vec![2, 1, 2]);
+    let got = out.to_vec::<f32>().unwrap();
+    // Token 0 via expert 0 (identity): square([1,2]) = [1, 4].
+    // Token 1 via expert 1 (swap): square(swap([3,4])) = square([4,3]) = [16, 9].
+    assert_eq!(got, vec![1.0, 4.0, 16.0, 9.0]);
+  }
+
+  #[test]
+  fn switch_mlp_default_activation_is_gelu_approx() {
+    // `SwitchMLP::default_activation()` must be `gelu_approx` (the python
+    // `nn.GELU(approx="precise")` default). With identity fc1/fc2 the block
+    // collapses to the activation itself, so the output must equal
+    // `activations::gelu_approx(x)`.
+    let mlp = SwitchMLP::new(
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      SwitchMLP::default_activation(),
+    )
+    .unwrap();
+    let x = Array::from_slice::<f32>(&[-1.0, 0.5, 1.0, 2.0], &(2, 2)).unwrap();
+    let indices = Array::from_slice::<u32>(&[0, 1], &(2, 1)).unwrap();
+    let mut out = mlp.forward(&x, &indices).unwrap();
+    let got = out.to_vec::<f32>().unwrap();
+    // Reference: gelu_approx applied element-wise (fc1/fc2 are identity).
+    let mut reference = super::super::activations::gelu_approx(&x).unwrap();
+    let want = reference.to_vec::<f32>().unwrap();
+    assert_close(&got, &want);
+  }
+
+  #[test]
+  fn switch_mlp_sorted_path_matches_hand_trace() {
+    // Same `indices.size() >= 64` sorted-path exercise as the SwitchGLU
+    // sibling test, for the un-gated `fc2(square(fc1(x)))` body.
+    let square: Activation = Box::new(|a: &Array| a.multiply(a));
+    let mlp = SwitchMLP::new(
+      SwitchLinear::from_parts(identity_then_swap_weight(), None).unwrap(),
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      square,
+    )
+    .unwrap();
+    let n = 64usize;
+    let mut x_data = Vec::with_capacity(n * 2);
+    let mut idx_data = Vec::with_capacity(n);
+    for t in 0..n {
+      x_data.push(t as f32);
+      x_data.push(t as f32 + 1.0);
+      idx_data.push((t % 2) as u32);
+    }
+    let x = Array::from_slice::<f32>(&x_data, &(n, 2usize)).unwrap();
+    let indices = Array::from_slice::<u32>(&idx_data, &(n, 1usize)).unwrap();
+    assert!(indices.size() >= 64, "test must exercise the sorted path");
+    let mut out = mlp.forward(&x, &indices).unwrap();
+    assert_eq!(out.shape(), vec![n, 1, 2]);
+    let got = out.to_vec::<f32>().unwrap();
+    // Reference: per token, square(fc1_e(x)) — expert 0 identity, expert 1 swap.
+    let mut want = Vec::with_capacity(n * 2);
+    for t in 0..n {
+      let (x0, x1) = (t as f32, t as f32 + 1.0);
+      if t % 2 == 0 {
+        want.push(x0 * x0);
+        want.push(x1 * x1);
+      } else {
+        // expert 1 swaps before squaring
+        want.push(x1 * x1);
+        want.push(x0 * x0);
+      }
+    }
+    assert_close(&got, &want);
+  }
+
+  #[test]
+  fn switch_mlp_new_rejects_mismatched_projection_shapes() {
+    // fc2 must be the [hidden→input] inverse of fc1 [input→hidden]. fc1 is
+    // [2→2]; an fc2 of [2→3] (wrong output_dims) is rejected.
+    let bad_fc2 =
+      Array::from_slice::<f32>(&[0.0f32; 2 * 3 * 2], &(2usize, 3usize, 2usize)).unwrap();
+    let err = SwitchMLP::new(
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      SwitchLinear::from_parts(bad_fc2, None).unwrap(),
+      SwitchMLP::default_activation(),
+    )
+    .unwrap_err();
+    assert!(
+      matches!(err, crate::Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch on mismatched fc2, got {err:?}"
+    );
+  }
+
+  #[test]
+  fn gather_sort_then_scatter_unsort_round_trips() {
+    // `gather_sort` reorders rows by expert id; `scatter_unsort` (with the
+    // returned `inv_order`) must restore the original order exactly. Round-
+    // tripping the *index* array through the pair must yield the input.
+    // indices: [N=3, k=2] with deliberately-unsorted expert ids.
+    let indices = Array::from_slice::<u32>(&[2, 0, 1, 1, 0, 2], &(3, 2)).unwrap();
+    // gather_sort's `x` arg is the post-expand_dims input — rank ≥ 3 with
+    // trailing (1, 1, D). Build a [3, 2, 1, 1, D=1] x whose value encodes the
+    // flattened (token, k) slot so a mis-sort is visible.
+    let x = Array::from_slice::<f32>(
+      &(0..6).map(|i| i as f32).collect::<Vec<_>>(),
+      &(3usize, 2usize, 1usize, 1usize),
+    )
+    .unwrap();
+    let x_expanded = shape::expand_dims_axes(&x, &[-1]).unwrap(); // [3,2,1,1,1]
+    let (_x_sorted, mut idx_sorted, inv_order) = gather_sort(&x_expanded, &indices).unwrap();
+    // The sorted expert ids must be non-decreasing.
+    let sorted_ids = idx_sorted.to_vec::<u32>().unwrap();
+    let mut expected_sorted = vec![2u32, 0, 1, 1, 0, 2];
+    expected_sorted.sort_unstable();
+    assert_eq!(sorted_ids, expected_sorted);
+    // scatter_unsort of the sorted ids (reshaped to indices.shape) restores
+    // the original [3, 2] index array.
+    let idx_as_rows = shape::expand_dims_axes(&idx_sorted, &[-1]).unwrap(); // [6,1]
+    let mut restored = scatter_unsort(&idx_as_rows, &inv_order, &[3, 2]).unwrap();
+    assert_eq!(restored.shape(), vec![3, 2, 1]);
+    let restored_flat = restored.to_vec::<u32>().unwrap();
+    assert_eq!(restored_flat, vec![2, 0, 1, 1, 0, 2]);
   }
 }
