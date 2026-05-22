@@ -22,6 +22,7 @@ pub mod perplexity;
 pub mod quant;
 pub mod sample;
 pub mod speculative;
+pub mod stop;
 /// Tool-call format parsers — Python `mlx_lm.tool_parsers.*`.
 ///
 /// Surface re-export of [`crate::tokenizer::tools`] under the canonical
