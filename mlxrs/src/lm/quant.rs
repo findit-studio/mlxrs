@@ -85,6 +85,7 @@ use serde::{Deserialize, Deserializer};
 
 use crate::{
   array::Array,
+  dtype::Dtype,
   error::{Error, Result},
   lm::load::Weights,
   ops,
@@ -427,16 +428,178 @@ pub fn default_eligible(_path: &str, _weight: &Array) -> bool {
   true
 }
 
-/// Whether `weights` already carries a quantized triple for `layer_path` —
-/// `<layer_path>.scales` is present. mlx-lm `class_predicate`
-/// (`utils.py:349-355`) gates on `f"{p}.scales" in weights` as the signal
-/// that the checkpoint already pre-quantized this layer; an
-/// already-quantized weight is left untouched (no double-quantize).
-fn is_already_quantized(weights: &Weights, layer_path: &str) -> bool {
-  let mut key = String::with_capacity(layer_path.len() + SCALES_SUFFIX.len());
-  key.push_str(layer_path);
-  key.push_str(SCALES_SUFFIX);
-  weights.contains_key(&key)
+/// Classification of a `<layer_path>.weight` key's quantization siblings
+/// (`.scales` / `.biases`) in the input weight map.
+///
+/// [`quantize_weights`] consults [`classify_triple`] BEFORE the
+/// eligibility / per-layer / shape gates, so the sibling-collision check
+/// fires uniformly for every prospective quantization target, not only
+/// the ones the rest of the chain happens to select.
+enum TripleClass {
+  /// No `.scales` or `.biases` sibling — this is a fresh dense weight;
+  /// proceed to the eligibility predicate + structural guards +
+  /// quantize.
+  Absent,
+  /// A structurally valid already-quantized triple. mlx-lm
+  /// `class_predicate` (`utils.py:349-355`) gates on `f"{p}.scales" in
+  /// weights` as the signal that the checkpoint already pre-quantized
+  /// this layer; on top of that signal, this validates the layout
+  /// mlx's `quantize` actually produces
+  /// (`mlx/mlx/ops.cpp:4789-4798,4893-4904`):
+  ///
+  /// - `.weight` dtype is `uint32` (packed quantized — both `affine`
+  ///   and the `fp` modes write a `uint32` packed matrix; a float
+  ///   `.weight` next to a `.scales` is the orphan case).
+  /// - `.scales` rank equals `.weight` rank, and the leading dims (all
+  ///   but the last) match — mlx preserves the leading shape across
+  ///   `quantize`.
+  /// - If `.biases` is present (affine), it has the same shape and
+  ///   dtype as `.scales` — `affine_quantize` writes `scales` and
+  ///   `biases` from the same template (`mlx/mlx/ops.cpp:4780-4786`,
+  ///   `4793-4798`).
+  ///
+  /// Pass-through unchanged.
+  Valid,
+  /// A `.scales` and/or `.biases` sibling exists but does NOT match
+  /// mlx's quantized layout — an orphan or a mismatch from a corrupted
+  /// / out-of-sync checkpoint. The message names the offending path and
+  /// the specific inconsistency; the caller surfaces it as
+  /// [`Error::Backend`].
+  Invalid(String),
+}
+
+/// Inspect `<layer_path>.scales` and `<layer_path>.biases` in `weights`
+/// and classify the triple as [`Absent`](TripleClass::Absent),
+/// [`Valid`](TripleClass::Valid) (mlx-quantized layout) or
+/// [`Invalid`](TripleClass::Invalid) (orphan / shape / dtype mismatch).
+///
+/// `layer_weight` is the `<layer_path>.weight` array (the caller has
+/// already stripped the suffix). See [`TripleClass`] for the exact
+/// invariants enforced, and the module-level
+/// [Sibling-name reservation](self#sibling-name-reservation) section for
+/// the surrounding contract.
+fn classify_triple(weights: &Weights, layer_path: &str, layer_weight: &Array) -> TripleClass {
+  let scales_key = format!("{layer_path}{SCALES_SUFFIX}");
+  let biases_key = format!("{layer_path}{BIASES_SUFFIX}");
+  let scales = weights.get(&scales_key);
+  let biases = weights.get(&biases_key);
+
+  match (scales, biases) {
+    // No siblings at all — a fresh dense weight. Proceed to the rest of
+    // the chain (eligibility / shape gates / quantize).
+    (None, None) => TripleClass::Absent,
+    // Orphan `.biases` with no `.scales`. mlx `affine_quantize`
+    // always writes `.scales` alongside `.biases`
+    // (`mlx/ops.cpp:4793-4798`); a `.biases` alone is never a valid
+    // mlx-produced triple. The `fp` schemes (`mxfp4`/`mxfp8`/`nvfp4`)
+    // don't write `.biases` at all (`mlx/ops.cpp:4898-4900`), so this
+    // can't be a non-affine triple either.
+    (None, Some(_)) => TripleClass::Invalid(format!(
+      "quantize_weights: layer {layer_path}: input has a stale `{biases_key}` \
+       with no matching `{scales_key}` (mlx `quantize` always writes `.scales` \
+       alongside `.biases`); refusing to silently overwrite the generated bias"
+    )),
+    // `.scales` present (with or without `.biases`). Validate the
+    // layout matches what mlx's `quantize` produces — if not, it's
+    // an orphan `.scales` next to a dense weight, or a corrupted
+    // shape/dtype mismatch.
+    (Some(s), b_opt) => {
+      // `.weight` dtype must be `uint32` — both `affine_quantize`
+      // (`mlx/ops.cpp:4795`) and `fp_quantize` (`mlx/ops.cpp:4900`)
+      // write a `uint32` packed matrix. A float `.weight` means this
+      // is a dense weight with a stale `.scales` orphan next to it.
+      let w_dtype = match layer_weight.dtype() {
+        Ok(d) => d,
+        Err(e) => {
+          return TripleClass::Invalid(format!(
+            "quantize_weights: layer {layer_path}: cannot read `.weight` dtype \
+             (required to validate already-quantized triple): {e}"
+          ));
+        }
+      };
+      if w_dtype != Dtype::U32 {
+        return TripleClass::Invalid(format!(
+          "quantize_weights: layer {layer_path}: input has `{scales_key}` but \
+           `.weight` dtype is {w_dtype:?} (mlx-quantized `.weight` is always \
+           uint32 — `mlx/ops.cpp:4795,4900`); this is a stale `.scales` orphan \
+           next to a dense `.weight`, not a valid already-quantized triple"
+        ));
+      }
+      // `.scales` rank == `.weight` rank, and the leading dims (all
+      // but the last) match — mlx `quantize` preserves the leading
+      // shape (`mlx/ops.cpp:4789-4798`).
+      let w_shape = layer_weight.shape();
+      let s_shape = s.shape();
+      if s_shape.len() != w_shape.len() {
+        return TripleClass::Invalid(format!(
+          "quantize_weights: layer {layer_path}: `{scales_key}` rank ({}) \
+           does not match `.weight` rank ({}) — mlx `quantize` preserves the \
+           leading shape across the packed `.weight` / `.scales` / `.biases` \
+           outputs (`mlx/ops.cpp:4789-4798`)",
+          s_shape.len(),
+          w_shape.len()
+        ));
+      }
+      // Compare leading dims (all but the last axis) iff both have rank
+      // ≥ 1. Mlx `quantize` requires rank ≥ 2 inputs (`mlx/ops.cpp:4925-4929`),
+      // so a rank-0 `.weight` already isn't a real quantized triple — but
+      // the rank-equality check above subsumes that case; here we just
+      // guard the slice index.
+      if !w_shape.is_empty()
+        && !s_shape.is_empty()
+        && s_shape[..s_shape.len() - 1] != w_shape[..w_shape.len() - 1]
+      {
+        return TripleClass::Invalid(format!(
+          "quantize_weights: layer {layer_path}: `{scales_key}` leading dims \
+           {:?} do not match `.weight` leading dims {:?} — mlx `quantize` \
+           preserves all-but-last dims",
+          &s_shape[..s_shape.len() - 1],
+          &w_shape[..w_shape.len() - 1],
+        ));
+      }
+      // `.biases` (if present): same shape and dtype as `.scales` —
+      // `affine_quantize` writes them from the same template
+      // (`mlx/ops.cpp:4780-4786`, `4793-4798`).
+      if let Some(b) = b_opt {
+        let b_shape = b.shape();
+        if b_shape != s_shape {
+          return TripleClass::Invalid(format!(
+            "quantize_weights: layer {layer_path}: `{biases_key}` shape \
+             {b_shape:?} does not match `{scales_key}` shape {s_shape:?} \
+             (mlx `affine_quantize` writes them from the same template, \
+             `mlx/ops.cpp:4780-4786,4793-4798`)"
+          ));
+        }
+        let s_dtype = match s.dtype() {
+          Ok(d) => d,
+          Err(e) => {
+            return TripleClass::Invalid(format!(
+              "quantize_weights: layer {layer_path}: cannot read \
+               `{scales_key}` dtype: {e}"
+            ));
+          }
+        };
+        let b_dtype = match b.dtype() {
+          Ok(d) => d,
+          Err(e) => {
+            return TripleClass::Invalid(format!(
+              "quantize_weights: layer {layer_path}: cannot read \
+               `{biases_key}` dtype: {e}"
+            ));
+          }
+        };
+        if s_dtype != b_dtype {
+          return TripleClass::Invalid(format!(
+            "quantize_weights: layer {layer_path}: `{biases_key}` dtype \
+             ({b_dtype:?}) does not match `{scales_key}` dtype \
+             ({s_dtype:?}) (mlx `affine_quantize` writes them from the \
+             same template, `mlx/ops.cpp:4780-4786`)"
+          ));
+        }
+      }
+      TripleClass::Valid
+    }
+  }
 }
 
 /// Quantize the eligible weights in `weights` per `cfg`, returning a new
@@ -482,14 +645,23 @@ fn is_already_quantized(weights: &Weights, layer_path: &str) -> bool {
 /// ## Sibling-name reservation
 ///
 /// When a path `P` is selected for quantization, the generated triple
-/// (`P.weight` / `P.scales` / `P.biases`) reserves those names. A
-/// stale orphan `P.biases` (with no matching `P.scales` — therefore
-/// NOT a valid already-quantized triple) is a collision that would
-/// non-deterministically either overwrite or be overwritten by the
-/// generated bias depending on HashMap iteration order; this returns a
-/// recoverable [`Error::Backend`] naming the conflict instead. The
-/// already-quantized triple skip (`<path>.scales` present in input) is
-/// unchanged and still passes through verbatim.
+/// (`P.weight` / `P.scales` / `P.biases`) reserves those names. Before
+/// the eligibility / per-layer / shape gates fire, every `<path>.weight`
+/// key is classified against the layout mlx's `quantize` actually
+/// produces (`<path>.weight` is `uint32`; `.scales` rank matches
+/// `.weight` rank with the same leading dims; `.biases` — if present —
+/// has the same shape and dtype as `.scales`):
+///
+/// - `Valid` (a structurally consistent already-quantized triple) →
+///   pass through unchanged, mlx-lm `class_predicate` semantics
+///   (`utils.py:349-355`).
+/// - `Invalid` (an orphan `.scales` / `.biases` with no matching
+///   sibling, a `.scales` next to a dense `.weight`, or a shape/dtype
+///   mismatch) → return [`Error::Backend`] naming the offending path
+///   and the inconsistency. A non-deterministic overwrite by HashMap
+///   iteration order — or a downstream [`dequantize_weights`]
+///   corrupt-triple crash — is worse than a clear early failure.
+/// - `Absent` (no siblings) → proceed to the rest of the chain.
 ///
 /// **Failure handling.** Every quantization op is fallible
 /// ([`crate::ops::quantized::quantize`] propagates mlx-c's error); a
@@ -506,26 +678,34 @@ pub fn quantize_weights(
   let mut out: Weights = HashMap::with_capacity(weights.len());
 
   // Two passes so the predicate sees the COMPLETE input map for the
-  // "already quantized" check (`<path>.scales` in weights). Pass 1 chooses
-  // which keys to quantize without mutating; pass 2 does the work. mlx-lm's
-  // `tree_map_with_path` on `leaf_modules()` is the module-tree analog of
-  // this two-pass shape (a sibling `.scales` check needs the full map up
-  // front).
+  // triple-classification check (sibling `.scales` / `.biases` need the
+  // full map up front). Pass 1 chooses which keys to quantize without
+  // mutating; pass 2 does the work. mlx-lm's `tree_map_with_path` on
+  // `leaf_modules()` is the module-tree analog of this two-pass shape.
   let mut to_quantize: Vec<(String, Quantization)> = Vec::new();
   for (key, arr) in &weights {
     let Some(layer_path) = key.strip_suffix(WEIGHT_SUFFIX) else {
       continue;
     };
+    // FIRST: classify the prospective triple against mlx's quantized
+    // layout. This runs BEFORE the eligibility / per-layer / shape
+    // gates so the orphan-sibling collision check fires uniformly for
+    // every `<path>.weight` key (catches the case where a dense
+    // `.weight` has a stale `.scales` / `.biases` orphan next to it
+    // — see [`TripleClass`] for the exact invariants). The
+    // `is_already_quantized` presence-only gate (mlx-lm
+    // `utils.py:349-355`) is subsumed by the
+    // [`Valid`](TripleClass::Valid) branch.
+    match classify_triple(&weights, layer_path, arr) {
+      TripleClass::Absent => {}
+      TripleClass::Valid => continue,
+      TripleClass::Invalid(message) => return Err(Error::Backend { message }),
+    }
     // Caller-supplied eligibility — the structural analogue of mlx-lm's
     // `hasattr(module, "to_quantized")` (`utils.py:824`). Pass 1 of the
     // wrapped_predicate translation; fails the rest of the chain
     // immediately and the weight passes through unchanged.
     if !eligible(layer_path, arr) {
-      continue;
-    }
-    // mlx-lm `utils.py:349-355`: skip when the checkpoint already shipped
-    // a `<path>.scales` for this layer (already-quantized).
-    if is_already_quantized(&weights, layer_path) {
       continue;
     }
     // Per-layer-aware resolution (Skip wins; Quantize override wins over
@@ -549,39 +729,6 @@ pub fn quantize_weights(
     })?;
     if gs == 0 || last % gs != 0 {
       continue;
-    }
-    // Sibling-name reservation. We're about to write `P.weight` /
-    // `P.scales` / `P.biases`; an orphan `P.biases` (without `P.scales`,
-    // so not a valid already-quantized triple — that case was already
-    // filtered above) in the input collides with the generated bias
-    // non-deterministically (HashMap iteration order). REJECT rather
-    // than silently corrupt the output. An orphan `P.scales` would have
-    // tripped `is_already_quantized` already, so we don't need to
-    // re-check it here — but be defensive: if BOTH siblings somehow
-    // arrive without a `.weight` having been skipped, also reject.
-    let scales_key = format!("{layer_path}{SCALES_SUFFIX}");
-    let biases_key = format!("{layer_path}{BIASES_SUFFIX}");
-    if weights.contains_key(&biases_key) {
-      return Err(Error::Backend {
-        message: format!(
-          "quantize_weights: layer {layer_path}: input has a stale `{biases_key}` \
-           with no matching `{scales_key}` (not a valid already-quantized triple); \
-           refusing to silently overwrite the generated bias"
-        ),
-      });
-    }
-    if weights.contains_key(&scales_key) {
-      // Defensive — `is_already_quantized` above should have caught
-      // this, but if some future refactor changes that gate, this
-      // keeps the invariant ("we never overwrite a stale sibling")
-      // independent of the earlier check.
-      return Err(Error::Backend {
-        message: format!(
-          "quantize_weights: layer {layer_path}: input has a `{scales_key}` \
-           that was not classified as already-quantized; refusing to silently \
-           overwrite the generated scales"
-        ),
-      });
     }
     to_quantize.push((layer_path.to_string(), q));
   }
@@ -725,6 +872,17 @@ mod tests {
     Array::from_slice::<f32>(data, &shape).expect("from_slice")
   }
 
+  /// Construct a packed-quantized `.weight` array (dtype `uint32`,
+  /// the layout mlx's `quantize` writes). The new
+  /// [`TripleClass`]-based already-quantized detector validates that
+  /// `.weight` is `uint32` before passing a triple through, so the
+  /// "already quantized" test fixtures need to use this — a dense
+  /// `f32` `.weight` next to a `.scales` is now classified as an
+  /// orphan, not a valid triple.
+  fn arr_u32(data: &[u32], shape: &[usize]) -> Array {
+    Array::from_slice::<u32>(data, &shape).expect("from_slice")
+  }
+
   // ──────────────── Quantization parse (schema) ────────────────
 
   #[test]
@@ -846,10 +1004,17 @@ mod tests {
     // Two eligible weights: [3, 64].
     let w1 = arr_f32(&vec![0.5_f32; n_rows * group_size], &[n_rows, group_size]);
     let w2 = arr_f32(&vec![-0.25_f32; n_rows * group_size], &[n_rows, group_size]);
-    // Already-quantized layer: `<path>.scales` is present, so its `.weight`
-    // is skipped (per mlx-lm `utils.py:349-355`).
-    let already_w = arr_f32(&vec![0.0_f32; n_rows * group_size], &[n_rows, group_size]);
-    let already_scales = arr_f32(&vec![0.0_f32; n_rows], &[n_rows]);
+    // Already-quantized layer: a STRUCTURALLY-VALID affine triple
+    // (`<path>.weight` uint32 + `<path>.scales` (+ `<path>.biases`)
+    // f32 of matching leading dims). Classified as
+    // [`TripleClass::Valid`] → skipped + passed through verbatim (per
+    // mlx-lm `utils.py:349-355`, sharpened to the actual mlx layout
+    // — `mlx/ops.cpp:4789-4798`).
+    // Packed shape: bits=4 packs 8 elements per uint32 → last axis is
+    // `group_size / 8 = 8` for group_size=64.
+    let already_w = arr_u32(&vec![0_u32; n_rows * 8], &[n_rows, 8]);
+    let already_scales = arr_f32(&vec![0.0_f32; n_rows], &[n_rows, 1]);
+    let already_biases = arr_f32(&vec![0.0_f32; n_rows], &[n_rows, 1]);
     // A bias (1-D) — not quantizable (rank < 2).
     let bias = arr_f32(&[1.0_f32, 2.0, 3.0], &[3]);
     // A weight whose last axis (63) is not a multiple of group_size 64.
@@ -862,6 +1027,7 @@ mod tests {
     weights.insert("model.layers.0.k_proj.weight".to_string(), w2);
     weights.insert("model.layers.1.v_proj.weight".to_string(), already_w);
     weights.insert("model.layers.1.v_proj.scales".to_string(), already_scales);
+    weights.insert("model.layers.1.v_proj.biases".to_string(), already_biases);
     weights.insert("model.layers.0.q_proj.bias".to_string(), bias);
     weights.insert("model.layers.2.bad.weight".to_string(), odd_last);
     weights.insert("model.norm.gamma".to_string(), other);
@@ -889,11 +1055,14 @@ mod tests {
       assert_eq!(biases.dtype().unwrap(), crate::dtype::Dtype::F32);
     }
 
-    // Skipped: already-quantized layer's triple passes through unchanged.
+    // Skipped: already-quantized layer's triple passes through unchanged
+    // (uint32 packed `.weight`, f32 `.scales` / `.biases` of matching
+    // leading dims — exactly the layout mlx's `affine_quantize` writes).
     let pre_q_w = out.get("model.layers.1.v_proj.weight").expect("already-w");
-    assert_eq!(pre_q_w.shape(), vec![n_rows, group_size]);
-    assert_eq!(pre_q_w.dtype().unwrap(), crate::dtype::Dtype::F32);
+    assert_eq!(pre_q_w.shape(), vec![n_rows, 8]);
+    assert_eq!(pre_q_w.dtype().unwrap(), crate::dtype::Dtype::U32);
     assert!(out.contains_key("model.layers.1.v_proj.scales"));
+    assert!(out.contains_key("model.layers.1.v_proj.biases"));
 
     // Skipped: 1-D bias and ragged-last-axis weight pass through.
     assert_eq!(
@@ -1120,8 +1289,11 @@ mod tests {
     let n_rows = 2_usize;
     let w = arr_f32(&vec![0.5_f32; n_rows * group_size], &[n_rows, group_size]);
     // Orphan biases — NO matching `.scales`, so not a valid
-    // already-quantized triple. The predicate selects this path → the
-    // sibling-collision guard fires.
+    // already-quantized triple (mlx `affine_quantize` always writes
+    // `.scales` alongside `.biases`, `mlx/ops.cpp:4793-4798`). The
+    // `classify_triple` check runs BEFORE the eligibility predicate, so
+    // this fires unconditionally for every `.weight` key with an orphan
+    // `.biases` sibling.
     let stale_biases = arr_f32(&vec![0.0_f32; n_rows], &[n_rows, 1]);
     let mut weights: Weights = HashMap::new();
     weights.insert("model.foo.weight".to_string(), w);
@@ -1144,14 +1316,17 @@ mod tests {
     }
   }
 
-  /// Fix 3: a VALID already-quantized triple (`.weight` + `.scales`
-  /// (+ `.biases`)) STILL passes through unchanged. The collision guard
-  /// must not regress the already-quantized skip.
+  /// Fix 3: a VALID already-quantized triple (`.weight` uint32 packed +
+  /// `.scales` (+ `.biases`) of matching leading dims, the exact layout
+  /// mlx's `affine_quantize` writes — `mlx/ops.cpp:4789-4798`) STILL
+  /// passes through unchanged. The new [`TripleClass`] validation must
+  /// not regress the already-quantized skip.
   #[test]
   fn quantize_weights_valid_existing_triple_still_skipped() {
-    let group_size = 64_usize;
     let n_rows = 2_usize;
-    let w = arr_f32(&vec![0.0_f32; n_rows * group_size], &[n_rows, group_size]);
+    // Packed `.weight`: bits=4 packs 8 elements per uint32 → last axis
+    // is `group_size / 8 = 8` for group_size=64.
+    let w = arr_u32(&vec![0_u32; n_rows * 8], &[n_rows, 8]);
     let scales = arr_f32(&vec![1.0_f32; n_rows], &[n_rows, 1]);
     let biases = arr_f32(&vec![0.0_f32; n_rows], &[n_rows, 1]);
     let mut weights: Weights = HashMap::new();
@@ -1159,14 +1334,124 @@ mod tests {
     weights.insert("model.already.scales".to_string(), scales);
     weights.insert("model.already.biases".to_string(), biases);
 
-    let cfg = PerLayerQuantization::from_global(Quantization::affine(group_size as i32, 4));
+    let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
     let out = quantize_weights(weights, &cfg, &default_eligible).expect("valid triple passes");
-    // `.weight` still dense-shape (not the packed [N, 8] of quantized at 4 bits).
-    assert_eq!(
-      out.get("model.already.weight").unwrap().shape(),
-      vec![n_rows, group_size]
-    );
+    // `.weight` is the packed [N, 8] uint32 we inserted — not re-quantized.
+    let w_out = out.get("model.already.weight").unwrap();
+    assert_eq!(w_out.shape(), vec![n_rows, 8]);
+    assert_eq!(w_out.dtype().unwrap(), crate::dtype::Dtype::U32);
     assert!(out.contains_key("model.already.scales"));
     assert!(out.contains_key("model.already.biases"));
+  }
+
+  /// Fix 4 (this PR): a dense `.weight` (float dtype) next to a stale
+  /// `.scales` orphan (no matching `.biases`, no valid quantized layout)
+  /// → [`TripleClass::Invalid`] → `Err(Backend)` naming the layer and
+  /// the offending `.scales`. This is the case the Codex review surfaced:
+  /// the old presence-only `is_already_quantized` check would have
+  /// classified this as "already quantized" and silently passed through,
+  /// leaving a dense `.weight` next to a corrupt `.scales` for
+  /// `dequantize_weights` to choke on.
+  #[test]
+  fn quantize_weights_orphan_scales_with_dense_weight_errors() {
+    let group_size = 64_usize;
+    let n_rows = 2_usize;
+    // Dense f32 `.weight` (NOT a quantized uint32 packed matrix).
+    let w = arr_f32(&vec![0.5_f32; n_rows * group_size], &[n_rows, group_size]);
+    // Stale orphan `.scales` next to it; no matching `.biases`.
+    let stale_scales = arr_f32(&vec![1.0_f32; n_rows], &[n_rows, 1]);
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.foo.weight".to_string(), w);
+    weights.insert("model.foo.scales".to_string(), stale_scales);
+
+    let cfg = PerLayerQuantization::from_global(Quantization::affine(group_size as i32, 4));
+    let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("model.foo"),
+          "error should name the colliding layer, got: {message}"
+        );
+        assert!(
+          message.contains(".scales"),
+          "error should name the colliding sibling, got: {message}"
+        );
+        // The message should call out the dense-`.weight` mismatch
+        // (the load-bearing signal that this is an orphan, not a real
+        // already-quantized triple).
+        assert!(
+          message.contains("uint32") || message.contains("dense") || message.contains("F32"),
+          "error should explain the `.weight` dtype mismatch, got: {message}"
+        );
+      }
+      other => panic!("expected Error::Backend, got: {other:?}"),
+    }
+  }
+
+  /// Fix 4 (this PR): a `.weight` + `.scales` with MISMATCHED leading
+  /// dims (the `.weight` claims to be uint32 packed, but its rank or
+  /// leading shape doesn't match `.scales` as mlx's `quantize` would
+  /// produce). Classified as [`TripleClass::Invalid`] → `Err(Backend)`.
+  #[test]
+  fn quantize_weights_mismatched_scales_shape_errors() {
+    let n_rows = 2_usize;
+    // Packed `.weight` (uint32) at shape [N=2, 8].
+    let w = arr_u32(&vec![0_u32; n_rows * 8], &[n_rows, 8]);
+    // `.scales` with a different leading dim ([3, 1] vs `.weight`
+    // leading dim of [2]).
+    let bad_scales = arr_f32(&[1.0_f32; 3], &[3, 1]);
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.foo.weight".to_string(), w);
+    weights.insert("model.foo.scales".to_string(), bad_scales);
+
+    let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
+    let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("model.foo"),
+          "error should name the colliding layer, got: {message}"
+        );
+        assert!(
+          message.contains("leading"),
+          "error should explain the leading-dim mismatch, got: {message}"
+        );
+      }
+      other => panic!("expected Error::Backend, got: {other:?}"),
+    }
+  }
+
+  /// Fix 4 (this PR): a `.weight` + `.scales` + `.biases` with MISMATCHED
+  /// `.biases` dtype (vs `.scales`). mlx `affine_quantize` writes scales
+  /// and biases from the same template (`mlx/ops.cpp:4780-4786`), so a
+  /// dtype mismatch is a corrupt triple. Classified as
+  /// [`TripleClass::Invalid`] → `Err(Backend)`.
+  #[test]
+  fn quantize_weights_mismatched_biases_dtype_errors() {
+    let n_rows = 2_usize;
+    let w = arr_u32(&vec![0_u32; n_rows * 8], &[n_rows, 8]);
+    // `.scales` f32, `.biases` u32 (mlx always writes matching dtypes).
+    let scales = arr_f32(&vec![1.0_f32; n_rows], &[n_rows, 1]);
+    let biases = arr_u32(&vec![0_u32; n_rows], &[n_rows, 1]);
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.foo.weight".to_string(), w);
+    weights.insert("model.foo.scales".to_string(), scales);
+    weights.insert("model.foo.biases".to_string(), biases);
+
+    let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
+    let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("model.foo"),
+          "error should name the colliding layer, got: {message}"
+        );
+        assert!(
+          message.contains("dtype"),
+          "error should explain the `.biases` / `.scales` dtype mismatch, got: {message}"
+        );
+      }
+      other => panic!("expected Error::Backend, got: {other:?}"),
+    }
   }
 }
