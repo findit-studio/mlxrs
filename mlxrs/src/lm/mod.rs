@@ -9,10 +9,13 @@
 //! (`ModelConfiguration` + `model_type` registry + `load`), and the
 //! [`generate`](crate::lm::generate) loop (`generate_step` /
 //! `stream_generate` / `generate` + `make_sampler` /
-//! `make_logits_processors`), and the [`perplexity`](crate::lm::perplexity)
-//! evaluation (`perplexity` / `make_windows` / `cross_entropy_none`).
+//! `make_logits_processors`), the [`perplexity`](crate::lm::perplexity)
+//! evaluation (`perplexity` / `make_windows` / `cross_entropy_none`), and the
+//! prompt-cache fill+save driver ([`crate::lm::cache_prompt`] — `cache_prompt`,
+//! the support-surface port of `mlx_lm.cache_prompt`).
 
 pub mod cache;
+pub mod cache_prompt;
 pub mod factory;
 pub mod generate;
 pub mod load;

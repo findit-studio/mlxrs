@@ -540,6 +540,34 @@ impl KvCache for QuantizedKvCacheImpl {
     }
   }
 
+  /// Force-evaluate the cache's own stored quantized triples in place — the
+  /// per-chunk prefill memory barrier (see [`KvCache::materialize`]).
+  ///
+  /// Evals every array of the stored `self.keys`/`self.values` triples
+  /// `(w, scales, biases?)` directly via the explicit `&mut` [`Array::eval`]
+  /// — not the `trim_triple(.., self.offset)` slices [`state`](
+  /// KvCache::state) returns. (This port stores the triples at exactly
+  /// `offset` length, so the slice is the identity today, but evaling the
+  /// genuine stored arrays is the robust barrier regardless.) Materializes
+  /// the buffers the next `update_quantized` reuses; a no-op when empty.
+  fn materialize(&mut self) -> Result<()> {
+    let eval_triple = |t: &mut StoredTriple| -> Result<()> {
+      t.0.eval()?;
+      t.1.eval()?;
+      if let Some(b) = t.2.as_mut() {
+        b.eval()?;
+      }
+      Ok(())
+    };
+    if let Some(k) = self.keys.as_mut() {
+      eval_triple(k)?;
+    }
+    if let Some(v) = self.values.as_mut() {
+      eval_triple(v)?;
+    }
+    Ok(())
+  }
+
   /// mlx-lm `QuantizedKVCache.state` setter (`cache.py:294-296`:
   /// `self.keys, self.values = v`) / mlx-swift-lm
   /// (`KVCache.swift:935-949`): 6 arrays → `(w, scales, Some(biases))`

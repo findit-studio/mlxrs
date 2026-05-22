@@ -20,6 +20,7 @@ fn render(template: &str, tools: &Value, extra: &Value) -> String {
     &json!([]), // messages (unused by these templates)
     Some(tools),
     false, // add_generation_prompt
+    false, // continue_final_message
     None,  // bos_token
     None,  // eos_token
     false, // enable_thinking
@@ -161,7 +162,8 @@ fn tojson_enormous_integer_indent_errors_not_aborts() {
       tmpl,
       &json!([]),
       Some(&tools),
-      false,
+      false, // add_generation_prompt
+      false, // continue_final_message
       None,
       None,
       false,

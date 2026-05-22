@@ -84,6 +84,22 @@ impl KvCache for StandardKvCache {
     }
   }
 
+  /// Force-evaluate the cache's own stored `keys`/`values` in place — the
+  /// per-chunk prefill memory barrier (see [`KvCache::materialize`]). Evals
+  /// the genuine `self.keys`/`self.values` (which this cache always stores at
+  /// exactly the logical `offset` length, so they equal what `state()` would
+  /// return) via the explicit `&mut` [`Array::eval`] — no `state()` clone, no
+  /// slice. A no-op when empty.
+  fn materialize(&mut self) -> Result<()> {
+    if let Some(k) = self.keys.as_mut() {
+      k.eval()?;
+    }
+    if let Some(v) = self.values.as_mut() {
+      v.eval()?;
+    }
+    Ok(())
+  }
+
   /// mlx-lm `KVCache.state` setter (cross-checked vs swift
   /// `KVCacheSimple.state`): `keys, values = v; offset = keys.shape[-2]`.
   /// An empty state resets to the fresh cache (`_BaseCache` "no state").

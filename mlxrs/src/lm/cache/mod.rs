@@ -158,6 +158,48 @@ pub trait KvCache {
   /// Restore the array state (mlx-lm `cache.state` setter).
   fn set_state(&mut self, state: Vec<Array>) -> Result<()>;
 
+  /// Force evaluation of the cache's **own stored arrays in place** — the
+  /// per-chunk prefill memory barrier mlx-lm runs as
+  /// `mx.eval([c.state for c in prompt_cache])` (`generate.py:442`).
+  ///
+  /// `mlxrs::Array` is lazy (an op only records a graph node), so without a
+  /// per-chunk barrier the prefill loop would accumulate a single lazy graph
+  /// spanning **every** chunk and force it only at the final save — peak
+  /// memory would grow with the whole prompt and `prefill_step_size` would
+  /// bound nothing (a long prompt could OOM/abort). This hook caps the live
+  /// graph to one chunk's work by materializing the buffers the *next* chunk
+  /// reuses.
+  ///
+  /// # Why a `&mut self` hook and not `mx.eval(self.state())`
+  ///
+  /// mlx-lm evals `c.state`, which for the plain append cache *is* the live
+  /// buffer. But several caches' [`state`](KvCache::state) is a **serialized
+  /// view**, not the stored buffer: a sliding-window / chunked / batched
+  /// cache over-allocates its ring/step buffer and `state()` returns
+  /// `seq_slice(self.keys, 0, offset)` (the `offset`-length serialization
+  /// slice) whenever `offset < buffer_len` — exactly the regime an `S == 1`
+  /// update reaches after growing the ring (and the `prefill_step_size == 1`
+  /// path, also reachable via the `0` clamp). Evaluating that temporary slice
+  /// is **not** the same operation as evaluating the `self.keys`/`self.values`
+  /// arrays the next chunk's `update` actually reads and extends. Routing the
+  /// barrier through a `&mut self` hook lets each concrete cache eval its
+  /// genuine stored arrays directly (it owns the private fields), so the
+  /// materialization is on the live buffers regardless of what the
+  /// serialization `state()` happens to slice.
+  ///
+  /// # Contract for implementers
+  ///
+  /// Evaluate the concrete cache's **own** stored [`Array`] fields with the
+  /// explicit `&mut` [`Array::eval`] step (the crate makes eval an explicit
+  /// `&mut` operation; accessors never hidden-eval) — the real `self.keys`/
+  /// `self.values` (or quantized triples / per-sequence position arrays /
+  /// per-slot SSM state / child caches), **never** a `seq_slice`/`try_clone`
+  /// of [`state`](KvCache::state). An empty cache (no stored arrays) is a
+  /// no-op `Ok(())`. This is a required method (no default) precisely so a
+  /// new cache kind cannot silently inherit a `state()`-based barrier that
+  /// would evaluate the wrong (sliced) arrays.
+  fn materialize(&mut self) -> Result<()>;
+
   /// Serializable scalar metadata as strings (mlx-lm `cache.meta_state`);
   /// empty for caches without metadata.
   fn meta_state(&self) -> Vec<String> {

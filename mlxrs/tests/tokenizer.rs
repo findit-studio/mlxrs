@@ -152,7 +152,7 @@ fn chat_template_render_with_generation_prompt_and_tool() {
     {"type": "function", "function": {"name": "get_weather", "parameters": {}}}
   ]);
   let out = tok
-    .apply_chat_template(&messages, Some(&tools), true, None)
+    .apply_chat_template(&messages, Some(&tools), true, false, None)
     .unwrap();
   assert_eq!(
     out,
@@ -161,7 +161,7 @@ fn chat_template_render_with_generation_prompt_and_tool() {
 
   // Without generation prompt, the trailing assistant marker is absent.
   let out2 = tok
-    .apply_chat_template(&messages, None, false, None)
+    .apply_chat_template(&messages, None, false, false, None)
     .unwrap();
   assert_eq!(out2, "<s><|user|>hi<|assistant|>yo");
 }
