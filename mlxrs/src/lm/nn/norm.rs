@@ -271,13 +271,15 @@ pub struct GroupNorm {
   /// same modulo-invariant reason as [`Self::num_groups`]; read via
   /// [`Self::dims`].
   dims: i32,
-  /// Affine parameters: `Some((weight, bias))` when `affine = true`,
-  /// `None` when `affine = false`. Both tensors are shape `(dims,)`. A
-  /// SINGLE `Option` of the *pair* (not two independent `Option`s) so the
+  /// Affine parameters: `Some((weight, bias))` for an affine GroupNorm,
+  /// `None` otherwise. Both tensors are rank-1 shape `(dims,)`. A SINGLE
+  /// `Option` of the *pair* (not two independent `Option`s) so the
   /// invalid `(Some, None)` / `(None, Some)` partial state is
   /// unrepresentable — mlx's `nn.GroupNorm` creates `weight` and `bias`
   /// together inside `if affine:`. PRIVATE so the both-or-none invariant
-  /// can't be broken post-construction; read via [`Self::affine`].
+  /// can't be broken post-construction; read via [`Self::affine`],
+  /// installed by [`Self::new`] (default `(ones, zeros)`) or
+  /// [`Self::with_affine`] (a checkpoint's learned tensors).
   affine: Option<(Array, Array)>,
   /// Variance floor inside the sqrt (references default `1e-5`).
   pub eps: f32,
@@ -305,11 +307,64 @@ impl GroupNorm {
   /// is stored on the struct unconditionally (matching the references)
   /// and is checked against the input's last axis inside
   /// [`Self::forward`].
+  ///
+  /// This is the `affine: bool` convenience constructor — it can only
+  /// install the references' *default* `(ones, zeros)` affine. To install
+  /// a checkpoint's LEARNED `weight`/`bias`, use [`Self::with_affine`]
+  /// (this delegates to it: `affine = true` builds `ones`/`zeros` then
+  /// forwards `Some((ones, zeros))`, `affine = false` forwards `None`).
   pub fn new(
     num_groups: i32,
     dims: i32,
     eps: f32,
     affine: bool,
+    pytorch_compatible: bool,
+  ) -> Result<Self> {
+    // `affine = true` materializes the references' default `(ones,
+    // zeros)`; `affine = false` ⇒ no affine. The stored-state construction
+    // and the `num_groups`/`dims`/affine-shape validation all live in
+    // `with_affine` (the single source of truth) — `new` is the
+    // bool-to-`Option` shim. The `ones`/`zeros` alloc needs `dims > 0`
+    // (else `usize::try_from` would fail), so guard that one rule here
+    // before allocating; `with_affine` then re-checks it (cheap) along
+    // with the rest.
+    let affine = if affine {
+      if dims <= 0 {
+        return Err(crate::error::Error::ShapeMismatch {
+          message: format!("GroupNorm: dims ({dims}) must be positive"),
+        });
+      }
+      // `dims > 0` guaranteed just above ⇒ `usize::try_from` cannot fail.
+      let d = usize::try_from(dims).expect("dims > 0 guarded above");
+      Some((Array::ones::<f32>(&(d,))?, Array::zeros::<f32>(&(d,))?))
+    } else {
+      None
+    };
+    Self::with_affine(num_groups, dims, eps, affine, pytorch_compatible)
+  }
+
+  /// Construct a GroupNorm with explicit affine tensors — the fallible
+  /// constructor for installing a checkpoint's LEARNED `weight`/`bias`.
+  ///
+  /// [`Self::new`]'s `affine: bool` toggle can only produce the
+  /// references' *default* `(ones, zeros)` affine, so a model whose
+  /// GroupNorm carries non-default learned affine params would run with
+  /// an identity affine (wrong activations). This constructor takes the
+  /// real tensors instead.
+  ///
+  /// Runs the same `(num_groups, dims)` validation as [`Self::new`]
+  /// (both positive, `dims % num_groups == 0`). When `affine` is
+  /// `Some((weight, bias))`, BOTH tensors must be exactly rank-1 shape
+  /// `[dims]` — a mismatch is rejected with `Error::ShapeMismatch` naming
+  /// the expected vs actual shape. `affine = None` ⇒ no affine. The
+  /// `Option<(Array, Array)>` is stored directly, preserving the
+  /// both-or-none invariant ([`Self::new`] delegates here so the rule has
+  /// a single home).
+  pub fn with_affine(
+    num_groups: i32,
+    dims: i32,
+    eps: f32,
+    affine: Option<(Array, Array)>,
     pytorch_compatible: bool,
   ) -> Result<Self> {
     if num_groups <= 0 {
@@ -329,17 +384,31 @@ impl GroupNorm {
         ),
       });
     }
-    // `weight` and `bias` are created together (both or neither),
-    // matching mlx's `if affine:` block — the single `Option` of the pair
-    // makes a partial affine unrepresentable.
-    let affine = if affine {
-      // `dims > 0` guaranteed above ⇒ `usize::try_from` cannot fail; the
-      // `expect` documents the invariant rather than re-erroring.
-      let d = usize::try_from(dims).expect("dims > 0 guarded above");
-      Some((Array::ones::<f32>(&(d,))?, Array::zeros::<f32>(&(d,))?))
-    } else {
-      None
-    };
+    // When affine tensors are supplied, BOTH must be exactly rank-1
+    // `[dims]` — a checkpoint with a `[1, dims]` (rank-2) or `[dims + 1]`
+    // (wrong length) tensor would otherwise broadcast/fail unpredictably
+    // inside `forward`'s `multiply`/`add`. Validate here so the misuse
+    // surfaces at construction with a precise message.
+    if let Some((weight, bias)) = &affine {
+      // `dims > 0` guaranteed above ⇒ the cast is lossless.
+      let want = vec![dims as usize];
+      let w_shape = weight.shape();
+      if w_shape != want {
+        return Err(crate::error::Error::ShapeMismatch {
+          message: format!(
+            "GroupNorm: affine weight must be shape {want:?} (rank-1, length dims={dims}), got {w_shape:?}"
+          ),
+        });
+      }
+      let b_shape = bias.shape();
+      if b_shape != want {
+        return Err(crate::error::Error::ShapeMismatch {
+          message: format!(
+            "GroupNorm: affine bias must be shape {want:?} (rank-1, length dims={dims}), got {b_shape:?}"
+          ),
+        });
+      }
+    }
     Ok(Self {
       num_groups,
       dims,
@@ -966,6 +1035,150 @@ mod tests {
     let mut b = b.try_clone().unwrap();
     assert_eq!(w.to_vec::<f32>().unwrap(), vec![1.0; 4]);
     assert_eq!(b.to_vec::<f32>().unwrap(), vec![0.0; 4]);
+  }
+
+  // ─── GroupNorm::with_affine checkpoint-tensor regressions (Codex review) ───
+
+  /// `with_affine` installs a checkpoint's LEARNED (non-identity)
+  /// `(weight, bias)` — the gap `new`'s `affine: bool` couldn't fill
+  /// (it can only build the default `(ones, zeros)`). `affine()` must
+  /// return those exact tensors back.
+  #[test]
+  fn group_norm_with_affine_accepts_checkpoint_tensors() {
+    let w = Array::from_slice::<f32>(&[2.0, 2.0, 2.0, 2.0], &(4,)).unwrap();
+    let b = Array::from_slice::<f32>(&[1.0, 1.0, 1.0, 1.0], &(4,)).unwrap();
+    let gn = GroupNorm::with_affine(2, 4, 1e-5, Some((w, b)), false).unwrap();
+    let (gw, gb) = gn.affine().expect("with_affine(Some(_)) ⇒ Some");
+    let mut gw = gw.try_clone().unwrap();
+    let mut gb = gb.try_clone().unwrap();
+    assert_eq!(gw.to_vec::<f32>().unwrap(), vec![2.0; 4]);
+    assert_eq!(gb.to_vec::<f32>().unwrap(), vec![1.0; 4]);
+  }
+
+  /// Coverage gap the finding flagged: the prior affine test only used
+  /// `(ones, zeros)` (an identity affine), so a broken scale/shift would
+  /// not be caught. Construct via `with_affine` with NON-identity
+  /// `weight`/`bias` and assert `forward` output is exactly
+  /// `normalized * weight + bias` (and NOT the identity `normalized`).
+  #[test]
+  fn group_norm_with_affine_non_identity_forward_applies_scale_shift() {
+    let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(1, 4)).unwrap();
+    let w = Array::from_slice::<f32>(&[2.0, 2.0, 2.0, 2.0], &(4,)).unwrap();
+    let b = Array::from_slice::<f32>(&[1.0, 1.0, 1.0, 1.0], &(4,)).unwrap();
+    // `normalized` = the pure (affine=None) normalization of `x`.
+    let plain = GroupNorm::with_affine(2, 4, 1e-5, None, false).unwrap();
+    let mut normalized = plain.forward(&x).unwrap();
+    let normalized_v = normalized.to_vec::<f32>().unwrap();
+    // `forward` with the non-identity affine.
+    let affine = GroupNorm::with_affine(
+      2,
+      4,
+      1e-5,
+      Some((w.try_clone().unwrap(), b.try_clone().unwrap())),
+      false,
+    )
+    .unwrap();
+    let mut got = affine.forward(&x).unwrap();
+    // Expected: `normalized * weight + bias`, computed independently.
+    let scaled = ops::arithmetic::multiply(&w, &normalized).unwrap();
+    let mut want = ops::arithmetic::add(&scaled, &b).unwrap();
+    assert!(vclose(
+      &got.to_vec::<f32>().unwrap(),
+      &want.to_vec::<f32>().unwrap()
+    ));
+    // Sanity: the non-identity affine actually moved the result off
+    // `normalized` (weight=2/bias=1 cannot be the identity here).
+    assert!(
+      !vclose(&got.to_vec::<f32>().unwrap(), &normalized_v),
+      "non-identity affine must change the output"
+    );
+  }
+
+  /// `with_affine` rejects a `weight` that is not exactly rank-1
+  /// `[dims]` — both a wrong length (`[dims + 1]`) and a wrong rank
+  /// (`[1, dims]`) must produce `Err(ShapeMismatch)`.
+  #[test]
+  fn group_norm_with_affine_rejects_wrong_shape_weight() {
+    let bias = Array::zeros::<f32>(&(4,)).unwrap();
+    // Wrong length: `[dims + 1]`.
+    let long_w = Array::ones::<f32>(&(5,)).unwrap();
+    let err = GroupNorm::with_affine(2, 4, 1e-5, Some((long_w, bias.try_clone().unwrap())), false)
+      .unwrap_err();
+    match err {
+      crate::error::Error::ShapeMismatch { message } => {
+        assert!(
+          message.contains("weight") && message.contains("[5]"),
+          "unexpected message: {message}"
+        );
+      }
+      other => panic!("expected ShapeMismatch, got {other:?}"),
+    }
+    // Wrong rank: `[1, dims]`.
+    let rank2_w = Array::ones::<f32>(&(1, 4)).unwrap();
+    let err = GroupNorm::with_affine(2, 4, 1e-5, Some((rank2_w, bias)), false).unwrap_err();
+    match err {
+      crate::error::Error::ShapeMismatch { message } => {
+        assert!(
+          message.contains("weight") && message.contains("[1, 4]"),
+          "unexpected message: {message}"
+        );
+      }
+      other => panic!("expected ShapeMismatch, got {other:?}"),
+    }
+  }
+
+  /// `with_affine` rejects a `bias` that is not exactly rank-1 `[dims]`
+  /// — same check as for `weight`, both wrong-length and wrong-rank.
+  #[test]
+  fn group_norm_with_affine_rejects_wrong_shape_bias() {
+    let weight = Array::ones::<f32>(&(4,)).unwrap();
+    // Wrong length: `[dims + 1]`.
+    let long_b = Array::zeros::<f32>(&(5,)).unwrap();
+    let err = GroupNorm::with_affine(
+      2,
+      4,
+      1e-5,
+      Some((weight.try_clone().unwrap(), long_b)),
+      false,
+    )
+    .unwrap_err();
+    match err {
+      crate::error::Error::ShapeMismatch { message } => {
+        assert!(
+          message.contains("bias") && message.contains("[5]"),
+          "unexpected message: {message}"
+        );
+      }
+      other => panic!("expected ShapeMismatch, got {other:?}"),
+    }
+    // Wrong rank: `[1, dims]`.
+    let rank2_b = Array::zeros::<f32>(&(1, 4)).unwrap();
+    let err = GroupNorm::with_affine(2, 4, 1e-5, Some((weight, rank2_b)), false).unwrap_err();
+    match err {
+      crate::error::Error::ShapeMismatch { message } => {
+        assert!(
+          message.contains("bias") && message.contains("[1, 4]"),
+          "unexpected message: {message}"
+        );
+      }
+      other => panic!("expected ShapeMismatch, got {other:?}"),
+    }
+  }
+
+  /// `with_affine(.., None, ..)` ⇒ `affine()` is `None` and `forward`
+  /// returns the pure normalized result (no scale, no shift).
+  #[test]
+  fn group_norm_with_affine_none_is_pure_normalization() {
+    let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(1, 4)).unwrap();
+    let gn = GroupNorm::with_affine(2, 4, 1e-5, None, false).unwrap();
+    assert!(gn.affine().is_none());
+    // `forward` must equal the default-path `group_norm` normalization.
+    let mut got = gn.forward(&x).unwrap();
+    let mut want = gn.group_norm(&x).unwrap();
+    assert!(vclose(
+      &got.to_vec::<f32>().unwrap(),
+      &want.to_vec::<f32>().unwrap()
+    ));
   }
 
   // ─── GroupNorm shape-invariant regressions (Codex review) ───
