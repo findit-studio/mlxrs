@@ -38,8 +38,11 @@
 //!    `num_tokens_per_image == 0`) errors here BEFORE any image is
 //!    loaded / preprocessed / encoded.
 //! 2. *Preprocess + encode images.* For each path in `images`,
-//!    `vlm::image::load_image(path) → preprocess(…, &model.image_processor_config())`
-//!    yields `[H, W, 3]` f32; `model.encode_image(image)` lifts each into
+//!    `vlm::image::load_image(path) → preprocess(…, image_processor_config)`
+//!    — using the caller-supplied [`crate::vlm::image::ImageProcessorConfig`]
+//!    (the loaded processor's config, mirroring mlx-vlm `generate(model,
+//!    processor, …)`), NOT one re-derived from the model — yields
+//!    `[H, W, 3]` f32; `model.encode_image(image)` lifts each into
 //!    `[N_i, D]` vision-encoder embeddings. Each `encode_image` call
 //!    is validated to return EXACTLY `[num_tokens_per_image, D]` rows
 //!    — a model with variable-per-image counts must pad/truncate
@@ -107,7 +110,7 @@ use crate::{
   },
   ops,
   vlm::{
-    image::{load_image, preprocess},
+    image::{ImageProcessorConfig, load_image, preprocess},
     model::Model,
     prompt::{MarkerPolicy, insert_image_tokens},
   },
@@ -153,13 +156,29 @@ pub struct VlmGenConfig {
 
 /// End-to-end multimodal generation Iterator.
 ///
-/// Loads each image, preprocesses it via
-/// [`Model::image_processor_config`], encodes via [`Model::encode_image`],
+/// Loads each image, preprocesses it via the caller-supplied
+/// `image_processor_config`, encodes via [`Model::encode_image`],
 /// embeds the prompt via [`Model::embed_tokens`], splices the image
 /// features into the text embeds via [`Model::merge_embeddings`], runs
 /// the prefill via [`crate::lm::model::Model::forward_embeddings`], then
 /// dispatches the per-token decode (same per-step order as
 /// [`crate::lm::generate`]) via [`crate::lm::model::Model::forward`].
+///
+/// **The image-preprocessing config is an explicit parameter, not derived
+/// from the model.** mlx-vlm's `generate` / `generate_step` take the
+/// `processor` separately from the `model` (`generate.py:1183`, `:966` —
+/// `generate(model, processor, …)`): a VLM loaded via
+/// [`crate::vlm::load::load`] returns a [`crate::vlm::load::LoadedVlmContext`]
+/// whose [`processor`](crate::vlm::load::LoadedVlmContext::processor)
+/// carries the parsed `preprocessor_config.json` /
+/// `processor_config.json`. Pass that
+/// processor's [`image_processor_config`](crate::vlm::load::Processor::image_processor_config)
+/// here so real image prompts are preprocessed with the *loaded* config —
+/// `vlm_generate` deliberately does NOT call
+/// [`Model::image_processor_config`] itself (that would silently fall back
+/// to the trait default / a stale baked-in config when a loaded processor
+/// exists). A caller that only has a model and no separate processor can
+/// still pass `&model.image_processor_config()` explicitly.
 ///
 /// Returns `impl Iterator<Item = Result<GenStep>> + 'a` — `impl` keeps the
 /// concrete iterator type unnamed (matching the LM-side
@@ -207,6 +226,7 @@ pub struct VlmGenConfig {
 /// - any per-step forward / sample failure
 pub fn vlm_generate<'a, M: Model + ?Sized>(
   model: &'a M,
+  image_processor_config: &ImageProcessorConfig,
   text_tokens: &[u32],
   images: &[PathBuf],
   cache: Vec<Box<dyn KvCache>>,
@@ -333,11 +353,23 @@ pub fn vlm_generate<'a, M: Model + ?Sized>(
   // marker-to-image misalignment (the first prompt span would consume
   // 2 rows from image 1 plus 1 row from image 2). Surface as
   // `Error::ShapeMismatch` instead.
-  let processor_cfg = model.image_processor_config();
+  //
+  // Image preprocessing uses the caller-supplied `image_processor_config`
+  // — NOT `model.image_processor_config()`. mlx-vlm's `generate` /
+  // `generate_step` receive the `processor` separately from the `model`
+  // (`generate.py:1183`, `:966` — `generate(model, processor, …)`); a VLM
+  // loaded via [`crate::vlm::load::load`] carries a `Box<dyn Processor>`
+  // whose [`crate::vlm::load::Processor::image_processor_config`] reflects
+  // the parsed `preprocessor_config.json` / `processor_config.json`. The
+  // generation entry point therefore must NOT silently re-derive the
+  // preprocessing params from the model (which would fall back to the
+  // trait default / a stale baked-in config); the caller passes the
+  // processor's config explicitly. A caller that only has a model can
+  // still pass `&model.image_processor_config()`.
   let mut image_slabs: Vec<Array> = try_with_capacity(images.len())?;
   for (idx, path) in images.iter().enumerate() {
     let img = load_image(path)?;
-    let pre = preprocess(&img, &processor_cfg)?;
+    let pre = preprocess(&img, image_processor_config)?;
     let encoded = model.encode_image(&pre)?;
     let enc_shape = encoded.shape();
     let (rows, _d) = match enc_shape.as_slice() {

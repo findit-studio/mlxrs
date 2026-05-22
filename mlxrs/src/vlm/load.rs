@@ -1591,7 +1591,10 @@ mod tests {
       marker_policy: MarkerPolicy::Required,
     };
     let prompt = [0_u32, 1, 2];
-    let steps = vlm_generate(&*ctx.model, &prompt, &[], Vec::new(), cfg)
+    // mlx-vlm `generate(model, processor, …)` — the image-processor config is
+    // supplied separately; the loaded processor carries the parsed config.
+    let img_cfg = ctx.processor.image_processor_config();
+    let steps = vlm_generate(&*ctx.model, &img_cfg, &prompt, &[], Vec::new(), cfg)
       .expect("vlm_generate constructs against the loaded trait-object model");
 
     let tokens: Vec<u32> = steps
@@ -1601,6 +1604,199 @@ mod tests {
     // works for the trait-object output. (Greedy argmax of all-zero logits
     // is the lowest index, 0.)
     assert_eq!(tokens, vec![0_u32, 0, 0, 0]);
+  }
+
+  #[test]
+  fn loaded_processor_config_drives_image_preprocessing_not_model_default() {
+    // Codex review (load↔generate gap, [high]): `vlm_generate` must
+    // preprocess real image prompts with the *loaded* processor's
+    // `ImageProcessorConfig` — the one parsed from
+    // `preprocessor_config.json` / `processor_config.json` and carried on
+    // `LoadedVlmContext.processor` — NOT one re-derived from the model via
+    // `Model::image_processor_config()` (which falls back to the trait
+    // default / a stale baked-in config). mlx-vlm's `generate(model,
+    // processor, …)` takes the processor separately for exactly this
+    // reason; `vlm_generate` now mirrors that with an explicit
+    // `image_processor_config` parameter.
+    //
+    // This test wires the divergence concretely: the loaded processor
+    // config's image size (48×48, parsed off the processor JSON by the
+    // mock processor) DIFFERS from the model default (224×224). It loads
+    // a VLM via `load()`, drives `vlm_generate` on the loaded model with
+    // the loaded processor's config + one real image, and asserts the
+    // model's `encode_image` saw a `[48, 48, 3]` preprocessed array —
+    // proof the LOADED config (not the 224×224 model default) drove
+    // preprocessing. Before the fix this preprocessed to `[224, 224, 3]`.
+    use std::sync::{Arc, Mutex};
+
+    // A VLM model whose `encode_image` records the shape of the
+    // (preprocessed) array it receives, so the test can read back what
+    // size `preprocess` resized to. `embed_tokens` / `forward` /
+    // `forward_embeddings` are minimal but real so the full multimodal
+    // prefill+decode path runs. `image_processor_config` is left as the
+    // trait default (224×224) — the value that MUST NOT be used.
+    struct RecordingVlmModel {
+      /// Set once by `encode_image` to the preprocessed input's shape.
+      seen_image_shape: Arc<Mutex<Option<Vec<usize>>>>,
+    }
+    impl LmModel for RecordingVlmModel {
+      fn forward(&self, tokens: &Array, _c: &mut [Box<dyn KvCache>]) -> Result<Array> {
+        let (b, s) = match tokens.shape().as_slice() {
+          [b, s] => (*b, *s),
+          [s] => (1, *s),
+          other => {
+            return Err(Error::ShapeMismatch {
+              message: format!("RecordingVlmModel::forward expects [B, S], got {other:?}"),
+            });
+          }
+        };
+        // `[B, S, vocab=5]` zero logits — greedy argmax is token id 0.
+        Array::from_slice::<f32>(&vec![0.0_f32; b * s * 5], &(b, s, 5usize))
+      }
+      fn forward_embeddings(
+        &self,
+        embeddings: &Array,
+        _c: &mut [Box<dyn KvCache>],
+      ) -> Result<Array> {
+        // `[1, T, D]` merged embeds → `[1, T, vocab=5]` zero logits.
+        let (b, t) = match embeddings.shape().as_slice() {
+          [b, t, _d] => (*b, *t),
+          other => {
+            return Err(Error::ShapeMismatch {
+              message: format!(
+                "RecordingVlmModel::forward_embeddings expects [B, T, D], got {other:?}"
+              ),
+            });
+          }
+        };
+        Array::from_slice::<f32>(&vec![0.0_f32; b * t * 5], &(b, t, 5usize))
+      }
+    }
+    impl crate::vlm::model::Model for RecordingVlmModel {
+      fn embed_tokens(&self, tokens: &Array) -> Result<Array> {
+        let (b, t) = match tokens.shape().as_slice() {
+          [b, t] => (*b, *t),
+          other => {
+            return Err(Error::ShapeMismatch {
+              message: format!("RecordingVlmModel::embed_tokens expects [B, T], got {other:?}"),
+            });
+          }
+        };
+        // hidden_size = 8, matching `encode_image`'s D below.
+        Array::from_slice::<f32>(&vec![0.0_f32; b * t * 8], &(b, t, 8usize))
+      }
+      fn encode_image(&self, image: &Array) -> Result<Array> {
+        // Record the preprocessed image shape — this is the observable
+        // proof of which `ImageProcessorConfig` drove `preprocess`.
+        *self.seen_image_shape.lock().unwrap() = Some(image.shape());
+        // `[num_tokens_per_image = 1, D = 8]` features (one row per image,
+        // satisfying `vlm_generate`'s `[num_tokens_per_image, D]` check).
+        Array::from_slice::<f32>(&[0.0_f32; 8], &(1usize, 8usize))
+      }
+    }
+
+    let recorded: Arc<Mutex<Option<Vec<usize>>>> = Arc::new(Mutex::new(None));
+    // The model constructor captures a clone of the recording handle so
+    // the test can read back `encode_image`'s input AFTER `load()` has
+    // boxed the model into the `LoadedVlmContext`.
+    let model_registry = {
+      let recorded = Arc::clone(&recorded);
+      VlmTypeRegistry::new().with(
+        "recordingvlm",
+        Box::new(
+          move |loaded: &LoadedVlmModel| -> Result<Box<dyn VlmModel>> {
+            assert!(
+              !loaded.weights.is_empty(),
+              "constructor should receive the loaded weights"
+            );
+            Ok(Box::new(RecordingVlmModel {
+              seen_image_shape: Arc::clone(&recorded),
+            }))
+          },
+        ),
+      )
+    };
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", mock_processor_constructor());
+
+    // Processor config image size = 48 (≠ the 224×224 model default).
+    let dir = fresh_dir("loaded-proc-drives-preprocess");
+    write_vlm_dir(
+      &dir,
+      "recordingvlm",
+      "preprocessor_config.json",
+      "MockProc",
+      48,
+    );
+    let config = VlmModelConfiguration::from_directory(&dir);
+    let ctx = load(&config, &model_registry, &processor_registry).expect("load should succeed");
+
+    // Sanity: the loaded processor's config carries the 48×48 size parsed
+    // off the JSON, and it differs from the model's (default) 224×224.
+    let loaded_img_cfg = ctx.processor.image_processor_config();
+    assert_eq!(loaded_img_cfg.size, (48, 48));
+    assert_eq!(
+      crate::vlm::model::Model::image_processor_config(ctx.model.as_ref()).size,
+      (224, 224),
+      "the recording model uses the trait-default 224×224 — the value that must NOT drive preprocessing"
+    );
+
+    // A real PNG `vlm::image::load_image` can decode (size irrelevant —
+    // `preprocess` resizes to the config's `size`).
+    let img_path = dir.join("prompt.png");
+    let mut buf = ::image::RgbImage::new(10, 7);
+    for y in 0..7 {
+      for x in 0..10 {
+        buf.put_pixel(x, y, ::image::Rgb([(x * 20) as u8, (y * 30) as u8, 64]));
+      }
+    }
+    ::image::DynamicImage::ImageRgb8(buf)
+      .save_with_format(&img_path, ::image::ImageFormat::Png)
+      .unwrap();
+
+    // Drive `vlm_generate` on the LOADED model with the LOADED processor's
+    // config + one image. marker=image_token=99, num_tokens_per_image=1.
+    let cfg = VlmGenConfig {
+      lm: GenConfig {
+        max_tokens: 2,
+        ..Default::default()
+      },
+      image_token_id: 99,
+      image_marker_id: None,
+      num_tokens_per_image: 1,
+      marker_policy: MarkerPolicy::Required,
+    };
+    let prompt = [0_u32, 99, 1]; // one marker → one image
+    let steps = vlm_generate(
+      &*ctx.model,
+      &loaded_img_cfg,
+      &prompt,
+      std::slice::from_ref(&img_path),
+      Vec::new(),
+      cfg,
+    )
+    .expect("vlm_generate constructs against the loaded model + loaded processor config");
+    // Drain so the eager vision pipeline (load → preprocess → encode_image)
+    // has definitely run.
+    let tokens: Vec<u32> = steps
+      .map(|s| s.expect("each generation step succeeds").token)
+      .collect();
+    assert_eq!(tokens, vec![0_u32, 0]);
+
+    // THE ASSERTION: `encode_image` saw a `[48, 48, 3]` array — the loaded
+    // processor config's size drove `preprocess`, NOT the model's 224×224
+    // default. (`preprocess` emits channel-last `[H, W, 3]`.)
+    let seen = recorded
+      .lock()
+      .unwrap()
+      .clone()
+      .expect("encode_image must have run on the single image prompt");
+    assert_eq!(
+      seen,
+      vec![48, 48, 3],
+      "image preprocessing must use the loaded processor config's size (48×48), \
+       not the model's default 224×224"
+    );
   }
 
   #[test]
