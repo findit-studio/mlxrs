@@ -15,8 +15,9 @@
 use mlxrs::{
   Array, Dtype, Error,
   vlm::image::{
-    ColorOrder, ImageProcessorConfig, ResizeFilter, image_to_array, load_image, normalize_imagenet,
-    patchify, preprocess, rescale, resize,
+    ColorOrder, ImageProcessorConfig, ResizeFilter, center_crop, image_to_array, load_image,
+    normalize, normalize_imagenet, pad_to_square, patchify, preprocess, rescale, resize,
+    resize_lanczos,
   },
 };
 
@@ -119,6 +120,13 @@ fn image_to_array_rgb_vs_bgr_swap() {
 fn image_to_array_drops_alpha_from_rgba() {
   // 1x1 RGBA pixel with non-trivial alpha; alpha must be dropped (per
   // swift `MediaProcessing.swift:187` `array[..., :3]`).
+  //
+  // Regression for Codex review (high): with the prior
+  // `img.to_rgb8()` clone removed, this test now exercises the
+  // non-`Rgb8` per-pixel `dynamic_image_rgb_pixel` projection rather
+  // than the fast `as_rgb8()` path. The expected `[R, G, B]` triple
+  // is unchanged because the projection is byte-equivalent to
+  // `to_rgb8()` on `Rgba8` inputs (`Rgba.to_rgb()` drops alpha).
   let mut buf = ::image::RgbaImage::new(1, 1);
   buf.put_pixel(0, 0, ::image::Rgba([11, 22, 33, 44]));
   let img = ::image::DynamicImage::ImageRgba8(buf);
@@ -126,6 +134,75 @@ fn image_to_array_drops_alpha_from_rgba() {
   assert_eq!(arr.shape(), vec![1, 1, 3], "alpha channel dropped");
   let v: Vec<f32> = arr.to_vec().unwrap();
   assert!(vclose(&v, &[11.0, 22.0, 33.0]));
+}
+
+#[test]
+fn image_to_array_luma8_broadcasts_grey_across_rgb() {
+  // Regression for Codex review (high): the non-`Rgb8` per-pixel
+  // path replaces the prior infallible `img.to_rgb8()` clone.
+  // Luma8 sources must broadcast the grey value across all three
+  // RGB channels — identical projection to what `to_rgb8()` did
+  // (image-rs's `Luma::to_rgb()` returns `(L, L, L)`).
+  let mut buf = ::image::GrayImage::new(2, 2);
+  buf.put_pixel(0, 0, ::image::Luma([10]));
+  buf.put_pixel(1, 0, ::image::Luma([50]));
+  buf.put_pixel(0, 1, ::image::Luma([100]));
+  buf.put_pixel(1, 1, ::image::Luma([200]));
+  let img = ::image::DynamicImage::ImageLuma8(buf);
+  let mut arr = image_to_array(&img, ColorOrder::Rgb).unwrap();
+  assert_eq!(arr.shape(), vec![2, 2, 3]);
+  let v: Vec<f32> = arr.to_vec().unwrap();
+  // Row-major (H=2, W=2, 3): pixel (x, y) at index `(y * W + x) * 3 + c`.
+  // Each grey value broadcasts across (R, G, B).
+  assert!(
+    vclose(
+      &v,
+      &[
+        10.0, 10.0, 10.0, // (0, 0)
+        50.0, 50.0, 50.0, // (1, 0)
+        100.0, 100.0, 100.0, // (0, 1)
+        200.0, 200.0, 200.0, // (1, 1)
+      ],
+    ),
+    "got {v:?}",
+  );
+}
+
+#[test]
+fn image_to_array_luma8_bgr_path_still_broadcasts_grey() {
+  // BGR on a Luma8 source: since L → (L, L, L), the channel swap is
+  // a no-op. Verifies the non-`Rgb8` branch handles `ColorOrder::Bgr`
+  // correctly (the per-pixel match arms).
+  let mut buf = ::image::GrayImage::new(1, 2);
+  buf.put_pixel(0, 0, ::image::Luma([77]));
+  buf.put_pixel(0, 1, ::image::Luma([200]));
+  let img = ::image::DynamicImage::ImageLuma8(buf);
+  let mut arr = image_to_array(&img, ColorOrder::Bgr).unwrap();
+  assert_eq!(arr.shape(), vec![2, 1, 3]);
+  let v: Vec<f32> = arr.to_vec().unwrap();
+  assert!(
+    vclose(&v, &[77.0, 77.0, 77.0, 200.0, 200.0, 200.0]),
+    "got {v:?}",
+  );
+}
+
+#[test]
+fn image_to_array_rgba8_bgr_swaps_channels_drops_alpha() {
+  // RGBA → BGR via the per-pixel non-`Rgb8` path. Alpha is dropped
+  // and the remaining R/G/B is swapped to B/G/R. Verifies the
+  // per-pixel `ColorOrder::Bgr` arm in the non-`Rgb8` branch.
+  let mut buf = ::image::RgbaImage::new(2, 1);
+  buf.put_pixel(0, 0, ::image::Rgba([10, 20, 30, 99]));
+  buf.put_pixel(1, 0, ::image::Rgba([40, 50, 60, 88]));
+  let img = ::image::DynamicImage::ImageRgba8(buf);
+  let mut arr = image_to_array(&img, ColorOrder::Bgr).unwrap();
+  assert_eq!(arr.shape(), vec![1, 2, 3]);
+  let v: Vec<f32> = arr.to_vec().unwrap();
+  // BGR (alpha dropped): (B=30, G=20, R=10) then (60, 50, 40).
+  assert!(
+    vclose(&v, &[30.0, 20.0, 10.0, 60.0, 50.0, 40.0]),
+    "got {v:?}",
+  );
 }
 
 #[test]
@@ -531,11 +608,14 @@ fn imageprocessor_config_default_is_imagenet() {
 #[test]
 fn load_image_decodes_png_round_trip() {
   // Encode a small synthetic image as PNG into a tempfile, then
-  // load_image it back and assert the decoded dimensions match. PNG
-  // does not carry EXIF orientation, so `decoder.orientation()` returns
-  // `Orientation::NoTransforms` and `apply_orientation` is a no-op —
-  // this verifies the new `ImageReader` + orientation pipeline is a
-  // clean drop-in for the common non-rotating case.
+  // load_image it back and assert the decoded dimensions match. This
+  // synthetic PNG carries no EXIF orientation metadata (image-rs 0.25
+  // PNG decoders CAN expose EXIF orientation via `exif_metadata` —
+  // see the `load_image` doc — but our `synthetic_image` builder
+  // doesn't write one), so `decoder.orientation()` returns
+  // `Orientation::NoTransforms` and `apply_orientation_fallible` is a
+  // no-op here — this verifies the `ImageReader` + orientation
+  // pipeline is a clean drop-in for the common non-rotating case.
   let img = synthetic_image(5, 7); // 5 wide, 7 tall
   let dir = std::env::temp_dir().join(format!("mlxrs-vlm-image-test-{}", std::process::id(),));
   std::fs::create_dir_all(&dir).unwrap();
@@ -559,4 +639,454 @@ fn load_image_nonexistent_path_returns_err() {
   ));
   let err = load_image(&path).unwrap_err();
   assert!(matches!(err, Error::Backend { .. }), "got {err:?}");
+}
+
+// ---------- resize_lanczos ----------
+
+#[test]
+fn resize_lanczos_target_dimensions() {
+  // 8x6 source → 16x32 target via Lanczos3. Argument order is
+  // (target_h, target_w) matching the python image-processor
+  // convention; output width/height must match exactly.
+  let img = synthetic_image(8, 6);
+  let out = resize_lanczos(&img, 16, 32);
+  assert_eq!(out.width(), 32);
+  assert_eq!(out.height(), 16);
+}
+
+#[test]
+fn resize_lanczos_equivalent_to_resize_with_lanczos3_filter() {
+  // resize_lanczos is documented as a thin wrapper around
+  // resize(..., Lanczos3) — byte-for-byte output equality is the
+  // strongest assertion of that contract.
+  let img = synthetic_image(12, 10);
+  let a = resize_lanczos(&img, 8, 16);
+  let b = resize(&img, (8, 16), ResizeFilter::Lanczos3);
+  assert_eq!(a.to_rgba8().into_raw(), b.to_rgba8().into_raw());
+}
+
+#[test]
+fn resize_lanczos_smooth_on_constant_input_preserves_value() {
+  // Lanczos3 on a constant-color input must reproduce the constant
+  // (up to small floating-point error) at every output pixel — the
+  // sinc kernel sums to 1, so any value `c` survives. Use a
+  // mid-grey RGB pixel; check that downsample-then-upsample stays
+  // tightly bounded near the source value.
+  let mut buf = ::image::RgbImage::new(8, 8);
+  for y in 0..8 {
+    for x in 0..8 {
+      buf.put_pixel(x, y, ::image::Rgb([128, 64, 200]));
+    }
+  }
+  let img = ::image::DynamicImage::ImageRgb8(buf);
+  let out = resize_lanczos(&img, 4, 4);
+  assert_eq!(out.width(), 4);
+  assert_eq!(out.height(), 4);
+  // Every output pixel should land within 1 LSB of the source value
+  // — Lanczos3 on a constant-color image is exact up to integer
+  // rounding (rounding bias at the edge of the kernel may shift by
+  // at most 1 byte).
+  let rgba = out.to_rgba8();
+  for px in rgba.pixels() {
+    let [r, g, b, _] = px.0;
+    assert!(r.abs_diff(128) <= 1, "R={r} expected ~128");
+    assert!(g.abs_diff(64) <= 1, "G={g} expected ~64");
+    assert!(b.abs_diff(200) <= 1, "B={b} expected ~200");
+  }
+}
+
+// ---------- center_crop ----------
+
+#[test]
+fn center_crop_4x4_to_2x2_returns_center_pixels() {
+  // Hand-traced: source = 4x4 with pixel (x, y) = (10*x + y, 0, 0).
+  // The center 2x2 crop is rows y=1..3, cols x=1..3, so the cropped
+  // R values are:
+  //   (1, 1)=11  (2, 1)=21
+  //   (1, 2)=12  (2, 2)=22
+  let mut buf = ::image::RgbImage::new(4, 4);
+  for y in 0..4 {
+    for x in 0..4 {
+      buf.put_pixel(x, y, ::image::Rgb([(10 * x + y) as u8, 0, 0]));
+    }
+  }
+  let img = ::image::DynamicImage::ImageRgb8(buf);
+  let out = center_crop(&img, 2, 2);
+  assert_eq!(out.width(), 2);
+  assert_eq!(out.height(), 2);
+  let rgb = out.to_rgb8();
+  // Row-major: (0, 0)=11, (1, 0)=21, (0, 1)=12, (1, 1)=22.
+  assert_eq!(rgb.get_pixel(0, 0).0, [11, 0, 0]);
+  assert_eq!(rgb.get_pixel(1, 0).0, [21, 0, 0]);
+  assert_eq!(rgb.get_pixel(0, 1).0, [12, 0, 0]);
+  assert_eq!(rgb.get_pixel(1, 1).0, [22, 0, 0]);
+}
+
+#[test]
+fn center_crop_source_smaller_returns_source_unchanged() {
+  // Swift `rectSmallerOrEqual` early-return: a 4x4 source asked for
+  // an 8x8 crop returns the original image untouched. We check
+  // dimensions + a sample pixel.
+  let img = synthetic_image(4, 4);
+  let out = center_crop(&img, 8, 8);
+  assert_eq!(out.width(), 4);
+  assert_eq!(out.height(), 4);
+  // synthetic_image: pixel (x, y) = (10*y, 10*x, 100).
+  assert_eq!(out.to_rgb8().get_pixel(2, 3).0, [30, 20, 100]);
+}
+
+#[test]
+fn center_crop_one_axis_smaller_clamps_and_crops_bigger_axis() {
+  // Mirrors swift `rectSmallerOrEqual` + `centerCrop`'s `min(source,
+  // target)` clamp (`MediaProcessing.swift:201-210`): when only one
+  // axis exceeds the target, `crop_w = min(source_w, target_w)`,
+  // `crop_h = min(source_h, target_h)`, and the bigger axis is
+  // center-cropped. Source `(w=4, h=8)`, target `(target_h=4,
+  // target_w=6)` → `crop_w = min(4, 6) = 4`, `crop_h = min(8, 4) = 4`,
+  // y-offset = `(8 - 4) / 2 = 2` → output 4x4 taken from y=2..6.
+  let img = synthetic_image(4, 8);
+  let out = center_crop(&img, 4, 6);
+  assert_eq!(out.width(), 4);
+  assert_eq!(out.height(), 4);
+  // synthetic_image: pixel (x, y) = (10*y, 10*x, 100). The cropped
+  // window starts at y=2, so out's (0, 0) pixel is the source's
+  // (0, 2) = (20, 0, 100).
+  assert_eq!(out.to_rgb8().get_pixel(0, 0).0, [20, 0, 100]);
+  assert_eq!(out.to_rgb8().get_pixel(3, 3).0, [50, 30, 100]); // src (3, 5)
+}
+
+#[test]
+fn center_crop_height_only_larger_crops_height_keeps_width() {
+  // Regression for Codex Finding 1 (OR-bug): a source whose width
+  // exactly equals `target_w` but whose height exceeds `target_h`
+  // must still crop the height. Pre-fix code returned the source
+  // unchanged because `w <= target_w` short-circuited the OR.
+  //
+  // Source `(w=2, h=8)`, target `(target_h=4, target_w=2)` →
+  // `crop_w = min(2, 2) = 2`, `crop_h = min(8, 4) = 4`,
+  // y-offset = `(8 - 4) / 2 = 2` → output 2 (W) x 4 (H).
+  let img = synthetic_image(2, 8);
+  let out = center_crop(&img, 4, 2);
+  assert_eq!(out.width(), 2);
+  assert_eq!(out.height(), 4);
+  // synthetic_image: pixel (x, y) = (10*y, 10*x, 100). Cropped window
+  // starts at y=2 → out's (0, 0) is source (0, 2) = (20, 0, 100).
+  let rgb = out.to_rgb8();
+  assert_eq!(rgb.get_pixel(0, 0).0, [20, 0, 100]);
+  assert_eq!(rgb.get_pixel(1, 0).0, [20, 10, 100]); // src (1, 2)
+  assert_eq!(rgb.get_pixel(0, 3).0, [50, 0, 100]); // src (0, 5)
+  assert_eq!(rgb.get_pixel(1, 3).0, [50, 10, 100]); // src (1, 5)
+}
+
+// ---------- pad_to_square ----------
+
+#[test]
+fn pad_to_square_4x2_with_black_fill_produces_4x4_with_pad_rows() {
+  // Source = 4 wide × 2 tall, R-channel = 10*x at every y.
+  // (long - short) / 2 = (4 - 2) / 2 = 1 row of fill on top, 1 on
+  // bottom. Result: 4x4 with rows 0 and 3 filled, rows 1 and 2 the
+  // source.
+  let mut buf = ::image::RgbImage::new(4, 2);
+  for y in 0..2 {
+    for x in 0..4 {
+      buf.put_pixel(x, y, ::image::Rgb([(10 * x) as u8, 200, 50]));
+    }
+  }
+  let img = ::image::DynamicImage::ImageRgb8(buf);
+  let out = pad_to_square(img, [0, 0, 0]).unwrap();
+  assert_eq!(out.width(), 4);
+  assert_eq!(out.height(), 4);
+  let rgb = out.to_rgb8();
+  // Top pad row.
+  for x in 0..4 {
+    assert_eq!(
+      rgb.get_pixel(x, 0).0,
+      [0, 0, 0],
+      "row 0 must be fill; x={x}"
+    );
+  }
+  // Source rows at y=1 and y=2.
+  for y in 1..3 {
+    for x in 0..4 {
+      assert_eq!(
+        rgb.get_pixel(x, y).0,
+        [(10 * x) as u8, 200, 50],
+        "source row y={y} x={x}"
+      );
+    }
+  }
+  // Bottom pad row.
+  for x in 0..4 {
+    assert_eq!(
+      rgb.get_pixel(x, 3).0,
+      [0, 0, 0],
+      "row 3 must be fill; x={x}"
+    );
+  }
+}
+
+#[test]
+fn pad_to_square_2x4_pads_left_and_right() {
+  // Source = 2 wide × 4 tall, asymmetric R channel. Pad symmetric on
+  // the x axis: 1 col fill, 2 cols source, 1 col fill.
+  let mut buf = ::image::RgbImage::new(2, 4);
+  for y in 0..4 {
+    for x in 0..2 {
+      buf.put_pixel(x, y, ::image::Rgb([(10 * x + y) as u8, 1, 2]));
+    }
+  }
+  let img = ::image::DynamicImage::ImageRgb8(buf);
+  let out = pad_to_square(img, [255, 128, 64]).unwrap();
+  assert_eq!(out.width(), 4);
+  assert_eq!(out.height(), 4);
+  let rgb = out.to_rgb8();
+  // Pad columns.
+  for y in 0..4 {
+    assert_eq!(rgb.get_pixel(0, y).0, [255, 128, 64]);
+    assert_eq!(rgb.get_pixel(3, y).0, [255, 128, 64]);
+  }
+  // Source columns x=1..3 → source x=0..2 (offset by x_off=1).
+  for y in 0..4 {
+    for x_src in 0..2u32 {
+      assert_eq!(
+        rgb.get_pixel(1 + x_src, y).0,
+        [(10 * x_src + y) as u8, 1, 2],
+      );
+    }
+  }
+}
+
+#[test]
+fn pad_to_square_already_square_returns_input_unchanged() {
+  // No alloc / no padding when w == h; the by-value signature returns
+  // the input `DynamicImage` directly (no `clone()` — see the
+  // signature doc for why `Clone` would re-introduce a panic-abort
+  // on near-budget inputs). Output dims and a sample pixel must
+  // match the source.
+  let img = synthetic_image(4, 4);
+  let out = pad_to_square(img, [99, 99, 99]).unwrap();
+  assert_eq!(out.width(), 4);
+  assert_eq!(out.height(), 4);
+  // synthetic_image pixel (2, 3) = (10*3, 10*2, 100) = (30, 20, 100).
+  assert_eq!(out.to_rgb8().get_pixel(2, 3).0, [30, 20, 100]);
+}
+
+#[test]
+fn pad_to_square_odd_difference_extra_row_on_bottom() {
+  // Source = 3 wide × 2 tall. (long - short) = 1 → integer floor
+  // puts 0 rows on top, 1 row of pad on the bottom (matching python
+  // `Image.new(...).paste(img, (0, 0))` with the source at the top
+  // when (width - height) // 2 == 0).
+  let mut buf = ::image::RgbImage::new(3, 2);
+  for y in 0..2 {
+    for x in 0..3 {
+      buf.put_pixel(x, y, ::image::Rgb([(x + 10 * y) as u8, 7, 8]));
+    }
+  }
+  let img = ::image::DynamicImage::ImageRgb8(buf);
+  let out = pad_to_square(img, [42, 43, 44]).unwrap();
+  assert_eq!((out.width(), out.height()), (3, 3));
+  let rgb = out.to_rgb8();
+  // Source at rows 0 and 1, pad row at row 2.
+  for y in 0..2 {
+    for x in 0..3 {
+      assert_eq!(
+        rgb.get_pixel(x, y).0,
+        [(x + 10 * y) as u8, 7, 8],
+        "source y={y} x={x}",
+      );
+    }
+  }
+  for x in 0..3 {
+    assert_eq!(rgb.get_pixel(x, 2).0, [42, 43, 44], "pad row x={x}");
+  }
+}
+
+#[test]
+fn pad_to_square_rejects_oversized_canvas() {
+  // Regression for Codex Finding 2 (quadratic alloc OOM): a 100_000 x 1
+  // source would drive a 100_000² × 3 ≈ 30 GiB canvas — the prior
+  // infallible `RgbImage::from_pixel(size, size, ...)` would
+  // vec-overflow / OOM-abort the process. The fallible signature
+  // must surface this as a recoverable `Error::ShapeMismatch`,
+  // bounded by `MAX_DECODED_IMAGE_BYTES` (matches `load_image`'s 512
+  // MiB ceiling).
+  //
+  // The source itself is only 100_000 × 1 × 3 = ~300 KiB (fine to
+  // allocate as the test fixture). Only the would-be `pad_to_square`
+  // output trips the bound.
+  let img = ::image::DynamicImage::ImageRgb8(::image::RgbImage::new(100_000, 1));
+  let err = pad_to_square(img, [0, 0, 0]).expect_err("oversized canvas must be rejected");
+  match err {
+    Error::ShapeMismatch { message } => {
+      assert!(
+        message.contains("pad_to_square") && message.contains("MAX_DECODED_IMAGE_BYTES"),
+        "expected ShapeMismatch mentioning the budget; got: {message}"
+      );
+    }
+    other => panic!("expected ShapeMismatch, got {other:?}"),
+  }
+}
+
+#[test]
+fn pad_to_square_near_budget_nonsquare_no_second_source_copy() {
+  // Regression for Codex Finding (high): the prior `img.to_rgb8()` call
+  // inside the nonsquare branch materialized a *second* source-sized
+  // RGB buffer infallibly. A near-budget nonsquare RGB input
+  // (e.g. 13377 × 13376) would pass the `MAX_DECODED_IMAGE_BYTES`
+  // canvas gate, fallibly reserve the ~512 MiB canvas, then
+  // panic-abort on the second ~512 MiB `to_rgb8` clone the canvas
+  // gate doesn't cover.
+  //
+  // We exercise the same code path (already-`Rgb8` source → row-wise
+  // `copy_from_slice` fast path inside `pad_to_square`) with a much
+  // smaller proxy so CI doesn't actually allocate hundreds of MiB.
+  // The 4097 × 4096 = 1px-shorter-than-square shape lands the source
+  // in the `w > h` branch and the canvas at
+  // `4097 * 4097 * 3 ≈ 48 MiB` — well under the budget but big
+  // enough to exercise both the canvas alloc and the per-row
+  // `copy_from_slice` path. The check that matters: the call returns
+  // either `Ok(_)` or a recoverable `Err`, NOT a panic / abort.
+  let mut buf = ::image::RgbImage::new(4097, 4096);
+  // Sparse marker pixels (corners + center of the source region) —
+  // a full per-pixel fill would dominate the test budget and isn't
+  // necessary for verifying the copy path.
+  buf.put_pixel(0, 0, ::image::Rgb([1, 2, 3]));
+  buf.put_pixel(4096, 0, ::image::Rgb([4, 5, 6]));
+  buf.put_pixel(0, 4095, ::image::Rgb([7, 8, 9]));
+  buf.put_pixel(4096, 4095, ::image::Rgb([10, 11, 12]));
+  let img = ::image::DynamicImage::ImageRgb8(buf);
+  // If this panics / aborts the process we'd never reach the
+  // assertions — `cargo test` would surface the abort as a failed
+  // test. `Ok` is the expected path under the 48 MiB budget; the
+  // assertion guards the alternate-OOM case so a transient allocator
+  // failure on CI does not silently no-op the regression coverage.
+  let out = pad_to_square(img, [128, 128, 128])
+    .expect("near-budget nonsquare path must return Ok or recoverable Err, never abort");
+  // w > h → padding on the y axis; size = max(4097, 4096) = 4097.
+  // y_off = (4097 - 4096) / 2 = 0 (integer floor — top edge stays
+  // at 0 rows of fill, bottom edge gets the extra row).
+  assert_eq!((out.width(), out.height()), (4097, 4097));
+  let rgb = out.to_rgb8();
+  // Source corners must land at their src coords (y_off = 0,
+  // x_off = 0).
+  assert_eq!(rgb.get_pixel(0, 0).0, [1, 2, 3], "src TL");
+  assert_eq!(rgb.get_pixel(4096, 0).0, [4, 5, 6], "src TR");
+  assert_eq!(rgb.get_pixel(0, 4095).0, [7, 8, 9], "src BL");
+  assert_eq!(rgb.get_pixel(4096, 4095).0, [10, 11, 12], "src BR");
+  // Bottom pad row (y = 4096) must be the uniform fill.
+  assert_eq!(rgb.get_pixel(0, 4096).0, [128, 128, 128], "pad row TL");
+  assert_eq!(rgb.get_pixel(4096, 4096).0, [128, 128, 128], "pad row TR");
+}
+
+#[test]
+fn pad_to_square_non_rgb8_source_produces_rgb_output() {
+  // Regression for Codex Finding (high): the per-pixel non-`Rgb8`
+  // branch must produce correct RGB output without ever calling the
+  // infallible `to_rgb8()` clone. Cover both Luma8 (grey →
+  // broadcast across R/G/B) and Rgba8 (alpha → dropped, R/G/B
+  // preserved) — the two non-`Rgb8` variants `image_to_array`
+  // already accepts upstream.
+
+  // --- Luma8: 3 wide × 2 tall, grey ramp by column. Pad rows on
+  //     top/bottom to a 3x3 square.
+  let mut luma = ::image::GrayImage::new(3, 2);
+  for y in 0..2 {
+    for x in 0..3 {
+      luma.put_pixel(x, y, ::image::Luma([(10 * x + y) as u8]));
+    }
+  }
+  let img_luma = ::image::DynamicImage::ImageLuma8(luma);
+  let out = pad_to_square(img_luma, [200, 200, 200]).unwrap();
+  assert_eq!((out.width(), out.height()), (3, 3));
+  let rgb = out.to_rgb8();
+  // y_off = (3 - 2) / 2 = 0 → source occupies rows 0..2, fill at
+  // row 2. Each source pixel must broadcast the grey value across
+  // all 3 RGB channels.
+  for y in 0..2 {
+    for x in 0..3 {
+      let g = (10 * x + y) as u8;
+      assert_eq!(
+        rgb.get_pixel(x, y).0,
+        [g, g, g],
+        "luma broadcast y={y} x={x}",
+      );
+    }
+  }
+  for x in 0..3 {
+    assert_eq!(rgb.get_pixel(x, 2).0, [200, 200, 200], "luma pad x={x}");
+  }
+
+  // --- Rgba8: 2 wide × 4 tall with an alpha gradient. The alpha
+  //     must be dropped; R/G/B preserved.
+  let mut rgba = ::image::RgbaImage::new(2, 4);
+  for y in 0..4 {
+    for x in 0..2 {
+      rgba.put_pixel(
+        x,
+        y,
+        ::image::Rgba([(10 * x + y) as u8, 50, 100, ((y * 60) % 256) as u8]),
+      );
+    }
+  }
+  let img_rgba = ::image::DynamicImage::ImageRgba8(rgba);
+  let out = pad_to_square(img_rgba, [77, 88, 99]).unwrap();
+  assert_eq!((out.width(), out.height()), (4, 4));
+  let rgb = out.to_rgb8();
+  // x_off = (4 - 2) / 2 = 1; source columns land at x=1..3, pad at
+  // x=0 and x=3. Alpha must be dropped; R/G/B preserved.
+  for y in 0..4 {
+    assert_eq!(rgb.get_pixel(0, y).0, [77, 88, 99], "rgba pad L y={y}");
+    assert_eq!(rgb.get_pixel(3, y).0, [77, 88, 99], "rgba pad R y={y}");
+    for x_src in 0..2u32 {
+      assert_eq!(
+        rgb.get_pixel(1 + x_src, y).0,
+        [(10 * x_src + y) as u8, 50, 100],
+        "rgba src y={y} x_src={x_src} (alpha must be dropped)",
+      );
+    }
+  }
+}
+
+// ---------- normalize (alias + standalone) ----------
+
+#[test]
+fn normalize_hand_computed_1x1x3() {
+  // Tiny 1x1x3 array: x = [3.0, 5.0, 7.0]; mean = [1.0, 2.0, 3.0];
+  // std = [2.0, 1.0, 0.5]. Expected (x - mean) / std =
+  //   (3-1)/2 = 1.0,  (5-2)/1 = 3.0,  (7-3)/0.5 = 8.0.
+  let arr = Array::from_slice(&[3.0_f32, 5.0, 7.0], &(1usize, 1, 3)).unwrap();
+  let mean = [1.0_f32, 2.0, 3.0];
+  let std = [2.0_f32, 1.0, 0.5];
+  let mut out = normalize(&arr, &mean, &std).unwrap();
+  let v: Vec<f32> = out.to_vec().unwrap();
+  assert!(vclose(&v, &[1.0, 3.0, 8.0]), "got {v:?}");
+}
+
+#[test]
+fn normalize_imagenet_is_alias_for_normalize() {
+  // The deprecated `normalize_imagenet` name must produce
+  // byte-identical output to the new `normalize` for the same inputs.
+  let arr = Array::from_slice(&[0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6], &(2usize, 1, 3)).unwrap();
+  let mean = [0.485_f32, 0.456, 0.406];
+  let std = [0.229_f32, 0.224, 0.225];
+  let mut a = normalize(&arr, &mean, &std).unwrap();
+  let mut b = normalize_imagenet(&arr, &mean, &std).unwrap();
+  let va: Vec<f32> = a.to_vec().unwrap();
+  let vb: Vec<f32> = b.to_vec().unwrap();
+  assert!(vclose(&va, &vb));
+}
+
+#[test]
+fn normalize_rejects_integer_dtypes() {
+  // Integer input rejected with ShapeMismatch (mean/std cast to U8
+  // would floor to zero → division undefined). Mirror the
+  // `rescale_rejects_integer_dtypes` coverage for the renamed
+  // function.
+  let arr = Array::from_slice(&[0_u8; 3], &(1usize, 1, 3)).unwrap();
+  let err = normalize(&arr, &[0.485, 0.456, 0.406], &[0.229, 0.224, 0.225]).unwrap_err();
+  assert!(
+    matches!(err, Error::ShapeMismatch { .. }),
+    "want ShapeMismatch, got {err:?}",
+  );
 }
