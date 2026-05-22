@@ -9,7 +9,8 @@
 //! (`ModelConfiguration` + `model_type` registry + `load`), and the
 //! [`generate`](crate::lm::generate) loop (`generate_step` /
 //! `stream_generate` / `generate` + `make_sampler` /
-//! `make_logits_processors`).
+//! `make_logits_processors`), and the [`perplexity`](crate::lm::perplexity)
+//! evaluation (`perplexity` / `make_windows` / `cross_entropy_none`).
 
 pub mod cache;
 pub mod factory;
@@ -17,6 +18,7 @@ pub mod generate;
 pub mod load;
 pub mod model;
 pub mod nn;
+pub mod perplexity;
 pub mod quant;
 pub mod sample;
 pub mod speculative;
