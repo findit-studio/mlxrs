@@ -1336,6 +1336,7 @@ pub fn stream_generate<'a, M: Model>(
             prompt_tps,
             generation_tokens: n,
             generation_tps: gen_tps(n),
+            peak_memory_bytes: peak,
             finish_reason: Some("stop".to_string()),
           }));
         }
@@ -1360,6 +1361,7 @@ pub fn stream_generate<'a, M: Model>(
               prompt_tps,
               generation_tokens: n,
               generation_tps: gen_tps(n),
+              peak_memory_bytes: peak,
               finish_reason: Some(reason.to_string()),
             }));
           }
@@ -1375,6 +1377,7 @@ pub fn stream_generate<'a, M: Model>(
             prompt_tps,
             generation_tokens: n,
             generation_tps: gen_tps(n),
+            peak_memory_bytes: peak,
             finish_reason: None,
           }));
         }
