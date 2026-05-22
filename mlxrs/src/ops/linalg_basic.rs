@@ -1,10 +1,34 @@
-//! Basic linalg ops: addmm (Phase 3.5 trinary+scalar template), matmul, inner, outer.
+//! Basic linalg ops: addmm (Phase 3.5 trinary+scalar template), matmul, inner, outer,
+//! plus the gathered/batched matmul `gather_mm` (the mixture-of-experts primitive).
 
 use crate::{
   array::Array,
   error::{Result, check},
   stream::default_stream,
 };
+
+/// Raw handle for an `Option<&Array>`: the inner handle when `Some`, or a fresh
+/// NULL-ctx `mlx_array` when `None`. The returned guard owns the placeholder so
+/// its `Drop` frees it; keep it alive across the FFI call. Mirrors
+/// `ops::quantized::opt_array` (kept local rather than shared because the two
+/// callers are independent and the helper is trivially small; lifting it to a
+/// shared module is a separate refactor).
+#[inline]
+fn opt_array(a: Option<&Array>) -> (mlxrs_sys::mlx_array, Option<Array>) {
+  match a {
+    Some(arr) => (arr.0, None),
+    None => {
+      // SAFETY: `mlx_array_new()` returns a fresh empty handle (NULL ctx) per the
+      // mlx-c convention; it is wrapped in the RAII newtype FIRST so an early
+      // return / panic frees it. It is not an out-param here: the NULL-ctx
+      // placeholder is what mlx-c's "may be null" parameters accept for an
+      // absent optional input, and the returned guard keeps it alive across
+      // the FFI call.
+      let placeholder = Array(unsafe { mlxrs_sys::mlx_array_new() });
+      (placeholder.0, Some(placeholder))
+    }
+  }
+}
 
 /// `alpha * (a @ b) + beta * c` — fused matmul + scaled add.
 ///
@@ -69,5 +93,55 @@ pub fn outer(a: &Array, b: &Array) -> Result<Array> {
   // not retained by mlx past it); the out-param was freshly allocated above
   // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe { mlxrs_sys::mlx_outer(&mut out.0, a.0, b.0, default_stream()) })?;
+  Ok(out)
+}
+
+/// Batched/gathered matmul: like [`matmul`] but selects per-batch rows of `a` /
+/// `b` via optional `lhs_indices` / `rhs_indices` flat batch indices. The
+/// indices contain flat indices along the **batch** dimensions of each input
+/// (all but the last two dims); the last two dims of each input are still the
+/// matmul dims and contract normally.
+///
+/// This is the dense primitive behind mixture-of-experts (MoE) `SwitchLinear`:
+/// `a` is `[N, 1, K]` per-token input, `b` is `[E, K, M]` per-expert weights,
+/// and `rhs_indices` is the `[N]` per-token expert assignment — the result is
+/// `[N, 1, M]`, with token `i` matmul'd against expert `rhs_indices[i]`.
+///
+/// `sorted_indices` promises `rhs_indices` is sorted, enabling a faster
+/// kernel (mlx-lm's `SwitchGLU` sets this on the `_gather_sort` path).
+///
+/// Mirrors python `mx.gather_mm` and swift `gatherMM`. See
+/// [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.gather_mm.html).
+pub fn gather_mm(
+  a: &Array,
+  b: &Array,
+  lhs_indices: Option<&Array>,
+  rhs_indices: Option<&Array>,
+  sorted_indices: bool,
+) -> Result<Array> {
+  let (lhs_h, _lhs_guard) = opt_array(lhs_indices);
+  let (rhs_h, _rhs_guard) = opt_array(rhs_indices);
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it) — `lhs_h` / `rhs_h` are either the borrowed
+  // optional handles or NULL-ctx placeholders kept alive by their guards, which
+  // `mlx_gather_mm` accepts for the optional `lhs_indices` / `rhs_indices`
+  // (verified in vendor mlx/c/ops.cpp:1445-1469: each `ctx ? optional : nullopt`);
+  // the out-param was freshly allocated above and is written by this call;
+  // the backend rc is surfaced via `check()`.
+  check(unsafe {
+    mlxrs_sys::mlx_gather_mm(
+      &mut out.0,
+      a.0,
+      b.0,
+      lhs_h,
+      rhs_h,
+      sorted_indices,
+      default_stream(),
+    )
+  })?;
   Ok(out)
 }
