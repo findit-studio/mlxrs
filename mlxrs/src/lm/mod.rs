@@ -18,6 +18,7 @@ pub mod load;
 pub mod model;
 pub mod nn;
 pub mod sample;
+pub mod speculative;
 /// Tool-call format parsers — Python `mlx_lm.tool_parsers.*`.
 ///
 /// Surface re-export of [`crate::tokenizer::tools`] under the canonical
