@@ -423,25 +423,48 @@ pub fn load_audio(path: &Path) -> Result<(Vec<f32>, u32)> {
 ///    is the invariant every caller maintains by routing each decoded
 ///    buffer through this guard). Returns [`Error::Backend`] (the existing
 ///    over-cap error).
-/// 2. **Fallible reserve.** `try_reserve(n)` the room while STILL under
-///    the cap, mapping a [`std::collections::TryReserveError`] to
-///    [`Error::OutOfMemory`]. After this returns `Ok`, the caller's
-///    `out.push` calls for these `n` samples land in reserved capacity and
-///    cannot trigger an infallible (abort-on-OOM) `Vec` regrowth.
+/// 2. **Cap-limited fallible reserve.** Grow capacity to fit `n` more
+///    samples while STILL under the cap, mapping a
+///    [`std::collections::TryReserveError`] to [`Error::OutOfMemory`].
+///    After this returns `Ok`, the caller's `out.push` calls for these `n`
+///    samples land in reserved capacity and cannot trigger an infallible
+///    (abort-on-OOM) `Vec` regrowth.
 ///
-/// Amortized `try_reserve` (not `try_reserve_exact`): the header hint is
-/// already reserved upfront in [`load_audio`], so per-buffer top-ups use
-/// the amortized growth strategy to avoid quadratic reallocation when a
-/// compressed header under-estimates the true length.
+/// The reserve keeps an amortized-doubling growth strategy (avoids
+/// quadratic reallocation when a compressed header under-estimates the true
+/// length) BUT clamps the *target capacity* at `cap`. A plain
+/// `Vec::try_reserve(n)` is amortized too, but it can grow capacity to
+/// ~2× the *current* capacity even when only a few samples remain under the
+/// cap — so a near-cap header hint (reserved upfront by `try_reserve_exact`
+/// in [`load_audio`]) plus a final in-cap packet would make the reservation
+/// itself attempt FAR more than [`MAX_DECODED_SAMPLES`], defeating the
+/// advertised memory ceiling (and spuriously failing an in-cap decode under
+/// memory pressure, since the oversized reserve fails). Clamping `target`
+/// at `cap` keeps the doubling shape while guaranteeing the reservation
+/// never asks for more than the cap.
 fn reserve_under_cap(out: &mut Vec<f32>, n: usize, cap: usize) -> Result<()> {
   // `out.len() <= cap` always holds on entry (every prior buffer went
-  // through this guard), so `cap - out.len()` does not underflow.
+  // through this guard), so `cap - out.len()` does not underflow. This is
+  // the hard cap enforcement and stays BEFORE the growth logic below.
   if n > cap - out.len() {
     return Err(Error::Backend {
       message: format!("load_audio: stream produced more than the {cap}-sample cap"),
     });
   }
-  out.try_reserve(n).map_err(|_| Error::OutOfMemory)?;
+  // The over-cap check above guarantees `out.len() + n <= cap`, so `needed`
+  // does not overflow and is itself `<= cap`.
+  let needed = out.len() + n;
+  if out.capacity() < needed {
+    // Amortized doubling, but clamped at the cap: a plain `try_reserve(n)`
+    // could grow to ~2× the current capacity (potentially past `cap`),
+    // whereas this never targets more than `cap`. `needed <= cap`, so the
+    // `max` keeps `target <= cap` while still allowing the doubling shape
+    // when there is headroom under the cap.
+    let target = needed.max(out.capacity().saturating_mul(2).min(cap));
+    out
+      .try_reserve_exact(target - out.len())
+      .map_err(|_| Error::OutOfMemory)?;
+  }
   Ok(())
 }
 
@@ -1135,5 +1158,62 @@ mod tests {
       out.push(i as f32);
     }
     assert_eq!(out.len(), cap);
+  }
+
+  /// Codex review (cap-limited reserve growth): a plain amortized
+  /// `Vec::try_reserve(n)` can grow capacity to ~2× the *current* capacity
+  /// even when only a few samples remain under `cap`. With a near-cap
+  /// header hint (capacity already reserved up to `cap` by
+  /// `try_reserve_exact` in `load_audio`) plus a final in-cap packet, that
+  /// doubling would attempt an allocation FAR larger than the cap —
+  /// defeating the [`MAX_DECODED_SAMPLES`] memory ceiling (and, under
+  /// memory pressure, spuriously failing an in-cap decode because the
+  /// oversized reserve fails). The cap-limited growth must (a) accept the
+  /// in-cap packet and (b) NOT grow capacity past `cap`.
+  #[test]
+  fn reserve_under_cap_growth_does_not_exceed_cap() {
+    let cap = 64usize;
+    // `out` already holds capacity == cap (the near-cap header-hint state)
+    // and is filled to one below the cap, so a 1-sample packet still fits
+    // under the cap but the *needed* capacity (cap) equals current
+    // capacity — the case where a plain `try_reserve` would otherwise
+    // double to ~2*cap.
+    let mut out: Vec<f32> = Vec::with_capacity(cap);
+    out.resize(cap - 1, 0.0);
+    assert_eq!(out.capacity(), cap, "precondition: capacity == cap");
+
+    // A final packet that still fits under the cap is accepted.
+    reserve_under_cap(&mut out, 1, cap).expect("in-cap final packet must be accepted");
+
+    // The reservation must NOT have doubled capacity past the cap.
+    assert!(
+      out.capacity() <= cap,
+      "reserve grew capacity past the cap: capacity={} cap={cap}",
+      out.capacity()
+    );
+
+    // Also exercise the headroom case: capacity == cap - packet_len with
+    // plenty of slack below the cap. Growth is still clamped at the cap.
+    let packet = 8usize;
+    let mut out2: Vec<f32> = Vec::with_capacity(cap - packet);
+    out2.resize(cap - packet, 0.0);
+    let cap2_before = out2.capacity();
+    reserve_under_cap(&mut out2, packet, cap).expect("packet filling exactly to cap must succeed");
+    assert!(
+      out2.capacity() <= cap,
+      "reserve grew capacity past the cap: capacity={} cap={cap}",
+      out2.capacity()
+    );
+    assert!(
+      out2.capacity() >= cap2_before + packet,
+      "reserve did not provide room for the packet: capacity={} need>={}",
+      out2.capacity(),
+      cap2_before + packet
+    );
+    // The reserved room is real: pushing the packet cannot reallocate.
+    for i in 0..packet {
+      out2.push(i as f32);
+    }
+    assert_eq!(out2.len(), cap);
   }
 }
