@@ -32,7 +32,7 @@ tokenizer-deepseek-v32 = ["tokenizer-chat"]                                     
 tokenizer-tools      = ["tokenizer-config", "dep:serde_json"]                      # tool-call parsers + infer_tool_parser
 # umbrellas (compose only)
 embeddings           = ["tokenizer", "dep:smol_str", "dep:memspan"]                 # encode/decode (tokenizers crate) + `1_Pooling/config.json` parsing (HAND-ROLLED strict-JSON scanner per EMB-1; NO DIRECT `mlxrs::dep:serde_json` — `tokenizers v0.23` still pulls `serde_json` transitively for its `tokenizer.json` parse, so `embeddings` BUILDS but does not OWN `serde_json` after EMB-1. `tokenizer-config`/`tokenizer-bpe`/`tokenizer-spm`/`tokenizer-tools` continue to pull it directly). `smol_str` inlines short keys/values (≤23 bytes) into the JVal payload. `memspan` SIMD-accelerates `skip_ws` (AVX2/AVX-512/NEON dispatch) and the per-string `skip-until-quote-or-backslash` chunk scan, plus enables a no-escape fast path that copies the source slice directly into SmolStr with zero intermediate Vec.
-lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm", "tokenizer-bpe", "tokenizer-chat", "tokenizer-deepseek-v32", "tokenizer-tools"]
+lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm", "tokenizer-bpe", "tokenizer-chat", "tokenizer-deepseek-v32", "tokenizer-tools", "dep:regex"]   # +regex: HuggingFace PEFT LoraConfig target/exclude/rank/alpha pattern matching (lm::lora)
 vlm                  = ["lm", "dep:image"]
 audio                = ["lm", "dep:symphonia"] # mirrors mlx-audio's Python dep on mlx-lm; symphonia = WAV/MP3/FLAC/OGG-Vorbis codecs for audio::io. The always-compiled `mlxrs::simd` module accelerates the integrated_loudness sum-of-squares (NEON on aarch64, scalar fallback elsewhere) — no feature gate needed.
 unstable-ops-overload = []               # `&a + &b` etc. (panic on shape error). OFF by default.
@@ -114,6 +114,17 @@ symphonia = { version = "0.6", optional = true, default-features = false, featur
   "ogg",
   "vorbis",
 ] }
+# HuggingFace PEFT `LoraConfig` matching. PEFT's `target_modules` /
+# `exclude_modules` may be a single regex string, and `rank_pattern` /
+# `alpha_pattern` keys are matched against module paths with an anchored
+# `re.fullmatch` / `re.match` — `lm::lora` reproduces PEFT's matching
+# faithfully via the `regex` crate. Pulled SOLELY by `lm` (the LoRA-adapter
+# loader lives behind that feature); the bare/core / embeddings graphs never
+# compile it. `default-features = false` drops the (unused here) Unicode
+# tables to keep the dep tree minimal — PEFT module paths are ASCII. Loose
+# caret semver per `feedback_no_dependency_pinning` (crates.io current major
+# is 1.x — verified 1.11); never an exact `=` pin.
+regex = { version = "1", optional = true, default-features = false, features = ["std", "perf"] }
 
 # No [build-dependencies]: ALL tokenizer codegen moved to the `xtask` crate
 # (`cargo xtask-codegen`), so a normal `mlxrs` build never compiles

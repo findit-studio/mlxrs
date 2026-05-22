@@ -13,12 +13,20 @@
 //! evaluation (`perplexity` / `make_windows` / `cross_entropy_none`), and the
 //! prompt-cache fill+save driver ([`crate::lm::cache_prompt`] — `cache_prompt`,
 //! the support-surface port of `mlx_lm.cache_prompt`).
+//!
+//! M3 also lands inference-time **LoRA/DoRA adapter loading**
+//! ([`crate::lm::lora`]) — `LoRALinear` / `DoRALinear` (+ their quantized
+//! `QLoRA` / `QDoRA` bases), `fuse`, `linear_to_lora_layers`, and
+//! `load_adapters` — the runtime surface that applies a pre-trained adapter
+//! (`adapter_config.json` + `adapters.safetensors`) to a base model's weight
+//! map (mlx-lm `tuner/{lora,dora,utils}.py`, swift `Adapters/LoRA/`).
 
 pub mod cache;
 pub mod cache_prompt;
 pub mod factory;
 pub mod generate;
 pub mod load;
+pub mod lora;
 pub mod model;
 pub mod nn;
 pub mod perplexity;
