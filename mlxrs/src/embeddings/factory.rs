@@ -625,12 +625,19 @@ fn load_weights(dir: &Path) -> Result<EmbeddingWeights> {
 ///   model dir itself *and* in every subdirectory, exactly Python's
 ///   `recursive=True`. The legacy `"weight*.safetensors"` suffix has no `**`, so
 ///   it is root-only — matching `utils.py` line 163.
-/// - **`include_hidden=False`** (Python `glob`'s default) is
-///   [`MatchOptions::require_literal_leading_dot`]` = true`: a path component
-///   whose name starts with `.` is *not* matched by `*`/`**`/`?`/`[...]`, so a
+/// - **`include_hidden=False`** (Python `glob`'s default) excludes any path
+///   whose name — at *any* component below the model dir — starts with `.`, so a
 ///   `.hidden/model.safetensors` directory shard and a root `.model.safetensors`
-///   file shard are both excluded — a `.`-prefixed component would have to
-///   appear *literally* in the pattern (it does not) to match.
+///   file shard are both excluded. The natural spelling would be
+///   [`MatchOptions::require_literal_leading_dot`]` = true`, but `glob 0.3.3`
+///   implements that hidden-filter by calling `file_name().to_str().unwrap()` on
+///   **every** scanned directory child (`glob-0.3.3/src/lib.rs:953-955`) — a
+///   single non-UTF-8 sibling name on a mounted NFS/exFAT/case-sensitive volume
+///   would then *panic the process*. So the field is left `false` (which gates
+///   off that `unwrap` path entirely) and the `.`-component exclusion is
+///   re-implemented here ([`path_has_hidden_component`]) directly on the
+///   returned `PathBuf`s' `OsStr` components — no UTF-8 unwrap, panic-free for
+///   any filesystem.
 /// - **`require_literal_separator` is forced `true`** by `glob_with` regardless
 ///   of the field, so a `*` never matches across a `/` — `model*.safetensors`
 ///   matches one path component, as in Python.
@@ -661,19 +668,74 @@ fn load_weights(dir: &Path) -> Result<EmbeddingWeights> {
 /// snapshots store shards as symlinks into `blobs/<hash>`; a *valid* such
 /// symlink resolves to a regular file and passes.)
 ///
-/// **Non-UTF-8 model directory.** `glob_with` takes a `&str` pattern and
-/// internally `unwrap()`s `Path::to_str()` on it, so a model directory whose
-/// path is not valid UTF-8 would *panic* inside the crate. That is rejected up
-/// front here with a recoverable [`Error::Backend`] (a non-UTF-8 *model dir
-/// path* — distinct from a non-UTF-8 *file name within* it, which the host
-/// filesystem on the supported macOS/arm64 target does not permit and which
-/// `glob` would in any case simply not match). The literal `dir` portion of the
-/// pattern is [`glob::Pattern::escape`]d so a real directory name containing a
-/// glob metacharacter (`*`, `?`, `[`, `]`) is matched literally, not
-/// interpreted — only the `pattern_suffix` carries pattern metacharacters.
+/// **Non-UTF-8 paths.** `glob_with` takes a `&str` pattern and internally
+/// `unwrap()`s `Path::to_str()` on it, so a model directory whose path is not
+/// valid UTF-8 would *panic* inside the crate. That is rejected up front here
+/// with a recoverable [`Error::Backend`]. A non-UTF-8 *descendant* name is
+/// distinct: with `require_literal_leading_dot: false` `glob` no longer runs its
+/// `to_str().unwrap()` hidden-filter over directory children, so a non-UTF-8
+/// sibling on a mounted NFS/exFAT/case-sensitive volume no longer panics the
+/// walk — it simply does not match the ASCII `model*.safetensors` pattern and is
+/// skipped. The literal `dir` portion of the pattern is
+/// [`glob::Pattern::escape`]d so a real directory name containing a glob
+/// metacharacter (`*`, `?`, `[`, `]`) is matched literally, not interpreted —
+/// only the `pattern_suffix` carries pattern metacharacters.
 ///
 /// A malformed *pattern* (a [`glob::PatternError`]) would be a bug in this
 /// fixed, escaped pattern, not untrusted input, and maps to [`Error::Backend`].
+/// `true` if `path` has a hidden (`.`-prefixed) component *strictly below* the
+/// `root` model directory — the explicit, panic-free port of Python `glob`'s
+/// `include_hidden=False` (and of `glob 0.3.3`'s `require_literal_leading_dot`,
+/// which we cannot use directly: its implementation `unwrap()`s
+/// `file_name().to_str()` on every scanned child and so panics on a non-UTF-8
+/// sibling name — see [`collect_glob_shards`]).
+///
+/// Each component name is inspected as an [`OsStr`](std::ffi::OsStr) with **no
+/// UTF-8 conversion**: on Unix via [`OsStrExt::as_bytes`] (testing the first
+/// byte for `b'.'`), elsewhere via a lossy view. Either way this never panics on
+/// a non-UTF-8 name — a non-UTF-8 component simply does not begin with an ASCII
+/// `.` and so is not treated as hidden.
+///
+/// Only components *below* `root` are checked: the model directory the user
+/// pointed at is theirs to name (it may itself sit under a `.`-prefixed path)
+/// and matches Python `glob`, which only filters path segments it itself walked
+/// *under* the glob root. The shard file name is included in the check — a
+/// `.model.safetensors` is hidden — but `model*.safetensors` / `weight*.safetensors`
+/// never begin with `.`, so a legitimate shard name is unaffected.
+fn path_has_hidden_component(path: &Path, root: &Path) -> bool {
+  // `strip_prefix` operates on `OsStr`-backed `Path`s with no UTF-8
+  // requirement; `Err` (the glob result is somehow not under `root`) is treated
+  // conservatively as "no hidden component" — `glob` always yields paths under
+  // the escaped `dir` prefix, so this branch is unreachable in practice.
+  let Ok(rel) = path.strip_prefix(root) else {
+    return false;
+  };
+  rel.components().any(|component| {
+    let std::path::Component::Normal(name) = component else {
+      // `glob` yields plain descendant paths; `.` / `..` / prefixes never
+      // appear, but if one did it is not a hidden *entry* name.
+      return false;
+    };
+    starts_with_dot(name)
+  })
+}
+
+/// `true` if the OS string `name` begins with an ASCII `.`, inspected without a
+/// UTF-8 unwrap so a non-UTF-8 file name can never panic the check.
+fn starts_with_dot(name: &std::ffi::OsStr) -> bool {
+  #[cfg(unix)]
+  {
+    use std::os::unix::ffi::OsStrExt;
+    name.as_bytes().first() == Some(&b'.')
+  }
+  #[cfg(not(unix))]
+  {
+    // Non-Unix has no `OsStrExt::as_bytes`; a lossy view still cannot panic and
+    // a leading ASCII `.` survives any lossy conversion intact.
+    name.to_string_lossy().starts_with('.')
+  }
+}
+
 fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<DiscoveredShard>> {
   // `glob_with` takes a `&str` and `unwrap()`s `to_str()` internally — reject a
   // non-UTF-8 model dir path here so that becomes a recoverable error, not a
@@ -690,14 +752,21 @@ fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<Discovere
   // `pattern_suffix` contributes pattern metacharacters (`**`, `model*`).
   let pattern = format!("{}/{}", glob::Pattern::escape(dir_str), pattern_suffix);
 
-  // `require_literal_leading_dot: true` == Python glob's default
-  // `include_hidden=False` (a `.`-prefixed component is excluded).
-  // `case_sensitive: true` matches Python glob on a case-sensitive filesystem.
-  // `require_literal_separator` is forced `true` by `glob_with` regardless.
+  // `require_literal_leading_dot` is deliberately `false`, NOT `true`: the
+  // `true` spelling would be the natural port of Python glob's
+  // `include_hidden=False`, but `glob 0.3.3` implements that filter by calling
+  // `file_name().to_str().unwrap()` on every scanned directory child
+  // (`glob-0.3.3/src/lib.rs:953-955`) — a single non-UTF-8 sibling name would
+  // panic the process. With the field `false` that `unwrap` path is never
+  // reached; the `.`-component exclusion is re-applied below via
+  // `path_has_hidden_component` on the returned `PathBuf`s (OsStr-level, no
+  // UTF-8 unwrap). `case_sensitive: true` matches Python glob on a
+  // case-sensitive filesystem; `require_literal_separator` is forced `true` by
+  // `glob_with` regardless of the field.
   let options = MatchOptions {
     case_sensitive: true,
     require_literal_separator: false,
-    require_literal_leading_dot: true,
+    require_literal_leading_dot: false,
   };
 
   let matches = glob_with(&pattern, options).map_err(|e| Error::Backend {
@@ -713,6 +782,16 @@ fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<Discovere
     // that entry (the iterator continues over the rest) so one unreadable
     // nested directory never aborts a load whose real shards live elsewhere.
     let Ok(path) = entry else { continue };
+
+    // `include_hidden=False`: with `require_literal_leading_dot: false`, `glob`
+    // *does* now yield paths through `.`-prefixed (hidden) components — so the
+    // exclusion is re-applied here, explicitly, on the returned `PathBuf`. This
+    // is the panic-free replacement for `glob`'s own `to_str().unwrap()` hidden
+    // -filter: a `.checkpoints/model.safetensors`, a root `.model.safetensors`,
+    // and a normal shard under any `.`-prefixed ancestor are all skipped.
+    if path_has_hidden_component(&path, dir) {
+      continue;
+    }
 
     // `glob`'s match is name-based: a directory / symlink-to-dir / FIFO /
     // device / dangling symlink NAMED `model*.safetensors` is yielded. Stat the
@@ -1936,12 +2015,15 @@ mod tests {
 
   // ───────── glob-faithful recursive-walk tests (Codex review) ─────────
   // `collect_glob_shards` drives `glob::glob_with` with
-  // `MatchOptions { require_literal_leading_dot: true, .. }` — the faithful
+  // `MatchOptions { require_literal_leading_dot: false, .. }` — the faithful
   // port of `glob.glob("**/model*.safetensors", recursive=True,
-  // include_hidden=False)`: hidden (`.`-prefixed) components are excluded, `**`
-  // recursion + directory-symlink follow (with cycle termination) + `scandir`
-  // -error suppression are the `glob` crate's job, and a `model*.safetensors`
-  // -named non-regular entry is rejected by the per-match stat gate.
+  // include_hidden=False)`: `**` recursion + directory-symlink follow (with
+  // cycle termination) + `scandir`-error suppression are the `glob` crate's
+  // job, the hidden (`.`-prefixed) component exclusion is re-applied explicitly
+  // by `path_has_hidden_component` (the field is `false` so `glob`'s own
+  // `to_str().unwrap()` hidden-filter — which panics on a non-UTF-8 sibling —
+  // is never reached), and a `model*.safetensors`-named non-regular entry is
+  // rejected by the per-match stat gate.
 
   #[test]
   fn load_weights_excludes_hidden_directory_shards() {
@@ -2267,11 +2349,12 @@ mod tests {
 
   #[test]
   fn load_weights_glob_recurses_deeply_and_excludes_hidden() {
-    // Combined `**`-recursion + `require_literal_leading_dot` exclusion: the
-    // `glob` `**` matches `model*.safetensors` at the root AND in arbitrarily
-    // deep subdirectories, while a `.`-prefixed component ANYWHERE on the path
-    // — whether a hidden directory, a hidden FILE, or a hidden directory ABOVE
-    // an otherwise-normal shard — is excluded (`include_hidden=False`).
+    // Combined `**`-recursion + explicit `path_has_hidden_component` exclusion:
+    // the `glob` `**` matches `model*.safetensors` at the root AND in
+    // arbitrarily deep subdirectories, while a `.`-prefixed component ANYWHERE
+    // below the model dir — whether a hidden directory, a hidden FILE, or a
+    // hidden directory ABOVE an otherwise-normal shard — is excluded
+    // (`include_hidden=False`).
     let dir = fresh_dir("glob-deep-hidden");
     // (a) a root shard — `**` matches the model dir itself.
     write_one_tensor(&dir.join("model.safetensors"), "root.weight");
@@ -2320,7 +2403,7 @@ mod tests {
       assert!(
         !weights.contains_key(forbidden),
         "a `.`-prefixed path component must exclude its shard \
-         (require_literal_leading_dot); leaked {forbidden:?} in {:?}",
+         (path_has_hidden_component); leaked {forbidden:?} in {:?}",
         weights.keys().collect::<Vec<_>>()
       );
     }
@@ -2359,6 +2442,62 @@ mod tests {
       err.to_string().contains("not valid UTF-8"),
       "the error should explain the non-UTF-8 path rejection; got: {err}"
     );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn load_weights_non_utf8_descendant_does_not_panic() {
+    // A non-UTF-8 *descendant* name (distinct from a non-UTF-8 model-dir path):
+    // `glob 0.3.3`'s `require_literal_leading_dot: true` hidden-filter calls
+    // `file_name().to_str().unwrap()` on EVERY scanned directory child
+    // (`glob-0.3.3/src/lib.rs:953-955`), so a single non-UTF-8 sibling inside an
+    // otherwise-UTF-8 model directory would panic the whole process. Driving
+    // `glob_with` with `require_literal_leading_dot: false` gates that `unwrap`
+    // path off; `collect_glob_shards` must therefore walk a directory holding a
+    // non-UTF-8 entry WITHOUT panicking and still load the legitimate
+    // `model.safetensors` shards.
+    //
+    // macOS/APFS enforces UTF-8 file names and will reject creating the
+    // non-UTF-8 entry — the test then `return`s cleanly (the no-panic code path,
+    // not this fixture, is the deliverable; on a mounted NFS/exFAT/case
+    // -sensitive volume the entry creates and the walk is exercised for real).
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = fresh_dir("non-utf8-child");
+    // A legitimate root shard plus a legitimate nested shard — both must still
+    // load once the non-UTF-8 sibling no longer aborts the walk.
+    write_one_tensor(&dir.join("model.safetensors"), "root.weight");
+    let nested = dir.join("text_model");
+    std::fs::create_dir_all(&nested).unwrap();
+    write_one_tensor(&nested.join("model.safetensors"), "encoder.weight");
+
+    // A non-UTF-8 file name (`m` then byte 0xFF) directly inside the model dir,
+    // so `glob`'s `**` expansion `read_dir`s it as a sibling of the real shard.
+    let non_utf8_name = std::ffi::OsString::from_vec(vec![b'm', 0xFF]);
+    if std::fs::write(dir.join(&non_utf8_name), b"junk").is_err() {
+      // APFS (and any UTF-8-enforcing filesystem) rejects the name — the
+      // panic-free walk cannot be exercised here; skip without failing.
+      return;
+    }
+    // Also place a non-UTF-8-named entry one level down, so the nested
+    // directory's `read_dir` children list is non-UTF-8 too.
+    let _ = std::fs::write(nested.join(&non_utf8_name), b"junk");
+
+    // The deliverable: the walk completes without a panic. The non-UTF-8 entry
+    // is not named `model*.safetensors` (it is not even ASCII) so it never
+    // matches the pattern; the two legitimate shards still load.
+    let weights = load_weights(&dir).expect("a non-UTF-8 descendant must not break the glob walk");
+    assert!(
+      weights.contains_key("root.weight"),
+      "the root shard must still load past a non-UTF-8 sibling; got {:?}",
+      weights.keys().collect::<Vec<_>>()
+    );
+    assert!(
+      weights.contains_key("text_model.encoder.weight"),
+      "the nested shard must still load past a non-UTF-8 sibling; got {:?}",
+      weights.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(weights.len(), 2);
   }
 
   #[test]
