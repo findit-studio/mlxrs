@@ -767,24 +767,55 @@ pub fn get_total_parameters(
     {
       continue;
     }
-    // A `<path>.biases` (note the trailing `s`) belonging to an affine
-    // quantization triple is ALSO metadata, not a model parameter — the
-    // affine `affine_quantize` zero-point array, sibling to `.scales`, not
-    // the `m.bias` the reference's quantized branch counts. mlx-lm's
-    // `get_total_parameters` reaches it only through the *module* tree
-    // where it is the quantized module's `scales`/`biases` buffers (never
-    // summed), so counting it here would inflate `total_parameters` and
-    // depress `compute_bits_per_weight`. Skip a `.biases` that has BOTH a
-    // `.weight` AND a `.scales` sibling — the exact affine-triple shape
-    // (`<path>.weight` + `<path>.scales` + `<path>.biases`, see
-    // [`crate::lm::quant`]). A genuine dense module bias is named `.bias`
-    // (singular, no `.scales` sibling) and still falls through to the
-    // dense count below.
+    // A `<path>.biases` (note the trailing `s`) sitting next to a
+    // `<path>.weight` + `<path>.scales` triple is the **affine**
+    // `affine_quantize` zero-point buffer — metadata, not a model
+    // parameter (it is the quantized module's `biases` buffer, never
+    // summed by mlx-lm's quantized branch; counting it would inflate
+    // `total_parameters` and depress `compute_bits_per_weight`).
+    //
+    // But that is true ONLY under affine quantization: the scale-only
+    // schemes (`mxfp4` / `mxfp8` / `nvfp4`) have NO `.biases` output and
+    // explicitly reject one (`mlx/ops.cpp:5085-5099`; see
+    // [`crate::lm::quant`]). So resolve the layer's [`QuantMode`] before
+    // deciding — skip the `.biases` as metadata only for
+    // [`QuantMode::Affine`]; under a scale-only mode a `.biases` sibling
+    // is structurally invalid data and is flagged as an
+    // [`Error::Backend`] rather than silently dropped. A genuine dense
+    // module bias is named `.bias` (singular, no `.scales` sibling) and
+    // falls through to the dense count below regardless.
     if let Some(path) = key.strip_suffix(".biases")
       && weights.contains_key(&format!("{path}.weight"))
       && weights.contains_key(&format!("{path}.scales"))
     {
-      continue;
+      use crate::lm::quant::QuantMode;
+      // The same `quantization_for` resolution the `.weight` branch uses
+      // (an unresolvable quantized layer is the same configuration error
+      // there; HashMap iteration may reach `.biases` first, so error
+      // here too rather than relying on the `.weight` visit).
+      let q = quant.quantization_for(path).ok_or_else(|| Error::Backend {
+        message: format!(
+          "get_total_parameters: quantized layer {path:?} (has `.weight` \
+           + `.scales` + `.biases`) but no quantization params for it in \
+           the config"
+        ),
+      })?;
+      match q.mode {
+        // Affine zero-point buffer — metadata, skip (do not count).
+        QuantMode::Affine => continue,
+        // mxfp4 / mxfp8 / nvfp4 carry no `.biases`; a present one means
+        // an invalid checkpoint — flag it, do not silently drop it.
+        QuantMode::Mxfp4 | QuantMode::Mxfp8 | QuantMode::Nvfp4 => {
+          return Err(Error::Backend {
+            message: format!(
+              "get_total_parameters: layer {path:?} is quantized with \
+               scale-only mode `{}`, which has no `.biases` buffer, yet a \
+               `{key}` tensor is present — invalid checkpoint",
+              q.mode.as_mlx_str()
+            ),
+          });
+        }
+      }
     }
     // Everything else — a dense `.weight`, a real module `.bias`, the
     // unpacked-bias of a quantized layer counted via its packed `.weight`
@@ -870,11 +901,23 @@ fn shard_file_name(index_1based: usize, shards_count: usize) -> String {
 /// 4. Each shard is written with [`crate::io::save_safetensors_with_metadata`]
 ///    and the `{"format": "mlx"}` safetensors metadata mlx writes
 ///    (`utils.py:756`); the shard file name comes from `shard_file_name`.
-/// 5. The `weight_map` (`weight name → shard file name`) is assembled, then
+/// 5. Any **stale** pre-existing `model*.safetensors` shard whose name is
+///    not in the freshly written set is removed, so the destination ends
+///    up holding *only* the new checkpoint. The reference does not do
+///    this (`save_model` assumes a fresh directory), but mlxrs
+///    [`load_weights`] reads **every** `model*.safetensors` in the
+///    directory — not just the ones named in the index — so overwriting,
+///    say, a 3-shard checkpoint with a single-`model.safetensors` one
+///    would otherwise leave `model-00002-of-00003.safetensors` …
+///    behind and silently resurrect stale tensors on the next load. This
+///    cleanup makes `save_model` idempotent: a second save to the same
+///    directory yields exactly the second checkpoint.
+/// 6. The `weight_map` (`weight name → shard file name`) is assembled, then
 ///    **sorted by key** (`utils.py:762-764`), and the whole `index_data`
 ///    (`{ "metadata": { total_size, total_parameters }, "weight_map": … }`)
 ///    is written to `model.safetensors.index.json` with 4-space indentation
-///    (`json.dump(..., indent=4)`, `utils.py:766-771`).
+///    (`json.dump(..., indent=4)`, `utils.py:766-771`). The index file name
+///    is constant, so the new index always overwrites any prior one.
 ///
 /// `quant` supplies the per-layer [`Quantization`]
 /// [`get_total_parameters`] needs (pass
@@ -922,6 +965,10 @@ pub fn save_model(
   // `weight_map` collected sorted-by-key so the written index is
   // deterministic (`utils.py:762-764` sorts it before the `json.dump`).
   let mut weight_map: BTreeMap<String, String> = BTreeMap::new();
+  // The names of the shards just written — every other `model*.safetensors`
+  // in `save_path` is stale and removed in step 5.
+  let mut written_shards: std::collections::HashSet<String> =
+    std::collections::HashSet::with_capacity(shards_count);
   for (i, shard) in shards.iter().enumerate() {
     let shard_name = shard_file_name(i + 1, shards_count);
     let shard_path = save_path.join(&shard_name);
@@ -933,9 +980,38 @@ pub fn save_model(
     for &weight_name in shard.keys() {
       weight_map.insert(weight_name.to_string(), shard_name.clone());
     }
+    written_shards.insert(shard_name);
   }
 
-  // 5. assemble + write `model.safetensors.index.json` with `indent=4`
+  // 5. idempotency: drop any pre-existing `model*.safetensors` left over
+  //    from an earlier checkpoint that the new shard set did not just
+  //    rewrite. Without this, [`load_weights`] (which merges *every*
+  //    `model*.safetensors`, not the index) would resurrect stale tensors
+  //    when a multi-shard checkpoint is overwritten by a smaller one. The
+  //    `model.safetensors.index.json` has a constant name and is
+  //    overwritten unconditionally in step 6, so it needs no cleanup.
+  //    `collect_sorted` applies the same `model*.safetensors` predicate
+  //    `load_weights` uses, so exactly the files a later load would pick
+  //    up are considered.
+  let existing_shards = collect_sorted(save_path, |name| {
+    name.starts_with("model") && name.ends_with(".safetensors")
+  })?;
+  for stale in &existing_shards {
+    let is_stale = stale
+      .file_name()
+      .and_then(|n| n.to_str())
+      .is_some_and(|n| !written_shards.contains(n));
+    if is_stale {
+      std::fs::remove_file(stale).map_err(|e| Error::Backend {
+        message: format!(
+          "save_model: cannot remove stale shard {}: {e}",
+          stale.display()
+        ),
+      })?;
+    }
+  }
+
+  // 6. assemble + write `model.safetensors.index.json` with `indent=4`
   //    (`utils.py:735-771`). `serde_json::Value` preserves the
   //    reference key order (`metadata` before `weight_map`); `weight_map`
   //    is a `BTreeMap`, so its keys serialize sorted.
@@ -1071,7 +1147,7 @@ mod save_tests {
   //! are checked against hand-verified counts. No `peak_memory()` assert.
 
   use super::*;
-  use crate::lm::quant::{PerLayerQuantization, Quantization};
+  use crate::lm::quant::{PerLayerQuantization, QuantMode, Quantization};
 
   /// A fresh, writable per-test temp directory (the crate's
   /// no-`tempfile`-crate convention — `temp_dir()` + pid + a process-unique
@@ -1599,5 +1675,220 @@ mod save_tests {
     assert_eq!(cfg["hidden_size"], 8);
 
     let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  // ─────────────────────── save_model idempotency ───────────────────────
+
+  /// `save_model` is idempotent: overwriting a *multi-shard* checkpoint
+  /// with a *smaller single-shard* one must leave the destination holding
+  /// ONLY the new checkpoint — no stale `model-0000N-of-…safetensors`
+  /// shards may survive. (mlxrs [`load_weights`] merges every
+  /// `model*.safetensors` in the dir, so a stale shard would silently
+  /// resurrect dead tensors.) A pre-existing 3-shard layout is hand-written
+  /// (the same `save_safetensors_view` primitive `save_model` uses, since
+  /// `save_model` hard-codes the 5-GiB cap and cannot be coerced into
+  /// multi-shard from tiny weights), then `save_model` rewrites the dir
+  /// with two small weights → one `model.safetensors`. After the save the
+  /// dir must contain exactly `model.safetensors`, no `model-*-of-*` files,
+  /// and `load_weights` must see only the two new keys.
+  #[test]
+  fn save_model_overwrite_multi_shard_with_single_is_idempotent() {
+    let dir = fresh_dir("save-model-idempotent");
+
+    // Stale 3-shard checkpoint, hand-written with the multi-shard names.
+    let stale_vals = [
+      ("stale.a.weight", vec![100.0_f32]),
+      ("stale.b.weight", vec![200.0_f32, 201.0]),
+      ("stale.c.weight", vec![300.0_f32, 301.0, 302.0]),
+    ];
+    let stale_arrays: Vec<(&str, Array)> = stale_vals
+      .iter()
+      .map(|(k, v)| (*k, Array::from_slice::<f32>(v, &(v.len(),)).unwrap()))
+      .collect();
+    let mut meta: HashMap<String, String> = HashMap::new();
+    meta.insert("format".to_string(), "mlx".to_string());
+    let stale_count = stale_arrays.len();
+    let mut stale_map: BTreeMap<String, String> = BTreeMap::new();
+    for (i, (k, arr)) in stale_arrays.iter().enumerate() {
+      let name = shard_file_name(i + 1, stale_count);
+      crate::io::save_safetensors_view(&dir.join(&name), std::iter::once((*k, arr)), &meta)
+        .unwrap();
+      stale_map.insert((*k).to_string(), name);
+    }
+    // A stale index too — the new save must overwrite it (same name).
+    write_json_pretty(
+      &dir.join("model.safetensors.index.json"),
+      &serde_json::json!({
+        "metadata": { "total_size": 24, "total_parameters": 6 },
+        "weight_map": stale_map,
+      }),
+      "test: stale index",
+    )
+    .unwrap();
+    // Sanity: three multi-shard files are present before the overwrite.
+    assert!(dir.join("model-00001-of-00003.safetensors").is_file());
+    assert!(dir.join("model-00002-of-00003.safetensors").is_file());
+    assert!(dir.join("model-00003-of-00003.safetensors").is_file());
+
+    // Overwrite with a smaller single-shard checkpoint.
+    let mut new_w: Weights = HashMap::new();
+    new_w.insert(
+      "fresh.x.weight".to_string(),
+      Array::from_slice::<f32>(&[1.0, 2.0], &(2usize,)).unwrap(),
+    );
+    new_w.insert(
+      "fresh.y.weight".to_string(),
+      Array::from_slice::<f32>(&[3.0], &(1usize,)).unwrap(),
+    );
+    save_model(&dir, &new_w, &PerLayerQuantization::default()).unwrap();
+
+    // Destination holds ONLY the new single shard — no stale shards left.
+    assert!(dir.join("model.safetensors").is_file());
+    assert!(
+      !dir.join("model-00001-of-00003.safetensors").exists(),
+      "stale shard 1 must be removed"
+    );
+    assert!(
+      !dir.join("model-00002-of-00003.safetensors").exists(),
+      "stale shard 2 must be removed"
+    );
+    assert!(
+      !dir.join("model-00003-of-00003.safetensors").exists(),
+      "stale shard 3 must be removed"
+    );
+    // Exactly one `model*.safetensors` survives.
+    let survivors = collect_sorted(&dir, |n| {
+      n.starts_with("model") && n.ends_with(".safetensors")
+    })
+    .unwrap();
+    assert_eq!(
+      survivors.len(),
+      1,
+      "exactly one shard file after an idempotent overwrite"
+    );
+
+    // `load_weights` sees ONLY the new checkpoint's keys (no resurrected
+    // stale tensors).
+    let mut loaded = load_weights(&dir).unwrap();
+    assert_eq!(loaded.len(), 2, "only the two new weights load back");
+    assert!(loaded.contains_key("fresh.x.weight"));
+    assert!(loaded.contains_key("fresh.y.weight"));
+    assert!(!loaded.contains_key("stale.a.weight"));
+    assert!(!loaded.contains_key("stale.b.weight"));
+    assert!(!loaded.contains_key("stale.c.weight"));
+    assert_eq!(
+      loaded
+        .get_mut("fresh.x.weight")
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap(),
+      vec![1.0, 2.0]
+    );
+
+    // The index `weight_map` lists only the new keys, all → model.safetensors.
+    let index_text = std::fs::read_to_string(dir.join("model.safetensors.index.json")).unwrap();
+    let index: serde_json::Value = serde_json::from_str(&index_text).unwrap();
+    let wm = index["weight_map"].as_object().unwrap();
+    assert_eq!(wm.len(), 2);
+    assert_eq!(wm["fresh.x.weight"], "model.safetensors");
+    assert_eq!(wm["fresh.y.weight"], "model.safetensors");
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// Re-saving the *same* checkpoint to a directory is a no-op on the file
+  /// set (a plain idempotency check on the common single-shard path: the
+  /// one shard is rewritten, nothing stale, nothing removed).
+  #[test]
+  fn save_model_resave_same_checkpoint_is_stable() {
+    let dir = fresh_dir("save-model-resave");
+    let mut w: Weights = HashMap::new();
+    w.insert("m.w.weight".to_string(), f32_weight(4));
+
+    save_model(&dir, &w, &PerLayerQuantization::default()).unwrap();
+    save_model(&dir, &w, &PerLayerQuantization::default()).unwrap();
+
+    let survivors = collect_sorted(&dir, |n| {
+      n.starts_with("model") && n.ends_with(".safetensors")
+    })
+    .unwrap();
+    assert_eq!(survivors.len(), 1, "single shard, stable across re-saves");
+    let loaded = load_weights(&dir).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert!(loaded.contains_key("m.w.weight"));
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  // ───────────── get_total_parameters: scale-only `.biases` ─────────────
+
+  /// A `.biases` tensor present under a **scale-only** quant mode
+  /// (`mxfp4` / `mxfp8` / `nvfp4`) is structurally invalid — those layouts
+  /// have no zero-point buffer and reject one. `get_total_parameters` must
+  /// flag it as an [`Error::Backend`], NOT silently skip it as it does for
+  /// the affine zero-point. Checked for all three scale-only modes.
+  #[test]
+  fn get_total_parameters_scale_only_biases_is_error() {
+    for mode in [QuantMode::Mxfp4, QuantMode::Mxfp8, QuantMode::Nvfp4] {
+      let mut w: Weights = HashMap::new();
+      w.insert(
+        "model.layers.0.q_proj.weight".to_string(),
+        Array::from_slice::<u32>(&[0u32; 8], &(2usize, 4)).unwrap(),
+      );
+      w.insert(
+        "model.layers.0.q_proj.scales".to_string(),
+        Array::from_slice::<f32>(&[0.0, 0.0], &(2usize,)).unwrap(),
+      );
+      // A stale `.biases` sibling — invalid under a scale-only layout.
+      w.insert(
+        "model.layers.0.q_proj.biases".to_string(),
+        Array::from_slice::<f32>(&[0.0, 0.0], &(2usize,)).unwrap(),
+      );
+      let quant = PerLayerQuantization::from_global(Quantization {
+        group_size: 32,
+        bits: 4,
+        mode,
+      });
+      let err = get_total_parameters(&w, &quant);
+      assert!(
+        matches!(err, Err(Error::Backend { .. })),
+        "a `.biases` under scale-only `{}` must be an Error::Backend, got {err:?}",
+        mode.as_mlx_str()
+      );
+      // The error names the offending layer and mode.
+      if let Err(Error::Backend { message }) = err {
+        assert!(
+          message.contains("q_proj") && message.contains(mode.as_mlx_str()),
+          "error should name the layer + the scale-only mode, got: {message}"
+        );
+      }
+    }
+  }
+
+  /// The affine counterpart: under `QuantMode::Affine` the `.biases`
+  /// zero-point buffer is still correctly skipped as metadata (not
+  /// counted, no error). Hand-trace: packed `.weight` 8 `u32`, `bits = 4`
+  /// → `8 * 32 / 4 = 64` logical weights; `.scales` + `.biases` → +0.
+  /// Total = 64.
+  #[test]
+  fn get_total_parameters_affine_biases_still_skipped() {
+    let mut w: Weights = HashMap::new();
+    w.insert(
+      "model.layers.0.q_proj.weight".to_string(),
+      Array::from_slice::<u32>(&[0u32; 8], &(2usize, 4)).unwrap(),
+    );
+    w.insert(
+      "model.layers.0.q_proj.scales".to_string(),
+      Array::from_slice::<f32>(&[0.0, 0.0], &(2usize,)).unwrap(),
+    );
+    w.insert(
+      "model.layers.0.q_proj.biases".to_string(),
+      Array::from_slice::<f32>(&[0.0, 0.0], &(2usize,)).unwrap(),
+    );
+    let quant = PerLayerQuantization::from_global(Quantization::affine(32, 4));
+    let total = get_total_parameters(&w, &quant).unwrap();
+    assert_eq!(
+      total, 64,
+      "affine `.biases` skipped, only unpacked weight counts"
+    );
   }
 }
