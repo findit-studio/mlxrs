@@ -701,6 +701,18 @@ impl KvCache for RotatingKvCache {
     self.keys.is_none()
   }
 
+  /// Fresh iff this cache holds no cached tokens — no ring buffer
+  /// allocated **and** the raw counter `offset == 0` **and** the physical
+  /// ring cursor `idx == 0` (see [`KvCache::is_fresh`]). This is the same
+  /// triple the [`super::from_state`] / [`from_serialized`](
+  /// KvCache::from_serialized) restore guards already enforce as the
+  /// `empty ⇒ offset==0 && idx==0` invariant — a genuinely fresh
+  /// `RotatingKvCache::new(..)` satisfies all three, and any restored cache
+  /// carrying state fails at least one.
+  fn is_fresh(&self) -> bool {
+    self.keys.is_none() && self.offset == 0 && self.idx == 0
+  }
+
   /// An independent copy (mlx-lm `copy.deepcopy` / swift `copy()`).
   /// Independence comes from MLX value semantics, not buffer duplication:
   /// arrays are immutable and the cache only ever *reassigns* `keys` /

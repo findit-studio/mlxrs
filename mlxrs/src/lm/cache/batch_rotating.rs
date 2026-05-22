@@ -1023,6 +1023,24 @@ impl KvCache for BatchRotatingKvCache {
     self.keys.is_none()
   }
 
+  /// Fresh iff this cache holds no cached tokens — no ring buffer
+  /// allocated, the monotone counter `_offset == 0`, the physical ring
+  /// cursor `_idx == 0`, the ring not `rotated`, and no per-sequence
+  /// `_lengths` armed (see [`KvCache::is_fresh`]). This is the same
+  /// `empty ⇒ _offset==0 && _idx==0 && !rotated` invariant the
+  /// [`super::from_state`] restore guard enforces, extended with the
+  /// `_lengths` deferred-right-padding scratch. A genuinely fresh
+  /// `BatchRotatingKvCache::new(..)` satisfies all five.
+  ///
+  /// As with [`super::BatchKvCache`]'s `is_fresh`, the per-sequence `offset`
+  /// / `left_padding` `[B]` arrays are constructor input (`offset` starts at
+  /// `-left_padding`), *not* prefilled state, so they are not part of the
+  /// predicate; `max_size` is configuration. Only buffers + ring cursors +
+  /// per-request `_lengths` scratch determine freshness.
+  fn is_fresh(&self) -> bool {
+    self.keys.is_none() && self.off == 0 && self.idx == 0 && !self.rotated && self.lengths.is_none()
+  }
+
   /// An independent copy (mlx-lm `copy.deepcopy`). MLX value semantics:
   /// arrays are immutable and the cache only ever *reassigns* its arrays
   /// (the in-place ring writes go through `set_seq`, which builds a fresh

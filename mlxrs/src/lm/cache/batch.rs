@@ -586,6 +586,23 @@ impl KvCache for BatchKvCache {
     self.keys.is_none()
   }
 
+  /// Fresh iff this cache holds no cached tokens — no key/value buffer
+  /// allocated, the scalar logical length `_idx == 0`, and no deferred
+  /// `right_padding` armed (see [`KvCache::is_fresh`]). A genuinely fresh
+  /// `BatchKvCache::new(left_padding)` satisfies all three.
+  ///
+  /// The per-sequence `offset` / `left_padding` `[B]` arrays are
+  /// **constructor input** (`offset` starts at `-left_padding`), *not*
+  /// prefilled state, so they are intentionally not part of the predicate —
+  /// requiring `offset` to be all-zero would wrongly reject a fresh cache
+  /// built with non-zero left-padding. `right_padding` *is* included: a
+  /// pending `prepare_right_padding` is per-request scratch a reused cache
+  /// must not carry into a new prompt (the empty-state `set_state` clears it
+  /// for exactly this reason).
+  fn is_fresh(&self) -> bool {
+    self.keys.is_none() && self.idx == 0 && self.right_padding.is_none()
+  }
+
   /// An independent copy (mlx-lm `copy.deepcopy`). MLX value semantics:
   /// arrays are immutable and the cache only ever *reassigns* its arrays
   /// (never mutates a buffer in place), so a refcount-sharing

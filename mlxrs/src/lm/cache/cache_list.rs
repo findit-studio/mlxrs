@@ -446,6 +446,23 @@ impl KvCache for CacheList {
     }
   }
 
+  /// Fresh iff **every** child is fresh — recursively (see
+  /// [`KvCache::is_fresh`]).
+  ///
+  /// This deliberately differs from [`is_empty`](KvCache::is_empty), which
+  /// — faithful to mlx-lm `CacheList.empty()` (`cache.py:887-888`) —
+  /// reports only the **first** child's emptiness. A composite whose first
+  /// child is fresh while a later child carries state (e.g. an attention
+  /// child fresh, an SSM/`ArraysCache` child sparsely populated) would
+  /// report `is_empty() == true`, so an `is_empty()`-based freshness
+  /// predicate would wrongly pass it. `all(is_fresh)` polls **every**
+  /// child, so a nested `CacheList` child recurses through this same
+  /// method. An empty child list is vacuously fresh (`all` over nothing is
+  /// `true`) — a composite with no children holds nothing.
+  fn is_fresh(&self) -> bool {
+    self.caches.iter().all(|c| c.is_fresh())
+  }
+
   /// A deep, independent copy — mlx-lm `copy.deepcopy(cache)` (the generic
   /// deep copy `copy_prompt_cache` uses) / Swift `caches.map { $0.copy() }`
   /// then `CacheList(caches:)` (KVCache.swift:1287-1291). Each child is

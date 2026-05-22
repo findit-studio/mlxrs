@@ -189,6 +189,17 @@ impl KvCache for StandardKvCache {
     self.keys.is_none()
   }
 
+  /// Fresh iff this cache holds no cached tokens — no key/value buffer
+  /// allocated **and** `offset == 0` (see [`KvCache::is_fresh`]). For
+  /// `StandardKvCache` `keys.is_none()` already implies `offset == 0` (the
+  /// only way to set a non-zero `offset` is `update`/`set_state`, both of
+  /// which also store a buffer), but the conjunction is spelled out so the
+  /// invariant is explicit and a forged restore cannot slip a non-zero
+  /// `offset` past the guard.
+  fn is_fresh(&self) -> bool {
+    self.keys.is_none() && self.offset == 0
+  }
+
   /// An independent copy (mlx-lm `copy.deepcopy` / swift `copy()`).
   /// Independence comes from MLX value semantics, not buffer duplication:
   /// arrays are immutable and this cache only ever *reassigns* `keys` /

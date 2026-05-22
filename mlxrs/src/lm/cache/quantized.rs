@@ -828,6 +828,17 @@ impl KvCache for QuantizedKvCacheImpl {
     self.keys.is_none()
   }
 
+  /// Fresh iff this cache holds no quantized state — no stored quantized
+  /// key triple **and** the cached length `offset == 0` (see
+  /// [`KvCache::is_fresh`]). This is the same pair the [`super::from_state`]
+  /// / [`from_serialized`](KvCache::from_serialized) restore guards enforce
+  /// as the `empty ⇒ offset==0` invariant; a genuinely fresh
+  /// `QuantizedKvCacheImpl::new(..)` satisfies both. `group_size` / `bits`
+  /// are configuration, not state, so they are not part of the predicate.
+  fn is_fresh(&self) -> bool {
+    self.keys.is_none() && self.offset == 0
+  }
+
   /// An independent copy (mlx-lm `copy.deepcopy` / mlx-swift-lm `copy()`,
   /// `KVCache.swift:972-980`). Independence comes from MLX value semantics,
   /// not buffer duplication: the cache only ever *reassigns* the triples to

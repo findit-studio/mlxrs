@@ -23,7 +23,8 @@ use mlxrs::{
   Array,
   lm::{
     cache::{
-      CacheConfig, KvCache, MaskMode, RotatingKvCache, load_prompt_cache, make_prompt_cache,
+      ArraysCache, CacheConfig, CacheList, KvCache, MaskMode, RotatingKvCache, StandardKvCache,
+      load_prompt_cache, make_prompt_cache,
     },
     cache_prompt::{
       CachePromptInfo, META_MODEL, META_TOKENIZER_CONFIG, cache_prompt, cache_prompt_ids,
@@ -538,6 +539,174 @@ fn cache_prompt_rejects_reused_cache_without_writing() {
 }
 
 // ---------------------------------------------------------------------------
+// Sparse / aggregate non-fresh caches (Codex round-2 finding).
+//
+// The round-1 freshness guard used `offset() != 0 || !is_empty()`. That
+// predicate is INCOMPLETE: `ArraysCache::offset()` is always 0 and its
+// `is_empty()` checks only slot 0 (mlx-lm `cache[0] is None`), and
+// `CacheList::is_empty()` checks only its first child — so a reused *sparse*
+// `ArraysCache` (slot 0 empty, a later slot populated) and a `CacheList`
+// whose first child is fresh while a later child is sparse-stale both passed
+// the guard, reached `prefill_full`, and the save persisted the stale slot
+// state. The fix replaces the guard with the per-cache-type `is_fresh()`
+// predicate, which polls every buffer / SSM slot / child recursively.
+// ---------------------------------------------------------------------------
+
+/// A 2-slot SSM `(conv, ssm)` state array — a non-trivial slot tensor.
+fn slot_state() -> Array {
+  Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(1usize, 4usize)).unwrap()
+}
+
+/// `cache_prompt_ids` rejects a reused **sparse** `ArraysCache` — slot 0
+/// empty (so `is_empty()` reports `true`) but a *later* slot populated — with
+/// a recoverable `Error::Backend`, and writes NO file. The old
+/// `offset()/is_empty()` predicate would have passed this sparse cache
+/// (`offset()` is always 0, `is_empty()` sees only slot 0) and persisted its
+/// stale slot state; `is_fresh()` (every slot must be empty) rejects it.
+#[test]
+fn cache_prompt_ids_rejects_sparse_arrays_cache_without_writing() {
+  let model = MockModel::ramp(8);
+  let dir = temp_dir("sparse_arrays");
+
+  // A 2-slot ArraysCache: slot 0 EMPTY, slot 1 POPULATED — the exact sparse
+  // shape mlx-lm's `empty()` (`cache[0] is None`) misses.
+  let mut sparse = ArraysCache::new(2);
+  sparse.set(1, slot_state()).unwrap();
+  assert!(
+    sparse.is_empty(),
+    "precondition: a slot-0-empty ArraysCache reports is_empty()==true"
+  );
+  assert_eq!(
+    sparse.offset(),
+    0,
+    "precondition: ArraysCache::offset() is always 0"
+  );
+  assert!(
+    !sparse.is_fresh(),
+    "a sparse ArraysCache (slot 1 populated) must NOT be fresh"
+  );
+  let mut c: Vec<Box<dyn KvCache>> = vec![Box::new(sparse)];
+
+  let out = dir.join("sparse.safetensors");
+  assert!(
+    !out.exists(),
+    "precondition: the target file does not exist"
+  );
+  let err = cache_prompt_ids(
+    &model,
+    &[1u32, 3],
+    &mut c,
+    &out,
+    "mock",
+    "{}",
+    8,
+    &HashMap::new(),
+  )
+  .expect_err("a reused sparse ArraysCache must be rejected");
+  match err {
+    mlxrs::Error::Backend { message } => assert!(
+      message.contains("fresh"),
+      "the rejection message must indicate the cache is not fresh: {message}"
+    ),
+    other => panic!("expected a recoverable Error::Backend, got {other:?}"),
+  }
+  assert!(
+    !out.exists(),
+    "a sparse ArraysCache must NOT persist anything — no stale slot state written"
+  );
+}
+
+/// `cache_prompt_ids` rejects a `CacheList` whose **first** child is fresh
+/// while a *later* child carries zero-offset sparse-stale state, with a
+/// recoverable `Error::Backend`, and writes NO file. `CacheList::is_empty()`
+/// reports only the first child's emptiness, so the old guard missed the
+/// stale later child; `is_fresh()` polls ALL children recursively.
+#[test]
+fn cache_prompt_ids_rejects_cache_list_with_stale_later_child_without_writing() {
+  let model = MockModel::ramp(8);
+  let dir = temp_dir("list_stale_child");
+
+  // child 0: a genuinely fresh StandardKvCache; child 1: a sparse
+  // (slot-0-empty, slot-1-populated) ArraysCache holding zero-offset state.
+  let mut stale_child = ArraysCache::new(2);
+  stale_child.set(1, slot_state()).unwrap();
+  let list = CacheList::new(vec![
+    Box::new(StandardKvCache::new()) as Box<dyn KvCache>,
+    Box::new(stale_child) as Box<dyn KvCache>,
+  ]);
+  assert!(
+    list.is_empty(),
+    "precondition: CacheList::is_empty() sees only the (fresh) first child"
+  );
+  assert!(
+    !list.is_fresh(),
+    "a CacheList with a stale later child must NOT be fresh"
+  );
+  let mut c: Vec<Box<dyn KvCache>> = vec![Box::new(list)];
+
+  let out = dir.join("list_stale.safetensors");
+  assert!(
+    !out.exists(),
+    "precondition: the target file does not exist"
+  );
+  let err = cache_prompt_ids(
+    &model,
+    &[1u32, 3],
+    &mut c,
+    &out,
+    "mock",
+    "{}",
+    8,
+    &HashMap::new(),
+  )
+  .expect_err("a CacheList with a stale later child must be rejected");
+  match err {
+    mlxrs::Error::Backend { message } => assert!(
+      message.contains("fresh"),
+      "the rejection message must indicate the cache is not fresh: {message}"
+    ),
+    other => panic!("expected a recoverable Error::Backend, got {other:?}"),
+  }
+  assert!(
+    !out.exists(),
+    "a CacheList with a stale child must NOT persist anything"
+  );
+}
+
+/// No false-reject: a genuinely fresh cache of every concrete `KvCache` kind
+/// passes the freshness guard's `is_fresh()` predicate. The full-path
+/// positive runs (fresh cache → `cache_prompt_ids` → save) are covered by
+/// `driver_fill_save_load_matches_direct_prefill` (`StandardKvCache`) and
+/// `driver_sliding_window_*` (`RotatingKvCache`); this pins the predicate
+/// itself for the kinds the driver does not otherwise prefill (`ArraysCache`
+/// / `CacheList`, whose `update` is container/slot-only) so the guard cannot
+/// regress to wrongly rejecting them.
+#[test]
+fn freshly_built_caches_of_every_kind_pass_the_guard_predicate() {
+  assert!(
+    StandardKvCache::new().is_fresh(),
+    "a fresh StandardKvCache must pass the guard"
+  );
+  assert!(
+    RotatingKvCache::new(8, 4).is_fresh(),
+    "a fresh RotatingKvCache must pass the guard"
+  );
+  assert!(
+    ArraysCache::new(2).is_fresh(),
+    "a fresh 2-slot ArraysCache must pass the guard"
+  );
+  // A CacheList over all-fresh children is fresh (recursively).
+  let fresh_list = CacheList::new(vec![
+    Box::new(StandardKvCache::new()) as Box<dyn KvCache>,
+    Box::new(ArraysCache::new(2)) as Box<dyn KvCache>,
+  ]);
+  assert!(
+    fresh_list.is_fresh(),
+    "a CacheList over all-fresh children must pass the guard"
+  );
+}
+
+// ---------------------------------------------------------------------------
 // High-level `cache_prompt` (tokenizer encode path).
 // ---------------------------------------------------------------------------
 
@@ -868,6 +1037,9 @@ impl KvCache for ObservingRotatingCache {
   }
   fn is_empty(&self) -> bool {
     self.inner.is_empty()
+  }
+  fn is_fresh(&self) -> bool {
+    self.inner.is_fresh()
   }
   fn copy(&self) -> mlxrs::Result<Box<dyn KvCache>> {
     self.inner.copy()

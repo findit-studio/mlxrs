@@ -293,6 +293,38 @@ pub trait KvCache {
   /// Whether the cache holds no keys yet (mlx-lm `cache.empty()`).
   fn is_empty(&self) -> bool;
 
+  /// Whether the cache holds **no prefilled/serialized state at all** — a
+  /// genuinely *fresh* cache, exactly as a just-built
+  /// [`make_prompt_cache`] entry is.
+  ///
+  /// This is **not** the same predicate as [`is_empty`](KvCache::is_empty)
+  /// or `offset() == 0`, and a correct impl must **not** be derived from
+  /// them:
+  ///
+  /// - [`is_empty`](KvCache::is_empty) is each cache's faithful port of
+  ///   mlx-lm `cache.empty()`, which for several caches checks only **one**
+  ///   buffer/slot — e.g. [`ArraysCache::is_empty`] tests `cache[0] is None`
+  ///   (`cache.py:723-724`), so a *sparse* `ArraysCache` whose slot 0 is
+  ///   empty while a later slot is populated reports `is_empty() == true`
+  ///   despite holding state.
+  /// - [`offset`](KvCache::offset) is `0` for caches that never advance it —
+  ///   [`ArraysCache::offset`] is always `0` (mlx-lm `ArraysCache` has no
+  ///   `offset`), so `offset() == 0` says nothing about its slots.
+  ///
+  /// `cache_prompt`'s freshness guard ([`crate::lm::cache_prompt`]) needs
+  /// the *exact* "holds nothing" predicate so a reused / sparsely-populated
+  /// cache cannot reach `prefill_full` and persist stale cross-request
+  /// state. Each concrete cache therefore implements this against **all**
+  /// of its state — every key/value buffer, every SSM slot, every
+  /// per-sequence ring cursor / position field, and (for [`CacheList`])
+  /// every child recursively — so a fresh cache returns `true` and any
+  /// cache carrying prefilled or restored state returns `false`.
+  ///
+  /// This is a **required** method (no default) precisely so a new cache
+  /// kind cannot silently inherit an `offset()`/`is_empty()`-based
+  /// approximation that would miss its sparse/aggregate state.
+  fn is_fresh(&self) -> bool;
+
   /// An independent deep copy (mlx-lm `copy.deepcopy` / swift `copy()`).
   ///
   /// Swift's `copy()` is infallible (array COW); in Rust the underlying
