@@ -40,12 +40,19 @@
 //!   dup. A `try_clone` is **cheap** (a refcount bump + a small handle
 //!   alloc, no feature-data copy), so caching shares the buffer exactly
 //!   like Python's reference-semantics `mx.array`.
-//! - **Keys are [`Key`], an owned `String` wrapper.** Python's `_make_key`
-//!   normalizes every source to a `str`; [`Key`] does the same with
-//!   three constructors mirroring the three Python branches —
+//! - **Keys are [`Key`], a normalized-string wrapper.** Python's
+//!   `_make_key` normalizes every source to a `str`; [`Key`] does the same
+//!   with three constructors mirroring the three Python branches —
 //!   [`Key::from_source`] (the `str` branch — path/URL used verbatim),
 //!   [`Key::from_sources`] (the `list` branch — `"|"`-joined), and
-//!   [`Key::from_bytes`] (the PIL branch — a content hash). Because
+//!   [`Key::from_bytes`] (the PIL branch — a content hash). [`Key`] holds
+//!   that string as an [`Rc<str>`](std::rc::Rc) (an implementation
+//!   detail — every public constructor / accessor has the same signature
+//!   and semantics it would with a `String` field); the cache stores
+//!   `Rc<str>` clones in both its containers, so the recency queue and the
+//!   entry map share one heap-allocated string and [`put`] never
+//!   heap-copies a key (see [`Key`]'s "Internal representation" note and
+//!   [`VisionFeatureCache`]'s "Key storage" note). Because
 //!   mlxrs has no PIL type and no crypto dependency, [`Key::from_bytes`]
 //!   uses the std [`DefaultHasher`](std::hash::DefaultHasher) (a fast
 //!   non-cryptographic hash) rather than `sha256`: this is a **cache
@@ -71,6 +78,7 @@
 use std::{
   collections::{HashMap, VecDeque},
   hash::{Hash, Hasher},
+  rc::Rc,
 };
 
 use crate::{
@@ -98,8 +106,31 @@ pub const DEFAULT_MAX_SIZE: usize = 20;
 /// distinct sources never collide and (matching the reference) **list
 /// order is significant** — `["a", "b"]` and `["b", "a"]` are different
 /// keys.
+///
+/// # Internal representation
+///
+/// The normalized string is held as an [`Rc<str>`](Rc), not a `String`.
+/// This is an implementation detail — every public method
+/// ([`from_source`](Self::from_source), [`from_sources`](Self::from_sources),
+/// [`from_bytes`](Self::from_bytes), [`as_str`](Self::as_str), and the
+/// `From<&str>` conversion) has the exact same signature and behavior it
+/// would with a `String` field. The `Rc` backing buys two things the cache
+/// relies on:
+///
+/// - **`Clone` is a refcount bump** — infallible, no heap allocation, no
+///   string copy. [`VisionFeatureCache`] stores a key in *two* containers
+///   (the entry map and the recency queue); with an `Rc<str>` the second
+///   container gets a [`Rc::clone`], so a [`put`](VisionFeatureCache::put)
+///   never heap-copies a key and the post-eviction key handoff cannot
+///   fail. (With a `String` field that second copy was a fallible-by-abort
+///   heap allocation occurring *after* eviction — a transactional hazard.)
+/// - **`Hash`/`Eq` are unchanged** — `Rc<str>` hashes and compares by the
+///   pointed-to `str` *content* (it derefs / `Borrow`s `str`), so the
+///   derived `Hash`/`PartialEq`/`Eq` here are byte-for-byte the same
+///   relation as a `String`-backed `Key`: two `Key`s are equal iff their
+///   strings are equal, full stop.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Key(String);
+pub struct Key(Rc<str>);
 
 impl Key {
   /// Key for a single path- or URL-style image source — the reference's
@@ -111,7 +142,10 @@ impl Key {
   /// different query string) is a distinct key — exactly as in the
   /// reference, which does no path canonicalization.
   pub fn from_source(source: &str) -> Self {
-    Self(source.to_owned())
+    // `Rc::from(&str)` allocates the shared string once, here in the
+    // constructor — the cache's `put` then only ever *moves* and refcount-
+    // clones this `Rc`, never re-allocates the key.
+    Self(Rc::from(source))
   }
 
   /// Key for a multi-image source — the reference's
@@ -124,7 +158,11 @@ impl Key {
   /// `"".join([])`), and a single-element slice equals
   /// [`Key::from_source`] of that element — both faithful to `str.join`.
   pub fn from_sources(sources: &[&str]) -> Self {
-    Self(sources.join("|"))
+    // `join` builds the `'|'`-joined `String`; `Rc::from` consumes it into
+    // the shared `Rc<str>` the cache stores (the transient `String` buffer
+    // is freed). The whole allocation cost is borne here in the
+    // constructor, not on the `put` hot path.
+    Self(Rc::from(sources.join("|")))
   }
 
   /// Key for an in-memory image with no stable path — the reference's
@@ -142,12 +180,15 @@ impl Key {
   pub fn from_bytes(bytes: &[u8]) -> Self {
     let mut hasher = std::hash::DefaultHasher::new();
     bytes.hash(&mut hasher);
-    Self(format!("pil:{:016x}", hasher.finish()))
+    // `format!` builds the `pil:`-prefixed digest `String`; `Rc::from`
+    // consumes it into the shared `Rc<str>` (transient buffer freed).
+    Self(Rc::from(format!("pil:{:016x}", hasher.finish())))
   }
 
   /// The normalized key string. Exposed for tests / introspection; the
   /// cache never needs the caller to read it.
   pub fn as_str(&self) -> &str {
+    // `Rc<str>` derefs to `str`; `&self.0` coerces `&Rc<str>` to `&str`.
     &self.0
   }
 }
@@ -183,6 +224,22 @@ impl From<&str> for Key {
 /// entry (the reference's model-unload hook); on `Drop` the whole map is
 /// freed.
 ///
+/// # Key storage
+///
+/// A key's normalized string is stored exactly **once** per entry as an
+/// [`Rc<str>`](Rc): the entry-map key and the recency-queue entry are two
+/// [`Rc::clone`]s of that one allocation. `Rc::clone` is an infallible
+/// refcount bump — **no heap allocation, no string copy** — so every
+/// key-side operation on the [`put`] path (inserting into both containers)
+/// and on the recency-update path (a [`get`] hit relocates the key within
+/// the recency queue) is allocation-free. The string a [`Key`] carries is
+/// consumed into the `Rc<str>` once, on the inserting `put`; after that no
+/// `put` or `get` ever heap-allocates a key. This is what makes a
+/// full-cache `put` (evict + insert) and a `get` hit's recency bump
+/// strictly allocation-free on the key side, and what makes the
+/// post-eviction key handoff infallible (a refcount bump cannot fail), so
+/// a failed `put` can never leave the cache half-mutated.
+///
 /// # Concurrency
 ///
 /// Not `Sync` (it stores [`Array`], which is intentionally `!Send` +
@@ -192,15 +249,24 @@ pub struct VisionFeatureCache {
   /// LRU bound. `>= 1` — enforced by [`Self::with_max_size`].
   max_size: usize,
   /// Key → feature-`Array` map. Holds the owned (refcount-shared)
-  /// handles.
-  entries: HashMap<Key, Array>,
+  /// `Array` handles. The map *key* is an [`Rc<str>`](Rc): the same
+  /// allocation the recency queue holds (see the struct-level "Key
+  /// storage" note), so admitting a key never heap-copies the string.
+  /// `Rc<str>` hashes and compares by content (it `Borrow`s `str`), so
+  /// lookups with a `&Key` work via `key.as_str()`.
+  entries: HashMap<Rc<str>, Array>,
   /// Recency queue, **least-recently-used at the front**, most-recent at
   /// the back — the explicit mirror of `OrderedDict`'s insertion order.
   /// `move_to_end` is "remove this key, push it to the back"; eviction is
   /// "pop the front" (`popitem(last=False)`). Every key in `entries` is
   /// present exactly once in `recency`, and vice versa — the two are kept
   /// in lockstep by every mutating method.
-  recency: VecDeque<Key>,
+  ///
+  /// Holds [`Rc<str>`](Rc) clones of the *same* allocations the entry map
+  /// keys point at. Pushing/moving a key here is therefore a refcount bump,
+  /// not a `String` copy — so [`put`](Self::put) and [`touch`](Self::touch)
+  /// never heap-allocate a key.
+  recency: VecDeque<Rc<str>>,
 }
 
 impl VisionFeatureCache {
@@ -232,8 +298,11 @@ impl VisionFeatureCache {
   /// successful construction — a DoS class. Empty-init removes that
   /// entirely; the cost is a few reallocations as the cache fills to its
   /// actual working set (which is `<= max_size`, and usually far smaller).
-  /// Incremental growth is itself fallible — see [`put`](Self::put)'s
-  /// `try_reserve(1)`, so even map growth cannot abort the process.
+  /// That incremental growth happens only while the cache is below
+  /// `max_size` and is itself fallible — see [`put`](Self::put)'s not-full
+  /// path `try_reserve(1)` — so even map growth cannot abort the process.
+  /// Once the cache is full, eviction reuses freed capacity and `put` does
+  /// not grow a container at all.
   ///
   /// # Errors
   ///
@@ -308,7 +377,10 @@ impl VisionFeatureCache {
     // `try_clone` BEFORE touching `recency`: if the clone fails we return
     // `Err` having mutated nothing, so the cache is left exactly as it
     // was (transactional — no half-applied LRU bump).
-    let cloned = match self.entries.get(key) {
+    //
+    // The map keys are `Rc<str>`, which `Borrow<str>`, so the lookup keys
+    // on `key.as_str()` — no `Key`/`Rc` is constructed to probe the map.
+    let cloned = match self.entries.get(key.as_str()) {
       Some(features) => features.try_clone()?,
       None => return Ok(None),
     };
@@ -337,62 +409,116 @@ impl VisionFeatureCache {
   /// # Errors
   ///
   /// - [`Error::OutOfMemory`] (or another backend error) if the
-  ///   [`Array::try_clone`] of `features` fails.
+  ///   [`Array::try_clone`] of `features` fails — this is checked **first**,
+  ///   before any mutation.
   /// - [`Error::OutOfMemory`] if growing a backing container to admit a
-  ///   **new** key fails. Capacity grows lazily (the constructor pre-reserves
-  ///   nothing — see [`with_max_size`](Self::with_max_size)), so a new
-  ///   insertion may need one growth step; that step is the fallible
+  ///   **new** key into a **not-full** cache fails. Capacity grows lazily
+  ///   (the constructor pre-reserves nothing — see
+  ///   [`with_max_size`](Self::with_max_size)), so inserting into a cache
+  ///   below `max_size` may need one growth step; that step is the fallible
   ///   [`try_reserve(1)`](HashMap::try_reserve), so it cannot abort the
-  ///   process on an allocator failure. The overwrite path reuses an existing
-  ///   slot and never grows, so it never hits this.
+  ///   process. The **full**-cache and **overwrite** paths never grow a
+  ///   container (see below), so they never hit this — and never error at
+  ///   all once the initial `try_clone` has succeeded.
   ///
-  /// On any error the cache is **unchanged** — the clone and the
-  /// reservation both happen before any structural mutation, so a failed
-  /// `put` neither inserts, overwrites, nor evicts.
+  /// # Allocation discipline (zero-alloc on the hot paths)
+  ///
+  /// Keys are stored as [`Rc<str>`](Rc) — the heap string was allocated in
+  /// the [`Key`] constructor, before `put` is even called. Inside `put` a
+  /// key is only ever *moved* into a container or refcount-cloned
+  /// ([`Rc::clone`]) into the second one; `put` itself **never
+  /// heap-allocates a key**.
+  ///
+  /// - **Overwrite** (`key` present): the value is replaced in place via
+  ///   [`HashMap::get_mut`] — the existing entry, its `Rc<str>` key, and
+  ///   both containers' capacity are all reused. No growth, no eviction, no
+  ///   allocation.
+  /// - **New key, cache full** (`len == max_size`): the LRU entry is
+  ///   evicted **first** (dropping `len` to `max_size - 1` at unchanged
+  ///   container capacity), *then* the new key is inserted — refilling the
+  ///   just-freed slot. Because eviction precedes insertion the containers
+  ///   never need to grow past `max_size`, so this path does **no
+  ///   `try_reserve` and no allocation**: it is `evict` + `insert` +
+  ///   [`Rc::clone`], every step infallible. Once `try_clone` has passed
+  ///   the full path *cannot fail*, so it cannot leave the cache
+  ///   half-mutated.
+  /// - **New key, cache not full** (`len < max_size`): the insertion
+  ///   genuinely grows the containers by one slot, so each is given a
+  ///   fallible [`try_reserve(1)`](HashMap::try_reserve) **before** any
+  ///   structural mutation. This is the *only* allocating path, and its one
+  ///   allocation is fallible (recoverable `Error::OutOfMemory`), never an
+  ///   abort.
+  ///
+  /// On any error the cache is **unchanged** — `try_clone` and (on the
+  /// not-full path only) the `try_reserve`s all happen before any
+  /// structural mutation, and the full path has no fallible step after
+  /// `try_clone` at all, so a failed `put` never inserts, overwrites, or
+  /// evicts.
   pub fn put(&mut self, key: Key, features: &Array) -> Result<()> {
-    // Clone FIRST — before any mutation — so a clone failure leaves the
-    // cache (entries + recency + the would-be-evicted victim) untouched.
+    // Clone the value FIRST — before any mutation — so a clone failure
+    // leaves the cache (entries + recency + the would-be-evicted victim)
+    // untouched.
     let stored = features.try_clone()?;
 
-    if self.entries.contains_key(&key) {
-      // Overwrite path: replace the value, refresh recency. The key already
-      // exists so `insert` reuses its slot — no growth, no eviction (mirrors
-      // the reference's `move_to_end` then `self._cache[key] = features`).
-      self.entries.insert(key.clone(), stored);
+    // Overwrite path: the key is already present. Replace the value in its
+    // existing slot via `get_mut` (the map keys are `Rc<str>`, which
+    // `Borrow<str>`, so this probes with `key.as_str()` — no `Rc` built).
+    // The entry's `Rc<str>` key and both containers' capacity are reused —
+    // no growth, no eviction, no key allocation (mirrors the reference's
+    // `move_to_end` then `self._cache[key] = features`).
+    if let Some(slot) = self.entries.get_mut(key.as_str()) {
+      *slot = stored;
       self.touch(&key);
       return Ok(());
     }
 
-    // New key. Containers were constructed empty (no upfront reserve), so
-    // admitting a new key may grow them by one. Reserve that one slot
-    // FALLIBLY, BEFORE any structural mutation (and before the eviction
-    // below) — so a reservation failure leaves the cache *exactly* as it
-    // was: no insert, no overwrite, and crucially no premature eviction.
-    // Incremental growth thus stays recoverable (`Error::OutOfMemory`) and
-    // can never abort the process the way an infallible `insert`-triggered
-    // realloc could. Reserving one slot of headroom on the current length is
-    // always enough: the optional eviction below only ever *shrinks* the
-    // containers before the single push/insert.
-    self
-      .recency
-      .try_reserve(1)
-      .map_err(|_| Error::OutOfMemory)?;
-    self
-      .entries
-      .try_reserve(1)
-      .map_err(|_| Error::OutOfMemory)?;
+    // New key. The `Key` carries its `Rc<str>` (the heap string was
+    // allocated in the `Key` constructor, not here); move it out so the two
+    // containers can share it by refcount.
+    let key_rc: Rc<str> = key.0;
 
-    // At capacity: evict the LRU entry first. `>=` (not `==`) matches the
-    // reference's `len(self._cache) >= self.max_size`; with the invariant
-    // `len <= max_size` always holding, this evicts exactly one entry, and
-    // only when full.
-    if self.entries.len() >= self.max_size
-      && let Some(lru_key) = self.recency.pop_front()
-    {
-      self.entries.remove(&lru_key);
+    if self.entries.len() >= self.max_size {
+      // FULL — evict the LRU entry *before* inserting. `>=` (not `==`)
+      // mirrors the reference's `len(self._cache) >= self.max_size`; with
+      // the invariant `len <= max_size` always holding, exactly one entry
+      // is dropped. Eviction drops `len` to `max_size - 1` while leaving
+      // container *capacity* untouched, so the `push_back` / `insert`
+      // below refill the just-freed slot and never grow — no `try_reserve`
+      // is needed, and this whole path has no fallible step (it cannot
+      // leave the cache half-mutated).
+      //
+      // Capacity is sufficient by construction: the cache only ever
+      // reaches `len == max_size` via a not-full insert (the step from
+      // `max_size - 1` to `max_size`), and that insert ran `try_reserve(1)`
+      // — so whenever the cache is full both containers already have
+      // capacity `>= max_size`. `remove`/`pop_front` never shrink, so that
+      // capacity still holds here.
+      if let Some(lru_key) = self.recency.pop_front() {
+        self.entries.remove(&lru_key);
+      }
+    } else {
+      // NOT FULL — the insertion genuinely grows the containers by one.
+      // Reserve that one slot FALLIBLY, BEFORE any structural mutation, so
+      // a reservation failure leaves the cache *exactly* as it was (no
+      // insert, no overwrite, no eviction). This is the only allocating
+      // path in `put`, and the allocation is recoverable (`OutOfMemory`),
+      // never an abort.
+      self
+        .recency
+        .try_reserve(1)
+        .map_err(|_| Error::OutOfMemory)?;
+      self
+        .entries
+        .try_reserve(1)
+        .map_err(|_| Error::OutOfMemory)?;
     }
-    self.recency.push_back(key.clone());
-    self.entries.insert(key, stored);
+
+    // Insert the new key into both containers. `Rc::clone` is an
+    // infallible refcount bump (no allocation, no string copy); the
+    // `entries.insert` then *moves* the `Rc`. Both containers thus share
+    // one heap-allocated string.
+    self.recency.push_back(Rc::clone(&key_rc));
+    self.entries.insert(key_rc, stored);
     Ok(())
   }
 
@@ -403,7 +529,9 @@ impl VisionFeatureCache {
   /// recency (the reference's `__contains__` likewise does not
   /// `move_to_end`), so it can take `&self`.
   pub fn contains(&self, key: &Key) -> bool {
-    self.entries.contains_key(key)
+    // The map keys are `Rc<str>`, which `Borrow<str>`, so membership is
+    // probed with `key.as_str()` — no `Rc` is constructed for the query.
+    self.entries.contains_key(key.as_str())
   }
 
   /// Drop every cached entry — port of `clear` (`vision_cache.py:70-72`),
@@ -421,21 +549,45 @@ impl VisionFeatureCache {
   /// Mark `key` as most-recently-used: the mirror of
   /// `OrderedDict.move_to_end(key)`.
   ///
-  /// Removes the (single) prior occurrence of `key` from `recency` and
-  /// pushes it to the back. `key` is assumed present in `entries` by
-  /// every caller; if it is somehow absent from `recency` the queue is
-  /// just left as-is (no panic) — but the entries/recency lockstep
-  /// invariant means that never happens in practice.
+  /// Relocates the (single) prior occurrence of `key` to the back of
+  /// `recency`. `key` is assumed present in `entries` by every caller; if
+  /// it is somehow absent from `recency` the queue is just left as-is (no
+  /// panic) — but the entries/recency lockstep invariant means that never
+  /// happens in practice.
+  ///
+  /// Allocation-free: the queue stores [`Rc<str>`](Rc), so the existing
+  /// entry is **moved** (not copied) from its old position to the back —
+  /// [`VecDeque::remove`] hands back the queue's own `Rc<str>` and
+  /// [`VecDeque::push_back`] re-files that same allocation. No `String`
+  /// copy, no heap allocation, no refcount churn.
   fn touch(&mut self, key: &Key) {
-    if let Some(pos) = self.recency.iter().position(|k| k == key) {
-      // `remove` at an arbitrary position is O(n) in the queue length,
-      // but the queue length is bounded by `max_size` (default 20) — a
-      // tiny, fixed bound — so this is effectively O(1) for any realistic
-      // cache. Faithful to `OrderedDict.move_to_end`'s O(1) amortized
-      // intent without pulling an intrusive-list dependency.
-      self.recency.remove(pos);
+    // The queue holds `Rc<str>`; compare by `str` content (`as_ref()` /
+    // `as_str()` both yield `&str`) so a `&Key` probes without building
+    // an `Rc`.
+    match self.recency.iter().position(|k| k.as_ref() == key.as_str()) {
+      Some(pos) => {
+        // MOVE the existing entry to the back: `remove` yields the
+        // queue's own `Rc<str>` (no copy), `push_back` re-files that
+        // exact allocation. `remove` at an arbitrary position is O(n) in
+        // the queue length, but that length is bounded by `max_size`
+        // (default 20) — a tiny fixed bound — so this is effectively O(1)
+        // for any realistic cache, faithful to `OrderedDict.move_to_end`'s
+        // O(1)-amortized intent without an intrusive-list dependency.
+        // `pos` came from `position`, so `remove` is always `Some`; the
+        // `if let` simply avoids any panic branch on the hot path.
+        if let Some(entry) = self.recency.remove(pos) {
+          self.recency.push_back(entry);
+        }
+      }
+      None => {
+        // Unreachable under the entries/recency lockstep invariant (every
+        // `entries` key is present in `recency`). Kept as a no-panic
+        // safety net: if a key were somehow missing, re-file it via an
+        // `Rc::clone` (infallible refcount bump) of the caller's key —
+        // still allocation-free, no `String` copy.
+        self.recency.push_back(Rc::clone(&key.0));
+      }
     }
-    self.recency.push_back(key.clone());
   }
 }
 
@@ -457,5 +609,219 @@ impl std::fmt::Debug for VisionFeatureCache {
       .field("max_size", &self.max_size)
       .field("len", &self.entries.len())
       .finish()
+  }
+}
+
+/// Allocation-discipline tests that need to inspect the cache's **private**
+/// containers (`entries` / `recency`) — capacity stability and `Rc<str>`
+/// key sharing. They live in an inline `#[cfg(test)]` module (not the
+/// integration suite in `tests/vlm_feature_cache.rs`) precisely because the
+/// guarantees under test are structural and only observable through the
+/// private fields. The functional behavior tests (put/get/LRU/overwrite/
+/// the lazy-capacity tests) stay in the integration suite.
+#[cfg(test)]
+mod alloc_discipline_tests {
+  use super::*;
+
+  /// A small feature tensor — the value is irrelevant here (these tests
+  /// exercise key/container bookkeeping, not feature contents).
+  fn features() -> Array {
+    Array::full::<f32>(&(1usize, 4usize, 8usize), 1.0)
+      .expect("constructing a tiny feature tensor must not fail")
+  }
+
+  /// Fill the cache to exactly `max_size` entries with distinct keys
+  /// `k0..k{max_size}`.
+  fn fill_to_capacity(cache: &mut VisionFeatureCache) {
+    for i in 0..cache.max_size() {
+      cache
+        .put(Key::from_source(&format!("k{i}")), &features())
+        .expect("put while filling below capacity must succeed");
+    }
+  }
+
+  /// **Finding 1 — evict-first, no wasteful `len+1` reserve.** Once the
+  /// cache is full, a new-key `put` evicts the LRU entry *first* and
+  /// refills the freed slot, so neither backing container ever grows past
+  /// `max_size` capacity. This test fills to `max_size`, snapshots both
+  /// containers' capacity, performs a full-cache `put`, and asserts the
+  /// capacity is **unchanged** — i.e. the full path took no `try_reserve`
+  /// and no reallocation (the old code's `len+1` reserve, which could
+  /// spuriously `Err(OutOfMemory)` under pressure, is gone).
+  #[test]
+  fn full_cache_put_evicts_without_capacity_growth() {
+    let mut cache = VisionFeatureCache::with_max_size(4).unwrap();
+    fill_to_capacity(&mut cache);
+    assert_eq!(cache.len(), 4, "cache is filled to max_size");
+
+    let entries_cap_before = cache.entries.capacity();
+    let recency_cap_before = cache.recency.capacity();
+
+    // Full-cache put: a brand-new key. Evicts the LRU (`k0`) and inserts.
+    cache
+      .put(Key::from_source("new"), &features())
+      .expect("full-cache put must succeed (eviction admits the new key)");
+
+    assert_eq!(
+      cache.len(),
+      4,
+      "len returns to max_size: one evicted, one inserted"
+    );
+    assert_eq!(
+      cache.entries.capacity(),
+      entries_cap_before,
+      "entries map must NOT grow on the full path — eviction frees a slot \
+       the insert reuses (no try_reserve, no realloc)"
+    );
+    assert_eq!(
+      cache.recency.capacity(),
+      recency_cap_before,
+      "recency queue must NOT grow on the full path — same freed-slot reuse"
+    );
+    // The LRU was evicted, the new key admitted: behavior is intact.
+    assert!(
+      !cache.contains(&Key::from_source("k0")),
+      "k0 was the LRU and must have been evicted"
+    );
+    assert!(
+      cache.contains(&Key::from_source("new")),
+      "the new key must have been admitted"
+    );
+  }
+
+  /// The full path is *repeatably* zero-growth: many consecutive
+  /// full-cache `put`s never reallocate either container. This locks in
+  /// that the evict-first restructure has no slow drift toward growth.
+  #[test]
+  fn repeated_full_cache_puts_never_grow_containers() {
+    let mut cache = VisionFeatureCache::with_max_size(3).unwrap();
+    fill_to_capacity(&mut cache);
+
+    let entries_cap = cache.entries.capacity();
+    let recency_cap = cache.recency.capacity();
+
+    for i in 0..32 {
+      cache
+        .put(Key::from_source(&format!("extra{i}")), &features())
+        .expect("each full-cache put must succeed");
+      assert_eq!(cache.len(), 3, "len stays pinned at max_size");
+      assert_eq!(
+        cache.entries.capacity(),
+        entries_cap,
+        "entries capacity must stay stable across every full-cache put"
+      );
+      assert_eq!(
+        cache.recency.capacity(),
+        recency_cap,
+        "recency capacity must stay stable across every full-cache put"
+      );
+    }
+  }
+
+  /// **Finding 2 — post-eviction key handoff is a refcount bump, not a
+  /// heap `String` clone.** Keys are stored as `Rc<str>`: a `put` builds
+  /// the `Rc<str>` *once* (in the `Key` constructor, before `put`), then
+  /// the entry map and the recency queue each hold a [`Rc::clone`] — an
+  /// infallible refcount bump, no allocation. This test proves the
+  /// single-allocation sharing structurally: after a full-cache `put` the
+  /// inserted key's `Rc<str>` has `strong_count == 2` — exactly one
+  /// reference per container. Two *independent* allocations (the hazard if
+  /// the code `String`-cloned the key) would instead be two separate
+  /// `Rc`s each at count 1. A count of 2 is only possible if both
+  /// containers share one allocation, which is the zero-alloc, infallible,
+  /// transactional handoff the fix guarantees.
+  #[test]
+  fn full_cache_put_shares_one_key_allocation() {
+    let mut cache = VisionFeatureCache::with_max_size(2).unwrap();
+    fill_to_capacity(&mut cache);
+
+    // Full-cache put — the new-key/full path (evict LRU, then insert).
+    cache
+      .put(Key::from_source("shared"), &features())
+      .expect("full-cache put must succeed");
+
+    // Pull the stored key's `Rc<str>` back out of the entry map and count
+    // its strong references. `entries` holds one; `recency` holds the
+    // other; they are the SAME allocation (`Rc::clone`d, not re-allocated).
+    let (key_rc, _) = cache
+      .entries
+      .get_key_value("shared")
+      .expect("the just-inserted key must be present");
+    assert_eq!(
+      Rc::strong_count(key_rc),
+      2,
+      "the key's `Rc<str>` is shared by exactly the two containers \
+       (entry map + recency queue) — one allocation, two refcount-clones, \
+       NO heap `String` copy on the put path"
+    );
+  }
+
+  /// **`touch` (the `get`-hit recency bump) does not clone the key
+  /// string.** On a `get` hit the entry's recency position is refreshed by
+  /// `touch`, which *moves* the existing `Rc<str>` within the `VecDeque`
+  /// (`remove` then `push_back` of the same `Rc`) rather than cloning a
+  /// `String`. After a `get` hit the touched key's `Rc<str>` therefore
+  /// still has `strong_count == 2` (entry map + recency queue) — `touch`
+  /// neither allocated a new key nor leaked an extra reference.
+  #[test]
+  fn get_hit_touch_does_not_clone_key_string() {
+    let mut cache = VisionFeatureCache::with_max_size(4).unwrap();
+    cache
+      .put(Key::from_source("hot"), &features())
+      .expect("initial put must succeed");
+
+    // Sanity: freshly inserted, the key is shared by the two containers.
+    {
+      let (rc, _) = cache.entries.get_key_value("hot").unwrap();
+      assert_eq!(Rc::strong_count(rc), 2, "post-put: entries + recency");
+    }
+
+    // A `get` hit drives `touch`. The probe `Key` below is a *separate*
+    // allocation (its own `Rc`, count 1) — it cannot perturb the stored
+    // key's count.
+    for _ in 0..8 {
+      assert!(
+        cache.get(&Key::from_source("hot")).unwrap().is_some(),
+        "the key must hit"
+      );
+      let (rc, _) = cache.entries.get_key_value("hot").unwrap();
+      assert_eq!(
+        Rc::strong_count(rc),
+        2,
+        "after a `get`-hit `touch` the key's `Rc<str>` is STILL shared by \
+         just the two containers — `touch` moved the queue's `Rc` rather \
+         than cloning the key string, so no allocation and no leaked ref"
+      );
+    }
+  }
+
+  /// The overwrite path likewise reuses the existing `Rc<str>` key (it
+  /// replaces only the value, via `get_mut`) — so an overwrite neither
+  /// allocates a key nor changes the key's refcount.
+  #[test]
+  fn overwrite_reuses_key_allocation() {
+    let mut cache = VisionFeatureCache::with_max_size(4).unwrap();
+    cache
+      .put(Key::from_source("ow"), &features())
+      .expect("initial put must succeed");
+    let cap_before = cache.entries.capacity();
+
+    cache
+      .put(Key::from_source("ow"), &features())
+      .expect("overwrite put must succeed");
+
+    let (rc, _) = cache.entries.get_key_value("ow").unwrap();
+    assert_eq!(
+      Rc::strong_count(rc),
+      2,
+      "overwrite reuses the existing key `Rc<str>` (entries + recency); \
+       it does not allocate or clone a key"
+    );
+    assert_eq!(cache.len(), 1, "overwrite must not grow the cache");
+    assert_eq!(
+      cache.entries.capacity(),
+      cap_before,
+      "overwrite reuses the existing slot — no capacity growth"
+    );
   }
 }
