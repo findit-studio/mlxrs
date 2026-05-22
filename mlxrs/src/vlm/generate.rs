@@ -545,8 +545,17 @@ impl<M: Model> VlmDecode<'_, M> {
     //    (`y.item()` in mlx-vlm / mlx-lm).
     let token: u32 = sampled.item::<u32>()?;
     // mlx-vlm/mlx-lm `logprobs.squeeze(0)` ⇒ a `[V]` vector. Kept lazy.
+    // L3 `GenStep.logprobs` is `Option<Array>`: VLM has not adopted the
+    // [`crate::lm::generate::GenConfig::collect_logprobs`] opt-in yet, so
+    // we always emit `Some` to preserve the prior unconditional yield
+    // (callers' field access shape changes from `step.logprobs` to
+    // `step.logprobs.unwrap()` / `.as_ref()` — the same source-break the
+    // LM crate accepts).
     let logprobs = ops::shape::squeeze_axes(&logprobs, &[0])?;
-    Ok(GenStep { token, logprobs })
+    Ok(GenStep {
+      token,
+      logprobs: Some(logprobs),
+    })
   }
 
   /// The embed-based prefill (VLM-8 offset-aware chunked design): walk

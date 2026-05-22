@@ -9,10 +9,20 @@
 //! Everything is generic over the [`Model`] trait: the loop only ever calls
 //! `model.forward(tokens, &mut cache)`. The decode loop is an idiomatic Rust
 //! [`Iterator`] (the spec's A1) — [`generate_step`] yields one [`GenStep`]
-//! per step (the typed step item: `token` + `logprobs`),
+//! per step (the typed step item: `token` + opt-in `logprobs`),
 //! [`stream_generate`] maps that through the #18 streaming detokenizer into
 //! [`GenerationResponse`]s, and [`generate`] collects the whole thing into a
-//! `String`.
+//! `(String, GenerationStats)` pair (the L3 stats surface — counts +
+//! tokens-per-second + peak memory, sourced from the final
+//! [`GenerationResponse`]).
+//!
+//! **L3 opt-in: per-step logprobs are gated by
+//! [`GenConfig::collect_logprobs`].** When `false` (default), [`GenStep`]'s
+//! `logprobs` field is `None` and the post-sampler squeeze is skipped — the
+//! decode loop never builds the `[V]` MLX node, so a caller that only
+//! reads `token` pays zero per-step materialization cost. When `true`, the
+//! `[V]` `Array` is yielded byte-identically to mlx-lm's
+//! `logprobs.squeeze(0)`.
 //!
 //! **Exact per-step order (mlx-lm `generate_step._step`, lines 396-422):**
 //!
@@ -28,7 +38,10 @@
 //! 5. `token = sampler(logprobs)` — the [`make_sampler`] chain
 //!    (top-k/p, min-p, xtc, categorical) or the default temperature-0
 //!    `argmax`.
-//! 6. yield `GenStep { token, logprobs: logprobs.squeeze(0) }`; stop when
+//! 6. yield `GenStep { token, logprobs }` — `logprobs` is
+//!    `Some(logprobs.squeeze(0))` when [`GenConfig::collect_logprobs`] is
+//!    `true`, `None` otherwise (L3 opt-in; mlx-lm always yields the
+//!    array, mlxrs surfaces the cost knob to the step loop). Stop when
 //!    `token ∈ eos` (`finish_reason = "stop"`) or `count == max_tokens`
 //!    (`finish_reason = "length"`).
 //!
@@ -194,6 +207,19 @@ pub struct GenConfig {
   /// restart from the same sequence (mlx-lm's default — see [`make_sampler`]).
   /// Ignored when `temp == 0` (the deterministic argmax sampler).
   pub seed: Option<u64>,
+
+  /// When `true`, every yielded [`GenStep`] carries the full `[V]`
+  /// log-probability vector as `Some(Array)` (the mlx-lm `generate_step`
+  /// per-step `logprobs` yield, lazy / kept on-device); when `false`
+  /// (default), the loop **skips the post-sampler squeeze** and yields
+  /// `None`, saving one MLX node per decode step in the common case where
+  /// the caller only reads the sampled token. mlx-lm itself always yields
+  /// logprobs (server-side opt-in lives a layer up at
+  /// `mlx_lm/server.py:191` `logprobs: bool`); flipping the opt-in down to
+  /// the step loop is a Rust-idiomatic cost-discipline improvement that
+  /// honors the project's "no implicit eval" / allocation-discipline rules
+  /// without changing the per-step compute when logprobs ARE requested.
+  pub collect_logprobs: bool,
 }
 
 impl Default for GenConfig {
@@ -218,6 +244,7 @@ impl Default for GenConfig {
       frequency_context_size: DEFAULT_REPETITION_CONTEXT_SIZE,
       eos: Vec::new(),
       seed: None,
+      collect_logprobs: false,
     }
   }
 }
@@ -434,15 +461,32 @@ fn recent_ids(tokens: &[u32], context_size: usize) -> Result<Vec<i32>> {
   Ok(ids)
 }
 
-/// One decode step — the sampled `token` plus the `[V]` log-probability
-/// vector over the vocabulary that produced it (mlx-lm
-/// `generate_step`'s `yield y.item(), logprobs`).
+/// One decode step — the sampled `token` plus an **opt-in** `[V]`
+/// log-probability vector over the vocabulary that produced it (mlx-lm
+/// `generate_step`'s `yield y.item(), logprobs`, gated here by
+/// [`GenConfig::collect_logprobs`]).
 ///
 /// Replaces the prior `(u32, Array)` tuple item: mlx-lm uses Python's
 /// positional tuple as informal documentation, but Rust callers reading
 /// the iterator item shouldn't have to remember tuple-index conventions —
 /// the struct is self-documenting and a Rust-idiomatic improvement
 /// (prefer idiomatic-Rust ergonomics over verbatim Python mirroring).
+///
+/// # `logprobs` opt-in (L3)
+///
+/// `logprobs` is `Some(Array)` when [`GenConfig::collect_logprobs`] is
+/// `true` (the prior unconditional yield); `None` otherwise so a caller
+/// that only reads `token` pays no per-step squeeze. The `Option<Array>`
+/// type (not `Option<Vec<f32>>`) keeps the no-implicit-eval contract:
+/// materialization into a CPU `Vec<f32>` is the caller's explicit step
+/// via [`Array::to_vec`] / [`Array::as_slice`]. This deviates from mlx-lm
+/// (which always yields the array); mlx-lm's server-side opt-in
+/// (`mlx_lm/server.py:191` `logprobs: bool`) is moved down to the step
+/// loop so the cost-when-off saving applies to every consumer, not just
+/// the HTTP server. VLM ([`crate::vlm::generate`]) and audio
+/// ([`crate::audio::stt::generate`]) `GenStep` producers preserve their
+/// unconditional-`Some` behavior (their public surfaces have not yet
+/// adopted the `collect_logprobs` opt-in).
 ///
 /// # Back-compat
 ///
@@ -452,18 +496,21 @@ fn recent_ids(tokens: &[u32], context_size: usize) -> Result<Vec<i32>> {
 /// struct (`let GenStep { token, logprobs } = step?;`). The break is
 /// **intentional** — mlxrs is pre-1.0, and the ergonomics + self-
 /// documentation win outweighs a one-line migration per call site. The
-/// `From<GenStep> for (u32, Array)` impl below makes that migration
-/// mechanical.
+/// `From<GenStep> for (u32, Option<Array>)` impl below makes that
+/// migration mechanical (the previous `From<GenStep> for (u32, Array)`
+/// is replaced — the `Option` shift propagates through the tuple form
+/// so call sites can't silently drop the new semantic).
 #[derive(Debug)]
 pub struct GenStep {
   /// The sampled token id (mlx-lm `y.item()`).
   pub token: u32,
   /// The token's `[V]` log-probability vector (mlx-lm
-  /// `logprobs.squeeze(0)`), kept lazy.
-  pub logprobs: Array,
+  /// `logprobs.squeeze(0)`), kept lazy. `Some` iff
+  /// [`GenConfig::collect_logprobs`] was `true` for this run.
+  pub logprobs: Option<Array>,
 }
 
-impl From<GenStep> for (u32, Array) {
+impl From<GenStep> for (u32, Option<Array>) {
   fn from(s: GenStep) -> Self {
     (s.token, s.logprobs)
   }
@@ -507,6 +554,9 @@ pub struct Generator<'a, M: Model> {
   max_tokens: usize,
   prefill_step_size: usize,
   eos: Vec<u32>,
+  /// [`GenConfig::collect_logprobs`]: when `false`, the per-step squeeze
+  /// is skipped and [`GenStep::logprobs`] is `None`.
+  collect_logprobs: bool,
   /// `true` once prompt prefill has run (it runs on the first `next()`).
   prefilled: bool,
   /// `true` until the first decode step has run (it feeds the prompt tail;
@@ -594,7 +644,17 @@ impl<M: Model> Generator<'_, M> {
     let token: u32 = sampled.item::<u32>()?;
 
     // mlx-lm returns `logprobs.squeeze(0)` ⇒ a `[V]` vector. Kept lazy.
-    let logprobs = ops::shape::squeeze_axes(&logprobs, &[0])?;
+    // L3 opt-in: skip the squeeze entirely when `collect_logprobs == false`
+    // — the caller never reads it, so building the MLX node is wasted work
+    // (the [V] view is cheap but the optional skip applies the
+    // allocation-discipline rule per token in the hot loop). When `true`,
+    // the produced array is byte-identical to the prior unconditional
+    // yield (mlx-lm's `logprobs.squeeze(0)`).
+    let logprobs = if self.collect_logprobs {
+      Some(ops::shape::squeeze_axes(&logprobs, &[0])?)
+    } else {
+      None
+    };
     Ok(GenStep { token, logprobs })
   }
 }
@@ -786,6 +846,7 @@ pub fn generate_step<'a, M: Model>(
     Ok((sampler, processors))
   })();
 
+  let collect_logprobs = cfg.collect_logprobs;
   match built {
     Ok((sampler, processors)) => Generator {
       model,
@@ -800,6 +861,7 @@ pub fn generate_step<'a, M: Model>(
       max_tokens: cfg.max_tokens,
       prefill_step_size: cfg.prefill_step_size.max(1),
       eos: cfg.eos,
+      collect_logprobs,
       prefilled: false,
       first_step: true,
       pending_err: None,
@@ -824,6 +886,7 @@ pub fn generate_step<'a, M: Model>(
       max_tokens: cfg.max_tokens,
       prefill_step_size: 1,
       eos: Vec::new(),
+      collect_logprobs,
       prefilled: true,
       first_step: false,
       pending_err: Some(e),
@@ -842,6 +905,15 @@ pub fn generate_step<'a, M: Model>(
 /// intermediate responses, `Some("stop")` when the model emitted an eos
 /// token, `Some("length")` when `max_tokens` was reached — exactly mlx-lm's
 /// `"stop" if token in tokenizer.eos_token_ids else "length"`.
+///
+/// `logprobs` honours the `GenStep` opt-in: `Some` iff the underlying
+/// [`GenConfig::collect_logprobs`] was `true`; `None` otherwise.
+///
+/// `peak_memory_bytes` mirrors mlx-lm's `peak_memory = mx.get_peak_memory()
+/// / 1e9` (kept in raw bytes here — the caller picks the scale). `None`
+/// when the [`crate::memory::peak_memory`] FFI call itself errors; the
+/// stream then continues uninterrupted (the per-response counter is
+/// diagnostic, not load-bearing).
 #[derive(Debug)]
 pub struct GenerationResponse {
   /// The next readable text segment (mlx-lm `detokenizer.last_segment`);
@@ -850,7 +922,8 @@ pub struct GenerationResponse {
   /// The token this response carries (mlx-lm `token`).
   pub token: u32,
   /// The token's `[V]` log-probability vector (mlx-lm `logprobs`).
-  pub logprobs: Array,
+  /// `Some` iff [`GenConfig::collect_logprobs`] was `true`.
+  pub logprobs: Option<Array>,
   /// Number of prompt tokens (mlx-lm `prompt_tokens` = `prompt.size`).
   pub prompt_tokens: usize,
   /// Prompt processing tokens-per-second (mlx-lm `prompt_tps`).
@@ -860,9 +933,48 @@ pub struct GenerationResponse {
   pub generation_tokens: usize,
   /// Generation tokens-per-second (mlx-lm `generation_tps`).
   pub generation_tps: f64,
+  /// Process-global mlx allocator peak in bytes (mlx-lm's
+  /// `mx.get_peak_memory()`). `None` if the FFI counter is unavailable —
+  /// stream is unaffected.
+  pub peak_memory_bytes: Option<u64>,
   /// `None` while generating; `Some("stop")` on an eos token, `Some(
   /// "length")` at `max_tokens` (mlx-lm `finish_reason`).
   pub finish_reason: Option<String>,
+}
+
+/// Aggregate stats for one full [`generate`] run — the cumulative
+/// counterparts of the per-response [`GenerationResponse`] timing fields,
+/// returned alongside the assembled output string.
+///
+/// Mirrors mlx-lm's `generate` verbose-mode summary (`mlx_lm/generate.py`
+/// lines 791-798) and the mlx-swift-lm `GenerateCompletionInfo` /
+/// `GenerateResult` summary, condensed into the union of fields the
+/// no-network surface produces:
+///
+/// - `prompt_tokens` / `generation_tokens` — counts (mlx-lm
+///   `response.prompt_tokens` / `response.generation_tokens`).
+/// - `prompt_tps` / `generation_tps` — tokens-per-second (mlx-lm
+///   `response.prompt_tps` / `response.generation_tps`); both are 0.0
+///   when their respective phase took zero measurable wall time.
+/// - `peak_memory_bytes` — process-global mlx allocator peak in bytes
+///   (mlx-lm `mx.get_peak_memory()`); `None` if the FFI counter is
+///   unavailable.
+#[derive(Debug, Clone, Copy)]
+pub struct GenerationStats {
+  /// Prompt tokens processed (mlx-lm `response.prompt_tokens`).
+  pub prompt_tokens: usize,
+  /// Tokens generated by the model (mlx-lm `response.generation_tokens`;
+  /// `0` if `stream_generate` produced no tokens).
+  pub generation_tokens: usize,
+  /// Prompt processing tokens-per-second (mlx-lm `response.prompt_tps`).
+  pub prompt_tps: f64,
+  /// Generation tokens-per-second (mlx-lm `response.generation_tps`).
+  pub generation_tps: f64,
+  /// Process-global mlx allocator peak in bytes at the end of the run
+  /// (mlx-lm `response.peak_memory * 1e9`). `None` if the FFI counter
+  /// (`mlx_get_peak_memory`) is unavailable / errored — the run completes
+  /// regardless.
+  pub peak_memory_bytes: Option<u64>,
 }
 
 /// Stream text from `model` for `prompt` — a 1:1 port of
@@ -943,6 +1055,11 @@ pub fn stream_generate<'a, M: Model>(
       if dt > 0.0 { gen_count as f64 / dt } else { 0.0 }
     };
 
+    // mlx-lm: `peak_memory = mx.get_peak_memory() / 1e9`. We surface raw
+    // bytes; an FFI failure (rare — process-global counter) degrades to
+    // `None` without aborting the stream (the field is diagnostic).
+    let peak = crate::memory::peak_memory().ok();
+
     // mlx-lm: `if token in eos: break` BEFORE `add_token` ⇒ the eos token
     // is never detokenized; a final `finish_reason="stop"` response with
     // the (empty) finalized tail is yielded.
@@ -958,6 +1075,7 @@ pub fn stream_generate<'a, M: Model>(
         prompt_tps,
         generation_tokens: n + 1,
         generation_tps: gen_tps(n + 1),
+        peak_memory_bytes: peak,
         finish_reason: Some("stop".to_string()),
       }));
     }
@@ -980,6 +1098,7 @@ pub fn stream_generate<'a, M: Model>(
         prompt_tps,
         generation_tokens: n,
         generation_tps: gen_tps(n),
+        peak_memory_bytes: peak,
         finish_reason: Some("length".to_string()),
       }));
     }
@@ -993,6 +1112,7 @@ pub fn stream_generate<'a, M: Model>(
       prompt_tps,
       generation_tokens: n,
       generation_tps: gen_tps(n),
+      peak_memory_bytes: peak,
       finish_reason: None,
     }))
   })
@@ -1000,7 +1120,22 @@ pub fn stream_generate<'a, M: Model>(
 
 /// Generate a complete response string for `prompt` — a 1:1 port of
 /// `mlx_lm.generate.generate` (the non-verbose path): collect every
-/// [`stream_generate`] segment into one `String`.
+/// [`stream_generate`] segment into one `String` and return it alongside
+/// the aggregate [`GenerationStats`] for the run (the L3 stats surface —
+/// counts + tokens-per-second + peak memory, populated from the final
+/// [`GenerationResponse`] mlx-lm emits in its verbose-mode summary).
+///
+/// Returns `(text, stats)`:
+/// - `text` is the concatenation of every per-response `text` segment
+///   (the eos token contributes no text, faithful to mlx-lm).
+/// - `stats` carries the final response's `prompt_tokens` /
+///   `generation_tokens` / `prompt_tps` / `generation_tps` plus
+///   `peak_memory_bytes` (mlx-lm's `mx.get_peak_memory()` in bytes; see
+///   [`GenerationStats`]).
+///
+/// An empty run (zero produced tokens — `max_tokens == 0`) returns the
+/// empty string and a zero-tps `GenerationStats` with the original
+/// `prompt_tokens` count and the current peak memory.
 ///
 /// Any step error is surfaced as `Err` (it short-circuits the collection,
 /// exactly the [`stream_generate`] Iterator-`Err` contract).
@@ -1010,12 +1145,40 @@ pub fn generate<M: Model>(
   prompt: &[u32],
   cache: Vec<Box<dyn KvCache>>,
   cfg: GenConfig,
-) -> Result<String> {
+) -> Result<(String, GenerationStats)> {
+  let prompt_tokens = prompt.len();
   let mut text = String::new();
+  // Capture the *final* response's stats fields (mlx-lm's verbose-mode
+  // summary uses the loop's last `response`); a stream that produced
+  // nothing falls back to the zero-tps init below.
+  let mut final_response: Option<GenerationResponse> = None;
   for response in stream_generate(model, tokenizer, prompt, cache, cfg) {
-    text.push_str(&response?.text);
+    let response = response?;
+    text.push_str(&response.text);
+    final_response = Some(response);
   }
-  Ok(text)
+
+  let stats = match final_response {
+    Some(r) => GenerationStats {
+      prompt_tokens: r.prompt_tokens,
+      generation_tokens: r.generation_tokens,
+      prompt_tps: r.prompt_tps,
+      generation_tps: r.generation_tps,
+      peak_memory_bytes: r.peak_memory_bytes,
+    },
+    // No tokens produced (e.g. `max_tokens == 0`): mlx-lm prints
+    // "No text generated for this prompt" and returns; we surface the
+    // same zero-counts stats so the caller still gets `prompt_tokens` +
+    // a current peak-memory snapshot.
+    None => GenerationStats {
+      prompt_tokens,
+      generation_tokens: 0,
+      prompt_tps: 0.0,
+      generation_tps: 0.0,
+      peak_memory_bytes: crate::memory::peak_memory().ok(),
+    },
+  };
+  Ok((text, stats))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
