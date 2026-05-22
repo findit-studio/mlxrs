@@ -64,17 +64,20 @@
 //! VLM ([`crate::vlm::generate`]) and audio ([`crate::audio::stt::generate`])
 //! share the same defect via the same `make_sampler` chain. The
 //! structural fix lives in `sample::categorical_sampling` itself —
-//! options: upcast `temp` to f64 before the reciprocal + dtype cast,
-//! replace `logits * scalar_like(1/temp, logits)` with `logits /
-//! scalar_like(temp, logits)` (avoids materializing the `+Inf`
-//! reciprocal entirely), or route to argmax INSIDE the primitive
-//! after all upstream sampler stages run. A LM-only argmax bypass in
-//! the generation loop was prototyped and reverted (R3+R4 → R5
-//! revert): it failed to cover VLM/STT and silently skipped
-//! configured sampler stages (XTC/top_k/min_p), so the fix must land
-//! in the primitive with regression tests across LM/VLM/STT. Deferred
-//! to a dedicated `fix(lm/sample)` follow-up PR after this one
-//! merges.
+//! the fix must avoid materializing an `+Inf` reciprocal OR casting an
+//! overflowing reciprocal into the logits dtype. Two viable shapes:
+//! (1) divide instead of multiply (`logits / scalar_like(temp,
+//! logits)` — never materializes `1/temp`, covers both overflow
+//! modes), or (2) route to argmax INSIDE the primitive after every
+//! upstream sampler stage runs (preserves XTC/top_k/min_p semantics).
+//! A naive `1/temp` upcast to f64 is only a partial mitigation — it
+//! closes the f32 subnormal path but the cast back into f16 still
+//! overflows for `temp < 1/65504`. A LM-only argmax bypass in the
+//! generation loop was prototyped and reverted (R3+R4 → R5 revert):
+//! it failed to cover VLM/STT and silently skipped configured sampler
+//! stages, so the fix must land in the primitive with regression
+//! tests across LM/VLM/STT. Deferred to a dedicated `fix(lm/sample)`
+//! follow-up PR after this one merges.
 //!
 //! **Exact per-step order (mlx-lm `generate_step._step`, lines 396-422):**
 //!
