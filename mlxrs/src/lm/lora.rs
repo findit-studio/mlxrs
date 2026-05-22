@@ -646,7 +646,9 @@ pub enum AdapterSelection {
 ///
 /// A real PEFT `LoraConfig` carries training-only / metadata fields with **no**
 /// inference effect on already-saved factors: `init_lora_weights` (a factor
-/// *seed* — except `"loftq"`, which re-quantizes base weights and is rejected),
+/// *seed* for the pure-seed values `true` / `false` / `gaussian` / `eva` /
+/// `orthogonal` — but the base-weight-mutating modes `olora` / `pissa*` /
+/// `corda` / `loftq` / `lora_ga` are **rejected**, see below),
 /// `loftq_config`, `eva_config`, `corda_config`, `lora_ga_config`, `task_type`
 /// and the other inherited `PeftConfig` metadata (`auto_mapping`,
 /// `base_model_name_or_path`, `revision`, `inference_mode`, `peft_version`),
@@ -725,7 +727,9 @@ pub enum AdapterSelection {
 ///   effect on saved factors) — the **explicit allowlist** in the private
 ///   `is_benign_ignore_field`: `megatron_config`/`megatron_core`,
 ///   `loftq_config`, `eva_config`, `corda_config`, `lora_ga_config`,
-///   `init_lora_weights` (except `"loftq"`), `task_type`, `auto_mapping`,
+///   `init_lora_weights` (pure-seed values only — the base-weight-mutating
+///   modes `olora` / `pissa*` / `corda` / `loftq` / `lora_ga` are rejected),
+///   `task_type`, `auto_mapping`,
 ///   `base_model_name_or_path`, `revision`, `inference_mode`, `peft_version`,
 ///   `runtime_config`, `qalora_group_size`, `ensure_weight_tying`.
 /// - **Rejected loudly** (set values that *do* change inference / model
@@ -733,7 +737,8 @@ pub enum AdapterSelection {
 ///   `modules_to_save` (non-empty), and the exotic variants `use_qalora`,
 ///   `alora_invocation_tokens`, `velora_config`, `monteclora_config`; **plus**,
 ///   via the structural backstop, any *other* un-modeled non-benign field set to
-///   an active value — including `init_lora_weights: "loftq"`, `arrow_config`,
+///   an active value — including the base-weight-mutating `init_lora_weights`
+///   modes (`olora` / `pissa*` / `corda` / `loftq` / `lora_ga`), `arrow_config`,
 ///   `use_bdlora`, `layer_replication`, `trainable_token_indices`,
 ///   `target_parameters`, and any future forward-switching field.
 #[derive(Debug, Clone)]
@@ -1013,15 +1018,21 @@ fn is_active_config_value(value: &serde_json::Value) -> bool {
 /// - **Inherited `PeftConfig` metadata** (`config.py` parent): `task_type`,
 ///   `auto_mapping`, `peft_version`, `base_model_name_or_path`, `revision`,
 ///   `inference_mode` — provenance / bookkeeping, never read in the forward.
-/// - **Factor-initialization strategies** — applied *at training time* to seed
-///   the LoRA factors; the saved factors already embody them, so they are no-ops
-///   at load. `init_lora_weights` (`true` / `false` / `gaussian` / `pissa` /
-///   `olora` / `eva` / `corda` / `orthogonal`, …) and its companions
-///   `eva_config`, `corda_config`, `lora_ga_config`, `loftq_config`.
-///   **Exception:** `init_lora_weights == "loftq"` *re-quantizes the base
-///   weights* (not a pure factor seed), so it is handled as a REJECT before this
-///   allowlist is consulted (see [`reject_unknown_active_peft_fields`]); the
-///   bare `init_lora_weights` key is benign here for every *other* value.
+/// - **Factor-initialization strategies** — *pure factor seeds* applied at
+///   training time; the saved factors already embody them, so they are no-ops
+///   at load. The benign `init_lora_weights` values are `true` / `false` /
+///   `gaussian` / `eva` / `orthogonal`, plus the companion config blocks
+///   `eva_config`, `corda_config`, `lora_ga_config`, `loftq_config` (carried,
+///   never read). **Exception — the base-weight-mutating modes are rejected:**
+///   `init_lora_weights ∈ { olora, pissa (incl. pissa_niter_<N>), corda,
+///   loftq, lora_ga }` each subtract a low-rank residual from the *base layer
+///   weight* at init (not a pure factor seed; see
+///   [`is_base_weight_mutating_init_mode`]), so a raw checkpoint saved with one
+///   pairs its factors with a modified base. These are handled as a REJECT
+///   before this allowlist is consulted (see
+///   [`reject_unknown_active_peft_fields`]); the bare `init_lora_weights` key
+///   is benign here only for the pure-seed values above. (PEFT's conversion
+///   path rewrites such adapters to `init_lora_weights = true`, which loads.)
 /// - **Training-only / runtime knobs**: `megatron_config`, `megatron_core`
 ///   (Megatron parallel-linear construction at train time), `runtime_config`
 ///   (explicitly *not saved or restored* — `config.py`), `qalora_group_size`
@@ -1044,9 +1055,11 @@ fn is_benign_ignore_field(field: &str) -> bool {
       | "revision"
       | "inference_mode"
       // Factor-init strategies + their config blocks (train-time seed only;
-      // saved factors already reflect them). `init_lora_weights == "loftq"` is
-      // intercepted as a REJECT before this allowlist (it re-quantizes base
-      // weights), so the bare key is benign for all other values.
+      // saved factors already reflect them). The base-weight-MUTATING modes
+      // (olora / pissa* / corda / loftq / lora_ga) are intercepted as a REJECT
+      // before this allowlist (see `reject_unknown_active_peft_fields` /
+      // `is_base_weight_mutating_init_mode`), so the bare key is benign only
+      // for the pure factor seeds (gaussian / eva / orthogonal / true / false).
       | "init_lora_weights"
       | "eva_config"
       | "corda_config"
@@ -1059,6 +1072,36 @@ fn is_benign_ignore_field(field: &str) -> bool {
       | "qalora_group_size"
       | "ensure_weight_tying"
   )
+}
+
+/// Whether an `init_lora_weights` string names a PEFT init mode that **mutates
+/// the base layer weight at training time** — and is therefore *not* a benign
+/// factor seed.
+///
+/// These modes (peft `tuners/lora/layer.py`) subtract a low-rank residual from
+/// `base_layer.weight.data` when seeding the adapter, so the *raw* saved LoRA
+/// factors are paired with a **modified** base weight:
+///
+/// - `"olora"` — `olora_init` (`:361` `base_layer.weight.data = weight_tensor`).
+/// - `"pissa"` and `"pissa_niter_<N>"` — `pissa_init`
+///   (`:396` `get_base_layer().weight.data = weight`); the SVD-power-iteration
+///   variants share the `pissa` prefix.
+/// - `"corda"` — `corda_init` (`:477` `...weight.data = weight`).
+/// - `"loftq"` — `loftq_init` (`:499`); LoftQ additionally re-quantizes the base.
+/// - `"lora_ga"` — `lora_ga_init` (`:631` `...weight.data = weight_data`).
+///
+/// This loader applies adapters to the **unmodified** base, so a raw checkpoint
+/// saved with any of these modes would run at the wrong behavior — they are
+/// rejected (see [`reject_unknown_active_peft_fields`]). A checkpoint run
+/// through PEFT's conversion path instead reports `init_lora_weights = true`
+/// (e.g. `eva.py:526`) and loads fine, as do the pure factor seeds
+/// (`gaussian` / `eva` / `orthogonal` / `true` / `false`). Matching is
+/// case-insensitive (PEFT writes these lowercase, but be lenient on read).
+fn is_base_weight_mutating_init_mode(mode: &str) -> bool {
+  // `pissa` covers both `"pissa"` and the `"pissa_niter_<N>"` SVD-iteration
+  // variants; the rest are exact mode names.
+  let lower = mode.to_ascii_lowercase();
+  lower.starts_with("pissa") || matches!(lower.as_str(), "olora" | "corda" | "loftq" | "lora_ga")
 }
 
 /// The *reject-unknown-active* backstop for the **PEFT-flat** path: reject any
@@ -1086,28 +1129,40 @@ fn is_benign_ignore_field(field: &str) -> bool {
 /// default for its variant fields) are ignored, so a config that merely *carries*
 /// a defaulted future field still loads.
 ///
-/// `init_lora_weights == "loftq"` is special-cased here as a hard reject:
-/// unlike every other init strategy (a pure factor seed), LoftQ *re-quantizes
-/// the base weights*, so a checkpoint trained with it is not interchangeable
-/// with a plain-LoRA load.
+/// The **base-weight-mutating** `init_lora_weights` modes are special-cased
+/// here as a hard reject: unlike the pure factor seeds (`gaussian` / `eva` /
+/// `orthogonal` / `true` / `false`), the modes `olora`, `pissa` (incl.
+/// `pissa_niter_<N>`), `corda`, `loftq`, and `lora_ga` subtract a low-rank
+/// residual from the base layer weight at init (see
+/// [`is_base_weight_mutating_init_mode`]), so a raw checkpoint trained with one
+/// is not interchangeable with a plain-LoRA load on the unmodified base.
 fn reject_unknown_active_peft_fields<E: serde::de::Error>(
   raw: &RawLoraConfig,
 ) -> std::result::Result<(), E> {
-  // `init_lora_weights: "loftq"` re-quantizes the BASE weights (not just a
-  // factor seed), so it cannot be treated as the benign init-only field it
-  // otherwise is. Reject it explicitly before the generic allowlist pass.
+  // Some `init_lora_weights` strings MUTATE the base layer weight at init —
+  // they subtract a low-rank residual from `base_layer.weight.data` so the
+  // raw saved factors are paired with a *modified* base (peft `lora/layer.py`:
+  // `olora_init` :361, `pissa_init` :396, `corda_init` :477, `loftq_init`
+  // :499, `lora_ga_init` :631). Applying those raw factors to the UNMODIFIED
+  // base — what this loader has — is silently wrong inference, so the mode
+  // strings are rejected here (naming the mode) before the benign allowlist
+  // pass (which otherwise treats the bare `init_lora_weights` key as benign).
+  // peft's CONVERSION path rewrites `init_lora_weights = True` for converted
+  // adapters (e.g. `eva.py:526`), so a converted checkpoint reports `true`
+  // and stays loadable — only the raw mode strings trip this.
   if let Some(init) = raw.extra.get("init_lora_weights")
-    && init
-      .as_str()
-      .is_some_and(|s| s.eq_ignore_ascii_case("loftq"))
+    && let Some(mode) = init.as_str()
+    && is_base_weight_mutating_init_mode(mode)
   {
-    return Err(E::custom(
-      "adapter_config.json sets `init_lora_weights: \"loftq\"` — LoftQ re-quantizes the base \
-       model weights (not just the LoRA factor seed), so a LoftQ checkpoint is not \
-       interchangeable with a plain-LoRA load; this loader does not implement it (loading it as \
-       plain LoRA would be wrong). Other `init_lora_weights` values (gaussian / pissa / olora / \
-       eva / corda / orthogonal / true / false) are factor-initialization only and load fine.",
-    ));
+    return Err(E::custom(format!(
+      "adapter_config.json sets `init_lora_weights: {mode:?}` — this PEFT init mode mutates the \
+       base model weight at training time (it subtracts a low-rank residual from \
+       `base_layer.weight`), so the raw saved LoRA factors are paired with a *modified* base. \
+       This loader applies adapters to the unmodified base, so loading such a raw checkpoint \
+       would be silently wrong; this loader does not implement it. (A checkpoint converted via \
+       PEFT's conversion path reports `init_lora_weights: true` and loads fine; the pure factor \
+       seeds gaussian / eva / orthogonal / true / false also load fine.)"
+    )));
   }
 
   // Generic backstop: every key serde could not bind to a modeled field is in
@@ -5074,41 +5129,50 @@ mod tests {
   }
 
   #[test]
-  fn peft_config_init_lora_weights_loftq_is_err_others_ok() {
-    // `init_lora_weights` is a factor-init *seed* — benign for every value
-    // EXCEPT "loftq", which re-quantizes the BASE weights (a LoftQ checkpoint is
-    // not interchangeable with a plain-LoRA load).
-    let loftq = r#"{
-      "peft_type": "LORA", "r": 8, "lora_alpha": 16.0, "target_modules": ["q_proj"],
-      "init_lora_weights": "loftq", "loftq_config": { "loftq_bits": 4 }
-    }"#;
-    let err = LoraConfig::from_json(loftq)
-      .expect_err("`init_lora_weights: \"loftq\"` must be rejected (re-quantizes base weights)");
-    match err {
-      Error::Backend { message } => assert!(
-        message.contains("loftq") || message.contains("LoftQ"),
-        "the rejection should mention loftq; got: {message}"
-      ),
-      other => panic!("expected Error::Backend, got {other:?}"),
-    }
-    // Every other init strategy is a pure factor seed and loads fine.
-    for init in [
-      "\"pissa\"",
-      "\"gaussian\"",
-      "\"olora\"",
-      "\"eva\"",
-      "\"corda\"",
-      "\"orthogonal\"",
-      "true",
-      "false",
+  fn peft_config_init_lora_weights_base_mutating_modes_are_err_seeds_ok() {
+    // The base-weight-MUTATING `init_lora_weights` modes subtract a low-rank
+    // residual from `base_layer.weight` at init (peft `lora/layer.py`:
+    // olora_init/pissa_init/corda_init/loftq_init/lora_ga_init), so a RAW
+    // checkpoint saved with one pairs its factors with a modified base —
+    // applying them to the unmodified base is silently wrong. They must be
+    // rejected, with a message naming the offending mode (so the error is
+    // actionable). `pissa_niter_<N>` shares the `pissa` prefix and must reject
+    // too; matching is case-insensitive.
+    for mode in [
+      "pissa",
+      "pissa_niter_4",
+      "PISSA_NITER_16",
+      "olora",
+      "corda",
+      "lora_ga",
+      "loftq",
     ] {
+      let json = format!(
+        r#"{{ "peft_type": "LORA", "r": 8, "lora_alpha": 16.0,
+           "target_modules": ["q_proj"], "init_lora_weights": "{mode}" }}"#
+      );
+      match LoraConfig::from_json(&json) {
+        Err(Error::Backend { message }) => assert!(
+          message.contains(mode),
+          "the rejection should name the mode `{mode}`; got: {message}"
+        ),
+        Ok(_) => {
+          panic!("`init_lora_weights: \"{mode}\"` must be rejected (mutates base weight at init)")
+        }
+        Err(other) => panic!("expected Error::Backend for `{mode}`, got {other:?}"),
+      }
+    }
+    // The pure factor SEEDS only seed the LoRA factors (or are overwritten at
+    // load) and leave the base untouched, so they must still load. PEFT's
+    // conversion path also rewrites converted adapters to `true`.
+    for init in ["\"gaussian\"", "\"eva\"", "\"orthogonal\"", "true", "false"] {
       let json = format!(
         r#"{{ "peft_type": "LORA", "r": 8, "lora_alpha": 16.0,
            "target_modules": ["q_proj"], "init_lora_weights": {init} }}"#
       );
       assert!(
         LoraConfig::from_json(&json).is_ok(),
-        "`init_lora_weights: {init}` is factor-init only and must load"
+        "`init_lora_weights: {init}` is a pure factor seed and must load"
       );
     }
   }
