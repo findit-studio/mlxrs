@@ -445,8 +445,15 @@ fn vlm_generate_zero_image_preserves_logprobs() {
   // `collect_logprobs == false`, which is exactly the regression
   // surface: a default-cfg zero-image VLM run would otherwise return
   // `None` logprobs and break the documented "VLM always Some" contract.
-  let it = vlm_generate(&model, &prompt, &[], mock_cache(), vlm_cfg(2, 3))
-    .expect("vlm_generate constructs in zero-image mode");
+  let it = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[],
+    mock_cache(),
+    vlm_cfg(2, 3),
+  )
+  .expect("vlm_generate constructs in zero-image mode");
 
   let mut saw_step = false;
   for step in it {
