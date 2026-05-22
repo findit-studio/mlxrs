@@ -387,6 +387,19 @@ pub struct LoadedEmbeddingContext {
 /// *cheap, recoverable* failures come first — nothing heavy (weights,
 /// tokenizer) is touched until the checkpoint is known to be loadable:
 ///
+/// 0. Reject an **empty** model-directory (or, if a separate
+///    [`tokenizer_source`](EmbeddingModelConfiguration::tokenizer_source) is
+///    set, tokenizer-directory) path **up front** — before any `config.json`,
+///    pooling, or shard/glob resolution. An empty directory argument is a
+///    caller bug: it is not normalized to `"."`, it is rejected with a
+///    recoverable [`Error::Backend`]. The reason this cannot be left to the
+///    later steps is shard discovery — `collect_glob_shards` builds its glob
+///    pattern as `"<dir>/<suffix>"`, so an empty `<dir>` yields the *absolute*
+///    pattern `"/**/model*.safetensors"`, which recursively scans the
+///    filesystem root `/` and could merge unrelated `safetensors` from outside
+///    the intended directory (a filesystem-escape + wrong-weight load). The
+///    same up-front spirit as the non-UTF-8 model-dir-path rejection in
+///    `collect_glob_shards`, hoisted ahead of *all* I/O.
 /// 1. Resolve the model directory
 ///    ([`EmbeddingModelConfiguration::model_directory`] — local, no Hub
 ///    download) and read the `config.json` `model_type` **once** (bounded,
@@ -419,6 +432,23 @@ pub fn load(
   registry: &EmbeddingModelTypeRegistry,
 ) -> Result<LoadedEmbeddingContext> {
   let model_dir = configuration.model_directory();
+
+  // (0) Reject an EMPTY model-directory path up front, before any I/O. An
+  // empty path is a caller bug — and a load-bearing one: `collect_glob_shards`
+  // forms its shard pattern as `"<dir>/<suffix>"`, so an empty `<dir>` yields
+  // the ABSOLUTE pattern `"/**/model*.safetensors"`, recursively scanning the
+  // filesystem root `/` and potentially merging unrelated weights. It is NOT
+  // normalized to `"."`; it is rejected here, ahead of `config.json` / pooling
+  // / shard resolution (the same up-front spirit as the non-UTF-8 model-dir
+  // rejection inside `collect_glob_shards`).
+  reject_empty_dir(model_dir, "model")?;
+  // The tokenizer directory, when supplied separately via `tokenizer_source`,
+  // is rejected here too: an empty separate tokenizer path is the same caller
+  // bug. (When `tokenizer_source` is `None` the tokenizer dir IS the model dir,
+  // already checked above.)
+  if let Some(tokenizer_source) = &configuration.tokenizer_source {
+    reject_empty_dir(tokenizer_source, "tokenizer")?;
+  }
 
   // (1) Read the `config.json` `model_type` ONCE (bounded, dependency-free)
   // and canonicalize it (`-`→`_` + `MODEL_REMAPPING`, mirroring
@@ -483,6 +513,28 @@ pub fn load(
     model_type: loaded.model_type,
     pooling,
   })
+}
+
+/// Reject an **empty** directory path with a recoverable [`Error::Backend`].
+///
+/// `role` is the human label for the path being checked (`"model"` /
+/// `"tokenizer"`), so the message names which directory the caller passed
+/// empty. An empty [`Path`] is a caller bug — it is *not* silently normalized
+/// to the current directory (`"."`); see [`load()`] step 0 for why an empty
+/// model directory in particular is dangerous (the absolute `"/**/…"` shard
+/// pattern → filesystem-root scan).
+///
+/// The check is `Path::as_os_str().is_empty()` — a byte/`OsStr`-level test, so
+/// it is correct for a non-UTF-8 path too and never panics. A path that is
+/// merely whitespace or `"."` is *not* empty and is left to the existing I/O
+/// steps to resolve or reject; only the genuinely empty path is caught here.
+fn reject_empty_dir(dir: &Path, role: &str) -> Result<()> {
+  if dir.as_os_str().is_empty() {
+    return Err(Error::Backend {
+      message: format!("embeddings load: {role} directory path must not be empty"),
+    });
+  }
+  Ok(())
 }
 
 /// Read `<dir>/1_Pooling/config.json` if present, mirroring
@@ -768,6 +820,16 @@ fn starts_with_dot(name: &std::ffi::OsStr) -> bool {
 }
 
 fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<DiscoveredShard>> {
+  // Defense-in-depth: reject an EMPTY `dir` before building the pattern.
+  // `load()` already rejects an empty model/tokenizer directory up front, but
+  // `collect_glob_shards` must not itself be a hole — an empty `dir` makes the
+  // `format!("{}/{}", escape(dir_str), pattern_suffix)` below the ABSOLUTE
+  // pattern `"/**/model*.safetensors"`, which `glob` then expands by
+  // recursively scanning the filesystem root `/` (suppressing permission
+  // errors per-entry) and could merge unrelated `safetensors` from outside the
+  // intended directory. An empty `dir` is a bug, not a request to scan `/`.
+  reject_empty_dir(dir, "model")?;
+
   // `glob_with` takes a `&str` and `unwrap()`s `to_str()` internally — reject a
   // non-UTF-8 model dir path here so that becomes a recoverable error, not a
   // panic inside the crate.
@@ -1881,6 +1943,98 @@ mod tests {
       err.to_string().contains("no model weights"),
       "error should name the missing weights: {err}"
     );
+  }
+
+  #[test]
+  fn empty_model_directory_is_recoverable_error_before_any_scan() {
+    // `from_directory("")`, `from_id("")`, and `PathBuf::new()` all yield an
+    // EMPTY model-directory path. Without the up-front guard, shard discovery
+    // builds the ABSOLUTE pattern `"/**/model*.safetensors"` and scans the
+    // filesystem ROOT `/`. `load()` must reject the empty path with a
+    // recoverable `Error::Backend` BEFORE any `config.json`/pooling/shard I/O —
+    // i.e. it must error without ever performing that filesystem-root scan.
+    let registry = EmbeddingModelTypeRegistry::new().with("mockemb", mock_constructor());
+    for config in [
+      EmbeddingModelConfiguration::from_directory(""),
+      EmbeddingModelConfiguration::from_id(""),
+      EmbeddingModelConfiguration::from_directory(PathBuf::new()),
+    ] {
+      // Precondition: each constructor really did produce an empty path.
+      assert!(
+        config.model_directory().as_os_str().is_empty(),
+        "fixture precondition: the model directory path must be empty"
+      );
+      let Err(err) = load(&config, &registry) else {
+        panic!("an empty model directory path must be a recoverable error, not a load");
+      };
+      assert!(
+        matches!(err, Error::Backend { .. }),
+        "expected a recoverable Backend error; got {err:?}"
+      );
+      let msg = err.to_string();
+      assert!(
+        msg.contains("model directory path must not be empty"),
+        "the error should explain the empty-path rejection; got: {msg}"
+      );
+      // The empty path is rejected BEFORE discovery: the error must NOT be a
+      // downstream `config.json` / weights failure (which would mean step 0
+      // did not fire and a `/`-root scan was attempted).
+      assert!(
+        !msg.contains("config.json") && !msg.contains("no model weights"),
+        "the empty path must be rejected before config/shard resolution; got: {msg}"
+      );
+    }
+  }
+
+  #[test]
+  fn empty_tokenizer_source_is_recoverable_error() {
+    // A separately-supplied tokenizer directory that is EMPTY is the same
+    // caller bug and must be rejected up front too (the model dir here is a
+    // real, loadable directory, so only the empty tokenizer path can fail).
+    let model_dir = fresh_dir("empty-tok-src");
+    write_model_dir(&model_dir, "mockemb");
+    let registry = EmbeddingModelTypeRegistry::new().with("mockemb", mock_constructor());
+    let config = EmbeddingModelConfiguration::from_directory(&model_dir).with_tokenizer_source("");
+    assert!(
+      config.tokenizer_directory().as_os_str().is_empty(),
+      "fixture precondition: the tokenizer directory path must be empty"
+    );
+
+    let Err(err) = load(&config, &registry) else {
+      panic!("an empty tokenizer_source path must be a recoverable error");
+    };
+    assert!(
+      matches!(err, Error::Backend { .. }),
+      "expected a recoverable Backend error; got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+      msg.contains("tokenizer directory path must not be empty"),
+      "the error should explain the empty tokenizer-path rejection; got: {msg}"
+    );
+  }
+
+  #[test]
+  fn collect_glob_shards_rejects_empty_dir() {
+    // Defense-in-depth: `collect_glob_shards` itself must reject an empty
+    // `dir` — an empty `dir` would otherwise build the absolute pattern
+    // `"/**/model*.safetensors"` and recursively scan the filesystem root.
+    // The guard fires before any glob/I/O, so no directory need exist.
+    for suffix in ["**/model*.safetensors", "weight*.safetensors"] {
+      let Err(err) = collect_glob_shards(Path::new(""), suffix) else {
+        panic!("collect_glob_shards must reject an empty dir, not scan the filesystem root");
+      };
+      assert!(
+        matches!(err, Error::Backend { .. }),
+        "expected a recoverable Backend error; got {err:?}"
+      );
+      assert!(
+        err
+          .to_string()
+          .contains("model directory path must not be empty"),
+        "the error should explain the empty-path rejection; got: {err}"
+      );
+    }
   }
 
   #[test]

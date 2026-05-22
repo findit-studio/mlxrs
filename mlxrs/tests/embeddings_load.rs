@@ -182,6 +182,69 @@ fn missing_config_errors() {
 }
 
 #[test]
+fn empty_model_directory_errors_before_filesystem_root_scan() {
+  // `from_directory("")`, `from_id("")`, and `PathBuf::new()` each yield an
+  // EMPTY model-directory path. Shard discovery builds its glob pattern as
+  // `"<dir>/<suffix>"`, so an empty `<dir>` becomes the ABSOLUTE pattern
+  // `"/**/model*.safetensors"` — which recursively scans the filesystem ROOT
+  // `/`, suppresses permission errors, and can merge unrelated `safetensors`
+  // from outside the intended directory (a filesystem-escape + wrong-weight
+  // load). `load()` must reject the empty path with a recoverable
+  // `Error::Backend` BEFORE any `config.json` / pooling / shard resolution —
+  // i.e. it must error WITHOUT performing that filesystem-root scan.
+  let registry = EmbeddingModelTypeRegistry::new().with("bert", mock_constructor());
+  for config in [
+    EmbeddingModelConfiguration::from_directory(""),
+    EmbeddingModelConfiguration::from_id(""),
+    EmbeddingModelConfiguration::from_directory(PathBuf::new()),
+  ] {
+    let Err(err) = load(&config, &registry) else {
+      panic!("an empty model directory path must be a recoverable error, not a load");
+    };
+    assert!(
+      matches!(err, Error::Backend { .. }),
+      "expected a recoverable Backend error; got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+      msg.contains("model directory path must not be empty"),
+      "the error should explain the empty-path rejection; got: {msg}"
+    );
+    // Proof the rejection happened up front: the error is NOT a downstream
+    // `config.json` / weights failure (which would mean a `/`-root scan ran).
+    assert!(
+      !msg.contains("config.json") && !msg.contains("no model weights"),
+      "the empty path must be rejected before config/shard resolution; got: {msg}"
+    );
+  }
+}
+
+#[test]
+fn empty_tokenizer_source_errors() {
+  // A separately-supplied tokenizer directory that is EMPTY is the same caller
+  // bug and is rejected up front too. The model directory here is real and
+  // loadable, so only the empty tokenizer-source path can fail the load.
+  let model_dir = temp_dir("empty-tok-src");
+  write_model_dir(&model_dir, "bert");
+  let registry = EmbeddingModelTypeRegistry::new().with("bert", mock_constructor());
+  let config = EmbeddingModelConfiguration::from_directory(&model_dir).with_tokenizer_source("");
+
+  let Err(err) = load(&config, &registry) else {
+    panic!("an empty tokenizer_source path must be a recoverable error");
+  };
+  assert!(
+    matches!(err, Error::Backend { .. }),
+    "expected a recoverable Backend error; got {err:?}"
+  );
+  assert!(
+    err
+      .to_string()
+      .contains("tokenizer directory path must not be empty"),
+    "the error should explain the empty tokenizer-path rejection; got: {err}"
+  );
+}
+
+#[test]
 fn separator_normalization_via_public_remap() {
   // `_get_model_arch`'s `-`→`_` normalization is reachable + applied on load.
   assert_eq!(remap_model_type("xlm-roberta"), "xlm_roberta");
