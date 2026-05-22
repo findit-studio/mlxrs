@@ -63,12 +63,18 @@
 //! subnormal `temp`, and the dtype cast overflows for f16 + tiny `temp`.
 //! VLM ([`crate::vlm::generate`]) and audio ([`crate::audio::stt::generate`])
 //! share the same defect via the same `make_sampler` chain. The
-//! structural fix lives in `sample::categorical_sampling` (upcast-
-//! before-scale, divide-instead-of-multiply, or an argmax route at the
-//! primitive level) — tracked as `LM-6` in
-//! `docs/rust-golden-standard-followups.md` for a dedicated follow-up
-//! PR that updates `sample.rs` + all three call sites consistently per
-//! `feedback_review_finding_must_be_in_diff`.
+//! structural fix lives in `sample::categorical_sampling` itself —
+//! options: upcast `temp` to f64 before the reciprocal + dtype cast,
+//! replace `logits * scalar_like(1/temp, logits)` with `logits /
+//! scalar_like(temp, logits)` (avoids materializing the `+Inf`
+//! reciprocal entirely), or route to argmax INSIDE the primitive
+//! after all upstream sampler stages run. A LM-only argmax bypass in
+//! the generation loop was prototyped and reverted (R3+R4 → R5
+//! revert): it failed to cover VLM/STT and silently skipped
+//! configured sampler stages (XTC/top_k/min_p), so the fix must land
+//! in the primitive with regression tests across LM/VLM/STT. Deferred
+//! to a dedicated `fix(lm/sample)` follow-up PR after this one
+//! merges.
 //!
 //! **Exact per-step order (mlx-lm `generate_step._step`, lines 396-422):**
 //!
@@ -98,8 +104,10 @@
 //!    [`make_sampler`] is shift-invariant or softmaxes internally except
 //!    `top_p`, which forces step 4 to run. Extreme-temp NaN-safety for
 //!    `categorical_sampling` itself (f16 + `temp < 1/65504`, any dtype +
-//!    subnormal `temp`) is the LM-6 follow-up — see the module-level
-//!    "numerical-safety scope" note.
+//!    subnormal `temp`) is deferred to a dedicated `fix(lm/sample)`
+//!    follow-up PR — see the module-level "numerical-safety scope"
+//!    note for the scope, fix options, and prior in-diff revert
+//!    rationale.
 //! 6. yield `GenStep { token, logprobs }` — `logprobs` is
 //!    `Some(logprobs.squeeze(0))` when [`GenConfig::collect_logprobs`] is
 //!    `true`, `None` otherwise (L3 opt-in; mlx-lm always yields the
@@ -752,11 +760,13 @@ impl<M: Model> Generator<'_, M> {
     //    `1/temp` overflow for two extreme-`temp` configurations (f16
     //    logits + `temp < 1/65504`; any dtype + subnormal positive
     //    `temp < 1.0/f32::MAX ≈ 2.94e-39`). The structural fix lives in
-    //    `sample::categorical_sampling` and is tracked as LM-6 in
-    //    `docs/rust-golden-standard-followups.md` for a dedicated
-    //    follow-up PR that updates `sample.rs` + all three call sites
-    //    (LM / VLM / STT) consistently per
-    //    `feedback_review_finding_must_be_in_diff`.
+    //    `sample::categorical_sampling` and is deferred to a dedicated
+    //    `fix(lm/sample)` follow-up PR that updates `sample.rs` + all
+    //    three call sites (LM / VLM / STT) consistently per
+    //    `feedback_review_finding_must_be_in_diff` (a LM-only argmax
+    //    bypass was prototyped in R3+R4 and reverted in R5 because it
+    //    failed to cover VLM/STT and silently skipped configured
+    //    sampler stages — XTC/top_k/min_p).
     let needs_normalization = self.collect_logprobs || self.needs_logprobs;
     let sampler_input: Option<Array> = match (needs_normalization, self.temp_stochastic) {
       // Full normalization (collect_logprobs and/or top_p).
