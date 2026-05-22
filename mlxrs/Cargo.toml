@@ -11,16 +11,6 @@ rust-version.workspace = true
 
 [features]
 default = []
-# The hand-written `core::arch` SIMD kernels (the `mlxrs::simd` module:
-# scalar reference + aarch64 NEON backend behind a runtime-detection
-# dispatcher) are ALWAYS compiled — there is no `simd` cargo feature.
-# Whether the NEON backend runs is gated purely on `target_arch =
-# "aarch64"` + runtime CPU detection (`is_aarch64_feature_detected!`),
-# with the always-compiled scalar path as the automatic fallback on
-# non-aarch64 targets and under `--cfg mlxrs_force_scalar` (a build-cfg
-# for regression bisection / exotic-target builds). Matches the `dia`
-# reference design.
-# Granular, capability-named tokenizer features (minimize deps).
 tokenizer            = ["dep:tokenizers"]                                          # HfTokenizer load + encode/decode + special tokens from tokenizer.json. NO serde_json/minijinja.
 tokenizer-config     = ["tokenizer", "dep:serde_json"]                             # parse tokenizer_config.json → bos/eos/unk/chat_template/added-tokens
 tokenizer-stream     = ["tokenizer"]                                               # StreamingDetokenizer trait + NaiveStreamingDetokenizer (no serde_json)
@@ -30,13 +20,13 @@ tokenizer-spm        = ["tokenizer-stream", "dep:serde_json"]                   
 tokenizer-chat       = ["tokenizer-config", "dep:minijinja", "dep:minijinja-contrib", "dep:serde", "dep:jiff"]   # jinja apply_chat_template (jiff: strftime_now)
 tokenizer-deepseek-v32 = ["tokenizer-chat"]                                        # the one shipped chat-template override
 tokenizer-tools      = ["tokenizer-config", "dep:serde_json"]                      # tool-call parsers + infer_tool_parser
-# umbrellas (compose only)
-embeddings           = ["tokenizer", "dep:smol_str", "dep:memspan"]                 # encode/decode (tokenizers crate) + `1_Pooling/config.json` parsing (HAND-ROLLED strict-JSON scanner per EMB-1; NO DIRECT `mlxrs::dep:serde_json` — `tokenizers v0.23` still pulls `serde_json` transitively for its `tokenizer.json` parse, so `embeddings` BUILDS but does not OWN `serde_json` after EMB-1. `tokenizer-config`/`tokenizer-bpe`/`tokenizer-spm`/`tokenizer-tools` continue to pull it directly). `smol_str` inlines short keys/values (≤23 bytes) into the JVal payload. `memspan` SIMD-accelerates `skip_ws` (AVX2/AVX-512/NEON dispatch) and the per-string `skip-until-quote-or-backslash` chunk scan, plus enables a no-escape fast path that copies the source slice directly into SmolStr with zero intermediate Vec.
-lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm", "tokenizer-bpe", "tokenizer-chat", "tokenizer-deepseek-v32", "tokenizer-tools", "dep:regex"]   # +regex: HuggingFace PEFT LoraConfig target/exclude/rank/alpha pattern matching (lm::lora)
+
+embeddings           = ["tokenizer", "dep:smol_str", "dep:memspan", "dep:glob"]     
+lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm", "tokenizer-bpe", "tokenizer-chat", "tokenizer-deepseek-v32", "tokenizer-tools", "dep:regex"]
 vlm                  = ["lm", "dep:image"]
-audio                = ["lm", "dep:symphonia"] # mirrors mlx-audio's Python dep on mlx-lm; symphonia = WAV/MP3/FLAC/OGG-Vorbis codecs for audio::io. The always-compiled `mlxrs::simd` module accelerates the integrated_loudness sum-of-squares (NEON on aarch64, scalar fallback elsewhere) — no feature gate needed.
-unstable-ops-overload = []               # `&a + &b` etc. (panic on shape error). OFF by default.
-gguf                 = []                                                          # GGUF load/save (mlx-c `mlx_io_gguf*`). OFF: mlxrs-sys does not yet link gguflib.
+audio                = ["lm", "dep:symphonia"]
+unstable-ops-overload = []
+gguf                 = [] # GGUF load/save (mlx-c `mlx_io_gguf*`). OFF: mlxrs-sys does not yet link gguflib.
 
 [dependencies]
 mlxrs-sys.workspace = true
@@ -51,41 +41,11 @@ minijinja = { version = "2", features = ["loader", "json", "loop_controls", "bui
 minijinja-contrib = { version = "2", features = ["pycompat"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true, features = ["preserve_order"] }
-# Small-string optimization for `embeddings::config::JVal::Str` payloads.
-# Pooling-config keys/values are short ASCII strings ("mean"/"max"/
-# "cls_token"/"pooling_mode_mean_tokens") that fit in SmolStr's 23-byte
-# inline buffer — no heap allocation per JVal. Pulled SOLELY by
-# `embeddings`. Loose caret semver per `feedback_no_dependency_pinning`
-# (crates.io current major is 0.3.x — verified 0.3.6).
 smol_str = { version = "0.3", optional = true }
-# SIMD-accelerated byte-class scanning for the `embeddings::config`
-# strict-JSON scanner. Verified the published `memspan v0.1.0`
-# matches the repository metadata (`github.com/al8n/memspan`) and the
-# `cargo info memspan` crates.io entry byte-identically: name, version,
-# license, repo, description, keywords. Pulled SOLELY by `embeddings`.
-# Loose caret semver per `feedback_no_dependency_pinning`.
 memspan = { version = "0.1", optional = true }
-# `strftime_now` chat-template helper only — pulled SOLELY by `tokenizer-chat`
-# (`dep:jiff`), never by the serde_json-free `tokenizer` core, the
-# stream/bpe/spm features, or `[build-dependencies]`. Local-now formatted per
-# Python `datetime.now().strftime`. Loose caret semver (crates.io current
-# major is 0.2.x — verified 0.2.24); never an exact `=` pin.
+glob = { version = "0.3", optional = true }
 jiff = { version = "0.2", optional = true }
-# Image decode / resize / channel access. Pulled SOLELY by `vlm` (see the
-# umbrella above's `dep:image`); the bare/core / lm / audio / embeddings
-# graphs never compile it. Loose caret semver per
-# `feedback_no_dependency_pinning` (crates.io current major is 0.25.x,
-# verified 0.25.10) — never an exact `=` pin.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
-# NOTE: the resize hot path is OWNED by mlxrs (`src/vlm/resize.rs`), NOT a
-# third-party crate. The former `fast_image_resize` dependency was dropped
-# because its internal scratch (coefficient tables, per-row work buffers)
-# allocated INFALLIBLY inside the crate — and `vlm::image::resize`'s target
-# dimensions flow from an untrusted loaded `preprocessor_config.json`, so a
-# hostile-but-under-cap target could `abort()` the process despite our
-# `Result`. The own kernel is fully `try_reserve_exact`-fallible, NEON-
-# accelerated on aarch64 (scalar fallback always compiled), and bit-exact
-# with PIL `Image.resize` (the reference mlx-vlm preprocessing expects).
 # Multi-format audio decoder (pure-Rust, actively maintained).
 # `default-features = false` keeps the dep tree minimal — we enable
 # exactly the codecs/containers `mlx_audio.audio_io.read` decodes
@@ -114,30 +74,13 @@ symphonia = { version = "0.6", optional = true, default-features = false, featur
   "ogg",
   "vorbis",
 ] }
-# HuggingFace PEFT `LoraConfig` matching. PEFT's `target_modules` /
-# `exclude_modules` may be a single regex string, and `rank_pattern` /
-# `alpha_pattern` keys are matched against module paths with an anchored
-# `re.fullmatch` / `re.match` — `lm::lora` reproduces PEFT's matching
-# faithfully via the `regex` crate. Pulled SOLELY by `lm` (the LoRA-adapter
-# loader lives behind that feature); the bare/core / embeddings graphs never
-# compile it. `default-features = false` drops the (unused here) Unicode
-# tables to keep the dep tree minimal — PEFT module paths are ASCII. Loose
-# caret semver per `feedback_no_dependency_pinning` (crates.io current major
-# is 1.x — verified 1.11); never an exact `=` pin.
 regex = { version = "1", optional = true, default-features = false, features = ["std", "perf"] }
-
-# No [build-dependencies]: ALL tokenizer codegen moved to the `xtask` crate
-# (`cargo xtask-codegen`), so a normal `mlxrs` build never compiles
-# `tokenizers`/`serde_json`/`toml`. build.rs now only does tarpaulin-cfg
-# detection (std-only). Regenerated artifacts are committed source
-# (src/tokenizer/generated.rs, tests/fixtures/*.json); `cargo xtask-codegen
-# --check` is the drift guard against mlxrs/data/tokenizer/.
 
 [dev-dependencies]
 approx.workspace = true
 trybuild.workspace = true
 criterion = "0.8"
-libc = "0.2"                          # SIGABRT child-process test (tests/diagnostics.rs)
+libc = "0.2" # SIGABRT child-process test (tests/diagnostics.rs)
 
 [package.metadata.docs.rs]
 all-features = true
