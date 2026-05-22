@@ -333,6 +333,19 @@ impl KvCache for ArraysCache {
     self.cache.iter().flatten().map(|a| a.try_clone()).collect()
   }
 
+  /// Force-evaluate the cache's own stored slot arrays in place — the
+  /// per-chunk prefill memory barrier (see [`KvCache::materialize`]). Evals
+  /// each present (`Some`) slot of `self.cache` directly via the explicit
+  /// `&mut` [`Array::eval`] (`state()` already returns these live arrays
+  /// un-sliced, but evaling the stored slots is the robust barrier). A no-op
+  /// when every slot is empty.
+  fn materialize(&mut self) -> Result<()> {
+    for slot in self.cache.iter_mut().flatten() {
+      slot.eval()?;
+    }
+    Ok(())
+  }
+
   /// Replace the slots with `state`, compacted (`Some`) — swift
   /// `ArraysCache.state` setter `cache = newValue.map { $0 as MLXArray? }`
   /// (`KVCache.swift:1125-1127`). In [`super::from_state`] this runs

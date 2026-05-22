@@ -728,6 +728,16 @@ impl Tokenizer {
   ///
   /// `messages` / `tools` are JSON values; `additional_context` adds extra
   /// template variables.
+  ///
+  /// `continue_final_message` ports HF Transformers' flag of the same name:
+  /// when `true`, the rendered prompt is trimmed so it ends exactly at the
+  /// final message's content — the model *continues* that message instead of
+  /// starting a fresh turn (HF strips the trailing end-of-turn / EOS tokens
+  /// the template appended after it; see [`chat::render_jinja`]). It is
+  /// **mutually exclusive** with `add_generation_prompt`: HF raises a
+  /// `ValueError` if both are set, and this method returns an `Err` likewise.
+  /// Existing callers that do not continue the final message pass `false`
+  /// (unchanged behavior).
   #[cfg(feature = "tokenizer-chat")]
   #[cfg_attr(docsrs, doc(cfg(feature = "tokenizer-chat")))]
   pub fn apply_chat_template(
@@ -735,8 +745,20 @@ impl Tokenizer {
     messages: &Value,
     tools: Option<&Value>,
     add_generation_prompt: bool,
+    continue_final_message: bool,
     additional_context: Option<&Value>,
   ) -> Result<String, Error> {
+    // HF rejects `add_generation_prompt` + `continue_final_message` together
+    // (`apply_chat_template`: "continue_final_message is not compatible with
+    // add_generation_prompt"). Reject up front, before any rendering, so both
+    // the jinja and override paths share the guard.
+    if add_generation_prompt && continue_final_message {
+      return Err(Error::tokenizer(
+        "continue_final_message is not compatible with add_generation_prompt \
+         (only one may be set)",
+      ));
+    }
+
     let enable_thinking = additional_context
       .and_then(|c| c.get("enable_thinking"))
       .and_then(Value::as_bool)
@@ -748,15 +770,11 @@ impl Tokenizer {
         .as_array()
         .cloned()
         .ok_or_else(|| Error::tokenizer("messages must be a list"))?;
-      let continue_final = additional_context
-        .and_then(|c| c.get("continue_final_message"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
       return ovr.apply(
         &msgs,
         tools,
         add_generation_prompt,
-        continue_final,
+        continue_final_message,
         enable_thinking,
       );
     }
@@ -771,6 +789,7 @@ impl Tokenizer {
       messages,
       tools,
       add_generation_prompt,
+      continue_final_message,
       self.bos_token.as_deref(),
       self.eos_token.as_deref(),
       enable_thinking,
@@ -780,6 +799,10 @@ impl Tokenizer {
 
   /// Render the chat template and tokenize the result (Python
   /// `apply_chat_template(tokenize=True)`).
+  ///
+  /// `continue_final_message` is forwarded to [`Self::apply_chat_template`] —
+  /// see that method for the semantics (and the mutual exclusivity with
+  /// `add_generation_prompt`).
   #[cfg(feature = "tokenizer-chat")]
   #[cfg_attr(docsrs, doc(cfg(feature = "tokenizer-chat")))]
   pub fn apply_chat_template_ids(
@@ -787,10 +810,16 @@ impl Tokenizer {
     messages: &Value,
     tools: Option<&Value>,
     add_generation_prompt: bool,
+    continue_final_message: bool,
     additional_context: Option<&Value>,
   ) -> Result<Vec<u32>, Error> {
-    let text =
-      self.apply_chat_template(messages, tools, add_generation_prompt, additional_context)?;
+    let text = self.apply_chat_template(
+      messages,
+      tools,
+      add_generation_prompt,
+      continue_final_message,
+      additional_context,
+    )?;
     self.encode(&text, false)
   }
 

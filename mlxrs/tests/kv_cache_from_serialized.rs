@@ -108,6 +108,11 @@ impl KvCache for DefaultProbeCache {
   fn state(&self) -> mlxrs::Result<Vec<Array>> {
     Ok(Vec::new())
   }
+  fn materialize(&mut self) -> mlxrs::Result<()> {
+    unreachable!(
+      "DefaultProbeCache::materialize is not exercised by the from_serialized default test"
+    )
+  }
   fn set_state(&mut self, _state: Vec<Array>) -> mlxrs::Result<()> {
     self.calls.push("set_state");
     Ok(())

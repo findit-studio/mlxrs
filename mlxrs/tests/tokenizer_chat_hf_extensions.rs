@@ -37,6 +37,7 @@ fn render_gp(template: &str, messages: &Value, add_gen: bool, bos: Option<&str>)
     messages,
     None, // tools
     add_gen,
+    false, // continue_final_message
     bos,
     None,  // eos_token
     false, // enable_thinking
@@ -594,7 +595,8 @@ fn strftime_naive_offset_directives_and_unknown_are_safe() {
     "{{ strftime_now('%Q') }}",
     &json!([]),
     None,
-    false,
+    false, // add_generation_prompt
+    false, // continue_final_message
     None,
     None,
     false,
