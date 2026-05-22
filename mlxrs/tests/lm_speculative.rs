@@ -209,7 +209,9 @@ fn speculative_decoding_greedy_self_draft_byte_identical() {
     eos: eos.clone(),
     ..GenConfig::default()
   };
-  let baseline = generate(&target, &tok, &[3u32], cache(1), cfg_baseline).unwrap();
+  // L3: `generate` now returns `(String, GenerationStats)`; the speculative
+  // parity assertions compare only the assembled text.
+  let (baseline, _) = generate(&target, &tok, &[3u32], cache(1), cfg_baseline).unwrap();
 
   // Speculative with self-draft (move `eos` — last use here).
   let cfg_spec = GenConfig {
@@ -273,7 +275,9 @@ fn speculative_decoding_diverging_draft_still_correct() {
     eos: eos.clone(),
     ..GenConfig::default()
   };
-  let baseline = generate(&target, &tok, &[3u32], cache(1), cfg_baseline).unwrap();
+  // L3: `generate` now returns `(String, GenerationStats)`; the speculative
+  // parity assertions compare only the assembled text.
+  let (baseline, _) = generate(&target, &tok, &[3u32], cache(1), cfg_baseline).unwrap();
 
   let cfg_spec = GenConfig {
     max_tokens,
@@ -453,7 +457,9 @@ fn speculative_n_draft_zero_degenerates_to_plain() {
   let draft = MockModel::ramp(5);
 
   let max_tokens = 4;
-  let baseline = generate(
+  // L3: `generate` now returns `(String, GenerationStats)`; the speculative
+  // parity assertions compare only the assembled text.
+  let (baseline, _) = generate(
     &target,
     &tok,
     &[3u32],
@@ -516,7 +522,9 @@ fn speculative_self_draft_with_repetition_penalty_byte_identical() {
     repetition_penalty: Some(2.0),
     ..GenConfig::default()
   };
-  let baseline = generate(&target, &tok, &[3u32], cache(1), cfg_baseline).unwrap();
+  // L3: `generate` now returns `(String, GenerationStats)`; the speculative
+  // parity assertions compare only the assembled text.
+  let (baseline, _) = generate(&target, &tok, &[3u32], cache(1), cfg_baseline).unwrap();
 
   let cfg_spec = GenConfig {
     max_tokens,
@@ -564,7 +572,9 @@ fn speculative_self_draft_with_presence_penalty_byte_identical() {
     presence_penalty: Some(3.0),
     ..GenConfig::default()
   };
-  let baseline = generate(&target, &tok, &[3u32], cache(1), cfg_baseline).unwrap();
+  // L3: `generate` now returns `(String, GenerationStats)`; the speculative
+  // parity assertions compare only the assembled text.
+  let (baseline, _) = generate(&target, &tok, &[3u32], cache(1), cfg_baseline).unwrap();
 
   let cfg_spec = GenConfig {
     max_tokens,
@@ -616,7 +626,9 @@ fn speculative_diverging_draft_with_repetition_penalty_byte_identical() {
     repetition_penalty: Some(2.0),
     ..GenConfig::default()
   };
-  let baseline = generate(&target, &tok, &[3u32], cache(1), cfg_baseline).unwrap();
+  // L3: `generate` now returns `(String, GenerationStats)`; the speculative
+  // parity assertions compare only the assembled text.
+  let (baseline, _) = generate(&target, &tok, &[3u32], cache(1), cfg_baseline).unwrap();
 
   let cfg_spec = GenConfig {
     max_tokens,

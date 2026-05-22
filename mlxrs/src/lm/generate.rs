@@ -9,10 +9,75 @@
 //! Everything is generic over the [`Model`] trait: the loop only ever calls
 //! `model.forward(tokens, &mut cache)`. The decode loop is an idiomatic Rust
 //! [`Iterator`] (the spec's A1) — [`generate_step`] yields one [`GenStep`]
-//! per step (the typed step item: `token` + `logprobs`),
+//! per step (the typed step item: `token` + opt-in `logprobs`),
 //! [`stream_generate`] maps that through the #18 streaming detokenizer into
 //! [`GenerationResponse`]s, and [`generate`] collects the whole thing into a
-//! `String`.
+//! `(String, GenerationStats)` pair (the L3 stats surface — counts +
+//! tokens-per-second + peak memory, sourced from the final
+//! [`GenerationResponse`]).
+//!
+//! **L3 opt-in: per-step logprobs are gated by
+//! [`GenConfig::collect_logprobs`].** When `false` (default), [`GenStep`]'s
+//! `logprobs` field is `None`, the post-sampler squeeze is skipped, **and
+//! the `logits - logsumexp(logits)` normalization itself is skipped**
+//! whenever the configured sampler doesn't need normalized probabilities —
+//! i.e. greedy (`temp == 0`), top-k (monotonic-invariant), min-p
+//! (shift-invariant `max(logprobs) + log(min_p)` threshold), xtc (does its
+//! own `softmax` internally), and categorical (does its own `softmax`
+//! internally) all sample correctly from the raw post-processor logits, so
+//! a `collect_logprobs=false` run pays **zero** vocab-wide normalization
+//! cost per token. Only `top_p ∈ (0, 1)` requires the normalized
+//! log-probability cumsum-to-1 contract; when top_p is enabled the
+//! normalization runs regardless of `collect_logprobs` (the sampler would
+//! otherwise read uninitialized cumulative probabilities). When
+//! `collect_logprobs=true`, the `[V]` `Array` is yielded byte-identically
+//! to mlx-lm's `logprobs.squeeze(0)` (the normalization is always run so
+//! the yielded vector is the true log-softmax).
+//!
+//! **Stochastic-opt-out numerical safety (Codex review R2):** the
+//! shift-invariance argument above is mathematically valid but **not**
+//! numerically safe in low-precision compute dtypes. `categorical_sampling`
+//! multiplies its input by `1/temp` BEFORE the eventual `softmax` inside
+//! `mx.random.categorical`, so in f16 / bf16 a small `temp` combined with a
+//! large `logit_bias` (e.g. `bias = +50`, `temp = 0.1` ⇒ scaled logit `500`)
+//! overflows to `+inf` long before `softmax` can stabilize via shift
+//! cancellation. To preserve the per-step saving for stochastic configs
+//! without exposing that overflow, the opt-out path applies a cheap
+//! `logits - max(logits, keepdims=True)` per-row max-shift (one reduce + one
+//! broadcast subtract — ~3-4× cheaper than the full `logsumexp` + subtract)
+//! before feeding the sampler when `temp > 0`. Pure-greedy (`temp == 0`,
+//! `argmax_sample`) is shift-invariant numerically as well (argmax doesn't
+//! exponentiate anything), so it still receives the raw post-processor
+//! logits.
+//!
+//! **Numerical-safety scope:** the opt-in logprobs + opt-out paths above
+//! work correctly for sane (non-subnormal) `temp` + non-f16-tiny-temp
+//! configs. Two extreme-`temp` configurations still produce non-finite
+//! distributions inside `sample::categorical_sampling` itself (the bug
+//! is in the primitive, not the generation loop): f16 logits +
+//! `temp < 1/65504 ≈ 1.526e-5`, and any logits dtype + subnormal
+//! positive `temp < 1.0/f32::MAX ≈ 2.94e-39`. Both share the same root:
+//! `categorical_sampling` computes `1.0/temp` in `f32` (because
+//! `GenConfig.temp` is `f32`) then multiplies by `scalar_like(1/temp,
+//! logits)` IN THE LOGITS DTYPE; the `f32` reciprocal overflows for
+//! subnormal `temp`, and the dtype cast overflows for f16 + tiny `temp`.
+//! VLM ([`crate::vlm::generate`]) and audio ([`crate::audio::stt::generate`])
+//! share the same defect via the same `make_sampler` chain. The
+//! structural fix lives in `sample::categorical_sampling` itself —
+//! the fix must avoid materializing an `+Inf` reciprocal OR casting an
+//! overflowing reciprocal into the logits dtype. Two viable shapes:
+//! (1) divide instead of multiply (`logits / scalar_like(temp,
+//! logits)` — never materializes `1/temp`, covers both overflow
+//! modes), or (2) route to argmax INSIDE the primitive after every
+//! upstream sampler stage runs (preserves XTC/top_k/min_p semantics).
+//! A naive `1/temp` upcast to f64 is only a partial mitigation — it
+//! closes the f32 subnormal path but the cast back into f16 still
+//! overflows for `temp < 1/65504`. A LM-only argmax bypass in the
+//! generation loop was prototyped and reverted (R3+R4 → R5 revert):
+//! it failed to cover VLM/STT and silently skipped configured sampler
+//! stages, so the fix must land in the primitive with regression
+//! tests across LM/VLM/STT. Deferred to a dedicated `fix(lm/sample)`
+//! follow-up PR after this one merges.
 //!
 //! **Exact per-step order (mlx-lm `generate_step._step`, lines 396-422):**
 //!
@@ -25,10 +90,31 @@
 //!    primitives).
 //! 4. `logprobs = logits - mx.logsumexp(logits, keepdims=True)` — the exact
 //!    mlx-lm normalization (all-axes `logsumexp`, `[1, 1]`, broadcast).
-//! 5. `token = sampler(logprobs)` — the [`make_sampler`] chain
+//!    **Skipped** entirely when both [`GenConfig::collect_logprobs`] is
+//!    `false` AND the sampler chain doesn't need normalized log-probs
+//!    (every sampler except `top_p` is shift-invariant or softmaxes
+//!    internally — see [`GenConfig::collect_logprobs`]). In the opt-out
+//!    path with `temp > 0` a cheap `logits - max(logits, keepdims=True)`
+//!    max-shift is applied instead, to keep the downstream `1/temp`
+//!    multiply finite in f16/bf16 (Codex review R2 — see the module-level
+//!    "stochastic-opt-out numerical safety" note).
+//! 5. `token = sampler(logits_or_logprobs)` — the [`make_sampler`] chain
 //!    (top-k/p, min-p, xtc, categorical) or the default temperature-0
-//!    `argmax`.
-//! 6. yield `GenStep { token, logprobs: logprobs.squeeze(0) }`; stop when
+//!    `argmax`. The argument is the post-normalization `logprobs` if the
+//!    full normalization ran, the max-shifted logits if only the cheap
+//!    shift ran (stochastic opt-out), and the raw post-processor `logits`
+//!    if neither did (pure-greedy opt-out). Every sampler in
+//!    [`make_sampler`] is shift-invariant or softmaxes internally except
+//!    `top_p`, which forces step 4 to run. Extreme-temp NaN-safety for
+//!    `categorical_sampling` itself (f16 + `temp < 1/65504`, any dtype +
+//!    subnormal `temp`) is deferred to a dedicated `fix(lm/sample)`
+//!    follow-up PR — see the module-level "numerical-safety scope"
+//!    note for the scope, fix options, and prior in-diff revert
+//!    rationale.
+//! 6. yield `GenStep { token, logprobs }` — `logprobs` is
+//!    `Some(logprobs.squeeze(0))` when [`GenConfig::collect_logprobs`] is
+//!    `true`, `None` otherwise (L3 opt-in; mlx-lm always yields the
+//!    array, mlxrs surfaces the cost knob to the step loop). Stop when
 //!    `token ∈ eos` (`finish_reason = "stop"`) or `count == max_tokens`
 //!    (`finish_reason = "length"`).
 //!
@@ -194,6 +280,28 @@ pub struct GenConfig {
   /// restart from the same sequence (mlx-lm's default — see [`make_sampler`]).
   /// Ignored when `temp == 0` (the deterministic argmax sampler).
   pub seed: Option<u64>,
+
+  /// When `true`, every yielded [`GenStep`] carries the full `[V]`
+  /// log-probability vector as `Some(Array)` (the mlx-lm `generate_step`
+  /// per-step `logprobs` yield, lazy / kept on-device); when `false`
+  /// (default), the loop yields `None` AND skips the
+  /// `logits - logsumexp(logits)` normalization graph entirely when the
+  /// configured sampler doesn't require it — i.e. for greedy
+  /// (`temp == 0`) and every chain that does NOT include `top_p` (top-k /
+  /// min-p / xtc / categorical are all shift-invariant or
+  /// softmax-internally, so they sample correctly from raw post-processor
+  /// logits). `top_p ∈ (0, 1)` forces the normalization regardless of this
+  /// flag, since the cumsum-to-1 threshold is only meaningful on
+  /// normalized log-probs. This is a true ZERO-cost opt-out for the common
+  /// greedy / temperature-only case: the per-token vocab-wide reduce +
+  /// broadcast subtract that `logsumexp` triggers is avoided, not just the
+  /// `[V]` view squeeze. mlx-lm itself always yields logprobs (server-side
+  /// opt-in lives a layer up at `mlx_lm/server.py:191` `logprobs: bool`);
+  /// flipping the opt-in down to the step loop is a Rust-idiomatic
+  /// cost-discipline improvement that honors the project's "no implicit
+  /// eval" / allocation-discipline rules without changing the per-step
+  /// compute when logprobs ARE requested.
+  pub collect_logprobs: bool,
 }
 
 impl Default for GenConfig {
@@ -218,6 +326,7 @@ impl Default for GenConfig {
       frequency_context_size: DEFAULT_REPETITION_CONTEXT_SIZE,
       eos: Vec::new(),
       seed: None,
+      collect_logprobs: false,
     }
   }
 }
@@ -434,15 +543,32 @@ fn recent_ids(tokens: &[u32], context_size: usize) -> Result<Vec<i32>> {
   Ok(ids)
 }
 
-/// One decode step — the sampled `token` plus the `[V]` log-probability
-/// vector over the vocabulary that produced it (mlx-lm
-/// `generate_step`'s `yield y.item(), logprobs`).
+/// One decode step — the sampled `token` plus an **opt-in** `[V]`
+/// log-probability vector over the vocabulary that produced it (mlx-lm
+/// `generate_step`'s `yield y.item(), logprobs`, gated here by
+/// [`GenConfig::collect_logprobs`]).
 ///
 /// Replaces the prior `(u32, Array)` tuple item: mlx-lm uses Python's
 /// positional tuple as informal documentation, but Rust callers reading
 /// the iterator item shouldn't have to remember tuple-index conventions —
 /// the struct is self-documenting and a Rust-idiomatic improvement
 /// (prefer idiomatic-Rust ergonomics over verbatim Python mirroring).
+///
+/// # `logprobs` opt-in (L3)
+///
+/// `logprobs` is `Some(Array)` when [`GenConfig::collect_logprobs`] is
+/// `true` (the prior unconditional yield); `None` otherwise so a caller
+/// that only reads `token` pays no per-step squeeze. The `Option<Array>`
+/// type (not `Option<Vec<f32>>`) keeps the no-implicit-eval contract:
+/// materialization into a CPU `Vec<f32>` is the caller's explicit step
+/// via [`Array::to_vec`] / [`Array::as_slice`]. This deviates from mlx-lm
+/// (which always yields the array); mlx-lm's server-side opt-in
+/// (`mlx_lm/server.py:191` `logprobs: bool`) is moved down to the step
+/// loop so the cost-when-off saving applies to every consumer, not just
+/// the HTTP server. VLM ([`crate::vlm::generate`]) and audio
+/// ([`crate::audio::stt::generate`]) `GenStep` producers preserve their
+/// unconditional-`Some` behavior (their public surfaces have not yet
+/// adopted the `collect_logprobs` opt-in).
 ///
 /// # Back-compat
 ///
@@ -452,18 +578,21 @@ fn recent_ids(tokens: &[u32], context_size: usize) -> Result<Vec<i32>> {
 /// struct (`let GenStep { token, logprobs } = step?;`). The break is
 /// **intentional** — mlxrs is pre-1.0, and the ergonomics + self-
 /// documentation win outweighs a one-line migration per call site. The
-/// `From<GenStep> for (u32, Array)` impl below makes that migration
-/// mechanical.
+/// `From<GenStep> for (u32, Option<Array>)` impl below makes that
+/// migration mechanical (the previous `From<GenStep> for (u32, Array)`
+/// is replaced — the `Option` shift propagates through the tuple form
+/// so call sites can't silently drop the new semantic).
 #[derive(Debug)]
 pub struct GenStep {
   /// The sampled token id (mlx-lm `y.item()`).
   pub token: u32,
   /// The token's `[V]` log-probability vector (mlx-lm
-  /// `logprobs.squeeze(0)`), kept lazy.
-  pub logprobs: Array,
+  /// `logprobs.squeeze(0)`), kept lazy. `Some` iff
+  /// [`GenConfig::collect_logprobs`] was `true` for this run.
+  pub logprobs: Option<Array>,
 }
 
-impl From<GenStep> for (u32, Array) {
+impl From<GenStep> for (u32, Option<Array>) {
   fn from(s: GenStep) -> Self {
     (s.token, s.logprobs)
   }
@@ -507,6 +636,33 @@ pub struct Generator<'a, M: Model> {
   max_tokens: usize,
   prefill_step_size: usize,
   eos: Vec<u32>,
+  /// [`GenConfig::collect_logprobs`]: when `false`, the per-step squeeze
+  /// is skipped and [`GenStep::logprobs`] is `None`.
+  collect_logprobs: bool,
+  /// `true` iff the configured sampler chain requires `logits - logsumexp`
+  /// normalization to sample correctly. Only `top_p ∈ (0, 1)` does (its
+  /// `exp(logprobs)` cumsum threshold `1 - top_p` assumes the cumsum
+  /// reaches 1.0); every other sampler in [`make_sampler`] is
+  /// shift-invariant (argmax, top_k argpartition, min_p's
+  /// `max + log(min_p)` threshold) or softmaxes internally (xtc's own
+  /// `softmax`, categorical's own `softmax`). When `false` and
+  /// `collect_logprobs` is also `false`, the per-step `logsumexp +
+  /// subtract` is skipped entirely — the sampler reads the raw
+  /// post-processor logits and produces the byte-identical token.
+  /// Precomputed from `GenConfig` at construction so the per-step hot
+  /// loop is a single field check.
+  needs_logprobs: bool,
+  /// `true` iff `cfg.temp > 0` (stochastic sampling). Drives the
+  /// opt-out path's cheap `max + subtract` max-shift (Codex review R2):
+  /// when the full normalization is skipped (`!needs_normalization`) but
+  /// `temp > 0`, the sampler's downstream `logits * (1/temp)` would
+  /// overflow in f16/bf16 with a large `logit_bias`, so the opt-out
+  /// path subtracts the row-wise max to bound `exp` for every dtype.
+  /// `temp == 0` (pure-greedy `argmax_sample`) doesn't exponentiate, so
+  /// the raw-logit path stays the true zero-cost path there.
+  /// Precomputed from `GenConfig.temp` so the per-step `match` is a
+  /// single bool check.
+  temp_stochastic: bool,
   /// `true` once prompt prefill has run (it runs on the first `next()`).
   prefilled: bool,
   /// `true` until the first decode step has run (it feeds the prompt tail;
@@ -583,18 +739,84 @@ impl<M: Model> Generator<'_, M> {
 
     // 4. `logprobs = logits - mx.logsumexp(logits, keepdims=True)` — the
     //    exact mlx-lm normalization (all-axes logsumexp, broadcast).
-    let lse = ops::reduction::logsumexp(&logits, true)?;
-    let logprobs = ops::arithmetic::subtract(&logits, &lse)?;
+    //    **GATED, 3-way**: the per-step compute depends on
+    //    `(needs_normalization, temp > 0)` (Codex review R2):
+    //      • `(true, _)`  — full `logsumexp + subtract` (collect_logprobs
+    //         and/or top_p — `top_p` strictly needs the cumsum-to-1
+    //         contract; collect_logprobs yields the true log-softmax).
+    //      • `(false, true)` — cheap `max + subtract` max-shift. The
+    //         downstream `categorical_sampling` does `logits * (1/temp)`
+    //         BEFORE its internal `softmax`, so f16/bf16 + a large
+    //         `logit_bias` + small `temp` would overflow to `+inf` before
+    //         shift-invariance can save us. The max-shift caps the input
+    //         at 0 (no positive scaled value) ⇒ `exp` is bounded for
+    //         every dtype. One reduce + one broadcast subtract is ~3-4×
+    //         cheaper than the full `logsumexp` + subtract (skips the
+    //         per-element `exp` + `log`).
+    //      • `(false, false)` — raw logits. Pure-greedy
+    //         (`argmax_sample`) is shift-invariant numerically as well
+    //         (it doesn't exponentiate), so it stays the true zero-cost
+    //         path: no reduce, no broadcast, no allocation.
+    //
+    //    The R2 max-shift bounds the sampler input to ≤ 0, but it does
+    //    NOT protect against `categorical_sampling`'s own internal
+    //    `1/temp` overflow for two extreme-`temp` configurations (f16
+    //    logits + `temp < 1/65504`; any dtype + subnormal positive
+    //    `temp < 1.0/f32::MAX ≈ 2.94e-39`). The structural fix lives in
+    //    `sample::categorical_sampling` and is deferred to a dedicated
+    //    `fix(lm/sample)` follow-up PR that updates `sample.rs` + all
+    //    three call sites (LM / VLM / STT) consistently per
+    //    `feedback_review_finding_must_be_in_diff` (a LM-only argmax
+    //    bypass was prototyped in R3+R4 and reverted in R5 because it
+    //    failed to cover VLM/STT and silently skipped configured
+    //    sampler stages — XTC/top_k/min_p).
+    let needs_normalization = self.collect_logprobs || self.needs_logprobs;
+    let sampler_input: Option<Array> = match (needs_normalization, self.temp_stochastic) {
+      // Full normalization (collect_logprobs and/or top_p).
+      (true, _) => {
+        let lse = ops::reduction::logsumexp(&logits, true)?;
+        Some(ops::arithmetic::subtract(&logits, &lse)?)
+      }
+      // Stochastic opt-out: cheap max-shift for f16/bf16 numerical safety.
+      (false, true) => {
+        let m = ops::reduction::max(&logits, true)?;
+        Some(ops::arithmetic::subtract(&logits, &m)?)
+      }
+      // Pure-greedy opt-out: raw logits (argmax is shift-invariant).
+      (false, false) => None,
+    };
 
     // 5. `sampled = sampler(logprobs)` — the make_sampler chain / argmax.
-    let mut sampled = (self.sampler)(&logprobs)?;
+    //    Feed the full `normalized` if we computed it (top_p needs the
+    //    cumsum-to-1 log-probs; collect_logprobs needs the yielded
+    //    log-softmax); feed the cheap max-shift if we computed only that
+    //    (`(false, true)` — stochastic opt-out); otherwise feed the raw
+    //    `logits` (pure-greedy opt-out — `argmax(logits) == argmax(logits
+    //    - c)` for any scalar `c`).
+    let mut sampled = (self.sampler)(sampler_input.as_ref().unwrap_or(&logits))?;
 
     // 6. token boundary: the ONLY materialization (mlx-lm `y.item()`).
     //    `argmax` / `categorical` both yield `U32`.
     let token: u32 = sampled.item::<u32>()?;
 
     // mlx-lm returns `logprobs.squeeze(0)` ⇒ a `[V]` vector. Kept lazy.
-    let logprobs = ops::shape::squeeze_axes(&logprobs, &[0])?;
+    // L3 opt-in: only yield the `[V]` view when `collect_logprobs == true`;
+    // otherwise both the normalization (above) and this squeeze are
+    // skipped. When `true`, `sampler_input` is guaranteed `Some` via the
+    // `(true, _)` match arm (full logsumexp + subtract), so the yielded
+    // array is byte-identical to the prior unconditional yield (mlx-lm's
+    // `logprobs.squeeze(0)`); the cheap max-shift path is never taken
+    // when `collect_logprobs == true`.
+    let logprobs = if self.collect_logprobs {
+      Some(ops::shape::squeeze_axes(
+        sampler_input
+          .as_ref()
+          .expect("sampler_input is Some (full normalization) when collect_logprobs == true"),
+        &[0],
+      )?)
+    } else {
+      None
+    };
     Ok(GenStep { token, logprobs })
   }
 }
@@ -786,6 +1008,37 @@ pub fn generate_step<'a, M: Model>(
     Ok((sampler, processors))
   })();
 
+  let collect_logprobs = cfg.collect_logprobs;
+  // The sampler-chain "needs normalized log-probs" gate, computed from the
+  // same `(temp, top_p, …)` knobs `make_sampler` reads (so the gate stays
+  // in lockstep with the built chain). Only `top_p ∈ (0, 1)` strictly
+  // needs the cumsum-to-1 normalization — `apply_top_p` does
+  // `probs = exp(logprobs)` then `cumsum`, and its `1 - top_p` threshold
+  // only matches the true probability mass when the cumsum reaches 1.0.
+  // Every other sampler in `make_sampler` is either shift-invariant
+  // (argmax, top_k via argpartition on `-logprobs`, min_p whose threshold
+  // is `max + log(min_p)` so cancels the shift, xtc which does its own
+  // `softmax(logits)`) or softmaxes internally (`categorical_sampling`
+  // calls `random.categorical` which applies softmax over the last axis).
+  // mlx-lm always runs the normalization because it always yields
+  // `logprobs` to the caller; mlxrs separates the "yield" from the
+  // "sampler input" so a `collect_logprobs=false` greedy / temperature-
+  // only run pays zero per-token reduce + broadcast subtract.
+  //
+  // Lockstep with `make_sampler`'s `temp == 0` → argmax shortcut: when
+  // `cfg.temp == 0` the built sampler is pure argmax regardless of
+  // `top_p` (mlx-lm's `make_sampler` returns argmax BEFORE reading
+  // top_p / min_p / xtc / top_k), so the top_p flag is dead config — no
+  // normalization needed there either. Honor that here so a stale
+  // `top_p` on a greedy run still skips the per-token logsumexp.
+  let needs_logprobs = cfg.temp != 0.0 && cfg.top_p > 0.0 && cfg.top_p < 1.0;
+  // Lockstep with `make_sampler`'s `temp == 0` → argmax shortcut: the
+  // stochastic max-shift opt-out path only fires when the built sampler is
+  // actually stochastic (`temp > 0` ⇒ the chain bottoms out in
+  // `categorical_sampling`, which scales by `1/temp` before softmax). When
+  // `temp == 0` the sampler is pure argmax (shift-invariant numerically), so
+  // the raw-logit path is safe — see `temp_stochastic` on `Generator`.
+  let temp_stochastic = cfg.temp > 0.0;
   match built {
     Ok((sampler, processors)) => Generator {
       model,
@@ -800,6 +1053,9 @@ pub fn generate_step<'a, M: Model>(
       max_tokens: cfg.max_tokens,
       prefill_step_size: cfg.prefill_step_size.max(1),
       eos: cfg.eos,
+      collect_logprobs,
+      needs_logprobs,
+      temp_stochastic,
       prefilled: false,
       first_step: true,
       pending_err: None,
@@ -824,6 +1080,9 @@ pub fn generate_step<'a, M: Model>(
       max_tokens: cfg.max_tokens,
       prefill_step_size: 1,
       eos: Vec::new(),
+      collect_logprobs,
+      needs_logprobs,
+      temp_stochastic,
       prefilled: true,
       first_step: false,
       pending_err: Some(e),
@@ -842,6 +1101,15 @@ pub fn generate_step<'a, M: Model>(
 /// intermediate responses, `Some("stop")` when the model emitted an eos
 /// token, `Some("length")` when `max_tokens` was reached — exactly mlx-lm's
 /// `"stop" if token in tokenizer.eos_token_ids else "length"`.
+///
+/// `logprobs` honours the `GenStep` opt-in: `Some` iff the underlying
+/// [`GenConfig::collect_logprobs`] was `true`; `None` otherwise.
+///
+/// `peak_memory_bytes` mirrors mlx-lm's `peak_memory = mx.get_peak_memory()
+/// / 1e9` (kept in raw bytes here — the caller picks the scale). `None`
+/// when the [`crate::memory::peak_memory`] FFI call itself errors; the
+/// stream then continues uninterrupted (the per-response counter is
+/// diagnostic, not load-bearing).
 #[derive(Debug)]
 pub struct GenerationResponse {
   /// The next readable text segment (mlx-lm `detokenizer.last_segment`);
@@ -850,7 +1118,8 @@ pub struct GenerationResponse {
   /// The token this response carries (mlx-lm `token`).
   pub token: u32,
   /// The token's `[V]` log-probability vector (mlx-lm `logprobs`).
-  pub logprobs: Array,
+  /// `Some` iff [`GenConfig::collect_logprobs`] was `true`.
+  pub logprobs: Option<Array>,
   /// Number of prompt tokens (mlx-lm `prompt_tokens` = `prompt.size`).
   pub prompt_tokens: usize,
   /// Prompt processing tokens-per-second (mlx-lm `prompt_tps`).
@@ -860,9 +1129,48 @@ pub struct GenerationResponse {
   pub generation_tokens: usize,
   /// Generation tokens-per-second (mlx-lm `generation_tps`).
   pub generation_tps: f64,
+  /// Process-global mlx allocator peak in bytes (mlx-lm's
+  /// `mx.get_peak_memory()`). `None` if the FFI counter is unavailable —
+  /// stream is unaffected.
+  pub peak_memory_bytes: Option<u64>,
   /// `None` while generating; `Some("stop")` on an eos token, `Some(
   /// "length")` at `max_tokens` (mlx-lm `finish_reason`).
   pub finish_reason: Option<String>,
+}
+
+/// Aggregate stats for one full [`generate`] run — the cumulative
+/// counterparts of the per-response [`GenerationResponse`] timing fields,
+/// returned alongside the assembled output string.
+///
+/// Mirrors mlx-lm's `generate` verbose-mode summary (`mlx_lm/generate.py`
+/// lines 791-798) and the mlx-swift-lm `GenerateCompletionInfo` /
+/// `GenerateResult` summary, condensed into the union of fields the
+/// no-network surface produces:
+///
+/// - `prompt_tokens` / `generation_tokens` — counts (mlx-lm
+///   `response.prompt_tokens` / `response.generation_tokens`).
+/// - `prompt_tps` / `generation_tps` — tokens-per-second (mlx-lm
+///   `response.prompt_tps` / `response.generation_tps`); both are 0.0
+///   when their respective phase took zero measurable wall time.
+/// - `peak_memory_bytes` — process-global mlx allocator peak in bytes
+///   (mlx-lm `mx.get_peak_memory()`); `None` if the FFI counter is
+///   unavailable.
+#[derive(Debug, Clone, Copy)]
+pub struct GenerationStats {
+  /// Prompt tokens processed (mlx-lm `response.prompt_tokens`).
+  pub prompt_tokens: usize,
+  /// Tokens generated by the model (mlx-lm `response.generation_tokens`;
+  /// `0` if `stream_generate` produced no tokens).
+  pub generation_tokens: usize,
+  /// Prompt processing tokens-per-second (mlx-lm `response.prompt_tps`).
+  pub prompt_tps: f64,
+  /// Generation tokens-per-second (mlx-lm `response.generation_tps`).
+  pub generation_tps: f64,
+  /// Process-global mlx allocator peak in bytes at the end of the run
+  /// (mlx-lm `response.peak_memory * 1e9`). `None` if the FFI counter
+  /// (`mlx_get_peak_memory`) is unavailable / errored — the run completes
+  /// regardless.
+  pub peak_memory_bytes: Option<u64>,
 }
 
 /// Stream text from `model` for `prompt` — a 1:1 port of
@@ -943,6 +1251,11 @@ pub fn stream_generate<'a, M: Model>(
       if dt > 0.0 { gen_count as f64 / dt } else { 0.0 }
     };
 
+    // mlx-lm: `peak_memory = mx.get_peak_memory() / 1e9`. We surface raw
+    // bytes; an FFI failure (rare — process-global counter) degrades to
+    // `None` without aborting the stream (the field is diagnostic).
+    let peak = crate::memory::peak_memory().ok();
+
     // mlx-lm: `if token in eos: break` BEFORE `add_token` ⇒ the eos token
     // is never detokenized; a final `finish_reason="stop"` response with
     // the (empty) finalized tail is yielded.
@@ -958,6 +1271,7 @@ pub fn stream_generate<'a, M: Model>(
         prompt_tps,
         generation_tokens: n + 1,
         generation_tps: gen_tps(n + 1),
+        peak_memory_bytes: peak,
         finish_reason: Some("stop".to_string()),
       }));
     }
@@ -980,6 +1294,7 @@ pub fn stream_generate<'a, M: Model>(
         prompt_tps,
         generation_tokens: n,
         generation_tps: gen_tps(n),
+        peak_memory_bytes: peak,
         finish_reason: Some("length".to_string()),
       }));
     }
@@ -993,6 +1308,7 @@ pub fn stream_generate<'a, M: Model>(
       prompt_tps,
       generation_tokens: n,
       generation_tps: gen_tps(n),
+      peak_memory_bytes: peak,
       finish_reason: None,
     }))
   })
@@ -1000,7 +1316,22 @@ pub fn stream_generate<'a, M: Model>(
 
 /// Generate a complete response string for `prompt` — a 1:1 port of
 /// `mlx_lm.generate.generate` (the non-verbose path): collect every
-/// [`stream_generate`] segment into one `String`.
+/// [`stream_generate`] segment into one `String` and return it alongside
+/// the aggregate [`GenerationStats`] for the run (the L3 stats surface —
+/// counts + tokens-per-second + peak memory, populated from the final
+/// [`GenerationResponse`] mlx-lm emits in its verbose-mode summary).
+///
+/// Returns `(text, stats)`:
+/// - `text` is the concatenation of every per-response `text` segment
+///   (the eos token contributes no text, faithful to mlx-lm).
+/// - `stats` carries the final response's `prompt_tokens` /
+///   `generation_tokens` / `prompt_tps` / `generation_tps` plus
+///   `peak_memory_bytes` (mlx-lm's `mx.get_peak_memory()` in bytes; see
+///   [`GenerationStats`]).
+///
+/// An empty run (zero produced tokens — `max_tokens == 0`) returns the
+/// empty string and a zero-tps `GenerationStats` with the original
+/// `prompt_tokens` count and the current peak memory.
 ///
 /// Any step error is surfaced as `Err` (it short-circuits the collection,
 /// exactly the [`stream_generate`] Iterator-`Err` contract).
@@ -1010,12 +1341,40 @@ pub fn generate<M: Model>(
   prompt: &[u32],
   cache: Vec<Box<dyn KvCache>>,
   cfg: GenConfig,
-) -> Result<String> {
+) -> Result<(String, GenerationStats)> {
+  let prompt_tokens = prompt.len();
   let mut text = String::new();
+  // Capture the *final* response's stats fields (mlx-lm's verbose-mode
+  // summary uses the loop's last `response`); a stream that produced
+  // nothing falls back to the zero-tps init below.
+  let mut final_response: Option<GenerationResponse> = None;
   for response in stream_generate(model, tokenizer, prompt, cache, cfg) {
-    text.push_str(&response?.text);
+    let response = response?;
+    text.push_str(&response.text);
+    final_response = Some(response);
   }
-  Ok(text)
+
+  let stats = match final_response {
+    Some(r) => GenerationStats {
+      prompt_tokens: r.prompt_tokens,
+      generation_tokens: r.generation_tokens,
+      prompt_tps: r.prompt_tps,
+      generation_tps: r.generation_tps,
+      peak_memory_bytes: r.peak_memory_bytes,
+    },
+    // No tokens produced (e.g. `max_tokens == 0`): mlx-lm prints
+    // "No text generated for this prompt" and returns; we surface the
+    // same zero-counts stats so the caller still gets `prompt_tokens` +
+    // a current peak-memory snapshot.
+    None => GenerationStats {
+      prompt_tokens,
+      generation_tokens: 0,
+      prompt_tps: 0.0,
+      generation_tps: 0.0,
+      peak_memory_bytes: crate::memory::peak_memory().ok(),
+    },
+  };
+  Ok((text, stats))
 }
 
 // ════════════════════════════════════════════════════════════════════════════

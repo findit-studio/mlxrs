@@ -416,6 +416,51 @@ fn vlm_generate_zero_images_passthrough() {
   assert!(!model.forward_calls.borrow().is_empty());
 }
 
+/// L3 / Codex review finding-2: the zero-image VLM branch delegates to
+/// `lm::generate_step`, which honors `cfg.lm.collect_logprobs` — and that
+/// field's `Default` is `false`. The multimodal decode loop in
+/// `vlm::generate` ALWAYS emits `Some(logprobs)` (see the comment at the
+/// post-sampler squeeze: "VLM has not adopted the `collect_logprobs`
+/// opt-in yet, so we always emit `Some`"), so the cross-crate VLM
+/// contract is "every `GenStep.logprobs` is `Some`". Without an explicit
+/// override the zero-image branch silently flipped to `None`, breaking
+/// the contract — fixed by forcing `collect_logprobs = true` on the
+/// branch-local `cfg.lm` clone before delegating. This test pins that:
+/// a `vlm_generate(..., images=[], cfg with default cfg.lm)` MUST yield
+/// `Some(logprobs)` on every step.
+#[test]
+fn vlm_generate_zero_image_preserves_logprobs() {
+  let model = MockVlmModel::new(/*vocab=*/ 5, /*D=*/ 4, /*N_per_img=*/ 3);
+  let prompt = [1_u32, 2, 3];
+  // `vlm_cfg` builds a `VlmGenConfig` with `cfg.lm = GenConfig {
+  // max_tokens, ..Default::default() }` — and `Default` leaves
+  // `collect_logprobs == false`, which is exactly the regression
+  // surface: a default-cfg zero-image VLM run would otherwise return
+  // `None` logprobs and break the documented "VLM always Some" contract.
+  let it = vlm_generate(&model, &prompt, &[], mock_cache(), vlm_cfg(2, 3))
+    .expect("vlm_generate constructs in zero-image mode");
+
+  let mut saw_step = false;
+  for step in it {
+    let s = step.expect("step ok");
+    assert!(
+      s.logprobs.is_some(),
+      "zero-image VLM must preserve Some(logprobs) even though \
+       cfg.lm.collect_logprobs defaults to false — see Codex review \
+       finding-2 (VLM contract drift across the two branches)"
+    );
+    let lp = s.logprobs.as_ref().unwrap();
+    // The mock returns `[1, S, vocab=5]`; per-step squeeze yields `[V]`.
+    assert_eq!(
+      lp.shape(),
+      vec![5_usize],
+      "zero-image VLM logprobs shape is the post-squeeze [V] vector"
+    );
+    saw_step = true;
+  }
+  assert!(saw_step, "vlm_generate must yield at least one step here");
+}
+
 #[test]
 fn vlm_generate_marker_required_missing_errors() {
   // No marker in prompt + MarkerPolicy::Required ⇒ the assembler

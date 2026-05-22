@@ -230,6 +230,12 @@ pub fn speculative_stream_generate<'a>(
   cfg.eos = tokenizer.eos_token_ids().iter().copied().collect();
   let max_tokens = cfg.max_tokens;
   let eos: Vec<u32> = cfg.eos.clone();
+  // L3 opt-in (`GenConfig::collect_logprobs`): the speculative driver always
+  // computes the per-position `[V]` log-probs internally (the verification +
+  // sampling needs them), but the public `GenerationResponse.logprobs` only
+  // exposes that `[V]` view when the caller opted in — `None` otherwise,
+  // matching plain `stream_generate`'s opt-in contract.
+  let collect_logprobs = cfg.collect_logprobs;
   let prompt: Vec<u32> = prompt.to_vec();
 
   // Build the core driver up front so any construction error surfaces as the
@@ -302,11 +308,12 @@ pub fn speculative_stream_generate<'a>(
         response: GenerationResponse {
           text,
           token,
-          logprobs,
+          logprobs: collect_logprobs.then_some(logprobs),
           prompt_tokens,
           prompt_tps,
           generation_tokens: n + 1,
           generation_tps: gen_tps(n + 1),
+          peak_memory_bytes: crate::memory::peak_memory().ok(),
           finish_reason: Some("stop".to_string()),
         },
         from_draft,
@@ -325,11 +332,12 @@ pub fn speculative_stream_generate<'a>(
         response: GenerationResponse {
           text,
           token,
-          logprobs,
+          logprobs: collect_logprobs.then_some(logprobs),
           prompt_tokens,
           prompt_tps,
           generation_tokens: n,
           generation_tps: gen_tps(n),
+          peak_memory_bytes: crate::memory::peak_memory().ok(),
           finish_reason: Some("length".to_string()),
         },
         from_draft,
@@ -342,11 +350,12 @@ pub fn speculative_stream_generate<'a>(
       response: GenerationResponse {
         text,
         token,
-        logprobs,
+        logprobs: collect_logprobs.then_some(logprobs),
         prompt_tokens,
         prompt_tps,
         generation_tokens: n,
         generation_tps: gen_tps(n),
+        peak_memory_bytes: crate::memory::peak_memory().ok(),
         finish_reason: None,
       },
       from_draft,
