@@ -86,22 +86,6 @@ pub trait ToolParser: Send + Sync {
   fn tool_call_end(&self) -> &'static str {
     marker_end(self.name())
   }
-
-  /// Whether a *tagged* call's payload (the text between `tool_call_start` and
-  /// `tool_call_end`) is exactly one top-level JSON object.
-  ///
-  /// Default `false`. When `true`, the streaming [`ToolCallProcessor`] locates
-  /// the end tag with a JSON-string-aware balanced-object scan rather than a
-  /// naive substring search, so an end-delimiter that occurs *inside* a JSON
-  /// string argument value (e.g. `{"s":"</tool_call>"}`) is not mistaken for
-  /// the real closing tag and the call is not corrupted (Codex round-2
-  /// finding 2). Only formats whose payload is unambiguously a single JSON
-  /// object may opt in; structured/XML payloads (`qwen3_coder`, `glm47`,
-  /// `longcat`, `minimax_m2`, `kimi_k2`, the `gemma` family, `pythonic`) keep
-  /// the simple substring detection.
-  fn tagged_payload_is_json(&self) -> bool {
-    false
-  }
 }
 
 fn err(msg: impl Into<String>) -> Error {
@@ -215,11 +199,6 @@ impl ToolParser for JsonTools {
   }
   fn name(&self) -> &'static str {
     "json_tools"
-  }
-  /// `json_tools`' tagged payload is exactly `{json}`, so the end tag is
-  /// located with the JSON-aware balanced-object scan.
-  fn tagged_payload_is_json(&self) -> bool {
-    true
   }
 }
 
@@ -1277,14 +1256,18 @@ fn parse_eos(parser: &dyn ToolParser, buffer: &str, tools: Option<&Value>) -> Ve
 ///
 /// 256 KiB is far larger than any genuine tool-call payload (function names +
 /// JSON arguments are kilobytes at most) yet small enough that retaining it is
-/// harmless. After **each** chunk is appended the buffer length is checked
-/// against this cap; on exceeding it `ToolCallProcessor` *recovers* rather
-/// than panics (see `recover_at_cap`): a not-yet-confirmed start flushes the
-/// buffered bytes back as ordinary display text; a confirmed-but-overlong tool
-/// call drops the buffer. Either way the buffer is then emptied and the state
-/// reset, so growth is `O(1)` per generation rather than `O(total output)` —
-/// the buffer peaks at this cap plus at most one chunk (a single detokenized
-/// token's worth of text), never unbounded.
+/// harmless. After **each** chunk is appended the **combined** size
+/// `tool_call_buffer.len() + pending_display.len()` is checked against this
+/// cap; on exceeding it `ToolCallProcessor` *recovers* rather than panics (see
+/// `recover_at_cap`): a not-yet-confirmed start flushes the buffered bytes
+/// (including any `pending_display`) back as ordinary display text; a
+/// confirmed-but-overlong tool call drops `tool_call_buffer` but still
+/// surfaces any `pending_display` accumulated before the start tag was
+/// confirmed (those bytes are unambiguously display text). Either way the
+/// buffers are emptied and the state reset, so growth is `O(1)` per
+/// generation rather than `O(total output)` — the **combined** buffers peak
+/// at this cap plus at most one chunk (a single detokenized token's worth of
+/// text), never unbounded.
 const MAX_TOOL_CALL_BUFFER_BYTES: usize = 256 * 1024;
 
 /// Streaming state-machine for detecting and extracting tool calls while a
@@ -1338,6 +1321,18 @@ pub struct ToolCallProcessor {
   state: State,
   /// Buffered partial tool-call text not yet emitted or parsed.
   tool_call_buffer: String,
+  /// Display text seen *before* a potential / unconfirmed start tag that has
+  /// not yet been emitted (round-3 structural fix). The fix replaces the prior
+  /// per-chunk `leading_token` local with this persistent field so the bytes
+  /// preceding a start tag survive every chunk boundary — including a split
+  /// landing *inside* the start tag itself (`"Let me <"` then `"tool_call>…"`)
+  /// — and are emitted in stream order on confirmation, or flushed back as
+  /// display text on false-start divergence. This eliminates the whole class
+  /// of "split-inside-a-start-tag drops leading text" defects rather than
+  /// patching split positions one-by-one. Bounded jointly with
+  /// [`tool_call_buffer`](Self::tool_call_buffer) by
+  /// [`MAX_TOOL_CALL_BUFFER_BYTES`].
+  pending_display: String,
   /// Tool calls extracted so far, in arrival order.
   pub tool_calls: Vec<ToolCall>,
 }
@@ -1362,6 +1357,7 @@ impl ToolCallProcessor {
       tools,
       state: State::Normal,
       tool_call_buffer: String::new(),
+      pending_display: String::new(),
       tool_calls: Vec::new(),
     }
   }
@@ -1400,6 +1396,9 @@ impl ToolCallProcessor {
       return;
     }
     if self.tool_call_buffer.is_empty() {
+      // Pending display text accumulated before a never-arrived start char
+      // must not leak into a subsequent generation on the same processor.
+      self.pending_display.clear();
       self.state = State::Normal;
       return;
     }
@@ -1410,6 +1409,10 @@ impl ToolCallProcessor {
     );
     self.tool_calls.extend(parsed);
     self.tool_call_buffer.clear();
+    // `process_eos` returns no display text by API, but the pending leading
+    // text must still be cleared here so it cannot leak into a later
+    // generation on a reused processor.
+    self.pending_display.clear();
     self.state = State::Normal;
   }
 
@@ -1429,47 +1432,60 @@ impl ToolCallProcessor {
     }
   }
 
-  /// Recover when [`tool_call_buffer`](Self::tool_call_buffer) has reached
+  /// Recover when the **combined** size of
+  /// [`tool_call_buffer`](Self::tool_call_buffer) and
+  /// [`pending_display`](Self::pending_display) has reached
   /// [`MAX_TOOL_CALL_BUFFER_BYTES`] without the tool call completing.
   ///
-  /// This enforces the bounded-memory contract (Codex finding 2): the buffer
-  /// is *always* emptied here and the state reset to [`State::Normal`], so it
-  /// can never grow past the cap. The recovery action depends on how far
-  /// detection had progressed:
+  /// This enforces the bounded-memory contract (Codex finding 2): both
+  /// buffers are *always* emptied here and the state reset to
+  /// [`State::Normal`], so neither can grow past the cap. The recovery action
+  /// depends on how far detection had progressed:
   ///
   /// - [`State::PotentialToolCall`] — the start tag was never confirmed, so
-  ///   the buffered bytes are (at worst) a false start; they are flushed back
-  ///   to the caller verbatim as ordinary display text, losing nothing.
+  ///   the buffered bytes are (at worst) a false start; both `pending_display`
+  ///   (the text that arrived *before* the start char) and `tool_call_buffer`
+  ///   (the ambiguous tag-prefix) are flushed back to the caller verbatim as
+  ///   ordinary display text in stream order, losing nothing.
   /// - [`State::CollectingToolCall`] — a real tool call was in progress but is
-  ///   pathologically long / never terminates; its partial content is dropped
-  ///   (it is not valid display text and cannot be parsed) and `None` is
-  ///   returned. This is a clear "give up on this call" signal, never a panic.
-  /// - [`State::Normal`] — unreachable (the buffer only fills past `Normal`);
-  ///   handled defensively by flushing.
+  ///   pathologically long / never terminates; its partial content
+  ///   (`tool_call_buffer`) is dropped (it is not valid display text and
+  ///   cannot be parsed). Any `pending_display` accumulated *before* the
+  ///   start tag was confirmed is still surfaced — those bytes are
+  ///   unambiguously display text and dropping them would be a silent
+  ///   data-loss bug.
+  /// - [`State::Normal`] — unreachable (the buffers only fill past `Normal`);
+  ///   handled defensively by flushing both.
   ///
   /// Returns the text to display, if any.
   fn recover_at_cap(&mut self) -> Option<String> {
-    let recovered = std::mem::take(&mut self.tool_call_buffer);
-    let drop_as_malformed = self.state == State::CollectingToolCall;
+    let drop_tool_buffer = self.state == State::CollectingToolCall;
+    let pending = std::mem::take(&mut self.pending_display);
+    let recovered_buffer = std::mem::take(&mut self.tool_call_buffer);
     self.state = State::Normal;
-    if drop_as_malformed {
-      // Malformed / unbounded tool-call content — drop it, do not display.
-      None
-    } else {
-      // False start (or defensive `Normal`) — the bytes are display text.
-      Some(recovered)
+    let mut out: Option<String> = None;
+    if !pending.is_empty() {
+      push_display(&mut out, &pending);
     }
+    if !drop_tool_buffer && !recovered_buffer.is_empty() {
+      // False start (or defensive `Normal`) — the bytes are display text.
+      push_display(&mut out, &recovered_buffer);
+    }
+    out
   }
 
   /// Enforce the buffer cap once per appended chunk.
   ///
-  /// If `tool_call_buffer` has exceeded `MAX_TOOL_CALL_BUFFER_BYTES` this runs
-  /// `recover_at_cap` and folds any flushed display text into `display`;
-  /// otherwise it does nothing. Called from every buffering branch so the
-  /// bound holds after each chunk regardless of which state the processor is
-  /// in (Codex finding 2).
+  /// If the **combined** size of `tool_call_buffer` and `pending_display` has
+  /// exceeded `MAX_TOOL_CALL_BUFFER_BYTES` this runs `recover_at_cap` and
+  /// folds any flushed display text into `display`; otherwise it does
+  /// nothing. Called from every buffering branch so the bound holds after
+  /// each chunk regardless of which state the processor is in (Codex
+  /// finding 2). The combined bound is required because the round-3
+  /// structural fix introduced `pending_display`, which is *also* an
+  /// adversary-controlled buffer (leading text can be arbitrarily long).
   fn cap_recover_into(&mut self, display: &mut Option<String>) {
-    if self.tool_call_buffer.len() <= MAX_TOOL_CALL_BUFFER_BYTES {
+    if self.tool_call_buffer.len() + self.pending_display.len() <= MAX_TOOL_CALL_BUFFER_BYTES {
       return;
     }
     if let Some(flushed) = self.recover_at_cap() {
@@ -1590,6 +1606,15 @@ impl ToolCallProcessor {
   /// single batched chunk packed with many tool calls cannot overflow the
   /// stack. Each iteration's output is concatenated in stream order, exactly
   /// matching the previous recursive behaviour.
+  ///
+  /// Round-3 structural fix: leading display text seen *before* a candidate
+  /// start tag is accumulated into [`pending_display`](Self::pending_display),
+  /// not a per-chunk local. That makes a chunk boundary landing *inside* a
+  /// start tag (`"Let me <"` then `"tool_call>…"`) byte-for-byte equivalent
+  /// to feeding the whole stream in one chunk — the leading prose survives
+  /// across chunks and is emitted at start-tag confirmation (or flushed back
+  /// to display on strict-prefix divergence) regardless of where the split
+  /// landed.
   fn process_tagged_chunk(&mut self, chunk: &str) -> Option<String> {
     let start_tag = self.parser.tool_call_start();
     let Some(start_char) = self.start_tag_first_char() else {
@@ -1610,39 +1635,59 @@ impl ToolCallProcessor {
         return display;
       }
 
-      self.tool_call_buffer.push_str(&chunk);
-      let mut leading_token: Option<String> = None;
-
       if self.state == State::Normal {
-        // Advance to potential tool call, splitting off any leading text.
+        // Split the chunk at the first start char: everything before it is
+        // unambiguous leading display text (parked in `pending_display`), and
+        // the start char onwards is the candidate tag in `tool_call_buffer`.
+        // Doing the split here — not after appending to `tool_call_buffer` —
+        // ensures the bytes-before-start-char NEVER enter `tool_call_buffer`,
+        // so a chunk boundary landing inside a start tag preserves the
+        // already-seen leading text in `pending_display` across chunks.
+        if let Some(idx) = chunk.find(start_char) {
+          if idx > 0 {
+            self.pending_display.push_str(&chunk[..idx]);
+          }
+          self.tool_call_buffer.push_str(&chunk[idx..]);
+        } else {
+          // No start char in this chunk — unreachable thanks to the guard
+          // above, but handled defensively.
+          self.pending_display.push_str(&chunk);
+        }
         self.state = State::PotentialToolCall;
-        leading_token = separate_token(&mut self.tool_call_buffer, start_char, true);
+      } else {
+        // Past `Normal`: every chunk is appended to the active buffer
+        // (`tool_call_buffer`). `pending_display` is carried as-is.
+        self.tool_call_buffer.push_str(&chunk);
       }
 
       if self.state == State::PotentialToolCall {
         if partial_match(&self.tool_call_buffer, start_tag) {
           if self.tool_call_buffer.starts_with(start_tag) {
-            // Confirmed start tag — fall through to collecting. The text that
-            // preceded the tag is now unambiguously display text, so emit it
-            // in stream order *before* the call (Codex round-2 finding 1):
-            // it must surface whether or not the end tag has streamed yet,
-            // and identically to splitting the stream right before the tag.
+            // Confirmed start tag — fall through to collecting. The leading
+            // text (`pending_display`) is now unambiguously display text and
+            // is flushed in stream order *before* the call (Codex round-2
+            // finding 1; round-3 structural fix carries it across chunks).
             self.state = State::CollectingToolCall;
-            push_display(&mut display, &leading_token.take().unwrap_or_default());
+            let leading = std::mem::take(&mut self.pending_display);
+            push_display(&mut display, &leading);
           } else {
             // Still an ambiguous start-tag prefix. `partial_match` only holds
-            // here while the buffer is a *strict* prefix of `start_tag`, so it
-            // is already bounded by the (tiny) tag length and cannot grow
-            // unbounded — but apply the same cap defensively (Codex finding 2)
-            // so the bound holds unconditionally regardless of tag length.
+            // here while `tool_call_buffer` is a *strict* prefix of
+            // `start_tag`, so the tag-prefix portion is bounded by the (tiny)
+            // tag length — but `pending_display` is adversary-controlled and
+            // can grow unbounded across chunks, so apply the combined cap
+            // unconditionally (Codex finding 2 + round-3 structural fix).
             self.cap_recover_into(&mut display);
             return display;
           }
         } else {
-          // Not a tool call after all — return the collected text and reset.
+          // Not a tool call after all — flush `pending_display` (leading
+          // text) and `tool_call_buffer` (the false-start prefix) back to
+          // display in stream order, then reset.
           self.state = State::Normal;
+          let leading = std::mem::take(&mut self.pending_display);
           let buffer = std::mem::take(&mut self.tool_call_buffer);
-          push_display(&mut display, &leading_token.unwrap_or_default());
+          push_display(&mut display, &leading);
           push_display(&mut display, &buffer);
           return display;
         }
@@ -1658,16 +1703,15 @@ impl ToolCallProcessor {
         return display;
       }
 
-      // Locate the *real* end tag. For JSON-payload formats (`json_tools`) an
-      // end delimiter inside a JSON string argument value must not be mistaken
-      // for the close (Codex round-2 finding 2); `find_tagged_end_tag` uses a
-      // JSON-string-aware scan there and the plain substring search otherwise.
-      let end_at = find_tagged_end_tag(
-        &self.tool_call_buffer,
-        start_tag,
-        end_tag,
-        self.parser.tagged_payload_is_json(),
-      );
+      // Locate the *real* end tag. `find_tagged_end_tag` is dynamic per
+      // payload (round-3 structural fix replacing the prior per-parser flag):
+      // it inspects the confirmed payload itself and uses the JSON-string
+      // aware balanced-object scan whenever the payload begins (after
+      // whitespace) with `{`, and the plain substring search otherwise. This
+      // uniformly covers every parser whose payload may be JSON — `json_tools`
+      // unconditionally, `glm47`/`longcat` via their JSON-fallback paths,
+      // plus any future mixed-mode parser — without a flag to keep in sync.
+      let end_at = find_tagged_end_tag(&self.tool_call_buffer, start_tag, end_tag);
 
       if let Some(end_at) = end_at {
         // Split the buffer at the confirmed end-tag offset: everything after
@@ -1773,69 +1817,72 @@ fn balanced_json_object_prefix(text: &str) -> Option<(usize, usize)> {
 /// tool call, accounting for the end delimiter possibly occurring inside the
 /// payload (Codex round-2 finding 2).
 ///
-/// Two regimes, selected by `payload_is_json`:
+/// Round-3 structural fix: the JSON-vs-substring choice is now **dynamic per
+/// payload** — it inspects the confirmed payload itself rather than relying
+/// on a per-parser flag that has to be kept in sync with every JSON-capable
+/// parser. The previous static `ToolParser::tagged_payload_is_json` flag
+/// missed parsers that *also* accept JSON payloads via a fallback path
+/// (`glm47`'s `glm_parse_json` fallback, `longcat`'s `{...}` fast path), so
+/// a JSON-string end-delimiter would cut their object in half too.
 ///
-/// - **Non-JSON payloads** (`payload_is_json == false`): the payload cannot be
-///   reasoned about structurally, so the end tag is the first substring match
-///   — identical to the previous `contains` / `find` behaviour.
-/// - **JSON payloads** (`payload_is_json == true`, e.g. `json_tools`): the
-///   payload between `start_tag` and the end tag is exactly one JSON object.
-///   A naive search would stop at an `end_tag` that is merely a character
-///   sequence *inside a JSON string value* (`{"s":"</tool_call>"}`), cutting
-///   the object in half. Instead the JSON-string-aware
+/// Two regimes, selected by inspecting the payload:
+///
+/// - **JSON payload** — the first non-whitespace byte of the payload (the
+///   bytes after `start_tag`) is `{`: the JSON-string aware
 ///   [`balanced_json_object_prefix`] scanner finds where the object actually
 ///   closes, and the end tag is the first match **after** that close. While
-///   the object is still open (`balanced_json_object_prefix` → `None`) no end
-///   tag is accepted — any match so far is inside the unfinished object — so
-///   the caller keeps buffering until the object completes.
+///   the object is still open (scanner → `None`) no end tag is accepted —
+///   any match so far is inside the unfinished object — so the caller keeps
+///   buffering until the object completes.
+/// - **Non-JSON payload** — anything else (XML, pythonic `[…]`, plain text,
+///   the kimi/longcat tag wrappers, etc.): the end tag is the first
+///   substring match, identical to the previous `contains` / `find`
+///   behaviour. None of these formats can contain a literal end tag inside
+///   their *structured* payload (they have no JSON string-value scope), so
+///   substring detection is correct for them.
 ///
 /// Returns the offset (into `buffer`) at which `end_tag` begins, or `None`
 /// when no end tag has been confirmed yet (keep collecting). `end_tag` is
 /// assumed non-empty (callers handle the empty-end-tag formats separately).
-fn find_tagged_end_tag(
-  buffer: &str,
-  start_tag: &str,
-  end_tag: &str,
-  payload_is_json: bool,
-) -> Option<usize> {
-  if !payload_is_json {
-    return buffer.find(end_tag);
-  }
-  // The buffer of a confirmed tagged call starts with `start_tag`; the JSON
-  // object is whatever follows it. If (defensively) it does not, fall back to
-  // the naive search rather than mis-slicing.
+fn find_tagged_end_tag(buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
+  // The buffer of a confirmed tagged call starts with `start_tag`; the
+  // payload is whatever follows it. If (defensively) it does not, fall back
+  // to the naive search rather than mis-slicing.
   let payload_at = match buffer.find(start_tag) {
     Some(idx) => idx + start_tag.len(),
     None => return buffer.find(end_tag),
   };
   let payload = &buffer[payload_at..];
-  // `balanced_json_object_prefix` is JSON-string aware: an `end_tag` inside a
-  // `"..."` value is *within* `obj_end`, so the post-object search skips it.
-  let (_, obj_end) = balanced_json_object_prefix(payload)?;
-  // The end tag is the first occurrence strictly after the JSON object.
-  let rel = payload[obj_end..].find(end_tag)?;
-  Some(payload_at + obj_end + rel)
+  if payload_starts_with_json_object(payload) {
+    // JSON payload — the end tag is the first match strictly after the
+    // balanced object close. `balanced_json_object_prefix` is JSON-string
+    // aware: an `end_tag` inside a `"..."` value is *within* `obj_end`, so
+    // the post-object search skips it. While the object is still open the
+    // scanner returns `None` and we propagate that — no end tag yet.
+    let (_, obj_end) = balanced_json_object_prefix(payload)?;
+    let rel = payload[obj_end..].find(end_tag)?;
+    Some(payload_at + obj_end + rel)
+  } else {
+    // Non-JSON payload — naive substring search.
+    buffer[payload_at..]
+      .find(end_tag)
+      .map(|rel| payload_at + rel)
+  }
 }
 
-/// Split `buffer` on the first occurrence of the `char` `separator`, mirroring
-/// Swift `separateToken(returnLeading:)`.
+/// Whether `payload` (the bytes between `start_tag` and an as-yet-unknown
+/// `end_tag`) looks like a top-level JSON object: skip leading ASCII
+/// whitespace, then check whether the next byte is `{`.
 ///
-/// When `return_leading` is `true` the text *before* the separator is returned
-/// and `buffer` keeps the separator onward; when `false` the text *after* is
-/// returned and `buffer` keeps everything up to and including the separator.
-/// Returns `None` (leaving `buffer` untouched) when the separator is absent.
-fn separate_token(buffer: &mut String, separator: char, return_leading: bool) -> Option<String> {
-  let idx = buffer.find(separator)?;
-  if return_leading {
-    let token = buffer[..idx].to_owned();
-    buffer.replace_range(..idx, "");
-    Some(token)
-  } else {
-    let after = idx + separator.len_utf8();
-    let token = buffer[after..].to_owned();
-    buffer.truncate(after);
-    Some(token)
-  }
+/// JSON whitespace per RFC 8259 §2 is exactly space, tab, LF, CR — all ASCII,
+/// so a byte-level scan is correct even with multibyte content elsewhere.
+/// Returns `false` for an empty / all-whitespace payload (no JSON object
+/// started yet — we'll re-check on the next chunk).
+fn payload_starts_with_json_object(payload: &str) -> bool {
+  payload
+    .bytes()
+    .find(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+    == Some(b'{')
 }
 
 /// Whether `buffer` is a prefix-compatible partial (or full) match of `tag`:
@@ -2399,31 +2446,60 @@ mod tests {
   }
 
   #[test]
-  fn find_tagged_end_tag_json_vs_plain() {
-    // JSON-payload mode: an end tag inside a string value is skipped; the
+  fn find_tagged_end_tag_dynamic_dispatch() {
+    // Round-3 structural fix: end-tag detection is now dynamic per payload —
+    // a payload that *looks* like a JSON object (first non-whitespace byte is
+    // `{`) uses the balanced-object scan; anything else uses substring
+    // detection. No per-parser flag, so glm47/longcat JSON-fallback payloads
+    // get the JSON-aware path too.
+
+    // JSON-object payload: end tag inside a string value is skipped; the
     // first end tag after the balanced object is the real one.
     let buf = r#"<tool_call>{"s":"</tool_call>"}</tool_call>"#;
-    let pos = find_tagged_end_tag(buf, "<tool_call>", "</tool_call>", true)
+    let pos = find_tagged_end_tag(buf, "<tool_call>", "</tool_call>")
       .expect("real end tag after the balanced object");
     assert_eq!(&buf[..pos], r#"<tool_call>{"s":"</tool_call>"}"#);
     assert_eq!(&buf[pos..], "</tool_call>");
-    // Plain (non-JSON) mode finds the *first* occurrence — the in-string one.
-    let plain = find_tagged_end_tag(buf, "<tool_call>", "</tool_call>", false)
-      .expect("first substring match");
-    assert!(
-      plain < pos,
-      "plain detection stops at the in-string delimiter"
-    );
-    // JSON mode while the object is still open: no end tag is accepted.
+
+    // JSON-object payload with leading whitespace: still detected as JSON.
+    let buf_ws = "<tool_call>   {\"s\":\"</tool_call>\"}</tool_call>";
+    let pos_ws = find_tagged_end_tag(buf_ws, "<tool_call>", "</tool_call>")
+      .expect("ws-leading JSON still uses balanced scan");
+    assert_eq!(&buf_ws[pos_ws..], "</tool_call>");
+
+    // Non-JSON payload (XML-ish): substring search finds the first end tag.
+    let xml = "<tool_call><invoke>x</invoke></tool_call>";
+    let xml_pos = find_tagged_end_tag(xml, "<tool_call>", "</tool_call>")
+      .expect("substring match for non-JSON payload");
+    assert_eq!(&xml[xml_pos..], "</tool_call>");
+    assert_eq!(&xml[..xml_pos], "<tool_call><invoke>x</invoke>");
+
+    // JSON-object payload while the object is still open: no end tag is
+    // accepted (the premature in-string delimiter is *inside* the object).
     assert_eq!(
       find_tagged_end_tag(
         r#"<tool_call>{"s":"</tool_call>"#,
         "<tool_call>",
         "</tool_call>",
-        true,
       ),
       None
     );
+  }
+
+  #[test]
+  fn payload_starts_with_json_object_classification() {
+    // The dynamic JSON-vs-substring switch hinges on this helper; spot-check
+    // the boundary cases that matter in practice.
+    assert!(payload_starts_with_json_object("{}"));
+    assert!(payload_starts_with_json_object("  {\"k\":1}"));
+    assert!(payload_starts_with_json_object("\n\t{}"));
+    // Empty / all-whitespace: not yet an object (re-check on next chunk).
+    assert!(!payload_starts_with_json_object(""));
+    assert!(!payload_starts_with_json_object("   "));
+    // Anything else (XML, brackets, plain text) is NOT a JSON object payload.
+    assert!(!payload_starts_with_json_object("<invoke>"));
+    assert!(!payload_starts_with_json_object("[func()]"));
+    assert!(!payload_starts_with_json_object("name "));
   }
 
   // --- helper unit coverage ------------------------------------------------
@@ -2493,28 +2569,6 @@ mod tests {
   }
 
   #[test]
-  fn separate_token_leading_and_trailing() {
-    // `return_leading == true`: text *before* the separator, buffer keeps the
-    // separator onward.
-    let mut buf = String::from("abc<tool_call>def");
-    let leading = separate_token(&mut buf, '<', true);
-    assert_eq!(leading.as_deref(), Some("abc"));
-    assert_eq!(buf, "<tool_call>def");
-
-    // `return_leading == false`: text *after* the separator, buffer keeps up
-    // to and including the separator.
-    let mut buf = String::from("abc<def");
-    let trailing = separate_token(&mut buf, '<', false);
-    assert_eq!(trailing.as_deref(), Some("def"));
-    assert_eq!(buf, "abc<");
-
-    // Absent separator leaves the buffer untouched.
-    let mut buf = String::from("no sep here");
-    assert_eq!(separate_token(&mut buf, '<', true), None);
-    assert_eq!(buf, "no sep here");
-  }
-
-  #[test]
   fn strip_markers_tagged_and_inline() {
     // Tagged: both delimiters removed, inner trimmed.
     let inner = strip_markers(&JsonTools, "<tool_call>  {\"x\": 1}  </tool_call>");
@@ -2522,5 +2576,250 @@ mod tests {
     // Inline parser (empty markers): only trimmed.
     let inner = strip_markers(&InlineJson, "  {\"x\": 1}  ");
     assert_eq!(inner, r#"{"x": 1}"#);
+  }
+
+  // --- round-3 structural fix: pending_display + dynamic JSON end detection
+  // ----------------------------------------------------------------------
+
+  /// Feed an arbitrary `[parser_factory]`-flavoured tagged stream as `chunks`
+  /// and return the concatenated display text + extracted tool calls (running
+  /// `process_eos` to flush trailing state). Generic over the parser so the
+  /// same harness exercises `json_tools`, `glm47`, `longcat`.
+  fn run_with_parser(parser: Box<dyn ToolParser>, chunks: &[&str]) -> (String, Vec<ToolCall>) {
+    let mut p = ToolCallProcessor::new(parser, None);
+    let mut display = String::new();
+    for c in chunks {
+      if let Some(d) = p.process_chunk(c) {
+        display.push_str(&d);
+      }
+    }
+    p.process_eos();
+    (display, p.tool_calls)
+  }
+
+  #[test]
+  fn streaming_leading_text_split_inside_start_tag_persists() {
+    // Round-3 structural fix (pending_display): a chunk boundary that lands
+    // *inside* the start tag must still emit the leading prose. With the
+    // prior per-chunk `leading_token` local, "Let me <" parked the leading
+    // text in the next chunk's `tool_call_buffer` only — the second chunk
+    // entered `PotentialToolCall` with no leading_token, and the prose was
+    // silently dropped at confirmation. With `pending_display` persisting on
+    // the processor, the split is byte-equivalent to the one-chunk version.
+    let (d_split, c_split) = run_with_parser(
+      Box::new(JsonTools),
+      &[
+        "Let me <",
+        r#"tool_call>{"name":"ls","arguments":{}}</tool_call>"#,
+      ],
+    );
+    let (d_whole, c_whole) = run_with_parser(
+      Box::new(JsonTools),
+      &[r#"Let me <tool_call>{"name":"ls","arguments":{}}</tool_call>"#],
+    );
+    assert_eq!(d_split, "Let me ");
+    assert_eq!(d_split, d_whole, "split-inside-start-tag must equal whole");
+    assert_eq!(c_split.len(), 1);
+    assert_eq!(c_whole.len(), 1);
+    assert_eq!(c_split[0].name, "ls");
+    assert_eq!(c_whole[0].name, "ls");
+  }
+
+  #[test]
+  fn streaming_leading_text_every_byte_boundary_inside_start_tag() {
+    // The structural fix is "no split inside the start tag drops leading
+    // text" for *every* byte boundary — exercise them all. The start tag
+    // `<tool_call>` is 11 bytes; the leading text is "Let me " (7 bytes);
+    // for k = 1..=(7 + 11) split the stream after `k` bytes of
+    // "Let me <tool_call>" and verify identical output.
+    let prefix = "Let me <tool_call>";
+    let tail = r#"{"name":"ls","arguments":{}}</tool_call>"#;
+    let combined: String = format!("{prefix}{tail}");
+    let (d_baseline, c_baseline) = run_with_parser(Box::new(JsonTools), &[&combined]);
+    assert_eq!(d_baseline, "Let me ");
+    assert_eq!(c_baseline.len(), 1);
+    for k in 1..prefix.len() {
+      let head = &combined[..k];
+      let rest = &combined[k..];
+      let (d, c) = run_with_parser(Box::new(JsonTools), &[head, rest]);
+      assert_eq!(
+        d, d_baseline,
+        "byte split at k={k} ({head:?}|{rest:?}) lost leading text"
+      );
+      assert_eq!(c.len(), 1, "byte split at k={k} lost the call");
+      assert_eq!(c[0].name, "ls");
+    }
+  }
+
+  #[test]
+  fn streaming_pending_display_flushed_on_false_start() {
+    // Round-3: `pending_display` carrying leading text across chunks must
+    // also flush back to display when the start tag turns out to be a false
+    // start (strict-prefix divergence). Without this the leading prose would
+    // stick in `pending_display` and either leak into a later call or just
+    // be silently lost.
+    let (d, c) = run_with_parser(
+      Box::new(JsonTools),
+      &["Let me <", "thinking>oops</thinking> and continue"],
+    );
+    assert_eq!(c.len(), 0, "no tool call from a false start");
+    assert_eq!(
+      d, "Let me <thinking>oops</thinking> and continue",
+      "leading prose + false-start prefix + remainder all surface"
+    );
+  }
+
+  #[test]
+  fn streaming_back_to_back_with_trailing_partial_next_start() {
+    // Display text between two tagged calls where the second chunk's tail is
+    // a partial *next* start tag prefix. This exercises the trailing-suffix
+    // loop *plus* pending_display persistence across the loop iteration: the
+    // " and then <" is leading text for the second tool-call attempt and
+    // must survive into the chunk that completes the tag.
+    let (d, c) = run_with_parser(
+      Box::new(JsonTools),
+      &[
+        r#"<tool_call>{"name":"a","arguments":{}}</tool_call> and then <"#,
+        r#"tool_call>{"name":"b","arguments":{}}</tool_call>"#,
+      ],
+    );
+    assert_eq!(d, " and then ");
+    assert_eq!(c.len(), 2);
+    assert_eq!(c[0].name, "a");
+    assert_eq!(c[1].name, "b");
+  }
+
+  #[test]
+  fn streaming_glm47_json_fallback_end_tag_in_string_extracted() {
+    // Round-3 dynamic JSON-end detection: glm47's parse() falls back to
+    // `glm_parse_json` for payloads that are a plain `{...}` JSON object —
+    // not just `json_tools`. The static per-parser flag missed this and a
+    // glm47 JSON-fallback payload whose argument string contains the literal
+    // `</tool_call>` would be cut at the in-string delimiter, fail to parse,
+    // and discard the call. The dynamic per-payload scan accepts the end
+    // tag only after the balanced object closes, so the call extracts
+    // intact with the delimiter preserved.
+    let (d, c) = run_with_parser(
+      Box::new(Glm47),
+      &[r#"<tool_call>{"name":"echo","arguments":{"s":"</tool_call>"}}</tool_call>"#],
+    );
+    assert_eq!(d, "", "no suffix leaks");
+    assert_eq!(c.len(), 1, "glm47 JSON-fallback call must extract intact");
+    assert_eq!(c[0].name, "echo");
+    assert_eq!(
+      c[0].arguments,
+      serde_json::json!({"s": "</tool_call>"}),
+      "in-string delimiter preserved verbatim"
+    );
+  }
+
+  #[test]
+  fn streaming_glm47_json_fallback_end_tag_in_string_split_across_chunks() {
+    // Same as above, with the chunk boundary inside the in-string delimiter
+    // — the premature `</tool_call>` inside a still-open object must not end
+    // collection.
+    let (d, c) = run_with_parser(
+      Box::new(Glm47),
+      &[
+        r#"<tool_call>{"name":"echo","arguments":{"s":"<"#,
+        r#"/tool_call>"}}</tool_call>"#,
+      ],
+    );
+    assert_eq!(d, "");
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].name, "echo");
+    assert_eq!(c[0].arguments, serde_json::json!({"s": "</tool_call>"}));
+  }
+
+  #[test]
+  fn streaming_longcat_json_fastpath_end_tag_in_string_extracted() {
+    // Longcat's parse() has a `{...}` fast-path that accepts JSON payloads
+    // — same defect class as glm47. The dynamic per-payload scan must apply
+    // to longcat too, since the structural fix is "anything that looks like
+    // JSON gets the JSON-aware scan", with no per-parser opt-in.
+    let (d, c) = run_with_parser(
+      Box::new(Longcat),
+      &[
+        r#"<longcat_tool_call>{"name":"echo","arguments":{"s":"</longcat_tool_call>"}}</longcat_tool_call>"#,
+      ],
+    );
+    assert_eq!(d, "");
+    assert_eq!(c.len(), 1, "longcat JSON-fastpath call must extract intact");
+    assert_eq!(c[0].name, "echo");
+    assert_eq!(
+      c[0].arguments,
+      serde_json::json!({"s": "</longcat_tool_call>"}),
+    );
+  }
+
+  #[test]
+  fn streaming_longcat_json_fastpath_end_tag_in_string_split_across_chunks() {
+    let (d, c) = run_with_parser(
+      Box::new(Longcat),
+      &[
+        r#"<longcat_tool_call>{"name":"echo","arguments":{"s":"<"#,
+        r#"/longcat_tool_call>"}}</longcat_tool_call>"#,
+      ],
+    );
+    assert_eq!(d, "");
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].name, "echo");
+    assert_eq!(
+      c[0].arguments,
+      serde_json::json!({"s": "</longcat_tool_call>"}),
+    );
+  }
+
+  #[test]
+  fn streaming_pending_display_counted_against_cap() {
+    // Round-3 cap: `MAX_TOOL_CALL_BUFFER_BYTES` must bound the COMBINED size
+    // `tool_call_buffer.len() + pending_display.len()`. Without that, an
+    // adversary could pile arbitrarily large leading text into
+    // `pending_display` before any start char, and the per-buffer cap on
+    // `tool_call_buffer` alone would never trigger. Feed long leading text
+    // followed by a start char that never gets to a confirmed tag; the
+    // combined-size cap must trip and flush.
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    // No start char until the very end: every chunk lands entirely in
+    // `pending_display` once we cross into PotentialToolCall — but we never
+    // do until a `<` arrives. Prime with one `<` so subsequent chunks accrue
+    // into `tool_call_buffer`; combined with a long pre-seed in
+    // `pending_display`, the cap-check must still bound growth.
+    let _ = p.process_chunk("Let me say a lot first <");
+    let big = "x".repeat(64 * 1024);
+    let bound = MAX_TOOL_CALL_BUFFER_BYTES + big.len();
+    for _ in 0..8 {
+      let _ = p.process_chunk(&big);
+      // Combined bound: neither buffer alone, nor their sum, can pass `bound`.
+      assert!(p.tool_call_buffer.len() + p.pending_display.len() <= bound);
+    }
+    // After recovery the processor is usable again for a fresh stream.
+    assert_eq!(p.tool_call_buffer.len(), 0);
+    assert_eq!(p.pending_display.len(), 0);
+    let out = p.process_chunk(r#"<tool_call>{"name":"ok","arguments":{}}</tool_call>"#);
+    // The recovered "Let me say a lot first <" was already returned during
+    // the cap-trip; this fresh call has no leading prose.
+    assert_eq!(out, None);
+    assert_eq!(p.tool_calls.len(), 1);
+    assert_eq!(p.tool_calls[0].name, "ok");
+  }
+
+  #[test]
+  fn streaming_pending_display_cleared_on_eos() {
+    // Round-3: `pending_display` accumulated before a never-arrived start
+    // confirmation must be cleared on `process_eos` so it cannot leak into
+    // a subsequent generation reusing the same processor.
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    let _ = p.process_chunk("Just thinking <");
+    // EOS arrives mid-PotentialToolCall — both buffers must be empty after.
+    p.process_eos();
+    assert!(
+      p.pending_display.is_empty(),
+      "pending_display leaked past EOS"
+    );
+    assert!(p.tool_call_buffer.is_empty());
+    // A fresh stream is unaffected.
+    let out = p.process_chunk("hello");
+    assert_eq!(out.as_deref(), Some("hello"));
   }
 }
