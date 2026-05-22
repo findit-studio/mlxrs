@@ -69,9 +69,12 @@ pub const DEFAULT_BATCH_SIZE: usize = 8;
 /// prints).
 ///
 /// `losses` is the flat per-token negative-log-likelihood vector — the
-/// reference's `all_losses = mx.concatenate([...])` — left **lazy**
-/// ([`crate::lm::generate`]'s no-implicit-eval discipline); the scalar fields
-/// are already materialized (the reference calls `.item()` on each).
+/// reference's `all_losses = mx.concatenate([...])`. Each batch's per-token
+/// losses are materialized as they are computed (mirroring `eval_ppl`'s
+/// per-batch `mx.eval`, which bounds the lazy graph to one batch); the only
+/// residual graph node is the final `concatenate` over those already-evaluated
+/// batches (a single batch is returned fully evaluated). The scalar fields are
+/// likewise materialized (the reference calls `.item()` on each).
 pub struct PerplexityResult {
   /// `exp(mean_loss)` — the perplexity (`eval_ppl`'s `ppl`).
   pub perplexity: f32,
@@ -83,7 +86,8 @@ pub struct PerplexityResult {
   /// Total number of scored tokens — `sum over rows of (L - 1)`
   /// (`all_losses.size`).
   pub num_tokens: usize,
-  /// The flat `[num_tokens]` per-token NLL vector (`all_losses`), left lazy.
+  /// The flat `[num_tokens]` per-token NLL vector (`all_losses`); its
+  /// per-batch constituents are already evaluated (see the type-level note).
   pub losses: Array,
 }
 
@@ -126,9 +130,9 @@ pub fn make_windows(tokens: &[i32], sequence_length: usize) -> Result<Array> {
 /// (the only case `eval_ppl` exercises: `cross_entropy(logits, targets,
 /// reduction="none")`).
 ///
-/// `logits` is `[..., V]` (any leading shape) and `targets` is the same shape
-/// with the last axis dropped (`[...]`, an integer dtype). Returns the
-/// per-position loss `[...]`:
+/// `logits` is `[..., V]` (any leading shape) and `targets` must be **exactly**
+/// that shape with the last axis dropped (`[...]`, an integer dtype). Returns
+/// the per-position loss `[...]`:
 ///
 /// ```text
 /// score = take_along_axis(logits, targets[..., None], -1).squeeze(-1)
@@ -139,6 +143,12 @@ pub fn make_windows(tokens: &[i32], sequence_length: usize) -> Result<Array> {
 /// reference relies on (it never forms `log_softmax` explicitly). Label
 /// smoothing / weights / non-`none` reductions are out of scope here — the
 /// reference perplexity uses none of them.
+///
+/// Errors with [`Error::ShapeMismatch`] unless `targets.shape()` equals
+/// `logits.shape()` with the class axis removed — mirroring mlx's
+/// `cross_entropy` (`targets.shape != _drop_dim(logits.shape, axis)` raises).
+/// A merely broadcastable target shape (e.g. `[B, 1]` against `[B, S, V]`) is
+/// **rejected**, not silently broadcast across the missing positions.
 pub fn cross_entropy_none(logits: &Array, targets: &Array) -> Result<Array> {
   let logits_ndim = logits.ndim();
   if logits_ndim == 0 {
@@ -159,6 +169,25 @@ pub fn cross_entropy_none(logits: &Array, targets: &Array) -> Result<Array> {
     });
   }
   let axis = (logits_ndim - 1) as i32;
+  // mlx's `cross_entropy` rejects targets whose shape isn't *exactly* the logits
+  // shape with the class axis removed (`targets.shape != _drop_dim(logits.shape,
+  // axis)`). The rank check above isn't enough: `take_along_axis` + `subtract`
+  // broadcast, so e.g. `logits [B, S, V]` with targets `[B, 1]` would silently
+  // reuse one label across all `S` positions instead of erroring. Compare the
+  // full shape (class axis = last, so logits shape sans its final entry) BEFORE
+  // `expand_dims`/`take_along_axis` so a broadcastable-but-wrong shape is
+  // rejected, not silently broadcast.
+  let logits_shape = logits.shape();
+  let expected = &logits_shape[..logits_ndim - 1];
+  let targets_shape = targets.shape();
+  if targets_shape.as_slice() != expected {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "perplexity::cross_entropy_none: targets shape {targets_shape:?} does not match logits \
+         shape {logits_shape:?} with the class axis removed (expected {expected:?})"
+      ),
+    });
+  }
   // `mx.take_along_axis(logits, mx.expand_dims(targets, axis), axis).squeeze(axis)`.
   let idx = targets.expand_dims_axes(&[axis])?;
   let score = ops::indexing::take_along_axis(logits, &idx, axis)?;
@@ -174,8 +203,10 @@ pub fn cross_entropy_none(logits: &Array, targets: &Array) -> Result<Array> {
 /// `data` is a `[N, L]` integer array of `N` independent length-`L` windows
 /// (build it with [`make_windows`]). For each `batch_size`-row batch the model
 /// runs once over `data[:, :-1]`, its logits are scored against the next
-/// tokens `data[:, 1:]` with [`cross_entropy_none`], and every per-token loss
-/// is collected; then
+/// tokens `data[:, 1:]` with [`cross_entropy_none`], and the resulting
+/// per-token losses are **evaluated and collected per batch** (mirroring
+/// `eval_ppl`'s per-batch `mx.eval`, so the lazy compute graph stays bounded to
+/// one batch rather than growing with `N`); then
 ///
 /// ```text
 /// mean_loss = mean(all_losses)
@@ -249,7 +280,13 @@ pub fn perplexity<M: Model>(
 
     // `losses = cross_entropy(logits, targets, reduction="none").flatten()`.
     let losses = cross_entropy_none(&logits, &targets)?;
-    let losses = losses.flatten(0, -1)?;
+    let mut losses = losses.flatten(0, -1)?;
+    // mlx-lm's `eval_ppl` calls `mx.eval(losses)` each batch — materialize the
+    // per-token NLLs now instead of accumulating lazy graphs and eval'ing one
+    // giant graph at the end. This bounds the lazy compute graph to a single
+    // batch (memory + incremental compute); the accumulated values are exactly
+    // the per-token losses, so eval'ing them per batch is correct and faithful.
+    losses.eval()?;
     all_losses.push(losses);
 
     start = stop;
@@ -492,6 +529,84 @@ mod tests {
     // targets with the SAME rank as logits is the (unsupported) probs case.
     let bad = Array::from_slice::<i32>(&[0, 1, 0, 1], &(2usize, 2)).unwrap();
     assert!(cross_entropy_none(&logits, &bad).is_err());
+  }
+
+  #[test]
+  fn cross_entropy_none_rejects_broadcastable_target_shape() {
+    // The right rank but a non-matching (broadcastable) shape must be rejected,
+    // not silently broadcast — `take_along_axis`/`subtract` would otherwise reuse
+    // one label across every position. logits `[B=2, S=3, V=4]`.
+    let b = 2usize;
+    let s = 3usize;
+    let v = 4usize;
+    let logits = Array::from_slice::<f32>(&vec![0.0f32; b * s * v], &(b, s, v)).unwrap();
+
+    // targets `[B, 1]` — class-index rank (ndim 2 == 3 - 1) but broadcasts over S.
+    let bad_bs = Array::from_slice::<i32>(&[0, 1], &(b, 1usize)).unwrap();
+    assert!(
+      matches!(
+        cross_entropy_none(&logits, &bad_bs),
+        Err(Error::ShapeMismatch { .. })
+      ),
+      "targets [B, 1] should be rejected, not broadcast across S"
+    );
+
+    // targets `[1, S]` — also right rank, broadcasts over B.
+    let bad_1s = Array::from_slice::<i32>(&[0, 1, 2], &(1usize, s)).unwrap();
+    assert!(
+      matches!(
+        cross_entropy_none(&logits, &bad_1s),
+        Err(Error::ShapeMismatch { .. })
+      ),
+      "targets [1, S] should be rejected, not broadcast across B"
+    );
+
+    // The exact-shape targets `[B, S]` are accepted.
+    let good = Array::from_slice::<i32>(&[0, 1, 2, 3, 0, 1], &(b, s)).unwrap();
+    let mut loss = cross_entropy_none(&logits, &good).unwrap();
+    // Uniform-zero logits over V classes -> every loss is `log V`.
+    let got = loss.to_vec::<f32>().unwrap();
+    assert_eq!(got.len(), b * s);
+    let want = (v as f64).ln();
+    for x in got {
+      assert!((x as f64 - want).abs() < 1e-5, "loss {x} != log V {want}");
+    }
+  }
+
+  #[test]
+  fn many_batches_match_single_batch_after_per_batch_eval() {
+    // Finding 1: per-batch `eval` materializes each batch's losses incrementally
+    // (bounding the lazy graph) without changing the result. Drive *many* small
+    // batches (batch_size 1 over a tall matrix) and assert the PPL equals both
+    // the hand-traced closed form and the all-in-one-batch reduction.
+    let model = MockModel::new(6);
+    let rows: Vec<&[i32]> = vec![
+      &[0, 1, 2, 3, 4],
+      &[5, 4, 3, 2, 1],
+      &[1, 2, 3, 4, 5],
+      &[0, 0, 5, 5, 0],
+      &[2, 4, 1, 3, 5],
+      &[5, 5, 0, 0, 5],
+      &[3, 3, 3, 3, 3],
+      &[1, 0, 2, 4, 1],
+    ];
+    let data = matrix(&rows);
+
+    // batch_size 1 -> 8 separate batches, each eval'd before the next.
+    let res = perplexity(&model, &data, 1, &no_cache()).unwrap();
+    assert_eq!(res.num_tokens, rows.len() * (5 - 1));
+    let want = expected_ppl(&model.canned, &rows);
+    assert!(
+      (res.perplexity as f64 - want).abs() < 1e-4,
+      "many-batch ppl {} != hand-traced {want}",
+      res.perplexity
+    );
+
+    // The incremental per-batch eval must not change the answer vs one big batch.
+    let res_one = perplexity(&model, &data, 64, &no_cache()).unwrap();
+    assert!((res.perplexity as f64 - res_one.perplexity as f64).abs() < 1e-5);
+    assert!((res.mean_loss as f64 - res_one.mean_loss as f64).abs() < 1e-5);
+    assert_eq!(res.num_tokens, res_one.num_tokens);
   }
 
   /// A `MockModel` with a non-`f32` compute dtype must still reduce in f32
