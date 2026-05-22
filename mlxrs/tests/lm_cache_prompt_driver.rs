@@ -10,6 +10,12 @@
 //! `save_prompt_cache` / `load_prompt_cache` round-trip, with no real model or
 //! network.
 //!
+//! `cache_prompt` / `cache_prompt_ids` allocate their KV cache **internally**
+//! via `make_prompt_cache` (exactly `cache_prompt.py:111` — `cache =
+//! make_prompt_cache(model, ...)`); they take a `CacheConfig` (the
+//! model-appropriate cache spec), not a caller-provided cache. So the saved
+//! cache is fresh by construction and represents exactly the requested prompt.
+//!
 //! The core property: filling a cache via the driver and saving it, then
 //! loading it back, yields a cache *byte-identical* to a direct prefill — and
 //! a subsequent `generate_step` continuation from the loaded cache produces
@@ -17,14 +23,12 @@
 
 #![cfg(feature = "lm")]
 
-use std::{cell::Cell, collections::HashMap, fs, io::Write, path::PathBuf, process, rc::Rc};
+use std::{collections::HashMap, fs, io::Write, path::PathBuf, process};
 
 use mlxrs::{
   Array,
   lm::{
-    cache::{
-      CacheConfig, KvCache, MaskMode, RotatingKvCache, load_prompt_cache, make_prompt_cache,
-    },
+    cache::{CacheConfig, KvCache, load_prompt_cache, make_prompt_cache},
     cache_prompt::{
       CachePromptInfo, META_MODEL, META_TOKENIZER_CONFIG, cache_prompt, cache_prompt_ids,
     },
@@ -125,20 +129,30 @@ impl Model for MockModel {
   }
 }
 
-fn cache(layers: usize) -> Vec<Box<dyn KvCache>> {
-  make_prompt_cache(&CacheConfig {
+/// A full-attention (non-sliding-window) [`CacheConfig`] for `layers` decoder
+/// layers — what `cache_prompt` allocates a `StandardKvCache` per.
+fn config(layers: usize) -> CacheConfig {
+  CacheConfig {
     num_hidden_layers: layers,
     sliding_window: None,
-  })
+  }
 }
 
-/// One [`RotatingKvCache`] per layer (a sliding-window model) — mlx-lm's
-/// `make_prompt_cache` with `sliding_window` set.
-fn sliding_cache(layers: usize, window: i32) -> Vec<Box<dyn KvCache>> {
-  make_prompt_cache(&CacheConfig {
+/// A sliding-window [`CacheConfig`] — `cache_prompt` allocates a
+/// `RotatingKvCache` per layer for it (mlx-lm's `make_prompt_cache` with a
+/// model whose `sliding_window` is set).
+fn sliding_config(layers: usize, window: i32) -> CacheConfig {
+  CacheConfig {
     num_hidden_layers: layers,
     sliding_window: Some(window),
-  })
+  }
+}
+
+/// A freshly built full-attention per-layer cache — used only as the
+/// `generate_step` baseline (the loop takes an owned cache); the driver
+/// allocates its own internally.
+fn cache(layers: usize) -> Vec<Box<dyn KvCache>> {
+  make_prompt_cache(&config(layers))
 }
 
 /// Flatten every cache layer's `state` arrays into one comparable `Vec<f32>`
@@ -158,9 +172,10 @@ fn cache_signature(c: &[Box<dyn KvCache>]) -> Vec<f32> {
 // scratch.
 // ---------------------------------------------------------------------------
 
-/// `cache_prompt_ids` fills a cache + saves it; loading it back yields a cache
-/// whose state is **byte-identical** to a direct prefill of the same prompt,
-/// AND the returned `tokens_processed` equals the prompt length.
+/// `cache_prompt_ids` fills an internally-allocated cache + saves it; loading
+/// it back yields a cache whose state is **independent of `prefill_step_size`**
+/// (a small multi-chunk step and a single-chunk step produce a byte-identical
+/// saved cache), AND the returned `tokens_processed` equals the prompt length.
 #[test]
 fn driver_fill_save_load_matches_direct_prefill() {
   let model = MockModel::ramp(6);
@@ -168,16 +183,16 @@ fn driver_fill_save_load_matches_direct_prefill() {
   let dir = temp_dir("roundtrip");
   let out = dir.join("cache.safetensors");
 
-  // Drive: tokenize-skip (pre-encoded) → prefill → save.
-  let mut driven = cache(2);
+  // Drive: tokenize-skip (pre-encoded) → allocate cache internally → prefill
+  // → save. `prefill_step_size = 2` exercises the multi-chunk prefill.
   let info = cache_prompt_ids(
     &model,
     &prompt,
-    &mut driven,
+    &config(2),
     &out,
     "mock-model",
     "{}",
-    2, // small prefill_step_size to exercise multi-chunk prefill
+    2,
     &HashMap::new(),
   )
   .unwrap();
@@ -187,46 +202,33 @@ fn driver_fill_save_load_matches_direct_prefill() {
       tokens_processed: prompt.len()
     }
   );
-  // The driven cache is advanced to offset P.
-  assert!(driven.iter().all(|c| c.offset() == prompt.len()));
 
-  // Load it back from disk.
+  // Load it back from disk: the saved cache is at offset P.
   let (loaded, _meta) = load_prompt_cache(&out).unwrap();
   assert_eq!(loaded.len(), 2);
   assert!(loaded.iter().all(|c| c.offset() == prompt.len()));
 
-  // A direct, full-prompt prefill via `generate_step` (max_tokens large
-  // enough that prefill runs): the cache it leaves must match the loaded one.
-  // We reach the same state by driving `generate_step` for 0 *useful* compare
-  // — instead, compare the loaded signature to the driven (pre-save) one and
-  // to an independently-built direct prefill.
-  let mut direct = cache(2);
-  // Mirror what the driver does internally, but via the public generation
-  // forward path: feed the whole prompt, then read state. We use the driver's
-  // own prefill semantics by driving a fresh cache through `cache_prompt_ids`
-  // to a throwaway file and comparing.
-  let throwaway = dir.join("direct.safetensors");
+  // A second run over the SAME prompt with a different (single) chunk size
+  // must yield a byte-identical saved cache — the prefill result is
+  // independent of `prefill_step_size`.
+  let direct_out = dir.join("direct.safetensors");
   cache_prompt_ids(
     &model,
     &prompt,
-    &mut direct,
-    &throwaway,
+    &config(2),
+    &direct_out,
     "mock-model",
     "{}",
-    5, // a different chunk size — result must be identical
+    5, // a different (single-chunk) size — result must be identical
     &HashMap::new(),
   )
   .unwrap();
+  let (direct, _m) = load_prompt_cache(&direct_out).unwrap();
 
-  let sig_driven = cache_signature(&driven);
   let sig_loaded = cache_signature(&loaded);
   let sig_direct = cache_signature(&direct);
   assert_eq!(
-    sig_driven, sig_loaded,
-    "loaded cache != driven (pre-save) cache"
-  );
-  assert_eq!(
-    sig_driven, sig_direct,
+    sig_loaded, sig_direct,
     "prefill result must be independent of prefill_step_size"
   );
   assert!(
@@ -250,11 +252,10 @@ fn driver_multi_chunk_prefill_completes_and_loads() {
   let dir = temp_dir("multichunk");
   let out = dir.join("cache.safetensors");
 
-  let mut chunked = cache(2);
   let info = cache_prompt_ids(
     &model,
     &prompt,
-    &mut chunked,
+    &config(2),
     &out,
     "mock",
     "{}",
@@ -263,7 +264,6 @@ fn driver_multi_chunk_prefill_completes_and_loads() {
   )
   .unwrap();
   assert_eq!(info.tokens_processed, prompt.len());
-  assert!(chunked.iter().all(|c| c.offset() == prompt.len()));
 
   // The multi-chunk cache loads back at offset P.
   let (loaded, _meta) = load_prompt_cache(&out).unwrap();
@@ -273,12 +273,11 @@ fn driver_multi_chunk_prefill_completes_and_loads() {
   // Result is independent of chunking: a single-chunk prefill of the same
   // prompt yields a byte-identical cache (so the per-chunk barrier changed
   // nothing observable beyond bounding memory).
-  let mut single = cache(2);
   let throwaway = dir.join("single.safetensors");
   cache_prompt_ids(
     &model,
     &prompt,
-    &mut single,
+    &config(2),
     &throwaway,
     "mock",
     "{}",
@@ -286,6 +285,7 @@ fn driver_multi_chunk_prefill_completes_and_loads() {
     &HashMap::new(),
   )
   .unwrap();
+  let (single, _m) = load_prompt_cache(&throwaway).unwrap();
   assert_eq!(
     cache_signature(&loaded),
     cache_signature(&single),
@@ -303,12 +303,11 @@ fn driver_loaded_cache_continues_like_scratch() {
   let dir = temp_dir("continue");
   let out = dir.join("cache.safetensors");
 
-  // Fill + save a cache from the prompt.
-  let mut filled = cache(2);
+  // Fill + save a cache from the prompt (cache allocated internally).
   cache_prompt_ids(
     &model,
     &prompt,
-    &mut filled,
+    &config(2),
     &out,
     "mock",
     "{}",
@@ -317,9 +316,6 @@ fn driver_loaded_cache_continues_like_scratch() {
   )
   .unwrap();
 
-  // Load the cache and continue generation. With the prompt already in the
-  // cache, the continuation feeds only the *next* tokens. We mimic the
-  // documented reuse: a single-token "seed" continues from the cached prefix.
   // Drive `generate_step` from scratch over the full prompt for the baseline.
   let from_scratch: Vec<u32> = generate_step(
     &model,
@@ -334,12 +330,12 @@ fn driver_loaded_cache_continues_like_scratch() {
   .map(|r| r.unwrap().token)
   .collect();
 
-  // From the loaded cache: continue by feeding the *last generated-context*
-  // token. The cached prefix already covers `prompt`, so a continuation that
-  // re-feeds the prompt's final token reproduces the scratch trajectory's
-  // first decode (mlx-lm's prompt-cache reuse: cache holds the prefix, the
-  // loop continues from there). Greedy argmax is position-independent for the
-  // MockModel, so the produced tokens match the scratch run exactly.
+  // From the loaded cache: continue by feeding the *last* prompt token. The
+  // cached prefix already covers `prompt`, so a continuation that re-feeds the
+  // prompt's final token reproduces the scratch trajectory's first decode
+  // (mlx-lm's prompt-cache reuse: cache holds the prefix, the loop continues
+  // from there). Greedy argmax is position-independent for the MockModel, so
+  // the produced tokens match the scratch run exactly.
   let (loaded, _meta) = load_prompt_cache(&out).unwrap();
   assert!(loaded.iter().all(|c| c.offset() == prompt.len()));
   let continued: Vec<u32> = generate_step(
@@ -382,11 +378,10 @@ fn driver_metadata_round_trips() {
   // A colliding key the reference key must override.
   extra.insert(META_MODEL.to_string(), "WRONG".to_string());
 
-  let mut c = cache(1);
   cache_prompt_ids(
     &model,
     &prompt,
-    &mut c,
+    &config(1),
     &out,
     "my-model-id",
     "{\"eos_token\": \"</s>\"}",
@@ -409,13 +404,133 @@ fn driver_metadata_round_trips() {
 }
 
 // ---------------------------------------------------------------------------
+// Internally-allocated cache (the structural fix).
+//
+// `cache_prompt` / `cache_prompt_ids` allocate the per-layer KV cache
+// themselves via `make_prompt_cache(cache_config)` — exactly cache_prompt.py:111
+// (`cache = make_prompt_cache(model, args.max_kv_size)`). There is NO
+// caller-provided cache parameter, so the saved cache is fresh by construction
+// and represents *exactly* the requested prompt. The old caller-cache hazard
+// (a reused / pre-populated cache persisting a `[stale + new]` prefix and
+// leaking a prior request's context) is structurally impossible — there is no
+// cache object to reuse.
+// ---------------------------------------------------------------------------
+
+/// Two back-to-back `cache_prompt_ids` runs over *different* prompts each
+/// persist a cache at that run's own prompt length — the second (shorter)
+/// run's saved cache is exactly its own prompt, never `[run1 + run2]`. Because
+/// the cache is allocated inside `cache_prompt_ids` (never caller-provided),
+/// run 2 cannot inherit run 1's state: a cross-request context leak is
+/// structurally impossible.
+#[test]
+fn cache_prompt_ids_allocates_a_fresh_cache_per_call() {
+  let model = MockModel::ramp(8);
+  let dir = temp_dir("fresh_per_call");
+
+  // Run 1: a 4-token prompt.
+  let out1 = dir.join("run1.safetensors");
+  let info1 = cache_prompt_ids(
+    &model,
+    &[1u32, 3, 4, 5],
+    &config(2),
+    &out1,
+    "mock",
+    "{}",
+    8,
+    &HashMap::new(),
+  )
+  .unwrap();
+  assert_eq!(info1.tokens_processed, 4);
+  let (loaded1, _m1) = load_prompt_cache(&out1).unwrap();
+  assert!(
+    loaded1.iter().all(|c| c.offset() == 4),
+    "run 1's saved cache represents exactly its 4-token prompt"
+  );
+
+  // Run 2: a *shorter* 2-token prompt. The freshly allocated cache makes the
+  // saved cache exactly 2 tokens — not 4 + 2.
+  let out2 = dir.join("run2.safetensors");
+  let info2 = cache_prompt_ids(
+    &model,
+    &[6u32, 7],
+    &config(2),
+    &out2,
+    "mock",
+    "{}",
+    8,
+    &HashMap::new(),
+  )
+  .unwrap();
+  assert_eq!(
+    info2.tokens_processed, 2,
+    "run 2 processes only its own 2-token prompt"
+  );
+  let (loaded2, _m2) = load_prompt_cache(&out2).unwrap();
+  assert!(
+    loaded2.iter().all(|c| c.offset() == 2),
+    "run 2's saved cache is exactly its 2-token prompt — no leaked prior-request \
+     context (the internally-allocated cache is fresh by construction)"
+  );
+}
+
+/// The high-level `cache_prompt` (tokenizer encode path) likewise allocates
+/// its cache internally: two runs over different prompts each save a cache at
+/// that run's own encoded-prompt length.
+#[test]
+fn cache_prompt_allocates_a_fresh_cache_per_call() {
+  let dir = temp_dir("fresh_per_call_highlevel");
+  let tok = tokenizer(&dir);
+  let model = MockModel::ramp(64);
+
+  // Run 1.
+  let out1 = dir.join("run1.safetensors");
+  let info1 = cache_prompt(
+    &model,
+    &tok,
+    "hello world",
+    &config(2),
+    &out1,
+    "fixture-model",
+    "{}",
+    8,
+    &HashMap::new(),
+  )
+  .unwrap();
+  let (loaded1, _m1) = load_prompt_cache(&out1).unwrap();
+  assert!(
+    loaded1.iter().all(|c| c.offset() == info1.tokens_processed),
+    "run 1's saved cache is exactly its own encoded prompt"
+  );
+
+  // Run 2 over a different prompt: a fresh cache, exactly run 2's prompt.
+  let out2 = dir.join("run2.safetensors");
+  let info2 = cache_prompt(
+    &model,
+    &tok,
+    "the quick brown fox",
+    &config(2),
+    &out2,
+    "fixture-model",
+    "{}",
+    8,
+    &HashMap::new(),
+  )
+  .unwrap();
+  let (loaded2, _m2) = load_prompt_cache(&out2).unwrap();
+  assert!(
+    loaded2.iter().all(|c| c.offset() == info2.tokens_processed),
+    "run 2's saved cache is exactly its own encoded prompt — no leaked context"
+  );
+}
+
+// ---------------------------------------------------------------------------
 // High-level `cache_prompt` (tokenizer encode path).
 // ---------------------------------------------------------------------------
 
 /// The high-level `cache_prompt` encodes the prompt via the tokenizer (the
 /// fixture has a chat template, so the chat-template branch runs), fills +
-/// saves the cache, and reports the processed-token count == the encoded
-/// prompt length. The saved cache offset matches that count.
+/// saves an internally-allocated cache, and reports the processed-token count
+/// == the encoded prompt length. The saved cache offset matches that count.
 #[test]
 fn driver_high_level_encodes_and_fills() {
   let dir = temp_dir("highlevel");
@@ -423,12 +538,11 @@ fn driver_high_level_encodes_and_fills() {
   let model = MockModel::ramp(64); // vocab >= any fixture id
   let out = dir.join("cache.safetensors");
 
-  let mut c = cache(2);
   let info = cache_prompt(
     &model,
     &tok,
     "hello world",
-    &mut c,
+    &config(2),
     &out,
     "fixture-model",
     "{}",
@@ -441,11 +555,8 @@ fn driver_high_level_encodes_and_fills() {
     info.tokens_processed > 0,
     "a non-empty prompt processes >0 tokens"
   );
-  // Every layer's cache offset equals the processed count (the full prompt
-  // was prefilled).
-  assert!(c.iter().all(|x| x.offset() == info.tokens_processed));
 
-  // Round-trips: the cache + the `model` metadata load back.
+  // The saved cache's every layer offset equals the processed count.
   let (loaded, meta) = load_prompt_cache(&out).unwrap();
   assert!(loaded.iter().all(|x| x.offset() == info.tokens_processed));
   assert_eq!(
@@ -466,12 +577,11 @@ fn driver_high_level_empty_string_is_consistent() {
   let model = MockModel::ramp(64);
   let out = dir.join("cache.safetensors");
 
-  let mut c = cache(1);
   match cache_prompt(
     &model,
     &tok,
     "",
-    &mut c,
+    &config(1),
     &out,
     "m",
     "{}",
@@ -481,8 +591,9 @@ fn driver_high_level_empty_string_is_consistent() {
     Ok(info) => {
       // Chat template injected tokens ⇒ a non-empty encode; cache filled.
       assert!(info.tokens_processed > 0);
-      assert!(c.iter().all(|x| x.offset() == info.tokens_processed));
       assert!(out.exists());
+      let (loaded, _m) = load_prompt_cache(&out).unwrap();
+      assert!(loaded.iter().all(|x| x.offset() == info.tokens_processed));
     }
     Err(_) => {
       // An empty encode ⇒ error, nothing written.
@@ -599,12 +710,11 @@ fn cache_prompt_chat_template_uses_continue_final_message_offset() {
 
   // Drive the high-level `cache_prompt` (its chat-template branch encodes with
   // continue_final_message=true).
-  let mut c = cache(2);
   let info = cache_prompt(
     &model,
     &tok,
     "the quick brown fox",
-    &mut c,
+    &config(2),
     &out,
     "fixture-model",
     "{}",
@@ -625,7 +735,6 @@ fn cache_prompt_chat_template_uses_continue_final_message_offset() {
     plain.len(),
     "cache_prompt must NOT cache the extra terminator token"
   );
-  assert!(c.iter().all(|x| x.offset() == continued.len()));
 
   // Loaded cache continues like a from-scratch prefill of the continued
   // prompt: the cache holds the `continued` prefix, so re-feeding its last
@@ -664,158 +773,60 @@ fn cache_prompt_chat_template_uses_continue_final_message_offset() {
 }
 
 // ---------------------------------------------------------------------------
-// Sliding-window / rotating-cache prefill barrier (Codex finding).
+// Sliding-window / rotating-cache prefill (Codex finding).
 //
-// The per-chunk barrier used to evaluate `KvCache::state()` arrays. For a
-// `RotatingKvCache` whose ring buffer over-allocates (`offset < buffer_len` —
-// reached after an `S == 1` update grows the ring, i.e. `prefill_step_size ==
-// 1`, also via the `0` clamp), `state()` returns `seq_slice(keys, 0, offset)`
-// SERIALIZATION VIEWS, not the stored `keys`/`values` ring buffers the next
-// chunk reuses. Evaluating those slices left the stored buffers lazy and the
-// graph chaining across chunks. The fix routes the barrier through the
-// `KvCache::materialize` hook, which evals each cache's genuine stored arrays.
+// A sliding-window `CacheConfig` makes `cache_prompt` allocate a
+// `RotatingKvCache` per layer (via `make_prompt_cache`). The per-chunk barrier
+// routes through the `KvCache::materialize` hook so a `RotatingKvCache` whose
+// ring buffer over-allocates (`offset < buffer_len`) materializes its genuine
+// stored ring buffers, not the offset-length `state()` serialization slices.
+// (The barrier-fires-on-the-over-allocated-ring observation is pinned by the
+// in-crate `prefill_full` unit test, which can wrap a custom observing cache;
+// the integration driver allocates its cache internally, so here the contract
+// is "the sliding-window prefill completes + the saved cache round-trips".)
 // ---------------------------------------------------------------------------
 
-/// Sum the byte size of a cache's serialized `state()` arrays (`size * 4` for
-/// the f32 K/V here) — the *logical* (offset-length) size.
-fn state_nbytes(c: &dyn KvCache) -> usize {
-  c.state().unwrap().iter().map(|a| a.size() * 4).sum()
-}
-
-/// A [`KvCache`] wrapping a [`RotatingKvCache`] that, on every
-/// [`materialize`](KvCache::materialize) call (the per-chunk prefill barrier),
-/// records (1) the call count and (2) whether the ring buffer was
-/// **over-allocated** at that moment — i.e. the genuine stored buffer
-/// (`nbytes()`, the full ring) is larger than the offset-length serialized
-/// `state()`. That over-allocated regime is exactly the one where `state()`
-/// returns slice views diverging from the stored buffers, so observing it true
-/// proves the barrier ran on the precise rotating state the Codex finding is
-/// about (rather than a no-op or a never-over-allocated cache). Everything else
-/// delegates to the inner [`RotatingKvCache`], so the prefill exercises the
-/// real ring-grow / `update_in_place` paths.
-struct ObservingRotatingCache {
-  inner: RotatingKvCache,
-  materialize_calls: Rc<Cell<usize>>,
-  saw_overallocated_buffer: Rc<Cell<bool>>,
-}
-
-impl KvCache for ObservingRotatingCache {
-  fn offset(&self) -> usize {
-    self.inner.offset()
-  }
-  fn max_size(&self) -> Option<usize> {
-    self.inner.max_size()
-  }
-  fn update(&mut self, keys: &Array, values: &Array) -> mlxrs::Result<(Array, Array)> {
-    self.inner.update(keys, values)
-  }
-  fn state(&self) -> mlxrs::Result<Vec<Array>> {
-    self.inner.state()
-  }
-  fn set_state(&mut self, state: Vec<Array>) -> mlxrs::Result<()> {
-    self.inner.set_state(state)
-  }
-  fn materialize(&mut self) -> mlxrs::Result<()> {
-    self.materialize_calls.set(self.materialize_calls.get() + 1);
-    // Full stored ring buffer (`nbytes`) vs the offset-length serialized
-    // state: `>` ⇔ the ring over-allocated ⇔ `state()` is returning slice
-    // views, the regime the barrier must materialize the live buffers for.
-    if self.inner.nbytes() > state_nbytes(&self.inner) {
-      self.saw_overallocated_buffer.set(true);
-    }
-    self.inner.materialize()
-  }
-  fn meta_state(&self) -> Vec<String> {
-    self.inner.meta_state()
-  }
-  fn set_meta_state(&mut self, m: &[String]) -> mlxrs::Result<()> {
-    self.inner.set_meta_state(m)
-  }
-  fn make_mask(&self, n: usize, w: Option<usize>, ret: bool) -> mlxrs::Result<MaskMode> {
-    self.inner.make_mask(n, w, ret)
-  }
-  fn nbytes(&self) -> usize {
-    self.inner.nbytes()
-  }
-  fn is_empty(&self) -> bool {
-    self.inner.is_empty()
-  }
-  fn copy(&self) -> mlxrs::Result<Box<dyn KvCache>> {
-    self.inner.copy()
-  }
-  fn reference_class_name(&self) -> &'static str {
-    self.inner.reference_class_name()
-  }
-}
-
-/// A multi-chunk prefill over a `RotatingKvCache` with `prefill_step_size == 1`
-/// (each leading chunk is a single token ⇒ the `S == 1` `update_in_place` path
-/// that grows the ring buffer, so `offset < buffer_len` and `state()` returns
-/// slice views): the driver completes, the saved cache loads back at offset
-/// `P`, AND the per-chunk barrier (a) fires once per leading chunk and (b) was
-/// observed running while the ring buffer was over-allocated — proving the
-/// barrier materializes the live stored buffers, not the serialization slices.
+/// A multi-chunk prefill over a sliding-window config with `prefill_step_size
+/// == 1` (each leading chunk is a single token ⇒ the `S == 1` `update_in_place`
+/// path that grows the rotating ring): the driver completes and the saved
+/// cache loads back at offset `P` as a `RotatingKVCache`.
 #[test]
-fn driver_sliding_window_prefill_step_one_materializes_live_buffers() {
+fn driver_sliding_window_prefill_step_one_completes_and_loads() {
   let model = MockModel::ramp(8);
-  // P = 9 tokens, all < vocab(8). With step = 1, the leading P-1 = 8 tokens
-  // are 8 single-token chunks ⇒ 8 barrier calls; each S==1 update grows the
-  // ring, so the buffer over-allocates (window 4 << buffer step 256).
+  // P = 9 tokens, all < vocab(8). step = 1 ⇒ leading P-1 = 8 single-token
+  // chunks, each an `S == 1` `update_in_place`. Window 8 > the default `keep`
+  // (4) `make_prompt_cache` builds the RotatingKvCache with, so the ring
+  // genuinely rotates over P=9 (mlx-lm's sliding-window models always have
+  // sliding_window >> keep=4 — a window <= keep is a degenerate config).
   let prompt: Vec<u32> = (0..9u32).map(|i| i % 7).collect();
   let dir = temp_dir("sliding_step1");
   let out = dir.join("cache.safetensors");
 
-  let materialize_calls = Rc::new(Cell::new(0usize));
-  let saw_over = Rc::new(Cell::new(false));
-  let mut observed: Vec<Box<dyn KvCache>> = vec![Box::new(ObservingRotatingCache {
-    inner: RotatingKvCache::new(4, 2), // window 4, keep 2 (mlx-lm-style)
-    materialize_calls: Rc::clone(&materialize_calls),
-    saw_overallocated_buffer: Rc::clone(&saw_over),
-  })];
-
   let info = cache_prompt_ids(
     &model,
     &prompt,
-    &mut observed,
+    &sliding_config(1, 8), // window 8 (> the default keep=4)
     &out,
     "rotating",
     "{}",
-    1, // prefill_step_size == 1 ⇒ S==1 leading chunks (the buggy regime)
+    1, // prefill_step_size == 1 ⇒ S==1 leading chunks
     &HashMap::new(),
   )
   .unwrap();
-
-  // Completes: every layer advanced to offset P.
   assert_eq!(info.tokens_processed, prompt.len());
-  assert!(observed.iter().all(|c| c.offset() == prompt.len()));
 
-  // The barrier fired once per leading chunk (P-1 = 8 single-token chunks).
-  assert_eq!(
-    materialize_calls.get(),
-    prompt.len() - 1,
-    "the per-chunk materialize barrier must fire once per leading single-token chunk"
-  );
-  // ...and it ran while the ring buffer was over-allocated — i.e. on exactly
-  // the state where `state()` would return slice views diverging from the
-  // stored buffers (the precise precondition of the Codex finding).
-  assert!(
-    saw_over.get(),
-    "the rotating ring must over-allocate during step==1 prefill, so the barrier \
-     is exercised on the slice-view-diverging regime the fix targets"
-  );
-
-  // The saved cache loads back at offset P (a loadable rotating cache).
+  // The saved cache loads back at offset P as a RotatingKVCache.
   let (loaded, _meta) = load_prompt_cache(&out).unwrap();
   assert_eq!(loaded.len(), 1);
   assert!(loaded.iter().all(|c| c.offset() == prompt.len()));
   assert_eq!(
     loaded[0].reference_class_name(),
     "RotatingKVCache",
-    "the persisted sliding-window cache round-trips as a RotatingKVCache"
+    "a sliding-window config persists the cache as a RotatingKVCache"
   );
 }
 
-/// The `prefill_step_size == 0` clamp (→ 1) over a `RotatingKvCache`: a `0`
+/// The `prefill_step_size == 0` clamp (→ 1) over a sliding-window config: a `0`
 /// step must still make progress (clamped to single-token chunks, the same
 /// S==1 over-allocating ring path), completing and producing a loadable cache
 /// byte-identical to an explicit `step == 1` run.
@@ -829,13 +840,11 @@ fn driver_sliding_window_prefill_step_zero_clamped_completes() {
 
   // Window 8 > the default `keep` (4) so the ring genuinely rotates over the
   // P=7 prompt (a window <= keep cannot rotate — mlx-lm's models always have
-  // sliding_window >> keep=4).
-  // step == 0 (clamped to 1 internally).
-  let mut c_zero = sliding_cache(2, 8);
+  // sliding_window >> keep=4). step == 0 (clamped to 1 internally).
   let info = cache_prompt_ids(
     &model,
     &prompt,
-    &mut c_zero,
+    &sliding_config(2, 8),
     &out_zero,
     "rotating",
     "{}",
@@ -844,15 +853,13 @@ fn driver_sliding_window_prefill_step_zero_clamped_completes() {
   )
   .unwrap();
   assert_eq!(info.tokens_processed, prompt.len());
-  assert!(c_zero.iter().all(|c| c.offset() == prompt.len()));
 
   // Explicit step == 1: must yield a byte-identical cache (the 0-clamp is
   // exactly step 1).
-  let mut c_one = sliding_cache(2, 8);
   cache_prompt_ids(
     &model,
     &prompt,
-    &mut c_one,
+    &sliding_config(2, 8),
     &out_one,
     "rotating",
     "{}",
@@ -871,40 +878,32 @@ fn driver_sliding_window_prefill_step_zero_clamped_completes() {
   );
 }
 
-/// A multi-token-chunk (`prefill_step_size > 1`) prefill over a
-/// `RotatingKvCache` (the `S > 1` `update_concat` path) ALSO completes and
-/// loads — the barrier is correct on both rotating update paths, and the
-/// result is independent of the chunk size (matches a single-chunk prefill).
+/// A multi-token-chunk (`prefill_step_size > 1`) prefill over a sliding-window
+/// config (the `S > 1` `update_concat` path) ALSO completes and loads — the
+/// barrier is correct on both rotating update paths, leaving the saved cache
+/// at offset `P`.
 #[test]
-fn driver_sliding_window_multi_token_chunks_match_single_chunk() {
+fn driver_sliding_window_multi_token_chunks_complete_and_load() {
   let model = MockModel::ramp(8);
   let prompt: Vec<u32> = (0..13u32).map(|i| i % 6).collect(); // P = 13
   let dir = temp_dir("sliding_multichunk");
 
   // Window 8 > the default `keep` (4) so the ring rotates over P=13.
   // step = 3 ⇒ leading 12 tokens as [3,3,3,3] (S==3 update_concat chunks).
-  let mut c_chunked = sliding_cache(2, 8);
-  let out_chunked = dir.join("chunked.safetensors");
+  let out = dir.join("chunked.safetensors");
   cache_prompt_ids(
     &model,
     &prompt,
-    &mut c_chunked,
-    &out_chunked,
+    &sliding_config(2, 8),
+    &out,
     "rotating",
     "{}",
     3,
     &HashMap::new(),
   )
   .unwrap();
-  assert!(c_chunked.iter().all(|c| c.offset() == prompt.len()));
 
-  // step == 1 (single-token chunks) over the same prompt+window: a rotating
-  // cache's PHYSICAL ring layout is path-dependent (S==1 in-place overwrite vs
-  // S>1 concat over-retain), but both leave offset == P and a loadable cache.
-  // We assert the offset + loadability invariants hold for the multi-token
-  // path (the per-update-path-equivalence of the ring layout is covered by the
-  // dedicated cache unit tests; here the contract is "completes + loads").
-  let (loaded, _meta) = load_prompt_cache(&out_chunked).unwrap();
+  let (loaded, _meta) = load_prompt_cache(&out).unwrap();
   assert_eq!(loaded.len(), 2);
   assert!(loaded.iter().all(|c| c.offset() == prompt.len()));
 }
