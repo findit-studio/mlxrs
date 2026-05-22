@@ -427,6 +427,36 @@ pub fn pad(
   Ok(out)
 }
 
+/// Force `a` to be row-contiguous, copying its buffer if necessary.
+///
+/// Mirrors `mlx.core.contiguous(a, allow_col_major=False)` (python,
+/// `python/src/ops.cpp:5463`) and `MLX.contiguous(_:allowColMajor:stream:)`
+/// (swift, `Source/MLX/Ops.swift:3279`). When `a` is already row-contiguous
+/// (or already col-major + `allow_col_major == true`), mlx-c returns the
+/// input unchanged with a refcount bump; otherwise it materializes a fresh
+/// contiguous copy of the data. The returned array always satisfies
+/// `as_strided`'s element-bounds contract for `(shape, strides, offset)`
+/// computed from its declared `shape()`.
+///
+/// `allow_col_major == false` is the natural default for callers (us)
+/// that hand the result to `as_strided` / raw-pointer slice extraction,
+/// since those paths assume row-major layout. Pass `true` only when the
+/// downstream op (e.g. a GEMM that accepts col-major operands) handles
+/// either order.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.contiguous.html).
+pub fn contiguous(a: &Array, allow_col_major: bool) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
+  check(unsafe { mlxrs_sys::mlx_contiguous(&mut out.0, a.0, allow_col_major, default_stream()) })?;
+  Ok(out)
+}
+
 /// Strided view: reinterpret `a`'s buffer with custom `shape`, `strides`,
 /// and `offset` (in *elements*, not bytes). Mirrors `mx.as_strided` (python)
 /// and `MLX.asStrided(_:_:strides:offset:stream:)` (swift,

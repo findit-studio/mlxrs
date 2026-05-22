@@ -1,12 +1,15 @@
 //! DSP primitives: window family (Hann/Hamming/Blackman/Bartlett), STFT,
-//! inverse STFT, mel filterbank, mel + log-mel spectrogram.
+//! inverse STFT, mel filterbank, mel + log-mel spectrogram, 1-D IIR
+//! `lfilter`, ITU-R BS.1770 K-weighted integrated loudness +
+//! `normalize_loudness`.
 //!
 //! Faithful 1:1 port of the corresponding `mlx_audio.dsp` core
 //! (`hanning`, `hamming`, `blackman`, `bartlett`, `STR_TO_WINDOW_FN`, `stft`,
-//! `istft`, `mel_filters`) at <https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/dsp.py>.
+//! `istft`, `mel_filters`, `lfilter`, `integrated_loudness`,
+//! `normalize_loudness`) at <https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/dsp.py>.
 //! Out of scope for this PR: the `ISTFTCache` batched/cached overlap-add
-//! helper, Kaldi-style features, BS.1770 loudness, biquad filters, dither —
-//! see [`crate::audio`] for the scope fence.
+//! helper, Kaldi-style features, `normalize_peak`, dither — see
+//! [`crate::audio`] for the scope fence.
 //!
 //! ## API conventions
 //! - Window construction is **symmetric** (`periodic=False` in `mlx-audio`):
@@ -1770,6 +1773,1160 @@ pub fn log_mel_spectrogram_with(
   floored.log()
 }
 
+// ============================================================================
+// 1-D IIR filter (`lfilter`) and BS.1770 K-weighted integrated loudness.
+//
+// Both run pure-Rust on the CPU (mirroring how [`mel_filter_bank`] materializes
+// its bank Vec) — these are intrinsically sequential / per-block numerical
+// recurrences, NOT mlx graph ops. `lfilter` is per-sample sequential
+// (`y[n]` depends on `y[n-1..]`) so an mlx graph cannot express it as
+// element-wise ops; the BS.1770 path chains lfilter twice per channel and
+// then aggregates per-block mean-squares, all bounded by the K-weighted
+// channel data we already materialized. Computation is in `f64` to match
+// the reference (Python's `np.asarray(b, dtype=np.float64)` + `np.result_type`
+// promotion), with the public surface staying `f32` (the [`Array`] data dtype
+// throughout mlxrs's audio pipeline). Reads use `&self`-friendly accessors:
+// each input `&Array` is **cloned with [`Array::try_clone`]** so the
+// `&mut self`-tasking [`Array::to_vec`] (which performs the mandatory
+// `eval`) does not force a `mut` binding on the caller's borrow — the
+// `&self` borrow contract of these public functions is preserved.
+
+/// Hard ceiling on the per-channel sample count consumed by [`lfilter`].
+/// Mirrors the public-input allocation cap shared with [`stft`] and the
+/// window family (see
+/// [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES)): a
+/// caller-controllable `data` length above the cap returns a recoverable
+/// [`Error::Backend`] instead of risking a multi-GB CPU allocation for the
+/// `f64` state buffer + output `Vec`.
+const MAX_LFILTER_SAMPLES: usize = crate::audio::io::MAX_DECODED_SAMPLES;
+
+/// Hard ceiling on the **total element count** (`n_samples * n_channels`)
+/// [`integrated_loudness`] will consume. Shared with [`MAX_LFILTER_SAMPLES`]
+/// for the same reason: the input `to_vec` materializes
+/// `n_samples * n_channels` f32 samples, and each channel is K-weighted by
+/// two `lfilter_f64` chains. Capping the per-channel count alone (as a prior
+/// revision did) is unsafe for 2-D `(n_samples, n_channels)` inputs: a
+/// `(MAX_DECODED_SAMPLES, 5)` input would otherwise materialize multiple GB
+/// in `raw_f32` BEFORE any per-channel processing. Cap is on
+/// `n_samples.checked_mul(n_channels)` against
+/// [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES); the
+/// streaming per-channel path keeps the peak working set bounded by
+/// `raw_f32 + 1 channel's f64 K-weighted buffer` (no de-interleaved-AND-
+/// weighted-full-channel duplication). Above the cap returns a recoverable
+/// [`Error::Backend`].
+const MAX_LOUDNESS_SAMPLES: usize = crate::audio::io::MAX_DECODED_SAMPLES;
+
+/// Hard byte ceiling on the per-channel `f64` mean-square matrix
+/// [`integrated_loudness`] allocates: `num_blocks * n_channels *
+/// size_of::<f64>() <= MAX_LOUDNESS_BLOCK_BYTES`. The previous revision
+/// capped `num_blocks * n_channels` against the 64 Mi-**element** sample
+/// budget — but the cells are `f64`, so the actual peak bytes were 8× the
+/// element budget (`64 Mi * 8 B = 512 MiB`). A caller-controllable
+/// `overlap` close to 1 (e.g. `0.99999990`) on a small mono input derived
+/// tens of millions of blocks that all passed the element-only cap, then
+/// reserved hundreds of MB / ~2 GiB for the mean-square matrix alone. The
+/// byte cap bounds the dominant block-sized buffer directly: at 64 MiB
+/// the peak `mean_square` footprint is bounded regardless of how the
+/// caller distributes the (`num_blocks`, `n_channels`) product, and the
+/// gate-index iteration that re-reads the same matrix never sees more
+/// cells than this byte budget allows. Pathological overlaps return a
+/// recoverable [`Error::Backend`] BEFORE any allocation.
+const MAX_LOUDNESS_BLOCK_BYTES: usize = 64 * 1024 * 1024;
+/// Hard ceiling on the **total sample-visit work** [`integrated_loudness`]
+/// performs across the per-block mean-square loop: `num_blocks *
+/// ceil(block_size_samples) * n_channels <= MAX_LOUDNESS_WORK`. Even
+/// when the byte cap above admits a moderate `num_blocks`, a near-1
+/// overlap combined with a SMALL block size still drives the per-block
+/// CPU sum work to the trillions of sample-visits — each block re-sums
+/// `ceil(block_size_samples)` weighted samples, and the per-block sum
+/// loop runs ONCE PER CHANNEL (the streaming K-weighting loop iterates
+/// `n_channels` times), so the actual visit count is `num_blocks *
+/// ceil(block_size_samples) * n_channels` regardless of the matrix byte
+/// footprint. A prior revision omitted the `n_channels` factor and
+/// admitted a 5-channel pathological case (Codex review:
+/// `num_blocks=1_677_721, block_samples=160, n_channels=5` — channel-less
+/// product `~268 Mi <= 256 Mi cap` BUT actual visits `~1.34 Bi`); the
+/// fix folds `n_channels` into the work product. `ceil` is used because
+/// the per-block bounds `(floor(bi*step*bs*r), floor((bi*step+1)*bs*r))`
+/// can give `upper - lower = ceil(block_size_samples)` in the worst
+/// case for fractional `block_size_samples`. Cap the total visit count
+/// at 256 Mi (`block_size = 0.4 s` at 48 kHz = `19,200 samples/block`,
+/// so a default-overlap 256 Mi-visit budget admits ~13,653 blocks for
+/// mono ≈ 91 hours of audio, or ~2,730 5-channel blocks ≈ 18 hours of
+/// 5-channel audio — comfortable for any realistic loudness analysis,
+/// but rejects multi-trillion-visit pathological cases in microseconds).
+/// Pathological work returns a recoverable [`Error::Backend`] BEFORE
+/// the per-block loop.
+const MAX_LOUDNESS_WORK: usize = 256 * 1024 * 1024;
+
+/// Per-channel BS.1770 weighting gains for up to 5 channels: front L/R/C =
+/// `1.0`, surround L/R = `1.41` (~`+1.5 dB`). Matches
+/// `mlx_audio.dsp.integrated_loudness`'s `channel_gains = [1.0, 1.0, 1.0,
+/// 1.41, 1.41]` literal.
+const BS1770_CHANNEL_GAINS: [f64; 5] = [1.0, 1.0, 1.0, 1.41, 1.41];
+/// BS.1770 absolute gate (LUFS) — blocks at or below `-70 LUFS` never
+/// contribute to the integrated loudness. Matches
+/// `mlx_audio.dsp.integrated_loudness`'s `absolute_threshold = -70.0`.
+const BS1770_ABSOLUTE_THRESHOLD_LUFS: f64 = -70.0;
+/// BS.1770 relative gate offset (LUFS) — once an absolute-gated integrated
+/// loudness is computed, the relative gate is set `10 LU` below it and the
+/// final integrated loudness uses only blocks above BOTH gates. Matches
+/// `mlx_audio.dsp.integrated_loudness`'s `... - 10.0`.
+const BS1770_RELATIVE_OFFSET_LUFS: f64 = 10.0;
+/// BS.1770 loudness offset added in the per-block `LUFS = -0.691 + 10 *
+/// log10(...)` reduction. Matches `mlx_audio.dsp.integrated_loudness`'s
+/// `-0.691` literal (the K-weighting calibration constant from BS.1770-4
+/// Annex 1).
+const BS1770_LOUDNESS_OFFSET_LUFS: f64 = -0.691;
+/// Hard ceiling on channels accepted by [`integrated_loudness`]. The
+/// reference rejects `>5` channels (mlx-audio supports mono / stereo /
+/// 5.0); we mirror that.
+const BS1770_MAX_CHANNELS: usize = 5;
+
+/// Apply a 1-D causal linear filter (direct-form II transposed) to a
+/// 1-D real signal.
+///
+/// Faithful port of `mlx_audio.dsp.lfilter(b, a, data)` — implements the
+/// standard recurrence
+/// `a[0] * y[n] = sum_k b[k] * x[n-k] - sum_{k>=1} a[k] * y[n-k]`,
+/// normalizing by `a[0]`. Coefficients are taken in `f64` (matching the
+/// reference's `np.asarray(b, dtype=np.float64)` + `np.result_type`
+/// promotion); the state buffer is `f64`; the output is materialized back
+/// as `Dtype::F32` to keep the public dtype consistent with the rest of
+/// mlxrs's audio pipeline. The signal `data` is read once (`Array::to_vec`
+/// via a `try_clone` so the caller's borrow stays `&Array`), then the
+/// per-sample recurrence runs purely on the CPU — IIR `y[n]` depends on
+/// `y[n-1..]`, so an mlx graph cannot express it as element-wise ops.
+///
+/// # Errors
+/// - [`Error::Backend`] when:
+///   - `a` is empty,
+///   - `a[0] == 0` (the denominator's leading coefficient cannot be zero),
+///   - `data` is not 1-D,
+///   - `data`'s sample count exceeds the shared
+///     [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) cap,
+///   - any size exceeds `i32::MAX`.
+///
+/// The reference returns `np.zeros_like(data)` when `b` is empty; we mirror
+/// that.
+pub fn lfilter(b: &[f64], a: &[f64], data: &Array) -> Result<Array> {
+  if data.ndim() != 1 {
+    return Err(Error::Backend {
+      message: format!("lfilter: only supports 1-D input, got {}-D", data.ndim()),
+    });
+  }
+  let shape = data.shape();
+  let n_samples = shape[0];
+  let n_samples_i32 = i32::try_from(n_samples).map_err(|_| Error::Backend {
+    message: format!("lfilter: n_samples {n_samples} exceeds i32::MAX"),
+  })?;
+  // Enforce the bounded-memory contract on the SHAPE before any
+  // materialization: `data` may be a lazy oversized array
+  // (e.g. `Array::zeros(MAX_LFILTER_SAMPLES + 1)`), in which case the
+  // subsequent `to_vec::<f32>()` would eval-and-allocate the full f32
+  // buffer (and then promote to a second f64 Vec) BEFORE the kernel's
+  // post-promotion cap check ever fired. Reject up-front so the public
+  // wrapper allocates nothing for oversized inputs. `lfilter_f64` still
+  // re-checks the same cap for direct callers (K-weighting path) — this
+  // is the shape-side guard for the f32 boundary.
+  if n_samples > MAX_LFILTER_SAMPLES {
+    return Err(Error::Backend {
+      message: format!("lfilter: sample count {n_samples} exceeds the {MAX_LFILTER_SAMPLES} cap"),
+    });
+  }
+
+  // f32 boundary wrapper: read the input via `try_clone().to_vec::<f32>()`
+  // (no `&mut` on the caller's borrow), promote to f64, run the shared
+  // f64 kernel, then cast back down to f32 for the public mlxrs audio
+  // dtype. The K-weighting path of `integrated_loudness` calls the
+  // internal `lfilter_f64` directly to keep TWO biquad stages in f64 end-
+  // to-end (no intermediate f32 cast between stages), matching the
+  // reference's `np.result_type(data.dtype, b.dtype, a.dtype)` promotion.
+  let x_f32 = data.try_clone()?.to_vec::<f32>()?;
+  let mut x_f64: Vec<f64> = Vec::new();
+  x_f64
+    .try_reserve_exact(n_samples)
+    .map_err(|e| Error::Backend {
+      message: format!("lfilter: input promotion reservation for {n_samples} samples failed: {e}"),
+    })?;
+  for v in &x_f32 {
+    x_f64.push(f64::from(*v));
+  }
+  let y_f64 = lfilter_f64(b, a, &x_f64)?;
+  let mut y: Vec<f32> = Vec::new();
+  y.try_reserve_exact(n_samples).map_err(|e| Error::Backend {
+    message: format!("lfilter: output reservation for {n_samples} samples failed: {e}"),
+  })?;
+  for v in &y_f64 {
+    y.push(*v as f32);
+  }
+  Array::from_slice::<f32>(&y, &[n_samples_i32])
+}
+
+/// Private f64 kernel for [`lfilter`] and the BS.1770 K-weighting path.
+///
+/// Operates entirely on `f64` slices/Vecs — input, state, and output are
+/// all `f64` — so two-stage chains (K-weighting's high-shelf → high-pass)
+/// run in f64 end-to-end without an intermediate f32 cast between stages.
+/// The reference's `_k_weight_audio` (Python `np.float64` throughout) and
+/// our [`k_weight_channel`] both rely on this precision invariant; before
+/// the split they were lost via the public `lfilter`'s f32 boundary.
+///
+/// # Errors
+/// - [`Error::Backend`] when:
+///   - `a` is empty,
+///   - `a[0] == 0` (the denominator's leading coefficient cannot be zero),
+///   - `x.len()` exceeds the shared
+///     [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) cap
+///     (mirrors the public [`lfilter`]'s element budget).
+///
+/// The reference returns `np.zeros_like(data)` when `b` is empty; we mirror
+/// that.
+fn lfilter_f64(b: &[f64], a: &[f64], x: &[f64]) -> Result<Vec<f64>> {
+  if a.is_empty() {
+    return Err(Error::Backend {
+      message: "lfilter: filter denominator must be non-empty".into(),
+    });
+  }
+  if a[0] == 0.0 {
+    return Err(Error::Backend {
+      message: "lfilter: filter denominator must have a non-zero leading term (a[0] != 0)".into(),
+    });
+  }
+  let n_samples = x.len();
+  if n_samples > MAX_LFILTER_SAMPLES {
+    return Err(Error::Backend {
+      message: format!("lfilter: sample count {n_samples} exceeds the {MAX_LFILTER_SAMPLES} cap"),
+    });
+  }
+
+  // Mirror the reference's `if b.size == 0: return np.zeros_like(data)`.
+  // A zero-tap numerator is degenerate (filter output is identically zero
+  // regardless of `data` or `a`); allocate the result directly.
+  if b.is_empty() {
+    let mut y: Vec<f64> = Vec::new();
+    y.try_reserve_exact(n_samples).map_err(|e| Error::Backend {
+      message: format!("lfilter: zero-output reservation for {n_samples} samples failed: {e}"),
+    })?;
+    y.resize(n_samples, 0.0);
+    return Ok(y);
+  }
+
+  // Normalize `b` and `a` by `a[0]` (Python: `b = b / a[0]; a = a / a[0]`)
+  // into stack-friendly `Vec`s. Both are short (3 taps for biquads,
+  // typically <= a few dozen for general IIRs); the recoverable
+  // `try_reserve_exact` mirrors the rest of the dsp.rs allocation
+  // discipline.
+  let a0 = a[0];
+  let mut b_norm: Vec<f64> = Vec::new();
+  b_norm
+    .try_reserve_exact(b.len())
+    .map_err(|e| Error::Backend {
+      message: format!("lfilter: reservation for b ({} taps) failed: {e}", b.len()),
+    })?;
+  for &bv in b {
+    b_norm.push(bv / a0);
+  }
+  let mut a_norm: Vec<f64> = Vec::new();
+  a_norm
+    .try_reserve_exact(a.len())
+    .map_err(|e| Error::Backend {
+      message: format!("lfilter: reservation for a ({} taps) failed: {e}", a.len()),
+    })?;
+  for &av in a {
+    a_norm.push(av / a0);
+  }
+
+  // `state_len = max(len(a), len(b)) - 1`. With `a.len() >= 1` checked
+  // above and `b.len() >= 1` (the `b.is_empty()` early-return rules out
+  // `b.len() == 0`), the `max` is >= 1, so the subtraction is safe.
+  let state_len = a_norm.len().max(b_norm.len()) - 1;
+
+  // Output buffer (f64 — the kernel runs end-to-end in f64).
+  let mut y: Vec<f64> = Vec::new();
+  y.try_reserve_exact(n_samples).map_err(|e| Error::Backend {
+    message: format!("lfilter: output reservation for {n_samples} samples failed: {e}"),
+  })?;
+
+  // Reference's `state_len == 0` fast path: `y = b[0] * x` (no recurrence,
+  // no feedback state to maintain). This is the FIR-of-length-1 case.
+  if state_len == 0 {
+    let b0 = b_norm[0];
+    for &sample in x {
+      y.push(b0 * sample);
+    }
+    return Ok(y);
+  }
+
+  // General direct-form II transposed recurrence (matching the reference's
+  // per-sample loop body byte-for-byte).
+  let mut state: Vec<f64> = Vec::new();
+  state
+    .try_reserve_exact(state_len)
+    .map_err(|e| Error::Backend {
+      message: format!("lfilter: state reservation for {state_len} taps failed: {e}"),
+    })?;
+  state.resize(state_len, 0.0);
+
+  for &sample in x {
+    // `output = b[0] * sample + state[0]` — the next output sample;
+    // `state[0]` is the running accumulator for `b[1] * x[n-1] - a[1] *
+    // y[n-1] + state[1]` from the previous step.
+    let output = b_norm[0] * sample + state[0];
+    // Shift the state vector forward AND fold in the next sample's
+    // feedforward / feedback contribution. `i` walks indices `1..state_len`;
+    // the per-iteration assignment matches the reference's
+    // `state[i - 1] = state[i] + b[i] * sample - a[i] * output`, with `0.0`
+    // substituted for any out-of-range `b` / `a` tap (matches the
+    // reference's `b[i] * sample if i < len(b) else 0.0`).
+    for i in 1..state_len {
+      let feedforward = b_norm.get(i).copied().unwrap_or(0.0) * sample;
+      let feedback = a_norm.get(i).copied().unwrap_or(0.0) * output;
+      state[i - 1] = state[i] + feedforward - feedback;
+    }
+    // Final state cell: `state[-1] = b[state_len] * sample - a[state_len] *
+    // output`, again with 0.0 substituted for out-of-range taps. Indexing
+    // with `state_len - 1` is safe (`state_len >= 1` here).
+    let feedforward_last = b_norm.get(state_len).copied().unwrap_or(0.0) * sample;
+    let feedback_last = a_norm.get(state_len).copied().unwrap_or(0.0) * output;
+    state[state_len - 1] = feedforward_last - feedback_last;
+    y.push(output);
+  }
+
+  Ok(y)
+}
+
+/// In-place variant of [`lfilter_f64`]: runs the same direct-form II
+/// transposed IIR recurrence directly on the caller-provided `x` buffer,
+/// overwriting `x[n]` with `y[n]`. The numerical result is bit-identical
+/// to `lfilter_f64(b, a, x)` (same formula, same f64 precision, same
+/// `state[i] = ...` updates) — the only difference is allocation: this
+/// kernel only allocates the SMALL coefficient + state buffers
+/// (`max(len(a), len(b))` f64s total, typically 3 for a biquad), NOT a
+/// fresh `n_samples`-long output `Vec`.
+///
+/// Used by [`k_weight_channel`] to keep the peak working set at ONE f64
+/// channel buffer instead of TWO (the old chain `after_shelf =
+/// lfilter_f64(&hs, &chan); lfilter_f64(&hp, &after_shelf)` momentarily
+/// held both the first-stage output AND the second-stage allocation while
+/// `chan_f64` was still in scope — peak `~3 * channel_bytes` at the
+/// chain-call boundary).
+///
+/// # Errors
+/// - [`Error::Backend`] when:
+///   - `a` is empty,
+///   - `a[0] == 0` (the denominator's leading coefficient cannot be zero),
+///   - `x.len()` exceeds the shared
+///     [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) cap
+///     (mirrors [`lfilter_f64`]'s element budget).
+///
+/// `b` empty mirrors [`lfilter_f64`]'s "zero-output" semantics by writing
+/// zeros into `x` (the in-place equivalent of returning `np.zeros_like`).
+fn lfilter_f64_in_place(b: &[f64], a: &[f64], x: &mut [f64]) -> Result<()> {
+  if a.is_empty() {
+    return Err(Error::Backend {
+      message: "lfilter: filter denominator must be non-empty".into(),
+    });
+  }
+  if a[0] == 0.0 {
+    return Err(Error::Backend {
+      message: "lfilter: filter denominator must have a non-zero leading term (a[0] != 0)".into(),
+    });
+  }
+  let n_samples = x.len();
+  if n_samples > MAX_LFILTER_SAMPLES {
+    return Err(Error::Backend {
+      message: format!("lfilter: sample count {n_samples} exceeds the {MAX_LFILTER_SAMPLES} cap"),
+    });
+  }
+
+  // Mirror `lfilter_f64`'s `b.is_empty()` early-return semantics in place:
+  // overwrite `x` with zeros (the in-place equivalent of the out-of-place
+  // kernel's `Vec::with_capacity` + `resize` of zeros).
+  if b.is_empty() {
+    for v in x.iter_mut() {
+      *v = 0.0;
+    }
+    return Ok(());
+  }
+
+  // Normalize `b` and `a` by `a[0]` — same arithmetic as `lfilter_f64`.
+  let a0 = a[0];
+  let mut b_norm: Vec<f64> = Vec::new();
+  b_norm
+    .try_reserve_exact(b.len())
+    .map_err(|e| Error::Backend {
+      message: format!("lfilter: reservation for b ({} taps) failed: {e}", b.len()),
+    })?;
+  for &bv in b {
+    b_norm.push(bv / a0);
+  }
+  let mut a_norm: Vec<f64> = Vec::new();
+  a_norm
+    .try_reserve_exact(a.len())
+    .map_err(|e| Error::Backend {
+      message: format!("lfilter: reservation for a ({} taps) failed: {e}", a.len()),
+    })?;
+  for &av in a {
+    a_norm.push(av / a0);
+  }
+
+  // `state_len = max(len(a), len(b)) - 1`. `a.len() >= 1` checked above
+  // and `b.len() >= 1` (the `b.is_empty()` branch returns earlier), so
+  // the `max` is >= 1 and the subtraction is safe.
+  let state_len = a_norm.len().max(b_norm.len()) - 1;
+
+  // `state_len == 0` fast path: `y[n] = b[0] * x[n]`. Read each sample
+  // BEFORE writing — both source and destination are the same slot, so
+  // the multiplication is order-safe regardless (single-pass, no
+  // dependency on neighboring slots).
+  if state_len == 0 {
+    let b0 = b_norm[0];
+    for v in x.iter_mut() {
+      *v *= b0;
+    }
+    return Ok(());
+  }
+
+  // General direct-form II transposed recurrence — same body as
+  // `lfilter_f64` but writes the output back into `x`. The critical
+  // ordering invariant: read `sample = x[n]` into a local BEFORE
+  // overwriting `x[n]` with `output`, since the per-sample feedforward
+  // (`b[i] * sample`) and feedback (`a[i] * output`) both use the SAME
+  // `sample` value that lived in `x[n]` on entry to this iteration.
+  let mut state: Vec<f64> = Vec::new();
+  state
+    .try_reserve_exact(state_len)
+    .map_err(|e| Error::Backend {
+      message: format!("lfilter: state reservation for {state_len} taps failed: {e}"),
+    })?;
+  state.resize(state_len, 0.0);
+
+  for slot in x.iter_mut() {
+    let sample = *slot;
+    let output = b_norm[0] * sample + state[0];
+    for i in 1..state_len {
+      let feedforward = b_norm.get(i).copied().unwrap_or(0.0) * sample;
+      let feedback = a_norm.get(i).copied().unwrap_or(0.0) * output;
+      state[i - 1] = state[i] + feedforward - feedback;
+    }
+    let feedforward_last = b_norm.get(state_len).copied().unwrap_or(0.0) * sample;
+    let feedback_last = a_norm.get(state_len).copied().unwrap_or(0.0) * output;
+    state[state_len - 1] = feedforward_last - feedback_last;
+    *slot = output;
+  }
+
+  Ok(())
+}
+
+/// Compute a BS.1770 biquad's `(b, a)` coefficients (both length 3, both
+/// normalized by `a[0]`) for either the K-weighting high-shelf or the
+/// high-pass stage.
+///
+/// Faithful port of `mlx_audio.dsp._biquad_coefficients(gain_db, q_factor,
+/// center_freq, rate, filter_type)`. Both filter shapes follow the standard
+/// "Audio EQ Cookbook" (RBJ) biquad formulas; the high-shelf takes a
+/// non-zero `gain_db` (BS.1770 uses `+4 dB` at `1500 Hz`, `Q = 1/sqrt(2)`)
+/// while the high-pass uses `gain_db = 0` (BS.1770 uses `Q = 0.5`,
+/// `fc = 38 Hz`).
+///
+/// Returns `(b_norm, a_norm)` with `b_norm[0] = b0/a0` etc. — pre-divided by
+/// `a[0]` exactly as the reference does (`np.array([b0, b1, b2]) / a0`).
+fn bs1770_biquad_coefficients(
+  gain_db: f64,
+  q_factor: f64,
+  center_freq: f64,
+  rate: f64,
+  filter_type: BiquadKind,
+) -> ([f64; 3], [f64; 3]) {
+  // Reference matches:
+  //   amplitude = 10 ** (gain_db / 40.0)
+  //   omega = 2π * (center_freq / rate)
+  //   alpha = sin(omega) / (2 * q)
+  let amplitude = 10.0_f64.powf(gain_db / 40.0);
+  let omega = 2.0 * std::f64::consts::PI * (center_freq / rate);
+  let alpha = omega.sin() / (2.0 * q_factor);
+  let cos_omega = omega.cos();
+
+  let (b0, b1, b2, a0, a1, a2) = match filter_type {
+    BiquadKind::HighShelf => {
+      let sqrt_a = amplitude.sqrt();
+      let b0 =
+        amplitude * ((amplitude + 1.0) + (amplitude - 1.0) * cos_omega + 2.0 * sqrt_a * alpha);
+      let b1 = -2.0 * amplitude * ((amplitude - 1.0) + (amplitude + 1.0) * cos_omega);
+      let b2 =
+        amplitude * ((amplitude + 1.0) + (amplitude - 1.0) * cos_omega - 2.0 * sqrt_a * alpha);
+      let a0 = (amplitude + 1.0) - (amplitude - 1.0) * cos_omega + 2.0 * sqrt_a * alpha;
+      let a1 = 2.0 * ((amplitude - 1.0) - (amplitude + 1.0) * cos_omega);
+      let a2 = (amplitude + 1.0) - (amplitude - 1.0) * cos_omega - 2.0 * sqrt_a * alpha;
+      (b0, b1, b2, a0, a1, a2)
+    }
+    BiquadKind::HighPass => {
+      let b0 = (1.0 + cos_omega) / 2.0;
+      let b1 = -(1.0 + cos_omega);
+      let b2 = (1.0 + cos_omega) / 2.0;
+      let a0 = 1.0 + alpha;
+      let a1 = -2.0 * cos_omega;
+      let a2 = 1.0 - alpha;
+      (b0, b1, b2, a0, a1, a2)
+    }
+  };
+
+  // `a[0]` is `a0/a0 == 1.0` after the normalization; emit the literal so
+  // `clippy::eq_op` is happy without changing the value the reference
+  // produces (`np.array([a0, a1, a2]) / a0`).
+  ([b0 / a0, b1 / a0, b2 / a0], [1.0, a1 / a0, a2 / a0])
+}
+
+/// Which RBJ biquad shape [`bs1770_biquad_coefficients`] should produce.
+/// Only the two BS.1770 stages are wired (high-shelf, high-pass); the
+/// reference's `_biquad_coefficients` raises on any other `filter_type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BiquadKind {
+  HighShelf,
+  HighPass,
+}
+
+/// Apply BS.1770 K-weighting (high-shelf at 1.5 kHz then high-pass at
+/// 38 Hz) to a single channel's f32 samples, returning the K-weighted
+/// signal as a fresh `Vec<f64>`.
+///
+/// Internal helper for [`integrated_loudness`]; runs in `f64` to match the
+/// reference's `_k_weight_audio` (Python `np.float64` throughout —
+/// `np.result_type` promotes the input to f64 in BOTH biquad stages and
+/// the second stage receives an f64 input from the first). Drives the
+/// private [`lfilter_f64_in_place`] kernel directly: convert the f32
+/// channel to f64 ONCE into a single `chan_f64` buffer, then run TWO
+/// in-place `lfilter_f64_in_place` stages (no intermediate f32 cast
+/// between stages, no `Array` round-trip per stage, no second f64 channel
+/// buffer), then return that one buffer for the per-block mean-square
+/// reduction.
+///
+/// # Memory
+/// Peak working set per channel is ONE f64 channel buffer
+/// (`n_samples * 8 bytes`) plus the two biquads' small (length 3)
+/// coefficient + state buffers. The previous implementation chained
+/// out-of-place `lfilter_f64` calls (`after_shelf = lfilter_f64(...)`)
+/// which momentarily held TWO full f64 channel buffers across the second
+/// stage's allocation — for a max-allowed mono input
+/// (`MAX_DECODED_SAMPLES = 64 Mi samples`) that was an extra ~512 MiB
+/// beyond the documented bound. Switching to the in-place kernel
+/// eliminates the second buffer entirely.
+fn k_weight_channel(channel: &[f32], rate: u32) -> Result<Vec<f64>> {
+  let rate_f64 = f64::from(rate);
+  // High-shelf: +4 dB at 1500 Hz, Q = 1/sqrt(2). Matches
+  // `_k_weight_audio`'s `_biquad_coefficients(4.0, 1/sqrt(2), 1500.0, rate,
+  // "high_shelf")`.
+  let (hs_b, hs_a) = bs1770_biquad_coefficients(
+    4.0,
+    1.0 / std::f64::consts::SQRT_2,
+    1500.0,
+    rate_f64,
+    BiquadKind::HighShelf,
+  );
+  // High-pass: 0 dB (no shelf gain), Q = 0.5, fc = 38 Hz. Matches
+  // `_k_weight_audio`'s `_biquad_coefficients(0.0, 0.5, 38.0, rate,
+  // "high_pass")`.
+  let (hp_b, hp_a) = bs1770_biquad_coefficients(0.0, 0.5, 38.0, rate_f64, BiquadKind::HighPass);
+
+  // Promote the channel to f64 ONCE (the reference's
+  // `np.array(data, dtype=np.float64, copy=True)`). The high-shelf and
+  // high-pass biquads then run in-place on `chan_f64`, so the peak
+  // working set is exactly ONE f64 channel buffer (no
+  // `after_shelf`-then-`hp_output` overlap). The f64 precision is still
+  // preserved end-to-end across both stages: same `f64`-typed buffer,
+  // same f64 coefficients, same f64 state — no intermediate f32 cast
+  // between stages (which historically dropped ~16 bits of precision and
+  // biased gate decisions near the absolute/relative LUFS thresholds).
+  let n = channel.len();
+  let mut chan_f64: Vec<f64> = Vec::new();
+  chan_f64.try_reserve_exact(n).map_err(|e| Error::Backend {
+    message: format!("k_weight_channel: input promotion reservation for {n} samples failed: {e}"),
+  })?;
+  for &v in channel {
+    chan_f64.push(f64::from(v));
+  }
+  lfilter_f64_in_place(&hs_b, &hs_a, &mut chan_f64)?;
+  lfilter_f64_in_place(&hp_b, &hp_a, &mut chan_f64)?;
+  Ok(chan_f64)
+}
+
+/// Measure ITU-R BS.1770 integrated loudness (LUFS) of an audio signal.
+///
+/// Faithful port of `mlx_audio.dsp.integrated_loudness(data, rate,
+/// block_size=0.400, overlap=0.75)`. Implements the K-weighting (a high-
+/// shelf at 1.5 kHz then a high-pass at 38 Hz, via [`lfilter`] plus the
+/// internal BS.1770 biquad coefficient helper), then the standard 400 ms /
+/// 75 %-overlap gated block analysis with the absolute (`-70 LUFS`) and
+/// relative (integrated - `10 LUFS`) gates, and finally the BS.1770
+/// reduction `LUFS = -0.691 + 10 * log10(sum_channels gain_c *
+/// mean_square_c)`.
+///
+/// `data` is either:
+/// - 1-D (mono): a single channel of `(n_samples,)` `Dtype::F32`, OR
+/// - 2-D (multi-channel): `(n_samples, n_channels)` `Dtype::F32` with
+///   `1 <= n_channels <= 5` (BS.1770 channel gains are defined for up to
+///   5 channels — front L/R/C + surround L/R).
+///
+/// Returns the integrated loudness in LUFS (`f64`). Returns
+/// [`f64::NEG_INFINITY`] when there is no signal energy (matches Python's
+/// `np.log10(0.0) = -inf` behavior, since the reference suppresses the
+/// `divide` warning rather than raising).
+///
+/// # Errors
+/// - [`Error::Backend`] when:
+///   - `data` is not 1-D or 2-D,
+///   - the 2-D case has more than 5 channels (BS.1770 only defines channel
+///     gains up to surround 5.0),
+///   - the input is shorter than `block_size * rate` samples (matches the
+///     reference's `Audio must have length greater than the block size`
+///     raise),
+///   - `rate == 0`, `block_size <= 0`, or `overlap` is not in `[0, 1)`,
+///   - the **total element count** `n_samples * n_channels` exceeds the
+///     shared
+///     [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) cap
+///     (the cap is on the materialized buffer the `to_vec` reads — not
+///     just the per-channel sample count — so 2-D inputs like
+///     `(MAX_DECODED_SAMPLES, 5)` can't bypass it),
+///   - the per-channel `f64` mean-square matrix would exceed the
+///     `MAX_LOUDNESS_BLOCK_BYTES` byte cap (64 MiB), OR the total
+///     per-block sum work `num_blocks * ceil(block_size_samples) *
+///     n_channels` exceeds the `MAX_LOUDNESS_WORK` sample-visit cap
+///     (256 Mi) — together these reject pathological overlaps very
+///     close to 1 BEFORE any `num_blocks`-scaled allocation OR the
+///     per-block loop runs (the byte cap dominates for normal block
+///     sizes; the visit cap catches near-1 overlaps with small block
+///     sizes that fit under the byte cap but multiply the per-block CPU
+///     sum work — once per channel, since the per-block loop runs once
+///     per channel — to multi-trillion visits),
+///   - the number of blocks overflows `usize`,
+///   - any size exceeds `i32::MAX`.
+///
+/// # Memory bounds
+/// The streaming per-channel path keeps peak working memory bounded to:
+/// - the input clone `raw_f32` (`n_samples * n_channels * 4 bytes`,
+///   bounded by the total-element cap above),
+/// - ONE channel's f64 K-weighted buffer (`n_samples * 8 bytes`, fully
+///   in-place — the high-shelf and high-pass biquads both write back into
+///   the SAME buffer via the private in-place lfilter kernel, so there
+///   is no second `after_shelf` channel buffer outstanding at the stage
+///   boundary; dropped per channel before the next channel's promotion),
+///   and
+/// - the per-channel mean-square matrix
+///   (`num_blocks * n_channels * 8 bytes`, bounded by
+///   `MAX_LOUDNESS_BLOCK_BYTES` = 64 MiB so the peak `mean_square`
+///   footprint is capped regardless of overlap; the gate-index path
+///   iterates `block_loudness` directly with NO intermediate
+///   `Vec<usize>` reservation, so there is no `num_blocks`-sized gate-
+///   index allocation beyond the mean-square matrix itself).
+///
+/// We do NOT allocate per-channel deinterleaved f32 buffers AND per-
+/// channel weighted f64 buffers all-at-once — the previous revision held
+/// `3 * n_samples * n_channels`-worth of channel data simultaneously,
+/// which the [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES)
+/// cap could not bound (the cap is per-element, and the multiplier on the
+/// peak working set was hidden). The chained out-of-place
+/// `lfilter_f64(&hs, ...) → lfilter_f64(&hp, ...)` form similarly held
+/// TWO f64 channel buffers across the stage-boundary call (~+512 MiB for
+/// the max-allowed mono input); the in-place kernel eliminates that
+/// overlap.
+pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f64) -> Result<f64> {
+  // Input validation mirrors `_validate_loudness_audio` + the loudness
+  // parameter ranges.
+  if rate == 0 {
+    return Err(Error::Backend {
+      message: "integrated_loudness: rate must be > 0".into(),
+    });
+  }
+  if !(block_size > 0.0 && block_size.is_finite()) {
+    return Err(Error::Backend {
+      message: format!("integrated_loudness: block_size must be finite and > 0 (got {block_size})"),
+    });
+  }
+  if !((0.0..1.0).contains(&overlap) && overlap.is_finite()) {
+    return Err(Error::Backend {
+      message: format!("integrated_loudness: overlap must be in [0, 1) (got {overlap})"),
+    });
+  }
+  let shape = data.shape();
+  let (n_samples, n_channels) = match shape.len() {
+    1 => (shape[0], 1usize),
+    2 => {
+      // Reference stores audio as (n_samples, n_channels). We follow the
+      // same layout (column-per-channel) since BS.1770 K-weights and
+      // mean-squares each channel independently.
+      let (n_samples, n_channels) = (shape[0], shape[1]);
+      if n_channels > BS1770_MAX_CHANNELS {
+        return Err(Error::Backend {
+          message: format!(
+            "integrated_loudness: audio must have at most {BS1770_MAX_CHANNELS} channels \
+             (got {n_channels})"
+          ),
+        });
+      }
+      if n_channels == 0 {
+        return Err(Error::Backend {
+          message: "integrated_loudness: audio must have at least 1 channel".into(),
+        });
+      }
+      (n_samples, n_channels)
+    }
+    other => {
+      return Err(Error::Backend {
+        message: format!(
+          "integrated_loudness: data must be 1-D (mono) or 2-D \
+           (n_samples, n_channels), got {other}-D"
+        ),
+      });
+    }
+  };
+  // Cap on the TOTAL materialized element count BEFORE the `to_vec`. The
+  // previous revision capped only `n_samples`, which a 2-D input like
+  // `(MAX_DECODED_SAMPLES, 5)` would bypass — the `to_vec` would then
+  // materialize `5 * MAX_DECODED_SAMPLES` f32 samples (multi-GB). Mirrors
+  // the [`stft`] / OLA pattern of checking the materialized work cap
+  // before any allocation.
+  let total_elements = n_samples
+    .checked_mul(n_channels)
+    .ok_or_else(|| Error::Backend {
+      message: format!(
+        "integrated_loudness: total element count overflows usize (n_samples={n_samples}, \
+         n_channels={n_channels})"
+      ),
+    })?;
+  if total_elements > MAX_LOUDNESS_SAMPLES {
+    return Err(Error::Backend {
+      message: format!(
+        "integrated_loudness: total element count {total_elements} (n_samples={n_samples} * \
+         n_channels={n_channels}) exceeds the {MAX_LOUDNESS_SAMPLES} cap"
+      ),
+    });
+  }
+
+  // `block_size * rate` is the per-block sample count in the reference.
+  // Cast through `f64` to mirror the python arithmetic exactly (block_size
+  // is a float seconds, rate is an int Hz).
+  let rate_f64 = f64::from(rate);
+  let block_samples_f64 = block_size * rate_f64;
+  if !block_samples_f64.is_finite() || block_samples_f64 < 1.0 {
+    return Err(Error::Backend {
+      message: format!(
+        "integrated_loudness: block_size * rate = {block_samples_f64} produces \
+         < 1 sample (block_size={block_size}, rate={rate})"
+      ),
+    });
+  }
+  if (n_samples as f64) < block_samples_f64 {
+    return Err(Error::Backend {
+      message: format!(
+        "integrated_loudness: audio length {n_samples} samples must be greater than the \
+         block size ({block_samples_f64} samples)"
+      ),
+    });
+  }
+
+  // Per-block analysis. Reference:
+  //   step = 1 - overlap
+  //   duration_seconds = num_samples / rate
+  //   num_blocks = int(round((duration - block_size) / (block_size * step)) + 1)
+  let step = 1.0 - overlap;
+  let duration_seconds = n_samples as f64 / rate_f64;
+  // `step` is in `(0, 1]` (overlap in [0, 1)) so `block_size * step > 0`;
+  // the division is safe. The `round + 1` produces the count of blocks
+  // whose overlap-strided start fits inside `[0, duration]`.
+  //
+  // The reference rounds with `np.round`, which is round-half-to-EVEN
+  // (banker's rounding) — so `round_ties_even` is REQUIRED here, NOT the
+  // half-away-from-zero `f64::round`. They disagree on exact `*.5`
+  // quotients: e.g. a default-parameter 0.65 s clip at 48 kHz gives
+  // quotient 2.5 → `round_ties_even` ⇒ 2 (→ 3 blocks, the reference's
+  // count), `round` ⇒ 3 (→ 4 blocks). A wrong block count shifts the
+  // absolute/relative gates and the final LUFS for non-stationary audio.
+  let num_blocks_f64 =
+    ((duration_seconds - block_size) / (block_size * step)).round_ties_even() + 1.0;
+  if !num_blocks_f64.is_finite() || num_blocks_f64 < 1.0 {
+    return Err(Error::Backend {
+      message: format!(
+        "integrated_loudness: derived num_blocks {num_blocks_f64} is invalid \
+         (duration={duration_seconds}, block_size={block_size}, overlap={overlap})"
+      ),
+    });
+  }
+  // Reject pathological `num_blocks` BEFORE any `num_blocks`-scaled
+  // allocation OR the per-block sum loop runs. A caller-controlled
+  // `overlap` close to 1 (e.g. `0.99999990`) makes `step → 0` and
+  // `num_blocks → ∞`, which the previous element-only block-work cap
+  // (`num_blocks * n_channels <= 64 Mi`) admitted at tens of millions of
+  // blocks for a small mono signal — the `mean_square` matrix's actual
+  // BYTE footprint is `8 * num_blocks * n_channels` (`f64`), so the
+  // element cap let multi-hundred-MB / ~2-GiB reservations through, and
+  // the per-block sum loop then re-summed `block_size_samples` per
+  // block for an extreme CPU-time blow-up. The two new caps bound the
+  // ACTUAL peak bytes AND total sum work:
+  //   1. `MAX_LOUDNESS_BLOCK_BYTES` (64 MiB) — bounds the dominant
+  //      block-sized `f64` buffer (`mean_square`).
+  //   2. `MAX_LOUDNESS_WORK` (256 Mi sample-visits) — bounds the per-
+  //      block sum CPU work (`num_blocks * block_size_samples`).
+  // Both use `checked_mul`; arithmetic overflow rejects. The
+  // `num_blocks_f64 > usize::MAX as f64` check catches the as-cast
+  // saturation case where the `usize` cast silently clamps.
+  if num_blocks_f64 > usize::MAX as f64 {
+    return Err(Error::Backend {
+      message: format!(
+        "integrated_loudness: derived num_blocks {num_blocks_f64} overflows usize \
+         (duration={duration_seconds}, block_size={block_size}, overlap={overlap})"
+      ),
+    });
+  }
+  let num_blocks = num_blocks_f64 as usize;
+  if num_blocks == 0 {
+    return Err(Error::Backend {
+      message: "integrated_loudness: derived num_blocks == 0".into(),
+    });
+  }
+  // Byte cap: `num_blocks * n_channels * sizeof::<f64>() <=
+  // MAX_LOUDNESS_BLOCK_BYTES`. Compute the cell count first, then the
+  // byte product — both `checked_mul` so overflow rejects.
+  let block_cells = num_blocks
+    .checked_mul(n_channels)
+    .ok_or_else(|| Error::Backend {
+      message: format!(
+        "integrated_loudness: block cells {num_blocks} * {n_channels} overflows usize \
+         (overlap={overlap})"
+      ),
+    })?;
+  let block_bytes = block_cells
+    .checked_mul(std::mem::size_of::<f64>())
+    .ok_or_else(|| Error::Backend {
+      message: format!(
+        "integrated_loudness: block bytes {block_cells} * 8 overflows usize \
+         (overlap={overlap})"
+      ),
+    })?;
+  if block_bytes > MAX_LOUDNESS_BLOCK_BYTES {
+    return Err(Error::Backend {
+      message: format!(
+        "integrated_loudness: mean-square byte footprint {block_bytes} \
+         (num_blocks={num_blocks} * n_channels={n_channels} * 8) exceeds the \
+         {MAX_LOUDNESS_BLOCK_BYTES} byte cap (overlap={overlap})"
+      ),
+    });
+  }
+  // Work cap: `num_blocks * block_size_samples * n_channels <=
+  // MAX_LOUDNESS_WORK`. The per-block mean-square loop runs ONCE PER
+  // CHANNEL (see the per-channel streaming loop below), so the actual
+  // sample-visit count is `num_blocks * block_size_samples * n_channels`
+  // — bounding the channel-less product alone admitted a 5-channel input
+  // (Codex review: `num_blocks=1_677_721, block_samples=160, n_channels=5`
+  // gives a channel-less work product of ~268 Mi ≤ 256 Mi cap BUT actual
+  // visits ~1.34 Bi, defeating the bound for adversarial overlap × multi-
+  // channel). Include `n_channels` in the work product.
+  //
+  // `block_samples_f64` was already validated finite + >= 1 + <= n_samples
+  // (the audio-length-vs-block-size check above), so it fits in `usize`
+  // for any `n_samples` we accept (bounded by `MAX_LOUDNESS_SAMPLES`). We
+  // use `ceil` here — the per-block bounds (`lower = floor(bi*step*bs*r)`,
+  // `upper = floor((bi*step+1)*bs*r)`) can produce `upper - lower =
+  // ceil(block_samples_f64)` in the worst case for fractional
+  // `block_samples_f64`, so the conservative bound on actual slice visits
+  // uses `ceil`. `checked_mul` against `num_blocks` and `n_channels`
+  // then rejects overflow up-front.
+  let block_samples_usize: usize = block_samples_f64.ceil() as usize;
+  let total_work = num_blocks
+    .checked_mul(block_samples_usize)
+    .ok_or_else(|| Error::Backend {
+      message: format!(
+        "integrated_loudness: total work {num_blocks} * {block_samples_usize} overflows \
+         usize (overlap={overlap})"
+      ),
+    })?
+    .checked_mul(n_channels)
+    .ok_or_else(|| Error::Backend {
+      message: format!(
+        "integrated_loudness: total work {num_blocks} * {block_samples_usize} * \
+         {n_channels} overflows usize (overlap={overlap})"
+      ),
+    })?;
+  if total_work > MAX_LOUDNESS_WORK {
+    return Err(Error::Backend {
+      message: format!(
+        "integrated_loudness: total sample-visit work {total_work} (num_blocks={num_blocks} \
+         * block_samples={block_samples_usize} * n_channels={n_channels}) exceeds the \
+         {MAX_LOUDNESS_WORK} cap (overlap={overlap})"
+      ),
+    });
+  }
+
+  // Extract the raw interleaved f32 buffer (bounded by the
+  // `total_elements <= MAX_LOUDNESS_SAMPLES` cap above). We stream per
+  // channel from this buffer with a stride — no per-channel f32 copy and
+  // no per-channel weighted f64 buffer kept across iterations. Peak
+  // working memory across the K-weight loop is therefore one f64 channel
+  // buffer (and the f64 second-stage output) at a time, NOT
+  // `3 * n_samples * n_channels`.
+  let raw_f32 = data.try_clone()?.to_vec::<f32>()?;
+  if raw_f32.len() != total_elements {
+    return Err(Error::Backend {
+      message: format!(
+        "integrated_loudness: internal shape mismatch — got {} f32 samples for shape \
+         ({n_samples}, {n_channels})",
+        raw_f32.len()
+      ),
+    });
+  }
+
+  // mean_square[c][b] — per-channel, per-block mean-square. Matches the
+  // reference's `np.zeros((num_channels, num_blocks))`. Bounded by the
+  // `block_work` cap above.
+  let mut mean_square: Vec<Vec<f64>> = Vec::new();
+  mean_square
+    .try_reserve_exact(n_channels)
+    .map_err(|e| Error::Backend {
+      message: format!(
+        "integrated_loudness: reservation for {n_channels} mean-square channels failed: {e}"
+      ),
+    })?;
+  for _ in 0..n_channels {
+    let mut row: Vec<f64> = Vec::new();
+    row
+      .try_reserve_exact(num_blocks)
+      .map_err(|e| Error::Backend {
+        message: format!(
+          "integrated_loudness: reservation for {num_blocks} mean-square blocks failed: {e}"
+        ),
+      })?;
+    row.resize(num_blocks, 0.0);
+    mean_square.push(row);
+  }
+
+  // Per-channel streaming loop: extract ONE column of `raw_f32` into a
+  // small f32 channel buffer, K-weight it to f64 (the K-weighting helper
+  // converts to f64 once and runs both biquad stages in f64 end-to-end),
+  // compute the per-block mean-square into the matrix row, then DROP both
+  // the channel buffer and the K-weighted buffer before the next channel.
+  // Peak working set across channels is therefore one channel pair, not
+  // `n_channels` pairs.
+  //
+  // 1-D input has n_channels = 1 and the de-interleave is a straight
+  // copy. 2-D input has the reference's `(n_samples, n_channels)` layout
+  // — channel `c`'s sample `i` lives at `raw_f32[i * n_channels + c]`.
+  let mut chan_f32: Vec<f32> = Vec::new();
+  chan_f32
+    .try_reserve_exact(n_samples)
+    .map_err(|e| Error::Backend {
+      message: format!("integrated_loudness: reservation for {n_samples} samples failed: {e}"),
+    })?;
+  for (c, ms_row) in mean_square.iter_mut().enumerate() {
+    chan_f32.clear();
+    for i in 0..n_samples {
+      chan_f32.push(raw_f32[i * n_channels + c]);
+    }
+    // K-weight this channel (high-shelf @ 1.5 kHz, then high-pass @ 38 Hz);
+    // returns an f64 channel buffer ready for the per-block mean-square.
+    let weighted = k_weight_channel(&chan_f32, rate)?;
+
+    // Per-block bounds match the reference's
+    //   lower = int(block_size * (block_index * step) * rate)
+    //   upper = int(block_size * (block_index * step + 1) * rate)
+    // i.e. `lower = floor(block_index * step * block_size * rate)`,
+    // `upper = floor((block_index * step + 1) * block_size * rate)`.
+    // Both are clamped to the channel length to avoid reading past the
+    // end (the reference's slice `arr[lower:upper]` silently clamps; we
+    // mirror).
+    for (block_index, ms_cell) in ms_row.iter_mut().enumerate() {
+      let bi_f64 = block_index as f64;
+      let lower_f64 = block_size * (bi_f64 * step) * rate_f64;
+      let upper_f64 = block_size * (bi_f64 * step + 1.0) * rate_f64;
+      // The reference's `int(...)` floors for non-negative values; the
+      // values here are non-negative by construction (step >= 0,
+      // block_size > 0, rate > 0, bi >= 0).
+      let lower = lower_f64 as usize;
+      let upper = (upper_f64 as usize).min(weighted.len());
+      if upper <= lower {
+        // Empty block — leave the cell at the pre-`resize` 0.0 (the
+        // reference's `np.sum(np.square([]))` returns 0.0).
+        continue;
+      }
+      // `mean_square = (1 / (block_size * rate)) * sum(x[lower:upper]^2)`.
+      // The `block_size * rate` divisor is the EXPECTED per-block sample
+      // count (NOT `upper - lower`, which can be smaller on the trailing
+      // block) — preserves the reference's bias-correction-free form.
+      let mut sum_sq = 0.0_f64;
+      for &v in &weighted[lower..upper] {
+        sum_sq += v * v;
+      }
+      *ms_cell = sum_sq / block_samples_f64;
+    }
+    // `weighted` drops here (end of channel iteration) — next channel
+    // re-uses `chan_f32` via `.clear()` (no shrink) and allocates the next
+    // weighted buffer fresh.
+    drop(weighted);
+  }
+  // Free the raw interleaved buffer before we move on to the gate-index
+  // collect / per-block loudness reduction — the mean_square matrix is the
+  // only thing we still need from the audio data.
+  drop(raw_f32);
+  drop(chan_f32);
+
+  // Per-block loudness in LUFS: `block_loudness[b] = -0.691 + 10 log10
+  // (sum_c gain[c] * mean_square[c][b])`. `log10(0.0) = -inf` is
+  // acceptable — these blocks fall below the absolute gate and are
+  // dropped (matches the reference's `warnings.simplefilter("ignore", ...)`
+  // around the same `log10`).
+  let mut block_loudness: Vec<f64> = Vec::new();
+  block_loudness
+    .try_reserve_exact(num_blocks)
+    .map_err(|e| Error::Backend {
+      message: format!(
+        "integrated_loudness: reservation for {num_blocks} block loudness failed: {e}"
+      ),
+    })?;
+  for b in 0..num_blocks {
+    let mut weighted_sum = 0.0_f64;
+    // Channel gain is defined for the first 5 channels (the reference's
+    // `channel_gains`); we already rejected `> 5` channels above.
+    for (gain, ms_row) in BS1770_CHANNEL_GAINS.iter().zip(mean_square.iter()) {
+      weighted_sum += gain * ms_row[b];
+    }
+    block_loudness.push(BS1770_LOUDNESS_OFFSET_LUFS + 10.0 * weighted_sum.log10());
+  }
+
+  // Per-channel gated mean of `mean_square`, computed directly from
+  // `block_loudness` + `mean_square` WITHOUT materializing a `Vec<usize>`
+  // of gated block indices. The previous revision allocated TWO
+  // `num_blocks`-sized `Vec<usize>` (one per gate pass) via
+  // `try_reserve_exact(num_blocks)` — each `8 * num_blocks` bytes on a
+  // 64-bit target, scaling with `num_blocks` even when very few blocks
+  // survive the gate. The byte/work caps above now bound `num_blocks`,
+  // so this is no longer a multi-GB risk; we still eliminate the
+  // intermediate `Vec`s because they're pure overhead — the gated mean
+  // is a simple filter-fold over `block_loudness.iter().zip(ms_row)` that
+  // visits the same cells either way. Returns NaN for an empty survivor
+  // set (matches the reference's `np.mean([])` = NaN; subsequent
+  // `nan_to_num` or `log10(NaN)` then carries through faithfully).
+  //
+  // `pred(block_loudness[b])` selects survivors; the closure runs once
+  // per channel and computes that channel's gated mean by iterating
+  // `block_loudness` once. `mean_square.iter()` is the per-channel outer
+  // loop — total cell visits are `n_channels * num_blocks`, which is
+  // bounded by the `MAX_LOUDNESS_BLOCK_BYTES` cap (≤ 8 Mi cells).
+  let gated_mean_per_channel = |pred: &dyn Fn(f64) -> bool| -> Vec<f64> {
+    let mut out = Vec::with_capacity(n_channels);
+    for ms_row in mean_square.iter() {
+      let mut acc = 0.0_f64;
+      let mut count: usize = 0;
+      for (b, &l) in block_loudness.iter().enumerate() {
+        if pred(l) {
+          acc += ms_row[b];
+          count += 1;
+        }
+      }
+      if count == 0 {
+        out.push(f64::NAN);
+      } else {
+        out.push(acc / count as f64);
+      }
+    }
+    out
+  };
+
+  // First (absolute-only) gate at -70 LUFS — reference's `>= -70`.
+  let gated_mean_square_abs = gated_mean_per_channel(&|l| l >= BS1770_ABSOLUTE_THRESHOLD_LUFS);
+  // `relative_threshold = -0.691 + 10*log10(sum(gain * gated_ms)) - 10`.
+  // Carries through the reference's `log10` of a possibly-zero/NaN sum;
+  // that produces a finite -inf / NaN threshold which simply admits no
+  // additional blocks beyond the absolute gate (the python `if loudness >
+  // threshold` would then be false / NaN-false).
+  let mut weighted_abs = 0.0_f64;
+  for (gain, &gms) in BS1770_CHANNEL_GAINS
+    .iter()
+    .zip(gated_mean_square_abs.iter())
+  {
+    weighted_abs += gain * gms;
+  }
+  let relative_threshold =
+    BS1770_LOUDNESS_OFFSET_LUFS + 10.0 * weighted_abs.log10() - BS1770_RELATIVE_OFFSET_LUFS;
+
+  // Second pass: blocks above BOTH the relative threshold AND the absolute
+  // threshold (the reference uses `> relative_threshold AND > absolute`,
+  // not `>=`). NaN/-inf relative_threshold simply fails the `>` test.
+  let mut gated_mean_square_rel =
+    gated_mean_per_channel(&|l| l > relative_threshold && l > BS1770_ABSOLUTE_THRESHOLD_LUFS);
+  // Final per-channel gated mean-square; the reference `nan_to_num`s the
+  // NaN-from-empty-set case to 0, which lets us safely add up the weighted
+  // sum even when no blocks survived the second gate.
+  for v in gated_mean_square_rel.iter_mut() {
+    if v.is_nan() {
+      *v = 0.0;
+    }
+  }
+  let mut weighted_rel = 0.0_f64;
+  for (gain, &gms) in BS1770_CHANNEL_GAINS
+    .iter()
+    .zip(gated_mean_square_rel.iter())
+  {
+    weighted_rel += gain * gms;
+  }
+  // `log10(0.0)` returns `-inf` (matches the reference's
+  // `np.errstate(divide='ignore')` + `np.log10` behavior). The final LUFS
+  // is then `-inf`, which is the correct answer for "no signal energy
+  // survived the gates".
+  Ok(BS1770_LOUDNESS_OFFSET_LUFS + 10.0 * weighted_rel.log10())
+}
+
+/// Apply a linear gain to bring `data` from `input_loudness` to
+/// `target_loudness` (both in LUFS).
+///
+/// Faithful port of `mlx_audio.dsp.normalize_loudness(data, input_loudness,
+/// target_loudness)` — the signal is scaled by
+/// `gain = 10^((target - input) / 20)`. The output's shape and dtype match
+/// `data` (which must be 1-D or 2-D `Dtype::F32` for the mlxrs audio
+/// surface). Unlike the reference's `np.warn("Possible clipped samples
+/// in output.")`, we do not emit a runtime warning — Rust has no
+/// equivalent of Python's `warnings` module, and the loudness pipeline
+/// (`integrated_loudness` → `normalize_loudness`) is the standard
+/// pre-normalization step where the caller is expected to peak-limit
+/// downstream if needed.
+///
+/// The typical round-trip is:
+/// ```ignore
+/// let lufs = integrated_loudness(&samples, rate, 0.4, 0.75)?;
+/// let normalized = normalize_loudness(&samples, lufs, -23.0)?; // EBU R128 target
+/// // integrated_loudness(&normalized, rate, 0.4, 0.75) ≈ -23.0
+/// ```
+///
+/// # Errors
+/// - [`Error::Backend`] when:
+///   - `input_loudness` or `target_loudness` is non-finite (NaN/+-inf would
+///     yield a non-finite gain, silently corrupting the output),
+///   - the input multiply propagates a backend error.
+pub fn normalize_loudness(
+  data: &Array,
+  input_loudness: f64,
+  target_loudness: f64,
+) -> Result<Array> {
+  if !input_loudness.is_finite() {
+    return Err(Error::Backend {
+      message: format!("normalize_loudness: input_loudness must be finite (got {input_loudness})"),
+    });
+  }
+  if !target_loudness.is_finite() {
+    return Err(Error::Backend {
+      message: format!(
+        "normalize_loudness: target_loudness must be finite (got {target_loudness})"
+      ),
+    });
+  }
+  let delta = target_loudness - input_loudness;
+  // `gain = 10^(delta / 20)`. Reference: `np.power(10.0, delta / 20.0)`.
+  // Compute in f64 (matches the reference) and cast down to f32 for the
+  // mlx multiply.
+  let gain_f64 = 10.0_f64.powf(delta / 20.0);
+  let gain = gain_f64 as f32;
+  let gain_arr = Array::full::<f32>(&[0i32; 0], gain)?;
+  ops::arithmetic::multiply(data, &gain_arr)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -2440,6 +3597,847 @@ mod tests {
       max_diff > 1e-4,
       "Right- and Center-padded short-window mel must DIFFER (else the pad pin \
        is vacuous); max diff was {max_diff}"
+    );
+  }
+
+  // ---- A4: `lfilter` direct-form II transposed parity ---------------------
+
+  /// Hand-trace the reference `mlx_audio.dsp.lfilter` for a single-pole IIR
+  /// `y[n] = 0.5 * x[n] + 0.5 * y[n-1]` (i.e. `b=[0.5], a=[1, -0.5]`) on an
+  /// impulse `x = [1, 0, 0, 0, 0]`. Closed form: `y[n] = 0.5 * (0.5)^n`,
+  /// i.e. `[0.5, 0.25, 0.125, 0.0625, 0.03125]`. This is the canonical
+  /// single-pole-IIR sanity check from the spec.
+  #[test]
+  fn lfilter_single_pole_iir_impulse_response() {
+    let b: [f64; 1] = [0.5];
+    let a: [f64; 2] = [1.0, -0.5];
+    let x_buf: [f32; 5] = [1.0, 0.0, 0.0, 0.0, 0.0];
+    let x = Array::from_slice::<f32>(&x_buf, &[5i32]).unwrap();
+    let y = to_vec(&lfilter(&b, &a, &x).unwrap());
+    let expected = [0.5_f32, 0.25, 0.125, 0.0625, 0.03125];
+    assert_eq!(y.len(), expected.len());
+    for (i, (g, e)) in y.iter().zip(expected.iter()).enumerate() {
+      // f64-computed exact dyadic values; tight tolerance (the only error
+      // source is the final f64→f32 cast on a representable f32).
+      assert!(
+        (g - e).abs() < 1e-7,
+        "lfilter[{i}]: got {g}, want {e} (diff {})",
+        (g - e).abs()
+      );
+    }
+  }
+
+  /// Hand-trace the SAME single-pole IIR on a step input `x = [1, 1, 1, 1,
+  /// 1]`. Closed form: `y[n] = 1 - (0.5)^(n+1)` →
+  /// `[0.5, 0.75, 0.875, 0.9375, 0.96875]`. Asserts the recurrence runs
+  /// correctly past the first sample (the impulse test only exercises the
+  /// initial decay).
+  #[test]
+  fn lfilter_single_pole_iir_step_response() {
+    let b: [f64; 1] = [0.5];
+    let a: [f64; 2] = [1.0, -0.5];
+    let x_buf: [f32; 5] = [1.0, 1.0, 1.0, 1.0, 1.0];
+    let x = Array::from_slice::<f32>(&x_buf, &[5i32]).unwrap();
+    let y = to_vec(&lfilter(&b, &a, &x).unwrap());
+    let expected = [0.5_f32, 0.75, 0.875, 0.9375, 0.96875];
+    assert_eq!(y.len(), expected.len());
+    for (i, (g, e)) in y.iter().zip(expected.iter()).enumerate() {
+      assert!(
+        (g - e).abs() < 1e-7,
+        "lfilter step[{i}]: got {g}, want {e} (diff {})",
+        (g - e).abs()
+      );
+    }
+  }
+
+  /// Pure-FIR (state_len == 0): `b = [2.0], a = [1.0]` is a unit-delay-free
+  /// passthrough doubler. `y[n] = 2 * x[n]`. Exercises the
+  /// `state_len == 0` fast path in [`lfilter`].
+  #[test]
+  fn lfilter_fir_no_state_doubles() {
+    let b: [f64; 1] = [2.0];
+    let a: [f64; 1] = [1.0];
+    let x_buf: [f32; 4] = [0.1, -0.5, 0.7, 1.0];
+    let x = Array::from_slice::<f32>(&x_buf, &[4i32]).unwrap();
+    let y = to_vec(&lfilter(&b, &a, &x).unwrap());
+    let expected = [0.2_f32, -1.0, 1.4, 2.0];
+    for (i, (g, e)) in y.iter().zip(expected.iter()).enumerate() {
+      assert!((g - e).abs() < 1e-6, "fir[{i}]: got {g}, want {e}");
+    }
+  }
+
+  /// Normalization by `a[0] != 1`: `b = [1.0], a = [2.0]` should normalize
+  /// to `b = [0.5], a = [1.0]`, i.e. `y[n] = 0.5 * x[n]`. Exercises the
+  /// `a[0] != 1` normalization path (the reference always divides; we
+  /// mirror).
+  #[test]
+  fn lfilter_normalizes_by_leading_a() {
+    let b: [f64; 1] = [1.0];
+    let a: [f64; 1] = [2.0];
+    let x_buf: [f32; 3] = [4.0, 8.0, -2.0];
+    let x = Array::from_slice::<f32>(&x_buf, &[3i32]).unwrap();
+    let y = to_vec(&lfilter(&b, &a, &x).unwrap());
+    let expected = [2.0_f32, 4.0, -1.0];
+    for (i, (g, e)) in y.iter().zip(expected.iter()).enumerate() {
+      assert!((g - e).abs() < 1e-6, "norm[{i}]: got {g}, want {e}");
+    }
+  }
+
+  /// Biquad (state_len == 2) hand-trace: pass a 2-tap b and 3-tap a, then
+  /// hand-trace 4 samples through the reference's recurrence and assert
+  /// byte-for-byte.
+  ///
+  /// Filter: `b = [0.25, 0.5]`, `a = [1.0, -0.3, 0.1]` → recurrence
+  /// `y[n] = 0.25 x[n] + 0.5 x[n-1] + 0.3 y[n-1] - 0.1 y[n-2]`. With
+  /// state_len = max(2, 3) - 1 = 2 the reference's transposed loop produces
+  /// (hand-traced with state vectors at each step) for input
+  /// `x = [1, 0, 0, 0]`:
+  ///   n=0: y=0.25; n=1: y=0.5 + 0.075 = 0.575; n=2: y=0+0.1725-0.025 =
+  ///   0.1475; n=3: y=0+0.04425-0.0575 = -0.01325.
+  #[test]
+  fn lfilter_biquad_hand_traced_impulse() {
+    let b: [f64; 2] = [0.25, 0.5];
+    let a: [f64; 3] = [1.0, -0.3, 0.1];
+    let x_buf: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+    let x = Array::from_slice::<f32>(&x_buf, &[4i32]).unwrap();
+    let y = to_vec(&lfilter(&b, &a, &x).unwrap());
+    let expected = [0.25_f32, 0.575, 0.1475, -0.01325];
+    for (i, (g, e)) in y.iter().zip(expected.iter()).enumerate() {
+      assert!(
+        (g - e).abs() < 1e-6,
+        "biquad[{i}]: got {g}, want {e} (diff {})",
+        (g - e).abs()
+      );
+    }
+  }
+
+  /// Empty `b` → return zeros of the input shape (mirrors the reference's
+  /// `np.zeros_like(data)` early return).
+  #[test]
+  fn lfilter_empty_b_returns_zeros() {
+    let b: [f64; 0] = [];
+    let a: [f64; 1] = [1.0];
+    let x_buf: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let x = Array::from_slice::<f32>(&x_buf, &[4i32]).unwrap();
+    let y = to_vec(&lfilter(&b, &a, &x).unwrap());
+    assert_eq!(y, vec![0.0_f32; 4]);
+  }
+
+  /// `a` empty / `a[0] == 0` / non-1-D input must all be rejected with
+  /// `Error::Backend`, matching the reference's `ValueError` raises. (Note:
+  /// **empty `b`** is NOT a rejection — the reference returns
+  /// `np.zeros_like(data)` and we mirror that fast-path; see
+  /// `lfilter_empty_b_returns_zeros` for that case.)
+  #[test]
+  fn lfilter_rejects_invalid_inputs() {
+    let x = Array::from_slice::<f32>(&[1.0_f32, 2.0], &[2i32]).unwrap();
+    // a empty — reference raises `filter denominator must have a non-zero
+    // leading term` (the empty `a` falls into the `a[0] == 0` branch via
+    // `a.size == 0 or a[0] == 0`).
+    assert!(matches!(
+      lfilter(&[1.0_f64], &[], &x),
+      Err(Error::Backend { .. })
+    ));
+    // a[0] == 0
+    assert!(matches!(
+      lfilter(&[1.0_f64], &[0.0_f64, 1.0], &x),
+      Err(Error::Backend { .. })
+    ));
+    // 2-D input — reference raises `dsp.lfilter only supports 1-D input`.
+    let x_2d = Array::from_slice::<f32>(&[1.0_f32, 2.0, 3.0, 4.0], &[2i32, 2i32]).unwrap();
+    assert!(matches!(
+      lfilter(&[0.5_f64], &[1.0_f64, -0.5], &x_2d),
+      Err(Error::Backend { .. })
+    ));
+  }
+
+  /// Public [`lfilter`]'s sample cap must fire on the input SHAPE BEFORE
+  /// any `to_vec` materialization. We construct a lazy `Array::zeros` of
+  /// `(MAX_LFILTER_SAMPLES + 1,)` f32 — which mlx does not eval until a
+  /// data accessor runs — and assert `lfilter` rejects it with
+  /// `Error::Backend`. If the cap check still lived behind the `to_vec`
+  /// (the pre-fix behavior), the rejected call would have first
+  /// materialized `(MAX_LFILTER_SAMPLES + 1) * 4 bytes` (≈256 MiB) of f32
+  /// plus a second `(MAX_LFILTER_SAMPLES + 1) * 8 bytes` (≈512 MiB) f64
+  /// promotion before erroring — a ~768 MiB allocation for a call that
+  /// the bounded-memory contract says must allocate nothing. The lazy
+  /// `Array::zeros` is the regression handle: with the up-front cap
+  /// check this test runs effectively for free.
+  #[test]
+  fn lfilter_rejects_lazy_oversized_input_without_allocating() {
+    let lazy_huge =
+      Array::zeros::<f32>(&[(MAX_LFILTER_SAMPLES + 1) as i32]).expect("lazy zeros must succeed");
+    let res = lfilter(&[0.5_f64], &[1.0_f64, -0.5], &lazy_huge);
+    assert!(
+      matches!(res, Err(Error::Backend { .. })),
+      "lfilter must reject a lazy ({} samples) input via the up-front \
+       sample cap, BEFORE the to_vec materializes f32 / promotes to f64 \
+       (got {res:?})",
+      MAX_LFILTER_SAMPLES + 1
+    );
+  }
+
+  /// [`lfilter_f64_in_place`] is the in-place variant the K-weighting path
+  /// uses to keep the peak working set at ONE f64 channel buffer (the
+  /// pre-fix chained out-of-place form held TWO across the high-shelf →
+  /// high-pass stage boundary). Numerically the two kernels must produce
+  /// BIT-IDENTICAL output (same direct-form II transposed math, same f64
+  /// precision, same state updates) — only the allocation strategy
+  /// differs. Pin this with the same biquad hand-traced impulse from
+  /// `lfilter_biquad_hand_traced_impulse`, comparing the in-place output
+  /// against the out-of-place `lfilter_f64`'s output sample-for-sample
+  /// (zero tolerance — these MUST agree exactly in f64).
+  #[test]
+  fn lfilter_f64_in_place_matches_out_of_place() {
+    let b: [f64; 2] = [0.25, 0.5];
+    let a: [f64; 3] = [1.0, -0.3, 0.1];
+    let x_in: [f64; 4] = [1.0, 0.0, 0.0, 0.0];
+
+    // Out-of-place reference output.
+    let y_out = lfilter_f64(&b, &a, &x_in).expect("out-of-place must succeed");
+
+    // In-place run on a mutable copy.
+    let mut x_buf = x_in;
+    lfilter_f64_in_place(&b, &a, &mut x_buf).expect("in-place must succeed");
+
+    assert_eq!(
+      x_buf.len(),
+      y_out.len(),
+      "in-place output length must match out-of-place"
+    );
+    for (i, (g, e)) in x_buf.iter().zip(y_out.iter()).enumerate() {
+      // Bit-identical: same arithmetic in f64, no tolerance.
+      assert_eq!(
+        g, e,
+        "in-place[{i}] = {g} must equal out-of-place[{i}] = {e} \
+         (bit-identical f64)"
+      );
+    }
+  }
+
+  /// In-place `state_len == 0` fast path (`b = [2.0], a = [1.0]` →
+  /// `y[n] = 2 * x[n]`) must overwrite the buffer correctly. The
+  /// in-place kernel's per-slot ordering (read `sample` before writing
+  /// `output`) is trivial in this branch but the parity guarantee with
+  /// `lfilter_f64` still applies — assert both kernels produce the same
+  /// output on the same input.
+  #[test]
+  fn lfilter_f64_in_place_state_len_zero_doubles() {
+    let b: [f64; 1] = [2.0];
+    let a: [f64; 1] = [1.0];
+    let x_in: [f64; 4] = [0.1, -0.5, 0.7, 1.0];
+
+    let y_out = lfilter_f64(&b, &a, &x_in).expect("out-of-place must succeed");
+    let mut x_buf = x_in;
+    lfilter_f64_in_place(&b, &a, &mut x_buf).expect("in-place must succeed");
+
+    for (i, (g, e)) in x_buf.iter().zip(y_out.iter()).enumerate() {
+      assert_eq!(g, e, "in-place fir[{i}] = {g} must equal out-of-place {e}");
+    }
+  }
+
+  /// In-place `b.is_empty()` semantics: mirror [`lfilter_f64`]'s
+  /// `np.zeros_like`-equivalent by overwriting the input buffer with
+  /// zeros (the in-place equivalent of returning a fresh zero `Vec`).
+  #[test]
+  fn lfilter_f64_in_place_empty_b_zeros_buffer() {
+    let b: [f64; 0] = [];
+    let a: [f64; 1] = [1.0];
+    let mut x_buf: [f64; 4] = [1.0, 2.0, 3.0, 4.0];
+    lfilter_f64_in_place(&b, &a, &mut x_buf).expect("empty-b must succeed");
+    for (i, &v) in x_buf.iter().enumerate() {
+      assert_eq!(v, 0.0, "empty-b in-place must zero x_buf[{i}], got {v}");
+    }
+  }
+
+  /// In-place kernel must reject the same invalid inputs as
+  /// [`lfilter_f64`]: empty `a`, `a[0] == 0`. The sample-cap branch is
+  /// not exercised here (would require a multi-GB buffer) but its
+  /// presence in the kernel is verified by the existing
+  /// `integrated_loudness_rejects_oversized_total_elements` cap test
+  /// upstream.
+  #[test]
+  fn lfilter_f64_in_place_rejects_invalid_inputs() {
+    let mut x_buf: [f64; 2] = [1.0, 2.0];
+    assert!(matches!(
+      lfilter_f64_in_place(&[1.0_f64], &[], &mut x_buf),
+      Err(Error::Backend { .. })
+    ));
+    assert!(matches!(
+      lfilter_f64_in_place(&[1.0_f64], &[0.0_f64, 1.0], &mut x_buf),
+      Err(Error::Backend { .. })
+    ));
+  }
+
+  // ---- A3: BS.1770 K-weighted integrated loudness + normalize_loudness -----
+
+  /// Generate a `seconds`-long mono sine at `freq` Hz with amplitude `amp`
+  /// at `rate` samples/sec, as an `Array` of `Dtype::F32`.
+  fn sine_mono(freq: f64, amp: f32, rate: u32, seconds: f64) -> Array {
+    let n = (seconds * f64::from(rate)) as usize;
+    let mut buf: Vec<f32> = Vec::with_capacity(n);
+    let two_pi_freq = 2.0 * std::f64::consts::PI * freq;
+    let rate_f64 = f64::from(rate);
+    for i in 0..n {
+      let t = i as f64 / rate_f64;
+      buf.push(amp * (two_pi_freq * t).sin() as f32);
+    }
+    Array::from_slice::<f32>(&buf, &[n as i32]).unwrap()
+  }
+
+  /// Sanity: a 1 kHz sine well above 0 LUFS produces a finite (not -inf,
+  /// not NaN) integrated loudness above the absolute gate. This pins the
+  /// happy path of the full pipeline (K-weighting + block analysis + both
+  /// gates).
+  #[test]
+  fn integrated_loudness_sine_produces_finite_lufs() {
+    // 3 s of 1 kHz sine, amp = 0.5, at 48 kHz. The signal is well above
+    // -70 LUFS, so the absolute gate cannot drop every block, and a
+    // single-frequency sine has uniform per-block loudness so the relative
+    // gate keeps every block too.
+    let x = sine_mono(1000.0, 0.5, 48_000, 3.0);
+    let lufs = integrated_loudness(&x, 48_000, 0.4, 0.75).unwrap();
+    assert!(
+      lufs.is_finite(),
+      "integrated_loudness on a 1 kHz sine must be finite, got {lufs}"
+    );
+    assert!(
+      lufs > BS1770_ABSOLUTE_THRESHOLD_LUFS,
+      "1 kHz sine at amp=0.5 should be well above -70 LUFS (got {lufs})"
+    );
+  }
+
+  /// A 6 dB amplitude doubling raises integrated loudness by ~6 dB. This is
+  /// a relative parity check that exercises the K-weighting + per-block
+  /// mean-square pipeline end-to-end without needing to hardcode the
+  /// absolute LUFS value (which depends on the exact K-filter coefficients).
+  #[test]
+  fn integrated_loudness_scales_with_amplitude_squared() {
+    let rate = 48_000u32;
+    let x_lo = sine_mono(1000.0, 0.25, rate, 3.0);
+    let x_hi = sine_mono(1000.0, 0.5, rate, 3.0); // +6.02 dB
+    let l_lo = integrated_loudness(&x_lo, rate, 0.4, 0.75).unwrap();
+    let l_hi = integrated_loudness(&x_hi, rate, 0.4, 0.75).unwrap();
+    let delta = l_hi - l_lo;
+    // 20 log10(2) ≈ 6.02 LU. Allow ±0.05 LU for f32→f64 round-trip noise.
+    assert!(
+      (delta - 6.0206).abs() < 0.05,
+      "doubling amplitude (+6 dB) should add ~6 LU (got {delta} = {l_hi} - {l_lo})"
+    );
+  }
+
+  /// Round-trip: measure a signal's LUFS, normalize to a target, re-measure
+  /// — the re-measured value must match the target. This is the spec's
+  /// `normalize_loudness` parity test.
+  #[test]
+  fn normalize_loudness_round_trip_matches_target() {
+    let rate = 48_000u32;
+    let x = sine_mono(1000.0, 0.5, rate, 3.0);
+    let lufs_before = integrated_loudness(&x, rate, 0.4, 0.75).unwrap();
+    // EBU R128 broadcast target.
+    let target = -23.0_f64;
+    let normalized = normalize_loudness(&x, lufs_before, target).unwrap();
+    let lufs_after = integrated_loudness(&normalized, rate, 0.4, 0.75).unwrap();
+    // BS.1770 + normalize is linear in amplitude; the round-trip is exact
+    // modulo the f32 gain quantization on the multiply. Tight tolerance.
+    assert!(
+      (lufs_after - target).abs() < 0.01,
+      "normalize_loudness round-trip should hit target ±0.01 LUFS, \
+       got {lufs_after} (target {target}, before {lufs_before})"
+    );
+  }
+
+  /// Silence below the absolute gate produces `-inf` LUFS (the reference's
+  /// `np.log10(0.0) = -inf` behavior, mirrored). Asserts the absolute-gate
+  /// branch falls through correctly when no block survives.
+  #[test]
+  fn integrated_loudness_silence_returns_neg_inf() {
+    let rate = 48_000u32;
+    let n = (3.0 * f64::from(rate)) as usize;
+    let zeros = vec![0.0_f32; n];
+    let x = Array::from_slice::<f32>(&zeros, &[n as i32]).unwrap();
+    let lufs = integrated_loudness(&x, rate, 0.4, 0.75).unwrap();
+    assert!(
+      lufs == f64::NEG_INFINITY,
+      "silence should return -inf LUFS (got {lufs})"
+    );
+  }
+
+  /// 2-D stereo input (n_samples, 2) accepted; mono and stereo of the same
+  /// per-channel content produce identical LUFS (the channel gains for
+  /// channels 0 and 1 are both 1.0, so doubling the channel count with the
+  /// same content doubles the weighted-mean-square — i.e. adds ~3 LU). Pins
+  /// the 2-D layout (n_samples, n_channels), de-interleave path, and the
+  /// `channel_gains[0..2] = [1.0, 1.0]` literal.
+  #[test]
+  fn integrated_loudness_stereo_accepts_2d_and_adds_3lu() {
+    let rate = 48_000u32;
+    // Generate 3 s of mono sine, then build a stereo (n_samples, 2) Array
+    // with both channels identical to that mono signal.
+    let mono = sine_mono(1000.0, 0.5, rate, 3.0);
+    let mono_buf = mono.try_clone().unwrap().to_vec::<f32>().unwrap();
+    let n = mono_buf.len();
+    // Interleave: [s0_l, s0_r, s1_l, s1_r, ...]
+    let mut stereo_buf: Vec<f32> = Vec::with_capacity(n * 2);
+    for &s in &mono_buf {
+      stereo_buf.push(s);
+      stereo_buf.push(s);
+    }
+    let stereo = Array::from_slice::<f32>(&stereo_buf, &[n as i32, 2i32]).unwrap();
+
+    let lufs_mono = integrated_loudness(&mono, rate, 0.4, 0.75).unwrap();
+    let lufs_stereo = integrated_loudness(&stereo, rate, 0.4, 0.75).unwrap();
+    let delta = lufs_stereo - lufs_mono;
+    // Two identical channels with gain 1.0 each → weighted sum is 2x mono.
+    // 10 log10(2) ≈ 3.01 LU. Allow ±0.05 LU.
+    assert!(
+      (delta - 3.0103).abs() < 0.05,
+      "duplicating a mono signal to stereo (same content, gains [1, 1]) \
+       should add ~3 LU (got delta {delta} = {lufs_stereo} - {lufs_mono})"
+    );
+  }
+
+  /// Regression: the BS.1770 block count must use round-half-to-EVEN
+  /// (`np.round` parity), NOT half-away-from-zero `f64::round`. They
+  /// disagree on exact `*.5` quotients.
+  ///
+  /// With the default parameters (`block_size = 0.4 s`, `overlap = 0.75`,
+  /// so `step = 0.25`), a `0.65 s` clip at `48 kHz` (= `31200` samples)
+  /// gives a block-count quotient of exactly
+  ///   `(0.65 - 0.4) / (0.4 * 0.25) = 0.25 / 0.1 = 2.5`,
+  /// so `num_blocks = round(2.5) + 1`:
+  ///   - `round_ties_even(2.5) = 2` ⇒ **3 blocks** (the reference's count)
+  ///   - `f64::round(2.5)      = 3` ⇒ **4 blocks** (a parity bug)
+  ///
+  /// The block start/stride is `lower = floor(block_index * step *
+  /// block_size * rate)`, `upper = floor((block_index * step + 1) *
+  /// block_size * rate)`, so the four candidate blocks cover
+  ///   block 0 = `[0, 19200)`, block 1 = `[4800, 24000)`,
+  ///   block 2 = `[9600, 28800)`, block 3 = `[14400, 31200)`.
+  /// Crucially, samples `[28800, 31200)` (the last `0.05 s`) fall ONLY in
+  /// block 3. This test builds a signal that is pure silence everywhere
+  /// EXCEPT that tail, which carries a loud 1 kHz sine. A correct 3-block
+  /// analysis then sees only silent blocks — every block is below the
+  /// `-70 LUFS` absolute gate, so the integrated LUFS is `-inf`
+  /// (`10 * log10(0)`). A buggy 4-block analysis additionally measures
+  /// block 3, which is loud, yielding a finite integrated LUFS well above
+  /// `-70`. Asserting `-inf` therefore pins the block count at 3 and fails
+  /// loudly if the rounding ever regresses to `f64::round`.
+  #[test]
+  fn integrated_loudness_block_count_uses_round_ties_even() {
+    let rate = 48_000u32;
+    // 0.65 s @ 48 kHz = exactly 31200 samples (0.65 * 48000 is exact in
+    // f64); quotient is exactly 2.5 — the tie that round vs round_ties_even
+    // disagree on.
+    let n = 31_200usize;
+    debug_assert_eq!(n, (0.65_f64 * f64::from(rate)) as usize);
+    // Pure silence except the final 0.05 s ([28800, 31200)) — that span is
+    // covered ONLY by the would-be 4th block (block index 3).
+    let loud_start = 28_800usize;
+    let mut buf: Vec<f32> = vec![0.0_f32; n];
+    let two_pi_freq = 2.0 * std::f64::consts::PI * 1000.0;
+    let rate_f64 = f64::from(rate);
+    for (i, s) in buf.iter_mut().enumerate().skip(loud_start) {
+      let t = i as f64 / rate_f64;
+      *s = 0.5_f32 * (two_pi_freq * t).sin() as f32;
+    }
+    let x = Array::from_slice::<f32>(&buf, &[n as i32]).unwrap();
+
+    let lufs = integrated_loudness(&x, rate, 0.4, 0.75).unwrap();
+    // 3 blocks (tie-to-even): every block is silent → -inf.
+    // 4 blocks (half-away-from-zero, the bug): block 3 is loud → finite.
+    assert!(
+      lufs == f64::NEG_INFINITY,
+      "0.65 s clip @ 48 kHz must yield 3 blocks (round-ties-even); a silent \
+       signal with a loud tail only in the would-be 4th block must return \
+       -inf LUFS. Got {lufs} — a finite value means the block count \
+       regressed to 4 (f64::round instead of round_ties_even)"
+    );
+  }
+
+  /// Input shorter than `block_size * rate` must be rejected (matches the
+  /// reference's `Audio must have length greater than the block size`
+  /// raise).
+  #[test]
+  fn integrated_loudness_rejects_too_short_input() {
+    let rate = 48_000u32;
+    // 0.1 s @ 48 kHz = 4800 samples; block_size=0.4 needs 19200.
+    let x = sine_mono(1000.0, 0.5, rate, 0.1);
+    let res = integrated_loudness(&x, rate, 0.4, 0.75);
+    assert!(
+      matches!(res, Err(Error::Backend { .. })),
+      "audio shorter than block_size * rate must be rejected (got {res:?})"
+    );
+  }
+
+  /// 2-D input with `> 5` channels must be rejected (matches the
+  /// reference's `Audio must have five channels or less` raise).
+  #[test]
+  fn integrated_loudness_rejects_more_than_five_channels() {
+    let rate = 48_000u32;
+    let n = 24_000usize; // 0.5 s
+    let buf = vec![0.0_f32; n * 6];
+    let x = Array::from_slice::<f32>(&buf, &[n as i32, 6i32]).unwrap();
+    let res = integrated_loudness(&x, rate, 0.4, 0.75);
+    assert!(
+      matches!(res, Err(Error::Backend { .. })),
+      "audio with >5 channels must be rejected (got {res:?})"
+    );
+  }
+
+  /// 3-D input must be rejected (loudness is defined on (n_samples,) or
+  /// (n_samples, n_channels)).
+  #[test]
+  fn integrated_loudness_rejects_3d_input() {
+    let rate = 48_000u32;
+    let buf = vec![0.0_f32; 24_000];
+    let x = Array::from_slice::<f32>(&buf, &[100i32, 60i32, 4i32]).unwrap();
+    let res = integrated_loudness(&x, rate, 0.4, 0.75);
+    assert!(
+      matches!(res, Err(Error::Backend { .. })),
+      "3-D input must be rejected (got {res:?})"
+    );
+  }
+
+  /// Invalid `overlap` (out of [0, 1)) and `block_size <= 0` must be
+  /// rejected.
+  #[test]
+  fn integrated_loudness_rejects_invalid_block_params() {
+    let rate = 48_000u32;
+    let x = sine_mono(1000.0, 0.5, rate, 3.0);
+    // overlap = 1.0 — would divide by zero in `step = 1 - overlap`.
+    assert!(matches!(
+      integrated_loudness(&x, rate, 0.4, 1.0),
+      Err(Error::Backend { .. })
+    ));
+    // overlap < 0
+    assert!(matches!(
+      integrated_loudness(&x, rate, 0.4, -0.1),
+      Err(Error::Backend { .. })
+    ));
+    // block_size <= 0
+    assert!(matches!(
+      integrated_loudness(&x, rate, 0.0, 0.75),
+      Err(Error::Backend { .. })
+    ));
+    // rate == 0
+    assert!(matches!(
+      integrated_loudness(&x, 0, 0.4, 0.75),
+      Err(Error::Backend { .. })
+    ));
+  }
+
+  /// Total-element cap (`n_samples * n_channels`) must reject oversized 2-D
+  /// inputs BEFORE the `to_vec`. The previous revision capped only
+  /// `n_samples`, so a `(MAX_DECODED_SAMPLES, 5)` lazily-shaped input
+  /// would slip past the per-channel cap and then materialize
+  /// `5 * MAX_DECODED_SAMPLES` f32 samples (multi-GB) in `to_vec`. We use a
+  /// LAZY `Array::zeros` so nothing is materialized when the cap is
+  /// honored — asserting `Err` proves the cap fired BEFORE the to_vec
+  /// allocation. Both shapes:
+  /// - 1-D `(MAX_DECODED_SAMPLES + 1,)` — over the 1-channel cap, and
+  /// - 2-D `(MAX_DECODED_SAMPLES / 5 + 1, 5)` — over the 5-channel cap
+  ///   (per-channel count alone would NOT exceed the cap; total elements
+  ///   does).
+  ///
+  /// (Tests that USE the full cap would force a multi-GB allocation per
+  /// run; we test the rejection path, which is what bounds memory.)
+  #[test]
+  fn integrated_loudness_rejects_oversized_total_elements() {
+    let rate = 48_000u32;
+    // 1-D: per-channel count alone over the cap.
+    let lazy_mono =
+      Array::zeros::<f32>(&[(crate::audio::io::MAX_DECODED_SAMPLES + 1) as i32]).unwrap();
+    let res_mono = integrated_loudness(&lazy_mono, rate, 0.4, 0.75);
+    assert!(
+      matches!(res_mono, Err(Error::Backend { .. })),
+      "1-D input above the per-channel cap must be rejected (got {res_mono:?})"
+    );
+    // 2-D: per-channel BELOW the cap (would slip past a per-channel-only
+    // check) but TOTAL ELEMENTS above. With n_channels=5, per-channel
+    // n_samples = MAX_DECODED_SAMPLES / 5 + 1 < cap, but total =
+    // 5 * n_samples > cap.
+    let n_per_chan = crate::audio::io::MAX_DECODED_SAMPLES / 5 + 1;
+    let lazy_5ch = Array::zeros::<f32>(&[n_per_chan as i32, 5i32]).unwrap();
+    let res_5ch = integrated_loudness(&lazy_5ch, rate, 0.4, 0.75);
+    assert!(
+      matches!(res_5ch, Err(Error::Backend { .. })),
+      "2-D input where per-channel count fits but total elements does not \
+       must be rejected by the TOTAL-elements cap (got {res_5ch:?})"
+    );
+  }
+
+  /// Pathological `overlap` very close to 1 (e.g. `0.999_999_999_999`)
+  /// makes `step = 1 - overlap → ~1e-12` and `num_blocks ≈ duration /
+  /// (block_size * step) → trillions`, driving a multi-GB `mean_square`
+  /// reservation + gate-index collect for an otherwise-tiny signal. The
+  /// `MAX_LOUDNESS_BLOCK_BYTES` byte cap (64 MiB on the `f64` mean-
+  /// square matrix) and `MAX_LOUDNESS_WORK` visit cap (256 Mi sample-
+  /// visits on the per-block sum loop) together must reject this BEFORE
+  /// any `num_blocks`-scaled allocation OR the per-block loop runs. We
+  /// use a small signal (3 s @ 48 kHz, well under
+  /// [`MAX_LOUDNESS_SAMPLES`]) so the rejection is *purely* from the
+  /// pathological-overlap caps (not the sample cap). The overlap is
+  /// intentionally extreme — `0.999_999_999_999` makes `num_blocks ≈
+  /// 6.5e12` regardless of `n_channels`, so even mono (n_channels=1)
+  /// clears both caps by orders of magnitude. Asserting `Err` (not
+  /// panic, not OOM, not multi-minute timeout) proves the caps fire
+  /// up-front BEFORE the per-block loop.
+  #[test]
+  fn integrated_loudness_rejects_pathological_overlap() {
+    let rate = 48_000u32;
+    // 3 s of audio (way under MAX_DECODED_SAMPLES = 64 Mi samples).
+    // block_size = 0.4 s, overlap = 1 - 1e-12 ⇒ step ≈ 1e-12,
+    // num_blocks ≈ (3 - 0.4) / (0.4 * 1e-12) ≈ 6.5e12 — orders of
+    // magnitude above both new caps. The caps MUST fire BEFORE the
+    // mean_square allocation OR the per-block sum loop; if they did
+    // not, this would attempt a >=50 TB mean_square reservation and
+    // either OOM or take effectively forever.
+    let x = sine_mono(1000.0, 0.5, rate, 3.0);
+    let res = integrated_loudness(&x, rate, 0.4, 0.999_999_999_999);
+    assert!(
+      matches!(res, Err(Error::Backend { .. })),
+      "pathological overlap close to 1 must be rejected by the byte/work \
+       caps BEFORE any num_blocks-scaled allocation (got {res:?})"
+    );
+    // Same test with a STEREO input — proves the `n_channels` factor in
+    // the byte cap also catches it (a less-extreme overlap that produces
+    // num_blocks just under the cap for mono would exceed it for stereo).
+    let mono_buf = x.try_clone().unwrap().to_vec::<f32>().unwrap();
+    let n = mono_buf.len();
+    let mut stereo_buf: Vec<f32> = Vec::with_capacity(n * 2);
+    for &s in &mono_buf {
+      stereo_buf.push(s);
+      stereo_buf.push(s);
+    }
+    let stereo = Array::from_slice::<f32>(&stereo_buf, &[n as i32, 2i32]).unwrap();
+    let res_stereo = integrated_loudness(&stereo, rate, 0.4, 0.999_999_999_999);
+    assert!(
+      matches!(res_stereo, Err(Error::Backend { .. })),
+      "pathological-overlap stereo (byte cap factor n_channels) must be \
+       rejected (got {res_stereo:?})"
+    );
+  }
+
+  /// Regression: the *just-below-the-old-element-cap* case Codex flagged.
+  /// The previous revision capped `num_blocks * n_channels` against
+  /// `MAX_DECODED_SAMPLES = 64 Mi-elements` — but each cell is `f64`, so
+  /// `64 Mi cells * 8 B = 512 MiB` of actual `mean_square` allocation
+  /// passed the element-only cap. A near-1 overlap like `0.99999990`
+  /// on a tiny 3 s mono signal produces `num_blocks ≈ (3.0 - 0.4) /
+  /// (0.4 * 1e-7) ≈ 6.5e7` blocks, which sit JUST UNDER the old
+  /// 64 Mi-element cap (so the old guard would NOT reject and the
+  /// `try_reserve_exact` would attempt a ~520 MiB `mean_square` matrix
+  /// reservation followed by a per-block loop that re-sums 19,200
+  /// samples per block — multi-trillion sample visits, hours of CPU).
+  /// The new `MAX_LOUDNESS_BLOCK_BYTES` (64 MiB) cap rejects this case
+  /// at the byte-budget check BEFORE any allocation (block_bytes =
+  /// 6.5e7 * 1 * 8 = 520 MiB > 64 MiB); the visit cap would also catch
+  /// it (6.5e7 * 19200 = 1.25 trillion visits > 256 Mi). Asserting
+  /// `Err` in microseconds proves the byte/work caps fire up-front,
+  /// not the old elements-only cap.
+  #[test]
+  fn integrated_loudness_rejects_overlap_just_below_old_element_cap() {
+    let rate = 48_000u32;
+    // 3 s of audio = 144,000 samples — well below MAX_LOUDNESS_SAMPLES.
+    // overlap = 0.99999990 ⇒ step = 1e-7 ⇒ num_blocks ≈ 6.5e7. The OLD
+    // element cap was 64 Mi ≈ 6.7e7, so 6.5e7 was UNDER the old cap;
+    // the new byte cap (64 MiB / 8 B = 8 Mi cells) rejects num_blocks
+    // > 8 Mi for n_channels=1, and the work cap (256 Mi) rejects
+    // 6.5e7 * 19200 ≈ 1.25e12 visits — both fire well below 6.5e7.
+    let x = sine_mono(1000.0, 0.5, rate, 3.0);
+    let res = integrated_loudness(&x, rate, 0.4, 0.999_999_90);
+    assert!(
+      matches!(res, Err(Error::Backend { .. })),
+      "overlap=0.99999990 (under old elements-only cap; over new byte/work \
+       caps) must be rejected BEFORE allocation (got {res:?})"
+    );
+  }
+
+  /// Regression: the work cap MUST include `n_channels` (Codex review).
+  /// The per-block mean-square sum loop runs ONCE PER CHANNEL (the
+  /// per-channel streaming K-weighting loop), so the actual sample-visit
+  /// count is `num_blocks * block_samples * n_channels`. A prior revision
+  /// bounded the channel-less product alone, so a 5-channel pathological
+  /// case slipped through: `num_blocks ≈ 500_000, block_samples = 160,
+  /// n_channels = 5` gives a channel-less product of `8e7 < 256 Mi cap`
+  /// (would PASS the broken bound) BUT actual visits of `4e8 > 256 Mi`
+  /// (FAILS the corrected bound).
+  ///
+  /// We pick `rate = 16 kHz, block_size = 0.01 s` (⇒ `block_samples =
+  /// 160`), `n_samples = 161` (just over the block size so the
+  /// audio-length check passes), and an `overlap ≈ 1 - 1.25e-8` to land
+  /// `num_blocks ≈ 500_000` — comfortably under the byte cap
+  /// (`500_000 * 5 * 8 ≈ 19 MiB << 64 MiB`) so byte cap headroom is
+  /// not the rejecting cap; the rejection MUST come from the
+  /// n_channels-aware work cap. The byte and total-elements caps both
+  /// have wide headroom here (total elements = `161 * 5 = 805 << 64 Mi`).
+  ///
+  /// Asserts `Err`: pre-fix this would silently allow ~400 M sample-
+  /// visits across the per-block × per-channel loops (a multi-second
+  /// CPU spike on a small input); post-fix the work cap fires up-front
+  /// in microseconds.
+  #[test]
+  fn integrated_loudness_rejects_work_cap_only_when_n_channels_counted() {
+    let rate = 16_000u32;
+    let n_samples = 161usize;
+    let n_channels = 5usize;
+    // Interleaved 5-channel buffer of zeros — value doesn't matter,
+    // the cap fires BEFORE the per-block loop reads any samples.
+    let buf = vec![0.0_f32; n_samples * n_channels];
+    let x = Array::from_slice::<f32>(&buf, &[n_samples as i32, n_channels as i32]).unwrap();
+    // overlap chosen so num_blocks ≈ 500_000:
+    //   step = 1 - overlap = 1.25e-8
+    //   num_blocks = round((duration - bs) / (bs * step)) + 1
+    //              = round(6.25e-5 / (0.01 * 1.25e-8)) + 1
+    //              ≈ round(500_000) + 1 ≈ 500_001
+    //
+    // Channel-less work product (broken bound):
+    //   500_001 * 160 ≈ 8.0e7 < MAX_LOUDNESS_WORK (256 Mi ≈ 2.68e8) → PASSES (defect)
+    // n_channels-aware work product (corrected bound):
+    //   500_001 * 160 * 5 ≈ 4.0e8 > MAX_LOUDNESS_WORK              → REJECTS (fix)
+    // Byte cap (independent, must NOT be the rejecting cap):
+    //   500_001 * 5 * 8 ≈ 20 MB << MAX_LOUDNESS_BLOCK_BYTES (64 MiB) → PASSES
+    let res = integrated_loudness(&x, rate, 0.01, 0.999_999_987_5);
+    assert!(
+      matches!(res, Err(Error::Backend { .. })),
+      "5-channel input with num_blocks * block_samples just under the cap \
+       but num_blocks * block_samples * n_channels above must be REJECTED \
+       by the n_channels-aware work cap (got {res:?})"
+    );
+    // Verify the rejection actually comes from the WORK cap (not the
+    // byte cap and not the total-elements cap), so a future refactor that
+    // accidentally weakens the work cap surfaces here rather than passing
+    // because some other cap caught the case.
+    let msg = match res {
+      Err(Error::Backend { message }) => message,
+      _ => unreachable!(),
+    };
+    assert!(
+      msg.contains("total sample-visit work") && msg.contains("n_channels=5"),
+      "rejection must come from the n_channels-aware work cap (got: {msg})"
+    );
+  }
+
+  /// LUFS reference-parity test: a 1 kHz sine of known amplitude has a
+  /// well-defined BS.1770 integrated loudness governed by the closed form
+  /// `LUFS = -0.691 + 10 * log10(|K(f)|^2 * a_peak^2 / 2)` where `K(f)` is
+  /// the K-weighting filter response at frequency `f`. For the BS.1770
+  /// K-weighting (high-shelf +4 dB / Q=1/sqrt(2) / fc=1500 Hz, then
+  /// high-pass Q=0.5 / fc=38 Hz) evaluated analytically at 1 kHz / 48 kHz
+  /// (`z = exp(j * 2π * 1000 / 48000)`):
+  ///
+  /// ```text
+  ///   |K(1000)|^2 ≈ 1.16313337638011         (+0.6563 dB shelf gain)
+  ///   LUFS @ amp=0.5
+  ///     = -0.691 + 10*log10(|K|^2 * 0.5^2 / 2)
+  ///     = -0.691 + 10*log10(0.14539...)
+  ///     ≈ -9.0656046890608
+  /// ```
+  ///
+  /// The f64-end-to-end K-weighting kernel (no intermediate f32 cast
+  /// between the two biquad stages) should produce a value within tight
+  /// tolerance of the theoretical -9.0656. Before the f64-kernel split the
+  /// stage-boundary f32 cast dropped ~16 bits of precision between
+  /// biquads, biasing this absolute value (and gate decisions near the
+  /// absolute/relative thresholds). We assert ±0.05 LUFS — a tolerance
+  /// the previously-f32-between-stages path could overshoot for short
+  /// signals near the gate boundaries, and which the new f64 path
+  /// comfortably meets.
+  #[test]
+  fn integrated_loudness_one_khz_sine_matches_theoretical() {
+    let rate = 48_000u32;
+    let amp = 0.5_f32;
+    // 3 s of 1 kHz sine — long enough to give plenty of blocks above
+    // both gates with a uniform per-block loudness, so the integrated
+    // value is essentially the per-block loudness (no gating bias).
+    let x = sine_mono(1000.0, amp, rate, 3.0);
+    let lufs = integrated_loudness(&x, rate, 0.4, 0.75).unwrap();
+    // Theoretical value computed via the analytic evaluation of the two
+    // K-weighting biquads at `z = exp(j * 2π * 1000 / 48000)` (see the
+    // docstring above for the exact algebra). The K-weighting input
+    // signal is `amp * sin(2π * 1000 * t)` whose continuous mean-square
+    // is `amp^2 / 2`; after K-weighting the per-block mean-square is
+    // `|K|^2 * amp^2 / 2`, and the BS.1770 reduction is
+    // `-0.691 + 10*log10(mean_square)`.
+    let theoretical = -9.0656046890608_f64;
+    assert!(
+      (lufs - theoretical).abs() < 0.05,
+      "1 kHz sine @ amp=0.5 should be within ±0.05 LUFS of theoretical \
+       {theoretical} (got {lufs}, diff {})",
+      (lufs - theoretical).abs()
+    );
+    // Also: the f64-end-to-end kernel keeps the round-trip exact within
+    // 0.005 LUFS (tighter than the previous f32-between-stages 0.01
+    // tolerance for `normalize_loudness_round_trip_matches_target`).
+    let normalized = normalize_loudness(&x, lufs, -23.0).unwrap();
+    let lufs_after = integrated_loudness(&normalized, rate, 0.4, 0.75).unwrap();
+    assert!(
+      (lufs_after - (-23.0)).abs() < 0.005,
+      "f64-end-to-end K-weighting must yield a tighter round-trip (±0.005 \
+       LUFS), got {lufs_after} (target -23.0, before {lufs})"
+    );
+  }
+
+  /// `normalize_loudness` with a non-finite (NaN/+-inf) input or target
+  /// loudness must be rejected (the reference would propagate a NaN/inf
+  /// gain silently corrupting downstream samples).
+  #[test]
+  fn normalize_loudness_rejects_non_finite_params() {
+    let rate = 48_000u32;
+    let x = sine_mono(1000.0, 0.5, rate, 1.0);
+    assert!(matches!(
+      normalize_loudness(&x, f64::NAN, -23.0),
+      Err(Error::Backend { .. })
+    ));
+    assert!(matches!(
+      normalize_loudness(&x, -10.0, f64::INFINITY),
+      Err(Error::Backend { .. })
+    ));
+    assert!(matches!(
+      normalize_loudness(&x, f64::NEG_INFINITY, -23.0),
+      Err(Error::Backend { .. })
+    ));
+  }
+
+  /// `normalize_loudness` with `target == input` is a no-op (gain = 1.0).
+  #[test]
+  fn normalize_loudness_identity_when_target_eq_input() {
+    let rate = 48_000u32;
+    let x = sine_mono(1000.0, 0.5, rate, 1.0);
+    let original = x.try_clone().unwrap().to_vec::<f32>().unwrap();
+    let y = normalize_loudness(&x, -10.0, -10.0).unwrap();
+    let result = y.try_clone().unwrap().to_vec::<f32>().unwrap();
+    assert_eq!(result.len(), original.len());
+    // gain = 10^0 = 1.0; multiply by 1.0 is identity even in f32.
+    for (i, (g, e)) in result.iter().zip(original.iter()).enumerate() {
+      assert!((g - e).abs() < 1e-7, "identity[{i}]: got {g}, want {e}");
+    }
+  }
+
+  /// `bs1770_biquad_coefficients` produces `a[0] == 1.0` after the
+  /// normalization (the reference divides by `a0` at construction). Sanity
+  /// check the biquad shape directly so a coefficient regression surfaces
+  /// here, not 200 LOC downstream in `integrated_loudness`.
+  #[test]
+  fn biquad_coefficients_normalize_a0_to_one() {
+    let (_b, a) = bs1770_biquad_coefficients(
+      4.0,
+      1.0 / std::f64::consts::SQRT_2,
+      1500.0,
+      48_000.0,
+      BiquadKind::HighShelf,
+    );
+    assert!(
+      (a[0] - 1.0).abs() < 1e-15,
+      "high-shelf a[0] must normalize to 1.0, got {}",
+      a[0]
+    );
+    let (_b, a) = bs1770_biquad_coefficients(0.0, 0.5, 38.0, 48_000.0, BiquadKind::HighPass);
+    assert!(
+      (a[0] - 1.0).abs() < 1e-15,
+      "high-pass a[0] must normalize to 1.0, got {}",
+      a[0]
     );
   }
 }
