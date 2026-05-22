@@ -220,8 +220,19 @@ impl LayerNorm {
 /// step) or break the divisibility (silent activation corruption). This
 /// mirrors swift's `public let groupCount` / `public let dimensions`
 /// immutability without giving up the constructor's validation.
-/// `weight`/`bias`/`eps`/`pytorch_compatible` stay `pub` — they don't
-/// carry the modulo invariant.
+/// `eps`/`pytorch_compatible` stay `pub` — they don't carry an invariant.
+///
+/// `affine` is a single private `Option<(weight, bias)>` exposed via the
+/// [`affine`](Self::affine) read-only accessor. mlx's `nn.GroupNorm` has
+/// one `affine: bool` toggle — `weight` and `bias` are created *together*
+/// inside `if affine:` (both or neither), and `_extra_repr` reports
+/// `affine` as the single `'weight' in self` predicate. Two independent
+/// `Option<Array>` fields would make the invalid `(Some, None)` /
+/// `(None, Some)` partial states representable: a caller could construct
+/// the layer then set only one, and `forward` would *silently* drop the
+/// lone parameter (wrong activations, no error). The single-`Option`
+/// tuple makes a partial affine a compile-time impossibility, for the
+/// same both-or-none invariant reason `num_groups`/`dims` are private.
 ///
 /// Two grouping orders, matching the references:
 ///
@@ -260,11 +271,14 @@ pub struct GroupNorm {
   /// same modulo-invariant reason as [`Self::num_groups`]; read via
   /// [`Self::dims`].
   dims: i32,
-  /// Optional per-feature affine scale of shape `(dims,)`. `None` ⇒
-  /// `affine=False` in the references.
-  pub weight: Option<Array>,
-  /// Optional per-feature affine shift of shape `(dims,)`.
-  pub bias: Option<Array>,
+  /// Affine parameters: `Some((weight, bias))` when `affine = true`,
+  /// `None` when `affine = false`. Both tensors are shape `(dims,)`. A
+  /// SINGLE `Option` of the *pair* (not two independent `Option`s) so the
+  /// invalid `(Some, None)` / `(None, Some)` partial state is
+  /// unrepresentable — mlx's `nn.GroupNorm` creates `weight` and `bias`
+  /// together inside `if affine:`. PRIVATE so the both-or-none invariant
+  /// can't be broken post-construction; read via [`Self::affine`].
+  affine: Option<(Array, Array)>,
   /// Variance floor inside the sqrt (references default `1e-5`).
   pub eps: f32,
   /// `true` selects the pytorch-grouping path (see struct docs).
@@ -285,11 +299,12 @@ impl GroupNorm {
   /// silently corrupting activations).
   ///
   /// `affine = true` materializes the references' `weight = ones((dims,))`
-  /// and `bias = zeros((dims,))` (a small fallible alloc), so this is
-  /// `Result<Self>`. `affine = false` skips the alloc and leaves both
-  /// fields `None`. `dims` is stored on the struct unconditionally
-  /// (matching the references) and is checked against the input's last
-  /// axis inside [`Self::forward`].
+  /// and `bias = zeros((dims,))` (a small fallible alloc) into the single
+  /// `Some((weight, bias))` field, so this is `Result<Self>`.
+  /// `affine = false` skips the alloc and leaves the field `None`. `dims`
+  /// is stored on the struct unconditionally (matching the references)
+  /// and is checked against the input's last axis inside
+  /// [`Self::forward`].
   pub fn new(
     num_groups: i32,
     dims: i32,
@@ -314,22 +329,21 @@ impl GroupNorm {
         ),
       });
     }
-    let (weight, bias) = if affine {
+    // `weight` and `bias` are created together (both or neither),
+    // matching mlx's `if affine:` block — the single `Option` of the pair
+    // makes a partial affine unrepresentable.
+    let affine = if affine {
       // `dims > 0` guaranteed above ⇒ `usize::try_from` cannot fail; the
       // `expect` documents the invariant rather than re-erroring.
       let d = usize::try_from(dims).expect("dims > 0 guarded above");
-      (
-        Some(Array::ones::<f32>(&(d,))?),
-        Some(Array::zeros::<f32>(&(d,))?),
-      )
+      Some((Array::ones::<f32>(&(d,))?, Array::zeros::<f32>(&(d,))?))
     } else {
-      (None, None)
+      None
     };
     Ok(Self {
       num_groups,
       dims,
-      weight,
-      bias,
+      affine,
       eps,
       pytorch_compatible,
     })
@@ -358,6 +372,19 @@ impl GroupNorm {
     self.dims
   }
 
+  /// Affine parameters as `Some((&weight, &bias))` when this GroupNorm
+  /// was built with `affine = true`, `None` otherwise.
+  ///
+  /// Read-only accessor for the private `affine` field. The field is
+  /// private — and a single `Option` of the *pair* rather than two
+  /// independent `Option`s — so the invalid partial-affine state
+  /// (`weight` set but `bias` unset, or vice versa) can be neither
+  /// constructed nor mutated into. `weight` and `bias` are always both
+  /// present or both absent, matching mlx's `if affine:` block.
+  pub fn affine(&self) -> Option<(&Array, &Array)> {
+    self.affine.as_ref().map(|(w, b)| (w, b))
+  }
+
   /// Apply GroupNorm to `x`. Dispatches to the default or pytorch path
   /// based on [`pytorch_compatible`](Self::pytorch_compatible), then
   /// applies the optional affine `weight * x + bias`. Returns a new lazy
@@ -368,12 +395,17 @@ impl GroupNorm {
     } else {
       self.group_norm(x)?
     };
-    match (&self.weight, &self.bias) {
-      (Some(w), Some(b)) => {
+    // `Some((w, b))` ⇒ scale + shift; `None` ⇒ pure normalization. The
+    // single `Option<(Array, Array)>` field has no partial arm — a lone
+    // weight or bias is unrepresentable, so the previous silent-drop bug
+    // (`(Some, None)` falling through to `_ => Ok(normalized)`) cannot
+    // occur.
+    match &self.affine {
+      Some((w, b)) => {
         let scaled = ops::arithmetic::multiply(w, &normalized)?;
         ops::arithmetic::add(&scaled, b)
       }
-      _ => Ok(normalized),
+      None => Ok(normalized),
     }
   }
 
@@ -860,28 +892,66 @@ mod tests {
   }
 
   #[test]
-  fn group_norm_affine_applies_weight_and_bias() {
-    // affine=true with weight=2*ones, bias=ones should yield 2*unaffine + 1.
+  fn group_norm_affine_true_applies_scale_and_shift() {
+    // Regression: affine=true output == normalized * weight + bias, where
+    // `normalized` is the affine=false (pure-normalization) result and
+    // `(weight, bias)` is the pair the `affine()` accessor exposes. The
+    // constructor materializes the references' `(ones, zeros)`, so this
+    // also pins that the default affine is the identity on `normalized`.
     let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(1, 4)).unwrap();
     let plain = GroupNorm::new(2, 4, 1e-5, false, false).unwrap();
-    let mut affine = GroupNorm::new(2, 4, 1e-5, true, false).unwrap();
-    // Replace the default ones/zeros with weight=2, bias=1.
-    affine.weight = Some(Array::full::<f32>(&(4,), 2.0).unwrap());
-    affine.bias = Some(Array::ones::<f32>(&(4,)).unwrap());
-    let mut p = plain.forward(&x).unwrap();
+    let affine = GroupNorm::new(2, 4, 1e-5, true, false).unwrap();
+    let mut normalized = plain.forward(&x).unwrap();
     let mut a = affine.forward(&x).unwrap();
-    let pv = p.to_vec::<f32>().unwrap();
+    let normalized_v = normalized.to_vec::<f32>().unwrap();
     let av = a.to_vec::<f32>().unwrap();
-    let want: Vec<f32> = pv.iter().map(|v| 2.0 * v + 1.0).collect();
-    assert!(vclose(&av, &want));
+    // affine=true output == normalized * weight + bias.
+    let (w, b) = affine.affine().expect("affine=true ⇒ Some");
+    let scaled = ops::arithmetic::multiply(w, &normalized).unwrap();
+    let mut want = ops::arithmetic::add(&scaled, b).unwrap();
+    assert!(vclose(&av, &want.to_vec::<f32>().unwrap()));
+    // default (ones, zeros) ⇒ the affine is the identity on `normalized`.
+    assert!(vclose(&av, &normalized_v));
+  }
+
+  #[test]
+  fn group_norm_affine_false_is_pure_normalization() {
+    // affine=false ⇒ `affine()` is None ⇒ `forward` takes the `None` arm
+    // and returns the pure normalized result (no scale, no shift). Pinned
+    // against `group_norm_affine_true_applies_scale_and_shift`, which
+    // asserts the affine=false output is exactly the `normalized` term.
+    let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(1, 4)).unwrap();
+    let gn = GroupNorm::new(2, 4, 1e-5, false, false).unwrap();
+    assert!(gn.affine().is_none());
+    let mut y = gn.forward(&x).unwrap();
+    let v = y.to_vec::<f32>().unwrap();
+    assert_eq!(v.len(), 4);
+    assert!(v.iter().all(|x| x.is_finite()));
+  }
+
+  /// affine is a single both-or-none `Option<(weight, bias)>`:
+  /// `affine=true` ⇒ `affine()` is `Some`, `affine=false` ⇒ `None`. A
+  /// partial affine (lone weight or lone bias) is a compile-time
+  /// impossibility — the field is private and holds the pair, not two
+  /// independent `Option`s, so `(Some, None)` / `(None, Some)` cannot be
+  /// constructed or mutated into (the old code had a silent
+  /// `_ => Ok(normalized)` drop for exactly those states).
+  #[test]
+  fn group_norm_affine_is_both_or_none_by_construction() {
+    let with_affine = GroupNorm::new(2, 4, 1e-5, true, false).unwrap();
+    assert!(with_affine.affine().is_some());
+    let no_affine = GroupNorm::new(2, 4, 1e-5, false, false).unwrap();
+    assert!(no_affine.affine().is_none());
+    // (compile-fail) `with_affine.affine = Some((w, ...))` with only a
+    // weight is impossible: the field is private AND its type is
+    // `Option<(Array, Array)>`, so a lone parameter has no representation.
   }
 
   #[test]
   fn group_norm_default_constructor_no_affine() {
-    // affine=false ⇒ weight/bias are None (no allocation).
+    // affine=false ⇒ the affine field is None (no allocation).
     let gn = GroupNorm::new(2, 4, 1e-5, false, false).unwrap();
-    assert!(gn.weight.is_none());
-    assert!(gn.bias.is_none());
+    assert!(gn.affine().is_none());
     assert!(!gn.pytorch_compatible);
     assert_eq!(gn.num_groups(), 2);
   }
@@ -889,12 +959,11 @@ mod tests {
   #[test]
   fn group_norm_default_constructor_affine_allocates() {
     let gn = GroupNorm::new(2, 4, 1e-5, true, false).unwrap();
-    assert!(gn.weight.is_some());
-    assert!(gn.bias.is_some());
-    let mut w = gn.weight.unwrap();
-    let mut b = gn.bias.unwrap();
+    let (w, b) = gn.affine().expect("affine=true ⇒ Some");
     assert_eq!(w.shape(), vec![4]);
     assert_eq!(b.shape(), vec![4]);
+    let mut w = w.try_clone().unwrap();
+    let mut b = b.try_clone().unwrap();
     assert_eq!(w.to_vec::<f32>().unwrap(), vec![1.0; 4]);
     assert_eq!(b.to_vec::<f32>().unwrap(), vec![0.0; 4]);
   }
@@ -1053,8 +1122,7 @@ mod tests {
     let gn = GroupNorm::new(2, 4, 1e-5, false, false).unwrap();
     assert_eq!(gn.dims(), 4);
     assert_eq!(gn.num_groups(), 2);
-    assert!(gn.weight.is_none());
-    assert!(gn.bias.is_none());
+    assert!(gn.affine().is_none());
   }
 
   /// Forward rejects a config/checkpoint dim mismatch: construct with
