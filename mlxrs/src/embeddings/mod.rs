@@ -10,10 +10,13 @@
 //! helpers operate on the hidden states produced by an embedding model; the
 //! [`EmbeddingModel`](crate::embeddings::EmbeddingModel) trait + the
 //! [`encode`](crate::embeddings::encode()) entry add the orchestration
-//! (tokenize → pad + mask → forward → pool → normalize). Concrete model
-//! architectures, per-architecture loaders, model-id registries, ColVision,
-//! and `load` are added per-usecase and are out of scope here (no-model-arch
-//! rule).
+//! (tokenize → pad + mask → forward → pool → normalize). The local
+//! load-factory ([`crate::embeddings::factory`] — `load` + a `model_type`
+//! [`EmbeddingModelTypeRegistry`](crate::embeddings::EmbeddingModelTypeRegistry))
+//! turns a local model directory into a constructed model + tokenizer +
+//! pooling-config bundle. Concrete model architectures and ColVision are added
+//! per-usecase and are out of scope here (no-model-arch rule); the registry is
+//! the extension point those per-usecase architectures register into.
 //!
 //! ## Conventions
 //! - `token_embeddings`: `(batch, seq_len, hidden)` float array.
@@ -83,6 +86,7 @@
 
 pub mod config;
 pub mod encode;
+pub mod factory;
 pub mod fast;
 pub mod model;
 pub mod normalize;
@@ -126,6 +130,11 @@ pub use config::{
   pooling_from_st_config_str,
 };
 pub use encode::{EncodeConfig, encode};
+pub use factory::{
+  EmbeddingIdentifier, EmbeddingModelConfiguration, EmbeddingModelConstructor,
+  EmbeddingModelTypeRegistry, EmbeddingWeights, LoadedEmbeddingContext, LoadedEmbeddingModel, load,
+  remap_model_type,
+};
 pub use fast::{layer_norm, rms_norm};
 pub use model::{EmbeddingModel, EmbeddingModelOutput};
 pub use normalize::{
