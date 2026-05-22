@@ -102,22 +102,21 @@
 //!   "Y" requires every backing allocation under our direct control
 //!   to route through `try_reserve_exact` (or an equivalent fallible
 //!   primitive). "N" means image-crate / fast_image_resize-internal
-//!   allocations (`to_rgba8` / `rotate90` / `ImageBuffer::new` /
-//!   `Image::new`) may panic-abort on allocator pressure even though
-//!   the byte count itself is bounded.
+//!   allocations (`rotate90` / `ImageBuffer::new`) may panic-abort on
+//!   allocator pressure even though the byte count itself is bounded.
 //!
 //! | Site                                          | Scale         | Caller fn                | Bounded-memory | Recoverable-OOM | Notes                                       |
 //! |-----------------------------------------------|---------------|--------------------------|----------------|-----------------|---------------------------------------------|
 //! | `apply_orientation_fallible` u8 variants (Rotate90/270/+FlipH on Luma8/LumaA8/Rgb8/Rgba8) | source pixels | `load_image` →`Result` | Y (`MAX_DECODED_IMAGE_BYTES`) | **Y** | **FIXED (R5):** manual rotate over `try_reserve_exact`-backed buffer — no second alloc, no probe race |
 //! | `apply_orientation_fallible` non-u8 variants (Luma16/LumaA16/Rgb16/Rgba16/Rgb32F/Rgba32F + rotates) | source pixels | `load_image` →`Result` | Y (`MAX_DECODED_IMAGE_BYTES`) | **Y** | **FIXED (R6):** covered by manual generic rotate via `try_reserve_exact` over `T: Copy` — 16-bit PNGs (`Luma16`/`LumaA16`/`Rgb16`/`Rgba16` per image-rs PNG decoder) and 32-bit-float `DynamicImage` inputs (`Rgb32F`/`Rgba32F`) now route through the same fallible per-element-type buffer path as u8 |
 //! | `apply_orientation_fallible` (NoTransforms/Flip/Rot180, all variants) | in-place      | `load_image` →`Result`   | Y (in-place)   | Y (no alloc)    | Upstream `*_in_place` path — zero allocation |
-//! | `img.to_rgba8()` (in `resize`)                | source pixels | `resize` →`Result<DynamicImage>` | Y (`MAX_DECODED_IMAGE_BYTES` via `load_image`) | N (image-rs infallible clone) | RESIDUAL: source-sized clone is an image-crate-internal `Vec::clone`; byte count bounded by the decoder cap, abort only at a true ≤512 MiB system OOM |
-//! | `fast_image_resize::images::Image::new` (in `resize`) | target pixels (untrusted loaded config) | `resize` →`Result<DynamicImage>` | Y (`MAX_DECODED_IMAGE_BYTES` via `resize`'s target guard) | N (fast_image_resize infallible alloc) | **GUARDED (Codex review):** `resize` now validates the untrusted loaded-config target (`height*width*4` ≤ 512 MiB, non-zero, no overflow) BEFORE this alloc and returns `Err` instead of aborting; residual abort only at a true ≤512 MiB system OOM |
+//! | `resize` source RGBA buffer (`try_reserve_exact` + `as_rgba8` fast path / per-pixel `dynamic_image_rgba_pixel`) | source pixels | `resize` →`Result<DynamicImage>` | Y (`MAX_DECODED_IMAGE_BYTES` via `load_image`) | **Y** | **FIXED (Codex review R2):** replaced the infallible `img.to_rgba8()` clone with a `try_reserve_exact`-backed buffer filled manually (borrowed RGBA8 fast path or per-pixel projection), wrapped zero-copy in `fast_image_resize::ImageRef`; allocator failure → `Error::OutOfMemory` |
+//! | `resize` destination buffer (`try_reserve_exact` + zero-fill → `Image::from_vec_u8`) | target pixels (untrusted loaded config) | `resize` →`Result<DynamicImage>` | Y (`MAX_DECODED_IMAGE_BYTES` via `resize`'s target guard) | **Y** | **FIXED (Codex review R2):** replaced the infallible `fast_image_resize::Image::new` (backed by `vec![0; …]`) with a `try_reserve_exact` + zero-fill `Vec<u8>` handed to the fallible `Image::from_vec_u8`; the target guard still rejects zero/overflow/>512 MiB BEFORE the reservation; allocator failure → `Error::OutOfMemory` |
 //! | `img.clone()` (early-return in `center_crop`) | source pixels | `center_crop` →`DynamicImage` | Y (via `load_image` cap) | N (image-rs infallible `Vec::clone`) | OUT-OF-SCOPE: `-> DynamicImage` by reference parity |
 //! | `img.crop_imm(...)` (in `center_crop`)        | min(source, target) | `center_crop` →`DynamicImage` | Y (≤ source bound) | N | OUT-OF-SCOPE: same parity rationale |
 //! | `Vec::<u8>::try_reserve_exact` canvas (in `pad_to_square`) | target square (bounded) | `pad_to_square` →`Result` | Y (`MAX_DECODED_IMAGE_BYTES`) | Y (`try_reserve_exact` + `Error::OutOfMemory`) | FALLIBLE (R3) |
 //! | `Vec::<f32>::try_reserve_exact` buf (in `image_to_array`) | source pixels (bounded by `load_image` cap) | `image_to_array` →`Result` | Y (via `load_image` cap) | Y (`try_reserve_exact` + `Error::OutOfMemory`) | FALLIBLE (R3) |
-//! | `dynamic_image_rgb_pixel` per-pixel `get_pixel` | none (stack `Rgba<u8>` only) | shared helper | Y (zero alloc) | Y (no alloc) | OK — no full-image intermediate alloc |
+//! | `dynamic_image_rgb_pixel` / `dynamic_image_rgba_pixel` per-pixel `get_pixel` | none (stack `Rgb`/`Rgba<u8>` only) | shared helpers | Y (zero alloc) | Y (no alloc) | OK — no full-image intermediate alloc |
 //! | mlx `Array` ops (rescale/normalize/patchify/preprocess) | output array | each `-> Result<Array>` | Y (output-shape) | Y (mlx backend `Result`) | OK — mlx backend allocator errors surface via `Array::*` `Result` |
 //!
 //! **Class closure invariant.** This module guarantees
@@ -127,26 +126,32 @@
 //! [`ImageProcessorConfig::size`]) is capped against the same ceiling
 //! by [`resize`]'s target-dimension guard; no quadratic or unbounded
 //! growth is possible from hostile input OR hostile config.
-//! **Recoverable-OOM** is guaranteed for every allocation under our
+//! **Recoverable-OOM** is now guaranteed for every allocation under our
 //! direct control: [`pad_to_square`]'s canvas, [`image_to_array`]'s
-//! f32 buffer, and the rotate buffer for every `DynamicImage` element
-//! type (u8 / u16 / f32) in `apply_orientation_fallible` (private
-//! helper called by [`load_image`]) — the generic-rotate path covers
-//! 16-bit-PNG-derived `Luma16`/`LumaA16`/`Rgb16`/`Rgba16` (image-rs
-//! 0.25's PNG decoder emits 16-bit variants for `BitDepth::Sixteen`
-//! PNG inputs) and caller-supplied `Rgb32F`/`Rgba32F` inputs.
-//! [`resize`] additionally rejects an over-budget / zero / overflowing
-//! target as a typed [`Error::ShapeMismatch`] BEFORE allocating
-//! (Codex review: its target now flows from an untrusted on-disk
-//! config). The remaining sites (image-crate-internal `to_rgba8` /
-//! `Vec::clone` and `fast_image_resize::Image::new`) keep an
-//! infallible `Vec` allocator that aborts on allocator pressure, but
-//! their byte counts are now ALL bounded ≤512 MiB (source by the
-//! decoder cap, destination by the `resize` guard), so the only abort
-//! path left is a genuine system-wide OOM at a ≤512 MiB request —
-//! their public docstrings document this residual contract. Their
-//! signatures stay `-> DynamicImage` per
-//! `feedback_match_official_binding_design`.
+//! f32 buffer, BOTH of [`resize`]'s source RGBA and destination buffers
+//! (Codex review R2 — see below), and the rotate buffer for every
+//! `DynamicImage` element type (u8 / u16 / f32) in
+//! `apply_orientation_fallible` (private helper called by [`load_image`])
+//! — the generic-rotate path covers 16-bit-PNG-derived
+//! `Luma16`/`LumaA16`/`Rgb16`/`Rgba16` (image-rs 0.25's PNG decoder
+//! emits 16-bit variants for `BitDepth::Sixteen` PNG inputs) and
+//! caller-supplied `Rgb32F`/`Rgba32F` inputs. [`resize`] also rejects an
+//! over-budget / zero / overflowing target as a typed
+//! [`Error::ShapeMismatch`] BEFORE allocating (its target now flows from
+//! an untrusted on-disk config), then materializes BOTH its source RGBA
+//! buffer (formerly an infallible `img.to_rgba8()` clone) and its
+//! destination buffer (formerly an infallible
+//! `fast_image_resize::Image::new`, backed by `vec![0; …]`) via
+//! `try_reserve_exact` + a fallible `Image::from_vec_u8` constructor — so
+//! a just-under-cap hostile target can no longer force a ~512 MiB
+//! infallible alloc, and `resize`'s `Result` signature is honest. The
+//! ONLY remaining sites that keep an infallible image-crate `Vec`
+//! allocator are the `-> DynamicImage` by-reference-parity helpers
+//! (`center_crop`'s early-return `img.clone()` / `crop_imm`), whose byte
+//! counts are still bounded ≤512 MiB (source by the decoder cap) so the
+//! only abort path is a genuine system-wide OOM at a ≤512 MiB request;
+//! their public docstrings document this residual, and their signatures
+//! stay `-> DynamicImage` per `feedback_match_official_binding_design`.
 
 use crate::{
   Dtype,
@@ -842,7 +847,7 @@ fn rotate_buf<T: Copy + Default>(
 /// LOADED `preprocessor_config.json` / `processor_config.json` (see
 /// [`crate::vlm::load`]), which is UNTRUSTED on-disk input. A
 /// hostile/malformed config with an enormous `size` would otherwise
-/// drive the `img.to_rgba8()` clone and the
+/// drive the source RGBA materialization and the
 /// `fast_image_resize::images::Image::new(width, height, U8x4)`
 /// destination alloc to panic-abort the process — taking down image
 /// AND video preprocessing on the first request. We therefore
@@ -850,31 +855,47 @@ fn rotate_buf<T: Copy + Default>(
 /// surface an over-budget / zero / overflow target as a recoverable
 /// `Err` instead of an abort.
 ///
-/// **Allocation contract.** Byte counts are bounded on both ends: the
-/// source is bounded by [`MAX_DECODED_IMAGE_BYTES`] via [`load_image`]'s
-/// decoder cap, and the destination is now bounded by the same
-/// [`MAX_DECODED_IMAGE_BYTES`] ceiling enforced on `height * width * 4`
-/// by the guard below (mirroring [`pad_to_square`]'s canvas gate). The
-/// two `image` / `fast_image_resize`-internal allocations
-/// (`to_rgba8` clone, `Image::new` destination) are still infallible
-/// `Vec` allocators that abort on allocator pressure, but the byte
-/// count they see can no longer be driven past 512 MiB by a hostile
-/// config — so the only abort path left is a genuine system-wide OOM
-/// at a ≤512 MiB request (the same residual contract the module-doc
-/// table records for the `image`-crate clone sites). The [`preprocess`]
-/// and [`crate::vlm::video::process_frames`] composers inherit this
-/// guard transitively (both call `resize` via `?`).
+/// **Allocation contract — fully fallible (Codex review round 2).**
+/// Byte counts are bounded on both ends: the source is bounded by
+/// [`MAX_DECODED_IMAGE_BYTES`] via [`load_image`]'s decoder cap, and the
+/// destination is bounded by the same [`MAX_DECODED_IMAGE_BYTES`]
+/// ceiling enforced on `height * width * 4` by the target guard below
+/// (mirroring [`pad_to_square`]'s canvas gate). The cap bounds the SIZE;
+/// fallibility is now also guaranteed. BOTH source-sized allocations
+/// this function controls route through `try_reserve_exact` (via the
+/// crate-internal `error::try_with_capacity`) and surface allocator
+/// failure as [`Error::OutOfMemory`] instead of aborting:
+/// - the source RGBA buffer (formerly an infallible `img.to_rgba8()`
+///   clone) is reserved and filled manually — a borrowed `as_rgba8()`
+///   fast path or a per-pixel `dynamic_image_rgba_pixel` projection —
+///   then wrapped (zero-copy) in `fast_image_resize::ImageRef`;
+/// - the destination buffer (formerly an infallible
+///   `fast_image_resize::Image::new`, backed by `vec![0; …]`) is
+///   reserved + zero-filled, then handed to the fallible
+///   `Image::from_vec_u8` constructor.
+///
+/// No infallible `vec!` / `Image::new` / `to_rgba8` remains in this
+/// path, so a just-under-cap hostile target (≈11585×11585 ≈ 512 MiB)
+/// can no longer force a ~512 MiB infallible alloc → the `Result`
+/// signature is honest. The only residual abort is a genuine
+/// allocator-internal failure (e.g. a panic inside `vec.resize`'s growth
+/// of an ALREADY-reserved buffer, which cannot fail), not the
+/// reservation. The [`preprocess`] and
+/// [`crate::vlm::video::process_frames`] composers inherit this
+/// transitively (both call `resize` via `?`).
 ///
 /// # Errors
 /// - [`Error::ShapeMismatch`] if either target dimension is `0`, if
-///   `height * width * 4` overflows `u64`, or if it exceeds
-///   [`MAX_DECODED_IMAGE_BYTES`] — the message carries the offending
-///   dims and the cap. (The over-cap case uses `ShapeMismatch` rather
-///   than [`Error::OutOfMemory`] so it can name the dims + ceiling,
-///   matching [`pad_to_square`]'s canvas gate; `OutOfMemory` is
-///   reserved for true allocator failures, which the residual
-///   `image`-crate-internal `to_rgba8`/`Image::new` allocs surface as
-///   a process abort only at a now-bounded ≤512 MiB request.)
+///   `height * width * 4` overflows `u64`, if it exceeds
+///   [`MAX_DECODED_IMAGE_BYTES`], or if `source_width * source_height *
+///   4` overflows `usize` — the message carries the offending dims and
+///   the cap. (The over-cap case uses `ShapeMismatch` rather than
+///   [`Error::OutOfMemory`] so it can name the dims + ceiling, matching
+///   [`pad_to_square`]'s canvas gate.)
+/// - [`Error::OutOfMemory`] if the allocator cannot satisfy the
+///   `try_reserve_exact` for either the source RGBA buffer or the
+///   destination buffer (both bounded ≤512 MiB by the caps above) — a
+///   recoverable typed error instead of a process abort.
 pub fn resize(
   img: &::image::DynamicImage,
   target: (u32, u32),
@@ -883,7 +904,7 @@ pub fn resize(
   let (height, width) = target;
   // Target-dimension guard (Codex review): `target` now flows from an
   // UNTRUSTED loaded processor config, so validate it BEFORE the
-  // source-sized `to_rgba8()` clone and the `width * height * 4`
+  // source RGBA materialization and the `width * height * 4`
   // destination alloc. Mirrors `pad_to_square`'s canvas gate so the
   // per-step caps stay consistent.
   if width == 0 || height == 0 {
@@ -920,30 +941,110 @@ pub fn resize(
   // Pixel-type: RGBA8 for parity with the prior behavior (image-rs's
   // `imageops::resize` over a `DynamicImage` projects to `Rgba8`
   // unconditionally; downstream `image_to_array` drops alpha as before).
-  // `img.to_rgba8()` is an OWNED source-sized copy/convert — image 0.25
-  // returns a fresh `RgbaImage` and clones even when the source is
-  // already `ImageRgba8` (only the consuming `into_rgba8()` path avoids
-  // that clone, and we can't use it here because `img: &DynamicImage`).
-  // This is the infallible RGBA conversion captured in the module audit
-  // table; its byte count is bounded by [`MAX_DECODED_IMAGE_BYTES`] via
-  // `load_image`'s decoder cap on the source (the destination side is
-  // now bounded by the target-dimension guard above).
-  let src = img.to_rgba8();
+  //
+  // FALLIBLE source materialization (Codex review round 2): the prior
+  // `img.to_rgba8()` was an OWNED source-sized copy/convert backed by an
+  // INFALLIBLE `Vec` (image 0.25 returns a fresh `RgbaImage` and clones
+  // even when the source is already `ImageRgba8`; only the consuming
+  // `into_rgba8()` path avoids the clone, and we can't use it on a
+  // `&DynamicImage`). Even though the source byte count is bounded by
+  // [`MAX_DECODED_IMAGE_BYTES`] via `load_image`'s decoder cap, the
+  // allocation itself would `abort()` under allocator pressure — making
+  // the `Result` signature dishonest. We now reserve the source RGBA
+  // buffer via `try_reserve_exact` (`error::try_with_capacity`) and fill
+  // it ourselves, mirroring `image_to_array` / `pad_to_square`: a
+  // borrowed `as_rgba8()` fast path when the source is already RGBA8,
+  // else a per-pixel `dynamic_image_rgba_pixel` projection (the same
+  // `dynamic_map!` color-space conversion `to_rgba8()` performed).
+  // Allocator failure surfaces as [`Error::OutOfMemory`].
+  let src_w = img.width();
+  let src_h = img.height();
+  // `src_w * src_h * 4` (RGBA8 source bytes) in usize. The source came
+  // through `load_image`'s 512 MiB decoder cap so this product is bounded
+  // in practice, but a `checked_mul` keeps the reservation honest on a
+  // 32-bit `usize` (where the cap's byte count could still wrap) and
+  // routes any pathological product to a recoverable `ShapeMismatch`
+  // instead of a silent under-allocation.
+  let src_bytes = (src_w as usize)
+    .checked_mul(src_h as usize)
+    .and_then(|wh| wh.checked_mul(4))
+    .ok_or_else(|| Error::ShapeMismatch {
+      message: format!("resize: source width*height*4 overflows usize for {src_h}x{src_w}"),
+    })?;
+  let mut src_buf = crate::error::try_with_capacity::<u8>(src_bytes)?;
+  if let Some(rgba) = img.as_rgba8() {
+    // Already RGBA8: borrow the backing `&[u8]` and copy exactly
+    // `src_bytes` (slice to guard an over-long backing buffer, matching
+    // `image_to_array`'s `.get(..total)` discipline so the fill cannot
+    // grow `src_buf` past the `try_reserve_exact` reservation).
+    let raw = rgba
+      .as_raw()
+      .get(..src_bytes)
+      .ok_or_else(|| Error::ShapeMismatch {
+        message: format!(
+          "resize: rgba backing buffer too short: {} bytes < W*H*4={src_bytes} for {src_h}x{src_w}",
+          rgba.as_raw().len()
+        ),
+      })?;
+    src_buf.extend_from_slice(raw);
+  } else {
+    // Non-RGBA8 source (Luma8 / Rgb8 / Rgb16 / Rgb32F / …): per-pixel
+    // `DynamicImage::get_pixel(x, y) -> Rgba<u8>` projection (alpha
+    // preserved — this feeds the resize, downstream `image_to_array`
+    // drops it). NO intermediate source-sized image allocation.
+    for y in 0..src_h {
+      for x in 0..src_w {
+        src_buf.extend_from_slice(&dynamic_image_rgba_pixel(img, x, y));
+      }
+    }
+  }
+  debug_assert_eq!(
+    src_buf.len(),
+    src_bytes,
+    "resize source RGBA fill length must equal pre-computed src_bytes",
+  );
+  // Source view borrows the now-fallible `src_buf` (zero-copy). NOT a
+  // fresh `Image::new` — `ImageRef::new` only wraps the existing slice,
+  // so there is no second source-sized allocation here.
   let src_view = ::fast_image_resize::images::ImageRef::new(
-    src.width(),
-    src.height(),
-    src.as_raw(),
+    src_w,
+    src_h,
+    &src_buf,
     ::fast_image_resize::PixelType::U8x4,
   )
   // `ImageRef::new` only errors on `width * height * channels` overflow
-  // or buffer-length mismatch. The former is impossible because the
-  // dimensions came from a successfully-decoded `DynamicImage` (which
-  // image-rs validated in `from_decoder`). The latter is impossible
-  // because `RgbaImage::as_raw().len() == width * height * 4` by
-  // construction.
-  .expect("ImageRef::new: source dims/buffer length validated by image-rs decoder");
-  let mut dst =
-    ::fast_image_resize::images::Image::new(width, height, ::fast_image_resize::PixelType::U8x4);
+  // or buffer-length mismatch. The former is excluded by the `src_bytes`
+  // `checked_mul` above; the latter because `src_buf.len() == src_bytes
+  // == src_w * src_h * 4` by construction (asserted above).
+  .expect("ImageRef::new: source dims/buffer length validated by checked_mul + fill invariant");
+  // FALLIBLE destination (Codex review round 2): the prior
+  // `fast_image_resize::images::Image::new(width, height, U8x4)` is
+  // backed by `vec![0; width * height * pixel_size]` (fir 6.0.0
+  // `Image::new`) — an INFALLIBLE alloc that aborts on allocator
+  // pressure even though the target byte count is now bounded by the
+  // target-dimension guard above. Reserve `dst_bytes` via
+  // `try_reserve_exact` + zero-fill, then hand the buffer to
+  // `Image::from_vec_u8` (a `Result` constructor) so EVERY allocation in
+  // this path driven by the untrusted loaded-config dims is fallible.
+  //
+  // `dst_bytes` was computed (and capped ≤ `MAX_DECODED_IMAGE_BYTES`) by
+  // the target guard above; the prior gate proved `dst_bytes <= 512 MiB
+  // < usize::MAX` on every supported 64-bit host, so the cast is
+  // lossless.
+  let dst_bytes_usize = dst_bytes as usize;
+  let mut dst_buf = crate::error::try_with_capacity::<u8>(dst_bytes_usize)?;
+  dst_buf.resize(dst_bytes_usize, 0u8);
+  let mut dst = ::fast_image_resize::images::Image::from_vec_u8(
+    width,
+    height,
+    dst_buf,
+    ::fast_image_resize::PixelType::U8x4,
+  )
+  // `from_vec_u8` errors only on `buffer.len() < width * height *
+  // pixel_size` or misalignment. Length is exact (`dst_bytes_usize ==
+  // width * height * 4`, zero-filled above); `U8x4` is `align_of::<u8>()
+  // == 1`, so the alignment check is trivially satisfied for any `Vec<u8>`.
+  .expect("Image::from_vec_u8: dst buffer length == width*height*4 + u8-aligned by construction");
   ::fast_image_resize::Resizer::new()
     .resize(
       &src_view,
@@ -956,8 +1057,8 @@ pub fn resize(
     .expect("Resizer::resize: src/dst PixelType match by construction (both U8x4)");
   Ok(::image::DynamicImage::ImageRgba8(
     ::image::ImageBuffer::from_raw(width, height, dst.into_vec())
-      // `Image::new(width, height, U8x4)` allocates exactly
-      // `width * height * 4` bytes — the precise length
+      // The destination buffer is exactly `width * height * 4` bytes (the
+      // `try_reserve_exact` + zero-fill above) — the precise length
       // `ImageBuffer::from_raw` requires for a `width x height` RGBA buffer.
       .expect("ImageBuffer::from_raw: dst buffer length matches width * height * 4 by construction"),
   ))
@@ -1627,6 +1728,24 @@ fn dynamic_image_rgb_pixel(img: &::image::DynamicImage, x: u32, y: u32) -> [u8; 
   use ::image::GenericImageView as _;
   let p = img.get_pixel(x, y);
   [p.0[0], p.0[1], p.0[2]]
+}
+
+/// Project a single pixel of any [`::image::DynamicImage`] variant to an
+/// 8-bit RGBA quad on the stack (no allocation).
+///
+/// The RGBA sibling of [`dynamic_image_rgb_pixel`]: keeps the alpha
+/// channel instead of dropping it, for the [`resize`] source-buffer
+/// materialization (which resizes in `U8x4` for parity with image-rs's
+/// `imageops::resize` over a `DynamicImage`). `DynamicImage::get_pixel`
+/// returns an `Rgba<u8>` regardless of the backing variant — image's
+/// `dynamic_map!` dispatch performs the Luma-broadcast / 16-bit→8-bit /
+/// float→u8 / opaque-alpha conversions, exactly what `to_rgba8()` did
+/// per-pixel, so the borrowed-`as_rgba8()` fast path and this per-pixel
+/// path produce byte-identical RGBA for the same source.
+fn dynamic_image_rgba_pixel(img: &::image::DynamicImage, x: u32, y: u32) -> [u8; 4] {
+  use ::image::GenericImageView as _;
+  let p = img.get_pixel(x, y);
+  [p.0[0], p.0[1], p.0[2], p.0[3]]
 }
 
 /// Patchify `[H, W, C]` into `[H/p * W/p, p, p, C]` (ViT-style flat

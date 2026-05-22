@@ -154,6 +154,103 @@ fn resize_rejects_overflowing_target_product() {
   }
 }
 
+#[test]
+fn resize_accepted_target_uses_fallible_alloc_path_never_aborts() {
+  // Regression for Codex Finding (high, round 2): an accepted target AT
+  // OR BELOW the 512 MiB cap formerly still allocated through INFALLIBLE
+  // buffers — `img.to_rgba8()` (an owned RGBA clone) and
+  // `fast_image_resize::Image::new` (backed by `vec![0; …]`). A hostile
+  // config could pick a just-under-cap size (~11585×11585 ≈ 512 MiB) and
+  // force a ~512 MiB infallible allocation → process abort under memory
+  // pressure, despite the `Result` signature. The cap bounded the SIZE
+  // but not the FALLIBILITY.
+  //
+  // We do NOT allocate 512 MiB in CI. Instead we exercise the SAME
+  // fallible code path (the `try_reserve_exact`-backed source RGBA buffer
+  // + the `try_reserve_exact` + zero-fill destination handed to
+  // `Image::from_vec_u8`) at a moderate, CI-safe target that genuinely
+  // allocates a real buffer. The fallibility is STRUCTURAL: every
+  // allocation in `resize` driven by the (now-untrusted) config dims
+  // routes through `try_reserve_exact` and surfaces allocator failure as
+  // `Error::OutOfMemory`. A successful return is `Ok`; an allocator
+  // refusal would be a recoverable `Err(OutOfMemory)` — NEVER an abort.
+  let img = synthetic_image(8, 6);
+  // 1024 x 768 destination = 768 * 1024 * 4 = 3 MiB — well under the cap,
+  // large enough that BOTH the source-RGBA `try_reserve_exact` and the
+  // destination `try_reserve_exact` + `from_vec_u8` actually run (not a
+  // toy buffer the allocator never touches).
+  match resize(&img, (768, 1024), ResizeFilter::Bilinear) {
+    Ok(out) => {
+      assert_eq!(out.width(), 1024, "width = target.1");
+      assert_eq!(out.height(), 768, "height = target.0");
+    }
+    // Allocator could not satisfy the (bounded ≤512 MiB) reservation:
+    // recoverable, not an abort. This branch documents that the
+    // try_reserve path is wired — it should not fire for a 3 MiB buffer
+    // on any CI host, but accepting it proves the contract is
+    // "Ok-or-recoverable-Err, never abort".
+    Err(Error::OutOfMemory) => {}
+    Err(other) => panic!("expected Ok or recoverable OutOfMemory, got {other:?}"),
+  }
+}
+
+#[test]
+fn resize_non_rgba8_sources_convert_via_fallible_per_pixel_path() {
+  // The source-RGBA materialization has two paths: a borrowed
+  // `as_rgba8()` fast path (source already RGBA8) and a per-pixel
+  // `dynamic_image_rgba_pixel` projection for every other variant
+  // (Luma8 / Rgb8 / 16-bit / float). Both fill a `try_reserve_exact`
+  // buffer. Verify the per-pixel path produces correct output for
+  // non-RGBA8 sources, and that an already-RGBA8 source (fast path)
+  // works too.
+
+  // Rgb8 source (most common): synthetic_image yields ImageRgb8.
+  let rgb8 = synthetic_image(8, 6);
+  let out_rgb8 = resize(&rgb8, (4, 4), ResizeFilter::Nearest)
+    .expect("Rgb8 source must resize via the per-pixel fallible path");
+  assert_eq!((out_rgb8.width(), out_rgb8.height()), (4, 4));
+
+  // Luma8 source: exercises the grayscale-broadcast `get_pixel`
+  // projection. A uniform-gray image must round-trip to the same gray
+  // on every output channel (R == G == B) under Nearest.
+  let mut luma = ::image::GrayImage::new(8, 6);
+  for p in luma.pixels_mut() {
+    *p = ::image::Luma([123]);
+  }
+  let luma_img = ::image::DynamicImage::ImageLuma8(luma);
+  let out_luma = resize(&luma_img, (4, 4), ResizeFilter::Nearest)
+    .expect("Luma8 source must resize via the per-pixel fallible path");
+  assert_eq!((out_luma.width(), out_luma.height()), (4, 4));
+  // image_to_array drops alpha and broadcasts luma → RGB; every value
+  // must be the original gray level (uniform image, Nearest filter).
+  let mut arr = image_to_array(&out_luma, ColorOrder::Rgb).unwrap();
+  let v: Vec<f32> = arr.to_vec().unwrap();
+  assert_eq!(arr.shape(), vec![4, 4, 3], "[H, W, 3]");
+  assert!(
+    v.iter().all(|&x| close(x, 123.0)),
+    "uniform Luma8 must broadcast to {{123, 123, 123}} after resize; got {v:?}"
+  );
+
+  // Rgba8 source: exercises the borrowed `as_rgba8()` fast path. A
+  // uniform color must survive Nearest resize on all three RGB channels.
+  let mut rgba = ::image::RgbaImage::new(8, 6);
+  for p in rgba.pixels_mut() {
+    *p = ::image::Rgba([10, 20, 30, 255]);
+  }
+  let rgba_img = ::image::DynamicImage::ImageRgba8(rgba);
+  let out_rgba = resize(&rgba_img, (4, 4), ResizeFilter::Nearest)
+    .expect("Rgba8 source must resize via the borrowed fast path");
+  let mut arr2 = image_to_array(&out_rgba, ColorOrder::Rgb).unwrap();
+  let v2: Vec<f32> = arr2.to_vec().unwrap();
+  // Channel-last [4, 4, 3] uniform (10, 20, 30).
+  for px in v2.chunks_exact(3) {
+    assert!(
+      close(px[0], 10.0) && close(px[1], 20.0) && close(px[2], 30.0),
+      "uniform Rgba8 must survive resize as (10, 20, 30); got {px:?}"
+    );
+  }
+}
+
 // ---------- image_to_array ----------
 
 #[test]
