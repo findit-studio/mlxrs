@@ -17,6 +17,7 @@ pub mod generate;
 pub mod load;
 pub mod model;
 pub mod nn;
+pub mod quant;
 pub mod sample;
 pub mod speculative;
 /// Tool-call format parsers — Python `mlx_lm.tool_parsers.*`.
