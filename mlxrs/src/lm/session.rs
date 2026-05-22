@@ -22,7 +22,40 @@
 //! [`Tokenizer::apply_chat_template`], generates over the **held** KV cache,
 //! and appends both the user prompt and the model's reply to the history — so
 //! turn N+1 reuses turn N's cache (only the new tokens are prefilled, never
-//! the whole conversation) exactly as the Swift reference does.
+//! the whole conversation).
+//!
+//! ## Incremental prefill (the cross-turn cache-reuse mechanism)
+//!
+//! mlx-swift-lm's `ChatSession` *claims* "only the new tokens are prefilled"
+//! but its `LLMModel.prepare` feeds the **full** rendered `input.text` into
+//! the model every turn, and `KVCacheSimple.update` unconditionally appends
+//! `keys.dim(2)` to its offset — so the Swift reference actually re-appends
+//! the entire prior conversation's KV each turn (offset grows by the *whole*
+//! render, the prefix is duplicated). [`ChatSession`] does **not** port that
+//! defect: it ports the *documented* contract via real incremental prefill.
+//!
+//! Every realised cache carries the exact token sequence already represented
+//! in its KV state (a `Vec<u32>` whose length equals the cache `offset()`,
+//! plus a count of leading *opaque* tokens for a builder-restored cache whose
+//! ids are unknown). On a new turn the session:
+//!
+//! 1. renders the full prompt → `prompt_ids`;
+//! 2. computes the common prefix of `prompt_ids` against the already-cached
+//!    token sequence;
+//! 3. if the render **extends** the cached prefix, feeds [`generate_step`]
+//!    only the suffix beyond that prefix — the cache continues from its
+//!    current `offset()`, so turn N+1's prefill cost is the *new* tokens
+//!    only;
+//! 4. if the render **diverges** (it is not a prefix-extension of the cached
+//!    tokens — e.g. an `instructions` change, or a non-prefix-stable
+//!    template), discards the stale cache and **rebuilds from scratch** for
+//!    that turn, feeding the full `prompt_ids` — slower, but never wrong.
+//!
+//! The generated tokens are folded into the cached token sequence alongside
+//! the prompt, so turn N+2 sees turn N+1's prompt *and* reply as the cached
+//! prefix. (The speculative-decoding path cannot reuse its cache — its KV
+//! caches are consumed by the speculative generator and not handed back — so
+//! it always rebuilds and re-prefills; that is a documented divergence.)
 //!
 //! ## Concurrency divergence from the Swift reference (deliberate)
 //!
@@ -201,9 +234,43 @@ impl SpeculativeDecodingConfig {
 /// [`KvCache`] per decoder layer.
 type KvCaches = Vec<Box<dyn KvCache>>;
 
-/// A main cache plus an optional draft cache — what a session turn carries
-/// (the draft cache is `Some` iff speculative decoding is enabled).
-type MainAndDraftCaches = (KvCaches, Option<KvCaches>);
+/// The exact token sequence already represented in a realised cache's KV
+/// state — the bookkeeping that drives [`ChatSession`]'s incremental prefill
+/// (see the [module docs](self)).
+///
+/// `known` is the suffix of the cached tokens whose ids the session itself
+/// fed (`opaque_len + known.len()` always equals the cache `offset()`).
+/// `opaque_len` is the count of *leading* cached tokens whose ids are
+/// unknown — `0` for a session-built cache (every token is `known`), nonzero
+/// only for a cache restored via [`ChatSessionBuilder::cache`] (a pre-built
+/// prefix whose token ids the builder was never given).
+#[derive(Clone)]
+struct CachedTokens {
+  /// Count of leading KV tokens whose ids are unknown (a restored opaque
+  /// prefix); `0` for a session-built cache.
+  opaque_len: usize,
+  /// The token ids the session fed into the cache after the opaque prefix —
+  /// `opaque_len + known.len() == cache.offset()`.
+  known: Vec<u32>,
+}
+
+impl CachedTokens {
+  /// A freshly-built, empty cache: no opaque prefix, nothing fed yet.
+  fn empty() -> Self {
+    Self {
+      opaque_len: 0,
+      known: Vec::new(),
+    }
+  }
+
+  /// A builder-restored cache of `offset` tokens whose ids are all unknown.
+  fn opaque(offset: usize) -> Self {
+    Self {
+      opaque_len: offset,
+      known: Vec::new(),
+    }
+  }
+}
 
 /// The session's KV-cache slot — a port of the Swift `ChatSession.Cache`
 /// enum (`empty` / `kvcache` / `history`).
@@ -224,10 +291,24 @@ enum CacheSlot {
     /// The draft model's per-layer KV cache, present iff the session was
     /// built with a [`SpeculativeDecodingConfig`].
     draft_cache: Option<KvCaches>,
+    /// The exact token sequence in `cache`'s KV state — drives incremental
+    /// prefill on the next turn (see [`CachedTokens`] / the module docs).
+    cached: CachedTokens,
   },
   /// A re-hydrated message history awaiting its first generation — the
   /// Swift `.history` case (used by [`ChatSessionBuilder::history`]).
   History(Vec<ChatMessage>),
+  /// A speculative session that has run at least one turn. The
+  /// [`speculative_stream_generate`] iterator *consumes* its caches and does
+  /// not return them, so there is no advanced cache to carry — the next turn
+  /// rebuilds from the [`CacheConfig`] (a documented divergence — see
+  /// [`SpeculativeTurn`]). This state is deliberately **not** [`Realised`]:
+  /// presenting a freshly-allocated offset-0 cache as the "current" cache
+  /// would let [`ChatSession::save_cache`] persist a cache that does not
+  /// encode the conversation, so a speculative session reports
+  /// [`ChatSession::has_cache`] `false` and `save_cache` returns
+  /// [`ChatSessionError::SpeculativeCacheUnsupported`].
+  SpeculativeSpent,
 }
 
 /// Errors thrown by [`ChatSession`] — a port of mlx-swift-lm's
@@ -237,6 +318,13 @@ pub enum ChatSessionError {
   /// [`ChatSession::save_cache`] was called before any generation occurred —
   /// the Swift `ChatSessionError.noCacheAvailable`.
   NoCacheAvailable,
+  /// [`ChatSession::save_cache`] was called on a speculative-decoding
+  /// session. [`speculative_stream_generate`] consumes its KV caches and
+  /// does not return them, so a speculative session holds no advanced cache
+  /// to persist — saving the freshly-rebuilt offset-0 cache would write a
+  /// cache that does not encode the conversation. No Swift analogue (the
+  /// Swift `ChatSession` never made the speculative cache observable).
+  SpeculativeCacheUnsupported,
 }
 
 impl std::fmt::Display for ChatSessionError {
@@ -244,6 +332,11 @@ impl std::fmt::Display for ChatSessionError {
     match self {
       ChatSessionError::NoCacheAvailable => f.write_str(
         "no KV cache is available: call respond() / stream_respond() before save_cache()",
+      ),
+      ChatSessionError::SpeculativeCacheUnsupported => f.write_str(
+        "speculative-decoding sessions do not support cache save: the speculative \
+         generator consumes its KV caches and rebuilds them each turn, so there is \
+         no advanced cache that encodes the conversation to persist",
       ),
     }
   }
@@ -332,9 +425,18 @@ impl ChatSessionBuilder {
   /// Mutually exclusive with [`ChatSessionBuilder::history`]: the last one
   /// set wins.
   pub fn cache(mut self, cache: Vec<Box<dyn KvCache>>) -> Self {
+    // The restored cache encodes some prefix (a system prompt + document),
+    // but the builder is not given its token ids — so the whole prefill is
+    // *opaque*: `opaque_len` is the cache's current `offset()` and `known`
+    // is empty. The first turn feeds its rendered prompt as the suffix that
+    // continues this opaque prefix (the documented prefix-caching use); the
+    // session can verify+extend the `known` portion it appends, and falls
+    // back to a rebuild if a later render does not extend it.
+    let offset = cache.first().map(|c| c.offset()).unwrap_or(0);
     self.initial = CacheSlot::Realised {
       cache,
       draft_cache: None,
+      cached: CachedTokens::opaque(offset),
     };
     self
   }
@@ -451,6 +553,11 @@ impl ChatSession {
   /// the first turn, `true` after a turn, `false` again after
   /// [`ChatSession::clear`]. `true` immediately for a session built via
   /// [`ChatSessionBuilder::cache`].
+  ///
+  /// Always `false` for a **speculative** session, even after a turn:
+  /// [`speculative_stream_generate`] consumes its caches and does not return
+  /// an advanced cache to carry (the next turn rebuilds), so there is no
+  /// realised cache to observe or save.
   pub fn has_cache(&self) -> bool {
     matches!(self.cache, CacheSlot::Realised { .. })
   }
@@ -485,11 +592,15 @@ impl ChatSession {
   /// Returns [`ChatSessionError::NoCacheAvailable`] (faithful to the Swift
   /// `ChatSessionError.noCacheAvailable`) if no generation has occurred — the
   /// cache is not realised, so there is nothing to persist.
+  /// Returns [`ChatSessionError::SpeculativeCacheUnsupported`] for a
+  /// speculative session: its caches are consumed and rebuilt each turn, so
+  /// no cache encoding the conversation exists to persist.
   pub fn save_cache(&self, path: &std::path::Path) -> Result<()> {
     match &self.cache {
       CacheSlot::Realised { cache, .. } => {
         save_prompt_cache(path, cache, &std::collections::HashMap::new())
       }
+      CacheSlot::SpeculativeSpent => Err(ChatSessionError::SpeculativeCacheUnsupported.into()),
       _ => Err(ChatSessionError::NoCacheAvailable.into()),
     }
   }
@@ -552,34 +663,92 @@ impl ChatSession {
   /// on the first turn — the Swift `switch cache { case .empty / .kvcache /
   /// .history }` cache-preparation block.
   ///
-  /// Returns `(main_cache, draft_cache)`; `draft_cache` is `Some` iff the
-  /// session uses speculative decoding (built once, then carried). The slot
-  /// is left [`CacheSlot::Empty`] — [`ChatResponseStream`]'s `Drop` write-back
-  /// puts the advanced cache(s) back when the turn completes.
-  fn take_cache(&mut self) -> MainAndDraftCaches {
+  /// Returns `(main_cache, draft_cache, cached_tokens)`: `draft_cache` is
+  /// `Some` iff the session uses speculative decoding (built once, then
+  /// carried), and `cached_tokens` records what the returned `main_cache`'s
+  /// KV already encodes (drives incremental prefill). The slot is left
+  /// [`CacheSlot::Empty`] — [`ChatResponseStream`]'s `Drop` write-back puts
+  /// the advanced cache(s) back when the turn completes.
+  fn take_cache(&mut self) -> (KvCaches, Option<KvCaches>, CachedTokens) {
     let slot = std::mem::replace(&mut self.cache, CacheSlot::Empty);
     match slot {
-      // `.kvcache` — reuse the carried cache(s) as-is.
-      CacheSlot::Realised { cache, draft_cache } => {
+      // `.kvcache` — reuse the carried cache(s) and their token bookkeeping.
+      CacheSlot::Realised {
+        cache,
+        draft_cache,
+        cached,
+      } => {
         // A speculative session whose draft cache was not yet built (e.g.
         // restored via `cache:`) gets it allocated now, once.
         let draft = match (&self.speculative, draft_cache) {
           (Some(spec), None) => Some(make_prompt_cache(&spec.draft_cache_config)),
           (_, existing) => existing,
         };
-        (cache, draft)
+        (cache, draft, cached)
       }
-      // `.empty` / `.history` — allocate a fresh cache (the `.history`
-      // messages were already folded into the rendered prompt by
-      // `build_turn_prompt`, so only the cache shape matters here).
-      CacheSlot::Empty | CacheSlot::History(_) => {
+      // `.empty` / `.history` / speculative-spent — allocate a fresh cache
+      // (the `.history` messages were already folded into the rendered
+      // prompt by `build_turn_prompt`, so only the cache shape matters).
+      CacheSlot::Empty | CacheSlot::History(_) | CacheSlot::SpeculativeSpent => {
         let cache = make_prompt_cache(&self.cache_config);
         let draft = self
           .speculative
           .as_ref()
           .map(|spec| make_prompt_cache(&spec.draft_cache_config));
-        (cache, draft)
+        (cache, draft, CachedTokens::empty())
       }
+    }
+  }
+
+  /// Decide the incremental-prefill plan for a standard turn.
+  ///
+  /// Given the freshly-rendered `prompt_ids`, the cache taken from the slot
+  /// and the tokens that cache already encodes, returns the cache to feed
+  /// [`generate_step`], the token *slice range* of `prompt_ids` to feed it,
+  /// and the [`CachedTokens::opaque_len`] the resulting cache carries.
+  ///
+  /// - **Reuse** (the common path): if `prompt_ids` is a strict
+  ///   prefix-extension of the cached token sequence — its first
+  ///   `opaque_len` tokens line up with the opaque prefix (length only;
+  ///   their ids are unknowable) and the next `cached.known.len()` tokens
+  ///   byte-match `cached.known` — the cache is kept and only the suffix
+  ///   `prompt_ids[opaque_len + known.len() ..]` is fed. The cache continues
+  ///   from its current `offset()`; turn N+1 prefills the *new* tokens only.
+  /// - **Rebuild** (divergence / degenerate): if the render is *not* such an
+  ///   extension (an `instructions` change, a non-prefix-stable template, a
+  ///   render shorter than the cached tokens) — or if it is exactly equal to
+  ///   the cached tokens, leaving no suffix for [`generate_step`]'s
+  ///   non-empty-prompt contract — the stale cache is dropped, a fresh cache
+  ///   is built, and the *full* `prompt_ids` is fed. Slower (re-prefills the
+  ///   conversation) but always correct.
+  ///
+  /// Returns `(cache, prefill_start, opaque_len)`: feed
+  /// `prompt_ids[prefill_start..]` to `generate_step` over `cache`; the
+  /// resulting realised cache will encode an opaque prefix of `opaque_len`.
+  fn decide_prefill(
+    &self,
+    prompt_ids: &[u32],
+    cache: KvCaches,
+    cached: &CachedTokens,
+  ) -> (KvCaches, usize, usize) {
+    let prefix_len = cached.opaque_len + cached.known.len();
+    // The render must be strictly longer than everything already cached (a
+    // non-empty new suffix for `generate_step`), and its post-opaque region
+    // must begin with exactly the known cached ids. `prompt_ids.len() >
+    // prefix_len` implies `prompt_ids.len() > opaque_len` (since `prefix_len
+    // >= opaque_len`), so the `[opaque_len..]` slice below is always in
+    // bounds when it is reached (short-circuit `&&`).
+    let extends =
+      prompt_ids.len() > prefix_len && prompt_ids[cached.opaque_len..].starts_with(&cached.known);
+    if extends {
+      // Reuse: keep the cache, feed only the suffix beyond the cached
+      // prefix; the opaque prefix is carried forward unchanged.
+      (cache, prefix_len, cached.opaque_len)
+    } else {
+      // Divergence or degenerate render: rebuild from scratch and feed the
+      // whole prompt. `cache` (the stale cache) is dropped here.
+      drop(cache);
+      (make_prompt_cache(&self.cache_config), 0, 0)
     }
   }
 
@@ -650,8 +819,9 @@ impl ChatSession {
     // 1. Render the prompt (history + new turn) through the chat template.
     let (prompt_ids, replayed) = self.build_turn_prompt(prompt, role)?;
 
-    // 2. Take the KV cache out of the slot (fresh on the first turn).
-    let (cache, draft_cache) = self.take_cache();
+    // 2. Take the KV cache out of the slot (fresh on the first turn) along
+    //    with the token sequence it already encodes.
+    let (cache, draft_cache, cached) = self.take_cache();
 
     // 3. Fold a re-hydrated `.history` into the persisted history (once),
     //    then append the new user turn. The assistant reply is appended by
@@ -671,7 +841,20 @@ impl ChatSession {
     cfg.eos = eos.clone();
     let max_tokens = cfg.max_tokens;
 
-    // 5. Split the `&mut self` borrow into disjoint field references: the
+    // 5. Decide the incremental-prefill plan for the standard path: reuse
+    //    the cache + feed only the new suffix when the render extends the
+    //    cached prefix, else rebuild + feed the whole prompt (see
+    //    `decide_prefill`). The speculative path cannot reuse its caches
+    //    (`speculative_stream_generate` consumes them), so it always feeds
+    //    the full `prompt_ids` and rebuilds — handled in step 7.
+    let (std_cache, prefill_start, opaque_len) = if self.speculative.is_none() {
+      self.decide_prefill(&prompt_ids, cache, &cached)
+    } else {
+      // `cache` is moved into the speculative turn below; no plan needed.
+      (cache, 0, 0)
+    };
+
+    // 6. Split the `&mut self` borrow into disjoint field references: the
     //    generation driver borrows the model + tokenizer *immutably* for the
     //    stream's lifetime, while the stream needs *mutable* access to the
     //    cache slot + history for the `Drop` write-back. A whole-`self`
@@ -687,7 +870,7 @@ impl ChatSession {
     } = self;
     let model: &dyn Model = &**model;
 
-    // 6. Build the per-token generation driver — speculative or standard.
+    // 7. Build the per-token generation driver — speculative or standard.
     //    The streaming-detokenizer + finish-reason glue is identical to
     //    `stream_generate`'s eos path (`ChatSession` has no `stop_words`).
     let driver = match speculative.as_ref() {
@@ -699,8 +882,10 @@ impl ChatSession {
         Driver::Speculative(Box::new(SpeculativeTurn::new(
           model,
           tokenizer,
+          // The speculative path re-prefills the whole conversation each
+          // turn (its caches are consumed, not reused).
           &prompt_ids,
-          cache,
+          std_cache,
           draft_cache,
           DraftConfig {
             // `DraftConfig` owns its `draft_model`; the session keeps its
@@ -713,7 +898,12 @@ impl ChatSession {
         )))
       }
       None => Driver::Standard(Box::new(StandardTurn {
-        generator: generate_step(model, &prompt_ids, cache, cfg),
+        // Feed `generate_step` ONLY the suffix beyond the cached prefix
+        // (incremental prefill): the cache it is handed continues from its
+        // current `offset()`, so turn N+1 never re-prefills the prior
+        // conversation. `decide_prefill` guarantees `prefill_start <
+        // prompt_ids.len()`, so this slice is always non-empty.
+        generator: generate_step(model, &prompt_ids[prefill_start..], std_cache, cfg),
         // The standard path carries the draft cache (always `None` here)
         // through so the write-back round-trips the slot shape.
         draft_cache,
@@ -730,6 +920,12 @@ impl ChatSession {
       prompt_tokens: prompt_ids.len(),
       produced: 0,
       reply: String::new(),
+      // The full rendered prompt + the opaque-prefix length: `commit()`
+      // folds the generated tokens onto `prompt_ids` to form the next
+      // turn's cached-token sequence (incremental-prefill bookkeeping).
+      prompt_ids,
+      opaque_len,
+      generated: Vec::new(),
       finished: false,
       committed: false,
     })
@@ -795,21 +991,19 @@ struct StandardTurn<'a> {
 }
 
 /// Holds a speculative-decoding turn: the [`speculative_stream_generate`]
-/// iterator and the caches threaded through it.
+/// iterator threaded through the supplied caches.
 ///
 /// [`speculative_stream_generate`] consumes both caches and — unlike the
 /// standard [`Generator`] — does not hand them back, so a speculative turn
-/// always **rebuilds** the cache for the next turn from the [`CacheConfig`]
-/// (a documented divergence: speculative sessions re-prefill the conversation
-/// each turn). The standard path reuses the cache via [`Generator::into_cache`]
-/// and has no such cost.
+/// has **no advanced cache to carry**: after the turn the session's cache
+/// slot becomes [`CacheSlot::SpeculativeSpent`] and the next turn rebuilds
+/// its caches from the [`CacheConfig`] (a documented divergence — speculative
+/// sessions re-prefill the conversation each turn, and cannot save a cache).
+/// The standard path reuses the cache via [`Generator::into_cache`] and
+/// supports incremental prefill + cache save.
 struct SpeculativeTurn<'a> {
   /// The streaming speculative iterator, yielding one response per token.
   iter: Box<dyn Iterator<Item = Result<crate::lm::speculative::SpeculativeResponse>> + 'a>,
-  /// The main cache shape, to rebuild the cache after the turn.
-  cache_config: CacheConfig,
-  /// The draft cache shape, to rebuild the draft cache after the turn.
-  draft_cache_config: CacheConfig,
 }
 
 impl<'a> SpeculativeTurn<'a> {
@@ -825,12 +1019,6 @@ impl<'a> SpeculativeTurn<'a> {
     draft_cfg: DraftConfig,
     cfg: GenConfig,
   ) -> Self {
-    // Capture the cache shapes before the iterator consumes the caches —
-    // a speculative turn rebuilds them for the next turn (see the struct
-    // doc). `CacheConfig` is small and trivially derived from the layer
-    // count + sliding window.
-    let cache_config = cache_config_of(&cache);
-    let draft_cache_config = cache_config_of(&draft_cache);
     let iter = Box::new(speculative_stream_generate(
       target,
       tokenizer,
@@ -840,27 +1028,7 @@ impl<'a> SpeculativeTurn<'a> {
       draft_cfg,
       cfg,
     ));
-    Self {
-      iter,
-      cache_config,
-      draft_cache_config,
-    }
-  }
-}
-
-/// Recover a [`CacheConfig`] from a realised cache: the layer count is the
-/// vector length, and the sliding window is read back from a
-/// [`crate::lm::cache::RotatingKvCache`] entry if present.
-///
-/// Used only by the speculative path, which must rebuild its caches after a
-/// turn (`speculative_stream_generate` does not return them). A rotating
-/// cache reports its window via [`KvCache::max_size`]; a standard cache
-/// reports `None`, so the rebuilt cache matches the original kind.
-fn cache_config_of(cache: &[Box<dyn KvCache>]) -> CacheConfig {
-  let sliding_window = cache.first().and_then(|c| c.max_size()).map(|w| w as i32);
-  CacheConfig {
-    num_hidden_layers: cache.len(),
-    sliding_window,
+    Self { iter }
   }
 }
 
@@ -906,6 +1074,20 @@ pub struct ChatResponseStream<'s> {
   /// The assistant reply assembled so far — appended to the session history
   /// on `Drop`.
   reply: String,
+  /// The full rendered prompt for this turn (all `prompt_tokens` ids).
+  /// `commit()` derives the next turn's cached-token sequence from
+  /// `prompt_ids[opaque_len..]` concatenated with [`generated`](Self::generated)
+  /// — the incremental-prefill bookkeeping (see the [module docs](self)).
+  prompt_ids: Vec<u32>,
+  /// The count of leading KV tokens whose ids are unknown (a builder-restored
+  /// opaque prefix); `0` for a session-built cache. Carried into the next
+  /// turn's [`CachedTokens::opaque_len`].
+  opaque_len: usize,
+  /// Every token id the model sampled this turn, in order — folded after
+  /// `prompt_ids` to form the next turn's cached-token sequence. The standard
+  /// path appends each sampled token here as it streams; the speculative path
+  /// leaves this empty (its cache is rebuilt, not reused).
+  generated: Vec<u32>,
   /// `true` once the stream has ended (eos, `max_tokens`, or an `Err`) — the
   /// iterator fuses afterwards, never re-entering the model.
   finished: bool,
@@ -919,31 +1101,99 @@ impl ChatResponseStream<'_> {
   /// — the body of [`Drop`], factored out so it runs at most once
   /// (idempotent via the `committed` flag).
   ///
-  /// Standard path: the [`Generator`]'s cache is reclaimed by value
-  /// ([`Generator::into_cache`]) — the *advanced* cache, ready to be reused.
-  /// Speculative path: `speculative_stream_generate` consumed the caches and
-  /// does not return them, so fresh caches are built from the captured
-  /// shapes (a speculative session re-prefills each turn — see
-  /// [`SpeculativeTurn`]).
+  /// **Standard path** — the [`Generator`]'s cache is reclaimed by value
+  /// ([`Generator::into_cache`]): the *advanced* cache, holding the KV for
+  /// the prefilled prompt **and** the generated tokens. It is stored as
+  /// [`CacheSlot::Realised`] together with the exact token sequence it now
+  /// encodes ([`CachedTokens`]) — `prompt_ids[opaque_len..]` followed by the
+  /// sampled tokens, truncated to the cache's actual `offset()` so the
+  /// bookkeeping is self-correcting (the final sampled token is sampled but
+  /// never fed back into the cache, so the cache is one token shorter than
+  /// `prompt + generated`; the truncation drops exactly that token). Turn
+  /// N+1's [`ChatSession::decide_prefill`] uses this to feed only the new
+  /// suffix.
+  ///
+  /// If the stream was abandoned before the standard generator finished
+  /// (eos / `max_tokens`), the streaming detokenizer is **finalized** here
+  /// first (Finding 3): BPE/SPM detokenizers withhold bytes until
+  /// `finalize()`, so without this the recorded assistant text could be
+  /// missing a tail that the cache's generated tokens *do* encode — the next
+  /// turn would then render a history that no longer matches the cache.
+  ///
+  /// **Speculative path** — `speculative_stream_generate` consumed the caches
+  /// and does not return them, so there is no advanced cache to carry. The
+  /// slot is set to [`CacheSlot::SpeculativeSpent`] (not `Realised`): a
+  /// freshly-rebuilt offset-0 cache does not encode the conversation, and
+  /// presenting it as the current cache would let [`ChatSession::save_cache`]
+  /// persist a cache that cannot restore the session (Finding 2). The next
+  /// speculative turn rebuilds its caches from the [`CacheConfig`].
   fn commit(&mut self) {
     if self.committed {
       return;
     }
     self.committed = true;
 
-    let (cache, draft_cache) = match self.driver.take() {
-      Some(Driver::Standard(turn)) => (turn.generator.into_cache(), turn.draft_cache),
-      Some(Driver::Speculative(turn)) => {
-        // The iterator consumed the caches; rebuild from the shapes. The
-        // turn's reply was still generated over the consumed caches, so the
-        // history is correct — only the *cache reuse* is forfeited.
-        let cache = make_prompt_cache(&turn.cache_config);
-        let draft = make_prompt_cache(&turn.draft_cache_config);
-        (cache, Some(draft))
+    match self.driver.take() {
+      Some(Driver::Standard(turn)) => {
+        // Finding 3: finalize the detokenizer if the stream was dropped
+        // before the generator reached eos / max_tokens (those paths
+        // already finalized). A withheld tail (e.g. the BPE detok's bare-
+        // space token) is otherwise lost from `reply` while its tokens are
+        // in the cache — desyncing the recorded history from the KV state.
+        if !self.finished {
+          self.detok.finalize();
+          let tail = self.detok.last_segment();
+          self.reply.push_str(&tail);
+        }
+
+        let cache = turn.generator.into_cache();
+        // Finding 1: record exactly what the advanced cache encodes. The
+        // logical sequence after the opaque prefix is the rendered prompt
+        // suffix followed by the sampled tokens; clamp it to the cache's
+        // real `offset()` so it is exact regardless of how many tokens were
+        // actually fed (the last sampled token is sampled but never fed
+        // back into the cache, so the cache is one token short of
+        // `prompt + generated` — the truncation drops exactly that token).
+        let offset = cache.first().map(|c| c.offset()).unwrap_or(0);
+        let mut logical: Vec<u32> =
+          Vec::with_capacity(self.prompt_ids.len() + self.generated.len());
+        logical.extend_from_slice(&self.prompt_ids);
+        logical.extend_from_slice(&self.generated);
+        // The invariant `opaque_len + known.len() == offset()` must hold so
+        // the next turn's `decide_prefill` feeds the correct suffix. The
+        // expected case is `offset <= logical.len()` (truncate to the
+        // cache's real length, dropping the un-fed final token). If the
+        // cache somehow advanced past everything we can name (it should not
+        // for the standard `Generator`), fall back to treating the whole
+        // cache as an opaque prefix — always sound: the next turn either
+        // extends it or rebuilds.
+        let cached = if offset <= logical.len() {
+          logical.truncate(offset);
+          CachedTokens {
+            opaque_len: self.opaque_len.min(offset),
+            known: logical.split_off(self.opaque_len.min(offset)),
+          }
+        } else {
+          CachedTokens::opaque(offset)
+        };
+        *self.cache_slot = CacheSlot::Realised {
+          cache,
+          draft_cache: turn.draft_cache,
+          cached,
+        };
+      }
+      Some(Driver::Speculative(_turn)) => {
+        // Finding 2: the speculative iterator consumed the caches and does
+        // not return them. Do NOT store a freshly-rebuilt offset-0 cache as
+        // `Realised` — it would not encode the conversation, yet `save_cache`
+        // would happily persist it. Mark the slot spent: `has_cache()` is
+        // `false` and `save_cache()` returns a speculative-specific error.
+        // The reply was still generated correctly over the consumed caches,
+        // so the history below is right; only cache *reuse / save* is lost.
+        *self.cache_slot = CacheSlot::SpeculativeSpent;
       }
       None => return,
-    };
-    *self.cache_slot = CacheSlot::Realised { cache, draft_cache };
+    }
 
     // Append the assistant reply to the history. mlx-swift-lm appends the
     // turn regardless of how much was streamed (an interrupted stream still
@@ -1012,6 +1262,13 @@ impl Iterator for ChatResponseStream<'_> {
           }
         };
         let token = step.token;
+
+        // Incremental-prefill bookkeeping (Finding 1): record every sampled
+        // token in order. `commit()` folds these after the rendered prompt
+        // to form the next turn's cached-token sequence, clamped to the
+        // cache's real `offset()` (the final sampled token is sampled but
+        // not fed back into the cache, so the clamp drops it).
+        self.generated.push(token);
 
         // mlx-lm / `stream_generate`: `if token in eos: break` BEFORE
         // `add_token` — the eos token is not detokenized; the final
@@ -1203,6 +1460,106 @@ mod tests {
   }
 
   #[test]
+  fn turn_two_prefills_only_the_new_suffix_not_the_whole_history() {
+    // Finding 1 — the core incremental-prefill contract. Turn 2's cache
+    // offset must grow by exactly the *new* rendered suffix (the tokens not
+    // already in the cache) plus the tokens generated this turn — NOT by the
+    // whole turn-2 render (which re-includes turn 1). The bug being guarded:
+    // feeding the full render onto the already-advanced cache, re-appending
+    // the entire prior conversation's KV.
+    let max_tokens = 3;
+    let mut s = session(max_tokens);
+
+    // Turn 1.
+    let _ = s.respond("hello world").expect("turn 1");
+    let off1 = s.current_cache().expect("cache realised")[0].offset();
+    assert!(off1 > 0, "turn 1 advanced the cache");
+
+    // Render turn 2's full prompt the same way `stream_respond_as` will —
+    // the running history now holds turn 1, so this render re-includes it.
+    let (prompt2, _) = s
+      .build_turn_prompt("the quick fox", Role::User)
+      .expect("render turn 2");
+    let full_render2 = prompt2.len();
+
+    // The suffix actually fed to `generate_step` is `prompt2[off1..]`: the
+    // tokens beyond what the cache already encodes.
+    assert!(
+      full_render2 > off1,
+      "turn-2 render ({full_render2}) extends past the cached prefix ({off1})"
+    );
+    let suffix_len = full_render2 - off1;
+
+    // Turn 2.
+    let _ = s.respond("the quick fox").expect("turn 2");
+    let off2 = s.current_cache().expect("cache realised")[0].offset();
+
+    // `generate_step` over a P-token prompt advances the cache by `P - 1`
+    // (prefill) + `1` (first decode step) + `max_tokens - 1` (later decode
+    // steps) = `P - 1 + max_tokens`. With incremental prefill `P` is the
+    // SUFFIX length, so the growth is exactly this:
+    let expected_growth = suffix_len - 1 + max_tokens;
+    assert_eq!(
+      off2 - off1,
+      expected_growth,
+      "turn 2 grew the cache by the new suffix ({suffix_len}) + generated \
+       ({max_tokens}) only, not the whole render"
+    );
+
+    // The decisive anti-bug assertion: the growth is strictly LESS than a
+    // full re-prefill of the turn-2 render would cost. If the session were
+    // re-feeding the whole conversation, `off2 - off1` would be
+    // `full_render2 - 1 + max_tokens` instead.
+    assert!(
+      off2 - off1 < full_render2,
+      "turn 2 did NOT re-prefill the whole conversation (grew {}, full \
+       render is {full_render2})",
+      off2 - off1
+    );
+  }
+
+  #[test]
+  fn instructions_change_forces_a_cache_rebuild_not_wrong_output() {
+    // Finding 1 — the divergence fallback. Changing `instructions` between
+    // turns makes turn 2's render NOT a prefix-extension of turn 1's cached
+    // tokens (a new leading system message shifts everything). The session
+    // must detect this and rebuild the cache from scratch — feeding the full
+    // turn-2 render — rather than feed a bogus "suffix" onto a stale cache.
+    let max_tokens = 3;
+    let mut s = session(max_tokens);
+
+    let _ = s.respond("hello").expect("turn 1");
+    let off1 = s.current_cache().expect("realised")[0].offset();
+
+    // Change the system instructions — turn 2's render gains a leading
+    // `<|system|>...` block, so it no longer extends turn 1's cached prefix.
+    s.set_instructions(Some("hello world the quick".to_string()));
+    let (prompt2, _) = s
+      .build_turn_prompt("world", Role::User)
+      .expect("render turn 2");
+    let full_render2 = prompt2.len();
+
+    let _ = s.respond("world").expect("turn 2");
+    let off2 = s.current_cache().expect("realised")[0].offset();
+
+    // A rebuild re-prefills the WHOLE turn-2 render: growth from offset 0 is
+    // `full_render2 - 1 + max_tokens`. (Incremental prefill is impossible
+    // here — the divergence is real — so the larger cost is correct.)
+    assert_eq!(
+      off2,
+      full_render2 - 1 + max_tokens,
+      "instructions change rebuilt the cache from scratch (offset reset, \
+       full render re-prefilled)"
+    );
+    // The rebuilt cache offset bears no relation to turn 1's — it did not
+    // continue the stale cache.
+    assert!(
+      off2 != off1 + (full_render2 - 1 + max_tokens),
+      "the stale cache was discarded, not extended"
+    );
+  }
+
+  #[test]
   fn every_cache_layer_advances_in_lockstep() {
     // `make_prompt_cache` builds one cache per layer; a turn must advance
     // all of them equally (the model drives every layer each `forward`).
@@ -1320,10 +1677,12 @@ mod tests {
     // The Swift interrupt semantics (`testChatSessionAsyncInterrupt`): an
     // abandoned stream still commits its (partial) reply + advanced cache.
     let mut s = session(10);
+    let mut streamed = String::new();
     {
       let mut stream = s.stream_respond("hello").expect("stream");
       // consume exactly one token, then drop the stream
       let first = stream.next().expect("first token").expect("ok");
+      streamed.push_str(&first.text);
       assert!(first.finish_reason.is_none() || first.finish_reason.is_some());
     }
     // Drop committed: cache realised + a (partial) assistant turn recorded.
@@ -1331,11 +1690,71 @@ mod tests {
     assert_eq!(s.history().len(), 2, "interrupted turn still recorded");
     assert_eq!(s.history()[1].role, Role::Assistant);
 
+    // Finding 3: `commit()` finalizes the detokenizer on an interrupted
+    // standard stream, so the recorded reply is token-complete — it includes
+    // every streamed segment (and would include any tail a BPE/SPM detok
+    // withholds until `finalize()`). The recorded text must therefore start
+    // with everything the stream yielded.
+    assert!(
+      s.history()[1].content.starts_with(&streamed),
+      "recorded reply ({:?}) includes the streamed text ({streamed:?})",
+      s.history()[1].content
+    );
+
     // The session is still usable for a follow-up turn (cache reused).
     let off_before = s.current_cache().unwrap()[0].offset();
     let _ = s.respond("world").expect("follow-up turn");
     let off_after = s.current_cache().unwrap()[0].offset();
     assert!(off_after > off_before, "follow-up reused the cache");
+  }
+
+  #[test]
+  fn early_drop_then_followup_does_incremental_prefill() {
+    // Finding 1 + Finding 3 together: after an early-dropped standard
+    // stream, the next turn must still do *incremental* prefill — feeding
+    // only the new suffix. That only works if the partial reply recorded by
+    // `commit()` (after `finalize()`) round-trips to exactly the tokens the
+    // interrupted turn left in the cache; a token-incomplete reply would
+    // make turn 2's render diverge and force a (slower, but still correct)
+    // full rebuild. Asserting incremental prefill here transitively proves
+    // the committed history matches the committed cache state.
+    let max_tokens = 8;
+    let mut s = session(max_tokens);
+    {
+      let mut stream = s.stream_respond("hello world").expect("stream");
+      // Consume a few tokens, then abandon the stream mid-generation.
+      let _ = stream.next().expect("token 1").expect("ok");
+      let _ = stream.next().expect("token 2").expect("ok");
+    }
+    let off1 = s.current_cache().expect("realised")[0].offset();
+    assert!(off1 > 0, "interrupted turn advanced the cache");
+
+    // Render turn 2 the way `stream_respond_as` will.
+    let (prompt2, _) = s
+      .build_turn_prompt("the quick fox", Role::User)
+      .expect("render turn 2");
+    let full_render2 = prompt2.len();
+    assert!(
+      full_render2 > off1,
+      "turn-2 render extends past the interrupted cache"
+    );
+    let suffix_len = full_render2 - off1;
+
+    let _ = s.respond("the quick fox").expect("turn 2");
+    let off2 = s.current_cache().expect("realised")[0].offset();
+
+    // Incremental prefill: growth == new suffix + generated, NOT the whole
+    // render. If the committed partial reply did not match the cache, turn 2
+    // would diverge and rebuild (growth `full_render2 - 1 + max_tokens`).
+    assert_eq!(
+      off2 - off1,
+      suffix_len - 1 + max_tokens,
+      "follow-up after an early drop still prefilled only the new suffix"
+    );
+    assert!(
+      off2 - off1 < full_render2,
+      "follow-up did not re-prefill the whole conversation"
+    );
   }
 
   #[test]
@@ -1433,8 +1852,8 @@ mod tests {
     // The optional speculative-decoding path (the Swift
     // `SpeculativeDecodingConfig`). A `MockModel` self-draft (the same
     // deterministic model as target and draft) accepts every proposed
-    // token, so the turn completes; the session must still build the cache,
-    // accumulate the history, and stay usable for a second turn.
+    // token, so the turn completes; the session must accumulate the history
+    // and stay usable for a second turn.
     let mut s = ChatSession::builder(
       Box::new(MockModel::new(11)),
       fixture_tokenizer(),
@@ -1456,10 +1875,6 @@ mod tests {
     );
     let reply1 = s.respond("hello").expect("speculative turn 1");
     assert!(!reply1.is_empty(), "speculative decoding produced a reply");
-    assert!(
-      s.has_cache(),
-      "speculative turn realised the (rebuilt) cache"
-    );
     assert_eq!(s.history().len(), 2);
 
     // A second turn still works (the speculative path rebuilds its cache
@@ -1469,5 +1884,62 @@ mod tests {
     assert_eq!(s.history().len(), 4);
     assert_eq!(s.history()[2].content, "world");
     assert_eq!(s.history()[3].role, Role::Assistant);
+  }
+
+  #[test]
+  fn speculative_session_does_not_expose_a_saveable_cache() {
+    // Finding 2: `speculative_stream_generate` consumes its KV caches and
+    // does not return them. A speculative turn must NOT present a freshly
+    // rebuilt (offset-0) cache as the current/saveable cache — that cache
+    // does not encode the conversation, so `save_cache` would persist a
+    // cache that cannot restore the session. `has_cache()` stays `false`
+    // even after a turn, and `save_cache` returns a speculative-specific
+    // error (NOT `noCacheAvailable` — the session HAS run).
+    let mut s = ChatSession::builder(
+      Box::new(MockModel::new(11)),
+      fixture_tokenizer(),
+      cache_config(),
+    )
+    .speculative(SpeculativeDecodingConfig::new(
+      Rc::new(MockModel::new(11)),
+      cache_config(),
+    ))
+    .generate_params(GenConfig {
+      max_tokens: 3,
+      ..Default::default()
+    })
+    .build();
+
+    let _ = s.respond("hello").expect("speculative turn");
+    // History accumulated, the turn ran — but no realised cache.
+    assert_eq!(s.history().len(), 2, "the turn was still recorded");
+    assert!(
+      !s.has_cache(),
+      "a speculative session never exposes a realised cache (Finding 2)"
+    );
+    assert!(
+      s.current_cache().is_none(),
+      "no current cache for a speculative session"
+    );
+
+    // save_cache fails with the speculative-specific error, distinct from
+    // the pre-generation `noCacheAvailable`.
+    let path = std::env::temp_dir().join("mlxrs-l11-chat-session-spec-nocache.safetensors");
+    let err = s
+      .save_cache(&path)
+      .expect_err("speculative cache not saveable");
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("speculative"),
+      "speculative-specific save error surfaced: {msg}"
+    );
+    assert!(
+      !msg.contains("call respond"),
+      "not the pre-generation noCacheAvailable error: {msg}"
+    );
+    assert!(
+      !path.exists(),
+      "no cache file was written for the speculative session"
+    );
   }
 }
