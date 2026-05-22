@@ -1813,6 +1813,65 @@ fn balanced_json_object_prefix(text: &str) -> Option<(usize, usize)> {
   None
 }
 
+/// Find the first balanced top-level JSON-*array* span of `text`.
+///
+/// Round-4 sibling of [`balanced_json_object_prefix`] with the bracket pair
+/// `[` / `]`. Returns `(arr_start, arr_end)` byte offsets: `text[arr_start]`
+/// is the first `[`, and `text[arr_start..arr_end]` is the shortest complete
+/// `[ ... ]` array (depth returns to zero).
+///
+/// Like its sibling, the scanner is JSON-string aware: `[` / `]` inside a
+/// `"..."` literal — including after a `\"` escape — are not counted, so an
+/// in-element string carrying an end-tag (`</tool_call>`) is *inside* the
+/// returned span and not at the end-tag-search horizon. Scanning starts at
+/// the first `[`; bytes before it are ignored. A `]` driving depth below
+/// zero, or a never-closing array, yield `None` (caller keeps buffering).
+/// Bracket bytes are ASCII so every returned index is a UTF-8 char boundary
+/// even for multibyte content inside string values.
+///
+/// Mirrors `balanced_json_object_prefix`'s structure 1:1: same in-string /
+/// escape / depth bookkeeping, same return shape, same non-allocating
+/// panic-free discipline. Object `{`/`}` and array `[`/`]` *within the same
+/// scan* are NOT tracked separately — the scanner returns at the first
+/// matching top-level close — which is correct because any nested object's
+/// `{}` are inside the array's string-or-structural scope and don't drive
+/// the *top-level* array depth.
+fn balanced_json_array_prefix(text: &str) -> Option<(usize, usize)> {
+  let bytes = text.as_bytes();
+  let start = bytes.iter().position(|&b| b == b'[')?;
+  let mut depth: i32 = 0;
+  let mut in_string = false;
+  let mut escaped = false;
+  for (i, &b) in bytes.iter().enumerate().skip(start) {
+    if in_string {
+      if escaped {
+        escaped = false;
+      } else if b == b'\\' {
+        escaped = true;
+      } else if b == b'"' {
+        in_string = false;
+      }
+      continue;
+    }
+    match b {
+      b'"' => in_string = true,
+      b'[' => depth += 1,
+      b']' => {
+        depth -= 1;
+        if depth == 0 {
+          return Some((start, i + 1));
+        }
+        if depth < 0 {
+          // More closes than opens: not a well-formed array prefix.
+          return None;
+        }
+      }
+      _ => {}
+    }
+  }
+  None
+}
+
 /// Locate the byte offset of the *real* `end_tag` in a buffered **tagged**
 /// tool call, accounting for the end delimiter possibly occurring inside the
 /// payload (Codex round-2 finding 2).
@@ -1825,21 +1884,33 @@ fn balanced_json_object_prefix(text: &str) -> Option<(usize, usize)> {
 /// (`glm47`'s `glm_parse_json` fallback, `longcat`'s `{...}` fast path), so
 /// a JSON-string end-delimiter would cut their object in half too.
 ///
-/// Two regimes, selected by inspecting the payload:
+/// Round-4 extension: the classifier now distinguishes JSON *objects* (`{`)
+/// from JSON *arrays* (`[`). `glm47`'s `glm_parse_json` accepts a top-level
+/// `Value::Array` and pulls the first element, so a payload such as
+/// `[{"name":"echo","arguments":{"s":"</tool_call>"}}]` is valid glm47 input
+/// — but the round-3 detector only recognised `{`, sending arrays down the
+/// plain-substring path that cuts them at an in-string end-tag. The
+/// classifier now picks the matching balanced scanner per shape.
 ///
-/// - **JSON payload** — the first non-whitespace byte of the payload (the
-///   bytes after `start_tag`) is `{`: the JSON-string aware
-///   [`balanced_json_object_prefix`] scanner finds where the object actually
-///   closes, and the end tag is the first match **after** that close. While
-///   the object is still open (scanner → `None`) no end tag is accepted —
-///   any match so far is inside the unfinished object — so the caller keeps
-///   buffering until the object completes.
-/// - **Non-JSON payload** — anything else (XML, pythonic `[…]`, plain text,
-///   the kimi/longcat tag wrappers, etc.): the end tag is the first
-///   substring match, identical to the previous `contains` / `find`
-///   behaviour. None of these formats can contain a literal end tag inside
-///   their *structured* payload (they have no JSON string-value scope), so
-///   substring detection is correct for them.
+/// Three regimes, selected by inspecting the payload:
+///
+/// - **JSON object payload** — first non-whitespace byte is `{`: the
+///   JSON-string aware [`balanced_json_object_prefix`] scanner finds where
+///   the object actually closes, and the end tag is the first match **after**
+///   that close. While the object is still open (scanner → `None`) no end
+///   tag is accepted — any match so far is inside the unfinished object —
+///   so the caller keeps buffering until the object completes.
+/// - **JSON array payload** — first non-whitespace byte is `[`: same shape,
+///   using [`balanced_json_array_prefix`] (string- and bracket-aware) to
+///   find the closing `]`. The end tag is the first match after the array
+///   close; an unfinished array returns `None` (keep buffering).
+/// - **Non-JSON payload** — anything else (XML, pythonic `[func(...)]` with
+///   no leading whitespace would still be `[`, but pythonic uses *its own*
+///   wrapper tags `<|tool_call_start|>` / `<|tool_call_end|>` whose start
+///   never appears inside another parser's payload; the array-balanced
+///   scanner is therefore safe for any tagged parser whose payload happens
+///   to begin with `[`): the end tag is the first substring match,
+///   identical to the previous `contains` / `find` behaviour.
 ///
 /// Returns the offset (into `buffer`) at which `end_tag` begins, or `None`
 /// when no end tag has been confirmed yet (keep collecting). `end_tag` is
@@ -1853,36 +1924,70 @@ fn find_tagged_end_tag(buffer: &str, start_tag: &str, end_tag: &str) -> Option<u
     None => return buffer.find(end_tag),
   };
   let payload = &buffer[payload_at..];
-  if payload_starts_with_json_object(payload) {
-    // JSON payload — the end tag is the first match strictly after the
-    // balanced object close. `balanced_json_object_prefix` is JSON-string
-    // aware: an `end_tag` inside a `"..."` value is *within* `obj_end`, so
-    // the post-object search skips it. While the object is still open the
-    // scanner returns `None` and we propagate that — no end tag yet.
-    let (_, obj_end) = balanced_json_object_prefix(payload)?;
-    let rel = payload[obj_end..].find(end_tag)?;
-    Some(payload_at + obj_end + rel)
-  } else {
-    // Non-JSON payload — naive substring search.
-    buffer[payload_at..]
-      .find(end_tag)
-      .map(|rel| payload_at + rel)
+  match classify_json_payload_start(payload) {
+    JsonPayloadStart::Object => {
+      // JSON object payload — the end tag is the first match strictly after
+      // the balanced object close. `balanced_json_object_prefix` is
+      // JSON-string aware: an `end_tag` inside a `"..."` value is *within*
+      // `obj_end`, so the post-object search skips it. While the object is
+      // still open the scanner returns `None` and we propagate that — no end
+      // tag yet.
+      let (_, obj_end) = balanced_json_object_prefix(payload)?;
+      let rel = payload[obj_end..].find(end_tag)?;
+      Some(payload_at + obj_end + rel)
+    }
+    JsonPayloadStart::Array => {
+      // JSON array payload — same shape as the object case, using the
+      // bracket-aware balanced scanner. An end tag inside any of the array's
+      // string elements is `< arr_end` and therefore skipped.
+      let (_, arr_end) = balanced_json_array_prefix(payload)?;
+      let rel = payload[arr_end..].find(end_tag)?;
+      Some(payload_at + arr_end + rel)
+    }
+    JsonPayloadStart::None => {
+      // Non-JSON payload — naive substring search.
+      buffer[payload_at..]
+        .find(end_tag)
+        .map(|rel| payload_at + rel)
+    }
   }
 }
 
-/// Whether `payload` (the bytes between `start_tag` and an as-yet-unknown
-/// `end_tag`) looks like a top-level JSON object: skip leading ASCII
-/// whitespace, then check whether the next byte is `{`.
+/// Shape classification of a tagged tool-call payload's leading non-whitespace
+/// byte, driving the dynamic [`find_tagged_end_tag`] dispatch.
 ///
 /// JSON whitespace per RFC 8259 §2 is exactly space, tab, LF, CR — all ASCII,
 /// so a byte-level scan is correct even with multibyte content elsewhere.
-/// Returns `false` for an empty / all-whitespace payload (no JSON object
-/// started yet — we'll re-check on the next chunk).
-fn payload_starts_with_json_object(payload: &str) -> bool {
-  payload
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonPayloadStart {
+  /// Empty / all-whitespace / anything that is not `{` or `[`. Plain
+  /// substring end-tag search applies.
+  None,
+  /// Payload begins with `{` (after optional RFC-8259 whitespace) — drives
+  /// the [`balanced_json_object_prefix`] scan.
+  Object,
+  /// Payload begins with `[` (after optional RFC-8259 whitespace) — drives
+  /// the [`balanced_json_array_prefix`] scan. Round-4 fix: glm47's
+  /// `glm_parse_json` fallback accepts `Value::Array`, so a JSON-array
+  /// payload must also use a balanced (string-aware) scan rather than the
+  /// plain substring search that would cut on an in-string end tag.
+  Array,
+}
+
+/// Classify the leading shape of `payload` (the bytes between `start_tag`
+/// and an as-yet-unknown `end_tag`) into one of [`JsonPayloadStart`].
+///
+/// Skips leading ASCII whitespace then peeks one byte. Panic-free and
+/// allocation-free.
+fn classify_json_payload_start(payload: &str) -> JsonPayloadStart {
+  match payload
     .bytes()
     .find(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
-    == Some(b'{')
+  {
+    Some(b'{') => JsonPayloadStart::Object,
+    Some(b'[') => JsonPayloadStart::Array,
+    _ => JsonPayloadStart::None,
+  }
 }
 
 /// Whether `buffer` is a prefix-compatible partial (or full) match of `tag`:
@@ -2451,7 +2556,8 @@ mod tests {
     // a payload that *looks* like a JSON object (first non-whitespace byte is
     // `{`) uses the balanced-object scan; anything else uses substring
     // detection. No per-parser flag, so glm47/longcat JSON-fallback payloads
-    // get the JSON-aware path too.
+    // get the JSON-aware path too. Round-4 extends this with a third regime
+    // for top-level JSON *arrays* (`[`), covered separately below.
 
     // JSON-object payload: end tag inside a string value is skipped; the
     // first end tag after the balanced object is the real one.
@@ -2487,19 +2593,87 @@ mod tests {
   }
 
   #[test]
-  fn payload_starts_with_json_object_classification() {
-    // The dynamic JSON-vs-substring switch hinges on this helper; spot-check
-    // the boundary cases that matter in practice.
-    assert!(payload_starts_with_json_object("{}"));
-    assert!(payload_starts_with_json_object("  {\"k\":1}"));
-    assert!(payload_starts_with_json_object("\n\t{}"));
-    // Empty / all-whitespace: not yet an object (re-check on next chunk).
-    assert!(!payload_starts_with_json_object(""));
-    assert!(!payload_starts_with_json_object("   "));
-    // Anything else (XML, brackets, plain text) is NOT a JSON object payload.
-    assert!(!payload_starts_with_json_object("<invoke>"));
-    assert!(!payload_starts_with_json_object("[func()]"));
-    assert!(!payload_starts_with_json_object("name "));
+  fn find_tagged_end_tag_json_array_dispatch() {
+    // Round-4 finding: the dynamic detector must also recognise top-level
+    // JSON *arrays* — glm47's `glm_parse_json` accepts `Value::Array` and
+    // takes the first object. A valid glm47 payload of the form
+    // `[{"name":"echo","arguments":{"s":"</tool_call>"}}]` previously hit
+    // the plain-substring path because the round-3 classifier only matched
+    // `{`; the scanner then matched the in-string `</tool_call>` and
+    // truncated the buffer mid-array.
+
+    // JSON-array payload: in-string end tag inside an element is skipped;
+    // the first end tag *after* the balanced array close is the real one.
+    let buf = r#"<tool_call>[{"s":"</tool_call>"}]</tool_call>"#;
+    let pos = find_tagged_end_tag(buf, "<tool_call>", "</tool_call>")
+      .expect("real end tag after the balanced array");
+    assert_eq!(&buf[..pos], r#"<tool_call>[{"s":"</tool_call>"}]"#);
+    assert_eq!(&buf[pos..], "</tool_call>");
+
+    // JSON-array payload with leading whitespace: still detected as array.
+    let buf_ws = "<tool_call>  \n[{\"s\":\"</tool_call>\"}]</tool_call>";
+    let pos_ws = find_tagged_end_tag(buf_ws, "<tool_call>", "</tool_call>")
+      .expect("ws-leading array still uses balanced scan");
+    assert_eq!(&buf_ws[pos_ws..], "</tool_call>");
+
+    // Array still open (no matching `]` yet) — no end tag accepted.
+    assert_eq!(
+      find_tagged_end_tag(
+        r#"<tool_call>[{"s":"</tool_call>"#,
+        "<tool_call>",
+        "</tool_call>",
+      ),
+      None
+    );
+
+    // Multi-element array with multiple in-string end tags: still extracted
+    // after the array closes.
+    let multi = r#"<tool_call>[{"s":"</tool_call>"},{"t":"</tool_call>"}]</tool_call>"#;
+    let mp =
+      find_tagged_end_tag(multi, "<tool_call>", "</tool_call>").expect("multi-element array");
+    assert_eq!(
+      &multi[..mp],
+      r#"<tool_call>[{"s":"</tool_call>"},{"t":"</tool_call>"}]"#
+    );
+  }
+
+  #[test]
+  fn payload_starts_with_json_value_classification() {
+    // The dynamic JSON-vs-substring switch hinges on this classifier; cover
+    // every variant (`Object`, `Array`, `None`) plus the boundary cases that
+    // matter in practice (whitespace skipping, partial bytes, multibyte).
+    let cases: &[(&str, JsonPayloadStart)] = &[
+      // None: empty / all-whitespace / non-JSON leading byte.
+      ("", JsonPayloadStart::None),
+      ("   ", JsonPayloadStart::None),
+      ("\t\n\r ", JsonPayloadStart::None),
+      ("<", JsonPayloadStart::None),
+      ("<invoke>", JsonPayloadStart::None),
+      ("name ", JsonPayloadStart::None),
+      ("123", JsonPayloadStart::None),
+      (r#""str""#, JsonPayloadStart::None),
+      ("null", JsonPayloadStart::None),
+      // Object: `{` after RFC-8259 whitespace.
+      ("{}", JsonPayloadStart::Object),
+      ("{\"k\":1}", JsonPayloadStart::Object),
+      ("  {\"k\":1}", JsonPayloadStart::Object),
+      ("\n\t{}", JsonPayloadStart::Object),
+      // Array: `[` after RFC-8259 whitespace — round-4 addition.
+      ("[]", JsonPayloadStart::Array),
+      ("[1,2,3]", JsonPayloadStart::Array),
+      ("  [{\"a\":1}]", JsonPayloadStart::Array),
+      ("\n\t[]", JsonPayloadStart::Array),
+      // Multibyte content after whitespace doesn't crash the classifier and
+      // is correctly classified `None` (first non-ws byte is a UTF-8 lead).
+      ("  é", JsonPayloadStart::None),
+    ];
+    for (input, expected) in cases {
+      assert_eq!(
+        classify_json_payload_start(input),
+        *expected,
+        "classify_json_payload_start({input:?})"
+      );
+    }
   }
 
   // --- helper unit coverage ------------------------------------------------
@@ -2540,6 +2714,51 @@ mod tests {
       balanced_json_object_prefix(r#"{"x":"{{{{"}"#),
       Some((0, 12))
     );
+  }
+
+  #[test]
+  fn balanced_json_array_prefix_basic() {
+    // Round-4: arrays must scan with the same string/escape/depth discipline
+    // as objects.
+
+    // No bracket at all -> no array.
+    assert_eq!(balanced_json_array_prefix(""), None);
+    assert_eq!(balanced_json_array_prefix("plain text"), None);
+    assert_eq!(balanced_json_array_prefix("{not_array:1}"), None);
+
+    // Smallest array, scalars, nested arrays, and an array of objects.
+    assert_eq!(balanced_json_array_prefix("[]"), Some((0, 2)));
+    assert_eq!(balanced_json_array_prefix("[1,2,3]"), Some((0, 7)));
+    assert_eq!(balanced_json_array_prefix(r#"[{"a":1}]"#), Some((0, 9)));
+    assert_eq!(balanced_json_array_prefix("[[1],[2]]"), Some((0, 9)));
+
+    // String-aware: a `]` inside a `"..."` element value is not counted.
+    assert_eq!(
+      balanced_json_array_prefix(r#"["unrelated]"]"#),
+      Some((0, 14))
+    );
+    // Escaped quote inside a string keeps string state correct.
+    assert_eq!(balanced_json_array_prefix(r#"["a\"]b"]"#), Some((0, 9)));
+    // Bracket-only string body: every bracket is inside the string.
+    assert_eq!(balanced_json_array_prefix(r#"["]]]]"]"#), Some((0, 8)));
+
+    // Unbalanced / still open -> keep buffering (None).
+    assert_eq!(balanced_json_array_prefix("["), None);
+    assert_eq!(balanced_json_array_prefix("[1,2"), None);
+    assert_eq!(balanced_json_array_prefix(r#"[{"a":["#), None);
+
+    // Leading text before the first `[` is excluded from the array span.
+    let s = "hi [1,2] bye";
+    let (st, en) = balanced_json_array_prefix(s).expect("balanced array");
+    assert_eq!(&s[..st], "hi ");
+    assert_eq!(&s[st..en], "[1,2]");
+
+    // Trailing text after the array is excluded too — the suffix is
+    // re-examined by the caller, mirroring the object scanner.
+    let t = "[1,2,3] done";
+    let (st2, en2) = balanced_json_array_prefix(t).expect("balanced array");
+    assert_eq!(&t[st2..en2], "[1,2,3]");
+    assert_eq!(&t[en2..], " done");
   }
 
   #[test]
@@ -2730,6 +2949,60 @@ mod tests {
     assert_eq!(c[0].name, "echo");
     assert_eq!(c[0].arguments, serde_json::json!({"s": "</tool_call>"}));
   }
+
+  #[test]
+  fn streaming_glm47_json_array_end_tag_in_string_extracted() {
+    // Round-4 finding: glm47's `glm_parse_json` also accepts `Value::Array`
+    // (matches `[{...}, ...]` and takes the first object). A payload of the
+    // form `[{"name":"echo","arguments":{"s":"</tool_call>"}}]` previously
+    // hit the plain-substring path (round-3 only matched leading `{`); the
+    // scanner truncated at the in-string `</tool_call>` and either dropped
+    // the call or leaked the rest as display text. The round-4 array-shape
+    // classifier + balanced array scanner accepts the end tag only after the
+    // top-level `]` closes, so the call extracts intact.
+    let (d, c) = run_with_parser(
+      Box::new(Glm47),
+      &[r#"<tool_call>[{"name":"echo","arguments":{"s":"</tool_call>"}}]</tool_call>"#],
+    );
+    assert_eq!(d, "", "no suffix leaks (end tag matched after the array)");
+    assert_eq!(c.len(), 1, "glm47 JSON-array call must extract intact");
+    assert_eq!(c[0].name, "echo");
+    assert_eq!(
+      c[0].arguments,
+      serde_json::json!({"s": "</tool_call>"}),
+      "in-string delimiter preserved verbatim"
+    );
+  }
+
+  #[test]
+  fn streaming_glm47_json_array_end_tag_in_string_split_across_chunks() {
+    // Same as above but with the chunk boundary inside the in-string end tag
+    // — the premature `</tool_call>` inside a still-open top-level array
+    // must not end collection.
+    let (d, c) = run_with_parser(
+      Box::new(Glm47),
+      &[
+        r#"<tool_call>[{"name":"echo","arguments":{"s":"<"#,
+        r#"/tool_call>"}}]</tool_call>"#,
+      ],
+    );
+    assert_eq!(d, "");
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].name, "echo");
+    assert_eq!(c[0].arguments, serde_json::json!({"s": "</tool_call>"}));
+  }
+
+  // Negative finding (round-4 parser audit): `longcat` and `json_tools` do
+  // NOT accept top-level JSON arrays — `longcat.parse` only takes the `{`
+  // fast-path, and `json_tools.parse` requires a top-level object with
+  // `name`/`arguments` keys (an array fails `v.get("name")`). The round-4
+  // classifier + balanced array scanner still defends those parsers' buffers
+  // (an in-string `</tool_call>` inside a JSON-array payload no longer cuts
+  // the buffer mid-array), even though the parsers themselves reject the
+  // resulting array shape; that's preferable to the previous behaviour of
+  // truncating the buffer at the wrong byte. No dedicated parse-result
+  // streaming tests are added for those parsers because their `parse()`
+  // legitimately rejects an array, so the call surface there is unchanged.
 
   #[test]
   fn streaming_longcat_json_fastpath_end_tag_in_string_extracted() {
