@@ -50,6 +50,27 @@
 //! exponentiate anything), so it still receives the raw post-processor
 //! logits.
 //!
+//! **Tiny-temp f16 safety net (Codex review R3):** the R2 max-shift caps
+//! the sampler's input at `0`, but `categorical_sampling` then computes
+//! `scalar_like(1/temp, logits) * logits` IN THE LOGITS DTYPE. For `f16`
+//! logits + `temp < 1/65504 ≈ 1.526e-5`, the `1/temp` scalar casts to
+//! `+Inf`; the max-shifted row's max is exactly `0`, so `0 * Inf = NaN`
+//! and the tail becomes `-Inf` — `random::categorical` then draws from
+//! a non-finite distribution (silent collapse / wrong tokens). When the
+//! per-step dtype + reciprocal check fires, the step routes through
+//! `argmax_sample` directly (effectively-zero temperature IS the greedy
+//! sampler) — bypassing `categorical_sampling` entirely. The normalization
+//! arm still runs when `collect_logprobs == true`, so the user-observable
+//! `[V]` log-softmax is unchanged; only the SAMPLER is replaced. The
+//! underlying defect lives in `sample::categorical_sampling`
+//! (multiplying by `1/temp` in the logits dtype instead of upcast-then-
+//! scale or divide-instead-of-multiply); the structural fix is tracked
+//! as `LM-6` in `docs/rust-golden-standard-followups.md` for a separate
+//! follow-up PR per `feedback_review_finding_must_be_in_diff`. bf16 has
+//! f32-range exponent so its reciprocal never overflows for any
+//! `make_sampler`-validator-allowed `temp` (the floor is below
+//! `f32`'s positive-normal range); f32 / f64 likewise stay finite.
+//!
 //! **Exact per-step order (mlx-lm `generate_step._step`, lines 396-422):**
 //!
 //! 1. `logits = model.forward(last_tok[1, 1], &mut cache)` — `[1, 1, V]`,
@@ -76,7 +97,11 @@
 //!    shift ran (stochastic opt-out), and the raw post-processor `logits`
 //!    if neither did (pure-greedy opt-out). Every sampler in
 //!    [`make_sampler`] is shift-invariant or softmaxes internally except
-//!    `top_p`, which forces step 4 to run.
+//!    `top_p`, which forces step 4 to run. **R3 tiny-temp-f16 bypass:**
+//!    when `1/temp` overflows the logits dtype's finite range (only
+//!    possible for f16 + `temp < 1/65504`), the configured sampler is
+//!    bypassed and `argmax_sample` runs directly — see the module-level
+//!    "tiny-temp f16 safety net" note.
 //! 6. yield `GenStep { token, logprobs }` — `logprobs` is
 //!    `Some(logprobs.squeeze(0))` when [`GenConfig::collect_logprobs`] is
 //!    `true`, `None` otherwise (L3 opt-in; mlx-lm always yields the
@@ -110,6 +135,7 @@ use std::cell::RefCell;
 
 use crate::{
   array::Array,
+  dtype::Dtype,
   error::{Error, Result, try_extend_from_slice, try_with_capacity},
   lm::{cache::KvCache, model::Model, sample},
   ops,
@@ -629,6 +655,26 @@ pub struct Generator<'a, M: Model> {
   /// Precomputed from `GenConfig.temp` so the per-step `match` is a
   /// single bool check.
   temp_stochastic: bool,
+  /// `1.0 / cfg.temp` in `f64` when `temp_stochastic`, else `None`.
+  /// Used per-step to detect "the reciprocal overflows the logits dtype's
+  /// finite range" (Codex review R3): even after the cheap max-shift in
+  /// the opt-out arm, `categorical_sampling` multiplies by
+  /// `scalar_like(1.0/temp, logits)` IN THE LOGITS DTYPE — for f16 +
+  /// `temp < 1/65504 ≈ 1.526e-5`, the reciprocal casts to `+Inf`. The
+  /// max-shifted row has its max at exactly `0`, so `0 * Inf = NaN`,
+  /// the tail becomes `-Inf`, and `random::categorical` silently draws
+  /// from a non-finite distribution. When the per-step check fires the
+  /// step routes through `sample::argmax_sample` (effectively-zero temp
+  /// IS greedy), bypassing `categorical_sampling` entirely. f64
+  /// preserves the precision needed for the f16 boundary check
+  /// (`f32 1.0/temp` would already overflow for the same temps we want
+  /// to detect). `None` for greedy runs — they never enter the
+  /// stochastic arm. The underlying defect in `sample::categorical_sampling`
+  /// is tracked as LM-6 in `docs/rust-golden-standard-followups.md`;
+  /// this guard is the in-diff safety net pending the structural fix
+  /// (upcast-before-scale or divide-instead-of-multiply) in a separate
+  /// follow-up PR per `feedback_review_finding_must_be_in_diff`.
+  temp_recip_f64: Option<f64>,
   /// `true` once prompt prefill has run (it runs on the first `next()`).
   prefilled: bool,
   /// `true` until the first decode step has run (it feeds the prompt tail;
@@ -723,7 +769,42 @@ impl<M: Model> Generator<'_, M> {
     //         (`argmax_sample`) is shift-invariant numerically as well
     //         (it doesn't exponentiate), so it stays the true zero-cost
     //         path: no reduce, no broadcast, no allocation.
+    //
+    //    **f16 tiny-temp safety net (Codex review R3):** the R2 max-shift
+    //    bounds the sampler's input to ≤ 0, but `categorical_sampling`
+    //    still multiplies by `scalar_like(1/temp, logits)` IN THE LOGITS
+    //    DTYPE. For `f16` + `temp < 1/65504 ≈ 1.526e-5`, the `1/temp`
+    //    scalar casts to `+Inf`; the max-shifted row's max is exactly
+    //    `0`, so `0 * Inf = NaN` and the tail becomes `-Inf` →
+    //    `random::categorical` then draws from a non-finite distribution
+    //    (silent collapse / wrong tokens). When the per-step dtype +
+    //    reciprocal check fires (see `temp_recip_overflows_in_dtype`
+    //    below) we route through `argmax_sample` directly: an
+    //    effectively-zero temperature IS the greedy sampler, so this
+    //    preserves the "do what the user asked" semantic without
+    //    materializing the `0 * Inf` graph. The underlying defect lives
+    //    in `sample::categorical_sampling` (multiplying by `1/temp` in
+    //    the logits dtype instead of upcast-then-scale or
+    //    divide-instead-of-multiply); it is tracked as LM-6 in
+    //    `docs/rust-golden-standard-followups.md` for a separate
+    //    follow-up PR per `feedback_review_finding_must_be_in_diff`.
     let needs_normalization = self.collect_logprobs || self.needs_logprobs;
+    let logits_dtype = logits.dtype()?;
+    let temp_recip_overflows_in_dtype = match (self.temp_recip_f64, logits_dtype) {
+      // f16 reciprocal-overflow threshold = f16::MAX (65504.0). The
+      // categorical scalar `scalar_like(1/temp, f16-logits)` casts to
+      // f16 via `astype`, which clamps to ±Inf above f16::MAX.
+      (Some(r), Dtype::F16) => r > 65504.0_f64,
+      // bf16 has f32-range exponent (max ≈ 3.39e38); the reciprocal
+      // would need `temp < ~2.95e-39` to overflow, which is already
+      // below f32's positive-normal floor (~1.18e-38). Treat as never
+      // overflowing for the standard configs the loop sees.
+      (Some(_), Dtype::BF16) => false,
+      // f32 / f64 / etc.: the reciprocal stays finite for every
+      // user-supplied `temp` the make_sampler validator allows (it
+      // requires `temp.is_finite()` and `temp > 0`).
+      _ => false,
+    };
     let sampler_input: Option<Array> = match (needs_normalization, self.temp_stochastic) {
       // Full normalization (collect_logprobs and/or top_p).
       (true, _) => {
@@ -746,7 +827,24 @@ impl<M: Model> Generator<'_, M> {
     //    (`(false, true)` — stochastic opt-out); otherwise feed the raw
     //    `logits` (pure-greedy opt-out — `argmax(logits) == argmax(logits
     //    - c)` for any scalar `c`).
-    let mut sampled = (self.sampler)(sampler_input.as_ref().unwrap_or(&logits))?;
+    //
+    //    **R3 tiny-temp-f16 bypass:** when
+    //    `temp_recip_overflows_in_dtype == true` (f16 logits + temp <
+    //    1/65504), we skip `self.sampler` and call
+    //    `sample::argmax_sample` directly. The configured
+    //    `categorical_sampling` would compute `0 * Inf = NaN` after the
+    //    `1/temp` scalar casts to `+Inf` in f16, producing a non-finite
+    //    distribution; argmax matches the "effectively-zero temperature
+    //    IS greedy" semantic and is shift-invariant so reads `logits`
+    //    directly. The full-normalization branch still runs above when
+    //    `collect_logprobs == true` so the yielded `logprobs` vector is
+    //    the unchanged log-softmax — only the SAMPLER is bypassed, not
+    //    the user-observable log-probability surface.
+    let mut sampled = if temp_recip_overflows_in_dtype {
+      sample::argmax_sample(&logits)?
+    } else {
+      (self.sampler)(sampler_input.as_ref().unwrap_or(&logits))?
+    };
 
     // 6. token boundary: the ONLY materialization (mlx-lm `y.item()`).
     //    `argmax` / `categorical` both yield `U32`.
@@ -992,6 +1090,16 @@ pub fn generate_step<'a, M: Model>(
   // `temp == 0` the sampler is pure argmax (shift-invariant numerically), so
   // the raw-logit path is safe — see `temp_stochastic` on `Generator`.
   let temp_stochastic = cfg.temp > 0.0;
+  // R3 tiny-temp safety net: precompute `1/temp` in f64 so the per-step
+  // dtype check can compare against the logits dtype's finite range
+  // (e.g. `> 65504` for f16). Only meaningful when the stochastic path
+  // can run; greedy never enters `categorical_sampling`. See
+  // `temp_recip_f64` on `Generator`.
+  let temp_recip_f64 = if temp_stochastic {
+    Some(1.0_f64 / cfg.temp as f64)
+  } else {
+    None
+  };
   match built {
     Ok((sampler, processors)) => Generator {
       model,
@@ -1009,6 +1117,7 @@ pub fn generate_step<'a, M: Model>(
       collect_logprobs,
       needs_logprobs,
       temp_stochastic,
+      temp_recip_f64,
       prefilled: false,
       first_step: true,
       pending_err: None,
@@ -1036,6 +1145,7 @@ pub fn generate_step<'a, M: Model>(
       collect_logprobs,
       needs_logprobs,
       temp_stochastic,
+      temp_recip_f64,
       prefilled: true,
       first_step: false,
       pending_err: Some(e),

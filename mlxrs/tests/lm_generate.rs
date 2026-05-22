@@ -15,7 +15,7 @@
 use std::{collections::HashSet, fs, io::Write, path::PathBuf, process};
 
 use mlxrs::{
-  Array,
+  Array, Dtype,
   lm::{
     cache::{CacheConfig, KvCache, make_prompt_cache},
     generate::{
@@ -166,6 +166,63 @@ impl Model for RecordingModel {
       data.extend_from_slice(&self.bias);
     }
     Array::from_slice::<f32>(&data, &(batch, seq, vocab))
+  }
+}
+
+/// A `Model` returning logits in a chosen `dtype` (f16/bf16/f32) — drives
+/// the R3 tiny-temp dtype-aware safety-net path (`categorical_sampling`'s
+/// `1/temp` scalar overflows in f16 for `temp < 1/65504`, and the loop's
+/// per-step dtype check must route through `argmax_sample` instead). The
+/// f32 logits are built first, then `astype(dtype)` casts them to the
+/// target dtype — same fixture shape as the `MockModel::with_bias` flow,
+/// the cast is the only difference.
+struct DtypedMockModel {
+  bias: Vec<f32>,
+  n_kv_heads: usize,
+  head_dim: usize,
+  dtype: Dtype,
+}
+impl DtypedMockModel {
+  fn with_bias(bias: Vec<f32>, dtype: Dtype) -> Self {
+    Self {
+      bias,
+      n_kv_heads: 1,
+      head_dim: 2,
+      dtype,
+    }
+  }
+}
+impl Model for DtypedMockModel {
+  fn forward(&self, tokens: &Array, cache: &mut [Box<dyn KvCache>]) -> mlxrs::Result<Array> {
+    let shape = tokens.shape();
+    let (batch, seq) = match shape.as_slice() {
+      [b, s] => (*b, *s),
+      [s] => (1, *s),
+      _ => {
+        return Err(mlxrs::Error::ShapeMismatch {
+          message: format!("DtypedMockModel::forward expects [B, S] tokens, got {shape:?}"),
+        });
+      }
+    };
+    let vocab = self.bias.len();
+    for layer in cache.iter_mut() {
+      let elems = batch * self.n_kv_heads * seq * self.head_dim;
+      let k = Array::from_slice::<f32>(
+        &vec![1.0_f32; elems],
+        &(batch, self.n_kv_heads, seq, self.head_dim),
+      )?;
+      let v = Array::from_slice::<f32>(
+        &vec![2.0_f32; elems],
+        &(batch, self.n_kv_heads, seq, self.head_dim),
+      )?;
+      layer.update(&k, &v)?;
+    }
+    let mut data = Vec::with_capacity(batch * seq * vocab);
+    for _ in 0..batch * seq {
+      data.extend_from_slice(&self.bias);
+    }
+    let logits_f32 = Array::from_slice::<f32>(&data, &(batch, seq, vocab))?;
+    logits_f32.astype(self.dtype)
   }
 }
 
@@ -1347,6 +1404,133 @@ fn generate_step_opt_out_greedy_zero_temp() {
   );
   for t in &tokens_a {
     assert_eq!(*t, 1, "argmax(bias) == 1 (bias[1] == 5.0)");
+  }
+}
+
+/// L3 zero-cost opt-out — R3 tiny-temp f16 numerical safety net (Codex
+/// review R3). The R2 max-shift caps the opt-out sampler input at `0`, but
+/// `categorical_sampling` still computes `scalar_like(1/temp, logits) *
+/// logits` IN THE LOGITS DTYPE. For f16 + `temp < 1/65504 ≈ 1.526e-5`, the
+/// `1/temp` scalar casts to `+Inf`; the max-shifted row's max is exactly
+/// `0`, so `0 * Inf = NaN` and the tail becomes `-Inf` — `random::categorical`
+/// then draws from a non-finite distribution (silent collapse / wrong
+/// tokens). The R3 in-diff fix: per-step dtype check; when `1/temp`
+/// overflows the logits dtype's finite range, route through
+/// `argmax_sample` directly (effectively-zero temperature IS the greedy
+/// sampler), bypassing `categorical_sampling` entirely.
+///
+/// Observable proof: with f16 logits + `temp = 1.0e-6` (well below the
+/// f16 reciprocal-overflow threshold of `1.526e-5`) and biased logits
+/// whose argmax is unambiguous, the bypass must produce the argmax token
+/// every step (the greedy result), NOT a uniform-ish draw from a
+/// non-finite distribution. Without the bypass the same config would
+/// emit non-argmax tokens (NaN/-Inf categorical draws) — the assertion
+/// `tokens == [argmax-id; max_tokens]` is the load-bearing witness.
+///
+/// The underlying defect (`categorical_sampling`'s in-dtype `1/temp`
+/// multiply) is tracked as LM-6 in `docs/rust-golden-standard-followups.md`
+/// for a separate follow-up PR per `feedback_review_finding_must_be_in_diff`;
+/// this test pins the in-diff safety net.
+#[test]
+fn generate_step_opt_out_f16_tiny_temp_safe() {
+  // bias[3] = 5.0 dominates; argmax == 3 in every dtype the cast preserves.
+  let bias = vec![0.0_f32, 1.0, 2.0, 5.0, 1.5];
+  let argmax_id = 3u32;
+  let prompt = [1u32];
+  let max_tokens = 4;
+  // `temp = 1.0e-6` ⇒ `1/temp = 1.0e6`, well above f16::MAX (65504), so
+  // the categorical scalar would cast to `+Inf` in f16 and the in-dtype
+  // multiply would propagate `0 * Inf = NaN` post-max-shift.
+  let tiny_temp = 1.0e-6_f32;
+  assert!(
+    (1.0_f64 / tiny_temp as f64) > 65504.0,
+    "test premise: 1/temp must overflow f16::MAX, got 1/{tiny_temp} = {}",
+    1.0_f64 / tiny_temp as f64
+  );
+
+  // f16 logits + tiny temp + opt-out (default collect_logprobs=false).
+  // With the R3 bypass the loop sees the dtype + reciprocal-overflow and
+  // routes to `argmax_sample` — every emitted token must be `argmax_id`.
+  let model = DtypedMockModel::with_bias(bias.clone(), Dtype::F16);
+  let cfg = GenConfig {
+    max_tokens,
+    eos: vec![],
+    temp: tiny_temp,
+    seed: Some(42),
+    ..GenConfig::default()
+  };
+  let tokens: Vec<u32> = generate_step(&model, &prompt, cache(1), cfg)
+    .map(|r| r.unwrap().token)
+    .collect();
+  assert_eq!(tokens.len(), max_tokens, "{max_tokens} tokens produced");
+  for (i, t) in tokens.iter().enumerate() {
+    assert_eq!(
+      *t, argmax_id,
+      "R3 bypass: f16 + tiny temp must route to argmax (greedy); step {i} \
+       got {t} != argmax_id {argmax_id} (sampler hit the 0*Inf=NaN path)"
+    );
+  }
+
+  // Cross-dtype consistency: f32 logits + the same tiny temp must produce
+  // the same argmax token (f32 reciprocal stays finite — no bypass needed,
+  // the stochastic-opt-out max-shift handles it normally, and with a
+  // dominant bias the sampler still picks the argmax).
+  let model_f32 = DtypedMockModel::with_bias(bias.clone(), Dtype::F32);
+  let cfg_f32 = GenConfig {
+    max_tokens,
+    eos: vec![],
+    temp: tiny_temp,
+    seed: Some(42),
+    ..GenConfig::default()
+  };
+  let tokens_f32: Vec<u32> = generate_step(&model_f32, &prompt, cache(1), cfg_f32)
+    .map(|r| r.unwrap().token)
+    .collect();
+  for (i, t) in tokens_f32.iter().enumerate() {
+    assert_eq!(
+      *t, argmax_id,
+      "f32 cross-check: tiny temp + dominant bias still argmax at step {i}, \
+       got {t} != argmax_id {argmax_id}"
+    );
+  }
+
+  // collect_logprobs=true under the same f16 + tiny-temp regime: the
+  // R3 bypass still fires (the sampler is bypassed), and the yielded
+  // logprobs vector is the full-normalization log-softmax (the
+  // normalization arm runs because collect_logprobs forces it). The
+  // logprobs must be finite (no NaN/-Inf bleed from the bypassed
+  // sampler path) and the chosen token must still be the argmax.
+  let model_lp = DtypedMockModel::with_bias(bias, Dtype::F16);
+  let cfg_lp = GenConfig {
+    max_tokens,
+    eos: vec![],
+    temp: tiny_temp,
+    seed: Some(42),
+    collect_logprobs: true,
+    ..GenConfig::default()
+  };
+  let steps: Vec<GenStep> = generate_step(&model_lp, &prompt, cache(1), cfg_lp)
+    .map(|r| r.unwrap())
+    .collect();
+  for (i, s) in steps.iter().enumerate() {
+    assert_eq!(
+      s.token, argmax_id,
+      "collect_logprobs=true + R3 bypass: step {i}"
+    );
+    let mut lp = s
+      .logprobs
+      .as_ref()
+      .expect("collect_logprobs=true ⇒ Some")
+      .astype(Dtype::F32)
+      .unwrap();
+    let v = lp.to_vec::<f32>().unwrap();
+    assert_eq!(v.len(), 5, "yielded [V] logprobs vector at step {i}");
+    for (j, x) in v.iter().enumerate() {
+      assert!(
+        x.is_finite(),
+        "logprobs entry [{i}, {j}] = {x} must be finite (no NaN/-Inf from R3 bypass)"
+      );
+    }
   }
 }
 
