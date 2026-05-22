@@ -18,3 +18,13 @@ pub mod load;
 pub mod model;
 pub mod nn;
 pub mod sample;
+/// Tool-call format parsers — Python `mlx_lm.tool_parsers.*`.
+///
+/// Surface re-export of [`crate::tokenizer::tools`] under the canonical
+/// `lm::tool_parsers` path; the parser logic and per-format documentation
+/// live in the module that owns the [`crate::tokenizer::wrapper::Tokenizer`]
+/// consumer. Gated on the `tokenizer-tools` capability feature, which the
+/// `lm` umbrella always pulls in.
+#[cfg(feature = "tokenizer-tools")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokenizer-tools")))]
+pub mod tool_parsers;
