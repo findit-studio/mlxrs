@@ -1227,6 +1227,129 @@ fn generate_step_top_p_forces_normalization_even_when_off() {
   );
 }
 
+/// L3 zero-cost opt-out — stochastic max-shift numerical safety (Codex
+/// review R2). The opt-out path used to feed RAW post-processor logits to
+/// `categorical_sampling`, which multiplies by `1/temp` BEFORE the eventual
+/// internal `softmax`. With a large `logit_bias` (e.g. `+50`) and a small
+/// `temp` (e.g. `0.1` ⇒ `1/temp = 10`), the scaled logit reaches `+500`,
+/// which overflows to `+inf` in f16/bf16 long before shift-invariance can
+/// save us. The fix applies a cheap `logits - max(logits, keepdims=True)`
+/// max-shift in the opt-out path when `temp > 0`, capping the input at 0 so
+/// `exp` is bounded for every dtype.
+///
+/// The observable proof: the same fixed-seed stochastic config — large
+/// positive bias on one entry, small `temp` — must produce the same token
+/// stream whether `collect_logprobs == true` (full normalization runs) or
+/// `collect_logprobs == false` (only the cheap max-shift runs). Before the
+/// fix, the opt-out path's `1/temp` scaling on the raw `+50` bias would
+/// reach `+inf` after the upstream cast paths normalize through the
+/// graph; with the max-shift the input is always ≤ 0 and the
+/// `categorical_sampling` softmax is stable.
+#[test]
+fn generate_step_opt_out_max_shift_stable_with_large_bias() {
+  // Vocab 5; bias = [+50 on entry 0, near-zero elsewhere] ⇒ entry 0
+  // dominates regardless of normalization or shift, so the same seed must
+  // sample the same token stream in both runs.
+  let bias = vec![50.0_f32, 0.1, 0.0, -0.1, 0.2];
+  let prompt = [1u32];
+  let max_tokens = 4;
+  let cfg_base = || GenConfig {
+    max_tokens,
+    eos: vec![],
+    temp: 0.1,
+    seed: Some(42),
+    // logit_bias adds another +50 on entry 0 ON TOP of the per-vocab bias
+    // — drives the scaled-by-1/temp value well past any f16/bf16 finite
+    // range. The fix's max-shift caps it back to 0.
+    logit_bias: vec![(0, 50.0)],
+    ..GenConfig::default()
+  };
+
+  // Run A: full normalization (collect_logprobs=true ⇒ logsumexp +
+  // subtract). The reference token stream — the sampler reads true
+  // log-probs, no overflow risk.
+  let model_a = MockModel::with_bias(bias.clone());
+  let cfg_a = GenConfig {
+    collect_logprobs: true,
+    ..cfg_base()
+  };
+  let tokens_a: Vec<u32> = generate_step(&model_a, &prompt, cache(1), cfg_a)
+    .map(|r| r.unwrap().token)
+    .collect();
+
+  // Run B: opt-out (default collect_logprobs=false). With the R2 fix the
+  // sampler input is `logits - max(logits)` ⇒ same argmax as full
+  // normalization, same stable softmax in `categorical_sampling`.
+  let model_b = MockModel::with_bias(bias);
+  let cfg_b = cfg_base(); // collect_logprobs: false (default)
+  let tokens_b: Vec<u32> = generate_step(&model_b, &prompt, cache(1), cfg_b)
+    .map(|r| r.unwrap().token)
+    .collect();
+
+  assert_eq!(tokens_a.len(), max_tokens);
+  assert_eq!(tokens_b.len(), max_tokens);
+  assert_eq!(
+    tokens_a, tokens_b,
+    "max-shift opt-out must sample the same token stream as the full-normalization \
+     reference under large logit_bias + small temp (no +inf overflow in the \
+     `1/temp` multiply that would scramble `categorical_sampling`)"
+  );
+  // Every sampled token must be the dominant entry — proves the sampler
+  // didn't degenerate to a NaN/uniform draw under the overflow regime.
+  for t in &tokens_a {
+    assert_eq!(*t, 0, "biased entry must dominate every step");
+  }
+}
+
+/// L3 zero-cost opt-out — pure-greedy (`temp == 0`) still feeds RAW logits
+/// (no max-shift), matching the documented "true zero-cost path" for
+/// `argmax_sample`. The sampled token must be byte-identical to the
+/// `collect_logprobs == true` (full normalization) reference, since
+/// `argmax` is shift-invariant numerically as well as mathematically (it
+/// doesn't exponentiate anything).
+#[test]
+fn generate_step_opt_out_greedy_zero_temp() {
+  let bias = vec![0.0_f32, 5.0, 2.0, 3.0, 1.0]; // argmax == 1
+  let prompt = [1u32];
+  let max_tokens = 4;
+
+  // Run A: opt-in (full normalization).
+  let model_a = MockModel::with_bias(bias.clone());
+  let cfg_a = GenConfig {
+    max_tokens,
+    eos: vec![],
+    temp: 0.0, // greedy
+    collect_logprobs: true,
+    ..GenConfig::default()
+  };
+  let tokens_a: Vec<u32> = generate_step(&model_a, &prompt, cache(1), cfg_a)
+    .map(|r| r.unwrap().token)
+    .collect();
+
+  // Run B: opt-out (no normalization, no max-shift — pure-greedy is the
+  // `(false, false)` arm of the 3-way match: raw logits straight to
+  // argmax).
+  let model_b = MockModel::with_bias(bias);
+  let cfg_b = GenConfig {
+    max_tokens,
+    eos: vec![],
+    temp: 0.0, // greedy ⇒ argmax_sample, shift-invariant numerically
+    // collect_logprobs: false (default)
+    ..GenConfig::default()
+  };
+  let tokens_b: Vec<u32> = generate_step(&model_b, &prompt, cache(1), cfg_b)
+    .map(|r| r.unwrap().token)
+    .collect();
+
+  assert_eq!(
+    tokens_a, tokens_b,
+    "greedy opt-out must be byte-identical to opt-in"
+  );
+  for t in &tokens_a {
+    assert_eq!(*t, 1, "argmax(bias) == 1 (bias[1] == 5.0)");
+  }
+}
+
 /// `generate` with `max_tokens == 0` produces no tokens; the returned
 /// `GenerationStats` carries zero-counts + a zero tps + the original
 /// `prompt_tokens`.

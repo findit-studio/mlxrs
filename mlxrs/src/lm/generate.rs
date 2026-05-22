@@ -34,6 +34,22 @@
 //! to mlx-lm's `logprobs.squeeze(0)` (the normalization is always run so
 //! the yielded vector is the true log-softmax).
 //!
+//! **Stochastic-opt-out numerical safety (Codex review R2):** the
+//! shift-invariance argument above is mathematically valid but **not**
+//! numerically safe in low-precision compute dtypes. `categorical_sampling`
+//! multiplies its input by `1/temp` BEFORE the eventual `softmax` inside
+//! `mx.random.categorical`, so in f16 / bf16 a small `temp` combined with a
+//! large `logit_bias` (e.g. `bias = +50`, `temp = 0.1` ⇒ scaled logit `500`)
+//! overflows to `+inf` long before `softmax` can stabilize via shift
+//! cancellation. To preserve the per-step saving for stochastic configs
+//! without exposing that overflow, the opt-out path applies a cheap
+//! `logits - max(logits, keepdims=True)` per-row max-shift (one reduce + one
+//! broadcast subtract — ~3-4× cheaper than the full `logsumexp` + subtract)
+//! before feeding the sampler when `temp > 0`. Pure-greedy (`temp == 0`,
+//! `argmax_sample`) is shift-invariant numerically as well (argmax doesn't
+//! exponentiate anything), so it still receives the raw post-processor
+//! logits.
+//!
 //! **Exact per-step order (mlx-lm `generate_step._step`, lines 396-422):**
 //!
 //! 1. `logits = model.forward(last_tok[1, 1], &mut cache)` — `[1, 1, V]`,
@@ -48,11 +64,17 @@
 //!    **Skipped** entirely when both [`GenConfig::collect_logprobs`] is
 //!    `false` AND the sampler chain doesn't need normalized log-probs
 //!    (every sampler except `top_p` is shift-invariant or softmaxes
-//!    internally — see [`GenConfig::collect_logprobs`]).
+//!    internally — see [`GenConfig::collect_logprobs`]). In the opt-out
+//!    path with `temp > 0` a cheap `logits - max(logits, keepdims=True)`
+//!    max-shift is applied instead, to keep the downstream `1/temp`
+//!    multiply finite in f16/bf16 (Codex review R2 — see the module-level
+//!    "stochastic-opt-out numerical safety" note).
 //! 5. `token = sampler(logits_or_logprobs)` — the [`make_sampler`] chain
 //!    (top-k/p, min-p, xtc, categorical) or the default temperature-0
-//!    `argmax`. The argument is the post-normalization `logprobs` if step
-//!    4 ran, the raw post-processor `logits` otherwise — every sampler in
+//!    `argmax`. The argument is the post-normalization `logprobs` if the
+//!    full normalization ran, the max-shifted logits if only the cheap
+//!    shift ran (stochastic opt-out), and the raw post-processor `logits`
+//!    if neither did (pure-greedy opt-out). Every sampler in
 //!    [`make_sampler`] is shift-invariant or softmaxes internally except
 //!    `top_p`, which forces step 4 to run.
 //! 6. yield `GenStep { token, logprobs }` — `logprobs` is
@@ -596,6 +618,17 @@ pub struct Generator<'a, M: Model> {
   /// Precomputed from `GenConfig` at construction so the per-step hot
   /// loop is a single field check.
   needs_logprobs: bool,
+  /// `true` iff `cfg.temp > 0` (stochastic sampling). Drives the
+  /// opt-out path's cheap `max + subtract` max-shift (Codex review R2):
+  /// when the full normalization is skipped (`!needs_normalization`) but
+  /// `temp > 0`, the sampler's downstream `logits * (1/temp)` would
+  /// overflow in f16/bf16 with a large `logit_bias`, so the opt-out
+  /// path subtracts the row-wise max to bound `exp` for every dtype.
+  /// `temp == 0` (pure-greedy `argmax_sample`) doesn't exponentiate, so
+  /// the raw-logit path stays the true zero-cost path there.
+  /// Precomputed from `GenConfig.temp` so the per-step `match` is a
+  /// single bool check.
+  temp_stochastic: bool,
   /// `true` once prompt prefill has run (it runs on the first `next()`).
   prefilled: bool,
   /// `true` until the first decode step has run (it feeds the prompt tail;
@@ -672,28 +705,48 @@ impl<M: Model> Generator<'_, M> {
 
     // 4. `logprobs = logits - mx.logsumexp(logits, keepdims=True)` — the
     //    exact mlx-lm normalization (all-axes logsumexp, broadcast).
-    //    **GATED**: skipped entirely when we don't need to yield logprobs
-    //    AND the sampler chain doesn't require normalized log-probs (every
-    //    sampler except `top_p` is shift-invariant or softmaxes
-    //    internally). When skipped, the sampler reads raw post-processor
-    //    logits in step 5 — byte-identical sampling for the
-    //    shift-invariant chain (see `needs_logprobs` for the table). This
-    //    is the zero-cost path: a `collect_logprobs=false` + greedy /
-    //    temperature-only run pays no per-token vocab-wide reduce +
-    //    broadcast subtract.
-    let normalized: Option<Array> = if self.collect_logprobs || self.needs_logprobs {
-      let lse = ops::reduction::logsumexp(&logits, true)?;
-      Some(ops::arithmetic::subtract(&logits, &lse)?)
-    } else {
-      None
+    //    **GATED, 3-way**: the per-step compute depends on
+    //    `(needs_normalization, temp > 0)` (Codex review R2):
+    //      • `(true, _)`  — full `logsumexp + subtract` (collect_logprobs
+    //         and/or top_p — `top_p` strictly needs the cumsum-to-1
+    //         contract; collect_logprobs yields the true log-softmax).
+    //      • `(false, true)` — cheap `max + subtract` max-shift. The
+    //         downstream `categorical_sampling` does `logits * (1/temp)`
+    //         BEFORE its internal `softmax`, so f16/bf16 + a large
+    //         `logit_bias` + small `temp` would overflow to `+inf` before
+    //         shift-invariance can save us. The max-shift caps the input
+    //         at 0 (no positive scaled value) ⇒ `exp` is bounded for
+    //         every dtype. One reduce + one broadcast subtract is ~3-4×
+    //         cheaper than the full `logsumexp` + subtract (skips the
+    //         per-element `exp` + `log`).
+    //      • `(false, false)` — raw logits. Pure-greedy
+    //         (`argmax_sample`) is shift-invariant numerically as well
+    //         (it doesn't exponentiate), so it stays the true zero-cost
+    //         path: no reduce, no broadcast, no allocation.
+    let needs_normalization = self.collect_logprobs || self.needs_logprobs;
+    let sampler_input: Option<Array> = match (needs_normalization, self.temp_stochastic) {
+      // Full normalization (collect_logprobs and/or top_p).
+      (true, _) => {
+        let lse = ops::reduction::logsumexp(&logits, true)?;
+        Some(ops::arithmetic::subtract(&logits, &lse)?)
+      }
+      // Stochastic opt-out: cheap max-shift for f16/bf16 numerical safety.
+      (false, true) => {
+        let m = ops::reduction::max(&logits, true)?;
+        Some(ops::arithmetic::subtract(&logits, &m)?)
+      }
+      // Pure-greedy opt-out: raw logits (argmax is shift-invariant).
+      (false, false) => None,
     };
 
     // 5. `sampled = sampler(logprobs)` — the make_sampler chain / argmax.
-    //    Feed `normalized` when we computed it (top_p needs the cumsum-to-1
-    //    log-probs); otherwise feed the raw `logits` (every other sampler
-    //    is shift-invariant or softmaxes internally, so `argmax(logits) ==
-    //    argmax(logits - lse)`).
-    let mut sampled = (self.sampler)(normalized.as_ref().unwrap_or(&logits))?;
+    //    Feed the full `normalized` if we computed it (top_p needs the
+    //    cumsum-to-1 log-probs; collect_logprobs needs the yielded
+    //    log-softmax); feed the cheap max-shift if we computed only that
+    //    (`(false, true)` — stochastic opt-out); otherwise feed the raw
+    //    `logits` (pure-greedy opt-out — `argmax(logits) == argmax(logits
+    //    - c)` for any scalar `c`).
+    let mut sampled = (self.sampler)(sampler_input.as_ref().unwrap_or(&logits))?;
 
     // 6. token boundary: the ONLY materialization (mlx-lm `y.item()`).
     //    `argmax` / `categorical` both yield `U32`.
@@ -702,15 +755,16 @@ impl<M: Model> Generator<'_, M> {
     // mlx-lm returns `logprobs.squeeze(0)` ⇒ a `[V]` vector. Kept lazy.
     // L3 opt-in: only yield the `[V]` view when `collect_logprobs == true`;
     // otherwise both the normalization (above) and this squeeze are
-    // skipped. When `true`, `normalized` is guaranteed `Some` and the
-    // produced array is byte-identical to the prior unconditional yield
-    // (mlx-lm's `logprobs.squeeze(0)`).
+    // skipped. When `true`, `sampler_input` is guaranteed `Some` via the
+    // `(true, _)` match arm (full logsumexp + subtract), so the yielded
+    // array is byte-identical to the prior unconditional yield (mlx-lm's
+    // `logprobs.squeeze(0)`); the cheap max-shift path is never taken
+    // when `collect_logprobs == true`.
     let logprobs = if self.collect_logprobs {
-      // `normalized.unwrap()` is safe — the `if` above forced `Some`.
       Some(ops::shape::squeeze_axes(
-        normalized
+        sampler_input
           .as_ref()
-          .expect("normalized is Some when collect_logprobs == true"),
+          .expect("sampler_input is Some (full normalization) when collect_logprobs == true"),
         &[0],
       )?)
     } else {
@@ -931,6 +985,13 @@ pub fn generate_step<'a, M: Model>(
   // normalization needed there either. Honor that here so a stale
   // `top_p` on a greedy run still skips the per-token logsumexp.
   let needs_logprobs = cfg.temp != 0.0 && cfg.top_p > 0.0 && cfg.top_p < 1.0;
+  // Lockstep with `make_sampler`'s `temp == 0` → argmax shortcut: the
+  // stochastic max-shift opt-out path only fires when the built sampler is
+  // actually stochastic (`temp > 0` ⇒ the chain bottoms out in
+  // `categorical_sampling`, which scales by `1/temp` before softmax). When
+  // `temp == 0` the sampler is pure argmax (shift-invariant numerically), so
+  // the raw-logit path is safe — see `temp_stochastic` on `Generator`.
+  let temp_stochastic = cfg.temp > 0.0;
   match built {
     Ok((sampler, processors)) => Generator {
       model,
@@ -947,6 +1008,7 @@ pub fn generate_step<'a, M: Model>(
       eos: cfg.eos,
       collect_logprobs,
       needs_logprobs,
+      temp_stochastic,
       prefilled: false,
       first_step: true,
       pending_err: None,
@@ -973,6 +1035,7 @@ pub fn generate_step<'a, M: Model>(
       eos: Vec::new(),
       collect_logprobs,
       needs_logprobs,
+      temp_stochastic,
       prefilled: true,
       first_step: false,
       pending_err: Some(e),
