@@ -214,7 +214,7 @@ impl Default for TtsGenConfig {
 /// its backbone). mlxrs does **not** decode a reference *path* here — mirroring
 /// mlx-audio-swift, [`TtsReference::ref_audio`] is an already-decoded
 /// **rank-1 `f32` PCM `[samples]` [`Array`]** (the caller pre-loads it with
-/// [`crate::audio::io::load_wav`] + [`Array::from_slice`], resampled to the
+/// [`crate::audio::io::load_audio`] + [`Array::from_slice`], resampled to the
 /// model's [`TtsModel::sample_rate`] if needed). mlx-audio's Python
 /// `generate_audio` accepts a *path* and pre-decodes it with `load_audio`
 /// before handing the array to `model.generate`; mlxrs leaves that one I/O step
