@@ -367,8 +367,14 @@ impl<M: super::model::Model> SttGenerator<'_, M> {
     let token: u32 = sampled.item::<u32>()?;
 
     // mlx-lm returns `logprobs.squeeze(0)` ⇒ `[V]` vector. Kept lazy.
+    // L3 `GenStep.logprobs` is `Option<Array>`: audio STT has not adopted
+    // the [`crate::lm::generate::GenConfig::collect_logprobs`] opt-in,
+    // so we always emit `Some` to preserve the prior unconditional yield.
     let logprobs = ops::shape::squeeze_axes(&logprobs, &[0])?;
-    Ok(GenStep { token, logprobs })
+    Ok(GenStep {
+      token,
+      logprobs: Some(logprobs),
+    })
   }
 }
 

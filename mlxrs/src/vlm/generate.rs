@@ -231,8 +231,30 @@ pub fn vlm_generate<'a, M: Model>(
   // an image marker that the caller intends to remain literal text in a
   // no-image run; `lm::generate::generate_step` consumes raw token ids
   // exactly as supplied.
+  //
+  // **`collect_logprobs` override**: the multimodal-path decode loop in
+  // this file ALWAYS emits `Some(logprobs)` (the comment at the
+  // post-sampler squeeze documents the unconditional yield), so the
+  // cross-crate VLM-surface contract is "every `GenStep.logprobs` is
+  // `Some`". The zero-image branch delegates to `lm::generate_step`,
+  // which honors `cfg.lm.collect_logprobs` — and that field's `Default`
+  // is `false`, so a default-cfg zero-image VLM run would otherwise
+  // silently flip to `None`-logprobs and break the documented surface
+  // (Codex finding-2: contract drift between the two branches). Force
+  // the LM-level opt-in here so the zero-image branch yields the same
+  // `Some(logprobs)` shape the multimodal branch does — the caller still
+  // controls `collect_logprobs` end-to-end via [`VlmGenConfig::lm`], but
+  // the zero-image fallback can never undershoot the documented VLM
+  // contract.
   if images.is_empty() {
-    let iter = crate::lm::generate::generate_step(model, text_tokens, cache, cfg.lm);
+    // `cfg` is consumed by this branch (the multimodal path below
+    // re-borrows `cfg.*` fields directly), so move `cfg.lm` out instead
+    // of cloning — `clippy::redundant-clone` flags the avoidable extra
+    // owned `GenConfig` heap-walk of the eos / xtc_special_tokens /
+    // logit_bias vectors.
+    let mut lm = cfg.lm;
+    lm.collect_logprobs = true;
+    let iter = crate::lm::generate::generate_step(model, text_tokens, cache, lm);
     // Box so the two branches share an opaque return type. Allocation
     // here is one-shot at construction (not per step), and the
     // alternative — duplicating the iterator-state struct across both
@@ -545,8 +567,17 @@ impl<M: Model> VlmDecode<'_, M> {
     //    (`y.item()` in mlx-vlm / mlx-lm).
     let token: u32 = sampled.item::<u32>()?;
     // mlx-vlm/mlx-lm `logprobs.squeeze(0)` ⇒ a `[V]` vector. Kept lazy.
+    // L3 `GenStep.logprobs` is `Option<Array>`: VLM has not adopted the
+    // [`crate::lm::generate::GenConfig::collect_logprobs`] opt-in yet, so
+    // we always emit `Some` to preserve the prior unconditional yield
+    // (callers' field access shape changes from `step.logprobs` to
+    // `step.logprobs.unwrap()` / `.as_ref()` — the same source-break the
+    // LM crate accepts).
     let logprobs = ops::shape::squeeze_axes(&logprobs, &[0])?;
-    Ok(GenStep { token, logprobs })
+    Ok(GenStep {
+      token,
+      logprobs: Some(logprobs),
+    })
   }
 
   /// The embed-based prefill (VLM-8 offset-aware chunked design): walk

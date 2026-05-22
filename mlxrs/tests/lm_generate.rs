@@ -19,8 +19,8 @@ use mlxrs::{
   lm::{
     cache::{CacheConfig, KvCache, make_prompt_cache},
     generate::{
-      __resolved_unseeded_seed_for_test, GenConfig, GenStep, generate, generate_step,
-      make_logits_processors, make_sampler, stream_generate,
+      __resolved_unseeded_seed_for_test, GenConfig, GenStep, GenerationStats, generate,
+      generate_step, make_logits_processors, make_sampler, stream_generate,
     },
     model::Model,
   },
@@ -260,16 +260,20 @@ fn generate_step_yields_logprobs_normalized() {
   let cfg = GenConfig {
     max_tokens: 1,
     eos: vec![],
+    // L3: logprobs are opt-in; request them so the squeeze + per-step
+    // `Some(Array)` yield is enabled.
+    collect_logprobs: true,
     ..GenConfig::default()
   };
   let GenStep {
     token: tok,
-    logprobs: mut lp,
+    logprobs: lp,
   } = generate_step(&model, &[1u32], cache(1), cfg)
     .next()
     .unwrap()
     .unwrap();
   assert_eq!(tok, 2);
+  let mut lp = lp.expect("collect_logprobs=true ⇒ Some(Array)");
   assert_eq!(lp.shape(), vec![3], "logprobs squeezed to [vocab]");
   let v = lp.to_vec::<f32>().unwrap();
   // sum(exp(logprobs)) == 1 (normalized) and argmax preserved.
@@ -773,7 +777,8 @@ fn stream_generate_stop_finish_reason_on_eos() {
 }
 
 /// `generate` collects `stream_generate` into the full `String` (the eos
-/// token contributes no text).
+/// token contributes no text) and returns the aggregate
+/// [`mlxrs::lm::generate::GenerationStats`] alongside.
 #[test]
 fn generate_collects_to_string() {
   let tok = tokenizer("gen_str");
@@ -783,8 +788,10 @@ fn generate_collects_to_string() {
     eos: tok.eos_token_ids().iter().copied().collect(),
     ..GenConfig::default()
   };
-  let out = generate(&model, &tok, &[3u32], cache(1), cfg).unwrap();
+  let (out, stats) = generate(&model, &tok, &[3u32], cache(1), cfg).unwrap();
   assert!(out.contains("world"), "collected text, got {out:?}");
+  assert_eq!(stats.prompt_tokens, 1);
+  assert_eq!(stats.generation_tokens, 2);
 }
 
 /// A `forward` error inside `stream_generate` surfaces as a yielded `Err`
@@ -823,6 +830,9 @@ fn gen_step_token_field_matches_prior_tuple_zero() {
   let cfg = GenConfig {
     max_tokens: 1,
     eos: vec![],
+    // Request logprobs so the prior `.1 == [V] Array` contract is
+    // preserved verbatim under the L3 opt-in.
+    collect_logprobs: true,
     ..GenConfig::default()
   };
   let step = generate_step(&model, &[1u32], cache(1), cfg)
@@ -834,7 +844,8 @@ fn gen_step_token_field_matches_prior_tuple_zero() {
     "GenStep.token == argmax (ramp(5) ⇒ 4); identical to the prior (u32, Array).0"
   );
   // And `.logprobs` carries the [V] vector (prior .1 contract).
-  assert_eq!(step.logprobs.shape(), vec![5]);
+  let lp = step.logprobs.as_ref().expect("collect_logprobs=true");
+  assert_eq!(lp.shape(), vec![5]);
 }
 
 /// `GenStep` is `Debug` so test failures stay diagnosable (and the public
@@ -865,16 +876,17 @@ fn gen_step_is_debug() {
   let _ = format!("{step:?}");
 }
 
-/// `From<GenStep> for (u32, Array)` back-compat: a `GenStep` round-trips
-/// into the prior `(u32, Array)` tuple via `.into()`, so call sites that
-/// preferred tuple destructure (`let (tok, lp) = step.into();`) keep
-/// working unchanged.
+/// `From<GenStep> for (u32, Option<Array>)` back-compat: a `GenStep`
+/// round-trips into the (u32, Option<Array>) tuple via `.into()`, so call
+/// sites that preferred tuple destructure (`let (tok, lp) = step.into();`)
+/// keep working unchanged (the inner `Option` honors the L3 opt-in).
 #[test]
 fn gen_step_into_tuple_roundtrip() {
   let model = MockModel::ramp(5);
   let cfg = GenConfig {
     max_tokens: 1,
     eos: vec![],
+    collect_logprobs: true,
     ..GenConfig::default()
   };
   let step = generate_step(&model, &[1u32], cache(1), cfg)
@@ -883,12 +895,17 @@ fn gen_step_into_tuple_roundtrip() {
     .unwrap();
   // Capture the typed fields before the move so we can cross-check.
   let expected_token = step.token;
-  let expected_shape = step.logprobs.shape();
-  let (tok, mut lp): (u32, Array) = step.into();
+  let expected_shape = step
+    .logprobs
+    .as_ref()
+    .expect("collect_logprobs=true ⇒ Some(Array)")
+    .shape();
+  let (tok, lp): (u32, Option<Array>) = step.into();
   assert_eq!(
     tok, expected_token,
     "tuple .0 == GenStep.token via From<GenStep>"
   );
+  let mut lp = lp.expect("collect_logprobs=true ⇒ tuple .1 carries Some(Array)");
   assert_eq!(
     lp.shape(),
     expected_shape,
@@ -898,4 +915,453 @@ fn gen_step_into_tuple_roundtrip() {
   // (mlx-lm `logprobs.squeeze(0)`), summing to 1 in prob space.
   let s: f32 = lp.to_vec::<f32>().unwrap().iter().map(|x| x.exp()).sum();
   assert!((s - 1.0).abs() < 1e-4, "exp(logprobs) sums to 1, got {s}");
+}
+
+// ---------------------------------------------------------------------------
+// L3 — `collect_logprobs` opt-in + `GenerationStats` aggregate
+// ---------------------------------------------------------------------------
+
+/// Default flow: with [`GenConfig::collect_logprobs`] = `false` (the
+/// default), every yielded [`GenStep::logprobs`] is `None` — the squeeze
+/// is skipped, no MLX node materialized per step. The token is still
+/// produced exactly as before.
+#[test]
+fn generate_step_default_skips_logprobs() {
+  let model = MockModel::ramp(5);
+  let cfg = GenConfig {
+    max_tokens: 3,
+    eos: vec![],
+    ..GenConfig::default()
+  };
+  // Sanity: the default knob is `false`.
+  assert!(
+    !GenConfig::default().collect_logprobs,
+    "default GenConfig.collect_logprobs is false (opt-in)"
+  );
+  let steps: Vec<GenStep> = generate_step(&model, &[1u32], cache(1), cfg)
+    .map(|r| r.unwrap())
+    .collect();
+  assert_eq!(steps.len(), 3);
+  for step in &steps {
+    assert!(
+      step.logprobs.is_none(),
+      "collect_logprobs=false ⇒ every GenStep.logprobs is None"
+    );
+    assert_eq!(step.token, 4, "token still produced (ramp(5) argmax)");
+  }
+}
+
+/// Hand-traced parity (L3 spec): with a deterministic argmax sampler
+/// (`temp == 0`, the default) and an explicit `[V]` logits bias, the
+/// yielded `[V]` logprobs is **exactly** `log_softmax(logits)` —
+/// equivalently `logits - logsumexp(logits)` (mlx-lm `generate_step` line
+/// 416, the only normalization in the loop) — and the sampled token's
+/// logprob (`logprobs[token]`) is the maximum entry of the vector.
+///
+/// Computes the closed-form `log_softmax` from the same bias and asserts
+/// elementwise agreement; this pins the per-step logprob extraction to
+/// the mathematical definition the mlx-lm server (`server.py:891`
+/// `r.logprobs[r.token].item()`) relies on.
+#[test]
+fn generate_step_logprob_matches_log_softmax() {
+  // Three vocab entries: 1.0, 2.0, 5.0 ⇒ argmax == 2 ⇒ sampler picks
+  // token 2 ⇒ its logprob is `log_softmax([1, 2, 5])[2]`.
+  let bias = [1.0_f32, 2.0, 5.0];
+  let model = MockModel::with_bias(bias.to_vec());
+  let cfg = GenConfig {
+    max_tokens: 1,
+    eos: vec![],
+    collect_logprobs: true, // L3 opt-in
+    ..GenConfig::default()
+  };
+  let step = generate_step(&model, &[1u32], cache(1), cfg)
+    .next()
+    .unwrap()
+    .unwrap();
+  assert_eq!(step.token, 2, "argmax of [1, 2, 5] is index 2");
+
+  let mut lp = step.logprobs.expect("collect_logprobs=true ⇒ Some(Array)");
+  assert_eq!(lp.shape(), vec![3]);
+  let got = lp.to_vec::<f32>().unwrap();
+
+  // Closed-form `log_softmax(bias) = bias - log(sum(exp(bias)))`.
+  let max = bias.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+  let log_sum_exp = max + (bias.iter().map(|x| (x - max).exp()).sum::<f32>()).ln();
+  let expected: [f32; 3] = [
+    bias[0] - log_sum_exp,
+    bias[1] - log_sum_exp,
+    bias[2] - log_sum_exp,
+  ];
+
+  for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+    assert!(
+      (g - e).abs() < 1e-5,
+      "logprobs[{i}] mismatch: got {g}, expected {e} (log_softmax of {bias:?})"
+    );
+  }
+  // Sampled-token logprob == the max entry (mlx-lm `r.logprobs[r.token]`).
+  let sampled_lp = got[step.token as usize];
+  assert!(
+    (sampled_lp - expected[2]).abs() < 1e-5,
+    "sampled token's logprob == log_softmax(bias)[token]"
+  );
+  assert!(
+    sampled_lp >= got[0] && sampled_lp >= got[1],
+    "argmax-of-logprobs == sampled token (the sampler picked the maximum)"
+  );
+}
+
+/// `generate` returns the aggregate [`GenerationStats`] (counts + tps +
+/// peak_memory). Counts must match the per-response final values; tps
+/// fields are computed from wall-clock timing (assert `>= 0.0`, since on a
+/// trivial in-process model the prompt/generation phases can fall within
+/// one clock tick → 0.0 by mlx-lm's same divide-by-zero guard).
+#[test]
+fn generate_returns_generation_stats() {
+  let tok = tokenizer("gen_stats");
+  let model = MockModel::ramp(5);
+  let cfg = GenConfig {
+    max_tokens: 3,
+    eos: tok.eos_token_ids().iter().copied().collect(),
+    ..GenConfig::default()
+  };
+  let prompt = [3u32, 5u32]; // arbitrary 2-token prompt
+  let (_text, stats): (String, GenerationStats) =
+    generate(&model, &tok, &prompt, cache(1), cfg).unwrap();
+
+  assert_eq!(stats.prompt_tokens, prompt.len());
+  assert_eq!(stats.generation_tokens, 3);
+  assert!(
+    stats.prompt_tps >= 0.0,
+    "prompt_tps is a measured tokens-per-second (>=0)"
+  );
+  assert!(
+    stats.generation_tps >= 0.0,
+    "generation_tps is a measured tokens-per-second (>=0)"
+  );
+  // peak_memory_bytes is `Option<u64>`: under the in-process MLX runtime
+  // the counter is always available, so the Option is `Some` and
+  // non-zero (we've allocated at least the prompt + cache).
+  let peak = stats
+    .peak_memory_bytes
+    .expect("mlx_get_peak_memory is available in-process");
+  assert!(peak > 0, "peak_memory_bytes > 0 after an in-process run");
+}
+
+/// Per-response `peak_memory_bytes` is `Some(u64)` under the in-process
+/// MLX runtime (mlx-lm's `mx.get_peak_memory() / 1e9` analogue) and
+/// non-decreasing across the stream (the underlying counter is a
+/// monotonic process-global peak).
+#[test]
+fn stream_generate_peak_memory_is_monotonic() {
+  let tok = tokenizer("stream_peak");
+  let model = MockModel::ramp(5);
+  let cfg = GenConfig {
+    max_tokens: 4,
+    eos: vec![],
+    ..GenConfig::default()
+  };
+  let responses: Vec<_> = stream_generate(&model, &tok, &[3u32], cache(1), cfg)
+    .map(|r| r.unwrap())
+    .collect();
+  assert!(!responses.is_empty());
+  let peaks: Vec<u64> = responses
+    .iter()
+    .map(|r| {
+      r.peak_memory_bytes
+        .expect("peak_memory available in-process")
+    })
+    .collect();
+  for w in peaks.windows(2) {
+    assert!(
+      w[1] >= w[0],
+      "peak_memory is monotonically non-decreasing across the stream, got {peaks:?}"
+    );
+  }
+}
+
+/// L3 zero-cost opt-out (Codex review fix): with
+/// `collect_logprobs == false` and the default greedy sampler
+/// (`temp == 0`), the `logits - logsumexp(logits)` normalization is
+/// SKIPPED entirely — not just the `[V]` squeeze. The sampler reads raw
+/// post-processor logits, and `argmax(logits) == argmax(logits - lse)` so
+/// the sampled token is byte-identical to a `collect_logprobs == true`
+/// run.
+///
+/// The "zero-cost" property — that the logsumexp graph node is never built
+/// on the opt-out path — is guaranteed STRUCTURALLY by the 3-way
+/// `match (needs_normalization, temp_stochastic)` in `generate.rs`, which
+/// only constructs the logsumexp node in the `(true, _)` arm. It is
+/// verified FUNCTIONALLY here by the `step.logprobs.is_none()` assertion on
+/// the opt-out path (a `None` logprobs is the observable signal that the
+/// normalization branch — the only producer of `Some(logprobs)` — did not
+/// run).
+///
+/// A peak-memory MAGNITUDE comparison (e.g. `peak(opt-out) <= peak(opt-in)`)
+/// is deliberately NOT asserted: [`mlxrs::memory::peak_memory`] wraps mlx-c's
+/// `mlx_get_peak_memory`, a process-global monotonic high-water mark that
+/// never decreases and is shared by every concurrently-running test. Under
+/// the default multi-threaded test harness, other tests allocate during this
+/// test's measurement window and inflate the global counter unpredictably, so
+/// an absolute cross-sub-run peak comparison is fundamentally unreliable. The
+/// structural + functional checks above prove the contract without reading a
+/// shared global counter.
+#[test]
+fn generate_step_default_skips_logprobs_node() {
+  // Same prompt + model fixture for both runs, so the only difference is
+  // the L3 normalization gate.
+  let prompt = [1u32];
+  let max_tokens = 8;
+  let bias = [1.0_f32, 2.0, 5.0, 3.0, 4.0];
+
+  // Run A: opt-in. Both the normalization AND the squeeze run; every
+  // step yields `Some([V])` logprobs. Materialize each logprobs Array via
+  // `to_vec` (which evaluates the lazy graph) so the logsumexp + subtract
+  // nodes are actually computed, not just built.
+  let model_a = MockModel::with_bias(bias.to_vec());
+  let cfg_a = GenConfig {
+    max_tokens,
+    eos: vec![],
+    collect_logprobs: true,
+    ..GenConfig::default()
+  };
+  let mut tokens_a: Vec<u32> = Vec::new();
+  for step in generate_step(&model_a, &prompt, cache(1), cfg_a) {
+    let s = step.unwrap();
+    tokens_a.push(s.token);
+    // `collect_logprobs == true` ⇒ Some(Array): the normalization branch
+    // ran and produced logprobs. Evaluate to force the graph nodes.
+    let mut lp = s.logprobs.expect("collect_logprobs=true ⇒ Some(Array)");
+    let _ = lp.to_vec::<f32>().unwrap();
+  }
+
+  // Run B: opt-out (default). The normalization is skipped, the squeeze
+  // is skipped, every step yields `None` — the functional signal that the
+  // logsumexp node (the only producer of Some(logprobs)) was never built.
+  let model_b = MockModel::with_bias(bias.to_vec());
+  let cfg_b = GenConfig {
+    max_tokens,
+    eos: vec![],
+    // collect_logprobs: false (default)
+    ..GenConfig::default()
+  };
+  let mut tokens_b: Vec<u32> = Vec::new();
+  for step in generate_step(&model_b, &prompt, cache(1), cfg_b) {
+    let s = step.unwrap();
+    assert!(
+      s.logprobs.is_none(),
+      "collect_logprobs=false ⇒ GenStep.logprobs is None (logsumexp node skipped)"
+    );
+    tokens_b.push(s.token);
+  }
+
+  // Behavioural: same tokens (argmax is shift-invariant; the gate did not
+  // change sampling). bias[2] == 5.0 ⇒ argmax == 2 every step.
+  assert_eq!(tokens_a.len(), max_tokens);
+  assert_eq!(tokens_b.len(), max_tokens);
+  for (a, b) in tokens_a.iter().zip(tokens_b.iter()) {
+    assert_eq!(
+      a, b,
+      "opt-out path must sample the same token as opt-in (argmax is shift-invariant)"
+    );
+    assert_eq!(*a, 2, "argmax(bias) == 2 (bias[2] == 5.0)");
+  }
+}
+
+/// L3 normalization gate respects `top_p` (the only sampler in
+/// [`make_sampler`] that strictly requires normalized log-probs — its
+/// `exp(logprobs)` cumsum assumes a `1.0` total). With `top_p ∈ (0, 1)`
+/// AND `collect_logprobs == false`, the gate MUST still run the
+/// normalization so the sampler reads true log-probs (otherwise top_p's
+/// `1 - top_p` cumulative threshold is on raw `exp(logits)` and the
+/// nucleus cutoff is wrong). The observable proof: the sampled token is
+/// the same as the `collect_logprobs == true` run on the same `top_p`
+/// config — i.e. the sampler did NOT silently regress to a raw-logit
+/// input.
+#[test]
+fn generate_step_top_p_forces_normalization_even_when_off() {
+  // bias[2] is the dominant token (5.0 vs 1-4.0 others), so under any
+  // reasonable top_p the nucleus contains it; with `temp` small enough
+  // the categorical draw concentrates on token 2.
+  let bias = [1.0_f32, 2.0, 5.0, 3.0, 4.0];
+  let model_a = MockModel::with_bias(bias.to_vec());
+  // Seed the stochastic sampler so the two runs draw the SAME PRNG
+  // stream — any token divergence would then be a normalization bug, not
+  // PRNG drift.
+  let cfg_a = GenConfig {
+    max_tokens: 4,
+    eos: vec![],
+    temp: 0.1,  // small temp → very concentrated draw
+    top_p: 0.9, // forces the normalization gate
+    seed: Some(42),
+    collect_logprobs: true,
+    ..GenConfig::default()
+  };
+  let steps_a: Vec<u32> = generate_step(&model_a, &[1u32], cache(1), cfg_a)
+    .map(|r| r.unwrap().token)
+    .collect();
+
+  let model_b = MockModel::with_bias(bias.to_vec());
+  let cfg_b = GenConfig {
+    max_tokens: 4,
+    eos: vec![],
+    temp: 0.1,
+    top_p: 0.9,
+    seed: Some(42),
+    // collect_logprobs: false (default) — the gate must STILL run the
+    // normalization because top_p is enabled.
+    ..GenConfig::default()
+  };
+  let steps_b: Vec<u32> = generate_step(&model_b, &[1u32], cache(1), cfg_b)
+    .map(|r| r.unwrap().token)
+    .collect();
+
+  assert_eq!(
+    steps_a, steps_b,
+    "top_p must force normalization even with collect_logprobs=false — \
+     same PRNG seed ⇒ identical token stream"
+  );
+}
+
+/// L3 zero-cost opt-out — stochastic max-shift numerical safety (Codex
+/// review R2). The opt-out path used to feed RAW post-processor logits to
+/// `categorical_sampling`, which multiplies by `1/temp` BEFORE the eventual
+/// internal `softmax`. With a large `logit_bias` (e.g. `+50`) and a small
+/// `temp` (e.g. `0.1` ⇒ `1/temp = 10`), the scaled logit reaches `+500`,
+/// which overflows to `+inf` in f16/bf16 long before shift-invariance can
+/// save us. The fix applies a cheap `logits - max(logits, keepdims=True)`
+/// max-shift in the opt-out path when `temp > 0`, capping the input at 0 so
+/// `exp` is bounded for every dtype.
+///
+/// The observable proof: the same fixed-seed stochastic config — large
+/// positive bias on one entry, small `temp` — must produce the same token
+/// stream whether `collect_logprobs == true` (full normalization runs) or
+/// `collect_logprobs == false` (only the cheap max-shift runs). Before the
+/// fix, the opt-out path's `1/temp` scaling on the raw `+50` bias would
+/// reach `+inf` after the upstream cast paths normalize through the
+/// graph; with the max-shift the input is always ≤ 0 and the
+/// `categorical_sampling` softmax is stable.
+#[test]
+fn generate_step_opt_out_max_shift_stable_with_large_bias() {
+  // Vocab 5; bias = [+50 on entry 0, near-zero elsewhere] ⇒ entry 0
+  // dominates regardless of normalization or shift, so the same seed must
+  // sample the same token stream in both runs.
+  let bias = vec![50.0_f32, 0.1, 0.0, -0.1, 0.2];
+  let prompt = [1u32];
+  let max_tokens = 4;
+  let cfg_base = || GenConfig {
+    max_tokens,
+    eos: vec![],
+    temp: 0.1,
+    seed: Some(42),
+    // logit_bias adds another +50 on entry 0 ON TOP of the per-vocab bias
+    // — drives the scaled-by-1/temp value well past any f16/bf16 finite
+    // range. The fix's max-shift caps it back to 0.
+    logit_bias: vec![(0, 50.0)],
+    ..GenConfig::default()
+  };
+
+  // Run A: full normalization (collect_logprobs=true ⇒ logsumexp +
+  // subtract). The reference token stream — the sampler reads true
+  // log-probs, no overflow risk.
+  let model_a = MockModel::with_bias(bias.clone());
+  let cfg_a = GenConfig {
+    collect_logprobs: true,
+    ..cfg_base()
+  };
+  let tokens_a: Vec<u32> = generate_step(&model_a, &prompt, cache(1), cfg_a)
+    .map(|r| r.unwrap().token)
+    .collect();
+
+  // Run B: opt-out (default collect_logprobs=false). With the R2 fix the
+  // sampler input is `logits - max(logits)` ⇒ same argmax as full
+  // normalization, same stable softmax in `categorical_sampling`.
+  let model_b = MockModel::with_bias(bias);
+  let cfg_b = cfg_base(); // collect_logprobs: false (default)
+  let tokens_b: Vec<u32> = generate_step(&model_b, &prompt, cache(1), cfg_b)
+    .map(|r| r.unwrap().token)
+    .collect();
+
+  assert_eq!(tokens_a.len(), max_tokens);
+  assert_eq!(tokens_b.len(), max_tokens);
+  assert_eq!(
+    tokens_a, tokens_b,
+    "max-shift opt-out must sample the same token stream as the full-normalization \
+     reference under large logit_bias + small temp (no +inf overflow in the \
+     `1/temp` multiply that would scramble `categorical_sampling`)"
+  );
+  // Every sampled token must be the dominant entry — proves the sampler
+  // didn't degenerate to a NaN/uniform draw under the overflow regime.
+  for t in &tokens_a {
+    assert_eq!(*t, 0, "biased entry must dominate every step");
+  }
+}
+
+/// L3 zero-cost opt-out — pure-greedy (`temp == 0`) still feeds RAW logits
+/// (no max-shift), matching the documented "true zero-cost path" for
+/// `argmax_sample`. The sampled token must be byte-identical to the
+/// `collect_logprobs == true` (full normalization) reference, since
+/// `argmax` is shift-invariant numerically as well as mathematically (it
+/// doesn't exponentiate anything).
+#[test]
+fn generate_step_opt_out_greedy_zero_temp() {
+  let bias = vec![0.0_f32, 5.0, 2.0, 3.0, 1.0]; // argmax == 1
+  let prompt = [1u32];
+  let max_tokens = 4;
+
+  // Run A: opt-in (full normalization).
+  let model_a = MockModel::with_bias(bias.clone());
+  let cfg_a = GenConfig {
+    max_tokens,
+    eos: vec![],
+    temp: 0.0, // greedy
+    collect_logprobs: true,
+    ..GenConfig::default()
+  };
+  let tokens_a: Vec<u32> = generate_step(&model_a, &prompt, cache(1), cfg_a)
+    .map(|r| r.unwrap().token)
+    .collect();
+
+  // Run B: opt-out (no normalization, no max-shift — pure-greedy is the
+  // `(false, false)` arm of the 3-way match: raw logits straight to
+  // argmax).
+  let model_b = MockModel::with_bias(bias);
+  let cfg_b = GenConfig {
+    max_tokens,
+    eos: vec![],
+    temp: 0.0, // greedy ⇒ argmax_sample, shift-invariant numerically
+    // collect_logprobs: false (default)
+    ..GenConfig::default()
+  };
+  let tokens_b: Vec<u32> = generate_step(&model_b, &prompt, cache(1), cfg_b)
+    .map(|r| r.unwrap().token)
+    .collect();
+
+  assert_eq!(
+    tokens_a, tokens_b,
+    "greedy opt-out must be byte-identical to opt-in"
+  );
+  for t in &tokens_a {
+    assert_eq!(*t, 1, "argmax(bias) == 1 (bias[1] == 5.0)");
+  }
+}
+
+/// `generate` with `max_tokens == 0` produces no tokens; the returned
+/// `GenerationStats` carries zero-counts + a zero tps + the original
+/// `prompt_tokens`.
+#[test]
+fn generate_zero_max_tokens_stats() {
+  let tok = tokenizer("gen_zero");
+  let model = MockModel::ramp(5);
+  let cfg = GenConfig {
+    max_tokens: 0,
+    eos: tok.eos_token_ids().iter().copied().collect(),
+    ..GenConfig::default()
+  };
+  let (text, stats) = generate(&model, &tok, &[3u32, 5], cache(1), cfg).unwrap();
+  assert_eq!(text, "", "no tokens produced ⇒ empty output");
+  assert_eq!(stats.prompt_tokens, 2);
+  assert_eq!(stats.generation_tokens, 0);
+  assert_eq!(stats.prompt_tps, 0.0);
+  assert_eq!(stats.generation_tps, 0.0);
 }

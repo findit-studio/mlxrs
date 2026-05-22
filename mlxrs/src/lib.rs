@@ -36,6 +36,7 @@ pub mod dtype;
 pub mod error;
 /// Model IO — safetensors + GGUF load/save (local files only).
 pub mod io;
+pub mod memory;
 pub mod ops;
 pub mod shape;
 pub mod stream;
