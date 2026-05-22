@@ -244,6 +244,9 @@ fn prefill_full<M: Model>(
 ///    a recoverable [`Error::Backend`] (mlx-lm's `generate_step` raises
 ///    `ValueError` on an empty prompt; a prefill over zero tokens would be a
 ///    no-op saving an empty cache, so failing fast is the faithful behavior).
+///    A non-fresh `cache` (any layer with cached tokens) is likewise rejected
+///    up front — the prefill only appends, so a reused cache would persist a
+///    `[stale + new]` prefix.
 /// 3. **Save** the cache via [`crate::lm::cache::save_prompt_cache`] with the
 ///    metadata cache_prompt.py writes — `metadata["model"] = model_id` and
 ///    `metadata["tokenizer_config"] = tokenizer_config_json`
@@ -254,8 +257,13 @@ fn prefill_full<M: Model>(
 /// `cache` is the caller-built per-layer KV cache
 /// ([`crate::lm::cache::make_prompt_cache`]) the model mutates in place — it
 /// must have one entry per decoder layer, exactly as the generation loop
-/// requires. It is borrowed `&mut` (advanced to offset `P`) and then saved;
-/// the caller still owns it afterwards (e.g. to keep generating from it).
+/// requires. It **must be fresh/empty** (every layer at `offset() == 0`): the
+/// prefill only appends, and the persisted cache must represent exactly this
+/// prompt, so a reused / pre-populated cache is rejected with a recoverable
+/// [`Error::Backend`] before any prefill or save (a reused cache would
+/// persist stale state and leak a prior request's context). It is borrowed
+/// `&mut` (advanced to offset `P`) and then saved; the caller still owns it
+/// afterwards (e.g. to keep generating from it).
 ///
 /// Returns a [`CachePromptInfo`] with the number of tokens processed (the
 /// reference's printed `processed` count / the cache's final offset). Any
@@ -298,6 +306,14 @@ pub fn cache_prompt<M: Model>(
 /// `tokenizer_config` metadata cache_prompt.py writes (plus `extra_metadata`).
 /// An empty `prompt_ids` is a recoverable [`Error::Backend`] (faithful to
 /// mlx-lm's empty-prompt `ValueError`); nothing is written in that case.
+///
+/// **Precondition — `cache` must be fresh/empty.** The prefill only ever
+/// *appends* to `cache`; the saved cache must represent *exactly this
+/// prompt*. A reused / pre-populated cache (any layer with `offset() != 0`)
+/// is rejected with a recoverable [`Error::Backend`] before the prefill runs
+/// (so nothing is written) — saving a reused cache would persist a
+/// `[stale + new]` prefix and leak a prior request's context. Pass a freshly
+/// built [`crate::lm::cache::make_prompt_cache`] cache.
 #[allow(clippy::too_many_arguments)]
 pub fn cache_prompt_ids<M: Model>(
   model: &M,
@@ -317,6 +333,37 @@ pub fn cache_prompt_ids<M: Model>(
       message:
         "cache_prompt: prompt must be non-empty (mlx-lm raises ValueError on an empty prompt)"
           .into(),
+    });
+  }
+
+  // The cache MUST be fresh/empty: `cache_prompt` saves a cache representing
+  // *exactly this prompt*, but `prefill_full` only ever *appends* (it never
+  // resets the cache). A reused / pre-populated cache would have the new
+  // prompt prefilled on top of its stale state, and the save would persist
+  // the combined `[stale + new]` prefix while `tokens_processed` reports the
+  // new count alone — the saved cache would not represent the requested
+  // prompt (in a service, a later generation would be conditioned on a prior
+  // request's context: a cross-request context leak). mlx-lm never hits this
+  // because `cache_prompt.py` allocates the cache itself
+  // (`make_prompt_cache(model)`); here the cache is caller-provided, so the
+  // freshness precondition is enforced explicitly. Reject ANY layer that
+  // holds cached tokens (`offset() != 0`) or already holds key buffers
+  // (`!is_empty()`) — a genuinely fresh `make_prompt_cache` cache satisfies
+  // both. Checked before `prefill_full`, so the save never runs and no file
+  // is written. Mirrors the empty-prompt guard above.
+  if let Some((layer_idx, stale)) = cache
+    .iter()
+    .enumerate()
+    .find(|(_, layer)| layer.offset() != 0 || !layer.is_empty())
+  {
+    return Err(Error::Backend {
+      message: format!(
+        "cache_prompt: the provided cache must be fresh/empty — layer {layer_idx} already \
+         holds {} cached token(s); cache_prompt saves a cache representing exactly this \
+         prompt, so a reused cache would persist stale state. Pass a freshly built cache \
+         (`make_prompt_cache`).",
+        stale.offset()
+      ),
     });
   }
 
@@ -758,6 +805,90 @@ mod tests {
       !out.exists(),
       "no cache file written on the empty-prompt error"
     );
+  }
+
+  /// `cache_prompt_ids` rejects a **non-fresh** cache (a reused / pre-populated
+  /// cache with `offset() > 0`) as a recoverable `Err` and writes no file —
+  /// `cache_prompt` saves a cache representing exactly the requested prompt, so
+  /// prefilling on top of stale state (which `prefill_full` would silently do,
+  /// it only appends) would persist a `[stale + new]` prefix and leak prior
+  /// context. Mirrors the empty-prompt guard's structure.
+  #[test]
+  fn cache_prompt_ids_non_fresh_cache_errors_without_writing() {
+    let model = MockModel::new(4);
+    // Pre-populate the cache by prefilling a first prompt into it (offset > 0).
+    let mut c = cache(2);
+    prefill_full(&model, &[1u32, 2, 3], &mut c, 8).unwrap();
+    assert!(
+      c.iter().all(|x| x.offset() == 3),
+      "the cache is pre-populated (offset > 0) before the rejected call"
+    );
+
+    let dir = std::env::temp_dir().join(format!(
+      "mlxrs_cache_prompt_nonfresh_{}",
+      std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let out = dir.join("nonfresh.safetensors");
+    let _ = std::fs::remove_file(&out);
+
+    let r = cache_prompt_ids(
+      &model,
+      &[4u32, 5],
+      &mut c,
+      &out,
+      "mock",
+      "{}",
+      8,
+      &HashMap::new(),
+    );
+    match r {
+      Err(Error::Backend { message }) => {
+        assert!(
+          message.contains("fresh") || message.contains("empty"),
+          "the error must indicate the cache has to be fresh/empty: {message}"
+        );
+      }
+      other => panic!("a reused cache must be a recoverable Error::Backend, got {other:?}"),
+    }
+    assert!(
+      !out.exists(),
+      "no cache file may be written when a reused cache is rejected"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// A genuinely **fresh** cache still succeeds: `cache_prompt_ids` over a
+  /// freshly built [`make_prompt_cache`] cache prefills + saves normally (the
+  /// freshness guard does not regress the positive path).
+  #[test]
+  fn cache_prompt_ids_fresh_cache_succeeds() {
+    let model = MockModel::new(4);
+    let mut c = cache(2);
+    assert!(
+      c.iter().all(|x| x.offset() == 0 && x.is_empty()),
+      "a make_prompt_cache cache is fresh (offset 0, empty)"
+    );
+    let dir = std::env::temp_dir().join(format!("mlxrs_cache_prompt_fresh_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let out = dir.join("fresh.safetensors");
+    let _ = std::fs::remove_file(&out);
+
+    let info = cache_prompt_ids(
+      &model,
+      &[1u32, 2, 3],
+      &mut c,
+      &out,
+      "mock",
+      "{}",
+      8,
+      &HashMap::new(),
+    )
+    .expect("a fresh cache must prefill + save successfully");
+    assert_eq!(info.tokens_processed, 3);
+    assert!(c.iter().all(|x| x.offset() == 3));
+    assert!(out.exists(), "a fresh-cache run must write the cache file");
+    let _ = std::fs::remove_dir_all(&dir);
   }
 
   /// [`effective_safetensors_path`] mirrors mlx core's extension-append: a

@@ -409,6 +409,135 @@ fn driver_metadata_round_trips() {
 }
 
 // ---------------------------------------------------------------------------
+// Fresh-cache precondition (Codex finding).
+//
+// `cache_prompt` / `cache_prompt_ids` take a CALLER-PROVIDED cache and save a
+// cache representing *exactly* the requested prompt. The internal prefill only
+// ever APPENDS — it never resets the cache. So a reused / pre-populated cache
+// would have the new prompt prefilled on top of its stale state, and the save
+// would persist the combined `[stale + new]` prefix while `tokens_processed`
+// reports the new count alone. In a service, a later generation restored from
+// that cache would be conditioned on a prior request's context — a
+// cross-request context leak. The driver therefore rejects any non-fresh cache
+// up front (before prefill / save), so nothing is written.
+// ---------------------------------------------------------------------------
+
+/// `cache_prompt_ids` rejects a reused / pre-populated cache (`offset() > 0`)
+/// with a recoverable `Error::Backend` whose message indicates the cache must
+/// be fresh — and crucially writes NO file (the reused-cache case must not
+/// persist a `[stale + new]` prefix). The cache is pre-populated by a genuine
+/// first `cache_prompt_ids` run, exactly the service "reuse the cache object"
+/// misuse the guard defends against.
+#[test]
+fn cache_prompt_ids_rejects_reused_cache_without_writing() {
+  let model = MockModel::ramp(8);
+  let dir = temp_dir("reused_cache");
+
+  // 1. A genuine first run leaves `reused` populated (offset == 4).
+  let mut reused = cache(2);
+  let first = dir.join("first.safetensors");
+  cache_prompt_ids(
+    &model,
+    &[1u32, 3, 4, 5],
+    &mut reused,
+    &first,
+    "mock",
+    "{}",
+    8,
+    &HashMap::new(),
+  )
+  .unwrap();
+  assert!(
+    reused.iter().all(|c| c.offset() == 4),
+    "the cache is pre-populated by the first run"
+  );
+
+  // 2. Reusing that same (non-fresh) cache for a second prompt must be
+  //    rejected before any prefill / save — no file at `out`.
+  let out = dir.join("leaked.safetensors");
+  assert!(
+    !out.exists(),
+    "precondition: the target file does not exist"
+  );
+  let err = cache_prompt_ids(
+    &model,
+    &[6u32, 7],
+    &mut reused,
+    &out,
+    "mock",
+    "{}",
+    8,
+    &HashMap::new(),
+  )
+  .expect_err("a reused (non-fresh) cache must be rejected");
+  match err {
+    mlxrs::Error::Backend { message } => assert!(
+      message.contains("fresh") || message.contains("empty"),
+      "the rejection message must indicate the cache has to be fresh/empty: {message}"
+    ),
+    other => panic!("expected a recoverable Error::Backend, got {other:?}"),
+  }
+  assert!(
+    !out.exists(),
+    "a reused cache must NOT persist anything — no [stale + new] prefix written"
+  );
+}
+
+/// The high-level `cache_prompt` (tokenizer encode path) is covered by the same
+/// guard: `cache_prompt` delegates straight to `cache_prompt_ids`, so a reused
+/// cache passed to `cache_prompt` is rejected with the same `Error::Backend`
+/// and writes nothing.
+#[test]
+fn cache_prompt_rejects_reused_cache_without_writing() {
+  let dir = temp_dir("reused_cache_highlevel");
+  let tok = tokenizer(&dir);
+  let model = MockModel::ramp(64);
+
+  // First run populates the cache.
+  let mut reused = cache(2);
+  let first = dir.join("first.safetensors");
+  cache_prompt(
+    &model,
+    &tok,
+    "hello world",
+    &mut reused,
+    &first,
+    "fixture-model",
+    "{}",
+    8,
+    &HashMap::new(),
+  )
+  .unwrap();
+  assert!(
+    reused.iter().all(|c| c.offset() > 0),
+    "the first cache_prompt run pre-populates the cache"
+  );
+
+  // Reusing it via the high-level entry must also be rejected, writing nothing.
+  let out = dir.join("leaked.safetensors");
+  let err = cache_prompt(
+    &model,
+    &tok,
+    "the quick brown fox",
+    &mut reused,
+    &out,
+    "fixture-model",
+    "{}",
+    8,
+    &HashMap::new(),
+  )
+  .expect_err("cache_prompt with a reused cache must be rejected");
+  assert!(
+    matches!(err, mlxrs::Error::Backend { .. }),
+    "the rejection is a recoverable Error::Backend"
+  );
+  assert!(
+    !out.exists(),
+    "the high-level cache_prompt must not persist a reused cache"
+  );
+}
+
+// ---------------------------------------------------------------------------
 // High-level `cache_prompt` (tokenizer encode path).
 // ---------------------------------------------------------------------------
 
