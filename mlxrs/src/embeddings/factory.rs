@@ -973,6 +973,19 @@ fn name_bytes_match(name: &std::ffi::OsStr, prefix: &[u8], suffix: &[u8]) -> boo
 /// equally be yielded by `glob`'s name-based match (and rejected by the stat
 /// gate); flagging any non-UTF-8 shard-named entry, file or not, keeps the
 /// fail-loud contract complete.
+///
+/// **Known limitation (deliberate scope decision).** Recursion descends only
+/// real directories (`file_type().is_dir()`, with a fallible `path().is_dir()`
+/// fallback) — it does **not** follow directory *symlinks*, whereas the `glob`
+/// pass does. So a non-UTF-8-named shard inside a *symlinked* component
+/// directory is invisible to both the preflight (does not descend the symlink)
+/// and `glob` (silently drops the non-UTF-8 leaf); a model directory stacking a
+/// symlinked component dir + a non-UTF-8 shard name + a stale legacy
+/// `weight*.safetensors` could then fall back to the legacy file instead of
+/// erroring. This contrived layout is accepted as **out of scope** per E3's
+/// "match the reference, trust the input" decision (see the project follow-ups
+/// doc, `DEFERRED-3`); real Hugging Face model directories neither symlink
+/// component directories nor use non-UTF-8 filenames.
 fn scan_non_utf8_shards(dir: &Path, pattern_suffix: &str) -> Result<()> {
   // Dispatch on the exact `pattern_suffix` strings `collect_glob_shards` is
   // called with. `(prefix, suffix, recursive)` is the byte-level transcription
