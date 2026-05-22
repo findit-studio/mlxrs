@@ -33,6 +33,16 @@
 //!   registry (after [`remap_model_type`], mirroring `MODEL_REMAPPING`) →
 //!   invoke the constructor → return the `(Box<dyn Model>, Tokenizer)` pair.
 //!
+//! On top of that load surface sits [`ModelContext`] — a thin **owning
+//! bundle** of the loaded `(model, tokenizer, config)` with ergonomic
+//! convenience methods (`encode` / `decode` / `apply_chat_template` /
+//! `generate` / `stream_generate`, each a thin forward to the tokenizer or
+//! [`crate::lm::generate`]). It is the single-thread reduction of
+//! mlx-swift-lm's `ModelContext` / `ModelContainer` — the actor concurrency of
+//! the Swift `ModelContainer` is dropped because mlxrs's
+//! [`Array`](crate::array::Array) is `!Send`/`!Sync` (see the
+//! [`ModelContext`] type docs).
+//!
 //! Conventions match the rest of `lm`: every fallible step returns
 //! [`Result`], recoverable failures (missing/invalid config, no weights,
 //! unknown `model_type`, tokenizer load) are [`Error::Backend`] with a
@@ -48,6 +58,7 @@ use std::{
 use crate::{
   error::{Error, Result},
   lm::{
+    generate::{GenConfig, GenerationResponse, GenerationStats},
     load::{self, Config, Weights},
     model::Model,
   },
@@ -409,6 +420,253 @@ pub fn load(
     tokenizer,
     config: loaded.config,
   })
+}
+
+/// An owning bundle of a loaded `(model, tokenizer, config)` with ergonomic
+/// convenience entry points — the single-thread reduction of mlx-swift-lm's
+/// `ModelContext` / `ModelContainer`.
+///
+/// # Relationship to [`LoadedModelContext`]
+///
+/// [`load()`] returns a [`LoadedModelContext`] — the loader's plain *product*
+/// struct (public fields, no behavior). [`ModelContext`] is the **owning
+/// context** layered on top: it takes the same three values by value and adds
+/// the convenience surface (`encode` / `decode` / `apply_chat_template` /
+/// `generate` / `stream_generate`) so a caller need not thread `&model`,
+/// `&tokenizer` and a hand-built `CacheConfig` through every `lm::generate`
+/// call. Build one straight from a load with [`From<LoadedModelContext>`]
+/// (`load(..)?.into()`) or the [`ModelContext::load`] one-call convenience.
+///
+/// # Actor → single-thread divergence (intentional)
+///
+/// mlx-swift-lm's `ModelContainer` is a Swift **`actor`** — it exists to share
+/// one model safely across threads, serializing access to the non-`Sendable`
+/// `MLXArray`s inside. mlxrs's [`Array`](crate::array::Array) is deliberately
+/// `!Send`/`!Sync` (single-thread, matching MLX's own threading model), so a
+/// faithful actor port is **inapplicable**: there is no cross-thread sharing
+/// to serialize. [`ModelContext`] therefore ports the *logic* of
+/// `ModelContext` / `ModelContainer` — the `(model, tokenizer, config)`
+/// ownership plus the convenience entry points — as a plain single-thread
+/// owning struct, dropping only the actor concurrency machinery (the
+/// `SerialAccessContainer`, the `perform` closure isolation, the `Sendable` /
+/// `sending` annotations). This mirrors how the project already handles the
+/// other Swift `actor` types it ports.
+///
+/// # API conventions
+///
+/// Matches the rest of `lm`: every fallible call returns [`Result`]; accessors
+/// ([`model`](Self::model) / [`tokenizer`](Self::tokenizer) /
+/// [`config`](Self::config)) borrow and never eval (no implicit eval — the
+/// owned [`Array`](crate::array::Array) weights are touched only by an explicit
+/// `generate` forward pass). The convenience methods are **thin forwards** —
+/// `encode` / `decode` / `apply_chat_template` defer to the [`Tokenizer`],
+/// `generate` / `stream_generate` defer to [`crate::lm::generate`] — they
+/// re-implement nothing.
+///
+/// The generation methods take `&self`, not `&mut self`: a [`ModelContext`]
+/// owns **no** KV cache (model weights are immutable after load — see the
+/// [`Model`] trait — and [`crate::lm::generate`] takes `&M`). Each `generate`
+/// / `stream_generate` call builds a *fresh* per-call cache (sized from
+/// [`Config::num_hidden_layers`] / [`Config::sliding_window`] via
+/// [`crate::lm::cache::make_prompt_cache`]) that the call consumes, so the
+/// context is never mutated. A persistent multi-turn cache is a chat-session
+/// concern layered above this bundle (mlx-swift-lm's `ChatSession`), not part
+/// of the `ModelContext` reduction.
+#[non_exhaustive]
+pub struct ModelContext {
+  /// The loaded model (mlx-swift-lm `ModelContext.model`).
+  model: Box<dyn Model>,
+  /// The model's tokenizer (mlx-swift-lm `ModelContext.tokenizer`).
+  tokenizer: Tokenizer,
+  /// The parsed `config.json` subset (the architecture metadata mlx-swift-lm
+  /// keeps on `ModelContext.configuration`, restricted to the typed
+  /// [`Config`] the load surface produces).
+  config: Config,
+}
+
+impl ModelContext {
+  /// Bundle an already-loaded `(model, tokenizer, config)` triple.
+  ///
+  /// The direct constructor — mlx-swift-lm's `ModelContext.init(...)`. Most
+  /// callers instead use [`From<LoadedModelContext>`] (`load(..)?.into()`) or
+  /// [`load`](Self::load); this is for callers assembling the triple by hand
+  /// (e.g. tests, or a model built without the [`load()`] factory path).
+  pub fn new(model: Box<dyn Model>, tokenizer: Tokenizer, config: Config) -> Self {
+    Self {
+      model,
+      tokenizer,
+      config,
+    }
+  }
+
+  /// Load a model + tokenizer from a local [`ModelConfiguration`] and bundle
+  /// the result into a [`ModelContext`] — the one-call convenience.
+  ///
+  /// Equivalent to `load(configuration, registry).map(ModelContext::from)`,
+  /// the analogue of mlx-swift-lm's `loadModelContainer` (which loads a
+  /// `ModelContext` and wraps it in the owning `ModelContainer`). The same
+  /// recoverable [`Error::Backend`]s [`load()`] returns (missing/invalid
+  /// config, no weights, unknown `model_type`, tokenizer load) propagate
+  /// unchanged.
+  pub fn load(configuration: &ModelConfiguration, registry: &ModelTypeRegistry) -> Result<Self> {
+    load(configuration, registry).map(Self::from)
+  }
+
+  /// The bundled model (mlx-swift-lm `ModelContainer.perform { $0.model }`).
+  pub fn model(&self) -> &dyn Model {
+    self.model.as_ref()
+  }
+
+  /// The bundled tokenizer (mlx-swift-lm `ModelContainer.tokenizer`).
+  pub fn tokenizer(&self) -> &Tokenizer {
+    &self.tokenizer
+  }
+
+  /// The bundled parsed `config.json` subset (mlx-swift-lm
+  /// `ModelContainer.configuration`).
+  pub fn config(&self) -> &Config {
+    &self.config
+  }
+
+  /// Decompose the bundle back into its owned `(model, tokenizer, config)`
+  /// triple (the inverse of [`new`](Self::new) — mlx-swift-lm's `consuming`
+  /// `ModelContext` move-out).
+  pub fn into_parts(self) -> (Box<dyn Model>, Tokenizer, Config) {
+    (self.model, self.tokenizer, self.config)
+  }
+
+  /// Encode `text` to token ids — a thin forward to
+  /// [`Tokenizer::encode`](crate::tokenizer::Tokenizer::encode)
+  /// (mlx-swift-lm's `ModelContainer.encode(_:)`).
+  ///
+  /// `add_special_tokens` is forwarded verbatim (mlx-swift-lm's bare `encode`
+  /// uses the tokenizer default; this exposes the flag so callers keep full
+  /// control).
+  pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
+    self.tokenizer.encode(text, add_special_tokens)
+  }
+
+  /// Decode token `ids` back to a string — a thin forward to
+  /// [`Tokenizer::decode`](crate::tokenizer::Tokenizer::decode)
+  /// (mlx-swift-lm's `ModelContainer.decode(tokenIds:)`).
+  pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
+    self.tokenizer.decode(ids, skip_special_tokens)
+  }
+
+  /// Render the chat template for `messages` — a thin forward to
+  /// [`Tokenizer::apply_chat_template`](crate::tokenizer::Tokenizer::apply_chat_template)
+  /// (mlx-swift-lm's `ModelContainer.applyChatTemplate(messages:)`).
+  ///
+  /// Returns the rendered prompt **string**; pair it with
+  /// [`encode`](Self::encode) (or use [`apply_chat_template_ids`](Self::apply_chat_template_ids))
+  /// to get token ids. All arguments forward verbatim — see the tokenizer
+  /// method for `add_generation_prompt` / `continue_final_message` semantics
+  /// (and their mutual exclusivity).
+  #[cfg(feature = "tokenizer-chat")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "tokenizer-chat")))]
+  pub fn apply_chat_template(
+    &self,
+    messages: &serde_json::Value,
+    tools: Option<&serde_json::Value>,
+    add_generation_prompt: bool,
+    continue_final_message: bool,
+    additional_context: Option<&serde_json::Value>,
+  ) -> Result<String> {
+    self.tokenizer.apply_chat_template(
+      messages,
+      tools,
+      add_generation_prompt,
+      continue_final_message,
+      additional_context,
+    )
+  }
+
+  /// Render the chat template and tokenize it in one step — a thin forward to
+  /// [`Tokenizer::apply_chat_template_ids`](crate::tokenizer::Tokenizer::apply_chat_template_ids)
+  /// (the `tokenize: true` form of mlx-swift-lm's `applyChatTemplate`).
+  #[cfg(feature = "tokenizer-chat")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "tokenizer-chat")))]
+  pub fn apply_chat_template_ids(
+    &self,
+    messages: &serde_json::Value,
+    tools: Option<&serde_json::Value>,
+    add_generation_prompt: bool,
+    continue_final_message: bool,
+    additional_context: Option<&serde_json::Value>,
+  ) -> Result<Vec<u32>> {
+    self.tokenizer.apply_chat_template_ids(
+      messages,
+      tools,
+      add_generation_prompt,
+      continue_final_message,
+      additional_context,
+    )
+  }
+
+  /// A [`CacheConfig`](crate::lm::cache::CacheConfig) for this model's KV
+  /// cache, derived from the bundled [`Config`].
+  ///
+  /// `num_hidden_layers` and `sliding_window` are the two `config.json` keys
+  /// [`make_prompt_cache`](crate::lm::cache::make_prompt_cache) needs; both
+  /// are carried on [`Config`]. Used by [`generate`](Self::generate) /
+  /// [`stream_generate`](Self::stream_generate) to size each fresh per-call
+  /// cache. `num_hidden_layers` is an `i32` on [`Config`]; a negative or
+  /// absurd value never reaches here on a real checkpoint, and a `0`/negative
+  /// count simply yields an empty cache.
+  fn cache_config(&self) -> crate::lm::cache::CacheConfig {
+    crate::lm::cache::CacheConfig {
+      num_hidden_layers: self.config.num_hidden_layers.max(0) as usize,
+      sliding_window: self.config.sliding_window,
+    }
+  }
+
+  /// Generate a complete response string for the already-encoded `prompt` —
+  /// a thin forward to [`crate::lm::generate::generate`].
+  ///
+  /// The owning-context counterpart of mlx-swift-lm's
+  /// `ModelContainer.generate(...)` collected to a string. Builds a **fresh**
+  /// KV cache for this call (sized from [`Config::num_hidden_layers`] /
+  /// [`Config::sliding_window`] via
+  /// [`make_prompt_cache`](crate::lm::cache::make_prompt_cache)) and hands the
+  /// bundled model + tokenizer to [`crate::lm::generate`];
+  /// nothing on `&self` is mutated (see the type docs on why this is
+  /// `&self`). `prompt` is the encoded prompt ids — encode a `&str` via
+  /// [`encode`](Self::encode) or a chat prompt via
+  /// [`apply_chat_template_ids`](Self::apply_chat_template_ids) first.
+  ///
+  /// Returns `(text, stats)` exactly as [`crate::lm::generate::generate`]; an
+  /// underlying step error propagates as `Err`.
+  pub fn generate(&self, prompt: &[u32], cfg: GenConfig) -> Result<(String, GenerationStats)> {
+    let cache = crate::lm::cache::make_prompt_cache(&self.cache_config());
+    crate::lm::generate::generate(self.model.as_ref(), &self.tokenizer, prompt, cache, cfg)
+  }
+
+  /// Stream the response for the already-encoded `prompt` as an iterator of
+  /// [`GenerationResponse`]s — a thin forward to
+  /// [`crate::lm::generate::stream_generate`].
+  ///
+  /// The owning-context counterpart of mlx-swift-lm's
+  /// `ModelContainer.generate(...)` `AsyncStream`. Like [`generate`](Self::generate)
+  /// it builds a fresh per-call cache; the returned iterator borrows `&self`
+  /// for the model + tokenizer (so it cannot outlive the context). `prompt`
+  /// is the encoded prompt ids.
+  pub fn stream_generate(
+    &self,
+    prompt: &[u32],
+    cfg: GenConfig,
+  ) -> impl Iterator<Item = Result<GenerationResponse>> + '_ {
+    let cache = crate::lm::cache::make_prompt_cache(&self.cache_config());
+    crate::lm::generate::stream_generate(self.model.as_ref(), &self.tokenizer, prompt, cache, cfg)
+  }
+}
+
+impl From<LoadedModelContext> for ModelContext {
+  /// Wrap the loader's product struct into the owning convenience context —
+  /// the analogue of mlx-swift-lm's `GenericModelFactory._wrap` (which boxes a
+  /// freshly-`_load`ed `ModelContext` into the owning `ModelContainer`).
+  fn from(loaded: LoadedModelContext) -> Self {
+    Self::new(loaded.model, loaded.tokenizer, loaded.config)
+  }
 }
 
 #[cfg(test)]
@@ -793,5 +1051,323 @@ mod tests {
     // typed `Config` was parsed from (single read — no divergence window).
     let seen = captured.lock().unwrap().clone().expect("ctor ran");
     assert_eq!(seen, on_disk);
+  }
+
+  // ──────────────────────────────────────────────────────────────────────
+  //   ModelContext — the owning `(model, tokenizer, config)` bundle.
+  //
+  //   Hand-traced tests over the crate-shared deterministic `MockModel`
+  //   (`crate::lm::model::MockModel`) and the shared `tests/fixtures`
+  //   tokenizer (a tiny WordLevel model + a jinja chat template), proving
+  //   the bundle owns the triple and that `encode` / `decode` /
+  //   `apply_chat_template` / `generate` / `stream_generate` forward to the
+  //   same underlying calls a hand-wired `lm::generate` / tokenizer would.
+  //   No `peak_memory()` magnitude asserts (process-global counter).
+  // ──────────────────────────────────────────────────────────────────────
+
+  use crate::lm::{generate::GenConfig, model::MockModel};
+
+  /// Load the shared `tests/fixtures` tokenizer (WordLevel vocab + jinja chat
+  /// template + `</s>` eos), reachable from the in-crate `#[cfg(test)]` build
+  /// via `CARGO_MANIFEST_DIR` — the same fixture `lm::generate`'s tests use.
+  fn fixture_tokenizer() -> Tokenizer {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+      .join("tests")
+      .join("fixtures");
+    Tokenizer::from_path(&dir, None).expect("load fixture tokenizer")
+  }
+
+  /// A minimal typed [`Config`] for the bundle tests: `vocab_size` and
+  /// `num_hidden_layers` are the keys [`ModelContext`] actually consults
+  /// (vocab for the mock, layer count for the per-call cache), the rest are
+  /// the typed [`Config`]'s required fields filled with inert values.
+  fn mock_config(vocab: i32, num_layers: i32) -> Config {
+    Config::from_json(&format!(
+      r#"{{
+        "model_type": "mockarch",
+        "hidden_size": 8,
+        "num_hidden_layers": {num_layers},
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 2,
+        "rope_theta": 10000.0,
+        "vocab_size": {vocab},
+        "tie_word_embeddings": false
+      }}"#
+    ))
+    .expect("mock config parses")
+  }
+
+  /// Build a [`ModelContext`] over a [`MockModel`] of the given `vocab` and a
+  /// matching fixture tokenizer / [`Config`]. `MockModel`'s greedy argmax is
+  /// the last vocab index, so `vocab` chooses the generated token id.
+  fn mock_context(vocab: i32, num_layers: i32) -> ModelContext {
+    ModelContext::new(
+      Box::new(MockModel::new(vocab as usize)),
+      fixture_tokenizer(),
+      mock_config(vocab, num_layers),
+    )
+  }
+
+  #[test]
+  fn context_owns_and_exposes_model_tokenizer_config() {
+    // The bundle owns the triple and the accessors hand back the SAME values
+    // (the config's typed fields, a working tokenizer, a runnable model).
+    let ctx = mock_context(8, 2);
+
+    assert_eq!(ctx.config().model_type, "mockarch");
+    assert_eq!(ctx.config().vocab_size, 8);
+    assert_eq!(ctx.config().num_hidden_layers, 2);
+
+    // The tokenizer accessor returns a real, working tokenizer.
+    let ids = ctx.tokenizer().encode("the quick brown", false).unwrap();
+    assert_eq!(ids.len(), 3);
+
+    // The model accessor returns the runnable mock: one forward yields
+    // `[B, S, vocab]` logits (vocab == 8).
+    let mut cache: Vec<Box<dyn crate::lm::cache::KvCache>> = Vec::new();
+    let tokens = Array::from_slice::<i32>(&[1, 2, 3], &(1usize, 3)).unwrap();
+    let logits = ctx.model().forward(&tokens, &mut cache).unwrap();
+    assert_eq!(logits.shape(), vec![1, 3, 8]);
+  }
+
+  #[test]
+  fn encode_forwards_to_tokenizer() {
+    // `ModelContext::encode` is a thin forward — it must produce byte-for-byte
+    // the ids the bundled tokenizer's own `encode` produces.
+    let ctx = mock_context(8, 1);
+    let text = "the quick brown world";
+    let via_context = ctx.encode(text, false).unwrap();
+    let via_tokenizer = ctx.tokenizer().encode(text, false).unwrap();
+    assert_eq!(via_context, via_tokenizer);
+    // WordLevel over 4 known fixture words ⇒ 4 ids.
+    assert_eq!(via_context.len(), 4);
+  }
+
+  #[test]
+  fn decode_forwards_to_tokenizer_and_round_trips_encode() {
+    // `decode` forwards to the tokenizer, and `encode`→`decode` round-trips
+    // the fixture vocab words (every word here is in-vocab).
+    let ctx = mock_context(8, 1);
+    let ids = ctx.encode("hello world", false).unwrap();
+    let via_context = ctx.decode(&ids, true).unwrap();
+    let via_tokenizer = ctx.tokenizer().decode(&ids, true).unwrap();
+    assert_eq!(via_context, via_tokenizer);
+    assert_eq!(via_context, "hello world");
+  }
+
+  #[test]
+  fn apply_chat_template_forwards_to_tokenizer() {
+    // `apply_chat_template` forwards to the tokenizer; the fixture template is
+    // `{{bos}}{% for m %}<|role|>content{% endfor %}{% gen-prompt %}`.
+    let ctx = mock_context(8, 1);
+    let messages = serde_json::json!([
+      {"role": "user", "content": "hello"}
+    ]);
+
+    let via_context = ctx
+      .apply_chat_template(&messages, None, true, false, None)
+      .unwrap();
+    let via_tokenizer = ctx
+      .tokenizer()
+      .apply_chat_template(&messages, None, true, false, None)
+      .unwrap();
+    assert_eq!(via_context, via_tokenizer);
+    // Hand-trace the fixture template: bos + the user turn + the
+    // add_generation_prompt assistant marker.
+    assert_eq!(via_context, "<s><|user|>hello<|assistant|>");
+  }
+
+  #[test]
+  fn apply_chat_template_ids_forwards_and_equals_render_then_encode() {
+    // The `tokenize: true` form forwards to the tokenizer AND equals
+    // `apply_chat_template` followed by `encode` (its own documented
+    // composition).
+    let ctx = mock_context(8, 1);
+    let messages = serde_json::json!([
+      {"role": "user", "content": "the quick"}
+    ]);
+
+    let via_context = ctx
+      .apply_chat_template_ids(&messages, None, true, false, None)
+      .unwrap();
+    let via_tokenizer = ctx
+      .tokenizer()
+      .apply_chat_template_ids(&messages, None, true, false, None)
+      .unwrap();
+    assert_eq!(via_context, via_tokenizer);
+
+    let rendered = ctx
+      .apply_chat_template(&messages, None, true, false, None)
+      .unwrap();
+    assert_eq!(via_context, ctx.encode(&rendered, false).unwrap());
+  }
+
+  #[test]
+  fn apply_chat_template_rejects_generation_prompt_with_continue() {
+    // The mutually-exclusive-flags guard lives on the tokenizer; the forward
+    // must surface that error (not panic) just as a direct call would.
+    let ctx = mock_context(8, 1);
+    let messages = serde_json::json!([{"role": "user", "content": "hello"}]);
+    let err = ctx
+      .apply_chat_template(
+        &messages, None, /*gen*/ true, /*continue*/ true, None,
+      )
+      .expect_err("gen-prompt + continue must error");
+    assert!(
+      err.to_string().contains("continue_final_message"),
+      "got: {err}"
+    );
+  }
+
+  #[test]
+  fn generate_forwards_and_runs_to_length() {
+    // `MockModel::new(8)`'s greedy argmax is the last index (7), and the
+    // fixture eos is `</s>` (id 2) — so token 7 is never eos and a greedy run
+    // proceeds for the full `max_tokens`. `generate` builds its own per-call
+    // cache (sized from `num_hidden_layers`) and forwards to
+    // `lm::generate::generate`.
+    let ctx = mock_context(8, 2);
+    let prompt = ctx.encode("hello world", false).unwrap();
+    let cfg = GenConfig {
+      max_tokens: 3,
+      ..Default::default()
+    };
+    let (text, stats) = ctx.generate(&prompt, cfg).expect("generate");
+
+    // Three non-eos tokens generated, the prompt counted, length-capped run.
+    assert_eq!(stats.generation_tokens, 3);
+    assert_eq!(stats.prompt_tokens, prompt.len());
+    // The collected text is exactly the detokenization of the three argmax
+    // tokens — i.e. forwarding to `lm::generate` produced a real decode.
+    assert_eq!(text, ctx.decode(&[7, 7, 7], true).unwrap());
+  }
+
+  #[test]
+  fn generate_stops_on_eos_token() {
+    // `MockModel::new(3)`'s greedy argmax is index 2 == the fixture `</s>`
+    // eos id: the very first sampled token is eos, so generation stops
+    // immediately with no produced text (mlx-lm never detokenizes the eos
+    // token). Proves the bundle's eos handling is the `lm::generate` one.
+    let ctx = mock_context(3, 1);
+    let prompt = ctx.encode("hello", false).unwrap();
+    let cfg = GenConfig {
+      max_tokens: 16,
+      ..Default::default()
+    };
+    let (text, stats) = ctx.generate(&prompt, cfg).expect("generate");
+    assert!(
+      text.is_empty(),
+      "eos token contributes no text, got {text:?}"
+    );
+    // The eos token itself counts as one generation token (mlx-lm `n + 1`).
+    assert_eq!(stats.generation_tokens, 1);
+  }
+
+  #[test]
+  fn stream_generate_forwards_and_yields_per_token_responses() {
+    // `stream_generate` forwards to `lm::generate::stream_generate`: a greedy
+    // run over `MockModel::new(8)` (argmax 7, never eos) yields one response
+    // per token and the final response carries `finish_reason = "length"`.
+    let ctx = mock_context(8, 2);
+    let prompt = ctx.encode("the quick", false).unwrap();
+    let cfg = GenConfig {
+      max_tokens: 4,
+      ..Default::default()
+    };
+
+    let mut reasons = Vec::new();
+    let mut collected = String::new();
+    for resp in ctx.stream_generate(&prompt, cfg) {
+      let r = resp.expect("stream step");
+      collected.push_str(&r.text);
+      reasons.push(r.finish_reason);
+    }
+
+    // Four tokens ⇒ four responses; only the last has a finish_reason.
+    assert_eq!(reasons.len(), 4);
+    assert_eq!(reasons[0], None);
+    assert_eq!(reasons[3], Some("length".to_string()));
+    // Streaming and the collecting `generate` agree on the assembled text.
+    let (gen_text, _) = ctx
+      .generate(
+        &prompt,
+        GenConfig {
+          max_tokens: 4,
+          ..Default::default()
+        },
+      )
+      .unwrap();
+    assert_eq!(collected, gen_text);
+  }
+
+  #[test]
+  fn from_loaded_model_context_wraps_the_triple() {
+    // `ModelContext` is buildable straight from the loader's product struct
+    // (`load(..)?.into()`): load a real mock model dir, wrap it, and confirm
+    // the bundle exposes the loaded model + tokenizer + config.
+    let dir = fresh_dir("ctx-from-loaded");
+    write_model_dir(&dir, "mockarch");
+    let registry = ModelTypeRegistry::new().with("mockarch", mock_constructor());
+    let configuration = ModelConfiguration::from_directory(&dir);
+
+    let loaded = load(&configuration, &registry).expect("load");
+    let ctx: ModelContext = loaded.into();
+
+    assert_eq!(ctx.config().model_type, "mockarch");
+    // The loaded mock arch has vocab 5 (see `mock_config_json`); the model
+    // forwards `[B, S, 5]` logits.
+    let mut cache: Vec<Box<dyn crate::lm::cache::KvCache>> = Vec::new();
+    let tokens = Array::from_slice::<i32>(&[0, 1, 2], &(1usize, 3)).unwrap();
+    let logits = ctx.model().forward(&tokens, &mut cache).unwrap();
+    assert_eq!(logits.shape(), vec![1, 3, 5]);
+    // The tokenizer loaded from the same dir (the 3-token fixture vocab).
+    assert_eq!(ctx.encode("a b c", false).unwrap().len(), 3);
+  }
+
+  #[test]
+  fn context_load_convenience_equals_load_then_into() {
+    // `ModelContext::load` is the one-call convenience — it must yield the
+    // same bundle as `load(..)` followed by `.into()`.
+    let dir = fresh_dir("ctx-load");
+    write_model_dir(&dir, "mockarch");
+    let registry = ModelTypeRegistry::new().with("mockarch", mock_constructor());
+    let configuration = ModelConfiguration::from_directory(&dir);
+
+    let ctx = ModelContext::load(&configuration, &registry).expect("ModelContext::load");
+    assert_eq!(ctx.config().model_type, "mockarch");
+    assert_eq!(ctx.config().vocab_size, 5);
+    assert_eq!(ctx.encode("a b c", false).unwrap().len(), 3);
+  }
+
+  #[test]
+  fn context_load_propagates_unknown_model_type_error() {
+    // The convenience `load` surfaces the same recoverable errors `load()`
+    // does — an unregistered `model_type` is an `Error`, not a panic.
+    let dir = fresh_dir("ctx-load-unknown");
+    write_model_dir(&dir, "nope");
+    let registry = ModelTypeRegistry::new().with("mockarch", mock_constructor());
+    let configuration = ModelConfiguration::from_directory(&dir);
+
+    let Err(err) = ModelContext::load(&configuration, &registry) else {
+      panic!("unknown model_type must error");
+    };
+    assert!(
+      err.to_string().contains("unsupported model type"),
+      "got: {err}"
+    );
+  }
+
+  #[test]
+  fn into_parts_round_trips_new() {
+    // `into_parts` is the inverse of `new`: decomposing then rebuilding
+    // preserves the config, and the model/tokenizer stay runnable.
+    let ctx = mock_context(8, 3);
+    let (model, tokenizer, config) = ctx.into_parts();
+    assert_eq!(config.num_hidden_layers, 3);
+
+    let rebuilt = ModelContext::new(model, tokenizer, config);
+    assert_eq!(rebuilt.config().vocab_size, 8);
+    assert_eq!(rebuilt.encode("hello", false).unwrap().len(), 1);
   }
 }
