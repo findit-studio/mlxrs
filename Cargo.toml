@@ -41,6 +41,10 @@ single_use_lifetimes = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = [
   'cfg(all_tests)',
   'cfg(tarpaulin)',
+  # `mlxrs::simd` force-scalar escape: `RUSTFLAGS="--cfg mlxrs_force_scalar"`
+  # routes the SIMD dispatchers through the scalar path on a NEON-capable
+  # host (regression bisection / exotic-target builds).
+  'cfg(mlxrs_force_scalar)',
 ] }
 
 [workspace.lints.clippy]

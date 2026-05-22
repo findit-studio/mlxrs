@@ -2751,11 +2751,16 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
       // The `block_size * rate` divisor is the EXPECTED per-block sample
       // count (NOT `upper - lower`, which can be smaller on the trailing
       // block) — preserves the reference's bias-correction-free form.
-      let mut sum_sq = 0.0_f64;
-      for &v in &weighted[lower..upper] {
-        sum_sq += v * v;
-      }
-      *ms_cell = sum_sq / block_samples_f64;
+      //
+      // The `Σ v²` reduction goes through `simd::sum_of_squares`: a NEON
+      // 2-lane FMA kernel on aarch64 (with a bit-identical scalar
+      // fallback). `weighted` is a contiguous `Vec<f64>` and the block
+      // slice is contiguous — ideal SIMD input, no layout fixup. The
+      // SIMD reduction tree differs from the previous strict
+      // left-to-right `sum_sq += v * v` loop, so `sum_sq` may move by a
+      // few ULPs; the `log10` in the BS.1770 reduction compresses that
+      // well within the loudness tests' tolerances.
+      *ms_cell = crate::simd::sum_of_squares(&weighted[lower..upper]) / block_samples_f64;
     }
     // `weighted` drops here (end of channel iteration) — next channel
     // re-uses `chan_f32` via `.clear()` (no shrink) and allocates the next

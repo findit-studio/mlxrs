@@ -39,6 +39,18 @@ pub mod io;
 pub mod memory;
 pub mod ops;
 pub mod shape;
+/// Hand-written `core::arch` SIMD kernels for the host-CPU numeric
+/// loops mlxrs runs itself (audio DSP / preprocessing) — *not* the
+/// MLX-delegated tensor math. Scalar reference + `aarch64` NEON
+/// backend behind a runtime-detection dispatcher.
+///
+/// **Always compiled** so any caller (e.g. `audio`) can rely on it —
+/// there is no `simd` cargo feature. Whether the NEON backend runs is
+/// gated purely on `#[cfg(target_arch = "aarch64")]` + runtime CPU
+/// detection; on every other target the dispatchers route to the
+/// always-compiled scalar path. The `--cfg mlxrs_force_scalar` build
+/// escape forces the scalar path even on a NEON-capable host.
+pub mod simd;
 pub mod stream;
 pub mod version;
 

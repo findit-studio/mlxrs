@@ -11,6 +11,15 @@ rust-version.workspace = true
 
 [features]
 default = []
+# The hand-written `core::arch` SIMD kernels (the `mlxrs::simd` module:
+# scalar reference + aarch64 NEON backend behind a runtime-detection
+# dispatcher) are ALWAYS compiled — there is no `simd` cargo feature.
+# Whether the NEON backend runs is gated purely on `target_arch =
+# "aarch64"` + runtime CPU detection (`is_aarch64_feature_detected!`),
+# with the always-compiled scalar path as the automatic fallback on
+# non-aarch64 targets and under `--cfg mlxrs_force_scalar` (a build-cfg
+# for regression bisection / exotic-target builds). Matches the `dia`
+# reference design.
 # Granular, capability-named tokenizer features (minimize deps).
 tokenizer            = ["dep:tokenizers"]                                          # HfTokenizer load + encode/decode + special tokens from tokenizer.json. NO serde_json/minijinja.
 tokenizer-config     = ["tokenizer", "dep:serde_json"]                             # parse tokenizer_config.json → bos/eos/unk/chat_template/added-tokens
@@ -25,7 +34,7 @@ tokenizer-tools      = ["tokenizer-config", "dep:serde_json"]                   
 embeddings           = ["tokenizer", "dep:smol_str", "dep:memspan"]                 # encode/decode (tokenizers crate) + `1_Pooling/config.json` parsing (HAND-ROLLED strict-JSON scanner per EMB-1; NO DIRECT `mlxrs::dep:serde_json` — `tokenizers v0.23` still pulls `serde_json` transitively for its `tokenizer.json` parse, so `embeddings` BUILDS but does not OWN `serde_json` after EMB-1. `tokenizer-config`/`tokenizer-bpe`/`tokenizer-spm`/`tokenizer-tools` continue to pull it directly). `smol_str` inlines short keys/values (≤23 bytes) into the JVal payload. `memspan` SIMD-accelerates `skip_ws` (AVX2/AVX-512/NEON dispatch) and the per-string `skip-until-quote-or-backslash` chunk scan, plus enables a no-escape fast path that copies the source slice directly into SmolStr with zero intermediate Vec.
 lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm", "tokenizer-bpe", "tokenizer-chat", "tokenizer-deepseek-v32", "tokenizer-tools"]
 vlm                  = ["lm", "dep:image", "dep:fast_image_resize"]
-audio                = ["lm", "dep:symphonia"] # mirrors mlx-audio's Python dep on mlx-lm; symphonia = WAV codec for audio::io
+audio                = ["lm", "dep:symphonia"] # mirrors mlx-audio's Python dep on mlx-lm; symphonia = WAV codec for audio::io. The always-compiled `mlxrs::simd` module accelerates the integrated_loudness sum-of-squares (NEON on aarch64, scalar fallback elsewhere) — no feature gate needed.
 unstable-ops-overload = []               # `&a + &b` etc. (panic on shape error). OFF by default.
 gguf                 = []                                                          # GGUF load/save (mlx-c `mlx_io_gguf*`). OFF: mlxrs-sys does not yet link gguflib.
 
