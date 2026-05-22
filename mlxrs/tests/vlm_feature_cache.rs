@@ -245,7 +245,7 @@ fn key_encoding_non_aliasing() {
     &[0xffu8; 32][..],
   ] {
     let hashed = Key::from_bytes(bytes);
-    let digest = hashed.as_str(); // e.g. "b:0123456789abcdef"
+    let digest = hashed.as_str(); // e.g. "b:0123456789abcdef0123456789abcdef"
     // A literal path equal to the *encoded* digest must not alias it.
     assert_ne!(
       Key::from_source(digest),
@@ -368,10 +368,22 @@ fn url_key() {
 // ──────────────────────────── content-hash key ──────────────────────────
 
 /// The PIL/content-hash branch (`Key::from_bytes`): identical bytes hash
-/// to the same key (hit), different bytes to different keys (no collision),
-/// and the key carries the `b:` variant tag so it can't alias a literal
-/// path (cross-variant non-aliasing is exhaustively checked in
+/// to the same key (hit), different bytes to different keys (no collision for
+/// any practical input), and the key carries the `b:` variant tag so it can't
+/// alias a literal path (cross-variant non-aliasing is exhaustively checked in
 /// `key_encoding_non_aliasing`).
+///
+/// **Contract — collision-resistant, not injective.** Unlike `from_source` /
+/// `from_sources` (which carry the full source string and are *injective* —
+/// distinct sources always yield distinct keys), `from_bytes` is a fixed-width
+/// **128-bit digest** of the raw bytes. A digest cannot be injective over an
+/// unbounded byte space (pigeonhole), so the guarantee is collision-*resistance*,
+/// not collision-freedom: distinct bytes practically never collide (birthday
+/// bound ≈2⁶⁴ images), but a collision is possible in principle. The
+/// "different bytes → different key" assertions below hold for these (and any
+/// realistic) inputs precisely because of that 128-bit collision-resistance;
+/// they are not claiming the map is injective. See `from_bytes_is_*` for the
+/// stability + width contract.
 #[test]
 fn content_hash_key() {
   let mut cache = VisionFeatureCache::new();
@@ -382,17 +394,76 @@ fn content_hash_key() {
     .put(Key::from_bytes(&img_a), &features(10, 64, 1.0))
     .unwrap();
 
-  // Same bytes → same key → hit.
+  // Same bytes → same key → hit (the digest is stable).
   assert!(
     cache
       .get(&Key::from_bytes(&[1u8, 2, 3, 4, 5]))
       .unwrap()
       .is_some()
   );
-  // Different bytes → different key → miss.
+  // Different bytes → different key → miss (collision-resistant: these
+  // distinct inputs digest to distinct 128-bit values).
   assert!(cache.get(&Key::from_bytes(&img_b)).unwrap().is_none());
   // `b:`-tagged so it never aliases a real path (an `s:` key).
   assert!(Key::from_bytes(&img_a).as_str().starts_with("b:"));
+}
+
+/// `from_bytes` is a STABLE, fixed-width 128-bit digest: same bytes → same key
+/// (so a cache lookup with a re-derived key hits), and the encoded form is
+/// always `"b:"` + 32 hex chars regardless of input length.
+///
+/// This pins the *digest* contract — stability + fixed width — as distinct
+/// from the *injectivity* the string-carrying variants (`from_source` /
+/// `from_sources`) guarantee. A digest is collision-RESISTANT, not injective
+/// (see `content_hash_key`'s doc); these assertions verify only that it is a
+/// well-formed, stable, 128-bit digest.
+#[test]
+fn from_bytes_is_stable_fixed_width_digest() {
+  // Stable: identical bytes always produce the identical key.
+  assert_eq!(Key::from_bytes(b"abc"), Key::from_bytes(b"abc"));
+  assert_eq!(Key::from_bytes(b""), Key::from_bytes(b""));
+  assert_eq!(
+    Key::from_bytes(&[0xffu8; 64]),
+    Key::from_bytes(&[0xffu8; 64])
+  );
+
+  // Fixed width: `"b:"` (2) + 128-bit digest as 32 lowercase hex chars = 34,
+  // for ANY input length (empty, short, long).
+  for bytes in [
+    &b""[..],
+    &b"x"[..],
+    &b"a longer payload than one hash block, exercising the streaming path"[..],
+    &[0u8; 1024][..],
+  ] {
+    let key = Key::from_bytes(bytes);
+    let s = key.as_str();
+    assert_eq!(s.len(), 34, "b: + 32 hex chars (128-bit digest), got {s:?}");
+    let payload = s.strip_prefix("b:").expect("from_bytes key is b:-tagged");
+    assert_eq!(payload.len(), 32, "128-bit digest is 32 hex chars");
+    assert!(
+      payload.bytes().all(|c| c.is_ascii_hexdigit()),
+      "digest payload must be lowercase hex, got {payload:?}"
+    );
+  }
+
+  // Collision-resistance (not injectivity): distinct inputs yield distinct
+  // keys for these practical samples. The 128-bit width is what makes this
+  // hold for any realistic test corpus — it is NOT a claim of injectivity.
+  let samples: [&[u8]; 6] = [b"", b"a", b"b", b"ab", b"ba", &[0u8; 5]];
+  for (i, &x) in samples.iter().enumerate() {
+    for &y in samples.iter().skip(i + 1) {
+      assert_ne!(
+        Key::from_bytes(x),
+        Key::from_bytes(y),
+        "distinct byte inputs must digest to distinct 128-bit keys"
+      );
+    }
+  }
+
+  // The two domain-separated halves carry independent information: a single
+  // bit flip in the input changes the digest (would not be guaranteed if both
+  // halves were the same un-separated SipHash pass).
+  assert_ne!(Key::from_bytes(b"\x00"), Key::from_bytes(b"\x01"));
 }
 
 // ──────────────────────────────── clear ─────────────────────────────────

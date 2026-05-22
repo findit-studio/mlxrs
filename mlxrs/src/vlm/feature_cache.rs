@@ -45,31 +45,46 @@
 //!   with three constructors mirroring the three Python branches —
 //!   [`Key::from_source`] (the `str` branch — path/URL), [`Key::from_sources`]
 //!   (the `list` branch — a multi-image source), and [`Key::from_bytes`]
-//!   (the PIL branch — a content hash). The encoded key is **namespaced and
-//!   unambiguous**, *not* the reference's bare normalized string: each
-//!   constructor prefixes a distinct variant tag (`s:` / `l:` / `b:`) and
-//!   the list variant length-prefixes its components. This is a deliberate
-//!   deviation — the reference's encoding *aliases* distinct image
-//!   identities (a `'|'`-joined list collides with a literal `'|'`-bearing
-//!   path; a `pil:`-hashed key collides with a literal `pil:…` path), which
-//!   would silently feed one image's cached embeddings to a different
-//!   image. The tag + length-prefix scheme makes both cross-variant and
-//!   within-list collision impossible by construction (see [`Key`]'s
-//!   "Internal representation — unambiguous encoding" note). [`Key`] holds
-//!   that encoded string as an [`Arc<str>`](std::sync::Arc) (an
-//!   implementation detail — every public constructor / accessor has the
-//!   same signature and semantics it would with a `String` field); the
-//!   cache stores `Arc<str>` clones in both its containers, so the recency
-//!   queue and the entry map share one heap-allocated string and [`put`]
-//!   never heap-copies a key (see [`Key`]'s "Internal representation" note
-//!   and [`VisionFeatureCache`]'s "Key storage" note). `Arc` (not `Rc`)
-//!   keeps the public [`Key`] type `Send + Sync` — see [`Key`]'s "Internal
-//!   representation" note. Because mlxrs has no PIL type and no crypto
-//!   dependency, [`Key::from_bytes`] uses the std
-//!   [`DefaultHasher`](std::hash::DefaultHasher) (a fast non-cryptographic
-//!   hash) rather than `sha256`: this is a **cache key**, collision-tolerant
-//!   by construction and never a security boundary, so a SipHash-class
-//!   digest is the idiomatic Rust choice and pulls no new crate.
+//!   (the PIL branch — a content hash). Each constructor prefixes a distinct
+//!   variant tag (`s:` / `l:` / `b:`), and the list variant length-prefixes
+//!   its components. This is a deliberate deviation — the reference's encoding
+//!   *aliases* distinct image identities (a `'|'`-joined list collides with a
+//!   literal `'|'`-bearing path; a `pil:`-hashed key collides with a literal
+//!   `pil:…` path), which would silently feed one image's cached embeddings to
+//!   a different image. The variant tag makes **cross-variant** collision
+//!   impossible by construction, and the length-prefix makes the
+//!   [`from_sources`](Key::from_sources) list encoding **injective** (see
+//!   [`Key`]'s "Internal representation" note). The per-variant key contract
+//!   is:
+//!   - [`from_source`](Key::from_source) / [`from_sources`](Key::from_sources)
+//!     carry the **full source string(s)** verbatim (tagged, and the list
+//!     length-prefixed), so they are **injective** — distinct sources always
+//!     produce distinct keys, so a cache hit can never return a different
+//!     image's features.
+//!   - [`from_bytes`](Key::from_bytes) **digests** arbitrary image bytes to a
+//!     fixed-width value, so it is a digest, *not* an injection — it is
+//!     **collision-resistant**, not collision-free. A digest maps an unbounded
+//!     byte space onto fixed-width output, so a collision is possible in
+//!     principle; the 128-bit width (below) makes it astronomically unlikely
+//!     (see that constructor's note).
+//!
+//!   [`Key`] holds the encoded string as an [`Arc<str>`](std::sync::Arc) (an
+//!   implementation detail — every public constructor / accessor has the same
+//!   signature and semantics it would with a `String` field); the cache stores
+//!   `Arc<str>` clones in both its containers, so the recency queue and the
+//!   entry map share one heap-allocated string and [`put`] never heap-copies a
+//!   key (see [`Key`]'s "Internal representation" note and
+//!   [`VisionFeatureCache`]'s "Key storage" note). `Arc` (not `Rc`) keeps the
+//!   public [`Key`] type `Send + Sync` — see [`Key`]'s "Internal
+//!   representation" note. Because mlxrs has no PIL type and adds no crypto
+//!   dependency, [`Key::from_bytes`] does not use the reference's `sha256`; it
+//!   builds a **128-bit** digest from two domain-separated
+//!   [`DefaultHasher`](std::hash::DefaultHasher) (SipHash) passes. 128 bits
+//!   lifts the birthday bound to ≈2⁶⁴ distinct images before a collision is
+//!   *expected* — practically unreachable for a cache — so a collision is
+//!   negligible without pulling any new crate (a content hash here is a cache
+//!   key, never a security boundary; cryptographic strength is not required,
+//!   only practical collision-resistance).
 //! - **Bounded memory** — the reference is already bounded (`max_size`,
 //!   default 20); mlxrs keeps that exact cap and default. The constructor
 //!   rejects `max_size == 0` ([`Error::ShapeMismatch`]) rather than
@@ -106,15 +121,39 @@ pub const DEFAULT_MAX_SIZE: usize = 20;
 /// reduces every image source to a `str`. The three constructors map 1:1
 /// to the reference's three branches:
 ///
-/// | Python branch | constructor | encoded form |
-/// |---|---|---|
-/// | `isinstance(image_source, str)` — path / URL | [`Key::from_source`] | `s:<source>` |
-/// | `isinstance(image_source, list)` — multi-image | [`Key::from_sources`] | `l:` + length-prefixed components |
-/// | PIL image — `sha256(tobytes())[:16]` | [`Key::from_bytes`] | `b:<hexdigest>` |
+/// | Python branch | constructor | encoded form | contract |
+/// |---|---|---|---|
+/// | `isinstance(image_source, str)` — path / URL | [`Key::from_source`] | `s:<source>` | injective |
+/// | `isinstance(image_source, list)` — multi-image | [`Key::from_sources`] | `l:` + length-prefixed components | injective |
+/// | PIL image — `sha256(tobytes())[:16]` | [`Key::from_bytes`] | `b:<128-bit hexdigest>` | collision-resistant |
 ///
 /// Two `Key`s are equal iff their encoded strings are equal. **List order
 /// is significant** (matching the reference) — `["a", "b"]` and `["b", "a"]`
 /// are different keys.
+///
+/// # Per-variant key contract
+///
+/// The three constructors do **not** share one guarantee — the "contract"
+/// column above is exact:
+///
+/// - [`from_source`](Self::from_source) and [`from_sources`](Self::from_sources)
+///   are **injective**: they carry the full source string(s) verbatim (tagged,
+///   and the list length-prefixed), so distinct image identities *always*
+///   produce distinct keys. A cache hit on one of these keys can never return
+///   a different image's features.
+/// - [`from_bytes`](Self::from_bytes) is **collision-resistant**, not
+///   injective: it *digests* arbitrary image bytes onto a fixed-width 128-bit
+///   value, so by the pigeonhole principle two different byte slices *can* in
+///   principle map to the same key. The 128-bit digest makes that
+///   astronomically unlikely (birthday bound ≈2⁶⁴ images), so for any
+///   practical workload a `from_bytes` collision never occurs — but the
+///   guarantee is collision-*resistance*, not the injectivity the
+///   string-carrying variants give.
+///
+/// The **variant tag** (`s:` / `l:` / `b:`) is a separate, unconditional
+/// guarantee that holds for *all three*: two keys from *different*
+/// constructors can never be equal, so `from_bytes`'s digest can never alias a
+/// literal path/list source (and vice versa) regardless of the digest's value.
 ///
 /// # Internal representation — unambiguous encoding
 ///
@@ -147,12 +186,19 @@ pub const DEFAULT_MAX_SIZE: usize = 20;
 ///   and the two differ. The list encoding is injective.
 ///
 /// Together the variant tag (kills cross-variant aliasing) and the
-/// length-prefixed list components (kill within-list aliasing) make the
-/// encoding **injective**: distinct image identities always produce
-/// distinct keys, so a cache hit can never return a different image's
-/// features. The encoded form is an internal cache key — [`as_str`](Self::as_str)
-/// exposes it for tests/introspection, but no caller parses it back into a
-/// source.
+/// length-prefixed list components (kill within-list aliasing) make the two
+/// **string-carrying** variants — [`from_source`](Self::from_source) and
+/// [`from_sources`](Self::from_sources) — **injective**: distinct path/URL/list
+/// identities always produce distinct keys, so a cache hit on those can never
+/// return a different image's features. The third variant,
+/// [`from_bytes`](Self::from_bytes), is a fixed-width *digest* of the raw
+/// bytes, so it is **collision-resistant** rather than injective (a digest
+/// cannot be injective over an unbounded byte space — see the "Per-variant key
+/// contract" section above and that constructor's note); its variant tag still
+/// unconditionally prevents cross-variant aliasing with the two injective
+/// variants. The encoded form is an internal cache key —
+/// [`as_str`](Self::as_str) exposes it for tests/introspection, but no caller
+/// parses it back into a source.
 ///
 /// The encoded string is held as an [`Arc<str>`](Arc), not a `String`.
 /// This is an implementation detail — every public method
@@ -300,35 +346,75 @@ impl Key {
   /// Key for an in-memory image with no stable path — the reference's
   /// PIL branch (`vision_cache.py:47-49`): hash the raw image bytes.
   ///
-  /// The reference uses `sha256(tobytes())[:16]`; mlxrs uses the std
-  /// [`DefaultHasher`](std::hash::DefaultHasher) because this is a
-  /// collision-tolerant **cache key**, never a security boundary, and a
-  /// SipHash-class digest needs no extra crate (see the module-level
+  /// # Contract: collision-resistant, *not* injective
+  ///
+  /// Unlike [`from_source`](Self::from_source) /
+  /// [`from_sources`](Self::from_sources) (which carry the full source string
+  /// and are therefore **injective** — distinct sources always yield distinct
+  /// keys), this constructor **digests** arbitrary image bytes onto a
+  /// fixed-width value. A digest cannot be injective over an unbounded byte
+  /// space (pigeonhole), so two *different* byte slices *can* in principle map
+  /// to the same key. The digest below is **128-bit**, which makes that
+  /// astronomically unlikely — the birthday bound is ≈2⁶⁴ distinct images
+  /// before a collision is even *expected*, far beyond any cache's lifetime —
+  /// so for any practical workload a `from_bytes` collision never happens. But
+  /// the guarantee is **collision-resistance**, not the injectivity the
+  /// string-carrying variants give: callers must not assume two distinct
+  /// images can *never* share a `from_bytes` key, only that it is
+  /// negligibly unlikely.
+  ///
+  /// The reference uses `sha256(tobytes())[:16]`. mlxrs builds the 128-bit
+  /// digest from two domain-separated [`DefaultHasher`](std::hash::DefaultHasher)
+  /// (SipHash) passes instead of pulling a crypto crate: a content hash here
+  /// is a **cache key**, never a security boundary, so cryptographic strength
+  /// is not required — only practical collision-resistance, which 128 bits of
+  /// SipHash provides. This adds no new dependency (see the module-level
   /// "Deviations" note).
+  ///
+  /// ## Why two passes (and why domain-separated)
+  ///
+  /// A single [`DefaultHasher`](std::hash::DefaultHasher) yields only 64 bits
+  /// (birthday bound ≈2³² images — uncomfortably reachable). Two passes give
+  /// 128 bits, but a naïve "hash the same bytes twice" would produce two
+  /// *identical* 64-bit halves, because `DefaultHasher::new()` is always seeded
+  /// with the same fixed SipHash keys — so the second half would carry no new
+  /// information. Each pass is therefore **domain-separated** by feeding a
+  /// distinct one-byte tag (`0` then `1`) into the hasher *before* the image
+  /// bytes; the two halves then depend on the input through two different
+  /// SipHash inputs and are effectively independent, giving the full 128-bit
+  /// width.
   ///
   /// # Encoding
   ///
-  /// The result is `"b:"` followed by the fixed-width hex digest. The `b:`
-  /// variant tag namespaces this constructor against
+  /// The result is `"b:"` followed by the fixed-width **32-hex-char** (128-bit)
+  /// digest. The `b:` variant tag namespaces this constructor against
   /// [`from_source`](Self::from_source) (`s:`) and
   /// [`from_sources`](Self::from_sources) (`l:`). This is what makes
-  /// cross-variant aliasing **impossible by construction**: a `from_bytes`
-  /// key always starts `b:`, a `from_source` key always `s:`, so a literal
-  /// path source — even one named exactly `b:0123456789abcdef`, or the
-  /// reference's old `pil:`-prefixed shape — encodes to `s:b:...` /
-  /// `s:pil:...` and can never equal a real `from_bytes` key. (The earlier
-  /// `pil:`-prefix-only scheme guarded against a literal `pil:...` path but
-  /// *not* against a literal `b:<hexdigest>` path; the `s:`/`b:` tag pair
-  /// closes that hole — the tag is on the *outside* and the user's bytes
-  /// never reach it.)
+  /// cross-variant aliasing **impossible by construction** (independent of the
+  /// digest's collision-resistance): a `from_bytes` key always starts `b:`, a
+  /// `from_source` key always `s:`, so a literal path source — even one named
+  /// exactly like a digest, or the reference's old `pil:`-prefixed shape —
+  /// encodes to `s:...` and can never equal a real `from_bytes` key. (The tag
+  /// is on the *outside* and the user's bytes never reach it.)
   pub fn from_bytes(bytes: &[u8]) -> Self {
-    let mut hasher = std::hash::DefaultHasher::new();
-    bytes.hash(&mut hasher);
+    // 128-bit digest = two domain-separated 64-bit SipHash passes. Each pass
+    // is seeded with the same fixed `DefaultHasher` keys, so they are
+    // distinguished by a leading one-byte domain tag (`0` / `1`) hashed
+    // *before* `bytes`; without that the two halves would be identical and
+    // the key would carry only 64 bits of entropy.
+    let half = |domain: u8| -> u64 {
+      let mut hasher = std::hash::DefaultHasher::new();
+      hasher.write_u8(domain);
+      bytes.hash(&mut hasher);
+      hasher.finish()
+    };
+    let hi = half(0);
+    let lo = half(1);
     // `format!` builds the `b:`-prefixed fixed-width hex digest `String`;
     // `Arc::from` consumes it into the shared `Arc<str>` (transient buffer
-    // freed). The digest width is fixed (16 hex chars), so the encoded key
-    // is always exactly `"b:" + 16` chars.
-    Self(Arc::from(format!("b:{:016x}", hasher.finish())))
+    // freed). Each half is 16 hex chars, so the encoded key is always exactly
+    // `"b:" + 32` chars.
+    Self(Arc::from(format!("b:{hi:016x}{lo:016x}")))
   }
 
   /// The normalized key string — the internal, namespaced cache-key
