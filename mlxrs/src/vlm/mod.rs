@@ -8,6 +8,14 @@
 //! `mlx-vlm/models/` — only the cross-model support surface lives here.
 //!
 //! ## Submodules
+//! - [`crate::vlm::load`] — local VLM **load factory** + a
+//!   (`model_type`, `processor_class`) → constructor registry pair,
+//!   the VLM analog of [`crate::lm::factory`]. Reads the model's
+//!   `config.json` once, the VLM processor config
+//!   (`preprocessor_config.json` preferred, `processor_config.json`
+//!   fallback) once, validates both registries early, then loads
+//!   weights / tokenizer / constructs model + processor. Local-only;
+//!   no Hugging Face Hub download.
 //! - [`image`] — core image preprocessing primitives ported 1:1 from
 //!   `mlx-swift-lm`'s `Libraries/MLXVLM/MediaProcessing.swift`
 //!   (load / resize / channel-extract / rescale / normalize / patchify
@@ -39,6 +47,7 @@
 
 pub mod generate;
 pub mod image;
+pub mod load;
 pub mod model;
 pub mod prompt;
 pub mod video;

@@ -1568,7 +1568,14 @@ pub struct BatchGenStep {
 /// The iterator **fuses**: after it yields `Err` (a step failed) or finishes
 /// (every row done) every further `next()` is `None` — never a panic, never a
 /// poisoned re-entry (spec §4).
-pub struct BatchGenerator<'a, M: Model> {
+///
+/// `M: Model + ?Sized` — like single-seq [`Generator`], the loop only ever
+/// touches the model behind the `&'a M` borrow (`model.forward(...)`), never
+/// by value and never via a `Sized`-requiring associated item, so `M` may be
+/// an unsized trait object (`&dyn Model`, or a deref-coerced
+/// `Box<dyn Model>` / `Box<dyn VlmModel>`). This keeps batch generation
+/// drivable by the exact handle a load factory returns.
+pub struct BatchGenerator<'a, M: Model + ?Sized> {
   model: &'a M,
   cache: Vec<Box<dyn KvCache>>,
   sampler: Sampler,
@@ -1623,7 +1630,7 @@ pub struct BatchGenerator<'a, M: Model> {
   done: bool,
 }
 
-impl<M: Model> BatchGenerator<'_, M> {
+impl<M: Model + ?Sized> BatchGenerator<'_, M> {
   fn batch_size(&self) -> usize {
     self.padded_rows.len()
   }
@@ -1781,7 +1788,7 @@ impl<M: Model> BatchGenerator<'_, M> {
   }
 }
 
-impl<M: Model> Iterator for BatchGenerator<'_, M> {
+impl<M: Model + ?Sized> Iterator for BatchGenerator<'_, M> {
   type Item = Result<BatchGenStep>;
 
   fn next(&mut self) -> Option<Self::Item> {
@@ -2026,7 +2033,7 @@ pub fn batch_left_padding(prompts: &[&[u32]]) -> Vec<i32> {
 /// (use [`batch_left_padding`]) — the per-row mask uses that exact term.
 /// `cache.len()` must match the model's decoder-layer count (the same as
 /// single-seq [`generate_step`]).
-pub fn batch_generate_step<'a, M: Model>(
+pub fn batch_generate_step<'a, M: Model + ?Sized>(
   model: &'a M,
   prompts: &[&[u32]],
   pad_token_id: u32,
@@ -2125,7 +2132,7 @@ pub fn batch_generate_step<'a, M: Model>(
 /// See [`batch_generate_step`] for the iteration contract; this just wires
 /// `cfg.eos = tokenizer.eos_token_ids()` before constructing the underlying
 /// [`BatchGenerator`].
-pub fn batch_stream_generate<'a, M: Model>(
+pub fn batch_stream_generate<'a, M: Model + ?Sized>(
   model: &'a M,
   tokenizer: &'a crate::tokenizer::Tokenizer,
   prompts: &[&[u32]],
@@ -2174,7 +2181,7 @@ pub fn batch_stream_generate<'a, M: Model>(
 /// row's length is `produced - int(finish_reason == "stop")` ⇒ at most
 /// `cfg.max_tokens`. A `"stop"` finish drops the trailing EOS; a `"length"`
 /// finish keeps the final token.
-pub fn batch_generate<M: Model>(
+pub fn batch_generate<M: Model + ?Sized>(
   model: &M,
   tokenizer: &crate::tokenizer::Tokenizer,
   prompts: &[&[u32]],
