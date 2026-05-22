@@ -199,14 +199,182 @@ impl std::ops::Deref for SpeculativeResponse {
   }
 }
 
+/// A streaming speculative-decoding run — the [`Iterator`]
+/// [`speculative_stream_generate`] returns.
+///
+/// Yields one [`SpeculativeResponse`] per yielded token (accepted draft or
+/// bonus). Unlike a bare `impl Iterator`, this is a named type so a caller
+/// that abandons the stream mid-generation can still finalize the streaming
+/// detokenizer via [`SpeculativeStream::finalize_tail`] — the buffered tail
+/// a BPE/SPM detokenizer withholds until `finalize()` would otherwise be
+/// lost (see that method's doc).
+pub struct SpeculativeStream<'a> {
+  /// The speculative driver, or `None` once the run is finished / failed at
+  /// construction.
+  driver: Option<SpeculativeDriver<'a>>,
+  /// A construction-time error, deferred so the public surface stays a pure
+  /// `Iterator`: yielded once on the first poll, then the iterator fuses.
+  /// `Error` is not `Clone`, hence the `take()`-on-first-poll `Option`.
+  pending_err: Option<Error>,
+  /// The streaming detokenizer — maps yielded token ids to text segments.
+  detok: crate::tokenizer::wrapper::BoxedDetokenizer,
+  /// Encoded prompt length, surfaced on every [`GenerationResponse`].
+  prompt_tokens: usize,
+  /// The eos id set (from `tokenizer.eos_token_ids()`): generation ends on
+  /// the first eos token.
+  eos: Vec<u32>,
+  /// `cfg.max_tokens` — the "length" stop.
+  max_tokens: usize,
+  /// Whether the caller opted into per-position logprobs (`GenConfig`).
+  collect_logprobs: bool,
+  /// Tokens yielded so far (mlx-lm's `n`).
+  n: usize,
+  /// `true` once the run has ended (eos / `max_tokens` / `Err`); the
+  /// iterator fuses afterwards.
+  finished: bool,
+  /// Start instant for the prompt-/generation-tps measurement.
+  tic: std::time::Instant,
+  /// Tokens-per-second over the prompt prefill (set after the first token).
+  prompt_tps: f64,
+}
+
+impl SpeculativeStream<'_> {
+  /// Finalize the streaming detokenizer and return whatever tail it had
+  /// withheld — the text that an EOS / `max_tokens` poll *would* have
+  /// flushed but that an interrupted run never reaches.
+  ///
+  /// BPE/SPM detokenizers buffer trailing bytes / spaces and only release
+  /// them on `finalize()`. A caller that drops this stream mid-generation
+  /// (e.g. [`crate::lm::session::ChatSession`]'s interrupted speculative
+  /// turn) must call this to make the recorded text token-complete;
+  /// otherwise the last produced token's tail is lost. Idempotent: once the
+  /// run finished naturally (eos / `max_tokens` already finalized), or once
+  /// this has been called, it returns an empty string.
+  pub fn finalize_tail(&mut self) -> String {
+    self.detok.finalize();
+    self.detok.last_segment()
+  }
+}
+
+impl Iterator for SpeculativeStream<'_> {
+  type Item = Result<SpeculativeResponse>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    if let Some(e) = self.pending_err.take() {
+      // Construction-time failure: yield once, then fuse.
+      self.finished = true;
+      return Some(Err(e));
+    }
+    if self.finished {
+      return None;
+    }
+    let d = self.driver.as_mut()?;
+
+    let TokenOut {
+      token,
+      logprobs,
+      from_draft,
+      stats,
+    } = match d.next_token() {
+      Ok(Some(t)) => t,
+      Ok(None) => {
+        self.finished = true;
+        return None;
+      }
+      Err(e) => {
+        self.finished = true;
+        return Some(Err(e));
+      }
+    };
+
+    if self.n == 0 {
+      let prompt_time = self.tic.elapsed().as_secs_f64();
+      self.prompt_tps = if prompt_time > 0.0 {
+        self.prompt_tokens as f64 / prompt_time
+      } else {
+        0.0
+      };
+      self.tic = std::time::Instant::now();
+    }
+
+    let dt = self.tic.elapsed().as_secs_f64();
+    let gen_tps = |gen_count: usize| -> f64 { if dt > 0.0 { gen_count as f64 / dt } else { 0.0 } };
+
+    // mlx-lm: `if token in eos: break` BEFORE `add_token` — the eos token
+    // is yielded with an empty (or only the finalized tail) text segment.
+    if self.eos.contains(&token) {
+      self.finished = true;
+      self.detok.finalize();
+      let text = self.detok.last_segment();
+      return Some(Ok(SpeculativeResponse {
+        response: GenerationResponse {
+          text,
+          token,
+          logprobs: self.collect_logprobs.then_some(logprobs),
+          prompt_tokens: self.prompt_tokens,
+          prompt_tps: self.prompt_tps,
+          generation_tokens: self.n + 1,
+          generation_tps: gen_tps(self.n + 1),
+          peak_memory_bytes: crate::memory::peak_memory().ok(),
+          finish_reason: Some("stop".to_string()),
+        },
+        from_draft,
+        stats,
+      }));
+    }
+
+    self.detok.add_token(token);
+    self.n += 1;
+
+    if self.n >= self.max_tokens {
+      self.finished = true;
+      self.detok.finalize();
+      let text = self.detok.last_segment();
+      return Some(Ok(SpeculativeResponse {
+        response: GenerationResponse {
+          text,
+          token,
+          logprobs: self.collect_logprobs.then_some(logprobs),
+          prompt_tokens: self.prompt_tokens,
+          prompt_tps: self.prompt_tps,
+          generation_tokens: self.n,
+          generation_tps: gen_tps(self.n),
+          peak_memory_bytes: crate::memory::peak_memory().ok(),
+          finish_reason: Some("length".to_string()),
+        },
+        from_draft,
+        stats,
+      }));
+    }
+
+    let text = self.detok.last_segment();
+    Some(Ok(SpeculativeResponse {
+      response: GenerationResponse {
+        text,
+        token,
+        logprobs: self.collect_logprobs.then_some(logprobs),
+        prompt_tokens: self.prompt_tokens,
+        prompt_tps: self.prompt_tps,
+        generation_tokens: self.n,
+        generation_tps: gen_tps(self.n),
+        peak_memory_bytes: crate::memory::peak_memory().ok(),
+        finish_reason: None,
+      },
+      from_draft,
+      stats,
+    }))
+  }
+}
+
 /// Stream speculative-decoded text from `target` for `prompt`, using
 /// `draft_cfg.draft_model` to propose tokens — port of the `draft_model`
 /// branch of `mlx_lm.generate.stream_generate` (`generate.py:711-746`).
 ///
-/// Yields one [`SpeculativeResponse`] per yielded token (accepted draft or
-/// bonus). The streaming detokenizer + finish-reason wiring is the same as
-/// plain [`crate::lm::generate::stream_generate`] — the eos set is taken
-/// from `tokenizer.eos_token_ids()` (overriding any `cfg.eos`), so the
+/// Returns a [`SpeculativeStream`], an [`Iterator`] yielding one
+/// [`SpeculativeResponse`] per yielded token (accepted draft or bonus). The
+/// streaming detokenizer + finish-reason wiring is the same as plain
+/// [`crate::lm::generate::stream_generate`] — the eos set is taken from
+/// `tokenizer.eos_token_ids()` (overriding any `cfg.eos`), so the
 /// `finish_reason` matches mlx-lm exactly.
 ///
 /// **Cache trimmability is required.** Both `target_cache` and `draft_cache`
@@ -221,9 +389,7 @@ pub fn speculative_stream_generate<'a>(
   draft_cache: Vec<Box<dyn KvCache>>,
   draft_cfg: DraftConfig,
   cfg: GenConfig,
-) -> impl Iterator<Item = Result<SpeculativeResponse>> + 'a {
-  use std::time::Instant;
-
+) -> SpeculativeStream<'a> {
   let prompt_tokens = prompt.len();
   // mlx-lm uses the tokenizer's eos set for the break / finish_reason.
   let mut cfg = cfg;
@@ -241,127 +407,25 @@ pub fn speculative_stream_generate<'a>(
   // Build the core driver up front so any construction error surfaces as the
   // iterator's first (and only) `Err`, keeping the public surface a pure
   // `Iterator`. Cache trimmability is checked here too.
-  let driver = SpeculativeDriver::new(target, draft_cfg, prompt, target_cache, draft_cache, &cfg);
-
-  let mut detok = tokenizer.detokenizer();
-  let mut n: usize = 0;
-  let mut finished = false;
-  let mut tic = Instant::now();
-  let mut prompt_tps = 0.0_f64;
-  let mut driver = match driver {
-    Ok(d) => Some(d),
-    Err(e) => {
-      // Single deferred error; iterator yields it once then ends. `Error`
-      // is not `Clone` so we wrap in an `Option` and `take()` on first
-      // poll (the iterator fuses afterwards by returning `None`).
-      let mut pending_err = Some(e);
-      return Box::new(std::iter::from_fn(move || pending_err.take().map(Err)))
-        as Box<dyn Iterator<Item = Result<SpeculativeResponse>>>;
-    }
-  };
-
-  Box::new(std::iter::from_fn(move || {
-    if finished {
-      return None;
-    }
-    let d = driver.as_mut()?;
-
-    let TokenOut {
-      token,
-      logprobs,
-      from_draft,
-      stats,
-    } = match d.next_token() {
-      Ok(Some(t)) => t,
-      Ok(None) => {
-        finished = true;
-        return None;
-      }
-      Err(e) => {
-        finished = true;
-        return Some(Err(e));
-      }
+  let (driver, pending_err) =
+    match SpeculativeDriver::new(target, draft_cfg, prompt, target_cache, draft_cache, &cfg) {
+      Ok(d) => (Some(d), None),
+      Err(e) => (None, Some(e)),
     };
 
-    if n == 0 {
-      let prompt_time = tic.elapsed().as_secs_f64();
-      prompt_tps = if prompt_time > 0.0 {
-        prompt_tokens as f64 / prompt_time
-      } else {
-        0.0
-      };
-      tic = Instant::now();
-    }
-
-    let gen_tps = |gen_count: usize| -> f64 {
-      let dt = tic.elapsed().as_secs_f64();
-      if dt > 0.0 { gen_count as f64 / dt } else { 0.0 }
-    };
-
-    // mlx-lm: `if token in eos: break` BEFORE `add_token` — the eos token
-    // is yielded with an empty (or only the finalized tail) text segment.
-    if eos.contains(&token) {
-      finished = true;
-      detok.finalize();
-      let text = detok.last_segment();
-      return Some(Ok(SpeculativeResponse {
-        response: GenerationResponse {
-          text,
-          token,
-          logprobs: collect_logprobs.then_some(logprobs),
-          prompt_tokens,
-          prompt_tps,
-          generation_tokens: n + 1,
-          generation_tps: gen_tps(n + 1),
-          peak_memory_bytes: crate::memory::peak_memory().ok(),
-          finish_reason: Some("stop".to_string()),
-        },
-        from_draft,
-        stats,
-      }));
-    }
-
-    detok.add_token(token);
-    n += 1;
-
-    if n >= max_tokens {
-      finished = true;
-      detok.finalize();
-      let text = detok.last_segment();
-      return Some(Ok(SpeculativeResponse {
-        response: GenerationResponse {
-          text,
-          token,
-          logprobs: collect_logprobs.then_some(logprobs),
-          prompt_tokens,
-          prompt_tps,
-          generation_tokens: n,
-          generation_tps: gen_tps(n),
-          peak_memory_bytes: crate::memory::peak_memory().ok(),
-          finish_reason: Some("length".to_string()),
-        },
-        from_draft,
-        stats,
-      }));
-    }
-
-    let text = detok.last_segment();
-    Some(Ok(SpeculativeResponse {
-      response: GenerationResponse {
-        text,
-        token,
-        logprobs: collect_logprobs.then_some(logprobs),
-        prompt_tokens,
-        prompt_tps,
-        generation_tokens: n,
-        generation_tps: gen_tps(n),
-        peak_memory_bytes: crate::memory::peak_memory().ok(),
-        finish_reason: None,
-      },
-      from_draft,
-      stats,
-    }))
-  })) as Box<dyn Iterator<Item = Result<SpeculativeResponse>>>
+  SpeculativeStream {
+    driver,
+    pending_err,
+    detok: tokenizer.detokenizer(),
+    prompt_tokens,
+    eos,
+    max_tokens,
+    collect_logprobs,
+    n: 0,
+    finished: false,
+    tic: std::time::Instant::now(),
+    prompt_tps: 0.0,
+  }
 }
 
 /// The per-token output of the speculative driver — accepted draft or

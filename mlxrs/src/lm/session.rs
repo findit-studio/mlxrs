@@ -34,28 +34,35 @@
 //! render, the prefix is duplicated). [`ChatSession`] does **not** port that
 //! defect: it ports the *documented* contract via real incremental prefill.
 //!
-//! Every realised cache carries the exact token sequence already represented
-//! in its KV state (a `Vec<u32>` whose length equals the cache `offset()`,
-//! plus a count of leading *opaque* tokens for a builder-restored cache whose
-//! ids are unknown). On a new turn the session:
+//! Every realised cache carries the exact *known* token sequence in its KV
+//! state (a `Vec<u32>`), plus a count of leading **opaque** tokens — a
+//! builder-restored prefix whose ids the session was never given
+//! (`opaque_len + known.len()` equals the cache `offset()`). The opaque
+//! prefix is the one part of the KV state the session cannot name; it is
+//! **never** re-rendered into a turn's prompt (the session's history holds
+//! only turns it itself ran), so a render begins with the *known* region
+//! only. On a new turn the session:
 //!
 //! 1. renders the full prompt → `prompt_ids`;
-//! 2. computes the common prefix of `prompt_ids` against the already-cached
-//!    token sequence;
-//! 3. if the render **extends** the cached prefix, feeds [`generate_step`]
-//!    only the suffix beyond that prefix — the cache continues from its
-//!    current `offset()`, so turn N+1's prefill cost is the *new* tokens
-//!    only;
-//! 4. if the render **diverges** (it is not a prefix-extension of the cached
-//!    tokens — e.g. an `instructions` change, or a non-prefix-stable
-//!    template), discards the stale cache and **rebuilds from scratch** for
-//!    that turn, feeding the full `prompt_ids` — slower, but never wrong.
+//! 2. checks whether `prompt_ids` begins with the cache's *known* token
+//!    sequence (the opaque prefix sits implicitly in front of the cache, not
+//!    in front of `prompt_ids`);
+//! 3. if so — the render **extends** the cache — feeds [`generate_step`] only
+//!    the suffix beyond the known ids; the cache continues from its current
+//!    `offset()`, so turn N+1's prefill cost is the *new* tokens only. A
+//!    fresh builder-restored cache (empty `known`) extends on every render,
+//!    so the entire new prompt is fed as the suffix continuing the opaque
+//!    prefix;
+//! 4. if not — the render **diverges** (an `instructions` change, a
+//!    non-prefix-stable template) — discards the stale cache and **rebuilds
+//!    from scratch** for that turn, feeding the full `prompt_ids` — slower,
+//!    but never wrong.
 //!
-//! The generated tokens are folded into the cached token sequence alongside
+//! The generated tokens are folded into the cached *known* sequence alongside
 //! the prompt, so turn N+2 sees turn N+1's prompt *and* reply as the cached
-//! prefix. (The speculative-decoding path cannot reuse its cache — its KV
-//! caches are consumed by the speculative generator and not handed back — so
-//! it always rebuilds and re-prefills; that is a documented divergence.)
+//! known prefix. (The speculative-decoding path cannot reuse its cache — its
+//! KV caches are consumed by the speculative generator and not handed back —
+//! so it always rebuilds and re-prefills; that is a documented divergence.)
 //!
 //! ## Concurrency divergence from the Swift reference (deliberate)
 //!
@@ -101,7 +108,7 @@ use crate::{
     cache::{CacheConfig, KvCache, make_prompt_cache, save_prompt_cache},
     generate::{GenConfig, GenerationResponse, Generator, generate_step},
     model::Model,
-    speculative::{DraftConfig, speculative_stream_generate},
+    speculative::{DraftConfig, SpeculativeStream, speculative_stream_generate},
   },
   tokenizer::{Tokenizer, wrapper::BoxedDetokenizer},
 };
@@ -707,20 +714,38 @@ impl ChatSession {
   /// [`generate_step`], the token *slice range* of `prompt_ids` to feed it,
   /// and the [`CachedTokens::opaque_len`] the resulting cache carries.
   ///
-  /// - **Reuse** (the common path): if `prompt_ids` is a strict
-  ///   prefix-extension of the cached token sequence — its first
-  ///   `opaque_len` tokens line up with the opaque prefix (length only;
-  ///   their ids are unknowable) and the next `cached.known.len()` tokens
-  ///   byte-match `cached.known` — the cache is kept and only the suffix
-  ///   `prompt_ids[opaque_len + known.len() ..]` is fed. The cache continues
-  ///   from its current `offset()`; turn N+1 prefills the *new* tokens only.
-  /// - **Rebuild** (divergence / degenerate): if the render is *not* such an
-  ///   extension (an `instructions` change, a non-prefix-stable template, a
-  ///   render shorter than the cached tokens) — or if it is exactly equal to
-  ///   the cached tokens, leaving no suffix for [`generate_step`]'s
-  ///   non-empty-prompt contract — the stale cache is dropped, a fresh cache
-  ///   is built, and the *full* `prompt_ids` is fed. Slower (re-prefills the
-  ///   conversation) but always correct.
+  /// ## The opaque prefix is *not* part of `prompt_ids`
+  ///
+  /// The crucial bookkeeping fact (Finding 1): a cache's `opaque_len`
+  /// leading tokens are tokens the session *never knew* — a builder-restored
+  /// prefix (a system prompt + document prefilled outside the session). The
+  /// session's [`ChatSession::history`] never contains them, so a turn's
+  /// render **never re-renders the opaque region**. By contrast `cached.known`
+  /// *is* re-rendered: those ids came from prompts / replies the session does
+  /// hold in its history. So a prefix-extending render `prompt_ids` begins
+  /// with `cached.known` (the opaque region is *implicitly* in front of the
+  /// cache, not in front of `prompt_ids`).
+  ///
+  /// - **Reuse** (the common path): if `prompt_ids` begins with exactly the
+  ///   known cached ids `cached.known` and is strictly longer (a non-empty
+  ///   new suffix), the cache is kept and only the suffix
+  ///   `prompt_ids[known.len() ..]` is fed. The cache continues from its
+  ///   current `offset()` (`opaque_len + known.len()`); turn N+1 prefills the
+  ///   *new* tokens only. The `opaque_len` is carried forward unchanged — a
+  ///   restored opaque prefix stays opaque, and the full new render is folded
+  ///   into `known` by [`ChatResponseStream::commit`]. This subsumes the
+  ///   builder-restored-cache case: a fresh (`known` empty) restored cache
+  ///   reuses on *every* render (`prompt_ids` trivially "begins with" the
+  ///   empty `known`), so the entire newly-rendered prompt is fed as the
+  ///   suffix that continues the opaque prefix — exactly the documented
+  ///   prefix-caching contract.
+  /// - **Rebuild** (divergence / degenerate): if the render does *not* begin
+  ///   with `cached.known` (an `instructions` change, a non-prefix-stable
+  ///   template) — or if it equals `cached.known` exactly, leaving no suffix
+  ///   for [`generate_step`]'s non-empty-prompt contract — the stale cache is
+  ///   dropped, a fresh cache is built, and the *full* `prompt_ids` is fed
+  ///   (`opaque_len` resets to `0`). Slower (re-prefills the conversation)
+  ///   but always correct.
   ///
   /// Returns `(cache, prefill_start, opaque_len)`: feed
   /// `prompt_ids[prefill_start..]` to `generate_step` over `cache`; the
@@ -731,19 +756,19 @@ impl ChatSession {
     cache: KvCaches,
     cached: &CachedTokens,
   ) -> (KvCaches, usize, usize) {
-    let prefix_len = cached.opaque_len + cached.known.len();
-    // The render must be strictly longer than everything already cached (a
-    // non-empty new suffix for `generate_step`), and its post-opaque region
-    // must begin with exactly the known cached ids. `prompt_ids.len() >
-    // prefix_len` implies `prompt_ids.len() > opaque_len` (since `prefix_len
-    // >= opaque_len`), so the `[opaque_len..]` slice below is always in
-    // bounds when it is reached (short-circuit `&&`).
-    let extends =
-      prompt_ids.len() > prefix_len && prompt_ids[cached.opaque_len..].starts_with(&cached.known);
+    // The render must begin with exactly the *known* cached ids (the opaque
+    // prefix is implicitly in front of the CACHE, never re-rendered into
+    // `prompt_ids` — see the method doc) and be strictly longer than them,
+    // so `prompt_ids[known.len()..]` is a non-empty suffix for
+    // `generate_step`. `prompt_ids.len() > known.len()` makes that slice
+    // in-bounds and non-empty.
+    let extends = prompt_ids.len() > cached.known.len() && prompt_ids.starts_with(&cached.known);
     if extends {
-      // Reuse: keep the cache, feed only the suffix beyond the cached
-      // prefix; the opaque prefix is carried forward unchanged.
-      (cache, prefix_len, cached.opaque_len)
+      // Reuse: keep the cache, feed only the suffix beyond the known ids;
+      // the opaque prefix is carried forward unchanged. For a fresh
+      // builder-restored cache (`known` empty) this feeds the WHOLE
+      // `prompt_ids` as the suffix continuing the opaque prefix.
+      (cache, cached.known.len(), cached.opaque_len)
     } else {
       // Divergence or degenerate render: rebuild from scratch and feed the
       // whole prompt. `cache` (the stale cache) is dropped here.
@@ -990,8 +1015,8 @@ struct StandardTurn<'a> {
   draft_cache: Option<KvCaches>,
 }
 
-/// Holds a speculative-decoding turn: the [`speculative_stream_generate`]
-/// iterator threaded through the supplied caches.
+/// Holds a speculative-decoding turn: the [`SpeculativeStream`] iterator
+/// threaded through the supplied caches.
 ///
 /// [`speculative_stream_generate`] consumes both caches and — unlike the
 /// standard [`Generator`] — does not hand them back, so a speculative turn
@@ -1001,9 +1026,16 @@ struct StandardTurn<'a> {
 /// sessions re-prefill the conversation each turn, and cannot save a cache).
 /// The standard path reuses the cache via [`Generator::into_cache`] and
 /// supports incremental prefill + cache save.
+///
+/// The stream is held as the concrete [`SpeculativeStream`] (not a boxed
+/// `dyn Iterator`) so an interrupted turn can reach
+/// [`SpeculativeStream::finalize_tail`] in [`ChatResponseStream::commit`]
+/// (Finding 2): the speculative driver's streaming detokenizer is finalized
+/// only on eos / `max_tokens`, so without that call a stream dropped
+/// mid-generation would lose any tail a BPE/SPM detokenizer withheld.
 struct SpeculativeTurn<'a> {
   /// The streaming speculative iterator, yielding one response per token.
-  iter: Box<dyn Iterator<Item = Result<crate::lm::speculative::SpeculativeResponse>> + 'a>,
+  iter: SpeculativeStream<'a>,
 }
 
 impl<'a> SpeculativeTurn<'a> {
@@ -1019,7 +1051,7 @@ impl<'a> SpeculativeTurn<'a> {
     draft_cfg: DraftConfig,
     cfg: GenConfig,
   ) -> Self {
-    let iter = Box::new(speculative_stream_generate(
+    let iter = speculative_stream_generate(
       target,
       tokenizer,
       prompt,
@@ -1027,7 +1059,7 @@ impl<'a> SpeculativeTurn<'a> {
       draft_cache,
       draft_cfg,
       cfg,
-    ));
+    );
     Self { iter }
   }
 }
@@ -1075,13 +1107,16 @@ pub struct ChatResponseStream<'s> {
   /// on `Drop`.
   reply: String,
   /// The full rendered prompt for this turn (all `prompt_tokens` ids).
-  /// `commit()` derives the next turn's cached-token sequence from
-  /// `prompt_ids[opaque_len..]` concatenated with [`generated`](Self::generated)
-  /// — the incremental-prefill bookkeeping (see the [module docs](self)).
+  /// `commit()` forms the next turn's *known* cached-token region by
+  /// concatenating `prompt_ids` with [`generated`](Self::generated) and
+  /// truncating to `offset() - opaque_len` — the incremental-prefill
+  /// bookkeeping (see the [module docs](self)). The opaque prefix is *not*
+  /// part of `prompt_ids` (the session never re-renders it).
   prompt_ids: Vec<u32>,
   /// The count of leading KV tokens whose ids are unknown (a builder-restored
-  /// opaque prefix); `0` for a session-built cache. Carried into the next
-  /// turn's [`CachedTokens::opaque_len`].
+  /// opaque prefix); `0` for a session-built cache. Carried unchanged into
+  /// the next turn's [`CachedTokens::opaque_len`] on a cache-reuse turn, or
+  /// reset to `0` when `decide_prefill` rebuilds.
   opaque_len: usize,
   /// Every token id the model sampled this turn, in order — folded after
   /// `prompt_ids` to form the next turn's cached-token sequence. The standard
@@ -1105,13 +1140,15 @@ impl ChatResponseStream<'_> {
   /// ([`Generator::into_cache`]): the *advanced* cache, holding the KV for
   /// the prefilled prompt **and** the generated tokens. It is stored as
   /// [`CacheSlot::Realised`] together with the exact token sequence it now
-  /// encodes ([`CachedTokens`]) — `prompt_ids[opaque_len..]` followed by the
-  /// sampled tokens, truncated to the cache's actual `offset()` so the
-  /// bookkeeping is self-correcting (the final sampled token is sampled but
-  /// never fed back into the cache, so the cache is one token shorter than
-  /// `prompt + generated`; the truncation drops exactly that token). Turn
-  /// N+1's [`ChatSession::decide_prefill`] uses this to feed only the new
-  /// suffix.
+  /// encodes ([`CachedTokens`]): the carried-forward opaque prefix
+  /// (`opaque_len` leading tokens — a builder-restored prefix, never part of
+  /// `prompt_ids`) plus a *known* region of `prompt_ids` followed by the
+  /// sampled tokens, the known region truncated to `offset() - opaque_len`
+  /// so the bookkeeping is self-correcting (the final sampled token is
+  /// sampled but never fed back into the cache, so the cache is one token
+  /// shorter than `opaque + prompt + generated`; the truncation drops
+  /// exactly that token). Turn N+1's [`ChatSession::decide_prefill`] uses
+  /// this to feed only the new suffix.
   ///
   /// If the stream was abandoned before the standard generator finished
   /// (eos / `max_tokens`), the streaming detokenizer is **finalized** here
@@ -1127,6 +1164,14 @@ impl ChatResponseStream<'_> {
   /// presenting it as the current cache would let [`ChatSession::save_cache`]
   /// persist a cache that cannot restore the session (Finding 2). The next
   /// speculative turn rebuilds its caches from the [`CacheConfig`].
+  ///
+  /// If a speculative stream was abandoned before the driver reached
+  /// eos / `max_tokens`, its inner streaming detokenizer is **finalized**
+  /// here first via [`SpeculativeStream::finalize_tail`] (Finding 2): that
+  /// detok is finalized only on eos / `max_tokens`, so without this the
+  /// recorded assistant text could miss the tail of the last produced
+  /// token — and the next speculative turn would rebuild from a truncated
+  /// history.
   fn commit(&mut self) {
     if self.committed {
       return;
@@ -1148,12 +1193,14 @@ impl ChatResponseStream<'_> {
 
         let cache = turn.generator.into_cache();
         // Finding 1: record exactly what the advanced cache encodes. The
-        // logical sequence after the opaque prefix is the rendered prompt
-        // suffix followed by the sampled tokens; clamp it to the cache's
-        // real `offset()` so it is exact regardless of how many tokens were
-        // actually fed (the last sampled token is sampled but never fed
-        // back into the cache, so the cache is one token short of
-        // `prompt + generated` — the truncation drops exactly that token).
+        // cache holds `opaque_len` leading opaque tokens (a builder-restored
+        // prefix the session never knew — NOT part of `prompt_ids`) followed
+        // by a *known* region. That known region is the freshly-rendered
+        // prompt followed by the sampled tokens: `prompt_ids ++ generated`.
+        // Its length in the cache is `offset() - opaque_len` — clamp the
+        // logical `prompt_ids ++ generated` to exactly that, which drops the
+        // final sampled token (sampled but never fed back into the cache, so
+        // the cache is one token short of `prompt + generated`).
         let offset = cache.first().map(|c| c.offset()).unwrap_or(0);
         let mut logical: Vec<u32> =
           Vec::with_capacity(self.prompt_ids.len() + self.generated.len());
@@ -1161,17 +1208,21 @@ impl ChatResponseStream<'_> {
         logical.extend_from_slice(&self.generated);
         // The invariant `opaque_len + known.len() == offset()` must hold so
         // the next turn's `decide_prefill` feeds the correct suffix. The
-        // expected case is `offset <= logical.len()` (truncate to the
-        // cache's real length, dropping the un-fed final token). If the
-        // cache somehow advanced past everything we can name (it should not
-        // for the standard `Generator`), fall back to treating the whole
-        // cache as an opaque prefix — always sound: the next turn either
-        // extends it or rebuilds.
-        let cached = if offset <= logical.len() {
-          logical.truncate(offset);
+        // known region the cache encodes has length `offset - opaque_len`;
+        // the expected case is `known_len <= logical.len()` (truncate to it,
+        // dropping the un-fed final token). If the cache somehow advanced
+        // past everything we can name (it should not for the standard
+        // `Generator` — or if `opaque_len` somehow exceeds `offset`), fall
+        // back to treating the whole cache as an opaque prefix — always
+        // sound: the next turn either extends it (against an empty `known`)
+        // or rebuilds.
+        let opaque_len = self.opaque_len.min(offset);
+        let known_len = offset - opaque_len;
+        let cached = if known_len <= logical.len() {
+          logical.truncate(known_len);
           CachedTokens {
-            opaque_len: self.opaque_len.min(offset),
-            known: logical.split_off(self.opaque_len.min(offset)),
+            opaque_len,
+            known: logical,
           }
         } else {
           CachedTokens::opaque(offset)
@@ -1182,14 +1233,27 @@ impl ChatResponseStream<'_> {
           cached,
         };
       }
-      Some(Driver::Speculative(_turn)) => {
-        // Finding 2: the speculative iterator consumed the caches and does
-        // not return them. Do NOT store a freshly-rebuilt offset-0 cache as
-        // `Realised` — it would not encode the conversation, yet `save_cache`
-        // would happily persist it. Mark the slot spent: `has_cache()` is
-        // `false` and `save_cache()` returns a speculative-specific error.
-        // The reply was still generated correctly over the consumed caches,
-        // so the history below is right; only cache *reuse / save* is lost.
+      Some(Driver::Speculative(mut turn)) => {
+        // Finding 2 (detok tail): the speculative driver's streaming
+        // detokenizer is finalized only on eos / `max_tokens`. If this
+        // stream was dropped mid-generation (`!finished`), that detok still
+        // holds a withheld tail (e.g. a BPE detok's trailing bare-space
+        // token) — flush it so the recorded `reply` is token-complete and
+        // the next speculative turn rebuilds from an exact history. On a
+        // run that ended naturally the detok was already finalized, and
+        // `finalize_tail()` is idempotent (returns ""), so this is a no-op.
+        if !self.finished {
+          let tail = turn.iter.finalize_tail();
+          self.reply.push_str(&tail);
+        }
+        // Finding 2 (cache): the speculative iterator consumed the caches
+        // and does not return them. Do NOT store a freshly-rebuilt offset-0
+        // cache as `Realised` — it would not encode the conversation, yet
+        // `save_cache` would happily persist it. Mark the slot spent:
+        // `has_cache()` is `false` and `save_cache()` returns a
+        // speculative-specific error. The reply was still generated
+        // correctly over the consumed caches, so the history below is
+        // right; only cache *reuse / save* is lost.
         *self.cache_slot = CacheSlot::SpeculativeSpent;
       }
       None => return,
@@ -1367,7 +1431,7 @@ mod tests {
   //! `offset()` is an exact, observable witness of cross-turn reuse.
 
   use super::*;
-  use crate::lm::model::MockModel;
+  use crate::{lm::model::MockModel, tokenizer::StreamingDetokenizer};
 
   /// Load the committed fixture tokenizer (`<s> <unk> </s> hello world the
   /// quick brown fox <think> </think>`, with a `<|role|>content` chat
@@ -1940,6 +2004,318 @@ mod tests {
     assert!(
       !path.exists(),
       "no cache file was written for the speculative session"
+    );
+  }
+
+  /// Build a per-layer KV cache pre-advanced to exactly `n_tokens` — the
+  /// stand-in for a `ChatSessionBuilder::cache`-restored prefix whose token
+  /// ids the builder was never given (`MockModel::forward` advances every
+  /// layer by the token-window length). `n_tokens` must be `> 0`.
+  fn prefilled_opaque_cache(n_tokens: usize) -> Vec<Box<dyn KvCache>> {
+    assert!(n_tokens > 0, "an opaque cache must have a non-empty prefix");
+    let model = MockModel::new(11);
+    let mut cache = make_prompt_cache(&cache_config());
+    let window: Vec<i32> = (0..n_tokens as i32).map(|i| i % 11).collect();
+    let arr = crate::array::Array::from_slice::<i32>(&window, &(1usize, n_tokens))
+      .expect("opaque-prefill token window");
+    let _ = model.forward(&arr, &mut cache).expect("opaque prefill");
+    assert_eq!(cache[0].offset(), n_tokens, "opaque cache pre-advanced");
+    cache
+  }
+
+  /// Build a `ChatSession` restored from a `prefilled_opaque_cache`.
+  fn cache_restored_session(opaque_len: usize, max_tokens: usize) -> ChatSession {
+    ChatSession::builder(
+      Box::new(MockModel::new(11)),
+      fixture_tokenizer(),
+      cache_config(),
+    )
+    .generate_params(GenConfig {
+      max_tokens,
+      ..Default::default()
+    })
+    .cache(prefilled_opaque_cache(opaque_len))
+    .build()
+  }
+
+  #[test]
+  fn cache_restore_short_prompt_reuses_opaque_prefix_not_rebuilds() {
+    // Finding 1 — the documented `ChatSessionBuilder::cache` prefix-caching
+    // path, the case the round-1 code corrupted. The restored cache holds an
+    // OPAQUE prefix of `opaque_len` tokens whose ids the session never knew;
+    // a turn's render NEVER re-renders that prefix. A *short* first prompt
+    // (rendered shorter than `opaque_len`) must still REUSE the restored
+    // cache — feeding the WHOLE new render as the suffix that continues the
+    // opaque prefix — NOT rebuild from an empty cache (which would silently
+    // discard the restored context).
+    let max_tokens = 3;
+    // `opaque_len` chosen strictly between the short and long renders below,
+    // so the short render is shorter than the opaque prefix (the exact case
+    // the buggy `prompt_ids.len() > opaque_len` guard rebuilt-from-empty).
+    let opaque_len = 10;
+
+    // Measure the short render the way `stream_respond_as` will (a fresh,
+    // history-free session renders identically — `.cache()` adds no history).
+    let p_short = session(max_tokens)
+      .build_turn_prompt("hello", Role::User)
+      .expect("render short prompt")
+      .0
+      .len();
+    assert!(
+      p_short < opaque_len,
+      "the short render ({p_short}) must be shorter than the opaque prefix \
+       ({opaque_len}) to exercise the rebuilt-from-empty bug"
+    );
+
+    let mut s = cache_restored_session(opaque_len, max_tokens);
+    // A `cache:`-restored session reports a realised cache immediately.
+    assert!(s.has_cache(), "cache-restored session: cache realised");
+
+    let _ = s.respond("hello").expect("first turn over restored cache");
+    let off = s.current_cache().expect("cache realised")[0].offset();
+
+    // The restored cache continued from `opaque_len`: the WHOLE short render
+    // was fed as the suffix, then `max_tokens` decode steps ran. Offset =
+    // opaque + (P - 1 prefill) + max_tokens. The `-1` is the final sampled
+    // token (sampled, never fed back).
+    assert_eq!(
+      off,
+      opaque_len + p_short - 1 + max_tokens,
+      "the full new render ({p_short}) was fed onto the opaque prefix \
+       ({opaque_len}); offset = opaque + P - 1 + generated"
+    );
+    // Decisive anti-bug assertion: a rebuild-from-empty would give
+    // `p_short - 1 + max_tokens` with NO `opaque_len` term — strictly less
+    // than `opaque_len`. The offset exceeding `opaque_len` witnesses that
+    // the restored prefix was kept, not discarded.
+    assert!(
+      off > opaque_len + max_tokens,
+      "the restored opaque prefix was REUSED, not rebuilt-from-empty \
+       (offset {off} retains the opaque {opaque_len} tokens)"
+    );
+
+    // A second turn must do incremental prefill against the now-`known`
+    // region (turn-1 render + reply), proving `commit()` recorded `known`
+    // correctly relative to `offset - opaque_len`.
+    let (prompt2, _) = s
+      .build_turn_prompt("world", Role::User)
+      .expect("render turn 2");
+    let full_render2 = prompt2.len();
+    let _ = s.respond("world").expect("second turn");
+    let off2 = s.current_cache().expect("realised")[0].offset();
+    // Reuse (not rebuild): grew by only the new suffix, strictly less than a
+    // full re-prefill of the turn-2 render.
+    assert!(
+      off2 > off && off2 - off < full_render2,
+      "turn 2 reused the cache (grew {} < full render {full_render2})",
+      off2 - off
+    );
+  }
+
+  #[test]
+  fn cache_restore_long_prompt_feeds_full_new_prompt_no_dropped_tokens() {
+    // Finding 1 — the other half of the corrupted `cache:` path. When the
+    // first render is LONGER than the opaque prefix, the round-1 code fed
+    // `prompt_ids[opaque_len..]` — dropping the first `opaque_len` tokens of
+    // the ACTUAL new prompt. The fix feeds the ENTIRE new render as the
+    // suffix continuing the opaque prefix.
+    let max_tokens = 4;
+    let opaque_len = 10;
+
+    let p_long = session(max_tokens)
+      .build_turn_prompt("hello world the quick brown fox", Role::User)
+      .expect("render long prompt")
+      .0
+      .len();
+    assert!(
+      p_long > opaque_len,
+      "the long render ({p_long}) must exceed the opaque prefix ({opaque_len}) \
+       to exercise the dropped-first-tokens bug"
+    );
+
+    let mut s = cache_restored_session(opaque_len, max_tokens);
+    let _ = s
+      .respond("hello world the quick brown fox")
+      .expect("first turn over restored cache");
+    let off = s.current_cache().expect("cache realised")[0].offset();
+
+    // The FULL `p_long`-token render was fed onto the opaque prefix — NOT
+    // `prompt_ids[opaque_len..]`. Offset = opaque + (p_long - 1) + max_tokens.
+    assert_eq!(
+      off,
+      opaque_len + p_long - 1 + max_tokens,
+      "the FULL new render ({p_long} tokens) was fed; no first-{opaque_len} \
+       tokens dropped"
+    );
+    // The dropped-tokens bug would have fed only `p_long - opaque_len` tokens
+    // ⇒ offset `opaque_len + (p_long - opaque_len) - 1 + max_tokens` =
+    // `p_long - 1 + max_tokens`. The real offset is larger by exactly
+    // `opaque_len` — the witness that no leading tokens were dropped.
+    assert_eq!(
+      off - (p_long - 1 + max_tokens),
+      opaque_len,
+      "offset retains the full opaque prefix; the dropped-tokens bug would \
+       lose exactly {opaque_len} tokens"
+    );
+  }
+
+  /// Build a temp-dir tokenizer whose `decoder` is `ByteLevel` (so
+  /// `Tokenizer::detokenizer()` yields a real `BpeStreamingDetokenizer`) and
+  /// whose vocab includes the token `"â"` — a single GPT-2 byte-encoded char
+  /// for raw byte `0xE2`, a UTF-8 *lead* byte. A run of `"â"` tokens decodes
+  /// to an incomplete UTF-8 sequence (`"\u{fffd}…"`), which the BPE
+  /// detokenizer **withholds in its `unflushed` buffer** — released only by
+  /// `finalize()`. Returns `(tokenizer, â_id, vocab_size)`.
+  fn bpe_withholding_tokenizer() -> (Tokenizer, u32, usize) {
+    // The committed WordLevel fixture vocab (ids 0..=10) plus `"â"` at 11.
+    let a_id = 11u32;
+    let tokenizer_json = json!({
+      "version": "1.0",
+      "truncation": Value::Null,
+      "padding": Value::Null,
+      "added_tokens": [
+        { "id": 0, "content": "<unk>", "single_word": false, "lstrip": false,
+          "rstrip": false, "normalized": false, "special": true },
+        { "id": 1, "content": "<s>", "single_word": false, "lstrip": false,
+          "rstrip": false, "normalized": false, "special": true },
+        { "id": 2, "content": "</s>", "single_word": false, "lstrip": false,
+          "rstrip": false, "normalized": false, "special": true }
+      ],
+      "normalizer": Value::Null,
+      "pre_tokenizer": { "type": "Whitespace" },
+      "post_processor": Value::Null,
+      // The ByteLevel decoder is what `infer_detokenizer_class` keys on to
+      // pick the BPE streaming detokenizer.
+      "decoder": { "type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true,
+                   "use_regex": true },
+      "model": {
+        "type": "WordLevel",
+        "vocab": {
+          "<unk>": 0, "<s>": 1, "</s>": 2, "hello": 3, "world": 4, "the": 5,
+          "quick": 6, "brown": 7, "fox": 8, "<think>": 9, "</think>": 10,
+          "â": a_id
+        },
+        "unk_token": "<unk>"
+      }
+    });
+    let config_json = json!({
+      "bos_token": "<s>",
+      "eos_token": "</s>",
+      "unk_token": "<unk>",
+      "clean_up_tokenization_spaces": false,
+      "chat_template":
+        "{{ bos_token }}{% for m in messages %}{{ '<|' + m['role'] + '|>' }}\
+         {{ m['content'] }}{% endfor %}{% if add_generation_prompt %}<|assistant|>{% endif %}"
+    });
+
+    let dir = std::env::temp_dir().join(format!("mlxrs-l11-bpe-withhold-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp tokenizer dir");
+    std::fs::write(
+      dir.join("tokenizer.json"),
+      serde_json::to_string(&tokenizer_json).expect("serialize tokenizer.json"),
+    )
+    .expect("write tokenizer.json");
+    std::fs::write(
+      dir.join("tokenizer_config.json"),
+      serde_json::to_string(&config_json).expect("serialize tokenizer_config.json"),
+    )
+    .expect("write tokenizer_config.json");
+
+    let tok = Tokenizer::from_path(&dir, None).expect("load BPE-decoder tokenizer");
+    // The vocab is 0..=11 (12 ids).
+    (tok, a_id, 12)
+  }
+
+  #[test]
+  fn speculative_interrupted_stream_flushes_detokenizer_tail() {
+    // Finding 2 — an interrupted speculative turn must record token-complete
+    // text. The speculative driver's streaming detokenizer is finalized only
+    // on eos / `max_tokens`; a `ChatResponseStream` dropped mid-stream must
+    // flush that detokenizer's withheld tail in `commit()`, or the recorded
+    // assistant message loses the tail of the last produced token and the
+    // next speculative turn rebuilds from a truncated history.
+    let (tok, a_id, vocab) = bpe_withholding_tokenizer();
+    // A `MockModel` whose argmax is `â` (id 11): every produced token decodes
+    // to byte 0xE2, so the BPE detok withholds the whole reply in `unflushed`
+    // until `finalize()` (`last_segment()` sees an empty `text` meanwhile).
+    let mut canned = vec![0.0_f32; vocab];
+    canned[a_id as usize] = 10.0;
+    let target = MockModel {
+      canned: canned.clone(),
+      n_kv_heads: 1,
+      head_dim: 2,
+    };
+    let draft = MockModel {
+      canned,
+      n_kv_heads: 1,
+      head_dim: 2,
+    };
+
+    let mut s = ChatSession::builder(Box::new(target), tok, cache_config())
+      .speculative(SpeculativeDecodingConfig::new(
+        Rc::new(draft),
+        cache_config(),
+      ))
+      .generate_params(GenConfig {
+        max_tokens: 12,
+        ..Default::default()
+      })
+      .build();
+
+    // Drain only a few tokens, then drop the stream mid-generation.
+    let mut produced_tokens: Vec<u32> = Vec::new();
+    let mut streamed = String::new();
+    {
+      let mut stream = s.stream_respond("hello").expect("speculative stream");
+      for _ in 0..3 {
+        let r = stream.next().expect("token").expect("ok");
+        produced_tokens.push(r.token);
+        streamed.push_str(&r.text);
+      }
+      // `stream` dropped here mid-generation (finish_reason never seen).
+    }
+    assert_eq!(produced_tokens.len(), 3, "drained 3 tokens before drop");
+    assert!(
+      produced_tokens.iter().all(|&t| t == a_id),
+      "the mock samples the withheld `â` token every step"
+    );
+
+    // The committed assistant turn.
+    assert_eq!(s.history().len(), 2, "interrupted turn still recorded");
+    let recorded = &s.history()[1].content;
+
+    // Token-complete oracle: feed the SAME produced tokens into an
+    // independent BPE detokenizer and `finalize()` — the committed history
+    // text must equal that full detokenization. Without the Finding-2 fix
+    // the recorded text would be MISSING the withheld tail (the BPE detok
+    // buffers every `â` in `unflushed` until `finalize()`), so `recorded`
+    // would be the empty mid-stream `text` instead.
+    let reference = {
+      let mut d = crate::tokenizer::BpeStreamingDetokenizer::new(
+        // `(token_string, id)` vocab pairs — only `â` is produced, but a
+        // faithful detok is built over the full vocab.
+        vec![("â".to_string(), a_id)],
+        false,
+      );
+      for &t in &produced_tokens {
+        d.add_token(t);
+      }
+      d.finalize();
+      d.last_segment()
+    };
+    assert_eq!(
+      *recorded, reference,
+      "the interrupted speculative turn recorded token-complete text \
+       (detokenizer tail flushed): recorded {recorded:?} == finalized {reference:?}"
+    );
+    // The withheld tail is non-empty here, so the fix is load-bearing: the
+    // recorded text is strictly longer than what the stream yielded
+    // mid-flight (every mid-stream `last_segment()` returned "").
+    assert!(
+      !reference.is_empty() && recorded.len() > streamed.len(),
+      "the BPE detok genuinely withheld a tail that `commit()` flushed \
+       (streamed {streamed:?}, recorded {recorded:?})"
     );
   }
 }
