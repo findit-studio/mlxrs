@@ -46,13 +46,15 @@
 //!   [`Key::from_source`] (the `str` branch — path/URL used verbatim),
 //!   [`Key::from_sources`] (the `list` branch — `"|"`-joined), and
 //!   [`Key::from_bytes`] (the PIL branch — a content hash). [`Key`] holds
-//!   that string as an [`Rc<str>`](std::rc::Rc) (an implementation
+//!   that string as an [`Arc<str>`](std::sync::Arc) (an implementation
 //!   detail — every public constructor / accessor has the same signature
 //!   and semantics it would with a `String` field); the cache stores
-//!   `Rc<str>` clones in both its containers, so the recency queue and the
+//!   `Arc<str>` clones in both its containers, so the recency queue and the
 //!   entry map share one heap-allocated string and [`put`] never
 //!   heap-copies a key (see [`Key`]'s "Internal representation" note and
-//!   [`VisionFeatureCache`]'s "Key storage" note). Because
+//!   [`VisionFeatureCache`]'s "Key storage" note). `Arc` (not `Rc`) keeps
+//!   the public [`Key`] type `Send + Sync` — see [`Key`]'s "Internal
+//!   representation" note. Because
 //!   mlxrs has no PIL type and no crypto dependency, [`Key::from_bytes`]
 //!   uses the std [`DefaultHasher`](std::hash::DefaultHasher) (a fast
 //!   non-cryptographic hash) rather than `sha256`: this is a **cache
@@ -78,7 +80,7 @@
 use std::{
   collections::{HashMap, VecDeque},
   hash::{Hash, Hasher},
-  rc::Rc,
+  sync::Arc,
 };
 
 use crate::{
@@ -109,28 +111,47 @@ pub const DEFAULT_MAX_SIZE: usize = 20;
 ///
 /// # Internal representation
 ///
-/// The normalized string is held as an [`Rc<str>`](Rc), not a `String`.
+/// The normalized string is held as an [`Arc<str>`](Arc), not a `String`.
 /// This is an implementation detail — every public method
 /// ([`from_source`](Self::from_source), [`from_sources`](Self::from_sources),
 /// [`from_bytes`](Self::from_bytes), [`as_str`](Self::as_str), and the
 /// `From<&str>` conversion) has the exact same signature and behavior it
-/// would with a `String` field. The `Rc` backing buys two things the cache
-/// relies on:
+/// would with a `String` field. The `Arc` backing buys three things:
 ///
 /// - **`Clone` is a refcount bump** — infallible, no heap allocation, no
 ///   string copy. [`VisionFeatureCache`] stores a key in *two* containers
-///   (the entry map and the recency queue); with an `Rc<str>` the second
-///   container gets a [`Rc::clone`], so a [`put`](VisionFeatureCache::put)
+///   (the entry map and the recency queue); with an `Arc<str>` the second
+///   container gets an [`Arc::clone`], so a [`put`](VisionFeatureCache::put)
 ///   never heap-copies a key and the post-eviction key handoff cannot
 ///   fail. (With a `String` field that second copy was a fallible-by-abort
 ///   heap allocation occurring *after* eviction — a transactional hazard.)
-/// - **`Hash`/`Eq` are unchanged** — `Rc<str>` hashes and compares by the
+///   The bump is a single atomic increment — negligible for this cache's
+///   use, and the same allocation-free handoff a non-atomic `Rc` gave.
+/// - **`Hash`/`Eq` are unchanged** — `Arc<str>` hashes and compares by the
 ///   pointed-to `str` *content* (it derefs / `Borrow`s `str`), so the
 ///   derived `Hash`/`PartialEq`/`Eq` here are byte-for-byte the same
 ///   relation as a `String`-backed `Key`: two `Key`s are equal iff their
 ///   strings are equal, full stop.
+/// - **`Send + Sync` are preserved** — `Arc<str>` is `Send + Sync` (a
+///   non-atomic `Rc<str>` is neither), so the public `Key` keeps the
+///   `Send`/`Sync` auto-traits a `String`-backed `Key` had. Downstream code
+///   may precompute, queue, or move `Key`s across thread/task boundaries.
+///   (This is `Key` alone — [`VisionFeatureCache`] stores [`Array`], which
+///   is intentionally `!Send`/`!Sync`; only the *key* is thread-portable.)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Key(Rc<str>);
+pub struct Key(Arc<str>);
+
+// Compile-time guard: the public `Key` must stay `Send + Sync`. The prior
+// `Rc<str>` backing silently dropped both auto-traits; `Arc<str>` restores
+// them. A regression back to `Rc` (or any other `!Send`/`!Sync` field)
+// fails this assertion at compile time. `VisionFeatureCache` itself is
+// deliberately NOT asserted here — it stores `Array`, which is intentionally
+// `!Send`/`!Sync` (one cache belongs to one inference thread); only the
+// thread-portable `Key` carries the contract.
+const _: fn() = || {
+  fn assert_send_sync<T: Send + Sync>() {}
+  assert_send_sync::<Key>();
+};
 
 impl Key {
   /// Key for a single path- or URL-style image source — the reference's
@@ -142,10 +163,10 @@ impl Key {
   /// different query string) is a distinct key — exactly as in the
   /// reference, which does no path canonicalization.
   pub fn from_source(source: &str) -> Self {
-    // `Rc::from(&str)` allocates the shared string once, here in the
+    // `Arc::from(&str)` allocates the shared string once, here in the
     // constructor — the cache's `put` then only ever *moves* and refcount-
-    // clones this `Rc`, never re-allocates the key.
-    Self(Rc::from(source))
+    // clones this `Arc`, never re-allocates the key.
+    Self(Arc::from(source))
   }
 
   /// Key for a multi-image source — the reference's
@@ -158,11 +179,11 @@ impl Key {
   /// `"".join([])`), and a single-element slice equals
   /// [`Key::from_source`] of that element — both faithful to `str.join`.
   pub fn from_sources(sources: &[&str]) -> Self {
-    // `join` builds the `'|'`-joined `String`; `Rc::from` consumes it into
-    // the shared `Rc<str>` the cache stores (the transient `String` buffer
+    // `join` builds the `'|'`-joined `String`; `Arc::from` consumes it into
+    // the shared `Arc<str>` the cache stores (the transient `String` buffer
     // is freed). The whole allocation cost is borne here in the
     // constructor, not on the `put` hot path.
-    Self(Rc::from(sources.join("|")))
+    Self(Arc::from(sources.join("|")))
   }
 
   /// Key for an in-memory image with no stable path — the reference's
@@ -180,15 +201,15 @@ impl Key {
   pub fn from_bytes(bytes: &[u8]) -> Self {
     let mut hasher = std::hash::DefaultHasher::new();
     bytes.hash(&mut hasher);
-    // `format!` builds the `pil:`-prefixed digest `String`; `Rc::from`
-    // consumes it into the shared `Rc<str>` (transient buffer freed).
-    Self(Rc::from(format!("pil:{:016x}", hasher.finish())))
+    // `format!` builds the `pil:`-prefixed digest `String`; `Arc::from`
+    // consumes it into the shared `Arc<str>` (transient buffer freed).
+    Self(Arc::from(format!("pil:{:016x}", hasher.finish())))
   }
 
   /// The normalized key string. Exposed for tests / introspection; the
   /// cache never needs the caller to read it.
   pub fn as_str(&self) -> &str {
-    // `Rc<str>` derefs to `str`; `&self.0` coerces `&Rc<str>` to `&str`.
+    // `Arc<str>` derefs to `str`; `&self.0` coerces `&Arc<str>` to `&str`.
     &self.0
   }
 }
@@ -227,34 +248,38 @@ impl From<&str> for Key {
 /// # Key storage
 ///
 /// A key's normalized string is stored exactly **once** per entry as an
-/// [`Rc<str>`](Rc): the entry-map key and the recency-queue entry are two
-/// [`Rc::clone`]s of that one allocation. `Rc::clone` is an infallible
-/// refcount bump — **no heap allocation, no string copy** — so every
-/// key-side operation on the [`put`] path (inserting into both containers)
-/// and on the recency-update path (a [`get`] hit relocates the key within
-/// the recency queue) is allocation-free. The string a [`Key`] carries is
-/// consumed into the `Rc<str>` once, on the inserting `put`; after that no
-/// `put` or `get` ever heap-allocates a key. This is what makes a
-/// full-cache `put` (evict + insert) and a `get` hit's recency bump
-/// strictly allocation-free on the key side, and what makes the
-/// post-eviction key handoff infallible (a refcount bump cannot fail), so
-/// a failed `put` can never leave the cache half-mutated.
+/// [`Arc<str>`](Arc): the entry-map key and the recency-queue entry are two
+/// [`Arc::clone`]s of that one allocation. `Arc::clone` is an infallible
+/// refcount bump (a single atomic increment) — **no heap allocation, no
+/// string copy** — so every key-side operation on the [`put`] path
+/// (inserting into both containers) and on the recency-update path (a
+/// [`get`] hit relocates the key within the recency queue) is
+/// allocation-free. The string a [`Key`] carries is consumed into the
+/// `Arc<str>` once, on the inserting `put`; after that no `put` or `get`
+/// ever heap-allocates a key. This is what makes a full-cache `put`
+/// (evict + insert) and a `get` hit's recency bump strictly
+/// allocation-free on the key side, and what makes the post-eviction key
+/// handoff infallible (a refcount bump cannot fail), so a failed `put` can
+/// never leave the cache half-mutated.
 ///
 /// # Concurrency
 ///
-/// Not `Sync` (it stores [`Array`], which is intentionally `!Send` +
-/// `!Sync`). One cache belongs to one inference thread — the same
-/// single-thread contract the rest of `mlxrs` is built on.
+/// Neither `Send` nor `Sync` — it stores [`Array`], which is intentionally
+/// `!Send` + `!Sync`. One cache belongs to one inference thread, the same
+/// single-thread contract the rest of `mlxrs` is built on. Note this is the
+/// *cache* type only: its [`Key`] type *is* `Send + Sync` (it is backed by
+/// an `Arc<str>`), so keys may be precomputed or moved across threads even
+/// though the cache they index must not.
 pub struct VisionFeatureCache {
   /// LRU bound. `>= 1` — enforced by [`Self::with_max_size`].
   max_size: usize,
   /// Key → feature-`Array` map. Holds the owned (refcount-shared)
-  /// `Array` handles. The map *key* is an [`Rc<str>`](Rc): the same
+  /// `Array` handles. The map *key* is an [`Arc<str>`](Arc): the same
   /// allocation the recency queue holds (see the struct-level "Key
   /// storage" note), so admitting a key never heap-copies the string.
-  /// `Rc<str>` hashes and compares by content (it `Borrow`s `str`), so
+  /// `Arc<str>` hashes and compares by content (it `Borrow`s `str`), so
   /// lookups with a `&Key` work via `key.as_str()`.
-  entries: HashMap<Rc<str>, Array>,
+  entries: HashMap<Arc<str>, Array>,
   /// Recency queue, **least-recently-used at the front**, most-recent at
   /// the back — the explicit mirror of `OrderedDict`'s insertion order.
   /// `move_to_end` is "remove this key, push it to the back"; eviction is
@@ -262,11 +287,11 @@ pub struct VisionFeatureCache {
   /// present exactly once in `recency`, and vice versa — the two are kept
   /// in lockstep by every mutating method.
   ///
-  /// Holds [`Rc<str>`](Rc) clones of the *same* allocations the entry map
+  /// Holds [`Arc<str>`](Arc) clones of the *same* allocations the entry map
   /// keys point at. Pushing/moving a key here is therefore a refcount bump,
   /// not a `String` copy — so [`put`](Self::put) and [`touch`](Self::touch)
   /// never heap-allocate a key.
-  recency: VecDeque<Rc<str>>,
+  recency: VecDeque<Arc<str>>,
 }
 
 impl VisionFeatureCache {
@@ -378,8 +403,8 @@ impl VisionFeatureCache {
     // `Err` having mutated nothing, so the cache is left exactly as it
     // was (transactional — no half-applied LRU bump).
     //
-    // The map keys are `Rc<str>`, which `Borrow<str>`, so the lookup keys
-    // on `key.as_str()` — no `Key`/`Rc` is constructed to probe the map.
+    // The map keys are `Arc<str>`, which `Borrow<str>`, so the lookup keys
+    // on `key.as_str()` — no `Key`/`Arc` is constructed to probe the map.
     let cloned = match self.entries.get(key.as_str()) {
       Some(features) => features.try_clone()?,
       None => return Ok(None),
@@ -423,14 +448,14 @@ impl VisionFeatureCache {
   ///
   /// # Allocation discipline (zero-alloc on the hot paths)
   ///
-  /// Keys are stored as [`Rc<str>`](Rc) — the heap string was allocated in
-  /// the [`Key`] constructor, before `put` is even called. Inside `put` a
-  /// key is only ever *moved* into a container or refcount-cloned
-  /// ([`Rc::clone`]) into the second one; `put` itself **never
+  /// Keys are stored as [`Arc<str>`](Arc) — the heap string was allocated
+  /// in the [`Key`] constructor, before `put` is even called. Inside `put`
+  /// a key is only ever *moved* into a container or refcount-cloned
+  /// ([`Arc::clone`]) into the second one; `put` itself **never
   /// heap-allocates a key**.
   ///
   /// - **Overwrite** (`key` present): the value is replaced in place via
-  ///   [`HashMap::get_mut`] — the existing entry, its `Rc<str>` key, and
+  ///   [`HashMap::get_mut`] — the existing entry, its `Arc<str>` key, and
   ///   both containers' capacity are all reused. No growth, no eviction, no
   ///   allocation.
   /// - **New key, cache full** (`len == max_size`): the LRU entry is
@@ -439,7 +464,7 @@ impl VisionFeatureCache {
   ///   just-freed slot. Because eviction precedes insertion the containers
   ///   never need to grow past `max_size`, so this path does **no
   ///   `try_reserve` and no allocation**: it is `evict` + `insert` +
-  ///   [`Rc::clone`], every step infallible. Once `try_clone` has passed
+  ///   [`Arc::clone`], every step infallible. Once `try_clone` has passed
   ///   the full path *cannot fail*, so it cannot leave the cache
   ///   half-mutated.
   /// - **New key, cache not full** (`len < max_size`): the insertion
@@ -461,9 +486,9 @@ impl VisionFeatureCache {
     let stored = features.try_clone()?;
 
     // Overwrite path: the key is already present. Replace the value in its
-    // existing slot via `get_mut` (the map keys are `Rc<str>`, which
-    // `Borrow<str>`, so this probes with `key.as_str()` — no `Rc` built).
-    // The entry's `Rc<str>` key and both containers' capacity are reused —
+    // existing slot via `get_mut` (the map keys are `Arc<str>`, which
+    // `Borrow<str>`, so this probes with `key.as_str()` — no `Arc` built).
+    // The entry's `Arc<str>` key and both containers' capacity are reused —
     // no growth, no eviction, no key allocation (mirrors the reference's
     // `move_to_end` then `self._cache[key] = features`).
     if let Some(slot) = self.entries.get_mut(key.as_str()) {
@@ -472,10 +497,10 @@ impl VisionFeatureCache {
       return Ok(());
     }
 
-    // New key. The `Key` carries its `Rc<str>` (the heap string was
+    // New key. The `Key` carries its `Arc<str>` (the heap string was
     // allocated in the `Key` constructor, not here); move it out so the two
     // containers can share it by refcount.
-    let key_rc: Rc<str> = key.0;
+    let key_arc: Arc<str> = key.0;
 
     if self.entries.len() >= self.max_size {
       // FULL — evict the LRU entry *before* inserting. `>=` (not `==`)
@@ -513,12 +538,12 @@ impl VisionFeatureCache {
         .map_err(|_| Error::OutOfMemory)?;
     }
 
-    // Insert the new key into both containers. `Rc::clone` is an
+    // Insert the new key into both containers. `Arc::clone` is an
     // infallible refcount bump (no allocation, no string copy); the
-    // `entries.insert` then *moves* the `Rc`. Both containers thus share
+    // `entries.insert` then *moves* the `Arc`. Both containers thus share
     // one heap-allocated string.
-    self.recency.push_back(Rc::clone(&key_rc));
-    self.entries.insert(key_rc, stored);
+    self.recency.push_back(Arc::clone(&key_arc));
+    self.entries.insert(key_arc, stored);
     Ok(())
   }
 
@@ -529,8 +554,8 @@ impl VisionFeatureCache {
   /// recency (the reference's `__contains__` likewise does not
   /// `move_to_end`), so it can take `&self`.
   pub fn contains(&self, key: &Key) -> bool {
-    // The map keys are `Rc<str>`, which `Borrow<str>`, so membership is
-    // probed with `key.as_str()` — no `Rc` is constructed for the query.
+    // The map keys are `Arc<str>`, which `Borrow<str>`, so membership is
+    // probed with `key.as_str()` — no `Arc` is constructed for the query.
     self.entries.contains_key(key.as_str())
   }
 
@@ -555,19 +580,19 @@ impl VisionFeatureCache {
   /// panic) — but the entries/recency lockstep invariant means that never
   /// happens in practice.
   ///
-  /// Allocation-free: the queue stores [`Rc<str>`](Rc), so the existing
+  /// Allocation-free: the queue stores [`Arc<str>`](Arc), so the existing
   /// entry is **moved** (not copied) from its old position to the back —
-  /// [`VecDeque::remove`] hands back the queue's own `Rc<str>` and
+  /// [`VecDeque::remove`] hands back the queue's own `Arc<str>` and
   /// [`VecDeque::push_back`] re-files that same allocation. No `String`
   /// copy, no heap allocation, no refcount churn.
   fn touch(&mut self, key: &Key) {
-    // The queue holds `Rc<str>`; compare by `str` content (`as_ref()` /
+    // The queue holds `Arc<str>`; compare by `str` content (`as_ref()` /
     // `as_str()` both yield `&str`) so a `&Key` probes without building
-    // an `Rc`.
+    // an `Arc`.
     match self.recency.iter().position(|k| k.as_ref() == key.as_str()) {
       Some(pos) => {
         // MOVE the existing entry to the back: `remove` yields the
-        // queue's own `Rc<str>` (no copy), `push_back` re-files that
+        // queue's own `Arc<str>` (no copy), `push_back` re-files that
         // exact allocation. `remove` at an arbitrary position is O(n) in
         // the queue length, but that length is bounded by `max_size`
         // (default 20) — a tiny fixed bound — so this is effectively O(1)
@@ -583,9 +608,9 @@ impl VisionFeatureCache {
         // Unreachable under the entries/recency lockstep invariant (every
         // `entries` key is present in `recency`). Kept as a no-panic
         // safety net: if a key were somehow missing, re-file it via an
-        // `Rc::clone` (infallible refcount bump) of the caller's key —
+        // `Arc::clone` (infallible refcount bump) of the caller's key —
         // still allocation-free, no `String` copy.
-        self.recency.push_back(Rc::clone(&key.0));
+        self.recency.push_back(Arc::clone(&key.0));
       }
     }
   }
@@ -613,7 +638,7 @@ impl std::fmt::Debug for VisionFeatureCache {
 }
 
 /// Allocation-discipline tests that need to inspect the cache's **private**
-/// containers (`entries` / `recency`) — capacity stability and `Rc<str>`
+/// containers (`entries` / `recency`) — capacity stability and `Arc<str>`
 /// key sharing. They live in an inline `#[cfg(test)]` module (not the
 /// integration suite in `tests/vlm_feature_cache.rs`) precisely because the
 /// guarantees under test are structural and only observable through the
@@ -719,15 +744,15 @@ mod alloc_discipline_tests {
   }
 
   /// **Finding 2 — post-eviction key handoff is a refcount bump, not a
-  /// heap `String` clone.** Keys are stored as `Rc<str>`: a `put` builds
-  /// the `Rc<str>` *once* (in the `Key` constructor, before `put`), then
-  /// the entry map and the recency queue each hold a [`Rc::clone`] — an
+  /// heap `String` clone.** Keys are stored as `Arc<str>`: a `put` builds
+  /// the `Arc<str>` *once* (in the `Key` constructor, before `put`), then
+  /// the entry map and the recency queue each hold an [`Arc::clone`] — an
   /// infallible refcount bump, no allocation. This test proves the
   /// single-allocation sharing structurally: after a full-cache `put` the
-  /// inserted key's `Rc<str>` has `strong_count == 2` — exactly one
+  /// inserted key's `Arc<str>` has `strong_count == 2` — exactly one
   /// reference per container. Two *independent* allocations (the hazard if
   /// the code `String`-cloned the key) would instead be two separate
-  /// `Rc`s each at count 1. A count of 2 is only possible if both
+  /// `Arc`s each at count 1. A count of 2 is only possible if both
   /// containers share one allocation, which is the zero-alloc, infallible,
   /// transactional handoff the fix guarantees.
   #[test]
@@ -740,17 +765,17 @@ mod alloc_discipline_tests {
       .put(Key::from_source("shared"), &features())
       .expect("full-cache put must succeed");
 
-    // Pull the stored key's `Rc<str>` back out of the entry map and count
+    // Pull the stored key's `Arc<str>` back out of the entry map and count
     // its strong references. `entries` holds one; `recency` holds the
-    // other; they are the SAME allocation (`Rc::clone`d, not re-allocated).
-    let (key_rc, _) = cache
+    // other; they are the SAME allocation (`Arc::clone`d, not re-allocated).
+    let (key_arc, _) = cache
       .entries
       .get_key_value("shared")
       .expect("the just-inserted key must be present");
     assert_eq!(
-      Rc::strong_count(key_rc),
+      Arc::strong_count(key_arc),
       2,
-      "the key's `Rc<str>` is shared by exactly the two containers \
+      "the key's `Arc<str>` is shared by exactly the two containers \
        (entry map + recency queue) — one allocation, two refcount-clones, \
        NO heap `String` copy on the put path"
     );
@@ -758,9 +783,9 @@ mod alloc_discipline_tests {
 
   /// **`touch` (the `get`-hit recency bump) does not clone the key
   /// string.** On a `get` hit the entry's recency position is refreshed by
-  /// `touch`, which *moves* the existing `Rc<str>` within the `VecDeque`
-  /// (`remove` then `push_back` of the same `Rc`) rather than cloning a
-  /// `String`. After a `get` hit the touched key's `Rc<str>` therefore
+  /// `touch`, which *moves* the existing `Arc<str>` within the `VecDeque`
+  /// (`remove` then `push_back` of the same `Arc`) rather than cloning a
+  /// `String`. After a `get` hit the touched key's `Arc<str>` therefore
   /// still has `strong_count == 2` (entry map + recency queue) — `touch`
   /// neither allocated a new key nor leaked an extra reference.
   #[test]
@@ -772,30 +797,30 @@ mod alloc_discipline_tests {
 
     // Sanity: freshly inserted, the key is shared by the two containers.
     {
-      let (rc, _) = cache.entries.get_key_value("hot").unwrap();
-      assert_eq!(Rc::strong_count(rc), 2, "post-put: entries + recency");
+      let (arc, _) = cache.entries.get_key_value("hot").unwrap();
+      assert_eq!(Arc::strong_count(arc), 2, "post-put: entries + recency");
     }
 
     // A `get` hit drives `touch`. The probe `Key` below is a *separate*
-    // allocation (its own `Rc`, count 1) — it cannot perturb the stored
+    // allocation (its own `Arc`, count 1) — it cannot perturb the stored
     // key's count.
     for _ in 0..8 {
       assert!(
         cache.get(&Key::from_source("hot")).unwrap().is_some(),
         "the key must hit"
       );
-      let (rc, _) = cache.entries.get_key_value("hot").unwrap();
+      let (arc, _) = cache.entries.get_key_value("hot").unwrap();
       assert_eq!(
-        Rc::strong_count(rc),
+        Arc::strong_count(arc),
         2,
-        "after a `get`-hit `touch` the key's `Rc<str>` is STILL shared by \
-         just the two containers — `touch` moved the queue's `Rc` rather \
+        "after a `get`-hit `touch` the key's `Arc<str>` is STILL shared by \
+         just the two containers — `touch` moved the queue's `Arc` rather \
          than cloning the key string, so no allocation and no leaked ref"
       );
     }
   }
 
-  /// The overwrite path likewise reuses the existing `Rc<str>` key (it
+  /// The overwrite path likewise reuses the existing `Arc<str>` key (it
   /// replaces only the value, via `get_mut`) — so an overwrite neither
   /// allocates a key nor changes the key's refcount.
   #[test]
@@ -810,11 +835,11 @@ mod alloc_discipline_tests {
       .put(Key::from_source("ow"), &features())
       .expect("overwrite put must succeed");
 
-    let (rc, _) = cache.entries.get_key_value("ow").unwrap();
+    let (arc, _) = cache.entries.get_key_value("ow").unwrap();
     assert_eq!(
-      Rc::strong_count(rc),
+      Arc::strong_count(arc),
       2,
-      "overwrite reuses the existing key `Rc<str>` (entries + recency); \
+      "overwrite reuses the existing key `Arc<str>` (entries + recency); \
        it does not allocate or clone a key"
     );
     assert_eq!(cache.len(), 1, "overwrite must not grow the cache");
