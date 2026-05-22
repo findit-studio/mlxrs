@@ -1541,9 +1541,11 @@ struct NormKey {
 /// call:
 /// - the **flattened scatter-index buffer** `indices[m, j] = m * hop + j`
 ///   (keyed by `(num_frames, frame_width, hop)` — `get_positions`), and
-/// - the **scattered `Σ w²` normalization buffer** of overlap-add length `t`,
-///   floored at `COVERAGE_EPS` (keyed by the full window + framing geometry —
-///   `get_norm_buffer`).
+/// - the **scattered `Σ w²` window-sum buffer** of overlap-add length `t`
+///   (keyed by the full window + framing geometry — `get_norm_buffer`). mlxrs
+///   caches the RAW (un-floored) window-sum rather than the reference's
+///   `mx.maximum(., 1e-10)`-floored divisor, so the cached path can reproduce
+///   the free [`istft`]'s coverage guard exactly (see below).
 ///
 /// For a streaming decoder that inverts many same-shaped frame blocks (the
 /// reference's stated use case — "streaming"), this skips the per-call CPU
@@ -1551,25 +1553,32 @@ struct NormKey {
 ///
 /// ## Relationship to the free [`istft`] function
 /// [`ISTFTCache::istft`] is **numerically identical** to the free [`istft`] for
-/// every supported [`Spectrum`]: it builds the same `Σ w²` divisor, performs the
-/// same `irfft` → window → overlap-add → divide, and applies the same
-/// center-trim / `length` slicing. The only difference is that the index buffer
-/// and the (floored) norm buffer are memoized. It enforces the same invariants:
+/// every [`Spectrum`] — **including its rejection behavior**, not just its happy
+/// path. It builds the same raw `Σ w²` window-sum, performs the same `irfft` →
+/// window → overlap-add, applies the **same coverage guard** over the requested
+/// region, the same `mx.where(window_sum > COVERAGE_EPS, normalized, raw)`
+/// normalization, and the same center-trim / `length` slicing. The only
+/// difference is that the index buffer and the raw window-sum buffer are
+/// memoized across same-geometry calls. It enforces the same invariants:
 /// [`WindowPad::Right`] short-window inversion (`win_length != n_fft`) is
-/// rejected up front (not a faithful inverse — see [`istft`]).
+/// rejected up front (not a faithful inverse — see [`istft`]), and a requested
+/// region containing a zero-coverage sample (a `center=true` length reaching
+/// into the zero-coverage tail, or a `center=false` head/tail) is **rejected**
+/// with the same coverage error the free [`istft`] returns — never divided by a
+/// floor and silently emitted as corrupt audio.
 ///
-/// **Difference from the free [`istft`]'s coverage guard.** The free [`istft`]
-/// runs a *coverage guard* — it reads back the minimum window-sum of the
-/// requested region and errors if any requested sample got negligible window
-/// energy. `ISTFTCache` instead **floors the cached norm buffer at
-/// `COVERAGE_EPS`** (the reference's `mx.maximum(norm_buffer, 1e-10)`), so a
-/// zero-coverage sample is divided by the floor rather than flagged. For the
-/// supported configurations ([`WindowPad::Center`] any `win_length`, or
-/// [`WindowPad::Right`] with `win_length == n_fft`) every requested sample has
-/// full COLA coverage, so the floor never actually engages on a returned sample
-/// and the two paths agree. The floor is a deliberate, reference-faithful
-/// choice (`ISTFTCache` is the *fast streaming* path; the free [`istft`] is the
-/// *guarded* path).
+/// **Why the raw window-sum is cached (not the floored divisor).** The
+/// reference's `get_norm_buffer` floors the window-sum at `COVERAGE_EPS`
+/// (`mx.maximum(norm_buffer, 1e-10)`) and divides directly. Caching that floored
+/// divisor would LOSE the free [`istft`]'s coverage guard: a zero-coverage
+/// requested sample would be divided by the `1e-10` floor and silently emit
+/// invalid audio instead of being rejected. mlxrs therefore caches the RAW
+/// window-sum and reproduces the free [`istft`]'s guard + `where` on it, so the
+/// cached path is the numerically-identical *guarded* path — just with the index
+/// and window-sum buffers memoized for streaming. For the supported
+/// configurations ([`WindowPad::Center`] any `win_length`, or [`WindowPad::Right`]
+/// with `win_length == n_fft`) every requested sample has full COLA coverage, so
+/// the guard never fires and the round-trip is exact.
 ///
 /// ## Bounded memory
 /// Each cached entry is bounded by the same `MAX_OLA_WORK` /
@@ -1591,8 +1600,9 @@ struct NormKey {
 pub struct ISTFTCache {
   /// Memoized flattened scatter-index buffers, keyed by framing geometry.
   position_cache: std::collections::HashMap<PositionKey, Array>,
-  /// Memoized scattered `Σ w²` norm buffers (floored at `COVERAGE_EPS`),
-  /// keyed by the full window + framing geometry.
+  /// Memoized scattered RAW `Σ w²` window-sum buffers (un-floored, so the
+  /// coverage guard + `where`-normalization can reproduce the free [`istft`]
+  /// exactly), keyed by the full window + framing geometry.
   norm_buffer_cache: std::collections::HashMap<NormKey, Array>,
 }
 
@@ -1629,20 +1639,21 @@ impl ISTFTCache {
   /// of the free [`istft`].
   ///
   /// Builds the reconstruction exactly as [`istft`] does (`irfft` → synthesis
-  /// window → overlap-add → divide by `Σ w²`), but reuses the flattened
-  /// scatter-index buffer and the floored `Σ w²` norm buffer from the cache
-  /// when a [`Spectrum`] with the same geometry was seen before. The result is
-  /// the reconstructed 1-D real signal (`Dtype::F32`), identical to
-  /// `istft(spectrum, length)` for every supported [`Spectrum`].
+  /// window → overlap-add → coverage guard → `where`-normalize by `Σ w²`), but
+  /// reuses the flattened scatter-index buffer and the raw `Σ w²` window-sum
+  /// buffer from the cache when a [`Spectrum`] with the same geometry was seen
+  /// before. The result is the reconstructed 1-D real signal (`Dtype::F32`),
+  /// identical to `istft(spectrum, length)` for every [`Spectrum`] — including
+  /// its rejection behavior.
   ///
   /// `length` has the same meaning as in [`istft`]: with `center = true` the
   /// `n_fft / 2` reflect prefix is dropped first, then `length` (if any) keeps
   /// the leading real samples; with `center = false` it slices `[0 .. length]`.
   ///
   /// # Errors
-  /// Same error surface as [`istft`] **except the coverage guard** (this path
-  /// floors the norm buffer at `COVERAGE_EPS` instead — see the
-  /// [`ISTFTCache`] type docs):
+  /// The **same error surface as [`istft`], including its coverage guard** (this
+  /// path caches the raw window-sum and reproduces the guard exactly rather than
+  /// flooring — see the [`ISTFTCache`] type docs):
   /// - [`Error::Backend`] when the [`Spectrum`]'s `window_pad` is
   ///   [`WindowPad::Right`] and `win_length != n_fft` (short-window right-pad
   ///   inversion is not a faithful inverse — rejected up front),
@@ -1651,6 +1662,10 @@ impl ISTFTCache {
   ///   [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) cap, or
   ///   the scatter work `num_frames * n_fft` exceeds `MAX_OLA_WORK`,
   /// - [`Error::Backend`] when the `length` trim is out of range,
+  /// - [`Error::Backend`] when the **coverage guard** fires — a requested output
+  ///   sample has window-sum `<= COVERAGE_EPS` (a `center=true` length reaching
+  ///   into the zero-coverage tail, or a `center=false` head/tail). Identical to
+  ///   the free [`istft`]; should never fire for a supported config,
   /// - propagates window-construction errors from the shared `frame_window`.
   pub fn istft(&mut self, spectrum: &Spectrum, length: Option<usize>) -> Result<Array> {
     // Every transform parameter is read straight off the typed `Spectrum` (its
@@ -1769,12 +1784,20 @@ impl ISTFTCache {
       slot.insert(indices);
     }
 
-    // ---- cached scattered `Σ w²` norm buffer ----------------------------
+    // ---- cached scattered `Σ w²` window-sum buffer ----------------------
     // The reference (`get_norm_buffer`) scatters the tiled squared window into
-    // a zero buffer of OLA length, then `mx.maximum(., 1e-10)`-floors it. The
-    // floored buffer is the divisor. Keyed by the full window + framing
-    // geometry. Built once via the shared `frame_window` (so the synthesis
-    // window matches the forward `stft` exactly).
+    // a zero buffer of OLA length. We cache the RAW (un-floored) window-sum —
+    // NOT the `mx.maximum(., 1e-10)`-floored divisor — because the floored
+    // divisor would LOSE the free `istft`'s coverage guard: a zero-coverage
+    // requested sample (e.g. a `center=true` length reaching into the
+    // zero-coverage tail, or a `center=false` head/tail) would be divided by
+    // the `1e-10` floor and silently emit invalid audio instead of being
+    // rejected. Caching the raw sum lets the reconstruction path reproduce the
+    // free `istft` EXACTLY — both its coverage guard (reject the requested
+    // region) and its `mx.where(window_sum > eps, normalized, raw)`
+    // normalization. Keyed by the full window + framing geometry. Built once
+    // via the shared `frame_window` (so the synthesis window matches the
+    // forward `stft` exactly).
     let norm_key = NormKey {
       n_fft,
       hop_length,
@@ -1801,13 +1824,10 @@ impl ISTFTCache {
         .get(&pos_key)
         .expect("position_cache populated for pos_key above");
       let zeros_wsum = Array::zeros::<f32>(&[t_i32])?;
+      // RAW window-sum (no floor): the coverage guard + `where` below need the
+      // true `Σ w²` to detect zero-coverage samples, exactly as free `istft`.
       let window_sum = ops::indexing::scatter_add_axis(&zeros_wsum, indices, &updates_window, 0)?;
-      // Floor at COVERAGE_EPS — the reference's `mx.maximum(norm_buffer,
-      // 1e-10)`. For the supported configs every requested sample has full
-      // COLA coverage, so the floor never engages on a returned sample.
-      let floor = Array::full::<f32>(&[0i32; 0], COVERAGE_EPS)?;
-      let norm_buffer = ops::arithmetic::maximum(&window_sum, &floor)?;
-      self.norm_buffer_cache.insert(norm_key, norm_buffer);
+      self.norm_buffer_cache.insert(norm_key, window_sum);
     }
 
     // ---- reconstruction (cached buffers in hand) ------------------------
@@ -1825,7 +1845,7 @@ impl ISTFTCache {
       .position_cache
       .get(&pos_key)
       .expect("position_cache populated for pos_key above");
-    let norm_buffer = self
+    let window_sum = self
       .norm_buffer_cache
       .get(&norm_key)
       .expect("norm_buffer_cache populated for norm_key above");
@@ -1833,11 +1853,11 @@ impl ISTFTCache {
     let zeros_recon = Array::zeros::<f32>(&[t_i32])?;
     let reconstructed =
       ops::indexing::scatter_add_axis(&zeros_recon, indices, &updates_reconstructed, 0)?;
-    // Divide by the floored `Σ w²` norm buffer (no `where`: the floor already
-    // guarantees a finite divisor everywhere — the reference divides directly).
-    let reconstructed = ops::arithmetic::divide(&reconstructed, norm_buffer)?;
 
-    // ---- center-trim + `length` (same ordering as the free `istft`) -----
+    // ---- requested-output region (same bounds the free `istft` computes) -
+    // Compute the trim bounds BEFORE the coverage guard / normalization so the
+    // guard runs over EXACTLY the returned region — identical ordering to the
+    // free `istft`, so the cached path cannot disagree with what it returns.
     let pad = n_fft / 2;
     let (start_usize, stop_usize) = match (center, length) {
       (true, Some(len)) => {
@@ -1873,6 +1893,53 @@ impl ISTFTCache {
     let stop_i32 = i32::try_from(stop_usize).map_err(|_| Error::Backend {
       message: format!("ISTFTCache::istft: trim stop {stop_usize} exceeds i32::MAX"),
     })?;
+
+    // ---- coverage guard (IDENTICAL to the free `istft`) -----------------
+    // Every sample in the REQUESTED output region must have window-sum
+    // `> COVERAGE_EPS`; otherwise it received negligible window energy and
+    // dividing by the (would-be floored) sum is meaningless. The free `istft`
+    // reduces the requested slice of the RAW `window_sum` to its minimum and
+    // rejects (naming the offending global index) if that minimum is not
+    // strictly above the threshold (or is `NaN`). Reproduce it EXACTLY here —
+    // this is the guard the floored-divisor path silently dropped. An empty
+    // requested region (a single centered even-`n_fft` frame collapsing
+    // `[pad .. t - pad]`) has no samples to corrupt, so the reduction
+    // (undefined over an empty array) is skipped.
+    if start_usize < stop_usize {
+      let region_wsum = ops::indexing::slice(window_sum, &[start_i32], &[stop_i32], &[1])?;
+      let mut region_min = ops::reduction::min(&region_wsum, false)?;
+      let min_wsum = region_min.item::<f32>()?;
+      // Fire on `<= COVERAGE_EPS` AND on `NaN` (a NaN window-sum cannot
+      // normalize either). Written explicitly (not `!(min > eps)`) for the
+      // partial-ord lint, with the same NaN-catching semantics as free `istft`.
+      if min_wsum <= COVERAGE_EPS || min_wsum.is_nan() {
+        let mut min_idx_arr = ops::misc::argmin(&region_wsum, None, false)?;
+        let local_idx = min_idx_arr.item::<u32>()? as usize;
+        let global_idx = start_usize + local_idx;
+        return Err(Error::Backend {
+          message: format!(
+            "ISTFTCache::istft: requested output sample at index {global_idx} (region offset \
+             {local_idx}) has window-sum {min_wsum:.3e} <= COVERAGE_EPS ({COVERAGE_EPS:.0e}) — it \
+             received no window coverage in the overlap-add and is not recoverable \
+             (n_fft={n_fft}, win_length={win_length}, hop={hop_length}, window_pad={window_pad:?}); \
+             the requested region (e.g. a center=false head/tail) includes a zero-coverage sample \
+             — adjust length/center or the window"
+          ),
+        });
+      }
+    }
+
+    // ---- normalize (IDENTICAL to the free `istft`'s `where` branch) -----
+    // Divide by `Σ w²` where it exceeds the coverage threshold, else leave the
+    // raw overlap-add (the reference's `mx.where(window_sum > 1e-10, ...)`). The
+    // coverage guard above guarantees every REQUESTED sample is on the
+    // normalized branch; the `where` only matters for the trimmed-away region.
+    let threshold = Array::full::<f32>(&[0i32; 0], COVERAGE_EPS)?;
+    let mask = ops::comparison::greater(window_sum, &threshold)?;
+    let normalized_recon = ops::arithmetic::divide(&reconstructed, window_sum)?;
+    let reconstructed = ops::logical::select(&mask, &normalized_recon, &reconstructed)?;
+
+    // Final trim to the requested region (same bounds the coverage guard used).
     ops::indexing::slice(&reconstructed, &[start_i32], &[stop_i32], &[1])
   }
 }
@@ -3335,6 +3402,11 @@ pub fn normalize_loudness(
 ///   - the current peak `max(|data|)` is `0.0` (an all-silence input cannot be
 ///     peak-normalized — the gain would divide by zero) or non-finite (a
 ///     `NaN` / `inf` sample in the input),
+///   - the linear target `10^(target_peak_db / 20)` is non-finite (a finite but
+///     enormous `target_peak_db` overflows the f32 amplitude), or the resulting
+///     `gain = target_linear / current_peak` is non-finite (a finite target
+///     divided by a subnormal nonzero peak overflows) — either would scale the
+///     signal into non-finite samples,
 ///   - the underlying `abs` / `max` / multiply propagates a backend error.
 ///
 /// This reads back one scalar (the current peak) via an explicit `eval`.
@@ -3376,6 +3448,31 @@ pub fn normalize_peak(data: &Array, target_peak_db: f64) -> Result<Array> {
   // numerator in f64 (matches the reference) and the division in f32.
   let target_linear = 10.0_f64.powf(target_peak_db / 20.0) as f32;
   let gain = target_linear / current_peak;
+  // A FINITE `target_peak_db` and a finite, nonzero `current_peak` can still
+  // produce a non-finite `target_linear` (the f64 → f32 narrowing overflows for
+  // a huge `target_peak_db`, e.g. `10^(1e30/20)` → `+inf`) or a non-finite
+  // `gain` (a finite `target_linear` divided by a subnormal nonzero peak
+  // overflows to `+inf`). Either would multiply the signal into non-finite
+  // samples — so reject BEFORE building the scalar, exactly as the up-front
+  // non-finite `target_peak_db` / `current_peak` guards do.
+  if !target_linear.is_finite() {
+    return Err(Error::Backend {
+      message: format!(
+        "normalize_peak: target amplitude 10^(target_peak_db / 20) is non-finite \
+         ({target_linear}) — target_peak_db {target_peak_db} is too large to represent \
+         as a finite f32 gain"
+      ),
+    });
+  }
+  if !gain.is_finite() {
+    return Err(Error::Backend {
+      message: format!(
+        "normalize_peak: gain target_linear / current_peak is non-finite ({gain}) — \
+         the current peak {current_peak:.3e} is too small for target_peak_db \
+         {target_peak_db} (the scaling overflows to a non-finite value)"
+      ),
+    });
+  }
   let gain_arr = Array::full::<f32>(&[0i32; 0], gain)?;
   ops::arithmetic::multiply(data, &gain_arr)
 }
@@ -4994,6 +5091,136 @@ mod tests {
     ));
   }
 
+  #[test]
+  fn istft_cache_center_zero_coverage_tail_rejects_like_free_istft() {
+    // THE F1 FIX. A `center=true` spectrum whose requested `length` reaches into
+    // the zero-coverage OLA tail must be REJECTED by the cached path, EXACTLY as
+    // the free `istft` rejects it — not divided by a `1e-10` floor and silently
+    // emitted as corrupt audio. n_fft=8, hop=4, win=8 symmetric Hann; 16-sample
+    // input → num_frames=5, t = (5-1)*4 + 8 = 24, pad = 4. The last OLA index
+    // 23 is reached only by frame 4 at window position 7, whose Hann sample is
+    // 0, so wsum[23] == 0 (zero coverage).
+    let buf = signal_16();
+    let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
+    let spec = stft(&x, 8, 4, Some(8), WindowPad::Center).unwrap();
+    assert_eq!(spec.num_frames(), 5);
+    let t = (spec.num_frames() - 1) * spec.hop_length() + spec.n_fft();
+    assert_eq!(t, 24);
+    let pad = spec.n_fft() / 2; // 4
+
+    // `length = Some(t - pad)` requests `[pad .. t)` == `[4 .. 24)`, which
+    // includes the zero-coverage index 23. BOTH paths must reject it.
+    let tail_len = t - pad; // 20
+    let free_tail = istft(&spec, Some(tail_len));
+    assert!(
+      matches!(free_tail, Err(Error::Backend { .. })),
+      "free istft must reject the zero-coverage tail, got {free_tail:?}"
+    );
+    let mut cache = ISTFTCache::new();
+    let cached_tail = cache.istft(&spec, Some(tail_len));
+    assert!(
+      matches!(cached_tail, Err(Error::Backend { .. })),
+      "ISTFTCache must reject the zero-coverage tail IDENTICALLY to free istft \
+       (not divide by a floor + emit corrupt audio), got {cached_tail:?}"
+    );
+
+    // A COVERED request (`length = None` → `[pad .. t - pad)`, excludes the
+    // zero-coverage tail) must succeed AND be numerically identical to free
+    // istft. (Use a fresh cache so a populated norm-buffer from the rejected
+    // call above can't mask a bug; then assert the rejecting call left no stale
+    // corrupt state by re-rejecting on the same cache.)
+    let free_ok = to_vec(&istft(&spec, None).unwrap());
+    let mut cache_ok = ISTFTCache::new();
+    let cached_ok = to_vec(&cache_ok.istft(&spec, None).unwrap());
+    assert_eq!(free_ok.len(), cached_ok.len(), "covered-length mismatch");
+    for (i, (a, b)) in free_ok.iter().zip(cached_ok.iter()).enumerate() {
+      assert!(
+        (a - b).abs() < 1e-6,
+        "covered ISTFTCache vs istft[{i}]: {a} vs {b}"
+      );
+    }
+    // The same cache (now warm with the geometry from the rejected call) still
+    // rejects the tail — the guard runs every call, not just on a cold cache.
+    let warm_reject = cache.istft(&spec, Some(tail_len));
+    assert!(
+      matches!(warm_reject, Err(Error::Backend { .. })),
+      "warm-cache tail request must STILL reject (guard is per-call), got {warm_reject:?}"
+    );
+  }
+
+  #[test]
+  fn istft_cache_center_false_uncovered_head_rejects_like_free_istft() {
+    // F1 `center=false` consistency: the RAW OLA index 0 is reached only by
+    // frame 0 at window position 0 (Hann sample 0), so wsum[0] == 0. A
+    // `center=false` request includes index 0, so BOTH the free `istft` and the
+    // cached path must reject it — the cached path must NOT floor-divide and emit
+    // a corrupt head sample. Built via `from_parts` (stft always sets
+    // center=true); the transform data is unchanged, only the carried flag.
+    let buf = signal_16();
+    let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
+    let spec = stft(&x, 8, 4, Some(8), WindowPad::Center).unwrap();
+    let spec_no_center = Spectrum::from_parts(
+      spec.data().try_clone().unwrap(),
+      8,
+      4,
+      8,
+      WindowPad::Center,
+      false, // center=false: requested region starts at the uncovered index 0
+    )
+    .unwrap();
+    for len in [None, Some(10usize)] {
+      let free_res = istft(&spec_no_center, len);
+      assert!(
+        matches!(free_res, Err(Error::Backend { .. })),
+        "free istft center=false head (len={len:?}) must reject, got {free_res:?}"
+      );
+      let mut cache = ISTFTCache::new();
+      let cached_res = cache.istft(&spec_no_center, len);
+      assert!(
+        matches!(cached_res, Err(Error::Backend { .. })),
+        "ISTFTCache center=false head (len={len:?}) must reject IDENTICALLY to \
+         free istft, got {cached_res:?}"
+      );
+    }
+
+    // Consistency the other way: a `center=false` short window under Center
+    // placement whose covered interior IS requested still matches free istft.
+    // (win < n_fft, hop small enough that an interior length is fully covered.)
+    let spec_cov = stft(&x, 8, 2, Some(8), WindowPad::Center).unwrap();
+    let cov = Spectrum::from_parts(
+      spec_cov.data().try_clone().unwrap(),
+      8,
+      2,
+      8,
+      WindowPad::Center,
+      false,
+    )
+    .unwrap();
+    // Request a covered interior slice: skip the uncovered head by using free
+    // istft as the oracle — if free istft accepts a given length, the cache must
+    // produce the identical samples; if it rejects, the cache must reject too.
+    for len in [Some(6usize), Some(8usize), Some(12usize), None] {
+      let free_res = istft(&cov, len);
+      let mut cache = ISTFTCache::new();
+      let cached_res = cache.istft(&cov, len);
+      match (free_res, cached_res) {
+        (Ok(f), Ok(c)) => {
+          let fv = to_vec(&f);
+          let cv = to_vec(&c);
+          assert_eq!(fv.len(), cv.len(), "len={len:?} length mismatch");
+          for (i, (a, b)) in fv.iter().zip(cv.iter()).enumerate() {
+            assert!(
+              (a - b).abs() < 1e-6,
+              "center=false covered ISTFTCache vs istft[{i}] (len={len:?}): {a} vs {b}"
+            );
+          }
+        }
+        (Err(_), Err(_)) => { /* both reject — consistent */ }
+        (f, c) => panic!("center=false len={len:?}: free and cache DISAGREE: {f:?} vs {c:?}"),
+      }
+    }
+  }
+
   // ---- normalize_peak (hand-traced vs reference) ------------------------
 
   #[test]
@@ -5058,5 +5285,47 @@ mod tests {
       normalize_peak(&data, f64::INFINITY),
       Err(Error::Backend { .. })
     ));
+  }
+
+  #[test]
+  fn normalize_peak_rejects_overflowing_gain_from_finite_input() {
+    // A FINITE `target_peak_db` can still drive the gain non-finite. These must
+    // be rejected (not silently emit `inf` / `NaN` samples), per the f32
+    // finiteness guards on `target_linear` and `gain`.
+    let data = Array::from_slice::<f32>(&[0.5, -0.25, 0.1], &[3]).unwrap();
+
+    // Huge target_peak_db: 10^(1e30/20) overflows f32 → target_linear == +inf.
+    assert!(
+      matches!(normalize_peak(&data, 1e30), Err(Error::Backend { .. })),
+      "huge finite target_peak_db must be rejected (target_linear overflows f32)"
+    );
+
+    // A subnormal nonzero peak with a moderate target: target_linear is finite
+    // but `target_linear / current_peak` overflows to +inf. f32::MIN_POSITIVE
+    // (~1.18e-38) is the smallest normal positive; a *subnormal* nonzero peak is
+    // even smaller, so 1.0 / peak overflows.
+    let tiny = f32::from_bits(1); // smallest positive subnormal (~1.4e-45)
+    assert!(
+      tiny > 0.0 && tiny.is_finite(),
+      "tiny must be a finite nonzero"
+    );
+    let subnormal_peak = Array::from_slice::<f32>(&[tiny, 0.0, -tiny], &[3]).unwrap();
+    assert!(
+      matches!(
+        normalize_peak(&subnormal_peak, 0.0),
+        Err(Error::Backend { .. })
+      ),
+      "subnormal nonzero peak that overflows the gain must be rejected"
+    );
+
+    // Sanity: a normal dBFS target on a normal-magnitude peak still succeeds and
+    // stays finite (the guards only fire on genuine overflow).
+    let ok = normalize_peak(&data, -3.0).unwrap();
+    for v in to_vec(&ok) {
+      assert!(
+        v.is_finite(),
+        "normal target must keep samples finite, got {v}"
+      );
+    }
   }
 }

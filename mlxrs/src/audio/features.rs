@@ -80,6 +80,16 @@ const KALDI_FBANK_LOG_FLOOR: f32 = 1e-8;
 /// is the same generous ceiling [`crate::audio::dsp::stft`] uses.
 const MAX_FBANK_WORK: usize = 64 * 1024 * 1024;
 
+/// Hard ceiling on [`compute_deltas_kaldi`]'s `win_length`. Delta windows are
+/// tiny in practice — Kaldi's default is `5`, and even acceleration / wide
+/// regression windows stay well under a few hundred. A large odd `win_length`
+/// drives the per-offset shifted-slice loop (`win_length` strided slices) and
+/// the symmetric `n = win_length / 2` boundary pad, so an unbounded value would
+/// stall the CPU / blow memory long before the element cap engages on a tiny
+/// input. `1024` is far above any realistic delta window while keeping the
+/// padded-extent and slice-count work bounded.
+const MAX_DELTA_WIN_LENGTH: usize = 1024;
+
 /// Convert Hz to the Kaldi mel scale: `1127 * ln(1 + hz / 700)`.
 ///
 /// Faithful port of `mlx_audio.dsp.mel_scale_kaldi` (`dsp.py:762`). Unlike
@@ -1139,8 +1149,14 @@ pub enum DeltaPadMode {
 ///     the reference's `n = (win_length - 1) // 2` silently truncates an even
 ///     `win_length` to the next-lower odd window, which we reject rather than
 ///     silently reinterpret),
-///   - the flattened feature count `total / time` or the element count
-///     `total` exceeds the internal `MAX_FBANK_WORK` cap (~64 Mi elements),
+///   - `win_length` exceeds the small supported maximum (`1024`; delta windows
+///     are tiny in practice — the default is `5` — and a huge window drives the
+///     boundary pad / shifted-slice work into a CPU stall on a tiny input),
+///   - the element count `total` (== `num_features * time`) **or** the padded
+///     element count `num_features * (time + 2n)` exceeds the internal
+///     `MAX_FBANK_WORK` cap (~64 Mi elements) — the padded count is checked
+///     BEFORE any pad / broadcast / concatenate so a tiny input with a large
+///     `win_length` cannot allocate the bookends first,
 ///   - the padded time extent `time + 2n` overflows `usize` / `i32`.
 /// - Propagates errors from the underlying slice / pad / concatenate ops.
 pub fn compute_deltas_kaldi(
@@ -1161,6 +1177,20 @@ pub fn compute_deltas_kaldi(
       message: format!(
         "compute_deltas_kaldi: win_length must be odd (got {win_length}); an even \
          win_length would silently truncate to the next-lower odd window"
+      ),
+    });
+  }
+  // Cap `win_length` to a small supported bound BEFORE any work. A huge odd
+  // `win_length` drives both the symmetric `n = win_length / 2` boundary pad
+  // (which broadcasts two `(num_features, n)` bookends and concatenates) and
+  // the per-offset shifted-slice loop (`win_length` strided slices) — for a
+  // tiny input that work explodes long before the element-count cap engages.
+  // Delta windows are tiny in practice (Kaldi default 5), so reject early.
+  if win_length > MAX_DELTA_WIN_LENGTH {
+    return Err(Error::Backend {
+      message: format!(
+        "compute_deltas_kaldi: win_length {win_length} exceeds the supported maximum \
+         {MAX_DELTA_WIN_LENGTH} (delta windows are tiny — the default is 5)"
       ),
     });
   }
@@ -1193,10 +1223,45 @@ pub fn compute_deltas_kaldi(
 
   let n = (win_length - 1) / 2;
   // denom = n*(n+1)*(2n+1)/3 == Σ_{k=-n}^{n} k² (the reference's `denom`).
-  // `win_length <= total <= MAX_FBANK_WORK` (~64 Mi) ⇒ `n <= 32 Mi`, so the
-  // product `n*(n+1)*(2n+1)` fits comfortably in u64 / f64 without overflow.
+  // `win_length <= MAX_DELTA_WIN_LENGTH` (1024) ⇒ `n <= 511`, so the product
+  // `n*(n+1)*(2n+1)` fits comfortably in u64 / f64 without overflow.
   let denom = (n as f64 * (n + 1) as f64 * (2 * n + 1) as f64) / 3.0;
   let denom_f32 = denom as f32;
+
+  // Padded time extent `time + 2n`, the width of the buffer the pad/broadcast
+  // step below materializes (and the slice bound for the accumulation). Compute
+  // it and cap the PADDED work `num_features * padded_time` BEFORE any pad /
+  // broadcast / concatenate: the original-element cap above only bounds
+  // `num_features * time`, but `Edge` mode broadcasts two `(num_features, n)`
+  // bookends and `Constant` mode pads by `n` on each side, so a tiny input with
+  // a large (but still capped) `win_length` would otherwise allocate
+  // `num_features * (time + 2n)` elements unchecked. `win_length` is already
+  // bounded above (so `n <= 511`), but a large `num_features` × that pad can
+  // still exceed the budget — reject here, before allocating.
+  let padded_time = time.checked_add(2 * n).ok_or_else(|| Error::Backend {
+    message: format!(
+      "compute_deltas_kaldi: padded time time + 2n overflows usize (time={time}, n={n})"
+    ),
+  })?;
+  let padded_work = num_features
+    .checked_mul(padded_time)
+    .ok_or_else(|| Error::Backend {
+      message: format!(
+        "compute_deltas_kaldi: padded work num_features * (time + 2n) overflows usize \
+         (num_features={num_features}, padded_time={padded_time})"
+      ),
+    })?;
+  if padded_work > MAX_FBANK_WORK {
+    return Err(Error::Backend {
+      message: format!(
+        "compute_deltas_kaldi: padded element count {padded_work} (num_features={num_features} \
+         * (time + 2n)={padded_time}) exceeds the {MAX_FBANK_WORK} work cap"
+      ),
+    });
+  }
+  let _padded_time_i32 = i32::try_from(padded_time).map_err(|_| Error::Backend {
+    message: format!("compute_deltas_kaldi: padded time {padded_time} exceeds i32::MAX"),
+  })?;
 
   // Flatten to `(num_features, time)` (the reference's `reshape(-1, time)`).
   let num_features_i32 = i32::try_from(num_features).map_err(|_| Error::Backend {
@@ -1238,17 +1303,6 @@ pub fn compute_deltas_kaldi(
       ops::shape::concatenate(&[&pad_left, &flat, &pad_right], 1)?
     }
   };
-
-  // Padded time extent `time + 2n`, used as the slice bound. Checked so a
-  // (capped but still large) input near i32::MAX can't wrap.
-  let padded_time = time.checked_add(2 * n).ok_or_else(|| Error::Backend {
-    message: format!(
-      "compute_deltas_kaldi: padded time time + 2n overflows usize (time={time}, n={n})"
-    ),
-  })?;
-  let _padded_time_i32 = i32::try_from(padded_time).map_err(|_| Error::Backend {
-    message: format!("compute_deltas_kaldi: padded time {padded_time} exceeds i32::MAX"),
-  })?;
 
   // Accumulate `d += k * padded[:, n + k : n + k + time]` for k in -n..=n.
   // `k = 0` contributes nothing (weight 0), so skip it. The shifted slice for
@@ -2405,6 +2459,61 @@ mod tests {
       compute_deltas_kaldi(&x, 4, DeltaPadMode::Edge),
       Err(Error::Backend { .. })
     ));
+  }
+
+  #[test]
+  fn compute_deltas_kaldi_rejects_huge_win_length_on_tiny_input() {
+    // A 1-element specgram (shape `(1,)`) with a HUGE odd `win_length` must be
+    // rejected with a recoverable error BEFORE any pad / broadcast / slice loop
+    // — the original-element cap alone (total == 1) would not catch it, so an
+    // unbounded `win_length` could OOM / stall the CPU. Both `Edge` (broadcasts
+    // two `(num_features, n)` bookends) and `Constant` (pads by `n`) must reject.
+    let x = Array::from_slice::<f32>(&[1.0], &[1]).unwrap();
+    let huge = 4_000_001_usize; // huge AND odd
+    assert!(!huge.is_multiple_of(2), "win_length must be odd");
+    for mode in [DeltaPadMode::Edge, DeltaPadMode::Constant] {
+      assert!(
+        matches!(
+          compute_deltas_kaldi(&x, huge, mode),
+          Err(Error::Backend { .. })
+        ),
+        "huge win_length on a 1-element input must be rejected ({mode:?})"
+      );
+    }
+
+    // A normal win_length=5 still works on the same tiny input (n=2 pad,
+    // padded extent 1 + 4 = 5; all-edge replication of the single value → the
+    // shifted differences cancel, delta == 0). The point is it does NOT error.
+    let ok = compute_deltas_kaldi(&x, 5, DeltaPadMode::Edge).unwrap();
+    assert_eq!(ok.shape(), vec![1], "shape preserved for the tiny input");
+    let got = to_vec(&ok);
+    assert!(
+      got[0].abs() < F32_TOL,
+      "single-value edge-padded delta should be 0, got {}",
+      got[0]
+    );
+  }
+
+  #[test]
+  fn compute_deltas_kaldi_rejects_padded_work_over_cap() {
+    // A normal small `win_length` whose padded extent still pushes
+    // `num_features * (time + 2n)` past `MAX_FBANK_WORK` must be rejected by the
+    // pre-pad padded-work cap. Build a shape whose `num_features * time` is
+    // UNDER the cap but `num_features * (time + 2n)` is OVER it. With time=1,
+    // win_length=5 (n=2): padded_time = 1 + 4 = 5, so num_features * 5 > cap
+    // while num_features * 1 <= cap. num_features = MAX_FBANK_WORK gives
+    // total = MAX_FBANK_WORK (passes) but padded = 5 * MAX_FBANK_WORK (fails).
+    // Use `Array::zeros` (lazy — no host buffer materialized for the check).
+    let num_features = MAX_FBANK_WORK; // total == num_features * 1 == cap (ok)
+    let nf_i32 = i32::try_from(num_features).unwrap();
+    let x = Array::zeros::<f32>(&[nf_i32, 1]).unwrap();
+    assert!(
+      matches!(
+        compute_deltas_kaldi(&x, 5, DeltaPadMode::Edge),
+        Err(Error::Backend { .. })
+      ),
+      "padded work exceeding the cap must be rejected before allocating"
+    );
   }
 
   // ---- strided_frames_no_snip_edges (boundary values, hand-traced) ------
