@@ -33,7 +33,7 @@ tokenizer-tools      = ["tokenizer-config", "dep:serde_json"]                   
 # umbrellas (compose only)
 embeddings           = ["tokenizer", "dep:smol_str", "dep:memspan"]                 # encode/decode (tokenizers crate) + `1_Pooling/config.json` parsing (HAND-ROLLED strict-JSON scanner per EMB-1; NO DIRECT `mlxrs::dep:serde_json` — `tokenizers v0.23` still pulls `serde_json` transitively for its `tokenizer.json` parse, so `embeddings` BUILDS but does not OWN `serde_json` after EMB-1. `tokenizer-config`/`tokenizer-bpe`/`tokenizer-spm`/`tokenizer-tools` continue to pull it directly). `smol_str` inlines short keys/values (≤23 bytes) into the JVal payload. `memspan` SIMD-accelerates `skip_ws` (AVX2/AVX-512/NEON dispatch) and the per-string `skip-until-quote-or-backslash` chunk scan, plus enables a no-escape fast path that copies the source slice directly into SmolStr with zero intermediate Vec.
 lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm", "tokenizer-bpe", "tokenizer-chat", "tokenizer-deepseek-v32", "tokenizer-tools"]
-vlm                  = ["lm", "dep:image", "dep:fast_image_resize"]
+vlm                  = ["lm", "dep:image"]
 audio                = ["lm", "dep:symphonia"] # mirrors mlx-audio's Python dep on mlx-lm; symphonia = WAV codec for audio::io. The always-compiled `mlxrs::simd` module accelerates the integrated_loudness sum-of-squares (NEON on aarch64, scalar fallback elsewhere) — no feature gate needed.
 unstable-ops-overload = []               # `&a + &b` etc. (panic on shape error). OFF by default.
 gguf                 = []                                                          # GGUF load/save (mlx-c `mlx_io_gguf*`). OFF: mlxrs-sys does not yet link gguflib.
@@ -77,14 +77,15 @@ jiff = { version = "0.2", optional = true }
 # `feedback_no_dependency_pinning` (crates.io current major is 0.25.x,
 # verified 0.25.10) — never an exact `=` pin.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
-# SIMD-accelerated resize — 5-15x faster than `image::imageops::resize` on
-# the same algorithms (bilinear/bicubic/lanczos3). Decode-side stays on
-# `image` (above); the resize hot path uses `fast_image_resize` because
-# resize dominates VLM preprocessing per-image cost (224x224 to 768x768+
-# source images, hot per inference). Pure-Rust, no system deps, used by
-# wgpu / kornia-rs and other production Rust CV stacks. Loose semver
-# ("6") per [[feedback_no_dependency_pinning]].
-fast_image_resize = { version = "6", optional = true }
+# NOTE: the resize hot path is OWNED by mlxrs (`src/vlm/resize.rs`), NOT a
+# third-party crate. The former `fast_image_resize` dependency was dropped
+# because its internal scratch (coefficient tables, per-row work buffers)
+# allocated INFALLIBLY inside the crate — and `vlm::image::resize`'s target
+# dimensions flow from an untrusted loaded `preprocessor_config.json`, so a
+# hostile-but-under-cap target could `abort()` the process despite our
+# `Result`. The own kernel is fully `try_reserve_exact`-fallible, NEON-
+# accelerated on aarch64 (scalar fallback always compiled), and bit-exact
+# with PIL `Image.resize` (the reference mlx-vlm preprocessing expects).
 # Multi-format audio decoder (pure-Rust, actively maintained; WAV+PCM
 # today, MP3/FLAC/OGG/etc. become opt-in via additional feature flags in
 # future PRs). `default-features = false` keeps the dep tree minimal —

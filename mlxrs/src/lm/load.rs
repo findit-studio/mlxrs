@@ -316,58 +316,15 @@ fn collect_sorted(dir: &Path, pred: impl Fn(&str) -> bool) -> Result<Vec<std::pa
 /// and is **not** rewritten — it carries the on-disk model-specific keys
 /// verbatim for a constructor's `Codable`-style init.
 pub fn load_config(dir: &Path) -> Result<(Config, String)> {
-  use std::io::Read;
-
   let path = dir.join("config.json");
-
-  #[cfg(unix)]
-  let file = {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-      .read(true)
-      .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-      .open(&path)
-      .map_err(|e| Error::Backend {
-        message: format!("cannot open model config {}: {e}", path.display()),
-      })?
-  };
-  #[cfg(not(unix))]
-  let file = std::fs::File::open(&path).map_err(|e| Error::Backend {
-    message: format!("cannot open model config {}: {e}", path.display()),
-  })?;
-
-  let meta = file.metadata().map_err(|e| Error::Backend {
-    message: format!("cannot stat opened model config {}: {e}", path.display()),
-  })?;
-  if !meta.is_file() {
+  let Some(text) = read_bounded_config_file(&path, "model config")? else {
     return Err(Error::Backend {
       message: format!(
-        "model config {} is not a regular file; refusing to read",
+        "cannot open model config {}: file not found",
         path.display()
       ),
     });
-  }
-
-  let mut bytes = Vec::new();
-  file
-    .take(MAX_CONFIG_BYTES + 1)
-    .read_to_end(&mut bytes)
-    .map_err(|e| Error::Backend {
-      message: format!("cannot read model config {}: {e}", path.display()),
-    })?;
-  if bytes.len() as u64 > MAX_CONFIG_BYTES {
-    return Err(Error::Backend {
-      message: format!(
-        "model config {} exceeds the {}-byte cap; refusing to read",
-        path.display(),
-        MAX_CONFIG_BYTES
-      ),
-    });
-  }
-
-  let text = String::from_utf8(bytes).map_err(|e| Error::Backend {
-    message: format!("model config {} is not valid UTF-8: {e}", path.display()),
-  })?;
+  };
   let mut config = Config::from_json(&text)?;
 
   // mlx-lm `utils.load_config`: a *truthy* `generation_config.json`
@@ -380,6 +337,90 @@ pub fn load_config(dir: &Path) -> Result<(Config, String)> {
   }
 
   Ok((config, text))
+}
+
+/// Bounded, TOCTOU-closed read of a config-style file at `path`.
+///
+/// Shared bounded-config-file primitive used by every config-JSON reader in
+/// the loader (`config.json`, `generation_config.json`,
+/// `(pre)processor_config.json`, VLM base-config). Behavior:
+///
+/// - `Ok(Some(text))` on a successful, bounded, valid-UTF-8 read.
+/// - `Ok(None)` if the file is absent (`ENOENT`) — the caller's "try the
+///   next candidate" / "absent is OK" signal. The caller decides whether
+///   absence is a hard error (e.g. [`load_config`]) or simply *no override*
+///   (e.g. [`read_generation_eos`], the VLM processor-config fallback).
+/// - `Err(Error::Backend)` on every other failure (open failure other than
+///   `NotFound`, not a regular file, oversized, IO failure during read,
+///   non-UTF-8). Messages name the offending path and the `label` (one of
+///   `"model config"`, `"generation config"`, `"processor config"`, …).
+///
+/// Discipline mirrors `embeddings::config`'s pooling-config read: open
+/// **once** with `O_NONBLOCK | O_CLOEXEC` on unix (so a planted FIFO returns
+/// immediately and never hangs the loader), post-open `is_file()` fstat
+/// rejects non-regular targets even when reached via a symlink (HF Hub
+/// snapshot caches store these files as symlinks into `blobs/<hash>`, which
+/// is intentionally followed since the post-open stat enforces the
+/// guarantee on the *resolved* target), and the body is capped at
+/// [`MAX_CONFIG_BYTES`] via `Read::take` so a hostile model directory
+/// cannot OOM us by planting a huge config.
+pub(crate) fn read_bounded_config_file(path: &Path, label: &str) -> Result<Option<String>> {
+  use std::io::Read;
+
+  #[cfg(unix)]
+  let open_result = {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+      .read(true)
+      .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+      .open(path)
+  };
+  #[cfg(not(unix))]
+  let open_result = std::fs::File::open(path);
+
+  let file = match open_result {
+    Ok(f) => f,
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    Err(e) => {
+      return Err(Error::Backend {
+        message: format!("cannot open {label} {}: {e}", path.display()),
+      });
+    }
+  };
+
+  let meta = file.metadata().map_err(|e| Error::Backend {
+    message: format!("cannot stat opened {label} {}: {e}", path.display()),
+  })?;
+  if !meta.is_file() {
+    return Err(Error::Backend {
+      message: format!(
+        "{label} {} is not a regular file; refusing to read",
+        path.display()
+      ),
+    });
+  }
+
+  let mut bytes = Vec::new();
+  file
+    .take(MAX_CONFIG_BYTES + 1)
+    .read_to_end(&mut bytes)
+    .map_err(|e| Error::Backend {
+      message: format!("cannot read {label} {}: {e}", path.display()),
+    })?;
+  if bytes.len() as u64 > MAX_CONFIG_BYTES {
+    return Err(Error::Backend {
+      message: format!(
+        "{label} {} exceeds the {}-byte cap; refusing to read",
+        path.display(),
+        MAX_CONFIG_BYTES
+      ),
+    });
+  }
+
+  let text = String::from_utf8(bytes).map_err(|e| Error::Backend {
+    message: format!("{label} {} is not valid UTF-8: {e}", path.display()),
+  })?;
+  Ok(Some(text))
 }
 
 /// The *truthy* `eos_token_id` override from optional
@@ -395,44 +436,25 @@ pub fn load_config(dir: &Path) -> Result<(Config, String)> {
 /// cannot hang or OOM the loader. [`load_config`] writes this back into the
 /// returned `Config.eos_token_id` (exactly Python's in-place overwrite) so
 /// the returned config and the tokenizer's eos set always agree.
-fn read_generation_eos(dir: &Path) -> Option<EosTokenId> {
-  use std::io::Read;
-
+///
+/// `pub(crate)` so the [`crate::vlm::load`] base-config reader applies the
+/// same override through the same code path (mlx-vlm's `load_config` has
+/// the identical generation-config block — `mlx_vlm/utils.py:506-515`).
+pub(crate) fn read_generation_eos(dir: &Path) -> Option<EosTokenId> {
   let path = dir.join("generation_config.json");
 
-  #[cfg(unix)]
-  let Ok(file) = ({
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-      .read(true)
-      .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-      .open(&path)
-  }) else {
-    return None;
-  };
-  #[cfg(not(unix))]
-  let Ok(file) = std::fs::File::open(&path) else {
-    return None;
-  };
-
-  match file.metadata() {
-    Ok(m) if m.is_file() => {}
-    _ => return None,
-  }
-
-  let mut bytes = Vec::new();
-  if file
-    .take(MAX_CONFIG_BYTES + 1)
-    .read_to_end(&mut bytes)
-    .is_err()
-    || bytes.len() as u64 > MAX_CONFIG_BYTES
-  {
-    return None;
-  }
-
-  let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-    return None;
-  };
+  // mlx-lm's `except json.JSONDecodeError: pass` is widened here: any
+  // bounded-read failure (absent, non-regular, oversized, IO failure,
+  // non-UTF-8) AND any subsequent JSON-parse failure collapses to `None`,
+  // since this is optional metadata — exactly the Python `except: pass`
+  // semantics. The bounded-read primitive itself enforces the hardening
+  // (FIFO/oversized/non-regular rejection happens BEFORE we ever try to
+  // parse, so a planted FIFO cannot hang here even though we ignore the
+  // resulting error).
+  let bytes = read_bounded_config_file(&path, "generation config")
+    .ok()
+    .flatten()?;
+  let v = serde_json::from_str::<serde_json::Value>(&bytes).ok()?;
   match v.get("eos_token_id") {
     // mlx-lm overwrites only when truthy (`if eos_token_id := ...`): a
     // scalar `0` is falsy → `None`; a NON-empty list is truthy regardless
@@ -499,7 +521,23 @@ pub fn load(dir: &Path) -> Result<(Config, Weights, crate::tokenizer::Tokenizer)
 /// path. A tokenizer-load failure is a recoverable [`Error::Backend`] naming
 /// the directory.
 pub fn load_tokenizer(dir: &Path, config: &Config) -> Result<crate::tokenizer::Tokenizer> {
-  let resolved_eos = config.eos_token_id.clone().map(EosTokenId::into_ids);
+  load_tokenizer_with_eos(dir, config.eos_token_id.as_ref())
+}
+
+/// Build the #18 [`Tokenizer`](crate::tokenizer::Tokenizer) from `dir`,
+/// given the already-resolved [`EosTokenId`] (mirroring `TokenizerWrapper`'s
+/// `eos_token_ids`: if `Some(ids)` it REPLACES the tokenizer-config default
+/// entirely; `None` ⇒ the tokenizer's own `eos_token`). The single
+/// `eos_token_ids`-aware tokenizer-build primitive every loader funnels
+/// through — both [`load_tokenizer`] (which reads it off [`Config`]) and
+/// the [`crate::vlm::load`] base-config loader (whose minimal
+/// `VlmBaseConfig` carries the same `eos_token_id`) call this so the eos
+/// resolution stays uniform across LM and VLM.
+pub fn load_tokenizer_with_eos(
+  dir: &Path,
+  eos_token_id: Option<&EosTokenId>,
+) -> Result<crate::tokenizer::Tokenizer> {
+  let resolved_eos = eos_token_id.cloned().map(EosTokenId::into_ids);
   crate::tokenizer::Tokenizer::from_path(dir, resolved_eos.as_deref()).map_err(|e| Error::Backend {
     message: format!("cannot load tokenizer from {}: {e}", dir.display()),
   })

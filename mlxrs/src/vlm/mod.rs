@@ -8,6 +8,14 @@
 //! `mlx-vlm/models/` — only the cross-model support surface lives here.
 //!
 //! ## Submodules
+//! - [`crate::vlm::load`] — local VLM **load factory** + a
+//!   (`model_type`, `processor_class`) → constructor registry pair,
+//!   the VLM analog of [`crate::lm::factory`]. Reads the model's
+//!   `config.json` once, the VLM processor config
+//!   (`preprocessor_config.json` preferred, `processor_config.json`
+//!   fallback) once, validates both registries early, then loads
+//!   weights / tokenizer / constructs model + processor. Local-only;
+//!   no Hugging Face Hub download.
 //! - [`image`] — core image preprocessing primitives ported 1:1 from
 //!   `mlx-swift-lm`'s `Libraries/MLXVLM/MediaProcessing.swift`
 //!   (load / resize / channel-extract / rescale / normalize / patchify
@@ -27,8 +35,20 @@
 //!   generation Iterator, ported from `mlx-vlm/mlx_vlm/generate.py::
 //!   generate_step` (preprocess images → vision encode → embed merge →
 //!   prefill via `forward_embeddings` → per-token decode via `forward`).
+//! - [`crate::vlm::video`] — model-agnostic video *preprocessing* math
+//!   ported from `mlx-vlm/mlx_vlm/video_generate.py` (`smart_resize`,
+//!   `smart_nframes`, frame-index sampling, and a `process_frames` that
+//!   reuses [`image::preprocess`](crate::vlm::image::preprocess) per
+//!   frame + stacks). **Container
+//!   decoding (mp4 → frames) is intentionally NOT here** — it needs a
+//!   codec dependency and is a documented follow-up; this module ports
+//!   the portable sampling + resize + prep arithmetic and takes
+//!   caller-decoded frames.
 
 pub mod generate;
 pub mod image;
+pub mod load;
 pub mod model;
 pub mod prompt;
+pub(crate) mod resize;
+pub mod video;

@@ -41,9 +41,10 @@ single_use_lifetimes = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = [
   'cfg(all_tests)',
   'cfg(tarpaulin)',
-  # `mlxrs::simd` force-scalar escape: `RUSTFLAGS="--cfg mlxrs_force_scalar"`
-  # routes the SIMD dispatchers through the scalar path on a NEON-capable
-  # host (regression bisection / exotic-target builds).
+  # Force-scalar escape: `RUSTFLAGS="--cfg mlxrs_force_scalar"` routes BOTH
+  # the `mlxrs::simd` (loudness) and `vlm::resize` NEON dispatchers through
+  # the scalar path on a NEON-capable host (regression bisection / exotic
+  # targets).
   'cfg(mlxrs_force_scalar)',
 ] }
 

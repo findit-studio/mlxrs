@@ -38,8 +38,11 @@
 //!    `num_tokens_per_image == 0`) errors here BEFORE any image is
 //!    loaded / preprocessed / encoded.
 //! 2. *Preprocess + encode images.* For each path in `images`,
-//!    `vlm::image::load_image(path) → preprocess(…, &model.image_processor_config())`
-//!    yields `[H, W, 3]` f32; `model.encode_image(image)` lifts each into
+//!    `vlm::image::load_image(path) → preprocess(…, image_processor_config)`
+//!    — using the caller-supplied [`crate::vlm::image::ImageProcessorConfig`]
+//!    (the loaded processor's config, mirroring mlx-vlm `generate(model,
+//!    processor, …)`), NOT one re-derived from the model — yields
+//!    `[H, W, 3]` f32; `model.encode_image(image)` lifts each into
 //!    `[N_i, D]` vision-encoder embeddings. Each `encode_image` call
 //!    is validated to return EXACTLY `[num_tokens_per_image, D]` rows
 //!    — a model with variable-per-image counts must pad/truncate
@@ -107,7 +110,7 @@ use crate::{
   },
   ops,
   vlm::{
-    image::{load_image, preprocess},
+    image::{ImageProcessorConfig, load_image, preprocess},
     model::Model,
     prompt::{MarkerPolicy, insert_image_tokens},
   },
@@ -153,19 +156,46 @@ pub struct VlmGenConfig {
 
 /// End-to-end multimodal generation Iterator.
 ///
-/// Loads each image, preprocesses it via
-/// [`Model::image_processor_config`], encodes via [`Model::encode_image`],
+/// Loads each image, preprocesses it via the caller-supplied
+/// `image_processor_config`, encodes via [`Model::encode_image`],
 /// embeds the prompt via [`Model::embed_tokens`], splices the image
 /// features into the text embeds via [`Model::merge_embeddings`], runs
 /// the prefill via [`crate::lm::model::Model::forward_embeddings`], then
 /// dispatches the per-token decode (same per-step order as
 /// [`crate::lm::generate`]) via [`crate::lm::model::Model::forward`].
 ///
+/// **The image-preprocessing config is an explicit parameter, not derived
+/// from the model.** mlx-vlm's `generate` / `generate_step` take the
+/// `processor` separately from the `model` (`generate.py:1183`, `:966` —
+/// `generate(model, processor, …)`): a VLM loaded via
+/// [`crate::vlm::load::load`] returns a [`crate::vlm::load::LoadedVlmContext`]
+/// whose [`processor`](crate::vlm::load::LoadedVlmContext::processor)
+/// carries the parsed `preprocessor_config.json` /
+/// `processor_config.json`. Pass that
+/// processor's [`image_processor_config`](crate::vlm::load::Processor::image_processor_config)
+/// here so real image prompts are preprocessed with the *loaded* config —
+/// `vlm_generate` deliberately does NOT call
+/// [`Model::image_processor_config`] itself (that would silently fall back
+/// to the trait default / a stale baked-in config when a loaded processor
+/// exists). A caller that only has a model and no separate processor can
+/// still pass `&model.image_processor_config()` explicitly.
+///
 /// Returns `impl Iterator<Item = Result<GenStep>> + 'a` — `impl` keeps the
 /// concrete iterator type unnamed (matching the LM-side
 /// [`crate::lm::generate::stream_generate`] shape so a future text-only
 /// fallback can drop in without an API break). Borrows `&'a M` plus owns
 /// the cache, so no aliasing of the model across the borrow.
+///
+/// `M: Model + ?Sized` — the loop only ever touches the model behind the
+/// `&'a M` borrow (`model.embed_tokens(...)`, `model.encode_image(...)`,
+/// `model.forward*(...)`), never by value and never via a
+/// `Sized`-requiring associated item. `M` may therefore be an unsized
+/// trait object: a deref-coerced `Box<dyn VlmModel>` — the exact handle
+/// the load factory returns ([`crate::vlm::load::LoadedVlmContext::model`])
+/// — drives generation directly without a forwarding shim. The
+/// zero-image passthrough hands the same `&'a M` to
+/// [`crate::lm::generate::generate_step`], which is likewise
+/// `?Sized`-generic (and accepts it because `VlmModel: Model`).
 ///
 /// **Zero-image passthrough**: when `images.is_empty()`, the function
 /// dispatches directly to [`crate::lm::generate::generate_step`] (the
@@ -194,8 +224,9 @@ pub struct VlmGenConfig {
 ///
 /// - sampler / logits-processor construction failure
 /// - any per-step forward / sample failure
-pub fn vlm_generate<'a, M: Model>(
+pub fn vlm_generate<'a, M: Model + ?Sized>(
   model: &'a M,
+  image_processor_config: &ImageProcessorConfig,
   text_tokens: &[u32],
   images: &[PathBuf],
   cache: Vec<Box<dyn KvCache>>,
@@ -322,11 +353,23 @@ pub fn vlm_generate<'a, M: Model>(
   // marker-to-image misalignment (the first prompt span would consume
   // 2 rows from image 1 plus 1 row from image 2). Surface as
   // `Error::ShapeMismatch` instead.
-  let processor_cfg = model.image_processor_config();
+  //
+  // Image preprocessing uses the caller-supplied `image_processor_config`
+  // — NOT `model.image_processor_config()`. mlx-vlm's `generate` /
+  // `generate_step` receive the `processor` separately from the `model`
+  // (`generate.py:1183`, `:966` — `generate(model, processor, …)`); a VLM
+  // loaded via [`crate::vlm::load::load`] carries a `Box<dyn Processor>`
+  // whose [`crate::vlm::load::Processor::image_processor_config`] reflects
+  // the parsed `preprocessor_config.json` / `processor_config.json`. The
+  // generation entry point therefore must NOT silently re-derive the
+  // preprocessing params from the model (which would fall back to the
+  // trait default / a stale baked-in config); the caller passes the
+  // processor's config explicitly. A caller that only has a model can
+  // still pass `&model.image_processor_config()`.
   let mut image_slabs: Vec<Array> = try_with_capacity(images.len())?;
   for (idx, path) in images.iter().enumerate() {
     let img = load_image(path)?;
-    let pre = preprocess(&img, &processor_cfg)?;
+    let pre = preprocess(&img, image_processor_config)?;
     let encoded = model.encode_image(&pre)?;
     let enc_shape = encoded.shape();
     let (rows, _d) = match enc_shape.as_slice() {
@@ -472,7 +515,7 @@ pub fn vlm_generate<'a, M: Model>(
 /// pattern (its `step` is `&mut self`; we use `&self + RefCell` because
 /// the prefill / decode branches share the same step body and one borrow
 /// scope keeps the code linear).
-struct VlmDecode<'a, M: Model> {
+struct VlmDecode<'a, M: Model + ?Sized> {
   model: &'a M,
   cache: RefCell<Vec<Box<dyn KvCache>>>,
   sampler: RefCell<Sampler>,
@@ -527,7 +570,7 @@ struct VlmDecode<'a, M: Model> {
   done: bool,
 }
 
-impl<M: Model> VlmDecode<'_, M> {
+impl<M: Model + ?Sized> VlmDecode<'_, M> {
   /// Sample one token from `logits` (`[1, V]`) using the sampler and the
   /// configured logits processors. Mirrors the post-forward portion of
   /// [`crate::lm::generate::Generator::step`] (steps 3–6 in that file's
@@ -778,7 +821,7 @@ impl<M: Model> VlmDecode<'_, M> {
   }
 }
 
-impl<M: Model> Iterator for VlmDecode<'_, M> {
+impl<M: Model + ?Sized> Iterator for VlmDecode<'_, M> {
   type Item = Result<GenStep>;
 
   fn next(&mut self) -> Option<Self::Item> {

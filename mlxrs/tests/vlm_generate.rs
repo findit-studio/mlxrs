@@ -349,6 +349,7 @@ fn vlm_generate_pipeline_smoke() {
   let prompt = [1_u32, 2, 99, 3, 4]; // marker run of len 1 → 1 image
   let it = vlm_generate(
     &model,
+    &model.image_processor_config(),
     &prompt,
     &[img],
     mock_cache(),
@@ -398,8 +399,15 @@ fn vlm_generate_zero_images_passthrough() {
   // touches forward_embeddings).
   let model = MockVlmModel::new(5, 4, 3);
   let prompt = [1_u32, 2, 3];
-  let it = vlm_generate(&model, &prompt, &[], mock_cache(), vlm_cfg(2, 3))
-    .expect("vlm_generate constructs in zero-image mode");
+  let it = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[],
+    mock_cache(),
+    vlm_cfg(2, 3),
+  )
+  .expect("vlm_generate constructs in zero-image mode");
 
   let mut tokens = Vec::new();
   for step in it {
@@ -437,8 +445,15 @@ fn vlm_generate_zero_image_preserves_logprobs() {
   // `collect_logprobs == false`, which is exactly the regression
   // surface: a default-cfg zero-image VLM run would otherwise return
   // `None` logprobs and break the documented "VLM always Some" contract.
-  let it = vlm_generate(&model, &prompt, &[], mock_cache(), vlm_cfg(2, 3))
-    .expect("vlm_generate constructs in zero-image mode");
+  let it = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[],
+    mock_cache(),
+    vlm_cfg(2, 3),
+  )
+  .expect("vlm_generate constructs in zero-image mode");
 
   let mut saw_step = false;
   for step in it {
@@ -471,6 +486,7 @@ fn vlm_generate_marker_required_missing_errors() {
   let prompt = [1_u32, 2, 3]; // no marker (99)
   let res = vlm_generate(
     &model,
+    &model.image_processor_config(),
     &prompt,
     &[img],
     mock_cache(),
@@ -543,8 +559,15 @@ fn vlm_generate_image_tokens_spliced_correctly() {
   let dir = temp_dir("splice_correct");
   let img = write_test_image(&dir, "img.png");
   let prompt = [1_u32, 2, 99, 3, 4];
-  let mut it = vlm_generate(&model, &prompt, &[img], mock_cache(), vlm_cfg(1, 3))
-    .expect("vlm_generate construction");
+  let mut it = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[img],
+    mock_cache(),
+    vlm_cfg(1, 3),
+  )
+  .expect("vlm_generate construction");
   it.next().expect("one step").expect("step ok");
 
   let shape = model.captured_shape.borrow().clone().expect("merge ran");
@@ -578,6 +601,7 @@ fn vlm_generate_two_images_concat_and_two_spans() {
   let prompt = [1_u32, 2, 99, 99, 3]; // marker run of len 2
   let mut it = vlm_generate(
     &model,
+    &model.image_processor_config(),
     &prompt,
     &[img1, img2],
     mock_cache(),
@@ -621,11 +645,18 @@ fn vlm_generate_uses_image_processor_config_override() {
   let dir = temp_dir("cfg_override");
   let img = write_test_image(&dir, "img.png");
   let prompt = [1_u32, 99, 2];
-  let _ = vlm_generate(&model, &prompt, &[img], mock_cache(), vlm_cfg(1, 3))
-    .expect("constructs")
-    .next()
-    .expect("step yields")
-    .expect("step ok");
+  let _ = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[img],
+    mock_cache(),
+    vlm_cfg(1, 3),
+  )
+  .expect("constructs")
+  .next()
+  .expect("step yields")
+  .expect("step ok");
   // The preprocess step resized to (16, 32) so encode_image saw a
   // [16, 32, 3] array.
   assert_eq!(model.encode_calls.borrow()[0], vec![16_usize, 32, 3]);
@@ -644,7 +675,14 @@ fn vlm_generate_encode_failure_propagates_synchronously() {
   let dir = temp_dir("encode_fail");
   let img = write_test_image(&dir, "img.png");
   let prompt = [1_u32, 99, 2];
-  let res = vlm_generate(&model, &prompt, &[img], mock_cache(), vlm_cfg(1, 3));
+  let res = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[img],
+    mock_cache(),
+    vlm_cfg(1, 3),
+  );
   match res {
     Ok(_) => panic!("expected Err on encode failure"),
     Err(e) => {
@@ -665,8 +703,15 @@ fn vlm_generate_forward_failure_yields_err_then_fuses() {
   let dir = temp_dir("forward_fail");
   let img = write_test_image(&dir, "img.png");
   let prompt = [1_u32, 99, 2];
-  let mut it = vlm_generate(&model, &prompt, &[img], mock_cache(), vlm_cfg(5, 3))
-    .expect("vlm_generate construction succeeds");
+  let mut it = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[img],
+    mock_cache(),
+    vlm_cfg(5, 3),
+  )
+  .expect("vlm_generate construction succeeds");
   // First step (prefill): uses forward_embeddings, succeeds.
   let s1 = it.next().expect("one step").expect("prefill step ok");
   assert_eq!(s1.token, 4);
@@ -686,8 +731,15 @@ fn vlm_generate_respects_max_tokens() {
   let img = write_test_image(&dir, "img.png");
   let prompt = [1_u32, 99, 2];
   // max_tokens = 7: expect 7 tokens.
-  let it =
-    vlm_generate(&model, &prompt, &[img], mock_cache(), vlm_cfg(7, 3)).expect("vlm_generate ok");
+  let it = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[img],
+    mock_cache(),
+    vlm_cfg(7, 3),
+  )
+  .expect("vlm_generate ok");
   let mut n_tokens = 0_usize;
   for step in it {
     step.expect("step ok");
@@ -706,7 +758,15 @@ fn vlm_generate_eos_stops_iteration() {
   let prompt = [1_u32, 99, 2];
   let mut cfg = vlm_cfg(10, 3);
   cfg.lm.eos = vec![4]; // argmax of ramp logits with vocab=5
-  let it = vlm_generate(&model, &prompt, &[img], mock_cache(), cfg).expect("vlm_generate ok");
+  let it = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[img],
+    mock_cache(),
+    cfg,
+  )
+  .expect("vlm_generate ok");
   let tokens: Vec<u32> = it.map(|r| r.expect("step ok").token).collect();
   // EOS token IS yielded (per `lm::generate` convention), then the
   // iterator fuses.
@@ -811,7 +871,15 @@ fn vlm_generate_distinct_marker_and_placeholder_ids() {
     num_tokens_per_image: 3,
     marker_policy: MarkerPolicy::Required,
   };
-  let mut it = vlm_generate(&model, &prompt, &[img], mock_cache(), cfg).expect("vlm_generate ok");
+  let mut it = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[img],
+    mock_cache(),
+    cfg,
+  )
+  .expect("vlm_generate ok");
   let s = it.next().expect("step").expect("ok");
   assert_eq!(s.token, 4);
   // After splice, T = 5 (1 + 3 + 1).
@@ -838,7 +906,15 @@ fn vlm_generate_advances_cache_across_prefill_and_decode() {
   // iterator owns it), so instead we observe the model's forward call
   // record: prefill = 1 call with embed shape [1, 7, D]; decode = 2
   // calls with token shape [1, 1].
-  let it = vlm_generate(&model, &prompt, &[img], cache, vlm_cfg(3, 3)).expect("ok");
+  let it = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[img],
+    cache,
+    vlm_cfg(3, 3),
+  )
+  .expect("ok");
   let n: usize = it.map(|r| r.is_ok() as usize).sum();
   assert_eq!(n, 3);
   // Per-layer cache offsets observed: 1 prefill (advances by 7) + 2
@@ -936,6 +1012,7 @@ fn vlm_generate_rejects_per_image_shape_mismatch() {
   let prompt = [1_u32, 99, 99, 2]; // marker run of len 2 → 2 images
   let res = vlm_generate(
     &model,
+    &model.image_processor_config(),
     &prompt,
     &[img1, img2],
     mock_cache(),
@@ -986,7 +1063,15 @@ fn vlm_generate_first_token_sees_prompt_history_in_logit_bias() {
     num_tokens_per_image: 3,
     marker_policy: MarkerPolicy::Required,
   };
-  let mut it = vlm_generate(&model, &prompt, &[img], mock_cache(), cfg).expect("vlm_generate ok");
+  let mut it = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[img],
+    mock_cache(),
+    cfg,
+  )
+  .expect("vlm_generate ok");
   let step = it.next().expect("step").expect("ok");
   // If processors had been skipped (old behavior), the argmax would
   // be 4 (vocab-1). With the fix, the logit_bias applies on the
@@ -1012,6 +1097,7 @@ fn vlm_generate_marker_missing_errors_before_any_image_work() {
   let prompt = [1_u32, 2, 3]; // no marker (99)
   let res = vlm_generate(
     &model,
+    &model.image_processor_config(),
     &prompt,
     &[img],
     mock_cache(),
@@ -1041,7 +1127,14 @@ fn vlm_generate_marker_count_mismatch_errors_before_any_image_work() {
   // Marker run of length 1 but 2 images supplied → insert_image_tokens
   // returns Err.
   let prompt = [1_u32, 99, 2];
-  let res = vlm_generate(&model, &prompt, &[img1, img2], mock_cache(), vlm_cfg(1, 3));
+  let res = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[img1, img2],
+    mock_cache(),
+    vlm_cfg(1, 3),
+  );
   assert!(res.is_err());
   assert_eq!(
     model.encode_calls.borrow().len(),
@@ -1089,7 +1182,15 @@ fn vlm_generate_span_aware_chunking_never_splits_image_span() {
     num_tokens_per_image: 3,
     marker_policy: MarkerPolicy::Required,
   };
-  let mut it = vlm_generate(&model, &prompt, &[img], mock_cache(), cfg).expect("vlm_generate ok");
+  let mut it = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[img],
+    mock_cache(),
+    cfg,
+  )
+  .expect("vlm_generate ok");
   let step = it.next().expect("step").expect("ok");
   assert_eq!(step.token, 4);
 
@@ -1186,7 +1287,15 @@ fn vlm_generate_threads_cache_offset_and_chunk_local_spans() {
     num_tokens_per_image: 3,
     marker_policy: MarkerPolicy::Required,
   };
-  let mut it = vlm_generate(&model, &prompt, &[img], mock_cache(), cfg).expect("vlm_generate ok");
+  let mut it = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[img],
+    mock_cache(),
+    cfg,
+  )
+  .expect("vlm_generate ok");
   it.next().expect("step").expect("ok");
 
   let cap = model.captured.borrow();
@@ -1247,7 +1356,15 @@ fn vlm_generate_single_chunk_when_prefill_step_size_ge_t() {
     num_tokens_per_image: 3,
     marker_policy: MarkerPolicy::Required,
   };
-  let mut it = vlm_generate(&model, &prompt, &[img], mock_cache(), cfg).expect("vlm_generate ok");
+  let mut it = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[img],
+    mock_cache(),
+    cfg,
+  )
+  .expect("vlm_generate ok");
   it.next().expect("step").expect("ok");
   let calls = model.forward_emb_calls.borrow().clone();
   assert_eq!(calls.len(), 1);
@@ -1279,7 +1396,15 @@ fn vlm_generate_max_tokens_zero_does_no_image_work() {
     num_tokens_per_image: 3,
     marker_policy: MarkerPolicy::Required,
   };
-  let mut it = vlm_generate(&model, &prompt, &[img], mock_cache(), cfg).expect("vlm_generate ok");
+  let mut it = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[img],
+    mock_cache(),
+    cfg,
+  )
+  .expect("vlm_generate ok");
   assert!(
     it.next().is_none(),
     "max_tokens=0 must yield an empty iterator"
@@ -1375,6 +1500,7 @@ fn vlm_generate_threads_per_request_spans_no_cross_iterator_pollution() {
 
   let mut it_a = vlm_generate(
     &model,
+    &model.image_processor_config(),
     &prompt_a,
     &[img_a],
     mock_cache(),
@@ -1383,6 +1509,7 @@ fn vlm_generate_threads_per_request_spans_no_cross_iterator_pollution() {
   .expect("iter A constructs");
   let mut it_b = vlm_generate(
     &model,
+    &model.image_processor_config(),
     &prompt_b,
     &[img_b],
     mock_cache(),
@@ -1424,8 +1551,15 @@ fn vlm_generate_forward_embeddings_multimodal_default_dispatches_to_lm() {
   let dir = temp_dir("default_dispatch");
   let img = write_test_image(&dir, "img.png");
   let prompt = [1_u32, 99, 2];
-  let mut it =
-    vlm_generate(&model, &prompt, &[img], mock_cache(), vlm_cfg(1, 3)).expect("vlm_generate ok");
+  let mut it = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[img],
+    mock_cache(),
+    vlm_cfg(1, 3),
+  )
+  .expect("vlm_generate ok");
   it.next().expect("step").expect("ok");
   // The default dispatch goes through the LM's `forward_embeddings`
   // (observed via `forward_emb_calls`); the mock never overrides
@@ -1467,7 +1601,15 @@ fn vlm_generate_does_not_build_unused_attention_mask() {
     num_tokens_per_image: 100,
     marker_policy: MarkerPolicy::Required,
   };
-  let mut it = vlm_generate(&model, &prompt, &[img], mock_cache(), cfg).expect("vlm_generate ok");
+  let mut it = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[img],
+    mock_cache(),
+    cfg,
+  )
+  .expect("vlm_generate ok");
   let step = it.next().expect("step").expect("ok");
   assert_eq!(step.token, 4);
   // Sanity: prefill embed shape was [1, 102, 4].
