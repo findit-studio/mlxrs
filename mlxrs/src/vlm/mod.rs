@@ -8,6 +8,11 @@
 //! `mlx-vlm/models/` — only the cross-model support surface lives here.
 //!
 //! ## Submodules
+//! - [`crate::vlm::feature_cache`] — an LRU cache of vision-encoder output
+//!   features keyed by image identity, ported 1:1 from
+//!   `mlx-vlm/mlx_vlm/vision_cache.py::VisionFeatureCache`. Lets a VLM
+//!   discussing the same image across multiple turns re-use the cached
+//!   embeddings instead of re-running the (expensive) vision encoder.
 //! - [`crate::vlm::load`] — local VLM **load factory** + a
 //!   (`model_type`, `processor_class`) → constructor registry pair,
 //!   the VLM analog of [`crate::lm::factory`]. Reads the model's
@@ -45,6 +50,7 @@
 //!   the portable sampling + resize + prep arithmetic and takes
 //!   caller-decoded frames.
 
+pub mod feature_cache;
 pub mod generate;
 pub mod image;
 pub mod load;
