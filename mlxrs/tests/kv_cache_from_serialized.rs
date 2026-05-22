@@ -130,9 +130,6 @@ impl KvCache for DefaultProbeCache {
   fn is_empty(&self) -> bool {
     true
   }
-  fn is_fresh(&self) -> bool {
-    unreachable!("DefaultProbeCache::is_fresh is not exercised")
-  }
   fn copy(&self) -> mlxrs::Result<Box<dyn KvCache>> {
     unreachable!("DefaultProbeCache::copy is not exercised")
   }

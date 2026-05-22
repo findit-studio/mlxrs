@@ -566,24 +566,6 @@ impl KvCache for ArraysCache {
     }
   }
 
-  /// Fresh iff **every** slot is empty (see [`KvCache::is_fresh`]).
-  ///
-  /// This deliberately differs from [`is_empty`](KvCache::is_empty), which
-  /// — faithful to mlx-lm `ArraysCache.empty()` (`cache.py:723-724`) —
-  /// checks **only slot 0**. A reused `ArraysCache` whose slot 0 was never
-  /// written but a *later* slot carries recurrent SSM state would report
-  /// `is_empty() == true` (and `offset()` is always `0` for this cache), so
-  /// an `offset()`/`is_empty()`-based freshness predicate would wrongly
-  /// pass it — the exact sparse-cache hole this method closes. Checking
-  /// `self.cache.iter().all(Option::is_none)` reports `false` whenever
-  /// *any* slot holds state. `left_padding` / `lengths` are transient
-  /// `prepare`/`advance` scratch (never serialized, mlx-lm keeps them out
-  /// of `state`/`meta_state`), so they are intentionally not part of the
-  /// predicate — only the genuine per-slot recurrent state is.
-  fn is_fresh(&self) -> bool {
-    self.cache.iter().all(Option::is_none)
-  }
-
   /// Deep, independent copy — mlx-lm `copy.deepcopy` / swift `copy()`
   /// (`KVCache.swift:1130-1139`: new `ArraysCache(size)`, copy state +
   /// `offset` + `leftPadding`; here `lengths` is carried too, matching

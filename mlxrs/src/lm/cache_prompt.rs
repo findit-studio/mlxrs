@@ -58,7 +58,7 @@ use crate::{
   array::Array,
   error::{Error, Result, try_with_capacity},
   lm::{
-    cache::{KvCache, save_prompt_cache},
+    cache::{CacheConfig, KvCache, make_prompt_cache, save_prompt_cache},
     model::Model,
   },
   tokenizer::Tokenizer,
@@ -230,41 +230,39 @@ fn prefill_full<M: Model>(
   Ok(())
 }
 
-/// Tokenize `prompt`, prefill `cache` with it, and save the populated cache
-/// (plus metadata) to `out_path` — the support-surface port of
+/// Tokenize `prompt`, prefill a freshly allocated cache with it, and save the
+/// populated cache (plus metadata) to `out_path` — the support-surface port of
 /// `mlx_lm.cache_prompt.main` (cache_prompt.py:83-145), minus the CLI.
 ///
 /// Mirrors the reference end to end:
 ///
 /// 1. **Tokenize** via `encode_prompt` (chat template when present, else
 ///    [`Tokenizer::encode`]) — cache_prompt.py:100-109.
-/// 2. **Prefill** the full prompt into `cache` via `prefill_full` (the
+/// 2. **Allocate** a fresh per-layer KV cache via
+///    [`crate::lm::cache::make_prompt_cache`] — exactly cache_prompt.py:111
+///    (`cache = make_prompt_cache(model, args.max_kv_size)`). The cache is
+///    *internally allocated*, never caller-provided, so it is fresh by
+///    construction: there is no prior-request state to leak.
+/// 3. **Prefill** the full prompt into that cache via `prefill_full` (the
 ///    `generate_step(max_tokens=0)` forward sequence; no sampling) —
 ///    cache_prompt.py:111-136. The empty-prompt case is rejected up front as
 ///    a recoverable [`Error::Backend`] (mlx-lm's `generate_step` raises
 ///    `ValueError` on an empty prompt; a prefill over zero tokens would be a
 ///    no-op saving an empty cache, so failing fast is the faithful behavior).
-///    A non-fresh `cache` (any layer that fails [`KvCache::is_fresh`] — cached
-///    tokens, populated SSM slots, or a non-fresh child) is likewise rejected
-///    up front — the prefill only appends, so a reused cache would persist a
-///    `[stale + new]` prefix.
-/// 3. **Save** the cache via [`crate::lm::cache::save_prompt_cache`] with the
+/// 4. **Save** the cache via [`crate::lm::cache::save_prompt_cache`] with the
 ///    metadata cache_prompt.py writes — `metadata["model"] = model_id` and
 ///    `metadata["tokenizer_config"] = tokenizer_config_json`
 ///    (cache_prompt.py:142-145). `extra_metadata` lets a caller add further
 ///    keys (e.g. an explicit processed-count) without altering the wire
 ///    format; the two reference keys take precedence on collision.
 ///
-/// `cache` is the caller-built per-layer KV cache
-/// ([`crate::lm::cache::make_prompt_cache`]) the model mutates in place — it
-/// must have one entry per decoder layer, exactly as the generation loop
-/// requires. It **must be fresh** (every layer [`KvCache::is_fresh`]): the
-/// prefill only appends, and the persisted cache must represent exactly this
-/// prompt, so a reused / pre-populated cache is rejected with a recoverable
-/// [`Error::Backend`] before any prefill or save (a reused cache would
-/// persist stale state and leak a prior request's context). It is borrowed
-/// `&mut` (advanced to offset `P`) and then saved; the caller still owns it
-/// afterwards (e.g. to keep generating from it).
+/// `cache_config` is the model-appropriate cache spec
+/// ([`crate::lm::cache::CacheConfig`] — `num_hidden_layers` and the optional
+/// `sliding_window`). In mlx-lm `make_prompt_cache(model)` reads this off the
+/// model object; mlxrs's [`Model`] trait carries no such introspection seam,
+/// so the spec is passed explicitly — `make_prompt_cache` then builds the
+/// matching cache (a [`crate::lm::cache::RotatingKvCache`] per layer for a
+/// sliding-window model, a [`crate::lm::cache::StandardKvCache`] otherwise).
 ///
 /// Returns a [`CachePromptInfo`] with the number of tokens processed (the
 /// reference's printed `processed` count / the cache's final offset). Any
@@ -275,7 +273,7 @@ pub fn cache_prompt<M: Model>(
   model: &M,
   tokenizer: &Tokenizer,
   prompt: &str,
-  cache: &mut [Box<dyn KvCache>],
+  cache_config: &CacheConfig,
   out_path: &std::path::Path,
   model_id: &str,
   tokenizer_config_json: &str,
@@ -287,7 +285,7 @@ pub fn cache_prompt<M: Model>(
   cache_prompt_ids(
     model,
     &prompt_ids,
-    cache,
+    cache_config,
     out_path,
     model_id,
     tokenizer_config_json,
@@ -301,27 +299,28 @@ pub fn cache_prompt<M: Model>(
 /// takes already-encoded ids, so a caller that has tokenized once need not
 /// re-encode, and tests can drive the prefill+save without a `Tokenizer`).
 ///
-/// Performs steps 2-3 of [`cache_prompt`]: prefill the full `prompt_ids` into
-/// `cache` (the `generate_step(max_tokens=0)` forward sequence), then save via
-/// [`crate::lm::cache::save_prompt_cache`] with the `model` /
-/// `tokenizer_config` metadata cache_prompt.py writes (plus `extra_metadata`).
-/// An empty `prompt_ids` is a recoverable [`Error::Backend`] (faithful to
-/// mlx-lm's empty-prompt `ValueError`); nothing is written in that case.
+/// Performs steps 2-4 of [`cache_prompt`]: allocate a fresh per-layer KV
+/// cache via [`crate::lm::cache::make_prompt_cache`] (`cache_config`), prefill
+/// the full `prompt_ids` into it (the `generate_step(max_tokens=0)` forward
+/// sequence), then save via [`crate::lm::cache::save_prompt_cache`] with the
+/// `model` / `tokenizer_config` metadata cache_prompt.py writes (plus
+/// `extra_metadata`). An empty `prompt_ids` is a recoverable
+/// [`Error::Backend`] (faithful to mlx-lm's empty-prompt `ValueError`);
+/// nothing is written in that case.
 ///
-/// **Precondition — `cache` must be fresh.** The prefill only ever
-/// *appends* to `cache`; the saved cache must represent *exactly this
-/// prompt*. A reused / pre-populated cache (any layer that fails
-/// [`KvCache::is_fresh`] — cached tokens, populated SSM slots, or a
-/// non-fresh child cache) is rejected with a recoverable [`Error::Backend`]
-/// before the prefill runs (so nothing is written) — saving a reused cache
-/// would persist a `[stale + new]` prefix and leak a prior request's
-/// context. Pass a freshly built [`crate::lm::cache::make_prompt_cache`]
-/// cache.
+/// The cache is **allocated internally**, exactly as `cache_prompt.py:111`
+/// does (`cache = make_prompt_cache(model, args.max_kv_size)`) — never
+/// caller-provided. An internally-allocated cache is *fresh by construction*,
+/// so the saved cache represents exactly this prompt: there is no caller cache
+/// to reuse and therefore no way to persist a prior request's state. (This is
+/// strictly more faithful to the reference than a caller-cache parameter would
+/// be.) `cache_config` is the model-appropriate cache spec — see
+/// [`cache_prompt`].
 #[allow(clippy::too_many_arguments)]
 pub fn cache_prompt_ids<M: Model>(
   model: &M,
   prompt_ids: &[u32],
-  cache: &mut [Box<dyn KvCache>],
+  cache_config: &CacheConfig,
   out_path: &std::path::Path,
   model_id: &str,
   tokenizer_config_json: &str,
@@ -339,51 +338,19 @@ pub fn cache_prompt_ids<M: Model>(
     });
   }
 
-  // The cache MUST be fresh: `cache_prompt` saves a cache representing
-  // *exactly this prompt*, but `prefill_full` only ever *appends* (it never
-  // resets the cache). A reused / pre-populated cache would have the new
-  // prompt prefilled on top of its stale state, and the save would persist
-  // the combined `[stale + new]` prefix while `tokens_processed` reports the
-  // new count alone — the saved cache would not represent the requested
-  // prompt (in a service, a later generation would be conditioned on a prior
-  // request's context: a cross-request context leak). mlx-lm never hits this
-  // because `cache_prompt.py` allocates the cache itself
-  // (`make_prompt_cache(model)`); here the cache is caller-provided, so the
-  // freshness precondition is enforced explicitly.
-  //
-  // Reject ANY layer that is not [`KvCache::is_fresh`] — the dedicated,
-  // per-cache-type "holds no prefilled/serialized state" predicate. It is
-  // deliberately NOT an `offset() != 0 || !is_empty()` test: that predicate
-  // is incomplete for caches whose `offset()` is always `0` and whose
-  // `is_empty()` inspects only one buffer/slot — e.g. a reused *sparse*
-  // `ArraysCache` (slot 0 empty, a later slot populated), or a `CacheList`
-  // whose first child is fresh while a later child carries zero-offset
-  // sparse state, would slip past it and let the save persist stale
-  // cross-request state. `is_fresh()` polls every buffer / SSM slot / ring
-  // cursor / child recursively, so a genuinely fresh `make_prompt_cache`
-  // cache passes and any cache carrying state is rejected. Checked before
-  // `prefill_full`, so the save never runs and no file is written. Mirrors
-  // the empty-prompt guard above.
-  if let Some((layer_idx, _)) = cache
-    .iter()
-    .enumerate()
-    .find(|(_, layer)| !layer.is_fresh())
-  {
-    return Err(Error::Backend {
-      message: format!(
-        "cache_prompt: the provided cache must be fresh — layer {layer_idx} already \
-         holds prefilled/restored state (cached tokens, populated SSM slots, or a \
-         non-fresh child cache); cache_prompt saves a cache representing exactly this \
-         prompt, so a reused cache would persist stale state. Pass a freshly built cache \
-         (`make_prompt_cache`)."
-      ),
-    });
-  }
+  // 2. Allocate a fresh per-layer KV cache — cache_prompt.py:111
+  // (`cache = make_prompt_cache(model, args.max_kv_size)`). `cache_prompt`
+  // saves a cache representing *exactly this prompt*, and `prefill_full` only
+  // ever *appends* (it never resets a cache). Allocating the cache here — as
+  // the reference does — makes it fresh by construction: there is no
+  // caller-provided cache that could carry a prior request's state into the
+  // save, so a cross-request context leak is structurally impossible.
+  let mut cache = make_prompt_cache(cache_config);
 
-  // 2. prefill the full prompt into the cache (cache_prompt.py:111-136).
-  prefill_full(model, prompt_ids, cache, prefill_step_size)?;
+  // 3. prefill the full prompt into the cache (cache_prompt.py:111-136).
+  prefill_full(model, prompt_ids, &mut cache, prefill_step_size)?;
 
-  // 3. save with the reference metadata (cache_prompt.py:142-145).
+  // 4. save with the reference metadata (cache_prompt.py:142-145).
   // Build `extra` first so the two reference keys (`model` /
   // `tokenizer_config`) deterministically win on collision — mirroring
   // cache_prompt.py, which sets them last/unconditionally.
@@ -396,7 +363,7 @@ pub fn cache_prompt_ids<M: Model>(
   // Atomic save: write to a same-directory tempfile, fsync, then rename over
   // the destination — a crash / IO error mid-save never leaves a partial or
   // corrupt cache at `out_path` (Codex finding). Mirrors `audio::io::save_wav`.
-  save_prompt_cache_atomic(out_path, cache, &metadata)?;
+  save_prompt_cache_atomic(out_path, &cache, &metadata)?;
 
   Ok(CachePromptInfo {
     tokens_processed: prompt_ids.len(),
@@ -604,18 +571,24 @@ mod tests {
 
   use super::*;
   use crate::lm::{
-    cache::{
-      ArraysCache, CacheConfig, CacheList, ChunkedKvCache, MaskMode, QuantizedKvCacheImpl,
-      RotatingKvCache, StandardKvCache, make_prompt_cache,
-    },
+    cache::{MaskMode, RotatingKvCache, StandardKvCache},
     model::MockModel,
   };
 
-  fn cache(layers: usize) -> Vec<Box<dyn KvCache>> {
-    make_prompt_cache(&CacheConfig {
+  /// A [`CacheConfig`] for `layers` full-attention (non-sliding-window)
+  /// decoder layers — what the driver allocates a `StandardKvCache` per.
+  fn config(layers: usize) -> CacheConfig {
+    CacheConfig {
       num_hidden_layers: layers,
       sliding_window: None,
-    })
+    }
+  }
+
+  /// A freshly built per-layer cache for `layers` full-attention layers —
+  /// used by the `prefill_full` boundary tests, which drive the cache
+  /// directly (the public `cache_prompt_ids` allocates its own internally).
+  fn cache(layers: usize) -> Vec<Box<dyn KvCache>> {
+    make_prompt_cache(&config(layers))
   }
 
   /// A [`KvCache`] that delegates to a [`StandardKvCache`] but counts every
@@ -652,9 +625,6 @@ mod tests {
     }
     fn is_empty(&self) -> bool {
       self.inner.is_empty()
-    }
-    fn is_fresh(&self) -> bool {
-      self.inner.is_fresh()
     }
     fn copy(&self) -> Result<Box<dyn KvCache>> {
       self.inner.copy()
@@ -808,17 +778,116 @@ mod tests {
     assert!(c.iter().all(|x| x.offset() == 3));
   }
 
+  /// The per-chunk barrier routes through [`KvCache::materialize`] — and on a
+  /// [`RotatingKvCache`] whose ring buffer has *over-allocated* (`offset <
+  /// buffer_len`, the regime an `S == 1` `prefill_step_size == 1` update grows
+  /// the ring into) it must materialize the genuine stored ring buffers, not
+  /// the offset-length `state()` serialization slices (the Codex finding).
+  /// This wraps a `RotatingKvCache` and records, on each `materialize()` call,
+  /// whether the full stored ring (`nbytes()`) exceeded the offset-length
+  /// serialized `state()` — i.e. the over-allocated regime — proving the
+  /// barrier ran on exactly the slice-view-diverging state the hook targets.
+  #[test]
+  fn prefill_full_materializes_rotating_live_ring_buffers() {
+    /// Byte size of a cache's serialized `state()` arrays (`size * 4` for the
+    /// f32 K/V here) — the *logical* (offset-length) size.
+    fn state_nbytes(c: &dyn KvCache) -> usize {
+      c.state().unwrap().iter().map(|a| a.size() * 4).sum()
+    }
+
+    struct ObservingRotatingCache {
+      inner: RotatingKvCache,
+      materialize_calls: Rc<Cell<usize>>,
+      saw_overallocated_buffer: Rc<Cell<bool>>,
+    }
+
+    impl KvCache for ObservingRotatingCache {
+      fn offset(&self) -> usize {
+        self.inner.offset()
+      }
+      fn max_size(&self) -> Option<usize> {
+        self.inner.max_size()
+      }
+      fn update(&mut self, keys: &Array, values: &Array) -> Result<(Array, Array)> {
+        self.inner.update(keys, values)
+      }
+      fn state(&self) -> Result<Vec<Array>> {
+        self.inner.state()
+      }
+      fn set_state(&mut self, state: Vec<Array>) -> Result<()> {
+        self.inner.set_state(state)
+      }
+      fn materialize(&mut self) -> Result<()> {
+        self.materialize_calls.set(self.materialize_calls.get() + 1);
+        // Full stored ring buffer (`nbytes`) vs the offset-length serialized
+        // state: `>` ⇔ the ring over-allocated ⇔ `state()` is returning slice
+        // views, the regime the barrier must materialize the live buffers for.
+        if self.inner.nbytes() > state_nbytes(&self.inner) {
+          self.saw_overallocated_buffer.set(true);
+        }
+        self.inner.materialize()
+      }
+      fn make_mask(&self, n: usize, w: Option<usize>, ret: bool) -> Result<MaskMode> {
+        self.inner.make_mask(n, w, ret)
+      }
+      fn nbytes(&self) -> usize {
+        self.inner.nbytes()
+      }
+      fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+      }
+      fn copy(&self) -> Result<Box<dyn KvCache>> {
+        self.inner.copy()
+      }
+    }
+
+    let model = MockModel::new(8);
+    // P = 9 tokens; step = 1 ⇒ leading P-1 = 8 single-token chunks ⇒ 8
+    // barrier calls; each S==1 update grows the ring (window 4 << buffer
+    // step 256), so the buffer over-allocates.
+    let prompt: Vec<u32> = (0..9u32).map(|i| i % 7).collect();
+    let materialize_calls = Rc::new(Cell::new(0usize));
+    let saw_over = Rc::new(Cell::new(false));
+    let mut c: Vec<Box<dyn KvCache>> = vec![Box::new(ObservingRotatingCache {
+      inner: RotatingKvCache::new(4, 2),
+      materialize_calls: Rc::clone(&materialize_calls),
+      saw_overallocated_buffer: Rc::clone(&saw_over),
+    })];
+
+    prefill_full(&model, &prompt, &mut c, 1).unwrap();
+
+    assert!(c.iter().all(|x| x.offset() == prompt.len()));
+    assert_eq!(
+      materialize_calls.get(),
+      prompt.len() - 1,
+      "the per-chunk materialize barrier must fire once per leading single-token chunk"
+    );
+    assert!(
+      saw_over.get(),
+      "the rotating ring must over-allocate during step==1 prefill, so the barrier \
+       is exercised on the slice-view-diverging regime the fix targets"
+    );
+  }
+
   /// `cache_prompt_ids` over an empty prompt is a recoverable `Err` and
   /// writes no file (faithful to mlx-lm's empty-prompt `ValueError`).
   #[test]
   fn cache_prompt_ids_empty_prompt_errors_without_writing() {
     let model = MockModel::new(4);
-    let mut c = cache(1);
     let dir = std::env::temp_dir().join(format!("mlxrs_cache_prompt_empty_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let out = dir.join("empty.safetensors");
     let _ = std::fs::remove_file(&out);
-    let r = cache_prompt_ids(&model, &[], &mut c, &out, "mock", "{}", 8, &HashMap::new());
+    let r = cache_prompt_ids(
+      &model,
+      &[],
+      &config(1),
+      &out,
+      "mock",
+      "{}",
+      8,
+      &HashMap::new(),
+    );
     assert!(r.is_err(), "empty prompt must error");
     assert!(
       !out.exists(),
@@ -826,257 +895,112 @@ mod tests {
     );
   }
 
-  /// `cache_prompt_ids` rejects a **non-fresh** cache (a reused / pre-populated
-  /// cache with `offset() > 0`) as a recoverable `Err` and writes no file —
-  /// `cache_prompt` saves a cache representing exactly the requested prompt, so
-  /// prefilling on top of stale state (which `prefill_full` would silently do,
-  /// it only appends) would persist a `[stale + new]` prefix and leak prior
-  /// context. Mirrors the empty-prompt guard's structure.
+  /// `cache_prompt_ids` allocates its KV cache **internally** (via
+  /// `make_prompt_cache`, exactly cache_prompt.py:111) — there is no
+  /// caller-provided cache parameter. Each call therefore starts from a
+  /// fresh cache, so the saved cache represents *exactly* the requested
+  /// prompt: two back-to-back runs over different prompts each persist a
+  /// cache at that run's own prompt length (a cross-request leak — the old
+  /// caller-cache hazard — is structurally impossible here, since there is
+  /// no cache object to reuse). The `tokens_processed` count and the saved
+  /// cache offset match the prompt length on *every* run.
   #[test]
-  fn cache_prompt_ids_non_fresh_cache_errors_without_writing() {
-    let model = MockModel::new(4);
-    // Pre-populate the cache by prefilling a first prompt into it (offset > 0).
-    let mut c = cache(2);
-    prefill_full(&model, &[1u32, 2, 3], &mut c, 8).unwrap();
-    assert!(
-      c.iter().all(|x| x.offset() == 3),
-      "the cache is pre-populated (offset > 0) before the rejected call"
-    );
-
-    let dir = std::env::temp_dir().join(format!(
-      "mlxrs_cache_prompt_nonfresh_{}",
-      std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&dir);
-    let out = dir.join("nonfresh.safetensors");
-    let _ = std::fs::remove_file(&out);
-
-    let r = cache_prompt_ids(
-      &model,
-      &[4u32, 5],
-      &mut c,
-      &out,
-      "mock",
-      "{}",
-      8,
-      &HashMap::new(),
-    );
-    match r {
-      Err(Error::Backend { message }) => {
-        assert!(
-          message.contains("fresh") || message.contains("empty"),
-          "the error must indicate the cache has to be fresh/empty: {message}"
-        );
-      }
-      other => panic!("a reused cache must be a recoverable Error::Backend, got {other:?}"),
-    }
-    assert!(
-      !out.exists(),
-      "no cache file may be written when a reused cache is rejected"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-  }
-
-  /// A genuinely **fresh** cache still succeeds: `cache_prompt_ids` over a
-  /// freshly built [`make_prompt_cache`] cache prefills + saves normally (the
-  /// freshness guard does not regress the positive path).
-  #[test]
-  fn cache_prompt_ids_fresh_cache_succeeds() {
-    let model = MockModel::new(4);
-    let mut c = cache(2);
-    assert!(
-      c.iter().all(|x| x.offset() == 0 && x.is_empty()),
-      "a make_prompt_cache cache is fresh (offset 0, empty)"
-    );
+  fn cache_prompt_ids_allocates_a_fresh_cache_per_call() {
+    let model = MockModel::new(8);
     let dir = std::env::temp_dir().join(format!("mlxrs_cache_prompt_fresh_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
-    let out = dir.join("fresh.safetensors");
-    let _ = std::fs::remove_file(&out);
 
-    let info = cache_prompt_ids(
+    // Run 1: a 4-token prompt.
+    let out1 = dir.join("run1.safetensors");
+    let _ = std::fs::remove_file(&out1);
+    let info1 = cache_prompt_ids(
       &model,
-      &[1u32, 2, 3],
-      &mut c,
-      &out,
+      &[1u32, 2, 3, 4],
+      &config(2),
+      &out1,
       "mock",
       "{}",
       8,
       &HashMap::new(),
     )
-    .expect("a fresh cache must prefill + save successfully");
-    assert_eq!(info.tokens_processed, 3);
-    assert!(c.iter().all(|x| x.offset() == 3));
-    assert!(out.exists(), "a fresh-cache run must write the cache file");
-    let _ = std::fs::remove_dir_all(&dir);
-  }
-
-  /// A 2-slot SSM `(conv, ssm)` state — a non-trivial slot array.
-  fn slot_state() -> Array {
-    Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(1usize, 4usize)).unwrap()
-  }
-
-  /// `cache_prompt_ids` rejects a reused **sparse** `ArraysCache` (slot 0
-  /// empty, a *later* slot populated) and writes no file. This is the
-  /// round-2 hole: `ArraysCache::offset()` is always `0` and `is_empty()`
-  /// checks only slot 0, so the old `offset()/is_empty()` predicate passed a
-  /// sparse cache — `is_fresh()` (every slot must be empty) rejects it.
-  #[test]
-  fn cache_prompt_ids_rejects_sparse_arrays_cache_without_writing() {
-    let model = MockModel::new(4);
-    // A 2-slot ArraysCache with slot 0 EMPTY but slot 1 populated — the
-    // exact sparse shape `is_empty()` (== `cache[0] is None`) misses.
-    let mut sparse = ArraysCache::new(2);
-    sparse.set(1, slot_state()).unwrap();
+    .expect("run 1 must prefill + save successfully");
+    assert_eq!(info1.tokens_processed, 4);
+    assert!(out1.exists(), "run 1 must write the cache file");
+    let (loaded1, _m1) = crate::lm::cache::load_prompt_cache(&out1).unwrap();
     assert!(
-      sparse.is_empty(),
-      "precondition: a slot-0-empty ArraysCache reports is_empty()==true (mlx-lm cache[0])"
+      loaded1.iter().all(|c| c.offset() == 4),
+      "run 1's saved cache is exactly its 4-token prompt"
     );
+
+    // Run 2: a *shorter* 2-token prompt. Because the cache is freshly
+    // allocated inside `cache_prompt_ids`, run 2 cannot inherit run 1's
+    // state — its saved cache is exactly 2 tokens, not 4 + 2.
+    let out2 = dir.join("run2.safetensors");
+    let _ = std::fs::remove_file(&out2);
+    let info2 = cache_prompt_ids(
+      &model,
+      &[5u32, 6],
+      &config(2),
+      &out2,
+      "mock",
+      "{}",
+      8,
+      &HashMap::new(),
+    )
+    .expect("run 2 must prefill + save successfully");
     assert_eq!(
-      sparse.offset(),
-      0,
-      "precondition: ArraysCache::offset() is always 0"
+      info2.tokens_processed, 2,
+      "run 2 processes only its own 2-token prompt"
     );
+    let (loaded2, _m2) = crate::lm::cache::load_prompt_cache(&out2).unwrap();
     assert!(
-      !sparse.is_fresh(),
-      "a sparse ArraysCache must NOT be fresh — slot 1 holds state"
+      loaded2.iter().all(|c| c.offset() == 2),
+      "run 2's saved cache represents exactly its 2-token prompt — no leaked \
+       prior-request context (the internally-allocated cache is fresh)"
     );
-    let mut c: Vec<Box<dyn KvCache>> = vec![Box::new(sparse)];
 
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// A sliding-window `cache_config` (non-`None` `sliding_window`) makes
+  /// `cache_prompt_ids` allocate a [`crate::lm::cache::RotatingKvCache`] per
+  /// layer — the model-appropriate cache `make_prompt_cache` builds — and the
+  /// prefill + save still round-trips at offset `P`.
+  #[test]
+  fn cache_prompt_ids_sliding_window_config_uses_rotating_cache() {
+    let model = MockModel::new(8);
     let dir =
-      std::env::temp_dir().join(format!("mlxrs_cache_prompt_sparse_{}", std::process::id()));
+      std::env::temp_dir().join(format!("mlxrs_cache_prompt_sliding_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
-    let out = dir.join("sparse.safetensors");
+    let out = dir.join("sliding.safetensors");
     let _ = std::fs::remove_file(&out);
 
-    let r = cache_prompt_ids(
+    let cfg = CacheConfig {
+      num_hidden_layers: 2,
+      sliding_window: Some(8),
+    };
+    let info = cache_prompt_ids(
       &model,
-      &[1u32, 2],
-      &mut c,
+      &[1u32, 2, 3, 4, 5],
+      &cfg,
       &out,
       "mock",
       "{}",
-      8,
+      2,
       &HashMap::new(),
-    );
-    match r {
-      Err(Error::Backend { message }) => assert!(
-        message.contains("fresh"),
-        "the rejection must indicate the cache is not fresh: {message}"
-      ),
-      other => {
-        panic!("a reused sparse ArraysCache must be a recoverable Error::Backend, got {other:?}")
-      }
-    }
+    )
+    .expect("a sliding-window config must prefill + save successfully");
+    assert_eq!(info.tokens_processed, 5);
+
+    let (loaded, _m) = crate::lm::cache::load_prompt_cache(&out).unwrap();
+    assert!(loaded.iter().all(|c| c.offset() == 5));
     assert!(
-      !out.exists(),
-      "no cache file may be written when a sparse ArraysCache is rejected"
+      loaded
+        .iter()
+        .all(|c| c.reference_class_name() == "RotatingKVCache"),
+      "a sliding-window config allocates RotatingKVCache layers"
     );
     let _ = std::fs::remove_dir_all(&dir);
-  }
-
-  /// `cache_prompt_ids` rejects a `CacheList` whose **first** child is fresh
-  /// while a *later* child carries sparse-stale state, and writes no file.
-  /// `CacheList::is_empty()` reports only the first child's emptiness, so the
-  /// stale later child hides — `is_fresh()` (ALL children, recursively)
-  /// rejects it.
-  #[test]
-  fn cache_prompt_ids_rejects_cache_list_with_stale_later_child_without_writing() {
-    let model = MockModel::new(4);
-    // child 0: a genuinely fresh StandardKvCache; child 1: a sparse
-    // (slot-0-empty, slot-1-populated) ArraysCache holding zero-offset state.
-    let mut stale_child = ArraysCache::new(2);
-    stale_child.set(1, slot_state()).unwrap();
-    let list = CacheList::new(vec![
-      Box::new(StandardKvCache::new()),
-      Box::new(stale_child),
-    ]);
-    assert!(
-      list.is_empty(),
-      "precondition: CacheList::is_empty() sees only the (fresh) first child"
-    );
-    assert!(
-      !list.is_fresh(),
-      "a CacheList with a stale later child must NOT be fresh"
-    );
-    let mut c: Vec<Box<dyn KvCache>> = vec![Box::new(list)];
-
-    let dir = std::env::temp_dir().join(format!(
-      "mlxrs_cache_prompt_listchild_{}",
-      std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&dir);
-    let out = dir.join("listchild.safetensors");
-    let _ = std::fs::remove_file(&out);
-
-    let r = cache_prompt_ids(
-      &model,
-      &[1u32, 2],
-      &mut c,
-      &out,
-      "mock",
-      "{}",
-      8,
-      &HashMap::new(),
-    );
-    match r {
-      Err(Error::Backend { message }) => assert!(
-        message.contains("fresh"),
-        "the rejection must indicate the cache is not fresh: {message}"
-      ),
-      other => panic!(
-        "a CacheList with a stale later child must be a recoverable Error::Backend, got {other:?}"
-      ),
-    }
-    assert!(
-      !out.exists(),
-      "no cache file may be written when a CacheList with a stale child is rejected"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-  }
-
-  /// `is_fresh()` is `true` for a genuinely fresh cache of **every** concrete
-  /// `KvCache` type (no false-reject) and `false` once any state lands.
-  #[test]
-  fn is_fresh_true_for_every_fresh_cache_type() {
-    // Each concrete cache, freshly constructed, is fresh.
-    assert!(StandardKvCache::new().is_fresh(), "fresh StandardKvCache");
-    assert!(
-      RotatingKvCache::new(8, 4).is_fresh(),
-      "fresh RotatingKvCache"
-    );
-    assert!(
-      ChunkedKvCache::new(Some(64)).is_fresh(),
-      "fresh ChunkedKvCache"
-    );
-    assert!(
-      QuantizedKvCacheImpl::new(64, 8).is_fresh(),
-      "fresh QuantizedKvCacheImpl"
-    );
-    assert!(ArraysCache::new(2).is_fresh(), "fresh 2-slot ArraysCache");
-    // A CacheList over all-fresh children is fresh (recursive).
-    let fresh_list = CacheList::new(vec![
-      Box::new(StandardKvCache::new()),
-      Box::new(ArraysCache::new(2)),
-    ]);
-    assert!(fresh_list.is_fresh(), "CacheList over fresh children");
-    // An empty CacheList holds nothing — vacuously fresh.
-    assert!(
-      CacheList::new(Vec::new()).is_fresh(),
-      "an empty CacheList is vacuously fresh"
-    );
-
-    // ...and not fresh once a slot/child is populated.
-    let mut populated = ArraysCache::new(2);
-    populated.set(0, slot_state()).unwrap();
-    assert!(
-      !populated.is_fresh(),
-      "a populated ArraysCache is not fresh"
-    );
-    let stale_list = CacheList::new(vec![Box::new(populated)]);
-    assert!(
-      !stale_list.is_fresh(),
-      "a CacheList with a populated child is not fresh"
-    );
   }
 
   /// [`effective_safetensors_path`] mirrors mlx core's extension-append: a
@@ -1125,11 +1049,10 @@ mod tests {
     let out = dir.join("cache.safetensors");
 
     // 1. Write a good cache.
-    let mut c = cache(2);
     cache_prompt_ids(
       &model,
       &[1u32, 2, 3, 4],
-      &mut c,
+      &config(2),
       &out,
       "good",
       "{}",
@@ -1148,11 +1071,10 @@ mod tests {
     perms.set_mode(0o500); // r-x------ : no write ⇒ create/write fails
     fs::set_permissions(&dir, perms).unwrap();
 
-    let mut c2 = cache(2);
     let r = cache_prompt_ids(
       &model,
       &[5u32, 6, 7, 8],
-      &mut c2,
+      &config(2),
       &out,
       "SHOULD-NOT-WIN",
       "{}",
@@ -1218,11 +1140,10 @@ mod tests {
     perms.set_mode(0o500);
     fs::set_permissions(&dir, perms).unwrap();
 
-    let mut c = cache(1);
     let r = cache_prompt_ids(
       &model,
       &[1u32, 2, 3],
-      &mut c,
+      &config(1),
       &out,
       "m",
       "{}",
@@ -1269,11 +1190,10 @@ mod tests {
     let out = dir.join("dest.safetensors");
     fs::create_dir_all(&out).unwrap();
 
-    let mut c = cache(1);
     let r = cache_prompt_ids(
       &model,
       &[1u32, 2, 3],
-      &mut c,
+      &config(1),
       &out,
       "m",
       "{}",

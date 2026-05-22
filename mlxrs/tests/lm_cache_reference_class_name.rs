@@ -133,10 +133,6 @@ impl KvCache for DefaultMock {
   fn is_empty(&self) -> bool {
     true
   }
-  fn is_fresh(&self) -> bool {
-    // No stored state — this probe is always fresh.
-    true
-  }
   fn copy(&self) -> Result<Box<dyn KvCache>> {
     Ok(Box::new(DefaultMock))
   }
@@ -214,9 +210,6 @@ impl KvCache for RotatingForwardingWrapper {
   }
   fn is_empty(&self) -> bool {
     self.inner.is_empty()
-  }
-  fn is_fresh(&self) -> bool {
-    self.inner.is_fresh()
   }
   fn copy(&self) -> Result<Box<dyn KvCache>> {
     self.inner.copy()

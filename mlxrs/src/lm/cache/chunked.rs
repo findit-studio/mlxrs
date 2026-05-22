@@ -675,18 +675,6 @@ impl KvCache for ChunkedKvCache {
     self.keys.is_none()
   }
 
-  /// Fresh iff this cache holds no cached tokens — no buffer allocated
-  /// **and** the raw counter `offset == 0` **and** no leading tokens have
-  /// been dropped (`start_position == 0`) (see [`KvCache::is_fresh`]). A
-  /// genuinely fresh `ChunkedKvCache::new(..)` satisfies all three; a
-  /// restored cache that was trimmed at the front carries a non-zero
-  /// `start_position` and so is correctly *not* fresh. `chunk_size` is
-  /// configuration, not state, so it is intentionally not part of the
-  /// predicate.
-  fn is_fresh(&self) -> bool {
-    self.keys.is_none() && self.offset == 0 && self.start_position == 0
-  }
-
   /// An independent copy (mlx-lm `copy.deepcopy` / mlx-swift-lm
   /// `ChunkedKVCache.copy()`, `KVCache.swift:1071-1080`). Independence is
   /// from MLX value semantics, not buffer duplication: arrays are immutable
