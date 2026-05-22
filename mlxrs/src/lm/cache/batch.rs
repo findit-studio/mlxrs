@@ -408,6 +408,34 @@ impl KvCache for BatchKvCache {
     }
   }
 
+  /// Force-evaluate the cache's own stored arrays in place — the per-chunk
+  /// prefill memory barrier (see [`KvCache::materialize`]).
+  ///
+  /// Evals the genuine stored arrays via the explicit `&mut` [`Array::eval`]:
+  /// the `self.keys`/`self.values` step buffers (the arrays the next
+  /// `update`/`finalize` reads and splices into — **not** the
+  /// `slice_seq(k, 0, self.idx)` views [`state`](KvCache::state) returns),
+  /// plus the per-sequence `self.offset`/`self.left_padding`/
+  /// `self.right_padding` position arrays (themselves lazy `[B]` graphs — e.g.
+  /// `offset` is a lazy `negative(left_padding)` after an empty `set_state` —
+  /// that would otherwise chain across chunks). Materializes every live
+  /// buffer the next chunk reuses; `keys`/`values`/`right_padding` are no-ops
+  /// when absent.
+  fn materialize(&mut self) -> Result<()> {
+    if let Some(k) = self.keys.as_mut() {
+      k.eval()?;
+    }
+    if let Some(v) = self.values.as_mut() {
+      v.eval()?;
+    }
+    self.offset.eval()?;
+    self.left_padding.eval()?;
+    if let Some(rp) = self.right_padding.as_mut() {
+      rp.eval()?;
+    }
+    Ok(())
+  }
+
   /// mlx-lm `BatchKVCache.state` setter (`cache.py:997-1000`):
   /// `keys, values, offset, left_padding = v; _idx = keys.shape[2]`. An
   /// empty state resets the cache.

@@ -130,34 +130,40 @@ fn token_window(ids: &[u32]) -> Result<Array> {
   Array::from_slice::<i32>(&row, &(1usize, row.len()))
 }
 
-/// Force-evaluate the per-layer cache **state** arrays — the prefill
-/// memory-barrier mlx-lm runs after every prompt chunk
+/// Force-evaluate every per-layer cache's **own stored arrays in place** —
+/// the prefill memory-barrier mlx-lm runs after every prompt chunk
 /// (`generate.py:442`: `mx.eval([c.state for c in prompt_cache])`).
 ///
 /// `mlxrs::Array` is lazy (an op only records a graph node), so without this
 /// each prefill chunk's `forward` would *append* to a graph spanning every
 /// prior chunk and nothing would materialize until the final save — making
 /// peak memory grow with the whole prompt and defeating `prefill_step_size`
-/// (a long prompt could OOM/abort at the end). [`KvCache::state`] returns the
-/// cache's K/V arrays as refcount-sharing handles ([`Array::try_clone`]) onto
-/// the *same* underlying buffers the cache holds, so evaluating them
-/// materializes the cache itself — exactly mlx-lm's `mx.eval([c.state ...])`.
-/// Evaluation is the crate's explicit `&mut` step ([`Array::eval`]); there is
-/// no hidden eval in `state()` (it only clones handles), so this barrier is
-/// the deliberate materialization point.
+/// (a long prompt could OOM/abort at the end).
+///
+/// This drives the [`KvCache::materialize`] hook on every layer (`&mut` via
+/// [`slice::iter_mut`]), which evals each cache's **genuine stored
+/// `keys`/`values`** (and quantized triples / per-sequence position arrays /
+/// SSM slots / child caches) directly. It deliberately does **not** route
+/// through [`KvCache::state`]: a sliding-window / chunked / batched cache
+/// over-allocates its ring/step buffer and `state()` returns
+/// `seq_slice(self.keys, 0, offset)` serialization views whenever `offset <
+/// buffer_len` (the regime an `S == 1` update reaches after growing the ring,
+/// also the `prefill_step_size == 1` / `0`-clamp path) — evaluating those
+/// temporary slices would materialize the slice's output buffer, not the
+/// stored buffer the next chunk's `update` reads and extends, so the live
+/// graph could still chain across chunks and peak memory would not be bounded
+/// (the Codex finding this hook closes). Evaluating the live arrays via the
+/// `&mut` hook is faithful to mlx-lm's `mx.eval([c.state ...])` (per-chunk
+/// full materialization of the live cache) without that hazard.
 ///
 /// mlxrs has no safe vector-eval wrapper (mlx-c's `mlx_eval(mlx_vector_array)`
-/// is unbound here), so each state array is evaluated individually — observably
-/// identical to a single `mx.eval` over the list (each array's graph is forced
-/// to its buffer; order is irrelevant). An empty-state layer (a cache that
-/// holds nothing — `state()` returns `[]`) contributes no work.
-fn eval_cache_state(cache: &mut [Box<dyn KvCache>]) -> Result<()> {
-  for layer in cache.iter() {
-    // `state()` clones the cache's K/V handles (shared buffers); evaluating
-    // each forces materialization of the cache's own arrays.
-    for mut arr in layer.state()? {
-      arr.eval()?;
-    }
+/// is unbound here), so each cache's arrays are evaluated individually —
+/// observably identical to a single `mx.eval` over the list (each array's
+/// graph is forced to its buffer; order is irrelevant). An empty cache (one
+/// that holds no arrays) is a no-op.
+fn materialize_caches(cache: &mut [Box<dyn KvCache>]) -> Result<()> {
+  for layer in cache.iter_mut() {
+    layer.materialize()?;
   }
   Ok(())
 }
@@ -172,21 +178,23 @@ fn eval_cache_state(cache: &mut [Box<dyn KvCache>]) -> Result<()> {
 /// state after each chunk** at `generate.py:442`) and then forwards the final
 /// token in the first `_step` (`generate.py:454`) — together the whole prompt.
 /// This reproduces that precisely: the same chunk boundaries for the first
-/// `P - 1` tokens with a per-chunk [`eval_cache_state`] barrier, then a final
-/// 1-token forward. The result is a cache at offset `P`, byte-identical to a
-/// `generate_step` run that prefilled the same prompt. No `logits` are kept
-/// (every `forward` return is dropped — the chunk only fills the cache).
+/// `P - 1` tokens with a per-chunk [`materialize_caches`] barrier, then a
+/// final 1-token forward. The result is a cache at offset `P`, byte-identical
+/// to a `generate_step` run that prefilled the same prompt. No `logits` are
+/// kept (every `forward` return is dropped — the chunk only fills the cache).
 ///
 /// ## Why the per-chunk barrier (Codex finding — memory-bounded prefill)
 ///
-/// `mlxrs::Array` is lazy, so without [`eval_cache_state`] the chunk loop would
-/// accumulate a single lazy graph spanning **every** chunk and only force it at
-/// the final save — `prefill_step_size` would bound nothing and a long prompt
-/// could OOM/abort. Evaluating the cache state after each chunk caps the live
-/// graph to one chunk's work (mlx-lm's exact discipline). The final tail
-/// token's forward is left to be materialized by the save (mlx-lm `async_eval`s
-/// it rather than blocking) — `save_prompt_cache` reads `state()` and writes
-/// it, forcing that last step.
+/// `mlxrs::Array` is lazy, so without [`materialize_caches`] the chunk loop
+/// would accumulate a single lazy graph spanning **every** chunk and only
+/// force it at the final save — `prefill_step_size` would bound nothing and a
+/// long prompt could OOM/abort. Materializing each cache's live stored arrays
+/// after each chunk (via the [`KvCache::materialize`] hook — **not** the
+/// serializable `state()`, whose over-allocated-buffer slices would leave the
+/// stored buffers lazy and chaining) caps the live graph to one chunk's work
+/// (mlx-lm's exact discipline). The final tail token's forward is left to be
+/// materialized by the save (mlx-lm `async_eval`s it rather than blocking) —
+/// `save_prompt_cache` reads `state()` and writes it, forcing that last step.
 ///
 /// `prefill_step_size` is clamped to `>= 1` (a `0` would not make progress),
 /// matching [`crate::lm::generate::generate_step`]'s `prefill_step_size.max(1)`.
@@ -207,9 +215,9 @@ fn prefill_full<M: Model>(
     let chunk = token_window(&prompt[processed..processed + n])?;
     // logits discarded — the chunk only fills the cache.
     let _ = model.forward(&chunk, cache)?;
-    // mlx-lm `generate.py:442`: materialize the cache state so the lazy graph
-    // does not span every chunk (memory-bounded prefill).
-    eval_cache_state(cache)?;
+    // mlx-lm `generate.py:442`: materialize each cache's live stored arrays
+    // so the lazy graph does not span every chunk (memory-bounded prefill).
+    materialize_caches(cache)?;
     processed += n;
   }
   // mlx-lm `_step(input_tokens=prompt)` over the final unconsumed token: the
@@ -548,12 +556,12 @@ mod tests {
   }
 
   /// A [`KvCache`] that delegates to a [`StandardKvCache`] but counts every
-  /// [`state`](KvCache::state) call into a shared counter — used to observe
-  /// the per-chunk [`eval_cache_state`] barrier firing during prefill (the
-  /// barrier calls `state()` once per layer per chunk).
+  /// [`materialize`](KvCache::materialize) call into a shared counter — used
+  /// to observe the per-chunk [`materialize_caches`] barrier firing during
+  /// prefill (the barrier calls `materialize()` once per layer per chunk).
   struct CountingCache {
     inner: StandardKvCache,
-    state_calls: Rc<Cell<usize>>,
+    materialize_calls: Rc<Cell<usize>>,
   }
 
   impl KvCache for CountingCache {
@@ -564,8 +572,11 @@ mod tests {
       self.inner.update(keys, values)
     }
     fn state(&self) -> Result<Vec<Array>> {
-      self.state_calls.set(self.state_calls.get() + 1);
       self.inner.state()
+    }
+    fn materialize(&mut self) -> Result<()> {
+      self.materialize_calls.set(self.materialize_calls.get() + 1);
+      self.inner.materialize()
     }
     fn set_state(&mut self, state: Vec<Array>) -> Result<()> {
       self.inner.set_state(state)
@@ -659,20 +670,20 @@ mod tests {
     );
   }
 
-  /// The per-chunk cache-state eval barrier (mlx-lm `generate.py:442`) fires
-  /// once per layer per leading chunk on a multi-chunk prompt (`P > step`):
-  /// the lazy graph is materialized between chunks, not accumulated to the
-  /// save. A [`CountingCache`] counts `state()` calls during prefill; with
-  /// `P = 7`, `step = 2` the leading `P-1 = 6` tokens are 3 chunks `[2,2,2]`,
-  /// so the barrier runs **3 times** (> 1 chunk) — proving the prefill is
-  /// memory-bounded (the graph never spans the whole prompt).
+  /// The per-chunk cache materialization barrier (mlx-lm `generate.py:442`)
+  /// fires once per layer per leading chunk on a multi-chunk prompt (`P >
+  /// step`): the lazy graph is materialized between chunks, not accumulated to
+  /// the save. A [`CountingCache`] counts `materialize()` calls during
+  /// prefill; with `P = 7`, `step = 2` the leading `P-1 = 6` tokens are 3
+  /// chunks `[2,2,2]`, so the barrier runs **3 times** (> 1 chunk) — proving
+  /// the prefill is memory-bounded (the graph never spans the whole prompt).
   #[test]
-  fn prefill_full_evals_cache_state_per_chunk() {
+  fn prefill_full_materializes_caches_per_chunk() {
     let model = MockModel::new(5);
     let counter = Rc::new(Cell::new(0usize));
     let mut c: Vec<Box<dyn KvCache>> = vec![Box::new(CountingCache {
       inner: StandardKvCache::new(),
-      state_calls: Rc::clone(&counter),
+      materialize_calls: Rc::clone(&counter),
     })];
     // P = 7, step = 2 ⇒ leading 6 tokens as [2,2,2] ⇒ 3 barrier calls.
     let prompt = [1u32, 2, 3, 4, 5, 6, 7];
@@ -680,7 +691,7 @@ mod tests {
     assert_eq!(
       counter.get(),
       3,
-      "the per-chunk eval barrier must fire once per leading chunk (3 chunks for P=7, step=2)"
+      "the per-chunk materialize barrier must fire once per leading chunk (3 chunks for P=7, step=2)"
     );
     assert!(
       counter.get() > 1,
@@ -701,7 +712,7 @@ mod tests {
     let one = Rc::new(Cell::new(0usize));
     let mut c1: Vec<Box<dyn KvCache>> = vec![Box::new(CountingCache {
       inner: StandardKvCache::new(),
-      state_calls: Rc::clone(&one),
+      materialize_calls: Rc::clone(&one),
     })];
     prefill_full(&model, &[1u32, 2, 3, 4], &mut c1, 8).unwrap();
     assert_eq!(one.get(), 1, "a single leading chunk runs the barrier once");
@@ -710,7 +721,7 @@ mod tests {
     let zero = Rc::new(Cell::new(0usize));
     let mut c0: Vec<Box<dyn KvCache>> = vec![Box::new(CountingCache {
       inner: StandardKvCache::new(),
-      state_calls: Rc::clone(&zero),
+      materialize_calls: Rc::clone(&zero),
     })];
     prefill_full(&model, &[42u32], &mut c0, 8).unwrap();
     assert_eq!(

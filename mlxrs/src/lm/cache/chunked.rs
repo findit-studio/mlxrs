@@ -481,6 +481,26 @@ impl KvCache for ChunkedKvCache {
     }
   }
 
+  /// Force-evaluate the cache's own stored buffers in place — the per-chunk
+  /// prefill memory barrier (see [`KvCache::materialize`]).
+  ///
+  /// Evals the **full** `self.keys`/`self.values` step buffers (the arrays
+  /// the next chunk's `update` reads and splices into) via the explicit
+  /// `&mut` [`Array::eval`] — not the `seq_slice(k, 0, self.offset)` views
+  /// [`state`](KvCache::state) returns when the buffer over-allocates
+  /// (`offset != buffer_len`). Materializing the stored buffers (not the
+  /// serialization slices) keeps the prefill memory-bounded. A no-op when
+  /// empty.
+  fn materialize(&mut self) -> Result<()> {
+    if let Some(k) = self.keys.as_mut() {
+      k.eval()?;
+    }
+    if let Some(v) = self.values.as_mut() {
+      v.eval()?;
+    }
+    Ok(())
+  }
+
   /// mlx-lm `ChunkedKVCache.state` setter (`cache.py:783-786`):
   /// `self.keys, self.values = v; self.offset = self.keys.shape[2]`.
   ///

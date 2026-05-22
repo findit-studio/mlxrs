@@ -457,6 +457,29 @@ impl KvCache for RotatingKvCache {
     }
   }
 
+  /// Force-evaluate the cache's own stored ring buffers in place — the
+  /// per-chunk prefill memory barrier (see [`KvCache::materialize`]).
+  ///
+  /// Evals the **full** `self.keys`/`self.values` ring buffers (the arrays
+  /// the next chunk's `update_in_place`/`update_concat` actually reads and
+  /// extends) via the explicit `&mut` [`Array::eval`] — deliberately **not**
+  /// the `seq_slice(k, 0, self.offset)` views [`state`](KvCache::state)
+  /// returns once the buffer over-allocates (`offset < buffer_len`, the
+  /// regime an `S == 1` decode reaches after growing the ring). Evaluating
+  /// those temporary slices would materialize the slice's output buffer, not
+  /// the stored ring the next chunk reuses, so the stored lazy graph could
+  /// chain across chunks and the prefill would not be memory-bounded — the
+  /// exact bug this hook closes. A no-op when empty.
+  fn materialize(&mut self) -> Result<()> {
+    if let Some(k) = self.keys.as_mut() {
+      k.eval()?;
+    }
+    if let Some(v) = self.values.as_mut() {
+      v.eval()?;
+    }
+    Ok(())
+  }
+
   /// mlx-lm `RotatingKVCache.state` setter: `keys, values = v` (offset/idx
   /// come from [`set_meta_state`](KvCache::set_meta_state), not the keys).
   /// An empty state resets the buffer.

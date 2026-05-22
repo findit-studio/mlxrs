@@ -669,6 +669,32 @@ impl KvCache for BatchRotatingKvCache {
     }
   }
 
+  /// Force-evaluate the cache's own stored arrays in place — the per-chunk
+  /// prefill memory barrier (see [`KvCache::materialize`]).
+  ///
+  /// Evals the genuine stored arrays via the explicit `&mut` [`Array::eval`]:
+  /// the **full** `self.keys`/`self.values` ring buffers (the arrays the next
+  /// `update` reads and extends — **not** the `seq_slice(k, 0, self.off)`
+  /// views [`state`](KvCache::state) returns once the ring over-allocates),
+  /// the per-sequence `self.offset`/`self.left_padding` position arrays (lazy
+  /// `[B]` graphs that would otherwise chain across chunks), and the pending
+  /// right-pad `self.lengths` when armed. Materializes every live buffer the
+  /// next chunk reuses; `keys`/`values`/`lengths` are no-ops when absent.
+  fn materialize(&mut self) -> Result<()> {
+    if let Some(k) = self.keys.as_mut() {
+      k.eval()?;
+    }
+    if let Some(v) = self.values.as_mut() {
+      v.eval()?;
+    }
+    self.offset.eval()?;
+    self.left_padding.eval()?;
+    if let Some(lengths) = self.lengths.as_mut() {
+      lengths.eval()?;
+    }
+    Ok(())
+  }
+
   /// mlx-lm `BatchRotatingKVCache.state` setter (`cache.py:1301-1303`):
   /// `keys, values, offset, left_padding = v`. An empty state resets the
   /// buffer (`_offset`/`_idx`/`rotated`/`max_size` come from

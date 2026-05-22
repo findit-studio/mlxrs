@@ -263,6 +263,19 @@ impl KvCache for CacheList {
     Ok(())
   }
 
+  /// Force-evaluate every child cache's own stored arrays in place — the
+  /// per-chunk prefill memory barrier (see [`KvCache::materialize`]).
+  /// Delegates to each child's `materialize` (mirroring how
+  /// [`state`](KvCache::state) flattens each child's `state()`), so each
+  /// concrete child evals its genuine stored buffers rather than its
+  /// serialization view. A no-op for an empty list.
+  fn materialize(&mut self) -> Result<()> {
+    for c in &mut self.caches {
+      c.materialize()?;
+    }
+    Ok(())
+  }
+
   /// The flattened per-child framing — Swift `metaState`
   /// (KVCache.swift:1315-1327): `[childCount, (className, stateCount,
   /// metaCount, ...childMeta)*]`. `className` is each child's **reference**

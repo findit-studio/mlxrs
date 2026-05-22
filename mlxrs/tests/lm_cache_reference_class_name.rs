@@ -112,6 +112,10 @@ impl KvCache for DefaultMock {
   fn state(&self) -> Result<Vec<Array>> {
     Ok(Vec::new())
   }
+  fn materialize(&mut self) -> Result<()> {
+    // No stored arrays (this probe is empty); the barrier is a no-op.
+    Ok(())
+  }
   fn set_state(&mut self, _state: Vec<Array>) -> Result<()> {
     Ok(())
   }
@@ -177,6 +181,9 @@ impl KvCache for RotatingForwardingWrapper {
   }
   fn state(&self) -> Result<Vec<Array>> {
     self.inner.state()
+  }
+  fn materialize(&mut self) -> Result<()> {
+    self.inner.materialize()
   }
   fn set_state(&mut self, state: Vec<Array>) -> Result<()> {
     self.inner.set_state(state)
