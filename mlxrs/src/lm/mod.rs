@@ -20,6 +20,14 @@
 //! `load_adapters` — the runtime surface that applies a pre-trained adapter
 //! (`adapter_config.json` + `adapters.safetensors`) to a base model's weight
 //! map (mlx-lm `tuner/{lora,dora,utils}.py`, swift `Adapters/LoRA/`).
+//!
+//! M3 also lands the stateful multi-turn chat
+//! [`session`](crate::lm::session) ([`ChatSession`] — the port of
+//! mlx-swift-lm's `ChatSession`: a type owning the model, tokenizer, KV
+//! cache and conversation history that reuses the cache across `respond`
+//! turns).
+//!
+//! [`ChatSession`]: crate::lm::session::ChatSession
 
 pub mod cache;
 pub mod cache_prompt;
@@ -32,6 +40,7 @@ pub mod nn;
 pub mod perplexity;
 pub mod quant;
 pub mod sample;
+pub mod session;
 pub mod speculative;
 pub mod stop;
 /// Tool-call format parsers — Python `mlx_lm.tool_parsers.*`.

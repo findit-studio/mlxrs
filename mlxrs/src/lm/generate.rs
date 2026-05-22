@@ -698,6 +698,26 @@ pub struct Generator<'a, M: Model + ?Sized> {
 }
 
 impl<M: Model + ?Sized> Generator<'_, M> {
+  /// Consume the generator and return its per-layer KV cache.
+  ///
+  /// The cache the generator was constructed with is moved into the
+  /// [`Generator`] and advanced **in place** by every prefill / decode
+  /// [`Model::forward`] call — so once the iterator is exhausted (eos /
+  /// `max_tokens`) this is the *advanced* cache, holding the keys/values for
+  /// the full prompt **and** every generated token.
+  ///
+  /// This is a pure ownership transfer (no generation work, no eval): it
+  /// hands the already-owned cache back so a longer-lived caller can reuse it
+  /// — the building block a stateful, multi-turn driver
+  /// ([`crate::lm::session::ChatSession`]) needs to carry one KV cache across
+  /// `respond` turns instead of re-prefilling the conversation each time.
+  /// The plain [`stream_generate`] / [`generate`] entry points drop the cache
+  /// with the iterator (single-shot, mlx-lm's `generate_step` contract); this
+  /// accessor is the seam for the reuse case.
+  pub fn into_cache(self) -> Vec<Box<dyn KvCache>> {
+    self.cache
+  }
+
   /// Run the prompt prefill once: feed the first `total - 1` tokens through
   /// the model in `prefill_step_size` chunks (logits discarded, cache
   /// filled) by advancing [`Generator::prefill_offset`] over `self.prompt`,
