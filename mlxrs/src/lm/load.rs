@@ -61,17 +61,16 @@ pub(crate) const MAX_CONFIG_BYTES: u64 = 1 << 20;
 
 /// Quantization parameters from a checkpoint's `config.json` `quantization`
 /// block (mlx-lm `utils.py` `config["quantization"]`: `{ "group_size": int,
-/// "bits": int, ... }`). Carried so a per-usecase architecture can apply
-/// quantization itself; [`load`] never quantizes. Extra keys in the block
-/// (e.g. `"mode"`) are ignored — only the two `mlx.core.quantize` always
-/// needs are modeled here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
-pub struct Quantization {
-  /// Elements per quantization group (`mlx.core.quantize` `group_size`).
-  pub group_size: i32,
-  /// Bits per weight (`mlx.core.quantize` `bits`).
-  pub bits: i32,
-}
+/// "bits": int, [ "mode": str ] }`).
+///
+/// Re-export of the canonical [`crate::lm::quant::Quantization`] (the
+/// swift-faithful schema with `mode` — `BaseConfiguration.swift:22-56`).
+/// Carried so a per-usecase architecture can apply quantization itself;
+/// [`load`] never quantizes. For the per-layer-aware "fine-grained" schema
+/// (per-layer overrides, `Skip` entries), see
+/// [`crate::lm::quant::PerLayerQuantization`] / the
+/// [`crate::lm::quant::parse_quantization`] entry point.
+pub use crate::lm::quant::Quantization;
 
 /// The `config.json` subset the loader / generation loop needs, mirroring
 /// the keys `mlx_lm.utils.load_config` feeds into a model's `ModelArgs`.
