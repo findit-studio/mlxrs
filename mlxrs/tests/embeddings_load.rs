@@ -427,3 +427,135 @@ fn load_non_utf8_leaf_shard_nested_under_subfolder_is_recoverable_error() {
     "the error should name the offending nested shard path; got: {msg}"
   );
 }
+
+// ──────────── present-but-broken `1_Pooling/config.json` (Unix) ───────────
+//
+// `read_optional_pooling`'s presence probe must distinguish a *genuinely
+// absent* pooling config (`Ok(None)` — fall back to default pooling, the
+// faithful `_read_pooling_config` "absent" case) from a *present-but-broken*
+// one (a dangling symlink, a permission-denied path). The naïve `Path::exists()`
+// gate collapses every error into `false`, so a present-but-unresolvable config
+// would be silently treated as ABSENT and the loader would degrade to the wrong
+// pooling strategy/dimension with no diagnostic. The fix uses `symlink_metadata`
+// (`lstat`): only a genuine `NotFound` is "absent ⇒ None"; any other present /
+// unresolvable state is a recoverable `Error::Backend`. These tests drive the
+// PUBLIC `load()` so the contract is verified end-to-end.
+
+#[cfg(unix)]
+#[test]
+fn load_broken_symlink_pooling_config_is_recoverable_error() {
+  // THE DANGEROUS CASE: `1_Pooling/config.json` is a BROKEN symlink (its target
+  // does not exist). `Path::exists()` follows the link, finds nothing, and
+  // returns `false` — so the old gate would treat the config as ABSENT and the
+  // model would load with silently-wrong (default) pooling. `symlink_metadata`
+  // lstats the link itself, sees a present entry, and the parse path then fails
+  // opening the dangling target — the load must FAIL with an `Error::Backend`,
+  // NOT silently fall back to default pooling.
+  let dir = temp_dir("pooling-broken-symlink");
+  write_model_dir(&dir, "bert");
+  let pooling_dir = dir.join("1_Pooling");
+  fs::create_dir_all(&pooling_dir).unwrap();
+  // A symlink at `1_Pooling/config.json` pointing at a target that does not
+  // exist — a present directory entry whose resolution fails.
+  std::os::unix::fs::symlink(
+    dir.join("nonexistent_pooling_target.json"),
+    pooling_dir.join("config.json"),
+  )
+  .unwrap();
+
+  let registry = EmbeddingModelTypeRegistry::new().with("bert", mock_constructor());
+  let Err(err) = load(
+    &EmbeddingModelConfiguration::from_directory(&dir),
+    &registry,
+  ) else {
+    panic!(
+      "a present-but-broken (dangling-symlink) 1_Pooling/config.json must fail the load, \
+       NOT be silently treated as absent and fall back to default pooling"
+    );
+  };
+  assert!(
+    matches!(err, Error::Backend { .. }),
+    "expected a recoverable Backend error; got {err:?}"
+  );
+}
+
+#[test]
+fn load_absent_pooling_config_still_loads_with_default_pooling() {
+  // The control: a model dir with NO `1_Pooling/` directory at all (the common
+  // plain-encoder layout). A genuinely absent pooling config must NOT be turned
+  // into a false error by the stricter probe — it still loads fine with
+  // `pooling == None` (the faithful `_read_pooling_config` "absent ⇒ None").
+  let dir = temp_dir("pooling-genuinely-absent");
+  write_model_dir(&dir, "bert");
+  assert!(
+    !dir.join("1_Pooling").exists(),
+    "this fixture must not have a 1_Pooling directory"
+  );
+
+  let registry = EmbeddingModelTypeRegistry::new().with("bert", mock_constructor());
+  let ctx = load(
+    &EmbeddingModelConfiguration::from_directory(&dir),
+    &registry,
+  )
+  .expect("a genuinely-absent 1_Pooling/config.json must still load (default pooling)");
+  assert!(
+    ctx.pooling.is_none(),
+    "no 1_Pooling/config.json ⇒ no pooling override"
+  );
+}
+
+#[cfg(unix)]
+#[test]
+fn load_permission_denied_pooling_config_is_recoverable_error() {
+  // A `1_Pooling/config.json` the process cannot even stat: its parent
+  // `1_Pooling/` directory has mode 0o000, so `symlink_metadata` on the config
+  // path fails with `PermissionDenied` (no search permission on the parent).
+  // `Path::exists()` would collapse that to `false` (silently "absent" ⇒ wrong
+  // default pooling); the fix must surface it as a recoverable `Error::Backend`.
+  use std::os::unix::fs::PermissionsExt;
+
+  let dir = temp_dir("pooling-perm-denied");
+  write_model_dir(&dir, "bert");
+  let pooling_dir = dir.join("1_Pooling");
+  fs::create_dir_all(&pooling_dir).unwrap();
+  fs::write(
+    pooling_dir.join("config.json"),
+    r#"{"word_embedding_dimension": 4, "pooling_mode_cls_token": true}"#,
+  )
+  .unwrap();
+  // Drop all permissions on the parent directory: a `lstat` of any child path
+  // now fails with EACCES (no search bit).
+  fs::set_permissions(&pooling_dir, fs::Permissions::from_mode(0o000)).unwrap();
+
+  // Probe whether the env actually enforces the permission — running as root,
+  // or some CI filesystems, bypass directory permission bits. If not enforced,
+  // this case cannot be provoked here (the broken-symlink test still covers the
+  // present-but-unresolvable contract on every filesystem).
+  let enforced = fs::symlink_metadata(pooling_dir.join("config.json")).is_err();
+  let registry = EmbeddingModelTypeRegistry::new().with("bert", mock_constructor());
+  let result = load(
+    &EmbeddingModelConfiguration::from_directory(&dir),
+    &registry,
+  );
+  // Always restore so `temp_dir`'s next-run `remove_dir_all` cleanup can run,
+  // even if an assertion below fails.
+  fs::set_permissions(&pooling_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+  if !enforced {
+    eprintln!(
+      "skipping permission-denied pooling-config assertion: this environment \
+       does not enforce directory search permission"
+    );
+    return;
+  }
+  let Err(err) = result else {
+    panic!(
+      "a permission-denied 1_Pooling/config.json must fail the load, NOT be silently \
+       treated as absent and fall back to default pooling"
+    );
+  };
+  assert!(
+    matches!(err, Error::Backend { .. }),
+    "expected a recoverable Backend error; got {err:?}"
+  );
+}

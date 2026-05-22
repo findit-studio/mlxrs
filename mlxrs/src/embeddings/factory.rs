@@ -541,22 +541,50 @@ fn reject_empty_dir(dir: &Path, role: &str) -> Result<()> {
 /// `mlx_embeddings.utils._read_pooling_config` (`return None` when the file is
 /// absent) and mlx-swift-lm's `loadPooling`.
 ///
-/// An **absent** `1_Pooling/config.json` (or no `1_Pooling` directory at all)
-/// is the common case for a plain HF encoder checkpoint and yields `Ok(None)`.
-/// A **present** file is parsed via
+/// A **genuinely absent** `1_Pooling/config.json` (or no `1_Pooling` directory
+/// at all) is the common case for a plain HF encoder checkpoint and yields
+/// `Ok(None)`. A **present** entry is parsed via
 /// [`pooling_from_st_config_path`](crate::embeddings::pooling_from_st_config_path)
 /// (the existing bounded, hand-rolled strict-JSON reader); a malformed present
 /// file therefore propagates as an [`Error::Backend`] rather than being
 /// silently dropped — a planted broken pooling config is a recoverable error,
 /// not a silently-wrong pooling strategy.
+///
+/// The presence probe is [`Path::symlink_metadata`] (an `lstat` — it does
+/// **not** follow symlinks), *not* [`Path::exists`]: `exists()` collapses every
+/// error — a broken symlink, a symlink loop, permission-denied, any metadata
+/// failure — into `false`, so a *present-but-unresolvable* pooling config would
+/// be silently treated as ABSENT and the loader would fall back to the wrong
+/// pooling strategy/dimension with no diagnostic. With `symlink_metadata`:
+///
+/// - `Err(NotFound)` ⇒ the path genuinely does not exist (not even a dangling
+///   link) ⇒ `Ok(None)` — the faithful `_read_pooling_config` "absent" case.
+/// - `Ok(_)` ⇒ an entry *is* present — including a **broken symlink**, which an
+///   `lstat` reports as the link itself rather than erroring `NotFound`. The
+///   parse proceeds: [`pooling_from_st_config_path`] opens (following symlinks)
+///   and a broken/looping link, or a non-regular target, is rejected there as
+///   an [`Error::Backend`]. A "present but bad" config is thus an error, never
+///   silently-absent.
+/// - any other `Err` (permission-denied, …) ⇒ a present-but-unresolvable
+///   config ⇒ an [`Error::Backend`] naming the path, never `Ok(None)`.
 fn read_optional_pooling(dir: &Path) -> Result<Option<StPoolingConfig>> {
   // `_read_pooling_config`'s "absent ⇒ None" is a presence check on
   // `1_Pooling/config.json`; the existing reader maps an absent file to an
-  // open-error `Err`, so the presence check is done here first.
-  if !dir.join("1_Pooling").join("config.json").exists() {
-    return Ok(None);
+  // open-error `Err`, so the presence check is done here first. Probe with
+  // `symlink_metadata` (`lstat`) so a present-but-broken entry (dangling
+  // symlink, EACCES) is NOT mistaken for absence — only a genuine `NotFound`
+  // is the "absent ⇒ None" case.
+  let config_path = dir.join("1_Pooling").join("config.json");
+  match config_path.symlink_metadata() {
+    Ok(_) => crate::embeddings::config::pooling_from_st_config_path(dir).map(Some),
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+    Err(e) => Err(Error::Backend {
+      message: format!(
+        "embeddings load: pooling config at {} is present but unreadable: {e}",
+        config_path.display()
+      ),
+    }),
   }
-  crate::embeddings::config::pooling_from_st_config_path(dir).map(Some)
 }
 
 /// A discovered weight shard: its full path plus the **key prefix** to apply to
