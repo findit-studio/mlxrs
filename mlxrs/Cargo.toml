@@ -31,7 +31,7 @@ lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm",
 # grammar-engine compile cost; callers who need structured outputs opt in.
 llguidance           = ["lm", "dep:llguidance", "dep:toktrie_hf_tokenizers", "dep:serde_json"]
 vlm                  = ["lm", "dep:image"]
-audio                = ["lm", "dep:symphonia"]
+audio                = ["lm", "dep:symphonia", "dep:cpal"]
 unstable-ops-overload = []
 gguf                 = [] # GGUF load/save (mlx-c `mlx_io_gguf*`). OFF: mlxrs-sys does not yet link gguflib.
 
@@ -81,6 +81,15 @@ symphonia = { version = "0.6", optional = true, default-features = false, featur
   "ogg",
   "vorbis",
 ] }
+# Cross-platform device-audio output (A11 `audio::playback`). cpal is the
+# de-facto pure-Rust audio I/O crate (CoreAudio on macOS, WASAPI on
+# Windows, ALSA on Linux); it mirrors the cpal-equivalent of the
+# `AVAudioEngine` + `AVAudioPlayerNode` pattern the Swift
+# `MLXAudioCore.AudioPlayer` uses (Host → Device → StreamConfig →
+# Stream + a callback that pulls samples from a thread-safe queue).
+# `default-features` are already minimal (no `jack`/`asio`/wasm-bindgen
+# / audioworklet); we don't enable any of the optional backends.
+cpal = { version = "0.17", optional = true }
 regex = { version = "1", optional = true, default-features = false, features = ["std", "perf"] }
 # Grammar-constrained decoding backend (V6 — `lm::structured`). `default-features
 # = false` strips `rayon` (parallel mask compute — orthogonal to our single-

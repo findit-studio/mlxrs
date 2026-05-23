@@ -55,6 +55,7 @@ pub mod features;
 pub mod io;
 pub mod lid;
 pub mod load;
+pub mod playback;
 pub mod sts;
 pub mod stt;
 pub mod tts;
