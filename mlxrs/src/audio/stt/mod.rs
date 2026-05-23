@@ -30,5 +30,6 @@
 //! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 
 pub mod generate;
+pub mod load;
 pub mod model;
 pub mod serializers;
