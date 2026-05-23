@@ -350,9 +350,16 @@ pub fn score_single_vector(qs: &[Array], ps: &[Array]) -> Result<Array> {
 ///   surface the equivalent recoverable error instead of looping
 ///   forever).
 /// - Any query or passage with `shape[0] == 0` → [`Error::ShapeMismatch`]
-///   from the internal `pad_to_max` helper whose message contains
-///   `"zero tokens"`. See the "Precondition (enforced)" subsection of
-///   the divergence note above.
+///   whose message identifies the offending input by path tag and
+///   *global* index (e.g. `"score_multi_vector: passages[3] has zero
+///   tokens (shape[0] == 0); ..."`) and contains the substring
+///   `"zero tokens"`. The check runs up front, before any tiling, so
+///   the index is the caller's index into `qs` / `ps` — not a
+///   tile-local index. See the "Precondition (enforced)" subsection of
+///   the divergence note above. (The internal `pad_to_max` helper
+///   also rejects `shape[0] == 0` as defense-in-depth, but its message
+///   is never observed by `score_multi_vector` callers because the
+///   pre-validation fires first.)
 /// - Per-tile shape errors (mismatched `d`, non-rank-2 inputs) propagate
 ///   from [`stack`] / [`matmul`].
 pub fn score_multi_vector(qs: &[Array], ps: &[Array], batch_size: usize) -> Result<Array> {
@@ -374,6 +381,30 @@ pub fn score_multi_vector(qs: &[Array], ps: &[Array], batch_size: usize) -> Resu
     return Err(Error::ShapeMismatch {
       message: "score_multi_vector: batch_size must be non-zero".into(),
     });
+  }
+  // Pre-validate zero-token inputs up front so the error identifies the
+  // offending array by *global* index AND path tag (queries vs passages).
+  // The inner [`pad_to_max`] helper also rejects `shape[0] == 0` as
+  // defense-in-depth, but its message uses the *tile-local* index and
+  // has no path tag — e.g. with `batch_size = 128`, passage `ps[129]`
+  // would otherwise be reported as `array 1`. The early guard fires
+  // before the tile loop, so `pad_to_max` never sees zero-token input
+  // from this caller. Mirrors the single-vector path's pre-validation
+  // (lines 219-233).
+  for (label, slice) in [("queries", qs), ("passages", ps)] {
+    for (i, a) in slice.iter().enumerate() {
+      let sh = a.shape();
+      // `shape[0] == 0` flags both `(0,)` rank-1 vectors and any
+      // higher-rank input whose leading axis is empty.
+      if sh.first().copied() == Some(0) {
+        return Err(Error::ShapeMismatch {
+          message: format!(
+            "score_multi_vector: {label}[{i}] has zero tokens (shape[0] == 0); \
+             non-empty token sequences are required for the masked MaxSim contract"
+          ),
+        });
+      }
+    }
   }
   // python lines 93-105: outer-loop over query tiles, inner-loop over
   // passage tiles, MaxSim per tile, concat along passage axis (axis=1)
@@ -771,16 +802,20 @@ mod tests {
   }
 
   /// REGRESSION (Codex finding, round 2): a zero-token query is
-  /// rejected by `score_multi_vector` via [`pad_to_max`] — even though
-  /// the outer `qs.is_empty()` guard passes, the per-array
-  /// `shape[0] == 0` check in `pad_to_max` must fire. The contract is
-  /// that callers filter out empty-tokenization inputs before invoking
-  /// the scorer; if they don't, the failure must be observable and
-  /// recoverable (not non-finite scores).
+  /// rejected by `score_multi_vector` — even though the outer
+  /// `qs.is_empty()` guard passes, the per-array `shape[0] == 0` check
+  /// must fire. The contract is that callers filter out
+  /// empty-tokenization inputs before invoking the scorer; if they
+  /// don't, the failure must be observable and recoverable (not
+  /// non-finite scores).
+  ///
+  /// REGRESSION (Codex finding, round 3): the message must carry the
+  /// path tag (`queries`) AND the *global* index, not a tile-local
+  /// `array N` from the inner `pad_to_max` helper.
   ///
   /// Assertion: returns [`Error::ShapeMismatch`] whose message
-  /// contains `"zero tokens"` (the inner `pad_to_max` guard message),
-  /// not a propagation of `-inf` through the masked MaxSim.
+  /// contains `"zero tokens"` AND `"queries[0]"`, not a propagation of
+  /// `-inf` through the masked MaxSim.
   #[test]
   fn score_multi_vector_rejects_zero_token_query() {
     let q_empty = Array::from_slice::<f32>(&[], &(0, 2)).unwrap();
@@ -793,24 +828,28 @@ mod tests {
     .unwrap_err();
     assert!(
       matches!(err, Error::ShapeMismatch { .. }),
-      "expected ShapeMismatch from inner pad_to_max guard, got {err:?}"
+      "expected ShapeMismatch from score_multi_vector pre-validation, got {err:?}"
     );
     let msg = format!("{err}");
     assert!(
-      msg.contains("zero tokens"),
-      "expected 'zero tokens' in message, got {msg}"
+      msg.contains("zero tokens") && msg.contains("queries[0]"),
+      "expected 'zero tokens' + 'queries[0]' in message, got {msg}"
     );
   }
 
   /// REGRESSION (Codex finding, round 2): the high-finding fixture.
   /// `q = [[1, 0]]`, `p0 = [[0_size_2]]` (zero tokens), `p1 = [[2, 0],
-  /// [0, 1]]`. Without the `pad_to_max` zero-token guard, the
-  /// `(c=2, s_max=2)` mask row for `p0` would be all-`false`,
-  /// [`select`] would replace every `(b=1, c=0, n=1, s)` similarity
-  /// with `-inf`, `max(axis=3)` would return `-inf` for that passage,
-  /// and `sum(axis=2)` would propagate to a `-inf` ranking score.
-  /// The guard surfaces a recoverable [`Error::ShapeMismatch`]
-  /// instead, with a message identifying the zero-token array.
+  /// [0, 1]]`. Without the zero-token guard, the `(c=2, s_max=2)` mask
+  /// row for `p0` would be all-`false`, [`select`] would replace every
+  /// `(b=1, c=0, n=1, s)` similarity with `-inf`, `max(axis=3)` would
+  /// return `-inf` for that passage, and `sum(axis=2)` would propagate
+  /// to a `-inf` ranking score. The guard surfaces a recoverable
+  /// [`Error::ShapeMismatch`] instead.
+  ///
+  /// REGRESSION (Codex finding, round 3): the message must carry the
+  /// path tag (`passages`) AND the *global* index — here `passages[0]`
+  /// — even though `p0` is also at tile-local index 0 (the
+  /// distinguishing global-vs-local fixture is below).
   #[test]
   fn score_multi_vector_rejects_zero_token_passage_in_mixed_tile() {
     let q = Array::from_slice::<f32>(&[1.0, 0.0], &(1, 2)).unwrap();
@@ -822,12 +861,67 @@ mod tests {
     let err = score_multi_vector(std::slice::from_ref(&q), &[p0, p1], 2).unwrap_err();
     assert!(
       matches!(err, Error::ShapeMismatch { .. }),
-      "expected ShapeMismatch from pad_to_max (NOT -inf propagation), got {err:?}"
+      "expected ShapeMismatch from pre-validation (NOT -inf propagation), got {err:?}"
     );
     let msg = format!("{err}");
     assert!(
-      msg.contains("zero tokens"),
-      "expected 'zero tokens' in message, got {msg}"
+      msg.contains("zero tokens") && msg.contains("passages[0]"),
+      "expected 'zero tokens' + 'passages[0]' in message, got {msg}"
+    );
+  }
+
+  /// REGRESSION (Codex finding, round 3): when the zero-token query is
+  /// at a *non-zero* position whose tile-local index differs from the
+  /// global index, the message must report the GLOBAL index. With
+  /// `batch_size = 128` and `qs.len() = 4`, every query sits in the
+  /// same first tile, so the tile-local index equals the global index
+  /// here — but the path tag (`queries`) and 0-vs-N distinction would
+  /// still have been lost with the old inner-helper message
+  /// (`array 2`). Asserts `queries[2]` and `zero tokens`.
+  #[test]
+  fn score_multi_vector_rejects_zero_token_query_at_non_zero_global_index() {
+    let q0 = Array::from_slice::<f32>(&[1.0, 0.0], &(1, 2)).unwrap();
+    let q1 = Array::from_slice::<f32>(&[0.0, 1.0], &(1, 2)).unwrap();
+    let q_empty = Array::from_slice::<f32>(&[], &(0, 2)).unwrap();
+    let q3 = Array::from_slice::<f32>(&[1.0, 1.0], &(1, 2)).unwrap();
+    let p = Array::from_slice::<f32>(&[1.0, 0.0, 0.0, 1.0], &(2, 2)).unwrap();
+    let err =
+      score_multi_vector(&[q0, q1, q_empty, q3], std::slice::from_ref(&p), 128).unwrap_err();
+    assert!(
+      matches!(err, Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch from pre-validation, got {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("zero tokens") && msg.contains("queries[2]"),
+      "expected 'zero tokens' + 'queries[2]' (GLOBAL index) in message, got {msg}"
+    );
+  }
+
+  /// REGRESSION (Codex finding, round 3): the distinguishing global-
+  /// vs-tile-local fixture. With `ps.len() = 4` and `batch_size = 2`,
+  /// the offending zero-token passage at global index 3 lives in the
+  /// SECOND tile and would have been reported by the inner
+  /// `pad_to_max` helper as `array 1` (tile-local). The pre-validate
+  /// fix reports the global `passages[3]` instead.
+  #[test]
+  fn score_multi_vector_rejects_zero_token_passage_at_non_zero_global_index() {
+    let q = Array::from_slice::<f32>(&[1.0, 0.0], &(1, 2)).unwrap();
+    let p0 = Array::from_slice::<f32>(&[1.0, 0.0], &(1, 2)).unwrap();
+    let p1 = Array::from_slice::<f32>(&[0.0, 1.0], &(1, 2)).unwrap();
+    let p2 = Array::from_slice::<f32>(&[1.0, 1.0], &(1, 2)).unwrap();
+    let p_empty = Array::from_slice::<f32>(&[], &(0, 2)).unwrap();
+    // batch_size=2 → tiles {p0, p1} and {p2, p_empty}; p_empty is
+    // tile-local index 1 within its tile but global index 3.
+    let err = score_multi_vector(std::slice::from_ref(&q), &[p0, p1, p2, p_empty], 2).unwrap_err();
+    assert!(
+      matches!(err, Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch from pre-validation, got {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("zero tokens") && msg.contains("passages[3]"),
+      "expected 'zero tokens' + 'passages[3]' (GLOBAL index, not tile-local 'array 1') in message, got {msg}"
     );
   }
 
