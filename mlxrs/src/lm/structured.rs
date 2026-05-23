@@ -149,9 +149,42 @@ fn tok_env_from_tokenizer(
   let json = serde_json::to_vec(tokenizer.hf()).map_err(|e| Error::Backend {
     message: format!("llguidance: serialize HF tokenizer: {e}"),
   })?;
-  let bt = ByteTokenizer::from_json_bytes(&json).map_err(|e| Error::Backend {
+  let mut bt = ByteTokenizer::from_json_bytes(&json).map_err(|e| Error::Backend {
     message: format!("llguidance: build ByteTokenizer: {e}"),
   })?;
+
+  // Sync mlxrs's configured EOS ids into the ByteTokenizer so the resulting
+  // [`TokEnv`]'s `tok_trie().eos_token_set()` matches the model's ACTUAL
+  // stop ids. Upstream `ByteTokenizer::from_tokenizer`
+  // (`toktrie_hf_tokenizers/src/lib.rs:179-194`) only auto-detects a small
+  // hardcoded set of EOS strings (`</s>`, `<|endoftext|>`,
+  // `<|end_of_text|>`, DeepSeek's `<｜end▁of▁sentence｜>`, `<eos>`) and
+  // silently defaults `tok_eos` to id `0` for everything else (note: it
+  // classifies `<|im_end|>`/`<|eot_id|>` as `tok_end_of_turn`, NOT `tok_eos`).
+  // Without this sync:
+  //   - a caller-supplied `eos_token_ids` override is ignored by llguidance,
+  //   - a `tokenizer_config.json` `eos_token` string outside the hardcoded
+  //     list (e.g. `<|im_end|>`) is silently dropped,
+  //   - and `compute_mask_or_eos` returns an EOS-only mask gated by the
+  //     WRONG eos id (id `0`).
+  //
+  // [`ByteTokenizer::set_eos_tokens`]
+  // (`toktrie_hf_tokenizers/src/lib.rs:271-282`) registers the full ordered
+  // eos set: `tokens[0]` becomes the primary `tok_eos`, the rest are extras,
+  // and `into_tok_env` later threads them through `TokTrie::with_eos_tokens`
+  // (`lib.rs:326-328`). The mlxrs `Tokenizer::eos_token_ids()` returns a
+  // `BTreeSet<u32>` — iterating in sorted-numeric order is deterministic;
+  // for mask correctness only the SET membership matters
+  // (`eos_token_set()` collects every registered id), so the chosen
+  // slot-0 primary doesn't change which ids are unmasked. Skip the call
+  // when the set is empty (no eos configured at all) — `set_eos_tokens`
+  // panics on an empty slice, and in that case upstream's hardcoded
+  // detection is the only signal we have anyway.
+  let configured_eos: Vec<u32> = tokenizer.eos_token_ids().iter().copied().collect();
+  if !configured_eos.is_empty() {
+    bt.set_eos_tokens(&configured_eos);
+  }
+
   bt.into_tok_env(model_vocab_size)
     .map_err(|e| Error::Backend {
       message: format!("llguidance: build TokEnv: {e}"),

@@ -24,6 +24,16 @@
 //! - `llguidance_processor_implements_logits_processor_trait` — compile-
 //!   check that `into_logits_processor` plugs into the
 //!   `make_logits_processors` trait alias.
+//! - `llguidance_terminal_grammar_uses_mlxrs_configured_custom_eos_id` —
+//!   R2 fix: pin `Tokenizer::eos_token_ids` to a custom id whose string
+//!   is OUTSIDE `toktrie_hf_tokenizers`'s hardcoded auto-detect set,
+//!   then assert the terminal-grammar EOS-only mask leaves ONLY that
+//!   id finite (NOT the upstream-default id 0 or the auto-detected
+//!   `</s>`).
+//! - `llguidance_terminal_grammar_multi_eos_unmasks_all_configured_ids`
+//!   — R2 fix: pin three caller-supplied eos ids (mixed
+//!   auto-detect/non-auto-detect), assert all three remain finite in
+//!   the EOS-only mask and every non-eos id is `-inf`.
 
 #![cfg(all(feature = "lm", feature = "llguidance"))]
 
@@ -393,6 +403,293 @@ fn llguidance_terminal_lark_grammar_returns_eos_only_after_close() {
 // placeholder special tokens up to the model's actual vocab width. The
 // placeholder ids have no real byte sequence, so the grammar engine
 // never allows them — they must always be `-inf` in the returned mask.
+
+// ── Finding 1 (R2): mlxrs-configured EOS ids synced into ByteTokenizer ─
+//
+// `tok_env_from_tokenizer` used to build the `ByteTokenizer` via
+// `from_json_bytes` + `into_tok_env` WITHOUT syncing
+// `Tokenizer::eos_token_ids()` — upstream `from_tokenizer` only auto-
+// detects a small hardcoded set of EOS strings (`</s>`, `<|endoftext|>`,
+// `<|end_of_text|>`, DeepSeek's `<｜end▁of▁sentence｜>`, `<eos>`) and
+// silently defaults `tok_eos` to id `0` for everything else. The previous
+// terminal-grammar test happened to use a fixture with `</s>` at id 2,
+// masking the bug. The fix calls
+// [`ByteTokenizer::set_eos_tokens`](https://github.com/microsoft/llguidance/blob/main/toktrie_hf_tokenizers/src/lib.rs#L271-L282)
+// (toktrie_hf_tokenizers/src/lib.rs:271-282) right after the
+// ByteTokenizer is built and BEFORE `into_tok_env`, so the
+// `tok_trie().eos_token_set()` returned by `compute_mask_or_eos` reflects
+// the model's ACTUAL stop ids.
+//
+// Test 1: a fixture whose EOS string is NOT in upstream's hardcoded set
+// (`<|im_end|>` — upstream classifies it as `tok_end_of_turn`, NOT
+// `tok_eos`). Force `Tokenizer::from_path` to pin `eos_token_ids =
+// [<im_end_id>]`; assert the terminal-grammar EOS-only mask leaves
+// EXACTLY that id finite (NOT id 0, NOT id 2 `</s>`).
+//
+// Test 2: a fixture with MULTIPLE caller-supplied eos ids; assert ALL of
+// them remain finite in the EOS-only mask, and every non-eos id is
+// `-inf`.
+
+/// Build a byte-level tokenizer JSON fixture with `extra_added` placed
+/// after the base 3 specials + printable ASCII region. Each entry is
+/// (`(id, content)`); content must be a `<...>`-bracketed special-token
+/// string so `toktrie_hf_tokenizers::ByteTokenizer::from_tokenizer`
+/// classifies it as a special (lib.rs:181 `info.content.starts_with("<")
+/// && info.content.ends_with(">")`). Ids MUST be > 97 (the existing
+/// fixture's last printable-ASCII id is `3 + 95 - 1 = 97`).
+fn build_byte_level_tokenizer_json_with_extras(extra_added: &[(u32, &str)]) -> String {
+  // Reuse the base vocab body (specials + 95 printable ASCII tokens at
+  // ids 3..=97), then splice extras into the `added_tokens` array AND
+  // the BPE `vocab` map.
+  let mut vocab_entries: Vec<String> = Vec::new();
+  vocab_entries.push("\"<unk>\": 0".to_string());
+  vocab_entries.push("\"<s>\": 1".to_string());
+  vocab_entries.push("\"</s>\": 2".to_string());
+  let mut next_id: u32 = 3;
+  let mut k: u32 = 0x100;
+  let mut char_map: Vec<char> = Vec::with_capacity(256);
+  for byte in 0..=255u8 {
+    let c = byte as char;
+    let mapped = match c {
+      '!'..='~' => c,
+      '\u{00A1}'..='\u{00AC}' => c,
+      '\u{00AE}'..='\u{00FF}' => c,
+      _ => {
+        let m = char::from_u32(k).unwrap();
+        k += 1;
+        m
+      }
+    };
+    char_map.push(mapped);
+  }
+  for byte in 0x20u8..=0x7Eu8 {
+    let glyph = char_map[byte as usize];
+    let escaped = match glyph {
+      '"' => "\\\"".to_string(),
+      '\\' => "\\\\".to_string(),
+      c => c.to_string(),
+    };
+    vocab_entries.push(format!("\"{}\": {}", escaped, next_id));
+    next_id += 1;
+  }
+  // Splice extras (JSON-escape the content; brackets `<|...|>` are
+  // JSON-safe as-is).
+  let mut added_entries: Vec<String> = vec![
+    "{\"id\": 0, \"content\": \"<unk>\", \"single_word\": false, \"lstrip\": false, \"rstrip\": false, \"normalized\": false, \"special\": true}".to_string(),
+    "{\"id\": 1, \"content\": \"<s>\", \"single_word\": false, \"lstrip\": false, \"rstrip\": false, \"normalized\": false, \"special\": true}".to_string(),
+    "{\"id\": 2, \"content\": \"</s>\", \"single_word\": false, \"lstrip\": false, \"rstrip\": false, \"normalized\": false, \"special\": true}".to_string(),
+  ];
+  for &(id, content) in extra_added {
+    assert!(
+      id >= next_id,
+      "extra-added id {id} must be > base vocab top id {}",
+      next_id - 1
+    );
+    vocab_entries.push(format!("\"{}\": {}", content, id));
+    added_entries.push(format!(
+      "{{\"id\": {}, \"content\": \"{}\", \"single_word\": false, \"lstrip\": false, \"rstrip\": false, \"normalized\": false, \"special\": true}}",
+      id, content
+    ));
+  }
+
+  format!(
+    r#"{{
+      "version": "1.0",
+      "truncation": null,
+      "padding": null,
+      "added_tokens": [
+        {}
+      ],
+      "normalizer": null,
+      "pre_tokenizer": {{
+        "type": "ByteLevel",
+        "add_prefix_space": false,
+        "trim_offsets": true
+      }},
+      "post_processor": null,
+      "decoder": {{
+        "type": "ByteLevel",
+        "add_prefix_space": false,
+        "trim_offsets": true
+      }},
+      "model": {{
+        "type": "BPE",
+        "dropout": null,
+        "unk_token": "<unk>",
+        "continuing_subword_prefix": null,
+        "end_of_word_suffix": null,
+        "fuse_unk": false,
+        "vocab": {{
+          {}
+        }},
+        "merges": []
+      }}
+    }}"#,
+    added_entries.join(",\n        "),
+    vocab_entries.join(",\n          ")
+  )
+}
+
+/// Same as [`fixture_tokenizer`] but installs `extra_added` specials AND
+/// pins `eos_token_ids` to `eos_override` (replacing the `eos_token` =
+/// `</s>` default from `TOKENIZER_CONFIG_JSON`).
+fn fixture_tokenizer_with_eos_override(
+  name: &str,
+  extra_added: &[(u32, &str)],
+  eos_override: &[u32],
+) -> mlxrs::tokenizer::Tokenizer {
+  let dir = temp_dir(name);
+  let tj_path = dir.join("tokenizer.json");
+  let mut tj = fs::File::create(&tj_path).unwrap();
+  tj.write_all(build_byte_level_tokenizer_json_with_extras(extra_added).as_bytes())
+    .unwrap();
+  let mut tc = fs::File::create(dir.join("tokenizer_config.json")).unwrap();
+  tc.write_all(TOKENIZER_CONFIG_JSON.as_bytes()).unwrap();
+  mlxrs::tokenizer::Tokenizer::from_path(&dir, Some(eos_override))
+    .unwrap_or_else(|e| panic!("fixture tokenizer load failed: {e}"))
+}
+
+/// Custom EOS id placed after the printable-ASCII region. Id 98 is the
+/// next free slot (base ids 0..=2 are specials, 3..=97 are printables).
+const CUSTOM_EOS_ID: u32 = 98;
+
+#[test]
+fn llguidance_terminal_grammar_uses_mlxrs_configured_custom_eos_id() {
+  // `<|im_end|>` is NOT in `toktrie_hf_tokenizers`'s hardcoded `tok_eos`
+  // detection list (it's classified as `tok_end_of_turn` —
+  // `toktrie_hf_tokenizers/src/lib.rs:189`). Pre-fix, the resulting
+  // `tok_eos` would default to `0`, and a terminal grammar's EOS-only
+  // mask would leave ONLY id 0 finite. Post-fix, the sync via
+  // `set_eos_tokens` carries the mlxrs-configured override
+  // (`eos_token_ids = [CUSTOM_EOS_ID]`) into the toktrie, and only that
+  // id is finite.
+  let tok = fixture_tokenizer_with_eos_override(
+    "terminal_custom_eos",
+    &[(CUSTOM_EOS_ID, "<|im_end|>")],
+    &[CUSTOM_EOS_ID],
+  );
+  // Sanity: the mlxrs wrapper now reports exactly that one eos id.
+  let set = tok.eos_token_ids();
+  assert_eq!(
+    set.iter().copied().collect::<Vec<u32>>(),
+    vec![CUSTOM_EOS_ID],
+    "mlxrs Tokenizer::eos_token_ids() must reflect the from_path override"
+  );
+
+  // Terminal regex grammar `a`: after consuming `a` the matcher is
+  // stopped and `compute_mask_or_eos` returns `tok_trie().eos_token_set()`.
+  let grammar = structured::GrammarSpec::Regex("a".to_string());
+  let proc = structured::LLGuidanceLogitsProcessor::new(grammar, &tok, None)
+    .expect("processor construction with custom eos override should succeed");
+
+  let vocab = tok.hf().get_vocab_size(true);
+  let zeros = vec![0.0f32; vocab];
+  let logits = Array::from_slice::<f32>(&zeros, &(1, vocab)).unwrap();
+
+  // Prime, then drive to terminal state by consuming `a`.
+  let _ = proc
+    .apply(&[], &logits)
+    .expect("first apply should succeed");
+  let a_token_id = id_for_byte(b'a');
+  let mut out = proc
+    .apply(&[a_token_id], &logits)
+    .expect("post-consume apply should succeed");
+  let out_v = out.to_vec::<f32>().unwrap();
+  assert_eq!(out_v.len(), vocab);
+
+  // Post-fix assertion: ONLY the custom eos id is finite.
+  assert!(
+    out_v[CUSTOM_EOS_ID as usize].is_finite(),
+    "EOS-only mask: custom eos id {CUSTOM_EOS_ID} must remain finite, got {}",
+    out_v[CUSTOM_EOS_ID as usize]
+  );
+  // Pre-fix this would be finite (upstream defaulted `tok_eos` to 0);
+  // post-fix it must be `-inf`.
+  assert!(
+    out_v[0].is_infinite() && out_v[0] < 0.0,
+    "EOS-only mask: id 0 (upstream's pre-fix default `tok_eos`) must be -inf, got {}",
+    out_v[0]
+  );
+  // The previous hardcoded-default `</s>` id must NOT be unmasked
+  // (proving the override REPLACES — not unions with — upstream's
+  // auto-detection).
+  assert!(
+    out_v[FIXTURE_EOS_ID].is_infinite() && out_v[FIXTURE_EOS_ID] < 0.0,
+    "EOS-only mask: hardcoded `</s>` id {FIXTURE_EOS_ID} must be -inf (override replaces), got {}",
+    out_v[FIXTURE_EOS_ID]
+  );
+  // Every other id is `-inf`.
+  for (i, v) in out_v.iter().enumerate() {
+    if i as u32 == CUSTOM_EOS_ID {
+      continue;
+    }
+    assert!(
+      v.is_infinite() && *v < 0.0,
+      "EOS-only mask: non-eos id {i} must be -inf, got {v}"
+    );
+  }
+}
+
+#[test]
+fn llguidance_terminal_grammar_multi_eos_unmasks_all_configured_ids() {
+  // Multiple caller-supplied eos ids — the sync must register ALL of
+  // them in the toktrie's EOS set, so `compute_mask_or_eos` leaves every
+  // configured id finite (and only those). Use ids 1, 2, and 98:
+  //   - id 1 = `<s>` (in the base fixture; NOT auto-eos upstream)
+  //   - id 2 = `</s>` (in the base fixture; IS auto-eos upstream)
+  //   - id 98 = `<|im_end|>` (added; NOT auto-eos upstream).
+  // The mixed selection proves the path is "use the caller-supplied
+  // set" — not "union" or "fall back to auto-detection".
+  let tok = fixture_tokenizer_with_eos_override(
+    "terminal_multi_eos",
+    &[(CUSTOM_EOS_ID, "<|im_end|>")],
+    &[1, 2, CUSTOM_EOS_ID],
+  );
+  let set = tok.eos_token_ids();
+  assert_eq!(
+    set.iter().copied().collect::<Vec<u32>>(),
+    vec![1, 2, CUSTOM_EOS_ID],
+    "mlxrs Tokenizer::eos_token_ids() must hold all three caller-supplied ids"
+  );
+
+  let grammar = structured::GrammarSpec::Regex("a".to_string());
+  let proc = structured::LLGuidanceLogitsProcessor::new(grammar, &tok, None)
+    .expect("processor construction with multi-eos override should succeed");
+
+  let vocab = tok.hf().get_vocab_size(true);
+  let zeros = vec![0.0f32; vocab];
+  let logits = Array::from_slice::<f32>(&zeros, &(1, vocab)).unwrap();
+
+  let _ = proc
+    .apply(&[], &logits)
+    .expect("first apply should succeed");
+  let a_token_id = id_for_byte(b'a');
+  let mut out = proc
+    .apply(&[a_token_id], &logits)
+    .expect("post-consume apply should succeed");
+  let out_v = out.to_vec::<f32>().unwrap();
+  assert_eq!(out_v.len(), vocab);
+
+  // All three configured eos ids must remain finite.
+  for &eos in &[1u32, 2u32, CUSTOM_EOS_ID] {
+    assert!(
+      out_v[eos as usize].is_finite(),
+      "EOS-only mask: configured eos id {eos} must remain finite, got {}",
+      out_v[eos as usize]
+    );
+  }
+  // Every other id (including id 0 = upstream's pre-fix default eos) is `-inf`.
+  for (i, v) in out_v.iter().enumerate() {
+    let id = i as u32;
+    if id == 1 || id == 2 || id == CUSTOM_EOS_ID {
+      continue;
+    }
+    assert!(
+      v.is_infinite() && *v < 0.0,
+      "EOS-only mask: non-eos id {i} must be -inf, got {v}"
+    );
+  }
+}
 
 #[test]
 fn llguidance_processor_accepts_padded_model_vocab() {
