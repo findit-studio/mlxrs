@@ -80,5 +80,7 @@ pub use stream::{DetokenizerClass, NaiveStreamingDetokenizer, StreamingDetokeniz
 /// streaming [`tools::ToolCallProcessor`], and the selectors.
 #[cfg(feature = "tokenizer-tools")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokenizer-tools")))]
-pub use tools::{ToolCall, ToolCallProcessor, ToolParser, infer_tool_parser, parser_by_name};
+pub use tools::{
+  TaggedPayloadShape, ToolCall, ToolCallProcessor, ToolParser, infer_tool_parser, parser_by_name,
+};
 pub use wrapper::{Tokenizer, no_bos_or_eos};

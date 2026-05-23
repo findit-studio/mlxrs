@@ -60,5 +60,6 @@
 
 pub use crate::tokenizer::tools::{
   FunctionGemma, Gemma4, Glm47, JsonTools, KimiK2, Longcat, MinimaxM2, Mistral, Pythonic,
-  Qwen3Coder, ToolCall, ToolCallProcessor, ToolParser, infer_tool_parser, parser_by_name,
+  Qwen3Coder, TaggedPayloadShape, ToolCall, ToolCallProcessor, ToolParser, infer_tool_parser,
+  parser_by_name,
 };
