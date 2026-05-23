@@ -5,12 +5,20 @@
 //! `mlx-vlm/mlx_vlm/models/falcon_ocr/language.py::create_falcon_ocr_mask`
 //! (lines ~120–149).
 //!
-//! Per-model chat templates (`MessageFormatter`/`MessageFormat` in
-//! `prompt_utils.py`) and the per-model `merge_input_ids_with_image_features`
-//! embedding-space splice are deliberately **out of scope** (the latter
-//! operates on embeddings inside each model's forward pass; here we only
-//! touch tokens + an attention mask). See the `project_no_per_model_arch_porting`
-//! convention.
+//! ## V4 addition: chat-format builder (`MessageFormat` + `MessageFormatter`)
+//!
+//! The per-model chat-format selection layer (`MessageFormat` enum,
+//! `MODEL_CONFIG` per-family map, `SINGLE_IMAGE_ONLY_MODELS` set,
+//! `MessageBuilder`, `MessageFormatter`, `get_message_json`) is now ported
+//! 1:1 from `mlx-vlm/mlx_vlm/prompt_utils.py` (the 15-variant `MessageFormat`
+//! enum at lines 6–23 + the ~60-entry `MODEL_CONFIG` dict at lines 27–89 +
+//! the formatter dispatch at lines 192–441). This is declarative
+//! configuration data + a small dispatch — NOT per-model architecture.
+//!
+//! What stays out of scope: the per-model `merge_input_ids_with_image_features`
+//! embedding-space splice (operates on embeddings inside each model's forward
+//! pass) and per-model architecture impls — see the
+//! `project_no_per_model_arch_porting` convention.
 //!
 //! ## API at a glance
 //!
@@ -34,6 +42,19 @@
 //!   `(1, 1, S, S)` return contract.
 //! - [`assemble_multimodal_prompt`] — end-to-end: splice + per-image span
 //!   computation (preserves causal-across-images boundary) + mask.
+//! - [`MessageFormat`] — 15-variant enum mirroring the Python
+//!   `MessageFormat(Enum)` at lines 6–23 (one-to-one).
+//! - [`MODEL_CONFIG`] — `&[(model_type, MessageFormat)]` per-family map
+//!   mirroring the Python `MODEL_CONFIG` dict at lines 27–89.
+//! - [`SINGLE_IMAGE_ONLY_MODELS`] — model-type allow-list mirroring the
+//!   Python set at lines 92–100.
+//! - [`MessageBuilder`] — content-item constructors mirroring the Python
+//!   `MessageBuilder` class at lines 151–189 (text / content / image /
+//!   image_url / audio / video).
+//! - [`MessageFormatter`] — per-model dispatch mirroring the Python class
+//!   at lines 192–441.
+//! - [`get_message_json`] — top-level helper mirroring the Python free
+//!   function at lines 444–480.
 //!
 //! ## Mask semantics
 //!
@@ -762,4 +783,846 @@ pub fn assemble_multimodal_prompt(
     image_spans,
     attention_mask,
   })
+}
+
+// ==========================================================================
+// V4: chat-format builder (`MessageFormat` + `MessageFormatter`)
+// ==========================================================================
+//
+// Faithful 1:1 port of the model-agnostic chat-format selection layer in
+// `mlx-vlm/mlx_vlm/prompt_utils.py`. Per the
+// `project_no_per_model_arch_porting` convention this is declarative
+// configuration data (the per-model-family `MessageFormat` selection) +
+// a small format dispatcher — NOT model-architecture impls.
+//
+// The Python ref is intentionally a thin builder: it produces a
+// `{"role": ..., "content": ...}` dict (or sometimes a plain `str`) for a
+// single chat turn; the per-model image/audio token-injection convention
+// is encoded in the `MessageFormat` selected by [`MODEL_CONFIG`].
+
+/// 15-variant `MessageFormat` enum — one-to-one with the Python
+/// `MessageFormat(Enum)` at `mlx-vlm/mlx_vlm/prompt_utils.py:6–23`.
+///
+/// Each variant selects how a chat message's `content` is built for a
+/// model-family. The selection per model_type is encoded in
+/// [`MODEL_CONFIG`]. The 15 variants split into four families:
+///
+/// 1. **List-with-image** (image is a separate content item, image-tag
+///    position is configurable): [`MessageFormat::ListWithImage`],
+///    [`MessageFormat::ListWithImageFirst`],
+///    [`MessageFormat::ListWithImageUrlFirst`],
+///    [`MessageFormat::ListWithImageType`],
+///    [`MessageFormat::ListWithImageTypeText`],
+///    [`MessageFormat::ListWithImageTypeTextImageLast`].
+/// 2. **Image-token in text** (image is a sentinel token embedded in the
+///    text content): [`MessageFormat::ImageToken`],
+///    [`MessageFormat::ImageTokenPipe`],
+///    [`MessageFormat::StartImageToken`],
+///    [`MessageFormat::ImageTokenNewline`],
+///    [`MessageFormat::NumberedImageTokens`].
+/// 3. **Prompt-only** (just the prompt string, possibly with image-token
+///    prefix): [`MessageFormat::PromptOnly`],
+///    [`MessageFormat::PromptWithImageToken`],
+///    [`MessageFormat::PromptWithStartImageToken`].
+/// 4. **Video-with-text** (one entry per video plus a trailing text):
+///    [`MessageFormat::VideoWithText`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum MessageFormat {
+  /// `list_with_image` — `content = [text, image*]` (text first, then
+  /// image entries). Used by idefics2, aya_vision, qwen2_vl, llava, …
+  ListWithImage,
+  /// `list_with_image_first` — `content = [image*, text]` (images first).
+  /// Used by idefics3, qwen2_5_vl, qwen3_vl, mistral3, smolvlm, …
+  ListWithImageFirst,
+  /// `list_with_image_url_first` — same as `list_with_image_first` but
+  /// the image entries use `{"type": "image_url"}` (ERNIE-family).
+  ListWithImageUrlFirst,
+  /// `list_with_image_type` — `content = [image*, content_text]` with
+  /// `content_message` (`{type:"text", text, content}`) for text and
+  /// `image_message` for image; also appends audio entries after text in
+  /// the user role. Default for internvl_chat, nemotron-h.
+  ListWithImageType,
+  /// `list_with_image_type_text` — variant of [`Self::ListWithImageType`]
+  /// using `text_message` instead of `content_message`. Used by gemma3n,
+  /// gemma4, pixtral.
+  ListWithImageTypeText,
+  /// `list_with_image_type_text_image_last` — variant of
+  /// [`Self::ListWithImageTypeText`] but with images AFTER the text.
+  /// Declared in the enum at line 14, but no model in the Python ref's
+  /// `MODEL_CONFIG` selects it; ported for parity.
+  ListWithImageTypeTextImageLast,
+  /// `image_token` — content is a string `f"{<image>*N}{prompt}"`
+  /// (image-token prefix). Used by minicpmo, multi_modality.
+  ImageToken,
+  /// `image_token_pipe` — content is a string with `<|image|>` token
+  /// prefix. Used by jvlm / jina_vlm.
+  ImageTokenPipe,
+  /// `start_image_token` — content is a string `f"{prompt}{<start_of_image>*N}"`
+  /// (image token APPENDED, not prepended). Used by gemma3.
+  StartImageToken,
+  /// `image_token_newline` — `<image>\n` token prefix (per-image).
+  /// Used by llava-qwen2, bunny-llama, deepseek_vl_v2.
+  ImageTokenNewline,
+  /// `numbered_image_tokens` — `<|image_1|><|image_2|>...` prefix
+  /// (followed by `<|audio_N|>` numbered audio tokens). Used by
+  /// phi3_v, phi4mm.
+  NumberedImageTokens,
+  /// `prompt_only` — content is the bare prompt string, no tokens
+  /// injected. Used by florence2, molmo, moondream3, falcon_ocr.
+  PromptOnly,
+  /// `prompt_with_image_token` — content is `f"<image>*N + prompt"`
+  /// (a flat string, not a dict). Used by paligemma.
+  PromptWithImageToken,
+  /// `prompt_with_start_image_token` — content is
+  /// `f"prompt + <start_of_image>*N"`. Declared in the enum at line 22,
+  /// but no model in the Python ref's `MODEL_CONFIG` selects it;
+  /// ported for parity.
+  PromptWithStartImageToken,
+  /// `video_with_text` — `content = [{type:"video", video, max_pixels,
+  /// fps} * N, text]`. Used by qwen2_vl / qwen2_5_vl / qwen3_vl /
+  /// qwen3_omni_moe / gemma4 when `video=` is passed.
+  VideoWithText,
+}
+
+/// All 15 [`MessageFormat`] variants in declaration order — used by the
+/// `message_format_15_variants_table` test to assert the enum matches the
+/// Python `MessageFormat(Enum)` declaration faithfully.
+///
+/// (The V4 dispatcher prompt referred to "18 variants" as an audit
+/// estimate; the Python ref has EXACTLY 15 enum variants — verified by
+/// `grep '= "' prompt_utils.py | head -20`. The Rust port matches that
+/// count one-to-one. The other "shapes" alluded to by the audit are the
+/// 6 [`MessageBuilder`] static constructors below.)
+pub const MESSAGE_FORMAT_VARIANTS: &[MessageFormat] = &[
+  MessageFormat::ListWithImage,
+  MessageFormat::ListWithImageFirst,
+  MessageFormat::ListWithImageUrlFirst,
+  MessageFormat::ListWithImageType,
+  MessageFormat::ListWithImageTypeText,
+  MessageFormat::ListWithImageTypeTextImageLast,
+  MessageFormat::ImageToken,
+  MessageFormat::ImageTokenPipe,
+  MessageFormat::StartImageToken,
+  MessageFormat::ImageTokenNewline,
+  MessageFormat::NumberedImageTokens,
+  MessageFormat::PromptOnly,
+  MessageFormat::PromptWithImageToken,
+  MessageFormat::PromptWithStartImageToken,
+  MessageFormat::VideoWithText,
+];
+
+/// Per-model-family [`MessageFormat`] selection — faithful 1:1 port of
+/// the Python `MODEL_CONFIG` dict at
+/// `mlx-vlm/mlx_vlm/prompt_utils.py:27–89`.
+///
+/// Stored as a sorted (lexicographic by `model_type`) slice so that
+/// [`MessageFormatter::for_model`] can binary-search without allocating a
+/// `HashMap` (the table is ~60 small entries — a binary search is faster
+/// than a hash lookup at this size and avoids the `HashMap` pulled
+/// dependency surface).
+///
+/// Keys are the lowercased `model_type` strings the python reference
+/// also lowercases at line 196 (`self.model_name = model_name.lower()`).
+/// Match the Python entries verbatim — including the deprecated aliases
+/// (`jvlm`, `lfm2_vl`, `llava-qwen2`, `llava_qwen2`, `bunny-llama`,
+/// `deepseekocr_2`) so a caller migrating from the python ref sees the
+/// same `model_type`s accepted.
+pub const MODEL_CONFIG: &[(&str, MessageFormat)] = &[
+  // ─── kept in lexicographic order so binary_search_by works ────────
+  ("aya_vision", MessageFormat::ListWithImage),
+  ("bunny-llama", MessageFormat::ImageTokenNewline),
+  ("cohere2_vision", MessageFormat::ListWithImage),
+  ("deepseek_vl_v2", MessageFormat::ImageTokenNewline),
+  ("deepseekocr", MessageFormat::ImageTokenNewline),
+  ("deepseekocr_2", MessageFormat::ImageTokenNewline),
+  ("dots_ocr", MessageFormat::ListWithImageFirst),
+  ("ernie4_5_moe_vl", MessageFormat::ListWithImageUrlFirst),
+  ("falcon_ocr", MessageFormat::PromptOnly),
+  ("florence2", MessageFormat::PromptOnly),
+  ("gemma3", MessageFormat::StartImageToken),
+  ("gemma3n", MessageFormat::ListWithImageTypeText),
+  ("gemma4", MessageFormat::ListWithImageTypeText),
+  ("glm4v", MessageFormat::ListWithImageFirst),
+  ("glm4v_moe", MessageFormat::ListWithImageFirst),
+  ("glm_ocr", MessageFormat::ListWithImageFirst),
+  ("granite4_vision", MessageFormat::ListWithImage),
+  ("granite_vision", MessageFormat::ListWithImage),
+  ("hunyuan_vl", MessageFormat::ListWithImageFirst),
+  ("idefics2", MessageFormat::ListWithImage),
+  ("idefics3", MessageFormat::ListWithImageFirst),
+  ("internvl_chat", MessageFormat::ListWithImageType),
+  ("jina_vlm", MessageFormat::ImageTokenPipe),
+  ("jvlm", MessageFormat::ImageTokenPipe),
+  ("kimi_k25", MessageFormat::ListWithImage),
+  ("kimi_vl", MessageFormat::ListWithImage),
+  ("lfm2-vl", MessageFormat::ListWithImageFirst),
+  ("lfm2_vl", MessageFormat::ListWithImageFirst),
+  ("llama4", MessageFormat::ListWithImage),
+  ("llava", MessageFormat::ListWithImage),
+  ("llava-qwen2", MessageFormat::ImageTokenNewline),
+  ("llava_next", MessageFormat::ListWithImage),
+  ("llava_qwen2", MessageFormat::ImageTokenNewline),
+  ("minicpmo", MessageFormat::ImageToken),
+  ("mistral3", MessageFormat::ListWithImageFirst),
+  ("mllama", MessageFormat::ListWithImage),
+  ("molmo", MessageFormat::PromptOnly),
+  ("molmo2", MessageFormat::ListWithImageFirst),
+  ("molmo_point", MessageFormat::ListWithImageFirst),
+  ("moondream3", MessageFormat::PromptOnly),
+  ("multi_modality", MessageFormat::ImageToken),
+  ("nemotron_h_nano_omni", MessageFormat::ListWithImageType),
+  (
+    "nemotronh_nano_omni_reasoning_v3",
+    MessageFormat::ListWithImageType,
+  ),
+  ("paddleocr_vl", MessageFormat::ListWithImageFirst),
+  ("paligemma", MessageFormat::PromptWithImageToken),
+  ("phi3_v", MessageFormat::NumberedImageTokens),
+  ("phi4-siglip", MessageFormat::ImageTokenNewline),
+  ("phi4mm", MessageFormat::NumberedImageTokens),
+  ("pixtral", MessageFormat::ListWithImageTypeText),
+  ("qwen2_5_vl", MessageFormat::ListWithImageFirst),
+  ("qwen2_vl", MessageFormat::ListWithImage),
+  ("qwen3_5", MessageFormat::ListWithImageFirst),
+  ("qwen3_5_moe", MessageFormat::ListWithImageFirst),
+  ("qwen3_omni_moe", MessageFormat::ListWithImageFirst),
+  ("qwen3_vl", MessageFormat::ListWithImageFirst),
+  ("qwen3_vl_moe", MessageFormat::ListWithImageFirst),
+  ("smolvlm", MessageFormat::ListWithImageFirst),
+  ("youtu_vl", MessageFormat::ListWithImageFirst),
+];
+
+/// Models that do NOT support multi-image chat — faithful 1:1 port of
+/// the Python `SINGLE_IMAGE_ONLY_MODELS` set at
+/// `mlx-vlm/mlx_vlm/prompt_utils.py:92–100`. Sorted for binary search.
+pub const SINGLE_IMAGE_ONLY_MODELS: &[&str] = &[
+  "bunny-llama",
+  "falcon_ocr",
+  "llava-qwen2",
+  "llava_next",
+  "mllama",
+  "multi_modality",
+  "paligemma",
+];
+
+/// Models that emit the video format on `video=` — faithful 1:1 port
+/// of the literal list at `mlx-vlm/mlx_vlm/prompt_utils.py:221–230`.
+/// Sorted for binary search.
+const VIDEO_FORMAT_MODELS: &[&str] = &[
+  "gemma4",
+  "qwen2_5_vl",
+  "qwen2_vl",
+  "qwen3_5",
+  "qwen3_5_moe",
+  "qwen3_omni_moe",
+  "qwen3_vl",
+  "qwen3_vl_moe",
+];
+
+/// A single content item in a [`Message::content`] list — the typed
+/// equivalent of the Python dicts produced by [`MessageBuilder`].
+///
+/// `mlx-vlm`'s `MessageBuilder` returns plain `dict`s (e.g.
+/// `{"type": "image"}` at line 167, or
+/// `{"type": "text", "text": ..., "content": ...}` at line 157). The Rust
+/// port models them as a strongly-typed enum so a downstream chat-template
+/// renderer can match on the variant rather than string-comparing
+/// `item.get("type")` (mirrors the `MessageBuilder` static constructors
+/// at `prompt_utils.py:151–189` one-to-one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ContentItem {
+  /// `{type:"text", text, content}` — produced by
+  /// [`MessageBuilder::text_message`]. The Python ref carries the same
+  /// string in two fields (`text` AND `content`) at line 157 — a faithful
+  /// port keeps both so downstream consumers that read either field see
+  /// the same value.
+  Text {
+    /// The text payload (mirrors `dict["text"]` AND `dict["content"]`
+    /// in the python ref).
+    text: String,
+  },
+  /// `{type:"text", text, content}` — produced by
+  /// [`MessageBuilder::content_message`] (line 161); semantically
+  /// identical to [`Self::Text`] but the python ref distinguishes them
+  /// because `_format_list_with_image_type` line 323 selects between
+  /// `content_message` and `text_message` based on `message_type=
+  /// "content" | "text"`. We preserve the distinction so the
+  /// dispatcher's selection round-trips faithfully.
+  ContentText {
+    /// The text payload (mirrors `dict["text"]` AND `dict["content"]`
+    /// in the python ref).
+    text: String,
+  },
+  /// `{type:"image"}` — produced by [`MessageBuilder::image_message`]
+  /// (line 167). The image *data* is carried separately (see
+  /// `prepare_inputs`); this entry only marks the per-image position
+  /// in the message content.
+  Image,
+  /// `{type:"image_url"}` — produced by
+  /// [`MessageBuilder::image_url_message`] (line 172). Same as
+  /// [`Self::Image`] but with a different `type` tag (ERNIE-family).
+  ImageUrl,
+  /// `{type:"audio"}` — produced by
+  /// [`MessageBuilder::audio_message`] (line 177).
+  Audio,
+  /// `{type:"video", video, max_pixels, fps}` — produced by
+  /// [`MessageBuilder::video_message`] (line 184). Carries the source
+  /// path plus the sampling parameters (pixels-cap + frames-per-second)
+  /// the chat template's video preprocessor reads at render time.
+  Video {
+    /// Source path (or URL) for the video. Mirrors `dict["video"]` in
+    /// the python ref.
+    video: String,
+    /// Maximum pixel count per frame. Mirrors `dict["max_pixels"]` in
+    /// the python ref (default `224 * 224`).
+    max_pixels: u32,
+    /// Frame sampling rate. Mirrors `dict["fps"]` in the python ref
+    /// (default `1`).
+    fps: u32,
+  },
+}
+
+/// Static content-item constructors — faithful 1:1 port of the Python
+/// `MessageBuilder` class at `mlx-vlm/mlx_vlm/prompt_utils.py:151–189`.
+///
+/// Each method mirrors one of the 6 `@staticmethod`s on the Python class
+/// and returns a typed [`ContentItem`] instead of a `dict`.
+#[derive(Debug, Clone, Copy)]
+pub struct MessageBuilder;
+
+impl MessageBuilder {
+  /// `text_message(text)` — `mlx-vlm/mlx_vlm/prompt_utils.py:154–157`.
+  ///
+  /// The python ref returns `{"type":"text", "text":text, "content":text}`
+  /// (the same string under two keys). The typed [`ContentItem::Text`]
+  /// variant stores it once and the chat-template renderer can write
+  /// either key.
+  pub fn text_message(text: impl Into<String>) -> ContentItem {
+    ContentItem::Text { text: text.into() }
+  }
+
+  /// `content_message(content)` — `mlx-vlm/mlx_vlm/prompt_utils.py:159–162`.
+  ///
+  /// Returns the [`ContentItem::ContentText`] discriminant; semantically
+  /// identical to [`Self::text_message`] but the python `_format_list_with_image_type`
+  /// at line 323 selects between them based on `message_type`.
+  pub fn content_message(content: impl Into<String>) -> ContentItem {
+    ContentItem::ContentText {
+      text: content.into(),
+    }
+  }
+
+  /// `image_message()` — `mlx-vlm/mlx_vlm/prompt_utils.py:164–167`.
+  pub fn image_message() -> ContentItem {
+    ContentItem::Image
+  }
+
+  /// `image_url_message()` — `mlx-vlm/mlx_vlm/prompt_utils.py:169–172`.
+  pub fn image_url_message() -> ContentItem {
+    ContentItem::ImageUrl
+  }
+
+  /// `audio_message()` — `mlx-vlm/mlx_vlm/prompt_utils.py:174–177`.
+  pub fn audio_message() -> ContentItem {
+    ContentItem::Audio
+  }
+
+  /// `video_message(video_path, max_pixels=224*224, fps=1)` —
+  /// `mlx-vlm/mlx_vlm/prompt_utils.py:179–189`.
+  pub fn video_message(video_path: impl Into<String>, max_pixels: u32, fps: u32) -> ContentItem {
+    ContentItem::Video {
+      video: video_path.into(),
+      max_pixels,
+      fps,
+    }
+  }
+}
+
+/// One chat turn — the typed equivalent of the
+/// `{"role": ..., "content": ...}` dict the Python formatters return.
+///
+/// `content` is either a list of [`ContentItem`]s (multimodal turn, mirrors
+/// the python `list` branch) or a flat string (token-prefix or
+/// prompt-only turn, mirrors the python `str` branch). The python ref
+/// returns one or the other depending on the [`MessageFormat`] selected;
+/// the [`MessageContent`] enum surfaces that distinction in the type
+/// system.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Message {
+  /// `messages[i]["role"]` — typically `"user"` / `"assistant"` /
+  /// `"system"` / `"tool"`. Stored as a string (not [`crate::lm::session::Role`])
+  /// because the python ref's `format_message(role=...)` accepts any
+  /// string — the chat-template renderer ultimately interprets it.
+  pub role: String,
+  /// `messages[i]["content"]` — either a list (multimodal turn) or a
+  /// flat string (token-prefix or prompt-only turn).
+  pub content: MessageContent,
+}
+
+/// `messages[i]["content"]` — either a list of items or a flat string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageContent {
+  /// `content` is a `[ContentItem*]` list — the multimodal turn.
+  Items(Vec<ContentItem>),
+  /// `content` is a flat string — the prompt-only / token-prefix turn.
+  Text(String),
+}
+
+/// Output of [`MessageFormatter::format_message`] — either a [`Message`]
+/// (the standard `{role, content}` dict branch) or a bare `String` (the
+/// `PROMPT_ONLY`-family branch where the python ref returns the prompt
+/// itself, not a dict).
+///
+/// The python ref's `format_message` returns
+/// `Union[str, Dict[str, Any]]` (line 210); this enum models the same
+/// distinction in the type system.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormattedMessage {
+  /// The python `dict` branch — the formatter produced a `{role, content}`
+  /// message.
+  Message(Message),
+  /// The python `str` branch — the formatter produced a bare prompt
+  /// string (`PROMPT_ONLY`, `PROMPT_WITH_IMAGE_TOKEN`, or
+  /// `PROMPT_WITH_START_IMAGE_TOKEN`).
+  String(String),
+}
+
+/// Per-call options for [`MessageFormatter::format_message`] — faithful
+/// 1:1 port of the keyword arguments at
+/// `mlx-vlm/mlx_vlm/prompt_utils.py:201–209`.
+///
+/// Defaulted to match the python defaults exactly so a caller passing
+/// `..Default::default()` matches a Python call that omits all kwargs.
+#[derive(Debug, Clone)]
+pub struct FormatOpts {
+  /// `role` — defaults to `"user"`.
+  pub role: String,
+  /// `skip_image_token` — defaults to `false`. If true, no image entries
+  /// are added (used by `apply_chat_template` for non-target turns).
+  pub skip_image_token: bool,
+  /// `skip_audio_token` — defaults to `false`.
+  pub skip_audio_token: bool,
+  /// `num_images` — defaults to `1` (mirrors python line 207).
+  pub num_images: usize,
+  /// `num_audios` — defaults to `1` (mirrors python line 208).
+  pub num_audios: usize,
+  /// `video` — paths for the [`MessageFormat::VideoWithText`] /
+  /// `_format_video_message` branch. Empty when there is no video.
+  /// Stored as a `Vec<String>` to mirror python's "scalar or list"
+  /// accepted at line 424.
+  pub video: Vec<String>,
+  /// `max_pixels` — per-frame pixel cap for the video branch (line 428,
+  /// default `224 * 224`).
+  pub max_pixels: u32,
+  /// `fps` — sampling fps for the video branch (line 429, default `1`).
+  /// One value per entry in [`Self::video`], or a single value applied
+  /// to every video; an empty `Vec` means "use the python default
+  /// (`fps=1`) for every entry".
+  pub fps: Vec<u32>,
+}
+
+impl Default for FormatOpts {
+  fn default() -> Self {
+    Self {
+      role: "user".to_string(),
+      skip_image_token: false,
+      skip_audio_token: false,
+      num_images: 1,
+      num_audios: 1,
+      video: Vec::new(),
+      max_pixels: 224 * 224,
+      fps: Vec::new(),
+    }
+  }
+}
+
+/// Per-model chat-format dispatcher — faithful 1:1 port of the Python
+/// `MessageFormatter` class at `mlx-vlm/mlx_vlm/prompt_utils.py:192–441`.
+///
+/// Constructed with a `model_type` (lowercased, like the python ref at
+/// line 196), looks up the matching [`MessageFormat`] in [`MODEL_CONFIG`],
+/// then dispatches [`Self::format_message`] to the right
+/// `_format_*` body.
+#[derive(Debug, Clone)]
+pub struct MessageFormatter {
+  /// The lowercased model type passed to [`Self::for_model`].
+  pub model_name: String,
+  /// The [`MessageFormat`] selected from [`MODEL_CONFIG`].
+  pub format_type: MessageFormat,
+}
+
+impl MessageFormatter {
+  /// Construct a formatter for `model_type` by looking it up in
+  /// [`MODEL_CONFIG`]. Mirrors the python `__init__` at lines 195–199.
+  ///
+  /// Lowercases the input first to match the python `model_name.lower()`
+  /// at line 196.
+  ///
+  /// # Errors
+  ///
+  /// `Error::ShapeMismatch` if `model_type` is not in [`MODEL_CONFIG`]
+  /// (matches the python `raise ValueError(f"Unsupported model: ...")`).
+  pub fn for_model(model_type: &str) -> Result<Self> {
+    let lower = model_type.to_lowercase();
+    // MODEL_CONFIG is sorted lexicographically; binary search ~60 entries
+    // beats a linear scan and avoids pulling a `HashMap` dependency.
+    let idx = MODEL_CONFIG
+      .binary_search_by(|(k, _)| (*k).cmp(lower.as_str()))
+      .map_err(|_| Error::ShapeMismatch {
+        message: format!("MessageFormatter::for_model: unsupported model: {model_type}"),
+      })?;
+    Ok(Self {
+      model_name: lower,
+      format_type: MODEL_CONFIG[idx].1,
+    })
+  }
+
+  /// Dispatch the prompt to the right `_format_*` body. Mirrors the
+  /// python `format_message` at lines 201–282.
+  ///
+  /// # Errors
+  ///
+  /// - `Error::ShapeMismatch` if `opts.num_images > 1` and the model is
+  ///   in [`SINGLE_IMAGE_ONLY_MODELS`] (mirrors python lines 214–218).
+  /// - `Error::ShapeMismatch` if the [`MessageFormat::VideoWithText`]
+  ///   branch is selected but `opts.video.is_empty()` (the python branch
+  ///   at line 424 unconditionally dereferences `kwargs["video"]` — port
+  ///   surfaces the missing-video case as a hard error instead of an
+  ///   `IndexError`).
+  /// - `Error::ShapeMismatch` if [`FormatOpts::fps`] length differs from
+  ///   [`FormatOpts::video`] length (mirrors python lines 431–434).
+  pub fn format_message(&self, prompt: &str, opts: &FormatOpts) -> Result<FormattedMessage> {
+    // Single-image guard — python lines 214–218.
+    if opts.num_images > 1
+      && SINGLE_IMAGE_ONLY_MODELS
+        .binary_search(&self.model_name.as_str())
+        .is_ok()
+    {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "MessageFormatter::format_message: model {} does not support multi-image chat. \
+           Please only use 1 image.",
+          self.model_name
+        ),
+      });
+    }
+
+    // Video special-case — python lines 221–231. The python check is
+    // `model_name in [...] and kwargs.get("video")` (truthy iff non-
+    // empty list), so a model whose normal MessageFormat would be
+    // ListWithImageFirst (e.g. qwen2_5_vl) routes to _format_video_message
+    // when video= is passed.
+    if !opts.video.is_empty()
+      && VIDEO_FORMAT_MODELS
+        .binary_search(&self.model_name.as_str())
+        .is_ok()
+    {
+      return self.format_video_message(prompt, opts);
+    }
+
+    // Main dispatch — python lines 234–271.
+    Ok(match self.format_type {
+      MessageFormat::ListWithImage => self.format_list_with_image(prompt, opts, false, false),
+      MessageFormat::ListWithImageFirst => self.format_list_with_image(prompt, opts, true, false),
+      MessageFormat::ListWithImageUrlFirst => self.format_list_with_image(prompt, opts, true, true),
+      MessageFormat::ListWithImageType => {
+        self.format_list_with_image_type(prompt, opts, ContentMessageKind::Content, true)
+      }
+      MessageFormat::ListWithImageTypeText => {
+        self.format_list_with_image_type(prompt, opts, ContentMessageKind::Text, true)
+      }
+      MessageFormat::ListWithImageTypeTextImageLast => {
+        self.format_list_with_image_type(prompt, opts, ContentMessageKind::Text, false)
+      }
+      MessageFormat::ImageToken => self.format_with_token(prompt, opts, "<image>", true),
+      MessageFormat::ImageTokenPipe => self.format_with_token(prompt, opts, "<|image|>", true),
+      MessageFormat::StartImageToken => {
+        self.format_with_token(prompt, opts, "<start_of_image>", false)
+      }
+      MessageFormat::ImageTokenNewline => self.format_with_token(prompt, opts, "<image>\n", true),
+      MessageFormat::NumberedImageTokens => self.format_numbered_tokens(prompt, opts),
+      MessageFormat::PromptOnly => FormattedMessage::String(prompt.to_string()),
+      MessageFormat::PromptWithImageToken => {
+        // python line 265–267: "<image>" * num_images + prompt.
+        let mut s = String::with_capacity(7 * opts.num_images + prompt.len());
+        for _ in 0..opts.num_images {
+          s.push_str("<image>");
+        }
+        s.push_str(prompt);
+        FormattedMessage::String(s)
+      }
+      MessageFormat::PromptWithStartImageToken => {
+        // python line 268–269: prompt + "<start_of_image>" * num_images.
+        let mut s = String::with_capacity(prompt.len() + 16 * opts.num_images);
+        s.push_str(prompt);
+        for _ in 0..opts.num_images {
+          s.push_str("<start_of_image>");
+        }
+        FormattedMessage::String(s)
+      }
+      MessageFormat::VideoWithText => self.format_video_message(prompt, opts)?,
+    })
+  }
+
+  /// `_format_list_with_image` — python lines 284–308.
+  ///
+  /// Builds `content = [text]` plus, if `role=="user"` and not skipped,
+  /// `num_images` image entries (`ContentItem::Image` or
+  /// `ContentItem::ImageUrl`), placed first or last per `image_first`.
+  fn format_list_with_image(
+    &self,
+    prompt: &str,
+    opts: &FormatOpts,
+    image_first: bool,
+    use_image_url: bool,
+  ) -> FormattedMessage {
+    let mut content = Vec::with_capacity(1 + opts.num_images);
+    content.push(MessageBuilder::text_message(prompt));
+
+    if opts.role == "user" && !opts.skip_image_token && opts.num_images > 0 {
+      let image_builder = if use_image_url {
+        MessageBuilder::image_url_message
+      } else {
+        MessageBuilder::image_message
+      };
+      // image_tokens = [image_builder()] * num_images
+      if image_first {
+        // content = images + content
+        let mut new_content = Vec::with_capacity(opts.num_images + content.len());
+        for _ in 0..opts.num_images {
+          new_content.push(image_builder());
+        }
+        new_content.extend(content);
+        content = new_content;
+      } else {
+        // content = content + images
+        for _ in 0..opts.num_images {
+          content.push(image_builder());
+        }
+      }
+    }
+
+    FormattedMessage::Message(Message {
+      role: opts.role.clone(),
+      content: MessageContent::Items(content),
+    })
+  }
+
+  /// `_format_list_with_image_type` — python lines 310–348.
+  ///
+  /// Builds `content = [msg_func(prompt)]` (where `msg_func` is
+  /// `content_message` for the default `Content` and `text_message`
+  /// for `Text`); then, if `role=="user"`, prepends/appends image
+  /// entries and appends audio entries. If `role=="assistant"`,
+  /// collapses content to a flat string (line 343–346).
+  fn format_list_with_image_type(
+    &self,
+    prompt: &str,
+    opts: &FormatOpts,
+    msg_kind: ContentMessageKind,
+    image_first: bool,
+  ) -> FormattedMessage {
+    let msg = match msg_kind {
+      ContentMessageKind::Content => MessageBuilder::content_message(prompt),
+      ContentMessageKind::Text => MessageBuilder::text_message(prompt),
+    };
+    let mut content: Vec<ContentItem> = vec![msg];
+
+    if opts.role == "user" {
+      if !opts.skip_image_token && opts.num_images > 0 {
+        if image_first {
+          let mut new_content = Vec::with_capacity(opts.num_images + content.len());
+          for _ in 0..opts.num_images {
+            new_content.push(MessageBuilder::image_message());
+          }
+          new_content.extend(content);
+          content = new_content;
+        } else {
+          for _ in 0..opts.num_images {
+            content.push(MessageBuilder::image_message());
+          }
+        }
+      }
+      if !opts.skip_audio_token && opts.num_audios > 0 {
+        for _ in 0..opts.num_audios {
+          content.push(MessageBuilder::audio_message());
+        }
+      }
+    }
+
+    if opts.role == "assistant" {
+      // python lines 343–346: collapse to a flat string.
+      // Take `content[0]`'s text (it's always `Text` or `ContentText` —
+      // we constructed it so).
+      let s = match &content[0] {
+        ContentItem::Text { text } | ContentItem::ContentText { text } => text.clone(),
+        // Defensive: shouldn't happen because we just constructed
+        // content[0] from msg_func(prompt). Fall back to empty string
+        // (matches `content[0].get("content", content[0].get("text"))`
+        // returning None → KeyError, but `dict.get` returns None and
+        // python returns None — we choose empty string for fail-soft).
+        _ => String::new(),
+      };
+      return FormattedMessage::Message(Message {
+        role: opts.role.clone(),
+        content: MessageContent::Text(s),
+      });
+    }
+
+    FormattedMessage::Message(Message {
+      role: opts.role.clone(),
+      content: MessageContent::Items(content),
+    })
+  }
+
+  /// `_format_with_token` — python lines 350–373.
+  ///
+  /// Builds `content = f"{token*N}{prompt}"` (or `{prompt}{token*N}` if
+  /// `image_first=false`), then prepends `<|audio_1|><|audio_2|>...` for
+  /// audio.
+  fn format_with_token(
+    &self,
+    prompt: &str,
+    opts: &FormatOpts,
+    token: &str,
+    image_first: bool,
+  ) -> FormattedMessage {
+    let mut content = prompt.to_string();
+
+    if opts.role == "user" && !opts.skip_image_token && opts.num_images > 0 {
+      let mut prefix = String::with_capacity(token.len() * opts.num_images);
+      for _ in 0..opts.num_images {
+        prefix.push_str(token);
+      }
+      content = if image_first {
+        format!("{prefix}{content}")
+      } else {
+        format!("{content}{prefix}")
+      };
+    }
+
+    if opts.role == "user" && !opts.skip_audio_token && opts.num_audios > 0 {
+      let mut audio_prefix = String::with_capacity(12 * opts.num_audios);
+      for i in 0..opts.num_audios {
+        audio_prefix.push_str(&format!("<|audio_{}|>", i + 1));
+      }
+      content = format!("{audio_prefix}{content}");
+    }
+
+    FormattedMessage::Message(Message {
+      role: opts.role.clone(),
+      content: MessageContent::Text(content),
+    })
+  }
+
+  /// `_format_numbered_tokens` — python lines 375–405.
+  ///
+  /// Builds `content = "<|image_1|><|image_2|>...<|audio_1|>...prompt"`
+  /// (images first, then audio, matching the Phi-4 convention).
+  fn format_numbered_tokens(&self, prompt: &str, opts: &FormatOpts) -> FormattedMessage {
+    let mut content = prompt.to_string();
+
+    if opts.role == "user" {
+      let mut prefix = String::new();
+      if !opts.skip_image_token && opts.num_images > 0 {
+        for i in 0..opts.num_images {
+          prefix.push_str(&format!("<|image_{}|>", i + 1));
+        }
+      }
+      if !opts.skip_audio_token && opts.num_audios > 0 {
+        for i in 0..opts.num_audios {
+          prefix.push_str(&format!("<|audio_{}|>", i + 1));
+        }
+      }
+      if !prefix.is_empty() {
+        content = format!("{prefix}{content}");
+      }
+    }
+
+    FormattedMessage::Message(Message {
+      role: opts.role.clone(),
+      content: MessageContent::Text(content),
+    })
+  }
+
+  /// `_format_video_message` — python lines 407–441.
+  ///
+  /// Emits one [`ContentItem::Video`] entry per video path, followed by
+  /// a text item.
+  fn format_video_message(&self, prompt: &str, opts: &FormatOpts) -> Result<FormattedMessage> {
+    if opts.video.is_empty() {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "MessageFormatter::format_video_message: model {} requires opts.video to be \
+           non-empty (the python branch unconditionally dereferences kwargs['video'])",
+          self.model_name
+        ),
+      });
+    }
+    // fps_list (python lines 430–434): scalar applied to all, or
+    // per-video. Empty → use the python default (1) for every entry.
+    let fps_list: Vec<u32> = if opts.fps.is_empty() {
+      vec![1u32; opts.video.len()]
+    } else if opts.fps.len() == 1 {
+      vec![opts.fps[0]; opts.video.len()]
+    } else if opts.fps.len() == opts.video.len() {
+      opts.fps.clone()
+    } else {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "MessageFormatter::format_video_message: got {} fps values for {} videos.",
+          opts.fps.len(),
+          opts.video.len()
+        ),
+      });
+    };
+
+    let mut content = Vec::with_capacity(opts.video.len() + 1);
+    for (v, f) in opts.video.iter().zip(fps_list.iter()) {
+      content.push(MessageBuilder::video_message(
+        v.clone(),
+        opts.max_pixels,
+        *f,
+      ));
+    }
+    content.push(MessageBuilder::text_message(prompt));
+
+    Ok(FormattedMessage::Message(Message {
+      role: opts.role.clone(),
+      content: MessageContent::Items(content),
+    }))
+  }
+}
+
+/// `message_type` selector for `_format_list_with_image_type` — mirrors
+/// python line 318 (`message_type: str = "content"`) restricted to the
+/// two values the dispatcher actually passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentMessageKind {
+  /// `message_type="content"` — `content_message` (line 324–325).
+  Content,
+  /// `message_type="text"` — `text_message` (line 326–327).
+  Text,
+}
+
+/// Top-level helper — faithful 1:1 port of the Python `get_message_json`
+/// free function at `mlx-vlm/mlx_vlm/prompt_utils.py:444–480`.
+///
+/// Returns a [`FormattedMessage`] (the `Union[str, Dict[str, Any]]`
+/// branch of the python signature).
+///
+/// # Errors
+///
+/// Propagates from [`MessageFormatter::for_model`] (unsupported model)
+/// and [`MessageFormatter::format_message`] (multi-image / video
+/// validation).
+pub fn get_message_json(
+  model_name: &str,
+  prompt: &str,
+  opts: &FormatOpts,
+) -> Result<FormattedMessage> {
+  let formatter = MessageFormatter::for_model(model_name)?;
+  formatter.format_message(prompt, opts)
 }

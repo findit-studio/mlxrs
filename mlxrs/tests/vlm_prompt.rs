@@ -582,3 +582,509 @@ fn assemble_multimodal_prompt_required_rejects_missing_marker() {
     "unexpected error: {msg}"
   );
 }
+
+// =================================================================
+// V4: MessageFormat / MessageFormatter / get_message_json tests
+// =================================================================
+//
+// Reference: `mlx-vlm/mlx_vlm/prompt_utils.py` lines 6–23 (enum), 27–89
+// (`MODEL_CONFIG`), 92–100 (`SINGLE_IMAGE_ONLY_MODELS`), 151–189
+// (`MessageBuilder`), 192–441 (`MessageFormatter`), 444–480
+// (`get_message_json`).
+
+use mlxrs::vlm::prompt::{
+  ContentItem, FormatOpts, FormattedMessage, MESSAGE_FORMAT_VARIANTS, MODEL_CONFIG, MessageBuilder,
+  MessageContent, MessageFormat, MessageFormatter, SINGLE_IMAGE_ONLY_MODELS, get_message_json,
+};
+
+// ──────────────────────── MessageFormat 18-variant table ────────────────────
+
+#[test]
+fn message_format_18_variants_table() {
+  // The V4 dispatcher prompt referenced "18 variants" as an audit
+  // estimate; counting `prompt_utils.py` lines 9–23 yields exactly
+  // 15 enum variants. Assert the count matches the python ref AND
+  // each declared variant string maps to the right Rust variant.
+  // (Renaming the test would lose the dispatcher-spec trace; we
+  // assert the precise 15-count under the dispatcher-named test
+  // so a `git log -p` shows the audit-vs-truth reconciliation.)
+  assert_eq!(
+    MESSAGE_FORMAT_VARIANTS.len(),
+    15,
+    "MessageFormat variant count does not match python ref (15)"
+  );
+
+  // Spot-check each variant has a unique Debug name (no aliases).
+  use std::collections::HashSet;
+  let names: HashSet<String> = MESSAGE_FORMAT_VARIANTS
+    .iter()
+    .map(|v| format!("{v:?}"))
+    .collect();
+  assert_eq!(names.len(), 15, "duplicate MessageFormat variants");
+}
+
+#[test]
+fn model_config_size_matches_python_ref() {
+  // The python `MODEL_CONFIG` dict has 58 entries
+  // (verified via `grep -c 'MessageFormat\.' prompt_utils.py` over
+  // lines 27–89). Assert the Rust table matches.
+  assert_eq!(
+    MODEL_CONFIG.len(),
+    58,
+    "MODEL_CONFIG size does not match python ref"
+  );
+}
+
+#[test]
+fn model_config_is_sorted_lexicographically() {
+  // MessageFormatter::for_model uses binary search; assert the table
+  // is sorted bytewise.
+  for w in MODEL_CONFIG.windows(2) {
+    assert!(
+      w[0].0 < w[1].0,
+      "MODEL_CONFIG not sorted: {:?} >= {:?}",
+      w[0].0,
+      w[1].0
+    );
+  }
+}
+
+#[test]
+fn single_image_only_models_set() {
+  // Faithful port of python lines 92–100 (7 entries).
+  assert_eq!(SINGLE_IMAGE_ONLY_MODELS.len(), 7);
+  // Spot-check key entries.
+  assert!(SINGLE_IMAGE_ONLY_MODELS.contains(&"paligemma"));
+  assert!(SINGLE_IMAGE_ONLY_MODELS.contains(&"mllama"));
+  assert!(SINGLE_IMAGE_ONLY_MODELS.contains(&"falcon_ocr"));
+}
+
+// ──────────────────────── MessageFormatter::for_model ───────────────────────
+
+#[test]
+fn message_formatter_for_model_picks_right_variant() {
+  // Python lines 27–89:
+  //   "qwen2_vl"   -> LIST_WITH_IMAGE
+  //   "qwen2_5_vl" -> LIST_WITH_IMAGE_FIRST
+  //   "paligemma"  -> PROMPT_WITH_IMAGE_TOKEN
+  //   "gemma3"     -> START_IMAGE_TOKEN
+  //   "phi3_v"     -> NUMBERED_IMAGE_TOKENS
+  //   "florence2"  -> PROMPT_ONLY
+  let cases = [
+    ("qwen2_vl", MessageFormat::ListWithImage),
+    ("qwen2_5_vl", MessageFormat::ListWithImageFirst),
+    ("paligemma", MessageFormat::PromptWithImageToken),
+    ("gemma3", MessageFormat::StartImageToken),
+    ("phi3_v", MessageFormat::NumberedImageTokens),
+    ("florence2", MessageFormat::PromptOnly),
+    ("ernie4_5_moe_vl", MessageFormat::ListWithImageUrlFirst),
+    ("jvlm", MessageFormat::ImageTokenPipe),
+    ("internvl_chat", MessageFormat::ListWithImageType),
+    ("minicpmo", MessageFormat::ImageToken),
+    ("bunny-llama", MessageFormat::ImageTokenNewline),
+  ];
+  for (model, expected) in cases {
+    let f = MessageFormatter::for_model(model).unwrap_or_else(|e| {
+      panic!("MessageFormatter::for_model({model}) failed: {e}");
+    });
+    assert_eq!(f.format_type, expected, "for_model({model})");
+    assert_eq!(f.model_name, model.to_lowercase());
+  }
+}
+
+#[test]
+fn message_formatter_for_model_lowercases_input() {
+  // Python line 196: `model_name.lower()`.
+  let f = MessageFormatter::for_model("Qwen2_VL").unwrap();
+  assert_eq!(f.model_name, "qwen2_vl");
+  assert_eq!(f.format_type, MessageFormat::ListWithImage);
+}
+
+#[test]
+fn message_formatter_for_model_unsupported_errors() {
+  // Python lines 198–199: `ValueError(f"Unsupported model: {model_name}")`.
+  let err = MessageFormatter::for_model("not_a_real_model").unwrap_err();
+  let msg = format!("{err}");
+  assert!(msg.contains("unsupported model"), "unexpected error: {msg}");
+}
+
+// ──────────────────────── get_message_json shapes ────────────────────────
+
+#[test]
+fn get_message_json_text_only_shape() {
+  // PROMPT_ONLY: content is the bare prompt string. Florence2 uses
+  // this format.
+  let out = get_message_json(
+    "florence2",
+    "describe this",
+    &FormatOpts {
+      num_images: 0,
+      ..Default::default()
+    },
+  )
+  .unwrap();
+  match out {
+    FormattedMessage::String(s) => assert_eq!(s, "describe this"),
+    other => panic!("expected String branch, got: {other:?}"),
+  }
+}
+
+#[test]
+fn get_message_json_image_content_embedded() {
+  // qwen2_vl uses LIST_WITH_IMAGE: content = [text, image] (image
+  // last, because image_first=False is the default for this variant).
+  let out = get_message_json(
+    "qwen2_vl",
+    "describe this",
+    &FormatOpts {
+      num_images: 1,
+      ..Default::default()
+    },
+  )
+  .unwrap();
+  match out {
+    FormattedMessage::Message(m) => {
+      assert_eq!(m.role, "user");
+      let items = match m.content {
+        MessageContent::Items(v) => v,
+        other => panic!("expected Items branch, got: {other:?}"),
+      };
+      assert_eq!(items.len(), 2);
+      // First is text (LIST_WITH_IMAGE puts text first), second is image.
+      match &items[0] {
+        ContentItem::Text { text } => assert_eq!(text, "describe this"),
+        other => panic!("expected Text at [0], got: {other:?}"),
+      }
+      assert_eq!(items[1], ContentItem::Image);
+    }
+    other => panic!("expected Message branch, got: {other:?}"),
+  }
+}
+
+#[test]
+fn get_message_json_image_first_shape() {
+  // qwen2_5_vl uses LIST_WITH_IMAGE_FIRST: content = [image, text].
+  let out = get_message_json(
+    "qwen2_5_vl",
+    "describe this",
+    &FormatOpts {
+      num_images: 1,
+      ..Default::default()
+    },
+  )
+  .unwrap();
+  let items = match out {
+    FormattedMessage::Message(m) => match m.content {
+      MessageContent::Items(v) => v,
+      _ => panic!(),
+    },
+    _ => panic!(),
+  };
+  assert_eq!(items.len(), 2);
+  assert_eq!(items[0], ContentItem::Image);
+  match &items[1] {
+    ContentItem::Text { text } => assert_eq!(text, "describe this"),
+    other => panic!("expected Text at [1], got: {other:?}"),
+  }
+}
+
+#[test]
+fn get_message_json_image_url_first_shape() {
+  // ernie4_5_moe_vl uses LIST_WITH_IMAGE_URL_FIRST: content = [image_url, text].
+  let out = get_message_json(
+    "ernie4_5_moe_vl",
+    "describe",
+    &FormatOpts {
+      num_images: 1,
+      ..Default::default()
+    },
+  )
+  .unwrap();
+  let items = match out {
+    FormattedMessage::Message(m) => match m.content {
+      MessageContent::Items(v) => v,
+      _ => panic!(),
+    },
+    _ => panic!(),
+  };
+  assert_eq!(items[0], ContentItem::ImageUrl);
+}
+
+#[test]
+fn get_message_json_image_token_inline() {
+  // minicpmo uses IMAGE_TOKEN: content is a flat string with
+  // `<image>` prefixed (one per image). num_audios=0 to suppress the
+  // python default-1 audio prefix (the python ref's default is also 1
+  // — see line 208).
+  let out = get_message_json(
+    "minicpmo",
+    "what is this",
+    &FormatOpts {
+      num_images: 2,
+      num_audios: 0,
+      ..Default::default()
+    },
+  )
+  .unwrap();
+  match out {
+    FormattedMessage::Message(m) => match m.content {
+      MessageContent::Text(s) => assert_eq!(s, "<image><image>what is this"),
+      other => panic!("expected Text branch, got: {other:?}"),
+    },
+    _ => panic!(),
+  }
+}
+
+#[test]
+fn get_message_json_start_image_token_suffixed() {
+  // gemma3 uses START_IMAGE_TOKEN: token is APPENDED, not prepended
+  // (python `image_first=False` at line 258).
+  let out = get_message_json(
+    "gemma3",
+    "what is this",
+    &FormatOpts {
+      num_images: 1,
+      num_audios: 0,
+      ..Default::default()
+    },
+  )
+  .unwrap();
+  match out {
+    FormattedMessage::Message(m) => match m.content {
+      MessageContent::Text(s) => assert_eq!(s, "what is this<start_of_image>"),
+      _ => panic!(),
+    },
+    _ => panic!(),
+  }
+}
+
+#[test]
+fn get_message_json_numbered_image_tokens_phi() {
+  // phi3_v uses NUMBERED_IMAGE_TOKENS: `<|image_1|><|image_2|>...prompt`.
+  // Adding 2 audios should also prepend `<|audio_1|><|audio_2|>`.
+  let out = get_message_json(
+    "phi3_v",
+    "describe",
+    &FormatOpts {
+      num_images: 2,
+      num_audios: 1,
+      ..Default::default()
+    },
+  )
+  .unwrap();
+  match out {
+    FormattedMessage::Message(m) => match m.content {
+      // Order: images then audio, then prompt (python lines 391–403).
+      MessageContent::Text(s) => assert_eq!(s, "<|image_1|><|image_2|><|audio_1|>describe"),
+      _ => panic!(),
+    },
+    _ => panic!(),
+  }
+}
+
+#[test]
+fn get_message_json_prompt_with_image_token_paligemma() {
+  // paligemma uses PROMPT_WITH_IMAGE_TOKEN: returns a bare String,
+  // `"<image>"*N + prompt`. paligemma is in SINGLE_IMAGE_ONLY_MODELS
+  // so we use num_images=1.
+  let out = get_message_json(
+    "paligemma",
+    "describe",
+    &FormatOpts {
+      num_images: 1,
+      ..Default::default()
+    },
+  )
+  .unwrap();
+  match out {
+    FormattedMessage::String(s) => assert_eq!(s, "<image>describe"),
+    other => panic!("expected String branch, got: {other:?}"),
+  }
+}
+
+#[test]
+fn get_message_json_single_image_only_rejects_multi() {
+  // paligemma is in SINGLE_IMAGE_ONLY_MODELS; num_images=2 should error.
+  let err = get_message_json(
+    "paligemma",
+    "describe",
+    &FormatOpts {
+      num_images: 2,
+      ..Default::default()
+    },
+  )
+  .unwrap_err();
+  let msg = format!("{err}");
+  assert!(
+    msg.contains("does not support multi-image"),
+    "unexpected error: {msg}"
+  );
+}
+
+#[test]
+fn get_message_json_video_message_qwen2_vl() {
+  // qwen2_vl normally uses LIST_WITH_IMAGE, but the video special-case
+  // (python lines 221–231) routes to _format_video_message when
+  // opts.video is non-empty.
+  let out = get_message_json(
+    "qwen2_vl",
+    "what's in this video",
+    &FormatOpts {
+      num_images: 0,
+      video: vec!["video.mp4".to_string()],
+      max_pixels: 224 * 224,
+      fps: vec![],
+      ..Default::default()
+    },
+  )
+  .unwrap();
+  let items = match out {
+    FormattedMessage::Message(m) => match m.content {
+      MessageContent::Items(v) => v,
+      _ => panic!(),
+    },
+    _ => panic!(),
+  };
+  assert_eq!(items.len(), 2);
+  // First: video item.
+  match &items[0] {
+    ContentItem::Video {
+      video,
+      max_pixels,
+      fps,
+    } => {
+      assert_eq!(video, "video.mp4");
+      assert_eq!(*max_pixels, 224 * 224);
+      assert_eq!(*fps, 1);
+    }
+    other => panic!("expected Video at [0], got: {other:?}"),
+  }
+  // Second: text item.
+  match &items[1] {
+    ContentItem::Text { text } => assert_eq!(text, "what's in this video"),
+    other => panic!("expected Text at [1], got: {other:?}"),
+  }
+}
+
+#[test]
+fn message_formatter_assistant_collapses_to_string() {
+  // _format_list_with_image_type: assistant role collapses content to a
+  // flat string (python lines 343–346). Uses internvl_chat
+  // (LIST_WITH_IMAGE_TYPE).
+  let f = MessageFormatter::for_model("internvl_chat").unwrap();
+  let out = f
+    .format_message(
+      "the answer is 42",
+      &FormatOpts {
+        role: "assistant".to_string(),
+        num_images: 0,
+        ..Default::default()
+      },
+    )
+    .unwrap();
+  match out {
+    FormattedMessage::Message(m) => {
+      assert_eq!(m.role, "assistant");
+      match m.content {
+        MessageContent::Text(s) => assert_eq!(s, "the answer is 42"),
+        other => panic!("expected Text branch, got: {other:?}"),
+      }
+    }
+    _ => panic!(),
+  }
+}
+
+#[test]
+fn message_formatter_skip_image_token_suppresses_images() {
+  // skip_image_token=true should suppress the image entries — used by
+  // apply_chat_template for non-target turns in a multi-message list.
+  let f = MessageFormatter::for_model("qwen2_vl").unwrap();
+  let out = f
+    .format_message(
+      "describe",
+      &FormatOpts {
+        num_images: 2,
+        skip_image_token: true,
+        ..Default::default()
+      },
+    )
+    .unwrap();
+  let items = match out {
+    FormattedMessage::Message(m) => match m.content {
+      MessageContent::Items(v) => v,
+      _ => panic!(),
+    },
+    _ => panic!(),
+  };
+  // No images, just the text.
+  assert_eq!(items.len(), 1);
+  match &items[0] {
+    ContentItem::Text { .. } => (),
+    other => panic!("expected Text only, got: {other:?}"),
+  }
+}
+
+#[test]
+fn message_builder_audio_and_video_messages() {
+  // Spot-check the static MessageBuilder constructors.
+  assert_eq!(MessageBuilder::image_message(), ContentItem::Image);
+  assert_eq!(MessageBuilder::image_url_message(), ContentItem::ImageUrl);
+  assert_eq!(MessageBuilder::audio_message(), ContentItem::Audio);
+  match MessageBuilder::text_message("hello") {
+    ContentItem::Text { text } => assert_eq!(text, "hello"),
+    other => panic!("got {other:?}"),
+  }
+  match MessageBuilder::content_message("world") {
+    ContentItem::ContentText { text } => assert_eq!(text, "world"),
+    other => panic!("got {other:?}"),
+  }
+  match MessageBuilder::video_message("v.mp4", 1234, 5) {
+    ContentItem::Video {
+      video,
+      max_pixels,
+      fps,
+    } => {
+      assert_eq!(video, "v.mp4");
+      assert_eq!(max_pixels, 1234);
+      assert_eq!(fps, 5);
+    }
+    other => panic!("got {other:?}"),
+  }
+}
+
+#[test]
+fn message_formatter_list_with_image_type_text_image_last_variant() {
+  // LIST_WITH_IMAGE_TYPE_TEXT_IMAGE_LAST is declared in the python
+  // enum (line 14) but no model in MODEL_CONFIG selects it; the Rust
+  // port exposes it via the dispatcher so a caller can use it
+  // explicitly. Construct via direct method call (no model lookup).
+  let f = MessageFormatter {
+    model_name: "synthetic".to_string(),
+    format_type: MessageFormat::ListWithImageTypeTextImageLast,
+  };
+  let out = f
+    .format_message(
+      "what is this",
+      &FormatOpts {
+        num_images: 1,
+        num_audios: 0,
+        ..Default::default()
+      },
+    )
+    .unwrap();
+  let items = match out {
+    FormattedMessage::Message(m) => match m.content {
+      MessageContent::Items(v) => v,
+      _ => panic!(),
+    },
+    _ => panic!(),
+  };
+  // image_first=false → text first, then image (LIST_WITH_IMAGE_TYPE
+  // path uses text_message because message_type=Text).
+  assert_eq!(items.len(), 2);
+  match &items[0] {
+    ContentItem::Text { text } => assert_eq!(text, "what is this"),
+    other => panic!("expected Text at [0], got: {other:?}"),
+  }
+  assert_eq!(items[1], ContentItem::Image);
+}
