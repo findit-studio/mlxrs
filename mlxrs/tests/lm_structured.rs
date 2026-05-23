@@ -173,7 +173,7 @@ fn build_json_schema_logits_processor_constructs() {
       "name": { "type": "string" }
     }
   });
-  let _proc = structured::build_json_schema_logits_processor(schema, &tok)
+  let _proc = structured::build_json_schema_logits_processor(schema, &tok, None)
     .expect("processor construction should succeed for a simple schema");
 }
 
@@ -183,7 +183,7 @@ fn json_schema_processor_masks_invalid_first_tokens() {
   // The simplest schema: any JSON object — only `{` (and optional
   // leading whitespace per the JSON grammar) can be the first token.
   let schema = json!({ "type": "object" });
-  let proc = structured::build_json_schema_logits_processor(schema, &tok)
+  let proc = structured::build_json_schema_logits_processor(schema, &tok, None)
     .expect("processor construction should succeed");
 
   // Build a `[1, V]` logits row of zeros; the processor should mask
@@ -229,7 +229,7 @@ fn json_schema_processor_masks_invalid_first_tokens() {
 fn llguidance_regex_grammar_constructs() {
   let tok = fixture_tokenizer("regex_constructs");
   let grammar = structured::GrammarSpec::Regex(r"[0-9]+".to_string());
-  let _proc = structured::LLGuidanceLogitsProcessor::new(grammar, &tok)
+  let _proc = structured::LLGuidanceLogitsProcessor::new(grammar, &tok, None)
     .expect("regex grammar processor construction should succeed");
 }
 
@@ -241,7 +241,7 @@ fn llguidance_lark_grammar_constructs() {
 DIGITS: /[0-9]+/
 "#;
   let grammar = structured::GrammarSpec::Lark(lark.to_string());
-  let _proc = structured::LLGuidanceLogitsProcessor::new(grammar, &tok)
+  let _proc = structured::LLGuidanceLogitsProcessor::new(grammar, &tok, None)
     .expect("lark grammar processor construction should succeed");
 }
 
@@ -251,7 +251,7 @@ fn llguidance_processor_implements_logits_processor_trait() {
   // `make_logits_processors` trait alias `Box<dyn Fn(&[u32], &Array)
   // -> Result<Array>>`; the binding's type pin enforces it.
   let tok = fixture_tokenizer("plug_into_chain");
-  let proc = structured::build_json_schema_logits_processor(json!({"type": "object"}), &tok)
+  let proc = structured::build_json_schema_logits_processor(json!({"type": "object"}), &tok, None)
     .expect("processor construction should succeed");
 
   let boxed: LogitsProcessor = proc.into_logits_processor();
@@ -260,4 +260,184 @@ fn llguidance_processor_implements_logits_processor_trait() {
   let zeros = vec![0.0f32; vocab];
   let logits = Array::from_slice::<f32>(&zeros, &(1, vocab)).unwrap();
   let _out = boxed(&[], &logits).expect("boxed closure call should succeed");
+}
+
+// ── Finding 1 (R1): terminal-grammar EOS-only mask ────────────────────
+//
+// `Matcher::compute_mask` errors out once the grammar reaches a stopped
+// state (e.g. a `Regex("a")` grammar after the single `a` has been
+// consumed). The fix uses `compute_mask_or_eos`, which returns an EOS-
+// only mask when stopped. These two tests pin that behaviour: after
+// consuming the only token the grammar accepts, the next mask must
+// allow ONLY the tokenizer's eos id (every other position `-inf`).
+
+/// Index of the tokenizer's EOS in the byte-level fixture vocab.
+///
+/// `TOKENIZER_CONFIG_JSON` sets `eos_token` = `</s>`; the added-tokens
+/// section in `build_byte_level_tokenizer_json` assigns id `2` to
+/// `</s>`. Codify this once so the two terminal-grammar tests can
+/// assert against it.
+const FIXTURE_EOS_ID: usize = 2;
+
+#[test]
+fn llguidance_terminal_regex_grammar_returns_eos_only_mask_after_consume() {
+  let tok = fixture_tokenizer("terminal_regex_eos_only");
+  // A regex grammar that accepts exactly the single byte `a`. The
+  // matcher is in `StopReason::NotStopped` initially (one token may
+  // still be sampled), then after consuming the `a` token it
+  // transitions to a stopped state.
+  let grammar = structured::GrammarSpec::Regex("a".to_string());
+  let proc = structured::LLGuidanceLogitsProcessor::new(grammar, &tok, None)
+    .expect("terminal regex processor construction should succeed");
+
+  let vocab = tok.hf().get_vocab_size(true);
+  let zeros = vec![0.0f32; vocab];
+  let logits = Array::from_slice::<f32>(&zeros, &(1, vocab)).unwrap();
+
+  // Step 1: the first `apply` call returns the initial mask (the `a`
+  // token is the only valid sample). The `is_first_token` flag is set,
+  // so no history token is consumed yet.
+  let mut first = proc
+    .apply(&[], &logits)
+    .expect("first apply should succeed (initial mask, not yet stopped)");
+  let first_v = first.to_vec::<f32>().unwrap();
+  let a_id = id_for_byte(b'a') as usize;
+  assert!(
+    first_v[a_id].is_finite(),
+    "first-step `a` token (id {a_id}) must remain finite, got {}",
+    first_v[a_id]
+  );
+
+  // Step 2: simulate consuming the `a` token. The matcher transitions
+  // to `StopReason::EosTriggered` (the regex is now satisfied) — pre-
+  // fix `compute_mask` would surface an `Err`; the fix routes through
+  // `compute_mask_or_eos`, which auto-returns an EOS-only mask. The
+  // returned logits must have EVERY position `-inf` except `FIXTURE_EOS_ID`.
+  let a_token_id = a_id as u32;
+  let mut out = proc
+    .apply(&[a_token_id], &logits)
+    .expect("post-consume apply should succeed and return EOS-only mask");
+  let out_v = out.to_vec::<f32>().unwrap();
+  assert_eq!(out_v.len(), vocab);
+
+  assert!(
+    out_v[FIXTURE_EOS_ID].is_finite(),
+    "EOS-only mask: eos token (id {FIXTURE_EOS_ID}) must remain finite, got {}",
+    out_v[FIXTURE_EOS_ID]
+  );
+  // Every other token (including the previously-allowed `a`) must be
+  // masked to `-inf`.
+  for (i, v) in out_v.iter().enumerate() {
+    if i == FIXTURE_EOS_ID {
+      continue;
+    }
+    assert!(
+      v.is_infinite() && *v < 0.0,
+      "EOS-only mask: non-eos token id {i} must be -inf, got {v}"
+    );
+  }
+}
+
+#[test]
+fn llguidance_terminal_lark_grammar_returns_eos_only_after_close() {
+  let tok = fixture_tokenizer("terminal_lark_eos_only");
+  // A finite Lark grammar that accepts exactly the single literal
+  // `x`. After consuming the `x` token the grammar is satisfied and
+  // the matcher transitions to a stopped state.
+  let lark = r#"start: "x"
+"#;
+  let grammar = structured::GrammarSpec::Lark(lark.to_string());
+  let proc = structured::LLGuidanceLogitsProcessor::new(grammar, &tok, None)
+    .expect("terminal lark processor construction should succeed");
+
+  let vocab = tok.hf().get_vocab_size(true);
+  let zeros = vec![0.0f32; vocab];
+  let logits = Array::from_slice::<f32>(&zeros, &(1, vocab)).unwrap();
+
+  // Step 1: prime the matcher (first call doesn't consume history).
+  let _ = proc
+    .apply(&[], &logits)
+    .expect("first apply should succeed (initial mask, not yet stopped)");
+
+  // Step 2: consume the `x` token; the lark grammar is now finished.
+  let x_token_id = id_for_byte(b'x');
+  let mut out = proc
+    .apply(&[x_token_id], &logits)
+    .expect("post-close apply should succeed and return EOS-only mask");
+  let out_v = out.to_vec::<f32>().unwrap();
+  assert_eq!(out_v.len(), vocab);
+
+  assert!(
+    out_v[FIXTURE_EOS_ID].is_finite(),
+    "EOS-only lark mask: eos (id {FIXTURE_EOS_ID}) must remain finite, got {}",
+    out_v[FIXTURE_EOS_ID]
+  );
+  for (i, v) in out_v.iter().enumerate() {
+    if i == FIXTURE_EOS_ID {
+      continue;
+    }
+    assert!(
+      v.is_infinite() && *v < 0.0,
+      "EOS-only lark mask: non-eos token id {i} must be -inf, got {v}"
+    );
+  }
+}
+
+// ── Finding 2 (R1): padded model-vocab support ────────────────────────
+//
+// `tok_env_from_tokenizer` used to call `into_tok_env(None)`, so the
+// matcher mask was sized to `tokenizer.get_vocab_size(true)`. Models
+// with a padded LM head (logits last-dim > tokenizer vocab) would hit a
+// shape-mismatch in `apply`. The fix threads a `model_vocab_size:
+// Option<usize>` through to `into_tok_env`, padding the toktrie with
+// placeholder special tokens up to the model's actual vocab width. The
+// placeholder ids have no real byte sequence, so the grammar engine
+// never allows them — they must always be `-inf` in the returned mask.
+
+#[test]
+fn llguidance_processor_accepts_padded_model_vocab() {
+  let tok = fixture_tokenizer("padded_model_vocab");
+  // Logits last-dim larger than the tokenizer vocab — simulate a
+  // padded LM head (e.g. 32064 vs 32000 for Llama-style models).
+  let tok_vocab = tok.hf().get_vocab_size(true);
+  let model_vocab = tok_vocab + 8;
+
+  // Pass `Some(model_vocab)` so the toktrie is padded to match the
+  // logits' last-axis width.
+  let proc = structured::build_json_schema_logits_processor(
+    json!({ "type": "object" }),
+    &tok,
+    Some(model_vocab),
+  )
+  .expect("processor construction should succeed with padded model vocab");
+
+  let zeros = vec![0.0f32; model_vocab];
+  let logits = Array::from_slice::<f32>(&zeros, &(1, model_vocab)).unwrap();
+
+  // Pre-fix this would error out with "matcher mask length {tok_vocab}
+  // < logits vocab {model_vocab}".
+  let mut out = proc
+    .apply(&[], &logits)
+    .expect("apply should succeed when model vocab is padded via Some(n)");
+  let out_v = out.to_vec::<f32>().unwrap();
+  assert_eq!(out_v.len(), model_vocab);
+
+  // The original tokenizer-vocab `{` token is allowed (JSON object
+  // start), so we still have a finite anchor.
+  let open_brace = id_for_byte(b'{') as usize;
+  assert!(
+    out_v[open_brace].is_finite(),
+    "padded-vocab mask: `{{` (id {open_brace}) must remain finite, got {}",
+    out_v[open_brace]
+  );
+
+  // Every padded-placeholder position (ids `tok_vocab..model_vocab`)
+  // must be `-inf` — the grammar engine never allows them because
+  // they have no real byte sequence.
+  for (i, v) in out_v.iter().enumerate().take(model_vocab).skip(tok_vocab) {
+    assert!(
+      v.is_infinite() && *v < 0.0,
+      "padded placeholder id {i} must be -inf, got {v}"
+    );
+  }
 }

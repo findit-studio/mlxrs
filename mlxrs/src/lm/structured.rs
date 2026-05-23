@@ -118,7 +118,8 @@ impl GrammarSpec {
 }
 
 /// Build a [`TokEnv`] (byte-level vocab view for [`llguidance`]) from an
-/// [`mlxrs` `Tokenizer`](Tokenizer).
+/// [`mlxrs` `Tokenizer`](Tokenizer), optionally padding the vocab to
+/// `model_vocab_size` placeholder special tokens.
 ///
 /// Mirrors the Python `llguidance.hf.from_tokenizer(tokenizer)` call
 /// (`structured.py:117`). The mlxrs `tokenizers = "0.23"` and
@@ -129,16 +130,32 @@ impl GrammarSpec {
 /// so we round-trip through `serde_json::to_vec` + `ByteTokenizer::from_json_bytes`
 /// (which calls `Tokenizer::from_bytes` on the v0.21 side). Result: one
 /// `tokenizers` version in the dep graph, no behavioural change.
-fn tok_env_from_tokenizer(tokenizer: &Tokenizer) -> Result<TokEnv> {
+///
+/// **Padded vocabularies.** Many transformer LMs round the LM-head's
+/// output dim up (e.g. 32064 for Llama with a 32000-token tokenizer) so
+/// the logits' last axis is LARGER than `tokenizer.get_vocab_size(true)`.
+/// `ByteTokenizer::into_tok_env(Some(n))` pads the toktrie with
+/// placeholder special tokens up to `n` (see `toktrie_hf_tokenizers`'s
+/// `ByteTokenizerEnv::new`), so the resulting mask has the model's vocab
+/// width and the placeholder ids fall in the "no real byte sequence
+/// maps to this id" bucket — the grammar engine never allows them, so
+/// they're masked to `-inf` for free. `None` falls back to the
+/// tokenizer's own vocab size (the previous behaviour, fine for models
+/// whose LM head matches the tokenizer exactly).
+fn tok_env_from_tokenizer(
+  tokenizer: &Tokenizer,
+  model_vocab_size: Option<usize>,
+) -> Result<TokEnv> {
   let json = serde_json::to_vec(tokenizer.hf()).map_err(|e| Error::Backend {
     message: format!("llguidance: serialize HF tokenizer: {e}"),
   })?;
   let bt = ByteTokenizer::from_json_bytes(&json).map_err(|e| Error::Backend {
     message: format!("llguidance: build ByteTokenizer: {e}"),
   })?;
-  bt.into_tok_env(None).map_err(|e| Error::Backend {
-    message: format!("llguidance: build TokEnv: {e}"),
-  })
+  bt.into_tok_env(model_vocab_size)
+    .map_err(|e| Error::Backend {
+      message: format!("llguidance: build TokEnv: {e}"),
+    })
 }
 
 /// MLX logits processor backed by [`llguidance`].
@@ -165,7 +182,8 @@ pub struct LLGuidanceLogitsProcessor {
 }
 
 impl LLGuidanceLogitsProcessor {
-  /// Construct a new processor from a [`GrammarSpec`] + tokenizer.
+  /// Construct a new processor from a [`GrammarSpec`] + tokenizer
+  /// (optionally pinned to the model's LM-head vocab width).
   ///
   /// Internally: builds a [`TokEnv`] from `tokenizer` (one `~1.5s` walk
   /// of the vocab — the Python reference caches this; see
@@ -175,8 +193,25 @@ impl LLGuidanceLogitsProcessor {
   /// and wraps the resulting [`llguidance::TokenParser`] in a
   /// [`Matcher`]. Any grammar-compile error from `llguidance` surfaces
   /// as an [`Error::Backend`].
-  pub fn new(grammar: GrammarSpec, tokenizer: &Tokenizer) -> Result<Self> {
-    let tok_env = tok_env_from_tokenizer(tokenizer)?;
+  ///
+  /// # `model_vocab_size`
+  ///
+  /// `Some(n)` pins the resulting mask width to `n` (the logits' last-
+  /// axis size), padding the underlying toktrie with placeholder special
+  /// tokens beyond the tokenizer's own `get_vocab_size(true)`. Use this
+  /// when the LM-head's output dim is wider than the tokenizer's vocab
+  /// (a common case — Llama-style models round the LM head's output dim
+  /// up for hardware alignment, leaving 64+ "padding" ids that have no
+  /// real bytes). Without it, `apply` would surface a
+  /// [`Error::ShapeMismatch`] on the first call. `None` keeps the
+  /// previous behaviour (mask width = tokenizer vocab size), fine for
+  /// models whose LM head matches the tokenizer exactly.
+  pub fn new(
+    grammar: GrammarSpec,
+    tokenizer: &Tokenizer,
+    model_vocab_size: Option<usize>,
+  ) -> Result<Self> {
+    let tok_env = tok_env_from_tokenizer(tokenizer, model_vocab_size)?;
     let mut factory = ParserFactory::new_simple(&tok_env).map_err(|e| Error::Backend {
       message: format!("llguidance: ParserFactory: {e}"),
     })?;
@@ -214,9 +249,12 @@ impl LLGuidanceLogitsProcessor {
   ///    model just emitted, so consume it through
   ///    [`Matcher::consume_token`] before recomputing the mask.
   /// 3. Compute the allowed-token bit-vector with
-  ///    [`Matcher::compute_mask`], iterate it to build a `[V]` boolean
-  ///    "disallowed" array, broadcast across the logits' batch axis, and
-  ///    mask via `select(disallowed, -inf, logits)`.
+  ///    [`Matcher::compute_mask_or_eos`] (which forces an EOS-only mask
+  ///    when the grammar has reached a terminal/stopped state, instead
+  ///    of erroring as `compute_mask` would — the documented "terminal
+  ///    grammar → next token must be EOS" path), iterate it to build a
+  ///    `[V]` boolean "disallowed" array, broadcast across the logits'
+  ///    batch axis, and mask via `select(disallowed, -inf, logits)`.
   ///
   /// `logits` may be `[V]` or `[1, V]`; the returned `Array` keeps the
   /// input shape + dtype (the `-inf` scalar is cast `astype(logits.dtype)`
@@ -260,12 +298,22 @@ impl LLGuidanceLogitsProcessor {
     }
 
     // Compute the allowed-bit vector for the next token.
+    //
+    // [`Matcher::compute_mask`] errors out when the grammar has finished
+    // (`StopReason != NotStopped` — e.g. a `Regex("a")` grammar after the
+    // single `a` token has been consumed). For a terminal grammar the
+    // documented next step is to force EOS, not to abort generation, so
+    // we call [`Matcher::compute_mask_or_eos`] which auto-returns an
+    // EOS-only [`toktrie::SimpleVob`] when the parser is stopped (it
+    // delegates to `compute_mask` otherwise). The downstream
+    // `is_allowed`-based loop then naturally masks every token but EOS
+    // to `-inf`, the documented "terminal grammar → force EOS" path.
     let mask = self
       .matcher
       .borrow_mut()
-      .compute_mask()
+      .compute_mask_or_eos()
       .map_err(|e| Error::Backend {
-        message: format!("llguidance: compute_mask: {e}"),
+        message: format!("llguidance: compute_mask_or_eos: {e}"),
       })?;
 
     // Validate sizes match: `mask.len()` is `tokrx_info.vocab_size`
@@ -346,7 +394,7 @@ impl LLGuidanceLogitsProcessor {
 }
 
 /// One-shot helper: build a [`LLGuidanceLogitsProcessor`] from a JSON
-/// schema + tokenizer.
+/// schema + tokenizer (+ optional model vocab-size override).
 ///
 /// Port of `mlx_vlm/structured.py:105-121`
 /// (`build_json_schema_logits_processor`). The Python reference caches the
@@ -355,10 +403,13 @@ impl LLGuidanceLogitsProcessor {
 /// processors at the request boundary — so this thin helper is the
 /// natural shim. Equivalent to
 /// `LLGuidanceLogitsProcessor::new(GrammarSpec::JsonSchema(schema),
-/// tokenizer)`.
+/// tokenizer, model_vocab_size)`. See
+/// [`LLGuidanceLogitsProcessor::new`]'s `model_vocab_size` doc for when
+/// to pass `Some(n)` (padded LM heads).
 pub fn build_json_schema_logits_processor(
   schema: Value,
   tokenizer: &Tokenizer,
+  model_vocab_size: Option<usize>,
 ) -> Result<LLGuidanceLogitsProcessor> {
-  LLGuidanceLogitsProcessor::new(GrammarSpec::JsonSchema(schema), tokenizer)
+  LLGuidanceLogitsProcessor::new(GrammarSpec::JsonSchema(schema), tokenizer, model_vocab_size)
 }
