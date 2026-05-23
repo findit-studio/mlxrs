@@ -69,6 +69,34 @@
 //!   `isStreamingMode` distinction (we collapse them into a single
 //!   tri-state to make the cpal-side check a single atomic load).
 //!
+//! ## Concurrency
+//!
+//! The cpal callback runs on a real-time audio I/O thread with a
+//! hard deadline: missing the device's callback period yields an
+//! audible underrun even if the silence-fill path is correct
+//! (CoreAudio fills with whatever was left in the buffer). The
+//! callback **must not block** on producer-held mutexes.
+//!
+//! Concrete contract:
+//!
+//! - **Callback uses `try_lock`, not `lock`.** If the producer is
+//!   mid-extend on the queue mutex, the callback emits silence for
+//!   the current period instead of blocking past the device
+//!   deadline. The cost (one underrun period) is bounded; blocking
+//!   the audio thread is not.
+//! - **Producer chunks large writes.** [`AudioPlayer::write_samples`]
+//!   splits writes larger than [`WRITE_CHUNK_MAX`] into per-chunk
+//!   lock acquisitions, so the callback's `try_lock` window is
+//!   bounded by the duration of one chunk's `extend` (microseconds
+//!   at 4096 f32 samples) rather than the duration of the full
+//!   producer payload (which can be hundreds of milliseconds for a
+//!   multi-second TTS chunk).
+//! - **Future migration.** If audible underruns persist under
+//!   profiling, swap the `Mutex<VecDeque<f32>>` for a lock-free
+//!   `crossbeam-queue::ArrayQueue<f32>` (no new dep today; the
+//!   `try_lock` + chunking pattern stays within the existing
+//!   surface).
+//!
 //! ## Scope cuts (explicit, A11)
 //!
 //! The Swift `AudioPlayer` exposes a few capabilities A11 deliberately
@@ -153,6 +181,39 @@ const FLUSH_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// realistic 4-second queue (the [`PlaybackConfig`] default) can drain
 /// at real-time playback speeds with safety margin.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum number of f32 samples the producer extends into the
+/// shared queue per lock acquisition. Bounds the duration the
+/// callback's `try_lock` would have to wait if it raced the producer
+/// (~microseconds at 4096 samples on a modern CPU), so the cpal
+/// callback's silence-on-contention fallback never lingers across
+/// multiple device periods.
+///
+/// Picked at 4096 f32 samples (170ms at 24 kHz mono, 85ms at 48 kHz
+/// stereo) — far larger than any realistic cpal callback buffer
+/// (typically 64–1024 frames) but small enough that the producer's
+/// per-chunk `extend` finishes well inside one device period.
+pub const WRITE_CHUNK_MAX: usize = 4096;
+
+/// Sanitize a caller-supplied volume scalar to `[0.0, 1.0]`. Public
+/// helper so the policy can be unit-tested without constructing an
+/// [`AudioPlayer`] (which opens a cpal device — not available in
+/// CI). Used by [`AudioPlayer::set_volume`].
+///
+/// - **Non-finite (`NaN`, `±∞`) maps to `0.0`.** `f32::clamp`
+///   preserves NaN bits, which would cause the cpal callback's
+///   `sample * volume` arithmetic to emit NaN PCM (audible as
+///   full-scale noise on most DACs).
+/// - **Finite out-of-range is clamped to `[0.0, 1.0]`.** Matches
+///   `AVAudioPlayerNode.volume`'s documented range.
+#[must_use]
+pub fn sanitize_volume(vol: f32) -> f32 {
+  if vol.is_finite() {
+    vol.clamp(0.0, 1.0)
+  } else {
+    0.0
+  }
+}
 
 /// Thread-shared callback context. Lives behind an `Arc` so the cpal
 /// stream's callback (which gets a `'static` closure) and the
@@ -326,9 +387,25 @@ impl AudioPlayer {
       // Single short critical section: drain into the cpal buffer.
       // We don't hold the lock across `*s = ...` arithmetic outside
       // this scope.
-      let mut q = match cb_shared.queue.lock() {
+      //
+      // `try_lock` (not blocking `lock`): the callback runs on the
+      // real-time audio I/O thread and MUST NOT block on a
+      // producer-held mutex past the device callback deadline. On
+      // contention, emit silence for this period — the cost is one
+      // underrun, the alternative (blocking) is unbounded latency
+      // that compounds across device periods. See the module-level
+      // `## Concurrency` doc-comment for the full contract.
+      let mut q = match cb_shared.queue.try_lock() {
         Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+          // Producer holds the lock; emit silence rather than block
+          // past the device deadline.
+          for s in out.iter_mut() {
+            *s = 0.0;
+          }
+          return;
+        }
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
       };
       let drain_n = out.len().min(q.len());
       for slot in out.iter_mut().take(drain_n) {
@@ -416,16 +493,23 @@ impl AudioPlayer {
   /// the range are clamped silently (matches the
   /// `AVAudioPlayerNode.volume` 0..1 documented range).
   ///
+  /// **Non-finite inputs (NaN, ±∞) are mapped to `0.0`** rather than
+  /// propagated. `f32::clamp` preserves NaN bits, which would cause
+  /// the callback's `sample * volume` arithmetic to emit NaN samples
+  /// (audible as full-scale noise on most DACs); silent safe-default
+  /// matches the unsigned-clamp idiom used elsewhere in mlxrs for
+  /// user-supplied scalars.
+  ///
   /// Takes `&self` (not `&mut self`) so the volume can be adjusted
   /// concurrently with [`AudioPlayer::write_samples`] without
   /// shadowing the producer borrow — useful when a UI thread tweaks
   /// volume while a worker thread is pumping samples.
   pub fn set_volume(&self, vol: f32) {
-    let clamped = vol.clamp(0.0, 1.0);
+    let sanitized = sanitize_volume(vol);
     self
       .shared
       .volume_bits
-      .store(clamped.to_bits(), Ordering::Relaxed);
+      .store(sanitized.to_bits(), Ordering::Release);
   }
 
   /// Start the cpal stream — samples written via
@@ -486,6 +570,19 @@ impl AudioPlayer {
   /// [`AudioPlayer::start`] still works), and clears any captured
   /// callback error. Mirrors `stopStreaming()`.
   ///
+  /// **Terminal-state contract.** After `stop()` returns, subsequent
+  /// [`AudioPlayer::write_samples`] calls reject with
+  /// [`Error::Backend`] ("...called after stop()") to honor the
+  /// [`super::output_stream::AudioOutputStream::stop`] contract —
+  /// late producer chunks MUST NOT accumulate silently and replay
+  /// on a later `start()` / [`AudioPlayer::resume`]. This is a hard
+  /// terminal state for the *write* path; the player itself can be
+  /// re-started (the cpal stream is preserved) but the producer
+  /// must not push more samples until a coordinated restart of the
+  /// upstream pipeline. Pause is the soft-state alternative (see
+  /// [`AudioPlayer::pause`] — pause-state writes still buffer for
+  /// [`AudioPlayer::resume`]).
+  ///
   /// # Errors
   /// - [`Error::Backend`] if the cpal `Stream::pause()` call fails.
   pub fn stop(&mut self) -> Result<()> {
@@ -512,41 +609,91 @@ impl AudioPlayer {
   /// one is queued — the next producer call after a device error
   /// receives the error report.
   ///
+  /// Internally splits `samples` into [`WRITE_CHUNK_MAX`]-sized
+  /// inner-loop chunks, each taking the queue lock for its own
+  /// `extend`. This bounds the duration the audio callback's
+  /// `try_lock` would have to wait on the producer to ~one chunk's
+  /// extend (microseconds), so a multi-second producer payload
+  /// can't stall the cpal callback past the device deadline. See
+  /// the module-level `## Concurrency` doc-comment.
+  ///
   /// # Errors
+  /// - [`Error::Backend`] if [`AudioPlayer::stop`] has been called
+  ///   on this player. `stop()` is the terminal state — writes after
+  ///   stop are rejected outright to honor the
+  ///   [`super::output_stream::AudioOutputStream::stop`] contract
+  ///   ("any queued samples MUST be dropped; subsequent
+  ///   `write_samples` calls MUST return `Err`"). Pause-state writes
+  ///   are still accepted (they buffer for `resume`).
   /// - [`Error::Backend`] if the queue would overflow
   ///   [`PlaybackConfig::queue_capacity_frames`] × channel count.
   ///   The write is rejected wholesale — no partial accept on
   ///   overflow (the caller has no way to know how many fit, and a
   ///   partial accept would invite torn audio at the chunk
-  ///   boundary).
+  ///   boundary). The overflow check uses the total payload length
+  ///   so chunking can't mask the cap.
   /// - [`Error::Backend`] if a prior cpal callback error was
   ///   captured.
   pub fn write_samples(&mut self, samples: &[f32]) -> Result<usize> {
     self.take_callback_error()?;
 
-    let mut q = match self.shared.queue.lock() {
-      Ok(g) => g,
-      Err(poisoned) => poisoned.into_inner(),
-    };
-    let projected_len = q
-      .len()
-      .checked_add(samples.len())
-      .ok_or_else(|| Error::Backend {
-        message: "AudioPlayer::write_samples: queue length + new samples overflows usize"
-          .to_string(),
-      })?;
-    if projected_len > self.shared.queue_capacity_samples {
+    // FIX 1: terminal-state gate. `STATE_STOPPED` is the closed
+    // state per `AudioOutputStream::stop`'s contract — accepting
+    // writes here would let post-stop samples accumulate and play
+    // on a later `start()`/`resume()`. Acquire-load pairs with the
+    // Release-store in `stop()`. Pause-state writes still buffer
+    // (the cpal callback gates on STATE_RUNNING separately).
+    let state = self.shared.state.load(Ordering::Acquire);
+    if state == STATE_STOPPED {
       return Err(Error::Backend {
-        message: format!(
-          "AudioPlayer::write_samples: queue overflow (capacity {} samples, current {} samples, \
-           tried to push {})",
-          self.shared.queue_capacity_samples,
-          q.len(),
-          samples.len()
-        ),
+        message: "AudioPlayer::write_samples called after stop()".to_string(),
       });
     }
-    q.extend(samples.iter().copied());
+
+    // Whole-payload overflow check up front (one lock acquisition).
+    // Chunking is purely a concurrency-shaping concern; it must not
+    // weaken the cap.
+    {
+      let q = match self.shared.queue.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+      };
+      let projected_len = q
+        .len()
+        .checked_add(samples.len())
+        .ok_or_else(|| Error::Backend {
+          message: "AudioPlayer::write_samples: queue length + new samples overflows usize"
+            .to_string(),
+        })?;
+      if projected_len > self.shared.queue_capacity_samples {
+        return Err(Error::Backend {
+          message: format!(
+            "AudioPlayer::write_samples: queue overflow (capacity {} samples, current {} \
+             samples, tried to push {})",
+            self.shared.queue_capacity_samples,
+            q.len(),
+            samples.len()
+          ),
+        });
+      }
+    }
+
+    // FIX 2: per-chunk lock acquisition. Each inner-loop iteration
+    // takes the queue lock for ~one chunk's `extend` so the cpal
+    // callback's `try_lock` window is bounded by `WRITE_CHUNK_MAX`
+    // samples, not the full payload length.
+    for chunk in samples.chunks(WRITE_CHUNK_MAX) {
+      let mut q = match self.shared.queue.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+      };
+      // `reserve_exact` BEFORE `extend` to keep allocation cost out
+      // of the contention window (if the underlying buffer needs to
+      // grow, do that under the lock but in one shot rather than the
+      // amortized doubling `extend` would do mid-stream).
+      q.reserve_exact(chunk.len());
+      q.extend(chunk.iter().copied());
+    }
     Ok(samples.len())
   }
 

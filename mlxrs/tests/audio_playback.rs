@@ -17,7 +17,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use mlxrs::audio::playback::{AudioOutputStream, ChannelLayout, PlaybackConfig, SampleFormat};
+use mlxrs::audio::playback::{
+  AudioOutputStream, ChannelLayout, PlaybackConfig, SampleFormat,
+  player::{WRITE_CHUNK_MAX, sanitize_volume},
+};
 
 // ---------------------------------------------------------------------------
 // Mock AudioOutputStream
@@ -114,9 +117,43 @@ fn playback_config_stereo_constructor() {
   let cfg = PlaybackConfig::stereo(44_100);
   assert_eq!(cfg.channels, ChannelLayout::Stereo);
   assert_eq!(cfg.channels.count(), 2);
-  // Stereo capacity bumps the frame budget so 4 seconds of stereo
-  // audio fits (queue is in samples internally).
-  assert_eq!(cfg.queue_capacity_frames, 44_100 * 4 * 2);
+  // F4: `queue_capacity_frames` is in FRAMES (not samples), same
+  // unit across mono and stereo. The player's `with_device`
+  // constructor does the single frame-to-sample conversion via
+  // `* channels.count()`; `stereo()` MUST NOT pre-multiply (doing
+  // so would double-count the bound and yield 8 seconds of stereo
+  // for what's advertised as a 4-second cap).
+  assert_eq!(cfg.queue_capacity_frames, 44_100 * 4);
+}
+
+#[test]
+fn playback_config_stereo_queue_capacity_is_frames_not_samples() {
+  // F4 regression: pre-fix the stereo constructor stored
+  // `sample_rate * 4 * 2` and `with_device` then multiplied by
+  // channel count again — yielding 8 seconds of stereo capacity
+  // for what's advertised as 4 seconds. Post-fix the stored value
+  // is in frames and matches the mono constructor's unit.
+  let cfg = PlaybackConfig::stereo(48_000);
+  // 4 seconds @ 48 kHz = 192_000 frames (NOT 384_000 samples).
+  assert_eq!(cfg.queue_capacity_frames, 192_000);
+  // Per-channel-applied sample budget is what the player actually
+  // bounds: 192_000 frames × 2 channels = 384_000 interleaved
+  // samples (i.e. 4 seconds of stereo audio, the documented cap).
+  let samples = cfg.queue_capacity_frames * usize::from(cfg.channels.count());
+  assert_eq!(samples, 384_000);
+}
+
+#[test]
+fn playback_config_mono_queue_capacity_is_frames_not_samples() {
+  // F4 invariant: the mono path is the unit-of-truth — frames are
+  // frames whether the channel count is 1 or N. For mono,
+  // `queue_capacity_frames * 1 == queue_capacity_frames`, which is
+  // a degenerate case but pins the contract.
+  let cfg = PlaybackConfig::mono(48_000);
+  // 4 seconds @ 48 kHz = 192_000 frames.
+  assert_eq!(cfg.queue_capacity_frames, 192_000);
+  let samples = cfg.queue_capacity_frames * usize::from(cfg.channels.count());
+  assert_eq!(samples, 192_000);
 }
 
 #[test]
@@ -227,6 +264,53 @@ fn audio_output_stream_overflow_returns_err() {
 // in the `#[ignore]`-gated real-device tests below.
 
 #[test]
+fn audio_player_write_chunk_max_splits_large_writes() {
+  // F2 contract: producer-side `write_samples` splits payloads
+  // larger than `WRITE_CHUNK_MAX` into per-chunk lock acquisitions
+  // so the cpal callback's `try_lock` window is bounded by
+  // `WRITE_CHUNK_MAX` samples (microseconds-scale `extend`), not
+  // the full payload length (which can be hundreds of milliseconds
+  // for a multi-second TTS chunk). This mock test verifies the
+  // chunking math via the public `WRITE_CHUNK_MAX` constant — the
+  // device-touching path is exercised under the real-device gate.
+  assert_eq!(
+    WRITE_CHUNK_MAX, 4096,
+    "WRITE_CHUNK_MAX is the documented contract value; bumping it changes the audio-callback \
+     contention envelope (see player.rs ## Concurrency)"
+  );
+
+  // Simulate a 10 000-sample producer payload (e.g. a ~200ms
+  // mono-24kHz TTS chunk). It must split into ceil(10000/4096)=3
+  // chunks of sizes [4096, 4096, 1808] — the same iteration the
+  // producer's per-chunk lock loop walks.
+  let payload = vec![0.0_f32; 10_000];
+  let chunks: Vec<usize> = payload.chunks(WRITE_CHUNK_MAX).map(<[f32]>::len).collect();
+  assert_eq!(chunks.len(), 3);
+  assert_eq!(chunks[0], 4096);
+  assert_eq!(chunks[1], 4096);
+  assert_eq!(chunks[2], 1808);
+  assert_eq!(chunks.iter().sum::<usize>(), 10_000);
+  // Every chunk MUST be <= WRITE_CHUNK_MAX (the lock-window bound).
+  assert!(chunks.iter().all(|&n| n <= WRITE_CHUNK_MAX));
+
+  // Boundary: a payload smaller than WRITE_CHUNK_MAX takes one
+  // chunk; a payload exactly WRITE_CHUNK_MAX takes one chunk too.
+  assert_eq!(vec![0.0_f32; 100].chunks(WRITE_CHUNK_MAX).count(), 1);
+  assert_eq!(
+    vec![0.0_f32; WRITE_CHUNK_MAX]
+      .chunks(WRITE_CHUNK_MAX)
+      .count(),
+    1
+  );
+  assert_eq!(
+    vec![0.0_f32; WRITE_CHUNK_MAX + 1]
+      .chunks(WRITE_CHUNK_MAX)
+      .count(),
+    2
+  );
+}
+
+#[test]
 fn audio_player_rejects_non_f32_sample_format_pre_device() {
   // We can construct a PlaybackConfig with SampleFormat::I16 even
   // though the player doesn't currently support it; assert the
@@ -248,19 +332,40 @@ fn audio_player_rejects_non_f32_sample_format_pre_device() {
 
 #[test]
 fn audio_player_queue_capacity_frames_multiplied_by_channels() {
-  // Sanity-check the per-frame -> per-sample math the player uses
-  // internally so a stereo player with 1024-frame capacity actually
-  // accepts 2048 samples (interleaved L/R) before overflow.
-  let cfg = PlaybackConfig {
+  // F4 post-fix semantics: `queue_capacity_frames` is the frame
+  // count (constant across channel layouts); the player's
+  // `with_device` constructor does the single frame-to-sample
+  // conversion via `* channels.count()`. So a stereo config with
+  // `queue_capacity_frames = 1024` admits exactly 2048 interleaved
+  // L/R samples before overflow — NOT 4096 (the pre-fix bug
+  // double-counted the channel multiplier in the `stereo()`
+  // constructor; the assertion below is the post-fix unit-of-truth
+  // for both mono and stereo, set via an explicit-field struct
+  // literal so the constructor's frame/sample convention can't mask
+  // a future regression).
+  let stereo = PlaybackConfig {
     sample_rate: 16_000,
     channels: ChannelLayout::Stereo,
     sample_format: SampleFormat::F32,
     buffer_size_frames: None,
     queue_capacity_frames: 1024,
   };
-  let frames = cfg.queue_capacity_frames;
-  let samples = frames * usize::from(cfg.channels.count());
-  assert_eq!(samples, 2048);
+  assert_eq!(
+    stereo.queue_capacity_frames * usize::from(stereo.channels.count()),
+    2048
+  );
+
+  let mono = PlaybackConfig {
+    sample_rate: 16_000,
+    channels: ChannelLayout::Mono,
+    sample_format: SampleFormat::F32,
+    buffer_size_frames: None,
+    queue_capacity_frames: 1024,
+  };
+  assert_eq!(
+    mono.queue_capacity_frames * usize::from(mono.channels.count()),
+    1024
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -344,8 +449,13 @@ fn audio_player_buffer_overflow_returns_err() {
     queue_capacity_frames: 1024,
   };
   let mut player = AudioPlayer::new(cfg).unwrap();
-  // Don't start — keep the cpal callback paused so the queue
-  // doesn't drain while we fill it.
+  // F1: writes pre-`start()` are rejected (STATE_STOPPED is the
+  // initial state, and the write-gate is "reject when STOPPED").
+  // Transition to STATE_PAUSED via start()+pause() so writes are
+  // accepted but the cpal callback's STATE_RUNNING guard prevents
+  // it from draining the queue while we fill it.
+  player.start().unwrap();
+  player.pause().unwrap();
   player.write_samples(&[0.0_f32; 1024]).unwrap();
   let err = player.write_samples(&[0.0_f32; 1]).unwrap_err();
   assert!(
@@ -397,4 +507,102 @@ fn audio_player_set_volume_clamps_and_persists() {
 
   player.set_volume(-0.1);
   assert!((player.volume() - 0.0).abs() < 1e-6);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires real default audio output device"]
+fn audio_output_stream_rejects_writes_after_stop() {
+  // F1: terminal-state contract. After `stop()` returns,
+  // `write_samples` MUST reject — late producer chunks MUST NOT
+  // accumulate silently and replay on a later restart.
+  use mlxrs::audio::playback::AudioPlayer;
+
+  let mut player = AudioPlayer::new(PlaybackConfig::mono(16_000)).unwrap();
+  player.start().unwrap();
+
+  // Pre-stop: write succeeds.
+  assert_eq!(player.write_samples(&[0.0_f32; 128]).unwrap(), 128);
+
+  // Stop is the terminal-state transition.
+  player.stop().unwrap();
+  assert!(!player.is_running());
+
+  // Post-stop: write is rejected with an `after stop()` Backend
+  // error. The literal "after stop()" substring is the contract.
+  let err = player.write_samples(&[0.0_f32; 32]).unwrap_err();
+  match err {
+    mlxrs::error::Error::Backend { message } => {
+      assert!(
+        message.contains("after stop()"),
+        "expected `after stop()` in error message, got: {message}"
+      );
+    }
+    other => panic!("expected Backend error, got {other:?}"),
+  }
+}
+
+// F3 tests exercise the pure `sanitize_volume` helper directly so
+// they run in CI without a default audio output device. The
+// device-touching round-trip is exercised in
+// `audio_player_set_volume_clamps_and_persists` (real-device gate).
+
+#[test]
+fn audio_player_set_volume_sanitizes_nan_to_zero() {
+  // F3: NaN must NOT propagate into volume_bits — the callback's
+  // `sample * volume` would emit NaN PCM (audible as full-scale
+  // noise on most DACs). `f32::clamp` preserves NaN, so the
+  // sanitizer explicitly maps non-finite inputs to 0.0.
+  let stored = sanitize_volume(f32::NAN);
+  assert!(
+    !stored.is_nan(),
+    "sanitize_volume(NaN) must NOT return NaN (would produce NaN PCM via sample * volume); \
+     got {stored}"
+  );
+  assert_eq!(stored, 0.0, "NaN volume must sanitize to 0.0");
+}
+
+#[test]
+fn audio_player_set_volume_sanitizes_infinity_to_zero() {
+  // F3: positive and negative infinity are both non-finite and
+  // must sanitize to 0.0 (same policy as NaN — `f32::clamp` on +∞
+  // returns 1.0, which is the wrong semantic for "you gave us
+  // garbage"; we treat all non-finite inputs uniformly).
+  assert_eq!(
+    sanitize_volume(f32::INFINITY),
+    0.0,
+    "+infinity volume must sanitize to 0.0 (non-finite policy)"
+  );
+  assert_eq!(
+    sanitize_volume(f32::NEG_INFINITY),
+    0.0,
+    "-infinity volume must sanitize to 0.0 (non-finite policy)"
+  );
+}
+
+#[test]
+fn audio_player_set_volume_clamps_negative_to_zero() {
+  // F3: negative finite values are clamped (not sanitized) — the
+  // existing `clamp(0.0, 1.0)` path handles this. Explicit test so
+  // a future regression (e.g. dropping the clamp in favor of the
+  // is_finite branch) is caught.
+  assert_eq!(sanitize_volume(-0.5), 0.0);
+  assert_eq!(sanitize_volume(-1.0), 0.0);
+  assert_eq!(sanitize_volume(-1000.0), 0.0);
+}
+
+#[test]
+fn audio_player_set_volume_passes_through_in_range() {
+  // F3 sanity: finite in-range values pass through unchanged.
+  assert_eq!(sanitize_volume(0.0), 0.0);
+  assert_eq!(sanitize_volume(0.5), 0.5);
+  assert_eq!(sanitize_volume(1.0), 1.0);
+}
+
+#[test]
+fn audio_player_set_volume_clamps_above_unity() {
+  // F3: finite values >1.0 clamp to 1.0 (not sanitized to 0.0 —
+  // they're well-formed, just out of range).
+  assert_eq!(sanitize_volume(1.5), 1.0);
+  assert_eq!(sanitize_volume(100.0), 1.0);
 }

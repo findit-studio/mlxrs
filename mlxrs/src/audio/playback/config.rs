@@ -118,11 +118,16 @@ pub struct PlaybackConfig {
   /// platform pick (cpal's `BufferSize::Default` — equivalent to
   /// `AVAudioEngine`'s automatic I/O buffer sizing).
   pub buffer_size_frames: Option<u32>,
-  /// Maximum queued frames before
+  /// Maximum queued *FRAMES* (NOT samples) before
   /// [`super::output_stream::AudioOutputStream::write_samples`]
   /// returns [`crate::error::Error::Backend`]. Bounds memory; bound
-  /// is enforced in *frames* (i.e. one frame = `channels.count()`
-  /// interleaved samples) so it's framerate-aware.
+  /// is enforced in **frames** (one frame = `channels.count()`
+  /// interleaved samples). The
+  /// [`super::player::AudioPlayer::with_device`] constructor does the
+  /// single frame-to-sample conversion via `* channels.count()` —
+  /// callers MUST NOT pre-multiply by channel count (doing so
+  /// double-counts the bound). The unit here is constant across all
+  /// channel layouts.
   ///
   /// Default: `sample_rate as usize * 4` — four seconds of audio at
   /// the configured sample rate, large enough that a moderately
@@ -167,6 +172,11 @@ impl PlaybackConfig {
   /// `AudioPlayer` doesn't expose this directly (its streaming path
   /// is mono); ported for parity with cpal's `default_output_config`
   /// which is typically stereo.
+  ///
+  /// `queue_capacity_frames` is `sample_rate * 4` (four seconds of
+  /// frames), the same unit as [`PlaybackConfig::mono`] — the
+  /// frame-to-sample fan-out by channel count is the player's
+  /// responsibility (see [`PlaybackConfig::queue_capacity_frames`]).
   #[must_use]
   pub fn stereo(sample_rate: u32) -> Self {
     Self {
@@ -174,7 +184,7 @@ impl PlaybackConfig {
       channels: ChannelLayout::Stereo,
       sample_format: SampleFormat::F32,
       buffer_size_frames: None,
-      queue_capacity_frames: (sample_rate as usize) * 4 * 2,
+      queue_capacity_frames: (sample_rate as usize) * 4,
     }
   }
 

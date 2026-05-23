@@ -80,8 +80,18 @@ pub trait AudioOutputStream: Send {
 
   /// Stop the sink immediately. Any queued samples MUST be dropped;
   /// subsequent [`write_samples`][Self::write_samples] calls MUST
-  /// return `Err`. Mirrors Swift's
+  /// return `Err` (this is the **terminal-state** contract — once
+  /// `stop()` returns, the sink rejects further writes until the
+  /// caller drops the implementor and constructs a fresh one).
+  /// Mirrors Swift's
   /// `MLXAudioCore.AudioPlayer.stopStreaming()`.
+  ///
+  /// Distinct from a pause-style suspension: a pausable sink (e.g.
+  /// [`super::player::AudioPlayer::pause`]) buffers writes for later
+  /// resume; `stop()` does not. Implementors MUST NOT silently
+  /// accept post-stop writes (a post-stop write that "succeeded"
+  /// would surprise-replay on a later restart and violate the
+  /// "dropped" contract on queued samples).
   ///
   /// # Errors
   /// - [`crate::error::Error::Backend`] if stopping the underlying
