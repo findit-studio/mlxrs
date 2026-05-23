@@ -116,3 +116,29 @@ pub trait AudioOutputStream: Send {
   /// cpal-equivalent of Swift's `isPlaying` for streaming mode).
   fn is_running(&self) -> bool;
 }
+
+/// Blanket impl forwarding [`AudioOutputStream`] through a mutable
+/// reference — lets callers pass `&mut sink` to APIs that accept a
+/// `S: AudioOutputStream` by value, retaining ownership for
+/// post-call inspection (the
+/// [`crate::audio::sts::pipeline::VoiceSession::run`] call site this
+/// blanket enables).
+///
+/// The forwarding is a flat delegation; no buffering is added.
+impl<T: AudioOutputStream + ?Sized> AudioOutputStream for &mut T {
+  fn write_samples(&mut self, samples: &[f32]) -> Result<usize> {
+    (**self).write_samples(samples)
+  }
+
+  fn flush(&mut self) -> Result<()> {
+    (**self).flush()
+  }
+
+  fn stop(&mut self) -> Result<()> {
+    (**self).stop()
+  }
+
+  fn is_running(&self) -> bool {
+    (**self).is_running()
+  }
+}

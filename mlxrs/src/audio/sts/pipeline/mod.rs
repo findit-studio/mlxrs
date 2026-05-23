@@ -19,9 +19,21 @@
 //! - [`mod@voice_pipeline`] — [`VoicePipeline`] trait (the high-level
 //!   `run(mic_input, audio_out)` shape).
 //!
-//! The default implementor [`VoiceSession`][orch-session] that
-//! composes every trait surface together lands in the
-//! [`mod@orchestrator`] sibling submodule.
+//! - [`mod@orchestrator`] — [`VoiceSession`] (the default
+//!   [`VoicePipeline`] implementor that composes every trait
+//!   surface together into one synchronous mic-iterator-driven
+//!   loop) plus the four per-step adapter traits
+//!   [`VadFrameAdapter`][orchestrator::VadFrameAdapter] /
+//!   [`SttTurnAdapter`][orchestrator::SttTurnAdapter] /
+//!   [`LlmResponderAdapter`][orchestrator::LlmResponderAdapter] /
+//!   [`TtsStreamAdapter`][orchestrator::TtsStreamAdapter] the
+//!   orchestrator needs (a streaming view over the
+//!   whole-utterance shapes the existing
+//!   [`crate::audio::vad::VadModel`] /
+//!   [`crate::audio::stt::model::Model`] /
+//!   [`crate::lm::model::Model`] /
+//!   [`crate::audio::tts::model::TtsModel`] trait surfaces
+//!   expose).
 //!
 //! ## Scope cuts (explicit, A8)
 //!
@@ -68,11 +80,15 @@
 pub mod barge_in;
 pub mod chunker;
 pub mod config;
+pub mod orchestrator;
 pub mod turn_taking;
 pub mod voice_pipeline;
 
 pub use barge_in::{BargeInDetector, EnergyBargeInDetector};
 pub use chunker::{AudioChunker, FixedSizeAudioChunker, PreRollBuffer};
 pub use config::{LatencyProfile, VoicePipelineConfig};
+pub use orchestrator::{
+  LlmResponderAdapter, SttTurnAdapter, TtsStreamAdapter, TurnEvent, VadFrameAdapter, VoiceSession,
+};
 pub use turn_taking::{SilenceTurnTakingPolicy, TurnTakingPolicy};
 pub use voice_pipeline::VoicePipeline;

@@ -45,5 +45,6 @@ pub mod pipeline;
 pub use load::{StsModel, load, load_model};
 pub use pipeline::{
   AudioChunker, BargeInDetector, EnergyBargeInDetector, FixedSizeAudioChunker, LatencyProfile,
-  PreRollBuffer, SilenceTurnTakingPolicy, TurnTakingPolicy, VoicePipeline, VoicePipelineConfig,
+  LlmResponderAdapter, PreRollBuffer, SilenceTurnTakingPolicy, SttTurnAdapter, TtsStreamAdapter,
+  TurnEvent, TurnTakingPolicy, VadFrameAdapter, VoicePipeline, VoicePipelineConfig, VoiceSession,
 };
