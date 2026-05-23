@@ -185,6 +185,14 @@ pub trait BaseColVisionProcessor {
 ///   `"No queries provided"` (line 52).
 /// - `ps.is_empty()` → [`Error::ShapeMismatch`] with the python message
 ///   `"No passages provided"` (line 54).
+/// - Any input with `shape[0] == 0` (zero-element vector / zero-token
+///   embedding) → [`Error::ShapeMismatch`] whose message contains
+///   `"zero tokens"`. A zero-element single vector would dot-product
+///   with every passage to `0.0` regardless of content, silently
+///   collapsing the ranking signal; the equivalent precondition that
+///   the internal `pad_to_max` helper enforces for the multi-vector
+///   path is enforced here directly (this function does not go through
+///   `pad_to_max`).
 /// - Underlying [`stack`] / [`matmul`] errors propagate (e.g. inputs
 ///   with mismatched `d`).
 pub fn score_single_vector(qs: &[Array], ps: &[Array]) -> Result<Array> {
@@ -200,6 +208,28 @@ pub fn score_single_vector(qs: &[Array], ps: &[Array]) -> Result<Array> {
     return Err(Error::ShapeMismatch {
       message: "No passages provided".into(),
     });
+  }
+  // Reject zero-element vectors. This is the single-vector analog of
+  // the `pad_to_max` zero-token guard used by [`score_multi_vector`]:
+  // a `(0,)` input would dot-product to `0.0` against every passage
+  // regardless of content, silently collapsing the ranking signal.
+  // [`stack`] of `(0,)` slices would also produce a `(B, 0)` matrix
+  // and the subsequent [`matmul`] would be a no-op multiplication of
+  // empty contraction axes — not what the caller intends.
+  for (label, slice) in [("queries", qs), ("passages", ps)] {
+    for (i, a) in slice.iter().enumerate() {
+      let sh = a.shape();
+      // `shape[0] == 0` flags both `(0,)` rank-1 vectors and any
+      // higher-rank input whose leading axis is empty.
+      if sh.first().copied() == Some(0) {
+        return Err(Error::ShapeMismatch {
+          message: format!(
+            "score_single_vector: {label}[{i}] has zero tokens (shape[0] == 0); \
+             non-empty embedding vectors are required"
+          ),
+        });
+      }
+    }
   }
   // python line 56-57: `mx.stack(qs)`, `mx.stack(ps)`. `mlxrs::stack`
   // takes `&[&Array]`; collect borrows without cloning the arrays.
@@ -290,6 +320,23 @@ pub fn score_single_vector(qs: &[Array], ps: &[Array]) -> Result<Array> {
 /// the max if a real similarity happened to be `-inf`, which finite
 /// f32/f16/bf16 dot products of finite embeddings cannot produce.)
 ///
+/// ### Precondition (enforced): no zero-token queries or passages
+///
+/// The "padded positions can never win the max" invariant above
+/// depends on every input having **at least one** real token (i.e.
+/// `shape[0] >= 1`). A zero-token passage `(0, d)` would record `0`
+/// in the internal `pad_to_max` helper's `original_lengths`; the
+/// per-passage mask row would then be all-`false`, [`select`] would
+/// replace every position with `-inf`, and `max(axis=3)` on an
+/// all-`-inf` row returns `-inf`, which `sum(axis=2)` would propagate
+/// as a non-finite ranking score. To preserve the invariant, the
+/// internal `pad_to_max` helper explicitly rejects any array with
+/// `shape[0] == 0` with an [`Error::ShapeMismatch`] whose message
+/// contains `"zero tokens"`. Both the query and passage paths of
+/// `score_multi_vector` inherit this precondition through their
+/// `pad_to_max` calls. Callers must filter out empty-tokenization
+/// inputs before invoking the scorer.
+///
 /// An upstream issue should be filed against
 /// <https://github.com/Blaizzy/mlx-embeddings> referencing this PR.
 ///
@@ -302,6 +349,10 @@ pub fn score_single_vector(qs: &[Array], ps: &[Array]) -> Result<Array> {
 ///   len(qs), batch_size)` would `ValueError` on `batch_size == 0`;
 ///   surface the equivalent recoverable error instead of looping
 ///   forever).
+/// - Any query or passage with `shape[0] == 0` → [`Error::ShapeMismatch`]
+///   from the internal `pad_to_max` helper whose message contains
+///   `"zero tokens"`. See the "Precondition (enforced)" subsection of
+///   the divergence note above.
 /// - Per-tile shape errors (mismatched `d`, non-rank-2 inputs) propagate
 ///   from [`stack`] / [`matmul`].
 pub fn score_multi_vector(qs: &[Array], ps: &[Array], batch_size: usize) -> Result<Array> {
@@ -450,6 +501,19 @@ pub fn score_multi_vector(qs: &[Array], ps: &[Array], batch_size: usize) -> Resu
 /// returns [`Error::ShapeMismatch`] (defensive — would otherwise panic
 /// on `arrays[0].shape()`).
 ///
+/// Any **individual** array with `shape[0] == 0` is also rejected with
+/// an [`Error::ShapeMismatch`] whose message contains `"zero tokens"`.
+/// A zero-token sequence would record `0` in `original_lengths`, and
+/// the [`score_multi_vector`] masking loop would then build an
+/// all-`false` row for that passage — every position in `sim` for that
+/// passage would be replaced with `-inf` by [`select`], `max(axis=3)`
+/// would return `-inf`, and `sum(axis=2)` would propagate a non-finite
+/// ranking score. Enforcing the precondition here (rather than in the
+/// caller) means both the query and passage paths of
+/// [`score_multi_vector`] inherit the guard for free. See the
+/// "Precondition (enforced)" subsection of the divergence note on
+/// [`score_multi_vector`].
+///
 /// ## Return shape (diverges from python)
 ///
 /// Returns `(padded, original_lengths)`:
@@ -481,7 +545,7 @@ pub(crate) fn pad_to_max(arrays: &[Array]) -> Result<(Array, Vec<usize>)> {
   let emb_dim = first_shape[1]; // python line 82
   let mut max_len: usize = 0;
   let mut original_lengths: Vec<usize> = Vec::with_capacity(arrays.len());
-  for a in arrays {
+  for (i, a) in arrays.iter().enumerate() {
     let sh = a.shape();
     if sh.len() != 2 {
       return Err(Error::ShapeMismatch {
@@ -497,6 +561,26 @@ pub(crate) fn pad_to_max(arrays: &[Array]) -> Result<(Array, Vec<usize>)> {
         message: format!(
           "pad_to_max: all arrays must share emb_dim, got {} vs {}",
           sh[1], emb_dim
+        ),
+      });
+    }
+    // Reject zero-token sequences. A `(0, d)` array would record `0` in
+    // `original_lengths`, which the [`score_multi_vector`] masking loop
+    // would turn into an all-false row for that passage → every position
+    // becomes `-inf` after [`select`] → `max(axis=3)` returns `-inf` →
+    // `sum(axis=2)` propagates a non-finite ranking score. The
+    // mask-padded-positions-to-`-inf` invariant only holds when every
+    // input has at least one real token; enforce that precondition here
+    // rather than emit non-finite scores downstream. Mirrors the
+    // python reference's implicit assumption (the upstream
+    // `pad_to_max` also breaks on zero-token inputs: `max_len = 0`
+    // gives a `(len, 0, d)` stack and `max(axis=3)` of an empty axis
+    // is undefined). See the divergence note on [`score_multi_vector`].
+    if sh[0] == 0 {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "pad_to_max: array {i} has zero tokens (shape[0] == 0); \
+           non-empty token sequences are required for the masked MaxSim contract"
         ),
       });
     }
@@ -589,6 +673,52 @@ mod tests {
     assert_eq!(v, vec![1.0, 2.0, 1.0, 0.0]);
   }
 
+  /// REGRESSION (Codex finding, round 2 — single-vector analog): a
+  /// `(0,)` query embedding (zero-element vector) must be rejected.
+  /// The single-vector path does not go through [`pad_to_max`]; it has
+  /// its own early guard. A `(0,)` vector would dot-product to `0.0`
+  /// against every passage regardless of content, silently collapsing
+  /// the ranking signal. Assertion: returns [`Error::ShapeMismatch`]
+  /// whose message contains `"zero tokens"`.
+  #[test]
+  fn score_single_vector_rejects_zero_token_query() {
+    let q_empty = Array::from_slice::<f32>(&[], &(0,)).unwrap();
+    let p = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(3,)).unwrap();
+    let err =
+      score_single_vector(std::slice::from_ref(&q_empty), std::slice::from_ref(&p)).unwrap_err();
+    assert!(
+      matches!(err, Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch, got {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("zero tokens") && msg.contains("queries"),
+      "expected 'zero tokens' + 'queries' in message, got {msg}"
+    );
+  }
+
+  /// REGRESSION (Codex finding, round 2 — single-vector analog): a
+  /// `(0,)` passage embedding must be rejected for the same reasons as
+  /// the query analog. Assertion: returns [`Error::ShapeMismatch`]
+  /// whose message contains `"zero tokens"` and identifies the
+  /// passage path.
+  #[test]
+  fn score_single_vector_rejects_zero_token_passage() {
+    let q = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(3,)).unwrap();
+    let p_empty = Array::from_slice::<f32>(&[], &(0,)).unwrap();
+    let err =
+      score_single_vector(std::slice::from_ref(&q), std::slice::from_ref(&p_empty)).unwrap_err();
+    assert!(
+      matches!(err, Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch, got {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("zero tokens") && msg.contains("passages"),
+      "expected 'zero tokens' + 'passages' in message, got {msg}"
+    );
+  }
+
   /// python line 63: `.astype(mx.float32)` — non-f32 input must come
   /// back as f32 (dtype upcast for the score, but inputs themselves
   /// stay in their dtype until the final cast).
@@ -638,6 +768,67 @@ mod tests {
     let err =
       score_multi_vector(std::slice::from_ref(&q), std::slice::from_ref(&p), 0).unwrap_err();
     assert!(format!("{err}").contains("batch_size"));
+  }
+
+  /// REGRESSION (Codex finding, round 2): a zero-token query is
+  /// rejected by `score_multi_vector` via [`pad_to_max`] — even though
+  /// the outer `qs.is_empty()` guard passes, the per-array
+  /// `shape[0] == 0` check in `pad_to_max` must fire. The contract is
+  /// that callers filter out empty-tokenization inputs before invoking
+  /// the scorer; if they don't, the failure must be observable and
+  /// recoverable (not non-finite scores).
+  ///
+  /// Assertion: returns [`Error::ShapeMismatch`] whose message
+  /// contains `"zero tokens"` (the inner `pad_to_max` guard message),
+  /// not a propagation of `-inf` through the masked MaxSim.
+  #[test]
+  fn score_multi_vector_rejects_zero_token_query() {
+    let q_empty = Array::from_slice::<f32>(&[], &(0, 2)).unwrap();
+    let p = Array::from_slice::<f32>(&[1.0, 0.0, 0.0, 1.0], &(2, 2)).unwrap();
+    let err = score_multi_vector(
+      std::slice::from_ref(&q_empty),
+      std::slice::from_ref(&p),
+      128,
+    )
+    .unwrap_err();
+    assert!(
+      matches!(err, Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch from inner pad_to_max guard, got {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("zero tokens"),
+      "expected 'zero tokens' in message, got {msg}"
+    );
+  }
+
+  /// REGRESSION (Codex finding, round 2): the high-finding fixture.
+  /// `q = [[1, 0]]`, `p0 = [[0_size_2]]` (zero tokens), `p1 = [[2, 0],
+  /// [0, 1]]`. Without the `pad_to_max` zero-token guard, the
+  /// `(c=2, s_max=2)` mask row for `p0` would be all-`false`,
+  /// [`select`] would replace every `(b=1, c=0, n=1, s)` similarity
+  /// with `-inf`, `max(axis=3)` would return `-inf` for that passage,
+  /// and `sum(axis=2)` would propagate to a `-inf` ranking score.
+  /// The guard surfaces a recoverable [`Error::ShapeMismatch`]
+  /// instead, with a message identifying the zero-token array.
+  #[test]
+  fn score_multi_vector_rejects_zero_token_passage_in_mixed_tile() {
+    let q = Array::from_slice::<f32>(&[1.0, 0.0], &(1, 2)).unwrap();
+    // p0 is a zero-token passage `(0, 2)`; p1 has two real tokens.
+    let p0 = Array::from_slice::<f32>(&[], &(0, 2)).unwrap();
+    let p1 = Array::from_slice::<f32>(&[2.0, 0.0, 0.0, 1.0], &(2, 2)).unwrap();
+    // batch_size=2 forces both passages into the same tile, so the
+    // padded `p0` would otherwise produce an all-masked row.
+    let err = score_multi_vector(std::slice::from_ref(&q), &[p0, p1], 2).unwrap_err();
+    assert!(
+      matches!(err, Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch from pad_to_max (NOT -inf propagation), got {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("zero tokens"),
+      "expected 'zero tokens' in message, got {msg}"
+    );
   }
 
   /// python lines 100-102: MaxSim for one query, one passage, both
@@ -761,6 +952,42 @@ mod tests {
     let b = Array::from_slice::<f32>(&[3.0, 4.0, 5.0], &(1, 3)).unwrap();
     let err = pad_to_max(&[a, b]).unwrap_err();
     assert!(format!("{err}").contains("emb_dim"));
+  }
+
+  /// REGRESSION (Codex finding, round 2): a `(0, d)` array must be
+  /// rejected. Without the guard, [`pad_to_max`] records `0` in
+  /// `original_lengths`, [`score_multi_vector`]'s mask loop builds an
+  /// all-`false` row for the offending passage, [`select`] replaces
+  /// every position with `-inf`, `max(axis=3)` returns `-inf`, and the
+  /// resulting ranking score is non-finite. Enforce the precondition
+  /// here so the failure is observable, recoverable, and named.
+  ///
+  /// Assertion: returns [`Error::ShapeMismatch`] whose message contains
+  /// `"zero tokens"` and identifies the offending array index.
+  #[test]
+  fn pad_to_max_rejects_zero_token_array() {
+    // `(0, 2)` — a zero-token query / passage embedding.
+    let zero = Array::from_slice::<f32>(&[], &(0, 2)).unwrap();
+    let err = pad_to_max(std::slice::from_ref(&zero)).unwrap_err();
+    assert!(
+      matches!(err, Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch, got {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("zero tokens"),
+      "expected 'zero tokens' in message, got {msg}"
+    );
+    // Even when the zero-token array is not the first one in the slice,
+    // the guard must still fire and identify its index.
+    let good = Array::from_slice::<f32>(&[1.0, 2.0], &(1, 2)).unwrap();
+    let bad = Array::from_slice::<f32>(&[], &(0, 2)).unwrap();
+    let err2 = pad_to_max(&[good, bad]).unwrap_err();
+    let msg2 = format!("{err2}");
+    assert!(
+      msg2.contains("zero tokens") && msg2.contains("array 1"),
+      "expected 'zero tokens' + 'array 1' in message, got {msg2}"
+    );
   }
 
   /// dtype-fidelity: a half-precision input batch must stay
