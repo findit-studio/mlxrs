@@ -17,11 +17,22 @@
 //! mlx-audio's [`sts/voice_pipeline.py`][sts-pipeline] composes a full
 //! voice-pipeline (VAD + STT + LLM + TTS); per the
 //! [mirror-reference-structure][mirror] rule, mlxrs keeps STS as the
-//! per-domain `load` surface and treats `VoicePipeline` as a separate
-//! caller-level composition (it consumes the [`crate::audio::vad`] +
-//! [`crate::audio::stt`] + [`crate::audio::tts`] surfaces directly; STS
-//! itself is the surface for end-to-end speech-to-speech models, exactly
-//! the upstream `sts.utils.load` shape).
+//! per-domain `load` surface (the [`mod@load`] submodule) and lifts
+//! the voice-pipeline composition into a separate [`mod@pipeline`]
+//! sibling that consumes the [`crate::audio::vad`] +
+//! [`crate::audio::stt`] + [`crate::audio::tts`] +
+//! [`crate::audio::playback`] surfaces directly. STS itself stays the
+//! surface for end-to-end speech-to-speech models (exactly the
+//! upstream `sts.utils.load` shape); the [`mod@pipeline`] sibling is
+//! the orchestration shape mlx-audio's `VoicePipeline` class exposes.
+//!
+//! - [`mod@load`] — the per-domain [`load::load`] / [`load::load_model`]
+//!   entry points + the [`StsModel`] trait every concrete STS
+//!   architecture implements.
+//! - [`mod@pipeline`] — A8 voice-pipeline orchestration (the
+//!   [`pipeline::VoiceSession`] default + the [`pipeline::VoicePipeline`]
+//!   trait + the chunker / barge-in / turn-taking primitive
+//!   submodules).
 //!
 //! [sts-init]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/utils.py
 //! [sts-pipeline]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/voice_pipeline.py
@@ -29,5 +40,11 @@
 //! [mirror]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/mirror-reference-structure.md
 
 pub mod load;
+pub mod pipeline;
 
 pub use load::{StsModel, load, load_model};
+pub use pipeline::{
+  AudioChunker, BargeInDetector, EnergyBargeInDetector, FixedSizeAudioChunker, LatencyProfile,
+  LlmResponderAdapter, PreRollBuffer, SilenceTurnTakingPolicy, SttTurnAdapter, TtsStreamAdapter,
+  TurnEvent, TurnTakingPolicy, VadFrameAdapter, VoicePipeline, VoicePipelineConfig, VoiceSession,
+};
