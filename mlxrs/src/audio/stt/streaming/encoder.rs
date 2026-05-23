@@ -156,6 +156,14 @@ impl<B: StreamingEncoderBackend> StreamingEncoder<B> {
   ///
   /// `mel_frames` must be 2-D with shape `(num_frames, n_mels)`.
   ///
+  /// `feed` is **transactional**: every fallible step (concatenate,
+  /// slice, [`StreamingEncoderBackend::encode_window`], `eval`,
+  /// `try_clone`) executes against local staging variables; `self.*`
+  /// is mutated only after the WHOLE call succeeds. On `Err`, the
+  /// caller may retry `feed` with the same `mel_frames` and observe
+  /// the same starting state — no pending frames are consumed and no
+  /// partial windows are committed to the cache.
+  ///
   /// # Errors
   /// [`Error::Backend`] for a non-2-D input or a propagated error from
   /// the backend's [`StreamingEncoderBackend::encode_window`].
@@ -169,52 +177,70 @@ impl<B: StreamingEncoderBackend> StreamingEncoder<B> {
       });
     }
 
-    // Concatenate into pending buffer.
-    let new_pending = match self.pending_frames.take() {
-      Some(existing) => concatenate(&[&existing, mel_frames], 0)?,
+    let window_size_i32 = i32::try_from(self.window_size).map_err(|_| Error::Backend {
+      message: "StreamingEncoder::feed: window_size does not fit i32".into(),
+    })?;
+    let stride_i32 = i32::try_from(self.window_stride).map_err(|_| Error::Backend {
+      message: "StreamingEncoder::feed: window_stride does not fit i32".into(),
+    })?;
+
+    // STAGE the merged pending buffer in a LOCAL. Use try_clone on the
+    // existing self.pending_frames (refcount clone, no full copy)
+    // instead of take so a concatenate error leaves self.pending_frames
+    // intact for retry.
+    let combined = match self.pending_frames.as_ref() {
+      Some(existing) => concatenate(&[existing, mel_frames], 0)?,
       None => mel_frames.try_clone()?,
     };
-    self.pending_frame_count = new_pending.shape().first().copied().unwrap_or(0);
-    self.pending_frames = Some(new_pending);
+    let mut staged_count = combined.shape().first().copied().unwrap_or(0);
+    let mut staged_pending: Option<Array> = Some(combined);
 
-    let mut new_windows = 0;
-    while self.pending_frame_count >= self.window_size {
-      let frames = self
-        .pending_frames
+    // Encode-loop output is staged in these locals — they are only
+    // appended to self.cached_windows / self.newly_encoded_windows
+    // AFTER the loop completes without error.
+    let mut staged_cached: Vec<Array> = Vec::new();
+    let mut staged_newly: Vec<Array> = Vec::new();
+
+    while staged_count >= self.window_size {
+      let frames = staged_pending
         .take()
-        .expect("pending_frames was non-empty");
-      let window_size_i32 = i32::try_from(self.window_size).map_err(|_| Error::Backend {
-        message: "StreamingEncoder::feed: window_size does not fit i32".into(),
-      })?;
-      // Take rows `[0, window_size)` for the encode pass — full window,
+        .expect("staged_pending was non-empty when staged_count >= window_size");
+      // Take rows [0, window_size) for the encode pass — full window,
       // valid_frames == window_size, no padding needed.
       let window = frames.slice(&[0i32, 0i32], &[window_size_i32, i32::MAX], &[1i32, 1i32])?;
       let mut encoded = self.encoder.encode_window(&window, self.window_size)?;
       encoded.eval()?;
+      // try_clone BEFORE pushing into both staging vecs: a clone Err
+      // must not leave one Vec one-ahead of the other.
+      let cached_handle = encoded.try_clone()?;
+      staged_cached.push(cached_handle);
+      staged_newly.push(encoded);
 
-      self.cached_windows.push(encoded.try_clone()?);
-      self.newly_encoded_windows.push(encoded);
-      self.total_encoded_windows = self.total_encoded_windows.saturating_add(1);
-      new_windows += 1;
-
-      // Trim pending to leave `pending - window_stride` rows.
-      if self.pending_frame_count > self.window_stride {
-        let stride_i32 = i32::try_from(self.window_stride).map_err(|_| Error::Backend {
-          message: "StreamingEncoder::feed: window_stride does not fit i32".into(),
-        })?;
+      // Trim staged pending to leave staged_count - window_stride rows.
+      if staged_count > self.window_stride {
         let remainder = frames.slice(&[stride_i32, 0i32], &[i32::MAX, i32::MAX], &[1i32, 1i32])?;
-        self.pending_frame_count = remainder.shape().first().copied().unwrap_or(0);
-        self.pending_frames = Some(remainder);
+        staged_count = remainder.shape().first().copied().unwrap_or(0);
+        staged_pending = Some(remainder);
       } else {
-        self.pending_frames = None;
-        self.pending_frame_count = 0;
+        staged_pending = None;
+        staged_count = 0;
       }
+    }
 
-      // Enforce the max cache size by dropping oldest.
+    // COMMIT. Every fallible step succeeded — only now mutate self.*.
+    // Append cached windows one-by-one so the max_cached_windows eviction
+    // matches the prior call-order semantics (oldest dropped first).
+    let new_windows = staged_cached.len();
+    self.pending_frames = staged_pending;
+    self.pending_frame_count = staged_count;
+    for window in staged_cached {
+      self.cached_windows.push(window);
       if self.cached_windows.len() > self.max_cached_windows {
         self.cached_windows.remove(0);
       }
     }
+    self.newly_encoded_windows.extend(staged_newly);
+    self.total_encoded_windows = self.total_encoded_windows.saturating_add(new_windows);
 
     Ok(new_windows)
   }

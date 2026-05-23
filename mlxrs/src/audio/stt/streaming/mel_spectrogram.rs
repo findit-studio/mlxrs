@@ -121,6 +121,15 @@ impl IncrementalMelSpectrogram {
     self.total_frames
   }
 
+  /// Length of the rolling overlap buffer — exposed for in-crate tests
+  /// that need to assert the transactional `flush` contract (overlap
+  /// preserved on Err, cleared on Ok).
+  #[doc(hidden)]
+  #[cfg(test)]
+  pub(crate) fn overlap_buffer_len(&self) -> usize {
+    self.overlap_buffer.len()
+  }
+
   /// Process new audio samples and return mel frames, shape
   /// `(num_frames, n_mels)`.
   ///
@@ -179,6 +188,12 @@ impl IncrementalMelSpectrogram {
   /// tail (matching the Swift reference + the offline STFT's
   /// `reflect` pad convention).
   ///
+  /// `flush` is **transactional**: the overlap buffer is cloned into a
+  /// local stage, the fallible mel computation runs against the stage,
+  /// and only after `compute_mel` returns `Ok` is `self.overlap_buffer`
+  /// cleared. On `Err` the buffer is preserved so a retry recomputes
+  /// the same `mel_frames` from the same input.
+  ///
   /// # Errors
   /// Same propagation as [`process`](Self::process).
   pub fn flush(&mut self) -> Result<Option<Array>> {
@@ -186,7 +201,9 @@ impl IncrementalMelSpectrogram {
       return Ok(None);
     }
 
-    let mut signal = std::mem::take(&mut self.overlap_buffer);
+    // Stage: clone the overlap buffer into a local. self.overlap_buffer
+    // stays intact so a fallible compute_mel below can be retried.
+    let mut signal: Vec<f32> = self.overlap_buffer.clone();
 
     // Pad with zeros so we have at least `n_fft` samples.
     if signal.len() < self.n_fft {
@@ -210,9 +227,16 @@ impl IncrementalMelSpectrogram {
       0
     };
     if num_frames == 0 {
+      // No fallible work happens — commit the clear immediately so a
+      // double-flush on an unconsumable tail doesn't re-enter the work.
+      self.overlap_buffer.clear();
       return Ok(None);
     }
+    // FALLIBLE: any Err below MUST leave self.overlap_buffer intact
+    // for retry. Runs against the staged clone, not self.*.
     let mel = self.compute_mel(&signal, num_frames)?;
+    // COMMIT: compute_mel succeeded — only now clear the source.
+    self.overlap_buffer.clear();
     self.total_frames += num_frames;
     Ok(Some(mel))
   }
