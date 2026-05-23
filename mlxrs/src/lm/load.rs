@@ -1648,7 +1648,29 @@ fn open_excl_temp_shard(final_path: &Path) -> Result<PathBuf> {
 /// *here*, not after a not-yet-on-disk file has been renamed over a
 /// previously-valid checkpoint. mlx-c does not fsync; reopen the path
 /// read-only and `sync_all` it. Mirrors `cache_prompt::save_prompt_cache_atomic`.
-fn fsync_path(path: &Path) -> Result<()> {
+///
+/// `pub(crate)` so sibling modules ([`crate::lm::convert`]'s post-copy
+/// durability step, F7 R4) can call the same well-tested helper rather
+/// than re-implement the open + `sync_all` boilerplate. Test-only fault
+/// injection is wired through [`arm_fsync_path_fault`].
+pub(crate) fn fsync_path(path: &Path) -> Result<()> {
+  // Test-only fault-injection knob — see [`arm_fsync_path_fault`]. Mirrors
+  // the `fsync_dir` injector shape so the F7 R4 post-copy durability tests
+  // can exercise the "file content is durable but fsync warned" branch
+  // without needing a hostile filesystem. Production code path: always
+  // `None`, falls straight through to the real fsync.
+  #[cfg(test)]
+  if let Some(remaining) = FSYNC_PATH_FAULT_SKIP_THEN_FAIL.with(|c| c.get()) {
+    if remaining == 0 {
+      FSYNC_PATH_FAULT_SKIP_THEN_FAIL.with(|c| c.set(None));
+      return Err(Error::Backend {
+        message: format!("injected fsync_path failure for {}", path.display()),
+      });
+    } else {
+      FSYNC_PATH_FAULT_SKIP_THEN_FAIL.with(|c| c.set(Some(remaining - 1)));
+    }
+  }
+
   let f = std::fs::File::open(path).map_err(|e| Error::Backend {
     message: format!(
       "save: reopen tempfile {} for fsync failed: {e}",
@@ -1658,6 +1680,44 @@ fn fsync_path(path: &Path) -> Result<()> {
   f.sync_all().map_err(|e| Error::Backend {
     message: format!("save: fsync tempfile {} failed: {e}", path.display()),
   })
+}
+
+// Test-only fault injector for `fsync_path`: when set on the current
+// thread, the next `n` `fsync_path` calls succeed normally and the
+// (n+1)-th returns `Error::Backend { message: "injected fsync_path ..." }`.
+// Used by F7 R4's post-copy durability tests to drive the
+// `CopyOutcome::CommittedWithDurabilityWarning` branch without needing a
+// hostile filesystem. Always `None` in production code (the thread-local
+// is only set inside `#[test]` fns and unset on test exit).
+#[cfg(test)]
+thread_local! {
+  static FSYNC_PATH_FAULT_SKIP_THEN_FAIL: std::cell::Cell<Option<usize>> =
+    const { std::cell::Cell::new(None) };
+}
+
+/// Arm the [`fsync_path`] fault injector to skip `skip` successful calls
+/// then make the next call fail. Returns a [`Drop`] guard that disarms
+/// the injector when it goes out of scope (so a test panic still leaves
+/// the thread in a clean state for the next test).
+///
+/// `pub(crate)` (test-only) so sibling modules' tests (e.g.
+/// [`crate::lm::convert`]'s F7 R4 post-copy durability closure) can
+/// drive the [`CopyOutcome::CommittedWithDurabilityWarning`] branch
+/// through the public [`crate::lm::convert::convert`] entrypoint.
+#[cfg(test)]
+pub(crate) fn arm_fsync_path_fault(skip: usize) -> FsyncPathFaultGuard {
+  FSYNC_PATH_FAULT_SKIP_THEN_FAIL.with(|c| c.set(Some(skip)));
+  FsyncPathFaultGuard
+}
+
+#[cfg(test)]
+pub(crate) struct FsyncPathFaultGuard;
+
+#[cfg(test)]
+impl Drop for FsyncPathFaultGuard {
+  fn drop(&mut self) {
+    FSYNC_PATH_FAULT_SKIP_THEN_FAIL.with(|c| c.set(None));
+  }
 }
 
 // Test-only fault injector for `fsync_dir`: when set on the current
@@ -1713,7 +1773,11 @@ impl Drop for FsyncDirFaultGuard {
 /// is journaled by the filesystem, not user-flushable), and the call
 /// silently succeeds rather than propagate a platform-specific error
 /// that has no corresponding fix at this layer.
-fn fsync_dir(path: &Path) -> std::io::Result<()> {
+/// `pub(crate)` so sibling modules ([`crate::lm::convert`]'s post-copy
+/// directory-fsync step, F7 R4) can call the same well-tested helper
+/// rather than re-implement the `O_DIRECTORY` + `sync_all` boilerplate.
+/// Test-only fault injection is wired through [`arm_fsync_dir_fault`].
+pub(crate) fn fsync_dir(path: &Path) -> std::io::Result<()> {
   // Test-only fault-injection knob — see [`arm_fsync_dir_fault`]. Threaded
   // through here rather than at each call site so every fsync_dir call
   // (shard-fsync, index-fsync, config-fsync) is uniformly faultable.

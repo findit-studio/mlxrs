@@ -491,9 +491,12 @@ pub fn mixed_quant_predicate(
 ///
 /// ## Returns
 ///
-/// `Ok(())` — the conversion fully succeeded: weights + shard index +
-/// config + tokenizer extras all landed on disk and the parent-directory
-/// `fsync` reported success.
+/// `Ok(())` — the conversion fully succeeded AND is durable on disk:
+/// weights + shard index + config + tokenizer extras all landed on
+/// disk AND every fsync along the way (save-side parent-directory
+/// fsync, post-copy per-file fsync for each tokenizer / `*.py`, and
+/// the post-copy destination-directory fsync) reported success.
+/// `Ok = durable across power loss` end-to-end (F7 R4).
 ///
 /// Every recoverable failure is an [`Error`] with a meaning that lets the
 /// caller decide whether the on-disk destination is usable as-is, needs a
@@ -515,22 +518,27 @@ pub fn mixed_quant_predicate(
 /// - [`Error::DurabilityWarning`] with `committed: true` — the save is
 ///   **logically complete**: weights + index + config + the tokenizer
 ///   extras copy all landed on disk and would be observed by a
-///   subsequent [`crate::lm::load::load`]. The only failure is that the
-///   post-rename `fsync_dir` returned an error, so a power loss before
-///   the FS internally drains could revert the rename. The caller may
-///   proceed (the convert is logically complete).
+///   subsequent [`crate::lm::load::load`]. ANY of the following fsync
+///   boundaries returned an error (so a power loss before the FS
+///   internally drains could revert the corresponding rename / write):
+///   the save-side parent-directory fsync, a post-copy per-file fsync,
+///   or the post-copy destination-directory fsync. The caller may
+///   proceed (the convert is logically complete; only durability is
+///   uncertain). When MULTIPLE fsync boundaries warn in the same
+///   convert, the `source` carries a folded message naming both.
 ///
 /// - [`Error::ConvertPostSavePartial`] with `committed: true` — the save
 ///   committed (weights + index + config on disk) but the post-save
-///   [`copy_tokenizer_and_extras`] step partially failed: at least one
-///   tokenizer / `*.py` / `generation_config.json` file did NOT make it
-///   to the destination directory. The on-disk destination is
-///   **structurally incomplete** and a downstream
-///   [`crate::lm::load::load`] would either fail (missing
-///   tokenizer.json) or silently produce a checkpoint with the wrong
-///   tokenizer. The caller MUST decide whether to retry the copy, copy
-///   the missing files by hand, or treat the whole convert as failed
-///   and delete the destination.
+///   [`copy_tokenizer_and_extras`] step's [`std::fs::copy`] ACTUALLY
+///   FAILED for at least one tokenizer / `*.py` / `generation_config.json`
+///   file (the file did NOT reach disk — distinct from a post-copy
+///   fsync warning, which surfaces as [`Error::DurabilityWarning`]
+///   above). The on-disk destination is **structurally incomplete**
+///   and a downstream [`crate::lm::load::load`] would either fail
+///   (missing tokenizer.json) or silently produce a checkpoint with
+///   the wrong tokenizer. The caller MUST decide whether to retry the
+///   copy, copy the missing files by hand, or treat the whole convert
+///   as failed and delete the destination.
 ///
 ///   The variant's typed fields (`save_warning: Option<io::Error>`,
 ///   `copy_error: io::Error`) carry the two failure signals
@@ -796,47 +804,94 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
   // [`std::mem::discriminant`] tells the caller the destination is
   // structurally incomplete (tokenizer files missing) — NOT merely
   // committed-with-fsync-warning.
+  //
+  // F7 R4 Finding-1: [`copy_tokenizer_and_extras`] now fsyncs each
+  // copied file + the dst dir, so the documented "Ok = durable"
+  // contract holds for tokenizer extras too. The fsync step
+  // distinguishes a POST-COPY fsync warning (data on disk, durability
+  // uncertain — same shape as the save-side fsync warning) from a
+  // hard copy failure (file did NOT reach disk). The return type is
+  // now [`CopyOutcome`], whose [`CopyOutcome::CommittedWithDurabilityWarning`]
+  // arm carries the post-copy fsync warning so it can be folded into
+  // the existing [`Error::DurabilityWarning`] variant (rather than
+  // [`Error::ConvertPostSavePartial`], which stays reserved for the
+  // genuine "copy actually failed" case).
   let copy_result = copy_tokenizer_and_extras(&hf_path, &mlx_path);
 
   // ─── 7. (Hub upload — `convert.py:174-175`) — REJECTED at step 1. ───
 
   match (committed_warning, copy_result) {
-    // (Some, Ok) — committed + durability warning, copy succeeded →
-    // `Err(DurabilityWarning { committed: true, .. })`. On-disk dir is
-    // logically complete (weights + index + config + tokenizer extras
-    // all landed); only the parent-dir fsync warned. Same shape
-    // [`load::save`] surfaces. Caller may proceed.
-    (Some(source), Ok(())) => Err(Error::DurabilityWarning {
+    // (None, Ok(Committed)) — happy path: weights + index + config +
+    // tokenizer extras all landed and EVERY fsync (save-side
+    // parent-dir, post-copy per-file, post-copy dst-dir) returned
+    // success. `Ok = durable` contract holds end-to-end.
+    (None, Ok(CopyOutcome::Committed)) => Ok(()),
+
+    // (None, Ok(CommittedWithDurabilityWarning)) — save clean +
+    // copies all succeeded BUT at least one post-copy fsync warned.
+    // The data IS on disk (weights + index + config from save;
+    // tokenizer extras from `std::fs::copy`); only durability across
+    // a power loss is uncertain. Same "logically committed,
+    // durability uncertain" shape as the save-side fsync warning:
+    // surface via [`Error::DurabilityWarning`] so callers' existing
+    // "committed=true DurabilityWarning = proceed-with-warning"
+    // recovery path applies uniformly to both fsync boundaries.
+    (None, Ok(CopyOutcome::CommittedWithDurabilityWarning(post_copy_err))) => {
+      Err(Error::DurabilityWarning {
+        committed: true,
+        source: post_copy_err,
+      })
+    }
+
+    // (Some, Ok(Committed)) — save raised a DurabilityWarning + copy
+    // committed cleanly → re-raise the save-side warning. On-disk dir
+    // is logically complete (weights + index + config + tokenizer
+    // extras all landed); only the save-side parent-dir fsync warned.
+    // Caller may proceed.
+    (Some(save_source), Ok(CopyOutcome::Committed)) => Err(Error::DurabilityWarning {
       committed: true,
-      source,
+      source: save_source,
     }),
-    // (Some, Err) — committed + durability warning + copy failed →
-    // [`Error::ConvertPostSavePartial`] with the durability warning
-    // carried in `save_warning` and the actual copy failure in
-    // `copy_error`. Both signals stay machine-readable (no free-form
-    // string fold), and the variant tells the caller the destination
-    // is structurally incomplete — not merely committed-with-fsync-
-    // warning.
-    (Some(save_source), Err(copy_err)) => Err(Error::ConvertPostSavePartial {
-      committed: true,
-      save_warning: Some(save_source),
-      copy_error: std::io::Error::other(copy_err.to_string()),
-    }),
-    // (None, Ok) — happy path: weights + index + config + tokenizer
-    // extras all landed and the parent-dir fsync returned success.
-    (None, Ok(())) => Ok(()),
-    // (None, Err) — committed (save returned plain Ok) + copy failed →
-    // also surface the structured variant with `save_warning: None`,
-    // because the save IS still committed (the rename succeeded
-    // before we even reached the copy step) — the destination dir is
-    // structurally incomplete but the weights + index + config are
-    // already on disk. The R2 fix surfaced the bare copy error here,
-    // which was correct for "not committed" but the save HAS
-    // committed by this point: the structured variant matches the
-    // (Some, Err) case's "incomplete-destination" recovery contract.
+
+    // (Some, Ok(CommittedWithDurabilityWarning)) — save warned AND a
+    // post-copy fsync warned. Both boundaries are durability-only
+    // warnings (no missing data); fold into a single
+    // [`Error::DurabilityWarning`] whose source names both boundaries
+    // so the caller sees the complete picture.
+    (Some(save_source), Ok(CopyOutcome::CommittedWithDurabilityWarning(post_copy_err))) => {
+      Err(Error::DurabilityWarning {
+        committed: true,
+        source: std::io::Error::other(format!(
+          "convert: save warned + post-copy fsync warned — save: {save_source}; \
+           post-copy: {post_copy_err}",
+        )),
+      })
+    }
+
+    // (None, Err) — save was clean but the copy step's
+    // [`std::fs::copy`] returned `Err` for a file (it did NOT reach
+    // disk) → the destination dir is structurally incomplete. Surface
+    // the structured [`Error::ConvertPostSavePartial`] variant with
+    // `save_warning: None` so the caller can machine-detect the
+    // incomplete-destination contract. The save IS committed (the
+    // index rename succeeded before we even reached the copy step) —
+    // weights + index + config are on disk; only the extras are
+    // missing.
     (None, Err(copy_err)) => Err(Error::ConvertPostSavePartial {
       committed: true,
       save_warning: None,
+      copy_error: std::io::Error::other(copy_err.to_string()),
+    }),
+
+    // (Some, Err) — save raised a DurabilityWarning AND the copy
+    // step's [`std::fs::copy`] failed for a file → both signals
+    // matter. Surface the structured variant with the save warning
+    // in `save_warning` and the actual copy failure in `copy_error`.
+    // Both stay machine-readable; the variant tells the caller the
+    // destination is structurally incomplete (not just fsync-warned).
+    (Some(save_source), Err(copy_err)) => Err(Error::ConvertPostSavePartial {
+      committed: true,
+      save_warning: Some(save_source),
       copy_error: std::io::Error::other(copy_err.to_string()),
     }),
   }
@@ -1279,6 +1334,49 @@ const TOKENIZER_EXTRA_FILES: &[&str] = &[
   "generation_config.json",
 ];
 
+/// Outcome of a successful [`copy_tokenizer_and_extras`] call —
+/// disambiguates "all files are durable on disk" from "all files'
+/// content reached disk but at least one post-copy `fsync` warned"
+/// (F7 R4 Finding-1).
+///
+/// A copy is considered **logically complete** the moment
+/// [`std::fs::copy`] returns `Ok`: the file's bytes are in the page
+/// cache and a subsequent reader (including a process restart on a
+/// running kernel) will observe them. The post-copy `fsync_path` /
+/// `fsync_dir` calls only convert "logically complete" into "durable
+/// across a power loss". A fsync error AFTER the content is in place
+/// therefore does NOT mean the data is missing — only that durability
+/// is uncertain.
+///
+/// The R3 [`Error::ConvertPostSavePartial`] variant stays reserved for
+/// the genuine "copy actually failed" case where [`std::fs::copy`]
+/// itself returned `Err` (the file did NOT reach disk); the new
+/// `CommittedWithDurabilityWarning` variant carries the post-copy
+/// fsync warning so [`convert`] can re-surface it via the existing
+/// [`Error::DurabilityWarning`] shape — same "logically committed,
+/// durability uncertain" contract as the save-side fsync warning.
+///
+/// Used internally by [`convert`] (the public surface still returns
+/// [`Result<()>`]) and surfaced via [`copy_tokenizer_and_extras`] for
+/// callers that drive the helper standalone (e.g. partial-convert
+/// recovery flows) — those callers need the same machine-detectable
+/// "data on disk, durability uncertain" signal.
+#[derive(Debug)]
+pub enum CopyOutcome {
+  /// All [`std::fs::copy`] calls returned `Ok` AND all post-copy
+  /// `fsync_path` + post-copy `fsync_dir(dst)` returned `Ok`. The
+  /// destination directory is fully durable.
+  Committed,
+  /// All [`std::fs::copy`] calls returned `Ok` (so the file content
+  /// reached disk and is observable by a subsequent reader) BUT at
+  /// least one post-copy `fsync_path` or the post-copy
+  /// `fsync_dir(dst)` returned `Err`. The data IS on disk; only
+  /// durability across a power loss is uncertain. Carries the first
+  /// fsync error observed (or a folded message if both the per-file
+  /// fsync AND the directory fsync warned).
+  CommittedWithDurabilityWarning(std::io::Error),
+}
+
 /// Copy the tokenizer + extras family of files from `src` to `dst`,
 /// mirroring `utils.save:944-948` minus the `tokenizer.save_pretrained`
 /// in-memory re-serialization (mlxrs's tokenizer surface is load-only;
@@ -1310,20 +1408,72 @@ const TOKENIZER_EXTRA_FILES: &[&str] = &[
 /// implementation; the explicit guard short-circuits the entire walk.
 /// `src`'s files are left untouched.
 ///
-/// Failure semantics: a missing source file is silently skipped (the
-/// python `for file in glob(...)` is naturally absent-tolerant); an IO
-/// failure on an existing source file is a recoverable
-/// [`Error::Backend`] naming the offending file and the underlying
-/// error.
-pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<()> {
+/// **Post-copy durability** (F7 R4 Finding-1): after each successful
+/// [`std::fs::copy`], the copied file is `fsync`ed (via the
+/// `crate::lm::load::fsync_path` helper) so its bytes are durable on
+/// disk. After ALL copies complete, the destination directory is
+/// `fsync`ed (via the `crate::lm::load::fsync_dir` helper) so the new
+/// directory entries are durable. Without these, an `Ok` return would
+/// lie: a crash AFTER `convert() → Ok(())` could leave weights /
+/// config durable (the save side already fsyncs them) but tokenizer
+/// files torn / missing — breaking the documented "Ok = durable"
+/// contract.
+///
+/// Failure semantics:
+///
+/// - A missing source file is silently skipped (the python `for file
+///   in glob(...)` is naturally absent-tolerant).
+/// - An IO failure on the [`std::fs::copy`] of an existing source file
+///   is a recoverable [`Error::Backend`] naming the offending file and
+///   the underlying error — the file did NOT reach disk, so the
+///   destination dir is structurally incomplete.
+/// - An IO failure on a post-copy `fsync_path` / `fsync_dir` AFTER the
+///   file content reached disk is folded into the returned
+///   [`CopyOutcome::CommittedWithDurabilityWarning`] (the data IS on
+///   disk; only durability is uncertain). Distinguishable from a hard
+///   copy failure at the type level.
+///
+/// [`tokenizer.save_pretrained`]: https://huggingface.co/docs/transformers/v4.46.0/en/main_classes/tokenizer
+pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<CopyOutcome> {
   // Rename-in-place: nothing to do (mirrors python's natural behavior —
   // `tokenizer.save_pretrained(dst)` is a no-op when the tokenizer was
   // loaded from `dst`, and `shutil.copy` on the same path is at best a
   // no-op at worst a truncate). Short-circuit so we don't accidentally
-  // unlink-then-recreate.
+  // unlink-then-recreate. No fsync needed: nothing changed on disk.
   if paths_are_same(src, dst) {
-    return Ok(());
+    return Ok(CopyOutcome::Committed);
   }
+
+  // First post-copy fsync warning observed (if any). Captured rather
+  // than early-returned so the WHOLE batch of copies runs (data
+  // durability is best-effort post-copy) and so we can fold a
+  // subsequent dir-fsync warning into the same message.
+  let mut first_fsync_warning: Option<std::io::Error> = None;
+
+  // Helper: fsync the just-copied destination file. Maps the
+  // [`crate::lm::load::fsync_path`] error (which uses [`Error::Backend`]
+  // for context) back into a typed [`std::io::Error`] so the warning
+  // shape is uniform with [`fsync_dir`] (which returns
+  // `io::Result<()>`).
+  let fsync_copied = |path: &Path| -> std::io::Result<()> {
+    match crate::lm::load::fsync_path(path) {
+      Ok(()) => Ok(()),
+      // [`fsync_path`] wraps its underlying io::Error in
+      // [`Error::Backend`] for the save-side caller; unwrap it back into
+      // an io::Error here so the warning carries a clean typed payload.
+      Err(Error::Backend { message }) => Err(std::io::Error::other(message)),
+      Err(other) => Err(std::io::Error::other(other.to_string())),
+    }
+  };
+
+  // Record a fsync warning iff none has been observed yet — preserves
+  // FIRST-failure information so the user can pinpoint the earliest
+  // boundary that lost durability.
+  let mut record_fsync_warning = |e: std::io::Error| {
+    if first_fsync_warning.is_none() {
+      first_fsync_warning = Some(e);
+    }
+  };
 
   // The fixed-set extras.
   for name in TOKENIZER_EXTRA_FILES {
@@ -1339,6 +1489,13 @@ pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<()> {
         d.display()
       ),
     })?;
+    // Post-copy file fsync (F7 R4 Finding-1). The data IS on disk
+    // after `std::fs::copy` returns Ok; this only converts "logically
+    // complete" into "durable across a power loss". A failure here
+    // does NOT mean the file is missing — record + continue.
+    if let Err(e) = fsync_copied(&d) {
+      record_fsync_warning(e);
+    }
   }
 
   // The python `*.py` glob (HF model code; some loaders need it).
@@ -1378,9 +1535,37 @@ pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<()> {
         d.display()
       ),
     })?;
+    // Post-copy file fsync — same rationale as above.
+    if let Err(e) = fsync_copied(&d) {
+      record_fsync_warning(e);
+    }
   }
 
-  Ok(())
+  // Post-copy directory fsync — makes the new directory entries
+  // (every `dst/<name>` created above) durable. Same shape as
+  // [`crate::lm::load::save`]'s post-rename `fsync_dir`. A failure
+  // here is also a durability-only warning (the entries are observable
+  // by a reader on this running kernel; only a power loss could revert
+  // them). Folded into [`CopyOutcome::CommittedWithDurabilityWarning`]
+  // either as the first warning (if no per-file fsync warned) or as a
+  // combined message (so the user can see BOTH boundaries).
+  if let Err(dir_err) = crate::lm::load::fsync_dir(dst) {
+    first_fsync_warning = Some(match first_fsync_warning.take() {
+      None => std::io::Error::other(format!(
+        "post-copy fsync_dir({}) warned: {dir_err}",
+        dst.display()
+      )),
+      Some(file_warning) => std::io::Error::other(format!(
+        "post-copy fsync warnings — file fsync: {file_warning}; dir fsync({}): {dir_err}",
+        dst.display()
+      )),
+    });
+  }
+
+  Ok(match first_fsync_warning {
+    None => CopyOutcome::Committed,
+    Some(e) => CopyOutcome::CommittedWithDurabilityWarning(e),
+  })
 }
 
 /// Resolve `src` and `dst` to canonical absolute paths and compare. Used
@@ -2316,6 +2501,413 @@ mod unit {
       assert!(copy_error.to_string().contains("EACCES on copy"));
     } else {
       unreachable!("constructed ConvertPostSavePartial above");
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // F7 R4 Finding-1 closures — post-copy durability (fsync_path +
+  // fsync_dir AFTER tokenizer/extras `std::fs::copy`).
+  //
+  // Before R4 `copy_tokenizer_and_extras` did not fsync the copied
+  // files or the dst dir, so a crash AFTER `convert() → Ok(())` could
+  // leave weights+config durable but tokenizer files torn/missing —
+  // the documented "Ok = durable" contract was broken for extras.
+  //
+  // The R4 fix:
+  //   (1) fsyncs each copied file via [`crate::lm::load::fsync_path`]
+  //   (2) fsyncs the dst dir via [`crate::lm::load::fsync_dir`] after
+  //       all copies complete
+  //   (3) routes post-copy fsync warnings (data IS on disk, only
+  //       durability uncertain) into the [`Error::DurabilityWarning`]
+  //       variant — distinguishable from a hard
+  //       [`Error::ConvertPostSavePartial`] (file did NOT reach disk).
+  //
+  // These tests drive the (1)/(2)/(3) branches via the
+  // [`crate::lm::load::arm_fsync_path_fault`] +
+  // [`crate::lm::load::arm_fsync_dir_fault`] injectors. Both are
+  // [`#[cfg(test)] pub(crate)`] (sibling-test access) and `Drop`-guarded
+  // so a test panic leaves the thread clean.
+  //
+  // The shared fixture is the same shape as the R1/R2/R3 tests:
+  // build a synthetic src with config + weights + a tokenizer the
+  // load step accepts, then arm the relevant injector and call
+  // `convert`. The skip counts target the post-copy fsync(s): the
+  // save side makes 3 `fsync_path` + 3 `fsync_dir` calls before
+  // copy_tokenizer_and_extras runs (config-stage fsync_path, shard
+  // fsync_path, index fsync_path; shard-dir fsync_dir, index-dir
+  // fsync_dir, config-commit fsync_dir), so skip=3 lets every
+  // save-side fsync pass and fires on the first post-copy call.
+  // ──────────────────────────────────────────────────────────────────
+
+  /// Build the synthetic src+dst dir pair used by the R4 post-copy
+  /// fsync tests. Mirrors the R1/R2/R3 fixture but extracted so the
+  /// four new tests don't each duplicate ~30 lines. Returns
+  /// `(workdir, src, dst)` so the caller controls cleanup via
+  /// `remove_dir_all(workdir)`.
+  fn build_r4_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let workdir =
+      std::env::temp_dir().join(format!("mlxrs_convert_r4_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&workdir);
+    let src = workdir.join("src");
+    let dst = workdir.join("dst");
+    std::fs::create_dir_all(&src).unwrap();
+
+    let plain_config = r#"{
+      "model_type":"qwen3","hidden_size":16,"num_hidden_layers":1,
+      "num_attention_heads":2,"num_key_value_heads":2,"head_dim":8,
+      "rope_theta":10000.0,"vocab_size":128,"tie_word_embeddings":false
+    }"#;
+    std::fs::write(src.join("config.json"), plain_config).unwrap();
+    let blob: Vec<f32> = (0..128).map(|i| (i as f32) * 0.01).collect();
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "layer.weight".to_string(),
+      Array::from_slice::<f32>(&blob, &(2usize, 64usize)).unwrap(),
+    );
+    crate::io::save_safetensors(&src.join("model.safetensors"), &weights).unwrap();
+
+    // Tokenizer fixtures + extras the helper will copy.
+    let tokenizer_json = include_str!("../../tests/fixtures/tokenizer.json");
+    let tokenizer_config_json = include_str!("../../tests/fixtures/tokenizer_config.json");
+    std::fs::write(src.join("tokenizer.json"), tokenizer_json).unwrap();
+    std::fs::write(src.join("tokenizer_config.json"), tokenizer_config_json).unwrap();
+    std::fs::write(
+      src.join("special_tokens_map.json"),
+      br#"{"eos_token":"</s>"}"#,
+    )
+    .unwrap();
+    std::fs::write(src.join("generation_config.json"), br#"{"max_length":32}"#).unwrap();
+
+    (workdir, src, dst)
+  }
+
+  /// F7 R4 Finding-1 — post-copy FILE fsync failure surfaces
+  /// `Err(DurabilityWarning)` (NOT `ConvertPostSavePartial`).
+  ///
+  /// The post-copy fsync runs AFTER `std::fs::copy` returns Ok, so the
+  /// file content IS on disk; only durability is uncertain. This
+  /// matches the documented `DurabilityWarning { committed: true }`
+  /// contract (the destination is logically complete). The
+  /// `ConvertPostSavePartial` variant stays reserved for the case
+  /// where `std::fs::copy` itself failed (file did NOT reach disk).
+  ///
+  /// Skip count: 3 — save makes 3 `fsync_path` calls (config-stage,
+  /// shard tmp, index tmp) before copy_tokenizer_and_extras starts,
+  /// so skip=3 lets every save-side fsync pass and fires on the
+  /// first post-copy file fsync (the first
+  /// TOKENIZER_EXTRA_FILES-resident file in the src, which is
+  /// `tokenizer.json` by the const-array's order).
+  #[test]
+  fn convert_post_copy_file_fsync_failure_returns_durability_warning() {
+    let (workdir, src, dst) = build_r4_fixture("file_fsync_fail");
+
+    // Arm the fsync_path injector: skip the 3 save-side calls, fail
+    // on the 4th (first post-copy per-file fsync). The dir injector
+    // is NOT armed, so the post-copy fsync_dir(dst) passes.
+    let _guard = crate::lm::load::arm_fsync_path_fault(3);
+
+    let r = convert(ConvertArgs {
+      hf_path: src.clone(),
+      mlx_path: dst.clone(),
+      ..Default::default()
+    });
+    drop(_guard);
+
+    // (b) Result is `Err(DurabilityWarning { committed: true })` —
+    //     NOT `ConvertPostSavePartial`. A post-copy fsync warning
+    //     means data IS on disk; the variant distinction matters
+    //     because callers' recovery contract differs.
+    match &r {
+      Err(Error::DurabilityWarning { committed, source }) => {
+        assert!(
+          *committed,
+          "post-copy fsync warning carries committed=true (data IS on disk)"
+        );
+        // (c) The source message references the post-copy fsync (so
+        //     the user can pinpoint the boundary that warned).
+        let msg = source.to_string();
+        assert!(
+          msg.contains("injected fsync_path failure") || msg.contains("post-copy"),
+          "source message references the post-copy fsync; got: {msg}"
+        );
+      }
+      Err(Error::ConvertPostSavePartial { .. }) => panic!(
+        "post-copy FSYNC warning must NOT surface as ConvertPostSavePartial — \
+         that variant is reserved for `std::fs::copy` itself failing (file \
+         did NOT reach disk). A post-copy fsync warning means data IS on \
+         disk; only durability is uncertain (DurabilityWarning contract)."
+      ),
+      other => panic!("expected Err(DurabilityWarning), got {other:?}"),
+    }
+
+    // (a) The copied file IS on disk byte-equal to its source. The
+    //     fsync failed but `std::fs::copy` ran to completion BEFORE
+    //     fsync was attempted, so the data is in the page cache and
+    //     visible to any reader on this running kernel.
+    for name in [
+      "tokenizer.json",
+      "tokenizer_config.json",
+      "special_tokens_map.json",
+      "generation_config.json",
+    ] {
+      assert!(
+        dst.join(name).is_file(),
+        "{name} IS on disk despite the post-copy fsync warning"
+      );
+      let a = std::fs::read(src.join(name)).unwrap();
+      let b = std::fs::read(dst.join(name)).unwrap();
+      assert_eq!(a, b, "{name} byte-equal at dst");
+    }
+
+    let _ = std::fs::remove_dir_all(&workdir);
+  }
+
+  /// F7 R4 Finding-1 — post-copy DIR fsync failure surfaces
+  /// `Err(DurabilityWarning)` (NOT `ConvertPostSavePartial`).
+  ///
+  /// Same shape as the file-fsync test above — the only difference
+  /// is WHICH fsync warns. The post-copy `fsync_dir(dst)` runs after
+  /// EVERY per-file fsync has succeeded; a failure here means the
+  /// new directory entries are visible (the renames committed) but
+  /// the dir-inode metadata may not yet be durable. Data IS on
+  /// disk — `DurabilityWarning` contract.
+  ///
+  /// Skip count: 3 — save makes 3 `fsync_dir` calls (shard publish,
+  /// index publish, config commit) before copy_tokenizer_and_extras
+  /// starts. skip=3 lets each pass and fires on the 4th call (the
+  /// post-copy `fsync_dir(dst)`).
+  #[test]
+  fn convert_post_copy_dir_fsync_failure_returns_durability_warning() {
+    let (workdir, src, dst) = build_r4_fixture("dir_fsync_fail");
+
+    // Arm the fsync_dir injector: skip the 3 save-side calls, fail
+    // on the 4th (post-copy fsync_dir(dst)). The path injector is
+    // NOT armed, so every per-file fsync_path passes.
+    let _guard = crate::lm::load::arm_fsync_dir_fault(3);
+
+    let r = convert(ConvertArgs {
+      hf_path: src.clone(),
+      mlx_path: dst.clone(),
+      ..Default::default()
+    });
+    drop(_guard);
+
+    match &r {
+      Err(Error::DurabilityWarning { committed, source }) => {
+        assert!(
+          *committed,
+          "post-copy dir-fsync warning carries committed=true (data IS on disk)"
+        );
+        let msg = source.to_string();
+        // The source message references the post-copy dir fsync —
+        // either via the verbatim injector marker or the "post-copy"
+        // tag added by the convert-side fold.
+        assert!(
+          msg.contains("injected fsync_dir failure") || msg.contains("post-copy fsync_dir"),
+          "source message references the post-copy dir fsync; got: {msg}"
+        );
+      }
+      Err(Error::ConvertPostSavePartial { .. }) => panic!(
+        "post-copy DIR fsync warning must NOT surface as ConvertPostSavePartial — \
+         that variant is reserved for `std::fs::copy` itself failing. A \
+         post-copy dir-fsync warning means data IS on disk (every file's \
+         own fsync passed); only the dir-entry durability is uncertain."
+      ),
+      other => panic!("expected Err(DurabilityWarning), got {other:?}"),
+    }
+
+    // Files are on disk byte-equal — the per-file fsyncs all passed
+    // and the renames committed.
+    for name in [
+      "tokenizer.json",
+      "tokenizer_config.json",
+      "special_tokens_map.json",
+      "generation_config.json",
+    ] {
+      assert!(dst.join(name).is_file(), "{name} on disk");
+      let a = std::fs::read(src.join(name)).unwrap();
+      let b = std::fs::read(dst.join(name)).unwrap();
+      assert_eq!(a, b, "{name} byte-equal at dst");
+    }
+
+    let _ = std::fs::remove_dir_all(&workdir);
+  }
+
+  /// F7 R4 Finding-1 — BOTH the per-file fsync AND the post-copy
+  /// dir fsync warn. The single returned `DurabilityWarning.source`
+  /// must reference BOTH boundaries so the user sees the complete
+  /// picture (no silently-folded warning).
+  ///
+  /// Skip counts: 3 on each injector. The path injector fires on
+  /// the first post-copy file fsync; the dir injector fires on the
+  /// post-copy `fsync_dir(dst)` call AFTER every per-file fsync
+  /// completes. `copy_tokenizer_and_extras` records the first file
+  /// fsync warning, runs to completion through every other file,
+  /// then triggers the dir fsync — observing its warning too —
+  /// and folds the two into a single combined message.
+  #[test]
+  fn convert_post_copy_both_fsyncs_fail_combined_message() {
+    let (workdir, src, dst) = build_r4_fixture("both_fsyncs_fail");
+
+    // Arm BOTH injectors. The path injector skips the 3 save-side
+    // fsync_path calls (config-stage, shard tmp, index tmp) and
+    // fires on the 4th (first post-copy file fsync). The dir
+    // injector skips the 3 save-side fsync_dir calls (shard publish,
+    // index publish, config commit) and fires on the 4th (post-copy
+    // fsync_dir(dst)).
+    let _path_guard = crate::lm::load::arm_fsync_path_fault(3);
+    let _dir_guard = crate::lm::load::arm_fsync_dir_fault(3);
+
+    let r = convert(ConvertArgs {
+      hf_path: src,
+      mlx_path: dst,
+      ..Default::default()
+    });
+    drop(_path_guard);
+    drop(_dir_guard);
+
+    match &r {
+      Err(Error::DurabilityWarning { committed, source }) => {
+        assert!(*committed, "committed=true even when both fsyncs warn");
+        // The combined message references BOTH boundaries.
+        let msg = source.to_string();
+        assert!(
+          msg.contains("file fsync") && msg.contains("dir fsync"),
+          "combined message names BOTH the file fsync AND the dir fsync \
+           boundaries (so the user sees the complete picture); got: {msg}"
+        );
+        // Underlying signals from both injectors survive in the fold.
+        assert!(
+          msg.contains("injected fsync_path failure"),
+          "combined message preserves the file-fsync injector marker; \
+           got: {msg}"
+        );
+        assert!(
+          msg.contains("injected fsync_dir failure"),
+          "combined message preserves the dir-fsync injector marker; \
+           got: {msg}"
+        );
+      }
+      Err(Error::ConvertPostSavePartial { .. }) => panic!(
+        "both-fsyncs-warn surfaces DurabilityWarning, NOT \
+         ConvertPostSavePartial (data IS on disk; only durability \
+         uncertain on two boundaries)"
+      ),
+      other => panic!("expected Err(DurabilityWarning), got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&workdir);
+  }
+
+  /// F7 R4 Finding-1 — happy-path: `convert() → Ok(())` implies every
+  /// post-copy fsync was actually invoked. Asserted by reading the
+  /// on-disk state: every copied file's bytes match the source AND
+  /// the destination dir is observable. A regression that silently
+  /// SKIPPED the post-copy fsyncs would still pass the on-disk
+  /// byte-equality check (the fsync is durability-only, not content);
+  /// to catch a silent-skip we ALSO verify that the fsync_path
+  /// injector — armed with skip=0 to fire on the FIRST call — converts
+  /// the otherwise-Ok happy path into a `DurabilityWarning`. If the
+  /// post-copy fsyncs were never called (e.g. someone removed the
+  /// fsync_path loop), the injector would only fire during save and
+  /// the test would observe the save-side fsync, not the post-copy
+  /// one. To isolate, we use skip=3 (past every save-side call) so
+  /// the injector only has a chance to fire IF the post-copy fsync
+  /// loop runs.
+  #[test]
+  fn convert_ok_implies_post_copy_fsyncs_called() {
+    // ── Sub-test A: no injector → happy path returns Ok(()) AND
+    //                every copied file is on disk byte-equal.
+    {
+      let (workdir, src, dst) = build_r4_fixture("happy_path");
+      let r = convert(ConvertArgs {
+        hf_path: src.clone(),
+        mlx_path: dst.clone(),
+        ..Default::default()
+      });
+      assert!(
+        matches!(r, Ok(())),
+        "happy path returns Ok(()) — every fsync passes; got: {r:?}"
+      );
+      for name in [
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "generation_config.json",
+      ] {
+        assert!(
+          dst.join(name).is_file(),
+          "{name} on disk after happy-path convert"
+        );
+        let a = std::fs::read(src.join(name)).unwrap();
+        let b = std::fs::read(dst.join(name)).unwrap();
+        assert_eq!(a, b, "{name} byte-equal");
+      }
+      let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    // ── Sub-test B: arm fsync_path with skip=3 (past every save-side
+    //                call). If the post-copy file fsync loop is
+    //                actually called, the injector fires and convert
+    //                returns DurabilityWarning. If a regression
+    //                silently REMOVED the post-copy fsync_path call,
+    //                the injector would still be armed at end-of-
+    //                convert and the result would be Ok(()) — a
+    //                clear signal that the fsync was skipped.
+    {
+      let (workdir, src, dst) = build_r4_fixture("happy_path_spy_file");
+      let _guard = crate::lm::load::arm_fsync_path_fault(3);
+      let r = convert(ConvertArgs {
+        hf_path: src,
+        mlx_path: dst,
+        ..Default::default()
+      });
+      drop(_guard);
+      assert!(
+        matches!(
+          r,
+          Err(Error::DurabilityWarning {
+            committed: true,
+            ..
+          })
+        ),
+        "fsync_path injector armed past every save-side call must be \
+         observed by the post-copy file fsync loop — a silent removal \
+         of that loop would leave the injector unfired and the result \
+         Ok(()); got: {r:?}"
+      );
+      let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    // ── Sub-test C: arm fsync_dir with skip=3 (past every save-side
+    //                call). Same reasoning as sub-test B but for the
+    //                post-copy `fsync_dir(dst)` call. If a regression
+    //                silently REMOVED the post-copy dir fsync, the
+    //                injector would not fire and the result would be
+    //                Ok(()).
+    {
+      let (workdir, src, dst) = build_r4_fixture("happy_path_spy_dir");
+      let _guard = crate::lm::load::arm_fsync_dir_fault(3);
+      let r = convert(ConvertArgs {
+        hf_path: src,
+        mlx_path: dst,
+        ..Default::default()
+      });
+      drop(_guard);
+      assert!(
+        matches!(
+          r,
+          Err(Error::DurabilityWarning {
+            committed: true,
+            ..
+          })
+        ),
+        "fsync_dir injector armed past every save-side call must be \
+         observed by the post-copy `fsync_dir(dst)` call — a silent \
+         removal of that call would leave the injector unfired and \
+         the result Ok(()); got: {r:?}"
+      );
+      let _ = std::fs::remove_dir_all(&workdir);
     }
   }
 }
