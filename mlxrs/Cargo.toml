@@ -126,3 +126,10 @@ harness = false
 name = "simd_pad_canvas_fill"
 harness = false
 required-features = ["vlm"]
+
+# C4 verify-before-claim bench — gated on the `vlm` feature for the
+# same reason (dispatcher lives behind the `vlm` feature gate).
+[[bench]]
+name = "simd_bgr_widen"
+harness = false
+required-features = ["vlm"]

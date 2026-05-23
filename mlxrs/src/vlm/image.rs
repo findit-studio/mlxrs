@@ -1506,15 +1506,47 @@ pub fn image_to_array(img: &::image::DynamicImage, color_order: ColorOrder) -> R
         buf.extend(raw.iter().map(|&b| f32::from(b)));
       }
       ColorOrder::Bgr => {
-        // Per-pixel R↔B swap. `chunks_exact(3)` yields `&[u8]` of
-        // guaranteed length 3 (verified by `as_raw().len() >= total`
-        // and the `.get(..total)` slice above), keeping the inner-loop
-        // indices bounded so LLVM can unroll the 3-element shuffle.
-        for px in raw.chunks_exact(3) {
-          buf.push(f32::from(px[2]));
-          buf.push(f32::from(px[1]));
-          buf.push(f32::from(px[0]));
+        // Per-pixel R↔B swap via the C4 `bgr_widen` dispatcher
+        // (`crate::simd::vlm::bgr_widen`). On `aarch64` this routes
+        // to a `vld3q_u8` + permuted `vst3q_f32` 16-pixel-per-tile
+        // NEON kernel (the R↔B swap is encoded by feeding the
+        // de-interleaved planes to the interleave-store in reversed
+        // R/B order); elsewhere it falls back to the scalar
+        // `chunks_exact_mut(3) + MaybeUninit::write` path. See
+        // `docs/core-arch-simd-candidates.md` §2 row C4 + §3.3 + §5.5
+        // for the rationale + tracking ([#149]).
+        //
+        // The dispatcher takes `&mut [MaybeUninit<f32>]` (type-encoded
+        // uninit safety — see the kernel-module doc), so we pass the
+        // pre-reserved spare capacity **directly** and `set_len` after
+        // every f32 has been written. No `from_raw_parts_mut` cast
+        // over uninit backing memory (which would be UB regardless of
+        // subsequent writes, per `from_raw_parts_mut`'s "properly
+        // initialized" precondition).
+        {
+          let spare = buf.spare_capacity_mut();
+          // `total <= spare.len()` because `try_reserve_exact(total)`
+          // above reserved exactly `total` extra capacity. Take the
+          // first `total` slots of spare (one f32 per input byte).
+          debug_assert!(
+            spare.len() >= total,
+            "try_reserve_exact must have reserved at least total f32s"
+          );
+          crate::simd::vlm::bgr_widen(&mut spare[..total], raw);
         }
+        // SAFETY: `bgr_widen` wrote every f32 in `0..total` of the
+        // spare capacity (its function-level contract: "every f32 of
+        // `out` is written before this returns" — both the scalar
+        // `chunks_exact_mut(3)` path and the NEON 16-pixel tile path
+        // cover the full slice). `Vec::set_len`'s preconditions:
+        //   (1) `total <= buf.capacity()` — `try_reserve_exact` above
+        //       reserved exactly that much capacity (a
+        //       `try_reserve_exact` failure would have early-returned
+        //       `Error::OutOfMemory`);
+        //   (2) elements at `[0..total]` are initialized — the
+        //       kernel-contract above guarantees this.
+        // Both hold.
+        unsafe { buf.set_len(total) };
       }
     }
   } else {
