@@ -57,3 +57,4 @@ pub mod stop;
 #[cfg(feature = "tokenizer-tools")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokenizer-tools")))]
 pub mod tool_parsers;
+pub mod tuner;
