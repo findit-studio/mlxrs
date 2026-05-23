@@ -393,6 +393,14 @@ pub fn format_vtt_timestamp(seconds: f64) -> String {
 /// caller) for parity with mlx-audio's writer signature; downstream CLI
 /// wrappers that already pass the base path work unchanged.
 ///
+/// ## Stdout passthrough (`path == "-"`)
+///
+/// Mirrors the python `output_path != "-"` branch in `save_as_txt`
+/// (`stt/generate.py:136-140`): when `path` is exactly `"-"` mlxrs writes
+/// to [`std::io::stdout`] WITHOUT appending the `.txt` extension (no
+/// `-.txt` file is created on disk), matching python's
+/// `contextlib.nullcontext(sys.stdout)` branch.
+///
 /// # Errors
 ///
 /// Returns [`Error::Backend`] when the destination file cannot be created
@@ -404,19 +412,34 @@ pub fn format_vtt_timestamp(seconds: f64) -> String {
 ///
 /// [stt-gen]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/generate.py
 pub fn save_as_txt(transcript: &Transcript, path: &Path) -> Result<()> {
+  if path == Path::new("-") {
+    let stdout = std::io::stdout();
+    let mut w = stdout.lock();
+    return save_as_txt_to_writer(transcript, &mut w).map_err(|e| Error::Backend {
+      message: format!("save_as_txt: write to stdout failed: {e}"),
+    });
+  }
   let final_path = with_extension(path, "txt");
   let f = File::create(&final_path).map_err(|e| Error::Backend {
     message: format!("save_as_txt: create {} failed: {e}", final_path.display()),
   })?;
   let mut w = BufWriter::new(f);
-  w.write_all(transcript.text().as_bytes())
-    .map_err(|e| Error::Backend {
-      message: format!("save_as_txt: write {} failed: {e}", final_path.display()),
-    })?;
+  save_as_txt_to_writer(transcript, &mut w).map_err(|e| Error::Backend {
+    message: format!("save_as_txt: write {} failed: {e}", final_path.display()),
+  })?;
   w.flush().map_err(|e| Error::Backend {
     message: format!("save_as_txt: flush {} failed: {e}", final_path.display()),
   })?;
   Ok(())
+}
+
+/// Write the TXT body of `transcript` to any [`Write`] sink — extracted from
+/// [`save_as_txt`] so the python-shape rendering is shared by both the
+/// on-disk file branch AND the `path == "-"` stdout-passthrough branch (and
+/// is exercised directly by the unit-test stdout asserts without needing a
+/// real fd-redirect).
+fn save_as_txt_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::io::Result<()> {
+  w.write_all(transcript.text().as_bytes())
 }
 
 /// Save the transcript as SubRip `.srt` to `<path>.srt`.
@@ -436,17 +459,43 @@ pub fn save_as_txt(transcript: &Transcript, path: &Path) -> Result<()> {
 /// the cue blocks are separated by a blank line (the `\n\n` after `{TEXT}`).
 /// Timestamps use [`format_timestamp`] (`,` separator, SRT spec).
 ///
+/// ## Stdout passthrough (`path == "-"`)
+///
+/// Mirrors the python `output_path != "-"` branch in `save_as_srt`
+/// (`stt/generate.py:145-149`): when `path` is exactly `"-"` mlxrs writes
+/// to [`std::io::stdout`] WITHOUT appending the `.srt` extension.
+///
 /// # Errors
 ///
 /// Same conditions as [`save_as_txt`].
 ///
 /// [stt-gen]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/generate.py
 pub fn save_as_srt(transcript: &Transcript, path: &Path) -> Result<()> {
+  if path == Path::new("-") {
+    let stdout = std::io::stdout();
+    let mut w = stdout.lock();
+    return save_as_srt_to_writer(transcript, &mut w).map_err(|e| Error::Backend {
+      message: format!("save_as_srt: write to stdout failed: {e}"),
+    });
+  }
   let final_path = with_extension(path, "srt");
   let f = File::create(&final_path).map_err(|e| Error::Backend {
     message: format!("save_as_srt: create {} failed: {e}", final_path.display()),
   })?;
   let mut w = BufWriter::new(f);
+  save_as_srt_to_writer(transcript, &mut w).map_err(|e| Error::Backend {
+    message: format!("save_as_srt: write {} failed: {e}", final_path.display()),
+  })?;
+  w.flush().map_err(|e| Error::Backend {
+    message: format!("save_as_srt: flush {} failed: {e}", final_path.display()),
+  })?;
+  Ok(())
+}
+
+/// Write the SRT body of `transcript` to any [`Write`] sink — extracted from
+/// [`save_as_srt`] so the python-shape rendering is shared by both the
+/// on-disk file branch AND the `path == "-"` stdout-passthrough branch.
+fn save_as_srt_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::io::Result<()> {
   for (i, cue) in get_cues(transcript).iter().enumerate() {
     // python `for i, cue in enumerate(..., 1)` → 1-based index.
     let idx = i + 1;
@@ -457,16 +506,8 @@ pub fn save_as_srt(transcript: &Transcript, path: &Path) -> Result<()> {
       format_timestamp(cue.end),
       cue.text,
     );
-    w.write_all(block.as_bytes()).map_err(|e| Error::Backend {
-      message: format!(
-        "save_as_srt: write cue {idx} to {} failed: {e}",
-        final_path.display()
-      ),
-    })?;
+    w.write_all(block.as_bytes())?;
   }
-  w.flush().map_err(|e| Error::Backend {
-    message: format!("save_as_srt: flush {} failed: {e}", final_path.display()),
-  })?;
   Ok(())
 }
 
@@ -486,24 +527,45 @@ pub fn save_as_srt(transcript: &Transcript, path: &Path) -> Result<()> {
 ///
 /// ```
 ///
+/// ## Stdout passthrough (`path == "-"`)
+///
+/// Mirrors the python `output_path != "-"` branch in `save_as_vtt`
+/// (`stt/generate.py:159-163`): when `path` is exactly `"-"` mlxrs writes
+/// to [`std::io::stdout`] WITHOUT appending the `.vtt` extension.
+///
 /// # Errors
 ///
 /// Same conditions as [`save_as_txt`].
 ///
 /// [stt-gen]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/generate.py
 pub fn save_as_vtt(transcript: &Transcript, path: &Path) -> Result<()> {
+  if path == Path::new("-") {
+    let stdout = std::io::stdout();
+    let mut w = stdout.lock();
+    return save_as_vtt_to_writer(transcript, &mut w).map_err(|e| Error::Backend {
+      message: format!("save_as_vtt: write to stdout failed: {e}"),
+    });
+  }
   let final_path = with_extension(path, "vtt");
   let f = File::create(&final_path).map_err(|e| Error::Backend {
     message: format!("save_as_vtt: create {} failed: {e}", final_path.display()),
   })?;
   let mut w = BufWriter::new(f);
-  // `WEBVTT` magic header — required by every WebVTT parser, NOT optional.
-  w.write_all(b"WEBVTT\n\n").map_err(|e| Error::Backend {
-    message: format!(
-      "save_as_vtt: write header to {} failed: {e}",
-      final_path.display()
-    ),
+  save_as_vtt_to_writer(transcript, &mut w).map_err(|e| Error::Backend {
+    message: format!("save_as_vtt: write {} failed: {e}", final_path.display()),
   })?;
+  w.flush().map_err(|e| Error::Backend {
+    message: format!("save_as_vtt: flush {} failed: {e}", final_path.display()),
+  })?;
+  Ok(())
+}
+
+/// Write the WebVTT body of `transcript` to any [`Write`] sink — extracted
+/// from [`save_as_vtt`] so the python-shape rendering is shared by both the
+/// on-disk file branch AND the `path == "-"` stdout-passthrough branch.
+fn save_as_vtt_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::io::Result<()> {
+  // `WEBVTT` magic header — required by every WebVTT parser, NOT optional.
+  w.write_all(b"WEBVTT\n\n")?;
   for (i, cue) in get_cues(transcript).iter().enumerate() {
     let idx = i + 1;
     let block = format!(
@@ -513,16 +575,8 @@ pub fn save_as_vtt(transcript: &Transcript, path: &Path) -> Result<()> {
       format_vtt_timestamp(cue.end),
       cue.text,
     );
-    w.write_all(block.as_bytes()).map_err(|e| Error::Backend {
-      message: format!(
-        "save_as_vtt: write cue {idx} to {} failed: {e}",
-        final_path.display()
-      ),
-    })?;
+    w.write_all(block.as_bytes())?;
   }
-  w.flush().map_err(|e| Error::Backend {
-    message: format!("save_as_vtt: flush {} failed: {e}", final_path.display()),
-  })?;
   Ok(())
 }
 
@@ -564,6 +618,12 @@ pub fn save_as_vtt(transcript: &Transcript, path: &Path) -> Result<()> {
 /// default is also raw UTF-8 (it only escapes JSON-required code points),
 /// matching the python behavior.
 ///
+/// ## Stdout passthrough (`path == "-"`)
+///
+/// Mirrors the python `output_path != "-"` branch in `save_as_json`
+/// (`stt/generate.py:220-224`): when `path` is exactly `"-"` mlxrs writes
+/// to [`std::io::stdout`] WITHOUT appending the `.json` extension.
+///
 /// # Errors
 ///
 /// Returns [`Error::Backend`] for any file-creation / write / flush /
@@ -575,8 +635,40 @@ pub fn save_as_vtt(transcript: &Transcript, path: &Path) -> Result<()> {
 ///
 /// [stt-gen]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/generate.py
 pub fn save_as_json(transcript: &Transcript, path: &Path) -> Result<()> {
+  if path == Path::new("-") {
+    let stdout = std::io::stdout();
+    let mut w = stdout.lock();
+    return save_as_json_to_writer(transcript, &mut w).map_err(|e| Error::Backend {
+      message: format!("save_as_json: serialize to stdout failed: {e}"),
+    });
+  }
   let final_path = with_extension(path, "json");
+  let f = File::create(&final_path).map_err(|e| Error::Backend {
+    message: format!("save_as_json: create {} failed: {e}", final_path.display()),
+  })?;
+  let mut w = BufWriter::new(f);
+  save_as_json_to_writer(transcript, &mut w).map_err(|e| Error::Backend {
+    message: format!(
+      "save_as_json: serialize {} failed: {e}",
+      final_path.display()
+    ),
+  })?;
+  w.flush().map_err(|e| Error::Backend {
+    message: format!("save_as_json: flush {} failed: {e}", final_path.display()),
+  })?;
+  Ok(())
+}
 
+/// Write the JSON body of `transcript` (python-shape pretty-printed,
+/// 2-space-indent) to any [`Write`] sink — extracted from [`save_as_json`]
+/// so the python-shape rendering is shared by both the on-disk file branch
+/// AND the `path == "-"` stdout-passthrough branch.
+///
+/// `serde_json::Error` is folded into [`std::io::Error`] via
+/// [`std::io::Error::other`] so the writer-facing signature mirrors the
+/// txt/srt/vtt helpers; the outer [`save_as_json`] re-wraps into
+/// [`Error::Backend`] uniformly.
+fn save_as_json_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::io::Result<()> {
   // Build the python-shaped Value tree. We do NOT just `serde_json::to_value`
   // on `Transcript` directly because the python shape differs from
   // `Transcript`'s natural serde shape in two ways:
@@ -587,26 +679,12 @@ pub fn save_as_json(transcript: &Transcript, path: &Path) -> Result<()> {
   //      identical to the python output to support tooling that
   //      string-matches it.
   let value = transcript_to_python_shape(transcript);
-
-  let f = File::create(&final_path).map_err(|e| Error::Backend {
-    message: format!("save_as_json: create {} failed: {e}", final_path.display()),
-  })?;
-  let mut w = BufWriter::new(f);
   // python `json.dump(..., ensure_ascii=False, indent=2)` → 2-space indent +
   // no ASCII escape. `serde_json::to_writer_pretty` defaults to 2-space
   // indent (`PrettyFormatter::default()` uses `b"  "`) and never escapes
   // non-ASCII UTF-8 chars, so this matches the python output byte-for-byte
   // for the same key ordering.
-  serde_json::to_writer_pretty(&mut w, &value).map_err(|e| Error::Backend {
-    message: format!(
-      "save_as_json: serialize {} failed: {e}",
-      final_path.display()
-    ),
-  })?;
-  w.flush().map_err(|e| Error::Backend {
-    message: format!("save_as_json: flush {} failed: {e}", final_path.display()),
-  })?;
-  Ok(())
+  serde_json::to_writer_pretty(w, &value).map_err(std::io::Error::other)
 }
 
 /// Build a `serde_json::Value` matching the python `save_as_json` output
@@ -665,7 +743,15 @@ fn transcript_to_python_shape(t: &Transcript) -> serde_json::Value {
         // (end < start) timing produces the python-equivalent negative
         // duration rather than a Rust-side clamp.
         obj.insert("duration".into(), json!(s.end - s.start));
-        if let Some(words) = &s.words {
+        // python `if "words" in s and s["words"]` (stt/generate.py:213): the
+        // `words` key is emitted ONLY when the per-segment word list is
+        // truthy (non-empty). An `Option<Vec<Word>>` of `Some(vec![])` is
+        // python-falsy and MUST be dropped from the JSON, matching the
+        // python branch — otherwise downstream tooling that
+        // `"words" in seg` checks would diverge between python + mlxrs.
+        if let Some(words) = &s.words
+          && !words.is_empty()
+        {
           let words_arr: Vec<Value> = words
             .iter()
             .map(|w| {
@@ -886,6 +972,109 @@ mod tests {
     assert_eq!(
       super::with_extension(Path::new("out.draft"), "txt"),
       PathBuf::from("out.draft.txt"),
+    );
+  }
+
+  /// Hand-traced fixture matching the SRT/VTT byte-exact integration tests
+  /// for the dash-path stdout-writer round-trip — three contiguous Whisper
+  /// segments, no per-word alignment.
+  fn three_segments_fixture() -> Transcript {
+    Transcript::Segments {
+      text: "hello world foo".into(),
+      segments: vec![
+        Segment {
+          start: 0.0,
+          end: 1.234,
+          text: "hello".into(),
+          words: None,
+          speaker_id: None,
+        },
+        Segment {
+          start: 1.234,
+          end: 2.500,
+          text: "world".into(),
+          words: None,
+          speaker_id: None,
+        },
+        Segment {
+          start: 2.500,
+          end: 4.000,
+          text: "foo".into(),
+          words: None,
+          speaker_id: None,
+        },
+      ],
+    }
+  }
+
+  // ---------- Finding 2 regression: writer-helper round-trip ----------
+
+  #[test]
+  fn save_as_txt_to_writer_matches_python_body() {
+    // mlxrs writer helper that's shared by `save_as_txt`'s file branch AND
+    // the `path == "-"` stdout branch — assert the python-shape body is
+    // identical regardless of sink (so the dash-path stdout output is
+    // byte-exact-equivalent to the on-disk `.txt` body).
+    let t = three_segments_fixture();
+    let mut buf: Vec<u8> = Vec::new();
+    super::save_as_txt_to_writer(&t, &mut buf).unwrap();
+    assert_eq!(
+      std::str::from_utf8(&buf).unwrap(),
+      "hello world foo",
+      "writer helper writes the same body the on-disk `.txt` test asserts"
+    );
+  }
+
+  #[test]
+  fn save_as_srt_to_writer_matches_python_body() {
+    let t = three_segments_fixture();
+    let mut buf: Vec<u8> = Vec::new();
+    super::save_as_srt_to_writer(&t, &mut buf).unwrap();
+    let expected = "1\n00:00:00,000 --> 00:00:01,234\nhello\n\n\
+                    2\n00:00:01,234 --> 00:00:02,500\nworld\n\n\
+                    3\n00:00:02,500 --> 00:00:04,000\nfoo\n\n";
+    assert_eq!(
+      std::str::from_utf8(&buf).unwrap(),
+      expected,
+      "writer helper writes the same body the on-disk `.srt` test asserts"
+    );
+  }
+
+  #[test]
+  fn save_as_vtt_to_writer_matches_python_body() {
+    let t = three_segments_fixture();
+    let mut buf: Vec<u8> = Vec::new();
+    super::save_as_vtt_to_writer(&t, &mut buf).unwrap();
+    let expected = "WEBVTT\n\n\
+                    1\n00:00:00.000 --> 00:00:01.234\nhello\n\n\
+                    2\n00:00:01.234 --> 00:00:02.500\nworld\n\n\
+                    3\n00:00:02.500 --> 00:00:04.000\nfoo\n\n";
+    assert_eq!(
+      std::str::from_utf8(&buf).unwrap(),
+      expected,
+      "writer helper writes the same body the on-disk `.vtt` test asserts"
+    );
+  }
+
+  #[test]
+  fn save_as_json_to_writer_matches_python_body() {
+    // `save_as_json_to_writer` is the shared sink for `save_as_json`'s file
+    // branch + dash-path stdout branch. The python output is 2-space
+    // pretty-printed; we round-trip the buffer through `serde_json` to
+    // assert structural equality (the byte-exact assertion is exercised by
+    // the existing integration test `save_as_json_round_trips_transcript`).
+    let t = three_segments_fixture();
+    let mut buf: Vec<u8> = Vec::new();
+    super::save_as_json_to_writer(&t, &mut buf).unwrap();
+    let parsed: Transcript = serde_json::from_slice(&buf).unwrap();
+    assert_eq!(
+      parsed, t,
+      "writer helper writes the same python-shape JSON the on-disk `.json` test asserts"
+    );
+    // Sanity: 2-space indent is present (python `indent=2`).
+    assert!(
+      std::str::from_utf8(&buf).unwrap().contains("\n  \"text\":"),
+      "writer JSON output uses 2-space indent"
     );
   }
 }

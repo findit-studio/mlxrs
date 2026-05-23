@@ -301,3 +301,189 @@ fn save_as_txt_appends_extension_does_not_replace() {
   assert!(appended.exists(), "extension was appended, not replaced");
   let _ = fs::remove_file(&appended);
 }
+
+// ---------- Finding 1 regression: empty `words` list is python-falsy ----------
+
+#[test]
+fn save_as_json_omits_empty_words_field() {
+  // python `if "words" in s and s["words"]` (stt/generate.py:213): the
+  // `words` key is dropped when the per-segment word list is empty (python
+  // truthy check). A `Some(vec![])` MUST NOT produce a `"words": []` entry
+  // in the JSON — downstream tooling that `"words" in seg` checks would
+  // diverge from the python reference otherwise.
+  let base = temp_base("json_empty_words_omitted");
+  let t = Transcript::Segments {
+    text: "hi".into(),
+    segments: vec![Segment {
+      start: 0.0,
+      end: 1.0,
+      text: "hi".into(),
+      // The defect-trigger: `Some(empty)` — would have emitted `"words":
+      // []` in the pre-fix port; python omits the key entirely.
+      words: Some(vec![]),
+      speaker_id: None,
+    }],
+  };
+  save_as_json(&t, &base).unwrap();
+  let json_path = base.with_file_name(format!(
+    "{}.json",
+    base.file_name().unwrap().to_string_lossy()
+  ));
+  let raw = fs::read_to_string(&json_path).unwrap();
+  // Parse + introspect: the segment object must NOT carry a `"words"` key.
+  let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+  let segs = parsed
+    .get("segments")
+    .and_then(|v| v.as_array())
+    .expect("JSON has `segments` array");
+  assert_eq!(segs.len(), 1, "fixture has one segment");
+  let seg = segs[0].as_object().expect("segment is an object");
+  assert!(
+    !seg.contains_key("words"),
+    "empty `words: Some(vec![])` must omit the `words` key entirely (python truthy semantics); \
+     got JSON keys {:?}",
+    seg.keys().collect::<Vec<_>>()
+  );
+  // String-level sanity: the literal `"words"` substring must not appear
+  // anywhere in the rendered JSON.
+  assert!(
+    !raw.contains("\"words\""),
+    "rendered JSON must not contain the `\"words\"` key when the list is empty; got: {raw}"
+  );
+  let _ = fs::remove_file(&json_path);
+}
+
+#[test]
+fn save_as_json_emits_words_when_non_empty() {
+  // Regression-guard the happy path: a non-empty `Some(vec![Word])` MUST
+  // still emit the `"words"` array (so the fix only drops the empty case).
+  let base = temp_base("json_words_present_when_nonempty");
+  let t = Transcript::Segments {
+    text: "hi".into(),
+    segments: vec![Segment {
+      start: 0.0,
+      end: 1.0,
+      text: "hi".into(),
+      words: Some(vec![Word {
+        start: 0.0,
+        end: 1.0,
+        word: "hi".into(),
+        extra: BTreeMap::new(),
+      }]),
+      speaker_id: None,
+    }],
+  };
+  save_as_json(&t, &base).unwrap();
+  let json_path = base.with_file_name(format!(
+    "{}.json",
+    base.file_name().unwrap().to_string_lossy()
+  ));
+  let raw = fs::read_to_string(&json_path).unwrap();
+  let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+  let seg = parsed["segments"][0]
+    .as_object()
+    .expect("segment is an object");
+  let words = seg
+    .get("words")
+    .and_then(|v| v.as_array())
+    .expect("non-empty `words` must produce the JSON `words` array");
+  assert_eq!(
+    words.len(),
+    1,
+    "non-empty `Some(vec![Word])` produces a one-entry `words` array"
+  );
+  let _ = fs::remove_file(&json_path);
+}
+
+// ---------- Finding 2 regression: `Path::new("-")` → stdout, NOT a file ----------
+
+/// Stdout-passthrough fixture used by all four `save_as_*_writes_to_stdout`
+/// regression tests below.
+fn dash_path_fixture() -> Transcript {
+  Transcript::Segments {
+    text: "hello world foo".into(),
+    segments: vec![
+      Segment {
+        start: 0.0,
+        end: 1.234,
+        text: "hello".into(),
+        words: None,
+        speaker_id: None,
+      },
+      Segment {
+        start: 1.234,
+        end: 2.500,
+        text: "world".into(),
+        words: None,
+        speaker_id: None,
+      },
+      Segment {
+        start: 2.500,
+        end: 4.000,
+        text: "foo".into(),
+        words: None,
+        speaker_id: None,
+      },
+    ],
+  }
+}
+
+/// Assert that calling `save_as_*` with `Path::new("-")` did NOT create a
+/// `-.{ext}` file on disk anywhere a python user could have ended up
+/// (cwd + `std::env::temp_dir()`). The python `contextlib.nullcontext(
+/// sys.stdout)` branch never opens a file; mlxrs must mirror that exactly.
+fn assert_no_dash_file_on_disk(ext: &str) {
+  let cwd_candidate = std::path::PathBuf::from(format!("-.{ext}"));
+  assert!(
+    !cwd_candidate.exists(),
+    "dash-path stdout branch must NOT create `-.{ext}` in cwd (got {})",
+    cwd_candidate.display()
+  );
+  let mut tmp_candidate = std::env::temp_dir();
+  tmp_candidate.push(format!("-.{ext}"));
+  assert!(
+    !tmp_candidate.exists(),
+    "dash-path stdout branch must NOT create `-.{ext}` in tmpdir (got {})",
+    tmp_candidate.display()
+  );
+}
+
+#[test]
+fn save_as_txt_writes_to_stdout_for_dash_path() {
+  // python `output_path != "-"` branch in `save_as_txt`
+  // (stt/generate.py:135-141): the `-` literal selects
+  // `contextlib.nullcontext(sys.stdout)`, which writes the body to stdout
+  // WITHOUT appending the `.txt` extension. mlxrs mirrors that by routing
+  // through `std::io::stdout()` in the same branch.
+  //
+  // Capturing stdout from the test process is awkward + racy in cargo's
+  // multi-test runner (and `--test-threads=1` doesn't help with the
+  // outer-process pipe), so we assert the *observable disk side-effect*
+  // (no `-.txt` file created on disk anywhere) plus the writer-helper
+  // unit tests above (`save_as_txt_to_writer_matches_python_body`) which
+  // exercise the byte-exact body the stdout branch writes.
+  let t = dash_path_fixture();
+  save_as_txt(&t, std::path::Path::new("-")).unwrap();
+  assert_no_dash_file_on_disk("txt");
+}
+
+#[test]
+fn save_as_srt_writes_to_stdout_for_dash_path() {
+  let t = dash_path_fixture();
+  save_as_srt(&t, std::path::Path::new("-")).unwrap();
+  assert_no_dash_file_on_disk("srt");
+}
+
+#[test]
+fn save_as_vtt_writes_to_stdout_for_dash_path() {
+  let t = dash_path_fixture();
+  save_as_vtt(&t, std::path::Path::new("-")).unwrap();
+  assert_no_dash_file_on_disk("vtt");
+}
+
+#[test]
+fn save_as_json_writes_to_stdout_for_dash_path() {
+  let t = dash_path_fixture();
+  save_as_json(&t, std::path::Path::new("-")).unwrap();
+  assert_no_dash_file_on_disk("json");
+}
