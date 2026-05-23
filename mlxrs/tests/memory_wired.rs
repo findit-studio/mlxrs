@@ -10,14 +10,21 @@
 //! magnitude checks. Functional contract + monotonic `>=` only.
 //!
 //! ## Threading: wired-limit tests are serialized
-//! `mlx_set_wired_limit` is process-global; two concurrent guards would race
-//! on the captured `old_limit` and leave the process in a stale state on
-//! drop. Tests that mutate the wired limit acquire [`WIRED_LIMIT_LOCK`]
-//! first so they run strictly serially within this binary. Per-policy
-//! math tests do NOT acquire the lock (they are pure functions of their
-//! inputs).
+//! `mlx_set_wired_limit` is process-global. The [`WiredLimitGuard`] itself
+//! is race-safe across concurrent installs (refcounted via the internal
+//! mutex — CODEX R1 F2 / R2 fix), but our tests also call the raw
+//! [`set_wired_limit`] helper to snapshot/restore the limit; THOSE calls
+//! would race with the guard tests' state-mutating install/drop cycles
+//! without serialization. Tests that mutate the wired limit acquire
+//! [`WIRED_LIMIT_LOCK`] first so they run strictly serially within this
+//! binary. Per-policy math tests do NOT acquire the lock (they are pure
+//! functions of their inputs). The two tests that intentionally exercise
+//! concurrent installs (`concurrent_install_t1_drops_first_t2_retains_
+//! recommended_limit` and `concurrent_install_drop_restores_correct_old_
+//! limit_per_owner`) hold the lock for their full duration to keep their
+//! observation of the live process-global limit consistent.
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Barrier, Mutex, MutexGuard, PoisonError};
 
 use mlxrs::{
   Stream,
@@ -280,9 +287,13 @@ fn wired_limit_guard_drop_restores_old_limit() {
   );
 }
 
-/// CODEX R1 [HIGH] F2 regression guard — concurrent install/Drop on
-/// different threads MUST leave the process-global wired-memory limit at
-/// its original pre-install value, not at the recommended budget.
+/// CODEX R1 [HIGH] F2 / CODEX R2 regression guard — concurrent
+/// install/Drop on different threads MUST leave the process-global
+/// wired-memory limit at its original pre-install value, not at the
+/// recommended budget. Coarse stress test that asserts the final
+/// restored-state invariant; the deterministic in-scope-protection
+/// invariant is asserted by
+/// [`concurrent_install_t1_drops_first_t2_retains_recommended_limit`].
 ///
 /// Pre-F2 failure mode (no synchronization):
 /// ```text
@@ -291,16 +302,16 @@ fn wired_limit_guard_drop_restores_old_limit() {
 ///   T1 drop:    restores L0     (limit = L0)
 ///   T2 drop:    restores recommended    (limit = recommended  ← BUG)
 /// ```
-/// Post-F2 (single-active-guard semantics): T2's install observes the
-/// owner-lock is held → returns `Ok(None)` (no-op). Only T1 has a real
-/// guard whose `Drop` restores L0.
+/// Post-R2 (refcounted-guard semantics): T1 install captures L0 + sets
+/// limit; T2 install bumps refcount and gets its own `Some(guard)` (NOT
+/// `Ok(None)` as in the R1 single-active-guard design); whichever drops
+/// first decrements; whichever drops last restores L0.
 ///
 /// This test cannot reliably reproduce the deterministic interleave
 /// without sleeps/yields (and even then, races are inherently flaky),
 /// so it asserts the *invariant* instead: after any number of concurrent
 /// install/drop cycles, the limit is exactly what it was before the
-/// stress test began. This invariant holds under the F2 fix; it failed
-/// to hold under the pre-F2 design.
+/// stress test began.
 #[test]
 fn concurrent_install_drop_restores_correct_old_limit_per_owner() {
   let _serialized = lock_wired_limit();
@@ -317,21 +328,31 @@ fn concurrent_install_drop_restores_correct_old_limit_per_owner() {
   let _ = set_wired_limit(snapshot_before).expect("restore snapshot baseline");
 
   // Spawn 2 worker threads each running multiple install/drop cycles.
-  // Some installs will collide on the owner-lock and return `Ok(None)`
-  // (the F2 single-active-guard semantics); others will succeed with
-  // `Ok(Some(_))`. Both branches are correct — the invariant we
-  // verify is post-stress restoration, NOT individual install outcomes.
+  // Under the R2 refcounted-guard semantics every successful install
+  // yields `Ok(Some(_))` — the only valid `Ok(None)` outcome is
+  // Metal-unavailable (excluded by the early-return above). The
+  // invariant we verify is post-stress restoration; individual install
+  // outcomes are uniformly `Some`.
   let handles: Vec<_> = (0..2)
     .map(|_| {
       std::thread::spawn(|| {
         for _ in 0..32 {
           match WiredLimitGuard::install(0, &[]) {
             Ok(Some(_guard)) => {
-              // Guard drops at end of scope, restoring under the F2 lock.
+              // Guard drops at end of scope, decrementing the refcount.
+              // The last drop in each epoch restores the captured L0.
             }
             Ok(None) => {
-              // Another guard was active OR Metal-unavailable — no-op.
-              // Both branches are valid F2 outcomes.
+              // Under R2, a guard-install on a Metal-available host
+              // MUST yield Some — Ok(None) here means the R2 refcount
+              // semantics regressed back to R1's single-active flag.
+              panic!(
+                "R2 refcounted semantics: every install on a Metal-available \
+                 host must yield Some(guard); Ok(None) is reserved for the \
+                 Metal-unavailable path. The R1 single-active-guard fix \
+                 silently returned None on concurrent installs which loses \
+                 in-scope protection — do not reintroduce that contract."
+              );
             }
             Err(e) => panic!("install must not error on a healthy host: {e:?}"),
           }
@@ -347,16 +368,282 @@ fn concurrent_install_drop_restores_correct_old_limit_per_owner() {
   // Invariant: after all workers have joined, the process-global limit
   // must equal `snapshot_before`. Pre-F2, the race would leave the limit
   // at `recommended` for a substantial fraction of runs (the T2-overwrites-
-  // T1-restore interleave).
+  // T1-restore interleave). Post-R2, the last-drop-restores discipline of
+  // the refcounted design guarantees the limit returns to the captured L0.
   let observed = set_wired_limit(snapshot_before).expect("read-back via set");
   assert_eq!(
     observed, snapshot_before,
-    "F2 fix: after concurrent install/drop stress, the wired-memory limit \
+    "R2 fix: after concurrent install/drop stress, the wired-memory limit \
      must equal the pre-stress snapshot (snapshot_before={snapshot_before}, \
      observed={observed}). A mismatch (typically observed = recommended) \
-     indicates the install/Drop race re-introduced — the single-active-guard \
-     ownership lock is supposed to make it impossible for two guards to \
-     simultaneously hold captures of inconsistent old_limits."
+     indicates the install/Drop race re-introduced — the refcounted shared \
+     state is supposed to make it impossible for two guards to simultaneously \
+     hold inconsistent captures, while still letting each guard's full \
+     scope enjoy the recommended-limit protection."
+  );
+}
+
+/// CODEX R2 [HIGH] regression guard — the deterministic
+/// in-scope-protection invariant. T1 installs, T2 installs (T2 receives
+/// a real guard, NOT `Ok(None)`), T1 drops FIRST — T2's continued scope
+/// MUST still observe the limit at the recommended budget, not at the
+/// originally-captured prior value.
+///
+/// Pre-R2 (single-active-guard) failure mode flagged by Codex:
+/// ```text
+///   T1 install      → captures L0, sets recommended, returns Some(guard)
+///   T2 install      → flag set, returns Ok(None) (NO GUARD)
+///   T2 work assumes protection; in reality is unprotected from the start
+///   T1 drops        → restores L0 (the original, lower limit)
+///   T2 still active → now at L0 for the rest of its scope (no protection)
+/// ```
+///
+/// Post-R2 (refcounted-guard):
+/// ```text
+///   T1 install      → state=Some(L0, 1), limit=recommended
+///   T2 install      → state=Some(L0, 2), limit STAYS recommended, Some(guard)
+///   T1 drop         → state=Some(L0, 1), limit STAYS recommended  ← THE FIX
+///   T2 still active → observes limit==recommended (verified by this test)
+///   T2 drop         → state=None, limit=L0 (final restore)
+/// ```
+///
+/// Uses two `Barrier`s to deterministically order: install both, T1 drops
+/// first while T2 holds, T2 asserts the live limit is still recommended,
+/// then T2 drops and the test asserts the limit is back to `snapshot_before`.
+#[test]
+fn concurrent_install_t1_drops_first_t2_retains_recommended_limit() {
+  let _serialized = lock_wired_limit();
+
+  let Ok(Some(recommended)) = recommended_working_set_bytes() else {
+    eprintln!("skipping: recommended_working_set_bytes unavailable on this host");
+    return;
+  };
+
+  // Snapshot the pre-test limit + re-set it so the live value matches.
+  let snapshot_before = set_wired_limit(0).expect("snapshot via round-trip");
+  let _ = set_wired_limit(snapshot_before).expect("restore baseline");
+
+  // Sanity: this test only discriminates the R2-fixed-vs-broken behavior
+  // when snapshot_before != recommended (otherwise "T2 sees limit at
+  // recommended" and "T2 sees limit at snapshot_before" are
+  // indistinguishable). On macOS the default wired-limit at process
+  // start is 0 and `recommended` is the device's
+  // `max_recommended_working_set_size` (a large positive value), so the
+  // pre-condition holds. Skip with a clear message if it doesn't.
+  if snapshot_before == recommended {
+    eprintln!(
+      "skipping: snapshot_before ({snapshot_before}) == recommended ({recommended}); \
+       this test cannot discriminate the R2 fix in that degenerate state"
+    );
+    return;
+  }
+
+  // Two barriers gate (a) both installs done; (b) T1's drop done.
+  let barrier_both_installed = Arc::new(Barrier::new(3));
+  let barrier_t1_dropped = Arc::new(Barrier::new(3));
+
+  let bi_t1 = Arc::clone(&barrier_both_installed);
+  let bd_t1 = Arc::clone(&barrier_t1_dropped);
+  let t1 = std::thread::spawn(move || {
+    let guard = WiredLimitGuard::install(0, &[])
+      .expect("t1 install rc")
+      .expect(
+        "t1 must receive Some(guard) — Ok(None) here means Metal became unavailable \
+         mid-test or the R2 refcounted semantics regressed",
+      );
+    // Hold the guard while T2 also installs.
+    bi_t1.wait();
+    // T1 drops FIRST: the dispatch on T2 must still find limit == recommended.
+    drop(guard);
+    // Signal that T1's drop completed so T2 can assert.
+    bd_t1.wait();
+  });
+
+  let bi_t2 = Arc::clone(&barrier_both_installed);
+  let bd_t2 = Arc::clone(&barrier_t1_dropped);
+  let t2 = std::thread::spawn(move || {
+    // Wait briefly until T1 has surely entered the lock + installed —
+    // spin-park on the barrier from below until T1 reaches it.
+    // (T1 reaches the barrier AFTER its install completes, so we can
+    // safely install here BEFORE the barrier without risking ordering
+    // ambiguity: T2's install will queue on the mutex if T1 holds it,
+    // and proceed once T1 releases it post-state-write.)
+    let guard = WiredLimitGuard::install(0, &[])
+      .expect("t2 install rc")
+      .expect(
+        "t2 MUST receive Some(guard) under R2 refcounted semantics — \
+         Ok(None) here is the exact bug Codex R2 flagged (loss of \
+         in-scope protection for the second concurrent install)",
+      );
+    // Now both installs are done — release T1 to drop.
+    bi_t2.wait();
+    // Wait for T1's drop to complete.
+    bd_t2.wait();
+    // T1 has dropped; T2 is still alive. The shared state has
+    // refcount == 1, and the FFI limit MUST still be at `recommended`
+    // (NOT restored to snapshot_before).
+    //
+    // Read the live limit via a `set_wired_limit(x).prior` round-trip:
+    // set to recommended (no-op on the live value) and observe that
+    // `recommended` is what it WAS already.
+    let observed = set_wired_limit(recommended).expect("t2 read-back via set");
+    assert_eq!(
+      observed, recommended,
+      "R2 in-scope protection: after T1 drops first, T2 still alive must \
+       observe limit == recommended (observed={observed}, \
+       recommended={recommended}). A mismatch (typically observed == \
+       snapshot_before) is the exact Codex R2 finding: the R1 single-active \
+       design restored the limit on T1's drop, leaving T2's scope unprotected."
+    );
+    // Restore so T2's drop sees the live value matching the recommended
+    // (no-op semantically; the read-back above set it to recommended).
+    let _ = set_wired_limit(recommended).expect("t2 re-set recommended");
+    // T2 drops here at scope exit (returns from the closure).
+    drop(guard);
+  });
+
+  // The main thread participates in the barriers to keep the ordering
+  // visible at the test level (and to fail loudly if either worker
+  // wedges).
+  barrier_both_installed.wait();
+  barrier_t1_dropped.wait();
+
+  t1.join().expect("t1 worker must not panic");
+  t2.join().expect("t2 worker must not panic");
+
+  // Final invariant: after BOTH guards have dropped, the limit returns
+  // to `snapshot_before` (R2 last-drop-restores discipline).
+  let observed_final = set_wired_limit(snapshot_before).expect("final read-back via set");
+  assert_eq!(
+    observed_final, snapshot_before,
+    "R2 last-drop-restores: after both guards drop, limit must return to \
+     snapshot_before (observed_final={observed_final}, \
+     snapshot_before={snapshot_before})"
+  );
+}
+
+/// CODEX R2 [HIGH] regression guard — a concurrent install (one already
+/// active) MUST yield `Ok(Some(_))` not `Ok(None)`. Direct contract test
+/// for the API shape change vs the R1 single-active-guard design.
+///
+/// This is the simplest expression of the bug Codex caught: under R1, T2's
+/// install returned `Ok(None)` and the caller had no way to distinguish
+/// "Metal unavailable" from "another guard is active", and crucially had
+/// no live guard to participate in the cleanup contract.
+#[test]
+fn concurrent_install_returns_some_guard_not_none_when_already_installed() {
+  let _serialized = lock_wired_limit();
+
+  let Ok(Some(_recommended)) = recommended_working_set_bytes() else {
+    eprintln!("skipping: recommended_working_set_bytes unavailable on this host");
+    return;
+  };
+
+  let snapshot_before = set_wired_limit(0).expect("snapshot via round-trip");
+  let _ = set_wired_limit(snapshot_before).expect("restore baseline");
+
+  // Install on this thread (T1).
+  let g1 = WiredLimitGuard::install(0, &[])
+    .expect("t1 install rc")
+    .expect("t1 must receive Some(guard)");
+
+  // Spawn T2 and assert its install also yields Some — this is the R2
+  // contract change. Done in a worker thread to prove the install path
+  // does not depend on same-thread reentrancy detection.
+  let t2 = std::thread::spawn(|| WiredLimitGuard::install(0, &[]).map(|opt| opt.is_some()));
+  let t2_yielded_some = t2
+    .join()
+    .expect("t2 must not panic")
+    .expect("t2 install rc");
+
+  assert!(
+    t2_yielded_some,
+    "R2 refcounted semantics: a concurrent install (T1 active) must yield \
+     Ok(Some(_)) not Ok(None). The R1 single-active-guard design returned \
+     None here, silently losing in-scope protection for the caller. This \
+     test asserts the API shape change directly — if it ever fails again, \
+     the R1 regression has reappeared."
+  );
+
+  // Drop T1 (T2's guard was already dropped at the end of its closure;
+  // the boolean `is_some()` consumed-and-dropped the guard before
+  // returning). The shared state's refcount is now 1; T1's drop is the
+  // last in this epoch and restores `snapshot_before`.
+  drop(g1);
+
+  let observed = set_wired_limit(snapshot_before).expect("final read-back");
+  assert_eq!(
+    observed, snapshot_before,
+    "After both T1 + T2 guards drop, limit must restore to snapshot_before"
+  );
+}
+
+/// CODEX R2 [HIGH] regression guard — refcount discipline. Install guard
+/// A, install guard B (refcount = 2), drop A → limit MUST be unchanged
+/// (still at recommended). Then drop B → limit MUST restore.
+///
+/// This is a same-thread version of the deterministic ordering test
+/// above; useful because it runs without any thread synchronization
+/// overhead, exercises the same install/drop refcount transitions, and
+/// can catch a regression where the refcount logic is correct on the
+/// install path but wrong on the drop path (e.g. unconditionally
+/// restoring on every drop).
+#[test]
+fn refcounted_guard_drop_does_not_restore_until_last_drop() {
+  let _serialized = lock_wired_limit();
+
+  let Ok(Some(recommended)) = recommended_working_set_bytes() else {
+    eprintln!("skipping: recommended_working_set_bytes unavailable on this host");
+    return;
+  };
+
+  let snapshot_before = set_wired_limit(0).expect("snapshot via round-trip");
+  let _ = set_wired_limit(snapshot_before).expect("restore baseline");
+
+  // Sanity: discriminating power requires snapshot_before != recommended
+  // (same reason as `concurrent_install_t1_drops_first_t2_retains_recommended_limit`).
+  if snapshot_before == recommended {
+    eprintln!(
+      "skipping: snapshot_before ({snapshot_before}) == recommended ({recommended}); \
+       this test cannot discriminate refcount-discipline in that degenerate state"
+    );
+    return;
+  }
+
+  let a = WiredLimitGuard::install(0, &[])
+    .expect("a install rc")
+    .expect("a must receive Some(guard)");
+  let b = WiredLimitGuard::install(0, &[])
+    .expect("b install rc")
+    .expect("b must receive Some(guard) under R2 refcounted semantics");
+
+  // Both guards alive, refcount = 2, limit = recommended.
+  // Drop A — refcount becomes 1; limit MUST stay at recommended.
+  drop(a);
+
+  let observed_after_a_drop = set_wired_limit(recommended).expect("read-back after a drop");
+  assert_eq!(
+    observed_after_a_drop, recommended,
+    "R2 refcount discipline: dropping A while B is still alive must NOT \
+     restore the limit (observed={observed_after_a_drop}, \
+     recommended={recommended}). A mismatch here means Drop unconditionally \
+     restores instead of refcount-gated restoring — the exact regression \
+     the refcounted design exists to prevent."
+  );
+  // Re-set to recommended in case the read-back above mutated the live
+  // value (it shouldn't have — we passed recommended which equals the
+  // existing live value — but make this defensive).
+  let _ = set_wired_limit(recommended).expect("re-set recommended");
+
+  // Drop B — refcount becomes 0, limit MUST restore to snapshot_before.
+  drop(b);
+
+  let observed_after_b_drop = set_wired_limit(snapshot_before).expect("read-back after b drop");
+  assert_eq!(
+    observed_after_b_drop, snapshot_before,
+    "R2 last-drop-restores: after B (the last live guard in the epoch) \
+     drops, limit must restore to snapshot_before (observed={observed_after_b_drop}, \
+     snapshot_before={snapshot_before})."
   );
 }
 
