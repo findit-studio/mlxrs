@@ -636,3 +636,292 @@ fn mixed_quant_predicate_no_down_proj_is_error() {
     Err(other) => panic!("expected Error::Backend, got {other:?}"),
   }
 }
+
+// ──────────────────────── Finding 1 — explicit-dtype gate ────────────────────────
+
+/// F7 R1 Finding 1 — an explicit `Some(Dtype::I32)` MUST be a hard
+/// error from `convert`, not silently cast every floating weight to
+/// int. The reference's string-typed `if dtype in MODEL_CONVERSION_DTYPES`
+/// gate (`convert.py:133`) silently drops unknown spellings; the typed
+/// `Dtype` enum would otherwise silently accept `I32` and forward it to
+/// `cast_floats_to_dtype`, wrecking every weight. End-to-end through
+/// `convert`.
+#[test]
+fn convert_rejects_explicit_dtype_i32() {
+  let weights = make_quantizable_weights();
+  let src = write_src_dir("reject_dtype_i32_src", &weights, PLAIN_CONFIG_JSON);
+  let dst = temp_dir("reject_dtype_i32_dst");
+  fs::remove_dir_all(&dst).unwrap();
+
+  let err = convert::convert(ConvertArgs {
+    hf_path: src,
+    mlx_path: dst,
+    dtype: Some(Dtype::I32),
+    ..Default::default()
+  })
+  .unwrap_err();
+  match err {
+    mlxrs::Error::Backend { message } => {
+      assert!(
+        message.contains("float16") && message.contains("bfloat16") && message.contains("float32"),
+        "error names the supported set: {message}"
+      );
+      assert!(
+        message.to_lowercase().contains("dtype"),
+        "error names the dtype field: {message}"
+      );
+    }
+    other => panic!("expected Error::Backend, got {other:?}"),
+  }
+}
+
+#[test]
+fn convert_rejects_explicit_dtype_f64() {
+  let weights = make_quantizable_weights();
+  let src = write_src_dir("reject_dtype_f64_src", &weights, PLAIN_CONFIG_JSON);
+  let dst = temp_dir("reject_dtype_f64_dst");
+  fs::remove_dir_all(&dst).unwrap();
+
+  let err = convert::convert(ConvertArgs {
+    hf_path: src,
+    mlx_path: dst,
+    dtype: Some(Dtype::F64),
+    ..Default::default()
+  })
+  .unwrap_err();
+  match err {
+    mlxrs::Error::Backend { message } => {
+      assert!(
+        message.contains("float16"),
+        "error names supported set: {message}"
+      );
+    }
+    other => panic!("expected Error::Backend, got {other:?}"),
+  }
+}
+
+#[test]
+fn convert_rejects_explicit_dtype_complex() {
+  let weights = make_quantizable_weights();
+  let src = write_src_dir("reject_dtype_complex_src", &weights, PLAIN_CONFIG_JSON);
+  let dst = temp_dir("reject_dtype_complex_dst");
+  fs::remove_dir_all(&dst).unwrap();
+
+  let err = convert::convert(ConvertArgs {
+    hf_path: src,
+    mlx_path: dst,
+    dtype: Some(Dtype::Complex64),
+    ..Default::default()
+  })
+  .unwrap_err();
+  match err {
+    mlxrs::Error::Backend { message } => {
+      assert!(
+        message.contains("float16"),
+        "error names supported set: {message}"
+      );
+    }
+    other => panic!("expected Error::Backend, got {other:?}"),
+  }
+}
+
+// ──────────────────────── Finding 2 — q_group_size / q_bits zero falsy ────────────────────────
+
+/// F7 R1 Finding 2 — `q_group_size: Some(0)` is python-falsy
+/// (`utils.py:808`: `group_size or default_group_size`) and MUST fall
+/// back to the per-mode default. The previous `unwrap_or` shape would
+/// have written a `quantization.group_size = 0` block to disk against
+/// dense weights (because `quantize_weights`' `last % 0 != 0` arm skips
+/// every layer) — convert would have silently produced a broken
+/// checkpoint. This test asserts the destination ACTUALLY quantizes
+/// (`.scales` is emitted) when `Some(0)` is passed.
+#[test]
+fn convert_q_group_size_zero_falls_back_to_default() {
+  let weights = make_quantizable_weights();
+  let src = write_src_dir("q_group_size_zero_src", &weights, PLAIN_CONFIG_JSON);
+  let dst = temp_dir("q_group_size_zero_dst");
+  fs::remove_dir_all(&dst).unwrap();
+
+  // q_group_size = Some(0) — python-falsy; convert MUST fall back to
+  // the affine default (64). The weights are sized for 64-element
+  // groups (last axis = 64) so the quantize step succeeds.
+  convert::convert(ConvertArgs {
+    hf_path: src,
+    mlx_path: dst.clone(),
+    quantize: true,
+    q_bits: Some(4),
+    q_group_size: Some(0),
+    q_mode: QuantMode::Affine,
+    ..Default::default()
+  })
+  .unwrap();
+
+  let reloaded = load::load_weights(&dst).unwrap();
+  // If `Some(0)` had survived, `quantize_weights`'s shape gate would
+  // have skipped every layer → no `.scales` emitted → the assertion
+  // below would fire.
+  assert!(
+    reloaded.contains_key("layer.scales"),
+    "Some(0) group_size fell back to default 64 → quantization actually ran"
+  );
+  assert!(
+    reloaded.contains_key("layer.biases"),
+    "Some(0) group_size fell back to default 64 → biases emitted"
+  );
+
+  // The saved config carries group_size = 64 (NOT 0).
+  let cfg_text = fs::read_to_string(dst.join("config.json")).unwrap();
+  let cfg: serde_json::Value = serde_json::from_str(&cfg_text).unwrap();
+  let q = cfg.get("quantization").unwrap();
+  assert_eq!(
+    q.get("group_size").and_then(|v| v.as_i64()),
+    Some(64),
+    "config.quantization.group_size is the fallback default, not 0"
+  );
+}
+
+#[test]
+fn convert_q_bits_zero_falls_back_to_default() {
+  let weights = make_quantizable_weights();
+  let src = write_src_dir("q_bits_zero_src", &weights, PLAIN_CONFIG_JSON);
+  let dst = temp_dir("q_bits_zero_dst");
+  fs::remove_dir_all(&dst).unwrap();
+
+  // q_bits = Some(0) — python-falsy; convert MUST fall back to the
+  // affine default (4).
+  convert::convert(ConvertArgs {
+    hf_path: src,
+    mlx_path: dst.clone(),
+    quantize: true,
+    q_bits: Some(0),
+    q_group_size: Some(64),
+    q_mode: QuantMode::Affine,
+    ..Default::default()
+  })
+  .unwrap();
+
+  let reloaded = load::load_weights(&dst).unwrap();
+  assert!(
+    reloaded.contains_key("layer.scales"),
+    "Some(0) bits fell back to default 4 → quantization ran"
+  );
+  // The saved config carries bits = 4 (NOT 0).
+  let cfg_text = fs::read_to_string(dst.join("config.json")).unwrap();
+  let cfg: serde_json::Value = serde_json::from_str(&cfg_text).unwrap();
+  let q = cfg.get("quantization").unwrap();
+  assert_eq!(
+    q.get("bits").and_then(|v| v.as_i64()),
+    Some(4),
+    "config.quantization.bits is the fallback default, not 0"
+  );
+}
+
+// ──────────────────────── Finding 3 — predicate called once per layer ────────────────────────
+
+/// F7 R1 Finding 3 — the user-supplied `MixedQuantPredicate` MUST be
+/// called exactly ONCE per structurally-eligible layer across the full
+/// convert pipeline. The reference's `nn.quantize` invokes
+/// `wrapped_predicate` exactly once per module (`utils.py:837-843`),
+/// and its single return value flows BOTH into `quantized_config`
+/// (`utils.py:831-834`) AND back to `nn.quantize`'s decision — a
+/// stateful predicate is therefore consistent across both views.
+///
+/// The previous mlxrs shape evaluated the predicate twice (once in
+/// `build_quantize_config`, again in the `eligible` closure of
+/// `convert`), so a stateful or non-deterministic predicate could write
+/// one decision into the saved config and apply a different one to the
+/// weights. This test asserts max-count <= 1 per path across the full
+/// convert pipeline.
+#[test]
+fn convert_stateful_predicate_called_exactly_once_per_eligible_layer() {
+  use std::{cell::RefCell, rc::Rc};
+
+  // Predicate that records every call site (path → count).
+  // `Rc` not `Arc`: `MixedQuantPredicate` is `!Send` / `!Sync` (per
+  // the trait's doc-comment), so single-threaded ref-counting is the
+  // right shape (clippy's `arc_with_non_send_sync` would reject `Arc`).
+  struct CountingPredicate {
+    counts: Rc<RefCell<HashMap<String, u32>>>,
+  }
+  impl MixedQuantPredicate for CountingPredicate {
+    fn decide(&self, layer_name: &str, _weight: &Array) -> Option<Quantization> {
+      *self
+        .counts
+        .borrow_mut()
+        .entry(layer_name.to_string())
+        .or_insert(0) += 1;
+      // Returning `Some(_)` is more strenuous than `None` — it forces
+      // BOTH the config-builder write arm and the `eligible` closure
+      // accept arm to fire (i.e. both downstream consumers that
+      // previously re-invoked the predicate).
+      Some(Quantization::affine(64, 4))
+    }
+  }
+
+  // Build a synthetic model with multiple structurally-eligible
+  // layers (rank 2, last axis = 64). All paths should be quantized.
+  let mut weights: HashMap<String, Array> = HashMap::new();
+  let blob: Vec<f32> = (0..128).map(|i| (i as f32) * 0.01).collect();
+  let eligible_paths = [
+    "model.layers.0.self_attn.q_proj",
+    "model.layers.0.self_attn.k_proj",
+    "model.layers.0.self_attn.v_proj",
+    "model.layers.0.mlp.down_proj",
+  ];
+  for path in eligible_paths {
+    weights.insert(format!("{path}.weight"), f32_array(&blob, (2, 64)));
+  }
+  let src = write_src_dir("predicate_once_src", &weights, PLAIN_CONFIG_JSON);
+  let dst = temp_dir("predicate_once_dst");
+  fs::remove_dir_all(&dst).unwrap();
+
+  let counts = Rc::new(RefCell::new(HashMap::<String, u32>::new()));
+  let pred = CountingPredicate {
+    counts: Rc::clone(&counts),
+  };
+
+  convert::convert(ConvertArgs {
+    hf_path: src,
+    mlx_path: dst.clone(),
+    quantize: true,
+    q_bits: Some(4),
+    q_group_size: Some(64),
+    q_mode: QuantMode::Affine,
+    quant_predicate: Some(Box::new(pred)),
+    ..Default::default()
+  })
+  .unwrap();
+
+  // Read back the per-path counts. The key assertion: max count across
+  // all eligible layers is <= 1.
+  let counts_ro = counts.borrow();
+  assert!(
+    !counts_ro.is_empty(),
+    "the predicate was invoked at all (sanity)"
+  );
+  let max = counts_ro.values().copied().max().unwrap_or(0);
+  assert!(
+    max <= 1,
+    "predicate must be invoked at most once per eligible layer; max count was {max}; counts={:?}",
+    *counts_ro,
+  );
+  // And each eligible path was visited exactly once (== 1, not 0).
+  for path in eligible_paths {
+    assert_eq!(
+      counts_ro.get(path).copied(),
+      Some(1),
+      "{path} visited exactly once"
+    );
+  }
+
+  // Sanity: the weights actually quantized (so we know we drove the
+  // "predicate's decision flows to the quantizer" path, not just the
+  // "predicate skipped everything" no-op).
+  let reloaded = load::load_weights(&dst).unwrap();
+  for path in eligible_paths {
+    assert!(
+      reloaded.contains_key(&format!("{path}.scales")),
+      "{path} got quantized"
+    );
+  }
+}

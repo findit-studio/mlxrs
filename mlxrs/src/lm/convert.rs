@@ -142,11 +142,29 @@ pub struct ConvertArgs {
   /// `dtype` (`convert.py:92`). Override the loaded weights' floating
   /// dtype. `None` falls back to `config.json` `torch_dtype` then
   /// `text_config.dtype` (`convert.py:129-132`); a still-`None` dtype is a
-  /// no-op (weights are written in their loaded dtype). Only the three
-  /// values in `MODEL_CONVERSION_DTYPES` (`convert.py:82`) are honored:
-  /// [`Dtype::F16`] / [`Dtype::BF16`] / [`Dtype::F32`]. Any other
-  /// `Some(_)` is accepted (no-op pass-through, matching python's silent
-  /// `if dtype in MODEL_CONVERSION_DTYPES` gate at `convert.py:133`).
+  /// no-op (weights are written in their loaded dtype).
+  ///
+  /// **Supported set.** Only the three values in
+  /// `MODEL_CONVERSION_DTYPES` (`convert.py:82`) are honored:
+  /// [`Dtype::F16`] / [`Dtype::BF16`] / [`Dtype::F32`]. An explicit
+  /// `Some(_)` outside that set ([`Dtype::I32`] / [`Dtype::F64`] /
+  /// [`Dtype::Bool`] / [`Dtype::Complex64`] / any other integer /
+  /// boolean variant) is an [`Error::Backend`] at [`convert`]-call time
+  /// — matching the reference's silent `if dtype in MODEL_CONVERSION_DTYPES`
+  /// gate (`convert.py:133`), where any other parsed string falls
+  /// through to "no cast" and never casts weights into an unsupported
+  /// type. The Rust port surfaces this as a hard error so a caller
+  /// passing e.g. [`Dtype::I32`] cannot silently destroy every floating
+  /// weight by casting it to a non-floating dtype (the python `or`-arm
+  /// fallback chain at `convert.py:129-132` is string-typed and silently
+  /// `None` for any unknown spelling; an explicit `mx.<dtype>` enum
+  /// value at the python call site would similarly slip past the gate
+  /// — mlxrs forecloses the foot-gun).
+  ///
+  /// `None` (the default) parses the config's `torch_dtype` /
+  /// `text_config.dtype` strings exactly per the reference; unknown
+  /// strings are still a silent no-cast (the `if dtype in
+  /// MODEL_CONVERSION_DTYPES` gate, faithfully ported).
   pub dtype: Option<Dtype>,
 
   /// `upload_repo` (`convert.py:93`). HuggingFace Hub destination repo.
@@ -590,7 +608,7 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
   // `getattr(...,  lambda _: True)`); we have no nn.Module to consult
   // for an architecture-specific override, so the always-true default is
   // the only branch (mirroring the python default arm exactly).
-  let resolved_dtype = resolve_target_dtype(dtype, &config_json_text);
+  let resolved_dtype = resolve_target_dtype(dtype, &config_json_text)?;
   let weights = if let Some(d) = resolved_dtype {
     cast_floats_to_dtype(weights, d)?
   } else {
@@ -608,25 +626,54 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
     // `convert.py:149-158` — `quantize_model(model, config, q_group_size,
     //   q_bits, mode=q_mode, quant_predicate=quant_predicate)`.
     let (gs, bits) = defaults_for_mode(q_mode, q_group_size, q_bits);
-    let (cfg, cfg_json) = build_quantize_config(
-      &config_json_text,
-      gs,
-      bits,
-      q_mode,
-      quant_predicate.as_deref(),
-      &weights,
-    )?;
-    let eligible = |path: &str, weight: &Array| -> bool {
+
+    // F7 R1 Finding-3 closure: evaluate the predicate ONCE per
+    // structurally-eligible layer into a decision map BEFORE walking
+    // either the config builder OR the `quantize_weights` eligibility
+    // closure. The python reference's `wrapped_predicate` is called
+    // exactly once per module by `nn.quantize` (`utils.py:837-843`),
+    // and its single return value flows BOTH into `quantized_config`
+    // (`utils.py:831-834`) AND back to `nn.quantize`'s decision —
+    // a stateful predicate is therefore consistent across both views.
+    //
+    // The mlxrs port previously evaluated the predicate twice (once in
+    // `build_quantize_config`, again in the `eligible` closure), so a
+    // stateful / non-deterministic predicate could write one decision
+    // into the saved config and apply a different one to the weights.
+    // Caching the per-eligible-layer decision in a `HashMap` collapses
+    // both reads to the same source-of-truth, matching the reference's
+    // call-the-callable-once semantics.
+    let decisions = build_predicate_decisions(quant_predicate.as_deref(), &weights, gs);
+
+    let (cfg, cfg_json) =
+      build_quantize_config(&config_json_text, gs, bits, q_mode, &decisions, &weights)?;
+    let eligible = |path: &str, _weight: &Array| -> bool {
       // The "structural analogue of mlx-lm's `hasattr(module,
-      // 'to_quantized')`" predicate, deferring to the user-supplied
-      // [`MixedQuantPredicate`] when one is set so a `None` decision
-      // from it (the python `False` arm of `wrapped_predicate`,
-      // `utils.py:823-835`) actually skips the layer at the
-      // `quantize_weights` call site.
-      if let Some(p) = quant_predicate.as_deref() {
-        return p.decide(path, weight).is_some();
+      // 'to_quantized')`" predicate. When a predicate is supplied, the
+      // pre-computed [`PredicateDecisions`] map is the single source of
+      // truth: `Some(Some(_))` ⇒ quantize, `Some(None)` ⇒ predicate
+      // explicitly skipped, `None` ⇒ layer never reached the predicate
+      // (structurally ineligible — same arms `build_predicate_decisions`
+      // filtered out, so `quantize_weights`'s downstream shape gate
+      // would skip too). The match collapses to "do we have a Some
+      // decision for this path?".
+      //
+      // No user predicate? Then every layer that passes the downstream
+      // shape gates is eligible (the python `quant_predicate=None` arm
+      // of `wrapped_predicate` defaults `bool_or_params=True`,
+      // `utils.py:828`).
+      match (quant_predicate.is_some(), decisions.get(path)) {
+        // Predicate supplied + a `Some(q)` decision on file → quantize.
+        (true, Some(Some(_))) => true,
+        // Predicate supplied + an explicit `None` skip on file → skip.
+        (true, Some(None)) => false,
+        // Predicate supplied + this path never reached the predicate
+        // (structurally ineligible). Fall through to the downstream
+        // shape gate (which will skip too) by returning false here.
+        (true, None) => false,
+        // No predicate at all → every eligible layer goes through.
+        (false, _) => true,
       }
-      true
     };
     let w = quant::quantize_weights(weights, &cfg, &eligible)?;
     (w, cfg_json, cfg)
@@ -660,14 +707,49 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
   // ported — the tokenizer surface is load-only) or the source-`*.py` /
   // `generation_config.json` copy: those are this F7 driver's
   // `copy_tokenizer_and_extras` step below.
-  load::save(&mlx_path, &out_weights, &out_config_json, &per_layer_cfg)?;
+  //
+  // F7 R1 Finding-4: a [`Error::DurabilityWarning`] with `committed:
+  // true` from [`load::save`] is NOT a hard failure — the weights +
+  // index + config are already visible on disk (only the post-rename
+  // parent-directory `fsync` returned an error). A plain `?` early-
+  // return would skip the tokenizer copy, leaving a destination that
+  // PASSES the [`mlx_path.exists()`] gate of any future
+  // [`convert`] retry while MISSING tokenizer files — a non-fatal
+  // durability warning would become a partial, hard-to-recover
+  // conversion. Match the warning explicitly: stash the underlying
+  // error, continue with the tokenizer / extras copy (so the on-disk
+  // dir is COMPLETE), then re-raise the warning to the caller.
+  let committed_warning: Option<std::io::Error> =
+    match load::save(&mlx_path, &out_weights, &out_config_json, &per_layer_cfg) {
+      Ok(()) => None,
+      Err(Error::DurabilityWarning {
+        committed: true,
+        source,
+      }) => Some(source),
+      Err(other) => return Err(other),
+    };
 
   // ─── 6. Copy tokenizer + extras (the deliberately-deferred portion
   //         of `utils.save`, `utils.py:944-948`) ───
+  //
+  // Runs unconditionally on a committed save — including the committed-
+  // durability-warning branch — so the destination dir is fully
+  // populated before we propagate the warning to the caller.
   copy_tokenizer_and_extras(&hf_path, &mlx_path)?;
 
   // ─── 7. (Hub upload — `convert.py:174-175`) — REJECTED at step 1. ───
 
+  // Re-surface any committed-DurabilityWarning AFTER the tokenizer /
+  // extras copy ran (step 6). The on-disk dir is logically complete;
+  // the caller's contract on `Err(DurabilityWarning { committed: true,
+  // .. })` is "the save IS visible but the parent-dir fsync didn't
+  // return success" — same shape [`load::save`] surfaces.
+  if let Some(source) = committed_warning {
+    return Err(Error::DurabilityWarning {
+      committed: true,
+      source,
+    });
+  }
   Ok(())
 }
 
@@ -675,6 +757,21 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
 
 /// `defaults_for_mode` (`utils.py:800-808`) — per-mode `(group_size,
 /// bits)` fallbacks when the kwarg is `None`. mlx-lm's hard-coded table.
+///
+/// **Zero is falsy** (`utils.py:808`): python evaluates `group_size or
+/// default_group_size, bits or default_bits` — `0` triggers the `or`-arm
+/// fallback because it's falsy. The Rust port mirrors that: `Some(0)`
+/// MUST fall back to the per-mode default, not survive as `0`. A
+/// surviving `0` would skip every layer at the `last % group_size == 0`
+/// gate (`quantize_weights` would write dense weights against an invalid
+/// `group_size: 0` quantization block on disk — see F7 R1 Finding-2).
+///
+/// We mirror with `Option::filter(|&v| v > 0).unwrap_or(default)` —
+/// faithful one-line transcription of `value or default` for the
+/// positive-integer arithmetic the table demands. Negative values would
+/// also be invalid (mlx's `quantize` asserts positive `group_size` /
+/// `bits`); the filter rejects those too so a `Some(-1)` doesn't
+/// pretend the caller actually wanted `-1`.
 fn defaults_for_mode(mode: QuantMode, gs: Option<i32>, bits: Option<i32>) -> (i32, i32) {
   let (default_gs, default_bits) = match mode {
     QuantMode::Affine => (64, 4),
@@ -682,12 +779,18 @@ fn defaults_for_mode(mode: QuantMode, gs: Option<i32>, bits: Option<i32>) -> (i3
     QuantMode::Nvfp4 => (16, 4),
     QuantMode::Mxfp8 => (32, 8),
   };
-  (gs.unwrap_or(default_gs), bits.unwrap_or(default_bits))
+  // `Some(v).filter(|&v| v > 0)` is the Rust transcription of python's
+  // `v or default` truthiness (where `0`/`-1` are falsy for positive
+  // integer arithmetic) — see fn-doc.
+  (
+    gs.filter(|&v| v > 0).unwrap_or(default_gs),
+    bits.filter(|&v| v > 0).unwrap_or(default_bits),
+  )
 }
 
 /// Resolve the target floating dtype the cast step should use, mirroring
 /// the python fallback chain at `convert.py:129-133`:
-///   1. explicit kwarg (`Some(d)` returned as-is)
+///   1. explicit kwarg (`Some(d)` — gated to the supported set)
 ///   2. `config.json` `torch_dtype` (string)
 ///   3. `config.json` `text_config.dtype` (string; the VLM-config
 ///      fallback)
@@ -696,30 +799,49 @@ fn defaults_for_mode(mode: QuantMode, gs: Option<i32>, bits: Option<i32>) -> (i3
 /// Only the three [`MODEL_CONVERSION_DTYPES`] (`convert.py:82`) are
 /// honored — any other parsed string falls through to `None` (no cast),
 /// matching python's silent `if dtype in MODEL_CONVERSION_DTYPES` gate.
-fn resolve_target_dtype(explicit: Option<Dtype>, config_json: &str) -> Option<Dtype> {
+///
+/// **Explicit-kwarg gate** (this fn's `explicit` arg): the reference's
+/// gate is string-typed and silently falls through to "no cast" for any
+/// unknown spelling. mlxrs's [`Dtype`] is an enum that includes integer /
+/// boolean / complex variants that the reference's `if dtype in
+/// MODEL_CONVERSION_DTYPES` gate would silently drop — a caller passing
+/// e.g. [`Dtype::I32`] would NEVER cast in python but WOULD destroy
+/// every floating weight in Rust. The port forecloses the foot-gun by
+/// surfacing an [`Error::Backend`] for any explicit `Some(d)` outside
+/// the supported set, matching the reference's effective semantics (no
+/// unsupported cast) while telling the caller why.
+fn resolve_target_dtype(explicit: Option<Dtype>, config_json: &str) -> Result<Option<Dtype>> {
   if let Some(d) = explicit {
-    // The python `if dtype in MODEL_CONVERSION_DTYPES` gate
-    // (`convert.py:133`) implicitly accepts any explicit `mx.*` dtype
-    // the user passes too — mlxrs's `Dtype` enum is already a fixed
-    // set; pass it through.
-    return Some(d);
+    // Gate the explicit override to the same set the reference resolves
+    // via `getattr(mx, dtype)` from `MODEL_CONVERSION_DTYPES`
+    // (`convert.py:82`, `convert.py:133-135`). Anything else is a hard
+    // error — see the [`ConvertArgs::dtype`] field-doc for the why.
+    return match d {
+      Dtype::F16 | Dtype::BF16 | Dtype::F32 => Ok(Some(d)),
+      other => Err(Error::Backend {
+        message: format!(
+          "convert: `dtype` must be one of float16, bfloat16, float32 — got {other:?}; \
+           matches mlx_lm/convert.py:82 supported set (MODEL_CONVERSION_DTYPES)"
+        ),
+      }),
+    };
   }
   let parsed: serde_json::Value = match serde_json::from_str(config_json) {
     Ok(v) => v,
-    Err(_) => return None, // config parsed once already; this path is unreachable in practice
+    Err(_) => return Ok(None), // config parsed once already; this path is unreachable in practice
   };
   if let Some(s) = parsed.get("torch_dtype").and_then(|v| v.as_str())
     && let Some(d) = parse_conversion_dtype(s)
   {
-    return Some(d);
+    return Ok(Some(d));
   }
   if let Some(text_cfg) = parsed.get("text_config")
     && let Some(s) = text_cfg.get("dtype").and_then(|v| v.as_str())
     && let Some(d) = parse_conversion_dtype(s)
   {
-    return Some(d);
+    return Ok(Some(d));
   }
-  None
+  Ok(None)
 }
 
 /// `MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]`
@@ -761,6 +883,83 @@ fn cast_floats_to_dtype(weights: Weights, target: Dtype) -> Result<Weights> {
   Ok(out)
 }
 
+/// Per-eligible-layer cached predicate decision — the F7 R1 Finding-3
+/// "evaluate the predicate exactly once per layer" data structure.
+///
+/// A path appears in the map iff it cleared the python `wrapped_predicate`'s
+/// structural gates (`hasattr(module, 'to_quantized')` + last-axis-divisible-
+/// by-group-size, `utils.py:824-827`). The value records the predicate's
+/// single return — `Some(Quantization)` ⇒ python's dict-arm
+/// (`utils.py:831-832`); `None` ⇒ python's `False` arm
+/// (`utils.py:823-835` falls through to `return False`).
+///
+/// Both `build_quantize_config` (the saved-config writer) and the
+/// `eligible` closure (the runtime weights-quantization gate) read from
+/// this map. The predicate itself is invoked ONCE per path inside
+/// [`build_predicate_decisions`]; downstream call sites never re-invoke
+/// it. This mirrors python's `nn.quantize` calling `wrapped_predicate`
+/// exactly once per module (`utils.py:837-843`) — a stateful or
+/// non-deterministic predicate yields one consistent decision per
+/// layer.
+type PredicateDecisions = HashMap<String, Option<Quantization>>;
+
+/// Walk `weights`, run the structural eligibility gate
+/// (`utils.py:824-827`) per layer, and call the predicate exactly once
+/// for each surviving path. The returned map keys the eligible paths
+/// onto the predicate's single decision. F7 R1 Finding-3.
+///
+/// When `predicate` is `None`, the returned map is empty — the
+/// downstream `eligible` closure short-circuits to "every layer is
+/// eligible" in that case (matching the python `quant_predicate=None`
+/// arm's `bool_or_params = True` default at `utils.py:828`).
+///
+/// `group_size <= 0` is a defensive guard — `defaults_for_mode` now
+/// clamps `Some(0)` to the mode default (F7 R1 Finding-2), so a 0 here
+/// would mean the global default itself is 0 (which the config
+/// builder's `if last % (group_size as usize) != 0` guard would catch
+/// anyway). We early-return an empty map in that case so the divisor
+/// is never used and the python `if module.weight.shape[-1] %
+/// group_size != 0` arm's behavior (skip everything) is preserved.
+fn build_predicate_decisions(
+  predicate: Option<&dyn MixedQuantPredicate>,
+  weights: &Weights,
+  group_size: i32,
+) -> PredicateDecisions {
+  let mut decisions: PredicateDecisions = HashMap::new();
+  let Some(pred) = predicate else {
+    return decisions;
+  };
+  if group_size <= 0 {
+    return decisions;
+  }
+  let gs_usize = group_size as usize;
+  for (key, arr) in weights {
+    let Some(path) = key.strip_suffix(".weight") else {
+      continue;
+    };
+    // mlx-lm `class_predicate` only fires for layers that pass the
+    // structural shape gate (`weight.shape[-1] % group_size == 0`,
+    // `utils.py:826-827`). Mirror so a predicate returning `Some(q)`
+    // for an ineligible layer doesn't end up in the saved config (and
+    // is never asked about — matching `nn.quantize`'s single-call
+    // semantics).
+    let shape = arr.shape();
+    if shape.len() < 2 {
+      continue;
+    }
+    let last = *shape.last().expect("rank>=2");
+    if last % gs_usize != 0 {
+      continue;
+    }
+    // The single predicate invocation per eligible layer. Cached into
+    // the decision map for both downstream consumers (config builder
+    // + `eligible` closure) — neither re-invokes the predicate.
+    let decision = pred.decide(path, arr);
+    decisions.insert(path.to_string(), decision);
+  }
+  decisions
+}
+
 /// Build the [`PerLayerQuantization`] config the quantization pass will
 /// honor + emit the saved `config.json` text with the right
 /// `"quantization"` block in place. Mirrors `quantize_model`'s config
@@ -779,12 +978,20 @@ fn cast_floats_to_dtype(weights: Weights, target: Dtype) -> Result<Weights> {
 /// — F6's `save_config` already does that mirror at write-time, so the
 /// returned config text carries only the `quantization` key (the mirror
 /// happens inside `save_config`).
+///
+/// **Predicate decisions are pre-computed.** The `decisions` arg is the
+/// F7 R1 Finding-3 single-evaluation map (see
+/// [`build_predicate_decisions`]); the builder NEVER re-invokes the
+/// predicate. An empty map means "no user predicate / nothing eligible
+/// for an override" — the global block alone is written. The `weights`
+/// arg is still threaded through for the bookkeeping pass that iterates
+/// `.weight`-keys; it does NOT trigger any predicate call.
 fn build_quantize_config(
   config_json: &str,
   group_size: i32,
   bits: i32,
   mode: QuantMode,
-  predicate: Option<&dyn MixedQuantPredicate>,
+  decisions: &PredicateDecisions,
   weights: &Weights,
 ) -> Result<(PerLayerQuantization, String)> {
   let value: serde_json::Value = serde_json::from_str(config_json).map_err(|e| Error::Backend {
@@ -802,7 +1009,7 @@ fn build_quantize_config(
   // Build the live [`PerLayerQuantization`] the `quantize_weights` call
   // will read for per-layer (and global) params. The global default is
   // always the call's (group_size, bits, mode); per-layer overrides
-  // come from the predicate.
+  // come from the pre-computed predicate decision map.
   let global = Quantization {
     group_size,
     bits,
@@ -810,32 +1017,29 @@ fn build_quantize_config(
   };
   let mut per_layer_overrides: HashMap<String, QuantizationOption> = HashMap::new();
 
-  // Walk every `.weight`-bearing weight key; for each, ask the predicate
-  // what to do. The python `wrapped_predicate(path, module)` runs at
+  // Walk every `.weight`-bearing weight key; for each, read the cached
+  // decision. The python `wrapped_predicate(path, module)` runs at
   // `nn.quantize(...)` time over every Linear/Embedding/SwitchLinear
-  // module; we walk the weight MAP keys to get the same shape (path,
-  // weight). The predicate's decision flows two ways: into the runtime
-  // `per_layer` overrides (so `quantize_weights` sees them), and into
-  // the saved config block (so a later load can reconstruct the
-  // per-layer layout, mirroring `utils.py:832-834`).
-  if let Some(pred) = predicate {
-    for (key, arr) in weights {
+  // module ONCE; we cached that single return in `decisions`. The
+  // decision's two arms (`Some(q)` / `None`) map directly onto the
+  // python dict-arm and `False`-arm of `wrapped_predicate`. We also
+  // need to walk `weights` here (not just iterate `decisions`) so the
+  // ineligible-but-fine-grained "use defaults under this path" arm
+  // (`utils.py:833-834`) can fire — though in the current shape
+  // `decisions` only contains the eligible set, so the iteration
+  // remains a faithful one-pass.
+  if !decisions.is_empty() {
+    for key in weights.keys() {
       let Some(path) = key.strip_suffix(".weight") else {
         continue;
       };
-      // mlx-lm `class_predicate` only fires for layers that pass the
-      // structural shape gate (`weight.shape[-1] % group_size == 0`,
-      // `utils.py:826-827`). Mirror so a predicate returning `Some(q)`
-      // for an ineligible layer doesn't end up in the saved config.
-      let shape = arr.shape();
-      if shape.len() < 2 {
+      // Look up the cached decision. `None` here means the layer never
+      // passed the structural gate inside `build_predicate_decisions`
+      // (or no predicate was supplied) — nothing to write.
+      let Some(decision) = decisions.get(path) else {
         continue;
-      }
-      let last = *shape.last().expect("rank>=2");
-      if group_size <= 0 || last % (group_size as usize) != 0 {
-        continue;
-      }
-      match pred.decide(path, arr) {
+      };
+      match decision {
         Some(q) => {
           // The python `wrapped_predicate`'s dict-arm
           // (`utils.py:831-832`) writes the per-layer dict; the
@@ -846,8 +1050,8 @@ fn build_quantize_config(
           // case we only emit an override when fine_grained (matching
           // python's `elif fine_grained_config and bool_or_params:
           // ...`).
-          if q != global || fine_grained {
-            per_layer_overrides.insert(path.to_string(), QuantizationOption::Quantize(q));
+          if *q != global || fine_grained {
+            per_layer_overrides.insert(path.to_string(), QuantizationOption::Quantize(*q));
           }
         }
         None => {
@@ -1131,6 +1335,51 @@ mod unit {
     );
   }
 
+  /// Finding 2 (Codex F7 R1) — `Some(0)` is python-falsy and MUST fall
+  /// back to the per-mode default (`utils.py:808`: `group_size or
+  /// default_group_size, bits or default_bits`). A surviving `0` would
+  /// later make `quantize_weights` skip every layer at the
+  /// `last % group_size == 0` gate (and `0 % 0` is undefined) — yielding
+  /// dense weights on disk against an invalid `group_size: 0` block.
+  #[test]
+  fn defaults_for_mode_zero_group_size_is_falsy() {
+    assert_eq!(
+      defaults_for_mode(QuantMode::Affine, Some(0), None),
+      (64, 4),
+      "Some(0) group_size falls back to mode default"
+    );
+    assert_eq!(
+      defaults_for_mode(QuantMode::Mxfp4, Some(0), None),
+      (32, 4),
+      "Some(0) group_size falls back to mxfp4 default"
+    );
+  }
+
+  #[test]
+  fn defaults_for_mode_zero_bits_is_falsy() {
+    assert_eq!(
+      defaults_for_mode(QuantMode::Affine, None, Some(0)),
+      (64, 4),
+      "Some(0) bits falls back to mode default"
+    );
+    assert_eq!(
+      defaults_for_mode(QuantMode::Mxfp8, None, Some(0)),
+      (32, 8),
+      "Some(0) bits falls back to mxfp8 default"
+    );
+  }
+
+  #[test]
+  fn defaults_for_mode_negative_also_falls_back() {
+    // Defensive: a negative `group_size` / `bits` is invalid per mlx's
+    // `quantize` op anyway; the `filter(|&v| v > 0)` arm of the python-
+    // truthiness transcription rejects those too.
+    assert_eq!(
+      defaults_for_mode(QuantMode::Affine, Some(-1), Some(-2)),
+      (64, 4)
+    );
+  }
+
   #[test]
   fn parse_conversion_dtype_table_matches_convert_py_82() {
     assert_eq!(parse_conversion_dtype("float16"), Some(Dtype::F16));
@@ -1147,7 +1396,7 @@ mod unit {
   fn resolve_target_dtype_explicit_wins() {
     let cfg = r#"{"torch_dtype":"float32"}"#;
     assert_eq!(
-      resolve_target_dtype(Some(Dtype::BF16), cfg),
+      resolve_target_dtype(Some(Dtype::BF16), cfg).unwrap(),
       Some(Dtype::BF16)
     );
   }
@@ -1155,19 +1404,79 @@ mod unit {
   #[test]
   fn resolve_target_dtype_falls_back_to_torch_dtype() {
     let cfg = r#"{"torch_dtype":"bfloat16"}"#;
-    assert_eq!(resolve_target_dtype(None, cfg), Some(Dtype::BF16));
+    assert_eq!(resolve_target_dtype(None, cfg).unwrap(), Some(Dtype::BF16));
   }
 
   #[test]
   fn resolve_target_dtype_falls_back_to_text_config_dtype() {
     let cfg = r#"{"text_config":{"dtype":"float16"}}"#;
-    assert_eq!(resolve_target_dtype(None, cfg), Some(Dtype::F16));
+    assert_eq!(resolve_target_dtype(None, cfg).unwrap(), Some(Dtype::F16));
   }
 
   #[test]
   fn resolve_target_dtype_unknown_is_none() {
     let cfg = r#"{"torch_dtype":"float64"}"#;
-    assert_eq!(resolve_target_dtype(None, cfg), None);
+    assert_eq!(resolve_target_dtype(None, cfg).unwrap(), None);
+  }
+
+  /// Finding 1 (Codex F7 R1) — an explicit `Some(Dtype::I32)` (or any
+  /// non-floating dtype) is a hard `Error::Backend`, NOT a silent
+  /// "cast every float to int" wrecking-ball. The reference's
+  /// string-typed `if dtype in MODEL_CONVERSION_DTYPES` gate
+  /// (`convert.py:133`) silently drops unknown strings; the typed
+  /// `Dtype` enum could silently accept e.g. `Dtype::I32` and cast
+  /// every weight to int — the port forecloses that foot-gun.
+  #[test]
+  fn resolve_target_dtype_explicit_i32_is_error() {
+    let cfg = r#"{"torch_dtype":"float32"}"#;
+    match resolve_target_dtype(Some(Dtype::I32), cfg) {
+      Err(Error::Backend { message }) => {
+        assert!(
+          message.contains("float16")
+            && message.contains("bfloat16")
+            && message.contains("float32"),
+          "error names the supported set: {message}"
+        );
+        assert!(
+          message.contains("I32") || message.contains("got"),
+          "error names the rejected dtype: {message}"
+        );
+      }
+      other => panic!("expected Err(Backend), got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn resolve_target_dtype_explicit_f64_is_error() {
+    let cfg = r#"{}"#;
+    match resolve_target_dtype(Some(Dtype::F64), cfg) {
+      Err(Error::Backend { message }) => {
+        assert!(message.contains("float16"));
+      }
+      other => panic!("expected Err(Backend), got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn resolve_target_dtype_explicit_complex_is_error() {
+    let cfg = r#"{}"#;
+    match resolve_target_dtype(Some(Dtype::Complex64), cfg) {
+      Err(Error::Backend { message }) => {
+        assert!(message.contains("float16"));
+      }
+      other => panic!("expected Err(Backend), got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn resolve_target_dtype_explicit_bool_is_error() {
+    let cfg = r#"{}"#;
+    match resolve_target_dtype(Some(Dtype::Bool), cfg) {
+      Err(Error::Backend { message }) => {
+        assert!(message.contains("float16"));
+      }
+      other => panic!("expected Err(Backend), got {other:?}"),
+    }
   }
 
   #[test]
@@ -1186,5 +1495,276 @@ mod unit {
       parsed.get("model_type").and_then(|v| v.as_str()),
       Some("qwen3")
     );
+  }
+
+  // ─────────── Finding 3 — single-evaluation predicate ───────────
+
+  use std::cell::RefCell;
+
+  /// Test-only predicate that counts how many times `decide` was called
+  /// per layer path. Used by the F7 R1 Finding-3 closure test to assert
+  /// `nn.quantize`'s single-call-per-module semantics
+  /// (`utils.py:837-843`).
+  struct CountingPredicate {
+    /// `RefCell<HashMap>` because `MixedQuantPredicate::decide` is
+    /// `&self`; the trait is `!Send` so single-threaded interior
+    /// mutability is the right shape.
+    counts: RefCell<HashMap<String, u32>>,
+    /// `RefCell<u32>` cycle counter for the alternating decision
+    /// (used by the "non-deterministic predicate desyncs config from
+    /// weights" half of the test). Each call increments it; the
+    /// predicate returns `Some(_)` on odd cycles and `None` on even.
+    cycle: RefCell<u32>,
+  }
+
+  impl CountingPredicate {
+    fn new() -> Self {
+      Self {
+        counts: RefCell::new(HashMap::new()),
+        cycle: RefCell::new(0),
+      }
+    }
+
+    fn max_count(&self) -> u32 {
+      self.counts.borrow().values().copied().max().unwrap_or(0)
+    }
+
+    fn paths_seen(&self) -> Vec<String> {
+      let mut paths: Vec<String> = self.counts.borrow().keys().cloned().collect();
+      paths.sort();
+      paths
+    }
+  }
+
+  impl MixedQuantPredicate for CountingPredicate {
+    fn decide(&self, layer_name: &str, _weight: &Array) -> Option<Quantization> {
+      *self
+        .counts
+        .borrow_mut()
+        .entry(layer_name.to_string())
+        .or_insert(0) += 1;
+      // Bump cycle — used to make the predicate flip-flop. The
+      // Finding-3 desync (config-says-quantize, weights-say-skip)
+      // would manifest if the predicate were called twice and saw
+      // different cycle values.
+      *self.cycle.borrow_mut() += 1;
+      Some(Quantization {
+        group_size: 64,
+        bits: 4,
+        mode: QuantMode::Affine,
+      })
+    }
+  }
+
+  /// Finding 3 (Codex F7 R1) — `build_predicate_decisions` must call
+  /// the predicate exactly ONCE per structurally-eligible layer. The
+  /// previous shape evaluated the predicate twice (once in
+  /// `build_quantize_config`, again in the `eligible` closure of
+  /// `convert`); a stateful predicate could record one decision in the
+  /// saved config and apply a different one to weights. This test
+  /// counts invocations per path and asserts max <= 1, mirroring the
+  /// python `nn.quantize`'s single-call-per-module contract
+  /// (`utils.py:837-843`).
+  #[test]
+  fn build_predicate_decisions_calls_predicate_once_per_eligible_layer() {
+    let mut weights: Weights = HashMap::new();
+    // Three structurally-eligible layers (rank 2, last axis 64 ⇒
+    // last % 64 == 0).
+    for path in ["layer.a", "layer.b", "layer.c"] {
+      weights.insert(
+        format!("{path}.weight"),
+        Array::from_slice::<f32>(&[0.0_f32; 128], &(2usize, 64usize)).unwrap(),
+      );
+    }
+    // One structurally-INeligible layer (rank 1) — must NEVER reach
+    // the predicate (it fails the `shape.len() >= 2` gate).
+    weights.insert(
+      "layer.d.weight".to_string(),
+      Array::from_slice::<f32>(&[0.0_f32; 64], &(64usize,)).unwrap(),
+    );
+
+    let pred = CountingPredicate::new();
+    let decisions = build_predicate_decisions(Some(&pred), &weights, 64);
+
+    // Eligible layers each got exactly one call.
+    let counts = pred.counts.borrow();
+    assert_eq!(counts.len(), 3, "exactly the 3 eligible layers visited");
+    for path in ["layer.a", "layer.b", "layer.c"] {
+      assert_eq!(
+        counts.get(path).copied(),
+        Some(1),
+        "{path} called exactly once",
+      );
+    }
+    // The ineligible layer was never called.
+    assert!(
+      !counts.contains_key("layer.d"),
+      "structurally-ineligible layer never reaches the predicate"
+    );
+
+    // The decision map records each eligible layer with the predicate's
+    // single return.
+    assert_eq!(decisions.len(), 3, "decision map has 3 eligible entries");
+    for path in ["layer.a", "layer.b", "layer.c"] {
+      assert!(
+        matches!(decisions.get(path), Some(Some(_))),
+        "{path} decision recorded as Some(Some(_))",
+      );
+    }
+  }
+
+  /// Finding 3 followup — re-call after the map is built must NOT
+  /// re-invoke the predicate. The full convert pipeline runs the
+  /// predicate once (in `build_predicate_decisions`); both downstream
+  /// consumers (`build_quantize_config` + the `eligible` closure) read
+  /// from the cached map. This test models the pipeline by calling
+  /// `build_quantize_config` after `build_predicate_decisions` and
+  /// asserts the counter never moves past the single invocation.
+  #[test]
+  fn build_quantize_config_does_not_reinvoke_predicate() {
+    let mut weights: Weights = HashMap::new();
+    for path in ["layer.a", "layer.b"] {
+      weights.insert(
+        format!("{path}.weight"),
+        Array::from_slice::<f32>(&[0.0_f32; 128], &(2usize, 64usize)).unwrap(),
+      );
+    }
+
+    let pred = CountingPredicate::new();
+    let decisions = build_predicate_decisions(Some(&pred), &weights, 64);
+    // Snapshot the post-decisions counter for each path.
+    let after_decisions = pred.counts.borrow().clone();
+
+    // Now run the config builder.
+    let _ = build_quantize_config("{}", 64, 4, QuantMode::Affine, &decisions, &weights).unwrap();
+
+    // The counter MUST NOT have moved — `build_quantize_config` reads
+    // from `decisions`, never from the predicate.
+    assert_eq!(
+      *pred.counts.borrow(),
+      after_decisions,
+      "build_quantize_config must not re-invoke the predicate"
+    );
+    assert_eq!(pred.max_count(), 1, "every layer's count is still 1");
+    let paths = pred.paths_seen();
+    assert_eq!(paths, vec!["layer.a".to_string(), "layer.b".to_string()]);
+  }
+
+  // ─────────── Finding 4 — DurabilityWarning still copies tokenizer ───────────
+
+  /// Finding 4 (Codex F7 R1) — when `load::save` returns
+  /// [`Error::DurabilityWarning`] with `committed: true`, the weights +
+  /// config are visible on disk; `convert` MUST continue with the
+  /// tokenizer / extras copy (so the destination dir is COMPLETE)
+  /// before re-surfacing the warning. The previous shape used `?` on
+  /// the `load::save` call, which early-returned and SKIPPED the
+  /// `copy_tokenizer_and_extras` step — a non-fatal durability warning
+  /// became a partial, hard-to-recover conversion (the destination dir
+  /// existed so the `mlx_path.exists()` gate of a retry would reject
+  /// it, but tokenizer files were missing).
+  ///
+  /// This test:
+  ///   (a) arms the F6 `fsync_dir` fault injector to fire AFTER the
+  ///       shard fsync (skip=1, fires on the index-fsync) — driving
+  ///       `save` into the `CommittedWithDurabilityWarning` branch.
+  ///   (b) runs `convert` end-to-end through this driver.
+  ///   (c) asserts: the dst dir is COMPLETE (config + index + a
+  ///       tokenizer-extras file ARE present), AND convert's final
+  ///       return is `Err(DurabilityWarning { committed: true, .. })`.
+  #[test]
+  fn convert_durability_warning_still_copies_tokenizer_and_returns_warning() {
+    // Build a synthetic source dir with config + weights + a tokenizer
+    // file we can assert was copied.
+    let dir = std::env::temp_dir().join(format!("mlxrs_convert_durability_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let src = dir.join("src");
+    let dst = dir.join("dst");
+    std::fs::create_dir_all(&src).unwrap();
+
+    let plain_config = r#"{
+      "model_type":"qwen3","hidden_size":16,"num_hidden_layers":1,
+      "num_attention_heads":2,"num_key_value_heads":2,"head_dim":8,
+      "rope_theta":10000.0,"vocab_size":128,"tie_word_embeddings":false
+    }"#;
+    std::fs::write(src.join("config.json"), plain_config).unwrap();
+    let blob: Vec<f32> = (0..128).map(|i| (i as f32) * 0.01).collect();
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "layer.weight".to_string(),
+      Array::from_slice::<f32>(&blob, &(2usize, 64usize)).unwrap(),
+    );
+    crate::io::save_safetensors(&src.join("model.safetensors"), &weights).unwrap();
+
+    // Plant the tokenizer-extras files (we don't actually need a real
+    // tokenizer to load; convert's tokenizer-loading is independent of
+    // copy_tokenizer_and_extras's copy list, and we use a real
+    // tokenizer.json + tokenizer_config.json from the integration
+    // suite's fixtures so `load_tokenizer` succeeds).
+    let tokenizer_json = include_str!("../../tests/fixtures/tokenizer.json");
+    let tokenizer_config_json = include_str!("../../tests/fixtures/tokenizer_config.json");
+    std::fs::write(src.join("tokenizer.json"), tokenizer_json).unwrap();
+    std::fs::write(src.join("tokenizer_config.json"), tokenizer_config_json).unwrap();
+    // A "marker" extras file that the helper MUST copy.
+    std::fs::write(
+      src.join("special_tokens_map.json"),
+      br#"{"eos_token":"</s>"}"#,
+    )
+    .unwrap();
+    std::fs::write(src.join("generation_config.json"), br#"{"max_length":32}"#).unwrap();
+
+    // Arm the fault injector to fire on the index-fsync (skip=1: shard
+    // fsync passes, index fsync fails → save_model returns
+    // CommittedWithDurabilityWarning; save() surfaces a final
+    // Err(DurabilityWarning) AFTER committing the config too).
+    let _guard = crate::lm::load::arm_fsync_dir_fault(1);
+
+    let r = convert(ConvertArgs {
+      hf_path: src.clone(),
+      mlx_path: dst.clone(),
+      ..Default::default()
+    });
+    drop(_guard);
+
+    // (a) convert's final return is `Err(DurabilityWarning{committed:true})`.
+    match r {
+      Err(Error::DurabilityWarning { committed, source }) => {
+        assert!(
+          committed,
+          "convert's DurabilityWarning must carry committed=true"
+        );
+        assert!(
+          source.to_string().contains("injected fsync_dir failure"),
+          "underlying io::Error preserved: got {source}"
+        );
+      }
+      other => panic!("expected Err(DurabilityWarning), got {other:?}"),
+    }
+
+    // (b) The destination dir IS complete: weights + index + config +
+    // tokenizer files all present, byte-equal to source where
+    // applicable.
+    assert!(dst.join("config.json").is_file(), "config.json on disk");
+    assert!(
+      dst.join("model.safetensors.index.json").is_file(),
+      "index.json on disk"
+    );
+    for name in [
+      "tokenizer.json",
+      "tokenizer_config.json",
+      "special_tokens_map.json",
+      "generation_config.json",
+    ] {
+      assert!(
+        dst.join(name).is_file(),
+        "{name} copied despite the DurabilityWarning"
+      );
+      // Byte-equal to the source copy.
+      let a = std::fs::read(src.join(name)).unwrap();
+      let b = std::fs::read(dst.join(name)).unwrap();
+      assert_eq!(a, b, "{name} byte-equal at dst");
+    }
+
+    // Cleanup.
+    let _ = std::fs::remove_dir_all(&dir);
   }
 }

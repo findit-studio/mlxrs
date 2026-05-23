@@ -1677,14 +1677,18 @@ thread_local! {
 /// then make the next call fail. Returns a [`Drop`] guard that disarms
 /// the injector when it goes out of scope (so a test panic still leaves
 /// the thread in a clean state for the next test).
+///
+/// `pub(crate)` (test-only) so sibling modules' tests (e.g.
+/// [`crate::lm::convert`]'s F7 R1 Finding-4 closure) can drive the same
+/// post-commit durability path through the public [`save`] entrypoint.
 #[cfg(test)]
-fn arm_fsync_dir_fault(skip: usize) -> FsyncDirFaultGuard {
+pub(crate) fn arm_fsync_dir_fault(skip: usize) -> FsyncDirFaultGuard {
   FSYNC_DIR_FAULT_SKIP_THEN_FAIL.with(|c| c.set(Some(skip)));
   FsyncDirFaultGuard
 }
 
 #[cfg(test)]
-struct FsyncDirFaultGuard;
+pub(crate) struct FsyncDirFaultGuard;
 
 #[cfg(test)]
 impl Drop for FsyncDirFaultGuard {
