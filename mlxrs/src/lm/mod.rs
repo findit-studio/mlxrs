@@ -19,7 +19,11 @@
 //! `QLoRA` / `QDoRA` bases), `fuse`, `linear_to_lora_layers`, and
 //! `load_adapters` — the runtime surface that applies a pre-trained adapter
 //! (`adapter_config.json` + `adapters.safetensors`) to a base model's weight
-//! map (mlx-lm `tuner/{lora,dora,utils}.py`, swift `Adapters/LoRA/`).
+//! map (mlx-lm `tuner/{lora,dora,utils}.py`, swift `Adapters/LoRA/`); the
+//! [`crate::lm::fuse::fuse`] driver wires `load_adapters` + the per-layer
+//! [`fuse`](crate::lm::lora::LoraLayer::fuse) + the F6 save into a one-call
+//! "fold the adapter into the base model and write the result as a
+//! standalone checkpoint" pipeline (mlx-lm `fuse.py`).
 //!
 //! M3 also lands the stateful multi-turn chat
 //! [`session`](crate::lm::session) ([`ChatSession`] — the port of
@@ -33,6 +37,7 @@ pub mod cache;
 pub mod cache_prompt;
 pub mod convert;
 pub mod factory;
+pub mod fuse;
 pub mod generate;
 #[cfg(feature = "gguf")]
 #[cfg_attr(docsrs, doc(cfg(feature = "gguf")))]

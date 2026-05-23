@@ -3322,10 +3322,57 @@ pub fn load_adapters(
   quant: Option<&PerLayerQuantization>,
   num_blocks: i32,
 ) -> Result<LoraLayers> {
-  // 1) adapter_config.json (bounded read, untrusted-dir-safe).
+  // Single parse of `adapter_config.json` (bounded, untrusted-dir-safe) ⇒
+  // forward to the with-config variant. Callers that already hold a parsed
+  // [`LoraConfig`] (e.g. [`crate::lm::fuse::fuse`], which needs the PEFT
+  // `fan_in_fan_out` flag BEFORE walking the fused layers) should call
+  // [`load_adapters_with_config`] directly so the same on-disk file isn't
+  // parsed twice — two reads = two snapshots = a TOCTOU window where a
+  // hostile or just-flipped `adapter_config.json` could send the load side
+  // and the save side down divergent paths (a quantized + `fan_in_fan_out`
+  // flag flip would panic the debug-only `insert_base_linear` assertion;
+  // a square-target `fan_in_fan_out` flag flip would silently transpose
+  // the saved weight against the load-side decision).
   let config_text = read_bounded_adapter_config(dir)?;
   let config = LoraConfig::from_json(&config_text)?;
+  load_adapters_with_config(base_weights, dir, &config, quant, num_blocks)
+}
 
+/// Like [`load_adapters`] but takes a pre-parsed [`LoraConfig`] instead of
+/// reading + parsing `<dir>/adapter_config.json` internally. The on-disk
+/// adapter weights file is still located + loaded from `dir`, but the
+/// config is **not** re-read — eliminating a TOCTOU window for callers that
+/// also need the typed config for their own decisions (e.g.
+/// [`crate::lm::fuse::fuse`] needs the PEFT `fan_in_fan_out` flag BEFORE
+/// walking the fused layers).
+///
+/// All other arguments + errors + postconditions match [`load_adapters`]
+/// — the body of the two is structurally identical from "validate config"
+/// onward; [`load_adapters`] is a thin wrapper that parses once then forwards.
+///
+/// # Single-snapshot contract
+///
+/// The shared parsed config is the **single source of truth** for both the
+/// load side (transpose-on-read for PEFT `fan_in_fan_out`, build_base_linear's
+/// quantized-rejection) and the save side (re-transpose to persisted
+/// orientation, quant-arm debug-assert). A separate parse on the save side
+/// could observe a different snapshot (process raced the file replacement,
+/// or a hostile re-write) — that would either silently corrupt the saved
+/// weight orientation (square-target case: a load-canonical fused weight
+/// would be written without the matching transpose-back-to-persisted) or
+/// fire the debug-only `insert_base_linear` quantized-arm assertion in
+/// debug builds (the quantized + `fan_in_fan_out` combination is rejected
+/// at load time; a flag flip between parses would let the load side see
+/// `fan_in_fan_out: false` and proceed, while the save side sees
+/// `fan_in_fan_out: true` and trips the invariant). Callers must hold ONE
+/// parsed config across both reads.
+pub fn load_adapters_with_config(
+  base_weights: &Weights,
+  dir: &Path,
+  config: &LoraConfig,
+  quant: Option<&PerLayerQuantization>,
+  num_blocks: i32,
+) -> Result<LoraLayers> {
   // mlx-lm skips linear_to_lora_layers for "full" and loads a dense delta;
   // mlxrs has no module tree to merge a full fine-tune into here, so reject it
   // as unsupported (recoverable) — the per-usecase architecture merges a full
@@ -3353,7 +3400,7 @@ pub fn load_adapters(
   // HuggingFace PEFT names it `adapter_model.safetensors`. Pick by the config
   // shape, but fall back to whichever file is actually on disk (some exporters
   // pair a PEFT config with the mlx-lm filename, or vice versa).
-  let st_path = locate_adapter_safetensors(dir, &config)?;
+  let st_path = locate_adapter_safetensors(dir, config)?;
   // Stat the file FIRST (regular-file + size-budget) so an untrusted adapter
   // dir cannot point us at a FIFO/device (hang/opaque error) or an oversized
   // blob (OOM) — the safetensors path is otherwise handed straight to mlx-c,
@@ -3373,7 +3420,26 @@ pub fn load_adapters(
   let adapter_params = split_adapter_params(adapter_arrays, config.is_dora())?;
 
   // 3) Build + apply the LoRA/DoRA layers over the base weight map.
-  linear_to_lora_layers(base_weights, &config, &adapter_params, quant, num_blocks)
+  linear_to_lora_layers(base_weights, config, &adapter_params, quant, num_blocks)
+}
+
+/// Read + parse an adapter directory's `adapter_config.json` and return the
+/// typed [`LoraConfig`] — the same bounded read + serde parse
+/// [`load_adapters`] uses internally, exposed so callers that need only the
+/// config metadata (e.g. [`crate::lm::fuse::fuse`] needs the PEFT
+/// `fan_in_fan_out` flag to carry the persisted-orientation contract through
+/// fusion) don't have to load the full weight map + build the layer table
+/// first.
+///
+/// Same untrusted-dir safety discipline as [`load_adapters`]'s internal read:
+/// non-blocking open with `O_CLOEXEC`, regular-file check before any read,
+/// body capped at the crate-internal `MAX_CONFIG_BYTES` (1 MiB) via
+/// `Read::take`. A missing directory / file / non-regular target / oversized
+/// body / malformed JSON is a recoverable [`Error::Backend`] whose message
+/// names the offending path (twin of [`load_adapters`]'s error shape).
+pub fn read_adapter_config(dir: &Path) -> Result<LoraConfig> {
+  let config_text = read_bounded_adapter_config(dir)?;
+  LoraConfig::from_json(&config_text)
 }
 
 /// mlx-lm's adapter weights filename (`tuner/utils.py:137`
