@@ -69,7 +69,17 @@ impl ToolCall {
 /// also expose the `tool_call_start` / `tool_call_end` delimiters.
 pub trait ToolParser: Send + Sync {
   /// Parse one assistant tool-call payload into one or more [`ToolCall`]s.
-  fn parse(&self, text: &str, tools: Option<&Value>) -> Result<Vec<ToolCall>, Error>;
+  ///
+  /// **Default:** loops on [`try_parse_one_call`](Self::try_parse_one_call)
+  /// over `text` (re-feeding the trailing suffix until either `Ok(None)` —
+  /// no more complete calls — or `Err`), so a parser that implements
+  /// `try_parse_one_call` correctly gets `parse` for free. Parsers with
+  /// richer batch semantics (e.g. Mistral, whose `parse` consumes a payload
+  /// that the streaming layer never sees mid-stream because its end tag is
+  /// empty) override this directly.
+  fn parse(&self, text: &str, tools: Option<&Value>) -> Result<Vec<ToolCall>, Error> {
+    default_parse_via_try_parse_one_call(self, text, tools)
+  }
 
   /// The stable parser name (matches the Python module name).
   fn name(&self) -> &'static str;
@@ -87,54 +97,102 @@ pub trait ToolParser: Send + Sync {
     marker_end(self.name())
   }
 
-  /// Find the byte position in `buffer` at which `end_tag` correctly closes
-  /// **this parser's** payload syntax, given that the payload starts at
-  /// `buffer.find(start_tag) + start_tag.len()`. Returns `Some(idx)` if found
-  /// at a position that respects the parser's payload semantics (NOT a false
-  /// match inside a quoted string, a balanced JSON construct, an XML CDATA
-  /// region, an escape sequence, etc.). Returns `None` if not yet found
-  /// (buffer needs more bytes; the streaming caller will append the next
-  /// chunk and retry).
+  /// Attempt to parse ONE complete tagged tool-call section starting in
+  /// `buffer`. Returns `Ok(Some((calls, end_pos)))` when `buffer` contains a
+  /// complete section — `calls` are the [`ToolCall`]s extracted from that
+  /// section (one for singleton parsers; many for multi-block parsers like
+  /// `minimax_m2`, `kimi_k2`, `gemma4`) and `end_pos` is the byte position
+  /// one past the last byte the section consumed. Returns `Ok(None)` if
+  /// `buffer` is incomplete (the streaming caller appends the next chunk
+  /// and retries). Returns `Err` for an unrecoverable malformation.
   ///
-  /// Round-6 structural fix: end-tag detection is the parser's own
-  /// responsibility, not a central dispatcher's. Each parser owns the
-  /// payload-syntax knowledge needed to reject a false in-payload match
-  /// (Pythonic single/double-quoted strings, JSON object/array balancing,
-  /// XML body whose value can carry the end tag literal, `<escape>`-bracketed
-  /// gemma strings, etc.). The previous central `TaggedPayloadShape` dispatch
-  /// kept opening syntax gaps round-after-round because no central enum can
-  /// enumerate every parser's escaping rules; making the trait method the
-  /// ownership boundary closes the whole defect class structurally.
+  /// **Critical contract:** this method UNIFIES extraction and end-detection
+  /// — it must use EXACTLY the same find/rfind/iteration order as
+  /// [`parse`](Self::parse) over the same payload, so streaming and batch
+  /// results are identical for every input. The L9 R10 structural pivot:
+  /// each parser owns ONE method that performs both jobs in lock-step,
+  /// instead of a separate end-tag-scanner that drifts from `parse`
+  /// round-after-round (R7..R10 chased exactly that drift).
   ///
-  /// **Default:** plain substring search of `end_tag` against `buffer` from
-  /// the payload's start offset — safe ONLY when the parser's payload syntax
-  /// CANNOT contain the `end_tag` literal as bytes inside its data. If the
-  /// payload syntax allows quoted strings, balanced brackets, XML CDATA,
-  /// escape sequences, or any construct that can embed the end_tag literal,
-  /// the parser MUST override this.
-  fn find_end_tag_in_buffer(&self, buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
-    default_plain_end_tag_scan(buffer, start_tag, end_tag)
-  }
+  /// For multi-call parsers the streaming caller does NOT loop on per-inner-
+  /// block extraction here: `try_parse_one_call` peels off ONE TAGGED
+  /// SECTION (a single start-tag → end-tag pair) and returns every inner
+  /// block within that section. The processor then loops on the trailing
+  /// suffix (truncating to `[end_pos..]`) to consume back-to-back sections.
+  /// This avoids the awkward "wrapper start shared across calls" splitting
+  /// while still keeping the per-section unit identical to `parse`'s output.
+  fn try_parse_one_call(
+    &self,
+    buffer: &str,
+    tools: Option<&Value>,
+  ) -> Result<Option<(Vec<ToolCall>, usize)>, Error>;
 }
 
-/// Default plain-substring end-tag scan: locate `end_tag` strictly inside the
-/// payload region (after the first occurrence of `start_tag`). Shared by every
-/// parser whose override delegates to it after running its own payload-prefix
-/// scanner (e.g. balanced JSON object scan ⇒ look for `end_tag` after the
-/// `}`). Falls back to a buffer-wide search if (defensively) the start tag is
-/// missing, mirroring the original [`find_tagged_end_tag`] safety net.
-fn default_plain_end_tag_scan(buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
-  let payload_at = match buffer.find(start_tag) {
-    Some(idx) => idx + start_tag.len(),
-    None => return buffer.find(end_tag),
-  };
-  buffer[payload_at..]
-    .find(end_tag)
-    .map(|rel| payload_at + rel)
+/// Default `parse` implementation that loops on
+/// [`ToolParser::try_parse_one_call`] until exhaustion. Generic over the
+/// parser type. Used by every parser whose payload semantics map cleanly to
+/// per-section extraction (i.e. every parser except `Mistral`, whose end tag
+/// is empty and whose `parse` is only invoked at EOS over the whole buffer).
+fn default_parse_via_try_parse_one_call<P: ToolParser + ?Sized>(
+  parser: &P,
+  text: &str,
+  tools: Option<&Value>,
+) -> Result<Vec<ToolCall>, Error> {
+  let mut out = Vec::new();
+  let mut cursor = 0usize;
+  while cursor < text.len() {
+    match parser.try_parse_one_call(&text[cursor..], tools)? {
+      Some((calls, end_pos)) => {
+        if end_pos == 0 {
+          // Defensive: a zero-width advance would loop forever. Treat as
+          // "no progress" and stop, mirroring the streaming caller's
+          // `Ok(None)` keep-collecting behaviour at end-of-stream.
+          break;
+        }
+        out.extend(calls);
+        cursor += end_pos;
+      }
+      None => break,
+    }
+  }
+  Ok(out)
 }
 
 fn err(msg: impl Into<String>) -> Error {
   Error::tokenizer(msg.into())
+}
+
+/// Locate the first occurrence of `start_tag` in `buffer` and return
+/// `(payload_at, payload)` where `payload_at` is the byte offset just past
+/// the start tag and `payload = &buffer[payload_at..]`. Returns `None` if
+/// the start tag is empty or not present yet — the streaming caller treats
+/// the buffer as incomplete.
+fn locate_tagged_payload<'a>(buffer: &'a str, start_tag: &str) -> Option<(usize, &'a str)> {
+  if start_tag.is_empty() {
+    return None;
+  }
+  let start_at = buffer.find(start_tag)?;
+  let payload_at = start_at + start_tag.len();
+  Some((payload_at, &buffer[payload_at..]))
+}
+
+/// Trim a tagged section (`start_tag…end_tag`) down to its inner payload
+/// for delegation to a parser's `parse`. Mirrors [`strip_markers`] but takes
+/// the start/end tags directly so the streaming hot path doesn't re-borrow
+/// the parser. Whitespace is trimmed to match `parse`'s `.trim()` calls.
+fn strip_section_markers<'a>(section: &'a str, start_tag: &str, end_tag: &str) -> &'a str {
+  let mut text = section;
+  if !start_tag.is_empty()
+    && let Some(idx) = text.find(start_tag)
+  {
+    text = &text[idx + start_tag.len()..];
+  }
+  if !end_tag.is_empty()
+    && let Some(idx) = text.rfind(end_tag)
+  {
+    text = &text[..idx];
+  }
+  text.trim()
 }
 
 /// Approximates Python `ast.literal_eval` enough for tool-arg coercion:
@@ -245,14 +303,38 @@ impl ToolParser for JsonTools {
   fn name(&self) -> &'static str {
     "json_tools"
   }
-  fn find_end_tag_in_buffer(&self, buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
-    // `parse()` requires a top-level `{name, arguments}` object; a top-level
-    // array fails `v.get("name")`. Skip past the JSON object using a
-    // string-aware balanced scan, then plain-substring search for `end_tag`
-    // strictly AFTER the closing brace, so an in-string `</tool_call>` (or
-    // any other end-tag literal embedded inside a string value) inside the
-    // JSON object never cuts the buffer mid-payload.
-    json_object_then_end_tag(buffer, start_tag, end_tag)
+  /// Lock-step with [`Self::parse`] (lines ~243–253 above):
+  /// `parse` requires a top-level `{name, arguments}` JSON object. Skip past
+  /// that object using the string-aware `balanced_json_object_prefix` (the
+  /// SAME balancer the inline path uses), then accept `end_tag` strictly
+  /// AFTER the closing `}`. An in-string `</tool_call>` literal inside the
+  /// JSON object is safely *inside* the balanced span.
+  fn try_parse_one_call(
+    &self,
+    buffer: &str,
+    tools: Option<&Value>,
+  ) -> Result<Option<(Vec<ToolCall>, usize)>, Error> {
+    let start_tag = self.tool_call_start();
+    let end_tag = self.tool_call_end();
+    let Some((payload_at, payload)) = locate_tagged_payload(buffer, start_tag) else {
+      return Ok(None);
+    };
+    let Some((_, obj_end)) = balanced_json_object_prefix(payload) else {
+      return Ok(None);
+    };
+    let Some(rel) = payload[obj_end..].find(end_tag) else {
+      return Ok(None);
+    };
+    let end_pos = payload_at + rel + obj_end + end_tag.len();
+    let inner = strip_section_markers(&buffer[..end_pos], start_tag, end_tag);
+    match self.parse(inner, tools) {
+      Ok(calls) if !calls.is_empty() => Ok(Some((calls, end_pos))),
+      // `parse` rejected (e.g. top-level array fails the `name` lookup) — the
+      // section is structurally a tagged-call shape but contains no actual
+      // tool call. Advance past the section anyway so the processor doesn't
+      // loop, and surface zero calls.
+      _ => Ok(Some((Vec::new(), end_pos))),
+    }
   }
 }
 
@@ -277,15 +359,33 @@ impl ToolParser for Pythonic {
   fn name(&self) -> &'static str {
     "pythonic"
   }
-  fn find_end_tag_in_buffer(&self, buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
-    // Round-6 regression class: Pythonic payloads `[name(args)]` carry
-    // single-quoted (and double-quoted) string arguments which can embed the
-    // `<|tool_call_end|>` literal verbatim (`[echo(s='<|tool_call_end|>')]`).
-    // Plain substring would split at the in-string match, drop the call, and
-    // discard trailing display. Skip past the Pythonic call using a quote +
-    // bracket aware scan to find the `)]` that legitimately closes the call,
-    // then plain-substring for `end_tag` strictly after that.
-    pythonic_call_then_end_tag(buffer, start_tag, end_tag)
+  /// Lock-step with [`Self::parse`] (lines ~349–360 above):
+  /// `parse` looks for `[name(args)]` via `find_pythonic_call`. The
+  /// scanner finds the FIRST `[name(` then the matching `)]` (quote- and
+  /// bracket-aware so a `)]` inside `'...'` or `"..."` doesn't close the
+  /// call), then accepts `end_tag` strictly after the `)]`.
+  fn try_parse_one_call(
+    &self,
+    buffer: &str,
+    tools: Option<&Value>,
+  ) -> Result<Option<(Vec<ToolCall>, usize)>, Error> {
+    let start_tag = self.tool_call_start();
+    let end_tag = self.tool_call_end();
+    let Some((payload_at, payload)) = locate_tagged_payload(buffer, start_tag) else {
+      return Ok(None);
+    };
+    let Some(call_close_rel) = pythonic_call_close(payload) else {
+      return Ok(None);
+    };
+    let Some(end_rel) = payload[call_close_rel..].find(end_tag) else {
+      return Ok(None);
+    };
+    let end_pos = payload_at + call_close_rel + end_rel + end_tag.len();
+    let inner = strip_section_markers(&buffer[..end_pos], start_tag, end_tag);
+    match self.parse(inner, tools) {
+      Ok(calls) if !calls.is_empty() => Ok(Some((calls, end_pos))),
+      _ => Ok(Some((Vec::new(), end_pos))),
+    }
   }
 }
 
@@ -397,10 +497,42 @@ impl ToolParser for Mistral {
   fn name(&self) -> &'static str {
     "mistral"
   }
-  // No `find_end_tag_in_buffer` override: Mistral's `tool_call_end` is the
-  // empty string — the streaming processor handles the empty-end-tag case
-  // separately (call is closed at EOS, not in-stream) and never invokes the
-  // trait method here.
+  /// Lock-step with [`Self::parse`] (lines ~465–479 above):
+  /// `parse` looks for `[TOOL_CALLS]name[ARGS]{json}` and balances the
+  /// trailing JSON object. The streaming processor short-circuits this
+  /// parser because `tool_call_end` is empty (mistral is closed at EOS),
+  /// so `try_parse_one_call` is invoked only by `parse`'s default loop
+  /// over a complete payload and by audit/matches-parse tests. We mirror
+  /// `parse`'s scan: find `[ARGS]`, then the balanced `{json}`, then
+  /// report `end_pos = (one past the JSON object's `}`).
+  fn try_parse_one_call(
+    &self,
+    buffer: &str,
+    tools: Option<&Value>,
+  ) -> Result<Option<(Vec<ToolCall>, usize)>, Error> {
+    let start_tag = self.tool_call_start();
+    let Some((payload_at, payload)) = locate_tagged_payload(buffer, start_tag) else {
+      return Ok(None);
+    };
+    let Some(args_rel) = payload.find("[ARGS]") else {
+      return Ok(None);
+    };
+    let after_args = args_rel + "[ARGS]".len();
+    let Some((obj_start_in, obj_end_in)) = balanced_json_object_prefix(&payload[after_args..])
+    else {
+      return Ok(None);
+    };
+    // Absolute end_pos = (payload start) + (offset to `[ARGS]` + len) +
+    // (offset of `}`+1 within the post-[ARGS] slice).
+    let _ = obj_start_in;
+    let end_pos = payload_at + after_args + obj_end_in;
+    let inner = &buffer[..end_pos];
+    let inner = strip_section_markers(inner, start_tag, "");
+    match self.parse(inner, tools) {
+      Ok(calls) if !calls.is_empty() => Ok(Some((calls, end_pos))),
+      _ => Ok(Some((Vec::new(), end_pos))),
+    }
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -448,15 +580,51 @@ impl ToolParser for Qwen3Coder {
   fn name(&self) -> &'static str {
     "qwen3_coder"
   }
-  fn find_end_tag_in_buffer(&self, buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
-    // `qwen3_coder`'s end tag (`</tool_call>`) collides with parameter VALUES
-    // that may contain `</tool_call>` verbatim inside a
-    // `<parameter=p>VALUE</parameter>` body — e.g. a tool whose VALUE is the
-    // string `</tool_call>`. Scan past the parser's own `</function>` close
-    // (its `parse()` does `<function=...` then `.rfind("</function>")`) and
-    // search for `end_tag` strictly after it; if no `</function>` is in
-    // `buffer` yet keep collecting.
-    xml_function_then_end_tag(buffer, start_tag, end_tag)
+  /// Lock-step with [`Self::parse`] (lines ~496–529 above):
+  /// `parse` does `text.find("<function=")` then `after.rfind("</function>")`
+  /// — the **LAST** `</function>` in the section is the real close, because
+  /// parameter VALUES legitimately carry `</function>` (and `</tool_call>`)
+  /// literals (L9 R10 finding). For the streaming buffer we mirror that:
+  /// rfind the wrapper `end_tag` (the section's outermost close), then
+  /// rfind `</function>` strictly inside that span, then verify a
+  /// `<function=` opens before it. This keeps `try_parse_one_call`
+  /// byte-identical to what `parse` would extract from the buffer slice.
+  fn try_parse_one_call(
+    &self,
+    buffer: &str,
+    tools: Option<&Value>,
+  ) -> Result<Option<(Vec<ToolCall>, usize)>, Error> {
+    let start_tag = self.tool_call_start();
+    let end_tag = self.tool_call_end();
+    let Some((payload_at, payload)) = locate_tagged_payload(buffer, start_tag) else {
+      return Ok(None);
+    };
+    // The function block must open before the rfind chain can validate.
+    let Some(fn_open_rel) = payload.find("<function=") else {
+      return Ok(None);
+    };
+    // rfind the wrapper end_tag — the LAST `</tool_call>` in the buffer is
+    // the section close (R10: in-value `</tool_call>` literals appear
+    // EARLIER, so they cannot win an rfind race).
+    let Some(end_rel) = payload.rfind(end_tag) else {
+      return Ok(None);
+    };
+    if end_rel < fn_open_rel + "<function=".len() {
+      // The wrapper close precedes the function content — incomplete buffer.
+      return Ok(None);
+    }
+    // Within the slice up to the wrapper end, rfind `</function>` (R10's
+    // anchor — same rfind that `parse` uses on the section payload).
+    let span = &payload[..end_rel];
+    let Some(_fn_close_rel) = span.rfind("</function>") else {
+      return Ok(None);
+    };
+    let end_pos = payload_at + end_rel + end_tag.len();
+    let inner = strip_section_markers(&buffer[..end_pos], start_tag, end_tag);
+    match self.parse(inner, tools) {
+      Ok(calls) if !calls.is_empty() => Ok(Some((calls, end_pos))),
+      _ => Ok(Some((Vec::new(), end_pos))),
+    }
   }
 }
 
@@ -574,103 +742,83 @@ impl ToolParser for Glm47 {
   fn name(&self) -> &'static str {
     "glm47"
   }
-  fn find_end_tag_in_buffer(&self, buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
-    // glm47 accepts THREE shapes via `parse()`:
-    //   1. XML-style `name<arg_key>k</arg_key><arg_value>v</arg_value>…` —
-    //      values inside `<arg_value>…</arg_value>` are arbitrary text and may
-    //      legitimately carry the wrapper end tag literal `</tool_call>`
-    //      (L9 R7 finding). Use [`xml_value_aware_end_tag_scan`] to skip
-    //      `<arg_value>` regions before matching the wrapper end tag.
-    //   2. `glm_parse_json` fallback — top-level JSON object OR array. Use the
-    //      balanced scanner whose shape matches the payload's leading byte.
-    //   3. `glm_parse_plain` fallback — plain text whose bytes are opaque and
-    //      may carry a raw `<arg_value>` literal (no matching close). It must
-    //      NOT be routed through the value-aware scanner (would block on the
-    //      missing `</arg_value>` and drop the call at buffer cap — L9 R8).
-    //
-    // Classify the payload's leading non-whitespace byte: `{` → balanced
-    // object then plain substring; `[` → balanced array then plain substring;
-    // else distinguish shape 1 (XML-style) from shape 3 (plain) by the
-    // presence of `<arg_key>` (`parse()`'s XML branch gate; the plain branch
-    // never emits it).
-    let payload_at = match buffer.find(start_tag) {
-      Some(idx) => idx + start_tag.len(),
-      None => return buffer.find(end_tag),
+  /// Lock-step with [`Self::parse`] (lines ~622–656 above): `parse` accepts
+  /// THREE payload shapes — branching on the presence of `<arg_key>`, then
+  /// `glm_parse_json` (top-level object OR array), then `glm_parse_plain`.
+  /// Streaming extraction mirrors that branch ladder with payload-shape
+  /// classification + the L9 R9 prefix-bounded `<arg_key>`-vs-end_tag race:
+  /// * `{`-leading → balanced JSON object then `end_tag`.
+  /// * `[`-leading → balanced JSON array then `end_tag`.
+  /// * else if `<arg_key>` precedes any candidate `end_tag` →
+  ///   value-aware XML scan (skip `<arg_value>` regions, accept `end_tag`
+  ///   strictly after `</arg_value>`).
+  /// * else → plain substring: accept the first `end_tag` directly (the
+  ///   plain payload's bytes are opaque; a raw `<arg_value>` literal MUST
+  ///   NOT block on a never-arriving `</arg_value>` — L9 R8 finding).
+  fn try_parse_one_call(
+    &self,
+    buffer: &str,
+    tools: Option<&Value>,
+  ) -> Result<Option<(Vec<ToolCall>, usize)>, Error> {
+    let start_tag = self.tool_call_start();
+    let end_tag = self.tool_call_end();
+    let Some((payload_at, payload)) = locate_tagged_payload(buffer, start_tag) else {
+      return Ok(None);
     };
-    let payload = &buffer[payload_at..];
-    match classify_json_payload_start(payload) {
+    let end_rel = match classify_json_payload_start(payload) {
       JsonPayloadStart::Object => {
-        let (_, obj_end) = balanced_json_object_prefix(payload)?;
-        let rel = payload[obj_end..].find(end_tag)?;
-        Some(payload_at + obj_end + rel)
+        let Some((_, obj_end)) = balanced_json_object_prefix(payload) else {
+          return Ok(None);
+        };
+        let Some(rel) = payload[obj_end..].find(end_tag) else {
+          return Ok(None);
+        };
+        obj_end + rel
       }
       JsonPayloadStart::Array => {
-        let (_, arr_end) = balanced_json_array_prefix(payload)?;
-        let rel = payload[arr_end..].find(end_tag)?;
-        Some(payload_at + arr_end + rel)
+        let Some((_, arr_end)) = balanced_json_array_prefix(payload) else {
+          return Ok(None);
+        };
+        let Some(rel) = payload[arr_end..].find(end_tag) else {
+          return Ok(None);
+        };
+        arr_end + rel
       }
       JsonPayloadStart::None => {
-        // Shape 1 (XML-style) OR shape 3 (plain). The discriminator is the
-        // presence of `<arg_key>`: `parse()`'s XML branch is gated on
-        // `text.find("<arg_key>")` and `find_kv_pairs` always consumes the key
-        // BEFORE the value, so every structurally-valid XML-style payload
-        // contains `<arg_key>` at or before any `<arg_value>`. The plain
-        // fallback (`glm_parse_plain`) NEVER emits `<arg_key>` tags — its
-        // bytes are arbitrary command text that may legitimately contain a
-        // raw `<arg_value>` literal (L9 R8 finding: a payload like
-        // `<tool_call>echo <arg_value></tool_call>` was over-eagerly routed
-        // through the value-aware scanner which then blocked waiting for a
-        // matching `</arg_value>` that never arrives → soft-DoS, call
-        // dropped at buffer cap).
-        //
-        // L9 R9 fix: the discriminator MUST be bounded to the prefix that
-        // COULD be the actual payload (bytes up to a candidate end_tag).
-        // Scanning the entire `payload` (including trailing display after a
-        // legitimate `end_tag`) lets a `<arg_key>` literal in the trailing
-        // display flip a plain-fallback call into XML-aware mode, which
-        // then waits for `</arg_value>` that never arrives and drops the
-        // call at buffer cap. Race the first end_tag occurrence against
-        // the first `<arg_key>` occurrence; only when `<arg_key>` arrives
-        // STRICTLY BEFORE any candidate `end_tag` is this an XML-style
-        // payload.
-        //
-        // Streaming corner-case audit: each call re-evaluates the full
-        // buffer, so there is no lock-in. If `<arg_key>` arrives in a later
-        // chunk (i.e. an XML-style payload whose key tag straddles the
-        // chunk boundary), the next invocation routes to the XML scanner.
-        // A valid XML-style payload cannot have `<arg_value>` before
-        // `<arg_key>` (`find_kv_pairs` requires key-then-value), so a
-        // prefix-bounded "no `<arg_key>` before end_tag ⇒ plain" rule is
-        // sound. If neither end_tag nor `<arg_key>` is present yet, the
-        // scanner returns `None` and the processor keeps collecting.
+        // L9 R9 prefix-bounded discriminator: race the first end_tag against
+        // the first `<arg_key>` occurrence. `<arg_key>` strictly before any
+        // candidate `end_tag` ⇒ XML-aware (must close every `<arg_value>`
+        // region before the wrapper close). Otherwise plain — accept end_tag
+        // directly so a raw `<arg_value>` literal cannot block.
         let first_end = payload.find(end_tag);
         let first_key = payload.find("<arg_key>");
         match (first_end, first_key) {
-          // `<arg_key>` arrives STRICTLY before any candidate `end_tag` —
-          // XML-aware path (must wait for the matching `</arg_value>` and
-          // then the real `end_tag` after the value-close).
           (Some(e), Some(k)) if k < e => {
-            xml_value_aware_end_tag_scan(payload, "<arg_value>", "</arg_value>", end_tag)
-              .map(|rel| payload_at + rel)
+            let Some(rel) =
+              xml_value_aware_end_tag_scan(payload, "<arg_value>", "</arg_value>", end_tag)
+            else {
+              return Ok(None);
+            };
+            rel
           }
-          // No `end_tag` yet but `<arg_key>` is present — also XML-aware
-          // (the close hasn't arrived, the value-aware scan will keep
-          // collecting; if the next chunk delivers `end_tag` first, the
-          // race re-evaluates on the next call).
           (None, Some(_)) => {
-            xml_value_aware_end_tag_scan(payload, "<arg_value>", "</arg_value>", end_tag)
-              .map(|rel| payload_at + rel)
+            let Some(rel) =
+              xml_value_aware_end_tag_scan(payload, "<arg_value>", "</arg_value>", end_tag)
+            else {
+              return Ok(None);
+            };
+            rel
           }
-          // `end_tag` is reachable AT or BEFORE any `<arg_key>` — plain
-          // fallback: return the end_tag offset directly. Trailing display
-          // after `end_tag` cannot influence this decision because the
-          // `<arg_key>` check is bounded by `e`. Any `<arg_value>` literal
-          // inside the plain payload is opaque text.
-          (Some(e), _) => Some(payload_at + e),
-          // Neither `end_tag` nor `<arg_key>` yet — keep collecting.
-          (None, None) => None,
+          (Some(e), _) => e,
+          (None, None) => return Ok(None),
         }
       }
+    };
+    let end_pos = payload_at + end_rel + end_tag.len();
+    let inner = strip_section_markers(&buffer[..end_pos], start_tag, end_tag);
+    match self.parse(inner, tools) {
+      Ok(calls) if !calls.is_empty() => Ok(Some((calls, end_pos))),
+      _ => Ok(Some((Vec::new(), end_pos))),
     }
   }
 }
@@ -863,19 +1011,71 @@ impl ToolParser for KimiK2 {
   fn name(&self) -> &'static str {
     "kimi_k2"
   }
-  fn find_end_tag_in_buffer(&self, buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
-    // Kimi payload is one-or-more
-    //   <|tool_call_begin|>functions.name:N<|tool_call_argument_begin|>{json}<|tool_call_end|>
-    // calls between the section delimiters. The per-call `{json}` arguments
-    // are arbitrary JSON, so a string value could embed the section end tag
-    // `<|tool_calls_section_end|>` verbatim. Skip past each call's
-    // `<|tool_call_end|>` (so any in-JSON section-end literal is safely
-    // *inside* a confirmed call body), then plain-substring after the last
-    // such call closes. While a per-call `{json}` is still open the inner
-    // `<|tool_call_end|>` may itself live inside a string value, so we
-    // additionally use the balanced JSON object scanner for the args region
-    // before consuming the per-call end.
-    kimi_section_then_end_tag(buffer, start_tag, end_tag)
+  /// Lock-step with [`Self::parse`] (lines ~937–944 above): the section is
+  /// `<|tool_calls_section_begin|> ... <|tool_calls_section_end|>` with
+  /// zero-or-more inner
+  /// `<|tool_call_begin|>name:N<|tool_call_argument_begin|>{json}<|tool_call_end|>`
+  /// blocks. `parse` ingests the full section and `find_all`s the inner
+  /// blocks (or falls back to single-block parsing). The streaming walker
+  /// races the section `end_tag` against the next per-call opener — section
+  /// end first wins; opener first consumes one inner block (using balanced
+  /// JSON for the args so an in-string `<|tool_call_end|>` cannot truncate).
+  fn try_parse_one_call(
+    &self,
+    buffer: &str,
+    tools: Option<&Value>,
+  ) -> Result<Option<(Vec<ToolCall>, usize)>, Error> {
+    let start_tag = self.tool_call_start();
+    let end_tag = self.tool_call_end();
+    let Some((payload_at, payload)) = locate_tagged_payload(buffer, start_tag) else {
+      return Ok(None);
+    };
+    let call_begin = "<|tool_call_begin|>";
+    let arg_begin = "<|tool_call_argument_begin|>";
+    let call_end = "<|tool_call_end|>";
+    let mut cursor = 0usize;
+    let section_end_rel = loop {
+      let end_rel = payload[cursor..].find(end_tag).map(|p| cursor + p);
+      let open_rel = payload[cursor..].find(call_begin).map(|p| cursor + p);
+      let open_rel = match (end_rel, open_rel) {
+        (Some(e), Some(o)) if e <= o => break e,
+        (Some(_), Some(o)) => o,
+        (Some(e), None) => break e,
+        (None, Some(o)) => o,
+        (None, None) => return Ok(None),
+      };
+      let after_open = open_rel + call_begin.len();
+      let arg_open_rel = match payload[after_open..].find(arg_begin) {
+        Some(a) => after_open + a,
+        None => return Ok(None),
+      };
+      let args_at = arg_open_rel + arg_begin.len();
+      let args_region = &payload[args_at..];
+      let after_args_rel = match classify_json_payload_start(args_region) {
+        JsonPayloadStart::Object => {
+          let Some((_, obj_end)) = balanced_json_object_prefix(args_region) else {
+            return Ok(None);
+          };
+          let Some(end_rel) = args_region[obj_end..].find(call_end) else {
+            return Ok(None);
+          };
+          obj_end + end_rel + call_end.len()
+        }
+        _ => {
+          let Some(end_rel) = args_region.find(call_end) else {
+            return Ok(None);
+          };
+          end_rel + call_end.len()
+        }
+      };
+      cursor = args_at + after_args_rel;
+    };
+    let end_pos = payload_at + section_end_rel + end_tag.len();
+    let inner = strip_section_markers(&buffer[..end_pos], start_tag, end_tag);
+    match self.parse(inner, tools) {
+      Ok(calls) if !calls.is_empty() => Ok(Some((calls, end_pos))),
+      _ => Ok(Some((Vec::new(), end_pos))),
+    }
   }
 }
 
@@ -932,35 +1132,50 @@ impl ToolParser for Longcat {
   fn name(&self) -> &'static str {
     "longcat"
   }
-  fn find_end_tag_in_buffer(&self, buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
-    // Longcat's `parse()` is either a `{...}` JSON fast-path (object only —
-    // not array, the `else` branch is XML-style `<longcat_arg_key>` data) or
-    // the XML-style format. For JSON payloads use the string-aware balanced
-    // object scan so an in-string `</longcat_tool_call>` cannot truncate the
-    // object; for XML-style payloads use [`xml_value_aware_end_tag_scan`] so a
-    // `</longcat_tool_call>` literal inside a `<longcat_arg_value>` body (L9
-    // R7 finding: legitimately valid value text) does not cut the buffer
-    // mid-call.
-    let payload_at = match buffer.find(start_tag) {
-      Some(idx) => idx + start_tag.len(),
-      None => return buffer.find(end_tag),
+  /// Lock-step with [`Self::parse`] (lines ~972–985 above):
+  /// `parse` is either a `{...}` JSON object fast-path (not array — the
+  /// `else` branch requires `<longcat_arg_key>` data) or the XML-style
+  /// `<longcat_arg_key>/`<longcat_arg_value>` shape. We mirror that branch:
+  /// `{`-leading → balanced object then plain substring after `}`; else
+  /// value-aware XML scan that skips `<longcat_arg_value>` regions so an
+  /// in-value `</longcat_tool_call>` literal cannot truncate the section.
+  fn try_parse_one_call(
+    &self,
+    buffer: &str,
+    tools: Option<&Value>,
+  ) -> Result<Option<(Vec<ToolCall>, usize)>, Error> {
+    let start_tag = self.tool_call_start();
+    let end_tag = self.tool_call_end();
+    let Some((payload_at, payload)) = locate_tagged_payload(buffer, start_tag) else {
+      return Ok(None);
     };
-    let payload = &buffer[payload_at..];
-    if matches!(
+    let end_rel = if matches!(
       classify_json_payload_start(payload),
       JsonPayloadStart::Object
     ) {
-      let (_, obj_end) = balanced_json_object_prefix(payload)?;
-      let rel = payload[obj_end..].find(end_tag)?;
-      Some(payload_at + obj_end + rel)
+      let Some((_, obj_end)) = balanced_json_object_prefix(payload) else {
+        return Ok(None);
+      };
+      let Some(rel) = payload[obj_end..].find(end_tag) else {
+        return Ok(None);
+      };
+      obj_end + rel
     } else {
-      xml_value_aware_end_tag_scan(
+      match xml_value_aware_end_tag_scan(
         payload,
         "<longcat_arg_value>",
         "</longcat_arg_value>",
         end_tag,
-      )
-      .map(|rel| payload_at + rel)
+      ) {
+        Some(rel) => rel,
+        None => return Ok(None),
+      }
+    };
+    let end_pos = payload_at + end_rel + end_tag.len();
+    let inner = strip_section_markers(&buffer[..end_pos], start_tag, end_tag);
+    match self.parse(inner, tools) {
+      Ok(calls) if !calls.is_empty() => Ok(Some((calls, end_pos))),
+      _ => Ok(Some((Vec::new(), end_pos))),
     }
   }
 }
@@ -1124,17 +1339,48 @@ impl ToolParser for MinimaxM2 {
   fn name(&self) -> &'static str {
     "minimax_m2"
   }
-  fn find_end_tag_in_buffer(&self, buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
-    // The end tag `</minimax:tool_call>` collides with parameter VALUES that
-    // may contain `</minimax:tool_call>` verbatim inside a
-    // `<parameter name="p">VALUE</parameter>` body. Walk the payload as a
-    // sequence of `<invoke name=...>...</invoke>` blocks (mirroring `parse()`'s
-    // `find_all("<invoke name=", "</invoke>")`); the section end legitimately
-    // begins only AFTER the last completed `</invoke>` (and the next byte is
-    // not the start of another `<invoke`). Inside an `<invoke>` body any
-    // textual `</minimax:tool_call>` is safely *inside* the invoke close so
-    // this scan never trips on it.
-    xml_invoke_then_end_tag(buffer, start_tag, end_tag)
+  /// Lock-step with [`Self::parse`] (lines ~1172–1205 above): `parse` walks
+  /// the section by `find_all("<invoke name=", "</invoke>")`. The streaming
+  /// walker iterates the same block sequence, racing the section `end_tag`
+  /// against the next `<invoke name=` opener at each cursor (L9 R7) — section
+  /// end first wins; opener first finds the corresponding `</invoke>` and
+  /// loops. In-VALUE `</minimax:tool_call>` literals are safely inside the
+  /// invoke close.
+  fn try_parse_one_call(
+    &self,
+    buffer: &str,
+    tools: Option<&Value>,
+  ) -> Result<Option<(Vec<ToolCall>, usize)>, Error> {
+    let start_tag = self.tool_call_start();
+    let end_tag = self.tool_call_end();
+    let Some((payload_at, payload)) = locate_tagged_payload(buffer, start_tag) else {
+      return Ok(None);
+    };
+    let open = "<invoke name=";
+    let close = "</invoke>";
+    let mut cursor = 0usize;
+    let section_end_rel = loop {
+      let end_rel = payload[cursor..].find(end_tag).map(|p| cursor + p);
+      let open_rel = payload[cursor..].find(open).map(|p| cursor + p);
+      let open_rel = match (end_rel, open_rel) {
+        (Some(e), Some(o)) if e <= o => break e,
+        (Some(_), Some(o)) => o,
+        (Some(e), None) => break e,
+        (None, Some(o)) => o,
+        (None, None) => return Ok(None),
+      };
+      let close_search_from = open_rel + open.len();
+      let Some(close_rel) = payload[close_search_from..].find(close) else {
+        return Ok(None);
+      };
+      cursor = close_search_from + close_rel + close.len();
+    };
+    let end_pos = payload_at + section_end_rel + end_tag.len();
+    let inner = strip_section_markers(&buffer[..end_pos], start_tag, end_tag);
+    match self.parse(inner, tools) {
+      Ok(calls) if !calls.is_empty() => Ok(Some((calls, end_pos))),
+      _ => Ok(Some((Vec::new(), end_pos))),
+    }
   }
 }
 
@@ -1195,15 +1441,69 @@ impl ToolParser for FunctionGemma {
   fn name(&self) -> &'static str {
     "function_gemma"
   }
-  fn find_end_tag_in_buffer(&self, buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
-    // Function-gemma's payload is `call:name{k:v,...}` where `v` can be
-    // `<escape>STR<escape>` and STR is arbitrary text that may contain the
-    // end tag `<end_function_call>` literal. The braces themselves are
-    // single-level (`gemma_call` uses non-greedy `.*?}`) but only the brace-
-    // close that follows the call is the parse anchor. Use a scan that
-    // tracks `<escape>...<escape>` regions verbatim and the `{...}` of the
-    // call body, then plain-substring after the call's `}` for `end_tag`.
-    function_gemma_call_then_end_tag(buffer, start_tag, end_tag)
+  /// Lock-step with [`Self::parse`] (lines ~1231–1273 above): `parse` calls
+  /// `gemma_call(text, false)` which finds `call:name{...}` via non-greedy
+  /// `\{(.*?)\}` (first `}` wins). String values inside `<escape>STR<escape>`
+  /// can carry the `<end_function_call>` literal verbatim. The streaming
+  /// walker advances to the first `}` OUTSIDE any `<escape>` region, then
+  /// accepts `end_tag` strictly after that `}`.
+  fn try_parse_one_call(
+    &self,
+    buffer: &str,
+    tools: Option<&Value>,
+  ) -> Result<Option<(Vec<ToolCall>, usize)>, Error> {
+    let start_tag = self.tool_call_start();
+    let end_tag = self.tool_call_end();
+    let Some((payload_at, payload)) = locate_tagged_payload(buffer, start_tag) else {
+      return Ok(None);
+    };
+    let call_marker = "call:";
+    let Some(call_rel) = payload.find(call_marker) else {
+      return Ok(None);
+    };
+    let after_marker = call_rel + call_marker.len();
+    let bytes = payload.as_bytes();
+    let mut j = after_marker;
+    while j < bytes.len()
+      && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
+    {
+      j += 1;
+    }
+    if j >= bytes.len() || bytes[j] != b'{' {
+      return Ok(None);
+    }
+    // Scan past the first `}` that is not inside `<escape>...<escape>`.
+    let escape = "<escape>";
+    let mut idx = j + 1;
+    let mut in_escape = false;
+    let body_close_after = loop {
+      if idx >= bytes.len() {
+        return Ok(None);
+      }
+      if !in_escape && payload[idx..].starts_with(escape) {
+        in_escape = true;
+        idx += escape.len();
+        continue;
+      }
+      if in_escape && payload[idx..].starts_with(escape) {
+        in_escape = false;
+        idx += escape.len();
+        continue;
+      }
+      if !in_escape && bytes[idx] == b'}' {
+        break idx + 1;
+      }
+      idx += utf8_char_width(bytes[idx]);
+    };
+    let Some(end_rel) = payload[body_close_after..].find(end_tag) else {
+      return Ok(None);
+    };
+    let end_pos = payload_at + body_close_after + end_rel + end_tag.len();
+    let inner = strip_section_markers(&buffer[..end_pos], start_tag, end_tag);
+    match self.parse(inner, tools) {
+      Ok(calls) if !calls.is_empty() => Ok(Some((calls, end_pos))),
+      _ => Ok(Some((Vec::new(), end_pos))),
+    }
   }
 }
 
@@ -1253,14 +1553,58 @@ impl ToolParser for Gemma4 {
   fn name(&self) -> &'static str {
     "gemma4"
   }
-  fn find_end_tag_in_buffer(&self, buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
-    // Gemma4's payload is one-or-more `call:name{...}` blocks where strings
-    // are `<|"|>STR<|"|>` and braces are balanced (matching
-    // `gemma4_calls` / `balanced_brace_end`). STR can carry the end tag
-    // `<tool_call|>` literal verbatim. Walk the payload as a sequence of
-    // such call blocks (string- and brace-aware), then plain-substring after
-    // the last call's `}` for `end_tag`.
-    gemma4_calls_then_end_tag(buffer, start_tag, end_tag)
+  /// Lock-step with [`Self::parse`] (lines ~1321–1333 above): `parse` calls
+  /// `gemma4_calls(text)` which walks `call:name{...}` blocks with balanced
+  /// braces (skipping `<|"|>STR<|"|>` string regions). The streaming walker
+  /// races the section `end_tag` against the next `call:` opener at each
+  /// cursor (L9 R7) — section end first wins; opener first advances past
+  /// the brace-matched body and loops. STR can carry the `<tool_call|>`
+  /// literal verbatim.
+  fn try_parse_one_call(
+    &self,
+    buffer: &str,
+    tools: Option<&Value>,
+  ) -> Result<Option<(Vec<ToolCall>, usize)>, Error> {
+    let start_tag = self.tool_call_start();
+    let end_tag = self.tool_call_end();
+    let Some((payload_at, payload)) = locate_tagged_payload(buffer, start_tag) else {
+      return Ok(None);
+    };
+    let bytes = payload.as_bytes();
+    let mut cursor = 0usize;
+    let section_end_rel = loop {
+      let end_rel = payload[cursor..].find(end_tag).map(|p| cursor + p);
+      let call_rel = payload[cursor..].find("call:").map(|p| cursor + p);
+      let call_rel = match (end_rel, call_rel) {
+        (Some(e), Some(c)) if e <= c => break e,
+        (Some(_), Some(c)) => c,
+        (Some(e), None) => break e,
+        (None, Some(c)) => c,
+        (None, None) => return Ok(None),
+      };
+      let after_marker = call_rel + "call:".len();
+      let mut j = after_marker;
+      while j < bytes.len()
+        && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
+      {
+        j += 1;
+      }
+      if j >= bytes.len() || bytes[j] != b'{' {
+        cursor = after_marker;
+        continue;
+      }
+      let body = &payload[j..];
+      let Some(close_rel) = balanced_brace_end(body) else {
+        return Ok(None);
+      };
+      cursor = j + close_rel + 1;
+    };
+    let end_pos = payload_at + section_end_rel + end_tag.len();
+    let inner = strip_section_markers(&buffer[..end_pos], start_tag, end_tag);
+    match self.parse(inner, tools) {
+      Ok(calls) if !calls.is_empty() => Ok(Some((calls, end_pos))),
+      _ => Ok(Some((Vec::new(), end_pos))),
+    }
   }
 }
 
@@ -1669,22 +2013,6 @@ impl ToolCallProcessor {
     self.state = State::Normal;
   }
 
-  /// Run the parser against the current buffer (with delimiters stripped),
-  /// treating an `Err` as a failed parse (Swift returns `nil`). On success any
-  /// extracted calls are appended; returns `true` when at least one call was
-  /// extracted.
-  fn try_parse_buffer(&mut self) -> bool {
-    let inner = strip_markers(self.parser.as_ref(), &self.tool_call_buffer);
-    let parsed = self.parser.parse(inner, self.tools.as_ref());
-    match parsed {
-      Ok(calls) if !calls.is_empty() => {
-        self.tool_calls.extend(calls);
-        true
-      }
-      _ => false,
-    }
-  }
-
   /// Recover when the **combined** size of
   /// [`tool_call_buffer`](Self::tool_call_buffer) and
   /// [`pending_display`](Self::pending_display) has reached
@@ -1956,47 +2284,52 @@ impl ToolCallProcessor {
         return display;
       }
 
-      // Locate the *real* end tag. Round-6 structural fix: end-tag detection
-      // is the parser's own responsibility (each parser owns its payload-
-      // syntax escape rules — JSON quoting, Pythonic single/double-quoted
-      // strings, XML body bytes, `<escape>` markers, etc.). Each parser
-      // overrides `find_end_tag_in_buffer` to skip past its own payload
-      // syntactically before doing the plain-substring end-tag match, so an
-      // in-payload end-tag literal can never cut the buffer mid-call. See
-      // [`ToolParser::find_end_tag_in_buffer`].
-      let end_at = self
+      // L9 R10 structural unification: extract + end-detect via the parser's
+      // sole `try_parse_one_call` method. Lock-step with `parse()` removes
+      // the round-after-round drift between a separate end-tag scanner and
+      // each parser's own extraction logic (R7..R10 chased exactly that
+      // drift). Match outcomes:
+      //   Ok(Some((calls, end_pos))) → emit the calls, truncate the buffer
+      //     to `[end_pos..]`, loop on any remaining suffix that contains the
+      //     start char (back-to-back sections);
+      //   Ok(None) → buffer is incomplete, keep collecting (apply cap);
+      //   Err → malformed section, recover via cap path.
+      let outcome = self
         .parser
-        .find_end_tag_in_buffer(&self.tool_call_buffer, start_tag, end_tag);
-
-      if let Some(end_at) = end_at {
-        // Split the buffer at the confirmed end-tag offset: everything after
-        // the end tag becomes the trailing token (Swift `separateToken` with
-        // `returnLeading: false`), and the buffer keeps up to and including
-        // the end tag for parsing.
-        let after = end_at + end_tag.len();
-        let trailing_token = self.tool_call_buffer[after..].to_owned();
-        self.tool_call_buffer.truncate(after);
-
-        self.try_parse_buffer();
-
-        self.state = State::Normal;
-        self.tool_call_buffer.clear();
-
-        // If the trailing token holds the start char there may be more calls
-        // — loop on it instead of recursing.
-        if trailing_token.contains(start_char) {
-          chunk = std::borrow::Cow::Owned(trailing_token);
-          // Re-enter the loop with the trailing suffix as the next chunk.
-        } else {
-          push_display(&mut display, &trailing_token);
+        .try_parse_one_call(&self.tool_call_buffer, self.tools.as_ref());
+      match outcome {
+        Ok(Some((calls, end_pos))) => {
+          if end_pos == 0 {
+            // Defensive: zero-width advance would loop forever — treat as
+            // incomplete and keep collecting under the cap.
+            self.cap_recover_into(&mut display);
+            return display;
+          }
+          self.tool_calls.extend(calls);
+          let trailing_token = self.tool_call_buffer[end_pos..].to_owned();
+          self.tool_call_buffer.clear();
+          self.state = State::Normal;
+          if trailing_token.contains(start_char) {
+            chunk = std::borrow::Cow::Owned(trailing_token);
+            // Re-enter the loop with the trailing suffix as the next chunk.
+          } else {
+            push_display(&mut display, &trailing_token);
+            return display;
+          }
+        }
+        Ok(None) => {
+          // Section not yet complete — confirmed tool call still collecting.
+          // Cap the buffer so a never-terminated tagged call cannot OOM
+          // (Codex finding 2); recovery here drops the malformed content.
+          self.cap_recover_into(&mut display);
           return display;
         }
-      } else {
-        // End tag not yet seen — confirmed tool call still collecting. Cap the
-        // buffer so a never-terminated tagged call cannot OOM (Codex finding
-        // 2); recovery here drops the malformed content.
-        self.cap_recover_into(&mut display);
-        return display;
+        Err(_) => {
+          // Malformed section — same cap-recovery semantics as the
+          // never-terminated case: drop tool content, surface nothing.
+          self.cap_recover_into(&mut display);
+          return display;
+        }
       }
     }
   }
@@ -2127,30 +2460,6 @@ fn balanced_json_array_prefix(text: &str) -> Option<(usize, usize)> {
   None
 }
 
-/// Combine a JSON-object-aware payload-end scan with the post-object
-/// substring search for `end_tag`. Used by parsers whose payload is a single
-/// top-level JSON object whose string values can carry the end-tag literal
-/// verbatim (`json_tools`, `glm47` object payloads, `longcat` object
-/// payloads). Returns the offset of `end_tag` strictly AFTER the balanced
-/// `}`, or `None` while the object is still open / no end tag has arrived.
-fn json_object_then_end_tag(buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
-  let payload_at = match buffer.find(start_tag) {
-    Some(idx) => idx + start_tag.len(),
-    None => return buffer.find(end_tag),
-  };
-  let payload = &buffer[payload_at..];
-  // Use the JSON-string-aware balanced scanner so an `end_tag` substring
-  // inside any `"..."` value is *within* `obj_end` and the post-object search
-  // safely skips past it. If the payload's first non-whitespace byte is not
-  // `{` (e.g. a glm47 XML-style payload routed by mistake), the scanner
-  // simply returns `None` because there is no opening brace; the call site
-  // then keeps collecting. Real callers route by classifier before invoking,
-  // so the `None` case here is rare.
-  let (_, obj_end) = balanced_json_object_prefix(payload)?;
-  let rel = payload[obj_end..].find(end_tag)?;
-  Some(payload_at + obj_end + rel)
-}
-
 /// Shape classification of a tagged tool-call payload's leading non-whitespace
 /// byte. Used by glm47 / longcat to pick the appropriate JSON balancer
 /// (object vs array) before falling back to plain-substring for non-JSON
@@ -2188,28 +2497,6 @@ fn classify_json_payload_start(payload: &str) -> JsonPayloadStart {
     Some(b'[') => JsonPayloadStart::Array,
     _ => JsonPayloadStart::None,
   }
-}
-
-/// Skip a Pythonic call body `[name(args)]` (single/double-quoted string and
-/// bracket aware) starting at the first `[` in `payload`, then plain-
-/// substring search for `end_tag` strictly after the `)]`. Returns `None`
-/// while the call is still open / no end tag has arrived.
-///
-/// The R6 regression class: `[echo(s='<|tool_call_end|>')]<|tool_call_end|>`.
-/// A naive substring would split at the in-string `<|tool_call_end|>` and
-/// drop the call. The scan tracks single-quoted `'…'` and double-quoted
-/// `"…"` strings (escape-aware: `\'`, `\"`, `\\`) so the in-string match is
-/// safely *inside* the call body.
-fn pythonic_call_then_end_tag(buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
-  let payload_at = match buffer.find(start_tag) {
-    Some(idx) => idx + start_tag.len(),
-    None => return buffer.find(end_tag),
-  };
-  let payload = &buffer[payload_at..];
-  let call_end_rel = pythonic_call_close(payload)?;
-  let after = call_end_rel; // exclusive: bytes [.., call_end_rel) are the call
-  let rel = payload[after..].find(end_tag)?;
-  Some(payload_at + after + rel)
 }
 
 /// Return the byte offset just past the `)]` that closes the *first* Pythonic
@@ -2349,257 +2636,6 @@ fn xml_value_aware_end_tag_scan(
   None
 }
 
-/// Skip a qwen3_coder `<function=...>…</function>` body, then plain-substring
-/// search for `end_tag` strictly after `</function>`. Returns `None` while
-/// the function block is still open / no end tag has arrived.
-///
-/// `parse()` extracts via `<function=` … `.rfind("</function>")`, so a
-/// streaming detector must agree: scan past the FIRST `</function>` that
-/// follows the `<function=` open, then look for the end tag. Inside any
-/// `<parameter=p>VALUE</parameter>` body, a textual `</tool_call>` is safely
-/// *inside* the `</function>` so the post-function search ignores it.
-fn xml_function_then_end_tag(buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
-  let payload_at = match buffer.find(start_tag) {
-    Some(idx) => idx + start_tag.len(),
-    None => return buffer.find(end_tag),
-  };
-  let payload = &buffer[payload_at..];
-  // Find the start of a function block. If there is none yet, keep collecting.
-  let fn_open = payload.find("<function=")?;
-  let after_open = fn_open + "<function=".len();
-  let close = "</function>";
-  let close_rel = payload[after_open..].find(close)?;
-  let after_close = after_open + close_rel + close.len();
-  let rel = payload[after_close..].find(end_tag)?;
-  Some(payload_at + after_close + rel)
-}
-
-/// Skip the minimax_m2 `<invoke name=…>…</invoke>` block sequence, then
-/// plain-substring search for `end_tag` strictly after the last invoke. Each
-/// invoke ends at its FIRST `</invoke>` (mirroring `parse()`'s
-/// `find_all("<invoke name=", "</invoke>")`). The end tag may legitimately
-/// follow the last `</invoke>`; subsequent `<invoke` opens mean more invokes
-/// are coming.
-///
-/// Returns `None` while still inside an invoke / no `</invoke>` has arrived /
-/// no end tag yet.
-///
-/// L9 R7 fix: at each post-block cursor, search for BOTH the section
-/// `end_tag` AND the next `<invoke name=` opener; whichever occurs at the
-/// EARLIER byte position wins. If `end_tag` is earlier the section is closed
-/// and we return its offset. If the opener is earlier we continue with the
-/// next block. The previous loop greedily searched for the next opener first
-/// and a trailing-display literal like `<invoke name="x">` after the section
-/// close was misread as another in-section block opener, masking the real
-/// `end_tag` that occurred BEFORE it.
-fn xml_invoke_then_end_tag(buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
-  let payload_at = match buffer.find(start_tag) {
-    Some(idx) => idx + start_tag.len(),
-    None => return buffer.find(end_tag),
-  };
-  let payload = &buffer[payload_at..];
-  let open = "<invoke name=";
-  let close = "</invoke>";
-  let mut cursor = 0;
-  loop {
-    // L9 R7: race the end tag against the next opener; whichever appears
-    // FIRST at or after `cursor` wins. End-tag-first means the section is
-    // closed; opener-first means another in-section block follows.
-    let end_rel = payload[cursor..].find(end_tag).map(|p| cursor + p);
-    let open_rel = payload[cursor..].find(open).map(|p| cursor + p);
-    let open_rel = match (end_rel, open_rel) {
-      (Some(e), Some(o)) if e <= o => return Some(payload_at + e),
-      (Some(_), Some(o)) => o,
-      (Some(e), None) => return Some(payload_at + e),
-      (None, Some(o)) => o,
-      (None, None) => return None,
-    };
-    // Inside an invoke: find its `</invoke>` close. If absent, keep
-    // collecting (the invoke is still streaming).
-    let close_search_from = open_rel + open.len();
-    let close_rel = payload[close_search_from..].find(close)?;
-    let after_close = close_search_from + close_rel + close.len();
-    // Past this invoke close. Loop to find any subsequent `<invoke name=`
-    // (more invokes) OR the end tag (no more invokes).
-    cursor = after_close;
-  }
-}
-
-/// Skip the kimi_k2 per-call sequence
-/// `<|tool_call_begin|>functions.name:N<|tool_call_argument_begin|>{json}<|tool_call_end|>`
-/// (repeating), then plain-substring search for `end_tag`
-/// (`<|tool_calls_section_end|>`) strictly after the last per-call
-/// `<|tool_call_end|>`. The per-call `{json}` may carry the section end tag
-/// literal verbatim inside a string value; the balanced JSON object scanner
-/// is used to skip past the args region before consuming the per-call end.
-///
-/// Returns `None` while still inside a per-call args region / no per-call end
-/// yet / no section end yet.
-fn kimi_section_then_end_tag(buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
-  let payload_at = match buffer.find(start_tag) {
-    Some(idx) => idx + start_tag.len(),
-    None => return buffer.find(end_tag),
-  };
-  let payload = &buffer[payload_at..];
-  let call_begin = "<|tool_call_begin|>";
-  let arg_begin = "<|tool_call_argument_begin|>";
-  let call_end = "<|tool_call_end|>";
-  let mut cursor = 0;
-  loop {
-    // L9 R7: race the section end tag against the next per-call opener;
-    // whichever appears FIRST at or after `cursor` wins. End-tag-first means
-    // the section closed; opener-first means another in-section per-call
-    // follows. Greedily seeking the opener first masked the real section end
-    // when trailing display text after the section close happened to contain
-    // the `<|tool_call_begin|>` literal.
-    let end_rel = payload[cursor..].find(end_tag).map(|p| cursor + p);
-    let open_rel = payload[cursor..].find(call_begin).map(|p| cursor + p);
-    let open_rel = match (end_rel, open_rel) {
-      (Some(e), Some(o)) if e <= o => return Some(payload_at + e),
-      (Some(_), Some(o)) => o,
-      (Some(e), None) => return Some(payload_at + e),
-      (None, Some(o)) => o,
-      (None, None) => return None,
-    };
-    // Past the per-call open: find the per-call `<|tool_call_argument_begin|>`.
-    let after_open = open_rel + call_begin.len();
-    let arg_open_rel = match payload[after_open..].find(arg_begin) {
-      Some(a) => after_open + a,
-      None => {
-        // Args header not yet present — keep collecting.
-        return None;
-      }
-    };
-    let args_at = arg_open_rel + arg_begin.len();
-    let args_region = &payload[args_at..];
-    // The args region is `{json}<|tool_call_end|>`. Use the JSON object
-    // balanced scanner so an in-string `<|tool_call_end|>` is `< obj_end` and
-    // does not prematurely terminate the per-call. If the args region is not
-    // JSON-leading (defensive — a malformed model), fall back to plain
-    // substring for `<|tool_call_end|>` from `args_at`.
-    let after_args_rel = match classify_json_payload_start(args_region) {
-      JsonPayloadStart::Object => {
-        let (_, obj_end) = balanced_json_object_prefix(args_region)?;
-        // `<|tool_call_end|>` should follow strictly after the JSON object.
-        let end_rel = args_region[obj_end..].find(call_end)?;
-        obj_end + end_rel + call_end.len()
-      }
-      _ => {
-        let end_rel = args_region.find(call_end)?;
-        end_rel + call_end.len()
-      }
-    };
-    cursor = args_at + after_args_rel;
-  }
-}
-
-/// Skip a single `call:name{...}` function_gemma block (with `<escape>`-
-/// bracketed string regions), then plain-substring search for `end_tag`
-/// strictly after the closing `}`. Returns `None` while the call body is
-/// still open / no end tag has arrived.
-///
-/// `gemma_call` uses non-greedy `\{(.*?)\}` (first `}` wins). The scan
-/// therefore advances to the first `}` *that is not inside a
-/// `<escape>...<escape>` region*. STR inside escape markers can carry the
-/// end tag `<end_function_call>` literal verbatim and `}` characters
-/// without truncating the call body.
-fn function_gemma_call_then_end_tag(buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
-  let payload_at = match buffer.find(start_tag) {
-    Some(idx) => idx + start_tag.len(),
-    None => return buffer.find(end_tag),
-  };
-  let payload = &buffer[payload_at..];
-  // Locate the call's opening `{` (anchored to `call:name`).
-  let call_marker = "call:";
-  let call_rel = payload.find(call_marker)?;
-  let after_marker = call_rel + call_marker.len();
-  let bytes = payload.as_bytes();
-  let mut j = after_marker;
-  while j < bytes.len()
-    && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
-  {
-    j += 1;
-  }
-  if j >= bytes.len() || bytes[j] != b'{' {
-    return None;
-  }
-  // Scan past the first `}` that is not inside `<escape>...<escape>`.
-  let escape = "<escape>";
-  let mut idx = j + 1;
-  let mut in_escape = false;
-  while idx < bytes.len() {
-    if !in_escape && payload[idx..].starts_with(escape) {
-      in_escape = true;
-      idx += escape.len();
-      continue;
-    }
-    if in_escape && payload[idx..].starts_with(escape) {
-      in_escape = false;
-      idx += escape.len();
-      continue;
-    }
-    if !in_escape && bytes[idx] == b'}' {
-      // Just past the closing brace.
-      let after_call = idx + 1;
-      let rel = payload[after_call..].find(end_tag)?;
-      return Some(payload_at + after_call + rel);
-    }
-    idx += utf8_char_width(bytes[idx]);
-  }
-  None
-}
-
-/// Skip a sequence of `call:name{...}` gemma4 blocks (with `<|"|>`-bracketed
-/// string regions and balanced braces), then plain-substring search for
-/// `end_tag` strictly after the last call's closing `}`. Returns `None`
-/// while a call body is still open / no end tag has arrived.
-///
-/// Mirrors `gemma4_calls` / `balanced_brace_end`: braces inside
-/// `<|"|>STR<|"|>` regions are not counted, so STR can carry the end tag
-/// `<tool_call|>` literal verbatim without truncating the call body.
-fn gemma4_calls_then_end_tag(buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
-  let payload_at = match buffer.find(start_tag) {
-    Some(idx) => idx + start_tag.len(),
-    None => return buffer.find(end_tag),
-  };
-  let payload = &buffer[payload_at..];
-  let mut cursor = 0;
-  loop {
-    // L9 R7: race the section end tag against the next `call:` opener;
-    // whichever appears FIRST at or after `cursor` wins. End-tag-first means
-    // the section closed; opener-first means another in-section call follows.
-    // Greedily seeking the opener first masked the real section end when
-    // trailing display text after the section close happened to contain the
-    // `call:` literal.
-    let end_rel = payload[cursor..].find(end_tag).map(|p| cursor + p);
-    let call_rel = payload[cursor..].find("call:").map(|p| cursor + p);
-    let call_rel = match (end_rel, call_rel) {
-      (Some(e), Some(c)) if e <= c => return Some(payload_at + e),
-      (Some(_), Some(c)) => c,
-      (Some(e), None) => return Some(payload_at + e),
-      (None, Some(c)) => c,
-      (None, None) => return None,
-    };
-    let after_marker = call_rel + "call:".len();
-    let bytes = payload.as_bytes();
-    let mut j = after_marker;
-    while j < bytes.len()
-      && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
-    {
-      j += 1;
-    }
-    if j >= bytes.len() || bytes[j] != b'{' {
-      // Not a real call header — skip past `call:` and try again.
-      cursor = after_marker;
-      continue;
-    }
-    let body = &payload[j..];
-    let close_rel = balanced_brace_end(body)?;
-    // `close_rel` is the byte offset of the matching `}` within `body`.
-    cursor = j + close_rel + 1;
-  }
-}
-
 /// Whether `buffer` is a prefix-compatible partial (or full) match of `tag`:
 /// every char they share in order must be equal (Swift `partialMatch`). An
 /// empty buffer trivially matches; a buffer longer than `tag` matches iff it
@@ -2632,6 +2668,24 @@ mod tests {
     }
     fn name(&self) -> &'static str {
       "inline_json_test_parser"
+    }
+    /// Inline-format test parser: `tool_call_start` is empty so the streaming
+    /// processor routes via `process_inline_chunk` and never invokes this
+    /// method. Lock-step with `parse`: balance the first JSON object, return
+    /// the call with end_pos = one past the `}`.
+    fn try_parse_one_call(
+      &self,
+      buffer: &str,
+      tools: Option<&Value>,
+    ) -> Result<Option<(Vec<ToolCall>, usize)>, Error> {
+      let Some((_, obj_end)) = balanced_json_object_prefix(buffer) else {
+        return Ok(None);
+      };
+      let inner = buffer[..obj_end].trim();
+      match self.parse(inner, tools) {
+        Ok(calls) if !calls.is_empty() => Ok(Some((calls, obj_end))),
+        _ => Ok(Some((Vec::new(), obj_end))),
+      }
     }
   }
 
@@ -3161,128 +3215,110 @@ mod tests {
   }
 
   #[test]
-  fn per_parser_find_end_tag_in_buffer_routing() {
-    // Round-6 structural fix: end-tag detection is each parser's own
-    // responsibility (via `ToolParser::find_end_tag_in_buffer`). This unit
-    // exercises the core routing decisions per parser using the trait
-    // method directly, so a future regression in any one parser's override
-    // (or in the default's plain-substring search) trips here rather than
-    // only in an end-to-end streaming test where the failure mode is
-    // "buffer never completes".
+  fn per_parser_try_parse_one_call_routing() {
+    // L9 R10 structural unification: each parser owns ONE method
+    // (`try_parse_one_call`) that performs extraction AND end-detection in
+    // lock-step. This unit exercises that the per-parser implementations
+    // each return the correct `end_pos` for an adversarial in-payload
+    // end-tag literal — a future regression in any one parser's override
+    // trips here rather than only in an end-to-end streaming test.
 
     // -- json_tools: balanced object then plain-substring after `}` -------
-    // In-string end tag inside the object is skipped; the real end tag is
-    // the first match strictly after the balanced `}`.
     {
-      let buf = r#"<tool_call>{"s":"</tool_call>"}</tool_call>"#;
-      let pos = JsonTools
-        .find_end_tag_in_buffer(buf, "<tool_call>", "</tool_call>")
-        .expect("real end tag after the balanced object");
-      assert_eq!(&buf[..pos], r#"<tool_call>{"s":"</tool_call>"}"#);
-      assert_eq!(&buf[pos..], "</tool_call>");
-      // Object still open — no end tag yet (`None` keep collecting).
+      // Adversarial payload: string value contains the wrapper end_tag
+      // literal. The balanced-object scan must skip the in-string match.
+      // Use a payload with `name` so parse() actually emits a call.
+      let buf = r#"<tool_call>{"name":"echo","arguments":{"s":"</tool_call>"}}</tool_call>"#;
+      let (calls, end_pos) = JsonTools
+        .try_parse_one_call(buf, None)
+        .expect("Ok")
+        .expect("Some");
+      assert_eq!(end_pos, buf.len(), "end_pos lands at buffer end");
+      assert_eq!(calls.len(), 1, "one call extracted intact");
+      assert_eq!(calls[0].name, "echo");
       assert_eq!(
-        JsonTools.find_end_tag_in_buffer(
-          r#"<tool_call>{"s":"</tool_call>"#,
-          "<tool_call>",
-          "</tool_call>"
-        ),
-        None
+        calls[0].arguments,
+        serde_json::json!({"s": "</tool_call>"}),
+        "in-string end-tag literal preserved verbatim"
       );
+      // Object still open — `Ok(None)` keep collecting.
+      assert!(matches!(
+        JsonTools.try_parse_one_call(r#"<tool_call>{"s":"</tool_call>"#, None),
+        Ok(None)
+      ));
     }
 
     // -- glm47: classify-then-scan (object OR array OR XML) ---------------
     {
-      // Object payload: balanced object scan.
       let buf = r#"<tool_call>{"s":"</tool_call>"}</tool_call>"#;
-      let pos = Glm47
-        .find_end_tag_in_buffer(buf, "<tool_call>", "</tool_call>")
-        .expect("object payload");
-      assert_eq!(&buf[..pos], r#"<tool_call>{"s":"</tool_call>"}"#);
-      // Array payload: balanced array scan (in-string end tag skipped).
+      let (_, end_pos) = Glm47
+        .try_parse_one_call(buf, None)
+        .expect("Ok")
+        .expect("Some");
+      assert_eq!(end_pos, buf.len());
       let buf = r#"<tool_call>[{"s":"</tool_call>"}]</tool_call>"#;
-      let pos = Glm47
-        .find_end_tag_in_buffer(buf, "<tool_call>", "</tool_call>")
-        .expect("array payload");
-      assert_eq!(&buf[..pos], r#"<tool_call>[{"s":"</tool_call>"}]"#);
-      // XML-ish payload: plain substring.
+      let (_, end_pos) = Glm47
+        .try_parse_one_call(buf, None)
+        .expect("Ok")
+        .expect("Some");
+      assert_eq!(end_pos, buf.len());
       let xml = "<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>";
-      let pos = Glm47
-        .find_end_tag_in_buffer(xml, "<tool_call>", "</tool_call>")
-        .expect("XML-ish payload");
-      assert_eq!(&xml[pos..], "</tool_call>");
-      // Array still open — `None`.
-      assert_eq!(
-        Glm47.find_end_tag_in_buffer(
-          r#"<tool_call>[{"s":"</tool_call>"#,
-          "<tool_call>",
-          "</tool_call>"
-        ),
-        None
-      );
+      let (_, end_pos) = Glm47
+        .try_parse_one_call(xml, None)
+        .expect("Ok")
+        .expect("Some");
+      assert_eq!(end_pos, xml.len());
+      assert!(matches!(
+        Glm47.try_parse_one_call(r#"<tool_call>[{"s":"</tool_call>"#, None),
+        Ok(None)
+      ));
     }
 
-    // -- longcat: object fast-path then plain substring -------------------
+    // -- longcat: object fast-path then XML-aware otherwise ---------------
     {
-      // Object payload: balanced object scan, in-string end tag skipped.
       let buf = r#"<longcat_tool_call>{"s":"</longcat_tool_call>"}</longcat_tool_call>"#;
-      let pos = Longcat
-        .find_end_tag_in_buffer(buf, "<longcat_tool_call>", "</longcat_tool_call>")
-        .expect("object payload");
-      assert_eq!(
-        &buf[..pos],
-        r#"<longcat_tool_call>{"s":"</longcat_tool_call>"}"#
-      );
-      // Array payload (not accepted by parse) falls through to plain
-      // substring — the call surface is contract-correct (the parser will
-      // reject the shape later).
+      let (_, end_pos) = Longcat
+        .try_parse_one_call(buf, None)
+        .expect("Ok")
+        .expect("Some");
+      assert_eq!(end_pos, buf.len());
       let xml = "<longcat_tool_call>name<longcat_arg_key>k</longcat_arg_key><longcat_arg_value>v</longcat_arg_value></longcat_tool_call>";
-      let pos = Longcat
-        .find_end_tag_in_buffer(xml, "<longcat_tool_call>", "</longcat_tool_call>")
-        .expect("XML-ish payload");
-      assert_eq!(&xml[pos..], "</longcat_tool_call>");
+      let (_, end_pos) = Longcat
+        .try_parse_one_call(xml, None)
+        .expect("Ok")
+        .expect("Some");
+      assert_eq!(end_pos, xml.len());
     }
 
-    // -- pythonic: quote/bracket aware, find `)]` then end tag ------------
+    // -- pythonic: quote/bracket aware ----------------------------------
     {
-      // The R6 case: single-quoted string carrying the literal end tag.
       let buf = "<|tool_call_start|>[echo(s='<|tool_call_end|>')]<|tool_call_end|>";
-      let pos = Pythonic
-        .find_end_tag_in_buffer(buf, "<|tool_call_start|>", "<|tool_call_end|>")
-        .expect("real end tag after the )]");
-      assert_eq!(
-        &buf[..pos],
-        "<|tool_call_start|>[echo(s='<|tool_call_end|>')]"
-      );
-      assert_eq!(&buf[pos..], "<|tool_call_end|>");
-      // Double-quoted variant — same defence.
+      let (_, end_pos) = Pythonic
+        .try_parse_one_call(buf, None)
+        .expect("Ok")
+        .expect("Some");
+      assert_eq!(end_pos, buf.len());
       let buf = r#"<|tool_call_start|>[echo(s="<|tool_call_end|>")]<|tool_call_end|>"#;
-      let pos = Pythonic
-        .find_end_tag_in_buffer(buf, "<|tool_call_start|>", "<|tool_call_end|>")
-        .expect("real end tag after the )]");
-      assert_eq!(
-        &buf[..pos],
-        r#"<|tool_call_start|>[echo(s="<|tool_call_end|>")]"#
-      );
-      // Still open (no `)]` yet).
-      assert_eq!(
-        Pythonic.find_end_tag_in_buffer(
-          "<|tool_call_start|>[echo(s='[",
-          "<|tool_call_start|>",
-          "<|tool_call_end|>",
-        ),
-        None
-      );
+      let (_, end_pos) = Pythonic
+        .try_parse_one_call(buf, None)
+        .expect("Ok")
+        .expect("Some");
+      assert_eq!(end_pos, buf.len());
+      assert!(matches!(
+        Pythonic.try_parse_one_call("<|tool_call_start|>[echo(s='[", None),
+        Ok(None)
+      ));
     }
 
-    // -- qwen3_coder: find `</function>` then end tag ---------------------
+    // -- qwen3_coder: rfind `</function>` then end tag --------------------
     {
       let buf =
         "<tool_call><function=echo><parameter=s></tool_call></parameter></function></tool_call>";
-      let pos = Qwen3Coder
-        .find_end_tag_in_buffer(buf, "<tool_call>", "</tool_call>")
-        .expect("real end tag after </function>");
-      assert_eq!(&buf[pos..], "</tool_call>");
+      let (_, end_pos) = Qwen3Coder
+        .try_parse_one_call(buf, None)
+        .expect("Ok")
+        .expect("Some");
+      assert_eq!(end_pos, buf.len());
     }
 
     // -- minimax_m2: walk `<invoke …></invoke>` blocks --------------------
@@ -3292,20 +3328,21 @@ mod tests {
         r#"<invoke name="f"><parameter name="p">v</parameter></invoke>"#,
         "</minimax:tool_call>",
       );
-      let pos = MinimaxM2
-        .find_end_tag_in_buffer(buf, "<minimax:tool_call>", "</minimax:tool_call>")
-        .expect("real end tag after </invoke>");
-      assert_eq!(&buf[pos..], "</minimax:tool_call>");
-      // Parameter VALUE contains the end tag literal — must be safely inside.
+      let (_, end_pos) = MinimaxM2
+        .try_parse_one_call(buf, None)
+        .expect("Ok")
+        .expect("Some");
+      assert_eq!(end_pos, buf.len());
       let buf = concat!(
         "<minimax:tool_call>",
         r#"<invoke name="f"><parameter name="p"></minimax:tool_call></parameter></invoke>"#,
         "</minimax:tool_call>",
       );
-      let pos = MinimaxM2
-        .find_end_tag_in_buffer(buf, "<minimax:tool_call>", "</minimax:tool_call>")
-        .expect("real end tag after </invoke>");
-      assert_eq!(&buf[pos..], "</minimax:tool_call>");
+      let (_, end_pos) = MinimaxM2
+        .try_parse_one_call(buf, None)
+        .expect("Ok")
+        .expect("Some");
+      assert_eq!(end_pos, buf.len());
     }
 
     // -- kimi_k2: balanced JSON args per call, then section end -----------
@@ -3317,34 +3354,32 @@ mod tests {
         "<|tool_call_end|>",
         "<|tool_calls_section_end|>",
       );
-      let pos = KimiK2
-        .find_end_tag_in_buffer(
-          buf,
-          "<|tool_calls_section_begin|>",
-          "<|tool_calls_section_end|>",
-        )
-        .expect("real section end after the per-call end");
-      // Real end tag is the LAST `<|tool_calls_section_end|>`.
-      assert_eq!(&buf[pos..], "<|tool_calls_section_end|>");
+      let (_, end_pos) = KimiK2
+        .try_parse_one_call(buf, None)
+        .expect("Ok")
+        .expect("Some");
+      assert_eq!(end_pos, buf.len());
     }
 
     // -- function_gemma: find `}` outside <escape>...<escape> -------------
     {
       let buf =
         "<start_function_call>call:f{k:<escape><end_function_call><escape>}<end_function_call>";
-      let pos = FunctionGemma
-        .find_end_tag_in_buffer(buf, "<start_function_call>", "<end_function_call>")
-        .expect("real end tag after `}`");
-      assert_eq!(&buf[pos..], "<end_function_call>");
+      let (_, end_pos) = FunctionGemma
+        .try_parse_one_call(buf, None)
+        .expect("Ok")
+        .expect("Some");
+      assert_eq!(end_pos, buf.len());
     }
 
     // -- gemma4: walk `call:name{...}` blocks (brace + <|"|> aware) -------
     {
       let buf = r#"<|tool_call>call:f{k: <|"|><tool_call|><|"|>}<tool_call|>"#;
-      let pos = Gemma4
-        .find_end_tag_in_buffer(buf, "<|tool_call>", "<tool_call|>")
-        .expect("real end tag after `}`");
-      assert_eq!(&buf[pos..], "<tool_call|>");
+      let (_, end_pos) = Gemma4
+        .try_parse_one_call(buf, None)
+        .expect("Ok")
+        .expect("Some");
+      assert_eq!(end_pos, buf.len());
     }
   }
 
@@ -3872,22 +3907,26 @@ mod tests {
 
   #[test]
   fn streaming_json_tools_leading_bracket_buffer_extraction_is_contract_correct() {
-    // Round-5/6 invariant: `json_tools`' `parse()` requires a top-level
-    // `{name, arguments}` object — a top-level array fails `v.get("name")`.
-    // The parser's `find_end_tag_in_buffer` override uses the balanced JSON
-    // object scanner which finds the FIRST `{` in the payload. For a payload
-    // `[{...}]` that first `{` is the inner object; the override returns the
-    // end tag's offset (the call site / parser then rejects the array shape
-    // at the parse step). The contract is: the call surface returns
-    // *something* sensible (the buffer doesn't hang) and trailing display
-    // text reaches the caller; the parser correctly rejects.
+    // Round-5/6 invariant preserved under R10 unification: `json_tools`'
+    // `parse()` requires a top-level `{name, arguments}` object — a top-level
+    // array fails `v.get("name")`. `try_parse_one_call` uses the balanced
+    // JSON object scanner which finds the FIRST `{` in the payload. For
+    // `[{...}]` that first `{` is the inner object; the method returns
+    // `Some((Vec::new(), end_pos))` (zero calls but valid section advance)
+    // so the call site / processor still progresses past the section. The
+    // contract: the call surface returns sensible output (no hang) and
+    // trailing display text reaches the caller.
     let buf = r#"<tool_call>[{"name":"echo","arguments":{}}]</tool_call> trailing"#;
-    // The override locates an end-tag offset that does not panic and is
-    // strictly greater than the start tag.
-    let pos = JsonTools
-      .find_end_tag_in_buffer(buf, "<tool_call>", "</tool_call>")
-      .expect("json_tools override returns Some for a closeable buffer");
-    assert!(buf[pos..].starts_with("</tool_call>"));
+    let (calls, end_pos) = JsonTools
+      .try_parse_one_call(buf, None)
+      .expect("Ok")
+      .expect("Some — section is closeable");
+    assert!(buf[..end_pos].ends_with("</tool_call>"));
+    assert_eq!(
+      calls.len(),
+      0,
+      "json_tools rejects a top-level array shape (no `name` field)"
+    );
     // End-to-end streaming: the parser rejects the array shape, but the
     // trailing display text still reaches the caller (no buffer hang).
     let (d, c) = run_with_parser(Box::new(JsonTools), &[buf]);
@@ -3899,149 +3938,132 @@ mod tests {
   }
 
   #[test]
-  fn parser_find_end_tag_audit_assignments() {
-    // Round-6 audit lock: each parser's end-tag detection strategy is fixed
-    // here so a future regression in any override (or a silent removal of
-    // an override) trips a unit test rather than only an integration
-    // symptom. Mirrors the L9 R6 per-parser audit:
+  fn parser_try_parse_one_call_audit_assignments() {
+    // L9 R10 audit lock: each parser's `try_parse_one_call` extraction is
+    // fixed here so a future regression in any implementation (or a silent
+    // removal of an override) trips a unit test rather than only an
+    // integration symptom. Mirrors the L9 R6/R10 per-parser audit:
     //
     // | parser          | strategy                                                                  |
     // |-----------------|----------------------------------------------------------------------------|
     // | json_tools      | balanced JSON object then plain-substring after `}`                       |
-    // | glm47           | classify payload: `{` object / `[` array / else plain-substring           |
-    // | longcat         | classify `{` object then plain-substring; else plain-substring            |
+    // | glm47           | classify payload: `{` object / `[` array / else `<arg_key>` race          |
+    // | longcat         | `{` object fast-path; else value-aware XML scan                           |
     // | pythonic        | quote/bracket aware `)]` then plain-substring                             |
-    // | mistral         | no end tag (EOS-closed); trait method never invoked                       |
-    // | qwen3_coder     | XML `<function=...>…</function>` then plain-substring                     |
-    // | minimax_m2      | walk `<invoke …>…</invoke>` blocks then plain-substring                   |
-    // | kimi_k2         | walk per-call `<|tool_call_begin|>...{json}<|tool_call_end|>` then end    |
+    // | mistral         | EOS-closed; try_parse_one_call mirrors parse via `[ARGS]{json}`           |
+    // | qwen3_coder     | rfind `</function>` (R10: in-VALUE `</function>` literal skipped)         |
+    // | minimax_m2      | walk `<invoke …>…</invoke>` blocks; opener-vs-end race                    |
+    // | kimi_k2         | walk per-call `<|tool_call_begin|>...{json}<|tool_call_end|>`; opener-vs-end race |
     // | function_gemma  | `call:name{...}` with `<escape>` aware `}` then plain-substring           |
-    // | gemma4          | `call:name{...}` with `<|"|>` + balanced braces then plain-substring      |
+    // | gemma4          | `call:name{...}` with `<|"|>` + balanced braces; opener-vs-end race       |
     //
     // The test fixture: each parser is given a *minimal*, *in-protocol* buffer
     // whose payload data carries the end_tag LITERAL where the parser's own
     // syntax says it is INSIDE the payload, plus a TRAILING legitimate end
-    // tag. The override must find the trailing one, never the in-payload one.
+    // tag. `try_parse_one_call` must extract the call AND return an `end_pos`
+    // exactly at the trailing end-tag's close.
 
     struct Row {
       label: &'static str,
       parser: Box<dyn ToolParser>,
       buffer: &'static str,
-      start: &'static str,
-      end: &'static str,
-      // Bytes BEFORE the returned offset must equal `expected_prefix`.
-      expected_prefix: &'static str,
+      // Expected end_pos: the byte position one past the trailing end-tag.
+      // Set to `buffer.len()` for buffers whose adversarial payload ends at
+      // the section close (the common in-table case).
+      expect_end_pos_eq_len: bool,
     }
     let rows = [
       Row {
         label: "json_tools",
         parser: Box::new(JsonTools),
         buffer: r#"<tool_call>{"s":"</tool_call>"}</tool_call>"#,
-        start: "<tool_call>",
-        end: "</tool_call>",
-        expected_prefix: r#"<tool_call>{"s":"</tool_call>"}"#,
+        expect_end_pos_eq_len: true,
       },
       Row {
         label: "glm47 (object)",
         parser: Box::new(Glm47),
         buffer: r#"<tool_call>{"s":"</tool_call>"}</tool_call>"#,
-        start: "<tool_call>",
-        end: "</tool_call>",
-        expected_prefix: r#"<tool_call>{"s":"</tool_call>"}"#,
+        expect_end_pos_eq_len: true,
       },
       Row {
         label: "glm47 (array)",
         parser: Box::new(Glm47),
         buffer: r#"<tool_call>[{"s":"</tool_call>"}]</tool_call>"#,
-        start: "<tool_call>",
-        end: "</tool_call>",
-        expected_prefix: r#"<tool_call>[{"s":"</tool_call>"}]"#,
+        expect_end_pos_eq_len: true,
       },
       Row {
         label: "longcat",
         parser: Box::new(Longcat),
         buffer: r#"<longcat_tool_call>{"s":"</longcat_tool_call>"}</longcat_tool_call>"#,
-        start: "<longcat_tool_call>",
-        end: "</longcat_tool_call>",
-        expected_prefix: r#"<longcat_tool_call>{"s":"</longcat_tool_call>"}"#,
+        expect_end_pos_eq_len: true,
       },
       Row {
         label: "pythonic (single-quoted)",
         parser: Box::new(Pythonic),
         buffer: "<|tool_call_start|>[echo(s='<|tool_call_end|>')]<|tool_call_end|>",
-        start: "<|tool_call_start|>",
-        end: "<|tool_call_end|>",
-        expected_prefix: "<|tool_call_start|>[echo(s='<|tool_call_end|>')]",
+        expect_end_pos_eq_len: true,
       },
       Row {
         label: "pythonic (double-quoted)",
         parser: Box::new(Pythonic),
         buffer: r#"<|tool_call_start|>[echo(s="<|tool_call_end|>")]<|tool_call_end|>"#,
-        start: "<|tool_call_start|>",
-        end: "<|tool_call_end|>",
-        expected_prefix: r#"<|tool_call_start|>[echo(s="<|tool_call_end|>")]"#,
+        expect_end_pos_eq_len: true,
       },
       Row {
         label: "qwen3_coder",
         parser: Box::new(Qwen3Coder),
         buffer: "<tool_call><function=echo><parameter=s></tool_call></parameter></function></tool_call>",
-        start: "<tool_call>",
-        end: "</tool_call>",
-        expected_prefix: "<tool_call><function=echo><parameter=s></tool_call></parameter></function>",
+        expect_end_pos_eq_len: true,
       },
       Row {
         label: "minimax_m2",
         parser: Box::new(MinimaxM2),
         buffer: "<minimax:tool_call><invoke name=\"f\"><parameter name=\"p\"></minimax:tool_call></parameter></invoke></minimax:tool_call>",
-        start: "<minimax:tool_call>",
-        end: "</minimax:tool_call>",
-        expected_prefix: "<minimax:tool_call><invoke name=\"f\"><parameter name=\"p\"></minimax:tool_call></parameter></invoke>",
+        expect_end_pos_eq_len: true,
       },
       Row {
         label: "kimi_k2",
         parser: Box::new(KimiK2),
         buffer: "<|tool_calls_section_begin|><|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>{\"s\":\"<|tool_calls_section_end|>\"}<|tool_call_end|><|tool_calls_section_end|>",
-        start: "<|tool_calls_section_begin|>",
-        end: "<|tool_calls_section_end|>",
-        expected_prefix: "<|tool_calls_section_begin|><|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>{\"s\":\"<|tool_calls_section_end|>\"}<|tool_call_end|>",
+        expect_end_pos_eq_len: true,
       },
       Row {
         label: "function_gemma",
         parser: Box::new(FunctionGemma),
         buffer: "<start_function_call>call:f{k:<escape><end_function_call><escape>}<end_function_call>",
-        start: "<start_function_call>",
-        end: "<end_function_call>",
-        expected_prefix: "<start_function_call>call:f{k:<escape><end_function_call><escape>}",
+        expect_end_pos_eq_len: true,
       },
       Row {
         label: "gemma4",
         parser: Box::new(Gemma4),
         buffer: r#"<|tool_call>call:f{k: <|"|><tool_call|><|"|>}<tool_call|>"#,
-        start: "<|tool_call>",
-        end: "<tool_call|>",
-        expected_prefix: r#"<|tool_call>call:f{k: <|"|><tool_call|><|"|>}"#,
+        expect_end_pos_eq_len: true,
       },
     ];
     for row in &rows {
-      let pos = row
+      let result = row
         .parser
-        .find_end_tag_in_buffer(row.buffer, row.start, row.end)
-        .unwrap_or_else(|| panic!("{}: end tag not found", row.label));
-      assert_eq!(
-        &row.buffer[..pos],
-        row.expected_prefix,
-        "{}: scanner returned wrong offset",
-        row.label
-      );
+        .try_parse_one_call(row.buffer, None)
+        .unwrap_or_else(|e| panic!("{}: try_parse_one_call errored: {e}", row.label));
+      let (_calls, end_pos) =
+        result.unwrap_or_else(|| panic!("{}: section not detected as complete", row.label));
+      if row.expect_end_pos_eq_len {
+        assert_eq!(
+          end_pos,
+          row.buffer.len(),
+          "{}: end_pos must land at buffer end (one past the trailing close)",
+          row.label
+        );
+      }
       assert!(
-        row.buffer[pos..].starts_with(row.end),
-        "{}: offset does not align with end tag",
+        end_pos > 0,
+        "{}: end_pos must advance past at least one byte",
         row.label
       );
     }
-    // Mistral has no end tag — the trait method is never invoked for it
-    // (the streaming processor short-circuits the empty-end-tag case). The
-    // audit-table note above is the contract; no override is required.
+    // Mistral has no end tag — the streaming processor short-circuits the
+    // empty-end-tag case so `try_parse_one_call` is exercised only via
+    // `parse`'s default loop and a dedicated mistral test below.
     assert!(Mistral.tool_call_end().is_empty());
   }
 
@@ -4615,5 +4637,252 @@ mod tests {
       serde_json::json!({"k": "v"}),
       "key/value extracted via the XML-aware scan"
     );
+  }
+
+  // --- L9 R10 regression coverage -----------------------------------------
+  // The R10 defining defect: qwen3_coder's `parse()` uses
+  // `text.rfind("</function>")` because parameter VALUES legitimately carry
+  // `</function>` literals. R7..R9 patched the *scanner* with `find()`
+  // (FIRST match) which diverges from `parse`'s rfind, so the in-value
+  // `</function>` (and the in-value wrapper end `</tool_call>`) cut the
+  // section at the wrong byte. The R10 structural fix UNIFIES extraction +
+  // end-detection in `try_parse_one_call`, which uses the SAME rfind chain
+  // as `parse`, so both literals are safely inside the section.
+
+  #[test]
+  fn streaming_qwen3_coder_parameter_value_with_function_close_and_tool_call_close_literals_extracts_intact()
+   {
+    // Adversarial payload: parameter VALUE contains BOTH `</function>` and
+    // `</tool_call>` literals. The rfind chain (last `</tool_call>`, then
+    // last `</function>` before it) must skip the in-value literals.
+    let payload = concat!(
+      "<tool_call><function=f><parameter=p>v containing ",
+      "</function> and </tool_call>",
+      "</parameter></function></tool_call>",
+    );
+    // (i) Single-chunk.
+    let (d, c) = run_with_parser(Box::new(Qwen3Coder), &[payload]);
+    assert_eq!(d, "", "no trailing display leak");
+    assert_eq!(c.len(), 1, "one tool call extracted");
+    assert_eq!(c[0].name, "f");
+    let p_value = c[0]
+      .arguments
+      .as_object()
+      .and_then(|m| m.get("p"))
+      .and_then(Value::as_str)
+      .expect("string parameter `p`");
+    assert!(
+      p_value.contains("</function>"),
+      "`</function>` literal preserved verbatim inside the parameter value (got: {p_value:?})"
+    );
+    assert!(
+      p_value.contains("</tool_call>"),
+      "`</tool_call>` literal preserved verbatim inside the parameter value (got: {p_value:?})"
+    );
+
+    // (ii) Split-across-chunks: boundary inside the in-value `</tool_call>`.
+    let (d2, c2) = run_with_parser(
+      Box::new(Qwen3Coder),
+      &[
+        concat!(
+          "<tool_call><function=f><parameter=p>v containing ",
+          "</function> and </tool_",
+        ),
+        "call></parameter></function></tool_call>",
+      ],
+    );
+    assert_eq!(d2, "");
+    assert_eq!(c2.len(), 1);
+    assert_eq!(c2[0].name, "f");
+  }
+
+  // --- L9 R10 lock-step audit: try_parse_one_call_matches_parse -----------
+  // For every parser, asserting that `try_parse_one_call(buffer)` returns
+  // the SAME call set that running `parse(strip_markers(buffer))` would,
+  // for a battery of representative payloads. This is the structural
+  // safety net: if a future maintenance change drifts a parser's
+  // `try_parse_one_call` away from its `parse`, this trips immediately.
+
+  fn assert_try_parse_one_call_matches_parse(parser: &dyn ToolParser, label: &str, buffer: &str) {
+    let try_result = parser
+      .try_parse_one_call(buffer, None)
+      .unwrap_or_else(|e| panic!("{label}: try_parse_one_call errored: {e}"));
+    let (try_calls, end_pos) = try_result
+      .unwrap_or_else(|| panic!("{label}: try_parse_one_call returned None (incomplete buffer)"));
+    // Run parse() over the EXACT same section bytes the processor would
+    // delegate (start/end markers stripped, trimmed) — the contract is that
+    // both methods agree call-by-call on the same section.
+    let inner = strip_section_markers(
+      &buffer[..end_pos],
+      parser.tool_call_start(),
+      parser.tool_call_end(),
+    );
+    let parse_calls = parser.parse(inner, None).unwrap_or_default();
+    assert_eq!(
+      try_calls.len(),
+      parse_calls.len(),
+      "{label}: try_parse_one_call vs parse call-count mismatch"
+    );
+    for (i, (a, b)) in try_calls.iter().zip(parse_calls.iter()).enumerate() {
+      assert_eq!(a.name, b.name, "{label}[{i}]: name mismatch");
+      assert_eq!(a.arguments, b.arguments, "{label}[{i}]: arguments mismatch");
+      assert_eq!(a.id, b.id, "{label}[{i}]: id mismatch");
+    }
+  }
+
+  #[test]
+  fn try_parse_one_call_matches_parse_json_tools() {
+    let cases = [
+      r#"<tool_call>{"name":"a","arguments":{}}</tool_call>"#,
+      r#"<tool_call>{"name":"echo","arguments":{"s":"</tool_call>"}}</tool_call>"#,
+      // With trailing display: end_pos must land at the section close,
+      // and the parsed call from that slice must match.
+      r#"<tool_call>{"name":"a","arguments":{}}</tool_call> trailing"#,
+    ];
+    for c in cases {
+      assert_try_parse_one_call_matches_parse(&JsonTools, "json_tools", c);
+    }
+  }
+
+  #[test]
+  fn try_parse_one_call_matches_parse_pythonic() {
+    let cases = [
+      "<|tool_call_start|>[ping()]<|tool_call_end|>",
+      "<|tool_call_start|>[echo(s='hello')]<|tool_call_end|>",
+      "<|tool_call_start|>[echo(s='<|tool_call_end|>')]<|tool_call_end|>",
+      r#"<|tool_call_start|>[echo(s="<|tool_call_end|>")]<|tool_call_end|>"#,
+      "<|tool_call_start|>[ping()]<|tool_call_end|> after",
+    ];
+    for c in cases {
+      assert_try_parse_one_call_matches_parse(&Pythonic, "pythonic", c);
+    }
+  }
+
+  #[test]
+  fn try_parse_one_call_matches_parse_mistral() {
+    let cases = [
+      r#"[TOOL_CALLS]get_weather[ARGS]{"city":"Tokyo"}"#,
+      r#"[TOOL_CALLS]ping[ARGS]{}"#,
+    ];
+    for c in cases {
+      assert_try_parse_one_call_matches_parse(&Mistral, "mistral", c);
+    }
+  }
+
+  #[test]
+  fn try_parse_one_call_matches_parse_qwen3_coder() {
+    let cases = [
+      "<tool_call><function=ping></function></tool_call>",
+      "<tool_call><function=echo><parameter=s>hello</parameter></function></tool_call>",
+      // R10 case: in-value `</function>` AND `</tool_call>` literals.
+      concat!(
+        "<tool_call><function=f><parameter=p>v containing ",
+        "</function> and </tool_call>",
+        "</parameter></function></tool_call>",
+      ),
+    ];
+    for c in cases {
+      assert_try_parse_one_call_matches_parse(&Qwen3Coder, "qwen3_coder", c);
+    }
+  }
+
+  #[test]
+  fn try_parse_one_call_matches_parse_glm47() {
+    let cases = [
+      // XML-style.
+      "<tool_call>echo<arg_key>s</arg_key><arg_value>v</arg_value></tool_call>",
+      // JSON-object fallback.
+      r#"<tool_call>{"name":"echo","arguments":{"s":"hi"}}</tool_call>"#,
+      // JSON-array fallback.
+      r#"<tool_call>[{"name":"echo","arguments":{"s":"hi"}}]</tool_call>"#,
+      // Plain fallback (no `<arg_key>`, no JSON leading byte).
+      "<tool_call>plain command</tool_call>",
+    ];
+    for c in cases {
+      assert_try_parse_one_call_matches_parse(&Glm47, "glm47", c);
+    }
+  }
+
+  #[test]
+  fn try_parse_one_call_matches_parse_longcat() {
+    let cases = [
+      // XML-style.
+      "<longcat_tool_call>echo<longcat_arg_key>s</longcat_arg_key><longcat_arg_value>v</longcat_arg_value></longcat_tool_call>",
+      // JSON fast-path.
+      r#"<longcat_tool_call>{"name":"echo","arguments":{"s":"hi"}}</longcat_tool_call>"#,
+    ];
+    for c in cases {
+      assert_try_parse_one_call_matches_parse(&Longcat, "longcat", c);
+    }
+  }
+
+  #[test]
+  fn try_parse_one_call_matches_parse_minimax_m2() {
+    let cases = [
+      concat!(
+        "<minimax:tool_call>",
+        r#"<invoke name="f"><parameter name="p">v</parameter></invoke>"#,
+        "</minimax:tool_call>",
+      ),
+      concat!(
+        "<minimax:tool_call>",
+        r#"<invoke name="a"></invoke><invoke name="b"></invoke>"#,
+        "</minimax:tool_call>",
+      ),
+    ];
+    for c in cases {
+      assert_try_parse_one_call_matches_parse(&MinimaxM2, "minimax_m2", c);
+    }
+  }
+
+  #[test]
+  fn try_parse_one_call_matches_parse_kimi_k2() {
+    let cases = [
+      concat!(
+        "<|tool_calls_section_begin|>",
+        "<|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>",
+        r#"{"k":"v"}"#,
+        "<|tool_call_end|>",
+        "<|tool_calls_section_end|>",
+      ),
+      // Two per-call blocks in one section.
+      concat!(
+        "<|tool_calls_section_begin|>",
+        "<|tool_call_begin|>functions.a:0<|tool_call_argument_begin|>",
+        r#"{}"#,
+        "<|tool_call_end|>",
+        "<|tool_call_begin|>functions.b:1<|tool_call_argument_begin|>",
+        r#"{}"#,
+        "<|tool_call_end|>",
+        "<|tool_calls_section_end|>",
+      ),
+    ];
+    for c in cases {
+      assert_try_parse_one_call_matches_parse(&KimiK2, "kimi_k2", c);
+    }
+  }
+
+  #[test]
+  fn try_parse_one_call_matches_parse_function_gemma() {
+    let cases = [
+      "<start_function_call>call:f{k:1}<end_function_call>",
+      "<start_function_call>call:f{k:<escape>hello<escape>}<end_function_call>",
+    ];
+    for c in cases {
+      assert_try_parse_one_call_matches_parse(&FunctionGemma, "function_gemma", c);
+    }
+  }
+
+  #[test]
+  fn try_parse_one_call_matches_parse_gemma4() {
+    let cases = [
+      r#"<|tool_call>call:f{k: 1}<tool_call|>"#,
+      r#"<|tool_call>call:f{k: <|"|>hello<|"|>}<tool_call|>"#,
+      // Two calls in one section.
+      r#"<|tool_call>call:a{k: 1}call:b{k: 2}<tool_call|>"#,
+    ];
+    for c in cases {
+      assert_try_parse_one_call_matches_parse(&Gemma4, "gemma4", c);
+    }
   }
 }
