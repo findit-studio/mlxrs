@@ -577,17 +577,17 @@ impl ToolParser for Glm47 {
   fn find_end_tag_in_buffer(&self, buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
     // glm47 accepts THREE shapes via `parse()`:
     //   1. XML-style `name<arg_key>k</arg_key><arg_value>v</arg_value>…` —
-    //      values are plain text after `</arg_value>` close, so the end tag
-    //      cannot legitimately appear inside a `<arg_value>` body without
-    //      breaking the format (any `</arg_value>` in v would terminate the
-    //      value early); treat as plain substring.
+    //      values inside `<arg_value>…</arg_value>` are arbitrary text and may
+    //      legitimately carry the wrapper end tag literal `</tool_call>`
+    //      (L9 R7 finding). Use [`xml_value_aware_end_tag_scan`] to skip
+    //      `<arg_value>` regions before matching the wrapper end tag.
     //   2. `glm_parse_json` fallback — top-level JSON object OR array. Use the
     //      balanced scanner whose shape matches the payload's leading byte.
     //   3. `glm_parse_plain` fallback — plain text.
     //
     // Classify the payload's leading non-whitespace byte: `{` → balanced
     // object then plain substring; `[` → balanced array then plain substring;
-    // else plain substring.
+    // else value-tag-aware XML scan (shape 1).
     let payload_at = match buffer.find(start_tag) {
       Some(idx) => idx + start_tag.len(),
       None => return buffer.find(end_tag),
@@ -604,9 +604,13 @@ impl ToolParser for Glm47 {
         let rel = payload[arr_end..].find(end_tag)?;
         Some(payload_at + arr_end + rel)
       }
-      JsonPayloadStart::None => buffer[payload_at..]
-        .find(end_tag)
-        .map(|rel| payload_at + rel),
+      JsonPayloadStart::None => {
+        // Shape 1 (XML-style) OR shape 3 (plain). The value-aware scanner is
+        // safe for both: if the payload has no `<arg_value>` regions it
+        // degenerates to a plain substring search for `end_tag`.
+        xml_value_aware_end_tag_scan(payload, "<arg_value>", "</arg_value>", end_tag)
+          .map(|rel| payload_at + rel)
+      }
     }
   }
 }
@@ -873,10 +877,10 @@ impl ToolParser for Longcat {
     // not array, the `else` branch is XML-style `<longcat_arg_key>` data) or
     // the XML-style format. For JSON payloads use the string-aware balanced
     // object scan so an in-string `</longcat_tool_call>` cannot truncate the
-    // object; for XML-style payloads plain substring is correct (an
-    // `</longcat_tool_call>` inside a `<longcat_arg_value>` body would
-    // structurally terminate the value early, which is the model's own
-    // protocol violation, not a scanner gap).
+    // object; for XML-style payloads use [`xml_value_aware_end_tag_scan`] so a
+    // `</longcat_tool_call>` literal inside a `<longcat_arg_value>` body (L9
+    // R7 finding: legitimately valid value text) does not cut the buffer
+    // mid-call.
     let payload_at = match buffer.find(start_tag) {
       Some(idx) => idx + start_tag.len(),
       None => return buffer.find(end_tag),
@@ -890,9 +894,13 @@ impl ToolParser for Longcat {
       let rel = payload[obj_end..].find(end_tag)?;
       Some(payload_at + obj_end + rel)
     } else {
-      buffer[payload_at..]
-        .find(end_tag)
-        .map(|rel| payload_at + rel)
+      xml_value_aware_end_tag_scan(
+        payload,
+        "<longcat_arg_value>",
+        "</longcat_arg_value>",
+        end_tag,
+      )
+      .map(|rel| payload_at + rel)
     }
   }
 }
@@ -2228,6 +2236,59 @@ fn pythonic_call_close(payload: &str) -> Option<usize> {
   None
 }
 
+/// Value-aware XML end-tag scan: walk `payload` looking for `end_tag`, but
+/// SKIP any region delimited by `value_open` ... `value_close` (treat its
+/// bytes as opaque value data). Returns the byte offset of the first
+/// `end_tag` outside any value region, or `None` if not yet found / still
+/// inside an unterminated value.
+///
+/// L9 R7 fix for glm47 + longcat XML-style fallback payloads: their values
+/// are extracted via `<arg_value>...</arg_value>` (resp.
+/// `<longcat_arg_value>...</longcat_arg_value>`) and a `</tool_call>` (resp.
+/// `</longcat_tool_call>`) wrapper-end literal inside such a value is VALID
+/// value text — NOT the wrapper close. The previous plain substring scanner
+/// truncated mid-call. This scanner:
+///
+/// 1. Walks left to right; on encountering `value_open`, jumps to the next
+///    `value_close` (returning `None` if absent — buffer needs more bytes
+///    and the streaming caller will retry on the next chunk).
+/// 2. Otherwise checks whether `end_tag` starts at the current position; if
+///    so, returns the position.
+/// 3. Returns `None` if neither `value_open` nor `end_tag` is reachable
+///    inside the current payload.
+fn xml_value_aware_end_tag_scan(
+  payload: &str,
+  value_open: &str,
+  value_close: &str,
+  end_tag: &str,
+) -> Option<usize> {
+  let mut idx = 0usize;
+  while idx <= payload.len() {
+    let next_value = payload[idx..].find(value_open).map(|p| idx + p);
+    let next_end = payload[idx..].find(end_tag).map(|p| idx + p);
+    match (next_value, next_end) {
+      (Some(v), Some(e)) if v < e => {
+        // A value region opens BEFORE the next end-tag candidate. Skip the
+        // entire value body so an in-value `end_tag` literal cannot match.
+        let after_open = v + value_open.len();
+        let close_rel = payload[after_open..].find(value_close)?;
+        idx = after_open + close_rel + value_close.len();
+      }
+      (_, Some(e)) => return Some(e),
+      (Some(v), None) => {
+        // No end_tag yet, but a value opens — must still skip it to keep
+        // the cursor honest; if its close hasn't arrived yet, return None
+        // (the streaming caller will retry).
+        let after_open = v + value_open.len();
+        let close_rel = payload[after_open..].find(value_close)?;
+        idx = after_open + close_rel + value_close.len();
+      }
+      (None, None) => return None,
+    }
+  }
+  None
+}
+
 /// Skip a qwen3_coder `<function=...>…</function>` body, then plain-substring
 /// search for `end_tag` strictly after `</function>`. Returns `None` while
 /// the function block is still open / no end tag has arrived.
@@ -2262,6 +2323,15 @@ fn xml_function_then_end_tag(buffer: &str, start_tag: &str, end_tag: &str) -> Op
 ///
 /// Returns `None` while still inside an invoke / no `</invoke>` has arrived /
 /// no end tag yet.
+///
+/// L9 R7 fix: at each post-block cursor, search for BOTH the section
+/// `end_tag` AND the next `<invoke name=` opener; whichever occurs at the
+/// EARLIER byte position wins. If `end_tag` is earlier the section is closed
+/// and we return its offset. If the opener is earlier we continue with the
+/// next block. The previous loop greedily searched for the next opener first
+/// and a trailing-display literal like `<invoke name="x">` after the section
+/// close was misread as another in-section block opener, masking the real
+/// `end_tag` that occurred BEFORE it.
 fn xml_invoke_then_end_tag(buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
   let payload_at = match buffer.find(start_tag) {
     Some(idx) => idx + start_tag.len(),
@@ -2272,17 +2342,17 @@ fn xml_invoke_then_end_tag(buffer: &str, start_tag: &str, end_tag: &str) -> Opti
   let close = "</invoke>";
   let mut cursor = 0;
   loop {
-    // Require a `<invoke name=` open at or after `cursor`; if absent we're
-    // either between invokes (look for end tag from here) or have not yet
-    // entered one (keep collecting).
-    let open_rel = match payload[cursor..].find(open) {
-      Some(o) => cursor + o,
-      None => {
-        // No further invoke opens in this buffer. From `cursor` onward the
-        // bytes are the optional gap before the section end tag.
-        let rel = payload[cursor..].find(end_tag)?;
-        return Some(payload_at + cursor + rel);
-      }
+    // L9 R7: race the end tag against the next opener; whichever appears
+    // FIRST at or after `cursor` wins. End-tag-first means the section is
+    // closed; opener-first means another in-section block follows.
+    let end_rel = payload[cursor..].find(end_tag).map(|p| cursor + p);
+    let open_rel = payload[cursor..].find(open).map(|p| cursor + p);
+    let open_rel = match (end_rel, open_rel) {
+      (Some(e), Some(o)) if e <= o => return Some(payload_at + e),
+      (Some(_), Some(o)) => o,
+      (Some(e), None) => return Some(payload_at + e),
+      (None, Some(o)) => o,
+      (None, None) => return None,
     };
     // Inside an invoke: find its `</invoke>` close. If absent, keep
     // collecting (the invoke is still streaming).
@@ -2316,14 +2386,20 @@ fn kimi_section_then_end_tag(buffer: &str, start_tag: &str, end_tag: &str) -> Op
   let call_end = "<|tool_call_end|>";
   let mut cursor = 0;
   loop {
-    // Look for the next per-call open. If none, search for the section end
-    // tag from `cursor` (we are either between calls or before any call).
-    let open_rel = match payload[cursor..].find(call_begin) {
-      Some(o) => cursor + o,
-      None => {
-        let rel = payload[cursor..].find(end_tag)?;
-        return Some(payload_at + cursor + rel);
-      }
+    // L9 R7: race the section end tag against the next per-call opener;
+    // whichever appears FIRST at or after `cursor` wins. End-tag-first means
+    // the section closed; opener-first means another in-section per-call
+    // follows. Greedily seeking the opener first masked the real section end
+    // when trailing display text after the section close happened to contain
+    // the `<|tool_call_begin|>` literal.
+    let end_rel = payload[cursor..].find(end_tag).map(|p| cursor + p);
+    let open_rel = payload[cursor..].find(call_begin).map(|p| cursor + p);
+    let open_rel = match (end_rel, open_rel) {
+      (Some(e), Some(o)) if e <= o => return Some(payload_at + e),
+      (Some(_), Some(o)) => o,
+      (Some(e), None) => return Some(payload_at + e),
+      (None, Some(o)) => o,
+      (None, None) => return None,
     };
     // Past the per-call open: find the per-call `<|tool_call_argument_begin|>`.
     let after_open = open_rel + call_begin.len();
@@ -2429,14 +2505,20 @@ fn gemma4_calls_then_end_tag(buffer: &str, start_tag: &str, end_tag: &str) -> Op
   let payload = &buffer[payload_at..];
   let mut cursor = 0;
   loop {
-    // Look for the next `call:` open. If none, search for `end_tag` from
-    // `cursor` (we are either between calls or before any call).
-    let call_rel = match payload[cursor..].find("call:") {
-      Some(c) => cursor + c,
-      None => {
-        let rel = payload[cursor..].find(end_tag)?;
-        return Some(payload_at + cursor + rel);
-      }
+    // L9 R7: race the section end tag against the next `call:` opener;
+    // whichever appears FIRST at or after `cursor` wins. End-tag-first means
+    // the section closed; opener-first means another in-section call follows.
+    // Greedily seeking the opener first masked the real section end when
+    // trailing display text after the section close happened to contain the
+    // `call:` literal.
+    let end_rel = payload[cursor..].find(end_tag).map(|p| cursor + p);
+    let call_rel = payload[cursor..].find("call:").map(|p| cursor + p);
+    let call_rel = match (end_rel, call_rel) {
+      (Some(e), Some(c)) if e <= c => return Some(payload_at + e),
+      (Some(_), Some(c)) => c,
+      (Some(e), None) => return Some(payload_at + e),
+      (None, Some(c)) => c,
+      (None, None) => return None,
     };
     let after_marker = call_rel + "call:".len();
     let bytes = payload.as_bytes();
@@ -4076,6 +4158,243 @@ mod tests {
     assert_eq!(
       p.tool_calls[0].arguments,
       serde_json::json!({"k": "<tool_call|>"})
+    );
+  }
+
+  // --- L9 R7 regression coverage -------------------------------------------
+  // Finding 1: multi-block scanners (`xml_invoke_then_end_tag`,
+  // `kimi_section_then_end_tag`, `gemma4_calls_then_end_tag`) previously
+  // searched for the NEXT block opener before the section `end_tag`. If
+  // trailing display text after the section close happened to contain the
+  // inner-block opener literal (e.g. ` text <invoke name="x">` after a closed
+  // `</minimax:tool_call>`) the scanner mis-classified that literal as another
+  // in-section block, then never found a closing `</invoke>` and returned
+  // `None`, so the completed call was never emitted. The L9 R7 fix races
+  // end_tag against opener at each cursor and returns whichever comes first.
+
+  #[test]
+  fn streaming_minimax_m2_trailing_display_with_inner_opener_does_not_hide_end_tag() {
+    // Trailing display text after the section close contains the literal
+    // inner-opener `<invoke name=`. The scanner must return the end-tag
+    // position (BEFORE the trailing display) so the call is emitted and the
+    // trailing bytes reach display via the parser's normal flush mechanism.
+    let payload = concat!(
+      "<minimax:tool_call>",
+      r#"<invoke name="f"><parameter name="p">v</parameter></invoke>"#,
+      "</minimax:tool_call>",
+      r#" some text <invoke name="x">"#,
+    );
+    let (d, c) = run_with_parser(Box::new(MinimaxM2), &[payload]);
+    assert_eq!(c.len(), 1, "completed tool call must be emitted");
+    assert_eq!(c[0].name, "f");
+    assert_eq!(
+      d, r#" some text <invoke name="x">"#,
+      "trailing display (with the inner-opener literal) reaches the caller \
+       byte-for-byte; the in-display opener does not re-open collection"
+    );
+  }
+
+  #[test]
+  fn streaming_minimax_m2_trailing_display_with_inner_opener_split_across_chunks() {
+    // Same payload as above, but split inside the trailing display's literal
+    // `<invoke name=` opener: the split must not change behaviour.
+    let (d, c) = run_with_parser(
+      Box::new(MinimaxM2),
+      &[
+        concat!(
+          "<minimax:tool_call>",
+          r#"<invoke name="f"><parameter name="p">v</parameter></invoke>"#,
+          "</minimax:tool_call>",
+          " some text <invoke ",
+        ),
+        r#"name="x">"#,
+      ],
+    );
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].name, "f");
+    assert_eq!(d, r#" some text <invoke name="x">"#);
+  }
+
+  #[test]
+  fn streaming_kimi_k2_trailing_display_with_inner_opener_does_not_hide_end_tag() {
+    // Trailing display after the kimi_k2 section close contains the
+    // literal per-call opener `<|tool_call_begin|>` (e.g. quoted in a model
+    // self-narration). The end-tag must be returned at the section close.
+    let payload = concat!(
+      "<|tool_calls_section_begin|>",
+      "<|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>",
+      r#"{"k":"v"}"#,
+      "<|tool_call_end|>",
+      "<|tool_calls_section_end|>",
+      " some text <|tool_call_begin|>functions.x:1",
+    );
+    let (d, c) = run_with_parser(Box::new(KimiK2), &[payload]);
+    assert_eq!(c.len(), 1, "completed tool call must be emitted");
+    assert_eq!(c[0].name, "f");
+    assert_eq!(c[0].arguments, serde_json::json!({"k": "v"}));
+    assert_eq!(
+      d, " some text <|tool_call_begin|>functions.x:1",
+      "trailing display (with the inner-opener literal) reaches the caller"
+    );
+  }
+
+  #[test]
+  fn streaming_kimi_k2_trailing_display_with_inner_opener_split_across_chunks() {
+    let (d, c) = run_with_parser(
+      Box::new(KimiK2),
+      &[
+        concat!(
+          "<|tool_calls_section_begin|>",
+          "<|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>",
+          r#"{"k":"v"}"#,
+          "<|tool_call_end|>",
+          "<|tool_calls_section_end|>",
+          " some text <|tool_call_",
+        ),
+        "begin|>functions.x:1",
+      ],
+    );
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].name, "f");
+    assert_eq!(d, " some text <|tool_call_begin|>functions.x:1");
+  }
+
+  #[test]
+  fn streaming_gemma4_trailing_display_with_inner_opener_does_not_hide_end_tag() {
+    // Trailing display after gemma4's section close contains the literal
+    // `call:name{` opener. The end-tag must be returned at the section close
+    // so the gemma4 call is emitted; trailing bytes reach display.
+    let payload = concat!(
+      "<|tool_call>",
+      r#"call:f{"k":"v"}"#,
+      "<tool_call|>",
+      " some text call:x{abc",
+    );
+    let (d, c) = run_with_parser(Box::new(Gemma4), &[payload]);
+    assert_eq!(c.len(), 1, "completed tool call must be emitted");
+    assert_eq!(c[0].name, "f");
+    assert_eq!(c[0].arguments, serde_json::json!({"k": "v"}));
+    assert_eq!(
+      d, " some text call:x{abc",
+      "trailing display (with the inner-opener literal) reaches the caller"
+    );
+  }
+
+  #[test]
+  fn streaming_gemma4_trailing_display_with_inner_opener_split_across_chunks() {
+    let (d, c) = run_with_parser(
+      Box::new(Gemma4),
+      &[
+        concat!(
+          "<|tool_call>",
+          r#"call:f{"k":"v"}"#,
+          "<tool_call|>",
+          " some text call",
+        ),
+        ":x{abc",
+      ],
+    );
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].name, "f");
+    assert_eq!(d, " some text call:x{abc");
+  }
+
+  // Finding 2: glm47 + longcat non-JSON XML fallbacks scanned for the
+  // wrapper end-tag with a plain substring search; an in-`<arg_value>` (resp.
+  // `<longcat_arg_value>`) end-tag literal is VALID value text but the
+  // scanner truncated the call there. The L9 R7 fix introduces
+  // `xml_value_aware_end_tag_scan`, which skips value regions while
+  // searching.
+
+  #[test]
+  fn streaming_glm47_xml_arg_value_contains_wrapper_end_literal_not_truncated() {
+    // glm47 XML payload whose `<arg_value>` body contains `</tool_call>`
+    // literal. The wrapper end tag must match ONLY at the position AFTER the
+    // value's `</arg_value>` close — not at the in-value literal.
+    let payload = concat!(
+      "<tool_call>",
+      "echo<arg_key>s</arg_key><arg_value>blah</tool_call> more blah</arg_value>",
+      "</tool_call>",
+      " after",
+    );
+    let (d, c) = run_with_parser(Box::new(Glm47), &[payload]);
+    assert_eq!(d, " after", "trailing display reaches caller");
+    assert_eq!(c.len(), 1, "tool call must extract intact");
+    assert_eq!(c[0].name, "echo");
+    assert_eq!(
+      c[0].arguments,
+      serde_json::json!({"s": "blah</tool_call> more blah"}),
+      "in-value wrapper-end literal preserved verbatim inside the arg value"
+    );
+  }
+
+  #[test]
+  fn streaming_glm47_xml_arg_value_contains_wrapper_end_literal_split_across_chunks() {
+    // Same as above with the chunk boundary INSIDE the in-value
+    // `</tool_call>` literal — neither the scanner nor the parser may
+    // mis-detect the wrapper close across the split.
+    let (d, c) = run_with_parser(
+      Box::new(Glm47),
+      &[
+        concat!(
+          "<tool_call>",
+          "echo<arg_key>s</arg_key><arg_value>blah</tool_",
+        ),
+        "call> more blah</arg_value></tool_call> after",
+      ],
+    );
+    assert_eq!(d, " after");
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].name, "echo");
+    assert_eq!(
+      c[0].arguments,
+      serde_json::json!({"s": "blah</tool_call> more blah"}),
+    );
+  }
+
+  #[test]
+  fn streaming_longcat_xml_arg_value_contains_wrapper_end_literal_not_truncated() {
+    // Longcat XML payload whose `<longcat_arg_value>` body contains the
+    // wrapper end literal `</longcat_tool_call>`. The wrapper end tag must
+    // match ONLY at the position AFTER the value's `</longcat_arg_value>`
+    // close.
+    let payload = concat!(
+      "<longcat_tool_call>",
+      "echo<longcat_arg_key>s</longcat_arg_key>",
+      "<longcat_arg_value>blah</longcat_tool_call> more blah</longcat_arg_value>",
+      "</longcat_tool_call>",
+      " after",
+    );
+    let (d, c) = run_with_parser(Box::new(Longcat), &[payload]);
+    assert_eq!(d, " after", "trailing display reaches caller");
+    assert_eq!(c.len(), 1, "tool call must extract intact");
+    assert_eq!(c[0].name, "echo");
+    assert_eq!(
+      c[0].arguments,
+      serde_json::json!({"s": "blah</longcat_tool_call> more blah"}),
+      "in-value wrapper-end literal preserved verbatim"
+    );
+  }
+
+  #[test]
+  fn streaming_longcat_xml_arg_value_contains_wrapper_end_literal_split_across_chunks() {
+    let (d, c) = run_with_parser(
+      Box::new(Longcat),
+      &[
+        concat!(
+          "<longcat_tool_call>",
+          "echo<longcat_arg_key>s</longcat_arg_key>",
+          "<longcat_arg_value>blah</longcat_",
+        ),
+        "tool_call> more blah</longcat_arg_value></longcat_tool_call> after",
+      ],
+    );
+    assert_eq!(d, " after");
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].name, "echo");
+    assert_eq!(
+      c[0].arguments,
+      serde_json::json!({"s": "blah</longcat_tool_call> more blah"}),
     );
   }
 }
