@@ -25,6 +25,27 @@
 //! [`stt_generate`] never materializes the encoder states or the logits
 //! itself.
 //!
+//! ## `wired_limit` / generation-stats parity (audit, AUDIO-A13)
+//!
+//! mlx-audio's `generate_transcription` (`stt/generate.py:272-413`) wraps
+//! per-model decoding in a `wired_limit(model, [generation_stream])` context
+//! manager and emits per-run `STTOutput` timing fields (`prompt_tokens`,
+//! `generation_tokens`, `prompt_tps`, `generation_tps`, `total_time`).
+//! mlxrs's [`stt_generate`] is the **iterator-shaped** analogue (mirroring
+//! [`crate::lm::generate::generate_step`], NOT the higher-level
+//! [`crate::lm::generate::stream_generate`] that aggregates into
+//! [`crate::lm::generate::GenerationResponse`]); both `wired_limit`
+//! integration and per-run [`crate::lm::generate::GenerationStats`]-shaped
+//! aggregation are intentionally deferred to a coordinated LM/STT follow-up
+//! (mlxrs-safe has no `set_wired_limit` wrapper yet — `mlxrs_sys::
+//! mlx_set_wired_limit` exists but no `crate::memory::set_wired_limit`
+//! surface fn does, and `mlx_device_info_get` for
+//! `max_recommended_working_set_size` is also un-wrapped — both gaps are
+//! shared with the LM side and live with the LM L6 follow-up). The
+//! detailed audit + rationale is in [`super::serializers`] — that module's
+//! header carries the canonical write-up so this loop's doc stays focused
+//! on the decode-step contract.
+//!
 //! [stt-gen]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/generate.py
 //! [whisper]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/whisper/whisper.py
 //! [parakeet]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/parakeet/parakeet.py
