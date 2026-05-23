@@ -1108,6 +1108,62 @@ pub fn dequantize_weights(weights: Weights, cfg: &PerLayerQuantization) -> Resul
 }
 
 // ─────────────────────────── AutoAWQ / GPTQ on-load conversion ───────────────────────────
+//
+// # Scope
+//
+// This section ports the on-load CONVERSION half of mlx-lm's AutoAWQ /
+// GPTQ pipeline (`mlx-lm/mlx_lm/utils.py:72-172`): an already-quantized
+// AutoAWQ checkpoint's `qweight` / `qzeros` / `scales` triple is
+// transformed into MLX's native `weight` / `scales` / `biases` layout
+// so the standard MLX quant load path can consume it.
+//
+// **Out of scope:**
+//
+// - **AWQ search-and-quantize** (`mlx-lm/mlx_lm/quant/awq.py`,
+//   ~585 lines: `awq_quantize`, `search_best_scale`, `apply_scale`,
+//   `scale_block`, `search_best_clip`, `clip_block`, `run_layer`, ...).
+//   That is the TRAINING half — searching for per-channel scale + clip
+//   ranges to minimize quantization error. Callers that need to mint a
+//   fresh AutoAWQ checkpoint must do so upstream (via the python
+//   `mlx_lm.quant.awq` module) and feed the resulting on-disk
+//   checkpoint through [`transform_awq_weights`] at load time. A
+//   future port of the search path is tracked separately; flagged here
+//   as a follow-up.
+//
+// - **ParoQuant loader + `RotateQuantizedLinear`** (mlx-swift-lm
+//   `Libraries/MLXLMCommon/ParoQuant/ParoQuantLoader.swift` +
+//   `.../RotateQuantizedLinear.swift`). These ARE present in the
+//   swift ref but are intentionally NOT ported here:
+//
+//   1. `ParoQuantLoader.loadParoQuantModel` is a **per-model loader**
+//      gated on `architectures == ["Qwen3_5ForConditionalGeneration"]`
+//      (`ParoQuantLoader.swift:52`). It is not a general-purpose
+//      loader, just a Qwen3.5-PARO entry point that reuses the AWQ
+//      unpack-and-repack we DO port (see `convertAutoAWQ` in the
+//      swift ref, which is a re-implementation of
+//      `_transform_awq_weights` parameterized on the PARO key set).
+//      Per `[[project_no_per_model_arch_porting]]`: mlxrs ports
+//      loaders/tokenizers/pooling — not per-usecase
+//      model-architecture loaders.
+//
+//   2. `RotateQuantizedLinear` is a `QuantizedLinear` subclass that
+//      overrides `callAsFunction` to fuse a pairwise-Givens rotation
+//      into the forward pass via a **Metal compute kernel** built
+//      with `MLXFast.metalKernel(name:inputNames:outputNames:source:)`.
+//      mlxrs does not currently expose a Module/Linear hierarchy
+//      (per the project scope above) and does not wrap mlx-c's
+//      general `mlx_fast_metal_kernel_config` surface (only
+//      `mlx_fast_layer_norm` / `mlx_fast_rms_norm` are bound, in
+//      `crate::embeddings::fast`). Porting the layer would require
+//      both substrates first and is therefore deferred to the
+//      per-usecase consumer that needs a Qwen3.5-PARO inference
+//      pipeline.
+//
+//   The AWQ on-load conversion this section ports IS the load-time
+//   substrate ParoQuant relies on (`convertAutoAWQ` in the swift ref
+//   is the same algorithm with the same inverse-permutation +
+//   transpose + repack steps); a future ParoQuant port will sit on
+//   top of [`transform_awq_weights`] rather than re-implementing it.
 
 /// The AutoAWQ / GPTQ on-load quantization parameters carried by the
 /// `quantization_config` block of the upstream `config.json` —
