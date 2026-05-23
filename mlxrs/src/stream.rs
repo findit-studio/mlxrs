@@ -117,6 +117,18 @@ pub(crate) fn mark_streams_cleared() {
   DEFAULT_STREAM.with(|cell| cell.set(None));
 }
 
+/// Whether this thread has had its streams cleared via
+/// [`super::Stream::clear_current_thread_streams`]. Crate-internal probe
+/// for `Drop` paths (e.g. [`super::memory::WiredLimitGuard`]) that need to
+/// SKIP a stream-touching action when the thread is poisoned — calling
+/// e.g. `Stream::default_gpu()` / `Stream::synchronize()` from a `Drop`
+/// would panic (or double-panic on unwind), so the caller checks this and
+/// silently skips that step instead.
+#[inline]
+pub(crate) fn current_thread_streams_cleared() -> bool {
+  STREAMS_CLEARED.with(Cell::get)
+}
+
 // INTENTIONAL: never freed at thread/process exit. Metal frameworks tear down
 // before destructors run, so calling mlx_stream_free at exit would crash.
 // Instruments will flag this as a leak on shutdown — that's expected.
@@ -326,6 +338,63 @@ impl Stream {
     // the call, mlx does not retain it past the call, and the backend rc is
     // surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_synchronize(self.0) })
+  }
+
+  /// Non-panicking, drop-safe variant of [`Self::synchronize`].
+  ///
+  /// Returns `Ok(())` and silently SKIPS the sync (without panicking) when
+  /// this thread's streams have been cleared via
+  /// [`Self::clear_current_thread_streams`] — mlx will not re-bootstrap the
+  /// stream, so synchronizing would touch dead encoder state and is
+  /// inappropriate. Crate-internal because the only legitimate caller is
+  /// a `Drop` impl (which must be infallible / non-panicking — calling the
+  /// public [`Self::synchronize`] from a `Drop` would `panic!` via the
+  /// `assert_streams_not_cleared()` guard, and unwinding through a panic
+  /// already in flight would abort the process).
+  ///
+  /// The returned `Result` carries only the underlying mlx-c rc; the
+  /// caller (a `Drop`) discards it per the crate-wide Drop convention.
+  ///
+  /// CODEX R1 [HIGH] F3 fix: lets [`crate::memory::WiredLimitGuard::drop`]
+  /// safely no-op the sync step when its scope ended after
+  /// `clear_current_thread_streams`, while still completing the
+  /// `set_wired_limit` restore step.
+  pub(crate) fn try_synchronize(&self) -> Result<()> {
+    if current_thread_streams_cleared() {
+      return Ok(());
+    }
+    ensure_handler_installed();
+    // SAFETY: `self.0` is a valid borrowed stream handle for the duration of
+    // the call, mlx does not retain it past the call, and the backend rc is
+    // surfaced via `check()`.
+    check(unsafe { mlxrs_sys::mlx_synchronize(self.0) })
+  }
+
+  /// Non-panicking, drop-safe variant of [`Self::default_gpu`].
+  ///
+  /// Returns `None` when this thread's streams have been cleared via
+  /// [`Self::clear_current_thread_streams`] (the default GPU stream is no
+  /// longer reachable on a poisoned thread). Returns `None` on any FFI
+  /// failure instead of `Err`, since the only legitimate caller is a
+  /// `Drop` impl that has no good way to surface an error.
+  ///
+  /// CODEX R1 [HIGH] F3 fix companion to [`Self::try_synchronize`] — lets
+  /// [`crate::memory::WiredLimitGuard::drop`] decide whether to sync the
+  /// default stream (when no explicit streams were passed) or skip it
+  /// entirely on a poisoned thread, without panicking.
+  pub(crate) fn try_default_gpu() -> Option<Self> {
+    if current_thread_streams_cleared() {
+      return None;
+    }
+    ensure_handler_installed();
+    // SAFETY: `mlx_default_gpu_stream_new()` returns the thread's default GPU
+    // stream handle; the error handler is installed first; the NULL-ctx case
+    // (e.g. no GPU at all) is treated as "skip" per the drop-safe contract.
+    let raw = unsafe { mlxrs_sys::mlx_default_gpu_stream_new() };
+    if raw.ctx.is_null() {
+      return None;
+    }
+    Some(Self(raw))
   }
 
   /// Destroy **every** stream created on the *current thread*, reclaiming

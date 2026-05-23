@@ -1,19 +1,6 @@
-//! Process-global memory introspection — thin wrappers around mlx-c's
-//! `memory.h` peak / active / cache counters.
-//!
-//! Mirrors the surface
-//! [mlx-swift `Source/MLX/Memory.swift`](https://github.com/ml-explore/mlx-swift/blob/main/Source/MLX/Memory.swift)
-//! exposes as the `GPU.peakMemory` / `GPU.activeMemory` / `GPU.cacheMemory`
-//! static properties (which in turn mirror mlx-c's
-//! [`mlx_get_peak_memory`](https://github.com/ml-explore/mlx/blob/main/mlx/c/memory.h)
-//! / `mlx_get_active_memory` / `mlx_get_cache_memory`). Used by the
-//! [`crate::lm::generate::GenerationStats`] peak-memory field (mlx-lm
-//! `mx.get_peak_memory() / 1e9` in `mlx_lm/generate.py` `stream_generate`).
-//!
-//! All values are byte counts of the **process-global** mlx allocator
-//! (`mlx::core::metal::allocator()`), not per-`Device` / per-`Stream`. The
-//! peak counter is monotonically non-decreasing within a process unless
-//! [`reset_peak_memory`] is called (mlx-c's only reset hook).
+//! `memory.h` peak / active / cache counter wrappers. Re-exported by
+//! [`crate::memory`]; see the parent module's docs for the unified surface
+//! description (counters + wired-limit guard + policies).
 
 use crate::error::{Result, check, ensure_handler_installed};
 
