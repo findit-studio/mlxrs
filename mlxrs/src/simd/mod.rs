@@ -67,11 +67,126 @@
 //!
 //! Verified by the `differential_tests` module below
 //! (`assert_eq!` on `f64::to_bits()`).
+//!
+//! ## Adding a new kernel — the per-kernel triple
+//!
+//! Every new kernel ships as **three pieces** that follow the in-tree
+//! [`dot`](crate::simd::dot) worked example exactly:
+//!
+//! 1. **Scalar reference** — `pub fn foo_scalar(x: &[T]) -> R` under
+//!    [`scalar`](crate::simd::scalar). Always compiled, independent of
+//!    `target_arch`. Anchors the math contract, is the
+//!    differential-test oracle, and is the fallback path. See
+//!    [`scalar::dot`](crate::simd::scalar::dot) for the worked
+//!    example.
+//! 2. **NEON kernel** — `#[target_feature(enable = "neon")] unsafe fn
+//!    foo(x: &[T]) -> R` under `arch::neon` (the whole module is
+//!    `#[cfg(target_arch = "aarch64")]`-gated). See `arch::neon::dot`
+//!    for the worked example — note the `pub(crate)` visibility and
+//!    the `# Safety` doc-comment that names every caller obligation
+//!    (NEON availability + every input precondition).
+//! 3. **Dispatcher** — `pub fn foo(x: &[T]) -> R` under `dispatch::`,
+//!    re-exported from this module. Asserts its slice-length
+//!    preconditions **unconditionally** (release-too — the NEON
+//!    kernel's `debug_assert!` is a no-op in release and would
+//!    OOB-read), then
+//!    `if neon_available() { unsafe { neon::foo(x) } } else { scalar::foo(x) }`.
+//!    See the re-exported [`dot`](crate::simd::dot) for the worked
+//!    example.
+//!
+//! ## Picking a differential-test class — `Exact` vs `Tolerance`
+//!
+//! Every new kernel also ships a scalar-vs-dispatcher differential
+//! test using the helpers in [`diff`](crate::simd::diff):
+//!
+//! - **`Exact`** — call
+//!   [`diff::assert_eq_over_lane_sweep`](crate::simd::diff::assert_eq_over_lane_sweep).
+//!   Use for data-movement / lossless-widening kernels (C1 integer
+//!   arms, C3, C4, C5, C6) — the SIMD output **must be bit-identical**
+//!   to scalar. For fp outputs that are deliberately bit-identical
+//!   (the in-tree `dot` is one — matched reduction tree), the
+//!   `differential_tests` module below compares on `f64::to_bits()`
+//!   instead.
+//! - **`Tolerance { abs, rel }` — scalar output** — call
+//!   [`diff::assert_close_over_lane_sweep`](crate::simd::diff::assert_close_over_lane_sweep).
+//!   Use for fp-reduction / FMA-rounding kernels that fold the input
+//!   to a single `f64` (C2 loudness sum-of-squares; any future fp
+//!   reduction without a matched scalar reduction tree).
+//! - **`Tolerance { abs, rel }` — vector output** — call
+//!   [`diff::assert_close_slice_over_lane_sweep`](crate::simd::diff::assert_close_slice_over_lane_sweep).
+//!   Use for fp kernels that return a `Vec<f64>` (C5 `rotate_buf`
+//!   permutation, C10 `mel_filter_bank` triangle construction, C12
+//!   window generation — the vector-producing fp candidates
+//!   documented under `simd::audio` / `simd::vlm`). Asserts
+//!   dispatcher and scalar outputs have the same length **and** every
+//!   element pair satisfies the same `abs.max(rel * |s|)` tolerance
+//!   as the scalar twin.
+//!
+//! All three helpers share the same length sweep
+//! ([`diff::lane_sweep_lengths`](crate::simd::diff::lane_sweep_lengths)
+//! — 9 lengths covering every boundary class: empty / singleton /
+//! single-block-just-below / single-block-clean / single-block-plus-tail /
+//! post-body large-tail / multi-block-clean ×2 / multi-block-clean ×3 /
+//! multi-block-plus-tail), so coverage is uniform across `Exact` and
+//! both `Tolerance` flavours.
+//!
+//! See the [`diff`](crate::simd::diff) module doc for the full class
+//! catalog and the length-sweep rationale.
+//!
+//! ## Verify-before-claim (§5.4 of the SIMD doc)
+//!
+//! Before committing a hand-written NEON kernel for any new
+//! candidate, **benchmark scalar vs SIMD** in the `mlxrs-m2-benches`
+//! worktree under release. Some candidates (C3 RGB widen, the cold
+//! one-time table builds C10/C11/C12) are *suspected already
+//! auto-vectorized by LLVM* or *too cold to matter* — shipping a
+//! hand-rolled intrinsic kernel that LLVM already emits is dead
+//! weight (extra `unsafe`, extra maintenance, no perf win). The
+//! benchmark is the gate, not intuition or "it should be faster". See
+//! `docs/core-arch-simd-candidates.md` §5.4 and the
+//! [project memory rule "Verify review premise empirically"].
+//!
+//! ## Suggested execution order (§5.5 of the SIMD doc)
+//!
+//! The cross-cutting doc orders the candidate work by
+//! risk × benefit:
+//!
+//! 1. **C6** — `pad_to_square` fill (quick win, lowest risk).
+//! 2. **C1** — PCM decode widen (highest steady benefit, exact
+//!    semantics).
+//! 3. **C4** — BGR `vld3`/`vst3` de-interleave widen (clean NEON
+//!    fit, exact, the arm LLVM most likely misses).
+//! 4. **C3** — RGB widen, **only if** disassembly shows LLVM is not
+//!    already vectorizing.
+//! 5. **C2** — loudness sum-of-squares (fp-associativity / LUFS
+//!    bit-exactness risk; needs existing loudness test tolerances
+//!    re-baselined; do *after* C1/C3/C4).
+//! 6. **Defer C5, C7, C8, C10, C11, C12** — cold, gather-bound, or
+//!    transcendental-bound; revisit only if a benchmark proves a
+//!    real cost.
+//! 7. **Never** — C9 (`lfilter` recurrence — serial by
+//!    construction).
+//!
+//! ## No cargo feature — always on (project memory override)
+//!
+//! Per the project memory rule **"SIMD always-on"**, mlxrs's SIMD
+//! infrastructure has **no `simd` cargo feature**. Whether the NEON
+//! backend runs is gated purely on `#[cfg(target_arch = "aarch64")]`
+//! plus runtime CPU detection
+//! ([`is_neon_available`](crate::simd::is_neon_available)); on every
+//! other target the dispatchers route to the always-compiled scalar
+//! path. This explicitly overrides §5.2 of the SIMD doc, which had
+//! recommended a Cargo-feature gate before the project rule was set.
 
 #[cfg(target_arch = "aarch64")]
 pub mod arch;
+#[cfg(target_arch = "aarch64")]
+pub(crate) mod audio;
+pub mod diff;
 mod dispatch;
 pub mod scalar;
+#[cfg(target_arch = "aarch64")]
+pub(crate) mod vlm;
 
 pub use dispatch::{dot, sum_of_squares};
 
@@ -116,6 +231,26 @@ pub fn neon_available() -> bool {
 #[cfg(not(target_arch = "aarch64"))]
 pub fn neon_available() -> bool {
   false
+}
+
+/// Whether the NEON SIMD backend is usable on the executing CPU.
+///
+/// Canonical name matching the [`std::arch::is_aarch64_feature_detected`]
+/// idiom — wraps `is_aarch64_feature_detected!("neon")` on `aarch64`
+/// and is a `const false` stub on every other target. New per-kernel
+/// dispatchers (the C1–C12 follow-ups landing under `simd::audio` /
+/// `simd::vlm`) call this directly so the runtime-detection branch
+/// has a uniform shape across the crate.
+///
+/// Functionally identical to [`neon_available`] (which the in-tree
+/// [`dot`] dispatcher uses); the duplicate name exists so callers can
+/// pick the idiom that reads best at the call site
+/// (`if is_neon_available()` mirrors `is_aarch64_feature_detected!`;
+/// `if neon_available()` reads naturally as a noun-style query). Both
+/// honour the `--cfg mlxrs_force_scalar` build escape.
+#[inline]
+pub fn is_neon_available() -> bool {
+  neon_available()
 }
 
 #[cfg(test)]
@@ -269,5 +404,32 @@ mod differential_tests {
     let a = vec![1.0_f64; 8];
     let b = vec![1.0_f64; 4];
     let _ = super::scalar::dot(&a, &b);
+  }
+
+  /// On `aarch64`, NEON is baseline-mandatory — every `aarch64` core
+  /// has it (ARMv8.0+) — so [`super::is_neon_available`] must report
+  /// `true` here on the deployment target. This pins the
+  /// runtime-detection contract: a flip to `false` (e.g. someone
+  /// accidentally inverting `is_aarch64_feature_detected!`) would
+  /// silently route every dispatcher to the scalar path and quietly
+  /// halve perf.
+  ///
+  /// Skipped under `--cfg mlxrs_force_scalar` — the force-scalar build
+  /// escape deliberately returns `false` to bisect SIMD-vs-scalar
+  /// numeric regressions; asserting `true` there would defeat the
+  /// escape.
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  fn is_neon_available_true_on_aarch64() {
+    if cfg!(mlxrs_force_scalar) {
+      // Force-scalar build: the detector deliberately returns false
+      // (see [`super::neon_available`]); skip the positive assertion
+      // so the escape stays a real, exercised branch.
+      return;
+    }
+    assert!(
+      super::is_neon_available(),
+      "NEON is baseline-mandatory on aarch64; is_neon_available() must report true"
+    );
   }
 }
