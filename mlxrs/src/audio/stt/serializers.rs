@@ -415,9 +415,7 @@ pub fn save_as_txt(transcript: &Transcript, path: &Path) -> Result<()> {
   if path == Path::new("-") {
     let stdout = std::io::stdout();
     let mut w = stdout.lock();
-    return save_as_txt_to_writer(transcript, &mut w).map_err(|e| Error::Backend {
-      message: format!("save_as_txt: write to stdout failed: {e}"),
-    });
+    return save_as_txt_stdout(transcript, &mut w);
   }
   let final_path = with_extension(path, "txt");
   let f = File::create(&final_path).map_err(|e| Error::Backend {
@@ -440,6 +438,29 @@ pub fn save_as_txt(transcript: &Transcript, path: &Path) -> Result<()> {
 /// real fd-redirect).
 fn save_as_txt_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::io::Result<()> {
   w.write_all(transcript.text().as_bytes())
+}
+
+/// Stdout-branch delegate for [`save_as_txt`] — writes the TXT body via
+/// [`save_as_txt_to_writer`] AND explicitly flushes the writer, surfacing
+/// either failure as [`Error::Backend`]. Factored out of [`save_as_txt`] so
+/// the flush-error path is unit-testable without going through a real
+/// stdout fd (the test substitutes a flush-failing writer).
+///
+/// `StdoutLock` is line-buffered when attached to a tty and fully-buffered
+/// when redirected; the writer-helper writes raw `text` with no trailing
+/// newline, so without an explicit flush the final bytes can sit in the
+/// stdout buffer past `save_as_txt`'s return (especially on
+/// redirect-to-file / redirect-to-pipe). Mirror the file branch's explicit
+/// `BufWriter::flush()` and surface failures as `Error::Backend`
+/// (broken-pipe, `ENOSPC` on the receiving end, ...).
+fn save_as_txt_stdout<W: Write>(transcript: &Transcript, w: &mut W) -> Result<()> {
+  save_as_txt_to_writer(transcript, w).map_err(|e| Error::Backend {
+    message: format!("save_as_txt: write to stdout failed: {e}"),
+  })?;
+  w.flush().map_err(|e| Error::Backend {
+    message: format!("save_as_txt: stdout flush failed: {e}"),
+  })?;
+  Ok(())
 }
 
 /// Save the transcript as SubRip `.srt` to `<path>.srt`.
@@ -474,9 +495,7 @@ pub fn save_as_srt(transcript: &Transcript, path: &Path) -> Result<()> {
   if path == Path::new("-") {
     let stdout = std::io::stdout();
     let mut w = stdout.lock();
-    return save_as_srt_to_writer(transcript, &mut w).map_err(|e| Error::Backend {
-      message: format!("save_as_srt: write to stdout failed: {e}"),
-    });
+    return save_as_srt_stdout(transcript, &mut w);
   }
   let final_path = with_extension(path, "srt");
   let f = File::create(&final_path).map_err(|e| Error::Backend {
@@ -511,6 +530,22 @@ fn save_as_srt_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::i
   Ok(())
 }
 
+/// Stdout-branch delegate for [`save_as_srt`] — writes the SRT body via
+/// [`save_as_srt_to_writer`] AND explicitly flushes the writer, surfacing
+/// either failure as [`Error::Backend`]. See
+/// [`save_as_txt_stdout`] for the buffered-stdout rationale; the SRT body
+/// ends with `\n\n` after the last cue but the partial bytes can still sit
+/// in the stdout buffer when redirected, so the explicit flush is required.
+fn save_as_srt_stdout<W: Write>(transcript: &Transcript, w: &mut W) -> Result<()> {
+  save_as_srt_to_writer(transcript, w).map_err(|e| Error::Backend {
+    message: format!("save_as_srt: write to stdout failed: {e}"),
+  })?;
+  w.flush().map_err(|e| Error::Backend {
+    message: format!("save_as_srt: stdout flush failed: {e}"),
+  })?;
+  Ok(())
+}
+
 /// Save the transcript as WebVTT `.vtt` to `<path>.vtt`.
 ///
 /// 1:1 port of [`mlx_audio.stt.generate.save_as_vtt`][stt-gen]
@@ -542,9 +577,7 @@ pub fn save_as_vtt(transcript: &Transcript, path: &Path) -> Result<()> {
   if path == Path::new("-") {
     let stdout = std::io::stdout();
     let mut w = stdout.lock();
-    return save_as_vtt_to_writer(transcript, &mut w).map_err(|e| Error::Backend {
-      message: format!("save_as_vtt: write to stdout failed: {e}"),
-    });
+    return save_as_vtt_stdout(transcript, &mut w);
   }
   let final_path = with_extension(path, "vtt");
   let f = File::create(&final_path).map_err(|e| Error::Backend {
@@ -577,6 +610,22 @@ fn save_as_vtt_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::i
     );
     w.write_all(block.as_bytes())?;
   }
+  Ok(())
+}
+
+/// Stdout-branch delegate for [`save_as_vtt`] — writes the VTT body via
+/// [`save_as_vtt_to_writer`] AND explicitly flushes the writer, surfacing
+/// either failure as [`Error::Backend`]. See
+/// [`save_as_txt_stdout`] for the buffered-stdout rationale; the VTT body
+/// (including the `WEBVTT\n\n` header + every cue block) is pushed past
+/// the stdout buffer before [`save_as_vtt`] returns.
+fn save_as_vtt_stdout<W: Write>(transcript: &Transcript, w: &mut W) -> Result<()> {
+  save_as_vtt_to_writer(transcript, w).map_err(|e| Error::Backend {
+    message: format!("save_as_vtt: write to stdout failed: {e}"),
+  })?;
+  w.flush().map_err(|e| Error::Backend {
+    message: format!("save_as_vtt: stdout flush failed: {e}"),
+  })?;
   Ok(())
 }
 
@@ -638,9 +687,7 @@ pub fn save_as_json(transcript: &Transcript, path: &Path) -> Result<()> {
   if path == Path::new("-") {
     let stdout = std::io::stdout();
     let mut w = stdout.lock();
-    return save_as_json_to_writer(transcript, &mut w).map_err(|e| Error::Backend {
-      message: format!("save_as_json: serialize to stdout failed: {e}"),
-    });
+    return save_as_json_stdout(transcript, &mut w);
   }
   let final_path = with_extension(path, "json");
   let f = File::create(&final_path).map_err(|e| Error::Backend {
@@ -685,6 +732,24 @@ fn save_as_json_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::
   // non-ASCII UTF-8 chars, so this matches the python output byte-for-byte
   // for the same key ordering.
   serde_json::to_writer_pretty(w, &value).map_err(std::io::Error::other)
+}
+
+/// Stdout-branch delegate for [`save_as_json`] — writes the JSON body via
+/// [`save_as_json_to_writer`] AND explicitly flushes the writer, surfacing
+/// either failure as [`Error::Backend`]. See
+/// [`save_as_txt_stdout`] for the buffered-stdout rationale; the JSON body
+/// ends with `\n}` (the trailing close-brace, NOT a final newline) which
+/// is never a flush trigger on a line-buffered tty, and is held in the
+/// buffer entirely on a redirected stdout — without an explicit flush the
+/// final JSON bytes can sit past [`save_as_json`]'s return.
+fn save_as_json_stdout<W: Write>(transcript: &Transcript, w: &mut W) -> Result<()> {
+  save_as_json_to_writer(transcript, w).map_err(|e| Error::Backend {
+    message: format!("save_as_json: serialize to stdout failed: {e}"),
+  })?;
+  w.flush().map_err(|e| Error::Backend {
+    message: format!("save_as_json: stdout flush failed: {e}"),
+  })?;
+  Ok(())
 }
 
 /// Build a `serde_json::Value` matching the python `save_as_json` output
@@ -1075,6 +1140,187 @@ mod tests {
     assert!(
       std::str::from_utf8(&buf).unwrap().contains("\n  \"text\":"),
       "writer JSON output uses 2-space indent"
+    );
+  }
+
+  // ---------- Round-2 finding: dash-stdout flush coverage ----------
+
+  /// Test-only [`Write`] adapter that records whether [`flush`] was called +
+  /// (optionally) returns an [`io::Error`] from [`flush`]. Used to exercise
+  /// the dash-stdout `save_as_*_stdout` delegate paths without going through
+  /// a real stdout fd:
+  ///
+  /// - `fail_flush = false` → buffers the writes, counts the flush calls.
+  ///   Used by [`save_as_txt_writer_helper_flushes_via_explicit_call`] to
+  ///   assert that the dash-stdout delegate actually calls `.flush()` (not
+  ///   relying on the writer's drop).
+  /// - `fail_flush = true` → returns [`io::Error::other`] from `.flush()`.
+  ///   Used by the per-format `*_stdout_flush_failure_surfaces_as_backend_error`
+  ///   tests to assert the flush-error path surfaces as [`Error::Backend`]
+  ///   with the `"stdout flush failed"` marker.
+  struct FailingFlushWriter {
+    buf: Vec<u8>,
+    flush_calls: usize,
+    fail_flush: bool,
+  }
+
+  impl FailingFlushWriter {
+    fn ok() -> Self {
+      Self {
+        buf: Vec::new(),
+        flush_calls: 0,
+        fail_flush: false,
+      }
+    }
+
+    fn failing() -> Self {
+      Self {
+        buf: Vec::new(),
+        flush_calls: 0,
+        fail_flush: true,
+      }
+    }
+  }
+
+  impl Write for FailingFlushWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+      self.buf.extend_from_slice(bytes);
+      Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+      self.flush_calls += 1;
+      if self.fail_flush {
+        Err(std::io::Error::other("induced flush failure"))
+      } else {
+        Ok(())
+      }
+    }
+  }
+
+  #[test]
+  fn save_as_txt_writer_helper_flushes_via_explicit_call() {
+    // The dash-stdout `save_as_*_stdout` delegate MUST call `.flush()`
+    // explicitly — relying on the writer's `Drop` is insufficient because
+    // `StdoutLock`'s drop does NOT flush the underlying stdout buffer
+    // (the lock guard only releases the lock; the buffer outlives it).
+    // Assert one flush call per save_as_*_stdout invocation across all
+    // four serializers.
+    let t = three_segments_fixture();
+    for (name, run) in [
+      (
+        "save_as_txt_stdout",
+        Box::new(|t: &Transcript, w: &mut FailingFlushWriter| super::save_as_txt_stdout(t, w))
+          as Box<dyn Fn(&Transcript, &mut FailingFlushWriter) -> Result<()>>,
+      ),
+      (
+        "save_as_srt_stdout",
+        Box::new(|t: &Transcript, w: &mut FailingFlushWriter| super::save_as_srt_stdout(t, w)),
+      ),
+      (
+        "save_as_vtt_stdout",
+        Box::new(|t: &Transcript, w: &mut FailingFlushWriter| super::save_as_vtt_stdout(t, w)),
+      ),
+      (
+        "save_as_json_stdout",
+        Box::new(|t: &Transcript, w: &mut FailingFlushWriter| super::save_as_json_stdout(t, w)),
+      ),
+    ] {
+      let mut w = FailingFlushWriter::ok();
+      run(&t, &mut w).unwrap_or_else(|e| panic!("{name} on ok-writer must succeed: {e}"));
+      assert_eq!(
+        w.flush_calls, 1,
+        "{name} must call .flush() exactly once on the writer (saw {})",
+        w.flush_calls
+      );
+      assert!(
+        !w.buf.is_empty(),
+        "{name} must have written body bytes before flushing"
+      );
+    }
+  }
+
+  #[test]
+  fn save_as_txt_stdout_flush_failure_surfaces_as_backend_error() {
+    let t = three_segments_fixture();
+    let mut w = FailingFlushWriter::failing();
+    let err =
+      super::save_as_txt_stdout(&t, &mut w).expect_err("flush-failing writer must produce an Err");
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("save_as_txt") && message.contains("stdout flush failed"),
+          "Error::Backend message must mention save_as_txt + stdout flush failure (got: {message})"
+        );
+      }
+      other => panic!("expected Error::Backend, got {other:?}"),
+    }
+    assert_eq!(
+      w.flush_calls, 1,
+      "flush must have been attempted exactly once"
+    );
+  }
+
+  #[test]
+  fn save_as_srt_stdout_flush_failure_surfaces_as_backend_error() {
+    let t = three_segments_fixture();
+    let mut w = FailingFlushWriter::failing();
+    let err =
+      super::save_as_srt_stdout(&t, &mut w).expect_err("flush-failing writer must produce an Err");
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("save_as_srt") && message.contains("stdout flush failed"),
+          "Error::Backend message must mention save_as_srt + stdout flush failure (got: {message})"
+        );
+      }
+      other => panic!("expected Error::Backend, got {other:?}"),
+    }
+    assert_eq!(
+      w.flush_calls, 1,
+      "flush must have been attempted exactly once"
+    );
+  }
+
+  #[test]
+  fn save_as_vtt_stdout_flush_failure_surfaces_as_backend_error() {
+    let t = three_segments_fixture();
+    let mut w = FailingFlushWriter::failing();
+    let err =
+      super::save_as_vtt_stdout(&t, &mut w).expect_err("flush-failing writer must produce an Err");
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("save_as_vtt") && message.contains("stdout flush failed"),
+          "Error::Backend message must mention save_as_vtt + stdout flush failure (got: {message})"
+        );
+      }
+      other => panic!("expected Error::Backend, got {other:?}"),
+    }
+    assert_eq!(
+      w.flush_calls, 1,
+      "flush must have been attempted exactly once"
+    );
+  }
+
+  #[test]
+  fn save_as_json_stdout_flush_failure_surfaces_as_backend_error() {
+    let t = three_segments_fixture();
+    let mut w = FailingFlushWriter::failing();
+    let err =
+      super::save_as_json_stdout(&t, &mut w).expect_err("flush-failing writer must produce an Err");
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("save_as_json") && message.contains("stdout flush failed"),
+          "Error::Backend message must mention save_as_json + stdout flush failure (got: {message})"
+        );
+      }
+      other => panic!("expected Error::Backend, got {other:?}"),
+    }
+    assert_eq!(
+      w.flush_calls, 1,
+      "flush must have been attempted exactly once"
     );
   }
 }
