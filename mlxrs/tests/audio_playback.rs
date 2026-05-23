@@ -675,88 +675,15 @@ fn audio_player_resume_after_stop_returns_terminated_err() {
 // (not just `extend`). R2 pre-allocates the full bounded
 // `queue_capacity_samples` at construction (via `try_reserve_exact` so alloc
 // failure surfaces as `Error::Backend`) and removes the per-chunk
-// `reserve_exact`. These tests assert the capacity is sized to the bound at
-// construction and never grows during playback. The `_test_*` accessors are
-// `#[doc(hidden)]` test-only API on AudioPlayer.
-
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "requires real default audio output device"]
-fn audio_player_pre_allocates_queue_capacity_at_construction() {
-  // F2 invariant: `buffer_depth()` is 0 immediately after
-  // construction (no samples queued) but the underlying VecDeque is
-  // already sized to `queue_capacity_samples`. The `>= cap` form is
-  // the `try_reserve_exact` contract ("AT LEAST `additional` more").
-  use mlxrs::audio::playback::AudioPlayer;
-
-  let cfg = PlaybackConfig {
-    sample_rate: 16_000,
-    channels: ChannelLayout::Mono,
-    sample_format: SampleFormat::F32,
-    buffer_size_frames: None,
-    queue_capacity_frames: 4096,
-  };
-  let player = AudioPlayer::new(cfg).unwrap();
-
-  assert_eq!(player.buffer_depth(), 0);
-  let cap_samples = player._test_queue_capacity_samples();
-  assert_eq!(
-    cap_samples, 4096,
-    "queue cap = frames * channels = 4096 * 1"
-  );
-  let underlying = player._test_queue_underlying_capacity();
-  assert!(
-    underlying >= cap_samples,
-    "VecDeque underlying capacity ({underlying}) must be >= bounded cap ({cap_samples}) per \
-     try_reserve_exact contract"
-  );
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "requires real default audio output device"]
-fn audio_player_write_samples_does_not_grow_queue_capacity_during_playback() {
-  // F2 invariant: producer-side `write_samples` does NOT call
-  // `reserve_exact` (or any other capacity-growing path) under the
-  // queue lock. We capture the underlying VecDeque capacity before
-  // + after a write well under the bound and assert it's unchanged
-  // — the producer-loop `extend` is a pure memcpy because the bound
-  // was pre-allocated at construction.
-  //
-  // We pause() (not stop()) so the cpal callback doesn't drain the
-  // samples we just pushed and trigger a buffer-depth race in the
-  // post-write capacity read; with the player paused, the queue
-  // holds the pushed samples and we can read capacity reliably.
-  use mlxrs::audio::playback::AudioPlayer;
-
-  let cfg = PlaybackConfig {
-    sample_rate: 16_000,
-    channels: ChannelLayout::Mono,
-    sample_format: SampleFormat::F32,
-    buffer_size_frames: None,
-    queue_capacity_frames: 4096,
-  };
-  let mut player = AudioPlayer::new(cfg).unwrap();
-  player.start().unwrap();
-  player.pause().unwrap();
-
-  let cap_before = player._test_queue_underlying_capacity();
-  let cap_samples = player._test_queue_capacity_samples();
-
-  // Push 1024 samples — well under the 4096-sample bound, so under
-  // the new contract `extend` is a pure memcpy with no realloc.
-  player.write_samples(&[0.25_f32; 1024]).unwrap();
-
-  let cap_after = player._test_queue_underlying_capacity();
-  assert_eq!(
-    cap_after, cap_before,
-    "queue capacity grew during write_samples (before={cap_before}, after={cap_after}) — \
-     producer-loop `extend` must not realloc because the queue is pre-allocated to \
-     queue_capacity_samples ({cap_samples}) at construction"
-  );
-
-  let _ = player.stop();
-}
+// `reserve_exact`. The two F2 invariant tests
+// (`audio_player_pre_allocates_queue_capacity_at_construction` +
+// `audio_player_write_samples_does_not_grow_queue_capacity_during_playback`)
+// were previously here and used `pub #[doc(hidden)] _test_*` accessors on
+// `AudioPlayer` to reach the private VecDeque capacity. The R3 MEDIUM fix
+// removes those leaked-public accessors and moves the tests INTO
+// `mlxrs/src/audio/playback/player.rs`'s `#[cfg(test)] mod tests` block,
+// where they can read `shared.queue.capacity()` +
+// `shared.queue_capacity_samples` directly without any `pub` surface.
 
 // F3 tests exercise the pure `sanitize_volume` helper directly so
 // they run in CI without a default audio output device. The

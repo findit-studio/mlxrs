@@ -315,6 +315,36 @@ impl SharedState {
   fn load_volume(&self) -> f32 {
     f32::from_bits(self.volume_bits.load(Ordering::Relaxed))
   }
+
+  /// Unconditionally drain the producer-visible state (queue +
+  /// captured callback error) under poison-recovering locks. Called
+  /// by [`AudioPlayer::stop`] AFTER the latch + state writes and
+  /// AFTER the cpal `Stream::pause()` attempt (whose result is
+  /// captured separately) — see the comment on `stop()` for why this
+  /// must run even when pause fails.
+  ///
+  /// Poison-recover (`into_inner`) on both locks: a panicked cpal
+  /// callback could have poisoned either, and on stop we MUST still
+  /// be able to clear them so a subsequent observer (e.g. the
+  /// integration test's `buffer_depth()`) sees an empty queue and
+  /// the post-stop producer-call gate doesn't surface a stale
+  /// captured error.
+  fn stop_cleanup(&self) {
+    {
+      let mut q = match self.queue.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+      };
+      q.clear();
+    }
+    {
+      let mut e = match self.callback_error.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+      };
+      *e = None;
+    }
+  }
 }
 
 /// Cpal-backed device player.
@@ -685,24 +715,36 @@ impl AudioPlayer {
     // Any subsequent producer-side call (including a re-entrant
     // `stop()` on a poisoned half-stopped player) checks this latch
     // BEFORE `state`, so the terminal contract holds even if the
-    // cpal `Stream::pause()` below returns an error and we bail
-    // early. Release-store pairs with Acquire-loads in `start` /
-    // `pause` / `resume` / `write_samples`.
+    // cpal `Stream::pause()` below returns an error. Release-store
+    // pairs with Acquire-loads in `start` / `pause` / `resume` /
+    // `write_samples`.
     self.shared.terminated.store(true, Ordering::Release);
     self.shared.state.store(STATE_STOPPED, Ordering::Release);
-    if let Some(stream) = self.stream.as_ref() {
+
+    // Capture the cpal pause result WITHOUT `?`-propagating — we
+    // must still run the unconditional queue + callback-error
+    // cleanup below even if pause fails. Pre-R3, an `?` here would
+    // skip cleanup: the latch + state were terminated but the
+    // VecDeque still held queued samples, so the cpal callback
+    // (running until `Drop`) would keep emitting silence-on-stopped
+    // while the queue lingered. The R3 contract is: stop() always
+    // tears down the queue + error slot; the pause error (if any)
+    // is reported AFTER the cleanup runs.
+    let pause_result = if let Some(stream) = self.stream.as_ref() {
       stream.pause().map_err(|e| Error::Backend {
         message: format!("AudioPlayer::stop: cpal pause() failed: {e}"),
-      })?;
-    }
-    // Clear queue + callback-error.
-    if let Ok(mut q) = self.shared.queue.lock() {
-      q.clear();
-    }
-    if let Ok(mut e) = self.shared.callback_error.lock() {
-      *e = None;
-    }
-    Ok(())
+      })
+    } else {
+      Ok(())
+    };
+
+    // UNCONDITIONAL queue + callback-error cleanup. Poison-recover
+    // (into_inner) rather than fail-silent on a poisoned lock so a
+    // panicked callback can't leave stale samples / errors behind
+    // post-stop. This MUST run regardless of the pause result above.
+    self.shared.stop_cleanup();
+
+    pause_result
   }
 
   /// Push interleaved PCM samples into the playback queue. Returns
@@ -812,42 +854,6 @@ impl AudioPlayer {
     Ok(samples.len())
   }
 
-  /// **Test-only** accessor for the underlying `VecDeque`'s raw
-  /// `capacity()`. Used by the audio playback integration tests to
-  /// assert the FIX 2 invariant: `SharedState::new` pre-allocates
-  /// the bounded `queue_capacity_samples` once at construction via
-  /// `try_reserve_exact`, so the producer loop's `extend` can't
-  /// realloc mid-stream (no allocator time inflates the
-  /// callback's `try_lock` window).
-  ///
-  /// `pub` (not `pub(crate)`) so the integration test (in
-  /// `mlxrs/tests/audio_playback.rs`, outside the crate) can reach
-  /// it; `#[doc(hidden)]` so it doesn't pollute the public docs.
-  /// Returns `>= queue_capacity_samples()` per `try_reserve_exact`'s
-  /// "AT LEAST `additional` more" contract.
-  #[doc(hidden)]
-  #[must_use]
-  pub fn _test_queue_underlying_capacity(&self) -> usize {
-    match self.shared.queue.lock() {
-      Ok(g) => g.capacity(),
-      Err(poisoned) => poisoned.into_inner().capacity(),
-    }
-  }
-
-  /// **Test-only** accessor for the configured queue capacity bound
-  /// in samples (`queue_capacity_frames * channels.count()`),
-  /// computed once in [`AudioPlayer::with_device`]. Pairs with
-  /// [`AudioPlayer::_test_queue_underlying_capacity`] to assert the
-  /// FIX 2 pre-allocation invariant in tests.
-  ///
-  /// `pub` + `#[doc(hidden)]` for the same integration-test-reach
-  /// reason as [`AudioPlayer::_test_queue_underlying_capacity`].
-  #[doc(hidden)]
-  #[must_use]
-  pub fn _test_queue_capacity_samples(&self) -> usize {
-    self.shared.queue_capacity_samples
-  }
-
   /// Block until the playback queue has drained. The cpal callback
   /// continues to consume samples while this method polls; when the
   /// queue empties, [`AudioPlayer::flush`] returns. Mirrors Swift's
@@ -948,5 +954,228 @@ impl Drop for AudioPlayer {
       let _ = stream.pause();
       drop(stream);
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  //! In-crate unit tests for `AudioPlayer` invariants that need
+  //! access to private state (`SharedState::queue`,
+  //! `SharedState::queue_capacity_samples`, `SharedState::terminated`,
+  //! `SharedState::callback_error`).
+  //!
+  //! These were previously reachable from `tests/audio_playback.rs`
+  //! via `pub #[doc(hidden)] _test_*` accessors on `AudioPlayer`,
+  //! which leaked into the crate's public API surface (downstream
+  //! crates could call them in release builds, and removing them
+  //! later would be a SemVer break). Moving the tests here keeps the
+  //! private invariant under in-crate test coverage without any
+  //! `pub` accessor.
+  //!
+  //! Device-touching tests (those that call `AudioPlayer::new`,
+  //! which opens a cpal output stream) remain
+  //! `#[ignore = "requires real default audio output device"]` so CI
+  //! without an audio device still passes — they run locally via
+  //! `cargo test --features audio -- --ignored`.
+  use super::*;
+  use crate::audio::playback::config::{ChannelLayout, PlaybackConfig, SampleFormat};
+
+  /// F1 (R3 MEDIUM) — `stop()`'s unconditional cleanup path:
+  /// `SharedState::stop_cleanup` MUST drain a non-empty queue + any
+  /// captured callback error to None, regardless of how it was
+  /// invoked. This is the cleanup branch `AudioPlayer::stop` runs
+  /// AFTER capturing the cpal pause result; if pause errs, this
+  /// still runs (the `Result` is returned at the end, not via `?`).
+  ///
+  /// Constructs `SharedState` directly (no cpal stream needed) so
+  /// the test runs in CI without an audio device — this is the
+  /// "struct mock" path the R3 spec calls for when injecting a real
+  /// cpal pause failure is impractical (cpal `Stream::pause()` on
+  /// macOS CoreAudio doesn't err on a healthy device, and there's
+  /// no public hook to swap in a faulty stream).
+  #[test]
+  fn shared_state_stop_cleanup_drains_queue_and_clears_error_unconditionally() {
+    let shared = SharedState::new(4096).expect("pre-allocate test queue");
+
+    // Pre-populate the queue + callback_error to non-empty so the
+    // cleanup's effect is observable.
+    {
+      let mut q = shared.queue.lock().unwrap();
+      q.extend([0.1_f32, 0.2, 0.3, 0.4]);
+    }
+    {
+      let mut e = shared.callback_error.lock().unwrap();
+      *e = Some("simulated prior cpal err_fn capture".to_string());
+    }
+
+    // Mirror `AudioPlayer::stop`'s ordering: latch FIRST, then
+    // state, then (in stop() — captured pause result, then) the
+    // unconditional cleanup. We exercise the cleanup branch
+    // directly here.
+    shared.terminated.store(true, Ordering::Release);
+    shared.state.store(STATE_STOPPED, Ordering::Release);
+    shared.stop_cleanup();
+
+    // Latch + state were set before cleanup — confirm they survive.
+    assert!(
+      shared.terminated.load(Ordering::Acquire),
+      "terminated latch must be set (stop ordering: latch -> state -> cleanup)"
+    );
+    assert_eq!(
+      shared.state.load(Ordering::Acquire),
+      STATE_STOPPED,
+      "state must be STOPPED post-stop"
+    );
+
+    // The unconditional cleanup MUST have drained the queue + cleared the
+    // captured callback error — both observable to the producer-side gates
+    // (`buffer_depth()` reads `queue.len()`; `take_callback_error()` reads
+    // `callback_error`).
+    assert_eq!(
+      shared.queue.lock().unwrap().len(),
+      0,
+      "stop_cleanup must drain the queue unconditionally (R3: this branch \
+       runs even when cpal pause errs — pre-R3, an early `?` on pause would \
+       skip this and leave samples lingering until Drop)"
+    );
+    assert!(
+      shared.callback_error.lock().unwrap().is_none(),
+      "stop_cleanup must clear captured callback_error unconditionally"
+    );
+  }
+
+  /// F1 corollary: `stop_cleanup` is also poison-safe — a panicked
+  /// callback that poisoned the queue or callback_error lock must
+  /// not prevent stop from draining. We simulate poisoning by
+  /// running a closure that panics while holding the lock.
+  #[test]
+  fn shared_state_stop_cleanup_recovers_from_poisoned_locks() {
+    use std::{panic, sync::Arc};
+
+    let shared = Arc::new(SharedState::new(64).expect("pre-allocate test queue"));
+
+    // Poison the queue lock from another thread by panicking while
+    // holding it. The Mutex transitions to Poisoned state; subsequent
+    // `lock()` returns `Err(PoisonError)`.
+    let queue_poisoner = Arc::clone(&shared);
+    let _ = std::thread::spawn(move || {
+      let _g = queue_poisoner.queue.lock().unwrap();
+      panic!("simulated callback panic poisoning queue lock");
+    })
+    .join();
+
+    // Poison the callback_error lock similarly.
+    let err_poisoner = Arc::clone(&shared);
+    let _ = std::thread::spawn(move || {
+      let _g = err_poisoner.callback_error.lock().unwrap();
+      panic!("simulated callback panic poisoning callback_error lock");
+    })
+    .join();
+
+    assert!(
+      shared.queue.is_poisoned(),
+      "test setup: queue lock should be poisoned"
+    );
+    assert!(
+      shared.callback_error.is_poisoned(),
+      "test setup: callback_error lock should be poisoned"
+    );
+
+    // Now exercise stop_cleanup: it MUST NOT propagate the
+    // PoisonError (no `unwrap`) and MUST still drain.
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+      shared.stop_cleanup();
+    }));
+    assert!(
+      result.is_ok(),
+      "stop_cleanup must not panic on poisoned locks (R3: poison-recover via into_inner)"
+    );
+  }
+
+  /// F2 (R3 MEDIUM, moved from `tests/audio_playback.rs`) — queue
+  /// is pre-allocated to its full `queue_capacity_samples` bound at
+  /// construction time, NOT on first producer write. Asserts the
+  /// `try_reserve_exact` contract ("AT LEAST `additional` more").
+  ///
+  /// Lives in-crate so it can read the private
+  /// `shared.queue.capacity()` + `shared.queue_capacity_samples`
+  /// without needing the previously-leaked `pub _test_*` accessors.
+  /// Device-gated: `AudioPlayer::new` opens a cpal output stream.
+  #[cfg(target_os = "macos")]
+  #[test]
+  #[ignore = "requires real default audio output device"]
+  fn audio_player_pre_allocates_queue_capacity_at_construction() {
+    let cfg = PlaybackConfig {
+      sample_rate: 16_000,
+      channels: ChannelLayout::Mono,
+      sample_format: SampleFormat::F32,
+      buffer_size_frames: None,
+      queue_capacity_frames: 4096,
+    };
+    let player = AudioPlayer::new(cfg).unwrap();
+
+    assert_eq!(player.buffer_depth(), 0);
+    let cap_samples = player.shared.queue_capacity_samples;
+    assert_eq!(
+      cap_samples, 4096,
+      "queue cap = frames * channels = 4096 * 1"
+    );
+    let underlying = match player.shared.queue.lock() {
+      Ok(g) => g.capacity(),
+      Err(poisoned) => poisoned.into_inner().capacity(),
+    };
+    assert!(
+      underlying >= cap_samples,
+      "VecDeque underlying capacity ({underlying}) must be >= bounded cap ({cap_samples}) per \
+       try_reserve_exact contract"
+    );
+  }
+
+  /// F2 (R3 MEDIUM, moved from `tests/audio_playback.rs`) —
+  /// producer-side `write_samples` MUST NOT grow the underlying
+  /// VecDeque capacity. The bound is pre-allocated at construction,
+  /// so `extend` is a pure O(chunk) memcpy with no realloc inside
+  /// the producer's lock window (the cpal callback's `try_lock`
+  /// can't be inflated by allocator time).
+  #[cfg(target_os = "macos")]
+  #[test]
+  #[ignore = "requires real default audio output device"]
+  fn audio_player_write_samples_does_not_grow_queue_capacity_during_playback() {
+    let cfg = PlaybackConfig {
+      sample_rate: 16_000,
+      channels: ChannelLayout::Mono,
+      sample_format: SampleFormat::F32,
+      buffer_size_frames: None,
+      queue_capacity_frames: 4096,
+    };
+    let mut player = AudioPlayer::new(cfg).unwrap();
+    player.start().unwrap();
+    // pause() so the callback doesn't drain the just-pushed samples
+    // and trigger a buffer-depth race in the post-write capacity
+    // read.
+    player.pause().unwrap();
+
+    let cap_before = match player.shared.queue.lock() {
+      Ok(g) => g.capacity(),
+      Err(poisoned) => poisoned.into_inner().capacity(),
+    };
+    let cap_samples = player.shared.queue_capacity_samples;
+
+    // Push 1024 samples — well under the 4096 bound, so `extend`
+    // is a pure memcpy with no realloc.
+    player.write_samples(&[0.25_f32; 1024]).unwrap();
+
+    let cap_after = match player.shared.queue.lock() {
+      Ok(g) => g.capacity(),
+      Err(poisoned) => poisoned.into_inner().capacity(),
+    };
+    assert_eq!(
+      cap_after, cap_before,
+      "queue capacity grew during write_samples (before={cap_before}, after={cap_after}) — \
+       producer-loop `extend` must not realloc because the queue is pre-allocated to \
+       queue_capacity_samples ({cap_samples}) at construction"
+    );
+
+    let _ = player.stop();
   }
 }
