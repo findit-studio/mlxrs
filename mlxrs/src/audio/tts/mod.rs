@@ -22,7 +22,15 @@
 //!   chunk types.
 //! - [`TextProcessor`] (in this module) — the text-preprocessing **hook**
 //!   the synthesis pipeline exposes (the *interface*, not a concrete
-//!   phonemizer — G2P is model-specific).
+//!   phonemizer — G2P is model-specific). [`BasicTextProcessor`] in
+//!   [`text_processor`] is a no-G2P default impl (NFC + lowercase +
+//!   whitespace collapse).
+//! - [`g2p`] — grapheme-to-phoneme subsystem (the [`g2p::Phonemizer`]
+//!   trait, in-memory [`g2p::CMUDict`] lexicon + local-file loader,
+//!   ARPAbet→IPA mapper, [`g2p::NeuralPhonemizer`] orchestrator). The
+//!   underlying ByT5 model architecture is excluded
+//!   per the no-per-model-arch rule — `NeuralPhonemizer` takes any
+//!   `Fn(&str, &str) -> Result<String>` backend closure.
 //!
 //! This mirrors the existing [`crate::audio::stt`] STT support surface:
 //! `stt` ships the [`Model`](crate::audio::stt::model::Model) trait + the
@@ -61,58 +69,10 @@
 //! [swift-tp]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioTTS/TextProcessor.swift
 //! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 
+pub mod g2p;
 pub mod generate;
 pub mod load;
 pub mod model;
+pub mod text_processor;
 
-use crate::error::Result;
-
-/// Text-preprocessing hook for the TTS synthesis pipeline.
-///
-/// A 1:1 port of mlx-audio-swift's [`TextProcessor`][swift-tp] protocol —
-/// the *interface*, not a concrete phonemizer. Some TTS models (kokoro,
-/// kitten-tts) require phonemized IPA input rather than raw text; a
-/// [`TextProcessor`] converts natural-language text into the format the
-/// target model expects.
-///
-/// Phonemization / G2P itself is **model-specific** and out of scope per
-/// the project's [no per-model arch porting][noarch] rule — mlxrs ships the
-/// hook, not a Misaki/eSpeak G2P implementation. A per-model crate
-/// implements [`TextProcessor`] (e.g. a Misaki G2P adapter) and the model's
-/// [`TtsModel::synthesize_segment`](model::TtsModel::synthesize_segment)
-/// runs it; the [`tts_generate`](generate::tts_generate) driver itself
-/// never phonemizes — it passes segment text through unchanged.
-///
-/// Why a separate hook trait rather than a method on
-/// [`TtsModel`](model::TtsModel): mlx-audio-swift keeps `TextProcessor`
-/// distinct from `SpeechGenerationModel` precisely so one G2P adapter can
-/// be shared across several models, and so a caller can *inject* a custom
-/// processor at load time (the swift `loadModel(..., textProcessor:)`
-/// parameter). mlxrs mirrors that separation — per the
-/// [mirror-reference-structure][mirror] rule, the reference's two distinct
-/// protocols stay two distinct traits.
-///
-/// [swift-tp]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioTTS/TextProcessor.swift
-/// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
-/// [mirror]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/mirror-reference-structure.md
-pub trait TextProcessor {
-  /// Download or initialize any resources the processor needs before
-  /// [`TextProcessor::process`] can run (a G2P lexicon, a weights file, …).
-  ///
-  /// Mirrors the swift `TextProcessor.prepare()`. The default impl is a
-  /// no-op for processors that need no preparation (the swift protocol
-  /// extension's default is likewise empty); call it once before the first
-  /// `process`.
-  fn prepare(&mut self) -> Result<()> {
-    Ok(())
-  }
-
-  /// Convert input `text` into the format the target model expects (e.g.
-  /// phonemized IPA).
-  ///
-  /// `language` is an optional locale code (`"en-us"`, `"en-gb"`, …) — the
-  /// same `language: String?` argument the swift `process(text:language:)`
-  /// takes; `None` lets the processor pick a default. Returns the processed
-  /// string a per-model tokenizer then consumes.
-  fn process(&self, text: &str, language: Option<&str>) -> Result<String>;
-}
+pub use text_processor::{BasicTextProcessor, TextProcessor};
