@@ -1723,6 +1723,34 @@ fn fsync_path_inner(path: &Path) -> std::io::Result<()> {
     }
   }
 
+  // F7 R7 Finding test hook — "real OS failure" injector. Unlike the
+  // pre-existing injector above (which synthesizes a formatted
+  // io::Error string that incidentally includes the path), this one
+  // removes the target file then falls through to the natural
+  // [`std::fs::File::open`] call so the test observes the AUTHENTIC
+  // [`std::io::Error`] the OS produces — a context-free OS-level
+  // message like `"No such file or directory (os error 2)"` with NO
+  // path embedded. Used by `convert.rs`'s F7 R7 "real failure" test to
+  // prove the call-site wrap in `copy_tokenizer_and_extras` adds path
+  // context INDEPENDENT of any injector-format coincidence.
+  //
+  // Production code path: always `None`, falls straight through to the
+  // real fsync (the entire `#[cfg(test)]` block is compiled out).
+  #[cfg(test)]
+  if let Some(remaining) = FSYNC_PATH_FAULT_REMOVE_THEN_FAIL.with(|c| c.get()) {
+    if remaining == 0 {
+      FSYNC_PATH_FAULT_REMOVE_THEN_FAIL.with(|c| c.set(None));
+      // Best-effort remove; if it doesn't exist we still want the
+      // natural File::open below to produce the real NotFound error.
+      let _ = std::fs::remove_file(path);
+      // Fall through to the natural code path — File::open(path) will
+      // now return `io::ErrorKind::NotFound` with the OS-level message
+      // (no path in `.to_string()`).
+    } else {
+      FSYNC_PATH_FAULT_REMOVE_THEN_FAIL.with(|c| c.set(Some(remaining - 1)));
+    }
+  }
+
   let f = std::fs::File::open(path)?;
   f.sync_all()
 }
@@ -1747,6 +1775,16 @@ thread_local! {
   /// Cleared in lockstep with `FSYNC_PATH_FAULT_SKIP_THEN_FAIL` when the
   /// injector fires.
   static FSYNC_PATH_FAULT_KIND: std::cell::Cell<Option<std::io::ErrorKind>> =
+    const { std::cell::Cell::new(None) };
+  /// F7 R7 — "real failure" injector skip counter. When `Some(n)`, the
+  /// next `n` `fsync_path_inner` calls pass and the (n+1)-th
+  /// `remove_file`s the target path then falls through to the natural
+  /// [`std::fs::File::open`] which produces a real OS-level
+  /// [`std::io::ErrorKind::NotFound`] error (no path in the message).
+  /// Used to verify the call-site wrap in
+  /// `crate::lm::convert::copy_tokenizer_and_extras` adds path context
+  /// independent of any injector-format coincidence.
+  static FSYNC_PATH_FAULT_REMOVE_THEN_FAIL: std::cell::Cell<Option<usize>> =
     const { std::cell::Cell::new(None) };
 }
 
@@ -1793,6 +1831,37 @@ impl Drop for FsyncPathFaultGuard {
   fn drop(&mut self) {
     FSYNC_PATH_FAULT_SKIP_THEN_FAIL.with(|c| c.set(None));
     FSYNC_PATH_FAULT_KIND.with(|c| c.set(None));
+  }
+}
+
+/// F7 R7 — arm the "real OS failure" injector: skip `skip` successful
+/// `fsync_path_inner` calls, then on the (skip+1)-th call remove the
+/// target file before the natural [`std::fs::File::open`] runs. The
+/// resulting [`std::io::Error`] is the AUTHENTIC OS-level error (kind
+/// [`std::io::ErrorKind::NotFound`], message like `"No such file or
+/// directory (os error 2)"`) with NO path embedded — exactly the kind
+/// of context-free failure the F7 R7 call-site wrap is designed to
+/// catch. Returns a [`Drop`] guard that disarms the injector on scope
+/// exit (so a test panic still leaves the thread clean).
+///
+/// `pub(crate)` (test-only) so [`crate::lm::convert`]'s F7 R7
+/// "real failure" test can drive a non-synthesized post-copy fsync
+/// warning through the public [`crate::lm::convert::convert`]
+/// entrypoint and assert the call-site wrap added path + operation
+/// context to a path-free OS-level error.
+#[cfg(test)]
+pub(crate) fn arm_fsync_path_fault_remove_then_fail(skip: usize) -> FsyncPathRemoveFaultGuard {
+  FSYNC_PATH_FAULT_REMOVE_THEN_FAIL.with(|c| c.set(Some(skip)));
+  FsyncPathRemoveFaultGuard
+}
+
+#[cfg(test)]
+pub(crate) struct FsyncPathRemoveFaultGuard;
+
+#[cfg(test)]
+impl Drop for FsyncPathRemoveFaultGuard {
+  fn drop(&mut self) {
+    FSYNC_PATH_FAULT_REMOVE_THEN_FAIL.with(|c| c.set(None));
   }
 }
 

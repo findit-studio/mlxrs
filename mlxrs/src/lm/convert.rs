@@ -1413,6 +1413,16 @@ pub struct CopyDurabilityWarnings {
   /// message text. The R6 fix routes through a new kind-preserving
   /// `fsync_path_io` sibling (returns [`std::io::Result`]) so callers
   /// can branch on `.kind()` directly.
+  ///
+  /// F7 R7 Finding: the message is also wrapped at the call site with
+  /// `"copy_tokenizer_and_extras: fsync <destination-path> failed:
+  /// <inner>"` so callers (and humans reading the warning) can pinpoint
+  /// WHICH copied tokenizer file warned — without this a real OS
+  /// failure (where the inner [`std::io::Error`] message is the
+  /// context-free OS text like `"No such file or directory (os error
+  /// 2)"`) would surface no path information. The wrap preserves the
+  /// underlying `kind()` (uses [`std::io::Error::new`], not
+  /// [`std::io::Error::other`]) so the F7 R6 contract is intact.
   pub post_copy_file: Option<std::io::Error>,
   /// Post-copy `fsync_dir(dst)` warning, after every per-file fsync
   /// has been observed. `None` if the directory fsync passed.
@@ -1557,6 +1567,40 @@ pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<CopyOutcome> 
     }
   };
 
+  // F7 R7 Finding: wrap `fsync_path_io`'s raw [`std::io::Error`] with
+  // operation + destination-path context BEFORE recording. Without this
+  // a REAL post-copy fsync failure (where [`std::fs::File::open`] /
+  // [`std::fs::File::sync_all`] return an [`std::io::Error`] whose
+  // message is the OS-level text only — `"No such file or directory
+  // (os error 2)"`, `"Input/output error (os error 5)"`, ...) gives the
+  // caller no way to identify WHICH copied tokenizer file warned or
+  // whether the failure was the reopen vs the sync_all. The injected-
+  // error tests pass the path-context assertion by accident (the
+  // test-only injector formats the path into its message), but a real
+  // failure in production would surface a context-free OS string.
+  //
+  // [`std::io::Error::new`] preserves the underlying [`ErrorKind`]
+  // (the F7 R6 contract — callers branch on `.kind()` to disambiguate
+  // ENOSPC / EIO / PermissionDenied / NotFound / ...) while the wrap
+  // adds the missing operation + path context to the message. The
+  // helper is closed over `dst`'s display lifetime per-call so each
+  // entry's warning names its OWN file.
+  //
+  // Takes `e` by reference: we read `kind()` (`&self`) and Display-
+  // interpolate (`{e}` via `Display::fmt(&self, _)`) and DON'T need to
+  // consume the value — the new wrapped [`std::io::Error`] is
+  // constructed from these two views plus the path-context message.
+  // Avoids clippy::needless_pass_by_value.
+  fn wrap_fsync_err(dst: &Path, e: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+      e.kind(),
+      format!(
+        "copy_tokenizer_and_extras: fsync {} failed: {e}",
+        dst.display()
+      ),
+    )
+  }
+
   // The fixed-set extras.
   for name in TOKENIZER_EXTRA_FILES {
     let s = src.join(name);
@@ -1585,8 +1629,11 @@ pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<CopyOutcome> 
     // `io::Error::other(...)` — collapsing every real kind to
     // [`std::io::ErrorKind::Other`] and forcing callers to parse the
     // message text to disambiguate quota / permission / disk failures.
+    //
+    // F7 R7 Finding: wrap with operation + destination-path context at
+    // the call site (kind preserved). See `wrap_fsync_err` above.
     if let Err(e) = crate::lm::load::fsync_path_io(&d) {
-      record_file_fsync_warning(e);
+      record_file_fsync_warning(wrap_fsync_err(&d, &e));
     }
   }
 
@@ -1628,9 +1675,10 @@ pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<CopyOutcome> 
       ),
     })?;
     // Post-copy file fsync — same rationale + kind-preservation as
-    // the TOKENIZER_EXTRA_FILES loop above (F7 R6 Finding).
+    // the TOKENIZER_EXTRA_FILES loop above (F7 R6 Finding). Wrapped
+    // with operation + destination-path context (F7 R7 Finding).
     if let Err(e) = crate::lm::load::fsync_path_io(&d) {
-      record_file_fsync_warning(e);
+      record_file_fsync_warning(wrap_fsync_err(&d, &e));
     }
   }
 
@@ -3653,6 +3701,239 @@ mod unit {
         );
       }
       other => panic!("expected Err(DurabilityWarning), got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&workdir);
+  }
+
+  // ─── F7 R7 Finding — call-site wrap adds path + operation context ──
+  //
+  // Codex R7 finding: `fsync_path_io` returns the raw [`std::io::Error`]
+  // from [`std::fs::File::open`] / [`std::fs::File::sync_all`] without
+  // adding path/operation context. For REAL failures (not the injected
+  // ones whose message happens to include the path), callers get only
+  // OS-level text like `"No such file or directory (os error 2)"` or
+  // `"Input/output error (os error 5)"` — no way to tell WHICH copied
+  // tokenizer file warned or whether the failure was the reopen vs the
+  // sync_all.
+  //
+  // The fix wraps at the call site (in `copy_tokenizer_and_extras`)
+  // with `"copy_tokenizer_and_extras: fsync <dst-path> failed: <inner>"`
+  // via [`std::io::Error::new`] (kind preserved — the R6 contract is
+  // intact).
+  //
+  // The two tests below cover BOTH halves of the assurance:
+  //
+  // 1. `convert_post_copy_file_warning_includes_destination_path` —
+  //    drives the existing R6 injected-kind path and asserts the wrap
+  //    added BOTH the destination filename AND the operation tag. This
+  //    verifies the wrap fires on the standard injected path
+  //    (regression detector: if the wrap is removed, the assertion
+  //    that the message contains the operation tag fails because the
+  //    injector's own message doesn't include `"copy_tokenizer_and_extras:
+  //    fsync"`).
+  //
+  // 2. `convert_post_copy_file_real_failure_includes_path_and_kind` —
+  //    drives the F7 R7 "real failure" injector (which removes the
+  //    target file then falls through to the natural
+  //    [`std::fs::File::open`] for an AUTHENTIC OS-level
+  //    [`std::io::ErrorKind::NotFound`] with NO path in the message).
+  //    Asserts the wrap added path + operation context to a context-
+  //    free OS error — proving the path-context assertion isn't passing
+  //    only because the injector pre-formats the path into its message.
+
+  /// F7 R7 Finding — the post-copy per-file fsync warning message
+  /// contains the destination filename + operation tag (added by the
+  /// call-site wrap in `copy_tokenizer_and_extras`).
+  ///
+  /// Drives the same injected-kind path as
+  /// `convert_post_copy_file_warning_preserves_io_error_kind` but adds
+  /// the R7 path-context assertions. A regression that removes the
+  /// call-site wrap would still pass the kind assertion (because
+  /// `fsync_path_io` returns the raw io::Error directly) but would FAIL
+  /// the operation-tag assertion because the injector's own message
+  /// (`"injected fsync_path failure for ..."`) does NOT contain
+  /// `"copy_tokenizer_and_extras: fsync"`.
+  ///
+  /// Skip count: 3 — same shape as the R6 test. The first post-copy
+  /// per-file fsync is for `tokenizer.json` (first
+  /// `TOKENIZER_EXTRA_FILES` entry that exists at src). Asserts the
+  /// warning message contains BOTH `"tokenizer.json"` and the
+  /// operation tag `"copy_tokenizer_and_extras: fsync"`.
+  #[test]
+  fn convert_post_copy_file_warning_includes_destination_path() {
+    let (workdir, src, dst) = build_r4_fixture("post_copy_file_path_ctx");
+
+    let _guard =
+      crate::lm::load::arm_fsync_path_fault_with_kind(3, std::io::ErrorKind::PermissionDenied);
+
+    let r = convert(ConvertArgs {
+      hf_path: src,
+      mlx_path: dst.clone(),
+      ..Default::default()
+    });
+    drop(_guard);
+
+    match &r {
+      Err(Error::DurabilityWarning { committed, source }) => {
+        assert!(*committed, "committed=true (data IS on disk)");
+        // R6 contract intact: the wrap uses io::Error::new (kind
+        // preserved), not io::Error::other (which would collapse to
+        // `Other`).
+        assert_eq!(
+          source.kind(),
+          std::io::ErrorKind::PermissionDenied,
+          "R7 wrap preserves the underlying ErrorKind (R6 contract); \
+           got: {:?} ({source})",
+          source.kind()
+        );
+        let msg = source.to_string();
+        // R7 wrap added the operation tag — the injector's own message
+        // does not contain this string, so this assertion fails if the
+        // call-site wrap is removed.
+        assert!(
+          msg.contains("copy_tokenizer_and_extras: fsync"),
+          "R7 wrap adds the operation tag `copy_tokenizer_and_extras: \
+           fsync ...`; got: {msg}"
+        );
+        // R7 wrap added the destination filename (tokenizer.json is
+        // the first entry of TOKENIZER_EXTRA_FILES present in src per
+        // build_r4_fixture).
+        assert!(
+          msg.contains("tokenizer.json"),
+          "wrap names the destination filename (tokenizer.json); got: \
+           {msg}"
+        );
+        // The wrap names the FULL destination path (not just the
+        // basename) so users can `cd` to the parent dir.
+        let expected_dst = dst.join("tokenizer.json");
+        assert!(
+          msg.contains(&expected_dst.display().to_string()),
+          "wrap names the full destination path ({}); got: {msg}",
+          expected_dst.display()
+        );
+        // R6 contract intact: the wrap PRESERVES the inner injector
+        // message via the trailing `: {e}` interpolation.
+        assert!(
+          msg.contains("injected fsync_path failure"),
+          "wrap preserves the verbatim inner io::Error message; got: \
+           {msg}"
+        );
+      }
+      other => panic!("expected Err(DurabilityWarning), got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&workdir);
+  }
+
+  /// F7 R7 Finding — REAL OS-level fsync failure (not the synthesized
+  /// "injected fsync_path failure for {path}" string from the standard
+  /// injector) carries path + operation context via the call-site wrap.
+  ///
+  /// Drives the F7 R7 "remove_then_fail" injector — on the 4th
+  /// `fsync_path_inner` call (past the 3 save-side calls), the injector
+  /// removes the target file then FALLS THROUGH to the natural
+  /// [`std::fs::File::open`] which returns the AUTHENTIC OS-level
+  /// [`std::io::ErrorKind::NotFound`] error. That error's message is
+  /// the platform OS text (`"No such file or directory (os error 2)"`
+  /// on Unix) — it does NOT include the path. Without the F7 R7 call-
+  /// site wrap, the recorded warning would surface this context-free
+  /// string to the caller, who would have no way to tell WHICH copied
+  /// tokenizer file warned.
+  ///
+  /// Asserts:
+  ///   (a) result is `Err(DurabilityWarning)` (single warning →
+  ///       single-source shape, R5 routing) with `committed: true`;
+  ///   (b) source.kind() is the REAL OS kind (NotFound) — not the
+  ///       injector-default Other (proves we're observing the natural
+  ///       failure, not a synthesized one);
+  ///   (c) source.to_string() contains the destination filename
+  ///       (tokenizer.json — added by the R7 wrap);
+  ///   (d) source.to_string() does NOT contain `"injected fsync_path
+  ///       failure"` (the standard injector's marker — proves this is
+  ///       a real OS failure path, not the synthesized one);
+  ///   (e) source.to_string() contains `"copy_tokenizer_and_extras:
+  ///       fsync"` (the operation tag — added by the R7 wrap).
+  #[test]
+  fn convert_post_copy_file_real_failure_includes_path_and_kind() {
+    let (workdir, src, dst) = build_r4_fixture("post_copy_file_real_fail");
+
+    // Skip 3 (save-side fsync_path calls); fire on the 4th (first
+    // post-copy per-file fsync — tokenizer.json). The injector removes
+    // tokenizer.json then falls through to File::open which returns
+    // the real OS NotFound error WITHOUT path in the message.
+    let _guard = crate::lm::load::arm_fsync_path_fault_remove_then_fail(3);
+
+    let r = convert(ConvertArgs {
+      hf_path: src,
+      mlx_path: dst.clone(),
+      ..Default::default()
+    });
+    drop(_guard);
+
+    match &r {
+      Err(Error::DurabilityWarning { committed, source }) => {
+        // (a) committed: true.
+        assert!(
+          *committed,
+          "post-copy fsync warning carries committed=true (the file's \
+           bytes reached disk via std::fs::copy BEFORE the fsync ran; \
+           the durability-uncertain window is between copy returning \
+           Ok and the fsync completing)"
+        );
+        // (b) Real OS kind (NotFound), not the injector-default Other.
+        // This is the proof-of-real-failure: the standard
+        // `arm_fsync_path_fault` injector synthesizes a
+        // `ErrorKind::Other` failure; only the natural File::open path
+        // produces ErrorKind::NotFound.
+        assert_eq!(
+          source.kind(),
+          std::io::ErrorKind::NotFound,
+          "real OS failure path produces the natural File::open kind \
+           (NotFound) — observed {:?} ({source})",
+          source.kind()
+        );
+        let msg = source.to_string();
+        // (c) Destination filename is in the wrap.
+        assert!(
+          msg.contains("tokenizer.json"),
+          "wrap names the destination filename (tokenizer.json) so the \
+           caller can pinpoint WHICH copied file warned; got: {msg}"
+        );
+        let expected_dst = dst.join("tokenizer.json");
+        assert!(
+          msg.contains(&expected_dst.display().to_string()),
+          "wrap names the full destination path ({}) so the caller can \
+           navigate to the failing file directly; got: {msg}",
+          expected_dst.display()
+        );
+        // (d) Operation tag is in the wrap.
+        assert!(
+          msg.contains("copy_tokenizer_and_extras: fsync"),
+          "wrap adds the operation tag so a real OS error (which has no \
+           path embedded — the message is OS-level text like `No such \
+           file or directory (os error 2)`) can be traced back to the \
+           post-copy fsync step in copy_tokenizer_and_extras; got: {msg}"
+        );
+        // (e) Confirms this is the REAL OS path: the standard injector's
+        // marker is absent. Without this assertion the test could pass
+        // even if the remove_then_fail injector regressed to using the
+        // synthesized marker (which would coincidentally include the
+        // path and mask a missing call-site wrap).
+        assert!(
+          !msg.contains("injected fsync_path failure"),
+          "this test drives the REAL OS failure path (File::open on a \
+           removed file); the standard injector's synthesized marker \
+           `injected fsync_path failure` must NOT appear — its presence \
+           would mean the remove_then_fail injector regressed to using \
+           the synthesized error path; got: {msg}"
+        );
+      }
+      other => panic!(
+        "expected Err(DurabilityWarning) carrying the real OS NotFound \
+         (kind from File::open on a removed file) wrapped with R7 path + \
+         operation context, got {other:?}"
+      ),
     }
 
     let _ = std::fs::remove_dir_all(&workdir);
