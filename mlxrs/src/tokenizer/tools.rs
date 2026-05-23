@@ -65,56 +65,6 @@ impl ToolCall {
   }
 }
 
-/// Top-level payload shapes a **tagged** tool parser accepts.
-///
-/// Round-5 structural fix: the L9 R4 dispatcher classified a tagged payload
-/// purely by its first non-whitespace byte (`{` → JSON-object scan, `[` → JSON-
-/// array scan, else plain substring), but that ignores which shapes the
-/// PARSER would actually parse. Pythonic legitimately ships payloads of the
-/// form `[name(args)]` with **single-quoted** string values such as
-/// `[echo(s='[abc')]`. Routed through the JSON-array balanced scanner —
-/// which only understands JSON-quoted `"..."` strings — the unmatched `[`
-/// inside `'[abc'` increments depth, never balances, and the real
-/// `<|tool_call_end|>` is never accepted. The processor then collects until
-/// EOS / the buffer cap, dropping the trailing display text on extraction.
-///
-/// The fix passes a per-parser capability hint (this enum) to the streaming
-/// end-tag detector, telling it which top-level shapes the parser would
-/// actually parse. Only parsers whose `parse()` legitimately consumes a JSON
-/// object/array end up using the balanced (string-aware) JSON scanners; every
-/// other parser falls through to the plain-substring search regardless of the
-/// payload's leading byte.
-///
-/// Per the L9 R4 parser-acceptance audit:
-///
-/// - [`TaggedPayloadShape::JsonObject`] — `json_tools`, `longcat`.
-/// - [`TaggedPayloadShape::JsonObjectOrArray`] — `glm47` (its `glm_parse_json`
-///   fallback unwraps the first object of a top-level `Value::Array`).
-/// - [`TaggedPayloadShape::Plain`] — `pythonic`, `mistral`, `qwen3_coder`,
-///   `kimi_k2`, `minimax_m2`, `function_gemma`, `gemma4` (none of these accept
-///   a top-level JSON object or array as their payload shape, so the
-///   plain-substring scanner is contract-correct).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaggedPayloadShape {
-  /// Plain text — no JSON balancing. Pythonic (`[name(args)]` with single-
-  /// quoted or unquoted string values), XML-style tags, mistral's `[ARGS]`,
-  /// and every other non-JSON delimiter scheme land here. Matches the
-  /// previous (pre-R3) substring-search behaviour for these formats.
-  Plain,
-  /// JSON object only — the payload is a single top-level `{...}` object.
-  /// Drives a JSON-string-aware balanced-object scan; the end tag is the
-  /// first match strictly after the balanced object closes, so an in-string
-  /// `</tool_call>` is never matched mid-object. Payloads that start with
-  /// `[` fall through to plain-substring (the parser would reject the array
-  /// shape anyway).
-  JsonObject,
-  /// JSON object **or** top-level JSON array. Drives the balanced object
-  /// scanner for `{...}` payloads, the balanced array scanner for `[...]`
-  /// payloads, and plain-substring for everything else. Only `glm47`'s
-  /// `glm_parse_json` legitimately consumes a top-level array.
-  JsonObjectOrArray,
-}
-
 /// A tool-call parser (Python `tool_module.parse_tool_call`). Implementors
 /// also expose the `tool_call_start` / `tool_call_end` delimiters.
 pub trait ToolParser: Send + Sync {
@@ -137,18 +87,50 @@ pub trait ToolParser: Send + Sync {
     marker_end(self.name())
   }
 
-  /// Top-level payload shapes this parser legitimately accepts (round-5
-  /// structural fix). Drives [`ToolCallProcessor`]'s tagged end-tag dispatch
-  /// so a parser whose `parse()` does **not** consume top-level JSON never
-  /// has its buffer routed through the balanced JSON scanners — see
-  /// [`TaggedPayloadShape`] for the per-parser audit + defect.
+  /// Find the byte position in `buffer` at which `end_tag` correctly closes
+  /// **this parser's** payload syntax, given that the payload starts at
+  /// `buffer.find(start_tag) + start_tag.len()`. Returns `Some(idx)` if found
+  /// at a position that respects the parser's payload semantics (NOT a false
+  /// match inside a quoted string, a balanced JSON construct, an XML CDATA
+  /// region, an escape sequence, etc.). Returns `None` if not yet found
+  /// (buffer needs more bytes; the streaming caller will append the next
+  /// chunk and retry).
   ///
-  /// The default is [`TaggedPayloadShape::Plain`] so any future parser that
-  /// forgets to override stays safe-by-default (no JSON scanner gets to
-  /// misinterpret a non-JSON payload's brackets).
-  fn tagged_payload_shape(&self) -> TaggedPayloadShape {
-    TaggedPayloadShape::Plain
+  /// Round-6 structural fix: end-tag detection is the parser's own
+  /// responsibility, not a central dispatcher's. Each parser owns the
+  /// payload-syntax knowledge needed to reject a false in-payload match
+  /// (Pythonic single/double-quoted strings, JSON object/array balancing,
+  /// XML body whose value can carry the end tag literal, `<escape>`-bracketed
+  /// gemma strings, etc.). The previous central `TaggedPayloadShape` dispatch
+  /// kept opening syntax gaps round-after-round because no central enum can
+  /// enumerate every parser's escaping rules; making the trait method the
+  /// ownership boundary closes the whole defect class structurally.
+  ///
+  /// **Default:** plain substring search of `end_tag` against `buffer` from
+  /// the payload's start offset — safe ONLY when the parser's payload syntax
+  /// CANNOT contain the `end_tag` literal as bytes inside its data. If the
+  /// payload syntax allows quoted strings, balanced brackets, XML CDATA,
+  /// escape sequences, or any construct that can embed the end_tag literal,
+  /// the parser MUST override this.
+  fn find_end_tag_in_buffer(&self, buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
+    default_plain_end_tag_scan(buffer, start_tag, end_tag)
   }
+}
+
+/// Default plain-substring end-tag scan: locate `end_tag` strictly inside the
+/// payload region (after the first occurrence of `start_tag`). Shared by every
+/// parser whose override delegates to it after running its own payload-prefix
+/// scanner (e.g. balanced JSON object scan ⇒ look for `end_tag` after the
+/// `}`). Falls back to a buffer-wide search if (defensively) the start tag is
+/// missing, mirroring the original [`find_tagged_end_tag`] safety net.
+fn default_plain_end_tag_scan(buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
+  let payload_at = match buffer.find(start_tag) {
+    Some(idx) => idx + start_tag.len(),
+    None => return buffer.find(end_tag),
+  };
+  buffer[payload_at..]
+    .find(end_tag)
+    .map(|rel| payload_at + rel)
 }
 
 fn err(msg: impl Into<String>) -> Error {
@@ -263,10 +245,14 @@ impl ToolParser for JsonTools {
   fn name(&self) -> &'static str {
     "json_tools"
   }
-  fn tagged_payload_shape(&self) -> TaggedPayloadShape {
+  fn find_end_tag_in_buffer(&self, buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
     // `parse()` requires a top-level `{name, arguments}` object; a top-level
-    // array fails `v.get("name")`.
-    TaggedPayloadShape::JsonObject
+    // array fails `v.get("name")`. Skip past the JSON object using a
+    // string-aware balanced scan, then plain-substring search for `end_tag`
+    // strictly AFTER the closing brace, so an in-string `</tool_call>` (or
+    // any other end-tag literal embedded inside a string value) inside the
+    // JSON object never cuts the buffer mid-payload.
+    json_object_then_end_tag(buffer, start_tag, end_tag)
   }
 }
 
@@ -290,6 +276,16 @@ impl ToolParser for Pythonic {
   }
   fn name(&self) -> &'static str {
     "pythonic"
+  }
+  fn find_end_tag_in_buffer(&self, buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
+    // Round-6 regression class: Pythonic payloads `[name(args)]` carry
+    // single-quoted (and double-quoted) string arguments which can embed the
+    // `<|tool_call_end|>` literal verbatim (`[echo(s='<|tool_call_end|>')]`).
+    // Plain substring would split at the in-string match, drop the call, and
+    // discard trailing display. Skip past the Pythonic call using a quote +
+    // bracket aware scan to find the `)]` that legitimately closes the call,
+    // then plain-substring for `end_tag` strictly after that.
+    pythonic_call_then_end_tag(buffer, start_tag, end_tag)
   }
 }
 
@@ -401,6 +397,10 @@ impl ToolParser for Mistral {
   fn name(&self) -> &'static str {
     "mistral"
   }
+  // No `find_end_tag_in_buffer` override: Mistral's `tool_call_end` is the
+  // empty string — the streaming processor handles the empty-end-tag case
+  // separately (call is closed at EOS, not in-stream) and never invokes the
+  // trait method here.
 }
 
 // ----------------------------------------------------------------------------
@@ -447,6 +447,16 @@ impl ToolParser for Qwen3Coder {
   }
   fn name(&self) -> &'static str {
     "qwen3_coder"
+  }
+  fn find_end_tag_in_buffer(&self, buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
+    // `qwen3_coder`'s end tag (`</tool_call>`) collides with parameter VALUES
+    // that may contain `</tool_call>` verbatim inside a
+    // `<parameter=p>VALUE</parameter>` body — e.g. a tool whose VALUE is the
+    // string `</tool_call>`. Scan past the parser's own `</function>` close
+    // (its `parse()` does `<function=...` then `.rfind("</function>")`) and
+    // search for `end_tag` strictly after it; if no `</function>` is in
+    // `buffer` yet keep collecting.
+    xml_function_then_end_tag(buffer, start_tag, end_tag)
   }
 }
 
@@ -564,12 +574,40 @@ impl ToolParser for Glm47 {
   fn name(&self) -> &'static str {
     "glm47"
   }
-  fn tagged_payload_shape(&self) -> TaggedPayloadShape {
-    // `glm_parse_json` accepts both `Value::Object` and `Value::Array` (and
-    // unwraps the first object of a top-level array). Both shapes need their
-    // own JSON-string-aware balanced scanner so an in-string `</tool_call>`
-    // never cuts the buffer mid-payload.
-    TaggedPayloadShape::JsonObjectOrArray
+  fn find_end_tag_in_buffer(&self, buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
+    // glm47 accepts THREE shapes via `parse()`:
+    //   1. XML-style `name<arg_key>k</arg_key><arg_value>v</arg_value>…` —
+    //      values are plain text after `</arg_value>` close, so the end tag
+    //      cannot legitimately appear inside a `<arg_value>` body without
+    //      breaking the format (any `</arg_value>` in v would terminate the
+    //      value early); treat as plain substring.
+    //   2. `glm_parse_json` fallback — top-level JSON object OR array. Use the
+    //      balanced scanner whose shape matches the payload's leading byte.
+    //   3. `glm_parse_plain` fallback — plain text.
+    //
+    // Classify the payload's leading non-whitespace byte: `{` → balanced
+    // object then plain substring; `[` → balanced array then plain substring;
+    // else plain substring.
+    let payload_at = match buffer.find(start_tag) {
+      Some(idx) => idx + start_tag.len(),
+      None => return buffer.find(end_tag),
+    };
+    let payload = &buffer[payload_at..];
+    match classify_json_payload_start(payload) {
+      JsonPayloadStart::Object => {
+        let (_, obj_end) = balanced_json_object_prefix(payload)?;
+        let rel = payload[obj_end..].find(end_tag)?;
+        Some(payload_at + obj_end + rel)
+      }
+      JsonPayloadStart::Array => {
+        let (_, arr_end) = balanced_json_array_prefix(payload)?;
+        let rel = payload[arr_end..].find(end_tag)?;
+        Some(payload_at + arr_end + rel)
+      }
+      JsonPayloadStart::None => buffer[payload_at..]
+        .find(end_tag)
+        .map(|rel| payload_at + rel),
+    }
   }
 }
 
@@ -761,6 +799,20 @@ impl ToolParser for KimiK2 {
   fn name(&self) -> &'static str {
     "kimi_k2"
   }
+  fn find_end_tag_in_buffer(&self, buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
+    // Kimi payload is one-or-more
+    //   <|tool_call_begin|>functions.name:N<|tool_call_argument_begin|>{json}<|tool_call_end|>
+    // calls between the section delimiters. The per-call `{json}` arguments
+    // are arbitrary JSON, so a string value could embed the section end tag
+    // `<|tool_calls_section_end|>` verbatim. Skip past each call's
+    // `<|tool_call_end|>` (so any in-JSON section-end literal is safely
+    // *inside* a confirmed call body), then plain-substring after the last
+    // such call closes. While a per-call `{json}` is still open the inner
+    // `<|tool_call_end|>` may itself live inside a string value, so we
+    // additionally use the balanced JSON object scanner for the args region
+    // before consuming the per-call end.
+    kimi_section_then_end_tag(buffer, start_tag, end_tag)
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -816,12 +868,32 @@ impl ToolParser for Longcat {
   fn name(&self) -> &'static str {
     "longcat"
   }
-  fn tagged_payload_shape(&self) -> TaggedPayloadShape {
-    // Longcat's `parse()` has a `{...}` fast-path that calls
-    // `serde_json::from_str::<Value>` — it accepts a top-level object only,
-    // not a top-level array (the `else` branch falls into the XML-style
-    // `<longcat_arg_key>` path which `from_str` wouldn't apply to anyway).
-    TaggedPayloadShape::JsonObject
+  fn find_end_tag_in_buffer(&self, buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
+    // Longcat's `parse()` is either a `{...}` JSON fast-path (object only —
+    // not array, the `else` branch is XML-style `<longcat_arg_key>` data) or
+    // the XML-style format. For JSON payloads use the string-aware balanced
+    // object scan so an in-string `</longcat_tool_call>` cannot truncate the
+    // object; for XML-style payloads plain substring is correct (an
+    // `</longcat_tool_call>` inside a `<longcat_arg_value>` body would
+    // structurally terminate the value early, which is the model's own
+    // protocol violation, not a scanner gap).
+    let payload_at = match buffer.find(start_tag) {
+      Some(idx) => idx + start_tag.len(),
+      None => return buffer.find(end_tag),
+    };
+    let payload = &buffer[payload_at..];
+    if matches!(
+      classify_json_payload_start(payload),
+      JsonPayloadStart::Object
+    ) {
+      let (_, obj_end) = balanced_json_object_prefix(payload)?;
+      let rel = payload[obj_end..].find(end_tag)?;
+      Some(payload_at + obj_end + rel)
+    } else {
+      buffer[payload_at..]
+        .find(end_tag)
+        .map(|rel| payload_at + rel)
+    }
   }
 }
 
@@ -984,6 +1056,18 @@ impl ToolParser for MinimaxM2 {
   fn name(&self) -> &'static str {
     "minimax_m2"
   }
+  fn find_end_tag_in_buffer(&self, buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
+    // The end tag `</minimax:tool_call>` collides with parameter VALUES that
+    // may contain `</minimax:tool_call>` verbatim inside a
+    // `<parameter name="p">VALUE</parameter>` body. Walk the payload as a
+    // sequence of `<invoke name=...>...</invoke>` blocks (mirroring `parse()`'s
+    // `find_all("<invoke name=", "</invoke>")`); the section end legitimately
+    // begins only AFTER the last completed `</invoke>` (and the next byte is
+    // not the start of another `<invoke`). Inside an `<invoke>` body any
+    // textual `</minimax:tool_call>` is safely *inside* the invoke close so
+    // this scan never trips on it.
+    xml_invoke_then_end_tag(buffer, start_tag, end_tag)
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -1043,6 +1127,16 @@ impl ToolParser for FunctionGemma {
   fn name(&self) -> &'static str {
     "function_gemma"
   }
+  fn find_end_tag_in_buffer(&self, buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
+    // Function-gemma's payload is `call:name{k:v,...}` where `v` can be
+    // `<escape>STR<escape>` and STR is arbitrary text that may contain the
+    // end tag `<end_function_call>` literal. The braces themselves are
+    // single-level (`gemma_call` uses non-greedy `.*?}`) but only the brace-
+    // close that follows the call is the parse anchor. Use a scan that
+    // tracks `<escape>...<escape>` regions verbatim and the `{...}` of the
+    // call body, then plain-substring after the call's `}` for `end_tag`.
+    function_gemma_call_then_end_tag(buffer, start_tag, end_tag)
+  }
 }
 
 /// Find `call:name{...}` — non-greedy `{.*?}` when `balanced` is false.
@@ -1090,6 +1184,15 @@ impl ToolParser for Gemma4 {
   }
   fn name(&self) -> &'static str {
     "gemma4"
+  }
+  fn find_end_tag_in_buffer(&self, buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
+    // Gemma4's payload is one-or-more `call:name{...}` blocks where strings
+    // are `<|"|>STR<|"|>` and braces are balanced (matching
+    // `gemma4_calls` / `balanced_brace_end`). STR can carry the end tag
+    // `<tool_call|>` literal verbatim. Walk the payload as a sequence of
+    // such call blocks (string- and brace-aware), then plain-substring after
+    // the last call's `}` for `end_tag`.
+    gemma4_calls_then_end_tag(buffer, start_tag, end_tag)
   }
 }
 
@@ -1785,19 +1888,17 @@ impl ToolCallProcessor {
         return display;
       }
 
-      // Locate the *real* end tag. Round-3 made the JSON-vs-substring choice
-      // dynamic per payload; round-5 threads a per-parser capability hint
-      // (`tagged_payload_shape`) so a parser that doesn't accept JSON (e.g.
-      // pythonic, whose `[name(args)]` payload may contain single-quoted
-      // strings the JSON-array scanner would mis-balance) NEVER routes
-      // through the JSON scanners — payload-only classification is a parser-
-      // internal helper, not the dispatch axis.
-      let end_at = find_tagged_end_tag(
-        &self.tool_call_buffer,
-        start_tag,
-        end_tag,
-        self.parser.tagged_payload_shape(),
-      );
+      // Locate the *real* end tag. Round-6 structural fix: end-tag detection
+      // is the parser's own responsibility (each parser owns its payload-
+      // syntax escape rules — JSON quoting, Pythonic single/double-quoted
+      // strings, XML body bytes, `<escape>` markers, etc.). Each parser
+      // overrides `find_end_tag_in_buffer` to skip past its own payload
+      // syntactically before doing the plain-substring end-tag match, so an
+      // in-payload end-tag literal can never cut the buffer mid-call. See
+      // [`ToolParser::find_end_tag_in_buffer`].
+      let end_at = self
+        .parser
+        .find_end_tag_in_buffer(&self.tool_call_buffer, start_tag, end_tag);
 
       if let Some(end_at) = end_at {
         // Split the buffer at the confirmed end-tag offset: everything after
@@ -1958,120 +2059,34 @@ fn balanced_json_array_prefix(text: &str) -> Option<(usize, usize)> {
   None
 }
 
-/// Locate the byte offset of the *real* `end_tag` in a buffered **tagged**
-/// tool call, accounting for the end delimiter possibly occurring inside the
-/// payload (Codex round-2 finding 2).
-///
-/// Round-3 structural fix: the JSON-vs-substring choice was made **dynamic
-/// per payload** — it inspects the confirmed payload itself rather than
-/// relying on a per-parser flag that has to be kept in sync with every
-/// JSON-capable parser. The previous static `ToolParser::tagged_payload_is_json`
-/// flag missed parsers that *also* accept JSON payloads via a fallback path
-/// (`glm47`'s `glm_parse_json` fallback, `longcat`'s `{...}` fast path), so
-/// a JSON-string end-delimiter would cut their object in half too.
-///
-/// Round-4 extension: the classifier was extended to distinguish JSON
-/// *objects* (`{`) from JSON *arrays* (`[`). `glm47`'s `glm_parse_json`
-/// accepts a top-level `Value::Array` and pulls the first element, so a
-/// payload such as `[{"name":"echo","arguments":{"s":"</tool_call>"}}]` is
-/// valid glm47 input — the array-shape classifier + balanced array scanner
-/// keeps it intact.
-///
-/// **Round-5 structural fix:** payload-only classification mis-routed parsers
-/// whose payloads happen to *start* with `[` but who do NOT accept JSON
-/// arrays. Pythonic ships `[name(args)]` payloads with **single-quoted**
-/// string values (e.g. `[echo(s='[abc')]`); routed through
-/// [`balanced_json_array_prefix`] (which only knows JSON-quoted `"..."`
-/// strings) the unmatched `[` inside `'[abc'` increments depth, never
-/// balances, and the real `<|tool_call_end|>` is never accepted — the
-/// processor collects until EOS / the buffer cap and `strip_markers` discards
-/// the trailing display text.
-///
-/// The fix takes a per-parser `shape: TaggedPayloadShape` capability hint
-/// (the parser's own `tagged_payload_shape()` return). Only parsers whose
-/// `parse()` legitimately consumes JSON ever consult the balanced JSON
-/// scanners; every other parser falls through to the plain-substring search
-/// regardless of the payload's leading byte. Dispatch:
-///
-/// - [`TaggedPayloadShape::Plain`] — always plain-substring; the JSON
-///   scanners are never invoked. Preserves Pythonic, XML-style, mistral, and
-///   every other non-JSON parser.
-/// - [`TaggedPayloadShape::JsonObject`] — classify the payload's leading
-///   non-whitespace byte; only `{` drives the balanced object scanner.
-///   Anything else (including `[`) falls through to plain substring (the
-///   parser would reject an array shape regardless).
-/// - [`TaggedPayloadShape::JsonObjectOrArray`] — full classifier: `{` →
-///   balanced object scanner, `[` → balanced array scanner, otherwise plain
-///   substring. Used by `glm47` whose `glm_parse_json` fallback accepts both
-///   shapes.
-///
-/// Returns the offset (into `buffer`) at which `end_tag` begins, or `None`
-/// when no end tag has been confirmed yet (keep collecting). `end_tag` is
-/// assumed non-empty (callers handle the empty-end-tag formats separately).
-fn find_tagged_end_tag(
-  buffer: &str,
-  start_tag: &str,
-  end_tag: &str,
-  shape: TaggedPayloadShape,
-) -> Option<usize> {
-  // The buffer of a confirmed tagged call starts with `start_tag`; the
-  // payload is whatever follows it. If (defensively) it does not, fall back
-  // to the naive search rather than mis-slicing.
+/// Combine a JSON-object-aware payload-end scan with the post-object
+/// substring search for `end_tag`. Used by parsers whose payload is a single
+/// top-level JSON object whose string values can carry the end-tag literal
+/// verbatim (`json_tools`, `glm47` object payloads, `longcat` object
+/// payloads). Returns the offset of `end_tag` strictly AFTER the balanced
+/// `}`, or `None` while the object is still open / no end tag has arrived.
+fn json_object_then_end_tag(buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
   let payload_at = match buffer.find(start_tag) {
     Some(idx) => idx + start_tag.len(),
     None => return buffer.find(end_tag),
   };
   let payload = &buffer[payload_at..];
-  // Plain shape never inspects the payload's leading byte — the JSON scanners
-  // are NOT consulted under any circumstances. This is the round-5 fix: a
-  // parser that doesn't parse JSON must never let a JSON scanner interpret
-  // its brackets (Pythonic single-quoted strings, etc.).
-  if matches!(shape, TaggedPayloadShape::Plain) {
-    return buffer[payload_at..]
-      .find(end_tag)
-      .map(|rel| payload_at + rel);
-  }
-  match classify_json_payload_start(payload) {
-    JsonPayloadStart::Object => {
-      // JSON object payload — the end tag is the first match strictly after
-      // the balanced object close. `balanced_json_object_prefix` is
-      // JSON-string aware: an `end_tag` inside a `"..."` value is *within*
-      // `obj_end`, so the post-object search skips it. While the object is
-      // still open the scanner returns `None` and we propagate that — no end
-      // tag yet.
-      let (_, obj_end) = balanced_json_object_prefix(payload)?;
-      let rel = payload[obj_end..].find(end_tag)?;
-      Some(payload_at + obj_end + rel)
-    }
-    JsonPayloadStart::Array => {
-      // Only the JsonObjectOrArray shape gets to use the array scanner; a
-      // JsonObject-only parser falls through to plain substring (its
-      // `parse()` would reject the array shape anyway, but the buffer
-      // extraction stays contract-correct).
-      if matches!(shape, TaggedPayloadShape::JsonObjectOrArray) {
-        // JSON array payload — same shape as the object case, using the
-        // bracket-aware balanced scanner. An end tag inside any of the
-        // array's string elements is `< arr_end` and therefore skipped.
-        let (_, arr_end) = balanced_json_array_prefix(payload)?;
-        let rel = payload[arr_end..].find(end_tag)?;
-        Some(payload_at + arr_end + rel)
-      } else {
-        buffer[payload_at..]
-          .find(end_tag)
-          .map(|rel| payload_at + rel)
-      }
-    }
-    JsonPayloadStart::None => {
-      // Non-JSON-leading payload — naive substring search.
-      buffer[payload_at..]
-        .find(end_tag)
-        .map(|rel| payload_at + rel)
-    }
-  }
+  // Use the JSON-string-aware balanced scanner so an `end_tag` substring
+  // inside any `"..."` value is *within* `obj_end` and the post-object search
+  // safely skips past it. If the payload's first non-whitespace byte is not
+  // `{` (e.g. a glm47 XML-style payload routed by mistake), the scanner
+  // simply returns `None` because there is no opening brace; the call site
+  // then keeps collecting. Real callers route by classifier before invoking,
+  // so the `None` case here is rare.
+  let (_, obj_end) = balanced_json_object_prefix(payload)?;
+  let rel = payload[obj_end..].find(end_tag)?;
+  Some(payload_at + obj_end + rel)
 }
 
 /// Shape classification of a tagged tool-call payload's leading non-whitespace
-/// byte, driving the dynamic [`find_tagged_end_tag`] dispatch.
+/// byte. Used by glm47 / longcat to pick the appropriate JSON balancer
+/// (object vs array) before falling back to plain-substring for non-JSON
+/// payloads.
 ///
 /// JSON whitespace per RFC 8259 §2 is exactly space, tab, LF, CR — all ASCII,
 /// so a byte-level scan is correct even with multibyte content elsewhere.
@@ -2084,8 +2099,8 @@ enum JsonPayloadStart {
   /// the [`balanced_json_object_prefix`] scan.
   Object,
   /// Payload begins with `[` (after optional RFC-8259 whitespace) — drives
-  /// the [`balanced_json_array_prefix`] scan. Round-4 fix: glm47's
-  /// `glm_parse_json` fallback accepts `Value::Array`, so a JSON-array
+  /// the [`balanced_json_array_prefix`] scan. Used by glm47's
+  /// `glm_parse_json` fallback which accepts `Value::Array`, so a JSON-array
   /// payload must also use a balanced (string-aware) scan rather than the
   /// plain substring search that would cut on an in-string end tag.
   Array,
@@ -2104,6 +2119,342 @@ fn classify_json_payload_start(payload: &str) -> JsonPayloadStart {
     Some(b'{') => JsonPayloadStart::Object,
     Some(b'[') => JsonPayloadStart::Array,
     _ => JsonPayloadStart::None,
+  }
+}
+
+/// Skip a Pythonic call body `[name(args)]` (single/double-quoted string and
+/// bracket aware) starting at the first `[` in `payload`, then plain-
+/// substring search for `end_tag` strictly after the `)]`. Returns `None`
+/// while the call is still open / no end tag has arrived.
+///
+/// The R6 regression class: `[echo(s='<|tool_call_end|>')]<|tool_call_end|>`.
+/// A naive substring would split at the in-string `<|tool_call_end|>` and
+/// drop the call. The scan tracks single-quoted `'…'` and double-quoted
+/// `"…"` strings (escape-aware: `\'`, `\"`, `\\`) so the in-string match is
+/// safely *inside* the call body.
+fn pythonic_call_then_end_tag(buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
+  let payload_at = match buffer.find(start_tag) {
+    Some(idx) => idx + start_tag.len(),
+    None => return buffer.find(end_tag),
+  };
+  let payload = &buffer[payload_at..];
+  let call_end_rel = pythonic_call_close(payload)?;
+  let after = call_end_rel; // exclusive: bytes [.., call_end_rel) are the call
+  let rel = payload[after..].find(end_tag)?;
+  Some(payload_at + after + rel)
+}
+
+/// Return the byte offset just past the `)]` that closes the *first* Pythonic
+/// call body in `payload`, or `None` while the call is still open / there is
+/// no `[name(`. Tracks `[`/`]`/`(`/`)` depth and respects single- and double-
+/// quoted strings (escape-aware: `\'`, `\"`, `\\`) so a `)]` literal *inside*
+/// a string value never closes the call.
+///
+/// Pythonic grammar (Python `_tool_call_regex = \[(\w+)\((.*?)\)\]`): outer
+/// `[` opens, `name(` follows, then the args region, then `)]` closes. We
+/// support repeating call sequences like `[a(),b()]` only insofar as the
+/// returned offset is the FIRST `)]`; the caller then searches for `end_tag`
+/// after it, which is the expected per-call boundary because the Python
+/// regex matches the first complete `\[…\)\]`.
+fn pythonic_call_close(payload: &str) -> Option<usize> {
+  let bytes = payload.as_bytes();
+  // Find the first `[`; require it to be followed by a `(` somewhere ahead
+  // (the call form). If there is no `[`, no call here yet.
+  let start = bytes.iter().position(|&b| b == b'[')?;
+  let mut idx = start;
+  // Bracket / paren depth, and string state.
+  let mut bracket_depth: i32 = 0;
+  let mut paren_depth: i32 = 0;
+  let mut in_str: Option<u8> = None;
+  let mut escaped = false;
+  while idx < bytes.len() {
+    let b = bytes[idx];
+    if let Some(q) = in_str {
+      if escaped {
+        escaped = false;
+      } else if b == b'\\' {
+        escaped = true;
+      } else if b == q {
+        in_str = None;
+      }
+      idx += utf8_char_width(b);
+      continue;
+    }
+    match b {
+      b'\'' | b'"' => in_str = Some(b),
+      b'[' => bracket_depth += 1,
+      b']' => {
+        bracket_depth -= 1;
+        if bracket_depth == 0 {
+          // The closing `]` is at `idx`; for the call form we additionally
+          // require that the previous *structural* byte (skipping strings)
+          // was `)`. The simplest robust check: idx >= 1 and the byte at
+          // idx-1 is `)`.
+          if idx >= 1 && bytes[idx - 1] == b')' {
+            return Some(idx + 1);
+          }
+          // Closed without a `)` immediately before: still consume this
+          // outermost `]`; if we reach a bracket close without a `)` the
+          // Pythonic regex would not match a call here either, so we
+          // continue scanning past this `]` looking for another `[name(...)]`.
+          // Reset state to look for a fresh `[`.
+          // Move past this `]` and reset.
+          idx += 1;
+          while idx < bytes.len() && bytes[idx] != b'[' {
+            idx += utf8_char_width(bytes[idx]);
+          }
+          if idx >= bytes.len() {
+            return None;
+          }
+          // Re-enter the loop at the next `[`.
+          bracket_depth = 0;
+          paren_depth = 0;
+          in_str = None;
+          escaped = false;
+          continue;
+        }
+        if bracket_depth < 0 {
+          return None;
+        }
+      }
+      b'(' => paren_depth += 1,
+      b')' if paren_depth > 0 => {
+        paren_depth -= 1;
+      }
+      _ => {}
+    }
+    idx += utf8_char_width(b);
+  }
+  None
+}
+
+/// Skip a qwen3_coder `<function=...>…</function>` body, then plain-substring
+/// search for `end_tag` strictly after `</function>`. Returns `None` while
+/// the function block is still open / no end tag has arrived.
+///
+/// `parse()` extracts via `<function=` … `.rfind("</function>")`, so a
+/// streaming detector must agree: scan past the FIRST `</function>` that
+/// follows the `<function=` open, then look for the end tag. Inside any
+/// `<parameter=p>VALUE</parameter>` body, a textual `</tool_call>` is safely
+/// *inside* the `</function>` so the post-function search ignores it.
+fn xml_function_then_end_tag(buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
+  let payload_at = match buffer.find(start_tag) {
+    Some(idx) => idx + start_tag.len(),
+    None => return buffer.find(end_tag),
+  };
+  let payload = &buffer[payload_at..];
+  // Find the start of a function block. If there is none yet, keep collecting.
+  let fn_open = payload.find("<function=")?;
+  let after_open = fn_open + "<function=".len();
+  let close = "</function>";
+  let close_rel = payload[after_open..].find(close)?;
+  let after_close = after_open + close_rel + close.len();
+  let rel = payload[after_close..].find(end_tag)?;
+  Some(payload_at + after_close + rel)
+}
+
+/// Skip the minimax_m2 `<invoke name=…>…</invoke>` block sequence, then
+/// plain-substring search for `end_tag` strictly after the last invoke. Each
+/// invoke ends at its FIRST `</invoke>` (mirroring `parse()`'s
+/// `find_all("<invoke name=", "</invoke>")`). The end tag may legitimately
+/// follow the last `</invoke>`; subsequent `<invoke` opens mean more invokes
+/// are coming.
+///
+/// Returns `None` while still inside an invoke / no `</invoke>` has arrived /
+/// no end tag yet.
+fn xml_invoke_then_end_tag(buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
+  let payload_at = match buffer.find(start_tag) {
+    Some(idx) => idx + start_tag.len(),
+    None => return buffer.find(end_tag),
+  };
+  let payload = &buffer[payload_at..];
+  let open = "<invoke name=";
+  let close = "</invoke>";
+  let mut cursor = 0;
+  loop {
+    // Require a `<invoke name=` open at or after `cursor`; if absent we're
+    // either between invokes (look for end tag from here) or have not yet
+    // entered one (keep collecting).
+    let open_rel = match payload[cursor..].find(open) {
+      Some(o) => cursor + o,
+      None => {
+        // No further invoke opens in this buffer. From `cursor` onward the
+        // bytes are the optional gap before the section end tag.
+        let rel = payload[cursor..].find(end_tag)?;
+        return Some(payload_at + cursor + rel);
+      }
+    };
+    // Inside an invoke: find its `</invoke>` close. If absent, keep
+    // collecting (the invoke is still streaming).
+    let close_search_from = open_rel + open.len();
+    let close_rel = payload[close_search_from..].find(close)?;
+    let after_close = close_search_from + close_rel + close.len();
+    // Past this invoke close. Loop to find any subsequent `<invoke name=`
+    // (more invokes) OR the end tag (no more invokes).
+    cursor = after_close;
+  }
+}
+
+/// Skip the kimi_k2 per-call sequence
+/// `<|tool_call_begin|>functions.name:N<|tool_call_argument_begin|>{json}<|tool_call_end|>`
+/// (repeating), then plain-substring search for `end_tag`
+/// (`<|tool_calls_section_end|>`) strictly after the last per-call
+/// `<|tool_call_end|>`. The per-call `{json}` may carry the section end tag
+/// literal verbatim inside a string value; the balanced JSON object scanner
+/// is used to skip past the args region before consuming the per-call end.
+///
+/// Returns `None` while still inside a per-call args region / no per-call end
+/// yet / no section end yet.
+fn kimi_section_then_end_tag(buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
+  let payload_at = match buffer.find(start_tag) {
+    Some(idx) => idx + start_tag.len(),
+    None => return buffer.find(end_tag),
+  };
+  let payload = &buffer[payload_at..];
+  let call_begin = "<|tool_call_begin|>";
+  let arg_begin = "<|tool_call_argument_begin|>";
+  let call_end = "<|tool_call_end|>";
+  let mut cursor = 0;
+  loop {
+    // Look for the next per-call open. If none, search for the section end
+    // tag from `cursor` (we are either between calls or before any call).
+    let open_rel = match payload[cursor..].find(call_begin) {
+      Some(o) => cursor + o,
+      None => {
+        let rel = payload[cursor..].find(end_tag)?;
+        return Some(payload_at + cursor + rel);
+      }
+    };
+    // Past the per-call open: find the per-call `<|tool_call_argument_begin|>`.
+    let after_open = open_rel + call_begin.len();
+    let arg_open_rel = match payload[after_open..].find(arg_begin) {
+      Some(a) => after_open + a,
+      None => {
+        // Args header not yet present — keep collecting.
+        return None;
+      }
+    };
+    let args_at = arg_open_rel + arg_begin.len();
+    let args_region = &payload[args_at..];
+    // The args region is `{json}<|tool_call_end|>`. Use the JSON object
+    // balanced scanner so an in-string `<|tool_call_end|>` is `< obj_end` and
+    // does not prematurely terminate the per-call. If the args region is not
+    // JSON-leading (defensive — a malformed model), fall back to plain
+    // substring for `<|tool_call_end|>` from `args_at`.
+    let after_args_rel = match classify_json_payload_start(args_region) {
+      JsonPayloadStart::Object => {
+        let (_, obj_end) = balanced_json_object_prefix(args_region)?;
+        // `<|tool_call_end|>` should follow strictly after the JSON object.
+        let end_rel = args_region[obj_end..].find(call_end)?;
+        obj_end + end_rel + call_end.len()
+      }
+      _ => {
+        let end_rel = args_region.find(call_end)?;
+        end_rel + call_end.len()
+      }
+    };
+    cursor = args_at + after_args_rel;
+  }
+}
+
+/// Skip a single `call:name{...}` function_gemma block (with `<escape>`-
+/// bracketed string regions), then plain-substring search for `end_tag`
+/// strictly after the closing `}`. Returns `None` while the call body is
+/// still open / no end tag has arrived.
+///
+/// `gemma_call` uses non-greedy `\{(.*?)\}` (first `}` wins). The scan
+/// therefore advances to the first `}` *that is not inside a
+/// `<escape>...<escape>` region*. STR inside escape markers can carry the
+/// end tag `<end_function_call>` literal verbatim and `}` characters
+/// without truncating the call body.
+fn function_gemma_call_then_end_tag(buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
+  let payload_at = match buffer.find(start_tag) {
+    Some(idx) => idx + start_tag.len(),
+    None => return buffer.find(end_tag),
+  };
+  let payload = &buffer[payload_at..];
+  // Locate the call's opening `{` (anchored to `call:name`).
+  let call_marker = "call:";
+  let call_rel = payload.find(call_marker)?;
+  let after_marker = call_rel + call_marker.len();
+  let bytes = payload.as_bytes();
+  let mut j = after_marker;
+  while j < bytes.len()
+    && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
+  {
+    j += 1;
+  }
+  if j >= bytes.len() || bytes[j] != b'{' {
+    return None;
+  }
+  // Scan past the first `}` that is not inside `<escape>...<escape>`.
+  let escape = "<escape>";
+  let mut idx = j + 1;
+  let mut in_escape = false;
+  while idx < bytes.len() {
+    if !in_escape && payload[idx..].starts_with(escape) {
+      in_escape = true;
+      idx += escape.len();
+      continue;
+    }
+    if in_escape && payload[idx..].starts_with(escape) {
+      in_escape = false;
+      idx += escape.len();
+      continue;
+    }
+    if !in_escape && bytes[idx] == b'}' {
+      // Just past the closing brace.
+      let after_call = idx + 1;
+      let rel = payload[after_call..].find(end_tag)?;
+      return Some(payload_at + after_call + rel);
+    }
+    idx += utf8_char_width(bytes[idx]);
+  }
+  None
+}
+
+/// Skip a sequence of `call:name{...}` gemma4 blocks (with `<|"|>`-bracketed
+/// string regions and balanced braces), then plain-substring search for
+/// `end_tag` strictly after the last call's closing `}`. Returns `None`
+/// while a call body is still open / no end tag has arrived.
+///
+/// Mirrors `gemma4_calls` / `balanced_brace_end`: braces inside
+/// `<|"|>STR<|"|>` regions are not counted, so STR can carry the end tag
+/// `<tool_call|>` literal verbatim without truncating the call body.
+fn gemma4_calls_then_end_tag(buffer: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
+  let payload_at = match buffer.find(start_tag) {
+    Some(idx) => idx + start_tag.len(),
+    None => return buffer.find(end_tag),
+  };
+  let payload = &buffer[payload_at..];
+  let mut cursor = 0;
+  loop {
+    // Look for the next `call:` open. If none, search for `end_tag` from
+    // `cursor` (we are either between calls or before any call).
+    let call_rel = match payload[cursor..].find("call:") {
+      Some(c) => cursor + c,
+      None => {
+        let rel = payload[cursor..].find(end_tag)?;
+        return Some(payload_at + cursor + rel);
+      }
+    };
+    let after_marker = call_rel + "call:".len();
+    let bytes = payload.as_bytes();
+    let mut j = after_marker;
+    while j < bytes.len()
+      && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
+    {
+      j += 1;
+    }
+    if j >= bytes.len() || bytes[j] != b'{' {
+      // Not a real call header — skip past `call:` and try again.
+      cursor = after_marker;
+      continue;
+    }
+    let body = &payload[j..];
+    let close_rel = balanced_brace_end(body)?;
+    // `close_rel` is the byte offset of the matching `}` within `body`.
+    cursor = j + close_rel + 1;
   }
 }
 
@@ -2668,256 +3019,191 @@ mod tests {
   }
 
   #[test]
-  fn find_tagged_end_tag_dynamic_dispatch() {
-    // Round-3 structural fix: end-tag detection is dynamic per payload — a
-    // payload that *looks* like a JSON object uses the balanced-object scan
-    // when the parser accepts JSON; anything else uses substring detection.
-    // Round-4 added array shapes; round-5 made the JSON-or-plain decision
-    // parser-capability-driven (not payload-only) — covered in the dedicated
-    // 3-shapes × 3-classifier-states test below.
+  fn per_parser_find_end_tag_in_buffer_routing() {
+    // Round-6 structural fix: end-tag detection is each parser's own
+    // responsibility (via `ToolParser::find_end_tag_in_buffer`). This unit
+    // exercises the core routing decisions per parser using the trait
+    // method directly, so a future regression in any one parser's override
+    // (or in the default's plain-substring search) trips here rather than
+    // only in an end-to-end streaming test where the failure mode is
+    // "buffer never completes".
 
-    // JSON-object payload routed by a JSON-accepting parser (JsonObject):
-    // end tag inside a string value is skipped; the first end tag after the
-    // balanced object is the real one.
-    let buf = r#"<tool_call>{"s":"</tool_call>"}</tool_call>"#;
-    let pos = find_tagged_end_tag(
-      buf,
-      "<tool_call>",
-      "</tool_call>",
-      TaggedPayloadShape::JsonObject,
-    )
-    .expect("real end tag after the balanced object");
-    assert_eq!(&buf[..pos], r#"<tool_call>{"s":"</tool_call>"}"#);
-    assert_eq!(&buf[pos..], "</tool_call>");
+    // -- json_tools: balanced object then plain-substring after `}` -------
+    // In-string end tag inside the object is skipped; the real end tag is
+    // the first match strictly after the balanced `}`.
+    {
+      let buf = r#"<tool_call>{"s":"</tool_call>"}</tool_call>"#;
+      let pos = JsonTools
+        .find_end_tag_in_buffer(buf, "<tool_call>", "</tool_call>")
+        .expect("real end tag after the balanced object");
+      assert_eq!(&buf[..pos], r#"<tool_call>{"s":"</tool_call>"}"#);
+      assert_eq!(&buf[pos..], "</tool_call>");
+      // Object still open — no end tag yet (`None` keep collecting).
+      assert_eq!(
+        JsonTools.find_end_tag_in_buffer(
+          r#"<tool_call>{"s":"</tool_call>"#,
+          "<tool_call>",
+          "</tool_call>"
+        ),
+        None
+      );
+    }
 
-    // JSON-object payload with leading whitespace: still detected as JSON.
-    let buf_ws = "<tool_call>   {\"s\":\"</tool_call>\"}</tool_call>";
-    let pos_ws = find_tagged_end_tag(
-      buf_ws,
-      "<tool_call>",
-      "</tool_call>",
-      TaggedPayloadShape::JsonObject,
-    )
-    .expect("ws-leading JSON still uses balanced scan");
-    assert_eq!(&buf_ws[pos_ws..], "</tool_call>");
+    // -- glm47: classify-then-scan (object OR array OR XML) ---------------
+    {
+      // Object payload: balanced object scan.
+      let buf = r#"<tool_call>{"s":"</tool_call>"}</tool_call>"#;
+      let pos = Glm47
+        .find_end_tag_in_buffer(buf, "<tool_call>", "</tool_call>")
+        .expect("object payload");
+      assert_eq!(&buf[..pos], r#"<tool_call>{"s":"</tool_call>"}"#);
+      // Array payload: balanced array scan (in-string end tag skipped).
+      let buf = r#"<tool_call>[{"s":"</tool_call>"}]</tool_call>"#;
+      let pos = Glm47
+        .find_end_tag_in_buffer(buf, "<tool_call>", "</tool_call>")
+        .expect("array payload");
+      assert_eq!(&buf[..pos], r#"<tool_call>[{"s":"</tool_call>"}]"#);
+      // XML-ish payload: plain substring.
+      let xml = "<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>";
+      let pos = Glm47
+        .find_end_tag_in_buffer(xml, "<tool_call>", "</tool_call>")
+        .expect("XML-ish payload");
+      assert_eq!(&xml[pos..], "</tool_call>");
+      // Array still open — `None`.
+      assert_eq!(
+        Glm47.find_end_tag_in_buffer(
+          r#"<tool_call>[{"s":"</tool_call>"#,
+          "<tool_call>",
+          "</tool_call>"
+        ),
+        None
+      );
+    }
 
-    // Non-JSON payload (XML-ish): substring search finds the first end tag.
-    let xml = "<tool_call><invoke>x</invoke></tool_call>";
-    let xml_pos = find_tagged_end_tag(
-      xml,
-      "<tool_call>",
-      "</tool_call>",
-      TaggedPayloadShape::JsonObject,
-    )
-    .expect("substring match for non-JSON payload");
-    assert_eq!(&xml[xml_pos..], "</tool_call>");
-    assert_eq!(&xml[..xml_pos], "<tool_call><invoke>x</invoke>");
+    // -- longcat: object fast-path then plain substring -------------------
+    {
+      // Object payload: balanced object scan, in-string end tag skipped.
+      let buf = r#"<longcat_tool_call>{"s":"</longcat_tool_call>"}</longcat_tool_call>"#;
+      let pos = Longcat
+        .find_end_tag_in_buffer(buf, "<longcat_tool_call>", "</longcat_tool_call>")
+        .expect("object payload");
+      assert_eq!(
+        &buf[..pos],
+        r#"<longcat_tool_call>{"s":"</longcat_tool_call>"}"#
+      );
+      // Array payload (not accepted by parse) falls through to plain
+      // substring — the call surface is contract-correct (the parser will
+      // reject the shape later).
+      let xml = "<longcat_tool_call>name<longcat_arg_key>k</longcat_arg_key><longcat_arg_value>v</longcat_arg_value></longcat_tool_call>";
+      let pos = Longcat
+        .find_end_tag_in_buffer(xml, "<longcat_tool_call>", "</longcat_tool_call>")
+        .expect("XML-ish payload");
+      assert_eq!(&xml[pos..], "</longcat_tool_call>");
+    }
 
-    // JSON-object payload while the object is still open: no end tag is
-    // accepted (the premature in-string delimiter is *inside* the object).
-    assert_eq!(
-      find_tagged_end_tag(
-        r#"<tool_call>{"s":"</tool_call>"#,
-        "<tool_call>",
-        "</tool_call>",
-        TaggedPayloadShape::JsonObject,
-      ),
-      None
-    );
-  }
+    // -- pythonic: quote/bracket aware, find `)]` then end tag ------------
+    {
+      // The R6 case: single-quoted string carrying the literal end tag.
+      let buf = "<|tool_call_start|>[echo(s='<|tool_call_end|>')]<|tool_call_end|>";
+      let pos = Pythonic
+        .find_end_tag_in_buffer(buf, "<|tool_call_start|>", "<|tool_call_end|>")
+        .expect("real end tag after the )]");
+      assert_eq!(
+        &buf[..pos],
+        "<|tool_call_start|>[echo(s='<|tool_call_end|>')]"
+      );
+      assert_eq!(&buf[pos..], "<|tool_call_end|>");
+      // Double-quoted variant — same defence.
+      let buf = r#"<|tool_call_start|>[echo(s="<|tool_call_end|>")]<|tool_call_end|>"#;
+      let pos = Pythonic
+        .find_end_tag_in_buffer(buf, "<|tool_call_start|>", "<|tool_call_end|>")
+        .expect("real end tag after the )]");
+      assert_eq!(
+        &buf[..pos],
+        r#"<|tool_call_start|>[echo(s="<|tool_call_end|>")]"#
+      );
+      // Still open (no `)]` yet).
+      assert_eq!(
+        Pythonic.find_end_tag_in_buffer(
+          "<|tool_call_start|>[echo(s='[",
+          "<|tool_call_start|>",
+          "<|tool_call_end|>",
+        ),
+        None
+      );
+    }
 
-  #[test]
-  fn find_tagged_end_tag_json_array_dispatch() {
-    // Round-4 finding: the dynamic detector must also recognise top-level
-    // JSON *arrays* — glm47's `glm_parse_json` accepts `Value::Array` and
-    // takes the first object. Round-5 makes this contingent on the parser's
-    // declared `tagged_payload_shape() == JsonObjectOrArray`; a JsonObject-
-    // only parser fed an array falls through to plain substring (covered in
-    // the 9-cell round-5 test below).
+    // -- qwen3_coder: find `</function>` then end tag ---------------------
+    {
+      let buf =
+        "<tool_call><function=echo><parameter=s></tool_call></parameter></function></tool_call>";
+      let pos = Qwen3Coder
+        .find_end_tag_in_buffer(buf, "<tool_call>", "</tool_call>")
+        .expect("real end tag after </function>");
+      assert_eq!(&buf[pos..], "</tool_call>");
+    }
 
-    // JSON-array payload routed by JsonObjectOrArray: in-string end tag
-    // inside an element is skipped; the first end tag *after* the balanced
-    // array close is the real one.
-    let buf = r#"<tool_call>[{"s":"</tool_call>"}]</tool_call>"#;
-    let pos = find_tagged_end_tag(
-      buf,
-      "<tool_call>",
-      "</tool_call>",
-      TaggedPayloadShape::JsonObjectOrArray,
-    )
-    .expect("real end tag after the balanced array");
-    assert_eq!(&buf[..pos], r#"<tool_call>[{"s":"</tool_call>"}]"#);
-    assert_eq!(&buf[pos..], "</tool_call>");
+    // -- minimax_m2: walk `<invoke …></invoke>` blocks --------------------
+    {
+      let buf = concat!(
+        "<minimax:tool_call>",
+        r#"<invoke name="f"><parameter name="p">v</parameter></invoke>"#,
+        "</minimax:tool_call>",
+      );
+      let pos = MinimaxM2
+        .find_end_tag_in_buffer(buf, "<minimax:tool_call>", "</minimax:tool_call>")
+        .expect("real end tag after </invoke>");
+      assert_eq!(&buf[pos..], "</minimax:tool_call>");
+      // Parameter VALUE contains the end tag literal — must be safely inside.
+      let buf = concat!(
+        "<minimax:tool_call>",
+        r#"<invoke name="f"><parameter name="p"></minimax:tool_call></parameter></invoke>"#,
+        "</minimax:tool_call>",
+      );
+      let pos = MinimaxM2
+        .find_end_tag_in_buffer(buf, "<minimax:tool_call>", "</minimax:tool_call>")
+        .expect("real end tag after </invoke>");
+      assert_eq!(&buf[pos..], "</minimax:tool_call>");
+    }
 
-    // JSON-array payload with leading whitespace: still detected as array.
-    let buf_ws = "<tool_call>  \n[{\"s\":\"</tool_call>\"}]</tool_call>";
-    let pos_ws = find_tagged_end_tag(
-      buf_ws,
-      "<tool_call>",
-      "</tool_call>",
-      TaggedPayloadShape::JsonObjectOrArray,
-    )
-    .expect("ws-leading array still uses balanced scan");
-    assert_eq!(&buf_ws[pos_ws..], "</tool_call>");
+    // -- kimi_k2: balanced JSON args per call, then section end -----------
+    {
+      let buf = concat!(
+        "<|tool_calls_section_begin|>",
+        "<|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>",
+        r#"{"s":"<|tool_calls_section_end|>"}"#,
+        "<|tool_call_end|>",
+        "<|tool_calls_section_end|>",
+      );
+      let pos = KimiK2
+        .find_end_tag_in_buffer(
+          buf,
+          "<|tool_calls_section_begin|>",
+          "<|tool_calls_section_end|>",
+        )
+        .expect("real section end after the per-call end");
+      // Real end tag is the LAST `<|tool_calls_section_end|>`.
+      assert_eq!(&buf[pos..], "<|tool_calls_section_end|>");
+    }
 
-    // Array still open (no matching `]` yet) — no end tag accepted.
-    assert_eq!(
-      find_tagged_end_tag(
-        r#"<tool_call>[{"s":"</tool_call>"#,
-        "<tool_call>",
-        "</tool_call>",
-        TaggedPayloadShape::JsonObjectOrArray,
-      ),
-      None
-    );
+    // -- function_gemma: find `}` outside <escape>...<escape> -------------
+    {
+      let buf =
+        "<start_function_call>call:f{k:<escape><end_function_call><escape>}<end_function_call>";
+      let pos = FunctionGemma
+        .find_end_tag_in_buffer(buf, "<start_function_call>", "<end_function_call>")
+        .expect("real end tag after `}`");
+      assert_eq!(&buf[pos..], "<end_function_call>");
+    }
 
-    // Multi-element array with multiple in-string end tags: still extracted
-    // after the array closes.
-    let multi = r#"<tool_call>[{"s":"</tool_call>"},{"t":"</tool_call>"}]</tool_call>"#;
-    let mp = find_tagged_end_tag(
-      multi,
-      "<tool_call>",
-      "</tool_call>",
-      TaggedPayloadShape::JsonObjectOrArray,
-    )
-    .expect("multi-element array");
-    assert_eq!(
-      &multi[..mp],
-      r#"<tool_call>[{"s":"</tool_call>"},{"t":"</tool_call>"}]"#
-    );
-  }
-
-  #[test]
-  fn find_tagged_end_tag_shape_x_classifier_matrix() {
-    // Round-5 contract: dispatch is `TaggedPayloadShape × JsonPayloadStart`
-    // (parser capability × classifier state). 3 shapes × 3 classifier states
-    // = 9 cells; exercise every cell so a future regression in the dispatch
-    // table (mis-routing one cell) trips here rather than in an end-to-end
-    // streaming test where the failure mode is "buffer never completes".
-    //
-    // Each row is `(shape, payload, end_tag, expected_offset_into_buffer)`:
-    // - `expected_offset = Some(n)` means the scanner accepts the end tag at
-    //   byte `n` of `buffer`.
-    // - `expected_offset = None` means the scanner rejects (keep buffering).
-    //
-    // The buffer is always `"<tool_call>" + payload`, so `payload_at = 11`.
-    let start = "<tool_call>";
-    let end = "</tool_call>";
-    let plen = start.len();
-
-    // The 3 classifier states correspond to leading bytes:
-    //   - Object: `{...}` payload
-    //   - Array:  `[...]` payload
-    //   - None:   anything else (XML-ish in these cases)
-    //
-    // Payloads are chosen so each shape's behaviour is observable:
-    // - Object payload with in-string end tag — JSON-aware scanners must
-    //   match AFTER the close; plain-substring would mis-match at the inner
-    //   in-string `</tool_call>`.
-    // - Array payload with in-string end tag — same defect class for arrays.
-    // - XML-ish payload — first match always wins regardless of shape.
-
-    let obj_payload = r#"{"s":"</tool_call>"}"#; // close at byte 20.
-    let arr_payload = r#"[{"s":"</tool_call>"}]"#; // close at byte 22.
-    let xml_payload = "<invoke>x</invoke>"; // 18 bytes; end tag at byte 0 of payload (wait — payload doesn't contain end tag, end tag follows it in the buffer).
-
-    // For Object/Array payloads, expected = plen + balanced_close_offset.
-    let obj_real_end = plen + obj_payload.len(); // 11 + 20 = 31
-    let arr_real_end = plen + arr_payload.len(); // 11 + 22 = 33
-    let xml_real_end = plen + xml_payload.len(); // 11 + 18 = 29
-
-    // Cases of the form `(shape, classifier_state, payload, expected)`. We
-    // assert dispatch differs between shapes for the SAME payload where the
-    // round-5 fix matters: the Object payload with an in-string end tag.
-
-    // -- Plain × Object ---------------------------------------------------
-    // The JSON scanners are NOT consulted. Plain substring matches the FIRST
-    // `</tool_call>` it sees — even the in-string one inside the object. The
-    // round-5 contract for Plain is: never trust JSON balancing. (For a Plain
-    // parser the payload would NEVER legitimately be a JSON object anyway —
-    // its `parse()` would reject it — but the buffer slice is contract-
-    // correct: it ends at the first end tag substring match.)
-    let buf = format!("{start}{obj_payload}{end}");
-    let in_string_match = plen + obj_payload.find(end).unwrap();
-    assert_eq!(
-      find_tagged_end_tag(&buf, start, end, TaggedPayloadShape::Plain),
-      Some(in_string_match),
-      "Plain × Object: plain substring (no JSON balancing)"
-    );
-
-    // -- Plain × Array ---------------------------------------------------
-    // Same — Plain shape never asks the classifier. This is the pythonic
-    // regression class: a Plain payload that *starts* with `[` (e.g.
-    // `[name(args)]`) must not get routed to the array scanner.
-    let buf = format!("{start}{arr_payload}{end}");
-    let in_string_match_arr = plen + arr_payload.find(end).unwrap();
-    assert_eq!(
-      find_tagged_end_tag(&buf, start, end, TaggedPayloadShape::Plain),
-      Some(in_string_match_arr),
-      "Plain × Array: plain substring (Pythonic protection)"
-    );
-
-    // -- Plain × None ----------------------------------------------------
-    let buf = format!("{start}{xml_payload}{end}");
-    assert_eq!(
-      find_tagged_end_tag(&buf, start, end, TaggedPayloadShape::Plain),
-      Some(xml_real_end),
-      "Plain × None: plain substring"
-    );
-
-    // -- JsonObject × Object ---------------------------------------------
-    // Balanced object scanner — in-string end tag is skipped.
-    let buf = format!("{start}{obj_payload}{end}");
-    assert_eq!(
-      find_tagged_end_tag(&buf, start, end, TaggedPayloadShape::JsonObject),
-      Some(obj_real_end),
-      "JsonObject × Object: balanced object scan"
-    );
-
-    // -- JsonObject × Array ----------------------------------------------
-    // Falls through to plain substring (a JsonObject parser would reject an
-    // array payload — Codex round-5 explicitly required this row).
-    let buf = format!("{start}{arr_payload}{end}");
-    assert_eq!(
-      find_tagged_end_tag(&buf, start, end, TaggedPayloadShape::JsonObject),
-      Some(in_string_match_arr),
-      "JsonObject × Array: plain substring fallthrough (not the array scanner)"
-    );
-
-    // -- JsonObject × None -----------------------------------------------
-    let buf = format!("{start}{xml_payload}{end}");
-    assert_eq!(
-      find_tagged_end_tag(&buf, start, end, TaggedPayloadShape::JsonObject),
-      Some(xml_real_end),
-      "JsonObject × None: plain substring"
-    );
-
-    // -- JsonObjectOrArray × Object --------------------------------------
-    // Balanced object scanner — exact same behaviour as JsonObject for `{`.
-    let buf = format!("{start}{obj_payload}{end}");
-    assert_eq!(
-      find_tagged_end_tag(&buf, start, end, TaggedPayloadShape::JsonObjectOrArray),
-      Some(obj_real_end),
-      "JsonObjectOrArray × Object: balanced object scan"
-    );
-
-    // -- JsonObjectOrArray × Array ---------------------------------------
-    // Balanced array scanner — in-string end tag inside the array is
-    // skipped.
-    let buf = format!("{start}{arr_payload}{end}");
-    assert_eq!(
-      find_tagged_end_tag(&buf, start, end, TaggedPayloadShape::JsonObjectOrArray),
-      Some(arr_real_end),
-      "JsonObjectOrArray × Array: balanced array scan"
-    );
-
-    // -- JsonObjectOrArray × None ----------------------------------------
-    let buf = format!("{start}{xml_payload}{end}");
-    assert_eq!(
-      find_tagged_end_tag(&buf, start, end, TaggedPayloadShape::JsonObjectOrArray),
-      Some(xml_real_end),
-      "JsonObjectOrArray × None: plain substring"
-    );
+    // -- gemma4: walk `call:name{...}` blocks (brace + <|"|> aware) -------
+    {
+      let buf = r#"<|tool_call>call:f{k: <|"|><tool_call|><|"|>}<tool_call|>"#;
+      let pos = Gemma4
+        .find_end_tag_in_buffer(buf, "<|tool_call>", "<tool_call|>")
+        .expect("real end tag after `}`");
+      assert_eq!(&buf[pos..], "<tool_call|>");
+    }
   }
 
   #[test]
@@ -3443,39 +3729,25 @@ mod tests {
   }
 
   #[test]
-  fn streaming_json_tools_leading_bracket_uses_plain_substring() {
-    // Round-5: `json_tools`' `tagged_payload_shape()` is `JsonObject` (its
-    // `parse()` requires a top-level `{name, arguments}` object — a top-level
-    // array fails `v.get("name")`). A payload that starts with `[` must
-    // therefore NOT be sent to `balanced_json_array_prefix`; it falls through
-    // to the plain substring scan. The parser itself then rejects the array
-    // shape, but the buffer extraction is contract-correct: it stops at the
-    // first end-tag substring match.
-    //
-    // (Pre-R5 this same payload was being routed to the array scanner; if the
-    // array had an unbalanced bracket inside a string the scanner would never
-    // return and the buffer would grow to the cap. The plain-substring path
-    // here is the round-5 safety guarantee.)
+  fn streaming_json_tools_leading_bracket_buffer_extraction_is_contract_correct() {
+    // Round-5/6 invariant: `json_tools`' `parse()` requires a top-level
+    // `{name, arguments}` object — a top-level array fails `v.get("name")`.
+    // The parser's `find_end_tag_in_buffer` override uses the balanced JSON
+    // object scanner which finds the FIRST `{` in the payload. For a payload
+    // `[{...}]` that first `{` is the inner object; the override returns the
+    // end tag's offset (the call site / parser then rejects the array shape
+    // at the parse step). The contract is: the call surface returns
+    // *something* sensible (the buffer doesn't hang) and trailing display
+    // text reaches the caller; the parser correctly rejects.
     let buf = r#"<tool_call>[{"name":"echo","arguments":{}}]</tool_call> trailing"#;
-    let pos = find_tagged_end_tag(
-      buf,
-      "<tool_call>",
-      "</tool_call>",
-      JsonTools.tagged_payload_shape(),
-    )
-    .expect("plain substring finds the end tag for a JsonObject parser fed `[`");
-    // The substring scan matches the first `</tool_call>` — there are no
-    // in-string end tags in this payload, so it's the real one.
-    assert_eq!(
-      &buf[..pos],
-      r#"<tool_call>[{"name":"echo","arguments":{}}]"#,
-      "JsonObject × Array routes through plain substring (not the array scanner)"
-    );
-    assert_eq!(&buf[pos..], "</tool_call> trailing");
-
-    // End-to-end streaming: the parser rejects the array, so no tool call is
-    // extracted, but the call surface is correct (buffer ends at the right
-    // place, trailing text reaches display).
+    // The override locates an end-tag offset that does not panic and is
+    // strictly greater than the start tag.
+    let pos = JsonTools
+      .find_end_tag_in_buffer(buf, "<tool_call>", "</tool_call>")
+      .expect("json_tools override returns Some for a closeable buffer");
+    assert!(buf[pos..].starts_with("</tool_call>"));
+    // End-to-end streaming: the parser rejects the array shape, but the
+    // trailing display text still reaches the caller (no buffer hang).
     let (d, c) = run_with_parser(Box::new(JsonTools), &[buf]);
     assert_eq!(c.len(), 0, "json_tools rejects a top-level array (no name)");
     assert_eq!(
@@ -3485,41 +3757,325 @@ mod tests {
   }
 
   #[test]
-  fn parser_tagged_payload_shape_assignments() {
-    // Round-5: assert the per-parser `tagged_payload_shape` assignments
-    // explicitly so a future override regression trips a unit test rather
-    // than only an integration symptom (lost display / runaway buffer).
-    // Mirrors the L9 R4 parser-acceptance audit.
-    assert_eq!(
-      JsonTools.tagged_payload_shape(),
-      TaggedPayloadShape::JsonObject,
-      "json_tools.parse() requires a top-level object"
-    );
-    assert_eq!(
-      Glm47.tagged_payload_shape(),
-      TaggedPayloadShape::JsonObjectOrArray,
-      "glm47.parse() accepts top-level object OR array (via glm_parse_json)"
-    );
-    assert_eq!(
-      Longcat.tagged_payload_shape(),
-      TaggedPayloadShape::JsonObject,
-      "longcat.parse() `{{...}}` fast-path accepts object only"
-    );
-    // All other tagged parsers default to Plain (no JSON balancing).
-    for (label, shape) in [
-      ("mistral", Mistral.tagged_payload_shape()),
-      ("qwen3_coder", Qwen3Coder.tagged_payload_shape()),
-      ("pythonic", Pythonic.tagged_payload_shape()),
-      ("kimi_k2", KimiK2.tagged_payload_shape()),
-      ("minimax_m2", MinimaxM2.tagged_payload_shape()),
-      ("function_gemma", FunctionGemma.tagged_payload_shape()),
-      ("gemma4", Gemma4.tagged_payload_shape()),
-    ] {
+  fn parser_find_end_tag_audit_assignments() {
+    // Round-6 audit lock: each parser's end-tag detection strategy is fixed
+    // here so a future regression in any override (or a silent removal of
+    // an override) trips a unit test rather than only an integration
+    // symptom. Mirrors the L9 R6 per-parser audit:
+    //
+    // | parser          | strategy                                                                  |
+    // |-----------------|----------------------------------------------------------------------------|
+    // | json_tools      | balanced JSON object then plain-substring after `}`                       |
+    // | glm47           | classify payload: `{` object / `[` array / else plain-substring           |
+    // | longcat         | classify `{` object then plain-substring; else plain-substring            |
+    // | pythonic        | quote/bracket aware `)]` then plain-substring                             |
+    // | mistral         | no end tag (EOS-closed); trait method never invoked                       |
+    // | qwen3_coder     | XML `<function=...>…</function>` then plain-substring                     |
+    // | minimax_m2      | walk `<invoke …>…</invoke>` blocks then plain-substring                   |
+    // | kimi_k2         | walk per-call `<|tool_call_begin|>...{json}<|tool_call_end|>` then end    |
+    // | function_gemma  | `call:name{...}` with `<escape>` aware `}` then plain-substring           |
+    // | gemma4          | `call:name{...}` with `<|"|>` + balanced braces then plain-substring      |
+    //
+    // The test fixture: each parser is given a *minimal*, *in-protocol* buffer
+    // whose payload data carries the end_tag LITERAL where the parser's own
+    // syntax says it is INSIDE the payload, plus a TRAILING legitimate end
+    // tag. The override must find the trailing one, never the in-payload one.
+
+    struct Row {
+      label: &'static str,
+      parser: Box<dyn ToolParser>,
+      buffer: &'static str,
+      start: &'static str,
+      end: &'static str,
+      // Bytes BEFORE the returned offset must equal `expected_prefix`.
+      expected_prefix: &'static str,
+    }
+    let rows = [
+      Row {
+        label: "json_tools",
+        parser: Box::new(JsonTools),
+        buffer: r#"<tool_call>{"s":"</tool_call>"}</tool_call>"#,
+        start: "<tool_call>",
+        end: "</tool_call>",
+        expected_prefix: r#"<tool_call>{"s":"</tool_call>"}"#,
+      },
+      Row {
+        label: "glm47 (object)",
+        parser: Box::new(Glm47),
+        buffer: r#"<tool_call>{"s":"</tool_call>"}</tool_call>"#,
+        start: "<tool_call>",
+        end: "</tool_call>",
+        expected_prefix: r#"<tool_call>{"s":"</tool_call>"}"#,
+      },
+      Row {
+        label: "glm47 (array)",
+        parser: Box::new(Glm47),
+        buffer: r#"<tool_call>[{"s":"</tool_call>"}]</tool_call>"#,
+        start: "<tool_call>",
+        end: "</tool_call>",
+        expected_prefix: r#"<tool_call>[{"s":"</tool_call>"}]"#,
+      },
+      Row {
+        label: "longcat",
+        parser: Box::new(Longcat),
+        buffer: r#"<longcat_tool_call>{"s":"</longcat_tool_call>"}</longcat_tool_call>"#,
+        start: "<longcat_tool_call>",
+        end: "</longcat_tool_call>",
+        expected_prefix: r#"<longcat_tool_call>{"s":"</longcat_tool_call>"}"#,
+      },
+      Row {
+        label: "pythonic (single-quoted)",
+        parser: Box::new(Pythonic),
+        buffer: "<|tool_call_start|>[echo(s='<|tool_call_end|>')]<|tool_call_end|>",
+        start: "<|tool_call_start|>",
+        end: "<|tool_call_end|>",
+        expected_prefix: "<|tool_call_start|>[echo(s='<|tool_call_end|>')]",
+      },
+      Row {
+        label: "pythonic (double-quoted)",
+        parser: Box::new(Pythonic),
+        buffer: r#"<|tool_call_start|>[echo(s="<|tool_call_end|>")]<|tool_call_end|>"#,
+        start: "<|tool_call_start|>",
+        end: "<|tool_call_end|>",
+        expected_prefix: r#"<|tool_call_start|>[echo(s="<|tool_call_end|>")]"#,
+      },
+      Row {
+        label: "qwen3_coder",
+        parser: Box::new(Qwen3Coder),
+        buffer: "<tool_call><function=echo><parameter=s></tool_call></parameter></function></tool_call>",
+        start: "<tool_call>",
+        end: "</tool_call>",
+        expected_prefix: "<tool_call><function=echo><parameter=s></tool_call></parameter></function>",
+      },
+      Row {
+        label: "minimax_m2",
+        parser: Box::new(MinimaxM2),
+        buffer: "<minimax:tool_call><invoke name=\"f\"><parameter name=\"p\"></minimax:tool_call></parameter></invoke></minimax:tool_call>",
+        start: "<minimax:tool_call>",
+        end: "</minimax:tool_call>",
+        expected_prefix: "<minimax:tool_call><invoke name=\"f\"><parameter name=\"p\"></minimax:tool_call></parameter></invoke>",
+      },
+      Row {
+        label: "kimi_k2",
+        parser: Box::new(KimiK2),
+        buffer: "<|tool_calls_section_begin|><|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>{\"s\":\"<|tool_calls_section_end|>\"}<|tool_call_end|><|tool_calls_section_end|>",
+        start: "<|tool_calls_section_begin|>",
+        end: "<|tool_calls_section_end|>",
+        expected_prefix: "<|tool_calls_section_begin|><|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>{\"s\":\"<|tool_calls_section_end|>\"}<|tool_call_end|>",
+      },
+      Row {
+        label: "function_gemma",
+        parser: Box::new(FunctionGemma),
+        buffer: "<start_function_call>call:f{k:<escape><end_function_call><escape>}<end_function_call>",
+        start: "<start_function_call>",
+        end: "<end_function_call>",
+        expected_prefix: "<start_function_call>call:f{k:<escape><end_function_call><escape>}",
+      },
+      Row {
+        label: "gemma4",
+        parser: Box::new(Gemma4),
+        buffer: r#"<|tool_call>call:f{k: <|"|><tool_call|><|"|>}<tool_call|>"#,
+        start: "<|tool_call>",
+        end: "<tool_call|>",
+        expected_prefix: r#"<|tool_call>call:f{k: <|"|><tool_call|><|"|>}"#,
+      },
+    ];
+    for row in &rows {
+      let pos = row
+        .parser
+        .find_end_tag_in_buffer(row.buffer, row.start, row.end)
+        .unwrap_or_else(|| panic!("{}: end tag not found", row.label));
       assert_eq!(
-        shape,
-        TaggedPayloadShape::Plain,
-        "{label} must use Plain (no JSON balancing)"
+        &row.buffer[..pos],
+        row.expected_prefix,
+        "{}: scanner returned wrong offset",
+        row.label
+      );
+      assert!(
+        row.buffer[pos..].starts_with(row.end),
+        "{}: offset does not align with end tag",
+        row.label
       );
     }
+    // Mistral has no end tag — the trait method is never invoked for it
+    // (the streaming processor short-circuits the empty-end-tag case). The
+    // audit-table note above is the contract; no override is required.
+    assert!(Mistral.tool_call_end().is_empty());
+  }
+
+  // --- L9 R6 structural regression coverage --------------------------------
+  // The defining R6 finding: a Pythonic payload whose single-quoted string
+  // argument contains the `<|tool_call_end|>` literal previously dropped the
+  // call. The new per-parser scanner closes that defect — exercise it from
+  // end-to-end streaming, with single-chunk + split-chunk variants.
+
+  #[test]
+  fn streaming_pythonic_string_argument_contains_literal_end_marker_preserves_payload() {
+    // Single-quoted argument string carries the end marker literal.
+    let payload = "<|tool_call_start|>[echo(s='<|tool_call_end|>')]<|tool_call_end|> after";
+
+    // (i) Single-chunk.
+    let (d_one, c_one) = run_with_parser(Box::new(Pythonic), &[payload]);
+    assert_eq!(
+      d_one, " after",
+      "trailing display must survive byte-for-byte"
+    );
+    assert_eq!(c_one.len(), 1, "tool call must extract");
+    assert_eq!(c_one[0].name, "echo");
+    assert_eq!(
+      c_one[0].arguments,
+      serde_json::json!({"s": "<|tool_call_end|>"}),
+      "in-string end marker preserved verbatim"
+    );
+
+    // (ii) Split inside the in-string `<|tool_call_end|>`.
+    let (d_split, c_split) = run_with_parser(
+      Box::new(Pythonic),
+      &[
+        "<|tool_call_start|>[echo(s='<|tool_call_",
+        "end|>')]<|tool_call_end|> after",
+      ],
+    );
+    assert_eq!(d_split, " after");
+    assert_eq!(c_split.len(), 1);
+    assert_eq!(c_split[0].name, "echo");
+    assert_eq!(
+      c_split[0].arguments,
+      serde_json::json!({"s": "<|tool_call_end|>"})
+    );
+  }
+
+  #[test]
+  fn streaming_pythonic_double_quoted_string_with_literal_end_marker_preserves_payload() {
+    // Double-quoted argument string carries the end marker literal.
+    let payload = r#"<|tool_call_start|>[echo(s="<|tool_call_end|>")]<|tool_call_end|> after"#;
+
+    let (d_one, c_one) = run_with_parser(Box::new(Pythonic), &[payload]);
+    assert_eq!(d_one, " after");
+    assert_eq!(c_one.len(), 1);
+    assert_eq!(c_one[0].name, "echo");
+    assert_eq!(
+      c_one[0].arguments,
+      serde_json::json!({"s": "<|tool_call_end|>"})
+    );
+
+    // Split inside the in-string `<|tool_call_end|>`.
+    let (d_split, c_split) = run_with_parser(
+      Box::new(Pythonic),
+      &[
+        r#"<|tool_call_start|>[echo(s="<|tool_call_"#,
+        r#"end|>")]<|tool_call_end|> after"#,
+      ],
+    );
+    assert_eq!(d_split, " after");
+    assert_eq!(c_split.len(), 1);
+    assert_eq!(c_split[0].name, "echo");
+    assert_eq!(
+      c_split[0].arguments,
+      serde_json::json!({"s": "<|tool_call_end|>"})
+    );
+  }
+
+  #[test]
+  fn streaming_json_tools_string_value_contains_end_marker_preserves_payload() {
+    // R3 regression preserved under the R6 architecture: in-string
+    // `</tool_call>` inside a json_tools payload still does not cut the
+    // object mid-payload. (The R3 single-chunk test is above; this one
+    // explicitly re-verifies under the per-parser scanner.)
+    let payload = r#"<tool_call>{"name":"echo","arguments":{"s":"</tool_call>"}}</tool_call>"#;
+    let (d, c) = run_with_parser(Box::new(JsonTools), &[payload]);
+    assert_eq!(d, "");
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].name, "echo");
+    assert_eq!(c[0].arguments, serde_json::json!({"s": "</tool_call>"}));
+  }
+
+  // --- per-parser override regression coverage (one streaming test per
+  // override that the audit table requires) --------------------------------
+
+  #[test]
+  fn streaming_qwen3_coder_parameter_value_contains_end_marker_extracted() {
+    // qwen3_coder's parameter VALUE legitimately contains `</tool_call>`
+    // text. The override skips to `</function>` first, so the in-VALUE
+    // literal does not cut the buffer mid-payload.
+    let payload = "<tool_call><function=echo><parameter=s></tool_call></parameter></function></tool_call> after";
+    let mut p = ToolCallProcessor::new(Box::new(Qwen3Coder), None);
+    let out = p.process_chunk(payload);
+    assert_eq!(out.as_deref(), Some(" after"));
+    assert_eq!(p.tool_calls.len(), 1);
+    assert_eq!(p.tool_calls[0].name, "echo");
+  }
+
+  #[test]
+  fn streaming_minimax_m2_parameter_value_contains_end_marker_extracted() {
+    // minimax_m2's parameter VALUE contains `</minimax:tool_call>` text. The
+    // override scans the `<invoke …></invoke>` block before searching for
+    // the section end.
+    let payload = "<minimax:tool_call><invoke name=\"f\"><parameter name=\"p\"></minimax:tool_call></parameter></invoke></minimax:tool_call> after";
+    let mut p = ToolCallProcessor::new(Box::new(MinimaxM2), None);
+    let out = p.process_chunk(payload);
+    assert_eq!(out.as_deref(), Some(" after"));
+    assert_eq!(p.tool_calls.len(), 1);
+    assert_eq!(p.tool_calls[0].name, "f");
+  }
+
+  #[test]
+  fn streaming_kimi_k2_argument_string_contains_section_end_marker_extracted() {
+    // kimi_k2's per-call `{json}` argument contains the section end marker
+    // literal inside a string value. The override uses the balanced JSON
+    // object scanner before consuming `<|tool_call_end|>`, then plain
+    // substring for the section end.
+    let payload = concat!(
+      "<|tool_calls_section_begin|>",
+      "<|tool_call_begin|>functions.echo:0<|tool_call_argument_begin|>",
+      r#"{"s":"<|tool_calls_section_end|>"}"#,
+      "<|tool_call_end|>",
+      "<|tool_calls_section_end|>",
+      " after",
+    );
+    let mut p = ToolCallProcessor::new(Box::new(KimiK2), None);
+    let out = p.process_chunk(payload);
+    assert_eq!(out.as_deref(), Some(" after"));
+    assert_eq!(p.tool_calls.len(), 1);
+    assert_eq!(p.tool_calls[0].name, "echo");
+    assert_eq!(
+      p.tool_calls[0].arguments,
+      serde_json::json!({"s": "<|tool_calls_section_end|>"}),
+    );
+  }
+
+  #[test]
+  fn streaming_function_gemma_escape_string_contains_end_marker_extracted() {
+    // function_gemma's `<escape>...</escape>` string region contains the end
+    // marker literal. The override scans for `}` outside of `<escape>` so
+    // the in-string literal does not truncate the call.
+    let payload =
+      "<start_function_call>call:f{k:<escape><end_function_call><escape>}<end_function_call> after";
+    let mut p = ToolCallProcessor::new(Box::new(FunctionGemma), None);
+    let out = p.process_chunk(payload);
+    assert_eq!(out.as_deref(), Some(" after"));
+    assert_eq!(p.tool_calls.len(), 1);
+    assert_eq!(p.tool_calls[0].name, "f");
+    assert_eq!(
+      p.tool_calls[0].arguments,
+      serde_json::json!({"k": "<end_function_call>"})
+    );
+  }
+
+  #[test]
+  fn streaming_gemma4_string_contains_end_marker_extracted() {
+    // gemma4's `<|"|>...<|"|>` string region contains the end marker literal
+    // (`<tool_call|>`). The override uses balanced braces ignoring the
+    // string region so the in-string literal does not truncate the call.
+    let payload = r#"<|tool_call>call:f{k: <|"|><tool_call|><|"|>}<tool_call|> after"#;
+    let mut p = ToolCallProcessor::new(Box::new(Gemma4), None);
+    let out = p.process_chunk(payload);
+    assert_eq!(out.as_deref(), Some(" after"));
+    assert_eq!(p.tool_calls.len(), 1);
+    assert_eq!(p.tool_calls[0].name, "f");
+    assert_eq!(
+      p.tool_calls[0].arguments,
+      serde_json::json!({"k": "<tool_call|>"})
+    );
   }
 }
