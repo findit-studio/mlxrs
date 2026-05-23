@@ -1,0 +1,451 @@
+//! CMU Pronouncing Dictionary lexicon — a 1:1 port of mlx-audio-swift's
+//! [`CMUDictParser.swift`][parser] + [`CMUDictLoader.swift`][loader] +
+//! [`InMemoryLexicon.swift`][mem].
+//!
+//! ## Format
+//!
+//! CMUDict ships as one row per line in the form
+//! `WORD<spaces>PHONEME PHONEME …`. Variant pronunciations are flagged
+//! `WORD(N)` (e.g. `the(2)  DH IY0`). Lines starting `;;;` are comments;
+//! blank lines are skipped. The parser is whitespace-tolerant (single or
+//! double space between word and pronunciation, the wild-style raw and
+//! pre-formatted dict files).
+//!
+//! ## Local-file-only
+//!
+//! [`CMUDictLoader::load`] takes a directory path and reads the
+//! `cmudict.dict` file inside it (no HF Hub, no network). The bytes are
+//! decoded as UTF-8 first, falling back to Latin-1 (the upstream wild dict
+//! is mostly ASCII but ships with a handful of accented loanwords; the
+//! swift loader makes the same fallback).
+//!
+//! [parser]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioG2P/Lexicon/CMUDict/CMUDictParser.swift
+//! [loader]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioG2P/Lexicon/CMUDict/CMUDictLoader.swift
+//! [mem]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioG2P/Lexicon/InMemoryLexicon.swift
+
+use std::{collections::HashMap, fs, path::Path};
+
+use crate::{
+  audio::tts::g2p::{
+    arpabet,
+    types::{Lexicon, LexiconEntry},
+  },
+  error::{Error, Result},
+};
+
+/// One row of a parsed CMUDict file, BEFORE ARPAbet→IPA conversion.
+/// Mirrors swift's `CMUDictRawEntry`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RawEntry {
+  /// The lowercase word (the variant suffix `(N)` is stripped).
+  pub word: String,
+  /// The ARPAbet phoneme sequence as captured from the source line
+  /// (still carries stress digits).
+  pub arpabet: Vec<String>,
+  /// `Some(n)` for variant pronunciations (`word(n)` syntax); `None` for
+  /// the primary entry.
+  pub variant: Option<u32>,
+}
+
+/// Parse a single CMUDict source line into a [`RawEntry`].
+///
+/// Returns `None` for blank lines and comment lines (those starting
+/// `;;;`); returns `Err` for malformed rows (a non-empty, non-comment
+/// line that is missing whitespace or has a non-word/non-pronunciation
+/// shape after the split).
+///
+/// The error carries `line_number` so a bulk loader can surface the
+/// offending line position to the caller.
+pub fn parse_line(line: &str, line_number: usize) -> Result<Option<RawEntry>> {
+  let trimmed = line.trim();
+  if trimmed.is_empty() || trimmed.starts_with(";;;") {
+    return Ok(None);
+  }
+
+  // Split on first ASCII space: word is the first token, pronunciation is
+  // the rest (handles both raw `cmudict.dict` and double-space formats).
+  let Some(first_space) = trimmed.find(' ') else {
+    return Err(Error::Backend {
+      message: format!(
+        "CMUDict line {line_number}: missing whitespace between word and pronunciation"
+      ),
+    });
+  };
+
+  let word_part = &trimmed[..first_space];
+  let pron_part = trimmed[first_space + 1..].trim();
+
+  if word_part.is_empty() || pron_part.is_empty() {
+    return Err(Error::Backend {
+      message: format!("CMUDict line {line_number}: empty word or pronunciation"),
+    });
+  }
+
+  // Split `WORD(n)` into (word, variant).
+  let (word, variant) = if let Some(paren_start) = word_part.find('(') {
+    if let Some(paren_end) = word_part[paren_start + 1..].find(')').map(|i| paren_start + 1 + i) {
+      let var_str = &word_part[paren_start + 1..paren_end];
+      let var = var_str.parse::<u32>().ok();
+      (word_part[..paren_start].to_lowercase(), var)
+    } else {
+      (word_part.to_lowercase(), None)
+    }
+  } else {
+    (word_part.to_lowercase(), None)
+  };
+
+  let arpabet: Vec<String> = pron_part.split(' ').filter(|s| !s.is_empty()).map(String::from).collect();
+  if arpabet.is_empty() {
+    return Err(Error::Backend {
+      message: format!("CMUDict line {line_number}: empty pronunciation"),
+    });
+  }
+
+  Ok(Some(RawEntry { word, arpabet, variant }))
+}
+
+/// Parse a CMUDict text blob into a list of [`RawEntry`]. Comment / blank
+/// lines are skipped. If `primary_only` is set, variant pronunciations
+/// (`word(n)` rows) are filtered out.
+///
+/// Returns the first malformed line's error (with the offending line
+/// number); a single bad row fails the whole parse.
+pub fn parse(text: &str, primary_only: bool) -> Result<Vec<RawEntry>> {
+  let mut out = Vec::new();
+  for (idx, line) in text.lines().enumerate() {
+    // Line numbers are 1-indexed for human consumption.
+    let line_number = idx + 1;
+    if let Some(entry) = parse_line(line, line_number)?
+      && (!primary_only || entry.variant.is_none())
+    {
+      out.push(entry);
+    }
+  }
+  Ok(out)
+}
+
+/// In-memory CMU Pronouncing Dictionary lexicon — case-insensitive
+/// grapheme → IPA phoneme-sequence map. Mirrors swift's `InMemoryLexicon`
+/// (used by `CMUDictLoader`).
+#[derive(Debug, Clone)]
+pub struct CMUDict {
+  /// Lowercase grapheme → entry.
+  entries: HashMap<String, LexiconEntry>,
+}
+
+impl CMUDict {
+  /// Build a [`CMUDict`] from a list of [`LexiconEntry`]. Duplicate
+  /// graphemes are collapsed (last wins, matching swift's
+  /// `Dictionary(uniqueKeysWithValues:)` semantics: the *primary-only*
+  /// parse passes a deduplicated list, so the unique-keys assumption holds
+  /// in normal use; on dup we overwrite rather than panic, to stay robust).
+  #[must_use]
+  pub fn from_entries(entries: impl IntoIterator<Item = LexiconEntry>) -> Self {
+    let mut map = HashMap::new();
+    for entry in entries {
+      let key = entry.grapheme.to_lowercase();
+      map.insert(key, entry);
+    }
+    Self { entries: map }
+  }
+
+  /// Build a [`CMUDict`] from the parsed raw entries. Each row's ARPAbet
+  /// sequence is mapped to IPA via [`crate::audio::tts::g2p::arpabet`].
+  #[must_use]
+  pub fn from_raw_entries(raw: impl IntoIterator<Item = RawEntry>) -> Self {
+    let entries = raw.into_iter().map(|r| {
+      let phonemes = arpabet::convert_sequence(&r.arpabet);
+      LexiconEntry::new(r.word, phonemes)
+    });
+    Self::from_entries(entries)
+  }
+
+  /// Number of unique graphemes in the lexicon.
+  #[must_use]
+  pub fn len(&self) -> usize {
+    self.entries.len()
+  }
+
+  /// `true` iff the lexicon is empty.
+  #[must_use]
+  pub fn is_empty(&self) -> bool {
+    self.entries.is_empty()
+  }
+}
+
+impl Lexicon for CMUDict {
+  fn lookup(&self, grapheme: &str) -> Option<&LexiconEntry> {
+    self.entries.get(&grapheme.to_lowercase())
+  }
+}
+
+/// Loader for CMUDict files on the local filesystem.
+///
+/// **Local-file-only** — no HF Hub, no network. Reads `cmudict.dict` from
+/// the given directory, decodes UTF-8 first (falling back to Latin-1 for
+/// the handful of accented loanwords in the wild dict), parses
+/// `primary_only=true` (so the lookup returns the canonical pronunciation
+/// for each grapheme, not a variant), and converts ARPAbet to IPA on the
+/// way in.
+pub struct CMUDictLoader;
+
+impl CMUDictLoader {
+  /// Load `cmudict.dict` from `directory` and return an in-memory
+  /// [`CMUDict`].
+  ///
+  /// Errors:
+  /// - [`Error::Backend`] if the file is missing or unreadable.
+  /// - [`Error::Backend`] (with line number) on a malformed row.
+  pub fn load(directory: &Path) -> Result<CMUDict> {
+    let path = directory.join("cmudict.dict");
+    if !path.exists() {
+      return Err(Error::Backend {
+        message: format!("cmudict.dict missing at {}", path.display()),
+      });
+    }
+
+    let bytes = fs::read(&path).map_err(|e| Error::Backend {
+      message: format!("read {} failed: {e}", path.display()),
+    })?;
+
+    // UTF-8 first, then Latin-1 (every byte sequence is valid Latin-1, so
+    // this never fails — matching the swift loader's fallback chain).
+    let text = match std::str::from_utf8(&bytes) {
+      Ok(s) => s.to_owned(),
+      Err(_) => bytes.iter().map(|&b| b as char).collect(),
+    };
+
+    let raw = parse(&text, true)?;
+    Ok(CMUDict::from_raw_entries(raw))
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  // === parse_line ===
+
+  // Mirrors `parsesBasicEntry`.
+  #[test]
+  fn parses_basic_entry() {
+    let entry = parse_line("hello  HH AH0 L OW1", 1).unwrap().expect("entry");
+    assert_eq!(entry.word, "hello");
+    assert_eq!(entry.arpabet, vec!["HH", "AH0", "L", "OW1"]);
+    assert_eq!(entry.variant, None);
+  }
+
+  // Mirrors `parsesVariantEntry`.
+  #[test]
+  fn parses_variant_entry() {
+    let entry = parse_line("the(2)  DH IY0", 1).unwrap().expect("entry");
+    assert_eq!(entry.word, "the");
+    assert_eq!(entry.arpabet, vec!["DH", "IY0"]);
+    assert_eq!(entry.variant, Some(2));
+  }
+
+  // Mirrors `skipsCommentLines`.
+  #[test]
+  fn skips_comment_lines() {
+    assert_eq!(parse_line(";;; this is a comment", 1).unwrap(), None);
+  }
+
+  // Mirrors `skipsEmptyLines`.
+  #[test]
+  fn skips_empty_lines() {
+    assert_eq!(parse_line("", 1).unwrap(), None);
+    assert_eq!(parse_line("   ", 1).unwrap(), None);
+  }
+
+  // Mirrors `handlesSinglePhoneme`.
+  #[test]
+  fn handles_single_phoneme() {
+    let entry = parse_line("a  AH0", 1).unwrap().expect("entry");
+    assert_eq!(entry.word, "a");
+    assert_eq!(entry.arpabet, vec!["AH0"]);
+  }
+
+  #[test]
+  fn lowercases_uppercase_word() {
+    let entry = parse_line("HELLO  HH AH0", 1).unwrap().expect("entry");
+    assert_eq!(entry.word, "hello");
+  }
+
+  // Malformed row test — mlxrs surfaces an error (with line number) where
+  // swift silently drops the line. The error carries the offending line
+  // number so a bulk loader can point the caller at the bad row.
+  #[test]
+  fn malformed_line_errors_with_line_number() {
+    let err = parse_line("nopronunciation", 42).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("line 42"), "expected line number in {msg:?}");
+  }
+
+  // === parse (bulk) ===
+
+  // Mirrors `parsesBulkText`.
+  #[test]
+  fn parses_bulk_text() {
+    let text = ";;; comment\n\
+                hello  HH AH0 L OW1\n\
+                world  W ER1 L D\n\
+                the  DH AH0\n\
+                the(2)  DH IY0";
+    let entries = parse(text, false).unwrap();
+    assert_eq!(entries.len(), 4);
+    assert_eq!(entries[0].word, "hello");
+    assert_eq!(entries[3].variant, Some(2));
+  }
+
+  // Mirrors `filtersPrimaryOnly`.
+  #[test]
+  fn filters_primary_only() {
+    let text = "the  DH AH0\n\
+                the(2)  DH IY0\n\
+                hello  HH AH0 L OW1";
+    let entries = parse(text, true).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|e| e.variant.is_none()));
+  }
+
+  #[test]
+  fn bulk_propagates_line_number_on_first_error() {
+    let text = "hello  HH AH0\nbadline\nworld  W ER1 L D";
+    let err = parse(text, false).unwrap_err();
+    assert!(err.to_string().contains("line 2"), "{}", err);
+  }
+
+  // === CMUDict + Lexicon ===
+
+  fn fixture_dict() -> CMUDict {
+    let raw = parse(
+      "hello  HH AH0 L OW1\n\
+       world  W ER1 L D\n\
+       the  DH AH0\n\
+       phone  F OW1 N",
+      true,
+    )
+    .unwrap();
+    CMUDict::from_raw_entries(raw)
+  }
+
+  #[test]
+  fn lookup_returns_entry_for_known_word() {
+    let dict = fixture_dict();
+    let entry = dict.lookup("hello").expect("hello in dict");
+    assert_eq!(entry.grapheme, "hello");
+    assert_eq!(entry.phonemes, vec!["h", "ə", "l", "oʊ"]);
+  }
+
+  #[test]
+  fn lookup_is_case_insensitive() {
+    let dict = fixture_dict();
+    assert!(dict.lookup("HELLO").is_some());
+    assert!(dict.lookup("Hello").is_some());
+    assert!(dict.lookup("hello").is_some());
+  }
+
+  #[test]
+  fn lookup_returns_none_for_unknown() {
+    let dict = fixture_dict();
+    assert!(dict.lookup("xyzzyplugh").is_none());
+  }
+
+  #[test]
+  fn from_entries_is_case_insensitive() {
+    let dict = CMUDict::from_entries(vec![LexiconEntry::new(
+      "HELLO".to_string(),
+      vec!["h".into(), "ə".into(), "l".into(), "oʊ".into()],
+    )]);
+    assert!(dict.lookup("hello").is_some());
+    assert_eq!(dict.len(), 1);
+    assert!(!dict.is_empty());
+  }
+
+  #[test]
+  fn from_raw_entries_silently_skips_unknown_arpabet() {
+    let raw = vec![RawEntry {
+      word: "weird".into(),
+      arpabet: vec!["HH".into(), "XX".into(), "L".into()],
+      variant: None,
+    }];
+    let dict = CMUDict::from_raw_entries(raw);
+    let entry = dict.lookup("weird").unwrap();
+    assert_eq!(entry.phonemes, vec!["h", "l"]);
+  }
+
+  // === Loader (file-system) ===
+
+  fn temp_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+      "mlxrs_audio_g2p_cmudict_{}_{}",
+      std::process::id(),
+      name
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+  }
+
+  #[test]
+  fn loader_reads_cmudict_dict_from_directory() {
+    let dir = temp_dir("loader_reads");
+    fs::write(
+      dir.join("cmudict.dict"),
+      ";;; small fixture\n\
+       hello  HH AH0 L OW1\n\
+       world  W ER1 L D\n\
+       the  DH AH0\n\
+       the(2)  DH IY0\n",
+    )
+    .unwrap();
+
+    let dict = CMUDictLoader::load(&dir).unwrap();
+    assert!(dict.lookup("hello").is_some());
+    assert!(dict.lookup("world").is_some());
+    let the = dict.lookup("the").unwrap();
+    // primary_only=true → the(2) variant is filtered out, the primary
+    // (DH AH0 → ð ə) wins.
+    assert_eq!(the.phonemes, vec!["ð", "ə"]);
+  }
+
+  #[test]
+  fn loader_errors_on_missing_file() {
+    let dir = temp_dir("missing_file");
+    let err = CMUDictLoader::load(&dir).unwrap_err();
+    assert!(err.to_string().contains("cmudict.dict missing"));
+  }
+
+  #[test]
+  fn loader_propagates_malformed_line_error_with_line_number() {
+    let dir = temp_dir("malformed_line");
+    fs::write(
+      dir.join("cmudict.dict"),
+      "hello  HH AH0\n\
+       badline\n\
+       world  W ER1 L D\n",
+    )
+    .unwrap();
+
+    let err = CMUDictLoader::load(&dir).unwrap_err();
+    assert!(err.to_string().contains("line 2"), "{}", err);
+  }
+
+  /// Latin-1 fallback — bytes that aren't valid UTF-8 (e.g. an isolated
+  /// 0xE9 for é) decode as Latin-1.
+  #[test]
+  fn loader_decodes_latin1_when_utf8_invalid() {
+    let dir = temp_dir("latin1");
+    // 0xE9 is é in Latin-1 (but an invalid UTF-8 lead byte in isolation).
+    let mut bytes: Vec<u8> = Vec::from(b"caf\xE9  K AE1 F EY0\n" as &[u8]);
+    // Make sure UTF-8 decode fails (the leading bytes are ASCII but the
+    // 0xE9 mid-stream is not a valid UTF-8 sequence start).
+    assert!(std::str::from_utf8(&bytes).is_err());
+    fs::write(dir.join("cmudict.dict"), &bytes).unwrap();
+    bytes.clear();
+
+    let dict = CMUDictLoader::load(&dir).unwrap();
+    // After Latin-1 decode the word is "café" lowercased → "café".
+    assert!(dict.lookup("café").is_some(), "café should be present after Latin-1 fallback");
+  }
+}

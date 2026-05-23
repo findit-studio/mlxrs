@@ -22,7 +22,13 @@
 //!   chunk types.
 //! - [`TextProcessor`] (in this module) — the text-preprocessing **hook**
 //!   the synthesis pipeline exposes (the *interface*, not a concrete
-//!   phonemizer — G2P is model-specific).
+//!   phonemizer — G2P is model-specific). [`BasicTextProcessor`] in
+//!   [`text_processor`] is a no-G2P default impl (NFC + lowercase +
+//!   whitespace collapse).
+//! - [`g2p`] — grapheme-to-phoneme subsystem (the [`g2p::Phonemizer`]
+//!   trait, in-memory [`g2p::CMUDict`] lexicon + local-file loader,
+//!   ARPAbet→IPA mapper). A separate `NeuralPhonemizer` orchestrator
+//!   ships in a follow-up commit on this branch.
 //!
 //! This mirrors the existing [`crate::audio::stt`] STT support surface:
 //! `stt` ships the [`Model`](crate::audio::stt::model::Model) trait + the
@@ -61,6 +67,7 @@
 //! [swift-tp]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioTTS/TextProcessor.swift
 //! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 
+pub mod g2p;
 pub mod generate;
 pub mod load;
 pub mod model;
