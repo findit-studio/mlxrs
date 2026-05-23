@@ -180,9 +180,58 @@ fn tok_env_from_tokenizer(
   // when the set is empty (no eos configured at all) — `set_eos_tokens`
   // panics on an empty slice, and in that case upstream's hardcoded
   // detection is the only signal we have anyway.
+  //
+  // **Out-of-range validation (V6 R3).** Upstream
+  // [`set_eos_tokens`](https://github.com/microsoft/llguidance/blob/main/toktrie_hf_tokenizers/src/lib.rs#L271-L282)
+  // asserts `tok < self.info.vocab_size` for each id — an
+  // out-of-range id (e.g. a version-skewed model-config `eos_token_id`
+  // larger than the loaded tokenizer's vocab) would PANIC the calling
+  // thread instead of surfacing a recoverable error. The mlxrs
+  // [`Tokenizer::eos_token_ids()`] is populated from caller-supplied
+  // and/or `tokenizer_config.json`-derived ids without any vocab-size
+  // check (existing tests install ids as high as `4242`), so we MUST
+  // validate before crossing the FFI boundary into upstream's `assert!`.
+  //
+  // The effective bound is `model_vocab_size.unwrap_or(bt_vocab)` where
+  // `bt_vocab = bt.tokrx_info().vocab_size as usize` — padded LM heads
+  // (`into_tok_env(Some(n))` with `n > bt_vocab`) widen the resulting
+  // toktrie to `n`, and a model-config EOS id in the padded
+  // `[bt_vocab, n)` range is legitimate (placeholder-token slot used as
+  // the stop signal). To avoid panicking inside upstream's stricter
+  // `set_eos_tokens` check (which still asserts against the UNPADDED
+  // `bt.info.vocab_size`), we ALSO clamp the FFI call to ids that fit
+  // in `bt_vocab`: padded-range EOS ids pass our recoverable bound but
+  // are sliced out of `set_eos_tokens`'s argument. The padded-range
+  // ids cannot be registered through upstream's current
+  // `ByteTokenizer` API (`info.vocab_size` is not widened until
+  // `ByteTokenizerEnv::new` consumes `self`), so this dual gate is the
+  // best the surface allows — the recoverable Err still fires on ids
+  // above BOTH bounds, while the in-range subset is propagated.
   let configured_eos: Vec<u32> = tokenizer.eos_token_ids().iter().copied().collect();
   if !configured_eos.is_empty() {
-    bt.set_eos_tokens(&configured_eos);
+    let bt_vocab = bt.tokrx_info().vocab_size as usize;
+    let bound = model_vocab_size.unwrap_or(bt_vocab);
+    for &eos in &configured_eos {
+      if (eos as usize) >= bound {
+        return Err(Error::ShapeMismatch {
+          message: format!(
+            "llguidance: configured EOS token id {eos} is out of range \
+             (vocab bound = {bound}); cannot register with the grammar matcher"
+          ),
+        });
+      }
+    }
+    // Forward only the subset that fits in upstream's unpadded check
+    // (avoids `set_eos_tokens`'s own `assert!` panic for padded-range
+    // ids that passed our recoverable bound).
+    let in_range: Vec<u32> = configured_eos
+      .iter()
+      .copied()
+      .filter(|&eos| (eos as usize) < bt_vocab)
+      .collect();
+    if !in_range.is_empty() {
+      bt.set_eos_tokens(&in_range);
+    }
   }
 
   bt.into_tok_env(model_vocab_size)

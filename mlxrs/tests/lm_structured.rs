@@ -738,3 +738,168 @@ fn llguidance_processor_accepts_padded_model_vocab() {
     );
   }
 }
+
+// ── Finding 1 (R3): out-of-range configured EOS ids → recoverable Err ──
+//
+// Upstream `ByteTokenizer::set_eos_tokens`
+// (`toktrie_hf_tokenizers/src/lib.rs:271-282`) asserts
+// `tok < self.info.vocab_size` for every supplied id and PANICS
+// otherwise. The mlxrs `Tokenizer::eos_token_ids()` is populated from
+// caller-supplied and/or `tokenizer_config.json`-derived ids without
+// any vocab-size check (existing fixtures accept ids well past the
+// tokenizer's actual vocab — see e.g. id 4242), so an out-of-range
+// configured id used to take down the calling thread on the FFI side.
+//
+// R3 fix: validate every configured id against
+// `model_vocab_size.unwrap_or(bt.tokrx_info().vocab_size as usize)`
+// BEFORE crossing the FFI boundary, returning
+// `Error::ShapeMismatch` with the offending id + bound. Padded LM
+// heads (`Some(n)` > tokenizer vocab) are explicitly accepted: an
+// EOS id inside `[tokenizer_vocab, model_vocab)` is legitimate.
+
+#[test]
+fn llguidance_terminal_grammar_rejects_out_of_range_eos_id_without_panic() {
+  // Pin a single eos id far beyond any reasonable vocab. The fixture's
+  // total vocab is at most 99 (3 base specials + 95 printable ASCII +
+  // 1 added special). With `model_vocab_size = None`, the validation
+  // bound is the tokenizer's own vocab, so id 4242 is out of range
+  // and must surface as `Error::ShapeMismatch` — NOT a panic.
+  let tok = fixture_tokenizer_with_eos_override(
+    "out_of_range_eos",
+    &[(CUSTOM_EOS_ID, "<|im_end|>")],
+    &[4242],
+  );
+  let bound = tok.hf().get_vocab_size(true);
+
+  let grammar = structured::GrammarSpec::Regex("a".to_string());
+  // Test framework catches panics as failures, so a `Result::Err`
+  // return without a panic is sufficient evidence the constructor
+  // converted the upstream `assert!` into a recoverable Error.
+  // (`LLGuidanceLogitsProcessor` doesn't implement `Debug` — matcher
+  // state is intentionally opaque — so the `Ok` arm has to panic
+  // manually rather than via `expect_err`.)
+  let result = structured::LLGuidanceLogitsProcessor::new(grammar, &tok, None);
+  match result {
+    Err(mlxrs::Error::ShapeMismatch { message }) => {
+      assert!(
+        message.contains("4242"),
+        "error message must name the offending id 4242, got: {message}"
+      );
+      assert!(
+        message.contains("out of range"),
+        "error message must say `out of range`, got: {message}"
+      );
+      assert!(
+        message.contains(&bound.to_string()),
+        "error message must name the vocab bound {bound}, got: {message}"
+      );
+    }
+    Err(other) => panic!("expected Error::ShapeMismatch, got different Err: {other:?}"),
+    Ok(_) => panic!("out-of-range eos id must yield Err, not Ok"),
+  }
+}
+
+#[test]
+fn llguidance_terminal_grammar_accepts_padded_model_eos_id() {
+  // Padded-LM-head case: tokenizer vocab is N, `model_vocab_size =
+  // Some(n)` with `n > N` widens the toktrie to `n` (placeholder
+  // special tokens fill `[N, n)`). The validation bound must be
+  // `model_vocab_size.unwrap_or(tokenizer_vocab)` so a model-config
+  // EOS id within the padded range is not spuriously rejected — only
+  // ids above BOTH bounds are genuinely out of range.
+  //
+  // Two sub-checks:
+  //
+  // (a) EOS id in the padded range (`[bt_vocab, model_vocab)`) passes
+  //     the recoverable Err gate (constructor succeeds — does NOT
+  //     panic, does NOT return `Err`). Upstream's
+  //     `ByteTokenizer::set_eos_tokens` itself asserts against the
+  //     UNPADDED `info.vocab_size`, so the in-padded-range id is
+  //     filtered out of the FFI call (it never reaches the toktrie's
+  //     `eos_token_set`); but the configuration is still accepted —
+  //     `Err` is not surfaced — which is the contract the prompt
+  //     specifies for padded acceptance.
+  //
+  // (b) EOS id in the UNPADDED range with a padded `model_vocab_size`
+  //     supplied is unmasked correctly in the terminal-grammar
+  //     EOS-only mask (the realistic padded-model setup: EOS lives in
+  //     the tokenizer's actual vocab, model_vocab is just wider for
+  //     hardware alignment).
+  //
+  // The fixture has 99 base ids (3 specials + 95 printables + 1 added
+  // `<|im_end|>` at id 98). Pin `model_vocab_size = Some(128)`.
+
+  // ─ Sub-check (a): padded-range eos id is ACCEPTED (no Err, no panic).
+  let tok_padded_only = fixture_tokenizer_with_eos_override(
+    "padded_eos_accepted_padded_range",
+    &[(CUSTOM_EOS_ID, "<|im_end|>")],
+    &[120],
+  );
+  let tok_vocab_a = tok_padded_only.hf().get_vocab_size(true);
+  assert!(
+    120 >= tok_vocab_a as u32,
+    "test premise: eos id 120 must be in the PADDED range \
+     (above the tokenizer vocab {tok_vocab_a})"
+  );
+  let model_vocab = 128usize;
+  assert!(
+    120usize < model_vocab,
+    "test premise: eos id 120 must be inside model_vocab {model_vocab}"
+  );
+  let grammar_a = structured::GrammarSpec::Regex("a".to_string());
+  let _proc_a =
+    structured::LLGuidanceLogitsProcessor::new(grammar_a, &tok_padded_only, Some(model_vocab))
+      .expect(
+        "padded-model EOS id (in [tokenizer_vocab, model_vocab)) must be ACCEPTED — \
+         constructor must not panic and must not return Err",
+      );
+
+  // ─ Sub-check (b): in-unpadded-range eos id with padded model_vocab
+  //   round-trips through the EOS-only mask (the realistic case the
+  //   `model_vocab_size = Some(n)` path is designed for).
+  let tok_unpadded = fixture_tokenizer_with_eos_override(
+    "padded_eos_accepted_unpadded_range",
+    &[(CUSTOM_EOS_ID, "<|im_end|>")],
+    &[CUSTOM_EOS_ID],
+  );
+  let tok_vocab_b = tok_unpadded.hf().get_vocab_size(true);
+  assert!(
+    (CUSTOM_EOS_ID as usize) < tok_vocab_b,
+    "test premise: CUSTOM_EOS_ID ({CUSTOM_EOS_ID}) must be in the unpadded \
+     tokenizer vocab {tok_vocab_b}"
+  );
+  let grammar_b = structured::GrammarSpec::Regex("a".to_string());
+  let proc_b =
+    structured::LLGuidanceLogitsProcessor::new(grammar_b, &tok_unpadded, Some(model_vocab))
+      .expect("padded model_vocab with in-range EOS must be accepted");
+
+  let zeros = vec![0.0f32; model_vocab];
+  let logits = Array::from_slice::<f32>(&zeros, &(1, model_vocab)).unwrap();
+  let _ = proc_b
+    .apply(&[], &logits)
+    .expect("first apply should succeed");
+  let a_token_id = id_for_byte(b'a');
+  let mut out = proc_b
+    .apply(&[a_token_id], &logits)
+    .expect("post-consume apply should succeed and return EOS-only mask");
+  let out_v = out.to_vec::<f32>().unwrap();
+  assert_eq!(out_v.len(), model_vocab);
+
+  // The configured eos id is finite; every other id (including the
+  // padded placeholder positions in `[tok_vocab_b, model_vocab)`) is
+  // `-inf`.
+  assert!(
+    out_v[CUSTOM_EOS_ID as usize].is_finite(),
+    "padded-vocab EOS-only mask: id {CUSTOM_EOS_ID} must remain finite, got {}",
+    out_v[CUSTOM_EOS_ID as usize]
+  );
+  for (i, v) in out_v.iter().enumerate() {
+    if i as u32 == CUSTOM_EOS_ID {
+      continue;
+    }
+    assert!(
+      v.is_infinite() && *v < 0.0,
+      "padded-vocab EOS-only mask: non-eos id {i} must be -inf, got {v}"
+    );
+  }
+}
