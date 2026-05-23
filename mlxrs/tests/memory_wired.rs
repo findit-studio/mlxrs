@@ -285,7 +285,10 @@ fn wired_limit_guard_drop_restores_old_limit() {
 #[test]
 fn recommended_working_set_bytes_returns_ok() {
   let result = recommended_working_set_bytes();
-  assert!(result.is_ok(), "FFI rc must surface as Ok(...) on a healthy host");
+  assert!(
+    result.is_ok(),
+    "FFI rc must surface as Ok(...) on a healthy host"
+  );
   if let Ok(Some(n)) = result {
     assert!(n > 0, "Some-value contract: > 0 bytes");
   }

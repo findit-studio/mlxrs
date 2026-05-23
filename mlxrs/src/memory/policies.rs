@@ -30,8 +30,8 @@
 //! - [`WiredFixedPolicy`]: `limit` — ignores `baseline` and `active_sizes`.
 //! - [`WiredBudgetPolicy`]: `clamp(baseline + base_bytes + sum(active_sizes))`
 //!   — same clamp as Sum; `base_bytes` is the precomputed budget (weights
-//!   + workspace). Hashable / equality are by the policy's stable `id` (a
-//!   string handle, mirroring Swift's `UUID`-based grouping) so multiple
+//!   plus workspace). Hashable / equality are by the policy's stable `id`
+//!   (a string handle, mirroring Swift's `UUID`-based grouping) so multiple
 //!   tickets can reference the same logical policy instance.
 //!
 //! ## Divergences from Swift
@@ -308,11 +308,7 @@ impl std::hash::Hash for WiredBudgetPolicy {
 impl WiredMemoryPolicy for WiredBudgetPolicy {
   fn limit(&self, baseline: u64, active_sizes: &[u64]) -> u64 {
     let sum: u64 = active_sizes.iter().copied().sum();
-    self.clamp(
-      baseline
-        .saturating_add(self.base_bytes)
-        .saturating_add(sum),
-    )
+    self.clamp(baseline.saturating_add(self.base_bytes).saturating_add(sum))
   }
 
   fn can_admit(&self, baseline: u64, active_sizes: &[u64], new_size: u64) -> bool {

@@ -30,11 +30,11 @@ mod counters;
 mod policies;
 mod wired;
 
-pub use self::counters::{active_memory, cache_memory, peak_memory, reset_peak_memory};
-pub use self::policies::{
-  WiredBudgetPolicy, WiredFixedPolicy, WiredMaxPolicy, WiredMemoryMeasurement,
-  WiredMemoryPolicy, WiredSumPolicy, tune,
-};
-pub use self::wired::{
-  WiredLimitGuard, recommended_working_set_bytes, set_wired_limit,
+pub use self::{
+  counters::{active_memory, cache_memory, peak_memory, reset_peak_memory},
+  policies::{
+    WiredBudgetPolicy, WiredFixedPolicy, WiredMaxPolicy, WiredMemoryMeasurement, WiredMemoryPolicy,
+    WiredSumPolicy, tune,
+  },
+  wired::{WiredLimitGuard, recommended_working_set_bytes, set_wired_limit},
 };
