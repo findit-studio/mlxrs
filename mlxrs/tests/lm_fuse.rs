@@ -37,6 +37,14 @@
 //!   `tokenizer.json` / `tokenizer_config.json` / `chat_template.jinja` /
 //!   `generation_config.json` present at `model_path` lands at `save_path`
 //!   with byte-identical content (the verbatim-copy contract).
+//! - `fuse_load_adapters_with_config_skips_second_adapter_config_read` (R2
+//!   Finding 1) — `load_adapters_with_config` consumes a pre-parsed
+//!   [`mlxrs::lm::lora::LoraConfig`] and must NOT re-read
+//!   `adapter_config.json` on the load side. The test parses the config,
+//!   clobbers the on-disk file, then calls `load_adapters_with_config`
+//!   (success — proves no second read) AND `load_adapters` (failure —
+//!   proves the wrapper still does its own parse), closing the TOCTOU
+//!   window `fuse` previously had.
 //!
 //! No `peak_memory()` magnitude asserts (per project memory).
 #![cfg(feature = "lm")]
@@ -51,7 +59,7 @@ use std::{
 
 use mlxrs::{
   Array, Error, io,
-  lm::{fuse, load},
+  lm::{fuse, load, lora},
 };
 
 // ────────────────────────── test scaffolding ──────────────────────────
@@ -885,5 +893,80 @@ fn fuse_copies_all_tokenizer_extras_present_in_source() {
       &got_bytes, expected_bytes,
       "{basename}: byte-identical copy from source"
     );
+  }
+}
+
+// ───────────────── R2 Finding 1 — single adapter-config snapshot ─────────────────
+
+#[test]
+fn fuse_load_adapters_with_config_skips_second_adapter_config_read() {
+  // R2 Finding 1 — TOCTOU window between `read_adapter_config` (save-side
+  // `fan_in_fan_out` decision) and `load_adapters`' INTERNAL second read of
+  // the same `adapter_config.json` (load-side transpose / quant-arm
+  // decisions). The fix is `load_adapters_with_config`, a variant that
+  // takes a PRE-PARSED `LoraConfig` and skips the internal re-read.
+  //
+  // Empirical proof of single-snapshot:
+  //  1. Parse `LoraConfig` from a valid adapter dir.
+  //  2. CLOBBER `adapter_config.json` on disk with garbage that would FAIL
+  //     a re-parse (so a sneaky second read can't pass as a no-op).
+  //  3. Call `load_adapters_with_config` with the parsed config — MUST
+  //     succeed (no second read happens).
+  //  4. Call `load_adapters` (the wrapper) — MUST fail (it does its own
+  //     read at the top, which now sees the corrupted body).
+  //
+  // Together (3) + (4) prove the two functions diverge exactly on the
+  // adapter-config-read count: `_with_config` zero, the wrapper one. The
+  // `fuse()` orchestrator funnels through `_with_config` (using the same
+  // parsed config it consulted for `fan_in_fan_out`), so the load side
+  // and the save side share a single snapshot.
+  let weights = toy_base_weights(2);
+  let _model_dir = write_base_dir("toctou_model", &weights, &plain_config_json(2));
+  let adapter_dir = write_mlxlm_adapter("toctou_adapter", &[0, 1], 2.0);
+
+  // (1) parse once
+  let parsed_cfg = lora::read_adapter_config(&adapter_dir).expect("initial parse");
+
+  // (2) replace the on-disk config with garbage — proves the in-memory
+  // parsed_cfg is the ONLY source of truth on the load side. We keep the
+  // dir + weights file intact and only corrupt the config (deletion would
+  // also work, but `linear_to_lora_layers` depends on the adapter weights
+  // file being present).
+  fs::write(adapter_dir.join("adapter_config.json"), b"not json {{{")
+    .expect("clobber adapter_config.json");
+
+  // (3) load_adapters_with_config holds the pre-parsed config and does
+  // NOT re-read the on-disk file → succeeds.
+  let layers = lora::load_adapters_with_config(
+    &weights,
+    &adapter_dir,
+    &parsed_cfg,
+    /* quant */ None,
+    /* num_blocks */ 2,
+  )
+  .expect("load_adapters_with_config must not re-read adapter_config.json");
+  assert_eq!(
+    layers.len(),
+    2,
+    "both q_proj layers reached the adapter pipeline via the pre-parsed config"
+  );
+
+  // (4) the wrapper re-parses internally — clobbered body must surface
+  // as a JSON parse error from `LoraConfig::from_json`.
+  let err = lora::load_adapters(
+    &weights,
+    &adapter_dir,
+    /* quant */ None,
+    /* num_blocks */ 2,
+  )
+  .expect_err("load_adapters wrapper re-reads adapter_config.json and must surface the corruption");
+  match err {
+    Error::Backend { message } => {
+      assert!(
+        !message.is_empty(),
+        "wrapper error must carry a parse diagnostic: {message}"
+      );
+    }
+    other => panic!("expected Error::Backend from the wrapper's re-parse, got {other:?}"),
   }
 }

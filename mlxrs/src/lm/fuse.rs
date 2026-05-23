@@ -25,12 +25,14 @@
 //!      │   weights                       =  load::load_weights(model_path)
 //!      │   quant                         =  parse_quantization(config_json_text)
 //!      ▼
-//!   read adapter config (for fan_in_fan_out)     (fuse.py:65 → load_adapters reads this)
+//!   read adapter config ONCE (shared by load + save) (fuse.py:65 → load_adapters reads this)
 //!      │   lora_cfg = lora::read_adapter_config(adapter_path)
 //!      │   fifo     = lora_cfg.fan_in_fan_out()  // PEFT-only, false on mlx-lm-native
 //!      ▼
 //!   load adapters → LoraLayers map               (fuse.py:64-66 → load(adapter_path=...))
-//!      │   lora::load_adapters(&weights, adapter_path, quant.as_ref(), num_blocks)
+//!      │   lora::load_adapters_with_config(&weights, adapter_path,
+//!      │                                  &lora_cfg, quant.as_ref(), num_blocks)
+//!      │   // single-snapshot: same parsed `lora_cfg` the save side uses
 //!      ▼
 //!   for (path, layer) in layers:                 (fuse.py:68-75 → fused_linears + update_modules)
 //!      │   fused = layer.fuse(dequantize)?
@@ -214,27 +216,45 @@ pub fn fuse(
   // params correctly.
   let parsed_quant = quant::parse_quantization(&config_json_text)?;
 
-  // (4) Read the adapter's typed config separately so the PEFT
-  // `fan_in_fan_out` flag is available BEFORE we walk the fused layers
-  // — we need it to know whether the SAVED weight should be re-transposed
-  // back to the persisted `[in, out]` layout (see step 5). `load_adapters`
-  // already parses the same file internally; the duplicate parse is
-  // intentional and cheap (`adapter_config.json` is bounded by
-  // [`crate::lm::load::MAX_CONFIG_BYTES`] and small in practice — single-
-  // -digit-KB JSON).
+  // (4) Read the adapter's typed config ONCE and share it across both the
+  // load side (via [`lora::load_adapters_with_config`]) and the save side
+  // (the `fan_in_fan_out` decision below). The previous shape called
+  // [`lora::read_adapter_config`] here AND let [`lora::load_adapters`]
+  // re-open + re-parse the same file — two reads = two snapshots = a
+  // TOCTOU window where a hostile or just-flipped `adapter_config.json`
+  // could send the load side and the save side down divergent paths:
+  //
+  // - Square-target `fan_in_fan_out` flag flip ⇒ the load side would
+  //   build a canonical `[out, in]` fused weight, then the save side's
+  //   stale-snapshot decision would transpose it to `[in, out]` (or
+  //   skip the transpose), silently corrupting the saved orientation.
+  //   The R1-fix square-target test (`fuse_preserves_fan_in_fan_out_layout
+  //   _for_square_target`) is exactly this failure mode masked by a
+  //   silent corruption — re-opening that window between two reads
+  //   reopens the same bug.
+  // - Quantized + `fan_in_fan_out` flag flip ⇒ the load side passes
+  //   (`build_base_linear` rejects ONLY when load-side sees
+  //   `fan_in_fan_out: true`), and the save side's
+  //   [`insert_base_linear`] quantized arm fires its debug-only
+  //   `debug_assert!(!fan_in_fan_out, ...)`, panicking debug builds.
+  //
+  // Holding ONE parsed [`LoraConfig`] across both phases collapses both
+  // reads to the same snapshot. The cost is one fewer ~single-digit-KB
+  // disk read for the load side (cheaper, not more expensive).
   let lora_cfg = lora::read_adapter_config(adapter_path)?;
   let fan_in_fan_out = lora_cfg.fan_in_fan_out();
 
-  // (5) Build the LoraLayers map (path → wrapped layer) by reading
-  // `adapter_config.json` + the adapter weights, then matching factor
-  // groups to base layers. `load_adapters` does the explicit-target
-  // completeness check (an `Error::Backend` when an `adapter_config.json`
-  // `keys` / `target_modules` selection misses factors, or when an
-  // adapter factor group matches no base layer) so a partial / empty
-  // fuse cannot silently succeed.
-  let layers = lora::load_adapters(
+  // (5) Build the LoraLayers map (path → wrapped layer) by loading the
+  // adapter weights against the SHARED parsed [`LoraConfig`] (`lora_cfg`
+  // above) — no second `adapter_config.json` read. `load_adapters_with_config`
+  // does the explicit-target completeness check (an `Error::Backend` when
+  // an `adapter_config.json` `keys` / `target_modules` selection misses
+  // factors, or when an adapter factor group matches no base layer) so a
+  // partial / empty fuse cannot silently succeed.
+  let layers = lora::load_adapters_with_config(
     &weights,
     adapter_path,
+    &lora_cfg,
     parsed_quant.as_ref(),
     cfg_typed.num_hidden_layers,
   )?;
