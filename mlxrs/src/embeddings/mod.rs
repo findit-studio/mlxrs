@@ -14,9 +14,15 @@
 //! load-factory ([`crate::embeddings::factory`] — `load` + a `model_type`
 //! [`EmbeddingModelTypeRegistry`](crate::embeddings::EmbeddingModelTypeRegistry))
 //! turns a local model directory into a constructed model + tokenizer +
-//! pooling-config bundle. Concrete model architectures and ColVision are added
-//! per-usecase and are out of scope here (no-model-arch rule); the registry is
-//! the extension point those per-usecase architectures register into.
+//! pooling-config bundle. The cross-architecture ColVision seam
+//! ([`crate::embeddings::colvision`] —
+//! [`BaseColVisionProcessor`](crate::embeddings::BaseColVisionProcessor)
+//! trait + the static [`score_single_vector`](crate::embeddings::score_single_vector) /
+//! [`score_multi_vector`](crate::embeddings::score_multi_vector) helpers)
+//! ships here; concrete model architectures (BERT / ColIdefics3 /
+//! ColQwen2_5 / …) are added per-usecase and are out of scope (no-model-arch
+//! rule); the registry is the extension point those per-usecase architectures
+//! register into.
 //!
 //! ## Conventions
 //! - `token_embeddings`: `(batch, seq_len, hidden)` float array.
@@ -68,6 +74,16 @@
 //! - Similarity:
 //!   [`cosine_similarity`](crate::embeddings::cosine_similarity),
 //!   [`cosine_similarity_matrix`](crate::embeddings::cosine_similarity_matrix).
+//! - ColVision base processor seam (mlx-embeddings
+//!   `colvision_processor.py`):
+//!   [`BaseColVisionProcessor`](crate::embeddings::BaseColVisionProcessor)
+//!   trait declaring the abstract `process_images` / `process_queries` /
+//!   `score` shape every concrete (per-model) ColVision processor
+//!   implements, plus the two static scoring helpers
+//!   [`score_single_vector`](crate::embeddings::score_single_vector)
+//!   (dot-product) and
+//!   [`score_multi_vector`](crate::embeddings::score_multi_vector)
+//!   (MaxSim / late-interaction).
 //! - Orchestration: the
 //!   [`EmbeddingModel`](crate::embeddings::EmbeddingModel) trait +
 //!   [`EmbeddingModelOutput`](crate::embeddings::EmbeddingModelOutput)
@@ -84,6 +100,7 @@
 //!   python `utils.generate` + swift
 //!   `EmbedderModelContainer.perform`).
 
+pub mod colvision;
 pub mod config;
 pub mod encode;
 pub mod factory;
@@ -125,6 +142,9 @@ fn scalar_like(value: f32, like: &Array) -> Result<Array> {
   astype(&s, like.dtype()?)
 }
 
+pub use colvision::{
+  BaseColVisionProcessor, ProcessorBatch, score_multi_vector, score_single_vector,
+};
 pub use config::{
   StPoolingConfig, pooling_from_st_config_bytes, pooling_from_st_config_path,
   pooling_from_st_config_str,
