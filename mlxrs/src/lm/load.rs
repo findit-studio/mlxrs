@@ -1030,6 +1030,76 @@ pub fn does_model_support_input_embeddings(model: &dyn crate::lm::model::Model) 
   model.supports_input_embeddings()
 }
 
+/// Process-global counter feeding [`new_gen_id`]: a `fetch_add(1)` per save
+/// gives every save *from this process* a distinct counter value, closing
+/// the same-millisecond / same-microsecond collision the F6 R5 timestamp-
+/// only tag left open. Combined with the PID (unique among live processes)
+/// and the µs timestamp (monotone-ish across reboots) this makes the
+/// resulting `gen_id` collision-resistant by construction.
+static SAVE_GEN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// Test-only override for `new_gen_id`: when `Some(s)`, the next call
+// returns the override (cloned) and clears the override; otherwise the
+// regular `{ts_us}-{pid}-{ctr}` path runs. Used by the
+// `save_model_refuses_to_overwrite_existing_shard_basename` test to
+// deterministically force a save to predict a specific basename so we
+// can plant a colliding file at that exact path and assert
+// `Error::ShardPathCollision` fires.
+#[cfg(test)]
+thread_local! {
+  static GEN_ID_OVERRIDE: std::cell::RefCell<Option<String>> =
+    const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn force_next_gen_id(id: &str) {
+  GEN_ID_OVERRIDE.with(|c| *c.borrow_mut() = Some(id.to_string()));
+}
+
+/// Build a collision-resistant **generation id** for one save: a
+/// `{ts_us:013}-{pid:08x}-{ctr:016x}` tag captured once at the start of
+/// [`save_model`] so every shard of a single save shares it.
+///
+/// Why three components:
+///
+/// - `ts_us` (microseconds since the UNIX epoch, zero-padded to 13 digits):
+///   monotone-ish across reboots, so two saves separated by even a single
+///   filesystem tick land on different basenames; a clock error degrades to
+///   `0` rather than failing the save.
+/// - `pid` (the process id, lowercase hex, 8 digits): unique among **live
+///   processes**, so two saves from two different processes — say, two
+///   concurrent CLI invocations — can never collide on the PID component.
+/// - `ctr` (a process-global atomic `fetch_add(1)`, 16 hex digits): unique
+///   *within* this process across the lifetime of the binary, so two saves
+///   from the same process in the same microsecond can never collide on the
+///   counter. The mlx-lm reference produced fixed names that *did* collide;
+///   the F6 R5 timestamp-only tag collided whenever two saves landed in the
+///   same millisecond. This counter closes that hole.
+///
+/// Concatenated together the resulting tag is collision-resistant by
+/// construction — no collision surface remains for any two `save_model`
+/// calls anywhere in any process.
+fn new_gen_id() -> String {
+  // Test-only one-shot override (always `None` in production builds —
+  // the thread-local lives behind `#[cfg(test)]`).
+  #[cfg(test)]
+  if let Some(forced) = GEN_ID_OVERRIDE.with(|c| c.borrow_mut().take()) {
+    return forced;
+  }
+
+  use std::{
+    sync::atomic::Ordering,
+    time::{SystemTime, UNIX_EPOCH},
+  };
+  let ts_us = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|d| d.as_micros())
+    .unwrap_or(0);
+  let pid = std::process::id();
+  let ctr = SAVE_GEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+  format!("{ts_us:013}-{pid:08x}-{ctr:016x}")
+}
+
 /// Per-shard file name, **generation-tagged** to avoid colliding with any
 /// pre-existing shard on disk. The reference (`utils.py:728-732`) names a
 /// lone shard `model.safetensors` and a multi-shard set
@@ -1040,41 +1110,89 @@ pub fn does_model_support_input_embeddings(model: &dyn crate::lm::model::Model) 
 /// the NEW shard's bytes — `save_model` step 5's caveat).
 ///
 /// mlxrs avoids that class of corruption by using a **generation-unique**
-/// basename — `model-gen-{timestamp_ms}-{idx:05}-of-{N:05}.safetensors` —
-/// with `timestamp_ms` captured ONCE at the start of `save_model` (so every
-/// shard of a single save shares the same generation tag). New-checkpoint
-/// shards are then **guaranteed** not to overwrite the OLD checkpoint's
-/// shards: a `save_model` failure between shard renames and the index
-/// rename can leak orphan files into the directory but can never silently
-/// corrupt the previously-valid checkpoint. The single-shard case uses the
-/// uniform `…-00001-of-00001` form (no special case) so loader code never
-/// has to distinguish the two.
+/// basename — `model-gen-{gen_id}-{idx:05}-of-{N:05}.safetensors` — with
+/// `gen_id` built once at the start of [`save_model`] from a µs timestamp,
+/// the PID, and a process-global counter (see [`new_gen_id`]). Two saves
+/// from the same process can never collide on the counter; two saves from
+/// different processes can never collide on the PID; across reboots the
+/// timestamp is monotone-ish. The result: no collision surface remains.
+///
+/// The single-shard case uses the uniform `…-00001-of-00001` form (no
+/// special case) so loader code never has to distinguish single- and
+/// multi-shard layouts.
 ///
 /// The index records these exact names verbatim, and the loader
 /// ([`load_weights`]) follows the index, so any shard basename — including
 /// these generation-tagged ones — works transparently.
-fn shard_file_name(generation_ms: u128, index_1based: usize, shards_count: usize) -> String {
-  format!("model-gen-{generation_ms}-{index_1based:05}-of-{shards_count:05}.safetensors")
+fn shard_file_name(gen_id: &str, index_1based: usize, shards_count: usize) -> String {
+  format!("model-gen-{gen_id}-{index_1based:05}-of-{shards_count:05}.safetensors")
+}
+
+/// Outcome of [`save_model`]'s **observable commit point** (the index
+/// rename).
+///
+/// `save_model` returns `Err` ONLY for **pre-commit** failures — staging a
+/// shard, renaming a shard tempfile, or renaming the index. Once the index
+/// rename succeeds the NEW checkpoint IS observable on disk and
+/// [`load_weights`] would now load it. A subsequent `fsync_dir` failure
+/// does NOT roll the rename back (it cannot — the rename is durable in
+/// the directory inode, just possibly not yet durable in the on-disk
+/// directory metadata).
+///
+/// To distinguish the two cases cleanly, `save_model` returns
+/// `Result<CommitOutcome, Error>`:
+///
+/// - `Ok(Committed)` — index rename succeeded **and** the post-commit
+///   `fsync_dir` of the parent directory succeeded; the save is fully
+///   durable.
+/// - `Ok(CommittedWithDurabilityWarning(_))` — index rename succeeded, the
+///   visible checkpoint loads correctly, but the post-commit `fsync_dir`
+///   returned an error. The caller (e.g. [`save`]) MUST still proceed to
+///   commit any other staged state (the config), and surface the warning
+///   to its own caller via [`crate::Error::DurabilityWarning`].
+///
+/// This contract keeps the [`save`] driver from dropping a staged
+/// config-tempfile guard (and its cleanup-on-drop tempfile delete) just
+/// because a post-commit fsync hiccupped — which would leave NEW
+/// weights+index visible against the OLD config, the exact mismatch
+/// Finding 2 flagged.
+#[derive(Debug)]
+pub enum CommitOutcome {
+  /// The index rename succeeded and the post-commit parent-directory
+  /// `fsync` succeeded — the save is fully durable.
+  Committed,
+  /// The index rename succeeded (the NEW checkpoint IS visible on disk and
+  /// would be observed by [`load_weights`]), but the post-commit parent-
+  /// directory `fsync` returned an error. The save is logically committed
+  /// but the directory-entry write may not yet be durable on disk.
+  CommittedWithDurabilityWarning(std::io::Error),
 }
 
 /// Write a weight map as sharded `.safetensors` plus the
 /// `model.safetensors.index.json` weight-map index into `save_path`,
-/// mirroring `mlx_lm.utils.save_model` (`utils.py:714-771`) with two
+/// mirroring `mlx_lm.utils.save_model` (`utils.py:714-771`) with three
 /// **structural** additions: (1) the [`load_weights`] side reads the index
 /// as the authoritative shard manifest, so the index rename here becomes
 /// the **SINGLE** commit point — a mid-save crash leaves the previously-
-/// valid checkpoint atomically intact; (2) shard basenames are
-/// **generation-tagged** (`model-gen-{timestamp_ms}-{idx:05}-of-{N:05}
-/// .safetensors`, with a single timestamp captured at the start of the
-/// save) so a new save's shards can never overwrite an older checkpoint's
-/// shards on disk — closing the residual "torn rename between shard
-/// publish and index publish corrupts the old shard" window the reference's
-/// fixed shard names leave open.
+/// valid checkpoint atomically intact; (2) shard basenames carry a
+/// **collision-resistant generation id**
+/// (`model-gen-{gen_id}-{idx:05}-of-{N:05}.safetensors`, with `gen_id` =
+/// `{ts_us}-{pid:hex}-{ctr:hex}` built once at save start from the
+/// microsecond timestamp, the PID, and a process-global atomic counter)
+/// so a new save's shards can never overwrite an older checkpoint's
+/// shards on disk regardless of clock or process; (3) before every shard
+/// / index rename a `symlink_metadata` check refuses to overwrite an
+/// existing final path (fail-closed defense-in-depth — the collision-
+/// resistant `gen_id` is the real protection, but rather than trust the
+/// rename behavior under a hostile / racing peer, the save errors with
+/// [`crate::Error::ShardPathCollision`] on any pre-existing final
+/// target).
 ///
 /// Steps, in reference order:
 ///
 /// 1. `save_path` is created (`mkdir -p`, `utils.py:723`); a single
-///    generation timestamp (ms since the UNIX epoch) is captured.
+///    collision-resistant generation id (`ts_us`-`pid`-`ctr`) is
+///    captured up front.
 /// 2. The weights are sharded via [`make_shards`] at [`MAX_FILE_SIZE_GB`]
 ///    (`utils.py:726`).
 /// 3. `total_size` (the sum of every weight's `array_nbytes`) and
@@ -1088,22 +1206,52 @@ fn shard_file_name(generation_ms: u128, index_1based: usize, shards_count: usize
 ///    directory `O_EXCL` tempfile and fsynced. **Nothing is written to a
 ///    final path yet.** Any failure here removes every staged tempfile.
 /// 5. **Publish — single commit point.** Every shard tempfile is atomically
-///    renamed over its final shard name FIRST; the parent directory is
-///    `fsync`ed so those rename entries are durable; the staged index is
-///    atomically renamed over `model.safetensors.index.json` LAST; the
+///    renamed over its final shard name FIRST (each rename preceded by a
+///    `symlink_metadata` fail-closed existence check on the target); the
+///    parent directory is `fsync`ed so those rename entries are durable;
+///    the staged index is atomically renamed over
+///    `model.safetensors.index.json` LAST (again preceded by a
+///    `symlink_metadata` check — `NotFound` proceeds, anything else
+///    errors; the loader IS allowed to read the OLD `index.json`, and
+///    that file is the ONE final path we intentionally overwrite). The
 ///    parent directory is `fsync`ed again to make the index rename
-///    durable. The index rename is THE observable commit point: before it,
-///    load follows the OLD index (if any) to the OLD shards (any new-named
-///    shards on disk are invisible — [`load_weights`] only loads what the
-///    index lists); after it, load follows the NEW index to the new shards.
-///    POSIX `rename(2)` is atomic-within-fs (same-dir tempfiles keep it
-///    single-fs); the new checkpoint becomes visible only at that final
-///    rename. Because every NEW shard's basename carries a unique
-///    generation timestamp it can never overwrite an OLD shard — a failure
-///    between the shard renames and the index rename leaves the OLD index
-///    → OLD shards untouched and still loadable; the not-yet-published
-///    staged index is removed, and the renamed new-named shards become
-///    silently-orphan files (load ignores them).
+///    durable. The index rename is THE observable commit point: before
+///    it, load follows the OLD index (if any) to the OLD shards (any
+///    new-named shards on disk are invisible — [`load_weights`] only
+///    loads what the index lists); after it, load follows the NEW index
+///    to the new shards. POSIX `rename(2)` is atomic-within-fs (same-dir
+///    tempfiles keep it single-fs); the new checkpoint becomes visible
+///    only at that final rename. Because every NEW shard's basename
+///    carries the collision-resistant `gen_id` it can never overwrite an
+///    OLD shard — a failure between the shard renames and the index
+///    rename leaves the OLD index → OLD shards untouched and still
+///    loadable; the not-yet-published staged index is removed, and the
+///    renamed new-named shards become silently-orphan files (load
+///    ignores them).
+///
+/// **Failure-vs-commit boundary (`CommitOutcome`).** `save_model` returns
+/// `Result<CommitOutcome, Error>`:
+///
+/// - `Err(_)` is returned **only** for pre-commit failures (directory
+///   create, staging, shard rename, the existence-check defense-in-depth
+///   that catches a colliding final path, the index rename itself). On
+///   any such failure the OLD checkpoint is byte-identical to its
+///   pre-save state.
+/// - Once the index rename succeeds the NEW checkpoint IS observable and
+///   `save_model` returns `Ok(_)`:
+///   - `Ok(CommitOutcome::Committed)` — the post-commit parent-directory
+///     `fsync` also succeeded; the save is fully durable.
+///   - `Ok(CommitOutcome::CommittedWithDurabilityWarning(e))` — the
+///     post-commit `fsync_dir` returned `e`. The visible checkpoint
+///     loads correctly; the directory-entry write may not yet be durable
+///     (a power loss before the FS internally drains could lose the
+///     directory entry). The caller (e.g. [`save`]) MUST still proceed
+///     to commit any other staged state.
+///
+/// This contract closes the F6 R6 Finding-2 hole where a post-index-
+/// commit `fsync_dir` failure would propagate as `Err` and drop the
+/// staged config-tempfile guard (deleting its tempfile via [`Drop`]),
+/// leaving NEW weights+index visible against the OLD config.
 ///
 /// **Prior-generation shards on disk.** This implementation **does not**
 /// inline-prune `model*.safetensors` files left over from earlier
@@ -1128,15 +1276,15 @@ fn shard_file_name(generation_ms: u128, index_1based: usize, shards_count: usize
 /// takes ownership, so there is nothing to donate; the on-disk result is
 /// identical.
 ///
-/// A recoverable failure (directory create, a shard write, the index write,
-/// an unrecognized weight dtype) is an [`Error::Backend`] naming the path.
+/// A recoverable failure (directory create, a shard write, a shard-name
+/// collision, the index write) is an [`Error`] naming the path
+/// ([`Error::Backend`] for IO failures, [`crate::Error::ShardPathCollision`]
+/// for a pre-existing final shard path).
 pub fn save_model(
   save_path: &Path,
   weights: &Weights,
   quant: &crate::lm::quant::PerLayerQuantization,
-) -> Result<()> {
-  use std::time::{SystemTime, UNIX_EPOCH};
-
+) -> Result<CommitOutcome> {
   // 1. `save_path.mkdir(parents=True, exist_ok=True)` (`utils.py:723`).
   std::fs::create_dir_all(save_path).map_err(|e| Error::Backend {
     message: format!(
@@ -1145,18 +1293,17 @@ pub fn save_model(
     ),
   })?;
 
-  // Capture the generation timestamp ONCE up front so every shard of this
-  // save shares the same tag — making the basenames trivially identifiable
-  // as belonging to the same generation. The exact value is not load-
-  // critical (the loader follows the index, never parses the basename); it
-  // is just a uniqueness handle. A clock error falls back to `0` rather
-  // than failing the save — even a `0`-tag basename is unique enough to
-  // not collide with the reference's `model.safetensors` /
-  // `model-{N}-of-{M}.safetensors` names of a pre-existing checkpoint.
-  let generation_ms: u128 = SystemTime::now()
-    .duration_since(UNIX_EPOCH)
-    .map(|d| d.as_millis())
-    .unwrap_or(0);
+  // Capture a collision-resistant generation id ONCE up front so every
+  // shard of this save shares the same tag. The id is
+  // `{ts_us:013}-{pid:08x}-{ctr:016x}` — see [`new_gen_id`] for the per-
+  // component collision argument. Two saves from the same process can
+  // never collide on `ctr`; two saves from different processes can never
+  // collide on `pid` (PIDs are unique among LIVE processes); across
+  // reboots `ts_us` is monotone-ish. No collision surface remains. The
+  // value is not load-critical (the loader follows the index, never
+  // parses the basename); a clock error degrades `ts_us` to `0` without
+  // weakening the `pid`+`ctr` uniqueness.
+  let gen_id = new_gen_id();
 
   // 2. shard (`utils.py:726`).
   let shards = make_shards(weights, MAX_FILE_SIZE_GB)?;
@@ -1193,7 +1340,7 @@ pub fn save_model(
   // far before returning — no leaked `.tmp.safetensors` on a failed save.
   let staged: Result<()> = (|| {
     for (i, shard) in shards.iter().enumerate() {
-      let shard_name = shard_file_name(generation_ms, i + 1, shards_count);
+      let shard_name = shard_file_name(&gen_id, i + 1, shards_count);
       let final_path = save_path.join(&shard_name);
       // Exclusively created, same-directory, `.safetensors`-suffixed
       // tempfile: `save_safetensors_view` (mlx-c) writes exactly this path
@@ -1245,16 +1392,57 @@ pub fn save_model(
   // 5. Publish — single commit point.
   //
   //    a. Rename every shard tempfile over its final shard name FIRST.
-  //       Because each shard basename carries a generation-unique tag
-  //       (`model-gen-{ts}-…`) the rename target never pre-exists, so the
-  //       rename creates a brand-new file and can never overwrite an
-  //       older checkpoint's shards. A rename failure here leaves any
-  //       still-staged shard + the staged index as tempfiles, which are
-  //       cleaned up before propagating. Already-renamed shards remain on
-  //       disk as silently-invisible files (the OLD index, if any, still
-  //       points to its OLD shard names — which are untouched).
+  //       Because each shard basename carries a collision-resistant
+  //       `gen_id` (`model-gen-{ts_us}-{pid}-{ctr}-…`) the rename target
+  //       statistically cannot pre-exist. As defense-in-depth — fail-
+  //       closed on the residual hostile / racing case — every rename is
+  //       preceded by a `symlink_metadata` check on the final path: if it
+  //       returns `Ok(_)` (path exists) the save aborts with
+  //       [`crate::Error::ShardPathCollision`] rather than overwriting; a
+  //       `NotFound` proceeds (the normal path). A rename failure (or a
+  //       collision) here leaves any still-staged shard + the staged
+  //       index as tempfiles, which are cleaned up before propagating.
+  //       Already-renamed shards remain on disk as silently-invisible
+  //       files (the OLD index, if any, still points to its OLD shard
+  //       names — which are untouched).
   for idx in 0..staged_shards.len() {
     let (tmp, final_path) = &staged_shards[idx];
+    // Fail-closed existence check: defense in depth on top of the
+    // collision-resistant `gen_id`. `symlink_metadata` does NOT follow
+    // symlinks, so it sees a planted symlink as itself (and a `NotFound`
+    // means the path truly does not exist as any kind of inode). Anything
+    // other than `NotFound` is a collision (`Ok(_)`) or an unexpected
+    // stat error — both abort the save before the rename overwrites.
+    match std::fs::symlink_metadata(final_path) {
+      Ok(_) => {
+        for (leftover, _) in &staged_shards[idx..] {
+          let _ = std::fs::remove_file(leftover);
+        }
+        if let Some((index_tmp, _)) = &staged_index {
+          let _ = std::fs::remove_file(index_tmp);
+        }
+        return Err(Error::ShardPathCollision {
+          path: final_path.clone(),
+        });
+      }
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        // expected — proceed with the rename
+      }
+      Err(e) => {
+        for (leftover, _) in &staged_shards[idx..] {
+          let _ = std::fs::remove_file(leftover);
+        }
+        if let Some((index_tmp, _)) = &staged_index {
+          let _ = std::fs::remove_file(index_tmp);
+        }
+        return Err(Error::Backend {
+          message: format!(
+            "save_model: cannot stat shard final path {} before rename: {e}",
+            final_path.display()
+          ),
+        });
+      }
+    }
     if let Err(e) = std::fs::rename(tmp, final_path) {
       // Clean every still-unpublished shard tempfile + the staged index.
       for (leftover, _) in &staged_shards[idx..] {
@@ -1279,6 +1467,11 @@ pub fn save_model(
   //        the rename metadata, leaving the index referencing shards that
   //        appear missing on the next mount. A no-op on platforms where
   //        directory fsync is not supported.
+  //
+  //        This fsync is BEFORE the observable commit point (the index
+  //        rename), so a failure here is a genuine pre-commit error and
+  //        propagates as `Err`. The post-commit fsync (b') is the one
+  //        that gets demoted to a `CommitOutcome` warning.
   fsync_dir(save_path).map_err(|e| Error::Backend {
     message: format!(
       "save_model: fsync parent directory {} after shard renames failed: {e}",
@@ -1294,9 +1487,33 @@ pub fn save_model(
   //       the directory now holds renamed new-named shards alongside the
   //       OLD checkpoint (load follows the OLD index → still correct, the
   //       new-named shards are invisible).
+  //
+  //       The index is the ONE final path we intentionally overwrite —
+  //       the load contract is: "the index IS the manifest, the latest
+  //       rename wins". So `symlink_metadata` returning `Ok(_)` is
+  //       expected here (the OLD index) and is NOT a collision; we still
+  //       check for a non-`NotFound`-and-non-`Ok(_)` stat error to avoid
+  //       blindly renaming over a fs that refuses to stat.
   let (index_tmp, index_final) = staged_index
     .as_ref()
     .expect("index was successfully staged in step 4");
+  // Pre-rename existence stat: the OLD index existing (Ok(_)) is the
+  // intentional-overwrite path — the load contract is "the index IS the
+  // manifest, the latest rename wins". A `NotFound` (first save into the
+  // dir) also proceeds. Anything else (e.g. EACCES) is a genuine stat
+  // failure that aborts the save rather than blindly renaming over a
+  // filesystem we cannot inspect.
+  if let Err(e) = std::fs::symlink_metadata(index_final)
+    && e.kind() != std::io::ErrorKind::NotFound
+  {
+    let _ = std::fs::remove_file(index_tmp);
+    return Err(Error::Backend {
+      message: format!(
+        "save_model: cannot stat index final path {} before rename: {e}",
+        index_final.display()
+      ),
+    });
+  }
   if let Err(e) = std::fs::rename(index_tmp, index_final) {
     let _ = std::fs::remove_file(index_tmp);
     return Err(Error::Backend {
@@ -1309,16 +1526,22 @@ pub fn save_model(
   }
 
   //    b'. fsync the parent directory again so the index rename — THE
-  //        observable commit point — is durable. A successful return from
-  //        `save_model` now implies the new checkpoint survives a crash.
-  fsync_dir(save_path).map_err(|e| Error::Backend {
-    message: format!(
-      "save_model: fsync parent directory {} after index rename failed: {e}",
-      save_path.display()
-    ),
-  })?;
-
-  Ok(())
+  //        observable commit point — is durable. **An error here does
+  //        NOT roll the commit back** (the rename is durable in the
+  //        directory inode; only the on-disk directory metadata may not
+  //        yet be drained). The NEW checkpoint IS observable on disk and
+  //        [`load_weights`] would now load it; the caller MUST treat
+  //        this as a logically-committed save with a durability warning.
+  //
+  //        Returned as `Ok(CommittedWithDurabilityWarning(_))` rather
+  //        than `Err(_)`, so the [`save`] driver does not drop a still-
+  //        staged [`StagedConfig`] (which would delete its tempfile via
+  //        [`Drop`]), the F6 R6 Finding-2 hole. The caller surfaces it
+  //        to its own caller via [`crate::Error::DurabilityWarning`].
+  match fsync_dir(save_path) {
+    Ok(()) => Ok(CommitOutcome::Committed),
+    Err(e) => Ok(CommitOutcome::CommittedWithDurabilityWarning(e)),
+  }
 }
 
 /// Open an exclusively created (`O_CREAT|O_EXCL`), randomized tempfile in the
@@ -1422,6 +1645,39 @@ fn fsync_path(path: &Path) -> Result<()> {
   })
 }
 
+// Test-only fault injector for `fsync_dir`: when set on the current
+// thread, the next `n` `fsync_dir` calls succeed normally and the
+// (n+1)-th returns `io::Error::other(...)`. Used by the post-index-
+// commit durability-warning tests to drive the
+// `CommitOutcome::CommittedWithDurabilityWarning` branch without needing
+// a hostile filesystem. Always `None` in production code (the thread-
+// local is only set inside `#[test]` fns and unset on test exit).
+#[cfg(test)]
+thread_local! {
+  static FSYNC_DIR_FAULT_SKIP_THEN_FAIL: std::cell::Cell<Option<usize>> =
+    const { std::cell::Cell::new(None) };
+}
+
+/// Arm the [`fsync_dir`] fault injector to skip `skip` successful calls
+/// then make the next call fail. Returns a [`Drop`] guard that disarms
+/// the injector when it goes out of scope (so a test panic still leaves
+/// the thread in a clean state for the next test).
+#[cfg(test)]
+fn arm_fsync_dir_fault(skip: usize) -> FsyncDirFaultGuard {
+  FSYNC_DIR_FAULT_SKIP_THEN_FAIL.with(|c| c.set(Some(skip)));
+  FsyncDirFaultGuard
+}
+
+#[cfg(test)]
+struct FsyncDirFaultGuard;
+
+#[cfg(test)]
+impl Drop for FsyncDirFaultGuard {
+  fn drop(&mut self) {
+    FSYNC_DIR_FAULT_SKIP_THEN_FAIL.with(|c| c.set(None));
+  }
+}
+
 /// fsync the directory `path` so any rename / unlink / create entries inside
 /// it are durable on disk before we return — without this, a `rename(2)` is
 /// allowed to land in the parent directory's in-memory inode but be lost on
@@ -1439,6 +1695,22 @@ fn fsync_path(path: &Path) -> Result<()> {
 /// silently succeeds rather than propagate a platform-specific error
 /// that has no corresponding fix at this layer.
 fn fsync_dir(path: &Path) -> std::io::Result<()> {
+  // Test-only fault-injection knob — see [`arm_fsync_dir_fault`]. Threaded
+  // through here rather than at each call site so every fsync_dir call
+  // (shard-fsync, index-fsync, config-fsync) is uniformly faultable.
+  #[cfg(test)]
+  if let Some(remaining) = FSYNC_DIR_FAULT_SKIP_THEN_FAIL.with(|c| c.get()) {
+    if remaining == 0 {
+      FSYNC_DIR_FAULT_SKIP_THEN_FAIL.with(|c| c.set(None));
+      return Err(std::io::Error::other(format!(
+        "injected fsync_dir failure for {}",
+        path.display()
+      )));
+    } else {
+      FSYNC_DIR_FAULT_SKIP_THEN_FAIL.with(|c| c.set(Some(remaining - 1)));
+    }
+  }
+
   #[cfg(unix)]
   {
     use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
@@ -1488,10 +1760,19 @@ fn fsync_dir(path: &Path) -> std::io::Result<()> {
 ///
 /// `config` must be a JSON **object**; anything else (or invalid JSON) is an
 /// [`Error::Backend`]. A write failure is an [`Error::Backend`] naming the
-/// path.
+/// path. A post-rename `fsync_dir` failure is surfaced as
+/// [`Error::DurabilityWarning`] with `committed: true` — the NEW
+/// `config.json` IS observable on disk, but the directory-entry write may
+/// not yet be durable (matching the [`save`] driver's contract).
 pub fn save_config(config: &str, config_path: &Path) -> Result<()> {
   let staged = stage_config(config, config_path)?;
-  commit_staged_config(staged, config_path)
+  match commit_staged_config(staged, config_path)? {
+    CommitOutcome::Committed => Ok(()),
+    CommitOutcome::CommittedWithDurabilityWarning(source) => Err(Error::DurabilityWarning {
+      committed: true,
+      source,
+    }),
+  }
 }
 
 /// A `config.json` body that has been parsed, validated, cleaned, sorted,
@@ -1574,7 +1855,19 @@ fn stage_config(config: &str, config_path: &Path) -> Result<StagedConfig> {
 /// staging guard so a successful rename does not also delete the just-
 /// published file via [`Drop`]. On a rename failure the staging guard's
 /// `Drop` cleans the tempfile up.
-fn commit_staged_config(mut staged: StagedConfig, config_path: &Path) -> Result<()> {
+///
+/// Returns `Result<CommitOutcome, Error>` with the same shape as
+/// [`save_model`]:
+///
+/// - `Err(_)` for a pre-commit failure (the rename itself failed; the
+///   OLD `config.json`, if any, is untouched).
+/// - `Ok(Committed)` — rename + post-commit `fsync_dir` both succeeded.
+/// - `Ok(CommittedWithDurabilityWarning(e))` — rename succeeded (the NEW
+///   `config.json` IS observable on disk), but the post-rename
+///   `fsync_dir` returned `e`. The caller (e.g. [`save`]) MUST treat this
+///   as a logically-committed config-write with a durability warning,
+///   matching `save_model`'s contract.
+fn commit_staged_config(mut staged: StagedConfig, config_path: &Path) -> Result<CommitOutcome> {
   if let Err(e) = std::fs::rename(&staged.tmp_path, config_path) {
     // Leave `cleanup_on_drop = true` so `Drop` removes the tempfile.
     return Err(Error::Backend {
@@ -1588,18 +1881,19 @@ fn commit_staged_config(mut staged: StagedConfig, config_path: &Path) -> Result<
   // The rename consumed the tempfile (it IS now `config_path`); the
   // tempfile path no longer exists, so don't try to `unlink` it on Drop.
   staged.cleanup_on_drop = false;
-  // fsync the parent directory so the rename entry is durable on disk —
-  // without it, a crash between `rename(2)` and the next sync can lose
-  // the new `config.json` and leave the directory holding the OLD one.
-  if let Some(parent) = config_path.parent() {
-    fsync_dir(parent).map_err(|e| Error::Backend {
-      message: format!(
-        "save_config: fsync parent directory {} after rename failed: {e}",
-        parent.display()
-      ),
-    })?;
+  // fsync the parent directory so the rename entry is durable on disk.
+  // **An error here does NOT roll the commit back** (the rename is
+  // durable in the directory inode; only the on-disk directory metadata
+  // may not yet be drained). The NEW `config.json` IS observable on
+  // disk. Returned as `Ok(CommittedWithDurabilityWarning(_))` rather
+  // than `Err(_)` so the caller can surface it via
+  // [`crate::Error::DurabilityWarning`] without rolling the commit back.
+  if let Some(parent) = config_path.parent()
+    && let Err(e) = fsync_dir(parent)
+  {
+    return Ok(CommitOutcome::CommittedWithDurabilityWarning(e));
   }
-  Ok(())
+  Ok(CommitOutcome::Committed)
 }
 
 /// Save a model — weights and config — into `dst_path`, mirroring the
@@ -1620,18 +1914,36 @@ fn commit_staged_config(mut staged: StagedConfig, config_path: &Path) -> Result<
 /// 3. [`save_model`] writes the sharded `.safetensors` + the
 ///    `model.safetensors.index.json` index, with the index rename as the
 ///    single observable commit point (`utils.py:942` plus the structural
-///    atomicity fix; see [`save_model`]).
+///    atomicity fix; see [`save_model`]). A
+///    [`CommitOutcome::CommittedWithDurabilityWarning`] is NOT a failure —
+///    the visible checkpoint is on disk and complete; `save` PROCEEDS to
+///    commit the staged config (otherwise the staging guard's `Drop` would
+///    delete the staged config tempfile, leaving NEW weights+index against
+///    the OLD config — the F6 R6 Finding-2 hole). The warning is
+///    accumulated for the final return.
 /// 4. The staged config is **atomically renamed** over
-///    `<dst_path>/config.json` LAST (`utils.py:943`).
+///    `<dst_path>/config.json` LAST (`utils.py:943`). The config rename's
+///    own post-rename `fsync_dir` failure is similarly demoted to a
+///    durability warning.
+/// 5. If any [`CommitOutcome::CommittedWithDurabilityWarning`] was
+///    observed (from `save_model` or from `commit_staged_config`) `save`
+///    returns [`Error::DurabilityWarning`] with `committed: true` — the
+///    new checkpoint IS visible + complete (weights + index + config) on
+///    disk, but a parent-dir `fsync` did not return success and a power
+///    loss before the FS internally drains could lose the directory entry.
+///    Otherwise `save` returns `Ok(())`.
 ///
 /// Failure semantics:
 ///
 /// - A config validation / staging failure in step 2 aborts BEFORE any
 ///   weight or config file is touched — the entire previous checkpoint
 ///   (weights, index, config) is byte-identical to the pre-save state.
-/// - A `save_model` failure in step 3 leaves the previous weights+index
-///   intact (the index rename single-commit-point — see [`save_model`]);
-///   the staged config tempfile is removed by the staging-guard `Drop`.
+/// - A pre-index-commit `save_model` failure in step 3 leaves the
+///   previous weights+index intact (the index rename single-commit-point —
+///   see [`save_model`]); the staged config tempfile is removed by the
+///   staging-guard `Drop`.
+/// - A post-index-commit durability-warning in step 3 is NOT a failure;
+///   `save` PROCEEDS to step 4. (Step 5 surfaces the warning at the end.)
 /// - A config-rename failure in step 4 is the one residual mismatch
 ///   window: the new weights+index are committed but the OLD `config.json`
 ///   survives, so a subsequent load sees the NEW weights against the OLD
@@ -1657,7 +1969,7 @@ fn commit_staged_config(mut staged: StagedConfig, config_path: &Path) -> Result<
 /// `quant` supplies the per-layer [`Quantization`] [`save_model`] needs
 /// (pass [`PerLayerQuantization::default`](crate::lm::quant::PerLayerQuantization)
 /// for an unquantized model). Any step's recoverable failure is the
-/// [`Error::Backend`] that step produced.
+/// [`Error`] that step produced.
 pub fn save(
   dst_path: &Path,
   weights: &Weights,
@@ -1681,16 +1993,47 @@ pub fn save(
   let config_path = dst_path.join("config.json");
   let staged_config = stage_config(config, &config_path)?;
 
-  // 3. Save the weights + index (the index rename is the single observable
-  //    commit point for the weights — see `save_model`).
-  save_model(dst_path, weights, quant)?;
+  // 3. Save the weights + index. An `Err` is a pre-commit failure (the
+  //    previous checkpoint is untouched); the staging guard's `Drop`
+  //    cleans the config tempfile. An `Ok(CommittedWithDurabilityWarning)`
+  //    is NOT a failure — the index rename succeeded, so the visible
+  //    checkpoint loads correctly and we MUST proceed to commit the
+  //    config (dropping the staged config here would delete the config
+  //    tempfile, leaving NEW weights+index against the OLD config —
+  //    the F6 R6 Finding-2 hole this entire shape closes). The warning
+  //    is accumulated for the final return.
+  let mut durability: Option<std::io::Error> = match save_model(dst_path, weights, quant)? {
+    CommitOutcome::Committed => None,
+    CommitOutcome::CommittedWithDurabilityWarning(e) => Some(e),
+  };
 
-  // 4. Atomically rename the staged config LAST. The single residual
-  //    mismatch window is right here: if this rename fails, the NEW
-  //    weights are visible against the OLD config. Acceptable without a
-  //    true cross-file transaction (an `fs::rename` of a fsynced O_EXCL
-  //    tempfile inside the same directory is very unlikely to fail).
-  commit_staged_config(staged_config, &config_path)?;
+  // 4. Atomically rename the staged config LAST. A rename failure is a
+  //    true `Err` (the residual mismatch window — see above). A post-
+  //    rename `fsync_dir` failure is demoted to a durability warning,
+  //    same shape as `save_model`'s — the config IS visible on disk.
+  match commit_staged_config(staged_config, &config_path)? {
+    CommitOutcome::Committed => {}
+    CommitOutcome::CommittedWithDurabilityWarning(e) => {
+      // Prefer the FIRST warning observed (the index commit) so the
+      // surfaced error names the canonical commit point; otherwise
+      // attach the config commit's.
+      if durability.is_none() {
+        durability = Some(e);
+      }
+    }
+  }
+
+  // 5. Surface any accumulated durability warning as a non-fatal `Err`
+  //    with `committed: true`. The on-disk save is logically complete
+  //    (weights + index + config); only the parent-directory fsync
+  //    didn't return success. A successful `Ok(())` therefore means
+  //    "fully durable".
+  if let Some(source) = durability {
+    return Err(Error::DurabilityWarning {
+      committed: true,
+      source,
+    });
+  }
   Ok(())
 }
 
@@ -2021,33 +2364,89 @@ mod save_tests {
 
   // ─────────────────────── shard_file_name ───────────────────────
 
-  /// The generation-tagged basename: `model-gen-{ts}-{idx:05}-of-{N:05}
+  /// The generation-tagged basename: `model-gen-{gen_id}-{idx:05}-of-{N:05}
   /// .safetensors`. Uniform across single- and multi-shard sets so the
-  /// publish path has one code path. The exact `ts` value is not load-
+  /// publish path has one code path. The exact `gen_id` value is not load-
   /// critical (the loader follows the index, not the basename), it is
   /// just a uniqueness handle so new shards never collide with a prior
   /// checkpoint's shard names.
   #[test]
   fn shard_file_name_generation_tagged() {
+    let gen_id = "1234567890123-deadbeef-00000000cafef00d";
     assert_eq!(
-      shard_file_name(1234567890123u128, 1, 1),
-      "model-gen-1234567890123-00001-of-00001.safetensors"
+      shard_file_name(gen_id, 1, 1),
+      format!("model-gen-{gen_id}-00001-of-00001.safetensors")
     );
     assert_eq!(
-      shard_file_name(1234567890123u128, 1, 3),
-      "model-gen-1234567890123-00001-of-00003.safetensors"
+      shard_file_name(gen_id, 1, 3),
+      format!("model-gen-{gen_id}-00001-of-00003.safetensors")
     );
     assert_eq!(
-      shard_file_name(1234567890123u128, 3, 3),
-      "model-gen-1234567890123-00003-of-00003.safetensors"
+      shard_file_name(gen_id, 3, 3),
+      format!("model-gen-{gen_id}-00003-of-00003.safetensors")
     );
-    // Two distinct generations produce distinct basenames — the property
-    // that lets new-checkpoint shards never overwrite old-checkpoint
-    // shards on disk.
+    // Two distinct generation ids produce distinct basenames — the
+    // property that lets new-checkpoint shards never overwrite old-
+    // checkpoint shards on disk.
     assert_ne!(
-      shard_file_name(1, 1, 1),
-      shard_file_name(2, 1, 1),
-      "different generations must produce different shard names"
+      shard_file_name("first-gen-id", 1, 1),
+      shard_file_name("second-gen-id", 1, 1),
+      "different generation ids must produce different shard names"
+    );
+  }
+
+  /// [`new_gen_id`] returns the expected `{ts_us:013}-{pid:08x}-{ctr:016x}`
+  /// shape (the `:013` is a MINIMUM width pad — a 2026-and-later µs
+  /// timestamp is naturally 16 digits and is left unpadded by the
+  /// format spec), the counter advances each call (so two saves from
+  /// the same process can never share a `gen_id`), and the PID + ctr
+  /// widths stay constant.
+  #[test]
+  fn new_gen_id_shape_and_counter_advance() {
+    let a = new_gen_id();
+    let b = new_gen_id();
+    // Two calls produce two distinct ids (the counter component differs).
+    assert_ne!(a, b, "successive new_gen_id() calls must differ");
+    // Shape: three `-`-separated components.
+    for id in [&a, &b] {
+      let parts: Vec<&str> = id.split('-').collect();
+      assert_eq!(
+        parts.len(),
+        3,
+        "gen_id has 3 dash-separated components: {id}"
+      );
+      // ts_us is decimal digits, minimum 13 wide (the format-spec pad;
+      // a real 2026-and-later µs-since-epoch is 16 digits naturally).
+      assert!(
+        parts[0].len() >= 13,
+        "ts_us is at least 13 chars wide (the format-spec pad): {}",
+        parts[0]
+      );
+      assert!(
+        parts[0].chars().all(|c| c.is_ascii_digit()),
+        "ts_us is decimal: {}",
+        parts[0]
+      );
+      assert_eq!(parts[1].len(), 8, "pid is 8 hex chars: {}", parts[1]);
+      assert!(
+        parts[1].chars().all(|c| c.is_ascii_hexdigit()),
+        "pid is hex: {}",
+        parts[1]
+      );
+      assert_eq!(parts[2].len(), 16, "ctr is 16 hex chars: {}", parts[2]);
+      assert!(
+        parts[2].chars().all(|c| c.is_ascii_hexdigit()),
+        "ctr is hex: {}",
+        parts[2]
+      );
+    }
+    // The pid component is identical across two calls in the same
+    // process — only the counter (and possibly the timestamp) advances.
+    let a_parts: Vec<&str> = a.split('-').collect();
+    let b_parts: Vec<&str> = b.split('-').collect();
+    assert_eq!(
+      a_parts[1], b_parts[1],
+      "PID stable across calls in the same process"
     );
   }
 
@@ -2173,20 +2572,22 @@ mod save_tests {
     let w1 = Array::from_slice::<f32>(&[20.0, 21.0], &(2usize,)).unwrap();
     let shards: Vec<Shard<'_>> = vec![BTreeMap::from([("w0", &w0)]), BTreeMap::from([("w1", &w1)])];
     let count = shards.len();
-    // Single generation timestamp for the whole save — exactly what
-    // `save_model` does internally.
-    let gen_ms: u128 = 1_234_567_890_123;
+    // Single generation id for the whole save — exactly what
+    // `save_model` does internally (here a hand-crafted fixed value so
+    // the asserted basenames are deterministic; production uses
+    // `new_gen_id()`).
+    let gen_id = "1234567890123-deadbeef-00000000cafef00d";
     let mut meta: HashMap<String, String> = HashMap::new();
     meta.insert("format".to_string(), "mlx".to_string());
     let mut weight_map: BTreeMap<String, String> = BTreeMap::new();
     let mut written_basenames: Vec<String> = Vec::new();
     for (i, s) in shards.iter().enumerate() {
-      let name = shard_file_name(gen_ms, i + 1, count);
+      let name = shard_file_name(gen_id, i + 1, count);
       // Generation-tagged scheme + zero-padded indices.
       assert_eq!(
         name,
         format!(
-          "model-gen-{gen_ms}-{:05}-of-{:05}.safetensors",
+          "model-gen-{gen_id}-{:05}-of-{:05}.safetensors",
           i + 1,
           count
         )
@@ -3545,5 +3946,304 @@ mod save_tests {
       total, 64,
       "affine `.biases` skipped, only unpacked weight counts"
     );
+  }
+
+  // ────────── F6 R6: collision-resistant gen_id + fail-closed rename ──────────
+
+  /// Two consecutive `save_model` calls from the same process — even in a
+  /// tight loop where the µs timestamp may not advance between calls —
+  /// produce on-disk shards with distinct basenames, because the process-
+  /// global counter component of [`new_gen_id`] always advances. Without
+  /// the counter the timestamp-only F6 R5 tag would have collided
+  /// whenever two saves landed in the same ms / µs tick (and the second
+  /// save would have overwritten the first save's shard via
+  /// `fs::rename`); the counter closes that hole.
+  #[test]
+  fn gen_id_is_collision_resistant_across_same_ms_saves() {
+    let dir_a = fresh_dir("gen-id-collision-a");
+    let dir_b = fresh_dir("gen-id-collision-b");
+    let mut w: Weights = HashMap::new();
+    w.insert("w.weight".to_string(), f32_weight(2));
+    // Back-to-back saves to two distinct dirs to keep the assertion
+    // about basenames, not about a single-dir overwrite (that's covered
+    // by `save_model_no_overwrite_of_old_shards`).
+    save_model(&dir_a, &w, &PerLayerQuantization::default()).unwrap();
+    save_model(&dir_b, &w, &PerLayerQuantization::default()).unwrap();
+
+    let basenames = |dir: &Path| -> Vec<String> {
+      collect_sorted(dir, |n| {
+        n.starts_with("model-gen-") && n.ends_with(".safetensors")
+      })
+      .unwrap()
+      .into_iter()
+      .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+      .collect()
+    };
+    let a = basenames(&dir_a);
+    let b = basenames(&dir_b);
+    assert_eq!(a.len(), 1);
+    assert_eq!(b.len(), 1);
+    // Even if the µs timestamp tick did not advance between the two
+    // saves (e.g. on a coarser-clock host), the counter advances, so
+    // the basenames differ.
+    assert_ne!(
+      a[0], b[0],
+      "two same-process saves must produce distinct gen_id-tagged basenames; \
+       got {a:?} == {b:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+  }
+
+  /// Defense-in-depth: if a pre-existing file occupies one of the
+  /// predicted final shard paths (the collision-resistant `gen_id`
+  /// makes this statistically unreachable, so the test plants the file
+  /// by hand after forcing the gen_id via the test-only
+  /// `force_next_gen_id` helper) `save_model` MUST refuse to overwrite
+  /// it — returning [`crate::Error::ShardPathCollision`] naming the
+  /// offending path — and leave the planted file byte-identical and no
+  /// staged tempfiles behind.
+  #[test]
+  fn save_model_refuses_to_overwrite_existing_shard_basename() {
+    let dir = fresh_dir("save-refuses-overwrite");
+
+    // 1. Pick a known gen_id and plant a decoy file at the shard-1-of-1
+    //    path that gen_id will predict.
+    let forced_gen_id = "9999999999999-cafebabe-0000000000000042";
+    let collision_path = dir.join(shard_file_name(forced_gen_id, 1, 1));
+    let decoy_bytes = b"pre-existing decoy bytes that must NOT be overwritten";
+    std::fs::write(&collision_path, decoy_bytes).unwrap();
+
+    // 2. Force `save_model`'s next gen_id to match the planted path.
+    force_next_gen_id(forced_gen_id);
+
+    let mut w: Weights = HashMap::new();
+    w.insert("w.weight".to_string(), f32_weight(2));
+    let r = save_model(&dir, &w, &PerLayerQuantization::default());
+
+    // 3. The save aborts with `Error::ShardPathCollision` naming the
+    //    offending path.
+    match r {
+      Err(Error::ShardPathCollision { path }) => {
+        assert_eq!(
+          path, collision_path,
+          "the collision error names the planted path"
+        );
+      }
+      other => panic!("expected Err(ShardPathCollision), got {other:?}"),
+    }
+
+    // 4. The decoy file is byte-identical — no overwrite occurred.
+    assert!(
+      collision_path.is_file(),
+      "the planted decoy at {} must still be a file",
+      collision_path.display()
+    );
+    assert_eq!(
+      std::fs::read(&collision_path).unwrap(),
+      decoy_bytes,
+      "the planted decoy must be byte-identical (the rename was refused)"
+    );
+
+    // 5. No staged `.tmp.safetensors` leaks (every staged tempfile was
+    //    cleaned up on the collision-cleanup path).
+    let leftover_tmp = std::fs::read_dir(&dir)
+      .unwrap()
+      .filter_map(|e| e.ok())
+      .any(|e| {
+        e.file_name()
+          .to_string_lossy()
+          .ends_with(".tmp.safetensors")
+      });
+    assert!(
+      !leftover_tmp,
+      "no staged tempfile may remain after a ShardPathCollision abort"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  // ────────── F6 R6: post-index-commit durability warning ──────────
+
+  /// `save_model` returns `Ok(CommitOutcome::CommittedWithDurabilityWarning)`
+  /// — NOT `Err` — when the post-index-rename `fsync_dir` fails. The
+  /// visible checkpoint loads correctly; only the parent-directory
+  /// fsync hiccupped. This is the F6 R6 Finding-2 hole: returning `Err`
+  /// here would propagate through [`save`] and drop the staged
+  /// [`StagedConfig`], deleting its tempfile and leaving NEW
+  /// weights+index against the OLD config.
+  ///
+  /// Driven via the test-only `arm_fsync_dir_fault(skip)`: `skip=1`
+  /// makes the shard-fsync succeed and the INDEX-fsync (the
+  /// observable-commit-point fsync) fail. The contract:
+  ///
+  /// 1. `save_model` returns `Ok(CommittedWithDurabilityWarning(_))`.
+  /// 2. The on-disk checkpoint loads correctly (`load_weights` sees the
+  ///    new weights).
+  #[test]
+  fn save_model_post_index_fsync_failure_keeps_visible_checkpoint() {
+    let dir = fresh_dir("post-index-fsync-failure");
+
+    let mut w: Weights = HashMap::new();
+    w.insert(
+      "v.alpha.weight".to_string(),
+      Array::from_slice::<f32>(&[7.0, 8.0, 9.0], &(3usize,)).unwrap(),
+    );
+    w.insert(
+      "v.beta.weight".to_string(),
+      Array::from_slice::<f32>(&[1.0], &(1usize,)).unwrap(),
+    );
+
+    // Arm: skip the FIRST fsync_dir call (after shard renames) then
+    // fail the second (after the index rename — the durability fsync
+    // that follows the observable commit point).
+    let _guard = arm_fsync_dir_fault(1);
+    let outcome = save_model(&dir, &w, &PerLayerQuantization::default())
+      .expect("post-index fsync failure must NOT propagate as Err — it is a durability warning");
+    drop(_guard);
+
+    // (1) The returned outcome is the warning variant carrying the
+    // injected error.
+    let underlying = match outcome {
+      CommitOutcome::CommittedWithDurabilityWarning(e) => e,
+      CommitOutcome::Committed => {
+        panic!("expected CommittedWithDurabilityWarning, got Committed")
+      }
+    };
+    let underlying_msg = underlying.to_string();
+    assert!(
+      underlying_msg.contains("injected fsync_dir failure"),
+      "the durability warning carries the underlying io::Error: got {underlying_msg}"
+    );
+
+    // (2) The visible checkpoint loads correctly — the index rename
+    // succeeded, so `load_weights` sees the NEW weights.
+    let mut loaded = load_weights(&dir).unwrap();
+    assert_eq!(loaded.len(), 2);
+    assert!(loaded.contains_key("v.alpha.weight"));
+    assert!(loaded.contains_key("v.beta.weight"));
+    assert_eq!(
+      loaded
+        .get_mut("v.alpha.weight")
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap(),
+      vec![7.0, 8.0, 9.0]
+    );
+    assert_eq!(
+      loaded
+        .get_mut("v.beta.weight")
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap(),
+      vec![1.0]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// `save` proceeds to commit the staged config even when `save_model`
+  /// returned `CommittedWithDurabilityWarning` — the NEW `config.json`
+  /// MUST be byte-equal to the staged (cleaned/sorted) content, the OLD
+  /// `config.json` is gone, and `save`'s final return is
+  /// [`Error::DurabilityWarning`] with `committed: true`. This is the
+  /// end-to-end F6 R6 Finding-2 closure.
+  #[test]
+  fn save_post_commit_durability_warning_still_commits_config() {
+    let dir = fresh_dir("save-post-commit-warning-commits-config");
+
+    // 1. Initial save with a "before" config so we can prove the OLD
+    //    config.json is gone after the second save.
+    let mut w0: Weights = HashMap::new();
+    w0.insert("w.weight".to_string(), f32_weight(2));
+    let before_config = r#"{"model_type": "OLD", "hidden_size": 4}"#;
+    save(&dir, &w0, before_config, &PerLayerQuantization::default()).unwrap();
+    let old_cfg = std::fs::read_to_string(dir.join("config.json")).unwrap();
+    assert!(
+      old_cfg.contains("\"OLD\""),
+      "the OLD config.json was written"
+    );
+
+    // 2. Second save with a "after" config + a fsync injection that
+    //    fires AFTER the index rename inside save_model (skip=1 — the
+    //    shard fsync passes, the index fsync fails). The save MUST
+    //    still commit the config (otherwise the staged-config Drop
+    //    would delete its tempfile and we'd be left with NEW
+    //    weights+index against the OLD config).
+    let mut w1: Weights = HashMap::new();
+    w1.insert(
+      "w.weight".to_string(),
+      Array::from_slice::<f32>(&[5.0, 6.0], &(2usize,)).unwrap(),
+    );
+    let after_config = r#"{"model_type": "NEW", "hidden_size": 8}"#;
+
+    let _guard = arm_fsync_dir_fault(1);
+    let r = save(&dir, &w1, after_config, &PerLayerQuantization::default());
+    drop(_guard);
+
+    // (1) save's final return is `Err(DurabilityWarning{committed:true})`.
+    match r {
+      Err(Error::DurabilityWarning { committed, source }) => {
+        assert!(
+          committed,
+          "save's DurabilityWarning must carry committed=true"
+        );
+        assert!(
+          source.to_string().contains("injected fsync_dir failure"),
+          "the underlying io::Error must be preserved: got {source}"
+        );
+      }
+      other => panic!("expected Err(DurabilityWarning), got {other:?}"),
+    }
+
+    // (2) The NEW config.json is on disk and byte-equal to the staged
+    //    (cleaned/sorted) form of `after_config`.
+    let new_cfg = std::fs::read_to_string(dir.join("config.json")).unwrap();
+    assert!(
+      new_cfg.contains("\"NEW\""),
+      "the NEW config.json must be on disk: got {new_cfg}"
+    );
+    assert!(
+      !new_cfg.contains("\"OLD\""),
+      "the OLD config.json content must be gone: got {new_cfg}"
+    );
+    // The cleaned-and-sorted form of `after_config` (4-space indented,
+    // sorted keys, no trailing newline).
+    let expected_cfg = {
+      let v: serde_json::Value = serde_json::from_str(after_config).unwrap();
+      let obj = v.as_object().unwrap().clone();
+      let sorted: BTreeMap<String, serde_json::Value> = obj.into_iter().collect();
+      let mut buf = Vec::new();
+      let fmt = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+      let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
+      serde::Serialize::serialize(&sorted, &mut ser).unwrap();
+      String::from_utf8(buf).unwrap()
+    };
+    assert_eq!(
+      new_cfg, expected_cfg,
+      "the NEW config.json must be byte-equal to the staged (cleaned/sorted) form"
+    );
+
+    // (3) The visible weights are the NEW ones — `load_weights` loads
+    //    via the NEW index that the (warned-on) save did commit.
+    let mut loaded = load_weights(&dir).unwrap();
+    assert_eq!(
+      loaded.get_mut("w.weight").unwrap().to_vec::<f32>().unwrap(),
+      vec![5.0, 6.0]
+    );
+
+    // (4) No staged tempfile leaks behind.
+    let leftover = std::fs::read_dir(&dir)
+      .unwrap()
+      .filter_map(|e| e.ok())
+      .any(|e| {
+        e.file_name()
+          .to_string_lossy()
+          .ends_with(".tmp.safetensors")
+      });
+    assert!(!leftover, "no staged tempfile may leak");
+
+    let _ = std::fs::remove_dir_all(&dir);
   }
 }
