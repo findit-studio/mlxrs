@@ -507,3 +507,39 @@ pub fn astype(a: &Array, dtype: Dtype) -> Result<Array> {
   })?;
   Ok(out)
 }
+
+/// Bit-preserving dtype reinterpretation. Mirrors `mx.view`
+/// (`mlx/ops.cpp` — `array view(const array& a, const Dtype& dtype, ...)`)
+/// and the python `mx.core.view` binding. Unlike [`astype`] (which performs
+/// a value-preserving numeric cast), `view` keeps the underlying bit-pattern
+/// intact: when source and target dtypes are the same width, the shape is
+/// preserved and a signed/unsigned reinterpret round-trips losslessly. For
+/// different-width dtypes the last axis is rescaled to keep total byte count
+/// (mlx requires `last_axis_bytes` to be a multiple of the target dtype's
+/// element size; not exercised by mlxrs callers today but documented for
+/// parity).
+///
+/// Use this (not [`astype`]) when you need an i32 → u32 (or u32 → i32)
+/// reinterpret that preserves the sign bit as a high data bit — the AWQ
+/// `qweight` / `qzeros` shift-and-mask pipeline depends on negative i32
+/// values keeping their high bit through the cast.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.view.html).
+pub fn view(a: &Array, dtype: Dtype) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
+  check(unsafe {
+    mlxrs_sys::mlx_view(
+      &mut out.0,
+      a.0,
+      mlxrs_sys::mlx_dtype::from(dtype),
+      default_stream(),
+    )
+  })?;
+  Ok(out)
+}
