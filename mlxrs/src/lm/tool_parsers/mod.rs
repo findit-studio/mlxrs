@@ -45,6 +45,9 @@
 //! - [`crate::tokenizer::tools::ToolParser`] —
 //!   `parse(text, tools) -> Result<Vec<ToolCall>>` trait, with `name()` +
 //!   `tool_call_start()` / `tool_call_end()` markers.
+//! - [`crate::tokenizer::tools::ToolCallProcessor`] — the streaming
+//!   state-machine that detects and extracts tool calls mid-generation,
+//!   fed text chunk-by-chunk (port of `mlx-swift-lm`'s `ToolCallProcessor`).
 //! - [`crate::tokenizer::tools::parser_by_name`] — dispatcher mirroring
 //!   Python's `importlib.import_module("mlx_lm.tool_parsers.<name>")`.
 //! - [`crate::tokenizer::tools::infer_tool_parser`] —
@@ -57,5 +60,5 @@
 
 pub use crate::tokenizer::tools::{
   FunctionGemma, Gemma4, Glm47, JsonTools, KimiK2, Longcat, MinimaxM2, Mistral, Pythonic,
-  Qwen3Coder, ToolCall, ToolParser, infer_tool_parser, parser_by_name,
+  Qwen3Coder, ToolCall, ToolCallProcessor, ToolParser, infer_tool_parser, parser_by_name,
 };

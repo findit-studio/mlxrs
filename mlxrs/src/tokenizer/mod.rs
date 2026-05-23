@@ -76,8 +76,9 @@ pub use stream::infer_detokenizer_class;
 #[cfg(feature = "tokenizer-stream")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokenizer-stream")))]
 pub use stream::{DetokenizerClass, NaiveStreamingDetokenizer, StreamingDetokenizer};
-/// Tool-call parsing (`tokenizer-tools`).
+/// Tool-call parsing (`tokenizer-tools`) — the per-format parsers, the
+/// streaming [`tools::ToolCallProcessor`], and the selectors.
 #[cfg(feature = "tokenizer-tools")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokenizer-tools")))]
-pub use tools::{ToolCall, ToolParser, infer_tool_parser, parser_by_name};
+pub use tools::{ToolCall, ToolCallProcessor, ToolParser, infer_tool_parser, parser_by_name};
 pub use wrapper::{Tokenizer, no_bos_or_eos};
