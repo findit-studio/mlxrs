@@ -31,7 +31,7 @@ lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm",
 # grammar-engine compile cost; callers who need structured outputs opt in.
 llguidance           = ["lm", "dep:llguidance", "dep:toktrie_hf_tokenizers", "dep:serde_json"]
 vlm                  = ["lm", "dep:image"]
-audio                = ["lm", "dep:symphonia", "dep:cpal"]
+audio                = ["lm", "dep:symphonia", "dep:cpal", "dep:unicode-normalization"]
 unstable-ops-overload = []
 gguf                 = [] # GGUF load/save (mlx-c `mlx_io_gguf*`). OFF: mlxrs-sys does not yet link gguflib.
 
@@ -90,6 +90,12 @@ symphonia = { version = "0.6", optional = true, default-features = false, featur
 # `default-features` are already minimal (no `jack`/`asio`/wasm-bindgen
 # / audioworklet); we don't enable any of the optional backends.
 cpal = { version = "0.17", optional = true }
+# Unicode NFC composition for the TTS text frontend (BasicTextProcessor).
+# mlx-audio-swift's TTS text frontends apply NFC + lowercase + whitespace
+# collapse; std covers the latter two but NFC needs a Unicode table. The
+# `unicode-normalization` crate is the de-facto choice (used by `regex`,
+# `unicode-segmentation`, &c.); zero runtime deps.
+unicode-normalization = { version = "0.1", optional = true }
 regex = { version = "1", optional = true, default-features = false, features = ["std", "perf"] }
 # Grammar-constrained decoding backend (V6 — `lm::structured`). `default-features
 # = false` strips `rayon` (parallel mask compute — orthogonal to our single-
