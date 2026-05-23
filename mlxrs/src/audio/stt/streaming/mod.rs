@@ -10,15 +10,29 @@
 //!   trait +
 //!   [`crate::audio::stt::streaming::encoder::StreamingEncoder`] window
 //!   accumulator — mirrors `StreamingEncoder.swift`.
+//! - [`crate::audio::stt::streaming::session::StreamingInferenceSession`]
+//!   + [`crate::audio::stt::streaming::session::StreamingDecoderBackend`]
+//!   trait — orchestration, mirrors `StreamingInferenceSession.swift`.
 //! - [`crate::audio::stt::streaming::types::DelayPreset`],
 //!   [`crate::audio::stt::streaming::types::StreamingConfig`],
 //!   [`crate::audio::stt::streaming::types::TranscriptionEvent`], and
 //!   [`crate::audio::stt::streaming::types::StreamingStats`] —
 //!   value-types, mirror `StreamingTypes.swift`.
 //!
-//! A subsequent commit adds `session` (`StreamingInferenceSession` +
-//! `StreamingDecoderBackend` trait, mirroring
-//! `StreamingInferenceSession.swift`).
+//! Async-stream → sync-batch shape:
+//!
+//! The Swift reference's
+//! [`StreamingInferenceSession`][swift-session] yields
+//! [`crate::audio::stt::streaming::types::TranscriptionEvent`] values
+//! into an `AsyncStream<TranscriptionEvent>` and runs the decode pass
+//! on a detached `Task`. mlxrs's port runs the decode pass synchronously
+//! on the caller's thread and returns a `Vec<TranscriptionEvent>` from
+//! each [`crate::audio::stt::streaming::session::StreamingInferenceSession::feed_audio`]
+//! / [`crate::audio::stt::streaming::session::StreamingInferenceSession::stop`]
+//! call instead. The event sequence is byte-identical; only the
+//! delivery channel differs.
+//!
+//! [swift-session]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioSTT/Streaming/StreamingInferenceSession.swift
 //!
 //! Per the project's [no per-model arch porting][noarch] rule, mlxrs
 //! ships **no** concrete encoder / decoder implementations:
@@ -30,8 +44,10 @@
 
 pub mod encoder;
 pub mod mel_spectrogram;
+pub mod session;
 pub mod types;
 
 pub use encoder::{StreamingEncoder, StreamingEncoderBackend};
 pub use mel_spectrogram::IncrementalMelSpectrogram;
+pub use session::{StreamingDecoderBackend, StreamingInferenceSession, StreamingTokenizer};
 pub use types::{DelayPreset, StreamingConfig, StreamingStats, TranscriptionEvent};
