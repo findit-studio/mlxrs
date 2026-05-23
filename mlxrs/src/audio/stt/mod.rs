@@ -33,3 +33,6 @@ pub mod generate;
 pub mod load;
 pub mod model;
 pub mod serializers;
+/// Streaming STT — incremental encoder + orchestration. Ports
+/// `mlx-audio-swift/Sources/MLXAudioSTT/Streaming/`.
+pub mod streaming;
