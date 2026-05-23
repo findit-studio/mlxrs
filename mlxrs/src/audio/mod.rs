@@ -49,8 +49,13 @@
 //! [`audio_io.py`]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/audio_io.py
 //! [`dsp.py`]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/dsp.py
 
+pub mod codec;
 pub mod dsp;
 pub mod features;
 pub mod io;
+pub mod lid;
+pub mod load;
+pub mod sts;
 pub mod stt;
 pub mod tts;
+pub mod vad;
