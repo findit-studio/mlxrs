@@ -1107,6 +1107,586 @@ pub fn dequantize_weights(weights: Weights, cfg: &PerLayerQuantization) -> Resul
   Ok(out)
 }
 
+// ─────────────────────────── AutoAWQ / GPTQ on-load conversion ───────────────────────────
+
+/// The AutoAWQ / GPTQ on-load quantization parameters carried by the
+/// `quantization_config` block of the upstream `config.json` —
+/// mirroring the dict shape `_transform_awq_weights` consumes
+/// (`mlx-lm/mlx_lm/utils.py:83-172`) and the swift `ParoQuantConfig`
+/// reader (`mlx-swift-lm/Libraries/MLXLMCommon/ParoQuant/ParoQuantLoader.swift:24-40`).
+///
+/// Layout the upstream checkpoint emits:
+///
+/// ```json
+/// {
+///   "quantization_config": {
+///     "quant_method": "awq",
+///     "bits": 4,
+///     "group_size": 128,
+///     "zero_point": true,
+///     "version": "gemm"
+///   }
+/// }
+/// ```
+///
+/// `bits`, `group_size`, `zero_point`, `version` follow the AutoAWQ
+/// convention (`autoawq` library's `quantization_config` writer).
+/// Only `bits = 4` is supported by mlx-lm's converter
+/// (`utils.py:88-89`); other values are rejected at
+/// [`transform_awq_weights`] time. `zero_point` defaults to `true`
+/// (asymmetric, the AutoAWQ default; the python converter handles
+/// both paths — `utils.py:135-151`). `version` is interop metadata
+/// preserved from the checkpoint (e.g. `"gemm"`); the converter does
+/// not switch on it (mlx-lm consumes the same packed layout
+/// regardless), but it round-trips through [`AwqLoadConfig`] so a
+/// downstream caller can inspect it.
+///
+/// The `quant_method` discriminator (`"awq"` / `"gptq"` /
+/// `"paroquant"`) is **not** carried by this struct — the caller
+/// (loader) inspects it before deciding to invoke
+/// [`transform_awq_weights`] (`utils.py:370-391`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct AwqLoadConfig {
+  /// Bits per weight. mlx-lm rejects anything other than `4`
+  /// (`utils.py:88-89`).
+  #[serde(default = "AwqLoadConfig::default_bits")]
+  pub bits: u32,
+  /// Elements per quantization group. AutoAWQ default is `128`
+  /// (`utils.py:90`).
+  #[serde(default = "AwqLoadConfig::default_group_size")]
+  pub group_size: u32,
+  /// `true` = asymmetric (per-group `qzeros` carried alongside
+  /// `scales`); `false` = symmetric (implicit `2^(bits-1)` zero,
+  /// `utils.py:149-151`). AutoAWQ default is `true`.
+  #[serde(default = "AwqLoadConfig::default_zero_point")]
+  pub zero_point: bool,
+  /// AutoAWQ checkpoint version tag (`"gemm"` / `"gemv"` / ...). Not
+  /// consumed by the converter; preserved for caller inspection.
+  #[serde(default)]
+  pub version: String,
+}
+
+impl AwqLoadConfig {
+  fn default_bits() -> u32 {
+    4
+  }
+  fn default_group_size() -> u32 {
+    128
+  }
+  fn default_zero_point() -> bool {
+    true
+  }
+}
+
+impl Default for AwqLoadConfig {
+  /// mlx-lm / AutoAWQ defaults (`utils.py:87,90`,
+  /// `mlx-swift-lm/.../ParoQuantLoader.swift:36-39`).
+  fn default() -> Self {
+    Self {
+      bits: Self::default_bits(),
+      group_size: Self::default_group_size(),
+      zero_point: Self::default_zero_point(),
+      version: String::new(),
+    }
+  }
+}
+
+/// AutoAWQ packing constants — fixed at `bits = 4` (the only width
+/// mlx-lm's on-load converter accepts, `utils.py:88-89`). Splitting
+/// the constants out keeps the `transform_awq_weights` body focused
+/// on the layout logic rather than the magic numbers.
+const AWQ_BITS: u32 = 4;
+/// `pack_factor = 32 // bits` (`utils.py:74,115`) — 8 nibbles per `uint32`.
+const AWQ_PACK_FACTOR: usize = 32 / (AWQ_BITS as usize);
+/// `mask = (1 << bits) - 1` (`utils.py:77`) — the nibble extractor.
+const AWQ_NIBBLE_MASK: u32 = (1 << AWQ_BITS) - 1;
+/// AutoAWQ's per-nibble bit positions inside each packed `uint32`,
+/// `[0, 4, 1, 5, 2, 6, 3, 7] * bits` (`utils.py:78`).
+///
+/// AutoAWQ stores the 8 nibbles of each output element in the scrambled
+/// order `[0, 2, 4, 6, 1, 3, 5, 7]` (the forward "AWQ reorder").
+/// Reading them out via this shift table — the inverse permutation
+/// `[0, 4, 1, 5, 2, 6, 3, 7]` scaled by `bits` — places each nibble back
+/// at its natural sequential position. So the single `(qweight >> shifts)
+/// & mask` step in [`unpack_awq_weights`] both unpacks AND undoes the
+/// AWQ scramble in one pass — no follow-up `take`/`gather` is needed.
+/// (The swift `ParoQuantLoader.unpackAndReorder` does it in two steps
+/// — unpack with `arange(8) * bits`, then `take(inverseReorder)` — but
+/// the algebraic result is identical.)
+// Spelled-out vs computed: `[0,4,1,5,2,6,3,7].map(|i| i * AWQ_BITS)`,
+// inlined so clippy's `identity_op` doesn't fire on the `0 * X` term.
+// AWQ_BITS = 4, so `i * 4` for the inverse-permutation indices.
+const AWQ_SHIFTS: [u32; 8] = [0, 16, 4, 20, 8, 24, 12, 28];
+// Compile-time assertion that the spelled-out table tracks `AWQ_BITS`.
+// If `AWQ_BITS` ever changes from 4, this will fail to compile and force
+// the table to be regenerated.
+const _: () = assert!(AWQ_BITS == 4 && AWQ_SHIFTS[1] == 4 * AWQ_BITS);
+
+/// Unpack an AutoAWQ-packed 4-bit `qweight` (`uint32`, 8 nibbles per
+/// element) into the dense natural-order layout — port of
+/// `_unpack_awq_weights` (`mlx-lm/mlx_lm/utils.py:72-82`).
+///
+/// `qweight` must be a 2-D `uint32` array of shape `[rows, packed_cols]`.
+/// Output is the same dtype, shape `[rows, packed_cols * 8]`, with each
+/// position holding the 4-bit nibble in `[0, 15]`. The output dtype
+/// preserves the input's (`uint32`) — mlx-lm leaves the cast to the
+/// caller (`utils.py:79-80`); `transform_awq_weights` casts to `uint32`
+/// explicitly before its repack.
+///
+/// The shift table [`AWQ_SHIFTS`] folds the AutoAWQ packing-reorder
+/// into the unpack: a single `(qweight >> shifts) & mask` over the
+/// scaled inverse permutation yields the nibbles in their natural
+/// sequential order. See [`AWQ_SHIFTS`] for the algebra and the
+/// equivalent two-step swift form.
+///
+/// Mirrors the mlx-lm 2-D contract verbatim; non-2D inputs are a
+/// [`Error::ShapeMismatch`] (the python version would `ValueError`
+/// during the trailing `.reshape(out_features, in_features)`).
+pub fn unpack_awq_weights(qweight: &Array) -> Result<Array> {
+  let shape = qweight.shape();
+  if shape.len() != 2 {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "unpack_awq_weights: expected 2-D qweight `[rows, packed_cols]`, got shape {shape:?}"
+      ),
+    });
+  }
+  let dtype = qweight.dtype()?;
+  if dtype != Dtype::U32 {
+    return Err(Error::Backend {
+      message: format!(
+        "unpack_awq_weights: AutoAWQ stores `qweight` as `uint32`-packed nibbles \
+         (`utils.py:72-82`); got dtype {dtype:?}"
+      ),
+    });
+  }
+  let rows = shape[0];
+  let packed_cols = shape[1];
+  let cols = packed_cols
+    .checked_mul(AWQ_PACK_FACTOR)
+    .ok_or_else(|| Error::ShapeMismatch {
+      message: format!(
+        "unpack_awq_weights: unpacked col count `packed_cols * 8` overflows usize \
+         (packed_cols={packed_cols})"
+      ),
+    })?;
+
+  // Build the shift vector + mask scalar as broadcastable inputs. mlx-c
+  // promotes mixed-width integer rhs to the lhs dtype, so we hand it
+  // u32 directly — no astype dance needed.
+  let shifts = Array::from_slice::<u32>(&AWQ_SHIFTS, &(AWQ_SHIFTS.len(),))?;
+  let mask = Array::from_slice::<u32>(&[AWQ_NIBBLE_MASK], &(1usize,))?;
+  // `qweight[..., None]` → shape `[rows, packed_cols, 1]`; broadcast
+  // against `shifts` of shape `[8]` yields `[rows, packed_cols, 8]`.
+  let expanded = ops::shape::expand_dims_axes(qweight, &[2])?;
+  let shifted = ops::arithmetic::right_shift(&expanded, &shifts)?;
+  let nibbles = ops::arithmetic::bitwise_and(&shifted, &mask)?;
+  // Collapse the trailing pair `[packed_cols, 8]` → `[cols]`.
+  ops::shape::reshape(&nibbles, &(rows, cols))
+}
+
+/// Resolve every layer's transformed `model_dtype` consistently
+/// (`utils.py:156,163-165`): a single floating dtype shared by all the
+/// post-transform floating weights, so heterogeneous-precision
+/// checkpoints settle onto one type before the MLX quantize pass.
+///
+/// mlx-lm takes the LAST iterated layer's `scales.dtype` as the target
+/// (`utils.py:156` overwrites `model_dtype` each iteration; the
+/// `dict.keys()` order is insertion order, so it's the last inserted
+/// `.qweight` layer). mlxrs honors the same contract: we pick the dtype
+/// of the `scales` for the lexicographically last `.qweight` prefix —
+/// the result is stable across runs (HashMap iteration order is not),
+/// and matches the python ref's "last-wins" intent.
+fn resolve_awq_model_dtype(
+  weights: &Weights,
+  qweight_prefixes: &[String],
+) -> Result<Option<Dtype>> {
+  let Some(last_prefix) = qweight_prefixes.iter().max() else {
+    return Ok(None);
+  };
+  let scales_key = format!("{last_prefix}.scales");
+  let scales = weights.get(&scales_key).ok_or_else(|| Error::Backend {
+    message: format!(
+      "transform_awq_weights: layer `{last_prefix}.qweight` is missing its companion \
+         `{scales_key}` (AutoAWQ writes `.qweight` / `.scales` / `.qzeros` as a triple); \
+         refusing to silently drop the layer"
+    ),
+  })?;
+  Ok(Some(scales.dtype()?))
+}
+
+/// `true` for `F16` / `F32` / `F64` / `BF16` — the mlx-python
+/// `mx.issubdtype(dtype, mx.floating)` set
+/// (`utils.py:164`).
+fn is_floating(d: Dtype) -> bool {
+  matches!(d, Dtype::F16 | Dtype::F32 | Dtype::F64 | Dtype::BF16)
+}
+
+/// Convert an AutoAWQ / GPTQ on-disk weight map into MLX's quantized-triple
+/// layout — port of `_transform_awq_weights`
+/// (`mlx-lm/mlx_lm/utils.py:83-172`).
+///
+/// For every `<prefix>.qweight` in `weights`:
+///
+/// 1. **Unpack + reorder** `qweight` via [`unpack_awq_weights`]
+///    (`utils.py:121`). The unpack folds the AutoAWQ scramble into the
+///    shift table, so the result is the dense nibble matrix in natural
+///    order. Shape goes `[in_features, packed_out] → [in_features, out_features]`.
+/// 2. **Transpose** `[in_features, out_features] → [out_features, in_features]`
+///    (mlx stores `Linear`'s weight as `[out, in]`, `utils.py:122-123`).
+/// 3. **Re-pack** with MLX's sequential shift table `arange(pack_factor) * bits`
+///    (`utils.py:128-131`); output is `[out_features, in_features // pack_factor]`,
+///    dtype `uint32` — the exact `mlx.core.QuantizedLinear` layout.
+/// 4. **`scales`**: AutoAWQ stores `[n_groups, out_features]`; transpose to
+///    `[out_features, n_groups]` and materialise via `contiguous`
+///    (`utils.py:133`).
+/// 5. **`biases`**: from `qzeros` (asymmetric, `utils.py:136-147`) or
+///    implicit-zero (symmetric, `utils.py:148-151`). MLX dequantization is
+///    `w * scale + bias`; AWQ's is `(w - zero) * scale`. The algebra makes
+///    `bias = -zero * scale`.
+/// 6. **Floating-dtype unification** (`utils.py:163-165`): every transformed
+///    floating weight is cast to the resolved `model_dtype` (the last
+///    iterated layer's `scales.dtype` — see [`resolve_awq_model_dtype`]).
+///
+/// Returns the converted [`Weights`] map plus a [`PerLayerQuantization`]
+/// carrying the resolved `(group_size, bits)` MLX quant params
+/// (`utils.py:167-170`). Non-AWQ keys (anything that is not
+/// `.qweight` / `.qzeros` / `.scales`) pass through verbatim
+/// (`utils.py:158-161`); a `.g_idx` key (non-contiguous GPTQ group
+/// indices) is rejected as [`Error::Backend`] (`utils.py:95-100`).
+///
+/// `config.bits` must be `4`; mlx-lm rejects other widths
+/// (`utils.py:88-89`). The caller (loader) is responsible for routing
+/// only AWQ / GPTQ checkpoints into this function — the `quant_method`
+/// discriminator is read at the loader level (`utils.py:370-391`), not
+/// here.
+pub fn transform_awq_weights(
+  weights: Weights,
+  config: &AwqLoadConfig,
+) -> Result<(Weights, PerLayerQuantization)> {
+  // Faithful to mlx-lm's `if bits != 4: raise ValueError` (`utils.py:88`).
+  if config.bits != AWQ_BITS {
+    return Err(Error::Backend {
+      message: format!(
+        "transform_awq_weights: only bits=4 is supported for AutoAWQ/GPTQ models \
+         (`mlx-lm/mlx_lm/utils.py:88-89`); got bits={}",
+        config.bits
+      ),
+    });
+  }
+  let group_size = config.group_size;
+  let group_size_i32 = i32::try_from(group_size).map_err(|_| Error::ShapeMismatch {
+    message: format!("transform_awq_weights: group_size {group_size} exceeds i32::MAX"),
+  })?;
+
+  // Reject GPTQ `g_idx` upfront — `utils.py:95-100`. mlxrs's port does not
+  // implement the non-contiguous-group reorder path; the caller must
+  // re-quantize via `mlx_lm.convert` or pick a model without `g_idx`.
+  for key in weights.keys() {
+    if key.ends_with(".g_idx") {
+      return Err(Error::Backend {
+        message: format!(
+          "transform_awq_weights: found `{key}` in weights. Models with non-contiguous \
+           group indices (`g_idx`) are not supported by mlx-lm's AutoAWQ on-load \
+           converter (`mlx-lm/mlx_lm/utils.py:95-100`). Please use a model without `g_idx` \
+           or re-quantize the model via `mlx_lm.convert`."
+        ),
+      });
+    }
+  }
+
+  // Collect every prefix of a `.qweight` key (sorted, for the lex-last
+  // `model_dtype` resolution + deterministic iteration in tests).
+  let mut qweight_prefixes: Vec<String> = weights
+    .keys()
+    .filter_map(|k| k.strip_suffix(".qweight").map(str::to_string))
+    .collect();
+  qweight_prefixes.sort();
+
+  let model_dtype = resolve_awq_model_dtype(&weights, &qweight_prefixes)?;
+
+  // Sibling validation pass (deferred until after we know every prefix):
+  // refuse on-disk shapes that mlx-lm's converter would NameError /
+  // KeyError on, but surface a clear message instead of a panic. AutoAWQ
+  // always writes `.scales` alongside `.qweight` (`autoawq` source; the
+  // python converter assumes it, `utils.py:109`); `.qzeros` is optional
+  // (symmetric mode falls back to `2^(bits-1)`, `utils.py:148-151`).
+  for prefix in &qweight_prefixes {
+    let qweight_key = format!("{prefix}.qweight");
+    let scales_key = format!("{prefix}.scales");
+    let Some(qweight) = weights.get(&qweight_key) else {
+      // Should be unreachable (we built the prefix list FROM the keys),
+      // but guard defensively.
+      return Err(Error::Backend {
+        message: format!("transform_awq_weights: missing `{qweight_key}` after prefix scan"),
+      });
+    };
+    let Some(scales) = weights.get(&scales_key) else {
+      return Err(Error::Backend {
+        message: format!(
+          "transform_awq_weights: layer `{qweight_key}` is missing its companion `{scales_key}` \
+           (AutoAWQ writes `.qweight` / `.scales` / `.qzeros` as a triple); refusing to silently \
+           drop the layer"
+        ),
+      });
+    };
+    // Shape validation: `qweight: [in_features, packed_out]` /
+    // `scales: [n_groups, out_features]`. The two must agree on
+    // out_features (post-pack-factor), and `in_features` must be a
+    // multiple of `group_size` (`utils.py:118` `n_groups = in_features //
+    // group_size`).
+    let q_shape = qweight.shape();
+    let s_shape = scales.shape();
+    if q_shape.len() != 2 {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "transform_awq_weights: layer `{qweight_key}`: qweight must be 2-D \
+           `[in_features, packed_out]`, got shape {q_shape:?}"
+        ),
+      });
+    }
+    if s_shape.len() != 2 {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "transform_awq_weights: layer `{scales_key}`: scales must be 2-D \
+           `[n_groups, out_features]`, got shape {s_shape:?}"
+        ),
+      });
+    }
+    let in_features = q_shape[0];
+    let packed_out = q_shape[1];
+    let out_features =
+      packed_out
+        .checked_mul(AWQ_PACK_FACTOR)
+        .ok_or_else(|| Error::ShapeMismatch {
+          message: format!(
+            "transform_awq_weights: layer `{qweight_key}`: out_features overflows usize \
+           (packed_out={packed_out})"
+          ),
+        })?;
+    if group_size as usize == 0 || in_features % (group_size as usize) != 0 {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "transform_awq_weights: layer `{qweight_key}`: in_features {in_features} is not a \
+           multiple of group_size {group_size} (`utils.py:118`: n_groups = in_features // group_size)"
+        ),
+      });
+    }
+    let n_groups = in_features / (group_size as usize);
+    if s_shape[0] != n_groups || s_shape[1] != out_features {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "transform_awq_weights: layer `{prefix}`: scales shape {s_shape:?} does not match \
+           the expected `[n_groups={n_groups}, out_features={out_features}]` derived from \
+           qweight shape {q_shape:?} with group_size={group_size}"
+        ),
+      });
+    }
+    let qzeros_key = format!("{prefix}.qzeros");
+    if let Some(qzeros) = weights.get(&qzeros_key) {
+      let z_shape = qzeros.shape();
+      if z_shape.len() != 2 || z_shape[0] != n_groups || z_shape[1] != packed_out {
+        return Err(Error::ShapeMismatch {
+          message: format!(
+            "transform_awq_weights: layer `{qzeros_key}`: qzeros shape {z_shape:?} does not match \
+             the expected `[n_groups={n_groups}, packed_out={packed_out}]` derived from qweight \
+             shape {q_shape:?} with group_size={group_size}"
+          ),
+        });
+      }
+    }
+  }
+
+  // Now do the conversion. Move every key out of the input map exactly
+  // once — non-AWQ keys flow straight through.
+  let mut new_weights: Weights = HashMap::with_capacity(weights.len());
+  // First, pull out every AWQ triple component so the pass-through walk
+  // can move the remainder verbatim. Mirrors mlx-lm's
+  // `if key.endswith(".qweight"): ... elif not any(key.endswith(...)): ...`
+  // structure (`utils.py:102-161`).
+  // Triple: (qweight, scales, qzeros) — `qzeros` is optional (symmetric mode).
+  type AwqTriple = (Option<Array>, Option<Array>, Option<Array>);
+  let mut awq_components: HashMap<String, AwqTriple> =
+    HashMap::with_capacity(qweight_prefixes.len());
+  let mut remainder: Weights = HashMap::with_capacity(weights.len());
+  for (key, arr) in weights {
+    if let Some(prefix) = key.strip_suffix(".qweight") {
+      awq_components
+        .entry(prefix.to_string())
+        .or_insert((None, None, None))
+        .0 = Some(arr);
+    } else if let Some(prefix) = key.strip_suffix(".scales") {
+      if qweight_prefixes.binary_search(&prefix.to_string()).is_ok() {
+        awq_components
+          .entry(prefix.to_string())
+          .or_insert((None, None, None))
+          .1 = Some(arr);
+      } else {
+        // Orphan `.scales` not tied to an AWQ triple — pass through.
+        remainder.insert(key, arr);
+      }
+    } else if let Some(prefix) = key.strip_suffix(".qzeros") {
+      if qweight_prefixes.binary_search(&prefix.to_string()).is_ok() {
+        awq_components
+          .entry(prefix.to_string())
+          .or_insert((None, None, None))
+          .2 = Some(arr);
+      } else {
+        // Orphan `.qzeros` not tied to an AWQ triple — pass through.
+        remainder.insert(key, arr);
+      }
+    } else {
+      remainder.insert(key, arr);
+    }
+  }
+
+  // Convert each prefix in lexicographic order (deterministic for tests
+  // and shaves no observable behavior — mlx-lm's order is HashMap
+  // insertion order, which is unspecified).
+  for prefix in &qweight_prefixes {
+    let (qw_opt, sc_opt, qz_opt) = awq_components
+      .remove(prefix)
+      .ok_or_else(|| Error::Backend {
+        message: format!(
+          "transform_awq_weights: layer `{prefix}` lost its components mid-pipeline"
+        ),
+      })?;
+    let qweight = qw_opt.ok_or_else(|| Error::Backend {
+      message: format!("transform_awq_weights: layer `{prefix}.qweight` disappeared mid-pipeline"),
+    })?;
+    let scales = sc_opt.ok_or_else(|| Error::Backend {
+      message: format!("transform_awq_weights: layer `{prefix}.scales` disappeared mid-pipeline"),
+    })?;
+
+    let q_shape = qweight.shape();
+    let in_features = q_shape[0];
+    let packed_out = q_shape[1];
+    let out_features = packed_out * AWQ_PACK_FACTOR; // checked above.
+    let packed_in = in_features / AWQ_PACK_FACTOR;
+
+    // 1. Unpack + reorder `qweight` → `[in_features, out_features]` u32.
+    let unpacked = unpack_awq_weights(&qweight)?;
+    // 2. Transpose → `[out_features, in_features]`.
+    let unpacked_t = ops::shape::transpose(&unpacked)?;
+    // 3. Re-pack via MLX's sequential shift table.
+    //    reshape → `[out_features, packed_in, pack_factor]`.
+    let reshaped = ops::shape::reshape(&unpacked_t, &(out_features, packed_in, AWQ_PACK_FACTOR))?;
+    // Build the mlx repack shifts: arange(pack_factor) * bits as u32 vec.
+    // `utils.py:128` does `mx.arange(pack_factor) * bits`.
+    let pack_shifts_data: Vec<u32> = (0..AWQ_PACK_FACTOR as u32).map(|i| i * AWQ_BITS).collect();
+    let pack_shifts = Array::from_slice::<u32>(&pack_shifts_data, &(pack_shifts_data.len(),))?;
+    // Force u32 dtype on the reshaped nibble matrix so `<<` doesn't surprise
+    // us (it's already u32 from `unpack_awq_weights`, but be explicit —
+    // matches `utils.py:130` `repacked.astype(mx.uint32)`).
+    let reshaped_u32 = ops::misc::astype(&reshaped, Dtype::U32)?;
+    let shifted = ops::arithmetic::left_shift(&reshaped_u32, &pack_shifts)?;
+    // sum_axes axis=-1 (the pack_factor axis) → `[out_features, packed_in]` u32.
+    let repacked = ops::reduction::sum_axes(&shifted, &[2_i32], false)?;
+    // mlx-lm explicitly casts back to u32 in case the `sum` promoted
+    // (`utils.py:131`). On mlx the reduction keeps int dtype, but be
+    // safe + match the python.
+    let new_weight = ops::misc::astype(&repacked, Dtype::U32)?;
+
+    // 4. Scales: transpose `[n_groups, out_features] → [out_features, n_groups]`
+    //    then materialize via contiguous (`utils.py:133`). Keep dtype.
+    let scales_t = ops::shape::transpose(&scales)?;
+    let scales_c = ops::shape::contiguous(&scales_t, false)?;
+
+    // 5. Biases.
+    let scales_dtype = scales.dtype()?;
+    let biases = if config.zero_point {
+      match qz_opt {
+        Some(qzeros) => {
+          // 5a. Unpack zeros, transpose to `[out_features, n_groups]`.
+          let unpacked_zeros = unpack_awq_weights(&qzeros)?;
+          let unpacked_zeros_t = ops::shape::transpose(&unpacked_zeros)?;
+          // 5b. Promote to f32 for the multiply, then cast back. mlx-lm
+          //     does `unpacked_zeros.astype(mx.float32) * scales`
+          //     (`utils.py:147`) — note `scales` is the post-transpose
+          //     contiguous one.
+          let zeros_f32 = ops::misc::astype(&unpacked_zeros_t, Dtype::F32)?;
+          let scales_f32 = ops::misc::astype(&scales_c, Dtype::F32)?;
+          let prod = ops::arithmetic::multiply(&zeros_f32, &scales_f32)?;
+          let neg = ops::arithmetic::negative(&prod)?;
+          // Cast to scales dtype (matches `utils.py:155` /
+          // `biases.astype(scales.dtype)`).
+          ops::misc::astype(&neg, scales_dtype)?
+        }
+        None => {
+          // Asymmetric requested but no qzeros on disk — mlx-lm
+          // `utils.py:136` checks `qzeros_key in weights` so the python
+          // ref silently falls through to the symmetric path. Mirror
+          // that: zero_point=true means "use qzeros if present, else
+          // implicit zero".
+          symmetric_biases(&scales_c, scales_dtype)?
+        }
+      }
+    } else {
+      // 5c. Symmetric: implicit zero `2^(bits-1)` (`utils.py:149-151`).
+      symmetric_biases(&scales_c, scales_dtype)?
+    };
+
+    new_weights.insert(format!("{prefix}.weight"), new_weight);
+    new_weights.insert(format!("{prefix}.scales"), scales_c);
+    new_weights.insert(format!("{prefix}.biases"), biases);
+  }
+
+  // Pass-through pass for non-AWQ keys (`utils.py:158-161`). After the
+  // AWQ pass, apply the floating-dtype unification (`utils.py:163-165`)
+  // to every floating weight — but only when we resolved a model_dtype
+  // (i.e. at least one AWQ triple was converted; otherwise this is a
+  // no-op input and there's no target dtype to enforce).
+  for (key, arr) in remainder {
+    new_weights.insert(key, arr);
+  }
+  if let Some(target) = model_dtype {
+    let keys: Vec<String> = new_weights.keys().cloned().collect();
+    for key in keys {
+      let arr = new_weights
+        .get(&key)
+        .expect("key just enumerated from new_weights");
+      let d = arr.dtype()?;
+      if is_floating(d) && d != target {
+        let cast = ops::misc::astype(arr, target)?;
+        new_weights.insert(key, cast);
+      }
+    }
+  }
+
+  let mlx_quantization = PerLayerQuantization::from_global(Quantization {
+    group_size: group_size_i32,
+    bits: i32::try_from(config.bits).map_err(|_| Error::ShapeMismatch {
+      message: format!(
+        "transform_awq_weights: bits {} exceeds i32::MAX",
+        config.bits
+      ),
+    })?,
+    mode: QuantMode::Affine,
+  });
+
+  Ok((new_weights, mlx_quantization))
+}
+
+/// Build the symmetric-quantization biases array for one layer
+/// (`mlx-lm/mlx_lm/utils.py:149-151`):
+///
+/// ```text
+/// biases = -2^(bits-1) * scales   (cast to scales.dtype)
+/// ```
+fn symmetric_biases(scales_c: &Array, scales_dtype: Dtype) -> Result<Array> {
+  let zero_point = (1u32 << (AWQ_BITS - 1)) as f32; // 8.0 for bits=4
+  // `scales * -zero_point` via `multiply` + `full_like` (avoids needing a
+  // scalar broadcast helper — `full_like(scales_c, -zero_point)` matches
+  // scales dtype shape exactly).
+  let factor = ops::misc::full_like(scales_c, -zero_point)?;
+  let biases = ops::arithmetic::multiply(scales_c, &factor)?;
+  if biases.dtype()? != scales_dtype {
+    ops::misc::astype(&biases, scales_dtype)
+  } else {
+    Ok(biases)
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -2157,5 +2737,525 @@ mod tests {
       vec![0.5_f32; n_cols],
       "`.biases` data must be passed through verbatim"
     );
+  }
+
+  // ──────────────── AutoAWQ on-load conversion ────────────────
+
+  /// `0xFFFF` packed at the AWQ bit positions for `[0xF, 0, 0xF, 0, 0xF, 0, 0xF, 0]`.
+  /// See [`AWQ_SHIFTS`] for the bit-layout algebra. Verifying this exact pattern
+  /// pins the inverse-permutation step and catches a swap to `[0..8] * bits`
+  /// (the swift `unpackAndReorder` form without the `take` step).
+  #[test]
+  fn unpack_awq_weights_single_int32_gives_8_nibbles() {
+    // `0xFFFF` = `0xF | (0xF << 4) | (0xF << 8) | (0xF << 12)` — four 0xF
+    // nibbles at AWQ shift positions [0, 4, 8, 12] = logical positions
+    // [0, 2, 4, 6] (even). The shift table places them at output positions
+    // 0, 2, 4, 6; the zero nibbles at AWQ positions [16, 20, 24, 28] land
+    // at output positions 1, 3, 5, 7.
+    let packed = Array::from_slice::<u32>(&[0xFFFF_u32], &(1usize, 1)).unwrap();
+    let mut unpacked = unpack_awq_weights(&packed).unwrap();
+    assert_eq!(unpacked.shape(), vec![1, 8]);
+    assert_eq!(unpacked.dtype().unwrap(), Dtype::U32);
+    assert_eq!(
+      unpacked.to_vec::<u32>().unwrap(),
+      vec![0xF, 0, 0xF, 0, 0xF, 0, 0xF, 0]
+    );
+  }
+
+  /// Verify the inverse permutation: packing nibbles `[0, 1, 2, 3, 4, 5, 6, 7]`
+  /// at AWQ bit positions produces an int32 that unpacks to that natural order.
+  /// This is the load-bearing assertion — if the shift table were sequential
+  /// (`[0..8] * bits`) the output would be `[0, 2, 4, 6, 1, 3, 5, 7]` (the
+  /// AWQ-native scrambled order).
+  #[test]
+  fn unpack_awq_weights_reverses_awq_scramble() {
+    // logical-pos → bit-pos: [0→0, 1→16, 2→4, 3→20, 4→8, 5→24, 6→12, 7→28].
+    // The 0-nibble at bit 0 contributes nothing — drop the explicit `0_u32 |`
+    // to avoid clippy's `identity_op` lint.
+    let packed_val: u32 =
+      (1_u32 << 16) | (2 << 4) | (3 << 20) | (4 << 8) | (5 << 24) | (6 << 12) | (7 << 28);
+    assert_eq!(packed_val, 0x7531_6420);
+    let packed = Array::from_slice::<u32>(&[packed_val], &(1usize, 1)).unwrap();
+    let mut unpacked = unpack_awq_weights(&packed).unwrap();
+    assert_eq!(unpacked.shape(), vec![1, 8]);
+    assert_eq!(
+      unpacked.to_vec::<u32>().unwrap(),
+      vec![0, 1, 2, 3, 4, 5, 6, 7]
+    );
+  }
+
+  /// 2-D `[rows, packed_cols]` qweight → `[rows, packed_cols * 8]`. Mirrors
+  /// the python ref's strict 2-D contract (`utils.py:75` `out_features,
+  /// packed_in = qweight.shape`).
+  #[test]
+  fn unpack_awq_weights_preserves_row_count_expands_cols_8x() {
+    // 3 rows × 2 packed_cols = 6 int32. Use all zeros (the only shape we're
+    // checking here).
+    let packed = Array::from_slice::<u32>(&[0u32; 6], &(3usize, 2)).unwrap();
+    let mut unpacked = unpack_awq_weights(&packed).unwrap();
+    assert_eq!(unpacked.shape(), vec![3, 16]);
+    assert_eq!(unpacked.to_vec::<u32>().unwrap(), vec![0u32; 48]);
+  }
+
+  /// All-zero packed input → all-zero unpacked output of correct shape.
+  #[test]
+  fn unpack_awq_weights_handles_zero_input() {
+    let packed = Array::from_slice::<u32>(&[0u32, 0, 0, 0], &(2usize, 2)).unwrap();
+    let mut unpacked = unpack_awq_weights(&packed).unwrap();
+    assert_eq!(unpacked.shape(), vec![2, 16]);
+    assert_eq!(unpacked.to_vec::<u32>().unwrap(), vec![0u32; 32]);
+  }
+
+  /// 1-D / 3-D / 0-D inputs are rejected with a clear shape error. Mirrors the
+  /// python ref's strict 2-D contract (`utils.py:75`).
+  #[test]
+  fn unpack_awq_weights_rejects_non_2d() {
+    let r1 = Array::from_slice::<u32>(&[0u32; 4], &(4usize,)).unwrap();
+    let err = unpack_awq_weights(&r1).unwrap_err();
+    assert!(
+      matches!(err, Error::ShapeMismatch { .. }),
+      "1-D should be ShapeMismatch, got {err:?}"
+    );
+    let r3 = Array::from_slice::<u32>(&[0u32; 8], &(2usize, 2, 2)).unwrap();
+    assert!(matches!(
+      unpack_awq_weights(&r3).unwrap_err(),
+      Error::ShapeMismatch { .. }
+    ));
+  }
+
+  /// Non-`u32` dtype is rejected (AutoAWQ's `qweight` is always `uint32`-packed;
+  /// any other dtype is a layout mismatch the caller should fix upstream).
+  #[test]
+  fn unpack_awq_weights_rejects_non_u32_dtype() {
+    let r = Array::from_slice::<i32>(&[0i32; 4], &(2usize, 2)).unwrap();
+    let err = unpack_awq_weights(&r).unwrap_err();
+    assert!(
+      matches!(err, Error::Backend { .. }),
+      "i32 dtype should be Backend, got {err:?}"
+    );
+  }
+
+  // ──────────────── transform_awq_weights ────────────────
+
+  /// Build a 1-element AWQ qweight (`[1, 1]` u32) whose 8 nibbles, in logical
+  /// order, equal `nibbles`.
+  fn awq_pack_one_row(nibbles: [u32; 8]) -> u32 {
+    let mut packed = 0u32;
+    for (k, &n) in nibbles.iter().enumerate() {
+      packed |= (n & 0xF) << AWQ_SHIFTS[k];
+    }
+    packed
+  }
+
+  /// Compute the AutoAWQ-dequantize value for a single nibble:
+  /// `(nibble - zero) * scale` (`utils.py:144-147` comment).
+  fn awq_dequant(nibble: u32, zero: u32, scale: f32) -> f32 {
+    (nibble as i32 - zero as i32) as f32 * scale
+  }
+
+  /// Compute the MLX-affine-dequantize value for a single nibble:
+  /// `nibble * scale + bias` (`mlx/ops.cpp` affine_dequantize convention).
+  fn mlx_dequant(nibble: u32, scale: f32, bias: f32) -> f32 {
+    nibble as f32 * scale + bias
+  }
+
+  /// End-to-end round-trip: pick known AWQ qweight/qzeros/scales, run
+  /// `transform_awq_weights`, then verify that re-dequantizing the MLX-format
+  /// output (via the literal `nibble * scale + bias`) matches the original
+  /// AWQ-format dequant (`(nibble - zero) * scale`) at every output position.
+  /// This is the load-bearing semantic guarantee of the converter.
+  #[test]
+  fn transform_awq_weights_round_trips_known_fixture() {
+    // in_features = 8, out_features = 8, group_size = 4, bits = 4.
+    // → packed_out = 1, packed_in = 2, n_groups = 2.
+    // qweight shape: [in_features, packed_out] = [8, 1]
+    // scales  shape: [n_groups,    out_features] = [2, 8]
+    // qzeros  shape: [n_groups,    packed_out] = [2, 1]
+    let in_features = 8usize;
+    let out_features = 8usize;
+    let group_size = 4u32;
+    let n_groups = 2usize;
+
+    // Choose distinct nibbles per (in, out) so we can verify the transpose.
+    // unpacked_awq[in, out] = ((in + 1) * 3 + out) % 16
+    let awq_unpacked: Vec<Vec<u32>> = (0..in_features)
+      .map(|i| {
+        (0..out_features)
+          .map(|o| (((i + 1) * 3 + o) % 16) as u32)
+          .collect()
+      })
+      .collect();
+    // Pack each row's 8 nibbles into one u32 → flat [in_features] u32 buffer.
+    let qweight_data: Vec<u32> = (0..in_features)
+      .map(|i| {
+        let row: [u32; 8] = awq_unpacked[i].to_vec().try_into().unwrap();
+        awq_pack_one_row(row)
+      })
+      .collect();
+    let qweight = Array::from_slice::<u32>(&qweight_data, &(in_features, 1)).unwrap();
+
+    // qzeros: per (group, out). Choose nibble = (group + out) % 16.
+    let qzero_unpacked: Vec<Vec<u32>> = (0..n_groups)
+      .map(|g| (0..out_features).map(|o| ((g + o) % 16) as u32).collect())
+      .collect();
+    let qzeros_data: Vec<u32> = (0..n_groups)
+      .map(|g| {
+        let row: [u32; 8] = qzero_unpacked[g].to_vec().try_into().unwrap();
+        awq_pack_one_row(row)
+      })
+      .collect();
+    let qzeros = Array::from_slice::<u32>(&qzeros_data, &(n_groups, 1)).unwrap();
+
+    // scales: per (group, out). Distinct positive floats.
+    let scales_data: Vec<f32> = (0..n_groups * out_features)
+      .map(|i| 0.1_f32 * (i as f32 + 1.0))
+      .collect();
+    let scales = Array::from_slice::<f32>(&scales_data, &(n_groups, out_features)).unwrap();
+
+    let mut weights: Weights = HashMap::new();
+    weights.insert("layer.qweight".to_string(), qweight);
+    weights.insert("layer.qzeros".to_string(), qzeros);
+    weights.insert("layer.scales".to_string(), scales);
+
+    let config = AwqLoadConfig {
+      bits: 4,
+      group_size,
+      zero_point: true,
+      version: "gemm".into(),
+    };
+    let (out, plq) = transform_awq_weights(weights, &config).expect("transform");
+
+    // PerLayerQuantization carries the resolved (group_size=4, bits=4, affine).
+    let g = plq.quantization.expect("global quant");
+    assert_eq!(g.group_size, group_size as i32);
+    assert_eq!(g.bits, 4);
+    assert_eq!(g.mode, QuantMode::Affine);
+
+    // Output keys: `layer.weight` (u32 [out, packed_in]),
+    //              `layer.scales` (f32 [out, n_groups]),
+    //              `layer.biases` (f32 [out, n_groups]).
+    let mut weight_arr = out
+      .get("layer.weight")
+      .expect("layer.weight")
+      .try_clone()
+      .unwrap();
+    let mut scales_arr = out
+      .get("layer.scales")
+      .expect("layer.scales")
+      .try_clone()
+      .unwrap();
+    let mut biases_arr = out
+      .get("layer.biases")
+      .expect("layer.biases")
+      .try_clone()
+      .unwrap();
+    assert!(
+      !out.contains_key("layer.qweight"),
+      "qweight key must be replaced by .weight"
+    );
+    assert!(
+      !out.contains_key("layer.qzeros"),
+      "qzeros key must be replaced by .biases"
+    );
+    assert_eq!(weight_arr.dtype().unwrap(), Dtype::U32);
+    assert_eq!(weight_arr.shape(), vec![out_features, in_features / 8]);
+    assert_eq!(scales_arr.shape(), vec![out_features, n_groups]);
+    assert_eq!(biases_arr.shape(), vec![out_features, n_groups]);
+    assert_eq!(scales_arr.dtype().unwrap(), Dtype::F32);
+    assert_eq!(biases_arr.dtype().unwrap(), Dtype::F32);
+
+    // Unpack the MLX-format weight back to natural nibbles for the assertion.
+    // MLX-packed shifts: arange(8) * 4 = [0, 4, 8, 12, 16, 20, 24, 28].
+    let weight_packed: Vec<u32> = weight_arr.to_vec().unwrap();
+    let mut mlx_nibbles = vec![vec![0u32; in_features]; out_features];
+    for o in 0..out_features {
+      for pi in 0..(in_features / 8) {
+        let word = weight_packed[o * (in_features / 8) + pi];
+        for k in 0..8 {
+          mlx_nibbles[o][pi * 8 + k] = (word >> (k as u32 * AWQ_BITS)) & AWQ_NIBBLE_MASK;
+        }
+      }
+    }
+
+    // Verify: mlx_nibbles[o][i] == awq_unpacked[i][o] (the transpose).
+    for o in 0..out_features {
+      for i in 0..in_features {
+        assert_eq!(
+          mlx_nibbles[o][i], awq_unpacked[i][o],
+          "MLX-format nibble at (o={o}, i={i}) must equal AWQ-format nibble at (i={i}, o={o})"
+        );
+      }
+    }
+
+    // Verify MLX-dequant matches AWQ-dequant at every (i, o, group).
+    let scales_flat: Vec<f32> = scales_arr.to_vec().unwrap();
+    let biases_flat: Vec<f32> = biases_arr.to_vec().unwrap();
+    for o in 0..out_features {
+      for g in 0..n_groups {
+        // Per-group scale + bias (MLX layout: [o, g]).
+        let mlx_scale = scales_flat[o * n_groups + g];
+        let mlx_bias = biases_flat[o * n_groups + g];
+        // AWQ scale + zero for this (group, out) — AWQ scales/zeros are
+        // per group (n_groups, out_features).
+        let awq_scale = scales_data[g * out_features + o];
+        let awq_zero = qzero_unpacked[g][o];
+        // Every nibble in this group must dequantize identically.
+        for i_in in 0..(group_size as usize) {
+          let i = g * (group_size as usize) + i_in;
+          let nibble = awq_unpacked[i][o];
+          let awq_dq = awq_dequant(nibble, awq_zero, awq_scale);
+          let mlx_dq = mlx_dequant(nibble, mlx_scale, mlx_bias);
+          assert!(
+            (awq_dq - mlx_dq).abs() < 1e-4,
+            "AWQ dequant {awq_dq} != MLX dequant {mlx_dq} at (o={o}, g={g}, i={i}, nibble={nibble})"
+          );
+        }
+      }
+    }
+  }
+
+  /// Multiple AWQ-formatted layers in one input map: all transform correctly,
+  /// the PerLayerQuantization is a single global entry, and the non-AWQ keys
+  /// pass through verbatim.
+  #[test]
+  fn transform_awq_weights_handles_multiple_layers() {
+    let group_size = 4u32;
+    let in_features = 8usize;
+    let out_features = 8usize;
+    let n_groups = 2usize;
+    // Two layers with all-zero qweight/qzeros + nonzero scales — verify both
+    // exist + the pass-through key is preserved.
+    let make_weights = |prefix: &str| -> Vec<(String, Array)> {
+      let qw = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+      let qz = Array::from_slice::<u32>(&vec![0u32; n_groups], &(n_groups, 1)).unwrap();
+      let scales_data: Vec<f32> = (0..n_groups * out_features)
+        .map(|i| 0.1_f32 * (i as f32 + 1.0))
+        .collect();
+      let sc = Array::from_slice::<f32>(&scales_data, &(n_groups, out_features)).unwrap();
+      vec![
+        (format!("{prefix}.qweight"), qw),
+        (format!("{prefix}.qzeros"), qz),
+        (format!("{prefix}.scales"), sc),
+      ]
+    };
+    let mut weights: Weights = HashMap::new();
+    for (k, v) in make_weights("layer0.q") {
+      weights.insert(k, v);
+    }
+    for (k, v) in make_weights("layer1.q") {
+      weights.insert(k, v);
+    }
+    // Pass-through key (e.g. `embed_tokens.weight`).
+    let passthrough = Array::from_slice::<f32>(&[1.0_f32; 16], &(2usize, 8)).unwrap();
+    weights.insert("embed_tokens.weight".to_string(), passthrough);
+
+    let config = AwqLoadConfig {
+      bits: 4,
+      group_size,
+      zero_point: true,
+      version: String::new(),
+    };
+    let (out, plq) = transform_awq_weights(weights, &config).expect("transform");
+
+    // Both layers transformed.
+    assert!(out.contains_key("layer0.q.weight"));
+    assert!(out.contains_key("layer0.q.scales"));
+    assert!(out.contains_key("layer0.q.biases"));
+    assert!(out.contains_key("layer1.q.weight"));
+    assert!(out.contains_key("layer1.q.scales"));
+    assert!(out.contains_key("layer1.q.biases"));
+    // Originals gone.
+    assert!(!out.contains_key("layer0.q.qweight"));
+    assert!(!out.contains_key("layer1.q.qzeros"));
+    // Pass-through preserved.
+    let mut pt = out
+      .get("embed_tokens.weight")
+      .expect("pass-through")
+      .try_clone()
+      .unwrap();
+    assert_eq!(pt.shape(), vec![2, 8]);
+    assert_eq!(pt.to_vec::<f32>().unwrap(), vec![1.0_f32; 16]);
+    // PerLayerQuantization global is set, per-layer empty.
+    let g = plq.quantization.unwrap();
+    assert_eq!(g.group_size, group_size as i32);
+    assert_eq!(g.bits, 4);
+    assert!(plq.per_layer.is_empty());
+  }
+
+  /// A `.qweight` with no `.scales` companion is rejected with a clear
+  /// message (mirrors mlx-lm's implicit `KeyError`, `utils.py:109`).
+  #[test]
+  fn transform_awq_weights_rejects_missing_scales() {
+    let in_features = 8usize;
+    let qw = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let mut weights: Weights = HashMap::new();
+    weights.insert("layer.qweight".to_string(), qw);
+    // No scales, no qzeros.
+    let config = AwqLoadConfig::default();
+    let err = transform_awq_weights(weights, &config).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+      msg.contains("scales") && msg.contains("layer.qweight"),
+      "error must name the missing scales + offending qweight key, got: {msg}"
+    );
+  }
+
+  /// qweight/scales shape mismatch is rejected with a clear ShapeMismatch.
+  #[test]
+  fn transform_awq_weights_rejects_mismatched_shapes() {
+    let qw = Array::from_slice::<u32>(&[0u32; 8], &(8usize, 1)).unwrap();
+    // Mismatched scales: should be [n_groups=2, out_features=8] but we give [4, 8]
+    let sc = Array::from_slice::<f32>(&[0.1_f32; 32], &(4usize, 8)).unwrap();
+    let mut weights: Weights = HashMap::new();
+    weights.insert("layer.qweight".to_string(), qw);
+    weights.insert("layer.scales".to_string(), sc);
+    let config = AwqLoadConfig {
+      bits: 4,
+      group_size: 4,
+      zero_point: false,
+      version: String::new(),
+    };
+    let err = transform_awq_weights(weights, &config).unwrap_err();
+    assert!(
+      matches!(err, Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch, got {err:?}"
+    );
+  }
+
+  /// A `.g_idx` key (GPTQ non-contiguous-group reorder) is rejected upfront.
+  #[test]
+  fn transform_awq_weights_rejects_g_idx() {
+    let qw = Array::from_slice::<u32>(&[0u32; 8], &(8usize, 1)).unwrap();
+    let sc = Array::from_slice::<f32>(&[0.1_f32; 16], &(2usize, 8)).unwrap();
+    let gidx = Array::from_slice::<i32>(&[0i32, 1, 0, 1, 0, 1, 0, 1], &(8usize,)).unwrap();
+    let mut weights: Weights = HashMap::new();
+    weights.insert("layer.qweight".to_string(), qw);
+    weights.insert("layer.scales".to_string(), sc);
+    weights.insert("layer.g_idx".to_string(), gidx);
+    let config = AwqLoadConfig {
+      bits: 4,
+      group_size: 4,
+      zero_point: false,
+      version: String::new(),
+    };
+    let err = transform_awq_weights(weights, &config).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+      msg.contains("g_idx"),
+      "error must mention g_idx, got: {msg}"
+    );
+  }
+
+  /// Non-4 bits is rejected with a clear message.
+  #[test]
+  fn transform_awq_weights_rejects_non_4_bits() {
+    let weights: Weights = HashMap::new();
+    let config = AwqLoadConfig {
+      bits: 8,
+      ..AwqLoadConfig::default()
+    };
+    let err = transform_awq_weights(weights, &config).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("bits=4"), "error must say bits=4, got: {msg}");
+  }
+
+  /// Symmetric quantization (`zero_point: false`): biases are computed from
+  /// the implicit `2^(bits-1) = 8` zero point, NOT from any qzeros that
+  /// might happen to be present.
+  #[test]
+  fn transform_awq_weights_symmetric_uses_implicit_zero() {
+    let in_features = 8usize;
+    let out_features = 8usize;
+    let group_size = 4u32;
+    let n_groups = 2usize;
+    let qw = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    // Scale = 1.0 everywhere so the bias check is trivial: bias = -8 * 1 = -8.
+    let scales_data: Vec<f32> = vec![1.0_f32; n_groups * out_features];
+    let sc = Array::from_slice::<f32>(&scales_data, &(n_groups, out_features)).unwrap();
+    let mut weights: Weights = HashMap::new();
+    weights.insert("layer.qweight".to_string(), qw);
+    weights.insert("layer.scales".to_string(), sc);
+
+    let config = AwqLoadConfig {
+      bits: 4,
+      group_size,
+      zero_point: false,
+      version: String::new(),
+    };
+    let (out, _) = transform_awq_weights(weights, &config).expect("transform");
+    let mut biases_arr = out
+      .get("layer.biases")
+      .expect("layer.biases")
+      .try_clone()
+      .unwrap();
+    let biases: Vec<f32> = biases_arr.to_vec().unwrap();
+    // Every entry must be exactly -8.0.
+    for &b in &biases {
+      assert!(
+        (b + 8.0_f32).abs() < 1e-5,
+        "symmetric bias must be -2^(bits-1) * scale = -8.0, got {b}"
+      );
+    }
+  }
+
+  /// Empty input (no `.qweight` keys) is a no-op: pass-through verbatim plus
+  /// a `PerLayerQuantization` with the requested global params.
+  #[test]
+  fn transform_awq_weights_empty_input_is_noop() {
+    let pt = Array::from_slice::<f32>(&[1.0_f32, 2.0, 3.0], &(3usize,)).unwrap();
+    let mut weights: Weights = HashMap::new();
+    weights.insert("layer.weight".to_string(), pt);
+
+    let config = AwqLoadConfig::default();
+    let (out, plq) = transform_awq_weights(weights, &config).expect("transform");
+    // Pass-through preserved.
+    let mut got = out
+      .get("layer.weight")
+      .expect("pass-through")
+      .try_clone()
+      .unwrap();
+    assert_eq!(got.to_vec::<f32>().unwrap(), vec![1.0_f32, 2.0, 3.0]);
+    // Global quant set from config defaults.
+    let g = plq.quantization.unwrap();
+    assert_eq!(g.bits, 4);
+    assert_eq!(g.group_size, 128);
+    assert_eq!(g.mode, QuantMode::Affine);
+  }
+
+  // ──────────────── AwqLoadConfig ────────────────
+
+  /// AwqLoadConfig round-trips through serde from a typical AutoAWQ
+  /// `quantization_config` JSON block.
+  #[test]
+  fn awq_load_config_parses_quantization_json() {
+    let json = r#"{
+      "bits": 4,
+      "group_size": 128,
+      "zero_point": true,
+      "version": "gemm"
+    }"#;
+    let cfg: AwqLoadConfig = serde_json::from_str(json).expect("parse");
+    assert_eq!(cfg.bits, 4);
+    assert_eq!(cfg.group_size, 128);
+    assert!(cfg.zero_point);
+    assert_eq!(cfg.version, "gemm");
+  }
+
+  /// Defaults populate when keys are absent (AutoAWQ omitted-field convention).
+  #[test]
+  fn awq_load_config_defaults_when_keys_absent() {
+    let cfg: AwqLoadConfig = serde_json::from_str("{}").expect("parse");
+    assert_eq!(cfg.bits, 4);
+    assert_eq!(cfg.group_size, 128);
+    assert!(cfg.zero_point);
+    assert_eq!(cfg.version, "");
+  }
+
+  /// Default impl matches the JSON-deserialized defaults (audit cross-check).
+  #[test]
+  fn awq_load_config_default_matches_serde_default() {
+    let from_default = AwqLoadConfig::default();
+    let from_serde: AwqLoadConfig = serde_json::from_str("{}").unwrap();
+    assert_eq!(from_default, from_serde);
   }
 }
