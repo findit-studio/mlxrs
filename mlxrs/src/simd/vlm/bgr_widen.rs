@@ -222,10 +222,17 @@ use core::arch::aarch64::{
 ///   reserves exactly `H*W*3` f32s and slices the input to exactly
 ///   `H*W*3` bytes, so both preconditions hold there.
 ///
-/// The preconditions are asserted unconditionally at the **dispatcher**
-/// [`bgr_widen`] (release-too); this scalar reference debug-asserts
-/// them so a direct caller (the bench, the tests) still surfaces a
-/// mismatch loudly in debug builds.
+/// Both preconditions are asserted **unconditionally** (release-too).
+/// The function is `pub`, reachable through `simd::vlm::bgr_widen`,
+/// and its initialization contract ("every f32 of `out` is written
+/// before return") is load-bearing for callers that then call
+/// `Vec::set_len` over the covered region — a release-build size
+/// mismatch would leave some `MaybeUninit<f32>` slots unwritten and
+/// the caller's `set_len` would expose uninitialized memory. The
+/// dispatcher [`bgr_widen`] also asserts these unconditionally at its
+/// entry point; this kernel re-asserts them so direct callers (the
+/// bench, the tests, any future caller bypassing the dispatcher) are
+/// equally protected.
 ///
 /// # Initialization contract
 ///
@@ -249,15 +256,23 @@ use core::arch::aarch64::{
 #[inline]
 #[doc(hidden)]
 pub fn bgr_widen_scalar(out: &mut [MaybeUninit<f32>], src: &[u8]) {
-  debug_assert_eq!(
-    src.len() % 3,
-    0,
-    "bgr_widen_scalar: src.len() must be a multiple of 3 (one input pixel = 3 bytes)"
+  // Preconditions: unconditional (release-too). The function is
+  // `pub` and its init contract is load-bearing — a release-build
+  // size mismatch on either precondition would let
+  // `chunks_exact_mut(3).zip(chunks_exact(3))` truncate, leaving
+  // some `MaybeUninit<f32>` slots unwritten, and a caller's
+  // `Vec::set_len` would then expose uninitialized memory.
+  assert!(
+    src.len().is_multiple_of(3),
+    "bgr_widen_scalar: src.len() ({}) must be a multiple of 3 (one input pixel = 3 bytes)",
+    src.len(),
   );
-  debug_assert_eq!(
+  assert_eq!(
     out.len(),
     src.len(),
-    "bgr_widen_scalar: out.len() must equal src.len() (one output f32 per input byte)"
+    "bgr_widen_scalar: out.len() ({}) must equal src.len() ({}) (one output f32 per input byte)",
+    out.len(),
+    src.len(),
   );
 
   for (out_px, src_px) in out.chunks_exact_mut(3).zip(src.chunks_exact(3)) {
@@ -311,10 +326,12 @@ pub fn bgr_widen_scalar(out: &mut [MaybeUninit<f32>], src: &[u8]) {
 ///    caller's obligation — the public dispatcher [`bgr_widen`]
 ///    discharges it via [`crate::simd::is_neon_available`].
 /// 2. `src.len()` must be a multiple of 3 and `out.len()` must equal
-///    `src.len()`. Both are debug-asserted here and asserted
-///    *unconditionally* at the dispatcher (release-too — a release
-///    mismatch would OOB-write `out` or OOB-read `src` in the tile
-///    body).
+///    `src.len()`. Both are asserted **unconditionally** here
+///    (release-too — a release mismatch would OOB-write `out` or
+///    OOB-read `src` in the tile body, and the kernel's init
+///    contract is load-bearing for a caller that then calls
+///    `Vec::set_len`). The dispatcher also asserts them at its
+///    entry point.
 ///
 /// There is no input alignment requirement: `vld3q_u8` and
 /// `vst3q_f32` accept unaligned addresses at full throughput on
@@ -327,15 +344,21 @@ pub fn bgr_widen_scalar(out: &mut [MaybeUninit<f32>], src: &[u8]) {
 #[inline]
 #[target_feature(enable = "neon")]
 pub(crate) unsafe fn bgr_widen_neon(out: &mut [MaybeUninit<f32>], src: &[u8]) {
-  debug_assert_eq!(
-    src.len() % 3,
-    0,
-    "bgr_widen_neon: src.len() must be a multiple of 3 (one input pixel = 3 bytes)"
+  // Preconditions: unconditional (release-too). A release-build size
+  // mismatch would OOB-write `out` / OOB-read `src` in the tile body,
+  // and the kernel's init contract is load-bearing for any caller
+  // that follows up with `Vec::set_len` on uninit spare capacity.
+  assert!(
+    src.len().is_multiple_of(3),
+    "bgr_widen_neon: src.len() ({}) must be a multiple of 3 (one input pixel = 3 bytes)",
+    src.len(),
   );
-  debug_assert_eq!(
+  assert_eq!(
     out.len(),
     src.len(),
-    "bgr_widen_neon: out.len() must equal src.len() (one output f32 per input byte)"
+    "bgr_widen_neon: out.len() ({}) must equal src.len() ({}) (one output f32 per input byte)",
+    out.len(),
+    src.len(),
   );
 
   // Each pixel is 3 bytes input + 3 f32 output. Tile = 16 pixels =
@@ -461,8 +484,12 @@ pub(crate) unsafe fn bgr_widen_neon(out: &mut [MaybeUninit<f32>], src: &[u8]) {
 /// Both are asserted **unconditionally** (release-too — keeping the
 /// assertion shape consistent with C6's dispatcher and with the
 /// "dispatcher asserts unconditionally" rule in the X5 infrastructure
-/// doc; the NEON kernel only debug-asserts internally and would
-/// OOB-write `out` / OOB-read `src` on a release mismatch).
+/// doc). Both internal kernels ([`bgr_widen_scalar`] and
+/// [`bgr_widen_neon`]) also assert these preconditions unconditionally
+/// at their own entry points so direct callers (the bench, the tests,
+/// any future caller bypassing the dispatcher) are equally protected
+/// from a release-build size mismatch leaving `MaybeUninit<f32>` slots
+/// unwritten and a follow-up `Vec::set_len` exposing uninit memory.
 ///
 /// # Initialization contract
 ///
@@ -909,5 +936,87 @@ mod tests {
          `chunks_exact(3) + push * 3` loop (pattern={name}, n_bytes={n_bytes})"
       );
     }
+  }
+
+  /// Release-mode precondition guard for the public scalar kernel.
+  /// `bgr_widen_scalar`'s `src.len() % 3 == 0` precondition is now
+  /// asserted **unconditionally** (was `debug_assert_eq!` previously,
+  /// which would be stripped in release and let
+  /// `chunks_exact_mut(3).zip(chunks_exact(3))` truncate, leaving some
+  /// `MaybeUninit<f32>` slots unwritten — a caller's `Vec::set_len`
+  /// would then expose uninitialized f32 memory). Because `assert!`
+  /// stays compiled in release, this `#[should_panic]` test also
+  /// exercises the release-mode behaviour.
+  #[test]
+  #[should_panic(expected = "bgr_widen_scalar: src.len() (7) must be a multiple of 3")]
+  fn bgr_widen_scalar_panics_on_non_triplet_src_in_release() {
+    let src = [0u8; 7];
+    let mut v: Vec<f32> = Vec::with_capacity(7);
+    let spare: &mut [MaybeUninit<f32>] = v.spare_capacity_mut();
+    bgr_widen_scalar(&mut spare[..7], &src);
+  }
+
+  /// Release-mode precondition guard for the public scalar kernel,
+  /// size-mismatch arm. See the doc on
+  /// [`bgr_widen_scalar_panics_on_non_triplet_src_in_release`] for the
+  /// uninit-exposure rationale; an `out.len() != src.len()` mismatch
+  /// is the other shape that would let `zip` truncate and leave some
+  /// `MaybeUninit<f32>` slots unwritten in release.
+  #[test]
+  #[should_panic(expected = "bgr_widen_scalar: out.len() (9) must equal src.len() (6)")]
+  fn bgr_widen_scalar_panics_on_size_mismatch_in_release() {
+    let src = [0u8; 6];
+    let mut v: Vec<f32> = Vec::with_capacity(9);
+    let spare: &mut [MaybeUninit<f32>] = v.spare_capacity_mut();
+    bgr_widen_scalar(&mut spare[..9], &src);
+  }
+
+  /// Release-mode precondition guard for the NEON kernel,
+  /// non-triplet src arm. The NEON kernel's preconditions are now
+  /// asserted unconditionally for the same uninit-exposure reason
+  /// (a release-build size mismatch would OOB-write `out` /
+  /// OOB-read `src` in the tile body and leave the tail untouched).
+  /// Routed through the `bgr_widen_neon_init` adapter, gated on
+  /// `is_neon_available()` so the test no-ops where the NEON arm
+  /// cannot be invoked.
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  #[should_panic(expected = "bgr_widen_neon: src.len() (7) must be a multiple of 3")]
+  fn bgr_widen_neon_panics_on_non_triplet_src_in_release() {
+    if !crate::simd::is_neon_available() {
+      // Force a panic with the expected message so the test passes on
+      // non-NEON CPUs / `mlxrs_force_scalar` without invoking the
+      // kernel (the contract under test only applies when the NEON
+      // arm can be called).
+      panic!("bgr_widen_neon: src.len() (7) must be a multiple of 3 (skipped — NEON unavailable)");
+    }
+    let _ = bgr_widen_neon_init(&[0u8; 7]);
+  }
+
+  /// Release-mode precondition guard for the NEON kernel,
+  /// size-mismatch arm. Pairs with
+  /// [`bgr_widen_neon_panics_on_non_triplet_src_in_release`] for the
+  /// `out.len() != src.len()` shape.
+  ///
+  /// Calls the NEON kernel through a small inline adapter (rather
+  /// than `bgr_widen_neon_init`, which sizes `out` exactly to
+  /// `src.len()`) so we can exercise the explicit size mismatch.
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  #[should_panic(expected = "bgr_widen_neon: out.len() (9) must equal src.len() (6)")]
+  fn bgr_widen_neon_panics_on_size_mismatch_in_release() {
+    if !crate::simd::is_neon_available() {
+      panic!("bgr_widen_neon: out.len() (9) must equal src.len() (6) (skipped — NEON unavailable)");
+    }
+    let src = [0u8; 6];
+    let mut v: Vec<f32> = Vec::with_capacity(9);
+    let spare: &mut [MaybeUninit<f32>] = v.spare_capacity_mut();
+    // SAFETY: `is_neon_available()` was checked immediately above
+    // (precondition #1). The kernel is expected to panic on the
+    // intentional size mismatch (precondition #2 violation) before
+    // any pointer arithmetic occurs, so no actual writes to
+    // `spare`'s uninit memory take place; `v` is dropped via unwind
+    // with `len() == 0`, no `set_len` is reached.
+    unsafe { super::bgr_widen_neon(&mut spare[..9], &src) };
   }
 }
