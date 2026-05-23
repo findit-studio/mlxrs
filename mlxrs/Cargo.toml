@@ -104,3 +104,11 @@ harness = false
 [[bench]]
 name = "linalg"
 harness = false
+
+# C6 verify-before-claim bench — gated on the `vlm` feature so a
+# default-feature build skips it (the dispatcher lives behind the
+# `vlm` feature gate; see `simd::vlm` cfg in `mlxrs/src/simd/mod.rs`).
+[[bench]]
+name = "simd_pad_canvas_fill"
+harness = false
+required-features = ["vlm"]

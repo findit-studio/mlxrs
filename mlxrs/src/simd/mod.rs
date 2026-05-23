@@ -185,8 +185,29 @@ pub(crate) mod audio;
 pub mod diff;
 mod dispatch;
 pub mod scalar;
-#[cfg(target_arch = "aarch64")]
-pub(crate) mod vlm;
+// `simd::vlm` is **not** `aarch64`-gated: the scalar reference inside
+// each kernel triple (e.g. `pad_canvas_fill_scalar`) must compile on
+// every target so the dispatcher's scalar-fallback branch is a real,
+// linkable function (per the project memory rule "SIMD always-on" —
+// scalar fallback compiles on all targets, only the `arch` module is
+// `aarch64`-gated). The NEON kernels inside each kernel triple are
+// individually `#[cfg(target_arch = "aarch64")]`-gated at the
+// function level. The module is `vlm`-feature-gated so the
+// `--no-default-features` / per-feature CI builds don't compile a
+// dead-code dispatcher (the only call site is
+// [`crate::vlm::image::pad_to_square`], itself behind the same
+// feature).
+//
+// `pub` (rather than `pub(crate)`) so the in-tree
+// `benches/simd_pad_canvas_fill.rs` micro-benchmark — a separate
+// binary that only sees the public API — can drive the dispatcher
+// and scalar reference directly per the verify-before-claim rule
+// (§5.4 of the SIMD doc). Per-kernel items inside are individually
+// `pub`/`pub(crate)` (only the dispatcher + the scalar reference
+// are exposed; the `unsafe` NEON kernel stays `pub(crate)`).
+#[cfg(feature = "vlm")]
+#[doc(hidden)]
+pub mod vlm;
 
 pub use dispatch::{dot, sum_of_squares};
 

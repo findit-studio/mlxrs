@@ -1,7 +1,6 @@
-//! VLM-side SIMD kernels (placeholder — populated per-candidate in
-//! follow-up PRs).
+//! VLM-side SIMD kernels.
 //!
-//! This module receives the `aarch64` NEON + scalar dispatcher triples
+//! This module hosts the `aarch64` NEON + scalar dispatcher triples
 //! for the VLM image-preprocessing candidates documented in
 //! `docs/core-arch-simd-candidates.md` §4 (the "C" series, image arm).
 //! Each candidate ships as its own dispatcher + `arch::neon` kernel +
@@ -9,8 +8,19 @@
 //! with `dot`), plus a differential test using the helpers in
 //! [`crate::simd::diff`].
 //!
-//! Planned candidates (issue numbers — umbrella
-//! [`#143`](https://github.com/Findit-AI/mlxrs/issues/143)):
+//! # Shipped (per-candidate PR landing order)
+//!
+//! - **C6** ([#151](https://github.com/Findit-AI/mlxrs/issues/151)) —
+//!   `pad_to_square` canvas fill (`vlm/image.rs`). Class: `Exact`. The
+//!   `pad_canvas_fill` submodule holds the dispatcher, the scalar
+//!   reference, the 48-byte LCM(3, 16) NEON kernel, and the verify-
+//!   before-claim benchmark + decision (per §5.5 execution order —
+//!   quick-win lead-off). The submodule is `#[doc(hidden)]` so the
+//!   only public surface is the [`crate::vlm::image::pad_to_square`]
+//!   call site that consumes it.
+//!
+//! # Planned candidates (issue numbers — umbrella
+//! [`#143`](https://github.com/Findit-AI/mlxrs/issues/143))
 //!
 //! - **C3** ([#148](https://github.com/Findit-AI/mlxrs/issues/148)) —
 //!   `image_to_array` u8 → f32 RGB widening (`vlm/image.rs`). Class:
@@ -22,10 +32,8 @@
 //! - **C5** ([#150](https://github.com/Findit-AI/mlxrs/issues/150)) —
 //!   `rotate_buf` pixel permutation (`vlm/image.rs`). Class: `Exact`
 //!   (defer per §5.5; gather-bound).
-//! - **C6** ([#151](https://github.com/Findit-AI/mlxrs/issues/151)) —
-//!   `pad_to_square` canvas fill (`vlm/image.rs`). Class: `Exact`
-//!   (per-3-byte-`extend` fix is the quick-win lead-off per §5.5).
-//!
-//! X5 (this skeleton) ships **no** kernels — only the module hook so
-//! follow-up PRs can land each candidate without re-touching
-//! [`crate::simd::mod`](crate::simd).
+
+#[doc(hidden)]
+pub mod pad_canvas_fill;
+
+pub(crate) use pad_canvas_fill::pad_canvas_fill;
