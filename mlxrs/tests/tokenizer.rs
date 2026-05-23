@@ -208,6 +208,53 @@ fn glm47_parser_parses_xml_style() {
   assert_eq!(calls[0].arguments["city"], json!("Paris"));
 }
 
+/// Direct unit test for the [`Tokenizer::additional_special_token_ids`]
+/// accessor — used by `lm::gguf::HfVocab` to union `tokenizer_config.json`
+/// `additional_special_tokens` ids into the special-token set, mirroring
+/// HF's `PreTrainedTokenizerBase.additional_special_tokens_ids`.
+///
+/// The fixture reuses the shared `tokenizer.json` (so `<think>` at id 9 and
+/// `</think>` at id 10 are present), but plants a one-off
+/// `tokenizer_config.json` in a fresh dir that declares both as
+/// `additional_special_tokens` — one as a plain string and one as the
+/// `AddedToken` object shape (`{"content": ...}`) — to cover both JSON
+/// shapes the accessor accepts.
+#[test]
+fn additional_special_token_ids_unions_string_and_object_forms() {
+  let dir = std::env::temp_dir().join(format!(
+    "mlxrs-tok-addl-{}-{}",
+    std::process::id(),
+    std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map(|d| d.as_nanos())
+      .unwrap_or(0)
+  ));
+  std::fs::create_dir_all(&dir).unwrap();
+  std::fs::write(dir.join("tokenizer.json"), TOKENIZER_JSON).unwrap();
+  let cfg = json!({
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "unk_token": "<unk>",
+    "additional_special_tokens": [
+      "<think>",
+      { "content": "</think>", "lstrip": false, "rstrip": false, "single_word": false, "normalized": false, "special": true },
+      "not-in-vocab"  // silently skipped — `token_to_id` returns None
+    ]
+  });
+  std::fs::write(
+    dir.join("tokenizer_config.json"),
+    serde_json::to_string(&cfg).unwrap(),
+  )
+  .unwrap();
+
+  let tok = Tokenizer::from_path(&dir, None).unwrap();
+  let mut ids = tok.additional_special_token_ids();
+  ids.sort_unstable();
+  assert_eq!(ids, vec![9u32, 10u32]);
+
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn infer_tool_parser_selects_correctly() {
   use mlxrs::tokenizer::infer_tool_parser;

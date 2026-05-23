@@ -51,7 +51,7 @@
 //!   reference `convert_to_gguf` is a pure local-file driver anyway.
 
 use std::{
-  collections::{BTreeMap, HashMap},
+  collections::{BTreeMap, BTreeSet, HashMap, HashSet},
   path::PathBuf,
 };
 
@@ -128,14 +128,27 @@ pub struct HfVocab {
   added_tokens_list: Vec<String>,
   /// Ids of added tokens (`mlx_lm/gguf.py:44`) used to skip them in the
   /// base-vocab walk so an id is never emitted twice.
-  added_tokens_ids: std::collections::BTreeSet<u32>,
+  added_tokens_ids: BTreeSet<u32>,
   /// `{special_token_text -> id}` — port of
   /// `self.specials` (`mlx_lm/gguf.py:45-48`). Used to look up a
   /// added-token's id when classifying its `toktype`.
   specials: HashMap<String, u32>,
-  /// Set of all special-token ids
-  /// (`mlx_lm/gguf.py:49`).
-  special_ids: std::collections::BTreeSet<u32>,
+  /// Set of all special-token ids — port of
+  /// `set(self.tokenizer.all_special_ids)` (`mlx_lm/gguf.py:49`).
+  ///
+  /// HF's `PreTrainedTokenizerBase.all_special_ids` is the UNION of
+  /// `added_tokens_decoder` entries flagged `special=true` AND the ids
+  /// resolved from `tokenizer_config.json`'s `bos_token`/`eos_token`/
+  /// `unk_token`/`pad_token`/`additional_special_tokens` strings.
+  /// Crucially the latter may point at BASE-VOCAB ids (a BOS/EOS that
+  /// is part of the base vocab and so does not live in
+  /// `added_tokens_decoder`), so we MUST union both sources — building
+  /// `special_ids` from `added_tokens_decoder` alone would misclassify
+  /// such tokens as `Normal` instead of `Control` and emit a
+  /// `tokenizer.ggml.token_type` array inconsistent with the metadata's
+  /// own `bos_token_id`/`eos_token_id`/`unknown_token_id` scalar fields.
+  /// The `HashSet` is used inside `get_token_type` for O(1) membership.
+  special_ids: HashSet<u32>,
   /// `tokenizer.vocab_size` — base vocab (`mlx_lm/gguf.py:50`).
   vocab_size_base: u32,
   /// `vocab_size_base + len(added_tokens_list)` — the GGUF token count
@@ -191,23 +204,62 @@ impl HfVocab {
     added.sort_by_key(|(id, _)| *id);
 
     let mut added_tokens_list = Vec::with_capacity(added.len());
-    let mut added_tokens_ids = std::collections::BTreeSet::new();
+    let mut added_tokens_ids = BTreeSet::new();
     for (id, name) in &added {
       added_tokens_list.push(name.clone());
       added_tokens_ids.insert(*id);
     }
 
     // `self.specials = {tok: vocab[tok] for tok in tokenizer.all_special_tokens}`
-    // (`mlx_lm/gguf.py:45-48`). HF tokenizers expose this via the
-    // `added_tokens_decoder` filtered on `special` — a special token always
-    // lives in the added vocab.
+    // (`mlx_lm/gguf.py:45-48`) AND
+    // `self.special_ids = set(self.tokenizer.all_special_ids)`
+    // (`mlx_lm/gguf.py:49`).
+    //
+    // HF's `PreTrainedTokenizerBase.all_special_ids` is built from the
+    // UNION of:
+    //   (a) `added_tokens_decoder` entries flagged `special=true`, and
+    //   (b) BOS/EOS/UNK/PAD/`additional_special_tokens` declared in
+    //       `tokenizer_config.json` — these may resolve to BASE-VOCAB ids,
+    //       NOT just added-vocab ids (e.g. a tokenizer whose `<s>` lives
+    //       at base id 1, not as an `added_tokens_decoder` entry).
+    //
+    // Building `special_ids` from (a) alone would misclassify any BOS/EOS
+    // that happens to live in the base vocab as `Normal` instead of
+    // `Control`, emitting a `tokenizer.ggml.token_type` array inconsistent
+    // with the metadata's `bos/eos/unknown_token_id` scalar fields.
+    //
+    // `specials` (text→id) and `special_ids` (id-set) are populated from
+    // both sources so the added-token-walk classifier
+    // (`mlx_lm/gguf.py:78-84`) and the base-vocab-walk classifier
+    // (`mlx_lm/gguf.py:63-65`) both see the full set.
     let mut specials: HashMap<String, u32> = HashMap::new();
-    let mut special_ids = std::collections::BTreeSet::new();
+    let mut special_ids: HashSet<u32> = HashSet::new();
+    // (a) added_tokens_decoder entries with `special == true`.
     for (id, tok) in hf.get_added_tokens_decoder() {
       if tok.special {
         specials.insert(tok.content.clone(), id);
         special_ids.insert(id);
       }
+    }
+    // (b) tokenizer_config.json BOS/EOS/UNK/PAD + additional_special_tokens.
+    //     `Tokenizer`'s `*_token_id` accessors return the resolved vocab id
+    //     for the singular fields (or `None` if absent / unresolvable);
+    //     `additional_special_token_ids` returns the resolved vec for the
+    //     plural field. Each one is unioned into `special_ids`, which is a
+    //     `HashSet` (so re-adding an id already from (a) is a no-op).
+    for id in [
+      tokenizer.bos_token_id(),
+      tokenizer.eos_token_id(),
+      tokenizer.unk_token_id(),
+      tokenizer.pad_token_id(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+      special_ids.insert(id);
+    }
+    for id in tokenizer.additional_special_token_ids() {
+      special_ids.insert(id);
     }
 
     // Reverse-vocab `{id -> text}` for the base vocab range
@@ -848,19 +900,33 @@ pub struct ConvertToGgufArgs {
 /// Top-level GGUF export driver — port of `convert_to_gguf`
 /// (`mlx_lm/gguf.py:261-314`).
 ///
-/// Pipeline (mirroring the reference):
-/// 1. Load the model directory through [`crate::lm::load::load`] —
-///    yields `(Config, Weights, Tokenizer)` plus the raw `config.json`
-///    JSON for fields outside [`Config`]'s typed subset (e.g.
-///    `intermediate_size`, `_name_or_path`).
-/// 2. Reject a quantized checkpoint — the reference raises
-///    `NotImplementedError("Conversion of quantized models is not yet
-///    supported.")` (`mlx_lm/gguf.py:271-274`); we surface the same as
-///    [`Error::Backend`].
-/// 3. Reject a non-Llama-family `model_type` (a `model_type` outside
-///    the LM-side supported set `{"llama", "mistral", "mixtral"}` is
-///    rejected up front so a non-Llama tag is never silently emitted —
-///    see the module-doc scope boundary on per-model-arch porting).
+/// Pipeline (the Python reference receives `weights` + `config` already
+/// loaded by its caller, so it has no choice about ordering;
+/// `convert_to_gguf` here owns the load, so we run every fail-fast
+/// validation BEFORE the multi-GB weight read to avoid OOM'ing on a
+/// checkpoint we are about to reject):
+///
+/// 1. Load the (small) `config.json` via [`crate::lm::load::load_config`].
+///    Yields `(Config, raw_json)` — the typed subset plus the raw JSON
+///    body for fields outside [`Config`]'s typed subset (e.g.
+///    `intermediate_size`, `_name_or_path`, `rope_scaling.*`,
+///    `quantization_config`).
+/// 2. Fail-fast validation (BEFORE the weight load):
+///    - **2a.** Reject a non-Llama-family `model_type` (a `model_type`
+///      outside the LM-side supported set `{"llama", "mistral",
+///      "mixtral"}` is rejected up front so a non-Llama tag is never
+///      silently emitted — see the module-doc scope boundary on
+///      per-model-arch porting).
+///    - **2b.** Reject a quantized checkpoint — the reference raises
+///      `NotImplementedError("Conversion of quantized models is not yet
+///      supported.")` (`mlx_lm/gguf.py:271-274`); we surface the same
+///      as [`Error::Backend`]. Both `config["quantization"]` (already
+///      typed on [`Config`]) and `config["quantization_config"]` (some
+///      HF checkpoints + post-quantize artifacts use the longer key)
+///      trip this gate.
+///    - **2c.** Reject a missing `tokenizer.json` (`mlx_lm/gguf.py:297-298`).
+/// 3. Load the multi-GB weights + tokenizer ONLY after every (2)
+///    validation has passed.
 /// 4. Permute Q / K attention weights via [`permute_weights`]
 ///    (`mlx_lm/gguf.py:277-292`).
 /// 5. Remap HF weight names to GGUF via [`translate_weight_names`]
@@ -877,24 +943,30 @@ pub struct ConvertToGgufArgs {
 /// [`permute_weights`] / IO) is an [`Error::Backend`] whose message
 /// names the offending input.
 pub fn convert_to_gguf(args: &ConvertToGgufArgs) -> Result<()> {
-  // 1. Load the model. `load_config` already applies the
+  // 1. Load the (small) `config.json` FIRST — the bounded read is fast
+  //    and a few kilobytes at most. `load_config` already applies the
   //    `generation_config.json` eos override; we additionally need the
   //    raw `config.json` body for the untyped fields `prepare_metadata`
   //    consumes (`intermediate_size`, `max_position_embeddings`,
   //    `_name_or_path`, `rope_scaling.*`).
   let (config, raw_json) = crate::lm::load::load_config(&args.model_path)?;
-  let weights = crate::lm::load::load_weights(&args.model_path)?;
-  let tokenizer = crate::lm::load::load_tokenizer(&args.model_path, &config)?;
 
-  // 2. Quantized → reject (`mlx_lm/gguf.py:270-274`).
-  if config.quantization.is_some() {
-    return Err(Error::Backend {
-      message: "convert_to_gguf: conversion of quantized models is not yet supported".into(),
-    });
-  }
+  // 2. Fail-fast validation block — runs BEFORE the multi-GB weight
+  //    load + tokenizer build so an unsupported / quantized checkpoint
+  //    cannot OOM us on the weight read before the rejection path
+  //    fires. The reference Python (`mlx_lm/gguf.py:261-274`) receives
+  //    `weights` + `config` already loaded by its caller so the order
+  //    there is forced; our `convert_to_gguf` owns the load, so we
+  //    reject up front. Tests planting a sentinel weight file that
+  //    would error on read (`convert_to_gguf_rejects_unsupported_arch`
+  //    + `convert_to_gguf_rejects_quantized`) prove these paths return
+  //    the validation `Err(Backend)` WITHOUT touching the weights.
 
-  // 3. Architecture gate — fail-fast on a `model_type` outside the
-  //    Llama-family supported set. See `SUPPORTED_MODEL_TYPES`.
+  //   2a. Architecture gate (`[[project_no_model_arch_porting]]`):
+  //       reject any `model_type` outside the LM-side supported set so a
+  //       non-Llama tag is never silently emitted on a non-Llama
+  //       checkpoint. The reference's `prepare_metadata` hard-codes the
+  //       `llama.*` key prefix — see `SUPPORTED_MODEL_TYPES`.
   if !SUPPORTED_MODEL_TYPES.contains(&config.model_type.as_str()) {
     return Err(Error::Backend {
       message: format!(
@@ -905,10 +977,31 @@ pub fn convert_to_gguf(args: &ConvertToGgufArgs) -> Result<()> {
     });
   }
 
-  // `tokenizer.json` presence check (`mlx_lm/gguf.py:297-298`). The
-  // `load` call above already errors on a missing `tokenizer.json`
-  // through `Tokenizer::from_path`, but we explicitly check first so the
-  // diagnostic matches the reference's `"Tokenizer json not found"`.
+  //   2b. Quantized → reject (`mlx_lm/gguf.py:270-274`). [`Config`] only
+  //       carries the strongly-typed `quantization` block, but a few HF
+  //       checkpoints (and the mlx-lm convert pipeline post-quantize
+  //       artifacts) ship the same payload under the `quantization_config`
+  //       key — we reject either so an unsupported quantized checkpoint
+  //       cannot slip through. The GGUF LM export targets dense F16/F32;
+  //       dequantize first via `lm::convert` if needed.
+  let raw_config: serde_json::Value =
+    serde_json::from_str(&raw_json).map_err(|e| Error::Backend {
+      message: format!("convert_to_gguf: cannot re-parse config.json: {e}"),
+    })?;
+  if config.quantization.is_some() || raw_config.get("quantization_config").is_some() {
+    return Err(Error::Backend {
+      message: "convert_to_gguf: quantized checkpoints are not supported (the GGUF LM export \
+                targets dense F16/F32 GGUF); dequantize first via lm::convert"
+        .into(),
+    });
+  }
+
+  //   2c. `tokenizer.json` presence check (`mlx_lm/gguf.py:297-298`).
+  //       The later `load_tokenizer` call would also error on a missing
+  //       `tokenizer.json` through `Tokenizer::from_path`, but we check
+  //       here so the diagnostic matches the reference's
+  //       `"Tokenizer json not found"` AND so a missing tokenizer also
+  //       fails fast before the weight load.
   let tokenizer_json = args.model_path.join("tokenizer.json");
   if !tokenizer_json.exists() {
     return Err(Error::Backend {
@@ -919,11 +1012,15 @@ pub fn convert_to_gguf(args: &ConvertToGgufArgs) -> Result<()> {
     });
   }
 
-  // Parse the raw config JSON once.
-  let raw_config: serde_json::Value =
-    serde_json::from_str(&raw_json).map_err(|e| Error::Backend {
-      message: format!("convert_to_gguf: cannot re-parse config.json: {e}"),
-    })?;
+  // 3. NOW load the multi-GB weights + tokenizer — only after every
+  //    fail-fast validation in (2) has passed, so an unsupported model
+  //    never pays the load cost.
+  let weights = crate::lm::load::load_weights(&args.model_path)?;
+  let tokenizer = crate::lm::load::load_tokenizer(&args.model_path, &config)?;
+
+  // `raw_config` was parsed above (step 2b) before the weight load so the
+  // quantized-config gate could inspect `quantization_config`; it carries
+  // through to the head-count + rope-scaling reads below.
   let num_attention_heads = raw_config
     .get("num_attention_heads")
     .and_then(|v| v.as_i64())
@@ -1473,6 +1570,46 @@ mod tests {
     let _ = std::fs::remove_dir_all(&dir);
   }
 
+  /// SENTINEL pattern — plant a `model.safetensors` containing 1 MiB of
+  /// pure garbage bytes. If the fail-fast validation ran AFTER
+  /// `load_weights`, the safetensors loader would fail with a parser
+  /// error naming the bogus header (an mlx-c `safetensors` parse failure,
+  /// NOT a backend error about an unsupported arch / quantized
+  /// checkpoint). The test asserts the SPECIFIC validation error fires
+  /// AND that the error message does NOT carry any safetensors-parse
+  /// signature, which proves `convert_to_gguf` rejected the model
+  /// without touching the weight file.
+  ///
+  /// 1 MiB is large enough that an accidental "passed through to
+  /// `load_safetensors`" would either (a) succeed silently parsing
+  /// nothing of value, returning weird errors deeper in the pipeline, or
+  /// (b) error with a clear parse message — either way the assertion
+  /// below catches it.
+  fn write_sentinel_weights(dir: &std::path::Path) {
+    // 1 MiB of `0xAB` bytes — not a valid safetensors header, so
+    // `load_safetensors` would error with a parse-specific message.
+    let garbage = vec![0xAB_u8; 1024 * 1024];
+    std::fs::write(dir.join("model.safetensors"), &garbage).unwrap();
+  }
+
+  /// Assert `msg` contains NONE of the safetensors-loader error fingerprints
+  /// (any of which would prove `load_safetensors` ran on the sentinel file
+  /// — i.e. the fail-fast validation did NOT run before the weight load).
+  fn assert_no_safetensors_load_signature(msg: &str) {
+    for needle in [
+      "safetensors",
+      "load_safetensors",
+      "header",
+      "deserializ",
+      "mlx_load",
+    ] {
+      assert!(
+        !msg.to_lowercase().contains(needle),
+        "unexpected weight-load signature {needle:?} in error: {msg}"
+      );
+    }
+  }
+
   #[test]
   fn convert_to_gguf_rejects_unsupported_arch() {
     let dir = fresh_dir("reject_arch");
@@ -1492,9 +1629,10 @@ mod tests {
       "rms_norm_eps": 1e-5,
     });
     std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
-    // Empty weights — the architecture check fires before load_weights.
-    let weights: HashMap<String, Array> = HashMap::new();
-    crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+    // SENTINEL: 1 MiB of garbage bytes. If load_weights ran, the
+    // safetensors loader would error with a parse signature; the
+    // assert_no_safetensors_load_signature check below would trip.
+    write_sentinel_weights(&dir);
 
     let gguf_path = dir.join("out.gguf");
     let err = convert_to_gguf(&ConvertToGgufArgs {
@@ -1507,6 +1645,7 @@ mod tests {
       msg.contains("qwen3") && msg.contains("not supported"),
       "expected unsupported-arch error, got: {msg}"
     );
+    assert_no_safetensors_load_signature(&msg);
 
     let _ = std::fs::remove_dir_all(&dir);
   }
@@ -1531,8 +1670,8 @@ mod tests {
       "quantization": { "group_size": 64, "bits": 4 },
     });
     std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
-    let weights: HashMap<String, Array> = HashMap::new();
-    crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+    // SENTINEL: 1 MiB of garbage bytes (see `write_sentinel_weights`).
+    write_sentinel_weights(&dir);
 
     let gguf_path = dir.join("out.gguf");
     let err = convert_to_gguf(&ConvertToGgufArgs {
@@ -1542,8 +1681,267 @@ mod tests {
     .unwrap_err();
     let msg = format!("{err:?}");
     assert!(
-      msg.contains("quantized") && msg.contains("not yet supported"),
+      msg.contains("quantized") && msg.contains("not supported"),
       "expected quantized-reject error, got: {msg}"
+    );
+    assert_no_safetensors_load_signature(&msg);
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// Same fail-fast contract as above for the `quantization_config` JSON
+  /// key — a few HF checkpoints + mlx-lm post-quantize artifacts ship
+  /// the quantization payload under the longer key (not the strongly
+  /// typed `quantization` field that `Config` carries). The fail-fast
+  /// gate must trip on either key BEFORE the weight load.
+  #[test]
+  fn convert_to_gguf_rejects_quantization_config_key() {
+    let dir = fresh_dir("reject_quant_cfg");
+    let _ = write_tokenizer_fixture(&dir);
+    let config = serde_json::json!({
+      "model_type": "llama",
+      "hidden_size": 4,
+      "num_hidden_layers": 1,
+      "num_attention_heads": 2,
+      "num_key_value_heads": 2,
+      "head_dim": 2,
+      "rope_theta": 10000.0,
+      "vocab_size": 5,
+      "tie_word_embeddings": false,
+      "intermediate_size": 8,
+      "max_position_embeddings": 16,
+      "rms_norm_eps": 1e-5,
+      // The longer key — Config doesn't pull this into the typed field;
+      // the JSON gate in convert_to_gguf catches it.
+      "quantization_config": { "group_size": 64, "bits": 4 },
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    write_sentinel_weights(&dir);
+
+    let gguf_path = dir.join("out.gguf");
+    let err = convert_to_gguf(&ConvertToGgufArgs {
+      model_path: dir.clone(),
+      gguf_path,
+    })
+    .unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+      msg.contains("quantized") && msg.contains("not supported"),
+      "expected quantized-reject error, got: {msg}"
+    );
+    assert_no_safetensors_load_signature(&msg);
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  // ─────────── HfVocab.special_ids union (Finding 1 — coverage) ───────────
+
+  /// A second tokenizer fixture where BOS/EOS/UNK live at BASE-VOCAB ids
+  /// (NOT in `added_tokens_decoder`). The Python reference's
+  /// `tokenizer.all_special_ids` (`mlx_lm/gguf.py:49`) unions
+  /// `added_tokens_decoder.special=true` AND the ids declared in
+  /// `tokenizer_config.json` (`bos_token`/`eos_token`/`unk_token`/
+  /// `pad_token`/`additional_special_tokens`) — the latter can resolve
+  /// to base-vocab ids. Building `special_ids` from the added-tokens
+  /// decoder alone would misclassify these as `Normal` instead of
+  /// `Control`.
+  ///
+  /// Fixture shape:
+  ///   - 6 base-vocab tokens: `<unk>`(0), `<s>`(1), `</s>`(2), `<pad>`(3),
+  ///     `a`(4), `b`(5).
+  ///   - `tokenizer.json#added_tokens` is empty (so `<unk>`/`<s>`/`</s>`
+  ///     are NOT in `added_tokens_decoder`).
+  ///   - `tokenizer_config.json` declares `bos_token: <s>`,
+  ///     `eos_token: </s>`, `unk_token: <unk>`, `pad_token: <pad>`,
+  ///     `additional_special_tokens: [b]`.
+  ///
+  /// Expected: ids 0, 1, 2, 3, 5 are `Control`; id 4 (`a`) is `Normal`.
+  fn write_base_vocab_special_fixture(dir: &std::path::Path) -> crate::tokenizer::Tokenizer {
+    use serde_json::json;
+    let tok = json!({
+      "version": "1.0",
+      "model": {
+        "type": "BPE",
+        "vocab": {
+          "<unk>": 0,
+          "<s>": 1,
+          "</s>": 2,
+          "<pad>": 3,
+          "a": 4,
+          "b": 5,
+        },
+        "merges": []
+      },
+      // INTENTIONALLY EMPTY — the specials are declared via
+      // tokenizer_config.json, not via added_tokens_decoder.
+      "added_tokens": [],
+    });
+    std::fs::write(dir.join("tokenizer.json"), tok.to_string()).unwrap();
+
+    let cfg = json!({
+      "bos_token": "<s>",
+      "eos_token": "</s>",
+      "unk_token": "<unk>",
+      "pad_token": "<pad>",
+      "additional_special_tokens": ["b"],
+    });
+    std::fs::write(dir.join("tokenizer_config.json"), cfg.to_string()).unwrap();
+
+    crate::tokenizer::Tokenizer::from_path(dir, None).unwrap()
+  }
+
+  #[test]
+  fn convert_to_gguf_uses_base_vocab_special_token_ids() {
+    let dir = fresh_dir("base_vocab_specials");
+    let tokenizer = write_base_vocab_special_fixture(&dir);
+    let vocab = HfVocab::from_tokenizer(&tokenizer).unwrap();
+
+    // (a) special_ids contains the base-vocab ids declared in
+    //     tokenizer_config.json (the Finding 1 fix is the only way these
+    //     end up in the set — they are NOT in added_tokens_decoder).
+    assert!(vocab.special_ids.contains(&0), "unk (id 0) missing");
+    assert!(vocab.special_ids.contains(&1), "bos (id 1) missing");
+    assert!(vocab.special_ids.contains(&2), "eos (id 2) missing");
+    assert!(vocab.special_ids.contains(&3), "pad (id 3) missing");
+    assert!(vocab.special_ids.contains(&5), "additional 'b' missing");
+    assert!(
+      !vocab.special_ids.contains(&4),
+      "plain 'a' must NOT be classified Control"
+    );
+
+    // (b) get_token_type returns Control for those ids and Normal for 'a'.
+    assert_eq!(vocab.get_token_type(0, "<unk>"), TokenType::Control);
+    assert_eq!(vocab.get_token_type(1, "<s>"), TokenType::Control);
+    assert_eq!(vocab.get_token_type(2, "</s>"), TokenType::Control);
+    assert_eq!(vocab.get_token_type(3, "<pad>"), TokenType::Control);
+    assert_eq!(vocab.get_token_type(4, "a"), TokenType::Normal);
+    assert_eq!(vocab.get_token_type(5, "b"), TokenType::Control);
+
+    // (c) The emitted GGUF tokenizer.ggml.token_type array carries the
+    //     correct value at each of these indices. We drive this via
+    //     prepare_metadata which packs all_tokens() into the token_type
+    //     array (`mlx_lm/gguf.py:240`).
+    let config_text = serde_json::json!({
+      "model_type": "llama",
+      "hidden_size": 8,
+      "num_hidden_layers": 2,
+      "num_attention_heads": 2,
+      "num_key_value_heads": 2,
+      "head_dim": 4,
+      "rope_theta": 10000.0,
+      "vocab_size": 6,
+      "tie_word_embeddings": false,
+      "intermediate_size": 16,
+      "max_position_embeddings": 32,
+      "rms_norm_eps": 1e-5,
+    })
+    .to_string();
+    let raw_json: serde_json::Value = serde_json::from_str(&config_text).unwrap();
+    let config = Config::from_json(&config_text).unwrap();
+    let meta = prepare_metadata(&config, &raw_json, &vocab).unwrap();
+
+    let toktype_vals = match meta.get("tokenizer.ggml.token_type").unwrap() {
+      GgufMetadata::Array(a) => {
+        let mut a = a.try_clone().unwrap();
+        a.to_vec::<u32>().unwrap()
+      }
+      _ => panic!("token_type was not an Array"),
+    };
+    assert_eq!(toktype_vals.len(), 6);
+    assert_eq!(toktype_vals[0], TokenType::Control as u32, "unk (id 0)");
+    assert_eq!(toktype_vals[1], TokenType::Control as u32, "bos (id 1)");
+    assert_eq!(toktype_vals[2], TokenType::Control as u32, "eos (id 2)");
+    assert_eq!(toktype_vals[3], TokenType::Control as u32, "pad (id 3)");
+    assert_eq!(toktype_vals[4], TokenType::Normal as u32, "'a' (id 4)");
+    assert_eq!(
+      toktype_vals[5],
+      TokenType::Control as u32,
+      "additional 'b' (id 5)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// Cross-source coverage: one special lives in `added_tokens_decoder`
+  /// (with `special=true`), one lives in the base vocab and is declared
+  /// via `tokenizer_config.json` `additional_special_tokens` only. Both
+  /// must end up in `special_ids` (i.e. the union of (a) + (b) from the
+  /// `HfVocab` constructor docs).
+  #[test]
+  fn convert_to_gguf_special_ids_unions_added_and_base_vocab() {
+    let dir = fresh_dir("union_specials");
+    use serde_json::json;
+    let tok = json!({
+      "version": "1.0",
+      "model": {
+        "type": "BPE",
+        "vocab": {
+          "<unk>": 0,
+          "<s>": 1,
+          "a": 2,
+          "<extra>": 3, // base vocab, will be declared via additional_special_tokens
+        },
+        "merges": []
+      },
+      // added_tokens_decoder carries ONLY <added>, an out-of-base added token
+      // marked special=true. <s> is left out (so it lives only in the base
+      // vocab + tokenizer_config bos_token).
+      "added_tokens": [
+        {"id": 100, "content": "<added>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+      ],
+    });
+    std::fs::write(dir.join("tokenizer.json"), tok.to_string()).unwrap();
+
+    let cfg = json!({
+      "bos_token": "<s>",
+      "additional_special_tokens": ["<extra>"],
+    });
+    std::fs::write(dir.join("tokenizer_config.json"), cfg.to_string()).unwrap();
+
+    let tokenizer = crate::tokenizer::Tokenizer::from_path(&dir, None).unwrap();
+
+    // The `tokenizers` crate rewrites added-token ids past the base vocab
+    // into the next available slot (the JSON-declared `"id": 100` becomes
+    // `id = vocab_size_base` after load). Resolve the actual id of
+    // `<added>` from the live tokenizer rather than hard-coding 100 so
+    // the assertion stays robust to that rewrite (the union semantics —
+    // not the numeric id — is what the test exercises).
+    let added_id = tokenizer
+      .hf()
+      .get_added_tokens_decoder()
+      .iter()
+      .find(|(_, t)| t.content == "<added>")
+      .map(|(id, _)| *id)
+      .expect("`<added>` must appear in added_tokens_decoder");
+    let vocab = HfVocab::from_tokenizer(&tokenizer).unwrap();
+
+    // (a) source: added_tokens_decoder special=true → <added>.
+    assert!(
+      vocab.special_ids.contains(&added_id),
+      "added <added> (id {added_id}) missing — source (a) failed; special_ids={:?}",
+      vocab.special_ids,
+    );
+    // (b) source: tokenizer_config.json bos_token → <s> at base id 1
+    //     AND additional_special_tokens → <extra> at base id 3.
+    //     Neither of these is in added_tokens_decoder, so the only way
+    //     they end up in special_ids is via the Finding 1 union — they
+    //     are the canonical "BOS/EOS/UNK as a base-vocab token" case
+    //     this finding exists to cover.
+    assert!(
+      vocab.special_ids.contains(&1),
+      "bos <s> (base id 1) missing — source (b) failed; special_ids={:?}",
+      vocab.special_ids,
+    );
+    assert!(
+      vocab.special_ids.contains(&3),
+      "additional <extra> (base id 3) missing — source (b) failed; special_ids={:?}",
+      vocab.special_ids,
+    );
+    // Negative control: plain 'a' is not declared anywhere.
+    assert!(
+      !vocab.special_ids.contains(&2),
+      "plain 'a' (id 2) should not be in special_ids; special_ids={:?}",
+      vocab.special_ids,
     );
 
     let _ = std::fs::remove_dir_all(&dir);

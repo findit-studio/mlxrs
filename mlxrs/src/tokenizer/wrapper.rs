@@ -572,6 +572,43 @@ impl Tokenizer {
       .as_deref()
       .and_then(|t| self.hf.token_to_id(t))
   }
+  /// `additional_special_tokens` resolved to ids (from
+  /// `tokenizer_config.json`). Mirrors the HF
+  /// `PreTrainedTokenizerBase.additional_special_tokens_ids` accessor.
+  ///
+  /// Each entry in the `additional_special_tokens` array may be either a
+  /// plain string (`"<extra>"`) or an `AddedToken`-style object
+  /// (`{"content": "<extra>", ...}`) — the same two shapes the private
+  /// `cfg_str` helper handles for the singular `bos_token`/`eos_token`/
+  /// etc. fields. An entry that does not resolve to a known vocab id is
+  /// silently skipped (matching HF behavior — the underlying
+  /// `convert_tokens_to_ids` returns `None`/`unk_token_id` for unknown
+  /// entries, but the GGUF-export caller only needs the IDs that exist
+  /// in the vocab to flag them as `Control` tokens).
+  #[cfg(feature = "tokenizer-config")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "tokenizer-config")))]
+  pub fn additional_special_token_ids(&self) -> Vec<u32> {
+    let Some(arr) = self.config.get("additional_special_tokens") else {
+      return Vec::new();
+    };
+    let Some(items) = arr.as_array() else {
+      return Vec::new();
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+      let token: Option<&str> = match item {
+        Value::String(s) => Some(s.as_str()),
+        Value::Object(o) => o.get("content").and_then(Value::as_str),
+        _ => None,
+      };
+      if let Some(tok) = token
+        && let Some(id) = self.hf.token_to_id(tok)
+      {
+        out.push(id);
+      }
+    }
+    out
+  }
   /// The full eos-token-id set (Python `eos_token_ids`).
   pub fn eos_token_ids(&self) -> &std::collections::BTreeSet<u32> {
     &self.eos_token_ids
