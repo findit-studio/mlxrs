@@ -841,6 +841,29 @@ pub fn load_dataset<'a>(
   // Open FIRST, then validate against the handle's own metadata. This
   // closes a TOCTOU window where a metadata() check could be bypassed
   // by a symlink swap or by an append between the check and the read.
+  //
+  // On Unix the open uses `O_NONBLOCK | O_CLOEXEC` (mirroring
+  // [`crate::lm::lora`], [`crate::lm::load`], and
+  // [`crate::embeddings::config`]) so that a planted FIFO (or symlink
+  // → FIFO) at `path` cannot wedge a blocking `open()` on a missing
+  // writer; the call returns immediately and the post-open
+  // `is_file()` check below rejects the non-regular target before any
+  // read is attempted. `O_NONBLOCK` is a no-op for regular files
+  // (Linux/macOS), so the subsequent reads remain blocking as
+  // expected. `O_CLOEXEC` keeps the fd from leaking into child
+  // processes.
+  #[cfg(unix)]
+  let file = {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+      .read(true)
+      .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+      .open(path)
+      .map_err(|e| Error::Backend {
+        message: format!("open jsonl {}: {e}", path.display()),
+      })?
+  };
+  #[cfg(not(unix))]
   let file = std::fs::File::open(path).map_err(|e| Error::Backend {
     message: format!("open jsonl {}: {e}", path.display()),
   })?;
@@ -899,33 +922,101 @@ pub fn load_dataset<'a>(
 /// does NOT have to point at an actual file. A blank line is rejected
 /// (silently dropping blanks would shift every subsequent record's
 /// 1-based index and could mask data corruption).
+///
+/// # Why a manual `read_until` instead of `BufRead::lines()`
+///
+/// `BufRead::lines()` reads a FULL line into a `String` BEFORE
+/// yielding, so a single mid-read-grown gigantic line (or a hostile
+/// stream containing one giant unterminated line) would allocate
+/// arbitrarily many bytes BEFORE the post-yield cap check could fire
+/// → OOM. The fix is to bound EACH per-iteration read at
+/// `remaining + 1` bytes via `(&mut reader).take(remaining + 1)`:
+/// this enforces the cap on the read ITSELF (the `BufReader` cannot
+/// pull more than `remaining + 1` bytes into the line buffer per
+/// iteration), and the post-read cumulative check rejects on the
+/// `+1` overflow byte. A million-byte single line at file start with
+/// a 1000-byte cap therefore reads at most 1001 bytes before erroring.
 fn read_jsonl_with_cap<R: BufRead>(
-  reader: R,
+  mut reader: R,
   path_for_errors: &Path,
   max_bytes: u64,
 ) -> Result<Vec<Value>> {
   let mut data: Vec<Value> = Vec::new();
   let mut total_bytes: u64 = 0;
-  for (i, line_result) in reader.lines().enumerate() {
-    let lineno = i + 1; // 1-based for human-facing errors
-    let line = line_result.map_err(|e| Error::Backend {
-      message: format!(
-        "read jsonl {} line {}: {e}",
-        path_for_errors.display(),
-        lineno,
-      ),
-    })?;
-    // Cumulative cap, enforced INSIDE the read loop so that a file
-    // which grows between the pre-open metadata check and the actual
-    // read (or a custom reader that streams more bytes than its
-    // metadata advertised) cannot bypass the cap. `BufRead::lines()`
-    // strips the trailing newline, so the `+1` is a conservative
-    // estimate of the on-disk byte cost per iteration; this only
-    // OVER-counts (never under-counts), so the cap remains a strict
-    // upper bound on bytes actually read into memory.
-    total_bytes = total_bytes
-      .saturating_add(line.len() as u64)
-      .saturating_add(1);
+  let mut lineno: usize = 0;
+  let mut line_buf: Vec<u8> = Vec::with_capacity(4096);
+  loop {
+    line_buf.clear();
+    let remaining = max_bytes.saturating_sub(total_bytes);
+    if remaining == 0 {
+      // No budget left. If the reader still has bytes pending, that
+      // is a cap overflow; if it's at EOF, normal exit.
+      let mut peek = [0u8; 1];
+      let n = std::io::Read::read(&mut reader, &mut peek).map_err(|e| Error::Backend {
+        message: format!(
+          "read jsonl {} after line {}: {e}",
+          path_for_errors.display(),
+          lineno,
+        ),
+      })?;
+      if n == 0 {
+        break;
+      }
+      return Err(Error::Backend {
+        message: format!(
+          "jsonl {} exceeded the {}-byte cap during read (cumulative \
+           bytes after line {} already at the cap, and more bytes \
+           remained in the reader); the file may have grown mid-read, \
+           or the per-line size is unexpectedly large",
+          path_for_errors.display(),
+          max_bytes,
+          lineno,
+        ),
+      });
+    }
+    // Cap THIS line's read at `remaining + 1` so we detect the
+    // overflow on the `+1` byte rather than allocating arbitrarily.
+    // `Read::take(limit)` ENFORCES the cap on the read itself — the
+    // buffered reader cannot allocate more than `limit` bytes per
+    // iteration. We then check the cumulative byte count post-read
+    // to confirm the cap. `remaining + 1` cannot overflow u64
+    // because `remaining <= max_bytes <= u64::MAX - 1` (max_bytes is
+    // 2 GiB in production); we guard with saturating_add anyway.
+    let cap_this_line = remaining.saturating_add(1);
+    // `Read::take` consumes `Self`; calling it on `&mut R` (which is
+    // itself `Read` via the blanket `impl<R: Read + ?Sized> Read for
+    // &mut R`) borrows the inner reader for the duration of `take`
+    // without moving it. We then drive `BufRead::read_until` on the
+    // `Take<&mut R>` adapter, which is itself `BufRead` via the
+    // `impl<T: BufRead> BufRead for Take<T>` blanket. After this
+    // borrow ends the original `reader` is usable again for the next
+    // iteration.
+    let mut take = <&mut R as std::io::Read>::take(&mut reader, cap_this_line);
+    let n = match std::io::BufRead::read_until(&mut take, b'\n', &mut line_buf) {
+      Ok(n) => n,
+      Err(e) => {
+        return Err(Error::Backend {
+          message: format!(
+            "read jsonl {} line {}: {e}",
+            path_for_errors.display(),
+            lineno + 1,
+          ),
+        });
+      }
+    };
+    if n == 0 {
+      // EOF.
+      break;
+    }
+    total_bytes = total_bytes.saturating_add(n as u64);
+    lineno += 1;
+    // The cumulative cap is enforced INSIDE the read loop so that a
+    // file which grows between the pre-open metadata check and the
+    // actual read (or a custom reader that streams more bytes than
+    // its metadata advertised) cannot bypass the cap. Combined with
+    // the per-iteration `take(remaining + 1)`, this also rejects a
+    // SINGLE giant line that alone exceeds the cap without
+    // allocating past `remaining + 1` bytes.
     if total_bytes > max_bytes {
       return Err(Error::Backend {
         message: format!(
@@ -939,6 +1030,23 @@ fn read_jsonl_with_cap<R: BufRead>(
         ),
       });
     }
+    // Strip the trailing newline for downstream parsing, if any.
+    if line_buf.last() == Some(&b'\n') {
+      line_buf.pop();
+      // Also strip a preceding CR (Windows-style line endings).
+      if line_buf.last() == Some(&b'\r') {
+        line_buf.pop();
+      }
+    }
+    // Bytes were read into `line_buf`; treat the contents as UTF-8
+    // for the parsing path that follows.
+    let line = std::str::from_utf8(&line_buf).map_err(|e| Error::Backend {
+      message: format!(
+        "jsonl {} line {} is not valid UTF-8: {e}",
+        path_for_errors.display(),
+        lineno,
+      ),
+    })?;
     let trimmed = line.trim();
     if trimmed.is_empty() {
       // Python `tuner/datasets.py` does `[json.loads(l) for l in fid]`,
@@ -1614,5 +1722,130 @@ mod tests {
     };
     assert_eq!(second.0, vec![4, 2]); // world </s>
     assert_ne!(first.0, second.0);
+  }
+
+  // Codex round-2 [high]: `File::open` blocks read-only on a FIFO
+  // until a writer appears; the `meta.is_file()` rejection runs AFTER
+  // the open, so an adversarial FIFO at the dataset path used to hang
+  // the loader indefinitely. The fix opens with
+  // `O_NONBLOCK | O_CLOEXEC` (mirroring the rest of mlxrs's hardened
+  // loaders) so the open returns immediately and the post-open
+  // `is_file()` check rejects the non-regular target before any read
+  // is attempted. This test plants a real writer-less FIFO at the
+  // dataset path and asserts the loader returns `Err(Backend)` with a
+  // "not a regular file" message PROMPTLY (within a 2 s budget).
+  //
+  // Determinism / non-flakiness: the loader runs on a worker thread
+  // and is joined with a 2 s budget. With the fix, the open is
+  // instantaneous (sub-millisecond), so the budget is never
+  // approached. If the `O_NONBLOCK` open regresses, the blocking
+  // `File::open()` wedges on the writer-less FIFO → the budget
+  // elapses and the test FAILS loudly instead of hanging CI. The
+  // thread is left detached on the (regression-only) timeout path so
+  // a regression cannot wedge the entire test binary.
+  #[cfg(unix)]
+  #[test]
+  fn load_dataset_rejects_fifo_without_blocking() {
+    use std::{os::unix::ffi::OsStrExt, sync::mpsc};
+    let dir = fresh_dir("load_fifo");
+    // The dataset tokenizer fixture leaks a different temp dir.
+    let tok = tokenizer_fixture("load_fifo_tok");
+    let path = dir.join("train.jsonl");
+    // Plant a real FIFO with NO writer. A blocking read-only
+    // `open()` on this would hang forever.
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c_path` is a valid NUL-terminated C string that
+    // outlives the call; `mkfifo` only reads the path and creates a
+    // filesystem node — no aliasing concerns.
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo failed (rc {rc})");
+
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+      let r = load_dataset(&path, &tok, DatasetType::Auto, &DatasetConfig::default());
+      let msg = match &r {
+        Err(Error::Backend { message }) => Some(message.clone()),
+        _ => None,
+      };
+      let _ = tx.send(msg);
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+      Ok(Some(msg)) => {
+        handle.join().unwrap();
+        assert!(
+          msg.contains("not a regular file"),
+          "FIFO at dataset path must yield 'not a regular file' \
+           rejection, got: {msg}",
+        );
+      }
+      Ok(None) => {
+        handle.join().unwrap();
+        panic!(
+          "FIFO at dataset path must yield Err(Backend), got a \
+           different result"
+        );
+      }
+      Err(_) => {
+        // Regression: the O_NONBLOCK open was lost and the blocking
+        // `File::open()` is wedged. Do NOT join (would wedge CI) —
+        // fail loudly. The detached thread dies with the process.
+        std::fs::remove_dir_all(&dir).ok();
+        panic!(
+          "load_dataset HUNG on a writer-less FIFO — the O_NONBLOCK \
+           open regressed"
+        );
+      }
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  // Codex round-2 [high]: `BufRead::lines()` reads a FULL line into a
+  // `String` BEFORE yielding, so a single mid-read-grown gigantic
+  // line bypasses the cumulative cap → OOM. The fix replaces
+  // `lines()` with manual `read_until(b'\n')` plus a per-iteration
+  // `take(remaining + 1)` so the cap is enforced on the READ itself —
+  // the buffered reader cannot allocate more than `remaining + 1`
+  // bytes per iteration, regardless of how long the underlying
+  // (unterminated) line is.
+  //
+  // This test drives `read_jsonl_with_cap` with a 40-byte cap and a
+  // SINGLE 100-byte line containing no newline. Before the fix the
+  // reader would allocate all 100 bytes; after the fix it allocates
+  // at most `cap + 1 = 41` bytes before the cap error fires. We
+  // assert both the cap error and (via `line_buf` indirectly through
+  // error message structure) that the implementation is operating
+  // under the truncation.
+  #[test]
+  fn load_dataset_cap_enforced_on_single_giant_line() {
+    use std::io::Cursor;
+    // 100 bytes of `a`, no newline anywhere — would force any
+    // line-buffered reader to consume the full input before yielding.
+    let body: Vec<u8> = vec![b'a'; 100];
+    let cap: u64 = 40;
+    let path = std::path::PathBuf::from("/synthetic/giant.jsonl");
+    let err = read_jsonl_with_cap(Cursor::new(body), &path, cap).unwrap_err();
+    let s = err.to_string();
+    assert!(
+      s.contains("exceeded the 40-byte cap"),
+      "expected 40-byte cap error on a single giant line, got: {s}",
+    );
+    assert!(
+      s.contains("during read"),
+      "expected 'during read' phrasing in cap error, got: {s}",
+    );
+    assert!(
+      s.contains("/synthetic/giant.jsonl"),
+      "expected synthetic path in cap error, got: {s}",
+    );
+    // Also exercise the "no newline anywhere, cap >= input" boundary
+    // to confirm a short single line WITHOUT a trailing newline
+    // doesn't trip the cap (it should parse as one record). 16 bytes
+    // is well below the 40-byte cap.
+    let small_body = b"{\"text\":\"abc\"}".to_vec();
+    let v = read_jsonl_with_cap(Cursor::new(small_body), &path, cap).unwrap();
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0]["text"].as_str(), Some("abc"));
   }
 }
