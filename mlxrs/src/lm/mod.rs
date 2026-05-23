@@ -33,6 +33,9 @@ pub mod cache;
 pub mod cache_prompt;
 pub mod factory;
 pub mod generate;
+#[cfg(feature = "gguf")]
+#[cfg_attr(docsrs, doc(cfg(feature = "gguf")))]
+pub mod gguf;
 pub mod load;
 pub mod lora;
 pub mod model;
