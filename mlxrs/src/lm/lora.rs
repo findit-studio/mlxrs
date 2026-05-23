@@ -2349,8 +2349,12 @@ impl DoRAEmbedding {
   ///
   /// The renorm divisor is the L2 norm of each token's *adapted* embedding
   /// (per-token, NOT a global row-norm of the table — that is the [`fuse`]
-  /// path). `x` carries integer token ids; the output dtype matches the base
-  /// weight's. Lazy.
+  /// path). `x` carries integer token ids; the output dtype is the mlx
+  /// promotion of `y.dtype` and the adapter's dtype (matching mlx-lm
+  /// `tuner/dora.py:208` which returns `(m[x]/denom)[..., None] * out`
+  /// directly — no final astype). So with an f16/bf16 base and f32 adapter,
+  /// `forward` returns f32; callers that want the narrow dtype must cast.
+  /// Lazy.
   ///
   /// [`fuse`]: DoRAEmbedding::fuse
   pub fn forward(&self, x: &Array) -> Result<Array> {
@@ -2393,17 +2397,13 @@ impl DoRAEmbedding {
     // `tuner/dora.py:208`).
     let norm_scale = norm_scale.expand_dims_axes(&[-1])?;
     // (m[x]/denom)[..., None] * out — mlx promotes to the higher-precision
-    // dtype on multiply (`tuner/dora.py:208`).
-    let scaled_out = norm_scale.multiply(&out)?;
-    // Final cast back to y.dtype — the port pins the public return dtype to
-    // the embedding's dtype so downstream layers (which built around the
-    // embedding's narrow dtype) don't see a silent upcast from the
-    // mixed-precision renorm. mlx-lm leaves promotion implicit (its callers
-    // re-cast), but the rustier story is one explicit cast at the boundary.
-    match y.dtype() {
-      Ok(dt) => scaled_out.astype(dt),
-      Err(_) => Ok(scaled_out),
-    }
+    // dtype on multiply, exactly mirroring mlx-lm `tuner/dora.py:208`:
+    // `out = (self.m[x] / denom)[..., None] * out` (RETURNED DIRECTLY, NO
+    // astype). With f16/bf16 base + f32 adapter, mlx promotion leaves the
+    // result in f32; a final `astype(y.dtype)` here would silently narrow
+    // back to f16/bf16 and drop the promoted precision, diverging from
+    // mlx-lm at the forward boundary.
+    norm_scale.multiply(&out)
   }
 
   /// Tied-weight LM-head forward (`embedding.as_linear`) — mlx-lm
@@ -7121,9 +7121,13 @@ mod tests {
   /// pre-rounded version of the f32 source (f16 or bf16 round-trip) so it
   /// reflects the exact bits the kernel sees.
   ///
-  /// Returns the final f16/bf16-rounded outputs for each token in `ids`,
-  /// flattened to a `Vec<f32>` for direct comparison against the kernel
-  /// output (which we extract via `astype(F32)`).
+  /// Returns the kernel-equivalent promoted-dtype outputs for each token in
+  /// `ids`, flattened to a `Vec<f32>` for direct comparison against the
+  /// kernel output (which we extract via `astype(F32)`). The final value is
+  /// NOT round-tripped to the narrow dtype — `forward` now returns the
+  /// promoted dtype directly (mlx-lm `tuner/dora.py:208` returns
+  /// `(self.m[x] / denom)[..., None] * out` with no astype; the port
+  /// mirrors that exactly).
   #[allow(clippy::too_many_arguments)]
   fn forward_scalar_reference(
     weight_f32: &[Vec<f32>],
@@ -7168,13 +7172,16 @@ mod tests {
       let adapted: Vec<f64> = (0..dims).map(|d| y_rt[d] + z_for_norm[d]).collect();
       let denom = adapted.iter().map(|v| v * v).sum::<f64>().sqrt();
       let norm_scale = (m_f32[tid] as f64) / denom;
-      // scaled_out = norm_scale * out_pre — at f64; mlx runs at f32 (promotion
-      // from f16/bf16 * f32). The final cast back to y.dtype matches the port's
-      // `out.astype(y.dtype)` (mlx-lm leaves promotion implicit; the port pins
-      // the return dtype, see the `forward` doc).
+      // scaled_out = norm_scale * out_pre — at f64; mlx runs at f32
+      // (promotion from f16/bf16 * f32). NO final cast to y.dtype — `forward`
+      // now returns the promoted dtype directly (mlx-lm `tuner/dora.py:208`),
+      // so the reference is returned at the promoted dtype too (f32 for the
+      // mixed-precision fixture). f64 → f32 narrowing is fine here: the f64
+      // reference's round-off well below the fp16/bf16 tolerance floor used
+      // by the assertions.
       for &op in &out_pre {
         let scaled = norm_scale * op;
-        out.push(rt(scaled as f32) as f32);
+        out.push(scaled as f32);
       }
     }
     out
@@ -7289,9 +7296,10 @@ mod tests {
   /// the fp16 tolerance — the OLD (upfront-cast) port would mismatch the
   /// scalar reference by orders of magnitude.
   ///
-  /// Also asserts the output dtype is f16 — the new port pins the public
-  /// return dtype to `y.dtype` via the trailing `astype` (the renorm multiply
-  /// itself promotes to f32 via mlx).
+  /// Also asserts the output dtype is **f32** — the round-2 fix removed the
+  /// trailing `astype(y.dtype)` so `forward` now returns mlx's promoted dtype
+  /// directly (mlx-lm `tuner/dora.py:208` returns `(m[x]/denom)[..., None] *
+  /// out` with no astype; f16 base × f32 adapter promotes to f32).
   #[test]
   fn dora_embedding_forward_mixed_precision_matches_reference_f16_base_f32_adapter() {
     let (weight_f32, lora_a_f32, lora_b_f32, m_f32, scale) = mp_fixture();
@@ -7319,13 +7327,13 @@ mod tests {
     let ids_vec: Vec<i32> = (0..num_embeddings as i32).collect();
     let ids = Array::from_slice::<i32>(&ids_vec, &(num_embeddings,)).unwrap();
     let out = layer.forward(&ids).unwrap();
-    // Final dtype must be f16 — the port's trailing `astype(y.dtype)` pins
-    // the return dtype to the embedding's dtype (mlx-lm leaves promotion
-    // implicit; the port made one explicit cast at the boundary).
+    // Final dtype must be f32 — mlx promotes f16 × f32 → f32 on the final
+    // `(m[x]/denom)[..., None] * out` multiply, and the round-2 fix removed
+    // the narrowing astype that used to pin the return to y.dtype.
     assert_eq!(
       out.dtype().unwrap(),
-      Dtype::F16,
-      "forward must return y.dtype = f16"
+      Dtype::F32,
+      "forward must return the promoted dtype = f32 (f16 base × f32 adapter)"
     );
     let mut out_f32 = out.astype(Dtype::F32).unwrap();
     let got = out_f32.to_vec::<f32>().unwrap();
@@ -7340,9 +7348,12 @@ mod tests {
       f16_rt,
       false, // new pipeline: uncast z for the renorm.
     );
-    // fp16 tolerance: ~5e-3 relative on order-1 values; per-element absolute
-    // tol 5e-3 is comfortably above the f64-reference round-off and below
-    // the upfront-cast pipeline's mismatch (see the regression-oracle test).
+    // Promoted-dtype output. Tolerance still ~5e-3: the cancellation-fixture
+    // f16 rounding of `y` (which enters `adapted = y + z`) dominates the
+    // residual error; the dropped final-narrowing cast does not buy a
+    // tighter fit because the f16 round-off was already absorbed upstream.
+    // Keeping the original tolerance preserves the test's defect-detection
+    // power against the upfront-cast bug.
     approx_eq(&got, &want, 5e-3);
   }
 
@@ -7376,10 +7387,12 @@ mod tests {
     let ids_vec: Vec<i32> = (0..num_embeddings as i32).collect();
     let ids = Array::from_slice::<i32>(&ids_vec, &(num_embeddings,)).unwrap();
     let out = layer.forward(&ids).unwrap();
+    // Promoted dtype = f32 (bf16 × f32 → f32 under mlx promotion); round-2
+    // fix removed the narrowing astype.
     assert_eq!(
       out.dtype().unwrap(),
-      Dtype::BF16,
-      "forward must return y.dtype = bf16"
+      Dtype::F32,
+      "forward must return the promoted dtype = f32 (bf16 base × f32 adapter)"
     );
     let mut out_f32 = out.astype(Dtype::F32).unwrap();
     let got = out_f32.to_vec::<f32>().unwrap();
@@ -7394,7 +7407,8 @@ mod tests {
       bf16_rt,
       false,
     );
-    // bf16 tolerance: looser, matching its narrower mantissa.
+    // bf16 tolerance: looser, matching its narrower mantissa (the bf16
+    // round-off on y dominates; same reasoning as the f16 sibling).
     approx_eq(&got, &want, 5e-2);
   }
 
@@ -7500,16 +7514,17 @@ mod tests {
   }
 
   /// `dora_embedding_forward_loses_precision_with_upfront_cast_regression_oracle`
-  /// — assert the new (uncast-z, uncast-norm-scale) pipeline matches the
-  /// f64 scalar reference WAY MORE TIGHTLY than the OLD (upfront-cast)
-  /// pipeline would. Cancellation fixture: with f16 base + f32 adapter and
-  /// `y ≈ -z`, the f16 rounding of `z` perturbs ‖adapted‖ by a relative
-  /// amount that flows through `m/denom` and ends up well above the fp16
-  /// tolerance floor on the final output — so the new code matches the
-  /// scalar reference at ≤ `5e-3`, while comparing against the OLD
-  /// (upfront-cast) reference would mismatch by ≥ `5e-2` on at least one
-  /// element. Direct guard: if the dtype-flow fix is ever reverted, this
-  /// test fails.
+  /// — assert the new (uncast-z, uncast-norm-scale, no-final-astype)
+  /// pipeline matches the f64 scalar reference WAY MORE TIGHTLY than the OLD
+  /// (upfront-cast) pipeline would. Cancellation fixture: with f16 base +
+  /// f32 adapter and `y ≈ -z`, the f16 rounding of `z` perturbs ‖adapted‖
+  /// by a relative amount that flows through `m/denom` and ends up well
+  /// above the fp16 tolerance floor on the final output — so the new code
+  /// matches the scalar reference at ≤ `5e-3`, while comparing against the
+  /// OLD (upfront-cast) reference would mismatch by ≥ `1e-2` on at least one
+  /// element. Also asserts the promoted return dtype (f32) — direct guard
+  /// against both the round-1 (upfront-cast) and round-2 (final-narrowing-
+  /// astype) regressions.
   #[test]
   fn dora_embedding_forward_loses_precision_with_upfront_cast_regression_oracle() {
     let (weight_f32, lora_a_f32, lora_b_f32, m_f32, scale) = mp_fixture();
@@ -7536,6 +7551,13 @@ mod tests {
     let ids_vec: Vec<i32> = (0..num_embeddings as i32).collect();
     let ids = Array::from_slice::<i32>(&ids_vec, &(num_embeddings,)).unwrap();
     let out = layer.forward(&ids).unwrap();
+    // Round-2 guard: forward returns the promoted dtype (f32), not the
+    // base's f16. Re-introducing the final `astype(y.dtype)` would flip this.
+    assert_eq!(
+      out.dtype().unwrap(),
+      Dtype::F32,
+      "regression-oracle: forward must return the promoted dtype = f32"
+    );
     let mut out_f32 = out.astype(Dtype::F32).unwrap();
     let got = out_f32.to_vec::<f32>().unwrap();
     let ids_usize: Vec<usize> = (0..num_embeddings).collect();
@@ -7582,6 +7604,104 @@ mod tests {
     assert!(
       new_max_err * 5.0 <= old_max_err,
       "regression-oracle expected ≥5× tighter new-vs-old fit; got new={new_max_err}, old={old_max_err}",
+    );
+  }
+
+  /// `dora_embedding_forward_returns_promoted_dtype_for_mixed_precision` —
+  /// explicit, focused dtype guard for the round-2 fix. Asserts that
+  /// `forward` returns the mlx-promoted dtype (f32) for both `f16 base × f32
+  /// adapter` and `bf16 base × f32 adapter`, NOT the embedding's narrow
+  /// dtype. mlx-lm `tuner/dora.py:208` returns `(self.m[x] / denom)[...,
+  /// None] * out` directly — no astype — and the port now mirrors that.
+  /// Re-introducing a final `astype(y.dtype)` would flip these assertions.
+  ///
+  /// This test does NOT exercise value parity (the
+  /// `*_matches_reference_*_base_f32_adapter` tests do that); it is a pure
+  /// dtype contract test.
+  #[test]
+  fn dora_embedding_forward_returns_promoted_dtype_for_mixed_precision() {
+    for (narrow, label) in [(Dtype::F16, "f16"), (Dtype::BF16, "bf16")] {
+      let (weight_f32, lora_a_f32, lora_b_f32, m_f32, scale) = mp_fixture();
+      let num_embeddings = weight_f32.len();
+      let dims = weight_f32[0].len();
+      let r = lora_a_f32[0].len();
+      let flat_w: Vec<f32> = weight_f32.iter().flatten().copied().collect();
+      let flat_a: Vec<f32> = lora_a_f32.iter().flatten().copied().collect();
+      let flat_b: Vec<f32> = lora_b_f32.iter().flatten().copied().collect();
+      let weight_narrow = Array::from_slice::<f32>(&flat_w, &(num_embeddings, dims))
+        .unwrap()
+        .astype(narrow)
+        .unwrap();
+      let base = BaseEmbedding::dense(weight_narrow).unwrap();
+      // Adapter factors + magnitude stay f32 — mlx will promote on the
+      // final multiply.
+      let lora_a = Array::from_slice::<f32>(&flat_a, &(num_embeddings, r)).unwrap();
+      let lora_b = Array::from_slice::<f32>(&flat_b, &(r, dims)).unwrap();
+      let m = Array::from_slice::<f32>(&m_f32, &(num_embeddings,)).unwrap();
+      let params = AdapterParams {
+        lora_a,
+        lora_b,
+        magnitude: Some(m),
+      };
+      let layer = DoRAEmbedding::new(base, params, scale).unwrap();
+      let ids_vec: Vec<i32> = (0..num_embeddings as i32).collect();
+      let ids = Array::from_slice::<i32>(&ids_vec, &(num_embeddings,)).unwrap();
+      let out = layer.forward(&ids).unwrap();
+      assert_eq!(
+        out.dtype().unwrap(),
+        Dtype::F32,
+        "forward must return promoted dtype f32 for {label} base × f32 adapter (no final narrowing astype)",
+      );
+    }
+  }
+
+  /// `dora_embedding_forward_preserves_base_dtype_for_uniform_precision` —
+  /// sanity sibling of the mixed-precision dtype test: when base AND adapter
+  /// are both **f32**, `forward` returns f32 because no operand triggers
+  /// mlx's promotion-on-mix rule. Direct guard against a defensive "just to
+  /// be safe" re-introduction of the final astype — a forward that always
+  /// did `.astype(y.dtype)` would also pass this test (it's the no-op case),
+  /// but combined with `*_returns_promoted_dtype_for_mixed_precision`'s
+  /// "must be f32 for f16/bf16 base" assertion, the pair triangulates: a
+  /// re-introduced final astype would pass THIS test and fail THAT one,
+  /// pinpointing the regression.
+  ///
+  /// Note: an "f16 base + f16 adapter" case is intentionally NOT covered —
+  /// the `scale` parameter is a Rust f32 and the helper [`scaled`] creates
+  /// an f32 mlx scalar, so `z = scale · (lora_a[x] @ lora_b)` is promoted
+  /// to f32 even when both factor arrays are f16 (mirroring mlx-lm where
+  /// the Python float `self.scale` promotes the multiply). So with an f16
+  /// base, `forward`'s return is f32 regardless of the adapter's stored
+  /// dtype — which the `_returns_promoted_dtype_for_mixed_precision` test
+  /// covers explicitly.
+  #[test]
+  fn dora_embedding_forward_preserves_base_dtype_for_uniform_precision() {
+    let (weight_f32, lora_a_f32, lora_b_f32, m_f32, scale) = mp_fixture();
+    let num_embeddings = weight_f32.len();
+    let dims = weight_f32[0].len();
+    let r = lora_a_f32[0].len();
+    let flat_w: Vec<f32> = weight_f32.iter().flatten().copied().collect();
+    let flat_a: Vec<f32> = lora_a_f32.iter().flatten().copied().collect();
+    let flat_b: Vec<f32> = lora_b_f32.iter().flatten().copied().collect();
+    // All operands at f32 — no promotion at any step; `forward` returns f32.
+    let weight = Array::from_slice::<f32>(&flat_w, &(num_embeddings, dims)).unwrap();
+    let base = BaseEmbedding::dense(weight).unwrap();
+    let lora_a = Array::from_slice::<f32>(&flat_a, &(num_embeddings, r)).unwrap();
+    let lora_b = Array::from_slice::<f32>(&flat_b, &(r, dims)).unwrap();
+    let m = Array::from_slice::<f32>(&m_f32, &(num_embeddings,)).unwrap();
+    let params = AdapterParams {
+      lora_a,
+      lora_b,
+      magnitude: Some(m),
+    };
+    let layer = DoRAEmbedding::new(base, params, scale).unwrap();
+    let ids_vec: Vec<i32> = (0..num_embeddings as i32).collect();
+    let ids = Array::from_slice::<i32>(&ids_vec, &(num_embeddings,)).unwrap();
+    let out = layer.forward(&ids).unwrap();
+    assert_eq!(
+      out.dtype().unwrap(),
+      Dtype::F32,
+      "forward must return f32 when base AND adapter are uniform f32 (no promotion)",
     );
   }
 }
