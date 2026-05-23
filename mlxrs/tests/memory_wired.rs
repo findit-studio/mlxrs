@@ -27,7 +27,12 @@
 //! `sequential_install_then_install_then_drop_first_still_protects_second_guard`
 //! — the refcount-semantic contract does not require threading and the
 //! single-threaded version is immune to scheduler-dependent test-infra
-//! defects.
+//! defects. CROSS-THREAD in-scope protection (a future regression that
+//! accidentally scoped the guard epoch per-thread would pass the
+//! sequential test) is covered separately by
+//! `scoped_threads_t1_drop_first_does_not_revoke_t2_protection`, which
+//! uses [`std::thread::scope`] so workers cannot outlive the test's
+//! restore-guard and worker panics propagate to the parent.
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -510,6 +515,149 @@ fn sequential_install_then_install_then_drop_first_still_protects_second_guard()
     final_observed, test_baseline,
     "after all drops, limit was {final_observed} not test_baseline {test_baseline} — \
      restore broken"
+  );
+}
+
+/// CODEX R5 [MEDIUM] regression guard — deterministic CROSS-THREAD
+/// in-scope-protection coverage. Complements the same-thread refcount-math
+/// test [`sequential_install_then_install_then_drop_first_still_protects_second_guard`]
+/// by exercising the contract across two distinct OS threads: a future
+/// regression that accidentally scoped the guard epoch per-thread/owner
+/// (e.g. moved [`WIRED_LIMIT_STATE`] into `thread_local!`) would pass the
+/// sequential test and the coarse post-stress invariant test, but would
+/// fail this one because T1 dropping its guard would restore the limit
+/// while T2 is still mid-scope on the other thread.
+///
+/// ## Why [`std::thread::scope`] (vs the prior R3/R4 attempts)
+/// Past threaded versions of this test (`Barrier` in R2, `mpsc` in R3,
+/// timeout-bounded `recv` in R3-fix) accumulated infrastructure defects
+/// across four review rounds — the deepest being R4's observation that a
+/// detached worker (`std::thread::spawn`) could outlive the test's
+/// restore-guard and race the next test's setup. [`std::thread::scope`]
+/// (stable since Rust 1.63) closes that defect class structurally:
+/// - Scoped threads CANNOT outlive the scope — the scope blocks until
+///   every spawned thread has joined, so the test's restore-guard is
+///   guaranteed to run AFTER every worker has finished its drops.
+/// - Worker panics propagate to the parent at scope exit — no silent
+///   panic-then-race; a failed `expect` in either worker surfaces as a
+///   `JoinHandle::join` error that this test propagates via its own
+///   `expect`.
+/// - Scoped threads can borrow stack data directly (no `Arc` juggling).
+///
+/// The ordered handshake uses [`mpsc::channel`] with timeout-bounded
+/// `recv` whose `expect` calls turn timeout into a test failure (no
+/// schedule-dependent passing of broken code). [`mpsc`] is safe here
+/// even on worker panic because `thread::scope` joins every worker
+/// before returning, so a disconnected receiver always surfaces the
+/// worker's panic via the join-propagation path rather than as an
+/// ambiguous channel error.
+///
+/// Pre-R2 (R1 single-active) failure: T2's `install` returns `Ok(None)`
+/// → the first `expect` in T2 fires with the exact R1 diagnostic.
+/// Pre-R2 (no synchronization) or hypothetical per-thread state: T1's
+/// drop restores the limit → T2's post-T1-drop readback observes
+/// `test_baseline` instead of `recommended` → assertion fires with the
+/// "cross-thread in-scope protection lost" diagnostic.
+#[test]
+fn scoped_threads_t1_drop_first_does_not_revoke_t2_protection() {
+  let _serialize = lock_wired_limit();
+  let Some(recommended) = recommended_working_set_bytes().expect("rw query") else {
+    eprintln!("[skip] Metal not available");
+    return;
+  };
+  // Deliberate baseline DIFFERENT from `recommended` so the cross-thread
+  // readbacks discriminate regardless of ambient state.
+  let test_baseline: u64 = if recommended > 1024 * 1024 * 1024 {
+    recommended / 2
+  } else {
+    recommended.saturating_sub(1024)
+  };
+  let original = set_wired_limit(test_baseline).expect("set baseline");
+  struct RestoreOriginal(u64);
+  impl Drop for RestoreOriginal {
+    fn drop(&mut self) {
+      let _ = set_wired_limit(self.0);
+    }
+  }
+  let _restore = RestoreOriginal(original);
+
+  // Deterministic handshake via mpsc — channel disconnect on panic is
+  // recoverable here because thread::scope joins both threads before
+  // returning, so any worker panic surfaces via join rather than as an
+  // ambiguous channel error.
+  use std::sync::mpsc;
+  let (t1_installed_tx, t1_installed_rx) = mpsc::channel::<()>();
+  let (t2_observed_tx, t2_observed_rx) = mpsc::channel::<u64>(); // T2 sends observed limit after T1 drops
+  let (t1_dropped_tx, t1_dropped_rx) = mpsc::channel::<()>();
+
+  // `mpsc::Receiver` is `!Sync`, so the scoped closures MUST `move` their
+  // endpoints; capturing by reference would fail E0277.
+  let observed_after_t1_drop = std::thread::scope(|s| {
+    s.spawn(move || {
+      let g1 = WiredLimitGuard::install(0, &[])
+        .expect("T1 install FFI error")
+        .expect("T1 install returned None on first install with Metal");
+      t1_installed_tx.send(()).expect("send t1_installed");
+      // Wait for T2 to install + assert its protection.
+      let _ = t2_observed_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("T2 never sent observation — T2 likely failed install");
+      drop(g1);
+      t1_dropped_tx.send(()).expect("send t1_dropped");
+    });
+
+    // Main scope waits for T1 install BEFORE T2 install (ordered).
+    t1_installed_rx
+      .recv_timeout(std::time::Duration::from_secs(10))
+      .expect("T1 install never completed within 10s");
+
+    let t2 = s.spawn(move || {
+      // `_g2` (leading underscore on a NAME, not bare `_`) silences clippy's
+      // unused-binding lint while still extending the guard's lifetime until
+      // scope-end, which is REQUIRED — its Drop closes the refcount epoch.
+      let _g2 = WiredLimitGuard::install(0, &[])
+        .expect("T2 install FFI error")
+        .expect(
+          "T2 install returned None while T1 was active — \
+           exact R1 single-active regression OR per-thread-scoped guard regression",
+        );
+      // While both alive, verify limit is recommended.
+      let limit_with_both = set_wired_limit(recommended).expect("readback both");
+      assert_eq!(
+        limit_with_both, recommended,
+        "while both guards alive, limit was {limit_with_both} not recommended {recommended}"
+      );
+      // Tell T1 it may drop now.
+      t2_observed_tx
+        .send(limit_with_both)
+        .expect("send t2_observed");
+      // Wait for T1 to drop.
+      t1_dropped_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("T1 drop never completed within 10s");
+      // CRITICAL: limit MUST still be recommended (T2 still alive).
+      let limit_after_t1 = set_wired_limit(recommended).expect("readback after T1");
+      assert_eq!(
+        limit_after_t1, recommended,
+        "after T1 drop while T2 alive, limit was {limit_after_t1} not recommended \
+         {recommended} — cross-thread in-scope protection lost (R2 regression OR \
+         per-thread-scoped guards)"
+      );
+      // T2 returns the observed limit; scope drops g2 at return.
+      limit_after_t1
+    });
+    t2.join()
+      .expect("T2 panicked (assertion failure shown above)")
+  });
+
+  assert_eq!(observed_after_t1_drop, recommended);
+
+  // After scope exit, both guards are dropped (g1 by T1, g2 by T2's scope-end).
+  let final_limit = set_wired_limit(test_baseline).expect("readback final");
+  assert_eq!(
+    final_limit, test_baseline,
+    "after all guards dropped, limit was {final_limit} not test_baseline {test_baseline} — \
+     refcount or restore broken"
   );
 }
 
