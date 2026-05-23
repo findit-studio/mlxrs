@@ -56,16 +56,20 @@
 //! # Length sweep
 //!
 //! All three helpers call the input generator at lengths
-//! `{0, 1, lanes-1, lanes, lanes+1, 2*lanes, 3*lanes, 3*lanes+1}` so
-//! the kernel's head / body / tail paths are *all* exercised (§5.3 —
-//! "Cover the tail / remainder"). The two clean-multi-block lengths
-//! (`2*lanes`, `3*lanes`) specifically catch off-by-one bugs on the
-//! chunk-loop bound that a sweep without them would miss (a kernel
-//! that mis-handles `len == k * lanes && tail == 0` can pass a sweep
-//! that only carries multi-block-plus-tail). `lanes` is parameterized
-//! at the call site (e.g. `lanes = 2` for `float64x2_t`-based
-//! kernels, `lanes = 4` for `float32x4_t`, `lanes = 16` for
-//! `uint8x16_t`).
+//! `{0, 1, lanes-1, lanes, lanes+1, 2*lanes-1, 2*lanes, 3*lanes, 3*lanes+1}`
+//! so the kernel's head / body / tail paths are *all* exercised
+//! (§5.3 — "Cover the tail / remainder"). The two clean-multi-block
+//! lengths (`2*lanes`, `3*lanes`) specifically catch off-by-one bugs
+//! on the chunk-loop bound that a sweep without them would miss (a
+//! kernel that mis-handles `len == k * lanes && tail == 0` can pass a
+//! sweep that only carries multi-block-plus-tail). The `2*lanes-1`
+//! length is the post-body large-tail case: a kernel whose
+//! post-vector tail loop only handles a single remainder element
+//! would silently pass a sweep limited to `lanes+1` / `3*lanes+1`
+//! (both `tail == 1`) but fail at `2*lanes-1` (`full body +
+//! (lanes-1)`-element remainder). `lanes` is parameterized at the
+//! call site (e.g. `lanes = 2` for `float64x2_t`-based kernels,
+//! `lanes = 4` for `float32x4_t`, `lanes = 16` for `uint8x16_t`).
 //!
 //! # Signature shape
 //!
@@ -92,7 +96,7 @@
 /// Returns the canonical SIMD lane-sweep coverage for `lanes`-wide
 /// kernels.
 ///
-/// Covers eight boundary classes the helpers
+/// Covers nine boundary classes the helpers
 /// [`assert_eq_over_lane_sweep`], [`assert_close_over_lane_sweep`],
 /// and [`assert_close_slice_over_lane_sweep`] drive their generator
 /// at:
@@ -102,25 +106,30 @@
 /// 3. `lanes - 1`       — single-block-just-below (pure-tail, no body).
 /// 4. `lanes`           — single-block-clean (one body, no tail).
 /// 5. `lanes + 1`       — single-block-plus-tail (body + tail).
-/// 6. `2 * lanes`       — multi-block-clean ×2 (two bodies, no tail).
-/// 7. `3 * lanes`       — multi-block-clean ×3 (three bodies, no tail).
-/// 8. `3 * lanes + 1`   — multi-block-plus-tail (three bodies + tail).
+/// 6. `2 * lanes - 1`   — post-body large-tail (full body + `lanes-1`-element remainder).
+/// 7. `2 * lanes`       — multi-block-clean ×2 (two bodies, no tail).
+/// 8. `3 * lanes`       — multi-block-clean ×3 (three bodies, no tail).
+/// 9. `3 * lanes + 1`   — multi-block-plus-tail (three bodies + tail).
 ///
 /// The two clean-multi-block lengths catch chunk-loop off-by-one bugs
 /// that a sweep carrying only `3 * lanes + 1` would miss — a kernel
 /// that mis-handles `len == k * lanes && tail == 0` (e.g. an
 /// inclusive vs exclusive chunk bound) can still pass the
-/// multi-block-plus-tail length.
+/// multi-block-plus-tail length. The `2 * lanes - 1` length is the
+/// post-body large-tail case: a kernel whose post-vector tail loop
+/// only handles a single remainder element would silently pass a
+/// sweep limited to `lanes + 1` / `3 * lanes + 1` (both `tail == 1`)
+/// but fail at `2 * lanes - 1` (full body + `lanes-1` remainder).
 ///
 /// `lanes` is internally clamped to `>= 1` so `lanes == 0` is
-/// well-defined: it collapses (1 → 1, 0 → 0, 1 → 1, 2 → 2, 3 → 3,
-/// 4 → 4) but still covers the empty + singleton + small body cases.
-/// Some entries collide for very small `lanes` (e.g. `lanes == 1`
-/// gives `[0, 1, 0, 1, 2, 2, 3, 4]`); that is fine — duplicates are
-/// harmless (re-running a length is cheap) and the helper loop has no
-/// dedup requirement.
+/// well-defined: it collapses (1 → 1, 0 → 0, 1 → 1, 2 → 2, 1 → 1,
+/// 3 → 3, 4 → 4) but still covers the empty + singleton + small body
+/// cases. Some entries collide for very small `lanes` (e.g.
+/// `lanes == 1` gives `[0, 1, 0, 1, 2, 1, 2, 3, 4]`); that is fine —
+/// duplicates are harmless (re-running a length is cheap) and the
+/// helper loop has no dedup requirement.
 ///
-/// Returning a fixed-size array (`[usize; 8]`) keeps the signature
+/// Returning a fixed-size array (`[usize; 9]`) keeps the signature
 /// stack-only and avoids any heap allocation — the sweep is
 /// constant-shape, callers iterate by `for &n in &lane_sweep_lengths(l)`.
 ///
@@ -128,12 +137,24 @@
 /// kernel taking two slices `dot(a, b)`) can build its own loop using
 /// the same length set, instead of reimplementing the sweep.
 #[inline]
-pub fn lane_sweep_lengths(lanes: usize) -> [usize; 8] {
+pub fn lane_sweep_lengths(lanes: usize) -> [usize; 9] {
   // Clamp to >= 1 so `lanes == 0` doesn't degenerate every multi-block
   // length to 0 (which would silently strip coverage). `lanes - 1`
   // still uses `saturating_sub` on the clamped value for clarity.
+  // `2 * l - 1` uses `saturating_sub` so the `l == 1` case stays safe
+  // (collapses to `1`, harmlessly duplicating the singleton entry).
   let l = lanes.max(1);
-  [0, 1, l.saturating_sub(1), l, l + 1, 2 * l, 3 * l, 3 * l + 1]
+  [
+    0,
+    1,
+    l.saturating_sub(1),
+    l,
+    l + 1,
+    (2 * l).saturating_sub(1),
+    2 * l,
+    3 * l,
+    3 * l + 1,
+  ]
 }
 
 /// `Exact` differential-test class — asserts the SIMD dispatcher's
@@ -332,27 +353,27 @@ mod tests {
     lane_sweep_lengths,
   };
 
-  /// `lane_sweep_lengths` produces the documented 8-length set across
+  /// `lane_sweep_lengths` produces the documented 9-length set across
   /// the canonical NEON lane widths the in-tree kernels use
   /// (`lanes ∈ {1, 2, 4, 8, 16, 32}`). Locking the exact array per
   /// lane width pins the coverage contract — every boundary class
   /// (empty / singleton / single-block-just-below /
-  /// single-block-clean / single-block-plus-tail / multi-block-clean
-  /// ×2 / multi-block-clean ×3 / multi-block-plus-tail) is present at
-  /// every lane width, and adding/removing/shuffling an entry
-  /// surfaces here loudly.
+  /// single-block-clean / single-block-plus-tail / post-body
+  /// large-tail / multi-block-clean ×2 / multi-block-clean ×3 /
+  /// multi-block-plus-tail) is present at every lane width, and
+  /// adding/removing/shuffling an entry surfaces here loudly.
   #[test]
   fn lane_sweep_lengths_full_coverage() {
-    assert_eq!(lane_sweep_lengths(1), [0, 1, 0, 1, 2, 2, 3, 4]);
-    assert_eq!(lane_sweep_lengths(2), [0, 1, 1, 2, 3, 4, 6, 7]); // `float64x2_t`.
-    assert_eq!(lane_sweep_lengths(4), [0, 1, 3, 4, 5, 8, 12, 13]); // `float32x4_t`.
-    assert_eq!(lane_sweep_lengths(8), [0, 1, 7, 8, 9, 16, 24, 25]); // `int16x8_t`.
-    assert_eq!(lane_sweep_lengths(16), [0, 1, 15, 16, 17, 32, 48, 49]); // `uint8x16_t`.
-    assert_eq!(lane_sweep_lengths(32), [0, 1, 31, 32, 33, 64, 96, 97]); // 32-wide composite.
+    assert_eq!(lane_sweep_lengths(1), [0, 1, 0, 1, 2, 1, 2, 3, 4]);
+    assert_eq!(lane_sweep_lengths(2), [0, 1, 1, 2, 3, 3, 4, 6, 7]); // `float64x2_t`.
+    assert_eq!(lane_sweep_lengths(4), [0, 1, 3, 4, 5, 7, 8, 12, 13]); // `float32x4_t`.
+    assert_eq!(lane_sweep_lengths(8), [0, 1, 7, 8, 9, 15, 16, 24, 25]); // `int16x8_t`.
+    assert_eq!(lane_sweep_lengths(16), [0, 1, 15, 16, 17, 31, 32, 48, 49]); // `uint8x16_t`.
+    assert_eq!(lane_sweep_lengths(32), [0, 1, 31, 32, 33, 63, 64, 96, 97]); // 32-wide composite.
     // Edge: `lanes == 0` is well-defined — the helper clamps `l = lanes.max(1)`
     // so the sweep collapses to the `lanes == 1` shape rather than degenerating
     // every multi-block entry to 0.
-    assert_eq!(lane_sweep_lengths(0), [0, 1, 0, 1, 2, 2, 3, 4]);
+    assert_eq!(lane_sweep_lengths(0), [0, 1, 0, 1, 2, 1, 2, 3, 4]);
   }
 
   /// `Exact` class self-test using a trivial pass-through (`sum-by-fold`)

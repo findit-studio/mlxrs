@@ -124,11 +124,11 @@
 //!
 //! All three helpers share the same length sweep
 //! ([`diff::lane_sweep_lengths`](crate::simd::diff::lane_sweep_lengths)
-//! — 8 lengths covering every boundary class: empty / singleton /
+//! — 9 lengths covering every boundary class: empty / singleton /
 //! single-block-just-below / single-block-clean / single-block-plus-tail /
-//! multi-block-clean ×2 / multi-block-clean ×3 / multi-block-plus-tail),
-//! so coverage is uniform across `Exact` and both `Tolerance`
-//! flavours.
+//! post-body large-tail / multi-block-clean ×2 / multi-block-clean ×3 /
+//! multi-block-plus-tail), so coverage is uniform across `Exact` and
+//! both `Tolerance` flavours.
 //!
 //! See the [`diff`](crate::simd::diff) module doc for the full class
 //! catalog and the length-sweep rationale.
