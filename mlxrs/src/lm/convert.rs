@@ -1397,10 +1397,22 @@ const TOKENIZER_EXTRA_FILES: &[&str] = &[
 /// F7 R5 Finding).
 #[derive(Debug, Default)]
 pub struct CopyDurabilityWarnings {
-  /// First per-file `fsync_path` warning observed (preserves the
+  /// First per-file `fsync_path_io` warning observed (preserves the
   /// earliest-failure information so the user can pinpoint which file's
   /// fsync was the first to lose durability). `None` if every per-file
   /// fsync passed.
+  ///
+  /// F7 R6 Finding: the carried [`std::io::Error`] preserves the raw
+  /// underlying [`std::io::ErrorKind`] (ENOSPC / EIO /
+  /// PermissionDenied / ...) — the pre-R6 shape called the (crate-
+  /// internal) `fsync_path` helper (which returns the crate-wide
+  /// [`crate::Error::Backend`] variant — string-wrapping the
+  /// underlying io::Error and losing its kind) and then re-wrapped the
+  /// message via [`std::io::Error::other`], collapsing every kind to
+  /// [`std::io::ErrorKind::Other`] and forcing callers to parse the
+  /// message text. The R6 fix routes through a new kind-preserving
+  /// `fsync_path_io` sibling (returns [`std::io::Result`]) so callers
+  /// can branch on `.kind()` directly.
   pub post_copy_file: Option<std::io::Error>,
   /// Post-copy `fsync_dir(dst)` warning, after every per-file fsync
   /// has been observed. `None` if the directory fsync passed.
@@ -1490,7 +1502,9 @@ pub enum CopyOutcome {
 ///
 /// **Post-copy durability** (F7 R4 Finding-1): after each successful
 /// [`std::fs::copy`], the copied file is `fsync`ed (via the
-/// `crate::lm::load::fsync_path` helper) so its bytes are durable on
+/// `crate::lm::load::fsync_path_io` helper — the `io::Result<()>`
+/// variant of `fsync_path` that preserves the underlying
+/// [`std::io::ErrorKind`], F7 R6 Finding) so its bytes are durable on
 /// disk. After ALL copies complete, the destination directory is
 /// `fsync`ed (via the `crate::lm::load::fsync_dir` helper) so the new
 /// directory entries are durable. Without these, an `Ok` return would
@@ -1531,22 +1545,6 @@ pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<CopyOutcome> 
   // aggregate (F7 R5 Finding).
   let mut warnings = CopyDurabilityWarnings::default();
 
-  // Helper: fsync the just-copied destination file. Maps the
-  // [`crate::lm::load::fsync_path`] error (which uses [`Error::Backend`]
-  // for context) back into a typed [`std::io::Error`] so the warning
-  // shape is uniform with [`fsync_dir`] (which returns
-  // `io::Result<()>`).
-  let fsync_copied = |path: &Path| -> std::io::Result<()> {
-    match crate::lm::load::fsync_path(path) {
-      Ok(()) => Ok(()),
-      // [`fsync_path`] wraps its underlying io::Error in
-      // [`Error::Backend`] for the save-side caller; unwrap it back into
-      // an io::Error here so the warning carries a clean typed payload.
-      Err(Error::Backend { message }) => Err(std::io::Error::other(message)),
-      Err(other) => Err(std::io::Error::other(other.to_string())),
-    }
-  };
-
   // Record a per-file fsync warning iff none has been observed yet —
   // preserves FIRST-failure information so the user can pinpoint the
   // earliest file whose fsync lost durability. We do NOT fold a later
@@ -1577,7 +1575,17 @@ pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<CopyOutcome> 
     // after `std::fs::copy` returns Ok; this only converts "logically
     // complete" into "durable across a power loss". A failure here
     // does NOT mean the file is missing — record + continue.
-    if let Err(e) = fsync_copied(&d) {
+    //
+    // F7 R6 Finding: use the kind-preserving
+    // [`crate::lm::load::fsync_path_io`] variant so the underlying
+    // [`std::io::ErrorKind`] (ENOSPC / EIO / PermissionDenied / ...)
+    // carries through to the structured aggregate intact. The previous
+    // shape called [`crate::lm::load::fsync_path`] (returns crate
+    // [`Error::Backend`]) and then re-wrapped the message via
+    // `io::Error::other(...)` — collapsing every real kind to
+    // [`std::io::ErrorKind::Other`] and forcing callers to parse the
+    // message text to disambiguate quota / permission / disk failures.
+    if let Err(e) = crate::lm::load::fsync_path_io(&d) {
       record_file_fsync_warning(e);
     }
   }
@@ -1619,8 +1627,9 @@ pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<CopyOutcome> 
         d.display()
       ),
     })?;
-    // Post-copy file fsync — same rationale as above.
-    if let Err(e) = fsync_copied(&d) {
+    // Post-copy file fsync — same rationale + kind-preservation as
+    // the TOKENIZER_EXTRA_FILES loop above (F7 R6 Finding).
+    if let Err(e) = crate::lm::load::fsync_path_io(&d) {
       record_file_fsync_warning(e);
     }
   }
@@ -3435,5 +3444,217 @@ mod unit {
         "Display carries the committed=true tag; got: {err}"
       );
     }
+  }
+
+  // ─── F7 R6 Finding — io::Error kind preserved end-to-end ─────────
+  //
+  // Codex R6 finding: the convert()-side aggregate carries an
+  // `Option<std::io::Error>` per fsync boundary that is advertised as
+  // machine-readable (callers branch on `.kind()` to disambiguate
+  // ENOSPC / EIO / PermissionDenied / ...), but the pre-R6 shape used
+  // [`crate::lm::load::fsync_path`] (which returns
+  // [`crate::Error::Backend`] — string-wrapping the underlying
+  // io::Error and losing its kind) and then re-wrapped the message via
+  // [`std::io::Error::other`], collapsing EVERY post_copy_file
+  // warning's kind to [`std::io::ErrorKind::Other`]. The fix routes
+  // through the new kind-preserving sibling
+  // [`crate::lm::load::fsync_path_io`] (returns
+  // [`std::io::Result<()>`]) so the underlying kind survives intact.
+  //
+  // The save-side warning already preserves kind end-to-end
+  // ([`crate::lm::load::fsync_dir`] returns [`std::io::Result<()>`]
+  // natively and the save → save_warning path carries the raw
+  // io::Error via [`crate::lm::load::CommitOutcome::CommittedWithDurabilityWarning`]).
+  // The post-copy DIR warning also already preserves kind (the
+  // post-copy `fsync_dir(dst)` returns raw io::Error directly into
+  // `warnings.post_copy_dir`). The three tests below verify ALL THREE
+  // boundaries (save / post_copy_file / post_copy_dir) preserve the
+  // injected kind so a regression on ANY one is caught.
+  //
+  // Driven via the kind-injecting [`arm_fsync_path_fault_with_kind`] /
+  // [`arm_fsync_dir_fault_with_kind`] sibling injectors — they extend
+  // the pre-R6 single-arg variants with an [`std::io::ErrorKind`]
+  // override so the test can inject a SPECIFIC non-`Other` kind
+  // (defaulting to `Other` would mask the bug — the pre-R6 code path
+  // also produced `Other`, so a kind-equality assertion would pass
+  // even with the regression).
+
+  /// F7 R6 Finding — post-copy per-file fsync warning preserves the
+  /// underlying [`std::io::ErrorKind`] (NOT collapsed to `Other`).
+  ///
+  /// Drives the same path as
+  /// `convert_post_copy_file_fsync_failure_returns_durability_warning`
+  /// but injects [`std::io::ErrorKind::PermissionDenied`] specifically
+  /// — the assertion `agg.post_copy_file.unwrap().kind() ==
+  /// PermissionDenied` (NOT `Other`) is the regression detector. A
+  /// pre-R6 build would unwrap the injected io::Error via
+  /// `Err(Error::Backend { message }) => Err(io::Error::other(message))`
+  /// inside `copy_tokenizer_and_extras`'s `fsync_copied` closure,
+  /// collapsing the kind to `Other`.
+  ///
+  /// Skip count: 3 — past every save-side fsync_path call (config-
+  /// stage, shard tmp, index tmp), fires on the 4th call (first post-
+  /// copy per-file fsync). The dir injector is NOT armed so the only
+  /// non-None field is `post_copy_file` and the single-warning
+  /// surface is the existing [`Error::DurabilityWarning`] shape (R5
+  /// routing — count() == 1 takes the single-source branch).
+  #[test]
+  fn convert_post_copy_file_warning_preserves_io_error_kind() {
+    let (workdir, src, dst) = build_r4_fixture("post_copy_file_kind");
+
+    // Arm the path injector with skip=3 + a SPECIFIC non-`Other` kind.
+    // Pre-R6 would collapse to `Other` regardless of what the injector
+    // produces (the convert()-side `fsync_copied` re-wrapped via
+    // `io::Error::other(message)` — kind unconditionally `Other`).
+    // Post-R6 the kind survives through `fsync_path_io` → the typed
+    // aggregate's `post_copy_file` field.
+    let _guard =
+      crate::lm::load::arm_fsync_path_fault_with_kind(3, std::io::ErrorKind::PermissionDenied);
+
+    let r = convert(ConvertArgs {
+      hf_path: src,
+      mlx_path: dst,
+      ..Default::default()
+    });
+    drop(_guard);
+
+    // Single warning → existing single-source DurabilityWarning shape
+    // (R5 routing). The `source` field is the raw io::Error from
+    // `post_copy_file` — its `.kind()` must equal the INJECTED kind,
+    // NOT `Other`.
+    match &r {
+      Err(Error::DurabilityWarning { committed, source }) => {
+        assert!(*committed, "committed=true (data IS on disk)");
+        assert_eq!(
+          source.kind(),
+          std::io::ErrorKind::PermissionDenied,
+          "post_copy_file warning preserves the injected ErrorKind \
+           (PermissionDenied) end-to-end — a regression to the pre-R6 \
+           `io::Error::other(message)` re-wrap would collapse this to \
+           ErrorKind::Other; got: {:?} ({source})",
+          source.kind()
+        );
+        assert!(
+          source.to_string().contains("injected fsync_path failure"),
+          "source preserves the verbatim injector message: {source}"
+        );
+      }
+      other => panic!("expected Err(DurabilityWarning), got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&workdir);
+  }
+
+  /// F7 R6 Finding — post-copy directory fsync warning preserves the
+  /// underlying [`std::io::ErrorKind`]. The dir path already returned
+  /// raw [`std::io::Result`] (no `Error::Backend` wrap) so the
+  /// pre-R6 code path was kind-preserving HERE — this test guards
+  /// against a regression that adds a fold (e.g. a future "uniform
+  /// shape with fsync_path" refactor that wraps in
+  /// `io::Error::other(message)`).
+  ///
+  /// Skip count: 3 — past every save-side fsync_dir call (shard
+  /// publish, index publish, config commit), fires on the 4th call
+  /// (post-copy `fsync_dir(dst)`).
+  #[test]
+  fn convert_post_copy_dir_warning_preserves_io_error_kind() {
+    let (workdir, src, dst) = build_r4_fixture("post_copy_dir_kind");
+
+    // Use `StorageFull` (commonly ENOSPC) — a kind a real durability
+    // recovery flow MUST be able to distinguish from PermissionDenied
+    // to decide whether to retry / free space / surface to the user.
+    let _guard = crate::lm::load::arm_fsync_dir_fault_with_kind(3, std::io::ErrorKind::StorageFull);
+
+    let r = convert(ConvertArgs {
+      hf_path: src,
+      mlx_path: dst,
+      ..Default::default()
+    });
+    drop(_guard);
+
+    match &r {
+      Err(Error::DurabilityWarning { committed, source }) => {
+        assert!(*committed, "committed=true (data IS on disk)");
+        assert_eq!(
+          source.kind(),
+          std::io::ErrorKind::StorageFull,
+          "post_copy_dir warning preserves the injected ErrorKind \
+           (StorageFull / ENOSPC) end-to-end; got: {:?} ({source})",
+          source.kind()
+        );
+        assert!(
+          source.to_string().contains("injected fsync_dir failure"),
+          "source preserves the verbatim injector message: {source}"
+        );
+      }
+      other => panic!("expected Err(DurabilityWarning), got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&workdir);
+  }
+
+  /// F7 R6 Finding — save-side warning preserves the underlying
+  /// [`std::io::ErrorKind`]. Drives the same path as
+  /// `convert_durability_warning_still_copies_tokenizer_and_returns_warning`
+  /// but asserts the SPECIFIC injected kind (rather than just the
+  /// "DurabilityWarning observed" branch). The save side already
+  /// preserves kind end-to-end (the
+  /// [`crate::lm::load::CommitOutcome::CommittedWithDurabilityWarning`]
+  /// variant carries the raw io::Error from [`crate::lm::load::fsync_dir`]);
+  /// this test guards against a regression that adds a fold (e.g. a
+  /// "uniform shape" refactor in [`crate::lm::load::save`] that wraps
+  /// via `io::Error::other(message)`).
+  ///
+  /// Skip count: 1 — shard fsync passes, the index-fsync (save's 2nd
+  /// fsync_dir call) fails → save_model returns
+  /// `CommittedWithDurabilityWarning` → save() surfaces a final
+  /// `Err(DurabilityWarning)` after also committing the config.
+  /// No post-copy fsync is faulted, so the only non-None field is
+  /// `save` and the single-warning surface is the existing
+  /// `Error::DurabilityWarning` shape (R5 routing — count() == 1).
+  #[test]
+  fn convert_save_warning_preserves_io_error_kind() {
+    let (workdir, src, dst) = build_r4_fixture("save_kind");
+
+    // Inject ConnectionReset just to ensure the test is asserting a
+    // SPECIFIC kind that's neither `Other` (the default) nor
+    // PermissionDenied / StorageFull (used by the other two R6 tests)
+    // — a pre-R6-style fold that collapsed every kind to `Other` (or
+    // any non-ConnectionReset default) would fail this assertion. The
+    // kind is otherwise arbitrary — fsync errors in real life are
+    // commonly `Other` (errno EIO with no narrower std mapping), so
+    // the realism of the kind isn't the point; preservation is.
+    let _guard =
+      crate::lm::load::arm_fsync_dir_fault_with_kind(1, std::io::ErrorKind::ConnectionReset);
+
+    let r = convert(ConvertArgs {
+      hf_path: src,
+      mlx_path: dst,
+      ..Default::default()
+    });
+    drop(_guard);
+
+    match &r {
+      Err(Error::DurabilityWarning { committed, source }) => {
+        assert!(*committed, "committed=true (save committed)");
+        assert_eq!(
+          source.kind(),
+          std::io::ErrorKind::ConnectionReset,
+          "save-side warning preserves the injected ErrorKind \
+           (ConnectionReset) end-to-end through \
+           CommitOutcome::CommittedWithDurabilityWarning → \
+           Error::DurabilityWarning → convert's committed_warning \
+           stash → ConvertDurabilityWarnings.save; got: {:?} ({source})",
+          source.kind()
+        );
+        assert!(
+          source.to_string().contains("injected fsync_dir failure"),
+          "source preserves the verbatim injector message: {source}"
+        );
+      }
+      other => panic!("expected Err(DurabilityWarning), got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&workdir);
   }
 }
