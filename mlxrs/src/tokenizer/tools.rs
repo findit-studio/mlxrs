@@ -450,43 +450,15 @@ fn json_array_context_proven(prefix: &str) -> bool {
   prefix.trim_start().starts_with('[')
 }
 
-/// pythonic context predicate: the prefix must contain a `[` followed by
-/// an identifier (`[A-Za-z_][A-Za-z0-9_]*`) followed by `(`. A stray `[`
-/// elsewhere (e.g. `bad[`) — without a name+`(` shape — is NOT proof of a
-/// pythonic call body.
+/// pythonic context predicate: the prefix must contain a valid pythonic
+/// call start (`[name(`) somewhere — matching the EXACT recognizer
+/// [`find_first_pythonic_call_start`] / [`pythonic_call_start_at`] that the
+/// parser body uses. Sharing the recognizer between the predicate and the
+/// parser body prevents the drift class that R17 caught (predicate
+/// rejecting digit-leading names or accepting whitespace the parser
+/// rejects).
 fn pythonic_call_context_proven(prefix: &str) -> bool {
-  let bytes = prefix.as_bytes();
-  // Walk every `[` and check if a valid `name(` follows.
-  for (i, &b) in bytes.iter().enumerate() {
-    if b != b'[' {
-      continue;
-    }
-    let mut j = i + 1;
-    // Skip optional whitespace between `[` and name.
-    while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r') {
-      j += 1;
-    }
-    let name_start = j;
-    // First identifier char must be ASCII alpha or `_`.
-    if j >= bytes.len() || !(bytes[j].is_ascii_alphabetic() || bytes[j] == b'_') {
-      continue;
-    }
-    j += 1;
-    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
-      j += 1;
-    }
-    if j == name_start {
-      continue;
-    }
-    // Skip optional whitespace between name and `(`.
-    while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r') {
-      j += 1;
-    }
-    if j < bytes.len() && bytes[j] == b'(' {
-      return true;
-    }
-  }
-  false
+  find_first_pythonic_call_start(prefix).is_some()
 }
 
 /// qwen3_coder context predicate: the prefix must contain `<function=`
@@ -513,35 +485,16 @@ fn qwen_function_context_proven(prefix: &str) -> bool {
   false
 }
 
-/// function_gemma context predicate: the prefix must contain `call:`
-/// followed by an identifier (`[A-Za-z0-9_]+`) followed by `{` (the
-/// `call:name{` body-open shape). A stray `call:` without the name+`{` is
-/// NOT proof of a function_gemma call body.
+/// function_gemma context predicate: the prefix must contain a valid
+/// function_gemma call start (`call:name{`) somewhere — matching the EXACT
+/// recognizer [`find_first_function_gemma_call_start`] /
+/// [`function_gemma_call_start_at`] that the parser body
+/// ([`FunctionGemma::try_parse_one_call`] and [`gemma_call`]) uses. Sharing
+/// the recognizer between the predicate and the parser body prevents the
+/// drift class that R17 caught (predicate accepting whitespace between
+/// name and `{` that the parser rejects).
 fn function_gemma_call_context_proven(prefix: &str) -> bool {
-  let needle = "call:";
-  let bytes = prefix.as_bytes();
-  let mut search_from = 0;
-  while let Some(rel) = prefix[search_from..].find(needle) {
-    let after = search_from + rel + needle.len();
-    let mut j = after;
-    while j < bytes.len()
-      && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
-    {
-      j += 1;
-    }
-    if j > after {
-      // Optional whitespace between name and `{`.
-      let mut k = j;
-      while k < bytes.len() && matches!(bytes[k], b' ' | b'\t' | b'\n' | b'\r') {
-        k += 1;
-      }
-      if k < bytes.len() && bytes[k] == b'{' {
-        return true;
-      }
-    }
-    search_from = after;
-  }
-  false
+  find_first_function_gemma_call_start(prefix).is_some()
 }
 
 /// Plain-literal context predicate: the prefix must CONTAIN the given
@@ -860,27 +813,70 @@ impl ToolParser for Pythonic {
   }
 }
 
+/// **Shared pythonic call-start recognizer.** Returns `Some((name_start,
+/// after_open_paren))` when `payload[at..]` begins with a valid pythonic
+/// `[name(` opener (Python `_tool_call_regex = \[(\w+)\(`):
+/// * `payload[at]` MUST be `[`,
+/// * immediately followed by a non-empty ASCII alphanumeric/underscore run
+///   (`\w+`, no whitespace allowed between `[` and the name),
+/// * immediately followed by `(` (no whitespace allowed between the name
+///   and `(`).
+///
+/// Returns `None` otherwise. The `name_start` is the byte index of the
+/// first name byte (one past `[`); the `after_open_paren` is one past the
+/// `(`. This is the EXACT recognizer used by both
+/// [`find_pythonic_call`] (the parser body's call extractor) and
+/// [`pythonic_call_context_proven`] (the streaming-bound context
+/// predicate) — sharing it prevents the two from drifting (R17 finding 1).
+fn pythonic_call_start_at(payload: &str, at: usize) -> Option<(usize, usize)> {
+  let bytes = payload.as_bytes();
+  if at >= bytes.len() || bytes[at] != b'[' {
+    return None;
+  }
+  let name_start = at + 1;
+  let mut j = name_start;
+  while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+    j += 1;
+  }
+  if j == name_start {
+    return None;
+  }
+  if j >= bytes.len() || bytes[j] != b'(' {
+    return None;
+  }
+  Some((name_start, j + 1))
+}
+
+/// Scan `payload` for the FIRST byte position where
+/// [`pythonic_call_start_at`] returns Some. Returns the
+/// `after_open_paren` index of that first call start, or `None` if no
+/// valid `[name(` opener appears anywhere in `payload`.
+fn find_first_pythonic_call_start(payload: &str) -> Option<usize> {
+  let bytes = payload.as_bytes();
+  for i in 0..bytes.len() {
+    if let Some((_, after_open)) = pythonic_call_start_at(payload, i) {
+      return Some(after_open);
+    }
+  }
+  None
+}
+
 fn find_pythonic_call(text: &str) -> Option<(String, String)> {
   // Equivalent of \[(\w+)\((.*?)\)\] with DOTALL, first match.
   let bytes = text.as_bytes();
-  let mut i = 0;
-  while i < bytes.len() {
-    if bytes[i] == b'[' {
-      let mut j = i + 1;
-      let name_start = j;
-      while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
-        j += 1;
-      }
-      if j > name_start && j < bytes.len() && bytes[j] == b'(' {
-        let name = text[name_start..j].to_owned();
-        // non-greedy up to `)]`
-        let rest = &text[j + 1..];
-        if let Some(close) = rest.find(")]") {
-          return Some((name, rest[..close].to_owned()));
-        }
-      }
+  for i in 0..bytes.len() {
+    let Some((name_start, after_open)) = pythonic_call_start_at(text, i) else {
+      continue;
+    };
+    // `after_open` is one past `(`; `name_start..after_open - 1` is the
+    // name bytes (the `- 1` skips back over the `(`).
+    let name_end = after_open - 1;
+    let name = text[name_start..name_end].to_owned();
+    // non-greedy up to `)]`
+    let rest = &text[after_open..];
+    if let Some(close) = rest.find(")]") {
+      return Some((name, rest[..close].to_owned()));
     }
-    i += 1;
   }
   None
 }
@@ -2193,30 +2189,23 @@ impl ToolParser for FunctionGemma {
     let Some((bounded, end_pos)) = self.bound_section(payload, payload_at, end_tag) else {
       return Ok(None);
     };
-    let call_marker = "call:";
-    let Some(call_rel) = bounded.find(call_marker) else {
-      // No `call:` in the bounded body → bounded-but-malformed section.
+    // Use the SHARED recognizer (`function_gemma_call_start_at` via
+    // `find_first_function_gemma_call_start`) so the parser body and the
+    // context predicate cannot drift: both accept exactly the same
+    // `call:name{` shape (no whitespace anywhere between `call:`, the
+    // name, and `{`).
+    let Some(after_open_brace) = find_first_function_gemma_call_start(bounded) else {
+      // No valid `call:name{` opener within the bounded body → bounded-
+      // but-malformed section.
       return Ok(Some((Vec::new(), end_pos)));
     };
-    let after_marker = call_rel + call_marker.len();
     let bytes = bounded.as_bytes();
-    let mut j = after_marker;
-    while j < bytes.len()
-      && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
-    {
-      j += 1;
-    }
-    if j >= bytes.len() || bytes[j] != b'{' {
-      // `call:NAME` found but no `{` body opener within the bounded
-      // prefix → bounded-but-malformed section.
-      return Ok(Some((Vec::new(), end_pos)));
-    }
     // Within the bounded prefix, scan past the first `}` that is not
     // inside `<escape>...<escape>`. If no such `}` exists, the body is
     // bounded-but-malformed (`{` opened but never closed before the
     // wrapper end-tag).
     let escape = "<escape>";
-    let mut idx = j + 1;
+    let mut idx = after_open_brace;
     let mut in_escape = false;
     let body_close_found = loop {
       if idx >= bytes.len() {
@@ -2250,24 +2239,82 @@ impl ToolParser for FunctionGemma {
   }
 }
 
-/// Find `call:name{...}` — non-greedy `{.*?}` when `balanced` is false.
-fn gemma_call(text: &str, _balanced: bool) -> Option<(String, String)> {
-  let s = text.find("call:")?;
-  let after = &text[s + 5..];
-  let mut j = 0;
-  let bytes = after.as_bytes();
+/// **Shared function_gemma call-start recognizer.** Returns
+/// `Some((name_start, after_open_brace))` when `payload[at..]` begins with
+/// a valid `call:name{` opener:
+/// * `payload[at..]` MUST begin with the literal `call:`,
+/// * immediately followed by a non-empty run of ASCII
+///   alphanumeric/underscore/hyphen bytes (the function name; no
+///   whitespace allowed between `call:` and the name — matching what
+///   `try_parse_one_call` and [`gemma_call`] both accept),
+/// * immediately followed by `{` (no whitespace allowed between the name
+///   and `{` — the parser body bails on `bytes[j] != b'{'` without
+///   skipping whitespace).
+///
+/// Returns `None` otherwise. The `name_start` is the byte index of the
+/// first name byte (one past `call:`); the `after_open_brace` is one past
+/// the `{`. This is the EXACT recognizer used by both
+/// [`FunctionGemma::try_parse_one_call`] (and [`gemma_call`]) and
+/// [`function_gemma_call_context_proven`] (the streaming-bound context
+/// predicate) — sharing it prevents the two from drifting (R17 finding
+/// 2).
+fn function_gemma_call_start_at(payload: &str, at: usize) -> Option<(usize, usize)> {
+  let needle = "call:";
+  let bytes = payload.as_bytes();
+  if at + needle.len() > bytes.len() {
+    return None;
+  }
+  if &bytes[at..at + needle.len()] != needle.as_bytes() {
+    return None;
+  }
+  let name_start = at + needle.len();
+  let mut j = name_start;
   while j < bytes.len()
     && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
   {
     j += 1;
   }
-  if j == 0 || j >= bytes.len() || bytes[j] != b'{' {
+  if j == name_start {
     return None;
   }
-  let name = after[..j].to_owned();
-  let rest = &after[j + 1..];
-  let close = rest.find('}')?;
-  Some((name, rest[..close].to_owned()))
+  if j >= bytes.len() || bytes[j] != b'{' {
+    return None;
+  }
+  Some((name_start, j + 1))
+}
+
+/// Scan `payload` for the FIRST byte position where
+/// [`function_gemma_call_start_at`] returns Some. Returns the
+/// `after_open_brace` index of that first call start, or `None` if no
+/// valid `call:name{` opener appears anywhere in `payload`.
+fn find_first_function_gemma_call_start(payload: &str) -> Option<usize> {
+  let bytes = payload.as_bytes();
+  for i in 0..bytes.len() {
+    if let Some((_, after_open)) = function_gemma_call_start_at(payload, i) {
+      return Some(after_open);
+    }
+  }
+  None
+}
+
+/// Find `call:name{...}` — non-greedy `{.*?}` when `balanced` is false.
+fn gemma_call(text: &str, _balanced: bool) -> Option<(String, String)> {
+  // Use the shared recognizer to locate the first valid `call:name{`
+  // opener — never re-implement the grammar (R17 sharing rule).
+  let bytes = text.as_bytes();
+  for i in 0..bytes.len() {
+    let Some((name_start, after_open_brace)) = function_gemma_call_start_at(text, i) else {
+      continue;
+    };
+    // `after_open_brace` is one past `{`; `name_start..after_open_brace - 1`
+    // is the name bytes (`- 1` skips back over the `{`).
+    let name_end = after_open_brace - 1;
+    let name = text[name_start..name_end].to_owned();
+    let rest = &text[after_open_brace..];
+    let close = rest.find('}')?;
+    return Some((name, rest[..close].to_owned()));
+  }
+  None
 }
 
 // ----------------------------------------------------------------------------
@@ -7593,6 +7640,354 @@ mod tests {
         "{}: end_pos must land at the FIRST wrapper close — stray opener literal must not satisfy the structural context predicate",
         row.label,
       );
+    }
+  }
+
+  // ----------------------------------------------------------------------
+  // L9 R17: predicate ↔ parser-body recognizer drift.
+  // ----------------------------------------------------------------------
+  // R16 introduced per-parser context predicates to gate the syntax-aware
+  // body scanners behind PROOF of the parser's grammar. R17 caught two
+  // drift cases where the predicate grammar diverged from what
+  // `find_*_call` / `try_parse_one_call` actually recognise:
+  //
+  // Finding 1 (pythonic):
+  //   * Predicate rejected digit-leading names (`is_alphabetic` check).
+  //     Parser's `find_pythonic_call` accepts ANY non-empty ASCII
+  //     alphanumeric/underscore run (`\w+`) before `(`.
+  //     False-negative: `[1tool(s='<|tool_call_end|>')]<|tool_call_end|>`
+  //     → predicate rejects, plain-end used, in-string end-marker treated
+  //     as wrapper close, real call dropped.
+  //   * Predicate allowed whitespace between `[` and name AND between
+  //     name and `(`. Parser does NOT allow whitespace there.
+  //     False-positive: `bad[name (<|tool_call_end|>...` → predicate
+  //     accepts, recreates R16 failure mode.
+  //
+  // Finding 2 (function_gemma):
+  //   * Predicate skipped whitespace between name and `{`. Parser's
+  //     `try_parse_one_call` and `gemma_call` require IMMEDIATE `{` after
+  //     the name. False-positive: `bad call:f {<escape>...` satisfies
+  //     predicate but isn't a valid opener; escape-aware scanner treats
+  //     orphan `<escape>` as value region → returns None → hides wrapper
+  //     close.
+  //
+  // R17 structural fix: extract the per-parser call-start recognizer
+  // into a shared helper (`pythonic_call_start_at` /
+  // `find_first_pythonic_call_start`, `function_gemma_call_start_at` /
+  // `find_first_function_gemma_call_start`) used by BOTH the predicate
+  // and the parser body. The predicate becomes
+  // `find_first_*_call_start(prefix).is_some()` — it is impossible for
+  // the predicate to accept a payload the parser would reject (or
+  // vice-versa) because they share the same recognizer code.
+
+  #[test]
+  fn streaming_pythonic_digit_leading_name_with_in_string_end_marker_does_not_drop_call() {
+    // R17 finding 1, false-negative case. The body
+    // `[1tool(s='<|tool_call_end|>')]` is a legitimate pythonic call:
+    // Python's `\w+` accepts digit-leading names and the args use a
+    // single-quoted string carrying the wrapper end-marker literal
+    // verbatim. The PARSER (`find_pythonic_call`) walks every `[` and
+    // accepts ANY non-empty alnum/underscore name run — `1tool` is fine.
+    //
+    // R16's pre-fix `pythonic_call_context_proven` ran a SEPARATE name
+    // check that required `is_ascii_alphabetic() || _` for the first
+    // byte — so `[1tool(` was REJECTED. With the predicate false the
+    // gate returned plain-end → end_pos landed at the FIRST `<|tool_call_end|>`
+    // literal (the one INSIDE the single-quoted string) → bounded body
+    // `[1tool(s='` has no closing `)]` → empty calls → the suffix
+    // `')]<|tool_call_end|> tail` reached display verbatim — the real
+    // call was silently dropped.
+    //
+    // R17 shares `pythonic_call_start_at` between predicate and parser
+    // body: both accept `[1tool(`. Predicate true → quote-aware scan
+    // skips the single-quoted string → end_pos at the FIRST end-tag
+    // OUTSIDE every string (the SECOND `<|tool_call_end|>` literal) →
+    // bounded body is the full `[1tool(s='<|tool_call_end|>')]` → call
+    // extracted with `s = "<|tool_call_end|>"` intact, suffix ` tail`
+    // reaches display.
+    let (display, calls) = run_with_parser(
+      Box::new(Pythonic),
+      &["<|tool_call_start|>[1tool(s='<|tool_call_end|>')]<|tool_call_end|> tail"],
+    );
+    assert_eq!(
+      calls.len(),
+      1,
+      "digit-leading pythonic name MUST be accepted by the shared recognizer (R17 finding 1)",
+    );
+    assert_eq!(calls[0].name, "1tool");
+    assert_eq!(
+      calls[0].arguments,
+      serde_json::json!({ "s": "<|tool_call_end|>" }),
+      "in-single-quoted-string `<|tool_call_end|>` literal MUST survive the quote-aware scan when the recognizer accepts the digit-leading name",
+    );
+    assert_eq!(
+      display, " tail",
+      "FULL suffix (just the ` tail` past the SECOND wrapper end-tag) reaches display — the in-string end-marker MUST NOT be treated as the wrapper close",
+    );
+  }
+
+  #[test]
+  fn streaming_pythonic_stray_open_bracket_with_whitespace_in_malformed_body_does_not_hide_close() {
+    // R17 finding 1, false-positive case. The body `bad[name (`
+    // contains `[name` followed by a SPACE and then `(`. The parser's
+    // `find_pythonic_call` requires IMMEDIATE `(` after the name run
+    // (no whitespace — `bytes[j] == b'('` is the check), so the parser
+    // rejects this as a call start.
+    //
+    // R16's pre-fix `pythonic_call_context_proven` ALLOWED whitespace
+    // between the name and `(` (it skipped ` \t\n\r` before the `(`
+    // check), so the predicate ACCEPTED `bad[name (` → context proven
+    // → quote-aware scanner ran but found no end-tag outside strings
+    // (there are no strings here, and no `<|tool_call_end|>` literal in
+    // the body) → bound returned None → Ok(None) → buffer kept
+    // collecting → cap-recovery dropped the suffix at the cap or EOS.
+    //
+    // R17 shares `pythonic_call_start_at` between predicate and parser
+    // body: both REJECT `bad[name (` (whitespace between name and `(`
+    // is not part of the grammar). Predicate false → plain-end →
+    // end_pos lands at the FIRST `<|tool_call_end|>` → empty calls,
+    // suffix `[real(x=1)] tail` reaches display (parser-less display
+    // path because the suffix has no `<|tool_call_start|>` wrapper).
+    let (display, calls) = run_with_parser(
+      Box::new(Pythonic),
+      &["<|tool_call_start|>bad[name (<|tool_call_end|>[real(x=1)] tail"],
+    );
+    assert_eq!(
+      calls.len(),
+      0,
+      "stray `[name (` (whitespace before `(`) MUST NOT context-prove pythonic — predicate must match the parser's no-whitespace recognizer (R17 finding 1)",
+    );
+    assert_eq!(
+      display, "[real(x=1)] tail",
+      "FULL suffix bytes reach display — the wrapper close MUST be hit at the FIRST end-tag when the predicate correctly rejects the whitespace-bearing opener",
+    );
+  }
+
+  #[test]
+  fn streaming_function_gemma_stray_call_with_whitespace_in_malformed_body_does_not_hide_close() {
+    // R17 finding 2. The body `bad call:f {<escape>` has `call:f`
+    // followed by a SPACE and then `{`. The parser's
+    // `try_parse_one_call` / `gemma_call` require IMMEDIATE `{` after
+    // the name run (no whitespace — `bytes[j] != b'{'` bails without
+    // skipping whitespace), so the parser rejects this as a call start.
+    //
+    // R16's pre-fix `function_gemma_call_context_proven` ALLOWED
+    // whitespace between the name and `{` (it skipped ` \t\n\r` before
+    // the `{` check), so the predicate ACCEPTED `bad call:f {` →
+    // context proven → escape-aware scanner entered an escape region at
+    // the orphan `<escape>` looking for a matching `<escape>` close
+    // that doesn't exist in the body (the suffix's `call:f{k:v}` has
+    // no second `<escape>`) → bound returned None → Ok(None) → buffer
+    // kept collecting → cap-recovery dropped the suffix at the cap or
+    // EOS.
+    //
+    // R17 shares `function_gemma_call_start_at` between predicate and
+    // parser body: both REJECT `bad call:f {` (whitespace between
+    // name and `{` is not part of the grammar). Predicate false →
+    // plain-end → end_pos lands at the FIRST `<end_function_call>`
+    // → empty calls, suffix `call:f{k:v} tail` reaches display (no
+    // `<start_function_call>` wrapper in the suffix → display path).
+    let (display, calls) = run_with_parser(
+      Box::new(FunctionGemma),
+      &["<start_function_call>bad call:f {<escape><end_function_call>call:f{k:v} tail"],
+    );
+    assert_eq!(
+      calls.len(),
+      0,
+      "stray `call:f {{` (whitespace before `{{`) MUST NOT context-prove function_gemma — predicate must match the parser's no-whitespace recognizer (R17 finding 2)",
+    );
+    assert_eq!(
+      display, "call:f{k:v} tail",
+      "FULL suffix bytes reach display — the wrapper close MUST be hit at the FIRST end-tag when the predicate correctly rejects the whitespace-bearing opener",
+    );
+  }
+
+  /// L9 R17 audit-locking test: for each parser whose `bound_section`
+  /// uses a STRUCTURAL context predicate (not just the dispatcher's
+  /// own leading-byte classifier), the predicate's acceptance grammar
+  /// MUST match the parser's `try_parse_one_call` body recognizer
+  /// EXACTLY. The test exercises a curated set of "should-prove"
+  /// payloads (grammar-edge accepts) and "should-NOT-prove" payloads
+  /// (grammar-edge rejects), then for each:
+  ///   * "should-prove": the parser's `try_parse_one_call` MUST extract
+  ///     a real call when the body is a complete tagged section (the
+  ///     predicate's acceptance corresponds to a parseable opener).
+  ///   * "should-NOT-prove": the parser's `try_parse_one_call` MUST
+  ///     surface ZERO calls when the body contains only the
+  ///     predicate-rejected opener-shape garbage (the predicate's
+  ///     rejection corresponds to no parseable call).
+  ///
+  /// Drift surfaces immediately: if the predicate accepts a payload the
+  /// parser rejects (or vice-versa), the corresponding assertion fires.
+  /// New parsers that add a structural predicate MUST extend this table
+  /// rather than chasing the same drift class round-after-round.
+  #[test]
+  fn try_parse_one_call_context_predicate_matches_recognizer_per_parser() {
+    struct Row {
+      label: &'static str,
+      parser: Box<dyn ToolParser>,
+      // A buffer wrapping a complete tagged section whose body is the
+      // shape under test. The grammar edge IS the contents of the body
+      // (digit-leading name, whitespace, etc.).
+      buffer: &'static str,
+      // When true, the predicate MUST accept the body shape AND the
+      // parser MUST extract at least one call from the buffer. When
+      // false, the predicate MUST reject the body shape AND the parser
+      // MUST surface zero calls from the buffer.
+      should_extract: bool,
+    }
+    let rows: Vec<Row> = vec![
+      // --- pythonic grammar edges --------------------------------------
+      // Accept: digit-leading name (`\w+` allows leading digits).
+      Row {
+        label: "pythonic accept: digit-leading name `[1tool(x=1)]`",
+        parser: Box::new(Pythonic),
+        buffer: "<|tool_call_start|>[1tool(x=1)]<|tool_call_end|>",
+        should_extract: true,
+      },
+      // Accept: underscore-leading name.
+      Row {
+        label: "pythonic accept: underscore-leading name `[_tool(x=1)]`",
+        parser: Box::new(Pythonic),
+        buffer: "<|tool_call_start|>[_tool(x=1)]<|tool_call_end|>",
+        should_extract: true,
+      },
+      // Reject: whitespace between `[` and name.
+      Row {
+        label: "pythonic reject: whitespace before name `[ tool(x=1)]`",
+        parser: Box::new(Pythonic),
+        buffer: "<|tool_call_start|>[ tool(x=1)]<|tool_call_end|>",
+        should_extract: false,
+      },
+      // Reject: whitespace between name and `(`.
+      Row {
+        label: "pythonic reject: whitespace before `(` `[tool (x=1)]`",
+        parser: Box::new(Pythonic),
+        buffer: "<|tool_call_start|>[tool (x=1)]<|tool_call_end|>",
+        should_extract: false,
+      },
+      // Reject: empty name `[(`.
+      Row {
+        label: "pythonic reject: empty name `[(x=1)]`",
+        parser: Box::new(Pythonic),
+        buffer: "<|tool_call_start|>[(x=1)]<|tool_call_end|>",
+        should_extract: false,
+      },
+      // Reject: stray `[` only.
+      Row {
+        label: "pythonic reject: stray `[` only `bad[`",
+        parser: Box::new(Pythonic),
+        buffer: "<|tool_call_start|>bad[<|tool_call_end|>",
+        should_extract: false,
+      },
+      // --- function_gemma grammar edges --------------------------------
+      // Accept: ASCII-alpha name with immediate `{`.
+      Row {
+        label: "function_gemma accept: `call:foo{k:v}`",
+        parser: Box::new(FunctionGemma),
+        buffer: "<start_function_call>call:foo{k:v}<end_function_call>",
+        should_extract: true,
+      },
+      // Accept: digit-leading name (alnum run allowed; matches `gemma_call`).
+      Row {
+        label: "function_gemma accept: digit-leading `call:1foo{k:v}`",
+        parser: Box::new(FunctionGemma),
+        buffer: "<start_function_call>call:1foo{k:v}<end_function_call>",
+        should_extract: true,
+      },
+      // Accept: hyphen in name.
+      Row {
+        label: "function_gemma accept: hyphen `call:foo-bar{k:v}`",
+        parser: Box::new(FunctionGemma),
+        buffer: "<start_function_call>call:foo-bar{k:v}<end_function_call>",
+        should_extract: true,
+      },
+      // Reject: whitespace between name and `{`.
+      Row {
+        label: "function_gemma reject: whitespace before `{` `call:foo {k:v}`",
+        parser: Box::new(FunctionGemma),
+        buffer: "<start_function_call>call:foo {k:v}<end_function_call>",
+        should_extract: false,
+      },
+      // Reject: empty name.
+      Row {
+        label: "function_gemma reject: empty name `call:{k:v}`",
+        parser: Box::new(FunctionGemma),
+        buffer: "<start_function_call>call:{k:v}<end_function_call>",
+        should_extract: false,
+      },
+      // Reject: stray `call:` only.
+      Row {
+        label: "function_gemma reject: stray `call:` only `bad call:`",
+        parser: Box::new(FunctionGemma),
+        buffer: "<start_function_call>bad call:<end_function_call>",
+        should_extract: false,
+      },
+      // --- json_tools (predicate = leading-`{` shape) ------------------
+      // Accept: leading `{`.
+      Row {
+        label: "json_tools accept: leading `{`",
+        parser: Box::new(JsonTools),
+        buffer: r#"<tool_call>{"name":"x","arguments":{}}</tool_call>"#,
+        should_extract: true,
+      },
+      // Reject: stray `{` after garbage.
+      Row {
+        label: "json_tools reject: stray `{` after garbage `bad{`",
+        parser: Box::new(JsonTools),
+        buffer: r#"<tool_call>bad{"name":"x"}</tool_call>"#,
+        should_extract: false,
+      },
+      // --- qwen3_coder (predicate = `<function=NAME>` shape) -----------
+      // Accept: complete `<function=foo>` open-tag.
+      Row {
+        label: "qwen3_coder accept: `<function=foo></function>`",
+        parser: Box::new(Qwen3Coder),
+        buffer: "<tool_call><function=foo></function></tool_call>",
+        should_extract: true,
+      },
+      // Reject: `<function=` without name+`>` close.
+      Row {
+        label: "qwen3_coder reject: `<function=` without `NAME>` close",
+        parser: Box::new(Qwen3Coder),
+        buffer: "<tool_call>bad<function= </tool_call>",
+        should_extract: false,
+      },
+      // --- function_gemma R16 baseline regressions ---------------------
+      // Reject (orphan escape preserved): `call:` without `NAME{`.
+      Row {
+        label: "function_gemma reject: stray `call:` + orphan `<escape>`",
+        parser: Box::new(FunctionGemma),
+        buffer: "<start_function_call>bad call:<escape><end_function_call>",
+        should_extract: false,
+      },
+    ];
+
+    for row in &rows {
+      let result = row
+        .parser
+        .try_parse_one_call(row.buffer, None)
+        .unwrap_or_else(|e| panic!("{}: try_parse_one_call errored: {e}", row.label));
+      let (calls, _end_pos) = result.unwrap_or_else(|| {
+        panic!(
+          "{}: confirmed-bounded section expected (the wrapper end-tag is in the buffer), got Ok(None) — predicate/recognizer drift hid the wrapper close",
+          row.label,
+        )
+      });
+      if row.should_extract {
+        assert!(
+          !calls.is_empty(),
+          "{}: the predicate must ACCEPT this body shape (the parser's recognizer accepts it); got zero calls — predicate is STRICTER than the parser body (false-negative drift)",
+          row.label,
+        );
+      } else {
+        assert!(
+          calls.is_empty(),
+          "{}: the predicate must REJECT this body shape (the parser's recognizer rejects it); got {} call(s) — predicate is LOOSER than the parser body (false-positive drift)",
+          row.label,
+          calls.len(),
+        );
+      }
     }
   }
 }
