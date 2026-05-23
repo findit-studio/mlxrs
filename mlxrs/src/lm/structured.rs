@@ -69,7 +69,7 @@ use std::cell::RefCell;
 
 use llguidance::{Matcher, ParserFactory, api::TopLevelGrammar, toktrie::TokEnv};
 use serde_json::Value;
-use toktrie_hf_tokenizers::ByteTokenizer;
+use toktrie_hf_tokenizers::{ByteTokenizer, ByteTokenizerEnv};
 
 use crate::{
   array::Array,
@@ -149,95 +149,92 @@ fn tok_env_from_tokenizer(
   let json = serde_json::to_vec(tokenizer.hf()).map_err(|e| Error::Backend {
     message: format!("llguidance: serialize HF tokenizer: {e}"),
   })?;
-  let mut bt = ByteTokenizer::from_json_bytes(&json).map_err(|e| Error::Backend {
+  let bt = ByteTokenizer::from_json_bytes(&json).map_err(|e| Error::Backend {
     message: format!("llguidance: build ByteTokenizer: {e}"),
   })?;
 
-  // Sync mlxrs's configured EOS ids into the ByteTokenizer so the resulting
-  // [`TokEnv`]'s `tok_trie().eos_token_set()` matches the model's ACTUAL
-  // stop ids. Upstream `ByteTokenizer::from_tokenizer`
-  // (`toktrie_hf_tokenizers/src/lib.rs:179-194`) only auto-detects a small
-  // hardcoded set of EOS strings (`</s>`, `<|endoftext|>`,
+  // Sync mlxrs's configured EOS ids into the resulting [`TokEnv`]'s
+  // `tok_trie().eos_token_set()` so terminal-grammar EOS-only masks
+  // unmask the model's ACTUAL stop ids. Upstream
+  // `ByteTokenizer::from_tokenizer`
+  // (`toktrie_hf_tokenizers/src/lib.rs:186-205`) only auto-detects a
+  // small hardcoded set of EOS strings (`</s>`, `<|endoftext|>`,
   // `<|end_of_text|>`, DeepSeek's `<｜end▁of▁sentence｜>`, `<eos>`) and
   // silently defaults `tok_eos` to id `0` for everything else (note: it
-  // classifies `<|im_end|>`/`<|eot_id|>` as `tok_end_of_turn`, NOT `tok_eos`).
-  // Without this sync:
-  //   - a caller-supplied `eos_token_ids` override is ignored by llguidance,
-  //   - a `tokenizer_config.json` `eos_token` string outside the hardcoded
-  //     list (e.g. `<|im_end|>`) is silently dropped,
+  // classifies `<|im_end|>`/`<|eot_id|>` as `tok_end_of_turn`, NOT
+  // `tok_eos`). Without this sync:
+  //   - a caller-supplied `eos_token_ids` override is ignored by
+  //     llguidance,
+  //   - a `tokenizer_config.json` `eos_token` string outside the
+  //     hardcoded list (e.g. `<|im_end|>`) is silently dropped,
   //   - and `compute_mask_or_eos` returns an EOS-only mask gated by the
   //     WRONG eos id (id `0`).
   //
-  // [`ByteTokenizer::set_eos_tokens`]
-  // (`toktrie_hf_tokenizers/src/lib.rs:271-282`) registers the full ordered
-  // eos set: `tokens[0]` becomes the primary `tok_eos`, the rest are extras,
-  // and `into_tok_env` later threads them through `TokTrie::with_eos_tokens`
-  // (`lib.rs:326-328`). The mlxrs `Tokenizer::eos_token_ids()` returns a
-  // `BTreeSet<u32>` — iterating in sorted-numeric order is deterministic;
-  // for mask correctness only the SET membership matters
-  // (`eos_token_set()` collects every registered id), so the chosen
-  // slot-0 primary doesn't change which ids are unmasked. Skip the call
-  // when the set is empty (no eos configured at all) — `set_eos_tokens`
-  // panics on an empty slice, and in that case upstream's hardcoded
-  // detection is the only signal we have anyway.
+  // **Padded-vocab support (V6 R4).** We register the configured EOS ids
+  // AFTER widening the toktrie via `ByteTokenizerEnv::new(bt,
+  // model_vocab_size)`. The widened `TokTrie::vocab_size()` then equals
+  // `model_vocab_size.unwrap_or(bt_vocab)`, and
+  // [`TokTrie::with_eos_tokens`]
+  // (`toktrie/src/toktree.rs:300-313`) asserts every id against THAT
+  // widened vocab — so a padded-range EOS id (e.g. `120` for a model
+  // with `bt_vocab=99` + `model_vocab_size=Some(128)`) is now legitimate
+  // and fully registered in `tok_trie.eos_token_set()`.
   //
-  // **Out-of-range validation (V6 R3).** Upstream
-  // [`set_eos_tokens`](https://github.com/microsoft/llguidance/blob/main/toktrie_hf_tokenizers/src/lib.rs#L271-L282)
-  // asserts `tok < self.info.vocab_size` for each id — an
-  // out-of-range id (e.g. a version-skewed model-config `eos_token_id`
-  // larger than the loaded tokenizer's vocab) would PANIC the calling
-  // thread instead of surfacing a recoverable error. The mlxrs
+  // The earlier R3 design called `bt.set_eos_tokens` BEFORE
+  // `into_tok_env`, against the still-unpadded
+  // `bt.tokrx_info().vocab_size`. That meant padded-range ids could
+  // only be silently filtered out (otherwise upstream's `assert!`
+  // panicked), and a config supplying ONLY a padded-range EOS would
+  // leave the trie's EOS set defaulted to upstream's auto-detected id
+  // (often `0`) — `compute_mask_or_eos` would then unmask the WRONG
+  // token in a terminal-grammar state. Switching to post-widening
+  // registration via `ByteTokenizerEnv::new` + `tok_trie.with_eos_tokens`
+  // closes that silent-failure case (the recoverable Err still fires on
+  // ids above the WIDENED bound).
+  //
+  // **Out-of-range validation.** The mlxrs
   // [`Tokenizer::eos_token_ids()`] is populated from caller-supplied
   // and/or `tokenizer_config.json`-derived ids without any vocab-size
   // check (existing tests install ids as high as `4242`), so we MUST
-  // validate before crossing the FFI boundary into upstream's `assert!`.
+  // validate before crossing the FFI boundary into
+  // `TokTrie::with_eos_tokens`'s `assert!`. The effective bound is the
+  // widened `env.tok_trie.vocab_size()` — same value the upstream
+  // assert checks against — surfaced as a recoverable
+  // [`Error::ShapeMismatch`] with the offending id + bound.
   //
-  // The effective bound is `model_vocab_size.unwrap_or(bt_vocab)` where
-  // `bt_vocab = bt.tokrx_info().vocab_size as usize` — padded LM heads
-  // (`into_tok_env(Some(n))` with `n > bt_vocab`) widen the resulting
-  // toktrie to `n`, and a model-config EOS id in the padded
-  // `[bt_vocab, n)` range is legitimate (placeholder-token slot used as
-  // the stop signal). To avoid panicking inside upstream's stricter
-  // `set_eos_tokens` check (which still asserts against the UNPADDED
-  // `bt.info.vocab_size`), we ALSO clamp the FFI call to ids that fit
-  // in `bt_vocab`: padded-range EOS ids pass our recoverable bound but
-  // are sliced out of `set_eos_tokens`'s argument. The padded-range
-  // ids cannot be registered through upstream's current
-  // `ByteTokenizer` API (`info.vocab_size` is not widened until
-  // `ByteTokenizerEnv::new` consumes `self`), so this dual gate is the
-  // best the surface allows — the recoverable Err still fires on ids
-  // above BOTH bounds, while the in-range subset is propagated.
+  // The mlxrs `Tokenizer::eos_token_ids()` returns a `BTreeSet<u32>` —
+  // iterating in sorted-numeric order is deterministic; for mask
+  // correctness only the SET membership matters
+  // (`eos_token_set()` collects every registered id), so the chosen
+  // slot-0 primary doesn't change which ids are unmasked. Skip the call
+  // when the set is empty (no eos configured at all) —
+  // `with_eos_tokens` panics on an empty slice, and in that case
+  // upstream's hardcoded detection is the only signal we have anyway.
   let configured_eos: Vec<u32> = tokenizer.eos_token_ids().iter().copied().collect();
+
+  let mut env = ByteTokenizerEnv::new(bt, model_vocab_size).map_err(|e| Error::Backend {
+    message: format!("llguidance: build ByteTokenizerEnv: {e}"),
+  })?;
+
   if !configured_eos.is_empty() {
-    let bt_vocab = bt.tokrx_info().vocab_size as usize;
-    let bound = model_vocab_size.unwrap_or(bt_vocab);
+    let widened_vocab = env.tok_trie.vocab_size();
     for &eos in &configured_eos {
-      if (eos as usize) >= bound {
+      if (eos as usize) >= widened_vocab {
         return Err(Error::ShapeMismatch {
           message: format!(
             "llguidance: configured EOS token id {eos} is out of range \
-             (vocab bound = {bound}); cannot register with the grammar matcher"
+             (vocab bound = {widened_vocab}); cannot register with the grammar matcher"
           ),
         });
       }
     }
-    // Forward only the subset that fits in upstream's unpadded check
-    // (avoids `set_eos_tokens`'s own `assert!` panic for padded-range
-    // ids that passed our recoverable bound).
-    let in_range: Vec<u32> = configured_eos
-      .iter()
-      .copied()
-      .filter(|&eos| (eos as usize) < bt_vocab)
-      .collect();
-    if !in_range.is_empty() {
-      bt.set_eos_tokens(&in_range);
-    }
+    // Register against the WIDENED vocab — padded-range ids pass, and
+    // `tok_trie.eos_token_set()` now reflects the caller-supplied set
+    // exactly (no silent drop).
+    env.tok_trie = env.tok_trie.with_eos_tokens(&configured_eos);
   }
 
-  bt.into_tok_env(model_vocab_size)
-    .map_err(|e| Error::Backend {
-      message: format!("llguidance: build TokEnv: {e}"),
-    })
+  Ok(env.to_env())
 }
 
 /// MLX logits processor backed by [`llguidance`].

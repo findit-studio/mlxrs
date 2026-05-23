@@ -34,6 +34,17 @@
 //!   — R2 fix: pin three caller-supplied eos ids (mixed
 //!   auto-detect/non-auto-detect), assert all three remain finite in
 //!   the EOS-only mask and every non-eos id is `-inf`.
+//! - `llguidance_terminal_grammar_padded_eos_id_actually_unmasks_at_runtime`
+//!   — R4 fix: padded-only EOS configuration (`[120]` with
+//!   `model_vocab_size = Some(128)` over a `bt_vocab = 99` tokenizer)
+//!   drives the terminal-grammar EOS-only mask to leave EXACTLY id
+//!   120 finite. Under R3's filtered-FFI workaround the EOS-only mask
+//!   silently defaulted to id 0 (the upstream auto-detect fallback)
+//!   instead.
+//! - `llguidance_terminal_grammar_mixed_in_range_plus_padded_eos` —
+//!   R4 fix: mixed in-range + padded EOS configuration
+//!   (`[CUSTOM_EOS_ID, 120]`) registers BOTH ids in the terminal-grammar
+//!   EOS-only mask (under R3 the padded id was filtered out).
 
 #![cfg(all(feature = "lm", feature = "llguidance"))]
 
@@ -810,15 +821,13 @@ fn llguidance_terminal_grammar_accepts_padded_model_eos_id() {
   //
   // Two sub-checks:
   //
-  // (a) EOS id in the padded range (`[bt_vocab, model_vocab)`) passes
-  //     the recoverable Err gate (constructor succeeds — does NOT
-  //     panic, does NOT return `Err`). Upstream's
-  //     `ByteTokenizer::set_eos_tokens` itself asserts against the
-  //     UNPADDED `info.vocab_size`, so the in-padded-range id is
-  //     filtered out of the FFI call (it never reaches the toktrie's
-  //     `eos_token_set`); but the configuration is still accepted —
-  //     `Err` is not surfaced — which is the contract the prompt
-  //     specifies for padded acceptance.
+  // (a) EOS id in the padded range (`[bt_vocab, model_vocab)`) is
+  //     accepted AND actually drives the terminal-grammar EOS-only
+  //     mask to unmask that exact id — proving the R4 path registers
+  //     padded-range EOS ids through the widened
+  //     `TokTrie::with_eos_tokens` (the earlier R3 path silently
+  //     filtered them out, leaving the trie's EOS set defaulted to
+  //     upstream's auto-detected id, often `0`).
   //
   // (b) EOS id in the UNPADDED range with a padded `model_vocab_size`
   //     supplied is unmasked correctly in the terminal-grammar
@@ -829,7 +838,15 @@ fn llguidance_terminal_grammar_accepts_padded_model_eos_id() {
   // The fixture has 99 base ids (3 specials + 95 printables + 1 added
   // `<|im_end|>` at id 98). Pin `model_vocab_size = Some(128)`.
 
-  // ─ Sub-check (a): padded-range eos id is ACCEPTED (no Err, no panic).
+  // ─ Sub-check (a): padded-range eos id is ACCEPTED AND DRIVES the
+  // EOS-only mask. The strengthened R4 form: construct the processor,
+  // drive the regex grammar to terminal state by consuming `a`, and
+  // assert the EOS-only mask leaves id 120 finite. Under the R3
+  // filtered-FFI workaround this sub-check WOULD have surfaced the
+  // silent-failure bug (id 120 was sliced out of the FFI call, so
+  // `tok_trie.eos_token_set()` defaulted to id 0 — the post-consume
+  // mask would have left 0 finite and 120 `-inf`, the opposite of what
+  // the mlxrs Tokenizer reported).
   let tok_padded_only = fixture_tokenizer_with_eos_override(
     "padded_eos_accepted_padded_range",
     &[(CUSTOM_EOS_ID, "<|im_end|>")],
@@ -847,12 +864,49 @@ fn llguidance_terminal_grammar_accepts_padded_model_eos_id() {
     "test premise: eos id 120 must be inside model_vocab {model_vocab}"
   );
   let grammar_a = structured::GrammarSpec::Regex("a".to_string());
-  let _proc_a =
+  let proc_a =
     structured::LLGuidanceLogitsProcessor::new(grammar_a, &tok_padded_only, Some(model_vocab))
       .expect(
         "padded-model EOS id (in [tokenizer_vocab, model_vocab)) must be ACCEPTED — \
          constructor must not panic and must not return Err",
       );
+  let zeros_a = vec![0.0f32; model_vocab];
+  let logits_a = Array::from_slice::<f32>(&zeros_a, &(1, model_vocab)).unwrap();
+  let _ = proc_a
+    .apply(&[], &logits_a)
+    .expect("first apply should succeed");
+  let a_token_id_a = id_for_byte(b'a');
+  let mut out_a = proc_a
+    .apply(&[a_token_id_a], &logits_a)
+    .expect("post-consume apply should succeed and return EOS-only mask");
+  let out_va = out_a.to_vec::<f32>().unwrap();
+  assert_eq!(out_va.len(), model_vocab);
+  // Padded-range eos id 120 must be the one finite position in the
+  // EOS-only mask — proving option (a)'s post-widening
+  // `with_eos_tokens` registered it.
+  assert!(
+    out_va[120].is_finite(),
+    "padded-range EOS-only mask: padded eos id 120 must remain finite, got {}",
+    out_va[120]
+  );
+  // Upstream's pre-R4 fallback default (`tok_eos = 0`) must NOT be
+  // unmasked — the override REPLACES it entirely.
+  assert!(
+    out_va[0].is_infinite() && out_va[0] < 0.0,
+    "padded-range EOS-only mask: id 0 (upstream fallback default) must be -inf, got {}",
+    out_va[0]
+  );
+  // Every other id (including padded placeholders `[tok_vocab_a,
+  // model_vocab)` other than 120) is `-inf`.
+  for (i, v) in out_va.iter().enumerate() {
+    if i == 120 {
+      continue;
+    }
+    assert!(
+      v.is_infinite() && *v < 0.0,
+      "padded-range EOS-only mask: non-eos id {i} must be -inf, got {v}"
+    );
+  }
 
   // ─ Sub-check (b): in-unpadded-range eos id with padded model_vocab
   //   round-trips through the EOS-only mask (the realistic case the
@@ -900,6 +954,164 @@ fn llguidance_terminal_grammar_accepts_padded_model_eos_id() {
     assert!(
       v.is_infinite() && *v < 0.0,
       "padded-vocab EOS-only mask: non-eos id {i} must be -inf, got {v}"
+    );
+  }
+}
+
+// ── Finding 1 (R4): padded-range EOS actually reaches the runtime mask ──
+//
+// R3 filtered configured EOS ids `>= bt.tokrx_info().vocab_size` out of
+// the upstream `set_eos_tokens` call to dodge its `assert!`. That
+// SILENTLY accepted padded-only EOS configs (e.g. `[120]` with
+// `bt_vocab=99` + `model_vocab_size=Some(128)`): `in_range` was empty,
+// `set_eos_tokens` was never called, and `tok_trie.eos_token_set()`
+// defaulted to upstream's auto-detected `tok_eos` (often `0`). At the
+// terminal-grammar stopped state, `compute_mask_or_eos` then unmasked
+// the WRONG token id — mlxrs `Tokenizer::eos_token_ids()` reported
+// `{120}` while the structured-decoder emitted id `0`.
+//
+// R4 fix: register configured EOS ids POST-widening via
+// `ByteTokenizerEnv::new(bt, n_vocab)` + `tok_trie.with_eos_tokens`
+// (`toktrie/src/toktree.rs:300-313`), whose assert is against the
+// WIDENED `vocab_size()` — `120 < 128` is now valid and fully
+// propagated. The strengthened
+// `llguidance_terminal_grammar_accepts_padded_model_eos_id` (sub-check
+// a) exercises the realistic case; this test is a directly-named
+// regression pin so the silent-failure case is hard-locked.
+
+#[test]
+fn llguidance_terminal_grammar_padded_eos_id_actually_unmasks_at_runtime() {
+  // Padded-only EOS configuration: configured eos = `[120]`, tokenizer
+  // vocab = 99 (so `120 >= bt_vocab`), model_vocab_size = `Some(128)`.
+  // Under R3 the FFI call was suppressed and the EOS-only mask
+  // defaulted to id `0`. Under R4 the configured eos is registered
+  // against the WIDENED trie, so the EOS-only mask leaves id `120`
+  // finite and every other position (incl. `0`) `-inf`.
+  let tok = fixture_tokenizer_with_eos_override(
+    "r4_padded_eos_runtime_mask",
+    &[(CUSTOM_EOS_ID, "<|im_end|>")],
+    &[120],
+  );
+  let bt_vocab = tok.hf().get_vocab_size(true);
+  assert!(
+    120u32 >= bt_vocab as u32,
+    "test premise: eos id 120 must be padded-range \
+     (above the unpadded tokenizer vocab {bt_vocab})"
+  );
+  let model_vocab = 128usize;
+  assert!(
+    120usize < model_vocab,
+    "test premise: eos id 120 must be inside model_vocab {model_vocab}"
+  );
+
+  let grammar = structured::GrammarSpec::Regex("a".to_string());
+  let proc = structured::LLGuidanceLogitsProcessor::new(grammar, &tok, Some(model_vocab))
+    .expect("padded-only EOS construction must succeed under R4");
+
+  let zeros = vec![0.0f32; model_vocab];
+  let logits = Array::from_slice::<f32>(&zeros, &(1, model_vocab)).unwrap();
+  // Prime, then drive to terminal state by consuming `a`.
+  let _ = proc
+    .apply(&[], &logits)
+    .expect("first apply should succeed");
+  let a_token_id = id_for_byte(b'a');
+  let mut out = proc
+    .apply(&[a_token_id], &logits)
+    .expect("post-consume apply should succeed and return EOS-only mask");
+  let out_v = out.to_vec::<f32>().unwrap();
+  assert_eq!(out_v.len(), model_vocab);
+
+  // Post-R4 contract: padded-range eos id `120` is the ONLY finite
+  // position in the EOS-only mask. Under R3 this would have FAILED:
+  // id 0 (upstream's pre-R4 fallback) would have been finite and id
+  // 120 would have been `-inf`.
+  assert!(
+    out_v[120].is_finite(),
+    "R4 padded-range EOS-only mask: padded eos id 120 must remain finite, got {}",
+    out_v[120]
+  );
+  assert!(
+    out_v[0].is_infinite() && out_v[0] < 0.0,
+    "R4 padded-range EOS-only mask: id 0 (upstream pre-R4 fallback default) \
+     must be -inf, got {}",
+    out_v[0]
+  );
+  // Every other id (every placeholder padded slot, every printable, every
+  // base special other than the configured 120) must be `-inf`.
+  for (i, v) in out_v.iter().enumerate() {
+    if i == 120 {
+      continue;
+    }
+    assert!(
+      v.is_infinite() && *v < 0.0,
+      "R4 padded-range EOS-only mask: non-eos id {i} must be -inf, got {v}"
+    );
+  }
+}
+
+#[test]
+fn llguidance_terminal_grammar_mixed_in_range_plus_padded_eos() {
+  // Mixed configuration: `eos_token_ids = [98, 120]` + `model_vocab_size
+  // = Some(128)` with `bt_vocab = 99`. Under R3 the FFI call received
+  // `[98]` (in-range filter), so `tok_trie.eos_token_set()` had `{98}`
+  // and the EOS-only mask UNMASKED id 98 but MASKED id 120 — the
+  // padded-range id was silently dropped. Under R4 both ids are
+  // registered against the widened trie and both must be finite.
+  let tok = fixture_tokenizer_with_eos_override(
+    "r4_mixed_eos_in_range_plus_padded",
+    &[(CUSTOM_EOS_ID, "<|im_end|>")],
+    &[CUSTOM_EOS_ID, 120],
+  );
+  let bt_vocab = tok.hf().get_vocab_size(true);
+  assert!(
+    (CUSTOM_EOS_ID as usize) < bt_vocab,
+    "test premise: CUSTOM_EOS_ID ({CUSTOM_EOS_ID}) must be in the unpadded \
+     tokenizer vocab {bt_vocab}"
+  );
+  assert!(
+    120u32 >= bt_vocab as u32,
+    "test premise: eos id 120 must be padded-range \
+     (above the unpadded tokenizer vocab {bt_vocab})"
+  );
+  let model_vocab = 128usize;
+
+  let grammar = structured::GrammarSpec::Regex("a".to_string());
+  let proc = structured::LLGuidanceLogitsProcessor::new(grammar, &tok, Some(model_vocab))
+    .expect("mixed in-range + padded EOS construction must succeed under R4");
+
+  let zeros = vec![0.0f32; model_vocab];
+  let logits = Array::from_slice::<f32>(&zeros, &(1, model_vocab)).unwrap();
+  let _ = proc
+    .apply(&[], &logits)
+    .expect("first apply should succeed");
+  let a_token_id = id_for_byte(b'a');
+  let mut out = proc
+    .apply(&[a_token_id], &logits)
+    .expect("post-consume apply should succeed and return EOS-only mask");
+  let out_v = out.to_vec::<f32>().unwrap();
+  assert_eq!(out_v.len(), model_vocab);
+
+  // BOTH configured eos ids are finite (post-R4: both reach the
+  // widened trie's `eos_token_set`). Under R3 only `CUSTOM_EOS_ID`
+  // (98) would have been finite; `120` would have been `-inf`.
+  assert!(
+    out_v[CUSTOM_EOS_ID as usize].is_finite(),
+    "R4 mixed EOS-only mask: in-range eos id {CUSTOM_EOS_ID} must remain finite, got {}",
+    out_v[CUSTOM_EOS_ID as usize]
+  );
+  assert!(
+    out_v[120].is_finite(),
+    "R4 mixed EOS-only mask: padded-range eos id 120 must remain finite, got {}",
+    out_v[120]
+  );
+  // Every other id is `-inf`.
+  for (i, v) in out_v.iter().enumerate() {
+    if i as u32 == CUSTOM_EOS_ID || i == 120 {
+      continue;
+    }
+    assert!(
+      v.is_infinite() && *v < 0.0,
+      "R4 mixed EOS-only mask: non-eos id {i} must be -inf, got {v}"
     );
   }
 }
