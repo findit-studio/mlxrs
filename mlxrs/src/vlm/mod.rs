@@ -40,6 +40,15 @@
 //!   generation Iterator, ported from `mlx-vlm/mlx_vlm/generate.py::
 //!   generate_step` (preprocess images → vision encode → embed merge →
 //!   prefill via `forward_embeddings` → per-token decode via `forward`).
+//! - [`crate::vlm::inputs`] — multimodal **input assembly** (V4): the
+//!   branch-dispatch + padding-side core of
+//!   `mlx-vlm/mlx_vlm/utils.py::prepare_inputs` (lines 1173–1449),
+//!   plus the VLM-side audio/video glue wrappers
+//!   ([`crate::vlm::inputs::read_audio`],
+//!   [`crate::vlm::inputs::load_audio_vlm`],
+//!   [`crate::vlm::inputs::normalize_audio_features`],
+//!   [`crate::vlm::inputs::load_video`]). The audio glue is gated on
+//!   both `vlm` AND `audio` (it bridges the two subsystems).
 //! - [`crate::vlm::video`] — model-agnostic video *preprocessing* math
 //!   ported from `mlx-vlm/mlx_vlm/video_generate.py` (`smart_resize`,
 //!   `smart_nframes`, frame-index sampling, and a `process_frames` that
@@ -53,6 +62,7 @@
 pub mod feature_cache;
 pub mod generate;
 pub mod image;
+pub mod inputs;
 pub mod load;
 pub mod model;
 pub mod prompt;
