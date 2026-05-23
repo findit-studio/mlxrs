@@ -131,6 +131,69 @@ pub enum Error {
     #[source]
     source: std::io::Error,
   },
+
+  /// [`crate::lm::convert::convert`] reached the post-save extras-copy step
+  /// AFTER the index rename succeeded (so the weights + shard index +
+  /// config ARE visible on disk and a follow-up
+  /// [`crate::lm::load::load_weights`] / [`crate::lm::load::load_config`]
+  /// would observe the committed checkpoint) but
+  /// [`crate::lm::convert::copy_tokenizer_and_extras`] partially failed —
+  /// at least one tokenizer / `*.py` / `generation_config.json` file
+  /// did NOT make it to the destination directory.
+  ///
+  /// **Semantically distinct from [`Error::DurabilityWarning`]**: a
+  /// `DurabilityWarning` with `committed: true` means the on-disk
+  /// checkpoint is **logically complete** (weights + index + config + the
+  /// tokenizer-extras copy all landed; only the parent-directory `fsync`
+  /// returned an error and so a power loss before the FS internally drains
+  /// MAY revert the rename). A `ConvertPostSavePartial`, by contrast,
+  /// means the on-disk destination directory is **structurally
+  /// incomplete** — tokenizer files are missing — and a downstream
+  /// [`crate::lm::load::load`] would either fail (missing tokenizer.json)
+  /// or silently produce a checkpoint with the wrong tokenizer. Callers
+  /// MUST decide whether to retry the copy, copy the missing files by
+  /// hand, or treat the whole convert as failed and delete the
+  /// destination.
+  ///
+  /// This variant is constructed only when the `lm` feature is enabled.
+  /// It is machine-detectable via destructuring: the `save_warning` field
+  /// disambiguates the save side (a durability fsync warning vs a clean
+  /// save) and `copy_error` carries the original tokenizer-copy failure
+  /// (the new R3 information that the R2 fix's free-form
+  /// [`std::io::Error::other`] message hid from typed accessors).
+  #[cfg(feature = "lm")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "lm")))]
+  #[error(
+    "convert: save committed but post-save extras copy partially failed (committed={committed}); \
+     destination directory may be incomplete (missing tokenizer/extras files)"
+  )]
+  ConvertPostSavePartial {
+    /// Always `true` — this variant is reachable only AFTER the
+    /// observable commit point (the index rename + the config rename)
+    /// has succeeded. Kept in the public shape so a future caller can
+    /// branch on it without an API break.
+    committed: bool,
+    /// The durability-fsync warning from the save phase if the save
+    /// returned [`Error::DurabilityWarning`]; `None` if the save
+    /// returned plain `Ok(())` but the post-save extras copy still
+    /// failed. Either way the save side is committed; the field shape
+    /// keeps both cases machine-detectable without a string parse.
+    ///
+    /// Not annotated with `#[source]` because `thiserror`'s `#[source]`
+    /// requires a non-`Option` field (the trait method returns
+    /// `Option<&(dyn Error + 'static)>` already). The chain points at
+    /// `copy_error` (the actually-actionable failure the caller needs to
+    /// retry or recover from); `save_warning` is exposed via direct
+    /// field access.
+    save_warning: Option<std::io::Error>,
+    /// The tokenizer-extras copy failure (the new R3 information that
+    /// the R2 fix folded into a free-form [`std::io::Error::other`]
+    /// message). This is what the caller needs to retry or recover
+    /// from: which file failed and why. Carried as a typed
+    /// [`std::io::Error`] (its kind / message are machine-readable).
+    #[source]
+    copy_error: std::io::Error,
+  },
 }
 
 #[cfg(feature = "tokenizer")]

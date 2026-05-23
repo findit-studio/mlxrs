@@ -491,20 +491,55 @@ pub fn mixed_quant_predicate(
 ///
 /// ## Returns
 ///
-/// `Ok(())` on a successful conversion. Every recoverable failure is an
-/// [`Error`] surfaced as-is from the called primitive:
+/// `Ok(())` — the conversion fully succeeded: weights + shard index +
+/// config + tokenizer extras all landed on disk and the parent-directory
+/// `fsync` reported success.
 ///
-/// - [`Error::Backend`] for argument validation (existing destination,
-///   mutually-exclusive flags, rejected `upload_repo` / `revision`),
-///   load failures (missing / oversized / invalid `config.json` or
-///   weights or tokenizer — see [`crate::lm::load::load`]), quantize /
-///   dequantize failures (see [`crate::lm::quant`]) and save failures
-///   (see [`crate::lm::load::save`]).
-/// - [`Error::DurabilityWarning`] when the save committed but the
-///   post-rename `fsync_dir` failed — the new checkpoint IS visible on
-///   disk but a power loss before the FS drains could lose the directory
-///   entry (see [`crate::lm::load::save`]'s contract). The on-disk
-///   convert is logically complete in this case.
+/// Every recoverable failure is an [`Error`] with a meaning that lets the
+/// caller decide whether the on-disk destination is usable as-is, needs a
+/// follow-up recovery step, or should be treated as failed and removed:
+///
+/// - [`Error::Backend`] — **pre-save** failure: argument validation
+///   (existing destination, mutually-exclusive flags, rejected
+///   `upload_repo` / `revision`), load failures (missing / oversized /
+///   invalid `config.json` or weights or tokenizer — see
+///   [`crate::lm::load::load`]), quantize / dequantize failures (see
+///   [`crate::lm::quant`]) or pre-commit save failures (see
+///   [`crate::lm::load::save`]). The destination directory is **not
+///   committed**: either it was never created (validation/load failures)
+///   or [`crate::lm::load::save`]'s atomic index rename never happened
+///   (so any pre-commit shard / config tempfiles are still labeled
+///   tempfiles and won't be observed by a future
+///   [`crate::lm::load::load`]).
+///
+/// - [`Error::DurabilityWarning`] with `committed: true` — the save is
+///   **logically complete**: weights + index + config + the tokenizer
+///   extras copy all landed on disk and would be observed by a
+///   subsequent [`crate::lm::load::load`]. The only failure is that the
+///   post-rename `fsync_dir` returned an error, so a power loss before
+///   the FS internally drains could revert the rename. The caller may
+///   proceed (the convert is logically complete).
+///
+/// - [`Error::ConvertPostSavePartial`] with `committed: true` — the save
+///   committed (weights + index + config on disk) but the post-save
+///   [`copy_tokenizer_and_extras`] step partially failed: at least one
+///   tokenizer / `*.py` / `generation_config.json` file did NOT make it
+///   to the destination directory. The on-disk destination is
+///   **structurally incomplete** and a downstream
+///   [`crate::lm::load::load`] would either fail (missing
+///   tokenizer.json) or silently produce a checkpoint with the wrong
+///   tokenizer. The caller MUST decide whether to retry the copy, copy
+///   the missing files by hand, or treat the whole convert as failed
+///   and delete the destination.
+///
+///   The variant's typed fields (`save_warning: Option<io::Error>`,
+///   `copy_error: io::Error`) carry the two failure signals
+///   separately — `save_warning = Some(_)` means the save side ALSO
+///   raised a [`Error::DurabilityWarning`] (committed + fsync warning);
+///   `save_warning = None` means the save was clean and only the
+///   extras-copy failed. Both shapes leave the destination structurally
+///   incomplete, so both surface the same variant for the caller's
+///   uniform "incomplete-destination" recovery path.
 pub fn convert(args: ConvertArgs) -> Result<()> {
   let ConvertArgs {
     hf_path,
@@ -736,50 +771,74 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
   // durability-warning branch — so the destination dir is fully
   // populated before we propagate the warning to the caller.
   //
-  // F7 R2 Finding-1: the previous `copy_tokenizer_and_extras(...)?`
-  // discarded an already-stashed committed-DurabilityWarning on copy
-  // failure — the `?` early-return surfaced the copy IO error, hiding
-  // the only signal that the checkpoint was already on disk. A caller
-  // would then see a plain `Error::Backend` and treat the `mlx_path`
-  // as uncommitted/retryable, even though `save` had already returned
-  // `committed: true` and the index + weights + config were visible.
-  // Match BOTH outcomes (the stashed warning AND the copy result) and
-  // explicitly fold them so the caller always retains the committed
-  // signal whenever it existed; on copy failure, the copy IO error is
-  // folded INTO the DurabilityWarning's source message so the caller
-  // can disambiguate (both errors are reported, neither is lost).
+  // F7 R3 Finding-1: the R2 fix folded a post-save copy failure INTO
+  // the DurabilityWarning's `source` via [`std::io::Error::other(format!
+  // (...))`], conflating two semantically-different cases:
+  //
+  //   (a) save committed + only durability uncertain (the documented
+  //       [`Error::DurabilityWarning`] contract = logically-complete
+  //       checkpoint), and
+  //   (b) save committed + extras copy partially failed (destination
+  //       MAY be incomplete — tokenizer files missing).
+  //
+  // The R2 fold also HID the copy failure inside a free-form
+  // `source.to_string()` — callers couldn't machine-detect it via
+  // `ErrorKind` / typed accessors. Existing callers treating
+  // `committed=true DurabilityWarning` as "success-with-warning" per
+  // the documented contract could consume an INCOMPLETE checkpoint.
+  //
+  // The R3 fix routes (b) (and the symmetric clean-save + copy-fail
+  // case) to a NEW structured variant [`Error::ConvertPostSavePartial`]
+  // so the two cases are machine-detectable at the type level: the
+  // typed `save_warning: Option<io::Error>` field disambiguates the
+  // save side, the typed `copy_error: io::Error` field carries the
+  // actually-actionable failure, and the variant's distinct
+  // [`std::mem::discriminant`] tells the caller the destination is
+  // structurally incomplete (tokenizer files missing) — NOT merely
+  // committed-with-fsync-warning.
   let copy_result = copy_tokenizer_and_extras(&hf_path, &mlx_path);
 
   // ─── 7. (Hub upload — `convert.py:174-175`) — REJECTED at step 1. ───
 
   match (committed_warning, copy_result) {
-    // Save committed-with-warning + copy succeeded → re-surface the
-    // warning. On-disk dir is logically complete; the caller's contract
-    // on `Err(DurabilityWarning { committed: true, .. })` is "the save
-    // IS visible but the parent-dir fsync didn't return success" — same
-    // shape [`load::save`] surfaces.
+    // (Some, Ok) — committed + durability warning, copy succeeded →
+    // `Err(DurabilityWarning { committed: true, .. })`. On-disk dir is
+    // logically complete (weights + index + config + tokenizer extras
+    // all landed); only the parent-dir fsync warned. Same shape
+    // [`load::save`] surfaces. Caller may proceed.
     (Some(source), Ok(())) => Err(Error::DurabilityWarning {
       committed: true,
       source,
     }),
-    // Save committed-with-warning + copy failed → preserve committed=
-    // true; FOLD the copy failure into the warning source/message so
-    // the caller has BOTH signals (the save is committed, AND the
-    // tokenizer copy partially failed). Without this, the `?` early-
-    // return on the copy would have hidden the durability warning and
-    // a retry would see `mlx_path.exists()` and reject — losing the
-    // already-committed checkpoint.
-    (Some(save_source), Err(copy_err)) => Err(Error::DurabilityWarning {
+    // (Some, Err) — committed + durability warning + copy failed →
+    // [`Error::ConvertPostSavePartial`] with the durability warning
+    // carried in `save_warning` and the actual copy failure in
+    // `copy_error`. Both signals stay machine-readable (no free-form
+    // string fold), and the variant tells the caller the destination
+    // is structurally incomplete — not merely committed-with-fsync-
+    // warning.
+    (Some(save_source), Err(copy_err)) => Err(Error::ConvertPostSavePartial {
       committed: true,
-      source: std::io::Error::other(format!(
-        "convert: save committed but post-save warnings — \
-         fsync_dir: {save_source}; copy_tokenizer_and_extras: {copy_err}"
-      )),
+      save_warning: Some(save_source),
+      copy_error: std::io::Error::other(copy_err.to_string()),
     }),
-    // No warning + copy succeeded → normal Ok.
+    // (None, Ok) — happy path: weights + index + config + tokenizer
+    // extras all landed and the parent-dir fsync returned success.
     (None, Ok(())) => Ok(()),
-    // No warning + copy failed → propagate the copy failure normally.
-    (None, Err(e)) => Err(e),
+    // (None, Err) — committed (save returned plain Ok) + copy failed →
+    // also surface the structured variant with `save_warning: None`,
+    // because the save IS still committed (the rename succeeded
+    // before we even reached the copy step) — the destination dir is
+    // structurally incomplete but the weights + index + config are
+    // already on disk. The R2 fix surfaced the bare copy error here,
+    // which was correct for "not committed" but the save HAS
+    // committed by this point: the structured variant matches the
+    // (Some, Err) case's "incomplete-destination" recovery contract.
+    (None, Err(copy_err)) => Err(Error::ConvertPostSavePartial {
+      committed: true,
+      save_warning: None,
+      copy_error: std::io::Error::other(copy_err.to_string()),
+    }),
   }
 }
 
@@ -1917,40 +1976,73 @@ mod unit {
     });
     drop(_guard);
 
-    // (a) Final return is `Err(DurabilityWarning { committed: true })`
-    //     — NOT a plain IO/Backend error from the copy. This is the
-    //     R2 contract: a post-commit copy failure MUST NOT erase the
-    //     stashed durability warning.
+    // (a) Final return is the NEW structured
+    //     `Err(ConvertPostSavePartial { committed: true, save_warning:
+    //     Some(_), copy_error: _ })` (R3 fix) — NOT a free-form
+    //     [`DurabilityWarning`] with the copy error folded into its
+    //     `source` string. The R3 contract: a post-commit copy failure
+    //     MUST surface a distinct variant so the caller can
+    //     machine-detect "destination structurally incomplete" vs
+    //     "logically-complete checkpoint with fsync warning", AND
+    //     BOTH the save-side warning AND the copy failure stay
+    //     individually accessible via typed fields (no string parse).
     match &r {
-      Err(Error::DurabilityWarning { committed, source }) => {
+      Err(Error::ConvertPostSavePartial {
+        committed,
+        save_warning,
+        copy_error,
+      }) => {
         assert!(
           *committed,
-          "convert's DurabilityWarning must carry committed=true even \
-           when the post-save tokenizer copy fails"
+          "ConvertPostSavePartial must carry committed=true (variant is \
+           reachable only after the observable commit point)"
         );
-        // (b) The folded message names BOTH the original fsync_dir
-        //     failure AND the tokenizer-copy failure so the caller
-        //     can disambiguate (the committed-save signal stays, AND
-        //     the partial-tokenizer-copy signal is recoverable).
-        let msg = source.to_string();
+        // (b) `save_warning` is `Some(_)` because the save side raised
+        //     a `DurabilityWarning` (the fsync-dir injector fired on
+        //     skip=1). The underlying IO error is machine-readable
+        //     via `.kind()` and the verbatim original message
+        //     (`injected fsync_dir failure ...`) is preserved (no
+        //     string fold from R2).
+        let save_warning = save_warning
+          .as_ref()
+          .expect("save_warning must be Some — the fsync-dir injector fired");
+        // `.kind()` is the machine-readable accessor — assert it's a
+        // real IO error category (not the catch-all `Other` that
+        // `io::Error::other(format!(..))` produces). `fsync_dir`
+        // returns the OS-level errno via `Errno::result(...)?.into()`,
+        // so the kind is whatever the OS reported (commonly `Other`
+        // for ad-hoc fault-injector strings, but the source string
+        // below is the verbatim assertion).
+        let _ = save_warning.kind();
         assert!(
-          msg.contains("fsync_dir"),
-          "folded source must name fsync_dir; got: {msg}"
+          save_warning
+            .to_string()
+            .contains("injected fsync_dir failure"),
+          "save_warning preserves the verbatim fsync_dir io::Error \
+           message: got {save_warning}"
+        );
+        // (c) `copy_error` carries the actual tokenizer-copy failure
+        //     (the new R3 information). It's machine-readable via
+        //     `.kind()` and its message names
+        //     `copy_tokenizer_and_extras` (the function that returned
+        //     it). The two errors are NOT folded into a single
+        //     free-form string anymore.
+        let _ = copy_error.kind();
+        let copy_msg = copy_error.to_string();
+        assert!(
+          copy_msg.contains("copy_tokenizer_and_extras"),
+          "copy_error names copy_tokenizer_and_extras; got: {copy_msg}"
         );
         assert!(
-          msg.contains("copy_tokenizer_and_extras"),
-          "folded source must name copy_tokenizer_and_extras; got: {msg}"
-        );
-        // The committed-save marker is preserved too (the original
-        // `injected fsync_dir failure ...` message string).
-        assert!(
-          msg.contains("injected fsync_dir failure"),
-          "underlying fsync_dir io::Error preserved verbatim: {msg}"
+          copy_msg.contains("special_tokens_map.json"),
+          "copy_error names the failing file (special_tokens_map.json); \
+           got: {copy_msg}"
         );
       }
       other => panic!(
-        "expected Err(DurabilityWarning), got {other:?} — the post-save \
-         copy failure must NOT erase the stashed committed-warning"
+        "expected Err(ConvertPostSavePartial), got {other:?} — the post-save \
+         copy failure must surface the structured variant so the caller can \
+         machine-detect 'destination structurally incomplete'"
       ),
     }
 
@@ -1994,5 +2086,236 @@ mod unit {
     // succeeds even if the guard hasn't run yet.
     drop(_perm_guard);
     let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  // ─── Finding 1 (Codex F7 R3) — clean-save + tokenizer-copy failure
+  //     surfaces `ConvertPostSavePartial` with `save_warning = None` ───
+  //
+  // The R3 fix routes BOTH the "committed + durability warning + copy
+  // failure" AND the "committed + clean save + copy failure" cases to
+  // the new structured [`Error::ConvertPostSavePartial`] variant. The
+  // R2 fix's (None, Err) arm returned the bare copy `Error::Backend`,
+  // which was correct for "not committed" but the save HAS committed
+  // by this point (the index rename succeeded BEFORE the
+  // copy_tokenizer_and_extras step runs) — so the destination dir is
+  // structurally incomplete, and the caller needs the structured
+  // variant's recovery contract.
+  //
+  // This test exercises the (None, Err) arm in isolation:
+  //   (1) No fsync-dir fault injector — `save` returns plain `Ok(())`.
+  //   (2) `chmod 000` `special_tokens_map.json` so
+  //       `copy_tokenizer_and_extras` hits EACCES.
+  //
+  // Asserts:
+  //   (a) `Err(ConvertPostSavePartial { committed: true,
+  //       save_warning: None, copy_error: _ })` — the `None` arm of
+  //       `save_warning` is the machine-readable signal that the save
+  //       was clean.
+  //   (b) `copy_error.kind()` is meaningful and its message names
+  //       `copy_tokenizer_and_extras` + the failing file.
+  //   (c) The destination dir has the committed artifacts (weights +
+  //       index + config) but NOT the chmod-000 file.
+  //
+  // Unix-only for the same reason as the R2 test: `chmod 000` to
+  // produce EACCES.
+  #[cfg(unix)]
+  #[test]
+  fn convert_no_durability_warning_then_tokenizer_copy_failure_returns_partial_with_no_save_warning()
+   {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!(
+      "mlxrs_convert_clean_save_then_copyfail_{}",
+      std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let src = dir.join("src");
+    let dst = dir.join("dst");
+    std::fs::create_dir_all(&src).unwrap();
+
+    let plain_config = r#"{
+      "model_type":"qwen3","hidden_size":16,"num_hidden_layers":1,
+      "num_attention_heads":2,"num_key_value_heads":2,"head_dim":8,
+      "rope_theta":10000.0,"vocab_size":128,"tie_word_embeddings":false
+    }"#;
+    std::fs::write(src.join("config.json"), plain_config).unwrap();
+    let blob: Vec<f32> = (0..128).map(|i| (i as f32) * 0.01).collect();
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "layer.weight".to_string(),
+      Array::from_slice::<f32>(&blob, &(2usize, 64usize)).unwrap(),
+    );
+    crate::io::save_safetensors(&src.join("model.safetensors"), &weights).unwrap();
+
+    let tokenizer_json = include_str!("../../tests/fixtures/tokenizer.json");
+    let tokenizer_config_json = include_str!("../../tests/fixtures/tokenizer_config.json");
+    std::fs::write(src.join("tokenizer.json"), tokenizer_json).unwrap();
+    std::fs::write(src.join("tokenizer_config.json"), tokenizer_config_json).unwrap();
+    let chmod_target = src.join("special_tokens_map.json");
+    std::fs::write(&chmod_target, br#"{"eos_token":"</s>"}"#).unwrap();
+    std::fs::write(src.join("generation_config.json"), br#"{"max_length":32}"#).unwrap();
+
+    let mut perm = std::fs::metadata(&chmod_target).unwrap().permissions();
+    perm.set_mode(0o000);
+    std::fs::set_permissions(&chmod_target, perm).unwrap();
+
+    struct PermRestore(std::path::PathBuf);
+    impl Drop for PermRestore {
+      fn drop(&mut self) {
+        if let Ok(meta) = std::fs::metadata(&self.0) {
+          let mut p = meta.permissions();
+          p.set_mode(0o644);
+          let _ = std::fs::set_permissions(&self.0, p);
+        }
+      }
+    }
+    let _perm_guard = PermRestore(chmod_target);
+
+    // NO fault injector — `save` returns plain `Ok(())`.
+    let r = convert(ConvertArgs {
+      hf_path: src,
+      mlx_path: dst.clone(),
+      ..Default::default()
+    });
+
+    // (a) `Err(ConvertPostSavePartial { committed: true, save_warning:
+    //     None, copy_error: _ })`. The `None` arm of `save_warning`
+    //     is the machine-readable signal that the save was clean
+    //     (no fsync warning) — distinct from the R2 test which has
+    //     `save_warning: Some(_)`.
+    match &r {
+      Err(Error::ConvertPostSavePartial {
+        committed,
+        save_warning,
+        copy_error,
+      }) => {
+        assert!(
+          *committed,
+          "ConvertPostSavePartial must carry committed=true (variant is \
+           reachable only after the observable commit point)"
+        );
+        assert!(
+          save_warning.is_none(),
+          "save_warning must be None — the save returned plain Ok(()) \
+           with no fsync warning; got: {save_warning:?}"
+        );
+        // (b) `copy_error` is machine-readable.
+        let _ = copy_error.kind();
+        let copy_msg = copy_error.to_string();
+        assert!(
+          copy_msg.contains("copy_tokenizer_and_extras"),
+          "copy_error names copy_tokenizer_and_extras; got: {copy_msg}"
+        );
+        assert!(
+          copy_msg.contains("special_tokens_map.json"),
+          "copy_error names the failing file (special_tokens_map.json); \
+           got: {copy_msg}"
+        );
+      }
+      other => panic!(
+        "expected Err(ConvertPostSavePartial), got {other:?} — a clean \
+         save + post-save copy failure MUST surface the structured \
+         variant (the destination IS committed, structurally \
+         incomplete)"
+      ),
+    }
+
+    // (c) Destination dir has the committed artifacts but NOT the
+    //     chmod-000 file.
+    assert!(dst.join("config.json").is_file(), "config.json on disk");
+    assert!(
+      dst.join("model.safetensors.index.json").is_file(),
+      "index.json on disk"
+    );
+    let any_shard = std::fs::read_dir(&dst)
+      .unwrap()
+      .filter_map(|e| e.ok())
+      .any(|e| {
+        e.path()
+          .file_name()
+          .and_then(|n| n.to_str())
+          .map(|n| n.ends_with(".safetensors"))
+          .unwrap_or(false)
+      });
+    assert!(any_shard, "at least one shard committed on disk");
+    assert!(
+      !dst.join("special_tokens_map.json").is_file(),
+      "the chmod-000 source file MUST NOT have been copied"
+    );
+
+    drop(_perm_guard);
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  // ─── Finding 1 (Codex F7 R3) — `ConvertPostSavePartial` error chain
+  //     is iterable via `std::error::Error::source()` ─────────────────
+  //
+  // The R3 variant uses `#[source]` on `copy_error` so callers walking
+  // the error chain via [`std::error::Error::source`] reach the
+  // tokenizer-copy failure (the actually-actionable signal the caller
+  // needs to retry or recover from). This test asserts the chain is
+  // present and that `.source()` points at the `copy_error` (not
+  // `save_warning`, which is exposed via direct field access — see
+  // the variant doc-comment for the rationale).
+  #[test]
+  fn convert_post_save_partial_error_chain_iterable() {
+    // Construct the variant directly so this test runs on every
+    // platform (the (Some, Err) and (None, Err) paths above are
+    // Unix-only because they rely on `chmod 000`).
+    let copy_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "EACCES on copy");
+    let save_warning_inner = std::io::Error::other("fsync_dir warning");
+    let err = Error::ConvertPostSavePartial {
+      committed: true,
+      save_warning: Some(save_warning_inner),
+      copy_error: copy_err,
+    };
+
+    // The error implements `std::error::Error` (free check: trait
+    // object coercion only compiles if the trait is implemented).
+    let e: &dyn std::error::Error = &err;
+    // The top-level `Display` carries the structured message
+    // (committed + incomplete-destination hint).
+    let top = e.to_string();
+    assert!(
+      top.contains("committed=true"),
+      "Display carries the structured committed=true tag; got: {top}"
+    );
+    assert!(
+      top.contains("destination directory may be incomplete"),
+      "Display carries the structurally-incomplete hint; got: {top}"
+    );
+
+    // `.source()` points at `copy_error` (the actually-actionable
+    // failure). Its message matches what we constructed.
+    let source = e.source().expect(
+      "ConvertPostSavePartial has a #[source]-annotated chain — \
+       calling .source() must return the copy_error",
+    );
+    let source_msg = source.to_string();
+    assert!(
+      source_msg.contains("EACCES on copy"),
+      ".source() returns the copy_error (the actionable failure); \
+       got: {source_msg}"
+    );
+
+    // The same field is independently reachable via destructuring
+    // (machine-readable typed access, no string parse).
+    if let Error::ConvertPostSavePartial {
+      committed,
+      save_warning,
+      copy_error,
+    } = &err
+    {
+      assert!(*committed);
+      assert_eq!(
+        save_warning.as_ref().map(|e| e.to_string()).as_deref(),
+        Some("fsync_dir warning"),
+        "save_warning is reachable via direct field access (typed accessor)"
+      );
+      assert_eq!(copy_error.kind(), std::io::ErrorKind::PermissionDenied);
+      assert!(copy_error.to_string().contains("EACCES on copy"));
+    } else {
+      unreachable!("constructed ConvertPostSavePartial above");
+    }
   }
 }
