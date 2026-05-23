@@ -1381,29 +1381,113 @@ pub fn unpack_awq_weights(qweight: &Array) -> Result<Array> {
 /// post-transform floating weights, so heterogeneous-precision
 /// checkpoints settle onto one type before the MLX quantize pass.
 ///
-/// mlx-lm takes the LAST iterated layer's `scales.dtype` as the target
-/// (`utils.py:156` overwrites `model_dtype` each iteration; the
-/// `dict.keys()` order is insertion order, so it's the last inserted
-/// `.qweight` layer). mlxrs honors the same contract: we pick the dtype
-/// of the `scales` for the lexicographically last `.qweight` prefix —
-/// the result is stable across runs (HashMap iteration order is not),
-/// and matches the python ref's "last-wins" intent.
+/// **Fix 3 [HIGH]**: mlx-lm takes the LAST iterated layer's `scales.dtype`
+/// as the target (`utils.py:156` overwrites `model_dtype` each iteration).
+/// In Python that's `dict` insertion order, which for AutoAWQ checkpoints
+/// usually means the last weight in the safetensors file. mlxrs originally
+/// picked the LEX-LAST prefix to get a stable choice across HashMap
+/// iteration orders, but for HETEROGENEOUS-PRECISION checkpoints
+/// (e.g. some layers f16, some bf16) the lex-last pick is arbitrary and
+/// would silently downcast the higher-precision layers.
+///
+/// Tiebreaker: **highest precision wins** — `F32 > BF16 ~ F16`. Rationale:
+/// the dtype unification step (`utils.py:163-165`) CASTS every floating
+/// weight to the chosen target. Picking the highest precision present
+/// preserves the most information; picking lower would discard the high-
+/// precision layers' mantissa bits irrecoverably. (BF16 and F16 are both
+/// 16-bit, but BF16 wins the bf16-vs-f16 tie because its dynamic range
+/// matches f32's exponent — fewer overflow surprises during cast. F64 is
+/// not a valid `.scales` dtype but is included in the ordering for
+/// completeness if a checkpoint ever carries it.)
+///
+/// Validation: assumes every `.scales` dtype was already gated as
+/// floating by [`validate_awq_scales_are_floating`] — this fn does NOT
+/// re-check (its caller MUST call the validator first).
 fn resolve_awq_model_dtype(
   weights: &Weights,
   qweight_prefixes: &[String],
 ) -> Result<Option<Dtype>> {
-  let Some(last_prefix) = qweight_prefixes.iter().max() else {
+  if qweight_prefixes.is_empty() {
     return Ok(None);
-  };
-  let scales_key = format!("{last_prefix}.scales");
-  let scales = weights.get(&scales_key).ok_or_else(|| Error::Backend {
-    message: format!(
-      "transform_awq_weights: layer `{last_prefix}.qweight` is missing its companion \
-         `{scales_key}` (AutoAWQ writes `.qweight` / `.scales` / `.qzeros` as a triple); \
-         refusing to silently drop the layer"
-    ),
-  })?;
-  Ok(Some(scales.dtype()?))
+  }
+  // Walk every `.scales` (preflight validator already gated them as
+  // floating + present) and pick the highest-precision one. Deterministic
+  // tiebreaker via `floating_dtype_precision_rank` (higher rank = more
+  // precision; F32 > BF16 > F16). For ties (e.g. all bf16) the result is
+  // the first dtype with that rank — stable across runs.
+  let mut best: Option<Dtype> = None;
+  for prefix in qweight_prefixes {
+    let scales_key = format!("{prefix}.scales");
+    let scales = weights.get(&scales_key).ok_or_else(|| Error::Backend {
+      message: format!(
+        "transform_awq_weights: layer `{prefix}.qweight` is missing its companion \
+           `{scales_key}` (AutoAWQ writes `.qweight` / `.scales` / `.qzeros` as a triple); \
+           refusing to silently drop the layer"
+      ),
+    })?;
+    let d = scales.dtype()?;
+    match best {
+      None => best = Some(d),
+      Some(prev) => {
+        if floating_dtype_precision_rank(d) > floating_dtype_precision_rank(prev) {
+          best = Some(d);
+        }
+      }
+    }
+  }
+  Ok(best)
+}
+
+/// Fix 3 [HIGH]: precision rank for the floating dtypes that may appear as
+/// AWQ `.scales`. Higher rank = more precision. Tiebreaker rationale lives
+/// on [`resolve_awq_model_dtype`].
+///
+/// Order: `F64 > F32 > BF16 > F16 > anything-else (sentinel 0)`.
+fn floating_dtype_precision_rank(d: Dtype) -> u8 {
+  match d {
+    Dtype::F64 => 4,
+    Dtype::F32 => 3,
+    Dtype::BF16 => 2,
+    Dtype::F16 => 1,
+    _ => 0,
+  }
+}
+
+/// Fix 3 [HIGH]: validate that every AWQ `.scales` tensor is a SUPPORTED
+/// FLOATING dtype. Without this gate, a hostile/malformed checkpoint with
+/// integer `.scales` (e.g. `i32`, `u8`) would propagate that dtype through
+/// [`resolve_awq_model_dtype`] and the unification loop would then CAST
+/// every model floating weight to that integer dtype — corrupting the
+/// entire model.
+///
+/// "Supported floating" = the mlx-python `mx.issubdtype(dtype, mx.floating)`
+/// set (`utils.py:164`): `F16`, `F32`, `F64`, `BF16`. (F64 is included for
+/// upstream parity even though Metal has no native f64 support — the cast
+/// would still happen losslessly via the CPU path.)
+///
+/// On the first non-floating dtype encountered, returns `Err(Backend)`
+/// naming the offending layer + dtype.
+fn validate_awq_scales_are_floating(weights: &Weights, qweight_prefixes: &[String]) -> Result<()> {
+  for prefix in qweight_prefixes {
+    let scales_key = format!("{prefix}.scales");
+    // Missing `.scales` is a different error class (caught by the
+    // sibling-validation pass); skip silently here so the rejection
+    // message stays scoped to the dtype contract.
+    let Some(scales) = weights.get(&scales_key) else {
+      continue;
+    };
+    let d = scales.dtype()?;
+    if !is_floating(d) {
+      return Err(Error::Backend {
+        message: format!(
+          "transform_awq_weights: layer `{scales_key}` has non-floating dtype {d:?}; \
+           AutoAWQ `.scales` MUST be a floating type (F16 / F32 / F64 / BF16) — \
+           any other dtype would corrupt the dtype-unification cast"
+        ),
+      });
+    }
+  }
+  Ok(())
 }
 
 /// `true` for `F16` / `F32` / `F64` / `BF16` — the mlx-python
@@ -1517,13 +1601,20 @@ pub fn transform_awq_weights(
     }
   }
 
-  // Collect every prefix of a `.qweight` key (sorted, for the lex-last
-  // `model_dtype` resolution + deterministic iteration in tests).
+  // Collect every prefix of a `.qweight` key (sorted, for deterministic
+  // iteration in tests; `resolve_awq_model_dtype` uses a precision rank
+  // independent of order — see Fix 3 below).
   let mut qweight_prefixes: Vec<String> = weights
     .keys()
     .filter_map(|k| k.strip_suffix(".qweight").map(str::to_string))
     .collect();
   qweight_prefixes.sort();
+
+  // Fix 3 [HIGH]: gate every `.scales` dtype as floating BEFORE resolving
+  // model_dtype. Without this, an integer `.scales` would propagate to the
+  // unification loop and cast every model float to that integer — silently
+  // corrupting the model. Spec'd `validate_awq_scales_are_floating`.
+  validate_awq_scales_are_floating(&weights, &qweight_prefixes)?;
 
   let model_dtype = resolve_awq_model_dtype(&weights, &qweight_prefixes)?;
 
@@ -3681,6 +3772,141 @@ mod tests {
     assert_eq!(
       u32_buf, i32_buf,
       "i32 qweight must produce the SAME .weight bit-pattern as the equivalent u32 input"
+    );
+  }
+
+  // ──────────────── Fix 3 [HIGH]: .scales dtype validation ────────────────
+
+  /// Fix 3: integer `.scales` (`i32`) is REJECTED — a hostile/malformed
+  /// checkpoint with integer scales would silently CAST every model float
+  /// to that integer through the dtype-unification loop. The validator
+  /// fires first and names the offending layer + the rejection reason.
+  #[test]
+  fn transform_awq_weights_rejects_integer_scales_dtype() {
+    let in_features = 8usize;
+    let out_features = 8usize;
+    let n_groups = 2usize;
+    let qw = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let qz = Array::from_slice::<u32>(&vec![0u32; n_groups], &(n_groups, 1)).unwrap();
+    // INTEGER `.scales` — the bug class.
+    let sc_int = Array::from_slice::<i32>(
+      &vec![1_i32; n_groups * out_features],
+      &(n_groups, out_features),
+    )
+    .unwrap();
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.layer0.qweight".to_string(), qw);
+    weights.insert("model.layer0.qzeros".to_string(), qz);
+    weights.insert("model.layer0.scales".to_string(), sc_int);
+
+    let cfg = AwqLoadConfig {
+      bits: 4,
+      group_size: 4,
+      zero_point: true,
+      version: "gemm".into(),
+    };
+    let err = transform_awq_weights(weights, &cfg).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("model.layer0.scales"),
+          "error must name the offending layer's `.scales` key, got: {message}"
+        );
+        assert!(
+          message.contains("non-floating"),
+          "error must call out the 'non-floating' rejection, got: {message}"
+        );
+      }
+      other => panic!("expected Error::Backend, got: {other:?}"),
+    }
+  }
+
+  /// Fix 3: `u8` (unsigned narrow int) `.scales` is REJECTED with the same
+  /// error shape. Confirms the gate fires for narrow ints too — not just
+  /// the canonical `i32` case.
+  #[test]
+  fn transform_awq_weights_rejects_uint_scales_dtype() {
+    let in_features = 8usize;
+    let out_features = 8usize;
+    let n_groups = 2usize;
+    let qw = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let qz = Array::from_slice::<u32>(&vec![0u32; n_groups], &(n_groups, 1)).unwrap();
+    let sc_u8 = Array::from_slice::<u8>(
+      &vec![1_u8; n_groups * out_features],
+      &(n_groups, out_features),
+    )
+    .unwrap();
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.layer0.qweight".to_string(), qw);
+    weights.insert("model.layer0.qzeros".to_string(), qz);
+    weights.insert("model.layer0.scales".to_string(), sc_u8);
+
+    let cfg = AwqLoadConfig {
+      bits: 4,
+      group_size: 4,
+      zero_point: true,
+      version: "gemm".into(),
+    };
+    let err = transform_awq_weights(weights, &cfg).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("model.layer0.scales"),
+          "error must name the offending layer's `.scales`, got: {message}"
+        );
+        assert!(
+          message.contains("non-floating"),
+          "error must call out 'non-floating', got: {message}"
+        );
+      }
+      other => panic!("expected Error::Backend, got: {other:?}"),
+    }
+  }
+
+  /// Fix 3: heterogeneous-precision `.scales` (some `f16`, some `bf16`) —
+  /// the resolved `model_dtype` must pick the highest-precision (BF16,
+  /// which outranks F16 in the tiebreaker). Confirms the precision-rank
+  /// resolution is order-independent (no longer "lex-last wins").
+  #[test]
+  fn resolve_awq_model_dtype_picks_highest_precision_for_heterogeneous_scales() {
+    let in_features = 8usize;
+    let out_features = 8usize;
+    let n_groups = 2usize;
+
+    // Build two layers — one with f16 .scales, one with bf16 .scales.
+    let f16_scales_data: Vec<half::f16> = (0..n_groups * out_features)
+      .map(|i| half::f16::from_f32(0.1 * (i + 1) as f32))
+      .collect();
+    let bf16_scales_data: Vec<half::bf16> = (0..n_groups * out_features)
+      .map(|i| half::bf16::from_f32(0.5 + 0.01 * (i as f32)))
+      .collect();
+
+    let qw_a = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let sc_a = Array::from_slice::<half::f16>(&f16_scales_data, &(n_groups, out_features)).unwrap();
+    let qw_b = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let sc_b =
+      Array::from_slice::<half::bf16>(&bf16_scales_data, &(n_groups, out_features)).unwrap();
+
+    let weights: Weights = HashMap::from([
+      ("layer_a.qweight".to_string(), qw_a),
+      ("layer_a.scales".to_string(), sc_a),
+      ("layer_b.qweight".to_string(), qw_b),
+      ("layer_b.scales".to_string(), sc_b),
+    ]);
+    let mut prefixes: Vec<String> = vec!["layer_a".to_string(), "layer_b".to_string()];
+    prefixes.sort();
+
+    // Validator passes (both floating).
+    validate_awq_scales_are_floating(&weights, &prefixes).expect("both floating, must pass");
+
+    // Resolver picks the higher-precision dtype: BF16 > F16 in the rank.
+    let resolved = resolve_awq_model_dtype(&weights, &prefixes)
+      .unwrap()
+      .expect("some dtype");
+    assert_eq!(
+      resolved,
+      Dtype::BF16,
+      "heterogeneous f16+bf16 must resolve to BF16 (precision-rank tiebreaker), got {resolved:?}"
     );
   }
 
