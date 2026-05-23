@@ -461,28 +461,19 @@ fn pythonic_call_context_proven(prefix: &str) -> bool {
   find_first_pythonic_call_start(prefix).is_some()
 }
 
-/// qwen3_coder context predicate: the prefix must contain `<function=`
-/// followed by a name (`[A-Za-z0-9_-]+`) followed by `>` (the function
-/// open-tag shape). A stray `<function=` without the name+`>` close is NOT
-/// proof of a qwen3_coder function body.
+/// qwen3_coder context predicate: the prefix must contain a valid
+/// `<function=NAME>` open-tag (literal `<function=` followed by a non-empty
+/// name run followed by `>`) somewhere — matching the EXACT recognizer
+/// [`find_first_qwen_function_open`] / [`qwen_function_open_at`] that the
+/// parser body ([`Qwen3Coder::parse`] and
+/// [`Qwen3Coder::try_parse_one_call`]) uses. Sharing the recognizer between
+/// the predicate and the parser body prevents the drift class that R18
+/// caught (predicate REJECTING dotted/spaced names like `<function=foo.bar>`
+/// or `<function=foo bar>` that the parser body accepts, causing the
+/// plain-end gate to land on an in-parameter `</tool_call>` literal and
+/// silently drop the call).
 fn qwen_function_context_proven(prefix: &str) -> bool {
-  let needle = "<function=";
-  let mut search_from = 0;
-  while let Some(rel) = prefix[search_from..].find(needle) {
-    let after = search_from + rel + needle.len();
-    let bytes = prefix.as_bytes();
-    let mut j = after;
-    while j < bytes.len()
-      && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
-    {
-      j += 1;
-    }
-    if j > after && j < bytes.len() && bytes[j] == b'>' {
-      return true;
-    }
-    search_from = after;
-  }
-  false
+  find_first_qwen_function_open(prefix).is_some()
 }
 
 /// function_gemma context predicate: the prefix must contain a valid
@@ -1032,15 +1023,25 @@ impl Qwen3Coder {
   ///
   /// **L9 R16 context predicate:** [`bound_context_or_plain_end`] with the
   /// [`qwen_function_context_proven`] predicate gates parameter-value-aware
-  /// scanning behind PROOF of a `<function=name>` open-tag (the literal
-  /// `<function=` followed by a name followed by `>`). A stray `<function=`
-  /// inside malformed bytes (R15 missed: `<tool_call>bad<function= </tool_call>
-  /// <function=f><parameter=p>v</parameter></function> tail` — the
-  /// `<function=` substring in `bad<function= ` is the literal "opener"
-  /// R15 accepted) does NOT prove qwen3_coder context here because the
-  /// predicate requires the FULL `<function=name>` tag shape, not just
+  /// scanning behind PROOF of a `<function=NAME>` open-tag. A stray
+  /// `<function=` inside malformed bytes (R15 missed: `<tool_call>bad
+  /// <function= </tool_call><function=f><parameter=p>v</parameter></function>
+  /// tail` — the `<function=` substring in `bad<function= ` is the literal
+  /// "opener" R15 accepted) does NOT prove qwen3_coder context here because
+  /// the predicate requires the FULL `<function=NAME>` tag shape, not just
   /// the literal substring. With the predicate failing the gate returns
   /// the plain end_tag position so the suffix is preserved.
+  ///
+  /// **L9 R18 shared recognizer:** the predicate delegates to
+  /// [`find_first_qwen_function_open`] / [`qwen_function_open_at`] — the
+  /// EXACT recognizer the parser body ([`Qwen3Coder::parse`] and
+  /// [`Qwen3Coder::try_parse_one_call`]) uses. The shared recognizer
+  /// accepts ANY non-empty `<function=NAME>` opener whose NAME contains
+  /// neither `>` nor `<` (dotted, spaced, special-char names are all
+  /// valid). This kills the R17-residual drift class where the
+  /// `[A-Za-z0-9_-]+` predicate REJECTED parser-accepted dotted/spaced
+  /// names, causing the plain-end gate to land on an in-parameter
+  /// `</tool_call>` literal and silently drop the call.
   fn bound_section<'a>(
     &self,
     payload: &'a str,
@@ -1059,19 +1060,28 @@ impl Qwen3Coder {
 impl ToolParser for Qwen3Coder {
   fn parse(&self, text: &str, tools: Option<&Value>) -> Result<Vec<ToolCall>, Error> {
     // _function_regex = <function=(.*?)</function>$ (DOTALL, findall->[0])
-    let start = text
-      .find("<function=")
+    // Use the SHARED recognizer ([`qwen_function_open_at`]) to find the
+    // first `<function=NAME>` opener — so the parser body and the
+    // streaming context predicate ([`qwen_function_context_proven`])
+    // cannot drift. The recognizer accepts any non-empty `<function=NAME>`
+    // opener whose NAME contains neither `>` nor `<` — dotted (`foo.bar`),
+    // spaced (`foo bar`), and other punctuation are valid here, matching
+    // every byte the upstream Python parser's `body.find('>')` step
+    // accepts (R18 finding: dotted/spaced names parser-accepted but
+    // R17-predicate-rejected).
+    let bytes = text.as_bytes();
+    let (name_start, after_close_bracket) = (0..bytes.len())
+      .find_map(|i| qwen_function_open_at(text, i))
       .ok_or_else(|| err("qwen3_coder: No function provided."))?;
-    let after = &text[start + "<function=".len()..];
+    let after = &text[after_close_bracket..];
     let end = after
       .rfind("</function>")
       .ok_or_else(|| err("qwen3_coder: No function provided."))?;
-    let body = &after[..end];
-    let gt = body
-      .find('>')
-      .ok_or_else(|| err("qwen3_coder: malformed function"))?;
-    let func_name = body[..gt].to_owned();
-    let params_str = &body[gt + 1..];
+    // `after_close_bracket - 1` is the byte position of `>` (the name's
+    // terminator); slicing `text[name_start..after_close_bracket - 1]`
+    // extracts the raw NAME bytes the recognizer accepted.
+    let func_name = text[name_start..after_close_bracket - 1].to_owned();
+    let params_str = &after[..end];
     let props = tool_properties(tools, &func_name);
     let mut args = serde_json::Map::new();
     for cap in find_all(params_str, "<parameter=", "</parameter>") {
@@ -1095,10 +1105,12 @@ impl ToolParser for Qwen3Coder {
     "qwen3_coder"
   }
   /// Lock-step with [`Self::parse`] (above):
-  /// `parse` does `text.find("<function=")` then `after.rfind("</function>")`
-  /// — the **LAST** `</function>` in the section is the real close, because
-  /// parameter VALUES legitimately carry `</function>` (and `</tool_call>`)
-  /// literals (L9 R10 finding).
+  /// `parse` uses the SHARED recognizer (`find_first_qwen_function_open`
+  /// / `qwen_function_open_at`) to find the first valid `<function=NAME>`
+  /// opener, then `after.rfind("</function>")` — the **LAST** `</function>`
+  /// in the section is the real close, because parameter VALUES
+  /// legitimately carry `</function>` (and `</tool_call>`) literals (L9
+  /// R10 finding).
   ///
   /// **L9 R14 STRUCTURAL:** the FIRST step is `Self::bound_section`
   /// (parameter-value-aware end-tag scan over `<parameter=...></parameter>`
@@ -1108,6 +1120,13 @@ impl ToolParser for Qwen3Coder {
   /// would otherwise lock onto the *suffix* `<function=`, scan forward for
   /// `</function>`, fail to find an end-tag after it, return `Ok(None)`,
   /// and silently drop the suffix.
+  ///
+  /// **L9 R18 shared opener recognizer:** the bounded-prefix opener gate
+  /// (step (1) below) uses `find_first_qwen_function_open` — the EXACT
+  /// recognizer the predicate (`qwen_function_context_proven`) and the
+  /// `parse` body use. This prevents the gate from accepting an opener
+  /// shape (e.g. `<function=>` with empty name, or trailing garbage past
+  /// `>`) the predicate / parse body would reject.
   ///
   /// Once bounded, the existing forward-scan finds the first `</function>`
   /// outside every `<parameter=...></parameter>` region (the R10/R11 case)
@@ -1127,17 +1146,24 @@ impl ToolParser for Qwen3Coder {
     let Some((bounded, end_pos)) = self.bound_section(payload, payload_at, end_tag) else {
       return Ok(None);
     };
-    let function_open = "<function=";
     let function_close = "</function>";
     let parameter_open = "<parameter=";
     let parameter_close = "</parameter>";
 
-    // (1) Find the section's `<function=` within the bounded prefix.
-    let Some(fn_open_rel) = bounded.find(function_open) else {
-      // No `<function=` in the bounded body → bounded-but-malformed section
-      // (the body is structurally invalid for qwen3_coder). Surface zero
-      // calls with the known end_pos so the streaming processor preserves
-      // the same-chunk suffix.
+    // (1) Find the section's `<function=NAME>` opener within the bounded
+    //     prefix using the SHARED recognizer ([`qwen_function_open_at`] via
+    //     [`find_first_qwen_function_open`]) so this gate cannot drift from
+    //     the predicate ([`qwen_function_context_proven`]) or the parser
+    //     body ([`Qwen3Coder::parse`]). The recognizer returns
+    //     `after_close_bracket` — one past the `>` that closes the opener
+    //     — which is the correct starting cursor for the `</function>`
+    //     forward-scan below (an in-name `<` or `>` would never get past
+    //     the recognizer).
+    let Some(after_open_rel) = find_first_qwen_function_open(bounded) else {
+      // No `<function=NAME>` opener in the bounded body → bounded-but-
+      // malformed section (the body is structurally invalid for
+      // qwen3_coder). Surface zero calls with the known end_pos so the
+      // streaming processor preserves the same-chunk suffix.
       return Ok(Some((Vec::new(), end_pos)));
     };
 
@@ -1146,7 +1172,7 @@ impl ToolParser for Qwen3Coder {
     //     the VALUE is opaque text and can carry a literal `</function>` —
     //     that occurrence MUST be skipped (R10 case). All scanning is bounded
     //     to the body — the bytes after the wrapper close are never visible.
-    let mut cursor = fn_open_rel + function_open.len();
+    let mut cursor = after_open_rel;
     let fn_close_found = loop {
       let next_fclose = bounded[cursor..].find(function_close);
       let next_popen = bounded[cursor..].find(parameter_open);
@@ -1188,6 +1214,65 @@ impl ToolParser for Qwen3Coder {
       _ => Ok(Some((Vec::new(), end_pos))),
     }
   }
+}
+
+/// **Shared qwen3_coder function-open recognizer.** Returns
+/// `Some((name_start, after_close_bracket))` when `payload[at..]` begins
+/// with a valid `<function=NAME>` open-tag.
+///
+/// **Accepted name grammar:** any **non-empty run of bytes containing
+/// neither `>` nor `<`**. The `>` exclusion is the parser body's literal
+/// terminator: [`Qwen3Coder::parse`] does `body.find('>')` to delimit the
+/// name (so any byte before `>` is part of the name); the `<` exclusion is
+/// structural because a `<` inside the name would open a sibling XML tag
+/// and break the surrounding `<function=...>...</function>` framing every
+/// downstream scanner (`<parameter=`, `</parameter>`, `</function>`,
+/// `</tool_call>`) depends on. The name therefore admits dots (`foo.bar`),
+/// spaces (`foo bar`), and other punctuation the parser body accepts —
+/// it is NOT restricted to `[A-Za-z0-9_-]+`.
+///
+/// Returns `None` otherwise. The `name_start` is the byte index of the
+/// first name byte (one past `<function=`); the `after_close_bracket` is
+/// one past the `>`. This is the EXACT recognizer used by both
+/// [`Qwen3Coder::parse`] / [`Qwen3Coder::try_parse_one_call`] (the parser
+/// body) and [`qwen_function_context_proven`] (the streaming-bound
+/// context predicate) — sharing it prevents the two from drifting (R18
+/// finding: dotted/spaced names parser-accepted but R17-predicate-rejected).
+fn qwen_function_open_at(payload: &str, at: usize) -> Option<(usize, usize)> {
+  let needle = "<function=";
+  let bytes = payload.as_bytes();
+  if at + needle.len() > bytes.len() {
+    return None;
+  }
+  if &bytes[at..at + needle.len()] != needle.as_bytes() {
+    return None;
+  }
+  let name_start = at + needle.len();
+  let mut j = name_start;
+  while j < bytes.len() && bytes[j] != b'>' && bytes[j] != b'<' {
+    j += 1;
+  }
+  if j == name_start {
+    return None;
+  }
+  if j >= bytes.len() || bytes[j] != b'>' {
+    return None;
+  }
+  Some((name_start, j + 1))
+}
+
+/// Scan `payload` for the FIRST byte position where
+/// [`qwen_function_open_at`] returns Some. Returns the
+/// `after_close_bracket` index of that first function open-tag, or `None`
+/// if no valid `<function=NAME>` open-tag appears anywhere in `payload`.
+fn find_first_qwen_function_open(payload: &str) -> Option<usize> {
+  let bytes = payload.as_bytes();
+  for i in 0..bytes.len() {
+    if let Some((_, after_close_bracket)) = qwen_function_open_at(payload, i) {
+      return Some(after_close_bracket);
+    }
+  }
+  None
 }
 
 fn convert_param_value(
@@ -7802,6 +7887,112 @@ mod tests {
     );
   }
 
+  // ===== L9 R18: qwen3_coder predicate / recognizer drift =================
+  //
+  // R17 fixed the pythonic + function_gemma drift by sharing each parser's
+  // call-start recognizer between the predicate and the parser body. R17's
+  // audit row for qwen3_coder only covered `<function=foo>` (an
+  // `[A-Za-z0-9_-]+` name) and `<function= ` (orphan), so it MISSED the
+  // dotted/spaced-name case: the parser body's `find('>')` accepts any
+  // bytes before `>` (foo.bar, foo bar, foo:1, ...), but the R17 predicate
+  // restricted NAME to `[A-Za-z0-9_-]+` — a parser-accepted body would
+  // fail the predicate, the gate would plain-close on an in-parameter
+  // `</tool_call>` literal, and the call would silently disappear.
+  //
+  // R18 structural fix: extract `qwen_function_open_at` /
+  // `find_first_qwen_function_open` as the shared recognizer used by the
+  // predicate, the parser body's gate in `try_parse_one_call`, AND
+  // `Qwen3Coder::parse`'s opener search. The recognizer accepts ANY
+  // non-empty `<function=NAME>` opener whose NAME contains neither `>`
+  // nor `<` — matching the parser body's accepted grammar exactly.
+
+  #[test]
+  fn streaming_qwen3_coder_dotted_name_with_in_parameter_end_marker_does_not_drop_call() {
+    // R18 finding, false-negative case. The body
+    // `<function=foo.bar><parameter=p>v</parameter></function>` is a
+    // legitimate qwen3_coder call: `Qwen3Coder::parse` finds the first
+    // `>` to terminate the name (`foo.bar` is accepted because the dot is
+    // neither `>` nor `<`), and the parameter value is opaque text.
+    //
+    // R17's pre-fix `qwen_function_context_proven` restricted NAME to
+    // `[A-Za-z0-9_-]+` — so the dot REJECTED the open-tag. With the
+    // predicate false the gate returned the plain end_tag position → in
+    // this baseline shape the FIRST `</tool_call>` is the real wrapper
+    // close → call extracts. So a bare dotted-name body wouldn't have
+    // failed visibly. But add a `</tool_call>` literal INSIDE the
+    // parameter value (parameter values can carry the wrapper end-tag
+    // verbatim — L9 R10/R13), and the plain-end gate locks onto THAT
+    // in-parameter end-tag literal → bounded body is truncated to the
+    // bytes before `</tool_call>` → `</function>` close is no longer in
+    // the bounded prefix → empty calls → the rest of the body PLUS the
+    // real wrapper close PLUS the suffix all reach display verbatim,
+    // silently dropping the call.
+    //
+    // R18 shares `qwen_function_open_at` between predicate and parser
+    // body: both accept `<function=foo.bar>`. Predicate true → parameter-
+    // value-aware end-tag scan SKIPS the `<parameter=p>...</parameter>`
+    // region whole → end_pos lands at the FIRST `</tool_call>` OUTSIDE
+    // every parameter region (the real wrapper close) → call extracted
+    // with `p` containing `</tool_call>` intact, suffix ` tail` reaches
+    // display.
+    let (display, calls) = run_with_parser(
+      Box::new(Qwen3Coder),
+      &[
+        "<tool_call><function=foo.bar><parameter=p>contains </tool_call> bytes</parameter></function></tool_call> tail",
+      ],
+    );
+    assert_eq!(
+      calls.len(),
+      1,
+      "dotted-name qwen3_coder body MUST be accepted by the shared recognizer (R18 finding)",
+    );
+    assert_eq!(calls[0].name, "foo.bar");
+    assert_eq!(
+      calls[0].arguments,
+      serde_json::json!({ "p": "contains </tool_call> bytes" }),
+      "in-parameter `</tool_call>` literal MUST survive the parameter-value-aware scan when the recognizer accepts the dotted name",
+    );
+    assert_eq!(
+      display, " tail",
+      "FULL suffix (just the ` tail` past the REAL wrapper end-tag) reaches display — the in-parameter end-marker MUST NOT be treated as the wrapper close",
+    );
+  }
+
+  #[test]
+  fn streaming_qwen3_coder_spaced_name_with_in_parameter_end_marker_does_not_drop_call() {
+    // R18 finding, false-negative case with whitespace in name. The body
+    // `<function=foo bar><parameter=p>v</parameter></function>` is also a
+    // legitimate qwen3_coder call per Codex's audit — the parser body's
+    // `body.find('>')` accepts ANY bytes before `>`, so a space-in-name
+    // (`foo bar`) is parser-accepted. R17's `[A-Za-z0-9_-]+` predicate
+    // rejected the space → same false-negative as the dotted case when
+    // paired with an in-parameter end-marker.
+    //
+    // R18 shares the recognizer: `qwen_function_open_at` accepts spaces
+    // (and anything else that's neither `>` nor `<`).
+    let (display, calls) = run_with_parser(
+      Box::new(Qwen3Coder),
+      &[
+        "<tool_call><function=foo bar><parameter=p>has </tool_call> in value</parameter></function></tool_call> tail",
+      ],
+    );
+    assert_eq!(
+      calls.len(),
+      1,
+      "space-bearing qwen3_coder name MUST be accepted by the shared recognizer (R18 finding)",
+    );
+    assert_eq!(calls[0].name, "foo bar");
+    assert_eq!(
+      calls[0].arguments,
+      serde_json::json!({ "p": "has </tool_call> in value" }),
+      "in-parameter `</tool_call>` literal MUST survive the parameter-value-aware scan when the recognizer accepts the spaced name",
+    );
+    assert_eq!(
+      display, " tail",
+      "FULL suffix bytes reach display — the in-parameter end-marker MUST NOT be treated as the wrapper close when the recognizer accepts the spaced name",
+    );
+  }
+
   /// L9 R17 audit-locking test: for each parser whose `bound_section`
   /// uses a STRUCTURAL context predicate (not just the dispatcher's
   /// own leading-byte classifier), the predicate's acceptance grammar
@@ -7946,11 +8137,58 @@ mod tests {
         buffer: "<tool_call><function=foo></function></tool_call>",
         should_extract: true,
       },
+      // R18 accept: dotted name `<function=foo.bar>` — parser body's
+      // `body.find('>')` accepts ANY bytes before `>`, so a dot is fine.
+      // The R17 `[A-Za-z0-9_-]+` predicate REJECTED dots; the R18 shared
+      // recognizer accepts.
+      Row {
+        label: "qwen3_coder accept (R18): dotted name `<function=foo.bar></function>`",
+        parser: Box::new(Qwen3Coder),
+        buffer: "<tool_call><function=foo.bar></function></tool_call>",
+        should_extract: true,
+      },
+      // R18 accept: spaced name `<function=foo bar>` — same logic; the
+      // parser body accepts whitespace inside the name. R17 predicate
+      // rejected; R18 shared recognizer accepts.
+      Row {
+        label: "qwen3_coder accept (R18): spaced name `<function=foo bar></function>`",
+        parser: Box::new(Qwen3Coder),
+        buffer: "<tool_call><function=foo bar></function></tool_call>",
+        should_extract: true,
+      },
+      // R18 accept: special-char name `<function=ns:method/v2>` — colons,
+      // slashes, digits are all parser-accepted (none of them is `>` or
+      // `<`). R17 predicate rejected; R18 shared recognizer accepts.
+      Row {
+        label: "qwen3_coder accept (R18): special-char name `<function=ns:method/v2></function>`",
+        parser: Box::new(Qwen3Coder),
+        buffer: "<tool_call><function=ns:method/v2></function></tool_call>",
+        should_extract: true,
+      },
       // Reject: `<function=` without name+`>` close.
       Row {
         label: "qwen3_coder reject: `<function=` without `NAME>` close",
         parser: Box::new(Qwen3Coder),
         buffer: "<tool_call>bad<function= </tool_call>",
+        should_extract: false,
+      },
+      // R18 reject: empty name `<function=>` — the shared recognizer
+      // requires a non-empty name run. Matches the parser body's tightened
+      // recognizer-based opener search (which also rejects the empty
+      // name).
+      Row {
+        label: "qwen3_coder reject (R18): empty name `<function=></function>`",
+        parser: Box::new(Qwen3Coder),
+        buffer: "<tool_call><function=></function></tool_call>",
+        should_extract: false,
+      },
+      // R18 reject: name contains `<` — would break the surrounding XML
+      // framing because `<` opens a new tag. Recognizer requires NAME to
+      // contain neither `>` nor `<`.
+      Row {
+        label: "qwen3_coder reject (R18): name with `<` `<function=a<b></function>`",
+        parser: Box::new(Qwen3Coder),
+        buffer: "<tool_call><function=a<b></function></tool_call>",
         should_extract: false,
       },
       // --- function_gemma R16 baseline regressions ---------------------
