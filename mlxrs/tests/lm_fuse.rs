@@ -29,6 +29,14 @@
 //!   (asymmetric upper-triangular); a silent transpose would produce a
 //!   different matrix, so this catches the corruption a square-base
 //!   numerical check would miss.
+//! - `fuse_output_is_loadable_through_default_lm_loader` — fuse output dir
+//!   loads end-to-end through `lm::load::load` (which constructs the
+//!   tokenizer from the same dir); a fused dir that shipped weights +
+//!   config only would silently fail to load.
+//! - `fuse_copies_all_tokenizer_extras_present_in_source` — every
+//!   `tokenizer.json` / `tokenizer_config.json` / `chat_template.jinja` /
+//!   `generation_config.json` present at `model_path` lands at `save_path`
+//!   with byte-identical content (the verbatim-copy contract).
 //!
 //! No `peak_memory()` magnitude asserts (per project memory).
 #![cfg(feature = "lm")]
@@ -750,6 +758,132 @@ fn fuse_preserves_fan_in_fan_out_layout_for_square_target() {
        (full: {vals:?} vs {expected_persisted:?}); a silent transpose \
        would produce the canonical layout `[[1,0,0],[0,1,0],[2,2,3]]` \
        which differs at multiple cells"
+    );
+  }
+}
+
+// ─────────────────────── tokenizer + extras copy ───────────────────────
+
+/// A minimal valid `tokenizer.json` for the rust-tokenizers parser — a
+/// WordLevel model with three tokens. Small (sub-KB) so the helper
+/// stays self-contained and the parse cost stays negligible.
+fn minimal_tokenizer_json() -> &'static str {
+  r#"{
+    "version": "1.0",
+    "truncation": null,
+    "padding": null,
+    "added_tokens": [],
+    "normalizer": null,
+    "pre_tokenizer": null,
+    "post_processor": null,
+    "decoder": null,
+    "model": {
+      "type": "WordLevel",
+      "vocab": { "<pad>": 0, "hello": 1, "world": 2 },
+      "unk_token": "<pad>"
+    }
+  }"#
+}
+
+/// Write a model dir that ALSO carries the union of tokenizer extras the
+/// loader / `copy_tokenizer_and_extras` cover — used by the loadable-output
+/// and extras-copied tests. Returns the dir + a map of `basename → bytes`
+/// so the caller can assert byte-identical content on the destination.
+fn write_base_dir_with_tokenizer_extras(
+  name: &str,
+  weights: &HashMap<String, Array>,
+  config_json: &str,
+  extras: &[(&str, &[u8])],
+) -> (PathBuf, HashMap<String, Vec<u8>>) {
+  let dir = write_base_dir(name, weights, config_json);
+  let mut written: HashMap<String, Vec<u8>> = HashMap::new();
+  for (basename, bytes) in extras {
+    let path = dir.join(basename);
+    fs::write(&path, bytes).unwrap();
+    written.insert((*basename).to_string(), bytes.to_vec());
+  }
+  (dir, written)
+}
+
+#[test]
+fn fuse_output_is_loadable_through_default_lm_loader() {
+  // `lm::load::load(dir)` constructs the tokenizer from the same dir
+  // immediately after the weights / config (`load.rs:683-685`). A fused
+  // dir that shipped weights + config only would silently fail this load
+  // with a tokenizer-not-found error — the F2 fix is to copy tokenizer
+  // files from the original model dir to the destination so the dir loads
+  // end-to-end.
+  let weights = toy_base_weights(2);
+  let extras: &[(&str, &[u8])] = &[
+    ("tokenizer.json", minimal_tokenizer_json().as_bytes()),
+    (
+      "tokenizer_config.json",
+      br#"{"model_max_length": 32, "padding_side": "right"}"#,
+    ),
+  ];
+  let (model_dir, _written) =
+    write_base_dir_with_tokenizer_extras("loadable_model", &weights, &plain_config_json(2), extras);
+  let adapter_dir = write_mlxlm_adapter("loadable_adapter", &[0, 1], 2.0);
+  let save_dir = temp_dir("loadable_save");
+  fs::remove_dir_all(&save_dir).unwrap();
+
+  fuse::fuse(&model_dir, &adapter_dir, &save_dir, false).unwrap();
+
+  // The default LM loader: config + weights + tokenizer.
+  let (_cfg, _w, tokenizer) =
+    load::load(&save_dir).expect("fused dir loads end-to-end through the default LM loader");
+
+  // The tokenizer was loaded from the COPIED file — same vocab as source.
+  // Re-load directly from source to compare vocab-as-token-encoding.
+  let (_src_cfg, _src_w, src_tokenizer) =
+    load::load(&model_dir).expect("source dir loads (sanity)");
+  let probe = "hello world";
+  let dst_ids = tokenizer.encode(probe, true).expect("dst encode");
+  let src_ids = src_tokenizer.encode(probe, true).expect("src encode");
+  assert_eq!(
+    dst_ids, src_ids,
+    "copied tokenizer encodes {probe:?} the same way as the source"
+  );
+}
+
+#[test]
+fn fuse_copies_all_tokenizer_extras_present_in_source() {
+  // All 4 extras-family files at `model_path` must land at `save_path`
+  // with byte-identical content. We supply distinct, fingerprint-able
+  // bytes per file so a mistakenly mixed-up copy (or a missed file) is
+  // caught by the per-file content comparison.
+  let weights = toy_base_weights(1);
+  let chat_template_bytes = br#"{%- for m in messages %}{{ m.content }}{% endfor %}"#;
+  let extras: &[(&str, &[u8])] = &[
+    ("tokenizer.json", minimal_tokenizer_json().as_bytes()),
+    (
+      "tokenizer_config.json",
+      br#"{"model_max_length": 64, "padding_side": "left"}"#,
+    ),
+    ("chat_template.jinja", chat_template_bytes),
+    (
+      "generation_config.json",
+      br#"{"max_new_tokens": 256, "temperature": 0.7}"#,
+    ),
+  ];
+  let (model_dir, written) =
+    write_base_dir_with_tokenizer_extras("extras_model", &weights, &plain_config_json(1), extras);
+  let adapter_dir = write_mlxlm_adapter("extras_adapter", &[0], 2.0);
+  let save_dir = temp_dir("extras_save");
+  fs::remove_dir_all(&save_dir).unwrap();
+
+  fuse::fuse(&model_dir, &adapter_dir, &save_dir, false).unwrap();
+
+  for (basename, expected_bytes) in &written {
+    let dst_path = save_dir.join(basename);
+    assert!(
+      dst_path.is_file(),
+      "{basename}: present at destination after fuse"
+    );
+    let got_bytes = fs::read(&dst_path).unwrap();
+    assert_eq!(
+      &got_bytes, expected_bytes,
+      "{basename}: byte-identical copy from source"
     );
   }
 }

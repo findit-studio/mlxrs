@@ -47,6 +47,9 @@
 //!   save(save_path, &weights, &config_json, &per_layer)   (fuse.py:83-91 → save(...))
 //!      │
 //!      ▼
+//!   copy_tokenizer_and_extras(model_path, save_path)      (fuse.py:88 → save(..., tokenizer, ...))
+//!      │
+//!      ▼
 //!   Ok(())
 //! ```
 //!
@@ -65,18 +68,22 @@
 //!   future task; out of scope here. Callers wanting GGUF run the dedicated
 //!   GGUF-export driver against the fused model directory after this call
 //!   returns.
-//! - **Tokenizer load/save** (`fuse.py:64` reads the tokenizer; `fuse.py:88`
-//!   passes it to `save`) — mlxrs's tokenizer surface is load-only and the
-//!   tokenizer files on disk are NOT modified by the fuse operation, so the
-//!   `save_path` carries weights + the cleaned `config.json` only. Callers
-//!   wanting the full HF-style directory copy the source tokenizer files
-//!   (`tokenizer.json` / `tokenizer_config.json` / etc.) alongside, the
-//!   same convention [`crate::lm::convert::copy_tokenizer_and_extras`]
-//!   handles for [`crate::lm::convert::convert`]. (We deliberately do NOT
-//!   invoke that helper here: `fuse.py` does not copy tokenizer extras
-//!   either — its `save(..., tokenizer, ...)` call only writes the
-//!   in-memory tokenizer's own `save_pretrained` output, which mlxrs's
-//!   load-only tokenizer has no analogue for.)
+//!
+//! ## Tokenizer + extras: copied from the source model directory
+//!
+//! `fuse.py:64,88` reads the tokenizer with the base model and hands it to
+//! `save(..., tokenizer, ...)` so the saved directory is a self-contained,
+//! loadable HF-style model dir. mlxrs's tokenizer surface is load-only, so
+//! the on-disk tokenizer / extras files are copied verbatim from
+//! `model_path` via [`crate::lm::convert::copy_tokenizer_and_extras`] —
+//! the same union [`crate::lm::convert::convert`] writes
+//! (`tokenizer.json` / `tokenizer_config.json` / `special_tokens_map.json` /
+//! `added_tokens.json` / `spiece.model` / `tokenizer.model` / `vocab.json` /
+//! `merges.txt` / `chat_template.jinja` / `generation_config.json` / `*.py`).
+//! The output dir therefore loads end-to-end through
+//! [`crate::lm::load::load`] (which immediately constructs the tokenizer
+//! after the weights / config — `load.rs:683-685`); a fused directory that
+//! shipped weights + config only would silently fail to load.
 //!
 //! ## API style
 //!
@@ -92,6 +99,7 @@ use std::path::Path;
 use crate::{
   error::{Error, Result},
   lm::{
+    convert::{self, CopyDurabilityWarnings, CopyOutcome},
     load::{self, Weights},
     lora::{self, BaseEmbedding, BaseLinear, LoraLayer},
     quant::{self, PerLayerQuantization},
@@ -121,10 +129,12 @@ use crate::{
 ///   `adapters.safetensors` (mlx-lm-native) or `adapter_model.safetensors`
 ///   (HuggingFace PEFT). Same hub-URL rejection.
 /// - `save_path` — destination directory for the fused model. Created if
-///   absent. The fused output carries the rewritten weights + a cleaned
-///   `config.json` (with `quantization` / `quantization_config` stripped
-///   iff `dequantize`); tokenizer files are NOT copied — see the
-///   [module-level scope decisions](self#scope-decisions-deliberately-not-ported).
+///   absent. The fused output is a self-contained, loadable HF-style model
+///   dir: the rewritten weights + a cleaned `config.json` (with
+///   `quantization` / `quantization_config` stripped iff `dequantize`) +
+///   the tokenizer / `*.py` / `generation_config.json` extras copied
+///   verbatim from `model_path` (see [the module-level tokenizer + extras
+///   note](self#tokenizer--extras-copied-from-the-source-model-directory)).
 /// - `dequantize` — if `true`, additionally produce a fully dense model:
 ///   strip `quantization` + `quantization_config` from the saved config,
 ///   and dequantize any remaining quantized triples in the weight map
@@ -150,6 +160,17 @@ use crate::{
 ///   [`crate::Error::DurabilityWarning`] with `committed: true` (the
 ///   on-disk model is loadable, only directory metadata durability is
 ///   uncertain).
+/// - Tokenizer-extras copy from `model_path` → `save_path` failure
+///   (post-save, after weights+config commit): a hard
+///   [`std::fs::copy`] error surfaces as
+///   [`crate::Error::ConvertPostSavePartial`] with `committed: true` (the
+///   weights + config landed but at least one tokenizer file did NOT —
+///   the destination is structurally incomplete and a
+///   [`load::load`] would fail or load against the wrong tokenizer); a
+///   post-copy `fsync` warning surfaces as [`crate::Error::DurabilityWarning`]
+///   (single) or [`crate::Error::ConvertDurabilityWarnings`] (multi) —
+///   same "data on disk, durability uncertain" contract
+///   [`crate::lm::convert::convert`] uses.
 ///
 /// # Example
 ///
@@ -268,7 +289,90 @@ pub fn fuse(
   // `fsync_dir` warning surfaces as `Error::DurabilityWarning {
   // committed: true, .. }` so the caller can distinguish "saved but
   // durability uncertain" from a hard pre-commit failure.
-  load::save(save_path, &out_weights, &out_config_json, &save_quant)
+  //
+  // The save side returns one of three shapes:
+  //   - `Ok(())` — fully durable (every fsync passed).
+  //   - `Err(DurabilityWarning { committed: true, .. })` — weights + config
+  //      ARE on disk; only a parent-dir fsync warned. We REMEMBER this
+  //      warning and proceed to the tokenizer-extras copy (skipping the
+  //      copy on a durability-only warning would leave the destination
+  //      structurally incomplete — same routing `convert::convert` uses).
+  //   - any other `Err` — pre-commit failure; propagate immediately
+  //      (weights / config not durably on disk; copying tokenizer extras
+  //      now would only mask the real cause).
+  let save_warning: Option<std::io::Error> =
+    match load::save(save_path, &out_weights, &out_config_json, &save_quant) {
+      Ok(()) => None,
+      Err(Error::DurabilityWarning { committed, source }) if committed => Some(source),
+      Err(e) => return Err(e),
+    };
+
+  // (9) Copy tokenizer + extras from the ORIGINAL `model_path` to
+  // `save_path` so the fused directory is a self-contained, loadable
+  // HF-style model dir (`fuse.py:88` — `save(..., tokenizer, ...)`).
+  // The helper covers the same `tokenizer.json` / `tokenizer_config.json`
+  // / `special_tokens_map.json` / SentencePiece-family / BPE-family /
+  // `chat_template.jinja` / `generation_config.json` / `*.py` set
+  // `convert::convert` writes (see the source-side `TOKENIZER_EXTRA_FILES`
+  // constant + the `*.py` glob).
+  //
+  // We mirror `convert::convert`'s shape: route a hard copy failure to
+  // `ConvertPostSavePartial` (the destination is structurally incomplete)
+  // and route per-boundary fsync warnings to the typed `DurabilityWarning`
+  // (single) / `ConvertDurabilityWarnings` (multi) aggregate. This keeps
+  // the public error shape uniform across `convert::convert` and
+  // `fuse::fuse` — both produce HF-style dirs from a base model dir; both
+  // share the same post-save extras-copy contract.
+  match convert::copy_tokenizer_and_extras(model_path, save_path) {
+    Ok(copy_outcome) => {
+      let copy_warnings = match copy_outcome {
+        CopyOutcome::Committed => CopyDurabilityWarnings::default(),
+        CopyOutcome::CommittedWithDurabilityWarning(w) => w,
+      };
+      let aggregate = crate::error::ConvertDurabilityWarnings {
+        committed: true,
+        save: save_warning,
+        post_copy_file: copy_warnings.post_copy_file,
+        post_copy_dir: copy_warnings.post_copy_dir,
+      };
+      match aggregate.count() {
+        // 0 — fully durable end-to-end.
+        0 => Ok(()),
+        // 1 — surface via the existing single-warning shape
+        // (`DurabilityWarning`) so the one-source contract is unchanged.
+        1 => {
+          let crate::error::ConvertDurabilityWarnings {
+            committed: _,
+            save,
+            post_copy_file,
+            post_copy_dir,
+          } = aggregate;
+          let source = save
+            .or(post_copy_file)
+            .or(post_copy_dir)
+            .expect("count() == 1 guarantees exactly one Some field");
+          Err(Error::DurabilityWarning {
+            committed: true,
+            source,
+          })
+        }
+        // 2+ — typed multi-warning aggregate so each warning is reachable
+        // via direct destructuring (no string fold).
+        _ => Err(Error::ConvertDurabilityWarnings(aggregate)),
+      }
+    }
+    // A hard copy failure: at least one extras file did NOT reach disk —
+    // the destination dir is structurally incomplete. The save side IS
+    // committed (weights + config landed before we reached the copy
+    // step), so route through `ConvertPostSavePartial` with
+    // `committed: true` + the save-side fsync warning (if any) carried in
+    // `save_warning` and the underlying copy failure in `copy_error`.
+    Err(copy_err) => Err(Error::ConvertPostSavePartial {
+      committed: true,
+      save_warning,
+      copy_error: std::io::Error::other(copy_err.to_string()),
+    }),
+  }
 }
 
 /// Replace the `<path>.weight` / `.scales` / `.biases` / `.bias` entries in
