@@ -131,6 +131,205 @@ pub enum Error {
     #[source]
     source: std::io::Error,
   },
+
+  /// [`crate::lm::convert::convert`] reached the post-save extras-copy step
+  /// AFTER the index rename succeeded (so the weights + shard index +
+  /// config ARE visible on disk and a follow-up
+  /// [`crate::lm::load::load_weights`] / [`crate::lm::load::load_config`]
+  /// would observe the committed checkpoint) but
+  /// [`crate::lm::convert::copy_tokenizer_and_extras`] partially failed —
+  /// at least one tokenizer / `*.py` / `generation_config.json` file
+  /// did NOT make it to the destination directory.
+  ///
+  /// **Semantically distinct from [`Error::DurabilityWarning`]**: a
+  /// `DurabilityWarning` with `committed: true` means the on-disk
+  /// checkpoint is **logically complete** (weights + index + config + the
+  /// tokenizer-extras copy all landed; only the parent-directory `fsync`
+  /// returned an error and so a power loss before the FS internally drains
+  /// MAY revert the rename). A `ConvertPostSavePartial`, by contrast,
+  /// means the on-disk destination directory is **structurally
+  /// incomplete** — tokenizer files are missing — and a downstream
+  /// [`crate::lm::load::load`] would either fail (missing tokenizer.json)
+  /// or silently produce a checkpoint with the wrong tokenizer. Callers
+  /// MUST decide whether to retry the copy, copy the missing files by
+  /// hand, or treat the whole convert as failed and delete the
+  /// destination.
+  ///
+  /// This variant is constructed only when the `lm` feature is enabled.
+  /// It is machine-detectable via destructuring: the `save_warning` field
+  /// disambiguates the save side (a durability fsync warning vs a clean
+  /// save) and `copy_error` carries the original tokenizer-copy failure
+  /// (the new R3 information that the R2 fix's free-form
+  /// [`std::io::Error::other`] message hid from typed accessors).
+  #[cfg(feature = "lm")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "lm")))]
+  #[error(
+    "convert: save committed but post-save extras copy partially failed (committed={committed}); \
+     destination directory may be incomplete (missing tokenizer/extras files)"
+  )]
+  ConvertPostSavePartial {
+    /// Always `true` — this variant is reachable only AFTER the
+    /// observable commit point (the index rename + the config rename)
+    /// has succeeded. Kept in the public shape so a future caller can
+    /// branch on it without an API break.
+    committed: bool,
+    /// The durability-fsync warning from the save phase if the save
+    /// returned [`Error::DurabilityWarning`]; `None` if the save
+    /// returned plain `Ok(())` but the post-save extras copy still
+    /// failed. Either way the save side is committed; the field shape
+    /// keeps both cases machine-detectable without a string parse.
+    ///
+    /// Not annotated with `#[source]` because `thiserror`'s `#[source]`
+    /// requires a non-`Option` field (the trait method returns
+    /// `Option<&(dyn Error + 'static)>` already). The chain points at
+    /// `copy_error` (the actually-actionable failure the caller needs to
+    /// retry or recover from); `save_warning` is exposed via direct
+    /// field access.
+    save_warning: Option<std::io::Error>,
+    /// The tokenizer-extras copy failure (the new R3 information that
+    /// the R2 fix folded into a free-form [`std::io::Error::other`]
+    /// message). This is what the caller needs to retry or recover
+    /// from: which file failed and why. Carried as a typed
+    /// [`std::io::Error`] (its kind / message are machine-readable).
+    #[source]
+    copy_error: std::io::Error,
+  },
+
+  /// [`crate::lm::convert::convert`] observed durability-fsync warnings
+  /// at **two or more** fsync boundaries (the save-side parent-directory
+  /// fsync, the post-copy per-file fsync, and/or the post-copy
+  /// destination-directory fsync). Same "logically committed, durability
+  /// uncertain" contract as [`Error::DurabilityWarning`], but the
+  /// MULTI-warning shape carries each underlying [`std::io::Error`] in a
+  /// separate `Option` field so the caller can machine-detect WHICH
+  /// boundaries warned without a string parse.
+  ///
+  /// **Distinct from [`Error::DurabilityWarning`]** which carries
+  /// EXACTLY ONE underlying [`std::io::Error`]; this variant is reserved
+  /// for the strict-aggregate case (>= 2 boundaries warned in the same
+  /// convert). The single-warning case continues to use
+  /// [`Error::DurabilityWarning`] so existing callers' "exactly one
+  /// fsync warning" recovery path is unchanged.
+  ///
+  /// **Distinct from [`Error::ConvertPostSavePartial`]** which carries a
+  /// **hard copy failure** ([`std::fs::copy`] itself returned `Err` — the
+  /// file did NOT reach disk). A `ConvertDurabilityWarnings` means EVERY
+  /// file reached disk (every [`std::fs::copy`] returned `Ok`); only the
+  /// fsync boundaries warned, and the destination is logically complete
+  /// (a subsequent [`crate::lm::load::load`] would observe it on a running
+  /// kernel — only a power loss before the FS internally drains could
+  /// revert).
+  ///
+  /// The F7 R4 fix had folded multi-warning sources into a single
+  /// free-form `std::io::Error::other(format!(...))` message inside
+  /// the [`Error::DurabilityWarning`] `source` field, losing typed
+  /// access to the individual [`std::io::Error`]s. This R5 fix routes
+  /// the multi-warning
+  /// case to this new variant so each warning is reachable via direct
+  /// destructuring (and the first non-None warning is reachable via
+  /// [`std::error::Error::source`] for chain walkers — see
+  /// [`ConvertDurabilityWarnings`]).
+  ///
+  /// Constructed only when the `lm` feature is enabled.
+  #[cfg(feature = "lm")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "lm")))]
+  #[error(transparent)]
+  ConvertDurabilityWarnings(#[from] ConvertDurabilityWarnings),
+}
+
+/// Structured aggregate of `convert()`-time durability warnings —
+/// the inner shape carried by [`Error::ConvertDurabilityWarnings`].
+///
+/// Each field is `Some(_)` iff the corresponding fsync boundary returned
+/// `Err` AFTER its underlying write/copy succeeded; the data is on disk
+/// either way, only durability across a power loss is uncertain.
+///
+/// **Machine-detectable**: callers destructure to learn WHICH boundaries
+/// warned (no string parse). The
+/// [`std::error::Error::source`] impl returns the first non-`None`
+/// warning in deterministic `save -> post_copy_file -> post_copy_dir`
+/// priority order so the chain walk reaches the most-actionable warning.
+#[cfg(feature = "lm")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lm")))]
+#[derive(Debug)]
+pub struct ConvertDurabilityWarnings {
+  /// Always `true` — this aggregate is reachable only after the
+  /// observable commit point (the index rename) has succeeded. Kept
+  /// in the public shape so a future caller can branch on it without
+  /// an API break.
+  pub committed: bool,
+  /// Durability warning from the save phase. `Some(_)` iff
+  /// [`crate::lm::load::save_model`] returned
+  /// [`Error::DurabilityWarning`] (the save-side parent-directory
+  /// fsync warned); `None` if the save returned plain `Ok(())`.
+  pub save: Option<std::io::Error>,
+  /// Durability warning from the post-copy per-file fsync. `Some(_)`
+  /// iff at least one copied file's `fsync_path` returned `Err`
+  /// AFTER its [`std::fs::copy`] succeeded (data IS on disk, only
+  /// durability uncertain); `None` if every per-file fsync passed.
+  pub post_copy_file: Option<std::io::Error>,
+  /// Durability warning from the post-copy destination-directory
+  /// fsync. `Some(_)` iff `fsync_dir(dst)` returned `Err` AFTER every
+  /// [`std::fs::copy`] succeeded (data IS on disk, only the directory
+  /// inode metadata's durability uncertain); `None` if the dir fsync
+  /// passed.
+  pub post_copy_dir: Option<std::io::Error>,
+}
+
+#[cfg(feature = "lm")]
+impl std::fmt::Display for ConvertDurabilityWarnings {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "convert: save committed but post-save durability warnings (committed={}); \
+       destination is on-disk and load-correct, but one or more fsync boundaries returned a warning",
+      self.committed
+    )
+  }
+}
+
+#[cfg(feature = "lm")]
+impl std::error::Error for ConvertDurabilityWarnings {
+  /// Returns the FIRST non-`None` underlying [`std::io::Error`] in
+  /// deterministic `save -> post_copy_file -> post_copy_dir` priority
+  /// order — the most-actionable warning for a chain walker. Returns
+  /// `None` only if every field is `None` (which the convert()
+  /// call-site never constructs — the aggregate is reserved for the
+  /// 2+-non-None-fields case — but is well-defined here so a caller
+  /// constructing it directly observes a consistent contract).
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    self
+      .first_warning()
+      .map(|e| e as &(dyn std::error::Error + 'static))
+  }
+}
+
+#[cfg(feature = "lm")]
+impl ConvertDurabilityWarnings {
+  /// Return the first non-`None` underlying [`std::io::Error`] in
+  /// deterministic `save -> post_copy_file -> post_copy_dir` priority
+  /// order. Used by the [`std::error::Error::source`] impl; exposed
+  /// publicly so callers that prefer the inherent accessor over a
+  /// `dyn Error` chain walk get the same most-actionable warning
+  /// without re-implementing the priority.
+  pub fn first_warning(&self) -> Option<&std::io::Error> {
+    self
+      .save
+      .as_ref()
+      .or(self.post_copy_file.as_ref())
+      .or(self.post_copy_dir.as_ref())
+  }
+
+  /// Count the number of non-`None` warning fields. The convert()
+  /// call-site uses this to decide between `Ok(())` (0), the existing
+  /// [`Error::DurabilityWarning`] (1), and [`Error::ConvertDurabilityWarnings`]
+  /// (>= 2) so the multi-warning case is the only one routed through
+  /// this aggregate.
+  pub fn count(&self) -> usize {
+    usize::from(self.save.is_some())
+      + usize::from(self.post_copy_file.is_some())
+      + usize::from(self.post_copy_dir.is_some())
+  }
 }
 
 #[cfg(feature = "tokenizer")]
