@@ -49,6 +49,22 @@ pub trait Model {
       message: "this model does not implement `forward_embeddings` (VLM seam, M4)".into(),
     })
   }
+
+  /// Whether this model accepts pre-computed input embeddings — the
+  /// Rust-trait analogue of mlx-lm's
+  /// `does_model_support_input_embeddings` (`mlx_lm/utils.py:979-991`),
+  /// which inspects `model.__call__` for an `input_embeddings` parameter.
+  ///
+  /// mlxrs has no runtime call-signature introspection, so a model that
+  /// implements [`forward_embeddings`](Self::forward_embeddings) declares
+  /// the capability by also overriding this to `true`. Text-only models
+  /// inherit the `false` default (and the erroring `forward_embeddings`);
+  /// VLMs (M4) override both. The free function
+  /// [`crate::lm::load::does_model_support_input_embeddings`] is the
+  /// public entry point that mirrors the reference helper's name.
+  fn supports_input_embeddings(&self) -> bool {
+    false
+  }
 }
 
 /// A deterministic, dependency-free [`Model`] used across the `lm` test suite

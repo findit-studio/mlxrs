@@ -252,9 +252,19 @@ fn drain_string_map(map: mlxrs_sys::mlx_map_string_to_string) -> HashMap<String,
   out
 }
 
-/// Build a temporary `mlx_map_string_to_array` from a Rust map. Caller wraps
-/// the returned handle in an [`ArrayMapGuard`].
-fn build_array_map(arrays: &HashMap<String, Array>) -> Result<mlxrs_sys::mlx_map_string_to_array> {
+/// Build a temporary `mlx_map_string_to_array` from any iterator of borrowed
+/// `(name, array)` pairs. Caller wraps the returned handle in an
+/// [`ArrayMapGuard`].
+///
+/// Generic over the entry iterator so both an owned `&HashMap<String, Array>`
+/// (via `HashMap`'s `(&String, &Array)` iterator) and a borrowed shard view
+/// (`&HashMap<&str, &Array>`) feed the same map-builder without cloning any
+/// `Array` — the shard-save path ([`save_safetensors_view`]) needs the
+/// no-clone form.
+fn build_array_map<'a, I>(arrays: I) -> Result<mlxrs_sys::mlx_map_string_to_array>
+where
+  I: IntoIterator<Item = (&'a str, &'a Array)>,
+{
   // SAFETY: `mlx_map_string_to_array_new()` returns a fresh empty map handle
   // (NULL ctx on allocation failure, a defined-safe input to `_free`),
   // wrapped in an `ArrayMapGuard` IMMEDIATELY so any `?` below (interior-NUL
@@ -263,7 +273,7 @@ fn build_array_map(arrays: &HashMap<String, Array>) -> Result<mlxrs_sys::mlx_map
   // this guard's `Drop`); the caller re-wraps the returned raw handle.
   let guard = ArrayMapGuard(unsafe { mlxrs_sys::mlx_map_string_to_array_new() });
   for (k, v) in arrays {
-    let ck = CString::new(k.as_str()).map_err(|_| Error::Backend {
+    let ck = CString::new(k).map_err(|_| Error::Backend {
       message: format!("array key contains an interior NUL byte: {k:?}"),
     })?;
     // SAFETY: `guard.0` is the valid handle from above; `ck.as_ptr()` is a
@@ -363,6 +373,28 @@ pub fn save_safetensors_with_metadata(
   arrays: &HashMap<String, Array>,
   metadata: &HashMap<String, String>,
 ) -> Result<()> {
+  save_safetensors_view(path, arrays.iter().map(|(k, v)| (k.as_str(), v)), metadata)
+}
+
+/// Save an arbitrary borrowed `(name, array)` view plus `String -> String`
+/// metadata to a `.safetensors` file — the no-clone shard-write primitive.
+///
+/// Generalizes [`save_safetensors_with_metadata`] over the entry iterator so
+/// a sub-map of borrowed arrays (a shard, `HashMap<&str, &Array>` — see
+/// [`crate::lm::load::make_shards`]) can be written **without** refcount-
+/// cloning every `Array` into a fresh owned `HashMap<String, Array>` first.
+/// `save_safetensors_with_metadata` is the owned-map convenience wrapper over
+/// this. Behavior is otherwise identical to
+/// [`save_safetensors_with_metadata`]: the named arrays + metadata are
+/// handed to `mlx_save_safetensors` on the IO CPU stream.
+pub fn save_safetensors_view<'a, I>(
+  path: &Path,
+  arrays: I,
+  metadata: &HashMap<String, String>,
+) -> Result<()>
+where
+  I: IntoIterator<Item = (&'a str, &'a Array)>,
+{
   let cpath = path_cstring(path)?;
   let amap = build_array_map(arrays)?;
   let amap_guard = ArrayMapGuard(amap);

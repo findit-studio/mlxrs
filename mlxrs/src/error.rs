@@ -81,6 +81,56 @@ pub enum Error {
     /// Human-readable description of the tokenizer failure.
     message: String,
   },
+
+  /// Defense-in-depth shard-path collision:
+  /// [`crate::lm::load::save_model`]'s atomic no-replace
+  /// `std::fs::hard_link` of a shard tempfile onto its final shard path
+  /// failed with [`std::io::ErrorKind::AlreadyExists`], meaning a file
+  /// already occupies that final path. `link(2)` is atomic + no-replace
+  /// by spec, so this surfaces in a single syscall with no silent-
+  /// replace window (a `rename`-based publish would race a concurrent
+  /// writer here). The collision-resistant `gen_id` (timestamp µs,
+  /// PID, per-process counter) makes this statistically unreachable in
+  /// normal operation; surfacing it as a hard `Err` keeps the save
+  /// fail-closed (never silently overwrite a foreign file). Constructed
+  /// only when the `lm` feature is enabled.
+  #[cfg(feature = "lm")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "lm")))]
+  #[error("shard path collision: {path}")]
+  ShardPathCollision {
+    /// The pre-existing final shard path that the atomic no-replace
+    /// `hard_link` refused to overwrite.
+    path: std::path::PathBuf,
+  },
+
+  /// Post-commit durability warning: a checkpoint or config file was
+  /// successfully renamed into place (so the new content IS visible on
+  /// disk + would be observed by a subsequent
+  /// [`crate::lm::load::load_weights`] / [`crate::lm::load::load_config`])
+  /// but a follow-up `fsync` of the parent directory failed. The
+  /// directory-rename entry may not yet be durable on disk: a power loss
+  /// before the filesystem internally drains could leave the directory
+  /// pointing at the OLD entry. The caller knows the save is **logically
+  /// committed**.
+  ///
+  /// Returned by [`crate::lm::load::save`] when [`crate::lm::load::save_model`]
+  /// or the post-commit config rename produced a
+  /// [`crate::lm::load::CommitOutcome::CommittedWithDurabilityWarning`].
+  /// Constructed only when the `lm` feature is enabled.
+  #[cfg(feature = "lm")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "lm")))]
+  #[error("save committed but durability fsync failed (committed={committed}): {source}")]
+  DurabilityWarning {
+    /// Always `true` for now — this variant is constructed only AFTER the
+    /// observable commit point (the index rename + the config rename) has
+    /// succeeded. Kept in the public shape so a future caller can branch on
+    /// it without an API break if a `committed=false` durability story is
+    /// ever added.
+    committed: bool,
+    /// The underlying `fsync_dir` IO error.
+    #[source]
+    source: std::io::Error,
+  },
 }
 
 #[cfg(feature = "tokenizer")]

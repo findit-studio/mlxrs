@@ -136,6 +136,25 @@ fn weights_merges_shards_and_keeps_quant_triples() {
 
   io::save_safetensors(&dir.join("model-00001-of-00002.safetensors"), &s1).unwrap();
   io::save_safetensors(&dir.join("model-00002-of-00002.safetensors"), &s2).unwrap();
+  // The HF/safetensors sharded convention: an authoritative
+  // `model.safetensors.index.json` lists every key's owning shard. The
+  // index-honoring `load_weights` follows it — a shard not in the index
+  // is invisible (the structural fix that makes the `save_model`
+  // index-rename single-commit-point safe). Hand-written JSON so this
+  // integration test doesn't depend on `serde_json` being a dev-dep.
+  fs::write(
+    dir.join("model.safetensors.index.json"),
+    br#"{
+  "metadata": { "total_size": 32, "total_parameters": 8 },
+  "weight_map": {
+    "a.weight": "model-00001-of-00002.safetensors",
+    "a.scales": "model-00001-of-00002.safetensors",
+    "a.biases": "model-00001-of-00002.safetensors",
+    "b.weight": "model-00002-of-00002.safetensors"
+  }
+}"#,
+  )
+  .unwrap();
 
   let mut w = load::load_weights(&dir).unwrap();
   assert_eq!(w.len(), 4, "all four keys merged");
