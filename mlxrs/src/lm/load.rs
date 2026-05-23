@@ -1648,22 +1648,229 @@ fn open_excl_temp_shard(final_path: &Path) -> Result<PathBuf> {
 /// *here*, not after a not-yet-on-disk file has been renamed over a
 /// previously-valid checkpoint. mlx-c does not fsync; reopen the path
 /// read-only and `sync_all` it. Mirrors `cache_prompt::save_prompt_cache_atomic`.
-fn fsync_path(path: &Path) -> Result<()> {
-  let f = std::fs::File::open(path).map_err(|e| Error::Backend {
-    message: format!(
-      "save: reopen tempfile {} for fsync failed: {e}",
-      path.display()
-    ),
-  })?;
-  f.sync_all().map_err(|e| Error::Backend {
+///
+/// `pub(crate)` so sibling modules ([`crate::lm::convert`]'s post-copy
+/// durability step, F7 R4) can call the same well-tested helper rather
+/// than re-implement the open + `sync_all` boilerplate. Test-only fault
+/// injection is wired through [`arm_fsync_path_fault`].
+///
+/// Returns a crate-wide [`Error::Backend`] on IO failure. Callers that
+/// need to preserve the underlying [`std::io::ErrorKind`] (ENOSPC / EIO /
+/// PermissionDenied / ...) end-to-end through a structured aggregate
+/// should instead call [`fsync_path_io`] (the sibling `io::Result<()>`
+/// variant that does NOT collapse the kind into a string-wrapped
+/// `Error::Backend`).
+pub(crate) fn fsync_path(path: &Path) -> Result<()> {
+  // Forward to the kind-preserving inner so the production path + the
+  // (test-only) injector both produce a single canonical io::Error which
+  // we then wrap in [`Error::Backend`] (string-collapsing the kind — the
+  // historic API shape for callers that want the crate-wide Error type).
+  fsync_path_inner(path).map_err(|e| Error::Backend {
     message: format!("save: fsync tempfile {} failed: {e}", path.display()),
   })
 }
 
+/// Sibling of [`fsync_path`] that returns the raw [`std::io::Result`] so
+/// callers can preserve the underlying [`std::io::ErrorKind`]
+/// (ENOSPC / EIO / PermissionDenied / ...) instead of collapsing it into
+/// the string-wrapped [`Error::Backend`] that [`fsync_path`] returns.
+///
+/// Used by [`crate::lm::convert::copy_tokenizer_and_extras`] so its
+/// post-copy per-file fsync warnings carry a machine-readable
+/// [`std::io::ErrorKind`] through to the typed
+/// [`crate::error::ConvertDurabilityWarnings`] aggregate (without this
+/// the post_copy_file warning's kind would be uniformly
+/// [`std::io::ErrorKind::Other`] — callers couldn't distinguish a
+/// writeback-quota failure from a permission failure without parsing the
+/// message text). The save-side callers that want the crate-wide Error
+/// shape stay on the original [`fsync_path`] (the two variants share the
+/// same underlying IO + the same test-only injector — see
+/// [`fsync_path_inner`]).
+pub(crate) fn fsync_path_io(path: &Path) -> std::io::Result<()> {
+  fsync_path_inner(path)
+}
+
+/// Inner fsync helper shared by [`fsync_path`] (which wraps the io::Error
+/// in [`Error::Backend`] for the crate-wide Error type) and
+/// [`fsync_path_io`] (which returns the raw [`std::io::Result`] for
+/// callers that need to preserve [`std::io::ErrorKind`] end-to-end).
+///
+/// Routing the test-only fault injector through this single inner — not
+/// either variant's wrapper — means every caller observes the same
+/// injected failure regardless of which surface they used. The injector
+/// produces a real [`std::io::Error`] (with an injectable kind via
+/// [`arm_fsync_path_fault_with_kind`]) so the kind-preservation property
+/// the `_io` variant exposes is testable end-to-end.
+fn fsync_path_inner(path: &Path) -> std::io::Result<()> {
+  // Test-only fault-injection knob — see [`arm_fsync_path_fault`] /
+  // [`arm_fsync_path_fault_with_kind`]. Mirrors the `fsync_dir` injector
+  // shape so the F7 R4 post-copy durability tests can exercise the
+  // "file content is durable but fsync warned" branch without needing a
+  // hostile filesystem. Production code path: always `None`, falls
+  // straight through to the real fsync.
+  #[cfg(test)]
+  if let Some(remaining) = FSYNC_PATH_FAULT_SKIP_THEN_FAIL.with(|c| c.get()) {
+    if remaining == 0 {
+      let kind = FSYNC_PATH_FAULT_KIND.with(|c| c.get().unwrap_or(std::io::ErrorKind::Other));
+      FSYNC_PATH_FAULT_SKIP_THEN_FAIL.with(|c| c.set(None));
+      FSYNC_PATH_FAULT_KIND.with(|c| c.set(None));
+      return Err(std::io::Error::new(
+        kind,
+        format!("injected fsync_path failure for {}", path.display()),
+      ));
+    } else {
+      FSYNC_PATH_FAULT_SKIP_THEN_FAIL.with(|c| c.set(Some(remaining - 1)));
+    }
+  }
+
+  // F7 R7 Finding test hook — "real OS failure" injector. Unlike the
+  // pre-existing injector above (which synthesizes a formatted
+  // io::Error string that incidentally includes the path), this one
+  // removes the target file then falls through to the natural
+  // [`std::fs::File::open`] call so the test observes the AUTHENTIC
+  // [`std::io::Error`] the OS produces — a context-free OS-level
+  // message like `"No such file or directory (os error 2)"` with NO
+  // path embedded. Used by `convert.rs`'s F7 R7 "real failure" test to
+  // prove the call-site wrap in `copy_tokenizer_and_extras` adds path
+  // context INDEPENDENT of any injector-format coincidence.
+  //
+  // Production code path: always `None`, falls straight through to the
+  // real fsync (the entire `#[cfg(test)]` block is compiled out).
+  #[cfg(test)]
+  if let Some(remaining) = FSYNC_PATH_FAULT_REMOVE_THEN_FAIL.with(|c| c.get()) {
+    if remaining == 0 {
+      FSYNC_PATH_FAULT_REMOVE_THEN_FAIL.with(|c| c.set(None));
+      // Best-effort remove; if it doesn't exist we still want the
+      // natural File::open below to produce the real NotFound error.
+      let _ = std::fs::remove_file(path);
+      // Fall through to the natural code path — File::open(path) will
+      // now return `io::ErrorKind::NotFound` with the OS-level message
+      // (no path in `.to_string()`).
+    } else {
+      FSYNC_PATH_FAULT_REMOVE_THEN_FAIL.with(|c| c.set(Some(remaining - 1)));
+    }
+  }
+
+  let f = std::fs::File::open(path)?;
+  f.sync_all()
+}
+
+// Test-only fault injector for `fsync_path` / `fsync_path_io`: when set
+// on the current thread, the next `n` `fsync_path*` calls succeed
+// normally and the (n+1)-th returns
+// `std::io::Error::new(kind, "injected fsync_path ...")` (kind defaults
+// to `ErrorKind::Other`; can be overridden via
+// [`arm_fsync_path_fault_with_kind`]). Used by F7 R4's post-copy
+// durability tests to drive the
+// `CopyOutcome::CommittedWithDurabilityWarning` branch without needing a
+// hostile filesystem. Always `None` in production code (the thread-local
+// is only set inside `#[test]` fns and unset on test exit).
+#[cfg(test)]
+thread_local! {
+  static FSYNC_PATH_FAULT_SKIP_THEN_FAIL: std::cell::Cell<Option<usize>> =
+    const { std::cell::Cell::new(None) };
+  /// Optional override for the injected failure's
+  /// [`std::io::ErrorKind`]. `None` means the default
+  /// [`std::io::ErrorKind::Other`] (the historic injector shape).
+  /// Cleared in lockstep with `FSYNC_PATH_FAULT_SKIP_THEN_FAIL` when the
+  /// injector fires.
+  static FSYNC_PATH_FAULT_KIND: std::cell::Cell<Option<std::io::ErrorKind>> =
+    const { std::cell::Cell::new(None) };
+  /// F7 R7 — "real failure" injector skip counter. When `Some(n)`, the
+  /// next `n` `fsync_path_inner` calls pass and the (n+1)-th
+  /// `remove_file`s the target path then falls through to the natural
+  /// [`std::fs::File::open`] which produces a real OS-level
+  /// [`std::io::ErrorKind::NotFound`] error (no path in the message).
+  /// Used to verify the call-site wrap in
+  /// `crate::lm::convert::copy_tokenizer_and_extras` adds path context
+  /// independent of any injector-format coincidence.
+  static FSYNC_PATH_FAULT_REMOVE_THEN_FAIL: std::cell::Cell<Option<usize>> =
+    const { std::cell::Cell::new(None) };
+}
+
+/// Arm the [`fsync_path`] / [`fsync_path_io`] fault injector to skip
+/// `skip` successful calls then make the next call fail with
+/// [`std::io::ErrorKind::Other`]. Returns a [`Drop`] guard that disarms
+/// the injector when it goes out of scope (so a test panic still leaves
+/// the thread in a clean state for the next test).
+///
+/// `pub(crate)` (test-only) so sibling modules' tests (e.g.
+/// [`crate::lm::convert`]'s F7 R4 post-copy durability closure) can
+/// drive the [`CopyOutcome::CommittedWithDurabilityWarning`] branch
+/// through the public [`crate::lm::convert::convert`] entrypoint.
+#[cfg(test)]
+pub(crate) fn arm_fsync_path_fault(skip: usize) -> FsyncPathFaultGuard {
+  arm_fsync_path_fault_with_kind(skip, std::io::ErrorKind::Other)
+}
+
+/// Variant of [`arm_fsync_path_fault`] that lets the caller pick the
+/// injected [`std::io::ErrorKind`] (e.g.
+/// [`std::io::ErrorKind::PermissionDenied`] /
+/// [`std::io::ErrorKind::StorageFull`]). Used by F7 R6's
+/// kind-preservation tests so the post-copy file fsync warning's
+/// `.kind()` can be asserted against a SPECIFIC non-`Other` kind —
+/// proving the convert()-side aggregate preserves the kind end-to-end
+/// (the F7 R6 finding was that the R5 fix's `fsync_copied` closure
+/// re-wrapped the injected io::Error via `io::Error::other(message)`,
+/// collapsing every kind to `Other`).
+#[cfg(test)]
+pub(crate) fn arm_fsync_path_fault_with_kind(
+  skip: usize,
+  kind: std::io::ErrorKind,
+) -> FsyncPathFaultGuard {
+  FSYNC_PATH_FAULT_SKIP_THEN_FAIL.with(|c| c.set(Some(skip)));
+  FSYNC_PATH_FAULT_KIND.with(|c| c.set(Some(kind)));
+  FsyncPathFaultGuard
+}
+
+#[cfg(test)]
+pub(crate) struct FsyncPathFaultGuard;
+
+#[cfg(test)]
+impl Drop for FsyncPathFaultGuard {
+  fn drop(&mut self) {
+    FSYNC_PATH_FAULT_SKIP_THEN_FAIL.with(|c| c.set(None));
+    FSYNC_PATH_FAULT_KIND.with(|c| c.set(None));
+  }
+}
+
+/// F7 R7 — arm the "real OS failure" injector: skip `skip` successful
+/// `fsync_path_inner` calls, then on the (skip+1)-th call remove the
+/// target file before the natural [`std::fs::File::open`] runs. The
+/// resulting [`std::io::Error`] is the AUTHENTIC OS-level error (kind
+/// [`std::io::ErrorKind::NotFound`], message like `"No such file or
+/// directory (os error 2)"`) with NO path embedded — exactly the kind
+/// of context-free failure the F7 R7 call-site wrap is designed to
+/// catch. Returns a [`Drop`] guard that disarms the injector on scope
+/// exit (so a test panic still leaves the thread clean).
+///
+/// `pub(crate)` (test-only) so [`crate::lm::convert`]'s F7 R7
+/// "real failure" test can drive a non-synthesized post-copy fsync
+/// warning through the public [`crate::lm::convert::convert`]
+/// entrypoint and assert the call-site wrap added path + operation
+/// context to a path-free OS-level error.
+#[cfg(test)]
+pub(crate) fn arm_fsync_path_fault_remove_then_fail(skip: usize) -> FsyncPathRemoveFaultGuard {
+  FSYNC_PATH_FAULT_REMOVE_THEN_FAIL.with(|c| c.set(Some(skip)));
+  FsyncPathRemoveFaultGuard
+}
+
+#[cfg(test)]
+pub(crate) struct FsyncPathRemoveFaultGuard;
+
+#[cfg(test)]
+impl Drop for FsyncPathRemoveFaultGuard {
+  fn drop(&mut self) {
+    FSYNC_PATH_FAULT_REMOVE_THEN_FAIL.with(|c| c.set(None));
+  }
+}
+
 // Test-only fault injector for `fsync_dir`: when set on the current
 // thread, the next `n` `fsync_dir` calls succeed normally and the
-// (n+1)-th returns `io::Error::other(...)`. Used by the post-index-
-// commit durability-warning tests to drive the
+// (n+1)-th returns `std::io::Error::new(kind, ...)` (kind defaults to
+// `ErrorKind::Other`; can be overridden via
+// [`arm_fsync_dir_fault_with_kind`]). Used by the post-index-commit
+// durability-warning tests to drive the
 // `CommitOutcome::CommittedWithDurabilityWarning` branch without needing
 // a hostile filesystem. Always `None` in production code (the thread-
 // local is only set inside `#[test]` fns and unset on test exit).
@@ -1671,25 +1878,52 @@ fn fsync_path(path: &Path) -> Result<()> {
 thread_local! {
   static FSYNC_DIR_FAULT_SKIP_THEN_FAIL: std::cell::Cell<Option<usize>> =
     const { std::cell::Cell::new(None) };
+  /// Optional override for the injected failure's
+  /// [`std::io::ErrorKind`]. `None` means the default
+  /// [`std::io::ErrorKind::Other`] (the historic injector shape).
+  /// Cleared in lockstep with `FSYNC_DIR_FAULT_SKIP_THEN_FAIL` when the
+  /// injector fires.
+  static FSYNC_DIR_FAULT_KIND: std::cell::Cell<Option<std::io::ErrorKind>> =
+    const { std::cell::Cell::new(None) };
 }
 
 /// Arm the [`fsync_dir`] fault injector to skip `skip` successful calls
-/// then make the next call fail. Returns a [`Drop`] guard that disarms
-/// the injector when it goes out of scope (so a test panic still leaves
-/// the thread in a clean state for the next test).
+/// then make the next call fail with [`std::io::ErrorKind::Other`].
+/// Returns a [`Drop`] guard that disarms the injector when it goes out
+/// of scope (so a test panic still leaves the thread in a clean state
+/// for the next test).
+///
+/// `pub(crate)` (test-only) so sibling modules' tests (e.g.
+/// [`crate::lm::convert`]'s F7 R1 Finding-4 closure) can drive the same
+/// post-commit durability path through the public [`save`] entrypoint.
 #[cfg(test)]
-fn arm_fsync_dir_fault(skip: usize) -> FsyncDirFaultGuard {
+pub(crate) fn arm_fsync_dir_fault(skip: usize) -> FsyncDirFaultGuard {
+  arm_fsync_dir_fault_with_kind(skip, std::io::ErrorKind::Other)
+}
+
+/// Variant of [`arm_fsync_dir_fault`] that lets the caller pick the
+/// injected [`std::io::ErrorKind`]. Used by F7 R6's kind-preservation
+/// tests so the save-side warning + post-copy dir warning both carry a
+/// specific machine-readable kind end-to-end through the
+/// [`crate::error::ConvertDurabilityWarnings`] aggregate.
+#[cfg(test)]
+pub(crate) fn arm_fsync_dir_fault_with_kind(
+  skip: usize,
+  kind: std::io::ErrorKind,
+) -> FsyncDirFaultGuard {
   FSYNC_DIR_FAULT_SKIP_THEN_FAIL.with(|c| c.set(Some(skip)));
+  FSYNC_DIR_FAULT_KIND.with(|c| c.set(Some(kind)));
   FsyncDirFaultGuard
 }
 
 #[cfg(test)]
-struct FsyncDirFaultGuard;
+pub(crate) struct FsyncDirFaultGuard;
 
 #[cfg(test)]
 impl Drop for FsyncDirFaultGuard {
   fn drop(&mut self) {
     FSYNC_DIR_FAULT_SKIP_THEN_FAIL.with(|c| c.set(None));
+    FSYNC_DIR_FAULT_KIND.with(|c| c.set(None));
   }
 }
 
@@ -1709,18 +1943,25 @@ impl Drop for FsyncDirFaultGuard {
 /// is journaled by the filesystem, not user-flushable), and the call
 /// silently succeeds rather than propagate a platform-specific error
 /// that has no corresponding fix at this layer.
-fn fsync_dir(path: &Path) -> std::io::Result<()> {
-  // Test-only fault-injection knob — see [`arm_fsync_dir_fault`]. Threaded
-  // through here rather than at each call site so every fsync_dir call
-  // (shard-fsync, index-fsync, config-fsync) is uniformly faultable.
+/// `pub(crate)` so sibling modules ([`crate::lm::convert`]'s post-copy
+/// directory-fsync step, F7 R4) can call the same well-tested helper
+/// rather than re-implement the `O_DIRECTORY` + `sync_all` boilerplate.
+/// Test-only fault injection is wired through [`arm_fsync_dir_fault`].
+pub(crate) fn fsync_dir(path: &Path) -> std::io::Result<()> {
+  // Test-only fault-injection knob — see [`arm_fsync_dir_fault`] /
+  // [`arm_fsync_dir_fault_with_kind`]. Threaded through here rather than
+  // at each call site so every fsync_dir call (shard-fsync, index-fsync,
+  // config-fsync) is uniformly faultable.
   #[cfg(test)]
   if let Some(remaining) = FSYNC_DIR_FAULT_SKIP_THEN_FAIL.with(|c| c.get()) {
     if remaining == 0 {
+      let kind = FSYNC_DIR_FAULT_KIND.with(|c| c.get().unwrap_or(std::io::ErrorKind::Other));
       FSYNC_DIR_FAULT_SKIP_THEN_FAIL.with(|c| c.set(None));
-      return Err(std::io::Error::other(format!(
-        "injected fsync_dir failure for {}",
-        path.display()
-      )));
+      FSYNC_DIR_FAULT_KIND.with(|c| c.set(None));
+      return Err(std::io::Error::new(
+        kind,
+        format!("injected fsync_dir failure for {}", path.display()),
+      ));
     } else {
       FSYNC_DIR_FAULT_SKIP_THEN_FAIL.with(|c| c.set(Some(remaining - 1)));
     }
