@@ -17,7 +17,7 @@
 //! `mlx_audio.lid.models.ecapa_tdnn`; per the no-per-model-arch rule
 //! mlxrs returns a [`LidModel`] trait object the per-architecture
 //! loader's caller constructs, so the table is exposed in
-//! [`LID_MODEL_REMAPPING`] for reference but no arch crate is imported
+//! [`MODEL_REMAPPING`] for reference but no arch crate is imported
 //! here.
 //!
 //! [lid-utils]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/lid/utils.py
@@ -55,7 +55,7 @@ pub const LID_SAMPLE_RATE: u32 = 16_000;
 ///
 /// [lid-utils-remap]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/lid/utils.py#L10-L13
 /// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
-pub const LID_MODEL_REMAPPING: &[(&str, &str)] =
+pub const MODEL_REMAPPING: &[(&str, &str)] =
   &[("ecapa-tdnn", "ecapa_tdnn"), ("ecapa_tdnn", "ecapa_tdnn")];
 
 /// The trait every per-architecture LID model implements — the analogue

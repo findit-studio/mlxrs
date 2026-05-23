@@ -52,7 +52,7 @@ pub const STT_SAMPLE_RATE: u32 = 16_000;
 ///
 /// [stt-utils-remap]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/utils.py#L12-L26
 /// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
-pub const STT_MODEL_REMAPPING: &[(&str, &str)] = &[
+pub const MODEL_REMAPPING: &[(&str, &str)] = &[
   ("cohere_asr", "cohere_asr"),
   ("fireredasr2", "fireredasr2"),
   ("glm", "glmasr"),

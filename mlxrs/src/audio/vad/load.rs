@@ -19,7 +19,7 @@
 //! the no-per-model-arch rule mlxrs returns a [`VadModel`] trait object
 //! (`Box<dyn VadModel>`) the per-architecture loader's caller constructs
 //! itself, so the remap table is the **caller's** responsibility — this
-//! module documents the mlx-audio names in [`VAD_MODEL_REMAPPING`] for
+//! module documents the mlx-audio names in [`MODEL_REMAPPING`] for
 //! parity but never imports an arch crate.
 //!
 //! [vad-utils]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/vad/utils.py
@@ -48,7 +48,7 @@ use crate::{
 ///
 /// [vad-utils-remap]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/vad/utils.py#L8-L11
 /// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
-pub const VAD_MODEL_REMAPPING: &[(&str, &str)] =
+pub const MODEL_REMAPPING: &[(&str, &str)] =
   &[("silero", "silero_vad"), ("silero-vad", "silero_vad")];
 
 /// The trait every per-architecture VAD model implements — the analogue

@@ -63,10 +63,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{
   error::{Error, Result},
-  lm::{
-    load::read_bounded_config_file,
-    quant::{PerLayerQuantization, parse_quantization},
-  },
+  lm::{load::read_bounded_config_file, quant::PerLayerQuantization},
 };
 
 /// The bundle [`base_load_model`] returns: the resolved local model
@@ -152,12 +149,23 @@ pub fn get_model_path(path: &str) -> Result<PathBuf> {
 
   // (3) mlx-audio would call snapshot_download here. mlxrs is local-only
   // by policy: reject with a clear, actionable message.
+  //
+  // Strip the Hub-URL prefix from the input before interpolating it
+  // into the workaround. `huggingface-cli download` expects a
+  // repo-id (`org/model`), so feeding it the user's raw `hf://org/model`
+  // or `https://huggingface.co/org/model` would print broken advice —
+  // strip both forms back to `org/model` first.
+  let repo_id = path
+    .strip_prefix("hf://")
+    .or_else(|| path.strip_prefix("https://huggingface.co/"))
+    .or_else(|| path.strip_prefix("http://huggingface.co/"))
+    .unwrap_or(path);
   Err(Error::Backend {
     message: format!(
       "audio model path {path:?} is not a local on-disk directory; \
        mlxrs does not download from HuggingFace Hub. Fetch the model \
-       directory out of process (e.g. `huggingface-cli download {path}`) \
-       and pass the resulting local path."
+       directory out of process (e.g. `huggingface-cli download {repo_id}` \
+       or `hf download {repo_id}`) and pass the resulting local path."
     ),
   })
 }
@@ -236,9 +244,28 @@ pub fn load_config(dir: &Path) -> Result<String> {
   }
 }
 
-/// Parse the optional `quantization` block of `config_json` into a
+/// Parse the optional quantization block of `config_json` into a
 /// [`PerLayerQuantization`] — mirroring the input half of mlx-audio's
 /// [`apply_quantization`][audio-utils-quant] ([utils.py:207-254][audio-utils-quant]).
+///
+/// Audio-specific deviations from [`crate::lm::quant::parse_quantization`]
+/// (the LM-side parser this previously delegated to verbatim), faithful
+/// to mlx-audio's Python ([utils.py:221-226][audio-utils-quant]):
+///
+/// 1. **Key fallback** ([utils.py:221-223][audio-utils-quant]): try
+///    top-level `"quantization"` first, and if that key is absent fall
+///    back to `"quantization_config"` (the longer key HF post-quantize
+///    artifacts use — `mlx_audio.utils.apply_quantization` reads both).
+/// 2. **`group_size` default** ([utils.py:226][audio-utils-quant]): if
+///    the chosen block has no `"group_size"`, default it to `64` (audio
+///    convention — Python's `quantization.get("group_size", 64)`). The
+///    LM-side parser rejects missing `group_size` outright (swift
+///    `Quantization` requires it), so this is an audio-only relaxation.
+///
+/// Otherwise identical to the LM parser: the parsed block flows through
+/// the shared [`PerLayerQuantization`] deserializer (per-layer overrides
+/// and global default), so audio quantized checkpoints inherit the same
+/// per-layer schema as LM ones.
 ///
 /// Per the project's no-per-model-arch rule, mlxrs returns the **parsed
 /// schema** (the `Option<PerLayerQuantization>`) rather than mutating a
@@ -250,16 +277,59 @@ pub fn load_config(dir: &Path) -> Result<String> {
 /// [`crate::lm::convert`] driver uses).
 ///
 /// `Ok(None)` ⇒ the checkpoint is dense (mlx-audio's no-op early-return
-/// at [utils.py:222-225][audio-utils-quant]).
+/// at [utils.py:222-225][audio-utils-quant] — neither
+/// `"quantization"` nor `"quantization_config"` is present).
 /// `Ok(Some(plq))` ⇒ the checkpoint is quantized; `plq` carries the
 /// global default (`group_size` / `bits` / `mode`) plus any per-layer
-/// overrides. A malformed `quantization` block is a recoverable
+/// overrides. A malformed quantization block (e.g. `bits` missing or
+/// `quantization` not a JSON object) is a recoverable
 /// [`Error::Backend`].
 ///
 /// [audio-utils-quant]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/utils.py#L207-L254
 /// [`Error::Backend`]: crate::Error::Backend
 pub fn apply_quantization(config_json: &str) -> Result<Option<PerLayerQuantization>> {
-  parse_quantization(config_json)
+  use serde_json::Value;
+
+  let value: Value = serde_json::from_str(config_json).map_err(|e| Error::Backend {
+    message: format!("audio apply_quantization: invalid config JSON: {e}"),
+  })?;
+
+  // (1) mlx-audio utils.py:221-223 — prefer top-level "quantization",
+  // fall back to "quantization_config" (the HF post-quantize artifact
+  // key).
+  let block = match value.get("quantization") {
+    Some(b) => b,
+    None => match value.get("quantization_config") {
+      Some(b) => b,
+      // Neither key present → dense model, the no-op early return at
+      // mlx-audio utils.py:222-225.
+      None => return Ok(None),
+    },
+  };
+
+  let Value::Object(map) = block else {
+    return Err(Error::Backend {
+      message: format!(
+        "audio apply_quantization: quantization block must be a JSON object, got {block:?}"
+      ),
+    });
+  };
+
+  // (2) mlx-audio utils.py:226 — `group_size = quantization.get("group_size", 64)`.
+  // The shared `PerLayerQuantization` deserializer requires `group_size`
+  // at the top of the block (swift-faithful), so audio injects the
+  // default here before delegating, preserving every other key
+  // (including per-layer overrides) verbatim.
+  let mut patched = map.clone();
+  patched
+    .entry("group_size".to_string())
+    .or_insert_with(|| Value::from(64));
+
+  let plq: PerLayerQuantization =
+    serde_json::from_value(Value::Object(patched)).map_err(|e| Error::Backend {
+      message: format!("audio apply_quantization: invalid quantization block: {e}"),
+    })?;
+  Ok(Some(plq))
 }
 
 /// Faithful port of `mlx_audio.utils.base_load_model`
@@ -433,5 +503,156 @@ mod tests {
     assert_eq!(bundle.model_path, dir);
     assert_eq!(bundle.config_json, body);
     assert!(bundle.quantization.is_none());
+  }
+
+  /// HF post-quantize artifact: `"quantization_config"` (the longer key)
+  /// is the fallback mlx-audio's `utils.py:221-223` recognizes when the
+  /// shorter `"quantization"` is absent. Both should parse identically.
+  #[test]
+  fn apply_quantization_parses_quantization_config_key() {
+    let body = r#"{
+      "model_type": "voxtral",
+      "quantization_config": { "bits": 4, "group_size": 64 }
+    }"#;
+    let q = apply_quantization(body).expect("HF-key config parses");
+    let plq = q.expect("Some(PerLayerQuantization) for HF-key config");
+    let global = plq.quantization.expect("global default present");
+    assert_eq!(global.group_size, 64);
+    assert_eq!(global.bits, 4);
+  }
+
+  /// mlx-audio's `quantization.get("group_size", 64)` ([utils.py:226])
+  /// silently defaults a missing `group_size` to 64. The LM-side parser
+  /// would reject this; the audio parser injects the default.
+  #[test]
+  fn apply_quantization_defaults_missing_group_size_to_64() {
+    let body = r#"{
+      "model_type": "voxtral",
+      "quantization": { "bits": 4 }
+    }"#;
+    let q = apply_quantization(body).expect("missing-group_size config parses");
+    let plq = q.expect("Some(PerLayerQuantization) for default-injected config");
+    let global = plq.quantization.expect("global default present");
+    assert_eq!(global.group_size, 64, "audio default group_size is 64");
+    assert_eq!(global.bits, 4);
+  }
+
+  /// When BOTH `"quantization"` and `"quantization_config"` are present,
+  /// the top-level key (`"quantization"`) wins — matching mlx-audio's
+  /// `config.get("quantization", None)` precedence at utils.py:221.
+  #[test]
+  fn apply_quantization_top_level_takes_precedence_over_quantization_config() {
+    let body = r#"{
+      "model_type": "voxtral",
+      "quantization": { "bits": 8, "group_size": 32 },
+      "quantization_config": { "bits": 4, "group_size": 64 }
+    }"#;
+    let q = apply_quantization(body).expect("both-keys config parses");
+    let plq = q.expect("Some(PerLayerQuantization) for both-keys config");
+    let global = plq.quantization.expect("global default present");
+    assert_eq!(global.bits, 8, "top-level `quantization` wins");
+    assert_eq!(global.group_size, 32, "top-level `quantization` wins");
+  }
+
+  /// `hf://org/model` repo-id-shaped input: the rejection message's
+  /// **CLI workaround segment** must strip the `hf://` prefix so
+  /// `huggingface-cli download <repo_id>` is actionable.
+  ///
+  /// The message echoes the user's raw input for context (e.g. `path
+  /// "hf://org/model" is not a local on-disk directory`), but the CLI
+  /// suggestion segment after "Fetch the model directory out of process"
+  /// must contain only the clean repo id.
+  #[test]
+  fn get_model_path_hf_url_prefix_yields_clean_repo_id_in_error() {
+    let err = get_model_path("hf://mlx-community/silero-vad")
+      .expect_err("hf:// repo id must be rejected with a clean workaround");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("mlx-community/silero-vad"),
+      "workaround should print the clean repo id, got: {msg}"
+    );
+    // Extract the CLI suggestion segment (between "Fetch" and the
+    // closing ")") and assert the prefix isn't there — the leading
+    // `audio model path "hf://…"` is the verbatim echo, deliberate.
+    let workaround = msg
+      .split_once("Fetch the model directory out of process")
+      .map(|(_, after)| after)
+      .expect("workaround section present");
+    assert!(
+      !workaround.contains("hf://"),
+      "CLI workaround must not embed the `hf://` prefix, got: {workaround}"
+    );
+    assert!(
+      workaround.contains("huggingface-cli download mlx-community/silero-vad"),
+      "CLI workaround must use the clean repo id, got: {workaround}"
+    );
+  }
+
+  /// `https://huggingface.co/org/model` URL: same — strip the URL
+  /// prefix so the CLI workaround is correct.
+  #[test]
+  fn get_model_path_https_huggingface_url_yields_clean_repo_id_in_error() {
+    let err = get_model_path("https://huggingface.co/mlx-community/silero-vad")
+      .expect_err("https://huggingface.co/ URL must be rejected with a clean workaround");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("mlx-community/silero-vad"),
+      "workaround should print the clean repo id, got: {msg}"
+    );
+    let workaround = msg
+      .split_once("Fetch the model directory out of process")
+      .map(|(_, after)| after)
+      .expect("workaround section present");
+    assert!(
+      !workaround.contains("https://huggingface.co/"),
+      "CLI workaround must not embed the full URL, got: {workaround}"
+    );
+    assert!(
+      workaround.contains("huggingface-cli download mlx-community/silero-vad"),
+      "CLI workaround must use the clean repo id, got: {workaround}"
+    );
+  }
+
+  /// Every per-domain `audio::<domain>::load` module exposes its
+  /// `MODEL_REMAPPING` table under the same uniform name (no
+  /// per-domain prefix) so generic caller code can read
+  /// `audio::<domain>::load::MODEL_REMAPPING` without a per-domain
+  /// branch. Codec's table is empty (mlx-audio's `codec/__init__.py`
+  /// ships no remapping); the others mirror their upstream
+  /// `*-utils.py:MODEL_REMAPPING` tables.
+  #[test]
+  #[allow(non_snake_case)]
+  fn per_domain_load_modules_expose_uniform_MODEL_REMAPPING() {
+    let tts: &[(&str, &str)] = crate::audio::tts::load::MODEL_REMAPPING;
+    let stt: &[(&str, &str)] = crate::audio::stt::load::MODEL_REMAPPING;
+    let sts: &[(&str, &str)] = crate::audio::sts::load::MODEL_REMAPPING;
+    let vad: &[(&str, &str)] = crate::audio::vad::load::MODEL_REMAPPING;
+    let lid: &[(&str, &str)] = crate::audio::lid::load::MODEL_REMAPPING;
+    let codec: &[(&str, &str)] = crate::audio::codec::load::MODEL_REMAPPING;
+
+    assert!(
+      codec.is_empty(),
+      "codec's MODEL_REMAPPING must be empty per upstream's no-remapping shape, got: {codec:?}"
+    );
+    assert!(
+      !tts.is_empty(),
+      "TTS MODEL_REMAPPING must mirror upstream's non-empty alias table"
+    );
+    assert!(
+      !stt.is_empty(),
+      "STT MODEL_REMAPPING must mirror upstream's non-empty alias table"
+    );
+    assert!(
+      !sts.is_empty(),
+      "STS MODEL_REMAPPING must mirror upstream's non-empty alias table"
+    );
+    assert!(
+      !vad.is_empty(),
+      "VAD MODEL_REMAPPING must mirror upstream's non-empty alias table"
+    );
+    assert!(
+      !lid.is_empty(),
+      "LID MODEL_REMAPPING must mirror upstream's non-empty alias table"
+    );
   }
 }

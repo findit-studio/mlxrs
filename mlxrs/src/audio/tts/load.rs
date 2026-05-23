@@ -42,7 +42,7 @@ use crate::{
 ///
 /// [tts-utils-remap]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/tts/utils.py#L19-L45
 /// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
-pub const TTS_MODEL_REMAPPING: &[(&str, &str)] = &[
+pub const MODEL_REMAPPING: &[(&str, &str)] = &[
   ("qwen3_tts", "qwen3_tts"),
   ("outetts", "outetts"),
   ("spark", "spark"),

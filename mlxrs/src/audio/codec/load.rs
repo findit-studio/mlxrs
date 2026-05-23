@@ -25,6 +25,19 @@ use crate::{
   error::{Error, Result},
 };
 
+/// Uniform `MODEL_REMAPPING` table for codec architectures — empty for
+/// parity with the other audio domains' load surfaces
+/// ([`crate::audio::tts::load::MODEL_REMAPPING`] et al.).
+///
+/// mlx-audio's [`codec/__init__.py`][codec-init] ships no remapping
+/// (per-codec classes are imported by name with no alias table), so this
+/// constant is intentionally empty — exposed only so generic caller code
+/// `audio::<domain>::load::MODEL_REMAPPING` can iterate every domain's
+/// remap table uniformly without a per-domain branch.
+///
+/// [codec-init]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/codec/__init__.py
+pub const MODEL_REMAPPING: &[(&str, &str)] = &[];
+
 /// The trait every per-architecture neural-audio codec implements — the
 /// encode/decode pair every codec mlx-audio ships
 /// ([`codec/__init__.py`][codec-init]'s `DAC`, `Encodec`, `Mimi`,

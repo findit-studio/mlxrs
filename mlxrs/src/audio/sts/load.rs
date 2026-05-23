@@ -20,7 +20,7 @@
 //! `mlx_audio.sts.models.<arch>`; per the no-per-model-arch rule mlxrs
 //! returns an [`StsModel`] trait object the per-architecture loader's
 //! caller constructs, so the table is exposed in
-//! [`STS_MODEL_REMAPPING`] for reference but no arch crate is imported
+//! [`MODEL_REMAPPING`] for reference but no arch crate is imported
 //! here.
 //!
 //! [sts-utils]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/utils.py
@@ -43,7 +43,7 @@ use crate::{
 ///
 /// [sts-utils-remap]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/utils.py#L13-L26
 /// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
-pub const STS_MODEL_REMAPPING: &[(&str, &str)] = &[
+pub const MODEL_REMAPPING: &[(&str, &str)] = &[
   ("deepfilter", "deepfilternet"),
   ("deepfilternet", "deepfilternet"),
   ("deepfilternet3", "deepfilternet"),
