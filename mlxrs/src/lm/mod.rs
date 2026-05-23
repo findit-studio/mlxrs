@@ -31,6 +31,7 @@
 
 pub mod cache;
 pub mod cache_prompt;
+pub mod convert;
 pub mod factory;
 pub mod generate;
 #[cfg(feature = "gguf")]
