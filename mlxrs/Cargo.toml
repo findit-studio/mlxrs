@@ -21,8 +21,15 @@ tokenizer-chat       = ["tokenizer-config", "dep:minijinja", "dep:minijinja-cont
 tokenizer-deepseek-v32 = ["tokenizer-chat"]                                        # the one shipped chat-template override
 tokenizer-tools      = ["tokenizer-config", "dep:serde_json"]                      # tool-call parsers + infer_tool_parser
 
-embeddings           = ["tokenizer", "dep:smol_str", "dep:memspan", "dep:glob"]     
+embeddings           = ["tokenizer", "dep:smol_str", "dep:memspan", "dep:glob"]
 lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm", "tokenizer-bpe", "tokenizer-chat", "tokenizer-deepseek-v32", "tokenizer-tools", "dep:regex"]
+# Grammar-constrained logits processing (`build_json_schema_logits_processor` /
+# `LLGuidanceLogitsProcessor`, the `lm::structured` module — port of
+# `mlx_vlm/structured.py`'s LLGuidance-backed sampler). Pulls in the
+# `llguidance` Rust crate + `toktrie_hf_tokenizers` (HF tokenizer → byte trie
+# adapter). Gated separately so the default `lm` build doesn't pay the
+# grammar-engine compile cost; callers who need structured outputs opt in.
+llguidance           = ["lm", "dep:llguidance", "dep:toktrie_hf_tokenizers", "dep:serde_json"]
 vlm                  = ["lm", "dep:image"]
 audio                = ["lm", "dep:symphonia"]
 unstable-ops-overload = []
@@ -75,6 +82,13 @@ symphonia = { version = "0.6", optional = true, default-features = false, featur
   "vorbis",
 ] }
 regex = { version = "1", optional = true, default-features = false, features = ["std", "perf"] }
+# Grammar-constrained decoding backend (V6 — `lm::structured`). `default-features
+# = false` strips `rayon` (parallel mask compute — orthogonal to our single-
+# matcher per-step path) and `lark`/`referencing`; the `lark` feature is
+# re-enabled because `GrammarSpec::Lark` accepts Lark source. No GPU /
+# pyo3 / cbindgen / wasm features pulled in.
+llguidance = { version = "1.7", optional = true, default-features = false, features = ["lark", "referencing"] }
+toktrie_hf_tokenizers = { version = "1.7", optional = true }
 
 [dev-dependencies]
 approx.workspace = true

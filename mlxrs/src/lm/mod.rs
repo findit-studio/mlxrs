@@ -47,6 +47,20 @@ pub mod sample;
 pub mod session;
 pub mod speculative;
 pub mod stop;
+/// Grammar-constrained decoding — port of `mlx_vlm/structured.py` (V6,
+/// issue #180). [`LLGuidanceLogitsProcessor`] +
+/// [`build_json_schema_logits_processor`] mask each step's logits down
+/// to the tokens that keep the next sequence valid against a JSON
+/// schema / regex / Lark grammar. Backed by the
+/// [`llguidance`](https://crates.io/crates/llguidance) crate; gated on
+/// the `llguidance` cargo feature so the default `lm` build doesn't pay
+/// the grammar-engine compile cost.
+///
+/// [`LLGuidanceLogitsProcessor`]: crate::lm::structured::LLGuidanceLogitsProcessor
+/// [`build_json_schema_logits_processor`]: crate::lm::structured::build_json_schema_logits_processor
+#[cfg(feature = "llguidance")]
+#[cfg_attr(docsrs, doc(cfg(feature = "llguidance")))]
+pub mod structured;
 /// Tool-call format parsers — Python `mlx_lm.tool_parsers.*`.
 ///
 /// Surface re-export of [`crate::tokenizer::tools`] under the canonical
