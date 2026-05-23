@@ -233,6 +233,15 @@ impl<'a> WiredLimitGuard<'a> {
   }
 }
 
+impl std::fmt::Debug for WiredLimitGuard<'_> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("WiredLimitGuard")
+      .field("old_limit", &self.old_limit)
+      .field("streams_count", &self.streams.len())
+      .finish()
+  }
+}
+
 impl Drop for WiredLimitGuard<'_> {
   fn drop(&mut self) {
     // Mirrors Python's `finally:` — synchronize the streams (or the default
