@@ -1030,71 +1030,88 @@ pub fn does_model_support_input_embeddings(model: &dyn crate::lm::model::Model) 
   model.supports_input_embeddings()
 }
 
-/// Per-shard file name, mirroring `mlx_lm.utils.save_model`'s
-/// `shard_file_format` (`utils.py:728-732`): a lone shard is the bare
-/// `model.safetensors`; a multi-shard set uses the
-/// `model-{:05d}-of-{:05d}.safetensors` HF convention (**1-based** shard
-/// index, zero-padded to 5 digits).
-fn shard_file_name(index_1based: usize, shards_count: usize) -> String {
-  if shards_count > 1 {
-    format!("model-{index_1based:05}-of-{shards_count:05}.safetensors")
-  } else {
-    "model.safetensors".to_string()
-  }
+/// Per-shard file name, **generation-tagged** to avoid colliding with any
+/// pre-existing shard on disk. The reference (`utils.py:728-732`) names a
+/// lone shard `model.safetensors` and a multi-shard set
+/// `model-{:05d}-of-{:05d}.safetensors`; both of those *do* collide with a
+/// previously-saved checkpoint's shards on the same path, which then lets a
+/// torn rename between the shard publish and the index publish corrupt the
+/// OLD checkpoint (the OLD index still points at a path whose content is now
+/// the NEW shard's bytes — `save_model` step 5's caveat).
+///
+/// mlxrs avoids that class of corruption by using a **generation-unique**
+/// basename — `model-gen-{timestamp_ms}-{idx:05}-of-{N:05}.safetensors` —
+/// with `timestamp_ms` captured ONCE at the start of `save_model` (so every
+/// shard of a single save shares the same generation tag). New-checkpoint
+/// shards are then **guaranteed** not to overwrite the OLD checkpoint's
+/// shards: a `save_model` failure between shard renames and the index
+/// rename can leak orphan files into the directory but can never silently
+/// corrupt the previously-valid checkpoint. The single-shard case uses the
+/// uniform `…-00001-of-00001` form (no special case) so loader code never
+/// has to distinguish the two.
+///
+/// The index records these exact names verbatim, and the loader
+/// ([`load_weights`]) follows the index, so any shard basename — including
+/// these generation-tagged ones — works transparently.
+fn shard_file_name(generation_ms: u128, index_1based: usize, shards_count: usize) -> String {
+  format!("model-gen-{generation_ms}-{index_1based:05}-of-{shards_count:05}.safetensors")
 }
 
 /// Write a weight map as sharded `.safetensors` plus the
 /// `model.safetensors.index.json` weight-map index into `save_path`,
-/// mirroring `mlx_lm.utils.save_model` (`utils.py:714-771`) with one
-/// **structural** addition: the [`load_weights`] side reads the index as
-/// the authoritative shard manifest, so the index rename here becomes the
-/// **SINGLE** commit point — a mid-save crash leaves the previously-valid
-/// checkpoint atomically intact.
+/// mirroring `mlx_lm.utils.save_model` (`utils.py:714-771`) with two
+/// **structural** additions: (1) the [`load_weights`] side reads the index
+/// as the authoritative shard manifest, so the index rename here becomes
+/// the **SINGLE** commit point — a mid-save crash leaves the previously-
+/// valid checkpoint atomically intact; (2) shard basenames are
+/// **generation-tagged** (`model-gen-{timestamp_ms}-{idx:05}-of-{N:05}
+/// .safetensors`, with a single timestamp captured at the start of the
+/// save) so a new save's shards can never overwrite an older checkpoint's
+/// shards on disk — closing the residual "torn rename between shard
+/// publish and index publish corrupts the old shard" window the reference's
+/// fixed shard names leave open.
 ///
 /// Steps, in reference order:
 ///
-/// 1. `save_path` is created (`mkdir -p`, `utils.py:723`).
+/// 1. `save_path` is created (`mkdir -p`, `utils.py:723`); a single
+///    generation timestamp (ms since the UNIX epoch) is captured.
 /// 2. The weights are sharded via [`make_shards`] at [`MAX_FILE_SIZE_GB`]
 ///    (`utils.py:726`).
 /// 3. `total_size` (the sum of every weight's `array_nbytes`) and
 ///    `total_parameters` ([`get_total_parameters`]) are computed for the
 ///    index `metadata` block (`utils.py:734-741`).
 /// 4. Each shard is written — with the `{"format": "mlx"}` safetensors
-///    metadata mlx writes (`utils.py:756`) and the `shard_file_name`
-///    name — to a **same-directory, exclusively created (`O_EXCL`)
-///    `.safetensors` tempfile**, which is then **fsync**ed. The `index.json`
-///    body is likewise serialized to its own same-directory `O_EXCL`
-///    tempfile and fsynced. **Nothing is written to a final path yet.** Any
-///    failure here removes every staged tempfile.
+///    metadata mlx writes (`utils.py:756`) and the generation-tagged
+///    `shard_file_name` — to a **same-directory, exclusively created
+///    (`O_EXCL`) `.safetensors` tempfile**, which is then **fsync**ed.
+///    The `index.json` body is likewise serialized to its own same-
+///    directory `O_EXCL` tempfile and fsynced. **Nothing is written to a
+///    final path yet.** Any failure here removes every staged tempfile.
 /// 5. **Publish — single commit point.** Every shard tempfile is atomically
-///    renamed over its final shard name FIRST, then the staged index is
-///    atomically renamed over `model.safetensors.index.json` LAST. The
-///    index rename is THE observable commit point: before it, load follows
-///    the OLD index (if any) to the OLD shards (any new-named shards on
-///    disk are invisible — [`load_weights`] only loads what the index
-///    lists); after it, load follows the NEW index to the new shards.
+///    renamed over its final shard name FIRST; the parent directory is
+///    `fsync`ed so those rename entries are durable; the staged index is
+///    atomically renamed over `model.safetensors.index.json` LAST; the
+///    parent directory is `fsync`ed again to make the index rename
+///    durable. The index rename is THE observable commit point: before it,
+///    load follows the OLD index (if any) to the OLD shards (any new-named
+///    shards on disk are invisible — [`load_weights`] only loads what the
+///    index lists); after it, load follows the NEW index to the new shards.
 ///    POSIX `rename(2)` is atomic-within-fs (same-dir tempfiles keep it
 ///    single-fs); the new checkpoint becomes visible only at that final
-///    rename. A failure between a shard rename and the index rename
-///    leaves the OLD index → OLD shards still loadable; the not-yet-
-///    published staged index is removed, and the renamed shard tempfiles
-///    become silently-orphan files (load ignores them, and step 6 will
-///    clean them up on the next successful save).
-///    [Concurrent-reader caveat: when a NEW shard's name collides with an
-///    OLD shard's name (e.g. both checkpoints are single-shard
-///    `model.safetensors`), the per-shard rename does overwrite the old
-///    file. A crash after that overwrite but before the index rename
-///    leaves the OLD index pointing to a file whose content is the NEW
-///    shard — load returns NEW data through OLD index entries, with
-///    missing-key errors on any key the new shard does not carry. This
-///    is strictly better than a multi-file half-published mix and is the
-///    accepted ceiling without a cross-file transaction.]
-/// 6. **After** the index commits, any **stale** pre-existing
-///    `model*.safetensors` shard whose name is not in the freshly written
-///    set is removed as **optional hygiene**. Load already ignores
-///    non-indexed shards, so a failure here can only leak files (never
-///    corrupt the checkpoint); cleanup runs AFTER the single commit point
-///    so this step is no longer load-critical.
+///    rename. Because every NEW shard's basename carries a unique
+///    generation timestamp it can never overwrite an OLD shard — a failure
+///    between the shard renames and the index rename leaves the OLD index
+///    → OLD shards untouched and still loadable; the not-yet-published
+///    staged index is removed, and the renamed new-named shards become
+///    silently-orphan files (load ignores them).
+///
+/// **Prior-generation shards on disk.** This implementation **does not**
+/// inline-prune `model*.safetensors` files left over from earlier
+/// checkpoints. The loader follows the NEW index, never a glob, so those
+/// orphans are invisible to load and only leak disk space. An explicit
+/// prune API can be added later if needed; doing so as part of `save_model`
+/// would re-introduce a race we just removed (an unlink concurrent with a
+/// reader's `mmap`).
 ///
 /// The `weight_map` (`weight name → shard file name`) is assembled and
 /// **sorted by key** (`utils.py:762-764`); the whole `index_data`
@@ -1118,6 +1135,8 @@ pub fn save_model(
   weights: &Weights,
   quant: &crate::lm::quant::PerLayerQuantization,
 ) -> Result<()> {
+  use std::time::{SystemTime, UNIX_EPOCH};
+
   // 1. `save_path.mkdir(parents=True, exist_ok=True)` (`utils.py:723`).
   std::fs::create_dir_all(save_path).map_err(|e| Error::Backend {
     message: format!(
@@ -1125,6 +1144,19 @@ pub fn save_model(
       save_path.display()
     ),
   })?;
+
+  // Capture the generation timestamp ONCE up front so every shard of this
+  // save shares the same tag — making the basenames trivially identifiable
+  // as belonging to the same generation. The exact value is not load-
+  // critical (the loader follows the index, never parses the basename); it
+  // is just a uniqueness handle. A clock error falls back to `0` rather
+  // than failing the save — even a `0`-tag basename is unique enough to
+  // not collide with the reference's `model.safetensors` /
+  // `model-{N}-of-{M}.safetensors` names of a pre-existing checkpoint.
+  let generation_ms: u128 = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|d| d.as_millis())
+    .unwrap_or(0);
 
   // 2. shard (`utils.py:726`).
   let shards = make_shards(weights, MAX_FILE_SIZE_GB)?;
@@ -1156,16 +1188,12 @@ pub fn save_model(
   // Same for the staged index — kept separate so the publish step can
   // commit shards first and the index LAST.
   let mut staged_index: Option<(PathBuf, PathBuf)> = None;
-  // The names of the shards just written — every other `model*.safetensors`
-  // in `save_path` is stale hygiene in step 6.
-  let mut written_shards: std::collections::HashSet<String> =
-    std::collections::HashSet::with_capacity(shards_count);
 
   // Inner closure so ANY failure below cleans up every tempfile staged so
   // far before returning — no leaked `.tmp.safetensors` on a failed save.
   let staged: Result<()> = (|| {
     for (i, shard) in shards.iter().enumerate() {
-      let shard_name = shard_file_name(i + 1, shards_count);
+      let shard_name = shard_file_name(generation_ms, i + 1, shards_count);
       let final_path = save_path.join(&shard_name);
       // Exclusively created, same-directory, `.safetensors`-suffixed
       // tempfile: `save_safetensors_view` (mlx-c) writes exactly this path
@@ -1181,7 +1209,6 @@ pub fn save_model(
       for &weight_name in shard.keys() {
         weight_map.insert(weight_name.to_string(), shard_name.clone());
       }
-      written_shards.insert(shard_name);
     }
 
     // assemble `model.safetensors.index.json` with `indent=4`
@@ -1217,14 +1244,15 @@ pub fn save_model(
 
   // 5. Publish — single commit point.
   //
-  //    a. Rename every shard tempfile over its final shard name FIRST. A
-  //       rename failure here leaves any still-staged shard + the staged
-  //       index as tempfiles, which are cleaned up before propagating.
-  //       Already-renamed shards remain on disk as silently-invisible
-  //       files (the OLD index, if any, still points to the OLD shard
-  //       names — which, for non-colliding NEW names, are still intact).
-  //       Step 6 of the NEXT successful save will clean these orphans
-  //       up; the OLD checkpoint loads correctly in the meantime.
+  //    a. Rename every shard tempfile over its final shard name FIRST.
+  //       Because each shard basename carries a generation-unique tag
+  //       (`model-gen-{ts}-…`) the rename target never pre-exists, so the
+  //       rename creates a brand-new file and can never overwrite an
+  //       older checkpoint's shards. A rename failure here leaves any
+  //       still-staged shard + the staged index as tempfiles, which are
+  //       cleaned up before propagating. Already-renamed shards remain on
+  //       disk as silently-invisible files (the OLD index, if any, still
+  //       points to its OLD shard names — which are untouched).
   for idx in 0..staged_shards.len() {
     let (tmp, final_path) = &staged_shards[idx];
     if let Err(e) = std::fs::rename(tmp, final_path) {
@@ -1244,6 +1272,19 @@ pub fn save_model(
       });
     }
   }
+
+  //    a'. fsync the parent directory so all shard rename entries are
+  //        durable on disk before we publish the index. Without this, a
+  //        crash between the shard renames and the index rename can lose
+  //        the rename metadata, leaving the index referencing shards that
+  //        appear missing on the next mount. A no-op on platforms where
+  //        directory fsync is not supported.
+  fsync_dir(save_path).map_err(|e| Error::Backend {
+    message: format!(
+      "save_model: fsync parent directory {} after shard renames failed: {e}",
+      save_path.display()
+    ),
+  })?;
 
   //    b. Atomically rename the staged index over
   //       `model.safetensors.index.json` LAST. This is THE observable
@@ -1267,41 +1308,16 @@ pub fn save_model(
     });
   }
 
-  // 6. Optional hygiene: drop any pre-existing `model*.safetensors` left
-  //    over from an earlier checkpoint that the new index does not list.
-  //    [`load_weights`] already ignores non-indexed shards, so a failure
-  //    in this step can only leak disk space (never corrupt the
-  //    checkpoint). This is the second guarantee the single-commit-point
-  //    discipline buys: cleanup is no longer load-critical, and a
-  //    permission failure here is harmless to the published checkpoint.
-  let _ = cleanup_stale_shards(save_path, &written_shards);
-  Ok(())
-}
-
-/// Remove any `model*.safetensors` in `save_path` whose basename is NOT in
-/// `keep`. Optional hygiene called AFTER the index commits — a failure
-/// here can only leak disk space (load follows the index, not the glob),
-/// so the result is **deliberately ignored** by the caller. Returns the
-/// first removal error if any (for tests that want to assert hygiene
-/// actually ran), but `save_model` discards it.
-fn cleanup_stale_shards(save_path: &Path, keep: &std::collections::HashSet<String>) -> Result<()> {
-  let existing_shards = collect_sorted(save_path, |name| {
-    name.starts_with("model") && name.ends_with(".safetensors")
+  //    b'. fsync the parent directory again so the index rename — THE
+  //        observable commit point — is durable. A successful return from
+  //        `save_model` now implies the new checkpoint survives a crash.
+  fsync_dir(save_path).map_err(|e| Error::Backend {
+    message: format!(
+      "save_model: fsync parent directory {} after index rename failed: {e}",
+      save_path.display()
+    ),
   })?;
-  for stale in &existing_shards {
-    let is_stale = stale
-      .file_name()
-      .and_then(|n| n.to_str())
-      .is_some_and(|n| !keep.contains(n));
-    if is_stale {
-      std::fs::remove_file(stale).map_err(|e| Error::Backend {
-        message: format!(
-          "save_model: cannot remove stale shard {}: {e}",
-          stale.display()
-        ),
-      })?;
-    }
-  }
+
   Ok(())
 }
 
@@ -1404,6 +1420,46 @@ fn fsync_path(path: &Path) -> Result<()> {
   f.sync_all().map_err(|e| Error::Backend {
     message: format!("save: fsync tempfile {} failed: {e}", path.display()),
   })
+}
+
+/// fsync the directory `path` so any rename / unlink / create entries inside
+/// it are durable on disk before we return — without this, a `rename(2)` is
+/// allowed to land in the parent directory's in-memory inode but be lost on
+/// a crash, leaving the index referencing shards the kernel never wrote the
+/// directory entry for. Called once after every batch of renames in
+/// [`save_model`] (after the shard renames, after the index rename) and
+/// after the config rename in [`commit_staged_config`].
+///
+/// Unix implementation opens the directory read-only with `O_DIRECTORY`
+/// (so a non-directory path errors) and calls `sync_all`, mirroring the
+/// well-trodden POSIX `fsync(dirfd)` durability pattern that mlx-c does
+/// not perform. On non-Unix platforms (Windows, WASI), this is a no-op:
+/// Windows has no public API to fsync a directory handle (NTFS metadata
+/// is journaled by the filesystem, not user-flushable), and the call
+/// silently succeeds rather than propagate a platform-specific error
+/// that has no corresponding fix at this layer.
+fn fsync_dir(path: &Path) -> std::io::Result<()> {
+  #[cfg(unix)]
+  {
+    use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
+    // `O_DIRECTORY` makes the open fail with `ENOTDIR` if `path` is not a
+    // directory — a strong precondition check before we waste a syscall.
+    // `read(true)` is the portable POSIX way to ask for a read-only fd;
+    // a directory open for read is allowed, an open for write is not.
+    let f = OpenOptions::new()
+      .read(true)
+      .custom_flags(libc::O_DIRECTORY)
+      .open(path)?;
+    f.sync_all()
+  }
+  #[cfg(not(unix))]
+  {
+    // No portable user-space "fsync a directory" on Windows / WASI. The
+    // FS journals directory metadata transparently; returning Ok keeps
+    // the call site platform-agnostic.
+    let _ = path;
+    Ok(())
+  }
 }
 
 /// Write back a model configuration as `config.json`, mirroring
@@ -1513,10 +1569,11 @@ fn stage_config(config: &str, config_path: &Path) -> Result<StagedConfig> {
   Ok(staged)
 }
 
-/// Atomically rename a [`StagedConfig`]'s tempfile over `config_path`.
-/// Consumes the staging guard so a successful rename does not also delete
-/// the just-published file via [`Drop`]. On a rename failure the staging
-/// guard's `Drop` cleans the tempfile up.
+/// Atomically rename a [`StagedConfig`]'s tempfile over `config_path`, then
+/// `fsync` the parent directory so the rename is durable. Consumes the
+/// staging guard so a successful rename does not also delete the just-
+/// published file via [`Drop`]. On a rename failure the staging guard's
+/// `Drop` cleans the tempfile up.
 fn commit_staged_config(mut staged: StagedConfig, config_path: &Path) -> Result<()> {
   if let Err(e) = std::fs::rename(&staged.tmp_path, config_path) {
     // Leave `cleanup_on_drop = true` so `Drop` removes the tempfile.
@@ -1531,6 +1588,17 @@ fn commit_staged_config(mut staged: StagedConfig, config_path: &Path) -> Result<
   // The rename consumed the tempfile (it IS now `config_path`); the
   // tempfile path no longer exists, so don't try to `unlink` it on Drop.
   staged.cleanup_on_drop = false;
+  // fsync the parent directory so the rename entry is durable on disk —
+  // without it, a crash between `rename(2)` and the next sync can lose
+  // the new `config.json` and leave the directory holding the OLD one.
+  if let Some(parent) = config_path.parent() {
+    fsync_dir(parent).map_err(|e| Error::Backend {
+      message: format!(
+        "save_config: fsync parent directory {} after rename failed: {e}",
+        parent.display()
+      ),
+    })?;
+  }
   Ok(())
 }
 
@@ -1953,19 +2021,40 @@ mod save_tests {
 
   // ─────────────────────── shard_file_name ───────────────────────
 
+  /// The generation-tagged basename: `model-gen-{ts}-{idx:05}-of-{N:05}
+  /// .safetensors`. Uniform across single- and multi-shard sets so the
+  /// publish path has one code path. The exact `ts` value is not load-
+  /// critical (the loader follows the index, not the basename), it is
+  /// just a uniqueness handle so new shards never collide with a prior
+  /// checkpoint's shard names.
   #[test]
-  fn shard_file_name_single_vs_multi() {
-    // 1 shard → bare `model.safetensors`.
-    assert_eq!(shard_file_name(1, 1), "model.safetensors");
-    // multi-shard → 1-based, 5-digit zero-padded HF convention.
-    assert_eq!(shard_file_name(1, 3), "model-00001-of-00003.safetensors");
-    assert_eq!(shard_file_name(3, 3), "model-00003-of-00003.safetensors");
+  fn shard_file_name_generation_tagged() {
+    assert_eq!(
+      shard_file_name(1234567890123u128, 1, 1),
+      "model-gen-1234567890123-00001-of-00001.safetensors"
+    );
+    assert_eq!(
+      shard_file_name(1234567890123u128, 1, 3),
+      "model-gen-1234567890123-00001-of-00003.safetensors"
+    );
+    assert_eq!(
+      shard_file_name(1234567890123u128, 3, 3),
+      "model-gen-1234567890123-00003-of-00003.safetensors"
+    );
+    // Two distinct generations produce distinct basenames — the property
+    // that lets new-checkpoint shards never overwrite old-checkpoint
+    // shards on disk.
+    assert_ne!(
+      shard_file_name(1, 1, 1),
+      shard_file_name(2, 1, 1),
+      "different generations must produce different shard names"
+    );
   }
 
   // ─────────────────────── save_model round-trip ───────────────────────
 
-  /// `save_model` writes a single `model.safetensors` (the 3 small weights
-  /// fit one 5-GiB shard) plus a `model.safetensors.index.json`;
+  /// `save_model` writes a single generation-tagged shard (the 3 small
+  /// weights fit one 5-GiB shard) plus a `model.safetensors.index.json`;
   /// [`load_weights`] reads the weights back byte-equal, and the index JSON
   /// has the expected `metadata` + sorted `weight_map`.
   #[test]
@@ -1984,11 +2073,20 @@ mod save_tests {
 
     save_model(&dir, &w, &PerLayerQuantization::default()).unwrap();
 
-    // Exactly one shard file, named `model.safetensors`.
-    assert!(dir.join("model.safetensors").is_file());
+    // Exactly one shard file, named with the generation-tagged
+    // `…-00001-of-00001` form (uniform single- + multi-shard naming).
+    let shards = collect_sorted(&dir, |n| {
+      n.starts_with("model-gen-") && n.ends_with("-00001-of-00001.safetensors")
+    })
+    .unwrap();
+    assert_eq!(
+      shards.len(),
+      1,
+      "exactly one generation-tagged single shard file"
+    );
     assert!(dir.join("model.safetensors.index.json").is_file());
 
-    // Weights round-trip byte-equal.
+    // Weights round-trip byte-equal via the index.
     let mut loaded = load_weights(&dir).unwrap();
     assert_eq!(loaded.len(), 2);
     assert_eq!(
@@ -2017,8 +2115,15 @@ mod save_tests {
     assert_eq!(index["metadata"]["total_parameters"], 5);
     let wm = index["weight_map"].as_object().unwrap();
     assert_eq!(wm.len(), 2);
-    assert_eq!(wm["model.a.weight"], "model.safetensors");
-    assert_eq!(wm["model.b.weight"], "model.safetensors");
+    // Both weights are in the same single shard. The shard basename in the
+    // index matches the on-disk file.
+    let shard_basename = shards[0]
+      .file_name()
+      .unwrap()
+      .to_string_lossy()
+      .into_owned();
+    assert_eq!(wm["model.a.weight"], shard_basename);
+    assert_eq!(wm["model.b.weight"], shard_basename);
     // weight_map keys are sorted (a before b).
     let keys: Vec<&String> = wm.keys().collect();
     assert_eq!(keys, vec!["model.a.weight", "model.b.weight"]);
@@ -2055,7 +2160,10 @@ mod save_tests {
   /// *file naming + index* through `shard_file_name` +
   /// [`crate::io::save_safetensors_view`] directly, then confirms a
   /// hand-built 2-shard layout — published with its `weight_map` index —
-  /// reloads via [`load_weights`] (index-honoring path).
+  /// reloads via [`load_weights`] (index-honoring path). Asserts the
+  /// generation-tagged naming scheme (`model-gen-{ts}-{idx:05}-of-{N:05}
+  /// .safetensors`) at the basename level + that the on-disk files exactly
+  /// match the index's `weight_map` values.
   #[test]
   fn save_model_multi_shard_naming_and_index_reload() {
     let dir = fresh_dir("save-model-multi");
@@ -2065,20 +2173,30 @@ mod save_tests {
     let w1 = Array::from_slice::<f32>(&[20.0, 21.0], &(2usize,)).unwrap();
     let shards: Vec<Shard<'_>> = vec![BTreeMap::from([("w0", &w0)]), BTreeMap::from([("w1", &w1)])];
     let count = shards.len();
+    // Single generation timestamp for the whole save — exactly what
+    // `save_model` does internally.
+    let gen_ms: u128 = 1_234_567_890_123;
     let mut meta: HashMap<String, String> = HashMap::new();
     meta.insert("format".to_string(), "mlx".to_string());
     let mut weight_map: BTreeMap<String, String> = BTreeMap::new();
+    let mut written_basenames: Vec<String> = Vec::new();
     for (i, s) in shards.iter().enumerate() {
-      let name = shard_file_name(i + 1, count);
+      let name = shard_file_name(gen_ms, i + 1, count);
+      // Generation-tagged scheme + zero-padded indices.
       assert_eq!(
         name,
-        format!("model-{:05}-of-{:05}.safetensors", i + 1, count)
+        format!(
+          "model-gen-{gen_ms}-{:05}-of-{:05}.safetensors",
+          i + 1,
+          count
+        )
       );
       crate::io::save_safetensors_view(&dir.join(&name), s.iter().map(|(&k, &v)| (k, v)), &meta)
         .unwrap();
       for &k in s.keys() {
         weight_map.insert(k.to_string(), name.clone());
       }
+      written_basenames.push(name);
     }
     // The index makes the shard set discoverable by the index-honoring
     // [`load_weights`] path (without it, an absent `model.safetensors` /
@@ -2093,6 +2211,27 @@ mod save_tests {
       "test: 2-shard index",
     )
     .unwrap();
+
+    // Indices listed in the JSON exactly match the on-disk shard files
+    // (no orphan shards on disk, no dangling index references).
+    let on_disk: std::collections::BTreeSet<String> = collect_sorted(&dir, |n| {
+      n.starts_with("model-gen-") && n.ends_with(".safetensors")
+    })
+    .unwrap()
+    .into_iter()
+    .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+    .collect();
+    let indexed: std::collections::BTreeSet<String> = weight_map.values().cloned().collect();
+    assert_eq!(
+      on_disk, indexed,
+      "index `weight_map` values must exactly match the on-disk shard set"
+    );
+    let expected: std::collections::BTreeSet<String> = written_basenames.into_iter().collect();
+    assert_eq!(
+      indexed, expected,
+      "index lists every generation-tagged shard we wrote, no more, no less"
+    );
+
     // Both shard files reload + merge via the index-honoring `load_weights`.
     let mut loaded = load_weights(&dir).unwrap();
     assert_eq!(loaded.len(), 2);
@@ -2178,8 +2317,16 @@ mod save_tests {
 
     save(&dir, &w, config, &PerLayerQuantization::default()).unwrap();
 
-    // Weights side.
-    assert!(dir.join("model.safetensors").is_file());
+    // Weights side: a single generation-tagged shard plus the index.
+    let shards = collect_sorted(&dir, |n| {
+      n.starts_with("model-gen-") && n.ends_with(".safetensors")
+    })
+    .unwrap();
+    assert_eq!(
+      shards.len(),
+      1,
+      "the save driver produced exactly one generation-tagged shard"
+    );
     assert!(dir.join("model.safetensors.index.json").is_file());
     let mut loaded = load_weights(&dir).unwrap();
     assert_eq!(
@@ -2201,25 +2348,25 @@ mod save_tests {
     let _ = std::fs::remove_dir_all(&dir);
   }
 
-  // ─────────────────────── save_model idempotency ───────────────────────
+  // ─────────────────────── save_model overwrite semantics ───────────────────────
 
-  /// `save_model` is idempotent: overwriting a *multi-shard* checkpoint
-  /// with a *smaller single-shard* one must leave the destination holding
-  /// ONLY the new checkpoint — no stale `model-0000N-of-…safetensors`
-  /// shards may survive. (mlxrs [`load_weights`] merges every
-  /// `model*.safetensors` in the dir, so a stale shard would silently
-  /// resurrect dead tensors.) A pre-existing 3-shard layout is hand-written
-  /// (the same `save_safetensors_view` primitive `save_model` uses, since
-  /// `save_model` hard-codes the 5-GiB cap and cannot be coerced into
-  /// multi-shard from tiny weights), then `save_model` rewrites the dir
-  /// with two small weights → one `model.safetensors`. After the save the
-  /// dir must contain exactly `model.safetensors`, no `model-*-of-*` files,
-  /// and `load_weights` must see only the two new keys.
+  /// Overwriting a pre-existing checkpoint with the structurally-different
+  /// generation-tagged naming: the loader follows the NEW index, so only
+  /// the new weights are visible. Stale-shard files from the OLD
+  /// checkpoint may remain on disk as orphans — they are deliberately
+  /// invisible to load (the index is the authoritative manifest) and
+  /// they are NOT inline-cleaned by `save_model` (the inline cleanup was
+  /// removed in F6 round-5 because it raced concurrent readers; see
+  /// `save_model` rustdoc). This test asserts the *load* contract — only
+  /// the new keys appear — while letting orphan shards exist on disk;
+  /// `save_model_no_overwrite_of_old_shards` covers the on-disk side.
   #[test]
-  fn save_model_overwrite_multi_shard_with_single_is_idempotent() {
-    let dir = fresh_dir("save-model-idempotent");
+  fn save_model_overwrite_loads_only_new_weights() {
+    let dir = fresh_dir("save-model-overwrite-loads-new");
 
-    // Stale 3-shard checkpoint, hand-written with the multi-shard names.
+    // Stale 3-shard checkpoint, hand-written with the OLD reference-
+    // style multi-shard names (the form a pre-F6-round-5 build, or any
+    // hand-crafted checkpoint, could leave behind).
     let stale_vals = [
       ("stale.a.weight", vec![100.0_f32]),
       ("stale.b.weight", vec![200.0_f32, 201.0]),
@@ -2234,12 +2381,12 @@ mod save_tests {
     let stale_count = stale_arrays.len();
     let mut stale_map: BTreeMap<String, String> = BTreeMap::new();
     for (i, (k, arr)) in stale_arrays.iter().enumerate() {
-      let name = shard_file_name(i + 1, stale_count);
+      let name = format!("model-{:05}-of-{:05}.safetensors", i + 1, stale_count);
       crate::io::save_safetensors_view(&dir.join(&name), std::iter::once((*k, arr)), &meta)
         .unwrap();
       stale_map.insert((*k).to_string(), name);
     }
-    // A stale index too — the new save must overwrite it (same name).
+    // A stale index too — the new save's index rename overwrites it.
     write_json_pretty(
       &dir.join("model.safetensors.index.json"),
       &serde_json::json!({
@@ -2249,10 +2396,6 @@ mod save_tests {
       "test: stale index",
     )
     .unwrap();
-    // Sanity: three multi-shard files are present before the overwrite.
-    assert!(dir.join("model-00001-of-00003.safetensors").is_file());
-    assert!(dir.join("model-00002-of-00003.safetensors").is_file());
-    assert!(dir.join("model-00003-of-00003.safetensors").is_file());
 
     // Overwrite with a smaller single-shard checkpoint.
     let mut new_w: Weights = HashMap::new();
@@ -2266,33 +2409,9 @@ mod save_tests {
     );
     save_model(&dir, &new_w, &PerLayerQuantization::default()).unwrap();
 
-    // Destination holds ONLY the new single shard — no stale shards left.
-    assert!(dir.join("model.safetensors").is_file());
-    assert!(
-      !dir.join("model-00001-of-00003.safetensors").exists(),
-      "stale shard 1 must be removed"
-    );
-    assert!(
-      !dir.join("model-00002-of-00003.safetensors").exists(),
-      "stale shard 2 must be removed"
-    );
-    assert!(
-      !dir.join("model-00003-of-00003.safetensors").exists(),
-      "stale shard 3 must be removed"
-    );
-    // Exactly one `model*.safetensors` survives.
-    let survivors = collect_sorted(&dir, |n| {
-      n.starts_with("model") && n.ends_with(".safetensors")
-    })
-    .unwrap();
-    assert_eq!(
-      survivors.len(),
-      1,
-      "exactly one shard file after an idempotent overwrite"
-    );
-
-    // `load_weights` sees ONLY the new checkpoint's keys (no resurrected
-    // stale tensors).
+    // `load_weights` sees ONLY the new checkpoint's keys — the stale
+    // shards on disk are invisible because the new index does not list
+    // them.
     let mut loaded = load_weights(&dir).unwrap();
     assert_eq!(loaded.len(), 2, "only the two new weights load back");
     assert!(loaded.contains_key("fresh.x.weight"));
@@ -2309,20 +2428,30 @@ mod save_tests {
       vec![1.0, 2.0]
     );
 
-    // The index `weight_map` lists only the new keys, all → model.safetensors.
+    // The index `weight_map` lists only the new keys; their values
+    // reference exactly one generation-tagged shard.
     let index_text = std::fs::read_to_string(dir.join("model.safetensors.index.json")).unwrap();
     let index: serde_json::Value = serde_json::from_str(&index_text).unwrap();
     let wm = index["weight_map"].as_object().unwrap();
     assert_eq!(wm.len(), 2);
-    assert_eq!(wm["fresh.x.weight"], "model.safetensors");
-    assert_eq!(wm["fresh.y.weight"], "model.safetensors");
+    let shard_x = wm["fresh.x.weight"].as_str().unwrap();
+    let shard_y = wm["fresh.y.weight"].as_str().unwrap();
+    assert_eq!(
+      shard_x, shard_y,
+      "both new weights land in the same single shard"
+    );
+    assert!(
+      shard_x.starts_with("model-gen-") && shard_x.ends_with("-00001-of-00001.safetensors"),
+      "new shard is generation-tagged: got {shard_x}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
   }
 
-  /// Re-saving the *same* checkpoint to a directory is a no-op on the file
-  /// set (a plain idempotency check on the common single-shard path: the
-  /// one shard is rewritten, nothing stale, nothing removed).
+  /// Re-saving the *same* checkpoint to a directory is a structurally
+  /// safe operation: each save publishes its own generation-tagged
+  /// shard, and the loader follows the latest index. The test asserts
+  /// the load contract is stable across two consecutive saves.
   #[test]
   fn save_model_resave_same_checkpoint_is_stable() {
     let dir = fresh_dir("save-model-resave");
@@ -2332,14 +2461,128 @@ mod save_tests {
     save_model(&dir, &w, &PerLayerQuantization::default()).unwrap();
     save_model(&dir, &w, &PerLayerQuantization::default()).unwrap();
 
-    let survivors = collect_sorted(&dir, |n| {
-      n.starts_with("model") && n.ends_with(".safetensors")
-    })
-    .unwrap();
-    assert_eq!(survivors.len(), 1, "single shard, stable across re-saves");
-    let loaded = load_weights(&dir).unwrap();
+    // Each save writes its own generation-tagged shard; the loader sees
+    // exactly the latest one (one entry in the index, one weight loaded).
+    let mut loaded = load_weights(&dir).unwrap();
     assert_eq!(loaded.len(), 1);
     assert!(loaded.contains_key("m.w.weight"));
+    assert_eq!(
+      loaded
+        .get_mut("m.w.weight")
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap(),
+      vec![0.0, 0.0, 0.0, 0.0]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// Generation-unique shard names mean a NEW save can never overwrite an
+  /// OLD save's shard files on disk: after two consecutive saves to the
+  /// same directory, BOTH saves' shard files coexist on disk, but only
+  /// the SECOND save's shards are listed in the current index, and the
+  /// loader returns exactly the second save's weights. This is the load-
+  /// time guarantee the inline-cleanup removal trades for: prior-
+  /// generation shards leak disk space but never corrupt the
+  /// previously-valid checkpoint.
+  #[test]
+  fn save_model_no_overwrite_of_old_shards() {
+    let dir = fresh_dir("save-no-overwrite");
+
+    // FIRST save: a single weight whose value is byte-distinct from the
+    // second save's, so a confused load would surface obviously.
+    let mut first: Weights = HashMap::new();
+    first.insert(
+      "w.first.weight".to_string(),
+      Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(3usize,)).unwrap(),
+    );
+    save_model(&dir, &first, &PerLayerQuantization::default()).unwrap();
+    let first_shards: Vec<String> = collect_sorted(&dir, |n| {
+      n.starts_with("model-gen-") && n.ends_with(".safetensors")
+    })
+    .unwrap()
+    .into_iter()
+    .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+    .collect();
+    assert_eq!(first_shards.len(), 1, "first save writes one shard");
+
+    // Sleep so the millisecond timestamps of the two saves cannot
+    // coincide (a 1-ms tick is enough; we add a small margin for
+    // coarser-clock CI).
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    // SECOND save: a different weight name + value.
+    let mut second: Weights = HashMap::new();
+    second.insert(
+      "w.second.weight".to_string(),
+      Array::from_slice::<f32>(&[10.0, 20.0], &(2usize,)).unwrap(),
+    );
+    save_model(&dir, &second, &PerLayerQuantization::default()).unwrap();
+    let all_shards: Vec<String> = collect_sorted(&dir, |n| {
+      n.starts_with("model-gen-") && n.ends_with(".safetensors")
+    })
+    .unwrap()
+    .into_iter()
+    .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+    .collect();
+
+    // (1) Both saves' shard files coexist on disk — the second save did
+    // NOT inline-clean the first save's shard (no overwrite was possible
+    // because the basenames carry different generation timestamps).
+    assert_eq!(
+      all_shards.len(),
+      2,
+      "both saves' shard files coexist on disk (no inline cleanup); got {all_shards:?}"
+    );
+    for s in &first_shards {
+      assert!(
+        all_shards.contains(s),
+        "the first save's shard {s} must survive the second save"
+      );
+    }
+
+    // (2) Only the SECOND save's shards are listed in the current
+    // index — the orphan first-save shards are invisible to load.
+    let index_text = std::fs::read_to_string(dir.join("model.safetensors.index.json")).unwrap();
+    let index: serde_json::Value = serde_json::from_str(&index_text).unwrap();
+    let wm = index["weight_map"].as_object().unwrap();
+    assert_eq!(wm.len(), 1, "second save's index lists one weight");
+    let indexed: std::collections::BTreeSet<String> = wm
+      .values()
+      .filter_map(|v| v.as_str().map(|s| s.to_string()))
+      .collect();
+    assert_eq!(
+      indexed.len(),
+      1,
+      "all keys in the new index reference exactly one shard"
+    );
+    let indexed_shard = indexed.iter().next().unwrap().clone();
+    assert!(
+      !first_shards.contains(&indexed_shard),
+      "the second save's index must not reference the first save's shard"
+    );
+
+    // (3) The loader returns exactly the SECOND save's weights via the
+    // new index — no resurrected first-save tensors.
+    let mut loaded = load_weights(&dir).unwrap();
+    assert_eq!(loaded.len(), 1, "load sees only the new checkpoint");
+    assert!(
+      loaded.contains_key("w.second.weight"),
+      "the second save's weight loads"
+    );
+    assert!(
+      !loaded.contains_key("w.first.weight"),
+      "the first save's weight is invisible to load (orphan on disk only)"
+    );
+    assert_eq!(
+      loaded
+        .get_mut("w.second.weight")
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap(),
+      vec![10.0, 20.0]
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
   }
 
@@ -2374,7 +2617,20 @@ mod save_tests {
       Array::from_slice::<f32>(&[4.0, 5.0], &(2usize,)).unwrap(),
     );
     save_model(&dir, &orig, &PerLayerQuantization::default()).unwrap();
-    assert!(dir.join("model.safetensors").is_file());
+    // The original generation-tagged shard set (snapshotted before the
+    // failed save so we can assert it survives byte-identical).
+    let orig_shards: Vec<std::path::PathBuf> = collect_sorted(&dir, |n| {
+      n.starts_with("model-gen-") && n.ends_with(".safetensors")
+    })
+    .unwrap();
+    assert!(
+      !orig_shards.is_empty(),
+      "the original save produced at least one generation-tagged shard"
+    );
+    let orig_shard_bytes: BTreeMap<std::path::PathBuf, Vec<u8>> = orig_shards
+      .iter()
+      .map(|p| (p.clone(), std::fs::read(p).unwrap()))
+      .collect();
     let orig_index = std::fs::read_to_string(dir.join("model.safetensors.index.json")).unwrap();
 
     // 2. Make the directory read-only so the next save's tempfile
@@ -2428,6 +2684,21 @@ mod save_tests {
       orig_index,
       "the original index.json must survive the failed save unchanged"
     );
+    // Every original generation-tagged shard file is still on disk and
+    // byte-identical to its pre-failed-save state.
+    for (path, bytes) in &orig_shard_bytes {
+      assert!(
+        path.is_file(),
+        "original shard {} must survive the failed save",
+        path.display()
+      );
+      assert_eq!(
+        &std::fs::read(path).unwrap(),
+        bytes,
+        "original shard {} must be byte-identical after the failed save",
+        path.display()
+      );
+    }
     let leftover_tmp = std::fs::read_dir(&dir)
       .unwrap()
       .filter_map(|e| e.ok())
@@ -2445,33 +2716,35 @@ mod save_tests {
   }
 
   /// Failure-atomic save, rename-failure branch: when the final atomic
-  /// `rename` fails (here a final shard name pre-exists as a **directory**,
-  /// which `fs::rename(file -> dir)` rejects), every staged
-  /// `.tmp.safetensors` is cleaned up — no leftover tempfile. This reaches
-  /// the write-succeeds / rename-fails path the read-only-dir test (which
-  /// fails earlier, at tempfile *create*) does not.
+  /// `rename` of the **index** fails (here the index path pre-exists as a
+  /// **directory**, which `fs::rename(file -> dir)` rejects), every staged
+  /// `.tmp.safetensors` is cleaned up — no leftover tempfile. Note that
+  /// the shard renames *do* succeed (their basenames are generation-
+  /// tagged and never collide with any pre-existing file), so this test
+  /// exercises specifically the index-rename failure path; the renamed
+  /// shards become orphan files (deliberately not inline-cleaned).
   #[test]
   fn save_model_failed_save_rename_failure_cleans_up_tempfiles() {
     let dir = fresh_dir("save-model-failed-rename");
-    // A single-shard `save_model` renames its shard tempfile over
-    // `model.safetensors`; pre-create that name as a directory so the
-    // rename (file -> dir) fails after the tempfile is written + fsynced.
-    std::fs::create_dir_all(dir.join("model.safetensors")).unwrap();
+    // Pre-create the INDEX path as a directory so the final
+    // `rename(file -> dir)` of the staged index fails.
+    std::fs::create_dir_all(dir.join("model.safetensors.index.json")).unwrap();
 
     let mut w: Weights = HashMap::new();
     w.insert("m.w.weight".to_string(), f32_weight(4));
     let r = save_model(&dir, &w, &PerLayerQuantization::default());
     assert!(
       r.is_err(),
-      "rename of a shard onto an existing directory must fail"
+      "rename of the index onto an existing directory must fail"
     );
 
-    // `model.safetensors` is still the (untouched) directory.
+    // The colliding directory at the index path is untouched.
     assert!(
-      dir.join("model.safetensors").is_dir(),
-      "the colliding directory must be left untouched"
+      dir.join("model.safetensors.index.json").is_dir(),
+      "the colliding directory at the index path must be left untouched"
     );
-    // No `.tmp.safetensors` leftover — every staged tempfile was removed.
+    // No `.tmp.safetensors` leftover — every staged tempfile was removed
+    // on the rename-failure cleanup path.
     let leftover_tmp = std::fs::read_dir(&dir)
       .unwrap()
       .filter_map(|e| e.ok())
@@ -2804,11 +3077,11 @@ mod save_tests {
   /// OLD `model.safetensors.index.json` untouched. The failure is injected
   /// by pre-creating `model.safetensors.index.json` as a *directory* so the
   /// final atomic `rename(file -> dir)` fails after every shard has been
-  /// renamed into place. The OLD shards have non-colliding names (a
-  /// 2-shard old layout is overwritten by a 1-shard new layout, so the
-  /// new `model.safetensors` rename creates a brand-new file — the OLD
+  /// renamed into place. Because new shards are generation-tagged
+  /// (`model-gen-{ts}-…`), the renames never collide with the OLD
   /// `model-00001-of-00002.safetensors` and
-  /// `model-00002-of-00002.safetensors` are untouched).
+  /// `model-00002-of-00002.safetensors` files — the OLD shards are
+  /// untouched by construction.
   #[test]
   fn save_model_torn_publish_before_index_rename_keeps_old_checkpoint() {
     let dir = fresh_dir("torn-publish-before-index-rename");
@@ -2839,10 +3112,6 @@ mod save_tests {
       "old.b.weight".to_string(),
       "model-00002-of-00002.safetensors".to_string(),
     );
-    // We DELIBERATELY do NOT write `model.safetensors.index.json` as a
-    // file yet — we'll plant a directory at that name so the final index
-    // rename fails. The OLD index lives in `model.safetensors.index.json.OLD`
-    // for the test's reference comparison.
     let old_index_text = serde_json::to_string(&serde_json::json!({
       "metadata": { "total_size": 20, "total_parameters": 5 },
       "weight_map": old_wm,
@@ -2886,8 +3155,7 @@ mod save_tests {
       "the index rename onto an existing directory must fail"
     );
 
-    // 4. The OLD shards must be untouched (their names didn't collide
-    //    with the NEW `model.safetensors`, which the rename DID create).
+    // 4. The OLD shards must be untouched, and byte-identical.
     let old_a_path = dir.join("model-00001-of-00002.safetensors");
     let old_b_path = dir.join("model-00002-of-00002.safetensors");
     assert!(
@@ -2898,13 +3166,19 @@ mod save_tests {
       old_b_path.is_file(),
       "OLD shard 2 must survive the failed save"
     );
-    // The NEW `model.safetensors` was renamed into place before the
-    // failed index rename; load ignores it as long as it isn't indexed.
-    // The OLD index doesn't list it, so it's invisible to a load via
-    // the OLD index — exactly the design's promise.
-    assert!(
-      dir.join("model.safetensors").is_file(),
-      "the NEW shard rename SHOULD have succeeded (it's the index rename that fails); this asserts the torn-publish scenario the test is targeting"
+    // The NEW shard was renamed into place before the failed index
+    // rename; load ignores it as long as it isn't indexed. The OLD index
+    // doesn't list it, so it's invisible to a load via the OLD index —
+    // exactly the design's promise.
+    let new_shards_on_disk: Vec<std::path::PathBuf> = collect_sorted(&dir, |n| {
+      n.starts_with("model-gen-") && n.ends_with(".safetensors")
+    })
+    .unwrap();
+    assert_eq!(
+      new_shards_on_disk.len(),
+      1,
+      "the NEW shard rename SHOULD have succeeded (it's the index rename that fails); \
+       this asserts the torn-publish scenario the test is targeting"
     );
     // No staged tempfile remains.
     let leftover_tmp = std::fs::read_dir(&dir)
@@ -2922,8 +3196,8 @@ mod save_tests {
 
     // 5. Restore the OLD index file (replacing the directory we used as
     //    the failure lever) and confirm load follows it to the still-
-    //    intact OLD shards. The NEW `model.safetensors` is on disk but
-    //    is invisible — load only sees the OLD-indexed shards.
+    //    intact OLD shards. The NEW shard is on disk but is invisible —
+    //    load only sees the OLD-indexed shards.
     std::fs::remove_dir_all(dir.join("model.safetensors.index.json")).unwrap();
     std::fs::write(
       dir.join("model.safetensors.index.json"),
@@ -2959,6 +3233,142 @@ mod save_tests {
       "the NEW shard is on disk but the OLD index ignores it"
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// The new torn-publish guarantee, end-to-end via the public
+  /// [`save_model`] API: stage a save over an EXISTING checkpoint,
+  /// complete shard staging + shard renames, then fail the index rename
+  /// (by planting a directory at the index destination path). Because
+  /// the NEW shard basenames are generation-tagged, they cannot
+  /// overwrite the OLD shards — and the OLD index is left intact, so
+  /// the loader still returns the OLD checkpoint EXACTLY.
+  ///
+  /// Distinct from `save_model_torn_publish_before_index_rename_keeps_old_checkpoint`:
+  /// that test hand-builds the OLD layout with the reference-style names
+  /// to assert the structural intent; this one round-trips through
+  /// `save_model` for both saves to prove the end-to-end guarantee
+  /// holds against the production code path.
+  #[test]
+  fn save_model_torn_after_shard_rename_before_index_rename_keeps_old_checkpoint() {
+    let dir = fresh_dir("torn-after-shard-before-index");
+
+    // 1. FIRST save: produce a legitimate checkpoint via `save_model`.
+    let mut first: Weights = HashMap::new();
+    first.insert(
+      "first.alpha.weight".to_string(),
+      Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(3usize,)).unwrap(),
+    );
+    first.insert(
+      "first.beta.weight".to_string(),
+      Array::from_slice::<f32>(&[4.0, 5.0], &(2usize,)).unwrap(),
+    );
+    save_model(&dir, &first, &PerLayerQuantization::default()).unwrap();
+
+    // Snapshot the OLD checkpoint: every shard's bytes + the OLD index
+    // body, all for a post-failure byte-equality check.
+    let old_shard_paths: Vec<std::path::PathBuf> = collect_sorted(&dir, |n| {
+      n.starts_with("model-gen-") && n.ends_with(".safetensors")
+    })
+    .unwrap();
+    assert!(
+      !old_shard_paths.is_empty(),
+      "first save produced at least one shard"
+    );
+    let old_shard_bytes: BTreeMap<std::path::PathBuf, Vec<u8>> = old_shard_paths
+      .iter()
+      .map(|p| (p.clone(), std::fs::read(p).unwrap()))
+      .collect();
+    let old_index_text = std::fs::read_to_string(dir.join("model.safetensors.index.json")).unwrap();
+
+    // 2. Plant a directory at the index path AFTER removing the OLD
+    //    index file (so the OLD shards still sit on disk untouched, but
+    //    the next `save_model`'s index rename will fail).
+    std::fs::remove_file(dir.join("model.safetensors.index.json")).unwrap();
+    std::fs::create_dir_all(dir.join("model.safetensors.index.json")).unwrap();
+
+    // Sleep so the generation timestamp of the second save is guaranteed
+    // distinct from the first save's, even on coarser-clock platforms.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    // 3. SECOND save: must fail at the index rename, after the new
+    //    shard(s) have been renamed into place.
+    let mut second: Weights = HashMap::new();
+    second.insert(
+      "second.gamma.weight".to_string(),
+      Array::from_slice::<f32>(&[100.0, 200.0], &(2usize,)).unwrap(),
+    );
+    let r = save_model(&dir, &second, &PerLayerQuantization::default());
+    assert!(
+      r.is_err(),
+      "the index rename onto an existing directory must fail"
+    );
+
+    // 4. Every OLD shard is still on disk + byte-identical to its
+    //    pre-failed-save state (the unique generation-tagged basenames
+    //    of the SECOND save guaranteed they could not overwrite anything).
+    for (path, bytes) in &old_shard_bytes {
+      assert!(
+        path.is_file(),
+        "OLD shard {} must survive the failed save",
+        path.display()
+      );
+      assert_eq!(
+        &std::fs::read(path).unwrap(),
+        bytes,
+        "OLD shard {} must be byte-identical after the failed save",
+        path.display()
+      );
+    }
+
+    // 5. Restore the OLD index file (replacing the failure-lever
+    //    directory) and confirm the loader returns the OLD checkpoint
+    //    EXACTLY — no resurrected second-save weights.
+    std::fs::remove_dir_all(dir.join("model.safetensors.index.json")).unwrap();
+    std::fs::write(
+      dir.join("model.safetensors.index.json"),
+      old_index_text.as_bytes(),
+    )
+    .unwrap();
+    let mut loaded = load_weights(&dir).unwrap();
+    assert_eq!(loaded.len(), 2);
+    assert!(loaded.contains_key("first.alpha.weight"));
+    assert!(loaded.contains_key("first.beta.weight"));
+    assert!(
+      !loaded.contains_key("second.gamma.weight"),
+      "the SECOND save's shard is on disk but the OLD index ignores it"
+    );
+    assert_eq!(
+      loaded
+        .get_mut("first.alpha.weight")
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap(),
+      vec![1.0, 2.0, 3.0]
+    );
+    assert_eq!(
+      loaded
+        .get_mut("first.beta.weight")
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap(),
+      vec![4.0, 5.0]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// Smoke test the `fsync_dir` helper: open + fsync + close on a
+  /// writable tmpdir works without error. The function returns
+  /// `io::Result<()>` rather than `Result<()>` so the call sites in
+  /// `save_model` / `commit_staged_config` wrap with their own error
+  /// context.
+  #[test]
+  fn fsync_dir_helper_basic() {
+    let dir = fresh_dir("fsync-dir-helper");
+    // Sanity: the helper signature is `fsync_dir(&Path) -> io::Result<()>`.
+    let r: std::io::Result<()> = fsync_dir(&dir);
+    r.expect("fsync_dir must succeed on a writable tmpdir");
     let _ = std::fs::remove_dir_all(&dir);
   }
 
@@ -2998,7 +3408,12 @@ mod save_tests {
       m
     };
     let before = snapshot(&dir);
-    assert!(before.contains_key("model.safetensors"));
+    assert!(
+      before
+        .keys()
+        .any(|k| k.starts_with("model-gen-") && k.ends_with(".safetensors")),
+      "the initial save produced a generation-tagged shard"
+    );
     assert!(before.contains_key("model.safetensors.index.json"));
     assert!(before.contains_key("config.json"));
 
