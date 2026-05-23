@@ -25,6 +25,11 @@
 //!      │   weights                       =  load::load_weights(model_path)
 //!      │   quant                         =  parse_quantization(config_json_text)
 //!      ▼
+//!   validate source tokenizer is loadable        (mirrors convert.rs:644 — fail-fast
+//!      │   _ = load::load_tokenizer(model_path, &cfg_typed)?;     before any save IO so a
+//!      ▼                                                          missing/malformed
+//!                                                                 tokenizer can't ship a
+//!                                                                 silent unloadable dir)
 //!   read adapter config ONCE (shared by load + save) (fuse.py:65 → load_adapters reads this)
 //!      │   lora_cfg = lora::read_adapter_config(adapter_path)
 //!      │   fifo     = lora_cfg.fan_in_fan_out()  // PEFT-only, false on mlx-lm-native
@@ -151,6 +156,13 @@ use crate::{
 /// - Missing `model_path` / missing or unreadable `config.json` / no
 ///   safetensors → [`Error::Backend`] from [`load::load_config`] /
 ///   [`load::load_weights`].
+/// - Missing or malformed `model_path/tokenizer.json` (or unparseable
+///   `tokenizer_config.json` if present) → [`Error::Backend`] from
+///   [`load::load_tokenizer`]. Validated BEFORE any save-side IO so a
+///   source without a usable tokenizer fails fast — the alternative
+///   (leaving the validation to the post-save `copy_tokenizer_and_extras`
+///   step) would silently skip absent files and produce an unloadable
+///   `save_path` while returning `Ok(())`.
 /// - Missing `adapter_path` / missing `adapter_config.json` / missing
 ///   adapter weights file / config drift → [`Error::Backend`] from
 ///   [`lora::load_adapters`] (see that function's docs for the full list).
@@ -206,6 +218,26 @@ pub fn fuse(
   // re-stat here.
   let (cfg_typed, config_json_text) = load::load_config(model_path)?;
   let weights = load::load_weights(model_path)?;
+
+  // (2a) Validate the source tokenizer is loadable BEFORE any save work
+  // begins. The `tokenizer` itself is unused on this side (mlxrs's
+  // tokenizer surface is load-only; the on-disk tokenizer files are
+  // copied verbatim by `copy_tokenizer_and_extras` later); the call is
+  // a side-effect parse to prove the source directory has a usable
+  // `tokenizer.json` (+ optional `tokenizer_config.json` schema) so a
+  // missing / malformed source tokenizer surfaces HERE rather than
+  // silently producing an unloadable `save_path` (the prior shape called
+  // [`copy_tokenizer_and_extras`] after save, which silently skips an
+  // absent source file — so a missing source `tokenizer.json` would let
+  // `fuse()` return `Ok(())` while the saved dir was structurally
+  // incomplete and [`lm::load::load(save_path)`] would fail at
+  // tokenizer construction with a `tokenizer.json: No such file …` error).
+  //
+  // Mirrors [`crate::lm::convert::convert`]'s `let _tokenizer =
+  // load::load_tokenizer(&hf_path, &cfg_typed)?;` line — same shape,
+  // same purpose, same place in the pipeline (after config + weights
+  // load, before any save-side IO).
+  let _tokenizer = load::load_tokenizer(model_path, &cfg_typed)?;
 
   // (3) Parse the on-disk per-layer quantization block (the loaded
   // quantized triples' scheme). Carried through `load_adapters` (so

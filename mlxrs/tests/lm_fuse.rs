@@ -32,7 +32,10 @@
 //! - `fuse_output_is_loadable_through_default_lm_loader` — fuse output dir
 //!   loads end-to-end through `lm::load::load` (which constructs the
 //!   tokenizer from the same dir); a fused dir that shipped weights +
-//!   config only would silently fail to load.
+//!   config only would silently fail to load. R2 strengthens the assertion
+//!   to compare encodings across multiple probes (single-probe equality is
+//!   compatible with a partial-corruption that happens to agree on one
+//!   input).
 //! - `fuse_copies_all_tokenizer_extras_present_in_source` — every
 //!   `tokenizer.json` / `tokenizer_config.json` / `chat_template.jinja` /
 //!   `generation_config.json` present at `model_path` lands at `save_path`
@@ -45,6 +48,20 @@
 //!   (success — proves no second read) AND `load_adapters` (failure —
 //!   proves the wrapper still does its own parse), closing the TOCTOU
 //!   window `fuse` previously had.
+//! - `fuse_rejects_source_with_missing_tokenizer` (R2 Finding 2) — a model
+//!   dir WITHOUT `tokenizer.json` causes `fuse()` to fail BEFORE any save
+//!   work, preventing the prior silent-Ok / unloadable-destination
+//!   regression.
+//! - `fuse_rejects_source_with_malformed_tokenizer` (R2 Finding 2) — a
+//!   truncated `tokenizer.json` body fails the same fail-fast validation
+//!   (corrupt source bytes can't be silently shipped to the destination).
+//! - `fuse_overwrites_stale_destination_tokenizer` (R2 Finding 2) — a
+//!   `save_path` pre-populated with stale `tokenizer.json` bytes from a
+//!   different model has its contents OVERWRITTEN by the source's
+//!   tokenizer (the cross-model-contamination concern is mitigated by
+//!   `std::fs::copy`'s default-overwrite semantics; mlxrs `fuse` matches
+//!   fuse.py's permissive destination contract but the overwrite +
+//!   source-validate combo prevents stale data from leaking).
 //!
 //! No `peak_memory()` magnitude asserts (per project memory).
 #![cfg(feature = "lm")]
@@ -118,9 +135,53 @@ fn config_json_with_quant_blocks(num_hidden_layers: i32) -> String {
   )
 }
 
+/// A minimal valid `tokenizer.json` for the rust-tokenizers parser — a
+/// WordLevel model with three tokens. Small (sub-KB) so the fixture stays
+/// self-contained and the parse cost stays negligible. Shared by
+/// [`write_base_dir`] (the default-bundle fixture) and the loadable-output
+/// integration tests below.
+fn minimal_tokenizer_json() -> &'static str {
+  r#"{
+    "version": "1.0",
+    "truncation": null,
+    "padding": null,
+    "added_tokens": [],
+    "normalizer": null,
+    "pre_tokenizer": null,
+    "post_processor": null,
+    "decoder": null,
+    "model": {
+      "type": "WordLevel",
+      "vocab": { "<pad>": 0, "hello": 1, "world": 2 },
+      "unk_token": "<pad>"
+    }
+  }"#
+}
+
 /// Write a synthetic base-model directory: `config.json` + a single
-/// `model.safetensors` carrying `weights`.
+/// `model.safetensors` carrying `weights` + a minimal valid
+/// `tokenizer.json`. The tokenizer is bundled by default so the R2
+/// validate-source-tokenizer-before-save step in `fuse()` is satisfied
+/// for every standard fixture — tests that EXPLICITLY want to exercise
+/// the missing-tokenizer / malformed-tokenizer error path use
+/// [`write_base_dir_no_tokenizer`] which skips the tokenizer write.
 fn write_base_dir(name: &str, weights: &HashMap<String, Array>, config_json: &str) -> PathBuf {
+  let dir = write_base_dir_no_tokenizer(name, weights, config_json);
+  fs::write(dir.join("tokenizer.json"), minimal_tokenizer_json()).unwrap();
+  dir
+}
+
+/// Variant of [`write_base_dir`] that does NOT write `tokenizer.json`.
+/// Used by the R2 missing-tokenizer / malformed-tokenizer tests to
+/// construct a structurally incomplete source directory; every OTHER
+/// fixture uses the bundled [`write_base_dir`] (so the R2
+/// validate-source-tokenizer step passes for the orthogonal
+/// fuse-behavior tests).
+fn write_base_dir_no_tokenizer(
+  name: &str,
+  weights: &HashMap<String, Array>,
+  config_json: &str,
+) -> PathBuf {
   let dir = temp_dir(name);
   let mut f = File::create(dir.join("config.json")).unwrap();
   f.write_all(config_json.as_bytes()).unwrap();
@@ -772,31 +833,16 @@ fn fuse_preserves_fan_in_fan_out_layout_for_square_target() {
 
 // ─────────────────────── tokenizer + extras copy ───────────────────────
 
-/// A minimal valid `tokenizer.json` for the rust-tokenizers parser — a
-/// WordLevel model with three tokens. Small (sub-KB) so the helper
-/// stays self-contained and the parse cost stays negligible.
-fn minimal_tokenizer_json() -> &'static str {
-  r#"{
-    "version": "1.0",
-    "truncation": null,
-    "padding": null,
-    "added_tokens": [],
-    "normalizer": null,
-    "pre_tokenizer": null,
-    "post_processor": null,
-    "decoder": null,
-    "model": {
-      "type": "WordLevel",
-      "vocab": { "<pad>": 0, "hello": 1, "world": 2 },
-      "unk_token": "<pad>"
-    }
-  }"#
-}
-
 /// Write a model dir that ALSO carries the union of tokenizer extras the
 /// loader / `copy_tokenizer_and_extras` cover — used by the loadable-output
-/// and extras-copied tests. Returns the dir + a map of `basename → bytes`
-/// so the caller can assert byte-identical content on the destination.
+/// and extras-copied tests. The bundled `tokenizer.json` from
+/// [`write_base_dir`] is OVERWRITTEN if the `extras` list also names
+/// `tokenizer.json` (so a test can substitute a different vocab without
+/// fighting the default). Returns the dir + a map of
+/// `basename → bytes` so the caller can assert byte-identical content on
+/// the destination — the default tokenizer.json is included so a caller
+/// asserting "byte-identical copy from source" without explicitly listing
+/// `tokenizer.json` in `extras` still has a baseline.
 fn write_base_dir_with_tokenizer_extras(
   name: &str,
   weights: &HashMap<String, Array>,
@@ -805,6 +851,10 @@ fn write_base_dir_with_tokenizer_extras(
 ) -> (PathBuf, HashMap<String, Vec<u8>>) {
   let dir = write_base_dir(name, weights, config_json);
   let mut written: HashMap<String, Vec<u8>> = HashMap::new();
+  written.insert(
+    "tokenizer.json".to_string(),
+    minimal_tokenizer_json().as_bytes().to_vec(),
+  );
   for (basename, bytes) in extras {
     let path = dir.join(basename);
     fs::write(&path, bytes).unwrap();
@@ -842,16 +892,27 @@ fn fuse_output_is_loadable_through_default_lm_loader() {
     load::load(&save_dir).expect("fused dir loads end-to-end through the default LM loader");
 
   // The tokenizer was loaded from the COPIED file — same vocab as source.
-  // Re-load directly from source to compare vocab-as-token-encoding.
+  // Re-load directly from source to compare vocab-as-token-encoding ACROSS
+  // MULTIPLE distinct probes (the previous single "hello world" probe could
+  // pass even with a partially-corrupted copy where most ids happen to match;
+  // R2 strengthens the assertion by exercising 3 disjoint strings — multi-word
+  // mix, single in-vocab token, plus a string with an out-of-vocab token —
+  // so an identity-failure on any one fails the test).
   let (_src_cfg, _src_w, src_tokenizer) =
     load::load(&model_dir).expect("source dir loads (sanity)");
-  let probe = "hello world";
-  let dst_ids = tokenizer.encode(probe, true).expect("dst encode");
-  let src_ids = src_tokenizer.encode(probe, true).expect("src encode");
-  assert_eq!(
-    dst_ids, src_ids,
-    "copied tokenizer encodes {probe:?} the same way as the source"
-  );
+  for probe in ["hello world", "hello", "world hello unknown"] {
+    let dst_ids = tokenizer.encode(probe, true).expect("dst encode");
+    let src_ids = src_tokenizer.encode(probe, true).expect("src encode");
+    assert_eq!(
+      dst_ids, src_ids,
+      "copied tokenizer encodes {probe:?} identically to the source"
+    );
+    assert!(
+      !dst_ids.is_empty(),
+      "encode of {probe:?} must produce at least one id (a silently empty \
+       tokenizer would compare equal but be broken downstream)"
+    );
+  }
 }
 
 #[test]
@@ -969,4 +1030,158 @@ fn fuse_load_adapters_with_config_skips_second_adapter_config_read() {
     }
     other => panic!("expected Error::Backend from the wrapper's re-parse, got {other:?}"),
   }
+}
+
+// ───────────────── R2 Finding 2 — tokenizer validate-before-save ─────────────────
+
+#[test]
+fn fuse_rejects_source_with_missing_tokenizer() {
+  // R2 Finding 2 — `fuse()` previously called `copy_tokenizer_and_extras`
+  // AFTER save and mapped its `Ok(_)` to `Ok(())` without checking that
+  // the source had a usable `tokenizer.json`. `copy_tokenizer_and_extras`
+  // silently SKIPS absent files, so a source without `tokenizer.json` let
+  // `fuse()` return `Ok(())` and the saved dir was unloadable through
+  // `lm::load::load(save_path)`.
+  //
+  // The fix mirrors `convert::convert`'s `let _tokenizer =
+  // load::load_tokenizer(&hf_path, &cfg_typed)?` line — validate source
+  // tokenizer BEFORE any save IO so an unloadable source surfaces fast
+  // with the source path in the error message.
+  let weights = toy_base_weights(2);
+  // `write_base_dir_no_tokenizer` is the only fixture that omits the
+  // bundled `tokenizer.json`; every other test uses `write_base_dir`,
+  // which now writes the minimal tokenizer by default.
+  let model_dir = write_base_dir_no_tokenizer("missing_tok_model", &weights, &plain_config_json(2));
+  assert!(
+    !model_dir.join("tokenizer.json").exists(),
+    "fixture precondition: source has no tokenizer.json"
+  );
+  let adapter_dir = write_mlxlm_adapter("missing_tok_adapter", &[0, 1], 2.0);
+  let save_dir = temp_dir("missing_tok_save");
+  fs::remove_dir_all(&save_dir).unwrap();
+
+  let err = fuse::fuse(&model_dir, &adapter_dir, &save_dir, false)
+    .expect_err("fuse() must reject a source dir missing tokenizer.json");
+  match err {
+    Error::Backend { message } => {
+      assert!(
+        message.contains("tokenizer"),
+        "diagnostic names the tokenizer-construction failure: {message}"
+      );
+      assert!(
+        message.contains(model_dir.to_str().unwrap())
+          || message.contains(model_dir.file_name().unwrap().to_str().unwrap()),
+        "diagnostic names the source path so the caller can fix the input: {message}"
+      );
+    }
+    other => panic!("expected Error::Backend, got {other:?}"),
+  }
+  // Critical: NO save artifacts may have landed in save_dir. The whole
+  // point of validate-before-save is to fail FAST so a doomed fuse
+  // doesn't leave a half-populated destination.
+  assert!(
+    !save_dir.join("config.json").exists(),
+    "no config.json may land on a tokenizer-validation failure"
+  );
+  assert!(
+    !save_dir.join("model.safetensors.index.json").exists(),
+    "no weight index may land on a tokenizer-validation failure"
+  );
+}
+
+#[test]
+fn fuse_rejects_source_with_malformed_tokenizer() {
+  // Same fail-fast contract as `fuse_rejects_source_with_missing_tokenizer`
+  // but with a truncated `tokenizer.json` body (the parser fails inside
+  // `HfTokenizer::from_file` rather than at the open). Both error paths
+  // funnel through `Error::Backend { message: "cannot load tokenizer
+  // from {}: ..." }` per `load::load_tokenizer`.
+  let weights = toy_base_weights(2);
+  let model_dir =
+    write_base_dir_no_tokenizer("malformed_tok_model", &weights, &plain_config_json(2));
+  // Truncated mid-object — the WordLevel parser must reject (the `vocab`
+  // value is required and missing the closing `}`).
+  fs::write(
+    model_dir.join("tokenizer.json"),
+    b"{ \"version\": \"1.0\", \"model\": { \"type\": \"WordLevel\", \"vocab\":",
+  )
+  .unwrap();
+  let adapter_dir = write_mlxlm_adapter("malformed_tok_adapter", &[0, 1], 2.0);
+  let save_dir = temp_dir("malformed_tok_save");
+  fs::remove_dir_all(&save_dir).unwrap();
+
+  let err = fuse::fuse(&model_dir, &adapter_dir, &save_dir, false)
+    .expect_err("fuse() must reject a source dir with a malformed tokenizer.json");
+  match err {
+    Error::Backend { message } => {
+      assert!(
+        message.contains("tokenizer"),
+        "diagnostic names the tokenizer-construction failure: {message}"
+      );
+    }
+    other => panic!("expected Error::Backend, got {other:?}"),
+  }
+  assert!(
+    !save_dir.join("config.json").exists(),
+    "no config.json may land on a malformed-tokenizer validation failure"
+  );
+}
+
+#[test]
+fn fuse_overwrites_stale_destination_tokenizer() {
+  // R2 Finding 2 stale-destination audit: convert REJECTS pre-existing
+  // destinations wholesale (`convert.rs:588`); fuse.py PERMITS them
+  // (writes-through via `save_pretrained`). mlxrs `fuse` matches fuse.py
+  // (permissive), but the cross-model-contamination concern from R2 is
+  // mitigated by `std::fs::copy`'s default-overwrite semantics: a stale
+  // `tokenizer.json` at `save_path` is OVERWRITTEN by the source's bytes
+  // during `copy_tokenizer_and_extras`.
+  //
+  // This test pre-populates `save_path` with stale (different-from-source)
+  // tokenizer bytes, runs `fuse`, and asserts the destination tokenizer is
+  // byte-identical to the SOURCE — not the stale pre-existing content.
+  let weights = toy_base_weights(2);
+  let model_dir = write_base_dir("stale_dst_model", &weights, &plain_config_json(2));
+  let source_tok = fs::read(model_dir.join("tokenizer.json")).expect("source tokenizer");
+  let adapter_dir = write_mlxlm_adapter("stale_dst_adapter", &[0, 1], 2.0);
+  let save_dir = temp_dir("stale_dst_save");
+  // Pre-populate save_dir with a stale tokenizer.json that DIFFERS
+  // structurally from the source — same WordLevel shape but a DIFFERENT
+  // vocab so a stale-leak would surface as an encoding mismatch downstream.
+  let stale_tok = br#"{
+    "version": "1.0",
+    "truncation": null,
+    "padding": null,
+    "added_tokens": [],
+    "normalizer": null,
+    "pre_tokenizer": null,
+    "post_processor": null,
+    "decoder": null,
+    "model": {
+      "type": "WordLevel",
+      "vocab": { "<pad>": 0, "STALE": 1, "GHOST": 2 },
+      "unk_token": "<pad>"
+    }
+  }"#;
+  fs::write(save_dir.join("tokenizer.json"), stale_tok).unwrap();
+  // Sanity: the stale bytes are NOT equal to the source bytes.
+  assert_ne!(
+    stale_tok.as_slice(),
+    source_tok.as_slice(),
+    "fixture precondition: stale destination differs from source"
+  );
+
+  fuse::fuse(&model_dir, &adapter_dir, &save_dir, false)
+    .expect("fuse must succeed on a permissive destination with stale tokenizer");
+
+  let dst_tok = fs::read(save_dir.join("tokenizer.json")).expect("post-fuse destination tokenizer");
+  assert_eq!(
+    dst_tok, source_tok,
+    "stale destination tokenizer must be OVERWRITTEN with the source's bytes (no cross-model contamination)"
+  );
+  assert_ne!(
+    dst_tok.as_slice(),
+    stale_tok.as_slice(),
+    "destination must NOT carry the stale pre-existing content after fuse"
+  );
 }
