@@ -11,7 +11,10 @@
 //! into its base, optionally also fully dequantize, and write the result to
 //! `save_path` as a self-contained adapter-free model.
 //!
-//! ## Pipeline (mirrors `mlx_lm/fuse.py:62-93`)
+//! ## Pipeline
+//!
+//! Mirrors `mlx_lm/fuse.py:62-93`, hardened past fuse.py's permissive
+//! post-save copy with a staging-dir tokenizer snapshot.
 //!
 //! ```text
 //!   fuse(model_path, adapter_path, save_path, dequantize)
@@ -25,11 +28,23 @@
 //!      │   weights                       =  load::load_weights(model_path)
 //!      │   quant                         =  parse_quantization(config_json_text)
 //!      ▼
-//!   validate source tokenizer is loadable        (mirrors convert.rs:644 — fail-fast
-//!      │   _ = load::load_tokenizer(model_path, &cfg_typed)?;     before any save IO so a
-//!      ▼                                                          missing/malformed
-//!                                                                 tokenizer can't ship a
-//!                                                                 silent unloadable dir)
+//!   create save_path + a unique `<save_path>/.staging-fuse-<pid>-<nanos>-<ctr>/`
+//!      │  staging dir (the snapshot bay — survives the fuse pipeline and is
+//!      │  guard-deleted on every exit path via [`StagingDir::Drop`])
+//!      ▼
+//!   snapshot tokenizer + extras INTO staging  (Codex R3 Findings 1+2 fix)
+//!      │   copy_tokenizer_and_extras(model_path, &staging_dir)?;
+//!      │   // freezes the EXACT bytes the fused dir will ship — eliminates
+//!      │   // the TOCTOU window where a re-read of `model_path` between
+//!      │   // validate (T0) and copy (T1) could surface different tokenizer
+//!      │   // bytes
+//!      ▼
+//!   validate the SNAPSHOT is loadable           (fuse.py validate-source equivalent,
+//!      │   _ = load::load_tokenizer(&staging_dir, &cfg_typed)?;     re-pointed at
+//!      ▼                                                            the staged bytes
+//!                                                                   so validate +
+//!                                                                   copy see the
+//!                                                                   SAME bytes)
 //!   read adapter config ONCE (shared by load + save) (fuse.py:65 → load_adapters reads this)
 //!      │   lora_cfg = lora::read_adapter_config(adapter_path)
 //!      │   fifo     = lora_cfg.fan_in_fan_out()  // PEFT-only, false on mlx-lm-native
@@ -54,8 +69,12 @@
 //!   save(save_path, &weights, &config_json, &per_layer)   (fuse.py:83-91 → save(...))
 //!      │
 //!      ▼
-//!   copy_tokenizer_and_extras(model_path, save_path)      (fuse.py:88 → save(..., tokenizer, ...))
-//!      │
+//!   promote staging → save_path                  (replaces fuse.py:88 `save(..., tokenizer, ...)`
+//!      │   for each staged file: rename into save_path (overwrites)         with the snapshot+
+//!      │   for each TOKENIZER_EXTRA_FILES name + every `*.py` at save_path: promote+stale-walk
+//!      │     if NOT present in staging → unlink (Codex R3 F1 fix —          shape that
+//!      │     stale extras the source didn't carry are dropped)              eliminates both
+//!      │   remove staging dir                                               findings)
 //!      ▼
 //!   Ok(())
 //! ```
@@ -76,7 +95,7 @@
 //!   GGUF-export driver against the fused model directory after this call
 //!   returns.
 //!
-//! ## Tokenizer + extras: copied from the source model directory
+//! ## Tokenizer + extras: snapshot-and-promote from the source dir
 //!
 //! `fuse.py:64,88` reads the tokenizer with the base model and hands it to
 //! `save(..., tokenizer, ...)` so the saved directory is a self-contained,
@@ -92,6 +111,47 @@
 //! after the weights / config — `load.rs:683-685`); a fused directory that
 //! shipped weights + config only would silently fail to load.
 //!
+//! ### Staging-dir snapshot (Codex R3 — two HIGH findings fixed structurally)
+//!
+//! The pre-R3 shape called [`crate::lm::convert::copy_tokenizer_and_extras`]
+//! directly into `save_path` and validated `model_path`'s tokenizer at a
+//! DIFFERENT time. Two related defects fell out:
+//!
+//! 1. **F1 — stale-extras retention.** A permissive destination (the
+//!    fuse.py contract) only had files OVERWRITTEN when the source carried
+//!    them. So a `save_path/generation_config.json` /
+//!    `save_path/chat_template.jinja` / `save_path/*.py` left over from a
+//!    PREVIOUS model SURVIVED the fuse when the new source lacked the same
+//!    file. [`crate::lm::load::load_config`] consumes the leftover
+//!    `generation_config.json` as the EOS override and the tokenizer surface
+//!    consumes the leftover `tokenizer_config.json` / `chat_template.jinja`,
+//!    so the output dir silently loads with wrong-model semantics — the
+//!    EXACT cross-model-contamination concern R2 raised but only mitigated
+//!    on the present-at-source axis (a `std::fs::copy` overwrite).
+//! 2. **F2 — validate vs copy TOCTOU.** `load_tokenizer(model_path)`
+//!    validated at `T0`; `copy_tokenizer_and_extras(model_path, save_path)`
+//!    re-read `model_path` at `T1`. Any mid-flight mutation (the source dir
+//!    gets a deleted / swapped / partially-written `tokenizer.json`)
+//!    surfaces as a fuse that returns `Ok(())` with the validated-tokenizer
+//!    contract met but the actually-shipped tokenizer different from (or
+//!    missing relative to) what was validated.
+//!
+//! The R3 fix collapses both defects with one structural change: copy
+//! tokenizer + extras into a unique `<save_path>/.staging-fuse-*` staging
+//! directory FIRST (freezes a snapshot of the source bytes), validate the
+//! SNAPSHOT (the same bytes that will be shipped), run the rest of the
+//! pipeline, then PROMOTE staging → `save_path` with a stale-extras
+//! sweep — unlink any [`TOKENIZER_EXTRA_FILES`]-family name or `*.py` at
+//! `save_path` that the snapshot does NOT carry. The promote is the
+//! single ship point: a failure BEFORE promote drops the staging dir on
+//! `Drop`, leaving `save_path` untouched (or, if `load::save` already
+//! committed the weights+config, the partial state is reported via
+//! [`Error::ConvertPostSavePartial`]); a failure AFTER promote is
+//! reported via [`Error::ConvertPostSavePartial`] too.
+//!
+//! [`TOKENIZER_EXTRA_FILES`]: crate::lm::convert
+//! [`Error::ConvertPostSavePartial`]: crate::Error::ConvertPostSavePartial
+//!
 //! ## API style
 //!
 //! Per [project memory `feedback_api_style`] the python kwarg surface
@@ -101,12 +161,12 @@
 //!
 //! [`Error::Backend`]: crate::Error::Backend
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::{
   error::{Error, Result},
   lm::{
-    convert::{self, CopyDurabilityWarnings, CopyOutcome},
+    convert::{self, TOKENIZER_EXTRA_FILES},
     load::{self, Weights},
     lora::{self, BaseEmbedding, BaseLinear, LoraLayer},
     quant::{self, PerLayerQuantization},
@@ -219,25 +279,84 @@ pub fn fuse(
   let (cfg_typed, config_json_text) = load::load_config(model_path)?;
   let weights = load::load_weights(model_path)?;
 
-  // (2a) Validate the source tokenizer is loadable BEFORE any save work
-  // begins. The `tokenizer` itself is unused on this side (mlxrs's
-  // tokenizer surface is load-only; the on-disk tokenizer files are
-  // copied verbatim by `copy_tokenizer_and_extras` later); the call is
-  // a side-effect parse to prove the source directory has a usable
-  // `tokenizer.json` (+ optional `tokenizer_config.json` schema) so a
-  // missing / malformed source tokenizer surfaces HERE rather than
-  // silently producing an unloadable `save_path` (the prior shape called
-  // [`copy_tokenizer_and_extras`] after save, which silently skips an
-  // absent source file — so a missing source `tokenizer.json` would let
-  // `fuse()` return `Ok(())` while the saved dir was structurally
-  // incomplete and [`lm::load::load(save_path)`] would fail at
-  // tokenizer construction with a `tokenizer.json: No such file …` error).
+  // (2a) **Snapshot tokenizer + extras into a staging dir.** Codex R3
+  // Findings 1+2 fix.
   //
-  // Mirrors [`crate::lm::convert::convert`]'s `let _tokenizer =
-  // load::load_tokenizer(&hf_path, &cfg_typed)?;` line — same shape,
-  // same purpose, same place in the pipeline (after config + weights
-  // load, before any save-side IO).
-  let _tokenizer = load::load_tokenizer(model_path, &cfg_typed)?;
+  // The pre-R3 shape did `let _ = load::load_tokenizer(model_path, ...)`
+  // here AND `copy_tokenizer_and_extras(model_path, save_path)` AFTER
+  // save — TWO `model_path` reads at two different times (TOCTOU window:
+  // F2), and the post-save copy only OVERWROTE files PRESENT at the
+  // source so any stale extras at the destination survived (F1).
+  //
+  // The R3 fix collapses both: copy `model_path`'s tokenizer + extras
+  // into a unique `<save_path>/.staging-fuse-*` directory FIRST so the
+  // bytes that will be shipped are frozen at a single point in time,
+  // then validate THAT SNAPSHOT (no second read of `model_path`), then
+  // (after the rest of the pipeline runs) promote the snapshot into
+  // `save_path` with a stale-extras sweep that unlinks any
+  // [`TOKENIZER_EXTRA_FILES`]-family name or `*.py` at `save_path` the
+  // snapshot does NOT carry.
+  //
+  // `save_path` is created up front so the staging directory has a
+  // parent to land in (the F6 `load::save` would create it later, but
+  // we need it now so the same-fs `std::fs::rename` of staged files
+  // into `save_path` during promote stays atomic — cross-fs renames
+  // silently degrade to copy+unlink and lose atomicity). The staging
+  // guard's [`Drop`] removes the staging dir on every error exit so a
+  // failure between here and promotion never leaves `<save_path>/.staging-fuse-*`
+  // junk on disk.
+  std::fs::create_dir_all(save_path).map_err(|e| Error::Backend {
+    message: format!(
+      "fuse: cannot create save_path {} for staging: {e}",
+      save_path.display()
+    ),
+  })?;
+  let staging = StagingDir::create(save_path)?;
+  match convert::copy_tokenizer_and_extras(model_path, staging.path()) {
+    Ok(_outcome) => {
+      // The `_outcome` carries best-effort post-copy fsync warnings on
+      // the STAGING dir. Those warnings describe durability of the
+      // staging copy ONLY — we are about to re-rename every staged file
+      // into `save_path` and fsync the destination's parent dir during
+      // promotion, so the staging-dir's fsync warnings are intermediate
+      // (the staging dir gets removed after promote anyway). Discard.
+    }
+    Err(snapshot_err) => {
+      // The staging guard's `Drop` will clean up the (partial) staging
+      // dir on the way out. Propagate the snapshot error verbatim so
+      // the caller sees the actionable "cannot copy tokenizer file"
+      // diagnostic. No save artifacts have been written yet.
+      return Err(snapshot_err);
+    }
+  }
+
+  // (2b) Validate the STAGED snapshot is loadable BEFORE any save work
+  // begins. The `tokenizer` itself is unused on this side (mlxrs's
+  // tokenizer surface is load-only); the call is a side-effect parse to
+  // prove the snapshot directory has a usable `tokenizer.json` (+
+  // optional `tokenizer_config.json` schema). Reading from
+  // `staging.path()` rather than `model_path` is the F2 fix: a re-read
+  // of `model_path` here would re-open the TOCTOU window the snapshot
+  // closed.
+  //
+  // Failure here means the SOURCE tokenizer bytes don't parse — same
+  // "missing / malformed source tokenizer" contract the pre-R3 shape
+  // had, but routed through the snapshot so the validate and copy see
+  // the SAME bytes. The staging guard's `Drop` cleans the snapshot up;
+  // no save artifacts have landed. The validate failure is re-wrapped
+  // with `model_path` context so the diagnostic still names the SOURCE
+  // path the caller needs to fix (the snapshot path is an internal
+  // implementation detail).
+  if let Err(e) = load::load_tokenizer(staging.path(), &cfg_typed) {
+    return Err(Error::Backend {
+      message: format!(
+        "fuse: source tokenizer at {} failed validation against the staged snapshot \
+         at {}: {e}",
+        model_path.display(),
+        staging.path().display()
+      ),
+    });
+  }
 
   // (3) Parse the on-disk per-layer quantization block (the loaded
   // quantized triples' scheme). Carried through `load_adapters` (so
@@ -346,12 +465,13 @@ pub fn fuse(
   //   - `Ok(())` — fully durable (every fsync passed).
   //   - `Err(DurabilityWarning { committed: true, .. })` — weights + config
   //      ARE on disk; only a parent-dir fsync warned. We REMEMBER this
-  //      warning and proceed to the tokenizer-extras copy (skipping the
-  //      copy on a durability-only warning would leave the destination
+  //      warning and proceed to the staging-promote step (skipping the
+  //      promote on a durability-only warning would leave the destination
   //      structurally incomplete — same routing `convert::convert` uses).
   //   - any other `Err` — pre-commit failure; propagate immediately
-  //      (weights / config not durably on disk; copying tokenizer extras
-  //      now would only mask the real cause).
+  //      (weights / config not durably on disk; promoting tokenizer
+  //      extras now would only mask the real cause). The staging
+  //      guard's `Drop` cleans up the snapshot.
   let save_warning: Option<std::io::Error> =
     match load::save(save_path, &out_weights, &out_config_json, &save_quant) {
       Ok(()) => None,
@@ -359,33 +479,44 @@ pub fn fuse(
       Err(e) => return Err(e),
     };
 
-  // (9) Copy tokenizer + extras from the ORIGINAL `model_path` to
-  // `save_path` so the fused directory is a self-contained, loadable
-  // HF-style model dir (`fuse.py:88` — `save(..., tokenizer, ...)`).
-  // The helper covers the same `tokenizer.json` / `tokenizer_config.json`
-  // / `special_tokens_map.json` / SentencePiece-family / BPE-family /
-  // `chat_template.jinja` / `generation_config.json` / `*.py` set
-  // `convert::convert` writes (see the source-side `TOKENIZER_EXTRA_FILES`
-  // constant + the `*.py` glob).
+  // (9) **Promote staging → save_path** with a stale-extras sweep.
   //
-  // We mirror `convert::convert`'s shape: route a hard copy failure to
-  // `ConvertPostSavePartial` (the destination is structurally incomplete)
-  // and route per-boundary fsync warnings to the typed `DurabilityWarning`
-  // (single) / `ConvertDurabilityWarnings` (multi) aggregate. This keeps
-  // the public error shape uniform across `convert::convert` and
-  // `fuse::fuse` — both produce HF-style dirs from a base model dir; both
-  // share the same post-save extras-copy contract.
-  match convert::copy_tokenizer_and_extras(model_path, save_path) {
-    Ok(copy_outcome) => {
-      let copy_warnings = match copy_outcome {
-        CopyOutcome::Committed => CopyDurabilityWarnings::default(),
-        CopyOutcome::CommittedWithDurabilityWarning(w) => w,
-      };
+  // This is the single ship point for the tokenizer + extras. It runs
+  // ONLY after `load::save` committed the weights+config (so the
+  // save-side state is definitive) and reads bytes ONLY from `staging`
+  // (so the F2 TOCTOU window is closed: validate at step 2b and
+  // promotion here both consume the SAME on-disk bytes). The stale
+  // sweep handles F1: a [`TOKENIZER_EXTRA_FILES`] name or `*.py` at
+  // `save_path` that the snapshot did NOT carry is unlinked, so a
+  // permissive destination (the fuse.py contract this orchestrator
+  // mirrors) cannot ship a stale `generation_config.json` /
+  // `chat_template.jinja` / `tokenizer_config.json` / `*.py` from an
+  // earlier model.
+  //
+  // Any hard IO failure inside promotion routes through
+  // [`Error::ConvertPostSavePartial`] (the destination is structurally
+  // incomplete — weights+config are committed but tokenizer transfer
+  // didn't finish) with `committed: true` and the save-side fsync
+  // warning carried separately in `save_warning`. A best-effort
+  // staging-dir cleanup failure during promotion is recorded as a
+  // warning (see `StagingDir::Drop`) but does NOT fail the operation:
+  // the destination is correct; only a stray `<save_path>/.staging-fuse-*`
+  // dir survived.
+  let promote_outcome = promote_staging_into_save_path(staging, save_path);
+  match promote_outcome {
+    Ok(post_promote) => {
+      // Aggregate durability warnings from save + the post-promote
+      // per-file and per-dir fsyncs into the same typed shape
+      // `convert::convert` uses. 0 → Ok(()), 1 → DurabilityWarning,
+      // 2+ → ConvertDurabilityWarnings. The PRE-R3 shape funneled
+      // `copy_tokenizer_and_extras`'s CopyDurabilityWarnings here;
+      // post-R3 we carry the equivalent fsync boundaries observed
+      // during the staged-file rename + post-promote dir fsync.
       let aggregate = crate::error::ConvertDurabilityWarnings {
         committed: true,
         save: save_warning,
-        post_copy_file: copy_warnings.post_copy_file,
-        post_copy_dir: copy_warnings.post_copy_dir,
+        post_copy_file: post_promote.post_promote_file,
+        post_copy_dir: post_promote.post_promote_dir,
       };
       match aggregate.count() {
         // 0 — fully durable end-to-end.
@@ -413,18 +544,364 @@ pub fn fuse(
         _ => Err(Error::ConvertDurabilityWarnings(aggregate)),
       }
     }
-    // A hard copy failure: at least one extras file did NOT reach disk —
-    // the destination dir is structurally incomplete. The save side IS
-    // committed (weights + config landed before we reached the copy
-    // step), so route through `ConvertPostSavePartial` with
-    // `committed: true` + the save-side fsync warning (if any) carried in
-    // `save_warning` and the underlying copy failure in `copy_error`.
-    Err(copy_err) => Err(Error::ConvertPostSavePartial {
+    // A hard promotion failure: at least one staged file did NOT reach
+    // `save_path`, or a stale-extras unlink failed. The destination dir
+    // is structurally incomplete. The save side IS committed (weights +
+    // config landed before promotion), so route through
+    // `ConvertPostSavePartial` with `committed: true` + the save-side
+    // fsync warning (if any) carried in `save_warning` and the
+    // underlying promotion failure in `copy_error`.
+    Err(promote_err) => Err(Error::ConvertPostSavePartial {
       committed: true,
       save_warning,
-      copy_error: std::io::Error::other(copy_err.to_string()),
+      copy_error: std::io::Error::other(promote_err.to_string()),
     }),
   }
+}
+
+// ─────────────────────── staging-dir guard ───────────────────────
+
+/// A scoped, named temporary subdirectory of `<save_path>/` that holds
+/// the tokenizer + extras SNAPSHOT until promotion. Created via
+/// [`StagingDir::create`], promoted via [`StagingDir::consume`], and
+/// removed on `Drop` if neither was called (every error exit between
+/// staging and promotion).
+///
+/// **Naming:** `<save_path>/.staging-fuse-<pid>-<nanos>-<ctr>/`. Mirrors
+/// the F6 [`crate::lm::load::save_model`] tempfile naming pattern
+/// (`open_excl_temp_shard`'s `<filename>.<pid>.<rand>.tmp.safetensors`):
+/// pid + monotonic-nanos + process-unique atomic counter give a
+/// collision-resistant name that two concurrent `fuse()` calls into the
+/// same `save_path` won't share. The leading `.staging-fuse-` prefix
+/// keeps the name outside the [`TOKENIZER_EXTRA_FILES`] family and
+/// outside the `*.py` glob the stale-sweep walks, so concurrent
+/// promotions can't unlink each other's staging directories.
+///
+/// **Sibling rationale (vs `tempfile::tempdir_in`):** the `tempfile`
+/// crate is NOT a workspace dependency (per `Cargo.toml`), and the
+/// existing F6 [`open_excl_temp_shard`] / test [`fresh_dir`] code uses
+/// the same hand-rolled pid+nanos+counter pattern. Matching that pattern
+/// avoids introducing a new crate dependency for a one-call use site.
+struct StagingDir {
+  /// Absolute (or save-path-relative) path of the staging directory.
+  /// `None` after [`consume`](Self::consume) so [`Drop`] is a no-op for
+  /// the successful-promote case.
+  ///
+  /// On every error exit between [`create`](Self::create) and `consume`
+  /// the path is `Some`, and `Drop` removes the directory recursively.
+  path: Option<PathBuf>,
+}
+
+impl StagingDir {
+  /// Create a fresh staging directory under `parent` and return the
+  /// guard. The directory itself is created with `create_dir` (not
+  /// `create_dir_all`) so a name collision (extraordinarily unlikely
+  /// with the pid+nanos+counter pattern) surfaces as `AlreadyExists`
+  /// and we retry with a new name. The retry cap matches
+  /// [`open_excl_temp_shard`]'s `MAX_RETRIES = 16`.
+  fn create(parent: &Path) -> Result<Self> {
+    use std::{
+      fs::create_dir,
+      io::ErrorKind,
+      sync::atomic::{AtomicU64, Ordering},
+      time::{SystemTime, UNIX_EPOCH},
+    };
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    const MAX_RETRIES: u32 = 16;
+
+    let pid = std::process::id();
+    let mut last_err: Option<std::io::Error> = None;
+    for _ in 0..MAX_RETRIES {
+      let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+      let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+      let rand = nanos ^ counter.rotate_left(17);
+      let candidate = parent.join(format!(".staging-fuse-{pid}-{rand:016x}"));
+      match create_dir(&candidate) {
+        Ok(()) => {
+          return Ok(StagingDir {
+            path: Some(candidate),
+          });
+        }
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+          last_err = Some(e);
+          continue;
+        }
+        Err(e) => {
+          return Err(Error::Backend {
+            message: format!(
+              "fuse: cannot create staging dir under {}: {e}",
+              parent.display()
+            ),
+          });
+        }
+      }
+    }
+    Err(Error::Backend {
+      message: format!(
+        "fuse: cannot create unique staging dir under {} after {MAX_RETRIES} retries: {}",
+        parent.display(),
+        last_err.map_or_else(
+          || "no underlying error captured".to_string(),
+          |e| e.to_string()
+        )
+      ),
+    })
+  }
+
+  /// The on-disk path of the staging directory.
+  fn path(&self) -> &Path {
+    self
+      .path
+      .as_deref()
+      .expect("StagingDir::path called after consume — should be unreachable")
+  }
+
+  /// Consume the guard, returning the on-disk path WITHOUT removing it.
+  /// The caller is responsible for the eventual cleanup (after a
+  /// successful promotion the staging dir is empty and removed by
+  /// `promote_staging_into_save_path`'s final `remove_dir`).
+  fn consume(mut self) -> PathBuf {
+    self
+      .path
+      .take()
+      .expect("StagingDir::consume called twice — should be unreachable")
+  }
+}
+
+impl Drop for StagingDir {
+  /// Best-effort cleanup. Called on every error exit between
+  /// [`StagingDir::create`] and a successful [`StagingDir::consume`].
+  /// A failure to remove the staging dir is recorded as an `eprintln!`
+  /// warning (no `tracing` dep in `mlxrs`) — the destination dir is
+  /// correct; only a stray `<save_path>/.staging-fuse-*` survived.
+  fn drop(&mut self) {
+    if let Some(path) = self.path.take()
+      && let Err(e) = std::fs::remove_dir_all(&path)
+    {
+      eprintln!(
+        "fuse: warning — could not remove staging dir {}: {e}",
+        path.display()
+      );
+    }
+  }
+}
+
+// ─────────────────────── promote staging → save_path ───────────────────────
+
+/// Post-promotion durability warnings surfaced by
+/// [`promote_staging_into_save_path`]. Mirrors
+/// [`crate::lm::convert::CopyDurabilityWarnings`]'s shape so the
+/// `fuse()` aggregate can plug straight into the same
+/// [`crate::error::ConvertDurabilityWarnings`] structure.
+struct PostPromoteWarnings {
+  /// First per-file `fsync` warning observed AFTER a successful rename
+  /// of a staged file into `save_path`. The data IS on disk after the
+  /// rename (and observable by a subsequent reader); only durability
+  /// across a power loss is uncertain.
+  post_promote_file: Option<std::io::Error>,
+  /// Post-promotion `fsync_dir(save_path)` warning. The new directory
+  /// entries (the renamed-in staged files + the unlinked stale extras)
+  /// ARE observable by a reader; only durability is uncertain.
+  post_promote_dir: Option<std::io::Error>,
+}
+
+/// Move every staged file at `staging` into `save_path` (overwriting
+/// any existing same-name destination), unlink any
+/// [`TOKENIZER_EXTRA_FILES`] / `*.py` at `save_path` the snapshot did
+/// NOT carry, then remove the (now-empty) staging directory.
+///
+/// **Same-fs invariant.** `staging` is created under `save_path` by
+/// [`StagingDir::create`], so every per-file [`std::fs::rename`] below
+/// is single-fs (atomic on POSIX/Windows; a cross-fs rename silently
+/// degrades to copy+unlink and loses atomicity). The shared parent fs
+/// is the same property [`open_excl_temp_shard`] enforces for the
+/// shard tempfiles.
+///
+/// **Stale-extras sweep.** The walk covers EXACTLY the file family
+/// [`copy_tokenizer_and_extras`] writes: every name in
+/// [`TOKENIZER_EXTRA_FILES`] (the fixed list — `tokenizer.json` /
+/// `tokenizer_config.json` / `special_tokens_map.json` /
+/// `added_tokens.json` / `spiece.model` / `tokenizer.model` /
+/// `vocab.json` / `merges.txt` / `chat_template.jinja` /
+/// `generation_config.json`) PLUS every `*.py` at `save_path`. Any name
+/// in that family present at `save_path` but NOT present in the staging
+/// snapshot is unlinked. Files OUTSIDE the family — `config.json`,
+/// `model.safetensors*`, `model.safetensors.index.json` — are NOT
+/// touched (those are F6's `load::save`-owned artifacts and the F1
+/// finding is specifically scoped to the same family
+/// `copy_tokenizer_and_extras` writes).
+///
+/// **Returns** the post-promotion fsync warnings (see
+/// [`PostPromoteWarnings`]). A hard IO failure — a rename failure, an
+/// unlink failure on a stale extra, a `read_dir(save_path)` failure
+/// during the stale-sweep — short-circuits with `Err(Error::Backend)`
+/// the caller routes through [`Error::ConvertPostSavePartial`]. The
+/// stale-sweep's `read_dir(staging)` failure also short-circuits the
+/// same way.
+fn promote_staging_into_save_path(
+  staging: StagingDir,
+  save_path: &Path,
+) -> Result<PostPromoteWarnings> {
+  use std::collections::HashSet;
+
+  // Snapshot the staged file names BEFORE we move them — we need the
+  // set for the stale-sweep below.
+  let staging_path = staging.consume();
+
+  let mut staged_names: HashSet<String> = HashSet::new();
+  let entries = std::fs::read_dir(&staging_path).map_err(|e| Error::Backend {
+    message: format!(
+      "fuse: cannot read staging dir {}: {e}",
+      staging_path.display()
+    ),
+  })?;
+  let mut staged_paths: Vec<PathBuf> = Vec::new();
+  for entry in entries {
+    let entry = entry.map_err(|e| Error::Backend {
+      message: format!(
+        "fuse: cannot read entry in staging dir {}: {e}",
+        staging_path.display()
+      ),
+    })?;
+    let path = entry.path();
+    if !path.is_file() {
+      // Defensive: `copy_tokenizer_and_extras` only writes regular
+      // files, but if anything else ever lands here, skip it — the
+      // promotion is over the file family only.
+      continue;
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+      continue;
+    };
+    staged_names.insert(name.to_string());
+    staged_paths.push(path);
+  }
+
+  // Move each staged file into save_path (overwrite any existing
+  // same-name destination via `std::fs::rename`). Same-fs by
+  // construction (staging is a subdir of save_path). The per-file
+  // `fsync_path_io` AFTER the rename is best-effort: a warning records
+  // into `post_promote_file` but does NOT stop the promotion.
+  let mut post_promote_file: Option<std::io::Error> = None;
+
+  for staged_path in &staged_paths {
+    let Some(name) = staged_path.file_name() else {
+      continue;
+    };
+    let dst = save_path.join(name);
+    std::fs::rename(staged_path, &dst).map_err(|e| Error::Backend {
+      message: format!(
+        "fuse: cannot promote staged file {} -> {}: {e}",
+        staged_path.display(),
+        dst.display()
+      ),
+    })?;
+    if let Err(e) = crate::lm::load::fsync_path_io(&dst) {
+      // Wrap with operation + destination-path context (mirrors
+      // `copy_tokenizer_and_extras`'s F7 R7 wrap shape). Preserves
+      // `ErrorKind` via `std::io::Error::new`. First-failure preserved
+      // so the surfaced warning names the EARLIEST file whose fsync
+      // dropped durability.
+      if post_promote_file.is_none() {
+        post_promote_file = Some(std::io::Error::new(
+          e.kind(),
+          format!("fuse: fsync {} failed: {e}", dst.display()),
+        ));
+      }
+    }
+  }
+
+  // **Stale-extras sweep.** For each fixed name in
+  // `TOKENIZER_EXTRA_FILES`: if it exists at `save_path` AND the
+  // snapshot did NOT carry it → unlink. For each `*.py` at `save_path`:
+  // same rule. The walk over the dir does NOT touch any file outside
+  // the family.
+  //
+  // F1 fix: the pre-R3 shape only OVERWROTE files present at the
+  // source. A `save_path` pre-populated with e.g. `generation_config.json`
+  // / `chat_template.jinja` / `*.py` from an EARLIER model survived the
+  // fuse when the new source lacked them, and downstream loaders
+  // consumed the stale bytes as wrong-model semantics
+  // (`load_config` consumes `generation_config.json` as EOS override;
+  // tokenizer surface consumes `tokenizer_config.json` + chat
+  // metadata).
+  for name in TOKENIZER_EXTRA_FILES {
+    if staged_names.contains(*name) {
+      continue;
+    }
+    let candidate = save_path.join(name);
+    if candidate.is_file() {
+      std::fs::remove_file(&candidate).map_err(|e| Error::Backend {
+        message: format!(
+          "fuse: cannot remove stale destination file {}: {e}",
+          candidate.display()
+        ),
+      })?;
+    }
+  }
+
+  // `*.py` sweep. We walk save_path; for each `*.py`, if NOT in
+  // staged_names, unlink. (The staged_names set already contains the
+  // copied `*.py` basenames per the snapshot — see
+  // `copy_tokenizer_and_extras`'s `*.py` glob.)
+  let entries = std::fs::read_dir(save_path).map_err(|e| Error::Backend {
+    message: format!(
+      "fuse: cannot read save_path {} for stale-extras sweep: {e}",
+      save_path.display()
+    ),
+  })?;
+  for entry in entries {
+    let entry = entry.map_err(|e| Error::Backend {
+      message: format!(
+        "fuse: cannot read entry in save_path {}: {e}",
+        save_path.display()
+      ),
+    })?;
+    let path = entry.path();
+    if !path.is_file() {
+      continue;
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+      continue;
+    };
+    if !name.ends_with(".py") {
+      continue;
+    }
+    if staged_names.contains(name) {
+      continue;
+    }
+    std::fs::remove_file(&path).map_err(|e| Error::Backend {
+      message: format!(
+        "fuse: cannot remove stale destination file {}: {e}",
+        path.display()
+      ),
+    })?;
+  }
+
+  // Remove the (now-empty) staging directory. A failure here is a
+  // best-effort warning — the destination dir is correct; only a stray
+  // `<save_path>/.staging-fuse-*` survived.
+  if let Err(e) = std::fs::remove_dir(&staging_path) {
+    eprintln!(
+      "fuse: warning — could not remove empty staging dir {}: {e}",
+      staging_path.display()
+    );
+  }
+
+  // Post-promotion directory fsync — makes the new directory entries
+  // (the renamed-in staged files + any unlinked stale extras) durable.
+  // Same shape as the post-rename `fsync_dir` `crate::lm::load::save`
+  // uses. A failure is a durability-only warning (the entries ARE
+  // observable on a running kernel; only a power loss could revert).
+  let post_promote_dir = crate::lm::load::fsync_dir(save_path).err();
+
+  Ok(PostPromoteWarnings {
+    post_promote_file,
+    post_promote_dir,
+  })
 }
 
 /// Replace the `<path>.weight` / `.scales` / `.biases` / `.bias` entries in

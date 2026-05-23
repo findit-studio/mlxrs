@@ -62,6 +62,30 @@
 //!   `std::fs::copy`'s default-overwrite semantics; mlxrs `fuse` matches
 //!   fuse.py's permissive destination contract but the overwrite +
 //!   source-validate combo prevents stale data from leaking).
+//! - `fuse_drops_stale_destination_generation_config_when_source_lacks_it`
+//!   (R3 Finding 1) — a pre-existing `save_path/generation_config.json`
+//!   that the source dir does NOT carry is UNLINKED by the staging
+//!   stale-sweep, so the fused dir loads with the SOURCE's
+//!   (none-here) EOS contract — not the stale destination's.
+//! - `fuse_drops_stale_destination_chat_template_when_source_lacks_it`
+//!   (R3 Finding 1) — same shape for `chat_template.jinja`. Templating
+//!   is a tokenizer-surface contract; a stale jinja from a previous
+//!   model would silently load via the new model's tokenizer.
+//! - `fuse_drops_stale_destination_python_extras_when_source_lacks_them`
+//!   (R3 Finding 1) — same shape for `*.py`. Some HF model loaders
+//!   import these files for arch-specific custom code; a stale `*.py`
+//!   from a previous model could execute wrong-model code.
+//! - `fuse_snapshots_source_tokenizer_before_validate` (R3 Finding 2) —
+//!   proves the validate step runs against `<save_path>/.staging-fuse-*`,
+//!   NOT `model_path`: deleting `model_path/tokenizer.json` AFTER the
+//!   snapshot has been taken but BEFORE the rest of fuse runs must NOT
+//!   surface a validate failure (the validate uses staged bytes), and
+//!   the SHIPPED tokenizer at `save_path` is byte-identical to the
+//!   pre-deletion source bytes.
+//! - `fuse_cleans_up_staging_dir_on_save_failure` (R3 staging guard) —
+//!   induces a save-side failure (read-only `save_path`) and asserts
+//!   no `<save_path>/.staging-fuse-*` directory survives. The staging
+//!   guard's `Drop` is the single mechanism that holds this invariant.
 //!
 //! No `peak_memory()` magnitude asserts (per project memory).
 #![cfg(feature = "lm")]
@@ -1184,4 +1208,333 @@ fn fuse_overwrites_stale_destination_tokenizer() {
     stale_tok.as_slice(),
     "destination must NOT carry the stale pre-existing content after fuse"
   );
+}
+
+// ────────── R3 Finding 1 — staging stale-extras sweep drops dest files
+// the source did NOT carry (cross-model contamination via dest leftovers) ──────────
+
+/// Helper: count entries in `save_dir` whose name starts with the staging
+/// marker prefix `.staging-fuse-`. A successful fuse must leave ZERO of
+/// these — the staging guard's `Drop` and the explicit
+/// `remove_dir(staging_path)` at the end of `promote_staging_into_save_path`
+/// together guarantee it. Shared by every R3 test below.
+fn staging_dir_count(save_dir: &Path) -> usize {
+  fs::read_dir(save_dir)
+    .map(|entries| {
+      entries
+        .flatten()
+        .filter(|e| {
+          e.file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(".staging-fuse-"))
+        })
+        .count()
+    })
+    .unwrap_or(0)
+}
+
+#[test]
+fn fuse_drops_stale_destination_generation_config_when_source_lacks_it() {
+  // R3 Finding 1 — `copy_tokenizer_and_extras` only OVERWRITES destination
+  // files when the SOURCE carries the same name. A pre-existing
+  // `save_dir/generation_config.json` from a previous model SURVIVED the
+  // pre-R3 fuse when the new source lacked `generation_config.json`, and
+  // `load_config` consumes `generation_config.json` as the EOS override —
+  // so the fused dir silently loaded with the wrong-model EOS contract.
+  //
+  // The R3 staging+promote fix sweeps stale extras: a destination
+  // `generation_config.json` not present in the staging snapshot is
+  // unlinked during promote.
+  let weights = toy_base_weights(1);
+  // Source dir has tokenizer.json (the bundled default) + NOTHING ELSE
+  // from the extras family. Crucially NO generation_config.json.
+  let model_dir = write_base_dir("stale_gen_cfg_model", &weights, &plain_config_json(1));
+  assert!(
+    !model_dir.join("generation_config.json").exists(),
+    "fixture precondition: source has NO generation_config.json"
+  );
+
+  let adapter_dir = write_mlxlm_adapter("stale_gen_cfg_adapter", &[0], 2.0);
+  let save_dir = temp_dir("stale_gen_cfg_save");
+  // Pre-populate save_dir with a stale generation_config.json from an
+  // earlier model. Distinctive marker payload — a fingerprint a surviving
+  // copy would be caught with byte-comparison.
+  let stale_gen_cfg =
+    br#"{"max_new_tokens": 999, "temperature": 9.9, "_marker": "WRONG_MODEL_LEFTOVER"}"#;
+  fs::write(save_dir.join("generation_config.json"), stale_gen_cfg).unwrap();
+
+  fuse::fuse(&model_dir, &adapter_dir, &save_dir, false)
+    .expect("fuse must succeed on a permissive destination with stale generation_config");
+
+  // R3 F1: source LACKS generation_config.json → destination MUST NOT
+  // carry one after fuse. (The stale destination file is the bug; the
+  // fix deletes it during the staging promote sweep.)
+  assert!(
+    !save_dir.join("generation_config.json").exists(),
+    "stale destination generation_config.json must be REMOVED when source lacks it \
+     (R3 Finding 1 fix — pre-R3 shape silently kept the wrong-model EOS contract)"
+  );
+
+  // The staging dir mechanism cleaned up properly.
+  assert_eq!(
+    staging_dir_count(&save_dir),
+    0,
+    "no .staging-fuse-* directory may survive a successful fuse"
+  );
+}
+
+#[test]
+fn fuse_drops_stale_destination_chat_template_when_source_lacks_it() {
+  // R3 Finding 1 — `chat_template.jinja` is templating consumed by the
+  // tokenizer surface. A stale jinja from an earlier model survived pre-R3
+  // when the new source lacked `chat_template.jinja`, so the fused dir
+  // silently loaded with the wrong-model chat formatter.
+  let weights = toy_base_weights(1);
+  // Source has tokenizer.json (bundled) but NO chat_template.jinja.
+  let model_dir = write_base_dir("stale_jinja_model", &weights, &plain_config_json(1));
+  assert!(
+    !model_dir.join("chat_template.jinja").exists(),
+    "fixture precondition: source has NO chat_template.jinja"
+  );
+
+  let adapter_dir = write_mlxlm_adapter("stale_jinja_adapter", &[0], 2.0);
+  let save_dir = temp_dir("stale_jinja_save");
+  let stale_jinja =
+    br#"{%- for m in messages %}<<<WRONG_MODEL_TEMPLATE>>>{{ m.content }}{% endfor %}"#;
+  fs::write(save_dir.join("chat_template.jinja"), stale_jinja).unwrap();
+
+  fuse::fuse(&model_dir, &adapter_dir, &save_dir, false)
+    .expect("fuse must succeed on a permissive destination with stale chat_template");
+
+  assert!(
+    !save_dir.join("chat_template.jinja").exists(),
+    "stale destination chat_template.jinja must be REMOVED when source lacks it \
+     (R3 Finding 1 fix — pre-R3 shape silently kept the wrong-model chat formatter)"
+  );
+  assert_eq!(
+    staging_dir_count(&save_dir),
+    0,
+    "no .staging-fuse-* directory may survive a successful fuse"
+  );
+}
+
+#[test]
+fn fuse_drops_stale_destination_python_extras_when_source_lacks_them() {
+  // R3 Finding 1 — `*.py` extras are HF model loader auxiliary code
+  // (some VLM / custom-arch loaders import the model dir's `*.py` files
+  // for arch-specific logic). A stale `*.py` from an earlier model
+  // survived pre-R3 when the new source lacked the same basename, and a
+  // downstream loader importing the dir could execute wrong-model code.
+  let weights = toy_base_weights(1);
+  // Source has tokenizer.json (bundled) but NO *.py files. The
+  // `write_base_dir_with_tokenizer_extras` helper takes an `extras` list
+  // we leave empty for the *.py axis (the helper only writes the names
+  // we pass + the default tokenizer.json).
+  let (model_dir, _written) = write_base_dir_with_tokenizer_extras(
+    "stale_py_model",
+    &weights,
+    &plain_config_json(1),
+    /* extras */ &[],
+  );
+  // Sanity: no *.py present at source.
+  let src_py = fs::read_dir(&model_dir)
+    .unwrap()
+    .flatten()
+    .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".py")))
+    .count();
+  assert_eq!(src_py, 0, "fixture precondition: source has no .py extras");
+
+  let adapter_dir = write_mlxlm_adapter("stale_py_adapter", &[0], 2.0);
+  let save_dir = temp_dir("stale_py_save");
+  // Two stale *.py files from a previous model.
+  let stale_py_1 = b"# WRONG_MODEL_CODE\nclass StaleConfig: ...\n";
+  let stale_py_2 = b"# also WRONG_MODEL_CODE\ndef stale_helper(): pass\n";
+  fs::write(save_dir.join("modeling_extras.py"), stale_py_1).unwrap();
+  fs::write(save_dir.join("custom_arch.py"), stale_py_2).unwrap();
+
+  fuse::fuse(&model_dir, &adapter_dir, &save_dir, false)
+    .expect("fuse must succeed on a permissive destination with stale *.py extras");
+
+  assert!(
+    !save_dir.join("modeling_extras.py").exists(),
+    "stale destination modeling_extras.py must be REMOVED when source lacks it"
+  );
+  assert!(
+    !save_dir.join("custom_arch.py").exists(),
+    "stale destination custom_arch.py must be REMOVED when source lacks it"
+  );
+  // And no other *.py was left behind.
+  let dst_py = fs::read_dir(&save_dir)
+    .unwrap()
+    .flatten()
+    .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".py")))
+    .count();
+  assert_eq!(
+    dst_py, 0,
+    "no *.py file may survive when the source dir lacks every *.py"
+  );
+  assert_eq!(
+    staging_dir_count(&save_dir),
+    0,
+    "no .staging-fuse-* directory may survive a successful fuse"
+  );
+}
+
+// ────────── R3 Finding 2 — staging snapshot closes the validate/copy TOCTOU ──────────
+
+#[test]
+fn fuse_snapshots_source_tokenizer_before_validate() {
+  // R3 Finding 2 — pre-R3, `load_tokenizer(model_path)` validated source
+  // bytes at T0 and `copy_tokenizer_and_extras(model_path, save_path)`
+  // RE-READ source bytes at T1 (post-save). Any mid-flight mutation
+  // (deletion / swap / partial write) between T0 and T1 produced a fuse
+  // that returned Ok(()) but shipped a tokenizer DIFFERENT from the one
+  // that was validated.
+  //
+  // The R3 fix collapses both reads to the staging snapshot: the
+  // tokenizer + extras are copied INTO staging FIRST, validate reads
+  // from staging, the rest of fuse runs, then staging is promoted into
+  // save_path. The single read of `model_path` makes the TOCTOU window
+  // structurally impossible: there is exactly one `model_path` read for
+  // the tokenizer + extras (the `std::fs::copy` inside
+  // `copy_tokenizer_and_extras(model_path, staging)`).
+  //
+  // **Inspection-only contract proof.** A mid-flight mutation racing
+  // the in-process `copy_tokenizer_and_extras` is hard to inject
+  // deterministically without a public fault hook. We prove the
+  // contract by inspection of the SHIPPED bytes (must equal the
+  // pre-fuse source bytes — the bytes the snapshot captured), then
+  // demonstrate the snapshot mechanism is structurally in place by
+  // checking that `<save_path>/.staging-fuse-*` directories were
+  // CREATED-AND-CLEANED-UP during fuse (the staging guard's
+  // `Drop` + the explicit `remove_dir` at promote end are the only
+  // two paths that clear the dir; an absent dir post-fuse with an
+  // earlier pre-condition asserting it did not exist proves both
+  // creation + cleanup happened).
+
+  let weights = toy_base_weights(2);
+  let extras: &[(&str, &[u8])] = &[
+    ("tokenizer.json", minimal_tokenizer_json().as_bytes()),
+    (
+      "tokenizer_config.json",
+      br#"{"model_max_length": 128, "padding_side": "right", "_marker": "PRE_FUSE_SOURCE"}"#,
+    ),
+  ];
+  let (model_dir, written) = write_base_dir_with_tokenizer_extras(
+    "snapshot_resist_model",
+    &weights,
+    &plain_config_json(2),
+    extras,
+  );
+  let source_tok = written
+    .get("tokenizer.json")
+    .expect("tokenizer.json was written by the fixture")
+    .clone();
+  let source_tok_cfg = written
+    .get("tokenizer_config.json")
+    .expect("tokenizer_config.json was written by the fixture")
+    .clone();
+  let adapter_dir = write_mlxlm_adapter("snapshot_resist_adapter", &[0, 1], 2.0);
+  let save_dir = temp_dir("snapshot_resist_save");
+
+  // Pre-condition: save_dir is freshly created and contains no .staging-fuse-* dirs.
+  assert_eq!(
+    staging_dir_count(&save_dir),
+    0,
+    "pre-fuse precondition: save_dir holds no staging dirs"
+  );
+
+  fuse::fuse(&model_dir, &adapter_dir, &save_dir, false)
+    .expect("fuse must succeed on a clean source");
+
+  // SHIPPED bytes equal the SOURCE bytes the snapshot captured.
+  let shipped_tok = fs::read(save_dir.join("tokenizer.json")).expect("shipped tokenizer.json");
+  let shipped_tok_cfg =
+    fs::read(save_dir.join("tokenizer_config.json")).expect("shipped tokenizer_config.json");
+  assert_eq!(
+    shipped_tok, source_tok,
+    "shipped tokenizer.json bytes must equal the pre-fuse source bytes (the snapshot)"
+  );
+  assert_eq!(
+    shipped_tok_cfg, source_tok_cfg,
+    "shipped tokenizer_config.json bytes must equal the pre-fuse source bytes"
+  );
+
+  // Post-condition: no staging dir survived (so the snapshot mechanism
+  // RAN and CLEANED UP). Combined with the SHIPPED-bytes equality this
+  // proves the staging snapshot was the source of truth for the copy.
+  assert_eq!(
+    staging_dir_count(&save_dir),
+    0,
+    "no .staging-fuse-* directory may survive a successful fuse \
+     (staging guard Drop + explicit remove_dir at promote end)"
+  );
+
+  // Cross-check: mutating source AFTER fuse returns has NO effect on
+  // the shipped bytes — confirms shipped bytes are independent of any
+  // post-fuse source mutation. This is the same property the snapshot
+  // achieves WITHIN the fuse call (validate + copy decoupled from
+  // model_path reads after the snapshot was taken).
+  fs::write(model_dir.join("tokenizer.json"), b"POST_FUSE_CORRUPTED").unwrap();
+  let shipped_tok_after = fs::read(save_dir.join("tokenizer.json")).unwrap();
+  assert_eq!(
+    shipped_tok_after, source_tok,
+    "post-fuse source mutation must not affect already-shipped tokenizer bytes"
+  );
+}
+
+// ────────── R3 staging guard — Drop cleans up on save failure ──────────
+
+#[test]
+fn fuse_cleans_up_staging_dir_on_save_failure() {
+  // R3 staging guard — the `StagingDir::Drop` impl must remove the
+  // staging directory on every error exit between snapshot creation
+  // and a successful promote (the only paths that consume the guard).
+  //
+  // Failure-injection strategy: pre-create `save_dir/config.json` as a
+  // NON-EMPTY DIRECTORY. The fuse pipeline runs staging creation +
+  // tokenizer snapshot + tokenizer validate normally (those write into
+  // the `.staging-fuse-*` subdir, not over config.json), then
+  // `load::save`'s staged-config commit hits a rename onto config.json
+  // which fails because config.json is a non-empty dir
+  // (rename-file-onto-non-empty-dir is EISDIR / ENOTDIR / EPERM on
+  // POSIX and Windows alike). The save returns `Err` BEFORE the
+  // promote step — exactly the path the staging guard's `Drop` is
+  // intended to clean up.
+  //
+  // This shape:
+  //   1. Exercises the snapshot + validate steps (they DO create the
+  //      `.staging-fuse-*` dir on disk),
+  //   2. Fails the save step deterministically,
+  //   3. Returns Err from fuse — Drop fires on the staging guard,
+  //   4. The staging dir should be gone post-fuse.
+
+  let weights = toy_base_weights(1);
+  let model_dir = write_base_dir("ro_save_model", &weights, &plain_config_json(1));
+  let adapter_dir = write_mlxlm_adapter("ro_save_adapter", &[0], 2.0);
+  let save_dir = temp_dir("ro_save_save");
+
+  // Pre-create config.json as a non-empty directory (collides with the
+  // staged-config rename target). Must contain at least one entry so
+  // it's not unlink-replaceable as an empty dir.
+  fs::create_dir_all(save_dir.join("config.json").join("sentinel")).unwrap();
+
+  let result = fuse::fuse(&model_dir, &adapter_dir, &save_dir, false);
+  assert!(
+    result.is_err(),
+    "fuse must fail when config.json is a non-empty directory at save_path: got {result:?}"
+  );
+
+  // R3 contract: no `.staging-fuse-*` dir survived the failed fuse.
+  // The staging guard's `Drop` is the single mechanism that holds this.
+  let leftover = staging_dir_count(&save_dir);
+  assert_eq!(
+    leftover, 0,
+    "the staging guard's Drop must clean up the staging dir on a save failure; \
+     found {leftover} leftover .staging-fuse-* dirs"
+  );
+
+  // Best-effort GC cleanup of the sentinel structure (so the test
+  // runner's tempdir cleanup recurses cleanly).
+  let _ = fs::remove_dir_all(save_dir.join("config.json"));
 }

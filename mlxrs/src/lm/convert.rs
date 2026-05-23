@@ -1362,7 +1362,19 @@ fn strip_quantization_blocks(config_json: &str) -> Result<String> {
 /// are NOT copied — F6's `save_model` writes the new sharded layout.
 ///
 /// [`tokenizer.save_pretrained`]: https://huggingface.co/docs/transformers/v4.46.0/en/main_classes/tokenizer
-const TOKENIZER_EXTRA_FILES: &[&str] = &[
+///
+/// `pub(crate)` so [`crate::lm::fuse::fuse`]'s staging-promote step can
+/// walk the SAME fixed-name family to drop stale destination files that
+/// the source dir does not carry (Codex R3 Finding 1: a destination
+/// pre-populated with e.g. a stale `generation_config.json` /
+/// `chat_template.jinja` would otherwise survive the fuse, since the
+/// permissive `copy_tokenizer_and_extras` only OVERWRITES files present
+/// at the source — the `_skipped` arm leaves any absent name alone, so
+/// stale destination bytes silently ship as the fused checkpoint's
+/// tokenizer / generation config). Keeping the constant single-source
+/// guarantees the snapshot+stale-walk and the copy operate over the
+/// IDENTICAL file family.
+pub(crate) const TOKENIZER_EXTRA_FILES: &[&str] = &[
   // Core tokenizer.
   "tokenizer.json",
   "tokenizer_config.json",
