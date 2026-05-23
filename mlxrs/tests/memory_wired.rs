@@ -280,6 +280,86 @@ fn wired_limit_guard_drop_restores_old_limit() {
   );
 }
 
+/// CODEX R1 [HIGH] F2 regression guard — concurrent install/Drop on
+/// different threads MUST leave the process-global wired-memory limit at
+/// its original pre-install value, not at the recommended budget.
+///
+/// Pre-F2 failure mode (no synchronization):
+/// ```text
+///   T1 install: captures L0,    sets recommended
+///   T2 install: captures recommended,   sets recommended
+///   T1 drop:    restores L0     (limit = L0)
+///   T2 drop:    restores recommended    (limit = recommended  ← BUG)
+/// ```
+/// Post-F2 (single-active-guard semantics): T2's install observes the
+/// owner-lock is held → returns `Ok(None)` (no-op). Only T1 has a real
+/// guard whose `Drop` restores L0.
+///
+/// This test cannot reliably reproduce the deterministic interleave
+/// without sleeps/yields (and even then, races are inherently flaky),
+/// so it asserts the *invariant* instead: after any number of concurrent
+/// install/drop cycles, the limit is exactly what it was before the
+/// stress test began. This invariant holds under the F2 fix; it failed
+/// to hold under the pre-F2 design.
+#[test]
+fn concurrent_install_drop_restores_correct_old_limit_per_owner() {
+  let _serialized = lock_wired_limit();
+
+  let Ok(Some(_recommended)) = recommended_working_set_bytes() else {
+    eprintln!("skipping: recommended_working_set_bytes unavailable on this host");
+    return;
+  };
+
+  // Snapshot the pre-stress limit via `set_wired_limit` round-trip
+  // (returns prior; we immediately restore it so this round-trip is a
+  // no-op on the live value).
+  let snapshot_before = set_wired_limit(0).expect("snapshot via round-trip");
+  let _ = set_wired_limit(snapshot_before).expect("restore snapshot baseline");
+
+  // Spawn 2 worker threads each running multiple install/drop cycles.
+  // Some installs will collide on the owner-lock and return `Ok(None)`
+  // (the F2 single-active-guard semantics); others will succeed with
+  // `Ok(Some(_))`. Both branches are correct — the invariant we
+  // verify is post-stress restoration, NOT individual install outcomes.
+  let handles: Vec<_> = (0..2)
+    .map(|_| {
+      std::thread::spawn(|| {
+        for _ in 0..32 {
+          match WiredLimitGuard::install(0, &[]) {
+            Ok(Some(_guard)) => {
+              // Guard drops at end of scope, restoring under the F2 lock.
+            }
+            Ok(None) => {
+              // Another guard was active OR Metal-unavailable — no-op.
+              // Both branches are valid F2 outcomes.
+            }
+            Err(e) => panic!("install must not error on a healthy host: {e:?}"),
+          }
+        }
+      })
+    })
+    .collect();
+
+  for h in handles {
+    h.join().expect("worker thread must not panic");
+  }
+
+  // Invariant: after all workers have joined, the process-global limit
+  // must equal `snapshot_before`. Pre-F2, the race would leave the limit
+  // at `recommended` for a substantial fraction of runs (the T2-overwrites-
+  // T1-restore interleave).
+  let observed = set_wired_limit(snapshot_before).expect("read-back via set");
+  assert_eq!(
+    observed, snapshot_before,
+    "F2 fix: after concurrent install/drop stress, the wired-memory limit \
+     must equal the pre-stress snapshot (snapshot_before={snapshot_before}, \
+     observed={observed}). A mismatch (typically observed = recommended) \
+     indicates the install/Drop race re-introduced — the single-active-guard \
+     ownership lock is supposed to make it impossible for two guards to \
+     simultaneously hold captures of inconsistent old_limits."
+  );
+}
+
 /// CODEX R1 [HIGH] F3 regression guard — the guard's `Drop` MUST NOT
 /// panic when `clear_current_thread_streams()` was called before scope
 /// exit, AND MUST still restore the prior wired-memory limit.

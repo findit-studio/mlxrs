@@ -21,10 +21,76 @@
 //! [`crate::Device`] / [`crate::Stream`] requested it. Use the guard form to
 //! ensure the prior value is restored even on early return / panic.
 
+use std::sync::{Mutex, PoisonError};
+
 use crate::{
   Stream,
   error::{Result, check, ensure_handler_installed},
 };
+
+/// Process-global ownership tracker for [`WiredLimitGuard`].
+///
+/// CODEX R1 [HIGH] F2 fix — the previous design had NO synchronization on
+/// the install/Drop read-modify-restore cycle, so two concurrent guards
+/// on different threads could interleave their captures and corrupt the
+/// process-global `mlx_set_wired_limit` state:
+/// ```text
+///   T1 install: captures L0    (sets recommended)
+///   T2 install: captures recommended    (sets recommended; thinks "old" = recommended!)
+///   T1 drop:    restores L0    (limit = L0)
+///   T2 drop:    restores recommended    (limit = recommended; T1's restore is gone)
+/// ```
+/// Net effect: process-global limit ends at *recommended*, not the
+/// original L0, despite both scopes having "completed cleanly".
+///
+/// ## Design: single-active-guard
+/// We adopt **single-active-guard** semantics:
+/// - The first [`WiredLimitGuard::install`] holds the slot until its
+///   `Drop` runs. While held, the inner `bool` is `true`.
+/// - Any concurrent or nested [`WiredLimitGuard::install`] (same or
+///   different thread) returns `Ok(None)` — a graceful no-op, matching
+///   the same `Ok(None)` shape returned when Metal is unavailable. The
+///   caller cannot distinguish "no Metal" from "already-installed
+///   elsewhere"; both are legitimate "skipped" outcomes and we already
+///   surface the platform-unavailable case the same way.
+///
+/// This is intentionally NOT Python `wired_limit`'s implicit stacking
+/// (Python's GIL hides the race; under real concurrency the same bug
+/// fires). True stacking would require a `Vec<(thread_id, old)>` stack
+/// and stack-pop matching that opens its own holes (drop ordering ≠
+/// install ordering between threads). Single-active is the simplest
+/// race-free contract that preserves the "Drop restores the original"
+/// invariant unconditionally.
+///
+/// ## Lock-hold discipline
+/// The `Mutex` is held ONLY across the install's read-modify-write
+/// (acquire → set_wired_limit → record state) and the Drop's
+/// restore-and-release. It is NOT held during the scope's body, so user
+/// code in a `WiredLimitGuard`-scoped region runs unsynchronized — that
+/// is the correct behavior (the body shouldn't block on the limit
+/// transition).
+///
+/// The lock is poison-tolerant: a panic mid-install (extremely rare —
+/// `set_wired_limit`'s only failure path is the FFI rc) leaves the
+/// payload `false` (the install captured nothing), so subsequent
+/// installs proceed normally.
+static WIRED_LIMIT_OWNER: Mutex<bool> = Mutex::new(false);
+
+/// Restore the process-global wired-memory limit under the
+/// [`WIRED_LIMIT_OWNER`] lock and release ownership. Called from
+/// [`WiredLimitGuard::drop`]; SHOULD NOT panic (the lock is poison-
+/// tolerant; the FFI rc is discarded per the crate Drop convention).
+fn restore_wired_limit_under_lock(old_limit: u64) {
+  let mut owner = WIRED_LIMIT_OWNER
+    .lock()
+    .unwrap_or_else(PoisonError::into_inner);
+  // Restore even if the flag was somehow already `false` — the limit is
+  // a process-global resource and a defensive "always restore on Drop"
+  // is strictly safer than leaking a stale limit. The flag's role is to
+  // serialize install/Drop, not to gate the FFI write.
+  let _ = set_wired_limit(old_limit);
+  *owner = false;
+}
 
 /// Set the wired-memory limit in bytes, returning the **prior** limit.
 ///
@@ -156,11 +222,21 @@ pub fn recommended_working_set_bytes() -> Result<Option<u64>> {
 /// supplied streams (or the default stream if none) are synchronized and the
 /// prior limit is restored.
 ///
-/// `install` returns `Ok(None)` (no guard, no-op Drop) when the wired-limit
-/// surface is unavailable on this platform — non-Metal builds, CPU-only mlx,
-/// or any environment where [`recommended_working_set_bytes`] returns
-/// `Ok(None)`. Mirrors the Python helper's `if not mx.metal.is_available():
-/// yield` early return.
+/// `install` returns `Ok(None)` (no guard, no-op Drop) in two cases:
+/// - the wired-limit surface is unavailable on this platform (non-Metal
+///   build, CPU-only mlx, or any environment where
+///   [`recommended_working_set_bytes`] returns `Ok(None)`). Mirrors the
+///   Python helper's `if not mx.metal.is_available(): yield` early return.
+/// - another `WiredLimitGuard` is currently active on any thread. We
+///   serialize ownership of the process-global wired-memory limit (see
+///   [`WIRED_LIMIT_OWNER`]) for race-safety; the currently-active guard's
+///   `Drop` correctly restores the prior limit, so a second install is a
+///   no-op that does not corrupt the captured state. This deviates from
+///   Python's implicit-stacking semantics — Python's GIL hides the same
+///   race, but under real concurrency the stacking design corrupts the
+///   limit (`F2` in the L6 design notes). Callers that need stacking must
+///   coordinate at a higher level (e.g. a single long-lived install
+///   wrapping the whole concurrent region).
 ///
 /// Emits a `[WARNING]` to stderr (via [`eprintln`]) when `model_bytes >
 /// 0.9 * max_rec_size`, matching the Python helper's near-OOM warning
@@ -234,7 +310,28 @@ impl<'a> WiredLimitGuard<'a> {
       );
     }
 
+    // CODEX R1 [HIGH] F2 fix — acquire the process-global ownership lock
+    // BEFORE the read-modify-write so two concurrent installs cannot
+    // interleave their captures (the prior `Drop`'s blind restore would
+    // then clobber a still-active sibling's effect). See
+    // WIRED_LIMIT_OWNER's doc-comment for the single-active-guard
+    // semantics.
+    let mut owner = WIRED_LIMIT_OWNER
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner);
+    if *owner {
+      // Another `WiredLimitGuard` is currently active (same or different
+      // thread). Bail out as a no-op rather than racing — the active
+      // guard already pushed the limit to the recommended budget, so
+      // the caller's intent ("limit at recommended for the scope") is
+      // already satisfied; on the active guard's Drop the prior limit
+      // is correctly restored.
+      return Ok(None);
+    }
+
     let old_limit = set_wired_limit(max_rec_size)?;
+    *owner = true;
+    drop(owner); // release before yielding to user code
     Ok(Some(Self { old_limit, streams }))
   }
 
@@ -300,6 +397,10 @@ impl Drop for WiredLimitGuard<'_> {
         let _ = s.try_synchronize();
       }
     }
-    let _ = set_wired_limit(self.old_limit);
+    // Restore the process-global wired-memory limit under the F2
+    // owner-lock so we release the ownership slot for the next install
+    // atomically with the FFI restore. See `restore_wired_limit_under_lock`
+    // and the [`WIRED_LIMIT_OWNER`] doc-comment.
+    restore_wired_limit_under_lock(self.old_limit);
   }
 }
