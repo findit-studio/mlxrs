@@ -1278,16 +1278,28 @@ const AWQ_SHIFTS: [u32; 8] = [0, 16, 4, 20, 8, 24, 12, 28];
 // the table to be regenerated.
 const _: () = assert!(AWQ_BITS == 4 && AWQ_SHIFTS[1] == 4 * AWQ_BITS);
 
-/// Unpack an AutoAWQ-packed 4-bit `qweight` (`uint32`, 8 nibbles per
+/// Unpack an AutoAWQ-packed 4-bit `qweight` (32-bit packed nibbles, 8 per
 /// element) into the dense natural-order layout — port of
 /// `_unpack_awq_weights` (`mlx-lm/mlx_lm/utils.py:72-82`).
 ///
-/// `qweight` must be a 2-D `uint32` array of shape `[rows, packed_cols]`.
-/// Output is the same dtype, shape `[rows, packed_cols * 8]`, with each
-/// position holding the 4-bit nibble in `[0, 15]`. The output dtype
-/// preserves the input's (`uint32`) — mlx-lm leaves the cast to the
-/// caller (`utils.py:79-80`); `transform_awq_weights` casts to `uint32`
-/// explicitly before its repack.
+/// `qweight` must be a 2-D array of dtype `uint32` OR `int32` (AutoAWQ's
+/// `WQLinear_GEMM` allocates its packed buffer with `torch.int32`, so on-disk
+/// safetensors carry the SIGNED dtype — mlx-lm's python `_unpack_awq_weights`
+/// performs the shift-and-mask without any unsigned-only gate, so we accept
+/// both). For `int32` inputs the buffer is bit-preservingly reinterpreted
+/// via [`ops::misc::view`] (the MLX `mx.view` primitive — `mlx/ops.cpp`
+/// `array view(const array& a, const Dtype& dtype, ...)`) — this keeps a
+/// negative i32's sign bit as the u32 MSB, so the subsequent shift-and-mask
+/// over `AWQ_SHIFTS` (which contains a `28`-bit shift) recovers the top
+/// nibble. A value-preserving `astype` would clamp negatives to `0` and lose
+/// the high nibble entirely — that is the bug this gate prevents.
+///
+/// Output shape is `[rows, packed_cols * 8]`, dtype `uint32`, with each
+/// position holding the 4-bit nibble in `[0, 15]`. `transform_awq_weights`
+/// then re-casts to `uint32` explicitly before its repack
+/// (`utils.py:130`) — the dtype of the output here is already `uint32`
+/// since the view/already-u32 input flows through the bit-ops without
+/// dtype promotion.
 ///
 /// The internal `AWQ_SHIFTS` table folds the AutoAWQ packing-reorder
 /// into the unpack: a single `(qweight >> shifts) & mask` over the
@@ -1299,7 +1311,8 @@ const _: () = assert!(AWQ_BITS == 4 && AWQ_SHIFTS[1] == 4 * AWQ_BITS);
 ///
 /// Mirrors the mlx-lm 2-D contract verbatim; non-2D inputs are a
 /// [`Error::ShapeMismatch`] (the python version would `ValueError`
-/// during the trailing `.reshape(out_features, in_features)`).
+/// during the trailing `.reshape(out_features, in_features)`). Dtypes
+/// other than `uint32` / `int32` are rejected as [`Error::Backend`].
 pub fn unpack_awq_weights(qweight: &Array) -> Result<Array> {
   let shape = qweight.shape();
   if shape.len() != 2 {
@@ -1310,14 +1323,34 @@ pub fn unpack_awq_weights(qweight: &Array) -> Result<Array> {
     });
   }
   let dtype = qweight.dtype()?;
-  if dtype != Dtype::U32 {
-    return Err(Error::Backend {
-      message: format!(
-        "unpack_awq_weights: AutoAWQ stores `qweight` as `uint32`-packed nibbles \
-         (`utils.py:72-82`); got dtype {dtype:?}"
-      ),
-    });
-  }
+  // AutoAWQ allocates `qweight` / `qzeros` with `torch.int32` (signed) —
+  // mlx-lm's `_unpack_awq_weights` (`utils.py:72-82`) does the shift-and-mask
+  // without an unsigned-only gate, so we accept both dtypes. Other dtypes
+  // (floats, etc.) are still a layout error and rejected.
+  //
+  // For I32 input we bit-preservingly reinterpret to U32 via the MLX `view`
+  // primitive (NOT `astype`). For same-width dtypes `view` keeps the
+  // underlying bit-pattern intact, so a negative i32 (e.g. `0xF0FF_FFFF`
+  // = -251_658_241) becomes the u32 with the same MSB. `astype` would do
+  // a value-preserving cast that clamps negatives to 0 — losing the high
+  // nibble. See `mlx/ops.cpp` `array view(...)` for the source semantics.
+  let owned_view;
+  let packed_u32: &Array = match dtype {
+    Dtype::U32 => qweight,
+    Dtype::I32 => {
+      owned_view = ops::misc::view(qweight, Dtype::U32)?;
+      &owned_view
+    }
+    other => {
+      return Err(Error::Backend {
+        message: format!(
+          "unpack_awq_weights: AutoAWQ stores `qweight` as 32-bit packed nibbles \
+           (`utils.py:72-82`) — accept `uint32` (mlx-lm canonical) or `int32` \
+           (AutoAWQ `WQLinear_GEMM`'s default `torch.int32` allocation); got dtype {other:?}"
+        ),
+      });
+    }
+  };
   let rows = shape[0];
   let packed_cols = shape[1];
   let cols = packed_cols
@@ -1336,7 +1369,7 @@ pub fn unpack_awq_weights(qweight: &Array) -> Result<Array> {
   let mask = Array::from_slice::<u32>(&[AWQ_NIBBLE_MASK], &(1usize,))?;
   // `qweight[..., None]` → shape `[rows, packed_cols, 1]`; broadcast
   // against `shifts` of shape `[8]` yields `[rows, packed_cols, 8]`.
-  let expanded = ops::shape::expand_dims_axes(qweight, &[2])?;
+  let expanded = ops::shape::expand_dims_axes(packed_u32, &[2])?;
   let shifted = ops::arithmetic::right_shift(&expanded, &shifts)?;
   let nibbles = ops::arithmetic::bitwise_and(&shifted, &mask)?;
   // Collapse the trailing pair `[packed_cols, 8]` → `[cols]`.
@@ -1489,6 +1522,24 @@ pub fn transform_awq_weights(
         ),
       });
     };
+    // Fix 1 [CRITICAL]: dtype preflight. AutoAWQ's `WQLinear_GEMM`
+    // allocates `qweight` / `qzeros` as `torch.int32` (signed); mlx-lm's
+    // canonical converter expects `uint32`. Accept BOTH — but reject other
+    // dtypes (floats, narrower ints, etc.) here with a clear message, so a
+    // hostile/malformed checkpoint cannot slip past to mid-pipeline.
+    // `unpack_awq_weights` performs the bit-preserving I32 → U32 view
+    // internally; this gate just surfaces the wrong-dtype case as a
+    // preflight rather than a per-layer error during the conversion pass.
+    let qw_dtype = qweight.dtype()?;
+    if !matches!(qw_dtype, Dtype::U32 | Dtype::I32) {
+      return Err(Error::Backend {
+        message: format!(
+          "transform_awq_weights: layer `{qweight_key}`: qweight dtype {qw_dtype:?} not supported \
+           — AutoAWQ stores packed nibbles as `uint32` (mlx-lm canonical) or `int32` \
+           (AutoAWQ `WQLinear_GEMM` default `torch.int32` allocation); reject all other dtypes"
+        ),
+      });
+    }
     // Shape validation: `qweight: [in_features, packed_out]` /
     // `scales: [n_groups, out_features]`. The two must agree on
     // out_features (post-pack-factor), and `in_features` must be a
@@ -1543,6 +1594,17 @@ pub fn transform_awq_weights(
     }
     let qzeros_key = format!("{prefix}.qzeros");
     if let Some(qzeros) = weights.get(&qzeros_key) {
+      // Same dtype gate as qweight — accept U32 (mlx-lm canonical) or I32
+      // (AutoAWQ `torch.int32`), reject other dtypes here at preflight.
+      let qz_dtype = qzeros.dtype()?;
+      if !matches!(qz_dtype, Dtype::U32 | Dtype::I32) {
+        return Err(Error::Backend {
+          message: format!(
+            "transform_awq_weights: layer `{qzeros_key}`: qzeros dtype {qz_dtype:?} not supported \
+             — accept `uint32` (mlx-lm canonical) or `int32` (AutoAWQ default `torch.int32`)"
+          ),
+        });
+      }
       let z_shape = qzeros.shape();
       if z_shape.len() != 2 || z_shape[0] != n_groups || z_shape[1] != packed_out {
         return Err(Error::ShapeMismatch {
@@ -2882,16 +2944,64 @@ mod tests {
     ));
   }
 
-  /// Non-`u32` dtype is rejected (AutoAWQ's `qweight` is always `uint32`-packed;
-  /// any other dtype is a layout mismatch the caller should fix upstream).
+  /// Non-32-bit-int dtype is rejected. AutoAWQ allocates `qweight` /
+  /// `qzeros` as `torch.int32` (signed) — we accept both `u32` AND `i32`
+  /// (see [`unpack_awq_weights_accepts_i32_input`]), but anything else
+  /// (floats, narrower ints, etc.) is a layout mismatch the caller should
+  /// fix upstream.
   #[test]
-  fn unpack_awq_weights_rejects_non_u32_dtype() {
-    let r = Array::from_slice::<i32>(&[0i32; 4], &(2usize, 2)).unwrap();
+  fn unpack_awq_weights_rejects_non_32bit_int_dtype() {
+    // f32 is the canonical "wrong" dtype to test against — narrow ints,
+    // bool, and floats all hit the same `other => Err(Backend)` arm.
+    let r = Array::from_slice::<f32>(&[0.0_f32; 4], &(2usize, 2)).unwrap();
     let err = unpack_awq_weights(&r).unwrap_err();
     assert!(
       matches!(err, Error::Backend { .. }),
-      "i32 dtype should be Backend, got {err:?}"
+      "f32 dtype should be Backend, got {err:?}"
     );
+  }
+
+  /// Fix 1 [CRITICAL]: i32 input is accepted (AutoAWQ's `WQLinear_GEMM`
+  /// allocates packed buffers as `torch.int32`, so standard on-disk
+  /// checkpoints carry the signed dtype). Output matches what the equivalent
+  /// u32 input would produce — verifying the bit-preserving reinterpret.
+  #[test]
+  fn unpack_awq_weights_accepts_i32_input() {
+    // Pick a packed value whose high bit is SET — this is the case the
+    // bug would corrupt: a value-preserving cast would clamp the negative
+    // i32 to 0 (or saturate), losing the high nibble. The bit-preserving
+    // view keeps `0xF` in the MSB nibble.
+    let raw: u32 = 0xF0FF_FFFF;
+    let signed: i32 = raw as i32;
+    assert!(
+      signed < 0,
+      "fixture must be negative to exercise the sign bit"
+    );
+    let i32_packed = Array::from_slice::<i32>(&[signed], &(1usize, 1)).unwrap();
+    let u32_packed = Array::from_slice::<u32>(&[raw], &(1usize, 1)).unwrap();
+
+    let mut from_i32 = unpack_awq_weights(&i32_packed).expect("i32 input should be accepted");
+    let mut from_u32 = unpack_awq_weights(&u32_packed).expect("u32 input still accepted");
+    assert_eq!(from_i32.shape(), vec![1, 8]);
+    assert_eq!(from_u32.shape(), vec![1, 8]);
+    assert_eq!(from_i32.dtype().unwrap(), Dtype::U32);
+    let i32_nibbles = from_i32.to_vec::<u32>().unwrap();
+    let u32_nibbles = from_u32.to_vec::<u32>().unwrap();
+    assert_eq!(
+      i32_nibbles, u32_nibbles,
+      "i32 input must produce the SAME nibbles as the equivalent u32 input (bit-preserving)"
+    );
+  }
+
+  /// Fix 1: existing u32 inputs continue to work (regression guard for the
+  /// `Cow::Borrowed(qweight)` short-circuit path).
+  #[test]
+  fn unpack_awq_weights_accepts_u32_input() {
+    let raw: u32 = 0xF0FF_FFFF;
+    let packed = Array::from_slice::<u32>(&[raw], &(1usize, 1)).unwrap();
+    let out = unpack_awq_weights(&packed).expect("u32 input accepted");
+    assert_eq!(out.shape(), vec![1, 8]);
+    assert_eq!(out.dtype().unwrap(), Dtype::U32);
   }
 
   // ──────────────── transform_awq_weights ────────────────
@@ -3279,6 +3389,169 @@ mod tests {
     assert_eq!(g.bits, 4);
     assert_eq!(g.group_size, 128);
     assert_eq!(g.mode, QuantMode::Affine);
+  }
+
+  // ──────────────── Fix 1 [CRITICAL]: I32 qweight/qzeros acceptance ────────────────
+
+  /// Fix 1: a full I32 fixture (both qweight + qzeros allocated as `torch.int32`,
+  /// as AutoAWQ's `WQLinear_GEMM` does) round-trips through `transform_awq_weights`.
+  /// Includes a qweight value with the high bit SET — the bit-pattern that
+  /// would corrupt under a value-preserving `astype`.
+  #[test]
+  fn transform_awq_weights_accepts_i32_qweight_and_qzeros() {
+    // Same shapes as the round-trip fixture: in=8, out=8, gs=4, ng=2.
+    let in_features = 8usize;
+    let out_features = 8usize;
+    let group_size = 4u32;
+    let n_groups = 2usize;
+    // Pack a row with the high nibble set so the resulting u32 word's MSB
+    // is `0xF` — when allocated as i32 this is a negative number.
+    let qweight_data_u32: Vec<u32> = (0..in_features)
+      .map(|i| {
+        let nibbles = [
+          (i % 16) as u32,
+          ((i + 1) % 16) as u32,
+          ((i + 2) % 16) as u32,
+          ((i + 3) % 16) as u32,
+          ((i + 4) % 16) as u32,
+          ((i + 5) % 16) as u32,
+          ((i + 6) % 16) as u32,
+          0xF_u32, // high nibble = 0xF → MSB set when packed at AWQ_SHIFTS[7]=28
+        ];
+        awq_pack_one_row(nibbles)
+      })
+      .collect();
+    let qweight_data_i32: Vec<i32> = qweight_data_u32.iter().map(|&u| u as i32).collect();
+    assert!(
+      qweight_data_i32.iter().any(|&v| v < 0),
+      "fixture must contain a negative i32 to exercise the high-bit case"
+    );
+
+    // qzeros: also int32, with same fixture as the round-trip test.
+    let qzero_unpacked: Vec<Vec<u32>> = (0..n_groups)
+      .map(|g| (0..out_features).map(|o| ((g + o) % 16) as u32).collect())
+      .collect();
+    let qzeros_data_u32: Vec<u32> = (0..n_groups)
+      .map(|g| {
+        let row: [u32; 8] = qzero_unpacked[g].to_vec().try_into().unwrap();
+        awq_pack_one_row(row)
+      })
+      .collect();
+    let qzeros_data_i32: Vec<i32> = qzeros_data_u32.iter().map(|&u| u as i32).collect();
+
+    let scales_data: Vec<f32> = (0..n_groups * out_features)
+      .map(|i| 0.1_f32 * (i as f32 + 1.0))
+      .collect();
+
+    // Build the I32 weights map.
+    let qw_i32 = Array::from_slice::<i32>(&qweight_data_i32, &(in_features, 1)).unwrap();
+    let qz_i32 = Array::from_slice::<i32>(&qzeros_data_i32, &(n_groups, 1)).unwrap();
+    let sc = Array::from_slice::<f32>(&scales_data, &(n_groups, out_features)).unwrap();
+    let mut weights_i32: Weights = HashMap::new();
+    weights_i32.insert("layer.qweight".to_string(), qw_i32);
+    weights_i32.insert("layer.qzeros".to_string(), qz_i32);
+    weights_i32.insert("layer.scales".to_string(), sc);
+
+    let config = AwqLoadConfig {
+      bits: 4,
+      group_size,
+      zero_point: true,
+      version: "gemm".into(),
+    };
+    let (out, plq) =
+      transform_awq_weights(weights_i32, &config).expect("i32 qweight + qzeros accepted");
+
+    // The transformed `.weight` must be u32 (the MLX quantized output dtype).
+    let weight_arr = out.get("layer.weight").expect("layer.weight");
+    assert_eq!(weight_arr.dtype().unwrap(), Dtype::U32);
+    // PLQ unchanged.
+    let g = plq.quantization.expect("global quant");
+    assert_eq!(g.bits, 4);
+    assert_eq!(g.group_size, group_size as i32);
+  }
+
+  /// Fix 1: pack a known-negative i32 fixture and verify the resulting
+  /// MLX-format output bit-pattern matches what the equivalent U32 input
+  /// produces — confirming the i32 path is bit-preserving end-to-end
+  /// (NOT value-preserving via `astype`, which would clamp negatives to 0).
+  #[test]
+  fn transform_awq_weights_preserves_bit_pattern_on_i32_input() {
+    let in_features = 8usize;
+    let out_features = 8usize;
+    let group_size = 4u32;
+    let n_groups = 2usize;
+
+    // Build identical fixtures, one allocated as u32, the other as the
+    // bitwise-equal i32 — feed both through and compare the .weight output.
+    let qweight_data_u32: Vec<u32> = (0..in_features)
+      .map(|i| {
+        // Same scrambled nibbles with high bit set in MSB slot.
+        let nibbles = [
+          (i % 16) as u32,
+          ((i + 7) % 16) as u32,
+          ((i + 3) % 16) as u32,
+          ((i + 5) % 16) as u32,
+          ((i + 2) % 16) as u32,
+          ((i + 6) % 16) as u32,
+          ((i + 1) % 16) as u32,
+          0xF_u32,
+        ];
+        awq_pack_one_row(nibbles)
+      })
+      .collect();
+    let qweight_data_i32: Vec<i32> = qweight_data_u32.iter().map(|&u| u as i32).collect();
+
+    let qzeros_data_u32: Vec<u32> = vec![0_u32; n_groups];
+    let qzeros_data_i32: Vec<i32> = vec![0_i32; n_groups];
+    let scales_data: Vec<f32> = (0..n_groups * out_features)
+      .map(|i| 0.5_f32 + (i as f32) * 0.01)
+      .collect();
+
+    let build = |qw_dtype_i32: bool| -> Weights {
+      let mut w: Weights = HashMap::new();
+      if qw_dtype_i32 {
+        w.insert(
+          "layer.qweight".to_string(),
+          Array::from_slice::<i32>(&qweight_data_i32, &(in_features, 1)).unwrap(),
+        );
+        w.insert(
+          "layer.qzeros".to_string(),
+          Array::from_slice::<i32>(&qzeros_data_i32, &(n_groups, 1)).unwrap(),
+        );
+      } else {
+        w.insert(
+          "layer.qweight".to_string(),
+          Array::from_slice::<u32>(&qweight_data_u32, &(in_features, 1)).unwrap(),
+        );
+        w.insert(
+          "layer.qzeros".to_string(),
+          Array::from_slice::<u32>(&qzeros_data_u32, &(n_groups, 1)).unwrap(),
+        );
+      }
+      w.insert(
+        "layer.scales".to_string(),
+        Array::from_slice::<f32>(&scales_data, &(n_groups, out_features)).unwrap(),
+      );
+      w
+    };
+
+    let cfg = AwqLoadConfig {
+      bits: 4,
+      group_size,
+      zero_point: true,
+      version: "gemm".into(),
+    };
+    let (out_u32, _) = transform_awq_weights(build(false), &cfg).expect("u32 path");
+    let (out_i32, _) = transform_awq_weights(build(true), &cfg).expect("i32 path");
+
+    let mut w_u32 = out_u32.get("layer.weight").unwrap().try_clone().unwrap();
+    let mut w_i32 = out_i32.get("layer.weight").unwrap().try_clone().unwrap();
+    let u32_buf: Vec<u32> = w_u32.to_vec().unwrap();
+    let i32_buf: Vec<u32> = w_i32.to_vec().unwrap();
+    assert_eq!(
+      u32_buf, i32_buf,
+      "i32 qweight must produce the SAME .weight bit-pattern as the equivalent u32 input"
+    );
   }
 
   // ──────────────── AwqLoadConfig ────────────────

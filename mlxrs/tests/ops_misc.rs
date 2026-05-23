@@ -290,6 +290,41 @@ fn astype_method_form_changes_dtype() {
   assert_eq!(r.to_vec::<u32>().unwrap(), vec![1, 1, 1]);
 }
 
+// ───────── view (bit-preserving reinterpret) ─────────
+
+/// Bit-preserving i32 → u32 reinterpret: a negative i32 value keeps its
+/// high bit as the u32 sign-bit. The AWQ converter relies on this when
+/// AutoAWQ checkpoints store `qweight` as signed `torch.int32` whose high
+/// nibble's MSB is set (the converter then shifts-and-masks the resulting
+/// u32 — `astype` would clamp negatives to 0, which is what we MUST avoid).
+#[test]
+fn view_i32_to_u32_preserves_bit_pattern() {
+  // `0xF0FF_FFFF` as a signed 32-bit: -251_658_241 (the high nibble is 0xF,
+  // which is what AWQ would unpack from the top 4 bits of the word).
+  let raw: u32 = 0xF0FF_FFFF;
+  let signed: i32 = raw as i32;
+  assert!(
+    signed < 0,
+    "fixture must be a negative i32 to exercise the sign bit"
+  );
+  let a = Array::from_slice(&[signed], &[1]).unwrap();
+  let mut r = ops::misc::view(&a, Dtype::U32).unwrap();
+  assert_eq!(r.dtype().unwrap(), Dtype::U32);
+  // Bit-preserving: the u32 value must equal the original raw pattern, NOT
+  // a clamped / saturated cast (which astype would produce).
+  assert_eq!(r.to_vec::<u32>().unwrap(), vec![raw]);
+}
+
+/// Same-width view is shape-preserving (no last-axis rescale).
+#[test]
+fn view_same_width_preserves_shape() {
+  let a = Array::from_slice(&[1_i32, 2, 3, 4], &(2, 2)).unwrap();
+  let mut r = ops::misc::view(&a, Dtype::U32).unwrap();
+  assert_eq!(r.shape(), vec![2, 2]);
+  assert_eq!(r.dtype().unwrap(), Dtype::U32);
+  assert_eq!(r.to_vec::<u32>().unwrap(), vec![1, 2, 3, 4]);
+}
+
 // ───────── argpartition / softmax_axis (method-form bridges, #21) ─────────
 
 #[test]
