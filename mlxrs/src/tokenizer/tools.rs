@@ -623,25 +623,53 @@ impl ToolParser for Glm47 {
         // matching `</arg_value>` that never arrives → soft-DoS, call
         // dropped at buffer cap).
         //
+        // L9 R9 fix: the discriminator MUST be bounded to the prefix that
+        // COULD be the actual payload (bytes up to a candidate end_tag).
+        // Scanning the entire `payload` (including trailing display after a
+        // legitimate `end_tag`) lets a `<arg_key>` literal in the trailing
+        // display flip a plain-fallback call into XML-aware mode, which
+        // then waits for `</arg_value>` that never arrives and drops the
+        // call at buffer cap. Race the first end_tag occurrence against
+        // the first `<arg_key>` occurrence; only when `<arg_key>` arrives
+        // STRICTLY BEFORE any candidate `end_tag` is this an XML-style
+        // payload.
+        //
         // Streaming corner-case audit: each call re-evaluates the full
         // buffer, so there is no lock-in. If `<arg_key>` arrives in a later
         // chunk (i.e. an XML-style payload whose key tag straddles the
         // chunk boundary), the next invocation routes to the XML scanner.
-        // The simple "no `<arg_key>` ⇒ plain" rule is sound because a valid
-        // XML-style payload cannot have `<arg_value>` before `<arg_key>`
-        // (`find_kv_pairs` requires key-then-value), so a buffer with
-        // `<arg_value>` literals but no `<arg_key>` is unambiguously the
-        // plain fallback. If both branches still defer (no `<arg_key>` AND
-        // no `end_tag` yet), the scanner returns `None` and the processor
-        // keeps collecting.
-        if !payload.contains("<arg_key>") {
-          // Plain fallback: a plain substring search for `end_tag` suffices.
-          // Any `<arg_value>` literal inside the payload is opaque text, not
-          // a structural region.
-          return payload.find(end_tag).map(|rel| payload_at + rel);
+        // A valid XML-style payload cannot have `<arg_value>` before
+        // `<arg_key>` (`find_kv_pairs` requires key-then-value), so a
+        // prefix-bounded "no `<arg_key>` before end_tag ⇒ plain" rule is
+        // sound. If neither end_tag nor `<arg_key>` is present yet, the
+        // scanner returns `None` and the processor keeps collecting.
+        let first_end = payload.find(end_tag);
+        let first_key = payload.find("<arg_key>");
+        match (first_end, first_key) {
+          // `<arg_key>` arrives STRICTLY before any candidate `end_tag` —
+          // XML-aware path (must wait for the matching `</arg_value>` and
+          // then the real `end_tag` after the value-close).
+          (Some(e), Some(k)) if k < e => {
+            xml_value_aware_end_tag_scan(payload, "<arg_value>", "</arg_value>", end_tag)
+              .map(|rel| payload_at + rel)
+          }
+          // No `end_tag` yet but `<arg_key>` is present — also XML-aware
+          // (the close hasn't arrived, the value-aware scan will keep
+          // collecting; if the next chunk delivers `end_tag` first, the
+          // race re-evaluates on the next call).
+          (None, Some(_)) => {
+            xml_value_aware_end_tag_scan(payload, "<arg_value>", "</arg_value>", end_tag)
+              .map(|rel| payload_at + rel)
+          }
+          // `end_tag` is reachable AT or BEFORE any `<arg_key>` — plain
+          // fallback: return the end_tag offset directly. Trailing display
+          // after `end_tag` cannot influence this decision because the
+          // `<arg_key>` check is bounded by `e`. Any `<arg_value>` literal
+          // inside the plain payload is opaque text.
+          (Some(e), _) => Some(payload_at + e),
+          // Neither `end_tag` nor `<arg_key>` yet — keep collecting.
+          (None, None) => None,
         }
-        xml_value_aware_end_tag_scan(payload, "<arg_value>", "</arg_value>", end_tag)
-          .map(|rel| payload_at + rel)
       }
     }
   }
@@ -4505,6 +4533,87 @@ mod tests {
       c[0].arguments,
       serde_json::json!({"s": "v"}),
       "XML-aware routing recovers the key/value pair"
+    );
+  }
+
+  // L9 R9: the R8 simple `<arg_key>`-presence rule scans the ENTIRE buffer
+  // (including bytes AFTER the real `</tool_call>` end). A valid plain payload
+  // like `<tool_call>echo <arg_value></tool_call> after <arg_key>` has no
+  // `<arg_key>` in the actual payload, but the trailing display contains
+  // `<arg_key>` → discriminator would flip to XML-aware → scanner waits for
+  // `</arg_value>` that never comes → buffer grows to cap → call dropped.
+  // The fix bounds the discriminator to the prefix up to a candidate end_tag:
+  // race the first end_tag against the first `<arg_key>` and only when the
+  // key arrives STRICTLY BEFORE the end_tag is this an XML-style payload.
+
+  #[test]
+  fn streaming_glm47_plain_fallback_with_trailing_arg_key_in_display_does_not_block() {
+    // R9 regression: trailing display contains `<arg_key>` AFTER the real
+    // `</tool_call>` close. With the R8 unbounded scan, this would flip the
+    // discriminator into XML-aware mode and block waiting for `</arg_value>`.
+    // With the prefix-bounded race, `</tool_call>` is found at offset 0 of
+    // the search (within the payload), so the plain branch wins.
+    let (d, c) = run_with_parser(
+      Box::new(Glm47),
+      &["<tool_call>echo <arg_value></tool_call> after <arg_key>"],
+    );
+    assert_eq!(d, " after <arg_key>", "trailing display reaches caller");
+    assert_eq!(
+      c.len(),
+      1,
+      "plain-fallback call must extract (not be dropped)"
+    );
+    assert_eq!(c[0].name, "echo");
+    assert_eq!(
+      c[0].arguments,
+      serde_json::json!({"raw": "<arg_value>"}),
+      "raw `<arg_value>` literal preserved verbatim as plain arg text"
+    );
+  }
+
+  #[test]
+  fn streaming_glm47_plain_fallback_with_trailing_arg_key_in_display_split_across_chunks() {
+    // Split-chunk variant: chunk boundary lands inside the trailing
+    // ` after <arg_key>` literal. Once both halves arrive the plain branch
+    // still wins because `</tool_call>` precedes any `<arg_key>` in the
+    // combined buffer.
+    let (d, c) = run_with_parser(
+      Box::new(Glm47),
+      &[
+        "<tool_call>echo <arg_value></tool_call> after <arg",
+        "_key>",
+      ],
+    );
+    assert_eq!(d, " after <arg_key>");
+    assert_eq!(c.len(), 1, "plain-fallback call must extract across chunks");
+    assert_eq!(c[0].name, "echo");
+    assert_eq!(c[0].arguments, serde_json::json!({"raw": "<arg_value>"}));
+  }
+
+  #[test]
+  fn streaming_glm47_xml_style_with_trailing_arg_key_in_display_does_not_misroute() {
+    // Mirror case: payload IS XML-style (`<arg_key>` precedes the end_tag)
+    // and the trailing display ALSO contains a stray `<arg_key>` literal.
+    // The XML-aware scan must terminate at the FIRST `</tool_call>` that
+    // follows the value close (i.e. the one strictly after
+    // `</arg_value>`), and the trailing `<arg_key>` must reach display.
+    let (d, c) = run_with_parser(
+      Box::new(Glm47),
+      &[concat!(
+        "<tool_call><arg_key>k</arg_key><arg_value>v</arg_value>",
+        "</tool_call> bonus <arg_key>"
+      )],
+    );
+    assert_eq!(
+      d, " bonus <arg_key>",
+      "trailing display (with stray `<arg_key>`) reaches caller"
+    );
+    assert_eq!(c.len(), 1, "XML-style call must extract intact");
+    assert_eq!(c[0].name, "", "no name prefix before the first `<arg_key>`");
+    assert_eq!(
+      c[0].arguments,
+      serde_json::json!({"k": "v"}),
+      "key/value extracted via the XML-aware scan"
     );
   }
 }
