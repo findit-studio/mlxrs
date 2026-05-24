@@ -611,6 +611,217 @@ impl Default for GenConfig {
   }
 }
 
+impl GenConfig {
+  /// Eagerly validate every scalar sampler / logits-processor bound up
+  /// front (AUDIO-12 polish #136) — `temp`, `top_p`, `min_p`,
+  /// `min_tokens_to_keep`, `top_k`, `xtc_probability`, `xtc_threshold`,
+  /// `repetition_penalty`, and the `logit_bias` `(id, value)` pair-arity.
+  /// Returns the **first** bound violated as an `Err(Error::ShapeMismatch)`
+  /// with a descriptive message (the same `Err` shape the per-step
+  /// validation in [`crate::lm::sample`] surfaces, so a caller migrating
+  /// from "fails on first decode step" to "fails at config-build" sees
+  /// the same error class).
+  ///
+  /// # Why eager
+  ///
+  /// Codex #64 (the AUDIO-12 cross-reference) observed that
+  /// [`make_sampler`] / [`make_logits_processors`] build closures whose
+  /// purely-scalar bounds (`temp < 0`, `min_p > 1`, `xtc_probability` out
+  /// of range, a negative `repetition_penalty`, …) are checked INSIDE the
+  /// closure when it first runs against logits. So both
+  /// [`generate_step`] (LM) and [`crate::audio::stt::generate::stt_generate`]
+  /// (STT) had a window where an invalid `cfg` could pass the constructor
+  /// then run an entire prompt prefill (LM) — or an audio load, resample,
+  /// log-mel, and encoder pass (STT) — **before** surfacing the scalar-
+  /// bound `Err` on the first decode step. `validate()` collapses that
+  /// window: LM's [`generate_step`] calls it before any model work (the
+  /// `Err` becomes the iterator's first `pending_err` yield, like a
+  /// sampler-construction error); STT's
+  /// [`crate::audio::stt::generate::stt_generate`] calls it at the top of
+  /// the constructor (before the expensive audio pipeline runs), so a
+  /// misconfigured `cfg` fails fast in both loops with the same `Err`
+  /// regardless of which entry point the caller invokes.
+  ///
+  /// # Defense in depth
+  ///
+  /// The per-primitive validations in [`crate::lm::sample`]
+  /// (`apply_top_p` / `apply_min_p` / `apply_xtc` /
+  /// `apply_repetition_penalty` / `apply_logit_bias` / `scale_logits_by_temp`)
+  /// are **kept** — `validate()` is the eager gate but the sampler
+  /// primitives' own checks remain so a direct
+  /// `crate::lm::sample::apply_*` call (outside the generation loops) still
+  /// rejects invalid input. The eager + per-primitive validations use the
+  /// same bound predicates so the error messages match, modulo the
+  /// dynamic-bound checks (`top_k < vocab_size`, `min_tokens_to_keep <=
+  /// vocab_size`) that `validate()` can't enforce without the model's
+  /// vocab — those still surface on the first decode step.
+  ///
+  /// # Bounds checked
+  ///
+  /// - `temp.is_finite() && temp >= 0.0` — `temp == 0` is the argmax
+  ///   path (no scale), `temp > 0` is the stochastic path
+  ///   (`scale_logits_by_temp` requires `temp > 0`).
+  /// - `top_p.is_finite() && (0.0..=1.0).contains(&top_p)` —
+  ///   [`apply_top_p`][crate::lm::sample::apply_top_p] strictly requires
+  ///   `top_p > 0 && top_p <= 1`, but `make_sampler` only includes the
+  ///   stage `iff (0, 1)` so `top_p == 0` is "off" and `top_p == 1` is
+  ///   "include everything" — both no-op-equivalent, both accepted here.
+  /// - `min_p.is_finite() && (0.0..=1.0).contains(&min_p)` — mirrors
+  ///   [`apply_min_p`][crate::lm::sample::apply_min_p].
+  /// - `min_tokens_to_keep >= 1` — mirrors
+  ///   [`apply_min_p`][crate::lm::sample::apply_min_p] (the `< vocab_size`
+  ///   bound is vocab-dependent and deferred).
+  /// - `top_k >= 0` — `top_k == 0` is "off" in `make_sampler`,
+  ///   `top_k > 0` is "on" (`apply_top_k`'s `< vocab_size` bound is
+  ///   vocab-dependent and deferred).
+  /// - `xtc_probability.is_finite() && (0.0..=1.0).contains(&xtc_probability)`
+  ///   — mirrors [`apply_xtc`][crate::lm::sample::apply_xtc].
+  /// - `xtc_threshold.is_finite() && (0.0..=0.5).contains(&xtc_threshold)`
+  ///   — mirrors [`apply_xtc`][crate::lm::sample::apply_xtc].
+  /// - `repetition_penalty: Option<f32>` — if `Some(p)`, then
+  ///   `p.is_finite() && p >= 0.0` (mirrors
+  ///   [`apply_repetition_penalty`][crate::lm::sample::apply_repetition_penalty]
+  ///   and mlx-lm's `make_repetition_penalty` `ValueError`).
+  /// - `presence_penalty` / `frequency_penalty: Option<f32>` — finite-only.
+  ///   mlx-lm's `make_presence_penalty` / `make_frequency_penalty` allow
+  ///   negative values (they're additive bonuses/penalties); only `NaN` /
+  ///   `±inf` are caught here.
+  /// - `logit_bias` — every `(id, value)` `value` must be finite (no NaN
+  ///   bias). The pair-arity check (`indices.len() == values.size()`) is
+  ///   structurally impossible to fail here because
+  ///   [`make_logits_processors`] builds them from the same `Vec<(i32, f32)>`,
+  ///   but `apply_logit_bias` still checks it as defense-in-depth.
+  ///
+  /// # Not checked (out of scope)
+  ///
+  /// - `top_k < vocab_size`, `min_tokens_to_keep <= vocab_size` — both
+  ///   require knowing the model's vocab size, which is a model-load
+  ///   concern that doesn't belong on `GenConfig`. Surface on the first
+  ///   decode step like before.
+  /// - The `eos` token ids — these are tokenizer-resolved and any
+  ///   `u32` is a valid token id at this layer.
+  /// - `stop_strings` — empty strings, length, etc. are handled by
+  ///   [`crate::lm::stop::StopMatcher`].
+  /// - `prefill_step_size == 0` — clamped to `1` in [`generate_step`].
+  pub fn validate(&self) -> Result<()> {
+    // temp: finite + non-negative (temp == 0 ⇒ argmax path; temp > 0 ⇒
+    // stochastic path).
+    if !self.temp.is_finite() || self.temp < 0.0 {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "`temp` must be a finite non-negative float (0.0 = argmax, > 0.0 = stochastic), \
+           but is {}",
+          self.temp
+        ),
+      });
+    }
+    // top_p: [0, 1]. `make_sampler` gates the stage on `(0, 1)`; 0 and 1
+    // are no-op-equivalent and accepted as "off" / "include everything".
+    if !self.top_p.is_finite() || !(0.0..=1.0).contains(&self.top_p) {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "`top_p` must be a finite float in [0, 1] (0 = off, (0, 1) = nucleus cutoff, \
+           1 = include everything), but is {}",
+          self.top_p
+        ),
+      });
+    }
+    // min_p: [0, 1] (mirrors `apply_min_p`).
+    if !self.min_p.is_finite() || !(0.0..=1.0).contains(&self.min_p) {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "`min_p` must be a finite float in [0, 1], but is {}",
+          self.min_p
+        ),
+      });
+    }
+    // min_tokens_to_keep >= 1 (mirrors `apply_min_p`; the `<= vocab_size`
+    // bound is vocab-dependent and deferred to the first decode step).
+    if self.min_tokens_to_keep < 1 {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "`min_tokens_to_keep` must be a positive integer (>= 1), but is {}",
+          self.min_tokens_to_keep
+        ),
+      });
+    }
+    // top_k >= 0 (`top_k == 0` is "off"; `top_k > 0` is "on" — the
+    // `< vocab_size` bound is vocab-dependent and deferred).
+    if self.top_k < 0 {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "`top_k` must be non-negative (0 = off, > 0 = top-k cutoff), but is {}",
+          self.top_k
+        ),
+      });
+    }
+    // xtc_probability: [0, 1] (mirrors `apply_xtc`).
+    if !self.xtc_probability.is_finite() || !(0.0..=1.0).contains(&self.xtc_probability) {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "`xtc_probability` must be a finite float in [0, 1], but is {}",
+          self.xtc_probability
+        ),
+      });
+    }
+    // xtc_threshold: [0, 0.5] (mirrors `apply_xtc`).
+    if !self.xtc_threshold.is_finite() || !(0.0..=0.5).contains(&self.xtc_threshold) {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "`xtc_threshold` must be a finite float in [0, 0.5], but is {}",
+          self.xtc_threshold
+        ),
+      });
+    }
+    // repetition_penalty: finite + non-negative (mirrors
+    // `apply_repetition_penalty` + mlx-lm `make_repetition_penalty`'s
+    // `ValueError`). `None` and `Some(0.0)` are both "off" — the latter
+    // because `make_logits_processors` only includes the processor when
+    // `penalty != 0`.
+    if let Some(p) = self.repetition_penalty
+      && (!p.is_finite() || p < 0.0)
+    {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "`repetition_penalty` must be a finite non-negative float when `Some(_)`, \
+           but is {p}"
+        ),
+      });
+    }
+    // presence_penalty: finite-only. mlx-lm's `make_presence_penalty`
+    // allows negative values (presence "boost" is a negative penalty), so
+    // we only catch NaN / ±inf here.
+    if let Some(p) = self.presence_penalty
+      && !p.is_finite()
+    {
+      return Err(Error::ShapeMismatch {
+        message: format!("`presence_penalty` must be a finite float when `Some(_)`, but is {p}"),
+      });
+    }
+    // frequency_penalty: finite-only (same rationale as presence).
+    if let Some(p) = self.frequency_penalty
+      && !p.is_finite()
+    {
+      return Err(Error::ShapeMismatch {
+        message: format!("`frequency_penalty` must be a finite float when `Some(_)`, but is {p}"),
+      });
+    }
+    // logit_bias: every `(id, value)` `value` finite. `id` is `i32` and
+    // not bound here (the model's vocab is unknown; the `take`/scatter
+    // primitive will reject an out-of-range id at the first decode step).
+    for &(id, v) in &self.logit_bias {
+      if !v.is_finite() {
+        return Err(Error::ShapeMismatch {
+          message: format!(
+            "`logit_bias` value for token id {id} must be a finite float, but is {v}"
+          ),
+        });
+      }
+    }
+    Ok(())
+  }
+}
+
 /// Build the sampler function, composing the [`sample`] primitives exactly
 /// as `mlx_lm.sample_utils.make_sampler`.
 ///
@@ -820,13 +1031,43 @@ fn recent_ids(tokens: &[u32], context_size: usize) -> Result<Vec<i32>> {
 /// This is **not** drop-in source-compatible with the prior tuple item:
 /// existing `let (tok, lp) = step?;` call sites must add an explicit
 /// `.into()` (`let (tok, lp) = step?.into();`) or pattern-match the
-/// struct (`let GenStep { token, logprobs } = step?;`). The break is
+/// struct (`let GenStep { token, logprobs, .. } = step?;`). The break is
 /// **intentional** — mlxrs is pre-1.0, and the ergonomics + self-
 /// documentation win outweighs a one-line migration per call site. The
 /// `From<GenStep> for (u32, Option<Array>)` impl below makes that
 /// migration mechanical (the previous `From<GenStep> for (u32, Array)`
 /// is replaced — the `Option` shift propagates through the tuple form
-/// so call sites can't silently drop the new semantic).
+/// so call sites can't silently drop the new semantic). Pattern-match
+/// destructures should use the rest pattern (`..`) since LM-3 added
+/// `step_index` and `finish_reason` as further fields; new fields may be
+/// added in the future under the same convention.
+///
+/// # `step_index` + `finish_reason` (LM-3, polish #114)
+///
+/// LM-3 added two more named fields to mirror the existing
+/// [`BatchGenStep`]'s per-row shape (so a caller writing against either
+/// surface sees the same step envelope):
+///
+/// - `step_index: usize` — 0-based index of this step within the
+///   iterator's run. The first yielded step is `0`, the second `1`, etc.
+///   Distinct from the [`stream_generate`] / [`GenerationResponse`]'s
+///   `generation_tokens` (which is 1-indexed and counts the about-to-be-
+///   reported token, mlx-lm `n + 1`). Useful for callers that want a
+///   stable per-step identifier without re-counting via `enumerate()`.
+/// - `finish_reason: Option<String>` — `None` for ordinary steps,
+///   `Some("stop")` on the EOS-token step (the final yielded item when a
+///   sampled token is in [`GenConfig::eos`]). Note that single-seq
+///   generation does NOT emit a `Some("length")` step — mlx-lm's
+///   `if n == max_tokens: break` happens BEFORE the yield, so the
+///   `max_tokens` finish is signalled by the iterator simply ending
+///   (`next() == None`), not by a final `length`-tagged step. This
+///   mirrors mlx-lm's `generate_step` exactly (the `"length"` reason is
+///   computed by the higher-level [`stream_generate`] wrapper when it
+///   detects the iterator ended without an EOS-tagged step). Batch
+///   generation ([`BatchGenStep`]) DOES yield `Some("length")` per row
+///   because the iterator can't end the run as a whole until every row
+///   has finished — so per-row `length` must be signaled inline. Both
+///   surfaces are byte-faithful to their upstream parallel.
 #[derive(Debug)]
 pub struct GenStep {
   /// The sampled token id (mlx-lm `y.item()`).
@@ -835,6 +1076,20 @@ pub struct GenStep {
   /// `logprobs.squeeze(0)`), kept lazy. `Some` iff
   /// [`GenConfig::collect_logprobs`] was `true` for this run.
   pub logprobs: Option<Array>,
+  /// 0-based index of this step within the iterator's run (`0` for the
+  /// first yielded step, `1` for the second, …). LM-3 polish #114 — a
+  /// stable per-step identifier so callers don't have to wrap the
+  /// iterator in `enumerate()` just to know which step they're on.
+  pub step_index: usize,
+  /// `None` for ordinary steps; `Some("stop")` on the EOS-token step
+  /// (the final yielded item when a sampled token is in
+  /// [`GenConfig::eos`]). LM-3 polish #114 — mirrors the existing
+  /// [`BatchGenStep::finish_reason`] field so single-seq + batch surfaces
+  /// share a step envelope. NOTE: `Some("length")` is NEVER emitted at
+  /// this layer (mlx-lm `generate_step` `break`s BEFORE the
+  /// `max_tokens`-th yield); the [`stream_generate`] wrapper computes
+  /// the `"length"` reason itself.
+  pub finish_reason: Option<String>,
 }
 
 impl From<GenStep> for (u32, Option<Array>) {
@@ -1109,7 +1364,18 @@ impl<M: Model + ?Sized> Generator<'_, M> {
     } else {
       None
     };
-    Ok(GenStep { token, logprobs })
+    // LM-3 #114: `step_index` + `finish_reason` are set provisionally to
+    // `self.produced` (== "tokens yielded so far before this one") +
+    // `None`; the [`Iterator::next`] impl overrides `finish_reason` to
+    // `Some("stop")` on the EOS-token step (the only `Some(_)` value
+    // single-seq generation produces — `length` is signalled by the
+    // iterator ending, see the field doc).
+    Ok(GenStep {
+      token,
+      logprobs,
+      step_index: self.produced,
+      finish_reason: None,
+    })
   }
 }
 
@@ -1170,7 +1436,7 @@ impl<M: Model + ?Sized> Iterator for Generator<'_, M> {
     };
 
     match self.step(&input) {
-      Ok(step) => {
+      Ok(mut step) => {
         self.produced += 1;
         self.last = Some(step.token);
         // Spec §3: `generate_step` itself stops on an eos token (it carries
@@ -1178,6 +1444,12 @@ impl<M: Model + ?Sized> Iterator for Generator<'_, M> {
         // `stream_generate` breaks) — so yield it, then fuse.
         if self.eos.contains(&step.token) {
           self.done = true;
+          // LM-3 #114: surface the "stop" reason on the yielded EOS step
+          // (mirrors `BatchGenStep::finish_reason` semantics). `length` is
+          // never set here — `if produced >= max_tokens` above returns
+          // `None` BEFORE a step runs, mirroring mlx-lm `generate_step`'s
+          // pre-yield break exactly.
+          step.finish_reason = Some("stop".to_string());
         }
         Some(Ok(step))
       }
@@ -1304,6 +1576,18 @@ pub(crate) fn build_generator<'a, M: Model + ?Sized>(
         message: "generate: prompt must be non-empty".into(),
       });
     }
+    // AUDIO-12 #136: eager scalar-bound validation of every sampler /
+    // logits-processor knob in `cfg` BEFORE any prompt prefill / model
+    // work. Codex #64 surfaced that the sampler-build path only catches
+    // a SUBSET of bounds at build time; the per-primitive validations
+    // in `apply_*` only fire when the closure runs against logits, so
+    // an invalid `cfg` would pass the constructor + run an entire
+    // prompt prefill before erroring on the first decode step. Calling
+    // `cfg.validate()` here fails fast — the `Err` propagates through
+    // the existing `pending_err` channel so the iterator's first
+    // `next()` yields it without any model call, matching the surface
+    // shape already used for the prompt-empty / sampler-build Errs above.
+    cfg.validate()?;
     let sampler = make_sampler(
       cfg.temp,
       cfg.top_p,
@@ -1552,7 +1836,18 @@ pub fn stream_generate<'a, M: Model + ?Sized>(
     if finished {
       return None;
     }
-    let GenStep { token, logprobs } = match steps.next()? {
+    // LM-3 #114: `..` for forward compatibility — `GenStep` now also
+    // carries `step_index` + `finish_reason`. `stream_generate` recomputes
+    // its OWN `finish_reason` for `GenerationResponse` (`"stop"` on eos,
+    // `"length"` on `max_tokens`, factoring in stop-strings via the
+    // [`crate::lm::stop::StopMatcher`]) so the per-step
+    // `finish_reason` is not re-read here — the wrapper still owns that
+    // decision. `step_index` is the LM-loop's own counter (0-indexed),
+    // distinct from `generation_tokens` (1-indexed per `GenerationResponse`)
+    // so the latter stays mlx-lm parity (`n + 1`).
+    let GenStep {
+      token, logprobs, ..
+    } = match steps.next()? {
       Ok(step) => step,
       Err(e) => {
         finished = true;
@@ -2349,6 +2644,21 @@ pub fn batch_generate_step<'a, M: Model + ?Sized>(
 ) -> BatchGenerator<'a, M> {
   type Built = (Vec<Vec<u32>>, usize, Sampler, Vec<LogitsProcessor>);
   let built = (|| -> Result<Built> {
+    // AUDIO-12 #136 — eager scalar-bound validation of every sampler /
+    // logits-processor knob in `cfg` BEFORE any prefill / model work,
+    // mirroring single-seq [`generate_step`]. The sampler-build path
+    // only catches a SUBSET of bounds at build time; the per-primitive
+    // validations in `apply_*` fire only when the closure runs against
+    // real logits — so without this gate an invalid `cfg` would pass
+    // the constructor + run an entire prompt prefill before erroring
+    // on the first decode step, AND a NaN `logit_bias` / `*_penalty`
+    // could silently NaN-poison the logits without any per-primitive
+    // finite check. Calling `cfg.validate()` here fails fast — the
+    // `Err` propagates through the existing `pending_err` channel so
+    // the iterator's first `next()` yields it without any model call,
+    // matching the surface shape used for sampler-build / empty-prompt
+    // failures below.
+    cfg.validate()?;
     let (padded_rows, max_len) = left_pad_rows(prompts, pad_token_id)?;
     let sampler = make_sampler(
       cfg.temp,
@@ -2913,6 +3223,76 @@ mod batch_tests {
       emits_per_row[1]
     );
     assert_eq!(finish_per_row[1].as_deref(), Some("length"));
+  }
+
+  /// A `Model` whose every `forward` returns an error AND records that it
+  /// was called — drives the "validate fail-fast must run BEFORE any
+  /// model call" contract: if [`batch_generate_step`] regressed and called
+  /// `forward` before propagating a `cfg.validate()` failure, this model's
+  /// "mock batch forward failure" would surface instead of the validation
+  /// error AND the call counter would increment.
+  struct BatchFailModel {
+    calls: std::cell::RefCell<usize>,
+  }
+
+  impl Model for BatchFailModel {
+    fn forward(
+      &self,
+      _tokens: &Array,
+      _cache: &mut [Box<dyn crate::lm::cache::KvCache>],
+    ) -> Result<Array> {
+      *self.calls.borrow_mut() += 1;
+      Err(Error::Backend {
+        message: "mock batch forward failure".into(),
+      })
+    }
+  }
+
+  /// AUDIO-12 #136 — eager `GenConfig::validate` MUST run inside
+  /// [`batch_generate_step`]'s `built` closure BEFORE sampler /
+  /// processor construction (and so before any model / cache work).
+  /// An invalid `cfg` (negative `temp`) must surface as the iterator's
+  /// first `Err` propagated through the existing `pending_err` channel,
+  /// AND `BatchFailModel::forward` must NOT have been called (the
+  /// presence of "mock batch forward failure" or a non-zero call count
+  /// would prove the validate gate didn't fire). After the yielded
+  /// `Err` the iterator fuses (next call returns `None`).
+  #[test]
+  fn batch_generate_step_propagates_validate_err_before_forward() {
+    let model = BatchFailModel {
+      calls: std::cell::RefCell::new(0),
+    };
+    // Valid prompts so the `prompt.is_empty()` / `row.is_empty()` errs
+    // don't pre-empt the validation error we're testing.
+    let prompts: Vec<&[u32]> = vec![&[1u32, 2, 3], &[4u32]];
+    let left_pad = batch_left_padding(&prompts);
+    let cache: Vec<Box<dyn crate::lm::cache::KvCache>> =
+      vec![Box::new(BatchKvCache::new(&left_pad))];
+    let cfg = GenConfig {
+      temp: -1.0, // invalid: validate must reject
+      max_tokens: 4,
+      ..GenConfig::default()
+    };
+
+    let mut it = batch_generate_step(&model, &prompts, 0, cache, cfg);
+    let first = it.next().expect("iterator yields at least one item");
+    let err = first.expect_err("validation Err must propagate");
+    let msg = format!("{err:?}");
+    assert!(
+      msg.contains("temp"),
+      "yielded validation error, not the forward error (validate ran BEFORE forward): {msg}"
+    );
+    assert!(
+      !msg.contains("mock batch forward failure"),
+      "model.forward must NOT have been called (validate fail-fast): {msg}"
+    );
+    assert_eq!(
+      *model.calls.borrow(),
+      0,
+      "model.forward was called {} time(s) — validate gate did not fail-fast",
+      *model.calls.borrow()
+    );
+    assert!(it.next().is_none(), "iterator fuses after the yielded Err");
   }
 }
 

@@ -548,6 +548,19 @@ impl<'a> SpeculativeDriver<'a> {
         message: "speculative_generate: prompt must be non-empty".into(),
       });
     }
+    // AUDIO-12 #136 — eager scalar-bound validation of every sampler /
+    // logits-processor knob in `cfg` BEFORE any prefill / model work,
+    // mirroring single-seq [`crate::lm::generate::generate_step`] and
+    // [`crate::lm::generate::batch_generate_step`]. Without this gate
+    // an invalid `cfg` would pass the sampler / processor constructors
+    // (which only catch a subset of bounds) and run the entire target +
+    // draft prefill before erroring on the first decode step; a NaN
+    // `logit_bias` / `*_penalty` would silently NaN-poison logits at
+    // both verifier and draft samplers without any per-primitive finite
+    // check. The `Err` surfaces as the [`SpeculativeStream`]'s deferred
+    // `pending_err` and is yielded on the iterator's first `next()`
+    // without any model call.
+    cfg.validate()?;
     let sampler = make_sampler(
       cfg.temp,
       cfg.top_p,

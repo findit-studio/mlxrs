@@ -232,6 +232,23 @@ pub fn vlm_generate<'a, M: Model + ?Sized>(
   cache: Vec<Box<dyn KvCache>>,
   cfg: VlmGenConfig,
 ) -> Result<impl Iterator<Item = Result<GenStep>> + 'a> {
+  // ── EAGER `cfg.lm.validate()` ────────────────────────────────────────
+  // AUDIO-12 #136 — mirror single-seq [`crate::lm::generate::generate_step`]'s
+  // eager validation gate ACROSS BOTH VLM branches. The zero-image branch
+  // delegates to `generate_step` (which validates internally), but the
+  // multimodal branch builds its own sampler / logits-processors below
+  // and would otherwise burn the entire vision pipeline (load /
+  // preprocess / encode_image, possibly multi-image) before the first
+  // decode step surfaced an invalid bound — or silently NaN-poisoned
+  // logits via a NaN `logit_bias` / `*_penalty` that the per-primitive
+  // path does not finite-check. Validating HERE — synchronously, before
+  // the `max_tokens == 0` / zero-image / multimodal split — also gives
+  // the `max_tokens == 0` short-circuit identical "invalid config is
+  // always Err, never silent" semantics it has on the LM side, so
+  // `vlm_generate` is uniformly fail-fast on a bad cfg regardless of
+  // image count or zero-budget.
+  cfg.lm.validate()?;
+
   // ── max_tokens == 0 SHORT-CIRCUIT ────────────────────────────────────
   // Mirror the LM-side contract: `lm::generate`'s iterator checks
   // `produced >= max_tokens` BEFORE running prefill (generate.rs:598),
@@ -615,9 +632,14 @@ impl<M: Model + ?Sized> VlmDecode<'_, M> {
     // `step.logprobs.unwrap()` / `.as_ref()` — the same source-break the
     // LM crate accepts).
     let logprobs = ops::shape::squeeze_axes(&logprobs, &[0])?;
+    // LM-3 #114: provisional `step_index`/`finish_reason` — the iterator
+    // overrides `finish_reason` to `Some("stop")` on the EOS-token step
+    // (mirrors `lm::generate::Generator::step` + its `Iterator::next`).
     Ok(GenStep {
       token,
       logprobs: Some(logprobs),
+      step_index: self.produced,
+      finish_reason: None,
     })
   }
 
@@ -865,7 +887,7 @@ impl<M: Model + ?Sized> Iterator for VlmDecode<'_, M> {
     };
 
     match step_result {
-      Ok(step) => {
+      Ok(mut step) => {
         self.produced += 1;
         self.last = Some(step.token);
         // Same eos discipline as `lm::generate`: the eos token IS
@@ -873,6 +895,9 @@ impl<M: Model + ?Sized> Iterator for VlmDecode<'_, M> {
         // iterator fuses.
         if self.eos.contains(&step.token) {
           self.done = true;
+          // LM-3 #114: surface "stop" on the EOS-token step (matches
+          // `lm::generate::Generator::next`).
+          step.finish_reason = Some("stop".to_string());
         }
         Some(Ok(step))
       }

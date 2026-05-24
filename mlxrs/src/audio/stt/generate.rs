@@ -418,9 +418,14 @@ impl<M: super::model::Model> SttGenerator<'_, M> {
     // the [`crate::lm::generate::GenConfig::collect_logprobs`] opt-in,
     // so we always emit `Some` to preserve the prior unconditional yield.
     let logprobs = ops::shape::squeeze_axes(&logprobs, &[0])?;
+    // LM-3 #114: provisional `step_index`/`finish_reason` — the iterator
+    // overrides `finish_reason` to `Some("stop")` on the EOS step,
+    // mirroring `lm::generate::Generator::step` + its `Iterator::next`.
     Ok(GenStep {
       token,
       logprobs: Some(logprobs),
+      step_index: self.produced,
+      finish_reason: None,
     })
   }
 }
@@ -443,7 +448,7 @@ impl<M: super::model::Model> Iterator for SttGenerator<'_, M> {
     }
 
     match self.step() {
-      Ok(step) => {
+      Ok(mut step) => {
         self.produced += 1;
         let token = step.token;
         self.last = token;
@@ -452,6 +457,9 @@ impl<M: super::model::Model> Iterator for SttGenerator<'_, M> {
         // detokenizer; iteration ends after.
         if self.eos.contains(&token) {
           self.done = true;
+          // LM-3 #114: "stop" reason on the EOS step (mirrors
+          // `lm::generate::Generator::next` + VLM).
+          step.finish_reason = Some("stop".to_string());
         }
         Some(Ok(step))
       }
@@ -506,22 +514,33 @@ pub fn stt_generate<'a, M: super::model::Model>(
   cache: Vec<Box<dyn KvCache>>,
   cfg: SttGenConfig,
 ) -> Result<SttGenerator<'a, M>> {
+  // AUDIO-12 #136: eager scalar-bound validation of every sampler /
+  // logits-processor knob in `cfg.lm` BEFORE the audio pipeline runs.
+  // Codex #64 (the AUDIO-12 cross-reference) noted that the sampler-
+  // build path catches only a SUBSET of bounds at build time (the
+  // per-primitive validations in `crate::lm::sample::apply_*` only fire
+  // when the closure runs against logits), so an invalid `cfg` would
+  // pass the constructor + run the entire audio load + resample + mel +
+  // encode pipeline before erroring on the first decode step.
+  // `cfg.lm.validate()` collapses that window — a misconfigured
+  // sampler / penalty fails fast from the constructor without paying
+  // the audio / encode cost, mirroring the same eager gate
+  // [`crate::lm::generate::generate_step`] uses (one coordinated
+  // change, both loops uniformly).
+  cfg.lm.validate()?;
+
   // Build the sampler / logits-processor chain FIRST — BEFORE the
   // expensive audio load + resample + mel + `encode_audio` pipeline, so a
   // gen config that `make_sampler` / `make_logits_processors` rejects at
   // BUILD time (e.g. a logit_bias index/value-arity mismatch) fails fast
   // from the constructor without paying the audio/encode cost (Codex #64
-  // finding). NOTE: `make_sampler` validates only some constraints
-  // eagerly; purely-scalar bounds (`temp < 0`, `min_p > 1`,
-  // `xtc_probability` out of range, a negative penalty) are checked
-  // INSIDE the sampler/processor closure when it first runs against
-  // logits — so those still surface on the iterator's first decode step,
-  // exactly as in `lm::generate::generate_step` (the STT loop mirrors the
-  // LM loop's deferred-runtime-validation behavior, NOT a divergent
-  // audio-only eager pass). A fully-eager `GenConfig::validate()` shared
-  // by both loops is tracked as a coordinated follow-up (AUDIO-12). Built
-  // by reference from `cfg.lm` so `cfg` stays intact for
-  // `audio_path_to_mel`; the owned fields are moved out afterward.
+  // finding). The eager `cfg.lm.validate()` above covers every scalar
+  // sampler / processor bound; the closure-build path still catches the
+  // dynamic-bound + `make_sampler`-internal constraints (e.g. a
+  // logit_bias `(indices, values)` arity check the eager pass can't
+  // perform without rebuilding the same vectors). Built by reference
+  // from `cfg.lm` so `cfg` stays intact for `audio_path_to_mel`; the
+  // owned fields are moved out afterward.
   let (sampler, processors) = {
     let lm = &cfg.lm;
     let sampler = make_sampler(

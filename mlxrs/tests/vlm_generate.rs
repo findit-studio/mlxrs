@@ -1616,3 +1616,183 @@ fn vlm_generate_does_not_build_unused_attention_mask() {
   // Sanity: prefill embed shape was [1, 102, 4].
   assert_eq!(model.forward_emb_calls.borrow()[0], vec![1_usize, 102, 4]);
 }
+
+// ────────────────────── AUDIO-12 #136: eager cfg.lm.validate ─────────────
+
+/// `vlm_generate` MUST call `cfg.lm.validate()` at the TOP of the function
+/// — BEFORE the `max_tokens == 0` short-circuit, BEFORE the zero-image /
+/// multimodal split, and (most importantly) BEFORE any image
+/// load / preprocess / encode_image call. An invalid `cfg.lm` (NaN
+/// `logit_bias` here) must surface as the synchronous `Err` returned by
+/// `vlm_generate` itself — no Iterator construction, no vision pipeline,
+/// no model trait calls. The mock's call-count assertions prove the
+/// vision pipeline never ran; the nonexistent image path proves
+/// `load_image` was never reached (a `load_image` call on a missing path
+/// would surface a different "no such file" error).
+#[test]
+fn vlm_generate_rejects_invalid_lm_config_before_image_load() {
+  let model = MockVlmModel::new(/*vocab=*/ 5, /*D=*/ 4, /*N_per_img=*/ 3);
+  // Deliberately nonexistent path: if validation regressed and image
+  // load ran, this would surface as a "no such file" Err rather than
+  // the validation Err we expect — proving the validate gate ran first.
+  let bogus_img = PathBuf::from("/nonexistent/vlm_validate_test/image_that_does_not_exist.png");
+  let prompt = [1_u32, 2, 99, 3, 4]; // valid prompt (has marker)
+  let cfg = VlmGenConfig {
+    lm: GenConfig {
+      max_tokens: 3,
+      // NaN logit_bias value — `cfg.lm.validate()` MUST reject this.
+      // Without an eager validate, the multimodal branch builds its
+      // sampler / processors AFTER the vision pipeline, so a bad cfg
+      // would burn `load_image` + `preprocess` + `encode_image` before
+      // erroring (and a NaN bias could silently NaN-poison logits at
+      // the first decode step rather than erroring at all).
+      logit_bias: vec![(0, 1.0), (1, f32::NAN)],
+      ..Default::default()
+    },
+    image_token_id: 99,
+    image_marker_id: None,
+    num_tokens_per_image: 3,
+    marker_policy: MarkerPolicy::Required,
+  };
+  let res = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[bogus_img],
+    mock_cache(),
+    cfg,
+  );
+  let err = match res {
+    Ok(_) => panic!("vlm_generate must return Err for an invalid cfg.lm (NaN logit_bias)"),
+    Err(e) => e,
+  };
+  let msg = format!("{err}");
+  assert!(
+    msg.contains("logit_bias"),
+    "vlm_generate surfaced an error that does not reference logit_bias — \
+     validate fail-fast may have regressed (got: {msg})"
+  );
+  assert!(
+    !msg.contains("nonexistent")
+      && !msg.contains("No such file")
+      && !msg.contains("image_that_does_not_exist"),
+    "vlm_generate reached image load before validate — fail-fast regression (got: {msg})"
+  );
+
+  // Mock-trait call counters: every VLM-side method MUST be unobserved.
+  assert!(
+    model.encode_calls.borrow().is_empty(),
+    "encode_image was called {} time(s); validate gate did not fail-fast",
+    model.encode_calls.borrow().len(),
+  );
+  assert!(
+    model.embed_calls.borrow().is_empty(),
+    "embed_tokens was called; validate gate did not fail-fast",
+  );
+  assert!(
+    model.merge_calls.borrow().is_empty(),
+    "merge_embeddings was called; validate gate did not fail-fast",
+  );
+  assert!(
+    model.forward_emb_calls.borrow().is_empty(),
+    "forward_embeddings was called; validate gate did not fail-fast",
+  );
+  assert!(
+    model.forward_calls.borrow().is_empty(),
+    "forward was called; validate gate did not fail-fast",
+  );
+}
+
+/// Companion: invalid `cfg.lm` MUST be rejected even with `images=[]`
+/// — the zero-image branch in `vlm_generate` delegates to
+/// `lm::generate::generate_step` (which validates internally), so this
+/// branch was already covered before #136. The eager validate at the
+/// top of `vlm_generate` collapses BOTH branches to the same surface:
+/// the `vlm_generate` `Result` is synchronously `Err` on a bad cfg,
+/// without entering the Iterator construction at all.
+#[test]
+fn vlm_generate_rejects_invalid_lm_config_no_images() {
+  let model = MockVlmModel::new(/*vocab=*/ 5, /*D=*/ 4, /*N_per_img=*/ 3);
+  let prompt = [1_u32, 2, 3];
+  let cfg = VlmGenConfig {
+    lm: GenConfig {
+      max_tokens: 2,
+      temp: -1.0, // invalid: validate must reject
+      ..Default::default()
+    },
+    image_token_id: 99,
+    image_marker_id: None,
+    num_tokens_per_image: 3,
+    marker_policy: MarkerPolicy::Required,
+  };
+  let res = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[],
+    mock_cache(),
+    cfg,
+  );
+  match res {
+    Ok(_) => panic!("vlm_generate must return Err for an invalid cfg.lm (negative temp)"),
+    Err(e) => {
+      let msg = format!("{e}");
+      assert!(
+        msg.contains("temp"),
+        "expected validation error referencing `temp`, got: {msg}"
+      );
+    }
+  }
+  // No model trait method should have been called either.
+  assert!(model.forward_calls.borrow().is_empty());
+  assert!(model.forward_emb_calls.borrow().is_empty());
+  assert!(model.encode_calls.borrow().is_empty());
+  assert!(model.embed_calls.borrow().is_empty());
+  assert!(model.merge_calls.borrow().is_empty());
+}
+
+/// Companion: invalid `cfg.lm` MUST be rejected EVEN with
+/// `cfg.lm.max_tokens == 0` (the zero-budget short-circuit). Previously
+/// the `max_tokens == 0` branch returned an empty Iterator unconditionally,
+/// meaning a bad cfg silently produced an empty result instead of erroring.
+/// With the eager validate at the top of `vlm_generate`, the surface is
+/// uniformly "bad cfg = Err" regardless of `max_tokens`.
+#[test]
+fn vlm_generate_rejects_invalid_lm_config_under_zero_max_tokens() {
+  let model = MockVlmModel::new(/*vocab=*/ 5, /*D=*/ 4, /*N_per_img=*/ 3);
+  let prompt = [1_u32, 2, 99, 3, 4];
+  let cfg = VlmGenConfig {
+    lm: GenConfig {
+      max_tokens: 0,
+      logit_bias: vec![(0, f32::INFINITY)], // invalid: not finite
+      ..Default::default()
+    },
+    image_token_id: 99,
+    image_marker_id: None,
+    num_tokens_per_image: 3,
+    marker_policy: MarkerPolicy::Required,
+  };
+  let dir = temp_dir("validate_zero_max");
+  let img = write_test_image(&dir, "img.png");
+  let res = vlm_generate(
+    &model,
+    &model.image_processor_config(),
+    &prompt,
+    &[img],
+    mock_cache(),
+    cfg,
+  );
+  match res {
+    Ok(_) => panic!(
+      "vlm_generate(max_tokens=0) must STILL return Err for an invalid cfg.lm, \
+       not silently return an empty iterator"
+    ),
+    Err(e) => {
+      let msg = format!("{e}");
+      assert!(
+        msg.contains("logit_bias"),
+        "expected validation error referencing logit_bias, got: {msg}"
+      );
+    }
+  }
+}

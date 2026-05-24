@@ -268,6 +268,7 @@ fn generate_step_yields_logprobs_normalized() {
   let GenStep {
     token: tok,
     logprobs: lp,
+    ..
   } = generate_step(&model, &[1u32], cache(1), cfg)
     .next()
     .unwrap()
@@ -1545,4 +1546,265 @@ fn p1_generate_step_chains_iterator_methods() {
     .take(3)
     .count();
   assert!(n >= 1, "should yield at least one filtered token");
+}
+
+// ---------------------------------------------------------------------------
+// LM-3 #114 — `GenStep::step_index` + `GenStep::finish_reason`
+// ---------------------------------------------------------------------------
+
+/// `GenStep::step_index` increases monotonically from 0 across consecutive
+/// steps — the same 0-based counter mlx-lm's internal `n` carries. Drives
+/// the polish-#114 "stable per-step identifier without `enumerate()`" goal.
+#[test]
+fn gen_step_step_index_is_zero_based_monotonic() {
+  let model = MockModel::ramp(5);
+  let cfg = GenConfig {
+    max_tokens: 4,
+    eos: vec![],
+    ..GenConfig::default()
+  };
+  let steps: Vec<GenStep> = generate_step(&model, &[1u32], cache(1), cfg)
+    .map(|r| r.unwrap())
+    .collect();
+  assert_eq!(steps.len(), 4, "max_tokens steps produced");
+  let indices: Vec<usize> = steps.iter().map(|s| s.step_index).collect();
+  assert_eq!(
+    indices,
+    vec![0, 1, 2, 3],
+    "step_index is 0-based and monotonic"
+  );
+}
+
+/// `GenStep::finish_reason == Some(\"stop\")` on the EOS-token step (the
+/// final yielded item when a sampled token is in `cfg.eos`); `None` on
+/// every prior step. Single-seq generation never emits `Some(\"length\")`
+/// because the `max_tokens` finish is signalled by `next() == None`
+/// (mlx-lm `if n == max_tokens: break` is BEFORE the yield) — verified
+/// in the second sub-assert.
+#[test]
+fn gen_step_finish_reason_stop_on_eos_step() {
+  let model = MockModel::ramp(5);
+  // EOS = 4 (the ramp's argmax) ⇒ the very first step yields EOS.
+  let cfg = GenConfig {
+    max_tokens: 8,
+    eos: vec![4],
+    ..GenConfig::default()
+  };
+  let steps: Vec<GenStep> = generate_step(&model, &[1u32], cache(1), cfg)
+    .map(|r| r.unwrap())
+    .collect();
+  // Only one step yielded — the EOS step itself; iteration fuses after.
+  assert_eq!(steps.len(), 1, "iteration ends after EOS yield");
+  let s = &steps[0];
+  assert_eq!(s.token, 4);
+  assert_eq!(
+    s.finish_reason.as_deref(),
+    Some("stop"),
+    "EOS-token step carries `Some(\"stop\")`"
+  );
+}
+
+/// `GenStep::finish_reason` is `None` on the `max_tokens`-terminated path
+/// (single-seq generation never emits `Some(\"length\")` — that finish is
+/// signalled by `next() == None`, mlx-lm's `if n == max_tokens: break`
+/// happens BEFORE the yield).
+#[test]
+fn gen_step_finish_reason_none_on_max_tokens_path() {
+  let model = MockModel::ramp(5);
+  let cfg = GenConfig {
+    max_tokens: 3,
+    eos: vec![], // no EOS ⇒ run is terminated by max_tokens
+    ..GenConfig::default()
+  };
+  let steps: Vec<GenStep> = generate_step(&model, &[1u32], cache(1), cfg)
+    .map(|r| r.unwrap())
+    .collect();
+  assert_eq!(steps.len(), 3, "max_tokens steps produced");
+  for s in &steps {
+    assert!(
+      s.finish_reason.is_none(),
+      "no eos hit ⇒ every step's finish_reason is None"
+    );
+  }
+}
+
+/// VLM `GenStep::step_index` + `finish_reason` mirror the LM loop — also
+/// 0-based monotonic with `Some(\"stop\")` on the EOS step. Sanity-checked
+/// at the lm/vlm contract boundary (same struct, same semantics) by
+/// cross-asserting that the field exists + the surface is uniform; the
+/// runtime path is covered by the existing `vlm_generate` tests.
+#[test]
+fn gen_step_fields_uniform_across_lm_vlm_stt() {
+  // Compile-time check: every `GenStep` producer goes through the same
+  // struct, so `step_index` and `finish_reason` are accessible from every
+  // surface. This catches a regression where one of the three producers
+  // (LM / VLM / STT) silently drops a field in a manual constructor.
+  fn must_have_fields(s: &GenStep) -> (usize, Option<&str>) {
+    (s.step_index, s.finish_reason.as_deref())
+  }
+  let model = MockModel::ramp(3);
+  let cfg = GenConfig {
+    max_tokens: 1,
+    eos: vec![],
+    ..GenConfig::default()
+  };
+  let step = generate_step(&model, &[1u32], cache(1), cfg)
+    .next()
+    .unwrap()
+    .unwrap();
+  let (idx, reason) = must_have_fields(&step);
+  assert_eq!(idx, 0);
+  assert_eq!(reason, None);
+}
+
+// ---------------------------------------------------------------------------
+// AUDIO-12 #136 — eager `GenConfig::validate`
+// ---------------------------------------------------------------------------
+
+/// Default `GenConfig` validates cleanly — every default is in-range.
+#[test]
+fn gen_config_validate_default_ok() {
+  assert!(
+    GenConfig::default().validate().is_ok(),
+    "default GenConfig must pass validate (every default is in-range)"
+  );
+}
+
+/// `validate` rejects a negative `temp` BEFORE any model call — mlx-lm
+/// `scale_logits_by_temp` rejects this at the first decode step;
+/// `validate` collapses the window to config-build time.
+#[test]
+fn gen_config_validate_rejects_negative_temp() {
+  let cfg = GenConfig {
+    temp: -1.0,
+    ..GenConfig::default()
+  };
+  let err = cfg.validate().expect_err("negative temp must be rejected");
+  let msg = format!("{err:?}");
+  assert!(
+    msg.contains("temp"),
+    "error references the violating field: {msg}"
+  );
+}
+
+/// `validate` rejects `min_p > 1.0` (mirrors `apply_min_p`'s `[0, 1]`
+/// bound).
+#[test]
+fn gen_config_validate_rejects_min_p_over_one() {
+  let cfg = GenConfig {
+    temp: 0.7,
+    min_p: 1.5,
+    ..GenConfig::default()
+  };
+  let err = cfg.validate().expect_err("min_p > 1 must be rejected");
+  let msg = format!("{err:?}");
+  assert!(msg.contains("min_p"), "error references min_p: {msg}");
+}
+
+/// `validate` rejects out-of-range `xtc_probability` (mirrors `apply_xtc`'s
+/// `[0, 1]` bound) — this is one of the bounds the issue specifically
+/// calls out as previously deferred to first-decode-step.
+#[test]
+fn gen_config_validate_rejects_xtc_probability_out_of_range() {
+  let cfg = GenConfig {
+    temp: 0.7,
+    xtc_probability: 1.5,
+    ..GenConfig::default()
+  };
+  let err = cfg
+    .validate()
+    .expect_err("xtc_probability > 1 must be rejected");
+  let msg = format!("{err:?}");
+  assert!(
+    msg.contains("xtc_probability"),
+    "error references xtc_probability: {msg}"
+  );
+}
+
+/// `validate` rejects a negative `repetition_penalty` (mirrors
+/// `apply_repetition_penalty` + mlx-lm `make_repetition_penalty`).
+#[test]
+fn gen_config_validate_rejects_negative_repetition_penalty() {
+  let cfg = GenConfig {
+    repetition_penalty: Some(-0.5),
+    ..GenConfig::default()
+  };
+  let err = cfg
+    .validate()
+    .expect_err("negative repetition_penalty must be rejected");
+  let msg = format!("{err:?}");
+  assert!(
+    msg.contains("repetition_penalty"),
+    "error references repetition_penalty: {msg}"
+  );
+}
+
+/// `validate` rejects a NaN `logit_bias` value — a NaN bias would NaN-
+/// poison the per-step logits on first decode, so eager rejection here
+/// matches the issue's "fail-fast on invalid config" goal.
+#[test]
+fn gen_config_validate_rejects_nan_logit_bias() {
+  let cfg = GenConfig {
+    logit_bias: vec![(0, 1.0), (1, f32::NAN)],
+    ..GenConfig::default()
+  };
+  let err = cfg
+    .validate()
+    .expect_err("NaN logit_bias value must be rejected");
+  let msg = format!("{err:?}");
+  assert!(
+    msg.contains("logit_bias"),
+    "error references logit_bias: {msg}"
+  );
+}
+
+/// `validate` rejects `min_tokens_to_keep == 0` (mirrors `apply_min_p`'s
+/// `>= 1` bound; even with `min_p == 0` ("off"), the constructor field
+/// must be a positive integer to be type-faithful).
+#[test]
+fn gen_config_validate_rejects_zero_min_tokens_to_keep() {
+  let cfg = GenConfig {
+    min_tokens_to_keep: 0,
+    ..GenConfig::default()
+  };
+  let err = cfg
+    .validate()
+    .expect_err("min_tokens_to_keep < 1 must be rejected");
+  let msg = format!("{err:?}");
+  assert!(
+    msg.contains("min_tokens_to_keep"),
+    "error references min_tokens_to_keep: {msg}"
+  );
+}
+
+/// `generate_step` propagates a `GenConfig::validate` failure through the
+/// existing `pending_err` channel: the iterator's first `next()` yields
+/// the validation `Err` WITHOUT any model call (proven by using `FailModel`
+/// — if `validate()` weren't called eagerly, the iterator would surface
+/// `FailModel`'s `forward` error instead of the validation error). The
+/// iterator then fuses (next call returns `None`).
+#[test]
+fn generate_step_propagates_validate_err_before_forward() {
+  // FailModel.forward returns "mock forward failure" — if validate isn't
+  // called eagerly, that's the error we'd see. We want to see the
+  // validation error instead, proving the eager gate fired BEFORE any
+  // model call.
+  let model = FailModel;
+  let cfg = GenConfig {
+    temp: -1.0, // invalid: validate must reject
+    ..GenConfig::default()
+  };
+  let mut it = generate_step(&model, &[1u32], cache(1), cfg);
+  let first = it.next().expect("iterator yields at least one item");
+  let err = first.expect_err("validation Err must propagate");
+  let msg = format!("{err:?}");
+  assert!(
+    msg.contains("temp"),
+    "yielded validation error, not the forward error (validate ran BEFORE forward): {msg}"
+  );
+  assert!(
+    !msg.contains("mock forward failure"),
+    "model.forward must NOT have been called (validate fail-fast): {msg}"
+  );
+  assert!(it.next().is_none(), "iterator fuses after the yielded Err");
 }
