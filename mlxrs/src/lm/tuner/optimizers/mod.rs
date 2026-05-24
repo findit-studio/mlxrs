@@ -82,4 +82,5 @@ pub use lion::Lion;
 pub use multi::MultiOptimizer;
 pub use muon::Muon;
 pub use rmsprop::RMSprop;
+pub use schedulers::{Schedule, cosine_decay, exponential_decay, join_schedules, linear_schedule, step_decay};
 pub use sgd::SGD;
