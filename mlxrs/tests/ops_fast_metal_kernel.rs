@@ -23,6 +23,10 @@
 //!   output_name but the per-call `MetalKernelApplyConfig` supplies two
 //!   output_shapes; `apply` returns `Error::ShapeMismatch` without touching
 //!   the device.
+//! - `apply_accepts_valid_multi_dim_output_shape` — a 1-input, 1-output
+//!   kernel produces a `[4, 8, 16]`-shaped output; sanity-checks that a
+//!   ranked-3 output_shape routes through the FFI without tripping the
+//!   wrapper's new empty / negative-dim rejections.
 
 #![cfg(target_os = "macos")]
 
@@ -132,6 +136,45 @@ fn multi_output_kernel_emits_two_arrays() {
   let diff: Vec<f32> = outs[1].to_vec().unwrap();
   assert_eq!(sum, vec![6.0, 6.0, 6.0, 6.0]);
   assert_eq!(diff, vec![4.0, 4.0, 4.0, 4.0]);
+}
+
+#[test]
+#[ignore = "requires a Metal-capable GPU"]
+fn apply_accepts_valid_multi_dim_output_shape() {
+  // Sanity-check the FFI round-trip for a ranked-3 output shape: every
+  // dimension is positive and the slice is non-empty, so the wrapper's
+  // new `validate_dims` + empty-shape guard pass through and `dim_ptr`
+  // forwards `Vec::as_ptr()` unchanged. The kernel itself writes a
+  // constant so the test asserts shape + dtype rather than per-element
+  // contents.
+  let input = Array::ones::<f32>(&[4, 8, 16]).unwrap();
+  let kernel = MetalKernel::new(
+    "constant_3d_kernel",
+    &["input"],
+    &["out"],
+    "uint elem = thread_position_in_grid.x;
+     out[elem] = input[elem] * 2.0;",
+    "",
+    /* ensure_row_contiguous */ true,
+    /* atomic_outputs */ false,
+  )
+  .unwrap();
+
+  let cfg = MetalKernelApplyConfig::new(
+    /* grid */ (4 * 8 * 16, 1, 1),
+    /* thread_group */ (32, 1, 1),
+    /* output_shapes */ vec![vec![4, 8, 16]],
+    /* output_dtypes */ vec![Dtype::F32],
+  );
+  let mut outs = kernel.apply(&[&input], &cfg).unwrap();
+  assert_eq!(outs.len(), 1);
+  assert_eq!(outs[0].shape(), vec![4, 8, 16]);
+  assert_eq!(outs[0].dtype().unwrap(), Dtype::F32);
+  let buf: Vec<f32> = outs[0].to_vec().unwrap();
+  assert_eq!(buf.len(), 4 * 8 * 16);
+  for (i, v) in buf.iter().enumerate() {
+    assert!((v - 2.0_f32).abs() < 1e-5, "out[{i}] = {v}, expected 2.0");
+  }
 }
 
 #[test]

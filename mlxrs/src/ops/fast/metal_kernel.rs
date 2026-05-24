@@ -384,6 +384,9 @@ impl MetalKernel {
   ///   `config.output_dtypes.len()` disagrees with the declared
   ///   `output_names` count, or if those two `Vec`s disagree with each
   ///   other.
+  /// - [`Error::ShapeMismatch`] if any entry in `config.output_shapes`
+  ///   contains a negative dimension (rejected before mlx-c via
+  ///   [`crate::shape::validate_dims`]).
   /// - [`Error::Backend`] if a template-arg name contains an interior NUL
   ///   byte (rejected before mlx-c).
   /// - [`Error::Backend`] if any mlx-c `_set_*` / `_add_*` / `_apply` call
@@ -413,6 +416,33 @@ impl MetalKernel {
       });
     }
 
+    // Validate every output shape BEFORE any FFI allocation so a negative dim
+    // (which would silently sign-extend as a `usize` inside the C++ vector
+    // constructor and corrupt allocation/copy bookkeeping) is rejected at the
+    // safe boundary. Mirrors the `validate_dims` precedent in `ops::random`.
+    // Also rejects empty (rank-0 / scalar) output shapes: mlx-c custom Metal
+    // kernels require a ranked output_arg (`mlx::core::Shape` with `size > 0`)
+    // — surfacing the rejection here gives a wrapper-context error instead of
+    // a JIT-time backend message, and prevents the empty-slice case from
+    // ever reaching the FFI (where it would otherwise rely on `dim_ptr`'s
+    // sentinel for defined-pointer semantics).
+    for (idx, shape) in config.output_shapes.iter().enumerate() {
+      if shape.is_empty() {
+        return Err(Error::ShapeMismatch {
+          message: format!(
+            "mlxrs::ops::fast::metal_kernel: output_shapes[{idx}] is empty; \
+             custom Metal kernel outputs must have rank ≥ 1"
+          ),
+        });
+      }
+      crate::shape::validate_dims(shape).map_err(|e| match e {
+        Error::ShapeMismatch { message } => Error::ShapeMismatch {
+          message: format!("mlxrs::ops::fast::metal_kernel: output_shapes[{idx}]: {message}"),
+        },
+        other => other,
+      })?;
+    }
+
     // Resolve the stream FIRST so its cleared-thread poison guard fires
     // before any allocation — matches `ops::quantized::quantize` / `svd`.
     let stream = default_stream();
@@ -433,18 +463,23 @@ impl MetalKernel {
       );
     }
 
-    // Output arg slots — one (shape, dtype) per declared output_name.
+    // Output arg slots — one (shape, dtype) per declared output_name. Dim
+    // validation already ran above; the per-call `dim_ptr` sentinel keeps an
+    // empty `Vec<i32>` from passing a singular dangling pointer into mlx-c's
+    // `std::vector<int>` range constructor.
     for (shape, dtype) in config.output_shapes.iter().zip(config.output_dtypes.iter()) {
       // SAFETY: `config_raw` is the valid handle owned by `_config_guard`;
-      // `shape.as_ptr()` is a live read-only buffer of `shape.len()` `c_int`s
-      // (`shape: &Vec<i32>` is borrowed for the full loop iteration). mlx-c
-      // copies into a `mlx::core::Shape` (`std::vector<int>`), retaining no
-      // pointer past the call; rc via `check()`. The `dtype` enum-to-raw
-      // conversion is a const map (`Dtype: Copy`).
+      // `crate::shape::dim_ptr(shape)` is either `shape.as_ptr()` (a live
+      // read-only buffer of `shape.len()` `c_int`s, with `shape: &Vec<i32>`
+      // borrowed for the full loop iteration) or, for the empty-slice case,
+      // a pointer to a static `c_int` sentinel — never a singular dangling
+      // pointer. mlx-c copies into a `mlx::core::Shape` (`std::vector<int>`),
+      // retaining no pointer past the call; rc via `check()`. The `dtype`
+      // enum-to-raw conversion is a const map (`Dtype: Copy`).
       check(unsafe {
         mlxrs_sys::mlx_fast_metal_kernel_config_add_output_arg(
           config_raw,
-          shape.as_ptr(),
+          crate::shape::dim_ptr(shape),
           shape.len(),
           (*dtype).into(),
         )
@@ -774,5 +809,84 @@ mod tests {
     let err = MetalKernel::new("k", &["a"], &["out\0bad"], "// noop", "", true, false)
       .expect_err("interior NUL in output_names should be rejected");
     assert_interior_nul(&err, "output_names");
+  }
+
+  // ───────────────────────── MetalKernel::apply (output-shape validation) ─────────────────────────
+  //
+  // These tests cover the wrapper-side `output_shapes` validation that fires
+  // BEFORE any FFI allocation (negative-dim rejection via
+  // `crate::shape::validate_dims`, and the empty-slice → static-sentinel
+  // routing via `crate::shape::dim_ptr`). They construct a real
+  // `MetalKernel` to satisfy `apply`'s `&self` receiver — construction
+  // succeeds without a Metal device — and then exercise `apply` only up to
+  // the validation-or-route step so headless CI never reaches the Metal
+  // pipeline. The real-device round-trip for a valid multi-dim shape lives
+  // in `mlxrs/tests/ops_fast_metal_kernel.rs`.
+
+  fn make_validation_kernel(output_names: &[&str]) -> MetalKernel {
+    MetalKernel::new(
+      "validation_only",
+      &["x"],
+      output_names,
+      "uint elem = thread_position_in_grid.x; out[elem] = x[elem];",
+      "",
+      true,
+      false,
+    )
+    .expect("construction should not need a Metal device")
+  }
+
+  #[test]
+  fn apply_rejects_negative_output_dimension() {
+    // A negative dim sign-extends as `usize` inside the C++ vector
+    // constructor and would silently corrupt allocation bookkeeping.
+    // `validate_dims` rejects before the FFI call.
+    let kernel = make_validation_kernel(&["out"]);
+    let input = Array::ones::<f32>(&(8usize,)).expect("ones alloc");
+    let cfg =
+      MetalKernelApplyConfig::new((8, 1, 1), (8, 1, 1), vec![vec![-1, 8]], vec![Dtype::F32]);
+    let err = kernel
+      .apply(&[&input], &cfg)
+      .expect_err("negative output dim should be rejected before FFI");
+    match err {
+      Error::ShapeMismatch { message } => {
+        assert!(
+          message.contains("output_shapes[0]"),
+          "expected indexed message, got: {message:?}"
+        );
+        assert!(
+          message.contains("negative"),
+          "expected `negative` in message, got: {message:?}"
+        );
+      }
+      other => panic!("expected ShapeMismatch, got: {other:?}"),
+    }
+  }
+
+  #[test]
+  fn apply_rejects_scalar_output_shape() {
+    // An empty (rank-0) `Vec<i32>` would route through `dim_ptr`'s static
+    // sentinel — defined-pointer-wise — but mlx-c custom kernels require a
+    // ranked output_arg. The wrapper rejects up-front with a context
+    // message rather than waiting for a JIT-time backend error.
+    let kernel = make_validation_kernel(&["out"]);
+    let input = Array::ones::<f32>(&(8usize,)).expect("ones alloc");
+    let cfg = MetalKernelApplyConfig::new((1, 1, 1), (1, 1, 1), vec![vec![]], vec![Dtype::F32]);
+    let err = kernel
+      .apply(&[&input], &cfg)
+      .expect_err("empty output shape should be rejected before FFI");
+    match err {
+      Error::ShapeMismatch { message } => {
+        assert!(
+          message.contains("output_shapes[0]"),
+          "expected indexed message, got: {message:?}"
+        );
+        assert!(
+          message.contains("empty"),
+          "expected `empty` in message, got: {message:?}"
+        );
+      }
+      other => panic!("expected ShapeMismatch, got: {other:?}"),
+    }
   }
 }
