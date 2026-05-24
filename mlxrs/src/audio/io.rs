@@ -1174,26 +1174,24 @@ pub fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<
     message: format!("resample_linear: reservation for {out_len} samples failed: {e}"),
   })?;
   let ratio = f64::from(from_rate) / f64::from(to_rate);
-  // `last_in` is the largest valid source index; saturating-sub guards the
-  // `samples.len() == 1` case (we already returned Ok early for `is_empty`,
-  // but a 1-element input still has `last_in == 0`, in which case all
-  // interpolation degenerates to copying `samples[0]`).
-  let last_in = samples.len() - 1;
-  for i in 0..out_len {
-    let x = i as f64 * ratio;
-    let lo = x.floor();
-    let frac = x - lo;
-    // `lo as usize` is well-defined because `out_len = in_len * to_rate /
-    // from_rate`, so `x_max = (out_len-1) * from_rate/to_rate ≤ in_len - 1`
-    // (with strict inequality unless `(out_len-1)*from_rate` divides
-    // `to_rate` exactly), keeping `lo` in `[0, in_len-1]`. We still saturate
-    // to `last_in` defensively to absorb any FP rounding-up at the boundary.
-    let lo_idx = (lo as usize).min(last_in);
-    let hi_idx = (lo_idx + 1).min(last_in);
-    let a = samples[lo_idx];
-    let b = samples[hi_idx];
-    out.push(a + (b - a) * frac as f32);
-  }
+
+  // C8 SIMD: dispatch to the resample-linear NEON kernel
+  // (`crate::simd::audio::resample`). On `aarch64` this routes to a
+  // 4-lane NEON tile (`vmulq_f64` index math + `vfmaq_f32` FMA + scalar
+  // gather for `samples[lo_idx]` / `samples[hi_idx]`); elsewhere it
+  // falls back to the scalar shape preserved in
+  // `simd::audio::resample::resample_linear_scalar`.
+  //
+  // The dispatcher takes a `&mut [MaybeUninit<f32>]` sized to `out_len`
+  // and writes every slot via `MaybeUninit::write` before returning, so
+  // `set_len(out_len)` after the kernel returns is sound.
+  let spare = out.spare_capacity_mut();
+  crate::simd::audio::resample::resample_linear(&mut spare[..out_len], samples, ratio);
+  // SAFETY: the C8 dispatcher's init contract guarantees every f32 of
+  // the `out_len`-prefix of `spare` is initialized before returning;
+  // `out_len <= out.capacity()` per the `try_reserve_exact(out_len)`
+  // above.
+  unsafe { out.set_len(out_len) };
   Ok(out)
 }
 
