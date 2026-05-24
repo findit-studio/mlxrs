@@ -40,3 +40,5 @@
 //! [`mlx_lm/tuner/trainer.py`]: https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/tuner/trainer.py
 
 pub mod datasets;
+pub mod optimizers;
+pub mod trainer;
