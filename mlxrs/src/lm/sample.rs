@@ -320,13 +320,12 @@ pub fn scale_logits_by_temp(logits: &Array, temp: f32) -> Result<Array> {
       ops::misc::astype(&scaled_f32, dtype)
     }
     crate::Dtype::F64 => Err(Error::Backend {
-      message:
-        "categorical_sampling does not support F64 logits — MLX's GPU stream \
+      message: "categorical_sampling does not support F64 logits — MLX's GPU stream \
          does not implement float64, so a native F64 divide would error at \
          eval and the prior implicit F32 roundtrip silently lost precision on \
          near-tied logits (LM-6 R2 finding). Cast logits with \
          .astype(Dtype::F32) (or F16/BF16) before sampling."
-          .to_string(),
+        .to_string(),
     }),
     other => Err(Error::Backend {
       message: format!(
