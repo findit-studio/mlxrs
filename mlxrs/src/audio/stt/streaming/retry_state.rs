@@ -308,6 +308,29 @@ impl SessionRetryState {
     &mut self,
     mel_processor: &mut IncrementalMelSpectrogram,
   ) -> Result<Option<Array>> {
+    self.discharge_stop_mel_flush_with_clone(mel_processor, Array::try_clone)
+  }
+
+  /// Test-visible inner of [`discharge_stop_mel_flush`] with an injectable
+  /// clone function. Production uses [`Array::try_clone`]; tests pass a
+  /// closure that deterministically returns `Err` to exercise the R2-fix
+  /// rollback path
+  /// (see
+  /// `discharge_stop_mel_flush_try_clone_err_preserves_mel_as_stop_encoder_feed`).
+  ///
+  /// `mlx-c`'s `mlx_array_set` only fails on a host-allocator OOM (the
+  /// fresh `mlx_array_new` handle must `set` against the source); reaching
+  /// that arm in a unit test would require an FFI alloc-failure hook,
+  /// which mlx-c does not provide. The injectable seam is the
+  /// minimum-disruption alternative — same body, swap one call.
+  fn discharge_stop_mel_flush_with_clone<F>(
+    &mut self,
+    mel_processor: &mut IncrementalMelSpectrogram,
+    clone_fn: F,
+  ) -> Result<Option<Array>>
+  where
+    F: FnOnce(&Array) -> Result<Array>,
+  {
     let Some(RetryStage::StopMelFlush) = self.resume_at else {
       return Ok(None);
     };
@@ -342,7 +365,7 @@ impl SessionRetryState {
     // Try to clone the mel so we can carry BOTH a copy in the
     // obligation AND a copy in the return value (the caller's in-call
     // continuation immediately feeds it to the encoder).
-    match mel.try_clone() {
+    match clone_fn(&mel) {
       Ok(for_obligation) => {
         // Both handles live: obligation gets the clone, caller gets
         // the original. The obligation is the safety net — if the
@@ -362,7 +385,10 @@ impl SessionRetryState {
         //
         // Pre-fix re-armed StopMelFlush here; that was wrong because
         // `flush()` had already committed and cleared the overlap, so
-        // the next flush would yield None → silent tail loss.
+        // the next flush would yield None → silent tail loss. The
+        // injected-clone-Err test seam
+        // (`discharge_stop_mel_flush_try_clone_err_preserves_mel_as_stop_encoder_feed`)
+        // gives this branch deterministic regression coverage.
         self.resume_at = Some(RetryStage::StopEncoderFeed { mel_frames: mel });
         Err(Error::Backend {
           message: format!(
@@ -738,6 +764,134 @@ mod tests {
         "drain>0 path: obligation advanced to DecodeOwed"
       );
     }
+  }
+
+  /// R3-fix DETERMINISTIC regression test for the try_clone-Err arm.
+  ///
+  /// Pre-R2 the Err arm did `self.resume_at = Some(StopMelFlush)`, which
+  /// — combined with `flush()`'s post-commit empty overlap — meant the
+  /// next retry's flush short-circuited to `Ok(None)` and silently lost
+  /// the tail audio. The R2-fix routes the original `mel` into
+  /// `StopEncoderFeed { mel_frames }` on the Err arm so the next
+  /// discharge runs path (b) and feeds the preserved mel.
+  ///
+  /// `mlx_array_set` only fails on host-allocator OOM, which we can't
+  /// reach from a unit test. To give the Err branch deterministic
+  /// regression coverage we go through the test-only
+  /// `discharge_stop_mel_flush_with_clone` seam and inject a clone fn
+  /// that always returns `Err`. The pre-R2 production code would FAIL
+  /// this test (resume_at would be re-armed to `StopMelFlush` against an
+  /// empty overlap); the R2-fix code leaves resume_at on
+  /// `StopEncoderFeed` carrying the original mel.
+  #[test]
+  fn discharge_stop_mel_flush_try_clone_err_preserves_mel_as_stop_encoder_feed() {
+    let mut s = SessionRetryState::new();
+    let mut mel_proc = IncrementalMelSpectrogram::new(16_000, 32, 16, 8).unwrap();
+    // Populate the mel overlap so `flush()` returns `Ok(Some(mel))` (the
+    // only path that reaches the try_clone call).
+    let _ = mel_proc
+      .process(&[0.1_f32; 16])
+      .expect("process must succeed on small input");
+    assert!(
+      mel_proc.overlap_buffer_len() > 0,
+      "test precondition: overlap populated so flush yields Some(mel)"
+    );
+
+    s.stage_stop_mel_flush();
+    assert!(s.has_pending_stop_mel_flush());
+
+    // Inject a clone fn that ALWAYS fails — simulates the rare
+    // mlx_array_set host-allocator OOM that drives the R2-fix branch.
+    let result = s.discharge_stop_mel_flush_with_clone(&mut mel_proc, |_arr| {
+      Err(Error::Backend {
+        message: "test-injected clone failure".into(),
+      })
+    });
+
+    // The discharge MUST surface an Err so the caller's in-call path
+    // bails out (it can't continue without a mel handle of its own).
+    let err = result.expect_err("injected clone-Err MUST propagate as Err");
+    assert!(
+      matches!(err, Error::Backend { .. }),
+      "discharge wraps the clone-Err in Error::Backend, got {err:?}"
+    );
+
+    // CRITICAL R2-fix assertion: resume_at MUST land on StopEncoderFeed
+    // carrying the original flushed mel — NEVER on StopMelFlush (the
+    // pre-fix path that emits Ended with silent tail loss).
+    match s.resume_at() {
+      Some(RetryStage::StopEncoderFeed { mel_frames }) => {
+        // The staged mel should have non-zero rows (we populated the
+        // overlap with 16 samples + a 32-pt FFT, which produces ≥ 1
+        // mel frame on flush).
+        let rows: usize = mel_frames.shape().first().copied().unwrap_or(0);
+        let n_mels: usize = mel_frames.shape().get(1).copied().unwrap_or(0);
+        assert!(
+          rows > 0,
+          "R2-fix: staged mel_frames must carry the flushed rows (got rows=0)"
+        );
+        assert_eq!(
+          n_mels, 8,
+          "R2-fix: staged mel_frames must carry the configured n_mels=8"
+        );
+      }
+      other => panic!(
+        "R2-fix REGRESSION: expected StopEncoderFeed obligation carrying \
+         the preserved mel, got {other:?} — this is the pre-fix silent \
+         tail-loss path"
+      ),
+    }
+
+    // Belt-and-braces: the forbidden re-arm state is explicitly absent.
+    assert!(
+      !s.has_pending_stop_mel_flush(),
+      "R2-fix: StopMelFlush MUST NOT be re-armed after flush()'s overlap-clear"
+    );
+    // Overlap is empty (the flush committed), so the obligation is the
+    // ONLY surviving source of the tail mel.
+    assert_eq!(
+      mel_proc.overlap_buffer_len(),
+      0,
+      "test precondition for R2: flush commit clears overlap, so the \
+       obligation is the ONLY remaining source of the tail mel"
+    );
+
+    // End-to-end recovery: the staged obligation MUST be drainable by
+    // a subsequent path (b) discharge. We feed it through a recording
+    // encoder and assert the staged mel actually reaches the backend.
+    struct RecordingEncoder {
+      window_size: usize,
+      call_count: std::cell::RefCell<usize>,
+    }
+    impl StreamingEncoderBackend for RecordingEncoder {
+      fn window_size(&self) -> usize {
+        self.window_size
+      }
+      fn encode_window(&self, mel_window: &Array, _valid_frames: usize) -> Result<Array> {
+        *self.call_count.borrow_mut() += 1;
+        let rows: usize = mel_window.shape().first().copied().unwrap_or(0);
+        let buf = vec![0.0_f32; rows * 2];
+        Array::from_slice::<f32>(&buf, &[rows as i32, 2i32])
+      }
+    }
+    let backend = RecordingEncoder {
+      window_size: 1, // smallest window: every mel row is a full window
+      call_count: std::cell::RefCell::new(0),
+    };
+    let mut encoder: StreamingEncoder<RecordingEncoder> = StreamingEncoder::new(backend, 4, 0);
+
+    let _drained = s
+      .discharge_stop_encoder_feed(&mut encoder)
+      .expect("path (b) discharge MUST consume the preserved mel");
+    assert!(
+      *encoder.backend().call_count.borrow() > 0,
+      "R2-fix end-to-end recovery: the preserved mel MUST reach the \
+       encoder backend on the next discharge (call_count > 0)"
+    );
+    assert!(
+      !s.has_pending_stop_encoder_feed(),
+      "R2-fix: successful path-(b) drain MUST clear StopEncoderFeed"
+    );
   }
 
   /// R2-fix CRITICAL non-regression: the discharge MUST NEVER land in
