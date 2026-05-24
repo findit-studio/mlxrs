@@ -5,6 +5,7 @@
 
 pub mod arithmetic;
 pub mod comparison;
+pub mod fast;
 pub mod fft;
 pub mod indexing;
 pub mod linalg_basic;
