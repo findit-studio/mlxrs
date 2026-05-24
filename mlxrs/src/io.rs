@@ -17,6 +17,9 @@ use std::{
   cell::Cell,
   collections::HashMap,
   ffi::{CStr, CString},
+  fs::File,
+  io::{Seek, SeekFrom, Write},
+  os::raw::{c_char, c_int, c_void},
   path::Path,
 };
 
@@ -265,6 +268,16 @@ fn build_array_map<'a, I>(arrays: I) -> Result<mlxrs_sys::mlx_map_string_to_arra
 where
   I: IntoIterator<Item = (&'a str, &'a Array)>,
 {
+  // Install the mlx-c error handler BEFORE the `_new()` call so a
+  // `std::bad_alloc` (or any other exception) caught by the constructor's
+  // try/catch surfaces into `crate::error::LAST` via `mlx_error(e.what())`
+  // rather than mlx-c's default `printf + exit(-1)`. The constructor then
+  // returns a sentinel handle with `ctx == nullptr` (vendored
+  // `mlx-c/mlx/c/map.cpp::mlx_map_string_to_array_new` line 10-17), which
+  // the NULL-check below drains into `Err` so the empty-input case (no
+  // `_insert` calls inside the loop below) cannot silently propagate
+  // a useless empty handle to a downstream FFI call.
+  crate::error::ensure_handler_installed();
   // SAFETY: `mlx_map_string_to_array_new()` returns a fresh empty map handle
   // (NULL ctx on allocation failure, a defined-safe input to `_free`),
   // wrapped in an `ArrayMapGuard` IMMEDIATELY so any `?` below (interior-NUL
@@ -272,6 +285,16 @@ where
   // ownership is transferred to the caller via `mem::forget` (suppressing
   // this guard's `Drop`); the caller re-wraps the returned raw handle.
   let guard = ArrayMapGuard(unsafe { mlxrs_sys::mlx_map_string_to_array_new() });
+  // Reject the NULL-ctx sentinel from a failed `_new()` before the caller
+  // can act on a useless empty handle. Drain `LAST` (NOT peek — leaving
+  // a stale `Err` in the TLS would poison the next unrelated mlx-c call
+  // on this thread).
+  if guard.0.ctx.is_null() {
+    let last = crate::error::take_last();
+    return Err(last.unwrap_or(Error::Backend {
+      message: "mlx_map_string_to_array_new() returned NULL sentinel (allocation failure)".into(),
+    }));
+  }
   for (k, v) in arrays {
     let ck = CString::new(k).map_err(|_| Error::Backend {
       message: format!("array key contains an interior NUL byte: {k:?}"),
@@ -292,6 +315,17 @@ where
 /// Build a temporary `mlx_map_string_to_string` from a Rust map. Caller wraps
 /// the returned handle in a [`StringMapGuard`].
 fn build_string_map(meta: &HashMap<String, String>) -> Result<mlxrs_sys::mlx_map_string_to_string> {
+  // Install the mlx-c error handler BEFORE the `_new()` call so a
+  // `std::bad_alloc` (or any other exception) caught by the constructor's
+  // try/catch surfaces into `crate::error::LAST` via `mlx_error(e.what())`
+  // rather than mlx-c's default `printf + exit(-1)`. The constructor then
+  // returns a sentinel handle with `ctx == nullptr` (vendored
+  // `mlx-c/mlx/c/map.cpp::mlx_map_string_to_string_new` line 119-126),
+  // which the NULL-check below drains into `Err`. The empty-`HashMap`
+  // metadata case (the common call site for `save_safetensors`) makes no
+  // `_insert` calls inside the loop below, so without this guard an
+  // allocation-failure sentinel would silently return `Ok(NULL)`.
+  crate::error::ensure_handler_installed();
   // SAFETY: `mlx_map_string_to_string_new()` returns a fresh empty map handle
   // (NULL ctx on allocation failure, a defined-safe input to `_free`),
   // wrapped in a `StringMapGuard` IMMEDIATELY so any `?` below (interior-NUL
@@ -299,6 +333,18 @@ fn build_string_map(meta: &HashMap<String, String>) -> Result<mlxrs_sys::mlx_map
   // success ownership is transferred to the caller via `mem::forget`
   // (suppressing this guard's `Drop`); the caller re-wraps the raw handle.
   let guard = StringMapGuard(unsafe { mlxrs_sys::mlx_map_string_to_string_new() });
+  // Reject the NULL-ctx sentinel from a failed `_new()` before the loop
+  // runs — when `meta` is empty (the no-metadata `save_safetensors`
+  // path) no `_insert` call would be made, so an allocation-failure
+  // sentinel would otherwise pass through `Ok(NULL)` to the caller.
+  // Drain `LAST` (NOT peek — leaving a stale `Err` in the TLS would
+  // poison the next unrelated mlx-c call on this thread).
+  if guard.0.ctx.is_null() {
+    let last = crate::error::take_last();
+    return Err(last.unwrap_or(Error::Backend {
+      message: "mlx_map_string_to_string_new() returned NULL sentinel (allocation failure)".into(),
+    }));
+  }
   for (k, v) in meta {
     let ck = CString::new(k.as_str()).map_err(|_| Error::Backend {
       message: format!("metadata key contains an interior NUL byte: {k:?}"),
@@ -387,6 +433,17 @@ pub fn save_safetensors_with_metadata(
 /// this. Behavior is otherwise identical to
 /// [`save_safetensors_with_metadata`]: the named arrays + metadata are
 /// handed to `mlx_save_safetensors` on the IO CPU stream.
+///
+/// **TOCTOU note.** This entry point creates / truncates `path` by name via
+/// mlx-c's path-taking `mlx_save_safetensors`, so it must NOT be used as
+/// part of a same-directory "stage to `O_EXCL` tempfile, then rename"
+/// flow that wants to keep the original-open identity: between the
+/// `O_EXCL` create + this reopen-by-name, an attacker with directory
+/// write access could `unlink(path) + symlink(path, /etc/passwd)` and
+/// redirect the write. Atomic-staging code paths
+/// ([`crate::lm::load::save_model`], [`crate::lm::load::save_config`])
+/// instead use the fd-bound [`save_safetensors_to_file`] which writes
+/// through an already-open [`File`].
 pub fn save_safetensors_view<'a, I>(
   path: &Path,
   arrays: I,
@@ -410,12 +467,494 @@ where
   Ok(())
 }
 
+/// Save an arbitrary borrowed `(name, array)` view plus metadata to an
+/// **already-open** [`File`] — the **fd-bound** safetensors writer.
+///
+/// Same surface as [`save_safetensors_view`] but pinned to the caller's
+/// own [`File`] handle instead of a path. Internally builds a custom
+/// `mlx_io_writer` whose vtable delegates `is_open`/`good`/`tell`/`seek`/
+/// `write` to the supplied `&mut File`, then hands it to mlx-c's
+/// `mlx_save_safetensors_writer`. The `File` is borrowed for the call only
+/// — mlx-c performs an eager `eval` + synchronous writes inside
+/// `save_safetensors_writer` (see vendored
+/// `mlx/io/safetensors.cpp::save_safetensors(writer, ...)`), so no callback
+/// is ever invoked after this function returns.
+///
+/// **Why a `&mut File` rather than a path** — closes the TOCTOU window
+/// `O_EXCL`-created-then-reopened-by-name leaves open. Callers in
+/// [`crate::lm::load`]'s atomic-save path stage shards to same-directory
+/// `O_EXCL` tempfiles and then must continue to write through the
+/// `O_EXCL` open's identity (an attacker who can write the destination
+/// directory could otherwise `unlink + symlink` the path between the
+/// `O_EXCL` create + a reopen-by-name and redirect the write to e.g.
+/// `/etc/passwd`). The path-taking [`save_safetensors_view`] remains for
+/// direct path-based saves where the caller accepts the path semantics
+/// (creates / truncates the target).
+///
+/// # Destructive mutation
+///
+/// This function destructively mutates the file. On `Err`, the file may be
+/// in any of these states:
+///
+/// * **Untouched** — if Err occurred during input validation (interior NUL
+///   bytes in array names or metadata, NULL-sentinel from the mlx-c map or
+///   writer constructors). These early-validation Errs are returned before
+///   the file is truncated, so the prior contents are preserved as a
+///   defense-in-depth side effect. This is NOT a contract: callers MUST
+///   NOT rely on byte preservation across save failures.
+/// * **Partially mutated or zero-length** — if Err occurred during
+///   `mlx_save_safetensors_writer` (eager `eval` failure, MLX-internal
+///   rejection of the array set such as zero-element arrays, header-build
+///   failure, or any error returned by the underlying write callbacks).
+///   The file has been truncated to zero and may contain a partial
+///   safetensors header.
+///
+/// **For write-redirection-safe staging in an atomic-replace flow**, use
+/// the fd-bound tempfile-staging pattern (the open/write/fsync/drop
+/// steps below are exemplified by [`crate::lm::load::save_model`] in
+/// `mlxrs/src/lm/load.rs:1359-1372`):
+///
+/// 1. Open a [`File`] for a tempfile in the SAME directory as the target
+///    (so the eventual rename stays atomic on the same filesystem), e.g.
+///    via `OpenOptions::new().create_new(true).write(true).open(...)`
+///    with a unique tempfile name like `target.tmp.<rand>`.
+/// 2. Pass that `&mut File` to `save_safetensors_to_file(...)`.
+/// 3. On success, `file.sync_all()?` then
+///    `std::fs::rename(temp_path, target_path)?` (or
+///    `std::fs::hard_link` + unlink for atomic no-replace publish, as
+///    [`crate::lm::load::save_model`] does).
+/// 4. On error, the temp file is destructively mutated (per the contract
+///    above) but the original target file is untouched. Unlink the temp.
+///
+/// **Scope of this guarantee.** The fd-bound `&mut File` argument
+/// protects the WRITE PATH: an attacker with directory write access
+/// cannot redirect the bytes via `unlink + symlink` between when this
+/// function rewinds + truncates + writes the safetensors payload,
+/// because every write goes through the caller-owned fd rather than
+/// reopening by name. The SUBSEQUENT publication step in the recipe
+/// above (`std::fs::rename(temp_path, ...)` or
+/// `std::fs::hard_link(temp_path, ...) + unlink(temp_path)`) operates
+/// by PATHNAME and is therefore still subject to directory-entry
+/// races: an attacker with write access to the staging directory can
+/// `unlink(temp_path)` and substitute their own file at the same
+/// name; the subsequent rename / hard_link then atomically publishes
+/// the attacker's inode rather than the one this function wrote. The
+/// full attack window is the lifetime of the temp NAME —
+/// substitution can occur ANY TIME after the `O_EXCL` create and
+/// before publication, not only after fsync. The fd-bound write
+/// itself remains safe (every byte goes to the inode the caller
+/// holds), but the temp directory entry is no longer bound to that
+/// inode.
+///
+/// Avoiding this requires ONE of:
+///
+/// * **A trusted staging directory** (one that is not user-writable)
+///   — the simplest and most portable solution. The publication step
+///   is safe because no attacker can substitute the temp entry.
+/// * **Platform-specific publish-by-fd primitives** that link the open
+///   file descriptor (or an unnamed temp inode) into the target name in
+///   one step. The exact requirements are non-trivial and OS-specific
+///   (Linux's `O_TMPFILE` + `linkat(AT_EMPTY_PATH)` has multiple
+///   preconditions; macOS has no equivalent). **This crate does NOT
+///   provide such a primitive.** Callers needing this property must
+///   either implement it directly against their OS's syscalls (consult
+///   the relevant man-pages for the full constraint set) or use a
+///   security-audited library that explicitly documents fd-bound
+///   publication semantics. Path-based "atomic persist" APIs (including
+///   ones in popular crates) do NOT satisfy this property — they persist
+///   by pathname and remain vulnerable to the temp-name substitution
+///   race documented above.
+///
+/// Note that `openat`-family syscalls with a directory file
+/// descriptor (e.g. `renameat`, `linkat` by name) DO NOT close this
+/// race: they anchor the parent directory but still look up the
+/// mutable temp entry by name, so an attacker who can unlink and
+/// replace `temp_path` can still cause the substituted inode to be
+/// published. Neither of the two safe options above is provided by
+/// this API. **Do NOT use the path-taking
+/// [`save_safetensors_view`] for atomic replacement** — that API
+/// reopens by name and permits `unlink + symlink` write redirection
+/// in hostile directories (see its docstring's TOCTOU note); it is
+/// appropriate ONLY for callers who accept path-reopen semantics.
+///
+/// The `&mut File` API exists specifically for callers who need fd-bound
+/// semantics (e.g. TOCTOU mitigation when the target path is
+/// attacker-controllable, or writes to seekable file descriptors that
+/// lack a stable pathname like memfds created via `memfd_create(2)`).
+/// The descriptor must be **seekable** — non-seekable descriptors
+/// (pipes, sockets, ttys) deterministically fail at the `seek(0)` step
+/// below before any write. For non-seekable targets, save to a regular
+/// file first and stream the bytes separately.
+///
+/// Returns an error if any of the fallible setup steps fails (interior-NUL
+/// validation, the map ctors, or `mlx_io_writer_new()` itself), if the
+/// rewind / truncate fails, if the underlying `File` write fails (surfaced
+/// through the captured `WriterState::err`), or if mlx-c raises
+/// (surfaced via the installed error handler).
+pub fn save_safetensors_to_file<'a, I>(
+  file: &mut File,
+  arrays: I,
+  metadata: &HashMap<String, String>,
+) -> Result<()>
+where
+  I: IntoIterator<Item = (&'a str, &'a Array)>,
+{
+  // Validation runs first as a defense-in-depth side effect; on early-
+  // validation Err the file remains untouched. This is NOT a contract —
+  // see the "Destructive mutation" section of the doc comment above. The
+  // ordering keeps interior-NUL Errs (`build_array_map` /
+  // `build_string_map`) from truncating a caller-owned prefilled file
+  // before surfacing the error.
+  let amap = build_array_map(arrays)?;
+  let amap_guard = ArrayMapGuard(amap);
+  let mmap = build_string_map(metadata)?;
+  let mmap_guard = StringMapGuard(mmap);
+  // Defense-in-depth: build the `mlx_io_writer` before the destructive
+  // truncate so an allocation failure inside the vendored
+  // `mlx_io_writer_new_` ctor (which catches `std::bad_alloc` and returns
+  // a `mlx_io_writer({nullptr})` sentinel — vendored
+  // `mlx-c/mlx/c/io_types.cpp:48-54`) is surfaced as Err before the
+  // caller's file is mutated. Wrapped in `WriterGuard` immediately so a
+  // NULL or mid-function `?` frees the partial handle.
+  //
+  // `WriterState::new(file)` reborrows `&mut File` only to cast it to
+  // `*mut File`; the reborrow ends at function return, so `file` is
+  // re-usable as `&mut File` for the `seek`/`set_len` below (the raw
+  // pointer in `state.file` is only dereferenced from inside the
+  // vtable callbacks invoked by `mlx_save_safetensors_writer`, which
+  // runs strictly after both `seek` and `set_len` complete).
+  let state = WriterState::new(file);
+  // Install the mlx-c error handler BEFORE `mlx_io_writer_new` so a
+  // `std::bad_alloc` caught by the constructor's try/catch surfaces
+  // into `crate::error::LAST` via `mlx_error(e.what())` rather than
+  // mlx-c's default `printf + exit(-1)`. The NULL-ctx branch below
+  // then drains that captured message into the returned `Err`.
+  crate::error::ensure_handler_installed();
+  // SAFETY: `state.as_desc()` returns a `*mut c_void` aliasing the local
+  // `WriterState`; it must outlive the `mlx_io_writer` that captures it.
+  // We build the writer + immediately wrap it in a `WriterGuard` so any `?`
+  // below frees the writer (which DOES drop the shared_ptr<CWriter> — but
+  // CWriter only holds `desc + vtable` by value and never calls
+  // `vtable.free(desc)` on our side because we set it to a no-op). The
+  // `state` local outlives BOTH `writer_guard` (and thus any callback
+  // mlx-c could invoke) AND the entire `save_safetensors_writer` call —
+  // by the time `state` goes out of scope, the writer + its
+  // `shared_ptr<CWriter>` are already freed (writer_guard drop above).
+  // `mlx_io_writer_free` is a defined no-op on a NULL-ctx sentinel
+  // (vendored `mlx-c/mlx/c/private/io.h:138-142` checks `io.ctx` first),
+  // so the guard is safe to install unconditionally.
+  let writer = unsafe { mlxrs_sys::mlx_io_writer_new(state.as_desc(), make_writer_vtable()) };
+  let writer_guard = WriterGuard(writer);
+  // Defense-in-depth: surface a NULL-ctx sentinel from a failed
+  // `mlx_io_writer_new` before the destructive truncate. Drain `LAST`
+  // (NOT peek — leaving a stale `Err` in the TLS would poison the next
+  // unrelated mlx-c call on this thread). The drop order at the early
+  // return is: writer_guard (frees the NULL-ctx sentinel — defined
+  // no-op), then mmap_guard, then amap_guard (Rust drop is reverse
+  // declaration order); `state` is Drop-less.
+  if writer_guard.0.ctx.is_null() {
+    let last = crate::error::take_last();
+    return Err(last.unwrap_or(Error::Backend {
+      message: "mlx_io_writer_new() returned NULL sentinel (allocation failure)".into(),
+    }));
+  }
+  // Now that every fallible Rust- and FFI-level setup step has confirmed
+  // Ok / non-NULL handles, rewind the file to byte 0 and truncate to a
+  // clean canvas. Without these, a prefilled `File` handed in at a
+  // non-zero cursor would receive a prefix-corrupted safetensors (mlx-c's
+  // `cb_write` writes at the current cursor), and a prefilled `File`
+  // longer than the new payload would retain stale trailing bytes after
+  // the new (shorter) safetensors. Both surfaces are propagated as
+  // `Error::Backend` with the same `save_safetensors_to_file:` prefix
+  // the rest of this function uses, so logs stay greppable.
+  //
+  // After this point the file IS destructively mutated — see the
+  // "Destructive mutation" section of the doc comment. `seek` /
+  // `set_len` can themselves `Err` (partial OS-level mutation is
+  // possible), and `mlx_save_safetensors_writer` can `Err` mid-stream
+  // (eval failure, MLX-internal rejection, write-callback failure).
+  // Callers that need atomic-replace semantics should use the fd-bound
+  // tempfile-staging pattern (open a same-directory `O_EXCL` `File`,
+  // write through it, `sync_all`, then `rename` / `hard_link` to the
+  // final path) — see `save_model` in `mlxrs/src/lm/load.rs:1359-1372`
+  // and the "Destructive mutation" section of this function's doc
+  // comment. Do NOT route through the path-taking
+  // `save_safetensors_view` for atomic replacement: it reopens by name
+  // and reintroduces the TOCTOU window this API was built to close.
+  file.seek(SeekFrom::Start(0)).map_err(|e| Error::Backend {
+    message: format!("save_safetensors_to_file: failed to rewind file to byte 0: {e}"),
+  })?;
+  file.set_len(0).map_err(|e| Error::Backend {
+    message: format!("save_safetensors_to_file: failed to truncate file: {e}"),
+  })?;
+  // SAFETY: `writer` is the valid populated handle owned by `writer_guard`,
+  // valid for the duration of this call. `amap` / `mmap` are valid
+  // populated map handles owned by their guards above. mlx-c reads all
+  // three by const reference; rc surfaced via `check()`. On error the
+  // guards free everything in reverse-construction order.
+  let rc = unsafe { mlxrs_sys::mlx_save_safetensors_writer(writer, amap, mmap) };
+  // Drop the writer FIRST (mlx-c's `mlx_io_writer_free` destroys the
+  // C++ `shared_ptr<CWriter>` that aliases `state`), THEN check the rc
+  // and surface any captured `state.err`. This ordering guarantees no
+  // further callback into `state` is possible while we still hold the
+  // borrow.
+  drop(writer_guard);
+  drop(amap_guard);
+  drop(mmap_guard);
+  // A captured io::Error from the write callback takes precedence over the
+  // mlx-c rc (mlx-c will have raised once the write failed; rc != 0).
+  if let Some(e) = state.into_err() {
+    return Err(Error::Backend {
+      message: format!("save_safetensors_to_file: write callback failed: {e}"),
+    });
+  }
+  check(rc)?;
+  Ok(())
+}
+
+// ─────────────────────── mlx_io_writer backed by &mut File ───────────────────────
+
+/// State the writer-vtable callbacks operate on: a borrowed [`File`] plus a
+/// cell capturing the first [`std::io::Error`] any write/seek hit (so the
+/// caller can surface it after the FFI call returns). Layout is opaque on
+/// the C side (mlx-c only sees the `*mut c_void` we hand it via
+/// [`Self::as_desc`]; the callbacks cast back to `*mut WriterState`), so
+/// the default Rust layout suffices.
+struct WriterState {
+  /// `*mut File` rather than `&mut File` so the field is `Copy` + the type
+  /// stays trivially `Send`-checkable; the borrow is enforced at the
+  /// API surface by `&mut File`, not at the field level.
+  file: *mut File,
+  /// First IO error from any callback, captured here so
+  /// [`save_safetensors_to_file`] can surface it after the FFI call.
+  err: std::cell::Cell<Option<std::io::Error>>,
+  /// Static C-string label returned by the `label` callback — included in
+  /// mlx-c's "[save_safetensors] Failed to open ..." error messages.
+  label: &'static CStr,
+}
+
+impl WriterState {
+  fn new(file: &mut File) -> Self {
+    Self {
+      file: file as *mut File,
+      err: std::cell::Cell::new(None),
+      label: c"mlxrs::io::save_safetensors_to_file(&mut File)",
+    }
+  }
+
+  fn as_desc(&self) -> *mut c_void {
+    (self as *const Self as *mut Self).cast::<c_void>()
+  }
+
+  fn into_err(self) -> Option<std::io::Error> {
+    self.err.into_inner()
+  }
+
+  /// Set the captured error IFF none was already captured (so the FIRST
+  /// failure wins — subsequent callbacks may also fail because the file
+  /// is now in a bad state, but the original cause is what matters).
+  fn set_err(&self, e: std::io::Error) {
+    let prev = self.err.take();
+    self.err.set(prev.or(Some(e)));
+  }
+}
+
+/// RAII guard for an `mlx_io_writer`.
+struct WriterGuard(mlxrs_sys::mlx_io_writer);
+impl Drop for WriterGuard {
+  fn drop(&mut self) {
+    // SAFETY: frees a handle this guard owns exactly once. `_free` is a
+    // defined no-op on a NULL ctx, so a sentinel handle from a failed
+    // `_new()` is safe. Runs during `Drop` / thread teardown: must not
+    // touch TLS, call `check()`, panic, or unwind across `extern "C"`;
+    // the rc is discarded silently per the crate's Drop convention.
+    unsafe {
+      let _ = mlxrs_sys::mlx_io_writer_free(self.0);
+    }
+  }
+}
+
+// vtable callback panic-safety contract: every callback is reached from
+// mlx-c (`extern "C"`), so a Rust panic crossing the FFI boundary is UB.
+// Each callback wraps its body in `catch_unwind` and converts a caught
+// panic into `state.set_err(...)` — the FFI call then either short-
+// circuits (writes that follow turn the `File` into a bad state mlx-c
+// notices) or completes with a captured error the safe wrapper surfaces
+// before returning.
+
+/// `WriterState::with_state(desc, f)` — recover the borrowed `&WriterState`
+/// from the opaque desc pointer mlx-c hands the callback, and run `f`
+/// inside `catch_unwind`. A caught panic stores a synthetic
+/// `io::ErrorKind::Other` into `state.err` and returns `None`.
+fn with_state<R>(desc: *mut c_void, f: impl FnOnce(&WriterState, &mut File) -> R) -> Option<R> {
+  let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    // SAFETY: `desc` was set by `WriterState::as_desc` to a `*mut
+    // WriterState` aliasing a local that outlives this callback (callers
+    // of `save_safetensors_to_file` hold the `WriterState` on the stack
+    // for the whole `mlx_save_safetensors_writer` call). The same pointer
+    // is what every callback receives; we materialize `&WriterState` for
+    // the err-cell access. The inner `*mut File` is then re-borrowed as
+    // `&mut File` for the duration of `f` — mlx-c's safetensors writer is
+    // single-threaded inside the call, so no two callbacks alias the file
+    // at the same time.
+    let state = unsafe { &*(desc as *const WriterState) };
+    // SAFETY: as above; `state.file` is the `*mut File` derived from the
+    // `&mut File` the caller passed to `save_safetensors_to_file`; that
+    // borrow is exclusive for the duration of the FFI call, so we can
+    // safely materialize a `&mut File` here. Callbacks never re-enter
+    // each other (single-threaded inside mlx-c's safetensors writer).
+    let file = unsafe { &mut *state.file };
+    f(state, file)
+  }));
+  match result {
+    Ok(r) => Some(r),
+    Err(_) => {
+      // Capture a synthetic error so the safe wrapper surfaces a
+      // panic-in-callback as an `Error::Backend` rather than silently
+      // succeeding. We cannot resume_unwind across the FFI boundary.
+      // SAFETY: same recover-state pattern as above; only the err-cell
+      // is touched (no &mut File).
+      let state = unsafe { &*(desc as *const WriterState) };
+      state.set_err(std::io::Error::other(
+        "mlxrs::io::save_safetensors_to_file callback panicked",
+      ));
+      None
+    }
+  }
+}
+
+unsafe extern "C" fn cb_is_open(_desc: *mut c_void) -> bool {
+  // The File is open by construction (caller owns it); always true. No
+  // syscall, so panic-free.
+  true
+}
+
+unsafe extern "C" fn cb_good(desc: *mut c_void) -> bool {
+  // `good` in C++ iostream semantics = "no error state". We model it as
+  // "no captured error". A captured error means a previous callback hit
+  // an IO failure; mlx-c will see `!good()` and abort the save. Peek at
+  // the err-cell without consuming the captured error.
+  with_state(desc, |state, _file| {
+    let prev = state.err.take();
+    let is_good = prev.is_none();
+    state.err.set(prev);
+    is_good
+  })
+  .unwrap_or(false)
+}
+
+unsafe extern "C" fn cb_tell(desc: *mut c_void) -> usize {
+  with_state(desc, |state, file| match file.stream_position() {
+    Ok(p) => p as usize,
+    Err(e) => {
+      state.set_err(e);
+      0
+    }
+  })
+  .unwrap_or(0)
+}
+
+unsafe extern "C" fn cb_seek(desc: *mut c_void, off: i64, whence: c_int) {
+  with_state(desc, |state, file| {
+    // Map POSIX whence -> SeekFrom. The vendored `private/io.h` translates
+    // `std::ios_base::seekdir` -> `SEEK_SET`/`SEEK_CUR`/`SEEK_END`.
+    let pos = match whence {
+      x if x == libc::SEEK_SET => SeekFrom::Start(off as u64),
+      x if x == libc::SEEK_CUR => SeekFrom::Current(off),
+      x if x == libc::SEEK_END => SeekFrom::End(off),
+      _ => {
+        state.set_err(std::io::Error::other(format!(
+          "save_safetensors_to_file: unknown seek whence {whence}"
+        )));
+        return;
+      }
+    };
+    if let Err(e) = file.seek(pos) {
+      state.set_err(e);
+    }
+  });
+}
+
+unsafe extern "C" fn cb_read(desc: *mut c_void, _data: *mut c_char, _n: usize) {
+  // A writer should never be asked to read; capture the misuse.
+  with_state(desc, |state, _file| {
+    state.set_err(std::io::Error::other(
+      "save_safetensors_to_file: writer.read called (writer-only sink)",
+    ));
+  });
+}
+
+unsafe extern "C" fn cb_read_at_offset(
+  desc: *mut c_void,
+  _data: *mut c_char,
+  _n: usize,
+  _off: usize,
+) {
+  with_state(desc, |state, _file| {
+    state.set_err(std::io::Error::other(
+      "save_safetensors_to_file: writer.read_at_offset called (writer-only sink)",
+    ));
+  });
+}
+
+unsafe extern "C" fn cb_write(desc: *mut c_void, data: *const c_char, n: usize) {
+  with_state(desc, |state, file| {
+    if n == 0 {
+      return;
+    }
+    if data.is_null() {
+      state.set_err(std::io::Error::other(
+        "save_safetensors_to_file: write callback received NULL data",
+      ));
+      return;
+    }
+    // SAFETY: mlx-c's safetensors writer hands us a non-NULL `data`
+    // pointer to a contiguous run of `n` bytes (the JSON header bytes
+    // then each `arr.data<char>()` of `arr.nbytes()`); the pointer is
+    // valid for the duration of the synchronous callback only and is
+    // not retained by us.
+    let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, n) };
+    if let Err(e) = file.write_all(bytes) {
+      state.set_err(e);
+    }
+  });
+}
+
+unsafe extern "C" fn cb_label(desc: *mut c_void) -> *const c_char {
+  // Best-effort static label for mlx-c's "Failed to open ..." error
+  // formatting. Returning a pointer into `state.label` is safe because
+  // the WriterState (and its `&'static CStr`) outlive every callback.
+  with_state(desc, |state, _file| state.label.as_ptr()).unwrap_or(c"<panic>".as_ptr())
+}
+
+unsafe extern "C" fn cb_free(_desc: *mut c_void) {
+  // The `WriterState` is owned by the Rust caller (stack-allocated in
+  // `save_safetensors_to_file`); mlx-c MUST NOT free it. This is the
+  // explicit no-op contract the `mlx_io_vtable.free` slot accepts.
+}
+
+fn make_writer_vtable() -> mlxrs_sys::mlx_io_vtable {
+  mlxrs_sys::mlx_io_vtable {
+    is_open: Some(cb_is_open),
+    good: Some(cb_good),
+    tell: Some(cb_tell),
+    seek: Some(cb_seek),
+    read: Some(cb_read),
+    read_at_offset: Some(cb_read_at_offset),
+    write: Some(cb_write),
+    label: Some(cb_label),
+    free: Some(cb_free),
+  }
+}
+
 // ─────────────────────────── GGUF ───────────────────────────
 //
-// GGUF load/save is gated behind the `gguf` cargo feature (OFF by default):
-// mlx core's `gguf.cpp` depends on the third-party `gguflib` (`gguf_open`,
-// `gguf_create`, …) which `mlxrs-sys` does not yet fetch or link, so linking
-// these symbols fails until the sys crate vendors gguflib.
+// GGUF load/save is gated behind the `gguf` cargo feature (off by default —
+// opt-in for the GGUF dep weight in the link line + the public surface).
+// `mlxrs-sys/build.rs` links `gguflib` unconditionally (a self-contained
+// ld64 archive built by MLX core's FetchContent), so non-`gguf` binaries
+// pull no `gguf_*` objects (the linker only loads members that resolve
+// referenced symbols) and the default build is byte-for-byte unaffected.
 
 /// A typed GGUF metadata entry. GGUF metadata values are one of: a scalar/
 /// tensor [`Array`], a string, or a list of strings (matches mlx-c's
