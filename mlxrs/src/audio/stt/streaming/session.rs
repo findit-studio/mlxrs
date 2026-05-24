@@ -653,8 +653,16 @@ where
     //     never emitted, feed_audio accepts samples without consuming.
     //     The discharge re-runs the same fallible flush; on success it
     //     advances resume_at to StopEncoderFeed (if mel was produced),
-    //     so the (b) branch below picks up in the same call. On Err it
-    //     re-arms StopMelFlush so the next call retries.
+    //     so the (b) branch below picks up in the same call. On Err
+    //     there are two sub-cases (see discharge_stop_mel_flush docs):
+    //       - flush() Err → re-arms StopMelFlush (overlap intact).
+    //       - flush() Ok + try_clone Err → MOVES the flushed mel into
+    //         StopEncoderFeed and propagates Err. The mel is preserved
+    //         in the obligation; the next call's discharge will run
+    //         path (b) and feed it to the encoder. NEVER lost.
+    //     The `?` propagation leaves resume_at exactly as the discharge
+    //     set it, so the next call dispatches to whichever stage owns
+    //     the preserved payload.
     if self.retry_state.has_pending_stop_mel_flush() {
       let _mel_opt = self
         .retry_state
