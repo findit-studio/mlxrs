@@ -52,6 +52,12 @@ pub mod shape;
 /// escape forces the scalar path even on a NEON-capable host.
 pub mod simd;
 pub mod stream;
+/// Function transforms — autograd (`value_and_grad`/`grad`/`vjp`/`jvp`),
+/// custom-VJP overrides, gradient checkpointing, and bulk eval / async-eval.
+/// Mirrors `mlx-swift`'s `MLX.Transforms` (`Transforms.swift`,
+/// `Transforms+Eval.swift`, `Transforms+Grad.swift`) and `mlx.core`
+/// autograd. Always compiled (no feature gate).
+pub mod transforms;
 pub mod version;
 
 /// Language Model (LM) — text-only inference. Stub in M1; port lands in M3
