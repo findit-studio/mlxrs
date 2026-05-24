@@ -462,7 +462,9 @@ impl Drop for RawClosureGuard {
 /// Build a custom-VJP `mlx_closure_custom` from a Rust 3-input function.
 ///
 /// The contract matches `mlx_custom_vjp`'s `fun_vjp` argument:
-/// `(primals, outputs, cotangents) -> grads`.
+/// `(primals, cotangents, outputs) -> grads` — the same positional order
+/// `mlx::core::CustomTransforms::vjp` invokes its `vjp_fun_` callback with
+/// (`mlx/primitives.cpp::CustomTransforms::vjp`).
 pub(crate) fn closure_custom_new<F>(f: F) -> Result<ClosureCustomGuard>
 where
   F: Fn(&[Array], &[Array], &[Array]) -> Result<Vec<Array>> + 'static,
@@ -504,11 +506,22 @@ where
 pub(crate) type BoxedFn3 =
   Box<dyn Fn(&[Array], &[Array], &[Array]) -> Result<Vec<Array>> + 'static>;
 
+// MLX core `CustomTransforms::vjp` invokes its `vjp_fun_` callback with the
+// positional argument order `(primals, cotangents, outputs)` — see
+// `mlx/primitives.cpp::CustomTransforms::vjp` upstream:
+//
+// ```cpp
+// auto all_vjps = vjp_fun_(inputs, cotangents, outputs);
+// ```
+//
+// The Rust trampoline therefore names its second / third `mlx_vector_array`
+// arguments `cotangents` / `outputs` to match — the user closure receives the
+// triple in this same order via `f(&primals, &cotangents, &outputs)`.
 extern "C" fn trampoline_custom(
   outputs_out: *mut mlxrs_sys::mlx_vector_array,
   primals: mlxrs_sys::mlx_vector_array,
-  outputs: mlxrs_sys::mlx_vector_array,
   cotangents: mlxrs_sys::mlx_vector_array,
+  outputs: mlxrs_sys::mlx_vector_array,
   payload: *mut c_void,
 ) -> c_int {
   let result = catch_unwind(AssertUnwindSafe(|| {
@@ -516,9 +529,9 @@ extern "C" fn trampoline_custom(
     // is preserved by mlx-c; borrow without taking ownership.
     let f: &BoxedFn3 = unsafe { &*payload.cast::<BoxedFn3>() };
     let p = borrow_inputs(primals)?;
-    let o = borrow_inputs(outputs)?;
     let c = borrow_inputs(cotangents)?;
-    let grads = f(&p, &o, &c)?;
+    let o = borrow_inputs(outputs)?;
+    let grads = f(&p, &c, &o)?;
     write_outputs(outputs_out, &grads)?;
     Ok::<(), Error>(())
   }));

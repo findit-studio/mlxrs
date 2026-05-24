@@ -11,7 +11,9 @@
 //! custom JVP / vmap can extend this module in a follow-up.
 //!
 //! The Rust signature mirrors mlx-c's `mlx_closure_custom`:
-//! `(primals, outputs, cotangents) -> grads`. The crate-private
+//! `(primals, cotangents, outputs) -> grads` — the same positional order
+//! `mlx::core::CustomTransforms::vjp` uses when invoking its `vjp_fun_`
+//! callback (`mlx/primitives.cpp::CustomTransforms::vjp`). The crate-private
 //! `closure::BoxedFn3` alias documents the precise heap layout used to box
 //! the user callable for the FFI trampoline.
 
@@ -32,8 +34,10 @@ use crate::{
 ///
 /// - `f: Fn(&[Array]) -> Result<Vec<Array>>` — the forward pass.
 /// - `vjp_fn: Fn(&[Array], &[Array], &[Array]) -> Result<Vec<Array>>` —
-///   `(primals, outputs, cotangents) → grads`. Must return one gradient
-///   per primal in the same shape / dtype.
+///   `(primals, cotangents, outputs) → grads`. Must return one gradient
+///   per primal in the same shape / dtype. The triple order matches MLX
+///   core's `CustomTransforms::vjp` callback signature in
+///   `mlx/primitives.cpp` upstream.
 ///
 /// The returned closure has the same signature as `f`. Differentiating it
 /// (via [`super::grad`] / [`super::value_and_grad`] / [`super::vjp`]) routes
@@ -45,7 +49,7 @@ use crate::{
 /// // f(x) = x * x; custom VJP returns a constant 42 instead of 2x.
 /// let f = custom_vjp(
 ///   |xs| Ok(vec![mlxrs::ops::arithmetic::square(&xs[0])?]),
-///   |_primals, _outputs, _cot| {
+///   |_primals, _cot, _outputs| {
 ///     Ok(vec![Array::full::<f32>(&[0i32; 0], 42.0)?])
 ///   },
 /// )?;
@@ -120,7 +124,7 @@ where
 /// use mlxrs::{Array, transforms::{custom_function, grad}};
 /// let f = custom_function(
 ///   |xs| Ok(vec![mlxrs::ops::arithmetic::square(&xs[0])?]),
-///   |_primals, _outputs, _cot| {
+///   |_primals, _cot, _outputs| {
 ///     Ok(vec![Array::full::<f32>(&[0i32; 0], 7.0)?])
 ///   },
 /// )?;
