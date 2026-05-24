@@ -41,3 +41,4 @@
 
 pub mod datasets;
 pub mod optimizers;
+pub mod trainer;
