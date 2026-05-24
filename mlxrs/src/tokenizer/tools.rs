@@ -1356,11 +1356,18 @@ fn convert_param_value(
       .map(|i| Value::Number(i.into()))
       .unwrap_or_else(|_| Value::String(v.to_owned()))
   } else if ptype.starts_with("num") || ptype.starts_with("float") {
+    // LM-5: schema asked for a NUMBER, not an integer. ALWAYS emit a JSON
+    // float (`Number::from_f64`), never promote a finite-whole `f64` to
+    // `i64` — the old `f.fract() == 0.0 → (f as i64).into()` branch lost
+    // the type signal even when the value fit, and saturated at
+    // `i64::MIN`/`i64::MAX` for `|f| > i64` (e.g. `1e30` silently
+    // collapsed to `i64::MAX`). Non-finite `f64` (NaN / ±Inf) has no JSON
+    // representation, so fall back to the raw string (matching the
+    // existing parse-failure branch).
     match v.trim().parse::<f64>() {
-      Ok(f) if f.fract() == 0.0 => Value::Number((f as i64).into()),
       Ok(f) => serde_json::Number::from_f64(f)
         .map(Value::Number)
-        .unwrap_or(Value::Null),
+        .unwrap_or_else(|| Value::String(v.to_owned())),
       Err(_) => Value::String(v.to_owned()),
     }
   } else if BOOL.contains(&ptype.as_str()) {
@@ -2077,14 +2084,18 @@ fn convert_with_types(value: &str, ptypes: &[String]) -> Value {
         }
       }
       "number" | "float" => {
-        if let Ok(f) = value.parse::<f64>() {
-          return if f.fract() == 0.0 {
-            Value::Number((f as i64).into())
-          } else {
-            serde_json::Number::from_f64(f)
-              .map(Value::Number)
-              .unwrap_or(Value::Null)
-          };
+        // LM-5: schema asked for a NUMBER, not an integer. ALWAYS emit a
+        // JSON float (`Number::from_f64`), never promote a finite-whole
+        // `f64` to `i64` — the old `f.fract() == 0.0 → (f as i64).into()`
+        // branch lost the type signal even when the value fit, and
+        // saturated at `i64::MIN`/`i64::MAX` for `|f| > i64` (e.g. `1e30`
+        // silently collapsed to `i64::MAX`). Non-finite `f64` (NaN /
+        // ±Inf) has no JSON representation, so the union fall-through
+        // below picks the string fallback.
+        if let Ok(f) = value.parse::<f64>()
+          && let Some(n) = serde_json::Number::from_f64(f)
+        {
+          return Value::Number(n);
         }
       }
       "boolean" | "bool" => {

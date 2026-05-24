@@ -196,6 +196,165 @@ fn categorical_sampling_invalid_temp_errors() {
   assert!(sample::categorical_sampling(&lp, f32::INFINITY, &key).is_err());
 }
 
+/// LM-6 (#116) NaN-safety regression: a tiny `temp` whose `1/temp` would
+/// overflow either (a) the logits dtype on the `scalar_like` astype cast
+/// (f16 + `temp < 1/f16::MAX ≈ 1.526e-5`) or (b) the upstream f32
+/// reciprocal itself (any dtype + subnormal positive `temp <
+/// 1/f32::MAX ≈ 2.94e-39`) must still produce a draw within
+/// `[0, vocab)` — NOT silently degrade to a NaN distribution that
+/// `random::categorical` would draw a degenerate index from. The fix
+/// uses `divide(logits, scalar_like(temp))` rather than
+/// `multiply(logits, scalar_like(1/temp))` so the reciprocal is never
+/// materialized. Covers all three call sites (LM, VLM, STT) through the
+/// shared primitive.
+#[test]
+fn categorical_sampling_tiny_and_subnormal_temp_stays_finite() {
+  let key = mlxrs::ops::random::key(0).unwrap();
+
+  // Path (a): f16 logits + tiny temp. 1/temp ≈ 1e7 overflows f16::MAX
+  // (~65504); the multiply path would clamp to +Inf inside `scalar_like`,
+  // and `0 * +Inf = NaN` propagates over the L3-R2-max-shifted row.
+  let lp_f16 = Array::from_slice::<f32>(&[-3.0, -2.0, -1.0, 0.0], &[1, 4])
+    .unwrap()
+    .astype(Dtype::F16)
+    .unwrap();
+  let mut tok = sample::categorical_sampling(&lp_f16, 1e-7_f32, &key).unwrap();
+  let idx = tok.to_vec::<u32>().unwrap();
+  assert_eq!(idx.len(), 1, "f16 tiny-temp shape");
+  assert!(
+    idx[0] < 4,
+    "f16 tiny-temp must draw within [0, vocab); got {}",
+    idx[0]
+  );
+
+  // Path (b): subnormal positive f32 temp. 1/temp = +Inf in f32 BEFORE
+  // any astype, regardless of logits dtype. The validator passes
+  // (`temp.is_finite() && > 0`), so a NaN row would have escaped the old
+  // guard. Exercise on every float dtype that `make_sampler` allows.
+  let subnormal: f32 = 1e-40; // < 1/f32::MAX ≈ 2.94e-39; subnormal positive
+  assert!(subnormal.is_finite() && subnormal > 0.0);
+  assert!(
+    (1.0_f32 / subnormal).is_infinite(),
+    "test premise: 1/temp overflows f32 reciprocal"
+  );
+  for dt in [Dtype::F32, Dtype::F16, Dtype::BF16] {
+    let lp = Array::from_slice::<f32>(&[-3.0, -2.0, -1.0, 0.0], &[1, 4])
+      .unwrap()
+      .astype(dt)
+      .unwrap();
+    let mut tok = sample::categorical_sampling(&lp, subnormal, &key).unwrap();
+    let idx = tok.to_vec::<u32>().unwrap();
+    assert_eq!(idx.len(), 1, "{dt:?} subnormal-temp shape");
+    assert!(
+      idx[0] < 4,
+      "{dt:?} subnormal-temp must draw within [0, vocab); got {}",
+      idx[0]
+    );
+  }
+}
+
+/// LM-6 R1 follow-up (Codex adversarial review): the previous fix moved
+/// from `multiply(logits, scalar_like(1/temp))` to
+/// `divide(logits, scalar_like(temp, logits))`, killing the materialized-
+/// `1/temp` overflow but leaving the dtype-cast leg open — `scalar_like`
+/// still casts `temp` to the logits dtype BEFORE the divide, and any
+/// positive `temp` below the dtype's minimum subnormal rounds to 0 in
+/// f16/bf16. A max-shifted row then yields `0 / 0 = NaN`, which the
+/// older index-bounds-only test
+/// (`categorical_sampling_tiny_and_subnormal_temp_stays_finite`) could
+/// not catch (`random::categorical` returns *some* in-range index on a
+/// NaN distribution). This test asserts the SCALED LOGITS themselves
+/// are all finite for sub-min-subnormal `temp`s across F32/F16/BF16,
+/// reaching into the new `scale_logits_by_temp` helper so the assertion
+/// is on the divide output itself — not the post-softmax categorical
+/// draw, which is uninformative under NaN. The fix in
+/// `scale_logits_by_temp` has two parts: (a) the f32-denominator path
+/// (upcast logits to f32, divide in f32, downcast back) so `temp` never
+/// gets cast down to f16/bf16; (b) a `temp.max(f32::MIN_POSITIVE)`
+/// clamp so MLX's internal multiply-by-reciprocal in `divide` (the
+/// f32-divisor reciprocal it materializes inside the kernel on Apple
+/// Silicon) does not overflow for sub-`1/f32::MAX` temps and produce
+/// `0 * +Inf = NaN` on the max-shifted zero entries (this is what the
+/// `temp = 1e-40` regression below would trip without the clamp; bf16
+/// shares an exponent range with f32, so any `temp` below bf16's min
+/// subnormal is also below `1/f32::MAX` — the clamp is unavoidable for
+/// that specific Codex-finding sub-case).
+#[test]
+fn categorical_sampling_tiny_temp_produces_finite_scaled_logits() {
+  // `temp = 1e-40_f32` — sub-min-subnormal for f16 (its min subnormal
+  // ~5.96e-8) AND for bf16 (its min subnormal ~9.18e-41, since bf16
+  // shares f32's exponent range); also below `1/f32::MAX ≈ 2.94e-39`,
+  // so the divide kernel's internal multiply-by-reciprocal would
+  // overflow for the f32 path too without the `f32::MIN_POSITIVE`
+  // clamp — the test exercises BOTH the dtype-cast leg (f16) AND the
+  // f32-reciprocal-overflow leg (bf16 + f32) the LM-6 R1 fix closes.
+  let temp: f32 = 1e-40;
+  assert!(
+    temp.is_finite() && temp > 0.0,
+    "test premise: temp is finite +ve"
+  );
+
+  // Construct logits with a single max position (idx 3) and the rest at
+  // zero, so a max-shift (or just the raw row) contains explicit zeros —
+  // the entries that turn into 0/0 NaNs under the dtype-cast bug and
+  // 0*+Inf NaNs under the divide-reciprocal-overflow bug.
+  for dt in [Dtype::F32, Dtype::F16, Dtype::BF16] {
+    let lp = Array::from_slice::<f32>(
+      &[0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      &[1, 10],
+    )
+    .unwrap()
+    .astype(dt)
+    .unwrap();
+
+    // (1) Direct assertion on the scaled logits themselves — the strong
+    // check the R1 finding mandates (not just sampled-index range). All
+    // entries must be finite (the `0` entries must NOT have become NaN
+    // via either of the two failure legs).
+    let scaled = sample::scale_logits_by_temp(&lp, temp).unwrap();
+    assert_eq!(scaled.dtype().unwrap(), dt, "{dt:?} preserves dtype");
+    let mut sf = scaled.astype(Dtype::F32).unwrap();
+    let sv = sf.to_vec::<f32>().unwrap();
+    assert_eq!(sv.len(), 10, "{dt:?} scaled shape preserved");
+    for (i, x) in sv.iter().enumerate() {
+      assert!(
+        !x.is_nan(),
+        "{dt:?} scaled[{i}] must NOT be NaN under sub-min-subnormal temp; got {x} in {sv:?}"
+      );
+    }
+    // The max position (idx 3) divides a finite positive by the clamped
+    // `temp` (= `f32::MIN_POSITIVE` ~ 1.18e-38), so `5 / 1.18e-38 ≈
+    // 4.2e38` overflows f32::MAX to +Inf legitimately —
+    // `random::categorical`'s internal softmax shifts +Inf rows
+    // correctly (one-hot at the max). The zero positions must be
+    // exactly finite zero: `0 / temp = 0` with the clamp in place.
+    for (i, x) in sv.iter().enumerate() {
+      if i == 3 {
+        assert!(!x.is_nan(), "{dt:?} max position must NOT be NaN");
+      } else {
+        assert!(
+          x.is_finite() && *x == 0.0,
+          "{dt:?} zero position {i} must stay finite zero, got {x}"
+        );
+      }
+    }
+
+    // (2) Cross-check via the public categorical_sampling path — its
+    // softmax on the scaled logits must NOT produce a NaN distribution.
+    // The index-only check below is necessary but not sufficient; the
+    // finite-scaled assertion above is the load-bearing one.
+    let key = mlxrs::ops::random::key(0).unwrap();
+    let mut tok = sample::categorical_sampling(&lp, temp, &key).unwrap();
+    let idx = tok.to_vec::<u32>().unwrap();
+    assert_eq!(idx.len(), 1, "{dt:?} categorical shape");
+    assert!(
+      idx[0] < 10,
+      "{dt:?} categorical draws in-range index; got {}",
+      idx[0]
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // M3 follow-up: XTC + penalty/bias logits-processor parity
 // ---------------------------------------------------------------------------
@@ -495,5 +654,152 @@ fn apply_frequency_penalty_f16_large_penalty_no_nan_bleed() {
   assert!(
     sv[1].is_infinite() && sv[1] < 0.0,
     "selected col suppressed: {sv:?}"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// LM-6 R2 (Codex adversarial review) — `scale_logits_by_temp` follow-ups
+// ---------------------------------------------------------------------------
+
+/// LM-6 R2 (high): `scale_logits_by_temp` MUST install the error handler
+/// BEFORE any `Array::full` ctor — `Array::full::<f32>` runs the fallible
+/// `mlx_array_new_float32` ctor before its `mlx_full(default_stream())`
+/// would lazily install the handler. With the eager `#[ctor]` stripped, a
+/// ctor-stripped first sampling call could otherwise reach mlx-c with no
+/// handler installed → its default `printf + exit(-1)` instead of a
+/// recoverable `Err`. This is a STRUCTURAL test (reads sample.rs at
+/// compile time via `CARGO_MANIFEST_DIR` and asserts the install call is
+/// the first executable line of the function body), because the failure
+/// mode (process termination on scalar allocation failure) is impossible
+/// to exercise from a runtime test without a real allocation failure.
+#[test]
+fn scale_logits_by_temp_ensures_handler_installed_r2_structural() {
+  let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lm/sample.rs");
+  let src = std::fs::read_to_string(&path).expect("read sample.rs");
+
+  // Locate the function body. The signature line is unique in the file.
+  let sig = "pub fn scale_logits_by_temp(logits: &Array, temp: f32) -> Result<Array> {";
+  let sig_idx = src
+    .find(sig)
+    .expect("scale_logits_by_temp signature must exist in sample.rs");
+  // Body starts after the `{` of the signature line.
+  let body_start = sig_idx + sig.len();
+
+  // Slice from body start, then collect non-blank, non-comment lines until
+  // we have the first 3 executable statements.
+  let body = &src[body_start..];
+  let mut executable: Vec<&str> = Vec::new();
+  for raw in body.lines() {
+    if executable.len() >= 3 {
+      break;
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+      continue;
+    }
+    if trimmed.starts_with("//") {
+      continue;
+    }
+    executable.push(trimmed);
+  }
+  assert!(
+    !executable.is_empty(),
+    "scale_logits_by_temp body must contain at least one executable line"
+  );
+  // The very first executable line must be the handler install.
+  assert_eq!(
+    executable[0], "crate::error::ensure_handler_installed();",
+    "scale_logits_by_temp MUST call ensure_handler_installed() as the FIRST \
+     executable statement (LM-6 R2 high finding); first 3 executable lines were: {executable:?}"
+  );
+}
+
+/// LM-6 R2 (medium): F64 logits MUST be rejected — the prior non-F32
+/// branch silently funneled them through `astype(F32) → divide →
+/// astype(F64)`, losing precision on near-tied f64 logits before the
+/// Gumbel draw while still returning an F64 array downstream. A "native
+/// F64 divide" alternative is not available here because MLX's GPU
+/// stream (which `ops::arithmetic::divide` routes through) does not
+/// implement float64 — eval would error with `"float64 is not supported
+/// on the GPU"`. Rejecting up front is bit-honest about the backend's
+/// actual F64 capability AND surfaces the precision-loss bug the prior
+/// implicit-roundtrip path masked. This test verifies (a) the error
+/// path fires (b) the message mentions F64 + tells the caller to cast,
+/// and (c) the input that would have silently lost precision under
+/// the old path is the exact one this rejection protects.
+#[test]
+fn scale_logits_by_temp_rejects_f64() {
+  // 10 logits separated by exactly 1e-9 at the f64 level — well below
+  // f32's ~1.19e-7 epsilon at magnitude 1.0, so an f32 roundtrip would
+  // collide consecutive entries to the same value and destroy the
+  // strict-monotonic input ordering. Use base = 1.0 (exactly
+  // representable in both f32 and f64) so the only precision loss
+  // would be the per-step delta. This is the exact construction the
+  // prior implicit f32-roundtrip path corrupted; rejection protects
+  // the caller from that silent corruption.
+  let base: f64 = 1.0;
+  let step: f64 = 1e-9;
+  let input: Vec<f64> = (0..10).map(|i| base + (i as f64) * step).collect();
+  // Sanity: the input is strictly monotonic at the f64 level, but its
+  // f32 cast collapses adjacent values (demonstrating the precision
+  // loss the prior implementation hid).
+  for w in input.windows(2) {
+    assert!(w[0] < w[1], "test premise: input strictly monotonic in f64");
+  }
+  let f32_roundtripped: Vec<f64> = input.iter().map(|x| *x as f32 as f64).collect();
+  assert!(
+    f32_roundtripped.windows(2).any(|w| w[0] == w[1]),
+    "test premise: f32 roundtrip collapses some adjacent f64 values to equal — \
+     this is the silent precision loss the F64 rejection protects against; \
+     got {f32_roundtripped:?}"
+  );
+
+  let lp = Array::from_slice::<f64>(&input, &[1, 10]).unwrap();
+  assert_eq!(lp.dtype().unwrap(), Dtype::F64);
+  let err = sample::scale_logits_by_temp(&lp, 0.5).unwrap_err();
+  let msg = format!("{err}");
+  assert!(
+    msg.contains("F64"),
+    "F64 rejection message must mention F64 explicitly: {msg}"
+  );
+  assert!(
+    msg.contains("astype") || msg.contains("Cast"),
+    "F64 rejection message must tell the caller to cast: {msg}"
+  );
+  // And the public categorical_sampling entry surfaces the same error
+  // — the rejection is the entire categorical-sampling surface, not
+  // just the helper.
+  let key = mlxrs::ops::random::key(0).unwrap();
+  assert!(
+    sample::categorical_sampling(&lp, 0.5, &key).is_err(),
+    "categorical_sampling on F64 must error via scale_logits_by_temp"
+  );
+}
+
+/// LM-6 R2 (medium): integer / boolean logits must be REJECTED (the prior
+/// branch treated every non-F32 dtype as a half type and would silently
+/// astype through f32). Mirrors the dtype-rejection pattern in
+/// `kl_div_loss` — the message must mention floating-point and name the
+/// rejected dtype so the caller knows what to cast to.
+#[test]
+fn scale_logits_by_temp_rejects_integer_dtype() {
+  let lp = Array::from_slice::<i32>(&[1, 2, 3, 4], &[1, 4]).unwrap();
+  assert_eq!(lp.dtype().unwrap(), Dtype::I32);
+  let err = sample::scale_logits_by_temp(&lp, 0.8).unwrap_err();
+  let msg = format!("{err}");
+  assert!(
+    msg.contains("floating-point"),
+    "i32 rejection message must mention floating-point: {msg}"
+  );
+  assert!(
+    msg.contains("I32"),
+    "i32 rejection message must name the rejected dtype: {msg}"
+  );
+  // And via the public categorical_sampling entry — the same rejection
+  // propagates.
+  let key = mlxrs::ops::random::key(0).unwrap();
+  assert!(
+    sample::categorical_sampling(&lp, 0.8, &key).is_err(),
+    "categorical_sampling on i32 logits must error via scale_logits_by_temp"
   );
 }
