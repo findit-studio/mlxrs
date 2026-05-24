@@ -61,6 +61,10 @@ use crate::{
   },
   ops,
 };
+// P1 #111: bring the trait into scope so the `Detokenizer` enum's
+// `StreamingDetokenizer` impl methods dispatch through the enum value.
+#[cfg(feature = "tokenizer-stream")]
+use crate::tokenizer::StreamingDetokenizer as _;
 
 /// Statistics reported alongside a speculative-decoding run.
 ///
@@ -741,7 +745,7 @@ impl<'a> SpeculativeDriver<'a> {
         // History grows by `combined[pos]` for this position's input.
         try_extend_from_slice(&mut history_snapshot, &combined[pos..pos + 1])?;
         for p in &self.processors {
-          row = p(&history_snapshot, &row)?;
+          row = p.apply(&history_snapshot, &row)?;
         }
       }
       // `logprobs = row - logsumexp(row)` (the exact mlx-lm
@@ -749,7 +753,7 @@ impl<'a> SpeculativeDriver<'a> {
       let lse = ops::reduction::logsumexp(&row, true)?;
       let logprobs = ops::arithmetic::subtract(&row, &lse)?;
       // Sample (temp 0 ⇒ argmax).
-      let mut sampled = (self.sampler)(&logprobs)?;
+      let mut sampled = self.sampler.sample(&logprobs)?;
       let tok = sampled.item::<u32>()?;
       target_tokens.push(tok);
       target_logprobs.push(ops::shape::squeeze_axes(&logprobs, &[0])?);
@@ -905,12 +909,12 @@ impl<'a> SpeculativeDriver<'a> {
       if have_procs {
         draft_history.push(next_history_token);
         for p in &self.processors {
-          row = p(&draft_history, &row)?;
+          row = p.apply(&draft_history, &row)?;
         }
       }
       let lse = ops::reduction::logsumexp(&row, true)?;
       let lp = ops::arithmetic::subtract(&row, &lse)?;
-      let mut sampled = (self.sampler)(&lp)?;
+      let mut sampled = self.sampler.sample(&lp)?;
       let tok = sampled.item::<u32>()?;
       drafts.push(tok);
       y = vec![tok];

@@ -47,7 +47,8 @@
 //! 2. checks whether `prompt_ids` begins with the cache's *known* token
 //!    sequence (the opaque prefix sits implicitly in front of the cache, not
 //!    in front of `prompt_ids`);
-//! 3. if so — the render **extends** the cache — feeds [`generate_step`] only
+//! 3. if so — the render **extends** the cache — feeds
+//!    [`crate::lm::generate::generate_step`] only
 //!    the suffix beyond the known ids; the cache continues from its current
 //!    `offset()`, so turn N+1's prefill cost is the *new* tokens only. A
 //!    fresh builder-restored cache (empty `known`) extends on every render,
@@ -85,7 +86,7 @@
 //! ## What it reuses (no reimplementation)
 //!
 //! - **Generation** — every turn drives [`crate::lm::generate::generate_step`]
-//!   (the architecture-agnostic [`Generator`] loop) for the standard path and
+//!   (the architecture-agnostic generator loop) for the standard path and
 //!   [`crate::lm::speculative::speculative_stream_generate`] for the
 //!   speculative-decoding path. The session never re-implements the decode
 //!   loop; it only adds the streaming-detokenizer + history glue around it
@@ -95,8 +96,9 @@
 //! - **Template** — the prompt is rendered by
 //!   [`Tokenizer::apply_chat_template`]; the session never renders jinja.
 //! - **Cache** — built by [`make_prompt_cache`] and carried across turns via
-//!   [`Generator::into_cache`]; the session never reaches into a concrete
-//!   cache type.
+//!   the internal `Generator::into_cache` reclaim path (P1 #113 hid
+//!   `Generator` behind `pub(crate)`); the session never reaches into a
+//!   concrete cache type.
 
 use std::rc::Rc;
 
@@ -106,11 +108,14 @@ use crate::{
   error::{Error, Result},
   lm::{
     cache::{CacheConfig, KvCache, make_prompt_cache, save_prompt_cache},
-    generate::{GenConfig, GenerationResponse, Generator, generate_step},
+    generate::{GenConfig, GenerationResponse, Generator, build_generator},
     model::Model,
     speculative::{DraftConfig, SpeculativeStream, speculative_stream_generate},
   },
-  tokenizer::{Tokenizer, wrapper::BoxedDetokenizer},
+  // P1 #111: bring `StreamingDetokenizer` into scope so the `Detokenizer`
+  // enum's trait-impl methods (`add_token` / `finalize` / `last_segment` /
+  // …) dispatch through the enum value.
+  tokenizer::{StreamingDetokenizer as _, Tokenizer, wrapper::BoxedDetokenizer},
 };
 
 /// The role of a [`ChatMessage`] in the conversation — mlx-swift-lm's
@@ -974,7 +979,7 @@ impl ChatSession {
         // current `offset()`, so turn N+1 never re-prefills the prior
         // conversation. `decide_prefill` guarantees `prefill_start <
         // prompt_ids.len()`, so this slice is always non-empty.
-        generator: generate_step(model, &prompt_ids[prefill_start..], std_cache, cfg),
+        generator: build_generator(model, &prompt_ids[prefill_start..], std_cache, cfg),
         // The standard path carries the draft cache (always `None` here)
         // through so the write-back round-trips the slot shape.
         draft_cache,
@@ -1135,7 +1140,7 @@ pub struct ChatResponseStream<'s> {
   /// write-back appends the assistant reply here.
   history: &'s mut Vec<ChatMessage>,
   /// The per-turn generation driver. `Option` so [`Drop`] can `take` it and
-  /// reclaim the [`Generator`]'s cache by value.
+  /// reclaim the internal generator's cache by value.
   driver: Option<Driver<'s>>,
   /// The streaming detokenizer — maps token ids to readable text segments.
   detok: BoxedDetokenizer,
@@ -1144,7 +1149,7 @@ pub struct ChatResponseStream<'s> {
   /// `max_tokens` from the session's [`GenConfig`] — the "length" stop.
   max_tokens: usize,
   /// The encoded prompt length for this turn — surfaced on every yielded
-  /// [`GenerationResponse::prompt_tokens`] (the standard `Generator` path
+  /// [`GenerationResponse::prompt_tokens`] (the standard generator path
   /// only; the speculative path adopts the iterator's own response, which
   /// already carries it).
   prompt_tokens: usize,
@@ -1197,8 +1202,9 @@ impl ChatResponseStream<'_> {
   /// — the body of [`Drop`], factored out so it runs at most once
   /// (idempotent via the `committed` flag).
   ///
-  /// **Standard path** — the [`Generator`]'s cache is reclaimed by value
-  /// ([`Generator::into_cache`]): the *advanced* cache, holding the KV for
+  /// **Standard path** — the internal generator's cache is reclaimed by
+  /// value (via the in-crate `Generator::into_cache`): the *advanced*
+  /// cache, holding the KV for
   /// the prefilled prompt **and** the generated tokens. It is stored as
   /// [`CacheSlot::Realised`] together with the exact token sequence it now
   /// encodes ([`CachedTokens`]): the carried-forward opaque prefix

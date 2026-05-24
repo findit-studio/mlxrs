@@ -136,6 +136,9 @@ impl KvCache for DefaultMock {
   fn copy(&self) -> Result<Box<dyn KvCache>> {
     Ok(Box::new(DefaultMock))
   }
+  fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+    self
+  }
 }
 
 #[test]
@@ -213,6 +216,9 @@ impl KvCache for RotatingForwardingWrapper {
   }
   fn copy(&self) -> Result<Box<dyn KvCache>> {
     self.inner.copy()
+  }
+  fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+    self
   }
   // Deliberately NO `reference_class_name` override — exercises the trait
   // default fallback (the whole point of this test).

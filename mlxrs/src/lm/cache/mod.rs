@@ -109,6 +109,79 @@ pub type QTriple = (Array, Array, Option<Array>);
 /// Concrete caches ([`StandardKvCache`], [`RotatingKvCache`], and the
 /// later-PR Chunked/Quantized/… types) implement this; the generation loop
 /// and `make_prompt_cache` work uniformly over `Box<dyn KvCache>`.
+///
+/// # Per-layer fast-path convention (P1 #110)
+///
+/// `Model::forward` calls `cache[i].update(k, v)?` once per layer per token
+/// through the `Box<dyn KvCache>` vtable — `~32-80` vtables per token,
+/// one per layer. Each layer's cache type is **fixed per model
+/// architecture**, so the model statically knows which concrete type to
+/// expect; the vtable is wasted information.
+///
+/// **Convention** (mirrors mlx-swift-lm's
+/// `cache as? QuantizedKVCacheProtocol` idiom at
+/// `KVCache.swift:101`): inside each per-model `Model::forward`,
+/// downcast once via [`as_any_mut`](KvCache::as_any_mut) **before** the
+/// per-layer hot loop, then dispatch every per-layer `update` /
+/// `make_mask` / etc. on the concrete type — one vtable per layer
+/// (the downcast), then static dispatch on every subsequent method:
+///
+/// ```ignore
+/// fn forward(&self, tokens: &Array, cache: &mut [Box<dyn KvCache>]) -> Result<Array> {
+///     let mut x = self.embed(tokens)?;
+///     for (layer, c) in self.layers.iter().zip(cache.iter_mut()) {
+///         // ONE vtable per layer (downcast), then static dispatch on
+///         // every update / make_mask / etc. inside the layer body.
+///         let rot = c.as_any_mut()
+///             .downcast_mut::<RotatingKvCache>()
+///             .ok_or_else(|| Error::Backend {
+///                 message: format!("layer cache type mismatch (expected RotatingKvCache)"),
+///             })?;
+///         let (k, v) = rot.update(&x_k, &x_v)?;       // static dispatch
+///         let mask = rot.make_mask(s, None, false)?;  // static dispatch
+///         x = layer.attention(&x, &k, &v, &mask)?;
+///     }
+///     Ok(x)
+/// }
+/// ```
+///
+/// # Breaking change (P1 #110)
+///
+/// This trait now requires a `fn as_any_mut(&mut self) -> &mut dyn std::any::Any`
+/// method with NO default. Out-of-tree implementations of [`KvCache`] MUST add
+/// the following one-line override to compile:
+///
+/// ```rust,ignore
+/// impl KvCache for MyCustomCache {
+///     // ...
+///     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+/// }
+/// ```
+///
+/// **Lifetime requirement**: `std::any::Any` requires `Self: 'static`, so the
+/// `{ self }` one-liner only compiles for cache types that do not carry
+/// non-`'static` borrows. Custom caches holding `&'a SomeRef` borrows hit a
+/// lifetime error of the form `coercion requires 'a to outlive 'static` (no
+/// E-code; the borrow checker rejects the upcast to `&mut dyn Any`) and need
+/// a different downcast strategy (e.g., an `enum CacheRef<'a>` discriminator
+/// or `&'a self` accessors that bypass `Any` entirely). E0310 can
+/// additionally apply when the cache type takes an unconstrained generic
+/// parameter `T` that the compiler cannot prove is `'static` (e.g.,
+/// `impl<T> KvCache for MyCache<T>` without a `T: 'static` bound). All
+/// in-tree caches (Standard, Rotating, Chunked, Quantized, Batch,
+/// BatchRotating, Arrays, CacheList) are `'static` and use the one-liner
+/// above.
+///
+/// This enables zero-cost downcast-once-per-layer typed cache access in the
+/// hot loop, replacing per-layer vtable dispatch. The existing dynamic
+/// `update` / `update_quantized` dispatch continues to work, but only after
+/// implementers add this method (compile error E0046 otherwise; a
+/// `coercion requires 'a to outlive 'static` lifetime error for caches with
+/// non-`'static` borrowed fields, or E0310 for unconstrained generic
+/// parameters lacking a `'static` bound).
+///
+/// The first per-model port (Qwen3-VL, LFM2, …) should land the downcast
+/// pattern alongside its `forward` impl.
 pub trait KvCache {
   /// The current cached offset (mlx-lm `cache.offset` — the raw position
   /// the attention mask / RoPE use).
@@ -355,6 +428,54 @@ pub trait KvCache {
   fn as_cache_list_mut(&mut self) -> Option<&mut CacheList> {
     None
   }
+
+  /// Mutable [`Any`](std::any::Any) hook for the per-layer fast-path
+  /// downcast (P1 #110 — see the **Per-layer fast-path convention**
+  /// section on the trait doc above).
+  ///
+  /// Each per-model `Model::forward` calls `cache[i].update(k, v)?`
+  /// once per layer through the `Box<dyn KvCache>` vtable. The cache
+  /// type is fixed per architecture, so the model can downcast once
+  /// via `cache[i].as_any_mut().downcast_mut::<ConcreteCache>()` and
+  /// then dispatch every subsequent per-layer method statically
+  /// (mlx-swift-lm's `cache as? QuantizedKVCacheProtocol` idiom).
+  ///
+  /// This is the single trait method needed — all 8 in-tree caches
+  /// override it with the one-line `self` return:
+  ///
+  /// ```ignore
+  /// fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+  ///     self
+  /// }
+  /// ```
+  ///
+  /// **Required method, no default body.** The naive default of
+  /// returning a `'static` placeholder (`Box::leak(Box::new(()))`)
+  /// would allocate-and-leak per call, and a `&'static mut ()` via
+  /// `OnceLock` would race on `&mut`; widening `self` itself would
+  /// require `Self: 'static` on the trait (not enforced today and
+  /// would propagate the bound to every existing `Box<dyn KvCache>`).
+  /// Making this a required method instead surfaces the
+  /// "did-not-opt-in" case as a compile error, not a silent
+  /// fast-path miss — the right failure mode for a downcast target.
+  ///
+  /// **Lifetime requirement**: `std::any::Any` carries an implicit
+  /// `Self: 'static` bound. The `{ self }` one-liner above therefore
+  /// only compiles when the concrete cache type is `'static` (no
+  /// non-`'static` borrows in its fields). Out-of-tree caches carrying
+  /// `&'a SomeRef` borrows hit a lifetime error of the form
+  /// `coercion requires 'a to outlive 'static` (no E-code; the borrow
+  /// checker rejects the upcast to `&mut dyn Any`) with the one-liner
+  /// and need a non-`Any` downcast strategy (e.g., a
+  /// lifetime-parameterized discriminator enum or a typed `&'a self`
+  /// accessor). E0310 can additionally apply when the cache type takes
+  /// an unconstrained generic parameter `T` that the compiler cannot
+  /// prove is `'static` (e.g., `impl<T> KvCache for MyCache<T>` without
+  /// a `T: 'static` bound). All in-tree caches are `'static`. The trait
+  /// itself is **not** declared `KvCache: Any` / `'static` to avoid
+  /// propagating the bound to every existing `Box<dyn KvCache>`
+  /// consumer.
+  fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 
   /// The number of arrays [`state`](KvCache::state) would return, without
   /// materializing or cloning them. The default reads `self.state()?.len()`

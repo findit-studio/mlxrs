@@ -616,6 +616,12 @@ impl KvCache for ArraysCache {
     "ArraysCache"
   }
 
+  /// P1 #110: per-layer fast-path downcast target — see the
+  /// [`KvCache`]-trait doc's **Per-layer fast-path convention**.
+  fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+    self
+  }
+
   /// Transactional override of [`KvCache::from_serialized`] — leaves `self`
   /// byte-identical to its pre-call state on every recoverable error
   /// (`set_state` is infallible aside from `try_clone` paths it doesn't

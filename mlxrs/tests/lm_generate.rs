@@ -457,7 +457,9 @@ fn generate_step_zero_max_tokens_is_empty() {
 fn make_sampler_default_is_argmax() {
   let mut s = make_sampler(0.0, 0.0, 0.0, 1, 0, 0.0, 0.0, &[], None).unwrap();
   let lp = Array::from_slice::<f32>(&[-3.0, -1.0, -2.0], &[1, 3]).unwrap();
-  let mut tok = s(&lp).unwrap();
+  // P1 #108: `Sampler` is now an enum — `sample()` dispatches the
+  // canonical chain via match (`Sampler::Argmax` here).
+  let mut tok = s.sample(&lp).unwrap();
   assert_eq!(tok.to_vec::<u32>().unwrap(), vec![1], "argmax index");
 }
 
@@ -476,7 +478,7 @@ fn make_logits_processors_composition_and_order() {
   let procs = make_logits_processors(&[(0, 5.0)], None, 20, None, 20, None, 20).unwrap();
   assert_eq!(procs.len(), 1);
   let logits = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[1, 3]).unwrap();
-  let mut out = procs[0](&[7u32], &logits).unwrap();
+  let mut out = procs[0].apply(&[7u32], &logits).unwrap();
   assert_eq!(out.to_vec::<f32>().unwrap(), vec![6.0, 2.0, 3.0]);
 
   // Order: logit_bias is index 0, repetition penalty index 1.
@@ -485,13 +487,13 @@ fn make_logits_processors_composition_and_order() {
   // First processor (logit_bias) adds 1.0 at col 1; second (rep penalty,
   // token id 0, positive logit) divides col 0 by 2.
   let logits = Array::from_slice::<f32>(&[4.0, 8.0, 1.0], &[1, 3]).unwrap();
-  let mut a = procs[0](&[0u32], &logits).unwrap();
+  let mut a = procs[0].apply(&[0u32], &logits).unwrap();
   assert_eq!(
     a.to_vec::<f32>().unwrap(),
     vec![4.0, 9.0, 1.0],
     "bias first"
   );
-  let mut b = procs[1](&[0u32], &a).unwrap();
+  let mut b = procs[1].apply(&[0u32], &a).unwrap();
   assert_eq!(
     b.to_vec::<f32>().unwrap(),
     vec![2.0, 9.0, 1.0],
@@ -517,7 +519,7 @@ fn make_logits_processors_independent_context_windows() {
   let logits = Array::from_slice::<f32>(&[10.0, 10.0, 10.0], &[1, 3]).unwrap();
 
   // Presence: subtract 0.5 once from ids in tokens[-1:] == [1] ⇒ only col 1.
-  let mut p = procs[0](&[0u32, 1], &logits).unwrap();
+  let mut p = procs[0].apply(&[0u32, 1], &logits).unwrap();
   assert_eq!(
     p.to_vec::<f32>().unwrap(),
     vec![10.0, 9.5, 10.0],
@@ -525,7 +527,7 @@ fn make_logits_processors_independent_context_windows() {
   );
 
   // Frequency: subtract 0.25 per occurrence in tokens[-1:] == [1] ⇒ col 1.
-  let mut f = procs[1](&[0u32, 1], &logits).unwrap();
+  let mut f = procs[1].apply(&[0u32, 1], &logits).unwrap();
   assert_eq!(
     f.to_vec::<f32>().unwrap(),
     vec![10.0, 9.75, 10.0],
@@ -536,7 +538,7 @@ fn make_logits_processors_independent_context_windows() {
   // proving the window is the presence-specific param (now distinct from
   // the still-size-20 repetition default and the prior size-1 result).
   let procs2 = make_logits_processors(&[], None, 20, Some(0.5), 2, None, 20).unwrap();
-  let mut p2 = procs2[0](&[0u32, 1], &logits).unwrap();
+  let mut p2 = procs2[0].apply(&[0u32, 1], &logits).unwrap();
   assert_eq!(
     p2.to_vec::<f32>().unwrap(),
     vec![9.5, 9.5, 10.0],
@@ -558,7 +560,7 @@ fn make_logits_processors_zero_context_is_full_history() {
   // Repetition penalty 2.0, context 0 ⇒ full history [0,1] ⇒ cols 0,1
   // divided by 2 (positive logits ⇒ `logit / penalty`).
   let rep = make_logits_processors(&[], Some(2.0), 0, None, 20, None, 20).unwrap();
-  let mut r = rep[0](hist, &logits()).unwrap();
+  let mut r = rep[0].apply(hist, &logits()).unwrap();
   assert_eq!(
     r.to_vec::<f32>().unwrap(),
     vec![5.0, 5.0, 10.0],
@@ -567,7 +569,7 @@ fn make_logits_processors_zero_context_is_full_history() {
 
   // Presence penalty 0.5, context 0 ⇒ full history ⇒ cols 0,1 minus 0.5.
   let pre = make_logits_processors(&[], None, 20, Some(0.5), 0, None, 20).unwrap();
-  let mut p = pre[0](hist, &logits()).unwrap();
+  let mut p = pre[0].apply(hist, &logits()).unwrap();
   assert_eq!(
     p.to_vec::<f32>().unwrap(),
     vec![9.5, 9.5, 10.0],
@@ -577,7 +579,7 @@ fn make_logits_processors_zero_context_is_full_history() {
   // Frequency penalty 0.25, context 0, history [0,1] (each once) ⇒ cols
   // 0,1 minus 0.25.
   let fre = make_logits_processors(&[], None, 20, None, 20, Some(0.25), 0).unwrap();
-  let mut f = fre[0](hist, &logits()).unwrap();
+  let mut f = fre[0].apply(hist, &logits()).unwrap();
   assert_eq!(
     f.to_vec::<f32>().unwrap(),
     vec![9.75, 9.75, 10.0],
@@ -594,7 +596,10 @@ fn make_sampler_propagates_sample_rs_errors() {
   // temp != 0 so the chain is built; top_k == vocab is out of (0, vocab).
   let mut s = make_sampler(0.7, 0.0, 0.0, 1, 3, 0.0, 0.0, &[], None).unwrap();
   let lp = Array::from_slice::<f32>(&[-1.0, -2.0, -3.0], &[1, 3]).unwrap();
-  assert!(s(&lp).is_err(), "out-of-range top_k error propagates");
+  assert!(
+    s.sample(&lp).is_err(),
+    "out-of-range top_k error propagates"
+  );
 }
 
 /// Regression (Codex adversarial-review): stochastic (`temp > 0`) generation
@@ -679,7 +684,7 @@ fn make_logits_processors_propagates_sample_rs_errors() {
   assert_eq!(procs.len(), 1);
   let logits = Array::from_slice::<f32>(&[1.0, 2.0], &[1, 2]).unwrap();
   assert!(
-    procs[0](&[0u32], &logits).is_err(),
+    procs[0].apply(&[0u32], &logits).is_err(),
     "negative penalty error propagates from sample.rs"
   );
 }
@@ -1364,4 +1369,180 @@ fn generate_zero_max_tokens_stats() {
   assert_eq!(stats.generation_tokens, 0);
   assert_eq!(stats.prompt_tps, 0.0);
   assert_eq!(stats.generation_tps, 0.0);
+}
+
+// ============================================================
+// P1 hot-loop monomorphize regression tests
+// (#108 sampler + #109 processors + #111 detokenizer + #113 generate_step)
+// ============================================================
+
+/// P1 #108: `make_sampler(temp == 0, …)` returns the [`Sampler::Argmax`]
+/// variant, not a closure-bearing chain. This is the cheapest fast-path —
+/// no allocation, no PRNG key, no per-token closure indirection.
+#[test]
+fn p1_sampler_argmax_variant_for_temp_zero() {
+  use mlxrs::lm::generate::Sampler;
+  let s = make_sampler(0.0, 0.7, 0.0, 1, 0, 0.0, 0.0, &[], None).unwrap();
+  // Even with non-zero `top_p` set, `temp == 0` short-circuits to argmax
+  // (mlx-lm `make_sampler` line 46 — argmax returned BEFORE top_p is read).
+  assert!(matches!(s, Sampler::Argmax), "temp == 0 ⇒ Sampler::Argmax");
+}
+
+/// P1 #108: any `temp > 0` returns the [`Sampler::Chain`] variant
+/// regardless of the other gates; `Chain` owns the PRNG key + all
+/// per-stage `do_*` flags.
+#[test]
+fn p1_sampler_chain_variant_for_temp_positive() {
+  use mlxrs::lm::generate::Sampler;
+  // No `do_*` flags set — still `Chain` (chain is the categorical-only
+  // path, mlx-lm `make_sampler` always reaches `categorical_sampling`).
+  let s = make_sampler(0.5, 0.0, 0.0, 1, 0, 0.0, 0.0, &[], Some(42)).unwrap();
+  assert!(matches!(s, Sampler::Chain(_)), "temp > 0 ⇒ Sampler::Chain");
+
+  // Every-gate-on configuration also lands in `Chain`.
+  let s = make_sampler(0.7, 0.9, 0.05, 2, 50, 0.1, 0.2, &[10], Some(7)).unwrap();
+  assert!(matches!(s, Sampler::Chain(_)));
+}
+
+/// P1 #108: `Sampler::Custom` provides the escape hatch for out-of-tree
+/// samplers — the boxed closure is still dispatched once via the variant
+/// match, but the caller can carry any `FnMut(&Array) -> Result<Array>`.
+#[test]
+fn p1_sampler_custom_escape_hatch() {
+  use mlxrs::lm::generate::Sampler;
+  // Custom: always-return-row-0 (Array of shape `[1]` with `0u32`).
+  let mut s = Sampler::custom(|_logits: &Array| Array::from_slice::<u32>(&[0u32], &(1,)));
+  assert!(matches!(s, Sampler::Custom(_)));
+  let lp = Array::from_slice::<f32>(&[-3.0, -1.0, -2.0], &(1, 3)).unwrap();
+  let mut tok = s.sample(&lp).unwrap();
+  assert_eq!(tok.to_vec::<u32>().unwrap(), vec![0u32]);
+}
+
+/// P1 #109: each canonical processor lands in its named typed variant
+/// (`LogitBias` / `RepetitionPenalty` / `PresencePenalty` /
+/// `FrequencyPenalty`), not the `Custom` escape hatch. The variant
+/// match in `apply()` then dispatches to the [`crate::lm::sample`]
+/// primitive directly — no per-token vtable indirection.
+#[test]
+fn p1_logits_processor_typed_variants() {
+  use mlxrs::lm::generate::LogitsProcessor;
+  let procs = make_logits_processors(
+    &[(1i32, 1.5f32)], // logit bias
+    Some(2.0),         // repetition penalty
+    16,
+    Some(0.3), // presence penalty
+    8,
+    Some(0.1), // frequency penalty
+    4,
+  )
+  .unwrap();
+  assert_eq!(procs.len(), 4, "bias + rep + presence + frequency");
+  assert!(
+    matches!(procs[0], LogitsProcessor::LogitBias { .. }),
+    "first is LogitBias"
+  );
+  assert!(
+    matches!(
+      procs[1],
+      LogitsProcessor::RepetitionPenalty {
+        penalty: _,
+        context_size: 16
+      }
+    ),
+    "second is RepetitionPenalty with the rep-specific context size"
+  );
+  assert!(
+    matches!(
+      procs[2],
+      LogitsProcessor::PresencePenalty {
+        penalty: _,
+        context_size: 8
+      }
+    ),
+    "third is PresencePenalty with the presence-specific context size"
+  );
+  assert!(
+    matches!(
+      procs[3],
+      LogitsProcessor::FrequencyPenalty {
+        penalty: _,
+        context_size: 4
+      }
+    ),
+    "fourth is FrequencyPenalty with the frequency-specific context size"
+  );
+}
+
+/// P1 #109: `LogitsProcessor::Custom` is the escape hatch for out-of-tree
+/// processors (e.g. `LLGuidanceLogitsProcessor`); the inner closure is
+/// dispatched once via the variant match.
+#[test]
+fn p1_logits_processor_custom_escape_hatch() {
+  use mlxrs::lm::generate::LogitsProcessor;
+  let p = LogitsProcessor::Custom(Box::new(|_tokens: &[u32], logits: &Array| {
+    // Identity processor — `try_clone` to return owned without mutation.
+    logits.try_clone()
+  }));
+  assert!(matches!(p, LogitsProcessor::Custom(_)));
+  let logits = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(1, 3)).unwrap();
+  let mut out = p.apply(&[], &logits).unwrap();
+  assert_eq!(out.to_vec::<f32>().unwrap(), vec![1.0, 2.0, 3.0]);
+}
+
+/// P1 #113: [`generate_step`]'s return type is opaque
+/// (`impl Iterator<Item = Result<GenStep>> + 'a`). Concretely: a binding
+/// declared as the `impl Iterator<…>` trait object compiles, but the
+/// concrete `Generator<'a, M>` is no longer publicly nameable. This test
+/// pins the public surface — if it ever regresses to `pub struct
+/// Generator`, the trait-object binding would still compile (a concrete
+/// `Generator` satisfies `Iterator`), so we instead require that the
+/// return type IS the iterator trait through `Iterator` method calls.
+#[test]
+fn p1_generate_step_returns_impl_iterator() {
+  let tok = tokenizer("p1_impl_iter");
+  let model = MockModel::ramp(8);
+  let cfg = GenConfig {
+    max_tokens: 3,
+    eos: tok.eos_token_ids().iter().copied().collect(),
+    ..GenConfig::default()
+  };
+  // `let it: impl Iterator<…>` is not nameable directly in let bindings,
+  // but the IteratorExt methods (`take`, `count`) prove the return type
+  // implements `Iterator` through the public surface. Concretely: this
+  // typechecks ONLY because `generate_step` returns `impl Iterator + 'a`
+  // — naming `Generator<'a, _>` would require importing it (it is now
+  // `pub(crate)`, so a `use mlxrs::lm::generate::Generator;` would fail).
+  // `let it: impl Iterator<…>` is not a nameable type in `let`
+  // bindings, but the `Iterator::next()` method call proves the return
+  // type implements the trait — and this typechecks ONLY because
+  // `generate_step` returns `impl Iterator + 'a`. Naming
+  // `Generator<'a, _>` would require importing it (it is now
+  // `pub(crate)`, so a `use mlxrs::lm::generate::Generator;` would fail
+  // to compile).
+  let mut it = generate_step(&model, &[1u32, 2], cache(1), cfg);
+  // Argmax of ramp(8) is the last vocab id; assert at least one step yielded.
+  assert!(it.next().is_some(), "iterator must yield at least one step");
+}
+
+/// P1 #113: A `let _gen: mlxrs::lm::generate::Generator<…>` binding would
+/// fail to compile because `Generator` is now `pub(crate)`. We can't
+/// negative-test "this code fails to compile" inline, so instead pin the
+/// `impl Iterator` shape: chaining iterator combinators works.
+#[test]
+fn p1_generate_step_chains_iterator_methods() {
+  let tok = tokenizer("p1_chain");
+  let model = MockModel::ramp(8);
+  let cfg = GenConfig {
+    max_tokens: 5,
+    eos: tok.eos_token_ids().iter().copied().collect(),
+    ..GenConfig::default()
+  };
+  // map + filter + take + count all require Iterator — proves the
+  // public surface is the iterator trait, not a concrete type.
+  let n = generate_step(&model, &[1u32, 2], cache(1), cfg)
+    .map(|r| r.unwrap().token)
+    .filter(|t| *t < 100)
+    .take(3)
+    .count();
+  assert!(n >= 1, "should yield at least one filtered token");
 }

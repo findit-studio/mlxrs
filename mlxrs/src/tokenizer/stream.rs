@@ -599,6 +599,241 @@ pub fn infer_detokenizer_class(decoder: Option<&serde_json::Value>) -> Detokeniz
   }
 }
 
+/// A streaming naive detokenizer over a HuggingFace tokenizer — the
+/// non-generic concrete implementation that backs
+/// [`Detokenizer::Naive`].
+///
+/// Compared to [`NaiveStreamingDetokenizer<F>`], this avoids the
+/// generic `F` parameter so the [`Detokenizer`] enum can hold the
+/// Naive variant as a sized field (an enum cannot contain a closure
+/// type directly without monomorphizing the whole enum, which would
+/// defeat the unification). Behavior is byte-identical to
+/// `NaiveStreamingDetokenizer::new(|ids| hf.decode(ids, false), clean)`
+/// — the only difference is that the [`tokenizers::Tokenizer`] is
+/// stored inline rather than captured by a moved closure.
+#[cfg(feature = "tokenizer-stream")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokenizer-stream")))]
+pub struct NaiveHfDetokenizer {
+  hf: tokenizers::Tokenizer,
+  clean_up_spaces: bool,
+  tokens: Vec<u32>,
+  offset: usize,
+  text: String,
+  current_tokens: Vec<u32>,
+  current_text: String,
+}
+
+#[cfg(feature = "tokenizer-stream")]
+impl NaiveHfDetokenizer {
+  /// Build from a (cloned) [`tokenizers::Tokenizer`] and the
+  /// tokenizer's `clean_up_tokenization_spaces` flag.
+  pub fn new(hf: tokenizers::Tokenizer, clean_up_spaces: bool) -> Self {
+    Self {
+      hf,
+      clean_up_spaces,
+      tokens: Vec::new(),
+      offset: 0,
+      text: String::new(),
+      current_tokens: Vec::new(),
+      current_text: String::new(),
+    }
+  }
+
+  fn decode(&self, ids: &[u32]) -> String {
+    self.hf.decode(ids, false).unwrap_or_default()
+  }
+
+  fn recompute_text(&mut self) {
+    if !self.current_tokens.is_empty() {
+      let mut ct = self.decode(&self.current_tokens);
+      let ends_replacement = ct.ends_with('\u{fffd}');
+      let trailing_space = self.clean_up_spaces && !ct.is_empty() && ct.ends_with(' ');
+      if ends_replacement || trailing_space {
+        ct.pop();
+      }
+      self.current_text = ct;
+    }
+    if self.current_text.ends_with('\n') {
+      self.text.push_str(&self.current_text);
+      self.current_tokens.clear();
+      self.current_text.clear();
+    }
+  }
+}
+
+#[cfg(feature = "tokenizer-stream")]
+impl StreamingDetokenizer for NaiveHfDetokenizer {
+  fn reset(&mut self) {
+    self.offset = 0;
+    self.tokens.clear();
+    self.text.clear();
+    self.current_tokens.clear();
+    self.current_text.clear();
+  }
+
+  fn add_token(&mut self, token: u32) {
+    self.current_tokens.push(token);
+    self.tokens.push(token);
+    self.recompute_text();
+  }
+
+  fn finalize(&mut self) {
+    let decoded = self.decode(&self.current_tokens);
+    self.text.push_str(&decoded);
+    self.current_tokens.clear();
+    self.current_text.clear();
+  }
+
+  fn text(&self) -> std::borrow::Cow<'_, str> {
+    if self.current_text.is_empty() {
+      std::borrow::Cow::Borrowed(&self.text)
+    } else {
+      let mut s = String::with_capacity(self.text.len() + self.current_text.len());
+      s.push_str(&self.text);
+      s.push_str(&self.current_text);
+      std::borrow::Cow::Owned(s)
+    }
+  }
+
+  fn tokens(&self) -> &[u32] {
+    &self.tokens
+  }
+
+  fn offset(&self) -> usize {
+    self.offset
+  }
+
+  fn set_offset(&mut self, offset: usize) {
+    self.offset = offset;
+  }
+}
+
+/// A streaming detokenizer — the enum-unified replacement for the
+/// prior `Box<dyn StreamingDetokenizer>` trait-object alias.
+///
+/// # Breaking change (P1 #111)
+///
+/// Previously [`crate::tokenizer::wrapper::BoxedDetokenizer`] aliased
+/// `Box<dyn StreamingDetokenizer>` — one vtable indirection per
+/// emitted token (the `detok.add_token(token)` call in the
+/// `stream_generate` hot loop). The enum dispatches via `match`,
+/// inlining the canonical Naive / SPM / BPE variants and reserving
+/// [`Self::Custom`] for out-of-tree detokenizers.
+///
+/// The lower per-token dispatch cost of LM-1d (one indirection per
+/// token vs LM-1a/b's ~5 per token) is partly mitigated by
+/// branch-prediction warming on the consistent variant — a single
+/// generation run hits the same variant every token. The enum
+/// unification still wins on:
+/// - **inlining**: each variant's `add_token` body inlines through
+///   the `match`, so the per-variant logic (SPM's `try_flush`, BPE's
+///   `decode_bytes`) can vectorize / unroll.
+/// - **monomorphization**: no per-call vtable lookup, even cold.
+///
+/// Construct via [`crate::tokenizer::Tokenizer::detokenizer`] (the
+/// canonical class is inferred from `tokenizer.json`'s `decoder` node);
+/// out-of-tree detokenizers plug in through [`Self::Custom`].
+#[cfg(feature = "tokenizer-stream")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokenizer-stream")))]
+pub enum Detokenizer {
+  /// Naive re-decode detokenizer — the default / unknown-decoder
+  /// fallback. O(T²) over the longest line, matching Python. Boxed
+  /// because the wrapped [`tokenizers::Tokenizer`] is `~1KB` (dwarfs
+  /// the other variants); boxing keeps the enum's discriminant +
+  /// inline payload to a pointer, so per-token `match` dispatch
+  /// reads one pointer's worth of memory.
+  Naive(Box<NaiveHfDetokenizer>),
+  /// SentencePiece streaming detokenizer (`tokenizer-spm`-gated). Linear-time.
+  #[cfg(feature = "tokenizer-spm")]
+  Spm(SpmStreamingDetokenizer),
+  /// Byte-level BPE streaming detokenizer (`tokenizer-bpe`-gated).
+  #[cfg(feature = "tokenizer-bpe")]
+  Bpe(BpeStreamingDetokenizer),
+  /// Custom out-of-tree detokenizer (escape hatch). One indirection
+  /// per call.
+  Custom(Box<dyn StreamingDetokenizer>),
+}
+
+#[cfg(feature = "tokenizer-stream")]
+impl StreamingDetokenizer for Detokenizer {
+  fn reset(&mut self) {
+    match self {
+      Self::Naive(d) => d.reset(),
+      #[cfg(feature = "tokenizer-spm")]
+      Self::Spm(d) => d.reset(),
+      #[cfg(feature = "tokenizer-bpe")]
+      Self::Bpe(d) => d.reset(),
+      Self::Custom(d) => d.reset(),
+    }
+  }
+
+  fn add_token(&mut self, token: u32) {
+    match self {
+      Self::Naive(d) => d.add_token(token),
+      #[cfg(feature = "tokenizer-spm")]
+      Self::Spm(d) => d.add_token(token),
+      #[cfg(feature = "tokenizer-bpe")]
+      Self::Bpe(d) => d.add_token(token),
+      Self::Custom(d) => d.add_token(token),
+    }
+  }
+
+  fn finalize(&mut self) {
+    match self {
+      Self::Naive(d) => d.finalize(),
+      #[cfg(feature = "tokenizer-spm")]
+      Self::Spm(d) => d.finalize(),
+      #[cfg(feature = "tokenizer-bpe")]
+      Self::Bpe(d) => d.finalize(),
+      Self::Custom(d) => d.finalize(),
+    }
+  }
+
+  fn text(&self) -> std::borrow::Cow<'_, str> {
+    match self {
+      Self::Naive(d) => d.text(),
+      #[cfg(feature = "tokenizer-spm")]
+      Self::Spm(d) => d.text(),
+      #[cfg(feature = "tokenizer-bpe")]
+      Self::Bpe(d) => d.text(),
+      Self::Custom(d) => d.text(),
+    }
+  }
+
+  fn tokens(&self) -> &[u32] {
+    match self {
+      Self::Naive(d) => d.tokens(),
+      #[cfg(feature = "tokenizer-spm")]
+      Self::Spm(d) => d.tokens(),
+      #[cfg(feature = "tokenizer-bpe")]
+      Self::Bpe(d) => d.tokens(),
+      Self::Custom(d) => d.tokens(),
+    }
+  }
+
+  fn offset(&self) -> usize {
+    match self {
+      Self::Naive(d) => d.offset(),
+      #[cfg(feature = "tokenizer-spm")]
+      Self::Spm(d) => d.offset(),
+      #[cfg(feature = "tokenizer-bpe")]
+      Self::Bpe(d) => d.offset(),
+      Self::Custom(d) => d.offset(),
+    }
+  }
+
+  fn set_offset(&mut self, offset: usize) {
+    match self {
+      Self::Naive(d) => d.set_offset(offset),
+      #[cfg(feature = "tokenizer-spm")]
+      Self::Spm(d) => d.set_offset(offset),
+      #[cfg(feature = "tokenizer-bpe")]
+      Self::Bpe(d) => d.set_offset(offset),
+      Self::Custom(d) => d.set_offset(offset),
+    }
+  }
+}
+
 #[cfg(all(test, feature = "tokenizer-gpt2"))]
 mod byte_decoder_tests {
   /// The previous *runtime* `make_byte_decoder()` algorithm, reconstructed

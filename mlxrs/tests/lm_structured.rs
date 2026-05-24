@@ -268,19 +268,25 @@ DIGITS: /[0-9]+/
 
 #[test]
 fn llguidance_processor_implements_logits_processor_trait() {
-  // Compile-time check: `into_logits_processor` returns the
-  // `make_logits_processors` trait alias `Box<dyn Fn(&[u32], &Array)
-  // -> Result<Array>>`; the binding's type pin enforces it.
+  // P1 #109: `into_logits_processor` now returns the
+  // `LogitsProcessor::Custom` enum variant (the escape hatch for
+  // out-of-tree processors). The binding's type pin enforces it.
   let tok = fixture_tokenizer("plug_into_chain");
   let proc = structured::build_json_schema_logits_processor(json!({"type": "object"}), &tok, None)
     .expect("processor construction should succeed");
 
   let boxed: LogitsProcessor = proc.into_logits_processor();
+  // Confirm the enum variant the wrapper returns is `Custom` — the
+  // escape hatch (the canonical `make_logits_processors` chain returns
+  // the typed variants `LogitBias` / `RepetitionPenalty` / etc.).
+  assert!(matches!(boxed, LogitsProcessor::Custom(_)));
   // Exercise the boxed closure once to confirm the wiring round-trips.
   let vocab = tok.hf().get_vocab_size(true);
   let zeros = vec![0.0f32; vocab];
   let logits = Array::from_slice::<f32>(&zeros, &(1, vocab)).unwrap();
-  let _out = boxed(&[], &logits).expect("boxed closure call should succeed");
+  let _out = boxed
+    .apply(&[], &logits)
+    .expect("Custom processor apply should succeed");
 }
 
 // ── Finding 1 (R1): terminal-grammar EOS-only mask ────────────────────
