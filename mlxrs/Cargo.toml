@@ -148,3 +148,23 @@ required-features = ["vlm"]
 name = "simd_bgr_widen"
 harness = false
 required-features = ["vlm"]
+
+# C7 quantize bench — gated on the `audio` feature (dispatcher lives
+# behind the `audio` feature gate). Report-only per the user directive
+# 2026-05-23 (project memory rule "SIMD ship NEON regardless").
+[[bench]]
+name = "simd_quantize"
+harness = false
+required-features = ["audio"]
+
+# C3 RGB widen bench — gated on the `vlm` feature.
+[[bench]]
+name = "simd_rgb_widen"
+harness = false
+required-features = ["vlm"]
+
+# C1 PCM decode bench — gated on the `audio` feature.
+[[bench]]
+name = "simd_pcm_decode"
+harness = false
+required-features = ["audio"]

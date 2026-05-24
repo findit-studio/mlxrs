@@ -46,8 +46,6 @@
 //!   `LogFloor::Kaldi` docs). Tracks mlx-audio's literal, NOT the
 //!   upstream kaldi-asr `FbankComputer` floor of `f32::EPSILON`.
 
-use std::f32::consts::PI;
-
 use crate::{
   Array, Error, Result,
   ops::{
@@ -539,16 +537,20 @@ impl LogFloor {
 }
 
 /// Shared scaffolding for the symmetric (`periodic=False`) window family:
-/// validates `n`, applies the public-input allocation cap, and materializes
-/// `[sample(k) for k in 0..n]` on the CPU via a recoverable
-/// `try_reserve_exact`.
+/// validates `n`, applies the public-input allocation cap, and dispatches
+/// to the C12 SIMD window builder
+/// ([`crate::simd::audio::window::symmetric_window`]).
 ///
 /// `name` only flavors the error messages so each public window keeps its
-/// own diagnostic prefix; `sample` receives `(k, denom)` where
-/// `denom = (n - 1) as f32` (the `periodic=False` denominator shared by
-/// every `mlx-audio` window). The window kinds differ ONLY in this closure,
-/// so the guards / cap / fallible allocation can't drift between them.
-fn symmetric_window(name: &str, n: usize, sample: impl Fn(usize, f32) -> f32) -> Result<Array> {
+/// own diagnostic prefix; `kind` selects the per-window formula (Hann /
+/// Hamming / Blackman / Bartlett). On `aarch64` the C12 dispatcher
+/// routes to a 7-term Taylor cos polynomial NEON 4-lane tile;
+/// elsewhere it falls back to the per-element `f32::cos` scalar loop.
+fn symmetric_window(
+  name: &str,
+  n: usize,
+  kind: crate::simd::audio::window::SymWindowKind,
+) -> Result<Array> {
   if n < 2 {
     return Err(Error::Backend {
       message: format!("{name}: n must be >= 2 (got {n})"),
@@ -571,17 +573,15 @@ fn symmetric_window(name: &str, n: usize, sample: impl Fn(usize, f32) -> f32) ->
     message: format!("{name}: n {n} exceeds i32::MAX"),
   })?;
 
-  // Materialize on the CPU (cheap; n is bounded above) via a
-  // recoverable `try_reserve_exact` so the cap above (and any
-  // future allocation budget) cannot abort the host on a fuzzer input.
-  let denom = (n - 1) as f32;
-  let mut buf: Vec<f32> = Vec::new();
-  buf.try_reserve_exact(n).map_err(|e| Error::Backend {
-    message: format!("{name}: reservation for {n} elements failed: {e}"),
-  })?;
-  for k in 0..n {
-    buf.push(sample(k, denom));
-  }
+  // C12 SIMD: dispatch to the symmetric-window NEON kernel
+  // (`simd::audio::window::symmetric_window`). The dispatcher does
+  // its own fallible `try_reserve_exact(n)` + `spare_capacity_mut` +
+  // `set_len(n)` internally; we feed the result straight into
+  // `Array::from_slice`. The kernel's `n >= 2` precondition is
+  // already satisfied (asserted above), and its only fallible step
+  // is the request-scaled output reservation — which surfaces here
+  // as `Error::OutOfMemory`.
+  let buf = crate::simd::audio::window::symmetric_window(kind, n)?;
   Array::from_slice::<f32>(&buf, &[n_i32])
 }
 
@@ -599,10 +599,11 @@ fn symmetric_window(name: &str, n: usize, sample: impl Fn(usize, f32) -> f32) ->
 ///   [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) cap or
 ///   `i32::MAX`, or if the backing allocation fails.
 pub fn hann_window(n: usize) -> Result<Array> {
-  symmetric_window("hann_window", n, |k, denom| {
-    let theta = 2.0 * PI * (k as f32) / denom;
-    0.5 * (1.0 - theta.cos())
-  })
+  symmetric_window(
+    "hann_window",
+    n,
+    crate::simd::audio::window::SymWindowKind::Hann,
+  )
 }
 
 /// Symmetric Hamming window: `w[k] = 0.54 - 0.46 * cos(2π k / (n - 1))` for
@@ -613,10 +614,11 @@ pub fn hann_window(n: usize) -> Result<Array> {
 /// # Errors
 /// Same as [`hann_window`].
 pub fn hamming_window(n: usize) -> Result<Array> {
-  symmetric_window("hamming_window", n, |k, denom| {
-    let theta = 2.0 * PI * (k as f32) / denom;
-    0.54 - 0.46 * theta.cos()
-  })
+  symmetric_window(
+    "hamming_window",
+    n,
+    crate::simd::audio::window::SymWindowKind::Hamming,
+  )
 }
 
 /// Symmetric Blackman window:
@@ -629,10 +631,11 @@ pub fn hamming_window(n: usize) -> Result<Array> {
 /// # Errors
 /// Same as [`hann_window`].
 pub fn blackman_window(n: usize) -> Result<Array> {
-  symmetric_window("blackman_window", n, |k, denom| {
-    let theta = 2.0 * PI * (k as f32) / denom;
-    0.42 - 0.5 * theta.cos() + 0.08 * (2.0 * theta).cos()
-  })
+  symmetric_window(
+    "blackman_window",
+    n,
+    crate::simd::audio::window::SymWindowKind::Blackman,
+  )
 }
 
 /// Symmetric Bartlett (triangular) window:
@@ -644,9 +647,11 @@ pub fn blackman_window(n: usize) -> Result<Array> {
 /// # Errors
 /// Same as [`hann_window`].
 pub fn bartlett_window(n: usize) -> Result<Array> {
-  symmetric_window("bartlett_window", n, |k, denom| {
-    1.0 - 2.0 * (k as f32 - denom / 2.0).abs() / denom
-  })
+  symmetric_window(
+    "bartlett_window",
+    n,
+    crate::simd::audio::window::SymWindowKind::Bartlett,
+  )
 }
 
 /// String → window dispatch, mirroring `mlx-audio`'s `STR_TO_WINDOW_FN`
@@ -2071,31 +2076,32 @@ pub fn mel_filter_bank(
   // allocator's OOM panic (Rust's default behavior is to abort, not
   // unwind, on allocation failure — `Vec::with_capacity` and `vec![]`
   // share that abort path).
+  // Use `try_reserve_exact` so a multi-GB request from a forged input
+  // returns a recoverable `Error::Backend` rather than aborting on the
+  // allocator's OOM panic.
   let mut bank: Vec<f32> = Vec::new();
   bank
     .try_reserve_exact(bank_len)
     .map_err(|e| Error::Backend {
       message: format!("mel_filter_bank: allocation of {bank_len} f32 elements failed: {e}"),
     })?;
-  bank.resize(bank_len, 0.0);
-  for m in 0..n_mels {
-    let left = f_pts[m];
-    let center = f_pts[m + 1];
-    let right = f_pts[m + 2];
-    let lc = center - left;
-    let cr = right - center;
-    // Guard against zero-width triangles (collapsed mel bins). The
-    // reference would NaN/inf on the division; we keep the bin at zero.
-    if lc <= 0.0 || cr <= 0.0 {
-      continue;
-    }
-    for (f, &freq) in all_freqs.iter().enumerate() {
-      let up = (freq - left) / lc;
-      let down = (right - freq) / cr;
-      let v = up.min(down).max(0.0);
-      bank[m * n_freqs + f] = v;
-    }
-  }
+
+  // C10 SIMD: dispatch the row-by-row triangle construction through
+  // the SIMD kernel (`simd::audio::mel_triangle::mel_filter_bank_rows`).
+  // The dispatcher writes 0.0 for collapsed-bin rows (lc <= 0 / cr <=
+  // 0) so we no longer need `Vec::resize(bank_len, 0.0)` upfront —
+  // the kernel initializes every cell via `MaybeUninit::write`.
+  let spare = bank.spare_capacity_mut();
+  crate::simd::audio::mel_triangle::mel_filter_bank_rows(
+    &mut spare[..bank_len],
+    &all_freqs,
+    &f_pts,
+    n_mels,
+  );
+  // SAFETY: the C10 dispatcher's init contract guarantees every cell
+  // of the `bank_len`-prefix of `spare` is initialized before
+  // returning; `bank_len <= bank.capacity()` per `try_reserve_exact`.
+  unsafe { bank.set_len(bank_len) };
 
   Array::from_slice::<f32>(&bank, &[n_mels_i32, n_freqs_i32])
 }

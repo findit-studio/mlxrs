@@ -620,7 +620,12 @@ fn apply_rotate_fallible(
       Ok(DynamicImage::ImageRgb8(out))
     }
     DynamicImage::ImageRgba8(buf) => {
-      let dst = rotate_buf::<u8>(buf.as_raw(), src_w, src_h, 4, rotation)?;
+      // C5 SIMD: Rgba8 (u8 + channels=4) is the hot path — dispatch
+      // through the C5 NEON kernel (`simd::vlm::rotate_buf::rotate_buf_u8`)
+      // which uses a 4-pixel-tile `vld1q_u8` load + per-pixel u32
+      // scattered store. The other u8 channel counts (1/2/3) and
+      // every u16/f32 arm continue to use the generic `rotate_buf<T>`.
+      let dst = rotate_buf_u8_via_c5(buf.as_raw(), src_w, src_h, 4, rotation)?;
       let out: ::image::RgbaImage = ImageBuffer::from_raw(out_w, out_h, dst).expect(
         "ImageBuffer::from_raw: dst buffer length matches w*h*4 by construction in rotate_buf",
       );
@@ -814,6 +819,61 @@ fn rotate_buf<T: Copy + Default>(
       dst[dst_off..dst_off + channels].copy_from_slice(&src[src_off..src_off + channels]);
     }
   }
+  Ok(dst)
+}
+
+/// C5 SIMD-routed u8 rotate helper — shares the same allocation /
+/// length contract as [`rotate_buf`] but dispatches the inner two-loop
+/// through [`crate::simd::vlm::rotate_buf::rotate_buf_u8`], whose
+/// aarch64 kernel uses a 4-pixel-tile `vld1q_u8` + per-pixel u32
+/// scattered store on the `channels = 4` (Rgba8) hot path.
+///
+/// `channels = 1/2/3` fall through to the C5 dispatcher's scalar arm —
+/// bit-identical to [`rotate_buf::<u8>`]'s per-pixel `copy_from_slice`
+/// shape. Only `Rgba8` (the dominant call site post-image-decode) hits
+/// the NEON tile in the C5 dispatcher.
+fn rotate_buf_u8_via_c5(
+  src: &[u8],
+  src_w: u32,
+  src_h: u32,
+  channels: usize,
+  rotation: RotateKind,
+) -> Result<Vec<u8>> {
+  let w_usize = src_w as usize;
+  let h_usize = src_h as usize;
+  let elements = w_usize
+    .checked_mul(h_usize)
+    .and_then(|wh| wh.checked_mul(channels))
+    .ok_or_else(|| Error::ShapeMismatch {
+      message: format!(
+        "rotate_buf_u8_via_c5: w*h*channels overflows usize for {src_w}x{src_h}x{channels}"
+      ),
+    })?;
+  debug_assert_eq!(
+    src.len(),
+    elements,
+    "rotate_buf_u8_via_c5: src.len() must equal w*h*channels by ImageBuffer::as_raw() contract"
+  );
+  let mut dst: Vec<u8> = Vec::new();
+  dst
+    .try_reserve_exact(elements)
+    .map_err(|_| Error::OutOfMemory)?;
+  dst.resize(elements, 0u8);
+
+  let simd_rotation = match rotation {
+    RotateKind::Rotate90 => crate::simd::vlm::rotate_buf::RotateKind::Rotate90,
+    RotateKind::Rotate270 => crate::simd::vlm::rotate_buf::RotateKind::Rotate270,
+    RotateKind::Rotate90FlipH => crate::simd::vlm::rotate_buf::RotateKind::Rotate90FlipH,
+    RotateKind::Rotate270FlipH => crate::simd::vlm::rotate_buf::RotateKind::Rotate270FlipH,
+  };
+  crate::simd::vlm::rotate_buf::rotate_buf_u8(
+    &mut dst,
+    src,
+    w_usize,
+    h_usize,
+    channels,
+    simd_rotation,
+  );
   Ok(dst)
 }
 
@@ -1501,9 +1561,41 @@ pub fn image_to_array(img: &::image::DynamicImage, color_order: ColorOrder) -> R
       })?;
     match color_order {
       ColorOrder::Rgb => {
-        // Contiguous u8 → f32 widening — LLVM auto-vectorizes this on
-        // both NEON (aarch64) and AVX2 (x86_64) backends.
-        buf.extend(raw.iter().map(|&b| f32::from(b)));
+        // C3 SIMD dispatcher (`crate::simd::vlm::rgb_widen`). On
+        // `aarch64` this routes to a `vld1q_u8` + four `vst1q_f32`
+        // 16-byte-per-tile NEON kernel (pure byte-for-byte widen, no
+        // de-interleave needed for RGB-in-RGB-out); elsewhere it
+        // falls back to the scalar `MaybeUninit::write` path. The
+        // pre-C3 `buf.extend(raw.iter().map(|&b| f32::from(b)))`
+        // shape LLVM auto-vectorized cleanly, but the hand-rolled
+        // NEON arm pins the contract against compiler-version drift
+        // (per the user directive 2026-05-23 / project memory rule
+        // **"SIMD ship NEON regardless"**). See
+        // `docs/core-arch-simd-candidates.md` §2 row C3 + §3.3 +
+        // tracking [#148].
+        //
+        // The dispatcher takes `&mut [MaybeUninit<f32>]` (type-
+        // encoded uninit safety, matching C4/C6); we pass the
+        // pre-reserved spare capacity directly and `set_len(total)`
+        // after every f32 has been written.
+        {
+          let spare = buf.spare_capacity_mut();
+          debug_assert!(
+            spare.len() >= total,
+            "try_reserve_exact must have reserved at least total f32s"
+          );
+          crate::simd::vlm::rgb_widen(&mut spare[..total], raw);
+        }
+        // SAFETY: `rgb_widen` wrote every f32 in `0..total` of the
+        // spare capacity (function-level contract: "every f32 of
+        // `out` is written before this returns" — both scalar and
+        // NEON arms cover the full slice). `Vec::set_len`'s
+        // preconditions:
+        //   (1) `total <= buf.capacity()` — `try_reserve_exact`
+        //       above reserved exactly that much;
+        //   (2) elements at `[0..total]` are initialized — by
+        //       kernel contract.
+        unsafe { buf.set_len(total) };
       }
       ColorOrder::Bgr => {
         // Per-pixel R↔B swap via the C4 `bgr_widen` dispatcher

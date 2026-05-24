@@ -283,39 +283,41 @@ pub fn get_mel_banks_kaldi(
     .map_err(|e| Error::Backend {
       message: format!("get_mel_banks_kaldi: allocation of {bank_len} f32 elements failed: {e}"),
     })?;
-  bank.resize(bank_len, 0.0);
 
+  // Per-row center freqs (1-D output) — short loop, scalar `f32::ln`
+  // via `inverse_mel_scale_kaldi`. Built separately from the bank
+  // because the bank is built by the C11 SIMD dispatcher below.
   let mut centers: Vec<f32> = Vec::new();
   centers
     .try_reserve_exact(num_bins)
     .map_err(|e| Error::Backend {
       message: format!("get_mel_banks_kaldi: allocation of {num_bins} center freqs failed: {e}"),
     })?;
-
   for m in 0..num_bins {
-    let left_mel = mel_low + (m as f32) * mel_delta;
     let center_mel = mel_low + ((m + 1) as f32) * mel_delta;
-    let right_mel = mel_low + ((m + 2) as f32) * mel_delta;
     centers.push(inverse_mel_scale_kaldi(center_mel));
-
-    let lc = center_mel - left_mel;
-    let cr = right_mel - center_mel;
-    // Zero-width triangle guard (collapsed mel bin). The reference would
-    // NaN/inf on the division; we keep the bin at zero. In practice
-    // `mel_delta > 0` whenever `low_freq < high_freq`, which we asserted above,
-    // so this branch is defensive (it can fire only on f32 underflow).
-    if lc <= 0.0 || cr <= 0.0 {
-      continue;
-    }
-    let row = m * num_fft_bins;
-    for k in 0..num_fft_bins {
-      let mel = mel_scale_kaldi(fft_bin_width * k as f32);
-      let up = (mel - left_mel) / lc;
-      let down = (right_mel - mel) / cr;
-      let v = up.min(down).max(0.0);
-      bank[row + k] = v;
-    }
   }
+
+  // C11 SIMD: dispatch the row-by-row Kaldi triangle construction
+  // through the SIMD kernel
+  // (`simd::audio::kaldi_mel::get_mel_banks_kaldi_rows`). The
+  // dispatcher writes 0.0 for collapsed-bin rows (lc <= 0 / cr <= 0)
+  // so we no longer need `Vec::resize(bank_len, 0.0)` upfront — the
+  // kernel initializes every cell via `MaybeUninit::write`.
+  let spare = bank.spare_capacity_mut();
+  crate::simd::audio::kaldi_mel::get_mel_banks_kaldi_rows(
+    &mut spare[..bank_len],
+    num_bins,
+    num_fft_bins,
+    fft_bin_width,
+    mel_low,
+    mel_delta,
+  )?;
+  // SAFETY: the C11 dispatcher's init contract guarantees every cell
+  // of the `bank_len`-prefix of `spare` is initialized before
+  // returning `Ok(())`; `bank_len <= bank.capacity()` per
+  // `try_reserve_exact`.
+  unsafe { bank.set_len(bank_len) };
 
   let bins = Array::from_slice::<f32>(&bank, &[num_bins_i32, num_fft_bins_i32])?;
   let center_freqs = Array::from_slice::<f32>(&centers, &[num_bins_i32])?;
@@ -359,23 +361,41 @@ fn build_kaldi_window(win_type: KaldiWindow, win_size: usize) -> Result<Array> {
   let win_i32 = i32::try_from(win_size).map_err(|_| Error::Backend {
     message: format!("build_kaldi_window: win_size {win_size} exceeds i32::MAX"),
   })?;
-  let mut buf: Vec<f32> = Vec::new();
-  buf
-    .try_reserve_exact(win_size)
-    .map_err(|e| Error::Backend {
-      message: format!("build_kaldi_window: reservation for {win_size} elements failed: {e}"),
-    })?;
-  let denom = (win_size - 1) as f32;
-  for n in 0..win_size {
-    let theta = 2.0 * PI * (n as f32) / denom;
-    let v = match win_type {
-      KaldiWindow::Hamming => 0.54 - 0.46 * theta.cos(),
-      KaldiWindow::Hanning => 0.5 - 0.5 * theta.cos(),
-      KaldiWindow::Povey => (0.5 - 0.5 * theta.cos()).powf(0.85),
-      KaldiWindow::Rectangular => 1.0,
-    };
-    buf.push(v);
-  }
+
+  // C12 SIMD: dispatch Hamming / Hanning / Rectangular through the
+  // Kaldi-window NEON kernel (`simd::audio::window::kaldi_window`).
+  // Povey is **not** handled by C12 — its `powf(0.85)` cannot vectorize
+  // via the polynomial cos path; we keep the scalar `theta.cos() +
+  // .powf(0.85)` loop locally for that arm.
+  let buf: Vec<f32> = match win_type {
+    KaldiWindow::Hamming => crate::simd::audio::window::kaldi_window(
+      crate::simd::audio::window::KaldiWindowKind::Hamming,
+      win_size,
+    )?,
+    KaldiWindow::Hanning => crate::simd::audio::window::kaldi_window(
+      crate::simd::audio::window::KaldiWindowKind::Hanning,
+      win_size,
+    )?,
+    KaldiWindow::Rectangular => crate::simd::audio::window::kaldi_window(
+      crate::simd::audio::window::KaldiWindowKind::Rectangular,
+      win_size,
+    )?,
+    KaldiWindow::Povey => {
+      // Povey: scalar loop, `(0.5 - 0.5 * cos(theta)).powf(0.85)`.
+      let mut buf: Vec<f32> = Vec::new();
+      buf
+        .try_reserve_exact(win_size)
+        .map_err(|e| Error::Backend {
+          message: format!("build_kaldi_window: reservation for {win_size} elements failed: {e}"),
+        })?;
+      let denom = (win_size - 1) as f32;
+      for n in 0..win_size {
+        let theta = 2.0 * PI * (n as f32) / denom;
+        buf.push((0.5 - 0.5 * theta.cos()).powf(0.85));
+      }
+      buf
+    }
+  };
   Array::from_slice::<f32>(&buf, &[win_i32])
 }
 

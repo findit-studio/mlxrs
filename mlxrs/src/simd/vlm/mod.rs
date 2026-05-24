@@ -44,21 +44,38 @@
 //!   submodule is `#[doc(hidden)]` so the only public surface is the
 //!   [`crate::vlm::image::image_to_array`] call site.
 //!
-//! # Planned candidates (issue numbers — umbrella
-//! [`#143`](https://github.com/Findit-AI/mlxrs/issues/143))
+//! # Additional shipped candidates
 //!
 //! - **C3** ([#148](https://github.com/Findit-AI/mlxrs/issues/148)) —
 //!   `image_to_array` u8 → f32 RGB widening (`vlm/image.rs`). Class:
-//!   `Exact` (lossless integer-to-fp widen + constant scale; only land
-//!   if the disassembly check shows LLVM is not already vectorizing).
+//!   `Exact`. The `rgb_widen` submodule holds the dispatcher, the
+//!   scalar reference, the 16-byte tile NEON kernel, and the verify-
+//!   before-claim benchmark. NEON kernel ships unconditionally on
+//!   aarch64 per the user directive 2026-05-23 (project memory rule
+//!   **"SIMD ship NEON regardless"**).
 //! - **C5** ([#150](https://github.com/Findit-AI/mlxrs/issues/150)) —
-//!   `rotate_buf` pixel permutation (`vlm/image.rs`). Class: `Exact`
-//!   (defer per §5.5; gather-bound).
+//!   `rotate_buf` pixel permutation (`vlm/image.rs`). Class: `Exact`.
+//!   The `rotate_buf` submodule specialises the **u8 + channels=4**
+//!   (Rgba8) hot path with a 4-pixel-tile `vld1q_u8` + per-pixel u32
+//!   scattered store; all other type / channel combinations fall back
+//!   to the scalar arm. Per-pixel destination scatter is gather-bound
+//!   (NEON has no scatter), so the SIMD win is bounded by the per-tile
+//!   load width — ships unconditionally on aarch64 per the user
+//!   directive.
 
 #[doc(hidden)]
 pub mod bgr_widen;
 #[doc(hidden)]
 pub mod pad_canvas_fill;
+#[doc(hidden)]
+pub mod rgb_widen;
+#[doc(hidden)]
+pub mod rotate_buf;
 
 pub(crate) use bgr_widen::bgr_widen;
 pub(crate) use pad_canvas_fill::pad_canvas_fill;
+pub(crate) use rgb_widen::rgb_widen;
+// `rotate_buf::rotate_buf_u8` is re-exported via the public submodule
+// (no `pub(crate) use` here yet — the caller wiring lands separately
+// per the §5.5 incremental ship order, and re-exporting an unused
+// symbol triggers the workspace `-D warnings` gate).

@@ -180,8 +180,28 @@
 
 #[cfg(target_arch = "aarch64")]
 pub mod arch;
-#[cfg(target_arch = "aarch64")]
-pub(crate) mod audio;
+// `simd::audio` is **not** `aarch64`-gated (same rationale as `simd::vlm`
+// below): the scalar reference inside each kernel triple must compile on
+// every target so the dispatcher's scalar-fallback branch is a real,
+// linkable function (per the project memory rule "SIMD always-on" —
+// scalar fallback compiles on all targets, only the `arch` module is
+// `aarch64`-gated). The NEON kernels inside each kernel triple are
+// individually `#[cfg(target_arch = "aarch64")]`-gated at the
+// function level. The module is `audio`-feature-gated so the
+// `--no-default-features` / per-feature CI builds don't compile a
+// dead-code dispatcher (the only call sites are
+// [`crate::audio::*`], itself behind the same feature).
+//
+// `pub` (rather than `pub(crate)`) so the in-tree
+// `benches/simd_*.rs` micro-benchmarks — separate binaries that
+// only see the public API — can drive the dispatchers and scalar
+// references directly per the verify-before-claim rule (§5.4 of
+// the SIMD doc). Per-kernel items inside are individually
+// `pub`/`pub(crate)` (only the dispatcher + the scalar reference
+// are exposed; the `unsafe` NEON kernel stays `pub(crate)`).
+#[cfg(feature = "audio")]
+#[doc(hidden)]
+pub mod audio;
 pub mod diff;
 mod dispatch;
 pub mod scalar;

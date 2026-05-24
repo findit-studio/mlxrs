@@ -68,13 +68,17 @@ use symphonia::core::{
 
 use crate::error::{Error, Result};
 
-/// PCM-16 full-scale; matches `mlx-audio`'s `int16 → float32` divisor on
-/// `read` and `float32 → int16` multiplier on `write` (the reference uses
-/// `32768.0` on read and `32767` on write — both conventions are common and
-/// mlx-audio inherits scipy's split; we follow `read=32768.0` /
-/// `write=32767` to match `mlx_audio.audio_io.read` and `.write` exactly).
+/// PCM-16 full-scale on `read`; matches `mlx-audio`'s `int16 → float32`
+/// divisor on `read` (the reference uses `32768.0` on read and `32767`
+/// on write — both conventions are common and mlx-audio inherits scipy's
+/// split; we follow `read=32768.0` / `write=32767` to match
+/// `mlx_audio.audio_io.read` and `.write` exactly).
+///
+/// On `write`, the C7 SIMD quantizer in
+/// [`crate::simd::audio::quantize`] carries the matching `32767`
+/// multiplier; that constant lives in the SIMD module so the NEON
+/// kernel and scalar reference share one source of truth.
 const I16_DIV: f32 = 32768.0;
-const I16_MUL: f32 = 32767.0;
 
 /// Public-input-driven Vec allocation cap. Hard ceiling on the number of
 /// f32 samples [`load_audio`] / [`resample_linear`] will materialize from
@@ -610,26 +614,82 @@ fn push_samples(buf: &GenericAudioBufferRef<'_>, out: &mut Vec<f32>, cap: usize)
       }
     }
     GenericAudioBufferRef::S16(b) => {
-      let divisor = int_divisor(16)?;
+      let _ = int_divisor(16)?; // validate the bits arm (for parity + error shape)
       reserve_under_cap(out, b.samples_interleaved(), cap)?;
-      for s in b.iter_interleaved() {
-        out.push(f32::from(s) / divisor);
-      }
+      // C1 SIMD widen — collect the symphonia interleaved iterator
+      // into a contiguous `Vec<i16>` once, then dispatch the NEON
+      // s16-to-f32 normalizer over it in one shot. This keeps the
+      // (1) cap discipline above and (2) the per-iteration sample
+      // count contract intact, but removes the per-sample push +
+      // divide loop.
+      //
+      // The materialization step (`buf_i16`) is bounded by
+      // `b.samples_interleaved()` (already cap-checked) and uses
+      // `try_reserve_exact` so an adversarial decoder cannot trigger
+      // an infallible abort here. The subsequent dispatcher writes
+      // into the pre-reserved spare capacity of `out` (the f32 sample
+      // buffer) — no second copy.
+      //
+      // Multi-channel interleaved layout is preserved: `iter_interleaved`
+      // yields samples in `[ch0_t0, ch1_t0, ..., ch0_t1, ch1_t1, ...]`
+      // order, exactly what the f32 output buffer is contracted to
+      // carry.
+      let n = b.samples_interleaved();
+      let mut buf_i16: Vec<i16> = Vec::new();
+      buf_i16
+        .try_reserve_exact(n)
+        .map_err(|_| Error::OutOfMemory)?;
+      buf_i16.extend(b.iter_interleaved());
+      let spare: &mut [core::mem::MaybeUninit<f32>] = out.spare_capacity_mut();
+      crate::simd::audio::pcm_decode::s16_to_f32_normalize(&mut spare[..n], &buf_i16);
+      // SAFETY: dispatcher's function-level contract initializes
+      // every f32 of `spare[..n]`; `out.len() + n <= cap` was
+      // guaranteed by `reserve_under_cap`; capacity for `n` more
+      // slots was reserved there too.
+      unsafe { out.set_len(out.len() + n) };
     }
     GenericAudioBufferRef::S24(b) => {
       // `i24.inner()` returns the `[-2^23, 2^23)` value as `i32`.
       let divisor = int_divisor(24)?;
       reserve_under_cap(out, b.samples_interleaved(), cap)?;
-      for s in b.iter_interleaved() {
-        out.push(s.inner() as f32 / divisor);
-      }
+      // C1 SIMD widen — collect the symphonia i24 iterator
+      // (`.inner()` → i32 in `[-2^23, 2^23)`) into a contiguous
+      // Vec<i32> once, then dispatch the NEON s32-to-f32 normalizer
+      // with the 24-bit divisor (`1.0 / 2^23`). Same shape as the
+      // S16 arm.
+      let n = b.samples_interleaved();
+      let mut buf_i32: Vec<i32> = Vec::new();
+      buf_i32
+        .try_reserve_exact(n)
+        .map_err(|_| Error::OutOfMemory)?;
+      buf_i32.extend(b.iter_interleaved().map(|s| s.inner()));
+      let inv_scale = 1.0_f32 / divisor;
+      let spare: &mut [core::mem::MaybeUninit<f32>] = out.spare_capacity_mut();
+      crate::simd::audio::pcm_decode::s32_to_f32_normalize(&mut spare[..n], &buf_i32, inv_scale);
+      // SAFETY: dispatcher's contract initializes every f32 in
+      // `spare[..n]`; cap + capacity discharged by
+      // `reserve_under_cap`.
+      unsafe { out.set_len(out.len() + n) };
     }
     GenericAudioBufferRef::S32(b) => {
       let divisor = int_divisor(32)?;
       reserve_under_cap(out, b.samples_interleaved(), cap)?;
-      for s in b.iter_interleaved() {
-        out.push(s as f32 / divisor);
-      }
+      // C1 SIMD widen — collect symphonia's i32 iterator into a
+      // contiguous Vec<i32>, then dispatch the NEON s32-to-f32
+      // normalizer with the 32-bit divisor (`1.0 / 2^31`).
+      let n = b.samples_interleaved();
+      let mut buf_i32: Vec<i32> = Vec::new();
+      buf_i32
+        .try_reserve_exact(n)
+        .map_err(|_| Error::OutOfMemory)?;
+      buf_i32.extend(b.iter_interleaved());
+      let inv_scale = 1.0_f32 / divisor;
+      let spare: &mut [core::mem::MaybeUninit<f32>] = out.spare_capacity_mut();
+      crate::simd::audio::pcm_decode::s32_to_f32_normalize(&mut spare[..n], &buf_i32, inv_scale);
+      // SAFETY: dispatcher's contract initializes every f32 in
+      // `spare[..n]`; cap + capacity discharged by
+      // `reserve_under_cap`.
+      unsafe { out.set_len(out.len() + n) };
     }
   }
   Ok(())
@@ -821,16 +881,86 @@ pub fn save_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
       message: format!("save_wav: header write failed: {e}"),
     })?;
 
-    // Stream the samples. Quantization: clip to `[-1, 1]`, multiply by
-    // `I16_MUL = 32767`, round to nearest, cast to i16, write LE.
-    for &s in samples {
-      let clipped = s.clamp(-1.0, 1.0);
-      let q = (clipped * I16_MUL).round() as i16;
-      writer
-        .write_all(&q.to_le_bytes())
-        .map_err(|e| Error::Backend {
-          message: format!("save_wav: sample write failed: {e}"),
-        })?;
+    // Quantize all samples first via the C7 SIMD dispatcher
+    // (`simd::audio::quantize::f32_to_i16_quantize`) — clip to `[-1, 1]`,
+    // multiply by `I16_MUL = 32767`, round-half-away-from-zero, cast to
+    // i16. On `aarch64` this routes to an 8-lane NEON tile (vminq/vmaxq
+    // clamp → vmulq_n scale → vcvtaq_s32 round (FCVTAS, ties away from
+    // zero — bit-exact match for `f32::round`) → vqmovn+vcombine narrow
+    // → vst1q_s16 store); elsewhere it falls back to the scalar
+    // `clamp + round + cast` loop. See `docs/core-arch-simd-candidates.md`
+    // §2 row C7 + §3.5 + tracking [#152].
+    //
+    // The dispatcher takes `&mut [MaybeUninit<i16>]` (type-encoded
+    // uninit safety), so we pre-reserve via `try_reserve_exact` (so a
+    // multi-GB sample buffer cannot trigger an infallible abort here),
+    // pass the spare capacity directly, and `set_len` after every i16
+    // has been written. Then a SINGLE `write_all` writes the entire
+    // i16 byte view in one syscall — replacing the per-sample
+    // BufWriter pushes.
+    let mut quantized: Vec<i16> = Vec::new();
+    quantized
+      .try_reserve_exact(samples.len())
+      .map_err(|_| Error::OutOfMemory)?;
+    {
+      let spare: &mut [core::mem::MaybeUninit<i16>] = quantized.spare_capacity_mut();
+      // `samples.len() <= spare.len()` because `try_reserve_exact(samples.len())`
+      // above reserved exactly that much capacity.
+      debug_assert!(spare.len() >= samples.len());
+      crate::simd::audio::quantize::f32_to_i16_quantize(&mut spare[..samples.len()], samples);
+    }
+    // SAFETY: `f32_to_i16_quantize` wrote every i16 in `0..samples.len()`
+    // of the spare capacity (function-level contract). `Vec::set_len`'s
+    // preconditions: (1) `samples.len() <= quantized.capacity()` — the
+    // `try_reserve_exact` succeeded; (2) elements at `[0..samples.len()]`
+    // are initialized — kernel contract guarantees this.
+    unsafe { quantized.set_len(samples.len()) };
+
+    // Single bulk write of the entire i16 buffer as little-endian bytes.
+    // `to_le` on i16 is a no-op on LE hosts (the common case) and a
+    // bswap on BE hosts; per-element. After the conversion, the
+    // `&[i16]` is reinterpreted as `&[u8]` of `2 * samples.len()` bytes
+    // and written in one shot. The wav format stores i16 samples in
+    // little-endian order regardless of host endianness.
+    if cfg!(target_endian = "little") {
+      // SAFETY: `quantized` is `Vec<i16>` (len = samples.len(),
+      // cap = samples.len()), all initialized above. On a
+      // little-endian host the i16 in-memory representation IS the
+      // LE byte order required by the WAV format — reinterpret the
+      // contiguous slice as `&[u8]` of double the length for a
+      // single zero-copy `write_all`. `i16` and `u8` have well-
+      // defined layouts (no padding, no validity invariants), so a
+      // borrow of one as the other via `from_raw_parts` is sound.
+      // The borrow lives only for the `write_all` call below.
+      let byte_view: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+          quantized.as_ptr().cast::<u8>(),
+          quantized.len().checked_mul(2).expect(
+            "save_wav: byte-view length overflow (cap was MAX_MONO_I16_SAMPLES, * 2 ≤ u32::MAX - 36)",
+          ),
+        )
+      };
+      writer.write_all(byte_view).map_err(|e| Error::Backend {
+        message: format!("save_wav: bulk sample write failed: {e}"),
+      })?;
+    } else {
+      // Big-endian host: byteswap each i16 into a small stack buffer
+      // and write in chunks. Not benchmarked; rare path.
+      const CHUNK: usize = 1024;
+      let mut buf = [0u8; CHUNK * 2];
+      let mut idx = 0;
+      while idx < quantized.len() {
+        let n = (quantized.len() - idx).min(CHUNK);
+        for (i, &q) in quantized[idx..idx + n].iter().enumerate() {
+          buf[i * 2..i * 2 + 2].copy_from_slice(&q.to_le_bytes());
+        }
+        writer
+          .write_all(&buf[..n * 2])
+          .map_err(|e| Error::Backend {
+            message: format!("save_wav: bulk sample write failed: {e}"),
+          })?;
+        idx += n;
+      }
     }
 
     // BufWriter does NOT auto-flush on drop into a Result, and a missed
@@ -1044,26 +1174,24 @@ pub fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<
     message: format!("resample_linear: reservation for {out_len} samples failed: {e}"),
   })?;
   let ratio = f64::from(from_rate) / f64::from(to_rate);
-  // `last_in` is the largest valid source index; saturating-sub guards the
-  // `samples.len() == 1` case (we already returned Ok early for `is_empty`,
-  // but a 1-element input still has `last_in == 0`, in which case all
-  // interpolation degenerates to copying `samples[0]`).
-  let last_in = samples.len() - 1;
-  for i in 0..out_len {
-    let x = i as f64 * ratio;
-    let lo = x.floor();
-    let frac = x - lo;
-    // `lo as usize` is well-defined because `out_len = in_len * to_rate /
-    // from_rate`, so `x_max = (out_len-1) * from_rate/to_rate ≤ in_len - 1`
-    // (with strict inequality unless `(out_len-1)*from_rate` divides
-    // `to_rate` exactly), keeping `lo` in `[0, in_len-1]`. We still saturate
-    // to `last_in` defensively to absorb any FP rounding-up at the boundary.
-    let lo_idx = (lo as usize).min(last_in);
-    let hi_idx = (lo_idx + 1).min(last_in);
-    let a = samples[lo_idx];
-    let b = samples[hi_idx];
-    out.push(a + (b - a) * frac as f32);
-  }
+
+  // C8 SIMD: dispatch to the resample-linear NEON kernel
+  // (`crate::simd::audio::resample`). On `aarch64` this routes to a
+  // 4-lane NEON tile (`vmulq_f64` index math + `vfmaq_f32` FMA + scalar
+  // gather for `samples[lo_idx]` / `samples[hi_idx]`); elsewhere it
+  // falls back to the scalar shape preserved in
+  // `simd::audio::resample::resample_linear_scalar`.
+  //
+  // The dispatcher takes a `&mut [MaybeUninit<f32>]` sized to `out_len`
+  // and writes every slot via `MaybeUninit::write` before returning, so
+  // `set_len(out_len)` after the kernel returns is sound.
+  let spare = out.spare_capacity_mut();
+  crate::simd::audio::resample::resample_linear(&mut spare[..out_len], samples, ratio);
+  // SAFETY: the C8 dispatcher's init contract guarantees every f32 of
+  // the `out_len`-prefix of `spare` is initialized before returning;
+  // `out_len <= out.capacity()` per the `try_reserve_exact(out_len)`
+  // above.
+  unsafe { out.set_len(out_len) };
   Ok(out)
 }
 
