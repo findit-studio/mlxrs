@@ -1354,16 +1354,22 @@ pub fn save_model(
       let shard_name = shard_file_name(&gen_id, i + 1, shards_count);
       let final_path = save_path.join(&shard_name);
       // Exclusively created, same-directory, `.safetensors`-suffixed
-      // tempfile: `save_safetensors_view` (mlx-c) writes exactly this path
-      // (the trailing `.safetensors` stops mlx from appending its own).
-      let tmp_path = open_excl_temp_shard(&final_path)?;
+      // tempfile: we keep the open `File` through to the write so the
+      // bytes go to THIS fd (no reopen-by-name TOCTOU window).
+      let (mut tmp_file, tmp_path) = open_excl_temp_shard(&final_path)?;
       staged_shards.push((tmp_path.clone(), final_path));
-      crate::io::save_safetensors_view(
-        &tmp_path,
+      crate::io::save_safetensors_to_file(
+        &mut tmp_file,
         shard.iter().map(|(&k, &v)| (k, v)),
         &shard_metadata,
       )?;
-      fsync_path(&tmp_path)?;
+      // Pin durability to the same fd `open_excl_temp_shard` returned —
+      // a path-reopen here would re-introduce the TOCTOU window the
+      // `O_EXCL`-`File`-through-to-write change just closed. The path
+      // is still threaded through so the test-only fsync_path injector
+      // (`arm_fsync_path_fault*`) keeps firing identically.
+      fsync_open_file_for_path(&tmp_file, &tmp_path)?;
+      drop(tmp_file);
       for &weight_name in shard.keys() {
         weight_map.insert(weight_name.to_string(), shard_name.clone());
       }
@@ -1381,14 +1387,16 @@ pub fn save_model(
       "weight_map": weight_map,
     });
     let index_final = save_path.join("model.safetensors.index.json");
-    let index_tmp = open_excl_temp_shard(&index_final)?;
+    let (mut index_file, index_tmp) = open_excl_temp_shard(&index_final)?;
     staged_index = Some((index_tmp.clone(), index_final));
     write_json_pretty(
-      &index_tmp,
+      &mut index_file,
       &index,
       "save_model: model.safetensors.index.json",
     )?;
-    fsync_path(&index_tmp)
+    fsync_open_file_for_path(&index_file, &index_tmp)?;
+    drop(index_file);
+    Ok(())
   })();
   if let Err(err) = staged {
     for (tmp, _) in &staged_shards {
@@ -1559,25 +1567,36 @@ pub fn save_model(
   }
 }
 
-/// Open an exclusively created (`O_CREAT|O_EXCL`), randomized tempfile in the
-/// SAME directory as `final_path`, of the form
-/// `<file_name>.<pid>.<rand>.tmp.safetensors`, and return its path. The
-/// created handle is dropped immediately: `crate::io::save_safetensors_view`
-/// (mlx-c) reopens the path by name to write it, and `write_json_pretty`
-/// re-opens it via `fs::write` — the exclusive create still guarantees the
-/// path is a regular file *we* own (never an attacker-precreated symlink), so
-/// the subsequent truncate-by-name follows no symlink.
+/// Open an exclusively created (`O_CREAT|O_EXCL`), randomized tempfile in
+/// the SAME directory as `final_path`, of the form
+/// `<file_name>.<pid>.<rand>.tmp.safetensors`, and return **both** the open
+/// [`File`] **and** its path. Callers continue to write through the
+/// returned [`File`] (via [`crate::io::save_safetensors_to_file`] for
+/// shard bodies / [`write_json_pretty`] for the index + config JSON) so
+/// the original-open identity carries through to every write.
+///
+/// **TOCTOU rationale.** The earlier shape returned only the [`PathBuf`]
+/// and then dropped the open handle, leaving every subsequent write to
+/// re-open `path` by name. Between the `O_EXCL` create + that reopen, an
+/// attacker with write access to the destination directory could
+/// `unlink(path) + symlink(path, /etc/passwd)` and redirect the write —
+/// defeating the no-symlink guarantee `O_EXCL` was meant to provide.
+/// Returning the [`File`] eliminates the reopen-by-name step entirely: all
+/// further writes go through the same fd, which is pinned to the inode
+/// `O_EXCL` created.
 ///
 /// The trailing `.safetensors` is required for the shard tempfiles:
 /// `mlx_save_safetensors` appends `.safetensors` to a path that lacks it
-/// (`mlx/io/safetensors.cpp`), so a temp name ending in `.safetensors` makes
-/// mlx write *exactly* this path. The index tempfile reuses the same suffix
-/// harmlessly (it is `fs::write`-d, then renamed onto the `.index.json` name).
-/// Same-directory keeps the later [`std::fs::rename`] single-fs (atomic on
-/// POSIX/Windows; a cross-fs rename silently degrades to copy+unlink, losing
-/// atomicity). Mirrors `cache_prompt`'s `open_excl_temp_safetensors` /
-/// `audio::io::save_wav`'s `open_excl_tempfile` discipline.
-fn open_excl_temp_shard(final_path: &Path) -> Result<PathBuf> {
+/// (`mlx/io/safetensors.cpp`), so a temp name ending in `.safetensors`
+/// makes mlx write *exactly* this path even if the path-based writer is
+/// used. The index tempfile reuses the same suffix harmlessly (it is
+/// written via `write_json_pretty(&mut File, ...)` then renamed onto the
+/// `.index.json` name). Same-directory keeps the later [`std::fs::rename`]
+/// single-fs (atomic on POSIX/Windows; a cross-fs rename silently
+/// degrades to copy+unlink, losing atomicity). Mirrors `cache_prompt`'s
+/// `open_excl_temp_safetensors` / `audio::io::save_wav`'s
+/// `open_excl_tempfile` discipline.
+fn open_excl_temp_shard(final_path: &Path) -> Result<(std::fs::File, PathBuf)> {
   use std::{
     fs::OpenOptions,
     io::ErrorKind,
@@ -1614,10 +1633,11 @@ fn open_excl_temp_shard(final_path: &Path) -> Result<PathBuf> {
       .open(&candidate)
     {
       Ok(file) => {
-        // The writer (mlx-c / `fs::write`) reopens this path by name; drop
-        // our exclusive handle now.
-        drop(file);
-        return Ok(candidate);
+        // Hand the open `File` back to the caller so every subsequent
+        // write goes through THIS fd (closing the post-create / pre-
+        // reopen TOCTOU window). The path is returned alongside for the
+        // later atomic `fs::rename`.
+        return Ok((file, candidate));
       }
       Err(e) if e.kind() == ErrorKind::AlreadyExists => {
         last_err = Some(e);
@@ -1660,6 +1680,19 @@ fn open_excl_temp_shard(final_path: &Path) -> Result<PathBuf> {
 /// should instead call [`fsync_path_io`] (the sibling `io::Result<()>`
 /// variant that does NOT collapse the kind into a string-wrapped
 /// `Error::Backend`).
+///
+/// **TOCTOU note.** Reopening `path` by name to fsync it widens the same
+/// TOCTOU window the path-based safetensors writer does — an attacker
+/// with directory write access can `unlink(path) + symlink(path,
+/// /etc/passwd)` between the original `O_EXCL` create + this reopen.
+/// In-tree save callers therefore use the fd-bound
+/// [`fsync_open_file_for_path`] which `sync_all`s the original-open fd
+/// directly (still routing through the same `FSYNC_PATH_FAULT_*`
+/// injector). This path-based variant is retained for sibling modules
+/// (`convert.rs`'s post-copy durability step has no original-open fd to
+/// reuse since the files were `std::fs::copy`d not `File::open`d) and
+/// for back-compat.
+#[allow(dead_code)]
 pub(crate) fn fsync_path(path: &Path) -> Result<()> {
   // Forward to the kind-preserving inner so the production path + the
   // (test-only) injector both produce a single canonical io::Error which
@@ -1688,6 +1721,67 @@ pub(crate) fn fsync_path(path: &Path) -> Result<()> {
 /// [`fsync_path_inner`]).
 pub(crate) fn fsync_path_io(path: &Path) -> std::io::Result<()> {
   fsync_path_inner(path)
+}
+
+/// `fsync_path`-equivalent that operates on an **already-open** [`File`]
+/// (typed as `&std::fs::File` so callers keep their borrow). Issues
+/// `sync_all` on the supplied fd instead of reopening `path` by name, so
+/// the durability gate is pinned to the original-open identity — closes
+/// the same post-`O_EXCL` / pre-reopen TOCTOU window that
+/// [`open_excl_temp_shard`] returning the `File` closes for the write
+/// itself.
+///
+/// `path` is still threaded through so the test-only fault injector keyed
+/// on `fsync_path` (`FSYNC_PATH_FAULT_*`) fires identically — exposes the
+/// same fault surface to `convert.rs`'s post-copy / save-side tests as
+/// the path-based [`fsync_path`] / [`fsync_path_io`] do (the injector
+/// formats the path into its synthetic [`std::io::Error`] message; in the
+/// remove-then-fail variant the path is removed before falling through
+/// to the natural `sync_all` call, which will then return the OS's real
+/// error on the now-stale fd).
+pub(crate) fn fsync_open_file_for_path(file: &std::fs::File, path: &Path) -> Result<()> {
+  fsync_open_file_for_path_inner(file, path).map_err(|e| Error::Backend {
+    message: format!("save: fsync tempfile {} failed: {e}", path.display()),
+  })
+}
+
+fn fsync_open_file_for_path_inner(
+  file: &std::fs::File,
+  #[cfg_attr(not(test), allow(unused_variables))] path: &Path,
+) -> std::io::Result<()> {
+  #[cfg(test)]
+  if let Some(remaining) = FSYNC_PATH_FAULT_SKIP_THEN_FAIL.with(|c| c.get()) {
+    if remaining == 0 {
+      let kind = FSYNC_PATH_FAULT_KIND.with(|c| c.get().unwrap_or(std::io::ErrorKind::Other));
+      FSYNC_PATH_FAULT_SKIP_THEN_FAIL.with(|c| c.set(None));
+      FSYNC_PATH_FAULT_KIND.with(|c| c.set(None));
+      return Err(std::io::Error::new(
+        kind,
+        format!("injected fsync_path failure for {}", path.display()),
+      ));
+    } else {
+      FSYNC_PATH_FAULT_SKIP_THEN_FAIL.with(|c| c.set(Some(remaining - 1)));
+    }
+  }
+  #[cfg(test)]
+  if let Some(remaining) = FSYNC_PATH_FAULT_REMOVE_THEN_FAIL.with(|c| c.get()) {
+    if remaining == 0 {
+      FSYNC_PATH_FAULT_REMOVE_THEN_FAIL.with(|c| c.set(None));
+      let _ = std::fs::remove_file(path);
+      // Fall through — `file.sync_all()` on the now-unlinked fd will
+      // still succeed on POSIX (the inode stays live while the fd is
+      // open), so the F7 R7 "real failure" path that depends on the
+      // file disappearing is exercised through the path-based variant
+      // ([`fsync_path_io`]) which DOES reopen by name. This helper's
+      // remove-then-fail behavior matches POSIX semantics; the test
+      // matrix is unchanged because all `arm_fsync_path_fault_remove_*`
+      // call sites go through `fsync_path_io` (`copy_tokenizer_and_extras`
+      // in `convert.rs`), not this fd-based variant.
+    } else {
+      FSYNC_PATH_FAULT_REMOVE_THEN_FAIL.with(|c| c.set(Some(remaining - 1)));
+    }
+  }
+  file.sync_all()
 }
 
 /// Inner fsync helper shared by [`fsync_path`] (which wraps the io::Error
@@ -2096,13 +2190,14 @@ fn stage_config(config: &str, config_path: &Path) -> Result<StagedConfig> {
     message: format!("save_config: cannot re-serialize sorted config: {e}"),
   })?;
 
-  let tmp_path = open_excl_temp_shard(config_path)?;
+  let (mut tmp_file, tmp_path) = open_excl_temp_shard(config_path)?;
   let staged = StagedConfig {
     tmp_path,
     cleanup_on_drop: true,
   };
-  write_json_pretty(&staged.tmp_path, &sorted_value, "save_config: config.json")?;
-  fsync_path(&staged.tmp_path)?;
+  write_json_pretty(&mut tmp_file, &sorted_value, "save_config: config.json")?;
+  fsync_open_file_for_path(&tmp_file, &staged.tmp_path)?;
+  drop(tmp_file);
   Ok(staged)
 }
 
@@ -2293,23 +2388,50 @@ pub fn save(
   Ok(())
 }
 
-/// Write `value` to `path` as 4-space-indented JSON, mirroring Python's
-/// `json.dump(value, f, indent=4)` byte-for-byte: a 4-space indent and the
-/// `,` / `": "` separators `serde_json::ser::PrettyFormatter` already emits
-/// (Python's `indent=N` uses the same — see [`crate::tokenizer::chat`]'s
-/// `tojson` note). A trailing newline is **not** added — `json.dump` writes
-/// none. The parent directory is assumed to exist (callers `mkdir -p` it).
-fn write_json_pretty(path: &Path, value: &serde_json::Value, label: &str) -> Result<()> {
+/// Write `value` to an **already-open** [`std::fs::File`] as
+/// 4-space-indented JSON, mirroring Python's `json.dump(value, f, indent=4)`
+/// byte-for-byte: a 4-space indent and the `,` / `": "` separators
+/// `serde_json::ser::PrettyFormatter` already emits (Python's `indent=N`
+/// uses the same — see [`crate::tokenizer::chat`]'s `tojson` note). A
+/// trailing newline is **not** added — `json.dump` writes none.
+///
+/// **TOCTOU rationale.** Earlier this function took a [`Path`] and
+/// reopened it via `fs::write` — even when the caller had just created
+/// the path via `open_excl_temp_shard`'s `O_EXCL` tempfile, the reopen
+/// gave an attacker with directory write access a window to
+/// `unlink + symlink` the path between create + write. Writing through
+/// the caller's own [`File`] pins the write to the `O_EXCL`-created
+/// inode and closes that window.
+fn write_json_pretty(
+  file: &mut std::fs::File,
+  value: &serde_json::Value,
+  label: &str,
+) -> Result<()> {
+  use std::io::Write;
   let mut buf = Vec::new();
   let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
   let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
   serde::Serialize::serialize(value, &mut ser).map_err(|e| Error::Backend {
     message: format!("{label}: cannot serialize JSON: {e}"),
   })?;
-  std::fs::write(path, &buf).map_err(|e| Error::Backend {
-    message: format!("{label}: cannot write {}: {e}", path.display()),
+  file.write_all(&buf).map_err(|e| Error::Backend {
+    message: format!("{label}: cannot write JSON body: {e}"),
   })?;
   Ok(())
+}
+
+/// Test/back-compat convenience: open `path` for `O_CREAT|O_TRUNC` write
+/// and emit pretty-JSON through [`write_json_pretty`]. Test fixtures that
+/// hand-craft a sidecar (e.g. an index file) call this rather than
+/// reproducing the `File::create` + `write_json_pretty` pair. Not used in
+/// the production save path — that path opens its files via
+/// [`open_excl_temp_shard`] and keeps the fd through to publish.
+#[cfg(test)]
+fn write_json_pretty_to_path(path: &Path, value: &serde_json::Value, label: &str) -> Result<()> {
+  let mut f = std::fs::File::create(path).map_err(|e| Error::Backend {
+    message: format!("{label}: cannot create {}: {e}", path.display()),
+  })?;
+  write_json_pretty(&mut f, value, label)
 }
 
 #[cfg(test)]
@@ -2859,7 +2981,7 @@ mod save_tests {
     // [`load_weights`] path (without it, an absent `model.safetensors` /
     // `weights.safetensors` / `*.gguf` would error — and the bare-glob
     // resurrection of pre-index code is intentionally gone).
-    write_json_pretty(
+    write_json_pretty_to_path(
       &dir.join("model.safetensors.index.json"),
       &serde_json::json!({
         "metadata": { "total_size": 12, "total_parameters": 3 },
@@ -3044,7 +3166,7 @@ mod save_tests {
       stale_map.insert((*k).to_string(), name);
     }
     // A stale index too — the new save's index rename overwrites it.
-    write_json_pretty(
+    write_json_pretty_to_path(
       &dir.join("model.safetensors.index.json"),
       &serde_json::json!({
         "metadata": { "total_size": 24, "total_parameters": 6 },
@@ -3508,7 +3630,7 @@ mod save_tests {
     // An index that names ONLY the real shard.
     let mut weight_map: BTreeMap<String, String> = BTreeMap::new();
     weight_map.insert("real.weight".to_string(), "model.safetensors".to_string());
-    write_json_pretty(
+    write_json_pretty_to_path(
       &dir.join("model.safetensors.index.json"),
       &serde_json::json!({
         "metadata": { "total_size": 12, "total_parameters": 3 },
@@ -3636,7 +3758,7 @@ mod save_tests {
       "b.weight".to_string(),
       "model-00002-of-00002.safetensors".to_string(),
     );
-    write_json_pretty(
+    write_json_pretty_to_path(
       &dir.join("model.safetensors.index.json"),
       &serde_json::json!({
         "metadata": { "total_size": 8, "total_parameters": 2 },
@@ -3666,7 +3788,7 @@ mod save_tests {
     let dir = fresh_dir("load-index-path-traversal");
     let mut weight_map: BTreeMap<String, String> = BTreeMap::new();
     weight_map.insert("evil.weight".to_string(), "../../etc/passwd".to_string());
-    write_json_pretty(
+    write_json_pretty_to_path(
       &dir.join("model.safetensors.index.json"),
       &serde_json::json!({
         "metadata": { "total_size": 0, "total_parameters": 0 },
@@ -4607,6 +4729,180 @@ mod save_tests {
           .ends_with(".tmp.safetensors")
       });
     assert!(!leftover, "no staged tempfile may leak");
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  // ─────────────────────── LOAD-1 (#145): fd-bound atomic-save writers ───────────────────────
+
+  /// [`open_excl_temp_shard`] returns BOTH the open [`File`] and the path
+  /// so callers can write through the original-open fd (no reopen-by-name
+  /// TOCTOU window). The pre-LOAD-1 signature returned only the path; this
+  /// test asserts the post-fix shape, verifies the file was actually
+  /// created on disk, that we can write through the fd, and that the bytes
+  /// land on the inode the path points at.
+  #[test]
+  fn open_excl_temp_shard_returns_file_and_path() {
+    use std::io::Write as _;
+    let dir = fresh_dir("load1-open-excl-shape");
+    let final_path = dir.join("model-00001-of-00001.safetensors");
+    let (mut f, tmp) = open_excl_temp_shard(&final_path).unwrap();
+    // The path is a same-directory `.tmp.safetensors` sibling of the
+    // final path (no cross-directory tempfile).
+    assert_eq!(tmp.parent().unwrap(), final_path.parent().unwrap());
+    assert!(
+      tmp
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .ends_with(".tmp.safetensors"),
+      "tempfile must keep the .tmp.safetensors suffix, got {}",
+      tmp.display()
+    );
+    // It exists on disk.
+    assert!(tmp.exists(), "open_excl_temp_shard must create the file");
+    // Writing through the returned `File` is observable at the path —
+    // proves the `File` is bound to the same on-disk object as `tmp`.
+    let payload = b"LOAD-1: fd-bound shard tempfile";
+    f.write_all(payload).unwrap();
+    drop(f);
+    let on_disk = std::fs::read(&tmp).unwrap();
+    assert_eq!(
+      on_disk, payload,
+      "bytes written through the returned File must land at the returned path"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// **The LOAD-1 TOCTOU regression test for the safetensors writer.**
+  /// Replace the staging tempfile with a symlink pointing at a "decoy"
+  /// file AFTER opening the staging fd, then call the fd-bound writer.
+  /// The writes must land in the ORIGINAL fd's inode (now anonymous —
+  /// the path resolves to the decoy), not the decoy. Inode comparison
+  /// catches the case where a reopen-by-name would have followed the
+  /// symlink.
+  #[test]
+  fn save_safetensors_to_file_writes_via_fd_not_reopen_by_path() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = fresh_dir("load1-safetensors-fd-not-reopen");
+    let staging = dir.join("staging.tmp.safetensors");
+    let decoy = dir.join("decoy.target");
+    // Plant the decoy with known bytes.
+    std::fs::write(&decoy, b"DECOY: must not be overwritten").unwrap();
+    let decoy_meta_before = std::fs::metadata(&decoy).unwrap();
+    let decoy_inode_before = decoy_meta_before.ino();
+    // Open the staging fd via the same primitive `save_model` uses (an
+    // `O_EXCL` create).
+    let (mut staging_file, staging_path) = open_excl_temp_shard(&staging).unwrap();
+    let staging_inode = std::fs::metadata(&staging_path).unwrap().ino();
+    assert_ne!(
+      staging_inode, decoy_inode_before,
+      "test sanity: staging tempfile + decoy must be distinct inodes"
+    );
+    // Simulate the attack: unlink the staging path + symlink it to the
+    // decoy. A reopen-by-name from this point on would follow the symlink
+    // and write into the decoy. The staging fd we just opened, however,
+    // is still pinned to the original (now-anonymous) inode.
+    std::fs::remove_file(&staging_path).unwrap();
+    std::os::unix::fs::symlink(&decoy, &staging_path).unwrap();
+    // Drive the fd-bound writer with a small array.
+    let arr = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(3usize,)).unwrap();
+    let mut meta: HashMap<String, String> = HashMap::new();
+    meta.insert("format".to_string(), "mlx".to_string());
+    crate::io::save_safetensors_to_file(&mut staging_file, std::iter::once(("w", &arr)), &meta)
+      .unwrap();
+    drop(staging_file);
+    // Assert the decoy is byte-for-byte unchanged + still the same inode.
+    let decoy_after = std::fs::read(&decoy).unwrap();
+    assert_eq!(
+      decoy_after, b"DECOY: must not be overwritten",
+      "decoy must not be touched by the fd-bound writer"
+    );
+    let decoy_meta_after = std::fs::metadata(&decoy).unwrap();
+    assert_eq!(
+      decoy_meta_after.ino(),
+      decoy_inode_before,
+      "decoy inode must not have changed"
+    );
+    // Also: the symlink itself still resolves to the decoy (the staging
+    // path entry is the symlink, not a new file).
+    let lmeta = std::fs::symlink_metadata(&staging_path).unwrap();
+    assert!(lmeta.file_type().is_symlink());
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// **The LOAD-1 TOCTOU regression test for the JSON writer.** Same
+  /// shape as the safetensors test: replace the staging path with a
+  /// symlink to a decoy AFTER opening the staging fd, call the fd-bound
+  /// `write_json_pretty`, and assert the decoy is untouched. The
+  /// pre-LOAD-1 `write_json_pretty(&Path,...)` would `fs::write` the
+  /// symlinked decoy.
+  #[test]
+  fn write_json_pretty_writes_via_fd_not_reopen_by_path() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = fresh_dir("load1-json-fd-not-reopen");
+    let staging = dir.join("staging.tmp.safetensors");
+    let decoy = dir.join("decoy.json");
+    std::fs::write(&decoy, b"{\"decoy\": true}").unwrap();
+    let decoy_inode_before = std::fs::metadata(&decoy).unwrap().ino();
+    let (mut staging_file, staging_path) = open_excl_temp_shard(&staging).unwrap();
+    std::fs::remove_file(&staging_path).unwrap();
+    std::os::unix::fs::symlink(&decoy, &staging_path).unwrap();
+    // Drive the fd-bound JSON writer.
+    let value = serde_json::json!({
+      "metadata": { "total_size": 0, "total_parameters": 0 },
+      "weight_map": {},
+    });
+    write_json_pretty(&mut staging_file, &value, "LOAD-1: json fd-bound").unwrap();
+    drop(staging_file);
+    let decoy_after = std::fs::read(&decoy).unwrap();
+    assert_eq!(
+      decoy_after, b"{\"decoy\": true}",
+      "decoy JSON must be untouched by the fd-bound writer"
+    );
+    assert_eq!(
+      std::fs::metadata(&decoy).unwrap().ino(),
+      decoy_inode_before,
+      "decoy inode must not have changed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// Functional round-trip for the fd-bound safetensors writer: an array
+  /// written through `save_safetensors_to_file` reloads byte-for-byte via
+  /// [`crate::io::load_safetensors`]. Confirms the custom `mlx_io_writer`
+  /// (which delegates `tell`/`seek`/`write` to the supplied `&mut File`)
+  /// drives mlx-c through a correct safetensors layout — JSON header,
+  /// per-tensor `data_offsets`, then the contiguous tensor-data section
+  /// — equivalent in semantics to the path-based writer. The on-disk
+  /// byte sequence cannot be asserted equal to a path-based write because
+  /// mlx-c serializes the entry map (an `std::unordered_map`) in a
+  /// non-deterministic order — the safetensors LAYOUT is invariant, the
+  /// per-tensor offsets are not.
+  #[test]
+  fn save_safetensors_to_file_round_trips_via_path_load() {
+    let dir = fresh_dir("load1-fd-round-trip");
+    let arr_a = Array::from_slice::<f32>(&[1.0_f32, 2.0, 3.0, 4.0], &(4usize,)).unwrap();
+    let arr_b = Array::from_slice::<f32>(&[10.0_f32, 20.0], &(2usize,)).unwrap();
+    let mut meta: HashMap<String, String> = HashMap::new();
+    meta.insert("format".to_string(), "mlx".to_string());
+
+    // Fd-based write into a freshly-created `File`.
+    let path = dir.join("via_fd.safetensors");
+    let mut f = std::fs::File::create(&path).unwrap();
+    crate::io::save_safetensors_to_file(&mut f, [("a", &arr_a), ("b", &arr_b)], &meta).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+
+    // Reload through the path-based loader — proves the on-disk
+    // safetensors layout is valid (parseable header, correct offsets,
+    // correct dtype + shape encoding).
+    let mut loaded = crate::io::load_safetensors(&path).unwrap();
+    assert_eq!(loaded.len(), 2);
+    let a_read = loaded.get_mut("a").unwrap().to_vec::<f32>().unwrap();
+    let b_read = loaded.get_mut("b").unwrap().to_vec::<f32>().unwrap();
+    assert_eq!(a_read, vec![1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(b_read, vec![10.0, 20.0]);
 
     let _ = std::fs::remove_dir_all(&dir);
   }
