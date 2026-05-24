@@ -640,6 +640,7 @@ fn vlm_generate_uses_image_processor_config_override() {
     do_normalize: true,
     resample: ResizeFilter::Bilinear, // non-default
     color_order: ColorOrder::Rgb,
+    ..ImageProcessorConfig::default()
   };
   let model = MockVlmModel::new(5, 4, 3).with_processor_cfg(custom);
   let dir = temp_dir("cfg_override");

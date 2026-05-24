@@ -14,10 +14,11 @@
 
 use mlxrs::{
   Array, Dtype, Error,
+  ops::shape::contiguous,
   vlm::image::{
-    ColorOrder, ImageProcessorConfig, ResizeFilter, center_crop, image_to_array, load_image,
-    normalize, normalize_imagenet, pad_to_square, patchify, preprocess, rescale, resize,
-    resize_lanczos,
+    ColorOrder, ImageProcessorConfig, Layout, ResizeFilter, apply_layout, center_crop,
+    image_to_array, load_image, normalize, normalize_imagenet, pad_to_square, patchify, preprocess,
+    rescale, resize, resize_lanczos,
   },
 };
 
@@ -1760,5 +1761,352 @@ fn normalize_rejects_integer_dtypes() {
   assert!(
     matches!(err, Error::ShapeMismatch { .. }),
     "want ShapeMismatch, got {err:?}",
+  );
+}
+
+// ─── P8 / VLM-1 (#120) trailing-layout post-step tests ───────────────
+
+/// `Layout::Hwc` is the identity arm — `preprocess` and `apply_layout`
+/// must produce the historical `[H, W, 3]` shape for source
+/// compatibility (every pre-existing caller stays on the default).
+#[test]
+fn apply_layout_hwc_is_identity() {
+  // Hand-built [2, 3, 3] array (H=2, W=3, C=3) — the same shape
+  // [`preprocess`] emits before the layout post-step. `Hwc` must
+  // return it unchanged (shape + values bit-identical).
+  let n = 2 * 3 * 3;
+  let src: Vec<f32> = (0..n).map(|i| i as f32).collect();
+  let arr = Array::from_slice(&src, &(2usize, 3, 3)).unwrap();
+  let mut out = apply_layout(arr, Layout::Hwc).unwrap();
+  assert_eq!(out.shape(), vec![2, 3, 3], "Hwc must preserve [H, W, 3]");
+  let v: Vec<f32> = out.to_vec().unwrap();
+  assert_eq!(v, src, "Hwc identity must preserve values byte-identical");
+}
+
+/// `Layout::Chw` permutes `[H, W, 3]` → `[3, H, W]`. Verifies the
+/// shape swap AND the per-channel permutation by hand-tracing the
+/// channel-last → planar reordering.
+#[test]
+fn apply_layout_chw_transposes_to_planar() {
+  // Build a [2, 3, 3] array where pixel (y, x) carries
+  // (100*y + 10*x, 100*y + 10*x + 1, 100*y + 10*x + 2) — each
+  // channel uniquely traceable.
+  let h = 2;
+  let w = 3;
+  let mut src = Vec::with_capacity(h * w * 3);
+  for y in 0..h {
+    for x in 0..w {
+      let base = (100 * y + 10 * x) as f32;
+      src.push(base);
+      src.push(base + 1.0);
+      src.push(base + 2.0);
+    }
+  }
+  let arr = Array::from_slice(&src, &(h, w, 3usize)).unwrap();
+  let out = apply_layout(arr, Layout::Chw).unwrap();
+  // Shape: [H, W, 3] → [3, H, W].
+  assert_eq!(out.shape(), vec![3, h, w], "Chw must produce [3, H, W]");
+  // `transpose_axes` produces a non-contiguous strided view; materialize
+  // via `contiguous` before `to_vec` (matches every other transpose
+  // test in the suite).
+  let mut materialized = contiguous(&out, false).unwrap();
+  let v: Vec<f32> = materialized.to_vec().unwrap();
+  // Channel c at (y, x) lives at planar offset c*H*W + y*W + x.
+  for c in 0..3 {
+    for y in 0..h {
+      for x in 0..w {
+        let planar_off = c * h * w + y * w + x;
+        let expected = (100 * y + 10 * x) as f32 + c as f32;
+        assert_eq!(
+          v[planar_off], expected,
+          "Chw: planar (c={c}, y={y}, x={x}) must equal channel-last source"
+        );
+      }
+    }
+  }
+}
+
+/// `Layout::Bchw` adds the leading batch axis swift's
+/// `MediaProcessing.asMLXArray` produces — `[1, 3, H, W]`. Verifies
+/// shape AND that the planar values match the `Chw` arm (just with a
+/// leading unit dim).
+#[test]
+fn apply_layout_bchw_matches_swift_planar_batched() {
+  // Same hand-built [2, 3, 3] as the Chw test.
+  let h = 2;
+  let w = 3;
+  let mut src = Vec::with_capacity(h * w * 3);
+  for y in 0..h {
+    for x in 0..w {
+      let base = (100 * y + 10 * x) as f32;
+      src.push(base);
+      src.push(base + 1.0);
+      src.push(base + 2.0);
+    }
+  }
+  let arr = Array::from_slice(&src, &(h, w, 3usize)).unwrap();
+  let out = apply_layout(arr, Layout::Bchw).unwrap();
+  // Shape: [H, W, 3] → [3, H, W] → [1, 3, H, W]; matches swift
+  // `array.reshape((1, h, w, 3)).transposed(0, 3, 1, 2)`
+  // (`MLXVLM/MediaProcessing.swift:190`).
+  assert_eq!(
+    out.shape(),
+    vec![1, 3, h, w],
+    "Bchw must produce [1, 3, H, W] (swift MediaProcessing.asMLXArray shape)"
+  );
+  // Materialize the strided transpose view before `to_vec`.
+  let mut materialized = contiguous(&out, false).unwrap();
+  let v: Vec<f32> = materialized.to_vec().unwrap();
+  // Element layout is identical to Chw (the leading unit dim is
+  // metadata-only); the per-element check from the Chw test applies
+  // verbatim.
+  for c in 0..3 {
+    for y in 0..h {
+      for x in 0..w {
+        let planar_off = c * h * w + y * w + x;
+        let expected = (100 * y + 10 * x) as f32 + c as f32;
+        assert_eq!(v[planar_off], expected, "Bchw c={c} y={y} x={x}");
+      }
+    }
+  }
+}
+
+/// `apply_layout` rejects non-rank-3 inputs (the post-step targets the
+/// cross-model `[H, W, 3]` shape specifically — per-model processors
+/// with patchified `[N, P, P, 3]` or batched `[B, H, W, 3]` compose
+/// their own trailing layout).
+#[test]
+fn apply_layout_rejects_non_rank3_input() {
+  let arr = Array::from_slice(&[0.0_f32; 12], &(2usize, 6)).unwrap();
+  let err = apply_layout(arr, Layout::Chw).unwrap_err();
+  assert!(
+    matches!(err, Error::ShapeMismatch { .. }),
+    "want ShapeMismatch on non-rank-3 input, got {err:?}"
+  );
+}
+
+/// `apply_layout` rejects rank-3 inputs whose trailing channel dim is
+/// not 3 — the layout enum is RGB-specific (the swift / python references
+/// both assume a 3-channel input at this stage).
+#[test]
+fn apply_layout_rejects_non_3channel_trailing() {
+  let arr = Array::from_slice(&[0.0_f32; 16], &(2usize, 2, 4)).unwrap();
+  let err = apply_layout(arr, Layout::Chw).unwrap_err();
+  assert!(
+    matches!(err, Error::ShapeMismatch { .. }),
+    "want ShapeMismatch on trailing != 3, got {err:?}"
+  );
+}
+
+/// `preprocess` with default config (Layout::Hwc) keeps the historical
+/// `[H, W, 3]` shape — source-compatibility guarantee for every
+/// pre-existing caller of [`preprocess`].
+#[test]
+fn preprocess_default_layout_is_hwc_for_source_compat() {
+  // Default config = Layout::Hwc; output must be [H, W, 3] for a
+  // 4x4 input resized to 8x8 (the per-channel cfg.size = (224, 224)
+  // default is irrelevant here — we override).
+  let img = synthetic_image(4, 4);
+  let cfg = ImageProcessorConfig {
+    size: (8, 8),
+    ..ImageProcessorConfig::default()
+  };
+  let out = preprocess(&img, &cfg).unwrap();
+  assert_eq!(
+    out.shape(),
+    vec![8, 8, 3],
+    "default Layout::Hwc must keep [H, W, 3] output"
+  );
+}
+
+/// `preprocess` with `Layout::Bchw` produces swift's
+/// `[1, 3, H, W]` — the breaking-change opt-in that VLM-1 (#120)
+/// surfaces. The H*W*C product is unchanged (both layouts hold the
+/// same number of f32s) so the post-step is shape-only.
+#[test]
+fn preprocess_layout_bchw_emits_batched_planar() {
+  let img = synthetic_image(4, 4);
+  let cfg = ImageProcessorConfig {
+    size: (8, 8),
+    layout: Layout::Bchw,
+    ..ImageProcessorConfig::default()
+  };
+  let out = preprocess(&img, &cfg).unwrap();
+  assert_eq!(
+    out.shape(),
+    vec![1, 3, 8, 8],
+    "Layout::Bchw must emit [1, 3, H, W] (swift MediaProcessing.asMLXArray shape)"
+  );
+}
+
+/// `preprocess` with `Layout::Chw` produces `[3, H, W]` (planar, no
+/// batch axis) — the torchvision / timm classical-CV layout.
+#[test]
+fn preprocess_layout_chw_emits_planar_no_batch() {
+  let img = synthetic_image(4, 4);
+  let cfg = ImageProcessorConfig {
+    size: (8, 8),
+    layout: Layout::Chw,
+    ..ImageProcessorConfig::default()
+  };
+  let out = preprocess(&img, &cfg).unwrap();
+  assert_eq!(
+    out.shape(),
+    vec![3, 8, 8],
+    "Layout::Chw must emit [3, H, W] (torchvision planar)"
+  );
+}
+
+/// `ImageProcessorConfig::default().layout` is `Hwc` — pre-existing
+/// callers see the historical channel-last output as their default.
+#[test]
+fn imageprocessor_config_default_layout_is_hwc() {
+  let cfg = ImageProcessorConfig::default();
+  assert_eq!(
+    cfg.layout,
+    Layout::Hwc,
+    "default layout must be Hwc for source-compat"
+  );
+}
+
+// ─── P8 / VLM-3 (#121) non-Rgb8 bulk-fill regression ─────────────────
+
+/// The non-`Rgb8` branch of [`image_to_array`] used to per-pixel
+/// `buf.push(f32::from(...))` three times per pixel; the bulk-fill
+/// upgrade now builds a `Vec<u8>` then hands it to the same C3
+/// (`rgb_widen`) / C4 (`bgr_widen`) SIMD dispatcher the `Rgb8` fast
+/// path uses. This regression check verifies the non-`Rgb8` output is
+/// byte-identical to the `Rgb8` fast path for the SAME pixel values —
+/// proving the bulk-fill path produces the same f32 buffer as the
+/// per-pixel-push shape it replaced.
+#[test]
+fn image_to_array_non_rgb8_bulk_fill_matches_rgb8_fast_path() {
+  // Build a 3x4 Rgba8 source (the non-Rgb8 branch's hot path —
+  // covers BOTH the dynamic_image_rgb_pixel alpha-drop projection
+  // AND the new bulk-fill `Vec<u8>` intermediate). Pixel values are
+  // identical to the Rgb8 sibling — the alpha channel must be
+  // dropped by the projection.
+  let h = 3;
+  let w = 4;
+  let mut rgba = ::image::RgbaImage::new(w, h);
+  let mut rgb = ::image::RgbImage::new(w, h);
+  for y in 0..h {
+    for x in 0..w {
+      let r = (10 * x) as u8;
+      let g = (10 * y) as u8;
+      let b = 200u8;
+      rgba.put_pixel(x, y, ::image::Rgba([r, g, b, 128]));
+      rgb.put_pixel(x, y, ::image::Rgb([r, g, b]));
+    }
+  }
+  let img_rgba = ::image::DynamicImage::ImageRgba8(rgba);
+  let img_rgb = ::image::DynamicImage::ImageRgb8(rgb);
+  // RGB color order — the bulk-fill upgrade routes through `rgb_widen`.
+  let mut out_rgba = image_to_array(&img_rgba, ColorOrder::Rgb).unwrap();
+  let mut out_rgb = image_to_array(&img_rgb, ColorOrder::Rgb).unwrap();
+  let v_rgba: Vec<f32> = out_rgba.to_vec().unwrap();
+  let v_rgb: Vec<f32> = out_rgb.to_vec().unwrap();
+  assert_eq!(
+    v_rgba, v_rgb,
+    "non-Rgb8 (Rgba8 via bulk-fill + rgb_widen) must produce the same f32 buffer as \
+     the Rgb8 fast path for identical RGB pixel values (alpha dropped per \
+     image_to_array's documented projection)"
+  );
+}
+
+/// Same regression for `ColorOrder::Bgr` — the bulk-fill non-Rgb8
+/// branch routes through `bgr_widen` and must produce the same f32
+/// buffer as the Rgb8 fast path for identical RGB values.
+#[test]
+fn image_to_array_non_rgb8_bulk_fill_bgr_matches_rgb8_fast_path() {
+  let h = 2;
+  let w = 4;
+  let mut rgba = ::image::RgbaImage::new(w, h);
+  let mut rgb = ::image::RgbImage::new(w, h);
+  for y in 0..h {
+    for x in 0..w {
+      let r = (10 * x + 1) as u8;
+      let g = (10 * y + 3) as u8;
+      let b = ((20 * x + 30 * y + 7) % 256) as u8;
+      rgba.put_pixel(x, y, ::image::Rgba([r, g, b, 200]));
+      rgb.put_pixel(x, y, ::image::Rgb([r, g, b]));
+    }
+  }
+  let img_rgba = ::image::DynamicImage::ImageRgba8(rgba);
+  let img_rgb = ::image::DynamicImage::ImageRgb8(rgb);
+  let mut out_rgba = image_to_array(&img_rgba, ColorOrder::Bgr).unwrap();
+  let mut out_rgb = image_to_array(&img_rgb, ColorOrder::Bgr).unwrap();
+  let v_rgba: Vec<f32> = out_rgba.to_vec().unwrap();
+  let v_rgb: Vec<f32> = out_rgb.to_vec().unwrap();
+  assert_eq!(
+    v_rgba, v_rgb,
+    "non-Rgb8 BGR (Rgba8 via bulk-fill + bgr_widen) must match Rgb8 fast path"
+  );
+}
+
+/// Non-`Rgb8` branch with `Luma8` (single-channel grayscale) source:
+/// the `dynamic_image_rgb_pixel` helper broadcasts the luma to
+/// (L, L, L). Verifies the bulk-fill path produces 3× the source
+/// luma per pixel (no per-channel skew).
+#[test]
+fn image_to_array_luma8_broadcasts_to_rgb_via_bulk_fill() {
+  let h: u32 = 2;
+  let w: u32 = 3;
+  let mut gray = ::image::GrayImage::new(w, h);
+  for y in 0..h {
+    for x in 0..w {
+      gray.put_pixel(x, y, ::image::Luma([(10 * x + 50 * y) as u8]));
+    }
+  }
+  let img = ::image::DynamicImage::ImageLuma8(gray);
+  let mut out = image_to_array(&img, ColorOrder::Rgb).unwrap();
+  assert_eq!(
+    out.shape(),
+    vec![h as usize, w as usize, 3],
+    "Luma8 must broadcast to [H, W, 3]"
+  );
+  let v: Vec<f32> = out.to_vec().unwrap();
+  // Per pixel (y, x): L = 10*x + 50*y; output triple must be (L, L, L).
+  for y in 0..h {
+    for x in 0..w {
+      let l = (10 * x + 50 * y) as f32;
+      let off = ((y * w + x) * 3) as usize;
+      assert_eq!(
+        v[off], l,
+        "Luma8 R channel must equal luma at (y={y}, x={x})"
+      );
+      assert_eq!(v[off + 1], l, "G channel must equal luma");
+      assert_eq!(v[off + 2], l, "B channel must equal luma");
+    }
+  }
+}
+
+// ─── P8 / VLM-2 (#125) byte-budget validation regression ─────────────
+
+/// [`resize`] rejects an over-budget target via a typed
+/// [`Error::ShapeMismatch`] BEFORE any allocation — closure regression
+/// for VLM-2 (#125). Mirrors the audit-table guarantee: a hostile /
+/// mis-configured `ImageProcessorConfig.size` cannot drive a
+/// multi-GiB infallible alloc.
+#[test]
+fn resize_rejects_over_budget_target() {
+  let img = synthetic_image(8, 8);
+  // 64K × 64K × 4 = ~17 GiB — well over the 512 MiB cap.
+  let err = resize(&img, (65_536, 65_536), ResizeFilter::Bilinear).unwrap_err();
+  assert!(
+    matches!(err, Error::ShapeMismatch { .. }),
+    "want ShapeMismatch on over-budget target, got {err:?}"
+  );
+}
+
+/// [`resize`] rejects a zero-dim target — the VLM-2 byte-budget guard
+/// must reject zero/overflow targets before allocating.
+#[test]
+fn resize_rejects_zero_dim_target() {
+  let img = synthetic_image(8, 8);
+  let err = resize(&img, (0, 16), ResizeFilter::Bilinear).unwrap_err();
+  assert!(
+    matches!(err, Error::ShapeMismatch { .. }),
+    "want ShapeMismatch on zero target, got {err:?}"
   );
 }

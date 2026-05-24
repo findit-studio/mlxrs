@@ -1371,6 +1371,7 @@ mod tests {
         do_normalize: true,
         resample: ResizeFilter::Bilinear,
         color_order: ColorOrder::Rgb,
+        ..ImageProcessorConfig::default()
       }
     }
 
@@ -3077,6 +3078,7 @@ mod tests {
         do_normalize: true,
         resample: ResizeFilter::Bilinear,
         color_order: ColorOrder::Rgb,
+        ..ImageProcessorConfig::default()
       }
     }
 
