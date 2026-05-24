@@ -693,3 +693,96 @@ fn infer_tool_parser_full_marker_matrix() {
   assert_eq!(infer_tool_parser(Some("no markers at all")), None);
   assert_eq!(infer_tool_parser(None), None);
 }
+
+// ---------------------------------------------------------------------------
+// LM-5 (#115) — schema-coercion regression: `number`/`float` schemas must
+// emit a JSON FLOAT for every parsed `f64`, never silently saturate via
+// `as i64`. Covers both `convert_param_value` (Qwen3Coder path) and
+// `convert_with_types` (MinimaxM2 path).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn lm5_qwen3_coder_number_schema_emits_json_float_no_saturation() {
+  // Schema-asks-for-NUMBER + whole-valued huge value: the old branch
+  // `Ok(f) if f.fract() == 0.0 => (f as i64).into()` would saturate 1e30
+  // at `i64::MAX` (≈9.22e18) AND lose the float type signal. The fix
+  // routes whole-valued numbers through `Number::from_f64` like
+  // non-whole values do, so the output is a JSON float carrying the
+  // exact magnitude (modulo f64 round-trip).
+  let tools = json!([{
+    "function": {
+      "name": "f",
+      "parameters": {"properties": {"x": {"type": "number"}}}
+    }
+  }]);
+  let text = "<function=f><parameter=x>1e30</parameter></function>";
+  let calls = Qwen3Coder.parse(text, Some(&tools)).unwrap();
+  let v = &calls[0].arguments["x"];
+  let n = v
+    .as_number()
+    .expect("number schema must emit a JSON number");
+  // NEVER an integer (the type signal must survive).
+  assert!(
+    !n.is_i64() && !n.is_u64(),
+    "number schema must not emit an integer; got {n}"
+  );
+  let f = n.as_f64().unwrap();
+  assert!(f.is_finite(), "f64 round-trip is finite");
+  assert!(
+    f > 1e29 && f < 1e31,
+    "magnitude must survive (no i64::MAX saturation); got {f}"
+  );
+
+  // Sanity: small whole-valued number still routes through `from_f64`
+  // (a JSON float, NOT an integer — preserves the schema type signal).
+  let text_small = "<function=f><parameter=x>42</parameter></function>";
+  let calls_small = Qwen3Coder.parse(text_small, Some(&tools)).unwrap();
+  let n_small = calls_small[0].arguments["x"]
+    .as_number()
+    .expect("number schema must emit a JSON number");
+  assert!(
+    !n_small.is_i64() && !n_small.is_u64(),
+    "schema=number on `42` must still be a JSON float (type signal); got {n_small}"
+  );
+  assert_eq!(n_small.as_f64().unwrap(), 42.0);
+}
+
+#[test]
+fn lm5_minimax_m2_number_schema_emits_json_float_no_saturation() {
+  // Same regression on the parallel `convert_with_types` path used by
+  // MinimaxM2 (called from `parse` via `args.insert(pname,
+  // convert_with_types(&pval, &ptypes))`).
+  let tools = json!([{
+    "function": {
+      "name": "f",
+      "parameters": {"properties": {"x": {"type": "number"}}}
+    }
+  }]);
+  let text = r#"<invoke name="f"><parameter name="x">1e30</parameter></invoke>"#;
+  let calls = MinimaxM2.parse(text, Some(&tools)).unwrap();
+  let n = calls[0].arguments["x"]
+    .as_number()
+    .expect("number schema must emit a JSON number");
+  assert!(
+    !n.is_i64() && !n.is_u64(),
+    "number schema must not emit an integer; got {n}"
+  );
+  let f = n.as_f64().unwrap();
+  assert!(
+    f > 1e29 && f < 1e31,
+    "magnitude must survive (no i64::MAX saturation); got {f}"
+  );
+
+  // Explicit `integer` schema still routes to a JSON integer (the fix
+  // only changes the `number`/`float` arm — the integer arm in
+  // `convert_with_types` already uses `value.parse::<i64>()` directly).
+  let tools_int = json!([{
+    "function": {
+      "name": "f",
+      "parameters": {"properties": {"n": {"type": "integer"}}}
+    }
+  }]);
+  let text_int = r#"<invoke name="f"><parameter name="n">42</parameter></invoke>"#;
+  let calls_int = MinimaxM2.parse(text_int, Some(&tools_int)).unwrap();
+  assert_eq!(calls_int[0].arguments["n"], json!(42));
+}

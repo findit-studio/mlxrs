@@ -550,3 +550,90 @@ fn encoded_and_options_are_debug_clone() {
   let es = format!("{encoded:?}");
   assert!(es.contains("ids"));
 }
+
+// ---------------------------------------------------------------------------
+// LM-2 (#112) — `encode_batch_with`: batch analogue of `encode_with` with
+// the same `EncodeOptions` semantics applied per item, plus the same
+// fast-fail-on-missing-eos contract.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn encode_batch_with_matches_encode_with_per_item() {
+  // Parity: `encode_batch_with(texts, opts)` produces, item-for-item,
+  // the same `Encoded` (ids + mask) as a hand-rolled `for t in texts {
+  // tok.encode_with(t, opts) }` loop. Asserts on the exact opts that
+  // exercise every post-processing branch (add_eos + truncate_to +
+  // return_attention_mask + add_special) so any per-item drift surfaces.
+  let tok = Tokenizer::from_path(fixture_dir(), None).unwrap();
+  let texts = vec![
+    "hello world".to_owned(),
+    "hello world the quick brown fox".to_owned(),
+    "hello".to_owned(),
+  ];
+  let opts = EncodeOptions::new()
+    .add_special(false)
+    .add_eos(true)
+    .truncate_to(Some(3))
+    .return_attention_mask(true);
+
+  let batched = tok.encode_batch_with(texts.clone(), &opts).unwrap();
+  assert_eq!(batched.len(), texts.len());
+  for (i, text) in texts.iter().enumerate() {
+    let single = tok.encode_with(text, &opts).unwrap();
+    assert_eq!(
+      batched[i].ids, single.ids,
+      "item {i} ids must match encode_with"
+    );
+    assert_eq!(
+      batched[i].attention_mask, single.attention_mask,
+      "item {i} mask must match encode_with"
+    );
+    // truncate_to(3) + add_eos => last id is EOS in EVERY non-empty item.
+    let eos = tok.eos_token_id().expect("fixture has eos");
+    assert_eq!(batched[i].ids.last().copied(), Some(eos));
+    assert!(batched[i].ids.len() <= 3, "truncate cap honored");
+  }
+}
+
+#[test]
+fn encode_batch_with_add_eos_errors_without_calling_hf_encode_batch() {
+  // Same fast-fail contract as `encode_with`: missing primary EOS +
+  // `add_eos = true` rejects BEFORE the (potentially large) batch
+  // tokenizer call runs, exposing the configuration gap up front.
+  let dir = std::env::temp_dir().join(format!(
+    "mlxrs-tok-encode-opts-batch-noeos-{}",
+    std::process::id()
+  ));
+  std::fs::create_dir_all(&dir).unwrap();
+  let mut f = std::fs::File::create(dir.join("tokenizer.json")).unwrap();
+  f.write_all(TOKENIZER_JSON.as_bytes()).unwrap();
+  let tok = Tokenizer::from_path(&dir, None).unwrap();
+  assert!(tok.eos_token_ids().is_empty());
+
+  // Many large inputs that would be expensive to tokenize: the fast-fail
+  // path errors regardless of batch size / per-item size.
+  let big = "hello ".repeat(1024);
+  let texts: Vec<String> = (0..32).map(|_| big.clone()).collect();
+  let err = tok
+    .encode_batch_with(texts, &EncodeOptions::new().add_eos(true))
+    .unwrap_err();
+  let msg = format!("{err}");
+  assert!(
+    msg.contains("eos"),
+    "expected eos-related error, got: {msg}"
+  );
+}
+
+#[test]
+fn encode_batch_with_empty_input_is_empty_output() {
+  // Edge case: empty input vec yields empty output vec. Should NOT
+  // error on `add_eos = true` if no items would have been encoded — but
+  // because the precondition runs up front (before consulting input
+  // length), the empty-input + add_eos + missing-eos case is still an
+  // error. Test only the no-eos branch for the empty-vec round-trip.
+  let tok = Tokenizer::from_path(fixture_dir(), None).unwrap();
+  let out = tok
+    .encode_batch_with(Vec::new(), &EncodeOptions::new())
+    .unwrap();
+  assert!(out.is_empty());
+}

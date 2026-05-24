@@ -200,6 +200,142 @@ pub fn apply_top_p(logprobs: &Array, top_p: f32) -> Result<Array> {
   ops::logical::select(&keep, logprobs, &neg_inf)
 }
 
+/// Scale `logits` by `1 / temp`, returning a result in the **original**
+/// `logits` dtype. Dispatched per dtype:
+/// - **F32**: in-dtype `divide(logits, scalar_like(temp))` (hot path,
+///   bit-identical to the pre-fix path).
+/// - **F16 / BF16**: upcast to f32, divide in f32, downcast back —
+///   `temp` never gets cast down to the narrower dtype.
+/// - **F64**: rejected with an `Error::Backend`. MLX's GPU stream
+///   (`default_stream()`, which `ops::arithmetic::divide` routes through)
+///   does not support `float64` (`"float64 is not supported on the GPU"`),
+///   so a native F64 divide errors at eval; the prior implicit f32
+///   roundtrip silently lost precision on near-tied logits instead of
+///   surfacing the limitation (LM-6 R2 medium finding). The caller must
+///   cast logits down to F32 (or F16/BF16) before sampling — the
+///   reference Python `mlx_lm.sample_utils.categorical_sampling` only
+///   ever runs on F32/F16/BF16 logits.
+/// - **Anything else**: rejected with an `Error::Backend` (categorical
+///   sampling only makes sense on floating-point logits).
+///
+/// **NaN-safety (LM-6 R1 follow-up).** The previous fix replaced
+/// `multiply(logits, scalar_like(1/temp))` with
+/// `divide(logits, scalar_like(temp, logits))`, which still casts `temp`
+/// down to the logits dtype BEFORE the divide via `scalar_like`. For f16
+/// logits any positive `temp` below f16's minimum subnormal (~5.96e-8)
+/// rounds to 0 in that cast; bf16 hits the same trap below its own min
+/// subnormal (~9.18e-41). A max-shifted row contains a 0 entry, so
+/// `0 / 0 = NaN` leaks into [`crate::ops::random::categorical`]'s softmax — exactly
+/// the original LM-6 attack surface, just reached through the dtype cast
+/// instead of the `1/temp` overflow.
+///
+/// **Fix has three parts:**
+///
+/// 1. **f32-denominator upcast path for f16/bf16.** Upcast `logits` to
+///    f32 first, build the divisor in f32 (no cast-to-half), divide,
+///    then downcast the result back to the original dtype. `temp` never
+///    gets cast to the narrower dtype, eliminating the f16/bf16
+///    dtype-cast leg.
+///
+/// 2. **Below-`1/f32::MAX` clamp.** Empirically MLX's `divide` lowers to
+///    multiply-by-reciprocal internally on Apple Silicon (the divisor's
+///    f32 reciprocal is materialized inside the kernel), so the original
+///    `1/temp` overflow path the prior LM-6 fix claimed to eliminate is
+///    actually still active for `temp < 1/f32::MAX ≈ 2.94e-39` (it just
+///    moved into mlx-c). Without this clamp, `0 / temp` produces NaN
+///    even after the upcast (since the kernel computes `0 * +Inf`).
+///    Clamping `temp` from below to [`f32::MIN_POSITIVE`] (smallest f32
+///    normal, `~1.18e-38`, so `1/temp` is finite) preserves the divide's
+///    correctness for any sub-normal `temp` the validator accepts —
+///    `softmax(logits/temp)` is mathematically equivalent to argmax in
+///    this limit anyway, and the post-divide `±Inf` overflows for
+///    extreme logits resolve correctly inside
+///    [`crate::ops::random::categorical`]'s internal softmax (one-hot at
+///    the max). This is the secondary recommendation in the LM-6 R1
+///    Codex finding ("explicitly route temperatures that would round to
+///    zero ... to an argmax-after-filtering path") for the bf16-only
+///    sub-min-subnormal regime where the f32 reciprocal trap is
+///    unavoidable (bf16 and f32 share an exponent range, so any temp
+///    below bf16 min subnormal is also below `1/f32::MAX`).
+///
+/// 3. **F64 + non-floating dtype rejection (LM-6 R2 follow-up).** The
+///    prior single non-F32 branch quietly funneled F64 through an f32
+///    roundtrip, so near-tied f64 logits at small `temp` could lose
+///    ordering before the Gumbel draw while still returning an F64
+///    array. MLX's GPU stream does not support F64 (`"float64 is not
+///    supported on the GPU"`), so a native F64 divide would error at
+///    eval rather than preserve precision; F64 is now rejected up front
+///    with a clear `Error::Backend` instructing the caller to cast
+///    before sampling — bit-honest about the backend's actual F64
+///    capability. Any non-floating dtype is likewise rejected (mirroring
+///    the dtype-rejection pattern in `kl_div_loss`), so an i32/u32/etc.
+///    array does not silently astype through f32.
+///
+/// **Handler safety.** `ensure_handler_installed()` runs as the FIRST
+/// executable statement — `Array::full::<f32>` invokes the fallible
+/// `mlx_array_new_float32` ctor BEFORE its `mlx_full` call (whose
+/// `default_stream()` arg is what triggers the lazy install), so with
+/// the eager `#[ctor]` stripped that first ctor could reach mlx-c with
+/// no error handler installed → its default `printf + exit(-1)` instead
+/// of a recoverable `Err`. Same defense-in-depth as `scalar_like` and
+/// `embeddings::scalar_like` (LM-6 R2 Codex finding).
+///
+/// Exposed as `pub` so the [`categorical_sampling`] regression test can
+/// assert directly on the scaled logits (not just the eventual sampled
+/// index, which is uninformative under a NaN distribution); also genuinely
+/// useful as a building block for custom sampler compositions.
+pub fn scale_logits_by_temp(logits: &Array, temp: f32) -> Result<Array> {
+  // Install the error handler BEFORE any fallible mlx-c ctor — `Array::full`
+  // runs `mlx_array_new_float32` before its `mlx_full(default_stream())`
+  // would lazily install it, so a ctor-stripped first sampling call could
+  // otherwise trip mlx-c's default `printf + exit(-1)` on scalar allocation
+  // failure instead of returning `Err` (LM-6 R2 Codex finding).
+  crate::error::ensure_handler_installed();
+  if !temp.is_finite() || temp <= 0.0 {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "`temp` has to be a finite positive float (use `argmax_sample` for temperature-0 / greedy decoding), but is {temp}"
+      ),
+    });
+  }
+  // Clamp from below to ensure `1/temp` is finite — see docstring part (2).
+  // This keeps MLX's internal multiply-by-reciprocal on Apple Silicon from
+  // computing `0 * +Inf = NaN` on the max-shifted zero entries. Above this
+  // threshold the clamp is a no-op (`temp` is returned unchanged).
+  let temp = temp.max(f32::MIN_POSITIVE);
+  let dtype = logits.dtype()?;
+  match dtype {
+    crate::Dtype::F32 => {
+      // Bit-identical to the pre-fix path on the hot path most callers
+      // hit (no extra cast-roundtrip).
+      let divisor = Array::full::<f32>(&(1,), temp)?;
+      ops::arithmetic::divide(logits, &divisor)
+    }
+    crate::Dtype::F16 | crate::Dtype::BF16 => {
+      // Half precision — upcast-divide-downcast so `temp` never gets
+      // cast to the narrower dtype (the LM-6 R1 dtype-cast leg).
+      let logits_f32 = ops::misc::astype(logits, crate::Dtype::F32)?;
+      let divisor = Array::full::<f32>(&(1,), temp)?;
+      let scaled_f32 = ops::arithmetic::divide(&logits_f32, &divisor)?;
+      ops::misc::astype(&scaled_f32, dtype)
+    }
+    crate::Dtype::F64 => Err(Error::Backend {
+      message:
+        "categorical_sampling does not support F64 logits — MLX's GPU stream \
+         does not implement float64, so a native F64 divide would error at \
+         eval and the prior implicit F32 roundtrip silently lost precision on \
+         near-tied logits (LM-6 R2 finding). Cast logits with \
+         .astype(Dtype::F32) (or F16/BF16) before sampling."
+          .to_string(),
+    }),
+    other => Err(Error::Backend {
+      message: format!(
+        "categorical_sampling requires floating-point logits (F32, F16, or BF16); got {other:?}. Cast logits with .astype(Dtype::F32) before sampling."
+      ),
+    }),
+  }
+}
+
 /// Temperature-scaled categorical draw.
 ///
 /// Port of `mlx_lm.sample_utils.categorical_sampling`:
@@ -209,15 +345,15 @@ pub fn apply_top_p(logprobs: &Array, top_p: f32) -> Result<Array> {
 /// `make_sampler` dispatch is deferred here, this validates the precondition
 /// the reference relies on instead of producing `inf`/`NaN` logits. Use
 /// [`argmax_sample`] for greedy / `temp == 0` decoding.
+///
+/// **NaN-safety (LM-6).** The scaling is delegated to
+/// [`scale_logits_by_temp`], which uses an f32-denominator path so the
+/// inverse temperature is never materialized AND `temp` never gets cast
+/// down to f16/bf16 (where positive sub-min-subnormal values round to
+/// zero, opening a `0 / 0 = NaN` hole under the L3-R2 max-shift —
+/// the R1 follow-up to the original LM-6 fix).
 pub fn categorical_sampling(logits: &Array, temp: f32, key: &Array) -> Result<Array> {
-  if !temp.is_finite() || temp <= 0.0 {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "`temp` has to be a finite positive float (use `argmax_sample` for temperature-0 / greedy decoding), but is {temp}"
-      ),
-    });
-  }
-  let scaled = ops::arithmetic::multiply(logits, &scalar_like(1.0 / temp, logits)?)?;
+  let scaled = scale_logits_by_temp(logits, temp)?;
   ops::random::categorical(&scaled, -1, key)
 }
 
