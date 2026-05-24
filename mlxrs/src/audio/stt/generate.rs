@@ -159,16 +159,39 @@ fn audio_path_to_mel<M: super::model::Model>(
   //      duration exceeds the per-utterance limit before the resample
   //      + mel + encode passes allocate.
   //
-  //    The cap is therefore not a single "reject before any allocation"
-  //    guarantee for crafted inputs whose declared frame count is below
-  //    `MAX_DECODED_SAMPLES` but above `max_audio_seconds * src_sr` —
-  //    those go through the load-stage allocation (bounded by the
-  //    256 MiB ceiling) before the STT-stage cap rejects them. This
-  //    mirrors mlx-audio's behavior: the python loader loads first,
-  //    then the per-model code checks duration. A stricter pre-load
-  //    cap (e.g. a sample-count-aware loader variant) is a planned
-  //    `audio::io` follow-up, not an STT-loop concern.
-  let (samples, src_sr) = audio_io::load_audio(audio_path)?;
+  //    The layered cap is applied at the LOAD stage via
+  //    `load_audio_with_max_seconds`: it probes the container's source
+  //    sample rate FIRST, then enforces the load-stage cap as
+  //    `src_sr * max_audio_seconds` (clamped to
+  //    `MAX_DECODED_SAMPLES`). For exact-count formats (WAV / FLAC-with-
+  //    STREAMINFO) whose container header declares a sample-exact total
+  //    the rejection fires BEFORE allocating the sample buffer; for
+  //    lossy formats (MP3 / OGG-Vorbis / FLAC-without-STREAMINFO) the
+  //    cap also bounds the per-decoded-buffer push, so the wall-time
+  //    cost of partial decode is bounded by `max_audio_seconds *
+  //    src_sr` worth of decoded f32 frames, not the full 256 MiB
+  //    load-stage ceiling.
+  //
+  //    Source-rate cap (NOT target-rate): a Codex R1 high finding
+  //    flagged that deriving the cap from the model's target sample
+  //    rate spuriously rejected valid auto-resample inputs whose
+  //    `src_sr > target_sr` (e.g. a 1.0 s 44.1 kHz WAV at a 16 kHz
+  //    model with `max_audio_seconds = 1.0` — declared 44 100 source
+  //    samples vs `target_sr * 1.0 = 16 000` cap). Probing the source
+  //    rate first and capping by `src_sr * max_audio_seconds` keeps
+  //    every input whose source duration is `<= max_audio_seconds`
+  //    decodable regardless of the model's resample target.
+  //    Closes the AUDIO-11 layered-cap gap.
+  //
+  // Snapshot the model's mel config ONCE (Codex #64 finding): the same
+  // `mc` drives the resample target rate (step 3) and the log-mel
+  // parameters (step 6). Calling `model.mel_config()` multiple times
+  // risks subtle skew if a model computes it dynamically. The load-
+  // stage cap is now source-rate-driven (handled inside
+  // `load_audio_with_max_seconds`), so `mc.sample_rate` no longer
+  // appears in the load-stage budget here.
+  let mc = model.mel_config();
+  let (samples, src_sr) = audio_io::load_audio_with_max_seconds(audio_path, cfg.max_audio_seconds)?;
 
   // 2. Duration cap — checked against the **source** duration (load_audio's
   //    `samples.len() / src_sr`) BEFORE resampling allocates a second
@@ -198,11 +221,13 @@ fn audio_path_to_mel<M: super::model::Model>(
     });
   }
 
-  // Snapshot the model's mel config ONCE (Codex #64 finding): it drives
-  // both the resample target rate (step 3) and the log-mel parameters
-  // (step 6). Calling `model.mel_config()` twice risks subtle skew if a
-  // model computes it dynamically, and duplicates the work.
-  let mc = model.mel_config();
+  // `mc` was snapshotted ONCE above (Codex #64 finding: calling
+  // `model.mel_config()` twice risks subtle skew if a model computes it
+  // dynamically, and duplicates the work). It drives the resample target
+  // rate (step 3) and the log-mel parameters (step 6). The load-stage
+  // cap is now source-rate-driven and lives inside
+  // `audio_io::load_audio_with_max_seconds`, so `mc.sample_rate` no
+  // longer participates in the load budget.
 
   // 3. Resample. `mc.sample_rate` is what the model's feature extractor
   //    was trained on; `resample_linear` is a verbatim copy when the

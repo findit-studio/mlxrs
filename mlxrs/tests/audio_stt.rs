@@ -362,7 +362,11 @@ fn stt_generate_rejects_sr_mismatch_when_resample_off() {
 
 /// `max_audio_seconds` cap: a 2-second WAV with a 1-second cap rejects
 /// **before** the mel-spec allocation (the encoder MUST NOT have been
-/// called).
+/// called). Post P7 #137: the WAV header rejects at the LOAD stage
+/// (`load_audio_with_cap` sees the container's declared sample count
+/// exceeds `max_audio_seconds * target_sr`), before any decoded buffer
+/// is allocated. The error variant is still recoverable
+/// [`mlxrs::Error::Backend`] and the encoder is still never called.
 #[test]
 fn stt_generate_rejects_audio_longer_than_max() {
   let path = make_wav("too_long", 16_000, 2 * ONE_SECOND_16K);
@@ -376,9 +380,15 @@ fn stt_generate_rejects_audio_longer_than_max() {
     .expect("over-cap audio rejected");
   match err {
     mlxrs::Error::Backend { message } => {
+      // Post P7 #137 layered cap: load-stage rejection fires for WAVs
+      // (the header is sample-exact); the STT-stage check remains the
+      // fallback for lossy formats. Accept EITHER message — both
+      // prove the encoder was bypassed.
+      let mentions_layered_cap = message.contains("max_audio_seconds")
+        || (message.contains("container declares") && message.contains("cap"));
       assert!(
-        message.contains("max_audio_seconds"),
-        "error mentions max_audio_seconds, got {message}"
+        mentions_layered_cap,
+        "error mentions either max_audio_seconds or the load-stage layered cap, got {message}"
       );
     }
     other => panic!("expected Backend error, got {other:?}"),
@@ -397,6 +407,13 @@ fn stt_generate_rejects_audio_longer_than_max() {
 /// at a 16 kHz-target model with a 1-second cap MUST reject without
 /// resampling. The encoder never being called is the proxy for the
 /// resample-then-reject path being closed.
+///
+/// Post P7 #137: the load-stage layered cap (`load_audio_with_cap`,
+/// invoked with `target_sr * max_audio_seconds = 16000` samples) is
+/// hit first because 88200 > 16000; the source WAV header is sample-
+/// exact, so the rejection fires at header parse before any buffer is
+/// allocated. The resample-then-reject path is still closed because
+/// the encoder is never called.
 #[test]
 fn stt_generate_rejects_over_cap_before_resample() {
   // 2 seconds of audio at 44.1 kHz: 88200 samples; target_sr = 16000.
@@ -412,15 +429,15 @@ fn stt_generate_rejects_over_cap_before_resample() {
     .expect("over-cap source rejected pre-resample");
   match err {
     mlxrs::Error::Backend { message } => {
+      // Post P7 #137 layered cap: either path proves the resample was
+      // skipped. Load-stage: container declares more samples than the
+      // load cap. STT-stage: source-duration check fires after load.
+      let load_layered = message.contains("container declares") && message.contains("cap");
+      let stt_max = message.contains("max_audio_seconds") && message.contains("44100");
       assert!(
-        message.contains("max_audio_seconds"),
-        "error mentions max_audio_seconds, got {message}"
-      );
-      // The message must reference the SOURCE sample rate to prove the
-      // check ran on the source duration, not the post-resample one.
-      assert!(
-        message.contains("44100"),
-        "error references the source sample_rate=44100, got {message}"
+        load_layered || stt_max,
+        "error mentions either the load-stage layered cap OR \
+         max_audio_seconds + source sample_rate 44100, got {message}"
       );
     }
     other => panic!("expected Backend error, got {other:?}"),
@@ -428,6 +445,50 @@ fn stt_generate_rejects_over_cap_before_resample() {
   assert!(
     model.last_mel_shape.borrow().is_none(),
     "encoder was NOT called (cap rejected BEFORE resample)"
+  );
+  let _ = fs::remove_file(&path);
+}
+
+/// P7 #137 (AUDIO-11): the STT pipeline now invokes
+/// `load_audio_with_cap(path, target_sr * max_audio_seconds)` so an
+/// oversized WAV header rejects at the LOAD stage, before the
+/// load-stage sample buffer is allocated. Verifies the load-layer
+/// error path explicitly (not the STT-layer fallback path covered
+/// above): the error message mentions `container declares` (load-
+/// stage origin) AND the rejection precedes the encoder call.
+///
+/// A 5-second 16 kHz WAV (80 000 samples) with `max_audio_seconds =
+/// 1.0` at a 16 kHz target model has `load_cap = 16_000`, so the
+/// declared 80 000-sample WAV header fires the load-stage layered
+/// cap with one `Error::Backend` and zero sample-buffer allocation.
+#[test]
+fn stt_generate_layered_cap_rejects_at_load_stage_for_wav() {
+  // 5 seconds @ 16 kHz = 80 000 samples; max_audio_seconds = 1.0,
+  // target_sr = 16 000 → load_cap = 16 000 < 80 000.
+  let path = make_wav("layered_cap_load_stage", 16_000, 5 * ONE_SECOND_16K);
+  let model = MockSttModel::new(3);
+  let cfg = SttGenConfig {
+    max_audio_seconds: 1.0,
+    ..SttGenConfig::default()
+  };
+  let err = stt_generate(&model, &path, cache(1), cfg)
+    .err()
+    .expect("layered cap must reject at load stage");
+  match err {
+    mlxrs::Error::Backend { message } => {
+      // Load-stage origin: `load_audio: container declares N samples
+      // (>M cap, ...)` — proves the rejection fired BEFORE any
+      // sample-buffer allocation.
+      assert!(
+        message.contains("container declares"),
+        "expected load-stage layered-cap error, got {message}"
+      );
+    }
+    other => panic!("expected Backend error, got {other:?}"),
+  }
+  assert!(
+    model.last_mel_shape.borrow().is_none(),
+    "encoder must not be called (layered cap rejected at load stage)"
   );
   let _ = fs::remove_file(&path);
 }
@@ -687,4 +748,69 @@ fn stt_gen_config_defaults_are_whisper_shape() {
   let c = SttGenConfig::default();
   assert!((c.max_audio_seconds - 30.0).abs() < 1e-6, "30s whisper cap");
   assert!(c.auto_resample, "auto_resample default = true");
+}
+
+/// Regression — Codex P7 R1 HIGH: the STT load cap must be derived from
+/// the **source** sample rate, not the model's target rate. A valid
+/// 1.0 s, 44.1 kHz WAV at a 16 kHz target model with
+/// `max_audio_seconds = 1.0` was previously rejected at the load stage
+/// because `load_cap = target_sr * max_audio_seconds = 16 000`
+/// undershot the WAV header's declared 44 100 source samples.
+///
+/// Post-fix: `audio_path_to_mel` invokes
+/// `load_audio_with_max_seconds(path, 1.0)` which probes the source
+/// sample rate first and computes `load_cap = 44 100 * 1.0 = 44 100`,
+/// so the 44 100-sample header passes the load-stage cap, the source-
+/// duration check (`1.0 s == 1.0 s`) passes, the resample pass runs
+/// down to 16 kHz, and the encoder receives a real mel.
+#[test]
+fn audio_path_to_mel_accepts_44_1k_wav_with_16k_model_resample() {
+  // 1.0 s @ 44.1 kHz = 44 100 samples. Default model = whisper-style at
+  // 16 kHz target. `max_audio_seconds = 1.0` makes the bug bite (pre-
+  // fix `load_cap = 16 000 < 44 100`, so the header would reject).
+  let path = make_wav("p7_r1_44k_16k_resample", 44_100, 44_100);
+  let model = MockSttModel::new(3);
+  let cfg = SttGenConfig {
+    lm: mlxrs::lm::generate::GenConfig {
+      max_tokens: 1,
+      ..mlxrs::lm::generate::GenConfig::default()
+    },
+    auto_resample: true,
+    max_audio_seconds: 1.0,
+  };
+
+  // Drive via `encode_audio_file` (the public proxy for
+  // `audio_path_to_mel` — same load + resample + log-mel chain, minus
+  // the decode loop). Pre-fix this returned `Err(Backend)` from the
+  // load-stage layered cap. Post-fix it returns `Ok(encoded)` and the
+  // encoder observes a `(80, T)` mel computed off the resampled 16 kHz
+  // samples (so T is the post-resample frame count, ~101 for 1 s at
+  // hop 160).
+  let enc = encode_audio_file(&model, &path, &cfg)
+    .expect("post-fix: 1.0 s 44.1 kHz WAV at 16 kHz model + 1.0 s cap must decode");
+  assert_eq!(
+    enc.shape(),
+    vec![1, 1, 1],
+    "MockSttModel::encode_audio returns the canned [1,1,1] state"
+  );
+  let mel_shape = model
+    .last_mel_shape
+    .borrow()
+    .clone()
+    .expect("encoder was called with a real mel (post-fix)");
+  assert_eq!(mel_shape.len(), 2, "(n_mels, T)");
+  assert_eq!(mel_shape[0], 80, "whisper-default n_mels");
+  // The mel T axis is the post-resample 16 kHz frame count. At 1 s
+  // 16 kHz mono with hop 160, T is ~101 frames. The 44.1 kHz no-resample
+  // count would be ~276 frames; anything < 200 proves we resampled down
+  // to 16 kHz BEFORE the mel — i.e. the load-stage source-rate cap let
+  // the file through and the existing resample step then ran.
+  assert!(
+    mel_shape[1] < 200,
+    "mel T={} must be the post-resample (16 kHz) frame count (~101), \
+     not the source-rate (44.1 kHz) frame count (~276); load-stage cap \
+     was source-rate-aware",
+    mel_shape[1]
+  );
+  let _ = fs::remove_file(&path);
 }

@@ -321,3 +321,74 @@ fn log_mel_spectrogram_default_matches_explicit_whisper() {
     );
   }
 }
+
+/// Regression — Codex P7 R1 MEDIUM: `mel_spectrogram` must call
+/// `mel_filter_bank_cached` (per-thread LRU bank cache) rather than the
+/// uncached `mel_filter_bank` constructor on the hot path. Pre-fix the
+/// cache was wired only into its own unit tests while `mel_spectrogram`
+/// (and every `log_mel_spectrogram` / `log_mel_spectrogram_with` / STT
+/// log-mel callsite that flows through it) kept rebuilding the bank on
+/// every call.
+///
+/// **Structural assertion** rather than a runtime-cache-hit observation:
+/// the `mel_filter_bank_cached` thread-local store is private to the
+/// module and the cached `Array` is value-equal to the uncached path
+/// (so a runtime hit/miss probe would have to reach into the cache
+/// internals — out of public-API scope). Reading the function body's
+/// source text instead pins the structural property — `mel_spectrogram`
+/// references `mel_filter_bank_cached` — without coupling to private
+/// state.
+#[test]
+fn mel_spectrogram_uses_cached_filter_bank_r1_structural() {
+  // Source of `mlxrs/src/audio/dsp.rs` — `include_str!` resolves
+  // relative to THIS test file at `mlxrs/tests/audio_dsp.rs`.
+  let src = include_str!("../src/audio/dsp.rs");
+
+  // Locate the `mel_spectrogram` definition. The matmul-and-return at
+  // the end (`ops::linalg_basic::matmul(&mel, &power_t)`) is the
+  // canonical terminator: every word from `pub fn mel_spectrogram(`
+  // through it is the function body.
+  let body_start = src
+    .find("pub fn mel_spectrogram(")
+    .expect("dsp.rs must define `pub fn mel_spectrogram(`");
+  let body_tail = &src[body_start..];
+  let body_end_rel = body_tail
+    .find("ops::linalg_basic::matmul(&mel, &power_t)")
+    .expect("mel_spectrogram body must terminate with the canonical matmul-return");
+  let body = &body_tail[..body_end_rel];
+
+  assert!(
+    body.contains("mel_filter_bank_cached("),
+    "Codex P7 R1 MEDIUM regression: `mel_spectrogram` must invoke \
+     `mel_filter_bank_cached(...)` (per-thread LRU cache), not the \
+     uncached `mel_filter_bank(...)`. Function body was:\n{body}"
+  );
+
+  // Belt-and-braces: no leftover uncached `mel_filter_bank(` call in
+  // the body. The literal `mel_filter_bank(` substring excludes the
+  // cached variant (`mel_filter_bank_cached(` has `_cached` between
+  // `bank` and `(`), so any match is necessarily an uncached call. A
+  // preceding-byte check rejects matches embedded in a longer
+  // identifier (`not_mel_filter_bank(` etc.) — the preceding byte must
+  // not be a Rust identifier continuation char.
+  let uncached_calls = body
+    .match_indices("mel_filter_bank(")
+    .filter(|(idx, _)| {
+      // Reject matches where the preceding byte is part of an
+      // identifier (so `not_mel_filter_bank(` is excluded as a
+      // different identifier).
+      if *idx == 0 {
+        return true;
+      }
+      let prev = body.as_bytes()[*idx - 1];
+      !(prev.is_ascii_alphanumeric() || prev == b'_')
+    })
+    .count();
+  assert_eq!(
+    uncached_calls, 0,
+    "Codex P7 R1 MEDIUM regression: `mel_spectrogram` body must NOT \
+     contain any direct `mel_filter_bank(` call; only the cached \
+     variant `mel_filter_bank_cached(` is allowed. Found {uncached_calls} \
+     uncached call(s).\nBody:\n{body}"
+  );
+}

@@ -146,9 +146,237 @@ pub const MAX_RESAMPLED_SAMPLES: usize = MAX_DECODED_SAMPLES;
 ///   uncompressed WAV's decoded sample count disagrees with its header,
 ///   or any sample is non-finite (NaN/inf in the decoded PCM).
 pub fn load_audio(path: &Path) -> Result<(Vec<f32>, u32)> {
+  load_audio_with_cap(path, MAX_DECODED_SAMPLES)
+}
+
+/// Decode `path` into an owned `Vec<f32>` like [`load_audio`], but reuse
+/// `out`'s pre-allocated capacity instead of allocating a fresh buffer.
+///
+/// **Buffer reuse for streaming / batch loaders.** A typical TTS dataset
+/// pre-allocates one `Vec<f32>` sized for the longest expected utterance
+/// and calls [`load_audio_into`] for each file — the destination's
+/// capacity is reused, so per-file `load_audio` allocations collapse to
+/// (at most) one growth when the cap is exceeded. `out` is cleared
+/// (`out.clear()`) before decoding; existing samples are discarded but
+/// the underlying capacity is retained. On any decode error `out`'s
+/// length is unspecified (it may carry partial decoded samples that
+/// should not be observed) — call `out.clear()` before retrying with a
+/// different file.
+///
+/// Mirrors [`load_audio`]'s validation and the
+/// [`MAX_DECODED_SAMPLES`] cap exactly; the only difference is the
+/// caller-owned destination buffer. The sample-rate return is the
+/// container-declared rate, same as [`load_audio`].
+///
+/// # Errors
+/// - Same as [`load_audio`].
+pub fn load_audio_into(path: &Path, out: &mut Vec<f32>) -> Result<u32> {
+  load_audio_into_with_cap(path, out, MAX_DECODED_SAMPLES)
+}
+
+/// Load a mono audio file enforcing `max_samples` BEFORE allocating the
+/// decoded sample buffer.
+///
+/// Layered-cap variant of [`load_audio`] for callers (e.g.
+/// `audio::stt::generate::stt_generate`) that need to reject an
+/// oversized input strictly **before** the load-stage allocation rather
+/// than after. The behavior is identical to [`load_audio`] except:
+///
+/// - The container-declared frame count (`Track::num_frames` for WAV /
+///   FLAC-with-STREAMINFO — the formats whose header carries an exact
+///   total) is rejected against `min(max_samples, MAX_DECODED_SAMPLES)`
+///   BEFORE the sample `Vec` is allocated. A 30-minute WAV with a
+///   30-second cap therefore never touches the 256 MiB load-stage
+///   ceiling — the rejection fires at the header-parse stage with one
+///   recoverable [`Error::Backend`].
+/// - The per-decoded-buffer cap (`reserve_under_cap` / `push_samples`)
+///   uses the same `min(max_samples, MAX_DECODED_SAMPLES)` so a
+///   compressed file lacking a declared frame count — MP3 Xing/Info
+///   under-estimate, OGG-Vorbis, FLAC without STREAMINFO — is still
+///   rejected mid-decode the moment `out.len()` would exceed
+///   `max_samples`. The wall-time cost of partial decode is bounded by
+///   `max_samples` worth of decoded f32 frames.
+///
+/// Passing `max_samples == usize::MAX` (or `>= MAX_DECODED_SAMPLES`) is
+/// equivalent to calling [`load_audio`] directly — the
+/// [`MAX_DECODED_SAMPLES`] global cap still applies.
+///
+/// # Errors
+/// - Same set as [`load_audio`], plus the early header-cap rejection
+///   above (also [`Error::Backend`]).
+pub fn load_audio_with_cap(path: &Path, max_samples: usize) -> Result<(Vec<f32>, u32)> {
+  let mut out: Vec<f32> = Vec::new();
+  let sample_rate = load_audio_into_with_cap(path, &mut out, max_samples)?;
+  Ok((out, sample_rate))
+}
+
+/// Duration-aware variant of [`load_audio_with_cap`] that derives the
+/// load-stage sample cap from the **source** file's own sample rate.
+///
+/// Mirrors [`load_audio_with_cap`] except the caller supplies a
+/// `max_seconds` budget instead of a raw sample count: the function
+/// probes the container's codec parameters to read the source sample
+/// rate, then enforces `max_samples = src_sr * max_seconds` (clamped to
+/// [`MAX_DECODED_SAMPLES`]) as the load-stage cap.
+///
+/// **Why source-rate, not target-rate.** A pipeline that downsamples
+/// (e.g. STT at a 16 kHz model with a 44.1 kHz source) cannot use
+/// `target_sr * max_seconds` as the load cap: a perfectly valid 1.0 s
+/// source carries `src_sr * 1.0 = 44 100` samples, but
+/// `target_sr * 1.0 = 16 000` would reject the header at the load
+/// stage. Deriving the cap from the source rate after probing keeps
+/// the cap consistent with the file's declared duration, so any input
+/// whose source duration is `<= max_seconds` decodes successfully
+/// regardless of the caller's downstream resample target rate.
+///
+/// Returns the same `(samples, source_sample_rate)` pair as
+/// [`load_audio_with_cap`] — the caller still resamples to its target
+/// rate (or asserts equality) after this returns.
+///
+/// `max_seconds` must be a positive finite `f32`; NaN, ±∞, zero, and
+/// negatives surface as [`Error::Backend`] before any file IO. The
+/// `src_sr * max_seconds` product is computed in `f64` (the load-stage
+/// `MAX_DECODED_SAMPLES` ceiling fits comfortably in the `f64`
+/// mantissa) and any out-of-range product saturates to `usize::MAX`
+/// per the Rust `as usize` spec, which is then clamped to
+/// [`MAX_DECODED_SAMPLES`].
+///
+/// **TOCTOU-free unified probe + decode.** The function opens the file
+/// EXACTLY ONCE (Codex R2 finding, severity medium): the probe pass that reads
+/// `src_sr` and the decode pass that produces samples share the same
+/// `File` handle / `FormatReader` / `Track`, so a path that is
+/// mutated, replaced, or symlink-swapped between the two phases
+/// cannot drift the cap from the decoded stream. Earlier prototypes
+/// re-opened the file for a probe-only `File::open` and then handed
+/// off to [`load_audio_with_cap`] (which re-opened a second time);
+/// that pattern let a high-rate probe authorize a much larger cap for
+/// a subsequent low-rate decode of a different file. The current
+/// implementation funnels through a single internal worker that
+/// derives `effective_cap` from the SAME `FormatReader` that drives
+/// the decode loop.
+///
+/// # Errors
+/// - [`Error::Backend`] if `max_seconds` is not a finite value > 0
+///   (NaN, ±∞, zero, negative).
+/// - Same set as [`load_audio_with_cap`] for the open / probe / decode
+///   pass (open / probe / no audio track / no codec params /
+///   multi-channel / header > cap / decode failure).
+pub fn load_audio_with_max_seconds(path: &Path, max_seconds: f32) -> Result<(Vec<f32>, u32)> {
+  // Validate the caller's duration cap up front (mirrors the STT
+  // pipeline's `max_audio_seconds` guard). `is_finite()` covers NaN
+  // and ±∞; `> 0.0` covers zero and negatives. Two positive guards
+  // avoid the `neg_cmp_op_on_partial_ord` clippy lint forbidding the
+  // negated-comparison shorthand on `f32`.
+  if !max_seconds.is_finite() || max_seconds <= 0.0 {
+    return Err(Error::Backend {
+      message: format!(
+        "load_audio_with_max_seconds: `max_seconds` must be a finite value > 0 (got {max_seconds})"
+      ),
+    });
+  }
+
+  // One open, one probe, one decode — the unified worker resolves the
+  // cap strategy to `effective_cap` AFTER reading `src_sr` from the same
+  // `FormatReader` it then decodes through.
+  let mut out: Vec<f32> = Vec::new();
+  let sr = load_audio_into_unified(path, &mut out, CapStrategy::SrcRateMaxSeconds(max_seconds))?;
+  Ok((out, sr))
+}
+
+/// Resolution strategy for the load-stage sample cap, threaded through
+/// [`load_audio_into_unified`] so a single open/probe pass serves both
+/// the explicit `max_samples` and the duration-derived
+/// `src_sr * max_seconds` paths.
+///
+/// Both variants are clamped to [`MAX_DECODED_SAMPLES`] inside the
+/// unified worker — the global ceiling is the hard upper bound and no
+/// caller-supplied strategy can raise it.
+#[derive(Debug, Clone, Copy)]
+enum CapStrategy {
+  /// Explicit caller-supplied sample cap. Used by [`load_audio_with_cap`]
+  /// and [`load_audio_into_with_cap`].
+  MaxSamples(usize),
+  /// Duration cap (in seconds) resolved AFTER probing the source sample
+  /// rate from the same `FormatReader` used for the decode loop. The
+  /// computed cap is `src_sr * max_seconds` (in `f64`, saturated to
+  /// `usize::MAX` per the `as usize` spec). Used by
+  /// [`load_audio_with_max_seconds`]. The `f32` payload must be a finite
+  /// value > 0 — the public entry point validates this before calling.
+  SrcRateMaxSeconds(f32),
+}
+
+/// Buffer-reusing + layered-cap variant of [`load_audio_into`].
+///
+/// Combines [`load_audio_into`] (reuse caller's `Vec`) with
+/// [`load_audio_with_cap`] (reject oversized inputs against
+/// `max_samples` BEFORE allocation). Used by streaming pipelines that
+/// need both a tight per-utterance cap AND a reused decode buffer
+/// across files — the worker behind [`load_audio_into`] and
+/// [`load_audio_with_cap`].
+///
+/// `out` is cleared before decoding; existing samples are discarded
+/// but the underlying capacity is retained. On any decode error
+/// `out`'s length is unspecified.
+///
+/// # Errors
+/// - Same as [`load_audio_with_cap`].
+pub fn load_audio_into_with_cap(
+  path: &Path,
+  out: &mut Vec<f32>,
+  max_samples: usize,
+) -> Result<u32> {
+  load_audio_into_unified(path, out, CapStrategy::MaxSamples(max_samples))
+}
+
+/// Unified open + probe + decode worker shared by every load-audio entry
+/// point.
+///
+/// **One `File::open` per call (Codex R2 TOCTOU fix).** Both the
+/// explicit-sample-cap path ([`CapStrategy::MaxSamples`]) and the
+/// duration-derived path ([`CapStrategy::SrcRateMaxSeconds`]) flow
+/// through this function: it opens `path` ONCE, probes the container
+/// ONCE, and runs the decode loop against the SAME `FormatReader` —
+/// no second `File::open` ever appears between the probe that reads
+/// `src_sr` and the decode that consumes the audio. An earlier
+/// implementation re-opened the path for a separate probe-only pass
+/// and then handed off to `load_audio_with_cap` (which opened it a
+/// third time); that pattern let a high-rate probe of `foo.wav`
+/// authorize a much larger cap for a low-rate decode of a different
+/// `foo.wav` whose contents had been swapped between opens. Funneling
+/// every entry through one open + one probe + one decode eliminates
+/// the TOCTOU window structurally.
+///
+/// **Cap resolution.** The strategy is resolved to `effective_cap`
+/// AFTER reading `sample_rate` from the same `FormatReader` that drives
+/// the decode loop:
+/// - `MaxSamples(n)` → `effective_cap = min(n, MAX_DECODED_SAMPLES)`.
+/// - `SrcRateMaxSeconds(s)` → `effective_cap = min(src_sr * s as
+///   usize, MAX_DECODED_SAMPLES)`, with the product computed in `f64`
+///   and saturated to `usize::MAX` per the `as usize` spec.
+///
+/// **Header cap policy (Codex R2 lossy-overestimate fix).** The
+/// container-declared `num_frames` is treated differently depending on
+/// `exact_count`:
+/// - **Exact-count formats** (WAV always, FLAC with STREAMINFO total):
+///   a `header_len > effective_cap` declaration is a hard upfront
+///   rejection — the count is sample-exact, so an over-cap declaration
+///   IS a file outside the budget.
+/// - **Estimate formats** (MP3 Xing/Info, OGG-Vorbis granule rounding):
+///   the header is an estimate that routinely overstates the true
+///   length, so an upfront rejection of `header_len > effective_cap`
+///   would reject perfectly valid in-cap audio. Instead, the
+///   reservation hint is clamped to `effective_cap` and the actual cap
+///   enforcement is left to the `push_samples` per-buffer guard, which
+///   decides based on real decoded sample count.
+///
+/// `out` is cleared before decoding (capacity retained); on any decode
+/// error `out`'s length is unspecified.
+fn load_audio_into_unified(path: &Path, out: &mut Vec<f32>, strategy: CapStrategy) -> Result<u32> {
   // Open + wrap in symphonia's MediaSourceStream. Box<File> is required by
   // the MediaSource trait; the allocation is one-per-load_audio (fine —
-  // file IO dominates the cost).
+  // file IO dominates the cost). THIS IS THE ONLY `File::open` IN THE
+  // WHOLE LOAD PATH — every cap strategy reads `src_sr` from this same
+  // handle, eliminating the probe-vs-decode TOCTOU window.
   let file = File::open(path).map_err(|e| Error::Backend {
     message: format!("load_audio: open {} failed: {e}", path.display()),
   })?;
@@ -213,8 +441,10 @@ pub fn load_audio(path: &Path) -> Result<(Vec<f32>, u32)> {
   // truncated FLAC that decodes fewer frames is real corruption. Lossy
   // codecs (MP3 Xing/Info, Vorbis) are NOT exact: their declared count
   // is an estimate, so they stay relaxed (hint-only) regardless. Drives
-  // both the hard cap (`cap` below) and the strict post-decode equality
-  // cross-check.
+  // (1) the upfront `header_len > effective_cap` REJECTION (only on
+  // exact-count — otherwise an over-estimate would spuriously fail a
+  // valid in-cap file), (2) the hard per-buffer `cap` ceiling, and
+  // (3) the strict post-decode equality cross-check.
   let exact_count = is_wav || (is_flac && track_num_frames.is_some());
 
   let codec_params = track.codec_params.as_ref().ok_or_else(|| Error::Backend {
@@ -252,6 +482,13 @@ pub fn load_audio(path: &Path) -> Result<(Vec<f32>, u32)> {
     message: format!("load_audio: {} has no sample_rate", path.display()),
   })?;
 
+  // Resolve the cap strategy to `effective_cap` USING THE SAME
+  // `sample_rate` JUST READ from the SAME `FormatReader` that drives
+  // the decode loop below. This is the Codex R2 TOCTOU fix: the
+  // duration-cap path no longer derives `src_sr` from a separate probe
+  // open whose decode could be a different file.
+  let effective_cap = strategy.resolve(sample_rate);
+
   let mut decoder = symphonia::default::get_codecs()
     .make_audio_decoder(audio_params, &AudioDecoderOptions::default())
     .map_err(|e| Error::Backend {
@@ -263,40 +500,53 @@ pub fn load_audio(path: &Path) -> Result<(Vec<f32>, u32)> {
   // `Vec::with_capacity` is infallible (aborts on allocator OOM), so we
   // fall back to `try_reserve_exact` against `MAX_DECODED_SAMPLES`.
   //
-  // - If the container declares `num_frames`, reject upfront if it
-  //   exceeds `MAX_DECODED_SAMPLES` — that rejection is format-agnostic
-  //   (a 10-GB-claiming MP3 header is refused exactly like a 10-GB WAV
-  //   header), since it bounds the *reservation* and a wildly oversized
-  //   declared length is never a valid file.
-  // - WAV: `num_frames` is sample-EXACT, so pre-reserve exactly that
-  //   much (one allocation per call; matches the prior hound-based path).
-  // - MP3 / FLAC / OGG-Vorbis: `num_frames` is an ESTIMATE (MP3
-  //   Xing/Info header) or subject to decoder delay/granule rounding.
-  //   It is used only as a capacity HINT — pre-reserve it (clamped to
-  //   the cap) to avoid reallocation churn, but the *hard* per-push
-  //   ceiling below is `MAX_DECODED_SAMPLES`, not the header value, so
-  //   a slight under-estimate does not spuriously fail a valid decode.
-  // - If the container omits `num_frames`, reserve 0 and grow lazily;
-  //   the per-push cap (`MAX_DECODED_SAMPLES` checked in `push_one`
-  //   below) bounds the allocation so an unbounded stream cannot exceed
-  //   the cap.
+  // Header-cap policy (Codex R2 lossy-overestimate fix):
+  // - **Exact-count formats** (WAV always, FLAC-with-STREAMINFO): a
+  //   `header_len > effective_cap` declaration is rejected upfront. The
+  //   count is sample-exact by construction, so an over-cap declaration
+  //   IS the file being outside the budget — no reason to start the
+  //   decode.
+  // - **Estimate formats** (MP3 Xing/Info, OGG-Vorbis granule rounding,
+  //   FLAC without STREAMINFO): the header is a *capacity hint*, not a
+  //   bound. MP3 Xing/Info routinely *overstates* the true decoded
+  //   length by encoder-delay/padding frames, so an upfront
+  //   `header_len > effective_cap` rejection would spuriously fail
+  //   perfectly valid in-cap audio. Instead the reservation hint below
+  //   is clamped to `effective_cap`, and the actual cap is enforced per
+  //   decoded buffer by `push_samples` using the REAL decoded count —
+  //   so an estimate-format file that genuinely exceeds the cap still
+  //   fails (mid-decode), but one that overstates an in-cap length
+  //   decodes successfully.
   let header_len_opt = track_num_frames.and_then(|n| usize::try_from(n).ok());
-  if let Some(header_len) = header_len_opt
-    && header_len > MAX_DECODED_SAMPLES
+  if exact_count
+    && let Some(header_len) = header_len_opt
+    && header_len > effective_cap
   {
     return Err(Error::Backend {
       message: format!(
-        "load_audio: container declares {header_len} samples (>{MAX_DECODED_SAMPLES} cap); \
-         refuse to allocate. Crafted/oversized inputs require a streaming \
-         decoder API (planned follow-up)."
+        "load_audio: container declares {header_len} samples (>{effective_cap} cap, \
+         min(max_samples, {MAX_DECODED_SAMPLES})); refuse to allocate. Oversized / \
+         crafted inputs require a streaming decoder API (planned follow-up). \
+         (Exact-count format: WAV or FLAC-with-STREAMINFO.)"
       ),
     });
   }
-  // For WAV the header count is the exact length; for compressed formats
-  // it is a hint clamped to the cap (it was already rejected above if it
-  // exceeded the cap, so this clamp is a belt-and-braces no-op there).
-  let reserve_len = header_len_opt.unwrap_or(0).min(MAX_DECODED_SAMPLES);
-  let mut out: Vec<f32> = Vec::new();
+  // Reservation hint — used by `try_reserve_exact` below to avoid
+  // reallocation churn during the decode loop. For exact-count formats
+  // this is the (already cap-checked) header length; for estimate
+  // formats this is the header's overestimate CLAMPED to `effective_cap`
+  // so a 10-minute MP3 Xing estimate paired with a 30-second cap
+  // reserves at most 30 seconds of samples upfront and lets the
+  // `push_samples` per-buffer cap reject mid-decode if the real length
+  // actually overshoots.
+  let reserve_len = header_len_opt.unwrap_or(0).min(effective_cap);
+  // Buffer-reuse path (`load_audio_into` / `load_audio_into_with_cap`):
+  // discard any prior contents but keep the caller's capacity. The
+  // subsequent `try_reserve_exact(reserve_len)` requests *additional*
+  // capacity beyond what `out` already has, so a generously-sized reused
+  // buffer skips the reservation entirely (the `try_reserve_exact` op
+  // is a no-op when `additional <= remaining capacity`).
+  out.clear();
   out
     .try_reserve_exact(reserve_len)
     .map_err(|e| Error::Backend {
@@ -307,18 +557,21 @@ pub fn load_audio(path: &Path) -> Result<(Vec<f32>, u32)> {
   // buffer by `push_samples`.
   // - Exact-count formats (WAV, FLAC-with-STREAMINFO-total): the header
   //   `num_frames` is sample-exact, so the cap is that count —
-  //   over-running it means a malformed/corrupt file.
+  //   over-running it means a malformed/corrupt file. Still clamped to
+  //   `effective_cap` so a caller-supplied tighter cap (e.g. the STT
+  //   pipeline's `max_audio_seconds * sample_rate`) does not raise the
+  //   effective ceiling.
   // - Lossy MP3 / OGG-Vorbis (and a FLAC without a declared total): the
   //   header count (if any) is only an estimate, so the cap is the
-  //   global `MAX_DECODED_SAMPLES` ceiling; using the estimate as a hard
-  //   cap would spuriously fail a valid file whose true length slightly
-  //   exceeds an under-estimating Xing/Info header.
+  //   `effective_cap` (= `min(max_samples, MAX_DECODED_SAMPLES)`); using
+  //   the estimate as a hard cap would spuriously fail a valid file whose
+  //   true length slightly exceeds an under-estimating Xing/Info header.
   // Reaching `cap` makes `push_samples` return `Error::Backend` rather
   // than re-grow into the infallible-alloc path.
   let cap = if exact_count {
-    header_len_opt.unwrap_or(MAX_DECODED_SAMPLES)
+    header_len_opt.unwrap_or(effective_cap).min(effective_cap)
   } else {
-    MAX_DECODED_SAMPLES
+    effective_cap
   };
 
   // Decode loop. End-of-stream is signalled by `Ok(None)` from
@@ -377,7 +630,9 @@ pub fn load_audio(path: &Path) -> Result<(Vec<f32>, u32)> {
     // `int16 / 32768.0` convention that we avoid by going through the
     // raw integer samples). MP3 / Vorbis decoders hand us an already-
     // decoded f32 buffer; that arm is pass-through.
-    push_samples(&audio_buf, &mut out, cap)?;
+    // `out` is already `&mut Vec<f32>`; auto-reborrow handles the
+    // call-site type without an explicit `&mut *out`.
+    push_samples(&audio_buf, out, cap)?;
   }
 
   // Cross-check decoded sample count against the header-declared length
@@ -411,7 +666,45 @@ pub fn load_audio(path: &Path) -> Result<(Vec<f32>, u32)> {
     });
   }
 
-  Ok((out, sample_rate))
+  Ok(sample_rate)
+}
+
+impl CapStrategy {
+  /// Resolve the strategy to a concrete `effective_cap` (in samples)
+  /// AFTER `sample_rate` has been read from the same `FormatReader`
+  /// that drives the decode loop. Both arms clamp at
+  /// [`MAX_DECODED_SAMPLES`] — no caller-supplied strategy can raise
+  /// the global ceiling.
+  fn resolve(self, sample_rate: u32) -> usize {
+    match self {
+      // The effective cap is the smaller of the caller's cap and the
+      // load-stage global ceiling. A caller can never raise the
+      // ceiling above `MAX_DECODED_SAMPLES`; passing `usize::MAX`
+      // simply degrades to the bare `load_audio` behavior.
+      Self::MaxSamples(n) => n.min(MAX_DECODED_SAMPLES),
+      Self::SrcRateMaxSeconds(max_seconds) => {
+        // Derive the load-stage sample cap from the SOURCE rate, so a
+        // valid `max_seconds`-long input always decodes regardless of
+        // the caller's downstream resample target. `f64` arithmetic
+        // avoids any overflow on a very large `src_sr * max_seconds`
+        // product; the result saturates to `usize::MAX` per the
+        // `as usize` spec when the product exceeds `usize::MAX as f64`,
+        // and we then clamp to `MAX_DECODED_SAMPLES`. The public
+        // `load_audio_with_max_seconds` entry point validated
+        // `max_seconds` is a finite value > 0 so the product is finite
+        // by construction; the defensive `is_finite()` guard here makes
+        // the saturation explicit if a future caller bypasses the
+        // public entry point.
+        let raw = f64::from(sample_rate) * f64::from(max_seconds);
+        let max_samples = if raw.is_finite() && raw >= 0.0 {
+          raw.min(usize::MAX as f64) as usize
+        } else {
+          MAX_DECODED_SAMPLES
+        };
+        max_samples.min(MAX_DECODED_SAMPLES)
+      }
+    }
+  }
 }
 
 /// Bound + reserve room for `n` more samples in `out` BEFORE appending
@@ -746,6 +1039,81 @@ fn push_samples(buf: &GenericAudioBufferRef<'_>, out: &mut Vec<f32>, cap: usize)
 ///   untouched (tempfile path is removed, original `path` contents
 ///   — if any — remain).
 pub fn save_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
+  // Allocate a fresh i16 scratch buffer; for the buffer-reuse path used
+  // by streaming / batch writers, see [`save_wav_into`].
+  let mut scratch: Vec<i16> = Vec::new();
+  save_wav_into(path, samples, sample_rate, &mut scratch)
+}
+
+/// Quantize `src` into the `MaybeUninit<i16>` slice via the C7 SIMD
+/// dispatcher (`simd::audio::quantize::f32_to_i16_quantize`): clip to
+/// `[-1, 1]`, multiply by `I16_MUL = 32767`, round-half-away-from-zero,
+/// cast to `i16`. The single-source-of-truth quantizer used by
+/// [`save_wav`] / [`save_wav_into`] and by future encoder writers
+/// (e.g. flac/opus, when those land per the module doc) so every
+/// destination format shares the same f32 → i16 conversion.
+///
+/// **Trait, not free function**, so a future encoder can keep its own
+/// `Quantizer<f32, i16>` (or `<f32, i24>`, `<f32, u8>`) instance
+/// without rewriting [`save_wav_into`]; the trait is the extension
+/// point.
+///
+/// # Contract
+/// - `dst.len() == src.len()` — one quantized output per input
+///   sample. The implementation MUST initialize every cell of `dst`
+///   before returning; callers may then `Vec::set_len(src.len())`.
+///   Panics on length mismatch (debug + release — the misuse is a
+///   caller bug, not a runtime input).
+pub trait Quantizer<Source, Target> {
+  /// Quantize `src` into `dst`. `dst.len() == src.len()`; the
+  /// implementation initializes every cell of `dst` before returning.
+  fn quantize_into(&self, dst: &mut [core::mem::MaybeUninit<Target>], src: &[Source]);
+}
+
+/// `f32` → `i16` quantizer used by [`save_wav`] / [`save_wav_into`] and
+/// the shared C7 SIMD path. Stateless newtype so the buffer-reuse
+/// helper's signature is `&dyn Quantizer<f32, i16>` (vs. a free fn
+/// taking a `&mut [MaybeUninit<i16>]`).
+///
+/// Wraps `simd::audio::quantize::f32_to_i16_quantize` (NEON 8-lane on
+/// aarch64, scalar fallback elsewhere); see that module's docs for the
+/// rounding mode (FCVTAS, ties away from zero — bit-exact match for
+/// `f32::round`).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct I16Quantizer;
+
+impl Quantizer<f32, i16> for I16Quantizer {
+  fn quantize_into(&self, dst: &mut [core::mem::MaybeUninit<i16>], src: &[f32]) {
+    crate::simd::audio::quantize::f32_to_i16_quantize(dst, src);
+  }
+}
+
+/// Write `samples` to `path` as a 16-bit mono WAV at `sample_rate`,
+/// reusing `scratch`'s pre-allocated capacity for the f32 → i16
+/// quantize buffer.
+///
+/// Mirrors [`save_wav`] (same atomic-rename + fsync + permission
+/// preservation + 256 MiB cap + NaN/inf rejection), but a streaming /
+/// batch writer can amortize the i16 scratch allocation across many
+/// `save_wav_into` calls by passing the same `&mut Vec<i16>` each
+/// time. The scratch is cleared (`scratch.clear()`) before writing;
+/// existing contents are discarded but the underlying capacity is
+/// retained. On any write error `scratch`'s length is unspecified;
+/// the destination is unaffected (the tempfile-then-rename invariant
+/// from [`save_wav`] holds here too).
+///
+/// `scratch` may be empty on the first call; subsequent calls reuse
+/// whatever capacity the previous call left (clamped to `samples.len()`
+/// for the next quantize).
+///
+/// # Errors
+/// - Same as [`save_wav`].
+pub fn save_wav_into(
+  path: &Path,
+  samples: &[f32],
+  sample_rate: u32,
+  scratch: &mut Vec<i16>,
+) -> Result<()> {
   if sample_rate == 0 {
     return Err(Error::Backend {
       message: "save_wav: sample_rate must be > 0".into(),
@@ -898,23 +1266,36 @@ pub fn save_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
     // has been written. Then a SINGLE `write_all` writes the entire
     // i16 byte view in one syscall — replacing the per-sample
     // BufWriter pushes.
-    let mut quantized: Vec<i16> = Vec::new();
-    quantized
+    // Reuse the caller-provided `scratch` for the i16 quantize buffer.
+    // `clear()` drops the prior contents but retains the allocated
+    // capacity, so a streaming caller (one `Vec<i16>` shared across
+    // many `save_wav_into` calls) pays one growth at the high-water
+    // mark and skips per-call allocations afterward. The shared C7
+    // quantizer dispatcher is invoked through the `Quantizer` trait
+    // so future encoder writers (flac/opus, when those land) reuse
+    // the same fused f32 → i16 path.
+    scratch.clear();
+    scratch
       .try_reserve_exact(samples.len())
       .map_err(|_| Error::OutOfMemory)?;
     {
-      let spare: &mut [core::mem::MaybeUninit<i16>] = quantized.spare_capacity_mut();
+      let spare: &mut [core::mem::MaybeUninit<i16>] = scratch.spare_capacity_mut();
       // `samples.len() <= spare.len()` because `try_reserve_exact(samples.len())`
-      // above reserved exactly that much capacity.
+      // above reserved exactly that much additional capacity.
       debug_assert!(spare.len() >= samples.len());
-      crate::simd::audio::quantize::f32_to_i16_quantize(&mut spare[..samples.len()], samples);
+      I16Quantizer.quantize_into(&mut spare[..samples.len()], samples);
     }
-    // SAFETY: `f32_to_i16_quantize` wrote every i16 in `0..samples.len()`
-    // of the spare capacity (function-level contract). `Vec::set_len`'s
-    // preconditions: (1) `samples.len() <= quantized.capacity()` — the
-    // `try_reserve_exact` succeeded; (2) elements at `[0..samples.len()]`
-    // are initialized — kernel contract guarantees this.
-    unsafe { quantized.set_len(samples.len()) };
+    // Rebind `quantized` to a local immutable view of the scratch (so
+    // the subsequent byte-view / write code reads naturally as
+    // "quantized samples", matching the prior `save_wav` body).
+    // SAFETY: `f32_to_i16_quantize` (via the `Quantizer` impl) wrote
+    // every i16 in `0..samples.len()` of the spare capacity (function-
+    // level contract). `Vec::set_len`'s preconditions: (1)
+    // `samples.len() <= scratch.capacity()` — the `try_reserve_exact`
+    // succeeded; (2) elements at `[0..samples.len()]` are initialized —
+    // kernel contract guarantees this.
+    unsafe { scratch.set_len(samples.len()) };
+    let quantized: &Vec<i16> = scratch;
 
     // Single bulk write of the entire i16 buffer as little-endian bytes.
     // `to_le` on i16 is a no-op on LE hosts (the common case) and a

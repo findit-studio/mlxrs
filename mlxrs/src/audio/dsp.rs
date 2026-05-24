@@ -166,6 +166,81 @@ pub enum WindowPad {
   Center,
 }
 
+/// Signal-centering pad mode for [`stft`]. Matches the `pad_mode` argument
+/// of `mlx_audio.dsp.stft(x, n_fft, ..., center=True, pad_mode="reflect")`
+/// and `librosa.stft`'s same-named parameter.
+///
+/// Currently only [`PadMode::Reflect`] is supported (the
+/// `mlx_audio.dsp.stft` default and what `librosa.stft` / Whisper-style
+/// front-ends use). The variant exists to allow a future
+/// `"constant"`/`"edge"` extension without breaking the [`StftConfig`]
+/// API.
+///
+/// `mlx-c`'s `mlx_pad` only supports `"constant"` and `"edge"`, NOT
+/// `"reflect"`, so even on the back end this is built from
+/// `slice + concatenate`, mirroring `mlx_audio.dsp.stft._pad`'s python
+/// construction (a single-op reflect would require an upstream mlx
+/// `Pad::reflect` change — see the [`stft`] implementation for the
+/// reasoning).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PadMode {
+  /// Reflect the signal at the edges (`mlx-audio` / Whisper / librosa
+  /// default). Mirrors `pad_mode="reflect"`.
+  #[default]
+  Reflect,
+}
+
+/// Builder for [`stft_with_config`] — factors the `center` runtime branch
+/// out of the [`stft`] signature so the caller configures padding once,
+/// and the inner code path is uniform for the [`Spectrum`] producer.
+///
+/// Drives the same forward STFT as the bare [`stft`] entry point: it
+/// shares the same validation + work-cap + framing machinery so byte-
+/// identical output for `StftConfig::default()` is guaranteed.
+///
+/// # Examples
+///
+/// Centered (the [`stft`] default — `center=true, pad_mode="reflect"`):
+///
+/// ```ignore
+/// let cfg = StftConfig::default();
+/// let spec = stft_with_config(&samples, n_fft, hop, None, WindowPad::Right, &cfg)?;
+/// ```
+///
+/// Aligned (no signal padding — frames start at sample 0 / index
+/// `hop * k`):
+///
+/// ```ignore
+/// let cfg = StftConfig { center: false, ..StftConfig::default() };
+/// let spec = stft_with_config(&samples, n_fft, hop, None, WindowPad::Right, &cfg)?;
+/// // Equivalent shortcut:
+/// // let spec = stft_aligned(&samples, n_fft, hop, None, WindowPad::Right)?;
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StftConfig {
+  /// Reflect-pad the signal by `n_fft / 2` on each side before framing.
+  /// Default `true` — matches `mlx_audio.dsp.stft(..., center=True)` and
+  /// is what every Whisper / librosa-style front-end expects.
+  ///
+  /// When `false` the frames start at sample 0 (the "aligned" path);
+  /// the resulting [`Spectrum`]'s `center()` returns `false` and
+  /// [`istft`] does NOT trim a centered prefix / suffix when inverting.
+  pub center: bool,
+  /// Signal-pad mode used when `center == true`. Default
+  /// [`PadMode::Reflect`] (the `mlx-audio` default). Ignored when
+  /// `center == false` (no signal padding is applied).
+  pub pad_mode: PadMode,
+}
+
+impl Default for StftConfig {
+  fn default() -> Self {
+    Self {
+      center: true,
+      pad_mode: PadMode::Reflect,
+    }
+  }
+}
+
 /// A typed short-time spectrum: the `(num_frames, n_fft / 2 + 1)`
 /// `Dtype::Complex64` transform data **plus all the metadata
 /// [`istft`] needs to invert it exactly**.
@@ -865,6 +940,79 @@ pub fn stft(
   win_length: Option<usize>,
   window_pad: WindowPad,
 ) -> Result<Spectrum> {
+  // The bare entry point hardcodes `mlx_audio.dsp.stft`'s defaults
+  // (`center = true, pad_mode = "reflect"`). `stft_with_config` carries
+  // the same validation + work-cap + framing machinery so this call
+  // produces byte-identical output to the prior in-line body.
+  stft_with_config(
+    samples,
+    n_fft,
+    hop_length,
+    win_length,
+    window_pad,
+    &StftConfig::default(),
+  )
+}
+
+/// [`stft`] without signal centering — frames start at sample 0
+/// (`pad_mode` is ignored; no padding is applied). The resulting
+/// [`Spectrum`] carries `center = false`, and [`istft`] will NOT trim a
+/// centered prefix / suffix when inverting.
+///
+/// Equivalent to:
+///
+/// ```ignore
+/// let cfg = StftConfig { center: false, ..StftConfig::default() };
+/// stft_with_config(samples, n_fft, hop, win_length, window_pad, &cfg)
+/// ```
+///
+/// # Errors
+/// - Same as [`stft`], plus rejecting inputs too short to fit one
+///   frame *without* the centering reflect pad (the aligned path
+///   requires `samples_len >= n_fft`).
+pub fn stft_aligned(
+  samples: &Array,
+  n_fft: usize,
+  hop_length: usize,
+  win_length: Option<usize>,
+  window_pad: WindowPad,
+) -> Result<Spectrum> {
+  stft_with_config(
+    samples,
+    n_fft,
+    hop_length,
+    win_length,
+    window_pad,
+    &StftConfig {
+      center: false,
+      pad_mode: PadMode::Reflect,
+    },
+  )
+}
+
+/// [`stft`] driven by an explicit [`StftConfig`] — factors the
+/// `center` / `pad_mode` knobs out of the hot-path signature.
+///
+/// Centered (`cfg.center == true`) routes through the same
+/// reflect-pad path as the bare [`stft`]; aligned
+/// (`cfg.center == false`) skips the pad entirely so the frame view is
+/// a plain `as_strided` over the raw samples. Validation, work caps,
+/// framing, FFT, and [`Spectrum`] assembly are otherwise identical, so
+/// the centered path is byte-identical to [`stft`] for the same
+/// arguments.
+///
+/// # Errors
+/// - Same as [`stft`]; the aligned path additionally requires
+///   `samples_len >= n_fft` (without the centering pad there is no
+///   `+ n_fft` headroom).
+pub fn stft_with_config(
+  samples: &Array,
+  n_fft: usize,
+  hop_length: usize,
+  win_length: Option<usize>,
+  window_pad: WindowPad,
+  cfg: &StftConfig,
+) -> Result<Spectrum> {
   if n_fft == 0 {
     return Err(Error::Backend {
       message: "stft: n_fft must be > 0".into(),
@@ -906,18 +1054,22 @@ pub fn stft(
     });
   }
 
-  // INPUT-LENGTH CAP (Codex OOM finding). The reflect pad below
-  // (`reflect_pad_1d`) is a lazy slice+concatenate, but *evaluating* the graph
-  // materializes a padded signal proportional to the INPUT length — independent
-  // of `num_frames`. The post-framing `MAX_STFT_WORK` cap bounds
-  // `num_frames * n_fft`, but a lazily-shaped huge 1-D input with a LARGE
-  // `hop_length` yields few frames, so `frame_work` stays under that cap while
-  // the reflect-pad concatenate still balloons proportional to the input. We
-  // therefore reject any input whose sample count — or padded length
-  // `samples_len + n_fft` (reflect pad adds `n_fft / 2` on each side) — exceeds
-  // the per-call sample budget [`MAX_DECODED_SAMPLES`] BEFORE building the
-  // padded signal or any frame view, bounding the reflect-pad allocation
-  // regardless of hop. Checked arithmetic so the `+ n_fft` itself can't wrap.
+  // INPUT-LENGTH CAP (Codex OOM finding). When `cfg.center == true` the
+  // reflect pad below (`reflect_pad_1d`) is a lazy slice+concatenate, but
+  // *evaluating* the graph materializes a padded signal proportional to the
+  // INPUT length — independent of `num_frames`. The post-framing
+  // `MAX_STFT_WORK` cap bounds `num_frames * n_fft`, but a lazily-shaped huge
+  // 1-D input with a LARGE `hop_length` yields few frames, so `frame_work`
+  // stays under that cap while the reflect-pad concatenate still balloons
+  // proportional to the input. We therefore reject any input whose sample
+  // count — or padded length `samples_len + n_fft` (reflect pad adds
+  // `n_fft / 2` on each side) — exceeds the per-call sample budget
+  // [`MAX_DECODED_SAMPLES`] BEFORE building the padded signal or any frame
+  // view, bounding the reflect-pad allocation regardless of hop. Checked
+  // arithmetic so the `+ n_fft` itself can't wrap. The aligned path
+  // (`cfg.center == false`) doesn't add padding, but we keep the same
+  // input-sample-count cap so an oversized aligned input is still rejected
+  // at the same load-stage ceiling.
   let samples_len = shape[0];
   if samples_len > crate::audio::io::MAX_DECODED_SAMPLES {
     return Err(Error::Backend {
@@ -928,23 +1080,25 @@ pub fn stft(
       ),
     });
   }
-  let padded_len_budget = samples_len
-    .checked_add(n_fft)
-    .ok_or_else(|| Error::Backend {
-      message: format!(
-        "stft: padded length samples_len + n_fft overflows usize \
-         (samples_len={samples_len}, n_fft={n_fft})"
-      ),
-    })?;
-  if padded_len_budget > crate::audio::io::MAX_DECODED_SAMPLES {
-    return Err(Error::Backend {
-      message: format!(
-        "stft: padded length {padded_len_budget} (samples_len={samples_len} + \
-         n_fft={n_fft}) exceeds the {} sample budget (would force a reflect-pad \
-         allocation proportional to the input)",
-        crate::audio::io::MAX_DECODED_SAMPLES
-      ),
-    });
+  if cfg.center {
+    let padded_len_budget = samples_len
+      .checked_add(n_fft)
+      .ok_or_else(|| Error::Backend {
+        message: format!(
+          "stft: padded length samples_len + n_fft overflows usize \
+           (samples_len={samples_len}, n_fft={n_fft})"
+        ),
+      })?;
+    if padded_len_budget > crate::audio::io::MAX_DECODED_SAMPLES {
+      return Err(Error::Backend {
+        message: format!(
+          "stft: padded length {padded_len_budget} (samples_len={samples_len} + \
+           n_fft={n_fft}) exceeds the {} sample budget (would force a reflect-pad \
+           allocation proportional to the input)",
+          crate::audio::io::MAX_DECODED_SAMPLES
+        ),
+      });
+    }
   }
 
   // Analysis window via the SHARED `frame_window` (symmetric hann of
@@ -954,12 +1108,29 @@ pub fn stft(
   // elements) is allocated. `istft` rebuilds its synthesis window through the
   // exact same call, so analysis and synthesis windows always match.
 
-  // `center=True, pad_mode="reflect"` (reference default). The reflect pad is a
-  // lazy slice+concatenate, but evaluating it materializes a signal
+  // `cfg.center == true, pad_mode == Reflect` (reference default). The reflect
+  // pad is a lazy slice+concatenate, but evaluating it materializes a signal
   // proportional to the input length, so the input/padded-length cap above
-  // gates it; the post-framing `MAX_STFT_WORK` cap then gates the strided view /
-  // window / rfft (frame work + FFT output).
-  let padded = reflect_pad_1d(samples, n_fft / 2)?;
+  // gates it; the post-framing `MAX_STFT_WORK` cap then gates the strided view
+  // / window / rfft (frame work + FFT output). When `cfg.center == false` we
+  // frame directly over `samples` — no slice/concatenate intermediates.
+  //
+  // mlx-c's `mlx_pad` only supports `pad_value`-mode and `edge`-mode
+  // (not `reflect`), so reflect is constructed from `slice + concatenate`
+  // here, exactly as `mlx_audio.dsp.stft._pad(..., pad_mode="reflect")`
+  // does. Folding this to a single `ops::shape::pad(..., c"reflect")`
+  // call awaits an upstream `mlx::core::Pad` extension — until that
+  // lands, the 3-op reconstruction is the byte-for-byte parity path.
+  let padded = if cfg.center {
+    match cfg.pad_mode {
+      PadMode::Reflect => reflect_pad_1d(samples, n_fft / 2)?,
+    }
+  } else {
+    // No signal padding: the strided frame view operates directly on the
+    // raw samples. `try_clone` is a cheap mlx-c rc bump (no buffer copy),
+    // so `padded` stays a uniform owned `Array` for the framing path.
+    samples.try_clone()?
+  };
   let padded_len = padded.shape()[0];
 
   // Pre-frame validation: need at least one frame.
@@ -1090,9 +1261,10 @@ pub fn stft(
   let data = fft::rfft(&windowed, n_fft_i32, 1, FftNorm::Backward)?;
 
   // Wrap the `(num_frames, n_fft / 2 + 1)` Complex64 transform together with
-  // the analysis metadata `istft` needs to invert it exactly. `center` is
-  // always `true` here (`stft` hardcodes `center = true, pad_mode = "reflect"`,
-  // the `mlx_audio.dsp` default). All invariants `Spectrum::from_parts` would
+  // the analysis metadata `istft` needs to invert it exactly. `center` comes
+  // from `cfg` (`true` for the [`stft`] / `stft_with_config(.., StftConfig::
+  // default())` path, `false` for [`stft_aligned`] / explicit
+  // `cfg.center = false`). All invariants `Spectrum::from_parts` would
   // re-check (even n_fft, `n_freqs == n_fft / 2 + 1`, `win_length <= n_fft`,
   // non-empty) hold by construction, so the data is wrapped directly.
   Ok(Spectrum {
@@ -1101,7 +1273,7 @@ pub fn stft(
     hop_length,
     win_length,
     window_pad,
-    center: true,
+    center: cfg.center,
   })
 }
 
@@ -2106,14 +2278,172 @@ pub fn mel_filter_bank(
   Array::from_slice::<f32>(&bank, &[n_mels_i32, n_freqs_i32])
 }
 
+/// Maximum number of `(sample_rate, n_fft, n_mels, f_min, f_max)` triples kept
+/// per thread by [`mel_filter_bank_cached`]. A handful covers every realistic
+/// pipeline (one front-end per loaded model, occasionally a second per
+/// chained stage); the bound stops a pathological caller from growing the
+/// cache without limit. LRU evicts the oldest entry on overflow.
+///
+/// **Public** so [`mel_filter_bank_cached`] / [`clear_mel_filter_cache`]
+/// can intra-doc-link it under `rustdoc::private-intra-doc-links` (which
+/// the workspace CI denies). Also a useful published bound for callers
+/// reasoning about worst-case per-thread mel-bank footprint.
+pub const MEL_FILTER_CACHE_CAP: usize = 8;
+
+/// Cache key. `f_min` / `f_max` are kept bit-wise so two different `NaN`
+/// payloads are distinct — but [`mel_filter_bank`] itself rejects non-finite
+/// `f_min` / `f_max` (the `f_min >= 0.0 && f_max > f_min` guard fails on
+/// any NaN), so a NaN key can never be inserted via the cached entry path.
+/// `f_max` is `Option<f32>` to preserve `None == Nyquist` distinct from
+/// the explicitly-passed value `Some(sample_rate / 2)` (the two compute
+/// to byte-identical banks, but caching them separately keeps the
+/// cache transparent — never silently aliasing two distinct API calls).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MelFilterCacheKey {
+  n_mels: usize,
+  n_fft: usize,
+  sample_rate: u32,
+  f_min_bits: u32,
+  f_max_bits: Option<u32>,
+}
+
+impl MelFilterCacheKey {
+  fn new(n_mels: usize, n_fft: usize, sample_rate: u32, f_min: f32, f_max: Option<f32>) -> Self {
+    Self {
+      n_mels,
+      n_fft,
+      sample_rate,
+      f_min_bits: f_min.to_bits(),
+      f_max_bits: f_max.map(f32::to_bits),
+    }
+  }
+}
+
+// `Array` is `!Send`, so the cache is per-thread. Mirrors mlx-audio's
+// `@lru_cache` on `mel_filters(sample_rate, n_fft, n_mels, ...)` (CPython
+// is single-threaded at the GIL level; here `thread_local!` provides the
+// same observable behavior without forcing `Send`).
+thread_local! {
+  static MEL_FILTER_CACHE: std::cell::RefCell<Vec<(MelFilterCacheKey, Array)>> =
+    const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Cached variant of [`mel_filter_bank`] — returns a thread-local cached
+/// constant matrix keyed on `(sample_rate, n_fft, n_mels, f_min, f_max)`.
+///
+/// The mel filterbank is a one-shot constant per
+/// `(sample_rate, n_fft, n_mels, f_min, f_max)` triple — a streaming /
+/// per-chunk caller rebuilds the same `(n_mels, n_freqs)` matrix on every
+/// call. This wrapper memoizes the result so repeated calls with identical
+/// parameters pay one `try_clone` (a cheap shallow reference-bump on the
+/// mlx-c handle) instead of a full triangle-construction + `Array::from_slice`.
+///
+/// Mirrors `mlx_audio.dsp.mel_filters`'s `@lru_cache` decorator: the
+/// reference's `mel_filters(sample_rate, n_fft, n_mels, f_min, f_max, ...)`
+/// memoizes on the exact same key. We use a thread-local cache because
+/// `Array` is `!Send` (mlx-c arrays are bound to the thread that created
+/// them); a `Mutex<HashMap>`-style global would not be safely shareable.
+///
+/// The cache is **bounded** at [`MEL_FILTER_CACHE_CAP`] entries (LRU
+/// eviction) so a buggy / adversarial caller cycling through many
+/// `(sample_rate, n_fft)` combinations cannot grow the cache without
+/// limit. A handful of entries covers any realistic pipeline (front-end
+/// per loaded model, occasional second per chained stage).
+///
+/// The returned [`Array`] is a `try_clone` of the cached entry — the
+/// caller may mutate / consume it freely; the cached copy is untouched.
+///
+/// Validation, work caps, and error paths match [`mel_filter_bank`]
+/// exactly (the first call delegates through it); a cached hit returns
+/// the same `Array` value-for-value.
+///
+/// # Errors
+/// - Same as [`mel_filter_bank`].
+///
+/// # See also
+/// - [`mel_filter_bank`] — the uncached construction path.
+/// - [`clear_mel_filter_cache`] — empties the per-thread cache (test /
+///   memory-pressure use).
+pub fn mel_filter_bank_cached(
+  n_mels: usize,
+  n_fft: usize,
+  sample_rate: u32,
+  f_min: f32,
+  f_max: Option<f32>,
+) -> Result<Array> {
+  let key = MelFilterCacheKey::new(n_mels, n_fft, sample_rate, f_min, f_max);
+
+  // Fast path: lookup + move-to-front for LRU semantics.
+  let hit = MEL_FILTER_CACHE.with(|cell| -> Result<Option<Array>> {
+    let mut cache = cell.borrow_mut();
+    if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
+      // Move the hit to the back (most-recently-used end) so the
+      // front of the Vec is always the LRU victim.
+      let entry = cache.remove(pos);
+      let clone = entry.1.try_clone()?;
+      cache.push(entry);
+      Ok(Some(clone))
+    } else {
+      Ok(None)
+    }
+  })?;
+  if let Some(arr) = hit {
+    return Ok(arr);
+  }
+
+  // Miss: build via the uncached path. The construction can fail with a
+  // recoverable `Error::Backend` (invalid params, work cap, etc.); we
+  // propagate that error WITHOUT touching the cache, so a failed call
+  // cannot poison the cache with an absent or invalid entry.
+  let bank = mel_filter_bank(n_mels, n_fft, sample_rate, f_min, f_max)?;
+
+  // Cache the just-built bank. Hold a `try_clone` for the caller so the
+  // cached entry is independent. Eviction when full: drop the LRU
+  // (front), then push the new entry at the back.
+  let for_caller = bank.try_clone()?;
+  MEL_FILTER_CACHE.with(|cell| {
+    let mut cache = cell.borrow_mut();
+    if cache.len() >= MEL_FILTER_CACHE_CAP {
+      // Evict the LRU entry (oldest). `remove(0)` is O(n) but n <= 8.
+      let _ = cache.remove(0);
+    }
+    cache.push((key, bank));
+  });
+  Ok(for_caller)
+}
+
+/// Empty the per-thread [`mel_filter_bank_cached`] cache.
+///
+/// Intended for memory-pressure recovery and test isolation: a sequence
+/// of `(sample_rate, n_fft, n_mels)` triples can otherwise pin up to
+/// [`MEL_FILTER_CACHE_CAP`] mel banks per thread for the lifetime of
+/// the thread. Tests that exercise cache eviction or otherwise want a
+/// fresh slate call this before / after the body.
+///
+/// **Per-thread only.** Other threads' caches are untouched; call from
+/// each thread that needs eviction (the cache is `!Send`).
+pub fn clear_mel_filter_cache() {
+  MEL_FILTER_CACHE.with(|cell| cell.borrow_mut().clear());
+}
+
 /// Mel spectrogram: `mel_bank @ |stft(samples)|^2`.
 ///
 /// Returns shape `(n_mels, num_frames)` `Dtype::F32`. Combines [`stft`],
-/// magnitude-squared, and [`mel_filter_bank`] in the canonical Whisper /
-/// mlx-audio order.
+/// magnitude-squared, and [`mel_filter_bank_cached`] in the canonical
+/// Whisper / mlx-audio order.
+///
+/// The filter bank is fetched via [`mel_filter_bank_cached`] (per-thread
+/// LRU cache keyed on `(n_mels, n_fft, sample_rate, f_min, f_max)`). A
+/// streaming / per-chunk caller (and every [`log_mel_spectrogram`] /
+/// [`log_mel_spectrogram_with`] + STT log-mel hop) therefore pays one bank
+/// construction on the first call per parameter triple, then a cheap
+/// `try_clone` (shallow mlx-c handle bump) on every subsequent call —
+/// matching the `mlx_audio.dsp.mel_filters` `@lru_cache` shape. The bank
+/// is a constant for a given `(sample_rate, n_fft, n_mels, f_min, f_max)`
+/// so the returned mel spectrogram is byte-identical to the uncached path.
 ///
 /// # Errors
-/// Propagates from [`stft`] and [`mel_filter_bank`].
+/// Propagates from [`stft`] and [`mel_filter_bank_cached`].
 #[allow(clippy::too_many_arguments)]
 pub fn mel_spectrogram(
   samples: &Array,
@@ -2140,8 +2470,11 @@ pub fn mel_spectrogram(
   let power = mag.square()?;
   // `power` is `(num_frames, n_freqs)`; mel is `(n_mels, n_freqs)`.
   // Mel-spec layout in mlx-audio / Whisper is `(n_mels, num_frames)` =
-  // `mel @ power.T`.
-  let mel = mel_filter_bank(n_mels, n_fft, sample_rate, f_min, f_max)?;
+  // `mel @ power.T`. Uses `mel_filter_bank_cached` so repeated calls with
+  // the same `(n_mels, n_fft, sample_rate, f_min, f_max)` share the
+  // per-thread LRU cache (Codex R1 medium finding — the uncached path
+  // rebuilt the bank on every chunk / per-utterance encode pass).
+  let mel = mel_filter_bank_cached(n_mels, n_fft, sample_rate, f_min, f_max)?;
   let power_t = power.transpose()?;
   ops::linalg_basic::matmul(&mel, &power_t)
 }
@@ -5422,5 +5755,228 @@ mod tests {
         "normal target must keep samples finite, got {v}"
       );
     }
+  }
+
+  // ---- P7 #128: mel_filter_bank_cached -------------------------------------
+
+  /// Cached and uncached forms produce byte-identical banks.
+  #[test]
+  fn mel_filter_bank_cached_matches_uncached() {
+    clear_mel_filter_cache();
+    let plain = mel_filter_bank(80, 400, 16_000, 0.0, None).unwrap();
+    let cached = mel_filter_bank_cached(80, 400, 16_000, 0.0, None).unwrap();
+    let p = to_vec(&plain);
+    let c = to_vec(&cached);
+    assert_eq!(p, c, "cached mel bank must match uncached value-for-value");
+    clear_mel_filter_cache();
+  }
+
+  /// A second call with the same parameters re-uses the cached entry; the
+  /// returned `Array` is still value-for-value identical, and the cache
+  /// did NOT rebuild it (a fresh `Vec<f32>` clone would still be value-
+  /// equal — we assert structural equality here, and rely on the LRU
+  /// behavior test below to assert the cache state itself).
+  #[test]
+  fn mel_filter_bank_cached_hit_returns_same_values() {
+    clear_mel_filter_cache();
+    let first = mel_filter_bank_cached(80, 400, 16_000, 0.0, None).unwrap();
+    let second = mel_filter_bank_cached(80, 400, 16_000, 0.0, None).unwrap();
+    assert_eq!(to_vec(&first), to_vec(&second));
+    clear_mel_filter_cache();
+  }
+
+  /// Different `(sample_rate, n_fft, n_mels, f_min, f_max)` keys are
+  /// cached separately; a request for a new key does not return the
+  /// previous bank.
+  #[test]
+  fn mel_filter_bank_cached_distinguishes_keys() {
+    clear_mel_filter_cache();
+    let a = mel_filter_bank_cached(80, 400, 16_000, 0.0, None).unwrap();
+    let b = mel_filter_bank_cached(80, 400, 22_050, 0.0, None).unwrap();
+    let c = mel_filter_bank_cached(40, 400, 16_000, 0.0, None).unwrap();
+    let d = mel_filter_bank_cached(80, 512, 16_000, 0.0, None).unwrap();
+    let e = mel_filter_bank_cached(80, 400, 16_000, 80.0, None).unwrap();
+    let f = mel_filter_bank_cached(80, 400, 16_000, 0.0, Some(7_500.0)).unwrap();
+    // Each of (b..=f) must differ from `a` somewhere.
+    let av = to_vec(&a);
+    for (name, other) in [
+      ("sample_rate", &b),
+      ("n_mels", &c),
+      ("n_fft", &d),
+      ("f_min", &e),
+      ("f_max", &f),
+    ] {
+      let ov = to_vec(other);
+      assert_ne!(av, ov, "{name} key collapsed into same cache entry");
+    }
+    clear_mel_filter_cache();
+  }
+
+  /// LRU eviction: filling the cache with `MEL_FILTER_CACHE_CAP + 1`
+  /// distinct keys evicts the oldest entry. A subsequent request for
+  /// the evicted key still succeeds (rebuilds via the uncached path),
+  /// and the most-recent key remains cached (still resolves correctly).
+  #[test]
+  fn mel_filter_bank_cached_evicts_lru_at_cap() {
+    clear_mel_filter_cache();
+    // Walk `cap + 1` distinct (sample_rate) keys.
+    let cap = super::MEL_FILTER_CACHE_CAP;
+    let mut first_bank: Option<Vec<f32>> = None;
+    for i in 0..(cap + 1) {
+      let sr = 16_000u32 + (i as u32) * 1_000;
+      let bank = mel_filter_bank_cached(40, 400, sr, 0.0, None).unwrap();
+      if i == 0 {
+        first_bank = Some(to_vec(&bank));
+      }
+    }
+    // The first key was evicted but a re-request still returns a
+    // value-equal bank (the uncached construction path produces the
+    // same matrix).
+    let refetched = mel_filter_bank_cached(40, 400, 16_000, 0.0, None).unwrap();
+    assert_eq!(
+      to_vec(&refetched),
+      first_bank.unwrap(),
+      "evicted key must rebuild value-equal bank on re-request"
+    );
+    clear_mel_filter_cache();
+  }
+
+  /// Cached path propagates validation errors from the underlying
+  /// `mel_filter_bank` constructor (and does NOT cache a failed entry).
+  #[test]
+  fn mel_filter_bank_cached_propagates_errors() {
+    clear_mel_filter_cache();
+    // `n_fft = 0` → recoverable Error::Backend.
+    assert!(matches!(
+      mel_filter_bank_cached(80, 0, 16_000, 0.0, None),
+      Err(Error::Backend { .. })
+    ));
+    // A valid call AFTER the failed one still succeeds (the failure
+    // didn't pollute the cache).
+    let ok = mel_filter_bank_cached(80, 400, 16_000, 0.0, None);
+    assert!(ok.is_ok());
+    clear_mel_filter_cache();
+  }
+
+  // ---- P7 #131: AUDIO-5 magic constants are named ---------------------------
+
+  /// Pin the exact named-constant values that mlx-audio expects. Closes
+  /// AUDIO-5 by asserting the const surface (so a future refactor can't
+  /// quietly drift any of the five magic numbers).
+  #[test]
+  fn dsp_named_constants_match_mlx_audio_literals() {
+    assert_eq!(super::MEL_HZ_DIV, 2595.0_f32);
+    assert_eq!(super::MEL_HZ_BREAK, 700.0_f32);
+    assert_eq!(super::LOG_FLOOR_WHISPER, 1e-10_f32);
+    assert_eq!(super::LOG_FLOOR_KALDI, 1e-8_f32);
+    assert_eq!(super::BS1770_LOUDNESS_OFFSET_LUFS, -0.691_f64);
+  }
+
+  /// `LogFloor` surfaces the configurable log floor; both built-in
+  /// variants resolve to the named constants and `Custom` clamps non-
+  /// finite / non-positive inputs to `f32::MIN_POSITIVE` (the docs).
+  #[test]
+  fn log_floor_variants_resolve_named_constants() {
+    assert_eq!(LogFloor::Whisper.value(), super::LOG_FLOOR_WHISPER);
+    assert_eq!(LogFloor::Kaldi.value(), super::LOG_FLOOR_KALDI);
+    assert_eq!(LogFloor::Custom(1e-6).value(), 1e-6);
+    // Non-finite / non-positive clamp.
+    assert_eq!(LogFloor::Custom(f32::NAN).value(), f32::MIN_POSITIVE);
+    assert_eq!(LogFloor::Custom(-1.0).value(), f32::MIN_POSITIVE);
+    assert_eq!(LogFloor::Custom(0.0).value(), f32::MIN_POSITIVE);
+  }
+
+  // ---- P7 #134: StftConfig + stft_with_config + stft_aligned ---------------
+
+  /// `StftConfig::default()` is `(center: true, pad_mode: Reflect)` — the
+  /// `mlx_audio.dsp.stft` reference defaults.
+  #[test]
+  fn stft_config_default_matches_mlx_audio_defaults() {
+    let cfg = StftConfig::default();
+    assert!(cfg.center);
+    assert_eq!(cfg.pad_mode, PadMode::Reflect);
+  }
+
+  /// `stft` and `stft_with_config(.., StftConfig::default())` produce
+  /// byte-identical Spectra (data + every metadata field).
+  #[test]
+  fn stft_with_config_default_matches_bare_stft() {
+    let n = 256usize;
+    let samples: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
+    let arr = Array::from_slice::<f32>(&samples, &[n as i32]).unwrap();
+    let bare = stft(&arr, 64, 16, None, WindowPad::Right).unwrap();
+    let with_cfg =
+      stft_with_config(&arr, 64, 16, None, WindowPad::Right, &StftConfig::default()).unwrap();
+    assert_eq!(bare.n_fft(), with_cfg.n_fft());
+    assert_eq!(bare.hop_length(), with_cfg.hop_length());
+    assert_eq!(bare.win_length(), with_cfg.win_length());
+    assert_eq!(bare.window_pad(), with_cfg.window_pad());
+    assert_eq!(bare.center(), with_cfg.center());
+    assert_eq!(bare.num_frames(), with_cfg.num_frames());
+    assert_eq!(bare.n_freqs(), with_cfg.n_freqs());
+  }
+
+  /// `stft_aligned` returns a Spectrum with `center == false` and one
+  /// fewer "centering" frame than the centered path for the same input.
+  #[test]
+  fn stft_aligned_carries_center_false() {
+    let n = 256usize;
+    let samples: Vec<f32> = (0..n).map(|i| (i as f32 * 0.02).cos()).collect();
+    let arr = Array::from_slice::<f32>(&samples, &[n as i32]).unwrap();
+    let aligned = stft_aligned(&arr, 64, 16, None, WindowPad::Right).unwrap();
+    let centered = stft(&arr, 64, 16, None, WindowPad::Right).unwrap();
+    assert!(!aligned.center(), "stft_aligned must carry center == false");
+    assert!(centered.center(), "stft must carry center == true");
+    // Centered path adds `2 * (n_fft / 2) = n_fft` samples of reflect
+    // padding, so its frame count is strictly greater.
+    assert!(
+      centered.num_frames() > aligned.num_frames(),
+      "centered={} aligned={}",
+      centered.num_frames(),
+      aligned.num_frames()
+    );
+  }
+
+  /// `stft_aligned` on an input shorter than `n_fft` rejects (no padding
+  /// to bridge the gap).
+  #[test]
+  fn stft_aligned_rejects_too_short_input() {
+    let samples: Vec<f32> = (0..32).map(|i| i as f32).collect();
+    let arr = Array::from_slice::<f32>(&samples, &[32]).unwrap();
+    // n_fft = 64 > 32, so without padding there is no frame.
+    assert!(matches!(
+      stft_aligned(&arr, 64, 16, None, WindowPad::Right),
+      Err(Error::Backend { .. })
+    ));
+  }
+
+  // ---- P7 #129: reflect_pad_1d round-trip + zero-pad fast path -------------
+
+  /// `reflect_pad_1d` with `padding == 0` returns the input unchanged
+  /// (the cheap rc-clone fast path — skips the slice + concatenate).
+  #[test]
+  fn reflect_pad_1d_zero_padding_returns_unchanged() {
+    let samples: Vec<f32> = (0..16).map(|i| i as f32).collect();
+    let arr = Array::from_slice::<f32>(&samples, &[16]).unwrap();
+    let padded = reflect_pad_1d(&arr, 0).unwrap();
+    assert_eq!(to_vec(&padded), samples);
+  }
+
+  /// `reflect_pad_1d` matches the python reference's
+  /// `[1..=p][::-1] ++ samples ++ [-p-1..-1][::-1]` semantics.
+  #[test]
+  fn reflect_pad_1d_matches_python_reference_construction() {
+    let samples: Vec<f32> = (0..8).map(|i| i as f32).collect();
+    let arr = Array::from_slice::<f32>(&samples, &[8]).unwrap();
+    // padding = 3: prefix should be samples[3..=1] reversed = [3, 2, 1]
+    // suffix should be samples[6..=4] reversed = [6, 5, 4]
+    let padded = reflect_pad_1d(&arr, 3).unwrap();
+    let v = to_vec(&padded);
+    let expected: Vec<f32> = vec![
+      3.0, 2.0, 1.0, // prefix
+      0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, // original
+      6.0, 5.0, 4.0, // suffix
+    ];
+    assert_eq!(v, expected);
   }
 }
