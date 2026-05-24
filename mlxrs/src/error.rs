@@ -453,8 +453,40 @@ extern "C" fn handler(msg: *const c_char, _data: *mut c_void) {
     let s = unsafe { CStr::from_ptr(msg) }
       .to_string_lossy()
       .into_owned();
+    // Preserve a trampoline-set user error against mlx-c's generic
+    // closure-non-zero wrapper. When a [`crate::transforms::closure`]
+    // trampoline returns a non-zero rc, mlx-c's C++ wrappers (see
+    // vendored `mlx-c/mlx/c/closure.cpp` lines 50, 83, 122, 188, 233,
+    // 310, 357, 448, 495, 587, 638, 730, 784) throw
+    // `std::runtime_error("mlx_closure...returned a non-zero value")`,
+    // caught by the outer `mlx_closure*_apply` (or
+    // `mlx_value_and_grad` / `mlx_vjp` / `mlx_jvp` / `mlx_custom_vjp` /
+    // …) and surfaced via `mlx_error(e.what())` — which invokes this
+    // handler. Without the preserve check below, that generic message
+    // would overwrite the user's actual error (the trampoline already
+    // called [`set_last`] with the user's `Err` or panic message before
+    // returning the non-zero rc), and callers would see
+    // "mlx_closure returned a non-zero value" instead of their own
+    // error / panic payload.
+    //
+    // The wrapper messages all share the shape
+    // `mlx_closure[_kind] returned a non-zero value at <file>:<line>`
+    // — mlx-c surfaces them via `mlx_error(e.what())` where `e.what()`
+    // includes the C++ source location suffix appended by the
+    // `std::runtime_error` thrown at vendored
+    // `mlx-c/mlx/c/closure.cpp` lines 50, 83, 122, 188, 233, 310, 357,
+    // 448, 495, 587, 638, 730, 784. Match on the common prefix +
+    // load-bearing inner phrase (NOT `ends_with`, since the trailing
+    // `at <file>:<line>` varies by build root) so every variant is
+    // covered without an explicit enumeration of the kinds.
+    let is_generic_closure_wrapper = s.starts_with("mlx_closure")
+      && s.contains("returned a non-zero value");
     let _ = LAST.try_with(|c| {
       if let Ok(mut g) = c.try_borrow_mut() {
+        if is_generic_closure_wrapper && g.is_some() {
+          // Preserve the trampoline's already-set user error.
+          return;
+        }
         *g = Some(Error::Backend { message: s });
       }
     });

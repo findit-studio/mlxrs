@@ -222,6 +222,74 @@ fn grad_composition_yields_second_derivative() {
   assert!(approx_eq(grads[0].item::<f32>().unwrap(), 12.0, 1e-4));
 }
 
+// ───────────────────── F3: user error/panic propagation ─────────────────────
+
+/// F3 contract: a user closure that returns `Err` must surface that
+/// SAME error through `grad` / `value_and_grad`'s outer return — NOT
+/// mlx-c's generic "mlx_closure returned a non-zero value" wrapper.
+///
+/// Pre-fix, mlx-c's outer catch in `mlx_closure_*_apply` re-entered our
+/// global error handler with the wrapper text after the trampoline had
+/// already stashed the user's `Err` in TLS via `set_last`, overwriting
+/// the user payload. Post-fix the handler preserves a trampoline-set
+/// error when the incoming message matches the
+/// `mlx_closure*…returned a non-zero value` wrapper shape.
+#[test]
+fn closure_user_error_propagates_through_grad() {
+  use mlxrs::Error;
+  let g = grad(
+    |_xs: &[Array]| -> mlxrs::Result<Vec<Array>> {
+      Err(Error::Backend {
+        message: "USER_ERROR_PAYLOAD".into(),
+      })
+    },
+    &[0],
+  )
+  .unwrap();
+  let x = Array::full::<f32>(&[0i32; 0], 3.0).unwrap();
+  let err = g(&[x]).err().expect("user error must surface");
+  let msg = format!("{err}");
+  assert!(
+    msg.contains("USER_ERROR_PAYLOAD"),
+    "expected user error payload to surface; got: {msg}"
+  );
+  assert!(
+    !msg.contains("mlx_closure returned a non-zero value"),
+    "must NOT surface mlx-c's generic closure-non-zero wrapper; got: {msg}"
+  );
+}
+
+/// F3 contract (panic case): a user closure that panics must surface a
+/// Rust-side error mentioning the panic payload + that the trampoline
+/// caught a panic — NOT mlx-c's generic wrapper text. The trampoline
+/// catches via `catch_unwind` so the panic never crosses the
+/// `extern "C"` boundary (which would be UB); the panic message is
+/// stashed in TLS via `set_last`, and the F3 preserve-check ensures it
+/// survives mlx-c's subsequent wrapper invocation of the handler.
+#[test]
+fn closure_user_panic_propagates_through_grad_as_error() {
+  let g = grad(
+    |_xs: &[Array]| -> mlxrs::Result<Vec<Array>> { panic!("USER_PANIC_PAYLOAD") },
+    &[0],
+  )
+  .unwrap();
+  let x = Array::full::<f32>(&[0i32; 0], 3.0).unwrap();
+  let err = g(&[x]).err().expect("user panic must surface as Err");
+  let msg = format!("{err}");
+  assert!(
+    msg.contains("USER_PANIC_PAYLOAD"),
+    "expected user panic payload to surface; got: {msg}"
+  );
+  assert!(
+    msg.contains("panic"),
+    "expected indication that the closure panicked; got: {msg}"
+  );
+  assert!(
+    !msg.contains("mlx_closure returned a non-zero value"),
+    "must NOT surface mlx-c's generic closure-non-zero wrapper; got: {msg}"
+  );
+}
+
 // ─────────────────────────────── vjp ───────────────────────────────
 
 /// VJP of a scalar-output function with cotangent = 1 equals the gradient.
