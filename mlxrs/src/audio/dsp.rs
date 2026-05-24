@@ -3973,14 +3973,35 @@ mod tests {
 
   #[test]
   fn windows_reject_n_lt_2() {
+    // P6 / AUDIO-1 (#127): the reference Python form `0.5 * (1 - cos(2π n /
+    // (size - 1)))` divides by zero for `size == 1`, silently producing
+    // `NaN` for every sample. mlxrs centralizes the rejection in
+    // `symmetric_window` so EVERY window function (Hann / Hamming /
+    // Blackman / Bartlett) returns a recoverable `Error::Backend` for
+    // both `n == 0` (empty window — pointless) and `n == 1` (denom = 0
+    // — silent NaN in the reference). The cross-product is exhaustively
+    // exercised below to lock the contract for all four window families.
     for r in [
+      hann_window(0),
+      hann_window(1),
       hamming_window(0),
       hamming_window(1),
+      blackman_window(0),
       blackman_window(1),
       bartlett_window(0),
       bartlett_window(1),
     ] {
       assert!(matches!(r, Err(Error::Backend { .. })));
+    }
+    // The `window_from_name` dispatch must propagate the same rejection
+    // for every supported name (so `STR_TO_WINDOW_FN`-style callers also
+    // get the error rather than a silent NaN window).
+    for name in ["hann", "hanning", "hamming", "blackman", "bartlett"] {
+      let r = window_from_name(name, 1);
+      assert!(
+        matches!(r, Err(Error::Backend { .. })),
+        "window_from_name({name:?}, 1) must reject n<2, got {r:?}"
+      );
     }
   }
 
