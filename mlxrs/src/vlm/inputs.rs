@@ -461,9 +461,21 @@ pub fn normalize_audio_features(features: &Array) -> Result<Array> {
 /// sampled frames here. This split mirrors `vlm/video.rs`'s existing
 /// API decomposition (sampling math + per-frame preprocessing).
 ///
+/// **`cfg.layout` constraint — only
+/// [`crate::vlm::image::Layout::Hwc`] is currently supported.**
+/// `load_video` delegates to
+/// [`crate::vlm::video::process_frames`], whose `[T, H, W, 3]` stack
+/// contract is broken if a planar [`crate::vlm::image::Layout`] is
+/// applied per frame. Video-tensor layout semantics are not yet pinned
+/// to a per-model contract; callers needing planar output should
+/// post-process the returned `[T, H, W, 3]` themselves until a future
+/// PR adds first-class video-layout semantics. See
+/// [`crate::vlm::video::process_frames`] for the full rationale.
+///
 /// # Errors
 ///
-/// Propagates from [`crate::vlm::video::process_frames`].
+/// Propagates from [`crate::vlm::video::process_frames`] (including
+/// [`crate::Error::Backend`] when `cfg.layout != Layout::Hwc`).
 #[cfg(feature = "vlm")]
 pub fn load_video(
   frames: &[::image::DynamicImage],

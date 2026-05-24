@@ -33,32 +33,35 @@
 //!   `where_` op is exposed.
 //!
 //! ## Conventions
-//! - **Channel layout (intentional divergence from swift):** outputs from
-//!   [`image_to_array`] and [`preprocess`] are *channel-last*
-//!   `[H, W, 3]`. Alpha is intentionally dropped — see
-//!   [`image_to_array`]'s doc for the swift `array[..., :3]` parity
-//!   citation. The swift
-//!   reference's `MediaProcessing.asMLXArray` reshapes/transposes to
-//!   *planar* `[1, C, H, W]` (`MediaProcessing.swift:190`) because the
-//!   per-model encoders in `MLXVLM/Models/*.swift` consume that layout
-//!   directly. We deliberately STOP at the channel-last step because:
-//!     1. The `(3,)` mean/std broadcasts cleanly across the last axis
-//!        without an extra transpose, so [`normalize_imagenet`] needs
-//!        no layout-specific reshape.
-//!     2. The planar `[1, C, H, W]` reshape is a per-model contract
-//!        (some encoders want `[C, H, W]` without the batch axis;
-//!        others want patchified `[N, P, P, C]` etc.), so emitting it
-//!        from the cross-model primitive would force every caller to
-//!        un-do or re-do the transpose for their encoder. Per the
-//!        project's no-per-model-arch rule (see
-//!        `feedback_no_per_model_arch_porting`), per-model layout is
-//!        the per-model processor's job; the cross-model primitive
-//!        owns the layout-agnostic ImageNet pipeline only.
-//!     3. The per-model planar conversion is one mlx call
-//!        (`reshape((1, h, w, 3))` + `transpose_axes(&[0, 3, 1, 2])`)
-//!        on the lazy `Array` — zero memory cost beyond the metadata
-//!        update. The end-to-end math is unchanged; only the trailing
-//!        layout step moves to the call site.
+//! - **Channel layout (opt-in planar via [`ImageProcessorConfig::layout`]):**
+//!   [`image_to_array`] always emits channel-last `[H, W, 3]` (so the
+//!   `(3,)` mean/std broadcast cleanly across the trailing axis without
+//!   a layout-specific reshape in [`normalize`] / [`rescale`]). Alpha is
+//!   intentionally dropped — see [`image_to_array`]'s doc for the swift
+//!   `array[..., :3]` parity citation.
+//!
+//!   [`preprocess`] then applies a **trailing layout post-step** picked
+//!   via [`ImageProcessorConfig::layout`] (a [`Layout`] enum defaulting
+//!   to `Hwc` — pre-existing callers see no change):
+//!   - `Hwc` (default): identity. The historical `[H, W, 3]` output.
+//!   - `Chw`: one `transpose_axes(&[2, 0, 1])` → `[3, H, W]`. The
+//!     torchvision / timm / classical-CV planar layout without a batch
+//!     axis.
+//!   - `Bchw`: same transpose + one `expand_dims_axes(&[0])` →
+//!     `[1, 3, H, W]`. Matches swift `MediaProcessing.asMLXArray`
+//!     (`MediaProcessing.swift:190` —
+//!     `array.reshape((1, h, w, 3)).transposed(0, 3, 1, 2)`), the layout
+//!     every `MLXVLM/Models/*.swift` ViT-class encoder consumes
+//!     directly.
+//!
+//!   Both `Chw` / `Bchw` compose lazily on the [`Array`] (metadata
+//!   update only — `transpose_axes` and `expand_dims_axes` do not copy
+//!   the underlying buffer), so the planar arms have zero memory cost
+//!   beyond the shape/stride bookkeeping. Per-model encoders that need
+//!   a layout NOT in the three-arm enum (e.g. patchified `[N, P, P, C]`)
+//!   keep the default `Hwc` output and compose their own trailing step;
+//!   the [`Layout`] enum only enumerates the layouts ≥1 per-model
+//!   encoder consumes verbatim today.
 //! - **Dtype:** [`image_to_array`] returns `f32` in `[0.0, 255.0]` *before*
 //!   [`rescale`] — exactly mirroring the swift `CIFormat.RGBAf` render
 //!   (`MediaProcessing.swift:171`) which produces f32 in `[0, 255]`.
@@ -76,6 +79,65 @@
 //! ```
 //! [`preprocess`] composes the full chain off a decoded
 //! [`image::DynamicImage`] + an [`ImageProcessorConfig`].
+//!
+//! ## P8 polish bundle closure (#120 / #121 / #122 / #123 / #124 / #125 / #126)
+//!
+//! - **VLM-1 (#120)** — opt-in planar layout: addressed via
+//!   [`ImageProcessorConfig::layout`] (a [`Layout`] enum defaulting to
+//!   `Hwc`, with `Chw` / `Bchw` for planar). Pre-existing callers see
+//!   no change (`Hwc` is the identity arm); per-model encoders that
+//!   want `[1, C, H, W]` (the swift
+//!   `MediaProcessing.asMLXArray` shape) request `Bchw` and the
+//!   composer applies one lazy `transpose_axes` + `expand_dims_axes` at
+//!   zero memory cost. See [`Layout`] for the per-arm rationale +
+//!   parity citations.
+//! - **VLM-3 (#121)** — bulk-fill widen in [`image_to_array`]:
+//!   addressed via the C3 (`rgb_widen`) / C4 (`bgr_widen`) NEON
+//!   dispatchers wired into BOTH the `as_rgb8()` fast path AND the
+//!   non-`Rgb8` per-pixel-projection path (the latter builds a
+//!   contiguous `Vec<u8>` of length `H*W*3` then hands it to the same
+//!   SIMD dispatcher — the per-pixel `push` overhead the issue called
+//!   out is gone). See [`image_to_array`] for the per-branch wiring.
+//! - **VLM-5 (#122)** — SIMD resize: closed via the own
+//!   `vlm::resize` kernel (not `fast_image_resize`).
+//!   The issue's original ask was to adopt `fast_image_resize`; the
+//!   subsequent allocation-discipline audit showed `fast_image_resize`
+//!   allocates its internal scratch (coefficient tables, per-row work
+//!   buffers) infallibly inside the crate — so a near-budget hostile
+//!   target could abort the process despite our `Result`. The own
+//!   kernel runs the same SIMD shape on aarch64 AND routes every
+//!   internal buffer through `try_reserve_exact`, so the
+//!   recoverable-OOM contract is honest end-to-end. See [`resize`] for
+//!   the per-buffer fallibility breakdown.
+//! - **VLM-6 (#123)** — hand-written SIMD u8→f32 + BGR-swap:
+//!   addressed via the C3 (`rgb_widen` — 16-byte tile `vld1q_u8` + 4×
+//!   `vst1q_f32`) and C4 (`bgr_widen` — 16-pixel tile `vld3q_u8` +
+//!   permuted `vst3q_f32`) NEON kernels. Both ship unconditionally on
+//!   aarch64 per the project memory rule "SIMD ship NEON regardless"
+//!   (the user directive 2026-05-23 overriding §5.4 of the SIMD doc).
+//! - **VLM-4 (#124)** — fallible-allocation discipline in
+//!   [`crate::vlm::prompt`]: every production allocation in the splice
+//!   / mask / placeholder paths uses the crate-private
+//!   `error::try_with_capacity` helper (i.e. `try_reserve_exact` under
+//!   the hood); allocator failure surfaces as
+//!   [`crate::error::Error::OutOfMemory`] instead of aborting. Grep
+//!   `Vec::with_capacity` in `vlm/prompt.rs` to verify: the only
+//!   matches are inline comments documenting what the new shape
+//!   replaces.
+//! - **VLM-2 (#125)** — byte-budget validation in [`resize`]:
+//!   addressed via the target-dimension guard (`height * width * 4 <=
+//!   MAX_DECODED_IMAGE_BYTES`) that fires BEFORE any allocation. The
+//!   signature is `-> Result<DynamicImage>` — over-budget / zero /
+//!   overflow targets surface as a typed `Error::ShapeMismatch` with
+//!   the offending dims and the cap. See [`resize`]'s "Return type"
+//!   doc paragraph for the full rationale.
+//! - **VLM-7 (#126)** — `to_rgb8()` clone elision in
+//!   [`image_to_array`]: addressed via the `as_rgb8()` fast path
+//!   (borrows the source's backing `&[u8]` directly) + a per-pixel
+//!   `dynamic_image_rgb_pixel` projection on the non-`Rgb8` branch
+//!   (NO intermediate source-sized RGB image allocation). Grep
+//!   `to_rgb8\|to_rgba8` in `vlm/image.rs` to verify: every match is
+//!   in an inline comment documenting what the new path replaces.
 //!
 //! ## Allocation-fallibility audit (Codex round-5 closure)
 //!
@@ -247,6 +309,65 @@ pub enum ColorOrder {
   Bgr,
 }
 
+/// Trailing tensor layout applied by [`preprocess`] AFTER the
+/// channel-last `[H, W, 3]` ImageNet pipeline (resize → widen → rescale
+/// → normalize) completes.
+///
+/// **Why an enum, not a per-model post-step.** The cross-model primitive
+/// always emits `[H, W, 3]` from [`image_to_array`] (so the `(3,)`
+/// mean/std broadcasts cleanly across the trailing axis without a
+/// layout-specific reshape — see the module-doc `Conventions > Channel
+/// layout` block for the rationale). The downstream per-model encoder
+/// then needs one of three concrete layouts depending on its
+/// architecture:
+///
+/// - `Hwc` (`[H, W, 3]`): identity. The historical [`preprocess`]
+///   output; the natural ImageNet-pipeline layout. Default for source
+///   compatibility — pre-existing callers see no change.
+/// - `Chw` (`[3, H, W]`): the planar layout torchvision / timm /
+///   classical-CV stack uses without a batch axis. One
+///   `transpose_axes(&[2, 0, 1])` over the lazy `Array` — metadata
+///   update only, no buffer copy.
+/// - `Bchw` (`[1, 3, H, W]`): the planar+batch layout swift
+///   `MediaProcessing.asMLXArray` produces (`MLXVLM/MediaProcessing.swift:190`,
+///   `array.reshape(1, h, w, 3).transposed(0, 3, 1, 2)`) for direct
+///   ViT-encoder feed. One `transpose_axes` plus one
+///   `expand_dims_axes(&[0])` over the lazy `Array`.
+///
+/// The per-model encoder picks the layout via
+/// [`ImageProcessorConfig::layout`]; the cross-model primitive owns the
+/// trailing post-step so the per-model code does NOT manually compose
+/// the transpose + expand at every call site (and so a future variant —
+/// e.g. a `[H, W, 3, 1]` patch grid — only adds one new arm here).
+///
+/// **Cost.** The post-step composes lazily on the [`Array`] — both
+/// [`transpose_axes`] and `expand_dims_axes` update strides/shape
+/// metadata without copying the underlying buffer (mlx's standard
+/// no-op view semantics). The `Bchw` and `Chw` arms therefore have
+/// **zero memory cost** beyond the metadata update.
+///
+/// **Parity citations.**
+/// - swift `MediaProcessing.asMLXArray` line 190 — planar `[1, C, H, W]`
+///   via `reshape((1, h, w, 3))` + `transpose_axes(&[0, 3, 1, 2])`;
+///   this is the `Bchw` arm verbatim.
+/// - python `mlx_vlm` per-model processors (`siglip` /
+///   `clip_image_processor`) call `np.transpose(arr, (2, 0, 1))` after
+///   the ImageNet pipeline for the `Chw` arm.
+///
+/// Tracking issue: [#120](https://github.com/Findit-AI/mlxrs/issues/120)
+/// (VLM-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+  /// Channel-last `[H, W, 3]`. Identity post-step — the historical
+  /// [`preprocess`] output, kept as default for source compatibility.
+  Hwc,
+  /// Planar `[3, H, W]`. One `transpose_axes(&[2, 0, 1])`; no batch axis.
+  Chw,
+  /// Planar batched `[1, 3, H, W]`. Matches swift's
+  /// `MediaProcessing.asMLXArray` (`MediaProcessing.swift:190`).
+  Bchw,
+}
+
 /// Image preprocessing config — the *union* of fields common across VLM
 /// image processors.
 ///
@@ -278,14 +399,29 @@ pub struct ImageProcessorConfig {
   pub resample: ResizeFilter,
   /// Channel layout forwarded to [`image_to_array`].
   pub color_order: ColorOrder,
+  /// Trailing tensor layout applied by [`preprocess`] after the
+  /// ImageNet pipeline. Default [`Layout::Hwc`] preserves the
+  /// historical channel-last `[H, W, 3]` output for source
+  /// compatibility; per-model encoders that consume planar
+  /// `[1, C, H, W]` (the swift `MediaProcessing.asMLXArray` shape) can
+  /// opt in via [`Layout::Bchw`] without a manual call-site transpose.
+  /// See [`Layout`] for the full per-arm rationale + cost analysis
+  /// (zero copy — lazy `Array` metadata update only).
+  ///
+  /// Tracking issue: [#120](https://github.com/Findit-AI/mlxrs/issues/120)
+  /// (VLM-1).
+  pub layout: Layout,
 }
 
 impl Default for ImageProcessorConfig {
   /// ImageNet defaults: `size = (224, 224)`, `mean = [0.485, 0.456,
   /// 0.406]`, `std = [0.229, 0.224, 0.225]`, `rescale_factor = 1/255`,
-  /// `resample = Bicubic`, `color_order = Rgb`, all `do_*` flags `true`.
-  /// These are the values nearly every CLIP / SigLIP / DINO / ViT
-  /// preprocessing config ships with.
+  /// `resample = Bicubic`, `color_order = Rgb`, `layout = Hwc`, all
+  /// `do_*` flags `true`. These are the values nearly every CLIP /
+  /// SigLIP / DINO / ViT preprocessing config ships with. `Hwc` is the
+  /// historical [`preprocess`] output — pre-existing callers see no
+  /// change; opt into [`Layout::Bchw`] / [`Layout::Chw`] explicitly when
+  /// the per-model encoder wants planar layout.
   fn default() -> Self {
     Self {
       size: (224, 224),
@@ -297,6 +433,7 @@ impl Default for ImageProcessorConfig {
       do_normalize: true,
       resample: ResizeFilter::Bicubic,
       color_order: ColorOrder::Rgb,
+      layout: Layout::Hwc,
     }
   }
 }
@@ -1643,30 +1780,72 @@ pub fn image_to_array(img: &::image::DynamicImage, color_order: ColorOrder) -> R
     }
   } else {
     // Non-`Rgb8` source (Luma8 / Rgba8 / Rgb16 / Rgb32F / …):
-    // per-pixel `DynamicImage::get_pixel(x, y)` projection. The
-    // shared [`dynamic_image_rgb_pixel`] helper handles the
-    // alpha-drop / Luma-broadcast / 16-bit-to-8-bit / float-to-u8
-    // conversions via `image`'s `dynamic_map!` dispatch — one
-    // `Rgba<u8>` on the stack per pixel, NO intermediate
-    // source-sized RGB image allocation. Identical projection to
-    // `pad_to_square`'s non-`Rgb8` branch (same helper).
+    // build a contiguous `Vec<u8>` of length `H*W*3` via the shared
+    // [`dynamic_image_rgb_pixel`] helper (one `Rgba<u8>` on the stack
+    // per pixel — NO intermediate source-sized RGB image allocation),
+    // THEN hand the bulk buffer to the same C3/C4 SIMD dispatcher
+    // the `Rgb8` fast path uses above. The earlier per-pixel
+    // `buf.push(f32::from(...))` shape paid an iterator + per-element
+    // capacity-check overhead even though `try_reserve_exact` had
+    // already reserved exact capacity — Copilot review (VLM-3, #121).
+    //
+    // The intermediate `Vec<u8>` is itself fallibly reserved through
+    // the crate-private `error::try_with_capacity` helper so allocator
+    // failure surfaces as [`Error::OutOfMemory`] identically to the f32 buf
+    // (no second abort-on-OOM seam). The intermediate is bounded by
+    // the same `total` overflow-checked shape product above (its
+    // byte count == 1×total, vs the f32 buf's 4×total), so the
+    // byte-budget audit table's "Bounded-memory" Y still holds
+    // end-to-end — `MAX_DECODED_IMAGE_BYTES` (512 MiB) at
+    // [`load_image`] caps the SOURCE byte count, the f32 widening
+    // here is at most 4× of that, and this intermediate adds at most
+    // 1× more (5× total = ~2.5 GiB peak for a near-cap source —
+    // unchanged from the prior `push` shape which materialized the
+    // same f32 buf and merely paid per-element overhead).
+    let mut rgb_buf = crate::error::try_with_capacity::<u8>(total)?;
     for y in 0..h {
       for x in 0..w {
         let rgb = dynamic_image_rgb_pixel(img, x, y);
-        match color_order {
-          ColorOrder::Rgb => {
-            buf.push(f32::from(rgb[0]));
-            buf.push(f32::from(rgb[1]));
-            buf.push(f32::from(rgb[2]));
-          }
-          ColorOrder::Bgr => {
-            buf.push(f32::from(rgb[2]));
-            buf.push(f32::from(rgb[1]));
-            buf.push(f32::from(rgb[0]));
-          }
-        }
+        rgb_buf.push(rgb[0]);
+        rgb_buf.push(rgb[1]);
+        rgb_buf.push(rgb[2]);
       }
     }
+    debug_assert_eq!(
+      rgb_buf.len(),
+      total,
+      "non-Rgb8 RGB intermediate fill length must equal pre-computed total"
+    );
+    // Dispatch through the same C3/C4 SIMD widener the Rgb8 fast path
+    // uses. NEON kernel on aarch64; auto-vectorized scalar elsewhere.
+    // Identical kernel-contract (every f32 in `0..total` of spare is
+    // written before return), identical post-call `set_len` safety
+    // chain — fold this branch into the same code shape as the fast
+    // path so the SIMD ship-decision applies uniformly to every input
+    // variant, not just `ImageRgb8`.
+    match color_order {
+      ColorOrder::Rgb => {
+        let spare = buf.spare_capacity_mut();
+        debug_assert!(
+          spare.len() >= total,
+          "try_reserve_exact must have reserved at least total f32s"
+        );
+        crate::simd::vlm::rgb_widen(&mut spare[..total], &rgb_buf);
+      }
+      ColorOrder::Bgr => {
+        let spare = buf.spare_capacity_mut();
+        debug_assert!(
+          spare.len() >= total,
+          "try_reserve_exact must have reserved at least total f32s"
+        );
+        crate::simd::vlm::bgr_widen(&mut spare[..total], &rgb_buf);
+      }
+    }
+    // SAFETY: identical to the `Rgb8` fast path above — `rgb_widen` /
+    // `bgr_widen` write every f32 in `0..total` per their function-level
+    // contract; `try_reserve_exact(total)` reserved exactly that much
+    // capacity; both `Vec::set_len` preconditions hold.
+    unsafe { buf.set_len(total) };
   }
   debug_assert_eq!(
     buf.len(),
@@ -2015,13 +2194,16 @@ pub fn patchify(arr: &Array, patch_size: usize) -> Result<Array> {
 ///
 /// See the module-level audit table for the per-site breakdown.
 // NOTE (Codex finding, round 2): a review request asked `preprocess`
-// to return swift's `[1, C, H, W]` directly. This is intentionally
-// rejected to respect the project's no-per-model-arch boundary
-// (`feedback_no_per_model_arch_porting`): the cross-model primitive
-// owns the layout-agnostic ImageNet pipeline, and per-model encoders
-// pick the trailing layout in their own processor. The module doc
-// explains why `[H, W, 3]` is the canonical primitive output and how
-// callers reach `[1, C, H, W]` in one cheap lazy step.
+// to return swift's `[1, C, H, W]` directly. The cross-model primitive
+// always runs the ImageNet pipeline on `[H, W, 3]` (so the `(3,)`
+// mean/std broadcast cleanly across the trailing axis — see the
+// module-doc `Conventions > Channel layout` block). The trailing
+// **planar layout** is now opt-in via [`ImageProcessorConfig::layout`]
+// (a `Layout` enum defaulting to `Hwc` — pre-existing callers see no
+// change; per-model encoders that want `[1, C, H, W]` request
+// `Layout::Bchw` and the composer applies one lazy transpose +
+// expand_dims at zero memory cost). See [`Layout`] for the per-arm
+// rationale; tracking issue [#120](https://github.com/Findit-AI/mlxrs/issues/120).
 pub fn preprocess(img: &::image::DynamicImage, cfg: &ImageProcessorConfig) -> Result<Array> {
   let resized;
   let src = if cfg.do_resize {
@@ -2036,10 +2218,88 @@ pub fn preprocess(img: &::image::DynamicImage, cfg: &ImageProcessorConfig) -> Re
   } else {
     arr
   };
-  if cfg.do_normalize {
-    normalize(&arr, &cfg.mean, &cfg.std)
+  let arr = if cfg.do_normalize {
+    normalize(&arr, &cfg.mean, &cfg.std)?
   } else {
-    Ok(arr)
+    arr
+  };
+  apply_layout(arr, cfg.layout)
+}
+
+/// Apply the trailing tensor layout post-step to a channel-last
+/// `[H, W, 3]` array (the canonical [`preprocess`] output).
+///
+/// **Rank precondition.** The post-step targets the cross-model
+/// preprocessor's rank-3 channel-last output specifically — `Hwc`,
+/// `Chw`, and `Bchw` are all defined as `H W 3` permutations / batch
+/// expansions of that exact shape. Non-rank-3 / non-trailing-3-channel
+/// inputs are rejected with [`Error::ShapeMismatch`] before any FFI
+/// call; per-model processors that produce different ranks (patchified
+/// `[N, P, P, 3]`, batched `[B, H, W, 3]`, etc.) compose their own
+/// trailing layout via `transpose_axes` / `expand_dims_axes` directly.
+///
+/// **Ownership.** Takes `arr` by **value** so the [`Layout::Hwc`] arm
+/// is a literal identity (returns the input as-is) without going
+/// through [`Array::try_clone`] — `Array` is intentionally non-`Clone`
+/// (every duplication is a fallible mlx FFI bump), and the
+/// pre-existing `Hwc` default must not pay a `try_clone` cost just to
+/// pass through.
+///
+/// **Lazy / zero-copy on the non-identity arms.** Both [`transpose_axes`]
+/// and `expand_dims_axes` update the [`Array`]'s shape/stride metadata
+/// without copying the underlying buffer (mlx's standard no-op view
+/// semantics). The `Chw` arm is one metadata-only `transpose_axes`; the
+/// `Bchw` arm is the same transpose + one `expand_dims_axes(&[0])`
+/// (which inserts a leading unit axis, again metadata-only).
+///
+/// **Axis convention.** `transpose_axes(&[2, 0, 1])` permutes the
+/// rank-3 input `[H, W, 3]` → `[3, H, W]`, matching the swift
+/// `MediaProcessing.asMLXArray` line 190
+/// (`array.reshape((1, h, w, 3)).transposed(0, 3, 1, 2)`) modulo the
+/// batch axis that `expand_dims_axes(&[0])` adds for the `Bchw` arm.
+///
+/// # Errors
+/// - [`Error::ShapeMismatch`] if the input is not rank-3 with a
+///   trailing channel dim of 3.
+///
+/// Tracking issue: [#120](https://github.com/Findit-AI/mlxrs/issues/120)
+/// (VLM-1).
+pub fn apply_layout(arr: Array, layout: Layout) -> Result<Array> {
+  use crate::ops::shape::expand_dims_axes;
+  // Validate rank-3 `[H, W, 3]` shape before any FFI call — surfaces a
+  // typed `ShapeMismatch` for batched / patchified / non-RGB inputs
+  // rather than letting mlx's permutation-validation error message
+  // surface (which would be less actionable).
+  let shape = arr.shape();
+  if shape.len() != 3 || shape[2] != 3 {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "apply_layout: expected rank-3 [H, W, 3] input, got shape {shape:?}; \
+         per-model processors that produce non-rank-3 layouts should compose \
+         transpose_axes / expand_dims_axes directly"
+      ),
+    });
+  }
+  match layout {
+    Layout::Hwc => {
+      // Identity — historical channel-last output. Pass through by
+      // value: no `try_clone`, no allocation.
+      Ok(arr)
+    }
+    Layout::Chw => {
+      // [H, W, 3] → [3, H, W]. One metadata-only transpose.
+      transpose_axes(&arr, &[2, 0, 1])
+    }
+    Layout::Bchw => {
+      // [H, W, 3] → [3, H, W] → [1, 3, H, W]. Matches swift
+      // `MediaProcessing.asMLXArray` (`MediaProcessing.swift:190` —
+      // `array.reshape((1, h, w, 3)).transposed(0, 3, 1, 2)`); we
+      // compose the equivalent via transpose + expand_dims since the
+      // input is already `[H, W, 3]` (no reshape needed). Both ops
+      // are metadata-only on the lazy `Array`.
+      let chw = transpose_axes(&arr, &[2, 0, 1])?;
+      expand_dims_axes(&chw, &[0])
+    }
   }
 }
 

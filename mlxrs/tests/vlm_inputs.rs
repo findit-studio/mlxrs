@@ -367,6 +367,7 @@ fn load_video_wraps_vlm_video() {
     do_normalize: false,
     resample: ResizeFilter::Bilinear,
     color_order: ColorOrder::Rgb,
+    ..ImageProcessorConfig::default()
   };
   let out = load_video(&frames, &cfg).unwrap();
   // stack of 2 frames, 4x4 RGB, channel-last → [2, 4, 4, 3]

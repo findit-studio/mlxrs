@@ -15,7 +15,7 @@
 #![cfg(feature = "vlm")]
 
 use mlxrs::vlm::{
-  image::{ColorOrder, ImageProcessorConfig, ResizeFilter},
+  image::{ColorOrder, ImageProcessorConfig, Layout, ResizeFilter},
   video::{
     FrameSampling, MAX_PIXELS, MIN_PIXELS, ceil_by_factor, floor_by_factor, process_frames,
     round_by_factor, sample_frame_indices, smart_nframes, smart_resize,
@@ -668,6 +668,7 @@ fn passthrough_cfg(size: (u32, u32)) -> ImageProcessorConfig {
     do_normalize: false,
     resample: ResizeFilter::Bicubic,
     color_order: ColorOrder::Rgb,
+    ..ImageProcessorConfig::default()
   }
 }
 
@@ -712,6 +713,7 @@ fn process_frames_matches_per_frame_preprocess_with_rescale() {
     do_normalize: false,
     resample: ResizeFilter::Bicubic,
     color_order: ColorOrder::Rgb,
+    ..ImageProcessorConfig::default()
   };
   let frames = [frame];
   let mut out = process_frames(&frames, &cfg).unwrap();
@@ -739,4 +741,78 @@ fn process_frames_empty_is_err() {
   let frames: [::image::DynamicImage; 0] = [];
   let cfg = passthrough_cfg((2, 2));
   assert!(process_frames(&frames, &cfg).is_err());
+}
+
+// ---------- process_frames cfg.layout rejection (Codex r1 high) ----------
+//
+// `process_frames` documents a `[T, H, W, 3]` stack contract. Applying a
+// planar `Layout` per frame inside `preprocess` would silently break that
+// contract (Chw → `[T, 3, H, W]`, Bchw → `[T, 1, 3, H, W]`). Until
+// video-layout semantics are defined, `process_frames` must reject any
+// `cfg.layout != Layout::Hwc` with a clear, recoverable Err — never
+// silently emit the wrong shape.
+
+#[test]
+fn process_frames_rejects_chw_layout() {
+  // A planar per-frame Layout::Chw would yield `[T, 3, H, W]`, breaking
+  // the documented `[T, H, W, 3]` stack contract. `process_frames` must
+  // reject it with a clear, recoverable Err pointing at the layout.
+  let frames = [solid_frame(2, 2, [10, 20, 30])];
+  let cfg = ImageProcessorConfig {
+    layout: Layout::Chw,
+    ..passthrough_cfg((2, 2))
+  };
+  let err = process_frames(&frames, &cfg).expect_err("Chw must Err");
+  let msg = format!("{err}");
+  assert!(
+    msg.contains("Layout::Hwc"),
+    "error message must name the supported layout; got: {msg}"
+  );
+  assert!(
+    msg.contains("Chw"),
+    "error message must echo the offending layout; got: {msg}"
+  );
+}
+
+#[test]
+fn process_frames_rejects_bchw_layout() {
+  // A batched-planar per-frame Layout::Bchw would yield a rank-5
+  // `[T, 1, 3, H, W]` that matches no normal video layout. `process_frames`
+  // must reject it with the same recoverable Err.
+  let frames = [solid_frame(2, 2, [10, 20, 30])];
+  let cfg = ImageProcessorConfig {
+    layout: Layout::Bchw,
+    ..passthrough_cfg((2, 2))
+  };
+  let err = process_frames(&frames, &cfg).expect_err("Bchw must Err");
+  let msg = format!("{err}");
+  assert!(
+    msg.contains("Layout::Hwc"),
+    "error message must name the supported layout; got: {msg}"
+  );
+  assert!(
+    msg.contains("Bchw"),
+    "error message must echo the offending layout; got: {msg}"
+  );
+}
+
+#[test]
+fn process_frames_accepts_hwc_layout_unchanged_default() {
+  // Happy path: explicit Layout::Hwc (the default) keeps the documented
+  // `[T, H, W, 3]` rank-4 stack contract. 2 frames × `passthrough_cfg`
+  // (no resize) → [2, 2, 2, 3].
+  let frames = [
+    solid_frame(2, 2, [10, 20, 30]),
+    solid_frame(2, 2, [40, 50, 60]),
+  ];
+  let cfg = ImageProcessorConfig {
+    layout: Layout::Hwc,
+    ..passthrough_cfg((2, 2))
+  };
+  let out = process_frames(&frames, &cfg).expect("Hwc must succeed");
+  assert_eq!(
+    out.shape(),
+    vec![2, 2, 2, 3],
+    "Layout::Hwc must keep rank-4 [T, H, W, 3]"
+  );
 }

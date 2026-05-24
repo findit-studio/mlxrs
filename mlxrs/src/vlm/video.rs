@@ -64,7 +64,7 @@ use crate::{
   array::Array,
   error::{Error, Result},
   ops::shape::stack,
-  vlm::image::{ImageProcessorConfig, preprocess},
+  vlm::image::{ImageProcessorConfig, Layout, preprocess},
 };
 
 /// `image_processing_qwen2_vl.IMAGE_FACTOR` (`video_generate.py:33`):
@@ -785,6 +785,19 @@ pub fn sample_frame_indices(total_frames: i64, nframes: i64) -> Result<Vec<i64>>
 /// a per-model contract reachable in one lazy `transpose_axes(&[0, 3, 1,
 /// 2])`; see the module `Channel layout` block.
 ///
+/// **`cfg.layout` constraint — only [`Layout::Hwc`] is currently
+/// supported.** `process_frames` produces a channel-last `[T, H, W, 3]`
+/// stack and the *video-tensor* analogues of [`Layout::Chw`] /
+/// [`Layout::Bchw`] (i.e. whether a video tensor should be
+/// `[T, 3, H, W]`, `[1, T, 3, H, W]`, or something else) are not yet
+/// pinned to a per-model contract, so applying [`Layout`] **per-frame**
+/// here would silently break the stack contract above. Passing
+/// `cfg.layout != Layout::Hwc` therefore returns
+/// [`Error::Backend`] rather than producing a misleading shape. Callers
+/// that need a planar video tensor can post-process the returned
+/// `[T, H, W, 3]` themselves (one lazy `transpose_axes(&[0, 3, 1, 2])`)
+/// until a future PR defines first-class video-layout semantics.
+///
 /// **No implicit eval:** every frame composes lazily; the returned
 /// `Array` is un-evaluated.
 ///
@@ -792,6 +805,8 @@ pub fn sample_frame_indices(total_frames: i64, nframes: i64) -> Result<Vec<i64>>
 /// - [`Error::ShapeMismatch`] if `frames` is empty (python `np.stack`
 ///   raises on an empty sequence; the swift `_asProcessedSequence` has a
 ///   `precondition(videoFrames.isEmpty == false)`).
+/// - [`Error::Backend`] if `cfg.layout != Layout::Hwc` (see the
+///   `cfg.layout` constraint above).
 /// - Any error from [`preprocess`] on a
 ///   frame (dtype/shape/allocation) is propagated.
 /// - [`Error::OutOfMemory`] if the per-frame `Array` handle vector cannot
@@ -803,6 +818,25 @@ pub fn process_frames(
   if frames.is_empty() {
     return Err(Error::ShapeMismatch {
       message: "process_frames: frames slice is empty".into(),
+    });
+  }
+  // Reject non-Hwc per-frame layouts. Applying a planar `Layout` per
+  // frame here would silently break the documented `[T, H, W, 3]` stack
+  // contract (e.g. `Layout::Chw` would yield `[T, 3, H, W]` and
+  // `Layout::Bchw` would yield a rank-5 `[T, 1, 3, H, W]` that matches
+  // no standard video layout). Video-tensor layout semantics are not
+  // yet defined; callers wanting planar output should post-process the
+  // returned `[T, H, W, 3]` themselves.
+  if cfg.layout != Layout::Hwc {
+    return Err(Error::Backend {
+      message: format!(
+        "process_frames currently only supports Layout::Hwc per-frame configs; \
+         got {:?}. Video-tensor layout for Chw/Bchw is not yet defined — \
+         use Layout::Hwc for video inputs (and post-process the returned \
+         [T, H, W, 3] if a planar shape is needed) or wait for a future PR \
+         adding video layout semantics.",
+        cfg.layout
+      ),
     });
   }
   // Preprocess every frame to a channel-last [H, W, 3] f32 Array. The
