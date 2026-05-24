@@ -1229,7 +1229,10 @@ mod tests {
       default_loss,
       &mut cb,
     );
-    assert!(res.is_ok(), "train should run when opt-in is set; got {res:?}");
+    assert!(
+      res.is_ok(),
+      "train should run when opt-in is set; got {res:?}"
+    );
     Ok(())
   }
 
@@ -1365,8 +1368,13 @@ mod tests {
     }
   }
 
-  fn build_train_fixture()
-  -> Result<(FakeModel, FakeDataset, Weights, NoopCallback, CountingOptimizer)> {
+  fn build_train_fixture() -> Result<(
+    FakeModel,
+    FakeDataset,
+    Weights,
+    NoopCallback,
+    CountingOptimizer,
+  )> {
     let dataset = FakeDataset::new(4, 6);
     let model = FakeModel;
     let mut params: Weights = HashMap::new();
