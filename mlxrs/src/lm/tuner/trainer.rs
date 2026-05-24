@@ -1,6 +1,25 @@
 //! Training-loop orchestration ported from mlx-lm
 //! [`tuner/trainer.py`](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/tuner/trainer.py).
 //!
+//! ## v1 status — mechanics-only [`train`]
+//!
+//! The public [`train`] loop wires up the optimizer step, callbacks, eval,
+//! and save hooks end-to-end, but does NOT yet compute REAL per-parameter
+//! gradients — it dispatches `optimizer.apply_gradients(zeros_like(params),
+//! params)` because mlxrs has no `nn::Module` trait yet to bind
+//! `params → loss` for [`crate::transforms::value_and_grad`]. The full
+//! autograd path arrives once the [`crate::lm::model::Model`] trait grows
+//! parameter binding (tracked separately on the M3 roadmap).
+//!
+//! Callers must explicitly opt in via
+//! [`TrainingArgs::acknowledge_no_real_gradients`] = `true` before invoking
+//! [`train`] in v1. The flag exists so a future production caller cannot
+//! accidentally run multi-hour training jobs against the stub thinking
+//! they're getting actual parameter updates — the `Err` returned otherwise
+//! points the caller at this v1 limitation. Mechanics-only validation
+//! (callbacks fire, optimizer state advances, save hook runs at the right
+//! cadence) is the use case this v1 enables; real model fine-tuning is not.
+//!
 //! ## Surface
 //!
 //! - [`TrainingArgs`] — config (Python `@dataclass class TrainingArgs`,
@@ -15,7 +34,7 @@
 //!   iterator (Python `iterate_batches`, `trainer.py:102..=173`).
 //! - [`evaluate`] — eval-loss helper (Python `evaluate`, `trainer.py:176..=215`).
 //! - [`train`] — the main training loop (Python `train`,
-//!   `trainer.py:218..=387`).
+//!   `trainer.py:218..=387`). v1 mechanics-only; see the status note above.
 //! - [`TrainingCallback`] — progress-reporting hook trait (Python
 //!   `TrainingCallback`, `mlx_lm/tuner/callbacks.py`).
 //!
@@ -103,6 +122,21 @@ pub struct TrainingArgs {
   /// default `0` = disabled). v1 is a no-op (memory management out of
   /// scope), kept for API parity.
   pub clear_cache_threshold: usize,
+  /// Caller-side acknowledgment that [`train`]'s v1 path runs the
+  /// optimizer / callback / save mechanics but does NOT compute real
+  /// per-parameter gradients (the `nn::Module` trait that binds
+  /// `params → loss` for [`crate::transforms::value_and_grad`] is not yet
+  /// ported). Default is `false` so a future production caller cannot
+  /// accidentally run a long training job thinking the model is being
+  /// updated. When `false`, [`train`] returns
+  /// [`Error::Backend`](crate::error::Error::Backend) pointing at this
+  /// field; set to `true` to opt into the mechanics-only training path.
+  ///
+  /// **No Python parity:** this field is mlxrs-specific (Python's
+  /// `mx.value_and_grad` works against any callable that closes over
+  /// `mx.array` parameters, so the Python trainer has nothing analogous
+  /// to fence off).
+  pub acknowledge_no_real_gradients: bool,
 }
 
 impl Default for TrainingArgs {
@@ -119,6 +153,9 @@ impl Default for TrainingArgs {
       grad_checkpoint: false,
       grad_accumulation_steps: 1,
       clear_cache_threshold: 0,
+      // Caller MUST flip this to `true` to opt into the v1 mechanics-only
+      // `train()` (see the field doc-comment + module-level v1 status note).
+      acknowledge_no_real_gradients: false,
     }
   }
 }
@@ -585,12 +622,43 @@ where
   L: Fn(&M, &Array, &Array) -> Result<(Array, Array)>,
   C: TrainingCallback,
 {
+  if !args.acknowledge_no_real_gradients {
+    return Err(Error::Backend {
+      message: "train: TrainingArgs::acknowledge_no_real_gradients must be set to `true` to \
+                run the v1 mechanics-only training path. v1 wires the optimizer step + \
+                callbacks + save hook end-to-end but does NOT compute real per-parameter \
+                gradients (the `nn::Module` trait that binds `params -> loss` for \
+                `value_and_grad` is not yet ported). Flip this field to `true` if you only \
+                need the optimizer/callback/save mechanics; otherwise wait for the \
+                follow-up that lands the Module trait."
+        .into(),
+    });
+  }
   if args.iters == 0 {
     return Ok(());
   }
+  // Validate every interval field used as a modulo divisor. A `0`
+  // interval would underflow `it % 0` (panic) the first time the loop
+  // tested the periodic-report / eval / save predicate, so reject up
+  // front with a clear error instead of letting it crash at iteration 1.
   if args.grad_accumulation_steps == 0 {
     return Err(Error::Backend {
       message: "train: grad_accumulation_steps must be >= 1".into(),
+    });
+  }
+  if args.steps_per_report == 0 {
+    return Err(Error::Backend {
+      message: "train: steps_per_report must be >= 1".into(),
+    });
+  }
+  if args.steps_per_eval == 0 {
+    return Err(Error::Backend {
+      message: "train: steps_per_eval must be >= 1".into(),
+    });
+  }
+  if args.steps_per_save == 0 {
+    return Err(Error::Backend {
+      message: "train: steps_per_save must be >= 1".into(),
     });
   }
   let mut window_loss = 0.0_f32;
@@ -767,6 +835,9 @@ mod tests {
     assert_eq!(a.max_seq_length, 2048);
     assert!(!a.grad_checkpoint);
     assert_eq!(a.grad_accumulation_steps, 1);
+    // mlxrs-specific: defaults to false so a fresh `TrainingArgs` cannot
+    // accidentally run the v1 mechanics-only stub.
+    assert!(!a.acknowledge_no_real_gradients);
   }
 
   #[test]
@@ -911,6 +982,7 @@ mod tests {
       batch_size: 4,
       max_seq_length: 64,
       val_batches: Some(1),
+      acknowledge_no_real_gradients: true,
       ..TrainingArgs::default()
     };
     train(
@@ -941,5 +1013,180 @@ mod tests {
     let mut out = wrapped(&[x])?;
     assert_eq!(out[0].item::<f32>()?, 9.0);
     Ok(())
+  }
+
+  // ─────────── F1 — acknowledge_no_real_gradients gate ───────────
+
+  #[test]
+  fn train_rejects_when_acknowledge_no_real_gradients_is_false() -> Result<()> {
+    let dataset = FakeDataset::new(4, 6);
+    let model = FakeModel;
+    let mut params: Weights = HashMap::new();
+    params.insert("w".into(), Array::full::<f32>(&[0i32; 0], 1.0)?);
+    let mut sgd = SGD::vanilla(0.01)?;
+    let mut cb = NoopCallback;
+    // Default args leaves `acknowledge_no_real_gradients` = false.
+    let args = TrainingArgs {
+      iters: 1,
+      batch_size: 4,
+      max_seq_length: 64,
+      val_batches: Some(1),
+      ..TrainingArgs::default()
+    };
+    assert!(!args.acknowledge_no_real_gradients);
+    let res = train(
+      &model,
+      &mut sgd,
+      &mut params,
+      &dataset,
+      None,
+      &args,
+      default_loss,
+      &mut cb,
+    );
+    match res {
+      Err(Error::Backend { message }) => {
+        assert!(
+          message.contains("acknowledge_no_real_gradients"),
+          "error must reference the opt-in field; got {message}",
+        );
+      }
+      other => panic!("expected Err(Backend), got {other:?}"),
+    }
+    Ok(())
+  }
+
+  #[test]
+  fn train_runs_when_acknowledge_no_real_gradients_is_true() -> Result<()> {
+    let dataset = FakeDataset::new(4, 6);
+    let model = FakeModel;
+    let mut params: Weights = HashMap::new();
+    params.insert("w".into(), Array::full::<f32>(&[0i32; 0], 1.0)?);
+    let mut sgd = SGD::vanilla(0.01)?;
+    let mut cb = NoopCallback;
+    let args = TrainingArgs {
+      iters: 1,
+      batch_size: 4,
+      max_seq_length: 64,
+      val_batches: Some(1),
+      acknowledge_no_real_gradients: true,
+      ..TrainingArgs::default()
+    };
+    let res = train(
+      &model,
+      &mut sgd,
+      &mut params,
+      &dataset,
+      None,
+      &args,
+      default_loss,
+      &mut cb,
+    );
+    assert!(res.is_ok(), "train should run when opt-in is set; got {res:?}");
+    Ok(())
+  }
+
+  // ─────────── F5 — zero-interval rejection ───────────
+
+  fn args_for_zero_interval_tests() -> TrainingArgs {
+    TrainingArgs {
+      iters: 1,
+      batch_size: 4,
+      max_seq_length: 64,
+      val_batches: Some(1),
+      acknowledge_no_real_gradients: true,
+      ..TrainingArgs::default()
+    }
+  }
+
+  fn run_train_with_args(args: &TrainingArgs) -> crate::Result<()> {
+    let dataset = FakeDataset::new(4, 6);
+    let model = FakeModel;
+    let mut params: Weights = HashMap::new();
+    params.insert("w".into(), Array::full::<f32>(&[0i32; 0], 1.0)?);
+    let mut sgd = SGD::vanilla(0.01)?;
+    let mut cb = NoopCallback;
+    train(
+      &model,
+      &mut sgd,
+      &mut params,
+      &dataset,
+      None,
+      args,
+      default_loss,
+      &mut cb,
+    )
+  }
+
+  #[test]
+  fn train_rejects_zero_steps_per_report() {
+    let args = TrainingArgs {
+      steps_per_report: 0,
+      ..args_for_zero_interval_tests()
+    };
+    let res = run_train_with_args(&args);
+    match res {
+      Err(Error::Backend { message }) => {
+        assert!(
+          message.contains("steps_per_report"),
+          "error must name the field; got {message}",
+        );
+      }
+      other => panic!("expected Err(Backend) for steps_per_report=0; got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn train_rejects_zero_steps_per_eval() {
+    let args = TrainingArgs {
+      steps_per_eval: 0,
+      ..args_for_zero_interval_tests()
+    };
+    let res = run_train_with_args(&args);
+    match res {
+      Err(Error::Backend { message }) => {
+        assert!(
+          message.contains("steps_per_eval"),
+          "error must name the field; got {message}",
+        );
+      }
+      other => panic!("expected Err(Backend) for steps_per_eval=0; got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn train_rejects_zero_steps_per_save() {
+    let args = TrainingArgs {
+      steps_per_save: 0,
+      ..args_for_zero_interval_tests()
+    };
+    let res = run_train_with_args(&args);
+    match res {
+      Err(Error::Backend { message }) => {
+        assert!(
+          message.contains("steps_per_save"),
+          "error must name the field; got {message}",
+        );
+      }
+      other => panic!("expected Err(Backend) for steps_per_save=0; got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn train_rejects_zero_grad_accumulation_steps() {
+    let args = TrainingArgs {
+      grad_accumulation_steps: 0,
+      ..args_for_zero_interval_tests()
+    };
+    let res = run_train_with_args(&args);
+    match res {
+      Err(Error::Backend { message }) => {
+        assert!(
+          message.contains("grad_accumulation_steps"),
+          "error must name the field; got {message}",
+        );
+      }
+      other => panic!("expected Err(Backend) for grad_accumulation_steps=0; got {other:?}"),
+    }
   }
 }
