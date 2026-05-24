@@ -11,13 +11,39 @@
 use std::{
   env,
   path::{Path, PathBuf},
+  process::Command,
 };
+
+// ───── Submodule revision pins ─────
+//
+// These MUST match what `mlxrs-sys/vendor/mlx-c/CMakeLists.txt` declares
+// in its `FetchContent_Declare(mlx ... GIT_TAG v0.31.2)`, and what
+// `mlxrs-sys/vendor/mlx/mlx/io/CMakeLists.txt` declares in its
+// `FetchContent_Declare(gguflib ... GIT_TAG <sha>)`. With
+// `FETCHCONTENT_SOURCE_DIR_MLX` / `FETCHCONTENT_SOURCE_DIR_GGUFLIB` wired
+// below, cmake skips the GIT_TAG enforcement entirely and builds from
+// whatever sits at those paths — a submodule that's been manually
+// `git checkout`'d to a different SHA (or skipped during a lockstep
+// mlx-c bump) would silently compile against the wrong version. The
+// `check_submodule_rev` preflight below catches that drift.
+//
+// If a future mlx-c bump moves the mlx pin (or a future mlx bump moves
+// the gguflib pin):
+//   1. Update the submodule: `cd mlxrs-sys/vendor/<name> && git checkout
+//      <new_tag> && cd - && git add mlxrs-sys/vendor/<name>`.
+//   2. Update the corresponding `EXPECTED_*_REV` const below.
+//   3. Both must land in the same change so CI catches drift.
+// ──────────────────────────────────
+const EXPECTED_MLX_REV: &str = "68cf2fddd8de5edd8ab3d926391772b2e2cedad8"; // v0.31.2
+const EXPECTED_GGUFLIB_REV: &str = "8fa6eb65236618e28fd7710a0fba565f7faa1848";
 
 fn main() {
   // Re-run if these change
   println!("cargo:rerun-if-changed=build.rs");
   println!("cargo:rerun-if-changed=wrapper.h");
   println!("cargo:rerun-if-changed=vendor/mlx-c");
+  println!("cargo:rerun-if-changed=vendor/mlx");
+  println!("cargo:rerun-if-changed=vendor/gguflib");
   println!("cargo:rerun-if-changed=shim/mlxrs_shim.cpp");
 
   // Target check — M1 is macOS arm64 only.
@@ -31,16 +57,61 @@ fn main() {
   }
 
   // Submodule check — fail fast if user forgot --recurse-submodules.
+  // Three submodules under vendor/: mlx-c (which we cmake-configure
+  // directly), and mlx + gguflib (which mlx-c's CMakeLists.txt and mlx's
+  // io/CMakeLists.txt would otherwise FetchContent over the network, but
+  // which we redirect to these local paths via FETCHCONTENT_SOURCE_DIR_*
+  // below for offline builds).
   let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-  let mlx_c_root = manifest_dir.join("vendor/mlx-c");
-  if !mlx_c_root.join("CMakeLists.txt").exists() {
-    panic!(
-      "vendor/mlx-c/CMakeLists.txt missing. Run:\n\
-             \tgit submodule update --init --recursive"
-    );
+  let vendor_dir = manifest_dir.join("vendor");
+  let mlx_c_root = vendor_dir.join("mlx-c");
+  let mlx_root = vendor_dir.join("mlx");
+  let gguflib_root = vendor_dir.join("gguflib");
+  for (name, root, sentinel) in [
+    ("mlx-c", &mlx_c_root, "CMakeLists.txt"),
+    ("mlx", &mlx_root, "CMakeLists.txt"),
+    ("gguflib", &gguflib_root, "gguflib.c"),
+  ] {
+    if !root.join(sentinel).exists() {
+      panic!(
+        "vendor/{name}/{sentinel} missing. Run:\n\
+               \tgit submodule update --init --recursive"
+      );
+    }
   }
 
+  // Submodule revision check — verify each vendored submodule is at the
+  // pinned commit recorded in EXPECTED_*_REV. The sentinel-file preflight
+  // above only proves the source tree exists; with FETCHCONTENT_SOURCE_DIR_*
+  // below, cmake never enforces GIT_TAG, so a stale checkout (e.g. forgot
+  // `git submodule update` after a rebase) would otherwise silently build
+  // against the wrong upstream. See `check_submodule_rev` doc for the
+  // trust boundary (same level as `~/.cargo/registry/`: we trust the user
+  // to not tamper with their own vendored sources).
+  check_submodule_rev(&mlx_root, EXPECTED_MLX_REV, "mlx").unwrap_or_else(|msg| panic!("{msg}"));
+  check_submodule_rev(&gguflib_root, EXPECTED_GGUFLIB_REV, "gguflib")
+    .unwrap_or_else(|msg| panic!("{msg}"));
+
   // CMake invocation. cmake-rs installs to ${dst}/lib/, ${dst}/include/.
+  //
+  // FETCHCONTENT_SOURCE_DIR_<uppercaseName> is cmake's standard override
+  // for FetchContent_Declare: when set, cmake skips the GIT_REPOSITORY
+  // clone for that dependency and uses the local path as the source dir,
+  // then proceeds to build it in-place exactly as if it had fetched it.
+  // We wire two:
+  //   * FETCHCONTENT_SOURCE_DIR_MLX  → redirects mlx-c/CMakeLists.txt's
+  //     `FetchContent_Declare(mlx GIT_REPOSITORY ... GIT_TAG v0.31.2)`.
+  //   * FETCHCONTENT_SOURCE_DIR_GGUFLIB → redirects mlx core's
+  //     mlx/io/CMakeLists.txt's `FetchContent_Declare(gguflib ... GIT_TAG
+  //     8fa6eb65236618e28fd7710a0fba565f7faa1848)` (active when
+  //     MLX_BUILD_GGUF is ON — its unconditional upstream default).
+  // The vendored submodule pins MUST match these GIT_TAG values. If a
+  // future mlx-c bump changes the mlx pin, or a future mlx bump changes
+  // the gguflib pin, the corresponding submodule under vendor/ must be
+  // updated in lockstep (`git submodule update --remote` followed by an
+  // explicit `git checkout <newtag>` inside the submodule).
+  // Ref: https://cmake.org/cmake/help/latest/module/FetchContent.html
+  //      #variable:FETCHCONTENT_SOURCE_DIR_%3CuppercaseName%3E
   let dst = cmake::Config::new(&mlx_c_root)
     .define("BUILD_SHARED_LIBS", "OFF")
     .define("MLX_C_BUILD_EXAMPLES", "OFF")
@@ -49,6 +120,16 @@ fn main() {
     .define("MLX_BUILD_PYTHON_BINDINGS", "OFF")
     .define("CMAKE_CXX_STANDARD", "20")
     .define("CMAKE_BUILD_TYPE", "Release")
+    .define(
+      "FETCHCONTENT_SOURCE_DIR_MLX",
+      mlx_root.to_str().expect("mlx vendor path is valid UTF-8"),
+    )
+    .define(
+      "FETCHCONTENT_SOURCE_DIR_GGUFLIB",
+      gguflib_root
+        .to_str()
+        .expect("gguflib vendor path is valid UTF-8"),
+    )
     .build();
 
   // mlx-c's CMakeLists only does install(TARGETS mlxc ...), so libmlxc.a
@@ -101,26 +182,32 @@ fn main() {
   });
 
   // First-party C++ shim for mlx::core APIs that mlx-c does not expose
-  // (currently just `clear_streams`). Compiled against the FetchContent'd
-  // mlx C++ headers and linked alongside libmlx. cc emits its own
+  // (currently just `clear_streams`). Compiled against the mlx C++ headers
+  // and linked alongside libmlx. cc emits its own
   // `cargo:rustc-link-lib=static=mlxrs_shim` + search-path directives HERE,
   // i.e. BEFORE the `static=mlx` directive below, so a single-pass linker
   // (GNU ld) resolves the shim's `mlx::core::clear_streams` reference into
   // libmlx. macOS ld64 is order-insensitive for archives but we keep the
   // correct order regardless.
-  let mlx_src = build_dir.join("_deps/mlx-src");
-  if !mlx_src.join("mlx/stream.h").exists() {
+  //
+  // Header source: `vendor/mlx/` directly. With FETCHCONTENT_SOURCE_DIR_MLX
+  // wired above, cmake does NOT clone into `_deps/mlx-src/` — it uses the
+  // vendored submodule path as the cmake source dir in-place. Pointing the
+  // shim include at the submodule source guarantees the shim sees the same
+  // tagged-v0.31.2 headers that libmlx.a was compiled from, byte-identical
+  // to what FetchContent would have cloned.
+  if !mlx_root.join("mlx/stream.h").exists() {
     panic!(
       "mlx C++ headers not found at {} (expected mlx/stream.h). The shim \
-             needs the FetchContent'd mlx-src tree.",
-      mlx_src.display()
+             needs the vendored mlx submodule.",
+      mlx_root.display()
     );
   }
   cc::Build::new()
     .cpp(true)
     .std("c++20")
     .file("shim/mlxrs_shim.cpp")
-    .include(&mlx_src)
+    .include(&mlx_root)
     .compile("mlxrs_shim");
 
   // Link declarations.
@@ -147,6 +234,111 @@ fn main() {
   // is not part of the vendored mlx-c surface). This script's job is to
   // compile the shim + link libmlxc + libmlx + libmlxrs_shim + the Apple
   // frameworks.
+}
+
+/// Verify the vendored submodule is checked out at the pinned upstream
+/// revision recorded in [`EXPECTED_MLX_REV`] / [`EXPECTED_GGUFLIB_REV`].
+///
+/// # Trust boundary
+///
+/// This check confirms the submodule is INITIALIZED and at the expected
+/// COMMIT. It does NOT verify the working-tree contents are byte-identical
+/// to that commit. A developer with write access to the vendored worktree
+/// can locally modify or replace tracked files; this check will pass if
+/// `HEAD` still points to the pinned commit.
+///
+/// The trust model is the same as for files under `~/.cargo/registry/`:
+/// we trust the user to not tamper with their own vendored sources. If
+/// the user accidentally drifts (e.g. forgot to run `git submodule update`
+/// after a rebase), the HEAD-mismatch check catches that. If the user
+/// actively tampers, that is outside this build script's threat model.
+///
+/// Callers needing stricter integrity should:
+/// 1. Build from a clean checkout (`git clone` + `git submodule update --init --recursive`)
+/// 2. Or use cargo's vendored-sources mechanism with checksum verification
+///
+/// # Errors
+///
+/// Returns `Err` if:
+/// - The submodule directory exists with `.git` metadata BUT `git rev-parse HEAD`
+///   reports a different commit than expected. Remediation: run
+///   `git submodule update --init --recursive` from the parent repo.
+/// - The git command starts but reports non-zero exit (broken metadata,
+///   safety rejection, etc.). Remediation: re-initialize the submodule.
+///
+/// Returns `Ok(())` (intentional skip) if:
+/// - The submodule directory has no `.git` metadata. This happens when the
+///   crate is consumed as a packaged tarball (e.g. from crates.io) where the
+///   submodule was vendored as a plain directory. The packaging machinery is
+///   trusted to have captured the correct revision.
+/// - The `git` command cannot be executed (`Command::output()` returns Err).
+///   This typically means git is not on the PATH; we cannot verify, but we
+///   should not block the build for users who legitimately lack git.
+fn check_submodule_rev(
+  submodule_path: &Path,
+  expected: &str,
+  friendly_name: &str,
+) -> Result<(), String> {
+  // A live submodule checkout has either a `.git` directory (standalone
+  // clone) or a `.git` file (gitlink form, typical when nested under a
+  // superproject). Either form means git can resolve HEAD here. Absence
+  // is the packaged-tarball case — see docstring "Returns Ok" bullet 1.
+  if !submodule_path.join(".git").exists() {
+    return Ok(());
+  }
+
+  let path_str = match submodule_path.to_str() {
+    Some(s) => s,
+    None => return Ok(()), // non-UTF-8 path; can't pass to git CLI, best-effort skip.
+  };
+
+  let output = match Command::new("git")
+    .args(["-C", path_str, "rev-parse", "HEAD"])
+    .output()
+  {
+    Ok(o) => o,
+    Err(_) => return Ok(()), // git not on PATH; best-effort skip (process never launched).
+  };
+
+  if !output.status.success() {
+    // Process started but reported failure — broken gitfile, unreadable
+    // gitdir, safe-directory rejection, partial checkout, etc. Fail
+    // closed so drift protection isn't accidentally disabled by corrupt
+    // metadata (R2 hardening preserved through simplification).
+    return Err(format!(
+      "vendored submodule `{friendly_name}` at {} has git metadata but \
+       `git rev-parse HEAD` failed (exit {:?}, stderr: {}). Cannot verify \
+       pinned revision. Re-initialize the submodule:\n\
+       \tgit submodule deinit -f {}\n\
+       \tgit submodule update --init --recursive",
+      submodule_path.display(),
+      output.status.code(),
+      String::from_utf8_lossy(&output.stderr).trim_end(),
+      submodule_path.display(),
+    ));
+  }
+
+  let actual = String::from_utf8_lossy(&output.stdout).trim().to_string();
+  if actual != expected {
+    let name_upper = friendly_name.to_uppercase();
+    return Err(format!(
+      "vendored submodule `{friendly_name}` at {} is at revision {actual} \
+       but mlxrs-sys expects {expected}.\n\
+       \n\
+       If you intentionally updated the submodule, also update \
+       EXPECTED_{name_upper}_REV in mlxrs-sys/build.rs (both must commit \
+       in the same change so CI catches drift).\n\
+       \n\
+       Otherwise restore the pinned revision:\n\
+       \tgit -C {} checkout {expected}\n\
+       \tgit add {}",
+      submodule_path.display(),
+      submodule_path.display(),
+      submodule_path.display(),
+    ));
+  }
+
+  Ok(())
 }
 
 fn find_libmlx(start: &Path) -> Option<PathBuf> {

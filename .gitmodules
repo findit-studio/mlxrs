@@ -2,3 +2,9 @@
 	path = mlxrs-sys/vendor/mlx-c
 	url = https://github.com/ml-explore/mlx-c.git
 	branch = main
+[submodule "mlxrs-sys/vendor/mlx"]
+	path = mlxrs-sys/vendor/mlx
+	url = https://github.com/ml-explore/mlx.git
+[submodule "mlxrs-sys/vendor/gguflib"]
+	path = mlxrs-sys/vendor/gguflib
+	url = https://github.com/antirez/gguf-tools.git
