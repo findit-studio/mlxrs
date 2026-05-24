@@ -13,6 +13,29 @@ use std::{
   path::{Path, PathBuf},
 };
 
+// ───── Submodule revision pins ─────
+//
+// These MUST match what `mlxrs-sys/vendor/mlx-c/CMakeLists.txt` declares
+// in its `FetchContent_Declare(mlx ... GIT_TAG v0.31.2)`, and what
+// `mlxrs-sys/vendor/mlx/mlx/io/CMakeLists.txt` declares in its
+// `FetchContent_Declare(gguflib ... GIT_TAG <sha>)`. With
+// `FETCHCONTENT_SOURCE_DIR_MLX` / `FETCHCONTENT_SOURCE_DIR_GGUFLIB` wired
+// below, cmake skips the GIT_TAG enforcement entirely and builds from
+// whatever sits at those paths — a submodule that's been manually
+// `git checkout`'d to a different SHA (or skipped during a lockstep
+// mlx-c bump) would silently compile against the wrong version. The
+// `check_submodule_rev` preflight below catches that drift.
+//
+// If a future mlx-c bump moves the mlx pin (or a future mlx bump moves
+// the gguflib pin):
+//   1. Update the submodule: `cd mlxrs-sys/vendor/<name> && git checkout
+//      <new_tag> && cd - && git add mlxrs-sys/vendor/<name>`.
+//   2. Update the corresponding `EXPECTED_*_REV` const below.
+//   3. Both must land in the same change so CI catches drift.
+// ──────────────────────────────────
+const EXPECTED_MLX_REV: &str = "68cf2fddd8de5edd8ab3d926391772b2e2cedad8"; // v0.31.2
+const EXPECTED_GGUFLIB_REV: &str = "8fa6eb65236618e28fd7710a0fba565f7faa1848";
+
 fn main() {
   // Re-run if these change
   println!("cargo:rerun-if-changed=build.rs");
@@ -55,6 +78,17 @@ fn main() {
       );
     }
   }
+
+  // Submodule revision check — guard against silent drift between the
+  // vendored submodule HEAD and the SHA mlx-c's FetchContent expects. The
+  // sentinel-file preflight above only proves the source tree exists; with
+  // FETCHCONTENT_SOURCE_DIR_* below, cmake never enforces GIT_TAG, so a
+  // stale/manually-checked-out submodule would build the wrong version.
+  // Best-effort: skipped (returns Ok) for packaged-crate consumers without
+  // git metadata, or if `git` itself is unavailable.
+  check_submodule_rev(&mlx_root, EXPECTED_MLX_REV, "mlx").unwrap_or_else(|msg| panic!("{msg}"));
+  check_submodule_rev(&gguflib_root, EXPECTED_GGUFLIB_REV, "gguflib")
+    .unwrap_or_else(|msg| panic!("{msg}"));
 
   // CMake invocation. cmake-rs installs to ${dst}/lib/, ${dst}/include/.
   //
@@ -198,6 +232,76 @@ fn main() {
   // is not part of the vendored mlx-c surface). This script's job is to
   // compile the shim + link libmlxc + libmlx + libmlxrs_shim + the Apple
   // frameworks.
+}
+
+/// Verify a vendored submodule's HEAD matches the expected commit SHA.
+///
+/// `FETCHCONTENT_SOURCE_DIR_*` bypasses cmake's GIT_TAG enforcement, so a
+/// drifted submodule (manual `git checkout`, or a missed lockstep update
+/// when mlx-c bumps its FetchContent pin) would silently build the wrong
+/// version. This check closes that hole.
+///
+/// Best-effort semantics — returns `Ok(())` if:
+///   * The submodule path has no `.git` (packaged-crate / tarball case
+///     where git metadata is stripped — the sentinel-file preflight +
+///     pinned `Cargo.toml` version are the trust anchor instead).
+///   * `git rev-parse` itself fails (no `git` on PATH, etc.) — we don't
+///     want to brick the build over a missing tool.
+///
+/// Returns `Err(msg)` with an actionable remediation message if `git`
+/// reports a different SHA than expected.
+fn check_submodule_rev(
+  submodule_path: &Path,
+  expected: &str,
+  friendly_name: &str,
+) -> Result<(), String> {
+  // A live submodule checkout has either a `.git` directory (standalone
+  // clone) or a `.git` file (gitlink form, typical when nested under a
+  // superproject). Either form means git can resolve HEAD here.
+  if !submodule_path.join(".git").exists() {
+    // Packaged-crate / tarball case — `cargo publish` strips .git but the
+    // EXPECTED_*_REV consts + pinned crate version on crates.io are the
+    // trust anchor. Skip without failing the build.
+    return Ok(());
+  }
+
+  let path_str = match submodule_path.to_str() {
+    Some(s) => s,
+    None => return Ok(()), // non-UTF-8 path; can't pass to git CLI, best-effort skip.
+  };
+
+  let output = match std::process::Command::new("git")
+    .args(["-C", path_str, "rev-parse", "HEAD"])
+    .output()
+  {
+    Ok(o) => o,
+    Err(_) => return Ok(()), // git not available; best-effort skip.
+  };
+
+  if !output.status.success() {
+    return Ok(()); // git reported failure (maybe a partial checkout); best-effort skip.
+  }
+
+  let actual = String::from_utf8_lossy(&output.stdout).trim().to_string();
+  if actual != expected {
+    let name_upper = friendly_name.to_uppercase();
+    return Err(format!(
+      "vendored submodule `{friendly_name}` at {} is at revision {actual} \
+       but mlxrs-sys expects {expected}.\n\
+       \n\
+       If you intentionally updated the submodule, also update \
+       EXPECTED_{name_upper}_REV in mlxrs-sys/build.rs (both must commit \
+       in the same change so CI catches drift).\n\
+       \n\
+       Otherwise restore the pinned revision:\n\
+       \tgit -C {} checkout {expected}\n\
+       \tgit add {}",
+      submodule_path.display(),
+      submodule_path.display(),
+      submodule_path.display(),
+    ));
+  }
+  Ok(())
 }
 
 fn find_libmlx(start: &Path) -> Option<PathBuf> {
