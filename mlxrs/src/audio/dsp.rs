@@ -2497,6 +2497,15 @@ fn lfilter_f64(b: &[f64], a: &[f64], x: &[f64]) -> Result<Vec<f64>> {
 
   // Reference's `state_len == 0` fast path: `y = b[0] * x` (no recurrence,
   // no feedback state to maintain). This is the FIR-of-length-1 case.
+  // C9 / [#154]: a NEON `vmulq_n_f64` 2-lane kernel exists at
+  // [`crate::simd::audio::lfilter::lfilter_fir_b0`] but is NOT wired
+  // here — the simd_lfilter bench (M2 Pro, release, 2026-05-24)
+  // measured scalar at ~10 Gelem/s vs the NEON dispatcher at
+  // ~7.8 Gelem/s on f64 across every benched size. LLVM auto-
+  // vectorizes the per-sample multiply better than the hand-rolled
+  // NEON tile at f64 width. The kernel ships in `simd::audio::lfilter`
+  // as a regression guard + a building block for any future caller
+  // that wants the dispatcher behaviour explicitly.
   if state_len == 0 {
     let b0 = b_norm[0];
     for &sample in x {
@@ -2505,8 +2514,28 @@ fn lfilter_f64(b: &[f64], a: &[f64], x: &[f64]) -> Result<Vec<f64>> {
     return Ok(y);
   }
 
+  // C9 / [#154]: biquad fast path — `state_len == 2`, `b.len() ==
+  // a.len() == 3` (the actual BS.1770 K-weighting workload).
+  // Benchmarks (M2 Pro, release, 2026-05-24, `simd_lfilter.rs`)
+  // measured a ~1.13× speedup over the generic loop at every benched
+  // size (1024 → 65536, including the 48 kHz × 1 s K-weighting
+  // fixture); the dispatcher is wired here. The hand-unrolled
+  // body produces bit-identical output for any 3-tap biquad
+  // (asserted by `biquad_bit_exact_vs_generic_*` tests in
+  // [`crate::simd::audio::lfilter`]).
+  if state_len == 2 && b_norm.len() == 3 && a_norm.len() == 3 {
+    // The biquad kernel is in-place; the out-of-place public wrapper
+    // needs `y` to be `n_samples` long before the kernel runs. The
+    // single-pass copy is dwarfed by the per-sample 4-mul / 4-add
+    // body (memcpy at ~50 GB/s, biquad at ~270 Melem/s = 2.16 GB/s
+    // for f64).
+    y.extend_from_slice(x);
+    crate::simd::audio::lfilter::lfilter_biquad(&mut y, &b_norm, &a_norm);
+    return Ok(y);
+  }
+
   // General direct-form II transposed recurrence (matching the reference's
-  // per-sample loop body byte-for-byte).
+  // per-sample loop body byte-for-byte) — for non-biquad / non-FIR shapes.
   let mut state: Vec<f64> = Vec::new();
   state
     .try_reserve_exact(state_len)
@@ -2626,12 +2655,35 @@ fn lfilter_f64_in_place(b: &[f64], a: &[f64], x: &mut [f64]) -> Result<()> {
   // `state_len == 0` fast path: `y[n] = b[0] * x[n]`. Read each sample
   // BEFORE writing — both source and destination are the same slot, so
   // the multiplication is order-safe regardless (single-pass, no
-  // dependency on neighboring slots).
+  // dependency on neighboring slots). C9 / [#154]: the SIMD FIR
+  // dispatcher at [`crate::simd::audio::lfilter::lfilter_fir_b0`]
+  // exists, but the bench measured the scalar in-place `*v *= b0` loop
+  // (which LLVM autovectorizes) at ~10 Gelem/s vs the NEON dispatcher
+  // at ~7.8 Gelem/s on f64. The scalar loop stays here for the in-
+  // place case; the SIMD kernel is shipped in `simd::audio::lfilter`
+  // as a regression guard + building block.
   if state_len == 0 {
     let b0 = b_norm[0];
     for v in x.iter_mut() {
       *v *= b0;
     }
+    return Ok(());
+  }
+
+  // C9 / [#154]: biquad fast path — `state_len == 2`, `b.len() ==
+  // a.len() == 3` (the actual BS.1770 K-weighting workload — the
+  // chain through this kernel from [`k_weight_channel`] is the hot
+  // path of [`integrated_loudness`]). Benchmarks (M2 Pro, release,
+  // 2026-05-24, `simd_lfilter.rs`, `lfilter_k_weight_chain` group)
+  // measured a ~1.13× speedup over the generic loop on the actual
+  // 1 s @ 48 kHz K-weighting chain (HS → HP): 239 Melem/s scalar
+  // generic vs 270 Melem/s biquad dispatcher. The hand-unrolled body
+  // is bit-identical to the generic loop for any 3-tap biquad (asserted
+  // by `biquad_bit_exact_vs_generic_*` tests in
+  // [`crate::simd::audio::lfilter`]); LUFS measurements through
+  // [`integrated_loudness`] remain byte-identical to pre-C9 output.
+  if state_len == 2 && b_norm.len() == 3 && a_norm.len() == 3 {
+    crate::simd::audio::lfilter::lfilter_biquad(x, &b_norm, &a_norm);
     return Ok(());
   }
 

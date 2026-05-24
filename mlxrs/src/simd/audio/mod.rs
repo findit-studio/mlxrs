@@ -55,9 +55,30 @@
 //! - **C2** loudness sum-of-squares — covered by the in-tree
 //!   [`crate::simd::sum_of_squares`] kernel surface, see
 //!   `simd::scalar::sum_of_squares` and `simd::arch::neon::sum_of_squares`.
-//! - **C9** `lfilter` recurrence — serial by construction, never SIMD-able.
+//!
+//! # C9 — empirical attempt, ships only the FIR fast-path
+//!
+//! **C9** `lfilter` recurrence — originally documented as
+//! non-candidate (IIR is serial by construction). Per user directive
+//! 2026-05-24, an empirical bench-driven attempt was made. See
+//! [`lfilter`] for the full write-up. Outcome:
+//!
+//! - The `state_len == 0` FIR fast-path (`y[n] = b0 * x[n]`) IS
+//!   parallel and ships as a NEON `f64x2`-wide kernel. Cosmetic for
+//!   the K-weighting workload (which never hits this arm), but a
+//!   legit NEON kernel that the dispatcher routes through.
+//! - The biquad specialization (`state_len == 2`, K-weighting's
+//!   actual workload) was tried via hand-unrolling — the recurrence
+//!   is purely serial so there is no within-stream NEON parallelism
+//!   to exploit. Whether the hand-unrolled scalar arm or the
+//!   `target_feature(enable = "neon")`-annotated arm beats the
+//!   generic loop is benchmark-dependent; the
+//!   `mlxrs/benches/simd_lfilter.rs` micro-bench is the authoritative
+//!   data source. See [`lfilter`] module doc for the decision and
+//!   numbers.
 
 pub mod kaldi_mel;
+pub mod lfilter;
 pub mod mel_triangle;
 pub mod pcm_decode;
 pub mod quantize;
