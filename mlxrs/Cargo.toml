@@ -168,3 +168,15 @@ required-features = ["vlm"]
 name = "simd_pcm_decode"
 harness = false
 required-features = ["audio"]
+
+# C9 lfilter bench-driven attempt — gated on the `audio` feature
+# (kernel lives behind the same feature gate). Unlike other
+# simd_*.rs benches, this one IS the ship decision per user directive
+# 2026-05-24 (C9 is the documented exception to the "SIMD ship NEON
+# regardless" rule, because the IIR recurrence is purely serial and
+# a NEON arm is only worth shipping if it empirically beats the
+# generic loop).
+[[bench]]
+name = "simd_lfilter"
+harness = false
+required-features = ["audio"]
