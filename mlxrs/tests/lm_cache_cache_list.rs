@@ -828,3 +828,97 @@ fn cache_list_trim_transactional_short_circuits_on_non_trimmable_child() {
     "all-trimmable list: trim must actually trim (returned {r2})"
   );
 }
+
+#[test]
+fn state_into_buffer_reuse_matches_state_for_cache_list() {
+  // KVC-7 (#104): `state_into(&mut buf)` is the buffer-reuse companion to
+  // `state() -> Vec<Array>`. For a `CacheList` (which flattens every
+  // child's state), `state_into` lets a parent composite avoid the per-
+  // child `Vec<Array>` allocation the default trait method would pay.
+  // The OBSERVABLE output (count of arrays appended) must match `state()`
+  // byte-for-byte — the optimization is alloc-only, not behavior.
+  let cl = populated_pair();
+  let s = cl.state().unwrap();
+  let mut buf: Vec<Array> = Vec::new();
+  cl.state_into(&mut buf).unwrap();
+  assert_eq!(
+    s.len(),
+    buf.len(),
+    "state_into and state must append the same number of arrays"
+  );
+  // Append semantics: a non-empty buf is APPENDED to, NOT cleared. Reuse
+  // the same buffer for a second call and verify total len doubles.
+  cl.state_into(&mut buf).unwrap();
+  assert_eq!(
+    buf.len(),
+    s.len() * 2,
+    "state_into must APPEND, not clear (multi-cache callers depend on this)"
+  );
+}
+
+#[test]
+fn meta_state_into_buffer_reuse_matches_meta_state_for_cache_list() {
+  // KVC-6 (#103): `meta_state_into(&mut buf)` is the buffer-reuse
+  // companion to `meta_state() -> Vec<String>`. For a `CacheList`
+  // (whose framing is O(children) — `[childCount, (className,
+  // stateCount, metaCount, ...meta)*]`) this saves one Vec<String>
+  // allocation per child compared to the per-child meta_state() +
+  // extend pattern. Output must be byte-identical (the metaCount slot
+  // is patched in place after the child appends).
+  let cl = populated_pair();
+  let m1 = cl.meta_state();
+  let mut buf: Vec<String> = Vec::new();
+  cl.meta_state_into(&mut buf);
+  assert_eq!(
+    m1, buf,
+    "meta_state and meta_state_into must produce byte-identical output"
+  );
+  // Append semantics — second call must append, not clear.
+  cl.meta_state_into(&mut buf);
+  assert_eq!(
+    buf.len(),
+    m1.len() * 2,
+    "meta_state_into must APPEND, not clear"
+  );
+}
+
+#[test]
+fn meta_state_into_default_delegates_to_meta_state_for_standard_cache() {
+  // KVC-6 (#103): the trait DEFAULT `meta_state_into` delegates to
+  // `meta_state()` and appends. A concrete cache that does NOT override
+  // (e.g. `StandardKvCache` — its meta_state is the trait default empty
+  // Vec, so meta_state_into appends nothing) must still produce the same
+  // observable output.
+  let mut s = StandardKvCache::new();
+  s.update(&kv(&[0.0, 1.0]), &kv(&[0.0, 1.0])).unwrap();
+  let m = s.meta_state();
+  let mut buf: Vec<String> = Vec::new();
+  s.meta_state_into(&mut buf);
+  assert_eq!(
+    m, buf,
+    "default meta_state_into must produce identical output to meta_state"
+  );
+  // For StandardKvCache the meta is empty (no override) — both forms
+  // emit nothing.
+  assert!(buf.is_empty(), "StandardKvCache has no meta_state");
+}
+
+#[test]
+fn state_into_default_delegates_to_state_for_standard_cache() {
+  // KVC-7 (#104): the trait DEFAULT `state_into` delegates to `state()`
+  // and appends. A concrete cache that does NOT override (every cache
+  // EXCEPT `CacheList`) must still produce the same observable output.
+  let mut s = StandardKvCache::new();
+  s.update(&kv(&[0.0, 1.0, 2.0]), &kv(&[0.0, 1.0, 2.0]))
+    .unwrap();
+  let st = s.state().unwrap();
+  let mut buf: Vec<Array> = Vec::new();
+  s.state_into(&mut buf).unwrap();
+  assert_eq!(
+    st.len(),
+    buf.len(),
+    "default state_into must produce identical count to state"
+  );
+  // A populated StandardKvCache has (keys, values) — 2 arrays.
+  assert_eq!(buf.len(), 2, "populated StandardKvCache state has 2 arrays");
+}

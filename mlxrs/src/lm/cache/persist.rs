@@ -201,10 +201,22 @@ pub fn save_prompt_cache(
   let mut arrays: HashMap<String, Array> = HashMap::new();
   let mut side: HashMap<String, String> = HashMap::new();
 
+  // KVC-6/KVC-7 (#103/#104): reuse a single per-loop `Vec<Array>` /
+  // `Vec<String>` across all caches via the trait's `state_into` /
+  // `meta_state_into` buffer-reuse variants — one allocation per loop
+  // iteration's clear, not one per cache. Each iteration `clear()`s the
+  // buffer (preserving capacity) so subsequent appends reuse the same
+  // backing storage. mlx-lm's reference loop pays a fresh `c.state` /
+  // `c.meta_state` tuple per cache; this Rust port matches the observable
+  // serialization byte-for-byte while saving the per-cache `Vec`
+  // allocations.
+  let mut state_buf: Vec<Array> = Vec::new();
+  let mut meta_buf: Vec<String> = Vec::new();
   for (i, c) in cache.iter().enumerate() {
     // `cache_data = [c.state for c in cache]` -> `"{i}.{j}"`.
-    let state = c.state()?;
-    for (j, arr) in state.into_iter().enumerate() {
+    state_buf.clear();
+    c.state_into(&mut state_buf)?;
+    for (j, arr) in state_buf.drain(..).enumerate() {
       arrays.insert(format!("{i}.{j}"), arr);
     }
     // `cache_info = [c.meta_state for c in cache]`, then
@@ -226,11 +238,12 @@ pub fn save_prompt_cache(
     // no-meta cache from an empty metaState, which is correct for
     // `KVCacheSimple`; the scalar form is thus mlx-lm-faithful AND
     // swift-harmless.)
-    let ms = c.meta_state();
-    if ms.is_empty() {
+    meta_buf.clear();
+    c.meta_state_into(&mut meta_buf);
+    if meta_buf.is_empty() {
       side.insert(format!("0.{i}"), String::new());
     } else {
-      for (j, m) in ms.into_iter().enumerate() {
+      for (j, m) in meta_buf.drain(..).enumerate() {
         side.insert(format!("0.{i}.{j}"), m);
       }
     }

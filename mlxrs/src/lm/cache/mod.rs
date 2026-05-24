@@ -228,6 +228,28 @@ pub trait KvCache {
   /// cache holds nothing.
   fn state(&self) -> Result<Vec<Array>>;
 
+  /// Push the serializable array state into a caller-provided buffer —
+  /// the buffer-reuse companion to [`state`](KvCache::state) (KVC-7, #104).
+  ///
+  /// Python's `_BaseCache.state` getter (`cache.py:152-156`) returns a
+  /// fresh tuple per call, and swift's `var state: [MLXArray]` allocates a
+  /// fresh `Vec`; mlxrs's `state()` follows that pattern (`Vec<Array>` per
+  /// call). Hot consumers that already own a working buffer (e.g.
+  /// [`CacheList::state`], `persist::save_prompt_cache`) can avoid the
+  /// per-call `Vec` allocation by reusing one through this method.
+  ///
+  /// The default implementation delegates to [`state`](KvCache::state) and
+  /// `append`s its contents — semantically identical to a direct
+  /// `buf.extend(self.state()?)`. Concrete caches with a fixed pair (e.g.
+  /// `(keys, values)`) MAY override to `try_clone` straight into `buf`
+  /// (saving the intermediate `Vec`); the contract is the same:
+  /// **append** state arrays (do not clear `buf` — multi-child callers
+  /// pass the same buffer through several caches).
+  fn state_into(&self, buf: &mut Vec<Array>) -> Result<()> {
+    buf.extend(self.state()?);
+    Ok(())
+  }
+
   /// Restore the array state (mlx-lm `cache.state` setter).
   fn set_state(&mut self, state: Vec<Array>) -> Result<()>;
 
@@ -277,6 +299,29 @@ pub trait KvCache {
   /// empty for caches without metadata.
   fn meta_state(&self) -> Vec<String> {
     Vec::new()
+  }
+
+  /// Push the serializable scalar metadata into a caller-provided buffer —
+  /// the buffer-reuse companion to [`meta_state`](KvCache::meta_state)
+  /// (KVC-6, #103).
+  ///
+  /// Python's `_BaseCache.meta_state` getter (`cache.py:158-165`) returns
+  /// a fresh tuple per call and swift's `metaState: [String]` allocates a
+  /// fresh `Vec`; mlxrs's `meta_state()` follows the same pattern. Hot
+  /// callers that frame multiple caches' meta — e.g. [`CacheList::
+  /// meta_state`] (which calls `c.meta_state()` for every child on every
+  /// invocation) or `persist::save_prompt_cache` — can avoid the per-call
+  /// `Vec<String>` allocation by reusing a single buffer through this
+  /// method.
+  ///
+  /// The default delegates to [`meta_state`](KvCache::meta_state) and
+  /// `append`s its contents — semantically identical to a direct
+  /// `buf.extend(self.meta_state())`. Concrete caches with a fixed-arity
+  /// meta (e.g. `RotatingKvCache`'s 4 elements) MAY override to push
+  /// directly into `buf` (saving the intermediate `Vec`); the contract is
+  /// the same: **append** meta entries (do not clear `buf`).
+  fn meta_state_into(&self, buf: &mut Vec<String>) {
+    buf.extend(self.meta_state());
   }
 
   /// Restore scalar metadata (mlx-lm `cache.meta_state` setter). The

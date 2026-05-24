@@ -9,11 +9,42 @@ use crate::{
   ops,
 };
 
+/// Hard upper bound on the `slotCount` restored from a serialized
+/// `ArraysCache` meta_state — mlx-swift-lm's `Array(repeating: nil, count:
+/// slotCount)` (`KVCache.swift:1202`) and mlx-lm's equivalent
+/// (`cache.py:642-665`) both allocate a `[None] * slotCount` list with no
+/// upper bound, so a forged/corrupt prompt cache carrying `slotCount =
+/// INT32_MAX` would attempt a multi-GB allocation that `try_reserve_exact`
+/// rejects as OOM only **after** the allocator has been asked. Add an
+/// explicit cap that fails fast on absurd values (KVC-2, #99 — derived from
+/// realistic model maxes: Mamba's `MambaCache` is 2 slots,
+/// `KVCache.swift:1230-1245`; SSM models typically ≤ 64 slots; the cap is
+/// chosen ~4 orders of magnitude above that real-world ceiling so a
+/// legitimately-large valid prompt cache is never rejected, while a forged
+/// `INT32_MAX`-sized one is). Bounds the slot **allocation**; per the
+/// project's bounded-memory-caps discipline, the cumulative work is still
+/// bounded by the existing `try_reserve_exact` + `isize::MAX/elem_size`
+/// checks that run after this gate (so an evader who passes
+/// `MAX_SLOT_COUNT` still faces those secondary gates).
+pub const MAX_SLOT_COUNT: usize = 1 << 20;
+
 /// Parse a comma-separated meta_state value into `Vec<T>`, recoverable on
 /// any parse error. Generic so `presentSlots` (slot indices, `usize`) and
 /// `leftPadding` (signed offsets, `i32`) parse to their producer-native
 /// types — see the call sites in [`ArraysCache::set_meta_state`].
-fn parse_csv<T>(s: &str, what: &str) -> Result<Vec<T>>
+///
+/// **Bounded:** `max_elems` caps both the upfront capacity reservation and
+/// the streamed parse — a forged CSV whose comma-count exceeds `max_elems`
+/// is rejected with `Error::Backend` BEFORE any `Vec<T>` allocation
+/// (Codex-R1 [high] #1, KVC-2 follow-up). The producer side of
+/// `meta_state` only ever emits `slotCount` indices for `presentSlots`
+/// and at most one entry per slot for `leftPadding`, so a `max_elems =
+/// slotCount` (already cap-gated by [`MAX_SLOT_COUNT`]) bounds the
+/// entire parse to slot_count items — closing the "small `slotCount` +
+/// huge CSV payload" evasion of the `MAX_SLOT_COUNT` gate. Comma-count
+/// is computed by `bytes().filter()`, NOT `split().count()`, so the
+/// pre-check itself allocates no `&str` slices.
+fn parse_csv<T>(s: &str, what: &str, max_elems: usize) -> Result<Vec<T>>
 where
   T: FromStr,
   T::Err: std::fmt::Display,
@@ -21,13 +52,32 @@ where
   if s.is_empty() {
     return Ok(Vec::new());
   }
-  s.split(',')
-    .map(|p| {
-      p.parse::<T>().map_err(|e| Error::Backend {
-        message: format!("ArraysCache meta_state {what} ({p:?}): {e}"),
-      })
-    })
-    .collect()
+  // Cheap upper bound on element count via comma byte-counting — no
+  // `&str` slice allocation, no parse work. `split(',')` yields
+  // `commas + 1` substrings, so reject when that exceeds `max_elems`.
+  let comma_count = s.bytes().filter(|&b| b == b',').count();
+  let upper_bound = comma_count.saturating_add(1);
+  if upper_bound > max_elems {
+    return Err(Error::Backend {
+      message: format!(
+        "ArraysCache meta_state {what}: element count ({upper_bound}) exceeds bound ({max_elems}) — \
+         a forged CSV payload was rejected before allocation"
+      ),
+    });
+  }
+  // Pre-reserve so the streamed parse can fail fast on OOM for a hostile
+  // (but in-bound) `max_elems` rather than amortized grow.
+  let mut out: Vec<T> = Vec::new();
+  out
+    .try_reserve_exact(upper_bound)
+    .map_err(|_| Error::OutOfMemory)?;
+  for p in s.split(',') {
+    let v = p.parse::<T>().map_err(|e| Error::Backend {
+      message: format!("ArraysCache meta_state {what} ({p:?}): {e}"),
+    })?;
+    out.push(v);
+  }
+  Ok(out)
 }
 
 /// Generic array-slot cache — opaque per-slot state tensors, **not** 4-D
@@ -424,25 +474,30 @@ impl KvCache for ArraysCache {
           .into(),
       });
     }
-    // `presentSlots` is the producer's own `usize` slot index (emit at the
-    // `meta_state` getter is `i.to_string()` where `i: usize`), so parse it
-    // as `usize` to align producer/consumer types and drop the redundant
-    // `>= 0` + `as usize` cast at the use site below. `leftPadding` stays
-    // `i32` because mlx-lm/mlx-swift treat it as a signed offset and Swift
-    // emits it as `Int`.
-    let present = parse_csv::<usize>(&m[1], "presentSlots")?;
-    let left_padding = match m.get(2) {
-      Some(s) => Some(parse_csv::<i32>(s, "leftPadding")?),
-      None => None,
-    };
     // Atomicity is structural, not incidental: **every** fallible *and*
     // allocating step is staged here, with `self` still completely
     // untouched, so a malformed/hostile meta (bad parse, **or** an
     // attacker-chosen huge `slotCount` whose buffer can't be allocated)
     // returns `Err` with the cache exactly as the prior `set_state` left
     // it — the receiver is mutated by precisely one infallible block at the
-    // end. Two failure modes for an untrusted `slot_count`:
+    // end. Three failure modes for an untrusted `slot_count`:
     //
+    // 0. **Hard cap exceeded** (`slot_count > MAX_SLOT_COUNT`) — surface as
+    //    `Error::Backend` ("slot_count exceeds MAX_SLOT_COUNT"). The
+    //    **first** gate (KVC-2, #99) so a forged `INT32_MAX`-sized
+    //    `slotCount` is rejected before either of the secondary gates
+    //    (capacity-overflow / OOM) runs. Realistic SSM/Mamba caches have ≤
+    //    64 slots (`MambaCache` is 2), so `MAX_SLOT_COUNT = 1 << 20` is far
+    //    above any legitimate use while still well below `isize::MAX`.
+    //
+    //    **Codex-R1 [high] #1 (KVC-2 follow-up):** moved BEFORE the
+    //    `parse_csv` calls below (was previously after them) so a forged
+    //    `slotCount` rejects *before* either CSV's `Vec<T>` allocation —
+    //    closing the "small slot_count + huge presentSlots/leftPadding
+    //    payload" evasion. The CSVs themselves are then parsed with a
+    //    `max_elems = slot_count` bound (see [`parse_csv`]) so a payload
+    //    larger than slot_count is also rejected before any allocation,
+    //    even though the cap above already protects the slot_count.
     // 1. **Capacity overflow** (`slot_count * size_of::<Option<Array>>()`
     //    exceeds `isize::MAX`, the Rust allocator's hard cap) — surface as
     //    `Error::Backend` ("invalid slot_count: capacity overflow"). This
@@ -451,11 +506,21 @@ impl KvCache for ArraysCache {
     //    Pre-checked here because `TryReserveError::kind()` is nightly-only
     //    (#48043) — we can't distinguish OOM from capacity-overflow via
     //    the std `TryReserveError` accessors on stable, so we route the
-    //    overflow case explicitly (Copilot review #3271554056).
+    //    overflow case explicitly (Copilot review #3271554056). Kept as a
+    //    secondary gate after `MAX_SLOT_COUNT` so the hard cap can shrink
+    //    without losing the allocator-level safety net.
     // 2. **Out-of-memory** (the allocator can't satisfy a valid request) —
     //    surface as `Error::OutOfMemory`. After the capacity-overflow
     //    pre-check, the residual `try_reserve_exact` failure is
     //    unambiguously OOM.
+    if slot_count > MAX_SLOT_COUNT {
+      return Err(Error::Backend {
+        message: format!(
+          "ArraysCache meta_state: slot_count {slot_count} exceeds MAX_SLOT_COUNT ({MAX_SLOT_COUNT}) — \
+           realistic SSM/Mamba caches use ≤ 64 slots; the cap fails fast on forged/corrupt meta_state"
+        ),
+      });
+    }
     let elem_size = std::mem::size_of::<Option<Array>>().max(1);
     if slot_count > (isize::MAX as usize) / elem_size {
       return Err(Error::Backend {
@@ -464,6 +529,24 @@ impl KvCache for ArraysCache {
         ),
       });
     }
+    // `presentSlots` is the producer's own `usize` slot index (emit at the
+    // `meta_state` getter is `i.to_string()` where `i: usize`), so parse it
+    // as `usize` to align producer/consumer types and drop the redundant
+    // `>= 0` + `as usize` cast at the use site below. `leftPadding` stays
+    // `i32` because mlx-lm/mlx-swift treat it as a signed offset and Swift
+    // emits it as `Int`.
+    //
+    // Both CSVs are bounded by `slot_count`: the producer's `state_with_slots`
+    // emits at most `slot_count` `presentSlots` indices (one per occupied
+    // slot) and at most `slot_count` `leftPadding` entries (one per slot
+    // entry, when populated), so `max_elems = slot_count` is the exact
+    // legitimate upper bound. Codex-R1 [high] #1: rejects a forged
+    // small-slot-count + huge-payload CSV before allocation.
+    let present = parse_csv::<usize>(&m[1], "presentSlots", slot_count)?;
+    let left_padding = match m.get(2) {
+      Some(s) => Some(parse_csv::<i32>(s, "leftPadding", slot_count)?),
+      None => None,
+    };
     let mut rebuilt: Vec<Option<Array>> = Vec::new();
     rebuilt
       .try_reserve_exact(slot_count)

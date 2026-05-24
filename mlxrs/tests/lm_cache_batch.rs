@@ -1223,3 +1223,424 @@ fn batch_rotating_update_concat_clears_rotated_after_mixed_path() {
   // Sanity: the restored cache reports the same offset.
   assert_eq!(restored.offset(), c.offset());
 }
+
+#[test]
+fn batch_kv_pad_lengths_constructor_is_borrowed_slice() {
+  // KVC-4 (#101): `pad_lengths()` returns the constructor-supplied slice
+  // as a borrowed `&[i32]` — no per-call `.item()` round-trip (mlx-lm's
+  // `int(self.left_padding[i].item())` cache.py:947-955). Mirrors
+  // `ArraysCache::left_padding` for cross-cache consistency.
+  let lp = [3i32, 1, 0];
+  let c = BatchKvCache::new(&lp);
+  assert_eq!(c.pad_lengths(), &lp);
+  // Empty constructor: pad_lengths is empty (NOT a panic, NOT a default).
+  let c0 = BatchKvCache::new(&[]);
+  assert!(c0.pad_lengths().is_empty());
+}
+
+#[test]
+fn batch_kv_pad_lengths_updates_after_set_state() {
+  // KVC-4 (#101): `set_state` materializes the restored `left_padding`
+  // host mirror ONCE — subsequent `pad_lengths()` reads are zero-cost
+  // borrows. Restore via the same Array round-trip a prompt cache load
+  // would use, then verify the host mirror matches the restored values.
+  let initial = [0i32, 0];
+  let mut c = BatchKvCache::new(&initial);
+  // Build a 4-array restored state with non-trivial left_padding.
+  let restored_lp_vals = [2i32, 4];
+  let lp_arr = Array::from_slice::<i32>(&restored_lp_vals, &(2usize,)).unwrap();
+  let off_arr = Array::from_slice::<i32>(&[-2, -4], &(2usize,)).unwrap();
+  let k = kvb(&[&[1.0], &[2.0]]);
+  let v = kvb(&[&[3.0], &[4.0]]);
+  c.set_state(vec![k, v, off_arr, lp_arr]).unwrap();
+  assert_eq!(
+    c.pad_lengths(),
+    &restored_lp_vals,
+    "set_state must materialize the host mirror once at restore time"
+  );
+}
+
+#[test]
+fn batch_kv_pad_lengths_updates_after_finalize() {
+  // KVC-4 (#101): `finalize` applies `left_padding += right_padding`
+  // (cache.py:980-987). The host mirror must update in lockstep — using
+  // the cached `right_padding_host` values from `prepare_right_padding`,
+  // NOT a fresh eval of the Array form.
+  let mut c = BatchKvCache::new(&[1i32, 3]);
+  assert_eq!(c.pad_lengths(), &[1, 3]);
+  // Prefill so finalize has a buffer to roll.
+  let k = kvb(&[&[10.0], &[20.0]]);
+  c.update(&k, &k).unwrap();
+  // Arm right-pad and finalize.
+  c.prepare_right_padding(&[2, 0]).unwrap();
+  c.finalize().unwrap();
+  assert_eq!(
+    c.pad_lengths(),
+    &[3, 3],
+    "left_padding += right_padding mirrored in host pad_lengths"
+  );
+}
+
+#[test]
+fn batch_rotating_pad_lengths_constructor_and_set_state() {
+  // KVC-4 (#101): same accessor exists on `BatchRotatingKvCache` for
+  // cross-cache consistency. Constructor + set_state both maintain the
+  // host mirror.
+  let lp = [2i32, 0];
+  let c = BatchRotatingKvCache::new(4, &lp);
+  assert_eq!(c.pad_lengths(), &lp);
+
+  // Round-trip via set_state with a different left_padding.
+  let mut d = BatchRotatingKvCache::new(4, &[0, 0]);
+  let restored_lp = [1i32, 5];
+  let lp_arr = Array::from_slice::<i32>(&restored_lp, &(2usize,)).unwrap();
+  let off_arr = Array::from_slice::<i32>(&[-1, -5], &(2usize,)).unwrap();
+  let k = kvb(&[&[1.0], &[2.0]]);
+  let v = kvb(&[&[3.0], &[4.0]]);
+  d.set_state(vec![k, v, off_arr, lp_arr]).unwrap();
+  assert_eq!(d.pad_lengths(), &restored_lp);
+}
+
+#[test]
+fn batch_rotating_rotated_flag_observable_through_meta_state() {
+  // KVC-5 (#102): the `rotated` flag MUST be the last mutation in the
+  // commit tail of `update_in_place` / `update_concat` (mirrors swift's
+  // late `self.rotated = false` at KVCache.swift:1330-1370). With every
+  // post-`?` step infallible, an Ok-return is always coherent and an
+  // Err-return commits NOTHING. This test asserts the observable
+  // invariant via meta_state (which serializes `rotated` as the 4th
+  // field): after a mixed prefill + decode that wraps the ring,
+  // meta_state reports `rotated=true` AND the state/meta round-trip
+  // validates (the from_state structural guard would reject any
+  // desynchronized commit, so a green round-trip proves coherence).
+  let lp = [0i32];
+  let mut c = BatchRotatingKvCache::new(3, &lp); // tiny window forces rotation
+  // S=3 prefill fills the ring (off=3, rotated=false yet).
+  let p = kvb(&[&[0.0, 1.0, 2.0]]);
+  c.update(&p, &p).unwrap();
+  let meta_before = c.meta_state();
+  assert_eq!(
+    meta_before[3], "false",
+    "pre-wrap meta_state.rotated == false"
+  );
+  // S=1 decode wraps: idx == max_size → rotated=true, idx=0 → idx=1.
+  let d = kvb(&[&[3.0]]);
+  c.update(&d, &d).unwrap();
+  let meta_after = c.meta_state();
+  assert_eq!(
+    meta_after[3], "true",
+    "post-wrap meta_state.rotated == true"
+  );
+  assert_eq!(c.offset(), 4);
+  // Round-trip MUST succeed — proves rotated is coherent with the
+  // committed ring state (the from_state guard would reject if not).
+  let st = c.state().unwrap();
+  let restored = match from_state("BatchRotatingKVCache", st, &meta_after) {
+    Ok(c) => c,
+    Err(e) => {
+      panic!("post-rotation round-trip must succeed (proves rotated coherence), got Err({e})")
+    }
+  };
+  assert_eq!(restored.offset(), c.offset());
+}
+
+// ── Codex-R1 follow-ups ──────────────────────────────────────────────────
+
+/// Codex-R1 [high] #2: `BatchKvCache::finalize` previously committed the
+/// new `left_padding`/`right_padding=None` even when
+/// `right_padding_host.len() != self.pad_lengths.len()`, leaving the
+/// public `pad_lengths()` slice permanently stale. Fix: explicit
+/// length-1 broadcast (matching the Array op's broadcast rule) OR Err
+/// when shapes don't match a supported pattern.
+///
+/// This test covers BOTH branches:
+///   * length-1 `right_padding` against `pad_lengths.len() == 2`:
+///     finalize MUST succeed AND broadcast — `pad_lengths` is updated
+///     to `[old + scalar, old + scalar]`, NOT left stale.
+///   * length-3 `right_padding` against `pad_lengths.len() == 2`:
+///     finalize MUST Err — the host mirror can't reproduce the Array
+///     side's broadcast (or lack thereof), and we will NOT commit a
+///     desynchronized `pad_lengths`. The Array side itself errors on
+///     `[2] + [3]` (no MLX broadcast rule for `[B] op [B']`, B != B'
+///     != 1), so the same Err is reached structurally.
+#[test]
+fn kvc4_batch_kv_finalize_with_scalar_right_padding_broadcasts_or_errs() {
+  // Case 1: scalar broadcast — right_padding is length-1, pad_lengths is
+  // length-2. The Array op broadcasts `[2] + [1] -> [2]`; the host
+  // mirror MUST broadcast in lockstep, NOT silently skip the update.
+  let mut c = BatchKvCache::new(&[1i32, 3]);
+  assert_eq!(c.pad_lengths(), &[1, 3]);
+  // Prefill so `finalize` has a buffer to operate on.
+  let k = kvb(&[&[10.0], &[20.0]]);
+  c.update(&k, &k).unwrap();
+  // Arm a length-1 right_padding (max > 0 so it's stored).
+  c.prepare_right_padding(&[5]).unwrap();
+  c.finalize().unwrap();
+  assert_eq!(
+    c.pad_lengths(),
+    &[6, 8],
+    "length-1 right_padding MUST broadcast across pad_lengths (was: silently stale [1, 3])"
+  );
+
+  // Case 2: a wildly-mismatched length (3 vs 2). The Array op
+  // `[2] + [3]` errors on shape; our explicit host-side check also
+  // errors. Either way: NO commit, pad_lengths/left_padding/right_padding
+  // are left untouched.
+  let mut d = BatchKvCache::new(&[1i32, 3]);
+  let k2 = kvb(&[&[10.0], &[20.0]]);
+  d.update(&k2, &k2).unwrap();
+  let lp_before = iv(&d.left_padding_arr().unwrap());
+  let pl_before: Vec<i32> = d.pad_lengths().to_vec();
+  d.prepare_right_padding(&[1, 1, 1]).unwrap();
+  assert!(
+    d.finalize().is_err(),
+    "right_padding length 3 vs pad_lengths length 2 MUST Err"
+  );
+  // No partial mutation: pad_lengths, left_padding, and right_padding
+  // are all unchanged — retry-safe.
+  assert_eq!(
+    d.pad_lengths(),
+    pl_before.as_slice(),
+    "pad_lengths unchanged on Err"
+  );
+  assert_eq!(
+    iv(&d.left_padding_arr().unwrap()),
+    lp_before,
+    "left_padding unchanged on Err"
+  );
+}
+
+/// Codex-R1 [medium] #3: `BatchKvCache::set_state` previously swallowed
+/// `to_vec::<i32>` failures (non-I32, non-contiguous, etc.) via
+/// `unwrap_or_else(|_| self.pad_lengths.clone())` and then committed the
+/// new `left_padding` Array — leaving `pad_lengths()` permanently
+/// desynchronized (often at the empty placeholder from
+/// `from_state("BatchKVCache")`'s `BatchKvCache::new(&[])`). Fix:
+/// propagate the extraction failure via `?` and validate
+/// rank/dtype/length BEFORE committing.
+///
+/// Regression: non-I32 restored `left_padding` MUST Err; cache state
+/// (including the placeholder `left_padding` Array and the empty
+/// `pad_lengths`) MUST remain unchanged.
+#[test]
+fn kvc4_batch_kv_set_state_propagates_to_vec_failure() {
+  // Construct a `BatchKvCache` with a known initial `left_padding` so we
+  // can verify it's left untouched on Err.
+  let mut c = BatchKvCache::new(&[1i32, 2]);
+  let pl_before: Vec<i32> = c.pad_lengths().to_vec();
+  let lp_before = iv(&c.left_padding_arr().unwrap());
+
+  // Case A: non-I32 left_padding (F32 instead). Validation MUST fire
+  // BEFORE any mutation.
+  let lp_f32 = Array::from_slice::<f32>(&[1.0, 2.0], &(2usize,)).unwrap();
+  let off = Array::from_slice::<i32>(&[-1, -2], &(2usize,)).unwrap();
+  let k = kvb(&[&[1.0], &[2.0]]);
+  let v = kvb(&[&[3.0], &[4.0]]);
+  assert!(
+    c.set_state(vec![k, v, off, lp_f32]).is_err(),
+    "non-I32 left_padding MUST Err"
+  );
+  assert_eq!(
+    c.pad_lengths(),
+    pl_before.as_slice(),
+    "pad_lengths unchanged on Err"
+  );
+  assert_eq!(
+    iv(&c.left_padding_arr().unwrap()),
+    lp_before,
+    "left_padding unchanged on Err"
+  );
+
+  // Case B: wrong-rank left_padding (2-D instead of 1-D).
+  let lp_2d = Array::from_slice::<i32>(&[1, 2, 3, 4], &(2usize, 2)).unwrap();
+  let off2 = Array::from_slice::<i32>(&[-1, -2], &(2usize,)).unwrap();
+  let k2 = kvb(&[&[1.0], &[2.0]]);
+  let v2 = kvb(&[&[3.0], &[4.0]]);
+  assert!(
+    c.set_state(vec![k2, v2, off2, lp_2d]).is_err(),
+    "2-D left_padding MUST Err (rank validation)"
+  );
+  assert_eq!(c.pad_lengths(), pl_before.as_slice());
+  assert_eq!(iv(&c.left_padding_arr().unwrap()), lp_before);
+
+  // Case C: length mismatch (left_padding length 3, keys batch dim 2).
+  let lp_3 = Array::from_slice::<i32>(&[1, 2, 3], &(3usize,)).unwrap();
+  let off3 = Array::from_slice::<i32>(&[-1, -2], &(2usize,)).unwrap();
+  let k3 = kvb(&[&[1.0], &[2.0]]);
+  let v3 = kvb(&[&[3.0], &[4.0]]);
+  assert!(
+    c.set_state(vec![k3, v3, off3, lp_3]).is_err(),
+    "length-mismatched left_padding MUST Err"
+  );
+  assert_eq!(c.pad_lengths(), pl_before.as_slice());
+  assert_eq!(iv(&c.left_padding_arr().unwrap()), lp_before);
+
+  // Sanity: a well-formed restore still succeeds (the strict validation
+  // does NOT block legitimate state).
+  let good_lp = Array::from_slice::<i32>(&[3, 4], &(2usize,)).unwrap();
+  let good_off = Array::from_slice::<i32>(&[-3, -4], &(2usize,)).unwrap();
+  let good_k = kvb(&[&[1.0], &[2.0]]);
+  let good_v = kvb(&[&[3.0], &[4.0]]);
+  c.set_state(vec![good_k, good_v, good_off, good_lp])
+    .unwrap();
+  assert_eq!(
+    c.pad_lengths(),
+    &[3, 4],
+    "well-formed restore must update pad_lengths"
+  );
+}
+
+/// Codex-R1 [medium] #3 sibling: same `to_vec` propagation fix for
+/// `BatchRotatingKvCache::set_state`. Same failure classes (non-I32,
+/// wrong-rank, length-mismatch) MUST Err with no partial mutation.
+#[test]
+fn kvc4_batch_rotating_set_state_propagates_to_vec_failure() {
+  let mut c = BatchRotatingKvCache::new(4, &[1i32, 2]);
+  let pl_before: Vec<i32> = c.pad_lengths().to_vec();
+  let lp_before = iv(&c.left_padding_arr().unwrap());
+
+  // Non-I32 left_padding.
+  let lp_f32 = Array::from_slice::<f32>(&[1.0, 2.0], &(2usize,)).unwrap();
+  let off = Array::from_slice::<i32>(&[-1, -2], &(2usize,)).unwrap();
+  let k = kvb(&[&[1.0], &[2.0]]);
+  let v = kvb(&[&[3.0], &[4.0]]);
+  assert!(
+    c.set_state(vec![k, v, off, lp_f32]).is_err(),
+    "rotating: non-I32 left_padding MUST Err"
+  );
+  assert_eq!(c.pad_lengths(), pl_before.as_slice());
+  assert_eq!(iv(&c.left_padding_arr().unwrap()), lp_before);
+
+  // Wrong-rank.
+  let lp_2d = Array::from_slice::<i32>(&[1, 2, 3, 4], &(2usize, 2)).unwrap();
+  let off2 = Array::from_slice::<i32>(&[-1, -2], &(2usize,)).unwrap();
+  let k2 = kvb(&[&[1.0], &[2.0]]);
+  let v2 = kvb(&[&[3.0], &[4.0]]);
+  assert!(
+    c.set_state(vec![k2, v2, off2, lp_2d]).is_err(),
+    "rotating: 2-D left_padding MUST Err"
+  );
+  assert_eq!(c.pad_lengths(), pl_before.as_slice());
+  assert_eq!(iv(&c.left_padding_arr().unwrap()), lp_before);
+
+  // Length mismatch.
+  let lp_3 = Array::from_slice::<i32>(&[1, 2, 3], &(3usize,)).unwrap();
+  let off3 = Array::from_slice::<i32>(&[-1, -2], &(2usize,)).unwrap();
+  let k3 = kvb(&[&[1.0], &[2.0]]);
+  let v3 = kvb(&[&[3.0], &[4.0]]);
+  assert!(
+    c.set_state(vec![k3, v3, off3, lp_3]).is_err(),
+    "rotating: length-mismatched left_padding MUST Err"
+  );
+  assert_eq!(c.pad_lengths(), pl_before.as_slice());
+  assert_eq!(iv(&c.left_padding_arr().unwrap()), lp_before);
+
+  // Sanity: well-formed restore still succeeds.
+  let good_lp = Array::from_slice::<i32>(&[3, 4], &(2usize,)).unwrap();
+  let good_off = Array::from_slice::<i32>(&[-3, -4], &(2usize,)).unwrap();
+  let good_k = kvb(&[&[1.0], &[2.0]]);
+  let good_v = kvb(&[&[3.0], &[4.0]]);
+  c.set_state(vec![good_k, good_v, good_off, good_lp])
+    .unwrap();
+  assert_eq!(c.pad_lengths(), &[3, 4]);
+}
+
+// ── Codex-R2 follow-ups ──────────────────────────────────────────────────
+
+/// Codex-R2 [medium]: `BatchRotatingKvCache::finalize` previously
+/// swallowed `to_vec::<i32>` failures on the freshly-rolled
+/// `new_left_padding` via `unwrap_or_else(|_| self.pad_lengths.clone())`
+/// and then committed the new Array anyway — leaving `pad_lengths()`
+/// permanently desynchronized from the rolled Array state. Same class
+/// as R1 #3 (`BatchKvCache::set_state`); fix is to propagate the
+/// extraction failure via `?` BEFORE the infallible commit tail so any
+/// `to_vec` error leaves keys/values/offset/left_padding/_lengths
+/// fully untouched.
+///
+/// The `to_vec` error itself can only be reached via construction paths
+/// that are infeasible from outside (the new_left_padding Array is built
+/// from successful arithmetic ops, so it's always well-formed I32). The
+/// regression guard is therefore structural: assert no
+/// `to_vec::<i32>().unwrap_or_else` pattern remains in the dirty
+/// finalize/update_concat/update_in_place paths. Combined with the
+/// positive-path tests already covering finalize/concat/in-place, this
+/// pins the strict propagation discipline against future regressions.
+#[test]
+fn kvc4_batch_rotating_finalize_propagates_to_vec_failure() {
+  let src = std::fs::read_to_string(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/lm/cache/batch_rotating.rs"
+  ))
+  .expect("batch_rotating.rs must be readable for structural regression check");
+  assert!(
+    !src.contains("to_vec::<i32>()\n        .unwrap_or_else"),
+    "BatchRotatingKvCache must not swallow `to_vec::<i32>` failures via \
+     `unwrap_or_else(|_| self.pad_lengths.clone())` — Codex-R2 [medium] \
+     regression: such a fallback commits a stale `pad_lengths` host mirror \
+     against a freshly-rolled `left_padding` Array. Use `?` propagation \
+     BEFORE the infallible commit tail."
+  );
+  // Also assert no chained-form variant slipped in.
+  assert!(
+    !src.contains("to_vec::<i32>().unwrap_or_else"),
+    "BatchRotatingKvCache must not use any chained `to_vec::<i32>().unwrap_or_else` \
+     — Codex-R2 [medium] regression"
+  );
+}
+
+/// Codex-R2 [medium] sibling: `update_concat` (the `S > 1` path) had
+/// the same swallowed-`to_vec` fallback on its `lp_dirty` branch. Same
+/// structural regression guard — the runtime `to_vec` failure is
+/// unreachable through the public API (Array is constructed from
+/// successful arithmetic ops), so the regression pin is the absence of
+/// the `unwrap_or_else` pattern in source.
+#[test]
+fn kvc4_batch_rotating_update_concat_propagates_to_vec_failure() {
+  let src = std::fs::read_to_string(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/lm/cache/batch_rotating.rs"
+  ))
+  .expect("batch_rotating.rs must be readable for structural regression check");
+  // Count `to_vec::<i32>()?` occurrences — finalize + update_concat +
+  // update_in_place + set_state = 4 strict-propagation sites total
+  // (3 dirty paths + 1 set_state from R1).
+  let strict_count = src.matches("to_vec::<i32>()?").count();
+  assert!(
+    strict_count >= 4,
+    "Expected ≥4 strict `to_vec::<i32>()?` sites in batch_rotating.rs \
+     (finalize + update_concat + update_in_place + set_state) — found {strict_count}. \
+     Codex-R2 [medium] requires the dirty-left_padding paths use `?` propagation."
+  );
+}
+
+/// Codex-R2 [medium] sibling: `update_in_place` (the `S == 1` decode
+/// path) had the same swallowed-`to_vec` fallback on its `lp_dirty`
+/// branch (trim and/or rotate dirty case). Structural guard, same
+/// rationale as the finalize/update_concat siblings.
+///
+/// Positive-path coverage exists in
+/// `batch_rotating_active_ring_then_concat_mixed` and the trim/rotate
+/// tests, which exercise the `lp_dirty == true` branch end-to-end;
+/// this test pins the absence of the swallowing fallback so a future
+/// edit cannot silently reintroduce the desync.
+#[test]
+fn kvc4_batch_rotating_update_in_place_propagates_to_vec_failure() {
+  let src = std::fs::read_to_string(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/lm/cache/batch_rotating.rs"
+  ))
+  .expect("batch_rotating.rs must be readable for structural regression check");
+  // Pin: the post-fix source must mention strict propagation for the
+  // `lp_dirty` branches AND the `pad_lengths.clone()` fallback must
+  // only appear on the `lp_dirty == false` arms (where it's
+  // byte-identical to `self.pad_lengths`, not a stale-on-Err fallback).
+  // The error-path fallback signature was `unwrap_or_else(|_| self.pad_lengths.clone())`;
+  // a structural assert on `pad_lengths.clone()` alone would over-fire
+  // on the legitimate else-branch reuse. Match on the full sin pattern.
+  assert!(
+    !src.contains(".unwrap_or_else(|_| self.pad_lengths.clone())"),
+    "BatchRotatingKvCache must not swallow extraction failures with \
+     `unwrap_or_else(|_| self.pad_lengths.clone())` — Codex-R2 [medium] \
+     regression in any of finalize / update_concat / update_in_place."
+  );
+}

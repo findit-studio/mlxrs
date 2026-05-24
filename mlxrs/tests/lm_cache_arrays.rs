@@ -14,7 +14,7 @@
 use mlxrs::{
   Array,
   error::Error,
-  lm::cache::{ArraysCache, KvCache, MaskMode, RopeOffset, from_state},
+  lm::cache::{ArraysCache, KvCache, MAX_SLOT_COUNT, MaskMode, RopeOffset, from_state},
 };
 
 /// A `[1, 1, S, 1]`-ish slot tensor whose values are directly readable from
@@ -455,5 +455,169 @@ fn left_padding_round_trips_via_meta() {
       assert_eq!(m.to_vec::<bool>().unwrap(), vec![false, true, true, true]);
     }
     _ => panic!("expected array mask from restored left_padding"),
+  }
+}
+
+#[test]
+fn set_meta_state_rejects_slot_count_above_max_cap() {
+  // KVC-2 (#99): a forged/corrupt prompt cache with slotCount > MAX_SLOT_COUNT
+  // is rejected fast with Error::Backend BEFORE try_reserve_exact runs (which
+  // would otherwise hit the allocator with a multi-GB request). Realistic
+  // SSM/Mamba caches have ≤ 64 slots, so the cap (1 << 20) is far above any
+  // legitimate use. The prior `set_state` arrays must be left fully intact —
+  // staged-then-commit transactional discipline (Copilot review #3271554056).
+  let mut d = ArraysCache::new(0);
+  d.set_state(vec![slot(&[1.0, 2.0]), slot(&[3.0])]).unwrap();
+  let just_over = MAX_SLOT_COUNT + 1;
+  let meta = vec![just_over.to_string(), "0,1".into()];
+  let err = d.set_meta_state(&meta);
+  match err {
+    Err(Error::Backend { message }) => {
+      assert!(
+        message.contains("exceeds MAX_SLOT_COUNT"),
+        "expected message to mention MAX_SLOT_COUNT, got: {message}"
+      );
+      assert!(
+        message.contains(&just_over.to_string()),
+        "expected message to include offending slot_count {just_over}, got: {message}"
+      );
+    }
+    other => panic!("expected Err(Backend) about MAX_SLOT_COUNT, got {other:?}"),
+  }
+  // Cache survived unchanged: the 2 compacted arrays are still present.
+  let s = d.state().unwrap();
+  assert_eq!(
+    s.len(),
+    2,
+    "cache must be left untouched on hostile slot_count"
+  );
+}
+
+#[test]
+fn kvc2_arrayscache_rejects_huge_slot_count_before_csv_parse() {
+  // Codex-R1 [high] #1 (KVC-2 follow-up): a forged meta with a `slotCount >
+  // MAX_SLOT_COUNT` AND a huge `presentSlots`/`leftPadding` CSV payload
+  // must be rejected by the `MAX_SLOT_COUNT` gate BEFORE the CSV is parsed
+  // into a `Vec<T>` — closing the "forged slotCount + huge CSV" evasion
+  // where the prior version walked the CSV (large transient allocation +
+  // parse work) before reaching the cap check.
+  //
+  // STRUCTURAL assertion: the error message MUST identify the
+  // `MAX_SLOT_COUNT` gate (not the CSV `presentSlots`/`leftPadding`
+  // element parse) — proving the cap fires first. If the CSV parse ran
+  // first, a malformed token (e.g. `"X"`) would yield a parse error
+  // mentioning `presentSlots`/`leftPadding`, not the cap.
+  let mut d = ArraysCache::new(0);
+  d.set_state(vec![slot(&[1.0])]).unwrap();
+  // Huge slot_count AND a huge CSV payload containing UNPARSABLE tokens.
+  // The cap MUST fire first; if the CSV parse ran first, the test would
+  // hit the unparsable "X"/"Y" tokens and surface "presentSlots"/"X" in
+  // the error message instead of "MAX_SLOT_COUNT".
+  let huge_slot_count = (MAX_SLOT_COUNT + 10).to_string();
+  // ~5 MB of garbage tokens — large enough that any pre-cap CSV parse
+  // would be a measurable transient allocation. Building the input here
+  // is the *test's* allocation, not the implementation's (and the test
+  // is the producer-of-hostile-input — that work is unavoidable).
+  let big_payload = (0..500_000usize)
+    .map(|i| if i.is_multiple_of(2) { "X" } else { "Y" })
+    .collect::<Vec<_>>()
+    .join(",");
+  let meta = vec![huge_slot_count, big_payload.clone()];
+  match d.set_meta_state(&meta) {
+    Err(Error::Backend { message }) => {
+      assert!(
+        message.contains("exceeds MAX_SLOT_COUNT"),
+        "cap MUST fire first: expected MAX_SLOT_COUNT error, got: {message}"
+      );
+      // And NOT a CSV-parse error (would mean the parse ran first).
+      assert!(
+        !message.contains("presentSlots"),
+        "MAX_SLOT_COUNT gate must precede CSV parse; got presentSlots-mentioning error: {message}"
+      );
+    }
+    other => panic!("expected Err(Backend) about MAX_SLOT_COUNT, got {other:?}"),
+  }
+  // Also: the slot_count == 1 case (a small declared cap but a huge CSV
+  // payload) — the per-CSV `max_elems = slot_count` bound MUST reject the
+  // CSV before allocation, with a "element count exceeds bound" message
+  // (NOT a token parse error). This closes the second variant of the
+  // evasion where slot_count itself is small but the CSV is hostile.
+  let meta_small_count_huge_csv = vec!["1".to_string(), big_payload];
+  match d.set_meta_state(&meta_small_count_huge_csv) {
+    Err(Error::Backend { message }) => {
+      assert!(
+        message.contains("element count") && message.contains("exceeds bound"),
+        "CSV bound MUST fire before token parse: expected element-count error, got: {message}"
+      );
+      assert!(
+        message.contains("presentSlots"),
+        "CSV bound message should identify the offending CSV (presentSlots), got: {message}"
+      );
+    }
+    other => panic!("small slot_count + huge CSV must hit CSV bound, got {other:?}"),
+  }
+  // Cache survived all rejected restores untouched.
+  assert_eq!(
+    d.state().unwrap().len(),
+    1,
+    "cache must be left untouched on hostile slot_count / hostile CSV"
+  );
+}
+
+#[test]
+fn kvc2_arrayscache_csv_bound_rejects_oversized_left_padding() {
+  // Codex-R1 [high] #1 sibling assertion: the `leftPadding` CSV is also
+  // bounded by `slot_count` — a forged meta with a valid small
+  // `slot_count` + valid small `presentSlots` but a HUGE `leftPadding`
+  // CSV must be rejected before allocating the `Vec<i32>`.
+  let mut d = ArraysCache::new(0);
+  d.set_state(vec![slot(&[1.0])]).unwrap();
+  let huge_lp_csv = (0..10_000)
+    .map(|i| i.to_string())
+    .collect::<Vec<_>>()
+    .join(",");
+  // slot_count=2, presentSlots="0,1" (in-bound), leftPadding=10000 entries.
+  let meta = vec!["2".to_string(), "0,1".to_string(), huge_lp_csv];
+  match d.set_meta_state(&meta) {
+    Err(Error::Backend { message }) => {
+      assert!(
+        message.contains("element count") && message.contains("exceeds bound"),
+        "leftPadding CSV bound must fire: expected element-count error, got: {message}"
+      );
+      assert!(
+        message.contains("leftPadding"),
+        "CSV bound message should identify the offending CSV (leftPadding), got: {message}"
+      );
+    }
+    other => panic!("huge leftPadding CSV must hit bound, got {other:?}"),
+  }
+  // Cache untouched.
+  assert_eq!(d.state().unwrap().len(), 1);
+}
+
+#[test]
+fn set_meta_state_accepts_slot_count_at_max_cap() {
+  // KVC-2 sanity: a meta with `slotCount = MAX_SLOT_COUNT` (the boundary)
+  // must succeed — only `> MAX_SLOT_COUNT` is rejected. Use an EMPTY
+  // presentSlots CSV so the test does not actually allocate the full
+  // MAX_SLOT_COUNT × sizeof::<Option<Array>>() backing buffer in CI; the
+  // assertion is purely on the gate's boundary, not on the residual
+  // try_reserve_exact (which IS still exercised by the call but may itself
+  // OOM in a constrained CI environment — handled by accepting either
+  // Ok or Err::OutOfMemory, both of which prove the MAX_SLOT_COUNT gate
+  // did NOT fire).
+  let mut d = ArraysCache::new(0);
+  let meta = vec![MAX_SLOT_COUNT.to_string(), String::new()];
+  match d.set_meta_state(&meta) {
+    Ok(()) => {
+      // The cap let it through and the allocator satisfied the request.
+    }
+    Err(Error::OutOfMemory) => {
+      // The cap let it through but the allocator declined — both prove
+      // the MAX_SLOT_COUNT gate is NOT firing at the boundary value.
+    }
+    other => panic!(
+      "boundary slot_count = MAX_SLOT_COUNT must NOT be rejected by the cap gate; got {other:?}"
+    ),
   }
 }

@@ -190,12 +190,30 @@ impl KvCache for CacheList {
   /// trait's `Vec<Array>` (the per-child grouping is recoverable from
   /// [`meta_state`](KvCache::meta_state)'s `stateCount`). Empty list ->
   /// empty state.
+  ///
+  /// Routes through [`state_into`](KvCache::state_into) so each child can
+  /// push directly into the composite buffer — saves one `Vec<Array>`
+  /// allocation per child compared to the previous per-child `state()` +
+  /// `extend` pattern (KVC-7, #104). Behavior is byte-identical.
   fn state(&self) -> Result<Vec<Array>> {
     let mut out = Vec::new();
     for c in &self.caches {
-      out.extend(c.state()?);
+      c.state_into(&mut out)?;
     }
     Ok(out)
+  }
+
+  /// Push every child's state into the caller's buffer — the buffer-reuse
+  /// variant that lets a parent composite ([`super::save_prompt_cache`],
+  /// a nested `CacheList`, …) avoid the per-call `Vec<Array>` allocation
+  /// the default trait method would pay (KVC-7, #104). Equivalent to
+  /// `caches.iter().try_for_each(|c| c.state_into(buf))` — appends each
+  /// child's state in order, never clears `buf`.
+  fn state_into(&self, buf: &mut Vec<Array>) -> Result<()> {
+    for c in &self.caches {
+      c.state_into(buf)?;
+    }
+    Ok(())
   }
 
   /// Split the flattened arrays back per child by each child's *current*
@@ -284,17 +302,29 @@ impl KvCache for CacheList {
   /// `stateCount`/`metaCount` let it slice the flattened
   /// [`state`](KvCache::state) / meta back per child. Information-equivalent
   /// to Python's `([class_names], [child_meta_states])` (cache.py:838-843).
+  ///
+  /// Routes through [`meta_state_into`](KvCache::meta_state_into) so each
+  /// child pushes directly into the composite buffer — saves one
+  /// `Vec<String>` allocation per child compared to the previous per-child
+  /// `meta_state()` + `extend` pattern (KVC-6, #103). The `metaCount` slot
+  /// is reserved before each child appends, then patched in place by
+  /// snapshotting `buf.len()` before/after — preserves the swift-faithful
+  /// framing byte-identically.
   fn meta_state(&self) -> Vec<String> {
-    let mut out = vec![self.caches.len().to_string()];
+    let mut out = Vec::new();
+    self.meta_state_into(&mut out);
+    out
+  }
+
+  /// Push the flattened per-child framing into a caller-provided buffer —
+  /// the buffer-reuse variant ([`meta_state_into`](KvCache::meta_state_into))
+  /// override for `CacheList`. A nested `CacheList` recurses through this
+  /// same override so deep composites pay exactly **one** `Vec<String>`
+  /// allocation at the outermost call (KVC-6, #103). Layout is byte-
+  /// identical to [`meta_state`](KvCache::meta_state).
+  fn meta_state_into(&self, buf: &mut Vec<String>) {
+    buf.push(self.caches.len().to_string());
     for c in &self.caches {
-      // `c.meta_state()` allocates a fresh `Vec<String>` per call and many
-      // concrete caches' meta is non-trivial (Rotating allocates 4
-      // elements, Quantized 3, CacheList's own framing is O(children)).
-      // Compute it once here and consume it directly into the framing —
-      // the per-child class name dispatch is the pure trait-method
-      // `c.reference_class_name()` (no `meta_state` argument), so no
-      // helper is needed (the swift-faithful single switch).
-      let child_meta = c.meta_state();
       let class_name = c.reference_class_name();
       // `state_count()` may fail if a concrete cache falls back to the
       // trait default `Ok(self.state()?.len())` and `state()` itself
@@ -308,12 +338,21 @@ impl KvCache for CacheList {
         .state_count()
         .or_else(|_| c.state().map(|s| s.len()))
         .unwrap_or(0);
-      out.push(class_name.to_string());
-      out.push(state_count.to_string());
-      out.push(child_meta.len().to_string());
-      out.extend(child_meta);
+      buf.push(class_name.to_string());
+      buf.push(state_count.to_string());
+      // Reserve the `metaCount` slot, then push the child's meta directly
+      // into `buf` via `meta_state_into` — no intermediate per-child
+      // `Vec<String>`. Snapshot `buf.len()` before/after to compute the
+      // count, then patch the reserved slot. Identical framing to the
+      // pre-PR `child_meta.len()` value (a deterministic non-overflowing
+      // subtraction since `meta_state_into` only appends).
+      let count_slot = buf.len();
+      buf.push(String::new());
+      let before = buf.len();
+      c.meta_state_into(buf);
+      let appended = buf.len() - before;
+      buf[count_slot] = appended.to_string();
     }
-    out
   }
 
   /// `set_meta_state` is not a valid direct operation on a `CacheList`:
