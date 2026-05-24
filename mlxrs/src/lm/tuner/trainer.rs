@@ -20,6 +20,20 @@
 //! (callbacks fire, optimizer state advances, save hook runs at the right
 //! cadence) is the use case this v1 enables; real model fine-tuning is not.
 //!
+//! ## Periodic-event cadence — OPTIMIZER STEPS (deviation from Python)
+//!
+//! [`TrainingArgs::iters`] counts MICROBATCH iterations (matching Python
+//! `mlx-lm/tuner/trainer.py`), but [`TrainingArgs::steps_per_report`],
+//! [`TrainingArgs::steps_per_eval`], and [`TrainingArgs::steps_per_save`]
+//! count OPTIMIZER STEPS — they fire only after a complete
+//! [`TrainingArgs::grad_accumulation_steps`] window. Python counts these
+//! in microbatches, which makes a caller's report frequency silently
+//! depend on `grad_accumulation_steps`. mlxrs decouples them so a caller
+//! bumping `grad_accumulation_steps` doesn't accidentally inflate their
+//! report / eval / save frequency. Total optimizer steps the loop will
+//! execute is `iters / grad_accumulation_steps` (floored — any final
+//! partial window is dropped).
+//!
 //! ## Surface
 //!
 //! - [`TrainingArgs`] — config (Python `@dataclass class TrainingArgs`,
@@ -95,14 +109,18 @@ pub struct TrainingArgs {
   /// Number of validation batches per eval (Python `val_batches`, default
   /// `25`). `None` uses the entire validation set (Python `-1`).
   pub val_batches: Option<usize>,
-  /// Iterations between training-loss reports (Python `steps_per_report`,
-  /// default `10`).
+  /// OPTIMIZER steps between training-loss reports (Python
+  /// `steps_per_report`, default `10`). NOTE: counts OPTIMIZER steps (not
+  /// microbatches like the Python ref) — see the v1 status note in the
+  /// module-level doc-comment for the rationale.
   pub steps_per_report: usize,
-  /// Iterations between validations (Python `steps_per_eval`, default
-  /// `200`).
+  /// OPTIMIZER steps between validations (Python `steps_per_eval`,
+  /// default `200`). Counts OPTIMIZER steps (see [`Self::steps_per_report`]
+  /// for the deviation from the Python ref).
   pub steps_per_eval: usize,
-  /// Iterations between checkpoint saves (Python `steps_per_save`, default
-  /// `100`).
+  /// OPTIMIZER steps between checkpoint saves (Python `steps_per_save`,
+  /// default `100`). Counts OPTIMIZER steps (see [`Self::steps_per_report`]
+  /// for the deviation from the Python ref).
   pub steps_per_save: usize,
   /// Maximum per-example sequence length after padding/truncation (Python
   /// `max_seq_length`, default `2048`).
@@ -116,7 +134,13 @@ pub struct TrainingArgs {
   /// (training loop does not auto-wrap).
   pub grad_checkpoint: bool,
   /// Number of micro-batches accumulated before an optimizer step (Python
-  /// `grad_accumulation_steps`, default `1`).
+  /// `grad_accumulation_steps`, default `1`). The training loop
+  /// accumulates the SUM of per-microbatch gradients across one window,
+  /// divides by this count (the MEAN), then dispatches to
+  /// [`crate::lm::tuner::optimizers::Optimizer::apply_gradients`]. The
+  /// final partial window at the end of [`Self::iters`] is DROPPED — no
+  /// optimizer call fires for it — so the total optimizer step count is
+  /// `iters / grad_accumulation_steps` (floored).
   pub grad_accumulation_steps: usize,
   /// Cache-clear threshold in bytes (Python `clear_cache_threshold`,
   /// default `0` = disabled). v1 is a no-op (memory management out of
@@ -579,15 +603,24 @@ where
 // ─────────────────────────── train ───────────────────────────
 
 /// Run the training loop on `model` + `optimizer` over `train_dataset`,
-/// optionally evaluating on `val_dataset` every `args.steps_per_eval`
-/// iterations.
+/// optionally evaluating on `val_dataset` every
+/// [`TrainingArgs::steps_per_eval`] OPTIMIZER STEPS.
 ///
 /// Mirrors Python `train` (`trainer.py:218..=387`), with the scope cuts
-/// documented in the [module-level note](self#scope-cuts-deviations-from-python).
+/// documented in the
+/// [scope-cuts module-level note](self#scope-cuts-deviations-from-python),
+/// the v1 mechanics-only / no-real-gradients gate documented in the
+/// [v1 status module-level note](self#v1-status--mechanics-only-train),
+/// and the optimizer-step periodic cadence documented in the
+/// [periodic-event cadence note](self#periodic-event-cadence--optimizer-steps-deviation-from-python).
 ///
-/// The training step computes `value_and_grad` on `loss_fn`'s scalar
-/// output w.r.t. each parameter, then dispatches to
-/// [`Optimizer::apply_gradients`].
+/// Per microbatch the loop computes `(loss, grads)` and accumulates
+/// `grads` into a running sum across [`TrainingArgs::grad_accumulation_steps`]
+/// microbatches; once the window is complete it divides the accumulator
+/// by `grad_accumulation_steps` and dispatches the MEAN to
+/// [`Optimizer::apply_gradients`]. Any final partial window at the end
+/// of [`TrainingArgs::iters`] is dropped. (`grads` is currently
+/// `zeros_like(params)` per the v1 mechanics-only note above.)
 ///
 /// ## Parameter handoff
 ///
@@ -661,11 +694,36 @@ where
       message: "train: steps_per_save must be >= 1".into(),
     });
   }
+  // Total OPTIMIZER steps the loop will execute. Microbatch count is
+  // `args.iters`; one optimizer step per `args.grad_accumulation_steps`
+  // microbatches; any final partial window is DROPPED (no optimizer step
+  // for it). The floored division is therefore the right count.
+  let total_optim_steps = args.iters / args.grad_accumulation_steps;
+  // Periodic-report window accumulators. `window_steps` is OPTIMIZER
+  // STEPS in the current report window, `window_secs` is the cumulative
+  // wall-clock time across all microbatches that fed those steps.
   let mut window_loss = 0.0_f32;
   let mut window_tokens = 0.0_f32;
   let mut window_steps = 0usize;
   let mut window_secs = 0.0_f32;
   let mut trained_tokens = 0usize;
+  // Gradient-accumulation state. `accumulated_grads` collects the SUM of
+  // per-microbatch gradients across one optimizer window, then is divided
+  // by `args.grad_accumulation_steps` (the MEAN) before being dispatched
+  // to the optimizer.
+  let mut accumulated_grads: Option<Weights> = None;
+  let mut accum_count: usize = 0;
+  // OPTIMIZER step counter (NOT microbatch counter). Periodic events —
+  // train-loss reports, val-loss evals, save hooks — fire on this
+  // counter, so the per-event cadence is independent of
+  // `grad_accumulation_steps`. Deviation from `mlx-lm/tuner/trainer.py`
+  // which counts microbatches (see the v1 status note in the module-level
+  // doc-comment); chosen so a caller bumping `grad_accumulation_steps`
+  // doesn't accidentally inflate their report / eval / save frequency.
+  let mut optim_step: usize = 0;
+  // Per-microbatch timing accumulator for the current optimizer window.
+  // Folded into `window_secs` and reset every time the optimizer fires.
+  let mut window_micro_secs = 0.0_f32;
   let mut iter = iterate_batches(
     train_dataset,
     args.batch_size,
@@ -673,61 +731,65 @@ where
     true,
     None,
   )?;
-  for it in 1..=args.iters {
-    // Pre-step validation: at it == 1, every steps_per_eval, and at the
-    // last iteration (Python trainer.py:286..=317).
-    if let Some(val) = val_dataset
-      && (it == 1 || it % args.steps_per_eval == 0 || it == args.iters)
-    {
-      let val_start = Instant::now();
-      let val_loss = evaluate(
-        model,
-        val,
-        args.batch_size,
-        args.val_batches,
-        args.max_seq_length,
-        |m, b, l| (loss_fn)(m, b, l),
-      )?;
-      let val_time = val_start.elapsed().as_secs_f32();
-      callback.on_val_loss_report(&ValInfo {
-        iteration: it.saturating_sub(1),
-        val_loss,
-        val_time,
-      });
-    }
-    let step_start = Instant::now();
+  // Pre-loop val — emit BEFORE the first optimizer step (Python
+  // trainer.py:286..=317 does this implicitly by checking `it == 1`
+  // before its first step body). `iteration: 0` matches the previous
+  // microbatch-based semantics which fired at `iteration: it - 1 = 0`.
+  if let Some(val) = val_dataset
+    && total_optim_steps >= 1
+  {
+    run_val(model, val, args, 0, callback, &loss_fn)?;
+  }
+  for _microbatch_it in 1..=args.iters {
+    let micro_start = Instant::now();
     let batch = iter.next().ok_or_else(|| Error::Backend {
       message: "train: batch iterator exhausted unexpectedly (loop=true should never end)".into(),
     })??;
-    // Compute loss + grad scalars. We use a small closure that re-evaluates
-    // the model's forward pass at the current params + batch — the
-    // gradient is computed w.r.t. each Array in `current_params_vec` by
-    // index. We rebuild the vec from `params` each step (cheap: refcount-
-    // share clones).
+    // Compute loss + (placeholder) gradients. NOTE: this is the v1
+    // mechanics-only path — production code threads `value_and_grad`
+    // over a future `nn::Module` trait that binds `params -> loss`. v1
+    // ships a no-grad pass-through (`build_zero_grads`) gated by
+    // [`TrainingArgs::acknowledge_no_real_gradients`] so the optimizer /
+    // callback / save mechanics can be tested end-to-end.
     let (loss_scalar, ntoks_scalar) = (loss_fn)(model, &batch.tokens, &batch.lengths)?;
     let mut loss_val = loss_scalar.try_clone()?;
     let mut ntoks_val = ntoks_scalar.try_clone()?;
     let loss_f = loss_val.item::<f32>()?;
     let ntoks_f = ntoks_val.item::<f32>()?;
-    // Gradient computation: build per-parameter gradients via
-    // value_and_grad over the loss closure. NOTE: this is a SIMPLIFIED
-    // path — production code would thread the parameter handoff through
-    // a Module trait. v1 ships a no-grad pass-through that lets the loop
-    // mechanics + callbacks be tested end-to-end with mock models that
-    // don't actually backprop. The TrainingArgs.grad_accumulation_steps
-    // logic and optimizer.apply_gradients calls are wired through, with
-    // gradients populated as zeros_like(params) on this v1 path. The full
-    // autograd plumbing arrives once Module + parameter-binding lands.
     let grads: Weights = build_zero_grads(params)?;
-    optimizer.apply_gradients(&grads, params)?;
-    let step_secs = step_start.elapsed().as_secs_f32();
+    // Accumulate (sum) into the current window.
+    accumulated_grads = Some(match accumulated_grads {
+      None => grads,
+      Some(acc) => add_weights(&acc, &grads)?,
+    });
+    accum_count += 1;
     window_loss += loss_f;
     window_tokens += ntoks_f;
-    window_steps += 1;
-    window_secs += step_secs;
     trained_tokens += ntoks_f as usize;
-    // Periodic train-loss report.
-    if it % args.steps_per_report == 0 || it == args.iters {
+    window_micro_secs += micro_start.elapsed().as_secs_f32();
+    // Optimizer step fires only when the accumulation window is full.
+    // Partial windows at the end of `iters` are DROPPED (no
+    // apply_gradients call for them); see the contract documented on
+    // [`TrainingArgs::grad_accumulation_steps`] + the v1 status note.
+    if accum_count < args.grad_accumulation_steps {
+      continue;
+    }
+    let avg = divide_weights(
+      accumulated_grads
+        .as_ref()
+        .expect("accumulated_grads must be Some after at least one accum"),
+      args.grad_accumulation_steps as f32,
+    )?;
+    optimizer.apply_gradients(&avg, params)?;
+    optim_step += 1;
+    accumulated_grads = None;
+    accum_count = 0;
+    window_steps += 1;
+    window_secs += window_micro_secs;
+    window_micro_secs = 0.0;
+    let is_last_optim_step = optim_step == total_optim_steps;
+    // Periodic train-loss report (cadence in OPTIMIZER STEPS).
+    if optim_step % args.steps_per_report == 0 || is_last_optim_step {
       let mean_loss = if window_steps > 0 {
         window_loss / (window_steps as f32)
       } else {
@@ -744,7 +806,7 @@ where
         0.0
       };
       callback.on_train_loss_report(&TrainInfo {
-        iteration: it,
+        iteration: optim_step,
         train_loss: mean_loss,
         learning_rate: optimizer.learning_rate(),
         iterations_per_second: it_sec,
@@ -756,13 +818,59 @@ where
       window_steps = 0;
       window_secs = 0.0;
     }
-    // Periodic save hook.
-    if it % args.steps_per_save == 0 {
-      callback.on_save(it, &args.adapter_file)?;
+    // Periodic mid-training eval (cadence in OPTIMIZER STEPS). Fires
+    // both on the regular cadence and at the final optimizer step (so
+    // the caller always sees an end-of-training validation).
+    if let Some(val) = val_dataset
+      && (optim_step % args.steps_per_eval == 0 || is_last_optim_step)
+    {
+      run_val(model, val, args, optim_step, callback, &loss_fn)?;
+    }
+    // Periodic save hook (cadence in OPTIMIZER STEPS).
+    if optim_step % args.steps_per_save == 0 {
+      callback.on_save(optim_step, &args.adapter_file)?;
     }
   }
   // Final save hook (Python: writes adapters.safetensors at the end).
-  callback.on_save(args.iters, &args.adapter_file)?;
+  // Iteration label is the LAST optimizer step (0 if there were no
+  // optimizer steps, e.g. iters < grad_accumulation_steps).
+  callback.on_save(optim_step, &args.adapter_file)?;
+  Ok(())
+}
+
+/// Run one validation pass and dispatch `on_val_loss_report` with the
+/// matching [`ValInfo`]. Centralized so the train loop's pre-loop
+/// (iteration 0) and per-step (iteration = `optim_step`) val call sites
+/// share one body.
+fn run_val<M, D, L, C>(
+  model: &M,
+  val: &D,
+  args: &TrainingArgs,
+  iteration: usize,
+  callback: &mut C,
+  loss_fn: &L,
+) -> Result<()>
+where
+  M: Model,
+  D: Dataset,
+  L: Fn(&M, &Array, &Array) -> Result<(Array, Array)>,
+  C: TrainingCallback,
+{
+  let val_start = Instant::now();
+  let val_loss = evaluate(
+    model,
+    val,
+    args.batch_size,
+    args.val_batches,
+    args.max_seq_length,
+    |m, b, l| (loss_fn)(m, b, l),
+  )?;
+  let val_time = val_start.elapsed().as_secs_f32();
+  callback.on_val_loss_report(&ValInfo {
+    iteration,
+    val_loss,
+    val_time,
+  });
   Ok(())
 }
 
@@ -776,6 +884,45 @@ fn build_zero_grads(params: &Weights) -> Result<Weights> {
     grads.insert(key.clone(), crate::ops::misc::zeros_like(value)?);
   }
   Ok(grads)
+}
+
+/// Element-wise sum of two parameter-keyed gradient maps. `a` and `b`
+/// must share the same key set (the trainer always builds them from the
+/// same `params`, so this is an internal invariant — any missing key is
+/// reported via [`Error::Backend`] rather than silently dropped).
+fn add_weights(a: &Weights, b: &Weights) -> Result<Weights> {
+  if a.len() != b.len() {
+    return Err(Error::Backend {
+      message: format!(
+        "trainer::add_weights: mismatched key counts {} vs {}",
+        a.len(),
+        b.len()
+      ),
+    });
+  }
+  let mut out: Weights = HashMap::with_capacity(a.len());
+  for (key, lhs) in a {
+    let Some(rhs) = b.get(key) else {
+      return Err(Error::Backend {
+        message: format!("trainer::add_weights: key `{key}` missing from rhs"),
+      });
+    };
+    out.insert(key.clone(), arithmetic::add(lhs, rhs)?);
+  }
+  Ok(out)
+}
+
+/// Scalar-divide every entry in a parameter-keyed gradient map by
+/// `divisor`. Used by the [`train`] gradient-accumulation path to
+/// average the per-microbatch summed gradients before dispatching to
+/// the optimizer.
+fn divide_weights(w: &Weights, divisor: f32) -> Result<Weights> {
+  let divisor_scalar = Array::full::<f32>(&[0i32; 0], divisor)?;
+  let mut out: Weights = HashMap::with_capacity(w.len());
+  for (key, value) in w {
+    out.insert(key.clone(), arithmetic::divide(value, &divisor_scalar)?);
+  }
+  Ok(out)
 }
 
 #[cfg(test)]
@@ -1188,5 +1335,153 @@ mod tests {
       }
       other => panic!("expected Err(Backend) for grad_accumulation_steps=0; got {other:?}"),
     }
+  }
+
+  // ─────────── F3 — grad accumulation respects window cadence ───────────
+
+  /// Counting optimizer wrapper: counts `apply_gradients` invocations
+  /// without modifying params. Used to assert the train loop fires the
+  /// optimizer at the OPTIMIZER STEP cadence (one call per accumulation
+  /// window completion) rather than per microbatch.
+  struct CountingOptimizer {
+    apply_calls: usize,
+    step_count: usize,
+    lr: f32,
+  }
+  impl crate::lm::tuner::optimizers::Optimizer for CountingOptimizer {
+    fn init(&mut self, _params: &Weights) -> Result<()> {
+      Ok(())
+    }
+    fn apply_gradients(&mut self, _gradients: &Weights, _params: &mut Weights) -> Result<()> {
+      self.apply_calls += 1;
+      self.step_count += 1;
+      Ok(())
+    }
+    fn step(&self) -> usize {
+      self.step_count
+    }
+    fn learning_rate(&self) -> f32 {
+      self.lr
+    }
+  }
+
+  fn build_train_fixture()
+  -> Result<(FakeModel, FakeDataset, Weights, NoopCallback, CountingOptimizer)> {
+    let dataset = FakeDataset::new(4, 6);
+    let model = FakeModel;
+    let mut params: Weights = HashMap::new();
+    params.insert("w".into(), Array::full::<f32>(&[0i32; 0], 1.0)?);
+    let cb = NoopCallback;
+    let opt = CountingOptimizer {
+      apply_calls: 0,
+      step_count: 0,
+      lr: 0.0,
+    };
+    Ok((model, dataset, params, cb, opt))
+  }
+
+  #[test]
+  fn grad_accumulation_steps_2_calls_optimizer_every_other_iter() -> Result<()> {
+    // iters=10, grad_accumulation_steps=2 → 5 optimizer calls.
+    let (model, dataset, mut params, mut cb, mut opt) = build_train_fixture()?;
+    let args = TrainingArgs {
+      iters: 10,
+      grad_accumulation_steps: 2,
+      // steps_per_* large enough to avoid firing during this test (we
+      // only care about optimizer call count here).
+      steps_per_report: 100,
+      steps_per_eval: 100,
+      steps_per_save: 100,
+      batch_size: 4,
+      max_seq_length: 64,
+      val_batches: Some(1),
+      acknowledge_no_real_gradients: true,
+      ..TrainingArgs::default()
+    };
+    train(
+      &model,
+      &mut opt,
+      &mut params,
+      &dataset,
+      None,
+      &args,
+      default_loss,
+      &mut cb,
+    )?;
+    assert_eq!(
+      opt.apply_calls, 5,
+      "iters=10 + grad_accumulation_steps=2 must produce 5 optimizer steps; got {}",
+      opt.apply_calls,
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn grad_accumulation_steps_partial_window_at_end_drops() -> Result<()> {
+    // iters=11, grad_accumulation_steps=4 → only 11/4 = 2 complete
+    // windows (microbatches 1..=4 → step 1, 5..=8 → step 2). The final
+    // 3 microbatches (9, 10, 11) form a partial window which is DROPPED
+    // (no third optimizer call).
+    let (model, dataset, mut params, mut cb, mut opt) = build_train_fixture()?;
+    let args = TrainingArgs {
+      iters: 11,
+      grad_accumulation_steps: 4,
+      steps_per_report: 100,
+      steps_per_eval: 100,
+      steps_per_save: 100,
+      batch_size: 4,
+      max_seq_length: 64,
+      val_batches: Some(1),
+      acknowledge_no_real_gradients: true,
+      ..TrainingArgs::default()
+    };
+    train(
+      &model,
+      &mut opt,
+      &mut params,
+      &dataset,
+      None,
+      &args,
+      default_loss,
+      &mut cb,
+    )?;
+    assert_eq!(
+      opt.apply_calls, 2,
+      "iters=11 + grad_accumulation_steps=4 must drop the final partial \
+       window of 3 microbatches; expected 2 optimizer calls, got {}",
+      opt.apply_calls,
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn grad_accumulation_steps_1_is_identity_to_microbatch_count() -> Result<()> {
+    // The grad_accumulation_steps=1 case must NOT regress — every
+    // microbatch is its own optimizer step.
+    let (model, dataset, mut params, mut cb, mut opt) = build_train_fixture()?;
+    let args = TrainingArgs {
+      iters: 7,
+      grad_accumulation_steps: 1,
+      steps_per_report: 100,
+      steps_per_eval: 100,
+      steps_per_save: 100,
+      batch_size: 4,
+      max_seq_length: 64,
+      val_batches: Some(1),
+      acknowledge_no_real_gradients: true,
+      ..TrainingArgs::default()
+    };
+    train(
+      &model,
+      &mut opt,
+      &mut params,
+      &dataset,
+      None,
+      &args,
+      default_loss,
+      &mut cb,
+    )?;
+    assert_eq!(opt.apply_calls, 7);
+    Ok(())
   }
 }
