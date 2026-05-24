@@ -98,7 +98,7 @@ fn closure_constructor_failure_does_not_double_free_payload() {
     let captured = i as f32;
     let f = custom_vjp(
       move |xs| Ok(vec![square(&xs[0])?]),
-      move |primals, _outputs, _cot| {
+      move |primals, _cot, _outputs| {
         let dims = primals[0].shape();
         Ok(vec![Array::full::<f32>(&&dims[..], captured)?])
       },
@@ -320,7 +320,7 @@ fn jvp_matches_directional_derivative() {
 fn custom_vjp_overrides_autograd() {
   let f = custom_vjp(
     |xs| Ok(vec![square(&xs[0])?]),
-    |primals, _outputs, _cot| {
+    |primals, _cot, _outputs| {
       // Ignore the cotangent, return a constant 42 in primal-shape.
       let dims = primals[0].shape();
       Ok(vec![Array::full::<f32>(&&dims[..], 42.0)?])
@@ -331,6 +331,75 @@ fn custom_vjp_overrides_autograd() {
   let x = Array::full::<f32>(&[0i32; 0], 3.0).unwrap();
   let mut grads = g(&[x]).unwrap();
   assert!(approx_eq(grads[0].item::<f32>().unwrap(), 42.0, 1e-5));
+}
+
+/// Order-sensitive ABI regression guard for the `custom_vjp` trampoline.
+///
+/// Upstream `mlx/primitives.cpp::CustomTransforms::vjp` invokes the user
+/// VJP callback positionally as `vjp_fun_(inputs, cotangents, outputs)`.
+/// A pre-fix transposition in `transforms::closure::trampoline_custom`
+/// bound the slots as `(primals, outputs, cotangents)` — semantically
+/// wrong for every downstream `custom_vjp` user (the closure would treat
+/// the cotangent vector as the forward outputs and vice versa).
+///
+/// The fix (commit b9842b0) corrected the trampoline to bind
+/// `(primals, cotangents, outputs)`, matching mlx core. This test pins
+/// that ABI by constructing a backward closure whose return value depends
+/// DISTINCTLY on each of `primals[0]`, `cotangents[0]`, and `outputs[0]`,
+/// so any future regression swapping the cotangent / output slots is
+/// caught deterministically in routine CI (this test is intentionally
+/// non-ignored; the existing custom-VJP tests above use constant VJP
+/// bodies that would still pass with the slots reversed).
+///
+/// Setup:
+/// - Forward `f(x) = x^2`. At primal `x = 3.0`, the forward output is `9.0`.
+/// - VJP returns `cotangents[0] * 10.0 + outputs[0] + primals[0] * 1000.0`
+///   evaluated element-wise (single-scalar I/O so each slot collapses to a
+///   scalar add).
+/// - Cotangent fed via `vjp(...)` is `2.0`.
+///
+/// Correct slot binding `(primals, cotangents, outputs)` yields:
+///   `2.0 * 10.0 + 9.0 + 3.0 * 1000.0 = 3029.0`
+///
+/// If the slots were swapped to the pre-fix `(primals, outputs,
+/// cotangents)`, the closure would receive `cotangents = [9.0]` and
+/// `outputs = [2.0]`, yielding:
+///   `9.0 * 10.0 + 2.0 + 3.0 * 1000.0 = 3092.0` — a deterministic
+/// 63-unit gap that fails the assertion below.
+#[test]
+fn custom_vjp_trampoline_argument_order_regression() {
+  let f = custom_vjp(
+    |xs| Ok(vec![square(&xs[0])?]),
+    |primals, cotangents, outputs| {
+      // Distinct, slot-revealing combination:
+      //   cot * 10 + out + primal * 1000
+      let ten = Array::full::<f32>(&[0i32; 0], 10.0)?;
+      let thousand = Array::full::<f32>(&[0i32; 0], 1000.0)?;
+      let c_term = multiply(&cotangents[0], &ten)?;
+      let p_term = multiply(&primals[0], &thousand)?;
+      let sum1 = add(&c_term, &outputs[0])?;
+      Ok(vec![add(&sum1, &p_term)?])
+    },
+  )
+  .unwrap();
+
+  let primal = Array::full::<f32>(&[0i32; 0], 3.0).unwrap();
+  let cotangent = Array::full::<f32>(&[0i32; 0], 2.0).unwrap();
+
+  let (_vals, mut grads) = vjp(f, &[primal], &[cotangent]).unwrap();
+  assert_eq!(grads.len(), 1);
+  let got = grads[0].item::<f32>().unwrap();
+
+  // Correct trampoline order: 2 * 10 + 9 + 3 * 1000 = 3029.
+  let expected = 3029.0_f32;
+  // Pre-fix swapped order would yield: 9 * 10 + 2 + 3 * 1000 = 3092 (delta 63).
+  let swapped_value = 3092.0_f32;
+  assert!(
+    approx_eq(got, expected, 1e-3),
+    "trampoline arg order regression: got {got}, expected {expected} \
+     (a value near {swapped_value} would indicate the pre-fix \
+     `(primals, outputs, cotangents)` slot ordering has been reintroduced)"
+  );
 }
 
 // ───────────────────────────── checkpoint ─────────────────────────────
