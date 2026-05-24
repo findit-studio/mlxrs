@@ -48,6 +48,16 @@ pub mod encode_options;
   feature = "tokenizer-deepseek-v32"
 ))]
 mod generated;
+/// SentencePiece Unigram / BPE tokenizer (protobuf reader + Viterbi
+/// lattice + byte-fallback). Standalone, self-contained — uses neither
+/// the `tokenizers` crate nor [`wrapper::Tokenizer`]; loads from a raw
+/// `*.model` protobuf or the JSON `tokenizer.json` model subtree (with
+/// `tokenizer-config`). Gated under `audio` for now — the first caller
+/// is `crate::audio::stt::streaming`; promote to a standalone feature
+/// when a non-audio caller needs it.
+#[cfg(feature = "audio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "audio")))]
+pub mod sentencepiece;
 #[cfg(feature = "tokenizer-stream")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokenizer-stream")))]
 pub mod stream;
@@ -57,6 +67,13 @@ pub mod tools;
 pub mod wrapper;
 
 pub use encode_options::{EncodeOptions, Encoded};
+/// Re-export the SPM Unigram/BPE tokenizer top-level surface — gated
+/// under `audio` for now (see [`sentencepiece`] for the rationale).
+#[cfg(feature = "audio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "audio")))]
+pub use sentencepiece::{
+  SentencePieceModelType, SentencePiecePieceType, SentencePieceToken, SentencePieceTokenizer,
+};
 /// SPM/BPE streaming detokenizers. Each is gated on its own feature; the
 /// naive detokenizer + trait come with bare `tokenizer-stream`.
 #[cfg(feature = "tokenizer-bpe")]
