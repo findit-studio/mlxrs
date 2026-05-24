@@ -504,6 +504,12 @@ impl KvCache for CacheList {
     "CacheList"
   }
 
+  /// P1 #110: per-layer fast-path downcast target — see the
+  /// [`KvCache`]-trait doc's **Per-layer fast-path convention**.
+  fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+    self
+  }
+
   /// Transactional override of [`KvCache::from_serialized`] — leaves `self`
   /// byte-identical to its pre-call state on every recoverable error
   /// (malformed framing, non-numeric child count / `stateCount` /

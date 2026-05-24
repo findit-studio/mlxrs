@@ -21,7 +21,7 @@
 //!
 //! No implicit eval: every `Array` op is a pure [`crate::ops`] composition
 //! returning `Result`; the only materialization is the token boundary
-//! `.item::<u32>()` the inner [`crate::lm::generate::Generator`] handles —
+//! `.item::<u32>()` the inner LM-side generator handles —
 //! [`stt_generate`] never materializes the encoder states or the logits
 //! itself.
 //!
@@ -287,9 +287,9 @@ fn audio_path_to_mel<M: super::model::Model>(
 /// loop][crate::lm::generate] yields, so callers familiar with the LM loop
 /// see no new step shape).
 ///
-/// Lifetime `'a` ties to the borrowed model (same pattern as
-/// [`crate::lm::generate::Generator`]); the cache is owned so the iterator
-/// fully owns the in-flight decode state.
+/// Lifetime `'a` ties to the borrowed model (same pattern as the LM-side
+/// generator returned by [`crate::lm::generate::generate_step`]); the
+/// cache is owned so the iterator fully owns the in-flight decode state.
 ///
 /// The iterator **fuses**: after it yields `Err` (a step failed) or
 /// finishes (eos / `max_tokens`) every further `next()` is `None` — never a
@@ -370,7 +370,7 @@ impl<M: super::model::Model> SttGenerator<'_, M> {
     if !self.processors.is_empty() {
       try_extend_from_slice(&mut self.history, &[self.last])?;
       for p in &self.processors {
-        logits = p(&self.history, &logits)?;
+        logits = p.apply(&self.history, &logits)?;
       }
     }
 
@@ -382,7 +382,7 @@ impl<M: super::model::Model> SttGenerator<'_, M> {
     // 4. sample. The sampler chain is built by `make_sampler` from
     //    `self.lm` (the LM loop's exact sampler composition); the default
     //    `temp == 0` resolves to the deterministic argmax sampler.
-    let mut sampled = (self.sampler)(&logprobs)?;
+    let mut sampled = self.sampler.sample(&logprobs)?;
 
     // 5. token boundary — the only materialization (LM loop's `y.item()`).
     //    `argmax` / `categorical` both yield `U32`.

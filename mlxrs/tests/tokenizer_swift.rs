@@ -9,7 +9,10 @@
 
 use std::io::Write;
 
-use mlxrs::tokenizer::Tokenizer;
+// P1 #111: `Tokenizer::detokenizer()` returns the enum-unified
+// [`Detokenizer`]; methods like `add_token` / `text` / `last_segment`
+// require the [`StreamingDetokenizer`] trait in scope.
+use mlxrs::tokenizer::{StreamingDetokenizer, Tokenizer};
 
 const TOKENIZER_JSON: &str = include_str!("fixtures/tokenizer.json");
 

@@ -44,14 +44,26 @@ use super::stream::SpmStreamingDetokenizer;
 #[cfg(any(feature = "tokenizer-spm", feature = "tokenizer-bpe"))]
 use super::stream::infer_detokenizer_class;
 #[cfg(feature = "tokenizer-stream")]
-use super::stream::{DetokenizerClass, NaiveStreamingDetokenizer, StreamingDetokenizer};
+use super::stream::{Detokenizer, DetokenizerClass, NaiveHfDetokenizer};
 #[cfg(feature = "tokenizer-tools")]
 use super::tools::{self, ToolParser};
 
-/// A boxed streaming detokenizer (the `detokenizer()` factory return).
+/// The `detokenizer()` factory return — the enum-unified
+/// [`Detokenizer`] (P1 #111).
+///
+/// # Breaking change (P1 #111)
+///
+/// Previously `pub type BoxedDetokenizer = Box<dyn StreamingDetokenizer>`
+/// — one vtable indirection per emitted token. This is now an alias for
+/// the unified [`Detokenizer`] enum (`Naive` / `Spm` / `Bpe` /
+/// `Custom`), dispatching the per-token `add_token` / `text` /
+/// `last_segment` calls via `match` so the canonical variants inline.
+/// Callers passing `Box<dyn StreamingDetokenizer>` directly must wrap
+/// in [`Detokenizer::Custom`] (one indirection per call — the same
+/// cost as the prior alias).
 #[cfg(feature = "tokenizer-stream")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokenizer-stream")))]
-pub type BoxedDetokenizer = Box<dyn StreamingDetokenizer>;
+pub type BoxedDetokenizer = Detokenizer;
 
 /// Result of `_infer_thinking`: start/end marker strings and their token ids.
 #[derive(Debug, Clone, Default)]
@@ -711,12 +723,12 @@ impl Tokenizer {
       DetokenizerClass::Spm | DetokenizerClass::SpmNoSpace => {
         let vocab = self.hf.get_vocab(true);
         let trim = self.detok_class == DetokenizerClass::Spm;
-        Box::new(SpmStreamingDetokenizer::new(vocab, trim))
+        Detokenizer::Spm(SpmStreamingDetokenizer::new(vocab, trim))
       }
       #[cfg(feature = "tokenizer-bpe")]
       DetokenizerClass::Bpe => {
         let vocab = self.hf.get_vocab(true);
-        Box::new(BpeStreamingDetokenizer::new(vocab, clean))
+        Detokenizer::Bpe(BpeStreamingDetokenizer::new(vocab, clean))
       }
       #[cfg(not(feature = "tokenizer-spm"))]
       DetokenizerClass::Spm | DetokenizerClass::SpmNoSpace => {
@@ -732,12 +744,12 @@ impl Tokenizer {
     }
   }
 
-  /// The naive re-decode detokenizer over a cloned HF tokenizer.
+  /// The naive re-decode detokenizer over a cloned HF tokenizer —
+  /// returns the [`Detokenizer::Naive`] variant (the non-generic
+  /// concrete [`NaiveHfDetokenizer`] so the enum unification holds).
   #[cfg(feature = "tokenizer-stream")]
   fn naive_detokenizer(&self, clean: bool) -> BoxedDetokenizer {
-    let hf = self.hf.clone();
-    let decode = move |ids: &[u32]| hf.decode(ids, false).unwrap_or_default();
-    Box::new(NaiveStreamingDetokenizer::new(decode, clean))
+    Detokenizer::Naive(Box::new(NaiveHfDetokenizer::new(self.hf.clone(), clean)))
   }
 
   /// The inferred detokenizer class.

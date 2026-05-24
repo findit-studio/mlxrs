@@ -629,6 +629,9 @@ mod tests {
     fn copy(&self) -> Result<Box<dyn KvCache>> {
       self.inner.copy()
     }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+      self
+    }
   }
 
   /// `prefill_full` advances every layer's cache to exactly the prompt length
@@ -838,6 +841,9 @@ mod tests {
       }
       fn copy(&self) -> Result<Box<dyn KvCache>> {
         self.inner.copy()
+      }
+      fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
       }
     }
 

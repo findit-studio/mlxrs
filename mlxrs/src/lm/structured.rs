@@ -26,18 +26,25 @@
 //!   (`build_json_schema_logits_processor`). Single-call helper for the
 //!   common "give me a JSON-schema-constrained processor" path.
 //!
-//! **Per-step contract.** The processor implements the `Fn(&[u32], &Array)
-//! -> Result<Array>` [`crate::lm::generate::LogitsProcessor`] alias. On the
-//! **first** call the matcher is freshly built and the input-history's last
-//! token is NOT consumed (mirroring the Python class's `is_first_token`
-//! flag, `structured.py:18, 70-75`): the prompt has already produced the
-//! current logits, so the matcher's initial state already governs which
-//! token may be sampled. On every subsequent call the last id from `tokens`
-//! is fed through [`llguidance::Matcher::consume_token`] BEFORE computing
-//! the next mask. The returned `Array` has the same shape + dtype as the
-//! input `logits`; tokens not in the matcher's allowed set are replaced
-//! with `-inf` (in the logits' dtype) via [`crate::ops::logical::select`],
-//! using the same `Array`/`select` masking idiom as
+//! **Per-step contract.** [`crate::lm::generate::LogitsProcessor`] is now a
+//! public `enum` (P1 #109) with built-in variants for common cases
+//! (`LogitBias`, `RepetitionPenalty`, `PresencePenalty`, `FrequencyPenalty`).
+//! Custom or stateful logits processors plug in through the
+//! `LogitsProcessor::Custom(Box::new(...))` escape hatch, which preserves
+//! the previous `Box<dyn Fn(&[u32], &Array) -> Result<Array>>` semantics at
+//! the cost of one vtable dispatch per token. This module's
+//! [`LLGuidanceLogitsProcessor::into_logits_processor`](crate::lm::structured::LLGuidanceLogitsProcessor::into_logits_processor)
+//! wraps the matcher state in exactly that `Custom` variant. On the **first** call the matcher
+//! is freshly built and the input-history's last token is NOT consumed
+//! (mirroring the Python class's `is_first_token` flag,
+//! `structured.py:18, 70-75`): the prompt has already produced the current
+//! logits, so the matcher's initial state already governs which token may be
+//! sampled. On every subsequent call the last id from `tokens` is fed
+//! through [`llguidance::Matcher::consume_token`] BEFORE computing the next
+//! mask. The returned `Array` has the same shape + dtype as the input
+//! `logits`; tokens not in the matcher's allowed set are replaced with
+//! `-inf` (in the logits' dtype) via [`crate::ops::logical::select`], using
+//! the same `Array`/`select` masking idiom as
 //! [`crate::lm::sample::apply_min_p`].
 //!
 //! **Shape support.** `logits` may be `[V]` (single-row) or `[1, V]` (the
@@ -248,12 +255,15 @@ fn tok_env_from_tokenizer(
 ///
 /// # Mutability
 ///
-/// [`crate::lm::generate::LogitsProcessor`] is `Box<dyn Fn(...)>`
-/// (not `FnMut`) so processors that own mutable state — exactly this one
-/// — hold it behind a [`RefCell`]. The borrow is taken inside
-/// [`apply`](Self::apply) and released before the call returns; calling
-/// the same processor re-entrantly (e.g. composing it with another
-/// processor that re-invokes it) would panic, but the single-call-per-step
+/// [`crate::lm::generate::LogitsProcessor`] is now a public `enum`
+/// (P1 #109); stateful custom processors plug in via
+/// `LogitsProcessor::Custom(Box::new(...))`, whose closure type is
+/// `Box<dyn Fn(&[u32], &Array) -> Result<Array>>` (not `FnMut`). Processors
+/// that own mutable state — exactly this one — therefore hold it behind a
+/// [`RefCell`]. The borrow is taken inside [`apply`](Self::apply) and
+/// released before the call returns; calling the same processor
+/// re-entrantly (e.g. composing it with another processor that re-invokes
+/// it) would panic, but the single-call-per-step
 /// `make_logits_processors` chain never does that.
 pub struct LLGuidanceLogitsProcessor {
   matcher: RefCell<Matcher>,
@@ -462,13 +472,18 @@ impl LLGuidanceLogitsProcessor {
     Ok(())
   }
 
-  /// Wrap into a [`LogitsProcessor`] box so the processor plugs into
+  /// Wrap into a [`LogitsProcessor`] so the processor plugs into
   /// [`crate::lm::generate::make_logits_processors`]' output list.
   ///
-  /// The boxed closure captures `self` by move; one processor instance
-  /// per generation (the matcher is stateful — see the type-level note).
+  /// Returns the [`LogitsProcessor::Custom`] variant (the
+  /// out-of-tree-processor escape hatch — see the type's `# Breaking
+  /// change` note for the enum-unification rationale). The boxed
+  /// closure captures `self` by move; one processor instance per
+  /// generation (the matcher is stateful — see the type-level note).
   pub fn into_logits_processor(self) -> LogitsProcessor {
-    Box::new(move |tokens: &[u32], logits: &Array| self.apply(tokens, logits))
+    LogitsProcessor::Custom(Box::new(move |tokens: &[u32], logits: &Array| {
+      self.apply(tokens, logits)
+    }))
   }
 }
 

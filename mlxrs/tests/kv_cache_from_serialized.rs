@@ -133,6 +133,9 @@ impl KvCache for DefaultProbeCache {
   fn copy(&self) -> mlxrs::Result<Box<dyn KvCache>> {
     unreachable!("DefaultProbeCache::copy is not exercised")
   }
+  fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+    self
+  }
 }
 
 #[test]

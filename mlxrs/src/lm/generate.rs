@@ -148,20 +148,289 @@ use crate::{
   lm::{cache::KvCache, model::Model, sample},
   ops,
 };
+// P1 #111: bring the trait into scope so the `Detokenizer` enum's
+// `StreamingDetokenizer` impl methods (`add_token` / `finalize` / `text` /
+// `last_segment` / …) are callable through the enum value.
+#[cfg(feature = "tokenizer-stream")]
+use crate::tokenizer::StreamingDetokenizer as _;
+
+/// The custom-escape-hatch closure type for [`LogitsProcessor::Custom`]
+/// (extracted to satisfy `clippy::type_complexity` on the variant).
+pub type LogitsProcessorFn = Box<dyn Fn(&[u32], &Array) -> Result<Array>>;
+
+/// The custom-escape-hatch closure type for [`Sampler::Custom`]
+/// (extracted to satisfy `clippy::type_complexity` on the variant).
+pub type SamplerFn = Box<dyn FnMut(&Array) -> Result<Array>>;
 
 /// A logits processor: maps `(recent token-id history, raw logits)` to
 /// processed logits, exactly mlx-lm's
 /// `Callable[[mx.array, mx.array], mx.array]` (`make_logits_processors`
-/// closures). Boxed so the heterogeneous bias / repetition / presence /
-/// frequency closures share one list.
-pub type LogitsProcessor = Box<dyn Fn(&[u32], &Array) -> Result<Array>>;
+/// closures).
+///
+/// # Breaking change (P1 #109)
+///
+/// Previously this was the trait-object alias
+/// `Box<dyn Fn(&[u32], &Array) -> Result<Array>>` — one vtable indirection
+/// per processor per token (~4 indirections per token on the canonical
+/// chain: logit_bias + repetition + presence + frequency penalties). The
+/// enum unification preserves the same closure-call shape via `apply` but
+/// dispatches via a `match` so the compiler can inline each variant and
+/// the branch predictor warms on the consistent per-step variant pattern.
+///
+/// Construct via [`make_logits_processors`] (the canonical chain) or one
+/// of the variant constructors below; out-of-tree processors (e.g. the
+/// grammar-constrained [`crate::lm::structured::LLGuidanceLogitsProcessor`])
+/// plug in through the [`LogitsProcessor::Custom`] escape hatch.
+pub enum LogitsProcessor {
+  /// Additive logit bias (mlx-lm's inline `logit_bias_processor`).
+  /// `(indices, values)` paired by position; built once at processor
+  /// construction.
+  LogitBias {
+    /// The token-id columns to add bias to (`indices[i]` ↔ `values[i]`).
+    indices: Vec<i32>,
+    /// The bias `[n]` `F32` array built once at construction.
+    values: Array,
+  },
+  /// Sign-aware multiplicative repetition penalty (mlx-lm's
+  /// `make_repetition_penalty`). `context_size` is the per-penalty
+  /// independent window (Python `repetition_context_size`).
+  RepetitionPenalty {
+    /// The penalty factor (mlx-lm `repetition_penalty`).
+    penalty: f32,
+    /// Window size (mlx-lm `repetition_context_size`).
+    context_size: usize,
+  },
+  /// OpenAI presence penalty (mlx-lm's `make_presence_penalty`).
+  PresencePenalty {
+    /// The penalty value (mlx-lm `presence_penalty`).
+    penalty: f32,
+    /// Window size (mlx-lm `presence_context_size`).
+    context_size: usize,
+  },
+  /// OpenAI frequency penalty (mlx-lm's `make_frequency_penalty`).
+  FrequencyPenalty {
+    /// The penalty value (mlx-lm `frequency_penalty`).
+    penalty: f32,
+    /// Window size (mlx-lm `frequency_context_size`).
+    context_size: usize,
+  },
+  /// Custom out-of-tree processor (escape hatch — e.g.
+  /// [`crate::lm::structured::LLGuidanceLogitsProcessor`]). One
+  /// indirection per call, but the standard mlx-lm chain inlines
+  /// everything else.
+  Custom(LogitsProcessorFn),
+}
+
+impl LogitsProcessor {
+  /// Apply the processor: dispatch through the variant `match` to the
+  /// matching [`crate::lm::sample`] primitive. The canonical chain
+  /// inlines through the compiler-elided `match`; only [`Self::Custom`]
+  /// takes an indirection.
+  pub fn apply(&self, tokens: &[u32], logits: &Array) -> Result<Array> {
+    match self {
+      Self::LogitBias { indices, values } => sample::apply_logit_bias(logits, indices, values),
+      Self::RepetitionPenalty {
+        penalty,
+        context_size,
+      } => {
+        let ids = recent_ids(tokens, *context_size)?;
+        sample::apply_repetition_penalty(logits, &ids, *penalty)
+      }
+      Self::PresencePenalty {
+        penalty,
+        context_size,
+      } => {
+        let ids = recent_ids(tokens, *context_size)?;
+        sample::apply_presence_penalty(logits, &ids, *penalty)
+      }
+      Self::FrequencyPenalty {
+        penalty,
+        context_size,
+      } => {
+        let ids = recent_ids(tokens, *context_size)?;
+        sample::apply_frequency_penalty(logits, &ids, *penalty)
+      }
+      Self::Custom(f) => f(tokens, logits),
+    }
+  }
+}
+
+impl std::fmt::Debug for LogitsProcessor {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::LogitBias { indices, .. } => f
+        .debug_struct("LogitBias")
+        .field("n", &indices.len())
+        .finish(),
+      Self::RepetitionPenalty {
+        penalty,
+        context_size,
+      } => f
+        .debug_struct("RepetitionPenalty")
+        .field("penalty", penalty)
+        .field("context_size", context_size)
+        .finish(),
+      Self::PresencePenalty {
+        penalty,
+        context_size,
+      } => f
+        .debug_struct("PresencePenalty")
+        .field("penalty", penalty)
+        .field("context_size", context_size)
+        .finish(),
+      Self::FrequencyPenalty {
+        penalty,
+        context_size,
+      } => f
+        .debug_struct("FrequencyPenalty")
+        .field("penalty", penalty)
+        .field("context_size", context_size)
+        .finish(),
+      Self::Custom(_) => f.debug_tuple("Custom").finish(),
+    }
+  }
+}
 
 /// A sampler: maps a log-probability vector to a sampled token id array
-/// (`[1]`, `U32`), exactly mlx-lm's `Callable[[mx.array], mx.array]`. `FnMut`
-/// because the stochastic chain owns and advances its own PRNG key per call
-/// (mirroring mlx-lm's per-call `mx.random.state` split); the default
-/// temperature-0 `argmax` sampler is pure.
-pub type Sampler = Box<dyn FnMut(&Array) -> Result<Array>>;
+/// (`[1]`, `U32`), exactly mlx-lm's `Callable[[mx.array], mx.array]`.
+///
+/// # Breaking change (P1 #108)
+///
+/// Previously this was the trait-object alias
+/// `Box<dyn FnMut(&Array) -> Result<Array>>` — ONE indirect call per
+/// token (the **hottest** dispatch site in the loop). The enum
+/// unification dispatches through a `match` so the canonical chain
+/// inlines; only [`Sampler::Custom`] still takes an indirection.
+///
+/// Construct via [`make_sampler`] (the canonical chain) or
+/// [`Sampler::custom`]; out-of-tree samplers plug in through
+/// [`Sampler::Custom`].
+pub enum Sampler {
+  /// Greedy / temperature-0 argmax (mlx-lm `make_sampler` line 46).
+  /// Pure — no PRNG state.
+  Argmax,
+  /// The full mlx-lm `make_sampler` chain: top-p → min-p → xtc →
+  /// top-k → categorical (all gated on their `do_*` flags). The
+  /// per-call PRNG key is split per call to mirror `mx.random.state`.
+  Chain(SamplerChain),
+  /// Custom out-of-tree sampler (escape hatch). One indirection per
+  /// call.
+  Custom(SamplerFn),
+}
+
+impl Sampler {
+  /// Build a [`Self::Custom`] sampler from a closure. Convenience
+  /// constructor matching the prior `Sampler = Box<dyn FnMut>` shape.
+  pub fn custom<F>(f: F) -> Self
+  where
+    F: FnMut(&Array) -> Result<Array> + 'static,
+  {
+    Self::Custom(Box::new(f))
+  }
+
+  /// Sample one token from `logits`: dispatch through the variant
+  /// `match` to the matching [`crate::lm::sample`] composition. The
+  /// canonical chain inlines through the compiler-elided `match`;
+  /// only [`Self::Custom`] takes an indirection.
+  pub fn sample(&mut self, logits: &Array) -> Result<Array> {
+    match self {
+      Self::Argmax => sample::argmax_sample(logits),
+      Self::Chain(c) => c.sample(logits),
+      Self::Custom(f) => f(logits),
+    }
+  }
+}
+
+impl std::fmt::Debug for Sampler {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::Argmax => f.write_str("Argmax"),
+      Self::Chain(c) => f.debug_tuple("Chain").field(c).finish(),
+      Self::Custom(_) => f.debug_tuple("Custom").finish(),
+    }
+  }
+}
+
+/// The mlx-lm `make_sampler` chain — top-p → min-p → xtc → top-k →
+/// categorical, each stage gated on its own `do_*` flag. Owns the
+/// per-call PRNG key (advanced per call via [`ops::random::split`] to
+/// mirror mlx-lm's `mx.random.state` advance).
+///
+/// Wrapped in [`Sampler::Chain`]; constructed via [`make_sampler`].
+pub struct SamplerChain {
+  temp: f32,
+  top_p: f32,
+  min_p: f32,
+  min_tokens_to_keep: i32,
+  top_k: i32,
+  xtc_probability: f32,
+  xtc_threshold: f32,
+  xtc_special: Vec<i32>,
+  do_top_p: bool,
+  do_min_p: bool,
+  do_xtc: bool,
+  do_top_k: bool,
+  /// Per-call PRNG key advanced on each `sample` call (mlx-lm's
+  /// `mx.random.state` analogue). `RefCell` because `Sampler::sample`
+  /// is `&mut self` but the chain's interior key advance is independent
+  /// of the immutable enum dispatch.
+  key: RefCell<Array>,
+}
+
+impl SamplerChain {
+  fn sample(&self, logprobs: &Array) -> Result<Array> {
+    let (k_xtc, k_cat) = {
+      let mut k = self.key.borrow_mut();
+      let (next, k_xtc) = ops::random::split(&k)?;
+      let (next, k_cat) = ops::random::split(&next)?;
+      *k = next;
+      (k_xtc, k_cat)
+    };
+    // CORE-1: thread an `Option<Array>` through the optional stages so the
+    // "no-op stage" path is a pure borrow of `logprobs` (no clone), and a
+    // taken stage moves its owned result into `x`.
+    let mut x: Option<Array> = if self.do_top_p {
+      Some(sample::apply_top_p(logprobs, self.top_p)?)
+    } else {
+      None
+    };
+    if self.do_min_p {
+      x = Some(sample::apply_min_p(
+        x.as_ref().unwrap_or(logprobs),
+        self.min_p,
+        self.min_tokens_to_keep,
+      )?);
+    }
+    if self.do_xtc {
+      x = Some(sample::apply_xtc(
+        x.as_ref().unwrap_or(logprobs),
+        self.xtc_probability,
+        self.xtc_threshold,
+        &self.xtc_special,
+        &k_xtc,
+      )?);
+    }
+    if self.do_top_k {
+      x = Some(sample::apply_top_k(
+        x.as_ref().unwrap_or(logprobs),
+        self.top_k,
+      )?);
+    }
+    sample::categorical_sampling(x.as_ref().unwrap_or(logprobs), self.temp, &k_cat)
+  }
+}
+
+impl std::fmt::Debug for SamplerChain {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("SamplerChain")
+      .field("temp", &self.temp)
+      .field("top_p", &self.top_p)
+      .field("min_p", &self.min_p)
+      .field("top_k", &self.top_k)
+      .field("xtc_probability", &self.xtc_probability)
+      .finish()
+  }
+}
 
 /// mlx-lm's `make_logits_processors` default `*_context_size` (the number of
 /// most-recent tokens each penalty considers).
@@ -385,8 +654,10 @@ pub fn make_sampler(
   seed: Option<u64>,
 ) -> Result<Sampler> {
   // mlx-lm: `if temp == 0: return lambda x: mx.argmax(x, axis=-1)`.
+  // Returned as the [`Sampler::Argmax`] variant so the per-token dispatch
+  // is a one-arm `match` (no closure, no PRNG key allocation).
   if temp == 0.0 {
-    return Ok(Box::new(|logprobs: &Array| sample::argmax_sample(logprobs)));
+    return Ok(Sampler::Argmax);
   }
 
   // mlx-lm builds the stage list in this exact order; the gates mirror
@@ -411,49 +682,21 @@ pub fn make_sampler(
   // across steps.
   let key = RefCell::new(ops::random::key(resolved_seed)?);
 
-  let sampler = move |logprobs: &Array| -> Result<Array> {
-    let (k_xtc, k_cat) = {
-      let mut k = key.borrow_mut();
-      let (next, k_xtc) = ops::random::split(&k)?;
-      let (next, k_cat) = ops::random::split(&next)?;
-      *k = next;
-      (k_xtc, k_cat)
-    };
-    // CORE-1: thread an `Option<Array>` through the optional stages so the
-    // "no-op stage" path is a pure borrow of `logprobs` (no clone), and a
-    // taken stage moves its owned result into `x`. The prior structure
-    // unconditionally cloned `logprobs` when `do_top_p=false`, so a pure
-    // temperature-sampling step (every `do_*` flag false) wasted one clone
-    // per token (`apply_top_p` returns owned, so the `do_top_p=true` path
-    // is unaffected). Same observable behavior; one fewer hot-path clone
-    // per token in the common case.
-    let mut x: Option<Array> = if do_top_p {
-      Some(sample::apply_top_p(logprobs, top_p)?)
-    } else {
-      None
-    };
-    if do_min_p {
-      x = Some(sample::apply_min_p(
-        x.as_ref().unwrap_or(logprobs),
-        min_p,
-        min_tokens_to_keep,
-      )?);
-    }
-    if do_xtc {
-      x = Some(sample::apply_xtc(
-        x.as_ref().unwrap_or(logprobs),
-        xtc_probability,
-        xtc_threshold,
-        &xtc_special,
-        &k_xtc,
-      )?);
-    }
-    if do_top_k {
-      x = Some(sample::apply_top_k(x.as_ref().unwrap_or(logprobs), top_k)?);
-    }
-    sample::categorical_sampling(x.as_ref().unwrap_or(logprobs), temp, &k_cat)
-  };
-  Ok(Box::new(sampler))
+  Ok(Sampler::Chain(SamplerChain {
+    temp,
+    top_p,
+    min_p,
+    min_tokens_to_keep,
+    top_k,
+    xtc_probability,
+    xtc_threshold,
+    xtc_special,
+    do_top_p,
+    do_min_p,
+    do_xtc,
+    do_top_k,
+    key,
+  }))
 }
 
 /// Build the logits-processor list, composing the [`sample`] primitives
@@ -487,17 +730,14 @@ pub fn make_logits_processors(
   // logits (the exact mlx-lm processor application order). mlx-lm builds the
   // `indices` / `values` arrays ONCE at closure-creation time
   // (`indices = mx.array(list(...))`); mirror that — the `values` array is
-  // built once here, not rebuilt per step (faithful + no per-step alloc).
+  // built once here at variant construction, not rebuilt per step.
   if !logit_bias.is_empty() {
     let mut indices: Vec<i32> = try_with_capacity(logit_bias.len())?;
     indices.extend(logit_bias.iter().map(|&(i, _)| i));
     let mut values_vec: Vec<f32> = try_with_capacity(logit_bias.len())?;
     values_vec.extend(logit_bias.iter().map(|&(_, v)| v));
     let values = Array::from_slice::<f32>(&values_vec, &(values_vec.len(),))?;
-    let proc: LogitsProcessor = Box::new(move |_tokens: &[u32], logits: &Array| {
-      sample::apply_logit_bias(logits, &indices, &values)
-    });
-    processors.push(proc);
+    processors.push(LogitsProcessor::LogitBias { indices, values });
   }
 
   // mlx-lm: `(make_repetition_penalty, repetition_penalty,
@@ -506,28 +746,22 @@ pub fn make_logits_processors(
   // frequency_context_size)` — each appended iff `penalty is not None and
   // penalty != 0`, in this order, each capturing its OWN context size.
   if let Some(p) = repetition_penalty.filter(|&p| p != 0.0) {
-    let ctx = repetition_context_size;
-    let proc: LogitsProcessor = Box::new(move |tokens: &[u32], logits: &Array| {
-      let ids = recent_ids(tokens, ctx)?;
-      sample::apply_repetition_penalty(logits, &ids, p)
+    processors.push(LogitsProcessor::RepetitionPenalty {
+      penalty: p,
+      context_size: repetition_context_size,
     });
-    processors.push(proc);
   }
   if let Some(p) = presence_penalty.filter(|&p| p != 0.0) {
-    let ctx = presence_context_size;
-    let proc: LogitsProcessor = Box::new(move |tokens: &[u32], logits: &Array| {
-      let ids = recent_ids(tokens, ctx)?;
-      sample::apply_presence_penalty(logits, &ids, p)
+    processors.push(LogitsProcessor::PresencePenalty {
+      penalty: p,
+      context_size: presence_context_size,
     });
-    processors.push(proc);
   }
   if let Some(p) = frequency_penalty.filter(|&p| p != 0.0) {
-    let ctx = frequency_context_size;
-    let proc: LogitsProcessor = Box::new(move |tokens: &[u32], logits: &Array| {
-      let ids = recent_ids(tokens, ctx)?;
-      sample::apply_frequency_penalty(logits, &ids, p)
+    processors.push(LogitsProcessor::FrequencyPenalty {
+      penalty: p,
+      context_size: frequency_context_size,
     });
-    processors.push(proc);
   }
 
   Ok(processors)
@@ -611,14 +845,30 @@ impl From<GenStep> for (u32, Option<Array>) {
 
 /// The architecture-agnostic decode iterator: borrows the model, owns the
 /// per-layer KV cache, the running token history, the sampler, and the
-/// logits processors. `impl Iterator<Item = Result<GenStep>>` — a 1:1 port
-/// of `mlx_lm.generate.generate_step`.
+/// logits processors. Constructed by [`generate_step`].
 ///
-/// Construct via [`generate_step`]. The borrow of `&'a M` plus the owned
-/// cache means no aliasing (spec §7.5). The iterator **fuses**: after it
-/// yields `Err` (a step failed) or finishes (eos / `max_tokens`) every
-/// further `next()` is `None` — never a panic, never a poisoned re-entry
-/// (spec §4).
+/// # Breaking change (P1 #113)
+///
+/// Previously `pub struct Generator<'a, M>` — the concrete iterator type
+/// was part of the public API surface, so downstream code could name it,
+/// doc-comments tied to its layout, and any internal refactor (e.g.
+/// splitting into `PrefillGenerator + DecodeGenerator`) became a
+/// breaking change. The sibling [`stream_generate`] already returned
+/// `impl Iterator + 'a` for exactly the same reason.
+///
+/// [`generate_step`] now returns
+/// `impl Iterator<Item = Result<GenStep>> + 'a` (the opaque-iterator
+/// shape `stream_generate` already used), and `Generator` is
+/// `pub(crate)`. Callers that used
+/// `let mut it = generate_step(...); it.next();` work unchanged;
+/// callers that named the concrete `Generator<'a, M>` type (none on
+/// `main`, since `#48` introduced it) must switch to inference /
+/// `impl Iterator<_>`.
+///
+/// The borrow of `&'a M` plus the owned cache means no aliasing (spec
+/// §7.5). The iterator **fuses**: after it yields `Err` (a step failed)
+/// or finishes (eos / `max_tokens`) every further `next()` is `None` —
+/// never a panic, never a poisoned re-entry (spec §4).
 ///
 /// `M: Model + ?Sized` — the loop only ever touches the model behind the
 /// `&'a M` borrow (`model.forward(...)`), never by value and never via a
@@ -628,7 +878,7 @@ impl From<GenStep> for (u32, Option<Array>) {
 /// generation directly — the exact handle a load factory returns
 /// ([`crate::lm::factory::LoadedModelContext::model`],
 /// [`crate::vlm::load::LoadedVlmContext::model`]).
-pub struct Generator<'a, M: Model + ?Sized> {
+pub(crate) struct Generator<'a, M: Model + ?Sized> {
   model: &'a M,
   cache: Vec<Box<dyn KvCache>>,
   sampler: Sampler,
@@ -773,7 +1023,7 @@ impl<M: Model + ?Sized> Generator<'_, M> {
     if !self.processors.is_empty() && !input.is_empty() {
       try_extend_from_slice(&mut self.history, input)?;
       for p in &self.processors {
-        logits = p(&self.history, &logits)?;
+        logits = p.apply(&self.history, &logits)?;
       }
     }
 
@@ -833,7 +1083,9 @@ impl<M: Model + ?Sized> Generator<'_, M> {
     //    (`(false, true)` — stochastic opt-out); otherwise feed the raw
     //    `logits` (pure-greedy opt-out — `argmax(logits) == argmax(logits
     //    - c)` for any scalar `c`).
-    let mut sampled = (self.sampler)(sampler_input.as_ref().unwrap_or(&logits))?;
+    let mut sampled = self
+      .sampler
+      .sample(sampler_input.as_ref().unwrap_or(&logits))?;
 
     // 6. token boundary: the ONLY materialization (mlx-lm `y.item()`).
     //    `argmax` / `categorical` both yield `U32`.
@@ -1006,7 +1258,34 @@ fn last_position(logits: &Array) -> Result<Array> {
 /// token is the final yielded item) or [`GenConfig::max_tokens`] tokens
 /// have been produced. A step error is yielded once as `Err`, after which
 /// the iterator ends (spec §4 — no panic, no poison).
+///
+/// # Breaking change (P1 #113)
+///
+/// The return type is now `impl Iterator<Item = Result<GenStep>> + 'a`
+/// (previously the concrete `Generator<'a, M>`). Hiding the iterator's
+/// concrete type keeps internal refactors (e.g. splitting `Generator` into
+/// `PrefillGenerator + DecodeGenerator`) non-breaking and matches the
+/// sibling [`stream_generate`]'s shape. Callers that wrote
+/// `let mut it = generate_step(...); it.next();` are unaffected; callers
+/// that named the concrete `Generator<'a, M>` (none on `main` — it was
+/// added by `#48`) must switch to inference / `impl Iterator<_>`.
 pub fn generate_step<'a, M: Model + ?Sized>(
+  model: &'a M,
+  prompt: &[u32],
+  cache: Vec<Box<dyn KvCache>>,
+  cfg: GenConfig,
+) -> impl Iterator<Item = Result<GenStep>> + 'a {
+  build_generator(model, prompt, cache, cfg)
+}
+
+/// Concrete-typed twin of [`generate_step`] for the in-crate driver
+/// ([`crate::lm::session::ChatSession`]) that needs to reclaim the
+/// advanced cache via [`Generator::into_cache`] after the turn finishes.
+///
+/// Returns the concrete [`Generator<'a, M>`]; [`generate_step`] is a thin
+/// wrapper that hides this type behind `impl Iterator + 'a` for the
+/// public API surface (P1 #113).
+pub(crate) fn build_generator<'a, M: Model + ?Sized>(
   model: &'a M,
   prompt: &[u32],
   cache: Vec<Box<dyn KvCache>>,
@@ -1105,12 +1384,11 @@ pub fn generate_step<'a, M: Model + ?Sized>(
       model,
       cache,
       // A never-called placeholder sampler; `pending_err` ends the
-      // iterator on its first poll before any step runs.
-      sampler: Box::new(|_| {
-        Err(Error::Backend {
-          message: "generate: sampler construction failed".into(),
-        })
-      }),
+      // iterator on its first poll before any step runs. The cheapest
+      // variant ([`Sampler::Argmax`]) is used as a no-allocation
+      // placeholder — its `sample` is never called because `pending_err`
+      // short-circuits the first `next()`.
+      sampler: Sampler::Argmax,
       processors: Vec::new(),
       prompt: Vec::new(),
       prefill_offset: 0,
@@ -1321,7 +1599,7 @@ pub fn stream_generate<'a, M: Model + ?Sized>(
       let text = if matcher.is_active() {
         // eos path: reason is "stop" regardless of the matcher, so pass
         // "stop" as the default (a finalized-tail stop also reports "stop").
-        let (text, _) = finalize_active_tail(detok.as_ref(), &matcher, &mut emitted_len, "stop");
+        let (text, _) = finalize_active_tail(&detok, &matcher, &mut emitted_len, "stop");
         text
       } else {
         detok.last_segment()
@@ -1380,8 +1658,7 @@ pub fn stream_generate<'a, M: Model + ?Sized>(
             finished = true;
             drop(full);
             detok.finalize();
-            let (text, reason) =
-              finalize_active_tail(detok.as_ref(), &matcher, &mut emitted_len, "length");
+            let (text, reason) = finalize_active_tail(&detok, &matcher, &mut emitted_len, "length");
             return Some(Ok(GenerationResponse {
               text,
               token,
@@ -1598,7 +1875,8 @@ pub struct BatchGenStep {
 /// (every row done) every further `next()` is `None` — never a panic, never a
 /// poisoned re-entry (spec §4).
 ///
-/// `M: Model + ?Sized` — like single-seq [`Generator`], the loop only ever
+/// `M: Model + ?Sized` — like the single-sequence
+/// [`generate_step`] iterator, the loop only ever
 /// touches the model behind the `&'a M` borrow (`model.forward(...)`), never
 /// by value and never via a `Sized`-requiring associated item, so `M` may be
 /// an unsized trait object (`&dyn Model`, or a deref-coerced
@@ -1728,7 +2006,7 @@ impl<M: Model + ?Sized> BatchGenerator<'_, M> {
           ops::indexing::slice(&logits, &[row as i32, 0], &[(row + 1) as i32, v], &[1, 1])?;
         let mut row_l = row_logit;
         for p in &self.processors {
-          row_l = p(hist, &row_l)?;
+          row_l = p.apply(hist, &row_l)?;
         }
         row_logits.push(row_l);
       }
@@ -1756,7 +2034,7 @@ impl<M: Model + ?Sized> BatchGenerator<'_, M> {
     //    categorical / the make_sampler chain all reduce over axis=-1 and
     //    yield `[B]` U32. Per-row samplers (mlx-lm's `samplers[e]` list)
     //    are not exposed by [`GenConfig`] — mirrors mlx-lm's fallback path.
-    let mut sampled = (self.sampler)(&logprobs)?;
+    let mut sampled = self.sampler.sample(&logprobs)?;
 
     // 6. token boundary: ONE materialization for the whole batch (mlx-lm
     //    materializes `inputs.tolist()` once per step, line 1375); the
@@ -2124,13 +2402,10 @@ pub fn batch_generate_step<'a, M: Model + ?Sized>(
     Err(e) => BatchGenerator {
       model,
       cache,
-      // A never-called placeholder sampler; `pending_err` ends the iterator
-      // on its first poll before any step runs.
-      sampler: Box::new(|_| {
-        Err(Error::Backend {
-          message: "batch_generate: sampler construction failed".into(),
-        })
-      }),
+      // A never-called placeholder sampler ([`Sampler::Argmax`]);
+      // `pending_err` ends the iterator on its first poll before any step
+      // runs, so this is never invoked.
+      sampler: Sampler::Argmax,
       processors: Vec::new(),
       padded_rows: Vec::new(),
       max_len: 0,

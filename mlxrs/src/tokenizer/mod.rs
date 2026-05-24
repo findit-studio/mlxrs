@@ -92,7 +92,10 @@ pub use stream::SpmStreamingDetokenizer;
 pub use stream::infer_detokenizer_class;
 #[cfg(feature = "tokenizer-stream")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokenizer-stream")))]
-pub use stream::{DetokenizerClass, NaiveStreamingDetokenizer, StreamingDetokenizer};
+pub use stream::{
+  Detokenizer, DetokenizerClass, NaiveHfDetokenizer, NaiveStreamingDetokenizer,
+  StreamingDetokenizer,
+};
 /// Tool-call parsing (`tokenizer-tools`) — the per-format parsers, the
 /// streaming [`tools::ToolCallProcessor`], and the selectors.
 #[cfg(feature = "tokenizer-tools")]

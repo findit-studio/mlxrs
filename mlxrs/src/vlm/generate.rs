@@ -482,11 +482,9 @@ pub fn vlm_generate<'a, M: Model + ?Sized>(
     Err(e) => Ok(Box::new(VlmDecode {
       model,
       cache: RefCell::new(cache),
-      sampler: RefCell::new(Box::new(|_| {
-        Err(Error::Backend {
-          message: "vlm_generate: sampler construction failed".into(),
-        })
-      })),
+      // Cheapest no-allocation placeholder ([`Sampler::Argmax`]); never
+      // invoked because `pending_err` short-circuits the first `next()`.
+      sampler: RefCell::new(Sampler::Argmax),
       processors: Vec::new(),
       history: RefCell::new(Vec::new()),
       eos: Vec::new(),
@@ -596,7 +594,7 @@ impl<M: Model + ?Sized> VlmDecode<'_, M> {
       let mut history = self.history.borrow_mut();
       try_extend_from_slice(&mut history, step_inputs)?;
       for p in &self.processors {
-        logits = p(&history, &logits)?;
+        logits = p.apply(&history, &logits)?;
       }
     }
     // 3. `logprobs = logits - mx.logsumexp(logits, keepdims=True)` —
@@ -605,7 +603,7 @@ impl<M: Model + ?Sized> VlmDecode<'_, M> {
     let lse = ops::reduction::logsumexp(&logits, true)?;
     let logprobs = ops::arithmetic::subtract(&logits, &lse)?;
     // 4. sampler — argmax (temp=0) or the make_sampler chain.
-    let mut sampled = (self.sampler.borrow_mut())(&logprobs)?;
+    let mut sampled = self.sampler.borrow_mut().sample(&logprobs)?;
     // 5. token boundary — the ONLY materialization
     //    (`y.item()` in mlx-vlm / mlx-lm).
     let token: u32 = sampled.item::<u32>()?;

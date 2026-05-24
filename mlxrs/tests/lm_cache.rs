@@ -12,7 +12,8 @@
 use mlxrs::{
   Array, Error,
   lm::cache::{
-    CacheConfig, ChunkedKvCache, KvCache, MaskMode, RopeOffset, RotatingKvCache, StandardKvCache,
+    ArraysCache, BatchKvCache, BatchRotatingKvCache, CacheConfig, CacheList, ChunkedKvCache,
+    KvCache, MaskMode, QuantizedKvCacheImpl, RopeOffset, RotatingKvCache, StandardKvCache,
     create_attention_mask, create_causal_mask, from_state, make_prompt_cache,
   },
 };
@@ -1701,4 +1702,206 @@ fn rotating_update_in_place_partial_mutation_on_set_seq_err_is_rejected() {
   let ok = kv(&[7.0]);
   c.update(&ok, &ok).unwrap();
   assert_eq!(c.offset(), 3);
+}
+
+// ============================================================
+// P1 #110 — per-layer fast-path downcast via `as_any_mut`
+// ============================================================
+
+/// P1 #110: a `Box<dyn KvCache>` can downcast back to its concrete type
+/// via `as_any_mut().downcast_mut::<ConcreteCache>()`. This is the
+/// **convention** the per-layer fast-path uses inside `Model::forward`:
+/// once per layer, the downcast amortizes the vtable cost; every
+/// subsequent per-layer method call is static dispatch.
+#[test]
+fn p1_kvcache_as_any_mut_downcasts_to_standard() {
+  let mut boxed: Box<dyn KvCache> = Box::new(StandardKvCache::new());
+  let any = boxed.as_any_mut();
+  let std_cache: Option<&mut StandardKvCache> = any.downcast_mut::<StandardKvCache>();
+  assert!(
+    std_cache.is_some(),
+    "as_any_mut + downcast_mut must reach the concrete type"
+  );
+  // Negative: downcasting to a different concrete cache must fail.
+  let any = boxed.as_any_mut();
+  let wrong: Option<&mut RotatingKvCache> = any.downcast_mut::<RotatingKvCache>();
+  assert!(wrong.is_none(), "wrong-type downcast must return None");
+}
+
+/// P1 #110: same for `RotatingKvCache` — every in-tree cache overrides
+/// `as_any_mut` with the canonical `self` body so the downcast works.
+#[test]
+fn p1_kvcache_as_any_mut_downcasts_to_rotating() {
+  let mut boxed: Box<dyn KvCache> = Box::new(RotatingKvCache::new(8, 1));
+  let any = boxed.as_any_mut();
+  assert!(any.downcast_mut::<RotatingKvCache>().is_some());
+  let any = boxed.as_any_mut();
+  assert!(any.downcast_mut::<StandardKvCache>().is_none());
+}
+
+/// P1 #110: same for `ChunkedKvCache`.
+#[test]
+fn p1_kvcache_as_any_mut_downcasts_to_chunked() {
+  let mut boxed: Box<dyn KvCache> = Box::new(ChunkedKvCache::new(Some(8)));
+  let any = boxed.as_any_mut();
+  assert!(any.downcast_mut::<ChunkedKvCache>().is_some());
+}
+
+/// P1 #110: parameterized coverage — every one of the 8 in-tree
+/// [`KvCache`] implementations must satisfy the
+/// `as_any_mut().downcast_mut::<ConcreteCache>()` round-trip with the
+/// canonical `self` body. This catches a missing `as_any_mut` override on
+/// any concrete cache (would surface as a `None` downcast at runtime,
+/// which would silently fall back to vtable dispatch in the per-layer
+/// fast path) — the negative pole of the breaking-trait-method
+/// requirement documented on [`KvCache`].
+///
+/// Each arm boxes a freshly-constructed concrete cache as `Box<dyn KvCache>`,
+/// invokes `as_any_mut`, and asserts a positive downcast to the concrete
+/// type plus a negative downcast to a different concrete type (proving
+/// the [`Any`](std::any::Any) `TypeId` carried through is the cache's
+/// own, not some uniform placeholder).
+#[test]
+fn p1_kvcache_as_any_mut_downcasts_for_all_8_in_tree_impls() {
+  // 1. StandardKvCache
+  {
+    let mut boxed: Box<dyn KvCache> = Box::new(StandardKvCache::new());
+    assert!(
+      boxed
+        .as_any_mut()
+        .downcast_mut::<StandardKvCache>()
+        .is_some(),
+      "StandardKvCache: positive downcast must succeed"
+    );
+    assert!(
+      boxed
+        .as_any_mut()
+        .downcast_mut::<RotatingKvCache>()
+        .is_none(),
+      "StandardKvCache: wrong-type downcast must return None"
+    );
+  }
+
+  // 2. RotatingKvCache
+  {
+    let mut boxed: Box<dyn KvCache> = Box::new(RotatingKvCache::new(8, 1));
+    assert!(
+      boxed
+        .as_any_mut()
+        .downcast_mut::<RotatingKvCache>()
+        .is_some(),
+      "RotatingKvCache: positive downcast must succeed"
+    );
+    assert!(
+      boxed
+        .as_any_mut()
+        .downcast_mut::<StandardKvCache>()
+        .is_none(),
+      "RotatingKvCache: wrong-type downcast must return None"
+    );
+  }
+
+  // 3. ChunkedKvCache
+  {
+    let mut boxed: Box<dyn KvCache> = Box::new(ChunkedKvCache::new(Some(8)));
+    assert!(
+      boxed
+        .as_any_mut()
+        .downcast_mut::<ChunkedKvCache>()
+        .is_some(),
+      "ChunkedKvCache: positive downcast must succeed"
+    );
+    assert!(
+      boxed
+        .as_any_mut()
+        .downcast_mut::<StandardKvCache>()
+        .is_none(),
+      "ChunkedKvCache: wrong-type downcast must return None"
+    );
+  }
+
+  // 4. QuantizedKvCacheImpl
+  {
+    let mut boxed: Box<dyn KvCache> = Box::new(QuantizedKvCacheImpl::new(64, 8));
+    assert!(
+      boxed
+        .as_any_mut()
+        .downcast_mut::<QuantizedKvCacheImpl>()
+        .is_some(),
+      "QuantizedKvCacheImpl: positive downcast must succeed"
+    );
+    assert!(
+      boxed
+        .as_any_mut()
+        .downcast_mut::<StandardKvCache>()
+        .is_none(),
+      "QuantizedKvCacheImpl: wrong-type downcast must return None"
+    );
+  }
+
+  // 5. BatchKvCache
+  {
+    let mut boxed: Box<dyn KvCache> = Box::new(BatchKvCache::new(&[0, 0]));
+    assert!(
+      boxed.as_any_mut().downcast_mut::<BatchKvCache>().is_some(),
+      "BatchKvCache: positive downcast must succeed"
+    );
+    assert!(
+      boxed
+        .as_any_mut()
+        .downcast_mut::<BatchRotatingKvCache>()
+        .is_none(),
+      "BatchKvCache: wrong-type downcast must return None"
+    );
+  }
+
+  // 6. BatchRotatingKvCache
+  {
+    let mut boxed: Box<dyn KvCache> = Box::new(BatchRotatingKvCache::new(4, &[0, 0]));
+    assert!(
+      boxed
+        .as_any_mut()
+        .downcast_mut::<BatchRotatingKvCache>()
+        .is_some(),
+      "BatchRotatingKvCache: positive downcast must succeed"
+    );
+    assert!(
+      boxed.as_any_mut().downcast_mut::<BatchKvCache>().is_none(),
+      "BatchRotatingKvCache: wrong-type downcast must return None"
+    );
+  }
+
+  // 7. ArraysCache
+  {
+    let mut boxed: Box<dyn KvCache> = Box::new(ArraysCache::new(4));
+    assert!(
+      boxed.as_any_mut().downcast_mut::<ArraysCache>().is_some(),
+      "ArraysCache: positive downcast must succeed"
+    );
+    assert!(
+      boxed
+        .as_any_mut()
+        .downcast_mut::<StandardKvCache>()
+        .is_none(),
+      "ArraysCache: wrong-type downcast must return None"
+    );
+  }
+
+  // 8. CacheList (composite — boxes a child Standard cache so the parent
+  // is non-empty; the parent's own `as_any_mut` is what's under test).
+  {
+    let child: Box<dyn KvCache> = Box::new(StandardKvCache::new());
+    let mut boxed: Box<dyn KvCache> = Box::new(CacheList::new(vec![child]));
+    assert!(
+      boxed.as_any_mut().downcast_mut::<CacheList>().is_some(),
+      "CacheList: positive downcast must succeed"
+    );
+    assert!(
+      boxed
+        .as_any_mut()
+        .downcast_mut::<StandardKvCache>()
+        .is_none(),
+      "CacheList: wrong-type downcast must return None"
+    );
+  }
 }

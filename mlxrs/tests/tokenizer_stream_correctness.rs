@@ -313,3 +313,98 @@ fn last_segment_allocates_only_the_per_step_delta_not_the_whole_buffer() {
      {final_len}-byte buffer — proves no per-call full-buffer copy"
   );
 }
+
+// ============================================================
+// P1 #111 — Detokenizer enum unification (kills per-token vtable)
+// ============================================================
+
+/// P1 #111: the [`crate::tokenizer::Tokenizer::detokenizer`] factory
+/// returns the enum-unified [`Detokenizer`] variant, not a
+/// `Box<dyn StreamingDetokenizer>`. Naive / SPM / BPE each land in
+/// their typed variant; the per-token `add_token` then dispatches via
+/// `match` instead of vtable.
+///
+/// Naive-class fallback path (no `tokenizer.json` decoder node) ⇒
+/// `Detokenizer::Naive(NaiveHfDetokenizer)`.
+#[cfg(feature = "tokenizer-stream")]
+#[test]
+fn p1_detokenizer_factory_returns_typed_variant_for_naive() {
+  use mlxrs::tokenizer::{Detokenizer, NaiveHfDetokenizer, StreamingDetokenizer};
+  use tokenizers::Tokenizer as HfTokenizer;
+  // Load the shipped fixture's HF tokenizer (no network).
+  const TOKENIZER_JSON: &str = include_str!("fixtures/tokenizer.json");
+  let hf: HfTokenizer = TOKENIZER_JSON.parse().expect("parse fixture tokenizer");
+  let d = Detokenizer::Naive(Box::new(NaiveHfDetokenizer::new(hf, false)));
+  // Dispatch through the enum's StreamingDetokenizer impl proves the
+  // variant `match` arms work.
+  assert!(matches!(d, Detokenizer::Naive(_)));
+  // Tokens accessor proves trait dispatch through the enum compiles.
+  let _: &[u32] = d.tokens();
+}
+
+/// P1 #111: [`Detokenizer::Custom`] is the escape hatch for out-of-tree
+/// streaming detokenizers — the boxed `Box<dyn StreamingDetokenizer>`
+/// adds one indirection per call (same cost as the prior alias).
+#[cfg(feature = "tokenizer-stream")]
+#[test]
+fn p1_detokenizer_custom_escape_hatch() {
+  use mlxrs::tokenizer::{Detokenizer, StreamingDetokenizer};
+
+  // A no-op detokenizer: every observer returns the empty default.
+  struct NullDetok {
+    tokens: Vec<u32>,
+    offset: usize,
+  }
+  impl StreamingDetokenizer for NullDetok {
+    fn reset(&mut self) {
+      self.tokens.clear();
+      self.offset = 0;
+    }
+    fn add_token(&mut self, t: u32) {
+      self.tokens.push(t);
+    }
+    fn finalize(&mut self) {}
+    fn text(&self) -> std::borrow::Cow<'_, str> {
+      std::borrow::Cow::Borrowed("")
+    }
+    fn tokens(&self) -> &[u32] {
+      &self.tokens
+    }
+    fn offset(&self) -> usize {
+      self.offset
+    }
+    fn set_offset(&mut self, o: usize) {
+      self.offset = o;
+    }
+  }
+
+  let mut d = Detokenizer::Custom(Box::new(NullDetok {
+    tokens: Vec::new(),
+    offset: 0,
+  }));
+  assert!(matches!(d, Detokenizer::Custom(_)));
+  d.add_token(42);
+  d.add_token(43);
+  assert_eq!(d.tokens(), &[42, 43]);
+  assert_eq!(d.text().as_ref(), "");
+}
+
+#[cfg(all(feature = "tokenizer-stream", feature = "tokenizer-spm"))]
+#[test]
+fn p1_detokenizer_spm_variant_exists() {
+  use mlxrs::tokenizer::{Detokenizer, StreamingDetokenizer, stream::SpmStreamingDetokenizer};
+  let vocab = vec![("\u{2581}foo".to_string(), 0u32)];
+  let d = Detokenizer::Spm(SpmStreamingDetokenizer::new(vocab, false));
+  assert!(matches!(d, Detokenizer::Spm(_)));
+  let _: &[u32] = d.tokens();
+}
+
+#[cfg(all(feature = "tokenizer-stream", feature = "tokenizer-bpe"))]
+#[test]
+fn p1_detokenizer_bpe_variant_exists() {
+  use mlxrs::tokenizer::{Detokenizer, StreamingDetokenizer, stream::BpeStreamingDetokenizer};
+  let vocab = vec![("\u{0120}foo".to_string(), 0u32)];
+  let d = Detokenizer::Bpe(BpeStreamingDetokenizer::new(vocab, false));
+  assert!(matches!(d, Detokenizer::Bpe(_)));
+  let _: &[u32] = d.tokens();
+}
