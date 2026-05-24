@@ -31,7 +31,7 @@ lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm",
 # grammar-engine compile cost; callers who need structured outputs opt in.
 llguidance           = ["lm", "dep:llguidance", "dep:toktrie_hf_tokenizers", "dep:serde_json"]
 vlm                  = ["lm", "dep:image"]
-audio                = ["lm", "dep:symphonia", "dep:cpal", "dep:unicode-normalization"]
+audio                = ["lm", "dep:symphonia", "dep:cpal", "dep:unicode-normalization", "dep:xattr"]
 unstable-ops-overload = []
 gguf                 = [] # GGUF load/save (mlx-c `mlx_io_gguf*`). OFF: mlxrs-sys does not yet link gguflib.
 
@@ -104,6 +104,21 @@ regex = { version = "1", optional = true, default-features = false, features = [
 # pyo3 / cbindgen / wasm features pulled in.
 llguidance = { version = "1.7", optional = true, default-features = false, features = ["lark", "referencing"] }
 toktrie_hf_tokenizers = { version = "1.7", optional = true }
+
+# Unix-only dependencies. `xattr-1.x` imports `std::os::unix::io`
+# unconditionally and its supported-platform list is Unix-only — the
+# crate does NOT compile on Windows. We therefore declare it under
+# `[target.'cfg(unix)'.dependencies]` so the `audio` feature's
+# `dep:xattr` directive resolves to a no-op on Windows (the dep is
+# absent from the resolved set, and Cargo silently drops `dep:xattr`
+# rather than erroring). On Unix targets `dep:xattr` activates this
+# optional dependency normally. The `use xattr` import in
+# `audio/io.rs` is correspondingly gated behind `#[cfg(unix)]`, and
+# Windows builds use local no-op stubs for
+# `capture_xattrs`/`restore_xattrs`. Loose `"1"` per the project
+# rule "No dependency pinning" — semver-major matches 1.x.
+[target.'cfg(unix)'.dependencies]
+xattr = { version = "1", optional = true }
 
 [dev-dependencies]
 approx.workspace = true
