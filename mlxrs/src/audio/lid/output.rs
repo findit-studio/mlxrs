@@ -31,9 +31,31 @@
 pub struct LidPrediction {
   /// The predicted language code (e.g. `"eng"`, `"fra"`, …) or the
   /// `"LABEL_<idx>"` fallback when no `id2label` map is configured.
-  pub language_code: String,
+  language_code: String,
   /// The softmax probability for this language (in `[0, 1]`).
-  pub probability: f32,
+  probability: f32,
+}
+
+impl LidPrediction {
+  /// Construct a [`LidPrediction`] from a language code and probability.
+  pub fn new(language_code: impl Into<String>, probability: f32) -> Self {
+    Self {
+      language_code: language_code.into(),
+      probability,
+    }
+  }
+
+  /// The predicted language code (e.g. `"eng"`, `"fra"`, …).
+  #[inline(always)]
+  pub fn language_code(&self) -> &str {
+    &self.language_code
+  }
+
+  /// The softmax probability for this language (in `[0, 1]`).
+  #[inline(always)]
+  pub fn probability(&self) -> f32 {
+    self.probability
+  }
 }
 
 /// The result of one LID inference pass — port of mlx-audio's
@@ -59,10 +81,21 @@ pub struct LidOutput {
   /// The top-k `(language_code, probability)` predictions sorted by
   /// probability descending — port of mlx-audio's
   /// `[(id2label[idx], prob) for idx, prob in indexed[:top_k]]`.
-  pub predictions: Vec<LidPrediction>,
+  predictions: Vec<LidPrediction>,
 }
 
 impl LidOutput {
+  /// Construct a [`LidOutput`] from a pre-built predictions list.
+  pub fn new(predictions: Vec<LidPrediction>) -> Self {
+    Self { predictions }
+  }
+
+  /// The top-k predictions as a slice (sorted by probability descending).
+  #[inline(always)]
+  pub fn predictions_slice(&self) -> &[LidPrediction] {
+    &self.predictions
+  }
+
   /// The top-1 prediction, if any. Convenience accessor for the common
   /// "I just want the language code" caller.
   pub fn top(&self) -> Option<&LidPrediction> {
@@ -81,25 +114,16 @@ mod tests {
   #[test]
   fn lid_output_struct_round_trips() {
     let predictions = vec![
-      LidPrediction {
-        language_code: "eng".into(),
-        probability: 0.92,
-      },
-      LidPrediction {
-        language_code: "fra".into(),
-        probability: 0.05,
-      },
-      LidPrediction {
-        language_code: "deu".into(),
-        probability: 0.03,
-      },
+      LidPrediction::new("eng", 0.92),
+      LidPrediction::new("fra", 0.05),
+      LidPrediction::new("deu", 0.03),
     ];
-    let out = LidOutput { predictions };
+    let out = LidOutput::new(predictions);
 
     // Top-1 is the highest-probability entry.
     let top = out.top().expect("non-empty predictions has a top");
-    assert_eq!(top.language_code, "eng");
-    assert!((top.probability - 0.92).abs() < 1e-6);
+    assert_eq!(top.language_code(), "eng");
+    assert!((top.probability() - 0.92).abs() < 1e-6);
 
     // Full serde round-trip (the whole struct is serde-derivable).
     let s = serde_json::to_string(&out).unwrap();
@@ -111,9 +135,7 @@ mod tests {
   /// case the model returns when `top_k == 0` or the input is degenerate.
   #[test]
   fn lid_output_empty_top_is_none() {
-    let out = LidOutput {
-      predictions: Vec::new(),
-    };
+    let out = LidOutput::new(Vec::new());
     assert!(out.top().is_none());
   }
 }

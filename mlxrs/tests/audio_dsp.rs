@@ -76,8 +76,8 @@ fn stft_shape_matches_formula() {
   let x = sine_1khz_16samples();
   // `stft` now returns a typed `Spectrum`; its transform array is `.data()`.
   let s = stft(&x, 8, 4, None, WindowPad::Center).unwrap();
-  assert_eq!(s.data().shape(), vec![5, 5]); // (num_frames, n_fft/2 + 1)
-  assert_eq!(s.data().dtype().unwrap(), Dtype::Complex64);
+  assert_eq!(s.data_ref().shape(), vec![5, 5]); // (num_frames, n_fft/2 + 1)
+  assert_eq!(s.data_ref().dtype().unwrap(), Dtype::Complex64);
   // The metadata travels in the type (no inference downstream in istft).
   assert_eq!(s.n_fft(), 8);
   assert_eq!(s.hop_length(), 4);
@@ -125,8 +125,8 @@ fn stft_minimum_valid_input_boundary_padding_to_index_zero() {
   // the reflect-pad output itself is cleaner — assert via shape + dtype
   // and the fact that the call succeeds without going through the
   // too-short-error path).
-  assert_eq!(s.data().shape(), vec![2, 5]); // (num_frames, n_fft/2 + 1)
-  assert_eq!(s.data().dtype().unwrap(), Dtype::Complex64);
+  assert_eq!(s.data_ref().shape(), vec![2, 5]); // (num_frames, n_fft/2 + 1)
+  assert_eq!(s.data_ref().dtype().unwrap(), Dtype::Complex64);
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn stft_win_length_shorter_than_n_fft_zero_pads_window() {
   // length 8 on the right side. Shape stays `(num_frames, n_fft/2+1)`.
   let x = sine_1khz_16samples();
   let s = stft(&x, 8, 4, Some(4), WindowPad::Right).unwrap();
-  assert_eq!(s.data().shape(), vec![5, 5]);
+  assert_eq!(s.data_ref().shape(), vec![5, 5]);
   assert_eq!(s.win_length(), 4); // the short win_length is carried on the type
 }
 

@@ -29,9 +29,31 @@ use crate::array::Array;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct SpeechSegment {
   /// Start sample index (inclusive) of the speech segment.
-  pub start: u64,
+  start: u64,
   /// End sample index (exclusive) of the speech segment.
-  pub end: u64,
+  end: u64,
+}
+
+impl SpeechSegment {
+  /// Construct a [`SpeechSegment`] from a start/end sample-index pair.
+  ///
+  /// `start` is inclusive, `end` is exclusive. Both are sample indices
+  /// into the input waveform (`return_seconds=False` path).
+  pub const fn new(start: u64, end: u64) -> Self {
+    Self { start, end }
+  }
+
+  /// Start sample index (inclusive) of the speech segment.
+  #[inline(always)]
+  pub fn start(&self) -> u64 {
+    self.start
+  }
+
+  /// End sample index (exclusive) of the speech segment.
+  #[inline(always)]
+  pub fn end(&self) -> u64 {
+    self.end
+  }
 }
 
 /// The result of one VAD inference pass — port of
@@ -88,16 +110,7 @@ mod tests {
   /// handles).
   #[test]
   fn vad_output_struct_round_trips() {
-    let segments = vec![
-      SpeechSegment {
-        start: 0,
-        end: 1600,
-      },
-      SpeechSegment {
-        start: 3200,
-        end: 4800,
-      },
-    ];
+    let segments = vec![SpeechSegment::new(0, 1600), SpeechSegment::new(3200, 4800)];
     // Probabilities: shape (3,), the 3-frame mock the test exercises.
     let probabilities = Array::from_slice::<f32>(&[0.1, 0.9, 0.85], &(3,)).unwrap();
     let out = VadOutput {

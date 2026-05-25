@@ -19,7 +19,7 @@
 //! | `finishStreamingInput()`                    | [`super::output_stream::AudioOutputStream::flush`]  |
 //!
 //! Swift's volume is read off `AVAudioPlayerNode.volume`; mlxrs
-//! exposes the equivalent via [`AudioPlayer::set_volume`] +
+//! exposes the equivalent via [`AudioPlayer::store_volume`] +
 //! [`AudioPlayer::volume`] backed by an `AtomicU32` (f32 bits) the
 //! cpal callback reads each invocation.
 //!
@@ -198,7 +198,7 @@ pub const WRITE_CHUNK_MAX: usize = 4096;
 /// Sanitize a caller-supplied volume scalar to `[0.0, 1.0]`. Public
 /// helper so the policy can be unit-tested without constructing an
 /// [`AudioPlayer`] (which opens a cpal device — not available in
-/// CI). Used by [`AudioPlayer::set_volume`].
+/// CI). Used by [`AudioPlayer::store_volume`].
 ///
 /// - **Non-finite (`NaN`, `±∞`) maps to `0.0`.** `f32::clamp`
 ///   preserves NaN bits, which would cause the cpal callback's
@@ -265,7 +265,7 @@ struct SharedState {
   terminated: AtomicBool,
   /// Current volume scalar, stored as `f32::to_bits` in an
   /// `AtomicU32`. Read by the cpal callback every sample; written
-  /// by [`AudioPlayer::set_volume`]. Default is 1.0 (unity gain) —
+  /// by [`AudioPlayer::store_volume`]. Default is 1.0 (unity gain) —
   /// matches Swift's `AVAudioPlayerNode.volume` default.
   volume_bits: AtomicU32,
   /// Captured first error from the cpal stream's `err_fn`. The
@@ -312,6 +312,7 @@ impl SharedState {
     })
   }
 
+  #[inline(always)]
   fn load_volume(&self) -> f32 {
     f32::from_bits(self.volume_bits.load(Ordering::Relaxed))
   }
@@ -411,12 +412,12 @@ impl AudioPlayer {
   /// - [`Error::Backend`] if [`PlaybackConfig::cpal_config`] rejects
   ///   the config (zero channels) or the cpal stream build fails.
   pub fn with_device(device: &cpal::Device, config: PlaybackConfig) -> Result<Self> {
-    if !matches!(config.sample_format, SampleFormat::F32) {
+    if !matches!(config.sample_format(), SampleFormat::F32) {
       return Err(Error::Backend {
         message: format!(
           "AudioPlayer: only SampleFormat::F32 is currently supported (got {:?}); \
            non-F32 device negotiation is reserved for a follow-up",
-          config.sample_format
+          config.sample_format()
         ),
       });
     }
@@ -424,8 +425,8 @@ impl AudioPlayer {
     let stream_config = config.cpal_config()?;
 
     let queue_capacity_samples = config
-      .queue_capacity_frames
-      .checked_mul(usize::from(config.channels.count()))
+      .queue_capacity_frames()
+      .checked_mul(usize::from(config.channels().count()))
       .ok_or_else(|| Error::Backend {
         message: "AudioPlayer: queue_capacity_frames * channels overflows usize".to_string(),
       })?;
@@ -513,15 +514,17 @@ impl AudioPlayer {
     })
   }
 
-  /// Read-only view of the config the player was built with.
+  /// The config the player was built with. Returns by value (Copy).
+  #[inline(always)]
   #[must_use]
-  pub fn config(&self) -> &PlaybackConfig {
-    &self.config
+  pub fn config(&self) -> PlaybackConfig {
+    self.config
   }
 
   /// Number of samples currently queued for playback (the cpal
   /// equivalent of Swift's `queuedBuffers * buffer.frameLength` sum,
   /// in samples not frames).
+  #[inline(always)]
   #[must_use]
   pub fn buffer_depth(&self) -> usize {
     match self.shared.queue.lock() {
@@ -533,6 +536,7 @@ impl AudioPlayer {
   /// `true` if [`AudioPlayer::start`] has been called and neither
   /// [`AudioPlayer::pause`] nor [`AudioPlayer::stop`] has run since.
   /// Mirrors the Swift `isPlaying` getter on the streaming branch.
+  #[inline(always)]
   #[must_use]
   pub fn is_running(&self) -> bool {
     self.shared.state.load(Ordering::Acquire) == STATE_RUNNING
@@ -541,6 +545,7 @@ impl AudioPlayer {
   /// `true` if the player is in [`STATE_PAUSED`] (cpal stream is
   /// `pause()`d, queue retains samples; Swift's `playerNode.pause()`
   /// branch of `AudioPlayer.pause()`).
+  #[inline(always)]
   #[must_use]
   pub fn is_paused(&self) -> bool {
     self.shared.state.load(Ordering::Acquire) == STATE_PAUSED
@@ -548,13 +553,14 @@ impl AudioPlayer {
 
   /// Current output volume, default 1.0. Mirrors
   /// `AVAudioPlayerNode.volume`.
+  #[inline(always)]
   #[must_use]
   pub fn volume(&self) -> f32 {
     self.shared.load_volume()
   }
 
-  /// Set the output volume. Clamped to `[0.0, 1.0]` — values outside
-  /// the range are clamped silently (matches the
+  /// Atomically store the output volume. Clamped to `[0.0, 1.0]` — values
+  /// outside the range are clamped silently (matches the
   /// `AVAudioPlayerNode.volume` 0..1 documented range).
   ///
   /// **Non-finite inputs (NaN, ±∞) are mapped to `0.0`** rather than
@@ -564,11 +570,15 @@ impl AudioPlayer {
   /// matches the unsigned-clamp idiom used elsewhere in mlxrs for
   /// user-supplied scalars.
   ///
+  /// Named `store_volume` (not `set_volume`) to signal atomic-write
+  /// semantics rather than fluent-builder semantics — this is a global
+  /// side-effect on the player, not a `&mut self` field setter.
+  ///
   /// Takes `&self` (not `&mut self`) so the volume can be adjusted
   /// concurrently with [`AudioPlayer::write_samples`] without
   /// shadowing the producer borrow — useful when a UI thread tweaks
   /// volume while a worker thread is pumping samples.
-  pub fn set_volume(&self, vol: f32) {
+  pub fn store_volume(&self, vol: f32) {
     let sanitized = sanitize_volume(vol);
     self
       .shared
@@ -1105,13 +1115,8 @@ mod tests {
   #[test]
   #[ignore = "requires real default audio output device"]
   fn audio_player_pre_allocates_queue_capacity_at_construction() {
-    let cfg = PlaybackConfig {
-      sample_rate: 16_000,
-      channels: ChannelLayout::Mono,
-      sample_format: SampleFormat::F32,
-      buffer_size_frames: None,
-      queue_capacity_frames: 4096,
-    };
+    let cfg = PlaybackConfig::new(16_000, ChannelLayout::Mono, SampleFormat::F32)
+      .with_queue_capacity_frames(4096);
     let player = AudioPlayer::new(cfg).unwrap();
 
     assert_eq!(player.buffer_depth(), 0);
@@ -1141,13 +1146,8 @@ mod tests {
   #[test]
   #[ignore = "requires real default audio output device"]
   fn audio_player_write_samples_does_not_grow_queue_capacity_during_playback() {
-    let cfg = PlaybackConfig {
-      sample_rate: 16_000,
-      channels: ChannelLayout::Mono,
-      sample_format: SampleFormat::F32,
-      buffer_size_frames: None,
-      queue_capacity_frames: 4096,
-    };
+    let cfg = PlaybackConfig::new(16_000, ChannelLayout::Mono, SampleFormat::F32)
+      .with_queue_capacity_frames(4096);
     let mut player = AudioPlayer::new(cfg).unwrap();
     player.start().unwrap();
     // pause() so the callback doesn't drain the just-pushed samples

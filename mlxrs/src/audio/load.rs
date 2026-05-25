@@ -84,19 +84,56 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct LoadedAudioModel {
   /// The resolved local model directory (the output of [`get_model_path`]).
-  pub model_path: PathBuf,
+  model_path: PathBuf,
   /// The verbatim `config.json` body — kept as the source-of-truth string
   /// so an architecture-specific deserializer (`Codable`-style) can
   /// reparse model-specific keys outside the small typed subset
   /// [`load_config`] returns. Same TOCTOU-closed single-read convention
   /// as [`crate::lm::load::load_config`].
-  pub config_json: String,
+  config_json: String,
   /// Parsed per-layer-aware quantization, if `config.json` carried a
   /// `quantization` block. `None` ⇒ the checkpoint is dense — mlx-audio's
   /// no-op path ([utils.py:222-225][audio-utils-quant]).
   ///
   /// [audio-utils-quant]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/utils.py#L222-L225
-  pub quantization: Option<PerLayerQuantization>,
+  quantization: Option<PerLayerQuantization>,
+}
+
+impl LoadedAudioModel {
+  /// Construct a [`LoadedAudioModel`] from the resolved model directory,
+  /// verbatim `config.json` body, and optional parsed quantization.
+  ///
+  /// This is the canonical constructor — [`base_load_model`] builds its
+  /// return value through this.
+  pub fn new(
+    model_path: PathBuf,
+    config_json: String,
+    quantization: Option<PerLayerQuantization>,
+  ) -> Self {
+    Self {
+      model_path,
+      config_json,
+      quantization,
+    }
+  }
+
+  /// The resolved local model directory.
+  #[inline(always)]
+  pub fn model_path(&self) -> &Path {
+    &self.model_path
+  }
+
+  /// The verbatim `config.json` body.
+  #[inline(always)]
+  pub fn config_json(&self) -> &str {
+    &self.config_json
+  }
+
+  /// Parsed per-layer-aware quantization, if any. `None` ⇒ dense checkpoint.
+  #[inline(always)]
+  pub fn quantization(&self) -> Option<&PerLayerQuantization> {
+    self.quantization.as_ref()
+  }
 }
 
 /// Ensure `path` is a local on-disk model directory — mirroring
@@ -384,11 +421,7 @@ pub fn base_load_model(path: &str) -> Result<LoadedAudioModel> {
   let model_path = get_model_path(path)?;
   let config_json = load_config(&model_path)?;
   let quantization = apply_quantization(&config_json)?;
-  Ok(LoadedAudioModel {
-    model_path,
-    config_json,
-    quantization,
-  })
+  Ok(LoadedAudioModel::new(model_path, config_json, quantization))
 }
 
 #[cfg(test)]
@@ -509,9 +542,9 @@ mod tests {
     let body = r#"{ "model_type": "silero_vad" }"#;
     fs::write(dir.join("config.json"), body).unwrap();
     let bundle = base_load_model(&dir.to_string_lossy()).expect("local dir loads");
-    assert_eq!(bundle.model_path, dir);
-    assert_eq!(bundle.config_json, body);
-    assert!(bundle.quantization.is_none());
+    assert_eq!(bundle.model_path(), dir);
+    assert_eq!(bundle.config_json(), body);
+    assert!(bundle.quantization().is_none());
   }
 
   /// HF post-quantize artifact: `"quantization_config"` (the longer key)
