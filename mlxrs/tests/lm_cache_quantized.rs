@@ -828,19 +828,19 @@ fn from_state_underlength_state_clamps_offset_down() {
   }
 }
 
-/// Regression for the post-#80-amend Codex finding: forged ASYMMETRIC K/V
-/// restored seq-lens (keys stored seq-len 3, values stored seq-len 5,
-/// meta offset 5) must converge BOTH sides to `min(K, V) = 3`, not commit
-/// `offset=keys_len=3` while values storage stays at 5 (which would let
-/// the next `update_quantized` surface stale value tokens past the
-/// logical offset).
+/// **KVC-8 update (issue #105): post-fix behavior is REJECT, not clamp.**
+/// Pre-KVC-8 the across-K/V asymmetric forge (keys stored seq-len 3,
+/// values stored seq-len 5, meta offset 5) was accepted by `set_state` and
+/// later *converged* via `enforce_offset_len_invariant` (silent fix-up).
+/// Post-KVC-8 the eager K/V cross-validator in `set_state` REJECTS the
+/// asymmetry upfront with a precise diagnostic at the load boundary — a
+/// forged/corrupt prompt cache surfaces immediately instead of running
+/// through a silent shape-converging code path. This is the documented
+/// Rust-idiom upgrade for diagnosability (the lazy-error fix at the first
+/// `update_quantized` is replaced with an eager error at the load
+/// boundary).
 #[test]
-fn from_state_underlength_state_asymmetric_keys_shorter_clamps_both_to_min() {
-  // Build a "short" cache (3 tokens) and a "long" cache (5 tokens), then
-  // splice src_short's keys triple (`st[0..3]`) with src_long's values
-  // triple (`st[3..6]`) to forge an asymmetric state. The state layout
-  // is `[k_w, k_s, k_b, v_w, v_s, v_b]` per `QuantizedKvCacheImpl`'s
-  // `state` getter (set_state pop order: v_b, v_s, v_w, k_b, k_s, k_w).
+fn from_state_asymmetric_keys_shorter_is_rejected_at_set_state() {
   let mut src_short = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
   src_short.update_quantized(&kv(3), &kv(3)).unwrap();
   let s_short: Vec<Array> = src_short
@@ -857,41 +857,30 @@ fn from_state_underlength_state_asymmetric_keys_shorter_clamps_both_to_min() {
     .iter()
     .map(|a| a.try_clone().unwrap())
     .collect();
-  // Forged state: keys-side seq-len 3 (from s_short), values-side seq-len
-  // 5 (from s_long); meta offset 5.
   let forged_state: Vec<Array> = s_short[0..3]
     .iter()
     .map(|a| a.try_clone().unwrap())
     .chain(s_long[3..6].iter().map(|a| a.try_clone().unwrap()))
     .collect();
-  assert_eq!(forged_state[0].shape(), vec![1, 1, 3, HEAD_DIM / 4]);
-  assert_eq!(forged_state[3].shape(), vec![1, 1, 5, HEAD_DIM / 4]);
   let forged_meta = vec!["5".to_string(), "64".to_string(), "8".to_string()];
 
-  let c = from_state("QuantizedKVCache", forged_state, &forged_meta).unwrap();
-  // ASYMMETRIC CONVERGE: offset = min(K=3, V=5) = 3; both sides re-trimmed.
-  assert_eq!(
-    c.offset(),
-    3,
-    "asymmetric forge (keys shorter): offset must converge to min(K,V) = 3"
-  );
-  let st = c.state().unwrap();
-  assert_eq!(
-    st[0].shape(),
-    vec![1, 1, 3, HEAD_DIM / 4],
-    "keys side stays at its 3 (the smaller)"
-  );
-  assert_eq!(
-    st[3].shape(),
-    vec![1, 1, 3, HEAD_DIM / 4],
-    "values side MUST be re-trimmed down to 3 (was forged 5)"
+  let result = from_state("QuantizedKVCache", forged_state, &forged_meta);
+  let err = match result {
+    Err(e) => e,
+    Ok(_) => panic!("post-KVC-8: asymmetric K/V forge must be REJECTED at set_state (not clamped)"),
+  };
+  let msg = err.to_string();
+  assert!(
+    msg.contains("set_state") && (msg.contains("K and V") || msg.contains("axis")),
+    "diagnostic must name the load boundary + the K/V mismatch; got {msg}"
   );
 }
 
-/// Symmetric counterpart: keys longer than values. `min(K=5, V=3) = 3`;
-/// keys side re-trimmed down to 3.
+/// **KVC-8 update (issue #105): see sibling test above.** Symmetric
+/// counterpart: keys longer than values. Pre-KVC-8 the forge was clamped;
+/// post-KVC-8 it is REJECTED at set_state with a precise diagnostic.
 #[test]
-fn from_state_underlength_state_asymmetric_values_shorter_clamps_both_to_min() {
+fn from_state_asymmetric_values_shorter_is_rejected_at_set_state() {
   let mut src_short = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
   src_short.update_quantized(&kv(3), &kv(3)).unwrap();
   let s_short: Vec<Array> = src_short
@@ -908,33 +897,22 @@ fn from_state_underlength_state_asymmetric_values_shorter_clamps_both_to_min() {
     .iter()
     .map(|a| a.try_clone().unwrap())
     .collect();
-  // Forged: keys side seq-len 5 (from s_long), values side seq-len 3
-  // (from s_short).
   let forged_state: Vec<Array> = s_long[0..3]
     .iter()
     .map(|a| a.try_clone().unwrap())
     .chain(s_short[3..6].iter().map(|a| a.try_clone().unwrap()))
     .collect();
-  assert_eq!(forged_state[0].shape(), vec![1, 1, 5, HEAD_DIM / 4]);
-  assert_eq!(forged_state[3].shape(), vec![1, 1, 3, HEAD_DIM / 4]);
   let forged_meta = vec!["5".to_string(), "64".to_string(), "8".to_string()];
 
-  let c = from_state("QuantizedKVCache", forged_state, &forged_meta).unwrap();
-  assert_eq!(
-    c.offset(),
-    3,
-    "asymmetric forge (values shorter): offset must converge to min(K,V) = 3"
-  );
-  let st = c.state().unwrap();
-  assert_eq!(
-    st[0].shape(),
-    vec![1, 1, 3, HEAD_DIM / 4],
-    "keys side MUST be re-trimmed down to 3 (was forged 5)"
-  );
-  assert_eq!(
-    st[3].shape(),
-    vec![1, 1, 3, HEAD_DIM / 4],
-    "values side stays at its 3 (the smaller)"
+  let result = from_state("QuantizedKVCache", forged_state, &forged_meta);
+  let err = match result {
+    Err(e) => e,
+    Ok(_) => panic!("post-KVC-8: asymmetric K/V forge must be REJECTED at set_state (not clamped)"),
+  };
+  let msg = err.to_string();
+  assert!(
+    msg.contains("set_state") && (msg.contains("K and V") || msg.contains("axis")),
+    "diagnostic must name the load boundary + the K/V mismatch; got {msg}"
   );
 }
 
@@ -1010,71 +988,25 @@ fn from_state_underlength_state_within_triple_asymmetric_clamps_to_min() {
   );
   let forged_meta = vec!["5".to_string(), "64".to_string(), "8".to_string()];
 
-  let mut c = from_state("QuantizedKVCache", forged_state, &forged_meta).unwrap();
-  // Within-triple min for keys = min(5, 3, 5) = 3; across-K/V min(3, 5) = 3.
-  assert_eq!(
-    c.offset(),
-    3,
-    "within-triple asymmetry: offset converges to min across ALL components of BOTH triples = 3"
-  );
-  // EVERY component of BOTH triples must be at seq-len 3 post-restore:
-  // the within-triple longer components on keys (w, biases) and ALL three
-  // values components must be re-trimmed down from 5 to 3.
-  let st = c.state().unwrap();
-  assert_eq!(st.len(), 6, "affine -> 6-array state preserved");
-  assert_eq!(
-    st[0].shape(),
-    vec![1, 1, 3, HEAD_DIM / 4],
-    "keys.weight re-trimmed 5 -> 3 (within-triple long component)"
-  );
-  assert_eq!(
-    st[1].shape(),
-    vec![1, 1, 3, 1],
-    "keys.scales stays at 3 (the within-triple shortest)"
-  );
-  assert_eq!(
-    st[2].shape(),
-    vec![1, 1, 3, 1],
-    "keys.biases re-trimmed 5 -> 3 (within-triple long component)"
-  );
-  assert_eq!(
-    st[3].shape(),
-    vec![1, 1, 3, HEAD_DIM / 4],
-    "values.weight re-trimmed 5 -> 3 (across-K/V long side)"
-  );
-  assert_eq!(
-    st[4].shape(),
-    vec![1, 1, 3, 1],
-    "values.scales re-trimmed 5 -> 3 (across-K/V long side)"
-  );
-  assert_eq!(
-    st[5].shape(),
-    vec![1, 1, 3, 1],
-    "values.biases re-trimmed 5 -> 3 (across-K/V long side)"
-  );
-
-  // Subsequent `update_quantized` lands the new token at position 3 (the
-  // clamped offset), NOT 5 (the forged offset). The resulting triples are
-  // internally consistent: every component of both triples == new_offset.
-  let new_tok = kv_base(1, 100.0);
-  let (qk, qv) = {
-    let q = c
-      .as_quantized_mut()
-      .expect("reconstructed cache downcasts mutably");
-    q.update_quantized(&new_tok, &new_tok).unwrap()
+  // **KVC-8 update (issue #105): post-fix behavior is REJECT, not clamp.**
+  // The within-triple asymmetry on keys (k_w seq=5, k_s seq=3) makes
+  // k_s.shape != v_s.shape (v_s is seq=5), so the eager K/V validator
+  // rejects at set_state — the across-K/V projection of the within-triple
+  // inconsistency lands directly on the cross-validator's axis check. The
+  // pre-KVC-8 silent "within-triple min" convergence path is gone.
+  let result = from_state("QuantizedKVCache", forged_state, &forged_meta);
+  let err = match result {
+    Err(e) => e,
+    Ok(_) => panic!(
+      "post-KVC-8: within-triple asymmetry surfaces as a K/V scales shape mismatch \
+       at set_state — REJECTED, not silently converged"
+    ),
   };
-  assert_eq!(
-    c.offset(),
-    4,
-    "post-clamp update lands at offset 3 + 1 = 4 (NOT 5 + 1 = 6)"
+  let msg = err.to_string();
+  assert!(
+    msg.contains("set_state") && (msg.contains("scales") || msg.contains("K and V")),
+    "diagnostic must name the load boundary + the offending element; got {msg}"
   );
-  // Every component of the returned post-update triples is seq-len 4.
-  assert_eq!(qk.0.shape(), vec![1, 1, 4, HEAD_DIM / 4]);
-  assert_eq!(qk.1.shape(), vec![1, 1, 4, 1]);
-  assert_eq!(qk.2.as_ref().unwrap().shape(), vec![1, 1, 4, 1]);
-  assert_eq!(qv.0.shape(), vec![1, 1, 4, HEAD_DIM / 4]);
-  assert_eq!(qv.1.shape(), vec![1, 1, 4, 1]);
-  assert_eq!(qv.2.as_ref().unwrap().shape(), vec![1, 1, 4, 1]);
 }
 
 /// Edge case: a bias-less (4-array) state with within-triple asymmetry
@@ -1117,35 +1049,19 @@ fn from_state_underlength_state_within_triple_asymmetric_bias_less_clamps_to_min
   assert_eq!(forged_state[1].shape(), vec![1, 1, 3, 1]);
   let forged_meta = vec!["5".to_string(), "64".to_string(), "8".to_string()];
 
-  let c = from_state("QuantizedKVCache", forged_state, &forged_meta).unwrap();
-  // Within-triple keys-min = min(5, 3) = 3 (biases None NOT in the min);
-  // across-K/V min(3, 5) = 3.
-  assert_eq!(
-    c.offset(),
-    3,
-    "bias-less within-triple asymmetry: offset = min across present components = 3"
-  );
-  let st = c.state().unwrap();
-  assert_eq!(
-    st.len(),
-    4,
-    "bias-less round-trip preserves 4-array state (no biases fabricated)"
-  );
-  assert_eq!(
-    st[0].shape(),
-    vec![1, 1, 3, HEAD_DIM / 4],
-    "keys.weight re-trimmed 5 -> 3"
-  );
-  assert_eq!(st[1].shape(), vec![1, 1, 3, 1], "keys.scales stays at 3");
-  assert_eq!(
-    st[2].shape(),
-    vec![1, 1, 3, HEAD_DIM / 4],
-    "values.weight re-trimmed 5 -> 3"
-  );
-  assert_eq!(
-    st[3].shape(),
-    vec![1, 1, 3, 1],
-    "values.scales re-trimmed 5 -> 3"
+  // **KVC-8 update (issue #105): post-fix behavior is REJECT, not clamp.**
+  // Same as the 6-array within-triple test above: the k_s seq=3 vs v_s
+  // seq=5 mismatch is rejected by the eager K/V cross-validator at
+  // set_state.
+  let result = from_state("QuantizedKVCache", forged_state, &forged_meta);
+  let err = match result {
+    Err(e) => e,
+    Ok(_) => panic!("post-KVC-8: bias-less within-triple asymmetry is REJECTED at set_state"),
+  };
+  let msg = err.to_string();
+  assert!(
+    msg.contains("set_state") && (msg.contains("scales") || msg.contains("K and V")),
+    "diagnostic must name the load boundary + the offending element; got {msg}"
   );
 }
 

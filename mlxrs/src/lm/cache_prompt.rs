@@ -632,6 +632,11 @@ mod tests {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
       self
     }
+    // KVC-10: `reference_class_name` is REQUIRED (no default) — forward
+    // to the wrapped cache so persistence/dispatch sees the inner's name.
+    fn reference_class_name(&self) -> &'static str {
+      self.inner.reference_class_name()
+    }
   }
 
   /// `prefill_full` advances every layer's cache to exactly the prompt length
@@ -844,6 +849,12 @@ mod tests {
       }
       fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+      }
+      // KVC-10: `reference_class_name` is REQUIRED (no default) — forward
+      // to the wrapped rotating cache so persistence/dispatch sees the
+      // inner's name.
+      fn reference_class_name(&self) -> &'static str {
+        self.inner.reference_class_name()
       }
     }
 

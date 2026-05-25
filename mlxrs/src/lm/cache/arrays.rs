@@ -115,9 +115,22 @@ where
 /// is `init { super.init(size: 2) }` (`KVCache.swift:1230-1245`). Per the
 /// project's no-per-model-arch-porting rule (no Mamba architecture is ported
 /// into `mlxrs`), there is **no** separate `MambaCache` type: a Mamba-style
-/// architecture simply constructs [`ArraysCache::new(2)`](ArraysCache::new)
+/// architecture simply constructs [`ArraysCache::mamba`](ArraysCache::mamba)
 /// (the 2-slot `(conv_state, ssm_state)` layout) — that is the documented
 /// alias, nothing more.
+///
+/// ## Provenance flag (KVC-9)
+///
+/// To preserve the original `"MambaCache"` class label across a
+/// swift→Rust→swift round-trip, [`ArraysCache::mamba`] sets a constructor-
+/// time `is_mamba` flag and [`reference_class_name`](KvCache::reference_class_name)
+/// then returns `"MambaCache"` when the flag is set (`"ArraysCache"`
+/// otherwise). The flag is plain bookkeeping (no state shape change, no Mamba
+/// architecture) — exactly the swift-faithful `cacheClassName` switch
+/// (`KVCache.swift:1381-1390`) where the `MambaCache` arm precedes the
+/// `ArraysCache` arm. The [`super::from_state`] `"MambaCache"` arm
+/// reconstructs with `is_mamba = true` so a swift-saved `"MambaCache"`
+/// prompt cache round-trips as `"MambaCache"` — not `"ArraysCache"`.
 ///
 /// # State serialization (slot identity preserved)
 ///
@@ -180,6 +193,15 @@ pub struct ArraysCache {
   /// / `self.lengths -= N`). Transient (never serialized — mlx-lm does not
   /// put it in `state`/`meta_state`).
   lengths: Option<Vec<i32>>,
+  /// KVC-9 provenance flag: `true` iff this `ArraysCache` was constructed
+  /// via [`ArraysCache::mamba`] (i.e. it represents mlx-swift-lm's
+  /// `MambaCache: ArraysCache`, `KVCache.swift:1229`). When set,
+  /// [`reference_class_name`](KvCache::reference_class_name) returns
+  /// `"MambaCache"` instead of `"ArraysCache"` so the swift→Rust→swift
+  /// round-trip preserves the original class label. The flag is pure
+  /// bookkeeping — no state shape change, no Mamba architecture port (the
+  /// no-per-model-arch-porting rule is preserved).
+  is_mamba: bool,
 }
 
 impl ArraysCache {
@@ -190,6 +212,28 @@ impl ArraysCache {
       cache: (0..size).map(|_| None).collect(),
       left_padding: None,
       lengths: None,
+      is_mamba: false,
+    }
+  }
+
+  /// A 2-slot `ArraysCache` flagged with the `MambaCache` provenance
+  /// (KVC-9) — mlx-swift-lm's `class MambaCache: ArraysCache` whose only
+  /// specialization is `init { super.init(size: 2) }`
+  /// (`KVCache.swift:1230-1245`). State shape is identical to
+  /// [`ArraysCache::new(2)`](ArraysCache::new); the only observable
+  /// difference is [`reference_class_name`](KvCache::reference_class_name)
+  /// returns `"MambaCache"`, so a save-after-load preserves the swift class
+  /// label across the Rust round-trip.
+  ///
+  /// Construct this when porting a Mamba-style model (or restoring a
+  /// `"MambaCache"`-kind prompt cache via [`super::from_state`]); use
+  /// [`ArraysCache::new`] for the generic SSM slot cache.
+  pub fn mamba() -> Self {
+    Self {
+      cache: vec![None, None],
+      left_padding: None,
+      lengths: None,
+      is_mamba: true,
     }
   }
 
@@ -203,6 +247,12 @@ impl ArraysCache {
       c.left_padding = Some(left_padding.to_vec());
     }
     c
+  }
+
+  /// `true` iff this `ArraysCache` carries the `MambaCache` provenance
+  /// (KVC-9) — see [`ArraysCache::mamba`].
+  pub fn is_mamba(&self) -> bool {
+    self.is_mamba
   }
 
   /// Reconstruct from a serialized state list + metadata — the
@@ -225,10 +275,17 @@ impl ArraysCache {
   /// steps run on the freshly-`Self::new(0)`-built local, so the caller's
   /// own `self` (the trait-method override) is *never* mutated on an
   /// error path — the leaves-self-unchanged guarantee, end to end.
-  fn build_from_serialized(state: Vec<Array>, meta: &[String]) -> Result<Self> {
+  ///
+  /// `is_mamba` carries the KVC-9 provenance through the constructor —
+  /// preserves [`ArraysCache::reference_class_name`] returning
+  /// `"MambaCache"` across [`KvCache::from_serialized`] (so calling
+  /// `from_serialized` on an `ArraysCache::mamba()` keeps it Mamba) and
+  /// across [`super::from_state`]'s `"MambaCache"` arm.
+  fn build_from_serialized(state: Vec<Array>, meta: &[String], is_mamba: bool) -> Result<Self> {
     let mut c = Self::new(0);
     c.set_state(state)?;
     c.set_meta_state(meta)?;
+    c.is_mamba = is_mamba;
     Ok(c)
   }
 
@@ -668,35 +725,32 @@ impl KvCache for ArraysCache {
       cache,
       left_padding: self.left_padding.clone(),
       lengths: self.lengths.clone(),
+      // KVC-9: preserve `MambaCache` provenance across `copy()` so the
+      // deep-copied cache reports the same `reference_class_name`.
+      is_mamba: self.is_mamba,
     }))
   }
 
-  /// `"ArraysCache"` — mlx-lm's `type(ArraysCache).__name__` (`cache.py:56`)
-  /// / mlx-swift-lm `case is ArraysCache: return "ArraysCache"`
-  /// (`KVCache.swift:1385`). mlx-swift-lm's `cacheClassName` switch
-  /// (`KVCache.swift:1381-1390`) returns `"MambaCache"` for the
-  /// `MambaCache: ArraysCache` subclass *before* this arm. mlxrs has no
-  /// separate `MambaCache` struct per the no-per-model-arch-porting rule
-  /// (`MambaCache` is a 2-slot `ArraysCache` adding NO extra state/metadata —
-  /// the only specialization is `super.init(size: 2)`,
-  /// `KVCache.swift:1230-1245`); both kinds reconstruct via the same
-  /// `arrays::from_state_arrays` arm in [`super::from_state`].
+  /// `"ArraysCache"` (or `"MambaCache"` when the `is_mamba` flag is set —
+  /// KVC-9) — mlx-lm's `type(ArraysCache).__name__` (`cache.py:56`) /
+  /// mlx-swift-lm `cacheClassName` switch (`KVCache.swift:1381-1390`),
+  /// where the `MambaCache: ArraysCache` arm precedes the `ArraysCache`
+  /// arm.
   ///
-  /// **Trade-off, deliberate.** A swift-saved `"MambaCache"` prompt cache
-  /// round-trips through this Rust type as `"ArraysCache"` — load is
-  /// **backwards-compatible** (the `"MambaCache"` arm of [`super::from_state`]
-  /// aliases to `arrays::from_state_arrays`, so the slot state reloads
-  /// correctly), but the *original class label* is lost on save-after-load.
-  /// This is the same kind of trade-off the merged tree already makes (and
-  /// strictly worse without this PR — pre-PR, `ArraysCache` falls through to
-  /// the `meta_state()`/`max_size()` heuristic, which classifies it as
-  /// `"KVCache"` and the load side then fails to reconstruct it as a slot
-  /// cache at all). Preserving the `"MambaCache"` provenance would require
-  /// either a `MambaCache` Rust newtype OR an `ArraysCache::is_mamba`
-  /// constructor flag — both project-rule decisions tracked as a follow-up
-  /// (`docs/rust-golden-standard-followups.md` KVC-9).
+  /// **KVC-9 provenance.** Constructing via [`ArraysCache::mamba`] (or
+  /// loading via [`super::from_state`]'s `"MambaCache"` arm) sets the
+  /// `is_mamba` flag, so the swift→Rust→swift round-trip preserves the
+  /// `"MambaCache"` class label rather than degrading to `"ArraysCache"`.
+  /// State shape is identical for both kinds (the only specialization is
+  /// `super.init(size: 2)`, `KVCache.swift:1230-1245`), so this is pure
+  /// bookkeeping — no Mamba architecture is ported and the
+  /// no-per-model-arch-porting rule is preserved.
   fn reference_class_name(&self) -> &'static str {
-    "ArraysCache"
+    if self.is_mamba {
+      "MambaCache"
+    } else {
+      "ArraysCache"
+    }
   }
 
   /// P1 #110: per-layer fast-path downcast target — see the
@@ -722,17 +776,31 @@ impl KvCache for ArraysCache {
   /// the `set_state` body cannot fail without a `try_clone` it doesn't
   /// issue) 2-step window the default trait impl would leave open if
   /// `set_state` ever grew a fallible step.
+  ///
+  /// KVC-9: preserves the cache's current `is_mamba` provenance flag
+  /// across `from_serialized` (the trait-method override on `self`), so
+  /// calling `from_serialized` on an [`ArraysCache::mamba`]-constructed
+  /// cache keeps it Mamba. The [`super::from_state`] `"MambaCache"` arm
+  /// uses `from_state_arrays(..., is_mamba: true)` (a crate-private
+  /// helper) instead.
   #[allow(clippy::wrong_self_convention)] // see KvCache::from_serialized
   fn from_serialized(&mut self, state: Vec<Array>, meta: &[String]) -> Result<()> {
-    *self = ArraysCache::build_from_serialized(state, meta)?;
+    *self = ArraysCache::build_from_serialized(state, meta, self.is_mamba)?;
     Ok(())
   }
 }
 
-/// `from_state` arm for the `"ArraysCache"` reference class name
-/// (`cache.py:56` / the `load_prompt_cache` path `cache.py:79-82`). Kept out
-/// of [`super::from_state`]'s body so this file owns the whole port; the
-/// module's `match` adds one additive arm delegating here.
-pub(super) fn from_state_arrays(state: Vec<Array>, meta: &[String]) -> Result<Box<dyn KvCache>> {
-  Ok(Box::new(ArraysCache::build_from_serialized(state, meta)?))
+/// `from_state` arm for the `"ArraysCache"` / `"MambaCache"` reference
+/// class names (`cache.py:56` / the `load_prompt_cache` path
+/// `cache.py:79-82`). Kept out of [`super::from_state`]'s body so this file
+/// owns the whole port; the module's `match` adds two arms delegating here
+/// with `is_mamba` set accordingly (KVC-9 provenance preservation).
+pub(super) fn from_state_arrays(
+  state: Vec<Array>,
+  meta: &[String],
+  is_mamba: bool,
+) -> Result<Box<dyn KvCache>> {
+  Ok(Box::new(ArraysCache::build_from_serialized(
+    state, meta, is_mamba,
+  )?))
 }

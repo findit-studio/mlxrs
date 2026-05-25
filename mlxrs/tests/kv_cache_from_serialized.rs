@@ -136,6 +136,13 @@ impl KvCache for DefaultProbeCache {
   fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
     self
   }
+  // KVC-10: `reference_class_name` is REQUIRED (no default) — declare
+  // explicitly so the probe still compiles. The default-`from_serialized`
+  // test below only cares about set_state / set_meta_state call ordering,
+  // not the class name.
+  fn reference_class_name(&self) -> &'static str {
+    "DefaultProbeCache"
+  }
 }
 
 #[test]

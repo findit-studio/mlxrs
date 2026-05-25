@@ -5,7 +5,7 @@ use crate::{
   error::{Error, Result},
   lm::cache::{
     KvCache, MaskMode, QTriple, QuantizedKvCache, mask,
-    util::{concat_seq, nbytes, seq_len, slice_seq},
+    util::{KV_NDIM, concat_seq, nbytes, seq_len, slice_seq},
   },
   ops,
 };
@@ -207,6 +207,65 @@ impl QuantizedKvCacheImpl {
   /// half-populated triple (silent corruption) and never panicked.
   fn clone_triple(t: &StoredTriple) -> Result<StoredTriple> {
     Self::tree_map(t, |a| a.try_clone())
+  }
+
+  /// KVC-8 eager cross-validator for [`set_state`](KvCache::set_state).
+  /// Checks that the K and V arrays of a given triple-element (one of
+  /// `"w"`, `"scales"`, `"biases"`) have matching rank and matching leading
+  /// axes — the `[B, n_kv_heads, S]` part of the `[B, n_kv_heads, S, *]`
+  /// quantized KV layout. The trailing per-element quantization axis size
+  /// legitimately differs across w/scales/biases (`dim // el_per_int` for
+  /// `w` vs `dim // group_size` for scales/biases), so this is checked
+  /// per-axis only for the first `rank - 1` axes shared by K and V of the
+  /// SAME element. A mismatch is a recoverable
+  /// [`Error::ShapeMismatch`] with the offending element / shapes named,
+  /// so a forged prompt cache surfaces a precise diagnostic at the load
+  /// boundary instead of a far-from-cause-site `concat_seq` failure at the
+  /// first `update_quantized`.
+  fn validate_kv_leading_axes_match(k: &Array, v: &Array, element: &str) -> Result<()> {
+    let ks = k.shape();
+    let vs = v.shape();
+    // Rank gate: the cache layout is the 4-D `[B, n_kv_heads, S, payload_dim]`
+    // — `KV_NDIM == 4`. A non-4-D K or V is a forged / corrupt state and
+    // a recoverable error at the load boundary, not a panic via a blind
+    // `shape[axis]` index later.
+    if ks.len() != KV_NDIM || vs.len() != KV_NDIM {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "QuantizedKvCache::set_state: K and V {element} must both be 4-D \
+           [B, n_kv_heads, S, payload_dim] (K rank {} shape {ks:?} vs V rank \
+           {} shape {vs:?}); a forged or corrupt prompt cache mixed ranks — \
+           rejected upfront so the diagnostic points at the load boundary, not \
+           the first update_quantized concat",
+          ks.len(),
+          vs.len()
+        ),
+      });
+    }
+    // Compare ONLY the leading axes `[B, n_kv_heads, S]` (`0..rank-1`).
+    // The final axis is the per-element quantized PAYLOAD axis whose size
+    // legitimately differs not only across `w` vs `scales/biases` of a
+    // single element, but also between K and V of the SAME element when
+    // `v_head_dim != k_head_dim` (`update_quantized` reads
+    // `keys.shape[-1] == k_head_dim` and `values.shape[-1] == v_head_dim`
+    // independently, `cache.py:243-244`). Walking the full rank here
+    // rejected those valid skewed caches on their own saved state.
+    for (axis, (ka, va)) in ks.iter().zip(vs.iter()).take(KV_NDIM - 1).enumerate() {
+      if ka != va {
+        return Err(Error::ShapeMismatch {
+          message: format!(
+            "QuantizedKvCache::set_state: K and V {element} leading axes \
+             (B, n_kv_heads, S) must match; disagree on axis {axis} \
+             (K[axis]={ka} vs V[axis]={va}; K shape {ks:?} V shape {vs:?}); \
+             the last (payload) axis can legitimately differ for \
+             v_head_dim != k_head_dim — but the leading axes are a \
+             cache-coherence requirement, so a mismatch is a forged or \
+             corrupt prompt cache, rejected upfront at the load boundary"
+          ),
+        });
+      }
+    }
+    Ok(())
   }
 
   /// `concat_seq` two stored triples on the sequence axis (`-2`) — mlx-lm's
@@ -574,14 +633,29 @@ impl KvCache for QuantizedKvCacheImpl {
   /// triples; 4 arrays → `(w, scales, None)` triples (bias-less). An empty
   /// state resets to the fresh cache (`_BaseCache` "no state").
   ///
-  /// Faithful to mlx-lm/mlx-swift-lm, this does **not** cross-validate the
-  /// keys/values triples' shapes — it assigns and lets mlx error
-  /// downstream — and `offset` is **not** derived here (mlx-lm restores it
-  /// via `meta_state`, `cache.py:303-304`; the getter slices to whatever
-  /// `offset` `set_meta_state` sets). A length other than 0/4/6 is a
-  /// recoverable [`Error::Backend`] (mlx-swift-lm `fatalError`s,
-  /// `KVCache.swift:945`; this crate forbids a panic on the recoverable
-  /// load path).
+  /// # Eager cross-validation (KVC-8)
+  ///
+  /// `offset` is **not** derived here (mlx-lm restores it via `meta_state`,
+  /// `cache.py:303-304`; the getter slices to whatever `offset`
+  /// `set_meta_state` sets), and a length other than 0/4/6 is a recoverable
+  /// [`Error::Backend`] (mlx-swift-lm `fatalError`s, `KVCache.swift:945`;
+  /// this crate forbids a panic on the recoverable load path).
+  ///
+  /// KVC-8 additionally cross-validates the K and V triples' rank and
+  /// per-axis-not-counting-the-quantization-axis shapes are consistent
+  /// (rank match, batch / heads / seq_len match — the leading axes that
+  /// the cache treats as a single `[B, n_kv_heads, S, *]` layout). The
+  /// per-triple-element (w / scales / biases) inner-axis sizes legitimately
+  /// differ (`dim // el_per_int` for `w`, `dim // group_size` for scales /
+  /// biases), so the validator only checks the leading axes that MUST
+  /// match for the cache to be coherent. This catches a forged / corrupt
+  /// prompt cache eagerly at the load boundary (`set_state`) rather than
+  /// lazily at the first `update_quantized` op, with a precise diagnostic
+  /// instead of a far-from-cause-site `concat_seq` rank/shape failure.
+  /// mlx-lm / mlx-swift-lm tolerate the mismatch lazily (no upfront
+  /// cross-check); the Rust eager check is a Rust-idiom upgrade for
+  /// diagnosability without changing the kinds of inputs accepted on the
+  /// faithful round-trip path (a consistent cache passes unchanged).
   fn set_state(&mut self, mut state: Vec<Array>) -> Result<()> {
     match state.len() {
       0 => {
@@ -596,6 +670,12 @@ impl KvCache for QuantizedKvCacheImpl {
         let v_w = state.pop().unwrap();
         let k_s = state.pop().unwrap();
         let k_w = state.pop().unwrap();
+        // KVC-8: cross-validate K/V shapes BEFORE assignment so a forged
+        // state with mismatched K/V leading axes is rejected upfront with
+        // a precise diagnostic. All four arrays remain in scope on Err
+        // (drop-order is the natural Vec drop), and `self` is untouched.
+        Self::validate_kv_leading_axes_match(&k_w, &v_w, "w")?;
+        Self::validate_kv_leading_axes_match(&k_s, &v_s, "scales")?;
         self.keys = Some((k_w, k_s, None));
         self.values = Some((v_w, v_s, None));
         Ok(())
@@ -608,6 +688,10 @@ impl KvCache for QuantizedKvCacheImpl {
         let k_b = state.pop().unwrap();
         let k_s = state.pop().unwrap();
         let k_w = state.pop().unwrap();
+        // KVC-8: cross-validate K/V shapes BEFORE assignment (see 4-arm).
+        Self::validate_kv_leading_axes_match(&k_w, &v_w, "w")?;
+        Self::validate_kv_leading_axes_match(&k_s, &v_s, "scales")?;
+        Self::validate_kv_leading_axes_match(&k_b, &v_b, "biases")?;
         self.keys = Some((k_w, k_s, Some(k_b)));
         self.values = Some((v_w, v_s, Some(v_b)));
         Ok(())

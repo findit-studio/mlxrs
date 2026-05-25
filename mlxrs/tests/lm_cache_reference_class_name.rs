@@ -90,30 +90,43 @@ fn batch_rotating_kv_cache_reference_name_is_batch_rotating_kvcache() {
   assert_eq!(c.reference_class_name(), "BatchRotatingKVCache");
 }
 
-// ───────── trait default fallback ─────────
+// ───────── KVC-10: required method (no default) ─────────
+//
+// Per KVC-10 (issue #107), `KvCache::reference_class_name` is now a
+// REQUIRED trait method (no default). Forgetting to declare it on a new
+// in-tree cache is a compile error — closing the silent runtime
+// label-loss the pre-KVC-10 `"KVCache"` default left open (a new
+// state-shape-different cache would have round-tripped as a
+// `StandardKvCache`).
+//
+// The pre-KVC-10 `default_dyn_kvcache_falls_back_to_kvcache` test that
+// asserted the default returns `"KVCache"` is REMOVED — the default no
+// longer exists, and the assertion is structurally incoherent. The
+// `RotatingForwardingWrapper` tests are updated below to assert the
+// required-method contract: a wrapper MUST forward
+// `reference_class_name` to its inner cache (one-line method body) and
+// in-tree caches/wrappers do so explicitly.
 
-/// Minimal `KvCache` impl that omits the `reference_class_name` override —
-/// exercises the trait default (mlx-lm `_BaseCache` / mlx-swift-lm
-/// `default: return "KVCache"` at `KVCache.swift:1390`). Required so a
-/// future third-party / forward-compat cache that omits the override still
-/// produces a *parseable* (if generic) round-trip rather than failing to
-/// dispatch.
-struct DefaultMock;
+/// Minimal `KvCache` impl that declares `reference_class_name`
+/// EXPLICITLY (post-KVC-10: required method, no default). The custom
+/// `"MyCustomCache"` name demonstrates the required-method contract — a
+/// new cache type chooses its own class name at trait-impl site, a
+/// compile-time guarantee.
+struct ExplicitMock;
 
-impl KvCache for DefaultMock {
+impl KvCache for ExplicitMock {
   fn offset(&self) -> usize {
     0
   }
   fn update(&mut self, _keys: &Array, _values: &Array) -> Result<(Array, Array)> {
     Err(Error::Backend {
-      message: "DefaultMock::update is not used in this test".into(),
+      message: "ExplicitMock::update is not used in this test".into(),
     })
   }
   fn state(&self) -> Result<Vec<Array>> {
     Ok(Vec::new())
   }
   fn materialize(&mut self) -> Result<()> {
-    // No stored arrays (this probe is empty); the barrier is a no-op.
     Ok(())
   }
   fn set_state(&mut self, _state: Vec<Array>) -> Result<()> {
@@ -134,7 +147,11 @@ impl KvCache for DefaultMock {
     true
   }
   fn copy(&self) -> Result<Box<dyn KvCache>> {
-    Ok(Box::new(DefaultMock))
+    Ok(Box::new(ExplicitMock))
+  }
+  // KVC-10 (issue #107): REQUIRED — no default.
+  fn reference_class_name(&self) -> &'static str {
+    "MyCustomCache"
   }
   fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
     self
@@ -142,35 +159,32 @@ impl KvCache for DefaultMock {
 }
 
 #[test]
-fn default_dyn_kvcache_falls_back_to_kvcache() {
-  // The trait default is `"KVCache"` — mlx-lm `_BaseCache` / mlx-swift-lm
-  // `default: return "KVCache"` (`KVCache.swift:1390`). A cache that omits
-  // the override inherits the generic-but-parseable name; `from_state`'s
-  // `"KVCache"` arm routes such payloads to `StandardKvCache`.
-  let m = DefaultMock;
-  assert_eq!(m.reference_class_name(), "KVCache");
+fn explicit_kvcache_uses_declared_name() {
+  // KVC-10: a new cache impl declares its name at trait-impl site (no
+  // silent inheritance of a generic default). `ExplicitMock` returns
+  // `"MyCustomCache"`, the exact string compiled into its impl body —
+  // verifying the required-method contract holds via both direct call
+  // and dynamic dispatch (the path `persist::reference_class_name`
+  // uses).
+  let m = ExplicitMock;
+  assert_eq!(m.reference_class_name(), "MyCustomCache");
   let d: &dyn KvCache = &m;
   assert_eq!(
     d.reference_class_name(),
-    "KVCache",
-    "trait default must be observable via dynamic dispatch (the path persist::reference_class_name uses)"
+    "MyCustomCache",
+    "the declared name MUST be observable via dynamic dispatch (the path persist::reference_class_name uses)"
   );
 }
 
-/// Wrapper around a `RotatingKvCache` that forwards every method **except**
-/// `reference_class_name` — i.e. the exact "out-of-tree wrapper" shape the
-/// adversarial review flagged. Mirrors swift's `cacheClassName` default
-/// arm: a `KVCache`-conforming type that doesn't match any of the
-/// `case is …:` arms falls through to `default: return "KVCache"`
-/// (`KVCache.swift:1390`). The pre-PR Rust impl used a structural
-/// heuristic (`max_size().is_some() && meta_state().len() == 4 ⇒
-/// RotatingKVCache`) to back-discriminate such wrappers; this PR removes
-/// that heuristic in favor of the trait method (faithful to swift's
-/// class-identity switch). This test pins the documented behavior so a
-/// future "fallback heuristic" re-add would surface as a deliberate test
-/// change, not silent re-introduction of the very hack the trait method
-/// replaces. (See the `On the removed heuristic` section of the trait
-/// method doc in `mlxrs/src/lm/cache/mod.rs`.)
+/// Wrapper around a `RotatingKvCache` that forwards every method,
+/// INCLUDING `reference_class_name`. Post-KVC-10 (issue #107), every
+/// impl MUST declare its class name explicitly — the trait-default
+/// `"KVCache"` fallback is gone. This wrapper's `reference_class_name`
+/// forwards to `self.inner.reference_class_name()` (a one-liner — the
+/// documented pattern for any wrapper that wants the wrapped kind's
+/// label). The pre-KVC-10 silent-default behavior (`"KVCache"` for any
+/// type without override) would have been a compile error under the
+/// required method, not silent label loss.
 struct RotatingForwardingWrapper {
   inner: RotatingKvCache,
 }
@@ -220,73 +234,62 @@ impl KvCache for RotatingForwardingWrapper {
   fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
     self
   }
-  // Deliberately NO `reference_class_name` override — exercises the trait
-  // default fallback (the whole point of this test).
+  // KVC-10 (issue #107): REQUIRED — forward to inner's declared name.
+  fn reference_class_name(&self) -> &'static str {
+    self.inner.reference_class_name()
+  }
 }
 
 #[test]
-fn rotating_forwarding_wrapper_without_override_classifies_as_kvcache() {
-  // Mirrors swift's `default: return "KVCache"` arm exactly: a type that
-  // forwards the full structural surface (`max_size().is_some()`,
-  // `meta_state().len() == 4`) but omits the `reference_class_name`
-  // override gets the documented default `"KVCache"`, NOT the
-  // pre-PR heuristic-derived `"RotatingKVCache"`. This is the
-  // swift-faithful behavior; a `forward.reference_class_name()` one-liner
-  // is the standard fix for any real downstream wrapper that wants the
-  // wrapped kind's label (see `mlxrs/src/lm/cache/mod.rs`
-  // `# On the removed heuristic`).
+fn rotating_forwarding_wrapper_inherits_inner_class_name() {
+  // Post-KVC-10 contract: a wrapper that forwards
+  // `reference_class_name` to its inner cache reports the inner's name —
+  // exactly the documented one-liner for any wrapper that wants the
+  // wrapped kind's label. Pre-KVC-10 this was the trait default
+  // `"KVCache"` (a silent label loss for any state-shape-different
+  // wrapper); post-KVC-10 the explicit forward is the only path, which
+  // means a future state-shape-different wrapper that omits the forward
+  // is a COMPILE ERROR (the structural guarantee).
   let w = RotatingForwardingWrapper {
     inner: RotatingKvCache::new(8, 1),
   };
-  // Sanity: the structural shape that the pre-PR heuristic would have
-  // used to classify this as `"RotatingKVCache"` is genuinely present.
-  assert!(
-    w.max_size().is_some(),
-    "wrapper forwards max_size() (structural shape of a rotating)"
-  );
-  assert_eq!(
-    w.meta_state().len(),
-    4,
-    "wrapper forwards rotating's 4-field meta_state (structural shape)"
-  );
-  // The documented post-PR behavior: trait-default `"KVCache"`, faithful
-  // to swift's `default:` arm.
+  // Sanity: the inner is a rotating cache.
+  assert!(w.max_size().is_some());
+  assert_eq!(w.meta_state().len(), 4);
+  // The post-KVC-10 contract: explicit forward yields the inner's name.
   assert_eq!(
     w.reference_class_name(),
-    "KVCache",
-    "wrapper without override falls through to the trait default (swift KVCache.swift:1390)"
+    "RotatingKVCache",
+    "wrapper that forwards to inner.reference_class_name() reports the inner's name"
   );
   let d: &dyn KvCache = &w;
   assert_eq!(
     d.reference_class_name(),
-    "KVCache",
+    "RotatingKVCache",
     "via dynamic dispatch too (the path persist uses)"
   );
 }
 
 #[test]
-fn rotating_forwarding_wrapper_nested_in_cache_list_also_classifies_as_kvcache() {
-  // The "top-level vs nested" consistency check: a defaulting wrapper's
-  // class name must be the SAME `"KVCache"` whether it is the cache being
-  // persisted directly OR a child of a `CacheList`. Pre-fix,
-  // `cache_list::child_class_name_from_meta` had a structural
-  // `is_cache_list_meta` fallback that would reclassify a defaulting
-  // wrapper whose `meta_state` parsed as a CacheList frame back to
-  // `"CacheList"`, creating an inconsistency with the trait method's
-  // documented swift-default contract. This test pins the unified
-  // behavior: nested == top-level == trait method == `"KVCache"`.
+fn rotating_forwarding_wrapper_nested_in_cache_list_inherits_inner_class_name() {
+  // The "top-level vs nested" consistency check (post-KVC-10): a
+  // forwarding wrapper's class name must be the same in top-level vs
+  // nested-in-CacheList positions. With the trait method REQUIRED, the
+  // wrapper's explicit `self.inner.reference_class_name()` is the only
+  // path, so this test pins that nested classification == top-level
+  // classification == inner's `RotatingKVCache`.
   let w = RotatingForwardingWrapper {
     inner: RotatingKvCache::new(8, 1),
   };
   let cl = CacheList::new(vec![Box::new(w)]);
   let meta = cl.meta_state();
   // Framing: ["1" (childCount), className, stateCount, metaCount, ...meta].
-  // The className slot is meta[1] — must be the trait default `"KVCache"`,
-  // not a structurally-reclassified `"CacheList"` or `"RotatingKVCache"`.
+  // The className slot is meta[1] — must be the inner's declared
+  // `"RotatingKVCache"`, exactly the top-level classification above.
   assert_eq!(meta[0], "1", "one child");
   assert_eq!(
-    meta[1], "KVCache",
-    "nested defaulting wrapper must be named `KVCache` (trait default), \
-     identical to its top-level classification — no structural fallback"
+    meta[1], "RotatingKVCache",
+    "nested wrapper that forwards to inner reports the inner's name, \
+     identical to its top-level classification"
   );
 }
