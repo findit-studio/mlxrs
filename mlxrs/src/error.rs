@@ -31,7 +31,7 @@ use std::{
 use crate::Dtype;
 
 /// Errors surfaced from the mlx backend or detected at the safe-wrapper boundary.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, derive_more::IsVariant)]
 #[non_exhaustive]
 pub enum Error {
   /// Shape mismatch detected by mlx during graph construction or eval.
@@ -257,23 +257,23 @@ pub struct ConvertDurabilityWarnings {
   /// observable commit point (the index rename) has succeeded. Kept
   /// in the public shape so a future caller can branch on it without
   /// an API break.
-  pub committed: bool,
+  pub(crate) committed: bool,
   /// Durability warning from the save phase. `Some(_)` iff
   /// [`crate::lm::load::save_model`] returned
   /// [`Error::DurabilityWarning`] (the save-side parent-directory
   /// fsync warned); `None` if the save returned plain `Ok(())`.
-  pub save: Option<std::io::Error>,
+  pub(crate) save: Option<std::io::Error>,
   /// Durability warning from the post-copy per-file fsync. `Some(_)`
   /// iff at least one copied file's `fsync_path` returned `Err`
   /// AFTER its [`std::fs::copy`] succeeded (data IS on disk, only
   /// durability uncertain); `None` if every per-file fsync passed.
-  pub post_copy_file: Option<std::io::Error>,
+  pub(crate) post_copy_file: Option<std::io::Error>,
   /// Durability warning from the post-copy destination-directory
   /// fsync. `Some(_)` iff `fsync_dir(dst)` returned `Err` AFTER every
   /// [`std::fs::copy`] succeeded (data IS on disk, only the directory
   /// inode metadata's durability uncertain); `None` if the dir fsync
   /// passed.
-  pub post_copy_dir: Option<std::io::Error>,
+  pub(crate) post_copy_dir: Option<std::io::Error>,
 }
 
 #[cfg(feature = "lm")]
@@ -306,6 +306,69 @@ impl std::error::Error for ConvertDurabilityWarnings {
 
 #[cfg(feature = "lm")]
 impl ConvertDurabilityWarnings {
+  /// Construct the aggregate directly. Always passes `committed = true`
+  /// (this type is only reachable after the observable commit point).
+  /// External callers use this instead of struct literal syntax.
+  pub fn new(
+    committed: bool,
+    save: Option<std::io::Error>,
+    post_copy_file: Option<std::io::Error>,
+    post_copy_dir: Option<std::io::Error>,
+  ) -> Self {
+    Self {
+      committed,
+      save,
+      post_copy_file,
+      post_copy_dir,
+    }
+  }
+
+  /// Whether the checkpoint commit point was reached. Always `true` for
+  /// instances produced by [`crate::lm::convert::convert`].
+  #[inline(always)]
+  pub fn committed(&self) -> bool {
+    self.committed
+  }
+
+  /// Durability warning from the save phase, if any.
+  pub fn save(&self) -> Option<&std::io::Error> {
+    self.save.as_ref()
+  }
+
+  /// Durability warning from the post-copy per-file fsync, if any.
+  pub fn post_copy_file(&self) -> Option<&std::io::Error> {
+    self.post_copy_file.as_ref()
+  }
+
+  /// Durability warning from the post-copy destination-directory fsync, if any.
+  pub fn post_copy_dir(&self) -> Option<&std::io::Error> {
+    self.post_copy_dir.as_ref()
+  }
+
+  /// Decompose into the four constituent fields (owned).
+  ///
+  /// `std::io::Error` is `!Clone`, so this is the only way for a downstream
+  /// recovery path to move out the underlying typed errors (preserving
+  /// `kind()`/`source()` fidelity) — the borrowed getters above are read-only.
+  /// Used internally by the convert pipeline to route the single-warning case
+  /// into [`Error::DurabilityWarning`]; surfaced publicly for the same need
+  /// in external consumers.
+  pub fn into_parts(
+    self,
+  ) -> (
+    bool,
+    Option<std::io::Error>,
+    Option<std::io::Error>,
+    Option<std::io::Error>,
+  ) {
+    (
+      self.committed,
+      self.save,
+      self.post_copy_file,
+      self.post_copy_dir,
+    )
+  }
+
   /// Return the first non-`None` underlying [`std::io::Error`] in
   /// deterministic `save -> post_copy_file -> post_copy_dir` priority
   /// order. Used by the [`std::error::Error::source`] impl; exposed

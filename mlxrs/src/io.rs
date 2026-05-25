@@ -962,6 +962,12 @@ fn make_writer_vtable() -> mlxrs_sys::mlx_io_vtable {
 #[cfg(feature = "gguf")]
 #[cfg_attr(docsrs, doc(cfg(feature = "gguf")))]
 #[non_exhaustive]
+#[derive(
+  derive_more::Display, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
+)]
+#[display("{}", self.as_str())]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum GgufMetadata {
   /// An array-valued metadata entry.
   Array(Array),
@@ -969,6 +975,23 @@ pub enum GgufMetadata {
   String(String),
   /// A list-of-strings metadata entry.
   StringList(Vec<String>),
+}
+
+#[cfg(feature = "gguf")]
+impl GgufMetadata {
+  /// Stable snake_case tag for the active variant — single source of truth
+  /// for [`std::fmt::Display`], log keys, and error messages. Per
+  /// rust-type-conventions §2, data-carrying enums get `as_str -> &str`
+  /// (non-`const`); the returned strings are `&'static str` here only
+  /// because every variant maps to a literal, not because `as_str` itself
+  /// is `const`.
+  pub fn as_str(&self) -> &'static str {
+    match self {
+      Self::Array(_) => "array",
+      Self::String(_) => "string",
+      Self::StringList(_) => "string_list",
+    }
+  }
 }
 
 /// Load a `.gguf` file, returning `(weights, metadata)`.

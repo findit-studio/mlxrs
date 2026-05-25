@@ -524,12 +524,7 @@ pub fn fuse(
         // 1 — surface via the existing single-warning shape
         // (`DurabilityWarning`) so the one-source contract is unchanged.
         1 => {
-          let crate::error::ConvertDurabilityWarnings {
-            committed: _,
-            save,
-            post_copy_file,
-            post_copy_dir,
-          } = aggregate;
+          let (_, save, post_copy_file, post_copy_dir) = aggregate.into_parts();
           let source = save
             .or(post_copy_file)
             .or(post_copy_dir)
