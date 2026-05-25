@@ -658,18 +658,16 @@ fn solid_frame(width: u32, height: u32, rgb: [u8; 3]) -> ::image::DynamicImage {
 /// equals "image_to_array per frame, stacked", which is fully
 /// deterministic (no interpolation) for hand-tracing.
 fn passthrough_cfg(size: (u32, u32)) -> ImageProcessorConfig {
-  ImageProcessorConfig {
-    size,
-    mean: [0.0, 0.0, 0.0],
-    std: [1.0, 1.0, 1.0],
-    rescale_factor: 1.0,
-    do_resize: false,
-    do_rescale: false,
-    do_normalize: false,
-    resample: ResizeFilter::Bicubic,
-    color_order: ColorOrder::Rgb,
-    ..ImageProcessorConfig::default()
-  }
+  ImageProcessorConfig::new()
+    .with_size(size)
+    .with_mean([0.0, 0.0, 0.0])
+    .with_std([1.0, 1.0, 1.0])
+    .with_rescale_factor(1.0)
+    .with_do_resize(false)
+    .with_do_rescale(false)
+    .with_do_normalize(false)
+    .with_resample(ResizeFilter::Bicubic)
+    .with_color_order(ColorOrder::Rgb)
 }
 
 #[test]
@@ -703,18 +701,16 @@ fn process_frames_matches_per_frame_preprocess_with_rescale() {
   // With do_rescale=true (1/255) the stacked output must equal the
   // per-frame preprocess values. Single frame keeps the hand-trace tiny.
   let frame = solid_frame(1, 1, [255, 0, 128]);
-  let cfg = ImageProcessorConfig {
-    size: (1, 1),
-    mean: [0.0, 0.0, 0.0],
-    std: [1.0, 1.0, 1.0],
-    rescale_factor: 1.0 / 255.0,
-    do_resize: false,
-    do_rescale: true,
-    do_normalize: false,
-    resample: ResizeFilter::Bicubic,
-    color_order: ColorOrder::Rgb,
-    ..ImageProcessorConfig::default()
-  };
+  let cfg = ImageProcessorConfig::new()
+    .with_size((1, 1))
+    .with_mean([0.0, 0.0, 0.0])
+    .with_std([1.0, 1.0, 1.0])
+    .with_rescale_factor(1.0 / 255.0)
+    .with_do_resize(false)
+    .with_do_rescale(true)
+    .with_do_normalize(false)
+    .with_resample(ResizeFilter::Bicubic)
+    .with_color_order(ColorOrder::Rgb);
   let frames = [frame];
   let mut out = process_frames(&frames, &cfg).unwrap();
   assert_eq!(out.shape(), vec![1, 1, 1, 3]);
@@ -758,10 +754,7 @@ fn process_frames_rejects_chw_layout() {
   // the documented `[T, H, W, 3]` stack contract. `process_frames` must
   // reject it with a clear, recoverable Err pointing at the layout.
   let frames = [solid_frame(2, 2, [10, 20, 30])];
-  let cfg = ImageProcessorConfig {
-    layout: Layout::Chw,
-    ..passthrough_cfg((2, 2))
-  };
+  let cfg = passthrough_cfg((2, 2)).with_layout(Layout::Chw);
   let err = process_frames(&frames, &cfg).expect_err("Chw must Err");
   let msg = format!("{err}");
   assert!(
@@ -780,10 +773,7 @@ fn process_frames_rejects_bchw_layout() {
   // `[T, 1, 3, H, W]` that matches no normal video layout. `process_frames`
   // must reject it with the same recoverable Err.
   let frames = [solid_frame(2, 2, [10, 20, 30])];
-  let cfg = ImageProcessorConfig {
-    layout: Layout::Bchw,
-    ..passthrough_cfg((2, 2))
-  };
+  let cfg = passthrough_cfg((2, 2)).with_layout(Layout::Bchw);
   let err = process_frames(&frames, &cfg).expect_err("Bchw must Err");
   let msg = format!("{err}");
   assert!(
@@ -805,10 +795,7 @@ fn process_frames_accepts_hwc_layout_unchanged_default() {
     solid_frame(2, 2, [10, 20, 30]),
     solid_frame(2, 2, [40, 50, 60]),
   ];
-  let cfg = ImageProcessorConfig {
-    layout: Layout::Hwc,
-    ..passthrough_cfg((2, 2))
-  };
+  let cfg = passthrough_cfg((2, 2)).with_layout(Layout::Hwc);
   let out = process_frames(&frames, &cfg).expect("Hwc must succeed");
   assert_eq!(
     out.shape(),

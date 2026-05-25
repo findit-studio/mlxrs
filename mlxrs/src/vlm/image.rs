@@ -261,7 +261,8 @@ pub const MAX_DECODED_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
 /// `Nearest` and `Bilinear` because they appear in the python VLM ecosystem
 /// (PIL's `Image.resize` `resample=` argument that `mlx-vlm`'s
 /// `resize_image` uses transitively at `mlx_vlm/utils.py:835-839`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
+#[display("{}", self.as_str())]
 pub enum ResizeFilter {
   /// Nearest-neighbor (no smoothing). Cheapest; rarely used for VLM.
   /// PIL `Image.NEAREST`.
@@ -278,6 +279,18 @@ pub enum ResizeFilter {
   /// matches PIL's `Image.LANCZOS`. Mirrors the swift `resampleLanczos`
   /// (`MediaProcessing.swift:81-103`).
   Lanczos3,
+}
+
+impl ResizeFilter {
+  /// Lowercase string tag matching PIL resampling filter names.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Nearest => "nearest",
+      Self::Bilinear => "bilinear",
+      Self::Bicubic => "bicubic",
+      Self::Lanczos3 => "lanczos3",
+    }
+  }
 }
 
 impl ResizeFilter {
@@ -301,12 +314,23 @@ impl ResizeFilter {
 /// (`MediaProcessing.swift:171` — `CIFormat.RGBAf`'s RGBA channel order);
 /// `BGR` is exposed for parity with python image-processor configs that
 /// use OpenCV-style BGR (e.g. some older CLIP variants).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
+#[display("{}", self.as_str())]
 pub enum ColorOrder {
   /// Red-Green-Blue (the default; matches PIL / swift CoreImage).
   Rgb,
   /// Blue-Green-Red (OpenCV-style; swap R↔B).
   Bgr,
+}
+
+impl ColorOrder {
+  /// Lowercase string tag matching Python color-order convention.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Rgb => "rgb",
+      Self::Bgr => "bgr",
+    }
+  }
 }
 
 /// Trailing tensor layout applied by [`preprocess`] AFTER the
@@ -356,7 +380,8 @@ pub enum ColorOrder {
 ///
 /// Tracking issue: [#120](https://github.com/Findit-AI/mlxrs/issues/120)
 /// (VLM-1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
+#[display("{}", self.as_str())]
 pub enum Layout {
   /// Channel-last `[H, W, 3]`. Identity post-step — the historical
   /// [`preprocess`] output, kept as default for source compatibility.
@@ -366,6 +391,17 @@ pub enum Layout {
   /// Planar batched `[1, 3, H, W]`. Matches swift's
   /// `MediaProcessing.asMLXArray` (`MediaProcessing.swift:190`).
   Bchw,
+}
+
+impl Layout {
+  /// Lowercase string tag.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Hwc => "hwc",
+      Self::Chw => "chw",
+      Self::Bchw => "bchw",
+    }
+  }
 }
 
 /// Image preprocessing config — the *union* of fields common across VLM
@@ -382,23 +418,23 @@ pub enum Layout {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ImageProcessorConfig {
   /// Target image size `(height, width)`.
-  pub size: (u32, u32),
+  size: (u32, u32),
   /// Per-channel mean for [`normalize_imagenet`].
-  pub mean: [f32; 3],
+  mean: [f32; 3],
   /// Per-channel std for [`normalize_imagenet`].
-  pub std: [f32; 3],
+  std: [f32; 3],
   /// Multiplier applied by [`rescale`] (typically `1.0 / 255.0`).
-  pub rescale_factor: f32,
+  rescale_factor: f32,
   /// Whether the [`preprocess`] composer applies [`resize`].
-  pub do_resize: bool,
+  do_resize: bool,
   /// Whether the [`preprocess`] composer applies [`rescale`].
-  pub do_rescale: bool,
+  do_rescale: bool,
   /// Whether the [`preprocess`] composer applies [`normalize_imagenet`].
-  pub do_normalize: bool,
+  do_normalize: bool,
   /// Interpolation filter forwarded to [`resize`].
-  pub resample: ResizeFilter,
+  resample: ResizeFilter,
   /// Channel layout forwarded to [`image_to_array`].
-  pub color_order: ColorOrder,
+  color_order: ColorOrder,
   /// Trailing tensor layout applied by [`preprocess`] after the
   /// ImageNet pipeline. Default [`Layout::Hwc`] preserves the
   /// historical channel-last `[H, W, 3]` output for source
@@ -410,10 +446,16 @@ pub struct ImageProcessorConfig {
   ///
   /// Tracking issue: [#120](https://github.com/Findit-AI/mlxrs/issues/120)
   /// (VLM-1).
-  pub layout: Layout,
+  layout: Layout,
 }
 
 impl Default for ImageProcessorConfig {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl ImageProcessorConfig {
   /// ImageNet defaults: `size = (224, 224)`, `mean = [0.485, 0.456,
   /// 0.406]`, `std = [0.229, 0.224, 0.225]`, `rescale_factor = 1/255`,
   /// `resample = Bicubic`, `color_order = Rgb`, `layout = Hwc`, all
@@ -422,7 +464,7 @@ impl Default for ImageProcessorConfig {
   /// historical [`preprocess`] output — pre-existing callers see no
   /// change; opt into [`Layout::Bchw`] / [`Layout::Chw`] explicitly when
   /// the per-model encoder wants planar layout.
-  fn default() -> Self {
+  pub fn new() -> Self {
     Self {
       size: (224, 224),
       mean: [0.485, 0.456, 0.406],
@@ -435,6 +477,122 @@ impl Default for ImageProcessorConfig {
       color_order: ColorOrder::Rgb,
       layout: Layout::Hwc,
     }
+  }
+
+  // ── builders ──────────────────────────────────────────────────────────────
+
+  /// Set the target image size `(height, width)`.
+  #[must_use]
+  pub fn with_size(mut self, v: (u32, u32)) -> Self {
+    self.size = v;
+    self
+  }
+  /// Set the per-channel mean for normalization.
+  #[must_use]
+  pub fn with_mean(mut self, v: [f32; 3]) -> Self {
+    self.mean = v;
+    self
+  }
+  /// Set the per-channel std for normalization.
+  #[must_use]
+  pub fn with_std(mut self, v: [f32; 3]) -> Self {
+    self.std = v;
+    self
+  }
+  /// Set the rescale factor (typically `1.0 / 255.0`).
+  #[must_use]
+  pub fn with_rescale_factor(mut self, v: f32) -> Self {
+    self.rescale_factor = v;
+    self
+  }
+  /// Set the `do_resize` flag.
+  #[must_use]
+  pub fn with_do_resize(mut self, v: bool) -> Self {
+    self.do_resize = v;
+    self
+  }
+  /// Set the `do_rescale` flag.
+  #[must_use]
+  pub fn with_do_rescale(mut self, v: bool) -> Self {
+    self.do_rescale = v;
+    self
+  }
+  /// Set the `do_normalize` flag.
+  #[must_use]
+  pub fn with_do_normalize(mut self, v: bool) -> Self {
+    self.do_normalize = v;
+    self
+  }
+  /// Set the interpolation filter.
+  #[must_use]
+  pub fn with_resample(mut self, v: ResizeFilter) -> Self {
+    self.resample = v;
+    self
+  }
+  /// Set the channel order.
+  #[must_use]
+  pub fn with_color_order(mut self, v: ColorOrder) -> Self {
+    self.color_order = v;
+    self
+  }
+  /// Set the trailing tensor layout.
+  #[must_use]
+  pub fn with_layout(mut self, v: Layout) -> Self {
+    self.layout = v;
+    self
+  }
+
+  // ── accessors ─────────────────────────────────────────────────────────────
+
+  /// Target image size `(height, width)`.
+  #[inline(always)]
+  pub fn size(&self) -> (u32, u32) {
+    self.size
+  }
+  /// Per-channel mean for normalization.
+  #[inline(always)]
+  pub fn mean(&self) -> [f32; 3] {
+    self.mean
+  }
+  /// Per-channel std for normalization.
+  #[inline(always)]
+  pub fn std(&self) -> [f32; 3] {
+    self.std
+  }
+  /// Rescale factor (typically `1.0 / 255.0`).
+  #[inline(always)]
+  pub fn rescale_factor(&self) -> f32 {
+    self.rescale_factor
+  }
+  /// Whether [`preprocess`] applies [`resize`].
+  #[inline(always)]
+  pub fn do_resize(&self) -> bool {
+    self.do_resize
+  }
+  /// Whether [`preprocess`] applies [`rescale`].
+  #[inline(always)]
+  pub fn do_rescale(&self) -> bool {
+    self.do_rescale
+  }
+  /// Whether [`preprocess`] applies [`normalize_imagenet`].
+  #[inline(always)]
+  pub fn do_normalize(&self) -> bool {
+    self.do_normalize
+  }
+  /// Interpolation filter for [`resize`].
+  #[inline(always)]
+  pub fn resample(&self) -> ResizeFilter {
+    self.resample
+  }
+  /// Channel order.
+  #[inline(always)]
+  pub fn color_order(&self) -> ColorOrder {
+    self.color_order
+  }
+  /// Trailing tensor layout.
+  #[inline(always)]
+  pub fn layout(&self) -> Layout {
+    self.layout
   }
 }
 

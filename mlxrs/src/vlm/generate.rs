@@ -132,27 +132,95 @@ pub struct VlmGenConfig {
   /// `prefill_step_size` / `eos` / `seed`). Reused 1:1 from the LM
   /// surface — the multimodal loop adds NO new sampler / processor
   /// concepts.
-  pub lm: GenConfig,
+  lm: GenConfig,
   /// Token id of the image placeholder the splice emits (per-model — e.g.
   /// `<image>` or `<|image_pad|>`'s ID after tokenization). The merged
   /// embed sequence places `image_embeds` at every run of this id.
-  pub image_token_id: u32,
+  image_token_id: u32,
   /// Token id the chat template emits where images go. Often the same as
   /// [`Self::image_token_id`] (single-token marker that BOTH delimits the
   /// splice site AND occupies the placeholder positions), but some
   /// models use distinct ids — e.g. `<|image|>` (marker) vs `<|image_pad|>`
   /// (placeholder). When `None`, defaults to [`Self::image_token_id`]
   /// (the common case).
-  pub image_marker_id: Option<u32>,
+  image_marker_id: Option<u32>,
   /// Number of image tokens per image — the per-model
   /// `num_tokens_per_image` (Qwen-VL variable, LLaVA fixed-grid, etc.).
   /// MUST match what [`Model::encode_image`] emits (`N_i` per image), or
   /// the splice will fail the `Σ widths == N_total` contract in
   /// [`Model::merge_embeddings`].
-  pub num_tokens_per_image: usize,
+  num_tokens_per_image: usize,
   /// Marker-vs-prepend policy. See
   /// [`crate::vlm::prompt::MarkerPolicy`].
-  pub marker_policy: MarkerPolicy,
+  marker_policy: MarkerPolicy,
+}
+
+impl VlmGenConfig {
+  /// Construct a [`VlmGenConfig`].
+  ///
+  /// `image_marker_id` defaults to `None` (marker == placeholder — the
+  /// common single-token case). Use [`with_image_marker_id`] to set a
+  /// distinct marker id when the chat template uses separate tokens for the
+  /// splice site and the placeholder positions.
+  ///
+  /// [`with_image_marker_id`]: Self::with_image_marker_id
+  pub fn new(
+    lm: GenConfig,
+    image_token_id: u32,
+    num_tokens_per_image: usize,
+    marker_policy: MarkerPolicy,
+  ) -> Self {
+    Self {
+      lm,
+      image_token_id,
+      image_marker_id: None,
+      num_tokens_per_image,
+      marker_policy,
+    }
+  }
+
+  /// Set a distinct `image_marker_id` when the chat template uses separate
+  /// tokens for the splice site vs. the placeholder positions (e.g.
+  /// `<|image|>` marker vs. `<|image_pad|>` placeholder).
+  #[must_use]
+  pub fn with_image_marker_id(mut self, v: Option<u32>) -> Self {
+    self.image_marker_id = v;
+    self
+  }
+
+  // ── accessors ──────────────────────────────────────────────────────────────
+
+  /// All LM generation knobs.
+  #[inline(always)]
+  pub fn lm_ref(&self) -> &GenConfig {
+    &self.lm
+  }
+  /// Mutable borrow of the LM generation knobs for in-place mutation.
+  #[inline(always)]
+  pub fn lm_mut(&mut self) -> &mut GenConfig {
+    &mut self.lm
+  }
+  /// Image placeholder token id.
+  #[inline(always)]
+  pub fn image_token_id(&self) -> u32 {
+    self.image_token_id
+  }
+  /// Optional distinct image marker token id (`None` = use
+  /// [`image_token_id`](Self::image_token_id)).
+  #[inline(always)]
+  pub fn image_marker_id(&self) -> Option<u32> {
+    self.image_marker_id
+  }
+  /// Number of image feature tokens per image.
+  #[inline(always)]
+  pub fn num_tokens_per_image(&self) -> usize {
+    self.num_tokens_per_image
+  }
+  /// Marker vs. prepend policy.
+  #[inline(always)]
+  pub fn marker_policy(&self) -> MarkerPolicy {
+    self.marker_policy
+  }
 }
 
 /// End-to-end multimodal generation Iterator.

@@ -20,11 +20,11 @@ fn prepare_inputs_text_only_no_payloads() {
   let batch_a = [10_u32, 20, 30];
   let batches: &[&[u32]] = &[&batch_a];
   let out = prepare_inputs(batches, None, None, None, &PrepareInputsOpts::default()).unwrap();
-  assert_eq!(out.input_ids.shape(), vec![1, 3]);
-  assert_eq!(out.attention_mask.shape(), vec![1, 3]);
-  assert!(out.pixel_values.is_none());
-  assert!(out.input_features.is_none());
-  assert!(out.pixel_values_videos.is_none());
+  assert_eq!(out.input_ids_ref().shape(), vec![1, 3]);
+  assert_eq!(out.attention_mask_ref().shape(), vec![1, 3]);
+  assert!(out.pixel_values_ref().is_none());
+  assert!(out.input_features_ref().is_none());
+  assert!(out.pixel_values_videos_ref().is_none());
 }
 
 #[test]
@@ -44,12 +44,12 @@ fn prepare_inputs_image_only_dispatch() {
     &PrepareInputsOpts::default(),
   )
   .unwrap();
-  assert_eq!(out.input_ids.shape(), vec![1, 3]);
-  assert_eq!(out.attention_mask.shape(), vec![1, 3]);
-  let pv = out.pixel_values.expect("pixel_values present");
+  assert_eq!(out.input_ids_ref().shape(), vec![1, 3]);
+  assert_eq!(out.attention_mask_ref().shape(), vec![1, 3]);
+  let pv = out.pixel_values_ref().expect("pixel_values present");
   assert_eq!(pv.shape(), vec![1, 3, 4, 4]);
-  assert!(out.input_features.is_none());
-  assert!(out.pixel_values_videos.is_none());
+  assert!(out.input_features_ref().is_none());
+  assert!(out.pixel_values_videos_ref().is_none());
 }
 
 #[test]
@@ -68,10 +68,10 @@ fn prepare_inputs_audio_only_dispatch() {
     &PrepareInputsOpts::default(),
   )
   .unwrap();
-  let f = out.input_features.expect("input_features present");
+  let f = out.input_features_ref().expect("input_features present");
   assert_eq!(f.shape(), vec![1, 80, 100]);
-  assert!(out.pixel_values.is_none());
-  assert!(out.pixel_values_videos.is_none());
+  assert!(out.pixel_values_ref().is_none());
+  assert!(out.pixel_values_videos_ref().is_none());
 }
 
 #[test]
@@ -89,10 +89,10 @@ fn prepare_inputs_combined_image_text_audio() {
     &PrepareInputsOpts::default(),
   )
   .unwrap();
-  assert_eq!(out.input_ids.shape(), vec![1, 4]);
-  assert!(out.pixel_values.is_some());
-  assert!(out.input_features.is_some());
-  assert!(out.pixel_values_videos.is_none());
+  assert_eq!(out.input_ids_ref().shape(), vec![1, 4]);
+  assert!(out.pixel_values_ref().is_some());
+  assert!(out.input_features_ref().is_some());
+  assert!(out.pixel_values_videos_ref().is_none());
 }
 
 #[test]
@@ -110,11 +110,11 @@ fn prepare_inputs_video_dispatch() {
   )
   .unwrap();
   let v = out
-    .pixel_values_videos
+    .pixel_values_videos_ref()
     .expect("pixel_values_videos present");
   assert_eq!(v.shape(), vec![8, 224, 224, 3]);
-  assert!(out.pixel_values.is_none());
-  assert!(out.input_features.is_none());
+  assert!(out.pixel_values_ref().is_none());
+  assert!(out.input_features_ref().is_none());
 }
 
 // ──────────────────────── prepare_inputs: padding-side ───────────────────
@@ -126,21 +126,19 @@ fn prepare_inputs_padding_side_left_default() {
   let a = [10_u32, 20]; // len 2
   let b = [30_u32, 40, 50, 60]; // len 4 (max)
   let batches: &[&[u32]] = &[&a, &b];
-  let opts = PrepareInputsOpts {
-    pad_token_id: 0,
-    padding: true,
-    padding_side: PaddingSide::Left,
-    attention_mask: None,
-  };
+  let opts = PrepareInputsOpts::new()
+    .with_pad_token_id(0)
+    .with_padding(true)
+    .with_padding_side(PaddingSide::Left);
   let mut out = prepare_inputs(batches, None, None, None, &opts).unwrap();
-  assert_eq!(out.input_ids.shape(), vec![2, 4]);
-  let ids = out.input_ids.to_vec::<i32>().unwrap();
+  assert_eq!(out.input_ids_ref().shape(), vec![2, 4]);
+  let ids = out.input_ids_mut().to_vec::<i32>().unwrap();
   // Row 0 (left-padded): [0, 0, 10, 20]
   assert_eq!(&ids[0..4], &[0, 0, 10, 20]);
   // Row 1: [30, 40, 50, 60] (no padding needed)
   assert_eq!(&ids[4..8], &[30, 40, 50, 60]);
   // Attention mask: false at left-pads.
-  let mask = out.attention_mask.to_vec::<bool>().unwrap();
+  let mask = out.attention_mask_mut().to_vec::<bool>().unwrap();
   assert_eq!(&mask[0..4], &[false, false, true, true]);
   assert_eq!(&mask[4..8], &[true, true, true, true]);
 }
@@ -151,19 +149,17 @@ fn prepare_inputs_padding_side_right_vs_left() {
   let a = [10_u32, 20]; // len 2
   let b = [30_u32, 40, 50, 60]; // len 4 (max)
   let batches: &[&[u32]] = &[&a, &b];
-  let opts = PrepareInputsOpts {
-    pad_token_id: 7,
-    padding: true,
-    padding_side: PaddingSide::Right,
-    attention_mask: None,
-  };
+  let opts = PrepareInputsOpts::new()
+    .with_pad_token_id(7)
+    .with_padding(true)
+    .with_padding_side(PaddingSide::Right);
   let mut out = prepare_inputs(batches, None, None, None, &opts).unwrap();
-  let ids = out.input_ids.to_vec::<i32>().unwrap();
+  let ids = out.input_ids_mut().to_vec::<i32>().unwrap();
   // Row 0 (right-padded): [10, 20, 7, 7]
   assert_eq!(&ids[0..4], &[10, 20, 7, 7]);
   // Row 1: unchanged.
   assert_eq!(&ids[4..8], &[30, 40, 50, 60]);
-  let mask = out.attention_mask.to_vec::<bool>().unwrap();
+  let mask = out.attention_mask_mut().to_vec::<bool>().unwrap();
   assert_eq!(&mask[0..4], &[true, true, false, false]);
 }
 
@@ -173,12 +169,10 @@ fn prepare_inputs_padding_disabled_requires_uniform_length() {
   let a = [10_u32, 20];
   let b = [30_u32, 40, 50];
   let batches: &[&[u32]] = &[&a, &b];
-  let opts = PrepareInputsOpts {
-    pad_token_id: 0,
-    padding: false,
-    padding_side: PaddingSide::Left,
-    attention_mask: None,
-  };
+  let opts = PrepareInputsOpts::new()
+    .with_pad_token_id(0)
+    .with_padding(false)
+    .with_padding_side(PaddingSide::Left);
   let err = prepare_inputs(batches, None, None, None, &opts).unwrap_err();
   let msg = format!("{err}");
   assert!(msg.contains("padding=false"), "unexpected error: {msg}");
@@ -199,10 +193,10 @@ fn prepare_inputs_uniform_no_padding_needed() {
   let b = [40_u32, 50, 60];
   let batches: &[&[u32]] = &[&a, &b];
   let mut out = prepare_inputs(batches, None, None, None, &PrepareInputsOpts::default()).unwrap();
-  assert_eq!(out.input_ids.shape(), vec![2, 3]);
-  let ids = out.input_ids.to_vec::<i32>().unwrap();
+  assert_eq!(out.input_ids_ref().shape(), vec![2, 3]);
+  let ids = out.input_ids_mut().to_vec::<i32>().unwrap();
   assert_eq!(ids, vec![10, 20, 30, 40, 50, 60]);
-  let mask = out.attention_mask.to_vec::<bool>().unwrap();
+  let mask = out.attention_mask_mut().to_vec::<bool>().unwrap();
   assert!(mask.iter().all(|&b| b));
 }
 
@@ -223,15 +217,14 @@ fn prepare_inputs_caller_supplied_attention_mask_overrides_default() {
   let b = [30_u32, 40, 50, 60]; // all real tokens
   let batches: &[&[u32]] = &[&a, &b];
   let caller_mask = vec![vec![true, true, false, false], vec![true, true, true, true]];
-  let opts = PrepareInputsOpts {
-    pad_token_id: 0,
-    padding: true,
-    padding_side: PaddingSide::Left,
-    attention_mask: Some(caller_mask),
-  };
+  let opts = PrepareInputsOpts::new()
+    .with_pad_token_id(0)
+    .with_padding(true)
+    .with_padding_side(PaddingSide::Left)
+    .with_attention_mask(caller_mask);
   let mut out = prepare_inputs(batches, None, None, None, &opts).unwrap();
-  assert_eq!(out.attention_mask.shape(), vec![2, 4]);
-  let mask = out.attention_mask.to_vec::<bool>().unwrap();
+  assert_eq!(out.attention_mask_ref().shape(), vec![2, 4]);
+  let mask = out.attention_mask_mut().to_vec::<bool>().unwrap();
   // Row 0 (uniform-length → no extra padding step) → caller's mask
   // directly.
   assert_eq!(&mask[0..4], &[true, true, false, false]);
@@ -248,14 +241,13 @@ fn prepare_inputs_caller_mask_left_pads_with_false() {
   let b = [30_u32, 40, 50, 60]; // len 4
   let batches: &[&[u32]] = &[&a, &b];
   let caller_mask = vec![vec![true, false], vec![true, true, true, true]];
-  let opts = PrepareInputsOpts {
-    pad_token_id: 0,
-    padding: true,
-    padding_side: PaddingSide::Left,
-    attention_mask: Some(caller_mask),
-  };
+  let opts = PrepareInputsOpts::new()
+    .with_pad_token_id(0)
+    .with_padding(true)
+    .with_padding_side(PaddingSide::Left)
+    .with_attention_mask(caller_mask);
   let mut out = prepare_inputs(batches, None, None, None, &opts).unwrap();
-  let mask = out.attention_mask.to_vec::<bool>().unwrap();
+  let mask = out.attention_mask_mut().to_vec::<bool>().unwrap();
   // Row 0 left-padded to length 4:
   //   leading pad position (1) → false
   //   leading pad position (2) → false
@@ -272,14 +264,13 @@ fn prepare_inputs_caller_mask_right_pads_with_false() {
   let b = [30_u32, 40, 50, 60]; // len 4
   let batches: &[&[u32]] = &[&a, &b];
   let caller_mask = vec![vec![true, false], vec![true, true, true, true]];
-  let opts = PrepareInputsOpts {
-    pad_token_id: 0,
-    padding: true,
-    padding_side: PaddingSide::Right,
-    attention_mask: Some(caller_mask),
-  };
+  let opts = PrepareInputsOpts::new()
+    .with_pad_token_id(0)
+    .with_padding(true)
+    .with_padding_side(PaddingSide::Right)
+    .with_attention_mask(caller_mask);
   let mut out = prepare_inputs(batches, None, None, None, &opts).unwrap();
-  let mask = out.attention_mask.to_vec::<bool>().unwrap();
+  let mask = out.attention_mask_mut().to_vec::<bool>().unwrap();
   // Row 0 right-padded: caller's mask [true, false] then 2 trailing
   // pad positions (false).
   assert_eq!(&mask[0..4], &[true, false, false, false]);
@@ -293,12 +284,11 @@ fn prepare_inputs_caller_mask_dimension_mismatch_errors() {
   let b = [30_u32, 40];
   let batches: &[&[u32]] = &[&a, &b];
   let bad_mask = vec![vec![true, true]]; // outer len 1 != 2
-  let opts = PrepareInputsOpts {
-    pad_token_id: 0,
-    padding: true,
-    padding_side: PaddingSide::Left,
-    attention_mask: Some(bad_mask),
-  };
+  let opts = PrepareInputsOpts::new()
+    .with_pad_token_id(0)
+    .with_padding(true)
+    .with_padding_side(PaddingSide::Left)
+    .with_attention_mask(bad_mask);
   let err = prepare_inputs(batches, None, None, None, &opts).unwrap_err();
   assert!(
     matches!(err, Error::ShapeMismatch { .. }),
@@ -318,12 +308,11 @@ fn prepare_inputs_caller_mask_inner_dimension_mismatch_errors() {
   let b = [30_u32, 40, 50];
   let batches: &[&[u32]] = &[&a, &b];
   let bad_mask = vec![vec![true, true], vec![true, true]]; // mask[1] len 2 != 3
-  let opts = PrepareInputsOpts {
-    pad_token_id: 0,
-    padding: true,
-    padding_side: PaddingSide::Left,
-    attention_mask: Some(bad_mask),
-  };
+  let opts = PrepareInputsOpts::new()
+    .with_pad_token_id(0)
+    .with_padding(true)
+    .with_padding_side(PaddingSide::Left)
+    .with_attention_mask(bad_mask);
   let err = prepare_inputs(batches, None, None, None, &opts).unwrap_err();
   assert!(
     matches!(err, Error::ShapeMismatch { .. }),
@@ -357,18 +346,16 @@ fn load_video_wraps_vlm_video() {
   let frames = vec![mk_frame(), mk_frame()];
 
   // Minimal ImageProcessorConfig — keep input frame size, just rescale.
-  let cfg = ImageProcessorConfig {
-    size: (4, 4),
-    mean: [0.0, 0.0, 0.0],
-    std: [1.0, 1.0, 1.0],
-    rescale_factor: 1.0 / 255.0,
-    do_resize: false,
-    do_rescale: true,
-    do_normalize: false,
-    resample: ResizeFilter::Bilinear,
-    color_order: ColorOrder::Rgb,
-    ..ImageProcessorConfig::default()
-  };
+  let cfg = ImageProcessorConfig::new()
+    .with_size((4, 4))
+    .with_mean([0.0, 0.0, 0.0])
+    .with_std([1.0, 1.0, 1.0])
+    .with_rescale_factor(1.0 / 255.0)
+    .with_do_resize(false)
+    .with_do_rescale(true)
+    .with_do_normalize(false)
+    .with_resample(ResizeFilter::Bilinear)
+    .with_color_order(ColorOrder::Rgb);
   let out = load_video(&frames, &cfg).unwrap();
   // stack of 2 frames, 4x4 RGB, channel-last → [2, 4, 4, 3]
   assert_eq!(out.shape(), vec![2, 4, 4, 3]);
