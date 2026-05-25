@@ -827,7 +827,7 @@ pub fn process_frames(
   // no standard video layout). Video-tensor layout semantics are not
   // yet defined; callers wanting planar output should post-process the
   // returned `[T, H, W, 3]` themselves.
-  if cfg.layout != Layout::Hwc {
+  if cfg.layout() != Layout::Hwc {
     return Err(Error::Backend {
       message: format!(
         "process_frames currently only supports Layout::Hwc per-frame configs; \
@@ -835,7 +835,7 @@ pub fn process_frames(
          use Layout::Hwc for video inputs (and post-process the returned \
          [T, H, W, 3] if a planar shape is needed) or wait for a future PR \
          adding video layout semantics.",
-        cfg.layout
+        cfg.layout()
       ),
     });
   }

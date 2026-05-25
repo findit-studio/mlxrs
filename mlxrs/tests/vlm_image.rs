@@ -1200,13 +1200,11 @@ fn preprocess_no_resize_passthrough() {
   // do_resize=false: output spatial dims match the input image, not
   // cfg.size.
   let img = gradient_image(8, 6);
-  let cfg = ImageProcessorConfig {
-    size: (32, 32),
-    do_resize: false,
-    do_rescale: false,
-    do_normalize: false,
-    ..ImageProcessorConfig::default()
-  };
+  let cfg = ImageProcessorConfig::new()
+    .with_size((32, 32))
+    .with_do_resize(false)
+    .with_do_rescale(false)
+    .with_do_normalize(false);
   let mut out = preprocess(&img, &cfg).unwrap();
   // [H=6, W=8, 3]: cfg.size was ignored because do_resize=false.
   assert_eq!(out.shape(), vec![6, 8, 3]);
@@ -1220,13 +1218,11 @@ fn preprocess_no_normalize_passthrough() {
   // do_normalize=false: output is just rescaled, no per-channel
   // subtract/divide; values in [0, 1].
   let img = synthetic_image(4, 4);
-  let cfg = ImageProcessorConfig {
-    do_resize: false,
-    do_rescale: true,
-    do_normalize: false,
-    rescale_factor: 1.0 / 255.0,
-    ..ImageProcessorConfig::default()
-  };
+  let cfg = ImageProcessorConfig::new()
+    .with_do_resize(false)
+    .with_do_rescale(true)
+    .with_do_normalize(false)
+    .with_rescale_factor(1.0 / 255.0);
   let mut out = preprocess(&img, &cfg).unwrap();
   let v: Vec<f32> = out.to_vec().unwrap();
   assert!(v.iter().all(|&x| (0.0..=1.0).contains(&x)));
@@ -1237,12 +1233,10 @@ fn preprocess_no_rescale_no_normalize_keeps_raw_u8_range() {
   // do_rescale=false + do_normalize=false: output is the raw [0, 255]
   // f32 buffer, no other transform.
   let img = synthetic_image(2, 2);
-  let cfg = ImageProcessorConfig {
-    do_resize: false,
-    do_rescale: false,
-    do_normalize: false,
-    ..ImageProcessorConfig::default()
-  };
+  let cfg = ImageProcessorConfig::new()
+    .with_do_resize(false)
+    .with_do_rescale(false)
+    .with_do_normalize(false);
   let mut out = preprocess(&img, &cfg).unwrap();
   let v: Vec<f32> = out.to_vec().unwrap();
   assert!(v.iter().all(|&x| (0.0..=255.0).contains(&x)));
@@ -1253,13 +1247,11 @@ fn preprocess_resize_applies_filter() {
   // do_resize=true, target size matches the input dims → output shape
   // matches.
   let img = synthetic_image(8, 8);
-  let cfg = ImageProcessorConfig {
-    size: (4, 4),
-    do_resize: true,
-    do_rescale: false,
-    do_normalize: false,
-    ..ImageProcessorConfig::default()
-  };
+  let cfg = ImageProcessorConfig::new()
+    .with_size((4, 4))
+    .with_do_resize(true)
+    .with_do_rescale(false)
+    .with_do_normalize(false);
   let out = preprocess(&img, &cfg).unwrap();
   assert_eq!(out.shape(), vec![4, 4, 3]);
 }
@@ -1267,13 +1259,13 @@ fn preprocess_resize_applies_filter() {
 #[test]
 fn imageprocessor_config_default_is_imagenet() {
   let cfg = ImageProcessorConfig::default();
-  assert_eq!(cfg.size, (224, 224));
-  assert!(vclose(&cfg.mean, &[0.485, 0.456, 0.406]));
-  assert!(vclose(&cfg.std, &[0.229, 0.224, 0.225]));
-  assert!(close(cfg.rescale_factor, 1.0 / 255.0));
-  assert!(cfg.do_resize && cfg.do_rescale && cfg.do_normalize);
-  assert_eq!(cfg.resample, ResizeFilter::Bicubic);
-  assert_eq!(cfg.color_order, ColorOrder::Rgb);
+  assert_eq!(cfg.size(), (224, 224));
+  assert!(vclose(&cfg.mean(), &[0.485, 0.456, 0.406]));
+  assert!(vclose(&cfg.std(), &[0.229, 0.224, 0.225]));
+  assert!(close(cfg.rescale_factor(), 1.0 / 255.0));
+  assert!(cfg.do_resize() && cfg.do_rescale() && cfg.do_normalize());
+  assert_eq!(cfg.resample(), ResizeFilter::Bicubic);
+  assert_eq!(cfg.color_order(), ColorOrder::Rgb);
 }
 
 // ---------- load_image (light disk round-trip) ----------
@@ -1907,10 +1899,7 @@ fn preprocess_default_layout_is_hwc_for_source_compat() {
   // 4x4 input resized to 8x8 (the per-channel cfg.size = (224, 224)
   // default is irrelevant here — we override).
   let img = synthetic_image(4, 4);
-  let cfg = ImageProcessorConfig {
-    size: (8, 8),
-    ..ImageProcessorConfig::default()
-  };
+  let cfg = ImageProcessorConfig::new().with_size((8, 8));
   let out = preprocess(&img, &cfg).unwrap();
   assert_eq!(
     out.shape(),
@@ -1926,11 +1915,9 @@ fn preprocess_default_layout_is_hwc_for_source_compat() {
 #[test]
 fn preprocess_layout_bchw_emits_batched_planar() {
   let img = synthetic_image(4, 4);
-  let cfg = ImageProcessorConfig {
-    size: (8, 8),
-    layout: Layout::Bchw,
-    ..ImageProcessorConfig::default()
-  };
+  let cfg = ImageProcessorConfig::new()
+    .with_size((8, 8))
+    .with_layout(Layout::Bchw);
   let out = preprocess(&img, &cfg).unwrap();
   assert_eq!(
     out.shape(),
@@ -1944,11 +1931,9 @@ fn preprocess_layout_bchw_emits_batched_planar() {
 #[test]
 fn preprocess_layout_chw_emits_planar_no_batch() {
   let img = synthetic_image(4, 4);
-  let cfg = ImageProcessorConfig {
-    size: (8, 8),
-    layout: Layout::Chw,
-    ..ImageProcessorConfig::default()
-  };
+  let cfg = ImageProcessorConfig::new()
+    .with_size((8, 8))
+    .with_layout(Layout::Chw);
   let out = preprocess(&img, &cfg).unwrap();
   assert_eq!(
     out.shape(),
@@ -1963,7 +1948,7 @@ fn preprocess_layout_chw_emits_planar_no_batch() {
 fn imageprocessor_config_default_layout_is_hwc() {
   let cfg = ImageProcessorConfig::default();
   assert_eq!(
-    cfg.layout,
+    cfg.layout(),
     Layout::Hwc,
     "default layout must be Hwc for source-compat"
   );

@@ -87,7 +87,7 @@ use crate::{
 /// such checkpoint before any registered VLM constructor sees the raw JSON.
 /// The per-model VLM constructor parses its arch-specific text-model /
 /// vision-model fields off the verbatim
-/// [`config_json`](LoadedVlmModel::config_json), exactly as each swift VLM's
+/// [`config_json`](LoadedVlmModel::config_json_ref), exactly as each swift VLM's
 /// per-model `Codable` init decodes the full config `Data` after the
 /// `BaseConfiguration` is extracted (e.g. `Qwen25VL.ModelConfiguration.init`
 /// at `Models/Qwen25VL.swift:1052`).
@@ -101,7 +101,7 @@ pub struct VlmBaseConfig {
   /// Architecture id (`config.json` `model_type`, e.g. `"qwen2_vl"`,
   /// `"mistral3"`). The [`VlmTypeRegistry`] dispatch key (after
   /// [`remap_vlm_model_type`]).
-  pub model_type: String,
+  model_type: String,
   /// `config.json` `eos_token_id` (a single id or a list). A *truthy*
   /// `generation_config.json` `eos_token_id` overrides it; the result is
   /// the tokenizer's COMPLETE eos set (REPLACES the tokenizer-config
@@ -110,7 +110,7 @@ pub struct VlmBaseConfig {
   /// `eos_token_id` (and a `text_config.eos_token_id`-only layout, which a
   /// per-model constructor would surface) still parses.
   #[serde(default)]
-  pub eos_token_id: Option<EosTokenId>,
+  eos_token_id: Option<EosTokenId>,
   /// Weight-quantization parameters (`config["quantization"]`), if the
   /// checkpoint carries them at the top level. Optional and forward-
   /// compatible: a VLM whose quantization sits under
@@ -120,7 +120,7 @@ pub struct VlmBaseConfig {
   /// raw JSON if it needs to. Carried, not applied — same convention as
   /// [`crate::lm::load::Config::quantization`].
   #[serde(default)]
-  pub quantization: Option<Quantization>,
+  quantization: Option<Quantization>,
 }
 
 impl VlmBaseConfig {
@@ -133,6 +133,24 @@ impl VlmBaseConfig {
     serde_json::from_str(json).map_err(|e| Error::Backend {
       message: format!("invalid VLM base config JSON: {e}"),
     })
+  }
+
+  // ── accessors ─────────────────────────────────────────────────────────────
+
+  /// Architecture id (the [`VlmTypeRegistry`] dispatch key).
+  #[inline(always)]
+  pub fn model_type(&self) -> &str {
+    &self.model_type
+  }
+  /// Resolved eos token id set (generation-config override already applied).
+  #[inline(always)]
+  pub fn eos_token_id(&self) -> Option<&EosTokenId> {
+    self.eos_token_id.as_ref()
+  }
+  /// Weight-quantization parameters (if present). `Quantization` is `Copy`.
+  #[inline(always)]
+  pub fn quantization(&self) -> Option<Quantization> {
+    self.quantization
   }
 }
 
@@ -346,7 +364,15 @@ fn processor_class_override(model_type: &str) -> Option<&'static str> {
 pub struct ProcessorConfig {
   /// The processor class id (the registry lookup key) — e.g.
   /// `"PixtralProcessor"`, `"Qwen2VLProcessor"`. Required.
-  pub processor_class: String,
+  processor_class: String,
+}
+
+impl ProcessorConfig {
+  /// The processor class id (the [`VlmProcessorTypeRegistry`] lookup key).
+  #[inline(always)]
+  pub fn processor_class(&self) -> &str {
+    &self.processor_class
+  }
 }
 
 /// A **tolerant** parse of just the registry-dispatch field
@@ -602,11 +628,11 @@ pub fn load_processor_config(
 /// Borrowing — the constructor gets `&LoadedVlmModel`; it reads the typed
 /// [`VlmBaseConfig`] (`model_type` / `eos_token_id` / `quantization`) and,
 /// for everything else (nested `text_config` / `vision_config` /
-/// arch-specific fields), the verbatim [`config_json`](Self::config_json)
+/// arch-specific fields), the verbatim [`config_json`](Self::config_json_ref)
 /// text — the analogue of mlx-swift-lm passing the raw `config.json` `Data`
 /// to each model's `Codable` init at `VLMModelFactory.swift:341-348` — and
 /// takes the weight [`Array`](crate::array::Array)s it needs out of
-/// [`weights`](Self::weights) **by reference** (no implicit eval; mlx
+/// [`weights`](Self::weights_ref) **by reference** (no implicit eval; mlx
 /// `Array` is a cheap refcounted handle, so an arch clones only the
 /// handles it keeps). Same shape as [`crate::lm::factory::LoadedModel`],
 /// but the typed config is the VLM-minimal [`VlmBaseConfig`] (not the
@@ -621,20 +647,50 @@ pub struct LoadedVlmModel {
   /// [`load_vlm_base_config`]). Only the registry-dispatch + tokenizer
   /// fields are typed here; everything model-specific (nested
   /// `text_config` / `vision_config` / arch-specific keys) is read off
-  /// [`config_json`](Self::config_json) by the per-model constructor.
-  pub config: VlmBaseConfig,
+  /// [`config_json`](Self::config_json_ref) by the per-model constructor.
+  config: VlmBaseConfig,
   /// The verbatim `config.json` body, for every key outside the typed
   /// [`VlmBaseConfig`] subset — i.e. the nested `text_config` /
   /// `vision_config` / arch-specific fields each VLM constructor decodes
   /// itself, the analogue of mlx-swift-lm handing each model's `Codable`
   /// init the raw config `Data` at `VLMModelFactory.swift:343-344`. Always
-  /// the bytes the typed [`config`](Self::config) was parsed from.
-  pub config_json: String,
+  /// the bytes the typed config was parsed from.
+  config_json: String,
   /// The merged, name → [`Array`](crate::array::Array) weight map
   /// (mlx-vlm's `weights` dict). Keys are verbatim — the constructor
   /// applies any `sanitize`/remap itself, exactly as
   /// [`crate::lm::load::load_weights`] documents.
-  pub weights: Weights,
+  weights: Weights,
+}
+
+impl LoadedVlmModel {
+  /// Construct a [`LoadedVlmModel`] from its components.
+  pub fn new(config: VlmBaseConfig, config_json: String, weights: Weights) -> Self {
+    Self {
+      config,
+      config_json,
+      weights,
+    }
+  }
+
+  /// The typed VLM base config (dispatch key + eos + quantization).
+  #[inline(always)]
+  pub fn config_ref(&self) -> &VlmBaseConfig {
+    &self.config
+  }
+
+  /// The verbatim `config.json` body the per-model constructor decodes its
+  /// arch-specific fields off.
+  #[inline(always)]
+  pub fn config_json_ref(&self) -> &str {
+    &self.config_json
+  }
+
+  /// The weight map handed to the per-model constructor.
+  #[inline(always)]
+  pub fn weights_ref(&self) -> &Weights {
+    &self.weights
+  }
 }
 
 /// Everything [`load()`] resolved for the *processor* side, handed to a
@@ -659,7 +715,7 @@ pub struct LoadedVlmModel {
 /// fields beyond those reads them off the verbatim model `config.json`
 /// carried here as [`config_json`](Self::config_json) — the SAME
 /// single-read body the *model* constructor received as
-/// [`LoadedVlmModel::config_json`], NOT a re-read — so the processor and
+/// [`LoadedVlmModel::config_json_ref`], NOT a re-read — so the processor and
 /// model share one TOCTOU-consistent config view. The swift
 /// processor-construction signature likewise receives the same
 /// `BaseConfiguration` + raw config `Data` + `Tokenizer` triple. The
@@ -690,7 +746,7 @@ pub struct LoadedProcessor<'a> {
   pub config: &'a VlmBaseConfig,
   /// The verbatim model `config.json` body — the SAME single-read body
   /// the [`VlmModelConstructor`] received as
-  /// [`LoadedVlmModel::config_json`] (NOT a re-read). A concrete
+  /// [`LoadedVlmModel::config_json_ref`] (NOT a re-read). A concrete
   /// processor whose downcast-only methods need arch fields that live
   /// only in `config.json` (e.g. a `hidden_size` / `image_token_index`
   /// not duplicated into the processor configs) reads them off this
@@ -993,20 +1049,73 @@ impl VlmProcessorTypeRegistry {
 #[non_exhaustive]
 pub struct LoadedVlmContext {
   /// The constructed VLM model (from the [`VlmTypeRegistry`] constructor).
-  pub model: Box<dyn VlmModel>,
+  model: Box<dyn VlmModel>,
   /// The model's tokenizer, built from the (optionally separate)
   /// tokenizer directory with the resolved eos set.
-  pub tokenizer: Tokenizer,
+  tokenizer: Tokenizer,
   /// The constructed VLM processor (from the
   /// [`VlmProcessorTypeRegistry`] constructor).
-  pub processor: Box<dyn Processor>,
+  processor: Box<dyn Processor>,
   /// The parsed VLM base `config.json` subset, returned for callers that
   /// need the dispatch metadata (`model_type` / `eos_token_id` /
   /// `quantization`). Model-specific fields (nested `text_config` /
   /// `vision_config` / arch-specific keys) are NOT carried here — they
   /// live on the per-model VLM model constructed off the raw `config.json`
   /// JSON.
-  pub config: VlmBaseConfig,
+  config: VlmBaseConfig,
+}
+
+impl LoadedVlmContext {
+  /// Construct a [`LoadedVlmContext`] from its components.
+  pub fn new(
+    model: Box<dyn VlmModel>,
+    tokenizer: Tokenizer,
+    processor: Box<dyn Processor>,
+    config: VlmBaseConfig,
+  ) -> Self {
+    Self {
+      model,
+      tokenizer,
+      processor,
+      config,
+    }
+  }
+
+  /// The constructed VLM model.
+  #[inline(always)]
+  pub fn model(&self) -> &dyn VlmModel {
+    self.model.as_ref()
+  }
+
+  /// Mutable reference to the constructed VLM model.
+  #[inline(always)]
+  pub fn model_mut(&mut self) -> &mut dyn VlmModel {
+    self.model.as_mut()
+  }
+
+  /// The model's tokenizer.
+  #[inline(always)]
+  pub fn tokenizer(&self) -> &Tokenizer {
+    &self.tokenizer
+  }
+
+  /// The constructed VLM processor.
+  #[inline(always)]
+  pub fn processor(&self) -> &dyn Processor {
+    self.processor.as_ref()
+  }
+
+  /// Mutable reference to the constructed VLM processor.
+  #[inline(always)]
+  pub fn processor_mut(&mut self) -> &mut dyn Processor {
+    self.processor.as_mut()
+  }
+
+  /// The parsed VLM base config (dispatch metadata).
+  #[inline(always)]
+  pub fn config_ref(&self) -> &VlmBaseConfig {
+    &self.config
+  }
 }
 
 /// Load a VLM model + tokenizer + processor from a local
@@ -1160,11 +1269,7 @@ pub fn load(
   // (7) Construct the model via the registry (already validated as
   // registered in step 2). The model receives the parsed `config`
   // (still owned here) by reference inside `LoadedVlmModel`.
-  let loaded = LoadedVlmModel {
-    config,
-    config_json,
-    weights,
-  };
+  let loaded = LoadedVlmModel::new(config, config_json, weights);
   let model = model_registry.create(&loaded)?;
 
   // (8) Construct the processor via its registry. The processor receives
@@ -1189,12 +1294,12 @@ pub fn load(
     processor_registry.create(&loaded_proc)?
   };
 
-  Ok(LoadedVlmContext {
+  Ok(LoadedVlmContext::new(
     model,
     tokenizer,
     processor,
-    config: loaded.config,
-  })
+    loaded.config,
+  ))
 }
 
 #[cfg(test)]
@@ -1361,18 +1466,16 @@ mod tests {
       // Honor the image-size the processor decoded off the raw JSON, so
       // a test can assert the cross-model preprocessing parameters
       // round-trip through the registry.
-      ImageProcessorConfig {
-        size: (self.image_size, self.image_size),
-        mean: [0.5, 0.5, 0.5],
-        std: [0.5, 0.5, 0.5],
-        rescale_factor: 1.0 / 255.0,
-        do_resize: true,
-        do_rescale: true,
-        do_normalize: true,
-        resample: ResizeFilter::Bilinear,
-        color_order: ColorOrder::Rgb,
-        ..ImageProcessorConfig::default()
-      }
+      ImageProcessorConfig::new()
+        .with_size((self.image_size, self.image_size))
+        .with_mean([0.5, 0.5, 0.5])
+        .with_std([0.5, 0.5, 0.5])
+        .with_rescale_factor(1.0 / 255.0)
+        .with_do_resize(true)
+        .with_do_rescale(true)
+        .with_do_normalize(true)
+        .with_resample(ResizeFilter::Bilinear)
+        .with_color_order(ColorOrder::Rgb)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1398,11 +1501,11 @@ mod tests {
   fn mock_vlm_constructor() -> VlmModelConstructor {
     Box::new(|loaded: &LoadedVlmModel| -> Result<Box<dyn VlmModel>> {
       assert!(
-        !loaded.weights.is_empty(),
+        !loaded.weights_ref().is_empty(),
         "constructor should receive the loaded weights"
       );
       let raw: serde_json::Value =
-        serde_json::from_str(&loaded.config_json).map_err(|e| Error::Backend {
+        serde_json::from_str(loaded.config_json_ref()).map_err(|e| Error::Backend {
           message: format!("mock vlm ctor: bad config json: {e}"),
         })?;
       // Vocab can be top-level (the "flat" mock fixture) or nested under
@@ -1580,25 +1683,25 @@ mod tests {
     // The returned VLM base config carries the dispatch key + (here, no)
     // top-level eos override. vocab/etc. flow through the raw JSON to the
     // constructor, which proved them in `logits.shape()` below.
-    assert_eq!(ctx.config.model_type, "mockvlm");
-    assert_eq!(ctx.config.eos_token_id, None);
-    assert_eq!(ctx.config.quantization, None);
+    assert_eq!(ctx.config_ref().model_type(), "mockvlm");
+    assert_eq!(ctx.config_ref().eos_token_id().cloned(), None);
+    assert_eq!(ctx.config_ref().quantization(), None);
 
     // The constructed model is the mock: drive one forward to confirm it
     // is wired and the constructor saw the right vocab off the raw JSON.
     let mut cache: Vec<Box<dyn KvCache>> = Vec::new();
     let tokens = Array::from_slice::<i32>(&[0, 1, 2], &(1usize, 3)).unwrap();
-    let logits = LmModel::forward(ctx.model.as_ref(), &tokens, &mut cache).unwrap();
+    let logits = LmModel::forward(ctx.model(), &tokens, &mut cache).unwrap();
     assert_eq!(logits.shape(), vec![1, 3, 5]);
 
     // The constructed processor surfaces the image-size it decoded off
     // the raw processor JSON (64 from `write_vlm_dir`) — round-trip
     // proof that the processor constructor saw the right JSON body.
-    let proc_cfg = ctx.processor.image_processor_config();
-    assert_eq!(proc_cfg.size, (64, 64));
+    let proc_cfg = ctx.processor().image_processor_config();
+    assert_eq!(proc_cfg.size(), (64, 64));
 
     // The tokenizer loaded from the same directory.
-    let ids = ctx.tokenizer.encode("a b c", false).unwrap();
+    let ids = ctx.tokenizer().encode("a b c", false).unwrap();
     assert_eq!(ids.len(), 3);
   }
 
@@ -1608,7 +1711,7 @@ mod tests {
     // `LoadedVlmContext` whose `model` is a `Box<dyn VlmModel>`, and the
     // public `vlm_generate` is generic over `M: vlm::Model + ?Sized`. This
     // test proves the loader's trait-object output drives the generation
-    // loop *directly* — `&*ctx.model` deref-coerces `Box<dyn VlmModel>` to
+    // loop *directly* — `ctx.model()` deref-coerces `Box<dyn VlmModel>` to
     // `&dyn VlmModel`, an UNSIZED `M`, which satisfies the relaxed bound.
     // Before the `?Sized` relaxation this call did not compile at all (the
     // implicit `Sized` bound rejected `dyn VlmModel`), so the loader's
@@ -1625,27 +1728,23 @@ mod tests {
 
     let ctx = load(&config, &model_registry, &processor_registry).expect("load should succeed");
 
-    // Drive `vlm_generate` on the LOADED model — `&*ctx.model` is a
+    // Drive `vlm_generate` on the LOADED model — `ctx.model()` is a
     // `&dyn VlmModel` (the `Box<dyn VlmModel>` field deref-coerced). The
     // mock's `forward` returns `[B, S, vocab]` zero logits ⇒ greedy argmax
     // is token id 0 every step; an empty eos set lets it run to
     // `max_tokens`. The mock ignores the KV cache, so an empty cache is
     // sufficient to exercise the decode loop.
-    let cfg = VlmGenConfig {
-      lm: GenConfig {
-        max_tokens: 4,
-        ..Default::default()
-      },
-      image_token_id: 99,
-      image_marker_id: None,
-      num_tokens_per_image: 3,
-      marker_policy: MarkerPolicy::Required,
-    };
+    let cfg = VlmGenConfig::new(
+      GenConfig::default().with_max_tokens(4),
+      99,
+      3,
+      MarkerPolicy::Required,
+    );
     let prompt = [0_u32, 1, 2];
     // mlx-vlm `generate(model, processor, …)` — the image-processor config is
     // supplied separately; the loaded processor carries the parsed config.
-    let img_cfg = ctx.processor.image_processor_config();
-    let steps = vlm_generate(&*ctx.model, &img_cfg, &prompt, &[], Vec::new(), cfg)
+    let img_cfg = ctx.processor().image_processor_config();
+    let steps = vlm_generate(ctx.model(), &img_cfg, &prompt, &[], Vec::new(), cfg)
       .expect("vlm_generate constructs against the loaded trait-object model");
 
     let tokens: Vec<u32> = steps
@@ -1757,7 +1856,7 @@ mod tests {
         Box::new(
           move |loaded: &LoadedVlmModel| -> Result<Box<dyn VlmModel>> {
             assert!(
-              !loaded.weights.is_empty(),
+              !loaded.weights_ref().is_empty(),
               "constructor should receive the loaded weights"
             );
             Ok(Box::new(RecordingVlmModel {
@@ -1784,10 +1883,10 @@ mod tests {
 
     // Sanity: the loaded processor's config carries the 48×48 size parsed
     // off the JSON, and it differs from the model's (default) 224×224.
-    let loaded_img_cfg = ctx.processor.image_processor_config();
-    assert_eq!(loaded_img_cfg.size, (48, 48));
+    let loaded_img_cfg = ctx.processor().image_processor_config();
+    assert_eq!(loaded_img_cfg.size(), (48, 48));
     assert_eq!(
-      crate::vlm::model::Model::image_processor_config(ctx.model.as_ref()).size,
+      crate::vlm::model::Model::image_processor_config(ctx.model()).size(),
       (224, 224),
       "the recording model uses the trait-default 224×224 — the value that must NOT drive preprocessing"
     );
@@ -1807,19 +1906,15 @@ mod tests {
 
     // Drive `vlm_generate` on the LOADED model with the LOADED processor's
     // config + one image. marker=image_token=99, num_tokens_per_image=1.
-    let cfg = VlmGenConfig {
-      lm: GenConfig {
-        max_tokens: 2,
-        ..Default::default()
-      },
-      image_token_id: 99,
-      image_marker_id: None,
-      num_tokens_per_image: 1,
-      marker_policy: MarkerPolicy::Required,
-    };
+    let cfg = VlmGenConfig::new(
+      GenConfig::default().with_max_tokens(2),
+      99,
+      1,
+      MarkerPolicy::Required,
+    );
     let prompt = [0_u32, 99, 1]; // one marker → one image
     let steps = vlm_generate(
-      &*ctx.model,
+      ctx.model(),
       &loaded_img_cfg,
       &prompt,
       std::slice::from_ref(&img_path),
@@ -1887,7 +1982,7 @@ mod tests {
     // The mock processor records the image_size off the raw JSON — `32`
     // proves the preferred file was used (would be `999` from the
     // fallback otherwise).
-    assert_eq!(ctx.processor.image_processor_config().size, (32, 32));
+    assert_eq!(ctx.processor().image_processor_config().size(), (32, 32));
   }
 
   #[test]
@@ -1903,7 +1998,7 @@ mod tests {
 
     let ctx =
       load(&config, &model_registry, &processor_registry).expect("fallback processor_config load");
-    assert_eq!(ctx.processor.image_processor_config().size, (48, 48));
+    assert_eq!(ctx.processor().image_processor_config().size(), (48, 48));
   }
 
   #[test]
@@ -1920,7 +2015,7 @@ mod tests {
 
     let ctx = load(&config, &model_registry, &processor_registry)
       .expect("id-as-local-path load should succeed");
-    assert_eq!(ctx.config.model_type, "mockvlm");
+    assert_eq!(ctx.config_ref().model_type(), "mockvlm");
   }
 
   #[test]
@@ -1948,7 +2043,7 @@ mod tests {
     assert_eq!(config.tokenizer_directory(), tok_dir.as_path());
 
     let ctx = load(&config, &model_registry, &processor_registry).expect("split-tokenizer load");
-    let ids = ctx.tokenizer.encode("a b c", false).unwrap();
+    let ids = ctx.tokenizer().encode("a b c", false).unwrap();
     assert_eq!(ids.len(), 3);
   }
 
@@ -2079,7 +2174,7 @@ mod tests {
 
     let ctx = load(&config, &model_registry, &processor_registry)
       .expect("mistral3 override should dispatch to Mistral3Processor");
-    assert_eq!(ctx.processor.image_processor_config().size, (40, 40));
+    assert_eq!(ctx.processor().image_processor_config().size(), (40, 40));
   }
 
   #[test]
@@ -2135,7 +2230,7 @@ mod tests {
     let config = VlmModelConfiguration::from_directory(&dir);
 
     let ctx = load(&config, &model_registry, &processor_registry).expect("load");
-    assert_eq!(ctx.processor.image_processor_config().size, (24, 24));
+    assert_eq!(ctx.processor().image_processor_config().size(), (24, 24));
   }
 
   #[test]
@@ -2177,7 +2272,7 @@ mod tests {
 
     // The dispatch key arrived; vocab/hidden_size live under text_config
     // and are not on `VlmBaseConfig` (faithful to swift's BaseConfiguration).
-    assert_eq!(ctx.config.model_type, "mockvlm");
+    assert_eq!(ctx.config_ref().model_type(), "mockvlm");
 
     // Drive one forward — confirms the mock constructor decoded
     // `text_config.vocab_size = 5` off the raw JSON and the registry +
@@ -2185,7 +2280,7 @@ mod tests {
     // config.
     let mut cache: Vec<Box<dyn KvCache>> = Vec::new();
     let tokens = Array::from_slice::<i32>(&[0, 1, 2], &(1usize, 3)).unwrap();
-    let logits = LmModel::forward(ctx.model.as_ref(), &tokens, &mut cache).unwrap();
+    let logits = LmModel::forward(ctx.model(), &tokens, &mut cache).unwrap();
     assert_eq!(logits.shape(), vec![1, 3, 5]);
   }
 
@@ -2235,14 +2330,14 @@ mod tests {
 
     // Base config carries the [1, 2] list verbatim (shape-preserving).
     assert_eq!(
-      ctx.config.eos_token_id,
+      ctx.config_ref().eos_token_id().cloned(),
       Some(EosTokenId::Many(vec![1, 2])),
       "base config should carry the top-level eos_token_id list"
     );
     // And the tokenizer's COMPLETE eos set is exactly {1, 2} — the
     // tokenizer-config default was REPLACED (not unioned) by the resolved
     // list, exactly as `TokenizerWrapper::set(eos_token_ids)` does.
-    let eos_vec: Vec<u32> = ctx.tokenizer.eos_token_ids_iter().collect();
+    let eos_vec: Vec<u32> = ctx.tokenizer().eos_token_ids_iter().collect();
     assert_eq!(
       eos_vec,
       vec![1u32, 2],
@@ -2299,13 +2394,13 @@ mod tests {
     // The returned base config reflects the generation-config override
     // (`1` → `2`) — exactly the in-place overwrite mlx-vlm performs.
     assert_eq!(
-      ctx.config.eos_token_id,
+      ctx.config_ref().eos_token_id().cloned(),
       Some(EosTokenId::Single(2)),
       "generation_config.json eos_token_id should override config.json"
     );
     // Tokenizer's COMPLETE eos set is the post-override {2}, not the
     // on-disk {1}.
-    let eos_vec: Vec<u32> = ctx.tokenizer.eos_token_ids_iter().collect();
+    let eos_vec: Vec<u32> = ctx.tokenizer().eos_token_ids_iter().collect();
     assert_eq!(
       eos_vec,
       vec![2u32],
@@ -2323,9 +2418,9 @@ mod tests {
     // future regression that re-adds a hard LM field to `VlmBaseConfig`.
     let cfg = r#"{ "model_type": "qwen2_vl" }"#;
     let base = VlmBaseConfig::from_json(cfg).expect("VLM base config should parse");
-    assert_eq!(base.model_type, "qwen2_vl");
-    assert_eq!(base.eos_token_id, None);
-    assert_eq!(base.quantization, None);
+    assert_eq!(base.model_type(), "qwen2_vl");
+    assert_eq!(base.eos_token_id().cloned(), None);
+    assert_eq!(base.quantization(), None);
 
     // Same body through the LM `Config` parse fails (missing
     // `hidden_size` and the rest of the required LM subset). This pins
@@ -2396,13 +2491,13 @@ mod tests {
 
     // Base config carries the promoted [42, 50] list (shape-preserved).
     assert_eq!(
-      ctx.config.eos_token_id,
+      ctx.config_ref().eos_token_id().cloned(),
       Some(EosTokenId::Many(vec![42, 50])),
       "VlmBaseConfig should carry the promoted text_config.eos_token_id list"
     );
     // Tokenizer's COMPLETE eos set is exactly {42, 50} — the
     // tokenizer-config default ({2}) was REPLACED, not unioned.
-    let mut eos_vec: Vec<u32> = ctx.tokenizer.eos_token_ids_iter().collect();
+    let mut eos_vec: Vec<u32> = ctx.tokenizer().eos_token_ids_iter().collect();
     eos_vec.sort_unstable();
     assert_eq!(
       eos_vec,
@@ -2451,11 +2546,11 @@ mod tests {
       .expect("top-level eos with nested present");
 
     assert_eq!(
-      ctx.config.eos_token_id,
+      ctx.config_ref().eos_token_id().cloned(),
       Some(EosTokenId::Single(7)),
       "top-level eos_token_id must win over nested text_config.eos_token_id"
     );
-    let eos_vec: Vec<u32> = ctx.tokenizer.eos_token_ids_iter().collect();
+    let eos_vec: Vec<u32> = ctx.tokenizer().eos_token_ids_iter().collect();
     assert_eq!(
       eos_vec,
       vec![7u32],
@@ -2505,11 +2600,11 @@ mod tests {
       .expect("generation_config override over promoted nested eos");
 
     assert_eq!(
-      ctx.config.eos_token_id,
+      ctx.config_ref().eos_token_id().cloned(),
       Some(EosTokenId::Single(9)),
       "generation_config.json eos_token_id must override the promoted nested value"
     );
-    let eos_vec: Vec<u32> = ctx.tokenizer.eos_token_ids_iter().collect();
+    let eos_vec: Vec<u32> = ctx.tokenizer().eos_token_ids_iter().collect();
     assert_eq!(
       eos_vec,
       vec![9u32],
@@ -2560,7 +2655,7 @@ mod tests {
       .expect("nested llm_config.eos_token_id alias should promote");
 
     assert_eq!(
-      ctx.config.eos_token_id,
+      ctx.config_ref().eos_token_id().cloned(),
       Some(EosTokenId::Many(vec![11, 13])),
       "VlmBaseConfig should carry the promoted llm_config.eos_token_id list"
     );
@@ -2610,7 +2705,7 @@ mod tests {
       .expect("text_config should win over llm_config alias when both present");
 
     assert_eq!(
-      ctx.config.eos_token_id,
+      ctx.config_ref().eos_token_id().cloned(),
       Some(EosTokenId::Many(vec![42, 50])),
       "text_config.eos_token_id must take precedence over llm_config.eos_token_id"
     );
@@ -2659,10 +2754,11 @@ mod tests {
     // Promotion collapses to `None`, tokenizer falls back to its own
     // `eos_token` ("c" → id 2 from the tokenizer_config above).
     assert_eq!(
-      ctx.config.eos_token_id, None,
+      ctx.config_ref().eos_token_id().cloned(),
+      None,
       "scalar 0 nested eos must not promote (falsy)"
     );
-    let eos_vec: Vec<u32> = ctx.tokenizer.eos_token_ids_iter().collect();
+    let eos_vec: Vec<u32> = ctx.tokenizer().eos_token_ids_iter().collect();
     assert_eq!(
       eos_vec,
       vec![2u32],
@@ -2751,7 +2847,7 @@ mod tests {
     // `processor_class`). Round-trip proof that the split-source
     // dispatch picked the right body.
     assert_eq!(
-      ctx.processor.image_processor_config().size,
+      ctx.processor().image_processor_config().size(),
       (24, 24),
       "constructor must see preprocessor_config.json body (image-preprocessor metadata)"
     );
@@ -2788,7 +2884,8 @@ mod tests {
     let (proc_config, preprocessor_body, processor_body, filename) =
       load_processor_config(&dir).expect("split-layout processor config must resolve");
     assert_eq!(
-      proc_config.processor_class, "MockProc",
+      proc_config.processor_class(),
+      "MockProc",
       "dispatch class must come from processor_config.json"
     );
     assert_eq!(
@@ -2878,7 +2975,7 @@ mod tests {
     // The constructor read `mock_image_size = 24` off the preprocessor
     // body — proof the preprocessor body also reached it alongside the
     // processor_config.json body.
-    assert_eq!(ctx.processor.image_processor_config().size, (24, 24));
+    assert_eq!(ctx.processor().image_processor_config().size(), (24, 24));
   }
 
   #[test]
@@ -2916,7 +3013,8 @@ mod tests {
     let (proc_config, preprocessor_body, processor_body, filename) =
       load_processor_config(&dir).expect("preferred-class processor config must resolve");
     assert_eq!(
-      proc_config.processor_class, "MockProc",
+      proc_config.processor_class(),
+      "MockProc",
       "dispatch class must come from preprocessor_config.json (precedence unchanged)"
     );
     assert_eq!(
@@ -3010,7 +3108,7 @@ mod tests {
     // Round-trip proof: the constructor decoded `mock_image_size = 24`
     // off the preprocessor body, and only `MockProc` is registered so
     // dispatch used the preprocessor file's `processor_class`.
-    assert_eq!(ctx.processor.image_processor_config().size, (24, 24));
+    assert_eq!(ctx.processor().image_processor_config().size(), (24, 24));
   }
 
   #[test]
@@ -3067,18 +3165,16 @@ mod tests {
 
   impl Processor for MockConcreteProcessor {
     fn image_processor_config(&self) -> ImageProcessorConfig {
-      ImageProcessorConfig {
-        size: (1, 1),
-        mean: [0.5, 0.5, 0.5],
-        std: [0.5, 0.5, 0.5],
-        rescale_factor: 1.0 / 255.0,
-        do_resize: true,
-        do_rescale: true,
-        do_normalize: true,
-        resample: ResizeFilter::Bilinear,
-        color_order: ColorOrder::Rgb,
-        ..ImageProcessorConfig::default()
-      }
+      ImageProcessorConfig::new()
+        .with_size((1, 1))
+        .with_mean([0.5, 0.5, 0.5])
+        .with_std([0.5, 0.5, 0.5])
+        .with_rescale_factor(1.0 / 255.0)
+        .with_do_resize(true)
+        .with_do_rescale(true)
+        .with_do_normalize(true)
+        .with_resample(ResizeFilter::Bilinear)
+        .with_color_order(ColorOrder::Rgb)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -3128,7 +3224,7 @@ mod tests {
     // Recover the concrete per-model processor off the erased
     // `Box<dyn Processor>` and call its concrete-only method.
     let concrete = ctx
-      .processor
+      .processor()
       .as_any()
       .downcast_ref::<MockConcreteProcessor>()
       .expect("loaded processor must downcast to its concrete per-model type");
@@ -3210,7 +3306,7 @@ mod tests {
     // `LoadedProcessor.config_json` into the processor — NOT the
     // processor config's `mock_image_size = 999`.
     assert_eq!(
-      ctx.processor.image_processor_config().size,
+      ctx.processor().image_processor_config().size(),
       (8, 8),
       "processor must have read hidden_size=8 off LoadedProcessor.config_json, \
        not mock_image_size=999 off the processor config"

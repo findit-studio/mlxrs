@@ -126,7 +126,8 @@ pub type ImageTokenSpans = Vec<(usize, usize)>;
 /// here forces the caller to declare intent at the call site, so a missing
 /// marker under a marker-required template surfaces as a hard
 /// `Error::ShapeMismatch` instead of silently corrupting prompt order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
+#[display("{}", self.as_str())]
 pub enum MarkerPolicy {
   /// The input MUST contain an `image_marker_id` (a contiguous run of
   /// exactly `image_count` markers); missing markers under
@@ -138,6 +139,16 @@ pub enum MarkerPolicy {
   /// the prompt. Mirrors the python `PROMPT_WITH_IMAGE_TOKEN` /
   /// `PROMPT_WITH_START_IMAGE_TOKEN` formatters (e.g. paligemma).
   PrependIfAbsent,
+}
+
+impl MarkerPolicy {
+  /// Lowercase string tag.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Required => "required",
+      Self::PrependIfAbsent => "prepend_if_absent",
+    }
+  }
 }
 
 /// Locate contiguous runs of `image_token_id` in `tokens`.
@@ -862,7 +873,8 @@ pub fn assemble_multimodal_prompt(
 ///    [`MessageFormat::PromptWithStartImageToken`].
 /// 4. **Video-with-text** (one entry per video plus a trailing text):
 ///    [`MessageFormat::VideoWithText`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display, derive_more::IsVariant)]
+#[display("{}", self.as_str())]
 #[non_exhaustive]
 pub enum MessageFormat {
   /// `list_with_image` — `content = [text, image*]` (text first, then
@@ -919,6 +931,30 @@ pub enum MessageFormat {
   /// fps} * N, text]`. Used by qwen2_vl / qwen2_5_vl / qwen3_vl /
   /// qwen3_omni_moe / gemma4 when `video=` is passed.
   VideoWithText,
+}
+
+impl MessageFormat {
+  /// Lowercase snake_case string tag matching the Python
+  /// `MessageFormat(Enum)` value strings (e.g. `Qwen2Vl` → `"qwen2_vl"`).
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::ListWithImage => "list_with_image",
+      Self::ListWithImageFirst => "list_with_image_first",
+      Self::ListWithImageUrlFirst => "list_with_image_url_first",
+      Self::ListWithImageType => "list_with_image_type",
+      Self::ListWithImageTypeText => "list_with_image_type_text",
+      Self::ListWithImageTypeTextImageLast => "list_with_image_type_text_image_last",
+      Self::ImageToken => "image_token",
+      Self::ImageTokenPipe => "image_token_pipe",
+      Self::StartImageToken => "start_image_token",
+      Self::ImageTokenNewline => "image_token_newline",
+      Self::NumberedImageTokens => "numbered_image_tokens",
+      Self::PromptOnly => "prompt_only",
+      Self::PromptWithImageToken => "prompt_with_image_token",
+      Self::PromptWithStartImageToken => "prompt_with_start_image_token",
+      Self::VideoWithText => "video_with_text",
+    }
+  }
 }
 
 /// All 15 [`MessageFormat`] variants in declaration order — used by the

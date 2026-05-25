@@ -60,13 +60,26 @@ use crate::{
 /// generation starts), so the same `position_ids[max_length-1]` queries
 /// the correct token. `"right"` pads after the prompt, used by some
 /// training/finetuning paths.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+  Debug, Clone, Copy, PartialEq, Eq, Default, derive_more::Display, derive_more::IsVariant,
+)]
+#[display("{}", self.as_str())]
 pub enum PaddingSide {
   /// Pad on the LEFT (before the content). The python default.
   #[default]
   Left,
   /// Pad on the RIGHT (after the content).
   Right,
+}
+
+impl PaddingSide {
+  /// Lowercase string tag matching the python `padding_side` convention.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Left => "left",
+      Self::Right => "right",
+    }
+  }
 }
 
 /// Output of [`prepare_inputs`] — the typed equivalent of the python
@@ -83,23 +96,95 @@ pub struct PreparedInputs {
   /// `[B, T]` `i32` token ids, padded with `pad_token_id` per
   /// [`PaddingSide`]. Mirrors `model_inputs["input_ids"]` in the python
   /// ref (line 1387, line 1210).
-  pub input_ids: Array,
+  input_ids: Array,
   /// `[B, T]` `bool` mask — `true` at non-pad positions, `false` at
   /// padded positions. Mirrors `model_inputs["attention_mask"]` (lines
   /// 1390–1392, 1417–1419).
-  pub attention_mask: Array,
+  attention_mask: Array,
   /// `[B, C, H, W]` (or whatever the per-model image processor emits)
   /// `f32` pixel values. `None` when no images were passed. Mirrors
   /// `model_inputs["pixel_values"]` (line 1389, line 1414).
-  pub pixel_values: Option<Array>,
+  pixel_values: Option<Array>,
   /// Audio features `Array` — `None` when no audio was passed. Mirrors
   /// `model_inputs["input_features"]` (lines 1432, 1441–1447).
-  pub input_features: Option<Array>,
+  input_features: Option<Array>,
   /// Per-frame video pixels `Array` — `None` when no videos were
   /// passed. Mirrors `model_inputs["pixel_values_videos"]` /
   /// equivalent for the video branch (the python ref names it
   /// per-processor).
-  pub pixel_values_videos: Option<Array>,
+  pixel_values_videos: Option<Array>,
+}
+
+impl PreparedInputs {
+  /// Construct a [`PreparedInputs`] from the assembled arrays.
+  pub fn new(
+    input_ids: Array,
+    attention_mask: Array,
+    pixel_values: Option<Array>,
+    input_features: Option<Array>,
+    pixel_values_videos: Option<Array>,
+  ) -> Self {
+    Self {
+      input_ids,
+      attention_mask,
+      pixel_values,
+      input_features,
+      pixel_values_videos,
+    }
+  }
+
+  // ── accessors ─────────────────────────────────────────────────────────────
+
+  /// `[B, T]` `i32` token ids (immutable reference).
+  #[inline(always)]
+  pub fn input_ids_ref(&self) -> &Array {
+    &self.input_ids
+  }
+  /// `[B, T]` `i32` token ids (mutable reference, needed for fallible eval).
+  #[inline(always)]
+  pub fn input_ids_mut(&mut self) -> &mut Array {
+    &mut self.input_ids
+  }
+  /// `[B, T]` `bool` attention mask (immutable reference).
+  #[inline(always)]
+  pub fn attention_mask_ref(&self) -> &Array {
+    &self.attention_mask
+  }
+  /// `[B, T]` `bool` attention mask (mutable reference, needed for fallible eval).
+  #[inline(always)]
+  pub fn attention_mask_mut(&mut self) -> &mut Array {
+    &mut self.attention_mask
+  }
+  /// Optional `[B, C, H, W]` pixel values (immutable reference).
+  #[inline(always)]
+  pub fn pixel_values_ref(&self) -> Option<&Array> {
+    self.pixel_values.as_ref()
+  }
+  /// Optional `[B, C, H, W]` pixel values (mutable reference, needed for fallible eval).
+  #[inline(always)]
+  pub fn pixel_values_mut(&mut self) -> Option<&mut Array> {
+    self.pixel_values.as_mut()
+  }
+  /// Optional audio features array (immutable reference).
+  #[inline(always)]
+  pub fn input_features_ref(&self) -> Option<&Array> {
+    self.input_features.as_ref()
+  }
+  /// Optional audio features array (mutable reference, needed for fallible eval).
+  #[inline(always)]
+  pub fn input_features_mut(&mut self) -> Option<&mut Array> {
+    self.input_features.as_mut()
+  }
+  /// Optional per-frame video pixel values (immutable reference).
+  #[inline(always)]
+  pub fn pixel_values_videos_ref(&self) -> Option<&Array> {
+    self.pixel_values_videos.as_ref()
+  }
+  /// Optional per-frame video pixel values (mutable reference, needed for fallible eval).
+  #[inline(always)]
+  pub fn pixel_values_videos_mut(&mut self) -> Option<&mut Array> {
+    self.pixel_values_videos.as_mut()
+  }
 }
 
 /// Options for [`prepare_inputs`] — captures the python kwargs at
@@ -113,16 +198,15 @@ pub struct PrepareInputsOpts {
   /// 1391). Required: there is no implicit default — the python ref
   /// reads it from the processor; the Rust port forces the caller to
   /// supply one because no in-process tokenizer is mandatory.
-  pub pad_token_id: u32,
+  pad_token_id: u32,
   /// `padding` — whether to pad varying-length sequences. Mirrors
   /// `padding: bool = True` (line 1182). `Default::default()` resolves
-  /// to `true` via [`PrepareInputsOpts::default`] (see the impl
-  /// override below).
-  pub padding: bool,
+  /// to `true` via [`PrepareInputsOpts::new`] (see the impl below).
+  padding: bool,
   /// `padding_side` — see [`PaddingSide`]. Mirrors line 1183.
-  pub padding_side: PaddingSide,
+  padding_side: PaddingSide,
   /// Optional caller-supplied per-batch `attention_mask`. **When
-  /// `Some(masks)`**: `masks` must have shape `[B][T_b]` with
+  /// non-empty**: `masks` must have shape `[B][T_b]` with
   /// `masks.len() == text_token_batches.len()` AND
   /// `masks[i].len() == text_token_batches[i].len()` for each `i` —
   /// the supplied mask is treated as already authoritative and is
@@ -130,7 +214,7 @@ pub struct PrepareInputsOpts {
   /// `input_ids` shape (so any `false` positions inside the caller's
   /// mask survive into the output).
   ///
-  /// **When `None` (default)**: the mask is computed from the internal
+  /// **When empty (default)**: the mask is computed from the internal
   /// padding step (positions filled with `pad_token_id` are marked
   /// `false`, all caller-supplied tokens are marked `true`).
   ///
@@ -143,21 +227,78 @@ pub struct PrepareInputsOpts {
   /// internal step, which silently corrupts model semantics (the
   /// padded positions get attended to). The explicit-mask path closes
   /// that hole.
-  pub attention_mask: Option<Vec<Vec<bool>>>,
+  attention_mask: Vec<Vec<bool>>,
 }
 
 impl Default for PrepareInputsOpts {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl PrepareInputsOpts {
   /// Mirrors the python `prepare_inputs` kwargs defaults:
   /// `pad_token_id=0`, `padding=true` (line 1182),
-  /// `padding_side="left"` (line 1183), `attention_mask=None`
+  /// `padding_side="left"` (line 1183), `attention_mask=[]`
   /// (compute from the internal padding step).
-  fn default() -> Self {
+  pub fn new() -> Self {
     Self {
       pad_token_id: 0,
       padding: true,
       padding_side: PaddingSide::Left,
-      attention_mask: None,
+      attention_mask: Vec::new(),
     }
+  }
+
+  // ── builders ──────────────────────────────────────────────────────────────
+
+  /// Set the pad token id.
+  #[must_use]
+  pub fn with_pad_token_id(mut self, v: u32) -> Self {
+    self.pad_token_id = v;
+    self
+  }
+  /// Set the `padding` flag.
+  #[must_use]
+  pub fn with_padding(mut self, v: bool) -> Self {
+    self.padding = v;
+    self
+  }
+  /// Set the padding side.
+  #[must_use]
+  pub fn with_padding_side(mut self, v: PaddingSide) -> Self {
+    self.padding_side = v;
+    self
+  }
+  /// Set the caller-supplied per-batch attention mask (empty = compute
+  /// from the padding step).
+  #[must_use]
+  pub fn with_attention_mask(mut self, v: Vec<Vec<bool>>) -> Self {
+    self.attention_mask = v;
+    self
+  }
+
+  // ── accessors ─────────────────────────────────────────────────────────────
+
+  /// Pad token id.
+  #[inline(always)]
+  pub fn pad_token_id(&self) -> u32 {
+    self.pad_token_id
+  }
+  /// Whether to pad varying-length sequences.
+  #[inline(always)]
+  pub fn padding(&self) -> bool {
+    self.padding
+  }
+  /// Padding side.
+  #[inline(always)]
+  pub fn padding_side(&self) -> PaddingSide {
+    self.padding_side
+  }
+  /// Caller-supplied attention mask (empty = compute from padding step).
+  #[inline(always)]
+  pub fn attention_mask(&self) -> &[Vec<bool>] {
+    &self.attention_mask
   }
 }
 
@@ -230,9 +371,10 @@ pub fn prepare_inputs(
     });
   }
 
-  // Validate caller-supplied attention_mask shape if present. We do
+  // Validate caller-supplied attention_mask shape if non-empty. We do
   // this BEFORE any allocation so a dimension-mismatch path is cheap.
-  if let Some(masks) = &opts.attention_mask {
+  if !opts.attention_mask.is_empty() {
+    let masks = &opts.attention_mask;
     if masks.len() != text_token_batches.len() {
       return Err(Error::ShapeMismatch {
         message: format!(
@@ -302,13 +444,17 @@ pub fn prepare_inputs(
   // internal "everything-true-except-pads" mask.
   let mut ids_buf: Vec<i32> = try_with_capacity(total)?;
   let mut mask_buf: Vec<bool> = try_with_capacity(total)?;
-  let caller_mask = opts.attention_mask.as_deref();
+  let has_caller_mask = !opts.attention_mask.is_empty();
   for (b, batch) in text_token_batches.iter().enumerate() {
     let pad_count = target_t - lens[b];
     // Resolve the mask source for this row: caller's per-token slice
-    // (length already validated == batch.len()) OR `None` → fill
+    // (length already validated == batch.len()) OR empty → fill
     // `true` at every caller-token position.
-    let row_mask: Option<&[bool]> = caller_mask.map(|m| m[b].as_slice());
+    let row_mask: Option<&[bool]> = if has_caller_mask {
+      Some(opts.attention_mask[b].as_slice())
+    } else {
+      None
+    };
     match opts.padding_side {
       PaddingSide::Left => {
         for _ in 0..pad_count {
@@ -336,13 +482,13 @@ pub fn prepare_inputs(
   let input_ids = Array::from_slice::<i32>(&ids_buf, &(batch_size, target_t))?;
   let attention_mask = Array::from_slice::<bool>(&mask_buf, &(batch_size, target_t))?;
 
-  Ok(PreparedInputs {
+  Ok(PreparedInputs::new(
     input_ids,
     attention_mask,
     pixel_values,
     input_features,
     pixel_values_videos,
-  })
+  ))
 }
 
 // ==========================================================================
