@@ -95,16 +95,80 @@ pub const DEFAULT_MAX_AUDIO_SECONDS: f32 = 30.0;
 ///   (`MAX_DECODED_SAMPLES` = 64 Mi samples ≈ 256 MiB, ~17 min of 16 kHz
 ///   mono) — `max_audio_seconds` is the layered STT-pipeline cap on top
 ///   of that, NOT a replacement for it.
+///
+/// ?DEFERRED: renaming `SttGenConfig` → `GenConfig` (shadows
+/// `mlxrs::lm::generate::GenConfig` which is already widely used).
 pub struct SttGenConfig {
   /// LM loop config (sampler, max tokens, prefill chunk size, …).
-  pub lm: GenConfig,
+  lm: GenConfig,
   /// Resample the input WAV to [`super::model::Model::mel_config`]'s
   /// `sample_rate` when the source rate differs. Default `true`.
-  pub auto_resample: bool,
+  auto_resample: bool,
   /// Maximum accepted audio duration in seconds; inputs longer than this
   /// return [`Error::Backend`] **before** mel-spectrogram allocation.
   /// Default [`DEFAULT_MAX_AUDIO_SECONDS`] (30 s, mlx-audio whisper segment).
-  pub max_audio_seconds: f32,
+  max_audio_seconds: f32,
+}
+
+impl SttGenConfig {
+  /// Construct a [`SttGenConfig`] from all fields.
+  pub fn new(lm: GenConfig, auto_resample: bool, max_audio_seconds: f32) -> Self {
+    Self {
+      lm,
+      auto_resample,
+      max_audio_seconds,
+    }
+  }
+
+  /// Borrow the inner LM loop config.
+  #[inline(always)]
+  pub fn lm(&self) -> &GenConfig {
+    &self.lm
+  }
+
+  /// Mutably borrow the inner LM loop config.
+  #[inline(always)]
+  pub fn lm_mut(&mut self) -> &mut GenConfig {
+    &mut self.lm
+  }
+
+  /// Whether to auto-resample the input WAV.
+  #[inline(always)]
+  pub fn auto_resample(&self) -> bool {
+    self.auto_resample
+  }
+
+  /// Maximum accepted audio duration in seconds.
+  #[inline(always)]
+  pub fn max_audio_seconds(&self) -> f32 {
+    self.max_audio_seconds
+  }
+
+  /// Consume and return the inner [`GenConfig`].
+  pub fn into_lm(self) -> GenConfig {
+    self.lm
+  }
+
+  /// Return `self` with the LM config replaced.
+  pub fn with_lm(self, lm: GenConfig) -> Self {
+    Self { lm, ..self }
+  }
+
+  /// Return `self` with `auto_resample` replaced.
+  pub fn with_auto_resample(self, auto_resample: bool) -> Self {
+    Self {
+      auto_resample,
+      ..self
+    }
+  }
+
+  /// Return `self` with `max_audio_seconds` replaced.
+  pub fn with_max_audio_seconds(self, max_audio_seconds: f32) -> Self {
+    Self {
+      max_audio_seconds,
+      ..self
+    }
+  }
 }
 
 impl Default for SttGenConfig {
@@ -137,11 +201,11 @@ fn audio_path_to_mel<M: super::model::Model>(
   //    forbids the negated-comparison shorthand on `f32` because NaN
   //    makes the negated form non-trivially equivalent. `is_finite()`
   //    covers both NaN and ±inf, `> 0.0` covers zero/negative.
-  if !cfg.max_audio_seconds.is_finite() || cfg.max_audio_seconds <= 0.0 {
+  if !cfg.max_audio_seconds().is_finite() || cfg.max_audio_seconds() <= 0.0 {
     return Err(Error::Backend {
       message: format!(
         "stt_generate: `max_audio_seconds` must be a finite value > 0 (got {})",
-        cfg.max_audio_seconds
+        cfg.max_audio_seconds()
       ),
     });
   }
@@ -192,7 +256,8 @@ fn audio_path_to_mel<M: super::model::Model>(
   // `load_audio_with_max_seconds`), so `mc.sample_rate` no longer
   // appears in the load-stage budget here.
   let mc = model.mel_config();
-  let (samples, src_sr) = audio_io::load_audio_with_max_seconds(audio_path, cfg.max_audio_seconds)?;
+  let (samples, src_sr) =
+    audio_io::load_audio_with_max_seconds(audio_path, cfg.max_audio_seconds())?;
 
   // 2. Duration cap — checked against the **source** duration (load_audio's
   //    `samples.len() / src_sr`) BEFORE resampling allocates a second
@@ -208,7 +273,7 @@ fn audio_path_to_mel<M: super::model::Model>(
   //    `f64` mantissa carries it exactly, `f32` would round it). The
   //    `> cfg.max_audio_seconds as f64` lift keeps both sides in f64 for
   //    the comparison.
-  let cap_f64 = f64::from(cfg.max_audio_seconds);
+  let cap_f64 = f64::from(cfg.max_audio_seconds());
   let src_duration = samples.len() as f64 / f64::from(src_sr);
   if src_duration > cap_f64 {
     return Err(Error::Backend {
@@ -216,7 +281,7 @@ fn audio_path_to_mel<M: super::model::Model>(
         "stt_generate: audio duration {src_duration:.3}s (source sample_rate \
          {src_sr}) exceeds `max_audio_seconds` cap {:.3}s (samples={}); reject \
          before resample / mel-spec allocation",
-        cfg.max_audio_seconds,
+        cfg.max_audio_seconds(),
         samples.len()
       ),
     });
@@ -237,10 +302,10 @@ fn audio_path_to_mel<M: super::model::Model>(
   //    + mismatched rates surfaces as a recoverable `Error::Backend` so a
   //    misconfigured pipeline cannot silently feed wrong-rate mels to the
   //    model.
-  let target_sr = mc.sample_rate;
+  let target_sr = mc.sample_rate();
   let samples: Vec<f32> = if src_sr == target_sr {
     samples
-  } else if cfg.auto_resample {
+  } else if cfg.auto_resample() {
     audio_io::resample_linear(&samples, src_sr, target_sr)?
   } else {
     return Err(Error::Backend {
@@ -295,14 +360,14 @@ fn audio_path_to_mel<M: super::model::Model>(
   //    taken once at the top of this function.
   dsp::log_mel_spectrogram_with(
     &samples_arr,
-    mc.n_fft,
-    mc.hop_length,
-    mc.win_length,
-    mc.n_mels,
-    mc.sample_rate,
-    mc.f_min,
-    mc.f_max,
-    mc.log_floor,
+    mc.n_fft(),
+    mc.hop_length(),
+    mc.win_length(),
+    mc.n_mels(),
+    mc.sample_rate(),
+    mc.f_min(),
+    mc.f_max(),
+    mc.log_floor(),
   )
 }
 
@@ -321,7 +386,7 @@ fn audio_path_to_mel<M: super::model::Model>(
 /// finishes (eos / `max_tokens`) every further `next()` is `None` — never a
 /// panic, never a re-entry into the model (the same `done` flag pattern the
 /// LM loop uses).
-pub struct SttGenerator<'a, M: super::model::Model> {
+pub struct SttGenerator<'a, M> {
   model: &'a M,
   /// The output of [`super::model::Model::encode_audio`] — passed
   /// unchanged into every [`super::model::Model::decode_step`] call (one
@@ -528,22 +593,22 @@ pub fn stt_generate<'a, M: super::model::Model>(
   // the audio / encode cost, mirroring the same eager gate
   // [`crate::lm::generate::generate_step`] uses (one coordinated
   // change, both loops uniformly).
-  cfg.lm.validate()?;
+  cfg.lm().validate()?;
 
   // Build the sampler / logits-processor chain FIRST — BEFORE the
   // expensive audio load + resample + mel + `encode_audio` pipeline, so a
   // gen config that `make_sampler` / `make_logits_processors` rejects at
   // BUILD time (e.g. a logit_bias index/value-arity mismatch) fails fast
   // from the constructor without paying the audio/encode cost (Codex #64
-  // finding). The eager `cfg.lm.validate()` above covers every scalar
+  // finding). The eager `cfg.lm().validate()` above covers every scalar
   // sampler / processor bound; the closure-build path still catches the
   // dynamic-bound + `make_sampler`-internal constraints (e.g. a
   // logit_bias `(indices, values)` arity check the eager pass can't
   // perform without rebuilding the same vectors). Built by reference
-  // from `cfg.lm` so `cfg` stays intact for `audio_path_to_mel`; the
+  // from `cfg.lm()` so `cfg` stays intact for `audio_path_to_mel`; the
   // owned fields are moved out afterward.
   let (sampler, processors) = {
-    let lm = &cfg.lm;
+    let lm = cfg.lm();
     let sampler = make_sampler(
       lm.temp,
       lm.top_p,
@@ -576,10 +641,12 @@ pub fn stt_generate<'a, M: super::model::Model>(
 
   // Move the owned LM fields out of `cfg` for the iterator (the eos
   // override `Vec<u32>` consumed without a clone — by-value-consume style
-  // matching the LM `generate_step`). The earlier `&cfg.lm` borrow + the
+  // matching the LM `generate_step`). The earlier `cfg.lm()` borrow + the
   // `&cfg` audio borrow have both ended, so this partial move is sound.
-  let max_tokens = cfg.lm.max_tokens;
-  let cfg_eos = cfg.lm.eos;
+  // Consume cfg into its constituent parts now that the audio borrows are done.
+  let lm = cfg.into_lm();
+  let max_tokens = lm.max_tokens;
+  let cfg_eos = lm.eos;
 
   // EOS union: model.eos_token() ∪ cfg.lm.eos. The model's EOS is always
   // a stop token (no way for the caller to opt out — the model's own

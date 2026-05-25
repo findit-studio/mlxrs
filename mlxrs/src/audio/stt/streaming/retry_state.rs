@@ -24,6 +24,8 @@
 
 use std::collections::VecDeque;
 
+use derive_more::IsVariant;
+
 use super::{
   encoder::{StreamingEncoder, StreamingEncoderBackend},
   mel_spectrogram::IncrementalMelSpectrogram,
@@ -65,7 +67,7 @@ pub(super) struct PendingFinalize {
 /// variant — the [`SessionRetryState::finalize_queue`] field's
 /// non-emptiness is the obligation signal (the failed entry is at the
 /// queue front).
-#[derive(Debug)]
+#[derive(Debug, IsVariant)]
 pub(super) enum RetryStage {
   /// `stop()`'s `mel.flush()` errored. The mel processor's transactional
   /// `flush` left its overlap buffer intact, so the next `stop()` call
@@ -74,10 +76,10 @@ pub(super) enum RetryStage {
   StopMelFlush,
   /// `stop()`'s `mel.flush()` succeeded (committing-and-clearing the
   /// overlap buffer), and the freshly-flushed mel rows live nowhere but
-  /// in `mel_frames` here. Any retry from `feed_audio` / `stop` MUST
+  /// in this payload. Any retry from `feed_audio` / `stop` MUST
   /// re-feed THIS array (the overlap is gone). On Ok the array is
   /// consumed and `resume_at` advances to the next stage if any.
-  StopEncoderFeed { mel_frames: Array },
+  StopEncoderFeed(Array),
   /// One or more full encoder windows are committed to the encoder's
   /// `newly_encoded_windows` / `cached_windows` AND owe a decode pass.
   /// This covers two surfaces structurally:
@@ -96,7 +98,7 @@ pub(super) enum RetryStage {
   /// so the retry doesn't have to recompute encode_pending (which is
   /// itself fallible and idempotent — but skipping the recompute also
   /// avoids a redundant encoder forward pass).
-  StopPartialDecode { audio_features: Option<Array> },
+  StopPartialDecode(Option<Array>),
 }
 
 /// Unified retry-state machine.
@@ -140,12 +142,14 @@ impl SessionRetryState {
   /// True iff some prior call left work that MUST be discharged before
   /// any new audio can be accepted. Either a `resume_at` is set OR the
   /// finalize queue is non-empty — both arms are equally blocking.
+  #[inline(always)]
   pub(super) fn has_obligation(&self) -> bool {
     self.resume_at.is_some() || !self.finalize_queue.is_empty()
   }
 
   /// Inspect the resume point. Borrowed read-only — discharge methods
   /// mutate it via the dedicated `take_*` / `set_*` helpers below.
+  #[inline(always)]
   pub(super) fn resume_at(&self) -> Option<&RetryStage> {
     self.resume_at.as_ref()
   }
@@ -156,6 +160,7 @@ impl SessionRetryState {
   /// `discharge_retry_obligation`'s dispatcher would have nothing to
   /// gate on and `has_obligation()` would short-circuit `stop()` to an
   /// early-return.
+  #[inline(always)]
   pub(super) fn has_pending_stop_mel_flush(&self) -> bool {
     matches!(self.resume_at, Some(RetryStage::StopMelFlush))
   }
@@ -163,14 +168,15 @@ impl SessionRetryState {
   /// True iff `resume_at` names a stage whose source-of-truth lives
   /// inside `mel_processor` / `encoder` — i.e. some prior call's
   /// encoder.feed errored and the staged mel rows live in
-  /// `RetryStage::StopEncoderFeed { mel_frames }`. The session uses
-  /// this to keep the contract "drain the staged stop-tail BEFORE
-  /// processing new feed audio."
+  /// `RetryStage::StopEncoderFeed`. The session uses this to keep the
+  /// contract "drain the staged stop-tail BEFORE processing new feed audio."
+  #[inline(always)]
   pub(super) fn has_pending_stop_encoder_feed(&self) -> bool {
-    matches!(self.resume_at, Some(RetryStage::StopEncoderFeed { .. }))
+    matches!(self.resume_at, Some(RetryStage::StopEncoderFeed(_)))
   }
 
   /// True iff `resume_at == Some(DecodeOwed)`.
+  #[inline(always)]
   pub(super) fn has_decode_owed(&self) -> bool {
     matches!(self.resume_at, Some(RetryStage::DecodeOwed))
   }
@@ -215,7 +221,7 @@ impl SessionRetryState {
   where
     B: StreamingEncoderBackend,
   {
-    let Some(RetryStage::StopEncoderFeed { mel_frames }) = self.resume_at.take() else {
+    let Some(RetryStage::StopEncoderFeed(mel_frames)) = self.resume_at.take() else {
       // Not our obligation — restore (we took() it above) and exit.
       // The take() only matched on StopEncoderFeed, so this branch is
       // unreachable, but the explicit check guards against future
@@ -230,7 +236,7 @@ impl SessionRetryState {
       Err(e) => {
         // ROLLBACK: re-arm the resume point. `mel_frames` was MOVED
         // into the match arm — restore by re-constructing.
-        self.resume_at = Some(RetryStage::StopEncoderFeed { mel_frames });
+        self.resume_at = Some(RetryStage::StopEncoderFeed(mel_frames));
         return Err(e);
       }
     };
@@ -249,7 +255,7 @@ impl SessionRetryState {
   /// the feed errors, the resume point is already correct; on success
   /// the caller advances by clearing or chaining via the methods above.
   pub(super) fn stage_stop_encoder_feed(&mut self, mel_frames: Array) {
-    self.resume_at = Some(RetryStage::StopEncoderFeed { mel_frames });
+    self.resume_at = Some(RetryStage::StopEncoderFeed(mel_frames));
   }
 
   /// Stage a fresh `MelFlush` obligation — called by `stop()` BEFORE
@@ -371,9 +377,7 @@ impl SessionRetryState {
         // the original. The obligation is the safety net — if the
         // caller's in-call path fails downstream, the next discharge
         // re-feeds from the staged clone.
-        self.resume_at = Some(RetryStage::StopEncoderFeed {
-          mel_frames: for_obligation,
-        });
+        self.resume_at = Some(RetryStage::StopEncoderFeed(for_obligation));
         Ok(Some(mel))
       }
       Err(e) => {
@@ -389,7 +393,7 @@ impl SessionRetryState {
         // injected-clone-Err test seam
         // (`discharge_stop_mel_flush_try_clone_err_preserves_mel_as_stop_encoder_feed`)
         // gives this branch deterministic regression coverage.
-        self.resume_at = Some(RetryStage::StopEncoderFeed { mel_frames: mel });
+        self.resume_at = Some(RetryStage::StopEncoderFeed(mel));
         Err(Error::Backend {
           message: format!(
             "StopMelFlush: failed to clone flushed mel for in-call use; \
@@ -424,12 +428,13 @@ impl SessionRetryState {
   /// would be safe (`encode_pending` is `&self` + idempotent), skipping
   /// it avoids a redundant encoder forward pass.
   pub(super) fn arm_stop_partial_decode(&mut self, audio_features: Option<Array>) {
-    self.resume_at = Some(RetryStage::StopPartialDecode { audio_features });
+    self.resume_at = Some(RetryStage::StopPartialDecode(audio_features));
   }
 
   /// True iff `resume_at == Some(StopPartialDecode)`.
+  #[inline(always)]
   pub(super) fn has_pending_stop_partial_decode(&self) -> bool {
-    matches!(self.resume_at, Some(RetryStage::StopPartialDecode { .. }))
+    matches!(self.resume_at, Some(RetryStage::StopPartialDecode(_)))
   }
 
   /// Take the staged `StopPartialDecode` audio_features out of the
@@ -437,8 +442,8 @@ impl SessionRetryState {
   /// payload while the resume point is being advanced. Returns `None`
   /// if `resume_at` doesn't currently hold a `StopPartialDecode`.
   pub(super) fn take_stop_partial_decode_features(&mut self) -> Option<Option<Array>> {
-    if matches!(self.resume_at, Some(RetryStage::StopPartialDecode { .. })) {
-      let Some(RetryStage::StopPartialDecode { audio_features }) = self.resume_at.take() else {
+    if matches!(self.resume_at, Some(RetryStage::StopPartialDecode(_))) {
+      let Some(RetryStage::StopPartialDecode(audio_features)) = self.resume_at.take() else {
         unreachable!("matches! gated the take()")
       };
       Some(audio_features)
@@ -820,7 +825,7 @@ mod tests {
     // carrying the original flushed mel — NEVER on StopMelFlush (the
     // pre-fix path that emits Ended with silent tail loss).
     match s.resume_at() {
-      Some(RetryStage::StopEncoderFeed { mel_frames }) => {
+      Some(RetryStage::StopEncoderFeed(mel_frames)) => {
         // The staged mel should have non-zero rows (we populated the
         // overlap with 16 samples + a 32-pt FFT, which produces ≥ 1
         // mel frame on flush).

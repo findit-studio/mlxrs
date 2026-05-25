@@ -151,24 +151,26 @@ pub trait Model: crate::lm::model::Model {
 #[derive(Debug, Clone, Copy)]
 pub struct MelConfig {
   /// FFT length (mlx-audio whisper default `400`).
-  pub n_fft: usize,
+  n_fft: usize,
   /// STFT hop length in samples (mlx-audio whisper default `160`).
-  pub hop_length: usize,
+  hop_length: usize,
   /// Window length in samples; `None` ⇒ `n_fft` (mlx-audio default).
-  pub win_length: Option<usize>,
+  /// Per §1 scalar Option-with-meaningful-sentinel: kept as `Option`.
+  win_length: Option<usize>,
   /// Number of mel filterbank bins (mlx-audio whisper default `80`; canary
   /// uses `128`).
-  pub n_mels: usize,
+  n_mels: usize,
   /// Target audio sample rate in Hz (mlx-audio whisper default `16_000`).
   /// [`super::generate::stt_generate`] resamples the input via
   /// [`crate::audio::io::resample_linear`] when the source sample rate
   /// differs (gated on [`super::generate::SttGenConfig::auto_resample`]).
-  pub sample_rate: u32,
+  sample_rate: u32,
   /// Lower mel band edge (Hz; mlx-audio default `0.0`).
-  pub f_min: f32,
+  f_min: f32,
   /// Upper mel band edge (Hz); `None` ⇒ `sample_rate / 2` (Nyquist), the
   /// `mel_filter_bank` default.
-  pub f_max: Option<f32>,
+  /// Per §1 scalar Option-with-meaningful-sentinel: kept as `Option`.
+  f_max: Option<f32>,
   /// Numerical floor applied to mel energies before the **natural log**
   /// (`ln`, the `log_mel_spectrogram_with` `.log()` step)
   /// ([`crate::audio::dsp::LogFloor`]). Whisper frontends expect
@@ -181,17 +183,41 @@ pub struct MelConfig {
   /// units, silently degrading transcription quality. Threaded through
   /// [`super::generate::stt_generate`]'s `audio_path_to_mel` via
   /// [`crate::audio::dsp::log_mel_spectrogram_with`].
-  pub log_floor: crate::audio::dsp::LogFloor,
+  log_floor: crate::audio::dsp::LogFloor,
 }
 
 impl MelConfig {
+  /// Construct a [`MelConfig`] from all fields.
+  #[allow(clippy::too_many_arguments)]
+  pub fn new(
+    n_fft: usize,
+    hop_length: usize,
+    win_length: Option<usize>,
+    n_mels: usize,
+    sample_rate: u32,
+    f_min: f32,
+    f_max: Option<f32>,
+    log_floor: crate::audio::dsp::LogFloor,
+  ) -> Self {
+    Self {
+      n_fft,
+      hop_length,
+      win_length,
+      n_mels,
+      sample_rate,
+      f_min,
+      f_max,
+      log_floor,
+    }
+  }
+
   /// The Whisper preset: `n_fft=400`, `hop_length=160`, `n_mels=80`,
   /// `sample_rate=16_000`, `f_min=0`, `f_max=None` (Nyquist). Matches
   /// mlx-audio's whisper [`audio.py`][whisper-audio] feature-extractor
   /// defaults.
   ///
   /// [whisper-audio]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/whisper/audio.py
-  pub fn whisper_default() -> Self {
+  pub const fn whisper_default() -> Self {
     Self {
       n_fft: 400,
       hop_length: 160,
@@ -202,5 +228,104 @@ impl MelConfig {
       f_max: None,
       log_floor: crate::audio::dsp::LogFloor::Whisper,
     }
+  }
+
+  /// FFT length.
+  #[inline(always)]
+  pub fn n_fft(&self) -> usize {
+    self.n_fft
+  }
+
+  /// STFT hop length in samples.
+  #[inline(always)]
+  pub fn hop_length(&self) -> usize {
+    self.hop_length
+  }
+
+  /// Window length in samples; `None` ⇒ `n_fft`.
+  #[inline(always)]
+  pub fn win_length(&self) -> Option<usize> {
+    self.win_length
+  }
+
+  /// Number of mel filterbank bins.
+  #[inline(always)]
+  pub fn n_mels(&self) -> usize {
+    self.n_mels
+  }
+
+  /// Target audio sample rate in Hz.
+  #[inline(always)]
+  pub fn sample_rate(&self) -> u32 {
+    self.sample_rate
+  }
+
+  /// Lower mel band edge in Hz.
+  #[inline(always)]
+  pub fn f_min(&self) -> f32 {
+    self.f_min
+  }
+
+  /// Upper mel band edge in Hz; `None` ⇒ Nyquist.
+  #[inline(always)]
+  pub fn f_max(&self) -> Option<f32> {
+    self.f_max
+  }
+
+  /// Numerical log floor applied before the mel's natural log.
+  #[inline(always)]
+  pub fn log_floor(&self) -> crate::audio::dsp::LogFloor {
+    self.log_floor
+  }
+
+  /// Return a copy with `n_fft` overridden.
+  #[inline(always)]
+  pub fn with_n_fft(self, n_fft: usize) -> Self {
+    Self { n_fft, ..self }
+  }
+
+  /// Return a copy with `hop_length` overridden.
+  #[inline(always)]
+  pub fn with_hop_length(self, hop_length: usize) -> Self {
+    Self { hop_length, ..self }
+  }
+
+  /// Return a copy with `win_length` overridden.
+  #[inline(always)]
+  pub fn with_win_length(self, win_length: Option<usize>) -> Self {
+    Self { win_length, ..self }
+  }
+
+  /// Return a copy with `n_mels` overridden.
+  #[inline(always)]
+  pub fn with_n_mels(self, n_mels: usize) -> Self {
+    Self { n_mels, ..self }
+  }
+
+  /// Return a copy with `sample_rate` overridden.
+  #[inline(always)]
+  pub fn with_sample_rate(self, sample_rate: u32) -> Self {
+    Self {
+      sample_rate,
+      ..self
+    }
+  }
+
+  /// Return a copy with `f_min` overridden.
+  #[inline(always)]
+  pub fn with_f_min(self, f_min: f32) -> Self {
+    Self { f_min, ..self }
+  }
+
+  /// Return a copy with `f_max` overridden.
+  #[inline(always)]
+  pub fn with_f_max(self, f_max: Option<f32>) -> Self {
+    Self { f_max, ..self }
+  }
+
+  /// Return a copy with `log_floor` overridden.
+  #[inline(always)]
+  pub fn with_log_floor(self, log_floor: crate::audio::dsp::LogFloor) -> Self {
+    Self { log_floor, ..self }
   }
 }

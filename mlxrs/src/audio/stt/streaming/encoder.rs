@@ -72,7 +72,7 @@ pub trait StreamingEncoderBackend {
 /// Streaming wrapper around a [`StreamingEncoderBackend`] that
 /// accumulates mel frames into complete windows + caches the encoded
 /// output, with bounded cache size.
-pub struct StreamingEncoder<B: StreamingEncoderBackend> {
+pub struct StreamingEncoder<B> {
   encoder: B,
   window_size: usize,
   window_stride: usize,
@@ -118,26 +118,31 @@ impl<B: StreamingEncoderBackend> StreamingEncoder<B> {
 
   /// Borrow the underlying [`StreamingEncoderBackend`] (for example to
   /// query model-specific config).
+  #[inline(always)]
   pub fn backend(&self) -> &B {
     &self.encoder
   }
 
   /// Window size in mel frames.
+  #[inline(always)]
   pub fn window_size(&self) -> usize {
     self.window_size
   }
 
   /// Window stride (`window_size - overlap`).
+  #[inline(always)]
   pub fn window_stride(&self) -> usize {
     self.window_stride
   }
 
   /// Number of fully encoded windows since the last [`reset`](Self::reset).
+  #[inline(always)]
   pub fn encoded_window_count(&self) -> usize {
     self.total_encoded_windows
   }
 
   /// Whether pending mel frames are waiting for a full window.
+  #[inline(always)]
   pub fn has_pending_frames(&self) -> bool {
     self.pending_frame_count > 0
   }

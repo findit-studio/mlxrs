@@ -153,12 +153,7 @@ struct DecodePassParams<'a> {
 /// backend `D`, and tokenizer `T`. Owns its own
 /// [`IncrementalMelSpectrogram`] + [`StreamingEncoder`] + an internal
 /// retry-state machine.
-pub struct StreamingInferenceSession<B, D, T>
-where
-  B: StreamingEncoderBackend,
-  D: StreamingDecoderBackend,
-  T: StreamingTokenizer,
-{
+pub struct StreamingInferenceSession<B, D, T> {
   decoder: D,
   tokenizer: T,
   config: StreamingConfig,
@@ -209,7 +204,7 @@ where
     overlap_frames: usize,
   ) -> Result<Self> {
     let mel_processor = IncrementalMelSpectrogram::new(sample_rate, 400, 160, n_mels)?;
-    let max_cached_windows = config.max_cached_windows;
+    let max_cached_windows = config.max_cached_windows();
     let encoder = StreamingEncoder::new(encoder_backend, max_cached_windows, overlap_frames);
     Ok(Self {
       decoder,
@@ -229,21 +224,25 @@ where
   }
 
   /// Borrow the underlying [`StreamingConfig`].
+  #[inline(always)]
   pub fn config(&self) -> &StreamingConfig {
     &self.config
   }
 
   /// Total samples fed since construction / last [`reset`](Self::reset).
+  #[inline(always)]
   pub fn total_samples_fed(&self) -> usize {
     self.total_samples_fed
   }
 
   /// Number of fully encoded windows.
+  #[inline(always)]
   pub fn encoded_window_count(&self) -> usize {
     self.encoder.encoded_window_count()
   }
 
   /// Whether the session is still active (not stopped / cancelled).
+  #[inline(always)]
   pub fn is_active(&self) -> bool {
     self.is_active
   }
@@ -344,7 +343,7 @@ where
 
     let now = Instant::now();
     if new_windows > 0 {
-      let boost = self.config.boundary_boost_seconds.max(0.0);
+      let boost = self.config.boundary_boost_seconds().max(0.0);
       if boost > 0.0 {
         self.boundary_fast_decode_until = Some(now + std::time::Duration::from_secs_f64(boost));
       } else {
@@ -355,19 +354,19 @@ where
     let effective_decode_interval_seconds = if let Some(until) = self.boundary_fast_decode_until
       && now < until
     {
-      let fast = self.config.boundary_decode_interval_seconds.max(0.05);
-      let normal = self.config.decode_interval_seconds.max(0.05);
+      let fast = self.config.boundary_decode_interval_seconds().max(0.05);
+      let normal = self.config.decode_interval_seconds().max(0.05);
       fast.min(normal)
     } else {
       self.boundary_fast_decode_until = None;
-      self.config.decode_interval_seconds.max(0.05)
+      self.config.decode_interval_seconds().max(0.05)
     };
 
     let has_pending_retries =
-      self.config.finalize_completed_windows && !self.retry_state.finalize_queue().is_empty();
+      self.config.finalize_completed_windows() && !self.retry_state.finalize_queue().is_empty();
 
     let should_decode =
-      if (self.config.finalize_completed_windows && new_windows > 0) || has_pending_retries {
+      if (self.config.finalize_completed_windows() && new_windows > 0) || has_pending_retries {
         true
       } else if let Some(last) = self.last_decode_time {
         now.duration_since(last).as_secs_f64() >= effective_decode_interval_seconds
@@ -386,7 +385,7 @@ where
     if should_decode && (self.has_new_encoder_content || has_pending_retries) && !skip_normal_decode
     {
       self.has_new_encoder_content = false;
-      let is_boundary_finalize_pass = self.config.finalize_completed_windows && new_windows > 0;
+      let is_boundary_finalize_pass = self.config.finalize_completed_windows() && new_windows > 0;
       if !is_boundary_finalize_pass {
         self.last_decode_time = Some(now);
       }
@@ -541,7 +540,7 @@ where
     // 5. Stage: finalize-queue drain (or freeze for the no-finalize
     //    path). On Err, the queue front is unchanged so the next
     //    stop()/feed_audio() retry path drives the queue.
-    if self.config.finalize_completed_windows {
+    if self.config.finalize_completed_windows() {
       let drained = self.encoder.drain_newly_encoded_windows();
       for window in drained {
         self.retry_state.enqueue_finalize(window);
@@ -733,7 +732,7 @@ where
       // Same gate as the normal feed_audio decode-pass: only drive the
       // queue when finalize_completed_windows is on (the queue is only
       // populated in that mode).
-      if self.config.finalize_completed_windows {
+      if self.config.finalize_completed_windows() {
         let finalize_events = self.finalize_completed_windows()?;
         events.extend(finalize_events);
         ran_decode = true;
@@ -780,7 +779,7 @@ where
         let confirmed_count = self.shared.confirmed_token_ids.len();
         let estimated_tokens = self
           .config
-          .max_tokens_per_pass
+          .max_tokens_per_pass()
           .min(confirmed_count.saturating_add(24).max(24));
         let token_ids = self.decoder.decode_all_tokens(
           &audio_features,
@@ -811,9 +810,7 @@ where
     }
 
     let final_text = concat_text(&self.shared.completed_text, &self.shared.confirmed_text);
-    events.push(TranscriptionEvent::Ended {
-      full_text: final_text,
-    });
+    events.push(TranscriptionEvent::ended(final_text));
 
     Ok(())
   }
@@ -831,7 +828,7 @@ where
     // retry queue; `finalize_completed_windows` then pops them one at a
     // time as decodes succeed (and leaves any failed window at the
     // front for the next pass to retry).
-    if self.config.finalize_completed_windows {
+    if self.config.finalize_completed_windows() {
       let drained = self.encoder.drain_newly_encoded_windows();
       for window in drained {
         self.retry_state.enqueue_finalize(window);
@@ -857,7 +854,7 @@ where
     let estimated_total_tokens = ((windowed_seconds * 10.0).ceil() as usize).max(24);
     let max_tokens = self
       .config
-      .max_tokens_per_pass
+      .max_tokens_per_pass()
       .min(estimated_total_tokens.max(confirmed_count.saturating_add(24)));
 
     let display_prefix = concat_text(&self.shared.completed_text, &self.shared.confirmed_text);
@@ -866,11 +863,11 @@ where
     {
       self
         .config
-        .min_agreement_passes
-        .max(self.config.boundary_min_agreement_passes)
+        .min_agreement_passes()
+        .max(self.config.boundary_min_agreement_passes())
         .max(1)
     } else {
-      self.config.min_agreement_passes.max(1)
+      self.config.min_agreement_passes().max(1)
     };
 
     let params = DecodePassParams {
@@ -909,7 +906,7 @@ where
       .collect();
     let gen_token_count = all_token_ids.len();
     let now = Instant::now();
-    let delay = std::time::Duration::from_millis(u64::from(self.config.delay_preset.delay_ms()));
+    let delay = std::time::Duration::from_millis(u64::from(self.config.delay_preset().delay_ms()));
 
     // Common prefix match-length between prev provisional and new.
     let mut match_len = 0;
@@ -975,9 +972,10 @@ where
       let promoted: Vec<u32> = new_provisional[..promotion_count].to_vec();
       self.shared.confirmed_token_ids.extend(promoted);
       self.shared.confirmed_text = self.tokenizer.decode_ids(&self.shared.confirmed_token_ids);
-      events.push(TranscriptionEvent::Confirmed {
-        text: concat_text(&self.shared.completed_text, &self.shared.confirmed_text),
-      });
+      events.push(TranscriptionEvent::confirmed(concat_text(
+        &self.shared.completed_text,
+        &self.shared.confirmed_text,
+      )));
     }
     self.shared.provisional_token_ids = final_provisional.clone();
     self.shared.provisional_first_seen = final_first_seen;
@@ -985,10 +983,10 @@ where
 
     let final_prov_text = self.tokenizer.decode_ids(&final_provisional);
     let display_prefix = concat_text(&self.shared.completed_text, &self.shared.confirmed_text);
-    events.push(TranscriptionEvent::DisplayUpdate {
-      confirmed_text: display_prefix,
-      provisional_text: final_prov_text,
-    });
+    events.push(TranscriptionEvent::display_update(
+      display_prefix,
+      final_prov_text,
+    ));
     let _ = params.display_prefix; // shape parity — used only for the streaming preview event
 
     let total_audio_seconds = self.total_samples_fed as f64 / 16_000.0;
@@ -1075,7 +1073,7 @@ where
           &pending.encoder_output,
           &[],
           &self.config,
-          self.config.max_tokens_per_pass,
+          self.config.max_tokens_per_pass(),
         )?;
         let decode_time = start.elapsed().as_secs_f64();
         total_decode_time += decode_time;
@@ -1327,17 +1325,15 @@ mod tests {
     encoder: ScriptedEncoder,
     decoder: ScriptedDecoder,
   ) -> StreamingInferenceSession<ScriptedEncoder, ScriptedDecoder, MockTokenizer> {
-    let cfg = StreamingConfig {
-      decode_interval_seconds: 0.0,
-      boundary_decode_interval_seconds: 0.0,
-      boundary_boost_seconds: 0.0,
-      max_cached_windows: 8,
-      finalize_completed_windows: false,
-      min_agreement_passes: 1,
-      boundary_min_agreement_passes: 1,
-      delay_preset: DelayPreset::Custom(0),
-      ..StreamingConfig::default()
-    };
+    let cfg = StreamingConfig::default()
+      .with_decode_interval_seconds(0.0)
+      .with_boundary_decode_interval_seconds(0.0)
+      .with_boundary_boost_seconds(0.0)
+      .with_max_cached_windows(8)
+      .with_finalize_completed_windows(false)
+      .with_min_agreement_passes(1)
+      .with_boundary_min_agreement_passes(1)
+      .with_delay_preset(DelayPreset::Custom(0));
     StreamingInferenceSession::new(decoder, MockTokenizer, cfg, encoder, 16_000, 8, 0).unwrap()
   }
 
@@ -1346,17 +1342,15 @@ mod tests {
     encoder: ScriptedEncoder,
     decoder: ScriptedDecoder,
   ) -> StreamingInferenceSession<ScriptedEncoder, ScriptedDecoder, MockTokenizer> {
-    let cfg = StreamingConfig {
-      decode_interval_seconds: 0.0,
-      boundary_decode_interval_seconds: 0.0,
-      boundary_boost_seconds: 0.0,
-      max_cached_windows: 8,
-      finalize_completed_windows: true,
-      min_agreement_passes: 1,
-      boundary_min_agreement_passes: 1,
-      delay_preset: DelayPreset::Custom(0),
-      ..StreamingConfig::default()
-    };
+    let cfg = StreamingConfig::default()
+      .with_decode_interval_seconds(0.0)
+      .with_boundary_decode_interval_seconds(0.0)
+      .with_boundary_boost_seconds(0.0)
+      .with_max_cached_windows(8)
+      .with_finalize_completed_windows(true)
+      .with_min_agreement_passes(1)
+      .with_boundary_min_agreement_passes(1)
+      .with_delay_preset(DelayPreset::Custom(0));
     StreamingInferenceSession::new(decoder, MockTokenizer, cfg, encoder, 16_000, 8, 0).unwrap()
   }
 
@@ -1401,7 +1395,7 @@ mod tests {
     let events = session.feed_audio(&samples).unwrap();
     assert_eq!(session.decoder.call_count(), 1);
     assert!(
-      matches!(events.first(), Some(TranscriptionEvent::Confirmed { .. })),
+      matches!(events.first(), Some(TranscriptionEvent::Confirmed(_))),
       "events[0]={:?}",
       events.first()
     );
@@ -1421,7 +1415,7 @@ mod tests {
     let _ = session.feed_audio(&samples).unwrap();
     let stop_events = session.stop().unwrap();
     assert!(
-      matches!(stop_events.last(), Some(TranscriptionEvent::Ended { .. })),
+      matches!(stop_events.last(), Some(TranscriptionEvent::Ended(_))),
       "stop events: {stop_events:?}"
     );
     assert!(!session.is_active());
@@ -1486,7 +1480,7 @@ mod tests {
     partial_events.unwrap();
     boundary_events.unwrap();
     let stop_events = session.stop().unwrap();
-    let TranscriptionEvent::Ended { full_text } = stop_events
+    let TranscriptionEvent::Ended(full_text) = stop_events
       .last()
       .expect("expected Ended event at stop()")
       .clone()
@@ -1589,7 +1583,7 @@ mod tests {
 
     let stop_second = session.stop().expect("second stop() must succeed");
     assert!(
-      matches!(stop_second.last(), Some(TranscriptionEvent::Ended { .. })),
+      matches!(stop_second.last(), Some(TranscriptionEvent::Ended(_))),
       "second stop() must emit terminal Ended, got {stop_second:?}"
     );
     assert!(!session.is_active());
@@ -1709,7 +1703,7 @@ mod tests {
     let stop_second = session.stop().expect("retry stop() must succeed");
     assert!(matches!(
       stop_second.last(),
-      Some(TranscriptionEvent::Ended { .. })
+      Some(TranscriptionEvent::Ended(_))
     ));
     assert!(!session.is_active());
     assert!(!session.retry_state().has_obligation());
@@ -2124,7 +2118,7 @@ mod tests {
       .stop()
       .expect("F1: retry stop() MUST succeed via discharge_stop_mel_flush");
     assert!(
-      matches!(stop_second.last(), Some(TranscriptionEvent::Ended { .. })),
+      matches!(stop_second.last(), Some(TranscriptionEvent::Ended(_))),
       "F1: second stop() MUST emit Ended after the discharge succeeds"
     );
     assert!(!session.is_active());
@@ -2171,7 +2165,7 @@ mod tests {
       .expect("F1: third stop() MUST succeed once flush stops erring");
     assert!(matches!(
       stop_third.last(),
-      Some(TranscriptionEvent::Ended { .. })
+      Some(TranscriptionEvent::Ended(_))
     ));
     assert!(!session.is_active());
     assert!(!session.retry_state().has_obligation());
@@ -2281,7 +2275,7 @@ mod tests {
       .expect("F2: retry stop() fast path MUST succeed");
     assert!(matches!(
       stop_second.last(),
-      Some(TranscriptionEvent::Ended { .. })
+      Some(TranscriptionEvent::Ended(_))
     ));
     assert!(!session.retry_state().has_obligation());
     assert!(!session.is_active());

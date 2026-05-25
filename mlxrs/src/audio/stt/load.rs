@@ -176,6 +176,6 @@ mod tests {
     assert_eq!(captured.into_inner().unwrap(), dir);
     assert_eq!(model.bos_token(), 50258);
     assert_eq!(model.eos_token(), 50257);
-    assert_eq!(model.mel_config().sample_rate, 16_000);
+    assert_eq!(model.mel_config().sample_rate(), 16_000);
   }
 }
