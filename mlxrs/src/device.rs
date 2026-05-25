@@ -32,7 +32,8 @@ use crate::error::{Result, check, ensure_handler_installed};
 static DEFAULT_DEVICE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Device kind tag — mirrors `mlx_device_type` (`MLX_CPU` / `MLX_GPU`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display, derive_more::IsVariant)]
+#[display("{}", self.as_str())]
 #[non_exhaustive]
 pub enum DeviceKind {
   /// CPU device (`mlx_device_type__MLX_CPU`).
@@ -42,6 +43,14 @@ pub enum DeviceKind {
 }
 
 impl DeviceKind {
+  /// Canonical lowercase string name.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Cpu => "cpu",
+      Self::Gpu => "gpu",
+    }
+  }
+
   /// Convert to the raw mlx-c device-type tag.
   #[inline]
   fn to_raw(self) -> mlxrs_sys::mlx_device_type {
@@ -254,6 +263,7 @@ impl Device {
 
   /// Whether two devices refer to the same `{kind, index}` pair. Wraps
   /// `mlx_device_equal`.
+  #[inline(always)]
   pub fn equal(&self, other: &Device) -> bool {
     // SAFETY: pure comparison of two valid borrowed handles; mlx-c does not mutate
     // or retain either and returns a plain `bool`.

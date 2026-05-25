@@ -42,6 +42,7 @@ half.workspace = true
 smallvec.workspace = true
 static_assertions.workspace = true
 ctor.workspace = true
+derive_more.workspace = true
 libc = "0.2"                          # SIGABRT diagnostics handler (diagnostics.rs)
 tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
 minijinja = { version = "2", features = ["loader", "json", "loop_controls", "builtins", "preserve_order"], optional = true }

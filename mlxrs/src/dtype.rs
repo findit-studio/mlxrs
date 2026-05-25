@@ -9,7 +9,8 @@ use crate::error::{Error, Result, check};
 /// `#[non_exhaustive]` is intentionally NOT applied — the enum already covers
 /// all 14 mlx-c dtypes; adding a new dtype upstream is rare and warrants a
 /// SemVer-major bump.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
+#[display("{}", self.as_str())]
 pub enum Dtype {
   /// Boolean.
   Bool,
@@ -39,6 +40,28 @@ pub enum Dtype {
   BF16,
   /// 64-bit complex (2× f32).
   Complex64,
+}
+
+impl Dtype {
+  /// Canonical string name — matches mlx-c++'s `dtype_to_string` exactly.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Bool => "bool",
+      Self::U8 => "uint8",
+      Self::U16 => "uint16",
+      Self::U32 => "uint32",
+      Self::U64 => "uint64",
+      Self::I8 => "int8",
+      Self::I16 => "int16",
+      Self::I32 => "int32",
+      Self::I64 => "int64",
+      Self::F16 => "float16",
+      Self::F32 => "float32",
+      Self::F64 => "float64",
+      Self::BF16 => "bfloat16",
+      Self::Complex64 => "complex64",
+    }
+  }
 }
 
 impl TryFrom<mlxrs_sys::mlx_dtype> for Dtype {

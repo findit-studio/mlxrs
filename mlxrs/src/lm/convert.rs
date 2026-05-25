@@ -889,12 +889,7 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
         // pattern below is exhaustive over `aggregate`'s shape so
         // every field is named even when only one is `Some`.
         1 => {
-          let crate::error::ConvertDurabilityWarnings {
-            committed: _,
-            save,
-            post_copy_file,
-            post_copy_dir,
-          } = aggregate;
+          let (_, save, post_copy_file, post_copy_dir) = aggregate.into_parts();
           let source = save
             .or(post_copy_file)
             .or(post_copy_dir)

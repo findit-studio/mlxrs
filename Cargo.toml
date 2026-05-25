@@ -34,6 +34,7 @@ trybuild = "1"
 bindgen = "0.72"
 cmake = "0.1"
 walkdir = "2"
+derive_more = { version = "2", features = ["display", "is_variant", "unwrap", "try_unwrap"], default-features = false }
 
 [workspace.lints.rust]
 rust_2018_idioms = "warn"
