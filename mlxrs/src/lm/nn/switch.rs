@@ -81,7 +81,7 @@ use super::activations::silu;
 /// the constructor verifies the shape contract and surfaces any mismatch as a
 /// recoverable error rather than panicking at the first FFI call. The
 /// `weight` / `bias` fields are PRIVATE — exposed via the
-/// [`weight`](Self::weight) / [`bias`](Self::bias) read-only accessors —
+/// [`weight_ref`](Self::weight_ref) / [`bias`](Self::bias) read-only accessors —
 /// specifically so that the constructor's shape validation is the *only*
 /// way to populate them. Allowing external `&mut` mutation or struct-literal
 /// construction would let a caller install a malformed `bias` (e.g. `[E, 1]`)
@@ -96,13 +96,13 @@ pub struct SwitchLinear {
   /// input_dims]`. Stored as the python layout (mlx-lm reads safetensors
   /// directly into this shape); the `swapaxes(-1, -2)` to `[E, I, O]` for
   /// `gather_mm`'s `(M=I, K=O)` contract happens inside [`apply`](Self::apply).
-  /// PRIVATE — read via [`Self::weight`] — so the constructor's rank-3
+  /// PRIVATE — read via [`Self::weight_ref`] — so the constructor's rank-3
   /// `[E, O, I]` validation can't be bypassed by struct-literal construction
   /// or `&mut` mutation.
   weight: Array,
   /// Optional per-expert bias of shape `[num_experts, output_dims]`. `None`
   /// matches python `SwitchLinear(..., bias=False)`. PRIVATE — read via
-  /// [`Self::bias`] — for the same reason as [`Self::weight`]: a malformed
+  /// [`Self::bias`] — for the same reason as [`Self::weight_ref`]: a malformed
   /// `[E, 1]` bias would silently broadcast across every output channel in
   /// [`apply`](Self::apply) without the constructor's `[E, O]` check.
   bias: Option<Array>,
@@ -149,8 +149,9 @@ impl SwitchLinear {
   ///
   /// The field is private specifically so the constructor's rank-3 shape
   /// validation is the only construction path; see the struct doc for the
-  /// invariant rationale. Lazy — does not evaluate.
-  pub fn weight(&self) -> &Array {
+  /// invariant rationale. Named `weight_ref` per §3 (non-Copy `&Array`
+  /// accessor). Lazy — does not evaluate.
+  pub fn weight_ref(&self) -> &Array {
     &self.weight
   }
 
@@ -243,8 +244,8 @@ impl SwitchLinear {
 /// The packed `weight` shape itself is dictated by the quantization scheme
 /// (`gather_qmm` validates it); we surface only the input/output contract.
 ///
-/// All fields are PRIVATE — exposed via the [`weight`](Self::weight) /
-/// [`scales`](Self::scales) / [`quant_biases`](Self::quant_biases) /
+/// All fields are PRIVATE — exposed via the [`weight_ref`](Self::weight_ref) /
+/// [`scales_ref`](Self::scales_ref) / [`quant_biases`](Self::quant_biases) /
 /// [`bias`](Self::bias) / [`group_size`](Self::group_size) /
 /// [`bits`](Self::bits) / [`mode`](Self::mode) read-only accessors — so the
 /// constructor's validation is the only construction path. A struct-literal
@@ -258,11 +259,11 @@ impl SwitchLinear {
 pub struct QuantizedSwitchLinear {
   /// Packed quantized weight stack (output of
   /// [`ops::quantized::quantize`](crate::ops::quantized::quantize) on a dense
-  /// `[E, O, I]` weight). PRIVATE — read via [`Self::weight`] — so the
+  /// `[E, O, I]` weight). PRIVATE — read via [`Self::weight_ref`] — so the
   /// constructor's rank-3 validation is the only construction path.
   weight: Array,
   /// Per-group scales (paired with `weight` — same `[E, O, n_groups]` layout
-  /// the dense `quantize` op produces). PRIVATE — read via [`Self::scales`] —
+  /// the dense `quantize` op produces). PRIVATE — read via [`Self::scales_ref`] —
   /// for symmetry with `weight`: the `(weight, scales, quant_biases)` triple
   /// is internally consistent only when produced together by
   /// [`ops::quantized::quantize`](crate::ops::quantized::quantize), and
@@ -271,7 +272,7 @@ pub struct QuantizedSwitchLinear {
   /// Per-group biases (the affine-mode addend; `None` for the bias-less float
   /// schemes `mxfp4`/`mxfp8`/`nvfp4`, mirroring `ops::quantized::quantize`'s
   /// `Option<Array>` return). PRIVATE — read via [`Self::quant_biases`] —
-  /// for the same triple-consistency reason as [`Self::scales`].
+  /// for the same triple-consistency reason as [`Self::scales_ref`].
   quant_biases: Option<Array>,
   /// Optional per-expert output bias `[E, O]`. Independent of
   /// `quant_biases`; this is the layer's `Linear.bias`, not the quantization
@@ -512,8 +513,9 @@ impl QuantizedSwitchLinear {
   ///
   /// The field is private specifically so the constructor's rank-3 shape
   /// validation is the only construction path; see the struct doc for the
-  /// invariant rationale. Lazy — does not evaluate.
-  pub fn weight(&self) -> &Array {
+  /// invariant rationale. Named `weight_ref` per §3 (non-Copy `&Array`
+  /// accessor). Lazy — does not evaluate.
+  pub fn weight_ref(&self) -> &Array {
     &self.weight
   }
 
@@ -522,8 +524,9 @@ impl QuantizedSwitchLinear {
   /// The field is private to preserve the `(weight, scales, quant_biases)`
   /// triple's internal consistency — they're only well-formed when produced
   /// together by [`ops::quantized::quantize`](crate::ops::quantized::quantize).
-  /// Lazy — does not evaluate.
-  pub fn scales(&self) -> &Array {
+  /// Named `scales_ref` per §3 (non-Copy `&Array` accessor). Lazy — does not
+  /// evaluate.
+  pub fn scales_ref(&self) -> &Array {
     &self.scales
   }
 
@@ -531,7 +534,7 @@ impl QuantizedSwitchLinear {
   /// (`None` for the bias-less float schemes `mxfp4`/`mxfp8`/`nvfp4`).
   ///
   /// The field is private for the same triple-consistency reason as
-  /// [`Self::scales`]. Lazy — does not evaluate.
+  /// [`Self::scales_ref`]. Lazy — does not evaluate.
   pub fn quant_biases(&self) -> Option<&Array> {
     self.quant_biases.as_ref()
   }
@@ -548,7 +551,7 @@ impl QuantizedSwitchLinear {
   }
 
   /// Read-only accessor for the quantization group size (must match what
-  /// produced [`Self::weight`] / [`Self::scales`]).
+  /// produced [`Self::weight_ref`] / [`Self::scales_ref`]).
   ///
   /// The field is private to preserve the scheme-consistency invariant
   /// (`group_size` / `bits` / `mode` must collectively match what produced
@@ -1720,8 +1723,8 @@ mod tests {
     let (w_q, scales, none_qb) = quant_mxfp4_triple();
     assert!(none_qb.is_none(), "mxfp4 quantize must yield None biases");
     let layer = QuantizedSwitchLinear::from_parts(w_q, scales, None, None, 32, 4, "mxfp4").unwrap();
-    assert_eq!(layer.weight().shape()[0], 2); // E=2
-    assert_eq!(layer.weight().shape()[1], 4); // O=4
+    assert_eq!(layer.weight_ref().shape()[0], 2); // E=2
+    assert_eq!(layer.weight_ref().shape()[1], 4); // O=4
     assert!(layer.quant_biases().is_none());
     assert_eq!(layer.mode(), "mxfp4");
   }
@@ -1742,7 +1745,7 @@ mod tests {
   #[test]
   fn switch_linear_fields_are_read_only_via_accessors() {
     let layer = SwitchLinear::from_parts(hand_traced_weight(), None).unwrap();
-    assert_eq!(layer.weight().shape(), vec![2, 3, 4]);
+    assert_eq!(layer.weight_ref().shape(), vec![2, 3, 4]);
     assert!(layer.bias().is_none());
 
     let bias = Array::from_slice::<f32>(
@@ -1751,7 +1754,7 @@ mod tests {
     )
     .unwrap();
     let layer_with_bias = SwitchLinear::from_parts(hand_traced_weight(), Some(bias)).unwrap();
-    assert_eq!(layer_with_bias.weight().shape(), vec![2, 3, 4]);
+    assert_eq!(layer_with_bias.weight_ref().shape(), vec![2, 3, 4]);
     assert_eq!(layer_with_bias.bias().unwrap().shape(), vec![2, 3]);
     // (compile-fail) external `layer.weight = ...` and `layer.bias = ...`
     // are both private-field errors; trying them here from inside `super::`
@@ -1782,9 +1785,9 @@ mod tests {
         .unwrap();
     // All accessors return the constructor-validated values; the field
     // privacy is what guarantees no other write path exists.
-    assert_eq!(q_layer.weight().shape()[0], 2); // E=2
-    assert_eq!(q_layer.weight().shape()[1], 4); // O=4
-    assert_eq!(q_layer.scales().shape()[0], 2); // E
+    assert_eq!(q_layer.weight_ref().shape()[0], 2); // E=2
+    assert_eq!(q_layer.weight_ref().shape()[1], 4); // O=4
+    assert_eq!(q_layer.scales_ref().shape()[0], 2); // E
     assert!(q_layer.quant_biases().is_some()); // affine ⇒ Some
     assert_eq!(q_layer.bias().unwrap().shape(), vec![2, 4]);
     assert_eq!(q_layer.group_size(), 64);
