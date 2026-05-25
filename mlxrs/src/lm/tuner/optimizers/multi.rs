@@ -102,19 +102,45 @@ impl Optimizer for MultiOptimizer {
     Ok(())
   }
 
-  fn apply_gradients(&mut self, gradients: &Weights, params: &mut Weights) -> Result<()> {
-    // ATOMICITY GUARANTEE (#244): preflight every child optimizer BEFORE
-    // mutating any params or child state. If any child would fail (e.g. a
-    // schedule that became non-finite at the current step), the whole
-    // `apply_gradients` call returns `Err` with no observable side effect —
-    // a retry after fixing the bad LR remains idempotent.
-    //
-    // preflight also resolves and CACHES the LR with a step stamp so a
-    // stateful schedule closure is called AT MOST ONCE per step — the
-    // subsequent apply_gradients reads from the cache, not the closure.
+  /// Recursive preflight: validates EVERY descendant optimizer (including
+  /// nested `MultiOptimizer` children) at the current step before any
+  /// param mutation. R10 finding (#244): without this override, an outer
+  /// `MultiOptimizer` would call the trait-default no-op for a nested
+  /// `MultiOptimizer` child, then commit earlier siblings before the
+  /// nested child's own internal preflight (inside its `apply_gradients`)
+  /// could reject. The override walks the tree so the atomicity gate
+  /// reaches every leaf.
+  fn preflight(&mut self) -> Result<()> {
     for optimizer in &mut self.optimizers {
       optimizer.preflight()?;
     }
+    Ok(())
+  }
+
+  fn apply_gradients(&mut self, gradients: &Weights, params: &mut Weights) -> Result<()> {
+    // LR-ATOMICITY GUARANTEE (#244): recursive preflight on every
+    // descendant BEFORE mutating any params or child state. Scope is
+    // **LR validation only**: if any descendant's schedule resolves to a
+    // non-finite value at the current step, the whole `apply_gradients`
+    // returns `Err` with no observable side effect — a retry after
+    // fixing the bad LR remains idempotent. The preflight also resolves
+    // and CACHES the LR with a step stamp so a stateful schedule closure
+    // is called AT MOST ONCE per step.
+    //
+    // **NOT atomic for non-LR apply failures** (R11 explicit scope cut):
+    // if a later child's `apply_gradients` fails for a non-LR reason
+    // (shape/dtype mismatch, FFI error, etc.) AFTER earlier children
+    // have already committed their param + state updates, the call
+    // returns `Err` but earlier children remain advanced. Wrapping the
+    // call in a full two-phase commit (stage every child's update into
+    // a side buffer, swap on all-success) would close this but pays a
+    // per-step state-clone cost; we defer that until a real workload
+    // demands it. Callers that need apply-failure atomicity should
+    // snapshot params + optimizer state before the call.
+    //
+    // Routes through `self.preflight()` so nested `MultiOptimizer`
+    // children get their own recursive preflight (R10 finding).
+    self.preflight()?;
     let grad_split = self.split_dictionary(gradients)?;
     // Apply each child in order. The preflight gate above ensures none of
     // these will fail on a runtime LR validation; per-step optimizer math

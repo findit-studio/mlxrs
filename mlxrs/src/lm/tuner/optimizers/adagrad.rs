@@ -63,7 +63,7 @@ impl Adagrad {
       eps,
       step_count: 0,
       current_lr,
-      lr_resolved_for_step: Some(0),
+      lr_resolved_for_step: None,
       state: HashMap::new(),
     })
   }

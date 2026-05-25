@@ -18,9 +18,10 @@
 //! either a `LearningRate::Fixed(f32)` (Python `float`) or a
 //! `LearningRate::Schedule(Box<dyn Fn(usize) -> f32>)` (Python
 //! `Callable[[step], float]`) — mirroring the Python `Union[float,
-//! Callable]` pattern. The optimizer queries the schedule on every
-//! [`Optimizer::apply_gradients`] call via [`LearningRate::try_current`],
-//! passing the optimizer's step counter.
+//! Callable]` pattern. The optimizer queries the schedule via
+//! [`LearningRate::try_current`] in [`Optimizer::preflight`], caching the
+//! result with a step stamp so the schedule closure is called at most ONCE
+//! per step (resolve-once guarantee, issue #244).
 
 use crate::{Array, Result, lm::load::Weights};
 
@@ -64,10 +65,10 @@ impl LearningRate {
   /// Resolve and validate the learning rate at `step`. Returns
   /// [`crate::error::Error::Backend`] when the resolved value is
   /// non-finite (NaN/Inf would scale updates into garbage). Optimizers
-  /// SHOULD call this from `new` to reject a `Fixed(NaN)` or a
-  /// `Schedule` whose step-0 value is non-finite, and from every
-  /// `apply_gradients` to also catch a schedule that goes non-finite
-  /// mid-run.
+  /// call this from `new` to reject a `Fixed(NaN)` or a `Schedule`
+  /// whose step-0 value is non-finite, and from `preflight` to catch a
+  /// schedule that goes non-finite mid-run (at most once per step via
+  /// the skip-if-fresh cache).
   pub fn try_current(&self, step: usize) -> Result<f32> {
     let v = self.current(step);
     if !v.is_finite() {
