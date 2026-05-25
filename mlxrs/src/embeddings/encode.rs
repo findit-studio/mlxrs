@@ -32,43 +32,51 @@ use super::{PoolingStrategy, model::EmbeddingModel, pool, pool_post};
 /// truncation on, special tokens added) composed with swift's
 /// `pooling(output, normalize: true)`: [`mean`](PoolingStrategy::Mean)
 /// pooling, L2-normalized output.
+///
+/// Build via [`EncodeConfig::new`] and chain `with_*` setters:
+///
+/// ```rust,ignore
+/// let cfg = EncodeConfig::new()
+///   .with_strategy(PoolingStrategy::Cls)
+///   .with_normalize(false);
+/// ```
 #[derive(Debug, Clone)]
 pub struct EncodeConfig {
   /// Pooling strategy applied to the model's `(batch, seq_len, hidden)`
   /// hidden states (the existing [`PoolingStrategy`] / [`pool`] dispatcher).
   /// Default [`PoolingStrategy::Mean`] (python `generate`'s `text_embeds` is
   /// "mean pooled and normalized"; swift container default).
-  pub strategy: PoolingStrategy,
+  strategy: PoolingStrategy,
   /// L2-normalize the pooled vectors (python `normalize_embeddings`, swift
   /// `pooling(_, normalize: true)`). Default `true`.
-  pub normalize: bool,
+  normalize: bool,
   /// Add the tokenizer's special tokens (BOS/EOS/sep) when encoding, as in
   /// python `processor(..., add_special_tokens=True)` (the transformers
   /// default) and swift `tokenizer.encode(text:, addSpecialTokens: true)`.
   /// Default `true`.
-  pub add_special_tokens: bool,
+  add_special_tokens: bool,
   /// Per-sequence hard token cap (python `truncation=True`,
   /// `max_length=512`): each text is right-truncated (keep the head, drop the
   /// tail) to at most this many ids *before* batch padding. `None` disables
   /// truncation. Default `Some(512)`.
-  pub max_length: Option<usize>,
+  max_length: Option<usize>,
   /// Token id written into padding positions. The attention mask is `0`
   /// there, so this value never reaches the pooled output — it exists only so
   /// the padded `(batch, seq_len)` id tensor is well-formed (swift pads with
   /// `0`). Default `0`.
-  pub pad_token_id: u32,
+  pad_token_id: u32,
   /// Optional matryoshka last-dim truncation forwarded to [`pool`] (swift
   /// `Pooling.dimension`). `None` keeps the model's full hidden width.
   /// Default `None`.
-  pub dimension: Option<usize>,
+  dimension: Option<usize>,
   /// Apply a fused LayerNorm to the pooled vector before truncation /
   /// normalization (swift `applyLayerNorm:`), forwarded to [`pool`]. Default
   /// `false`.
-  pub apply_layer_norm: bool,
+  apply_layer_norm: bool,
   /// Apply a fused RMSNorm to the pooled vector (mlx-c-surfaced variant;
   /// ignored if `apply_layer_norm` is also set), forwarded to [`pool`].
   /// Default `false`.
-  pub apply_rms_norm: bool,
+  apply_rms_norm: bool,
 }
 
 impl Default for EncodeConfig {
@@ -91,45 +99,99 @@ impl EncodeConfig {
   pub fn new() -> Self {
     Self::default()
   }
-  /// Set [`EncodeConfig::strategy`].
-  pub fn strategy(mut self, v: PoolingStrategy) -> Self {
+
+  // ── builders ──────────────────────────────────────────────────────────
+
+  /// Set the pooling [`strategy`](Self::strategy).
+  #[must_use]
+  pub fn with_strategy(mut self, v: PoolingStrategy) -> Self {
     self.strategy = v;
     self
   }
-  /// Set [`EncodeConfig::normalize`].
-  pub fn normalize(mut self, v: bool) -> Self {
+  /// Set the [`normalize`](Self::normalize) flag.
+  #[must_use]
+  pub fn with_normalize(mut self, v: bool) -> Self {
     self.normalize = v;
     self
   }
-  /// Set [`EncodeConfig::add_special_tokens`].
-  pub fn add_special_tokens(mut self, v: bool) -> Self {
+  /// Set the [`add_special_tokens`](Self::add_special_tokens) flag.
+  #[must_use]
+  pub fn with_add_special_tokens(mut self, v: bool) -> Self {
     self.add_special_tokens = v;
     self
   }
-  /// Set [`EncodeConfig::max_length`].
-  pub fn max_length(mut self, v: Option<usize>) -> Self {
+  /// Set the per-sequence [`max_length`](Self::max_length) cap.
+  #[must_use]
+  pub fn with_max_length(mut self, v: Option<usize>) -> Self {
     self.max_length = v;
     self
   }
-  /// Set [`EncodeConfig::pad_token_id`].
-  pub fn pad_token_id(mut self, v: u32) -> Self {
+  /// Set the [`pad_token_id`](Self::pad_token_id).
+  #[must_use]
+  pub fn with_pad_token_id(mut self, v: u32) -> Self {
     self.pad_token_id = v;
     self
   }
-  /// Set [`EncodeConfig::dimension`].
-  pub fn dimension(mut self, v: Option<usize>) -> Self {
+  /// Set the matryoshka [`dimension`](Self::dimension) truncation.
+  #[must_use]
+  pub fn with_dimension(mut self, v: Option<usize>) -> Self {
     self.dimension = v;
     self
   }
-  /// Set [`EncodeConfig::apply_layer_norm`].
-  pub fn apply_layer_norm(mut self, v: bool) -> Self {
+  /// Set the [`apply_layer_norm`](Self::apply_layer_norm) flag.
+  #[must_use]
+  pub fn with_apply_layer_norm(mut self, v: bool) -> Self {
     self.apply_layer_norm = v;
     self
   }
-  /// Set [`EncodeConfig::apply_rms_norm`].
-  pub fn apply_rms_norm(mut self, v: bool) -> Self {
+  /// Set the [`apply_rms_norm`](Self::apply_rms_norm) flag.
+  #[must_use]
+  pub fn with_apply_rms_norm(mut self, v: bool) -> Self {
     self.apply_rms_norm = v;
     self
+  }
+
+  // ── accessors ─────────────────────────────────────────────────────────
+
+  /// The pooling strategy.
+  #[inline(always)]
+  pub fn strategy(&self) -> PoolingStrategy {
+    self.strategy
+  }
+  /// Whether the pooled vectors are L2-normalized.
+  #[inline(always)]
+  pub fn normalize(&self) -> bool {
+    self.normalize
+  }
+  /// Whether special tokens are added when encoding.
+  #[inline(always)]
+  pub fn add_special_tokens(&self) -> bool {
+    self.add_special_tokens
+  }
+  /// Per-sequence token cap (truncation limit). `None` means no truncation.
+  #[inline(always)]
+  pub fn max_length(&self) -> Option<usize> {
+    self.max_length
+  }
+  /// Token id written into padding positions.
+  #[inline(always)]
+  pub fn pad_token_id(&self) -> u32 {
+    self.pad_token_id
+  }
+  /// Matryoshka output dimension cap. `None` keeps the model's full width.
+  #[inline(always)]
+  pub fn dimension(&self) -> Option<usize> {
+    self.dimension
+  }
+  /// Whether a fused LayerNorm is applied to the pooled vector.
+  #[inline(always)]
+  pub fn apply_layer_norm(&self) -> bool {
+    self.apply_layer_norm
+  }
+  /// Whether a fused RMSNorm is applied to the pooled vector.
+  #[inline(always)]
+  pub fn apply_rms_norm(&self) -> bool {
+    self.apply_rms_norm
   }
 }
 
@@ -313,8 +375,9 @@ pub fn encode(
   // pooling only when the model emits none. The other strategies always pool
   // hidden states. Either way the normalize / dimension / layer-norm tail is
   // applied identically (here via `pool_post`, the shared tail of `pool`).
+  let (last_hidden_state, pooled_output) = output.into_parts();
   if matches!(cfg.strategy, PoolingStrategy::Cls | PoolingStrategy::None)
-    && let Some(pooled) = output.pooled_output
+    && let Some(pooled) = pooled_output
   {
     // This path bypasses the hidden-state poolers' rank/mask guards
     // (`validate_token_embeddings_*` in `pooling.rs`), so validate the
@@ -350,7 +413,7 @@ pub fn encode(
     // embeddings of an unexpected dimension. This fast-path bypasses the
     // hidden-state poolers' rank-3 guard, so confirm `last_hidden_state` is
     // rank-3 before indexing its hidden axis (same panic→`Err` discipline).
-    let hidden_shape = output.last_hidden_state.shape();
+    let hidden_shape = last_hidden_state.shape();
     if hidden_shape.len() != 3 {
       return Err(Error::ShapeMismatch {
         message: format!(
@@ -380,7 +443,7 @@ pub fn encode(
   }
 
   pool(
-    &output.last_hidden_state,
+    &last_hidden_state,
     &attention_mask,
     cfg.strategy,
     cfg.normalize,
@@ -417,12 +480,14 @@ mod tests {
 
   impl EmbeddingModel for RawPooledModel {
     fn forward(&self, input_ids: &Array, attention_mask: &Array) -> Result<EmbeddingModelOutput> {
-      let mut out = self.inner.forward(input_ids, attention_mask)?;
-      out.pooled_output = Some(Array::from_slice::<f32>(
-        &self.pooled_data,
-        &self.pooled_shape.as_slice(),
-      )?);
-      Ok(out)
+      let out = self.inner.forward(input_ids, attention_mask)?;
+      let pooled = Array::from_slice::<f32>(&self.pooled_data, &self.pooled_shape.as_slice())?;
+      // Use `into_parts()` to move the inner `last_hidden_state` Array out
+      // (avoids the `try_clone()?` allocation that the borrowed-accessor
+      // path would otherwise require). Drops the inner `pooled_output`
+      // since this helper overrides it with `pooled`.
+      let (last_hidden_state, _) = out.into_parts();
+      Ok(EmbeddingModelOutput::new(last_hidden_state, Some(pooled)))
     }
   }
 
@@ -559,9 +624,9 @@ mod tests {
 
     // "a b c" -> 3 real tokens (pos0,1,2); "d e" -> 2 real (pos0,1) + 1 pad.
     let cfg = EncodeConfig::new()
-      .add_special_tokens(false)
-      .strategy(PoolingStrategy::Mean)
-      .normalize(true);
+      .with_add_special_tokens(false)
+      .with_strategy(PoolingStrategy::Mean)
+      .with_normalize(true);
     let mut emb = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap();
     assert_eq!(emb.shape(), vec![2, 2]);
     let v = emb.to_vec::<f32>().unwrap();
@@ -581,9 +646,9 @@ mod tests {
     let tok = word_tokenizer();
     let model = MockEmbeddingModel::new(vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]]);
     let cfg = EncodeConfig::new()
-      .add_special_tokens(false)
-      .strategy(PoolingStrategy::Mean)
-      .normalize(false);
+      .with_add_special_tokens(false)
+      .with_strategy(PoolingStrategy::Mean)
+      .with_normalize(false);
     let mut emb = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap();
     let v = emb.to_vec::<f32>().unwrap();
     // Row 0: [2/3, 2/3] ; Row 1: [0.5, 0.5] (pad position excluded).
@@ -597,9 +662,9 @@ mod tests {
     // pos0 distinctive so CLS (first real token) is identifiable.
     let model = MockEmbeddingModel::new(vec![vec![9.0, 3.0], vec![0.0, 1.0], vec![1.0, 1.0]]);
     let cfg = EncodeConfig::new()
-      .add_special_tokens(false)
-      .strategy(PoolingStrategy::Cls)
-      .normalize(false);
+      .with_add_special_tokens(false)
+      .with_strategy(PoolingStrategy::Cls)
+      .with_normalize(false);
     let mut emb = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap();
     assert_eq!(emb.shape(), vec![2, 2]);
     let v = emb.to_vec::<f32>().unwrap();
@@ -666,9 +731,9 @@ mod tests {
     let model_a = MockEmbeddingModel::new(canned.clone());
     let model_b = MockEmbeddingModel::new(canned);
     let cfg = EncodeConfig::new()
-      .add_special_tokens(false)
-      .strategy(PoolingStrategy::Mean)
-      .normalize(false);
+      .with_add_special_tokens(false)
+      .with_strategy(PoolingStrategy::Mean)
+      .with_normalize(false);
 
     let mut emb_unpadded = encode(&model_a, &word_tokenizer(), &["a b c", "d e"], &cfg).unwrap();
     let mut emb_padded =
@@ -696,9 +761,9 @@ mod tests {
     let model = MockEmbeddingModel::new(vec![vec![9.0, 3.0], vec![0.0, 1.0], vec![1.0, 1.0]])
       .with_pooled(vec![vec![7.0, 5.0], vec![6.0, 4.0]]);
     let cfg = EncodeConfig::new()
-      .add_special_tokens(false)
-      .strategy(PoolingStrategy::Cls)
-      .normalize(false);
+      .with_add_special_tokens(false)
+      .with_strategy(PoolingStrategy::Cls)
+      .with_normalize(false);
     let mut emb = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap();
     assert_eq!(emb.shape(), vec![2, 2]);
     let v = emb.to_vec::<f32>().unwrap();
@@ -722,9 +787,9 @@ mod tests {
     let model = MockEmbeddingModel::new(vec![vec![9.0, 3.0], vec![0.0, 1.0]])
       .with_pooled(vec![vec![3.0, 4.0]]);
     let cfg = EncodeConfig::new()
-      .add_special_tokens(false)
-      .strategy(PoolingStrategy::Cls)
-      .normalize(true);
+      .with_add_special_tokens(false)
+      .with_strategy(PoolingStrategy::Cls)
+      .with_normalize(true);
     let mut emb = encode(&model, &tok, &["a b", "a b"], &cfg).unwrap();
     let v = emb.to_vec::<f32>().unwrap();
     // Both batch items reuse the single pooler row [3,4]; ‖[3,4]‖ = 5.
@@ -740,9 +805,9 @@ mod tests {
     let model = MockEmbeddingModel::new(vec![vec![9.0, 3.0], vec![0.0, 1.0], vec![1.0, 1.0]]);
     assert!(model.pooled.is_none());
     let cfg = EncodeConfig::new()
-      .add_special_tokens(false)
-      .strategy(PoolingStrategy::Cls)
-      .normalize(false);
+      .with_add_special_tokens(false)
+      .with_strategy(PoolingStrategy::Cls)
+      .with_normalize(false);
     let mut emb = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap();
     let v = emb.to_vec::<f32>().unwrap();
     // Hidden-states CLS = first real token = pos0 = [9, 3] for both rows.
@@ -772,9 +837,9 @@ mod tests {
     // Squeezed rank-1 [hidden] pooler instead of (batch, hidden).
     let model = raw_pooled_model(vec![7.0, 5.0], vec![2]);
     let cfg = EncodeConfig::new()
-      .add_special_tokens(false)
-      .strategy(PoolingStrategy::Cls)
-      .normalize(false);
+      .with_add_special_tokens(false)
+      .with_strategy(PoolingStrategy::Cls)
+      .with_normalize(false);
     let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
     assert!(
       matches!(err, Error::ShapeMismatch { .. }),
@@ -788,9 +853,9 @@ mod tests {
     let tok = word_tokenizer();
     let model = raw_pooled_model(vec![7.0, 5.0], vec![2]);
     let cfg = EncodeConfig::new()
-      .add_special_tokens(false)
-      .strategy(PoolingStrategy::None)
-      .normalize(false);
+      .with_add_special_tokens(false)
+      .with_strategy(PoolingStrategy::None)
+      .with_normalize(false);
     let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
     assert!(
       matches!(err, Error::ShapeMismatch { .. }),
@@ -807,9 +872,9 @@ mod tests {
     // (1, hidden) pooler for a 2-text batch.
     let model = raw_pooled_model(vec![7.0, 5.0], vec![1, 2]);
     let cfg = EncodeConfig::new()
-      .add_special_tokens(false)
-      .strategy(PoolingStrategy::Cls)
-      .normalize(false);
+      .with_add_special_tokens(false)
+      .with_strategy(PoolingStrategy::Cls)
+      .with_normalize(false);
     let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
     assert!(
       matches!(err, Error::ShapeMismatch { .. }),
@@ -823,9 +888,9 @@ mod tests {
     let tok = word_tokenizer();
     let model = raw_pooled_model(vec![7.0, 5.0], vec![1, 2]);
     let cfg = EncodeConfig::new()
-      .add_special_tokens(false)
-      .strategy(PoolingStrategy::None)
-      .normalize(false);
+      .with_add_special_tokens(false)
+      .with_strategy(PoolingStrategy::None)
+      .with_normalize(false);
     let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
     assert!(
       matches!(err, Error::ShapeMismatch { .. }),
@@ -845,9 +910,9 @@ mod tests {
     // (batch=2, hidden=3) pooler, but the model's hidden dim is 2.
     let model = raw_pooled_model(vec![7.0, 5.0, 1.0, 6.0, 4.0, 2.0], vec![2, 3]);
     let cfg = EncodeConfig::new()
-      .add_special_tokens(false)
-      .strategy(PoolingStrategy::Cls)
-      .normalize(false);
+      .with_add_special_tokens(false)
+      .with_strategy(PoolingStrategy::Cls)
+      .with_normalize(false);
     let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
     assert!(
       matches!(err, Error::ShapeMismatch { .. }),
@@ -862,9 +927,9 @@ mod tests {
     let tok = word_tokenizer();
     let model = raw_pooled_model(vec![7.0, 5.0, 1.0, 6.0, 4.0, 2.0], vec![2, 3]);
     let cfg = EncodeConfig::new()
-      .add_special_tokens(false)
-      .strategy(PoolingStrategy::None)
-      .normalize(false);
+      .with_add_special_tokens(false)
+      .with_strategy(PoolingStrategy::None)
+      .with_normalize(false);
     let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
     assert!(
       matches!(err, Error::ShapeMismatch { .. }),
@@ -880,9 +945,9 @@ mod tests {
     let tok = word_tokenizer();
     let model = raw_pooled_model(vec![7.0, 5.0, 6.0, 4.0], vec![2, 2]);
     let cfg = EncodeConfig::new()
-      .add_special_tokens(false)
-      .strategy(PoolingStrategy::Cls)
-      .normalize(false);
+      .with_add_special_tokens(false)
+      .with_strategy(PoolingStrategy::Cls)
+      .with_normalize(false);
     let mut emb = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap();
     assert_eq!(emb.shape(), vec![2, 2]);
     let v = emb.to_vec::<f32>().unwrap();

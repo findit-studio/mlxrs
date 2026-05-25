@@ -68,7 +68,7 @@ impl EmbeddingModel for MockEmbedding {
 fn mock_constructor() -> EmbeddingModelConstructor {
   Box::new(
     |loaded: &LoadedEmbeddingModel| -> Result<Box<dyn EmbeddingModel>, Error> {
-      assert!(!loaded.weights.is_empty());
+      assert!(!loaded.weights_ref().is_empty());
       Ok(Box::new(MockEmbedding))
     },
   )
@@ -123,7 +123,7 @@ fn load_produces_context_via_public_surface() {
   let ids = Array::from_slice::<i32>(&[0, 1, 2], &(1usize, 3)).unwrap();
   let mask = Array::from_slice::<f32>(&[1.0, 1.0, 1.0], &(1usize, 3)).unwrap();
   let out = ctx.model.forward(&ids, &mask).unwrap();
-  assert_eq!(out.last_hidden_state.shape(), vec![1, 3, 4]);
+  assert_eq!(out.last_hidden_state().shape(), vec![1, 3, 4]);
 
   let tok_ids = ctx.tokenizer.encode("a b c", false).unwrap();
   assert_eq!(tok_ids.len(), 3);
@@ -148,8 +148,8 @@ fn load_parses_pooling_config_when_present() {
   )
   .unwrap();
   let pooling = ctx.pooling.expect("pooling config parsed");
-  assert_eq!(pooling.strategy, PoolingStrategy::Cls);
-  assert_eq!(pooling.dimension, Some(4));
+  assert_eq!(pooling.strategy(), PoolingStrategy::Cls);
+  assert_eq!(pooling.dimension(), Some(4));
 }
 
 #[test]
@@ -583,7 +583,7 @@ fn capturing_constructor(
 ) -> EmbeddingModelConstructor {
   Box::new(
     move |loaded: &LoadedEmbeddingModel| -> Result<Box<dyn EmbeddingModel>, Error> {
-      let mut keys: Vec<String> = loaded.weights.keys().cloned().collect();
+      let mut keys: Vec<String> = loaded.weights_ref().keys().cloned().collect();
       keys.sort();
       *slot.lock().unwrap() = keys;
       Ok(Box::new(MockEmbedding))

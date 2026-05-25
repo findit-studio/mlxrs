@@ -46,21 +46,48 @@ use crate::{array::Array, error::Result};
 pub struct EmbeddingModelOutput {
   /// Per-token hidden states, `(batch, seq_len, hidden)`. Fed to the pooling
   /// stage. Python `last_hidden_state`, swift `hiddenStates`.
-  pub last_hidden_state: Array,
+  last_hidden_state: Array,
   /// Optional model-provided pooled vector, `(batch, hidden)`. Python
   /// `pooler_output`, swift `pooledOutput`. `None` for models that do not
   /// emit a dedicated pooler head.
-  pub pooled_output: Option<Array>,
+  pooled_output: Option<Array>,
 }
 
 impl EmbeddingModelOutput {
+  /// Construct an [`EmbeddingModelOutput`] from its two components.
+  pub fn new(last_hidden_state: Array, pooled_output: Option<Array>) -> Self {
+    Self {
+      last_hidden_state,
+      pooled_output,
+    }
+  }
+
   /// Construct an output carrying only hidden states (no model-provided
   /// pooler head) — the common case for encoders pooled externally.
   pub fn from_hidden_state(last_hidden_state: Array) -> Self {
-    Self {
-      last_hidden_state,
-      pooled_output: None,
-    }
+    Self::new(last_hidden_state, None)
+  }
+
+  /// The per-token hidden states, `(batch, seq_len, hidden)`.
+  #[inline(always)]
+  pub fn last_hidden_state(&self) -> &Array {
+    &self.last_hidden_state
+  }
+
+  /// The optional model-provided pooled vector, `(batch, hidden)`.
+  #[inline(always)]
+  pub fn pooled_output(&self) -> Option<&Array> {
+    self.pooled_output.as_ref()
+  }
+
+  /// Decompose into `(last_hidden_state, pooled_output)` by value.
+  ///
+  /// Allows callers to consume both arrays without cloning — the encode
+  /// pipeline needs to move `pooled_output` into the post-pooling tail while
+  /// retaining a reference to `last_hidden_state`'s shape for validation.
+  #[inline(always)]
+  pub fn into_parts(self) -> (Array, Option<Array>) {
+    (self.last_hidden_state, self.pooled_output)
   }
 }
 
@@ -217,10 +244,7 @@ impl EmbeddingModel for MockEmbeddingModel {
       }
     };
 
-    Ok(EmbeddingModelOutput {
-      last_hidden_state,
-      pooled_output,
-    })
+    Ok(EmbeddingModelOutput::new(last_hidden_state, pooled_output))
   }
 }
 
@@ -234,11 +258,12 @@ mod tests {
     // batch 2, seq 2 -> hidden rows canned[0], canned[1] per batch item.
     let ids = Array::from_slice::<i32>(&[7, 8, 9, 10], &(2, 2)).unwrap();
     let mask = Array::from_slice::<f32>(&[1.0, 1.0, 1.0, 1.0], &(2, 2)).unwrap();
-    let mut out = model.forward(&ids, &mask).unwrap();
-    assert_eq!(out.last_hidden_state.shape(), vec![2, 2, 2]);
-    assert!(out.pooled_output.is_none());
+    let out = model.forward(&ids, &mask).unwrap();
+    assert_eq!(out.last_hidden_state().shape(), vec![2, 2, 2]);
+    assert!(out.pooled_output().is_none());
+    let (mut lhs, _) = out.into_parts();
     assert_eq!(
-      out.last_hidden_state.to_vec::<f32>().unwrap(),
+      lhs.to_vec::<f32>().unwrap(),
       // batch 0: [1,2],[3,4]   batch 1: [1,2],[3,4]
       vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]
     );

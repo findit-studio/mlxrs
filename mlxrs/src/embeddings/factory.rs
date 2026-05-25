@@ -128,7 +128,7 @@ pub fn remap_model_type(model_type: &str) -> String {
 /// `model_path.exists()`); the `snapshot_download` Hub fetch is out of scope.
 /// So both variants resolve to a [`Path`] without any I/O beyond the later
 /// directory read in [`load()`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, derive_more::IsVariant)]
 pub enum EmbeddingIdentifier {
   /// A model identifier (`org/name`) treated as a **local path** (no Hub
   /// download). mlx-swift-lm's `.id(String, revision:)`, restricted to the
@@ -163,15 +163,36 @@ impl EmbeddingIdentifier {
 pub struct EmbeddingModelConfiguration {
   /// The model's location ([`EmbeddingIdentifier::Directory`] or an
   /// [`EmbeddingIdentifier::Id`] treated as a local path).
-  pub id: EmbeddingIdentifier,
+  id: EmbeddingIdentifier,
   /// An optional **separate local directory** for the tokenizer
   /// (mlx-swift-lm's `tokenizerSource`). `None` ⇒ load the tokenizer from the
   /// model directory (the common case). Like [`EmbeddingIdentifier`] this is
   /// local-only — no Hub download.
-  pub tokenizer_source: Option<PathBuf>,
+  tokenizer_source: Option<PathBuf>,
 }
 
 impl EmbeddingModelConfiguration {
+  /// Construct from an [`EmbeddingIdentifier`] and an optional separate
+  /// tokenizer source directory.
+  pub fn new(id: EmbeddingIdentifier, tokenizer_source: Option<PathBuf>) -> Self {
+    Self {
+      id,
+      tokenizer_source,
+    }
+  }
+
+  /// The model identifier.
+  #[inline(always)]
+  pub fn id(&self) -> &EmbeddingIdentifier {
+    &self.id
+  }
+
+  /// The optional separate tokenizer source directory.
+  #[inline(always)]
+  pub fn tokenizer_source(&self) -> Option<&Path> {
+    self.tokenizer_source.as_deref()
+  }
+
   /// A configuration for a model in a local `directory` (tokenizer loaded
   /// from the same directory). mlx-swift-lm's
   /// `ModelConfiguration(directory:)`.
@@ -208,7 +229,7 @@ impl EmbeddingModelConfiguration {
   }
 
   /// The resolved local tokenizer directory:
-  /// [`tokenizer_source`](Self::tokenizer_source) if set, else the model
+  /// [`tokenizer_source()`](Self::tokenizer_source) if set, else the model
   /// directory (mlx-swift-lm's `tokenizerDirectory` fallback).
   pub fn tokenizer_directory(&self) -> &Path {
     match &self.tokenizer_source {
@@ -236,27 +257,56 @@ pub type EmbeddingWeights = HashMap<String, Array>;
 ///
 /// The embeddings twin of [`crate::lm::factory::LoadedModel`]. Borrowing — the
 /// constructor gets `&LoadedEmbeddingModel`; it reads the
-/// [`model_type`](Self::model_type), the verbatim
-/// [`config_json`](Self::config_json) (the analogue of mlx-swift-lm passing the
+/// [`model_type()`](Self::model_type), the verbatim
+/// [`config_json()`](Self::config_json) (the analogue of mlx-swift-lm passing the
 /// raw `config.json` `Data` to each model's `Decodable` init), and takes the
-/// weight [`Array`]s it needs out of [`weights`](Self::weights) **by
+/// weight [`Array`]s it needs out of [`weights_ref()`](Self::weights_ref) **by
 /// reference** (no implicit eval; mlx `Array` is a cheap refcounted handle).
 #[non_exhaustive]
 pub struct LoadedEmbeddingModel {
   /// The checkpoint's canonicalized architecture id (`config.json`
   /// `model_type`, after [`remap_model_type`]). The registry key the
   /// constructor was looked up under.
-  pub model_type: String,
+  model_type: String,
   /// The verbatim `config.json` body, for the architecture's
   /// `Decodable`-style init (mlx-swift-lm hands each `EmbeddingModel`'s
   /// initializer the raw config `Data`). Always the exact bytes
-  /// [`model_type`](Self::model_type) was extracted from.
-  pub config_json: String,
+  /// [`model_type()`](Self::model_type) was extracted from.
+  config_json: String,
   /// The merged, name → [`Array`] weight map (mlx-embeddings' `weights`
   /// dict). Nested-component shards carry the `<folder>.` prefix (see
   /// [`load()`]'s weight discovery); root shards are verbatim. The constructor
   /// applies any further `sanitize`/remap itself.
-  pub weights: EmbeddingWeights,
+  weights: EmbeddingWeights,
+}
+
+impl LoadedEmbeddingModel {
+  /// Construct a [`LoadedEmbeddingModel`] from its three components.
+  pub fn new(model_type: String, config_json: String, weights: EmbeddingWeights) -> Self {
+    Self {
+      model_type,
+      config_json,
+      weights,
+    }
+  }
+
+  /// The checkpoint's canonicalized architecture id.
+  #[inline(always)]
+  pub fn model_type(&self) -> &str {
+    &self.model_type
+  }
+
+  /// The verbatim `config.json` body.
+  #[inline(always)]
+  pub fn config_json(&self) -> &str {
+    &self.config_json
+  }
+
+  /// The merged weight map.
+  #[inline(always)]
+  pub fn weights_ref(&self) -> &EmbeddingWeights {
+    &self.weights
+  }
 }
 
 /// A registered embedding-model constructor: assemble an [`EmbeddingModel`]
@@ -330,7 +380,7 @@ impl EmbeddingModelTypeRegistry {
   }
 
   /// Construct an [`EmbeddingModel`] for `loaded`'s
-  /// [`model_type`](LoadedEmbeddingModel::model_type), mirroring mlx-swift-lm's
+  /// [`model_type()`](LoadedEmbeddingModel::model_type), mirroring mlx-swift-lm's
   /// `createModel(configuration:modelType:)`. `loaded.model_type` is already
   /// canonicalized (see [`load()`]); an unregistered id is a recoverable
   /// [`Error::Backend`] (mlx-swift-lm's `unsupportedModelType`, mlx-embeddings'
@@ -500,11 +550,7 @@ pub fn load(
   })?;
 
   // (7) Construct via the registry (already validated as registered in step 2).
-  let loaded = LoadedEmbeddingModel {
-    model_type,
-    config_json,
-    weights,
-  };
+  let loaded = LoadedEmbeddingModel::new(model_type, config_json, weights);
   let model = registry.create(&loaded)?;
 
   Ok(LoadedEmbeddingContext {
@@ -1955,7 +2001,7 @@ mod tests {
     let ids = Array::from_slice::<i32>(&[0, 1, 2], &(1usize, 3)).unwrap();
     let mask = Array::from_slice::<f32>(&[1.0, 1.0, 1.0], &(1usize, 3)).unwrap();
     let out = ctx.model.forward(&ids, &mask).unwrap();
-    assert_eq!(out.last_hidden_state.shape(), vec![1, 3, 4]);
+    assert_eq!(out.last_hidden_state().shape(), vec![1, 3, 4]);
 
     // The tokenizer loaded from the same directory.
     let tok_ids = ctx.tokenizer.encode("a b c", false).unwrap();
@@ -1986,8 +2032,8 @@ mod tests {
 
     let ctx = load(&config, &registry).expect("load with pooling config");
     let pooling = ctx.pooling.expect("pooling config should be parsed");
-    assert_eq!(pooling.strategy, crate::embeddings::PoolingStrategy::Mean);
-    assert_eq!(pooling.dimension, Some(4));
+    assert_eq!(pooling.strategy(), crate::embeddings::PoolingStrategy::Mean);
+    assert_eq!(pooling.dimension(), Some(4));
   }
 
   #[test]

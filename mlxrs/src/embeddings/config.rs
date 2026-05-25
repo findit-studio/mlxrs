@@ -82,15 +82,44 @@ const LEGACY_KEYS: &[(&str, &str)] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StPoolingConfig {
   /// Resolved pooling strategy.
-  pub strategy: PoolingStrategy,
+  strategy: PoolingStrategy,
   /// Whether the embeddings should be L2-normalized after pooling. ST
   /// configs don't carry a normalize flag, so this is always `true`
   /// (the `mlx-embeddings` / `MLXEmbedders` convention is to normalize),
   /// surfaced explicitly so the caller can override.
-  pub normalize: bool,
+  normalize: bool,
   /// Matryoshka output dimension (`word_embedding_dimension`), if the
   /// config declares one.
-  pub dimension: Option<usize>,
+  dimension: Option<usize>,
+}
+
+impl StPoolingConfig {
+  /// Construct a [`StPoolingConfig`] from its three components.
+  pub fn new(strategy: PoolingStrategy, normalize: bool, dimension: Option<usize>) -> Self {
+    Self {
+      strategy,
+      normalize,
+      dimension,
+    }
+  }
+
+  /// The resolved pooling strategy.
+  #[inline(always)]
+  pub fn strategy(&self) -> PoolingStrategy {
+    self.strategy
+  }
+
+  /// Whether the embeddings should be L2-normalized after pooling.
+  #[inline(always)]
+  pub fn normalize(&self) -> bool {
+    self.normalize
+  }
+
+  /// Matryoshka output dimension, if the config declares one.
+  #[inline(always)]
+  pub fn dimension(&self) -> Option<usize> {
+    self.dimension
+  }
 }
 
 // ───────────────── hand-rolled strict-JSON scanner ────────────────────
@@ -1160,11 +1189,7 @@ fn parse_pairs(cfg: &[(SmolStr, JVal<'_>)]) -> Result<StPoolingConfig> {
     }
   };
 
-  Ok(StPoolingConfig {
-    strategy,
-    normalize: true,
-    dimension,
-  })
+  Ok(StPoolingConfig::new(strategy, true, dimension))
 }
 
 /// Parse a `1_Pooling/config.json` from an in-memory JSON string.
@@ -1356,7 +1381,7 @@ mod tests {
     let json =
       r#"{"pooling_mode_mean_tokens": true, "future_field": 42, "nested": {"x": [1, 2, 3]}}"#;
     let cfg = pooling_from_st_config_str(json).unwrap();
-    assert_eq!(cfg.strategy, super::PoolingStrategy::Mean);
+    assert_eq!(cfg.strategy(), super::PoolingStrategy::Mean);
   }
 
   #[test]
@@ -1516,7 +1541,7 @@ mod tests {
     // and skipped without error.
     let json = r#"{"pooling_mode_mean_tokens": true, "future_field": {"a": [{"b": [1,2,3]}]}}"#;
     let cfg = pooling_from_st_config_str(json).unwrap();
-    assert_eq!(cfg.strategy, super::PoolingStrategy::Mean);
+    assert_eq!(cfg.strategy(), super::PoolingStrategy::Mean);
   }
 
   #[test]
@@ -1542,6 +1567,6 @@ mod tests {
     }
     json.push('}');
     let cfg = pooling_from_st_config_str(&json).unwrap();
-    assert_eq!(cfg.strategy, super::PoolingStrategy::Mean);
+    assert_eq!(cfg.strategy(), super::PoolingStrategy::Mean);
   }
 }

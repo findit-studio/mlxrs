@@ -284,7 +284,8 @@ pub fn first_token_pooling(token_embeddings: &Array) -> Result<Array> {
 /// Mirrors swift `MLXEmbedders` `Pooling.Strategy` and python
 /// `mlx-embeddings` `pool_by_config` modes (`cls`/`mean`/`max`/
 /// `lasttoken`), unified into one enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
+#[display("{}", self.as_str())]
 pub enum PoolingStrategy {
   /// Mask-aware mean ([`mean_pooling`]); swift `.mean`, python `"mean"`.
   Mean,
@@ -319,6 +320,21 @@ pub enum PoolingStrategy {
 }
 
 impl PoolingStrategy {
+  /// The lowercase canonical string name for this strategy, matching the
+  /// python `pool_by_config` mode strings and swift `Pooling.Strategy`
+  /// display names: `"mean"` / `"cls"` / `"first"` / `"last"` / `"max"` /
+  /// `"none"`.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Mean => "mean",
+      Self::Cls => "cls",
+      Self::First => "first",
+      Self::Last => "last",
+      Self::Max => "max",
+      Self::None => "none",
+    }
+  }
+
   /// Parse a `sentence-transformers` / python `pool_by_config` mode
   /// string. Accepts `"cls"`, `"mean"`, `"max"`, `"lasttoken"` (python
   /// `_SUPPORTED_POOL_MODES`), plus `"first"` and `"none"` (swift

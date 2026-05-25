@@ -473,9 +473,9 @@ fn dispatcher_layer_norm_wins_over_rms_when_both_set() {
 #[test]
 fn st_config_modern_pooling_mode_key() {
   let cfg = pooling_from_st_config_str(r#"{"pooling_mode": "mean"}"#).unwrap();
-  assert_eq!(cfg.strategy, PoolingStrategy::Mean);
-  assert!(cfg.normalize);
-  assert_eq!(cfg.dimension, None);
+  assert_eq!(cfg.strategy(), PoolingStrategy::Mean);
+  assert!(cfg.normalize());
+  assert_eq!(cfg.dimension(), None);
 }
 
 #[test]
@@ -484,8 +484,8 @@ fn st_config_word_embedding_dimension_is_matryoshka_dim() {
     r#"{"word_embedding_dimension": 384, "pooling_mode_cls_token": true}"#,
   )
   .unwrap();
-  assert_eq!(cfg.strategy, PoolingStrategy::Cls);
-  assert_eq!(cfg.dimension, Some(384));
+  assert_eq!(cfg.strategy(), PoolingStrategy::Cls);
+  assert_eq!(cfg.dimension(), Some(384));
 }
 
 #[test]
@@ -502,8 +502,8 @@ fn st_config_legacy_mean_only() {
     "include_prompt": true
   }"#;
   let cfg = pooling_from_st_config_bytes(json.as_bytes()).unwrap();
-  assert_eq!(cfg.strategy, PoolingStrategy::Mean);
-  assert_eq!(cfg.dimension, Some(384));
+  assert_eq!(cfg.strategy(), PoolingStrategy::Mean);
+  assert_eq!(cfg.dimension(), Some(384));
 }
 
 #[test]
@@ -519,7 +519,7 @@ fn st_config_legacy_priority_cls_over_mean_over_max_over_last() {
     "pooling_mode_lasttoken": true
   }"#;
   assert_eq!(
-    pooling_from_st_config_str(all_true).unwrap().strategy,
+    pooling_from_st_config_str(all_true).unwrap().strategy(),
     PoolingStrategy::Cls
   );
 
@@ -530,7 +530,9 @@ fn st_config_legacy_priority_cls_over_mean_over_max_over_last() {
     "pooling_mode_lasttoken": true
   }"#;
   assert_eq!(
-    pooling_from_st_config_str(mean_max_last).unwrap().strategy,
+    pooling_from_st_config_str(mean_max_last)
+      .unwrap()
+      .strategy(),
     PoolingStrategy::Mean
   );
 
@@ -539,13 +541,13 @@ fn st_config_legacy_priority_cls_over_mean_over_max_over_last() {
     "pooling_mode_lasttoken": true
   }"#;
   assert_eq!(
-    pooling_from_st_config_str(max_last).unwrap().strategy,
+    pooling_from_st_config_str(max_last).unwrap().strategy(),
     PoolingStrategy::Max
   );
 
   let last_only = r#"{"pooling_mode_lasttoken": true}"#;
   assert_eq!(
-    pooling_from_st_config_str(last_only).unwrap().strategy,
+    pooling_from_st_config_str(last_only).unwrap().strategy(),
     PoolingStrategy::Last
   );
 }
@@ -560,7 +562,7 @@ fn st_config_legacy_all_false_defaults_to_mean() {
     "pooling_mode_lasttoken": false
   }"#;
   assert_eq!(
-    pooling_from_st_config_str(json).unwrap().strategy,
+    pooling_from_st_config_str(json).unwrap().strategy(),
     PoolingStrategy::Mean
   );
 }
@@ -698,13 +700,13 @@ fn st_config_present_invalid_dimension_rejected() {
   assert_eq!(
     pooling_from_st_config_str(r#"{"pooling_mode": "mean"}"#)
       .unwrap()
-      .dimension,
+      .dimension(),
     None
   );
   assert_eq!(
     pooling_from_st_config_str(r#"{"pooling_mode": "mean", "word_embedding_dimension": 256}"#)
       .unwrap()
-      .dimension,
+      .dimension(),
     Some(256)
   );
 }
@@ -716,13 +718,13 @@ fn st_config_end_to_end_drives_dispatcher() {
     r#"{"pooling_mode_max_tokens": true, "word_embedding_dimension": 1}"#,
   )
   .unwrap();
-  assert_eq!(cfg.strategy, PoolingStrategy::Max);
+  assert_eq!(cfg.strategy(), PoolingStrategy::Max);
   let mut p = pool(
     &emb,
     &mask,
-    cfg.strategy,
-    cfg.normalize,
-    cfg.dimension,
+    cfg.strategy(),
+    cfg.normalize(),
+    cfg.dimension(),
     false,
     false,
   )
@@ -842,11 +844,11 @@ fn st_config_resolved_cls_drives_mask_aware_dispatcher() {
   ] {
     let cfg = pooling_from_st_config_str(json).unwrap();
     assert_eq!(
-      cfg.strategy,
+      cfg.strategy(),
       PoolingStrategy::Cls,
       "ST CLS key must map to Cls (mask-aware), not First: {json}"
     );
-    let mut p = pool(&emb, &mask, cfg.strategy, false, None, false, false).unwrap();
+    let mut p = pool(&emb, &mask, cfg.strategy(), false, None, false, false).unwrap();
     assert!(
       vclose(&p.to_vec::<f32>().unwrap(), &[3.0, 3.0, 200.0, 200.0]),
       "ST-config CLS must select first real token (py cls_pooling): {json}"
@@ -922,7 +924,7 @@ fn st_config_path_rejects_oversize_file_without_oom() {
   // A small valid config in the same layout still parses fine.
   std::fs::write(&path, r#"{"pooling_mode": "cls"}"#).unwrap();
   let cfg = pooling_from_st_config_path(&dir).unwrap();
-  assert_eq!(cfg.strategy, PoolingStrategy::Cls);
+  assert_eq!(cfg.strategy(), PoolingStrategy::Cls);
 
   std::fs::remove_dir_all(&dir).ok();
 }
@@ -962,7 +964,7 @@ fn st_config_path_rejects_non_regular_file_without_hang() {
   std::fs::remove_dir_all(&cfg_as_dir).unwrap();
   std::fs::write(&cfg_as_dir, r#"{"pooling_mode": "max"}"#).unwrap();
   let cfg = pooling_from_st_config_path(&dir).unwrap();
-  assert_eq!(cfg.strategy, PoolingStrategy::Max);
+  assert_eq!(cfg.strategy(), PoolingStrategy::Max);
 
   std::fs::remove_dir_all(&dir).ok();
 }
@@ -996,7 +998,7 @@ fn st_config_path_accepts_file_at_exact_cap() {
   std::fs::write(&path, &blob).unwrap();
 
   let cfg = pooling_from_st_config_path(&dir).unwrap();
-  assert_eq!(cfg.strategy, PoolingStrategy::Mean);
+  assert_eq!(cfg.strategy(), PoolingStrategy::Mean);
 
   std::fs::remove_dir_all(&dir).ok();
 }
@@ -1079,7 +1081,7 @@ fn st_config_path_fifo_returns_err_without_hang() {
   std::fs::remove_file(&path).unwrap();
   std::fs::write(&path, r#"{"pooling_mode": "last"}"#).unwrap();
   let cfg = pooling_from_st_config_path(&dir).unwrap();
-  assert_eq!(cfg.strategy, PoolingStrategy::Last);
+  assert_eq!(cfg.strategy(), PoolingStrategy::Last);
 
   std::fs::remove_dir_all(&dir).ok();
 }
@@ -1131,9 +1133,9 @@ fn st_config_path_follows_symlink_to_regular_file() {
     "HF-cache symlink → regular config.json must be followed and parsed, \
      not rejected (O_NOFOLLOW regressed)",
   );
-  assert_eq!(cfg.strategy, PoolingStrategy::Cls);
-  assert!(cfg.normalize);
-  assert_eq!(cfg.dimension, Some(384));
+  assert_eq!(cfg.strategy(), PoolingStrategy::Cls);
+  assert!(cfg.normalize());
+  assert_eq!(cfg.dimension(), Some(384));
 
   std::fs::remove_dir_all(&dir).ok();
 }
