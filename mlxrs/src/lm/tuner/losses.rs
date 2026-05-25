@@ -1051,15 +1051,13 @@ fn kl_forward_apply(logits_q: &Array, logits_p: &Array) -> Result<Array> {
   let n_outs = n_outs_of(logits_q)?;
   let out_shape = leading_shape_i32(logits_q)?;
 
-  let cfg = MetalKernelApplyConfig {
-    template: template_for(dtype, vocab),
-    ..MetalKernelApplyConfig::new(
-      /* grid */ (1024, n_outs, 1),
-      /* thread_group */ (1024, 1, 1),
-      /* output_shapes */ vec![out_shape],
-      /* output_dtypes */ vec![dtype],
-    )
-  };
+  let cfg = MetalKernelApplyConfig::new(
+    /* grid */ [1024, n_outs as u32, 1],
+    /* thread_group */ [1024, 1, 1],
+    /* output_shapes */ vec![out_shape],
+    /* output_dtypes */ vec![dtype],
+  )
+  .with_template(template_for(dtype, vocab));
 
   with_kernel(&KL_FORWARD, build_kl_forward_kernel, |kernel| {
     let mut outputs = kernel.apply(&[logits_q, logits_p], &cfg)?;
@@ -1093,15 +1091,13 @@ fn kl_backward_apply(logits_q: &Array, logits_p: &Array, cotangent: &Array) -> R
   })?;
   let out_shape = full_shape_i32(logits_q)?;
 
-  let cfg = MetalKernelApplyConfig {
-    template: template_for(dtype, vocab),
-    ..MetalKernelApplyConfig::new(
-      (1024, cot_size, 1),
-      (1024, 1, 1),
-      vec![out_shape],
-      vec![dtype],
-    )
-  };
+  let cfg = MetalKernelApplyConfig::new(
+    [1024, cot_size as u32, 1],
+    [1024, 1, 1],
+    vec![out_shape],
+    vec![dtype],
+  )
+  .with_template(template_for(dtype, vocab));
 
   with_kernel(&KL_BACKWARD, build_kl_backward_kernel, |kernel| {
     let mut outputs = kernel.apply(&[logits_q, logits_p, cotangent], &cfg)?;
@@ -1123,15 +1119,13 @@ fn js_forward_apply(logits_q: &Array, logits_p: &Array) -> Result<(Array, Array)
   let n_outs = n_outs_of(logits_q)?;
   let leading = leading_shape_i32(logits_q)?;
 
-  let cfg = MetalKernelApplyConfig {
-    template: template_for(dtype, vocab),
-    ..MetalKernelApplyConfig::new(
-      (1024, n_outs, 1),
-      (1024, 1, 1),
-      vec![leading.clone(), leading],
-      vec![dtype, dtype],
-    )
-  };
+  let cfg = MetalKernelApplyConfig::new(
+    [1024, n_outs as u32, 1],
+    [1024, 1, 1],
+    vec![leading.clone(), leading],
+    vec![dtype, dtype],
+  )
+  .with_template(template_for(dtype, vocab));
 
   with_kernel(&JS_FORWARD, build_js_forward_kernel, |kernel| {
     let mut outputs = kernel.apply(&[logits_q, logits_p], &cfg)?;
@@ -1168,15 +1162,13 @@ fn js_backward_apply(
   })?;
   let out_shape = full_shape_i32(logits_q)?;
 
-  let cfg = MetalKernelApplyConfig {
-    template: template_for(dtype, vocab),
-    ..MetalKernelApplyConfig::new(
-      (1024, cot_size, 1),
-      (1024, 1, 1),
-      vec![out_shape],
-      vec![dtype],
-    )
-  };
+  let cfg = MetalKernelApplyConfig::new(
+    [1024, cot_size as u32, 1],
+    [1024, 1, 1],
+    vec![out_shape],
+    vec![dtype],
+  )
+  .with_template(template_for(dtype, vocab));
 
   with_kernel(&JS_BACKWARD, build_js_backward_kernel, |kernel| {
     let mut outputs = kernel.apply(&[logits_q, logits_p, cotan, kl_q], &cfg)?;

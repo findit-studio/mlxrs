@@ -13,7 +13,7 @@ use crate::{
 /// `ops::quantized::opt_array` (kept local rather than shared because the two
 /// callers are independent and the helper is trivially small; lifting it to a
 /// shared module is a separate refactor).
-#[inline]
+#[inline(always)]
 fn opt_array(a: Option<&Array>) -> (mlxrs_sys::mlx_array, Option<Array>) {
   match a {
     Some(arr) => (arr.0, None),

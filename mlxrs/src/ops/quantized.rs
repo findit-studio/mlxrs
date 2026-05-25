@@ -35,7 +35,7 @@ use crate::{
 
 /// Build a present `mlx_optional_int` (these ops always take explicit
 /// `group_size` / `bits`; mode-defaults are resolved inside mlx-c).
-#[inline]
+#[inline(always)]
 fn opt_int(v: i32) -> mlxrs_sys::mlx_optional_int {
   mlxrs_sys::mlx_optional_int {
     value: v,
@@ -46,7 +46,7 @@ fn opt_int(v: i32) -> mlxrs_sys::mlx_optional_int {
 /// Raw handle for an `Option<&Array>`: the inner handle when `Some`, or a
 /// fresh NULL-ctx `mlx_array` when `None`. The returned guard owns the
 /// placeholder so its `Drop` frees it; keep it alive across the FFI call.
-#[inline]
+#[inline(always)]
 fn opt_array(a: Option<&Array>) -> (mlxrs_sys::mlx_array, Option<Array>) {
   match a {
     Some(arr) => (arr.0, None),
@@ -66,7 +66,7 @@ fn opt_array(a: Option<&Array>) -> (mlxrs_sys::mlx_array, Option<Array>) {
 /// Convert the `mode` string into a C string. An interior NUL is a caller
 /// bug (mode names are short ASCII tags like `"affine"`); surface it as a
 /// backend-style error rather than panicking across the FFI boundary.
-#[inline]
+#[inline(always)]
 fn mode_cstring(mode: &str) -> Result<CString> {
   CString::new(mode).map_err(|_| crate::Error::Backend {
     message: format!("mlxrs::ops::quantized: `mode` contains an interior NUL byte: {mode:?}"),
