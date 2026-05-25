@@ -1,0 +1,89 @@
+# Tool-call parser markers + auto-selection table.
+#
+# Single source of truth for the per-parser `tool_call_start` /
+# `tool_call_end` delimiters and the ordered `_infer_tool_parser` selection.
+# Parser *logic* stays in Rust (`src/tokenizer/tools.rs`); only the
+# constant marker + selection dispatch table is regenerated from this file
+# by `cargo xtask-codegen` (drift-guarded in CI). This file is the source of
+# truth for the committed `src/tokenizer/generated.rs`.
+#
+# source: mlx-lm df1d3f3
+#   - markers: each `mlx_lm/tool_parsers/<name>.py` `tool_call_start` /
+#     `tool_call_end` module attributes (mirrored verbatim in tools.rs).
+#   - select: `mlx_lm/tokenizer_utils.py:548` `_infer_tool_parser`, the
+#     if/elif chain, order-preserving. A rule fires when every string in
+#     `all` is a substring of the chat template AND (when `any_of` is
+#     non-empty) at least one string in `any_of` is a substring. The first
+#     parser (in file order) whose rule fires wins.
+#
+# `select` faithfully reproduces the Python chain:
+#   minimax_m2  : "<minimax:tool_call>"
+#   gemma4      : "<|tool_call>" and "<tool_call|>"
+#   function_gemma: "<start_function_call>"
+#   longcat     : "<longcat_tool_call>"
+#   glm47       : "<arg_key>"
+#   pythonic    : "<|tool_list_start|>"
+#   qwen3_coder : "<tool_call>\n<function=" (literal-backslash-n OR newline)
+#   kimi_k2     : "<|tool_calls_section_begin|>"
+#   mistral     : "[TOOL_CALLS]"
+#   json_tools  : "<tool_call>" and "tool_call.name"
+
+[[parser]]
+name = "minimax_m2"
+tool_call_start = "<minimax:tool_call>"
+tool_call_end = "</minimax:tool_call>"
+select = { all = ["<minimax:tool_call>"], any_of = [] }
+
+[[parser]]
+name = "gemma4"
+tool_call_start = "<|tool_call>"
+tool_call_end = "<tool_call|>"
+select = { all = ["<|tool_call>", "<tool_call|>"], any_of = [] }
+
+[[parser]]
+name = "function_gemma"
+tool_call_start = "<start_function_call>"
+tool_call_end = "<end_function_call>"
+select = { all = ["<start_function_call>"], any_of = [] }
+
+[[parser]]
+name = "longcat"
+tool_call_start = "<longcat_tool_call>"
+tool_call_end = "</longcat_tool_call>"
+select = { all = ["<longcat_tool_call>"], any_of = [] }
+
+[[parser]]
+name = "glm47"
+tool_call_start = "<tool_call>"
+tool_call_end = "</tool_call>"
+select = { all = ["<arg_key>"], any_of = [] }
+
+[[parser]]
+name = "pythonic"
+tool_call_start = "<|tool_call_start|>"
+tool_call_end = "<|tool_call_end|>"
+select = { all = ["<|tool_list_start|>"], any_of = [] }
+
+[[parser]]
+name = "qwen3_coder"
+tool_call_start = "<tool_call>"
+tool_call_end = "</tool_call>"
+select = { all = [], any_of = ["<tool_call>\\n<function=", "<tool_call>\n<function="] }
+
+[[parser]]
+name = "kimi_k2"
+tool_call_start = "<|tool_calls_section_begin|>"
+tool_call_end = "<|tool_calls_section_end|>"
+select = { all = ["<|tool_calls_section_begin|>"], any_of = [] }
+
+[[parser]]
+name = "mistral"
+tool_call_start = "[TOOL_CALLS]"
+tool_call_end = ""
+select = { all = ["[TOOL_CALLS]"], any_of = [] }
+
+[[parser]]
+name = "json_tools"
+tool_call_start = "<tool_call>"
+tool_call_end = "</tool_call>"
+select = { all = ["<tool_call>", "tool_call.name"], any_of = [] }

@@ -1,0 +1,7 @@
+{
+  "bos_token": "<s>",
+  "chat_template": "{{ bos_token }}{% for m in messages %}{{ '<|' + m['role'] + '|>' }}{{ m['content'] }}{% endfor %}{% if tools %}{% for t in tools %}<tool>{{ t['function']['name'] }}</tool>{% endfor %}{% endif %}{% if add_generation_prompt %}<|assistant|>{% endif %}",
+  "clean_up_tokenization_spaces": false,
+  "eos_token": "</s>",
+  "unk_token": "<unk>"
+}
