@@ -79,10 +79,13 @@
 //! is parameterised by the rotation kind via a `RotateKind` enum
 //! mirror to keep dispatch symmetric with the call site.
 
+use derive_more::{Display, IsVariant};
+
 /// Pixel-permutation rotation variants. Mirrors
 /// `crate::vlm::image::RotateKind` (kept local because that enum is
 /// crate-private; this is the dispatcher's parameter type).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, IsVariant)]
+#[display("{}", self.as_str())]
 pub enum RotateKind {
   /// Clockwise 90° (transpose + flip on the horizontal axis).
   Rotate90,
@@ -92,6 +95,18 @@ pub enum RotateKind {
   Rotate90FlipH,
   /// `Rotate270` then horizontal flip — collapses to `(h-1-y, w-1-x)`.
   Rotate270FlipH,
+}
+
+impl RotateKind {
+  /// Lowercase string tag for this variant.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Rotate90 => "rotate90",
+      Self::Rotate270 => "rotate270",
+      Self::Rotate90FlipH => "rotate90fliph",
+      Self::Rotate270FlipH => "rotate270fliph",
+    }
+  }
 }
 
 /// Scalar reference: per-pixel rotation of `src` into `dst`. Bit-exact

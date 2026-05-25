@@ -83,13 +83,16 @@ use core::arch::aarch64::{
   vmulq_f32, vmulq_n_f32, vnegq_f32, vst1q_f32, vsubq_f32,
 };
 
+use derive_more::{Display, IsVariant};
+
 use crate::error::{Error, Result};
 
 /// The symmetric-window kinds the dispatcher handles. Mirrors
 /// [`crate::audio::dsp`]'s `hann_window` / `hamming_window` /
 /// `blackman_window` / `bartlett_window` triple. Each kind selects a
 /// different formula in `theta = 2π * k / (n - 1)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, IsVariant)]
+#[display("{}", self.as_str())]
 pub enum SymWindowKind {
   /// `0.5 * (1.0 - cos(theta))` — Hann (a.k.a. Hanning).
   Hann,
@@ -102,12 +105,25 @@ pub enum SymWindowKind {
   Bartlett,
 }
 
+impl SymWindowKind {
+  /// Lowercase string tag for this variant.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Hann => "hann",
+      Self::Hamming => "hamming",
+      Self::Blackman => "blackman",
+      Self::Bartlett => "bartlett",
+    }
+  }
+}
+
 /// Kaldi window kinds — mirrors [`crate::audio::features::KaldiWindow`].
 /// `Povey` uses `powf(0.85)` and CANNOT vectorize via the polynomial
 /// path; this dispatcher handles only the cosine kinds. The Povey
 /// arm in `crate::audio::features::build_kaldi_window` keeps its
 /// scalar `theta.cos()` + `.powf(0.85)` loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, IsVariant)]
+#[display("{}", self.as_str())]
 pub enum KaldiWindowKind {
   /// `0.54 - 0.46 * cos(theta)`.
   Hamming,
@@ -115,6 +131,17 @@ pub enum KaldiWindowKind {
   Hanning,
   /// Constant `1.0` — no cosine.
   Rectangular,
+}
+
+impl KaldiWindowKind {
+  /// Lowercase string tag for this variant.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Hamming => "hamming",
+      Self::Hanning => "hanning",
+      Self::Rectangular => "rectangular",
+    }
+  }
 }
 
 // ─── Scalar cosine reference ─────────────────────────────────────────

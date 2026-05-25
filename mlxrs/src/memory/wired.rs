@@ -386,6 +386,7 @@ impl<'a> WiredLimitGuard<'a> {
   /// install in the epoch). This matches the restored-final-state
   /// invariant: when the last guard drops, the limit returns to the value
   /// that was current BEFORE the epoch started.
+  #[inline(always)]
   pub fn old_limit(&self) -> u64 {
     let state = WIRED_LIMIT_STATE
       .lock()
