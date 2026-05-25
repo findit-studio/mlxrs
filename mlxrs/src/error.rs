@@ -495,6 +495,20 @@ extern "C" fn handler(msg: *const c_char, _data: *mut c_void) {
 
 #[ctor::ctor(unsafe)]
 fn install_handler() {
+  // **TEST-ONLY** env-var opt-out for the issue #223 stripped-ctor regression
+  // fixture. When `MLXRS_DISABLE_CTOR_FOR_TEST=1` is set in the child process's
+  // environment, the ctor skips its eager install. The
+  // `ensure_handler_installed()` defense-in-depth call inside every safe-layer
+  // FFI entry point is then the ONLY thing standing between mlx-c's default
+  // `printf + exit(-1)` and a normal `Err` return — which is exactly what the
+  // regression test `stripped_ctor_try_item::try_item_survives_stripped_ctor_environment`
+  // exercises. Production binaries do NOT set this env var; it is read only
+  // here, only on a process-start ctor, and only as `Result<_, _>::is_ok()`.
+  // The check itself is async-signal-safe-equivalent (no allocator, no FFI)
+  // and adds one env-var lookup per process start.
+  if std::env::var("MLXRS_DISABLE_CTOR_FOR_TEST").is_ok() {
+    return;
+  }
   // SAFETY: handler is a valid extern "C" fn; null data ptr; no dtor needed.
   unsafe {
     mlxrs_sys::mlx_set_error_handler(Some(handler), ptr::null_mut(), None);

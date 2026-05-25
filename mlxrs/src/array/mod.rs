@@ -60,6 +60,25 @@ impl Array {
   /// a recoverable path, and a refcount-sharing handle is cheap-but-not-free
   /// (**tens to hundreds of ns**: a fresh `mlx::core::array` heap allocation +
   /// a refcount bump). Never `try_clone` in hot paths; pass `&Array` instead.
+  ///
+  /// ## Why the heap allocation is unavoidable
+  ///
+  /// mlx-c's only refcount-sharing primitive is `mlx_array_set(&dst, src)`,
+  /// implemented in `vendor/mlx-c/mlx/c/private/array.h:28` as
+  /// `new mlx::core::array(s)` — i.e. it always heap-allocates a fresh outer
+  /// `mlx::core::array` (which is itself a `shared_ptr<array_desc>` wrapper)
+  /// and copy-constructs from `src`, bumping the inner `array_desc` refcount.
+  /// There is no public mlx-c entry point that mutates `dst.ctx` in-place from
+  /// a stack-allocated `array`, and the mlx C++ `array(const array&)` copy
+  /// constructor is private to the C++ side. So `try_clone` cannot elide the
+  /// heap allocation through the supported FFI surface; reducing the cost
+  /// requires upstream changes to the mlx-c API (issue #117 closes on this
+  /// finding, with the alloc-discipline guidance to **avoid the call**, not
+  /// to optimise it). Eliding the second alloc inside the `Self(mlx_array_new())`
+  /// wrap is also impossible: `mlx_array_new` returns an empty handle whose
+  /// `ctx` is NULL, and `mlx_array_set` always allocates when `ctx` is NULL
+  /// (`private/array.h:24-31`); there is no path that yields a populated
+  /// handle without one heap allocation.
   pub fn try_clone(&self) -> Result<Self> {
     crate::error::ensure_handler_installed();
     // RAII coverage: wrap the fresh handle in `Self` BEFORE the fallible

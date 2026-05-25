@@ -45,6 +45,21 @@ impl Array {
   /// # Ok(()) }
   /// ```
   pub fn ones<T: Element>(shape: &impl IntoShape) -> Result<Self> {
+    // CRITICAL: must be the first call in this function. The very first FFI
+    // call below (`mlx_array_new()`) is wrapped in mlx-c's standard
+    // `try/catch -> mlx_error(e.what())` boilerplate; without an installed
+    // handler, mlx-c's default handler `printf + exit(-1)` would fire on a
+    // throw and terminate the process before `check()` could observe the
+    // failure. See issue #215 (stripped-ctor regression history). Although
+    // `default_stream()` (below) also installs the handler, it runs AFTER
+    // the raw FFI ctor here.
+    //
+    // TEST COVERAGE: smoke-only (see `stripped_ctor_constructors`); the
+    // install-at-call-site requirement is enforced by code review, NOT by
+    // an executable regression test (a normal-input smoke does not throw
+    // in `mlx_array_new()`, and the AST/syn-based structural alternative
+    // is forbidden by issue #215).
+    crate::error::ensure_handler_installed();
     shape.with_shape(|s| {
       validate_dims(s)?;
       // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
@@ -69,6 +84,15 @@ impl Array {
 
   /// Creates an array filled with zeros.
   pub fn zeros<T: Element>(shape: &impl IntoShape) -> Result<Self> {
+    // CRITICAL: must be the first call in this function. See `Array::ones`
+    // for the full rationale — the raw `mlx_array_new()` below is in mlx-c's
+    // `try/catch -> mlx_error` wrapper and runs BEFORE `default_stream()`'s
+    // handler install.
+    //
+    // TEST COVERAGE: smoke-only (see `stripped_ctor_constructors`); the
+    // install-at-call-site requirement is enforced by code review, NOT by
+    // an executable regression test.
+    crate::error::ensure_handler_installed();
     shape.with_shape(|s| {
       validate_dims(s)?;
       // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
@@ -96,6 +120,25 @@ impl Array {
   /// `mlx_full` takes a scalar `mlx_array` for `vals`; this helper builds
   /// the scalar via `mlx_array_new_float32(value)` and frees it on return.
   pub fn full<T: Element>(shape: &impl IntoShape, value: f32) -> Result<Self> {
+    // CRITICAL: must be the first call in this function. `Array::full` is the
+    // worst-case constructor for the stripped-ctor exit(-1) regression: the
+    // raw `mlx_array_new_float32(value)` below heap-allocates a fresh
+    // `mlx::core::array(val)` and is in mlx-c's standard
+    // `try/catch -> mlx_error(e.what())` wrapper, so a `std::bad_alloc`
+    // (or any other backend throw) would invoke mlx-c's default
+    // `printf + exit(-1)` handler and terminate the process before
+    // `check_handle` could observe the NULL handle. The later
+    // `mlx_full(..., default_stream())` would install the handler, but it
+    // is too late for failures in the scalar constructor itself. See issue
+    // #215 (stripped-ctor regression history).
+    //
+    // TEST COVERAGE: smoke-only (see `stripped_ctor_constructors`); the
+    // install-at-call-site requirement is enforced by code review, NOT by
+    // an executable regression test (a normal-input smoke does not throw
+    // — exercising `std::bad_alloc` requires an allocator-shim test build
+    // out of scope here, and the AST/syn-based structural alternative is
+    // forbidden by issue #215).
+    crate::error::ensure_handler_installed();
     shape.with_shape(|s| {
       validate_dims(s)?;
       // SAFETY: fallible sentinel-handle ctor: the error handler is installed before
@@ -103,6 +146,23 @@ impl Array {
       // RAII guard before the NULL-ctx check (free is a defined no-op on a
       // NULL ctx), and the inputs are valid for the duration of the call.
       let scalar = ScalarGuard(unsafe { mlxrs_sys::mlx_array_new_float32(value) });
+      // Explicit NULL-ctx check on the scalar handle BEFORE passing it to
+      // `mlx_full`. `mlx_array_new_float32` reports failure via the
+      // sentinel-handle pattern (NULL `ctx`, plus a message stashed in the
+      // TLS slot by our handler). Without this check, a scalar-constructor
+      // OOM would silently flow into `mlx_full(scalar=NULL_ctx, ...)` and
+      // surface as a generic backend error instead of the original
+      // bad-alloc message — and on a stripped-ctor build the original
+      // exit(-1) would already have fired in the line above (which is why
+      // the `ensure_handler_installed()` call at the top of this function
+      // is the load-bearing fix; this NULL check is a secondary
+      // correctness improvement that propagates the original allocator
+      // error rather than a downstream cascade).
+      if scalar.0.ctx.is_null() {
+        return Err(crate::error::take_last().unwrap_or(Error::Backend {
+          message: "mlx_array_new_float32 returned null handle".into(),
+        }));
+      }
       // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
       // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
       // early return / panic frees it, then populated by the following call.
@@ -126,6 +186,15 @@ impl Array {
 
   /// Creates an `n×n` identity matrix.
   pub fn eye<T: Element>(n: usize) -> Result<Self> {
+    // CRITICAL: must be the first call in this function. See `Array::ones`
+    // for the full rationale — the raw `mlx_array_new()` below is in mlx-c's
+    // `try/catch -> mlx_error` wrapper and runs BEFORE `default_stream()`'s
+    // handler install.
+    //
+    // TEST COVERAGE: smoke-only (see `stripped_ctor_constructors`); the
+    // install-at-call-site requirement is enforced by code review, NOT by
+    // an executable regression test.
+    crate::error::ensure_handler_installed();
     let n_i32 = i32::try_from(n).map_err(|_| Error::ShapeMismatch {
       message: format!("eye dim {n} exceeds i32::MAX"),
     })?;
@@ -151,6 +220,15 @@ impl Array {
 
   /// Creates a 1-D f32 array of evenly-spaced values in `[start, stop)`.
   pub fn arange(start: f32, stop: f32, step: f32) -> Result<Self> {
+    // CRITICAL: must be the first call in this function. See `Array::ones`
+    // for the full rationale — the raw `mlx_array_new()` below is in mlx-c's
+    // `try/catch -> mlx_error` wrapper and runs BEFORE `default_stream()`'s
+    // handler install.
+    //
+    // TEST COVERAGE: smoke-only (see `stripped_ctor_constructors`); the
+    // install-at-call-site requirement is enforced by code review, NOT by
+    // an executable regression test.
+    crate::error::ensure_handler_installed();
     // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
     // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
     // early return / panic frees it, then populated by the following call.
@@ -173,6 +251,15 @@ impl Array {
 
   /// Creates a 1-D f32 array of `num` evenly-spaced values in `[start, stop]`.
   pub fn linspace(start: f32, stop: f32, num: usize) -> Result<Self> {
+    // CRITICAL: must be the first call in this function. See `Array::ones`
+    // for the full rationale — the raw `mlx_array_new()` below is in mlx-c's
+    // `try/catch -> mlx_error` wrapper and runs BEFORE `default_stream()`'s
+    // handler install.
+    //
+    // TEST COVERAGE: smoke-only (see `stripped_ctor_constructors`); the
+    // install-at-call-site requirement is enforced by code review, NOT by
+    // an executable regression test.
+    crate::error::ensure_handler_installed();
     let n_i32 = i32::try_from(num).map_err(|_| Error::ShapeMismatch {
       message: format!("linspace num {num} exceeds i32::MAX"),
     })?;
@@ -198,8 +285,22 @@ impl Array {
 
   /// Creates an array from a contiguous `&[T]` buffer plus shape. Buffer is COPIED.
   pub fn from_slice<T: Element>(data: &[T], shape: &impl IntoShape) -> Result<Self> {
-    // The only Array constructor that doesn't go through default_stream;
-    // install the error handler explicitly so the safety guarantee matches.
+    // CRITICAL: must be the first call in this function. `from_slice` is the
+    // only `Array` constructor that does NOT go through `default_stream()`
+    // (so there is no later installer to rescue a stripped `#[ctor]`); its
+    // only FFI call, `mlx_array_new_data`, is in mlx-c's standard
+    // `try/catch -> mlx_error` wrapper and can throw on copy/alloc failure
+    // (see `mlxrs-sys/vendor/mlx-c/mlx/c/array.cpp`). Without an installed
+    // handler, mlx-c's default `printf + exit(-1)` would terminate the
+    // process before `check_handle` could observe the NULL handle. See
+    // issue #215.
+    //
+    // TEST COVERAGE: smoke-only (see `stripped_ctor_constructors`); the
+    // install-at-call-site requirement is enforced by code review, NOT by
+    // an executable regression test (a normal-input smoke does not throw
+    // — exercising `std::bad_alloc` requires an allocator-shim test build
+    // out of scope here, and the AST/syn-based structural alternative is
+    // forbidden by issue #215).
     crate::error::ensure_handler_installed();
     shape.with_shape(|s| {
       // FFI safety boundary: validate the slice we're about to hand to

@@ -40,7 +40,18 @@ impl Array {
       .collect()
   }
 
-  /// Scalar extraction. Implicitly evaluates the array (mlx requires this for data access).
+  /// Scalar extraction. Implicitly evaluates the array (mlx requires the
+  /// underlying buffer to be materialized for data access), which is why the
+  /// signature is `&mut self` — the eval mutates non-atomic
+  /// `array_desc->status` and would race a shared `&Array` (see
+  /// `array/mod.rs` `!Sync` rationale).
+  ///
+  /// **CORE-2 audit (#118).** This is the `&mut self` accessor that exercises
+  /// the lazy→materialized transition. The [`Array::try_item`] parallel
+  /// relaxes the borrow to `&self` (useful when the caller holds an `&Array`)
+  /// but does **not** enforce the strict no-implicit-eval contract from
+  /// `feedback_no_implicit_eval` — see the `try_item` doc for the audit
+  /// finding and the binding work that would be needed to enforce it.
   pub fn item<T: Element>(&mut self) -> Result<T> {
     let actual = self.dtype()?;
     if actual != T::DTYPE {
@@ -60,6 +71,13 @@ impl Array {
   /// (logical element count) can exceed the contiguous storage reachable from
   /// the data pointer for views, so reading `size` elements would read past
   /// the allocation. M2 will add `.contiguous()` to materialize strided views.
+  ///
+  /// **CORE-2 audit (#118).** No `try_to_vec(&self)` parallel is provided:
+  /// `mlx_array_data_*` segfaults on an unscheduled array (see the
+  /// [`Array::try_item`] doc for the C++ status-check gap). A safe
+  /// borrow-relaxed variant requires either a binding for the internal
+  /// `_mlx_array_is_available` or an upstream mlx-c entry point that routes
+  /// through C++ const overloads — both out of scope for this polish PR.
   pub fn to_vec<T: Element>(&mut self) -> Result<Vec<T>> {
     let actual = self.dtype()?;
     if actual != T::DTYPE {
@@ -90,6 +108,10 @@ impl Array {
 
   /// Borrow the underlying buffer as `&[T]`. Forces eval. Errors with
   /// `Error::NonContiguous` if the array is strided (post-transpose, etc.).
+  ///
+  /// **CORE-2 audit (#118).** Same caveat as [`Array::to_vec`]: no
+  /// `try_as_slice(&self)` parallel — `mlx_array_data_*` is not safe on
+  /// unscheduled arrays. See [`Array::try_item`] doc.
   pub fn as_slice<T: Element>(&mut self) -> Result<&[T]> {
     let actual = self.dtype()?;
     if actual != T::DTYPE {
@@ -115,6 +137,135 @@ impl Array {
       assert!(!ptr.is_null(), "mlx data pointer NULL after eval");
       Ok(std::slice::from_raw_parts(ptr, len))
     }
+  }
+
+  /// `&self` scalar extraction — borrow-relaxation parallel of
+  /// [`Array::item`]. Lets the caller read a scalar through a shared `&Array`
+  /// reference (the canonical motivation of `feedback_no_implicit_eval`:
+  /// reading shouldn't require an `&mut` borrow).
+  ///
+  /// ```ignore
+  /// a.eval()?;                       // explicit eval (recommended pattern)
+  /// let v: f32 = a.try_item()?;      // works through `&Array`
+  /// ```
+  ///
+  /// ## CORE-2 audit finding (#118): no-implicit-eval not enforceable here
+  ///
+  /// The strict "error if unscheduled" contract from
+  /// `feedback_no_implicit_eval` cannot be honored under the current
+  /// mlx-c binding set: `mlx_array_item_*` internally dispatches to the C++
+  /// **non-const** `array::item()` overload (because
+  /// `mlx-c/mlx/c/private/array.h:42` exposes `array&`, not `const array&`,
+  /// so overload resolution picks the non-const overload at
+  /// `vendor/mlx/mlx/array.h:574-579`). That overload calls `eval()`
+  /// unconditionally and does NOT check status — only the `const` overload
+  /// at line 574-585 does. So a `try_item` call on an unscheduled array
+  /// still triggers an implicit eval inside mlx-c. The same is true for
+  /// `mlx_array_data_*` (which would back a `try_to_vec`/`try_as_slice`),
+  /// but worse: that path **segfaults** on unscheduled rather than
+  /// implicitly evaluating, because C++ `array::data<T>() const`
+  /// (`vendor/mlx/mlx/array.h:379-381`) `const_cast`s to the non-checking
+  /// non-const variant which dereferences `array_desc_->data->buffer`
+  /// (which is null when unscheduled). The mlx-c header comment
+  /// "Array must be evaluated, otherwise returns NULL"
+  /// (`vendor/mlx-c/mlx/c/array.h:309`) does not reflect the actual C++
+  /// behavior.
+  ///
+  /// **Enforcing the strict contract** therefore requires either:
+  ///   1. Allowlisting and binding `_mlx_array_is_available` (currently
+  ///      excluded by the `xtask` bindgen allowlist `mlx_.*` because of the
+  ///      underscore prefix) so we can pre-check status from Rust;
+  ///   2. Upstream mlx-c adding `mlx_array_item_*_const` /
+  ///      `mlx_array_data_*_const` entry points that route through the C++
+  ///      const overloads.
+  ///
+  /// Both are out of scope for a polish PR. `try_item` is shipped now as
+  /// **just the borrow-relaxation** — the `&self` signature lets callers pass
+  /// `&Array` (no `&mut`) and is sound on a single thread because `Array` is
+  /// `!Sync` (no cross-thread shared `&Array` is possible). The "no implicit
+  /// eval" guarantee is a follow-up that needs the binding work above.
+  ///
+  /// `try_to_vec` / `try_as_slice` are deliberately NOT added in this PR —
+  /// they would have the same borrow-relaxation value but with a SEGV
+  /// failure mode on unscheduled input, which is strictly worse than the
+  /// current `&mut self` accessors' "force the caller to materialize first"
+  /// guarantee.
+  ///
+  /// ## Errors
+  /// - `Error::DtypeMismatch` if `T::DTYPE != self.dtype()`.
+  /// - `Error::Backend` if mlx's `item` throws (e.g. `size() != 1`).
+  pub fn try_item<T: Element>(&self) -> Result<T> {
+    // CRITICAL: must be the first call in this function. If removed,
+    // a stripped-ctor environment (where the process-global mlx error handler
+    // wasn't installed by #[ctor]) would cause mlx-c's default handler to
+    // exit(-1) on the first FFI failure here, instead of returning Err.
+    // See issue #215 for the structural-test spiral history. Covered by
+    // the runtime regression test
+    // `stripped_ctor_try_item::try_item_survives_stripped_ctor_environment`
+    // (issue #223): it spawns a child with `MLXRS_DISABLE_CTOR_FOR_TEST=1`
+    // (suppressing the eager `#[ctor]` install) and calls `try_item` on a
+    // non-scalar; removing this `ensure_handler_installed()` reproducibly
+    // flips the child's exit code from 0 (Err returned) to non-zero (mlx-c
+    // `exit(-1)` aborted before `check()` could observe the rc).
+    //
+    // Defense-in-depth handler install, identical to `Array::eval` and the
+    // constructors. `try_item` is a public safe entry point that can call
+    // `mlx_array_item_*`, which may throw (non-scalar arrays, eval failure,
+    // OOM); the rc-pattern `check()` in `Element::item` assumes the handler
+    // is installed first, otherwise mlx-c's default handler can `exit(-1)`
+    // before Rust observes the error. Required because `try_item` is
+    // reachable on an `Array` constructed via `from_raw` without any prior
+    // `mlxrs` constructor / `eval` having run on this thread (the ctor
+    // install is process-global but the `INIT_VIA_CTOR` flag may be false
+    // if the static-constructor entry was stripped, e.g. an `objcopy`-d or
+    // dlopen'd build that disables `__attribute__((constructor))`).
+    crate::error::ensure_handler_installed();
+    let actual = self.dtype()?;
+    if actual != T::DTYPE {
+      return Err(Error::DtypeMismatch {
+        expected: T::DTYPE,
+        got: actual,
+      });
+    }
+    // Cleared-thread poison guard, identical to `Array::eval` — mlx-c's
+    // `item` reaches the backend and triggers eval internally (see the
+    // audit-finding doc above); without this guard, a `try_item` on a
+    // cleared-stream thread would fail cryptically inside mlx instead of
+    // panicking immediately.
+    crate::stream::assert_streams_not_cleared();
+    // SAFETY: dtype verified `== T::DTYPE` above.
+    //
+    // **Contract reconciliation (#118 R1).** `Element::item`'s documented
+    // `# Safety` precondition is "`arr` must be evaluated and have dtype
+    // `DTYPE`" (see `dtype::Element::item`). `try_item` intentionally
+    // relaxes the "must be evaluated" half — and that relaxation is sound
+    // *only* under an impl-specific guarantee, not the trait contract: all
+    // current `Element` impls route through `mlx_array_item_*`, which in
+    // turn dispatches to the C++ non-const `array::item()` overload at
+    // `vendor/mlx/mlx/array.h:574-579`, and that overload performs its own
+    // internal `eval()` before reading. An unscheduled handle therefore
+    // does NOT dereference a null `array_desc_->data->buffer` here — mlx-c
+    // evaluates it inside the FFI call.
+    //
+    // **Forward-compat invariant for future `Element` implementors / refactors:**
+    // any new `Element::item` impl MUST preserve the "internal-eval-on-
+    // lazy" routing (use `mlx_array_item_*`, not a hypothetical
+    // `*_const`/`*_strict` variant that would skip the implicit eval and
+    // deref a null buffer). If that routing ever changes (e.g. mlx-c adds
+    // a const overload and an impl switches to it), this call site MUST
+    // add an explicit `self.eval()` *before* `T::item(self.0)` — but
+    // `try_item` is `&self`, so that would require either changing the
+    // signature to `&mut self` or introducing an `_mlx_array_is_available`
+    // binding to check + bail (see audit-finding doc above). Until then,
+    // the soundness of `try_item` over a lazy array is anchored by the
+    // doc + the `try_item_currently_implicitly_evaluates_lazy_graph`
+    // regression in `tests/array_explicit_eval.rs`.
+    //
+    // Soundness of the `&self` signature itself relies on `Array: !Sync`
+    // preventing any concurrent `&Array` from another thread (the
+    // `mlx::core::array_desc->status` write inside the FFI eval is
+    // non-atomic, see `array/mod.rs` `!Sync` rationale).
+    unsafe { T::item(self.0) }
   }
 }
 
