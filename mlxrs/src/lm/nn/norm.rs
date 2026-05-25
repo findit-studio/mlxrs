@@ -111,8 +111,10 @@ fn fast_layer_norm(
 #[derive(Debug)]
 pub struct RMSNorm {
   /// Per-feature scale of shape `(dims,)` — required (matches the swift
-  /// `weight: MLXArray` / python `self.weight` non-optional field).
-  pub weight: Array,
+  /// `weight: MLXArray` / python `self.weight` non-optional field). Private
+  /// so the constructor is the only installation path; access via
+  /// [`Self::weight_ref`].
+  weight: Array,
   /// Variance floor under the rsqrt (references default `1e-5`).
   pub eps: f32,
 }
@@ -125,6 +127,15 @@ impl RMSNorm {
   /// directly without an intermediate allocation + assignment.
   pub fn new(weight: Array, eps: f32) -> Self {
     Self { weight, eps }
+  }
+
+  /// Read-only reference to the per-feature scale (`(dims,)` shape).
+  ///
+  /// Named `weight_ref` per §3 (non-Copy `Array` returns `&Array`, not
+  /// `Array`; `_ref` suffix signals the borrow). Lazy — does not evaluate.
+  #[inline(always)]
+  pub fn weight_ref(&self) -> &Array {
+    &self.weight
   }
 
   /// Apply RMSNorm to `x` — forwards to
@@ -170,12 +181,16 @@ impl RMSNorm {
 /// it does **not** evaluate.
 #[derive(Debug)]
 pub struct LayerNorm {
-  /// Optional per-feature affine scale of shape `(dims,)`.
-  pub weight: Option<Array>,
+  /// Optional per-feature affine scale of shape `(dims,)`. Private so the
+  /// constructor is the only installation path; access via
+  /// [`Self::weight_ref`].
+  weight: Option<Array>,
   /// Optional per-feature affine shift of shape `(dims,)`. `weight =
   /// None, bias = Some(_)` is rare (mirrors python `affine=False`
-  /// dropping both); the kernel still accepts it.
-  pub bias: Option<Array>,
+  /// dropping both); the kernel still accepts it. Private so the
+  /// constructor is the only installation path; access via
+  /// [`Self::bias_ref`].
+  bias: Option<Array>,
   /// Variance floor inside the sqrt (references default `1e-5`).
   pub eps: f32,
 }
@@ -188,6 +203,26 @@ impl LayerNorm {
   /// `Some`.
   pub fn new(weight: Option<Array>, bias: Option<Array>, eps: f32) -> Self {
     Self { weight, bias, eps }
+  }
+
+  /// Read-only reference to the optional affine scale (`(dims,)` shape, or
+  /// `None` when `affine=False`).
+  ///
+  /// Named `weight_ref` per §3 (non-Copy `Array` returns `&Array`, not
+  /// `Array`; `_ref` suffix signals the borrow). Lazy — does not evaluate.
+  #[inline(always)]
+  pub fn weight_ref(&self) -> Option<&Array> {
+    self.weight.as_ref()
+  }
+
+  /// Read-only reference to the optional affine shift (`(dims,)` shape, or
+  /// `None` when `bias=False`).
+  ///
+  /// Named `bias_ref` per §3 (non-Copy `Array` returns `&Array`, not
+  /// `Array`; `_ref` suffix signals the borrow). Lazy — does not evaluate.
+  #[inline(always)]
+  pub fn bias_ref(&self) -> Option<&Array> {
+    self.bias.as_ref()
   }
 
   /// Apply LayerNorm to `x` — forwards to

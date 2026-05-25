@@ -67,7 +67,7 @@ pub const DEFAULT_BASE: f32 = 10000.0;
 /// scalar `int` overload as the array overload over `array(offset, int32)`, so
 /// `Scalar(p)` and `Array([p])` are numerically identical — the split is purely
 /// to keep the cheaper scalar primitive for the common single-position case.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, derive_more::IsVariant)]
 pub enum RopeOffsetRef<'a> {
   /// A single scalar position shared by every sequence (mlx-lm's
   /// `rope(x, offset=cache.offset)`); routed through scalar `mlx_fast_rope`.

@@ -79,6 +79,9 @@ pub const ROTATING_DEFAULT_KEEP: i32 = 4;
 /// Offset to use when applying rotary position embeddings — mlx-swift-lm's
 /// `RoPEOffset` (a scalar position for the common case, or a per-sequence
 /// `[B]` array for batched caches).
+#[derive(derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum RopeOffset {
   /// A single scalar RoPE position (the offset all sequences share).
   Scalar(usize),
@@ -89,6 +92,9 @@ pub enum RopeOffset {
 /// Attention-mask mode returned by [`KvCache::make_mask`] — mlx-swift-lm's
 /// `ScaledDotProductAttentionMaskMode`, equivalently mlx-lm's
 /// `None | "causal" | array` triad.
+#[derive(derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum MaskMode {
   /// No mask (mlx-lm `None`; e.g. single-token decode).
   None,
@@ -677,7 +683,8 @@ pub trait BatchPositionedKvCache: KvCache {
 /// `parse` accepts both the reference Python/Swift class names AND the
 /// Rust struct-name round-trip aliases — every key the previous
 /// string-keyed match accepted (back-compat).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
+#[display("{}", self.as_str())]
 pub enum KvCacheKind {
   /// [`StandardKvCache`]: `"KVCache"` | `"ConcatenateKVCache"` |
   /// `"KVCacheSimple"` (swift) | `"StandardKvCache"` (Rust alias).
@@ -708,6 +715,24 @@ pub enum KvCacheKind {
 }
 
 impl KvCacheKind {
+  /// The canonical string tag for this cache kind — single source of truth for
+  /// [`std::fmt::Display`], log messages, and the `reference_class_name` round
+  /// trip. Unit-only enum (`KvCacheKind` has no data variants), so this is
+  /// `const fn`.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::KvCache => "KVCache",
+      Self::RotatingKvCache => "RotatingKVCache",
+      Self::ChunkedKvCache => "ChunkedKVCache",
+      Self::QuantizedKvCache => "QuantizedKVCache",
+      Self::CacheList => "CacheList",
+      Self::BatchKvCache => "BatchKVCache",
+      Self::BatchRotatingKvCache => "BatchRotatingKVCache",
+      Self::ArraysCache => "ArraysCache",
+      Self::MambaCache => "MambaCache",
+    }
+  }
+
   /// Parse a reference class name (or Rust round-trip alias) into the
   /// typed dispatch tag, or `Err` for an unknown kind — the typed
   /// replacement for the pre-KVC-3 `match kind { ... other => Err(...) }`
