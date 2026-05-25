@@ -321,13 +321,12 @@ fn mock_cache() -> Vec<Box<dyn KvCache>> {
 /// - num_tokens_per_image = 3,
 /// - MarkerPolicy::Required.
 fn vlm_cfg(max_tokens: usize, num_tokens_per_image: usize) -> VlmGenConfig {
-  VlmGenConfig {
-    lm: GenConfig::default().with_max_tokens(max_tokens),
-    image_token_id: 99,
-    image_marker_id: None,
+  VlmGenConfig::new(
+    GenConfig::default().with_max_tokens(max_tokens),
+    99,
     num_tokens_per_image,
-    marker_policy: MarkerPolicy::Required,
-  }
+    MarkerPolicy::Required,
+  )
 }
 
 // ─────────────────────────── basic pipeline ──────────────────────────────
@@ -627,18 +626,16 @@ fn vlm_generate_uses_image_processor_config_override() {
   // (size, filter, color_order, mean, std) and assert the preprocess
   // step honors it (observable through the encode_image call shape:
   // the input is [H_override, W_override, 3]).
-  let custom = ImageProcessorConfig {
-    size: (16, 32), // non-default (height, width)
-    mean: [0.5, 0.5, 0.5],
-    std: [0.5, 0.5, 0.5],
-    rescale_factor: 1.0 / 255.0,
-    do_resize: true,
-    do_rescale: true,
-    do_normalize: true,
-    resample: ResizeFilter::Bilinear, // non-default
-    color_order: ColorOrder::Rgb,
-    ..ImageProcessorConfig::default()
-  };
+  let custom = ImageProcessorConfig::new()
+    .with_size((16, 32)) // non-default (height, width)
+    .with_mean([0.5, 0.5, 0.5])
+    .with_std([0.5, 0.5, 0.5])
+    .with_rescale_factor(1.0 / 255.0)
+    .with_do_resize(true)
+    .with_do_rescale(true)
+    .with_do_normalize(true)
+    .with_resample(ResizeFilter::Bilinear) // non-default
+    .with_color_order(ColorOrder::Rgb);
   let model = MockVlmModel::new(5, 4, 3).with_processor_cfg(custom);
   let dir = temp_dir("cfg_override");
   let img = write_test_image(&dir, "img.png");
@@ -755,7 +752,7 @@ fn vlm_generate_eos_stops_iteration() {
   let img = write_test_image(&dir, "img.png");
   let prompt = [1_u32, 99, 2];
   let mut cfg = vlm_cfg(10, 3);
-  cfg.lm.set_eos(vec![4]); // argmax of ramp logits with vocab=5
+  cfg.lm_mut().set_eos(vec![4]); // argmax of ramp logits with vocab=5
   let it = vlm_generate(
     &model,
     &model.image_processor_config(),
@@ -859,13 +856,13 @@ fn vlm_generate_distinct_marker_and_placeholder_ids() {
   let dir = temp_dir("distinct_marker");
   let img = write_test_image(&dir, "img.png");
   let prompt = [1_u32, 50, 2]; // marker = 50, placeholder = 99
-  let cfg = VlmGenConfig {
-    lm: GenConfig::default().with_max_tokens(1),
-    image_token_id: 99,
-    image_marker_id: Some(50),
-    num_tokens_per_image: 3,
-    marker_policy: MarkerPolicy::Required,
-  };
+  let cfg = VlmGenConfig::new(
+    GenConfig::default().with_max_tokens(1),
+    99,
+    3,
+    MarkerPolicy::Required,
+  )
+  .with_image_marker_id(Some(50));
   let mut it = vlm_generate(
     &model,
     &model.image_processor_config(),
@@ -1045,15 +1042,14 @@ fn vlm_generate_first_token_sees_prompt_history_in_logit_bias() {
   let dir = temp_dir("first_token_bias");
   let img = write_test_image(&dir, "img.png");
   let prompt = [1_u32, 99, 2]; // T=1+3+1=5 after splice
-  let cfg = VlmGenConfig {
-    lm: GenConfig::default()
+  let cfg = VlmGenConfig::new(
+    GenConfig::default()
       .with_max_tokens(1)
       .with_logit_bias(vec![(0, 1000.0)]),
-    image_token_id: 99,
-    image_marker_id: None,
-    num_tokens_per_image: 3,
-    marker_policy: MarkerPolicy::Required,
-  };
+    99,
+    3,
+    MarkerPolicy::Required,
+  );
   let mut it = vlm_generate(
     &model,
     &model.image_processor_config(),
@@ -1162,15 +1158,14 @@ fn vlm_generate_span_aware_chunking_never_splits_image_span() {
   let dir = temp_dir("span_aware_chunking");
   let img = write_test_image(&dir, "img.png");
   let prompt = [1_u32, 2, 99, 3, 4]; // T = 7 after splice, span (2,5)
-  let cfg = VlmGenConfig {
-    lm: GenConfig::default()
+  let cfg = VlmGenConfig::new(
+    GenConfig::default()
       .with_max_tokens(1)
       .with_prefill_step_size(2),
-    image_token_id: 99,
-    image_marker_id: None,
-    num_tokens_per_image: 3,
-    marker_policy: MarkerPolicy::Required,
-  };
+    99,
+    3,
+    MarkerPolicy::Required,
+  );
   let mut it = vlm_generate(
     &model,
     &model.image_processor_config(),
@@ -1265,15 +1260,14 @@ fn vlm_generate_threads_cache_offset_and_chunk_local_spans() {
   let dir = temp_dir("offset_capture");
   let img = write_test_image(&dir, "img.png");
   let prompt = [1_u32, 2, 99, 3, 4];
-  let cfg = VlmGenConfig {
-    lm: GenConfig::default()
+  let cfg = VlmGenConfig::new(
+    GenConfig::default()
       .with_max_tokens(1)
       .with_prefill_step_size(2),
-    image_token_id: 99,
-    image_marker_id: None,
-    num_tokens_per_image: 3,
-    marker_policy: MarkerPolicy::Required,
-  };
+    99,
+    3,
+    MarkerPolicy::Required,
+  );
   let mut it = vlm_generate(
     &model,
     &model.image_processor_config(),
@@ -1332,15 +1326,14 @@ fn vlm_generate_single_chunk_when_prefill_step_size_ge_t() {
   let dir = temp_dir("single_chunk");
   let img = write_test_image(&dir, "img.png");
   let prompt = [1_u32, 2, 99, 3, 4]; // T = 7 after splice
-  let cfg = VlmGenConfig {
-    lm: GenConfig::default()
+  let cfg = VlmGenConfig::new(
+    GenConfig::default()
       .with_max_tokens(1)
       .with_prefill_step_size(100),
-    image_token_id: 99,
-    image_marker_id: None,
-    num_tokens_per_image: 3,
-    marker_policy: MarkerPolicy::Required,
-  };
+    99,
+    3,
+    MarkerPolicy::Required,
+  );
   let mut it = vlm_generate(
     &model,
     &model.image_processor_config(),
@@ -1371,13 +1364,12 @@ fn vlm_generate_max_tokens_zero_does_no_image_work() {
   let dir = temp_dir("max_tokens_zero");
   let img = write_test_image(&dir, "img.png");
   let prompt = [1_u32, 2, 99, 3, 4];
-  let cfg = VlmGenConfig {
-    lm: GenConfig::default().with_max_tokens(0),
-    image_token_id: 99,
-    image_marker_id: None,
-    num_tokens_per_image: 3,
-    marker_policy: MarkerPolicy::Required,
-  };
+  let cfg = VlmGenConfig::new(
+    GenConfig::default().with_max_tokens(0),
+    99,
+    3,
+    MarkerPolicy::Required,
+  );
   let mut it = vlm_generate(
     &model,
     &model.image_processor_config(),
@@ -1573,13 +1565,12 @@ fn vlm_generate_does_not_build_unused_attention_mask() {
   let dir = temp_dir("no_unused_mask");
   let img = write_test_image(&dir, "img.png");
   let prompt = [1_u32, 99, 2]; // T = 1 + 100 + 1 = 102 after splice
-  let cfg = VlmGenConfig {
-    lm: GenConfig::default().with_max_tokens(1),
-    image_token_id: 99,
-    image_marker_id: None,
-    num_tokens_per_image: 100,
-    marker_policy: MarkerPolicy::Required,
-  };
+  let cfg = VlmGenConfig::new(
+    GenConfig::default().with_max_tokens(1),
+    99,
+    100,
+    MarkerPolicy::Required,
+  );
   let mut it = vlm_generate(
     &model,
     &model.image_processor_config(),
@@ -1615,15 +1606,14 @@ fn vlm_generate_rejects_invalid_lm_config_before_image_load() {
   // the validation Err we expect — proving the validate gate ran first.
   let bogus_img = PathBuf::from("/nonexistent/vlm_validate_test/image_that_does_not_exist.png");
   let prompt = [1_u32, 2, 99, 3, 4]; // valid prompt (has marker)
-  let cfg = VlmGenConfig {
-    lm: GenConfig::default()
+  let cfg = VlmGenConfig::new(
+    GenConfig::default()
       .with_max_tokens(3)
       .with_logit_bias(vec![(0, 1.0), (1, f32::NAN)]),
-    image_token_id: 99,
-    image_marker_id: None,
-    num_tokens_per_image: 3,
-    marker_policy: MarkerPolicy::Required,
-  };
+    99,
+    3,
+    MarkerPolicy::Required,
+  );
   let res = vlm_generate(
     &model,
     &model.image_processor_config(),
@@ -1684,13 +1674,12 @@ fn vlm_generate_rejects_invalid_lm_config_before_image_load() {
 fn vlm_generate_rejects_invalid_lm_config_no_images() {
   let model = MockVlmModel::new(/*vocab=*/ 5, /*D=*/ 4, /*N_per_img=*/ 3);
   let prompt = [1_u32, 2, 3];
-  let cfg = VlmGenConfig {
-    lm: GenConfig::default().with_max_tokens(2).with_temp(-1.0),
-    image_token_id: 99,
-    image_marker_id: None,
-    num_tokens_per_image: 3,
-    marker_policy: MarkerPolicy::Required,
-  };
+  let cfg = VlmGenConfig::new(
+    GenConfig::default().with_max_tokens(2).with_temp(-1.0),
+    99,
+    3,
+    MarkerPolicy::Required,
+  );
   let res = vlm_generate(
     &model,
     &model.image_processor_config(),
@@ -1727,15 +1716,14 @@ fn vlm_generate_rejects_invalid_lm_config_no_images() {
 fn vlm_generate_rejects_invalid_lm_config_under_zero_max_tokens() {
   let model = MockVlmModel::new(/*vocab=*/ 5, /*D=*/ 4, /*N_per_img=*/ 3);
   let prompt = [1_u32, 2, 99, 3, 4];
-  let cfg = VlmGenConfig {
-    lm: GenConfig::default()
+  let cfg = VlmGenConfig::new(
+    GenConfig::default()
       .with_max_tokens(0)
       .with_logit_bias(vec![(0, f32::INFINITY)]),
-    image_token_id: 99,
-    image_marker_id: None,
-    num_tokens_per_image: 3,
-    marker_policy: MarkerPolicy::Required,
-  };
+    99,
+    3,
+    MarkerPolicy::Required,
+  );
   let dir = temp_dir("validate_zero_max");
   let img = write_test_image(&dir, "img.png");
   let res = vlm_generate(
