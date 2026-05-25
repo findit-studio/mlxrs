@@ -116,7 +116,7 @@ pub trait WiredMemoryPolicy: Send + Sync {
 pub struct WiredSumPolicy {
   /// Optional absolute cap in bytes. [`None`] → clamp to
   /// [`recommended_working_set_bytes`](super::recommended_working_set_bytes).
-  pub cap: Option<u64>,
+  cap: Option<u64>,
 }
 
 impl WiredSumPolicy {
@@ -124,6 +124,19 @@ impl WiredSumPolicy {
   /// `init(cap: Int? = nil)`.
   pub fn new(cap: Option<u64>) -> Self {
     Self { cap }
+  }
+
+  /// The optional cap in bytes.
+  #[inline(always)]
+  pub const fn cap(&self) -> Option<u64> {
+    self.cap
+  }
+
+  /// Builder: set the cap.
+  #[must_use]
+  pub fn with_cap(mut self, cap: Option<u64>) -> Self {
+    self.cap = cap;
+    self
   }
 
   /// Clamp `value` to the cap (if set) or the recommended working set (if
@@ -190,7 +203,7 @@ impl WiredMemoryPolicy for WiredMaxPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WiredFixedPolicy {
   /// The constant limit in bytes returned by [`WiredMemoryPolicy::limit`].
-  pub limit_bytes: u64,
+  limit_bytes: u64,
 }
 
 impl WiredFixedPolicy {
@@ -198,6 +211,19 @@ impl WiredFixedPolicy {
   /// `init(limit: Int)`.
   pub fn new(limit_bytes: u64) -> Self {
     Self { limit_bytes }
+  }
+
+  /// The constant limit in bytes.
+  #[inline(always)]
+  pub const fn limit_bytes(&self) -> u64 {
+    self.limit_bytes
+  }
+
+  /// Builder: set the limit in bytes.
+  #[must_use]
+  pub fn with_limit_bytes(mut self, b: u64) -> Self {
+    self.limit_bytes = b;
+    self
   }
 }
 
@@ -230,10 +256,10 @@ pub struct WiredBudgetPolicy {
   /// Base budget in bytes (e.g. weights + workspace). Clamped to `>= 0` at
   /// construction; mirrors Swift `self.baseBytes = max(0, baseBytes)`. The
   /// Rust signature already enforces `u64`, so the clamp is implicit.
-  pub base_bytes: u64,
+  base_bytes: u64,
   /// Optional absolute cap in bytes. [`None`] → clamp to
   /// [`recommended_working_set_bytes`](super::recommended_working_set_bytes).
-  pub cap: Option<u64>,
+  cap: Option<u64>,
 }
 
 /// Process-wide monotonic counter for the default `id` of a
@@ -269,9 +295,47 @@ impl WiredBudgetPolicy {
     }
   }
 
-  /// The stable grouping identifier. Mirrors Swift `identifier`.
-  pub fn id_str(&self) -> &str {
+  /// The grouping identifier — same string as [`WiredMemoryPolicy::id`],
+  /// surfaced as an inherent method so callers that hold a
+  /// `WiredBudgetPolicy` directly do not have to import the trait to read
+  /// it (Rust trait-method dispatch requires the trait be in scope).
+  #[inline(always)]
+  pub fn id(&self) -> &str {
     &self.id
+  }
+
+  /// Legacy alias of [`Self::id`] retained for one minor-version cycle.
+  /// New code should use [`Self::id`] directly (per rust-type-conventions
+  /// §3: a `String` getter takes the field name, not a `_str` suffix).
+  #[inline(always)]
+  pub fn id_str(&self) -> &str {
+    self.id()
+  }
+
+  /// The base budget in bytes.
+  #[inline(always)]
+  pub const fn base_bytes(&self) -> u64 {
+    self.base_bytes
+  }
+
+  /// Builder: set the base budget in bytes.
+  #[must_use]
+  pub fn with_base_bytes(mut self, b: u64) -> Self {
+    self.base_bytes = b;
+    self
+  }
+
+  /// The optional cap in bytes.
+  #[inline(always)]
+  pub const fn cap(&self) -> Option<u64> {
+    self.cap
+  }
+
+  /// Builder: set the cap.
+  #[must_use]
+  pub fn with_cap(mut self, cap: Option<u64>) -> Self {
+    self.cap = cap;
+    self
   }
 
   /// Clamp `value` to the cap (if set) or the recommended working set (if
@@ -329,32 +393,85 @@ impl WiredMemoryPolicy for WiredBudgetPolicy {
 ///
 /// Mirrors the Swift `WiredMemoryMeasurement` in
 /// [`mlx-swift-lm/.../WiredMemoryUtils.swift`](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXLMCommon/WiredMemoryUtils.swift)
-/// lines 8-26. All fields are public per the Swift `let` projection — the
-/// struct is a value-returned measurement record, not a privacy-gated
-/// resource.
+/// lines 8-26.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WiredMemoryMeasurement {
   /// Total bytes for model weights — sum of `Array::nbytes()` over the
   /// model's weight tree. Mirrors Swift `weightBytes`.
-  pub weight_bytes: u64,
+  weight_bytes: u64,
   /// Total bytes for KV-cache state after prefill (sum of `Array::nbytes()`
   /// over every cache array). Mirrors Swift `kvBytes`.
-  pub kv_bytes: u64,
+  kv_bytes: u64,
   /// Estimated transient workspace bytes — `max(0, peak_active_bytes -
   /// weight_bytes - kv_bytes)`. Mirrors Swift `workspaceBytes`.
-  pub workspace_bytes: u64,
+  workspace_bytes: u64,
   /// Peak [`crate::memory::active_memory`](super::active_memory) observed
   /// during prefill. Mirrors Swift `peakActiveBytes`.
-  pub peak_active_bytes: u64,
+  peak_active_bytes: u64,
   /// Number of tokens used during the prefill measurement. Mirrors Swift
   /// `tokenCount`.
-  pub token_count: usize,
+  token_count: usize,
   /// Prefill step size used for the measurement. Mirrors Swift
   /// `prefillStepSize`.
-  pub prefill_step_size: usize,
+  prefill_step_size: usize,
 }
 
 impl WiredMemoryMeasurement {
+  /// Construct a measurement record from its components.
+  pub fn new(
+    weight_bytes: u64,
+    kv_bytes: u64,
+    workspace_bytes: u64,
+    peak_active_bytes: u64,
+    token_count: usize,
+    prefill_step_size: usize,
+  ) -> Self {
+    Self {
+      weight_bytes,
+      kv_bytes,
+      workspace_bytes,
+      peak_active_bytes,
+      token_count,
+      prefill_step_size,
+    }
+  }
+
+  /// Total bytes for model weights. Mirrors Swift `weightBytes`.
+  #[inline(always)]
+  pub fn weight_bytes(&self) -> u64 {
+    self.weight_bytes
+  }
+
+  /// Total bytes for KV-cache state after prefill. Mirrors Swift `kvBytes`.
+  #[inline(always)]
+  pub fn kv_bytes(&self) -> u64 {
+    self.kv_bytes
+  }
+
+  /// Estimated transient workspace bytes. Mirrors Swift `workspaceBytes`.
+  #[inline(always)]
+  pub fn workspace_bytes(&self) -> u64 {
+    self.workspace_bytes
+  }
+
+  /// Peak active memory observed during prefill. Mirrors Swift `peakActiveBytes`.
+  #[inline(always)]
+  pub fn peak_active_bytes(&self) -> u64 {
+    self.peak_active_bytes
+  }
+
+  /// Number of tokens used during the prefill measurement. Mirrors Swift `tokenCount`.
+  #[inline(always)]
+  pub fn token_count(&self) -> usize {
+    self.token_count
+  }
+
+  /// Prefill step size used for the measurement. Mirrors Swift `prefillStepSize`.
+  #[inline(always)]
+  pub fn prefill_step_size(&self) -> usize {
+    self.prefill_step_size
+  }
+
   /// Combined budget suggestion = `weight_bytes + kv_bytes + workspace_bytes`.
   /// Mirrors Swift `var totalBytes: Int`.
   pub fn total_bytes(&self) -> u64 {

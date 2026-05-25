@@ -137,7 +137,7 @@ impl Closure {
   /// `Drop` will free the underlying handle. mlx-c transforms that consume a
   /// closure by *value* internally take a shared_ptr copy, so passing
   /// `closure.as_raw()` into e.g. `mlx_value_and_grad` is sound.
-  #[inline]
+  #[inline(always)]
   pub fn as_raw(&self) -> mlxrs_sys::mlx_closure {
     self.inner
   }
@@ -371,6 +371,14 @@ fn write_outputs(out: *mut mlxrs_sys::mlx_vector_array, outputs: &[Array]) -> Re
 /// RAII guard for a temporary `mlx_vector_array`. Constructed *before* the
 /// populating call so an early return / panic still frees it.
 pub(crate) struct VectorArrayGuard(pub(crate) mlxrs_sys::mlx_vector_array);
+impl VectorArrayGuard {
+  /// Borrow the raw handle for a transient FFI call. Must not outlive `self`.
+  #[allow(dead_code)]
+  #[inline(always)]
+  pub(crate) const fn as_raw(&self) -> mlxrs_sys::mlx_vector_array {
+    self.0
+  }
+}
 impl Drop for VectorArrayGuard {
   fn drop(&mut self) {
     // SAFETY: frees a handle this guard owns exactly once. Same `Drop`
@@ -426,6 +434,14 @@ pub(crate) fn vector_array_from_slice(arrays: &[Array]) -> Result<VectorArrayGua
 
 /// RAII guard for a temporary `mlx_closure_value_and_grad`.
 pub(crate) struct ClosureValueAndGradGuard(pub(crate) mlxrs_sys::mlx_closure_value_and_grad);
+impl ClosureValueAndGradGuard {
+  /// Borrow the raw handle for a transient FFI call. Must not outlive `self`.
+  #[allow(dead_code)]
+  #[inline(always)]
+  pub(crate) const fn as_raw(&self) -> mlxrs_sys::mlx_closure_value_and_grad {
+    self.0
+  }
+}
 impl Drop for ClosureValueAndGradGuard {
   fn drop(&mut self) {
     // SAFETY: same discipline as `VectorArrayGuard` — single-owner free,
@@ -438,6 +454,14 @@ impl Drop for ClosureValueAndGradGuard {
 
 /// RAII guard for a temporary `mlx_closure_custom`.
 pub(crate) struct ClosureCustomGuard(pub(crate) mlxrs_sys::mlx_closure_custom);
+impl ClosureCustomGuard {
+  /// Borrow the raw handle for a transient FFI call. Must not outlive `self`.
+  #[allow(dead_code)]
+  #[inline(always)]
+  pub(crate) const fn as_raw(&self) -> mlxrs_sys::mlx_closure_custom {
+    self.0
+  }
+}
 impl Drop for ClosureCustomGuard {
   fn drop(&mut self) {
     // SAFETY: same discipline as `VectorArrayGuard` — single-owner free.
@@ -450,6 +474,14 @@ impl Drop for ClosureCustomGuard {
 /// RAII guard for a temporary `mlx_closure` that we own (e.g. the result of
 /// `mlx_checkpoint` / `mlx_custom_function`).
 pub(crate) struct RawClosureGuard(pub(crate) mlxrs_sys::mlx_closure);
+impl RawClosureGuard {
+  /// Borrow the raw handle for a transient FFI call. Must not outlive `self`.
+  #[allow(dead_code)]
+  #[inline(always)]
+  pub(crate) const fn as_raw(&self) -> mlxrs_sys::mlx_closure {
+    self.0
+  }
+}
 impl Drop for RawClosureGuard {
   fn drop(&mut self) {
     // SAFETY: same discipline as `VectorArrayGuard` — single-owner free.

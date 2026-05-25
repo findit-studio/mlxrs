@@ -195,7 +195,7 @@ fn wired_budget_policy_auto_id_is_unique() {
   let a = WiredBudgetPolicy::new(100, Some(300));
   let b = WiredBudgetPolicy::new(100, Some(300));
   assert_ne!(a, b, "auto-id instances should be distinct");
-  assert_ne!(a.id_str(), b.id_str());
+  assert_ne!(a.id(), b.id());
 }
 
 /// Budget policy hashing matches equality — same id → same hash;
@@ -218,24 +218,17 @@ fn wired_budget_policy_hash_matches_eq() {
 
 // ─────────────────────────── Measurement ───────────────────────────────────
 
-/// `WiredMemoryMeasurement` is a public-field record; verify construction
-/// + `total_bytes()` matches the Swift `var totalBytes: Int` formula.
+/// `WiredMemoryMeasurement` construction + `total_bytes()` matches the
+/// Swift `var totalBytes: Int` formula.
 #[test]
 fn wired_memory_measurement_construction_and_total() {
-  let m = WiredMemoryMeasurement {
-    weight_bytes: 1_000,
-    kv_bytes: 200,
-    workspace_bytes: 50,
-    peak_active_bytes: 1_400,
-    token_count: 128,
-    prefill_step_size: 32,
-  };
-  assert_eq!(m.weight_bytes, 1_000);
-  assert_eq!(m.kv_bytes, 200);
-  assert_eq!(m.workspace_bytes, 50);
-  assert_eq!(m.peak_active_bytes, 1_400);
-  assert_eq!(m.token_count, 128);
-  assert_eq!(m.prefill_step_size, 32);
+  let m = WiredMemoryMeasurement::new(1_000, 200, 50, 1_400, 128, 32);
+  assert_eq!(m.weight_bytes(), 1_000);
+  assert_eq!(m.kv_bytes(), 200);
+  assert_eq!(m.workspace_bytes(), 50);
+  assert_eq!(m.peak_active_bytes(), 1_400);
+  assert_eq!(m.token_count(), 128);
+  assert_eq!(m.prefill_step_size(), 32);
   assert_eq!(m.total_bytes(), 1_250);
 }
 
