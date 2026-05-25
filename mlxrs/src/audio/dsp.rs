@@ -150,7 +150,10 @@ const COVERAGE_EPS: f32 = 1e-10;
 /// `mlx-audio-swift` has no `win_length` (the window is always `n_fft`), so
 /// it corresponds to `win_length == n_fft`, which both variants handle the
 /// same way (and both invert).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+  Debug, Clone, Copy, PartialEq, Eq, Hash, Default, derive_more::Display, derive_more::IsVariant,
+)]
+#[display("{}", self.as_str())]
 pub enum WindowPad {
   /// `[w, zeros]` right-padded in `n_fft` (mlx-audio / mlxrs `stft`). The
   /// default: keeps [`stft`]'s short-window output byte-identical to
@@ -164,6 +167,16 @@ pub enum WindowPad {
   /// coverage, exactly invertible by [`istft`] for every `win_length <=
   /// n_fft`. Opt in to this for invertible short-window round-trips.
   Center,
+}
+
+impl WindowPad {
+  /// The canonical lowercase string representation (`right`/`center`).
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Right => "right",
+      Self::Center => "center",
+    }
+  }
 }
 
 /// Signal-centering pad mode for [`stft`]. Matches the `pad_mode` argument
@@ -182,12 +195,25 @@ pub enum WindowPad {
 /// construction (a single-op reflect would require an upstream mlx
 /// `Pad::reflect` change — see the [`stft`] implementation for the
 /// reasoning).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+  Debug, Clone, Copy, PartialEq, Eq, Hash, Default, derive_more::Display, derive_more::IsVariant,
+)]
+#[display("{}", self.as_str())]
 pub enum PadMode {
   /// Reflect the signal at the edges (`mlx-audio` / Whisper / librosa
   /// default). Mirrors `pad_mode="reflect"`.
   #[default]
   Reflect,
+}
+
+impl PadMode {
+  /// The canonical lowercase string representation matching the mlx-audio
+  /// `pad_mode` argument (`reflect`).
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Reflect => "reflect",
+    }
+  }
 }
 
 /// Builder for [`stft_with_config`] — factors the `center` runtime branch
@@ -211,7 +237,7 @@ pub enum PadMode {
 /// `hop * k`):
 ///
 /// ```ignore
-/// let cfg = StftConfig { center: false, ..StftConfig::default() };
+/// let cfg = StftConfig::new(false, PadMode::Reflect);
 /// let spec = stft_with_config(&samples, n_fft, hop, None, WindowPad::Right, &cfg)?;
 /// // Equivalent shortcut:
 /// // let spec = stft_aligned(&samples, n_fft, hop, None, WindowPad::Right)?;
@@ -225,19 +251,44 @@ pub struct StftConfig {
   /// When `false` the frames start at sample 0 (the "aligned" path);
   /// the resulting [`Spectrum`]'s `center()` returns `false` and
   /// [`istft`] does NOT trim a centered prefix / suffix when inverting.
-  pub center: bool,
+  center: bool,
   /// Signal-pad mode used when `center == true`. Default
   /// [`PadMode::Reflect`] (the `mlx-audio` default). Ignored when
   /// `center == false` (no signal padding is applied).
-  pub pad_mode: PadMode,
+  pad_mode: PadMode,
+}
+
+impl StftConfig {
+  /// Construct a [`StftConfig`] with explicit `center` and `pad_mode`.
+  ///
+  /// # Examples
+  /// ```ignore
+  /// // Centered (the default):
+  /// let cfg = StftConfig::new(true, PadMode::Reflect);
+  /// // Aligned (no centering pad):
+  /// let cfg = StftConfig::new(false, PadMode::Reflect);
+  /// ```
+  pub const fn new(center: bool, pad_mode: PadMode) -> Self {
+    Self { center, pad_mode }
+  }
+
+  /// Whether the signal is reflect-padded by `n_fft / 2` on each side
+  /// before framing (`center = true`).
+  #[inline(always)]
+  pub fn center(&self) -> bool {
+    self.center
+  }
+
+  /// Signal-pad mode used when `center == true`.
+  #[inline(always)]
+  pub fn pad_mode(&self) -> PadMode {
+    self.pad_mode
+  }
 }
 
 impl Default for StftConfig {
   fn default() -> Self {
-    Self {
-      center: true,
-      pad_mode: PadMode::Reflect,
-    }
+    Self::new(true, PadMode::Reflect)
   }
 }
 
@@ -293,39 +344,51 @@ pub struct Spectrum {
 
 impl Spectrum {
   /// The `(num_frames, n_fft / 2 + 1)` `Dtype::Complex64` transform data.
-  pub fn data(&self) -> &Array {
+  ///
+  /// Named `data_ref` (not `data`) per §3 non-Copy `&T` accessor naming
+  /// convention — [`Array`] is not `Copy`, so the accessor returns a
+  /// reference rather than a copy and carries the `_ref` suffix to signal
+  /// that the returned value borrows `self`.
+  #[inline(always)]
+  pub fn data_ref(&self) -> &Array {
     &self.data
   }
 
   /// The (even) FFT length used to produce this spectrum (the irfft target
   /// width on the inverse).
+  #[inline(always)]
   pub fn n_fft(&self) -> usize {
     self.n_fft
   }
 
   /// The analysis hop length (the overlap-add stride [`istft`] uses).
+  #[inline(always)]
   pub fn hop_length(&self) -> usize {
     self.hop_length
   }
 
   /// The analysis window length (`win_length <= n_fft`).
+  #[inline(always)]
   pub fn win_length(&self) -> usize {
     self.win_length
   }
 
   /// The [`WindowPad`] placement of the `win_length` window in the `n_fft`
   /// frame ([`istft`] re-places the synthesis window identically).
+  #[inline(always)]
   pub fn window_pad(&self) -> WindowPad {
     self.window_pad
   }
 
   /// Whether [`stft`] reflect-padded the signal by `n_fft / 2` on each side
   /// (`center = true`). [`istft`] undoes this before applying `length`.
+  #[inline(always)]
   pub fn center(&self) -> bool {
     self.center
   }
 
   /// The number of frames (`data`'s first dimension).
+  #[inline(always)]
   pub fn num_frames(&self) -> usize {
     // `data` is validated 2-D at every construction site, so `shape()[0]`
     // is always present.
@@ -334,6 +397,7 @@ impl Spectrum {
 
   /// The number of one-sided frequency bins (`data`'s last dimension,
   /// `== n_fft / 2 + 1`).
+  #[inline(always)]
   pub fn n_freqs(&self) -> usize {
     self.data.shape()[1]
   }
@@ -558,7 +622,7 @@ fn frame_window(win_length: usize, n_fft: usize, window_pad: WindowPad) -> Resul
 ///
 /// Defaults to [`LogFloor::Whisper`] (the mlxrs reference target;
 /// preserves the previous port's behavior byte-identically).
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, derive_more::IsVariant)]
 pub enum LogFloor {
   /// `1e-10` — matches `mlx-audio`'s Whisper-style mel path.
   #[default]
@@ -962,7 +1026,7 @@ pub fn stft(
 /// Equivalent to:
 ///
 /// ```ignore
-/// let cfg = StftConfig { center: false, ..StftConfig::default() };
+/// let cfg = StftConfig::new(false, PadMode::Reflect);
 /// stft_with_config(samples, n_fft, hop, win_length, window_pad, &cfg)
 /// ```
 ///
@@ -983,10 +1047,7 @@ pub fn stft_aligned(
     hop_length,
     win_length,
     window_pad,
-    &StftConfig {
-      center: false,
-      pad_mode: PadMode::Reflect,
-    },
+    &StftConfig::new(false, PadMode::Reflect),
   )
 }
 
@@ -1080,7 +1141,7 @@ pub fn stft_with_config(
       ),
     });
   }
-  if cfg.center {
+  if cfg.center() {
     let padded_len_budget = samples_len
       .checked_add(n_fft)
       .ok_or_else(|| Error::Backend {
@@ -1121,8 +1182,8 @@ pub fn stft_with_config(
   // does. Folding this to a single `ops::shape::pad(..., c"reflect")`
   // call awaits an upstream `mlx::core::Pad` extension — until that
   // lands, the 3-op reconstruction is the byte-for-byte parity path.
-  let padded = if cfg.center {
-    match cfg.pad_mode {
+  let padded = if cfg.center() {
+    match cfg.pad_mode() {
       PadMode::Reflect => reflect_pad_1d(samples, n_fft / 2)?,
     }
   } else {
@@ -1273,7 +1334,7 @@ pub fn stft_with_config(
     hop_length,
     win_length,
     window_pad,
-    center: cfg.center,
+    center: cfg.center(),
   })
 }
 
@@ -1397,7 +1458,7 @@ pub fn istft(spectrum: &Spectrum, length: Option<usize>) -> Result<Array> {
   // n_freqs == n_fft/2 + 1, 1 <= win_length <= n_fft, hop >= 1, num_frames >=
   // 1, Complex64 data) were enforced at construction by `stft` /
   // `Spectrum::from_parts`.
-  let x = spectrum.data();
+  let x = spectrum.data_ref();
   let n_fft = spectrum.n_fft();
   let hop_length = spectrum.hop_length();
   let win_length = spectrum.win_length();
@@ -1773,7 +1834,7 @@ struct NormKey {
 ///   let audio = cache.istft(&spectrum, None)?; // index/norm buffers reused
 /// }
 /// ```
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ISTFTCache {
   /// Memoized flattened scatter-index buffers, keyed by framing geometry.
   position_cache: std::collections::HashMap<PositionKey, Array>,
@@ -1849,7 +1910,7 @@ impl ISTFTCache {
     // invariants — even n_fft, n_freqs == n_fft/2 + 1, 1 <= win_length <=
     // n_fft, hop >= 1, num_frames >= 1, Complex64 data — were enforced at
     // construction by `stft` / `Spectrum::from_parts`).
-    let x = spectrum.data();
+    let x = spectrum.data_ref();
     let n_fft = spectrum.n_fft();
     let hop_length = spectrum.hop_length();
     let win_length = spectrum.win_length();
@@ -2118,6 +2179,13 @@ impl ISTFTCache {
 
     // Final trim to the requested region (same bounds the coverage guard used).
     ops::indexing::slice(&reconstructed, &[start_i32], &[stop_i32], &[1])
+  }
+}
+
+impl Default for ISTFTCache {
+  /// A fresh, empty cache — delegates to [`ISTFTCache::new`].
+  fn default() -> Self {
+    Self::new()
   }
 }
 
@@ -2466,7 +2534,7 @@ pub fn mel_spectrogram(
   // then square. `mel_spectrogram` only needs the magnitudes, so it reads the
   // transform array off the typed `Spectrum` (the metadata is irrelevant to
   // the forward magnitude path here).
-  let mag = spec.data().abs()?;
+  let mag = spec.data_ref().abs()?;
   let power = mag.square()?;
   // `power` is `(num_frames, n_freqs)`; mel is `(n_mels, n_freqs)`.
   // Mel-spec layout in mlx-audio / Whisper is `(n_mels, num_frames)` =
@@ -3150,10 +3218,20 @@ fn bs1770_biquad_coefficients(
 /// Which RBJ biquad shape [`bs1770_biquad_coefficients`] should produce.
 /// Only the two BS.1770 stages are wired (high-shelf, high-pass); the
 /// reference's `_biquad_coefficients` raises on any other `filter_type`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::IsVariant)]
 enum BiquadKind {
   HighShelf,
   HighPass,
+}
+
+impl BiquadKind {
+  #[allow(dead_code)]
+  const fn as_str(&self) -> &'static str {
+    match self {
+      Self::HighShelf => "high_shelf",
+      Self::HighPass => "high_pass",
+    }
+  }
 }
 
 /// Apply BS.1770 K-weighting (high-shelf at 1.5 kHz then high-pass at
@@ -4122,16 +4200,16 @@ mod tests {
     // Spectra are byte-identical across the two modes (no window padding).
     let spec_c = stft(&x, 8, 4, Some(8), WindowPad::Center).unwrap();
     let spec_r = stft(&x, 8, 4, Some(8), WindowPad::Right).unwrap();
-    assert_eq!(spec_c.data().shape(), vec![5, 5]); // (num_frames, n_fft/2+1)
+    assert_eq!(spec_c.data_ref().shape(), vec![5, 5]); // (num_frames, n_fft/2+1)
     // Metadata is carried on the typed Spectrum (no inference downstream).
     assert_eq!(spec_c.n_fft(), 8);
     assert_eq!(spec_c.win_length(), 8);
     assert_eq!(spec_c.hop_length(), 4);
     assert_eq!(spec_c.window_pad(), WindowPad::Center);
     assert!(spec_c.center());
-    for (c, r) in to_vec(&spec_c.data().abs().unwrap())
+    for (c, r) in to_vec(&spec_c.data_ref().abs().unwrap())
       .iter()
-      .zip(to_vec(&spec_r.data().abs().unwrap()).iter())
+      .zip(to_vec(&spec_r.data_ref().abs().unwrap()).iter())
     {
       assert!(
         (c - r).abs() < 1e-6,
@@ -4202,7 +4280,7 @@ mod tests {
       // (carrying window_pad=Right, win<n_fft); it is the INVERSE that rejects
       // it, reading the placement off the typed Spectrum (no params passed).
       let spec = stft(&x, 16, 4, Some(win), WindowPad::Right).unwrap();
-      assert_eq!(spec.data().shape(), vec![5, 9]); // (num_frames, n_fft/2+1), n_fft=16
+      assert_eq!(spec.data_ref().shape(), vec![5, 9]); // (num_frames, n_fft/2+1), n_fft=16
       assert_eq!(spec.window_pad(), WindowPad::Right);
       assert_eq!(spec.win_length(), win);
       for len in [None, Some(16usize)] {
@@ -4255,7 +4333,7 @@ mod tests {
     let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
     let spec = stft(&x, 8, 4, Some(8), WindowPad::Center).unwrap();
     let spec_no_center = Spectrum::from_parts(
-      spec.data().try_clone().unwrap(),
+      spec.data_ref().try_clone().unwrap(),
       8, // n_fft
       4, // hop_length
       8, // win_length
@@ -4415,7 +4493,7 @@ mod tests {
     let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
     let stft_spec = stft(&x, 8, 4, Some(8), WindowPad::Center).unwrap();
     let external = Spectrum::from_parts(
-      stft_spec.data().try_clone().unwrap(),
+      stft_spec.data_ref().try_clone().unwrap(),
       8,
       4,
       8,
@@ -4564,7 +4642,7 @@ mod tests {
     // Hand-built reference on the Right-padded stft.
     let expected_mel = {
       let spec = stft(&x, n_fft, hop, Some(win), WindowPad::Right).unwrap();
-      let power = spec.data().abs().unwrap().square().unwrap();
+      let power = spec.data_ref().abs().unwrap().square().unwrap();
       let bank = mel_filter_bank(n_mels, n_fft, sr, 0.0, None).unwrap();
       let power_t = power.transpose().unwrap();
       to_vec(&ops::linalg_basic::matmul(&bank, &power_t).unwrap())
@@ -4582,7 +4660,7 @@ mod tests {
     // placed at a different offset, shifting the spectral energy).
     let center_mel = {
       let spec = stft(&x, n_fft, hop, Some(win), WindowPad::Center).unwrap();
-      let power = spec.data().abs().unwrap().square().unwrap();
+      let power = spec.data_ref().abs().unwrap().square().unwrap();
       let bank = mel_filter_bank(n_mels, n_fft, sr, 0.0, None).unwrap();
       let power_t = power.transpose().unwrap();
       to_vec(&ops::linalg_basic::matmul(&bank, &power_t).unwrap())
@@ -5609,7 +5687,7 @@ mod tests {
     let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
     let spec = stft(&x, 8, 4, Some(8), WindowPad::Center).unwrap();
     let spec_no_center = Spectrum::from_parts(
-      spec.data().try_clone().unwrap(),
+      spec.data_ref().try_clone().unwrap(),
       8,
       4,
       8,
@@ -5637,7 +5715,7 @@ mod tests {
     // (win < n_fft, hop small enough that an interior length is fully covered.)
     let spec_cov = stft(&x, 8, 2, Some(8), WindowPad::Center).unwrap();
     let cov = Spectrum::from_parts(
-      spec_cov.data().try_clone().unwrap(),
+      spec_cov.data_ref().try_clone().unwrap(),
       8,
       2,
       8,
@@ -5914,8 +5992,8 @@ mod tests {
   #[test]
   fn stft_config_default_matches_mlx_audio_defaults() {
     let cfg = StftConfig::default();
-    assert!(cfg.center);
-    assert_eq!(cfg.pad_mode, PadMode::Reflect);
+    assert!(cfg.center());
+    assert_eq!(cfg.pad_mode(), PadMode::Reflect);
   }
 
   /// `stft` and `stft_with_config(.., StftConfig::default())` produce

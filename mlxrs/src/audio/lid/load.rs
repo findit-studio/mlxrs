@@ -98,15 +98,12 @@ pub fn lid_output_from_pairs<I>(pairs: I) -> LidOutput
 where
   I: IntoIterator<Item = (String, f32)>,
 {
-  LidOutput {
-    predictions: pairs
+  LidOutput::new(
+    pairs
       .into_iter()
-      .map(|(language_code, probability)| LidPrediction {
-        language_code,
-        probability,
-      })
+      .map(|(language_code, probability)| LidPrediction::new(language_code, probability))
       .collect(),
-  }
+  )
 }
 
 /// Construct a [`LidModel`] from a local on-disk model directory —
@@ -155,17 +152,11 @@ mod tests {
   impl LidModel for FakeLid {
     fn predict(&self, _audio: &Array, top_k: usize) -> Result<LidOutput> {
       let mut predictions = vec![
-        LidPrediction {
-          language_code: "eng".into(),
-          probability: 0.95,
-        },
-        LidPrediction {
-          language_code: "fra".into(),
-          probability: 0.03,
-        },
+        LidPrediction::new("eng", 0.95),
+        LidPrediction::new("fra", 0.03),
       ];
       predictions.truncate(top_k);
-      Ok(LidOutput { predictions })
+      Ok(LidOutput::new(predictions))
     }
   }
 
@@ -190,7 +181,10 @@ mod tests {
 
     let captured: std::cell::RefCell<Option<(PathBuf, String)>> = std::cell::RefCell::new(None);
     let model = load(&dir.to_string_lossy(), |bundle| {
-      *captured.borrow_mut() = Some((bundle.model_path, bundle.config_json));
+      *captured.borrow_mut() = Some((
+        bundle.model_path().to_path_buf(),
+        bundle.config_json().to_owned(),
+      ));
       Ok(Box::new(FakeLid))
     })
     .expect("load constructs via the supplied factory");
@@ -201,8 +195,8 @@ mod tests {
 
     let probe = Array::from_slice::<f32>(&[0.0_f32; 16_000], &(16_000,)).unwrap();
     let out = model.predict(&probe, 2).unwrap();
-    assert_eq!(out.predictions.len(), 2);
-    assert_eq!(out.predictions[0].language_code, "eng");
+    assert_eq!(out.predictions_slice().len(), 2);
+    assert_eq!(out.predictions_slice()[0].language_code(), "eng");
   }
 
   /// Helper roundtrip: `lid_output_from_pairs` builds a sorted-input
@@ -214,8 +208,8 @@ mod tests {
       ("deu".to_string(), 0.2),
       ("fra".to_string(), 0.1),
     ]);
-    assert_eq!(out.predictions.len(), 3);
-    assert_eq!(out.predictions[0].language_code, "eng");
-    assert_eq!(out.predictions[2].language_code, "fra");
+    assert_eq!(out.predictions_slice().len(), 3);
+    assert_eq!(out.predictions_slice()[0].language_code(), "eng");
+    assert_eq!(out.predictions_slice()[2].language_code(), "fra");
   }
 }

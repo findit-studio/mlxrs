@@ -31,10 +31,14 @@
 /// the device, but the shipping [`super::player::AudioPlayer`] path
 /// only emits [`SampleFormat::F32`]; the variants are reserved for
 /// future format-conversion work (out of scope for A11).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+  Debug, Clone, Copy, PartialEq, Eq, Default, derive_more::Display, derive_more::IsVariant,
+)]
+#[display("{}", self.as_str())]
 pub enum SampleFormat {
   /// 32-bit interleaved float (the Swift `AudioPlayer` default; the
   /// only variant currently constructed by [`super::player::AudioPlayer`]).
+  #[default]
   F32,
   /// 16-bit signed interleaved integer. Reserved — A11 does not
   /// convert to this format; callers must supply f32 PCM.
@@ -42,6 +46,17 @@ pub enum SampleFormat {
   /// 16-bit unsigned interleaved integer. Reserved — A11 does not
   /// convert to this format; callers must supply f32 PCM.
   U16,
+}
+
+impl SampleFormat {
+  /// The canonical lowercase string representation (`f32`/`i16`/`u16`).
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::F32 => "f32",
+      Self::I16 => "i16",
+      Self::U16 => "u16",
+    }
+  }
 }
 
 /// Channel layout the player's cpal stream emits.
@@ -52,10 +67,11 @@ pub enum SampleFormat {
 /// streaming default is mono (`channels: 1`); we expose the common
 /// shapes plus a raw `Channels(N)` escape hatch for >2 channel
 /// configurations cpal supports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, derive_more::IsVariant)]
 pub enum ChannelLayout {
   /// One-channel (mono) — the Swift `AudioPlayer.startStreaming`
   /// default.
+  #[default]
   Mono,
   /// Two-channel (left, right) interleaved.
   Stereo,
@@ -69,6 +85,7 @@ pub enum ChannelLayout {
 impl ChannelLayout {
   /// Numeric channel count this layout maps to (cpal's
   /// `StreamConfig::channels`).
+  #[inline(always)]
   #[must_use]
   pub fn count(self) -> u16 {
     match self {
@@ -106,18 +123,18 @@ pub struct PlaybackConfig {
   ///
   /// Default: 24000 (matches the Swift `MLXAudioUI` voice-pipeline
   /// default).
-  pub sample_rate: u32,
+  sample_rate: u32,
   /// Channel layout. Default: [`ChannelLayout::Mono`] (the Swift
   /// streaming default).
-  pub channels: ChannelLayout,
+  channels: ChannelLayout,
   /// Sample format. Default: [`SampleFormat::F32`] (the Swift
   /// streaming default; the only format
   /// [`super::player::AudioPlayer`] emits today).
-  pub sample_format: SampleFormat,
+  sample_format: SampleFormat,
   /// Cpal device callback buffer-size hint (frames). `None` lets the
   /// platform pick (cpal's `BufferSize::Default` — equivalent to
   /// `AVAudioEngine`'s automatic I/O buffer sizing).
-  pub buffer_size_frames: Option<u32>,
+  buffer_size_frames: Option<u32>,
   /// Maximum queued *FRAMES* (NOT samples) before
   /// [`super::output_stream::AudioOutputStream::write_samples`]
   /// returns [`crate::error::Error::Backend`]. Bounds memory; bound
@@ -134,23 +151,49 @@ pub struct PlaybackConfig {
   /// bursty producer (TTS chunk arriving in 100ms windows) doesn't
   /// trip overflow, small enough that an unbounded-producer bug is
   /// caught instead of OOMing.
-  pub queue_capacity_frames: usize,
+  queue_capacity_frames: usize,
 }
 
 impl Default for PlaybackConfig {
   fn default() -> Self {
-    let sample_rate = 24_000;
-    Self {
-      sample_rate,
-      channels: ChannelLayout::Mono,
-      sample_format: SampleFormat::F32,
-      buffer_size_frames: None,
-      queue_capacity_frames: (sample_rate as usize) * 4,
-    }
+    Self::new(24_000, ChannelLayout::Mono, SampleFormat::F32)
   }
 }
 
 impl PlaybackConfig {
+  /// Build a [`PlaybackConfig`] with the given `sample_rate`, `channels`, and
+  /// `sample_format`. Sets `buffer_size_frames = None` (platform default) and
+  /// `queue_capacity_frames = sample_rate * 4` (four seconds of frames).
+  ///
+  /// Mirrors the three-parameter shape of Swift's
+  /// `AVAudioFormat(standardFormatWithSampleRate:channels:)` call.
+  #[must_use]
+  pub fn new(sample_rate: u32, channels: ChannelLayout, sample_format: SampleFormat) -> Self {
+    Self {
+      sample_rate,
+      channels,
+      sample_format,
+      buffer_size_frames: None,
+      queue_capacity_frames: (sample_rate as usize) * 4,
+    }
+  }
+
+  /// Override the cpal device callback buffer-size hint (in frames).
+  /// `None` (the default) lets the platform pick (`BufferSize::Default`).
+  #[must_use]
+  pub fn with_buffer_size_frames(mut self, frames: u32) -> Self {
+    self.buffer_size_frames = Some(frames);
+    self
+  }
+
+  /// Override the producer queue capacity (in frames). The player's
+  /// `with_device` constructor converts to samples via `× channels.count()`.
+  #[must_use]
+  pub fn with_queue_capacity_frames(mut self, frames: usize) -> Self {
+    self.queue_capacity_frames = frames;
+    self
+  }
+
   /// Build a config with the default channel layout
   /// ([`ChannelLayout::Mono`]) + format ([`SampleFormat::F32`]) + a
   /// 4-second queue capacity.
@@ -159,13 +202,7 @@ impl PlaybackConfig {
   /// single-argument constructor.
   #[must_use]
   pub fn mono(sample_rate: u32) -> Self {
-    Self {
-      sample_rate,
-      channels: ChannelLayout::Mono,
-      sample_format: SampleFormat::F32,
-      buffer_size_frames: None,
-      queue_capacity_frames: (sample_rate as usize) * 4,
-    }
+    Self::new(sample_rate, ChannelLayout::Mono, SampleFormat::F32)
   }
 
   /// Build a stereo config — a convenience helper. Swift's
@@ -179,13 +216,37 @@ impl PlaybackConfig {
   /// responsibility (see [`PlaybackConfig::queue_capacity_frames`]).
   #[must_use]
   pub fn stereo(sample_rate: u32) -> Self {
-    Self {
-      sample_rate,
-      channels: ChannelLayout::Stereo,
-      sample_format: SampleFormat::F32,
-      buffer_size_frames: None,
-      queue_capacity_frames: (sample_rate as usize) * 4,
-    }
+    Self::new(sample_rate, ChannelLayout::Stereo, SampleFormat::F32)
+  }
+
+  /// Output sample rate (Hz).
+  #[inline(always)]
+  pub fn sample_rate(&self) -> u32 {
+    self.sample_rate
+  }
+
+  /// Channel layout.
+  #[inline(always)]
+  pub fn channels(&self) -> ChannelLayout {
+    self.channels
+  }
+
+  /// Sample format.
+  #[inline(always)]
+  pub fn sample_format(&self) -> SampleFormat {
+    self.sample_format
+  }
+
+  /// Cpal device callback buffer-size hint (frames). `None` = platform default.
+  #[inline(always)]
+  pub fn buffer_size_frames(&self) -> Option<u32> {
+    self.buffer_size_frames
+  }
+
+  /// Maximum queued frames before `write_samples` returns `Err`.
+  #[inline(always)]
+  pub fn queue_capacity_frames(&self) -> usize {
+    self.queue_capacity_frames
   }
 
   /// Cpal `StreamConfig` equivalent of `self`. Returns

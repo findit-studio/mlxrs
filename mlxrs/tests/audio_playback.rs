@@ -95,35 +95,35 @@ fn playback_config_default_sample_rate_matches_swift_default() {
   // `PlaybackConfig::default` should match so the A8 pipeline
   // composes without spelling out the rate.
   let cfg = PlaybackConfig::default();
-  assert_eq!(cfg.sample_rate, 24_000);
-  assert_eq!(cfg.channels, ChannelLayout::Mono);
-  assert_eq!(cfg.sample_format, SampleFormat::F32);
-  assert_eq!(cfg.buffer_size_frames, None);
+  assert_eq!(cfg.sample_rate(), 24_000);
+  assert_eq!(cfg.channels(), ChannelLayout::Mono);
+  assert_eq!(cfg.sample_format(), SampleFormat::F32);
+  assert_eq!(cfg.buffer_size_frames(), None);
   // 4 seconds @ 24 kHz = 96000 frames.
-  assert_eq!(cfg.queue_capacity_frames, 96_000);
+  assert_eq!(cfg.queue_capacity_frames(), 96_000);
 }
 
 #[test]
 fn playback_config_mono_constructor() {
   let cfg = PlaybackConfig::mono(48_000);
-  assert_eq!(cfg.sample_rate, 48_000);
-  assert_eq!(cfg.channels, ChannelLayout::Mono);
-  assert_eq!(cfg.channels.count(), 1);
-  assert_eq!(cfg.queue_capacity_frames, 48_000 * 4);
+  assert_eq!(cfg.sample_rate(), 48_000);
+  assert_eq!(cfg.channels(), ChannelLayout::Mono);
+  assert_eq!(cfg.channels().count(), 1);
+  assert_eq!(cfg.queue_capacity_frames(), 48_000 * 4);
 }
 
 #[test]
 fn playback_config_stereo_constructor() {
   let cfg = PlaybackConfig::stereo(44_100);
-  assert_eq!(cfg.channels, ChannelLayout::Stereo);
-  assert_eq!(cfg.channels.count(), 2);
+  assert_eq!(cfg.channels(), ChannelLayout::Stereo);
+  assert_eq!(cfg.channels().count(), 2);
   // F4: `queue_capacity_frames` is in FRAMES (not samples), same
   // unit across mono and stereo. The player's `with_device`
   // constructor does the single frame-to-sample conversion via
   // `* channels.count()`; `stereo()` MUST NOT pre-multiply (doing
   // so would double-count the bound and yield 8 seconds of stereo
   // for what's advertised as a 4-second cap).
-  assert_eq!(cfg.queue_capacity_frames, 44_100 * 4);
+  assert_eq!(cfg.queue_capacity_frames(), 44_100 * 4);
 }
 
 #[test]
@@ -135,11 +135,11 @@ fn playback_config_stereo_queue_capacity_is_frames_not_samples() {
   // is in frames and matches the mono constructor's unit.
   let cfg = PlaybackConfig::stereo(48_000);
   // 4 seconds @ 48 kHz = 192_000 frames (NOT 384_000 samples).
-  assert_eq!(cfg.queue_capacity_frames, 192_000);
+  assert_eq!(cfg.queue_capacity_frames(), 192_000);
   // Per-channel-applied sample budget is what the player actually
   // bounds: 192_000 frames × 2 channels = 384_000 interleaved
   // samples (i.e. 4 seconds of stereo audio, the documented cap).
-  let samples = cfg.queue_capacity_frames * usize::from(cfg.channels.count());
+  let samples = cfg.queue_capacity_frames() * usize::from(cfg.channels().count());
   assert_eq!(samples, 384_000);
 }
 
@@ -151,8 +151,8 @@ fn playback_config_mono_queue_capacity_is_frames_not_samples() {
   // a degenerate case but pins the contract.
   let cfg = PlaybackConfig::mono(48_000);
   // 4 seconds @ 48 kHz = 192_000 frames.
-  assert_eq!(cfg.queue_capacity_frames, 192_000);
-  let samples = cfg.queue_capacity_frames * usize::from(cfg.channels.count());
+  assert_eq!(cfg.queue_capacity_frames(), 192_000);
+  let samples = cfg.queue_capacity_frames() * usize::from(cfg.channels().count());
   assert_eq!(samples, 192_000);
 }
 
@@ -165,13 +165,8 @@ fn channel_layout_count_arbitrary() {
 
 #[test]
 fn playback_config_cpal_config_rejects_zero_channels() {
-  let cfg = PlaybackConfig {
-    sample_rate: 16_000,
-    channels: ChannelLayout::Channels(0),
-    sample_format: SampleFormat::F32,
-    buffer_size_frames: None,
-    queue_capacity_frames: 1024,
-  };
+  let cfg = PlaybackConfig::new(16_000, ChannelLayout::Channels(0), SampleFormat::F32)
+    .with_queue_capacity_frames(1024);
   let err = cfg.cpal_config().unwrap_err();
   assert!(
     matches!(err, mlxrs::error::Error::Backend { ref message } if message.contains("channel count")),
@@ -181,13 +176,9 @@ fn playback_config_cpal_config_rejects_zero_channels() {
 
 #[test]
 fn playback_config_cpal_config_passes_buffer_hint() {
-  let with_hint = PlaybackConfig {
-    sample_rate: 16_000,
-    channels: ChannelLayout::Mono,
-    sample_format: SampleFormat::F32,
-    buffer_size_frames: Some(256),
-    queue_capacity_frames: 1024,
-  };
+  let with_hint = PlaybackConfig::new(16_000, ChannelLayout::Mono, SampleFormat::F32)
+    .with_buffer_size_frames(256)
+    .with_queue_capacity_frames(1024);
   let cpal_cfg = with_hint.cpal_config().unwrap();
   assert_eq!(cpal_cfg.channels, 1);
   // `cpal::SampleRate` is a `pub type SampleRate = u32` alias in
@@ -317,17 +308,12 @@ fn audio_player_rejects_non_f32_sample_format_pre_device() {
   // construction path itself succeeds (the device-open call would
   // be the one to reject — exercised in real-device tests). Verifies
   // the enum is exposed + the config builder is the gate.
-  let cfg = PlaybackConfig {
-    sample_rate: 16_000,
-    channels: ChannelLayout::Mono,
-    sample_format: SampleFormat::I16,
-    buffer_size_frames: None,
-    queue_capacity_frames: 1024,
-  };
+  let cfg = PlaybackConfig::new(16_000, ChannelLayout::Mono, SampleFormat::I16)
+    .with_queue_capacity_frames(1024);
   // cpal_config doesn't gate sample_format (that's a device-level
   // concern in cpal); the player's `with_device` constructor is what
   // returns Err on I16. Smoke-check the field round-trips:
-  assert_eq!(cfg.sample_format, SampleFormat::I16);
+  assert_eq!(cfg.sample_format(), SampleFormat::I16);
 }
 
 #[test]
@@ -343,27 +329,17 @@ fn audio_player_queue_capacity_frames_multiplied_by_channels() {
   // for both mono and stereo, set via an explicit-field struct
   // literal so the constructor's frame/sample convention can't mask
   // a future regression).
-  let stereo = PlaybackConfig {
-    sample_rate: 16_000,
-    channels: ChannelLayout::Stereo,
-    sample_format: SampleFormat::F32,
-    buffer_size_frames: None,
-    queue_capacity_frames: 1024,
-  };
+  let stereo = PlaybackConfig::new(16_000, ChannelLayout::Stereo, SampleFormat::F32)
+    .with_queue_capacity_frames(1024);
   assert_eq!(
-    stereo.queue_capacity_frames * usize::from(stereo.channels.count()),
+    stereo.queue_capacity_frames() * usize::from(stereo.channels().count()),
     2048
   );
 
-  let mono = PlaybackConfig {
-    sample_rate: 16_000,
-    channels: ChannelLayout::Mono,
-    sample_format: SampleFormat::F32,
-    buffer_size_frames: None,
-    queue_capacity_frames: 1024,
-  };
+  let mono = PlaybackConfig::new(16_000, ChannelLayout::Mono, SampleFormat::F32)
+    .with_queue_capacity_frames(1024);
   assert_eq!(
-    mono.queue_capacity_frames * usize::from(mono.channels.count()),
+    mono.queue_capacity_frames() * usize::from(mono.channels().count()),
     1024
   );
 }
@@ -392,7 +368,7 @@ fn audio_player_constructs_without_starting_stream() {
   assert!(!player.is_running());
   assert!(!player.is_paused());
   assert_eq!(player.buffer_depth(), 0);
-  assert_eq!(player.config().sample_rate, 24_000);
+  assert_eq!(player.config().sample_rate(), 24_000);
   // Defaults round-trip:
   assert!((player.volume() - 1.0).abs() < 1e-6);
   // Cleanup.
@@ -441,13 +417,8 @@ fn audio_player_buffer_overflow_returns_err() {
   use mlxrs::audio::playback::AudioPlayer;
 
   // Tiny queue so overflow is reachable without pushing megabytes.
-  let cfg = PlaybackConfig {
-    sample_rate: 16_000,
-    channels: ChannelLayout::Mono,
-    sample_format: SampleFormat::F32,
-    buffer_size_frames: None,
-    queue_capacity_frames: 1024,
-  };
+  let cfg = PlaybackConfig::new(16_000, ChannelLayout::Mono, SampleFormat::F32)
+    .with_queue_capacity_frames(1024);
   let mut player = AudioPlayer::new(cfg).unwrap();
   // F1: writes pre-`start()` are rejected (STATE_STOPPED is the
   // initial state, and the write-gate is "reject when STOPPED").
@@ -492,20 +463,20 @@ fn audio_player_underrun_emits_silence_no_panic() {
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires real default audio output device"]
-fn audio_player_set_volume_clamps_and_persists() {
+fn audio_player_store_volume_clamps_and_persists() {
   use mlxrs::audio::playback::AudioPlayer;
 
   let player = AudioPlayer::new(PlaybackConfig::mono(16_000)).unwrap();
   assert!((player.volume() - 1.0).abs() < 1e-6);
 
-  player.set_volume(0.5);
+  player.store_volume(0.5);
   assert!((player.volume() - 0.5).abs() < 1e-6);
 
   // Clamp: values >1.0 or <0.0 are clamped silently.
-  player.set_volume(1.5);
+  player.store_volume(1.5);
   assert!((player.volume() - 1.0).abs() < 1e-6);
 
-  player.set_volume(-0.1);
+  player.store_volume(-0.1);
   assert!((player.volume() - 0.0).abs() < 1e-6);
 }
 
@@ -688,10 +659,10 @@ fn audio_player_resume_after_stop_returns_terminated_err() {
 // F3 tests exercise the pure `sanitize_volume` helper directly so
 // they run in CI without a default audio output device. The
 // device-touching round-trip is exercised in
-// `audio_player_set_volume_clamps_and_persists` (real-device gate).
+// `audio_player_store_volume_clamps_and_persists` (real-device gate).
 
 #[test]
-fn audio_player_set_volume_sanitizes_nan_to_zero() {
+fn audio_player_store_volume_sanitizes_nan_to_zero() {
   // F3: NaN must NOT propagate into volume_bits — the callback's
   // `sample * volume` would emit NaN PCM (audible as full-scale
   // noise on most DACs). `f32::clamp` preserves NaN, so the
@@ -706,7 +677,7 @@ fn audio_player_set_volume_sanitizes_nan_to_zero() {
 }
 
 #[test]
-fn audio_player_set_volume_sanitizes_infinity_to_zero() {
+fn audio_player_store_volume_sanitizes_infinity_to_zero() {
   // F3: positive and negative infinity are both non-finite and
   // must sanitize to 0.0 (same policy as NaN — `f32::clamp` on +∞
   // returns 1.0, which is the wrong semantic for "you gave us
@@ -724,7 +695,7 @@ fn audio_player_set_volume_sanitizes_infinity_to_zero() {
 }
 
 #[test]
-fn audio_player_set_volume_clamps_negative_to_zero() {
+fn audio_player_store_volume_clamps_negative_to_zero() {
   // F3: negative finite values are clamped (not sanitized) — the
   // existing `clamp(0.0, 1.0)` path handles this. Explicit test so
   // a future regression (e.g. dropping the clamp in favor of the
@@ -735,7 +706,7 @@ fn audio_player_set_volume_clamps_negative_to_zero() {
 }
 
 #[test]
-fn audio_player_set_volume_passes_through_in_range() {
+fn audio_player_store_volume_passes_through_in_range() {
   // F3 sanity: finite in-range values pass through unchanged.
   assert_eq!(sanitize_volume(0.0), 0.0);
   assert_eq!(sanitize_volume(0.5), 0.5);
@@ -743,7 +714,7 @@ fn audio_player_set_volume_passes_through_in_range() {
 }
 
 #[test]
-fn audio_player_set_volume_clamps_above_unity() {
+fn audio_player_store_volume_clamps_above_unity() {
   // F3: finite values >1.0 clamp to 1.0 (not sanitized to 0.0 —
   // they're well-formed, just out of range).
   assert_eq!(sanitize_volume(1.5), 1.0);

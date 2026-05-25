@@ -148,10 +148,7 @@ mod tests {
   impl VadModel for FakeVad {
     fn generate(&self, _audio: &Array, _sample_rate: u32) -> Result<VadOutput> {
       Ok(VadOutput {
-        timestamps: vec![SpeechSegment {
-          start: 0,
-          end: 1600,
-        }],
+        timestamps: vec![SpeechSegment::new(0, 1600)],
         probabilities: Array::from_slice::<f32>(&[0.9], &(1,)).unwrap(),
         sample_rate: self.sample_rate,
       })
@@ -184,10 +181,13 @@ mod tests {
     let captured: std::cell::RefCell<Option<(PathBuf, String)>> = std::cell::RefCell::new(None);
     let model = load(&dir.to_string_lossy(), |bundle| {
       assert!(
-        bundle.quantization.is_none(),
+        bundle.quantization().is_none(),
         "dense config → no quantization"
       );
-      *captured.borrow_mut() = Some((bundle.model_path, bundle.config_json));
+      *captured.borrow_mut() = Some((
+        bundle.model_path().to_path_buf(),
+        bundle.config_json().to_owned(),
+      ));
       Ok(Box::new(FakeVad {
         sample_rate: 16_000,
       }))

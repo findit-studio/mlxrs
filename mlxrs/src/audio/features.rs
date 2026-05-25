@@ -330,7 +330,10 @@ pub fn get_mel_banks_kaldi(
 /// All variants use the **periodic** denominator `(window_size - 1)` (matching
 /// the reference's `2*pi*n / (window_size - 1)`); the Povey window is a Hann
 /// raised to the `0.85` power (the kaldi-asr `povey` window).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+  Debug, Clone, Copy, PartialEq, Eq, Default, derive_more::Display, derive_more::IsVariant,
+)]
+#[display("{}", self.as_str())]
 pub enum KaldiWindow {
   /// `0.54 - 0.46 * cos(2π n / (win_len - 1))` (the reference's default in
   /// `compute_fbank_kaldi`).
@@ -344,6 +347,19 @@ pub enum KaldiWindow {
   Povey,
   /// Constant `1.0` window (no windowing).
   Rectangular,
+}
+
+impl KaldiWindow {
+  /// The canonical lowercase string representation matching the mlx-audio
+  /// `win_type` argument (`hamming`/`hanning`/`povey`/`rectangular`).
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Hamming => "hamming",
+      Self::Hanning => "hanning",
+      Self::Povey => "povey",
+      Self::Rectangular => "rectangular",
+    }
+  }
 }
 
 /// Build the Kaldi-style analysis window of length `win_size`.
@@ -1199,7 +1215,10 @@ pub fn compute_fbank_kaldi(
 /// The delta at time `t` reads `c[t-n .. t+n]`; near the edges those indices
 /// fall outside `[0, time)`, so the spectrogram is padded by `n` frames on each
 /// side of the time axis first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+  Debug, Clone, Copy, PartialEq, Eq, Default, derive_more::Display, derive_more::IsVariant,
+)]
+#[display("{}", self.as_str())]
 pub enum DeltaPadMode {
   /// **Edge replication** (the reference default): the first / last time frame
   /// is repeated `n` times on the left / right (`mx.repeat(specgram[:, 0:1], n,
@@ -1209,6 +1228,17 @@ pub enum DeltaPadMode {
   /// **Zero padding**: `n` zero frames on each side (`mx.pad(specgram, [(0, 0),
   /// (n, n)])`). Matches the reference's `else` branch.
   Constant,
+}
+
+impl DeltaPadMode {
+  /// The canonical lowercase string representation matching the mlx-audio
+  /// `mode` argument (`edge`/`constant`).
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Edge => "edge",
+      Self::Constant => "constant",
+    }
+  }
 }
 
 /// Compute Kaldi-compatible delta (velocity / acceleration) coefficients of a

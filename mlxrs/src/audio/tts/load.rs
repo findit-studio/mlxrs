@@ -144,7 +144,7 @@ mod tests {
 
     let captured: std::cell::RefCell<Option<PathBuf>> = std::cell::RefCell::new(None);
     let model = load(&dir.to_string_lossy(), |bundle| {
-      *captured.borrow_mut() = Some(bundle.model_path);
+      *captured.borrow_mut() = Some(bundle.model_path().to_path_buf());
       Ok(Box::new(FakeTts))
     })
     .expect("load constructs via the supplied factory");
