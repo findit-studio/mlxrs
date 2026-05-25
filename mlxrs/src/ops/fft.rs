@@ -17,6 +17,8 @@
 
 use std::ffi::c_int;
 
+use derive_more::{Display, IsVariant};
+
 use crate::{
   array::Array,
   error::{Result, check},
@@ -25,7 +27,8 @@ use crate::{
 };
 
 /// Normalization mode for FFT ops. Mirrors `mlx.core.fft`'s `norm=` argument.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Display, IsVariant)]
+#[display("{}", self.as_str())]
 pub enum FftNorm {
   /// No scaling on forward, `1/N` on inverse. Matches numpy/mlx-python default.
   #[default]
@@ -34,6 +37,17 @@ pub enum FftNorm {
   Ortho,
   /// `1/N` on forward, no scaling on inverse.
   Forward,
+}
+
+impl FftNorm {
+  /// Lowercase string tag matching the mlx-python / mlx-c `norm=` argument.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Backward => "backward",
+      Self::Ortho => "ortho",
+      Self::Forward => "forward",
+    }
+  }
 }
 
 impl From<FftNorm> for mlxrs_sys::mlx_fft_norm {

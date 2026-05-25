@@ -54,11 +54,11 @@ fn exp_kernel_writes_e_to_every_element() {
   .unwrap();
 
   assert_eq!(kernel.output_arity(), 1);
-  assert_eq!(kernel.output_names(), &["out".to_string()]);
+  assert_eq!(kernel.output_names_slice(), &["out".to_string()]);
 
   let cfg = MetalKernelApplyConfig::new(
-    /* grid */ (8, 1, 1),
-    /* thread_group */ (8, 1, 1),
+    /* grid */ [8, 1, 1],
+    /* thread_group */ [8, 1, 1],
     /* output_shapes */ vec![vec![8]],
     /* output_dtypes */ vec![Dtype::F32],
   );
@@ -91,10 +91,8 @@ fn saxpy_kernel_uses_template_alpha() {
   )
   .unwrap();
 
-  let cfg = MetalKernelApplyConfig {
-    template: vec![("ALPHA".to_string(), KernelTemplateArg::Int(2))],
-    ..MetalKernelApplyConfig::new((4, 1, 1), (4, 1, 1), vec![vec![4]], vec![Dtype::F32])
-  };
+  let cfg = MetalKernelApplyConfig::new([4, 1, 1], [4, 1, 1], vec![vec![4]], vec![Dtype::F32])
+    .with_template(vec![("ALPHA".to_string(), KernelTemplateArg::Int(2))]);
   let mut outs = kernel.apply(&[&x, &y], &cfg).unwrap();
   assert_eq!(outs.len(), 1);
   let buf: Vec<f32> = outs[0].to_vec().unwrap();
@@ -123,8 +121,8 @@ fn multi_output_kernel_emits_two_arrays() {
   assert_eq!(kernel.output_arity(), 2);
 
   let cfg = MetalKernelApplyConfig::new(
-    (4, 1, 1),
-    (4, 1, 1),
+    [4, 1, 1],
+    [4, 1, 1],
     vec![vec![4], vec![4]],
     vec![Dtype::F32, Dtype::F32],
   );
@@ -161,8 +159,8 @@ fn apply_accepts_valid_multi_dim_output_shape() {
   .unwrap();
 
   let cfg = MetalKernelApplyConfig::new(
-    /* grid */ (4 * 8 * 16, 1, 1),
-    /* thread_group */ (32, 1, 1),
+    /* grid */ [4 * 8 * 16, 1, 1],
+    /* thread_group */ [32, 1, 1],
     /* output_shapes */ vec![vec![4, 8, 16]],
     /* output_dtypes */ vec![Dtype::F32],
   );
@@ -194,8 +192,8 @@ fn apply_rejects_shape_count_mismatch() {
   .unwrap();
   let input = Array::ones::<f32>(&[4]).unwrap();
   let cfg = MetalKernelApplyConfig::new(
-    (4, 1, 1),
-    (4, 1, 1),
+    [4, 1, 1],
+    [4, 1, 1],
     vec![vec![4], vec![4]],
     vec![Dtype::F32, Dtype::F32],
   );

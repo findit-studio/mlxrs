@@ -25,7 +25,7 @@ use crate::{
 };
 
 /// Build an `mlx_optional_float` from a Rust `Option<f32>`.
-#[inline]
+#[inline(always)]
 fn opt_float(v: Option<f32>) -> mlxrs_sys::mlx_optional_float {
   mlxrs_sys::mlx_optional_float {
     value: v.unwrap_or(0.0),

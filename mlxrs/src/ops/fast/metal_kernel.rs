@@ -18,6 +18,8 @@
 
 use std::ffi::CString;
 
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
+
 use crate::{
   array::Array,
   dtype::Dtype,
@@ -34,9 +36,11 @@ use crate::{
 ///
 /// Template arguments are referenced by name from the kernel source (e.g.
 /// `template <typename T, int N>` in MSL); the
-/// [`MetalKernelApplyConfig::template`] vector pairs each `(name, value)` and
+/// [`MetalKernelApplyConfig::template_slice`] vector pairs each `(name, value)` and
 /// forwards into one of `mlx_fast_metal_kernel_config_add_template_arg_{dtype,int,bool}`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum KernelTemplateArg {
   /// Boolean template parameter — forwards to
   /// `mlx_fast_metal_kernel_config_add_template_arg_bool`.
@@ -65,59 +69,56 @@ pub enum KernelTemplateArg {
 /// passing through to mlx-c (where the failure surfaces only at JIT time
 /// with a less actionable message).
 ///
-/// `template` may be empty; an absent entry is equivalent to omitting the
-/// kwarg in the swift / python APIs.
+/// The optional `template`, `init_value`, and `verbose` fields default to
+/// empty / `None` / `false` and can be set via the builder methods
+/// [`Self::with_template`], [`Self::with_init_value`], and
+/// [`Self::with_verbose`].
 ///
 /// `init_value` is `Some(v)` to pre-fill every output element with `v` before
 /// the kernel runs (mlx-c's `_set_init_value`); `None` skips that call,
 /// matching the swift / python default.
 #[derive(Debug, Clone)]
 pub struct MetalKernelApplyConfig {
-  /// Launch grid as `(grid_x, grid_y, grid_z)`. Forwarded to
+  /// Launch grid as `[grid_x, grid_y, grid_z]`. Forwarded to
   /// `mlx_fast_metal_kernel_config_set_grid`.
-  pub grid: (i32, i32, i32),
-  /// Thread-group size as `(x, y, z)`. Forwarded to
+  grid: [u32; 3],
+  /// Thread-group size as `[x, y, z]`. Forwarded to
   /// `mlx_fast_metal_kernel_config_set_thread_group`.
-  pub thread_group: (i32, i32, i32),
-  /// One shape per output array, aligned with [`Self::output_dtypes`] and
+  thread_group: [u32; 3],
+  /// One shape per output array, aligned with `output_dtypes` and
   /// with the `output_names` declared at parent-kernel construction.
-  pub output_shapes: Vec<Vec<i32>>,
-  /// One dtype per output array, aligned with [`Self::output_shapes`].
-  pub output_dtypes: Vec<Dtype>,
+  output_shapes: Vec<Vec<i32>>,
+  /// One dtype per output array, aligned with `output_shapes`.
+  output_dtypes: Vec<Dtype>,
   /// Template arguments, name + value. Empty is allowed.
-  pub template: Vec<(String, KernelTemplateArg)>,
+  template: Vec<(String, KernelTemplateArg)>,
   /// Optional pre-fill value for every output element (mlx-c's
   /// `_set_init_value`). `None` skips the call.
-  pub init_value: Option<f32>,
+  init_value: Option<f32>,
   /// If `true`, mlx-c logs the generated kernel source via
   /// `_set_verbose(true)` on each launch.
-  pub verbose: bool,
+  verbose: bool,
 }
 
 impl MetalKernelApplyConfig {
   /// Build a config with the required `grid`, `thread_group`, `output_shapes`,
-  /// and `output_dtypes`; optional template / init-value / verbose flags
-  /// default to empty / `None` / `false` and can be set on the returned value.
+  /// and `output_dtypes`; optional fields default to empty / `None` / `false`.
   ///
-  /// The constructor is intentionally NOT a `Builder` (the four required
-  /// arguments would all be `Option` and most call sites would set every
-  /// one); use struct-update on the returned value to override optional
-  /// fields:
+  /// Use the builder methods [`Self::with_template`], [`Self::with_init_value`],
+  /// and [`Self::with_verbose`] to set optional fields:
   ///
   /// ```ignore
-  /// MetalKernelApplyConfig {
-  ///     template: vec![("ALPHA".to_string(), KernelTemplateArg::Int(2))],
-  ///     init_value: Some(0.0),
-  ///     verbose: true,
-  ///     ..MetalKernelApplyConfig::new(
-  ///         (8, 1, 1), (8, 1, 1),
-  ///         vec![vec![8]], vec![Dtype::F32],
-  ///     )
-  /// }
+  /// MetalKernelApplyConfig::new(
+  ///     [8, 1, 1], [8, 1, 1],
+  ///     vec![vec![8]], vec![Dtype::F32],
+  /// )
+  /// .with_template(vec![("ALPHA".to_string(), KernelTemplateArg::Int(2))])
+  /// .with_init_value(0.0)
+  /// .with_verbose(true)
   /// ```
   pub fn new(
-    grid: (i32, i32, i32),
-    thread_group: (i32, i32, i32),
+    grid: [u32; 3],
+    thread_group: [u32; 3],
     output_shapes: Vec<Vec<i32>>,
     output_dtypes: Vec<Dtype>,
   ) -> Self {
@@ -130,6 +131,69 @@ impl MetalKernelApplyConfig {
       init_value: None,
       verbose: false,
     }
+  }
+
+  /// Set the template arguments for this config.
+  #[must_use]
+  pub fn with_template(mut self, template: Vec<(String, KernelTemplateArg)>) -> Self {
+    self.template = template;
+    self
+  }
+
+  /// Set the optional pre-fill init value for every output element.
+  #[must_use]
+  pub fn with_init_value(mut self, value: f32) -> Self {
+    self.init_value = Some(value);
+    self
+  }
+
+  /// Set the verbosity flag (mlx-c logs the generated kernel source when `true`).
+  #[must_use]
+  pub fn with_verbose(mut self, v: bool) -> Self {
+    self.verbose = v;
+    self
+  }
+
+  /// Launch grid `[grid_x, grid_y, grid_z]`.
+  #[inline(always)]
+  pub fn grid(&self) -> [u32; 3] {
+    self.grid
+  }
+
+  /// Thread-group size `[x, y, z]`.
+  #[inline(always)]
+  pub fn thread_group(&self) -> [u32; 3] {
+    self.thread_group
+  }
+
+  /// Output shapes — one `Vec<i32>` per declared output.
+  #[inline(always)]
+  pub fn output_shapes_slice(&self) -> &[Vec<i32>] {
+    &self.output_shapes
+  }
+
+  /// Output dtypes — one [`Dtype`] per declared output.
+  #[inline(always)]
+  pub fn output_dtypes_slice(&self) -> &[Dtype] {
+    &self.output_dtypes
+  }
+
+  /// Template argument pairs `(name, value)`.
+  #[inline(always)]
+  pub fn template_slice(&self) -> &[(String, KernelTemplateArg)] {
+    &self.template
+  }
+
+  /// Optional pre-fill init value (`None` means skip the mlx-c `_set_init_value` call).
+  #[inline(always)]
+  pub fn init_value(&self) -> Option<f32> {
+    self.init_value
+  }
+
+  /// Verbosity flag.
+  #[inline(always)]
+  pub fn verbose(&self) -> bool {
+    self.verbose
   }
 }
 
@@ -215,6 +279,27 @@ fn cstring_or_err(s: &str, context: &'static str) -> Result<CString> {
       "mlxrs::ops::fast::metal_kernel: {context} contains an interior NUL byte: {s:?}"
     ),
   })
+}
+
+/// Checked-conversion of a `[u32; 3]` dispatch dimension to `[i32; 3]` for
+/// the mlx-c `set_grid` / `set_thread_group` FFI. Any component above
+/// `i32::MAX` returns [`Error::Backend`] before the call — without this gate
+/// the `as i32` cast would wrap to a negative value, which the Metal backend
+/// would build a corrupt `MTL::Size(gx, gy, gz)` from. `context` is `"grid"`
+/// or `"thread_group"` so the error message identifies which dimension
+/// overflowed.
+fn to_dispatch_dim(dim: [u32; 3], context: &'static str) -> Result<[i32; 3]> {
+  let mut out = [0_i32; 3];
+  for (axis, &v) in dim.iter().enumerate() {
+    out[axis] = i32::try_from(v).map_err(|_| Error::Backend {
+      message: format!(
+        "mlxrs::ops::fast::metal_kernel: {context}[{axis}]={v} exceeds i32::MAX \
+         ({}), which mlx-c's set_{context} requires; reduce the dispatch dimension",
+        i32::MAX
+      ),
+    })?;
+  }
+  Ok(out)
 }
 
 /// Compiled custom Metal kernel ready for repeated invocation via
@@ -365,12 +450,14 @@ impl MetalKernel {
 
   /// Number of output arrays this kernel produces, matching the
   /// `output_names` slice passed to [`MetalKernel::new`].
+  #[inline(always)]
   pub fn output_arity(&self) -> usize {
     self.output_names.len()
   }
 
   /// Output parameter names (the slice passed to [`MetalKernel::new`]).
-  pub fn output_names(&self) -> &[String] {
+  #[inline(always)]
+  pub fn output_names_slice(&self) -> &[String] {
     &self.output_names
   }
 
@@ -392,25 +479,28 @@ impl MetalKernel {
   /// - [`Error::Backend`] if any mlx-c `_set_*` / `_add_*` / `_apply` call
   ///   reports an error (e.g. a runtime Metal pipeline failure).
   pub fn apply(&self, inputs: &[&Array], config: &MetalKernelApplyConfig) -> Result<Vec<Array>> {
-    crate::error::ensure_handler_installed();
+    // ensure_handler_installed() is deferred until AFTER all pure-Rust
+    // validation (arity, output_shapes, dispatch-dim overflow) so a wrapper
+    // error never touches mlx-c — its slow path calls `mlx_set_error_handler`
+    // FFI on the stripped-ctor / fallback route.
 
     let expected = self.output_names.len();
-    if config.output_shapes.len() != expected {
+    if config.output_shapes_slice().len() != expected {
       return Err(Error::ShapeMismatch {
         message: format!(
           "mlxrs::ops::fast::metal_kernel: output_shapes.len()={} does not match \
            the kernel's declared output_names.len()={}",
-          config.output_shapes.len(),
+          config.output_shapes_slice().len(),
           expected
         ),
       });
     }
-    if config.output_dtypes.len() != expected {
+    if config.output_dtypes_slice().len() != expected {
       return Err(Error::ShapeMismatch {
         message: format!(
           "mlxrs::ops::fast::metal_kernel: output_dtypes.len()={} does not match \
            the kernel's declared output_names.len()={}",
-          config.output_dtypes.len(),
+          config.output_dtypes_slice().len(),
           expected
         ),
       });
@@ -426,7 +516,7 @@ impl MetalKernel {
     // a JIT-time backend message, and prevents the empty-slice case from
     // ever reaching the FFI (where it would otherwise rely on `dim_ptr`'s
     // sentinel for defined-pointer semantics).
-    for (idx, shape) in config.output_shapes.iter().enumerate() {
+    for (idx, shape) in config.output_shapes_slice().iter().enumerate() {
       if shape.is_empty() {
         return Err(Error::ShapeMismatch {
           message: format!(
@@ -442,6 +532,22 @@ impl MetalKernel {
         other => other,
       })?;
     }
+
+    // Pre-FFI dispatch-dimension overflow check.
+    //
+    // mlx-c's `set_grid` / `set_thread_group` take `i32` per dimension; the
+    // Rust surface accepts `[u32; 3]` so callers cannot pass a negative
+    // dimension. Convert via `i32::try_from` HERE — before any mlx-c
+    // allocation or setter call — so a u32 value above `i32::MAX` cannot
+    // wrap into a negative dimension and reach the Metal backend's
+    // `MTL::Size(gx, gy, gz)` construction with corrupt data, and so a
+    // grid-overflow doesn't get masked by an earlier `_set_outputs` FFI
+    // error reaching `?` first.
+    let grid_i32 = to_dispatch_dim(config.grid(), "grid")?;
+    let thread_group_i32 = to_dispatch_dim(config.thread_group(), "thread_group")?;
+
+    // Pure-Rust validation done; from here on we may touch mlx-c.
+    crate::error::ensure_handler_installed();
 
     // Resolve the stream FIRST so its cleared-thread poison guard fires
     // before any allocation — matches `ops::quantized::quantize` / `svd`.
@@ -467,7 +573,11 @@ impl MetalKernel {
     // validation already ran above; the per-call `dim_ptr` sentinel keeps an
     // empty `Vec<i32>` from passing a singular dangling pointer into mlx-c's
     // `std::vector<int>` range constructor.
-    for (shape, dtype) in config.output_shapes.iter().zip(config.output_dtypes.iter()) {
+    for (shape, dtype) in config
+      .output_shapes_slice()
+      .iter()
+      .zip(config.output_dtypes_slice().iter())
+    {
       // SAFETY: `config_raw` is the valid handle owned by `_config_guard`;
       // `crate::shape::dim_ptr(shape)` is either `shape.as_ptr()` (a live
       // read-only buffer of `shape.len()` `c_int`s, with `shape: &Vec<i32>`
@@ -486,30 +596,32 @@ impl MetalKernel {
       })?;
     }
 
-    // Grid + thread-group (always required by the C config).
+    // Grid + thread-group (always required by the C config). Dimensions
+    // already validated above as `grid_i32` / `thread_group_i32`; the
+    // FFI receives the bounds-checked i32 values directly.
     // SAFETY: `config_raw` is the valid handle owned by `_config_guard`;
     // pure-value arguments, no pointer lifetimes; rc via `check()`.
     check(unsafe {
       mlxrs_sys::mlx_fast_metal_kernel_config_set_grid(
         config_raw,
-        config.grid.0,
-        config.grid.1,
-        config.grid.2,
+        grid_i32[0],
+        grid_i32[1],
+        grid_i32[2],
       )
     })?;
     // SAFETY: as above; pure-value args, rc via `check()`.
     check(unsafe {
       mlxrs_sys::mlx_fast_metal_kernel_config_set_thread_group(
         config_raw,
-        config.thread_group.0,
-        config.thread_group.1,
-        config.thread_group.2,
+        thread_group_i32[0],
+        thread_group_i32[1],
+        thread_group_i32[2],
       )
     })?;
 
     // Optional init-value (mlx-c skips the pre-fill when `_set_init_value`
     // is never called; we match that contract by only forwarding `Some`).
-    if let Some(v) = config.init_value {
+    if let Some(v) = config.init_value() {
       // SAFETY: as above; pure-value arg, rc via `check()`.
       check(unsafe { mlxrs_sys::mlx_fast_metal_kernel_config_set_init_value(config_raw, v) })?;
     }
@@ -518,13 +630,13 @@ impl MetalKernel {
     // `false` is a no-op apart from honoring an explicit caller flag).
     // SAFETY: as above; pure-value arg, rc via `check()`.
     check(unsafe {
-      mlxrs_sys::mlx_fast_metal_kernel_config_set_verbose(config_raw, config.verbose)
+      mlxrs_sys::mlx_fast_metal_kernel_config_set_verbose(config_raw, config.verbose())
     })?;
 
     // Template arguments — dispatch on the Rust enum to one of three mlx-c
     // typed `_add_template_arg_*` calls. Each arg name needs a transient
     // CString that must outlive its call.
-    for (arg_name, arg_value) in &config.template {
+    for (arg_name, arg_value) in config.template_slice() {
       let name_c = cstring_or_err(arg_name.as_str(), "template-arg name")?;
       match arg_value {
         KernelTemplateArg::Bool(v) => {
@@ -700,31 +812,29 @@ mod tests {
 
   #[test]
   fn config_new_defaults_optional_fields() {
-    let cfg = MetalKernelApplyConfig::new((8, 1, 1), (4, 1, 1), vec![vec![8]], vec![Dtype::F32]);
-    assert_eq!(cfg.grid, (8, 1, 1));
-    assert_eq!(cfg.thread_group, (4, 1, 1));
-    assert_eq!(cfg.output_shapes, vec![vec![8]]);
-    assert_eq!(cfg.output_dtypes, vec![Dtype::F32]);
-    assert!(cfg.template.is_empty());
-    assert!(cfg.init_value.is_none());
-    assert!(!cfg.verbose);
+    let cfg = MetalKernelApplyConfig::new([8, 1, 1], [4, 1, 1], vec![vec![8]], vec![Dtype::F32]);
+    assert_eq!(cfg.grid(), [8, 1, 1]);
+    assert_eq!(cfg.thread_group(), [4, 1, 1]);
+    assert_eq!(cfg.output_shapes_slice(), &[vec![8]]);
+    assert_eq!(cfg.output_dtypes_slice(), &[Dtype::F32]);
+    assert!(cfg.template_slice().is_empty());
+    assert!(cfg.init_value().is_none());
+    assert!(!cfg.verbose());
   }
 
   #[test]
   fn config_struct_update_overrides_optional_fields() {
-    let cfg = MetalKernelApplyConfig {
-      template: vec![("ALPHA".to_string(), KernelTemplateArg::Int(2))],
-      init_value: Some(0.5),
-      verbose: true,
-      ..MetalKernelApplyConfig::new((16, 1, 1), (8, 1, 1), vec![vec![16]], vec![Dtype::F16])
-    };
-    assert_eq!(cfg.grid, (16, 1, 1));
-    assert_eq!(cfg.thread_group, (8, 1, 1));
-    assert_eq!(cfg.template.len(), 1);
-    assert_eq!(cfg.template[0].0, "ALPHA");
-    assert_eq!(cfg.template[0].1, KernelTemplateArg::Int(2));
-    assert_eq!(cfg.init_value, Some(0.5));
-    assert!(cfg.verbose);
+    let cfg = MetalKernelApplyConfig::new([16, 1, 1], [8, 1, 1], vec![vec![16]], vec![Dtype::F16])
+      .with_template(vec![("ALPHA".to_string(), KernelTemplateArg::Int(2))])
+      .with_init_value(0.5)
+      .with_verbose(true);
+    assert_eq!(cfg.grid(), [16, 1, 1]);
+    assert_eq!(cfg.thread_group(), [8, 1, 1]);
+    assert_eq!(cfg.template_slice().len(), 1);
+    assert_eq!(cfg.template_slice()[0].0, "ALPHA");
+    assert_eq!(cfg.template_slice()[0].1, KernelTemplateArg::Int(2));
+    assert_eq!(cfg.init_value(), Some(0.5));
+    assert!(cfg.verbose());
   }
 
   #[test]
@@ -733,23 +843,26 @@ mod tests {
     // clone the config rather than rebuild it; pin the bound.
     fn assert_clone<T: Clone>() {}
     assert_clone::<MetalKernelApplyConfig>();
-    let cfg = MetalKernelApplyConfig::new((1, 1, 1), (1, 1, 1), vec![vec![1]], vec![Dtype::F32]);
+    let cfg = MetalKernelApplyConfig::new([1, 1, 1], [1, 1, 1], vec![vec![1]], vec![Dtype::F32]);
     let cloned = cfg.clone();
-    assert_eq!(cloned.grid, cfg.grid);
-    assert_eq!(cloned.output_shapes, cfg.output_shapes);
+    assert_eq!(cloned.grid(), cfg.grid());
+    assert_eq!(cloned.output_shapes_slice(), cfg.output_shapes_slice());
   }
 
   #[test]
   fn config_multi_output_shapes_and_dtypes_align() {
     let cfg = MetalKernelApplyConfig::new(
-      (2, 2, 1),
-      (1, 1, 1),
+      [2, 2, 1],
+      [1, 1, 1],
       vec![vec![4], vec![4, 4]],
       vec![Dtype::F32, Dtype::I32],
     );
-    assert_eq!(cfg.output_shapes.len(), cfg.output_dtypes.len());
-    assert_eq!(cfg.output_shapes[1], vec![4, 4]);
-    assert_eq!(cfg.output_dtypes[1], Dtype::I32);
+    assert_eq!(
+      cfg.output_shapes_slice().len(),
+      cfg.output_dtypes_slice().len()
+    );
+    assert_eq!(cfg.output_shapes_slice()[1], vec![4, 4]);
+    assert_eq!(cfg.output_dtypes_slice()[1], Dtype::I32);
   }
 
   // ───────────────────────── MetalKernel::new (validation) ─────────────────────────
@@ -844,7 +957,7 @@ mod tests {
     let kernel = make_validation_kernel(&["out"]);
     let input = Array::ones::<f32>(&(8usize,)).expect("ones alloc");
     let cfg =
-      MetalKernelApplyConfig::new((8, 1, 1), (8, 1, 1), vec![vec![-1, 8]], vec![Dtype::F32]);
+      MetalKernelApplyConfig::new([8, 1, 1], [8, 1, 1], vec![vec![-1, 8]], vec![Dtype::F32]);
     let err = kernel
       .apply(&[&input], &cfg)
       .expect_err("negative output dim should be rejected before FFI");
@@ -871,7 +984,7 @@ mod tests {
     // message rather than waiting for a JIT-time backend error.
     let kernel = make_validation_kernel(&["out"]);
     let input = Array::ones::<f32>(&(8usize,)).expect("ones alloc");
-    let cfg = MetalKernelApplyConfig::new((1, 1, 1), (1, 1, 1), vec![vec![]], vec![Dtype::F32]);
+    let cfg = MetalKernelApplyConfig::new([1, 1, 1], [1, 1, 1], vec![vec![]], vec![Dtype::F32]);
     let err = kernel
       .apply(&[&input], &cfg)
       .expect_err("empty output shape should be rejected before FFI");
