@@ -59,10 +59,22 @@ fn build_model_with_pieces(pieces: &[(&str, f32, u8)], model_type: u64) -> Vec<u
 fn from_model_bytes_parses_unigram_vocab() {
   let data = build_model_with_pieces(
     &[
-      ("<unk>", 0.0, SentencePiecePieceType::Unknown as u8),
-      ("\u{2581}hello", -1.0, SentencePiecePieceType::Normal as u8),
-      ("\u{2581}world", -1.0, SentencePiecePieceType::Normal as u8),
-      ("\u{2581}", -3.0, SentencePiecePieceType::Normal as u8),
+      ("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8),
+      (
+        "\u{2581}hello",
+        -1.0,
+        SentencePiecePieceType::Normal.as_raw() as u8,
+      ),
+      (
+        "\u{2581}world",
+        -1.0,
+        SentencePiecePieceType::Normal.as_raw() as u8,
+      ),
+      (
+        "\u{2581}",
+        -3.0,
+        SentencePiecePieceType::Normal.as_raw() as u8,
+      ),
     ],
     1, // unigram
   );
@@ -76,10 +88,22 @@ fn from_model_bytes_parses_unigram_vocab() {
 fn unigram_round_trip_recovers_original() {
   let data = build_model_with_pieces(
     &[
-      ("<unk>", 0.0, SentencePiecePieceType::Unknown as u8),
-      ("\u{2581}hello", -1.0, SentencePiecePieceType::Normal as u8),
-      ("\u{2581}world", -1.0, SentencePiecePieceType::Normal as u8),
-      ("\u{2581}", -3.0, SentencePiecePieceType::Normal as u8),
+      ("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8),
+      (
+        "\u{2581}hello",
+        -1.0,
+        SentencePiecePieceType::Normal.as_raw() as u8,
+      ),
+      (
+        "\u{2581}world",
+        -1.0,
+        SentencePiecePieceType::Normal.as_raw() as u8,
+      ),
+      (
+        "\u{2581}",
+        -3.0,
+        SentencePiecePieceType::Normal.as_raw() as u8,
+      ),
     ],
     1,
   );
@@ -94,11 +118,19 @@ fn unigram_round_trip_recovers_original() {
 fn unigram_byte_fallback_for_oov_character() {
   let data = build_model_with_pieces(
     &[
-      ("<unk>", 0.0, SentencePiecePieceType::Unknown as u8),
-      ("\u{2581}hello", -1.0, SentencePiecePieceType::Normal as u8),
-      ("\u{2581}", -3.0, SentencePiecePieceType::Normal as u8),
+      ("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8),
+      (
+        "\u{2581}hello",
+        -1.0,
+        SentencePiecePieceType::Normal.as_raw() as u8,
+      ),
+      (
+        "\u{2581}",
+        -3.0,
+        SentencePiecePieceType::Normal.as_raw() as u8,
+      ),
       // Byte-fallback for `!` (0x21)
-      ("<0x21>", -5.0, SentencePiecePieceType::Byte as u8),
+      ("<0x21>", -5.0, SentencePiecePieceType::Byte.as_raw() as u8),
     ],
     1,
   );
@@ -120,9 +152,17 @@ fn unrecognized_byte_falls_back_to_unknown_id_not_panic() {
   // must round-trip through `unknown_token_id` instead of panicking.
   let data = build_model_with_pieces(
     &[
-      ("<unk>", 0.0, SentencePiecePieceType::Unknown as u8),
-      ("\u{2581}hi", -1.0, SentencePiecePieceType::Normal as u8),
-      ("\u{2581}", -3.0, SentencePiecePieceType::Normal as u8),
+      ("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8),
+      (
+        "\u{2581}hi",
+        -1.0,
+        SentencePiecePieceType::Normal.as_raw() as u8,
+      ),
+      (
+        "\u{2581}",
+        -3.0,
+        SentencePiecePieceType::Normal.as_raw() as u8,
+      ),
     ],
     1,
   );
@@ -137,13 +177,29 @@ fn bpe_greedy_merge_picks_highest_scoring_pair() {
   // BPE model: "ab" merges to "abc" via higher score than "bc".
   let data = build_model_with_pieces(
     &[
-      ("<unk>", 0.0, SentencePiecePieceType::Unknown as u8),
-      ("\u{2581}", -3.0, SentencePiecePieceType::Normal as u8),
-      ("\u{2581}a", -2.0, SentencePiecePieceType::Normal as u8),
-      ("\u{2581}ab", -1.0, SentencePiecePieceType::Normal as u8),
-      ("b", -2.0, SentencePiecePieceType::Normal as u8),
-      ("c", -2.0, SentencePiecePieceType::Normal as u8),
-      ("\u{2581}abc", -0.5, SentencePiecePieceType::Normal as u8),
+      ("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8),
+      (
+        "\u{2581}",
+        -3.0,
+        SentencePiecePieceType::Normal.as_raw() as u8,
+      ),
+      (
+        "\u{2581}a",
+        -2.0,
+        SentencePiecePieceType::Normal.as_raw() as u8,
+      ),
+      (
+        "\u{2581}ab",
+        -1.0,
+        SentencePiecePieceType::Normal.as_raw() as u8,
+      ),
+      ("b", -2.0, SentencePiecePieceType::Normal.as_raw() as u8),
+      ("c", -2.0, SentencePiecePieceType::Normal.as_raw() as u8),
+      (
+        "\u{2581}abc",
+        -0.5,
+        SentencePiecePieceType::Normal.as_raw() as u8,
+      ),
     ],
     2, // bpe
   );

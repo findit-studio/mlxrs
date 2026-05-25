@@ -912,7 +912,7 @@ impl ChatSession {
     //    `cfg.eos` with the tokenizer's set; mirror that so `finish_reason`
     //    matches the plain entry points exactly.
     let detok = self.tokenizer.detokenizer();
-    let eos: Vec<u32> = self.tokenizer.eos_token_ids().iter().copied().collect();
+    let eos: Vec<u32> = self.tokenizer.eos_token_ids_iter().collect();
     let mut cfg = self.generate_params.clone();
     cfg.eos = eos.clone();
     let max_tokens = cfg.max_tokens;

@@ -42,9 +42,9 @@ fn json_tools_single_call_happy_path() {
     )
     .unwrap();
   assert_eq!(calls.len(), 1);
-  assert_eq!(calls[0].name, "get_weather");
-  assert_eq!(calls[0].arguments, json!({"city": "Paris", "days": 3}));
-  assert!(calls[0].id.is_none());
+  assert_eq!(calls[0].name(), "get_weather");
+  assert_eq!(*calls[0].arguments(), json!({"city": "Paris", "days": 3}));
+  assert!(calls[0].id().is_none());
 }
 
 #[test]
@@ -54,8 +54,8 @@ fn json_tools_leading_trailing_whitespace_trimmed() {
     .parse("   \n\t{\"name\": \"f\", \"arguments\": {}}\n\n  ", None)
     .unwrap();
   assert_eq!(calls.len(), 1);
-  assert_eq!(calls[0].name, "f");
-  assert_eq!(calls[0].arguments, json!({}));
+  assert_eq!(calls[0].name(), "f");
+  assert_eq!(*calls[0].arguments(), json!({}));
 }
 
 #[test]
@@ -63,8 +63,8 @@ fn json_tools_missing_arguments_field_yields_null() {
   // Python returns whatever `json.loads` produces; we follow with
   // `arguments.unwrap_or(Value::Null)` so a missing field is `null`.
   let calls = JsonTools.parse(r#"{"name": "ping"}"#, None).unwrap();
-  assert_eq!(calls[0].name, "ping");
-  assert_eq!(calls[0].arguments, Value::Null);
+  assert_eq!(calls[0].name(), "ping");
+  assert_eq!(*calls[0].arguments(), Value::Null);
 }
 
 #[test]
@@ -96,11 +96,11 @@ fn pythonic_single_call_happy_path() {
     )
     .unwrap();
   assert_eq!(calls.len(), 1);
-  assert_eq!(calls[0].name, "get_weather");
-  assert_eq!(calls[0].arguments["city"], json!("Paris"));
-  assert_eq!(calls[0].arguments["days"], json!(3));
+  assert_eq!(calls[0].name(), "get_weather");
+  assert_eq!(calls[0].arguments()["city"], json!("Paris"));
+  assert_eq!(calls[0].arguments()["days"], json!(3));
   // Python `ast.literal_eval("True") -> True`; our literal_eval matches.
-  assert_eq!(calls[0].arguments["hot"], json!(true));
+  assert_eq!(calls[0].arguments()["hot"], json!(true));
 }
 
 #[test]
@@ -108,8 +108,8 @@ fn pythonic_empty_args_call() {
   // The regex still matches `[name()]`; the loop over `(\w+)=...` finds none.
   let calls = Pythonic.parse("[ping()]", None).unwrap();
   assert_eq!(calls.len(), 1);
-  assert_eq!(calls[0].name, "ping");
-  assert_eq!(calls[0].arguments, json!({}));
+  assert_eq!(calls[0].name(), "ping");
+  assert_eq!(*calls[0].arguments(), json!({}));
 }
 
 #[test]
@@ -117,8 +117,8 @@ fn pythonic_first_match_only_when_multiple_present() {
   // pythonic.py:21 — `_tool_call_regex.search(text)` (first match only).
   let calls = Pythonic.parse("[a(x=1)] then [b(y=2)]", None).unwrap();
   assert_eq!(calls.len(), 1);
-  assert_eq!(calls[0].name, "a");
-  assert_eq!(calls[0].arguments["x"], json!(1));
+  assert_eq!(calls[0].name(), "a");
+  assert_eq!(calls[0].arguments()["x"], json!(1));
 }
 
 #[test]
@@ -133,7 +133,7 @@ fn pythonic_unquoted_value_keeps_string_on_literal_eval_fail() {
   // pythonic.py:38-41 — `ast.literal_eval` failure keeps the raw string.
   let calls = Pythonic.parse(r#"[f(name=Alice)]"#, None).unwrap();
   // `Alice` isn't valid JSON/Python literal → falls through to string.
-  assert_eq!(calls[0].arguments["name"], json!("Alice"));
+  assert_eq!(calls[0].arguments()["name"], json!("Alice"));
 }
 
 // ---------------------------------------------------------------------------
@@ -147,16 +147,16 @@ fn mistral_single_call_happy_path() {
     .parse(r#"get_weather[ARGS]{"city": "Paris", "days": 3}"#, None)
     .unwrap();
   assert_eq!(calls.len(), 1);
-  assert_eq!(calls[0].name, "get_weather");
-  assert_eq!(calls[0].arguments, json!({"city": "Paris", "days": 3}));
+  assert_eq!(calls[0].name(), "get_weather");
+  assert_eq!(*calls[0].arguments(), json!({"city": "Paris", "days": 3}));
 }
 
 #[test]
 fn mistral_leading_whitespace_around_name_and_args() {
   // The `\s*` allows whitespace; we trim around `[ARGS]` and before `{`.
   let calls = Mistral.parse("  ping[ARGS]  {}  ", None).unwrap();
-  assert_eq!(calls[0].name, "ping");
-  assert_eq!(calls[0].arguments, json!({}));
+  assert_eq!(calls[0].name(), "ping");
+  assert_eq!(*calls[0].arguments(), json!({}));
 }
 
 #[test]
@@ -191,10 +191,10 @@ fn qwen3_coder_single_call_happy_path() {
   let text = "<function=get_weather><parameter=city>Paris</parameter><parameter=days>3</parameter></function>";
   let calls = Qwen3Coder.parse(text, None).unwrap();
   assert_eq!(calls.len(), 1);
-  assert_eq!(calls[0].name, "get_weather");
+  assert_eq!(calls[0].name(), "get_weather");
   // Without `tools` schema, the values stay as raw strings (qwen3_coder.py:42).
-  assert_eq!(calls[0].arguments["city"], json!("Paris"));
-  assert_eq!(calls[0].arguments["days"], json!("3"));
+  assert_eq!(calls[0].arguments()["city"], json!("Paris"));
+  assert_eq!(calls[0].arguments()["days"], json!("3"));
 }
 
 #[test]
@@ -214,10 +214,10 @@ fn qwen3_coder_tools_schema_coerces_int_and_bool() {
   }]);
   let text = "<function=f><parameter=n>42</parameter><parameter=ok>true</parameter><parameter=name>Alice</parameter></function>";
   let calls = Qwen3Coder.parse(text, Some(&tools)).unwrap();
-  assert_eq!(calls[0].name, "f");
-  assert_eq!(calls[0].arguments["n"], json!(42));
-  assert_eq!(calls[0].arguments["ok"], json!(true));
-  assert_eq!(calls[0].arguments["name"], json!("Alice"));
+  assert_eq!(calls[0].name(), "f");
+  assert_eq!(calls[0].arguments()["n"], json!(42));
+  assert_eq!(calls[0].arguments()["ok"], json!(true));
+  assert_eq!(calls[0].arguments()["name"], json!("Alice"));
 }
 
 #[test]
@@ -225,7 +225,7 @@ fn qwen3_coder_null_value_yields_json_null() {
   // qwen3_coder.py:38 — `if param_value.lower() == "null": return None`.
   let text = "<function=f><parameter=x>null</parameter></function>";
   let calls = Qwen3Coder.parse(text, None).unwrap();
-  assert_eq!(calls[0].arguments["x"], Value::Null);
+  assert_eq!(calls[0].arguments()["x"], Value::Null);
 }
 
 #[test]
@@ -233,7 +233,7 @@ fn qwen3_coder_strips_trailing_leading_newline_from_value() {
   // qwen3_coder.py:91-95 — `param_value.startswith/endswith("\n")` stripped.
   let text = "<function=f><parameter=body>\nhello\n</parameter></function>";
   let calls = Qwen3Coder.parse(text, None).unwrap();
-  assert_eq!(calls[0].arguments["body"], json!("hello"));
+  assert_eq!(calls[0].arguments()["body"], json!("hello"));
 }
 
 #[test]
@@ -253,10 +253,10 @@ fn glm47_xml_style_single_call() {
   let text = "get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value>";
   let calls = Glm47.parse(text, None).unwrap();
   assert_eq!(calls.len(), 1);
-  assert_eq!(calls[0].name, "get_weather");
-  assert_eq!(calls[0].arguments["city"], json!("Paris"));
+  assert_eq!(calls[0].name(), "get_weather");
+  assert_eq!(calls[0].arguments()["city"], json!("Paris"));
   // Unknown type (no schema) → `_deserialize` parses "3" → JSON 3.
-  assert_eq!(calls[0].arguments["days"], json!(3));
+  assert_eq!(calls[0].arguments()["days"], json!(3));
 }
 
 #[test]
@@ -265,17 +265,17 @@ fn glm47_json_fallback_path() {
   let calls = Glm47
     .parse(r#"{"name": "f", "arguments": {"x": 1}}"#, None)
     .unwrap();
-  assert_eq!(calls[0].name, "f");
-  assert_eq!(calls[0].arguments["x"], json!(1));
+  assert_eq!(calls[0].name(), "f");
+  assert_eq!(calls[0].arguments()["x"], json!(1));
 }
 
 #[test]
 fn glm47_plain_text_fallback_with_kv_pairs() {
   // glm47.py:216-218 — plain-text `name k=v k=v` fallback.
   let calls = Glm47.parse("get_weather city=Paris days=3", None).unwrap();
-  assert_eq!(calls[0].name, "get_weather");
+  assert_eq!(calls[0].name(), "get_weather");
   // glm47.py:154-157 — non-string args via `_deserialize` (3 → JSON 3).
-  assert_eq!(calls[0].arguments["days"], json!(3));
+  assert_eq!(calls[0].arguments()["days"], json!(3));
 }
 
 #[test]
@@ -283,11 +283,11 @@ fn glm47_unknown_format_returns_unknown_raw() {
   // glm47.py:219 — final fallback `dict(name="unknown", arguments={"raw": ...})`.
   // We mirror this: never error, always return *something*.
   let calls = Glm47.parse("zzz", None).unwrap();
-  assert_eq!(calls[0].name, "zzz");
+  assert_eq!(calls[0].name(), "zzz");
   // Single bare word: glm47 plain-text path returns `name` with empty args
   // (Python `_parse_plain_text_tool_call` rest=empty branch). Verify the
   // documented shape: a single call, no panic.
-  assert_eq!(calls[0].arguments, json!({}));
+  assert_eq!(*calls[0].arguments(), json!({}));
 }
 
 #[test]
@@ -302,7 +302,7 @@ fn glm47_string_arg_schema_preserves_string() {
   let text = "f<arg_key>id</arg_key><arg_value>123</arg_value>";
   let calls = Glm47.parse(text, Some(&tools)).unwrap();
   // String-typed: "123" stays as string, not coerced to JSON number.
-  assert_eq!(calls[0].arguments["id"], json!("123"));
+  assert_eq!(calls[0].arguments()["id"], json!("123"));
 }
 
 // ---------------------------------------------------------------------------
@@ -315,9 +315,9 @@ fn kimi_k2_single_call_with_id() {
   let text = r#"functions.get_weather:0<|tool_call_argument_begin|>{"city": "Paris"}"#;
   let calls = KimiK2.parse(text, None).unwrap();
   assert_eq!(calls.len(), 1);
-  assert_eq!(calls[0].name, "get_weather");
-  assert_eq!(calls[0].id.as_deref(), Some("functions.get_weather:0"));
-  assert_eq!(calls[0].arguments, json!({"city": "Paris"}));
+  assert_eq!(calls[0].name(), "get_weather");
+  assert_eq!(calls[0].id(), Some("functions.get_weather:0"));
+  assert_eq!(*calls[0].arguments(), json!({"city": "Paris"}));
 }
 
 #[test]
@@ -329,12 +329,12 @@ fn kimi_k2_multi_call_split() {
   );
   let calls = KimiK2.parse(text, None).unwrap();
   assert_eq!(calls.len(), 2);
-  assert_eq!(calls[0].name, "a");
-  assert_eq!(calls[0].id.as_deref(), Some("functions.a:0"));
-  assert_eq!(calls[0].arguments["x"], json!(1));
-  assert_eq!(calls[1].name, "b");
-  assert_eq!(calls[1].id.as_deref(), Some("functions.b:1"));
-  assert_eq!(calls[1].arguments["y"], json!(2));
+  assert_eq!(calls[0].name(), "a");
+  assert_eq!(calls[0].id(), Some("functions.a:0"));
+  assert_eq!(calls[0].arguments()["x"], json!(1));
+  assert_eq!(calls[1].name(), "b");
+  assert_eq!(calls[1].id(), Some("functions.b:1"));
+  assert_eq!(calls[1].arguments()["y"], json!(2));
 }
 
 #[test]
@@ -342,8 +342,8 @@ fn kimi_k2_no_functions_prefix_still_parses() {
   // kimi_k2.py:15 — `(?:functions\.)?` makes the prefix optional.
   let text = r#"my_tool:7<|tool_call_argument_begin|>{"v": 1}"#;
   let calls = KimiK2.parse(text, None).unwrap();
-  assert_eq!(calls[0].name, "my_tool");
-  assert_eq!(calls[0].id.as_deref(), Some("my_tool:7"));
+  assert_eq!(calls[0].name(), "my_tool");
+  assert_eq!(calls[0].id(), Some("my_tool:7"));
 }
 
 #[test]
@@ -370,10 +370,10 @@ fn longcat_xml_style_single_call() {
   let text = "get_weather<longcat_arg_key>city</longcat_arg_key><longcat_arg_value>Paris</longcat_arg_value><longcat_arg_key>days</longcat_arg_key><longcat_arg_value>3</longcat_arg_value>";
   let calls = Longcat.parse(text, None).unwrap();
   assert_eq!(calls.len(), 1);
-  assert_eq!(calls[0].name, "get_weather");
-  assert_eq!(calls[0].arguments["city"], json!("Paris"));
+  assert_eq!(calls[0].name(), "get_weather");
+  assert_eq!(calls[0].arguments()["city"], json!("Paris"));
   // Without schema → `_deserialize("3") -> JSON 3`.
-  assert_eq!(calls[0].arguments["days"], json!(3));
+  assert_eq!(calls[0].arguments()["days"], json!(3));
 }
 
 #[test]
@@ -382,8 +382,8 @@ fn longcat_starts_with_brace_uses_json_path() {
   let calls = Longcat
     .parse(r#"{"name": "f", "arguments": {"x": 1}}"#, None)
     .unwrap();
-  assert_eq!(calls[0].name, "f");
-  assert_eq!(calls[0].arguments, json!({"x": 1}));
+  assert_eq!(calls[0].name(), "f");
+  assert_eq!(*calls[0].arguments(), json!({"x": 1}));
 }
 
 #[test]
@@ -397,7 +397,7 @@ fn longcat_string_typed_arg_preserved() {
   }]);
   let text = "f<longcat_arg_key>id</longcat_arg_key><longcat_arg_value>123</longcat_arg_value>";
   let calls = Longcat.parse(text, Some(&tools)).unwrap();
-  assert_eq!(calls[0].arguments["id"], json!("123"));
+  assert_eq!(calls[0].arguments()["id"], json!("123"));
 }
 
 #[test]
@@ -414,8 +414,8 @@ fn longcat_leading_trailing_whitespace_trimmed() {
   let text =
     "   greet<longcat_arg_key>name</longcat_arg_key><longcat_arg_value>Bob</longcat_arg_value>  ";
   let calls = Longcat.parse(text, None).unwrap();
-  assert_eq!(calls[0].name, "greet");
-  assert_eq!(calls[0].arguments["name"], json!("Bob"));
+  assert_eq!(calls[0].name(), "greet");
+  assert_eq!(calls[0].arguments()["name"], json!("Bob"));
 }
 
 // ---------------------------------------------------------------------------
@@ -428,8 +428,8 @@ fn minimax_m2_single_invoke_call() {
   let text = r#"<invoke name="get_weather"><parameter name="city">Paris</parameter></invoke>"#;
   let calls = MinimaxM2.parse(text, None).unwrap();
   assert_eq!(calls.len(), 1);
-  assert_eq!(calls[0].name, "get_weather");
-  assert_eq!(calls[0].arguments["city"], json!("Paris"));
+  assert_eq!(calls[0].name(), "get_weather");
+  assert_eq!(calls[0].arguments()["city"], json!("Paris"));
 }
 
 #[test]
@@ -441,10 +441,10 @@ fn minimax_m2_multi_invoke_call() {
   );
   let calls = MinimaxM2.parse(text, None).unwrap();
   assert_eq!(calls.len(), 2);
-  assert_eq!(calls[0].name, "a");
-  assert_eq!(calls[0].arguments["x"], json!("1"));
-  assert_eq!(calls[1].name, "b");
-  assert_eq!(calls[1].arguments["y"], json!("2"));
+  assert_eq!(calls[0].name(), "a");
+  assert_eq!(calls[0].arguments()["x"], json!("1"));
+  assert_eq!(calls[1].name(), "b");
+  assert_eq!(calls[1].arguments()["y"], json!("2"));
 }
 
 #[test]
@@ -458,7 +458,7 @@ fn minimax_m2_tools_schema_coerces_integer() {
   }]);
   let text = r#"<invoke name="f"><parameter name="n">42</parameter></invoke>"#;
   let calls = MinimaxM2.parse(text, Some(&tools)).unwrap();
-  assert_eq!(calls[0].arguments["n"], json!(42));
+  assert_eq!(calls[0].arguments()["n"], json!(42));
 }
 
 #[test]
@@ -473,8 +473,8 @@ fn minimax_m2_single_quoted_name_extracted() {
   // minimax_m2.py:14-24 — `_extract_name` strips single/double quotes.
   let text = r#"<invoke name='get_weather'><parameter name='city'>Paris</parameter></invoke>"#;
   let calls = MinimaxM2.parse(text, None).unwrap();
-  assert_eq!(calls[0].name, "get_weather");
-  assert_eq!(calls[0].arguments["city"], json!("Paris"));
+  assert_eq!(calls[0].name(), "get_weather");
+  assert_eq!(calls[0].arguments()["city"], json!("Paris"));
 }
 
 // ---------------------------------------------------------------------------
@@ -488,10 +488,10 @@ fn function_gemma_single_call_happy_path() {
     .parse("call:greet{name:<escape>Bob<escape>,count:3}", None)
     .unwrap();
   assert_eq!(calls.len(), 1);
-  assert_eq!(calls[0].name, "greet");
-  assert_eq!(calls[0].arguments["name"], json!("Bob"));
+  assert_eq!(calls[0].name(), "greet");
+  assert_eq!(calls[0].arguments()["name"], json!("Bob"));
   // count:3 is parsed via json.loads → 3.
-  assert_eq!(calls[0].arguments["count"], json!(3));
+  assert_eq!(calls[0].arguments()["count"], json!(3));
 }
 
 #[test]
@@ -500,7 +500,7 @@ fn function_gemma_string_with_escape_markers() {
   let calls = FunctionGemma
     .parse("call:f{x:<escape>hello<escape>}", None)
     .unwrap();
-  assert_eq!(calls[0].arguments["x"], json!("hello"));
+  assert_eq!(calls[0].arguments()["x"], json!("hello"));
 }
 
 #[test]
@@ -515,15 +515,15 @@ fn function_gemma_value_falls_through_to_string() {
   // function_gemma.py:39-41 — `JSONDecodeError` keeps `value` as string.
   let calls = FunctionGemma.parse("call:f{kind:Alice}", None).unwrap();
   // `Alice` isn't valid JSON → keep as string.
-  assert_eq!(calls[0].arguments["kind"], json!("Alice"));
+  assert_eq!(calls[0].arguments()["kind"], json!("Alice"));
 }
 
 #[test]
 fn function_gemma_empty_braces_empty_args() {
   // `call:name{}` — the `while args_str:` loop never runs.
   let calls = FunctionGemma.parse("call:ping{}", None).unwrap();
-  assert_eq!(calls[0].name, "ping");
-  assert_eq!(calls[0].arguments, json!({}));
+  assert_eq!(calls[0].name(), "ping");
+  assert_eq!(*calls[0].arguments(), json!({}));
 }
 
 // ---------------------------------------------------------------------------
@@ -537,9 +537,9 @@ fn gemma4_single_call_happy_path() {
     .parse(r#"call:f{name:<|"|>Bob<|"|>,n:2}"#, None)
     .unwrap();
   assert_eq!(calls.len(), 1);
-  assert_eq!(calls[0].name, "f");
-  assert_eq!(calls[0].arguments["name"], json!("Bob"));
-  assert_eq!(calls[0].arguments["n"], json!(2));
+  assert_eq!(calls[0].name(), "f");
+  assert_eq!(calls[0].arguments()["name"], json!("Bob"));
+  assert_eq!(calls[0].arguments()["n"], json!(2));
 }
 
 #[test]
@@ -549,17 +549,17 @@ fn gemma4_multi_call_returns_list() {
     .parse(r#"call:a{x:1} and call:b{y:2}"#, None)
     .unwrap();
   assert_eq!(calls.len(), 2);
-  assert_eq!(calls[0].name, "a");
-  assert_eq!(calls[0].arguments["x"], json!(1));
-  assert_eq!(calls[1].name, "b");
-  assert_eq!(calls[1].arguments["y"], json!(2));
+  assert_eq!(calls[0].name(), "a");
+  assert_eq!(calls[0].arguments()["x"], json!(1));
+  assert_eq!(calls[1].name(), "b");
+  assert_eq!(calls[1].arguments()["y"], json!(2));
 }
 
 #[test]
 fn gemma4_balanced_braces_in_nested_object_value() {
   // gemma4.py:17-20 — `(?2)` recursive balanced braces.
   let calls = Gemma4.parse(r#"call:f{cfg:{n:1}}"#, None).unwrap();
-  assert_eq!(calls[0].arguments["cfg"], json!({"n": 1}));
+  assert_eq!(calls[0].arguments()["cfg"], json!({"n": 1}));
 }
 
 #[test]
@@ -573,7 +573,7 @@ fn gemma4_no_call_marker_errors() {
 fn gemma4_dashed_function_name_supported() {
   // gemma4.py:18 — `call:([\w-]+)` allows hyphen in names.
   let calls = Gemma4.parse(r#"call:get-weather{n:1}"#, None).unwrap();
-  assert_eq!(calls[0].name, "get-weather");
+  assert_eq!(calls[0].name(), "get-weather");
 }
 
 // ---------------------------------------------------------------------------
@@ -622,8 +622,8 @@ fn parser_dispatch_round_trip_through_json_tools() {
   let calls = p
     .parse(r#"{"name": "f", "arguments": {"x": 1}}"#, None)
     .unwrap();
-  assert_eq!(calls[0].name, "f");
-  assert_eq!(calls[0].arguments["x"], json!(1));
+  assert_eq!(calls[0].name(), "f");
+  assert_eq!(calls[0].arguments()["x"], json!(1));
 }
 
 #[test]
@@ -717,7 +717,7 @@ fn lm5_qwen3_coder_number_schema_emits_json_float_no_saturation() {
   }]);
   let text = "<function=f><parameter=x>1e30</parameter></function>";
   let calls = Qwen3Coder.parse(text, Some(&tools)).unwrap();
-  let v = &calls[0].arguments["x"];
+  let v = &calls[0].arguments()["x"];
   let n = v
     .as_number()
     .expect("number schema must emit a JSON number");
@@ -737,7 +737,7 @@ fn lm5_qwen3_coder_number_schema_emits_json_float_no_saturation() {
   // (a JSON float, NOT an integer — preserves the schema type signal).
   let text_small = "<function=f><parameter=x>42</parameter></function>";
   let calls_small = Qwen3Coder.parse(text_small, Some(&tools)).unwrap();
-  let n_small = calls_small[0].arguments["x"]
+  let n_small = calls_small[0].arguments()["x"]
     .as_number()
     .expect("number schema must emit a JSON number");
   assert!(
@@ -760,7 +760,7 @@ fn lm5_minimax_m2_number_schema_emits_json_float_no_saturation() {
   }]);
   let text = r#"<invoke name="f"><parameter name="x">1e30</parameter></invoke>"#;
   let calls = MinimaxM2.parse(text, Some(&tools)).unwrap();
-  let n = calls[0].arguments["x"]
+  let n = calls[0].arguments()["x"]
     .as_number()
     .expect("number schema must emit a JSON number");
   assert!(
@@ -784,5 +784,5 @@ fn lm5_minimax_m2_number_schema_emits_json_float_no_saturation() {
   }]);
   let text_int = r#"<invoke name="f"><parameter name="n">42</parameter></invoke>"#;
   let calls_int = MinimaxM2.parse(text_int, Some(&tools_int)).unwrap();
-  assert_eq!(calls_int[0].arguments["n"], json!(42));
+  assert_eq!(calls_int[0].arguments()["n"], json!(42));
 }

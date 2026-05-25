@@ -201,7 +201,7 @@ fn speculative_decoding_greedy_self_draft_byte_identical() {
   let draft = MockModel::ramp(5);
 
   let max_tokens = 6;
-  let eos: Vec<u32> = tok.eos_token_ids().iter().copied().collect();
+  let eos: Vec<u32> = tok.eos_token_ids_iter().collect();
 
   // Plain generate baseline.
   let cfg_baseline = GenConfig {
@@ -268,7 +268,7 @@ fn speculative_decoding_diverging_draft_still_correct() {
   let draft = DivergingDraft::new(); // disagrees on alternating calls
 
   let max_tokens = 6;
-  let eos: Vec<u32> = tok.eos_token_ids().iter().copied().collect();
+  let eos: Vec<u32> = tok.eos_token_ids_iter().collect();
 
   let cfg_baseline = GenConfig {
     max_tokens,
@@ -676,7 +676,7 @@ fn speculative_eos_in_first_accepted_draft_stats_match_yields() {
   let target = MockModel::with_bias(vec![0.0, 0.0, 10.0, 0.0, 0.0]);
   let draft = MockModel::with_bias(vec![0.0, 0.0, 10.0, 0.0, 0.0]);
 
-  let eos: Vec<u32> = tok.eos_token_ids().iter().copied().collect();
+  let eos: Vec<u32> = tok.eos_token_ids_iter().collect();
   let responses: Vec<_> = speculative_stream_generate(
     &target,
     &tok,
@@ -815,7 +815,7 @@ fn speculative_stops_on_eos() {
   let target = MockModel::with_bias(vec![0.0, 0.0, 10.0, 0.0, 0.0]);
   let draft = MockModel::with_bias(vec![0.0, 0.0, 10.0, 0.0, 0.0]);
 
-  let eos: Vec<u32> = tok.eos_token_ids().iter().copied().collect();
+  let eos: Vec<u32> = tok.eos_token_ids_iter().collect();
   let responses: Vec<_> = speculative_stream_generate(
     &target,
     &tok,

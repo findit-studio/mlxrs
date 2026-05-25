@@ -183,18 +183,29 @@ fn tokenize_and_pad(
   // the per-sequence right-truncation cap (`truncate_to`). The result is
   // real tokens only — independent of the tokenizer's padding setting.
   let opts = EncodeOptions::new()
-    .add_special(add_special_tokens)
-    .truncate_to(max_length)
-    .return_attention_mask(true);
+    .with_add_special(add_special_tokens)
+    .with_truncate_to(max_length)
+    .with_return_attention_mask(true);
   let mut rows: Vec<(Vec<u32>, Vec<u8>)> = try_with_capacity(batch)?;
   for &text in texts {
     let enc = tokenizer.encode_with(text, &opts)?;
-    // `return_attention_mask(true)` guarantees `Some`; surface a clean error
-    // rather than panicking should that contract ever change.
-    let mask = enc.attention_mask.ok_or_else(|| Error::Backend {
-      message: "encode: encode_with(return_attention_mask=true) returned no mask".to_string(),
-    })?;
-    rows.push((enc.ids, mask));
+    // Validate the length-equality invariant on the borrowed slices BEFORE
+    // moving — `with_return_attention_mask(true)` guarantees `mask.len()
+    // == ids.len()` including the legitimate `(0, 0)` case. After the
+    // check passes, `into_parts()` moves both `Vec`s into the row without
+    // cloning (avoids the O(tokens) per-row copy that borrowed-accessor +
+    // owned-flatten would otherwise pay).
+    if enc.attention_mask().len() != enc.ids().len() {
+      return Err(Error::Backend {
+        message: format!(
+          "encode: encode_with(return_attention_mask=true) returned mask.len()={} \
+           but ids.len()={}; they must match",
+          enc.attention_mask().len(),
+          enc.ids().len(),
+        ),
+      });
+    }
+    rows.push(enc.into_parts());
   }
 
   let seq_len = rows.iter().map(|(ids, _)| ids.len()).max().unwrap_or(0);

@@ -397,7 +397,7 @@ pub fn speculative_stream_generate<'a>(
   let prompt_tokens = prompt.len();
   // mlx-lm uses the tokenizer's eos set for the break / finish_reason.
   let mut cfg = cfg;
-  cfg.eos = tokenizer.eos_token_ids().iter().copied().collect();
+  cfg.eos = tokenizer.eos_token_ids_iter().collect();
   let max_tokens = cfg.max_tokens;
   let eos: Vec<u32> = cfg.eos.clone();
   // L3 opt-in (`GenConfig::collect_logprobs`): the speculative driver always

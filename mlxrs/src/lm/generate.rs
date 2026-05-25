@@ -1781,7 +1781,7 @@ pub struct GenerationStats {
 /// Maps [`generate_step`] through the #18 streaming detokenizer
 /// ([`crate::tokenizer::Tokenizer::detokenizer`]) into
 /// [`GenerationResponse`]s. The eos set is taken from the tokenizer
-/// ([`crate::tokenizer::Tokenizer::eos_token_ids`], mlx-lm's
+/// ([`crate::tokenizer::Tokenizer::eos_token_ids_iter`], mlx-lm's
 /// `tokenizer.eos_token_ids`), overriding any `cfg.eos`, so the
 /// `finish_reason` matches mlx-lm exactly. mlx-lm does **not** detokenize
 /// the eos token (`if token in eos: break` before `add_token`), so the eos
@@ -1809,7 +1809,7 @@ pub fn stream_generate<'a, M: Model + ?Sized>(
   // mlx-lm uses the tokenizer's eos set (not a caller override) for the
   // break + `finish_reason`; mirror that exactly.
   let mut cfg = cfg;
-  cfg.eos = tokenizer.eos_token_ids().iter().copied().collect();
+  cfg.eos = tokenizer.eos_token_ids_iter().collect();
   let max_tokens = cfg.max_tokens;
   let eos: Vec<u32> = cfg.eos.clone();
 
@@ -2755,7 +2755,7 @@ pub fn batch_stream_generate<'a, M: Model + ?Sized>(
   cfg: GenConfig,
 ) -> BatchGenerator<'a, M> {
   let mut cfg = cfg;
-  cfg.eos = tokenizer.eos_token_ids().iter().copied().collect();
+  cfg.eos = tokenizer.eos_token_ids_iter().collect();
   batch_generate_step(model, prompts, pad_token_id, cache, cfg)
 }
 

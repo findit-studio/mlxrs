@@ -327,7 +327,7 @@ fn load_resolves_eos_set_replace_not_merge() {
   // and the returned `Config.eos_token_id` is `None`.
   let d0 = loadable("eos_base");
   let (c0, _w, t0) = load::load(&d0).expect("baseline loads");
-  let base: BTreeSet<u32> = t0.eos_token_ids().clone();
+  let base: BTreeSet<u32> = t0.eos_token_ids_iter().collect();
   assert_eq!(c0.eos_token_id, None, "no config/gen eos ⇒ Config eos None");
   assert!(
     !base.contains(&4242)
@@ -364,8 +364,8 @@ fn load_resolves_eos_set_replace_not_merge() {
   .unwrap();
   let (c1, _w, t1) = load::load(&d1).unwrap();
   assert_eq!(
-    t1.eos_token_ids(),
-    &set(&[4242, 4243]),
+    t1.eos_token_ids_iter().collect::<BTreeSet<u32>>(),
+    set(&[4242, 4243]),
     "list REPLACES, not merges"
   );
   assert_eq!(
@@ -383,8 +383,8 @@ fn load_resolves_eos_set_replace_not_merge() {
   .unwrap();
   let (c2, _w, t2) = load::load(&d2).unwrap();
   assert_eq!(
-    t2.eos_token_ids(),
-    &set(&[4244]),
+    t2.eos_token_ids_iter().collect::<BTreeSet<u32>>(),
+    set(&[4244]),
     "scalar REPLACES, not merges"
   );
   assert_eq!(
@@ -402,7 +402,11 @@ fn load_resolves_eos_set_replace_not_merge() {
   )
   .unwrap();
   let (cl0, _w, tl0) = load::load(&dl0).unwrap();
-  assert_eq!(tl0.eos_token_ids(), &set(&[0, 4242]), "list [0,..] keeps 0");
+  assert_eq!(
+    tl0.eos_token_ids_iter().collect::<BTreeSet<u32>>(),
+    set(&[0, 4242]),
+    "list [0,..] keeps 0"
+  );
   assert_eq!(
     cl0.eos_token_id,
     Some(Many(vec![0, 4242])),
@@ -415,8 +419,8 @@ fn load_resolves_eos_set_replace_not_merge() {
   fs::write(dz.join("generation_config.json"), br#"{"eos_token_id":0}"#).unwrap();
   let (cz, _w, tz) = load::load(&dz).unwrap();
   assert_eq!(
-    tz.eos_token_ids(),
-    &base,
+    tz.eos_token_ids_iter().collect::<BTreeSet<u32>>(),
+    base,
     "falsy scalar 0 ⇒ tokenizer default"
   );
   assert_eq!(
@@ -429,8 +433,8 @@ fn load_resolves_eos_set_replace_not_merge() {
   fs::write(de.join("generation_config.json"), br#"{"eos_token_id":[]}"#).unwrap();
   let (ce, _w, te) = load::load(&de).unwrap();
   assert_eq!(
-    te.eos_token_ids(),
-    &base,
+    te.eos_token_ids_iter().collect::<BTreeSet<u32>>(),
+    base,
     "empty list is falsy ⇒ tokenizer default"
   );
   assert_eq!(ce.eos_token_id, None, "empty list ⇒ Config eos untouched");
@@ -441,8 +445,8 @@ fn load_resolves_eos_set_replace_not_merge() {
   fs::write(dc.join("config.json"), cfg_with_eos("7")).unwrap();
   let (cc, _w, tc) = load::load(&dc).unwrap();
   assert_eq!(
-    tc.eos_token_ids(),
-    &set(&[7]),
+    tc.eos_token_ids_iter().collect::<BTreeSet<u32>>(),
+    set(&[7]),
     "config.json eos REPLACES default"
   );
   assert_eq!(
@@ -456,8 +460,8 @@ fn load_resolves_eos_set_replace_not_merge() {
   fs::write(dcl.join("config.json"), cfg_with_eos("[9,10]")).unwrap();
   let (ccl, _w, tcl) = load::load(&dcl).unwrap();
   assert_eq!(
-    tcl.eos_token_ids(),
-    &set(&[9, 10]),
+    tcl.eos_token_ids_iter().collect::<BTreeSet<u32>>(),
+    set(&[9, 10]),
     "config.json list REPLACES default"
   );
   assert_eq!(
@@ -473,8 +477,8 @@ fn load_resolves_eos_set_replace_not_merge() {
   fs::write(dp.join("generation_config.json"), br#"{"eos_token_id":8}"#).unwrap();
   let (cp, _w, tp) = load::load(&dp).unwrap();
   assert_eq!(
-    tp.eos_token_ids(),
-    &set(&[8]),
+    tp.eos_token_ids_iter().collect::<BTreeSet<u32>>(),
+    set(&[8]),
     "generation_config overrides config.json"
   );
   assert_eq!(
@@ -489,6 +493,10 @@ fn load_resolves_eos_set_replace_not_merge() {
   let db = loadable("eos_bad");
   fs::write(db.join("generation_config.json"), b"{ not json").unwrap();
   let (cb, _w, tb) = load::load(&db).expect("malformed generation_config is tolerated");
-  assert_eq!(tb.eos_token_ids(), &base, "malformed ⇒ tokenizer default");
+  assert_eq!(
+    tb.eos_token_ids_iter().collect::<BTreeSet<u32>>(),
+    base,
+    "malformed ⇒ tokenizer default"
+  );
   assert_eq!(cb.eos_token_id, None, "malformed ⇒ Config eos untouched");
 }

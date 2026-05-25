@@ -217,7 +217,7 @@ fn tok_env_from_tokenizer(
   // when the set is empty (no eos configured at all) —
   // `with_eos_tokens` panics on an empty slice, and in that case
   // upstream's hardcoded detection is the only signal we have anyway.
-  let configured_eos: Vec<u32> = tokenizer.eos_token_ids().iter().copied().collect();
+  let configured_eos: Vec<u32> = tokenizer.eos_token_ids_iter().collect();
 
   let mut env = ByteTokenizerEnv::new(bt, model_vocab_size).map_err(|e| Error::Backend {
     message: format!("llguidance: build ByteTokenizerEnv: {e}"),

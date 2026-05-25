@@ -2242,9 +2242,9 @@ mod tests {
     // And the tokenizer's COMPLETE eos set is exactly {1, 2} — the
     // tokenizer-config default was REPLACED (not unioned) by the resolved
     // list, exactly as `TokenizerWrapper::set(eos_token_ids)` does.
-    let eos_set = ctx.tokenizer.eos_token_ids();
+    let eos_vec: Vec<u32> = ctx.tokenizer.eos_token_ids_iter().collect();
     assert_eq!(
-      eos_set.iter().copied().collect::<Vec<_>>(),
+      eos_vec,
       vec![1u32, 2],
       "tokenizer eos set should be exactly the resolved {{1, 2}}"
     );
@@ -2305,9 +2305,9 @@ mod tests {
     );
     // Tokenizer's COMPLETE eos set is the post-override {2}, not the
     // on-disk {1}.
-    let eos_set = ctx.tokenizer.eos_token_ids();
+    let eos_vec: Vec<u32> = ctx.tokenizer.eos_token_ids_iter().collect();
     assert_eq!(
-      eos_set.iter().copied().collect::<Vec<_>>(),
+      eos_vec,
       vec![2u32],
       "tokenizer eos set should be the overridden {{2}}"
     );
@@ -2402,8 +2402,7 @@ mod tests {
     );
     // Tokenizer's COMPLETE eos set is exactly {42, 50} — the
     // tokenizer-config default ({2}) was REPLACED, not unioned.
-    let eos_set = ctx.tokenizer.eos_token_ids();
-    let mut eos_vec: Vec<u32> = eos_set.iter().copied().collect();
+    let mut eos_vec: Vec<u32> = ctx.tokenizer.eos_token_ids_iter().collect();
     eos_vec.sort_unstable();
     assert_eq!(
       eos_vec,
@@ -2456,9 +2455,9 @@ mod tests {
       Some(EosTokenId::Single(7)),
       "top-level eos_token_id must win over nested text_config.eos_token_id"
     );
-    let eos_set = ctx.tokenizer.eos_token_ids();
+    let eos_vec: Vec<u32> = ctx.tokenizer.eos_token_ids_iter().collect();
     assert_eq!(
-      eos_set.iter().copied().collect::<Vec<_>>(),
+      eos_vec,
       vec![7u32],
       "tokenizer eos set must be the top-level {{7}}, not nested {{42, 50}}"
     );
@@ -2510,9 +2509,9 @@ mod tests {
       Some(EosTokenId::Single(9)),
       "generation_config.json eos_token_id must override the promoted nested value"
     );
-    let eos_set = ctx.tokenizer.eos_token_ids();
+    let eos_vec: Vec<u32> = ctx.tokenizer.eos_token_ids_iter().collect();
     assert_eq!(
-      eos_set.iter().copied().collect::<Vec<_>>(),
+      eos_vec,
       vec![9u32],
       "tokenizer eos set must be the post-override {{9}}, not the promoted nested set"
     );
@@ -2663,9 +2662,9 @@ mod tests {
       ctx.config.eos_token_id, None,
       "scalar 0 nested eos must not promote (falsy)"
     );
-    let eos_set = ctx.tokenizer.eos_token_ids();
+    let eos_vec: Vec<u32> = ctx.tokenizer.eos_token_ids_iter().collect();
     assert_eq!(
-      eos_set.iter().copied().collect::<Vec<_>>(),
+      eos_vec,
       vec![2u32],
       "tokenizer should fall back to its tokenizer_config `eos_token` when nested is falsy"
     );

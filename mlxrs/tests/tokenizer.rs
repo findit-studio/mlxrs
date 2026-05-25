@@ -72,7 +72,7 @@ fn special_token_properties() {
   assert_eq!(tok.unk_token(), Some("<unk>"));
   assert_eq!(tok.bos_token_id(), Some(1));
   assert_eq!(tok.eos_token_id(), Some(2));
-  assert!(tok.eos_token_ids().contains(&2));
+  assert!(tok.contains_eos_id(2));
   assert!(tok.has_chat_template());
   // _infer_thinking: <think>/</think> are in vocab.
   assert!(tok.has_thinking());
@@ -176,8 +176,8 @@ fn json_tools_parser_parses_assistant_tool_call() {
     )
     .unwrap();
   assert_eq!(calls.len(), 1);
-  assert_eq!(calls[0].name, "get_weather");
-  assert_eq!(calls[0].arguments, json!({"city": "Paris"}));
+  assert_eq!(calls[0].name(), "get_weather");
+  assert_eq!(*calls[0].arguments(), json!({"city": "Paris"}));
 }
 
 #[test]
@@ -190,9 +190,9 @@ fn pythonic_parser_parses_assistant_tool_call() {
     )
     .unwrap();
   assert_eq!(calls.len(), 1);
-  assert_eq!(calls[0].name, "get_weather");
-  assert_eq!(calls[0].arguments["city"], json!("Paris"));
-  assert_eq!(calls[0].arguments["days"], json!(3));
+  assert_eq!(calls[0].name(), "get_weather");
+  assert_eq!(calls[0].arguments()["city"], json!("Paris"));
+  assert_eq!(calls[0].arguments()["days"], json!(3));
 }
 
 #[test]
@@ -204,8 +204,8 @@ fn glm47_parser_parses_xml_style() {
       None,
     )
     .unwrap();
-  assert_eq!(calls[0].name, "get_weather");
-  assert_eq!(calls[0].arguments["city"], json!("Paris"));
+  assert_eq!(calls[0].name(), "get_weather");
+  assert_eq!(calls[0].arguments()["city"], json!("Paris"));
 }
 
 /// Direct unit test for the [`Tokenizer::additional_special_token_ids`]

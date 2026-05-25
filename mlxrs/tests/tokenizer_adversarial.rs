@@ -188,16 +188,16 @@ fn pythonic_unicode_value_after_space_no_panic() {
     )
     .expect("unicode-after-space must parse, not panic");
   assert_eq!(calls.len(), 1);
-  assert_eq!(calls[0].name, "f");
-  assert_eq!(calls[0].arguments["city"], json!("\u{e9}"));
-  assert_eq!(calls[0].arguments["n"], json!(2));
+  assert_eq!(calls[0].name(), "f");
+  assert_eq!(calls[0].arguments()["city"], json!("\u{e9}"));
+  assert_eq!(calls[0].arguments()["n"], json!(2));
 
   // Multi-byte unquoted value after spaces, and a trailing emoji value.
   let calls2 = Pythonic
     .parse("[g(a=  \u{1f600}\u{1f680}, b=\"\u{4e2d}\u{6587}\")]", None)
     .expect("multibyte unquoted/quoted values must not panic");
-  assert_eq!(calls2[0].name, "g");
-  assert_eq!(calls2[0].arguments["b"], json!("\u{4e2d}\u{6587}"));
+  assert_eq!(calls2[0].name(), "g");
+  assert_eq!(calls2[0].arguments()["b"], json!("\u{4e2d}\u{6587}"));
 
   // ASCII path unchanged (zero behavior delta for valid inputs).
   let calls3 = Pythonic
@@ -206,9 +206,9 @@ fn pythonic_unicode_value_after_space_no_panic() {
       None,
     )
     .unwrap();
-  assert_eq!(calls3[0].name, "get_weather");
-  assert_eq!(calls3[0].arguments["city"], json!("Paris"));
-  assert_eq!(calls3[0].arguments["days"], json!(3));
+  assert_eq!(calls3[0].name(), "get_weather");
+  assert_eq!(calls3[0].arguments()["city"], json!("Paris"));
+  assert_eq!(calls3[0].arguments()["days"], json!(3));
 }
 
 #[cfg(feature = "tokenizer-tools")]
@@ -229,9 +229,9 @@ fn function_gemma_escape_unicode_after_value_no_panic() {
   let ok = FunctionGemma
     .parse("call:greet{name:<escape>Bob<escape>,count:3}", None)
     .expect("valid function_gemma must still parse");
-  assert_eq!(ok[0].name, "greet");
-  assert_eq!(ok[0].arguments["name"], serde_json::json!("Bob"));
-  assert_eq!(ok[0].arguments["count"], serde_json::json!(3));
+  assert_eq!(ok[0].name(), "greet");
+  assert_eq!(ok[0].arguments()["name"], serde_json::json!("Bob"));
+  assert_eq!(ok[0].arguments()["count"], serde_json::json!(3));
 }
 
 #[cfg(feature = "tokenizer-tools")]
@@ -250,13 +250,13 @@ fn gemma4_balanced_brace_non_ascii_inside_no_panic() {
       None,
     )
     .expect("non-ASCII gemma4 string values must parse, not panic");
-  assert_eq!(calls[0].name, "f");
+  assert_eq!(calls[0].name(), "f");
   assert_eq!(
-    calls[0].arguments["city"],
+    calls[0].arguments()["city"],
     serde_json::json!("\u{e9}\u{1f600}")
   );
   assert_eq!(
-    calls[0].arguments["note"],
+    calls[0].arguments()["note"],
     serde_json::json!("\u{4e2d}\u{6587}")
   );
 
@@ -264,7 +264,7 @@ fn gemma4_balanced_brace_non_ascii_inside_no_panic() {
   let ok = Gemma4
     .parse("call:f{name:<|\"|>Bob<|\"|>,n:2}", None)
     .expect("valid gemma4 must still parse");
-  assert_eq!(ok[0].name, "f");
-  assert_eq!(ok[0].arguments["name"], serde_json::json!("Bob"));
-  assert_eq!(ok[0].arguments["n"], serde_json::json!(2));
+  assert_eq!(ok[0].name(), "f");
+  assert_eq!(ok[0].arguments()["name"], serde_json::json!("Bob"));
+  assert_eq!(ok[0].arguments()["n"], serde_json::json!(2));
 }

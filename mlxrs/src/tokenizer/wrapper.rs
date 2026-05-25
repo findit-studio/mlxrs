@@ -360,10 +360,17 @@ impl Tokenizer {
   ///
   /// Exposes the richer surface of the underlying HF `tokenizers` crate that
   /// the short [`encode`](Self::encode) hides — explicit EOS appending,
-  /// truncation, attention-mask emission, and pad-stripping. The returned
-  /// [`Encoded::attention_mask`] is `Some` exactly when
-  /// [`EncodeOptions::return_attention_mask`] is `true`; when present its
-  /// length equals `ids.len()`.
+  /// truncation, attention-mask emission, and pad-stripping. Mask contract on
+  /// the returned [`Encoded::attention_mask`]:
+  /// - if [`EncodeOptions::return_attention_mask`] was `false`: empty slice
+  ///   (no allocation);
+  /// - if `true`: `mask.len() == ids.len()`, **including the legitimate
+  ///   `(0, 0)` zero-length encoding** (e.g.
+  ///   [`EncodeOptions::with_truncate_to`]`(Some(0))` or empty `text`).
+  ///
+  /// Presence of the mask is therefore a property of the caller's
+  /// [`EncodeOptions`], not of the result — do not test
+  /// `attention_mask().is_empty()` as a "not requested" sentinel.
   ///
   /// **Padding stripping.** If the HF tokenizer has padding enabled,
   /// `encode_with` drops all `mask == 0` cells regardless of position
@@ -376,8 +383,8 @@ impl Tokenizer {
   /// **after** the real attended tokens. The primary EOS is the first
   /// caller-supplied EOS id (else the `tokenizer-config` `eos_token`)
   /// tracked at load — NOT `eos_token_ids.iter().next()`, which would be
-  /// the numerically smallest id in the sorted [`Self::eos_token_ids`]
-  /// `BTreeSet` (possibly a non-EOS stop token). If no primary EOS is
+  /// the numerically smallest id in the sorted eos-id set
+  /// (possibly a non-EOS stop token). If no primary EOS is
   /// configured it returns an error rather than silently no-op-ing; the
   /// precondition is validated **before** the underlying `hf.encode`
   /// call so a configuration gap fails fast.
@@ -406,11 +413,11 @@ impl Tokenizer {
     // `tokenizer-config` `eos_token`), NOT `eos_token_ids.iter().next()` —
     // the latter returns the numerically smallest entry in the sorted
     // set, which can be a non-EOS pad/unk in a multi-id stop list.
-    let eos = Self::resolve_eos(opts.add_eos, self.primary_eos)?;
+    let eos = Self::resolve_eos(opts.add_eos(), self.primary_eos)?;
 
     let enc = self
       .hf
-      .encode(text, opts.add_special)
+      .encode(text, opts.add_special())
       .map_err(|e| Error::tokenizer(format!("hf.encode: {e}")))?;
 
     finalize_encoding(&enc, opts, eos)
@@ -454,11 +461,11 @@ impl Tokenizer {
   ) -> Result<Vec<Encoded>, Error> {
     // Same fast-fail-on-missing-eos contract as `encode_with` — resolve
     // BEFORE the (potentially expensive) batch tokenizer call.
-    let eos = Self::resolve_eos(opts.add_eos, self.primary_eos)?;
+    let eos = Self::resolve_eos(opts.add_eos(), self.primary_eos)?;
 
     let encs = self
       .hf
-      .encode_batch(texts, opts.add_special)
+      .encode_batch(texts, opts.add_special())
       .map_err(|e| Error::tokenizer(format!("hf.encode_batch: {e}")))?;
 
     let mut out = Vec::with_capacity(encs.len());
@@ -611,9 +618,17 @@ impl Tokenizer {
     }
     out
   }
-  /// The full eos-token-id set (Python `eos_token_ids`).
-  pub fn eos_token_ids(&self) -> &std::collections::BTreeSet<u32> {
-    &self.eos_token_ids
+  /// Iterate over all eos-token ids (Python `eos_token_ids`).
+  ///
+  /// Returns a `Copy`-element iterator over the sorted set; callers that
+  /// need a `Vec<u32>` can do `.eos_token_ids_iter().collect()`.
+  pub fn eos_token_ids_iter(&self) -> impl Iterator<Item = u32> + '_ {
+    self.eos_token_ids.iter().copied()
+  }
+
+  /// Returns `true` if `id` is in the eos-token-id set.
+  pub fn contains_eos_id(&self, id: u32) -> bool {
+    self.eos_token_ids.contains(&id)
   }
   /// Add an eos token by string or numeric-string id (Python `add_eos_token`).
   /// If no primary EOS was established at construction time (no
@@ -987,7 +1002,7 @@ fn finalize_encoding(
   let extra = usize::from(eos.is_some());
   let pre_trunc_len = real_len + extra;
   let final_len = opts
-    .truncate_to
+    .truncate_to()
     .map_or(pre_trunc_len, |n| n.min(pre_trunc_len));
 
   let mut ids: Vec<u32> = Vec::with_capacity(final_len);
@@ -1016,10 +1031,12 @@ fn finalize_encoding(
 
   // Mask is constant-1 for the returned cells (all attended, including
   // the appended eos). Single bounded allocation matching `ids.len()`.
-  let attention_mask = opts.return_attention_mask.then(|| vec![1u8; ids.len()]);
+  // §1 EMPTY MEANS ABSENT: empty Vec when mask was not requested.
+  let attention_mask = if opts.return_attention_mask() {
+    vec![1u8; ids.len()]
+  } else {
+    Vec::new()
+  };
 
-  Ok(Encoded {
-    ids,
-    attention_mask,
-  })
+  Ok(Encoded::new(ids, attention_mask))
 }

@@ -586,9 +586,9 @@ fn llguidance_terminal_grammar_uses_mlxrs_configured_custom_eos_id() {
     &[CUSTOM_EOS_ID],
   );
   // Sanity: the mlxrs wrapper now reports exactly that one eos id.
-  let set = tok.eos_token_ids();
+  let eos_vec: Vec<u32> = tok.eos_token_ids_iter().collect();
   assert_eq!(
-    set.iter().copied().collect::<Vec<u32>>(),
+    eos_vec,
     vec![CUSTOM_EOS_ID],
     "mlxrs Tokenizer::eos_token_ids() must reflect the from_path override"
   );
@@ -662,9 +662,9 @@ fn llguidance_terminal_grammar_multi_eos_unmasks_all_configured_ids() {
     &[(CUSTOM_EOS_ID, "<|im_end|>")],
     &[1, 2, CUSTOM_EOS_ID],
   );
-  let set = tok.eos_token_ids();
+  let eos_vec: Vec<u32> = tok.eos_token_ids_iter().collect();
   assert_eq!(
-    set.iter().copied().collect::<Vec<u32>>(),
+    eos_vec,
     vec![1, 2, CUSTOM_EOS_ID],
     "mlxrs Tokenizer::eos_token_ids() must hold all three caller-supplied ids"
   );

@@ -48,20 +48,59 @@ fn marker_end(name: &str) -> &'static str {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
   /// Function name.
-  pub name: String,
+  name: String,
   /// Arguments as a JSON object (or other JSON value for raw payloads).
-  pub arguments: Value,
+  arguments: Value,
   /// Optional tool-call id (kimi_k2 emits `functions.name:idx`).
-  pub id: Option<String>,
+  ///
+  /// **Intentional §1 exception:** `id` stays `Option<String>` — `None` means
+  /// "this parser does not emit call IDs" (e.g. `json_tools`), while
+  /// `Some("")` would mean the parser emitted an explicitly-empty id. The
+  /// semantic distinction is upstream-meaningful per Kimi-K2 / OpenAI
+  /// tool-call conventions; collapsing to `String` (with empty = absent) would
+  /// lose that signal.
+  id: Option<String>,
 }
 
 impl ToolCall {
-  fn new(name: impl Into<String>, arguments: Value) -> Self {
+  /// Internal shorthand: name + arguments, no id (used by most parsers).
+  fn new_nameless_id(name: impl Into<String>, arguments: Value) -> Self {
     Self {
       name: name.into(),
       arguments,
       id: None,
     }
+  }
+
+  /// Public constructor: name + arguments + optional id.
+  ///
+  /// `id` is `Option<String>` per upstream Kimi-K2 / OpenAI conventions —
+  /// `None` = parser does not emit ids; `Some("")` = explicitly-empty id
+  /// (semantically distinct). See field doc for rationale.
+  pub fn new(name: impl Into<String>, arguments: Value, id: Option<String>) -> Self {
+    Self {
+      name: name.into(),
+      arguments,
+      id,
+    }
+  }
+
+  /// Function name.
+  #[inline(always)]
+  pub fn name(&self) -> &str {
+    &self.name
+  }
+
+  /// Arguments (JSON value).
+  #[inline(always)]
+  pub fn arguments(&self) -> &Value {
+    &self.arguments
+  }
+
+  /// Tool-call id, if this parser emits one (see field doc for `None` semantics).
+  #[inline(always)]
+  pub fn id(&self) -> Option<&str> {
+    self.id.as_deref()
   }
 }
 
@@ -554,7 +593,7 @@ fn deserialize(value: &str) -> Value {
 }
 
 fn obj(name: &str, args: Value) -> Vec<ToolCall> {
-  vec![ToolCall::new(name, args)]
+  vec![ToolCall::new_nameless_id(name, args)]
 }
 
 fn tool_properties<'a>(
@@ -1498,7 +1537,7 @@ impl ToolParser for Glm47 {
     if let Some(c) = glm_parse_plain(text, tools) {
       return Ok(vec![c]);
     }
-    Ok(vec![ToolCall::new(
+    Ok(vec![ToolCall::new_nameless_id(
       "unknown",
       serde_json::json!({"raw": text.trim()}),
     )])
@@ -1607,10 +1646,10 @@ fn glm_parse_json(text: &str, tools: Option<&Value>) -> Option<ToolCall> {
   }
   let name = name.and_then(|n| n.as_str().map(str::to_owned))?;
   match arguments {
-    None => Some(ToolCall::new(name, serde_json::json!({}))),
+    None => Some(ToolCall::new_nameless_id(name, serde_json::json!({}))),
     Some(Value::Object(m)) => {
       let norm = normalize_arguments(&name, &m, tools);
-      Some(ToolCall::new(name, Value::Object(norm)))
+      Some(ToolCall::new_nameless_id(name, Value::Object(norm)))
     }
     _ => None,
   }
@@ -1629,7 +1668,7 @@ fn glm_parse_plain(text: &str, tools: Option<&Value>) -> Option<ToolCall> {
       && let Value::Object(m) = deserialize(rest)
     {
       let norm = normalize_arguments(&name, &m, tools);
-      return Some(ToolCall::new(name, Value::Object(norm)));
+      return Some(ToolCall::new_nameless_id(name, Value::Object(norm)));
     }
   }
   let (name, rest) = match stripped.split_once(' ') {
@@ -1640,11 +1679,11 @@ fn glm_parse_plain(text: &str, tools: Option<&Value>) -> Option<ToolCall> {
     return None;
   }
   if rest.is_empty() {
-    return Some(ToolCall::new(name, serde_json::json!({})));
+    return Some(ToolCall::new_nameless_id(name, serde_json::json!({})));
   }
   if let Value::Object(m) = deserialize(&rest) {
     let norm = normalize_arguments(&name, &m, tools);
-    return Some(ToolCall::new(name, Value::Object(norm)));
+    return Some(ToolCall::new_nameless_id(name, Value::Object(norm)));
   }
   // key=value pairs
   if rest.contains('=') {
@@ -1668,10 +1707,13 @@ fn glm_parse_plain(text: &str, tools: Option<&Value>) -> Option<ToolCall> {
       }
     }
     if ok && !args.is_empty() {
-      return Some(ToolCall::new(name, Value::Object(args)));
+      return Some(ToolCall::new_nameless_id(name, Value::Object(args)));
     }
   }
-  Some(ToolCall::new(name, serde_json::json!({"raw": rest})))
+  Some(ToolCall::new_nameless_id(
+    name,
+    serde_json::json!({"raw": rest}),
+  ))
 }
 
 /// Find `(key, value)` pairs delimited by two open/close tag pairs.
@@ -1725,11 +1767,7 @@ impl KimiK2 {
     let func_name = base.strip_prefix("functions.").unwrap_or(base).to_owned();
     let args_part = text[abeg_idx + abeg.len()..].trim();
     let arg = deserialize(args_part);
-    Ok(ToolCall {
-      name: func_name,
-      arguments: arg,
-      id: Some(full_id),
-    })
+    Ok(ToolCall::new(func_name, arg, Some(full_id)))
   }
 }
 
@@ -2149,7 +2187,10 @@ impl ToolParser for MinimaxM2 {
           .unwrap_or_else(|| vec!["string".to_owned()]);
         args.insert(pname, convert_with_types(&pval, &ptypes));
       }
-      calls.push(ToolCall::new(&function_name, Value::Object(args)));
+      calls.push(ToolCall::new_nameless_id(
+        &function_name,
+        Value::Object(args),
+      ));
     }
     Ok(calls)
   }
@@ -2479,7 +2520,7 @@ impl ToolParser for Gemma4 {
       let json_str = gemma4_args_to_json(&args_str);
       let arguments: Value =
         serde_json::from_str(&json_str).map_err(|e| err(format!("gemma4: {e}")))?;
-      out.push(ToolCall::new(&name, arguments));
+      out.push(ToolCall::new_nameless_id(&name, arguments));
     }
     Ok(out)
   }
@@ -2851,7 +2892,7 @@ const MAX_TOOL_CALL_BUFFER_BYTES: usize = 256 * 1024;
 /// // ... and emitted once its end tag arrives.
 /// assert_eq!(proc.process_chunk("\"arguments\": {}}</tool_call>"), None);
 /// assert_eq!(proc.tool_calls.len(), 1);
-/// assert_eq!(proc.tool_calls[0].name, "now");
+/// assert_eq!(proc.tool_calls[0].name(), "now");
 /// ```
 pub struct ToolCallProcessor {
   /// The per-format parser the state machine delegates structured parsing to.
@@ -3681,8 +3722,8 @@ mod tests {
     // Whole call consumed in one chunk: no display text leaks.
     assert_eq!(out, None);
     assert_eq!(p.tool_calls.len(), 1);
-    assert_eq!(p.tool_calls[0].name, "get_time");
-    assert_eq!(p.tool_calls[0].arguments, serde_json::json!({}));
+    assert_eq!(p.tool_calls[0].name(), "get_time");
+    assert_eq!(*p.tool_calls[0].arguments(), serde_json::json!({}));
   }
 
   #[test]
@@ -3699,9 +3740,9 @@ mod tests {
       None
     );
     assert_eq!(p.tool_calls.len(), 1);
-    assert_eq!(p.tool_calls[0].name, "get_weather");
+    assert_eq!(p.tool_calls[0].name(), "get_weather");
     assert_eq!(
-      p.tool_calls[0].arguments,
+      *p.tool_calls[0].arguments(),
       serde_json::json!({"city": "Tokyo"})
     );
   }
@@ -3717,7 +3758,7 @@ mod tests {
       None
     );
     assert_eq!(p.tool_calls.len(), 1);
-    assert_eq!(p.tool_calls[0].name, "ping");
+    assert_eq!(p.tool_calls[0].name(), "ping");
   }
 
   #[test]
@@ -3730,7 +3771,7 @@ mod tests {
     assert_eq!(out.as_deref(), Some("Let me check. "));
     assert_eq!(p.process_chunk("</tool_call>"), None);
     assert_eq!(p.tool_calls.len(), 1);
-    assert_eq!(p.tool_calls[0].name, "ls");
+    assert_eq!(p.tool_calls[0].name(), "ls");
   }
 
   #[test]
@@ -3740,7 +3781,7 @@ mod tests {
     // Text after the end tag is emitted as ordinary display text.
     assert_eq!(out.as_deref(), Some(" all done"));
     assert_eq!(p.tool_calls.len(), 1);
-    assert_eq!(p.tool_calls[0].name, "ls");
+    assert_eq!(p.tool_calls[0].name(), "ls");
   }
 
   #[test]
@@ -3753,8 +3794,8 @@ mod tests {
     );
     assert_eq!(out, None);
     assert_eq!(p.tool_calls.len(), 2);
-    assert_eq!(p.tool_calls[0].name, "a");
-    assert_eq!(p.tool_calls[1].name, "b");
+    assert_eq!(p.tool_calls[0].name(), "a");
+    assert_eq!(p.tool_calls[1].name(), "b");
   }
 
   // --- no tool call --------------------------------------------------------
@@ -3802,7 +3843,7 @@ mod tests {
     let out = p.process_chunk(r#"{"name": "now", "arguments": {}}"#);
     assert_eq!(out, None);
     assert_eq!(p.tool_calls.len(), 1);
-    assert_eq!(p.tool_calls[0].name, "now");
+    assert_eq!(p.tool_calls[0].name(), "now");
   }
 
   #[test]
@@ -3813,8 +3854,11 @@ mod tests {
     assert_eq!(p.tool_calls.len(), 0);
     assert_eq!(p.process_chunk(r#""arguments": {"tz": "UTC"}}"#), None);
     assert_eq!(p.tool_calls.len(), 1);
-    assert_eq!(p.tool_calls[0].name, "now");
-    assert_eq!(p.tool_calls[0].arguments, serde_json::json!({"tz": "UTC"}));
+    assert_eq!(p.tool_calls[0].name(), "now");
+    assert_eq!(
+      *p.tool_calls[0].arguments(),
+      serde_json::json!({"tz": "UTC"})
+    );
   }
 
   #[test]
@@ -3824,7 +3868,7 @@ mod tests {
     let out = p.process_chunk(r#"sure {"name": "now", "arguments": {}}"#);
     assert_eq!(out.as_deref(), Some("sure "));
     assert_eq!(p.tool_calls.len(), 1);
-    assert_eq!(p.tool_calls[0].name, "now");
+    assert_eq!(p.tool_calls[0].name(), "now");
   }
 
   #[test]
@@ -3860,9 +3904,9 @@ mod tests {
     // ... until process_eos parses the buffered tail.
     p.process_eos();
     assert_eq!(p.tool_calls.len(), 1);
-    assert_eq!(p.tool_calls[0].name, "get_weather");
+    assert_eq!(p.tool_calls[0].name(), "get_weather");
     assert_eq!(
-      p.tool_calls[0].arguments,
+      *p.tool_calls[0].arguments(),
       serde_json::json!({"city": "Tokyo"})
     );
   }
@@ -3922,13 +3966,13 @@ mod tests {
     let out = p.process_chunk(r#"{"name":"now","arguments":{}} done"#);
     assert_eq!(out.as_deref(), Some(" done"));
     assert_eq!(p.tool_calls.len(), 1);
-    assert_eq!(p.tool_calls[0].name, "now");
+    assert_eq!(p.tool_calls[0].name(), "now");
     // And the same bytes split right after the brace behave identically.
     let mut p2 = ToolCallProcessor::new(Box::new(InlineJson), None);
     assert_eq!(p2.process_chunk(r#"{"name":"now","arguments":{}}"#), None);
     assert_eq!(p2.process_chunk(" done").as_deref(), Some(" done"));
     assert_eq!(p2.tool_calls.len(), 1);
-    assert_eq!(p2.tool_calls[0].name, "now");
+    assert_eq!(p2.tool_calls[0].name(), "now");
   }
 
   #[test]
@@ -3940,8 +3984,8 @@ mod tests {
     let out = p.process_chunk(r#"{"name":"a","arguments":{}}{"name":"b","arguments":{}}"#);
     assert_eq!(out, None);
     assert_eq!(p.tool_calls.len(), 2);
-    assert_eq!(p.tool_calls[0].name, "a");
-    assert_eq!(p.tool_calls[1].name, "b");
+    assert_eq!(p.tool_calls[0].name(), "a");
+    assert_eq!(p.tool_calls[1].name(), "b");
   }
 
   #[test]
@@ -3959,9 +4003,9 @@ mod tests {
     let out2 = p2.process_chunk(r#"{"name":"echo","arguments":{"s":"a}b{c"}}"#);
     assert_eq!(out2, None);
     assert_eq!(p2.tool_calls.len(), 1);
-    assert_eq!(p2.tool_calls[0].name, "echo");
+    assert_eq!(p2.tool_calls[0].name(), "echo");
     assert_eq!(
-      p2.tool_calls[0].arguments,
+      *p2.tool_calls[0].arguments(),
       serde_json::json!({"s": "a}b{c"})
     );
   }
@@ -3993,7 +4037,7 @@ mod tests {
     let out = p.process_chunk(r#"{"name":"ok","arguments":{}}"#);
     assert_eq!(out, None);
     assert_eq!(p.tool_calls.len(), 1);
-    assert_eq!(p.tool_calls[0].name, "ok");
+    assert_eq!(p.tool_calls[0].name(), "ok");
   }
 
   #[test]
@@ -4057,8 +4101,8 @@ mod tests {
     assert_eq!(p.tool_calls.len(), N);
     // Ordering preserved: argument `i` increases monotonically with index.
     for (idx, call) in p.tool_calls.iter().enumerate() {
-      assert_eq!(call.name, "f");
-      assert_eq!(call.arguments, serde_json::json!({ "i": idx }));
+      assert_eq!(call.name(), "f");
+      assert_eq!(*call.arguments(), serde_json::json!({ "i": idx }));
     }
   }
 
@@ -4150,9 +4194,9 @@ mod tests {
       p.process_chunk(r#"<tool_call>{"name":"echo","arguments":{"s":"</tool_call>"}}</tool_call>"#);
     assert_eq!(out, None, "no suffix may leak as display text");
     assert_eq!(p.tool_calls.len(), 1, "the call must not be discarded");
-    assert_eq!(p.tool_calls[0].name, "echo");
+    assert_eq!(p.tool_calls[0].name(), "echo");
     assert_eq!(
-      p.tool_calls[0].arguments,
+      *p.tool_calls[0].arguments(),
       serde_json::json!({"s": "</tool_call>"}),
       "the delimiter inside the string argument is preserved verbatim"
     );
@@ -4172,9 +4216,9 @@ mod tests {
     assert_eq!(p.tool_calls.len(), 0);
     assert_eq!(p.process_chunk(r#"/tool_call>"}}</tool_call>"#), None);
     assert_eq!(p.tool_calls.len(), 1);
-    assert_eq!(p.tool_calls[0].name, "echo");
+    assert_eq!(p.tool_calls[0].name(), "echo");
     assert_eq!(
-      p.tool_calls[0].arguments,
+      *p.tool_calls[0].arguments(),
       serde_json::json!({"s": "</tool_call>"})
     );
   }
@@ -4190,9 +4234,9 @@ mod tests {
     );
     assert_eq!(out.as_deref(), Some(" done"));
     assert_eq!(p.tool_calls.len(), 1);
-    assert_eq!(p.tool_calls[0].name, "echo");
+    assert_eq!(p.tool_calls[0].name(), "echo");
     assert_eq!(
-      p.tool_calls[0].arguments,
+      *p.tool_calls[0].arguments(),
       serde_json::json!({"s": "</tool_call>"})
     );
   }
@@ -4218,9 +4262,9 @@ mod tests {
         .expect("Some");
       assert_eq!(end_pos, buf.len(), "end_pos lands at buffer end");
       assert_eq!(calls.len(), 1, "one call extracted intact");
-      assert_eq!(calls[0].name, "echo");
+      assert_eq!(calls[0].name(), "echo");
       assert_eq!(
-        calls[0].arguments,
+        *calls[0].arguments(),
         serde_json::json!({"s": "</tool_call>"}),
         "in-string end-tag literal preserved verbatim"
       );
@@ -4803,7 +4847,7 @@ mod tests {
     // the cap-trip; this fresh call has no leading prose.
     assert_eq!(out, None);
     assert_eq!(p.tool_calls.len(), 1);
-    assert_eq!(p.tool_calls[0].name, "ok");
+    assert_eq!(p.tool_calls[0].name(), "ok");
   }
 
   #[test]
@@ -5150,7 +5194,7 @@ mod tests {
     let out = p.process_chunk(payload);
     assert_eq!(out.as_deref(), Some(" after"));
     assert_eq!(p.tool_calls.len(), 1);
-    assert_eq!(p.tool_calls[0].name, "echo");
+    assert_eq!(p.tool_calls[0].name(), "echo");
   }
 
   #[test]
@@ -5163,7 +5207,7 @@ mod tests {
     let out = p.process_chunk(payload);
     assert_eq!(out.as_deref(), Some(" after"));
     assert_eq!(p.tool_calls.len(), 1);
-    assert_eq!(p.tool_calls[0].name, "f");
+    assert_eq!(p.tool_calls[0].name(), "f");
   }
 
   #[test]
@@ -5184,9 +5228,9 @@ mod tests {
     let out = p.process_chunk(payload);
     assert_eq!(out.as_deref(), Some(" after"));
     assert_eq!(p.tool_calls.len(), 1);
-    assert_eq!(p.tool_calls[0].name, "echo");
+    assert_eq!(p.tool_calls[0].name(), "echo");
     assert_eq!(
-      p.tool_calls[0].arguments,
+      *p.tool_calls[0].arguments(),
       serde_json::json!({"s": "<|tool_calls_section_end|>"}),
     );
   }
@@ -5202,9 +5246,9 @@ mod tests {
     let out = p.process_chunk(payload);
     assert_eq!(out.as_deref(), Some(" after"));
     assert_eq!(p.tool_calls.len(), 1);
-    assert_eq!(p.tool_calls[0].name, "f");
+    assert_eq!(p.tool_calls[0].name(), "f");
     assert_eq!(
-      p.tool_calls[0].arguments,
+      *p.tool_calls[0].arguments(),
       serde_json::json!({"k": "<end_function_call>"})
     );
   }
@@ -5219,9 +5263,9 @@ mod tests {
     let out = p.process_chunk(payload);
     assert_eq!(out.as_deref(), Some(" after"));
     assert_eq!(p.tool_calls.len(), 1);
-    assert_eq!(p.tool_calls[0].name, "f");
+    assert_eq!(p.tool_calls[0].name(), "f");
     assert_eq!(
-      p.tool_calls[0].arguments,
+      *p.tool_calls[0].arguments(),
       serde_json::json!({"k": "<tool_call|>"})
     );
   }
@@ -6094,7 +6138,8 @@ mod tests {
         row.label
       );
       assert_eq!(
-        calls[0].name, row.expect_first_name,
+        calls[0].name(),
+        row.expect_first_name,
         "{}: first section's first call name",
         row.label
       );
@@ -6521,9 +6566,9 @@ mod tests {
     let out2 = p.process_chunk(r#""}}</tool_call> done"#);
     assert_eq!(out2.as_deref(), Some(" done"));
     assert_eq!(p.tool_calls.len(), 1);
-    assert_eq!(p.tool_calls[0].name, "echo");
+    assert_eq!(p.tool_calls[0].name(), "echo");
     assert_eq!(
-      p.tool_calls[0].arguments,
+      *p.tool_calls[0].arguments(),
       serde_json::json!({"s": "</tool_call>"}),
       "in-string `</tool_call>` literal preserved verbatim"
     );
@@ -6964,7 +7009,7 @@ mod tests {
   fn streaming_glm47_suffix_object_after_malformed_section_preserved() {
     // glm47's `parse()` is permissive: a plain-text body `bad` is
     // accepted as a tool-call name (`glm_parse_plain` returns
-    // `ToolCall::new("bad", {})` rather than rejecting). Pre-R14 this
+    // `ToolCall::new_nameless_id("bad", {})` rather than rejecting). Pre-R14 this
     // single permissive call was already emitted at the FIRST wrapper
     // close. R14's invariant for glm47 is *suffix preservation*: the
     // body scan must not advance into the suffix object. With R14,
@@ -6980,7 +7025,7 @@ mod tests {
       1,
       "glm47 is permissive: plain-text body `bad` becomes ToolCall(`bad`); the R14 invariant is suffix preservation, not call rejection"
     );
-    assert_eq!(calls[0].name, "bad", "plain-text body parsed as name");
+    assert_eq!(calls[0].name(), "bad", "plain-text body parsed as name");
     assert_eq!(
       display, r#"{"name":"y"} tail"#,
       "FULL suffix (object literal + tail) survives the R14 attack — body scan must not lock onto the suffix object"
@@ -7070,7 +7115,7 @@ mod tests {
         expect_calls: 0,
       },
       // glm47 (None-arm): SUFFIX is a JSON object. `glm_parse_plain`
-      // is permissive: body `bad` becomes `ToolCall::new("bad", {})`
+      // is permissive: body `bad` becomes `ToolCall::new_nameless_id("bad", {})`
       // (one call). The R14 invariant is suffix preservation.
       R14Row {
         label: "glm47 (suffix = JSON object after non-JSON body)",
@@ -7168,7 +7213,7 @@ mod tests {
         parser: Box::new(Glm47),
         buffer: r#"<tool_call>bad</tool_call>{"name":"y"} tail"#,
         expect_end_pos: "<tool_call>bad</tool_call>".len(),
-        // Permissive: plain-text body `bad` → ToolCall::new("bad", {}).
+        // Permissive: plain-text body `bad` → ToolCall::new_nameless_id("bad", {}).
         expect_calls_empty: false,
       },
       Row {
@@ -7349,7 +7394,7 @@ mod tests {
     // JSON), so one call surfaces with name=`{garbage}`. The R15
     // assertion is suffix preservation.
     assert_eq!(calls.len(), 1, "glm47 permissive parse on `{{garbage}}`");
-    assert_eq!(calls[0].name, "{garbage}");
+    assert_eq!(calls[0].name(), "{garbage}");
     assert_eq!(
       display, r#"{"name":"y"} tail"#,
       "FULL suffix bytes reach display — Object arm race must close at the FIRST wrapper end-tag",
@@ -7369,7 +7414,7 @@ mod tests {
     );
     // glm47 permissive: `[garbage]` body, glm_parse_plain treats as name.
     assert_eq!(calls.len(), 1, "glm47 permissive parse on `[garbage]`");
-    assert_eq!(calls[0].name, "[garbage]");
+    assert_eq!(calls[0].name(), "[garbage]");
     assert_eq!(
       display, r#"{"name":"y"} tail"#,
       "FULL suffix bytes reach display — Array arm race must close at the FIRST wrapper end-tag",
@@ -7395,7 +7440,7 @@ mod tests {
     );
     // glm47 permissive: body parsed via glm_parse_plain → name=`bad`.
     assert_eq!(calls.len(), 1, "glm47 permissive parse extracts one call");
-    assert_eq!(calls[0].name, "bad");
+    assert_eq!(calls[0].name(), "bad");
     assert_eq!(
       display, r#"{"name":"y"} tail"#,
       "FULL suffix bytes reach display — R8/R9 None-arm race stays correct under R15",
@@ -7857,9 +7902,9 @@ mod tests {
       1,
       "digit-leading pythonic name MUST be accepted by the shared recognizer (R17 finding 1)",
     );
-    assert_eq!(calls[0].name, "1tool");
+    assert_eq!(calls[0].name(), "1tool");
     assert_eq!(
-      calls[0].arguments,
+      *calls[0].arguments(),
       serde_json::json!({ "s": "<|tool_call_end|>" }),
       "in-single-quoted-string `<|tool_call_end|>` literal MUST survive the quote-aware scan when the recognizer accepts the digit-leading name",
     );
@@ -8004,9 +8049,9 @@ mod tests {
       1,
       "dotted-name qwen3_coder body MUST be accepted by the shared recognizer (R18 finding)",
     );
-    assert_eq!(calls[0].name, "foo.bar");
+    assert_eq!(calls[0].name(), "foo.bar");
     assert_eq!(
-      calls[0].arguments,
+      *calls[0].arguments(),
       serde_json::json!({ "p": "contains </tool_call> bytes" }),
       "in-parameter `</tool_call>` literal MUST survive the parameter-value-aware scan when the recognizer accepts the dotted name",
     );
@@ -8039,9 +8084,9 @@ mod tests {
       1,
       "space-bearing qwen3_coder name MUST be accepted by the shared recognizer (R18 finding)",
     );
-    assert_eq!(calls[0].name, "foo bar");
+    assert_eq!(calls[0].name(), "foo bar");
     assert_eq!(
-      calls[0].arguments,
+      *calls[0].arguments(),
       serde_json::json!({ "p": "has </tool_call> in value" }),
       "in-parameter `</tool_call>` literal MUST survive the parameter-value-aware scan when the recognizer accepts the spaced name",
     );

@@ -46,8 +46,8 @@ fn encode_with_defaults_matches_encode_true() {
   let legacy = tok.encode(text, true).unwrap();
   let out = tok.encode_with(text, &EncodeOptions::default()).unwrap();
 
-  assert_eq!(out.ids, legacy);
-  assert!(out.attention_mask.is_none()); // default leaves the mask off
+  assert_eq!(out.ids(), legacy);
+  assert!(out.attention_mask().is_empty()); // default leaves the mask off
 }
 
 #[test]
@@ -61,10 +61,10 @@ fn encode_with_add_special_false_matches_legacy_false() {
 
   let legacy = tok.encode(text, false).unwrap();
   let out = tok
-    .encode_with(text, &EncodeOptions::new().add_special(false))
+    .encode_with(text, &EncodeOptions::new().with_add_special(false))
     .unwrap();
 
-  assert_eq!(out.ids, legacy);
+  assert_eq!(out.ids(), legacy);
 }
 
 #[test]
@@ -78,23 +78,25 @@ fn encode_with_add_eos_uses_primary_not_smallest_id() {
   // FIRST slice element separately and uses it for emission.
   let tok = Tokenizer::from_path(fixture_dir(), Some(&[2, 0])).unwrap();
   // The full stop set has both ids (order-independent).
-  assert!(tok.eos_token_ids().contains(&0));
-  assert!(tok.eos_token_ids().contains(&2));
+  assert!(tok.contains_eos_id(0));
+  assert!(tok.contains_eos_id(2));
 
   let out = tok
     .encode_with(
       "hello world",
-      &EncodeOptions::new().add_special(false).add_eos(true),
+      &EncodeOptions::new()
+        .with_add_special(false)
+        .with_add_eos(true),
     )
     .unwrap();
 
   // The PRIMARY (first-supplied) eos id is 2 — that's what must be
   // appended, NOT the numerically smaller 0.
-  assert_eq!(out.ids.last().copied(), Some(2u32));
+  assert_eq!(out.ids().last().copied(), Some(2u32));
   assert!(
-    !out.ids[..out.ids.len() - 1].contains(&2),
+    !out.ids()[..out.ids().len() - 1].contains(&2),
     "primary eos should appear only at the tail; got {:?}",
-    out.ids
+    out.ids()
   );
 }
 
@@ -109,15 +111,20 @@ fn encode_with_add_eos_appends_eos_id() {
   let text = "hello world";
 
   let base = tok
-    .encode_with(text, &EncodeOptions::new().add_special(false))
+    .encode_with(text, &EncodeOptions::new().with_add_special(false))
     .unwrap();
   let with_eos = tok
-    .encode_with(text, &EncodeOptions::new().add_special(false).add_eos(true))
+    .encode_with(
+      text,
+      &EncodeOptions::new()
+        .with_add_special(false)
+        .with_add_eos(true),
+    )
     .unwrap();
 
-  assert_eq!(with_eos.ids.last().copied(), Some(eos));
-  assert_eq!(with_eos.ids.len(), base.ids.len() + 1);
-  assert_eq!(&with_eos.ids[..base.ids.len()], &base.ids[..]);
+  assert_eq!(with_eos.ids().last().copied(), Some(eos));
+  assert_eq!(with_eos.ids().len(), base.ids().len() + 1);
+  assert_eq!(&with_eos.ids()[..base.ids().len()], base.ids());
 }
 
 #[test]
@@ -136,10 +143,10 @@ fn encode_with_add_eos_errors_when_no_eos_configured() {
   // Deliberately no `tokenizer_config.json` written: `from_path` falls back
   // to an empty Value and `eos_token_ids` stays empty (no user-supplied set).
   let tok = Tokenizer::from_path(&dir, None).unwrap();
-  assert!(tok.eos_token_ids().is_empty());
+  assert!(tok.eos_token_ids_iter().next().is_none());
 
   let err = tok
-    .encode_with("hi", &EncodeOptions::new().add_eos(true))
+    .encode_with("hi", &EncodeOptions::new().with_add_eos(true))
     .unwrap_err();
   let msg = format!("{err}");
   assert!(
@@ -165,12 +172,14 @@ fn encode_with_truncate_to_caps_length() {
   let out = tok
     .encode_with(
       text,
-      &EncodeOptions::new().add_special(false).truncate_to(Some(3)),
+      &EncodeOptions::new()
+        .with_add_special(false)
+        .with_truncate_to(Some(3)),
     )
     .unwrap();
 
-  assert_eq!(out.ids.len(), 3);
-  assert_eq!(out.ids, full[..3]);
+  assert_eq!(out.ids().len(), 3);
+  assert_eq!(out.ids(), &full[..3]);
 }
 
 #[test]
@@ -185,12 +194,12 @@ fn encode_with_truncate_to_above_length_is_noop() {
     .encode_with(
       text,
       &EncodeOptions::new()
-        .add_special(false)
-        .truncate_to(Some(full.len() + 100)),
+        .with_add_special(false)
+        .with_truncate_to(Some(full.len() + 100)),
     )
     .unwrap();
 
-  assert_eq!(out.ids, full);
+  assert_eq!(out.ids(), full);
 }
 
 #[test]
@@ -201,11 +210,12 @@ fn encode_with_return_attention_mask_matches_ids_len() {
   let text = "hello world the quick brown fox";
 
   let out = tok
-    .encode_with(text, &EncodeOptions::new().return_attention_mask(true))
+    .encode_with(text, &EncodeOptions::new().with_return_attention_mask(true))
     .unwrap();
 
-  let mask = out.attention_mask.expect("mask requested");
-  assert_eq!(mask.len(), out.ids.len());
+  let mask = out.attention_mask();
+  assert_eq!(mask.len(), out.ids().len());
+  assert!(!mask.is_empty(), "mask requested");
   assert!(mask.iter().all(|&m| m == 1), "non-padded mask is all 1s");
 }
 
@@ -221,14 +231,16 @@ fn encode_with_truncate_zero_yields_empty_ids_and_mask() {
     .encode_with(
       "hello world",
       &EncodeOptions::new()
-        .truncate_to(Some(0))
-        .return_attention_mask(true),
+        .with_truncate_to(Some(0))
+        .with_return_attention_mask(true),
     )
     .unwrap();
 
-  assert!(out.ids.is_empty());
-  let mask = out.attention_mask.expect("mask requested");
-  assert!(mask.is_empty());
+  assert!(out.ids().is_empty());
+  assert!(
+    out.attention_mask().is_empty(),
+    "mask requested + empty in lock-step with ids"
+  );
 }
 
 #[test]
@@ -243,16 +255,19 @@ fn encode_with_truncate_zero_dominates_add_eos() {
     .encode_with(
       "hello world",
       &EncodeOptions::new()
-        .add_eos(true)
-        .truncate_to(Some(0))
-        .return_attention_mask(true),
+        .with_add_eos(true)
+        .with_truncate_to(Some(0))
+        .with_return_attention_mask(true),
     )
     .expect("eos is configured in the fixture, so add_eos does not error");
 
-  assert!(out.ids.is_empty(), "n=0 cap dominates add_eos → empty ids");
   assert!(
-    out.attention_mask.expect("mask requested").is_empty(),
-    "mask empty in lock-step with ids"
+    out.ids().is_empty(),
+    "n=0 cap dominates add_eos → empty ids"
+  );
+  assert!(
+    out.attention_mask().is_empty(),
+    "mask empty in lock-step with ids (mask requested)"
   );
 }
 
@@ -294,13 +309,14 @@ fn encode_with_padded_tokenizer_strips_pads_and_eos_lands_after_real() {
     .encode_with(
       "hello world",
       &EncodeOptions::new()
-        .add_special(false)
-        .return_attention_mask(true),
+        .with_add_special(false)
+        .with_return_attention_mask(true),
     )
     .unwrap();
   // Padded HF encoding would be 16 tokens; encode_with strips pads.
-  assert_eq!(bare.ids.len(), 2);
-  let bare_mask = bare.attention_mask.expect("mask requested");
+  assert_eq!(bare.ids().len(), 2);
+  let bare_mask = bare.attention_mask();
+  assert!(!bare_mask.is_empty(), "mask requested");
   assert!(bare_mask.iter().all(|&m| m == 1));
 
   // With `add_eos`: EOS sits at the unpadded boundary, no pads remain in
@@ -309,21 +325,22 @@ fn encode_with_padded_tokenizer_strips_pads_and_eos_lands_after_real() {
     .encode_with(
       "hello world",
       &EncodeOptions::new()
-        .add_special(false)
-        .add_eos(true)
-        .return_attention_mask(true),
+        .with_add_special(false)
+        .with_add_eos(true)
+        .with_return_attention_mask(true),
     )
     .unwrap();
-  assert_eq!(with_eos.ids.len(), bare.ids.len() + 1);
-  assert_eq!(with_eos.ids.last().copied(), Some(eos));
+  assert_eq!(with_eos.ids().len(), bare.ids().len() + 1);
+  assert_eq!(with_eos.ids().last().copied(), Some(eos));
   // Padding id is 0; assert none of the result is the pad id.
   assert!(
-    !with_eos.ids.contains(&0),
+    !with_eos.ids().contains(&0),
     "result must not contain pad id 0; got {:?}",
-    with_eos.ids
+    with_eos.ids()
   );
-  let mask = with_eos.attention_mask.expect("mask requested");
-  assert_eq!(mask.len(), with_eos.ids.len());
+  let mask = with_eos.attention_mask();
+  assert!(!mask.is_empty(), "mask requested");
+  assert_eq!(mask.len(), with_eos.ids().len());
   assert!(mask.iter().all(|&m| m == 1));
 }
 
@@ -361,12 +378,13 @@ fn encode_with_left_padded_tokenizer_drops_leading_pads() {
     .encode_with(
       "hello world",
       &EncodeOptions::new()
-        .add_special(false)
-        .return_attention_mask(true),
+        .with_add_special(false)
+        .with_return_attention_mask(true),
     )
     .unwrap();
-  assert_eq!(bare.ids, vec![3u32, 4]);
-  let bare_mask = bare.attention_mask.expect("mask requested");
+  assert_eq!(bare.ids(), &[3u32, 4]);
+  let bare_mask = bare.attention_mask();
+  assert!(!bare_mask.is_empty(), "mask requested");
   assert!(bare_mask.iter().all(|&m| m == 1));
 
   // With `add_eos`: result is `[3, 4, eos]`, no leading pads.
@@ -374,10 +392,12 @@ fn encode_with_left_padded_tokenizer_drops_leading_pads() {
   let with_eos = tok
     .encode_with(
       "hello world",
-      &EncodeOptions::new().add_special(false).add_eos(true),
+      &EncodeOptions::new()
+        .with_add_special(false)
+        .with_add_eos(true),
     )
     .unwrap();
-  assert_eq!(with_eos.ids, vec![3u32, 4, eos]);
+  assert_eq!(with_eos.ids(), &[3u32, 4, eos]);
 }
 
 #[cfg(feature = "tokenizer-stream")]
@@ -433,13 +453,13 @@ fn encode_with_add_eos_errors_without_calling_hf_encode() {
   let mut f = std::fs::File::create(dir.join("tokenizer.json")).unwrap();
   f.write_all(TOKENIZER_JSON.as_bytes()).unwrap();
   let tok = Tokenizer::from_path(&dir, None).unwrap();
-  assert!(tok.eos_token_ids().is_empty());
+  assert!(tok.eos_token_ids_iter().next().is_none());
 
   // Use a large input that would be expensive to tokenize: this validates
   // the precondition path errors regardless of input size.
   let big = "hello ".repeat(1024);
   let err = tok
-    .encode_with(&big, &EncodeOptions::new().add_eos(true))
+    .encode_with(&big, &EncodeOptions::new().with_add_eos(true))
     .unwrap_err();
   let msg = format!("{err}");
   assert!(msg.contains("eos"), "{msg}");
@@ -467,12 +487,14 @@ fn encode_with_truncate_far_below_input_is_bounded_alloc() {
   let out = tok
     .encode_with(
       &buf,
-      &EncodeOptions::new().add_special(false).truncate_to(Some(8)),
+      &EncodeOptions::new()
+        .with_add_special(false)
+        .with_truncate_to(Some(8)),
     )
     .unwrap();
-  assert_eq!(out.ids.len(), 8);
+  assert_eq!(out.ids().len(), 8);
   // All 8 ids should be the "hello" id (== 3 in the fixture).
-  assert!(out.ids.iter().all(|&id| id == 3));
+  assert!(out.ids().iter().all(|&id| id == 3));
 }
 
 #[test]
@@ -487,23 +509,23 @@ fn encode_with_add_eos_then_truncate_caps_including_eos() {
   let text = "hello world the quick brown fox";
 
   let base = tok
-    .encode_with(text, &EncodeOptions::new().add_special(false))
+    .encode_with(text, &EncodeOptions::new().with_add_special(false))
     .unwrap();
-  assert!(base.ids.len() >= 2);
+  assert!(base.ids().len() >= 2);
   let eos = tok.eos_token_id().expect("fixture has eos");
 
   let out = tok
     .encode_with(
       text,
       &EncodeOptions::new()
-        .add_special(false)
-        .add_eos(true)
-        .truncate_to(Some(2)),
+        .with_add_special(false)
+        .with_add_eos(true)
+        .with_truncate_to(Some(2)),
     )
     .unwrap();
 
-  assert_eq!(out.ids.len(), 2);
-  assert_eq!(out.ids, vec![base.ids[0], eos]);
+  assert_eq!(out.ids().len(), 2);
+  assert_eq!(out.ids(), &[base.ids()[0], eos]);
 }
 
 #[test]
@@ -521,32 +543,28 @@ fn encoded_and_options_are_debug_clone() {
   // exercises the Clone impl without `let _ = x.clone()` (which clippy
   // flags as no-op).
   let opts = EncodeOptions::new()
-    .add_special(false)
-    .add_eos(true)
-    .truncate_to(Some(128))
-    .return_attention_mask(true);
+    .with_add_special(false)
+    .with_add_eos(true)
+    .with_truncate_to(Some(128))
+    .with_return_attention_mask(true);
   // Bind the clone to a real variable + mutate it so the value is observed
   // (clippy's `redundant_clone` triggers when the cloned value is dropped
   // without use). Field-equality on the chained-builder field-change proves
   // the Clone+chain composition is independent of the source.
-  let mut opts_cloned = opts.clone();
-  opts_cloned.add_eos = false;
-  assert!(opts.add_eos && !opts_cloned.add_eos);
+  let opts_cloned = opts.clone().with_add_eos(false);
+  assert!(opts.add_eos() && !opts_cloned.add_eos());
   let s = format!("{opts:?}");
   // Field names visible in the derived Debug — assert a couple as a smoke
   // signal that the format is not empty / not just "EncodeOptions".
   assert!(s.contains("add_eos"));
   assert!(s.contains("truncate_to"));
 
-  let encoded = Encoded {
-    ids: vec![1, 2, 3],
-    attention_mask: Some(vec![1, 1, 1]),
-  };
+  let encoded = Encoded::new(vec![1, 2, 3], vec![1, 1, 1]);
   // Same Clone-is-independent assertion for `Encoded`.
-  let mut encoded_cloned = encoded.clone();
-  encoded_cloned.ids.push(4);
-  assert_eq!(encoded.ids.len(), 3);
-  assert_eq!(encoded_cloned.ids.len(), 4);
+  let mut encoded_cloned_ids = encoded.ids().to_vec();
+  encoded_cloned_ids.push(4);
+  assert_eq!(encoded.ids().len(), 3);
+  assert_eq!(encoded_cloned_ids.len(), 4);
   let es = format!("{encoded:?}");
   assert!(es.contains("ids"));
 }
@@ -571,27 +589,29 @@ fn encode_batch_with_matches_encode_with_per_item() {
     "hello".to_owned(),
   ];
   let opts = EncodeOptions::new()
-    .add_special(false)
-    .add_eos(true)
-    .truncate_to(Some(3))
-    .return_attention_mask(true);
+    .with_add_special(false)
+    .with_add_eos(true)
+    .with_truncate_to(Some(3))
+    .with_return_attention_mask(true);
 
   let batched = tok.encode_batch_with(texts.clone(), &opts).unwrap();
   assert_eq!(batched.len(), texts.len());
   for (i, text) in texts.iter().enumerate() {
     let single = tok.encode_with(text, &opts).unwrap();
     assert_eq!(
-      batched[i].ids, single.ids,
+      batched[i].ids(),
+      single.ids(),
       "item {i} ids must match encode_with"
     );
     assert_eq!(
-      batched[i].attention_mask, single.attention_mask,
+      batched[i].attention_mask(),
+      single.attention_mask(),
       "item {i} mask must match encode_with"
     );
     // truncate_to(3) + add_eos => last id is EOS in EVERY non-empty item.
     let eos = tok.eos_token_id().expect("fixture has eos");
-    assert_eq!(batched[i].ids.last().copied(), Some(eos));
-    assert!(batched[i].ids.len() <= 3, "truncate cap honored");
+    assert_eq!(batched[i].ids().last().copied(), Some(eos));
+    assert!(batched[i].ids().len() <= 3, "truncate cap honored");
   }
 }
 
@@ -608,14 +628,14 @@ fn encode_batch_with_add_eos_errors_without_calling_hf_encode_batch() {
   let mut f = std::fs::File::create(dir.join("tokenizer.json")).unwrap();
   f.write_all(TOKENIZER_JSON.as_bytes()).unwrap();
   let tok = Tokenizer::from_path(&dir, None).unwrap();
-  assert!(tok.eos_token_ids().is_empty());
+  assert!(tok.eos_token_ids_iter().next().is_none());
 
   // Many large inputs that would be expensive to tokenize: the fast-fail
   // path errors regardless of batch size / per-item size.
   let big = "hello ".repeat(1024);
   let texts: Vec<String> = (0..32).map(|_| big.clone()).collect();
   let err = tok
-    .encode_batch_with(texts, &EncodeOptions::new().add_eos(true))
+    .encode_batch_with(texts, &EncodeOptions::new().with_add_eos(true))
     .unwrap_err();
   let msg = format!("{err}");
   assert!(

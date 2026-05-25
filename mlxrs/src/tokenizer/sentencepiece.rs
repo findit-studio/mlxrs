@@ -51,24 +51,58 @@ use crate::error::{Error, Result};
 
 /// SentencePiece piece-type enum, matching the upstream
 /// `ModelProto.SentencePiece.Type` ordinals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
+///
+/// `#[non_exhaustive]` because the upstream SentencePiece protobuf schema
+/// can gain new ordinals in future releases. The `Unknown(i32)` variant
+/// captures any ordinal not recognized at compile time, preserving round-trip
+/// identity: `from_raw(x.as_raw()) == x` for every value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
+#[display("{}", self.as_str())]
+#[non_exhaustive]
 pub enum SentencePiecePieceType {
   /// Trained vocabulary piece.
-  Normal = 1,
+  Normal,
   /// Unknown / OOV catch-all.
-  Unknown = 2,
+  Unknown,
   /// Reserved control token (BOS/EOS/PAD).
-  Control = 3,
+  Control,
   /// User-defined token (atomic — never split during BPE merges).
-  UserDefined = 4,
+  UserDefined,
   /// Unused vocabulary entry (skipped during decode).
-  Unused = 5,
+  Unused,
   /// Byte-fallback piece (e.g. `<0xFF>`).
-  Byte = 6,
+  Byte,
+  /// Unrecognized ordinal from a future or extended SentencePiece schema.
+  UnknownOrdinal(i32),
 }
 
 impl SentencePiecePieceType {
+  /// Lowercase string identifier for this piece type.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Normal => "normal",
+      Self::Unknown => "unknown",
+      Self::Control => "control",
+      Self::UserDefined => "user_defined",
+      Self::Unused => "unused",
+      Self::Byte => "byte",
+      Self::UnknownOrdinal(_) => "unknown",
+    }
+  }
+
+  /// Raw ordinal as stored in the protobuf.
+  pub fn as_raw(self) -> i32 {
+    match self {
+      Self::Normal => 1,
+      Self::Unknown => 2,
+      Self::Control => 3,
+      Self::UserDefined => 4,
+      Self::Unused => 5,
+      Self::Byte => 6,
+      Self::UnknownOrdinal(n) => n,
+    }
+  }
+
   fn from_raw(raw: u64) -> Self {
     match raw {
       1 => SentencePiecePieceType::Normal,
@@ -77,22 +111,30 @@ impl SentencePiecePieceType {
       4 => SentencePiecePieceType::UserDefined,
       5 => SentencePiecePieceType::Unused,
       6 => SentencePiecePieceType::Byte,
-      _ => SentencePiecePieceType::Normal,
+      n => SentencePiecePieceType::UnknownOrdinal(n as i32),
     }
   }
 }
 
 /// SentencePiece training algorithm — Unigram (default) or BPE.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
+#[display("{}", self.as_str())]
 pub enum SentencePieceModelType {
   /// Unigram language model — Viterbi-decoded.
-  Unigram = 1,
+  Unigram,
   /// Byte-pair encoding — greedy-merge-decoded.
-  Bpe = 2,
+  Bpe,
 }
 
 impl SentencePieceModelType {
+  /// Lowercase string identifier for this model type.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Unigram => "unigram",
+      Self::Bpe => "bpe",
+    }
+  }
+
   fn from_raw(raw: u64) -> Option<Self> {
     match raw {
       1 => Some(SentencePieceModelType::Unigram),
@@ -108,24 +150,41 @@ impl SentencePieceModelType {
 pub struct SentencePieceToken {
   /// The piece string (UTF-8). May contain the U+2581 metaspace marker
   /// `▁` for word-initial pieces and `<0xHH>` byte-fallback entries.
-  pub token: String,
+  token: String,
   /// Per-piece log-probability score from the trained model. Higher is
   /// more likely; the Unigram Viterbi maximizes the sum of these.
-  pub score: f32,
+  score: f32,
   /// Piece category — controls byte-fallback / decode-skip / atomic-BPE
   /// behavior.
-  pub r#type: SentencePiecePieceType,
+  piece_type: SentencePiecePieceType,
 }
 
 impl SentencePieceToken {
-  /// Build a `Normal` piece with the given token + score (the most
-  /// common case for tests + JSON construction).
-  pub fn new(token: impl Into<String>, score: f32) -> Self {
+  /// Build a piece with the given token, score, and piece type.
+  pub fn new(token: impl Into<String>, score: f32, piece_type: SentencePiecePieceType) -> Self {
     Self {
       token: token.into(),
       score,
-      r#type: SentencePiecePieceType::Normal,
+      piece_type,
     }
+  }
+
+  /// The piece string (UTF-8).
+  #[inline(always)]
+  pub fn token(&self) -> &str {
+    &self.token
+  }
+
+  /// Per-piece log-probability score.
+  #[inline(always)]
+  pub fn score(&self) -> f32 {
+    self.score
+  }
+
+  /// Piece category.
+  #[inline(always)]
+  pub fn piece_type(&self) -> SentencePiecePieceType {
+    self.piece_type
   }
 }
 
@@ -254,7 +313,7 @@ fn parse_pieces(data: &[u8]) -> Result<ParsedModel> {
     if field_number == 1 && wire_type == 2 {
       let piece_data = reader.read_length_delimited()?;
       if let Some(piece) = parse_piece(piece_data)? {
-        if piece.r#type == SentencePiecePieceType::Unknown && unknown_token_id.is_none() {
+        if piece.piece_type() == SentencePiecePieceType::Unknown && unknown_token_id.is_none() {
           unknown_token_id = Some(pieces.len());
         }
         pieces.push(piece);
@@ -276,7 +335,7 @@ fn parse_pieces(data: &[u8]) -> Result<ParsedModel> {
   }
 
   let resolved_unknown_id = unknown_token_id
-    .or_else(|| pieces.iter().position(|p| p.token == "<unk>"))
+    .or_else(|| pieces.iter().position(|p| p.token() == "<unk>"))
     .unwrap_or(0);
 
   Ok(ParsedModel {
@@ -310,11 +369,7 @@ fn parse_piece(data: &[u8]) -> Result<Option<SentencePieceToken>> {
       _ => reader.skip_field(wire_type)?,
     }
   }
-  Ok(token.map(|token| SentencePieceToken {
-    token,
-    score,
-    r#type,
-  }))
+  Ok(token.map(|token| SentencePieceToken::new(token, score, r#type)))
 }
 
 fn parse_trainer_spec_model_type(data: &[u8]) -> Result<Option<SentencePieceModelType>> {
@@ -599,20 +654,23 @@ impl SentencePieceTokenizer {
     unknown_token_id: usize,
     model_type: SentencePieceModelType,
   ) -> Self {
-    let min_score = vocab.iter().map(|t| t.score).fold(f32::INFINITY, f32::min);
+    let min_score = vocab
+      .iter()
+      .map(|t| t.score())
+      .fold(f32::INFINITY, f32::min);
     let unknown_token_score = min_score - 10.0;
 
     let mut tokens_to_ids: HashMap<String, usize> = HashMap::with_capacity(vocab.len());
     for (i, tok) in vocab.iter().enumerate() {
-      tokens_to_ids.insert(tok.token.clone(), i);
+      tokens_to_ids.insert(tok.token().to_owned(), i);
     }
 
     let mut trie = Trie::default();
-    trie.append_all(vocab.iter().map(|t| &t.token));
+    trie.append_all(vocab.iter().map(|t| t.token()));
 
     let mut byte_map: [Option<usize>; 256] = [None; 256];
     for (i, tok) in vocab.iter().enumerate() {
-      let s = &tok.token;
+      let s = tok.token();
       if let Some(byte) = parse_byte_fallback_piece(s) {
         byte_map[byte as usize] = Some(i);
       }
@@ -620,8 +678,8 @@ impl SentencePieceTokenizer {
 
     let mut bpe_atomic_pieces: Vec<String> = vocab
       .iter()
-      .filter(|t| t.r#type == SentencePiecePieceType::UserDefined)
-      .map(|t| t.token.clone())
+      .filter(|t| t.piece_type() == SentencePiecePieceType::UserDefined)
+      .map(|t| t.token().to_owned())
       .collect();
     bpe_atomic_pieces.sort_by_key(|piece| std::cmp::Reverse(piece.chars().count()));
 
@@ -715,7 +773,11 @@ impl SentencePieceTokenizer {
       let score = arr[1].as_f64().ok_or_else(|| Error::Backend {
         message: "SentencePieceTokenizer: `model.vocab` entry[1] not a number".into(),
       })? as f32;
-      pieces.push(SentencePieceToken::new(token.to_string(), score));
+      pieces.push(SentencePieceToken::new(
+        token.to_string(),
+        score,
+        SentencePiecePieceType::Normal,
+      ));
     }
 
     let model_type = match model.get("type").and_then(|v| v.as_str()) {
@@ -789,7 +851,7 @@ impl SentencePieceTokenizer {
           continue;
         };
         let token_char_count = token.chars().count();
-        let token_score = self.vocab[token_id].score;
+        let token_score = self.vocab[token_id].score();
         lattice.insert(begin_pos, token_char_count, token_score, token_id);
         if !has_single_node && token_char_count == mblen {
           has_single_node = true;
@@ -840,15 +902,15 @@ impl SentencePieceTokenizer {
         };
         let tok = &self.vocab[token_id];
         if !matches!(
-          tok.r#type,
+          tok.piece_type(),
           SentencePiecePieceType::Normal | SentencePiecePieceType::UserDefined
         ) {
           continue;
         }
-        if best_index.is_none() || tok.score > best_score {
+        if best_index.is_none() || tok.score() > best_score {
           best_index = Some(index);
           best_piece = candidate;
-          best_score = tok.score;
+          best_score = tok.score();
         }
       }
 
@@ -906,12 +968,12 @@ impl SentencePieceTokenizer {
         continue;
       };
       if matches!(
-        token.r#type,
+        token.piece_type(),
         SentencePiecePieceType::Control | SentencePiecePieceType::Unused
       ) {
         continue;
       }
-      let tok = &token.token;
+      let tok = token.token();
       if let Some(byte) = parse_byte_fallback_piece(tok) {
         bytes.push(byte);
         continue;
@@ -922,7 +984,7 @@ impl SentencePieceTokenizer {
         }
         bytes.clear();
       }
-      pieces.push(tok.clone());
+      pieces.push(tok.to_owned());
     }
     if !bytes.is_empty()
       && let Ok(s) = std::str::from_utf8(&bytes)
@@ -1024,9 +1086,17 @@ mod tests {
   fn parse_minimal_unigram_protobuf_yields_vocab_and_model_type() {
     let data = build_model_with_pieces(
       &[
-        ("<unk>", 0.0, SentencePiecePieceType::Unknown as u8),
-        ("\u{2581}hello", -1.0, SentencePiecePieceType::Normal as u8),
-        ("\u{2581}world", -2.0, SentencePiecePieceType::Normal as u8),
+        ("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8),
+        (
+          "\u{2581}hello",
+          -1.0,
+          SentencePiecePieceType::Normal.as_raw() as u8,
+        ),
+        (
+          "\u{2581}world",
+          -2.0,
+          SentencePiecePieceType::Normal.as_raw() as u8,
+        ),
       ],
       1, // unigram
     );
@@ -1034,10 +1104,7 @@ mod tests {
     assert_eq!(tok.vocab_size(), 3);
     assert_eq!(tok.unknown_token_id(), 0);
     assert_eq!(tok.model_type(), SentencePieceModelType::Unigram);
-    assert_eq!(
-      tok.piece(1).map(|p| p.token.as_str()),
-      Some("\u{2581}hello")
-    );
+    assert_eq!(tok.piece(1).map(|p| p.token()), Some("\u{2581}hello"));
   }
 
   #[test]
@@ -1083,12 +1150,24 @@ mod tests {
   fn toy_tokenizer() -> SentencePieceTokenizer {
     let data = build_model_with_pieces(
       &[
-        ("<unk>", 0.0, SentencePiecePieceType::Unknown as u8),
-        ("\u{2581}hello", -1.0, SentencePiecePieceType::Normal as u8),
-        ("\u{2581}world", -1.0, SentencePiecePieceType::Normal as u8),
-        ("\u{2581}", -3.0, SentencePiecePieceType::Normal as u8),
-        ("<0x21>", -5.0, SentencePiecePieceType::Byte as u8),
-        ("<0x3F>", -5.0, SentencePiecePieceType::Byte as u8),
+        ("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8),
+        (
+          "\u{2581}hello",
+          -1.0,
+          SentencePiecePieceType::Normal.as_raw() as u8,
+        ),
+        (
+          "\u{2581}world",
+          -1.0,
+          SentencePiecePieceType::Normal.as_raw() as u8,
+        ),
+        (
+          "\u{2581}",
+          -3.0,
+          SentencePiecePieceType::Normal.as_raw() as u8,
+        ),
+        ("<0x21>", -5.0, SentencePiecePieceType::Byte.as_raw() as u8),
+        ("<0x3F>", -5.0, SentencePiecePieceType::Byte.as_raw() as u8),
       ],
       1,
     );
@@ -1128,10 +1207,14 @@ mod tests {
   fn decode_skips_control_and_unused_pieces() {
     let data = build_model_with_pieces(
       &[
-        ("<unk>", 0.0, SentencePiecePieceType::Unknown as u8),
-        ("<s>", 0.0, SentencePiecePieceType::Control as u8),
-        ("<pad>", 0.0, SentencePiecePieceType::Unused as u8),
-        ("\u{2581}hi", -1.0, SentencePiecePieceType::Normal as u8),
+        ("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8),
+        ("<s>", 0.0, SentencePiecePieceType::Control.as_raw() as u8),
+        ("<pad>", 0.0, SentencePiecePieceType::Unused.as_raw() as u8),
+        (
+          "\u{2581}hi",
+          -1.0,
+          SentencePiecePieceType::Normal.as_raw() as u8,
+        ),
       ],
       1,
     );
@@ -1149,10 +1232,14 @@ mod tests {
     // round-trip-critical half of byte-fallback).
     let data = build_model_with_pieces(
       &[
-        ("<unk>", 0.0, SentencePiecePieceType::Unknown as u8),
-        ("<0xC3>", -5.0, SentencePiecePieceType::Byte as u8),
-        ("<0xA9>", -5.0, SentencePiecePieceType::Byte as u8),
-        ("\u{2581}", -1.0, SentencePiecePieceType::Normal as u8),
+        ("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8),
+        ("<0xC3>", -5.0, SentencePiecePieceType::Byte.as_raw() as u8),
+        ("<0xA9>", -5.0, SentencePiecePieceType::Byte.as_raw() as u8),
+        (
+          "\u{2581}",
+          -1.0,
+          SentencePiecePieceType::Normal.as_raw() as u8,
+        ),
       ],
       1,
     );

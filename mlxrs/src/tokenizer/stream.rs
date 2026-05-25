@@ -83,10 +83,7 @@ pub trait StreamingDetokenizer {
 /// The decode callback decodes a token-id slice into a string and reports the
 /// tokenizer's `clean_up_tokenization_spaces` flag (the Python field of the
 /// same name).
-pub struct NaiveStreamingDetokenizer<F>
-where
-  F: Fn(&[u32]) -> String,
-{
+pub struct NaiveStreamingDetokenizer<F> {
   decode: F,
   clean_up_spaces: bool,
   tokens: Vec<u32>,
@@ -532,7 +529,8 @@ impl StreamingDetokenizer for BpeStreamingDetokenizer {
 /// Which detokenizer class to instantiate, inferred from `tokenizer.json`'s
 /// `decoder` field. Mirrors Python `load`'s `detokenizer_class` selection via
 /// `_is_spm_decoder` / `_is_spm_decoder_no_space` / `_is_bpe_decoder`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
+#[display("{}", self.as_str())]
 pub enum DetokenizerClass {
   /// `NaiveStreamingDetokenizer` (default / unknown decoder).
   Naive,
@@ -542,6 +540,18 @@ pub enum DetokenizerClass {
   SpmNoSpace,
   /// `BPEStreamingDetokenizer`.
   Bpe,
+}
+
+impl DetokenizerClass {
+  /// Lowercase string identifier for this class.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Naive => "naive",
+      Self::Spm => "spm",
+      Self::SpmNoSpace => "spm_no_space",
+      Self::Bpe => "bpe",
+    }
+  }
 }
 
 #[cfg(any(feature = "tokenizer-spm", feature = "tokenizer-bpe"))]
@@ -735,6 +745,9 @@ impl StreamingDetokenizer for NaiveHfDetokenizer {
 /// out-of-tree detokenizers plug in through [`Self::Custom`].
 #[cfg(feature = "tokenizer-stream")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokenizer-stream")))]
+#[derive(derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum Detokenizer {
   /// Naive re-decode detokenizer — the default / unknown-decoder
   /// fallback. O(T²) over the longest line, matching Python. Boxed

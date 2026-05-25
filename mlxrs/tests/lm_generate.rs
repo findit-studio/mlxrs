@@ -735,7 +735,7 @@ fn stream_generate_text_assembly_and_counts_length() {
   let model = MockModel::ramp(5);
   let cfg = GenConfig {
     max_tokens: 3,
-    eos: tok.eos_token_ids().iter().copied().collect(),
+    eos: tok.eos_token_ids_iter().collect(),
     ..GenConfig::default()
   };
   let prompt = [3u32]; // "hello"
@@ -766,7 +766,7 @@ fn stream_generate_stop_finish_reason_on_eos() {
   let model = MockModel::with_bias(vec![0.0, 0.0, 10.0, 0.0, 0.0]);
   let cfg = GenConfig {
     max_tokens: 50,
-    eos: tok.eos_token_ids().iter().copied().collect(),
+    eos: tok.eos_token_ids_iter().collect(),
     ..GenConfig::default()
   };
   let responses: Vec<_> = stream_generate(&model, &tok, &[3u32], cache(1), cfg)
@@ -791,7 +791,7 @@ fn generate_collects_to_string() {
   let model = MockModel::ramp(5); // argmax == 4 == "world"
   let cfg = GenConfig {
     max_tokens: 2,
-    eos: tok.eos_token_ids().iter().copied().collect(),
+    eos: tok.eos_token_ids_iter().collect(),
     ..GenConfig::default()
   };
   let (out, stats) = generate(&model, &tok, &[3u32], cache(1), cfg).unwrap();
@@ -1028,7 +1028,7 @@ fn generate_returns_generation_stats() {
   let model = MockModel::ramp(5);
   let cfg = GenConfig {
     max_tokens: 3,
-    eos: tok.eos_token_ids().iter().copied().collect(),
+    eos: tok.eos_token_ids_iter().collect(),
     ..GenConfig::default()
   };
   let prompt = [3u32, 5u32]; // arbitrary 2-token prompt
@@ -1361,7 +1361,7 @@ fn generate_zero_max_tokens_stats() {
   let model = MockModel::ramp(5);
   let cfg = GenConfig {
     max_tokens: 0,
-    eos: tok.eos_token_ids().iter().copied().collect(),
+    eos: tok.eos_token_ids_iter().collect(),
     ..GenConfig::default()
   };
   let (text, stats) = generate(&model, &tok, &[3u32, 5], cache(1), cfg).unwrap();
@@ -1504,7 +1504,7 @@ fn p1_generate_step_returns_impl_iterator() {
   let model = MockModel::ramp(8);
   let cfg = GenConfig {
     max_tokens: 3,
-    eos: tok.eos_token_ids().iter().copied().collect(),
+    eos: tok.eos_token_ids_iter().collect(),
     ..GenConfig::default()
   };
   // `let it: impl Iterator<…>` is not nameable directly in let bindings,
@@ -1535,7 +1535,7 @@ fn p1_generate_step_chains_iterator_methods() {
   let model = MockModel::ramp(8);
   let cfg = GenConfig {
     max_tokens: 5,
-    eos: tok.eos_token_ids().iter().copied().collect(),
+    eos: tok.eos_token_ids_iter().collect(),
     ..GenConfig::default()
   };
   // map + filter + take + count all require Iterator — proves the
