@@ -58,10 +58,7 @@ use crate::{
 ///
 /// The `language` field is the locale code threaded through to the
 /// backend on every [`Phonemizer::phonemize`] call (e.g. `"eng-us"`).
-pub struct NeuralPhonemizer<F>
-where
-  F: Fn(&str, &str) -> Result<String>,
-{
+pub struct NeuralPhonemizer<F> {
   convert: F,
   language: String,
 }
@@ -81,6 +78,7 @@ where
   }
 
   /// The locale code passed to the backend on each phonemize call.
+  #[inline(always)]
   pub fn language(&self) -> &str {
     &self.language
   }
@@ -163,7 +161,7 @@ mod tests {
     );
     let units = p.phonemize("hola").unwrap();
     // Should encode the language and word into the symbols (then split per char).
-    let joined: String = units.iter().map(|u| u.symbol.as_str()).collect();
+    let joined: String = units.iter().map(|u| u.symbol()).collect();
     assert_eq!(joined, "<es>:hola");
     assert_eq!(p.language(), "es");
   }

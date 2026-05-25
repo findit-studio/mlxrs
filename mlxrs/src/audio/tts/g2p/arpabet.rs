@@ -96,7 +96,22 @@ pub fn convert_sequence<S: AsRef<str>>(arpabet: &[S]) -> Vec<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BadArpabetToken {
   /// The unrecognised source token (as it appeared in the input slice).
-  pub token: String,
+  token: String,
+}
+
+impl BadArpabetToken {
+  /// Construct a [`BadArpabetToken`] from the offending token string.
+  pub fn new(token: impl Into<String>) -> Self {
+    Self {
+      token: token.into(),
+    }
+  }
+
+  /// The unrecognised source token (as it appeared in the input slice).
+  #[inline(always)]
+  pub fn token(&self) -> &str {
+    &self.token
+  }
 }
 
 /// Batch-convert a list of ARPAbet symbols to IPA, returning `Err` on the
@@ -117,7 +132,7 @@ pub struct BadArpabetToken {
 /// );
 /// assert_eq!(
 ///   try_convert_sequence_strict(&["HH", "XX", "L"]).unwrap_err(),
-///   BadArpabetToken { token: "XX".to_string() }
+///   BadArpabetToken::new("XX")
 /// );
 /// ```
 pub fn try_convert_sequence_strict<S: AsRef<str>>(
@@ -129,9 +144,7 @@ pub fn try_convert_sequence_strict<S: AsRef<str>>(
     match to_ipa(token) {
       Some(ipa) => out.push(ipa),
       None => {
-        return Err(BadArpabetToken {
-          token: token.to_owned(),
-        });
+        return Err(BadArpabetToken::new(token));
       }
     }
   }
@@ -264,7 +277,7 @@ mod tests {
   fn try_convert_sequence_strict_errors_on_first_unknown() {
     let err = try_convert_sequence_strict(&["HH", "XX", "YY", "L"]).unwrap_err();
     // The FIRST unknown token wins (so the surfaced message is precise).
-    assert_eq!(err.token, "XX");
+    assert_eq!(err.token(), "XX");
   }
 
   /// Regression guard: the lax [`convert_sequence`] API must keep

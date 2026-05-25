@@ -30,6 +30,8 @@
 //! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 //! [iter]: core::iter::Iterator
 
+use derive_more::{Display, IsVariant};
+
 use crate::{
   array::Array,
   dtype::Dtype,
@@ -83,7 +85,8 @@ pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 /// Mirrors mlx-audio's string `audio_format` as a typed enum (idiomatic
 /// Rust — an unknown format is a compile error, not a runtime
 /// `ValueError`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Display, IsVariant)]
+#[display("{}", self.as_str())]
 pub enum AudioFormat {
   /// WAV (RIFF/PCM) — mlx-audio's default `audio_format="wav"`. The only
   /// format [`crate::audio::io::save_wav`] currently writes.
@@ -95,6 +98,18 @@ pub enum AudioFormat {
   Flac,
 }
 
+impl AudioFormat {
+  /// Lowercase string name — the `audio_format` value mlx-audio's
+  /// `generate_audio` / `audio_write` accept (`"wav"`, `"flac"`).
+  #[must_use]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Wav => "wav",
+      Self::Flac => "flac",
+    }
+  }
+}
+
 /// How [`tts_generate`] segments the input text before synthesis.
 ///
 /// mlx-audio's per-model `generate` loops split the prompt before the
@@ -103,7 +118,8 @@ pub enum AudioFormat {
 /// `regex` dependency in the audio surface): the two modes below cover the
 /// mlx-audio defaults. A model wanting a bespoke segmentation pre-splits the
 /// text itself and calls [`tts_generate`] once per segment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Display, IsVariant)]
+#[display("{}", self.as_str())]
 pub enum TextSegmentation {
   /// One segment per run of newlines, blank segments dropped — the
   /// mlx-audio kokoro default (`split_pattern=r"\n+"`). This is the
@@ -113,6 +129,18 @@ pub enum TextSegmentation {
   /// Treat the whole input as a single segment (no splitting) — for models
   /// / callers that do their own chunking, or short single-line prompts.
   Whole,
+}
+
+impl TextSegmentation {
+  /// Lowercase string name — the mlx-audio segmentation mode this variant
+  /// corresponds to (`"newlines"`, `"whole"`).
+  #[must_use]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Newlines => "newlines",
+      Self::Whole => "whole",
+    }
+  }
 }
 
 /// TTS synthesis config — the typed argument bundle [`tts_generate`]
@@ -127,47 +155,51 @@ pub enum TextSegmentation {
 /// decode loop), so unlike [`crate::audio::stt::generate::SttGenConfig`]
 /// (which composes the full LM [`crate::lm::generate::GenConfig`]) this is a
 /// plain knob bundle the per-model code reads.
+///
+/// All fields are private; construct via [`TtsGenConfig::new`] (all
+/// defaults) or chain [`with_voice`](TtsGenConfig::with_voice),
+/// [`with_language`](TtsGenConfig::with_language), etc. setters.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TtsGenConfig {
   /// Voice / speaker id (mlx-audio `generate_audio` `voice`; also the
   /// speaker for multi-speaker models). Default [`DEFAULT_VOICE`].
-  pub voice: String,
+  voice: String,
   /// Language / locale code (mlx-audio `lang_code`). Default
   /// [`DEFAULT_LANGUAGE`].
-  pub language: String,
+  language: String,
   /// Playback speed multiplier (mlx-audio `speed`); `1.0` is unmodified.
   /// `> 1.0` faster, `< 1.0` slower. Default `1.0`.
-  pub speed: f32,
+  speed: f32,
   /// Sampling temperature for autoregressive TTS backbones (mlx-audio
   /// `temperature`). Default [`DEFAULT_TEMPERATURE`]. Ignored by
   /// non-autoregressive models (kokoro-style duration predictors).
-  pub temperature: f32,
+  temperature: f32,
   /// Nucleus (top-p) cutoff for autoregressive backbones (mlx-audio
   /// `top_p`); `0.0` ⇒ unused. Default `0.0`.
-  pub top_p: f32,
+  top_p: f32,
   /// Top-k cutoff for autoregressive backbones (mlx-audio `top_k`); `0` ⇒
   /// unused. Default `0`.
-  pub top_k: i32,
+  top_k: i32,
   /// Repetition penalty for autoregressive backbones (mlx-audio
   /// `repetition_penalty`); `None` ⇒ unused. Default `None`.
-  pub repetition_penalty: Option<f32>,
+  repetition_penalty: Option<f32>,
   /// Per-segment token budget (mlx-audio `max_tokens`). Default
   /// [`DEFAULT_MAX_TOKENS`].
-  pub max_tokens: usize,
+  max_tokens: usize,
   /// How [`tts_generate`] splits the input text. Default
   /// [`TextSegmentation::Newlines`] (the mlx-audio kokoro default).
-  pub segmentation: TextSegmentation,
+  segmentation: TextSegmentation,
   /// Output container format the downstream writer should use (mlx-audio
   /// `audio_format`). Default [`AudioFormat::Wav`]. The driver yields raw
   /// PCM regardless; this is plumbed caller intent.
-  pub audio_format: AudioFormat,
+  audio_format: AudioFormat,
   /// Streaming-segment interval in seconds — the cadence a streaming
   /// per-model decoder yields partial chunks at (mlx-audio
   /// `streaming_interval`, fed into the per-model `streaming_token_interval`
   /// computation). Default [`DEFAULT_STREAMING_INTERVAL`]. The driver
   /// forwards it to per-model code via [`TtsSegment::streaming_interval`];
   /// it does not itself chunk a segment's audio.
-  pub streaming_interval: f32,
+  streaming_interval: f32,
 }
 
 impl Default for TtsGenConfig {
@@ -185,6 +217,180 @@ impl Default for TtsGenConfig {
       audio_format: AudioFormat::Wav,
       streaming_interval: DEFAULT_STREAMING_INTERVAL,
     }
+  }
+}
+
+impl TtsGenConfig {
+  /// Construct a [`TtsGenConfig`] with all defaults (equivalent to
+  /// `TtsGenConfig::default()`).
+  #[must_use]
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  // ── `with_*` builders ────────────────────────────────────────────────────
+
+  /// Set the voice / speaker id (mlx-audio `voice`). Default
+  /// [`DEFAULT_VOICE`].
+  #[must_use]
+  pub fn with_voice(mut self, voice: impl Into<String>) -> Self {
+    self.voice = voice.into();
+    self
+  }
+
+  /// Set the language / locale code (mlx-audio `lang_code`). Default
+  /// [`DEFAULT_LANGUAGE`].
+  #[must_use]
+  pub fn with_language(mut self, language: impl Into<String>) -> Self {
+    self.language = language.into();
+    self
+  }
+
+  /// Set the playback speed multiplier (mlx-audio `speed`). Default `1.0`.
+  #[must_use]
+  pub fn with_speed(mut self, speed: f32) -> Self {
+    self.speed = speed;
+    self
+  }
+
+  /// Set the sampling temperature (mlx-audio `temperature`). Default
+  /// [`DEFAULT_TEMPERATURE`].
+  #[must_use]
+  pub fn with_temperature(mut self, temperature: f32) -> Self {
+    self.temperature = temperature;
+    self
+  }
+
+  /// Set the nucleus (top-p) cutoff (mlx-audio `top_p`). Default `0.0`.
+  #[must_use]
+  pub fn with_top_p(mut self, top_p: f32) -> Self {
+    self.top_p = top_p;
+    self
+  }
+
+  /// Set the top-k cutoff (mlx-audio `top_k`). Default `0`.
+  #[must_use]
+  pub fn with_top_k(mut self, top_k: i32) -> Self {
+    self.top_k = top_k;
+    self
+  }
+
+  /// Set the repetition penalty (mlx-audio `repetition_penalty`). Default
+  /// `None`.
+  #[must_use]
+  pub fn with_repetition_penalty(mut self, repetition_penalty: Option<f32>) -> Self {
+    self.repetition_penalty = repetition_penalty;
+    self
+  }
+
+  /// Set the per-segment token budget (mlx-audio `max_tokens`). Default
+  /// [`DEFAULT_MAX_TOKENS`].
+  #[must_use]
+  pub fn with_max_tokens(mut self, max_tokens: usize) -> Self {
+    self.max_tokens = max_tokens;
+    self
+  }
+
+  /// Set the text segmentation mode. Default [`TextSegmentation::Newlines`].
+  #[must_use]
+  pub fn with_segmentation(mut self, segmentation: TextSegmentation) -> Self {
+    self.segmentation = segmentation;
+    self
+  }
+
+  /// Set the output audio format (mlx-audio `audio_format`). Default
+  /// [`AudioFormat::Wav`].
+  #[must_use]
+  pub fn with_audio_format(mut self, audio_format: AudioFormat) -> Self {
+    self.audio_format = audio_format;
+    self
+  }
+
+  /// Set the streaming-segment interval in seconds (mlx-audio
+  /// `streaming_interval`). Default [`DEFAULT_STREAMING_INTERVAL`].
+  #[must_use]
+  pub fn with_streaming_interval(mut self, streaming_interval: f32) -> Self {
+    self.streaming_interval = streaming_interval;
+    self
+  }
+
+  // ── `#[inline(always)]` accessors ────────────────────────────────────────
+
+  /// Voice / speaker id.
+  #[inline(always)]
+  #[must_use]
+  pub fn voice(&self) -> &str {
+    &self.voice
+  }
+
+  /// Language / locale code.
+  #[inline(always)]
+  #[must_use]
+  pub fn language(&self) -> &str {
+    &self.language
+  }
+
+  /// Speed multiplier.
+  #[inline(always)]
+  #[must_use]
+  pub fn speed(&self) -> f32 {
+    self.speed
+  }
+
+  /// Sampling temperature.
+  #[inline(always)]
+  #[must_use]
+  pub fn temperature(&self) -> f32 {
+    self.temperature
+  }
+
+  /// Nucleus (top-p) cutoff.
+  #[inline(always)]
+  #[must_use]
+  pub fn top_p(&self) -> f32 {
+    self.top_p
+  }
+
+  /// Top-k cutoff.
+  #[inline(always)]
+  #[must_use]
+  pub fn top_k(&self) -> i32 {
+    self.top_k
+  }
+
+  /// Repetition penalty (`None` ⇒ unused).
+  #[inline(always)]
+  #[must_use]
+  pub fn repetition_penalty(&self) -> Option<f32> {
+    self.repetition_penalty
+  }
+
+  /// Per-segment token budget.
+  #[inline(always)]
+  #[must_use]
+  pub fn max_tokens(&self) -> usize {
+    self.max_tokens
+  }
+
+  /// Text segmentation mode.
+  #[inline(always)]
+  #[must_use]
+  pub fn segmentation(&self) -> TextSegmentation {
+    self.segmentation
+  }
+
+  /// Output audio container format.
+  #[inline(always)]
+  #[must_use]
+  pub fn audio_format(&self) -> AudioFormat {
+    self.audio_format
+  }
+
+  /// Streaming-segment interval in seconds.
+  #[inline(always)]
+  #[must_use]
+  pub fn streaming_interval(&self) -> f32 {
+    self.streaming_interval
   }
 }
 
@@ -228,12 +434,39 @@ pub struct TtsReference<'a> {
   /// `generate_audio` `ref_audio`, swift `refAudio`). A rank-1 `f32` PCM
   /// `[samples]` [`Array`] at the model's [`TtsModel::sample_rate`]; `None`
   /// when not cloning. Threaded into every [`TtsSegment::ref_audio`].
-  pub ref_audio: Option<&'a Array>,
+  ref_audio: Option<&'a Array>,
   /// Transcript of [`TtsReference::ref_audio`] (mlx-audio `generate_audio`
   /// `ref_text`, swift `refText`). `None` when not cloning, or when the
   /// per-model code should transcribe the reference itself. Threaded into
   /// every [`TtsSegment::ref_text`].
-  pub ref_text: Option<&'a str>,
+  ref_text: Option<&'a str>,
+}
+
+impl<'a> TtsReference<'a> {
+  /// Construct a [`TtsReference`] from an optional waveform and optional
+  /// transcript. `TtsReference::default()` gives both-`None` (no cloning).
+  #[must_use]
+  pub const fn new(ref_audio: Option<&'a Array>, ref_text: Option<&'a str>) -> Self {
+    Self {
+      ref_audio,
+      ref_text,
+    }
+  }
+
+  /// Reference-speaker waveform (`None` ⇒ no cloning).
+  #[inline(always)]
+  #[must_use]
+  pub fn ref_audio(&self) -> Option<&'a Array> {
+    self.ref_audio
+  }
+
+  /// Transcript of the reference waveform (`None` ⇒ no cloning or
+  /// per-model transcription).
+  #[inline(always)]
+  #[must_use]
+  pub fn ref_text(&self) -> Option<&'a str> {
+    self.ref_text
+  }
 }
 
 /// One text segment plus the resolved synthesis knobs, handed to
@@ -258,40 +491,173 @@ pub struct TtsSegment<'a> {
   /// The segment's raw text (a slice of the [`tts_generate`] input). The
   /// per-model code phonemizes / tokenizes this itself — the driver passes
   /// it through unchanged (no normalization, no G2P).
-  pub text: &'a str,
+  text: &'a str,
   /// Voice / speaker id (from [`TtsGenConfig::voice`]).
-  pub voice: &'a str,
+  voice: &'a str,
   /// Language / locale code (from [`TtsGenConfig::language`]).
-  pub language: &'a str,
+  language: &'a str,
   /// Speed multiplier (from [`TtsGenConfig::speed`]).
-  pub speed: f32,
+  speed: f32,
   /// Sampling temperature (from [`TtsGenConfig::temperature`]).
-  pub temperature: f32,
+  temperature: f32,
   /// Top-p cutoff (from [`TtsGenConfig::top_p`]).
-  pub top_p: f32,
+  top_p: f32,
   /// Top-k cutoff (from [`TtsGenConfig::top_k`]).
-  pub top_k: i32,
+  top_k: i32,
   /// Repetition penalty (from [`TtsGenConfig::repetition_penalty`]).
-  pub repetition_penalty: Option<f32>,
+  repetition_penalty: Option<f32>,
   /// Per-segment token budget (from [`TtsGenConfig::max_tokens`]).
-  pub max_tokens: usize,
+  max_tokens: usize,
   /// Streaming-segment interval in seconds (from
   /// [`TtsGenConfig::streaming_interval`]) — per-model code that streams
   /// partial chunks derives its `streaming_token_interval` from this.
-  pub streaming_interval: f32,
+  streaming_interval: f32,
   /// Zero-based index of this segment in the input (mlx-audio's
   /// `segment_idx`). Stamped onto the produced [`AudioChunk::segment_idx`].
-  pub segment_idx: usize,
+  segment_idx: usize,
   /// Optional reference-audio waveform for zero-shot voice cloning
   /// (mlx-audio `generate_audio` `ref_audio`), from the run's
   /// [`TtsReference::ref_audio`]. A rank-1 `f32` PCM `[samples]` tensor;
   /// `None` when not cloning. Per-model passthrough — the driver never
   /// inspects it.
-  pub ref_audio: Option<&'a Array>,
+  ref_audio: Option<&'a Array>,
   /// Optional transcript of [`TtsSegment::ref_audio`] (mlx-audio
   /// `generate_audio` `ref_text`), from the run's [`TtsReference::ref_text`].
   /// `None` when not cloning. Per-model passthrough.
-  pub ref_text: Option<&'a str>,
+  ref_text: Option<&'a str>,
+}
+
+impl<'a> TtsSegment<'a> {
+  /// Construct a [`TtsSegment`] from all its fields.
+  ///
+  /// Per-model code consuming a segment uses the field accessors below;
+  /// the constructor is the single place the driver assembles a segment.
+  #[allow(clippy::too_many_arguments)]
+  #[must_use]
+  pub const fn new(
+    text: &'a str,
+    voice: &'a str,
+    language: &'a str,
+    speed: f32,
+    temperature: f32,
+    top_p: f32,
+    top_k: i32,
+    repetition_penalty: Option<f32>,
+    max_tokens: usize,
+    streaming_interval: f32,
+    segment_idx: usize,
+    ref_audio: Option<&'a Array>,
+    ref_text: Option<&'a str>,
+  ) -> Self {
+    Self {
+      text,
+      voice,
+      language,
+      speed,
+      temperature,
+      top_p,
+      top_k,
+      repetition_penalty,
+      max_tokens,
+      streaming_interval,
+      segment_idx,
+      ref_audio,
+      ref_text,
+    }
+  }
+
+  // ── `#[inline(always)]` accessors ────────────────────────────────────────
+
+  /// The segment's raw text slice.
+  #[inline(always)]
+  #[must_use]
+  pub fn text(&self) -> &'a str {
+    self.text
+  }
+
+  /// Voice / speaker id.
+  #[inline(always)]
+  #[must_use]
+  pub fn voice(&self) -> &'a str {
+    self.voice
+  }
+
+  /// Language / locale code.
+  #[inline(always)]
+  #[must_use]
+  pub fn language(&self) -> &'a str {
+    self.language
+  }
+
+  /// Speed multiplier.
+  #[inline(always)]
+  #[must_use]
+  pub fn speed(&self) -> f32 {
+    self.speed
+  }
+
+  /// Sampling temperature.
+  #[inline(always)]
+  #[must_use]
+  pub fn temperature(&self) -> f32 {
+    self.temperature
+  }
+
+  /// Nucleus (top-p) cutoff.
+  #[inline(always)]
+  #[must_use]
+  pub fn top_p(&self) -> f32 {
+    self.top_p
+  }
+
+  /// Top-k cutoff.
+  #[inline(always)]
+  #[must_use]
+  pub fn top_k(&self) -> i32 {
+    self.top_k
+  }
+
+  /// Repetition penalty (`None` ⇒ unused).
+  #[inline(always)]
+  #[must_use]
+  pub fn repetition_penalty(&self) -> Option<f32> {
+    self.repetition_penalty
+  }
+
+  /// Per-segment token budget.
+  #[inline(always)]
+  #[must_use]
+  pub fn max_tokens(&self) -> usize {
+    self.max_tokens
+  }
+
+  /// Streaming-segment interval in seconds.
+  #[inline(always)]
+  #[must_use]
+  pub fn streaming_interval(&self) -> f32 {
+    self.streaming_interval
+  }
+
+  /// Zero-based segment index.
+  #[inline(always)]
+  #[must_use]
+  pub fn segment_idx(&self) -> usize {
+    self.segment_idx
+  }
+
+  /// Reference-audio waveform (`None` ⇒ no cloning).
+  #[inline(always)]
+  #[must_use]
+  pub fn ref_audio(&self) -> Option<&'a Array> {
+    self.ref_audio
+  }
+
+  /// Reference transcript (`None` ⇒ no cloning or per-model transcription).
+  #[inline(always)]
+  #[must_use]
+  pub fn ref_text(&self) -> Option<&'a str> {
+    self.ref_text
+  }
 }
 
 /// One unit of synthesized audio — the streaming-chunk type
@@ -323,29 +689,91 @@ pub struct TtsSegment<'a> {
 pub struct AudioChunk {
   /// The chunk's audio: a rank-1 `[samples]` `f32` PCM tensor in `[-1, 1]`
   /// at [`AudioChunk::sample_rate`] (mlx-audio `GenerationResult.audio`).
-  pub audio: Array,
+  audio: Array,
   /// PCM sample rate in Hz (mlx-audio `GenerationResult.sample_rate`) —
   /// the producing model's [`TtsModel::sample_rate`].
-  pub sample_rate: u32,
+  sample_rate: u32,
   /// Zero-based index of the text segment this chunk belongs to (mlx-audio
   /// `GenerationResult.segment_idx`). Multiple chunks can share a
   /// `segment_idx` when a per-model decoder streams partial audio.
-  pub segment_idx: usize,
+  segment_idx: usize,
   /// `true` if this is a partial streaming chunk (mlx-audio
   /// `GenerationResult.is_streaming_chunk`). The driver itself yields one
   /// whole-segment chunk per segment (`false`); the flag is on the type so
   /// a per-model streaming decoder's chunks round-trip through the same
   /// [`AudioChunk`].
-  pub is_streaming_chunk: bool,
+  is_streaming_chunk: bool,
   /// `true` if this is the final chunk of the whole synthesis run
   /// (mlx-audio `GenerationResult.is_final_chunk`). Set by [`tts_generate`]
   /// on the last chunk of the last segment.
-  pub is_final_chunk: bool,
+  is_final_chunk: bool,
 }
 
 impl AudioChunk {
+  /// Construct an [`AudioChunk`] from all its fields.
+  ///
+  /// Per-model streaming decoders that produce their own chunk envelopes use
+  /// this constructor; the non-streaming [`tts_generate`] driver uses it
+  /// internally for each synthesized segment.
+  #[must_use]
+  pub fn new(
+    audio: Array,
+    sample_rate: u32,
+    segment_idx: usize,
+    is_streaming_chunk: bool,
+    is_final_chunk: bool,
+  ) -> Self {
+    Self {
+      audio,
+      sample_rate,
+      segment_idx,
+      is_streaming_chunk,
+      is_final_chunk,
+    }
+  }
+
+  /// Borrow the chunk's audio tensor without materializing it.
+  ///
+  /// A `&self` no-eval shape/dtype inspection accessor — callers that need
+  /// to inspect the shape or dtype without a full PCM decode use this.
+  /// [`AudioChunk::samples`] is the `&mut self` explicit-eval step.
+  #[inline(always)]
+  #[must_use]
+  pub fn audio_ref(&self) -> &Array {
+    &self.audio
+  }
+
+  /// PCM sample rate in Hz.
+  #[inline(always)]
+  #[must_use]
+  pub fn sample_rate(&self) -> u32 {
+    self.sample_rate
+  }
+
+  /// Zero-based segment index this chunk belongs to.
+  #[inline(always)]
+  #[must_use]
+  pub fn segment_idx(&self) -> usize {
+    self.segment_idx
+  }
+
+  /// `true` if this is a partial streaming chunk.
+  #[inline(always)]
+  #[must_use]
+  pub fn is_streaming_chunk(&self) -> bool {
+    self.is_streaming_chunk
+  }
+
+  /// `true` if this is the final chunk of the whole synthesis run.
+  #[inline(always)]
+  #[must_use]
+  pub fn is_final_chunk(&self) -> bool {
+    self.is_final_chunk
+  }
+
   /// The chunk's audio sample count (`audio.shape()[0]`) — a `&self`,
   /// no-eval shape read.
+  #[inline(always)]
   #[must_use]
   pub fn len_samples(&self) -> usize {
     // `audio` is rank-1 by the `tts_generate` post-condition (the driver
@@ -356,6 +784,7 @@ impl AudioChunk {
   }
 
   /// `true` if the chunk carries no audio samples.
+  #[inline(always)]
   #[must_use]
   pub fn is_empty(&self) -> bool {
     self.len_samples() == 0
@@ -367,12 +796,23 @@ impl AudioChunk {
   /// `sample_rate` is `u32`; computing in `f64` avoids `f32` rounding of
   /// the division. Returns `0.0` for a zero / absent sample rate rather
   /// than a NaN/inf.
+  #[inline(always)]
   #[must_use]
   pub fn duration_seconds(&self) -> f64 {
     if self.sample_rate == 0 {
       return 0.0;
     }
     self.len_samples() as f64 / f64::from(self.sample_rate)
+  }
+
+  /// Consume the chunk and return the inner audio [`Array`].
+  ///
+  /// Useful for callers that need to own the tensor (e.g.
+  /// [`join_audio_with_reference`] collects each chunk's audio to
+  /// concatenate them). No eval occurs; the array is moved out.
+  #[must_use]
+  pub fn into_audio(self) -> Array {
+    self.audio
   }
 
   /// Materialize the chunk's audio into an owned `Vec<f32>` of PCM samples.
@@ -454,7 +894,7 @@ fn push_if_nonblank(out: &mut Vec<(usize, usize)>, text: &str, start: usize, end
 /// or finishes (all segments produced) every further `next()` is `None` —
 /// never a panic, never a re-entry into the model (the same `done`-flag
 /// contract the STT / LM loops guarantee).
-pub struct TtsGenerator<'a, M: TtsModel> {
+pub struct TtsGenerator<'a, M> {
   model: &'a M,
   /// The full input text — [`TtsSegment::text`] is sliced from this.
   text: &'a str,
@@ -491,24 +931,24 @@ impl<M: TtsModel> TtsGenerator<'_, M> {
   /// returned audio tensor shape, wrap it with the chunk envelope.
   fn synthesize(&self, idx: usize) -> Result<AudioChunk> {
     let (start, end) = self.segments[idx];
-    let segment = TtsSegment {
-      text: &self.text[start..end],
-      voice: &self.cfg.voice,
-      language: &self.cfg.language,
-      speed: self.cfg.speed,
-      temperature: self.cfg.temperature,
-      top_p: self.cfg.top_p,
-      top_k: self.cfg.top_k,
-      repetition_penalty: self.cfg.repetition_penalty,
-      max_tokens: self.cfg.max_tokens,
-      streaming_interval: self.cfg.streaming_interval,
-      segment_idx: idx,
+    let segment = TtsSegment::new(
+      &self.text[start..end],
+      self.cfg.voice(),
+      self.cfg.language(),
+      self.cfg.speed(),
+      self.cfg.temperature(),
+      self.cfg.top_p(),
+      self.cfg.top_k(),
+      self.cfg.repetition_penalty(),
+      self.cfg.max_tokens(),
+      self.cfg.streaming_interval(),
+      idx,
       // Thread the run's voice-clone reference onto every segment (the same
       // borrow each time — no per-segment clone). `None`/`None` for a
       // non-cloning run.
-      ref_audio: self.reference.ref_audio,
-      ref_text: self.reference.ref_text,
-    };
+      self.reference.ref_audio(),
+      self.reference.ref_text(),
+    );
 
     let audio = self.model.synthesize_segment(&segment)?;
 
@@ -550,13 +990,13 @@ impl<M: TtsModel> TtsGenerator<'_, M> {
     // whole-segment (non-streaming) chunk per segment, so `is_streaming_chunk`
     // is always `false` here — a per-model decoder that streams partial
     // audio sets that flag on its own `AudioChunk`s.
-    Ok(AudioChunk {
+    Ok(AudioChunk::new(
       audio,
-      sample_rate: self.model.sample_rate(),
-      segment_idx: idx,
-      is_streaming_chunk: false,
-      is_final_chunk: idx + 1 == self.segments.len(),
-    })
+      self.model.sample_rate(),
+      idx,
+      false,
+      idx + 1 == self.segments.len(),
+    ))
   }
 }
 
@@ -686,7 +1126,7 @@ pub fn tts_generate_with_reference<'a, M: TtsModel>(
 
   // 2. Segment. `segment_ranges` drops blank segments; an all-blank input
   //    (empty string, only whitespace / newlines) yields no segments.
-  let segments = segment_ranges(text, cfg.segmentation);
+  let segments = segment_ranges(text, cfg.segmentation());
   if segments.is_empty() {
     return Err(Error::Backend {
       message: "tts_generate: input text has no non-blank segments — nothing to \
@@ -750,7 +1190,7 @@ pub fn join_audio_with_reference<M: TtsModel>(
 ) -> Result<Array> {
   let mut chunks: Vec<Array> = Vec::new();
   for chunk in tts_generate_with_reference(model, text, cfg, reference)? {
-    chunks.push(chunk?.audio);
+    chunks.push(chunk?.into_audio());
   }
 
   // `tts_generate` guarantees at least one segment (it errors on an

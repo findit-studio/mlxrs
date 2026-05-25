@@ -59,15 +59,15 @@ impl MockTtsModel {
 impl TtsModel for MockTtsModel {
   fn synthesize_segment(&self, segment: &TtsSegment<'_>) -> mlxrs::Result<Array> {
     self.seen.borrow_mut().push((
-      segment.text.to_string(),
-      segment.voice.to_string(),
-      segment.language.to_string(),
-      segment.speed,
-      segment.temperature,
-      segment.segment_idx,
+      segment.text().to_string(),
+      segment.voice().to_string(),
+      segment.language().to_string(),
+      segment.speed(),
+      segment.temperature(),
+      segment.segment_idx(),
     ));
     // `[base_len + segment_idx]` ramp — the length encodes the segment id.
-    let len = self.base_len + segment.segment_idx;
+    let len = self.base_len + segment.segment_idx();
     let samples: Vec<f32> = (0..len).map(|i| i as f32 * 0.01).collect();
     let n = i32::try_from(len).unwrap();
     Array::from_slice::<f32>(&samples, &[n])
@@ -139,8 +139,8 @@ impl RecordingRefModel {
 impl TtsModel for RecordingRefModel {
   fn synthesize_segment(&self, segment: &TtsSegment<'_>) -> mlxrs::Result<Array> {
     self.seen_refs.borrow_mut().push((
-      segment.ref_audio.is_some(),
-      segment.ref_text.map(str::to_string),
+      segment.ref_audio().is_some(),
+      segment.ref_text().map(str::to_string),
     ));
     // A valid rank-1 f32 waveform so synthesis succeeds.
     Array::from_slice::<f32>(&[0.0_f32, 0.1, 0.2], &[3])
@@ -178,14 +178,18 @@ fn tts_generate_single_segment_smoke() {
     .collect();
   assert_eq!(chunks.len(), 1, "one segment ⇒ one chunk");
   let c = &chunks[0];
-  assert_eq!(c.segment_idx, 0);
+  assert_eq!(c.segment_idx(), 0);
   assert_eq!(
-    c.sample_rate, 24_000,
+    c.sample_rate(),
+    24_000,
     "chunk stamped with model sample rate"
   );
   assert_eq!(c.len_samples(), 100, "segment 0 emits base_len samples");
-  assert!(!c.is_streaming_chunk, "driver yields whole-segment chunks");
-  assert!(c.is_final_chunk, "the only chunk is the final one");
+  assert!(
+    !c.is_streaming_chunk(),
+    "driver yields whole-segment chunks"
+  );
+  assert!(c.is_final_chunk(), "the only chunk is the final one");
   assert!(!c.is_empty());
   // The model saw the segment text verbatim (no phonemization by the driver).
   assert_eq!(model.seen.borrow().len(), 1);
@@ -206,14 +210,14 @@ fn tts_generate_splits_on_newlines() {
   assert_eq!(chunks.len(), 3, "three lines ⇒ three segments");
   // segment_idx 0,1,2 in order; lengths 10,11,12 (base_len + idx).
   for (i, c) in chunks.iter().enumerate() {
-    assert_eq!(c.segment_idx, i, "segment ids monotone");
+    assert_eq!(c.segment_idx(), i, "segment ids monotone");
     assert_eq!(
       c.len_samples(),
       10 + i,
       "segment i emits base_len+i samples"
     );
     assert_eq!(
-      c.is_final_chunk,
+      c.is_final_chunk(),
       i == 2,
       "only the last segment's chunk is final"
     );
@@ -249,10 +253,7 @@ fn tts_generate_drops_blank_segments() {
 #[test]
 fn tts_generate_whole_segmentation_single_chunk() {
   let model = MockTtsModel::new(24_000, 7);
-  let cfg = TtsGenConfig {
-    segmentation: TextSegmentation::Whole,
-    ..TtsGenConfig::default()
-  };
+  let cfg = TtsGenConfig::new().with_segmentation(TextSegmentation::Whole);
   let chunks: Vec<AudioChunk> = tts_generate(&model, "line one\nline two", &cfg)
     .unwrap()
     .map(|r| r.unwrap())
@@ -267,13 +268,11 @@ fn tts_generate_whole_segmentation_single_chunk() {
 #[test]
 fn tts_generate_plumbs_config_to_segments() {
   let model = MockTtsModel::new(24_000, 3);
-  let cfg = TtsGenConfig {
-    voice: "bf_emma".to_string(),
-    language: "en-gb".to_string(),
-    speed: 1.25,
-    temperature: 0.4,
-    ..TtsGenConfig::default()
-  };
+  let cfg = TtsGenConfig::new()
+    .with_voice("bf_emma")
+    .with_language("en-gb")
+    .with_speed(1.25)
+    .with_temperature(0.4);
   let _ = tts_generate(&model, "one\ntwo", &cfg)
     .unwrap()
     .map(|r| r.unwrap())
@@ -350,10 +349,7 @@ fn tts_generate_threads_reference_to_every_segment() {
   let cfg = TtsGenConfig::default();
   // A rank-1 f32 reference waveform + a transcript.
   let ref_wav = Array::from_slice::<f32>(&[0.5_f32, -0.5, 0.25, -0.25], &[4]).unwrap();
-  let reference = TtsReference {
-    ref_audio: Some(&ref_wav),
-    ref_text: Some("the reference transcript"),
-  };
+  let reference = TtsReference::new(Some(&ref_wav), Some("the reference transcript"));
   // Three newline-split segments.
   let _ = tts_generate_with_reference(&model, "one\ntwo\nthree", &cfg, reference)
     .unwrap()
@@ -380,10 +376,7 @@ fn tts_generate_threads_audio_only_reference() {
   let model = RecordingRefModel::new();
   let cfg = TtsGenConfig::default();
   let ref_wav = Array::from_slice::<f32>(&[0.1_f32, 0.2], &[2]).unwrap();
-  let reference = TtsReference {
-    ref_audio: Some(&ref_wav),
-    ref_text: None,
-  };
+  let reference = TtsReference::new(Some(&ref_wav), None);
   let _ = tts_generate_with_reference(&model, "alpha\nbeta", &cfg, reference)
     .unwrap()
     .map(|r| r.unwrap())
@@ -441,10 +434,7 @@ fn join_audio_with_reference_threads_reference() {
   let model = RecordingRefModel::new();
   let cfg = TtsGenConfig::default();
   let ref_wav = Array::from_slice::<f32>(&[0.3_f32, 0.4, 0.5], &[3]).unwrap();
-  let reference = TtsReference {
-    ref_audio: Some(&ref_wav),
-    ref_text: Some("caption"),
-  };
+  let reference = TtsReference::new(Some(&ref_wav), Some("caption"));
   // RecordingRefModel emits a [3] f32 waveform per segment ⇒ 2 segments = [6].
   let joined = join_audio_with_reference(&model, "p\nq", &cfg, reference).unwrap();
   assert_eq!(joined.shape(), vec![6], "two [3] segments joined to [6]");
@@ -505,7 +495,7 @@ fn tts_generate_accepts_f32_audio_dtype() {
   assert_eq!(chunks.len(), 1, "valid f32 audio ⇒ a successful chunk");
   assert_eq!(chunks[0].len_samples(), 8);
   assert_eq!(
-    chunks[0].audio.dtype().unwrap(),
+    chunks[0].audio_ref().dtype().unwrap(),
     mlxrs::Dtype::F32,
     "the chunk's audio is f32"
   );
@@ -589,7 +579,7 @@ fn tts_generate_handles_zero_length_output() {
   assert!(chunks[0].is_empty(), "zero-length waveform ⇒ empty chunk");
   assert_eq!(chunks[0].len_samples(), 0);
   assert_eq!(chunks[0].duration_seconds(), 0.0);
-  assert!(chunks[0].is_final_chunk, "still the final chunk");
+  assert!(chunks[0].is_final_chunk(), "still the final chunk");
 }
 
 /// The trait-default `synthesize_segment` returns a recoverable `Err` with
@@ -714,26 +704,26 @@ fn audio_chunk_samples_materializes_pcm() {
 #[test]
 fn tts_gen_config_defaults_match_mlx_audio() {
   let c = TtsGenConfig::default();
-  assert_eq!(c.voice, DEFAULT_VOICE);
-  assert_eq!(c.voice, "af_heart");
-  assert_eq!(c.language, "en");
-  assert!((c.speed - 1.0).abs() < 1e-6, "speed default 1.0");
+  assert_eq!(c.voice(), DEFAULT_VOICE);
+  assert_eq!(c.voice(), "af_heart");
+  assert_eq!(c.language(), "en");
+  assert!((c.speed() - 1.0).abs() < 1e-6, "speed default 1.0");
   assert!(
-    (c.temperature - DEFAULT_TEMPERATURE).abs() < 1e-6,
+    (c.temperature() - DEFAULT_TEMPERATURE).abs() < 1e-6,
     "temperature default 0.7"
   );
-  assert_eq!(c.top_p, 0.0, "top_p default off");
-  assert_eq!(c.top_k, 0, "top_k default off");
+  assert_eq!(c.top_p(), 0.0, "top_p default off");
+  assert_eq!(c.top_k(), 0, "top_k default off");
   assert!(
-    c.repetition_penalty.is_none(),
+    c.repetition_penalty().is_none(),
     "repetition_penalty default off"
   );
-  assert_eq!(c.max_tokens, DEFAULT_MAX_TOKENS);
-  assert_eq!(c.max_tokens, 1200);
-  assert_eq!(c.segmentation, TextSegmentation::Newlines);
-  assert_eq!(c.audio_format, AudioFormat::Wav);
+  assert_eq!(c.max_tokens(), DEFAULT_MAX_TOKENS);
+  assert_eq!(c.max_tokens(), 1200);
+  assert_eq!(c.segmentation(), TextSegmentation::Newlines);
+  assert_eq!(c.audio_format(), AudioFormat::Wav);
   assert!(
-    (c.streaming_interval - DEFAULT_STREAMING_INTERVAL).abs() < 1e-6,
+    (c.streaming_interval() - DEFAULT_STREAMING_INTERVAL).abs() < 1e-6,
     "streaming_interval default 2.0"
   );
 }

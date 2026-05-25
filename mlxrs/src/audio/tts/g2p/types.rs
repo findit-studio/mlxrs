@@ -15,7 +15,7 @@
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PhonemeUnit {
   /// The phoneme's textual symbol (e.g. `"h"`, `"ə"`, `"oʊ"`).
-  pub symbol: String,
+  symbol: String,
 }
 
 impl PhonemeUnit {
@@ -25,6 +25,12 @@ impl PhonemeUnit {
       symbol: symbol.into(),
     }
   }
+
+  /// The phoneme's textual symbol (e.g. `"h"`, `"ə"`, `"oʊ"`).
+  #[inline(always)]
+  pub fn symbol(&self) -> &str {
+    &self.symbol
+  }
 }
 
 /// A single lexicon row — one grapheme spelling paired with its phoneme
@@ -32,9 +38,9 @@ impl PhonemeUnit {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LexiconEntry {
   /// The grapheme / spelling (e.g. `"hello"`).
-  pub grapheme: String,
+  grapheme: String,
   /// The IPA phoneme sequence (e.g. `["h", "ə", "l", "oʊ"]`).
-  pub phonemes: Vec<String>,
+  phonemes: Vec<String>,
 }
 
 impl LexiconEntry {
@@ -44,6 +50,18 @@ impl LexiconEntry {
       grapheme: grapheme.into(),
       phonemes,
     }
+  }
+
+  /// The grapheme / spelling (e.g. `"hello"`).
+  #[inline(always)]
+  pub fn grapheme(&self) -> &str {
+    &self.grapheme
+  }
+
+  /// The IPA phoneme sequence as a slice (e.g. `["h", "ə", "l", "oʊ"]`).
+  #[inline(always)]
+  pub fn phonemes_slice(&self) -> &[String] {
+    &self.phonemes
   }
 }
 

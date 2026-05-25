@@ -40,17 +40,58 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RawEntry {
   /// The lowercase word (the variant suffix `(N)` is stripped).
-  pub word: String,
+  word: String,
   /// The ARPAbet phoneme sequence as captured from the source line
   /// (still carries stress digits).
-  pub arpabet: Vec<String>,
+  arpabet: Vec<String>,
   /// `Some(n)` for variant pronunciations (`word(n)` syntax); `None` for
   /// the primary entry.
-  pub variant: Option<u32>,
+  variant: Option<u32>,
   /// The 1-indexed source-line number this row came from. Carried so the
   /// downstream ARPAbet → IPA converter can surface a malformed-token
   /// error with the offending line position.
-  pub line_number: usize,
+  line_number: usize,
+}
+
+impl RawEntry {
+  /// Construct a [`RawEntry`] from all its fields.
+  pub fn new(
+    word: impl Into<String>,
+    arpabet: Vec<String>,
+    variant: Option<u32>,
+    line_number: usize,
+  ) -> Self {
+    Self {
+      word: word.into(),
+      arpabet,
+      variant,
+      line_number,
+    }
+  }
+
+  /// The lowercase word (variant suffix `(N)` stripped).
+  #[inline(always)]
+  pub fn word(&self) -> &str {
+    &self.word
+  }
+
+  /// The ARPAbet phoneme sequence (still carries stress digits).
+  #[inline(always)]
+  pub fn arpabet(&self) -> &[String] {
+    &self.arpabet
+  }
+
+  /// `Some(n)` for variant pronunciations; `None` for the primary entry.
+  #[inline(always)]
+  pub fn variant(&self) -> Option<u32> {
+    self.variant
+  }
+
+  /// The 1-indexed source-line number.
+  #[inline(always)]
+  pub fn line_number(&self) -> usize {
+    self.line_number
+  }
 }
 
 /// Construct a `malformed-word` [`Error::Backend`] tagged with the
@@ -179,12 +220,7 @@ pub fn parse_line(line: &str, line_number: usize) -> Result<Option<RawEntry>> {
     });
   }
 
-  Ok(Some(RawEntry {
-    word,
-    arpabet,
-    variant,
-    line_number,
-  }))
+  Ok(Some(RawEntry::new(word, arpabet, variant, line_number)))
 }
 
 /// Parse a CMUDict text blob into a list of [`RawEntry`]. Comment / blank
@@ -199,7 +235,7 @@ pub fn parse(text: &str, primary_only: bool) -> Result<Vec<RawEntry>> {
     // Line numbers are 1-indexed for human consumption.
     let line_number = idx + 1;
     if let Some(entry) = parse_line(line, line_number)?
-      && (!primary_only || entry.variant.is_none())
+      && (!primary_only || entry.variant().is_none())
     {
       out.push(entry);
     }
@@ -226,7 +262,7 @@ impl CMUDict {
   pub fn from_entries(entries: impl IntoIterator<Item = LexiconEntry>) -> Self {
     let mut map = HashMap::new();
     for entry in entries {
-      let key = entry.grapheme.to_lowercase();
+      let key = entry.grapheme().to_lowercase();
       map.insert(key, entry);
     }
     Self { entries: map }
@@ -251,21 +287,24 @@ impl CMUDict {
     let mut entries = Vec::new();
     for r in raw {
       let phonemes =
-        arpabet::try_convert_sequence_strict(&r.arpabet).map_err(|bad| Error::Backend {
+        arpabet::try_convert_sequence_strict(r.arpabet()).map_err(|bad| Error::Backend {
           message: format!(
             "CMUDict line {}: word '{}' has unknown ARPAbet token '{}'",
-            r.line_number, r.word, bad.token,
+            r.line_number(),
+            r.word(),
+            bad.token(),
           ),
         })?;
       if phonemes.is_empty() {
         return Err(Error::Backend {
           message: format!(
             "CMUDict line {}: word '{}' has empty pronunciation after ARPAbet → IPA conversion",
-            r.line_number, r.word,
+            r.line_number(),
+            r.word(),
           ),
         });
       }
-      entries.push(LexiconEntry::new(r.word, phonemes));
+      entries.push(LexiconEntry::new(r.word().to_owned(), phonemes));
     }
     Ok(Self::from_entries(entries))
   }
@@ -342,18 +381,18 @@ mod tests {
     let entry = parse_line("hello  HH AH0 L OW1", 1)
       .unwrap()
       .expect("entry");
-    assert_eq!(entry.word, "hello");
-    assert_eq!(entry.arpabet, vec!["HH", "AH0", "L", "OW1"]);
-    assert_eq!(entry.variant, None);
+    assert_eq!(entry.word(), "hello");
+    assert_eq!(entry.arpabet(), ["HH", "AH0", "L", "OW1"]);
+    assert_eq!(entry.variant(), None);
   }
 
   // Mirrors `parsesVariantEntry`.
   #[test]
   fn parses_variant_entry() {
     let entry = parse_line("the(2)  DH IY0", 1).unwrap().expect("entry");
-    assert_eq!(entry.word, "the");
-    assert_eq!(entry.arpabet, vec!["DH", "IY0"]);
-    assert_eq!(entry.variant, Some(2));
+    assert_eq!(entry.word(), "the");
+    assert_eq!(entry.arpabet(), ["DH", "IY0"]);
+    assert_eq!(entry.variant(), Some(2));
   }
 
   // Mirrors `skipsCommentLines`.
@@ -373,14 +412,14 @@ mod tests {
   #[test]
   fn handles_single_phoneme() {
     let entry = parse_line("a  AH0", 1).unwrap().expect("entry");
-    assert_eq!(entry.word, "a");
-    assert_eq!(entry.arpabet, vec!["AH0"]);
+    assert_eq!(entry.word(), "a");
+    assert_eq!(entry.arpabet(), ["AH0"]);
   }
 
   #[test]
   fn lowercases_uppercase_word() {
     let entry = parse_line("HELLO  HH AH0", 1).unwrap().expect("entry");
-    assert_eq!(entry.word, "hello");
+    assert_eq!(entry.word(), "hello");
   }
 
   // Malformed row test — mlxrs surfaces an error (with line number) where
@@ -405,8 +444,8 @@ mod tests {
                 the(2)  DH IY0";
     let entries = parse(text, false).unwrap();
     assert_eq!(entries.len(), 4);
-    assert_eq!(entries[0].word, "hello");
-    assert_eq!(entries[3].variant, Some(2));
+    assert_eq!(entries[0].word(), "hello");
+    assert_eq!(entries[3].variant(), Some(2));
   }
 
   // Mirrors `filtersPrimaryOnly`.
@@ -417,7 +456,7 @@ mod tests {
                 hello  HH AH0 L OW1";
     let entries = parse(text, true).unwrap();
     assert_eq!(entries.len(), 2);
-    assert!(entries.iter().all(|e| e.variant.is_none()));
+    assert!(entries.iter().all(|e| e.variant().is_none()));
   }
 
   #[test]
@@ -445,8 +484,8 @@ mod tests {
   fn lookup_returns_entry_for_known_word() {
     let dict = fixture_dict();
     let entry = dict.lookup("hello").expect("hello in dict");
-    assert_eq!(entry.grapheme, "hello");
-    assert_eq!(entry.phonemes, vec!["h", "ə", "l", "oʊ"]);
+    assert_eq!(entry.grapheme(), "hello");
+    assert_eq!(entry.phonemes_slice(), ["h", "ə", "l", "oʊ"]);
   }
 
   #[test]
@@ -483,12 +522,12 @@ mod tests {
   /// pronunciation, blocking the lexicon-first / neural-fallback pattern).
   #[test]
   fn from_raw_entries_strict_rejects_unknown_arpabet() {
-    let raw = vec![RawEntry {
-      word: "weird".into(),
-      arpabet: vec!["HH".into(), "XX".into(), "L".into()],
-      variant: None,
-      line_number: 7,
-    }];
+    let raw = vec![RawEntry::new(
+      "weird",
+      vec!["HH".into(), "XX".into(), "L".into()],
+      None,
+      7,
+    )];
     let err = CMUDict::from_raw_entries(raw).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("weird"), "expected word in {msg:?}");
@@ -528,7 +567,7 @@ mod tests {
     let the = dict.lookup("the").unwrap();
     // primary_only=true → the(2) variant is filtered out, the primary
     // (DH AH0 → ð ə) wins.
-    assert_eq!(the.phonemes, vec!["ð", "ə"]);
+    assert_eq!(the.phonemes_slice(), ["ð", "ə"]);
   }
 
   #[test]
@@ -651,12 +690,7 @@ mod tests {
   /// future refactor relaxes the strict path.
   #[test]
   fn cmudict_loader_rejects_empty_phonemes_after_conversion() {
-    let raw = vec![RawEntry {
-      word: "ghostword".into(),
-      arpabet: Vec::new(),
-      variant: None,
-      line_number: 17,
-    }];
+    let raw = vec![RawEntry::new("ghostword", Vec::new(), None, 17)];
     let err = CMUDict::from_raw_entries(raw).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("ghostword"), "expected word in {msg:?}");
@@ -675,6 +709,6 @@ mod tests {
     fs::write(dir.join("cmudict.dict"), "hello  HH AH0 L OW1\n").unwrap();
     let dict = CMUDictLoader::load(&dir).unwrap();
     let entry = dict.lookup("hello").expect("hello in dict");
-    assert_eq!(entry.phonemes, vec!["h", "ə", "l", "oʊ"]);
+    assert_eq!(entry.phonemes_slice(), ["h", "ə", "l", "oʊ"]);
   }
 }

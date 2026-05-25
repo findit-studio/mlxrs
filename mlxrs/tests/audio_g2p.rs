@@ -142,9 +142,9 @@ fn cmudict_parse_known_good_fixture() {
               the(2)  DH IY0\n";
   let entries = parse(text, false).unwrap();
   assert_eq!(entries.len(), 4);
-  assert_eq!(entries[0].word, "hello");
-  assert_eq!(entries[0].arpabet, vec!["HH", "AH0", "L", "OW1"]);
-  assert_eq!(entries[3].variant, Some(2));
+  assert_eq!(entries[0].word(), "hello");
+  assert_eq!(entries[0].arpabet(), ["HH", "AH0", "L", "OW1"]);
+  assert_eq!(entries[3].variant(), Some(2));
 }
 
 #[test]
@@ -152,7 +152,7 @@ fn cmudict_parse_primary_only_drops_variants() {
   let text = "the  DH AH0\nthe(2)  DH IY0\nhello  HH AH0 L OW1";
   let entries = parse(text, true).unwrap();
   assert_eq!(entries.len(), 2);
-  assert!(entries.iter().all(|e| e.variant.is_none()));
+  assert!(entries.iter().all(|e| e.variant().is_none()));
 }
 
 #[test]
@@ -221,7 +221,7 @@ fn cmudict_loader_produces_correct_ipa() {
   write_fixture(&dir);
   let dict = CMUDictLoader::load(&dir).unwrap();
   let hello = dict.lookup("hello").unwrap();
-  assert_eq!(hello.phonemes, vec!["h", "ə", "l", "oʊ"]);
+  assert_eq!(hello.phonemes_slice(), ["h", "ə", "l", "oʊ"]);
 }
 
 #[test]
@@ -250,11 +250,14 @@ fn cmudict_loader_fixes_digraph_orthography() {
   let dict = CMUDictLoader::load(&dir).unwrap();
 
   let phone = dict.lookup("phone").unwrap();
-  assert!(phone.phonemes.contains(&"f".to_string()));
-  assert!(!phone.phonemes.contains(&"p".to_string()));
+  assert!(phone.phonemes_slice().contains(&"f".to_string()));
+  assert!(!phone.phonemes_slice().contains(&"p".to_string()));
 
   let knight = dict.lookup("knight").unwrap();
-  assert_eq!(knight.phonemes.first().map(String::as_str), Some("n"));
+  assert_eq!(
+    knight.phonemes_slice().first().map(String::as_str),
+    Some("n")
+  );
 }
 
 #[test]
@@ -291,7 +294,7 @@ where
     let mut out = Vec::new();
     for word in text.split_whitespace() {
       let units = self.g2p.phonemize(word)?;
-      let joined: String = units.into_iter().map(|u| u.symbol).collect();
+      let joined: String = units.into_iter().map(|u| u.symbol().to_owned()).collect();
       out.push(joined);
     }
     Ok(out.join(" "))
@@ -341,7 +344,7 @@ fn end_to_end_lexicon_first_with_neural_fallback() {
   // "hello" hits the lexicon, "xyz" misses → neural fallback.
   let hello_units: Vec<PhonemeUnit> = if let Some(entry) = dict.lookup("hello") {
     entry
-      .phonemes
+      .phonemes_slice()
       .iter()
       .map(|p| PhonemeUnit::new(p.clone()))
       .collect()
@@ -350,7 +353,7 @@ fn end_to_end_lexicon_first_with_neural_fallback() {
   };
   let xyz_units: Vec<PhonemeUnit> = if let Some(entry) = dict.lookup("xyz") {
     entry
-      .phonemes
+      .phonemes_slice()
       .iter()
       .map(|p| PhonemeUnit::new(p.clone()))
       .collect()
