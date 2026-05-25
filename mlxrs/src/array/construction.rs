@@ -28,7 +28,10 @@ impl Drop for ScalarGuard {
 /// pointer must be associated with a real `T` allocation — a `[u8]` cast to
 /// `*const T` is not enough (Codex PR #5 round-2 finding).
 #[inline]
-fn data_ptr<T: Element>(data: &[T]) -> *const T {
+fn data_ptr<T>(data: &[T]) -> *const T
+where
+  T: Element,
+{
   if data.is_empty() {
     T::sentinel_ptr()
   } else {
@@ -44,7 +47,10 @@ impl Array {
   /// let a = mlxrs::Array::ones::<f32>(&(3, 3))?;
   /// # Ok(()) }
   /// ```
-  pub fn ones<T: Element>(shape: &impl IntoShape) -> Result<Self> {
+  pub fn ones<T>(shape: &impl IntoShape) -> Result<Self>
+  where
+    T: Element,
+  {
     // CRITICAL: must be the first call in this function. The very first FFI
     // call below (`mlx_array_new()`) is wrapped in mlx-c's standard
     // `try/catch -> mlx_error(e.what())` boilerplate; without an installed
@@ -83,7 +89,10 @@ impl Array {
   }
 
   /// Creates an array filled with zeros.
-  pub fn zeros<T: Element>(shape: &impl IntoShape) -> Result<Self> {
+  pub fn zeros<T>(shape: &impl IntoShape) -> Result<Self>
+  where
+    T: Element,
+  {
     // CRITICAL: must be the first call in this function. See `Array::ones`
     // for the full rationale — the raw `mlx_array_new()` below is in mlx-c's
     // `try/catch -> mlx_error` wrapper and runs BEFORE `default_stream()`'s
@@ -119,7 +128,10 @@ impl Array {
   ///
   /// `mlx_full` takes a scalar `mlx_array` for `vals`; this helper builds
   /// the scalar via `mlx_array_new_float32(value)` and frees it on return.
-  pub fn full<T: Element>(shape: &impl IntoShape, value: f32) -> Result<Self> {
+  pub fn full<T>(shape: &impl IntoShape, value: f32) -> Result<Self>
+  where
+    T: Element,
+  {
     // CRITICAL: must be the first call in this function. `Array::full` is the
     // worst-case constructor for the stripped-ctor exit(-1) regression: the
     // raw `mlx_array_new_float32(value)` below heap-allocates a fresh
@@ -185,7 +197,10 @@ impl Array {
   }
 
   /// Creates an `n×n` identity matrix.
-  pub fn eye<T: Element>(n: usize) -> Result<Self> {
+  pub fn eye<T>(n: usize) -> Result<Self>
+  where
+    T: Element,
+  {
     // CRITICAL: must be the first call in this function. See `Array::ones`
     // for the full rationale — the raw `mlx_array_new()` below is in mlx-c's
     // `try/catch -> mlx_error` wrapper and runs BEFORE `default_stream()`'s
@@ -284,7 +299,10 @@ impl Array {
   }
 
   /// Creates an array from a contiguous `&[T]` buffer plus shape. Buffer is COPIED.
-  pub fn from_slice<T: Element>(data: &[T], shape: &impl IntoShape) -> Result<Self> {
+  pub fn from_slice<T>(data: &[T], shape: &impl IntoShape) -> Result<Self>
+  where
+    T: Element,
+  {
     // CRITICAL: must be the first call in this function. `from_slice` is the
     // only `Array` constructor that does NOT go through `default_stream()`
     // (so there is no later installer to rescue a stripped `#[ctor]`); its

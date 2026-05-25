@@ -14,7 +14,12 @@ pub mod ops_impl;
 
 /// MLX N-dimensional array — RAII handle around an mlx-c `mlx_array`.
 #[repr(transparent)]
-pub struct Array(pub(crate) mlxrs_sys::mlx_array);
+// `pub(super)` (= `pub(crate)` from this location): the raw handle stays
+// crate-visible so the FFI wrappers in crate-sibling modules can construct
+// and consume `Array`s without going through accessors. Tightening further
+// is a separate refactor (introduce explicit `Array::from_raw` /
+// `into_raw` / handle-borrow accessors crate-wide); not in scope here.
+pub struct Array(pub(super) mlxrs_sys::mlx_array);
 
 // Compile-time guarantees colocated with the type definition.
 //

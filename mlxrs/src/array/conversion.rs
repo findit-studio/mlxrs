@@ -10,6 +10,7 @@ use crate::{
 
 impl Array {
   /// Number of dimensions.
+  #[inline(always)]
   pub fn ndim(&self) -> usize {
     // SAFETY: pure read of a valid borrowed handle; mlx-c does not mutate or retain
     // it, and the call returns a plain scalar (no out-param, no rc).
@@ -17,6 +18,7 @@ impl Array {
   }
 
   /// Total number of elements.
+  #[inline(always)]
   pub fn size(&self) -> usize {
     // SAFETY: pure read of a valid borrowed handle; mlx-c does not mutate or retain
     // it, and the call returns a plain scalar (no out-param, no rc).
@@ -24,6 +26,7 @@ impl Array {
   }
 
   /// Element type.
+  #[inline(always)]
   pub fn dtype(&self) -> Result<Dtype> {
     // SAFETY: pure read of a valid borrowed handle; mlx-c does not mutate or retain
     // it, and the call returns a plain scalar (no out-param, no rc).
@@ -52,7 +55,10 @@ impl Array {
   /// but does **not** enforce the strict no-implicit-eval contract from
   /// `feedback_no_implicit_eval` — see the `try_item` doc for the audit
   /// finding and the binding work that would be needed to enforce it.
-  pub fn item<T: Element>(&mut self) -> Result<T> {
+  pub fn item<T>(&mut self) -> Result<T>
+  where
+    T: Element,
+  {
     let actual = self.dtype()?;
     if actual != T::DTYPE {
       return Err(Error::DtypeMismatch {
@@ -78,7 +84,10 @@ impl Array {
   /// borrow-relaxed variant requires either a binding for the internal
   /// `_mlx_array_is_available` or an upstream mlx-c entry point that routes
   /// through C++ const overloads — both out of scope for this polish PR.
-  pub fn to_vec<T: Element>(&mut self) -> Result<Vec<T>> {
+  pub fn to_vec<T>(&mut self) -> Result<Vec<T>>
+  where
+    T: Element,
+  {
     let actual = self.dtype()?;
     if actual != T::DTYPE {
       return Err(Error::DtypeMismatch {
@@ -112,7 +121,10 @@ impl Array {
   /// **CORE-2 audit (#118).** Same caveat as [`Array::to_vec`]: no
   /// `try_as_slice(&self)` parallel — `mlx_array_data_*` is not safe on
   /// unscheduled arrays. See [`Array::try_item`] doc.
-  pub fn as_slice<T: Element>(&mut self) -> Result<&[T]> {
+  pub fn as_slice<T>(&mut self) -> Result<&[T]>
+  where
+    T: Element,
+  {
     let actual = self.dtype()?;
     if actual != T::DTYPE {
       return Err(Error::DtypeMismatch {
@@ -194,7 +206,10 @@ impl Array {
   /// ## Errors
   /// - `Error::DtypeMismatch` if `T::DTYPE != self.dtype()`.
   /// - `Error::Backend` if mlx's `item` throws (e.g. `size() != 1`).
-  pub fn try_item<T: Element>(&self) -> Result<T> {
+  pub fn try_item<T>(&self) -> Result<T>
+  where
+    T: Element,
+  {
     // CRITICAL: must be the first call in this function. If removed,
     // a stripped-ctor environment (where the process-global mlx error handler
     // wasn't installed by #[ctor]) would cause mlx-c's default handler to
