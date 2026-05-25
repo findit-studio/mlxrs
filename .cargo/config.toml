@@ -1,0 +1,6 @@
+[alias]
+# Light path: regen-bindings only (no tokenizers/serde_json/toml/onig).
+xtask = "run --package xtask --"
+# Heavy path: tokenizer codegen + its `codegen`-feature toolchain.
+# `cargo xtask-codegen` / `cargo xtask-codegen --check` (drift guard).
+xtask-codegen = "run --package xtask --features codegen -- codegen"

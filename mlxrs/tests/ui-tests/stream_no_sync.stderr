@@ -1,0 +1,22 @@
+error[E0277]: `*mut c_void` cannot be shared between threads safely
+ --> tests/ui-tests/stream_no_sync.rs:4:17
+  |
+4 |   assert_sync::<mlxrs::Stream>();
+  |                 ^^^^^^^^^^^^^ `*mut c_void` cannot be shared between threads safely
+  |
+  = help: within `Stream`, the trait `Sync` is not implemented for `*mut c_void`
+note: required because it appears within the type `mlxrs_sys::generated::mlx_stream_`
+ --> $WORKSPACE/mlxrs-sys/src/generated/bindings.rs
+  |
+  | pub struct mlx_stream_ {
+  |            ^^^^^^^^^^^
+note: required because it appears within the type `Stream`
+ --> src/stream.rs
+  |
+  | pub struct Stream(pub(crate) mlxrs_sys::mlx_stream);
+  |            ^^^^^^
+note: required by a bound in `assert_sync`
+ --> tests/ui-tests/stream_no_sync.rs:1:19
+  |
+1 | fn assert_sync<T: Sync>() {}
+  |                   ^^^^ required by this bound in `assert_sync`

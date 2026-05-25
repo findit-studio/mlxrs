@@ -1,0 +1,15 @@
+# BPE single-space cleanup suffixes.
+#
+# Single source of truth for `BPEStreamingDetokenizer._maybe_trim_space`'s
+# `_space_matches` tuple. When the held single-space token is followed by one
+# of these, the leading space is dropped (English contractions / punctuation).
+#
+# source: mlx-lm df1d3f3 mlx_lm/tokenizer_utils.py:163
+#   `_space_matches = (".", "?", "!", ",", "n't", "'m", "'s", "'ve", "'re")`
+#
+# `cargo xtask-codegen` regenerates `static BPE_SPACE_MATCHES: &[&str]` from
+# `matches` below (drift-guarded in CI); this file is the source of truth
+# for the committed `src/tokenizer/generated.rs`. Order-preserving (the
+# original is a tuple; order is not semantically significant for
+# `starts_with` but is kept faithful).
+matches = [".", "?", "!", ",", "n't", "'m", "'s", "'ve", "'re"]
