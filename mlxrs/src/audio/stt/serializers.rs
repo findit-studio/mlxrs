@@ -104,6 +104,7 @@ use std::{
   path::Path,
 };
 
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -120,11 +121,11 @@ use crate::error::{Error, Result};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Word {
   /// Word start time in seconds (mlx-audio python `w["start"]`).
-  pub start: f64,
+  start: f64,
   /// Word end time in seconds (mlx-audio python `w["end"]`).
-  pub end: f64,
+  end: f64,
   /// Word text (mlx-audio python `w["word"]`).
-  pub word: String,
+  word: String,
   /// Extra per-word fields the per-model decoder may attach (e.g.
   /// `probability`). Preserved verbatim through the JSON round-trip;
   /// faithful to `save_as_json`'s `seg["words"] = s["words"]` pass-through.
@@ -133,7 +134,48 @@ pub struct Word {
   /// matches `serde_json` `preserve_order` semantics for the rest of the
   /// struct's fields.
   #[serde(flatten)]
-  pub extra: BTreeMap<String, serde_json::Value>,
+  extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl Word {
+  /// Construct a [`Word`].
+  pub fn new(
+    start: f64,
+    end: f64,
+    word: impl Into<String>,
+    extra: BTreeMap<String, serde_json::Value>,
+  ) -> Self {
+    Self {
+      start,
+      end,
+      word: word.into(),
+      extra,
+    }
+  }
+
+  /// Word start time in seconds.
+  #[inline(always)]
+  pub fn start(&self) -> f64 {
+    self.start
+  }
+
+  /// Word end time in seconds.
+  #[inline(always)]
+  pub fn end(&self) -> f64 {
+    self.end
+  }
+
+  /// Word text.
+  #[inline(always)]
+  pub fn word(&self) -> &str {
+    &self.word
+  }
+
+  /// Extra per-word JSON fields.
+  #[inline(always)]
+  pub fn extra(&self) -> &BTreeMap<String, serde_json::Value> {
+    &self.extra
+  }
 }
 
 /// One Whisper-style transcript segment — mirrors the duck-typed
@@ -141,23 +183,83 @@ pub struct Word {
 /// (`{"start": ..., "end": ..., "text": ..., ["words": ...], ["speaker_id":
 /// ...]}`).
 ///
+/// Per §1 EMPTY=ABSENT: `words` is a `Vec<Word>` (empty = no word-level
+/// alignment) and `speaker_id` is a `String` (empty = no diarization). The
+/// serde wire form skips both fields when they are empty, so JSON consumers
+/// see the field absent rather than `null` or `[]`/`""` — matching the
+/// python null/missing convention these consumers depend on.
+///
 /// [stt-gen]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/generate.py
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Segment {
   /// Segment start time in seconds (mlx-audio python `s["start"]`).
-  pub start: f64,
+  start: f64,
   /// Segment end time in seconds (mlx-audio python `s["end"]`).
-  pub end: f64,
+  end: f64,
   /// Segment text (mlx-audio python `s["text"]`).
-  pub text: String,
-  /// Word-level cues (mlx-audio python `s["words"]`). `None` when the
-  /// per-model decoder did not emit word-level alignment.
-  #[serde(skip_serializing_if = "Option::is_none", default)]
-  pub words: Option<Vec<Word>>,
-  /// Optional speaker-id label (mlx-audio python `s["speaker_id"]`). `None`
-  /// when speaker diarization wasn't run.
-  #[serde(skip_serializing_if = "Option::is_none", default)]
-  pub speaker_id: Option<String>,
+  text: String,
+  /// Word-level cues (mlx-audio python `s["words"]`). Empty when the
+  /// per-model decoder did not emit word-level alignment (EMPTY=ABSENT:
+  /// field is omitted from JSON when empty, matching python null/missing).
+  #[serde(skip_serializing_if = "Vec::is_empty", default)]
+  words: Vec<Word>,
+  /// Speaker-id label (mlx-audio python `s["speaker_id"]`). Empty string
+  /// when speaker diarization wasn't run (EMPTY=ABSENT: field is omitted
+  /// from JSON when empty, matching python null/missing).
+  #[serde(skip_serializing_if = "String::is_empty", default)]
+  speaker_id: String,
+}
+
+impl Segment {
+  /// Construct a [`Segment`].
+  #[inline(always)]
+  pub fn new(
+    start: f64,
+    end: f64,
+    text: impl Into<String>,
+    words: Vec<Word>,
+    speaker_id: impl Into<String>,
+  ) -> Self {
+    Self {
+      start,
+      end,
+      text: text.into(),
+      words,
+      speaker_id: speaker_id.into(),
+    }
+  }
+
+  /// Segment start time in seconds.
+  #[inline(always)]
+  pub fn start(&self) -> f64 {
+    self.start
+  }
+
+  /// Segment end time in seconds.
+  #[inline(always)]
+  pub fn end(&self) -> f64 {
+    self.end
+  }
+
+  /// Segment text.
+  #[inline(always)]
+  pub fn text(&self) -> &str {
+    &self.text
+  }
+
+  /// Word-level cues as a slice. Empty slice = no word-level alignment
+  /// (EMPTY=ABSENT — absent from JSON when empty).
+  #[inline(always)]
+  pub fn words_slice(&self) -> &[Word] {
+    &self.words
+  }
+
+  /// Speaker-id label. Empty string = no diarization
+  /// (EMPTY=ABSENT — absent from JSON when empty).
+  #[inline(always)]
+  pub fn speaker_id(&self) -> &str {
+    &self.speaker_id
+  }
 }
 
 /// One Parakeet-style aligned token — mirrors `AlignedToken` from
@@ -168,14 +270,50 @@ pub struct Segment {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SentenceToken {
   /// Token text (mlx-audio python `t.text`).
-  pub text: String,
+  text: String,
   /// Token start time in seconds (mlx-audio python `t.start`).
-  pub start: f64,
+  start: f64,
   /// Token end time in seconds (mlx-audio python `t.end`; `start + duration`
   /// per `AlignedToken.__post_init__`).
-  pub end: f64,
+  end: f64,
   /// Token duration in seconds (mlx-audio python `t.duration`).
-  pub duration: f64,
+  duration: f64,
+}
+
+impl SentenceToken {
+  /// Construct a [`SentenceToken`].
+  pub fn new(text: impl Into<String>, start: f64, end: f64, duration: f64) -> Self {
+    Self {
+      text: text.into(),
+      start,
+      end,
+      duration,
+    }
+  }
+
+  /// Token text.
+  #[inline(always)]
+  pub fn text(&self) -> &str {
+    &self.text
+  }
+
+  /// Token start time in seconds.
+  #[inline(always)]
+  pub fn start(&self) -> f64 {
+    self.start
+  }
+
+  /// Token end time in seconds.
+  #[inline(always)]
+  pub fn end(&self) -> f64 {
+    self.end
+  }
+
+  /// Token duration in seconds.
+  #[inline(always)]
+  pub fn duration(&self) -> f64 {
+    self.duration
+  }
 }
 
 /// One Parakeet-style aligned sentence — mirrors `AlignedSentence` from
@@ -183,23 +321,153 @@ pub struct SentenceToken {
 /// alignment plus optional speaker-id (the only `hasattr(s, "speaker_id")`
 /// branch in `save_as_json`).
 ///
+/// Per §1 EMPTY=ABSENT: `speaker_id` is a `String` (empty = no diarization).
+/// The serde wire form skips the field when empty, so JSON consumers see the
+/// field absent rather than `null` or `""` — matching the python
+/// `hasattr(s, "speaker_id")` null/missing convention.
+///
 /// [palign]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/parakeet/alignment.py
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sentence {
   /// Sentence text (mlx-audio python `s.text`).
-  pub text: String,
+  text: String,
   /// Sentence start time in seconds (mlx-audio python `s.start`).
-  pub start: f64,
+  start: f64,
   /// Sentence end time in seconds (mlx-audio python `s.end`).
-  pub end: f64,
+  end: f64,
   /// Sentence duration in seconds (mlx-audio python `s.duration`).
-  pub duration: f64,
+  duration: f64,
   /// Per-token alignment (mlx-audio python `s.tokens`).
-  pub tokens: Vec<SentenceToken>,
-  /// Optional speaker-id label (mlx-audio python `s.speaker_id`; surfaced
-  /// only when `hasattr(s, "speaker_id")`).
-  #[serde(skip_serializing_if = "Option::is_none", default)]
-  pub speaker_id: Option<String>,
+  tokens: Vec<SentenceToken>,
+  /// Speaker-id label (mlx-audio python `s.speaker_id`; surfaced only when
+  /// `hasattr(s, "speaker_id")`). Empty string when diarization wasn't run
+  /// (EMPTY=ABSENT — field is omitted from JSON when empty, matching python
+  /// null/missing).
+  #[serde(skip_serializing_if = "String::is_empty", default)]
+  speaker_id: String,
+}
+
+impl Sentence {
+  /// Construct a [`Sentence`].
+  #[inline(always)]
+  pub fn new(
+    text: impl Into<String>,
+    start: f64,
+    end: f64,
+    duration: f64,
+    tokens: Vec<SentenceToken>,
+    speaker_id: impl Into<String>,
+  ) -> Self {
+    Self {
+      text: text.into(),
+      start,
+      end,
+      duration,
+      tokens,
+      speaker_id: speaker_id.into(),
+    }
+  }
+
+  /// Sentence text.
+  #[inline(always)]
+  pub fn text(&self) -> &str {
+    &self.text
+  }
+
+  /// Sentence start time in seconds.
+  #[inline(always)]
+  pub fn start(&self) -> f64 {
+    self.start
+  }
+
+  /// Sentence end time in seconds.
+  #[inline(always)]
+  pub fn end(&self) -> f64 {
+    self.end
+  }
+
+  /// Sentence duration in seconds.
+  #[inline(always)]
+  pub fn duration(&self) -> f64 {
+    self.duration
+  }
+
+  /// Per-token alignment.
+  #[inline(always)]
+  pub fn tokens(&self) -> &[SentenceToken] {
+    &self.tokens
+  }
+
+  /// Speaker-id label. Empty string = no diarization
+  /// (EMPTY=ABSENT — absent from JSON when empty).
+  #[inline(always)]
+  pub fn speaker_id(&self) -> &str {
+    &self.speaker_id
+  }
+}
+
+/// Payload for [`Transcript::Segments`] — carries the assembled text and the
+/// per-segment timing list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SegmentsPayload {
+  /// Assembled transcription text (mlx-audio python `segments.text`).
+  text: String,
+  /// Per-segment timing (mlx-audio python `segments.segments`).
+  segments: Vec<Segment>,
+}
+
+impl SegmentsPayload {
+  /// Construct a [`SegmentsPayload`].
+  pub fn new(text: impl Into<String>, segments: Vec<Segment>) -> Self {
+    Self {
+      text: text.into(),
+      segments,
+    }
+  }
+
+  /// Assembled transcription text.
+  #[inline(always)]
+  pub fn text(&self) -> &str {
+    &self.text
+  }
+
+  /// Per-segment timing.
+  #[inline(always)]
+  pub fn segments(&self) -> &[Segment] {
+    &self.segments
+  }
+}
+
+/// Payload for [`Transcript::Sentences`] — carries the assembled text and the
+/// per-sentence timing list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SentencesPayload {
+  /// Assembled transcription text (mlx-audio python `segments.text`).
+  text: String,
+  /// Per-sentence timing + tokens (mlx-audio python `segments.sentences`).
+  sentences: Vec<Sentence>,
+}
+
+impl SentencesPayload {
+  /// Construct a [`SentencesPayload`].
+  pub fn new(text: impl Into<String>, sentences: Vec<Sentence>) -> Self {
+    Self {
+      text: text.into(),
+      sentences,
+    }
+  }
+
+  /// Assembled transcription text.
+  #[inline(always)]
+  pub fn text(&self) -> &str {
+    &self.text
+  }
+
+  /// Per-sentence timing + tokens.
+  #[inline(always)]
+  pub fn sentences(&self) -> &[Sentence] {
+    &self.sentences
+  }
 }
 
 /// A transcript — the input to the four `save_as_*` serializers, mirroring
@@ -220,25 +488,16 @@ pub struct Sentence {
 /// shape (`save_as_txt:141`, `save_as_json:176/202`).
 ///
 /// [stt-gen]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/generate.py
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
 #[serde(untagged)]
 pub enum Transcript {
   /// Whisper-style transcript: `text` + `segments` (per-segment timing,
   /// optional word-level alignment, optional speaker-id).
-  Segments {
-    /// Assembled transcription text (mlx-audio python `segments.text`).
-    text: String,
-    /// Per-segment timing (mlx-audio python `segments.segments`).
-    segments: Vec<Segment>,
-  },
+  Segments(SegmentsPayload),
   /// Parakeet-style transcript: `text` + `sentences` (per-sentence timing +
   /// per-token alignment, optional speaker-id).
-  Sentences {
-    /// Assembled transcription text (mlx-audio python `segments.text`).
-    text: String,
-    /// Per-sentence timing + tokens (mlx-audio python `segments.sentences`).
-    sentences: Vec<Sentence>,
-  },
+  Sentences(SentencesPayload),
 }
 
 impl Transcript {
@@ -246,7 +505,8 @@ impl Transcript {
   /// (mlx-audio python `segments.text` access).
   pub fn text(&self) -> &str {
     match self {
-      Transcript::Segments { text, .. } | Transcript::Sentences { text, .. } => text,
+      Transcript::Segments(p) => p.text(),
+      Transcript::Sentences(p) => p.text(),
     }
   }
 }
@@ -264,11 +524,37 @@ impl Transcript {
 #[derive(Debug, Clone, Copy)]
 pub struct Cue<'a> {
   /// Cue start time in seconds.
-  pub start: f64,
+  start: f64,
   /// Cue end time in seconds.
-  pub end: f64,
+  end: f64,
   /// Cue text (borrowed back into the [`Transcript`]).
-  pub text: &'a str,
+  text: &'a str,
+}
+
+impl<'a> Cue<'a> {
+  /// Construct a [`Cue`].
+  #[inline(always)]
+  pub const fn new(start: f64, end: f64, text: &'a str) -> Self {
+    Self { start, end, text }
+  }
+
+  /// Cue start time in seconds.
+  #[inline(always)]
+  pub fn start(&self) -> f64 {
+    self.start
+  }
+
+  /// Cue end time in seconds.
+  #[inline(always)]
+  pub fn end(&self) -> f64 {
+    self.end
+  }
+
+  /// Cue text.
+  #[inline(always)]
+  pub fn text(&self) -> &str {
+    self.text
+  }
 }
 
 /// Extract unified cues from a [`Transcript`] — the model-agnostic
@@ -288,30 +574,17 @@ pub struct Cue<'a> {
 /// [stt-gen]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/generate.py
 pub fn get_cues(t: &Transcript) -> Vec<Cue<'_>> {
   match t {
-    Transcript::Sentences { sentences, .. } => sentences
+    Transcript::Sentences(p) => p
+      .sentences()
       .iter()
-      .map(|s| Cue {
-        start: s.start,
-        end: s.end,
-        text: &s.text,
-      })
+      .map(|s| Cue::new(s.start(), s.end(), s.text()))
       .collect(),
-    Transcript::Segments { segments, .. } => {
-      let mut cues = Vec::with_capacity(segments.len());
-      for s in segments {
-        cues.push(Cue {
-          start: s.start,
-          end: s.end,
-          text: &s.text,
-        });
-        if let Some(words) = &s.words {
-          for w in words {
-            cues.push(Cue {
-              start: w.start,
-              end: w.end,
-              text: &w.word,
-            });
-          }
+    Transcript::Segments(p) => {
+      let mut cues = Vec::with_capacity(p.segments().len());
+      for s in p.segments() {
+        cues.push(Cue::new(s.start(), s.end(), s.text()));
+        for w in s.words_slice() {
+          cues.push(Cue::new(w.start(), w.end(), w.word()));
         }
       }
       cues
@@ -521,9 +794,9 @@ fn save_as_srt_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::i
     let block = format!(
       "{}\n{} --> {}\n{}\n\n",
       idx,
-      format_timestamp(cue.start),
-      format_timestamp(cue.end),
-      cue.text,
+      format_timestamp(cue.start()),
+      format_timestamp(cue.end()),
+      cue.text(),
     );
     w.write_all(block.as_bytes())?;
   }
@@ -604,9 +877,9 @@ fn save_as_vtt_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::i
     let block = format!(
       "{}\n{} --> {}\n{}\n\n",
       idx,
-      format_vtt_timestamp(cue.start),
-      format_vtt_timestamp(cue.end),
-      cue.text,
+      format_vtt_timestamp(cue.start()),
+      format_vtt_timestamp(cue.end()),
+      cue.text(),
     );
     w.write_all(block.as_bytes())?;
   }
@@ -759,65 +1032,67 @@ fn save_as_json_stdout<W: Write>(transcript: &Transcript, w: &mut W) -> Result<(
 fn transcript_to_python_shape(t: &Transcript) -> serde_json::Value {
   use serde_json::{Map, Value, json};
   match t {
-    Transcript::Sentences { text, sentences } => {
+    Transcript::Sentences(p) => {
       // python `result = {"text": ..., "sentences": [...]}`
-      let mut sents_arr: Vec<Value> = Vec::with_capacity(sentences.len());
-      for s in sentences {
+      let mut sents_arr: Vec<Value> = Vec::with_capacity(p.sentences().len());
+      for s in p.sentences() {
         // python builds dict in {text, start, end, duration, tokens} order,
         // THEN appends speaker_id post-hoc (lines 196-199). Mirror exactly.
         let mut obj = Map::new();
-        obj.insert("text".into(), Value::String(s.text.clone()));
-        obj.insert("start".into(), json!(s.start));
-        obj.insert("end".into(), json!(s.end));
-        obj.insert("duration".into(), json!(s.duration));
+        obj.insert("text".into(), Value::String(s.text().to_owned()));
+        obj.insert("start".into(), json!(s.start()));
+        obj.insert("end".into(), json!(s.end()));
+        obj.insert("duration".into(), json!(s.duration()));
         let tok_arr: Vec<Value> = s
-          .tokens
+          .tokens()
           .iter()
           .map(|tk| {
             let mut tobj = Map::new();
-            tobj.insert("text".into(), Value::String(tk.text.clone()));
-            tobj.insert("start".into(), json!(tk.start));
-            tobj.insert("end".into(), json!(tk.end));
-            tobj.insert("duration".into(), json!(tk.duration));
+            tobj.insert("text".into(), Value::String(tk.text().to_owned()));
+            tobj.insert("start".into(), json!(tk.start()));
+            tobj.insert("end".into(), json!(tk.end()));
+            tobj.insert("duration".into(), json!(tk.duration()));
             Value::Object(tobj)
           })
           .collect();
         obj.insert("tokens".into(), Value::Array(tok_arr));
-        if let Some(sid) = &s.speaker_id {
-          obj.insert("speaker_id".into(), Value::String(sid.clone()));
+        if !s.speaker_id().is_empty() {
+          obj.insert(
+            "speaker_id".into(),
+            Value::String(s.speaker_id().to_owned()),
+          );
         }
         sents_arr.push(Value::Object(obj));
       }
       let mut root = Map::new();
-      root.insert("text".into(), Value::String(text.clone()));
+      root.insert("text".into(), Value::String(p.text().to_owned()));
       root.insert("sentences".into(), Value::Array(sents_arr));
       Value::Object(root)
     }
-    Transcript::Segments { text, segments } => {
+    Transcript::Segments(p) => {
       // python `result = {"text": ..., "segments": []}` then `result["segments"].append(seg)`
       // where each `seg = {text, start, end, duration}` plus optional words
       // / speaker_id (lines 206-218). Mirror the dict-insertion order exactly.
-      let mut segs_arr: Vec<Value> = Vec::with_capacity(segments.len());
-      for s in segments {
+      let mut segs_arr: Vec<Value> = Vec::with_capacity(p.segments().len());
+      for s in p.segments() {
         let mut obj = Map::new();
-        obj.insert("text".into(), Value::String(s.text.clone()));
-        obj.insert("start".into(), json!(s.start));
-        obj.insert("end".into(), json!(s.end));
+        obj.insert("text".into(), Value::String(s.text().to_owned()));
+        obj.insert("start".into(), json!(s.start()));
+        obj.insert("end".into(), json!(s.end()));
         // python `"duration": s["end"] - s["start"]` — computed, NOT carried
         // on `Segment`. Use the same subtract so a Segment with degenerate
         // (end < start) timing produces the python-equivalent negative
         // duration rather than a Rust-side clamp.
-        obj.insert("duration".into(), json!(s.end - s.start));
+        obj.insert("duration".into(), json!(s.end() - s.start()));
         // python `if "words" in s and s["words"]` (stt/generate.py:213): the
         // `words` key is emitted ONLY when the per-segment word list is
-        // truthy (non-empty). An `Option<Vec<Word>>` of `Some(vec![])` is
-        // python-falsy and MUST be dropped from the JSON, matching the
-        // python branch — otherwise downstream tooling that
-        // `"words" in seg` checks would diverge between python + mlxrs.
-        if let Some(words) = &s.words
-          && !words.is_empty()
-        {
-          let words_arr: Vec<Value> = words
+        // truthy (non-empty). An empty Vec is python-falsy and MUST be
+        // dropped from the JSON, matching the python branch — otherwise
+        // downstream tooling that `"words" in seg` checks would diverge
+        // between python + mlxrs.
+        if !s.words_slice().is_empty() {
+          let words_arr: Vec<Value> = s
+            .words_slice()
             .iter()
             .map(|w| {
               // python `seg["words"] = s["words"]` is a pass-through of the
@@ -825,10 +1100,10 @@ fn transcript_to_python_shape(t: &Transcript) -> serde_json::Value {
               // to mirror the most common per-word dict shape; the `extra`
               // map's BTreeMap ordering keeps the JSON deterministic.
               let mut wobj = Map::new();
-              wobj.insert("start".into(), json!(w.start));
-              wobj.insert("end".into(), json!(w.end));
-              wobj.insert("word".into(), Value::String(w.word.clone()));
-              for (k, v) in &w.extra {
+              wobj.insert("start".into(), json!(w.start()));
+              wobj.insert("end".into(), json!(w.end()));
+              wobj.insert("word".into(), Value::String(w.word().to_owned()));
+              for (k, v) in w.extra() {
                 wobj.insert(k.clone(), v.clone());
               }
               Value::Object(wobj)
@@ -836,13 +1111,16 @@ fn transcript_to_python_shape(t: &Transcript) -> serde_json::Value {
             .collect();
           obj.insert("words".into(), Value::Array(words_arr));
         }
-        if let Some(sid) = &s.speaker_id {
-          obj.insert("speaker_id".into(), Value::String(sid.clone()));
+        if !s.speaker_id().is_empty() {
+          obj.insert(
+            "speaker_id".into(),
+            Value::String(s.speaker_id().to_owned()),
+          );
         }
         segs_arr.push(Value::Object(obj));
       }
       let mut root = Map::new();
-      root.insert("text".into(), Value::String(text.clone()));
+      root.insert("text".into(), Value::String(p.text().to_owned()));
       root.insert("segments".into(), Value::Array(segs_arr));
       Value::Object(root)
     }
@@ -916,111 +1194,71 @@ mod tests {
 
   #[test]
   fn get_cues_segments_no_words() {
-    let t = Transcript::Segments {
-      text: "hello world".into(),
-      segments: vec![
-        Segment {
-          start: 0.0,
-          end: 1.0,
-          text: "hello".into(),
-          words: None,
-          speaker_id: None,
-        },
-        Segment {
-          start: 1.0,
-          end: 2.0,
-          text: "world".into(),
-          words: None,
-          speaker_id: None,
-        },
+    let t = Transcript::Segments(SegmentsPayload::new(
+      "hello world",
+      vec![
+        Segment::new(0.0, 1.0, "hello", vec![], ""),
+        Segment::new(1.0, 2.0, "world", vec![], ""),
       ],
-    };
+    ));
     let cues = get_cues(&t);
     assert_eq!(cues.len(), 2);
-    assert_eq!(cues[0].text, "hello");
-    assert_eq!(cues[1].text, "world");
+    assert_eq!(cues[0].text(), "hello");
+    assert_eq!(cues[1].text(), "world");
   }
 
   #[test]
   fn get_cues_segments_with_words() {
     // Python `_get_cues` emits segment-level cue THEN per-word cues.
-    let t = Transcript::Segments {
-      text: "hi there".into(),
-      segments: vec![Segment {
-        start: 0.0,
-        end: 1.0,
-        text: "hi there".into(),
-        words: Some(vec![
-          Word {
-            start: 0.0,
-            end: 0.5,
-            word: "hi".into(),
-            extra: BTreeMap::new(),
-          },
-          Word {
-            start: 0.5,
-            end: 1.0,
-            word: "there".into(),
-            extra: BTreeMap::new(),
-          },
-        ]),
-        speaker_id: None,
-      }],
-    };
+    let t = Transcript::Segments(SegmentsPayload::new(
+      "hi there",
+      vec![Segment::new(
+        0.0,
+        1.0,
+        "hi there",
+        vec![
+          Word::new(0.0, 0.5, "hi", BTreeMap::new()),
+          Word::new(0.5, 1.0, "there", BTreeMap::new()),
+        ],
+        "",
+      )],
+    ));
     let cues = get_cues(&t);
     // 1 segment cue + 2 word cues = 3 total
     assert_eq!(cues.len(), 3);
-    assert_eq!(cues[0].text, "hi there");
-    assert_eq!(cues[1].text, "hi");
-    assert_eq!(cues[2].text, "there");
+    assert_eq!(cues[0].text(), "hi there");
+    assert_eq!(cues[1].text(), "hi");
+    assert_eq!(cues[2].text(), "there");
   }
 
   #[test]
   fn get_cues_sentences_one_per_sentence() {
     // Python sentence branch: one cue per sentence, NO per-token cues.
-    let t = Transcript::Sentences {
-      text: "hi world".into(),
-      sentences: vec![
-        Sentence {
-          text: "hi".into(),
-          start: 0.0,
-          end: 1.0,
-          duration: 1.0,
-          tokens: vec![SentenceToken {
-            text: "h".into(),
-            start: 0.0,
-            end: 0.5,
-            duration: 0.5,
-          }],
-          speaker_id: None,
-        },
-        Sentence {
-          text: "world".into(),
-          start: 1.0,
-          end: 2.0,
-          duration: 1.0,
-          tokens: vec![],
-          speaker_id: None,
-        },
+    let t = Transcript::Sentences(SentencesPayload::new(
+      "hi world",
+      vec![
+        Sentence::new(
+          "hi",
+          0.0,
+          1.0,
+          1.0,
+          vec![SentenceToken::new("h", 0.0, 0.5, 0.5)],
+          "",
+        ),
+        Sentence::new("world", 1.0, 2.0, 1.0, vec![], ""),
       ],
-    };
+    ));
     let cues = get_cues(&t);
     // 2 sentences ⇒ 2 cues (NO per-token cues for the Sentences variant).
     assert_eq!(cues.len(), 2);
-    assert_eq!(cues[0].text, "hi");
-    assert_eq!(cues[1].text, "world");
+    assert_eq!(cues[0].text(), "hi");
+    assert_eq!(cues[1].text(), "world");
   }
 
   #[test]
   fn transcript_text_accessor() {
-    let t1 = Transcript::Segments {
-      text: "alpha".into(),
-      segments: vec![],
-    };
-    let t2 = Transcript::Sentences {
-      text: "beta".into(),
-      sentences: vec![],
-    };
+    let t1 = Transcript::Segments(SegmentsPayload::new("alpha", vec![]));
+    let t2 = Transcript::Sentences(SentencesPayload::new("beta", vec![]));
     assert_eq!(t1.text(), "alpha");
     assert_eq!(t2.text(), "beta");
   }
@@ -1044,32 +1282,14 @@ mod tests {
   /// for the dash-path stdout-writer round-trip — three contiguous Whisper
   /// segments, no per-word alignment.
   fn three_segments_fixture() -> Transcript {
-    Transcript::Segments {
-      text: "hello world foo".into(),
-      segments: vec![
-        Segment {
-          start: 0.0,
-          end: 1.234,
-          text: "hello".into(),
-          words: None,
-          speaker_id: None,
-        },
-        Segment {
-          start: 1.234,
-          end: 2.500,
-          text: "world".into(),
-          words: None,
-          speaker_id: None,
-        },
-        Segment {
-          start: 2.500,
-          end: 4.000,
-          text: "foo".into(),
-          words: None,
-          speaker_id: None,
-        },
+    Transcript::Segments(SegmentsPayload::new(
+      "hello world foo",
+      vec![
+        Segment::new(0.0, 1.234, "hello", vec![], ""),
+        Segment::new(1.234, 2.500, "world", vec![], ""),
+        Segment::new(2.500, 4.000, "foo", vec![], ""),
       ],
-    }
+    ))
   }
 
   // ---------- Finding 2 regression: writer-helper round-trip ----------

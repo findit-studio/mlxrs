@@ -244,10 +244,8 @@ const ONE_SECOND_16K: usize = 16_000;
 fn stt_generate_pipeline_smoke() {
   let path = make_wav("smoke", 16_000, ONE_SECOND_16K);
   let model = MockSttModel::new(5); // ramp → argmax == 4 every step
-  let cfg = SttGenConfig {
-    lm: mlxrs::lm::generate::GenConfig::default().with_max_tokens(3),
-    ..SttGenConfig::default()
-  };
+  let cfg =
+    SttGenConfig::default().with_lm(mlxrs::lm::generate::GenConfig::default().with_max_tokens(3));
   let it = stt_generate(&model, &path, cache(1), cfg).unwrap();
   let toks: Vec<u32> = it.map(|r| r.unwrap().token).collect();
   // `eos == vocab == 5` is never reached (argmax is vocab-1 == 4); the loop
@@ -267,10 +265,8 @@ fn stt_generate_stops_on_eos() {
   let path = make_wav("eos", 16_000, ONE_SECOND_16K);
   let mut model = MockSttModel::new(5);
   model.eos = 4; // argmax is 4 ⇒ first step IS the eos token.
-  let cfg = SttGenConfig {
-    lm: mlxrs::lm::generate::GenConfig::default().with_max_tokens(100),
-    ..SttGenConfig::default()
-  };
+  let cfg =
+    SttGenConfig::default().with_lm(mlxrs::lm::generate::GenConfig::default().with_max_tokens(100));
   let toks: Vec<u32> = stt_generate(&model, &path, cache(1), cfg)
     .unwrap()
     .map(|r| r.unwrap().token)
@@ -291,11 +287,9 @@ fn stt_generate_resamples_when_sr_mismatch() {
   // 44.1 kHz, 1 second of audio.
   let path = make_wav("resample", 44_100, 44_100);
   let model = MockSttModel::new(3);
-  let cfg = SttGenConfig {
-    lm: mlxrs::lm::generate::GenConfig::default().with_max_tokens(1),
-    auto_resample: true,
-    ..SttGenConfig::default()
-  };
+  let cfg = SttGenConfig::default()
+    .with_lm(mlxrs::lm::generate::GenConfig::default().with_max_tokens(1))
+    .with_auto_resample(true);
   let toks: Vec<u32> = stt_generate(&model, &path, cache(1), cfg)
     .unwrap()
     .map(|r| r.unwrap().token)
@@ -325,10 +319,7 @@ fn stt_generate_resamples_when_sr_mismatch() {
 fn stt_generate_rejects_sr_mismatch_when_resample_off() {
   let path = make_wav("no_resample", 44_100, 44_100);
   let model = MockSttModel::new(3);
-  let cfg = SttGenConfig {
-    auto_resample: false,
-    ..SttGenConfig::default()
-  };
+  let cfg = SttGenConfig::default().with_auto_resample(false);
   // SttGenerator is not Debug, so route via ok/err rather than pattern-
   // matching the full Result (which would need Debug on the iterator).
   let err = stt_generate(&model, &path, cache(1), cfg)
@@ -362,10 +353,7 @@ fn stt_generate_rejects_sr_mismatch_when_resample_off() {
 fn stt_generate_rejects_audio_longer_than_max() {
   let path = make_wav("too_long", 16_000, 2 * ONE_SECOND_16K);
   let model = MockSttModel::new(3);
-  let cfg = SttGenConfig {
-    max_audio_seconds: 1.0,
-    ..SttGenConfig::default()
-  };
+  let cfg = SttGenConfig::default().with_max_audio_seconds(1.0);
   let err = stt_generate(&model, &path, cache(1), cfg)
     .err()
     .expect("over-cap audio rejected");
@@ -410,11 +398,9 @@ fn stt_generate_rejects_over_cap_before_resample() {
   // 2 seconds of audio at 44.1 kHz: 88200 samples; target_sr = 16000.
   let path = make_wav("over_cap_pre_resample", 44_100, 2 * 44_100);
   let model = MockSttModel::new(3);
-  let cfg = SttGenConfig {
-    max_audio_seconds: 1.0,
-    auto_resample: true, // resample WOULD run if the cap check came after
-    ..SttGenConfig::default()
-  };
+  let cfg = SttGenConfig::default()
+    .with_max_audio_seconds(1.0)
+    .with_auto_resample(true); // resample WOULD run if the cap check came after
   let err = stt_generate(&model, &path, cache(1), cfg)
     .err()
     .expect("over-cap source rejected pre-resample");
@@ -458,10 +444,7 @@ fn stt_generate_layered_cap_rejects_at_load_stage_for_wav() {
   // target_sr = 16 000 → load_cap = 16 000 < 80 000.
   let path = make_wav("layered_cap_load_stage", 16_000, 5 * ONE_SECOND_16K);
   let model = MockSttModel::new(3);
-  let cfg = SttGenConfig {
-    max_audio_seconds: 1.0,
-    ..SttGenConfig::default()
-  };
+  let cfg = SttGenConfig::default().with_max_audio_seconds(1.0);
   let err = stt_generate(&model, &path, cache(1), cfg)
     .err()
     .expect("layered cap must reject at load stage");
@@ -520,14 +503,9 @@ fn stt_generate_rejects_empty_audio() {
 fn stt_generate_uses_mel_config_override() {
   let path = make_wav("mel_cfg", 16_000, ONE_SECOND_16K);
   let mut model = MockSttModel::new(3);
-  model.mel_cfg = MelConfig {
-    n_mels: 128,
-    ..MelConfig::whisper_default()
-  };
-  let cfg = SttGenConfig {
-    lm: mlxrs::lm::generate::GenConfig::default().with_max_tokens(1),
-    ..SttGenConfig::default()
-  };
+  model.mel_cfg = MelConfig::whisper_default().with_n_mels(128);
+  let cfg =
+    SttGenConfig::default().with_lm(mlxrs::lm::generate::GenConfig::default().with_max_tokens(1));
   let _ = stt_generate(&model, &path, cache(1), cfg)
     .unwrap()
     .map(|r| r.unwrap().token)
@@ -553,9 +531,8 @@ fn stt_generate_threads_mel_config_log_floor() {
   // HIGHER, so its mel min is strictly greater than the Whisper floor's.
   let path = make_wav("log_floor", 16_000, ONE_SECOND_16K);
 
-  let cfg = || SttGenConfig {
-    lm: mlxrs::lm::generate::GenConfig::default().with_max_tokens(1),
-    ..SttGenConfig::default()
+  let cfg = || {
+    SttGenConfig::default().with_lm(mlxrs::lm::generate::GenConfig::default().with_max_tokens(1))
   };
 
   let whisper_model = MockSttModel::new(3); // whisper_default ⇒ LogFloor::Whisper
@@ -569,10 +546,8 @@ fn stt_generate_threads_mel_config_log_floor() {
     .expect("whisper mel min recorded");
 
   let mut kaldi_model = MockSttModel::new(3);
-  kaldi_model.mel_cfg = MelConfig {
-    log_floor: mlxrs::audio::dsp::LogFloor::Kaldi,
-    ..MelConfig::whisper_default()
-  };
+  kaldi_model.mel_cfg =
+    MelConfig::whisper_default().with_log_floor(mlxrs::audio::dsp::LogFloor::Kaldi);
   let _ = stt_generate(&kaldi_model, &path, cache(1), cfg())
     .unwrap()
     .map(|r| r.unwrap().token)
@@ -625,10 +600,8 @@ fn encode_audio_file_smoke() {
 fn decode_step_default_errors_with_clear_message() {
   let path = make_wav("default_decode", 16_000, ONE_SECOND_16K);
   let model = DefaultDecodeModel;
-  let cfg = SttGenConfig {
-    lm: mlxrs::lm::generate::GenConfig::default().with_max_tokens(5),
-    ..SttGenConfig::default()
-  };
+  let cfg =
+    SttGenConfig::default().with_lm(mlxrs::lm::generate::GenConfig::default().with_max_tokens(5));
   let mut it = stt_generate(&model, &path, cache(1), cfg).unwrap();
   match it.next().expect("an item") {
     Err(mlxrs::Error::Backend { message }) => {
@@ -672,10 +645,8 @@ fn stt_generate_rejects_bad_decode_step_shape() {
 fn stt_generate_decode_step_error_fuses() {
   let path = make_wav("decode_fail", 16_000, ONE_SECOND_16K);
   let model = FailDecodeModel;
-  let cfg = SttGenConfig {
-    lm: mlxrs::lm::generate::GenConfig::default().with_max_tokens(5),
-    ..SttGenConfig::default()
-  };
+  let cfg =
+    SttGenConfig::default().with_lm(mlxrs::lm::generate::GenConfig::default().with_max_tokens(5));
   let mut it = stt_generate(&model, &path, cache(1), cfg).unwrap();
   let first = it.next().expect("an item");
   assert!(first.is_err(), "decode_step error yielded as Err");
@@ -693,13 +664,13 @@ fn stt_generate_decode_step_error_fuses() {
 #[test]
 fn mel_config_whisper_default_values() {
   let m = MelConfig::whisper_default();
-  assert_eq!(m.n_fft, 400);
-  assert_eq!(m.hop_length, 160);
-  assert!(m.win_length.is_none());
-  assert_eq!(m.n_mels, 80);
-  assert_eq!(m.sample_rate, 16_000);
-  assert_eq!(m.f_min, 0.0);
-  assert!(m.f_max.is_none());
+  assert_eq!(m.n_fft(), 400);
+  assert_eq!(m.hop_length(), 160);
+  assert!(m.win_length().is_none());
+  assert_eq!(m.n_mels(), 80);
+  assert_eq!(m.sample_rate(), 16_000);
+  assert_eq!(m.f_min(), 0.0);
+  assert!(m.f_max().is_none());
 }
 
 /// `max_tokens == 0`: the iterator is empty (no decode_step calls).
@@ -707,10 +678,8 @@ fn mel_config_whisper_default_values() {
 fn stt_generate_zero_max_tokens_is_empty() {
   let path = make_wav("zero_max", 16_000, ONE_SECOND_16K);
   let model = MockSttModel::new(3);
-  let cfg = SttGenConfig {
-    lm: mlxrs::lm::generate::GenConfig::default().with_max_tokens(0),
-    ..SttGenConfig::default()
-  };
+  let cfg =
+    SttGenConfig::default().with_lm(mlxrs::lm::generate::GenConfig::default().with_max_tokens(0));
   let n = stt_generate(&model, &path, cache(1), cfg).unwrap().count();
   assert_eq!(n, 0);
   assert_eq!(*model.decode_calls.borrow(), 0);
@@ -722,8 +691,11 @@ fn stt_generate_zero_max_tokens_is_empty() {
 #[test]
 fn stt_gen_config_defaults_are_whisper_shape() {
   let c = SttGenConfig::default();
-  assert!((c.max_audio_seconds - 30.0).abs() < 1e-6, "30s whisper cap");
-  assert!(c.auto_resample, "auto_resample default = true");
+  assert!(
+    (c.max_audio_seconds() - 30.0).abs() < 1e-6,
+    "30s whisper cap"
+  );
+  assert!(c.auto_resample(), "auto_resample default = true");
 }
 
 /// Regression — Codex P7 R1 HIGH: the STT load cap must be derived from
@@ -746,11 +718,10 @@ fn audio_path_to_mel_accepts_44_1k_wav_with_16k_model_resample() {
   // fix `load_cap = 16 000 < 44 100`, so the header would reject).
   let path = make_wav("p7_r1_44k_16k_resample", 44_100, 44_100);
   let model = MockSttModel::new(3);
-  let cfg = SttGenConfig {
-    lm: mlxrs::lm::generate::GenConfig::default().with_max_tokens(1),
-    auto_resample: true,
-    max_audio_seconds: 1.0,
-  };
+  let cfg = SttGenConfig::default()
+    .with_lm(mlxrs::lm::generate::GenConfig::default().with_max_tokens(1))
+    .with_auto_resample(true)
+    .with_max_audio_seconds(1.0);
 
   // Drive via `encode_audio_file` (the public proxy for
   // `audio_path_to_mel` — same load + resample + log-mel chain, minus

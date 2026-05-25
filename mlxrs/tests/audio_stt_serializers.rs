@@ -11,8 +11,8 @@
 use std::{collections::BTreeMap, fs, path::PathBuf, process};
 
 use mlxrs::audio::stt::serializers::{
-  Segment, Sentence, SentenceToken, Transcript, Word, save_as_json, save_as_srt, save_as_txt,
-  save_as_vtt,
+  Segment, SegmentsPayload, Sentence, SentenceToken, SentencesPayload, Transcript, Word,
+  save_as_json, save_as_srt, save_as_txt, save_as_vtt,
 };
 
 /// Process-scoped + named tempfile so parallel test binaries / cases never
@@ -31,32 +31,14 @@ fn temp_base(name: &str) -> PathBuf {
 /// no word-level alignment, no speaker_id. Hand-traced timestamps so the
 /// SRT/VTT/TXT byte-exact asserts are unambiguous.
 fn fixture_3_segments() -> Transcript {
-  Transcript::Segments {
-    text: "hello world foo".into(),
-    segments: vec![
-      Segment {
-        start: 0.0,
-        end: 1.234,
-        text: "hello".into(),
-        words: None,
-        speaker_id: None,
-      },
-      Segment {
-        start: 1.234,
-        end: 2.500,
-        text: "world".into(),
-        words: None,
-        speaker_id: None,
-      },
-      Segment {
-        start: 2.500,
-        end: 4.000,
-        text: "foo".into(),
-        words: None,
-        speaker_id: None,
-      },
+  Transcript::Segments(SegmentsPayload::new(
+    "hello world foo",
+    vec![
+      Segment::new(0.0, 1.234, "hello", vec![], ""),
+      Segment::new(1.234, 2.500, "world", vec![], ""),
+      Segment::new(2.500, 4.000, "foo", vec![], ""),
     ],
-  }
+  ))
 }
 
 #[test]
@@ -170,22 +152,17 @@ fn save_as_json_sentence_shape_includes_tokens() {
   //                                  "tokens": [{"text", "start", "end", "duration"}, ...],
   //                                  [optional "speaker_id"]}, ...]}`.
   let base = temp_base("json_sentence");
-  let t = Transcript::Sentences {
-    text: "hi".into(),
-    sentences: vec![Sentence {
-      text: "hi".into(),
-      start: 0.0,
-      end: 0.5,
-      duration: 0.5,
-      tokens: vec![SentenceToken {
-        text: "h".into(),
-        start: 0.0,
-        end: 0.25,
-        duration: 0.25,
-      }],
-      speaker_id: Some("spk_0".into()),
-    }],
-  };
+  let t = Transcript::Sentences(SentencesPayload::new(
+    "hi",
+    vec![Sentence::new(
+      "hi",
+      0.0,
+      0.5,
+      0.5,
+      vec![SentenceToken::new("h", 0.0, 0.25, 0.25)],
+      "spk_0",
+    )],
+  ));
   save_as_json(&t, &base).unwrap();
   let json_path = base.with_file_name(format!(
     "{}.json",
@@ -209,21 +186,16 @@ fn save_as_json_segments_with_words_emits_words_array() {
   // word-level alignment. mlxrs writes `{start, end, word}` per word; we
   // assert the JSON contains the words array exactly.
   let base = temp_base("json_words");
-  let t = Transcript::Segments {
-    text: "hi".into(),
-    segments: vec![Segment {
-      start: 0.0,
-      end: 1.0,
-      text: "hi".into(),
-      words: Some(vec![Word {
-        start: 0.0,
-        end: 0.5,
-        word: "hi".into(),
-        extra: BTreeMap::new(),
-      }]),
-      speaker_id: None,
-    }],
-  };
+  let t = Transcript::Segments(SegmentsPayload::new(
+    "hi",
+    vec![Segment::new(
+      0.0,
+      1.0,
+      "hi",
+      vec![Word::new(0.0, 0.5, "hi", BTreeMap::new())],
+      "",
+    )],
+  ));
   save_as_json(&t, &base).unwrap();
   let json_path = base.with_file_name(format!(
     "{}.json",
@@ -247,29 +219,19 @@ fn save_as_srt_emits_per_word_cues_when_words_present() {
   // mlxrs preserves that exactly. Verifies the segment-level cue comes
   // BEFORE the word-level cues (and indices are 1-based and contiguous).
   let base = temp_base("srt_with_words");
-  let t = Transcript::Segments {
-    text: "hi".into(),
-    segments: vec![Segment {
-      start: 0.0,
-      end: 1.0,
-      text: "hi there".into(),
-      words: Some(vec![
-        Word {
-          start: 0.0,
-          end: 0.5,
-          word: "hi".into(),
-          extra: BTreeMap::new(),
-        },
-        Word {
-          start: 0.5,
-          end: 1.0,
-          word: "there".into(),
-          extra: BTreeMap::new(),
-        },
-      ]),
-      speaker_id: None,
-    }],
-  };
+  let t = Transcript::Segments(SegmentsPayload::new(
+    "hi",
+    vec![Segment::new(
+      0.0,
+      1.0,
+      "hi there",
+      vec![
+        Word::new(0.0, 0.5, "hi", BTreeMap::new()),
+        Word::new(0.5, 1.0, "there", BTreeMap::new()),
+      ],
+      "",
+    )],
+  ));
   save_as_srt(&t, &base).unwrap();
   let srt_path = base.with_file_name(format!(
     "{}.srt",
@@ -289,10 +251,7 @@ fn save_as_txt_appends_extension_does_not_replace() {
   // convention (append, not replace). `out.draft` becomes `out.draft.txt`,
   // NOT `out.txt`.
   let base = temp_base("ext_append.draft");
-  let t = Transcript::Segments {
-    text: "x".into(),
-    segments: vec![],
-  };
+  let t = Transcript::Segments(SegmentsPayload::new("x", vec![]));
   save_as_txt(&t, &base).unwrap();
   let appended = base.with_file_name(format!(
     "{}.txt",
@@ -312,18 +271,18 @@ fn save_as_json_omits_empty_words_field() {
   // in the JSON — downstream tooling that `"words" in seg` checks would
   // diverge from the python reference otherwise.
   let base = temp_base("json_empty_words_omitted");
-  let t = Transcript::Segments {
-    text: "hi".into(),
-    segments: vec![Segment {
-      start: 0.0,
-      end: 1.0,
-      text: "hi".into(),
-      // The defect-trigger: `Some(empty)` — would have emitted `"words":
-      // []` in the pre-fix port; python omits the key entirely.
-      words: Some(vec![]),
-      speaker_id: None,
-    }],
-  };
+  let t = Transcript::Segments(SegmentsPayload::new(
+    "hi",
+    vec![Segment::new(
+      0.0,
+      1.0,
+      "hi",
+      // The defect-trigger: empty Vec — must NOT produce `"words": []` in
+      // JSON; python omits the key entirely (truthy check).
+      vec![],
+      "",
+    )],
+  ));
   save_as_json(&t, &base).unwrap();
   let json_path = base.with_file_name(format!(
     "{}.json",
@@ -358,21 +317,16 @@ fn save_as_json_emits_words_when_non_empty() {
   // Regression-guard the happy path: a non-empty `Some(vec![Word])` MUST
   // still emit the `"words"` array (so the fix only drops the empty case).
   let base = temp_base("json_words_present_when_nonempty");
-  let t = Transcript::Segments {
-    text: "hi".into(),
-    segments: vec![Segment {
-      start: 0.0,
-      end: 1.0,
-      text: "hi".into(),
-      words: Some(vec![Word {
-        start: 0.0,
-        end: 1.0,
-        word: "hi".into(),
-        extra: BTreeMap::new(),
-      }]),
-      speaker_id: None,
-    }],
-  };
+  let t = Transcript::Segments(SegmentsPayload::new(
+    "hi",
+    vec![Segment::new(
+      0.0,
+      1.0,
+      "hi",
+      vec![Word::new(0.0, 1.0, "hi", BTreeMap::new())],
+      "",
+    )],
+  ));
   save_as_json(&t, &base).unwrap();
   let json_path = base.with_file_name(format!(
     "{}.json",
@@ -400,32 +354,14 @@ fn save_as_json_emits_words_when_non_empty() {
 /// Stdout-passthrough fixture used by all four `save_as_*_writes_to_stdout`
 /// regression tests below.
 fn dash_path_fixture() -> Transcript {
-  Transcript::Segments {
-    text: "hello world foo".into(),
-    segments: vec![
-      Segment {
-        start: 0.0,
-        end: 1.234,
-        text: "hello".into(),
-        words: None,
-        speaker_id: None,
-      },
-      Segment {
-        start: 1.234,
-        end: 2.500,
-        text: "world".into(),
-        words: None,
-        speaker_id: None,
-      },
-      Segment {
-        start: 2.500,
-        end: 4.000,
-        text: "foo".into(),
-        words: None,
-        speaker_id: None,
-      },
+  Transcript::Segments(SegmentsPayload::new(
+    "hello world foo",
+    vec![
+      Segment::new(0.0, 1.234, "hello", vec![], ""),
+      Segment::new(1.234, 2.500, "world", vec![], ""),
+      Segment::new(2.500, 4.000, "foo", vec![], ""),
     ],
-  }
+  ))
 }
 
 /// Assert that calling `save_as_*` with `Path::new("-")` did NOT create a

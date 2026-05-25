@@ -112,17 +112,15 @@ impl StreamingTokenizer for MockTokenizer {
 fn promote_immediate_config(window_size_frames: usize) -> StreamingConfig {
   // Force decode every feed + immediate promote so the integration
   // tests don't need wall-clock waits.
-  StreamingConfig {
-    decode_interval_seconds: 0.0,
-    boundary_decode_interval_seconds: 0.0,
-    boundary_boost_seconds: 0.0,
-    max_cached_windows: window_size_frames.max(1),
-    finalize_completed_windows: false,
-    min_agreement_passes: 1,
-    boundary_min_agreement_passes: 1,
-    delay_preset: DelayPreset::Custom(0),
-    ..StreamingConfig::default()
-  }
+  StreamingConfig::default()
+    .with_decode_interval_seconds(0.0)
+    .with_boundary_decode_interval_seconds(0.0)
+    .with_boundary_boost_seconds(0.0)
+    .with_max_cached_windows(window_size_frames.max(1))
+    .with_finalize_completed_windows(false)
+    .with_min_agreement_passes(1)
+    .with_boundary_min_agreement_passes(1)
+    .with_delay_preset(DelayPreset::Custom(0))
 }
 
 fn zero_mel(rows: usize, n_mels: usize) -> Array {
@@ -208,7 +206,7 @@ fn streaming_session_round_trip_emits_lifecycle_events() {
 
   let stop_events = session.stop().unwrap();
   assert!(
-    matches!(stop_events.last(), Some(TranscriptionEvent::Ended { .. })),
+    matches!(stop_events.last(), Some(TranscriptionEvent::Ended(_))),
     "stop must emit Ended last, got {stop_events:?}"
   );
   assert!(!session.is_active());
@@ -271,7 +269,7 @@ fn streaming_session_stop_without_feed_emits_only_ended_event() {
 
   let events = session.stop().unwrap();
   assert!(
-    matches!(events.last(), Some(TranscriptionEvent::Ended { .. })),
+    matches!(events.last(), Some(TranscriptionEvent::Ended(_))),
     "stop must always end with Ended event, got {events:?}"
   );
 }
