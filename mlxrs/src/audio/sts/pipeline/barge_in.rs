@@ -59,15 +59,18 @@ pub trait BargeInDetector {
 /// `_handle_speech_started` runs implicitly via the Silero VAD's
 /// frame-probability output).
 ///
-/// `energy_threshold` is the absolute RMS amplitude in `[0, 1]`;
+/// The RMS amplitude threshold is in `[0, 1]`;
 /// mlx-audio uses no explicit number (the gate is upstream of the
 /// detector, in the VAD), so the default of `0.02` is a reasonable
 /// "audible speech" floor — quiet room noise rarely crosses it, and
 /// any voiced phone reliably does.
+///
+/// Construct via [`EnergyBargeInDetector::new`] or
+/// [`Default::default`]; tune via [`EnergyBargeInDetector::with_energy_threshold`].
 #[derive(Debug, Clone, Copy)]
 pub struct EnergyBargeInDetector {
   /// RMS amplitude threshold in `[0, 1]`. Default `0.02` ≈ −34 dBFS.
-  pub energy_threshold: f32,
+  energy_threshold: f32,
 }
 
 impl Default for EnergyBargeInDetector {
@@ -82,7 +85,20 @@ impl EnergyBargeInDetector {
   /// Build a detector with an explicit RMS amplitude threshold (in
   /// `[0, 1]`; clamped to `>= 0` by the detect-time check).
   #[must_use]
-  pub fn new(energy_threshold: f32) -> Self {
+  pub const fn new(energy_threshold: f32) -> Self {
+    Self { energy_threshold }
+  }
+
+  /// The configured RMS amplitude threshold.
+  #[inline(always)]
+  #[must_use]
+  pub const fn energy_threshold(&self) -> f32 {
+    self.energy_threshold
+  }
+
+  /// Return a copy with a different RMS amplitude threshold.
+  #[must_use]
+  pub fn with_energy_threshold(self, energy_threshold: f32) -> Self {
     Self { energy_threshold }
   }
 
@@ -90,6 +106,7 @@ impl EnergyBargeInDetector {
   /// on an empty slice (matches mlx-audio's
   /// `AudioRecorderManager`-style `sqrt(sum(x^2) / max(N, 1))`
   /// guard).
+  #[must_use]
   pub fn rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
       return 0.0;

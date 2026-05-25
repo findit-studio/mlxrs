@@ -27,6 +27,8 @@
 //! [vp-cfg]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/voice_pipeline.py#L25-L89
 //! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 
+use derive_more::Display;
+
 /// Latency-vs-quality profile preset — typed analogue of mlx-audio's
 /// `latency_profile: str` ("fast" / "balanced" / "quality").
 ///
@@ -36,7 +38,8 @@
 ///
 /// Defaults to [`LatencyProfile::Balanced`] — same as mlx-audio's
 /// dataclass default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Display)]
+#[display("{}", self.as_str())]
 pub enum LatencyProfile {
   /// Lowest end-to-end latency at the cost of partial-transcript
   /// stability — mlx-audio's `"fast"` profile (`240ms`
@@ -54,6 +57,40 @@ pub enum LatencyProfile {
 }
 
 impl LatencyProfile {
+  /// The lowercase snake-case string label for this profile —
+  /// `"low_latency"` / `"balanced"` / `"high_quality"`.
+  ///
+  /// Matches mlx-audio's `latency_profile: str` values after the
+  /// Rust-to-Python name mapping.
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      LatencyProfile::Fast => "low_latency",
+      LatencyProfile::Balanced => "balanced",
+      LatencyProfile::Quality => "high_quality",
+    }
+  }
+
+  /// Whether this is the [`LatencyProfile::Fast`] variant.
+  #[inline(always)]
+  #[must_use]
+  pub fn is_fast(self) -> bool {
+    matches!(self, LatencyProfile::Fast)
+  }
+
+  /// Whether this is the [`LatencyProfile::Balanced`] variant.
+  #[inline(always)]
+  #[must_use]
+  pub fn is_balanced(self) -> bool {
+    matches!(self, LatencyProfile::Balanced)
+  }
+
+  /// Whether this is the [`LatencyProfile::Quality`] variant.
+  #[inline(always)]
+  #[must_use]
+  pub fn is_quality(self) -> bool {
+    matches!(self, LatencyProfile::Quality)
+  }
+
   /// The `stt_transcription_delay_ms` default this profile contributes
   /// when the explicit field is `None`. Matches
   /// `voice_pipeline.py:78-83`'s `{"fast": 240, "balanced": 480,
@@ -93,6 +130,10 @@ impl LatencyProfile {
 /// `Option<…>` so the caller can leave them unset and have
 /// [`VoicePipelineConfig::resolved`] fill the profile-driven default.
 ///
+/// Construct via [`VoicePipelineConfig::new`] (= [`Default::default`])
+/// and tune via the `with_*` builder methods (each returns `Self`
+/// and is `#[must_use]`).
+///
 /// Per [no per-model arch porting][noarch] the per-model name strings
 /// (`stt_model` / `vad_model` / `turn_model` / `response_model` /
 /// `tts_model`) carry the upstream repo / path string verbatim; the
@@ -110,109 +151,109 @@ impl LatencyProfile {
 #[derive(Debug, Clone)]
 pub struct VoicePipelineConfig {
   /// Mic capture sample rate (Hz). mlx-audio default `16_000`.
-  pub input_sample_rate: u32,
+  input_sample_rate: u32,
   /// Audio-output sample rate (Hz). `None` ⇒ inherit the TTS model's
   /// [`crate::audio::tts::model::TtsModel::sample_rate`] at runtime,
   /// matching mlx-audio's `output_sample_rate: Optional[int] = None`
   /// default.
-  pub output_sample_rate: Option<u32>,
+  output_sample_rate: Option<u32>,
   /// Mic capture channel count. mlx-audio default `1` (mono).
-  pub input_channels: u16,
+  input_channels: u16,
   /// Mic frame duration in ms — the granularity at which input
   /// samples are pushed into the pipeline. mlx-audio default `32`.
-  pub frame_duration_ms: u32,
+  frame_duration_ms: u32,
   /// Latency-vs-quality profile — typed analogue of mlx-audio's
   /// `latency_profile: str`. Default [`LatencyProfile::Balanced`].
-  pub latency_profile: LatencyProfile,
+  latency_profile: LatencyProfile,
 
   // === STT ===
   /// STT model repo / path. mlx-audio default
   /// `"mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit"`.
-  pub stt_model: String,
+  stt_model: String,
   /// STT streaming transcription delay in ms. `None` ⇒ derived from
   /// [`LatencyProfile::default_transcription_delay_ms`].
-  pub stt_transcription_delay_ms: Option<u32>,
+  stt_transcription_delay_ms: Option<u32>,
   /// Maximum decode tokens per streaming step. mlx-audio default `6`.
-  pub stt_max_decode_tokens_per_step: u32,
+  stt_max_decode_tokens_per_step: u32,
   /// Maximum decode tokens per user turn. mlx-audio default `256`.
-  pub stt_max_turn_tokens: u32,
+  stt_max_turn_tokens: u32,
   /// Bounded finalization steps after endpointing. mlx-audio default
   /// `96`.
-  pub stt_finalization_max_steps: u32,
+  stt_finalization_max_steps: u32,
 
   // === VAD ===
   /// VAD model repo / path. mlx-audio default
   /// `"mlx-community/silero-vad"`.
-  pub vad_model: String,
+  vad_model: String,
   /// VAD start-of-speech probability threshold. mlx-audio default `0.35`.
-  pub vad_start_threshold: f32,
+  vad_start_threshold: f32,
   /// VAD continue-speech probability threshold (hysteresis). mlx-audio
   /// default `0.2`.
-  pub vad_stop_threshold: f32,
+  vad_stop_threshold: f32,
   /// Consecutive speech frames needed to confirm start-of-speech.
   /// mlx-audio default `1`.
-  pub vad_start_frames: u32,
+  vad_start_frames: u32,
   /// Silence duration that triggers turn-end consideration (ms).
   /// mlx-audio default `600`.
-  pub vad_end_silence_ms: u32,
+  vad_end_silence_ms: u32,
   /// Maximum single-turn duration (seconds). mlx-audio default `30.0`.
-  pub vad_max_turn_seconds: f32,
+  vad_max_turn_seconds: f32,
   /// Pre-roll buffer (ms) preserved at start-of-speech so the
   /// transcriber sees a small leading context. mlx-audio default
   /// `250`.
-  pub preroll_ms: u32,
+  preroll_ms: u32,
 
   // === Turn-taking ===
   /// Turn-end model repo / path. mlx-audio default
   /// `"mlx-community/smart-turn-v3"`.
-  pub turn_model: String,
+  turn_model: String,
   /// Smart-turn endpoint probability threshold. mlx-audio default `0.5`.
-  pub turn_threshold: f32,
+  turn_threshold: f32,
   /// Max silence (ms) we wait before force-finalizing when the
   /// endpoint model keeps reporting "incomplete". mlx-audio default
   /// `1600`.
-  pub turn_max_incomplete_silence_ms: u32,
+  turn_max_incomplete_silence_ms: u32,
 
   // === LLM response engine ===
   /// LLM model repo / path. mlx-audio default
   /// `"mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-4bit"`.
-  pub response_model: String,
+  response_model: String,
   /// System prompt for the LLM. mlx-audio default carries the
   /// voice-assistant persona prompt.
-  pub system_prompt: String,
+  system_prompt: String,
 
   // === TTS ===
   /// TTS model repo / path. mlx-audio default `"mlx-community/pocket-tts"`.
-  pub tts_model: String,
+  tts_model: String,
   /// TTS voice name. mlx-audio default `"cosette"`.
-  pub tts_voice: String,
+  tts_voice: String,
   /// TTS streaming chunk interval (seconds). `None` ⇒ derived from
   /// [`LatencyProfile::default_tts_streaming_interval`].
-  pub tts_streaming_interval: Option<f32>,
+  tts_streaming_interval: Option<f32>,
   /// TTS sampling temperature. `None` ⇒ model default.
-  pub tts_temperature: Option<f32>,
+  tts_temperature: Option<f32>,
 
   // === Barge-in + echo ===
   /// Whether to honor user barge-in during TTS playback. mlx-audio
   /// default `true`.
-  pub barge_in: bool,
+  barge_in: bool,
   /// Minimum user-speech duration (ms) required to confirm a
   /// barge-in candidate as real (not echo). mlx-audio default `180`.
-  pub min_barge_in_ms: u32,
+  min_barge_in_ms: u32,
   /// Playback-echo window after recent output callbacks (ms).
   /// mlx-audio default `450`.
-  pub ignore_playback_echo_ms: u32,
+  ignore_playback_echo_ms: u32,
   /// Minimum expected acoustic echo delay (ms). mlx-audio default
   /// `250`.
-  pub echo_delay_min_ms: u32,
+  echo_delay_min_ms: u32,
   /// Maximum expected acoustic echo delay (ms). mlx-audio default
   /// `500`.
-  pub echo_delay_max_ms: u32,
+  echo_delay_max_ms: u32,
   /// Echo-correlation step granularity (ms). mlx-audio default `32`.
-  pub echo_correlation_step_ms: u32,
+  echo_correlation_step_ms: u32,
   /// Minimum partial-transcript characters needed to confirm a
   /// barge-in candidate. mlx-audio default `2`.
-  pub barge_in_min_transcript_chars: u32,
+  barge_in_min_transcript_chars: u32,
 
   // === Output / runtime ===
   /// Whether to play TTS output through an audio device. mlx-audio
@@ -221,65 +262,24 @@ pub struct VoicePipelineConfig {
   /// `play_audio=False`).
   ///
   /// [`VoicePipeline::run`]: super::voice_pipeline::VoicePipeline::run
-  pub play_audio: bool,
+  play_audio: bool,
   /// Audio-queue capacity (slots). mlx-audio default `128`.
-  pub queue_size: usize,
+  queue_size: usize,
   /// Verbose structured-event logging. mlx-audio default `false`.
   /// mlxrs honors the flag but emits via the `log` crate rather than
   /// stdout (no global logger setup performed).
-  pub verbose: bool,
+  verbose: bool,
 }
 
 impl VoicePipelineConfig {
-  /// Resolve every `Option<…>` field — replace `None`s with the
-  /// `latency_profile` default — and return the value-copy with
-  /// every knob materialized.
-  ///
-  /// Mirrors mlx-audio's `__post_init__`
-  /// ([`voice_pipeline.py:75-89`][vp-cfg]) but as an explicit
-  /// fold-method rather than a constructor side-effect: a caller
-  /// who wants the raw `Option<u32>` knob preserved can hold the
-  /// original; a caller who needs the resolved profile-default
-  /// value calls [`Self::resolved_transcription_delay_ms`] /
-  /// [`Self::resolved_tts_streaming_interval`] without rebuilding
-  /// the whole struct.
-  ///
-  /// [vp-cfg]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/voice_pipeline.py#L75-L89
-  #[must_use]
-  pub fn resolved(mut self) -> Self {
-    if self.stt_transcription_delay_ms.is_none() {
-      self.stt_transcription_delay_ms = Some(self.latency_profile.default_transcription_delay_ms());
-    }
-    if self.tts_streaming_interval.is_none() {
-      self.tts_streaming_interval = Some(self.latency_profile.default_tts_streaming_interval());
-    }
-    self
-  }
-
-  /// The effective STT transcription delay (ms) — explicit field if
-  /// set, else the [`LatencyProfile`] default.
-  pub fn resolved_transcription_delay_ms(&self) -> u32 {
-    self
-      .stt_transcription_delay_ms
-      .unwrap_or_else(|| self.latency_profile.default_transcription_delay_ms())
-  }
-
-  /// The effective TTS streaming interval (seconds) — explicit field
-  /// if set, else the [`LatencyProfile`] default.
-  pub fn resolved_tts_streaming_interval(&self) -> f32 {
-    self
-      .tts_streaming_interval
-      .unwrap_or_else(|| self.latency_profile.default_tts_streaming_interval())
-  }
-}
-
-impl Default for VoicePipelineConfig {
-  /// The mlx-audio dataclass-default config
-  /// ([`voice_pipeline.py:26-89`][vp-cfg]). Every value matches the
-  /// upstream default verbatim.
+  /// Construct a config with all mlx-audio dataclass defaults
+  /// ([`voice_pipeline.py:26-89`][vp-cfg]). Identical to
+  /// [`Default::default`]; provided as an explicit constructor so
+  /// callers can write `VoicePipelineConfig::new().with_*(…)` chains.
   ///
   /// [vp-cfg]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/voice_pipeline.py#L25-L89
-  fn default() -> Self {
+  #[must_use]
+  pub fn new() -> Self {
     Self {
       input_sample_rate: 16_000,
       output_sample_rate: None,
@@ -328,6 +328,573 @@ impl Default for VoicePipelineConfig {
       verbose: false,
     }
   }
+
+  // ── Accessors ────────────────────────────────────────────────────────
+
+  /// Mic capture sample rate (Hz).
+  #[inline(always)]
+  #[must_use]
+  pub fn input_sample_rate(&self) -> u32 {
+    self.input_sample_rate
+  }
+
+  /// Audio-output sample rate override (Hz), or `None` to inherit from
+  /// the TTS model at runtime.
+  #[inline(always)]
+  #[must_use]
+  pub fn output_sample_rate(&self) -> Option<u32> {
+    self.output_sample_rate
+  }
+
+  /// Mic capture channel count.
+  #[inline(always)]
+  #[must_use]
+  pub fn input_channels(&self) -> u16 {
+    self.input_channels
+  }
+
+  /// Mic frame duration (ms).
+  #[inline(always)]
+  #[must_use]
+  pub fn frame_duration_ms(&self) -> u32 {
+    self.frame_duration_ms
+  }
+
+  /// Latency-vs-quality profile preset.
+  #[inline(always)]
+  #[must_use]
+  pub fn latency_profile(&self) -> LatencyProfile {
+    self.latency_profile
+  }
+
+  /// STT model repo / path.
+  #[inline(always)]
+  #[must_use]
+  pub fn stt_model(&self) -> &str {
+    &self.stt_model
+  }
+
+  /// STT streaming transcription delay override (ms), or `None`.
+  #[inline(always)]
+  #[must_use]
+  pub fn stt_transcription_delay_ms(&self) -> Option<u32> {
+    self.stt_transcription_delay_ms
+  }
+
+  /// Maximum decode tokens per streaming step.
+  #[inline(always)]
+  #[must_use]
+  pub fn stt_max_decode_tokens_per_step(&self) -> u32 {
+    self.stt_max_decode_tokens_per_step
+  }
+
+  /// Maximum decode tokens per user turn.
+  #[inline(always)]
+  #[must_use]
+  pub fn stt_max_turn_tokens(&self) -> u32 {
+    self.stt_max_turn_tokens
+  }
+
+  /// Bounded finalization steps after endpointing.
+  #[inline(always)]
+  #[must_use]
+  pub fn stt_finalization_max_steps(&self) -> u32 {
+    self.stt_finalization_max_steps
+  }
+
+  /// VAD model repo / path.
+  #[inline(always)]
+  #[must_use]
+  pub fn vad_model(&self) -> &str {
+    &self.vad_model
+  }
+
+  /// VAD start-of-speech probability threshold.
+  #[inline(always)]
+  #[must_use]
+  pub fn vad_start_threshold(&self) -> f32 {
+    self.vad_start_threshold
+  }
+
+  /// VAD continue-speech probability threshold (hysteresis).
+  #[inline(always)]
+  #[must_use]
+  pub fn vad_stop_threshold(&self) -> f32 {
+    self.vad_stop_threshold
+  }
+
+  /// Consecutive speech frames needed to confirm start-of-speech.
+  #[inline(always)]
+  #[must_use]
+  pub fn vad_start_frames(&self) -> u32 {
+    self.vad_start_frames
+  }
+
+  /// Silence duration that triggers turn-end consideration (ms).
+  #[inline(always)]
+  #[must_use]
+  pub fn vad_end_silence_ms(&self) -> u32 {
+    self.vad_end_silence_ms
+  }
+
+  /// Maximum single-turn duration (seconds).
+  #[inline(always)]
+  #[must_use]
+  pub fn vad_max_turn_seconds(&self) -> f32 {
+    self.vad_max_turn_seconds
+  }
+
+  /// Pre-roll buffer (ms) preserved at start-of-speech.
+  #[inline(always)]
+  #[must_use]
+  pub fn preroll_ms(&self) -> u32 {
+    self.preroll_ms
+  }
+
+  /// Turn-end model repo / path.
+  #[inline(always)]
+  #[must_use]
+  pub fn turn_model(&self) -> &str {
+    &self.turn_model
+  }
+
+  /// Smart-turn endpoint probability threshold.
+  #[inline(always)]
+  #[must_use]
+  pub fn turn_threshold(&self) -> f32 {
+    self.turn_threshold
+  }
+
+  /// Max silence (ms) before force-finalizing an incomplete turn.
+  #[inline(always)]
+  #[must_use]
+  pub fn turn_max_incomplete_silence_ms(&self) -> u32 {
+    self.turn_max_incomplete_silence_ms
+  }
+
+  /// LLM model repo / path.
+  #[inline(always)]
+  #[must_use]
+  pub fn response_model(&self) -> &str {
+    &self.response_model
+  }
+
+  /// System prompt for the LLM.
+  #[inline(always)]
+  #[must_use]
+  pub fn system_prompt(&self) -> &str {
+    &self.system_prompt
+  }
+
+  /// TTS model repo / path.
+  #[inline(always)]
+  #[must_use]
+  pub fn tts_model(&self) -> &str {
+    &self.tts_model
+  }
+
+  /// TTS voice name.
+  #[inline(always)]
+  #[must_use]
+  pub fn tts_voice(&self) -> &str {
+    &self.tts_voice
+  }
+
+  /// TTS streaming chunk interval override (seconds), or `None`.
+  #[inline(always)]
+  #[must_use]
+  pub fn tts_streaming_interval(&self) -> Option<f32> {
+    self.tts_streaming_interval
+  }
+
+  /// TTS sampling temperature override, or `None` for model default.
+  #[inline(always)]
+  #[must_use]
+  pub fn tts_temperature(&self) -> Option<f32> {
+    self.tts_temperature
+  }
+
+  /// Whether barge-in is enabled.
+  #[inline(always)]
+  #[must_use]
+  pub fn barge_in(&self) -> bool {
+    self.barge_in
+  }
+
+  /// Minimum user-speech duration (ms) to confirm barge-in.
+  #[inline(always)]
+  #[must_use]
+  pub fn min_barge_in_ms(&self) -> u32 {
+    self.min_barge_in_ms
+  }
+
+  /// Playback-echo window after recent output callbacks (ms).
+  #[inline(always)]
+  #[must_use]
+  pub fn ignore_playback_echo_ms(&self) -> u32 {
+    self.ignore_playback_echo_ms
+  }
+
+  /// Minimum expected acoustic echo delay (ms).
+  #[inline(always)]
+  #[must_use]
+  pub fn echo_delay_min_ms(&self) -> u32 {
+    self.echo_delay_min_ms
+  }
+
+  /// Maximum expected acoustic echo delay (ms).
+  #[inline(always)]
+  #[must_use]
+  pub fn echo_delay_max_ms(&self) -> u32 {
+    self.echo_delay_max_ms
+  }
+
+  /// Echo-correlation step granularity (ms).
+  #[inline(always)]
+  #[must_use]
+  pub fn echo_correlation_step_ms(&self) -> u32 {
+    self.echo_correlation_step_ms
+  }
+
+  /// Minimum partial-transcript characters to confirm barge-in.
+  #[inline(always)]
+  #[must_use]
+  pub fn barge_in_min_transcript_chars(&self) -> u32 {
+    self.barge_in_min_transcript_chars
+  }
+
+  /// Whether to play TTS output through an audio device.
+  #[inline(always)]
+  #[must_use]
+  pub fn play_audio(&self) -> bool {
+    self.play_audio
+  }
+
+  /// Audio-queue capacity (slots).
+  #[inline(always)]
+  #[must_use]
+  pub fn queue_size(&self) -> usize {
+    self.queue_size
+  }
+
+  /// Verbose structured-event logging.
+  #[inline(always)]
+  #[must_use]
+  pub fn verbose(&self) -> bool {
+    self.verbose
+  }
+
+  // ── Builder methods ──────────────────────────────────────────────────
+
+  /// Set the mic capture sample rate (Hz).
+  #[must_use]
+  pub fn with_input_sample_rate(mut self, v: u32) -> Self {
+    self.input_sample_rate = v;
+    self
+  }
+
+  /// Override the audio-output sample rate (Hz). Pass `None` to
+  /// inherit from the TTS model at runtime.
+  #[must_use]
+  pub fn with_output_sample_rate(mut self, v: Option<u32>) -> Self {
+    self.output_sample_rate = v;
+    self
+  }
+
+  /// Set the mic capture channel count.
+  #[must_use]
+  pub fn with_input_channels(mut self, v: u16) -> Self {
+    self.input_channels = v;
+    self
+  }
+
+  /// Set the mic frame duration (ms).
+  #[must_use]
+  pub fn with_frame_duration_ms(mut self, v: u32) -> Self {
+    self.frame_duration_ms = v;
+    self
+  }
+
+  /// Set the latency-vs-quality profile preset.
+  #[must_use]
+  pub fn with_latency_profile(mut self, v: LatencyProfile) -> Self {
+    self.latency_profile = v;
+    self
+  }
+
+  /// Set the STT model repo / path.
+  #[must_use]
+  pub fn with_stt_model(mut self, v: impl Into<String>) -> Self {
+    self.stt_model = v.into();
+    self
+  }
+
+  /// Override the STT streaming transcription delay (ms). Pass `None`
+  /// to derive from the latency profile.
+  #[must_use]
+  pub fn with_stt_transcription_delay_ms(mut self, v: Option<u32>) -> Self {
+    self.stt_transcription_delay_ms = v;
+    self
+  }
+
+  /// Set the maximum decode tokens per streaming step.
+  #[must_use]
+  pub fn with_stt_max_decode_tokens_per_step(mut self, v: u32) -> Self {
+    self.stt_max_decode_tokens_per_step = v;
+    self
+  }
+
+  /// Set the maximum decode tokens per user turn.
+  #[must_use]
+  pub fn with_stt_max_turn_tokens(mut self, v: u32) -> Self {
+    self.stt_max_turn_tokens = v;
+    self
+  }
+
+  /// Set the bounded finalization steps after endpointing.
+  #[must_use]
+  pub fn with_stt_finalization_max_steps(mut self, v: u32) -> Self {
+    self.stt_finalization_max_steps = v;
+    self
+  }
+
+  /// Set the VAD model repo / path.
+  #[must_use]
+  pub fn with_vad_model(mut self, v: impl Into<String>) -> Self {
+    self.vad_model = v.into();
+    self
+  }
+
+  /// Set the VAD start-of-speech probability threshold.
+  #[must_use]
+  pub fn with_vad_start_threshold(mut self, v: f32) -> Self {
+    self.vad_start_threshold = v;
+    self
+  }
+
+  /// Set the VAD continue-speech probability threshold (hysteresis).
+  #[must_use]
+  pub fn with_vad_stop_threshold(mut self, v: f32) -> Self {
+    self.vad_stop_threshold = v;
+    self
+  }
+
+  /// Set the consecutive speech frames needed to confirm start-of-speech.
+  #[must_use]
+  pub fn with_vad_start_frames(mut self, v: u32) -> Self {
+    self.vad_start_frames = v;
+    self
+  }
+
+  /// Set the silence duration that triggers turn-end consideration (ms).
+  #[must_use]
+  pub fn with_vad_end_silence_ms(mut self, v: u32) -> Self {
+    self.vad_end_silence_ms = v;
+    self
+  }
+
+  /// Set the maximum single-turn duration (seconds).
+  #[must_use]
+  pub fn with_vad_max_turn_seconds(mut self, v: f32) -> Self {
+    self.vad_max_turn_seconds = v;
+    self
+  }
+
+  /// Set the pre-roll buffer duration (ms).
+  #[must_use]
+  pub fn with_preroll_ms(mut self, v: u32) -> Self {
+    self.preroll_ms = v;
+    self
+  }
+
+  /// Set the turn-end model repo / path.
+  #[must_use]
+  pub fn with_turn_model(mut self, v: impl Into<String>) -> Self {
+    self.turn_model = v.into();
+    self
+  }
+
+  /// Set the smart-turn endpoint probability threshold.
+  #[must_use]
+  pub fn with_turn_threshold(mut self, v: f32) -> Self {
+    self.turn_threshold = v;
+    self
+  }
+
+  /// Set the max silence (ms) before force-finalizing an incomplete turn.
+  #[must_use]
+  pub fn with_turn_max_incomplete_silence_ms(mut self, v: u32) -> Self {
+    self.turn_max_incomplete_silence_ms = v;
+    self
+  }
+
+  /// Set the LLM model repo / path.
+  #[must_use]
+  pub fn with_response_model(mut self, v: impl Into<String>) -> Self {
+    self.response_model = v.into();
+    self
+  }
+
+  /// Set the system prompt for the LLM.
+  #[must_use]
+  pub fn with_system_prompt(mut self, v: impl Into<String>) -> Self {
+    self.system_prompt = v.into();
+    self
+  }
+
+  /// Set the TTS model repo / path.
+  #[must_use]
+  pub fn with_tts_model(mut self, v: impl Into<String>) -> Self {
+    self.tts_model = v.into();
+    self
+  }
+
+  /// Set the TTS voice name.
+  #[must_use]
+  pub fn with_tts_voice(mut self, v: impl Into<String>) -> Self {
+    self.tts_voice = v.into();
+    self
+  }
+
+  /// Override the TTS streaming chunk interval (seconds). Pass `None`
+  /// to derive from the latency profile.
+  #[must_use]
+  pub fn with_tts_streaming_interval(mut self, v: Option<f32>) -> Self {
+    self.tts_streaming_interval = v;
+    self
+  }
+
+  /// Override the TTS sampling temperature. Pass `None` for model
+  /// default.
+  #[must_use]
+  pub fn with_tts_temperature(mut self, v: Option<f32>) -> Self {
+    self.tts_temperature = v;
+    self
+  }
+
+  /// Enable or disable barge-in.
+  #[must_use]
+  pub fn with_barge_in(mut self, v: bool) -> Self {
+    self.barge_in = v;
+    self
+  }
+
+  /// Set the minimum user-speech duration (ms) to confirm barge-in.
+  #[must_use]
+  pub fn with_min_barge_in_ms(mut self, v: u32) -> Self {
+    self.min_barge_in_ms = v;
+    self
+  }
+
+  /// Set the playback-echo window (ms).
+  #[must_use]
+  pub fn with_ignore_playback_echo_ms(mut self, v: u32) -> Self {
+    self.ignore_playback_echo_ms = v;
+    self
+  }
+
+  /// Set the minimum expected acoustic echo delay (ms).
+  #[must_use]
+  pub fn with_echo_delay_min_ms(mut self, v: u32) -> Self {
+    self.echo_delay_min_ms = v;
+    self
+  }
+
+  /// Set the maximum expected acoustic echo delay (ms).
+  #[must_use]
+  pub fn with_echo_delay_max_ms(mut self, v: u32) -> Self {
+    self.echo_delay_max_ms = v;
+    self
+  }
+
+  /// Set the echo-correlation step granularity (ms).
+  #[must_use]
+  pub fn with_echo_correlation_step_ms(mut self, v: u32) -> Self {
+    self.echo_correlation_step_ms = v;
+    self
+  }
+
+  /// Set the minimum partial-transcript characters to confirm barge-in.
+  #[must_use]
+  pub fn with_barge_in_min_transcript_chars(mut self, v: u32) -> Self {
+    self.barge_in_min_transcript_chars = v;
+    self
+  }
+
+  /// Enable or disable playing TTS output through an audio device.
+  #[must_use]
+  pub fn with_play_audio(mut self, v: bool) -> Self {
+    self.play_audio = v;
+    self
+  }
+
+  /// Set the audio-queue capacity (slots).
+  #[must_use]
+  pub fn with_queue_size(mut self, v: usize) -> Self {
+    self.queue_size = v;
+    self
+  }
+
+  /// Enable or disable verbose structured-event logging.
+  #[must_use]
+  pub fn with_verbose(mut self, v: bool) -> Self {
+    self.verbose = v;
+    self
+  }
+
+  // ── Resolution helpers ───────────────────────────────────────────────
+
+  /// Resolve every `Option<…>` field — replace `None`s with the
+  /// `latency_profile` default — and return the value-copy with
+  /// every knob materialized.
+  ///
+  /// Mirrors mlx-audio's `__post_init__`
+  /// ([`voice_pipeline.py:75-89`][vp-cfg]) but as an explicit
+  /// fold-method rather than a constructor side-effect: a caller
+  /// who wants the raw `Option<u32>` knob preserved can hold the
+  /// original; a caller who needs the resolved profile-default
+  /// value calls [`Self::resolved_transcription_delay_ms`] /
+  /// [`Self::resolved_tts_streaming_interval`] without rebuilding
+  /// the whole struct.
+  ///
+  /// [vp-cfg]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/voice_pipeline.py#L75-L89
+  #[must_use]
+  pub fn resolved(mut self) -> Self {
+    if self.stt_transcription_delay_ms.is_none() {
+      self.stt_transcription_delay_ms = Some(self.latency_profile.default_transcription_delay_ms());
+    }
+    if self.tts_streaming_interval.is_none() {
+      self.tts_streaming_interval = Some(self.latency_profile.default_tts_streaming_interval());
+    }
+    self
+  }
+
+  /// The effective STT transcription delay (ms) — explicit field if
+  /// set, else the [`LatencyProfile`] default.
+  pub fn resolved_transcription_delay_ms(&self) -> u32 {
+    self
+      .stt_transcription_delay_ms
+      .unwrap_or_else(|| self.latency_profile.default_transcription_delay_ms())
+  }
+
+  /// The effective TTS streaming interval (seconds) — explicit field
+  /// if set, else the [`LatencyProfile`] default.
+  pub fn resolved_tts_streaming_interval(&self) -> f32 {
+    self
+      .tts_streaming_interval
+      .unwrap_or_else(|| self.latency_profile.default_tts_streaming_interval())
+  }
+}
+
+impl Default for VoicePipelineConfig {
+  /// The mlx-audio dataclass-default config
+  /// ([`voice_pipeline.py:26-89`][vp-cfg]). Every value matches the
+  /// upstream default verbatim. Delegates to [`VoicePipelineConfig::new`].
+  ///
+  /// [vp-cfg]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/voice_pipeline.py#L25-L89
+  fn default() -> Self {
+    Self::new()
+  }
 }
 
 #[cfg(test)]
@@ -340,57 +907,57 @@ mod tests {
   /// reconcile the divergence.
   #[test]
   fn defaults_match_python_dataclass() {
-    let cfg = VoicePipelineConfig::default();
+    let cfg = VoicePipelineConfig::new();
 
-    assert_eq!(cfg.input_sample_rate, 16_000);
-    assert_eq!(cfg.output_sample_rate, None);
-    assert_eq!(cfg.input_channels, 1);
-    assert_eq!(cfg.frame_duration_ms, 32);
-    assert_eq!(cfg.latency_profile, LatencyProfile::Balanced);
+    assert_eq!(cfg.input_sample_rate(), 16_000);
+    assert_eq!(cfg.output_sample_rate(), None);
+    assert_eq!(cfg.input_channels(), 1);
+    assert_eq!(cfg.frame_duration_ms(), 32);
+    assert_eq!(cfg.latency_profile(), LatencyProfile::Balanced);
 
     assert_eq!(
-      cfg.stt_model,
+      cfg.stt_model(),
       "mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit"
     );
-    assert_eq!(cfg.stt_transcription_delay_ms, None);
-    assert_eq!(cfg.stt_max_decode_tokens_per_step, 6);
-    assert_eq!(cfg.stt_max_turn_tokens, 256);
-    assert_eq!(cfg.stt_finalization_max_steps, 96);
+    assert_eq!(cfg.stt_transcription_delay_ms(), None);
+    assert_eq!(cfg.stt_max_decode_tokens_per_step(), 6);
+    assert_eq!(cfg.stt_max_turn_tokens(), 256);
+    assert_eq!(cfg.stt_finalization_max_steps(), 96);
 
-    assert_eq!(cfg.vad_model, "mlx-community/silero-vad");
-    assert!((cfg.vad_start_threshold - 0.35).abs() < 1e-6);
-    assert!((cfg.vad_stop_threshold - 0.2).abs() < 1e-6);
-    assert_eq!(cfg.vad_start_frames, 1);
-    assert_eq!(cfg.vad_end_silence_ms, 600);
-    assert!((cfg.vad_max_turn_seconds - 30.0).abs() < 1e-6);
-    assert_eq!(cfg.preroll_ms, 250);
+    assert_eq!(cfg.vad_model(), "mlx-community/silero-vad");
+    assert!((cfg.vad_start_threshold() - 0.35).abs() < 1e-6);
+    assert!((cfg.vad_stop_threshold() - 0.2).abs() < 1e-6);
+    assert_eq!(cfg.vad_start_frames(), 1);
+    assert_eq!(cfg.vad_end_silence_ms(), 600);
+    assert!((cfg.vad_max_turn_seconds() - 30.0).abs() < 1e-6);
+    assert_eq!(cfg.preroll_ms(), 250);
 
-    assert_eq!(cfg.turn_model, "mlx-community/smart-turn-v3");
-    assert!((cfg.turn_threshold - 0.5).abs() < 1e-6);
-    assert_eq!(cfg.turn_max_incomplete_silence_ms, 1600);
+    assert_eq!(cfg.turn_model(), "mlx-community/smart-turn-v3");
+    assert!((cfg.turn_threshold() - 0.5).abs() < 1e-6);
+    assert_eq!(cfg.turn_max_incomplete_silence_ms(), 1600);
 
     assert_eq!(
-      cfg.response_model,
+      cfg.response_model(),
       "mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-4bit"
     );
-    assert!(cfg.system_prompt.contains("voice assistant"));
+    assert!(cfg.system_prompt().contains("voice assistant"));
 
-    assert_eq!(cfg.tts_model, "mlx-community/pocket-tts");
-    assert_eq!(cfg.tts_voice, "cosette");
-    assert_eq!(cfg.tts_streaming_interval, None);
-    assert_eq!(cfg.tts_temperature, None);
+    assert_eq!(cfg.tts_model(), "mlx-community/pocket-tts");
+    assert_eq!(cfg.tts_voice(), "cosette");
+    assert_eq!(cfg.tts_streaming_interval(), None);
+    assert_eq!(cfg.tts_temperature(), None);
 
-    assert!(cfg.barge_in);
-    assert_eq!(cfg.min_barge_in_ms, 180);
-    assert_eq!(cfg.ignore_playback_echo_ms, 450);
-    assert_eq!(cfg.echo_delay_min_ms, 250);
-    assert_eq!(cfg.echo_delay_max_ms, 500);
-    assert_eq!(cfg.echo_correlation_step_ms, 32);
-    assert_eq!(cfg.barge_in_min_transcript_chars, 2);
+    assert!(cfg.barge_in());
+    assert_eq!(cfg.min_barge_in_ms(), 180);
+    assert_eq!(cfg.ignore_playback_echo_ms(), 450);
+    assert_eq!(cfg.echo_delay_min_ms(), 250);
+    assert_eq!(cfg.echo_delay_max_ms(), 500);
+    assert_eq!(cfg.echo_correlation_step_ms(), 32);
+    assert_eq!(cfg.barge_in_min_transcript_chars(), 2);
 
-    assert!(cfg.play_audio);
-    assert_eq!(cfg.queue_size, 128);
-    assert!(!cfg.verbose);
+    assert!(cfg.play_audio());
+    assert_eq!(cfg.queue_size(), 128);
+    assert!(!cfg.verbose());
   }
 
   /// `resolved()` fills in the profile-driven defaults for the two
@@ -398,59 +965,162 @@ mod tests {
   #[test]
   fn resolved_fills_profile_defaults() {
     // Balanced (default) → 480 ms / 0.32 s.
-    let cfg = VoicePipelineConfig::default().resolved();
-    assert_eq!(cfg.stt_transcription_delay_ms, Some(480));
-    assert_eq!(cfg.tts_streaming_interval, Some(0.32));
+    let cfg = VoicePipelineConfig::new().resolved();
+    assert_eq!(cfg.stt_transcription_delay_ms(), Some(480));
+    assert_eq!(cfg.tts_streaming_interval(), Some(0.32));
 
     // Fast → 240 ms / 0.24 s.
-    let cfg = VoicePipelineConfig {
-      latency_profile: LatencyProfile::Fast,
-      ..VoicePipelineConfig::default()
-    }
-    .resolved();
-    assert_eq!(cfg.stt_transcription_delay_ms, Some(240));
-    assert_eq!(cfg.tts_streaming_interval, Some(0.24));
+    let cfg = VoicePipelineConfig::new()
+      .with_latency_profile(LatencyProfile::Fast)
+      .resolved();
+    assert_eq!(cfg.stt_transcription_delay_ms(), Some(240));
+    assert_eq!(cfg.tts_streaming_interval(), Some(0.24));
 
     // Quality → 960 ms / 0.48 s.
-    let cfg = VoicePipelineConfig {
-      latency_profile: LatencyProfile::Quality,
-      ..VoicePipelineConfig::default()
-    }
-    .resolved();
-    assert_eq!(cfg.stt_transcription_delay_ms, Some(960));
-    assert_eq!(cfg.tts_streaming_interval, Some(0.48));
+    let cfg = VoicePipelineConfig::new()
+      .with_latency_profile(LatencyProfile::Quality)
+      .resolved();
+    assert_eq!(cfg.stt_transcription_delay_ms(), Some(960));
+    assert_eq!(cfg.tts_streaming_interval(), Some(0.48));
   }
 
   /// Explicit fields beat the profile default — mirror of mlx-audio's
   /// `__post_init__` "only fill if `is None`" rule.
   #[test]
   fn resolved_preserves_explicit_overrides() {
-    let cfg = VoicePipelineConfig {
-      latency_profile: LatencyProfile::Fast,
-      stt_transcription_delay_ms: Some(123),
-      tts_streaming_interval: Some(0.07),
-      ..VoicePipelineConfig::default()
-    }
-    .resolved();
-    assert_eq!(cfg.stt_transcription_delay_ms, Some(123));
-    assert_eq!(cfg.tts_streaming_interval, Some(0.07));
+    let cfg = VoicePipelineConfig::new()
+      .with_latency_profile(LatencyProfile::Fast)
+      .with_stt_transcription_delay_ms(Some(123))
+      .with_tts_streaming_interval(Some(0.07))
+      .resolved();
+    assert_eq!(cfg.stt_transcription_delay_ms(), Some(123));
+    assert_eq!(cfg.tts_streaming_interval(), Some(0.07));
   }
 
   /// The `resolved_*` accessors return the same value with or without
   /// going through [`VoicePipelineConfig::resolved`].
   #[test]
   fn resolved_accessors_agree_with_resolved_method() {
-    let raw = VoicePipelineConfig {
-      latency_profile: LatencyProfile::Quality,
-      ..VoicePipelineConfig::default()
-    };
+    let raw = VoicePipelineConfig::new().with_latency_profile(LatencyProfile::Quality);
     let folded = raw.clone().resolved();
     assert_eq!(
       raw.resolved_transcription_delay_ms(),
-      folded.stt_transcription_delay_ms.unwrap()
+      folded.stt_transcription_delay_ms().unwrap()
     );
     assert!(
-      (raw.resolved_tts_streaming_interval() - folded.tts_streaming_interval.unwrap()).abs() < 1e-6
+      (raw.resolved_tts_streaming_interval() - folded.tts_streaming_interval().unwrap()).abs()
+        < 1e-6
     );
+  }
+
+  /// `LatencyProfile::as_str` returns the expected snake-case labels.
+  #[test]
+  fn latency_profile_as_str() {
+    assert_eq!(LatencyProfile::Fast.as_str(), "low_latency");
+    assert_eq!(LatencyProfile::Balanced.as_str(), "balanced");
+    assert_eq!(LatencyProfile::Quality.as_str(), "high_quality");
+  }
+
+  /// `Display` for `LatencyProfile` delegates to `as_str`.
+  #[test]
+  fn latency_profile_display() {
+    assert_eq!(LatencyProfile::Fast.to_string(), "low_latency");
+    assert_eq!(LatencyProfile::Balanced.to_string(), "balanced");
+    assert_eq!(LatencyProfile::Quality.to_string(), "high_quality");
+  }
+
+  /// `is_*` variant predicate methods.
+  #[test]
+  fn latency_profile_is_variant_predicates() {
+    assert!(LatencyProfile::Fast.is_fast());
+    assert!(!LatencyProfile::Fast.is_balanced());
+    assert!(!LatencyProfile::Fast.is_quality());
+
+    assert!(!LatencyProfile::Balanced.is_fast());
+    assert!(LatencyProfile::Balanced.is_balanced());
+    assert!(!LatencyProfile::Balanced.is_quality());
+
+    assert!(!LatencyProfile::Quality.is_fast());
+    assert!(!LatencyProfile::Quality.is_balanced());
+    assert!(LatencyProfile::Quality.is_quality());
+  }
+
+  /// `with_*` builder chain round-trips all settable fields.
+  #[test]
+  fn builder_chain_sets_fields() {
+    let cfg = VoicePipelineConfig::new()
+      .with_input_sample_rate(8_000)
+      .with_output_sample_rate(Some(24_000))
+      .with_input_channels(2)
+      .with_frame_duration_ms(16)
+      .with_latency_profile(LatencyProfile::Fast)
+      .with_stt_model("my-stt")
+      .with_stt_transcription_delay_ms(Some(100))
+      .with_stt_max_decode_tokens_per_step(3)
+      .with_stt_max_turn_tokens(128)
+      .with_stt_finalization_max_steps(48)
+      .with_vad_model("my-vad")
+      .with_vad_start_threshold(0.5)
+      .with_vad_stop_threshold(0.3)
+      .with_vad_start_frames(2)
+      .with_vad_end_silence_ms(300)
+      .with_vad_max_turn_seconds(15.0)
+      .with_preroll_ms(100)
+      .with_turn_model("my-turn")
+      .with_turn_threshold(0.7)
+      .with_turn_max_incomplete_silence_ms(800)
+      .with_response_model("my-llm")
+      .with_system_prompt("be concise")
+      .with_tts_model("my-tts")
+      .with_tts_voice("alice")
+      .with_tts_streaming_interval(Some(0.1))
+      .with_tts_temperature(Some(0.8))
+      .with_barge_in(false)
+      .with_min_barge_in_ms(90)
+      .with_ignore_playback_echo_ms(200)
+      .with_echo_delay_min_ms(100)
+      .with_echo_delay_max_ms(300)
+      .with_echo_correlation_step_ms(16)
+      .with_barge_in_min_transcript_chars(5)
+      .with_play_audio(false)
+      .with_queue_size(64)
+      .with_verbose(true);
+
+    assert_eq!(cfg.input_sample_rate(), 8_000);
+    assert_eq!(cfg.output_sample_rate(), Some(24_000));
+    assert_eq!(cfg.input_channels(), 2);
+    assert_eq!(cfg.frame_duration_ms(), 16);
+    assert_eq!(cfg.latency_profile(), LatencyProfile::Fast);
+    assert_eq!(cfg.stt_model(), "my-stt");
+    assert_eq!(cfg.stt_transcription_delay_ms(), Some(100));
+    assert_eq!(cfg.stt_max_decode_tokens_per_step(), 3);
+    assert_eq!(cfg.stt_max_turn_tokens(), 128);
+    assert_eq!(cfg.stt_finalization_max_steps(), 48);
+    assert_eq!(cfg.vad_model(), "my-vad");
+    assert!((cfg.vad_start_threshold() - 0.5).abs() < 1e-6);
+    assert!((cfg.vad_stop_threshold() - 0.3).abs() < 1e-6);
+    assert_eq!(cfg.vad_start_frames(), 2);
+    assert_eq!(cfg.vad_end_silence_ms(), 300);
+    assert!((cfg.vad_max_turn_seconds() - 15.0).abs() < 1e-6);
+    assert_eq!(cfg.preroll_ms(), 100);
+    assert_eq!(cfg.turn_model(), "my-turn");
+    assert!((cfg.turn_threshold() - 0.7).abs() < 1e-6);
+    assert_eq!(cfg.turn_max_incomplete_silence_ms(), 800);
+    assert_eq!(cfg.response_model(), "my-llm");
+    assert_eq!(cfg.system_prompt(), "be concise");
+    assert_eq!(cfg.tts_model(), "my-tts");
+    assert_eq!(cfg.tts_voice(), "alice");
+    assert_eq!(cfg.tts_streaming_interval(), Some(0.1));
+    assert_eq!(cfg.tts_temperature(), Some(0.8));
+    assert!(!cfg.barge_in());
+    assert_eq!(cfg.min_barge_in_ms(), 90);
+    assert_eq!(cfg.ignore_playback_echo_ms(), 200);
+    assert_eq!(cfg.echo_delay_min_ms(), 100);
+    assert_eq!(cfg.echo_delay_max_ms(), 300);
+    assert_eq!(cfg.echo_correlation_step_ms(), 16);
+    assert_eq!(cfg.barge_in_min_transcript_chars(), 5);
+    assert!(!cfg.play_audio());
+    assert_eq!(cfg.queue_size(), 64);
+    assert!(cfg.verbose());
   }
 }

@@ -12,7 +12,7 @@
 //! - [`mod@load`] — the per-domain [`load::load`] / [`load::load_model`]
 //!   entry points that route through the shared
 //!   [`crate::audio::load::base_load_model`] factory, plus the
-//!   [`StsModel`] trait every concrete STS architecture implements.
+//!   [`load::Model`] trait every concrete STS architecture implements.
 //!
 //! mlx-audio's [`sts/voice_pipeline.py`][sts-pipeline] composes a full
 //! voice-pipeline (VAD + STT + LLM + TTS); per the
@@ -27,7 +27,7 @@
 //! the orchestration shape mlx-audio's `VoicePipeline` class exposes.
 //!
 //! - [`mod@load`] — the per-domain [`load::load`] / [`load::load_model`]
-//!   entry points + the [`StsModel`] trait every concrete STS
+//!   entry points + the [`load::Model`] trait every concrete STS
 //!   architecture implements.
 //! - [`mod@pipeline`] — A8 voice-pipeline orchestration (the
 //!   [`pipeline::VoiceSession`] default + the [`pipeline::VoicePipeline`]
@@ -42,7 +42,7 @@
 pub mod load;
 pub mod pipeline;
 
-pub use load::{StsModel, load, load_model};
+pub use load::{Model, load, load_model};
 pub use pipeline::{
   AudioChunker, BargeInDetector, EnergyBargeInDetector, FixedSizeAudioChunker, LatencyProfile,
   LlmResponderAdapter, PreRollBuffer, SilenceTurnTakingPolicy, SttTurnAdapter, TtsStreamAdapter,

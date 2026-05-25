@@ -166,14 +166,60 @@ pub trait TtsStreamAdapter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnEvent {
   /// Number of mic chunks consumed before this turn finalized.
-  pub chunks_consumed: usize,
+  chunks_consumed: usize,
   /// The transcribed user text the LLM saw.
-  pub user_text: String,
+  user_text: String,
   /// The LLM response the TTS spoke.
-  pub assistant_text: String,
+  assistant_text: String,
   /// Whether barge-in fired during this turn (the
   /// [`BargeInDetector`] returned `true` at least once).
-  pub barge_in_observed: bool,
+  barge_in_observed: bool,
+}
+
+impl TurnEvent {
+  /// Construct a `TurnEvent`.
+  #[must_use]
+  pub fn new(
+    chunks_consumed: usize,
+    user_text: String,
+    assistant_text: String,
+    barge_in_observed: bool,
+  ) -> Self {
+    Self {
+      chunks_consumed,
+      user_text,
+      assistant_text,
+      barge_in_observed,
+    }
+  }
+
+  /// Number of mic chunks consumed before this turn finalized.
+  #[inline(always)]
+  #[must_use]
+  pub fn chunks_consumed(&self) -> usize {
+    self.chunks_consumed
+  }
+
+  /// The transcribed user text the LLM saw.
+  #[inline(always)]
+  #[must_use]
+  pub fn user_text(&self) -> &str {
+    &self.user_text
+  }
+
+  /// The LLM response the TTS spoke.
+  #[inline(always)]
+  #[must_use]
+  pub fn assistant_text(&self) -> &str {
+    &self.assistant_text
+  }
+
+  /// Whether barge-in fired during this turn.
+  #[inline(always)]
+  #[must_use]
+  pub fn barge_in_observed(&self) -> bool {
+    self.barge_in_observed
+  }
 }
 
 /// The default [`VoicePipeline`] implementor — composes every
@@ -190,16 +236,7 @@ pub struct TurnEvent {
 /// session state (mlx-audio's `VoxtralRealtimeTranscriber.session`
 /// / `LocalLLMResponseEngine.conversation` / TTS streaming
 /// position).
-pub struct VoiceSession<V, S, L, T, C, B, P>
-where
-  V: VadFrameAdapter,
-  S: SttTurnAdapter,
-  L: LlmResponderAdapter,
-  T: TtsStreamAdapter,
-  C: AudioChunker,
-  B: BargeInDetector,
-  P: TurnTakingPolicy,
-{
+pub struct VoiceSession<V, S, L, T, C, B, P> {
   config: VoicePipelineConfig,
   vad: V,
   stt: S,
@@ -239,12 +276,12 @@ where
 {
   /// Build a session wiring every trait object together. The
   /// session's [`PreRollBuffer`] capacity is derived from
-  /// `config.input_sample_rate * config.preroll_ms / 1000`
+  /// `config.input_sample_rate() * config.preroll_ms() / 1000`
   /// (mirror of `voice_pipeline.py:613-615`).
   ///
   /// # Errors
   /// Returns [`crate::error::Error::Backend`] when
-  /// `config.input_sample_rate == 0` — the per-chunk silence-ms
+  /// `config.input_sample_rate() == 0` — the per-chunk silence-ms
   /// accounting divides by the sample rate and a zero rate would
   /// either panic or silently produce nonsense durations.
   #[allow(clippy::too_many_arguments)]
@@ -258,7 +295,7 @@ where
     barge_in: B,
     turn_policy: P,
   ) -> Result<Self> {
-    if config.input_sample_rate == 0 {
+    if config.input_sample_rate() == 0 {
       return Err(crate::error::Error::Backend {
         message:
           "VoicePipelineConfig::input_sample_rate must be > 0 (got 0); the orchestrator's per-chunk \
@@ -267,7 +304,7 @@ where
       });
     }
     let preroll_samples =
-      (config.input_sample_rate as usize) * (config.preroll_ms as usize) / 1_000;
+      (config.input_sample_rate() as usize) * (config.preroll_ms() as usize) / 1_000;
     Ok(Self {
       config,
       vad,
@@ -341,7 +378,7 @@ where
   ) -> Result<usize> {
     let mut turns_finalized = 0;
     let chunks = self.chunker.push_samples(frame)?;
-    let sample_rate = self.config.input_sample_rate as u64;
+    let sample_rate = self.config.input_sample_rate() as u64;
 
     for chunk in chunks {
       self.total_chunks_consumed += 1;
@@ -413,7 +450,7 @@ where
       // turn block above flips `in_speech` to true BEFORE we reach
       // this check, so the very first speech chunk that opens a
       // turn is still counted (matches the mlx-audio shape).
-      if self.config.barge_in
+      if self.config.barge_in()
         && is_speech
         && self.in_speech
         && self.barge_in.detect(&chunk, tts_playing)
@@ -460,7 +497,7 @@ where
     let user_text_for_event = user_text.clone();
     let assistant_text = self.llm.respond(&user_text)?;
 
-    if self.config.play_audio {
+    if self.config.play_audio() {
       let stream = self.tts.synthesize_stream(&assistant_text)?;
       for chunk in stream {
         let samples = chunk?;
@@ -480,12 +517,12 @@ where
       }
     }
 
-    self.events.push(TurnEvent {
-      chunks_consumed: self.total_chunks_consumed,
-      user_text: user_text_for_event,
+    self.events.push(TurnEvent::new(
+      self.total_chunks_consumed,
+      user_text_for_event,
       assistant_text,
       barge_in_observed,
-    });
+    ));
     Ok(())
   }
 }
@@ -634,16 +671,13 @@ mod tests {
     EnergyBargeInDetector,
     SilenceTurnTakingPolicy,
   > {
-    let config = VoicePipelineConfig {
-      // 16 kHz, 20 ms chunks = 320 samples; 200 ms silence
-      // threshold = 10 chunks worth of silence.
-      input_sample_rate: 16_000,
-      frame_duration_ms: 20,
-      preroll_ms: 40,
-      vad_end_silence_ms: 200,
-      turn_max_incomplete_silence_ms: 200,
-      ..VoicePipelineConfig::default()
-    };
+    // 16 kHz, 20 ms chunks = 320 samples; 200 ms silence threshold = 10 chunks.
+    let config = VoicePipelineConfig::new()
+      .with_input_sample_rate(16_000)
+      .with_frame_duration_ms(20)
+      .with_preroll_ms(40)
+      .with_vad_end_silence_ms(200)
+      .with_turn_max_incomplete_silence_ms(200);
     let chunk_size = (16_000 * 20) / 1_000;
     VoiceSession::new(
       config,
@@ -700,9 +734,9 @@ mod tests {
     assert_eq!(turns, 1, "exactly one turn finalized");
     let events = sess.turn_events();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].user_text, "hello world");
-    assert_eq!(events[0].assistant_text, "re:hello world");
-    assert!(!events[0].barge_in_observed);
+    assert_eq!(events[0].user_text(), "hello world");
+    assert_eq!(events[0].assistant_text(), "re:hello world");
+    assert!(!events[0].barge_in_observed());
 
     // STT saw the turn audio: 10 speech chunks + (silence
     // chunks up to the finalize). At least 10 * 320 samples.
@@ -724,7 +758,7 @@ mod tests {
   #[test]
   fn play_audio_false_skips_tts() {
     let mut sess = test_session();
-    sess.config.play_audio = false;
+    sess.config = sess.config.with_play_audio(false);
     let mut sink = MockSink::new();
     let chunk_size = 320;
     let speech_chunk: Vec<f32> = (0..chunk_size).map(|i| 0.3 * ((i as f32).sin())).collect();
@@ -815,7 +849,7 @@ mod tests {
       .unwrap();
 
     assert_eq!(sess.turn_events().len(), 1);
-    assert!(sess.turn_events()[0].barge_in_observed);
+    assert!(sess.turn_events()[0].barge_in_observed());
   }
 
   /// Sink that always returns `Ok(0)` from `write_samples` →
@@ -863,8 +897,8 @@ mod tests {
   fn config_accessor_returns_bundled_config() {
     let sess = test_session();
     let cfg = sess.config();
-    assert_eq!(cfg.input_sample_rate, 16_000);
-    assert_eq!(cfg.frame_duration_ms, 20);
+    assert_eq!(cfg.input_sample_rate(), 16_000);
+    assert_eq!(cfg.frame_duration_ms(), 20);
   }
 
   // ---------- Fix 1 (HIGH): first speech chunk must not be ----------
@@ -896,14 +930,12 @@ mod tests {
       }
     }
 
-    let config = VoicePipelineConfig {
-      input_sample_rate: 16_000,
-      frame_duration_ms: 20,
-      preroll_ms: 40,
-      vad_end_silence_ms: 200,
-      turn_max_incomplete_silence_ms: 200,
-      ..VoicePipelineConfig::default()
-    };
+    let config = VoicePipelineConfig::new()
+      .with_input_sample_rate(16_000)
+      .with_frame_duration_ms(20)
+      .with_preroll_ms(40)
+      .with_vad_end_silence_ms(200)
+      .with_turn_max_incomplete_silence_ms(200);
     let chunk_size = 320;
     let mut sess = VoiceSession::new(
       config,
@@ -1061,7 +1093,7 @@ mod tests {
     let events = sess.turn_events();
     assert_eq!(events.len(), 1, "exactly one turn finalized");
     assert!(
-      !events[0].barge_in_observed,
+      !events[0].barge_in_observed(),
       "idle-noise barge-in detection must NOT leak into a later \
        turn — only in-turn speech-while-TTS-playing counts"
     );
@@ -1073,14 +1105,12 @@ mod tests {
   /// than panicking at the first chunk's `chunk_ms` division.
   #[test]
   fn voice_session_new_rejects_zero_sample_rate() {
-    let config = VoicePipelineConfig {
-      input_sample_rate: 0,
-      frame_duration_ms: 20,
-      preroll_ms: 40,
-      vad_end_silence_ms: 200,
-      turn_max_incomplete_silence_ms: 200,
-      ..VoicePipelineConfig::default()
-    };
+    let config = VoicePipelineConfig::new()
+      .with_input_sample_rate(0)
+      .with_frame_duration_ms(20)
+      .with_preroll_ms(40)
+      .with_vad_end_silence_ms(200)
+      .with_turn_max_incomplete_silence_ms(200);
     let chunk_size = 320;
     let result = VoiceSession::new(
       config,
@@ -1188,14 +1218,12 @@ mod tests {
         small_silence,
       ]),
     };
-    let config = VoicePipelineConfig {
-      input_sample_rate: 16_000,
-      frame_duration_ms: 20,
-      preroll_ms: 0, // disable preroll for a clean length check
-      vad_end_silence_ms: 200,
-      turn_max_incomplete_silence_ms: 200,
-      ..VoicePipelineConfig::default()
-    };
+    let config = VoicePipelineConfig::new()
+      .with_input_sample_rate(16_000)
+      .with_frame_duration_ms(20)
+      .with_preroll_ms(0)
+      .with_vad_end_silence_ms(200)
+      .with_turn_max_incomplete_silence_ms(200);
     let mut sess = VoiceSession::new(
       config,
       MockVad { threshold: 0.05 },
@@ -1291,14 +1319,12 @@ mod tests {
         silence_chunk,
       ]),
     };
-    let config = VoicePipelineConfig {
-      input_sample_rate: 16_000,
-      frame_duration_ms: 20,
-      preroll_ms: 0,
-      vad_end_silence_ms: 200,
-      turn_max_incomplete_silence_ms: 200,
-      ..VoicePipelineConfig::default()
-    };
+    let config = VoicePipelineConfig::new()
+      .with_input_sample_rate(16_000)
+      .with_frame_duration_ms(20)
+      .with_preroll_ms(0)
+      .with_vad_end_silence_ms(200)
+      .with_turn_max_incomplete_silence_ms(200);
     let mut sess = VoiceSession::new(
       config,
       MockVad { threshold: 0.05 },

@@ -113,6 +113,7 @@ impl FixedSizeAudioChunker {
   }
 
   /// The configured chunk size (samples).
+  #[inline(always)]
   #[must_use]
   pub fn chunk_size(&self) -> usize {
     self.chunk_size
@@ -120,6 +121,7 @@ impl FixedSizeAudioChunker {
 
   /// Currently-buffered tail length (samples). The next chunk will
   /// be emitted when `buffered_len() + next_push.len() >= chunk_size`.
+  #[inline(always)]
   #[must_use]
   pub fn buffered_len(&self) -> usize {
     self.buffer.len()
@@ -187,7 +189,7 @@ impl PreRollBuffer {
   /// buffer into a permanent no-op (matches mlx-audio's
   /// `if self.max_samples <= 0: return`).
   #[must_use]
-  pub fn new(max_samples: usize) -> Self {
+  pub const fn new(max_samples: usize) -> Self {
     Self {
       max_samples,
       buffer: Vec::new(),
@@ -221,18 +223,21 @@ impl PreRollBuffer {
   }
 
   /// Currently-buffered length (samples).
+  #[inline(always)]
   #[must_use]
   pub fn len(&self) -> usize {
     self.buffer.len()
   }
 
   /// Whether the buffer holds no samples.
+  #[inline(always)]
   #[must_use]
   pub fn is_empty(&self) -> bool {
     self.buffer.is_empty()
   }
 
   /// Configured capacity (max retained samples).
+  #[inline(always)]
   #[must_use]
   pub fn max_samples(&self) -> usize {
     self.max_samples

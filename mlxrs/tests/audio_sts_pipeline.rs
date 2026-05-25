@@ -169,15 +169,13 @@ fn build_session() -> VoiceSession<
   EnergyBargeInDetector,
   SilenceTurnTakingPolicy,
 > {
-  let config = VoicePipelineConfig {
-    input_sample_rate: SR,
-    frame_duration_ms: CHUNK_MS,
-    preroll_ms: 40,
-    vad_end_silence_ms: 200,
-    turn_max_incomplete_silence_ms: 200,
-    latency_profile: LatencyProfile::Balanced,
-    ..VoicePipelineConfig::default()
-  };
+  let config = VoicePipelineConfig::new()
+    .with_input_sample_rate(SR)
+    .with_frame_duration_ms(CHUNK_MS)
+    .with_preroll_ms(40)
+    .with_vad_end_silence_ms(200)
+    .with_turn_max_incomplete_silence_ms(200)
+    .with_latency_profile(LatencyProfile::Balanced);
   VoiceSession::new(
     config,
     EnergyVad { threshold: 0.05 },
@@ -223,9 +221,9 @@ fn voice_session_drives_full_loop_in_order() {
   // Exactly one turn finalized.
   let events = sess.turn_events();
   assert_eq!(events.len(), 1, "expected exactly one turn finalized");
-  assert_eq!(events[0].user_text, "hello there");
-  assert_eq!(events[0].assistant_text, "you said: hello there");
-  assert!(!events[0].barge_in_observed);
+  assert_eq!(events[0].user_text(), "hello there");
+  assert_eq!(events[0].assistant_text(), "you said: hello there");
+  assert!(!events[0].barge_in_observed());
 
   // STT was called exactly once with at least the 5 speech chunks of audio.
   assert_eq!(sess.stt().audio_lengths_seen.borrow().len(), 1);
@@ -336,15 +334,13 @@ fn voice_session_play_audio_false_skips_tts_writes() {
   // Build a fresh session with play_audio=false (config is immutable
   // post-new — this exercises the `play_audio` knob's pipeline-side
   // effect rather than re-wiring an existing session).
-  let cfg = VoicePipelineConfig {
-    input_sample_rate: SR,
-    frame_duration_ms: CHUNK_MS,
-    preroll_ms: 40,
-    vad_end_silence_ms: 200,
-    turn_max_incomplete_silence_ms: 200,
-    play_audio: false,
-    ..VoicePipelineConfig::default()
-  };
+  let cfg = VoicePipelineConfig::new()
+    .with_input_sample_rate(SR)
+    .with_frame_duration_ms(CHUNK_MS)
+    .with_preroll_ms(40)
+    .with_vad_end_silence_ms(200)
+    .with_turn_max_incomplete_silence_ms(200)
+    .with_play_audio(false);
   let mut sess2 = VoiceSession::new(
     cfg,
     EnergyVad { threshold: 0.05 },
@@ -405,7 +401,7 @@ fn voice_session_records_barge_in_when_user_overlaps_tts() {
 
   let events = sess.turn_events();
   assert_eq!(events.len(), 1);
-  assert!(events[0].barge_in_observed);
+  assert!(events[0].barge_in_observed());
 }
 
 /// The `VoicePipeline` trait `config()` method is callable on the
@@ -415,9 +411,9 @@ fn voice_session_records_barge_in_when_user_overlaps_tts() {
 fn voice_pipeline_trait_config_accessor() {
   let sess = build_session();
   let cfg: &VoicePipelineConfig = sess.config();
-  assert_eq!(cfg.input_sample_rate, SR);
-  assert_eq!(cfg.frame_duration_ms, CHUNK_MS);
-  assert_eq!(cfg.latency_profile, LatencyProfile::Balanced);
+  assert_eq!(cfg.input_sample_rate(), SR);
+  assert_eq!(cfg.frame_duration_ms(), CHUNK_MS);
+  assert_eq!(cfg.latency_profile(), LatencyProfile::Balanced);
 }
 
 /// Sink that returns `Err` from `write_samples` → orchestrator

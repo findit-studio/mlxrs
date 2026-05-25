@@ -58,6 +58,10 @@ pub trait TurnTakingPolicy {
 /// `VoicePipelineConfig.turn_max_incomplete_silence_ms` default
 /// ([`voice_pipeline.py:51`][vp-cfg]).
 ///
+/// Construct via [`SilenceTurnTakingPolicy::new`] or
+/// [`Default::default`]; tune via
+/// [`SilenceTurnTakingPolicy::with_silence_threshold_ms`].
+///
 /// [vp-end]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/voice_pipeline.py#L1149-L1160
 /// [vp-cfg]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/voice_pipeline.py#L51
 #[derive(Debug, Clone, Copy)]
@@ -65,7 +69,7 @@ pub struct SilenceTurnTakingPolicy {
   /// Silence duration (ms) required to call the turn finished.
   /// Default `1600` matches mlx-audio's
   /// `turn_max_incomplete_silence_ms` default.
-  pub silence_threshold_ms: u32,
+  silence_threshold_ms: u32,
 }
 
 impl Default for SilenceTurnTakingPolicy {
@@ -79,7 +83,22 @@ impl Default for SilenceTurnTakingPolicy {
 impl SilenceTurnTakingPolicy {
   /// Build a policy with an explicit silence threshold in ms.
   #[must_use]
-  pub fn new(silence_threshold_ms: u32) -> Self {
+  pub const fn new(silence_threshold_ms: u32) -> Self {
+    Self {
+      silence_threshold_ms,
+    }
+  }
+
+  /// The configured silence threshold (ms).
+  #[inline(always)]
+  #[must_use]
+  pub const fn silence_threshold_ms(&self) -> u32 {
+    self.silence_threshold_ms
+  }
+
+  /// Return a copy with a different silence threshold (ms).
+  #[must_use]
+  pub fn with_silence_threshold_ms(self, silence_threshold_ms: u32) -> Self {
     Self {
       silence_threshold_ms,
     }

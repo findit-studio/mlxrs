@@ -18,7 +18,7 @@
 //! `moshi`/`moshiko` → `moshi`; `mossformer2`/`mossformer2_se` →
 //! `mossformer2_se`; `sam_audio`/`samaudio` → `sam_audio`) into
 //! `mlx_audio.sts.models.<arch>`; per the no-per-model-arch rule mlxrs
-//! returns an [`StsModel`] trait object the per-architecture loader's
+//! returns a [`Model`] trait object the per-architecture loader's
 //! caller constructs, so the table is exposed in
 //! [`MODEL_REMAPPING`] for reference but no arch crate is imported
 //! here.
@@ -67,7 +67,7 @@ pub const MODEL_REMAPPING: &[(&str, &str)] = &[
 /// concrete STS models; this trait is the *shape* per-architecture
 /// crates (lfm_audio / sam_audio / deepfilternet / mossformer2_se /
 /// moshi) implement so a caller can hand-off any STS architecture as a
-/// `Box<dyn StsModel>` from [`load`] / [`load_model`].
+/// `Box<dyn Model>` from [`load`] / [`load_model`].
 ///
 /// `process` is the unified entry point (mlx-audio uses different
 /// method names per architecture — `enhance` for noise suppression,
@@ -78,7 +78,7 @@ pub const MODEL_REMAPPING: &[(&str, &str)] = &[
 /// `&self` because weights are immutable after load.
 ///
 /// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
-pub trait StsModel {
+pub trait Model {
   /// Run STS inference on `audio`, returning the processed waveform.
   ///
   /// `audio` is the input waveform (typically a 1-D `(T,)` float
@@ -99,7 +99,7 @@ pub trait StsModel {
   fn sample_rate(&self) -> u32;
 }
 
-/// Construct an [`StsModel`] from a local on-disk model directory —
+/// Construct a [`Model`] from a local on-disk model directory —
 /// faithful 1:1 of `mlx_audio.sts.utils.load_model`
 /// ([sts-utils.py:112-163][sts-utils-loadmodel]).
 ///
@@ -121,9 +121,9 @@ pub trait StsModel {
 /// [sts-utils-loadmodel]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/utils.py#L112-L163
 /// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 /// [`Error::Backend`]: crate::Error::Backend
-pub fn load_model<F>(path: &str, constructor: F) -> Result<Box<dyn StsModel>>
+pub fn load_model<F>(path: &str, constructor: F) -> Result<Box<dyn Model>>
 where
-  F: FnOnce(LoadedAudioModel) -> Result<Box<dyn StsModel>>,
+  F: FnOnce(LoadedAudioModel) -> Result<Box<dyn Model>>,
 {
   let bundle = base_load_model(path)?;
   constructor(bundle)
@@ -134,9 +134,9 @@ where
 /// Thin alias over [`load_model`].
 ///
 /// [sts-utils-load]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/utils.py#L166-L173
-pub fn load<F>(path: &str, constructor: F) -> Result<Box<dyn StsModel>>
+pub fn load<F>(path: &str, constructor: F) -> Result<Box<dyn Model>>
 where
-  F: FnOnce(LoadedAudioModel) -> Result<Box<dyn StsModel>>,
+  F: FnOnce(LoadedAudioModel) -> Result<Box<dyn Model>>,
 {
   load_model(path, constructor)
 }
@@ -148,7 +148,7 @@ mod tests {
 
   struct FakeSts;
 
-  impl StsModel for FakeSts {
+  impl Model for FakeSts {
     fn process(&self, audio: &Array) -> Result<Array> {
       let t = audio.size();
       Array::from_slice::<f32>(&vec![0.0; t], &(t,))
@@ -178,7 +178,7 @@ mod tests {
     fs::write(dir.join("config.json"), body).unwrap();
 
     let captured: std::cell::RefCell<Option<PathBuf>> = std::cell::RefCell::new(None);
-    let model = load(&dir.to_string_lossy(), |bundle| {
+    let model: Box<dyn Model> = load(&dir.to_string_lossy(), |bundle| {
       *captured.borrow_mut() = Some(bundle.model_path().to_path_buf());
       Ok(Box::new(FakeSts))
     })
