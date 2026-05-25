@@ -259,9 +259,9 @@ impl PlaybackConfig {
   pub fn cpal_config(&self) -> crate::error::Result<cpal::StreamConfig> {
     let channels = self.channels.count();
     if channels == 0 {
-      return Err(crate::error::Error::Backend {
-        message: "PlaybackConfig: channel count must be >= 1".to_string(),
-      });
+      return Err(crate::error::Error::Backend(
+        "PlaybackConfig: channel count must be >= 1".to_string(),
+      ));
     }
     let buffer_size = match self.buffer_size_frames {
       Some(n) => cpal::BufferSize::Fixed(n),

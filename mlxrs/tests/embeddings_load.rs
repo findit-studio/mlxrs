@@ -52,9 +52,9 @@ impl EmbeddingModel for MockEmbedding {
     let (batch, seq) = match input_ids.shape().as_slice() {
       [b, s] => (*b, *s),
       other => {
-        return Err(Error::ShapeMismatch {
-          message: format!("expects (batch, seq), got {other:?}"),
-        });
+        return Err(Error::ShapeMismatch(format!(
+          "expects (batch, seq), got {other:?}"
+        )));
       }
     };
     let hidden = 4usize;
@@ -202,7 +202,7 @@ fn empty_model_directory_errors_before_filesystem_root_scan() {
       panic!("an empty model directory path must be a recoverable error, not a load");
     };
     assert!(
-      matches!(err, Error::Backend { .. }),
+      matches!(err, Error::Backend(_)),
       "expected a recoverable Backend error; got {err:?}"
     );
     let msg = err.to_string();
@@ -233,7 +233,7 @@ fn empty_tokenizer_source_errors() {
     panic!("an empty tokenizer_source path must be a recoverable error");
   };
   assert!(
-    matches!(err, Error::Backend { .. }),
+    matches!(err, Error::Backend(_)),
     "expected a recoverable Backend error; got {err:?}"
   );
   assert!(
@@ -319,7 +319,7 @@ fn load_non_utf8_leaf_model_shard_is_recoverable_error() {
     panic!("a non-UTF-8 model*.safetensors leaf must be a recoverable error, not a panic");
   };
   assert!(
-    matches!(err, Error::Backend { .. }),
+    matches!(err, Error::Backend(_)),
     "expected a recoverable Backend error; got {err:?}"
   );
   let msg = err.to_string();
@@ -372,7 +372,7 @@ fn load_non_utf8_leaf_shard_wins_over_stale_weight_fallback() {
     );
   };
   assert!(
-    matches!(err, Error::Backend { .. }),
+    matches!(err, Error::Backend(_)),
     "expected a recoverable Backend error; got {err:?}"
   );
   let msg = err.to_string();
@@ -414,7 +414,7 @@ fn load_non_utf8_leaf_shard_nested_under_subfolder_is_recoverable_error() {
     panic!("a non-UTF-8 leaf shard nested under a subfolder must be a recoverable error");
   };
   assert!(
-    matches!(err, Error::Backend { .. }),
+    matches!(err, Error::Backend(_)),
     "expected a recoverable Backend error; got {err:?}"
   );
   let msg = err.to_string();
@@ -474,7 +474,7 @@ fn load_broken_symlink_pooling_config_is_recoverable_error() {
     );
   };
   assert!(
-    matches!(err, Error::Backend { .. }),
+    matches!(err, Error::Backend(_)),
     "expected a recoverable Backend error; got {err:?}"
   );
 }
@@ -555,7 +555,7 @@ fn load_permission_denied_pooling_config_is_recoverable_error() {
     );
   };
   assert!(
-    matches!(err, Error::Backend { .. }),
+    matches!(err, Error::Backend(_)),
     "expected a recoverable Backend error; got {err:?}"
   );
 }

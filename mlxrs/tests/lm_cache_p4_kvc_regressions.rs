@@ -82,10 +82,9 @@ impl KvCache for RollbackProbeCache {
     // trait does NOT require `set_state` to be atomic, so the default
     // `from_serialized` must restore the snapshot even on this arm.
     if self.recorded_state_id == -1 {
-      return Err(Error::Backend {
-        message: "RollbackProbeCache: forced set_state failure (post-mutation) for KVC-1 test"
-          .into(),
-      });
+      return Err(Error::Backend(
+        "RollbackProbeCache: forced set_state failure (post-mutation) for KVC-1 test".into(),
+      ));
     }
     Ok(())
   }
@@ -96,9 +95,9 @@ impl KvCache for RollbackProbeCache {
     self.calls.push("set_meta_state");
     // Sentinel that triggers the rollback path deterministically.
     if m.first().map(String::as_str) == Some("FAIL_SENTINEL") {
-      return Err(Error::Backend {
-        message: "RollbackProbeCache: forced failure for KVC-1 test".into(),
-      });
+      return Err(Error::Backend(
+        "RollbackProbeCache: forced failure for KVC-1 test".into(),
+      ));
     }
     self.recorded_meta = m.first().cloned().unwrap_or_default();
     Ok(())
@@ -294,7 +293,7 @@ fn kvc3_kvcachekind_parse_unknown_is_recoverable_err() {
   // string-keyed `other => Err(...)` arm). NEVER a panic.
   let result = KvCacheKind::parse("DefinitelyNotARealCacheKind");
   match result {
-    Err(Error::Backend { message }) => {
+    Err(Error::Backend(message)) => {
       assert!(
         message.contains("unknown cache kind"),
         "diagnostic must name the failure mode; got {message:?}"
@@ -353,7 +352,7 @@ fn kvc8_quantized_set_state_4_arr_rejects_kv_shape_mismatch() {
   let mut cache = QuantizedKvCacheImpl::new(64, 4);
   let result = cache.set_state(state);
   match result {
-    Err(Error::ShapeMismatch { message }) => {
+    Err(Error::ShapeMismatch(message)) => {
       assert!(
         message.contains("set_state"),
         "diagnostic must name the load boundary; got {message:?}"
@@ -393,7 +392,7 @@ fn kvc8_quantized_set_state_6_arr_rejects_kv_bias_shape_mismatch() {
   let mut cache = QuantizedKvCacheImpl::new(64, 4);
   let result = cache.set_state(state);
   match result {
-    Err(Error::ShapeMismatch { message }) => {
+    Err(Error::ShapeMismatch(message)) => {
       assert!(
         message.contains("biases"),
         "diagnostic must name the offending element (biases); got {message:?}"
@@ -480,7 +479,7 @@ fn kvc8_quantized_set_state_rejects_non_4d_rank() {
   let mut cache = QuantizedKvCacheImpl::new(64, 4);
   let result = cache.set_state(state);
   match result {
-    Err(Error::ShapeMismatch { message }) => {
+    Err(Error::ShapeMismatch(message)) => {
       assert!(
         message.contains("4-D") || message.contains("rank"),
         "rank-gate diagnostic must name the 4-D requirement; got {message:?}"

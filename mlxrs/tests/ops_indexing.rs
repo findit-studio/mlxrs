@@ -54,7 +54,7 @@ fn gather_single_axis_slice_sizes_one() {
 fn gather_rejects_empty_indices() {
   let a = Array::from_slice::<f32>(&[1.0, 2.0], &[2i32]).unwrap();
   let r = ops::indexing::gather(&a, &[], &[], &[1]);
-  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })));
+  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch(_))));
 }
 
 #[test]
@@ -63,7 +63,16 @@ fn gather_rejects_indices_axes_length_mismatch() {
   let idx = Array::from_slice::<i32>(&[0], &[1i32]).unwrap();
   // Only one indices array, but two axes -> rejected before FFI.
   let r = ops::indexing::gather(&a, &[&idx], &[0, 1], &[1, 1]);
-  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })));
+  assert!(
+    matches!(
+      r,
+      Err(mlxrs::Error::LengthMismatch(ref p))
+        if p.context() == "gather: indices.len() vs axes.len()"
+          && p.expected() == 2
+          && p.actual() == 1
+    ),
+    "expected LengthMismatch; got {r:?}"
+  );
 }
 
 #[test]
@@ -73,7 +82,7 @@ fn gather_rejects_negative_slice_size() {
   let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3i32]).unwrap();
   let idx = Array::from_slice::<i32>(&[0], &[1i32]).unwrap();
   let r = ops::indexing::gather(&a, &[&idx], &[0], &[-1]);
-  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })));
+  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch(_))));
 }
 
 #[test]
@@ -83,7 +92,16 @@ fn gather_rejects_slice_sizes_rank_mismatch() {
   let idx = Array::from_slice::<i32>(&[0], &[1i32]).unwrap();
   // a.ndim() == 2 but slice_sizes is rank-1 -> rejected before FFI.
   let r = ops::indexing::gather(&a, &[&idx], &[0], &[1]);
-  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })));
+  assert!(
+    matches!(
+      r,
+      Err(mlxrs::Error::LengthMismatch(ref p))
+        if p.context() == "gather: slice_sizes.len() vs a.ndim()"
+          && p.expected() == 2
+          && p.actual() == 1
+    ),
+    "expected LengthMismatch; got {r:?}"
+  );
 }
 
 #[test]

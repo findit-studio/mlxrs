@@ -69,9 +69,9 @@ pub trait CodecModel {
   /// `Encodec.encode` / `Mimi.encode` per-class implementations.
   fn encode(&self, audio: &Array) -> Result<Array> {
     let _ = audio;
-    Err(Error::Backend {
-      message: "codec needs `encode` override (per-architecture)".into(),
-    })
+    Err(Error::Backend(
+      "codec needs `encode` override (per-architecture)".into(),
+    ))
   }
 
   /// Decode codec codes back into a waveform.
@@ -84,9 +84,9 @@ pub trait CodecModel {
   /// concrete codec MUST override it.
   fn decode(&self, codes: &Array) -> Result<Array> {
     let _ = codes;
-    Err(Error::Backend {
-      message: "codec needs `decode` override (per-architecture)".into(),
-    })
+    Err(Error::Backend(
+      "codec needs `decode` override (per-architecture)".into(),
+    ))
   }
 
   /// The codec's output PCM sample rate in Hz.

@@ -291,7 +291,7 @@ fn prepare_inputs_caller_mask_dimension_mismatch_errors() {
     .with_attention_mask(bad_mask);
   let err = prepare_inputs(batches, None, None, None, &opts).unwrap_err();
   assert!(
-    matches!(err, Error::ShapeMismatch { .. }),
+    matches!(err, Error::ShapeMismatch(_)),
     "expected ShapeMismatch, got: {err:?}"
   );
   let msg = format!("{err}");
@@ -315,7 +315,7 @@ fn prepare_inputs_caller_mask_inner_dimension_mismatch_errors() {
     .with_attention_mask(bad_mask);
   let err = prepare_inputs(batches, None, None, None, &opts).unwrap_err();
   assert!(
-    matches!(err, Error::ShapeMismatch { .. }),
+    matches!(err, Error::ShapeMismatch(_)),
     "expected ShapeMismatch, got: {err:?}"
   );
   let msg = format!("{err}");

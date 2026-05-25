@@ -57,7 +57,7 @@ use std::path::Path;
 use crate::{
   array::Array,
   audio::{dsp, io as audio_io},
-  error::{Error, Result, try_extend_from_slice},
+  error::{Error, OutOfRangePayload, Result, try_extend_from_slice},
   lm::{
     cache::KvCache,
     generate::{
@@ -202,12 +202,11 @@ fn audio_path_to_mel<M: super::model::Model>(
   //    makes the negated form non-trivially equivalent. `is_finite()`
   //    covers both NaN and ±inf, `> 0.0` covers zero/negative.
   if !cfg.max_audio_seconds().is_finite() || cfg.max_audio_seconds() <= 0.0 {
-    return Err(Error::Backend {
-      message: format!(
-        "stt_generate: `max_audio_seconds` must be a finite value > 0 (got {})",
-        cfg.max_audio_seconds()
-      ),
-    });
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt_generate: max_audio_seconds",
+      "must be a finite value > 0",
+      format!("{}", cfg.max_audio_seconds()),
+    )));
   }
 
   // 1. Load. `load_audio` decodes WAV / MP3 / FLAC / OGG-Vorbis (the
@@ -276,15 +275,13 @@ fn audio_path_to_mel<M: super::model::Model>(
   let cap_f64 = f64::from(cfg.max_audio_seconds());
   let src_duration = samples.len() as f64 / f64::from(src_sr);
   if src_duration > cap_f64 {
-    return Err(Error::Backend {
-      message: format!(
-        "stt_generate: audio duration {src_duration:.3}s (source sample_rate \
+    return Err(Error::Backend(format!(
+      "stt_generate: audio duration {src_duration:.3}s (source sample_rate \
          {src_sr}) exceeds `max_audio_seconds` cap {:.3}s (samples={}); reject \
          before resample / mel-spec allocation",
-        cfg.max_audio_seconds(),
-        samples.len()
-      ),
-    });
+      cfg.max_audio_seconds(),
+      samples.len()
+    )));
   }
 
   // `mc` was snapshotted ONCE above (Codex #64 finding: calling
@@ -308,12 +305,10 @@ fn audio_path_to_mel<M: super::model::Model>(
   } else if cfg.auto_resample() {
     audio_io::resample_linear(&samples, src_sr, target_sr)?
   } else {
-    return Err(Error::Backend {
-      message: format!(
-        "stt_generate: audio sample rate {src_sr} != model.mel_config().sample_rate \
+    return Err(Error::Backend(format!(
+      "stt_generate: audio sample rate {src_sr} != model.mel_config().sample_rate \
          {target_sr} but `cfg.auto_resample` is false; enable auto_resample or pre-resample"
-      ),
-    });
+    )));
   };
 
   // 4. Reject empty (or otherwise too-short-to-frame) audio. Fabricating
@@ -326,28 +321,26 @@ fn audio_path_to_mel<M: super::model::Model>(
   //    reflect-pad guards, which already return a recoverable `Err` with
   //    a descriptive message.
   if samples.is_empty() {
-    return Err(Error::Backend {
-      message: format!(
-        "stt_generate: audio input is empty (0 samples after load{}) — \
+    return Err(Error::Backend(format!(
+      "stt_generate: audio input is empty (0 samples after load{}) — \
          `model.encode_audio` requires at least one mel frame; provide a \
          non-empty WAV",
-        if src_sr == target_sr {
-          ""
-        } else {
-          " + resample"
-        }
-      ),
-    });
+      if src_sr == target_sr {
+        ""
+      } else {
+        " + resample"
+      }
+    )));
   }
 
   // 5. Build an Array from the f32 buffer. `samples.len()` fits i32 because
   //    `load_audio`'s `MAX_DECODED_SAMPLES = 64 Mi` and `resample_linear`'s
   //    `MAX_RESAMPLED_SAMPLES = 64 Mi` are both well below `i32::MAX`.
-  let n_samples = i32::try_from(samples.len()).map_err(|_| Error::Backend {
-    message: format!(
+  let n_samples = i32::try_from(samples.len()).map_err(|_| {
+    Error::Backend(format!(
       "stt_generate: samples.len() {} exceeds i32::MAX",
       samples.len()
-    ),
+    ))
   })?;
   let samples_arr = Array::from_slice::<f32>(&samples, &[n_samples])?;
 
@@ -445,11 +438,9 @@ impl<M: super::model::Model> SttGenerator<'_, M> {
     // confusing downstream error.
     let shape = logits.shape();
     if shape.len() != 2 || shape[0] != 1 || shape[1] == 0 {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "stt_generate: `decode_step` must return [1, V] logits with V >= 1, got {shape:?}"
-        ),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "stt_generate: `decode_step` must return [1, V] logits with V >= 1, got {shape:?}"
+      )));
     }
 
     // 2. accumulate the step's *input* token (the previously-sampled

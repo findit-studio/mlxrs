@@ -56,7 +56,7 @@ use std::{
 
 use crate::{
   array::Array,
-  error::{Error, Result, try_with_capacity},
+  error::{EmptyInputPayload, Error, FileIoPayload, FileOp, Result, try_with_capacity},
   lm::{
     cache::{CacheConfig, KvCache, make_prompt_cache, save_prompt_cache},
     model::Model,
@@ -106,16 +106,14 @@ fn encode_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<Vec<u32>> {
     let messages = serde_json::json!([{ "role": "user", "content": prompt }]);
     let ids = tokenizer
       .apply_chat_template_ids(&messages, None, false, true, None)
-      .map_err(|e| Error::Backend {
-        message: format!("cache_prompt: apply_chat_template failed: {e}"),
-      })?;
+      .map_err(|e| Error::Backend(format!("cache_prompt: apply_chat_template failed: {e}")))?;
     Ok(ids)
   } else {
     // mlx-lm `tokenizer.encode(args.prompt)` — the tokenizer's default
     // special-token handling (transformers `encode` adds specials).
-    tokenizer.encode(prompt, true).map_err(|e| Error::Backend {
-      message: format!("cache_prompt: encode failed: {e}"),
-    })
+    tokenizer
+      .encode(prompt, true)
+      .map_err(|e| Error::Backend(format!("cache_prompt: encode failed: {e}")))
   }
 }
 
@@ -331,11 +329,9 @@ pub fn cache_prompt_ids<M: Model>(
   // over zero tokens would silently save an empty cache, so reject it (the
   // save below never runs, so no file is written).
   if prompt_ids.is_empty() {
-    return Err(Error::Backend {
-      message:
-        "cache_prompt: prompt must be non-empty (mlx-lm raises ValueError on an empty prompt)"
-          .into(),
-    });
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "cache_prompt: prompt",
+    )));
   }
 
   // 2. Allocate a fresh per-layer KV cache — cache_prompt.py:111
@@ -411,11 +407,11 @@ fn open_excl_temp_safetensors(final_path: &Path, max_retries: u32) -> Result<Pat
   let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
   let file_name = final_path
     .file_name()
-    .ok_or_else(|| Error::Backend {
-      message: format!(
+    .ok_or_else(|| {
+      Error::Backend(format!(
         "cache_prompt: destination {} has no file_name component",
         final_path.display()
-      ),
+      ))
     })?
     .to_string_lossy()
     .into_owned();
@@ -446,23 +442,19 @@ fn open_excl_temp_safetensors(final_path: &Path, max_retries: u32) -> Result<Pat
         continue;
       }
       Err(e) => {
-        return Err(Error::Backend {
-          message: format!(
-            "cache_prompt: create_new tempfile {} failed: {e}",
-            candidate.display()
-          ),
-        });
+        return Err(Error::Backend(format!(
+          "cache_prompt: create_new tempfile {} failed: {e}",
+          candidate.display()
+        )));
       }
     }
   }
-  Err(Error::Backend {
-    message: format!(
-      "cache_prompt: exhausted {max_retries} tempfile retries (last error: {})",
-      last_err
-        .map(|e| e.to_string())
-        .unwrap_or_else(|| "<none>".into())
-    ),
-  })
+  Err(Error::Backend(format!(
+    "cache_prompt: exhausted {max_retries} tempfile retries (last error: {})",
+    last_err
+      .map(|e| e.to_string())
+      .unwrap_or_else(|| "<none>".into())
+  )))
 }
 
 /// Atomically save `cache` (+ `metadata`) to `out_path` — the durable,
@@ -507,17 +499,21 @@ fn save_prompt_cache_atomic(
     // delayed-allocation / NFS / quota writeback failure must surface here,
     // not after we've renamed a not-yet-on-disk file into place. mlx-c does
     // not fsync; reopen the path read-only and `sync_all` it.
-    let f = fs::File::open(&tmp_path).map_err(|e| Error::Backend {
-      message: format!(
-        "cache_prompt: reopen tempfile {} for fsync failed: {e}",
-        tmp_path.display()
-      ),
+    let f = fs::File::open(&tmp_path).map_err(|e| {
+      Error::FileIo(FileIoPayload::new(
+        "cache_prompt: reopen tempfile",
+        FileOp::Open,
+        tmp_path.to_path_buf(),
+        e,
+      ))
     })?;
-    f.sync_all().map_err(|e| Error::Backend {
-      message: format!(
-        "cache_prompt: fsync tempfile {} failed: {e}",
-        tmp_path.display()
-      ),
+    f.sync_all().map_err(|e| {
+      Error::FileIo(FileIoPayload::new(
+        "cache_prompt: fsync tempfile",
+        FileOp::Fsync,
+        tmp_path.to_path_buf(),
+        e,
+      ))
     })?;
     drop(f);
     Ok(())
@@ -535,12 +531,10 @@ fn save_prompt_cache_atomic(
     && let Err(e) = fs::set_permissions(&tmp_path, perms)
   {
     let _ = fs::remove_file(&tmp_path);
-    return Err(Error::Backend {
-      message: format!(
-        "cache_prompt: set_permissions on tempfile {} failed: {e}",
-        tmp_path.display()
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "cache_prompt: set_permissions on tempfile {} failed: {e}",
+      tmp_path.display()
+    )));
   }
 
   // Atomic-within-fs rename: no observer can see a half-written cache at the
@@ -548,13 +542,11 @@ fn save_prompt_cache_atomic(
   // destination keeps whatever it had before — never a partial file).
   if let Err(e) = fs::rename(&tmp_path, &dest) {
     let _ = fs::remove_file(&tmp_path);
-    return Err(Error::Backend {
-      message: format!(
-        "cache_prompt: rename {} -> {} failed: {e}",
-        tmp_path.display(),
-        dest.display()
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "cache_prompt: rename {} -> {} failed: {e}",
+      tmp_path.display(),
+      dest.display()
+    )));
   }
   Ok(())
 }
@@ -672,9 +664,9 @@ mod tests {
           [_, s] => *s,
           [s] => *s,
           other => {
-            return Err(Error::ShapeMismatch {
-              message: format!("Recorder: expected [B,S], got {other:?}"),
-            });
+            return Err(Error::ShapeMismatch(format!(
+              "Recorder: expected [B,S], got {other:?}"
+            )));
           }
         };
         self.seq_lens.borrow_mut().push(s);

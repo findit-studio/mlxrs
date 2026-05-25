@@ -158,7 +158,7 @@ use super::{
   config::{PlaybackConfig, SampleFormat},
   output_stream::AudioOutputStream,
 };
-use crate::error::{Error, Result};
+use crate::error::{ArithmeticOverflowPayload, Error, Result};
 
 /// Stopped — the cpal stream is built but not playing (Swift's
 /// `!isStreaming && !isPlaying`).
@@ -296,11 +296,11 @@ impl SharedState {
     let mut queue = VecDeque::new();
     queue
       .try_reserve_exact(queue_capacity_samples)
-      .map_err(|e| Error::Backend {
-        message: format!(
+      .map_err(|e| {
+        Error::Backend(format!(
           "AudioPlayer::with_device failed to pre-allocate queue capacity \
            ({queue_capacity_samples} samples): {e}"
-        ),
+        ))
       })?;
     Ok(Self {
       queue: Mutex::new(queue),
@@ -396,8 +396,8 @@ impl AudioPlayer {
   ///   etc.).
   pub fn new(config: PlaybackConfig) -> Result<Self> {
     let host = cpal::default_host();
-    let device = host.default_output_device().ok_or_else(|| Error::Backend {
-      message: "AudioPlayer: no default cpal output device available".to_string(),
+    let device = host.default_output_device().ok_or_else(|| {
+      Error::Backend("AudioPlayer: no default cpal output device available".to_string())
     })?;
     Self::with_device(&device, config)
   }
@@ -413,13 +413,11 @@ impl AudioPlayer {
   ///   the config (zero channels) or the cpal stream build fails.
   pub fn with_device(device: &cpal::Device, config: PlaybackConfig) -> Result<Self> {
     if !matches!(config.sample_format(), SampleFormat::F32) {
-      return Err(Error::Backend {
-        message: format!(
-          "AudioPlayer: only SampleFormat::F32 is currently supported (got {:?}); \
+      return Err(Error::Backend(format!(
+        "AudioPlayer: only SampleFormat::F32 is currently supported (got {:?}); \
            non-F32 device negotiation is reserved for a follow-up",
-          config.sample_format()
-        ),
-      });
+        config.sample_format()
+      )));
     }
 
     let stream_config = config.cpal_config()?;
@@ -427,9 +425,10 @@ impl AudioPlayer {
     let queue_capacity_samples = config
       .queue_capacity_frames()
       .checked_mul(usize::from(config.channels().count()))
-      .ok_or_else(|| Error::Backend {
-        message: "AudioPlayer: queue_capacity_frames * channels overflows usize".to_string(),
-      })?;
+      .ok_or(Error::ArithmeticOverflow(ArithmeticOverflowPayload::new(
+        "AudioPlayer: queue_capacity_frames * channels",
+        "usize",
+      )))?;
 
     let shared = Arc::new(SharedState::new(queue_capacity_samples)?);
 
@@ -503,9 +502,7 @@ impl AudioPlayer {
 
     let stream = device
       .build_output_stream(&stream_config, data_callback, err_callback, None)
-      .map_err(|e| Error::Backend {
-        message: format!("AudioPlayer: cpal build_output_stream failed: {e}"),
-      })?;
+      .map_err(|e| Error::Backend(format!("AudioPlayer: cpal build_output_stream failed: {e}")))?;
 
     Ok(Self {
       stream: Some(stream),
@@ -615,18 +612,17 @@ impl AudioPlayer {
     // subsequent `write_samples()` slip past its `STATE_STOPPED`
     // gate. Acquire-load pairs with the Release-store in `stop()`.
     if self.shared.terminated.load(Ordering::Acquire) {
-      return Err(Error::Backend {
-        message: "AudioPlayer::start called on terminated player — construct a new AudioPlayer"
-          .to_string(),
-      });
+      return Err(Error::Backend(
+        "AudioPlayer::start called on terminated player — construct a new AudioPlayer".to_string(),
+      ));
     }
     self.take_callback_error()?;
-    let stream = self.stream.as_ref().ok_or_else(|| Error::Backend {
-      message: "AudioPlayer::start: stream has been dropped (post-stop)".to_string(),
+    let stream = self.stream.as_ref().ok_or_else(|| {
+      Error::Backend("AudioPlayer::start: stream has been dropped (post-stop)".to_string())
     })?;
-    stream.play().map_err(|e| Error::Backend {
-      message: format!("AudioPlayer::start: cpal play() failed: {e}"),
-    })?;
+    stream
+      .play()
+      .map_err(|e| Error::Backend(format!("AudioPlayer::start: cpal play() failed: {e}")))?;
     self.shared.state.store(STATE_RUNNING, Ordering::Release);
     Ok(())
   }
@@ -645,18 +641,17 @@ impl AudioPlayer {
   /// - [`Error::Backend`] if the cpal `Stream::pause()` call fails.
   pub fn pause(&mut self) -> Result<()> {
     if self.shared.terminated.load(Ordering::Acquire) {
-      return Err(Error::Backend {
-        message: "AudioPlayer::pause called on terminated player — construct a new AudioPlayer"
-          .to_string(),
-      });
+      return Err(Error::Backend(
+        "AudioPlayer::pause called on terminated player — construct a new AudioPlayer".to_string(),
+      ));
     }
     self.take_callback_error()?;
-    let stream = self.stream.as_ref().ok_or_else(|| Error::Backend {
-      message: "AudioPlayer::pause: stream has been dropped (post-stop)".to_string(),
+    let stream = self.stream.as_ref().ok_or_else(|| {
+      Error::Backend("AudioPlayer::pause: stream has been dropped (post-stop)".to_string())
     })?;
-    stream.pause().map_err(|e| Error::Backend {
-      message: format!("AudioPlayer::pause: cpal pause() failed: {e}"),
-    })?;
+    stream
+      .pause()
+      .map_err(|e| Error::Backend(format!("AudioPlayer::pause: cpal pause() failed: {e}")))?;
     self.shared.state.store(STATE_PAUSED, Ordering::Release);
     Ok(())
   }
@@ -678,10 +673,9 @@ impl AudioPlayer {
   /// - [`Error::Backend`] if the cpal `Stream::play()` call fails.
   pub fn resume(&mut self) -> Result<()> {
     if self.shared.terminated.load(Ordering::Acquire) {
-      return Err(Error::Backend {
-        message: "AudioPlayer::resume called on terminated player — construct a new AudioPlayer"
-          .to_string(),
-      });
+      return Err(Error::Backend(
+        "AudioPlayer::resume called on terminated player — construct a new AudioPlayer".to_string(),
+      ));
     }
     self.start()
   }
@@ -741,9 +735,9 @@ impl AudioPlayer {
     // tears down the queue + error slot; the pause error (if any)
     // is reported AFTER the cleanup runs.
     let pause_result = if let Some(stream) = self.stream.as_ref() {
-      stream.pause().map_err(|e| Error::Backend {
-        message: format!("AudioPlayer::stop: cpal pause() failed: {e}"),
-      })
+      stream
+        .pause()
+        .map_err(|e| Error::Backend(format!("AudioPlayer::stop: cpal pause() failed: {e}")))
     } else {
       Ok(())
     };
@@ -798,10 +792,9 @@ impl AudioPlayer {
     // chunks on the re-armed stream. Acquire-load pairs with the
     // Release-store in `stop()`.
     if self.shared.terminated.load(Ordering::Acquire) {
-      return Err(Error::Backend {
-        message: "AudioPlayer::write_samples called after stop() — player is terminated"
-          .to_string(),
-      });
+      return Err(Error::Backend(
+        "AudioPlayer::write_samples called after stop() — player is terminated".to_string(),
+      ));
     }
     self.take_callback_error()?;
 
@@ -810,9 +803,9 @@ impl AudioPlayer {
     // the first `start()` rather than start cleanly.
     let state = self.shared.state.load(Ordering::Acquire);
     if state == STATE_STOPPED {
-      return Err(Error::Backend {
-        message: "AudioPlayer::write_samples called after stop()".to_string(),
-      });
+      return Err(Error::Backend(
+        "AudioPlayer::write_samples called after stop()".to_string(),
+      ));
     }
 
     // Whole-payload overflow check up front (one lock acquisition).
@@ -823,23 +816,19 @@ impl AudioPlayer {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
       };
-      let projected_len = q
-        .len()
-        .checked_add(samples.len())
-        .ok_or_else(|| Error::Backend {
-          message: "AudioPlayer::write_samples: queue length + new samples overflows usize"
-            .to_string(),
-        })?;
+      let projected_len = q.len().checked_add(samples.len()).ok_or_else(|| {
+        Error::Backend(
+          "AudioPlayer::write_samples: queue length + new samples overflows usize".to_string(),
+        )
+      })?;
       if projected_len > self.shared.queue_capacity_samples {
-        return Err(Error::Backend {
-          message: format!(
-            "AudioPlayer::write_samples: queue overflow (capacity {} samples, current {} \
+        return Err(Error::Backend(format!(
+          "AudioPlayer::write_samples: queue overflow (capacity {} samples, current {} \
              samples, tried to push {})",
-            self.shared.queue_capacity_samples,
-            q.len(),
-            samples.len()
-          ),
-        });
+          self.shared.queue_capacity_samples,
+          q.len(),
+          samples.len()
+        )));
       }
     }
 
@@ -895,20 +884,16 @@ impl AudioPlayer {
       }
       let state = self.shared.state.load(Ordering::Acquire);
       if state != STATE_RUNNING {
-        return Err(Error::Backend {
-          message: format!(
-            "AudioPlayer::flush: queue has {depth} samples but state is {state} (not running) — \
+        return Err(Error::Backend(format!(
+          "AudioPlayer::flush: queue has {depth} samples but state is {state} (not running) — \
              call start() before flush()"
-          ),
-        });
+        )));
       }
       if start.elapsed() > FLUSH_TIMEOUT {
-        return Err(Error::Backend {
-          message: format!(
-            "AudioPlayer::flush: timed out after {:?} with {depth} samples still queued",
-            FLUSH_TIMEOUT
-          ),
-        });
+        return Err(Error::Backend(format!(
+          "AudioPlayer::flush: timed out after {:?} with {depth} samples still queued",
+          FLUSH_TIMEOUT
+        )));
       }
       thread::sleep(FLUSH_POLL_INTERVAL);
       self.take_callback_error()?;
@@ -924,7 +909,7 @@ impl AudioPlayer {
       Err(poisoned) => poisoned.into_inner(),
     };
     if let Some(msg) = slot.take() {
-      return Err(Error::Backend { message: msg });
+      return Err(Error::Backend(msg));
     }
     Ok(())
   }

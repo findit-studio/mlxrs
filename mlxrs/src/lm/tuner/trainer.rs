@@ -77,6 +77,7 @@
 //! - **`mx.random.state` thread-state** — out of scope; callers seed their
 //!   own RNG and pass it through `iterate_batches`'s `seed`.
 
+use crate::error::{EmptyInputPayload, InvariantViolationPayload};
 use std::{collections::HashMap, marker::PhantomData, time::Instant};
 
 use crate::{
@@ -398,23 +399,21 @@ where
   let (_b, s) = match shape.as_slice() {
     [b, s] => (*b, *s),
     other => {
-      return Err(Error::ShapeMismatch {
-        message: format!("default_loss: batch must be [B, S], got {other:?}"),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "default_loss: batch must be [B, S], got {other:?}"
+      )));
     }
   };
   if s < 2 {
-    return Err(Error::ShapeMismatch {
-      message: format!("default_loss: batch S={s} must be >= 2 for next-token prediction"),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "default_loss: batch S={s} must be >= 2 for next-token prediction"
+    )));
   }
   let lengths_shape = lengths.shape();
   if lengths_shape.len() != 2 || lengths_shape[1] != 2 {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "default_loss: lengths must be [B, 2] = (offset, length), got {lengths_shape:?}"
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "default_loss: lengths must be [B, 2] = (offset, length), got {lengths_shape:?}"
+    )));
   }
   // inputs = batch[:, :-1], targets = batch[:, 1:]
   let b_dim = shape[0] as i32;
@@ -460,12 +459,12 @@ where
   // numerical fault.
   let ntoks_count = ntoks.item::<f32>()?;
   if ntoks_count == 0.0 {
-    return Err(Error::Backend {
-      message: "default_loss: batch produced 0 supervised tokens after applying the length mask. \
+    return Err(Error::Backend(
+      "default_loss: batch produced 0 supervised tokens after applying the length mask. \
                 All examples in the batch are too short (prompt-only or fully truncated) or have \
                 length <= 1. Filter such examples upstream."
         .into(),
-    });
+    ));
   }
   // loss = ce.astype(f32).sum() / ntoks
   let ce_sum = reduction::sum(&ce_masked.astype(Dtype::F32)?, false)?;
@@ -710,12 +709,10 @@ pub fn iterate_batches<'a, D: Dataset + 'a>(
   shuffle_seed: Option<u64>,
 ) -> Result<impl Iterator<Item = Result<Batch>> + 'a> {
   if dataset.len() < batch_size {
-    return Err(Error::Backend {
-      message: format!(
-        "iterate_batches: dataset has {} examples; need at least batch_size={batch_size}",
-        dataset.len(),
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "iterate_batches: dataset has {} examples; need at least batch_size={batch_size}",
+      dataset.len(),
+    )));
   }
   // Length-sort indices.
   let mut idx: Vec<usize> = (0..dataset.len()).collect();
@@ -878,9 +875,9 @@ where
     total_tokens += ntoks_f;
   }
   if total_tokens == 0.0 {
-    return Err(Error::Backend {
-      message: "evaluate: no tokens accumulated (eval set produced no batches)".into(),
-    });
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "evaluate: eval set (produced no batches with tokens)",
+    )));
   }
   Ok(total_loss / total_tokens)
 }
@@ -941,16 +938,10 @@ where
   C: TrainingCallback,
 {
   if !args.acknowledge_no_real_gradients() {
-    return Err(Error::Backend {
-      message: "train: TrainingArgs::acknowledge_no_real_gradients must be set to `true` to \
-                run the v1 mechanics-only training path. v1 wires the optimizer step + \
-                callbacks + save hook end-to-end but does NOT compute real per-parameter \
-                gradients (the `nn::Module` trait that binds `params -> loss` for \
-                `value_and_grad` is not yet ported). Flip this field to `true` if you only \
-                need the optimizer/callback/save mechanics; otherwise wait for the \
-                follow-up that lands the Module trait."
-        .into(),
-    });
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "train: TrainingArgs::acknowledge_no_real_gradients",
+      "must be set to `true` to run the v1 mechanics-only training path",
+    )));
   }
   if args.iters() == 0 {
     return Ok(());
@@ -960,24 +951,28 @@ where
   // tested the periodic-report / eval / save predicate, so reject up
   // front with a clear error instead of letting it crash at iteration 1.
   if args.grad_accumulation_steps() == 0 {
-    return Err(Error::Backend {
-      message: "train: grad_accumulation_steps must be >= 1".into(),
-    });
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "train: grad_accumulation_steps",
+      "must be >= 1",
+    )));
   }
   if args.steps_per_report() == 0 {
-    return Err(Error::Backend {
-      message: "train: steps_per_report must be >= 1".into(),
-    });
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "train: steps_per_report",
+      "must be >= 1",
+    )));
   }
   if args.steps_per_eval() == 0 {
-    return Err(Error::Backend {
-      message: "train: steps_per_eval must be >= 1".into(),
-    });
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "train: steps_per_eval",
+      "must be >= 1",
+    )));
   }
   if args.steps_per_save() == 0 {
-    return Err(Error::Backend {
-      message: "train: steps_per_save must be >= 1".into(),
-    });
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "train: steps_per_save",
+      "must be >= 1",
+    )));
   }
   // Total OPTIMIZER steps the loop will execute. Microbatch count is
   // `args.iters()`; one optimizer step per `args.grad_accumulation_steps()`
@@ -1033,8 +1028,10 @@ where
   }
   for _microbatch_it in 1..=args.iters() {
     let micro_start = Instant::now();
-    let batch = iter.next().ok_or_else(|| Error::Backend {
-      message: "train: batch iterator exhausted unexpectedly (loop=true should never end)".into(),
+    let batch = iter.next().ok_or_else(|| {
+      Error::Backend(
+        "train: batch iterator exhausted unexpectedly (loop=true should never end)".into(),
+      )
     })??;
     // Compute loss + (placeholder) gradients. NOTE: this is the v1
     // mechanics-only path — production code threads `value_and_grad`
@@ -1188,20 +1185,18 @@ fn build_zero_grads(params: &Weights) -> Result<Weights> {
 /// reported via [`Error::Backend`] rather than silently dropped).
 fn add_weights(a: &Weights, b: &Weights) -> Result<Weights> {
   if a.len() != b.len() {
-    return Err(Error::Backend {
-      message: format!(
-        "trainer::add_weights: mismatched key counts {} vs {}",
-        a.len(),
-        b.len()
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "trainer::add_weights: mismatched key counts {} vs {}",
+      a.len(),
+      b.len()
+    )));
   }
   let mut out: Weights = HashMap::with_capacity(a.len());
   for (key, lhs) in a {
     let Some(rhs) = b.get(key) else {
-      return Err(Error::Backend {
-        message: format!("trainer::add_weights: key `{key}` missing from rhs"),
-      });
+      return Err(Error::Backend(format!(
+        "trainer::add_weights: key `{key}` missing from rhs"
+      )));
     };
     out.insert(key.clone(), arithmetic::add(lhs, rhs)?);
   }
@@ -1243,9 +1238,9 @@ mod tests {
       self.samples.len()
     }
     fn get(&self, _idx: usize) -> Result<&serde_json::Value> {
-      Err(Error::Backend {
-        message: "FakeDataset::get not used by trainer iterator".into(),
-      })
+      Err(Error::Backend(
+        "FakeDataset::get not used by trainer iterator".into(),
+      ))
     }
     fn process(&self, idx: usize) -> Result<Example> {
       Ok((self.samples[idx].0.clone(), self.samples[idx].1))
@@ -1484,7 +1479,7 @@ mod tests {
       &mut cb,
     );
     match res {
-      Err(Error::Backend { message }) => {
+      Err(Error::Backend(message)) => {
         assert!(
           message.contains("acknowledge_no_real_gradients"),
           "error must reference the opt-in field; got {message}",
@@ -1561,7 +1556,7 @@ mod tests {
     let args = args_for_zero_interval_tests().with_steps_per_report(0);
     let res = run_train_with_args(&args);
     match res {
-      Err(Error::Backend { message }) => {
+      Err(Error::Backend(message)) => {
         assert!(
           message.contains("steps_per_report"),
           "error must name the field; got {message}",
@@ -1576,7 +1571,7 @@ mod tests {
     let args = args_for_zero_interval_tests().with_steps_per_eval(0);
     let res = run_train_with_args(&args);
     match res {
-      Err(Error::Backend { message }) => {
+      Err(Error::Backend(message)) => {
         assert!(
           message.contains("steps_per_eval"),
           "error must name the field; got {message}",
@@ -1591,7 +1586,7 @@ mod tests {
     let args = args_for_zero_interval_tests().with_steps_per_save(0);
     let res = run_train_with_args(&args);
     match res {
-      Err(Error::Backend { message }) => {
+      Err(Error::Backend(message)) => {
         assert!(
           message.contains("steps_per_save"),
           "error must name the field; got {message}",
@@ -1606,7 +1601,7 @@ mod tests {
     let args = args_for_zero_interval_tests().with_grad_accumulation_steps(0);
     let res = run_train_with_args(&args);
     match res {
-      Err(Error::Backend { message }) => {
+      Err(Error::Backend(message)) => {
         assert!(
           message.contains("grad_accumulation_steps"),
           "error must name the field; got {message}",
@@ -1871,7 +1866,7 @@ mod tests {
     let err = default_loss(&model, &batch, &lengths)
       .expect_err("expected default_loss to reject zero-token batch");
     match err {
-      Error::Backend { message } => {
+      Error::Backend(message) => {
         assert!(
           message.contains("0 supervised tokens"),
           "expected message to mention '0 supervised tokens', got: {message}",

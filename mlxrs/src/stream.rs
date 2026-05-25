@@ -252,11 +252,11 @@ impl Stream {
     // checked by the caller before the handle is used.
     let raw = unsafe { mlxrs_sys::mlx_default_gpu_stream_new() };
     if raw.ctx.is_null() {
-      return Err(crate::Error::Backend {
-        message: "mlx_default_gpu_stream_new returned NULL ctx \
+      return Err(crate::Error::Backend(
+        "mlx_default_gpu_stream_new returned NULL ctx \
                   (GPU unavailable or init failed)"
           .into(),
-      });
+      ));
     }
     Ok(Self(raw))
   }
@@ -270,9 +270,9 @@ impl Stream {
     // checked by the caller before the handle is cached/used.
     let raw = unsafe { mlxrs_sys::mlx_default_cpu_stream_new() };
     if raw.ctx.is_null() {
-      return Err(crate::Error::Backend {
-        message: "mlx_default_cpu_stream_new returned NULL ctx".into(),
-      });
+      return Err(crate::Error::Backend(
+        "mlx_default_cpu_stream_new returned NULL ctx".into(),
+      ));
     }
     Ok(Self(raw))
   }
@@ -297,9 +297,9 @@ impl Stream {
     // and the NULL-ctx case is checked by the caller.
     let raw = unsafe { mlxrs_sys::mlx_stream_new_device(device.0) };
     if raw.ctx.is_null() {
-      return Err(crate::Error::Backend {
-        message: "mlx_stream_new_device returned NULL ctx".into(),
-      });
+      return Err(crate::Error::Backend(
+        "mlx_stream_new_device returned NULL ctx".into(),
+      ));
     }
     Ok(Self(raw))
   }
@@ -459,9 +459,9 @@ impl Stream {
       // The C++ clear_streams() threw before tearing anything down (it just
       // clears a map; throwing is not expected). Leave the thread usable —
       // do NOT poison it — and surface the error.
-      return Err(crate::Error::Backend {
-        message: "mlxrs_shim_clear_streams: mlx::core::clear_streams() threw".into(),
-      });
+      return Err(crate::Error::Backend(
+        "mlxrs_shim_clear_streams: mlx::core::clear_streams() threw".into(),
+      ));
     }
     // Success: this thread's encoders are gone and mlx will not re-bootstrap
     // them. Poison the thread so the next op panics with a clear message

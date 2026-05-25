@@ -47,7 +47,7 @@
 
 use crate::{
   array::Array,
-  error::{Error, Result, try_with_capacity},
+  error::{Error, LengthMismatchPayload, Result, try_with_capacity},
 };
 
 /// Padding side for varying-length `input_ids` batches — mirrors the
@@ -366,9 +366,9 @@ pub fn prepare_inputs(
   opts: &PrepareInputsOpts,
 ) -> Result<PreparedInputs> {
   if text_token_batches.is_empty() {
-    return Err(Error::ShapeMismatch {
-      message: "prepare_inputs: text_token_batches is empty (need >= 1 batch entry)".into(),
-    });
+    return Err(Error::ShapeMismatch(
+      "prepare_inputs: text_token_batches is empty (need >= 1 batch entry)".into(),
+    ));
   }
 
   // Validate caller-supplied attention_mask shape if non-empty. We do
@@ -376,24 +376,20 @@ pub fn prepare_inputs(
   if !opts.attention_mask.is_empty() {
     let masks = &opts.attention_mask;
     if masks.len() != text_token_batches.len() {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "prepare_inputs: opts.attention_mask outer length {} != text_token_batches.len() {}",
-          masks.len(),
-          text_token_batches.len()
-        ),
-      });
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "prepare_inputs: opts.attention_mask outer vs text_token_batches",
+        text_token_batches.len(),
+        masks.len(),
+      )));
     }
     for (i, (m, b)) in masks.iter().zip(text_token_batches.iter()).enumerate() {
       if m.len() != b.len() {
-        return Err(Error::ShapeMismatch {
-          message: format!(
-            "prepare_inputs: opts.attention_mask[{i}] length {} != text_token_batches[{i}] \
+        return Err(Error::ShapeMismatch(format!(
+          "prepare_inputs: opts.attention_mask[{i}] length {} != text_token_batches[{i}] \
              length {}",
-            m.len(),
-            b.len()
-          ),
-        });
+          m.len(),
+          b.len()
+        )));
       }
     }
   }
@@ -407,12 +403,10 @@ pub fn prepare_inputs(
   } else {
     let first = lens[0];
     if !lens.iter().all(|&l| l == first) {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "prepare_inputs: padding=false but batches have varying lengths ({lens:?}); \
+      return Err(Error::ShapeMismatch(format!(
+        "prepare_inputs: padding=false but batches have varying lengths ({lens:?}); \
            enable padding or pre-pad upstream"
-        ),
-      });
+      )));
     }
     first
   };
@@ -420,23 +414,19 @@ pub fn prepare_inputs(
   // mlx dimension limit: signed 32-bit. Reject early before the host
   // allocation.
   if target_t > i32::MAX as usize || batch_size > i32::MAX as usize {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "prepare_inputs: batch_size ({batch_size}) or target_t ({target_t}) exceeds i32::MAX \
+    return Err(Error::ShapeMismatch(format!(
+      "prepare_inputs: batch_size ({batch_size}) or target_t ({target_t}) exceeds i32::MAX \
          (mlx dimension limit)"
-      ),
-    });
+    )));
   }
 
   // Total cell count with overflow guard (request-scaled allocation).
-  let total = batch_size
-    .checked_mul(target_t)
-    .ok_or_else(|| Error::ShapeMismatch {
-      message: format!(
-        "prepare_inputs: batch_size * target_t overflows usize \
+  let total = batch_size.checked_mul(target_t).ok_or_else(|| {
+    Error::ShapeMismatch(format!(
+      "prepare_inputs: batch_size * target_t overflows usize \
          (batch_size={batch_size}, target_t={target_t})"
-      ),
-    })?;
+    ))
+  })?;
 
   // Row-major fill — `i32` ids (mlx convention: token ids are i32),
   // padded per opts.padding_side. The mask is either the caller's

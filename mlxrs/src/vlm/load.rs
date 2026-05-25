@@ -130,9 +130,8 @@ impl VlmBaseConfig {
   /// failure (malformed JSON or a missing `model_type`) maps to
   /// [`Error::Backend`] — the codebase config-parse convention.
   pub fn from_json(json: &str) -> Result<VlmBaseConfig> {
-    serde_json::from_str(json).map_err(|e| Error::Backend {
-      message: format!("invalid VLM base config JSON: {e}"),
-    })
+    serde_json::from_str(json)
+      .map_err(|e| Error::Backend(format!("invalid VLM base config JSON: {e}")))
   }
 
   // ── accessors ─────────────────────────────────────────────────────────────
@@ -180,12 +179,10 @@ impl VlmBaseConfig {
 pub fn load_vlm_base_config(dir: &Path) -> Result<(VlmBaseConfig, String)> {
   let path = dir.join("config.json");
   let Some(text) = load::read_bounded_config_file(&path, "VLM base config")? else {
-    return Err(Error::Backend {
-      message: format!(
-        "cannot open VLM base config {}: file not found",
-        path.display()
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "cannot open VLM base config {}: file not found",
+      path.display()
+    )));
   };
   let mut config = VlmBaseConfig::from_json(&text)?;
 
@@ -505,12 +502,12 @@ pub fn load_processor_config(
     // are NOT a parse error at this layer; that's the case Fix 2 unblocks.
     // A truly malformed (non-JSON) preferred file is still an error, since
     // the constructor would also choke on it.
-    let parsed: ProcessorClassOnly = serde_json::from_str(&body).map_err(|e| Error::Backend {
-      message: format!(
+    let parsed: ProcessorClassOnly = serde_json::from_str(&body).map_err(|e| {
+      Error::Backend(format!(
         "invalid processor config JSON in {}: {e} (expected an OBJECT, optionally with a \
          `processor_class` string field)",
         preferred_path.display()
-      ),
+      ))
     })?;
 
     if let Some(processor_class) = parsed.processor_class {
@@ -541,30 +538,26 @@ pub fn load_processor_config(
     // `processor_config.json` for dispatch.
     let Some(fallback_body) = load::read_bounded_config_file(&fallback_path, "processor config")?
     else {
-      return Err(Error::Backend {
-        message: format!(
-          "{PREFERRED} in {} has no `processor_class` field and no {FALLBACK} present to fall back \
+      return Err(Error::Backend(format!(
+        "{PREFERRED} in {} has no `processor_class` field and no {FALLBACK} present to fall back \
            to for the dispatch class",
-          dir.display()
-        ),
-      });
+        dir.display()
+      )));
     };
     let fallback_parsed: ProcessorClassOnly =
-      serde_json::from_str(&fallback_body).map_err(|e| Error::Backend {
-        message: format!(
+      serde_json::from_str(&fallback_body).map_err(|e| {
+        Error::Backend(format!(
           "invalid processor config JSON in {}: {e} (expected an OBJECT, optionally with a \
            `processor_class` string field)",
           fallback_path.display()
-        ),
+        ))
       })?;
     let Some(processor_class) = fallback_parsed.processor_class else {
-      return Err(Error::Backend {
-        message: format!(
-          "neither {PREFERRED} nor {FALLBACK} in {} has a `processor_class` field for the \
+      return Err(Error::Backend(format!(
+        "neither {PREFERRED} nor {FALLBACK} in {} has a `processor_class` field for the \
            dispatch class",
-          dir.display()
-        ),
-      });
+        dir.display()
+      )));
     };
     // Carry BOTH file bodies: the constructor's primary image-
     // preprocessor metadata is the PREFERRED body, and the dispatch
@@ -587,28 +580,24 @@ pub fn load_processor_config(
   // `processor_config.json` (strict parse for `processor_class`, use its
   // body as the constructor JSON).
   let Some(body) = load::read_bounded_config_file(&fallback_path, "processor config")? else {
-    return Err(Error::Backend {
-      message: format!(
-        "no processor config found in {}: expected {PREFERRED} (preferred) or {FALLBACK}",
-        dir.display()
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "no processor config found in {}: expected {PREFERRED} (preferred) or {FALLBACK}",
+      dir.display()
+    )));
   };
-  let parsed: ProcessorClassOnly = serde_json::from_str(&body).map_err(|e| Error::Backend {
-    message: format!(
+  let parsed: ProcessorClassOnly = serde_json::from_str(&body).map_err(|e| {
+    Error::Backend(format!(
       "invalid processor config JSON in {}: {e} (expected an OBJECT, optionally with a \
        `processor_class` string field)",
       fallback_path.display()
-    ),
+    ))
   })?;
   let Some(processor_class) = parsed.processor_class else {
-    return Err(Error::Backend {
-      message: format!(
-        "{FALLBACK} in {} has no `processor_class` field for the dispatch class \
+    return Err(Error::Backend(format!(
+      "{FALLBACK} in {} has no `processor_class` field for the dispatch class \
          (and no {PREFERRED} present to fall back from)",
-        dir.display()
-      ),
-    });
+      dir.display()
+    )));
   };
   // No `preprocessor_config.json` → its body slot is `None`; the
   // constructor's metadata is entirely the `processor_config.json` body.
@@ -881,16 +870,13 @@ impl VlmTypeRegistry {
   /// `ValueError("Model type … not supported.")`).
   pub fn create(&self, loaded: &LoadedVlmModel) -> Result<Box<dyn VlmModel>> {
     let model_type = remap_vlm_model_type(&loaded.config.model_type);
-    let constructor = self
-      .creators
-      .get(model_type)
-      .ok_or_else(|| Error::Backend {
-        message: format!(
-          "unsupported VLM model type {:?}: no constructor registered (register one via \
+    let constructor = self.creators.get(model_type).ok_or_else(|| {
+      Error::Backend(format!(
+        "unsupported VLM model type {:?}: no constructor registered (register one via \
            VlmTypeRegistry::register)",
-          loaded.config.model_type
-        ),
-      })?;
+        loaded.config.model_type
+      ))
+    })?;
     constructor(loaded)
   }
 }
@@ -1020,16 +1006,13 @@ impl VlmProcessorTypeRegistry {
   /// `processor_class_override` to the lookup key. An unregistered id
   /// is a recoverable [`Error::Backend`].
   pub fn create(&self, loaded: &LoadedProcessor<'_>) -> Result<Box<dyn Processor>> {
-    let constructor = self
-      .creators
-      .get(loaded.processor_class)
-      .ok_or_else(|| Error::Backend {
-        message: format!(
-          "unsupported VLM processor class {:?}: no constructor registered (register one via \
+    let constructor = self.creators.get(loaded.processor_class).ok_or_else(|| {
+      Error::Backend(format!(
+        "unsupported VLM processor class {:?}: no constructor registered (register one via \
            VlmProcessorTypeRegistry::register)",
-          loaded.processor_class
-        ),
-      })?;
+        loaded.processor_class
+      ))
+    })?;
     constructor(loaded)
   }
 }
@@ -1204,13 +1187,11 @@ pub fn load(
   // the registry is normally empty — is a cheap, recoverable error
   // here, never paying for the rest of the load pipeline.
   if !model_registry.contains(&config.model_type) {
-    return Err(Error::Backend {
-      message: format!(
-        "unsupported VLM model type {:?}: no constructor registered (register one via \
+    return Err(Error::Backend(format!(
+      "unsupported VLM model type {:?}: no constructor registered (register one via \
          VlmTypeRegistry::register)",
-        config.model_type
-      ),
-    });
+      config.model_type
+    )));
   }
 
   // (3) Read the processor config (preprocessor_config.json preferred,
@@ -1231,21 +1212,19 @@ pub fn load(
     .unwrap_or(&proc_config.processor_class)
     .to_owned();
   if !processor_registry.contains(&processor_class) {
-    return Err(Error::Backend {
-      message: format!(
-        "unsupported VLM processor class {processor_class:?} (from {proc_filename} in {}{}): \
+    return Err(Error::Backend(format!(
+      "unsupported VLM processor class {processor_class:?} (from {proc_filename} in {}{}): \
          no constructor registered (register one via VlmProcessorTypeRegistry::register)",
-        model_dir.display(),
-        if processor_class != proc_config.processor_class {
-          format!(
-            ", overridden from on-disk {:?} for model_type {:?}",
-            proc_config.processor_class, canonical_model_type,
-          )
-        } else {
-          String::new()
-        },
-      ),
-    });
+      model_dir.display(),
+      if processor_class != proc_config.processor_class {
+        format!(
+          ", overridden from on-disk {:?} for model_type {:?}",
+          proc_config.processor_class, canonical_model_type,
+        )
+      } else {
+        String::new()
+      },
+    )));
   }
 
   // (4) Select the tokenizer directory FIRST: the separate
@@ -1318,6 +1297,7 @@ mod tests {
   use super::*;
   use crate::{
     array::Array,
+    error::MissingFieldPayload,
     lm::{cache::KvCache, generate::GenConfig, model::Model as LmModel},
     vlm::{
       generate::{VlmGenConfig, vlm_generate},
@@ -1417,9 +1397,9 @@ mod tests {
         [b, s] => (*b, *s),
         [s] => (1, *s),
         other => {
-          return Err(Error::ShapeMismatch {
-            message: format!("MockVlmModel::forward expects [B, S], got {other:?}"),
-          });
+          return Err(Error::ShapeMismatch(format!(
+            "MockVlmModel::forward expects [B, S], got {other:?}"
+          )));
         }
       };
       let vocab = self.vocab as usize;
@@ -1436,9 +1416,9 @@ mod tests {
       let (b, t) = match shape.as_slice() {
         [b, t] => (*b, *t),
         other => {
-          return Err(Error::ShapeMismatch {
-            message: format!("MockVlmModel::embed_tokens expects [B, T], got {other:?}"),
-          });
+          return Err(Error::ShapeMismatch(format!(
+            "MockVlmModel::embed_tokens expects [B, T], got {other:?}"
+          )));
         }
       };
       Array::from_slice::<f32>(&vec![0.0_f32; b * t * 8], &(b, t, 8usize))
@@ -1504,10 +1484,8 @@ mod tests {
         !loaded.weights_ref().is_empty(),
         "constructor should receive the loaded weights"
       );
-      let raw: serde_json::Value =
-        serde_json::from_str(loaded.config_json_ref()).map_err(|e| Error::Backend {
-          message: format!("mock vlm ctor: bad config json: {e}"),
-        })?;
+      let raw: serde_json::Value = serde_json::from_str(loaded.config_json_ref())
+        .map_err(|e| Error::Backend(format!("mock vlm ctor: bad config json: {e}")))?;
       // Vocab can be top-level (the "flat" mock fixture) or nested under
       // text_config (the real-VLM-shaped mock fixture). The per-model
       // constructor decides how to decode its own model-specific fields;
@@ -1519,15 +1497,18 @@ mod tests {
         .or_else(|| raw.get("text_config").and_then(|t| t.get("vocab_size")))
         .and_then(serde_json::Value::as_i64)
         .and_then(|x| i32::try_from(x).ok())
-        .ok_or_else(|| Error::Backend {
-          message: "mock vlm ctor: missing vocab_size (top-level or text_config.vocab_size)".into(),
+        .ok_or_else(|| {
+          Error::Backend(
+            "mock vlm ctor: missing vocab_size (top-level or text_config.vocab_size)".into(),
+          )
         })?;
       let mock_extra = raw
         .get("mock_extra")
         .and_then(serde_json::Value::as_i64)
-        .ok_or_else(|| Error::Backend {
-          message: "mock vlm ctor: missing mock_extra".into(),
-        })?;
+        .ok_or(Error::MissingField(MissingFieldPayload::new(
+          "mock vlm ctor",
+          "mock_extra",
+        )))?;
       Ok(Box::new(MockVlmModel { vocab, mock_extra }))
     })
   }
@@ -1551,19 +1532,22 @@ mod tests {
         let body = loaded
           .preprocessor_config_json
           .or(loaded.processor_config_json)
-          .ok_or_else(|| Error::Backend {
-            message: "mock vlm processor ctor: no processor-config body carried".into(),
+          .ok_or_else(|| {
+            Error::Backend("mock vlm processor ctor: no processor-config body carried".into())
           })?;
-        let raw: serde_json::Value = serde_json::from_str(body).map_err(|e| Error::Backend {
-          message: format!("mock vlm processor ctor: bad processor config json: {e}"),
+        let raw: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+          Error::Backend(format!(
+            "mock vlm processor ctor: bad processor config json: {e}"
+          ))
         })?;
         let image_size = raw
           .get("mock_image_size")
           .and_then(serde_json::Value::as_u64)
           .and_then(|x| u32::try_from(x).ok())
-          .ok_or_else(|| Error::Backend {
-            message: "mock vlm processor ctor: missing mock_image_size".into(),
-          })?;
+          .ok_or(Error::MissingField(MissingFieldPayload::new(
+            "mock vlm processor ctor",
+            "mock_image_size",
+          )))?;
         // Sanity-touch the tokenizer the swift `(Data, Tokenizer) ->
         // Processor` shape hands in — assert it can encode something so a
         // future change that hands the wrong (uninitialized / wrong-dir)
@@ -1795,9 +1779,9 @@ mod tests {
           [b, s] => (*b, *s),
           [s] => (1, *s),
           other => {
-            return Err(Error::ShapeMismatch {
-              message: format!("RecordingVlmModel::forward expects [B, S], got {other:?}"),
-            });
+            return Err(Error::ShapeMismatch(format!(
+              "RecordingVlmModel::forward expects [B, S], got {other:?}"
+            )));
           }
         };
         // `[B, S, vocab=5]` zero logits — greedy argmax is token id 0.
@@ -1812,11 +1796,9 @@ mod tests {
         let (b, t) = match embeddings.shape().as_slice() {
           [b, t, _d] => (*b, *t),
           other => {
-            return Err(Error::ShapeMismatch {
-              message: format!(
-                "RecordingVlmModel::forward_embeddings expects [B, T, D], got {other:?}"
-              ),
-            });
+            return Err(Error::ShapeMismatch(format!(
+              "RecordingVlmModel::forward_embeddings expects [B, T, D], got {other:?}"
+            )));
           }
         };
         Array::from_slice::<f32>(&vec![0.0_f32; b * t * 5], &(b, t, 5usize))
@@ -1827,9 +1809,9 @@ mod tests {
         let (b, t) = match tokens.shape().as_slice() {
           [b, t] => (*b, *t),
           other => {
-            return Err(Error::ShapeMismatch {
-              message: format!("RecordingVlmModel::embed_tokens expects [B, T], got {other:?}"),
-            });
+            return Err(Error::ShapeMismatch(format!(
+              "RecordingVlmModel::embed_tokens expects [B, T], got {other:?}"
+            )));
           }
         };
         // hidden_size = 8, matching `encode_image`'s D below.
@@ -2922,41 +2904,38 @@ mod tests {
 
     let asserting_processor_ctor: ProcessorConstructor = Box::new(
       |loaded: &LoadedProcessor<'_>| -> Result<Box<dyn Processor>> {
-        let preprocessor = loaded
-          .preprocessor_config_json
-          .ok_or_else(|| Error::Backend {
-            message: "expected preprocessor_config.json body on LoadedProcessor".into(),
-          })?;
-        let processor = loaded.processor_config_json.ok_or_else(|| Error::Backend {
-          message: "expected processor_config.json body on LoadedProcessor (the carried body)"
-            .into(),
+        let preprocessor = loaded.preprocessor_config_json.ok_or_else(|| {
+          Error::Backend("expected preprocessor_config.json body on LoadedProcessor".into())
         })?;
-        let pre: serde_json::Value =
-          serde_json::from_str(preprocessor).map_err(|e| Error::Backend {
-            message: format!("bad preprocessor body: {e}"),
-          })?;
+        let processor = loaded.processor_config_json.ok_or_else(|| {
+          Error::Backend(
+            "expected processor_config.json body on LoadedProcessor (the carried body)".into(),
+          )
+        })?;
+        let pre: serde_json::Value = serde_json::from_str(preprocessor)
+          .map_err(|e| Error::Backend(format!("bad preprocessor body: {e}")))?;
         let image_size = pre
           .get("mock_image_size")
           .and_then(serde_json::Value::as_u64)
           .and_then(|x| u32::try_from(x).ok())
-          .ok_or_else(|| Error::Backend {
-            message: "preprocessor body missing mock_image_size".into(),
-          })?;
-        let proc: serde_json::Value =
-          serde_json::from_str(processor).map_err(|e| Error::Backend {
-            message: format!("bad processor_config.json body: {e}"),
-          })?;
+          .ok_or(Error::MissingField(MissingFieldPayload::new(
+            "preprocessor body",
+            "mock_image_size",
+          )))?;
+        let proc: serde_json::Value = serde_json::from_str(processor)
+          .map_err(|e| Error::Backend(format!("bad processor_config.json body: {e}")))?;
         let seq_len = proc
           .get("image_seq_len")
           .and_then(serde_json::Value::as_u64)
-          .ok_or_else(|| Error::Backend {
-            message: "processor_config.json body missing image_seq_len (the discarded field)"
-              .into(),
+          .ok_or_else(|| {
+            Error::Backend(
+              "processor_config.json body missing image_seq_len (the discarded field)".into(),
+            )
           })?;
         if seq_len != 256 {
-          return Err(Error::Backend {
-            message: format!("image_seq_len must round-trip as 256, got {seq_len}"),
-          });
+          return Err(Error::Backend(format!(
+            "image_seq_len must round-trip as 256, got {seq_len}"
+          )));
         }
         Ok(Box::new(MockVlmProcessor {
           processor_class: loaded.processor_class.to_owned(),
@@ -3051,41 +3030,38 @@ mod tests {
 
     let asserting_processor_ctor: ProcessorConstructor = Box::new(
       |loaded: &LoadedProcessor<'_>| -> Result<Box<dyn Processor>> {
-        let preprocessor = loaded
-          .preprocessor_config_json
-          .ok_or_else(|| Error::Backend {
-            message: "expected preprocessor_config.json body on LoadedProcessor".into(),
-          })?;
-        let processor = loaded.processor_config_json.ok_or_else(|| Error::Backend {
-          message: "expected processor_config.json body on LoadedProcessor (the carried body)"
-            .into(),
+        let preprocessor = loaded.preprocessor_config_json.ok_or_else(|| {
+          Error::Backend("expected preprocessor_config.json body on LoadedProcessor".into())
         })?;
-        let pre: serde_json::Value =
-          serde_json::from_str(preprocessor).map_err(|e| Error::Backend {
-            message: format!("bad preprocessor body: {e}"),
-          })?;
+        let processor = loaded.processor_config_json.ok_or_else(|| {
+          Error::Backend(
+            "expected processor_config.json body on LoadedProcessor (the carried body)".into(),
+          )
+        })?;
+        let pre: serde_json::Value = serde_json::from_str(preprocessor)
+          .map_err(|e| Error::Backend(format!("bad preprocessor body: {e}")))?;
         let image_size = pre
           .get("mock_image_size")
           .and_then(serde_json::Value::as_u64)
           .and_then(|x| u32::try_from(x).ok())
-          .ok_or_else(|| Error::Backend {
-            message: "preprocessor body missing mock_image_size".into(),
-          })?;
-        let proc: serde_json::Value =
-          serde_json::from_str(processor).map_err(|e| Error::Backend {
-            message: format!("bad processor_config.json body: {e}"),
-          })?;
+          .ok_or(Error::MissingField(MissingFieldPayload::new(
+            "preprocessor body",
+            "mock_image_size",
+          )))?;
+        let proc: serde_json::Value = serde_json::from_str(processor)
+          .map_err(|e| Error::Backend(format!("bad processor_config.json body: {e}")))?;
         let seq_len = proc
           .get("image_seq_len")
           .and_then(serde_json::Value::as_u64)
-          .ok_or_else(|| Error::Backend {
-            message: "processor_config.json body missing image_seq_len (the discarded field)"
-              .into(),
+          .ok_or_else(|| {
+            Error::Backend(
+              "processor_config.json body missing image_seq_len (the discarded field)".into(),
+            )
           })?;
         if seq_len != 256 {
-          return Err(Error::Backend {
-            message: format!("image_seq_len must round-trip as 256, got {seq_len}"),
-          });
+          return Err(Error::Backend(format!(
+            "image_seq_len must round-trip as 256, got {seq_len}"
+          )));
         }
         Ok(Box::new(MockVlmProcessor {
           processor_class: loaded.processor_class.to_owned(),
@@ -3271,19 +3247,19 @@ mod tests {
         // Read the arch field off `LoadedProcessor.config_json` — the
         // SAME single-read body the model constructor saw. It is NOT in
         // either processor-config body.
-        let cfg: serde_json::Value =
-          serde_json::from_str(loaded.config_json).map_err(|e| Error::Backend {
-            message: format!("processor ctor: bad model config_json: {e}"),
-          })?;
+        let cfg: serde_json::Value = serde_json::from_str(loaded.config_json)
+          .map_err(|e| Error::Backend(format!("processor ctor: bad model config_json: {e}")))?;
         let hidden_size = cfg
           .get("text_config")
           .and_then(|t| t.get("hidden_size"))
           .and_then(serde_json::Value::as_u64)
           .and_then(|x| u32::try_from(x).ok())
-          .ok_or_else(|| Error::Backend {
-            message: "processor ctor: text_config.hidden_size must be readable off \
+          .ok_or_else(|| {
+            Error::Backend(
+              "processor ctor: text_config.hidden_size must be readable off \
                       LoadedProcessor.config_json (config.json-only arch field)"
-              .into(),
+                .into(),
+            )
           })?;
         // Drive `image_size` from the config.json-only field (NOT the
         // processor config's `mock_image_size`) so the test can assert

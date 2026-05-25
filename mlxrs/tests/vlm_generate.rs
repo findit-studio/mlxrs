@@ -148,18 +148,16 @@ impl MockVlmModel {
 impl LmModel for MockVlmModel {
   fn forward(&self, tokens: &Array, cache: &mut [Box<dyn KvCache>]) -> mlxrs::Result<Array> {
     if self.fail_forward {
-      return Err(Error::Backend {
-        message: "mock forward failure".into(),
-      });
+      return Err(Error::Backend("mock forward failure".into()));
     }
     let shape = tokens.shape();
     let (batch, seq) = match shape.as_slice() {
       [b, s] => (*b, *s),
       [s] => (1, *s),
       _ => {
-        return Err(Error::ShapeMismatch {
-          message: format!("MockVlmModel::forward expects [B, S] tokens, got {shape:?}"),
-        });
+        return Err(Error::ShapeMismatch(format!(
+          "MockVlmModel::forward expects [B, S] tokens, got {shape:?}"
+        )));
       }
     };
     self.forward_calls.borrow_mut().push(shape);
@@ -189,9 +187,9 @@ impl LmModel for MockVlmModel {
     let (batch, seq) = match shape.as_slice() {
       [b, s, _d] => (*b, *s),
       _ => {
-        return Err(Error::ShapeMismatch {
-          message: format!("MockVlmModel::forward_embeddings expects [B, T, D], got {shape:?}"),
-        });
+        return Err(Error::ShapeMismatch(format!(
+          "MockVlmModel::forward_embeddings expects [B, T, D], got {shape:?}"
+        )));
       }
     };
     self.forward_emb_calls.borrow_mut().push(shape);
@@ -216,9 +214,9 @@ impl VlmModel for MockVlmModel {
     let (b, t) = match shape.as_slice() {
       [b, t] => (*b, *t),
       _ => {
-        return Err(Error::ShapeMismatch {
-          message: format!("MockVlmModel::embed_tokens expects [B, T], got {shape:?}"),
-        });
+        return Err(Error::ShapeMismatch(format!(
+          "MockVlmModel::embed_tokens expects [B, T], got {shape:?}"
+        )));
       }
     };
     self.embed_calls.borrow_mut().push(shape);
@@ -231,9 +229,7 @@ impl VlmModel for MockVlmModel {
 
   fn encode_image(&self, image: &Array) -> mlxrs::Result<Array> {
     if self.fail_encode {
-      return Err(Error::Backend {
-        message: "mock encode_image failure".into(),
-      });
+      return Err(Error::Backend("mock encode_image failure".into()));
     }
     self.encode_calls.borrow_mut().push(image.shape());
     // Per-image-token slabs are deterministic & distinguishable: every

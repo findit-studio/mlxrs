@@ -21,6 +21,7 @@ use std::{
   cell::RefCell,
   ffi::{CStr, c_char, c_int, c_void},
   panic::{AssertUnwindSafe, catch_unwind},
+  path::PathBuf,
   ptr,
   sync::{
     OnceLock,
@@ -30,25 +31,721 @@ use std::{
 
 use crate::Dtype;
 
+/// The kind of file-system or I/O operation that failed, for [`Error::FileIo`].
+///
+/// Variants cover the operations observed across mlxrs: `Create`, `Write`,
+/// `Flush`, `Read`, `Open`, `Stat`, `Copy`, `Remove`, `Rename`, `Fsync`,
+/// `HardLink`, `Decode`. `Other` covers any operation not in the above list —
+/// callers match only the variants they care about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileOp {
+  /// `File::create` / `OpenOptions::create_new`.
+  Create,
+  /// Any write to a file or stream.
+  Write,
+  /// `flush()` on a buffered writer or stdout.
+  Flush,
+  /// `File::open` / `read_to_string` / `read_exact`.
+  Read,
+  /// `File::open` (open-only, no read implied).
+  Open,
+  /// `metadata()` / `symlink_metadata()` / `stat`.
+  Stat,
+  /// `fs::copy`.
+  Copy,
+  /// `fs::remove_file` / `fs::remove_dir_all`.
+  Remove,
+  /// `fs::rename` / `hard_link`.
+  Rename,
+  /// `File::sync_all` / `sync_data` / `fsync_dir`.
+  Fsync,
+  /// Any other named operation not in the list above.
+  Other(&'static str),
+}
+
+/// Display helper for the `lengths` field of [`Error::MultiLengthMismatch`].
+/// Formats a `Vec<(&'static str, usize)>` as `"axes=3, low=2, high=3"`.
+///
+/// Used directly in the `#[error("…")]` attribute via the
+/// `thiserror` positional-arg form so the variant needs no extra
+/// `impl Display for Error` override.
+struct MultiLengthsFmt<'a>(&'a Vec<(&'static str, usize)>);
+
+impl std::fmt::Display for MultiLengthsFmt<'_> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let mut first = true;
+    for (name, len) in self.0 {
+      if !first {
+        f.write_str(", ")?;
+      }
+      write!(f, "{name}={len}")?;
+      first = false;
+    }
+    Ok(())
+  }
+}
+
+impl std::fmt::Display for FileOp {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::Create => f.write_str("create"),
+      Self::Write => f.write_str("write"),
+      Self::Flush => f.write_str("flush"),
+      Self::Read => f.write_str("read"),
+      Self::Open => f.write_str("open"),
+      Self::Stat => f.write_str("stat"),
+      Self::Copy => f.write_str("copy"),
+      Self::Remove => f.write_str("remove"),
+      Self::Rename => f.write_str("rename"),
+      Self::Fsync => f.write_str("fsync"),
+      Self::Other(s) => f.write_str(s),
+    }
+  }
+}
+
+/// Payload for [`Error::DtypeMismatch`]: the expected and actual dtypes.
+///
+/// Accessors are `const fn` for the `Copy` inner type. Construct via
+/// [`DtypeMismatchPayload::new`]; destructure via the accessors (not struct
+/// literal syntax — this type follows §2 of the rust-golden-skills conventions
+/// which forbids public struct-style variant fields).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DtypeMismatchPayload {
+  expected: Dtype,
+  got: Dtype,
+}
+
+impl DtypeMismatchPayload {
+  /// Construct a new payload.
+  pub fn new(expected: Dtype, got: Dtype) -> Self {
+    Self { expected, got }
+  }
+
+  /// The dtype the caller asserted.
+  #[inline(always)]
+  pub const fn expected(&self) -> Dtype {
+    self.expected
+  }
+
+  /// The actual dtype of the array.
+  #[inline(always)]
+  pub const fn got(&self) -> Dtype {
+    self.got
+  }
+}
+
+impl std::fmt::Display for DtypeMismatchPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "expected {:?}, got {:?}", self.expected, self.got)
+  }
+}
+
+impl std::error::Error for DtypeMismatchPayload {}
+
+/// Payload for [`Error::FfiNullHandle`]: the mlx-c function name that returned
+/// a NULL handle.
+///
+/// Construct via [`FfiNullHandlePayload::new`]; access the field via
+/// [`FfiNullHandlePayload::fn_name`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FfiNullHandlePayload {
+  fn_name: &'static str,
+}
+
+impl FfiNullHandlePayload {
+  /// Construct a new payload.
+  pub fn new(fn_name: &'static str) -> Self {
+    Self { fn_name }
+  }
+
+  /// The mlx-c function name that returned a NULL handle
+  /// (e.g. `"mlx_array_new_float32"`).
+  #[inline(always)]
+  pub const fn fn_name(&self) -> &'static str {
+    self.fn_name
+  }
+}
+
+impl std::fmt::Display for FfiNullHandlePayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "FFI: {} returned NULL handle", self.fn_name)
+  }
+}
+
+impl std::error::Error for FfiNullHandlePayload {}
+
+/// Payload for [`Error::MissingField`]: the parent type and missing field path.
+///
+/// Construct via [`MissingFieldPayload::new`]; access fields via
+/// `type_name()` and `field()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingFieldPayload {
+  type_name: &'static str,
+  field: &'static str,
+}
+
+impl MissingFieldPayload {
+  /// Construct a new payload.
+  pub fn new(type_name: &'static str, field: &'static str) -> Self {
+    Self { type_name, field }
+  }
+
+  /// The parent type or config context (e.g. `"SentencePieceTokenizer"`).
+  #[inline(always)]
+  pub const fn type_name(&self) -> &'static str {
+    self.type_name
+  }
+
+  /// The missing field path (e.g. `"model.unk_id"`).
+  #[inline(always)]
+  pub const fn field(&self) -> &'static str {
+    self.field
+  }
+}
+
+impl std::fmt::Display for MissingFieldPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "{}: missing required field `{}`",
+      self.type_name, self.field
+    )
+  }
+}
+
+impl std::error::Error for MissingFieldPayload {}
+
+/// Payload for [`Error::ArithmeticOverflow`]: the operation context and result type.
+///
+/// Construct via [`ArithmeticOverflowPayload::new`]; access fields via
+/// `context()` and `op_type()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArithmeticOverflowPayload {
+  context: &'static str,
+  op_type: &'static str,
+}
+
+impl ArithmeticOverflowPayload {
+  /// Construct a new payload.
+  pub fn new(context: &'static str, op_type: &'static str) -> Self {
+    Self { context, op_type }
+  }
+
+  /// The expression or operation that overflowed
+  /// (e.g. `"vocab_size_base + added"`).
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+
+  /// The result type that overflowed (e.g. `"u32"`, `"usize"`).
+  #[inline(always)]
+  pub const fn op_type(&self) -> &'static str {
+    self.op_type
+  }
+}
+
+impl std::fmt::Display for ArithmeticOverflowPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "{}: overflow ({})", self.context, self.op_type)
+  }
+}
+
+impl std::error::Error for ArithmeticOverflowPayload {}
+
+/// Payload for [`Error::EmptyInput`]: the call-site context label.
+///
+/// Construct via [`EmptyInputPayload::new`]; access the field via
+/// [`EmptyInputPayload::context`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyInputPayload {
+  context: &'static str,
+}
+
+impl EmptyInputPayload {
+  /// Construct a new payload.
+  pub fn new(context: &'static str) -> Self {
+    Self { context }
+  }
+
+  /// The parameter or collection that was empty
+  /// (e.g. `"value_and_grad: argnums"`).
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+}
+
+impl std::fmt::Display for EmptyInputPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "{} is empty (at least one element required)",
+      self.context
+    )
+  }
+}
+
+impl std::error::Error for EmptyInputPayload {}
+
+/// Payload for [`Error::InvariantViolation`]: the call-site context and the
+/// violated requirement.
+///
+/// Construct via [`InvariantViolationPayload::new`]; access fields via
+/// `context()` and `requirement()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvariantViolationPayload {
+  context: &'static str,
+  requirement: &'static str,
+}
+
+impl InvariantViolationPayload {
+  /// Construct a new payload.
+  pub fn new(context: &'static str, requirement: &'static str) -> Self {
+    Self {
+      context,
+      requirement,
+    }
+  }
+
+  /// The parameter or field that violated the invariant
+  /// (e.g. `"train: steps_per_eval"`).
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+
+  /// The violated constraint (e.g. `"must be >= 1"`, `"must be > 0"`).
+  #[inline(always)]
+  pub const fn requirement(&self) -> &'static str {
+    self.requirement
+  }
+}
+
+impl std::fmt::Display for InvariantViolationPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "backend: {} {}", self.context, self.requirement)
+  }
+}
+
+impl std::error::Error for InvariantViolationPayload {}
+
+/// Payload for [`Error::RankMismatch`]: the call-site context, observed rank,
+/// and the full observed shape.
+///
+/// Construct via [`RankMismatchPayload::new`]; access fields via
+/// `context()`, `actual()`, and `actual_shape()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RankMismatchPayload {
+  context: &'static str,
+  actual: u32,
+  actual_shape: Vec<usize>,
+}
+
+impl RankMismatchPayload {
+  /// Construct a new payload.
+  pub fn new(context: &'static str, actual: u32, actual_shape: Vec<usize>) -> Self {
+    Self {
+      context,
+      actual,
+      actual_shape,
+    }
+  }
+
+  /// The call-site label + expected-rank description
+  /// (e.g. `"token_embeddings must be rank-3 (batch, seq_len, hidden)"`).
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+
+  /// The observed rank of the array.
+  #[inline(always)]
+  pub const fn actual(&self) -> u32 {
+    self.actual
+  }
+
+  /// The full observed shape, for diagnostics (may be empty for rank-0 scalars).
+  pub fn actual_shape(&self) -> &[usize] {
+    &self.actual_shape
+  }
+}
+
+impl std::fmt::Display for RankMismatchPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "shape mismatch: {}: got rank {} (shape {:?})",
+      self.context, self.actual, self.actual_shape
+    )
+  }
+}
+
+impl std::error::Error for RankMismatchPayload {}
+
+/// Payload for [`Error::LengthMismatch`]: the call-site context and the
+/// expected vs observed lengths.
+///
+/// Construct via [`LengthMismatchPayload::new`]; access fields via
+/// `context()`, `expected()`, and `actual()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LengthMismatchPayload {
+  context: &'static str,
+  expected: usize,
+  actual: usize,
+}
+
+impl LengthMismatchPayload {
+  /// Construct a new payload.
+  pub fn new(context: &'static str, expected: usize, actual: usize) -> Self {
+    Self {
+      context,
+      expected,
+      actual,
+    }
+  }
+
+  /// The call-site label identifying what lengths are being compared
+  /// (e.g. `"pad: axes vs low/high"`, `"gather: indices.len() vs axes.len()"`).
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+
+  /// The required length.
+  #[inline(always)]
+  pub const fn expected(&self) -> usize {
+    self.expected
+  }
+
+  /// The observed length.
+  #[inline(always)]
+  pub const fn actual(&self) -> usize {
+    self.actual
+  }
+}
+
+impl std::fmt::Display for LengthMismatchPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "shape mismatch: {}: expected length {}, got {}",
+      self.context, self.expected, self.actual
+    )
+  }
+}
+
+impl std::error::Error for LengthMismatchPayload {}
+
+/// Payload for [`Error::OutOfRange`]: the call-site context, the violated
+/// constraint, and the formatted runtime value.
+///
+/// Construct via [`OutOfRangePayload::new`]; access fields via `context()`,
+/// `requirement()`, and `value()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutOfRangePayload {
+  context: &'static str,
+  requirement: &'static str,
+  value: String,
+}
+
+impl OutOfRangePayload {
+  /// Construct a new payload.
+  pub fn new(context: &'static str, requirement: &'static str, value: String) -> Self {
+    Self {
+      context,
+      requirement,
+      value,
+    }
+  }
+
+  /// The parameter name and call-site context
+  /// (e.g. `"top_k: parameter"`, `"max_audio_seconds"`).
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+
+  /// The violated constraint as a static phrase
+  /// (e.g. `"must be in (0, vocab_size)"`).
+  #[inline(always)]
+  pub const fn requirement(&self) -> &'static str {
+    self.requirement
+  }
+
+  /// The formatted runtime value that violated the range.
+  pub fn value(&self) -> &str {
+    &self.value
+  }
+}
+
+impl std::fmt::Display for OutOfRangePayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "shape mismatch: {}: {}, got {}",
+      self.context, self.requirement, self.value
+    )
+  }
+}
+
+impl std::error::Error for OutOfRangePayload {}
+
+/// Payload for [`Error::FileIo`]: the call-site context, file-op kind, path,
+/// and the underlying `std::io::Error`.
+///
+/// Construct via [`FileIoPayload::new`]; access fields via `context()`,
+/// `op()`, `path()`, and `inner()`. The underlying io::Error is also
+/// reachable via [`std::error::Error::source`].
+#[derive(Debug)]
+pub struct FileIoPayload {
+  context: &'static str,
+  op: FileOp,
+  path: PathBuf,
+  inner: std::io::Error,
+}
+
+impl FileIoPayload {
+  /// Construct a new payload.
+  pub fn new(context: &'static str, op: FileOp, path: PathBuf, inner: std::io::Error) -> Self {
+    Self {
+      context,
+      op,
+      path,
+      inner,
+    }
+  }
+
+  /// Call-site label identifying the function or subsystem
+  /// (e.g. `"save_as_txt"`, `"load_audio"`, `"save_model"`).
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+
+  /// The operation kind that failed.
+  #[inline(always)]
+  pub const fn op(&self) -> FileOp {
+    self.op
+  }
+
+  /// The file or directory path involved.
+  pub fn path(&self) -> &std::path::Path {
+    &self.path
+  }
+
+  /// The underlying I/O error.
+  pub fn inner(&self) -> &std::io::Error {
+    &self.inner
+  }
+}
+
+impl std::fmt::Display for FileIoPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "io: {}: {} {}: {}",
+      self.context,
+      self.op,
+      self.path.display(),
+      self.inner
+    )
+  }
+}
+
+impl std::error::Error for FileIoPayload {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    Some(&self.inner)
+  }
+}
+
+/// Payload for [`Error::MultiLengthMismatch`]: the call-site context and the
+/// list of `(name, length)` pairs.
+///
+/// Construct via [`MultiLengthMismatchPayload::new`]; access fields via
+/// `context()` and `lengths()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiLengthMismatchPayload {
+  context: &'static str,
+  lengths: Vec<(&'static str, usize)>,
+}
+
+impl MultiLengthMismatchPayload {
+  /// Construct a new payload.
+  pub fn new(context: &'static str, lengths: Vec<(&'static str, usize)>) -> Self {
+    Self { context, lengths }
+  }
+
+  /// The call-site label and collections being compared
+  /// (e.g. `"pad: axes/low/high"`, `"slice: start/stop/strides"`).
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+
+  /// The `(name, length)` pairs for each collection, in order.
+  pub fn lengths(&self) -> &[(&'static str, usize)] {
+    &self.lengths
+  }
+}
+
+impl std::fmt::Display for MultiLengthMismatchPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "shape mismatch: {}: length mismatch — {}",
+      self.context,
+      MultiLengthsFmt(&self.lengths)
+    )
+  }
+}
+
+impl std::error::Error for MultiLengthMismatchPayload {}
+
+/// Payload for [`Error::DurabilityWarning`]: whether the commit succeeded and the IO error.
+///
+/// Construct via [`DurabilityWarningPayload::new`]; access fields via the
+/// `committed()` and `source()` accessors.
+#[cfg(feature = "lm")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lm")))]
+#[derive(Debug)]
+pub struct DurabilityWarningPayload {
+  committed: bool,
+  source: std::io::Error,
+}
+
+#[cfg(feature = "lm")]
+impl DurabilityWarningPayload {
+  /// Construct a new payload.
+  pub fn new(committed: bool, source: std::io::Error) -> Self {
+    Self { committed, source }
+  }
+
+  /// Whether the checkpoint commit point was reached before the fsync warning.
+  /// Always `true` for instances produced by `save` / `save_model`.
+  #[inline(always)]
+  pub const fn committed(&self) -> bool {
+    self.committed
+  }
+
+  /// The underlying `fsync_dir` IO error.
+  pub fn source(&self) -> &std::io::Error {
+    &self.source
+  }
+
+  /// Consume `self` and return the underlying IO error (owned).
+  pub fn into_source(self) -> std::io::Error {
+    self.source
+  }
+}
+
+#[cfg(feature = "lm")]
+impl std::fmt::Display for DurabilityWarningPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "save committed but durability fsync failed (committed={}): {}",
+      self.committed, self.source
+    )
+  }
+}
+
+#[cfg(feature = "lm")]
+impl std::error::Error for DurabilityWarningPayload {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    Some(&self.source)
+  }
+}
+
+/// Payload for [`Error::ConvertPostSavePartial`]: committed flag, optional save warning, and
+/// the copy error.
+///
+/// Construct via [`ConvertPostSavePartialPayload::new`]; access fields via
+/// `committed()`, `save_warning()`, and `copy_error()`.
+#[cfg(feature = "lm")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lm")))]
+#[derive(Debug)]
+pub struct ConvertPostSavePartialPayload {
+  committed: bool,
+  save_warning: Option<std::io::Error>,
+  // `Box` breaks the recursive size cycle (Error → Payload → Error).
+  // Carrying the crate `Error` directly preserves the typed structure
+  // of the underlying failure — e.g. `Error::FileIo(FileIoPayload { .. })`
+  // survives end-to-end with `op` and `path` intact for recovery code,
+  // instead of being stringified into an opaque `io::Error::other(...)`
+  // (R-final finding on PR #243).
+  copy_error: Box<Error>,
+}
+
+#[cfg(feature = "lm")]
+impl ConvertPostSavePartialPayload {
+  /// Construct a new payload. `copy_error` is boxed to break the
+  /// recursive size cycle; pass any `crate::Error` directly (typically
+  /// the `Error::FileIo(..)` returned by `copy_tokenizer_and_extras`)
+  /// to preserve its structured fields end-to-end.
+  pub fn new(committed: bool, save_warning: Option<std::io::Error>, copy_error: Error) -> Self {
+    Self {
+      committed,
+      save_warning,
+      copy_error: Box::new(copy_error),
+    }
+  }
+
+  /// Whether the checkpoint commit point was reached. Always `true` for
+  /// instances produced by `convert`.
+  #[inline(always)]
+  pub const fn committed(&self) -> bool {
+    self.committed
+  }
+
+  /// The durability-fsync warning from the save phase if the save returned
+  /// [`Error::DurabilityWarning`]; `None` if the save returned plain `Ok(())`.
+  pub fn save_warning(&self) -> Option<&std::io::Error> {
+    self.save_warning.as_ref()
+  }
+
+  /// The tokenizer-extras copy failure (typed `crate::Error`, typically
+  /// `Error::FileIo(FileIoPayload { .. })`).
+  pub fn copy_error(&self) -> &Error {
+    &self.copy_error
+  }
+
+  /// Consume `self` and return the constituent parts (owned).
+  pub fn into_parts(self) -> (bool, Option<std::io::Error>, Error) {
+    (self.committed, self.save_warning, *self.copy_error)
+  }
+}
+
+#[cfg(feature = "lm")]
+impl std::fmt::Display for ConvertPostSavePartialPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "convert: save committed but post-save extras copy partially failed (committed={}); \
+       destination directory may be incomplete (missing tokenizer/extras files)",
+      self.committed
+    )
+  }
+}
+
+#[cfg(feature = "lm")]
+impl std::error::Error for ConvertPostSavePartialPayload {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    Some(self.copy_error.as_ref() as &(dyn std::error::Error + 'static))
+  }
+}
+
 /// Errors surfaced from the mlx backend or detected at the safe-wrapper boundary.
 #[derive(Debug, thiserror::Error, derive_more::IsVariant)]
 #[non_exhaustive]
 pub enum Error {
   /// Shape mismatch detected by mlx during graph construction or eval.
-  #[error("shape mismatch: {message}")]
-  ShapeMismatch {
-    /// Backend-provided message.
-    message: String,
-  },
+  #[error("shape mismatch: {0}")]
+  ShapeMismatch(String),
 
   /// Dtype mismatch (e.g. requesting `as_slice::<f32>` on an i32 array).
-  #[error("dtype mismatch: expected {expected:?}, got {got:?}")]
-  DtypeMismatch {
-    /// Caller-asserted dtype.
-    expected: Dtype,
-    /// Actual array dtype.
-    got: Dtype,
-  },
+  #[error("dtype mismatch: expected {:?}, got {:?}", .0.expected(), .0.got())]
+  DtypeMismatch(DtypeMismatchPayload),
 
   /// `TryFrom<mlxrs_sys::mlx_dtype>` failed — mlx returned a dtype we don't recognize.
   #[error("unknown dtype value from mlx: {0}")]
@@ -65,22 +762,99 @@ pub enum Error {
   NonContiguous,
 
   /// Generic backend error with the message captured from mlx-c.
-  #[error("mlx backend: {message}")]
-  Backend {
-    /// Message captured from mlx-c's error handler.
-    message: String,
-  },
+  #[error("mlx backend: {0}")]
+  Backend(String),
+
+  /// FFI handle creation returned a NULL pointer (mlx-c idiomatic
+  /// "constructor failed"). The `fn_name` identifies which mlx-c
+  /// function returned the NULL, so callers can route on the failure
+  /// site without parsing strings.
+  #[error(transparent)]
+  FfiNullHandle(FfiNullHandlePayload),
+
+  /// A required field is missing from a parsed config / state body.
+  /// `type_name` is the parent type (e.g. `"SentencePieceTokenizer"`,
+  /// `"VlmBaseConfig"`); `field` is the missing field path
+  /// (e.g. `"model.unk_id"`, `"mock_image_size"`).
+  #[error(transparent)]
+  MissingField(MissingFieldPayload),
+
+  /// An integer arithmetic operation overflowed. `context` identifies
+  /// the operation site (e.g. `"vocab_size_base + added"`,
+  /// `"CacheList::state_count"`); `op_type` describes the result type
+  /// (e.g. `"u32"`, `"usize"`).
+  #[error(transparent)]
+  ArithmeticOverflow(ArithmeticOverflowPayload),
+
+  /// A scalar / collection input was empty when at least one element
+  /// was required. `context` identifies the call site
+  /// (e.g. `"stack: arrays slice"`, `"value_and_grad: argnums"`).
+  #[error(transparent)]
+  EmptyInput(EmptyInputPayload),
+
+  /// A scalar invariant was violated (e.g. "must be >= 1", "must be > 0").
+  /// `context` identifies the call site (e.g. `"train: steps_per_eval"`,
+  /// `"step_decay: step_size"`); `requirement` describes the violated
+  /// constraint (e.g. `"must be >= 1"`, `"must be > 0"`).
+  #[error(transparent)]
+  InvariantViolation(InvariantViolationPayload),
+
+  /// A tensor has the wrong rank. `context` gives the call site and the
+  /// expected rank (e.g. `"token_embeddings must be rank-3 (batch, seq_len, hidden)"`);
+  /// `actual` is the observed rank; `actual_shape` is the full observed shape
+  /// for diagnostics. The expected rank is encoded in `context` so callers with
+  /// non-integer requirements (e.g. ">= 2") can use a natural English phrase.
+  #[error(transparent)]
+  RankMismatch(RankMismatchPayload),
+
+  /// Two collections / dimensions / counts have mismatched lengths.
+  /// `context` identifies the call site and what was being compared
+  /// (e.g. `"slice: start/stop/strides length"`);
+  /// `expected` is the required length; `actual` is the observed length.
+  #[error(transparent)]
+  LengthMismatch(LengthMismatchPayload),
+
+  /// A scalar value is outside its allowed range. `context` identifies the
+  /// parameter and call site (e.g. `"top_k: parameter"`); `requirement`
+  /// describes the violated bound as a static phrase
+  /// (e.g. `"must be in (0, vocab_size)"`, `"must be a finite positive float"`);
+  /// `value` is the formatted runtime value that violated the range.
+  #[error(transparent)]
+  OutOfRange(OutOfRangePayload),
+
+  /// A file I/O operation failed. `context` identifies the call site
+  /// (e.g. `"save_as_txt"`, `"load_audio"`, `"save_model"`); `op` is the
+  /// [`FileOp`] kind (Create / Write / Flush / Read / …); `path` is the
+  /// file or directory path involved; `inner` is the underlying
+  /// [`std::io::Error`] (accessible via [`std::error::Error::source`]).
+  ///
+  /// Prefer this over `Backend(format!("ctx: op {} failed: {e}", path.display()))`
+  /// at any call site where the path is owned or cheaply cloned (e.g. a
+  /// `PathBuf` local, a `with_extension` result). The structured fields let
+  /// callers branch on [`FileOp`] kind, inspect the path, and walk the
+  /// source chain without string parsing.
+  #[error(transparent)]
+  FileIo(FileIoPayload),
+
+  /// Multiple parallel collections / dimensions disagreed on their lengths
+  /// when they must all agree. `context` identifies the call site and what
+  /// is being compared (e.g. `"pad: axes/low/high"`, `"slice:
+  /// start/stop/strides"`); `lengths` is a sequence of `(name, length)`
+  /// pairs for each mismatched collection.
+  ///
+  /// Prefer this over `ShapeMismatch(format!("pad: length mismatch — axes={}, low={}, high={}", …))`
+  /// at call sites that check three-or-more parallel slices (where
+  /// [`Error::LengthMismatch`]'s single expected/actual pair is insufficient).
+  #[error(transparent)]
+  MultiLengthMismatch(MultiLengthMismatchPayload),
 
   /// Tokenizer subsystem error (HF tokenizer load/encode/decode, chat-template
   /// render, tool-call parse). Only constructed when the `tokenizer` feature
   /// is enabled. The message carries the underlying cause.
   #[cfg(feature = "tokenizer")]
   #[cfg_attr(docsrs, doc(cfg(feature = "tokenizer")))]
-  #[error("tokenizer: {message}")]
-  Tokenizer {
-    /// Human-readable description of the tokenizer failure.
-    message: String,
-  },
+  #[error("tokenizer: {0}")]
+  Tokenizer(String),
 
   /// Defense-in-depth shard-path collision:
   /// [`crate::lm::load::save_model`]'s atomic no-replace
@@ -96,12 +870,8 @@ pub enum Error {
   /// only when the `lm` feature is enabled.
   #[cfg(feature = "lm")]
   #[cfg_attr(docsrs, doc(cfg(feature = "lm")))]
-  #[error("shard path collision: {path}")]
-  ShardPathCollision {
-    /// The pre-existing final shard path that the atomic no-replace
-    /// `hard_link` refused to overwrite.
-    path: std::path::PathBuf,
-  },
+  #[error("shard path collision: {}", .0.display())]
+  ShardPathCollision(std::path::PathBuf),
 
   /// Post-commit durability warning: a checkpoint or config file was
   /// successfully renamed into place (so the new content IS visible on
@@ -119,18 +889,13 @@ pub enum Error {
   /// Constructed only when the `lm` feature is enabled.
   #[cfg(feature = "lm")]
   #[cfg_attr(docsrs, doc(cfg(feature = "lm")))]
-  #[error("save committed but durability fsync failed (committed={committed}): {source}")]
-  DurabilityWarning {
-    /// Always `true` for now — this variant is constructed only AFTER the
-    /// observable commit point (the index rename + the config rename) has
-    /// succeeded. Kept in the public shape so a future caller can branch on
-    /// it without an API break if a `committed=false` durability story is
-    /// ever added.
-    committed: bool,
-    /// The underlying `fsync_dir` IO error.
-    #[source]
-    source: std::io::Error,
-  },
+  // `transparent` delegates BOTH `Display` AND `source()` to the inner
+  // payload. The payload's `std::error::Error::source()` returns the inner
+  // `std::io::Error` directly (not the payload itself), preserving the
+  // documented source-chain contract: the first `source()` hop is the
+  // actionable io::Error, not an opaque wrapper.
+  #[error(transparent)]
+  DurabilityWarning(DurabilityWarningPayload),
 
   /// [`crate::lm::convert::convert`] reached the post-save extras-copy step
   /// AFTER the index rename succeeded (so the weights + shard index +
@@ -156,44 +921,20 @@ pub enum Error {
   /// destination.
   ///
   /// This variant is constructed only when the `lm` feature is enabled.
-  /// It is machine-detectable via destructuring: the `save_warning` field
-  /// disambiguates the save side (a durability fsync warning vs a clean
-  /// save) and `copy_error` carries the original tokenizer-copy failure
-  /// (the new R3 information that the R2 fix's free-form
-  /// [`std::io::Error::other`] message hid from typed accessors).
+  /// It is machine-detectable via the payload accessors: the `save_warning`
+  /// accessor disambiguates the save side (a durability fsync warning vs a
+  /// clean save) and `copy_error` carries the original tokenizer-copy
+  /// failure.
   #[cfg(feature = "lm")]
   #[cfg_attr(docsrs, doc(cfg(feature = "lm")))]
-  #[error(
-    "convert: save committed but post-save extras copy partially failed (committed={committed}); \
-     destination directory may be incomplete (missing tokenizer/extras files)"
-  )]
-  ConvertPostSavePartial {
-    /// Always `true` — this variant is reachable only AFTER the
-    /// observable commit point (the index rename + the config rename)
-    /// has succeeded. Kept in the public shape so a future caller can
-    /// branch on it without an API break.
-    committed: bool,
-    /// The durability-fsync warning from the save phase if the save
-    /// returned [`Error::DurabilityWarning`]; `None` if the save
-    /// returned plain `Ok(())` but the post-save extras copy still
-    /// failed. Either way the save side is committed; the field shape
-    /// keeps both cases machine-detectable without a string parse.
-    ///
-    /// Not annotated with `#[source]` because `thiserror`'s `#[source]`
-    /// requires a non-`Option` field (the trait method returns
-    /// `Option<&(dyn Error + 'static)>` already). The chain points at
-    /// `copy_error` (the actually-actionable failure the caller needs to
-    /// retry or recover from); `save_warning` is exposed via direct
-    /// field access.
-    save_warning: Option<std::io::Error>,
-    /// The tokenizer-extras copy failure (the new R3 information that
-    /// the R2 fix folded into a free-form [`std::io::Error::other`]
-    /// message). This is what the caller needs to retry or recover
-    /// from: which file failed and why. Carried as a typed
-    /// [`std::io::Error`] (its kind / message are machine-readable).
-    #[source]
-    copy_error: std::io::Error,
-  },
+  // `transparent` delegates BOTH `Display` AND `source()` to the inner
+  // payload. The payload's `std::error::Error::source()` returns
+  // `copy_error` (the actionable tokenizer-copy failure) directly — NOT
+  // the payload wrapper — so the documented source-chain contract is
+  // preserved: walking `.source()` lands on the io::Error in one hop,
+  // not two.
+  #[error(transparent)]
+  ConvertPostSavePartial(ConvertPostSavePartialPayload),
 
   /// [`crate::lm::convert::convert`] observed durability-fsync warnings
   /// at **two or more** fsync boundaries (the save-side parent-directory
@@ -401,9 +1142,7 @@ impl Error {
   /// throughout the `tokenizer` module to funnel HF / minijinja / serde
   /// failures into the crate's unified error type.
   pub(crate) fn tokenizer(message: impl Into<String>) -> Self {
-    Self::Tokenizer {
-      message: message.into(),
-    }
+    Self::Tokenizer(message.into())
   }
 }
 
@@ -550,7 +1289,7 @@ extern "C" fn handler(msg: *const c_char, _data: *mut c_void) {
           // Preserve the trampoline's already-set user error.
           return;
         }
-        *g = Some(Error::Backend { message: s });
+        *g = Some(Error::Backend(s));
       }
     });
   }));
@@ -625,9 +1364,7 @@ pub(crate) fn check(rc: c_int) -> Result<()> {
     Err(
       LAST
         .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend {
-          message: format!("mlx returned {rc} with no message"),
-        }),
+        .unwrap_or(Error::Backend(format!("mlx returned {rc} with no message"))),
     )
   }
 }
@@ -641,9 +1378,7 @@ pub(crate) fn check_handle(handle: mlxrs_sys::mlx_array) -> Result<crate::Array>
     Err(
       LAST
         .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend {
-          message: "mlx returned null handle".into(),
-        }),
+        .unwrap_or(Error::Backend("mlx returned null handle".into())),
     )
   } else {
     Ok(crate::Array(handle))
@@ -663,9 +1398,9 @@ pub(crate) fn check_vector_array_handle(handle: mlxrs_sys::mlx_vector_array) -> 
     Err(
       LAST
         .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend {
-          message: "mlx returned null vector_array handle".into(),
-        }),
+        .unwrap_or(Error::Backend(
+          "mlx returned null vector_array handle".into(),
+        )),
     )
   } else {
     Ok(())
@@ -694,7 +1429,7 @@ mod init_smoke {
     let r = crate::Array::ones::<f32>(&(2, 2)).and_then(|a| a.reshape(&(3,)));
 
     assert!(
-      matches!(r, Err(crate::Error::Backend { .. })),
+      matches!(r, Err(crate::Error::Backend(_))),
       "failing op aborted process or produced wrong error variant; \
        mlx-c++ may have overwritten our handler post-ctor — got: {r:?}"
     );

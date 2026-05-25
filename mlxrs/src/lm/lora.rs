@@ -112,7 +112,7 @@ use regex::Regex;
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{Error, FileIoPayload, FileOp, OutOfRangePayload, RankMismatchPayload, Result},
   lm::{
     load::Weights,
     quant::{PerLayerQuantization, Quantization},
@@ -1518,9 +1518,8 @@ impl LoraConfig {
   /// the underlying cause — the codebase's config-parse error convention (twin
   /// of [`crate::lm::load::Config::from_json`]).
   pub fn from_json(json: &str) -> Result<LoraConfig> {
-    serde_json::from_str(json).map_err(|e| Error::Backend {
-      message: format!("invalid adapter_config.json: {e}"),
-    })
+    serde_json::from_str(json)
+      .map_err(|e| Error::Backend(format!("invalid adapter_config.json: {e}")))
   }
 
   /// Whether this config selects DoRA (weight-decomposed) — either
@@ -1685,21 +1684,17 @@ impl BaseLinear {
   pub fn dense(weight: Array, bias: Option<Array>) -> Result<Self> {
     let w_shape = weight.shape();
     if w_shape.len() != 2 {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "BaseLinear::dense: weight must be 2-D [output_dims, input_dims], got {w_shape:?}"
-        ),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "BaseLinear::dense: weight must be 2-D [output_dims, input_dims], got {w_shape:?}"
+      )));
     }
     if let Some(b) = &bias {
       let b_shape = b.shape();
       if b_shape.len() != 1 || b_shape[0] != w_shape[0] {
-        return Err(Error::ShapeMismatch {
-          message: format!(
-            "BaseLinear::dense: bias must be [output_dims={}], got {b_shape:?}",
-            w_shape[0]
-          ),
-        });
+        return Err(Error::ShapeMismatch(format!(
+          "BaseLinear::dense: bias must be [output_dims={}], got {b_shape:?}",
+          w_shape[0]
+        )));
       }
     }
     Ok(BaseLinear::Dense { weight, bias })
@@ -1721,37 +1716,31 @@ impl BaseLinear {
   ) -> Result<Self> {
     match (mode.as_str(), &quant_biases) {
       ("affine", None) => {
-        return Err(Error::Backend {
-          message: "BaseLinear::quantized: `affine` mode requires quant_biases (mlx \
+        return Err(Error::Backend(
+          "BaseLinear::quantized: `affine` mode requires quant_biases (mlx \
                     affine_quantize writes {w_q, scales, biases}), got None"
             .to_string(),
-        });
+        ));
       }
       ("mxfp4" | "mxfp8" | "nvfp4", Some(_)) => {
-        return Err(Error::Backend {
-          message: format!(
-            "BaseLinear::quantized: `{mode}` mode is scale-only (mlx fp_quantize writes \
+        return Err(Error::Backend(format!(
+          "BaseLinear::quantized: `{mode}` mode is scale-only (mlx fp_quantize writes \
              {{w_q, scales}}), but quant_biases was provided"
-          ),
-        });
+        )));
       }
       ("affine", Some(_)) | ("mxfp4" | "mxfp8" | "nvfp4", None) => {}
       (other, _) => {
-        return Err(Error::Backend {
-          message: format!(
-            "BaseLinear::quantized: unknown mode {other:?}; allowed: \"affine\", \"mxfp4\", \
+        return Err(Error::Backend(format!(
+          "BaseLinear::quantized: unknown mode {other:?}; allowed: \"affine\", \"mxfp4\", \
              \"mxfp8\", \"nvfp4\""
-          ),
-        });
+        )));
       }
     }
     if bits <= 0 || group_size <= 0 {
-      return Err(Error::Backend {
-        message: format!(
-          "BaseLinear::quantized: bits ({bits}) and group_size ({group_size}) must be > 0 \
+      return Err(Error::Backend(format!(
+        "BaseLinear::quantized: bits ({bits}) and group_size ({group_size}) must be > 0 \
            (per-mode value tables are validated by mlx-c)"
-        ),
-      });
+      )));
     }
     Ok(BaseLinear::Quantized {
       weight,
@@ -2069,22 +2058,20 @@ impl DoRALinear {
     let magnitude = match &params.magnitude {
       Some(m) => m.try_clone()?,
       None => {
-        return Err(Error::Backend {
-          message: "DoRALinear::new: DoRA requires a magnitude `m` (loaded from \
+        return Err(Error::Backend(
+          "DoRALinear::new: DoRA requires a magnitude `m` (loaded from \
                     adapters.safetensors), got None"
             .to_string(),
-        });
+        ));
       }
     };
     // `m` is the per-output-row norm: shape [output_dims].
     let output_dims = base_output_dims(&base)?;
     let m_shape = magnitude.shape();
     if m_shape.len() != 1 || m_shape[0] != output_dims {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "DoRALinear::new: magnitude `m` must be [output_dims={output_dims}], got {m_shape:?}"
-        ),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "DoRALinear::new: magnitude `m` must be [output_dims={output_dims}], got {m_shape:?}"
+      )));
     }
     Ok(Self {
       base,
@@ -2245,11 +2232,9 @@ impl BaseEmbedding {
   pub fn dense(weight: Array) -> Result<Self> {
     let shape = weight.shape();
     if shape.len() != 2 {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "BaseEmbedding::dense: weight must be 2-D [num_embeddings, dims], got {shape:?}"
-        ),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "BaseEmbedding::dense: weight must be 2-D [num_embeddings, dims], got {shape:?}"
+      )));
     }
     Ok(BaseEmbedding::Dense { weight })
   }
@@ -2263,26 +2248,18 @@ impl BaseEmbedding {
 
   /// `num_embeddings` — the embedding table's leading axis.
   fn num_embeddings(&self) -> Result<usize> {
-    self
-      .weight()
-      .shape()
-      .first()
-      .copied()
-      .ok_or_else(|| Error::ShapeMismatch {
-        message: "embedding weight has rank 0; cannot determine num_embeddings".to_string(),
-      })
+    self.weight().shape().first().copied().ok_or_else(|| {
+      Error::ShapeMismatch(
+        "embedding weight has rank 0; cannot determine num_embeddings".to_string(),
+      )
+    })
   }
 
   /// `dims` — the embedding table's trailing axis (the per-token vector width).
   fn dims(&self) -> Result<usize> {
-    self
-      .weight()
-      .shape()
-      .get(1)
-      .copied()
-      .ok_or_else(|| Error::ShapeMismatch {
-        message: "embedding weight has rank < 2; cannot determine dims".to_string(),
-      })
+    self.weight().shape().get(1).copied().ok_or_else(|| {
+      Error::ShapeMismatch("embedding weight has rank < 2; cannot determine dims".to_string())
+    })
   }
 
   /// Per-token lookup: `take_axis(weight, ids, axis=0)`, mirroring
@@ -2342,23 +2319,21 @@ impl DoRAEmbedding {
     let magnitude = match &params.magnitude {
       Some(m) => m.try_clone()?,
       None => {
-        return Err(Error::Backend {
-          message: "DoRAEmbedding::new: DoRA requires a magnitude `m` (loaded from \
+        return Err(Error::Backend(
+          "DoRAEmbedding::new: DoRA requires a magnitude `m` (loaded from \
                     adapters.safetensors), got None"
             .to_string(),
-        });
+        ));
       }
     };
     // `m` is the per-row norm: shape [num_embeddings].
     let num_embeddings = base.num_embeddings()?;
     let m_shape = magnitude.shape();
     if m_shape.len() != 1 || m_shape[0] != num_embeddings {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "DoRAEmbedding::new: magnitude `m` must be [num_embeddings={num_embeddings}], \
+      return Err(Error::ShapeMismatch(format!(
+        "DoRAEmbedding::new: magnitude `m` must be [num_embeddings={num_embeddings}], \
            got {m_shape:?}"
-        ),
-      });
+      )));
     }
     Ok(Self {
       base,
@@ -2559,40 +2534,34 @@ fn validate_embedding_factor_shapes(
   let a_shape = params.lora_a.shape();
   let b_shape = params.lora_b.shape();
   if a_shape.len() != 2 {
-    return Err(Error::ShapeMismatch {
-      message: format!("{who}: lora_a must be 2-D [num_embeddings, r], got {a_shape:?}"),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "{who}: lora_a must be 2-D [num_embeddings, r], got {a_shape:?}"
+    )));
   }
   if b_shape.len() != 2 {
-    return Err(Error::ShapeMismatch {
-      message: format!("{who}: lora_b must be 2-D [r, dims], got {b_shape:?}"),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "{who}: lora_b must be 2-D [r, dims], got {b_shape:?}"
+    )));
   }
   if a_shape[1] != b_shape[0] {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "{who}: rank mismatch — lora_a is [_, r={}] but lora_b is [r={}, _]",
-        a_shape[1], b_shape[0]
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "{who}: rank mismatch — lora_a is [_, r={}] but lora_b is [r={}, _]",
+      a_shape[1], b_shape[0]
+    )));
   }
   let num_embeddings = base.num_embeddings()?;
   if a_shape[0] != num_embeddings {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "{who}: lora_a leading axis ({}) must equal base num_embeddings ({num_embeddings})",
-        a_shape[0]
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "{who}: lora_a leading axis ({}) must equal base num_embeddings ({num_embeddings})",
+      a_shape[0]
+    )));
   }
   let dims = base.dims()?;
   if b_shape[1] != dims {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "{who}: lora_b last axis ({}) must equal base dims ({dims})",
-        b_shape[1]
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "{who}: lora_b last axis ({}) must equal base dims ({dims})",
+      b_shape[1]
+    )));
   }
   Ok(())
 }
@@ -2647,11 +2616,11 @@ impl LoraLayer {
     match self {
       LoraLayer::Lora(l) => l.fuse(dequantize),
       LoraLayer::Dora(d) => d.fuse(dequantize),
-      LoraLayer::DoraEmbedding(_) => Err(Error::Backend {
-        message: "LoraLayer::fuse: this is a DoRA embedding layer; call \
+      LoraLayer::DoraEmbedding(_) => Err(Error::Backend(
+        "LoraLayer::fuse: this is a DoRA embedding layer; call \
                   `fuse_embedding` to obtain a `BaseEmbedding`"
           .to_string(),
-      }),
+      )),
     }
   }
 
@@ -2662,11 +2631,11 @@ impl LoraLayer {
   pub fn fuse_embedding(&self) -> Result<BaseEmbedding> {
     match self {
       LoraLayer::DoraEmbedding(d) => d.fuse(),
-      LoraLayer::Lora(_) | LoraLayer::Dora(_) => Err(Error::Backend {
-        message: "LoraLayer::fuse_embedding: this is a linear LoRA/DoRA layer; call \
+      LoraLayer::Lora(_) | LoraLayer::Dora(_) => Err(Error::Backend(
+        "LoraLayer::fuse_embedding: this is a linear LoRA/DoRA layer; call \
                   `fuse` to obtain a `BaseLinear`"
           .to_string(),
-      }),
+      )),
     }
   }
 
@@ -2711,8 +2680,8 @@ fn base_output_dims(base: &BaseLinear) -> Result<usize> {
     BaseLinear::Dense { weight, .. } => weight.shape(),
     BaseLinear::Quantized { weight, .. } => weight.shape(),
   };
-  shape.first().copied().ok_or_else(|| Error::ShapeMismatch {
-    message: "base linear weight has rank 0; cannot determine output_dims".to_string(),
+  shape.first().copied().ok_or_else(|| {
+    Error::ShapeMismatch("base linear weight has rank 0; cannot determine output_dims".to_string())
   })
 }
 
@@ -2728,21 +2697,24 @@ fn base_input_dims(base: &BaseLinear) -> Result<usize> {
   match base {
     BaseLinear::Dense { weight, .. } => {
       let shape = weight.shape();
-      shape.get(1).copied().ok_or_else(|| Error::ShapeMismatch {
-        message: format!(
-          "dense base weight must be 2-D [output_dims, input_dims]; got rank-{} shape {shape:?}",
-          shape.len()
-        ),
+      let rank = shape.len() as u32;
+      shape.get(1).copied().ok_or_else(|| {
+        Error::RankMismatch(RankMismatchPayload::new(
+          "dense base weight must be 2-D [output_dims, input_dims]",
+          rank,
+          shape.clone(),
+        ))
       })
     }
     BaseLinear::Quantized { weight, bits, .. } => {
       let shape = weight.shape();
-      let packed = shape.get(1).copied().ok_or_else(|| Error::ShapeMismatch {
-        message: format!(
-          "quantized base weight must be 2-D [output_dims, input_dims*bits/32]; got rank-{} \
-           shape {shape:?}",
-          shape.len()
-        ),
+      let rank = shape.len() as u32;
+      let packed = shape.get(1).copied().ok_or_else(|| {
+        Error::RankMismatch(RankMismatchPayload::new(
+          "quantized base weight must be 2-D [output_dims, input_dims*bits/32]",
+          rank,
+          shape.clone(),
+        ))
       })?;
       // `bits > 0` is guaranteed by `BaseLinear::quantized`; recover the logical
       // input width `packed * 32 / bits` (e.g. 4-bit packs 8 weights / u32).
@@ -2763,43 +2735,37 @@ fn validate_factor_shapes(base: &BaseLinear, params: &AdapterParams, who: &str) 
   let a_shape = params.lora_a.shape();
   let b_shape = params.lora_b.shape();
   if a_shape.len() != 2 {
-    return Err(Error::ShapeMismatch {
-      message: format!("{who}: lora_a must be 2-D [input_dims, r], got {a_shape:?}"),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "{who}: lora_a must be 2-D [input_dims, r], got {a_shape:?}"
+    )));
   }
   if b_shape.len() != 2 {
-    return Err(Error::ShapeMismatch {
-      message: format!("{who}: lora_b must be 2-D [r, output_dims], got {b_shape:?}"),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "{who}: lora_b must be 2-D [r, output_dims], got {b_shape:?}"
+    )));
   }
   // r consistency: lora_a's last axis == lora_b's leading axis.
   if a_shape[1] != b_shape[0] {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "{who}: rank mismatch — lora_a is [_, r={}] but lora_b is [r={}, _]",
-        a_shape[1], b_shape[0]
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "{who}: rank mismatch — lora_a is [_, r={}] but lora_b is [r={}, _]",
+      a_shape[1], b_shape[0]
+    )));
   }
   // input_dims consistency: lora_a's leading axis == base input_dims.
   let input_dims = base_input_dims(base)?;
   if a_shape[0] != input_dims {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "{who}: lora_a leading axis ({}) must equal base input_dims ({input_dims})",
-        a_shape[0]
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "{who}: lora_a leading axis ({}) must equal base input_dims ({input_dims})",
+      a_shape[0]
+    )));
   }
   // output_dims consistency: lora_b's last axis == base output_dims.
   let output_dims = base_output_dims(base)?;
   if b_shape[1] != output_dims {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "{who}: lora_b last axis ({}) must equal base output_dims ({output_dims})",
-        b_shape[1]
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "{who}: lora_b last axis ({}) must equal base output_dims ({output_dims})",
+      b_shape[1]
+    )));
   }
   Ok(())
 }
@@ -2832,13 +2798,11 @@ fn validate_config_rank(params: &AdapterParams, config_rank: usize, who: &str) -
   let a_rank = a_shape.get(1).copied().unwrap_or_default();
   let b_rank = b_shape.first().copied().unwrap_or_default();
   if a_rank != config_rank || b_rank != config_rank {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "{who}: adapter factor rank ({a_rank}) does not match adapter_config.json rank \
+    return Err(Error::ShapeMismatch(format!(
+      "{who}: adapter factor rank ({a_rank}) does not match adapter_config.json rank \
          ({config_rank}); a stale config would silently scale by alpha/{config_rank} instead \
          of alpha/{a_rank}"
-      ),
-    });
+    )));
   }
   Ok(())
 }
@@ -3170,15 +3134,14 @@ fn check_adapter_completeness(
   if explicit_selection && !selected_without_factors.is_empty() {
     let mut missing: Vec<&str> = selected_without_factors.to_vec();
     missing.sort_unstable();
-    return Err(Error::Backend {
-      message: format!(
-        "load_adapters: adapter is missing factors for {} explicitly-selected target(s): {:?}; \
+    // TODO(§5): promote to a typed AdapterMissingFactors { count: usize, targets: Vec<String> } variant — carries machine-inspectable target list without string parse.
+    return Err(Error::Backend(format!(
+      "load_adapters: adapter is missing factors for {} explicitly-selected target(s): {:?}; \
          the adapter_config.json target selection does not match the adapters.safetensors \
          contents",
-        missing.len(),
-        missing
-      ),
-    });
+      missing.len(),
+      missing
+    )));
   }
 
   // (b) adapter factor groups that matched no base layer (unused).
@@ -3189,26 +3152,24 @@ fn check_adapter_completeness(
     .collect();
   if !unused.is_empty() {
     unused.sort_unstable();
-    return Err(Error::Backend {
-      message: format!(
-        "load_adapters: {} adapter factor group(s) match no base layer: {:?}; the \
+    return Err(Error::Backend(format!(
+      "load_adapters: {} adapter factor group(s) match no base layer: {:?}; the \
          adapters.safetensors paths do not line up with the base model weights (path-prefix \
          mismatch or config drift)",
-        unused.len(),
-        unused
-      ),
-    });
+      unused.len(),
+      unused
+    )));
   }
 
   // (c) nothing adapted at all.
   if applied.is_empty() {
-    return Err(Error::Backend {
-      message: "load_adapters: no base layer was adapted — the adapter_config.json target \
+    return Err(Error::Backend(
+      "load_adapters: no base layer was adapted — the adapter_config.json target \
                 selection (mlx-lm `keys`/`num_layers` or PEFT \
                 `target_modules`/`layers_to_transform`) matched nothing in the base model, or \
                 adapters.safetensors carried no factors"
         .to_string(),
-    });
+    ));
   }
 
   Ok(())
@@ -3248,14 +3209,12 @@ fn build_base_linear(
   let q: Option<Quantization> = quant.and_then(|c| c.quantization_for(path));
   if let (Some(q), Some(scales)) = (q, weights.get(&scales_key)) {
     if fan_in_fan_out {
-      return Err(Error::Backend {
-        message: format!(
-          "load_adapters: base layer {path:?} is quantized AND the adapter_config.json sets \
+      return Err(Error::Backend(format!(
+        "load_adapters: base layer {path:?} is quantized AND the adapter_config.json sets \
            `fan_in_fan_out` — a packed quantized weight cannot be transposed without \
            corrupting the bit-packing; `fan_in_fan_out` applies only to a dense \
            (Conv1D-style) base"
-        ),
-      });
+      )));
     }
     let quant_biases = weights.get(&biases_key).map(Array::try_clone).transpose()?;
     let bias = weights.get(&bias_key).map(Array::try_clone).transpose()?;
@@ -3416,22 +3375,21 @@ pub fn load_adapters_with_config(
   // as unsupported (recoverable) — the per-usecase architecture merges a full
   // fine-tune at the weight-map level instead.
   if config.fine_tune_type == FineTuneType::Full {
-    return Err(Error::Backend {
-      message: "load_adapters: fine_tune_type \"full\" is a full-weight fine-tune, not an \
+    return Err(Error::Backend(
+      "load_adapters: fine_tune_type \"full\" is a full-weight fine-tune, not an \
                 adapter; merge it at the weight-map level via lm::load::load_weights instead"
         .to_string(),
-    });
+    ));
   }
 
   // Reject a non-positive rank early (a degenerate config that would build
   // empty factors).
   if config.rank() <= 0 {
-    return Err(Error::Backend {
-      message: format!(
-        "load_adapters: adapter rank must be > 0, got {}",
-        config.rank()
-      ),
-    });
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "load_adapters: adapter rank",
+      "must be > 0",
+      format!("{}", config.rank()),
+    )));
   }
 
   // 2) Locate the adapter weights file. mlx-lm names it `adapters.safetensors`;
@@ -3444,8 +3402,11 @@ pub fn load_adapters_with_config(
   // blob (OOM) — the safetensors path is otherwise handed straight to mlx-c,
   // which would mmap whatever it is given.
   check_adapter_safetensors(&st_path)?;
-  let adapter_arrays = crate::io::load_safetensors(&st_path).map_err(|e| Error::Backend {
-    message: format!("load_adapters: cannot load {}: {e}", st_path.display()),
+  let adapter_arrays = crate::io::load_safetensors(&st_path).map_err(|e| {
+    Error::Backend(format!(
+      "load_adapters: cannot load {}: {e}",
+      st_path.display()
+    ))
   })?;
   // PEFT keys (`base_model.model.<path>.lora_A.weight`, …) → the mlxrs
   // `<path>.lora_a` / `.lora_b` / `.m` scheme, transposing the factor tensors
@@ -3507,12 +3468,10 @@ fn locate_adapter_safetensors(dir: &Path, config: &LoraConfig) -> Result<std::pa
   if fallback_path.exists() {
     return Ok(fallback_path);
   }
-  Err(Error::Backend {
-    message: format!(
-      "load_adapters: no adapter weights file in {}; expected {preferred:?} (or {fallback:?})",
-      dir.display()
-    ),
-  })
+  Err(Error::Backend(format!(
+    "load_adapters: no adapter weights file in {}; expected {preferred:?} (or {fallback:?})",
+    dir.display()
+  )))
 }
 
 /// PEFT adapter-weight key prefix — every tensor in a `peft`
@@ -3599,28 +3558,24 @@ fn translate_peft_keys(arrays: HashMap<String, Array>) -> Result<HashMap<String,
       // implemented (deferred), so reject with a precise, distinct error rather
       // than load it wrong. (`.contains` rather than `.strip_suffix` because the
       // suffix may be bare or carry a trailing `.weight`.)
-      return Err(Error::Backend {
-        message: format!(
-          "load_adapters: PEFT adapter tensor {key:?} is an embedding LoRA factor \
+      return Err(Error::Backend(format!(
+        "load_adapters: PEFT adapter tensor {key:?} is an embedding LoRA factor \
            (`lora_embedding_A` / `lora_embedding_B`); embedding LoRA is not supported by this \
            loader (only linear-layer `lora_A` / `lora_B` low-rank factors are applied), so it \
            cannot be loaded"
-        ),
-      });
+      )));
     } else {
       // A PEFT-prefixed tensor that is NOT a low-rank factor — a `.bias`
       // (PEFT `bias != "none"`) or a `modules_to_save` full-module weight. Both
       // affect inference; dropping them would silently corrupt the adapter, so
       // reject loudly naming the key (mlxrs's LoRALinear has no adapted-bias /
       // saved-module slot — same stance as the config-level rejection).
-      return Err(Error::Backend {
-        message: format!(
-          "load_adapters: PEFT adapter tensor {key:?} is not a recognized low-rank factor \
+      return Err(Error::Backend(format!(
+        "load_adapters: PEFT adapter tensor {key:?} is not a recognized low-rank factor \
            (`.lora_A.weight` / `.lora_B.weight` / `.lora_magnitude_vector`); it is a PEFT \
            `bias` or `modules_to_save` tensor, which affects inference and this low-rank \
            loader has no slot for — dropping it would silently corrupt the adapter"
-        ),
-      });
+      )));
     }
   }
   Ok(out)
@@ -3656,16 +3611,16 @@ fn split_adapter_params(
 
   let mut out: HashMap<String, AdapterParams> = HashMap::with_capacity(a_map.len());
   for (path, lora_a) in a_map {
-    let lora_b = b_map.remove(&path).ok_or_else(|| Error::Backend {
-      message: format!(
+    let lora_b = b_map.remove(&path).ok_or_else(|| {
+      Error::Backend(format!(
         "load_adapters: adapter path {path:?} has `lora_a` but no matching `lora_b`"
-      ),
+      ))
     })?;
     let magnitude = m_map.remove(&path);
     if expect_dora && magnitude.is_none() {
-      return Err(Error::Backend {
-        message: format!("load_adapters: DoRA adapter path {path:?} is missing its magnitude `m`"),
-      });
+      return Err(Error::Backend(format!(
+        "load_adapters: DoRA adapter path {path:?} is missing its magnitude `m`"
+      )));
     }
     out.insert(
       path,
@@ -3679,11 +3634,9 @@ fn split_adapter_params(
 
   // Any `lora_b` left without a matching `lora_a` is an error.
   if let Some((path, _)) = b_map.into_iter().next() {
-    return Err(Error::Backend {
-      message: format!(
-        "load_adapters: adapter path {path:?} has `lora_b` but no matching `lora_a`"
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "load_adapters: adapter path {path:?} has `lora_b` but no matching `lora_a`"
+    )));
   }
 
   Ok(out)
@@ -3700,12 +3653,10 @@ fn read_bounded_adapter_config(dir: &Path) -> Result<String> {
   use std::io::Read;
 
   if !dir.exists() {
-    return Err(Error::Backend {
-      message: format!(
-        "load_adapters: adapter path does not exist: {}",
-        dir.display()
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "load_adapters: adapter path does not exist: {}",
+      dir.display()
+    )));
   }
   let path = dir.join("adapter_config.json");
 
@@ -3716,45 +3667,61 @@ fn read_bounded_adapter_config(dir: &Path) -> Result<String> {
       .read(true)
       .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
       .open(&path)
-      .map_err(|e| Error::Backend {
-        message: format!("load_adapters: cannot open {}: {e}", path.display()),
+      .map_err(|e| {
+        Error::FileIo(FileIoPayload::new(
+          "load_adapters",
+          FileOp::Open,
+          path.to_path_buf(),
+          e,
+        ))
       })?
   };
   #[cfg(not(unix))]
-  let file = std::fs::File::open(&path).map_err(|e| Error::Backend {
-    message: format!("load_adapters: cannot open {}: {e}", path.display()),
+  let file = std::fs::File::open(&path).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "load_adapters",
+      FileOp::Open,
+      path.to_path_buf(),
+      e,
+    ))
   })?;
 
-  let meta = file.metadata().map_err(|e| Error::Backend {
-    message: format!("load_adapters: cannot stat {}: {e}", path.display()),
+  let meta = file.metadata().map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "load_adapters",
+      FileOp::Stat,
+      path.to_path_buf(),
+      e,
+    ))
   })?;
   if !meta.is_file() {
-    return Err(Error::Backend {
-      message: format!(
-        "load_adapters: {} is not a regular file; refusing to read",
-        path.display()
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "load_adapters: {} is not a regular file; refusing to read",
+      path.display()
+    )));
   }
 
   let cap = crate::lm::load::MAX_CONFIG_BYTES;
   let mut bytes = Vec::new();
-  file
-    .take(cap + 1)
-    .read_to_end(&mut bytes)
-    .map_err(|e| Error::Backend {
-      message: format!("load_adapters: cannot read {}: {e}", path.display()),
-    })?;
+  file.take(cap + 1).read_to_end(&mut bytes).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "load_adapters",
+      FileOp::Read,
+      path.clone(),
+      e,
+    ))
+  })?;
   if bytes.len() as u64 > cap {
-    return Err(Error::Backend {
-      message: format!(
-        "load_adapters: {} exceeds the {cap}-byte cap; refusing to read",
-        path.display()
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "load_adapters: {} exceeds the {cap}-byte cap; refusing to read",
+      path.display()
+    )));
   }
-  String::from_utf8(bytes).map_err(|e| Error::Backend {
-    message: format!("load_adapters: {} is not valid UTF-8: {e}", path.display()),
+  String::from_utf8(bytes).map_err(|e| {
+    Error::Backend(format!(
+      "load_adapters: {} is not valid UTF-8: {e}",
+      path.display()
+    ))
   })
 }
 
@@ -3788,35 +3755,46 @@ fn check_adapter_safetensors(path: &Path) -> Result<()> {
       .read(true)
       .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
       .open(path)
-      .map_err(|e| Error::Backend {
-        message: format!("load_adapters: cannot open {}: {e}", path.display()),
+      .map_err(|e| {
+        Error::FileIo(FileIoPayload::new(
+          "load_adapters",
+          FileOp::Open,
+          path.to_path_buf(),
+          e,
+        ))
       })?
   };
   #[cfg(not(unix))]
-  let file = std::fs::File::open(path).map_err(|e| Error::Backend {
-    message: format!("load_adapters: cannot open {}: {e}", path.display()),
+  let file = std::fs::File::open(path).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "load_adapters",
+      FileOp::Open,
+      path.to_path_buf(),
+      e,
+    ))
   })?;
 
-  let meta = file.metadata().map_err(|e| Error::Backend {
-    message: format!("load_adapters: cannot stat {}: {e}", path.display()),
+  let meta = file.metadata().map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "load_adapters",
+      FileOp::Stat,
+      path.to_path_buf(),
+      e,
+    ))
   })?;
   if !meta.is_file() {
-    return Err(Error::Backend {
-      message: format!(
-        "load_adapters: {} is not a regular file; refusing to load",
-        path.display()
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "load_adapters: {} is not a regular file; refusing to load",
+      path.display()
+    )));
   }
   if meta.len() > MAX_ADAPTER_SAFETENSORS_BYTES {
-    return Err(Error::Backend {
-      message: format!(
-        "load_adapters: {} is {} bytes, exceeding the {MAX_ADAPTER_SAFETENSORS_BYTES}-byte \
+    return Err(Error::Backend(format!(
+      "load_adapters: {} is {} bytes, exceeding the {MAX_ADAPTER_SAFETENSORS_BYTES}-byte \
          adapter budget; refusing to load",
-        path.display(),
-        meta.len()
-      ),
-    });
+      path.display(),
+      meta.len()
+    )));
   }
   Ok(())
 }
@@ -4053,7 +4031,7 @@ mod tests {
   fn dora_requires_magnitude() {
     let base = BaseLinear::dense(base_weight(), None).unwrap();
     let err = DoRALinear::new(base, plain_params(), 2.0).unwrap_err();
-    assert!(matches!(err, Error::Backend { .. }));
+    assert!(matches!(err, Error::Backend(_)));
   }
 
   // ───────────────────── QLoRA (quantized base) ─────────────────────
@@ -4665,7 +4643,7 @@ mod tests {
     let weights = toy_weights();
     let err = load_adapters(&weights, &tmp, None, 4).unwrap_err();
     assert!(
-      matches!(err, Error::ShapeMismatch { .. }),
+      matches!(err, Error::ShapeMismatch(_)),
       "rank drift must be a ShapeMismatch, got {err:?}"
     );
     std::fs::remove_dir_all(&tmp).ok();
@@ -4694,7 +4672,7 @@ mod tests {
     let weights = toy_weights();
     let err = load_adapters(&weights, &tmp, None, 4).unwrap_err();
     assert!(
-      matches!(err, Error::ShapeMismatch { .. }),
+      matches!(err, Error::ShapeMismatch(_)),
       "PEFT rank drift must be a ShapeMismatch, got {err:?}"
     );
     std::fs::remove_dir_all(&tmp).ok();
@@ -4724,7 +4702,7 @@ mod tests {
     write_mock_adapter(&tmp, "dora", false);
     let weights = toy_weights();
     let err = load_adapters(&weights, &tmp, None, 4).unwrap_err();
-    assert!(matches!(err, Error::Backend { .. }));
+    assert!(matches!(err, Error::Backend(_)));
     std::fs::remove_dir_all(&tmp).ok();
   }
 
@@ -4735,7 +4713,7 @@ mod tests {
     write_mock_adapter(&tmp, "full", false);
     let weights = toy_weights();
     let err = load_adapters(&weights, &tmp, None, 4).unwrap_err();
-    assert!(matches!(err, Error::Backend { .. }));
+    assert!(matches!(err, Error::Backend(_)));
     std::fs::remove_dir_all(&tmp).ok();
   }
 
@@ -4746,7 +4724,7 @@ mod tests {
     write_mock_adapter(&tmp, "bogus", false);
     let weights = toy_weights();
     let err = load_adapters(&weights, &tmp, None, 4).unwrap_err();
-    assert!(matches!(err, Error::Backend { .. }));
+    assert!(matches!(err, Error::Backend(_)));
     std::fs::remove_dir_all(&tmp).ok();
   }
 
@@ -4759,7 +4737,7 @@ mod tests {
     crate::io::save_safetensors(&tmp.join("adapters.safetensors"), &arrays).unwrap();
     let weights = toy_weights();
     let err = load_adapters(&weights, &tmp, None, 4).unwrap_err();
-    assert!(matches!(err, Error::Backend { .. }));
+    assert!(matches!(err, Error::Backend(_)));
     std::fs::remove_dir_all(&tmp).ok();
   }
 
@@ -4769,7 +4747,7 @@ mod tests {
     // Do NOT create the dir.
     let weights = toy_weights();
     let err = load_adapters(&weights, &tmp, None, 4).unwrap_err();
-    assert!(matches!(err, Error::Backend { .. }));
+    assert!(matches!(err, Error::Backend(_)));
   }
 
   // ───────────────────── factor-shape validation ─────────────────────
@@ -4785,7 +4763,7 @@ mod tests {
     };
     let base = BaseLinear::dense(base_weight(), None).unwrap();
     let err = LoRALinear::new(base, params, 2.0).unwrap_err();
-    assert!(matches!(err, Error::ShapeMismatch { .. }));
+    assert!(matches!(err, Error::ShapeMismatch(_)));
   }
 
   #[test]
@@ -4799,7 +4777,7 @@ mod tests {
     };
     let base = BaseLinear::dense(base_weight(), None).unwrap();
     let err = LoRALinear::new(base, params, 2.0).unwrap_err();
-    assert!(matches!(err, Error::ShapeMismatch { .. }));
+    assert!(matches!(err, Error::ShapeMismatch(_)));
   }
 
   // ───────── Finding 5: lora_a input-dim cross-check ─────────
@@ -4817,7 +4795,7 @@ mod tests {
     };
     let base = BaseLinear::dense(base_weight(), None).unwrap();
     let err = LoRALinear::new(base, params, 2.0).unwrap_err();
-    assert!(matches!(err, Error::ShapeMismatch { .. }));
+    assert!(matches!(err, Error::ShapeMismatch(_)));
   }
 
   #[test]
@@ -4842,7 +4820,7 @@ mod tests {
       magnitude: None,
     };
     let err = LoRALinear::new(q_base, params, 2.0).unwrap_err();
-    assert!(matches!(err, Error::ShapeMismatch { .. }));
+    assert!(matches!(err, Error::ShapeMismatch(_)));
   }
 
   #[test]
@@ -4993,7 +4971,7 @@ mod tests {
     let cfg = mlxlm_config(16, keyed_params(vec!["self_attn.q_proj".to_string()]));
     let err = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap_err();
     match err {
-      Error::Backend { message } => {
+      Error::Backend(message) => {
         assert!(message.contains("missing factors"), "got: {message}");
         assert!(
           message.contains("model.layers.2.self_attn.q_proj"),
@@ -5017,7 +4995,7 @@ mod tests {
     let cfg = mlxlm_config(16, keyed_params(vec!["self_attn.q_proj".to_string()]));
     let err = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap_err();
     match err {
-      Error::Backend { message } => {
+      Error::Backend(message) => {
         assert!(message.contains("match no base layer"), "got: {message}");
         assert!(
           message.contains("model.layers.99.self_attn.q_proj"),
@@ -5040,7 +5018,7 @@ mod tests {
     );
     let err = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap_err();
     match err {
-      Error::Backend { message } => {
+      Error::Backend(message) => {
         assert!(
           message.contains("no base layer was adapted"),
           "got: {message}"
@@ -5093,7 +5071,7 @@ mod tests {
 
     let weights = toy_weights();
     let err = load_adapters(&weights, &tmp, None, 4).unwrap_err();
-    assert!(matches!(err, Error::Backend { .. }));
+    assert!(matches!(err, Error::Backend(_)));
     std::fs::remove_dir_all(&tmp).ok();
   }
 
@@ -5114,7 +5092,7 @@ mod tests {
 
     let weights = toy_weights();
     let err = load_adapters(&weights, &tmp, None, 4).unwrap_err();
-    assert!(matches!(err, Error::Backend { .. }));
+    assert!(matches!(err, Error::Backend(_)));
     std::fs::remove_dir_all(&tmp).ok();
   }
 
@@ -5256,7 +5234,7 @@ mod tests {
     let weights = toy_weights();
     let err = load_adapters(&weights, &tmp, None, 4).unwrap_err();
     match err {
-      Error::Backend { message } => {
+      Error::Backend(message) => {
         assert!(message.contains("not a regular file"), "got: {message}");
       }
       other => panic!("expected Backend, got {other:?}"),
@@ -5284,7 +5262,7 @@ mod tests {
     let weights = toy_weights();
     let err = load_adapters(&weights, &tmp, None, 4).unwrap_err();
     match err {
-      Error::Backend { message } => {
+      Error::Backend(message) => {
         assert!(message.contains("adapter budget"), "got: {message}");
       }
       other => panic!("expected Backend, got {other:?}"),
@@ -5386,7 +5364,7 @@ mod tests {
       let err =
         LoraConfig::from_json(&json).expect_err(&format!("PEFT `bias: {bias:?}` must be rejected"));
       match err {
-        Error::Backend { message } => assert!(
+        Error::Backend(message) => assert!(
           message.contains("bias"),
           "the rejection should mention `bias`; got: {message}"
         ),
@@ -5413,7 +5391,7 @@ mod tests {
     let err =
       LoraConfig::from_json(json).expect_err("non-empty `modules_to_save` must be rejected");
     match err {
-      Error::Backend { message } => assert!(
+      Error::Backend(message) => assert!(
         message.contains("modules_to_save"),
         "the rejection should mention `modules_to_save`; got: {message}"
       ),
@@ -5452,7 +5430,7 @@ mod tests {
     let err = translate_peft_keys(with_bias)
       .expect_err("a PEFT-prefixed `.bias` tensor must be rejected, not silently dropped");
     match err {
-      Error::Backend { message } => assert!(
+      Error::Backend(message) => assert!(
         message.contains(bias_key),
         "the rejection must name the dropped key; got: {message}"
       ),
@@ -5466,7 +5444,7 @@ mod tests {
     with_saved.insert(saved_key.to_string(), base_weight());
     let err = translate_peft_keys(with_saved)
       .expect_err("a PEFT-prefixed `modules_to_save` weight must be rejected");
-    assert!(matches!(err, Error::Backend { message } if message.contains(saved_key)));
+    assert!(matches!(err, Error::Backend(message) if message.contains(saved_key)));
   }
 
   #[test]
@@ -5489,7 +5467,7 @@ mod tests {
       ));
       // The error message names the offending variant field.
       let msg = match &err {
-        Error::Backend { message } => message.clone(),
+        Error::Backend(message) => message.clone(),
         other => panic!("expected Error::Backend for `{field}`, got {other:?}"),
       };
       assert!(
@@ -5581,7 +5559,7 @@ mod tests {
     let err = LoraConfig::from_json(json)
       .expect_err("`arrow_config` set must be rejected (forward variant)");
     match err {
-      Error::Backend { message } => assert!(
+      Error::Backend(message) => assert!(
         message.contains("arrow_config"),
         "the rejection should name `arrow_config`; got: {message}"
       ),
@@ -5600,7 +5578,7 @@ mod tests {
     }"#;
     let err = LoraConfig::from_json(json).expect_err("`use_bdlora` set must be rejected");
     match err {
-      Error::Backend { message } => assert!(
+      Error::Backend(message) => assert!(
         message.contains("use_bdlora"),
         "the rejection should name `use_bdlora`; got: {message}"
       ),
@@ -5628,7 +5606,7 @@ mod tests {
         "an active unknown field `{field}` must be rejected by the structural backstop"
       ));
       match err {
-        Error::Backend { message } => assert!(
+        Error::Backend(message) => assert!(
           message.contains(field),
           "the rejection for `{field}` should name the field; got: {message}"
         ),
@@ -5722,7 +5700,7 @@ mod tests {
            "target_modules": ["q_proj"], "init_lora_weights": "{mode}" }}"#
       );
       match LoraConfig::from_json(&json) {
-        Err(Error::Backend { message }) => assert!(
+        Err(Error::Backend(message)) => assert!(
           message.contains(mode),
           "the rejection should name the mode `{mode}`; got: {message}"
         ),
@@ -5772,7 +5750,7 @@ mod tests {
     for (field, json) in cases {
       match LoraConfig::from_json(json) {
         Ok(_) => panic!("`{field}` set must be rejected by the structural backstop"),
-        Err(Error::Backend { message }) => assert!(
+        Err(Error::Backend(message)) => assert!(
           message.contains(field),
           "the rejection should name `{field}`; got: {message}"
         ),
@@ -5882,7 +5860,7 @@ mod tests {
       arrays.insert(key.clone(), Array::zeros::<f32>(&(2, 3)).unwrap());
       match translate_peft_keys(arrays) {
         Ok(_) => panic!("embedding-LoRA key {key:?} must be rejected, not accepted"),
-        Err(Error::Backend { message }) => {
+        Err(Error::Backend(message)) => {
           assert!(
             message.to_lowercase().contains("embedding"),
             "the rejection must mention embedding; got: {message}"
@@ -6644,7 +6622,7 @@ mod tests {
       true, // fan_in_fan_out
     )
     .unwrap_err();
-    assert!(matches!(err, Error::Backend { .. }));
+    assert!(matches!(err, Error::Backend(_)));
   }
 
   // ───────────── safetensors filename + neither-shape ─────────────
@@ -6926,7 +6904,7 @@ mod tests {
       magnitude: None,
     };
     let err = DoRAEmbedding::new(base, params, 1.0).unwrap_err();
-    assert!(matches!(err, Error::Backend { .. }));
+    assert!(matches!(err, Error::Backend(_)));
   }
 
   /// DoRAEmbedding rejects a `lora_a` whose leading axis is not
@@ -6948,7 +6926,7 @@ mod tests {
       magnitude: Some(m),
     };
     let err = DoRAEmbedding::new(base, params, 1.0).unwrap_err();
-    assert!(matches!(err, Error::ShapeMismatch { .. }));
+    assert!(matches!(err, Error::ShapeMismatch(_)));
   }
 
   /// `qdora_linear_forward_matches_python_reference` — assert the QDoRA

@@ -1189,8 +1189,10 @@ fn concat_text(a: &str, b: &str) -> String {
 fn clone_partial_decode_payload(features: Option<&Array>) -> Result<Option<Array>> {
   match features {
     None => Ok(None),
-    Some(a) => a.try_clone().map(Some).map_err(|e| crate::Error::Backend {
-      message: format!("StopPartialDecode: failed to clone audio_features for retry: {e}"),
+    Some(a) => a.try_clone().map(Some).map_err(|e| {
+      crate::Error::Backend(format!(
+        "StopPartialDecode: failed to clone audio_features for retry: {e}"
+      ))
     }),
   }
 }
@@ -1262,9 +1264,9 @@ mod tests {
         script.remove(0)
       };
       if should_err {
-        return Err(crate::error::Error::Backend {
-          message: "scripted encode_window failure".into(),
-        });
+        return Err(crate::error::Error::Backend(
+          "scripted encode_window failure".into(),
+        ));
       }
       let rows = mel_window.shape().first().copied().unwrap_or(0);
       let buf = vec![0.0_f32; rows * 2];
@@ -1502,9 +1504,7 @@ mod tests {
     let encoder = ScriptedEncoder::new(8, vec![]);
     let decoder = ScriptedDecoder::with_results(vec![
       Ok(vec![1]),
-      Err(Error::Backend {
-        message: "scripted finalize failure".into(),
-      }),
+      Err(Error::Backend("scripted finalize failure".into())),
       Ok(vec![42]),
     ]);
     let mut session = finalize_session(encoder, decoder);
@@ -1536,9 +1536,7 @@ mod tests {
     let encoder = ScriptedEncoder::new(8, vec![]);
     let decoder = ScriptedDecoder::with_results(vec![
       Ok(vec![1]),
-      Err(Error::Backend {
-        message: "scripted finalize failure".into(),
-      }),
+      Err(Error::Backend("scripted finalize failure".into())),
     ]);
     let mut session = finalize_session(encoder, decoder);
     let (partial_events, boundary_events) = drive_two_phase(&mut session);
@@ -1561,12 +1559,8 @@ mod tests {
     let encoder = ScriptedEncoder::new(8, vec![]);
     let decoder = ScriptedDecoder::with_results(vec![
       Ok(vec![1]),
-      Err(Error::Backend {
-        message: "scripted boundary finalize Err".into(),
-      }),
-      Err(Error::Backend {
-        message: "scripted stop-retry finalize Err".into(),
-      }),
+      Err(Error::Backend("scripted boundary finalize Err".into())),
+      Err(Error::Backend("scripted stop-retry finalize Err".into())),
       Ok(vec![42]),
     ]);
     let mut session = finalize_session(encoder, decoder);
@@ -1598,9 +1592,7 @@ mod tests {
     let encoder = ScriptedEncoder::new(8, vec![]);
     let decoder = ScriptedDecoder::with_results(vec![
       Ok(vec![1]),
-      Err(Error::Backend {
-        message: "scripted boundary finalize Err".into(),
-      }),
+      Err(Error::Backend("scripted boundary finalize Err".into())),
       Ok(vec![77]),
     ]);
     let mut session = finalize_session(encoder, decoder);
@@ -1627,9 +1619,7 @@ mod tests {
     let encoder = ScriptedEncoder::new(8, vec![]);
     let decoder = ScriptedDecoder::with_results(vec![
       Ok(vec![123]),
-      Err(Error::Backend {
-        message: "scripted boundary finalize Err".into(),
-      }),
+      Err(Error::Backend("scripted boundary finalize Err".into())),
       Ok(vec![]),
     ]);
     let mut session = finalize_session(encoder, decoder);
@@ -2243,9 +2233,9 @@ mod tests {
     // is left armed; third call (retry stop()'s fast path) succeeds.
     let decoder = ScriptedDecoder::with_results(vec![
       Ok(vec![1]),
-      Err(crate::error::Error::Backend {
-        message: "scripted stop-partial-decode Err".into(),
-      }),
+      Err(crate::error::Error::Backend(
+        "scripted stop-partial-decode Err".into(),
+      )),
       Ok(vec![1, 2]),
     ]);
     let mut session = nonfinalize_session(encoder, decoder);
@@ -2298,9 +2288,9 @@ mod tests {
     // so the arm is the LAST mutation before the Err.
     let decoder = ScriptedDecoder::with_results(vec![
       Ok(vec![1]),
-      Err(crate::error::Error::Backend {
-        message: "scripted stop-partial-decode Err".into(),
-      }),
+      Err(crate::error::Error::Backend(
+        "scripted stop-partial-decode Err".into(),
+      )),
     ]);
     let mut session = nonfinalize_session(encoder, decoder);
     let samples: Vec<f32> = (0..1200).map(|i| (i as f32 * 0.001).sin()).collect();

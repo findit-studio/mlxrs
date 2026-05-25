@@ -35,7 +35,7 @@
 
 use crate::{
   array::Array,
-  error::{Result, check},
+  error::{RankMismatchPayload, Result, check},
   ops,
   stream::default_stream,
 };
@@ -333,21 +333,19 @@ pub struct GroupNorm {
 /// re-running it (when `new` delegates to `with_affine`) is harmless.
 fn validate_group_params(num_groups: i32, dims: i32) -> Result<()> {
   if num_groups <= 0 {
-    return Err(crate::error::Error::ShapeMismatch {
-      message: format!("GroupNorm: num_groups ({num_groups}) must be positive"),
-    });
+    return Err(crate::error::Error::ShapeMismatch(format!(
+      "GroupNorm: num_groups ({num_groups}) must be positive"
+    )));
   }
   if dims <= 0 {
-    return Err(crate::error::Error::ShapeMismatch {
-      message: format!("GroupNorm: dims ({dims}) must be positive"),
-    });
+    return Err(crate::error::Error::ShapeMismatch(format!(
+      "GroupNorm: dims ({dims}) must be positive"
+    )));
   }
   if dims % num_groups != 0 {
-    return Err(crate::error::Error::ShapeMismatch {
-      message: format!(
-        "GroupNorm: dims ({dims}) must be evenly divisible by num_groups ({num_groups})"
-      ),
-    });
+    return Err(crate::error::Error::ShapeMismatch(format!(
+      "GroupNorm: dims ({dims}) must be evenly divisible by num_groups ({num_groups})"
+    )));
   }
   Ok(())
 }
@@ -447,19 +445,15 @@ impl GroupNorm {
       let want = vec![dims as usize];
       let w_shape = weight.shape();
       if w_shape != want {
-        return Err(crate::error::Error::ShapeMismatch {
-          message: format!(
-            "GroupNorm: affine weight must be shape {want:?} (rank-1, length dims={dims}), got {w_shape:?}"
-          ),
-        });
+        return Err(crate::error::Error::ShapeMismatch(format!(
+          "GroupNorm: affine weight must be shape {want:?} (rank-1, length dims={dims}), got {w_shape:?}"
+        )));
       }
       let b_shape = bias.shape();
       if b_shape != want {
-        return Err(crate::error::Error::ShapeMismatch {
-          message: format!(
-            "GroupNorm: affine bias must be shape {want:?} (rank-1, length dims={dims}), got {b_shape:?}"
-          ),
-        });
+        return Err(crate::error::Error::ShapeMismatch(format!(
+          "GroupNorm: affine bias must be shape {want:?} (rank-1, length dims={dims}), got {b_shape:?}"
+        )));
       }
     }
     Ok(Self {
@@ -557,38 +551,33 @@ impl GroupNorm {
   /// channel count) — surface the misuse as `Err(ShapeMismatch)` instead.
   fn validate_input_shape(&self, orig_shape: &[usize]) -> Result<i32> {
     if orig_shape.len() < 2 {
-      return Err(crate::error::Error::ShapeMismatch {
-        message: format!(
-          "GroupNorm input must have rank >= 2 (at least [batch, dims]), got rank {} shape {orig_shape:?}",
-          orig_shape.len()
-        ),
-      });
+      return Err(crate::error::Error::RankMismatch(RankMismatchPayload::new(
+        "GroupNorm input must have rank >= 2 (at least [batch, dims])",
+        orig_shape.len() as u32,
+        orig_shape.to_vec(),
+      )));
     }
     let dims = *orig_shape
       .last()
       .expect("rank-≥-2 guarded above ⇒ last() is Some");
-    let dims_i32 = i32::try_from(dims).map_err(|_| crate::error::Error::ShapeMismatch {
-      message: format!("GroupNorm: feature dim {dims} exceeds i32::MAX"),
+    let dims_i32 = i32::try_from(dims).map_err(|_| {
+      crate::error::Error::ShapeMismatch(format!("GroupNorm: feature dim {dims} exceeds i32::MAX"))
     })?;
     if dims_i32 != self.dims {
-      return Err(crate::error::Error::ShapeMismatch {
-        message: format!(
-          "GroupNorm: input last-axis ({dims_i32}) must match configured dims ({})",
-          self.dims
-        ),
-      });
+      return Err(crate::error::Error::ShapeMismatch(format!(
+        "GroupNorm: input last-axis ({dims_i32}) must match configured dims ({})",
+        self.dims
+      )));
     }
     // Constructor already enforces `dims % num_groups == 0`, so once
     // `dims_i32 == self.dims` this is unreachable. Kept as
     // belt-and-suspenders against a future refactor that reorders the
     // invariant checks.
     if dims_i32 % self.num_groups != 0 {
-      return Err(crate::error::Error::ShapeMismatch {
-        message: format!(
-          "GroupNorm: feature dim ({dims_i32}) must be evenly divisible by num_groups ({})",
-          self.num_groups
-        ),
-      });
+      return Err(crate::error::Error::ShapeMismatch(format!(
+        "GroupNorm: feature dim ({dims_i32}) must be evenly divisible by num_groups ({})",
+        self.num_groups
+      )));
     }
     Ok(dims_i32)
   }
@@ -667,12 +656,9 @@ impl GroupNorm {
     // of the reference's `reshape(batch, num_groups, -1)`. The product
     // is exact (it is the same `total / (B * num_groups)` the reference
     // factors per group across the spatial + per-group features).
-    let collapsed =
-      mid
-        .checked_mul(group_size)
-        .ok_or_else(|| crate::error::Error::ShapeMismatch {
-          message: "GroupNorm: mid * group_size overflowed i32".into(),
-        })?;
+    let collapsed = mid.checked_mul(group_size).ok_or_else(|| {
+      crate::error::Error::ShapeMismatch("GroupNorm: mid * group_size overflowed i32".into())
+    })?;
     let three_d: &[i32] = &[batch, self.num_groups, collapsed];
     let x = ops::shape::reshape(&x, &three_d)?;
 
@@ -702,9 +688,8 @@ fn shape_to_i32(shape: &[usize]) -> Result<Vec<i32>> {
   shape
     .iter()
     .map(|&d| {
-      i32::try_from(d).map_err(|_| crate::error::Error::ShapeMismatch {
-        message: format!("dim {d} exceeds i32::MAX"),
-      })
+      i32::try_from(d)
+        .map_err(|_| crate::error::Error::ShapeMismatch(format!("dim {d} exceeds i32::MAX")))
     })
     .collect()
 }
@@ -712,13 +697,13 @@ fn shape_to_i32(shape: &[usize]) -> Result<Vec<i32>> {
 /// Pull the leading batch dim as `i32`, erroring on rank 0 or on a dim
 /// past `i32::MAX`.
 fn batch_dim(shape: &[usize]) -> Result<i32> {
-  let b = *shape
-    .first()
-    .ok_or_else(|| crate::error::Error::ShapeMismatch {
-      message: "GroupNorm input must have at least one dim (the batch axis)".into(),
-    })?;
-  i32::try_from(b).map_err(|_| crate::error::Error::ShapeMismatch {
-    message: format!("GroupNorm: batch dim {b} exceeds i32::MAX"),
+  let b = *shape.first().ok_or_else(|| {
+    crate::error::Error::ShapeMismatch(
+      "GroupNorm input must have at least one dim (the batch axis)".into(),
+    )
+  })?;
+  i32::try_from(b).map_err(|_| {
+    crate::error::Error::ShapeMismatch(format!("GroupNorm: batch dim {b} exceeds i32::MAX"))
   })
 }
 
@@ -736,32 +721,32 @@ fn inferred_dim(shape: &[usize], known_dims: &[i32]) -> Result<i32> {
   let total: usize = shape
     .iter()
     .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-    .ok_or_else(|| crate::error::Error::ShapeMismatch {
-      message: format!("GroupNorm: shape product overflows usize for shape {shape:?}"),
+    .ok_or_else(|| {
+      crate::error::Error::ShapeMismatch(format!(
+        "GroupNorm: shape product overflows usize for shape {shape:?}"
+      ))
     })?;
   let mut divisor: usize = 1;
   for &d in known_dims {
-    let du = usize::try_from(d).map_err(|_| crate::error::Error::ShapeMismatch {
-      message: format!("GroupNorm: known reshape dim {d} must be non-negative"),
+    let du = usize::try_from(d).map_err(|_| {
+      crate::error::Error::ShapeMismatch(format!(
+        "GroupNorm: known reshape dim {d} must be non-negative"
+      ))
     })?;
-    divisor = divisor
-      .checked_mul(du)
-      .ok_or_else(|| crate::error::Error::ShapeMismatch {
-        message: "GroupNorm: reshape divisor overflowed usize".into(),
-      })?;
+    divisor = divisor.checked_mul(du).ok_or_else(|| {
+      crate::error::Error::ShapeMismatch("GroupNorm: reshape divisor overflowed usize".into())
+    })?;
   }
   if divisor == 0 || !total.is_multiple_of(divisor) {
-    return Err(crate::error::Error::ShapeMismatch {
-      message: format!(
-        "GroupNorm: cannot reshape {total} elements into a layout requiring {divisor} per inferred slot"
-      ),
-    });
+    return Err(crate::error::Error::ShapeMismatch(format!(
+      "GroupNorm: cannot reshape {total} elements into a layout requiring {divisor} per inferred slot"
+    )));
   }
-  i32::try_from(total / divisor).map_err(|_| crate::error::Error::ShapeMismatch {
-    message: format!(
+  i32::try_from(total / divisor).map_err(|_| {
+    crate::error::Error::ShapeMismatch(format!(
       "GroupNorm: inferred dim {} exceeds i32::MAX",
       total / divisor
-    ),
+    ))
   })
 }
 
@@ -1158,7 +1143,7 @@ mod tests {
     let err = GroupNorm::with_affine(2, 4, 1e-5, Some((long_w, bias.try_clone().unwrap())), false)
       .unwrap_err();
     match err {
-      crate::error::Error::ShapeMismatch { message } => {
+      crate::error::Error::ShapeMismatch(message) => {
         assert!(
           message.contains("weight") && message.contains("[5]"),
           "unexpected message: {message}"
@@ -1170,7 +1155,7 @@ mod tests {
     let rank2_w = Array::ones::<f32>(&(1, 4)).unwrap();
     let err = GroupNorm::with_affine(2, 4, 1e-5, Some((rank2_w, bias)), false).unwrap_err();
     match err {
-      crate::error::Error::ShapeMismatch { message } => {
+      crate::error::Error::ShapeMismatch(message) => {
         assert!(
           message.contains("weight") && message.contains("[1, 4]"),
           "unexpected message: {message}"
@@ -1196,7 +1181,7 @@ mod tests {
     )
     .unwrap_err();
     match err {
-      crate::error::Error::ShapeMismatch { message } => {
+      crate::error::Error::ShapeMismatch(message) => {
         assert!(
           message.contains("bias") && message.contains("[5]"),
           "unexpected message: {message}"
@@ -1208,7 +1193,7 @@ mod tests {
     let rank2_b = Array::zeros::<f32>(&(1, 4)).unwrap();
     let err = GroupNorm::with_affine(2, 4, 1e-5, Some((weight, rank2_b)), false).unwrap_err();
     match err {
-      crate::error::Error::ShapeMismatch { message } => {
+      crate::error::Error::ShapeMismatch(message) => {
         assert!(
           message.contains("bias") && message.contains("[1, 4]"),
           "unexpected message: {message}"
@@ -1245,7 +1230,7 @@ mod tests {
     let gn = GroupNorm::new(1, 4, 1e-5, false, false).unwrap();
     let err = gn.forward(&x).unwrap_err();
     match err {
-      crate::error::Error::ShapeMismatch { message } => {
+      crate::error::Error::ShapeMismatch(message) => {
         assert!(message.contains("rank"), "unexpected message: {message}");
       }
       other => panic!("expected ShapeMismatch, got {other:?}"),
@@ -1264,7 +1249,7 @@ mod tests {
     let gn = GroupNorm::new(2, 4, 1e-5, false, false).unwrap();
     let err = gn.forward(&x).unwrap_err();
     match err {
-      crate::error::Error::ShapeMismatch { message } => {
+      crate::error::Error::ShapeMismatch(message) => {
         assert!(
           message.contains("last-axis") && message.contains("4") && message.contains("3"),
           "unexpected message: {message}"
@@ -1282,7 +1267,7 @@ mod tests {
     let gn = GroupNorm::new(1, 4, 1e-5, false, true).unwrap();
     let err = gn.forward(&x).unwrap_err();
     match err {
-      crate::error::Error::ShapeMismatch { message } => {
+      crate::error::Error::ShapeMismatch(message) => {
         assert!(message.contains("rank"), "unexpected message: {message}");
       }
       other => panic!("expected ShapeMismatch, got {other:?}"),
@@ -1298,7 +1283,7 @@ mod tests {
     let gn = GroupNorm::new(2, 4, 1e-5, false, true).unwrap();
     let err = gn.forward(&x).unwrap_err();
     match err {
-      crate::error::Error::ShapeMismatch { message } => {
+      crate::error::Error::ShapeMismatch(message) => {
         assert!(
           message.contains("last-axis") && message.contains("4") && message.contains("3"),
           "unexpected message: {message}"
@@ -1331,7 +1316,7 @@ mod tests {
   fn group_norm_constructor_rejects_negative_dims() {
     let err = GroupNorm::new(2, -1, 1e-5, false, false).unwrap_err();
     match err {
-      crate::error::Error::ShapeMismatch { message } => {
+      crate::error::Error::ShapeMismatch(message) => {
         assert!(
           message.contains("dims") && message.contains("positive"),
           "unexpected message: {message}"
@@ -1351,7 +1336,7 @@ mod tests {
   fn group_norm_constructor_rejects_non_divisible_dims() {
     let err = GroupNorm::new(2, 3, 1e-5, false, false).unwrap_err();
     match err {
-      crate::error::Error::ShapeMismatch { message } => {
+      crate::error::Error::ShapeMismatch(message) => {
         assert!(
           message.contains("divisible"),
           "unexpected message: {message}"
@@ -1368,7 +1353,7 @@ mod tests {
   fn group_norm_constructor_rejects_zero_dims() {
     let err = GroupNorm::new(2, 0, 1e-5, false, false).unwrap_err();
     match err {
-      crate::error::Error::ShapeMismatch { message } => {
+      crate::error::Error::ShapeMismatch(message) => {
         assert!(
           message.contains("dims") && message.contains("positive"),
           "unexpected message: {message}"
@@ -1402,7 +1387,7 @@ mod tests {
     let gn = GroupNorm::new(2, 4, 1e-5, false, false).unwrap();
     let err = gn.forward(&x).unwrap_err();
     match err {
-      crate::error::Error::ShapeMismatch { message } => {
+      crate::error::Error::ShapeMismatch(message) => {
         assert!(
           message.contains("last-axis")
             && message.contains("dims")
@@ -1432,13 +1417,13 @@ mod tests {
     // `num_groups = 0` (non-positive) with `affine = true`.
     let err = GroupNorm::new(0, 4, 1e-5, true, false).unwrap_err();
     assert!(
-      matches!(err, crate::error::Error::ShapeMismatch { .. }),
+      matches!(err, crate::error::Error::ShapeMismatch(_)),
       "expected ShapeMismatch for num_groups=0, got {err:?}"
     );
     // `dims = 8` not divisible by `num_groups = 3`, with `affine = true`.
     let err = GroupNorm::new(3, 8, 1e-5, true, false).unwrap_err();
     assert!(
-      matches!(err, crate::error::Error::ShapeMismatch { .. }),
+      matches!(err, crate::error::Error::ShapeMismatch(_)),
       "expected ShapeMismatch for non-divisible dims, got {err:?}"
     );
   }
@@ -1479,7 +1464,7 @@ mod tests {
     let shape: [usize; 2] = [usize::MAX, 2];
     let err = inferred_dim(&shape, &[1, 1]).unwrap_err();
     match err {
-      crate::error::Error::ShapeMismatch { message } => {
+      crate::error::Error::ShapeMismatch(message) => {
         assert!(
           message.contains("overflow"),
           "unexpected message: {message}"

@@ -66,9 +66,9 @@ impl DeviceKind {
     match raw {
       mlxrs_sys::mlx_device_type__MLX_CPU => Ok(DeviceKind::Cpu),
       mlxrs_sys::mlx_device_type__MLX_GPU => Ok(DeviceKind::Gpu),
-      other => Err(crate::Error::Backend {
-        message: format!("unknown mlx_device_type: {other}"),
-      }),
+      other => Err(crate::Error::Backend(format!(
+        "unknown mlx_device_type: {other}"
+      ))),
     }
   }
 
@@ -142,9 +142,9 @@ impl Device {
     // case is checked by the caller before the handle is used.
     let raw = unsafe { mlxrs_sys::mlx_device_new_type(kind.to_raw(), index) };
     if raw.ctx.is_null() {
-      return Err(crate::Error::Backend {
-        message: format!("mlx_device_new_type returned NULL ctx for kind={kind:?} index={index}",),
-      });
+      return Err(crate::Error::Backend(format!(
+        "mlx_device_new_type returned NULL ctx for kind={kind:?} index={index}",
+      )));
     }
     Ok(Self(raw))
   }

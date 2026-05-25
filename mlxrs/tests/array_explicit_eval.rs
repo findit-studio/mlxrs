@@ -82,7 +82,7 @@ fn try_item_dtype_mismatch_errors_before_ffi() {
   a.eval().unwrap();
   let err = a.try_item::<i32>().unwrap_err();
   assert!(
-    matches!(err, mlxrs::Error::DtypeMismatch { .. }),
+    matches!(err, mlxrs::Error::DtypeMismatch(_)),
     "expected DtypeMismatch, got {err:?}"
   );
 }

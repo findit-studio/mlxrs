@@ -39,9 +39,9 @@ use crate::{
 /// Validate `clip_threshold` is finite and `> 0.0` (used as a divisor).
 fn validate_clip_threshold(clip_threshold: f32) -> Result<()> {
   if !clip_threshold.is_finite() || clip_threshold <= 0.0 {
-    return Err(Error::Backend {
-      message: format!("Adafactor: clip_threshold must be finite and > 0.0, got {clip_threshold}"),
-    });
+    return Err(Error::Backend(format!(
+      "Adafactor: clip_threshold must be finite and > 0.0, got {clip_threshold}"
+    )));
   }
   Ok(())
 }
@@ -55,12 +55,10 @@ fn validate_clip_threshold(clip_threshold: f32) -> Result<()> {
 /// approaching 1 from below.
 fn validate_decay_rate(decay_rate: f32) -> Result<()> {
   if !decay_rate.is_finite() || decay_rate > 0.0 {
-    return Err(Error::Backend {
-      message: format!(
-        "Adafactor: decay_rate must be finite and <= 0.0 (so that 1 - step^decay_rate \
+    return Err(Error::Backend(format!(
+      "Adafactor: decay_rate must be finite and <= 0.0 (so that 1 - step^decay_rate \
          stays in [0, 1)), got {decay_rate}"
-      ),
-    });
+    )));
   }
   Ok(())
 }
@@ -69,9 +67,9 @@ fn validate_decay_rate(decay_rate: f32) -> Result<()> {
 fn validate_eps(eps: (f32, f32)) -> Result<()> {
   let (e1, e2) = eps;
   if !e1.is_finite() || e1 < 0.0 || !e2.is_finite() || e2 < 0.0 {
-    return Err(Error::Backend {
-      message: format!("Adafactor: eps must be (finite >= 0, finite >= 0), got ({e1}, {e2})"),
-    });
+    return Err(Error::Backend(format!(
+      "Adafactor: eps must be (finite >= 0, finite >= 0), got ({e1}, {e2})"
+    )));
   }
   Ok(())
 }
@@ -81,9 +79,9 @@ fn validate_beta_1(beta_1: Option<f32>) -> Result<()> {
   if let Some(b) = beta_1
     && (!b.is_finite() || !(0.0..1.0).contains(&b))
   {
-    return Err(Error::Backend {
-      message: format!("Adafactor: beta_1 must be None or finite in [0.0, 1.0), got Some({b})"),
-    });
+    return Err(Error::Backend(format!(
+      "Adafactor: beta_1 must be None or finite in [0.0, 1.0), got Some({b})"
+    )));
   }
   Ok(())
 }
@@ -91,9 +89,9 @@ fn validate_beta_1(beta_1: Option<f32>) -> Result<()> {
 /// Validate `weight_decay` is finite and `>= 0.0`.
 fn validate_weight_decay(weight_decay: f32) -> Result<()> {
   if !weight_decay.is_finite() || weight_decay < 0.0 {
-    return Err(Error::Backend {
-      message: format!("Adafactor: weight_decay must be finite and >= 0.0, got {weight_decay}"),
-    });
+    return Err(Error::Backend(format!(
+      "Adafactor: weight_decay must be finite and >= 0.0, got {weight_decay}"
+    )));
   }
   Ok(())
 }
@@ -330,13 +328,12 @@ impl Adafactor {
   /// state.
   pub fn with_beta_1(mut self, beta_1: Option<f32>) -> Result<Self> {
     if !self.state.is_empty() {
-      return Err(Error::Backend {
-        message:
-          "Adafactor::with_beta_1: cannot toggle beta_1 after parameter state is initialized \
+      return Err(Error::Backend(
+        "Adafactor::with_beta_1: cannot toggle beta_1 after parameter state is initialized \
              (would desynchronize existing vs new parameters' exp_avg shape); construct a \
              fresh Adafactor or use try_set_beta_1 (which preserves state on error)"
-            .into(),
-      });
+          .into(),
+      ));
     }
     validate_beta_1(beta_1)?;
     self.beta_1 = beta_1;
@@ -349,13 +346,12 @@ impl Adafactor {
   /// `state` is non-empty, leaving `self` unchanged on either branch.
   pub fn try_set_beta_1(&mut self, beta_1: Option<f32>) -> Result<()> {
     if !self.state.is_empty() {
-      return Err(Error::Backend {
-        message:
-          "Adafactor::try_set_beta_1: cannot toggle beta_1 after parameter state is initialized \
+      return Err(Error::Backend(
+        "Adafactor::try_set_beta_1: cannot toggle beta_1 after parameter state is initialized \
              (would desynchronize existing vs new parameters' exp_avg shape); construct a \
              fresh Adafactor instead"
-            .into(),
-      });
+          .into(),
+      ));
     }
     validate_beta_1(beta_1)?;
     self.beta_1 = beta_1;

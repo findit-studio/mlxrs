@@ -125,9 +125,9 @@ mod tests {
 
   impl LmModel for FakeStt {
     fn forward(&self, _tokens: &Array, _cache: &mut [Box<dyn KvCache>]) -> Result<Array> {
-      Err(Error::Backend {
-        message: "FakeStt::forward (test stub) — unreachable in this test".into(),
-      })
+      Err(Error::Backend(
+        "FakeStt::forward (test stub) — unreachable in this test".into(),
+      ))
     }
   }
 

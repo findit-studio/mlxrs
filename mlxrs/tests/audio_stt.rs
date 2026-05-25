@@ -100,9 +100,9 @@ impl LmModel for MockSttModel {
     // The LM forward path is never reached by `stt_generate` — the STT
     // loop drives `decode_step` instead. Return an error so a defect that
     // accidentally routed through the LM forward surfaces loud.
-    Err(mlxrs::Error::Backend {
-      message: "MockSttModel::forward should not be called from stt_generate".into(),
-    })
+    Err(mlxrs::Error::Backend(
+      "MockSttModel::forward should not be called from stt_generate".into(),
+    ))
   }
 }
 
@@ -152,9 +152,7 @@ impl SttModel for MockSttModel {
 struct BadShapeModel;
 impl LmModel for BadShapeModel {
   fn forward(&self, _tokens: &Array, _cache: &mut [Box<dyn KvCache>]) -> mlxrs::Result<Array> {
-    Err(mlxrs::Error::Backend {
-      message: "unused".into(),
-    })
+    Err(mlxrs::Error::Backend("unused".into()))
   }
 }
 impl SttModel for BadShapeModel {
@@ -178,9 +176,7 @@ impl SttModel for BadShapeModel {
 struct FailDecodeModel;
 impl LmModel for FailDecodeModel {
   fn forward(&self, _tokens: &Array, _cache: &mut [Box<dyn KvCache>]) -> mlxrs::Result<Array> {
-    Err(mlxrs::Error::Backend {
-      message: "unused".into(),
-    })
+    Err(mlxrs::Error::Backend("unused".into()))
   }
 }
 impl SttModel for FailDecodeModel {
@@ -188,9 +184,7 @@ impl SttModel for FailDecodeModel {
     Array::from_slice::<f32>(&[0.0_f32], &[1, 1, 1])
   }
   fn decode_step(&self, _t: u32, _e: &Array, _c: &mut [Box<dyn KvCache>]) -> mlxrs::Result<Array> {
-    Err(mlxrs::Error::Backend {
-      message: "mock decode_step failure".into(),
-    })
+    Err(mlxrs::Error::Backend("mock decode_step failure".into()))
   }
   fn bos_token(&self) -> u32 {
     0
@@ -205,9 +199,7 @@ impl SttModel for FailDecodeModel {
 struct DefaultDecodeModel;
 impl LmModel for DefaultDecodeModel {
   fn forward(&self, _tokens: &Array, _cache: &mut [Box<dyn KvCache>]) -> mlxrs::Result<Array> {
-    Err(mlxrs::Error::Backend {
-      message: "unused".into(),
-    })
+    Err(mlxrs::Error::Backend("unused".into()))
   }
 }
 impl SttModel for DefaultDecodeModel {
@@ -326,7 +318,7 @@ fn stt_generate_rejects_sr_mismatch_when_resample_off() {
     .err()
     .expect("auto_resample=false rejects mismatched sample rate");
   match err {
-    mlxrs::Error::Backend { message } => {
+    mlxrs::Error::Backend(message) => {
       assert!(
         message.contains("auto_resample"),
         "error mentions auto_resample, got {message}"
@@ -358,7 +350,7 @@ fn stt_generate_rejects_audio_longer_than_max() {
     .err()
     .expect("over-cap audio rejected");
   match err {
-    mlxrs::Error::Backend { message } => {
+    mlxrs::Error::Backend(message) => {
       // Post P7 #137 layered cap: load-stage rejection fires for WAVs
       // (the header is sample-exact); the STT-stage check remains the
       // fallback for lossy formats. Accept EITHER message — both
@@ -405,7 +397,7 @@ fn stt_generate_rejects_over_cap_before_resample() {
     .err()
     .expect("over-cap source rejected pre-resample");
   match err {
-    mlxrs::Error::Backend { message } => {
+    mlxrs::Error::Backend(message) => {
       // Post P7 #137 layered cap: either path proves the resample was
       // skipped. Load-stage: container declares more samples than the
       // load cap. STT-stage: source-duration check fires after load.
@@ -449,7 +441,7 @@ fn stt_generate_layered_cap_rejects_at_load_stage_for_wav() {
     .err()
     .expect("layered cap must reject at load stage");
   match err {
-    mlxrs::Error::Backend { message } => {
+    mlxrs::Error::Backend(message) => {
       // Load-stage origin: `load_audio: container declares N samples
       // (>M cap, ...)` — proves the rejection fired BEFORE any
       // sample-buffer allocation.
@@ -481,7 +473,7 @@ fn stt_generate_rejects_empty_audio() {
     .err()
     .expect("empty audio rejected");
   match err {
-    mlxrs::Error::Backend { message } => {
+    mlxrs::Error::Backend(message) => {
       assert!(
         message.contains("empty"),
         "error mentions empty, got {message}"
@@ -604,7 +596,7 @@ fn decode_step_default_errors_with_clear_message() {
     SttGenConfig::default().with_lm(mlxrs::lm::generate::GenConfig::default().with_max_tokens(5));
   let mut it = stt_generate(&model, &path, cache(1), cfg).unwrap();
   match it.next().expect("an item") {
-    Err(mlxrs::Error::Backend { message }) => {
+    Err(mlxrs::Error::Backend(message)) => {
       assert!(
         message.contains("decode_step"),
         "error mentions decode_step, got {message}"
@@ -627,7 +619,7 @@ fn stt_generate_rejects_bad_decode_step_shape() {
   let cfg = SttGenConfig::default();
   let mut it = stt_generate(&model, &path, cache(1), cfg).unwrap();
   match it.next().expect("an item") {
-    Err(mlxrs::Error::ShapeMismatch { message }) => {
+    Err(mlxrs::Error::ShapeMismatch(message)) => {
       assert!(
         message.contains("[1, V]"),
         "error mentions [1, V], got {message}"

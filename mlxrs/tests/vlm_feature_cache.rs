@@ -605,7 +605,7 @@ fn default_max_size_is_20() {
 fn zero_max_size_is_rejected() {
   let err = VisionFeatureCache::with_max_size(0).unwrap_err();
   assert!(
-    matches!(err, Error::ShapeMismatch { .. }),
+    matches!(err, Error::ShapeMismatch(_)),
     "zero capacity must be a ShapeMismatch error, got {err:?}"
   );
 }

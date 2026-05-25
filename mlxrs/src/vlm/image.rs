@@ -225,7 +225,7 @@
 use crate::{
   Dtype,
   array::Array,
-  error::{Error, Result},
+  error::{Error, RankMismatchPayload, Result},
   ops::{
     arithmetic::{divide, multiply, subtract},
     misc::astype,
@@ -655,12 +655,11 @@ pub fn load_image(path: &std::path::Path) -> Result<::image::DynamicImage> {
   // returned by `into_decoder`.
   use ::image::ImageDecoder as _;
 
-  let backend_err = |e: ::image::ImageError| Error::Backend {
-    message: format!("vlm::image::load_image({}): {e}", path.display()),
+  let backend_err = |e: ::image::ImageError| {
+    Error::Backend(format!("vlm::image::load_image({}): {e}", path.display()))
   };
-  let io_err = |e: std::io::Error| Error::Backend {
-    message: format!("vlm::image::load_image({}): {e}", path.display()),
-  };
+  let io_err =
+    |e: std::io::Error| Error::Backend(format!("vlm::image::load_image({}): {e}", path.display()));
   // ImageReader::open guesses the format from the path extension; we
   // then call `with_guessed_format` to fall back to content sniffing
   // for extension-less paths (mirroring python `Image.open` which
@@ -865,21 +864,19 @@ fn apply_rotate_fallible(
   let bytes = w
     .checked_mul(h)
     .and_then(|wh| wh.checked_mul(bytes_per_pixel))
-    .ok_or_else(|| Error::ShapeMismatch {
-      message: format!(
+    .ok_or_else(|| {
+      Error::ShapeMismatch(format!(
         "apply_rotate_fallible: w*h*bytes_per_pixel overflows u64 \
          for {w}x{h} bytes_per_pixel={bytes_per_pixel}"
-      ),
+      ))
     })?;
   if bytes > MAX_DECODED_IMAGE_BYTES {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "apply_rotate_fallible: rotated buffer would need {bytes} bytes, \
+    return Err(Error::ShapeMismatch(format!(
+      "apply_rotate_fallible: rotated buffer would need {bytes} bytes, \
          exceeds MAX_DECODED_IMAGE_BYTES={MAX_DECODED_IMAGE_BYTES} \
          (source was {w}x{h}, bytes_per_pixel={bytes_per_pixel}, \
          rotation={rotation:?})"
-      ),
-    });
+    )));
   }
   let src_w = img.width();
   let src_h = img.height();
@@ -977,15 +974,13 @@ fn apply_rotate_fallible(
     // Recoverable by definition (it's an `Err`, not a panic), and
     // upgrading to a proper rotate arm becomes a localized edit
     // here the day a new variant ships.
-    other => Err(Error::Backend {
-      message: format!(
-        "apply_rotate_fallible: unsupported DynamicImage variant {:?}; \
+    other => Err(Error::Backend(format!(
+      "apply_rotate_fallible: unsupported DynamicImage variant {:?}; \
          image-rs added a new pixel type that mlxrs has not yet wired \
          into the fallible rotate path — please file an issue and \
          extend the match arms above",
-        other.color()
-      ),
-    }),
+      other.color()
+    ))),
   }
 }
 
@@ -1066,8 +1061,10 @@ fn rotate_buf<T: Copy + Default>(
   let elements = w_usize
     .checked_mul(h_usize)
     .and_then(|wh| wh.checked_mul(channels))
-    .ok_or_else(|| Error::ShapeMismatch {
-      message: format!("rotate_buf: w*h*channels overflows usize for {src_w}x{src_h}x{channels}"),
+    .ok_or_else(|| {
+      Error::ShapeMismatch(format!(
+        "rotate_buf: w*h*channels overflows usize for {src_w}x{src_h}x{channels}"
+      ))
     })?;
   debug_assert_eq!(
     src.len(),
@@ -1139,10 +1136,10 @@ fn rotate_buf_u8_via_c5(
   let elements = w_usize
     .checked_mul(h_usize)
     .and_then(|wh| wh.checked_mul(channels))
-    .ok_or_else(|| Error::ShapeMismatch {
-      message: format!(
+    .ok_or_else(|| {
+      Error::ShapeMismatch(format!(
         "rotate_buf_u8_via_c5: w*h*channels overflows usize for {src_w}x{src_h}x{channels}"
-      ),
+      ))
     })?;
   debug_assert_eq!(
     src.len(),
@@ -1271,11 +1268,9 @@ pub fn resize(
   // destination alloc. Mirrors `pad_to_square`'s canvas gate so the
   // per-step caps stay consistent.
   if width == 0 || height == 0 {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "resize: target dimensions must be non-zero, got {height}x{width} (height x width)"
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "resize: target dimensions must be non-zero, got {height}x{width} (height x width)"
+    )));
   }
   // `height * width * 4` (RGBA8 destination bytes). u64 throughout so the
   // check is host-width-independent; `u32::MAX^2 * 4 ≈ 7.4e19` fits in
@@ -1284,16 +1279,16 @@ pub fn resize(
   let dst_bytes = u64::from(height)
     .checked_mul(u64::from(width))
     .and_then(|hw| hw.checked_mul(4))
-    .ok_or_else(|| Error::ShapeMismatch {
-      message: format!("resize: height*width*4 overflows u64 for {height}x{width}"),
+    .ok_or_else(|| {
+      Error::ShapeMismatch(format!(
+        "resize: height*width*4 overflows u64 for {height}x{width}"
+      ))
     })?;
   if dst_bytes > MAX_DECODED_IMAGE_BYTES {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "resize: {height}x{width} target would need {dst_bytes} bytes, \
+    return Err(Error::ShapeMismatch(format!(
+      "resize: {height}x{width} target would need {dst_bytes} bytes, \
          exceeds MAX_DECODED_IMAGE_BYTES={MAX_DECODED_IMAGE_BYTES}"
-      ),
-    });
+    )));
   }
   // SIMD-accelerated, fully-fallible resize via mlxrs's OWN kernel
   // (`vlm::resize`) — `fast_image_resize` is dropped. NEON on
@@ -1332,8 +1327,10 @@ pub fn resize(
   let src_bytes = (src_w as usize)
     .checked_mul(src_h as usize)
     .and_then(|wh| wh.checked_mul(4))
-    .ok_or_else(|| Error::ShapeMismatch {
-      message: format!("resize: source width*height*4 overflows usize for {src_h}x{src_w}"),
+    .ok_or_else(|| {
+      Error::ShapeMismatch(format!(
+        "resize: source width*height*4 overflows usize for {src_h}x{src_w}"
+      ))
     })?;
   // Source-staging cap (Codex review): `load_image`'s 512 MiB ceiling is
   // enforced on `decoder.total_bytes()` — the SOURCE pixel format. A
@@ -1346,12 +1343,10 @@ pub fn resize(
   // staging before its `try_reserve_exact`. `u64` so the comparison is
   // host-width-independent (matches the `dst_bytes` gate).
   if src_bytes as u64 > MAX_DECODED_IMAGE_BYTES {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "resize: {src_h}x{src_w} source needs {src_bytes} bytes as RGBA8 staging, \
+    return Err(Error::ShapeMismatch(format!(
+      "resize: {src_h}x{src_w} source needs {src_bytes} bytes as RGBA8 staging, \
          exceeds MAX_DECODED_IMAGE_BYTES={MAX_DECODED_IMAGE_BYTES}"
-      ),
-    });
+    )));
   }
   let mut src_buf = crate::error::try_with_capacity::<u8>(src_bytes)?;
   if let Some(rgba) = img.as_rgba8() {
@@ -1359,15 +1354,12 @@ pub fn resize(
     // `src_bytes` (slice to guard an over-long backing buffer, matching
     // `image_to_array`'s `.get(..total)` discipline so the fill cannot
     // grow `src_buf` past the `try_reserve_exact` reservation).
-    let raw = rgba
-      .as_raw()
-      .get(..src_bytes)
-      .ok_or_else(|| Error::ShapeMismatch {
-        message: format!(
-          "resize: rgba backing buffer too short: {} bytes < W*H*4={src_bytes} for {src_h}x{src_w}",
-          rgba.as_raw().len()
-        ),
-      })?;
+    let raw = rgba.as_raw().get(..src_bytes).ok_or_else(|| {
+      Error::ShapeMismatch(format!(
+        "resize: rgba backing buffer too short: {} bytes < W*H*4={src_bytes} for {src_h}x{src_w}",
+        rgba.as_raw().len()
+      ))
+    })?;
     src_buf.extend_from_slice(raw);
   } else {
     // Non-RGBA8 source (Luma8 / Rgb8 / Rgb16 / Rgb32F / …): per-pixel
@@ -1605,16 +1597,16 @@ pub fn pad_to_square(img: ::image::DynamicImage, fill: [u8; 3]) -> Result<::imag
   let bytes = size_u64
     .checked_mul(size_u64)
     .and_then(|sq| sq.checked_mul(3))
-    .ok_or_else(|| Error::ShapeMismatch {
-      message: format!("pad_to_square: size*size*3 overflows u64 for {size}x{size}"),
+    .ok_or_else(|| {
+      Error::ShapeMismatch(format!(
+        "pad_to_square: size*size*3 overflows u64 for {size}x{size}"
+      ))
     })?;
   if bytes > MAX_DECODED_IMAGE_BYTES {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "pad_to_square: {size}x{size} canvas would need {bytes} bytes, \
+    return Err(Error::ShapeMismatch(format!(
+      "pad_to_square: {size}x{size} canvas would need {bytes} bytes, \
          exceeds MAX_DECODED_IMAGE_BYTES={MAX_DECODED_IMAGE_BYTES} (source was {w}x{h})"
-      ),
-    });
+    )));
   }
   // `bytes <= MAX_DECODED_IMAGE_BYTES = 512 MiB`, well under `usize::MAX`
   // on every supported host (we ship aarch64-darwin and x86_64-linux —
@@ -1816,8 +1808,8 @@ pub fn image_to_array(img: &::image::DynamicImage, color_order: ColorOrder) -> R
   let total = h_usize
     .checked_mul(w_usize)
     .and_then(|hw| hw.checked_mul(3))
-    .ok_or_else(|| Error::ShapeMismatch {
-      message: format!("image_to_array: h*w*3 overflows usize for {h}x{w}"),
+    .ok_or_else(|| {
+      Error::ShapeMismatch(format!("image_to_array: h*w*3 overflows usize for {h}x{w}"))
     })?;
   // Recoverable OOM at the f32 widening boundary. `Vec::with_capacity`
   // would `abort()` on a hostile-but-non-overflowing image (the
@@ -1845,15 +1837,12 @@ pub fn image_to_array(img: &::image::DynamicImage, color_order: ColorOrder) -> R
   // reservation via infallible allocation, reintroducing the
   // abort-on-OOM hazard.
   if let Some(rgb) = img.as_rgb8() {
-    let raw = rgb
-      .as_raw()
-      .get(..total)
-      .ok_or_else(|| Error::ShapeMismatch {
-        message: format!(
-          "image_to_array: rgb backing buffer too short: {} bytes < H*W*3={total} for H={h} W={w}",
-          rgb.as_raw().len()
-        ),
-      })?;
+    let raw = rgb.as_raw().get(..total).ok_or_else(|| {
+      Error::ShapeMismatch(format!(
+        "image_to_array: rgb backing buffer too short: {} bytes < H*W*3={total} for H={h} W={w}",
+        rgb.as_raw().len()
+      ))
+    })?;
     match color_order {
       ColorOrder::Rgb => {
         // C3 SIMD dispatcher (`crate::simd::vlm::rgb_widen`). On
@@ -2092,18 +2081,18 @@ pub fn rescale(arr: &Array, scale: f32) -> Result<Array> {
 pub fn normalize(arr: &Array, mean: &[f32; 3], std: &[f32; 3]) -> Result<Array> {
   let ndim = arr.ndim();
   if ndim == 0 {
-    return Err(Error::ShapeMismatch {
-      message: "normalize: input must have at least 1 dimension".into(),
-    });
+    return Err(Error::ShapeMismatch(
+      "normalize: input must have at least 1 dimension".into(),
+    ));
   }
   // Validate trailing channel dim == 3 with a clear error before falling
   // through to mlx's less-friendly broadcast failure.
   let shape = arr.shape();
   let trailing = shape[ndim - 1];
   if trailing != 3 {
-    return Err(Error::ShapeMismatch {
-      message: format!("normalize: trailing dim must be 3 (RGB), got shape {shape:?}"),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "normalize: trailing dim must be 3 (RGB), got shape {shape:?}"
+    )));
   }
   let dtype = arr.dtype()?;
   require_float_dtype("normalize", dtype)?;
@@ -2134,12 +2123,10 @@ pub fn normalize_imagenet(arr: &Array, mean: &[f32; 3], std: &[f32; 3]) -> Resul
 fn require_float_dtype(op: &str, dtype: Dtype) -> Result<()> {
   match dtype {
     Dtype::F16 | Dtype::BF16 | Dtype::F32 | Dtype::F64 => Ok(()),
-    other => Err(Error::ShapeMismatch {
-      message: format!(
-        "{op}: input must be a floating-point dtype (F16/BF16/F32/F64), got {other:?}; \
+    other => Err(Error::ShapeMismatch(format!(
+      "{op}: input must be a floating-point dtype (F16/BF16/F32/F64), got {other:?}; \
          convert with `astype(arr, Dtype::F32)?` before calling"
-      ),
-    }),
+    ))),
   }
 }
 
@@ -2161,9 +2148,9 @@ fn make_channel_broadcast(vals: &[f32; 3], ndim: usize, dtype: Dtype) -> Result<
   // hands us > 16 dims, the explicit guard below converts cleanly.
   const MAX_NDIM: usize = 16;
   if ndim > MAX_NDIM {
-    return Err(Error::ShapeMismatch {
-      message: format!("normalize: input ndim {ndim} exceeds supported maximum {MAX_NDIM}"),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "normalize: input ndim {ndim} exceeds supported maximum {MAX_NDIM}"
+    )));
   }
   let mut buf = [1usize; MAX_NDIM];
   buf[ndim - 1] = 3;
@@ -2264,29 +2251,26 @@ fn dynamic_image_rgba_pixel(img: &::image::DynamicImage, x: u32, y: u32) -> [u8;
 /// Layout: input `[H, W, C]` → reshape `[H/p, p, W/p, p, C]` →
 /// transpose `[H/p, W/p, p, p, C]` → reshape `[H/p * W/p, p, p, C]`.
 pub fn patchify(arr: &Array, patch_size: usize) -> Result<Array> {
-  if arr.ndim() != 3 {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "patchify: input must be rank-3 [H, W, C], got ndim {}",
-        arr.ndim()
-      ),
-    });
+  let shape = arr.shape();
+  if shape.len() != 3 {
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "patchify: input must be rank-3 [H, W, C]",
+      shape.len() as u32,
+      shape,
+    )));
   }
   if patch_size == 0 {
-    return Err(Error::ShapeMismatch {
-      message: "patchify: patch_size must be > 0".into(),
-    });
+    return Err(Error::ShapeMismatch(
+      "patchify: patch_size must be > 0".into(),
+    ));
   }
-  let shape = arr.shape();
   let h = shape[0];
   let w = shape[1];
   let c = shape[2];
   if !h.is_multiple_of(patch_size) || !w.is_multiple_of(patch_size) {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "patchify: H={h} and W={w} must both be divisible by patch_size {patch_size}"
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "patchify: H={h} and W={w} must both be divisible by patch_size {patch_size}"
+    )));
   }
   let hp = h / patch_size;
   let wp = w / patch_size;
@@ -2297,11 +2281,11 @@ pub fn patchify(arr: &Array, patch_size: usize) -> Result<Array> {
   // `Error::ShapeMismatch` rather than silently wrapping to a
   // smaller-than-expected first axis (which would later cause
   // reshape/broadcast misalignment) — Copilot review #3272880077.
-  let n_patches = hp.checked_mul(wp).ok_or_else(|| Error::ShapeMismatch {
-    message: format!(
+  let n_patches = hp.checked_mul(wp).ok_or_else(|| {
+    Error::ShapeMismatch(format!(
       "patchify: hp ({hp}) * wp ({wp}) overflows usize \
        (H={h}, W={w}, patch_size={patch_size})"
-    ),
+    ))
   })?;
   // [H, W, C] → [hp, p, wp, p, C]   (stack `[usize; 5]` buffer; no Vec
   // alloc per `feedback_allocation_discipline`)
@@ -2430,13 +2414,11 @@ pub fn apply_layout(arr: Array, layout: Layout) -> Result<Array> {
   // surface (which would be less actionable).
   let shape = arr.shape();
   if shape.len() != 3 || shape[2] != 3 {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "apply_layout: expected rank-3 [H, W, 3] input, got shape {shape:?}; \
+    return Err(Error::ShapeMismatch(format!(
+      "apply_layout: expected rank-3 [H, W, 3] input, got shape {shape:?}; \
          per-model processors that produce non-rank-3 layouts should compose \
          transpose_axes / expand_dims_axes directly"
-      ),
-    });
+    )));
   }
   match layout {
     Layout::Hwc => {

@@ -107,7 +107,7 @@ use std::{
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, FileIoPayload, FileOp, Result};
 
 /// One word-level cue inside a Whisper-style [`Segment`] — mirrors the
 /// duck-typed `s["words"]` list entry in
@@ -691,15 +691,30 @@ pub fn save_as_txt(transcript: &Transcript, path: &Path) -> Result<()> {
     return save_as_txt_stdout(transcript, &mut w);
   }
   let final_path = with_extension(path, "txt");
-  let f = File::create(&final_path).map_err(|e| Error::Backend {
-    message: format!("save_as_txt: create {} failed: {e}", final_path.display()),
+  let f = File::create(&final_path).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save_as_txt",
+      FileOp::Create,
+      ::std::path::PathBuf::from(&final_path),
+      e,
+    ))
   })?;
   let mut w = BufWriter::new(f);
-  save_as_txt_to_writer(transcript, &mut w).map_err(|e| Error::Backend {
-    message: format!("save_as_txt: write {} failed: {e}", final_path.display()),
+  save_as_txt_to_writer(transcript, &mut w).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save_as_txt",
+      FileOp::Write,
+      ::std::path::PathBuf::from(&final_path),
+      e,
+    ))
   })?;
-  w.flush().map_err(|e| Error::Backend {
-    message: format!("save_as_txt: flush {} failed: {e}", final_path.display()),
+  w.flush().map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save_as_txt",
+      FileOp::Flush,
+      ::std::path::PathBuf::from(&final_path),
+      e,
+    ))
   })?;
   Ok(())
 }
@@ -727,12 +742,10 @@ fn save_as_txt_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::i
 /// `BufWriter::flush()` and surface failures as `Error::Backend`
 /// (broken-pipe, `ENOSPC` on the receiving end, ...).
 fn save_as_txt_stdout<W: Write>(transcript: &Transcript, w: &mut W) -> Result<()> {
-  save_as_txt_to_writer(transcript, w).map_err(|e| Error::Backend {
-    message: format!("save_as_txt: write to stdout failed: {e}"),
-  })?;
-  w.flush().map_err(|e| Error::Backend {
-    message: format!("save_as_txt: stdout flush failed: {e}"),
-  })?;
+  save_as_txt_to_writer(transcript, w)
+    .map_err(|e| Error::Backend(format!("save_as_txt: write to stdout failed: {e}")))?;
+  w.flush()
+    .map_err(|e| Error::Backend(format!("save_as_txt: stdout flush failed: {e}")))?;
   Ok(())
 }
 
@@ -771,15 +784,30 @@ pub fn save_as_srt(transcript: &Transcript, path: &Path) -> Result<()> {
     return save_as_srt_stdout(transcript, &mut w);
   }
   let final_path = with_extension(path, "srt");
-  let f = File::create(&final_path).map_err(|e| Error::Backend {
-    message: format!("save_as_srt: create {} failed: {e}", final_path.display()),
+  let f = File::create(&final_path).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save_as_srt",
+      FileOp::Create,
+      ::std::path::PathBuf::from(&final_path),
+      e,
+    ))
   })?;
   let mut w = BufWriter::new(f);
-  save_as_srt_to_writer(transcript, &mut w).map_err(|e| Error::Backend {
-    message: format!("save_as_srt: write {} failed: {e}", final_path.display()),
+  save_as_srt_to_writer(transcript, &mut w).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save_as_srt",
+      FileOp::Write,
+      ::std::path::PathBuf::from(&final_path),
+      e,
+    ))
   })?;
-  w.flush().map_err(|e| Error::Backend {
-    message: format!("save_as_srt: flush {} failed: {e}", final_path.display()),
+  w.flush().map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save_as_srt",
+      FileOp::Flush,
+      ::std::path::PathBuf::from(&final_path),
+      e,
+    ))
   })?;
   Ok(())
 }
@@ -810,12 +838,10 @@ fn save_as_srt_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::i
 /// ends with `\n\n` after the last cue but the partial bytes can still sit
 /// in the stdout buffer when redirected, so the explicit flush is required.
 fn save_as_srt_stdout<W: Write>(transcript: &Transcript, w: &mut W) -> Result<()> {
-  save_as_srt_to_writer(transcript, w).map_err(|e| Error::Backend {
-    message: format!("save_as_srt: write to stdout failed: {e}"),
-  })?;
-  w.flush().map_err(|e| Error::Backend {
-    message: format!("save_as_srt: stdout flush failed: {e}"),
-  })?;
+  save_as_srt_to_writer(transcript, w)
+    .map_err(|e| Error::Backend(format!("save_as_srt: write to stdout failed: {e}")))?;
+  w.flush()
+    .map_err(|e| Error::Backend(format!("save_as_srt: stdout flush failed: {e}")))?;
   Ok(())
 }
 
@@ -853,15 +879,30 @@ pub fn save_as_vtt(transcript: &Transcript, path: &Path) -> Result<()> {
     return save_as_vtt_stdout(transcript, &mut w);
   }
   let final_path = with_extension(path, "vtt");
-  let f = File::create(&final_path).map_err(|e| Error::Backend {
-    message: format!("save_as_vtt: create {} failed: {e}", final_path.display()),
+  let f = File::create(&final_path).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save_as_vtt",
+      FileOp::Create,
+      ::std::path::PathBuf::from(&final_path),
+      e,
+    ))
   })?;
   let mut w = BufWriter::new(f);
-  save_as_vtt_to_writer(transcript, &mut w).map_err(|e| Error::Backend {
-    message: format!("save_as_vtt: write {} failed: {e}", final_path.display()),
+  save_as_vtt_to_writer(transcript, &mut w).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save_as_vtt",
+      FileOp::Write,
+      ::std::path::PathBuf::from(&final_path),
+      e,
+    ))
   })?;
-  w.flush().map_err(|e| Error::Backend {
-    message: format!("save_as_vtt: flush {} failed: {e}", final_path.display()),
+  w.flush().map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save_as_vtt",
+      FileOp::Flush,
+      ::std::path::PathBuf::from(&final_path),
+      e,
+    ))
   })?;
   Ok(())
 }
@@ -893,12 +934,10 @@ fn save_as_vtt_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::i
 /// (including the `WEBVTT\n\n` header + every cue block) is pushed past
 /// the stdout buffer before [`save_as_vtt`] returns.
 fn save_as_vtt_stdout<W: Write>(transcript: &Transcript, w: &mut W) -> Result<()> {
-  save_as_vtt_to_writer(transcript, w).map_err(|e| Error::Backend {
-    message: format!("save_as_vtt: write to stdout failed: {e}"),
-  })?;
-  w.flush().map_err(|e| Error::Backend {
-    message: format!("save_as_vtt: stdout flush failed: {e}"),
-  })?;
+  save_as_vtt_to_writer(transcript, w)
+    .map_err(|e| Error::Backend(format!("save_as_vtt: write to stdout failed: {e}")))?;
+  w.flush()
+    .map_err(|e| Error::Backend(format!("save_as_vtt: stdout flush failed: {e}")))?;
   Ok(())
 }
 
@@ -963,18 +1002,28 @@ pub fn save_as_json(transcript: &Transcript, path: &Path) -> Result<()> {
     return save_as_json_stdout(transcript, &mut w);
   }
   let final_path = with_extension(path, "json");
-  let f = File::create(&final_path).map_err(|e| Error::Backend {
-    message: format!("save_as_json: create {} failed: {e}", final_path.display()),
+  let f = File::create(&final_path).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save_as_json",
+      FileOp::Create,
+      ::std::path::PathBuf::from(&final_path),
+      e,
+    ))
   })?;
   let mut w = BufWriter::new(f);
-  save_as_json_to_writer(transcript, &mut w).map_err(|e| Error::Backend {
-    message: format!(
+  save_as_json_to_writer(transcript, &mut w).map_err(|e| {
+    Error::Backend(format!(
       "save_as_json: serialize {} failed: {e}",
       final_path.display()
-    ),
+    ))
   })?;
-  w.flush().map_err(|e| Error::Backend {
-    message: format!("save_as_json: flush {} failed: {e}", final_path.display()),
+  w.flush().map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save_as_json",
+      FileOp::Flush,
+      ::std::path::PathBuf::from(&final_path),
+      e,
+    ))
   })?;
   Ok(())
 }
@@ -1016,12 +1065,10 @@ fn save_as_json_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::
 /// buffer entirely on a redirected stdout — without an explicit flush the
 /// final JSON bytes can sit past [`save_as_json`]'s return.
 fn save_as_json_stdout<W: Write>(transcript: &Transcript, w: &mut W) -> Result<()> {
-  save_as_json_to_writer(transcript, w).map_err(|e| Error::Backend {
-    message: format!("save_as_json: serialize to stdout failed: {e}"),
-  })?;
-  w.flush().map_err(|e| Error::Backend {
-    message: format!("save_as_json: stdout flush failed: {e}"),
-  })?;
+  save_as_json_to_writer(transcript, w)
+    .map_err(|e| Error::Backend(format!("save_as_json: serialize to stdout failed: {e}")))?;
+  w.flush()
+    .map_err(|e| Error::Backend(format!("save_as_json: stdout flush failed: {e}")))?;
   Ok(())
 }
 
@@ -1467,7 +1514,7 @@ mod tests {
     let err =
       super::save_as_txt_stdout(&t, &mut w).expect_err("flush-failing writer must produce an Err");
     match err {
-      Error::Backend { message } => {
+      Error::Backend(message) => {
         assert!(
           message.contains("save_as_txt") && message.contains("stdout flush failed"),
           "Error::Backend message must mention save_as_txt + stdout flush failure (got: {message})"
@@ -1488,7 +1535,7 @@ mod tests {
     let err =
       super::save_as_srt_stdout(&t, &mut w).expect_err("flush-failing writer must produce an Err");
     match err {
-      Error::Backend { message } => {
+      Error::Backend(message) => {
         assert!(
           message.contains("save_as_srt") && message.contains("stdout flush failed"),
           "Error::Backend message must mention save_as_srt + stdout flush failure (got: {message})"
@@ -1509,7 +1556,7 @@ mod tests {
     let err =
       super::save_as_vtt_stdout(&t, &mut w).expect_err("flush-failing writer must produce an Err");
     match err {
-      Error::Backend { message } => {
+      Error::Backend(message) => {
         assert!(
           message.contains("save_as_vtt") && message.contains("stdout flush failed"),
           "Error::Backend message must mention save_as_vtt + stdout flush failure (got: {message})"
@@ -1530,7 +1577,7 @@ mod tests {
     let err =
       super::save_as_json_stdout(&t, &mut w).expect_err("flush-failing writer must produce an Err");
     match err {
-      Error::Backend { message } => {
+      Error::Backend(message) => {
         assert!(
           message.contains("save_as_json") && message.contains("stdout flush failed"),
           "Error::Backend message must mention save_as_json + stdout flush failure (got: {message})"

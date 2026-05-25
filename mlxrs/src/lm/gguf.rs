@@ -58,7 +58,7 @@ use std::{
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{Error, Result},
+  error::{ArithmeticOverflowPayload, Error, OutOfRangePayload, Result},
   io::GgufMetadata,
   lm::load::{Config, Weights},
 };
@@ -192,8 +192,10 @@ impl HfVocab {
     // `tokenizer.vocab_size` — HF tokenizer's BASE vocab size, NOT
     // including added tokens (`mlx_lm/gguf.py:50`).
     let vocab_size_base_usize = hf.get_vocab_size(false);
-    let vocab_size_base = u32::try_from(vocab_size_base_usize).map_err(|_| Error::Backend {
-      message: format!("tokenizer base vocab size {vocab_size_base_usize} overflows u32"),
+    let vocab_size_base = u32::try_from(vocab_size_base_usize).map_err(|_| {
+      Error::Backend(format!(
+        "tokenizer base vocab size {vocab_size_base_usize} overflows u32"
+      ))
     })?;
 
     // `tokenizer.get_added_vocab()` returns ALL added tokens by name->id
@@ -287,17 +289,16 @@ impl HfVocab {
     }
 
     let vocab_size = vocab_size_base
-      .checked_add(
-        u32::try_from(added_tokens_list.len()).map_err(|_| Error::Backend {
-          message: format!(
-            "added token count {} overflows u32",
-            added_tokens_list.len()
-          ),
-        })?,
-      )
-      .ok_or_else(|| Error::Backend {
-        message: "vocab_size_base + added overflows u32".into(),
-      })?;
+      .checked_add(u32::try_from(added_tokens_list.len()).map_err(|_| {
+        Error::Backend(format!(
+          "added token count {} overflows u32",
+          added_tokens_list.len()
+        ))
+      })?)
+      .ok_or(Error::ArithmeticOverflow(ArithmeticOverflowPayload::new(
+        "vocab_size_base + added",
+        "u32",
+      )))?;
 
     Ok(HfVocab {
       added_tokens_list,
@@ -387,9 +388,8 @@ impl HfVocab {
       }
       let text = self.reverse_base_vocab[id as usize]
         .as_deref()
-        .ok_or_else(|| Error::Backend {
-          message: format!("HfVocab: base vocab missing token id {id}"),
-        })?;
+        // TODO(§5): promote to MissingField — `id` is dynamic (u32); needs a TokenId variant or Cow<'static, str> field for `field`.
+        .ok_or_else(|| Error::Backend(format!("HfVocab: base vocab missing token id {id}")))?;
       let score = self.get_token_score(id);
       let toktype = self.get_token_type(id, text);
       out.push((text.to_owned(), score, toktype));
@@ -567,32 +567,36 @@ pub fn permute_weights(weights: &Array, n_head: i32, n_head_kv: Option<i32>) -> 
     _ => n_head,
   };
   if effective <= 0 {
-    return Err(Error::Backend {
-      message: format!("permute_weights: n_head must be positive, got {effective}"),
-    });
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "permute_weights: n_head",
+      "must be positive",
+      format!("{effective}"),
+    )));
   }
   let original_shape = weights.shape();
   let original_shape_i32: Vec<i32> = original_shape
     .iter()
     .map(|&d| {
-      i32::try_from(d).map_err(|_| Error::Backend {
-        message: format!("permute_weights: dim {d} exceeds i32::MAX"),
-      })
+      i32::try_from(d)
+        // TODO(§5): promote to ArithmeticOverflow — `d` is dynamic; needs ArithmeticOverflow with runtime context or a DimExceedsI32Max { dim: usize } variant.
+        .map_err(|_| Error::Backend(format!("permute_weights: dim {d} exceeds i32::MAX")))
     })
     .collect::<Result<_>>()?;
   if original_shape.is_empty() {
-    return Err(Error::Backend {
-      message: "permute_weights: requires at least 1-D weights".into(),
-    });
+    return Err(Error::Backend(
+      "permute_weights: requires at least 1-D weights".into(),
+    ));
   }
   let d0 = original_shape_i32[0];
-  let twice = 2_i32.checked_mul(effective).ok_or_else(|| Error::Backend {
-    message: format!("permute_weights: 2 * n_head ({effective}) overflows i32"),
+  let twice = 2_i32.checked_mul(effective).ok_or_else(|| {
+    Error::Backend(format!(
+      "permute_weights: 2 * n_head ({effective}) overflows i32"
+    ))
   })?;
   if d0 % twice != 0 {
-    return Err(Error::Backend {
-      message: format!("permute_weights: leading dim {d0} not divisible by 2 * n_head ({twice})"),
-    });
+    return Err(Error::Backend(format!(
+      "permute_weights: leading dim {d0} not divisible by 2 * n_head ({twice})"
+    )));
   }
   let split = d0 / twice;
 
@@ -806,13 +810,11 @@ pub fn prepare_metadata(
   let triples = vocab.all_tokens()?;
   // assert len(tokens) == vocab.vocab_size (`mlx_lm/gguf.py:240`).
   if triples.len() as u32 != vocab.vocab_size {
-    return Err(Error::Backend {
-      message: format!(
-        "prepare_metadata: emitted {} tokens but vocab.vocab_size is {}",
-        triples.len(),
-        vocab.vocab_size,
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "prepare_metadata: emitted {} tokens but vocab.vocab_size is {}",
+      triples.len(),
+      vocab.vocab_size,
+    )));
   }
   let mut tokens = Vec::with_capacity(triples.len());
   let mut scores = Vec::with_capacity(triples.len());
@@ -997,13 +999,11 @@ pub fn convert_to_gguf(args: &ConvertToGgufArgs) -> Result<()> {
   //       checkpoint. The reference's `prepare_metadata` hard-codes the
   //       `llama.*` key prefix — see `SUPPORTED_MODEL_TYPES`.
   if !SUPPORTED_MODEL_TYPES.contains(&config.model_type()) {
-    return Err(Error::Backend {
-      message: format!(
-        "convert_to_gguf: model_type {:?} is not supported by the LM-side GGUF \
+    return Err(Error::Backend(format!(
+      "convert_to_gguf: model_type {:?} is not supported by the LM-side GGUF \
          exporter (supported: {SUPPORTED_MODEL_TYPES:?})",
-        config.model_type(),
-      ),
-    });
+      config.model_type(),
+    )));
   }
 
   //   2b. Quantized → reject (`mlx_lm/gguf.py:270-274`). [`Config`] only
@@ -1013,16 +1013,14 @@ pub fn convert_to_gguf(args: &ConvertToGgufArgs) -> Result<()> {
   //       key — we reject either so an unsupported quantized checkpoint
   //       cannot slip through. The GGUF LM export targets dense F16/F32;
   //       dequantize first via `lm::convert` if needed.
-  let raw_config: serde_json::Value =
-    serde_json::from_str(&raw_json).map_err(|e| Error::Backend {
-      message: format!("convert_to_gguf: cannot re-parse config.json: {e}"),
-    })?;
+  let raw_config: serde_json::Value = serde_json::from_str(&raw_json)
+    .map_err(|e| Error::Backend(format!("convert_to_gguf: cannot re-parse config.json: {e}")))?;
   if config.quantization.is_some() || raw_config.get("quantization_config").is_some() {
-    return Err(Error::Backend {
-      message: "convert_to_gguf: quantized checkpoints are not supported (the GGUF LM export \
+    return Err(Error::Backend(
+      "convert_to_gguf: quantized checkpoints are not supported (the GGUF LM export \
                 targets dense F16/F32 GGUF); dequantize first via lm::convert"
         .into(),
-    });
+    ));
   }
 
   //   2c. Tokenizer build — fail-fast (Codex round-2, Finding 2). The
@@ -1057,8 +1055,9 @@ pub fn convert_to_gguf(args: &ConvertToGgufArgs) -> Result<()> {
     .get("num_attention_heads")
     .and_then(|v| v.as_i64())
     .and_then(|n| i32::try_from(n).ok())
-    .ok_or_else(|| Error::Backend {
-      message: "convert_to_gguf: config.json missing or invalid `num_attention_heads`".into(),
+    .ok_or_else(|| {
+      // TODO(§5): promote to MissingField — currently "missing or invalid" conflates two failure modes; split into MissingField + a separate InvalidValue variant.
+      Error::Backend("convert_to_gguf: config.json missing or invalid `num_attention_heads`".into())
     })?;
   let num_key_value_heads = raw_config
     .get("num_key_value_heads")

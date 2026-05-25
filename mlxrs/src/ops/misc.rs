@@ -7,7 +7,7 @@ use std::ffi::c_int;
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{Error, Result, check},
+  error::{Error, FfiNullHandlePayload, Result, check},
   stream::default_stream,
 };
 
@@ -55,9 +55,9 @@ fn checked_scalar_f32(value: f32) -> Result<ScalarGuard> {
     return Err(
       crate::error::LAST
         .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend {
-          message: "mlx_array_new_float32 returned NULL".into(),
-        }),
+        .unwrap_or(Error::FfiNullHandle(FfiNullHandlePayload::new(
+          "mlx_array_new_float32",
+        ))),
     );
   }
   Ok(guard)

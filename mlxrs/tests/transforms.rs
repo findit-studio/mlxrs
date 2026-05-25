@@ -235,9 +235,7 @@ fn closure_user_error_propagates_through_grad() {
   use mlxrs::Error;
   let g = grad(
     |_xs: &[Array]| -> mlxrs::Result<Vec<Array>> {
-      Err(Error::Backend {
-        message: "USER_ERROR_PAYLOAD".into(),
-      })
+      Err(Error::Backend("USER_ERROR_PAYLOAD".into()))
     },
     &[0],
   )

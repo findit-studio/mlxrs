@@ -45,7 +45,7 @@
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{ArithmeticOverflowPayload, Error, InvariantViolationPayload, Result},
   lm::cache::{KvCache, MaskMode, RopeOffset},
 };
 
@@ -176,12 +176,10 @@ impl KvCache for CacheList {
   /// [`get_mut`](CacheList::get_mut) and update *that* child. A recoverable
   /// [`Error::Backend`] — the no-panic equivalent of Swift's trap.
   fn update(&mut self, _keys: &Array, _values: &Array) -> Result<(Array, Array)> {
-    Err(Error::Backend {
-      message: "CacheList::update is invalid — index a child via \
-                CacheList::get_mut and update that child (mlx-lm/Swift \
-                access children via subscript, not the composite)"
-        .into(),
-    })
+    Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "CacheList::update",
+      "is invalid — index a child via CacheList::get_mut and update that child",
+    )))
   }
 
   /// The flattened concatenation of every child's state — Swift
@@ -250,13 +248,11 @@ impl KvCache for CacheList {
     }
     let total: usize = lengths.iter().sum();
     if total != state.len() {
-      return Err(Error::Backend {
-        message: format!(
-          "CacheList::set_state: flattened state has {} arrays but the \
+      return Err(Error::Backend(format!(
+        "CacheList::set_state: flattened state has {} arrays but the \
            children expect {total}",
-          state.len()
-        ),
-      });
+        state.len()
+      )));
     }
     // Stage onto copies first: copy every child, apply each per-child
     // chunk to the *staged* copy, and only swap `self.caches` after ALL
@@ -363,12 +359,12 @@ impl KvCache for CacheList {
   /// rebuilds children atomically. A recoverable [`Error::Backend`] — the
   /// no-panic equivalent of Swift's `assertionFailure`.
   fn set_meta_state(&mut self, _m: &[String]) -> Result<()> {
-    Err(Error::Backend {
-      message: "CacheList::set_meta_state is invalid — reconstruct via \
+    Err(Error::Backend(
+      "CacheList::set_meta_state is invalid — reconstruct via \
                 from_state(\"CacheList\", state, meta) (Swift: \
                 CacheList.fromState)"
         .into(),
-    })
+    ))
   }
 
   /// `all(c.is_trimmable() for c in self.caches)` — mlx-lm
@@ -458,12 +454,12 @@ impl KvCache for CacheList {
     _window_size: Option<usize>,
     _return_array: bool,
   ) -> Result<MaskMode> {
-    Err(Error::Backend {
-      message: "CacheList::make_mask is invalid — mask per child via \
+    Err(Error::Backend(
+      "CacheList::make_mask is invalid — mask per child via \
                 CacheList::get (mlx-lm CacheList/_BaseCache define no \
                 make_mask; masking is per child)"
         .into(),
-    })
+    ))
   }
 
   /// The **sum** of children's `nbytes` — mlx-lm `CacheList.nbytes`
@@ -528,9 +524,10 @@ impl KvCache for CacheList {
     for c in &self.caches {
       total = total
         .checked_add(c.state_count()?)
-        .ok_or_else(|| Error::Backend {
-          message: "CacheList::state_count overflow".into(),
-        })?;
+        .ok_or(Error::ArithmeticOverflow(ArithmeticOverflowPayload::new(
+          "CacheList::state_count",
+          "usize",
+        )))?;
     }
     Ok(total)
   }
@@ -682,9 +679,7 @@ fn build_cache_list_children(
   meta: &[String],
   depth_budget: usize,
 ) -> Result<Vec<Box<dyn KvCache>>> {
-  let err = |m: &str| Error::Backend {
-    message: format!("CacheList: {m}"),
-  };
+  let err = |m: &str| Error::Backend(format!("CacheList: {m}"));
 
   // Reject the over-deep chain BEFORE parsing this level's frame: a forged
   // single-child `CacheList -> CacheList -> …` consumes one budget unit per

@@ -8,7 +8,7 @@ fn shape_error_returns_err_not_abort() {
   // Reshaping a 4-element array to incompatible shape should produce Err, not abort.
   let r = mlxrs::Array::ones::<f32>(&(2, 2)).and_then(|a| a.reshape(&(3,)));
   assert!(
-    matches!(r, Err(mlxrs::Error::Backend { .. })),
+    matches!(r, Err(mlxrs::Error::Backend(_))),
     "expected Err(Error::Backend), got {r:?}"
   );
 }
@@ -22,7 +22,7 @@ fn each_thread_has_independent_error_slot() {
     .map(|tid| {
       thread::spawn(move || {
         let r = mlxrs::Array::ones::<f32>(&(2, 2)).and_then(|a| a.reshape(&(5 + tid,)));
-        assert!(matches!(r, Err(mlxrs::Error::Backend { .. })));
+        assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
       })
     })
     .collect();
@@ -102,7 +102,7 @@ fn from_slice_rejects_negative_i32_dims() {
   // shape says. Must surface as ShapeMismatch.
   let r = mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[-1i32, 3]);
   assert!(
-    matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    matches!(r, Err(mlxrs::Error::ShapeMismatch(_))),
     "expected Err(ShapeMismatch), got {r:?}"
   );
 }
@@ -113,7 +113,7 @@ fn from_slice_rejects_negative_i32_slice_dims() {
   let dims: &[i32] = &[2, -3];
   let r = mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &dims);
   assert!(
-    matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    matches!(r, Err(mlxrs::Error::ShapeMismatch(_))),
     "expected Err(ShapeMismatch), got {r:?}"
   );
 }
@@ -125,7 +125,7 @@ fn from_slice_rejects_overflowing_shape_product() {
   // Without checked_mul, the wrapped value could match data.len() and pass.
   let r = mlxrs::Array::from_slice::<f32>(&[1.0], &[i32::MAX, i32::MAX, i32::MAX]);
   assert!(
-    matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    matches!(r, Err(mlxrs::Error::ShapeMismatch(_))),
     "expected Err(ShapeMismatch) on overflow, got {r:?}"
   );
 }
@@ -138,9 +138,17 @@ fn slice_rejects_len_ne_ndim() {
   // so the safe-FFI boundary is closed without rejecting 0-D-scalar slicing.)
   let a = mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
   let r = mlxrs::ops::indexing::slice(&a, &[], &[], &[]);
+  // §5 typed: `slice` returns `LengthMismatch` when start/stop/strides
+  // agree with each other (empty here) but disagree with `a.ndim()`.
   assert!(
-    matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })),
-    "expected Err(ShapeMismatch) on len != ndim, got {r:?}"
+    matches!(
+      r,
+      Err(mlxrs::Error::LengthMismatch(ref p))
+        if p.context() == "slice: start/stop/strides length"
+          && p.expected() == 2
+          && p.actual() == 0
+    ),
+    "expected Err(LengthMismatch) on len != ndim, got {r:?}"
   );
 }
 
@@ -149,9 +157,15 @@ fn slice_rejects_mismatched_lengths() {
   // start/stop/strides must agree on length (one entry per axis).
   let a = mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
   let r = mlxrs::ops::indexing::slice(&a, &[0, 0], &[1], &[1, 1]);
+  // §5 typed: when start/stop/strides disagree with each other (not just
+  // with ndim), `slice` returns `MultiLengthMismatch` with named lengths.
   assert!(
-    matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })),
-    "expected Err(ShapeMismatch) on length mismatch, got {r:?}"
+    matches!(
+      r,
+      Err(mlxrs::Error::MultiLengthMismatch(ref p))
+        if p.context() == "slice: start/stop/strides"
+    ),
+    "expected Err(MultiLengthMismatch) on length mismatch, got {r:?}"
   );
 }
 
@@ -189,7 +203,7 @@ fn concatenate_rejects_empty_input() {
   // Codex PR #5 finding 3 / dangling-pointer concern for empty Vec::as_ptr().
   let r = mlxrs::ops::shape::concatenate(&[], 0);
   assert!(
-    matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    matches!(r, Err(mlxrs::Error::ShapeMismatch(_))),
     "expected Err(ShapeMismatch) on empty input, got {r:?}"
   );
 }

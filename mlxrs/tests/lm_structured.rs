@@ -797,7 +797,7 @@ fn llguidance_terminal_grammar_rejects_out_of_range_eos_id_without_panic() {
   // manually rather than via `expect_err`.)
   let result = structured::LLGuidanceLogitsProcessor::new(grammar, &tok, None);
   match result {
-    Err(mlxrs::Error::ShapeMismatch { message }) => {
+    Err(mlxrs::Error::ShapeMismatch(message)) => {
       assert!(
         message.contains("4242"),
         "error message must name the offending id 4242, got: {message}"

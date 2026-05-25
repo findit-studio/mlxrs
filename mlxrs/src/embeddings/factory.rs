@@ -76,7 +76,7 @@ use glob::{MatchOptions, glob_with};
 use crate::{
   array::Array,
   embeddings::{config::StPoolingConfig, model::EmbeddingModel},
-  error::{Error, Result},
+  error::{Error, FileIoPayload, FileOp, Result},
   tokenizer::Tokenizer,
 };
 
@@ -386,16 +386,13 @@ impl EmbeddingModelTypeRegistry {
   /// [`Error::Backend`] (mlx-swift-lm's `unsupportedModelType`, mlx-embeddings'
   /// `ValueError("Model type … not supported.")`).
   pub fn create(&self, loaded: &LoadedEmbeddingModel) -> Result<Box<dyn EmbeddingModel>> {
-    let constructor = self
-      .creators
-      .get(&loaded.model_type)
-      .ok_or_else(|| Error::Backend {
-        message: format!(
-          "unsupported model type {:?}: no constructor registered (register one via \
+    let constructor = self.creators.get(&loaded.model_type).ok_or_else(|| {
+      Error::Backend(format!(
+        "unsupported model type {:?}: no constructor registered (register one via \
              EmbeddingModelTypeRegistry::register)",
-          loaded.model_type
-        ),
-      })?;
+        loaded.model_type
+      ))
+    })?;
     constructor(loaded)
   }
 }
@@ -513,12 +510,11 @@ pub fn load(
   // normally empty — is a cheap, recoverable error here, never paying for
   // weight/tokenizer I/O.
   if !registry.contains(&model_type) {
-    return Err(Error::Backend {
-      message: format!(
-        "unsupported model type {model_type:?}: no constructor registered (register one via \
+    // TODO(§5): promote to a typed UnsupportedModelType { model_type: String } variant — `model_type` is dynamic but structured (a model-type string); direct variant would avoid string construction on the hot error path.
+    return Err(Error::Backend(format!(
+      "unsupported model type {model_type:?}: no constructor registered (register one via \
          EmbeddingModelTypeRegistry::register)"
-      ),
-    });
+    )));
   }
 
   // (3) Read the optional `1_Pooling/config.json` (mlx-embeddings
@@ -542,11 +538,11 @@ pub fn load(
   // does not generate, so there is no eos override (mlx-embeddings' embedding
   // `load` builds a plain tokenizer); pass `None` — `Tokenizer::from_path`
   // then uses the tokenizer's own `eos_token`.
-  let tokenizer = Tokenizer::from_path(tokenizer_dir, None).map_err(|e| Error::Backend {
-    message: format!(
+  let tokenizer = Tokenizer::from_path(tokenizer_dir, None).map_err(|e| {
+    Error::Backend(format!(
       "cannot load tokenizer from {}: {e}",
       tokenizer_dir.display()
-    ),
+    ))
   })?;
 
   // (7) Construct via the registry (already validated as registered in step 2).
@@ -576,9 +572,10 @@ pub fn load(
 /// steps to resolve or reject; only the genuinely empty path is caught here.
 fn reject_empty_dir(dir: &Path, role: &str) -> Result<()> {
   if dir.as_os_str().is_empty() {
-    return Err(Error::Backend {
-      message: format!("embeddings load: {role} directory path must not be empty"),
-    });
+    // TODO(§5): promote to EmptyInput — `role` is a dynamic &str label; needs Cow<'static, str> or a PathEmpty { role: String } variant.
+    return Err(Error::Backend(format!(
+      "embeddings load: {role} directory path must not be empty"
+    )));
   }
   Ok(())
 }
@@ -624,12 +621,10 @@ fn read_optional_pooling(dir: &Path) -> Result<Option<StPoolingConfig>> {
   match config_path.symlink_metadata() {
     Ok(_) => crate::embeddings::config::pooling_from_st_config_path(dir).map(Some),
     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-    Err(e) => Err(Error::Backend {
-      message: format!(
-        "embeddings load: pooling config at {} is present but unreadable: {e}",
-        config_path.display()
-      ),
-    }),
+    Err(e) => Err(Error::Backend(format!(
+      "embeddings load: pooling config at {} is present but unreadable: {e}",
+      config_path.display()
+    ))),
   }
 }
 
@@ -709,13 +704,11 @@ fn load_weights(dir: &Path) -> Result<EmbeddingWeights> {
   }
 
   if shards.is_empty() {
-    return Err(Error::Backend {
-      message: format!(
-        "no model weights found in {}: expected `model*.safetensors` (recursively, or legacy \
+    return Err(Error::Backend(format!(
+      "no model weights found in {}: expected `model*.safetensors` (recursively, or legacy \
          root-level `weight*.safetensors`)",
-        dir.display()
-      ),
-    });
+      dir.display()
+    )));
   }
 
   // Deterministic merge in sorted full-path order (`collect_glob_shards` sorts
@@ -955,11 +948,11 @@ fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<Discovere
   // `glob_with` takes a `&str` and `unwrap()`s `to_str()` internally — reject a
   // non-UTF-8 model dir path here so that becomes a recoverable error, not a
   // panic inside the crate.
-  let dir_str = dir.to_str().ok_or_else(|| Error::Backend {
-    message: format!(
+  let dir_str = dir.to_str().ok_or_else(|| {
+    Error::Backend(format!(
       "model directory path {} is not valid UTF-8; cannot glob for weight shards",
       dir.display()
-    ),
+    ))
   })?;
 
   // Byte-level preflight: `glob 0.3.3` matches a leaf component via
@@ -1007,10 +1000,10 @@ fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<Discovere
     require_literal_leading_dot: false,
   };
 
-  let matches = glob_with(&pattern, options).map_err(|e| Error::Backend {
-    // A `PatternError` from this fixed, escaped pattern would be an internal
-    // bug, not untrusted input — surface it as a recoverable error all the same.
-    message: format!("internal error building weight-shard glob pattern {pattern:?}: {e}"),
+  let matches = glob_with(&pattern, options).map_err(|e| {
+    Error::Backend(format!(
+      "internal error building weight-shard glob pattern {pattern:?}: {e}"
+    ))
   })?;
 
   let mut out = Vec::new();
@@ -1042,21 +1035,17 @@ fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<Discovere
     match std::fs::metadata(&path) {
       Ok(m) if m.is_file() => {}
       Ok(_) => {
-        return Err(Error::Backend {
-          message: format!(
-            "weight shard {} is a non-regular entry (directory / FIFO / device / socket); \
+        return Err(Error::Backend(format!(
+          "weight shard {} is a non-regular entry (directory / FIFO / device / socket); \
              refusing to load",
-            path.display()
-          ),
-        });
+          path.display()
+        )));
       }
       Err(e) => {
-        return Err(Error::Backend {
-          message: format!(
-            "weight shard {} cannot be resolved (broken symlink / unreadable target): {e}",
-            path.display()
-          ),
-        });
+        return Err(Error::Backend(format!(
+          "weight shard {} cannot be resolved (broken symlink / unreadable target): {e}",
+          path.display()
+        )));
       }
     }
 
@@ -1081,15 +1070,12 @@ fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<Discovere
     // cannot become a `String` prefix — and must NOT fall through to `None`,
     // which would silently mis-merge its keys verbatim (and collide with a real
     // root shard). Fail loudly with a path-naming `Error::Backend` instead.
-    let relative = path.strip_prefix(&glob_root).map_err(|_| Error::Backend {
-      // `glob` always yields matches under the normalized root, so this is
-      // unreachable in practice — surface it as a recoverable error all the
-      // same rather than silently mis-classifying the shard as root.
-      message: format!(
+    let relative = path.strip_prefix(&glob_root).map_err(|_| {
+      Error::Backend(format!(
         "weight shard {} is not under the model directory {}; cannot derive the key prefix",
         path.display(),
         glob_root.display()
-      ),
+      ))
     })?;
     // `Path::components()` already collapses any interior `.` segment, so only
     // `Normal` components remain to count; the last is the file name.
@@ -1104,12 +1090,12 @@ fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<Discovere
       // `[.., immediate_parent, file_name]` — a NESTED shard; the prefix is the
       // immediate parent folder name (the component just before the file name).
       Some((_file_name, [.., immediate_parent])) => {
-        let folder = immediate_parent.to_str().ok_or_else(|| Error::Backend {
-          message: format!(
+        let folder = immediate_parent.to_str().ok_or_else(|| {
+          Error::Backend(format!(
             "weight shard {} has a non-UTF-8 parent directory name; cannot derive the key \
              prefix",
             path.display()
-          ),
+          ))
         })?;
         Some(folder.to_owned())
       }
@@ -1250,16 +1236,14 @@ fn scan_non_utf8_shards(dir: &Path, pattern_suffix: &str) -> Result<()> {
     // `glob` leaves open — fail loudly, naming the path (lossy display).
     if name.to_str().is_none() && name_bytes_match(&name, prefix, suffix) {
       let path = entry.path();
-      return Err(Error::Backend {
-        message: format!(
-          "weight shard {} has a non-UTF-8 file name matching the `{}*{}` shard pattern; \
+      return Err(Error::Backend(format!(
+        "weight shard {} has a non-UTF-8 file name matching the `{}*{}` shard pattern; \
            `glob` silently skips it (glob 0.3.3 leaf match drops non-UTF-8 names), which would \
            let the load fall back to stale weights — refusing to load",
-          path.display(),
-          String::from_utf8_lossy(prefix),
-          String::from_utf8_lossy(suffix),
-        ),
-      });
+        path.display(),
+        String::from_utf8_lossy(prefix),
+        String::from_utf8_lossy(suffix),
+      )));
     }
 
     // Recurse into subdirectories for the `**/model*.safetensors` pass only —
@@ -1320,56 +1304,74 @@ fn read_model_type(dir: &Path) -> Result<(String, String)> {
       .read(true)
       .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
       .open(&path)
-      .map_err(|e| Error::Backend {
-        message: format!("cannot open model config {}: {e}", path.display()),
+      .map_err(|e| {
+        Error::FileIo(FileIoPayload::new(
+          "cannot open model config",
+          FileOp::Open,
+          path.to_path_buf(),
+          e,
+        ))
       })?
   };
   #[cfg(not(unix))]
-  let file = std::fs::File::open(&path).map_err(|e| Error::Backend {
-    message: format!("cannot open model config {}: {e}", path.display()),
+  let file = std::fs::File::open(&path).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "cannot open model config",
+      FileOp::Open,
+      path.to_path_buf(),
+      e,
+    ))
   })?;
 
-  let meta = file.metadata().map_err(|e| Error::Backend {
-    message: format!("cannot stat opened model config {}: {e}", path.display()),
+  let meta = file.metadata().map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "cannot stat opened model config",
+      FileOp::Stat,
+      path.to_path_buf(),
+      e,
+    ))
   })?;
   if !meta.is_file() {
-    return Err(Error::Backend {
-      message: format!(
-        "model config {} is not a regular file; refusing to read",
-        path.display()
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "model config {} is not a regular file; refusing to read",
+      path.display()
+    )));
   }
 
   let mut bytes = Vec::new();
   file
     .take(MAX_CONFIG_BYTES + 1)
     .read_to_end(&mut bytes)
-    .map_err(|e| Error::Backend {
-      message: format!("cannot read model config {}: {e}", path.display()),
+    .map_err(|e| {
+      Error::FileIo(FileIoPayload::new(
+        "cannot read model config",
+        FileOp::Read,
+        path.to_path_buf(),
+        e,
+      ))
     })?;
   if bytes.len() as u64 > MAX_CONFIG_BYTES {
-    return Err(Error::Backend {
-      message: format!(
-        "model config {} exceeds the {}-byte cap; refusing to read",
-        path.display(),
-        MAX_CONFIG_BYTES
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "model config {} exceeds the {}-byte cap; refusing to read",
+      path.display(),
+      MAX_CONFIG_BYTES
+    )));
   }
 
-  let text = String::from_utf8(bytes).map_err(|e| Error::Backend {
-    message: format!("model config {} is not valid UTF-8: {e}", path.display()),
+  let text = String::from_utf8(bytes).map_err(|e| {
+    Error::Backend(format!(
+      "model config {} is not valid UTF-8: {e}",
+      path.display()
+    ))
   })?;
 
-  let raw = extract_string_field(&text, "model_type").map_err(|e| Error::Backend {
-    message: format!("invalid model config {}: {e}", path.display()),
-  })?;
-  let model_type = raw.ok_or_else(|| Error::Backend {
-    message: format!(
+  let raw = extract_string_field(&text, "model_type")
+    .map_err(|e| Error::Backend(format!("invalid model config {}: {e}", path.display())))?;
+  let model_type = raw.ok_or_else(|| {
+    Error::Backend(format!(
       "model config {} has no string `model_type` field (required to pick an architecture)",
       path.display()
-    ),
+    ))
   })?;
 
   Ok((remap_model_type(&model_type), text))
@@ -1880,9 +1882,9 @@ mod tests {
       let (batch, seq) = match input_ids.shape().as_slice() {
         [b, s] => (*b, *s),
         other => {
-          return Err(Error::ShapeMismatch {
-            message: format!("MockLoadedEmbedding::forward expects (batch, seq), got {other:?}"),
-          });
+          return Err(Error::ShapeMismatch(format!(
+            "MockLoadedEmbedding::forward expects (batch, seq), got {other:?}"
+          )));
         }
       };
       let data = vec![0.0_f32; batch * seq * self.hidden];
@@ -2133,7 +2135,7 @@ mod tests {
         panic!("an empty model directory path must be a recoverable error, not a load");
       };
       assert!(
-        matches!(err, Error::Backend { .. }),
+        matches!(err, Error::Backend(_)),
         "expected a recoverable Backend error; got {err:?}"
       );
       let msg = err.to_string();
@@ -2169,7 +2171,7 @@ mod tests {
       panic!("an empty tokenizer_source path must be a recoverable error");
     };
     assert!(
-      matches!(err, Error::Backend { .. }),
+      matches!(err, Error::Backend(_)),
       "expected a recoverable Backend error; got {err:?}"
     );
     let msg = err.to_string();
@@ -2190,7 +2192,7 @@ mod tests {
         panic!("collect_glob_shards must reject an empty dir, not scan the filesystem root");
       };
       assert!(
-        matches!(err, Error::Backend { .. }),
+        matches!(err, Error::Backend(_)),
         "expected a recoverable Backend error; got {err:?}"
       );
       assert!(
@@ -2851,7 +2853,7 @@ mod tests {
     // A recoverable discovery error — must mention the broken shard, NOT be a
     // success that loaded `stale.weight`.
     assert!(
-      matches!(err, Error::Backend { .. }),
+      matches!(err, Error::Backend(_)),
       "expected a recoverable Backend error; got {err:?}"
     );
     let msg = err.to_string();
@@ -2883,7 +2885,7 @@ mod tests {
       );
     };
     assert!(
-      matches!(err, Error::Backend { .. }),
+      matches!(err, Error::Backend(_)),
       "expected a recoverable Backend error; got {err:?}"
     );
     let msg = err.to_string();
@@ -2912,7 +2914,7 @@ mod tests {
       panic!("a `model.safetensors` symlink-to-directory must fail the load");
     };
     assert!(
-      matches!(err, Error::Backend { .. }),
+      matches!(err, Error::Backend(_)),
       "expected a recoverable Backend error; got {err:?}"
     );
     let msg = err.to_string();
@@ -3052,7 +3054,7 @@ mod tests {
       panic!("a non-UTF-8 model dir path must be a recoverable error, not a panic");
     };
     assert!(
-      matches!(err, Error::Backend { .. }),
+      matches!(err, Error::Backend(_)),
       "expected a recoverable Backend error; got {err:?}"
     );
     assert!(
@@ -3154,7 +3156,7 @@ mod tests {
       );
     };
     assert!(
-      matches!(err, Error::Backend { .. }),
+      matches!(err, Error::Backend(_)),
       "expected a recoverable Backend error; got {err:?}"
     );
     let msg = err.to_string();

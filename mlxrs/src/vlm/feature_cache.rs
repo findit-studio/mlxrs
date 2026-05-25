@@ -552,11 +552,11 @@ impl VisionFeatureCache {
   ///   misuse instead of silently building a cache that can hold nothing.
   pub fn with_max_size(max_size: usize) -> Result<Self> {
     if max_size == 0 {
-      return Err(Error::ShapeMismatch {
-        message: "VisionFeatureCache: max_size must be >= 1 (a zero-capacity \
+      return Err(Error::ShapeMismatch(
+        "VisionFeatureCache: max_size must be >= 1 (a zero-capacity \
                   cache can never hold an entry)"
           .into(),
-      });
+      ));
     }
     // Create the containers EMPTY — do NOT pre-reserve the raw `max_size`.
     // `max_size` is caller-/config-/request-derived; reserving it up front

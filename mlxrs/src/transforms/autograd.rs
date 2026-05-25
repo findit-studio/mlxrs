@@ -40,7 +40,9 @@ use std::rc::Rc;
 
 use crate::{
   Array,
-  error::{Error, Result, check, check_vector_array_handle, ensure_handler_installed},
+  error::{
+    EmptyInputPayload, Error, Result, check, check_vector_array_handle, ensure_handler_installed,
+  },
   stream::assert_streams_not_cleared,
   transforms::closure::{
     BoxedFn, Closure, ClosureValueAndGradGuard, VectorArrayGuard, drain_vector,
@@ -92,9 +94,9 @@ where
   //   ([expr.add]) even when the addend is 0. Failing fast here removes
   //   both the no-op semantic and the spec-UB exposure.
   if argnums.is_empty() {
-    return Err(Error::Backend {
-      message: "value_and_grad: argnums must be non-empty (at least one input index to differentiate w.r.t.)".into(),
-    });
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "value_and_grad: argnums",
+    )));
   }
   // The Rust closure `F` is shared across invocations of the returned `Fn`.
   // mlx-swift rebuilds the `mlx_closure` per inner call (no payload sharing

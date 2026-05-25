@@ -30,9 +30,9 @@ use crate::{
 fn validate_betas(betas: (f32, f32)) -> Result<()> {
   let (b1, b2) = betas;
   if !b1.is_finite() || !b2.is_finite() || !(0.0..1.0).contains(&b1) || !(0.0..1.0).contains(&b2) {
-    return Err(Error::Backend {
-      message: format!("Lion: betas must be finite and in [0.0, 1.0), got ({b1}, {b2})"),
-    });
+    return Err(Error::Backend(format!(
+      "Lion: betas must be finite and in [0.0, 1.0), got ({b1}, {b2})"
+    )));
   }
   Ok(())
 }
@@ -40,9 +40,9 @@ fn validate_betas(betas: (f32, f32)) -> Result<()> {
 /// Validate that `weight_decay` is finite and `>= 0.0`.
 fn validate_weight_decay(weight_decay: f32) -> Result<()> {
   if !weight_decay.is_finite() || weight_decay < 0.0 {
-    return Err(Error::Backend {
-      message: format!("Lion: weight_decay must be finite and >= 0.0, got {weight_decay}"),
-    });
+    return Err(Error::Backend(format!(
+      "Lion: weight_decay must be finite and >= 0.0, got {weight_decay}"
+    )));
   }
   Ok(())
 }
