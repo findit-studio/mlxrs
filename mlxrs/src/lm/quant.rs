@@ -119,7 +119,20 @@ use crate::{
 /// The set of MLX quantization modes — mlx-swift's `QuantizationMode`
 /// (`mlx-swift/Source/MLX/Ops.swift:1097-1124`), serialized as the lowercase
 /// tag string mlx-c expects (`"affine"` / `"mxfp4"` / `"mxfp8"` / `"nvfp4"`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[derive(
+  Debug,
+  Clone,
+  Copy,
+  PartialEq,
+  Eq,
+  Hash,
+  serde::Deserialize,
+  serde::Serialize,
+  derive_more::Display,
+  derive_more::IsVariant,
+)]
+#[display("{}", self.as_str())]
+#[non_exhaustive]
 #[serde(rename_all = "lowercase")]
 pub enum QuantMode {
   /// Asymmetric grouped affine quantization (mlx default,
@@ -146,13 +159,23 @@ impl QuantMode {
   /// The mlx-c mode tag string (the wire format mlx-c expects). Stable
   /// snake-case lower — matches the `serde(rename_all = "lowercase")` form
   /// in [`QuantMode`]'s `Deserialize` impl, so serialize/deserialize roundtrip.
-  pub fn as_mlx_str(self) -> &'static str {
+  ///
+  /// Previously named `as_mlx_str`; renamed to `as_str` per §2 for
+  /// consistency with the rest of the mlxrs enum surface (§2: unit-only
+  /// enums expose `const fn as_str() -> &'static str`).
+  pub const fn as_str(self) -> &'static str {
     match self {
       QuantMode::Affine => "affine",
       QuantMode::Mxfp4 => "mxfp4",
       QuantMode::Mxfp8 => "mxfp8",
       QuantMode::Nvfp4 => "nvfp4",
     }
+  }
+
+  /// Compatibility alias — prefer [`as_str`](Self::as_str).
+  #[deprecated(since = "0.0.0", note = "renamed to `as_str`")]
+  pub const fn as_mlx_str(self) -> &'static str {
+    self.as_str()
   }
 }
 
@@ -190,7 +213,8 @@ impl Quantization {
 
 /// The per-layer override the [`PerLayerQuantization`] map carries — mlx-swift
 /// `BaseConfiguration.QuantizationOption` (`BaseConfiguration.swift:58-64`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::IsVariant)]
+#[non_exhaustive]
 pub enum QuantizationOption {
   /// "Do not quantize this layer." Encoded in `config.json` as a literal
   /// `false` for the layer path (`BaseConfiguration.swift:60-61`,
@@ -220,10 +244,24 @@ pub struct PerLayerQuantization {
   pub quantization: Option<Quantization>,
   /// Path → override. Empty when the on-disk JSON only carried the global
   /// `{ group_size, bits, [mode] }` (no per-layer keys — the common case).
-  pub per_layer: HashMap<String, QuantizationOption>,
+  ///
+  /// Private: access via [`per_layer_ref`](Self::per_layer_ref).
+  per_layer: HashMap<String, QuantizationOption>,
 }
 
 impl PerLayerQuantization {
+  /// Build a [`PerLayerQuantization`] from a global [`Quantization`] (or
+  /// `None` for skip-by-default) and an explicit per-layer override map.
+  pub fn new(
+    quantization: Option<Quantization>,
+    per_layer: HashMap<String, QuantizationOption>,
+  ) -> Self {
+    Self {
+      quantization,
+      per_layer,
+    }
+  }
+
   /// Build a flat-default [`PerLayerQuantization`] from a single global
   /// [`Quantization`] (no per-layer overrides). Convenience for callers
   /// that already have a [`Quantization`] in hand and want the default
@@ -233,6 +271,15 @@ impl PerLayerQuantization {
       quantization: Some(q),
       per_layer: HashMap::new(),
     }
+  }
+
+  /// The per-layer override map (path → [`QuantizationOption`]).
+  ///
+  /// Empty when the on-disk JSON only carried the global
+  /// `{ group_size, bits, [mode] }` (no per-layer keys — the common case).
+  #[inline(always)]
+  pub fn per_layer_ref(&self) -> &HashMap<String, QuantizationOption> {
+    &self.per_layer
   }
 
   /// Resolve the [`Quantization`] for one layer path — mlx-swift
@@ -629,7 +676,7 @@ fn classify_triple(
              `mlx/ops.cpp:4890,4898-4904`), but the input carries a stale \
              `{biases_key}` — refusing to silently retain a bias from a \
              different (affine) mode",
-            q.mode.as_mlx_str()
+            q.mode.as_str()
           ));
         }
         // `(Affine, Some(_))` falls through to the existing
@@ -863,7 +910,7 @@ pub fn quantize_weights(
     let quant_match = layer_path.and_then(|p| quantize_set.get(p).map(|q| (p, *q)));
     if let Some((path, q)) = quant_match {
       let (w_q, scales, biases) =
-        ops::quantized::quantize(&arr, q.group_size, q.bits, q.mode.as_mlx_str(), None)?;
+        ops::quantized::quantize(&arr, q.group_size, q.bits, q.mode.as_str(), None)?;
       // mlx's `QuantizedLinear` stores the packed weight at
       // `<path>.weight`, the scales at `<path>.scales`, and (for `affine`)
       // the biases at `<path>.biases` —
@@ -1083,7 +1130,7 @@ pub fn dequantize_weights(weights: Weights, cfg: &PerLayerQuantization) -> Resul
              `mlx/ops.cpp:5198-5210`), but the input carries a stale \
              `{path}.biases` — refusing to silently retain a bias from a \
              different (affine) mode",
-            q.mode.as_mlx_str()
+            q.mode.as_str()
           ),
         });
       }
@@ -1097,7 +1144,7 @@ pub fn dequantize_weights(weights: Weights, cfg: &PerLayerQuantization) -> Resul
       b_opt.as_ref(),
       q.group_size,
       q.bits,
-      q.mode.as_mlx_str(),
+      q.mode.as_str(),
       None,
       None,
     )?;

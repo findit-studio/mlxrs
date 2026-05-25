@@ -201,7 +201,7 @@ impl ModelTypeRegistry {
   /// `ModelFactoryError.unsupportedModelType`, mlx-lm's
   /// `ValueError("Model type … not supported.")`).
   pub fn create(&self, loaded: &LoadedModel) -> Result<Box<dyn Model>> {
-    let model_type = remap_model_type(&loaded.config.model_type);
+    let model_type = remap_model_type(loaded.config.model_type());
     let constructor = self
       .creators
       .get(model_type)
@@ -209,7 +209,7 @@ impl ModelTypeRegistry {
         message: format!(
           "unsupported model type {:?}: no constructor registered (register one via \
          ModelTypeRegistry::register)",
-          loaded.config.model_type
+          loaded.config.model_type()
         ),
       })?;
     constructor(loaded)
@@ -385,12 +385,12 @@ pub fn load(
   // normally empty — is a cheap, recoverable error here, never paying for
   // weight/tokenizer I/O (and never surfacing a weight error in place of the
   // recoverable unsupported-model one).
-  if !registry.contains(&config.model_type) {
+  if !registry.contains(config.model_type()) {
     return Err(Error::Backend {
       message: format!(
         "unsupported model type {:?}: no constructor registered (register one via \
          ModelTypeRegistry::register)",
-        config.model_type
+        config.model_type()
       ),
     });
   }
@@ -683,7 +683,10 @@ mod tests {
   };
 
   use super::*;
-  use crate::{array::Array, lm::cache::KvCache};
+  use crate::{
+    array::Array,
+    lm::{cache::KvCache, generate::FinishReason},
+  };
 
   /// A minimal `config.json` for the mock architecture. `model_type` is the
   /// registry key; the remaining fields are exactly the required keys of the
@@ -839,7 +842,7 @@ mod tests {
     let ctx = load(&config, &registry).expect("load should succeed");
 
     // The returned config carries the parsed model_type + vocab.
-    assert_eq!(ctx.config.model_type, "mockarch");
+    assert_eq!(ctx.config.model_type(), "mockarch");
     assert_eq!(ctx.config.vocab_size, 5);
 
     // The constructed model is the mock: drive one forward to confirm it is
@@ -865,7 +868,7 @@ mod tests {
     assert_eq!(config.model_directory(), dir.as_path());
 
     let ctx = load(&config, &registry).expect("id-as-local-path load should succeed");
-    assert_eq!(ctx.config.model_type, "mockarch");
+    assert_eq!(ctx.config.model_type(), "mockarch");
   }
 
   #[test]
@@ -1031,7 +1034,7 @@ mod tests {
         let raw: serde_json::Value = serde_json::from_str(&loaded.config_json).unwrap();
         assert_eq!(
           raw.get("model_type").and_then(|v| v.as_str()),
-          Some(loaded.config.model_type.as_str())
+          Some(loaded.config.model_type())
         );
         assert_eq!(
           raw.get("vocab_size").and_then(|v| v.as_i64()),
@@ -1115,7 +1118,7 @@ mod tests {
     // (the config's typed fields, a working tokenizer, a runnable model).
     let ctx = mock_context(8, 2);
 
-    assert_eq!(ctx.config().model_type, "mockarch");
+    assert_eq!(ctx.config().model_type(), "mockarch");
     assert_eq!(ctx.config().vocab_size, 8);
     assert_eq!(ctx.config().num_hidden_layers, 2);
 
@@ -1287,7 +1290,7 @@ mod tests {
     // Four tokens ⇒ four responses; only the last has a finish_reason.
     assert_eq!(reasons.len(), 4);
     assert_eq!(reasons[0], None);
-    assert_eq!(reasons[3], Some("length".to_string()));
+    assert_eq!(reasons[3], Some(FinishReason::Length));
     // Streaming and the collecting `generate` agree on the assembled text.
     let (gen_text, _) = ctx
       .generate(
@@ -1314,7 +1317,7 @@ mod tests {
     let loaded = load(&configuration, &registry).expect("load");
     let ctx: ModelContext = loaded.into();
 
-    assert_eq!(ctx.config().model_type, "mockarch");
+    assert_eq!(ctx.config().model_type(), "mockarch");
     // The loaded mock arch has vocab 5 (see `mock_config_json`); the model
     // forwards `[B, S, 5]` logits.
     let mut cache: Vec<Box<dyn crate::lm::cache::KvCache>> = Vec::new();
@@ -1335,7 +1338,7 @@ mod tests {
     let configuration = ModelConfiguration::from_directory(&dir);
 
     let ctx = ModelContext::load(&configuration, &registry).expect("ModelContext::load");
-    assert_eq!(ctx.config().model_type, "mockarch");
+    assert_eq!(ctx.config().model_type(), "mockarch");
     assert_eq!(ctx.config().vocab_size, 5);
     assert_eq!(ctx.encode("a b c", false).unwrap().len(), 3);
   }

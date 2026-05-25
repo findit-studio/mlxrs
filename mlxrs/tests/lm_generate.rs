@@ -19,8 +19,8 @@ use mlxrs::{
   lm::{
     cache::{CacheConfig, KvCache, make_prompt_cache},
     generate::{
-      __resolved_unseeded_seed_for_test, GenConfig, GenStep, GenerationStats, generate,
-      generate_step, make_logits_processors, make_sampler, stream_generate,
+      __resolved_unseeded_seed_for_test, FinishReason, GenConfig, GenStep, GenerationStats,
+      generate, generate_step, make_logits_processors, make_sampler, stream_generate,
     },
     model::Model,
   },
@@ -206,11 +206,7 @@ fn cache(layers: usize) -> Vec<Box<dyn KvCache>> {
 #[test]
 fn generate_step_greedy_deterministic_sequence() {
   let model = MockModel::ramp(5);
-  let cfg = GenConfig {
-    max_tokens: 4,
-    eos: vec![], // never stop on eos
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default().with_max_tokens(4);
   let prompt = [1u32, 2, 3];
   let toks: Vec<u32> = generate_step(&model, &prompt, cache(2), cfg)
     .map(|r| r.unwrap().token)
@@ -224,11 +220,7 @@ fn generate_step_greedy_deterministic_sequence() {
 #[test]
 fn generate_step_stops_at_max_tokens_length() {
   let model = MockModel::ramp(5);
-  let cfg = GenConfig {
-    max_tokens: 3,
-    eos: vec![],
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default().with_max_tokens(3);
   let n = generate_step(&model, &[1u32], cache(1), cfg).count();
   assert_eq!(n, 3);
 }
@@ -240,11 +232,9 @@ fn generate_step_stops_at_max_tokens_length() {
 #[test]
 fn generate_step_stops_on_eos_token() {
   let model = MockModel::ramp(5); // argmax == 4
-  let cfg = GenConfig {
-    max_tokens: 100,
-    eos: vec![4],
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default()
+    .with_max_tokens(100)
+    .with_eos(vec![4u32]);
   let toks: Vec<u32> = generate_step(&model, &[1u32, 2], cache(1), cfg)
     .map(|r| r.unwrap().token)
     .collect();
@@ -257,13 +247,10 @@ fn generate_step_stops_on_eos_token() {
 #[test]
 fn generate_step_yields_logprobs_normalized() {
   let model = MockModel::with_bias(vec![0.0, 0.0, 10.0]); // argmax == 2
-  let cfg = GenConfig {
-    max_tokens: 1,
-    eos: vec![],
-    // L3: logprobs are opt-in; request them so the squeeze + per-step
-    // `Some(Array)` yield is enabled.
-    collect_logprobs: true,
-    ..GenConfig::default()
+  let cfg = {
+    let mut _c = GenConfig::default().with_max_tokens(1);
+    _c.collect_logprobs = true;
+    _c
   };
   let GenStep {
     token: tok,
@@ -291,12 +278,9 @@ fn generate_step_yields_logprobs_normalized() {
 #[test]
 fn generate_step_prefill_chunks_by_prefill_step_size() {
   let model = MockModel::ramp(5);
-  let cfg = GenConfig {
-    max_tokens: 2,
-    prefill_step_size: 2, // force multi-chunk prefill of a 5-token prompt
-    eos: vec![],
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default()
+    .with_max_tokens(2)
+    .with_prefill_step_size(2);
   let prompt = [1u32, 2, 3, 4, 1];
   let toks: Vec<u32> = generate_step(&model, &prompt, cache(1), cfg)
     .map(|r| r.unwrap().token)
@@ -321,12 +305,9 @@ fn generate_step_prefill_chunk_boundaries_are_exact() {
   // `_step` forwards the length-1 tail `prompt[5..6]`. So prefill windows
   // == [2, 2, 1], then 3 decode steps each window length 1.
   let model = RecordingModel::ramp(5);
-  let cfg = GenConfig {
-    max_tokens: 3,
-    prefill_step_size: 2,
-    eos: vec![],
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default()
+    .with_max_tokens(3)
+    .with_prefill_step_size(2);
   let prompt = [1u32, 2, 3, 4, 1, 2]; // P = 6
   let toks: Vec<u32> = generate_step(&model, &prompt, cache(1), cfg)
     .map(|r| r.unwrap().token)
@@ -349,12 +330,9 @@ fn generate_step_prefill_chunk_boundaries_are_exact() {
   // (n=min(3,3)=3), then `7-6=1` not `> 1` ⇒ exit; first `_step` forwards
   // the length-1 tail. Prefill == [3, 3], then 2 decode steps length 1.
   let model_b = RecordingModel::ramp(5);
-  let cfg_b = GenConfig {
-    max_tokens: 2,
-    prefill_step_size: 3,
-    eos: vec![],
-    ..GenConfig::default()
-  };
+  let cfg_b = GenConfig::default()
+    .with_max_tokens(2)
+    .with_prefill_step_size(3);
   let prompt_b = [1u32, 2, 3, 4, 1, 2, 3]; // P = 7
   let _: Vec<u32> = generate_step(&model_b, &prompt_b, cache(1), cfg_b)
     .map(|r| r.unwrap().token)
@@ -372,12 +350,9 @@ fn generate_step_prefill_chunk_boundaries_are_exact() {
   // forwards the length-1 tail `prompt[2..3]`. So prefill == [2], tail
   // step length 1.
   let model_c = RecordingModel::ramp(5);
-  let cfg_c = GenConfig {
-    max_tokens: 1,
-    prefill_step_size: 8, // larger than the prompt
-    eos: vec![],
-    ..GenConfig::default()
-  };
+  let cfg_c = GenConfig::default()
+    .with_max_tokens(1)
+    .with_prefill_step_size(8);
   let prompt_c = [1u32, 2, 3]; // P = 3
   let _: Vec<u32> = generate_step(&model_c, &prompt_c, cache(1), cfg_c)
     .map(|r| r.unwrap().token)
@@ -399,11 +374,7 @@ fn generate_step_prefill_chunk_boundaries_are_exact() {
 fn generate_step_zero_length_logits_axis_is_recoverable_err() {
   for zero_seq in [true, false] {
     let model = ZeroAxisModel { zero_seq };
-    let cfg = GenConfig {
-      max_tokens: 8,
-      eos: vec![],
-      ..GenConfig::default()
-    };
+    let cfg = GenConfig::default().with_max_tokens(8);
     let mut it = generate_step(&model, &[1u32, 2], cache(1), cfg);
     let first = it.next().expect("an item is produced (no panic/underflow)");
     match first {
@@ -425,11 +396,7 @@ fn generate_step_zero_length_logits_axis_is_recoverable_err() {
 #[test]
 fn generate_step_forward_error_yields_err_then_ends() {
   let model = FailModel;
-  let cfg = GenConfig {
-    max_tokens: 8,
-    eos: vec![],
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default().with_max_tokens(8);
   let mut it = generate_step(&model, &[1u32, 2], cache(1), cfg);
   let first = it.next().expect("an item is produced");
   assert!(first.is_err(), "the forward error is yielded as Err");
@@ -440,11 +407,7 @@ fn generate_step_forward_error_yields_err_then_ends() {
 #[test]
 fn generate_step_zero_max_tokens_is_empty() {
   let model = MockModel::ramp(3);
-  let cfg = GenConfig {
-    max_tokens: 0,
-    eos: vec![],
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default().with_max_tokens(0);
   assert_eq!(generate_step(&model, &[1u32], cache(1), cfg).count(), 0);
 }
 
@@ -626,12 +589,11 @@ fn stochastic_sampler_independent_runs_and_seed_reproducible() {
   // Uniform logits ⇒ the categorical draw exercises the RNG every step.
   let model = MockModel::with_bias(vec![0.0; 8]);
   let run = |seed: u64| -> Vec<u32> {
-    let cfg = GenConfig {
-      max_tokens: 24,
-      temp: 1.0, // stochastic chain (not argmax)
-      eos: vec![],
-      seed: Some(seed),
-      ..GenConfig::default()
+    let cfg = {
+      let mut _c = GenConfig::default().with_max_tokens(24);
+      _c.temp = 1.0;
+      _c.seed = Some(seed);
+      _c
     };
     generate_step(&model, &[1u32], cache(1), cfg)
       .map(|r| r.unwrap().token)
@@ -704,12 +666,10 @@ fn make_logits_processors_propagates_sample_rs_errors() {
 #[test]
 fn generate_step_applies_processors_before_logsumexp_before_sampler() {
   let model = MockModel::with_bias(vec![0.0, 0.0, 1.0]); // raw argmax == 2
-  let cfg = GenConfig {
-    max_tokens: 1,
-    eos: vec![],
-    logit_bias: vec![(0, 100.0)], // post-processor argmax == 0
-    ..GenConfig::default()
-  };
+  // post-processor logit_bias == +100 on index 0 ⇒ steered argmax from 2 → 0.
+  let cfg = GenConfig::default()
+    .with_max_tokens(1)
+    .with_logit_bias(vec![(0i32, 100.0f32)]);
   let step = generate_step(&model, &[1u32], cache(1), cfg)
     .next()
     .unwrap()
@@ -733,18 +693,16 @@ fn stream_generate_text_assembly_and_counts_length() {
   let tok = tokenizer("stream_len");
   // argmax == 4 ("world"); never an eos (eos id is 2 = "</s>").
   let model = MockModel::ramp(5);
-  let cfg = GenConfig {
-    max_tokens: 3,
-    eos: tok.eos_token_ids_iter().collect(),
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default()
+    .with_max_tokens(3)
+    .with_eos(tok.eos_token_ids_iter().collect::<Vec<_>>());
   let prompt = [3u32]; // "hello"
   let responses: Vec<_> = stream_generate(&model, &tok, &prompt, cache(1), cfg)
     .map(|r| r.unwrap())
     .collect();
   assert!(!responses.is_empty());
   let last = responses.last().unwrap();
-  assert_eq!(last.finish_reason.as_deref(), Some("length"));
+  assert_eq!(last.finish_reason, Some(FinishReason::Length));
   assert_eq!(last.prompt_tokens, 1);
   assert_eq!(last.generation_tokens, 3);
   let full: String = responses.iter().map(|r| r.text.as_str()).collect();
@@ -764,16 +722,14 @@ fn stream_generate_stop_finish_reason_on_eos() {
   let tok = tokenizer("stream_stop");
   // Force argmax == 2 == "</s>" (the eos id).
   let model = MockModel::with_bias(vec![0.0, 0.0, 10.0, 0.0, 0.0]);
-  let cfg = GenConfig {
-    max_tokens: 50,
-    eos: tok.eos_token_ids_iter().collect(),
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default()
+    .with_max_tokens(50)
+    .with_eos(tok.eos_token_ids_iter().collect::<Vec<_>>());
   let responses: Vec<_> = stream_generate(&model, &tok, &[3u32], cache(1), cfg)
     .map(|r| r.unwrap())
     .collect();
   let last = responses.last().unwrap();
-  assert_eq!(last.finish_reason.as_deref(), Some("stop"));
+  assert_eq!(last.finish_reason, Some(FinishReason::Eos));
   // The eos token never reaches the detokenizer, so no "</s>" text.
   let full: String = responses.iter().map(|r| r.text.as_str()).collect();
   assert!(
@@ -789,11 +745,9 @@ fn stream_generate_stop_finish_reason_on_eos() {
 fn generate_collects_to_string() {
   let tok = tokenizer("gen_str");
   let model = MockModel::ramp(5); // argmax == 4 == "world"
-  let cfg = GenConfig {
-    max_tokens: 2,
-    eos: tok.eos_token_ids_iter().collect(),
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default()
+    .with_max_tokens(2)
+    .with_eos(tok.eos_token_ids_iter().collect::<Vec<_>>());
   let (out, stats) = generate(&model, &tok, &[3u32], cache(1), cfg).unwrap();
   assert!(out.contains("world"), "collected text, got {out:?}");
   assert_eq!(stats.prompt_tokens, 1);
@@ -807,11 +761,7 @@ fn generate_collects_to_string() {
 fn stream_generate_propagates_forward_error() {
   let tok = tokenizer("stream_err");
   let model = FailModel;
-  let cfg = GenConfig {
-    max_tokens: 8,
-    eos: vec![],
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default().with_max_tokens(8);
   let mut it = stream_generate(&model, &tok, &[3u32], cache(1), cfg);
   let first = it.next().expect("an item");
   assert!(
@@ -833,13 +783,10 @@ fn stream_generate_propagates_forward_error() {
 #[test]
 fn gen_step_token_field_matches_prior_tuple_zero() {
   let model = MockModel::ramp(5);
-  let cfg = GenConfig {
-    max_tokens: 1,
-    eos: vec![],
-    // Request logprobs so the prior `.1 == [V] Array` contract is
-    // preserved verbatim under the L3 opt-in.
-    collect_logprobs: true,
-    ..GenConfig::default()
+  let cfg = {
+    let mut _c = GenConfig::default().with_max_tokens(1);
+    _c.collect_logprobs = true;
+    _c
   };
   let step = generate_step(&model, &[1u32], cache(1), cfg)
     .next()
@@ -870,11 +817,7 @@ fn gen_step_is_debug() {
   // a fallible path) is caught — but DON'T assert on the resulting
   // string contents (format is rustc-version-dependent).
   let model = MockModel::ramp(3);
-  let cfg = GenConfig {
-    max_tokens: 1,
-    eos: vec![],
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default().with_max_tokens(1);
   let step = generate_step(&model, &[1u32], cache(1), cfg)
     .next()
     .unwrap()
@@ -889,11 +832,10 @@ fn gen_step_is_debug() {
 #[test]
 fn gen_step_into_tuple_roundtrip() {
   let model = MockModel::ramp(5);
-  let cfg = GenConfig {
-    max_tokens: 1,
-    eos: vec![],
-    collect_logprobs: true,
-    ..GenConfig::default()
+  let cfg = {
+    let mut _c = GenConfig::default().with_max_tokens(1);
+    _c.collect_logprobs = true;
+    _c
   };
   let step = generate_step(&model, &[1u32], cache(1), cfg)
     .next()
@@ -934,11 +876,7 @@ fn gen_step_into_tuple_roundtrip() {
 #[test]
 fn generate_step_default_skips_logprobs() {
   let model = MockModel::ramp(5);
-  let cfg = GenConfig {
-    max_tokens: 3,
-    eos: vec![],
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default().with_max_tokens(3);
   // Sanity: the default knob is `false`.
   assert!(
     !GenConfig::default().collect_logprobs,
@@ -974,11 +912,10 @@ fn generate_step_logprob_matches_log_softmax() {
   // token 2 ⇒ its logprob is `log_softmax([1, 2, 5])[2]`.
   let bias = [1.0_f32, 2.0, 5.0];
   let model = MockModel::with_bias(bias.to_vec());
-  let cfg = GenConfig {
-    max_tokens: 1,
-    eos: vec![],
-    collect_logprobs: true, // L3 opt-in
-    ..GenConfig::default()
+  let cfg = {
+    let mut _c = GenConfig::default().with_max_tokens(1);
+    _c.collect_logprobs = true;
+    _c
   };
   let step = generate_step(&model, &[1u32], cache(1), cfg)
     .next()
@@ -1026,11 +963,9 @@ fn generate_step_logprob_matches_log_softmax() {
 fn generate_returns_generation_stats() {
   let tok = tokenizer("gen_stats");
   let model = MockModel::ramp(5);
-  let cfg = GenConfig {
-    max_tokens: 3,
-    eos: tok.eos_token_ids_iter().collect(),
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default()
+    .with_max_tokens(3)
+    .with_eos(tok.eos_token_ids_iter().collect::<Vec<_>>());
   let prompt = [3u32, 5u32]; // arbitrary 2-token prompt
   let (_text, stats): (String, GenerationStats) =
     generate(&model, &tok, &prompt, cache(1), cfg).unwrap();
@@ -1062,11 +997,7 @@ fn generate_returns_generation_stats() {
 fn stream_generate_peak_memory_is_monotonic() {
   let tok = tokenizer("stream_peak");
   let model = MockModel::ramp(5);
-  let cfg = GenConfig {
-    max_tokens: 4,
-    eos: vec![],
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default().with_max_tokens(4);
   let responses: Vec<_> = stream_generate(&model, &tok, &[3u32], cache(1), cfg)
     .map(|r| r.unwrap())
     .collect();
@@ -1125,11 +1056,10 @@ fn generate_step_default_skips_logprobs_node() {
   // `to_vec` (which evaluates the lazy graph) so the logsumexp + subtract
   // nodes are actually computed, not just built.
   let model_a = MockModel::with_bias(bias.to_vec());
-  let cfg_a = GenConfig {
-    max_tokens,
-    eos: vec![],
-    collect_logprobs: true,
-    ..GenConfig::default()
+  let cfg_a = {
+    let mut _c = GenConfig::default().with_max_tokens(max_tokens);
+    _c.collect_logprobs = true;
+    _c
   };
   let mut tokens_a: Vec<u32> = Vec::new();
   for step in generate_step(&model_a, &prompt, cache(1), cfg_a) {
@@ -1145,12 +1075,7 @@ fn generate_step_default_skips_logprobs_node() {
   // is skipped, every step yields `None` — the functional signal that the
   // logsumexp node (the only producer of Some(logprobs)) was never built.
   let model_b = MockModel::with_bias(bias.to_vec());
-  let cfg_b = GenConfig {
-    max_tokens,
-    eos: vec![],
-    // collect_logprobs: false (default)
-    ..GenConfig::default()
-  };
+  let cfg_b = GenConfig::default().with_max_tokens(max_tokens);
   let mut tokens_b: Vec<u32> = Vec::new();
   for step in generate_step(&model_b, &prompt, cache(1), cfg_b) {
     let s = step.unwrap();
@@ -1194,29 +1119,27 @@ fn generate_step_top_p_forces_normalization_even_when_off() {
   // Seed the stochastic sampler so the two runs draw the SAME PRNG
   // stream — any token divergence would then be a normalization bug, not
   // PRNG drift.
-  let cfg_a = GenConfig {
-    max_tokens: 4,
-    eos: vec![],
-    temp: 0.1,  // small temp → very concentrated draw
-    top_p: 0.9, // forces the normalization gate
-    seed: Some(42),
-    collect_logprobs: true,
-    ..GenConfig::default()
+  let cfg_a = {
+    let mut _c = GenConfig::default().with_max_tokens(4);
+    _c.temp = 0.1; // small temp → very concentrated draw
+    _c.top_p = 0.9; // forces the normalization gate
+    _c.seed = Some(42);
+    _c.collect_logprobs = true;
+    _c
   };
   let steps_a: Vec<u32> = generate_step(&model_a, &[1u32], cache(1), cfg_a)
     .map(|r| r.unwrap().token)
     .collect();
 
   let model_b = MockModel::with_bias(bias.to_vec());
-  let cfg_b = GenConfig {
-    max_tokens: 4,
-    eos: vec![],
-    temp: 0.1,
-    top_p: 0.9,
-    seed: Some(42),
+  let cfg_b = {
+    let mut _c = GenConfig::default().with_max_tokens(4);
+    _c.temp = 0.1;
+    _c.top_p = 0.9;
+    _c.seed = Some(42);
     // collect_logprobs: false (default) — the gate must STILL run the
     // normalization because top_p is enabled.
-    ..GenConfig::default()
+    _c
   };
   let steps_b: Vec<u32> = generate_step(&model_b, &[1u32], cache(1), cfg_b)
     .map(|r| r.unwrap().token)
@@ -1255,25 +1178,23 @@ fn generate_step_opt_out_max_shift_stable_with_large_bias() {
   let bias = vec![50.0_f32, 0.1, 0.0, -0.1, 0.2];
   let prompt = [1u32];
   let max_tokens = 4;
-  let cfg_base = || GenConfig {
-    max_tokens,
-    eos: vec![],
-    temp: 0.1,
-    seed: Some(42),
-    // logit_bias adds another +50 on entry 0 ON TOP of the per-vocab bias
-    // — drives the scaled-by-1/temp value well past any f16/bf16 finite
-    // range. The fix's max-shift caps it back to 0.
-    logit_bias: vec![(0, 50.0)],
-    ..GenConfig::default()
+  let cfg_base = || {
+    let mut _c = GenConfig::default()
+      .with_max_tokens(max_tokens)
+      .with_logit_bias(vec![(0, 50.0)]);
+    _c.temp = 0.1;
+    _c.seed = Some(42);
+    _c
   };
 
   // Run A: full normalization (collect_logprobs=true ⇒ logsumexp +
   // subtract). The reference token stream — the sampler reads true
   // log-probs, no overflow risk.
   let model_a = MockModel::with_bias(bias.clone());
-  let cfg_a = GenConfig {
-    collect_logprobs: true,
-    ..cfg_base()
+  let cfg_a = {
+    let mut _c = cfg_base();
+    _c.collect_logprobs = true;
+    _c
   };
   let tokens_a: Vec<u32> = generate_step(&model_a, &prompt, cache(1), cfg_a)
     .map(|r| r.unwrap().token)
@@ -1317,12 +1238,11 @@ fn generate_step_opt_out_greedy_zero_temp() {
 
   // Run A: opt-in (full normalization).
   let model_a = MockModel::with_bias(bias.clone());
-  let cfg_a = GenConfig {
-    max_tokens,
-    eos: vec![],
-    temp: 0.0, // greedy
-    collect_logprobs: true,
-    ..GenConfig::default()
+  let cfg_a = {
+    let mut _c = GenConfig::default().with_max_tokens(max_tokens);
+    _c.temp = 0.0;
+    _c.collect_logprobs = true;
+    _c
   };
   let tokens_a: Vec<u32> = generate_step(&model_a, &prompt, cache(1), cfg_a)
     .map(|r| r.unwrap().token)
@@ -1332,12 +1252,10 @@ fn generate_step_opt_out_greedy_zero_temp() {
   // `(false, false)` arm of the 3-way match: raw logits straight to
   // argmax).
   let model_b = MockModel::with_bias(bias);
-  let cfg_b = GenConfig {
-    max_tokens,
-    eos: vec![],
-    temp: 0.0, // greedy ⇒ argmax_sample, shift-invariant numerically
-    // collect_logprobs: false (default)
-    ..GenConfig::default()
+  let cfg_b = {
+    let mut _c = GenConfig::default().with_max_tokens(max_tokens);
+    _c.temp = 0.0;
+    _c
   };
   let tokens_b: Vec<u32> = generate_step(&model_b, &prompt, cache(1), cfg_b)
     .map(|r| r.unwrap().token)
@@ -1359,11 +1277,9 @@ fn generate_step_opt_out_greedy_zero_temp() {
 fn generate_zero_max_tokens_stats() {
   let tok = tokenizer("gen_zero");
   let model = MockModel::ramp(5);
-  let cfg = GenConfig {
-    max_tokens: 0,
-    eos: tok.eos_token_ids_iter().collect(),
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default()
+    .with_max_tokens(0)
+    .with_eos(tok.eos_token_ids_iter().collect::<Vec<_>>());
   let (text, stats) = generate(&model, &tok, &[3u32, 5], cache(1), cfg).unwrap();
   assert_eq!(text, "", "no tokens produced ⇒ empty output");
   assert_eq!(stats.prompt_tokens, 2);
@@ -1439,37 +1355,19 @@ fn p1_logits_processor_typed_variants() {
   .unwrap();
   assert_eq!(procs.len(), 4, "bias + rep + presence + frequency");
   assert!(
-    matches!(procs[0], LogitsProcessor::LogitBias { .. }),
+    matches!(procs[0], LogitsProcessor::LogitBias(_)),
     "first is LogitBias"
   );
   assert!(
-    matches!(
-      procs[1],
-      LogitsProcessor::RepetitionPenalty {
-        penalty: _,
-        context_size: 16
-      }
-    ),
+    matches!(&procs[1], LogitsProcessor::RepetitionPenalty(p) if p.context_size() == 16),
     "second is RepetitionPenalty with the rep-specific context size"
   );
   assert!(
-    matches!(
-      procs[2],
-      LogitsProcessor::PresencePenalty {
-        penalty: _,
-        context_size: 8
-      }
-    ),
+    matches!(&procs[2], LogitsProcessor::PresencePenalty(p) if p.context_size() == 8),
     "third is PresencePenalty with the presence-specific context size"
   );
   assert!(
-    matches!(
-      procs[3],
-      LogitsProcessor::FrequencyPenalty {
-        penalty: _,
-        context_size: 4
-      }
-    ),
+    matches!(&procs[3], LogitsProcessor::FrequencyPenalty(p) if p.context_size() == 4),
     "fourth is FrequencyPenalty with the frequency-specific context size"
   );
 }
@@ -1502,11 +1400,9 @@ fn p1_logits_processor_custom_escape_hatch() {
 fn p1_generate_step_returns_impl_iterator() {
   let tok = tokenizer("p1_impl_iter");
   let model = MockModel::ramp(8);
-  let cfg = GenConfig {
-    max_tokens: 3,
-    eos: tok.eos_token_ids_iter().collect(),
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default()
+    .with_max_tokens(3)
+    .with_eos(tok.eos_token_ids_iter().collect::<Vec<_>>());
   // `let it: impl Iterator<…>` is not nameable directly in let bindings,
   // but the IteratorExt methods (`take`, `count`) prove the return type
   // implements `Iterator` through the public surface. Concretely: this
@@ -1533,11 +1429,9 @@ fn p1_generate_step_returns_impl_iterator() {
 fn p1_generate_step_chains_iterator_methods() {
   let tok = tokenizer("p1_chain");
   let model = MockModel::ramp(8);
-  let cfg = GenConfig {
-    max_tokens: 5,
-    eos: tok.eos_token_ids_iter().collect(),
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default()
+    .with_max_tokens(5)
+    .with_eos(tok.eos_token_ids_iter().collect::<Vec<_>>());
   // map + filter + take + count all require Iterator — proves the
   // public surface is the iterator trait, not a concrete type.
   let n = generate_step(&model, &[1u32, 2], cache(1), cfg)
@@ -1558,11 +1452,7 @@ fn p1_generate_step_chains_iterator_methods() {
 #[test]
 fn gen_step_step_index_is_zero_based_monotonic() {
   let model = MockModel::ramp(5);
-  let cfg = GenConfig {
-    max_tokens: 4,
-    eos: vec![],
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default().with_max_tokens(4);
   let steps: Vec<GenStep> = generate_step(&model, &[1u32], cache(1), cfg)
     .map(|r| r.unwrap())
     .collect();
@@ -1585,11 +1475,7 @@ fn gen_step_step_index_is_zero_based_monotonic() {
 fn gen_step_finish_reason_stop_on_eos_step() {
   let model = MockModel::ramp(5);
   // EOS = 4 (the ramp's argmax) ⇒ the very first step yields EOS.
-  let cfg = GenConfig {
-    max_tokens: 8,
-    eos: vec![4],
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default().with_max_tokens(8).with_eos(vec![4u32]);
   let steps: Vec<GenStep> = generate_step(&model, &[1u32], cache(1), cfg)
     .map(|r| r.unwrap())
     .collect();
@@ -1598,9 +1484,9 @@ fn gen_step_finish_reason_stop_on_eos_step() {
   let s = &steps[0];
   assert_eq!(s.token, 4);
   assert_eq!(
-    s.finish_reason.as_deref(),
-    Some("stop"),
-    "EOS-token step carries `Some(\"stop\")`"
+    s.finish_reason,
+    Some(FinishReason::Eos),
+    "EOS-token step carries `Some(FinishReason::Eos)`"
   );
 }
 
@@ -1611,11 +1497,7 @@ fn gen_step_finish_reason_stop_on_eos_step() {
 #[test]
 fn gen_step_finish_reason_none_on_max_tokens_path() {
   let model = MockModel::ramp(5);
-  let cfg = GenConfig {
-    max_tokens: 3,
-    eos: vec![], // no EOS ⇒ run is terminated by max_tokens
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default().with_max_tokens(3);
   let steps: Vec<GenStep> = generate_step(&model, &[1u32], cache(1), cfg)
     .map(|r| r.unwrap())
     .collect();
@@ -1639,15 +1521,11 @@ fn gen_step_fields_uniform_across_lm_vlm_stt() {
   // struct, so `step_index` and `finish_reason` are accessible from every
   // surface. This catches a regression where one of the three producers
   // (LM / VLM / STT) silently drops a field in a manual constructor.
-  fn must_have_fields(s: &GenStep) -> (usize, Option<&str>) {
-    (s.step_index, s.finish_reason.as_deref())
+  fn must_have_fields(s: &GenStep) -> (usize, Option<&FinishReason>) {
+    (s.step_index, s.finish_reason.as_ref())
   }
   let model = MockModel::ramp(3);
-  let cfg = GenConfig {
-    max_tokens: 1,
-    eos: vec![],
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default().with_max_tokens(1);
   let step = generate_step(&model, &[1u32], cache(1), cfg)
     .next()
     .unwrap()
@@ -1675,9 +1553,10 @@ fn gen_config_validate_default_ok() {
 /// `validate` collapses the window to config-build time.
 #[test]
 fn gen_config_validate_rejects_negative_temp() {
-  let cfg = GenConfig {
-    temp: -1.0,
-    ..GenConfig::default()
+  let cfg = {
+    let mut _c = GenConfig::default();
+    _c.temp = -1.0;
+    _c
   };
   let err = cfg.validate().expect_err("negative temp must be rejected");
   let msg = format!("{err:?}");
@@ -1691,10 +1570,11 @@ fn gen_config_validate_rejects_negative_temp() {
 /// bound).
 #[test]
 fn gen_config_validate_rejects_min_p_over_one() {
-  let cfg = GenConfig {
-    temp: 0.7,
-    min_p: 1.5,
-    ..GenConfig::default()
+  let cfg = {
+    let mut _c = GenConfig::default();
+    _c.temp = 0.7;
+    _c.min_p = 1.5;
+    _c
   };
   let err = cfg.validate().expect_err("min_p > 1 must be rejected");
   let msg = format!("{err:?}");
@@ -1706,10 +1586,11 @@ fn gen_config_validate_rejects_min_p_over_one() {
 /// calls out as previously deferred to first-decode-step.
 #[test]
 fn gen_config_validate_rejects_xtc_probability_out_of_range() {
-  let cfg = GenConfig {
-    temp: 0.7,
-    xtc_probability: 1.5,
-    ..GenConfig::default()
+  let cfg = {
+    let mut _c = GenConfig::default();
+    _c.temp = 0.7;
+    _c.xtc_probability = 1.5;
+    _c
   };
   let err = cfg
     .validate()
@@ -1725,9 +1606,10 @@ fn gen_config_validate_rejects_xtc_probability_out_of_range() {
 /// `apply_repetition_penalty` + mlx-lm `make_repetition_penalty`).
 #[test]
 fn gen_config_validate_rejects_negative_repetition_penalty() {
-  let cfg = GenConfig {
-    repetition_penalty: Some(-0.5),
-    ..GenConfig::default()
+  let cfg = {
+    let mut _c = GenConfig::default();
+    _c.repetition_penalty = Some(-0.5);
+    _c
   };
   let err = cfg
     .validate()
@@ -1744,10 +1626,7 @@ fn gen_config_validate_rejects_negative_repetition_penalty() {
 /// matches the issue's "fail-fast on invalid config" goal.
 #[test]
 fn gen_config_validate_rejects_nan_logit_bias() {
-  let cfg = GenConfig {
-    logit_bias: vec![(0, 1.0), (1, f32::NAN)],
-    ..GenConfig::default()
-  };
+  let cfg = GenConfig::default().with_logit_bias(vec![(0, 1.0), (1, f32::NAN)]);
   let err = cfg
     .validate()
     .expect_err("NaN logit_bias value must be rejected");
@@ -1763,9 +1642,10 @@ fn gen_config_validate_rejects_nan_logit_bias() {
 /// must be a positive integer to be type-faithful).
 #[test]
 fn gen_config_validate_rejects_zero_min_tokens_to_keep() {
-  let cfg = GenConfig {
-    min_tokens_to_keep: 0,
-    ..GenConfig::default()
+  let cfg = {
+    let mut _c = GenConfig::default();
+    _c.min_tokens_to_keep = 0;
+    _c
   };
   let err = cfg
     .validate()
@@ -1790,9 +1670,10 @@ fn generate_step_propagates_validate_err_before_forward() {
   // validation error instead, proving the eager gate fired BEFORE any
   // model call.
   let model = FailModel;
-  let cfg = GenConfig {
-    temp: -1.0, // invalid: validate must reject
-    ..GenConfig::default()
+  let cfg = {
+    let mut _c = GenConfig::default();
+    _c.temp = -1.0;
+    _c
   };
   let mut it = generate_step(&model, &[1u32], cache(1), cfg);
   let first = it.next().expect("iterator yields at least one item");

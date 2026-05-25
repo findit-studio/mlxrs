@@ -996,12 +996,12 @@ pub fn convert_to_gguf(args: &ConvertToGgufArgs) -> Result<()> {
   //       non-Llama tag is never silently emitted on a non-Llama
   //       checkpoint. The reference's `prepare_metadata` hard-codes the
   //       `llama.*` key prefix — see `SUPPORTED_MODEL_TYPES`.
-  if !SUPPORTED_MODEL_TYPES.contains(&config.model_type.as_str()) {
+  if !SUPPORTED_MODEL_TYPES.contains(&config.model_type()) {
     return Err(Error::Backend {
       message: format!(
         "convert_to_gguf: model_type {:?} is not supported by the LM-side GGUF \
          exporter (supported: {SUPPORTED_MODEL_TYPES:?})",
-        config.model_type,
+        config.model_type(),
       ),
     });
   }

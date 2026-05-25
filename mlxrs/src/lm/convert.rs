@@ -1278,7 +1278,7 @@ fn build_quantize_config(
   quant_block.insert("bits".to_string(), serde_json::Value::Number(bits.into()));
   quant_block.insert(
     "mode".to_string(),
-    serde_json::Value::String(mode.as_mlx_str().to_string()),
+    serde_json::Value::String(mode.as_str().to_string()),
   );
   for (path, opt) in &per_layer_overrides {
     match opt {
@@ -1294,7 +1294,7 @@ fn build_quantize_config(
         nested.insert("bits".to_string(), serde_json::Value::Number(q.bits.into()));
         nested.insert(
           "mode".to_string(),
-          serde_json::Value::String(q.mode.as_mlx_str().to_string()),
+          serde_json::Value::String(q.mode.as_str().to_string()),
         );
         quant_block.insert(path.clone(), serde_json::Value::Object(nested));
       }
@@ -1310,10 +1310,7 @@ fn build_quantize_config(
       message: format!("convert: cannot re-serialize patched config: {e}"),
     })?;
 
-  let live_cfg = PerLayerQuantization {
-    quantization: Some(global),
-    per_layer: per_layer_overrides,
-  };
+  let live_cfg = PerLayerQuantization::new(Some(global), per_layer_overrides);
   Ok((live_cfg, updated_text))
 }
 

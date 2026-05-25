@@ -162,6 +162,119 @@ pub type LogitsProcessorFn = Box<dyn Fn(&[u32], &Array) -> Result<Array>>;
 /// (extracted to satisfy `clippy::type_complexity` on the variant).
 pub type SamplerFn = Box<dyn FnMut(&Array) -> Result<Array>>;
 
+/// Payload for [`LogitsProcessor::LogitBias`].
+#[derive(Debug)]
+pub struct LogitBiasPayload {
+  indices: Vec<i32>,
+  values: Array,
+}
+
+impl LogitBiasPayload {
+  /// Construct a logit-bias payload from `(indices, values)` paired by position.
+  pub fn new(indices: Vec<i32>, values: Array) -> Self {
+    Self { indices, values }
+  }
+
+  /// The token-id columns to add bias to.
+  #[inline(always)]
+  pub fn indices_slice(&self) -> &[i32] {
+    &self.indices
+  }
+
+  /// The bias array (built once at construction).
+  #[inline(always)]
+  pub fn values_ref(&self) -> &Array {
+    &self.values
+  }
+}
+
+/// Payload for [`LogitsProcessor::RepetitionPenalty`].
+#[derive(Debug, Clone, Copy)]
+pub struct RepetitionPenaltyPayload {
+  penalty: f32,
+  context_size: usize,
+}
+
+impl RepetitionPenaltyPayload {
+  /// Construct a repetition-penalty payload.
+  pub const fn new(penalty: f32, context_size: usize) -> Self {
+    Self {
+      penalty,
+      context_size,
+    }
+  }
+
+  /// The penalty factor (mlx-lm `repetition_penalty`).
+  #[inline(always)]
+  pub const fn penalty(&self) -> f32 {
+    self.penalty
+  }
+
+  /// Window size (mlx-lm `repetition_context_size`).
+  #[inline(always)]
+  pub const fn context_size(&self) -> usize {
+    self.context_size
+  }
+}
+
+/// Payload for [`LogitsProcessor::PresencePenalty`].
+#[derive(Debug, Clone, Copy)]
+pub struct PresencePenaltyPayload {
+  penalty: f32,
+  context_size: usize,
+}
+
+impl PresencePenaltyPayload {
+  /// Construct a presence-penalty payload.
+  pub const fn new(penalty: f32, context_size: usize) -> Self {
+    Self {
+      penalty,
+      context_size,
+    }
+  }
+
+  /// The penalty value (mlx-lm `presence_penalty`).
+  #[inline(always)]
+  pub const fn penalty(&self) -> f32 {
+    self.penalty
+  }
+
+  /// Window size (mlx-lm `presence_context_size`).
+  #[inline(always)]
+  pub const fn context_size(&self) -> usize {
+    self.context_size
+  }
+}
+
+/// Payload for [`LogitsProcessor::FrequencyPenalty`].
+#[derive(Debug, Clone, Copy)]
+pub struct FrequencyPenaltyPayload {
+  penalty: f32,
+  context_size: usize,
+}
+
+impl FrequencyPenaltyPayload {
+  /// Construct a frequency-penalty payload.
+  pub const fn new(penalty: f32, context_size: usize) -> Self {
+    Self {
+      penalty,
+      context_size,
+    }
+  }
+
+  /// The penalty value (mlx-lm `frequency_penalty`).
+  #[inline(always)]
+  pub const fn penalty(&self) -> f32 {
+    self.penalty
+  }
+
+  /// Window size (mlx-lm `frequency_context_size`).
+  #[inline(always)]
+  pub const fn context_size(&self) -> usize {
+    self.context_size
+  }
+}
+
 /// A logits processor: maps `(recent token-id history, raw logits)` to
 /// processed logits, exactly mlx-lm's
 /// `Callable[[mx.array, mx.array], mx.array]` (`make_logits_processors`
@@ -181,39 +294,19 @@ pub type SamplerFn = Box<dyn FnMut(&Array) -> Result<Array>>;
 /// of the variant constructors below; out-of-tree processors (e.g. the
 /// grammar-constrained [`crate::lm::structured::LLGuidanceLogitsProcessor`])
 /// plug in through the [`LogitsProcessor::Custom`] escape hatch.
+#[non_exhaustive]
+#[derive(derive_more::IsVariant)]
 pub enum LogitsProcessor {
   /// Additive logit bias (mlx-lm's inline `logit_bias_processor`).
-  /// `(indices, values)` paired by position; built once at processor
-  /// construction.
-  LogitBias {
-    /// The token-id columns to add bias to (`indices[i]` ↔ `values[i]`).
-    indices: Vec<i32>,
-    /// The bias `[n]` `F32` array built once at construction.
-    values: Array,
-  },
+  LogitBias(LogitBiasPayload),
   /// Sign-aware multiplicative repetition penalty (mlx-lm's
   /// `make_repetition_penalty`). `context_size` is the per-penalty
   /// independent window (Python `repetition_context_size`).
-  RepetitionPenalty {
-    /// The penalty factor (mlx-lm `repetition_penalty`).
-    penalty: f32,
-    /// Window size (mlx-lm `repetition_context_size`).
-    context_size: usize,
-  },
+  RepetitionPenalty(RepetitionPenaltyPayload),
   /// OpenAI presence penalty (mlx-lm's `make_presence_penalty`).
-  PresencePenalty {
-    /// The penalty value (mlx-lm `presence_penalty`).
-    penalty: f32,
-    /// Window size (mlx-lm `presence_context_size`).
-    context_size: usize,
-  },
+  PresencePenalty(PresencePenaltyPayload),
   /// OpenAI frequency penalty (mlx-lm's `make_frequency_penalty`).
-  FrequencyPenalty {
-    /// The penalty value (mlx-lm `frequency_penalty`).
-    penalty: f32,
-    /// Window size (mlx-lm `frequency_context_size`).
-    context_size: usize,
-  },
+  FrequencyPenalty(FrequencyPenaltyPayload),
   /// Custom out-of-tree processor (escape hatch — e.g.
   /// [`crate::lm::structured::LLGuidanceLogitsProcessor`]). One
   /// indirection per call, but the standard mlx-lm chain inlines
@@ -228,27 +321,18 @@ impl LogitsProcessor {
   /// takes an indirection.
   pub fn apply(&self, tokens: &[u32], logits: &Array) -> Result<Array> {
     match self {
-      Self::LogitBias { indices, values } => sample::apply_logit_bias(logits, indices, values),
-      Self::RepetitionPenalty {
-        penalty,
-        context_size,
-      } => {
-        let ids = recent_ids(tokens, *context_size)?;
-        sample::apply_repetition_penalty(logits, &ids, *penalty)
+      Self::LogitBias(p) => sample::apply_logit_bias(logits, p.indices_slice(), p.values_ref()),
+      Self::RepetitionPenalty(p) => {
+        let ids = recent_ids(tokens, p.context_size())?;
+        sample::apply_repetition_penalty(logits, &ids, p.penalty())
       }
-      Self::PresencePenalty {
-        penalty,
-        context_size,
-      } => {
-        let ids = recent_ids(tokens, *context_size)?;
-        sample::apply_presence_penalty(logits, &ids, *penalty)
+      Self::PresencePenalty(p) => {
+        let ids = recent_ids(tokens, p.context_size())?;
+        sample::apply_presence_penalty(logits, &ids, p.penalty())
       }
-      Self::FrequencyPenalty {
-        penalty,
-        context_size,
-      } => {
-        let ids = recent_ids(tokens, *context_size)?;
-        sample::apply_frequency_penalty(logits, &ids, *penalty)
+      Self::FrequencyPenalty(p) => {
+        let ids = recent_ids(tokens, p.context_size())?;
+        sample::apply_frequency_penalty(logits, &ids, p.penalty())
       }
       Self::Custom(f) => f(tokens, logits),
     }
@@ -258,33 +342,24 @@ impl LogitsProcessor {
 impl std::fmt::Debug for LogitsProcessor {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
-      Self::LogitBias { indices, .. } => f
+      Self::LogitBias(p) => f
         .debug_struct("LogitBias")
-        .field("n", &indices.len())
+        .field("n", &p.indices_slice().len())
         .finish(),
-      Self::RepetitionPenalty {
-        penalty,
-        context_size,
-      } => f
+      Self::RepetitionPenalty(p) => f
         .debug_struct("RepetitionPenalty")
-        .field("penalty", penalty)
-        .field("context_size", context_size)
+        .field("penalty", &p.penalty())
+        .field("context_size", &p.context_size())
         .finish(),
-      Self::PresencePenalty {
-        penalty,
-        context_size,
-      } => f
+      Self::PresencePenalty(p) => f
         .debug_struct("PresencePenalty")
-        .field("penalty", penalty)
-        .field("context_size", context_size)
+        .field("penalty", &p.penalty())
+        .field("context_size", &p.context_size())
         .finish(),
-      Self::FrequencyPenalty {
-        penalty,
-        context_size,
-      } => f
+      Self::FrequencyPenalty(p) => f
         .debug_struct("FrequencyPenalty")
-        .field("penalty", penalty)
-        .field("context_size", context_size)
+        .field("penalty", &p.penalty())
+        .field("context_size", &p.context_size())
         .finish(),
       Self::Custom(_) => f.debug_tuple("Custom").finish(),
     }
@@ -512,12 +587,18 @@ pub struct GenConfig {
   /// XTC probability threshold.
   pub xtc_threshold: f32,
   /// Token ids XTC never masks.
-  pub xtc_special_tokens: Vec<i32>,
+  ///
+  /// Private: access via [`xtc_special_tokens_slice`](Self::xtc_special_tokens_slice);
+  /// set via [`with_xtc_special_tokens`](Self::with_xtc_special_tokens).
+  pub(crate) xtc_special_tokens: Vec<i32>,
 
   // --- logits-processor params (mlx-lm `make_logits_processors`) --------
   /// Additive logit bias as `(token_id, bias)` pairs (mlx-lm's
   /// `Dict[int, float]`). Applied first, before the penalties.
-  pub logit_bias: Vec<(i32, f32)>,
+  ///
+  /// Private: access via [`logit_bias_slice`](Self::logit_bias_slice);
+  /// set via [`with_logit_bias`](Self::with_logit_bias).
+  pub(crate) logit_bias: Vec<(i32, f32)>,
   /// Sign-aware multiplicative repetition penalty; the processor is added
   /// iff `Some(p)` with `p != 0`.
   pub repetition_penalty: Option<f32>,
@@ -541,7 +622,10 @@ pub struct GenConfig {
   /// The resolved stop-token id set (mlx-lm `tokenizer.eos_token_ids`).
   /// Generation ends (`finish_reason = "stop"`) once a sampled token is in
   /// this set.
-  pub eos: Vec<u32>,
+  ///
+  /// Private: access via [`eos_slice`](Self::eos_slice);
+  /// set via [`with_eos`](Self::with_eos).
+  pub(crate) eos: Vec<u32>,
 
   /// Multi-token / string stop sequences (mlx-lm's `stop_words` / the
   /// server's `stop` strings). Generation ends (`finish_reason = "stop"`)
@@ -551,7 +635,10 @@ pub struct GenConfig {
   /// the prior behavior. Only consulted by the text-level entry points
   /// ([`stream_generate`] / [`generate`]); [`generate_step`] is token-only,
   /// like mlx-lm.
-  pub stop_strings: Vec<String>,
+  ///
+  /// Private: access via [`stop_strings_slice`](Self::stop_strings_slice);
+  /// set via [`with_stop_strings`](Self::with_stop_strings).
+  pub(crate) stop_strings: Vec<String>,
 
   /// Stochastic-sampler RNG seed (mlx-lm's `mx.random.seed` analogue).
   /// `Some(s)` ⇒ a non-greedy run is reproducible; `None` ⇒ a fresh
@@ -612,6 +699,122 @@ impl Default for GenConfig {
 }
 
 impl GenConfig {
+  /// Construct a [`GenConfig`] with all defaults (same as [`Default::default`]).
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  // ── §1 encapsulated Vec accessors ──────────────────────────────────────
+
+  /// The XTC special-token ids (token ids XTC never masks).
+  #[inline(always)]
+  pub fn xtc_special_tokens_slice(&self) -> &[i32] {
+    &self.xtc_special_tokens
+  }
+
+  /// The logit-bias pairs (`(token_id, bias)` — mlx-lm `Dict[int, float]`).
+  #[inline(always)]
+  pub fn logit_bias_slice(&self) -> &[(i32, f32)] {
+    &self.logit_bias
+  }
+
+  /// The resolved stop-token id set.
+  #[inline(always)]
+  pub fn eos_slice(&self) -> &[u32] {
+    &self.eos
+  }
+
+  /// The string stop sequences.
+  #[inline(always)]
+  pub fn stop_strings_slice(&self) -> &[String] {
+    &self.stop_strings
+  }
+
+  // ── §1 with_* builders ─────────────────────────────────────────────────
+
+  /// Set `max_tokens` and return `self` (builder pattern). Equivalent to
+  /// `cfg.max_tokens = n; cfg` but chainable: use `GenConfig::default().with_max_tokens(n)`.
+  #[must_use]
+  pub fn with_max_tokens(mut self, n: usize) -> Self {
+    self.max_tokens = n;
+    self
+  }
+
+  /// Set `prefill_step_size` and return `self` (builder pattern).
+  #[must_use]
+  pub fn with_prefill_step_size(mut self, n: usize) -> Self {
+    self.prefill_step_size = n;
+    self
+  }
+
+  /// Set the XTC special-token ids and return `self` (builder pattern).
+  #[must_use]
+  pub fn with_xtc_special_tokens(mut self, tokens: impl Into<Vec<i32>>) -> Self {
+    self.xtc_special_tokens = tokens.into();
+    self
+  }
+
+  /// Set the logit-bias pairs and return `self` (builder pattern).
+  #[must_use]
+  pub fn with_logit_bias(mut self, bias: impl Into<Vec<(i32, f32)>>) -> Self {
+    self.logit_bias = bias.into();
+    self
+  }
+
+  /// Set the stop-token id set and return `self` (builder pattern).
+  #[must_use]
+  pub fn with_eos(mut self, eos: impl Into<Vec<u32>>) -> Self {
+    self.eos = eos.into();
+    self
+  }
+
+  /// Set the string stop sequences and return `self` (builder pattern).
+  #[must_use]
+  pub fn with_stop_strings(mut self, stops: impl Into<Vec<String>>) -> Self {
+    self.stop_strings = stops.into();
+    self
+  }
+
+  // In-place setters (per rust-type-conventions §3: plain non-optional
+  // fields get both `with_*` consuming AND `set_*` in-place returning
+  // `&mut Self` for chaining on an existing owned value).
+
+  /// Set the XTC special-token ids in place; chainable.
+  pub fn set_xtc_special_tokens(&mut self, tokens: impl Into<Vec<i32>>) -> &mut Self {
+    self.xtc_special_tokens = tokens.into();
+    self
+  }
+
+  /// Set the logit-bias pairs in place; chainable.
+  pub fn set_logit_bias(&mut self, bias: impl Into<Vec<(i32, f32)>>) -> &mut Self {
+    self.logit_bias = bias.into();
+    self
+  }
+
+  /// Set the stop-token id set in place; chainable.
+  pub fn set_eos(&mut self, eos: impl Into<Vec<u32>>) -> &mut Self {
+    self.eos = eos.into();
+    self
+  }
+
+  /// Set the string stop sequences in place; chainable.
+  pub fn set_stop_strings(&mut self, stops: impl Into<Vec<String>>) -> &mut Self {
+    self.stop_strings = stops.into();
+    self
+  }
+
+  /// Set the sampling `temp` and return `self` (builder pattern); useful
+  /// when the test or call-site needs to chain on top of
+  /// `GenConfig::default()`. `temp` is still a public field today, but
+  /// chaining keeps the surface symmetric with the privatized fields' builders
+  /// (also makes invalid-value rejection tests like `with_temp(-1.0)` read
+  /// uniformly across the call-site shape).
+  #[must_use]
+  pub fn with_temp(mut self, temp: f32) -> Self {
+    self.temp = temp;
+    self
+  }
+
   /// Eagerly validate every scalar sampler / logits-processor bound up
   /// front (AUDIO-12 polish #136) — `temp`, `top_p`, `min_p`,
   /// `min_tokens_to_keep`, `top_k`, `xtc_probability`, `xtc_threshold`,
@@ -948,7 +1151,9 @@ pub fn make_logits_processors(
     let mut values_vec: Vec<f32> = try_with_capacity(logit_bias.len())?;
     values_vec.extend(logit_bias.iter().map(|&(_, v)| v));
     let values = Array::from_slice::<f32>(&values_vec, &(values_vec.len(),))?;
-    processors.push(LogitsProcessor::LogitBias { indices, values });
+    processors.push(LogitsProcessor::LogitBias(LogitBiasPayload::new(
+      indices, values,
+    )));
   }
 
   // mlx-lm: `(make_repetition_penalty, repetition_penalty,
@@ -957,22 +1162,19 @@ pub fn make_logits_processors(
   // frequency_context_size)` — each appended iff `penalty is not None and
   // penalty != 0`, in this order, each capturing its OWN context size.
   if let Some(p) = repetition_penalty.filter(|&p| p != 0.0) {
-    processors.push(LogitsProcessor::RepetitionPenalty {
-      penalty: p,
-      context_size: repetition_context_size,
-    });
+    processors.push(LogitsProcessor::RepetitionPenalty(
+      RepetitionPenaltyPayload::new(p, repetition_context_size),
+    ));
   }
   if let Some(p) = presence_penalty.filter(|&p| p != 0.0) {
-    processors.push(LogitsProcessor::PresencePenalty {
-      penalty: p,
-      context_size: presence_context_size,
-    });
+    processors.push(LogitsProcessor::PresencePenalty(
+      PresencePenaltyPayload::new(p, presence_context_size),
+    ));
   }
   if let Some(p) = frequency_penalty.filter(|&p| p != 0.0) {
-    processors.push(LogitsProcessor::FrequencyPenalty {
-      penalty: p,
-      context_size: frequency_context_size,
-    });
+    processors.push(LogitsProcessor::FrequencyPenalty(
+      FrequencyPenaltyPayload::new(p, frequency_context_size),
+    ));
   }
 
   Ok(processors)
@@ -997,6 +1199,61 @@ fn recent_ids(tokens: &[u32], context_size: usize) -> Result<Vec<i32>> {
   let mut ids = try_with_capacity(tail.len())?;
   ids.extend(tail.iter().map(|&t| t as i32));
   Ok(ids)
+}
+
+/// Why generation stopped — the typed version of the `finish_reason` string
+/// (`"stop"` / `"length"` / stop-string) that mlx-lm / the OpenAI API
+/// surface carries.
+///
+/// Used on [`GenStep`], [`GenerationResponse`], and [`BatchGenStep`].
+#[derive(
+  Debug,
+  Clone,
+  PartialEq,
+  Eq,
+  derive_more::Display,
+  derive_more::IsVariant,
+  derive_more::Unwrap,
+  derive_more::TryUnwrap,
+)]
+#[display("{}", self.as_str())]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
+pub enum FinishReason {
+  /// A sampled token was in the eos set (mlx-lm `"stop"`).
+  Eos,
+  /// `max_tokens` was reached (mlx-lm `"length"`).
+  Length,
+  /// A string stop sequence matched (mlx-lm stop-words; the matched
+  /// string is carried).
+  Stop(String),
+}
+
+impl FinishReason {
+  /// The canonical finish-reason tag (mlx-lm / OpenAI `finish_reason`).
+  /// Both [`Self::Eos`] and [`Self::Stop`] map to `"stop"` — they share
+  /// the same external taxonomy; the difference (EOS token vs configured
+  /// stop string) lives internally. `"length"` for [`Self::Length`].
+  ///
+  /// For the matched stop sequence on [`Self::Stop`], use
+  /// [`Self::stop_sequence`].
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Eos | Self::Stop(_) => "stop",
+      Self::Length => "length",
+    }
+  }
+
+  /// The matched stop sequence string for [`Self::Stop`]; `None` for
+  /// [`Self::Eos`] and [`Self::Length`]. Use this when you need the
+  /// payload — `as_str()` and `Display` collapse `Stop(_)` to the
+  /// canonical tag `"stop"` per OpenAI's `finish_reason` contract.
+  pub fn stop_sequence(&self) -> Option<&str> {
+    match self {
+      Self::Stop(s) => Some(s.as_str()),
+      _ => None,
+    }
+  }
 }
 
 /// One decode step — the sampled `token` plus an **opt-in** `[V]`
@@ -1056,7 +1313,7 @@ fn recent_ids(tokens: &[u32], context_size: usize) -> Result<Vec<i32>> {
 ///   stable per-step identifier without re-counting via `enumerate()`.
 /// - `finish_reason: Option<String>` — `None` for ordinary steps,
 ///   `Some("stop")` on the EOS-token step (the final yielded item when a
-///   sampled token is in [`GenConfig::eos`]). Note that single-seq
+///   sampled token is in the eos set configured via [`GenConfig::with_eos`]). Note that single-seq
 ///   generation does NOT emit a `Some("length")` step — mlx-lm's
 ///   `if n == max_tokens: break` happens BEFORE the yield, so the
 ///   `max_tokens` finish is signalled by the iterator simply ending
@@ -1081,15 +1338,15 @@ pub struct GenStep {
   /// stable per-step identifier so callers don't have to wrap the
   /// iterator in `enumerate()` just to know which step they're on.
   pub step_index: usize,
-  /// `None` for ordinary steps; `Some("stop")` on the EOS-token step
-  /// (the final yielded item when a sampled token is in
-  /// [`GenConfig::eos`]). LM-3 polish #114 — mirrors the existing
+  /// `None` for ordinary steps; `Some(FinishReason::Eos)` on the EOS-token
+  /// step (the final yielded item when a sampled token is in the eos set
+  /// configured via [`GenConfig::with_eos`]). LM-3 polish #114 — mirrors the existing
   /// [`BatchGenStep::finish_reason`] field so single-seq + batch surfaces
-  /// share a step envelope. NOTE: `Some("length")` is NEVER emitted at
-  /// this layer (mlx-lm `generate_step` `break`s BEFORE the
+  /// share a step envelope. NOTE: `Some(FinishReason::Length)` is NEVER
+  /// emitted at this layer (mlx-lm `generate_step` `break`s BEFORE the
   /// `max_tokens`-th yield); the [`stream_generate`] wrapper computes
-  /// the `"length"` reason itself.
-  pub finish_reason: Option<String>,
+  /// the `Length` reason itself.
+  pub finish_reason: Option<FinishReason>,
 }
 
 impl From<GenStep> for (u32, Option<Array>) {
@@ -1449,7 +1706,7 @@ impl<M: Model + ?Sized> Iterator for Generator<'_, M> {
           // never set here — `if produced >= max_tokens` above returns
           // `None` BEFORE a step runs, mirroring mlx-lm `generate_step`'s
           // pre-yield break exactly.
-          step.finish_reason = Some("stop".to_string());
+          step.finish_reason = Some(FinishReason::Eos);
         }
         Some(Ok(step))
       }
@@ -1526,8 +1783,8 @@ fn last_position(logits: &Array) -> Result<Array> {
 /// sampled token id plus its `[V]` log-probability vector (the typed step
 /// item — see [`GenStep`]). The iterator prefills the prompt (chunked by
 /// [`GenConfig::prefill_step_size`]) on its first poll, then yields one
-/// token per step until a sampled token is in [`GenConfig::eos`] (the eos
-/// token is the final yielded item) or [`GenConfig::max_tokens`] tokens
+/// token per step until a sampled token is in the eos set (configured via
+/// [`GenConfig::with_eos`]; the eos token is the final yielded item) or [`GenConfig::max_tokens`] tokens
 /// have been produced. A step error is yielded once as `Err`, after which
 /// the iterator ends (spec §4 — no panic, no poison).
 ///
@@ -1735,9 +1992,9 @@ pub struct GenerationResponse {
   /// `mx.get_peak_memory()`). `None` if the FFI counter is unavailable —
   /// stream is unaffected.
   pub peak_memory_bytes: Option<u64>,
-  /// `None` while generating; `Some("stop")` on an eos token, `Some(
-  /// "length")` at `max_tokens` (mlx-lm `finish_reason`).
-  pub finish_reason: Option<String>,
+  /// `None` while generating; `Some(FinishReason::Eos)` on an eos token,
+  /// `Some(FinishReason::Length)` at `max_tokens` (mlx-lm `finish_reason`).
+  pub finish_reason: Option<FinishReason>,
 }
 
 /// Aggregate stats for one full [`generate`] run — the cumulative
@@ -1889,15 +2146,14 @@ pub fn stream_generate<'a, M: Model + ?Sized>(
       // until `finalize()` (e.g. the BPE detok holds a bare-space token),
       // so re-check the matcher against the now-finalized text before
       // emitting — a stop completed by the finalized tail still trims. The
-      // finish_reason is "stop" either way here (this is the eos token).
-      // Inert path: unchanged `last_segment()`.
-      let text = if matcher.is_active() {
-        // eos path: reason is "stop" regardless of the matcher, so pass
-        // "stop" as the default (a finalized-tail stop also reports "stop").
-        let (text, _) = finalize_active_tail(&detok, &matcher, &mut emitted_len, "stop");
-        text
+      // EOS token reached: typed FinishReason is Eos by default, but a
+      // detokenizer-withheld tail can complete a stop-string match in
+      // finalize_active_tail() — propagate that as Stop(matched) so the
+      // matched-sequence payload survives the terminal path.
+      let (text, reason) = if matcher.is_active() {
+        finalize_active_tail(&detok, &matcher, &mut emitted_len, FinishReason::Eos)
       } else {
-        detok.last_segment()
+        (detok.last_segment(), FinishReason::Eos)
       };
       return Some(Ok(GenerationResponse {
         text,
@@ -1908,7 +2164,7 @@ pub fn stream_generate<'a, M: Model + ?Sized>(
         generation_tokens: n + 1,
         generation_tps: gen_tps(n + 1),
         peak_memory_bytes: peak,
-        finish_reason: Some("stop".to_string()),
+        finish_reason: Some(reason),
       }));
     }
 
@@ -1924,10 +2180,11 @@ pub fn stream_generate<'a, M: Model + ?Sized>(
     if matcher.is_active() {
       let full = detok.text();
       match matcher.step(&full) {
-        crate::lm::stop::StopDecision::Stop { trimmed_len, .. } => {
+        crate::lm::stop::StopDecision::Stop(ref p) => {
           finished = true;
-          let end = trimmed_len.max(emitted_len).min(full.len());
+          let end = p.trimmed_len().max(emitted_len).min(full.len());
           let text = full[emitted_len..end].to_string();
+          let stop = p.stop().to_owned();
           emitted_len = end;
           drop(full);
           return Some(Ok(GenerationResponse {
@@ -1939,10 +2196,12 @@ pub fn stream_generate<'a, M: Model + ?Sized>(
             generation_tokens: n,
             generation_tps: gen_tps(n),
             peak_memory_bytes: peak,
-            finish_reason: Some("stop".to_string()),
+            // Stop-string match — typed FinishReason carries the matched
+            // sequence so callers can distinguish from an EOS-token finish.
+            finish_reason: Some(FinishReason::Stop(stop)),
           }));
         }
-        crate::lm::stop::StopDecision::Continue { safe_len } => {
+        crate::lm::stop::StopDecision::Continue(ref p) => {
           // mlx-lm: `if (n + 1) == max_tokens: break` ⇒ a final
           // `finish_reason="length"` response with the finalized tail. But a
           // detokenizer may withhold tail text from `text()` until
@@ -1953,7 +2212,8 @@ pub fn stream_generate<'a, M: Model + ?Sized>(
             finished = true;
             drop(full);
             detok.finalize();
-            let (text, reason) = finalize_active_tail(&detok, &matcher, &mut emitted_len, "length");
+            let (text, reason) =
+              finalize_active_tail(&detok, &matcher, &mut emitted_len, FinishReason::Length);
             return Some(Ok(GenerationResponse {
               text,
               token,
@@ -1963,9 +2223,10 @@ pub fn stream_generate<'a, M: Model + ?Sized>(
               generation_tokens: n,
               generation_tps: gen_tps(n),
               peak_memory_bytes: peak,
-              finish_reason: Some(reason.to_string()),
+              finish_reason: Some(reason),
             }));
           }
+          let safe_len = p.safe_len();
           let end = safe_len.max(emitted_len).min(full.len());
           let text = full[emitted_len..end].to_string();
           emitted_len = end;
@@ -2001,7 +2262,7 @@ pub fn stream_generate<'a, M: Model + ?Sized>(
         generation_tokens: n,
         generation_tps: gen_tps(n),
         peak_memory_bytes: peak,
-        finish_reason: Some("length".to_string()),
+        finish_reason: Some(FinishReason::Length),
       }));
     }
 
@@ -2042,17 +2303,19 @@ fn finalize_active_tail(
   detok: &dyn crate::tokenizer::StreamingDetokenizer,
   matcher: &crate::lm::stop::StopMatcher,
   emitted_len: &mut usize,
-  default_reason: &'static str,
-) -> (String, &'static str) {
+  default_reason: FinishReason,
+) -> (String, FinishReason) {
   let full = detok.text();
   match matcher.step(&full) {
-    crate::lm::stop::StopDecision::Stop { trimmed_len, .. } => {
-      let end = trimmed_len.max(*emitted_len).min(full.len());
+    crate::lm::stop::StopDecision::Stop(ref p) => {
+      let end = p.trimmed_len().max(*emitted_len).min(full.len());
       let text = full[*emitted_len..end].to_string();
       *emitted_len = end;
-      (text, "stop")
+      // Stop-string match — surface the matched sequence in the typed
+      // FinishReason so callers can distinguish a configured stop from EOS.
+      (text, FinishReason::Stop(p.stop().to_owned()))
     }
-    crate::lm::stop::StopDecision::Continue { .. } => {
+    crate::lm::stop::StopDecision::Continue(_) => {
       let start = (*emitted_len).min(full.len());
       let text = full[start..].to_string();
       *emitted_len = full.len();
@@ -2149,9 +2412,10 @@ pub struct BatchGenStep {
   /// The `[V]` per-row log-probability vector that produced `token` (mlx-lm
   /// `Response.logprobs`).
   pub logprobs: Array,
-  /// `None` while still generating; `Some("stop")` on an EOS token,
-  /// `Some("length")` on `max_tokens` — exactly mlx-lm `Response.finish_reason`.
-  pub finish_reason: Option<String>,
+  /// `None` while still generating; `Some(FinishReason::Eos)` on an EOS
+  /// token, `Some(FinishReason::Length)` on `max_tokens` — exactly mlx-lm
+  /// `Response.finish_reason`.
+  pub finish_reason: Option<FinishReason>,
 }
 
 /// Streaming batched-generation iterator: one [`BatchGenStep`] per row per
@@ -2202,14 +2466,15 @@ pub struct BatchGenerator<'a, M: Model + ?Sized> {
   /// Per-row "tokens generated so far" counter (mlx-lm `Response`'s
   /// generation count); compared against `max_tokens` per row.
   produced: Vec<usize>,
-  /// Per-row finish reason: `None` while still generating, `Some("stop")`
-  /// once EOS sampled, `Some("length")` at `max_tokens`. Mirrors mlx-lm's
+  /// Per-row finish reason: `None` while still generating,
+  /// `Some(FinishReason::Eos)` once EOS sampled,
+  /// `Some(FinishReason::Length)` at `max_tokens`. Mirrors mlx-lm's
   /// per-row `Response.finish_reason` semantics. A row stops contributing
   /// output the step it transitions from `None` to `Some(_)` (the EOS token
-  /// itself is yielded with `finish_reason="stop"` but NOT appended to the
+  /// itself is yielded with `finish_reason=Eos` but NOT appended to the
   /// row's running output by `batch_generate`, mirroring mlx-lm
   /// `generate.py:1945-1946`).
-  finished: Vec<Option<String>>,
+  finished: Vec<Option<FinishReason>>,
   /// 0-based row indices yet to emit at the current step (drained in order
   /// by `next()`). Empty between steps; refilled when a new forward runs.
   pending_emit: std::collections::VecDeque<BatchGenStep>,
@@ -2358,10 +2623,10 @@ impl<M: Model + ?Sized> BatchGenerator<'_, M> {
       // them again, but we still build the result so per-row order is
       // preserved if a caller streams them).
       let prior = self.finished[row].clone();
-      let new_reason: Option<String> = if prior.is_some() {
+      let new_reason: Option<FinishReason> = if prior.is_some() {
         prior
       } else if self.eos.contains(&tok) {
-        Some("stop".to_string())
+        Some(FinishReason::Eos)
       } else {
         // Pre-bump check: this step's token will be the `produced[row] + 1`th
         // generated token; mlx-lm reports "length" when `produced == max_tokens`
@@ -2370,11 +2635,11 @@ impl<M: Model + ?Sized> BatchGenerator<'_, M> {
         // BUT mlx-lm's single-seq path yields the LAST token with no
         // finish_reason and breaks; the next iteration sees `n ==
         // max_tokens` and stops. Here for batch we lump them: the
-        // `(produced+1) == max_tokens` token gets `Some("length")` to surface
-        // the per-row termination in ONE step (the caller would otherwise
-        // need a separate "length" sentinel after this token).
+        // `(produced+1) == max_tokens` token gets `Some(FinishReason::Length)`
+        // to surface the per-row termination in ONE step (the caller would
+        // otherwise need a separate "length" sentinel after this token).
         if self.produced[row] + 1 >= self.max_tokens {
-          Some("length".to_string())
+          Some(FinishReason::Length)
         } else {
           None
         }
@@ -2510,7 +2775,7 @@ impl<M: Model + ?Sized> Iterator for BatchGenerator<'_, M> {
         // for this step but should NOT propagate into the next-step input
         // (the row's `last` is reset to pad so a parallel still-running
         // row drives a deterministic dummy column).
-        if reason == "stop" {
+        if reason.is_eos() {
           self.last[row] = self.pad_token_id;
         }
       }
@@ -2824,12 +3089,12 @@ pub fn batch_generate<M: Model + ?Sized>(
         message: format!("batch_generate: step row {row} out of range for {b} prompts"),
       });
     }
-    match step.finish_reason.as_deref() {
-      Some("stop") => {
+    match &step.finish_reason {
+      Some(r) if r.is_eos() => {
         // EOS: drop the token, do NOT append.
       }
       _ => {
-        // None ("still going") or Some("length") or any other reason: append.
+        // None ("still going") or Some(Length) or any other reason: append.
         results[row].push(step.token);
       }
     }
@@ -2974,13 +3239,13 @@ mod batch_tests {
 
     // Drain all per-row steps; collect per-row tokens (excluding EOS).
     let mut rows: Vec<Vec<u32>> = vec![Vec::new(); 2];
-    let mut last_step_per_row: Vec<Option<String>> = vec![None; 2];
+    let mut last_step_per_row: Vec<Option<FinishReason>> = vec![None; 2];
     for item in batch_gen {
       let step = item.expect("step error");
       // Track per-row outputs the same way `batch_generate` aggregator does
       // (mlx-lm: exclude "stop" tokens from output, include everything else).
-      match step.finish_reason.as_deref() {
-        Some("stop") => {}
+      match &step.finish_reason {
+        Some(r) if r.is_eos() => {}
         _ => rows[step.row].push(step.token),
       }
       if let Some(r) = step.finish_reason {
@@ -2990,11 +3255,11 @@ mod batch_tests {
 
     // Row 0: 5 tokens at max_tokens, no EOS — full [11, 12, 13, 14, 15].
     assert_eq!(rows[0], vec![11, 12, 13, 14, 15]);
-    assert_eq!(last_step_per_row[0].as_deref(), Some("length"));
+    assert_eq!(last_step_per_row[0], Some(FinishReason::Length));
     // Row 1: EOS at script idx 2; output is [21, 22] (the EOS-token-bearing
-    // step is dropped). finished = "stop".
+    // step is dropped). finished = Eos.
     assert_eq!(rows[1], vec![21, 22]);
-    assert_eq!(last_step_per_row[1].as_deref(), Some("stop"));
+    assert_eq!(last_step_per_row[1], Some(FinishReason::Eos));
   }
 
   /// 3-row batch, ragged lengths: prompts of length 4 / 2 / 1. Asserts the
@@ -3036,11 +3301,11 @@ mod batch_tests {
     };
 
     let mut rows: Vec<Vec<u32>> = vec![Vec::new(); 3];
-    let mut last_step_per_row: Vec<Option<String>> = vec![None; 3];
+    let mut last_step_per_row: Vec<Option<FinishReason>> = vec![None; 3];
     for item in batch_generate_step(&model, &prompts, 0, cache, cfg) {
       let step = item.expect("step error");
-      match step.finish_reason.as_deref() {
-        Some("stop") => {}
+      match &step.finish_reason {
+        Some(r) if r.is_eos() => {}
         _ => rows[step.row].push(step.token),
       }
       if let Some(r) = step.finish_reason {
@@ -3049,11 +3314,11 @@ mod batch_tests {
     }
 
     assert_eq!(rows[0], vec![10, 11, 12]);
-    assert_eq!(last_step_per_row[0].as_deref(), Some("length"));
+    assert_eq!(last_step_per_row[0], Some(FinishReason::Length));
     assert_eq!(rows[1], vec![20]); // EOS at idx 1 dropped.
-    assert_eq!(last_step_per_row[1].as_deref(), Some("stop"));
+    assert_eq!(last_step_per_row[1], Some(FinishReason::Eos));
     assert_eq!(rows[2], vec![30, 31, 32]);
-    assert_eq!(last_step_per_row[2].as_deref(), Some("length"));
+    assert_eq!(last_step_per_row[2], Some(FinishReason::Length));
   }
 
   /// Empty / malformed prompt inputs surface as a deferred `Err` on first
@@ -3143,8 +3408,8 @@ mod batch_tests {
       let step = step.expect("zero-budget guard must not yield Err");
       // Reproduce the `batch_generate` aggregator: drop EOS-finish tokens,
       // append everything else. With max_tokens=0 the loop body never runs.
-      match step.finish_reason.as_deref() {
-        Some("stop") => {}
+      match &step.finish_reason {
+        Some(r) if r.is_eos() => {}
         _ => results[step.row].push(step.token),
       }
     }
@@ -3191,7 +3456,7 @@ mod batch_tests {
     };
 
     let mut emits_per_row: Vec<usize> = vec![0; 2];
-    let mut finish_per_row: Vec<Option<String>> = vec![None; 2];
+    let mut finish_per_row: Vec<Option<FinishReason>> = vec![None; 2];
     for item in batch_generate_step(&model, &prompts, 0, cache, cfg) {
       let step = item.expect("step error");
       emits_per_row[step.row] += 1;
@@ -3209,20 +3474,20 @@ mod batch_tests {
       }
     }
 
-    // Row 0: exactly ONE emit — the terminal `stop` step.
+    // Row 0: exactly ONE emit — the terminal Eos step.
     assert_eq!(
       emits_per_row[0], 1,
       "row 0 finished on step 1 but was re-emitted on later steps (got {} emits, expected 1)",
       emits_per_row[0]
     );
-    assert_eq!(finish_per_row[0].as_deref(), Some("stop"));
-    // Row 1: full `max_tokens` emits, last carries `Some("length")`.
+    assert_eq!(finish_per_row[0], Some(FinishReason::Eos));
+    // Row 1: full `max_tokens` emits, last carries `Some(Length)`.
     assert_eq!(
       emits_per_row[1], max_tokens,
       "row 1 expected {max_tokens} emits, got {}",
       emits_per_row[1]
     );
-    assert_eq!(finish_per_row[1].as_deref(), Some("length"));
+    assert_eq!(finish_per_row[1], Some(FinishReason::Length));
   }
 
   /// A `Model` whose every `forward` returns an error AND records that it
@@ -3375,7 +3640,7 @@ mod stop_sequence_tests {
     script: Vec<u32>,
     max_tokens: usize,
     stop_strings: Vec<String>,
-  ) -> (String, Vec<Option<String>>) {
+  ) -> (String, Vec<Option<FinishReason>>) {
     let tok = fixture_tokenizer();
     let vocab = 16usize;
     let model = ScriptModel {
@@ -3417,7 +3682,7 @@ mod stop_sequence_tests {
     let script = vec![4u32, 5, 2, 6, 7]; // world the </s> ...
     let (text, reasons) = run(&prompt, script, 32, Vec::new());
     assert_eq!(text, decode(&[4, 5]));
-    assert_eq!(reasons.last().unwrap().as_deref(), Some("stop"));
+    assert_eq!(reasons.last().unwrap(), &Some(FinishReason::Eos));
     // Only one "stop" (the eos), no premature stop.
     assert_eq!(reasons.iter().filter(|r| r.is_some()).count(), 1);
   }
@@ -3433,7 +3698,9 @@ mod stop_sequence_tests {
     let full = decode(&[3, 4, 5]); // hello world the
     let cut = full.find(&stop).expect("stop substring present in decode");
     assert_eq!(text, full[..cut].to_string());
-    assert_eq!(reasons.last().unwrap().as_deref(), Some("stop"));
+    // Typed FinishReason::Stop(matched) — as_str() collapses to "stop"
+    // canonically, payload carries the matched sequence.
+    assert_eq!(reasons.last().unwrap(), &Some(FinishReason::Stop(stop)));
   }
 
   #[test]
@@ -3448,12 +3715,12 @@ mod stop_sequence_tests {
     let full = decode(&[3, 5, 6, 7]); // up to brown
     let cut = full.find(&stop).expect("multi-token stop present");
     assert_eq!(text, full[..cut].to_string());
-    assert_eq!(reasons.last().unwrap().as_deref(), Some("stop"));
     // Crucially: it did NOT stop after the first token of the stop sequence —
     // the leading `hello` token survived (text is the non-empty pre-stop
     // prefix), and the full stop string is absent from the output.
     assert!(!text.is_empty());
     assert!(!text.contains(&stop));
+    assert_eq!(reasons.last().unwrap(), &Some(FinishReason::Stop(stop)));
   }
 
   #[test]
@@ -3468,9 +3735,11 @@ mod stop_sequence_tests {
     // No stop completed ⇒ ends on length, full text retained.
     assert!(!text.contains(&stop), "stop string must not appear");
     assert_eq!(text, decode(&[3, 5, 8, 4, 7]));
-    assert_eq!(reasons.last().unwrap().as_deref(), Some("length"));
+    assert_eq!(reasons.last().unwrap(), &Some(FinishReason::Length));
     assert!(
-      reasons.iter().all(|r| r.as_deref() != Some("stop")),
+      reasons
+        .iter()
+        .all(|r| r.as_ref() != Some(&FinishReason::Eos)),
       "no premature stop on the partial match"
     );
   }
@@ -3497,7 +3766,9 @@ mod stop_sequence_tests {
     // The stop string itself must be gone, and the cut is at the char
     // boundary where the stop began (mid the `quick` token's text).
     assert!(!text.contains(&stop));
-    assert_eq!(reasons.last().unwrap().as_deref(), Some("stop"));
+    // Typed FinishReason::Stop(matched) carries the stop sequence;
+    // FinishReason::as_str() still collapses to canonical "stop".
+    assert_eq!(reasons.last().unwrap(), &Some(FinishReason::Stop(stop)));
   }
 
   #[test]
@@ -3514,18 +3785,19 @@ mod stop_sequence_tests {
     assert_eq!(text, full[..cut].to_string());
     assert!(!text.contains(&early));
     assert!(!text.contains(&late));
-    assert_eq!(reasons.last().unwrap().as_deref(), Some("stop"));
+    // The early stop is the one that matched, so the typed payload carries it.
+    assert_eq!(reasons.last().unwrap(), &Some(FinishReason::Stop(early)));
   }
 
   #[test]
   fn finish_reason_is_stop_on_stop_string_match() {
     // Focused assertion: a stop-string match yields exactly one terminal
-    // response with finish_reason == Some("stop") and nothing after it.
+    // response with finish_reason == Some(Stop(matched)) and nothing after.
     let prompt = [1u32, 3];
     let script = vec![3u32, 4, 5, 6, 7];
     let stop = decode(&[5]); // "the"
-    let (_text, reasons) = run(&prompt, script, 32, vec![stop]);
-    assert_eq!(reasons.last().unwrap().as_deref(), Some("stop"));
+    let (_text, reasons) = run(&prompt, script, 32, vec![stop.clone()]);
+    assert_eq!(reasons.last().unwrap(), &Some(FinishReason::Stop(stop)));
     // Exactly one terminal reason, and it's the final element.
     assert_eq!(reasons.iter().filter(|r| r.is_some()).count(), 1);
   }
@@ -3629,11 +3901,12 @@ mod stop_sequence_tests {
     // The visible "hello" was already streamed mid-loop (emitted_len tracks it).
     let mut emitted_len = "hello".len();
     crate::tokenizer::StreamingDetokenizer::finalize(&mut d);
-    let (text, reason) = finalize_active_tail(&d, &stop, &mut emitted_len, "stop");
+    let (text, reason) = finalize_active_tail(&d, &stop, &mut emitted_len, FinishReason::Eos);
     // The stop " " starts at byte 5; trimmed_len=5 == emitted_len ⇒ nothing
-    // new emitted (the space is trimmed away, not returned), reason "stop".
+    // new emitted (the space is trimmed away, not returned). The finalized
+    // tail completed the stop, so the typed reason is Stop(matched), not Eos.
     assert_eq!(text, "");
-    assert_eq!(reason, "stop");
+    assert_eq!(reason, FinishReason::Stop(" ".to_string()));
     assert!(!text.contains(' '), "the bare space must not be emitted");
   }
 
@@ -3649,8 +3922,12 @@ mod stop_sequence_tests {
     d.push(" ", true); // final allowed token, withheld until finalize
     let mut emitted_len = "hi".len();
     crate::tokenizer::StreamingDetokenizer::finalize(&mut d);
-    let (text, reason) = finalize_active_tail(&d, &stop, &mut emitted_len, "length");
-    assert_eq!(reason, "stop", "finalized-tail stop must win over length");
+    let (text, reason) = finalize_active_tail(&d, &stop, &mut emitted_len, FinishReason::Length);
+    assert_eq!(
+      reason,
+      FinishReason::Stop(" ".to_string()),
+      "finalized-tail stop must win over length and carry the matched payload"
+    );
     assert_eq!(text, ""); // the space is trimmed, not emitted
     assert!(!text.contains(' '));
   }
@@ -3666,19 +3943,19 @@ mod stop_sequence_tests {
     d.push(" ", true); // withheld tail, no stop completion
     let mut emitted_len = "hi".len();
     crate::tokenizer::StreamingDetokenizer::finalize(&mut d);
-    // max_tokens semantics → "length", and the withheld space is emitted.
-    let (text, reason) = finalize_active_tail(&d, &stop, &mut emitted_len, "length");
+    // max_tokens semantics → Length, and the withheld space is emitted.
+    let (text, reason) = finalize_active_tail(&d, &stop, &mut emitted_len, FinishReason::Length);
     assert_eq!(text, " ");
-    assert_eq!(reason, "length");
-    // eos semantics → "stop", same emitted tail.
+    assert_eq!(reason, FinishReason::Length);
+    // eos semantics → Eos, same emitted tail.
     let mut d2 = WithholdDetokenizer::default();
     d2.push("hi", false);
     d2.push(" ", true);
     let mut emitted_len2 = "hi".len();
     crate::tokenizer::StreamingDetokenizer::finalize(&mut d2);
-    let (text2, reason2) = finalize_active_tail(&d2, &stop, &mut emitted_len2, "stop");
+    let (text2, reason2) = finalize_active_tail(&d2, &stop, &mut emitted_len2, FinishReason::Eos);
     assert_eq!(text2, " ");
-    assert_eq!(reason2, "stop");
+    assert_eq!(reason2, FinishReason::Eos);
   }
 
   #[test]
@@ -3695,8 +3972,8 @@ mod stop_sequence_tests {
     d.push("c", true);
     let mut emitted_len = "ab".len();
     crate::tokenizer::StreamingDetokenizer::finalize(&mut d);
-    let (text, reason) = finalize_active_tail(&d, &stop, &mut emitted_len, "length");
-    assert_eq!(reason, "stop");
+    let (text, reason) = finalize_active_tail(&d, &stop, &mut emitted_len, FinishReason::Length);
+    assert_eq!(reason, FinishReason::Stop("abc".to_string()));
     assert_eq!(text, "");
     // emitted_len clamped to match start (0) max emitted (2) = 2.
     assert_eq!(emitted_len, 2);

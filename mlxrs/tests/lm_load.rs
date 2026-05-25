@@ -52,7 +52,7 @@ const FULL_CONFIG_JSON: &str = r#"{
 #[test]
 fn config_parses_minimal_and_ignores_extra() {
   let cfg = Config::from_json(FULL_CONFIG_JSON).unwrap();
-  assert_eq!(cfg.model_type, "qwen3");
+  assert_eq!(cfg.model_type(), "qwen3");
   assert_eq!(cfg.hidden_size, 1024);
   assert_eq!(cfg.num_hidden_layers, 24);
   assert_eq!(cfg.num_attention_heads, 16);
@@ -84,7 +84,7 @@ fn config_optionals_default_when_absent() {
     "unrelated": "ignored"
   }"#;
   let cfg = Config::from_json(json).unwrap();
-  assert_eq!(cfg.model_type, "llama");
+  assert_eq!(cfg.model_type(), "llama");
   assert!(!cfg.tie_word_embeddings);
   assert_eq!(cfg.sliding_window, None);
   assert!(cfg.quantization.is_none());
@@ -220,7 +220,7 @@ fn load_returns_config_weights_tokenizer() {
   let dir = write_model_dir("full");
   let (cfg, weights, tok) = load::load(&dir).unwrap();
 
-  assert_eq!(cfg.model_type, "qwen3");
+  assert_eq!(cfg.model_type(), "qwen3");
   assert_eq!(cfg.num_hidden_layers, 24);
   assert_eq!(cfg.sliding_window, Some(4096));
 

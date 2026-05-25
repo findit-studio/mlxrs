@@ -42,27 +42,74 @@
 //! newly matched bytes are dropped together, so the whole stop sequence is
 //! trimmed exactly once.
 
-/// Outcome of feeding the running decoded text to a [`StopMatcher`].
+/// Payload for [`StopDecision::Continue`] — carries the safe-to-emit byte
+/// length.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuePayload {
+  safe_len: usize,
+}
+
+impl ContinuePayload {
+  /// Construct a [`ContinuePayload`].
+  pub fn new(safe_len: usize) -> Self {
+    Self { safe_len }
+  }
+
+  /// Byte length of the cumulative text that is safe to emit.
+  #[inline(always)]
+  pub fn safe_len(&self) -> usize {
+    self.safe_len
+  }
+}
+
+/// Payload for [`StopDecision::Stop`] — carries the trimmed-text length and
+/// which stop string matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopPayload {
+  trimmed_len: usize,
+  stop: String,
+}
+
+impl StopPayload {
+  /// Construct a [`StopPayload`].
+  pub fn new(trimmed_len: usize, stop: impl Into<String>) -> Self {
+    Self {
+      trimmed_len,
+      stop: stop.into(),
+    }
+  }
+
+  /// Byte length of the cumulative text up to (excluding) the matched stop.
+  #[inline(always)]
+  pub fn trimmed_len(&self) -> usize {
+    self.trimmed_len
+  }
+
+  /// Which configured stop string matched.
+  #[inline(always)]
+  pub fn stop(&self) -> &str {
+    &self.stop
+  }
+}
+
+/// Outcome of feeding the running decoded text to a [`StopMatcher`].
+#[derive(
+  Debug, Clone, PartialEq, Eq, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
+)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
+#[non_exhaustive]
 pub enum StopDecision {
   /// No stop string has completed yet. `safe_len` is the byte length of the
   /// prefix of the cumulative decoded text that is now safe to emit (no stop
   /// string can complete using only the held-back suffix). It only ever
   /// grows across calls; the caller emits the newly-safe slice.
-  Continue {
-    /// Byte length of the cumulative text that is safe to emit.
-    safe_len: usize,
-  },
+  Continue(ContinuePayload),
   /// A stop string completed. `trimmed_len` is the byte length of the
   /// cumulative decoded text with the matched stop sequence (and anything
   /// after it) removed — i.e. the text truncated at the match start. The
   /// matched stop string is reported in `stop`.
-  Stop {
-    /// Byte length of the cumulative text up to (excluding) the matched stop.
-    trimmed_len: usize,
-    /// Which configured stop string matched.
-    stop: String,
-  },
+  Stop(StopPayload),
 }
 
 /// A decode-and-string-match stop-sequence matcher.
@@ -118,9 +165,7 @@ impl StopMatcher {
   /// partial stop-prefix so a later token can still complete it.
   pub fn step(&self, full_text: &str) -> StopDecision {
     if self.stops.is_empty() {
-      return StopDecision::Continue {
-        safe_len: full_text.len(),
-      };
+      return StopDecision::Continue(ContinuePayload::new(full_text.len()));
     }
 
     // Earliest completed match: minimize the match START (so the shortest
@@ -136,19 +181,14 @@ impl StopMatcher {
       }
     }
     if let Some((start, stop)) = best {
-      return StopDecision::Stop {
-        trimmed_len: start,
-        stop: stop.to_string(),
-      };
+      return StopDecision::Stop(StopPayload::new(start, stop));
     }
 
     // No completion. Hold back the longest suffix of `full_text` that is a
     // proper prefix of some stop string (it could still grow into a match),
     // capped at `max_len - 1`. Everything before it is safe to emit.
     let held = self.held_back_suffix(full_text);
-    StopDecision::Continue {
-      safe_len: full_text.len() - held,
-    }
+    StopDecision::Continue(ContinuePayload::new(full_text.len() - held))
   }
 
   /// Byte length of the longest suffix of `text` that is a proper prefix of
@@ -194,9 +234,7 @@ mod tests {
     // Whole text is always safe; never stops.
     assert_eq!(
       m.step("anything at all"),
-      StopDecision::Continue {
-        safe_len: "anything at all".len()
-      }
+      StopDecision::Continue(ContinuePayload::new("anything at all".len()))
     );
   }
 
@@ -204,7 +242,7 @@ mod tests {
   fn empty_strings_are_dropped() {
     let m = matcher(&["", ""]);
     assert!(!m.is_active());
-    assert_eq!(m.step("x"), StopDecision::Continue { safe_len: 1 });
+    assert_eq!(m.step("x"), StopDecision::Continue(ContinuePayload::new(1)));
   }
 
   #[test]
@@ -213,10 +251,7 @@ mod tests {
     // "abcSTOPdef" -> trim at the 'S' (byte 3).
     assert_eq!(
       m.step("abcSTOPdef"),
-      StopDecision::Stop {
-        trimmed_len: 3,
-        stop: "STOP".to_string()
-      }
+      StopDecision::Stop(StopPayload::new(3, "STOP"))
     );
   }
 
@@ -224,19 +259,31 @@ mod tests {
   fn no_match_holds_back_partial_prefix() {
     let m = matcher(&["STOP"]);
     // "abcST" ends with "ST", a proper prefix of "STOP": hold back 2 bytes.
-    assert_eq!(m.step("abcST"), StopDecision::Continue { safe_len: 3 });
+    assert_eq!(
+      m.step("abcST"),
+      StopDecision::Continue(ContinuePayload::new(3))
+    );
     // "abc" ends with no stop-prefix: all safe.
-    assert_eq!(m.step("abc"), StopDecision::Continue { safe_len: 3 });
+    assert_eq!(
+      m.step("abc"),
+      StopDecision::Continue(ContinuePayload::new(3))
+    );
   }
 
   #[test]
   fn partial_then_diverge_releases_held_text() {
     let m = matcher(&["STOP"]);
     // Step 1: "...ST" holds back "ST".
-    assert_eq!(m.step("xxST"), StopDecision::Continue { safe_len: 2 });
+    assert_eq!(
+      m.step("xxST"),
+      StopDecision::Continue(ContinuePayload::new(2))
+    );
     // Step 2: next token made it "STX" — "ST" did not become "STOP", and the
     // new tail "X"/"TX"/"STX" is not a stop prefix, so everything is safe.
-    assert_eq!(m.step("xxSTX"), StopDecision::Continue { safe_len: 5 });
+    assert_eq!(
+      m.step("xxSTX"),
+      StopDecision::Continue(ContinuePayload::new(5))
+    );
   }
 
   #[test]
@@ -245,10 +292,7 @@ mod tests {
     let m = matcher(&["bar", "foo"]);
     assert_eq!(
       m.step("foobar"),
-      StopDecision::Stop {
-        trimmed_len: 0,
-        stop: "foo".to_string()
-      }
+      StopDecision::Stop(StopPayload::new(0, "foo"))
     );
   }
 
@@ -256,13 +300,7 @@ mod tests {
   fn first_match_wins_tie_broken_by_order() {
     // Both start at byte 0; construction order picks the first listed.
     let m = matcher(&["ab", "abc"]);
-    assert_eq!(
-      m.step("abc"),
-      StopDecision::Stop {
-        trimmed_len: 0,
-        stop: "ab".to_string()
-      }
-    );
+    assert_eq!(m.step("abc"), StopDecision::Stop(StopPayload::new(0, "ab")));
   }
 
   #[test]
@@ -272,7 +310,7 @@ mod tests {
     let m = matcher(&["é!"]);
     let d = m.step("abé");
     // "abé" = 4 bytes; held back is the 2-byte "é".
-    assert_eq!(d, StopDecision::Continue { safe_len: 2 });
+    assert_eq!(d, StopDecision::Continue(ContinuePayload::new(2)));
   }
 
   #[test]
@@ -280,10 +318,7 @@ mod tests {
     let m = matcher(&["é!"]);
     assert_eq!(
       m.step("abé!cd"),
-      StopDecision::Stop {
-        trimmed_len: 2,
-        stop: "é!".to_string()
-      }
+      StopDecision::Stop(StopPayload::new(2, "é!"))
     );
   }
 }

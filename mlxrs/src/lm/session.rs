@@ -108,7 +108,7 @@ use crate::{
   error::{Error, Result},
   lm::{
     cache::{CacheConfig, KvCache, make_prompt_cache, save_prompt_cache},
-    generate::{GenConfig, GenerationResponse, Generator, build_generator},
+    generate::{FinishReason, GenConfig, GenerationResponse, Generator, build_generator},
     model::Model,
     speculative::{DraftConfig, SpeculativeStream, speculative_stream_generate},
   },
@@ -124,7 +124,9 @@ use crate::{
 /// Rendered to the lowercase string the chat template expects (`"system"` /
 /// `"user"` / `"assistant"` / `"tool"`); [`ChatSession`] tags the prompt with
 /// [`Role::User`] and the model's reply with [`Role::Assistant`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display, derive_more::IsVariant)]
+#[display("{}", self.as_str())]
+#[non_exhaustive]
 pub enum Role {
   /// System instructions (the optional leading message).
   System,
@@ -138,7 +140,7 @@ pub enum Role {
 
 impl Role {
   /// The lowercase template key for this role (`messages[i]["role"]`).
-  fn as_str(self) -> &'static str {
+  pub const fn as_str(self) -> &'static str {
     match self {
       Role::System => "system",
       Role::User => "user",
@@ -159,40 +161,44 @@ pub struct ChatMessage {
   /// The speaker (`messages[i]["role"]`).
   pub role: Role,
   /// The message text (`messages[i]["content"]`).
-  pub content: String,
+  ///
+  /// Private: access via [`content`](Self::content).
+  content: String,
 }
 
 impl ChatMessage {
-  /// A `system` message (the optional leading instructions).
-  pub fn system(content: impl Into<String>) -> Self {
+  /// Build a message with an explicit role and content.
+  pub fn new(role: Role, content: impl Into<String>) -> Self {
     Self {
-      role: Role::System,
+      role,
       content: content.into(),
     }
+  }
+
+  /// The message text (`messages[i]["content"]`).
+  #[inline(always)]
+  pub fn content(&self) -> &str {
+    &self.content
+  }
+
+  /// A `system` message (the optional leading instructions).
+  pub fn system(content: impl Into<String>) -> Self {
+    Self::new(Role::System, content)
   }
 
   /// A `user` message.
   pub fn user(content: impl Into<String>) -> Self {
-    Self {
-      role: Role::User,
-      content: content.into(),
-    }
+    Self::new(Role::User, content)
   }
 
   /// An `assistant` (model) message.
   pub fn assistant(content: impl Into<String>) -> Self {
-    Self {
-      role: Role::Assistant,
-      content: content.into(),
-    }
+    Self::new(Role::Assistant, content)
   }
 
   /// A `tool`-result message.
   pub fn tool(content: impl Into<String>) -> Self {
-    Self {
-      role: Role::Tool,
-      content: content.into(),
-    }
+    Self::new(Role::Tool, content)
   }
 }
 
@@ -693,15 +699,12 @@ impl ChatSession {
     };
     messages.extend(replayed.iter().cloned());
     messages.extend(self.history.iter().cloned());
-    messages.push(ChatMessage {
-      role,
-      content: prompt.to_string(),
-    });
+    messages.push(ChatMessage::new(role, prompt));
 
     let json_messages = Value::Array(
       messages
         .iter()
-        .map(|m| json!({ "role": m.role.as_str(), "content": m.content }))
+        .map(|m| json!({ "role": m.role.as_str(), "content": m.content() }))
         .collect(),
     );
 
@@ -903,10 +906,7 @@ impl ChatSession {
     //    then append the new user turn. The assistant reply is appended by
     //    `ChatResponseStream::drop` once generation finishes.
     self.history.extend(replayed);
-    self.history.push(ChatMessage {
-      role,
-      content: prompt.to_string(),
-    });
+    self.history.push(ChatMessage::new(role, prompt));
 
     // 4. Prepare the per-turn `GenConfig`. `stream_generate` overrides
     //    `cfg.eos` with the tokenizer's set; mirror that so `finish_reason`
@@ -1459,7 +1459,7 @@ impl Iterator for ChatResponseStream<'_> {
             generation_tokens: self.produced + 1,
             generation_tps: 0.0,
             peak_memory_bytes: crate::memory::peak_memory().ok(),
-            finish_reason: Some("stop".to_string()),
+            finish_reason: Some(FinishReason::Eos),
           }));
         }
 
@@ -1491,7 +1491,7 @@ impl Iterator for ChatResponseStream<'_> {
             generation_tokens: self.produced,
             generation_tps: 0.0,
             peak_memory_bytes: crate::memory::peak_memory().ok(),
-            finish_reason: Some("length".to_string()),
+            finish_reason: Some(FinishReason::Length),
           }));
         }
 
@@ -1617,7 +1617,7 @@ mod tests {
     // history: 4 messages now (two full turns).
     assert_eq!(s.history().len(), 4);
     assert_eq!(s.history()[2].role, Role::User);
-    assert_eq!(s.history()[2].content, "the quick fox");
+    assert_eq!(s.history()[2].content(), "the quick fox");
     assert_eq!(s.history()[3].role, Role::Assistant);
 
     let offset_after_turn_2 = s
@@ -1771,7 +1771,7 @@ mod tests {
     );
     // Both sessions recorded the same history shape.
     assert_eq!(a.history().len(), b.history().len());
-    assert_eq!(a.history()[1].content, b.history()[1].content);
+    assert_eq!(a.history()[1].content(), b.history()[1].content);
   }
 
   #[test]
@@ -1788,7 +1788,7 @@ mod tests {
     }
     assert_eq!(s.history().len(), 2);
     assert_eq!(
-      s.history()[1].content,
+      s.history()[1].content(),
       streamed,
       "the recorded assistant turn equals the streamed text"
     );
@@ -1807,7 +1807,7 @@ mod tests {
         reasons.push(resp.expect("step").finish_reason);
       }
     }
-    assert_eq!(reasons.last().unwrap().as_deref(), Some("length"));
+    assert_eq!(reasons.last().unwrap(), &Some(FinishReason::Length));
     // Exactly one terminal reason; the rest are `None`.
     assert_eq!(reasons.iter().filter(|r| r.is_some()).count(), 1);
     assert_eq!(reasons.len(), 3, "max_tokens responses produced");
@@ -1872,9 +1872,9 @@ mod tests {
     // withholds until `finalize()`). The recorded text must therefore start
     // with everything the stream yielded.
     assert!(
-      s.history()[1].content.starts_with(&streamed),
+      s.history()[1].content().starts_with(&streamed),
       "recorded reply ({:?}) includes the streamed text ({streamed:?})",
-      s.history()[1].content
+      s.history()[1].content()
     );
 
     // The session is still usable for a follow-up turn (cache reused).
@@ -1959,9 +1959,9 @@ mod tests {
     assert!(s.has_cache(), "cache realised after the first turn");
     // live history: 2 replayed + (user "the fox" + assistant reply) = 4.
     assert_eq!(s.history().len(), 4, "replayed history folded in");
-    assert_eq!(s.history()[0].content, "hello");
-    assert_eq!(s.history()[1].content, "world");
-    assert_eq!(s.history()[2].content, "the fox");
+    assert_eq!(s.history()[0].content(), "hello");
+    assert_eq!(s.history()[1].content(), "world");
+    assert_eq!(s.history()[2].content(), "the fox");
     assert_eq!(s.history()[3].role, Role::Assistant);
   }
 
@@ -2061,7 +2061,7 @@ mod tests {
     let reply2 = s.respond("world").expect("speculative turn 2");
     assert!(!reply2.is_empty());
     assert_eq!(s.history().len(), 4);
-    assert_eq!(s.history()[2].content, "world");
+    assert_eq!(s.history()[2].content(), "world");
     assert_eq!(s.history()[3].role, Role::Assistant);
   }
 
@@ -2401,7 +2401,7 @@ mod tests {
 
     // The committed assistant turn.
     assert_eq!(s.history().len(), 2, "interrupted turn still recorded");
-    let recorded = &s.history()[1].content;
+    let recorded = s.history()[1].content();
 
     // Token-complete oracle: feed the SAME produced tokens into an
     // independent BPE detokenizer and `finalize()` — the committed history
@@ -2637,7 +2637,7 @@ mod tests {
 
     // The committed assistant turn.
     assert_eq!(s.history().len(), 2, "error-terminated turn still recorded");
-    let recorded = &s.history()[1].content;
+    let recorded = s.history()[1].content();
 
     // Token-complete oracle: feed the SAME produced tokens into an
     // independent BPE detokenizer and `finalize()` — the committed history
@@ -2756,7 +2756,7 @@ mod tests {
     // `streamed` — every mid-stream `last_segment()` returned "" because the
     // BPE detok buffered every `â`.
     assert_eq!(s.history().len(), 2, "error-terminated turn still recorded");
-    let recorded = &s.history()[1].content;
+    let recorded = s.history()[1].content();
 
     let reference = {
       let mut d =

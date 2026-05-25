@@ -245,10 +245,7 @@ fn stt_generate_pipeline_smoke() {
   let path = make_wav("smoke", 16_000, ONE_SECOND_16K);
   let model = MockSttModel::new(5); // ramp → argmax == 4 every step
   let cfg = SttGenConfig {
-    lm: mlxrs::lm::generate::GenConfig {
-      max_tokens: 3,
-      ..mlxrs::lm::generate::GenConfig::default()
-    },
+    lm: mlxrs::lm::generate::GenConfig::default().with_max_tokens(3),
     ..SttGenConfig::default()
   };
   let it = stt_generate(&model, &path, cache(1), cfg).unwrap();
@@ -271,10 +268,7 @@ fn stt_generate_stops_on_eos() {
   let mut model = MockSttModel::new(5);
   model.eos = 4; // argmax is 4 ⇒ first step IS the eos token.
   let cfg = SttGenConfig {
-    lm: mlxrs::lm::generate::GenConfig {
-      max_tokens: 100,
-      ..mlxrs::lm::generate::GenConfig::default()
-    },
+    lm: mlxrs::lm::generate::GenConfig::default().with_max_tokens(100),
     ..SttGenConfig::default()
   };
   let toks: Vec<u32> = stt_generate(&model, &path, cache(1), cfg)
@@ -298,10 +292,7 @@ fn stt_generate_resamples_when_sr_mismatch() {
   let path = make_wav("resample", 44_100, 44_100);
   let model = MockSttModel::new(3);
   let cfg = SttGenConfig {
-    lm: mlxrs::lm::generate::GenConfig {
-      max_tokens: 1,
-      ..mlxrs::lm::generate::GenConfig::default()
-    },
+    lm: mlxrs::lm::generate::GenConfig::default().with_max_tokens(1),
     auto_resample: true,
     ..SttGenConfig::default()
   };
@@ -534,10 +525,7 @@ fn stt_generate_uses_mel_config_override() {
     ..MelConfig::whisper_default()
   };
   let cfg = SttGenConfig {
-    lm: mlxrs::lm::generate::GenConfig {
-      max_tokens: 1,
-      ..mlxrs::lm::generate::GenConfig::default()
-    },
+    lm: mlxrs::lm::generate::GenConfig::default().with_max_tokens(1),
     ..SttGenConfig::default()
   };
   let _ = stt_generate(&model, &path, cache(1), cfg)
@@ -566,10 +554,7 @@ fn stt_generate_threads_mel_config_log_floor() {
   let path = make_wav("log_floor", 16_000, ONE_SECOND_16K);
 
   let cfg = || SttGenConfig {
-    lm: mlxrs::lm::generate::GenConfig {
-      max_tokens: 1,
-      ..mlxrs::lm::generate::GenConfig::default()
-    },
+    lm: mlxrs::lm::generate::GenConfig::default().with_max_tokens(1),
     ..SttGenConfig::default()
   };
 
@@ -641,10 +626,7 @@ fn decode_step_default_errors_with_clear_message() {
   let path = make_wav("default_decode", 16_000, ONE_SECOND_16K);
   let model = DefaultDecodeModel;
   let cfg = SttGenConfig {
-    lm: mlxrs::lm::generate::GenConfig {
-      max_tokens: 5,
-      ..mlxrs::lm::generate::GenConfig::default()
-    },
+    lm: mlxrs::lm::generate::GenConfig::default().with_max_tokens(5),
     ..SttGenConfig::default()
   };
   let mut it = stt_generate(&model, &path, cache(1), cfg).unwrap();
@@ -691,10 +673,7 @@ fn stt_generate_decode_step_error_fuses() {
   let path = make_wav("decode_fail", 16_000, ONE_SECOND_16K);
   let model = FailDecodeModel;
   let cfg = SttGenConfig {
-    lm: mlxrs::lm::generate::GenConfig {
-      max_tokens: 5,
-      ..mlxrs::lm::generate::GenConfig::default()
-    },
+    lm: mlxrs::lm::generate::GenConfig::default().with_max_tokens(5),
     ..SttGenConfig::default()
   };
   let mut it = stt_generate(&model, &path, cache(1), cfg).unwrap();
@@ -729,10 +708,7 @@ fn stt_generate_zero_max_tokens_is_empty() {
   let path = make_wav("zero_max", 16_000, ONE_SECOND_16K);
   let model = MockSttModel::new(3);
   let cfg = SttGenConfig {
-    lm: mlxrs::lm::generate::GenConfig {
-      max_tokens: 0,
-      ..mlxrs::lm::generate::GenConfig::default()
-    },
+    lm: mlxrs::lm::generate::GenConfig::default().with_max_tokens(0),
     ..SttGenConfig::default()
   };
   let n = stt_generate(&model, &path, cache(1), cfg).unwrap().count();
@@ -771,10 +747,7 @@ fn audio_path_to_mel_accepts_44_1k_wav_with_16k_model_resample() {
   let path = make_wav("p7_r1_44k_16k_resample", 44_100, 44_100);
   let model = MockSttModel::new(3);
   let cfg = SttGenConfig {
-    lm: mlxrs::lm::generate::GenConfig {
-      max_tokens: 1,
-      ..mlxrs::lm::generate::GenConfig::default()
-    },
+    lm: mlxrs::lm::generate::GenConfig::default().with_max_tokens(1),
     auto_resample: true,
     max_audio_seconds: 1.0,
   };

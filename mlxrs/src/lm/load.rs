@@ -114,9 +114,10 @@ pub use crate::lm::quant::Quantization;
 /// fields the (separately-stacked) `make_prompt_cache` bridge needs, so they
 /// are always carried here.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[non_exhaustive]
 pub struct Config {
   /// Architecture id (`config.json` `model_type`, e.g. `"qwen3"`).
-  pub model_type: String,
+  model_type: String,
   /// Model hidden / embedding dimension.
   pub hidden_size: i32,
   /// Number of decoder layers — one KV-cache entry per layer.
@@ -154,7 +155,7 @@ pub struct Config {
 /// write it as either a single integer (`128001`) or a list
 /// (`[128001, 128009]`); mlx-lm accepts both. Untagged so serde tries the
 /// scalar form first, then the list.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, derive_more::IsVariant)]
 #[serde(untagged)]
 pub enum EosTokenId {
   /// A single stop id.
@@ -175,6 +176,12 @@ impl EosTokenId {
 }
 
 impl Config {
+  /// Architecture id (`config.json` `model_type`, e.g. `"qwen3"`).
+  #[inline(always)]
+  pub fn model_type(&self) -> &str {
+    &self.model_type
+  }
+
   /// Parse a [`Config`] from an in-memory `config.json` string.
   ///
   /// Mirrors `mlx_lm.utils.load_config` (`json.load(config.json)`) restricted
@@ -968,7 +975,7 @@ pub fn get_total_parameters(
               "get_total_parameters: layer {path:?} is quantized with \
                scale-only mode `{}`, which has no `.biases` buffer, yet a \
                `{key}` tensor is present — invalid checkpoint",
-              q.mode.as_mlx_str()
+              q.mode.as_str()
             ),
           });
         }
@@ -4376,12 +4383,12 @@ mod save_tests {
       assert!(
         matches!(err, Err(Error::Backend { .. })),
         "a `.biases` under scale-only `{}` must be an Error::Backend, got {err:?}",
-        mode.as_mlx_str()
+        mode.as_str()
       );
       // The error names the offending layer and mode.
       if let Err(Error::Backend { message }) = err {
         assert!(
-          message.contains("q_proj") && message.contains(mode.as_mlx_str()),
+          message.contains("q_proj") && message.contains(mode.as_str()),
           "error should name the layer + the scale-only mode, got: {message}"
         );
       }

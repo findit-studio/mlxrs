@@ -105,7 +105,8 @@ use crate::{
   lm::{
     cache::KvCache,
     generate::{
-      GenConfig, GenStep, LogitsProcessor, Sampler, make_logits_processors, make_sampler,
+      FinishReason, GenConfig, GenStep, LogitsProcessor, Sampler, make_logits_processors,
+      make_sampler,
     },
   },
   ops,
@@ -897,7 +898,7 @@ impl<M: Model + ?Sized> Iterator for VlmDecode<'_, M> {
           self.done = true;
           // LM-3 #114: surface "stop" on the EOS-token step (matches
           // `lm::generate::Generator::next`).
-          step.finish_reason = Some("stop".to_string());
+          step.finish_reason = Some(FinishReason::Eos);
         }
         Some(Ok(step))
       }

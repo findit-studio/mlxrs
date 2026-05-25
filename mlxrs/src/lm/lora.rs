@@ -168,7 +168,19 @@ pub const MAX_ADAPTER_SAFETENSORS_BYTES: u64 = 2 << 30;
 /// reports it as unsupported here, since mlxrs has no module tree to load a
 /// full-weight delta into (the per-usecase architecture would merge a full
 /// fine-tune at the weight-map level via [`crate::lm::load::load_weights`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(
+  Debug,
+  Clone,
+  Copy,
+  PartialEq,
+  Eq,
+  serde::Deserialize,
+  serde::Serialize,
+  derive_more::Display,
+  derive_more::IsVariant,
+)]
+#[display("{}", self.as_str())]
+#[non_exhaustive]
 #[serde(rename_all = "lowercase")]
 pub enum FineTuneType {
   /// Low-Rank Adaptation — the `lora_a` / `lora_b` factors only
@@ -187,6 +199,18 @@ impl Default for FineTuneType {
   /// (`tuner/utils.py:129`).
   fn default() -> Self {
     FineTuneType::Lora
+  }
+}
+
+impl FineTuneType {
+  /// The lowercase tag string used in `adapter_config.json` and
+  /// mlx-lm's `fine_tune_type` field.
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      FineTuneType::Lora => "lora",
+      FineTuneType::Dora => "dora",
+      FineTuneType::Full => "full",
+    }
   }
 }
 
@@ -213,7 +237,7 @@ impl Default for FineTuneType {
 ///   [`DEFAULT_LORA_RANK`]), `lora_alpha` → [`alpha`] (default
 ///   [`DEFAULT_PEFT_LORA_ALPHA`]), `lora_dropout` → [`dropout`]. PEFT has no
 ///   literal-`scale` field, so [`scale`] is left `None`; PEFT's `target_modules`
-///   selection does **not** land in [`keys`] — it lives in [`PeftSelection`]
+///   selection does **not** land in `keys` — it lives in [`PeftSelection`]
 ///   ([`LoraConfig::selection`]), because PEFT's regex / `layers_to_transform`
 ///   selection is richer than a `keys` suffix list.
 ///
@@ -229,7 +253,6 @@ impl Default for FineTuneType {
 /// [`rank`]: LoraParameters::rank
 /// [`scale`]: LoraParameters::scale
 /// [`alpha`]: LoraParameters::alpha
-/// [`keys`]: LoraParameters::keys
 /// [`dropout`]: LoraParameters::dropout
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct LoraParameters {
@@ -258,11 +281,14 @@ pub struct LoraParameters {
   #[serde(default)]
   pub alpha: Option<f32>,
   /// **mlx-lm-native** explicit target-projection allowlist (suffix paths like
-  /// `"self_attn.q_proj"`). `None` ⇒ adapt every eligible linear. This is the
-  /// `lora_parameters.keys` key. A PEFT config leaves this `None` — PEFT's
-  /// `target_modules` / `exclude_modules` selection lives in [`PeftSelection`].
+  /// `"self_attn.q_proj"`). Empty ⇒ adapt every eligible linear (§1 EMPTY=ABSENT).
+  /// This is the `lora_parameters.keys` key. A PEFT config leaves this empty —
+  /// PEFT's `target_modules` / `exclude_modules` selection lives in
+  /// [`PeftSelection`].
+  ///
+  /// Private: access via [`keys_slice`](Self::keys_slice).
   #[serde(default)]
-  pub keys: Option<Vec<String>>,
+  keys: Vec<String>,
   /// Training dropout — carried for round-trip fidelity, **ignored at
   /// inference** (see module docs). The mlx-lm-native `lora_parameters.dropout`
   /// or the PEFT top-level `lora_dropout`.
@@ -280,9 +306,18 @@ impl Default for LoraParameters {
       rank: DEFAULT_LORA_RANK,
       scale: None,
       alpha: None,
-      keys: None,
+      keys: Vec::new(),
       dropout: None,
     }
+  }
+}
+
+impl LoraParameters {
+  /// The mlx-lm-native explicit target-projection allowlist. Empty ⇒ adapt
+  /// every eligible linear (§1 EMPTY=ABSENT — the auto-discovery path).
+  #[inline(always)]
+  pub fn keys_slice(&self) -> &[String] {
+    &self.keys
   }
 }
 
@@ -343,7 +378,7 @@ impl LoraParameters {
 /// (`model.get_output_embeddings()`). This is the [`ModuleMatcher::AllLinear`]
 /// arm — see `peft_module_is_selected` for how the eligibility (rank-2
 /// `.weight`) + head exclusion are applied without a module tree.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, derive_more::IsVariant)]
 pub enum ModuleMatcher {
   /// `["q_proj", "v_proj"]` — exact-or-`.endswith` suffix match.
   List(Vec<String>),
@@ -1450,7 +1485,7 @@ impl<'de> serde::Deserialize<'de> for LoraConfig {
         // PEFT `lora_alpha` defaults to 8 (NOT the mlx-lm `20.0` literal).
         alpha: Some(raw.lora_alpha.unwrap_or(DEFAULT_PEFT_LORA_ALPHA)),
         // PEFT selection lives in `PeftSelection`, not `keys`.
-        keys: None,
+        keys: Vec::new(),
         dropout: raw.lora_dropout,
       };
       return Ok(LoraConfig {
@@ -2907,7 +2942,7 @@ pub fn linear_to_lora_layers(
   // head-exclusion is approximate, so a discovered linear the adapter did not
   // train must be skipped (like auto-discovery), not flagged missing.
   let explicit_selection = match &config.selection {
-    AdapterSelection::MlxLm { .. } => config.lora_parameters.keys.is_some(),
+    AdapterSelection::MlxLm { .. } => !config.lora_parameters.keys.is_empty(),
     AdapterSelection::Peft(peft) => {
       matches!(&peft.target_modules, Some(m) if !matches!(m, ModuleMatcher::AllLinear))
     }
@@ -2971,17 +3006,20 @@ fn module_is_selected(path: &str, weight: &Array, config: &LoraConfig, first_ada
     AdapterSelection::MlxLm { .. } => {
       // mlx-lm: `keys` suffix allowlist, or rank-2 auto-discovery, then the
       // trailing-`num_layers`-block window.
-      match config.lora_parameters.keys.as_deref() {
-        Some(keys) => {
-          if !keys.iter().any(|k| path_matches_key(path, k)) {
-            return false;
-          }
+      if !config.lora_parameters.keys.is_empty() {
+        // explicit allowlist: path must match a key suffix
+        if !config
+          .lora_parameters
+          .keys
+          .iter()
+          .any(|k| path_matches_key(path, k))
+        {
+          return false;
         }
-        None => {
-          // auto-discovery: only rank-2 weights are "linears".
-          if weight.shape().len() != 2 {
-            return false;
-          }
+      } else {
+        // auto-discovery: only rank-2 weights are "linears".
+        if weight.shape().len() != 2 {
+          return false;
         }
       }
       // A path inside a decoder block is adapted only when its block index is
@@ -3228,7 +3266,7 @@ fn build_base_linear(
       bias,
       q.group_size,
       q.bits,
-      q.mode.as_mlx_str().to_string(),
+      q.mode.as_str().to_string(),
     );
   }
 
@@ -3848,8 +3886,8 @@ mod tests {
   }
 
   /// The `keys`-allowlisted rank-2 `LoraParameters` the layer-selection tests
-  /// reuse (`scale = 2.0`, the given `keys`).
-  fn keyed_params(keys: Option<Vec<String>>) -> LoraParameters {
+  /// reuse (`scale = 2.0`, the given `keys`; empty = auto-discovery).
+  fn keyed_params(keys: Vec<String>) -> LoraParameters {
     LoraParameters {
       rank: 2,
       scale: Some(2.0),
@@ -4139,7 +4177,7 @@ mod tests {
     assert_eq!(cfg.scale(), 2.0);
     // `target_modules` lands in the PEFT selection (NOT `keys` — PEFT
     // selection is the richer `PeftSelection`).
-    assert!(cfg.lora_parameters.keys.is_none());
+    assert!(cfg.lora_parameters.keys_slice().is_empty());
     let peft = cfg.peft().expect("PEFT config must carry a PeftSelection");
     match &peft.target_modules {
       Some(ModuleMatcher::List(names)) => {
@@ -4397,7 +4435,7 @@ mod tests {
     // `lora_layers_extra_factors_outside_window_is_err`).
     let weights = toy_weights();
     let params = toy_adapter_params_for(&[2, 3]);
-    let cfg = mlxlm_config(2, keyed_params(Some(vec!["self_attn.q_proj".to_string()])));
+    let cfg = mlxlm_config(2, keyed_params(vec!["self_attn.q_proj".to_string()]));
     let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap();
     // Only blocks 2 and 3 are inside the trailing-2 window.
     assert!(layers.contains_key("model.layers.2.self_attn.q_proj"));
@@ -4416,7 +4454,7 @@ mod tests {
     let weights = toy_weights();
     let params = toy_adapter_params();
     // num_layers 16 > 4 blocks ⇒ all q_proj blocks wrap.
-    let cfg = mlxlm_config(16, keyed_params(Some(vec!["self_attn.q_proj".to_string()])));
+    let cfg = mlxlm_config(16, keyed_params(vec!["self_attn.q_proj".to_string()]));
     let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap();
     assert_eq!(layers.len(), 4);
   }
@@ -4837,7 +4875,7 @@ mod tests {
       rank: 8,
       scale: None,
       alpha: Some(32.0),
-      keys: None,
+      keys: Vec::new(),
       dropout: None,
     };
     assert_eq!(p.resolved_scale(), 4.0);
@@ -4850,7 +4888,7 @@ mod tests {
       rank: 8,
       scale: Some(7.5),
       alpha: None,
-      keys: None,
+      keys: Vec::new(),
       dropout: None,
     };
     assert_eq!(p.resolved_scale(), 7.5);
@@ -4864,7 +4902,7 @@ mod tests {
       rank: 16,
       scale: Some(99.0),
       alpha: Some(64.0),
-      keys: None,
+      keys: Vec::new(),
       dropout: None,
     };
     assert_eq!(p.resolved_scale(), 4.0);
@@ -4877,7 +4915,7 @@ mod tests {
       rank: 8,
       scale: None,
       alpha: None,
-      keys: None,
+      keys: Vec::new(),
       dropout: None,
     };
     assert_eq!(p.resolved_scale(), DEFAULT_LORA_SCALE);
@@ -4891,7 +4929,7 @@ mod tests {
       rank: 0,
       scale: Some(5.0),
       alpha: Some(32.0),
-      keys: None,
+      keys: Vec::new(),
       dropout: None,
     };
     assert_eq!(p.resolved_scale(), 5.0);
@@ -4899,7 +4937,7 @@ mod tests {
       rank: -1,
       scale: None,
       alpha: Some(32.0),
-      keys: None,
+      keys: Vec::new(),
       dropout: None,
     };
     assert_eq!(p_no_scale.resolved_scale(), DEFAULT_LORA_SCALE);
@@ -4925,7 +4963,7 @@ mod tests {
     // num_layers: -1 adapts EVERY decoder block, not none.
     let weights = toy_weights();
     let params = toy_adapter_params(); // factors for all 4 q_proj blocks
-    let cfg = mlxlm_config(-1, keyed_params(Some(vec!["self_attn.q_proj".to_string()])));
+    let cfg = mlxlm_config(-1, keyed_params(vec!["self_attn.q_proj".to_string()]));
     let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap();
     assert_eq!(layers.len(), 4, "num_layers=-1 must adapt all 4 blocks");
     for b in 0..4 {
@@ -4938,7 +4976,7 @@ mod tests {
     // num_layers: 0 ⇒ `max(0,0)=0` ⇒ `layers[-0:]` == all blocks too.
     let weights = toy_weights();
     let params = toy_adapter_params();
-    let cfg = mlxlm_config(0, keyed_params(Some(vec!["self_attn.q_proj".to_string()])));
+    let cfg = mlxlm_config(0, keyed_params(vec!["self_attn.q_proj".to_string()]));
     let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap();
     assert_eq!(layers.len(), 4, "num_layers=0 must adapt all 4 blocks");
   }
@@ -4952,7 +4990,7 @@ mod tests {
     // targets with no factors ⇒ Err (case a).
     let weights = toy_weights();
     let params = toy_adapter_params_for(&[0, 1]);
-    let cfg = mlxlm_config(16, keyed_params(Some(vec!["self_attn.q_proj".to_string()])));
+    let cfg = mlxlm_config(16, keyed_params(vec!["self_attn.q_proj".to_string()]));
     let err = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap_err();
     match err {
       Error::Backend { message } => {
@@ -4976,7 +5014,7 @@ mod tests {
       "model.layers.99.self_attn.q_proj".to_string(),
       plain_params(),
     );
-    let cfg = mlxlm_config(16, keyed_params(Some(vec!["self_attn.q_proj".to_string()])));
+    let cfg = mlxlm_config(16, keyed_params(vec!["self_attn.q_proj".to_string()]));
     let err = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap_err();
     match err {
       Error::Backend { message } => {
@@ -4998,7 +5036,7 @@ mod tests {
     let params: HashMap<String, AdapterParams> = HashMap::new();
     let cfg = mlxlm_config(
       16,
-      keyed_params(Some(vec!["self_attn.nonexistent_proj".to_string()])),
+      keyed_params(vec!["self_attn.nonexistent_proj".to_string()]),
     );
     let err = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap_err();
     match err {
@@ -5019,7 +5057,7 @@ mod tests {
     // empty-result (c) checks apply. Factors for 2 of the 4 q_proj blocks ⇒ Ok.
     let weights = toy_weights();
     let params = toy_adapter_params_for(&[2, 3]);
-    let cfg = mlxlm_config(16, keyed_params(None));
+    let cfg = mlxlm_config(16, keyed_params(Vec::new()));
     let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap();
     assert_eq!(layers.len(), 2);
   }
@@ -7061,7 +7099,7 @@ mod tests {
         rank: 2,
         scale: Some(2.0),
         alpha: None,
-        keys: Some(vec!["self_attn.q_proj".to_string()]),
+        keys: vec!["self_attn.q_proj".to_string()],
         dropout: None,
       },
       use_dora: false,

@@ -14,7 +14,7 @@ use mlxrs::{
   Array,
   lm::{
     cache::{CacheConfig, KvCache, make_prompt_cache},
-    generate::{GenConfig, generate},
+    generate::{FinishReason, GenConfig, generate},
     model::Model,
     speculative::{DraftConfig, speculative_generate, speculative_stream_generate},
   },
@@ -204,21 +204,17 @@ fn speculative_decoding_greedy_self_draft_byte_identical() {
   let eos: Vec<u32> = tok.eos_token_ids_iter().collect();
 
   // Plain generate baseline.
-  let cfg_baseline = GenConfig {
-    max_tokens,
-    eos: eos.clone(),
-    ..GenConfig::default()
-  };
+  let cfg_baseline = GenConfig::default()
+    .with_max_tokens(max_tokens)
+    .with_eos(eos.clone());
   // L3: `generate` now returns `(String, GenerationStats)`; the speculative
   // parity assertions compare only the assembled text.
   let (baseline, _) = generate(&target, &tok, &[3u32], cache(1), cfg_baseline).unwrap();
 
   // Speculative with self-draft (move `eos` — last use here).
-  let cfg_spec = GenConfig {
-    max_tokens,
-    eos,
-    ..GenConfig::default()
-  };
+  let cfg_spec = GenConfig::default()
+    .with_max_tokens(max_tokens)
+    .with_eos(eos);
   let draft_cfg = DraftConfig {
     draft_model: Box::new(draft),
     n_draft_tokens: 3,
@@ -270,20 +266,16 @@ fn speculative_decoding_diverging_draft_still_correct() {
   let max_tokens = 6;
   let eos: Vec<u32> = tok.eos_token_ids_iter().collect();
 
-  let cfg_baseline = GenConfig {
-    max_tokens,
-    eos: eos.clone(),
-    ..GenConfig::default()
-  };
+  let cfg_baseline = GenConfig::default()
+    .with_max_tokens(max_tokens)
+    .with_eos(eos.clone());
   // L3: `generate` now returns `(String, GenerationStats)`; the speculative
   // parity assertions compare only the assembled text.
   let (baseline, _) = generate(&target, &tok, &[3u32], cache(1), cfg_baseline).unwrap();
 
-  let cfg_spec = GenConfig {
-    max_tokens,
-    eos,
-    ..GenConfig::default()
-  };
+  let cfg_spec = GenConfig::default()
+    .with_max_tokens(max_tokens)
+    .with_eos(eos);
   let draft_cfg = DraftConfig {
     draft_model: Box::new(draft),
     n_draft_tokens: 3,
@@ -332,11 +324,7 @@ fn speculative_stats_track_accept_rate() {
       draft_model: Box::new(MockModel::ramp(5)),
       n_draft_tokens: 2,
     },
-    GenConfig {
-      max_tokens: 5,
-      eos: vec![],
-      ..GenConfig::default()
-    },
+    GenConfig::default().with_max_tokens(5),
   )
   .unwrap();
   let r_self = stats_self.accept_rate();
@@ -361,11 +349,7 @@ fn speculative_stats_track_accept_rate() {
       draft_model: Box::new(always_wrong),
       n_draft_tokens: 2,
     },
-    GenConfig {
-      max_tokens: 4,
-      eos: vec![],
-      ..GenConfig::default()
-    },
+    GenConfig::default().with_max_tokens(4),
   )
   .unwrap();
   let r_wrong = stats_wrong.accept_rate();
@@ -414,11 +398,7 @@ fn kv_cache_rollback_after_rejection() {
       draft_model: Box::new(always_wrong),
       n_draft_tokens: n_draft,
     },
-    GenConfig {
-      max_tokens,
-      eos: vec![],
-      ..GenConfig::default()
-    },
+    GenConfig::default().with_max_tokens(max_tokens),
   ) {
     let r = r.unwrap();
     last_stats = r.stats;
@@ -464,11 +444,7 @@ fn speculative_n_draft_zero_degenerates_to_plain() {
     &tok,
     &[3u32],
     cache(1),
-    GenConfig {
-      max_tokens,
-      eos: vec![],
-      ..GenConfig::default()
-    },
+    GenConfig::default().with_max_tokens(max_tokens),
   )
   .unwrap();
 
@@ -482,11 +458,7 @@ fn speculative_n_draft_zero_degenerates_to_plain() {
       draft_model: Box::new(draft),
       n_draft_tokens: 0,
     },
-    GenConfig {
-      max_tokens,
-      eos: vec![],
-      ..GenConfig::default()
-    },
+    GenConfig::default().with_max_tokens(max_tokens),
   )
   .unwrap();
 
@@ -516,21 +488,19 @@ fn speculative_self_draft_with_repetition_penalty_byte_identical() {
   let draft = MockModel::with_bias(vec![0.0, 0.0, 0.0, 10.0, 12.0]);
 
   let max_tokens = 6;
-  let cfg_baseline = GenConfig {
-    max_tokens,
-    eos: vec![],
-    repetition_penalty: Some(2.0),
-    ..GenConfig::default()
+  let cfg_baseline = {
+    let mut _c = GenConfig::default().with_max_tokens(max_tokens);
+    _c.repetition_penalty = Some(2.0);
+    _c
   };
   // L3: `generate` now returns `(String, GenerationStats)`; the speculative
   // parity assertions compare only the assembled text.
   let (baseline, _) = generate(&target, &tok, &[3u32], cache(1), cfg_baseline).unwrap();
 
-  let cfg_spec = GenConfig {
-    max_tokens,
-    eos: vec![],
-    repetition_penalty: Some(2.0),
-    ..GenConfig::default()
+  let cfg_spec = {
+    let mut _c = GenConfig::default().with_max_tokens(max_tokens);
+    _c.repetition_penalty = Some(2.0);
+    _c
   };
   let (spec, _stats) = speculative_generate(
     &target,
@@ -566,21 +536,19 @@ fn speculative_self_draft_with_presence_penalty_byte_identical() {
   let draft = MockModel::with_bias(vec![0.0, 0.0, 0.0, 10.0, 12.0]);
 
   let max_tokens = 6;
-  let cfg_baseline = GenConfig {
-    max_tokens,
-    eos: vec![],
-    presence_penalty: Some(3.0),
-    ..GenConfig::default()
+  let cfg_baseline = {
+    let mut _c = GenConfig::default().with_max_tokens(max_tokens);
+    _c.presence_penalty = Some(3.0);
+    _c
   };
   // L3: `generate` now returns `(String, GenerationStats)`; the speculative
   // parity assertions compare only the assembled text.
   let (baseline, _) = generate(&target, &tok, &[3u32], cache(1), cfg_baseline).unwrap();
 
-  let cfg_spec = GenConfig {
-    max_tokens,
-    eos: vec![],
-    presence_penalty: Some(3.0),
-    ..GenConfig::default()
+  let cfg_spec = {
+    let mut _c = GenConfig::default().with_max_tokens(max_tokens);
+    _c.presence_penalty = Some(3.0);
+    _c
   };
   let (spec, _stats) = speculative_generate(
     &target,
@@ -620,21 +588,19 @@ fn speculative_diverging_draft_with_repetition_penalty_byte_identical() {
   let draft = DivergingDraft::new();
 
   let max_tokens = 6;
-  let cfg_baseline = GenConfig {
-    max_tokens,
-    eos: vec![],
-    repetition_penalty: Some(2.0),
-    ..GenConfig::default()
+  let cfg_baseline = {
+    let mut _c = GenConfig::default().with_max_tokens(max_tokens);
+    _c.repetition_penalty = Some(2.0);
+    _c
   };
   // L3: `generate` now returns `(String, GenerationStats)`; the speculative
   // parity assertions compare only the assembled text.
   let (baseline, _) = generate(&target, &tok, &[3u32], cache(1), cfg_baseline).unwrap();
 
-  let cfg_spec = GenConfig {
-    max_tokens,
-    eos: vec![],
-    repetition_penalty: Some(2.0),
-    ..GenConfig::default()
+  let cfg_spec = {
+    let mut _c = GenConfig::default().with_max_tokens(max_tokens);
+    _c.repetition_penalty = Some(2.0);
+    _c
   };
   let (spec, _stats) = speculative_generate(
     &target,
@@ -687,11 +653,7 @@ fn speculative_eos_in_first_accepted_draft_stats_match_yields() {
       draft_model: Box::new(draft),
       n_draft_tokens: 2,
     },
-    GenConfig {
-      max_tokens: 50,
-      eos,
-      ..GenConfig::default()
-    },
+    GenConfig::default().with_max_tokens(50).with_eos(eos),
   )
   .map(|r| r.unwrap())
   .collect();
@@ -704,8 +666,8 @@ fn speculative_eos_in_first_accepted_draft_stats_match_yields() {
   );
   let r = responses.first().expect("one response");
   assert_eq!(
-    r.response.finish_reason.as_deref(),
-    Some("stop"),
+    r.response.finish_reason,
+    Some(FinishReason::Eos),
     "first (and only) response is the EOS stop"
   );
   assert_eq!(
@@ -758,11 +720,7 @@ fn speculative_self_draft_final_partial_step_proposes_and_accepts() {
       draft_model: Box::new(draft),
       n_draft_tokens: 3,
     },
-    GenConfig {
-      max_tokens: 5,
-      eos: vec![], // no eos override; tokenizer's eos won't fire (bias=0)
-      ..GenConfig::default()
-    },
+    GenConfig::default().with_max_tokens(5),
   )
   .map(|r| r.unwrap())
   .collect();
@@ -775,8 +733,8 @@ fn speculative_self_draft_final_partial_step_proposes_and_accepts() {
   );
   let last = responses.last().expect("last response");
   assert_eq!(
-    last.response.finish_reason.as_deref(),
-    Some("length"),
+    last.response.finish_reason,
+    Some(FinishReason::Length),
     "final yield is the length-cap stop"
   );
   // R3: the last yielded token is an ACCEPTED DRAFT from step 2, not a
@@ -826,16 +784,12 @@ fn speculative_stops_on_eos() {
       draft_model: Box::new(draft),
       n_draft_tokens: 2,
     },
-    GenConfig {
-      max_tokens: 50,
-      eos,
-      ..GenConfig::default()
-    },
+    GenConfig::default().with_max_tokens(50).with_eos(eos),
   )
   .map(|r| r.unwrap())
   .collect();
   let last = responses.last().expect("at least one response");
-  assert_eq!(last.response.finish_reason.as_deref(), Some("stop"));
+  assert_eq!(last.response.finish_reason, Some(FinishReason::Eos));
   let full: String = responses.iter().map(|r| r.response.text.as_str()).collect();
   assert!(
     !full.contains("</s>"),

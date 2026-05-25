@@ -61,7 +61,8 @@ use crate::{
   lm::{
     cache::KvCache,
     generate::{
-      GenConfig, GenStep, LogitsProcessor, Sampler, make_logits_processors, make_sampler,
+      FinishReason, GenConfig, GenStep, LogitsProcessor, Sampler, make_logits_processors,
+      make_sampler,
     },
   },
   ops,
@@ -346,8 +347,8 @@ pub struct SttGenerator<'a, M: super::model::Model> {
   /// `max_tokens`.
   produced: usize,
   max_tokens: usize,
-  /// Stop-token set: per-model `eos_token()` plus any
-  /// [`GenConfig::eos`][crate::lm::generate::GenConfig::eos] caller override
+  /// Stop-token set: per-model `eos_token()` plus any caller override via
+  /// [`GenConfig::with_eos`][crate::lm::generate::GenConfig::with_eos]
   /// (the union, so a caller can add task-specific stop tokens — e.g.
   /// whisper's `<|endoftext|>` plus a custom timestamp-end marker — without
   /// dropping the model's own EOS).
@@ -459,7 +460,7 @@ impl<M: super::model::Model> Iterator for SttGenerator<'_, M> {
           self.done = true;
           // LM-3 #114: "stop" reason on the EOS step (mirrors
           // `lm::generate::Generator::next` + VLM).
-          step.finish_reason = Some("stop".to_string());
+          step.finish_reason = Some(FinishReason::Eos);
         }
         Some(Ok(step))
       }
@@ -493,8 +494,8 @@ impl<M: super::model::Model> Iterator for SttGenerator<'_, M> {
 ///
 /// Returns an [`Iterator`]`<Item = Result<GenStep>>` — the same per-step
 /// contract the LM loop returns. Iteration ends on the EOS token (the
-/// union of [`super::model::Model::eos_token`] and the
-/// [`GenConfig::eos`][crate::lm::generate::GenConfig::eos] override; the
+/// union of [`super::model::Model::eos_token`] and the eos override set via
+/// [`GenConfig::with_eos`][crate::lm::generate::GenConfig::with_eos]; the
 /// EOS token IS yielded as the final step) or after
 /// [`GenConfig::max_tokens`][crate::lm::generate::GenConfig::max_tokens]
 /// tokens have been produced.

@@ -321,11 +321,7 @@ fn driver_loaded_cache_continues_like_scratch() {
     &model,
     &prompt,
     cache(2),
-    GenConfig {
-      max_tokens: 4,
-      eos: vec![],
-      ..GenConfig::default()
-    },
+    GenConfig::default().with_max_tokens(4),
   )
   .map(|r| r.unwrap().token)
   .collect();
@@ -342,11 +338,7 @@ fn driver_loaded_cache_continues_like_scratch() {
     &model,
     &[*prompt.last().unwrap()], // continue from the cached prefix
     loaded,
-    GenConfig {
-      max_tokens: 4,
-      eos: vec![],
-      ..GenConfig::default()
-    },
+    GenConfig::default().with_max_tokens(4),
   )
   .map(|r| r.unwrap().token)
   .collect();
@@ -746,11 +738,7 @@ fn cache_prompt_chat_template_uses_continue_final_message_offset() {
     &model,
     &continued,
     cache(2),
-    GenConfig {
-      max_tokens: 3,
-      eos: vec![],
-      ..GenConfig::default()
-    },
+    GenConfig::default().with_max_tokens(3),
   )
   .map(|r| r.unwrap().token)
   .collect();
@@ -758,11 +746,7 @@ fn cache_prompt_chat_template_uses_continue_final_message_offset() {
     &model,
     &[*continued.last().unwrap()],
     loaded,
-    GenConfig {
-      max_tokens: 3,
-      eos: vec![],
-      ..GenConfig::default()
-    },
+    GenConfig::default().with_max_tokens(3),
   )
   .map(|r| r.unwrap().token)
   .collect();
