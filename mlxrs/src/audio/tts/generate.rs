@@ -32,10 +32,14 @@
 
 use derive_more::{Display, IsVariant};
 
+use smol_str::format_smolstr;
+
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{DtypeMismatchPayload, Error, Result},
+  error::{
+    CapExceededPayload, DtypeMismatchPayload, Error, LayerKeyedPayload, RankMismatchPayload, Result,
+  },
   ops,
 };
 
@@ -961,9 +965,13 @@ impl<M: TtsModel> TtsGenerator<'_, M> {
     // `decode_step` `[1, V]` shape check.
     let shape = audio.shape();
     if shape.len() != 1 {
-      return Err(Error::ShapeMismatch(format!(
-        "tts_generate: `synthesize_segment` must return a rank-1 [samples] \
-           audio tensor, got shape {shape:?} (segment {idx})"
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        format_smolstr!("tts_generate: segment {idx}"),
+        Error::RankMismatch(RankMismatchPayload::new(
+          "tts_generate: `synthesize_segment` must return a rank-1 [samples] audio tensor",
+          shape.len() as u32,
+          shape,
+        )),
       )));
     }
 
@@ -1113,10 +1121,11 @@ pub fn tts_generate_with_reference<'a, M: TtsModel>(
   //    STT loop's `max_audio_seconds` up-front check). `text.len()` is the
   //    UTF-8 byte length.
   if text.len() > MAX_TEXT_BYTES {
-    return Err(Error::Backend(format!(
-      "tts_generate: input text is {} bytes, exceeds the {MAX_TEXT_BYTES}-byte \
-         (1 MiB) cap; split the request into smaller calls",
-      text.len()
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "tts_generate: input text size (split the request into smaller calls)",
+      "MAX_TEXT_BYTES",
+      MAX_TEXT_BYTES as u64,
+      text.len() as u64,
     )));
   }
 

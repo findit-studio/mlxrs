@@ -25,12 +25,14 @@
 
 use std::{collections::HashMap, fs, path::Path};
 
+use smol_str::format_smolstr;
+
 use crate::{
   audio::tts::g2p::{
     arpabet,
     types::{Lexicon, LexiconEntry},
   },
-  error::{Error, FileIoPayload, FileOp, Result},
+  error::{Error, FileIoPayload, FileOp, MissingKeyPayload, OutOfRangePayload, Result},
 };
 
 /// One row of a parsed CMUDict file, BEFORE ARPAbet→IPA conversion.
@@ -94,13 +96,17 @@ impl RawEntry {
   }
 }
 
-/// Construct a `malformed-word` [`Error::Backend`] tagged with the
+/// Construct a `malformed-word` [`Error::OutOfRange`] tagged with the
 /// 1-indexed `line_number`, the offending `word_token`, and a short
 /// `reason` describing why the parse failed.
-fn malformed_word(word_token: &str, line_number: usize, reason: &str) -> Error {
-  Error::Backend(format!(
-    "CMUDict line {line_number}: malformed word '{word_token}' (expected WORD or WORD(N)) — \
-       {reason}"
+///
+/// `reason` must be a `&'static str` so it can live in the typed
+/// `OutOfRangePayload::requirement` field.
+fn malformed_word(word_token: &str, line_number: usize, reason: &'static str) -> Error {
+  Error::OutOfRange(OutOfRangePayload::new(
+    "CMUDict parse: malformed word token (expected WORD or WORD(N))",
+    reason,
+    format_smolstr!("line {line_number}: '{word_token}'"),
   ))
 }
 
@@ -187,8 +193,10 @@ pub fn parse_line(line: &str, line_number: usize) -> Result<Option<RawEntry>> {
   // Split on first ASCII space: word is the first token, pronunciation is
   // the rest (handles both raw `cmudict.dict` and double-space formats).
   let Some(first_space) = trimmed.find(' ') else {
-    return Err(Error::Backend(format!(
-      "CMUDict line {line_number}: missing whitespace between word and pronunciation"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "CMUDict line",
+      "must contain whitespace between word and pronunciation",
+      format_smolstr!("{line_number}"),
     )));
   };
 
@@ -196,8 +204,10 @@ pub fn parse_line(line: &str, line_number: usize) -> Result<Option<RawEntry>> {
   let pron_part = trimmed[first_space + 1..].trim();
 
   if word_part.is_empty() || pron_part.is_empty() {
-    return Err(Error::Backend(format!(
-      "CMUDict line {line_number}: empty word or pronunciation"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "CMUDict line",
+      "word and pronunciation must both be non-empty",
+      format_smolstr!("{line_number}"),
     )));
   }
 
@@ -211,8 +221,10 @@ pub fn parse_line(line: &str, line_number: usize) -> Result<Option<RawEntry>> {
     .map(String::from)
     .collect();
   if arpabet.is_empty() {
-    return Err(Error::Backend(format!(
-      "CMUDict line {line_number}: empty pronunciation"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "CMUDict line",
+      "pronunciation must be non-empty",
+      format_smolstr!("{line_number}"),
     )));
   }
 
@@ -283,18 +295,22 @@ impl CMUDict {
     let mut entries = Vec::new();
     for r in raw {
       let phonemes = arpabet::try_convert_sequence_strict(r.arpabet()).map_err(|bad| {
-        Error::Backend(format!(
-          "CMUDict line {}: word '{}' has unknown ARPAbet token '{}'",
-          r.line_number(),
-          r.word(),
-          bad.token(),
+        Error::OutOfRange(OutOfRangePayload::new(
+          "CMUDict ARPAbet token",
+          "must be a known ARPAbet symbol",
+          format_smolstr!(
+            "line {}: word '{}' token '{}'",
+            r.line_number(),
+            r.word(),
+            bad.token(),
+          ),
         ))
       })?;
       if phonemes.is_empty() {
-        return Err(Error::Backend(format!(
-          "CMUDict line {}: word '{}' has empty pronunciation after ARPAbet → IPA conversion",
-          r.line_number(),
-          r.word(),
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "CMUDict line: pronunciation after ARPAbet → IPA conversion",
+          "must be non-empty",
+          format_smolstr!("line {}: word '{}'", r.line_number(), r.word()),
         )));
       }
       entries.push(LexiconEntry::new(r.word().to_owned(), phonemes));
@@ -336,14 +352,17 @@ impl CMUDictLoader {
   /// [`CMUDict`].
   ///
   /// Errors:
-  /// - [`Error::Backend`] if the file is missing or unreadable.
-  /// - [`Error::Backend`] (with line number) on a malformed row.
+  /// - [`Error::MissingKey`] if the `cmudict.dict` file is not present in
+  ///   `directory`.
+  /// - [`Error::FileIo`] if the file cannot be read.
+  /// - [`Error::OutOfRange`] (with the 1-indexed line number) on a malformed
+  ///   row.
   pub fn load(directory: &Path) -> Result<CMUDict> {
     let path = directory.join("cmudict.dict");
     if !path.exists() {
-      return Err(Error::Backend(format!(
-        "cmudict.dict missing at {}",
-        path.display()
+      return Err(Error::MissingKey(MissingKeyPayload::new(
+        "CMUDictLoader::load: required file not found",
+        format_smolstr!("{}", path.display()),
       )));
     }
 
@@ -427,8 +446,14 @@ mod tests {
   #[test]
   fn malformed_line_errors_with_line_number() {
     let err = parse_line("nopronunciation", 42).unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("line 42"), "expected line number in {msg:?}");
+    let Error::OutOfRange(payload) = &err else {
+      panic!("malformed parse_line must be OutOfRange, got: {err:?}");
+    };
+    assert_eq!(
+      payload.value(),
+      "42",
+      "OutOfRange payload value must carry the 1-indexed line number"
+    );
   }
 
   // === parse (bulk) ===
@@ -462,7 +487,14 @@ mod tests {
   fn bulk_propagates_line_number_on_first_error() {
     let text = "hello  HH AH0\nbadline\nworld  W ER1 L D";
     let err = parse(text, false).unwrap_err();
-    assert!(err.to_string().contains("line 2"), "{}", err);
+    let Error::OutOfRange(payload) = &err else {
+      panic!("bulk parse first error must be OutOfRange, got: {err:?}");
+    };
+    assert_eq!(
+      payload.value(),
+      "2",
+      "OutOfRange payload value must carry the 1-indexed line number (2 for the malformed `badline` row)"
+    );
   }
 
   // === CMUDict + Lexicon ===
@@ -573,7 +605,14 @@ mod tests {
   fn loader_errors_on_missing_file() {
     let dir = temp_dir("missing_file");
     let err = CMUDictLoader::load(&dir).unwrap_err();
-    assert!(err.to_string().contains("cmudict.dict missing"));
+    let Error::MissingKey(payload) = &err else {
+      panic!("missing cmudict.dict must be MissingKey, got: {err:?}");
+    };
+    assert!(
+      payload.key().ends_with("cmudict.dict"),
+      "MissingKey payload key must name the missing cmudict.dict file, got: {}",
+      payload.key()
+    );
   }
 
   #[test]
@@ -588,7 +627,14 @@ mod tests {
     .unwrap();
 
     let err = CMUDictLoader::load(&dir).unwrap_err();
-    assert!(err.to_string().contains("line 2"), "{}", err);
+    let Error::OutOfRange(payload) = &err else {
+      panic!("loader malformed-line error must be OutOfRange, got: {err:?}");
+    };
+    assert_eq!(
+      payload.value(),
+      "2",
+      "OutOfRange payload value must carry the 1-indexed line number (2 for the malformed `badline` row)"
+    );
   }
 
   /// Latin-1 fallback — bytes that aren't valid UTF-8 (e.g. an isolated

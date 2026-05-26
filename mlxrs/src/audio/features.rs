@@ -47,11 +47,15 @@
 //!   `dither_key: Option<&Array>` — pass `None` (or `dither == 0.0`) for
 //!   deterministic output, pass `Some(&key)` to seed the dither additively.
 
-use crate::error::{EmptyInputPayload, InvariantViolationPayload, OutOfRangePayload};
+use smol_str::format_smolstr;
 use std::f32::consts::PI;
 
 use crate::{
   Array, Error, Result,
+  error::{
+    AllocFailurePayload, ArithmeticOverflowPayload, CapExceededPayload, EmptyInputPayload,
+    InvariantViolationPayload, OutOfRangePayload, RankMismatchPayload,
+  },
   ops::{
     self,
     fft::{self, FftNorm},
@@ -225,44 +229,58 @@ pub fn get_mel_banks_kaldi(
   // `dsp.py:831` — the reference's `assert` covers low/high range; we surface
   // it as a recoverable error.
   if !(low_freq >= 0.0 && low_freq < nyquist) {
-    return Err(Error::Backend(format!(
-      "get_mel_banks_kaldi: low_freq must satisfy 0 <= low_freq < nyquist \
-         (got low_freq={low_freq}, nyquist={nyquist})"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "get_mel_banks_kaldi: low_freq",
+      "must satisfy 0 <= low_freq < nyquist",
+      format_smolstr!("low_freq={low_freq}, nyquist={nyquist}"),
     )));
   }
   if !(high_freq > 0.0 && high_freq <= nyquist) {
-    return Err(Error::Backend(format!(
-      "get_mel_banks_kaldi: high_freq must satisfy 0 < high_freq <= nyquist \
-         (got high_freq={high_freq}, nyquist={nyquist})"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "get_mel_banks_kaldi: high_freq",
+      "must satisfy 0 < high_freq <= nyquist",
+      format_smolstr!("high_freq={high_freq}, nyquist={nyquist}"),
     )));
   }
   if low_freq >= high_freq {
-    return Err(Error::Backend(format!(
-      "get_mel_banks_kaldi: low_freq {low_freq} must be < high_freq {high_freq}"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "get_mel_banks_kaldi: low_freq",
+      "must be < high_freq",
+      format_smolstr!("low_freq={low_freq}, high_freq={high_freq}"),
     )));
   }
 
   let num_fft_bins = n_fft_padded / 2; // omits the Nyquist bin (reference)
   let bank_len = num_bins.checked_mul(num_fft_bins).ok_or_else(|| {
-    Error::Backend(format!(
-      "get_mel_banks_kaldi: num_bins * num_fft_bins overflows usize \
-         (num_bins={num_bins}, num_fft_bins={num_fft_bins})"
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "get_mel_banks_kaldi: num_bins * num_fft_bins",
+      "usize",
+      [
+        ("num_bins", num_bins as u64),
+        ("num_fft_bins", num_fft_bins as u64),
+      ],
     ))
   })?;
   if bank_len > MAX_FBANK_WORK {
-    return Err(Error::Backend(format!(
-      "get_mel_banks_kaldi: bank_len {bank_len} (num_bins={num_bins} * \
-         num_fft_bins={num_fft_bins}) exceeds the {MAX_FBANK_WORK} work cap"
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "get_mel_banks_kaldi: bank_len (= num_bins * num_fft_bins) exceeds work cap",
+      "MAX_FBANK_WORK",
+      MAX_FBANK_WORK as u64,
+      bank_len as u64,
     )));
   }
   let num_bins_i32 = i32::try_from(num_bins).map_err(|_| {
-    Error::Backend(format!(
-      "get_mel_banks_kaldi: num_bins {num_bins} exceeds i32::MAX"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "get_mel_banks_kaldi: num_bins",
+      "must fit in i32 (i32::MAX = 2147483647)",
+      format_smolstr!("{num_bins}"),
     ))
   })?;
   let num_fft_bins_i32 = i32::try_from(num_fft_bins).map_err(|_| {
-    Error::Backend(format!(
-      "get_mel_banks_kaldi: num_fft_bins {num_fft_bins} exceeds i32::MAX"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "get_mel_banks_kaldi: num_fft_bins",
+      "must fit in i32 (i32::MAX = 2147483647)",
+      format_smolstr!("{num_fft_bins}"),
     ))
   })?;
 
@@ -279,8 +297,11 @@ pub fn get_mel_banks_kaldi(
   // sample_freq, low, high)` tuple so the CPU-only build is the right shape.
   let mut bank: Vec<f32> = Vec::new();
   bank.try_reserve_exact(bank_len).map_err(|e| {
-    Error::Backend(format!(
-      "get_mel_banks_kaldi: allocation of {bank_len} f32 elements failed: {e}"
+    Error::AllocFailure(AllocFailurePayload::new(
+      "get_mel_banks_kaldi: bank reservation",
+      "f32 elements",
+      bank_len as u64,
+      e,
     ))
   })?;
 
@@ -289,8 +310,11 @@ pub fn get_mel_banks_kaldi(
   // because the bank is built by the C11 SIMD dispatcher below.
   let mut centers: Vec<f32> = Vec::new();
   centers.try_reserve_exact(num_bins).map_err(|e| {
-    Error::Backend(format!(
-      "get_mel_banks_kaldi: allocation of {num_bins} center freqs failed: {e}"
+    Error::AllocFailure(AllocFailurePayload::new(
+      "get_mel_banks_kaldi: centers reservation",
+      "f32 center freqs",
+      num_bins as u64,
+      e,
     ))
   })?;
   for m in 0..num_bins {
@@ -377,8 +401,10 @@ fn build_kaldi_window(win_type: KaldiWindow, win_size: usize) -> Result<Array> {
     )));
   }
   let win_i32 = i32::try_from(win_size).map_err(|_| {
-    Error::Backend(format!(
-      "build_kaldi_window: win_size {win_size} exceeds i32::MAX"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "build_kaldi_window: win_size",
+      "must fit in i32 (i32::MAX = 2147483647)",
+      format_smolstr!("{win_size}"),
     ))
   })?;
 
@@ -404,8 +430,11 @@ fn build_kaldi_window(win_type: KaldiWindow, win_size: usize) -> Result<Array> {
       // Povey: scalar loop, `(0.5 - 0.5 * cos(theta)).powf(0.85)`.
       let mut buf: Vec<f32> = Vec::new();
       buf.try_reserve_exact(win_size).map_err(|e| {
-        Error::Backend(format!(
-          "build_kaldi_window: reservation for {win_size} elements failed: {e}"
+        Error::AllocFailure(AllocFailurePayload::new(
+          "build_kaldi_window: Povey reservation",
+          "f32 elements",
+          win_size as u64,
+          e,
         ))
       })?;
       let denom = (win_size - 1) as f32;
@@ -456,32 +485,48 @@ fn strided_frames_snip_edges(
     .checked_mul(win_inc)
     .and_then(|v| v.checked_add(win_size))
     .ok_or_else(|| {
-      Error::Backend(format!(
-        "strided_frames_snip_edges: reachable element range overflows usize \
-         (num_frames={num_frames}, win_inc={win_inc}, win_size={win_size})"
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "strided_frames_snip_edges: reachable element range \
+         ((num_frames - 1) * win_inc + win_size)",
+        "usize",
+        [
+          ("num_frames", num_frames as u64),
+          ("win_inc", win_inc as u64),
+          ("win_size", win_size as u64),
+        ],
       ))
     })?;
   let waveform_len = waveform.shape()[0];
   if last_index > waveform_len {
-    return Err(Error::Backend(format!(
-      "strided_frames_snip_edges: derived frame bounds {last_index} > waveform len \
-         {waveform_len} (num_frames={num_frames}, win_inc={win_inc}, win_size={win_size}) — \
-         internal invariant violated"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "strided_frames_snip_edges: derived frame reach \
+         (internal invariant violated)",
+      "must be <= waveform.len()",
+      format_smolstr!(
+        "last_index={last_index}, waveform_len={waveform_len}, num_frames={num_frames}, \
+         win_inc={win_inc}, win_size={win_size}"
+      ),
     )));
   }
   let num_frames_i32 = i32::try_from(num_frames).map_err(|_| {
-    Error::Backend(format!(
-      "strided_frames_snip_edges: num_frames {num_frames} exceeds i32::MAX"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "strided_frames_snip_edges: num_frames",
+      "must fit in i32 (i32::MAX = 2147483647)",
+      format_smolstr!("{num_frames}"),
     ))
   })?;
   let win_size_i32 = i32::try_from(win_size).map_err(|_| {
-    Error::Backend(format!(
-      "strided_frames_snip_edges: win_size {win_size} exceeds i32::MAX"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "strided_frames_snip_edges: win_size",
+      "must fit in i32 (i32::MAX = 2147483647)",
+      format_smolstr!("{win_size}"),
     ))
   })?;
   let win_inc_i64 = i64::try_from(win_inc).map_err(|_| {
-    Error::Backend(format!(
-      "strided_frames_snip_edges: win_inc {win_inc} exceeds i64::MAX"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "strided_frames_snip_edges: win_inc",
+      "must fit in i64 (i64::MAX = 9223372036854775807)",
+      format_smolstr!("{win_inc}"),
     ))
   })?;
   let shape: &[i32] = &[num_frames_i32, win_size_i32];
@@ -509,9 +554,10 @@ fn strided_frames_snip_edges(
 fn reverse_1d(a: &Array) -> Result<Array> {
   let shape = a.shape();
   if shape.len() != 1 {
-    return Err(Error::Backend(format!(
-      "reverse_1d: expected 1-D input, got {}-D",
-      shape.len()
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "reverse_1d: expected 1-D input",
+      shape.len() as u32,
+      shape,
     )));
   }
   let len = shape[0];
@@ -520,15 +566,22 @@ fn reverse_1d(a: &Array) -> Result<Array> {
       "reverse_1d: array",
     )));
   }
-  let len_i32 = i32::try_from(len)
-    .map_err(|_| Error::Backend(format!("reverse_1d: len {len} exceeds i32::MAX")))?;
+  let len_i32 = i32::try_from(len).map_err(|_| {
+    Error::OutOfRange(OutOfRangePayload::new(
+      "reverse_1d: len",
+      "must fit in i32 (i32::MAX = 2147483647)",
+      format_smolstr!("{len}"),
+    ))
+  })?;
   // `stop = -(len + 1)` post-normalizes (via `+ len`) to `-1`, the
   // "left of index 0" sentinel, so the descending traversal includes index 0.
   // Compute in i64 to avoid overflow when `len == i32::MAX`.
   let sentinel_i64 = -(i64::from(len_i32) + 1);
   let stop = i32::try_from(sentinel_i64).map_err(|_| {
-    Error::Backend(format!(
-      "reverse_1d: reverse sentinel -(len + 1) = {sentinel_i64} overflows i32"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "reverse_1d: reverse sentinel -(len + 1)",
+      "must fit in i32 (i32::MAX = 2147483647)",
+      format_smolstr!("{sentinel_i64}"),
     ))
   })?;
   ops::indexing::slice(a, &[len_i32 - 1], &[stop], &[-1])
@@ -592,15 +645,18 @@ fn strided_frames_no_snip_edges(
 ) -> Result<Array> {
   let shape = waveform.shape();
   if shape.len() != 1 {
-    return Err(Error::Backend(format!(
-      "strided_frames_no_snip_edges: expected 1-D waveform, got {}-D",
-      shape.len()
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "strided_frames_no_snip_edges: expected 1-D waveform",
+      shape.len() as u32,
+      shape,
     )));
   }
-  let n = shape[0];
+  let n = waveform.shape()[0];
   let n_i32 = i32::try_from(n).map_err(|_| {
-    Error::Backend(format!(
-      "strided_frames_no_snip_edges: waveform len {n} exceeds i32::MAX"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "strided_frames_no_snip_edges: waveform len",
+      "must fit in i32 (i32::MAX = 2147483647)",
+      format_smolstr!("{n}"),
     ))
   })?;
   if num_frames == 0 {
@@ -642,17 +698,21 @@ fn strided_frames_no_snip_edges(
     let mut reflected_len: usize = 0;
     for &seg in seg_lens {
       reflected_len = reflected_len.checked_add(seg).ok_or_else(|| {
-        Error::Backend(format!(
-          "strided_frames_no_snip_edges: reflect-padded length overflows usize \
-             (n={n}, pad={pad})"
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+          "strided_frames_no_snip_edges: reflect-padded length \
+             (sum of concatenated segment lengths)",
+          "usize",
+          [("n", n as u64), ("pad", pad as u64), ("seg", seg as u64)],
         ))
       })?;
     }
     if reflected_len > MAX_FBANK_WORK {
-      return Err(Error::Backend(format!(
-        "strided_frames_no_snip_edges: reflect-padded buffer length {reflected_len} \
-           (waveform len={n}, pad={pad}) exceeds the {MAX_FBANK_WORK} work cap; the \
-           snip_edges=false reflect bookends would more than double the waveform's memory"
+      return Err(Error::CapExceeded(CapExceededPayload::new(
+        "strided_frames_no_snip_edges: reflect-padded buffer length exceeds work cap \
+           (snip_edges=false reflect bookends would more than double the waveform's memory)",
+        "MAX_FBANK_WORK",
+        MAX_FBANK_WORK as u64,
+        reflected_len as u64,
       )));
     }
     Ok(())
@@ -665,15 +725,18 @@ fn strided_frames_no_snip_edges(
     // i.e. `n >= pad + 1`. (For pad==1 the right bookend is `wf[1 .. n]`, also
     // needing `n >= 2 == pad + 1`.)
     if n < pad + 1 {
-      return Err(Error::Backend(format!(
-        "strided_frames_no_snip_edges: waveform len {n} too short to reflect-pad {pad} \
-           samples per side (need len >= pad + 1); the win_size/win_inc imply more \
-           reflection than the signal supports"
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "strided_frames_no_snip_edges: waveform len for reflect-pad \
+           (win_size/win_inc imply more reflection than the signal supports)",
+        "must be >= pad + 1",
+        format_smolstr!("n={n}, pad={pad}"),
       )));
     }
     let pad_i32 = i32::try_from(pad).map_err(|_| {
-      Error::Backend(format!(
-        "strided_frames_no_snip_edges: pad {pad} exceeds i32::MAX"
+      Error::OutOfRange(OutOfRangePayload::new(
+        "strided_frames_no_snip_edges: pad",
+        "must fit in i32 (i32::MAX = 2147483647)",
+        format_smolstr!("{pad}"),
       ))
     })?;
     // pad_left = reverse(wf[1 .. pad+1]) — the reference's `waveform[1:pad+1][::-1]`,
@@ -710,14 +773,18 @@ fn strided_frames_no_snip_edges(
     // but assert it so a degenerate `win_inc >> win_size` can't underflow.
     let abs_pad = (-pad_i64) as usize;
     if abs_pad > n {
-      return Err(Error::Backend(format!(
-        "strided_frames_no_snip_edges: |pad| {abs_pad} exceeds waveform len {n} \
-           (win_inc too large relative to win_size); cannot build the snip_edges=false buffer"
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "strided_frames_no_snip_edges: |pad| for snip_edges=false buffer \
+           (win_inc too large relative to win_size)",
+        "must be <= waveform len",
+        format_smolstr!("abs_pad={abs_pad}, n={n}"),
       )));
     }
     let abs_pad_i32 = i32::try_from(abs_pad).map_err(|_| {
-      Error::Backend(format!(
-        "strided_frames_no_snip_edges: |pad| {abs_pad} exceeds i32::MAX"
+      Error::OutOfRange(OutOfRangePayload::new(
+        "strided_frames_no_snip_edges: |pad|",
+        "must fit in i32 (i32::MAX = 2147483647)",
+        format_smolstr!("{abs_pad}"),
       ))
     })?;
     // head = wf[|pad| .. n] (length `n - |pad|`); rev = reverse(wf) (length `n`)
@@ -737,17 +804,27 @@ fn strided_frames_no_snip_edges(
     .checked_mul(win_inc)
     .and_then(|v| v.checked_add(win_size))
     .ok_or_else(|| {
-      Error::Backend(format!(
-        "strided_frames_no_snip_edges: reachable element range overflows usize \
-         (num_frames={num_frames}, win_inc={win_inc}, win_size={win_size})"
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "strided_frames_no_snip_edges: reachable element range \
+         ((num_frames - 1) * win_inc + win_size)",
+        "usize",
+        [
+          ("num_frames", num_frames as u64),
+          ("win_inc", win_inc as u64),
+          ("win_size", win_size as u64),
+        ],
       ))
     })?;
   if last_index > padded_len {
-    return Err(Error::Backend(format!(
-      "strided_frames_no_snip_edges: strided read end {last_index} exceeds reflect-padded \
-         length {padded_len} (num_frames={num_frames}, win_inc={win_inc}, win_size={win_size}, \
-         waveform len={n}); the win_size is too large relative to the signal length for a \
-         centered snip_edges=false framing — the reference would read out of bounds here"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "strided_frames_no_snip_edges: strided read end \
+         (win_size too large relative to signal length for centered snip_edges=false framing; \
+         reference would read out of bounds)",
+      "must be <= reflect-padded length",
+      format_smolstr!(
+        "last_index={last_index}, padded_len={padded_len}, num_frames={num_frames}, \
+         win_inc={win_inc}, win_size={win_size}, waveform_len={n}"
+      ),
     )));
   }
 
@@ -755,18 +832,24 @@ fn strided_frames_no_snip_edges(
   // contiguous; the strided view's reachable indices are all `< padded_len`
   // (asserted above), and `offset = 0`.
   let num_frames_i32 = i32::try_from(num_frames).map_err(|_| {
-    Error::Backend(format!(
-      "strided_frames_no_snip_edges: num_frames {num_frames} exceeds i32::MAX"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "strided_frames_no_snip_edges: num_frames",
+      "must fit in i32 (i32::MAX = 2147483647)",
+      format_smolstr!("{num_frames}"),
     ))
   })?;
   let win_size_i32 = i32::try_from(win_size).map_err(|_| {
-    Error::Backend(format!(
-      "strided_frames_no_snip_edges: win_size {win_size} exceeds i32::MAX"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "strided_frames_no_snip_edges: win_size",
+      "must fit in i32 (i32::MAX = 2147483647)",
+      format_smolstr!("{win_size}"),
     ))
   })?;
   let win_inc_i64 = i64::try_from(win_inc).map_err(|_| {
-    Error::Backend(format!(
-      "strided_frames_no_snip_edges: win_inc {win_inc} exceeds i64::MAX"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "strided_frames_no_snip_edges: win_inc",
+      "must fit in i64 (i64::MAX = 9223372036854775807)",
+      format_smolstr!("{win_inc}"),
     ))
   })?;
   let view_shape: &[i32] = &[num_frames_i32, win_size_i32];
@@ -856,9 +939,11 @@ pub fn compute_fbank_kaldi(
   // ---- input validation ------------------------------------------------
   let shape = waveform.shape();
   if shape.len() != 1 {
-    return Err(Error::Backend(format!(
-      "compute_fbank_kaldi: expected 1-D waveform, got {}-D",
-      shape.len()
+    let rank = shape.len() as u32;
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "compute_fbank_kaldi: expected 1-D waveform",
+      rank,
+      shape,
     )));
   }
   if sample_rate == 0 {
@@ -881,9 +966,11 @@ pub fn compute_fbank_kaldi(
     )));
   }
   if win_len > crate::audio::io::MAX_DECODED_SAMPLES {
-    return Err(Error::Backend(format!(
-      "compute_fbank_kaldi: win_len {win_len} exceeds the {} cap",
-      crate::audio::io::MAX_DECODED_SAMPLES
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "compute_fbank_kaldi: win_len exceeds cap",
+      "MAX_DECODED_SAMPLES",
+      crate::audio::io::MAX_DECODED_SAMPLES as u64,
+      win_len as u64,
     )));
   }
   if !dither.is_finite() || dither < 0.0 {
@@ -901,13 +988,13 @@ pub fn compute_fbank_kaldi(
     )));
   }
   if dither != 0.0 && dither_key.is_none() {
-    return Err(Error::Backend(
-      "compute_fbank_kaldi: dither != 0.0 requires an explicit dither_key \
-                (use crate::ops::random::key(seed) or pass dither=0.0 to disable). \
-                The Python reference's implicit-default-key behavior is deliberately \
-                not mirrored here — explicit keys make dithered features reproducible."
-        .into(),
-    ));
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "compute_fbank_kaldi: dither_key when dither != 0.0 \
+       (use crate::ops::random::key(seed) or pass dither=0.0 to disable; \
+       the Python reference's implicit-default-key behavior is deliberately not mirrored — \
+       explicit keys make dithered features reproducible)",
+      "must be Some(_) when dither != 0.0",
+    )));
   }
 
   let samples_len = shape[0];
@@ -926,12 +1013,13 @@ pub fn compute_fbank_kaldi(
   // materialization. `MAX_DECODED_SAMPLES` (= `MAX_FBANK_WORK` = 64 Mi) is the
   // documented audio-IO budget for any single decoded waveform.
   if samples_len > crate::audio::io::MAX_DECODED_SAMPLES {
-    return Err(Error::Backend(format!(
-      "compute_fbank_kaldi: samples_len {samples_len} exceeds the {} cap \
-         (MAX_DECODED_SAMPLES); rejecting BEFORE `contiguous` would materialize \
-         the logical extent (a broadcasted-view input could otherwise drive a \
-         multi-GB allocation at eval time)",
-      crate::audio::io::MAX_DECODED_SAMPLES
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "compute_fbank_kaldi: samples_len exceeds cap \
+         (rejecting BEFORE `contiguous` would materialize the logical extent — \
+         a broadcasted-view input could otherwise drive a multi-GB allocation at eval time)",
+      "MAX_DECODED_SAMPLES",
+      crate::audio::io::MAX_DECODED_SAMPLES as u64,
+      samples_len as u64,
     )));
   }
 
@@ -944,8 +1032,10 @@ pub fn compute_fbank_kaldi(
   //    `n < win`; it reflect-pads and frames anyway (see
   //    `strided_frames_no_snip_edges`).
   let num_mels_i32 = i32::try_from(num_mels).map_err(|_| {
-    Error::Backend(format!(
-      "compute_fbank_kaldi: num_mels {num_mels} exceeds i32::MAX"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "compute_fbank_kaldi: num_mels",
+      "must fit in i32 (i32::MAX = 2147483647)",
+      format_smolstr!("{num_mels}"),
     ))
   })?;
   let num_frames = if snip_edges {
@@ -972,15 +1062,21 @@ pub fn compute_fbank_kaldi(
   // a small `win_inc`, so we re-check the framing work here.
   let n_fft_padded = next_power_of_2(win_len);
   let frame_work = num_frames.checked_mul(n_fft_padded).ok_or_else(|| {
-    Error::Backend(format!(
-      "compute_fbank_kaldi: frame work num_frames * n_fft_padded overflows usize \
-         (num_frames={num_frames}, n_fft_padded={n_fft_padded})"
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "compute_fbank_kaldi: frame work num_frames * n_fft_padded",
+      "usize",
+      [
+        ("num_frames", num_frames as u64),
+        ("n_fft_padded", n_fft_padded as u64),
+      ],
     ))
   })?;
   if frame_work > MAX_FBANK_WORK {
-    return Err(Error::Backend(format!(
-      "compute_fbank_kaldi: frame work {frame_work} (num_frames={num_frames} * \
-         n_fft_padded={n_fft_padded}) exceeds the {MAX_FBANK_WORK} work cap"
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "compute_fbank_kaldi: frame work (= num_frames * n_fft_padded) exceeds work cap",
+      "MAX_FBANK_WORK",
+      MAX_FBANK_WORK as u64,
+      frame_work as u64,
     )));
   }
   // Output element count `num_frames * (n_fft_padded / 2 + 1)` (rfft output).
@@ -989,15 +1085,21 @@ pub fn compute_fbank_kaldi(
   let out_elems = num_frames
     .checked_mul(n_fft_padded / 2 + 1)
     .ok_or_else(|| {
-      Error::Backend(format!(
-        "compute_fbank_kaldi: rfft output element count overflows usize \
-         (num_frames={num_frames}, n_fft_padded={n_fft_padded})"
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "compute_fbank_kaldi: rfft output element count num_frames * (n_fft_padded/2 + 1)",
+        "usize",
+        [
+          ("num_frames", num_frames as u64),
+          ("n_fft_padded", n_fft_padded as u64),
+        ],
       ))
     })?;
   if out_elems > MAX_FBANK_WORK {
-    return Err(Error::Backend(format!(
-      "compute_fbank_kaldi: rfft output element count {out_elems} exceeds the \
-         {MAX_FBANK_WORK} work cap (num_frames={num_frames}, n_fft_padded={n_fft_padded})"
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "compute_fbank_kaldi: rfft output element count exceeds work cap",
+      "MAX_FBANK_WORK",
+      MAX_FBANK_WORK as u64,
+      out_elems as u64,
     )));
   }
   // Final output element count `num_frames * num_mels` (the `(num_frames, num_mels)`
@@ -1009,15 +1111,21 @@ pub fn compute_fbank_kaldi(
   // `win_inc` and a huge `num_mels` (Codex review). Reject BEFORE building the
   // mel filterbank, the matmul, or any of the intermediates they hold.
   let output_elems = num_frames.checked_mul(num_mels).ok_or_else(|| {
-    Error::Backend(format!(
-      "compute_fbank_kaldi: output element count num_frames * num_mels overflows usize \
-         (num_frames={num_frames}, num_mels={num_mels})"
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "compute_fbank_kaldi: output element count num_frames * num_mels",
+      "usize",
+      [
+        ("num_frames", num_frames as u64),
+        ("num_mels", num_mels as u64),
+      ],
     ))
   })?;
   if output_elems > MAX_FBANK_WORK {
-    return Err(Error::Backend(format!(
-      "compute_fbank_kaldi: output element count {output_elems} (num_frames={num_frames} * \
-         num_mels={num_mels}) exceeds the {MAX_FBANK_WORK} work cap"
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "compute_fbank_kaldi: output element count (= num_frames * num_mels) exceeds work cap",
+      "MAX_FBANK_WORK",
+      MAX_FBANK_WORK as u64,
+      output_elems as u64,
     )));
   }
   // Padded mel-bank element count `num_mels * (n_fft_padded / 2 + 1)`. This
@@ -1032,32 +1140,44 @@ pub fn compute_fbank_kaldi(
   // MAX_FBANK_WORK` would push that to `128 Mi` (256 MiB of f32). Reject
   // BEFORE building the mel filterbank or the matmul intermediates.
   let mel_padded_elems = num_mels.checked_mul(n_fft_padded / 2 + 1).ok_or_else(|| {
-    Error::Backend(format!(
-      "compute_fbank_kaldi: padded mel-bank element count num_mels * (n_fft_padded/2 + 1) \
-         overflows usize (num_mels={num_mels}, n_fft_padded={n_fft_padded})"
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "compute_fbank_kaldi: padded mel-bank element count num_mels * (n_fft_padded/2 + 1)",
+      "usize",
+      [
+        ("num_mels", num_mels as u64),
+        ("n_fft_padded", n_fft_padded as u64),
+      ],
     ))
   })?;
   if mel_padded_elems > MAX_FBANK_WORK {
-    return Err(Error::Backend(format!(
-      "compute_fbank_kaldi: padded mel-bank element count {mel_padded_elems} \
-         (num_mels={num_mels} * (n_fft_padded/2 + 1)={}) exceeds the {MAX_FBANK_WORK} work cap",
-      n_fft_padded / 2 + 1
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "compute_fbank_kaldi: padded mel-bank element count \
+         (= num_mels * (n_fft_padded/2 + 1)) exceeds work cap",
+      "MAX_FBANK_WORK",
+      MAX_FBANK_WORK as u64,
+      mel_padded_elems as u64,
     )));
   }
 
   let n_fft_padded_i32 = i32::try_from(n_fft_padded).map_err(|_| {
-    Error::Backend(format!(
-      "compute_fbank_kaldi: n_fft_padded {n_fft_padded} exceeds i32::MAX"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "compute_fbank_kaldi: n_fft_padded",
+      "must fit in i32 (i32::MAX = 2147483647)",
+      format_smolstr!("{n_fft_padded}"),
     ))
   })?;
   let win_len_i32 = i32::try_from(win_len).map_err(|_| {
-    Error::Backend(format!(
-      "compute_fbank_kaldi: win_len {win_len} exceeds i32::MAX"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "compute_fbank_kaldi: win_len",
+      "must fit in i32 (i32::MAX = 2147483647)",
+      format_smolstr!("{win_len}"),
     ))
   })?;
   let num_frames_i32 = i32::try_from(num_frames).map_err(|_| {
-    Error::Backend(format!(
-      "compute_fbank_kaldi: num_frames {num_frames} exceeds i32::MAX"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "compute_fbank_kaldi: num_frames",
+      "must fit in i32 (i32::MAX = 2147483647)",
+      format_smolstr!("{num_frames}"),
     ))
   })?;
 
@@ -1157,9 +1277,10 @@ pub fn compute_fbank_kaldi(
   // ---- 6. pad to power of 2 + rfft -------------------------------------
   let padded = if n_fft_padded != win_len {
     let pad_extent = i32::try_from(n_fft_padded - win_len).map_err(|_| {
-      Error::Backend(format!(
-        "compute_fbank_kaldi: pad extent {} exceeds i32::MAX",
-        n_fft_padded - win_len
+      Error::OutOfRange(OutOfRangePayload::new(
+        "compute_fbank_kaldi: pad extent (n_fft_padded - win_len)",
+        "must fit in i32 (i32::MAX = 2147483647)",
+        format_smolstr!("{}", n_fft_padded - win_len),
       ))
     })?;
     let pad_value = Array::zeros::<f32>(&[0_i32; 0])?;
@@ -1333,16 +1454,21 @@ pub fn compute_deltas_kaldi(
   // tiny input that work explodes long before the element-count cap engages.
   // Delta windows are tiny in practice (Kaldi default 5), so reject early.
   if win_length > MAX_DELTA_WIN_LENGTH {
-    return Err(Error::Backend(format!(
-      "compute_deltas_kaldi: win_length {win_length} exceeds the supported maximum \
-         {MAX_DELTA_WIN_LENGTH} (delta windows are tiny — the default is 5)"
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "compute_deltas_kaldi: win_length exceeds supported maximum \
+         (delta windows are tiny — the default is 5)",
+      "MAX_DELTA_WIN_LENGTH",
+      MAX_DELTA_WIN_LENGTH as u64,
+      win_length as u64,
     )));
   }
   let orig_shape = specgram.shape();
   if orig_shape.is_empty() {
-    return Err(Error::Backend(
-      "compute_deltas_kaldi: specgram must have rank >= 1 (a time axis)".into(),
-    ));
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "compute_deltas_kaldi: specgram must have rank >= 1 (a time axis)",
+      0,
+      Vec::new(),
+    )));
   }
   let time = orig_shape[orig_shape.len() - 1];
   // `num_features = product(orig_shape[..-1])` (1 for a 1-D input). Computed
@@ -1356,8 +1482,11 @@ pub fn compute_deltas_kaldi(
   }
   // Bound the work: `total` (== num_features * time) against the shared cap.
   if total > MAX_FBANK_WORK {
-    return Err(Error::Backend(format!(
-      "compute_deltas_kaldi: element count {total} exceeds the {MAX_FBANK_WORK} work cap"
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "compute_deltas_kaldi: element count exceeds work cap",
+      "MAX_FBANK_WORK",
+      MAX_FBANK_WORK as u64,
+      total as u64,
     )));
   }
   // `time > 0` here, so the integer division is exact and `num_features >= 1`.
@@ -1381,20 +1510,28 @@ pub fn compute_deltas_kaldi(
   // bounded above (so `n <= 511`), but a large `num_features` × that pad can
   // still exceed the budget — reject here, before allocating.
   let padded_time = time.checked_add(2 * n).ok_or_else(|| {
-    Error::Backend(format!(
-      "compute_deltas_kaldi: padded time time + 2n overflows usize (time={time}, n={n})"
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "compute_deltas_kaldi: padded time (time + 2n)",
+      "usize",
+      [("time", time as u64), ("n", n as u64)],
     ))
   })?;
   let padded_work = num_features.checked_mul(padded_time).ok_or_else(|| {
-    Error::Backend(format!(
-      "compute_deltas_kaldi: padded work num_features * (time + 2n) overflows usize \
-         (num_features={num_features}, padded_time={padded_time})"
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "compute_deltas_kaldi: padded work num_features * (time + 2n)",
+      "usize",
+      [
+        ("num_features", num_features as u64),
+        ("padded_time", padded_time as u64),
+      ],
     ))
   })?;
   if padded_work > MAX_FBANK_WORK {
-    return Err(Error::Backend(format!(
-      "compute_deltas_kaldi: padded element count {padded_work} (num_features={num_features} \
-         * (time + 2n)={padded_time}) exceeds the {MAX_FBANK_WORK} work cap"
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "compute_deltas_kaldi: padded element count (= num_features * (time + 2n)) exceeds work cap",
+      "MAX_FBANK_WORK",
+      MAX_FBANK_WORK as u64,
+      padded_work as u64,
     )));
   }
   // Cap the CUMULATIVE accumulation work, distinct from the buffer-size caps
@@ -1410,42 +1547,52 @@ pub fn compute_deltas_kaldi(
   // analogue of `dsp.rs`'s `MAX_LOUDNESS_WORK` visit cap. `win_length >= 3`
   // here, so `win_length - 1 >= 2`.
   let delta_work = total.checked_mul(win_length - 1).ok_or_else(|| {
-    Error::Backend(format!(
-      "compute_deltas_kaldi: accumulation work total * (win_length - 1) overflows usize \
-         (total={total}, win_length={win_length})"
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "compute_deltas_kaldi: accumulation work total * (win_length - 1)",
+      "usize",
+      [("total", total as u64), ("win_length", win_length as u64)],
     ))
   })?;
   if delta_work > MAX_DELTA_WORK {
-    return Err(Error::Backend(format!(
-      "compute_deltas_kaldi: accumulation work {delta_work} (element count {total} * \
-         (win_length - 1)={}) exceeds the {MAX_DELTA_WORK} work cap; the delta loop runs \
-         win_length - 1 full-width passes over the spectrogram",
-      win_length - 1
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "compute_deltas_kaldi: accumulation work (= total * (win_length - 1)) exceeds work cap \
+         (the delta loop runs win_length - 1 full-width passes over the spectrogram)",
+      "MAX_DELTA_WORK",
+      MAX_DELTA_WORK as u64,
+      delta_work as u64,
     )));
   }
   let _padded_time_i32 = i32::try_from(padded_time).map_err(|_| {
-    Error::Backend(format!(
-      "compute_deltas_kaldi: padded time {padded_time} exceeds i32::MAX"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "compute_deltas_kaldi: padded_time",
+      "must fit in i32 (i32::MAX = 2147483647)",
+      format_smolstr!("{padded_time}"),
     ))
   })?;
 
   // Flatten to `(num_features, time)` (the reference's `reshape(-1, time)`).
   let num_features_i32 = i32::try_from(num_features).map_err(|_| {
-    Error::Backend(format!(
-      "compute_deltas_kaldi: num_features {num_features} exceeds i32::MAX"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "compute_deltas_kaldi: num_features",
+      "must fit in i32 (i32::MAX = 2147483647)",
+      format_smolstr!("{num_features}"),
     ))
   })?;
   let time_i32 = i32::try_from(time).map_err(|_| {
-    Error::Backend(format!(
-      "compute_deltas_kaldi: time {time} exceeds i32::MAX"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "compute_deltas_kaldi: time",
+      "must fit in i32 (i32::MAX = 2147483647)",
+      format_smolstr!("{time}"),
     ))
   })?;
   let flat = ops::shape::reshape(specgram, &(num_features, time))?;
 
   // Pad the time axis by `n` on each side per `mode`.
   let n_i32 = i32::try_from(n).map_err(|_| {
-    Error::Backend(format!(
-      "compute_deltas_kaldi: pad extent n={n} exceeds i32::MAX"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "compute_deltas_kaldi: pad extent n",
+      "must fit in i32 (i32::MAX = 2147483647)",
+      format_smolstr!("{n}"),
     ))
   })?;
   let padded = match mode {
@@ -1607,27 +1754,27 @@ mod tests {
     // num_bins <= 3.
     assert!(matches!(
       get_mel_banks_kaldi(3, 512, 16_000.0, 0.0, 0.0),
-      Err(Error::Backend(_))
+      Err(Error::OutOfRange(_))
     ));
     // odd n_fft.
     assert!(matches!(
       get_mel_banks_kaldi(40, 513, 16_000.0, 0.0, 0.0),
-      Err(Error::Backend(_))
+      Err(Error::OutOfRange(_))
     ));
     // zero sample rate.
     assert!(matches!(
       get_mel_banks_kaldi(40, 512, 0.0, 0.0, 0.0),
-      Err(Error::Backend(_))
+      Err(Error::OutOfRange(_))
     ));
     // low >= high (after high_freq <= 0 resolution).
     assert!(matches!(
       get_mel_banks_kaldi(40, 512, 16_000.0, 9000.0, 0.0),
-      Err(Error::Backend(_))
+      Err(Error::OutOfRange(_))
     ));
     // low_freq >= nyquist.
     assert!(matches!(
       get_mel_banks_kaldi(40, 512, 16_000.0, 9000.0, -100.0),
-      Err(Error::Backend(_))
+      Err(Error::OutOfRange(_))
     ));
   }
 
@@ -1897,7 +2044,7 @@ mod tests {
         0.0,
         None
       ),
-      Err(Error::Backend(_))
+      Err(Error::RankMismatch(_))
     ));
 
     // sample_rate = 0.
@@ -1916,7 +2063,7 @@ mod tests {
         0.0,
         None
       ),
-      Err(Error::Backend(_))
+      Err(Error::InvariantViolation(_))
     ));
 
     // win_inc = 0.
@@ -1935,7 +2082,7 @@ mod tests {
         0.0,
         None
       ),
-      Err(Error::Backend(_))
+      Err(Error::InvariantViolation(_))
     ));
 
     // negative dither.
@@ -1954,7 +2101,7 @@ mod tests {
         0.0,
         None
       ),
-      Err(Error::Backend(_))
+      Err(Error::OutOfRange(_))
     ));
 
     // dither > 0 without a key.
@@ -1973,7 +2120,7 @@ mod tests {
         0.0,
         None
       ),
-      Err(Error::Backend(_))
+      Err(Error::InvariantViolation(_))
     ));
 
     // (snip_edges=false is now a supported path — see
@@ -1996,7 +2143,7 @@ mod tests {
         0.0,
         None
       ),
-      Err(Error::Backend(_))
+      Err(Error::OutOfRange(_))
     ));
   }
 
@@ -2828,12 +2975,12 @@ mod tests {
     // win_length < 3.
     assert!(matches!(
       compute_deltas_kaldi(&x, 2, DeltaPadMode::Edge),
-      Err(Error::Backend(_))
+      Err(Error::OutOfRange(_))
     ));
     // even win_length (would silently truncate to next-lower odd).
     assert!(matches!(
       compute_deltas_kaldi(&x, 4, DeltaPadMode::Edge),
-      Err(Error::Backend(_))
+      Err(Error::OutOfRange(_))
     ));
   }
 
@@ -2849,7 +2996,10 @@ mod tests {
     assert!(!huge.is_multiple_of(2), "win_length must be odd");
     for mode in [DeltaPadMode::Edge, DeltaPadMode::Constant] {
       assert!(
-        matches!(compute_deltas_kaldi(&x, huge, mode), Err(Error::Backend(_))),
+        matches!(
+          compute_deltas_kaldi(&x, huge, mode),
+          Err(Error::CapExceeded(_))
+        ),
         "huge win_length on a 1-element input must be rejected ({mode:?})"
       );
     }
@@ -2883,7 +3033,7 @@ mod tests {
     assert!(
       matches!(
         compute_deltas_kaldi(&x, 5, DeltaPadMode::Edge),
-        Err(Error::Backend(_))
+        Err(Error::CapExceeded(_))
       ),
       "padded work exceeding the cap must be rejected before allocating"
     );
@@ -3064,10 +3214,14 @@ mod tests {
     let x = Array::from_slice::<f32>(&wf, &[5]).unwrap();
     let err = strided_frames_no_snip_edges(&x, 8, 2, 3)
       .expect_err("expected degenerate overread to be rejected");
-    let msg = format!("{err:?}");
+    let Error::OutOfRange(payload) = &err else {
+      panic!("expected OutOfRange overread/short-signal error, got: {err:?}");
+    };
     assert!(
-      msg.contains("exceeds reflect-padded length") || msg.contains("too short to reflect-pad"),
-      "expected an overread/short-signal error, got: {msg}"
+      payload.context().contains("reflect-pad") || payload.requirement().contains("reflect-pad"),
+      "expected an overread/short-signal error referencing reflect-pad, got: context={:?}, requirement={:?}",
+      payload.context(),
+      payload.requirement()
     );
   }
 }

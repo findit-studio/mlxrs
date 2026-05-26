@@ -49,18 +49,24 @@ impl RecordingSink {
 impl AudioOutputStream for RecordingSink {
   fn write_samples(&mut self, samples: &[f32]) -> mlxrs::error::Result<usize> {
     if !self.running {
-      return Err(mlxrs::error::Error::Backend(
-        "RecordingSink: stream stopped".to_string(),
+      return Err(mlxrs::error::Error::InvariantViolation(
+        mlxrs::error::InvariantViolationPayload::new(
+          "RecordingSink::write_samples",
+          "stream stopped",
+        ),
       ));
     }
     let mut buf = self.buffer.lock().unwrap();
-    if buf.len() + samples.len() > self.capacity {
-      return Err(mlxrs::error::Error::Backend(format!(
-        "RecordingSink: capacity {} exceeded ({} + {})",
-        self.capacity,
-        buf.len(),
-        samples.len()
-      )));
+    let projected = buf.len() + samples.len();
+    if projected > self.capacity {
+      return Err(mlxrs::error::Error::CapExceeded(
+        mlxrs::error::CapExceededPayload::new(
+          "RecordingSink::write_samples",
+          "capacity",
+          self.capacity as u64,
+          projected as u64,
+        ),
+      ));
     }
     buf.extend_from_slice(samples);
     Ok(samples.len())
@@ -223,10 +229,16 @@ fn audio_output_stream_stop_marks_not_running_and_rejects_writes() {
 
   // Post-stop writes return Err — the trait contract.
   let err = sink.write_samples(&[0.0_f32; 32]).unwrap_err();
-  assert!(
-    matches!(err, mlxrs::error::Error::Backend(ref message) if message.contains("stopped")),
-    "expected stopped-stream Backend error, got {err:?}"
-  );
+  match err {
+    mlxrs::error::Error::InvariantViolation(p) => {
+      assert!(
+        p.requirement().contains("stopped"),
+        "InvariantViolation requirement must mention stopped state, got: {}",
+        p.requirement()
+      );
+    }
+    other => panic!("expected InvariantViolation, got {other:?}"),
+  }
 }
 
 #[test]
@@ -237,10 +249,12 @@ fn audio_output_stream_overflow_returns_err() {
 
   // Now full; next write blows the cap.
   let err = sink.write_samples(&[0.0_f32; 1]).unwrap_err();
-  assert!(
-    matches!(err, mlxrs::error::Error::Backend(ref message) if message.contains("capacity")),
-    "expected capacity-overflow Backend error, got {err:?}"
-  );
+  match err {
+    mlxrs::error::Error::CapExceeded(p) => {
+      assert_eq!(p.cap_name(), "capacity", "cap_name must be \"capacity\"");
+    }
+    other => panic!("expected CapExceeded, got {other:?}"),
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -427,10 +441,18 @@ fn audio_player_buffer_overflow_returns_err() {
   player.pause().unwrap();
   player.write_samples(&[0.0_f32; 1024]).unwrap();
   let err = player.write_samples(&[0.0_f32; 1]).unwrap_err();
-  assert!(
-    matches!(err, mlxrs::error::Error::Backend(ref message) if message.contains("overflow")),
-    "expected overflow Backend error, got {err:?}"
-  );
+  // Queue-overflow in AudioPlayer::write_samples surfaces as CapExceeded
+  // against `queue_capacity_samples`.
+  match err {
+    mlxrs::error::Error::CapExceeded(p) => {
+      assert_eq!(
+        p.cap_name(),
+        "queue_capacity_samples",
+        "cap_name must be queue_capacity_samples"
+      );
+    }
+    other => panic!("expected CapExceeded, got {other:?}"),
+  }
   let _ = player.stop();
 }
 

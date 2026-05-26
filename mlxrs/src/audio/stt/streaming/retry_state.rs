@@ -32,7 +32,7 @@ use super::{
 };
 use crate::{
   Array,
-  error::{Error, Result},
+  error::{Error, LayerKeyedPayload, Result},
 };
 
 /// One window of encoded mel that owes a finalize decode.
@@ -394,10 +394,11 @@ impl SessionRetryState {
         // (`discharge_stop_mel_flush_try_clone_err_preserves_mel_as_stop_encoder_feed`)
         // gives this branch deterministic regression coverage.
         self.resume_at = Some(RetryStage::StopEncoderFeed(mel));
-        Err(Error::Backend(format!(
-          "StopMelFlush: failed to clone flushed mel for in-call use; \
-             obligation preserved as StopEncoderFeed with original payload \
-             (retry stop() to discharge): {e}"
+        Err(Error::LayerKeyed(LayerKeyedPayload::new(
+          "StopMelFlush: failed to clone flushed mel for in-call use \
+             (obligation preserved as StopEncoderFeed with original payload, \
+             retry stop() to discharge)",
+          e,
         )))
       }
     }
@@ -812,9 +813,11 @@ mod tests {
     // The discharge MUST surface an Err so the caller's in-call path
     // bails out (it can't continue without a mel handle of its own).
     let err = result.expect_err("injected clone-Err MUST propagate as Err");
+    // The discharge wraps the inner clone-Err in `Error::LayerKeyed` with
+    // the obligation-recovery context as the layer label.
     assert!(
-      matches!(err, Error::Backend(_)),
-      "discharge wraps the clone-Err in Error::Backend, got {err:?}"
+      matches!(err, Error::LayerKeyed(_)),
+      "discharge wraps the clone-Err in Error::LayerKeyed, got {err:?}"
     );
 
     // CRITICAL R2-fix assertion: resume_at MUST land on StopEncoderFeed

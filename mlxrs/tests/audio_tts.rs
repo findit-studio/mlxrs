@@ -546,13 +546,14 @@ fn tts_generate_rejects_oversized_text() {
     .err()
     .expect("oversized text rejected");
   match err {
-    mlxrs::Error::Backend(message) => {
-      assert!(
-        message.contains("cap"),
-        "error mentions the cap, got {message}"
+    mlxrs::Error::CapExceeded(p) => {
+      assert_eq!(
+        p.cap_name(),
+        "MAX_TEXT_BYTES",
+        "cap_name must be MAX_TEXT_BYTES"
       );
     }
-    other => panic!("expected Backend error, got {other:?}"),
+    other => panic!("expected CapExceeded error, got {other:?}"),
   }
   assert!(
     model.seen.borrow().is_empty(),
@@ -607,13 +608,19 @@ fn tts_generate_rejects_bad_audio_shape() {
   let cfg = TtsGenConfig::default();
   let mut it = tts_generate(&model, "hi", &cfg).unwrap();
   match it.next().expect("an item") {
-    Err(mlxrs::Error::ShapeMismatch(message)) => {
-      assert!(
-        message.contains("rank-1"),
-        "error mentions rank-1, got {message}"
-      );
-    }
-    other => panic!("expected ShapeMismatch, got {other:?}"),
+    // tts_generate wraps the RankMismatch in LayerKeyed (carrying the
+    // segment idx); destructure the inner.
+    Err(mlxrs::Error::LayerKeyed(p)) => match p.inner() {
+      mlxrs::Error::RankMismatch(rp) => {
+        assert!(
+          rp.context().contains("rank-1"),
+          "inner RankMismatch context mentions rank-1, got {:?}",
+          rp.context()
+        );
+      }
+      other => panic!("expected inner RankMismatch, got {other:?}"),
+    },
+    other => panic!("expected LayerKeyed(RankMismatch(_)), got {other:?}"),
   }
   assert!(it.next().is_none(), "iterator fuses after the Err");
 }

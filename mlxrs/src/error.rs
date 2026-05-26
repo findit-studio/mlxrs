@@ -1023,6 +1023,13 @@ pub enum Error {
   #[error(transparent)]
   Parse(ParsePayload),
 
+  /// An external-library runtime / device-backend operation failed
+  /// (e.g. `cpal` audio device backend, `image` decoder backend). Distinct
+  /// from [`Error::Parse`] (external PARSERS) and [`Error::MlxOp`] /
+  /// [`Error::MlxC`] (the mlx-c boundary).
+  #[error(transparent)]
+  ExternalOp(ExternalOpPayload),
+
   /// A decoder produced more elements than the documented cap
   /// (e.g. truncated/malicious audio stream).
   #[error(transparent)]
@@ -2406,6 +2413,69 @@ impl std::fmt::Display for ParsePayload {
 }
 
 impl std::error::Error for ParsePayload {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    Some(self.inner.as_ref())
+  }
+}
+
+/// Payload for [`Error::ExternalOp`]: an external-library runtime /
+/// device-backend operation failed (e.g. `cpal` audio device backend's
+/// `build_output_stream` / `play` / `pause`, `image` crate's decode, a
+/// future GPU backend's command-queue submit).
+///
+/// **Distinct from [`Error::Parse`]** (which is for external PARSERS:
+/// JSON, regex, tokenizer.json), [`Error::MlxOp`] / [`Error::MlxC`]
+/// (which are the mlx-c C++ boundary), and [`Error::FileIo`] (which is
+/// for `std::fs` operations). This variant is for external libraries
+/// whose failures are device / runtime / capability errors, not
+/// parser errors.
+#[derive(Debug)]
+pub struct ExternalOpPayload {
+  context: &'static str,
+  op_kind: &'static str,
+  inner: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl ExternalOpPayload {
+  /// Construct a new payload.
+  pub fn new(
+    context: &'static str,
+    op_kind: &'static str,
+    inner: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+  ) -> Self {
+    Self {
+      context,
+      op_kind,
+      inner: inner.into(),
+    }
+  }
+  /// Call-site label.
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+  /// The external operation kind (e.g. `"cpal stream"`, `"image decode"`).
+  #[inline(always)]
+  pub const fn op_kind(&self) -> &'static str {
+    self.op_kind
+  }
+  /// The underlying library error.
+  pub fn inner(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+    self.inner.as_ref()
+  }
+}
+
+impl std::fmt::Display for ExternalOpPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "{}: external {} failed: {}",
+      self.context, self.op_kind, self.inner
+    )
+  }
+}
+
+impl std::error::Error for ExternalOpPayload {
   fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
     Some(self.inner.as_ref())
   }

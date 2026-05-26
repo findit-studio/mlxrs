@@ -63,7 +63,10 @@ use super::{
   retry_state::SessionRetryState,
   types::{StreamingConfig, StreamingStats, TranscriptionEvent},
 };
-use crate::{Array, error::Result};
+use crate::{
+  Array,
+  error::{LayerKeyedPayload, Result},
+};
 
 /// Architecture-specific per-pass decoder bridge.
 ///
@@ -1190,8 +1193,9 @@ fn clone_partial_decode_payload(features: Option<&Array>) -> Result<Option<Array
   match features {
     None => Ok(None),
     Some(a) => a.try_clone().map(Some).map_err(|e| {
-      crate::Error::Backend(format!(
-        "StopPartialDecode: failed to clone audio_features for retry: {e}"
+      crate::Error::LayerKeyed(LayerKeyedPayload::new(
+        "StopPartialDecode: failed to clone audio_features for retry",
+        e,
       ))
     }),
   }
