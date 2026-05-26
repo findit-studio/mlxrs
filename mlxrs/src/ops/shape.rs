@@ -7,7 +7,7 @@ use std::ffi::c_int;
 
 use crate::{
   array::Array,
-  error::{Error, Result, check},
+  error::{Error, LengthMismatchPayload, MultiLengthMismatchPayload, Result, check},
   shape::{IntoShape, dim_ptr, stride_ptr, validate_dims},
   stream::default_stream,
 };
@@ -49,9 +49,9 @@ pub fn concatenate(arrays: &[&Array], axis: i32) -> Result<Array> {
   // FFI rather than constructing an empty vector_array (which would also
   // hand mlx-c a Rust dangling pointer for `Vec::as_ptr()` on an empty Vec).
   if arrays.is_empty() {
-    return Err(Error::ShapeMismatch {
-      message: "concatenate: arrays slice is empty".into(),
-    });
+    return Err(Error::ShapeMismatch(
+      "concatenate: arrays slice is empty".into(),
+    ));
   }
   // Install the error handler before the first fallible FFI call. Without
   // this, mlx_vector_array_new_data could fail and trigger mlx-c's default
@@ -76,9 +76,9 @@ pub fn concatenate(arrays: &[&Array], axis: i32) -> Result<Array> {
     return Err(
       crate::error::LAST
         .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend {
-          message: "mlx_vector_array_new_data returned NULL".into(),
-        }),
+        .unwrap_or(Error::Backend(
+          "mlx_vector_array_new_data returned NULL".into(),
+        )),
     );
   }
 
@@ -197,9 +197,7 @@ pub fn broadcast_to(a: &Array, shape: &impl IntoShape) -> Result<Array> {
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.stack.html).
 pub fn stack(arrays: &[&Array]) -> Result<Array> {
   if arrays.is_empty() {
-    return Err(Error::ShapeMismatch {
-      message: "stack: arrays slice is empty".into(),
-    });
+    return Err(Error::ShapeMismatch("stack: arrays slice is empty".into()));
   }
   crate::error::ensure_handler_installed();
   let raw: Vec<mlxrs_sys::mlx_array> = arrays.iter().map(|a| a.0).collect();
@@ -213,9 +211,9 @@ pub fn stack(arrays: &[&Array]) -> Result<Array> {
     return Err(
       crate::error::LAST
         .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend {
-          message: "mlx_vector_array_new_data returned NULL".into(),
-        }),
+        .unwrap_or(Error::Backend(
+          "mlx_vector_array_new_data returned NULL".into(),
+        )),
     );
   }
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
@@ -234,9 +232,9 @@ pub fn stack(arrays: &[&Array]) -> Result<Array> {
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.stack.html).
 pub fn stack_axis(arrays: &[&Array], axis: i32) -> Result<Array> {
   if arrays.is_empty() {
-    return Err(Error::ShapeMismatch {
-      message: "stack_axis: arrays slice is empty".into(),
-    });
+    return Err(Error::ShapeMismatch(
+      "stack_axis: arrays slice is empty".into(),
+    ));
   }
   crate::error::ensure_handler_installed();
   let raw: Vec<mlxrs_sys::mlx_array> = arrays.iter().map(|a| a.0).collect();
@@ -250,9 +248,9 @@ pub fn stack_axis(arrays: &[&Array], axis: i32) -> Result<Array> {
     return Err(
       crate::error::LAST
         .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend {
-          message: "mlx_vector_array_new_data returned NULL".into(),
-        }),
+        .unwrap_or(Error::Backend(
+          "mlx_vector_array_new_data returned NULL".into(),
+        )),
     );
   }
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
@@ -386,14 +384,14 @@ pub fn pad(
   mode: &std::ffi::CStr,
 ) -> Result<Array> {
   if axes.len() != low.len() || axes.len() != high.len() {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "pad: length mismatch — axes={}, low={}, high={}",
-        axes.len(),
-        low.len(),
-        high.len()
-      ),
-    });
+    return Err(Error::MultiLengthMismatch(MultiLengthMismatchPayload::new(
+      "pad: axes/low/high",
+      vec![
+        ("axes", axes.len()),
+        ("low", low.len()),
+        ("high", high.len()),
+      ],
+    )));
   }
   // `low`/`high` are shape extents (counts of padding entries), not axis
   // indices, so negatives are invalid and must be rejected before they reach
@@ -490,13 +488,11 @@ pub unsafe fn as_strided(
 ) -> Result<Array> {
   shape.with_shape(|s| {
     if s.len() != strides.len() {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "as_strided: length mismatch — shape={}, strides={}",
-          s.len(),
-          strides.len()
-        ),
-      });
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "as_strided: shape length vs strides length",
+        s.len(),
+        strides.len(),
+      )));
     }
     validate_dims(s)?;
     // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)

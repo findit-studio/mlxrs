@@ -48,6 +48,7 @@
 
 use crate::{
   Array, Error, Result,
+  error::{EmptyInputPayload, InvariantViolationPayload, OutOfRangePayload},
   ops::{
     self,
     fft::{self, FftNorm},
@@ -439,72 +440,66 @@ impl Spectrum {
   ) -> Result<Spectrum> {
     let shape = data.shape();
     if shape.len() != 2 {
-      return Err(Error::Backend {
-        message: format!(
-          "Spectrum::from_parts: data must be 2-D (num_frames, n_freqs), got {}-D",
-          shape.len()
-        ),
-      });
+      return Err(Error::Backend(format!(
+        "Spectrum::from_parts: data must be 2-D (num_frames, n_freqs), got {}-D",
+        shape.len()
+      )));
     }
     if n_fft == 0 {
-      return Err(Error::Backend {
-        message: "Spectrum::from_parts: n_fft must be > 0".into(),
-      });
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "Spectrum::from_parts: n_fft",
+        "must be > 0",
+      )));
     }
     // Reject odd `n_fft`: a one-sided spectrum has `n_freqs == n_fft / 2 + 1`
     // for both `n_fft = 2k` and `2k + 1`, so an odd-`n_fft` spectrum cannot be
     // inverted unambiguously. Closing it here means a `Spectrum` can never
     // carry odd metadata regardless of how it was constructed.
     if !n_fft.is_multiple_of(2) {
-      return Err(Error::Backend {
-        message: format!(
-          "Spectrum::from_parts: n_fft must be even (got {n_fft}); odd n_fft is \
+      return Err(Error::Backend(format!(
+        "Spectrum::from_parts: n_fft must be even (got {n_fft}); odd n_fft is \
            unsupported because the one-sided spectrum cannot be inverted unambiguously"
-        ),
-      });
+      )));
     }
     if hop_length == 0 {
-      return Err(Error::Backend {
-        message: "Spectrum::from_parts: hop_length must be > 0".into(),
-      });
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "Spectrum::from_parts: hop_length",
+        "must be > 0",
+      )));
     }
     if win_length == 0 {
-      return Err(Error::Backend {
-        message: "Spectrum::from_parts: win_length must be > 0".into(),
-      });
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "Spectrum::from_parts: win_length",
+        "must be > 0",
+      )));
     }
     if win_length > n_fft {
-      return Err(Error::Backend {
-        message: format!(
-          "Spectrum::from_parts: win_length {win_length} > n_fft {n_fft} \
+      return Err(Error::Backend(format!(
+        "Spectrum::from_parts: win_length {win_length} > n_fft {n_fft} \
            (the window cannot exceed the irfft frame)"
-        ),
-      });
+      )));
     }
     let num_frames = shape[0];
     if num_frames == 0 {
-      return Err(Error::Backend {
-        message: "Spectrum::from_parts: num_frames must be > 0".into(),
-      });
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "Spectrum::from_parts: num_frames",
+        "must be > 0",
+      )));
     }
     let n_freqs = shape[1];
     // `n_fft` is even, so `n_fft / 2 + 1` is the exact one-sided bin count.
     let expected_n_freqs = n_fft / 2 + 1;
     if n_freqs != expected_n_freqs {
-      return Err(Error::Backend {
-        message: format!(
-          "Spectrum::from_parts: data last dim {n_freqs} != n_fft/2 + 1 = {expected_n_freqs} \
+      return Err(Error::Backend(format!(
+        "Spectrum::from_parts: data last dim {n_freqs} != n_fft/2 + 1 = {expected_n_freqs} \
            (n_fft={n_fft}); the bin count does not match the declared n_fft"
-        ),
-      });
+      )));
     }
     if data.dtype()? != crate::Dtype::Complex64 {
-      return Err(Error::Backend {
-        message: format!(
-          "Spectrum::from_parts: data must be Dtype::Complex64, got {:?}",
-          data.dtype()?
-        ),
-      });
+      return Err(Error::Backend(format!(
+        "Spectrum::from_parts: data must be Dtype::Complex64, got {:?}",
+        data.dtype()?
+      )));
     }
     Ok(Spectrum {
       data,
@@ -539,20 +534,21 @@ fn place_window(
   window_pad: WindowPad,
 ) -> Result<Array> {
   if w.ndim() != 1 {
-    return Err(Error::Backend {
-      message: format!("{caller}: window must be 1-D, got {}-D", w.ndim()),
-    });
+    return Err(Error::Backend(format!(
+      "{caller}: window must be 1-D, got {}-D",
+      w.ndim()
+    )));
   }
   let w_len = w.shape()[0];
   if w_len != win_length {
-    return Err(Error::Backend {
-      message: format!("{caller}: window length {w_len} must equal win_length {win_length}"),
-    });
+    return Err(Error::Backend(format!(
+      "{caller}: window length {w_len} must equal win_length {win_length}"
+    )));
   }
   if win_length > n_fft {
-    return Err(Error::Backend {
-      message: format!("{caller}: win_length {win_length} > n_fft {n_fft}"),
-    });
+    return Err(Error::Backend(format!(
+      "{caller}: win_length {win_length} > n_fft {n_fft}"
+    )));
   }
   if win_length == n_fft {
     return w.try_clone();
@@ -566,12 +562,10 @@ fn place_window(
     }
   };
   let pad_value = Array::zeros::<f32>(&[0i32; 0])?;
-  let low_i32 = i32::try_from(low).map_err(|_| Error::Backend {
-    message: format!("{caller}: window pad-low {low} exceeds i32::MAX"),
-  })?;
-  let high_i32 = i32::try_from(high).map_err(|_| Error::Backend {
-    message: format!("{caller}: window pad-high {high} exceeds i32::MAX"),
-  })?;
+  let low_i32 = i32::try_from(low)
+    .map_err(|_| Error::Backend(format!("{caller}: window pad-low {low} exceeds i32::MAX")))?;
+  let high_i32 = i32::try_from(high)
+    .map_err(|_| Error::Backend(format!("{caller}: window pad-high {high} exceeds i32::MAX")))?;
   ops::shape::pad(
     w,
     &[0_i32],
@@ -691,9 +685,8 @@ fn symmetric_window(
   kind: crate::simd::audio::window::SymWindowKind,
 ) -> Result<Array> {
   if n < 2 {
-    return Err(Error::Backend {
-      message: format!("{name}: n must be >= 2 (got {n})"),
-    });
+    // TODO(§5): promote to InvariantViolation — `name` and `n` are dynamic; needs Cow<'static, str> context or a separate WindowTooSmall { name, n } variant.
+    return Err(Error::Backend(format!("{name}: n must be >= 2 (got {n})")));
   }
   // Cap on public-input-driven allocation — defends against an
   // adversarial / fuzzer-supplied `n = usize::MAX` that would otherwise
@@ -701,16 +694,13 @@ fn symmetric_window(
   // typically <= a few thousand samples; 64 Mi-samples (256 MiB of f32)
   // is a generous ceiling that still excludes pathological inputs.
   if n > crate::audio::io::MAX_DECODED_SAMPLES {
-    return Err(Error::Backend {
-      message: format!(
-        "{name}: n {n} exceeds the {} cap",
-        crate::audio::io::MAX_DECODED_SAMPLES
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "{name}: n {n} exceeds the {} cap",
+      crate::audio::io::MAX_DECODED_SAMPLES
+    )));
   }
-  let n_i32 = i32::try_from(n).map_err(|_| Error::Backend {
-    message: format!("{name}: n {n} exceeds i32::MAX"),
-  })?;
+  let n_i32 =
+    i32::try_from(n).map_err(|_| Error::Backend(format!("{name}: n {n} exceeds i32::MAX")))?;
 
   // C12 SIMD: dispatch to the symmetric-window NEON kernel
   // (`simd::audio::window::symmetric_window`). The dispatcher does
@@ -814,9 +804,9 @@ pub fn window_from_name(name: &str, n: usize) -> Result<Array> {
     "hamming" => hamming_window(n),
     "blackman" => blackman_window(n),
     "bartlett" => bartlett_window(n),
-    other => Err(Error::Backend {
-      message: format!("window_from_name: unknown window function: {other}"),
-    }),
+    other => Err(Error::Backend(format!(
+      "window_from_name: unknown window function: {other}"
+    ))),
   }
 }
 
@@ -840,27 +830,30 @@ fn reflect_pad_1d(samples: &Array, padding: usize) -> Result<Array> {
   }
   let shape = samples.shape();
   if shape.len() != 1 {
-    return Err(Error::Backend {
-      message: format!("reflect_pad_1d: expected 1-D input, got {}-D", shape.len()),
-    });
+    return Err(Error::Backend(format!(
+      "reflect_pad_1d: expected 1-D input, got {}-D",
+      shape.len()
+    )));
   }
   let len = shape[0];
   // Need indices `samples[1..=padding]` AND `samples[len-padding-1..len-1]`
   // to exist — i.e. `len >= padding + 1`.
   if len < padding + 1 {
-    return Err(Error::Backend {
-      message: format!(
-        "reflect_pad_1d: samples len {len} too short for reflect padding {padding} \
+    return Err(Error::Backend(format!(
+      "reflect_pad_1d: samples len {len} too short for reflect padding {padding} \
          (need len >= padding + 1)"
-      ),
-    });
+    )));
   }
 
-  let p_i32 = i32::try_from(padding).map_err(|_| Error::Backend {
-    message: format!("reflect_pad_1d: padding {padding} exceeds i32::MAX"),
+  let p_i32 = i32::try_from(padding).map_err(|_| {
+    Error::Backend(format!(
+      "reflect_pad_1d: padding {padding} exceeds i32::MAX"
+    ))
   })?;
-  let len_i32 = i32::try_from(len).map_err(|_| Error::Backend {
-    message: format!("reflect_pad_1d: samples len {len} exceeds i32::MAX"),
+  let len_i32 = i32::try_from(len).map_err(|_| {
+    Error::Backend(format!(
+      "reflect_pad_1d: samples len {len} exceeds i32::MAX"
+    ))
   })?;
   // prefix indices: `samples[padding], samples[padding-1], ..., samples[1]`.
   // `slice(start=padding, stop=0, strides=-1)` traverses `padding, padding-1,
@@ -905,11 +898,11 @@ fn reflect_pad_1d(samples: &Array, padding: usize) -> Result<Array> {
     // sentinel in `i64` and reject the (vanishingly rare) overflow as a
     // recoverable `Error::Backend` rather than debug-panicking / wrapping.
     let sentinel_i64 = -(i64::from(len_i32) + 1);
-    i32::try_from(sentinel_i64).map_err(|_| Error::Backend {
-      message: format!(
+    i32::try_from(sentinel_i64).map_err(|_| {
+      Error::Backend(format!(
         "reflect_pad_1d: reflect-pad sentinel `-(len + 1) = {sentinel_i64}` overflows i32 \
          (len == padding + 1 == {len}, near i32::MAX boundary)"
-      ),
+      ))
     })?
   };
   let suffix = ops::indexing::slice(samples, &[suffix_start], &[suffix_stop], &[-1])?;
@@ -1075,9 +1068,10 @@ pub fn stft_with_config(
   cfg: &StftConfig,
 ) -> Result<Spectrum> {
   if n_fft == 0 {
-    return Err(Error::Backend {
-      message: "stft: n_fft must be > 0".into(),
-    });
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "stft: n_fft",
+      "must be > 0",
+    )));
   }
   // Reject odd `n_fft` up front (before any framing/FFT work): a one-sided
   // real-FFT spectrum has `n_freqs == n_fft / 2 + 1` for both `n_fft = 2k` and
@@ -1085,34 +1079,35 @@ pub fn stft_with_config(
   // even length. Keeping the producer even-only means the `Spectrum` this
   // returns can never carry an odd `n_fft`, so its inverse is unambiguous.
   if !n_fft.is_multiple_of(2) {
-    return Err(Error::Backend {
-      message: format!(
-        "stft: n_fft must be even (got {n_fft}); odd n_fft is unsupported \
+    return Err(Error::Backend(format!(
+      "stft: n_fft must be even (got {n_fft}); odd n_fft is unsupported \
          because the one-sided spectrum cannot be inverted unambiguously."
-      ),
-    });
+    )));
   }
   if hop_length == 0 {
-    return Err(Error::Backend {
-      message: "stft: hop_length must be > 0".into(),
-    });
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "stft: hop_length",
+      "must be > 0",
+    )));
   }
   let win_length = win_length.unwrap_or(n_fft);
   if win_length == 0 {
-    return Err(Error::Backend {
-      message: "stft: win_length must be > 0".into(),
-    });
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "stft: win_length",
+      "must be > 0",
+    )));
   }
   if win_length > n_fft {
-    return Err(Error::Backend {
-      message: format!("stft: win_length {win_length} > n_fft {n_fft} (unsupported)"),
-    });
+    return Err(Error::Backend(format!(
+      "stft: win_length {win_length} > n_fft {n_fft} (unsupported)"
+    )));
   }
   let shape = samples.shape();
   if shape.len() != 1 {
-    return Err(Error::Backend {
-      message: format!("stft: expected 1-D input, got {}-D", shape.len()),
-    });
+    return Err(Error::Backend(format!(
+      "stft: expected 1-D input, got {}-D",
+      shape.len()
+    )));
   }
 
   // INPUT-LENGTH CAP (Codex OOM finding). When `cfg.center == true` the
@@ -1133,32 +1128,26 @@ pub fn stft_with_config(
   // at the same load-stage ceiling.
   let samples_len = shape[0];
   if samples_len > crate::audio::io::MAX_DECODED_SAMPLES {
-    return Err(Error::Backend {
-      message: format!(
-        "stft: input sample count {samples_len} exceeds the {} sample budget \
+    return Err(Error::Backend(format!(
+      "stft: input sample count {samples_len} exceeds the {} sample budget \
          (would force a reflect-pad allocation proportional to the input)",
-        crate::audio::io::MAX_DECODED_SAMPLES
-      ),
-    });
+      crate::audio::io::MAX_DECODED_SAMPLES
+    )));
   }
   if cfg.center() {
-    let padded_len_budget = samples_len
-      .checked_add(n_fft)
-      .ok_or_else(|| Error::Backend {
-        message: format!(
-          "stft: padded length samples_len + n_fft overflows usize \
+    let padded_len_budget = samples_len.checked_add(n_fft).ok_or_else(|| {
+      Error::Backend(format!(
+        "stft: padded length samples_len + n_fft overflows usize \
            (samples_len={samples_len}, n_fft={n_fft})"
-        ),
-      })?;
+      ))
+    })?;
     if padded_len_budget > crate::audio::io::MAX_DECODED_SAMPLES {
-      return Err(Error::Backend {
-        message: format!(
-          "stft: padded length {padded_len_budget} (samples_len={samples_len} + \
+      return Err(Error::Backend(format!(
+        "stft: padded length {padded_len_budget} (samples_len={samples_len} + \
            n_fft={n_fft}) exceeds the {} sample budget (would force a reflect-pad \
            allocation proportional to the input)",
-          crate::audio::io::MAX_DECODED_SAMPLES
-        ),
-      });
+        crate::audio::io::MAX_DECODED_SAMPLES
+      )));
     }
   }
 
@@ -1196,21 +1185,17 @@ pub fn stft_with_config(
 
   // Pre-frame validation: need at least one frame.
   if padded_len < n_fft {
-    return Err(Error::Backend {
-      message: format!(
-        "stft: input is too short (padded_len={padded_len}) for n_fft={n_fft} \
+    return Err(Error::Backend(format!(
+      "stft: input is too short (padded_len={padded_len}) for n_fft={n_fft} \
          (need padded_len >= n_fft)"
-      ),
-    });
+    )));
   }
   let num_frames = 1 + (padded_len - n_fft) / hop_length;
   if num_frames == 0 {
-    return Err(Error::Backend {
-      message: format!(
-        "stft: input is too short for n_fft={n_fft} hop_length={hop_length} \
+    return Err(Error::Backend(format!(
+      "stft: input is too short for n_fft={n_fft} hop_length={hop_length} \
          (computed num_frames = 0)"
-      ),
-    });
+    )));
   }
 
   // SAFETY pre-condition: the reachable element range of the strided view
@@ -1219,20 +1204,18 @@ pub fn stft_with_config(
   let last_element_index = (num_frames - 1)
     .checked_mul(hop_length)
     .and_then(|v| v.checked_add(n_fft))
-    .ok_or_else(|| Error::Backend {
-      message: format!(
+    .ok_or_else(|| {
+      Error::Backend(format!(
         "stft: reachable element range overflows usize \
          (num_frames={num_frames}, hop_length={hop_length}, n_fft={n_fft})"
-      ),
+      ))
     })?;
   if last_element_index > padded_len {
-    return Err(Error::Backend {
-      message: format!(
-        "stft: derived frame bounds {last_element_index} > padded len {padded_len} \
+    return Err(Error::Backend(format!(
+      "stft: derived frame bounds {last_element_index} > padded len {padded_len} \
          (n_fft={n_fft}, hop_length={hop_length}, num_frames={num_frames}) — \
          internal invariant violated"
-      ),
-    });
+    )));
   }
 
   // WORK CAP (Codex finding). Mirror `istft`'s `MAX_OLA_WORK` guard on the
@@ -1248,39 +1231,31 @@ pub fn stft_with_config(
   // intermediate nor the FFT output can balloon past `MAX_STFT_WORK`. Checked
   // arithmetic + the cap precede every allocation below (including the
   // `frame_window` CPU `Vec`), so a shaped/lazy input never reaches them.
-  let frame_work = num_frames
-    .checked_mul(n_fft)
-    .ok_or_else(|| Error::Backend {
-      message: format!(
-        "stft: frame work count num_frames * n_fft overflows usize \
+  let frame_work = num_frames.checked_mul(n_fft).ok_or_else(|| {
+    Error::Backend(format!(
+      "stft: frame work count num_frames * n_fft overflows usize \
          (num_frames={num_frames}, n_fft={n_fft})"
-      ),
-    })?;
+    ))
+  })?;
   if frame_work > MAX_STFT_WORK {
-    return Err(Error::Backend {
-      message: format!(
-        "stft: frame work count {frame_work} (num_frames={num_frames} * n_fft={n_fft}) \
+    return Err(Error::Backend(format!(
+      "stft: frame work count {frame_work} (num_frames={num_frames} * n_fft={n_fft}) \
          exceeds the {MAX_STFT_WORK} work cap"
-      ),
-    });
+    )));
   }
   // `n_fft` is even (checked above), so `n_fft / 2 + 1` cannot overflow.
-  let out_elems = num_frames
-    .checked_mul(n_fft / 2 + 1)
-    .ok_or_else(|| Error::Backend {
-      message: format!(
-        "stft: output element count num_frames * (n_fft/2 + 1) overflows usize \
+  let out_elems = num_frames.checked_mul(n_fft / 2 + 1).ok_or_else(|| {
+    Error::Backend(format!(
+      "stft: output element count num_frames * (n_fft/2 + 1) overflows usize \
          (num_frames={num_frames}, n_fft={n_fft})"
-      ),
-    })?;
+    ))
+  })?;
   if out_elems > MAX_STFT_WORK {
-    return Err(Error::Backend {
-      message: format!(
-        "stft: output element count {out_elems} (num_frames={num_frames} * \
+    return Err(Error::Backend(format!(
+      "stft: output element count {out_elems} (num_frames={num_frames} * \
          (n_fft/2 + 1)={}) exceeds the {MAX_STFT_WORK} work cap",
-        n_fft / 2 + 1
-      ),
-    });
+      n_fft / 2 + 1
+    )));
   }
 
   // Analysis window via the SHARED `frame_window` (symmetric hann of
@@ -1291,15 +1266,12 @@ pub fn stft_with_config(
   // windows always match by construction.
   let window = frame_window(win_length, n_fft, window_pad)?;
 
-  let num_frames_i32 = i32::try_from(num_frames).map_err(|_| Error::Backend {
-    message: format!("stft: num_frames {num_frames} exceeds i32::MAX"),
-  })?;
-  let n_fft_i32 = i32::try_from(n_fft).map_err(|_| Error::Backend {
-    message: format!("stft: n_fft {n_fft} exceeds i32::MAX"),
-  })?;
-  let hop_i64 = i64::try_from(hop_length).map_err(|_| Error::Backend {
-    message: format!("stft: hop_length {hop_length} exceeds i64::MAX"),
-  })?;
+  let num_frames_i32 = i32::try_from(num_frames)
+    .map_err(|_| Error::Backend(format!("stft: num_frames {num_frames} exceeds i32::MAX")))?;
+  let n_fft_i32 = i32::try_from(n_fft)
+    .map_err(|_| Error::Backend(format!("stft: n_fft {n_fft} exceeds i32::MAX")))?;
+  let hop_i64 = i64::try_from(hop_length)
+    .map_err(|_| Error::Backend(format!("stft: hop_length {hop_length} exceeds i64::MAX")))?;
 
   // PR #50 changed `as_strided`'s shape param to `&impl IntoShape`; an
   // array literal `&[i32; 2]` doesn't impl `IntoShape`, so we bind a
@@ -1466,12 +1438,10 @@ pub fn istft(spectrum: &Spectrum, length: Option<usize>) -> Result<Array> {
   let center = spectrum.center();
   let shape = x.shape();
   if shape.len() != 2 {
-    return Err(Error::Backend {
-      message: format!(
-        "istft: expected 2-D (num_frames, n_freqs) spectrum data, got {}-D",
-        shape.len()
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "istft: expected 2-D (num_frames, n_freqs) spectrum data, got {}-D",
+      shape.len()
+    )));
   }
   let num_frames = shape[0];
   // The irfft target length is the `Spectrum`'s OWN even `n_fft` — read from
@@ -1496,14 +1466,12 @@ pub fn istft(spectrum: &Spectrum, length: Option<usize>) -> Result<Array> {
   // is a faithful inverse. The forward `stft` keeps Right padding (byte-faithful
   // to mlx-audio); only the inverse restricts Right to `win_length == n_fft`.
   if matches!(window_pad, WindowPad::Right) && win_length != n_fft {
-    return Err(Error::Backend {
-      message: format!(
-        "istft: WindowPad::Right supports only win_length == n_fft \
+    return Err(Error::Backend(format!(
+      "istft: WindowPad::Right supports only win_length == n_fft \
          (got win_length={win_length}, n_fft={n_fft}); right-pad short-window \
          inversion is not a faithful inverse — use WindowPad::Center for \
          short-window (win_length < n_fft) inversion"
-      ),
-    });
+    )));
   }
   // Every frame is `n_fft` wide: the irfft output width AND the synthesis
   // window width (a `win_length`-wide window is placed into the `n_fft` frame
@@ -1517,19 +1485,17 @@ pub fn istft(spectrum: &Spectrum, length: Option<usize>) -> Result<Array> {
   let t = (num_frames - 1)
     .checked_mul(hop_length)
     .and_then(|v| v.checked_add(frame_width))
-    .ok_or_else(|| Error::Backend {
-      message: format!(
+    .ok_or_else(|| {
+      Error::Backend(format!(
         "istft: OLA length (num_frames-1)*hop + n_fft overflows usize \
          (num_frames={num_frames}, hop={hop_length}, n_fft={n_fft})"
-      ),
+      ))
     })?;
   if t > crate::audio::io::MAX_DECODED_SAMPLES {
-    return Err(Error::Backend {
-      message: format!(
-        "istft: OLA length {t} exceeds the {} cap",
-        crate::audio::io::MAX_DECODED_SAMPLES
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "istft: OLA length {t} exceeds the {} cap",
+      crate::audio::io::MAX_DECODED_SAMPLES
+    )));
   }
 
   // OOM guard on the *real* scatter/update workload (`num_frames *
@@ -1539,32 +1505,28 @@ pub fn istft(spectrum: &Spectrum, length: Option<usize>) -> Result<Array> {
   // n_fft=65536, hop=1 → t≈131071 but idx_len≈4.29e9). Reject overflow,
   // `> i32::MAX`, and `> MAX_OLA_WORK` here so a shaped/lazy input can never
   // drive a multi-GB allocation downstream.
-  let idx_len = num_frames
-    .checked_mul(frame_width)
-    .ok_or_else(|| Error::Backend {
-      message: format!(
-        "istft: scatter work count num_frames * n_fft overflows usize \
+  let idx_len = num_frames.checked_mul(frame_width).ok_or_else(|| {
+    Error::Backend(format!(
+      "istft: scatter work count num_frames * n_fft overflows usize \
          (num_frames={num_frames}, n_fft={n_fft})"
-      ),
-    })?;
+    ))
+  })?;
   if idx_len > MAX_OLA_WORK {
-    return Err(Error::Backend {
-      message: format!(
-        "istft: scatter work count {idx_len} (num_frames={num_frames} * n_fft={n_fft}) \
+    return Err(Error::Backend(format!(
+      "istft: scatter work count {idx_len} (num_frames={num_frames} * n_fft={n_fft}) \
          exceeds the {MAX_OLA_WORK} work cap"
-      ),
-    });
+    )));
   }
-  let idx_len_i32 = i32::try_from(idx_len).map_err(|_| Error::Backend {
-    message: format!("istft: scatter work count {idx_len} exceeds i32::MAX"),
+  let idx_len_i32 = i32::try_from(idx_len).map_err(|_| {
+    Error::Backend(format!(
+      "istft: scatter work count {idx_len} exceeds i32::MAX"
+    ))
   })?;
 
-  let t_i32 = i32::try_from(t).map_err(|_| Error::Backend {
-    message: format!("istft: OLA length {t} exceeds i32::MAX"),
-  })?;
-  let n_fft_i32 = i32::try_from(n_fft).map_err(|_| Error::Backend {
-    message: format!("istft: n_fft {n_fft} exceeds i32::MAX"),
-  })?;
+  let t_i32 = i32::try_from(t)
+    .map_err(|_| Error::Backend(format!("istft: OLA length {t} exceeds i32::MAX")))?;
+  let n_fft_i32 = i32::try_from(n_fft)
+    .map_err(|_| Error::Backend(format!("istft: n_fft {n_fft} exceeds i32::MAX")))?;
 
   // Synthesis window via the SHARED `frame_window` — the symmetric Hann of
   // `win_length` placed into the `n_fft` frame per `window_pad`, the EXACT
@@ -1605,14 +1567,13 @@ pub fn istft(spectrum: &Spectrum, length: Option<usize>) -> Result<Array> {
   // Built CPU-side (bounded by the work cap above) as i32 — the reference
   // builds the same via arange broadcasts.
   let mut idx_buf: Vec<i32> = Vec::new();
-  idx_buf
-    .try_reserve_exact(idx_len)
-    .map_err(|e| Error::Backend {
-      message: format!("istft: index reservation for {idx_len} elements failed: {e}"),
-    })?;
-  let frame_width_i32 = i32::try_from(frame_width).map_err(|_| Error::Backend {
-    message: format!("istft: n_fft {frame_width} exceeds i32::MAX"),
+  idx_buf.try_reserve_exact(idx_len).map_err(|e| {
+    Error::Backend(format!(
+      "istft: index reservation for {idx_len} elements failed: {e}"
+    ))
   })?;
+  let frame_width_i32 = i32::try_from(frame_width)
+    .map_err(|_| Error::Backend(format!("istft: n_fft {frame_width} exceeds i32::MAX")))?;
   for m in 0..num_frames {
     // `m * hop_length < t <= i32::MAX` (t bounded above), and `+ j` stays
     // `< t`, so every index fits i32 without a per-element checked cast.
@@ -1647,15 +1608,15 @@ pub fn istft(spectrum: &Spectrum, length: Option<usize>) -> Result<Array> {
   let pad = n_fft / 2;
   let (start_usize, stop_usize) = match (center, length) {
     (true, Some(len)) => {
-      let end = pad.checked_add(len).ok_or_else(|| Error::Backend {
-        message: format!("istft: center offset {pad} + length {len} overflows usize"),
+      let end = pad.checked_add(len).ok_or_else(|| {
+        Error::Backend(format!(
+          "istft: center offset {pad} + length {len} overflows usize"
+        ))
       })?;
       if end > t {
-        return Err(Error::Backend {
-          message: format!(
-            "istft: center offset {pad} + length {len} = {end} exceeds reconstruction length {t}"
-          ),
-        });
+        return Err(Error::Backend(format!(
+          "istft: center offset {pad} + length {len} = {end} exceeds reconstruction length {t}"
+        )));
       }
       (pad, end)
     }
@@ -1666,20 +1627,18 @@ pub fn istft(spectrum: &Spectrum, length: Option<usize>) -> Result<Array> {
     }
     (false, Some(len)) => {
       if len > t {
-        return Err(Error::Backend {
-          message: format!("istft: requested length {len} exceeds reconstruction length {t}"),
-        });
+        return Err(Error::Backend(format!(
+          "istft: requested length {len} exceeds reconstruction length {t}"
+        )));
       }
       (0usize, len)
     }
     (false, None) => (0usize, t),
   };
-  let start_i32 = i32::try_from(start_usize).map_err(|_| Error::Backend {
-    message: format!("istft: trim start {start_usize} exceeds i32::MAX"),
-  })?;
-  let stop_i32 = i32::try_from(stop_usize).map_err(|_| Error::Backend {
-    message: format!("istft: trim stop {stop_usize} exceeds i32::MAX"),
-  })?;
+  let start_i32 = i32::try_from(start_usize)
+    .map_err(|_| Error::Backend(format!("istft: trim start {start_usize} exceeds i32::MAX")))?;
+  let stop_i32 = i32::try_from(stop_usize)
+    .map_err(|_| Error::Backend(format!("istft: trim stop {stop_usize} exceeds i32::MAX")))?;
 
   // COVERAGE GUARD (structural correctness invariant). Every sample in the
   // REQUESTED output region must have window-sum `> COVERAGE_EPS`; otherwise
@@ -1713,16 +1672,14 @@ pub fn istft(spectrum: &Spectrum, length: Option<usize>) -> Result<Array> {
       let mut min_idx_arr = ops::misc::argmin(&region_wsum, None, false)?;
       let local_idx = min_idx_arr.item::<u32>()? as usize;
       let global_idx = start_usize + local_idx;
-      return Err(Error::Backend {
-        message: format!(
-          "istft: requested output sample at index {global_idx} (region offset {local_idx}) \
+      return Err(Error::Backend(format!(
+        "istft: requested output sample at index {global_idx} (region offset {local_idx}) \
            has window-sum {min_wsum:.3e} <= COVERAGE_EPS ({COVERAGE_EPS:.0e}) — it received \
            no window coverage in the overlap-add and is not recoverable \
            (n_fft={n_fft}, win_length={win_length}, hop={hop_length}, window_pad={window_pad:?}); \
            the requested region (e.g. a center=false head/tail) \
            includes a zero-coverage sample — adjust length/center or the window"
-        ),
-      });
+      )));
     }
   }
 
@@ -1923,14 +1880,12 @@ impl ISTFTCache {
     // for the full rationale). The forward `stft` keeps Right padding; only
     // the inverse restricts Right to `win_length == n_fft`.
     if matches!(window_pad, WindowPad::Right) && win_length != n_fft {
-      return Err(Error::Backend {
-        message: format!(
-          "ISTFTCache::istft: WindowPad::Right supports only win_length == n_fft \
+      return Err(Error::Backend(format!(
+        "ISTFTCache::istft: WindowPad::Right supports only win_length == n_fft \
            (got win_length={win_length}, n_fft={n_fft}); right-pad short-window \
            inversion is not a faithful inverse — use WindowPad::Center for \
            short-window (win_length < n_fft) inversion"
-        ),
-      });
+      )));
     }
 
     // Every frame is `n_fft` wide (the `win_length` window is placed into the
@@ -1942,48 +1897,45 @@ impl ISTFTCache {
     let t = (num_frames - 1)
       .checked_mul(hop_length)
       .and_then(|v| v.checked_add(frame_width))
-      .ok_or_else(|| Error::Backend {
-        message: format!(
+      .ok_or_else(|| {
+        Error::Backend(format!(
           "ISTFTCache::istft: OLA length (num_frames-1)*hop + n_fft overflows usize \
            (num_frames={num_frames}, hop={hop_length}, n_fft={n_fft})"
-        ),
+        ))
       })?;
     if t > crate::audio::io::MAX_DECODED_SAMPLES {
-      return Err(Error::Backend {
-        message: format!(
-          "ISTFTCache::istft: OLA length {t} exceeds the {} cap",
-          crate::audio::io::MAX_DECODED_SAMPLES
-        ),
-      });
+      return Err(Error::Backend(format!(
+        "ISTFTCache::istft: OLA length {t} exceeds the {} cap",
+        crate::audio::io::MAX_DECODED_SAMPLES
+      )));
     }
-    let t_i32 = i32::try_from(t).map_err(|_| Error::Backend {
-      message: format!("ISTFTCache::istft: OLA length {t} exceeds i32::MAX"),
+    let t_i32 = i32::try_from(t).map_err(|_| {
+      Error::Backend(format!(
+        "ISTFTCache::istft: OLA length {t} exceeds i32::MAX"
+      ))
     })?;
-    let n_fft_i32 = i32::try_from(n_fft).map_err(|_| Error::Backend {
-      message: format!("ISTFTCache::istft: n_fft {n_fft} exceeds i32::MAX"),
-    })?;
+    let n_fft_i32 = i32::try_from(n_fft)
+      .map_err(|_| Error::Backend(format!("ISTFTCache::istft: n_fft {n_fft} exceeds i32::MAX")))?;
 
     // Scatter-work cap on `num_frames * frame_width`, checked BEFORE any
     // allocation / cache insertion (the `t` cap bounds the output but small
     // hops drive the scatter far past `t` — same guard the free `istft` uses).
-    let idx_len = num_frames
-      .checked_mul(frame_width)
-      .ok_or_else(|| Error::Backend {
-        message: format!(
-          "ISTFTCache::istft: scatter work count num_frames * n_fft overflows usize \
+    let idx_len = num_frames.checked_mul(frame_width).ok_or_else(|| {
+      Error::Backend(format!(
+        "ISTFTCache::istft: scatter work count num_frames * n_fft overflows usize \
            (num_frames={num_frames}, n_fft={n_fft})"
-        ),
-      })?;
+      ))
+    })?;
     if idx_len > MAX_OLA_WORK {
-      return Err(Error::Backend {
-        message: format!(
-          "ISTFTCache::istft: scatter work count {idx_len} (num_frames={num_frames} * \
+      return Err(Error::Backend(format!(
+        "ISTFTCache::istft: scatter work count {idx_len} (num_frames={num_frames} * \
            n_fft={n_fft}) exceeds the {MAX_OLA_WORK} work cap"
-        ),
-      });
+      )));
     }
-    let idx_len_i32 = i32::try_from(idx_len).map_err(|_| Error::Backend {
-      message: format!("ISTFTCache::istft: scatter work count {idx_len} exceeds i32::MAX"),
+    let idx_len_i32 = i32::try_from(idx_len).map_err(|_| {
+      Error::Backend(format!(
+        "ISTFTCache::istft: scatter work count {idx_len} exceeds i32::MAX"
+      ))
     })?;
 
     // ---- cached flattened scatter-index buffer --------------------------
@@ -2000,15 +1952,15 @@ impl ISTFTCache {
     // (Can't use `or_insert_with` — the build is fallible.)
     if let std::collections::hash_map::Entry::Vacant(slot) = self.position_cache.entry(pos_key) {
       let mut idx_buf: Vec<i32> = Vec::new();
-      idx_buf
-        .try_reserve_exact(idx_len)
-        .map_err(|e| Error::Backend {
-          message: format!(
-            "ISTFTCache::istft: index reservation for {idx_len} elements failed: {e}"
-          ),
-        })?;
-      let frame_width_i32 = i32::try_from(frame_width).map_err(|_| Error::Backend {
-        message: format!("ISTFTCache::istft: n_fft {frame_width} exceeds i32::MAX"),
+      idx_buf.try_reserve_exact(idx_len).map_err(|e| {
+        Error::Backend(format!(
+          "ISTFTCache::istft: index reservation for {idx_len} elements failed: {e}"
+        ))
+      })?;
+      let frame_width_i32 = i32::try_from(frame_width).map_err(|_| {
+        Error::Backend(format!(
+          "ISTFTCache::istft: n_fft {frame_width} exceeds i32::MAX"
+        ))
       })?;
       for m in 0..num_frames {
         // `m * hop < t <= i32::MAX` and `+ j` stays `< t`, so every index
@@ -2099,37 +2051,39 @@ impl ISTFTCache {
     let pad = n_fft / 2;
     let (start_usize, stop_usize) = match (center, length) {
       (true, Some(len)) => {
-        let end = pad.checked_add(len).ok_or_else(|| Error::Backend {
-          message: format!("ISTFTCache::istft: center offset {pad} + length {len} overflows usize"),
+        let end = pad.checked_add(len).ok_or_else(|| {
+          Error::Backend(format!(
+            "ISTFTCache::istft: center offset {pad} + length {len} overflows usize"
+          ))
         })?;
         if end > t {
-          return Err(Error::Backend {
-            message: format!(
-              "ISTFTCache::istft: center offset {pad} + length {len} = {end} exceeds \
+          return Err(Error::Backend(format!(
+            "ISTFTCache::istft: center offset {pad} + length {len} = {end} exceeds \
                reconstruction length {t}"
-            ),
-          });
+          )));
         }
         (pad, end)
       }
       (true, None) => (pad, t - pad),
       (false, Some(len)) => {
         if len > t {
-          return Err(Error::Backend {
-            message: format!(
-              "ISTFTCache::istft: requested length {len} exceeds reconstruction length {t}"
-            ),
-          });
+          return Err(Error::Backend(format!(
+            "ISTFTCache::istft: requested length {len} exceeds reconstruction length {t}"
+          )));
         }
         (0usize, len)
       }
       (false, None) => (0usize, t),
     };
-    let start_i32 = i32::try_from(start_usize).map_err(|_| Error::Backend {
-      message: format!("ISTFTCache::istft: trim start {start_usize} exceeds i32::MAX"),
+    let start_i32 = i32::try_from(start_usize).map_err(|_| {
+      Error::Backend(format!(
+        "ISTFTCache::istft: trim start {start_usize} exceeds i32::MAX"
+      ))
     })?;
-    let stop_i32 = i32::try_from(stop_usize).map_err(|_| Error::Backend {
-      message: format!("ISTFTCache::istft: trim stop {stop_usize} exceeds i32::MAX"),
+    let stop_i32 = i32::try_from(stop_usize).map_err(|_| {
+      Error::Backend(format!(
+        "ISTFTCache::istft: trim stop {stop_usize} exceeds i32::MAX"
+      ))
     })?;
 
     // ---- coverage guard (IDENTICAL to the free `istft`) -----------------
@@ -2154,16 +2108,14 @@ impl ISTFTCache {
         let mut min_idx_arr = ops::misc::argmin(&region_wsum, None, false)?;
         let local_idx = min_idx_arr.item::<u32>()? as usize;
         let global_idx = start_usize + local_idx;
-        return Err(Error::Backend {
-          message: format!(
-            "ISTFTCache::istft: requested output sample at index {global_idx} (region offset \
+        return Err(Error::Backend(format!(
+          "ISTFTCache::istft: requested output sample at index {global_idx} (region offset \
              {local_idx}) has window-sum {min_wsum:.3e} <= COVERAGE_EPS ({COVERAGE_EPS:.0e}) — it \
              received no window coverage in the overlap-add and is not recoverable \
              (n_fft={n_fft}, win_length={win_length}, hop={hop_length}, window_pad={window_pad:?}); \
              the requested region (e.g. a center=false head/tail) includes a zero-coverage sample \
              — adjust length/center or the window"
-          ),
-        });
+        )));
       }
     }
 
@@ -2226,25 +2178,28 @@ pub fn mel_filter_bank(
   f_max: Option<f32>,
 ) -> Result<Array> {
   if n_fft == 0 {
-    return Err(Error::Backend {
-      message: "mel_filter_bank: n_fft must be > 0".into(),
-    });
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "mel_filter_bank: n_fft",
+      "must be > 0",
+    )));
   }
   if n_mels == 0 {
-    return Err(Error::Backend {
-      message: "mel_filter_bank: n_mels must be > 0".into(),
-    });
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "mel_filter_bank: n_mels",
+      "must be > 0",
+    )));
   }
   if sample_rate == 0 {
-    return Err(Error::Backend {
-      message: "mel_filter_bank: sample_rate must be > 0".into(),
-    });
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "mel_filter_bank: sample_rate",
+      "must be > 0",
+    )));
   }
   let f_max = f_max.unwrap_or((sample_rate / 2) as f32);
   if !(f_min >= 0.0 && f_max > f_min) {
-    return Err(Error::Backend {
-      message: format!("mel_filter_bank: invalid f_min={f_min} / f_max={f_max}"),
-    });
+    return Err(Error::Backend(format!(
+      "mel_filter_bank: invalid f_min={f_min} / f_max={f_max}"
+    )));
   }
 
   // `n_freqs = n_fft / 2 + 1`; `n_fft / 2 <= usize::MAX / 2`, so `+ 1`
@@ -2253,25 +2208,28 @@ pub fn mel_filter_bank(
   let n_freqs = n_fft / 2 + 1;
   // `n_pts = n_mels + 2`; check for overflow on `n_mels = usize::MAX` /
   // `usize::MAX - 1` before we walk `0..n_pts`.
-  let n_pts = n_mels.checked_add(2).ok_or_else(|| Error::Backend {
-    message: format!("mel_filter_bank: n_mels {n_mels} + 2 overflows usize"),
+  let n_pts = n_mels.checked_add(2).ok_or_else(|| {
+    Error::Backend(format!(
+      "mel_filter_bank: n_mels {n_mels} + 2 overflows usize"
+    ))
   })?;
   // Bank size: `n_mels * n_freqs`. The reference uses an mlx broadcast
   // graph; we materialize one `Vec<f32>` of the same logical size, so we
   // must reject any combination that would attempt a multi-GB allocation
   // (the python form would silently swap or OOM-kill).
-  let bank_len = n_mels.checked_mul(n_freqs).ok_or_else(|| Error::Backend {
-    message: format!(
+  let bank_len = n_mels.checked_mul(n_freqs).ok_or_else(|| {
+    Error::Backend(format!(
       "mel_filter_bank: n_mels * n_freqs overflows usize \
        (n_mels={n_mels}, n_freqs={n_freqs})"
-    ),
+    ))
   })?;
   // i32 bounds on the final mlx shape go here, BEFORE any large allocation.
-  let n_mels_i32 = i32::try_from(n_mels).map_err(|_| Error::Backend {
-    message: format!("mel_filter_bank: n_mels {n_mels} exceeds i32::MAX"),
-  })?;
-  let n_freqs_i32 = i32::try_from(n_freqs).map_err(|_| Error::Backend {
-    message: format!("mel_filter_bank: n_freqs {n_freqs} exceeds i32::MAX"),
+  let n_mels_i32 = i32::try_from(n_mels)
+    .map_err(|_| Error::Backend(format!("mel_filter_bank: n_mels {n_mels} exceeds i32::MAX")))?;
+  let n_freqs_i32 = i32::try_from(n_freqs).map_err(|_| {
+    Error::Backend(format!(
+      "mel_filter_bank: n_freqs {n_freqs} exceeds i32::MAX"
+    ))
   })?;
 
   // `all_freqs[i] = i * (sample_rate / 2) / (n_freqs - 1)` for the python
@@ -2282,11 +2240,11 @@ pub fn mel_filter_bank(
   let nyq = (sample_rate / 2) as f32;
   let denom = (n_freqs as f32 - 1.0).max(1.0);
   let mut all_freqs: Vec<f32> = Vec::new();
-  all_freqs
-    .try_reserve_exact(n_freqs)
-    .map_err(|e| Error::Backend {
-      message: format!("mel_filter_bank: reservation for n_freqs={n_freqs} failed: {e}"),
-    })?;
+  all_freqs.try_reserve_exact(n_freqs).map_err(|e| {
+    Error::Backend(format!(
+      "mel_filter_bank: reservation for n_freqs={n_freqs} failed: {e}"
+    ))
+  })?;
   for i in 0..n_freqs {
     all_freqs.push(i as f32 * nyq / denom);
   }
@@ -2296,8 +2254,10 @@ pub fn mel_filter_bank(
   let m_max = hz_to_mel(f_max);
   let m_denom = (n_pts as f32 - 1.0).max(1.0);
   let mut f_pts: Vec<f32> = Vec::new();
-  f_pts.try_reserve_exact(n_pts).map_err(|e| Error::Backend {
-    message: format!("mel_filter_bank: reservation for n_pts={n_pts} failed: {e}"),
+  f_pts.try_reserve_exact(n_pts).map_err(|e| {
+    Error::Backend(format!(
+      "mel_filter_bank: reservation for n_pts={n_pts} failed: {e}"
+    ))
   })?;
   for i in 0..n_pts {
     let m = m_min + (m_max - m_min) * (i as f32) / m_denom;
@@ -2320,11 +2280,11 @@ pub fn mel_filter_bank(
   // returns a recoverable `Error::Backend` rather than aborting on the
   // allocator's OOM panic.
   let mut bank: Vec<f32> = Vec::new();
-  bank
-    .try_reserve_exact(bank_len)
-    .map_err(|e| Error::Backend {
-      message: format!("mel_filter_bank: allocation of {bank_len} f32 elements failed: {e}"),
-    })?;
+  bank.try_reserve_exact(bank_len).map_err(|e| {
+    Error::Backend(format!(
+      "mel_filter_bank: allocation of {bank_len} f32 elements failed: {e}"
+    ))
+  })?;
 
   // C10 SIMD: dispatch the row-by-row triangle construction through
   // the SIMD kernel (`simd::audio::mel_triangle::mel_filter_bank_rows`).
@@ -2759,15 +2719,15 @@ const BS1770_MAX_CHANNELS: usize = 5;
 /// that.
 pub fn lfilter(b: &[f64], a: &[f64], data: &Array) -> Result<Array> {
   if data.ndim() != 1 {
-    return Err(Error::Backend {
-      message: format!("lfilter: only supports 1-D input, got {}-D", data.ndim()),
-    });
+    return Err(Error::Backend(format!(
+      "lfilter: only supports 1-D input, got {}-D",
+      data.ndim()
+    )));
   }
   let shape = data.shape();
   let n_samples = shape[0];
-  let n_samples_i32 = i32::try_from(n_samples).map_err(|_| Error::Backend {
-    message: format!("lfilter: n_samples {n_samples} exceeds i32::MAX"),
-  })?;
+  let n_samples_i32 = i32::try_from(n_samples)
+    .map_err(|_| Error::Backend(format!("lfilter: n_samples {n_samples} exceeds i32::MAX")))?;
   // Enforce the bounded-memory contract on the SHAPE before any
   // materialization: `data` may be a lazy oversized array
   // (e.g. `Array::zeros(MAX_LFILTER_SAMPLES + 1)`), in which case the
@@ -2778,9 +2738,9 @@ pub fn lfilter(b: &[f64], a: &[f64], data: &Array) -> Result<Array> {
   // re-checks the same cap for direct callers (K-weighting path) — this
   // is the shape-side guard for the f32 boundary.
   if n_samples > MAX_LFILTER_SAMPLES {
-    return Err(Error::Backend {
-      message: format!("lfilter: sample count {n_samples} exceeds the {MAX_LFILTER_SAMPLES} cap"),
-    });
+    return Err(Error::Backend(format!(
+      "lfilter: sample count {n_samples} exceeds the {MAX_LFILTER_SAMPLES} cap"
+    )));
   }
 
   // f32 boundary wrapper: read the input via `try_clone().to_vec::<f32>()`
@@ -2792,18 +2752,20 @@ pub fn lfilter(b: &[f64], a: &[f64], data: &Array) -> Result<Array> {
   // reference's `np.result_type(data.dtype, b.dtype, a.dtype)` promotion.
   let x_f32 = data.try_clone()?.to_vec::<f32>()?;
   let mut x_f64: Vec<f64> = Vec::new();
-  x_f64
-    .try_reserve_exact(n_samples)
-    .map_err(|e| Error::Backend {
-      message: format!("lfilter: input promotion reservation for {n_samples} samples failed: {e}"),
-    })?;
+  x_f64.try_reserve_exact(n_samples).map_err(|e| {
+    Error::Backend(format!(
+      "lfilter: input promotion reservation for {n_samples} samples failed: {e}"
+    ))
+  })?;
   for v in &x_f32 {
     x_f64.push(f64::from(*v));
   }
   let y_f64 = lfilter_f64(b, a, &x_f64)?;
   let mut y: Vec<f32> = Vec::new();
-  y.try_reserve_exact(n_samples).map_err(|e| Error::Backend {
-    message: format!("lfilter: output reservation for {n_samples} samples failed: {e}"),
+  y.try_reserve_exact(n_samples).map_err(|e| {
+    Error::Backend(format!(
+      "lfilter: output reservation for {n_samples} samples failed: {e}"
+    ))
   })?;
   for v in &y_f64 {
     y.push(*v as f32);
@@ -2832,20 +2794,21 @@ pub fn lfilter(b: &[f64], a: &[f64], data: &Array) -> Result<Array> {
 /// that.
 fn lfilter_f64(b: &[f64], a: &[f64], x: &[f64]) -> Result<Vec<f64>> {
   if a.is_empty() {
-    return Err(Error::Backend {
-      message: "lfilter: filter denominator must be non-empty".into(),
-    });
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "lfilter: filter denominator (a)",
+    )));
   }
   if a[0] == 0.0 {
-    return Err(Error::Backend {
-      message: "lfilter: filter denominator must have a non-zero leading term (a[0] != 0)".into(),
-    });
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "lfilter: filter denominator a[0]",
+      "must be non-zero (a[0] != 0)",
+    )));
   }
   let n_samples = x.len();
   if n_samples > MAX_LFILTER_SAMPLES {
-    return Err(Error::Backend {
-      message: format!("lfilter: sample count {n_samples} exceeds the {MAX_LFILTER_SAMPLES} cap"),
-    });
+    return Err(Error::Backend(format!(
+      "lfilter: sample count {n_samples} exceeds the {MAX_LFILTER_SAMPLES} cap"
+    )));
   }
 
   // Mirror the reference's `if b.size == 0: return np.zeros_like(data)`.
@@ -2853,8 +2816,10 @@ fn lfilter_f64(b: &[f64], a: &[f64], x: &[f64]) -> Result<Vec<f64>> {
   // regardless of `data` or `a`); allocate the result directly.
   if b.is_empty() {
     let mut y: Vec<f64> = Vec::new();
-    y.try_reserve_exact(n_samples).map_err(|e| Error::Backend {
-      message: format!("lfilter: zero-output reservation for {n_samples} samples failed: {e}"),
+    y.try_reserve_exact(n_samples).map_err(|e| {
+      Error::Backend(format!(
+        "lfilter: zero-output reservation for {n_samples} samples failed: {e}"
+      ))
     })?;
     y.resize(n_samples, 0.0);
     return Ok(y);
@@ -2867,20 +2832,22 @@ fn lfilter_f64(b: &[f64], a: &[f64], x: &[f64]) -> Result<Vec<f64>> {
   // discipline.
   let a0 = a[0];
   let mut b_norm: Vec<f64> = Vec::new();
-  b_norm
-    .try_reserve_exact(b.len())
-    .map_err(|e| Error::Backend {
-      message: format!("lfilter: reservation for b ({} taps) failed: {e}", b.len()),
-    })?;
+  b_norm.try_reserve_exact(b.len()).map_err(|e| {
+    Error::Backend(format!(
+      "lfilter: reservation for b ({} taps) failed: {e}",
+      b.len()
+    ))
+  })?;
   for &bv in b {
     b_norm.push(bv / a0);
   }
   let mut a_norm: Vec<f64> = Vec::new();
-  a_norm
-    .try_reserve_exact(a.len())
-    .map_err(|e| Error::Backend {
-      message: format!("lfilter: reservation for a ({} taps) failed: {e}", a.len()),
-    })?;
+  a_norm.try_reserve_exact(a.len()).map_err(|e| {
+    Error::Backend(format!(
+      "lfilter: reservation for a ({} taps) failed: {e}",
+      a.len()
+    ))
+  })?;
   for &av in a {
     a_norm.push(av / a0);
   }
@@ -2892,8 +2859,10 @@ fn lfilter_f64(b: &[f64], a: &[f64], x: &[f64]) -> Result<Vec<f64>> {
 
   // Output buffer (f64 — the kernel runs end-to-end in f64).
   let mut y: Vec<f64> = Vec::new();
-  y.try_reserve_exact(n_samples).map_err(|e| Error::Backend {
-    message: format!("lfilter: output reservation for {n_samples} samples failed: {e}"),
+  y.try_reserve_exact(n_samples).map_err(|e| {
+    Error::Backend(format!(
+      "lfilter: output reservation for {n_samples} samples failed: {e}"
+    ))
   })?;
 
   // Reference's `state_len == 0` fast path: `y = b[0] * x` (no recurrence,
@@ -2942,11 +2911,11 @@ fn lfilter_f64(b: &[f64], a: &[f64], x: &[f64]) -> Result<Vec<f64>> {
   // AND for `state_len == 2` (the biquad-dispatcher fast-path was tried
   // and reverted; see comment above).
   let mut state: Vec<f64> = Vec::new();
-  state
-    .try_reserve_exact(state_len)
-    .map_err(|e| Error::Backend {
-      message: format!("lfilter: state reservation for {state_len} taps failed: {e}"),
-    })?;
+  state.try_reserve_exact(state_len).map_err(|e| {
+    Error::Backend(format!(
+      "lfilter: state reservation for {state_len} taps failed: {e}"
+    ))
+  })?;
   state.resize(state_len, 0.0);
 
   for &sample in x {
@@ -3005,20 +2974,21 @@ fn lfilter_f64(b: &[f64], a: &[f64], x: &[f64]) -> Result<Vec<f64>> {
 /// zeros into `x` (the in-place equivalent of returning `np.zeros_like`).
 fn lfilter_f64_in_place(b: &[f64], a: &[f64], x: &mut [f64]) -> Result<()> {
   if a.is_empty() {
-    return Err(Error::Backend {
-      message: "lfilter: filter denominator must be non-empty".into(),
-    });
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "lfilter: filter denominator (a)",
+    )));
   }
   if a[0] == 0.0 {
-    return Err(Error::Backend {
-      message: "lfilter: filter denominator must have a non-zero leading term (a[0] != 0)".into(),
-    });
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "lfilter: filter denominator a[0]",
+      "must be non-zero (a[0] != 0)",
+    )));
   }
   let n_samples = x.len();
   if n_samples > MAX_LFILTER_SAMPLES {
-    return Err(Error::Backend {
-      message: format!("lfilter: sample count {n_samples} exceeds the {MAX_LFILTER_SAMPLES} cap"),
-    });
+    return Err(Error::Backend(format!(
+      "lfilter: sample count {n_samples} exceeds the {MAX_LFILTER_SAMPLES} cap"
+    )));
   }
 
   // Mirror `lfilter_f64`'s `b.is_empty()` early-return semantics in place:
@@ -3034,20 +3004,22 @@ fn lfilter_f64_in_place(b: &[f64], a: &[f64], x: &mut [f64]) -> Result<()> {
   // Normalize `b` and `a` by `a[0]` — same arithmetic as `lfilter_f64`.
   let a0 = a[0];
   let mut b_norm: Vec<f64> = Vec::new();
-  b_norm
-    .try_reserve_exact(b.len())
-    .map_err(|e| Error::Backend {
-      message: format!("lfilter: reservation for b ({} taps) failed: {e}", b.len()),
-    })?;
+  b_norm.try_reserve_exact(b.len()).map_err(|e| {
+    Error::Backend(format!(
+      "lfilter: reservation for b ({} taps) failed: {e}",
+      b.len()
+    ))
+  })?;
   for &bv in b {
     b_norm.push(bv / a0);
   }
   let mut a_norm: Vec<f64> = Vec::new();
-  a_norm
-    .try_reserve_exact(a.len())
-    .map_err(|e| Error::Backend {
-      message: format!("lfilter: reservation for a ({} taps) failed: {e}", a.len()),
-    })?;
+  a_norm.try_reserve_exact(a.len()).map_err(|e| {
+    Error::Backend(format!(
+      "lfilter: reservation for a ({} taps) failed: {e}",
+      a.len()
+    ))
+  })?;
   for &av in a {
     a_norm.push(av / a0);
   }
@@ -3132,11 +3104,11 @@ fn lfilter_f64_in_place(b: &[f64], a: &[f64], x: &mut [f64]) -> Result<()> {
   // (`b[i] * sample`) and feedback (`a[i] * output`) both use the SAME
   // `sample` value that lived in `x[n]` on entry to this iteration.
   let mut state: Vec<f64> = Vec::new();
-  state
-    .try_reserve_exact(state_len)
-    .map_err(|e| Error::Backend {
-      message: format!("lfilter: state reservation for {state_len} taps failed: {e}"),
-    })?;
+  state.try_reserve_exact(state_len).map_err(|e| {
+    Error::Backend(format!(
+      "lfilter: state reservation for {state_len} taps failed: {e}"
+    ))
+  })?;
   state.resize(state_len, 0.0);
 
   for slot in x.iter_mut() {
@@ -3287,8 +3259,10 @@ fn k_weight_channel(channel: &[f32], rate: u32) -> Result<Vec<f64>> {
   // biased gate decisions near the absolute/relative LUFS thresholds).
   let n = channel.len();
   let mut chan_f64: Vec<f64> = Vec::new();
-  chan_f64.try_reserve_exact(n).map_err(|e| Error::Backend {
-    message: format!("k_weight_channel: input promotion reservation for {n} samples failed: {e}"),
+  chan_f64.try_reserve_exact(n).map_err(|e| {
+    Error::Backend(format!(
+      "k_weight_channel: input promotion reservation for {n} samples failed: {e}"
+    ))
   })?;
   for &v in channel {
     chan_f64.push(f64::from(v));
@@ -3381,19 +3355,23 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
   // Input validation mirrors `_validate_loudness_audio` + the loudness
   // parameter ranges.
   if rate == 0 {
-    return Err(Error::Backend {
-      message: "integrated_loudness: rate must be > 0".into(),
-    });
+    return Err(Error::Backend(
+      "integrated_loudness: rate must be > 0".into(),
+    ));
   }
   if !(block_size > 0.0 && block_size.is_finite()) {
-    return Err(Error::Backend {
-      message: format!("integrated_loudness: block_size must be finite and > 0 (got {block_size})"),
-    });
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "integrated_loudness: block_size",
+      "must be a finite value > 0",
+      format!("{block_size}"),
+    )));
   }
   if !((0.0..1.0).contains(&overlap) && overlap.is_finite()) {
-    return Err(Error::Backend {
-      message: format!("integrated_loudness: overlap must be in [0, 1) (got {overlap})"),
-    });
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "integrated_loudness: overlap",
+      "must be a finite value in [0, 1)",
+      format!("{overlap}"),
+    )));
   }
   let shape = data.shape();
   let (n_samples, n_channels) = match shape.len() {
@@ -3404,27 +3382,24 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
       // mean-squares each channel independently.
       let (n_samples, n_channels) = (shape[0], shape[1]);
       if n_channels > BS1770_MAX_CHANNELS {
-        return Err(Error::Backend {
-          message: format!(
-            "integrated_loudness: audio must have at most {BS1770_MAX_CHANNELS} channels \
-             (got {n_channels})"
-          ),
-        });
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "integrated_loudness: n_channels",
+          "must be at most 5 (BS.1770 standard limit)",
+          format!("{n_channels}"),
+        )));
       }
       if n_channels == 0 {
-        return Err(Error::Backend {
-          message: "integrated_loudness: audio must have at least 1 channel".into(),
-        });
+        return Err(Error::Backend(
+          "integrated_loudness: audio must have at least 1 channel".into(),
+        ));
       }
       (n_samples, n_channels)
     }
     other => {
-      return Err(Error::Backend {
-        message: format!(
-          "integrated_loudness: data must be 1-D (mono) or 2-D \
+      return Err(Error::Backend(format!(
+        "integrated_loudness: data must be 1-D (mono) or 2-D \
            (n_samples, n_channels), got {other}-D"
-        ),
-      });
+      )));
     }
   };
   // Cap on the TOTAL materialized element count BEFORE the `to_vec`. The
@@ -3433,21 +3408,17 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
   // materialize `5 * MAX_DECODED_SAMPLES` f32 samples (multi-GB). Mirrors
   // the [`stft`] / OLA pattern of checking the materialized work cap
   // before any allocation.
-  let total_elements = n_samples
-    .checked_mul(n_channels)
-    .ok_or_else(|| Error::Backend {
-      message: format!(
-        "integrated_loudness: total element count overflows usize (n_samples={n_samples}, \
+  let total_elements = n_samples.checked_mul(n_channels).ok_or_else(|| {
+    Error::Backend(format!(
+      "integrated_loudness: total element count overflows usize (n_samples={n_samples}, \
          n_channels={n_channels})"
-      ),
-    })?;
+    ))
+  })?;
   if total_elements > MAX_LOUDNESS_SAMPLES {
-    return Err(Error::Backend {
-      message: format!(
-        "integrated_loudness: total element count {total_elements} (n_samples={n_samples} * \
+    return Err(Error::Backend(format!(
+      "integrated_loudness: total element count {total_elements} (n_samples={n_samples} * \
          n_channels={n_channels}) exceeds the {MAX_LOUDNESS_SAMPLES} cap"
-      ),
-    });
+    )));
   }
 
   // `block_size * rate` is the per-block sample count in the reference.
@@ -3456,20 +3427,17 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
   let rate_f64 = f64::from(rate);
   let block_samples_f64 = block_size * rate_f64;
   if !block_samples_f64.is_finite() || block_samples_f64 < 1.0 {
-    return Err(Error::Backend {
-      message: format!(
-        "integrated_loudness: block_size * rate = {block_samples_f64} produces \
+    return Err(Error::Backend(format!(
+      "integrated_loudness: block_size * rate = {block_samples_f64} produces \
          < 1 sample (block_size={block_size}, rate={rate})"
-      ),
-    });
+    )));
   }
   if (n_samples as f64) < block_samples_f64 {
-    return Err(Error::Backend {
-      message: format!(
-        "integrated_loudness: audio length {n_samples} samples must be greater than the \
-         block size ({block_samples_f64} samples)"
-      ),
-    });
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "integrated_loudness: audio length (samples)",
+      "must be greater than the block size",
+      format!("{n_samples} samples (block_size*rate = {block_samples_f64:.1} samples)"),
+    )));
   }
 
   // Per-block analysis. Reference:
@@ -3492,12 +3460,10 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
   let num_blocks_f64 =
     ((duration_seconds - block_size) / (block_size * step)).round_ties_even() + 1.0;
   if !num_blocks_f64.is_finite() || num_blocks_f64 < 1.0 {
-    return Err(Error::Backend {
-      message: format!(
-        "integrated_loudness: derived num_blocks {num_blocks_f64} is invalid \
+    return Err(Error::Backend(format!(
+      "integrated_loudness: derived num_blocks {num_blocks_f64} is invalid \
          (duration={duration_seconds}, block_size={block_size}, overlap={overlap})"
-      ),
-    });
+    )));
   }
   // Reject pathological `num_blocks` BEFORE any `num_blocks`-scaled
   // allocation OR the per-block sum loop runs. A caller-controlled
@@ -3518,46 +3484,40 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
   // `num_blocks_f64 > usize::MAX as f64` check catches the as-cast
   // saturation case where the `usize` cast silently clamps.
   if num_blocks_f64 > usize::MAX as f64 {
-    return Err(Error::Backend {
-      message: format!(
-        "integrated_loudness: derived num_blocks {num_blocks_f64} overflows usize \
+    return Err(Error::Backend(format!(
+      "integrated_loudness: derived num_blocks {num_blocks_f64} overflows usize \
          (duration={duration_seconds}, block_size={block_size}, overlap={overlap})"
-      ),
-    });
+    )));
   }
   let num_blocks = num_blocks_f64 as usize;
   if num_blocks == 0 {
-    return Err(Error::Backend {
-      message: "integrated_loudness: derived num_blocks == 0".into(),
-    });
+    return Err(Error::Backend(
+      "integrated_loudness: derived num_blocks == 0".into(),
+    ));
   }
   // Byte cap: `num_blocks * n_channels * sizeof::<f64>() <=
   // MAX_LOUDNESS_BLOCK_BYTES`. Compute the cell count first, then the
   // byte product — both `checked_mul` so overflow rejects.
-  let block_cells = num_blocks
-    .checked_mul(n_channels)
-    .ok_or_else(|| Error::Backend {
-      message: format!(
-        "integrated_loudness: block cells {num_blocks} * {n_channels} overflows usize \
+  let block_cells = num_blocks.checked_mul(n_channels).ok_or_else(|| {
+    Error::Backend(format!(
+      "integrated_loudness: block cells {num_blocks} * {n_channels} overflows usize \
          (overlap={overlap})"
-      ),
-    })?;
+    ))
+  })?;
   let block_bytes = block_cells
     .checked_mul(std::mem::size_of::<f64>())
-    .ok_or_else(|| Error::Backend {
-      message: format!(
+    .ok_or_else(|| {
+      Error::Backend(format!(
         "integrated_loudness: block bytes {block_cells} * 8 overflows usize \
          (overlap={overlap})"
-      ),
+      ))
     })?;
   if block_bytes > MAX_LOUDNESS_BLOCK_BYTES {
-    return Err(Error::Backend {
-      message: format!(
-        "integrated_loudness: mean-square byte footprint {block_bytes} \
+    return Err(Error::Backend(format!(
+      "integrated_loudness: mean-square byte footprint {block_bytes} \
          (num_blocks={num_blocks} * n_channels={n_channels} * 8) exceeds the \
          {MAX_LOUDNESS_BLOCK_BYTES} byte cap (overlap={overlap})"
-      ),
-    });
+    )));
   }
   // Work cap: `num_blocks * block_size_samples * n_channels <=
   // MAX_LOUDNESS_WORK`. The per-block mean-square loop runs ONCE PER
@@ -3581,27 +3541,25 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
   let block_samples_usize: usize = block_samples_f64.ceil() as usize;
   let total_work = num_blocks
     .checked_mul(block_samples_usize)
-    .ok_or_else(|| Error::Backend {
-      message: format!(
+    .ok_or_else(|| {
+      Error::Backend(format!(
         "integrated_loudness: total work {num_blocks} * {block_samples_usize} overflows \
          usize (overlap={overlap})"
-      ),
+      ))
     })?
     .checked_mul(n_channels)
-    .ok_or_else(|| Error::Backend {
-      message: format!(
+    .ok_or_else(|| {
+      Error::Backend(format!(
         "integrated_loudness: total work {num_blocks} * {block_samples_usize} * \
          {n_channels} overflows usize (overlap={overlap})"
-      ),
+      ))
     })?;
   if total_work > MAX_LOUDNESS_WORK {
-    return Err(Error::Backend {
-      message: format!(
-        "integrated_loudness: total sample-visit work {total_work} (num_blocks={num_blocks} \
+    return Err(Error::Backend(format!(
+      "integrated_loudness: total sample-visit work {total_work} (num_blocks={num_blocks} \
          * block_samples={block_samples_usize} * n_channels={n_channels}) exceeds the \
          {MAX_LOUDNESS_WORK} cap (overlap={overlap})"
-      ),
-    });
+    )));
   }
 
   // Extract the raw interleaved f32 buffer (bounded by the
@@ -3613,35 +3571,29 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
   // `3 * n_samples * n_channels`.
   let raw_f32 = data.try_clone()?.to_vec::<f32>()?;
   if raw_f32.len() != total_elements {
-    return Err(Error::Backend {
-      message: format!(
-        "integrated_loudness: internal shape mismatch — got {} f32 samples for shape \
+    return Err(Error::Backend(format!(
+      "integrated_loudness: internal shape mismatch — got {} f32 samples for shape \
          ({n_samples}, {n_channels})",
-        raw_f32.len()
-      ),
-    });
+      raw_f32.len()
+    )));
   }
 
   // mean_square[c][b] — per-channel, per-block mean-square. Matches the
   // reference's `np.zeros((num_channels, num_blocks))`. Bounded by the
   // `block_work` cap above.
   let mut mean_square: Vec<Vec<f64>> = Vec::new();
-  mean_square
-    .try_reserve_exact(n_channels)
-    .map_err(|e| Error::Backend {
-      message: format!(
-        "integrated_loudness: reservation for {n_channels} mean-square channels failed: {e}"
-      ),
-    })?;
+  mean_square.try_reserve_exact(n_channels).map_err(|e| {
+    Error::Backend(format!(
+      "integrated_loudness: reservation for {n_channels} mean-square channels failed: {e}"
+    ))
+  })?;
   for _ in 0..n_channels {
     let mut row: Vec<f64> = Vec::new();
-    row
-      .try_reserve_exact(num_blocks)
-      .map_err(|e| Error::Backend {
-        message: format!(
-          "integrated_loudness: reservation for {num_blocks} mean-square blocks failed: {e}"
-        ),
-      })?;
+    row.try_reserve_exact(num_blocks).map_err(|e| {
+      Error::Backend(format!(
+        "integrated_loudness: reservation for {num_blocks} mean-square blocks failed: {e}"
+      ))
+    })?;
     row.resize(num_blocks, 0.0);
     mean_square.push(row);
   }
@@ -3658,11 +3610,11 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
   // copy. 2-D input has the reference's `(n_samples, n_channels)` layout
   // — channel `c`'s sample `i` lives at `raw_f32[i * n_channels + c]`.
   let mut chan_f32: Vec<f32> = Vec::new();
-  chan_f32
-    .try_reserve_exact(n_samples)
-    .map_err(|e| Error::Backend {
-      message: format!("integrated_loudness: reservation for {n_samples} samples failed: {e}"),
-    })?;
+  chan_f32.try_reserve_exact(n_samples).map_err(|e| {
+    Error::Backend(format!(
+      "integrated_loudness: reservation for {n_samples} samples failed: {e}"
+    ))
+  })?;
   for (c, ms_row) in mean_square.iter_mut().enumerate() {
     chan_f32.clear();
     for i in 0..n_samples {
@@ -3726,13 +3678,11 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
   // dropped (matches the reference's `warnings.simplefilter("ignore", ...)`
   // around the same `log10`).
   let mut block_loudness: Vec<f64> = Vec::new();
-  block_loudness
-    .try_reserve_exact(num_blocks)
-    .map_err(|e| Error::Backend {
-      message: format!(
-        "integrated_loudness: reservation for {num_blocks} block loudness failed: {e}"
-      ),
-    })?;
+  block_loudness.try_reserve_exact(num_blocks).map_err(|e| {
+    Error::Backend(format!(
+      "integrated_loudness: reservation for {num_blocks} block loudness failed: {e}"
+    ))
+  })?;
   for b in 0..num_blocks {
     let mut weighted_sum = 0.0_f64;
     // Channel gain is defined for the first 5 channels (the reference's
@@ -3858,16 +3808,18 @@ pub fn normalize_loudness(
   target_loudness: f64,
 ) -> Result<Array> {
   if !input_loudness.is_finite() {
-    return Err(Error::Backend {
-      message: format!("normalize_loudness: input_loudness must be finite (got {input_loudness})"),
-    });
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "normalize_loudness: input_loudness",
+      "must be finite (NaN/±inf would yield a non-finite gain)",
+      format!("{input_loudness}"),
+    )));
   }
   if !target_loudness.is_finite() {
-    return Err(Error::Backend {
-      message: format!(
-        "normalize_loudness: target_loudness must be finite (got {target_loudness})"
-      ),
-    });
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "normalize_loudness: target_loudness",
+      "must be finite (NaN/±inf would yield a non-finite gain)",
+      format!("{target_loudness}"),
+    )));
   }
   let delta = target_loudness - input_loudness;
   // `gain = 10^(delta / 20)`. Reference: `np.power(10.0, delta / 20.0)`.
@@ -3918,36 +3870,35 @@ pub fn normalize_loudness(
 /// This reads back one scalar (the current peak) via an explicit `eval`.
 pub fn normalize_peak(data: &Array, target_peak_db: f64) -> Result<Array> {
   if !target_peak_db.is_finite() {
-    return Err(Error::Backend {
-      message: format!("normalize_peak: target_peak_db must be finite (got {target_peak_db})"),
-    });
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "normalize_peak: target_peak_db",
+      "must be finite (NaN/±inf cannot represent a dB level)",
+      format!("{target_peak_db}"),
+    )));
   }
   if data.size() == 0 {
-    return Err(Error::Backend {
-      message: "normalize_peak: data must be non-empty (max over an empty array is undefined)"
-        .into(),
-    });
+    return Err(Error::Backend(
+      "normalize_peak: data must be non-empty (max over an empty array is undefined)".into(),
+    ));
   }
   // current_peak = max(|data|). One explicit scalar readback.
   let abs_data = data.abs()?;
   let mut peak_arr = ops::reduction::max(&abs_data, false)?;
   let current_peak = peak_arr.item::<f32>()?;
   if !current_peak.is_finite() {
-    return Err(Error::Backend {
-      message: format!(
-        "normalize_peak: current peak max(|data|) is non-finite ({current_peak}) — \
+    return Err(Error::Backend(format!(
+      "normalize_peak: current peak max(|data|) is non-finite ({current_peak}) — \
          the input contains a NaN or infinite sample"
-      ),
-    });
+    )));
   }
   // `current_peak` is `max(|.|)`, so it is always `>= 0.0`; `== 0.0` means an
   // all-silence (or all-zero) input, which cannot be peak-normalized.
   if current_peak == 0.0 {
-    return Err(Error::Backend {
-      message: "normalize_peak: current peak max(|data|) is 0.0 — an all-silence input \
+    return Err(Error::Backend(
+      "normalize_peak: current peak max(|data|) is 0.0 — an all-silence input \
                 cannot be peak-normalized (the gain would divide by zero)"
         .into(),
-    });
+    ));
   }
   // `gain = 10^(target_peak_db / 20) / current_peak`. Reference:
   // `np.power(10.0, target_peak_db / 20.0) / current_peak`. Compute the
@@ -3962,22 +3913,18 @@ pub fn normalize_peak(data: &Array, target_peak_db: f64) -> Result<Array> {
   // samples — so reject BEFORE building the scalar, exactly as the up-front
   // non-finite `target_peak_db` / `current_peak` guards do.
   if !target_linear.is_finite() {
-    return Err(Error::Backend {
-      message: format!(
-        "normalize_peak: target amplitude 10^(target_peak_db / 20) is non-finite \
+    return Err(Error::Backend(format!(
+      "normalize_peak: target amplitude 10^(target_peak_db / 20) is non-finite \
          ({target_linear}) — target_peak_db {target_peak_db} is too large to represent \
          as a finite f32 gain"
-      ),
-    });
+    )));
   }
   if !gain.is_finite() {
-    return Err(Error::Backend {
-      message: format!(
-        "normalize_peak: gain target_linear / current_peak is non-finite ({gain}) — \
+    return Err(Error::Backend(format!(
+      "normalize_peak: gain target_linear / current_peak is non-finite ({gain}) — \
          the current peak {current_peak:.3e} is too small for target_peak_db \
          {target_peak_db} (the scaling overflows to a non-finite value)"
-      ),
-    });
+    )));
   }
   let gain_arr = Array::full::<f32>(&[0i32; 0], gain)?;
   ops::arithmetic::multiply(data, &gain_arr)
@@ -4069,7 +4016,7 @@ mod tests {
       bartlett_window(0),
       bartlett_window(1),
     ] {
-      assert!(matches!(r, Err(Error::Backend { .. })));
+      assert!(matches!(r, Err(Error::Backend(_))));
     }
     // The `window_from_name` dispatch must propagate the same rejection
     // for every supported name (so `STR_TO_WINDOW_FN`-style callers also
@@ -4077,7 +4024,7 @@ mod tests {
     for name in ["hann", "hanning", "hamming", "blackman", "bartlett"] {
       let r = window_from_name(name, 1);
       assert!(
-        matches!(r, Err(Error::Backend { .. })),
+        matches!(r, Err(Error::Backend(_))),
         "window_from_name({name:?}, 1) must reject n<2, got {r:?}"
       );
     }
@@ -4101,7 +4048,7 @@ mod tests {
   fn window_from_name_rejects_unknown() {
     assert!(matches!(
       window_from_name("kaiser", 8),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
   }
 
@@ -4286,7 +4233,7 @@ mod tests {
       for len in [None, Some(16usize)] {
         let res = istft(&spec, len);
         assert!(
-          matches!(res, Err(Error::Backend { .. })),
+          matches!(res, Err(Error::Backend(_))),
           "Right + win={win} < n_fft=16 (length={len:?}) must be rejected up front \
            (covered-but-wrong for win=12; the coverage guard does NOT catch it), \
            got {res:?}"
@@ -4344,7 +4291,7 @@ mod tests {
     for len in [None, Some(10usize)] {
       let res = istft(&spec_no_center, len);
       assert!(
-        matches!(res, Err(Error::Backend { .. })),
+        matches!(res, Err(Error::Backend(_))),
         "center=false head (length={len:?}) includes the zero-coverage OLA \
          index 0 and must hit the coverage guard, got {res:?}"
       );
@@ -4367,7 +4314,7 @@ mod tests {
     for n_fft in [9usize, 15] {
       let res = stft(&x, n_fft, 4, None, WindowPad::Center);
       assert!(
-        matches!(res, Err(Error::Backend { .. })),
+        matches!(res, Err(Error::Backend(_))),
         "odd n_fft={n_fft} must be rejected up front, got {res:?}"
       );
     }
@@ -4389,10 +4336,7 @@ mod tests {
     let spec = stft(&x, 8, 4, Some(8), WindowPad::Center).unwrap();
     // length larger than the OLA length (t = (5-1)*4 + 8 = 24): center=true so
     // n_fft/2 + length = 4 + 1000 > 24 is out of range.
-    assert!(matches!(
-      istft(&spec, Some(1000)),
-      Err(Error::Backend { .. })
-    ));
+    assert!(matches!(istft(&spec, Some(1000)), Err(Error::Backend(_))));
   }
 
   #[test]
@@ -4419,7 +4363,7 @@ mod tests {
     // no Spectrum can ever carry it.)
     assert!(matches!(
       Spectrum::from_parts(valid.try_clone().unwrap(), 9, 4, 8, WindowPad::Center, true),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
 
     // Wrong n_freqs for the declared n_fft: n_fft=16 ⇒ n_freqs must be 9, but
@@ -4433,7 +4377,7 @@ mod tests {
         WindowPad::Center,
         true
       ),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
 
     // win_length > n_fft.
@@ -4446,23 +4390,23 @@ mod tests {
         WindowPad::Center,
         true
       ),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
 
     // hop_length == 0 and win_length == 0.
     assert!(matches!(
       Spectrum::from_parts(valid.try_clone().unwrap(), 8, 0, 8, WindowPad::Center, true),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
     assert!(matches!(
       Spectrum::from_parts(valid.try_clone().unwrap(), 8, 4, 0, WindowPad::Center, true),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
 
     // n_fft == 0.
     assert!(matches!(
       Spectrum::from_parts(valid.try_clone().unwrap(), 0, 4, 0, WindowPad::Center, true),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
 
     // Non-2-D data (1-D).
@@ -4472,14 +4416,14 @@ mod tests {
       .unwrap();
     assert!(matches!(
       Spectrum::from_parts(one_d, 8, 4, 8, WindowPad::Center, true),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
 
     // Non-Complex64 data (F32) with otherwise-consistent metadata.
     let real_data = Array::zeros::<f32>(&[5i32, 5i32]).unwrap();
     assert!(matches!(
       Spectrum::from_parts(real_data, 8, 4, 8, WindowPad::Center, true),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
   }
 
@@ -4555,7 +4499,7 @@ mod tests {
     .unwrap();
     let res = istft(&spec, None);
     assert!(
-      matches!(res, Err(Error::Backend { .. })),
+      matches!(res, Err(Error::Backend(_))),
       "pathological num_frames*n_fft must be rejected by the MAX_OLA_WORK cap \
        before the frame_window allocation"
     );
@@ -4581,7 +4525,7 @@ mod tests {
     let lazy = Array::zeros::<f32>(&[n_samples]).unwrap();
     let res = stft(&lazy, 1024, 1, None, WindowPad::Right);
     assert!(
-      matches!(res, Err(Error::Backend { .. })),
+      matches!(res, Err(Error::Backend(_))),
       "pathological lazy huge-shape stft input (num_frames * n_fft) must be \
        rejected by the MAX_STFT_WORK cap before any framing/FFT allocation, got {res:?}"
     );
@@ -4610,7 +4554,7 @@ mod tests {
     let large_hop = crate::audio::io::MAX_DECODED_SAMPLES;
     let res = stft(&lazy, 16, large_hop, None, WindowPad::Right);
     assert!(
-      matches!(res, Err(Error::Backend { .. })),
+      matches!(res, Err(Error::Backend(_))),
       "oversized lazy stft input with a large hop (work cap would pass) must be \
        rejected by the input/padded-length cap before the reflect pad, got {res:?}"
     );
@@ -4813,18 +4757,18 @@ mod tests {
     // `a.size == 0 or a[0] == 0`).
     assert!(matches!(
       lfilter(&[1.0_f64], &[], &x),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
     // a[0] == 0
     assert!(matches!(
       lfilter(&[1.0_f64], &[0.0_f64, 1.0], &x),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
     // 2-D input — reference raises `dsp.lfilter only supports 1-D input`.
     let x_2d = Array::from_slice::<f32>(&[1.0_f32, 2.0, 3.0, 4.0], &[2i32, 2i32]).unwrap();
     assert!(matches!(
       lfilter(&[0.5_f64], &[1.0_f64, -0.5], &x_2d),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
   }
 
@@ -4846,7 +4790,7 @@ mod tests {
       Array::zeros::<f32>(&[(MAX_LFILTER_SAMPLES + 1) as i32]).expect("lazy zeros must succeed");
     let res = lfilter(&[0.5_f64], &[1.0_f64, -0.5], &lazy_huge);
     assert!(
-      matches!(res, Err(Error::Backend { .. })),
+      matches!(res, Err(Error::Backend(_))),
       "lfilter must reject a lazy ({} samples) input via the up-front \
        sample cap, BEFORE the to_vec materializes f32 / promotes to f64 \
        (got {res:?})",
@@ -4938,11 +4882,11 @@ mod tests {
     let mut x_buf: [f64; 2] = [1.0, 2.0];
     assert!(matches!(
       lfilter_f64_in_place(&[1.0_f64], &[], &mut x_buf),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
     assert!(matches!(
       lfilter_f64_in_place(&[1.0_f64], &[0.0_f64, 1.0], &mut x_buf),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
   }
 
@@ -5142,7 +5086,7 @@ mod tests {
     let x = sine_mono(1000.0, 0.5, rate, 0.1);
     let res = integrated_loudness(&x, rate, 0.4, 0.75);
     assert!(
-      matches!(res, Err(Error::Backend { .. })),
+      matches!(res, Err(Error::Backend(_))),
       "audio shorter than block_size * rate must be rejected (got {res:?})"
     );
   }
@@ -5157,7 +5101,7 @@ mod tests {
     let x = Array::from_slice::<f32>(&buf, &[n as i32, 6i32]).unwrap();
     let res = integrated_loudness(&x, rate, 0.4, 0.75);
     assert!(
-      matches!(res, Err(Error::Backend { .. })),
+      matches!(res, Err(Error::Backend(_))),
       "audio with >5 channels must be rejected (got {res:?})"
     );
   }
@@ -5171,7 +5115,7 @@ mod tests {
     let x = Array::from_slice::<f32>(&buf, &[100i32, 60i32, 4i32]).unwrap();
     let res = integrated_loudness(&x, rate, 0.4, 0.75);
     assert!(
-      matches!(res, Err(Error::Backend { .. })),
+      matches!(res, Err(Error::Backend(_))),
       "3-D input must be rejected (got {res:?})"
     );
   }
@@ -5185,22 +5129,22 @@ mod tests {
     // overlap = 1.0 — would divide by zero in `step = 1 - overlap`.
     assert!(matches!(
       integrated_loudness(&x, rate, 0.4, 1.0),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
     // overlap < 0
     assert!(matches!(
       integrated_loudness(&x, rate, 0.4, -0.1),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
     // block_size <= 0
     assert!(matches!(
       integrated_loudness(&x, rate, 0.0, 0.75),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
     // rate == 0
     assert!(matches!(
       integrated_loudness(&x, 0, 0.4, 0.75),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
   }
 
@@ -5227,7 +5171,7 @@ mod tests {
       Array::zeros::<f32>(&[(crate::audio::io::MAX_DECODED_SAMPLES + 1) as i32]).unwrap();
     let res_mono = integrated_loudness(&lazy_mono, rate, 0.4, 0.75);
     assert!(
-      matches!(res_mono, Err(Error::Backend { .. })),
+      matches!(res_mono, Err(Error::Backend(_))),
       "1-D input above the per-channel cap must be rejected (got {res_mono:?})"
     );
     // 2-D: per-channel BELOW the cap (would slip past a per-channel-only
@@ -5238,7 +5182,7 @@ mod tests {
     let lazy_5ch = Array::zeros::<f32>(&[n_per_chan as i32, 5i32]).unwrap();
     let res_5ch = integrated_loudness(&lazy_5ch, rate, 0.4, 0.75);
     assert!(
-      matches!(res_5ch, Err(Error::Backend { .. })),
+      matches!(res_5ch, Err(Error::Backend(_))),
       "2-D input where per-channel count fits but total elements does not \
        must be rejected by the TOTAL-elements cap (got {res_5ch:?})"
     );
@@ -5273,7 +5217,7 @@ mod tests {
     let x = sine_mono(1000.0, 0.5, rate, 3.0);
     let res = integrated_loudness(&x, rate, 0.4, 0.999_999_999_999);
     assert!(
-      matches!(res, Err(Error::Backend { .. })),
+      matches!(res, Err(Error::Backend(_))),
       "pathological overlap close to 1 must be rejected by the byte/work \
        caps BEFORE any num_blocks-scaled allocation (got {res:?})"
     );
@@ -5290,7 +5234,7 @@ mod tests {
     let stereo = Array::from_slice::<f32>(&stereo_buf, &[n as i32, 2i32]).unwrap();
     let res_stereo = integrated_loudness(&stereo, rate, 0.4, 0.999_999_999_999);
     assert!(
-      matches!(res_stereo, Err(Error::Backend { .. })),
+      matches!(res_stereo, Err(Error::Backend(_))),
       "pathological-overlap stereo (byte cap factor n_channels) must be \
        rejected (got {res_stereo:?})"
     );
@@ -5325,7 +5269,7 @@ mod tests {
     let x = sine_mono(1000.0, 0.5, rate, 3.0);
     let res = integrated_loudness(&x, rate, 0.4, 0.999_999_90);
     assert!(
-      matches!(res, Err(Error::Backend { .. })),
+      matches!(res, Err(Error::Backend(_))),
       "overlap=0.99999990 (under old elements-only cap; over new byte/work \
        caps) must be rejected BEFORE allocation (got {res:?})"
     );
@@ -5377,7 +5321,7 @@ mod tests {
     //   500_001 * 5 * 8 ≈ 20 MB << MAX_LOUDNESS_BLOCK_BYTES (64 MiB) → PASSES
     let res = integrated_loudness(&x, rate, 0.01, 0.999_999_987_5);
     assert!(
-      matches!(res, Err(Error::Backend { .. })),
+      matches!(res, Err(Error::Backend(_))),
       "5-channel input with num_blocks * block_samples just under the cap \
        but num_blocks * block_samples * n_channels above must be REJECTED \
        by the n_channels-aware work cap (got {res:?})"
@@ -5387,7 +5331,7 @@ mod tests {
     // accidentally weakens the work cap surfaces here rather than passing
     // because some other cap caught the case.
     let msg = match res {
-      Err(Error::Backend { message }) => message,
+      Err(Error::Backend(message)) => message,
       _ => unreachable!(),
     };
     assert!(
@@ -5465,15 +5409,15 @@ mod tests {
     let x = sine_mono(1000.0, 0.5, rate, 1.0);
     assert!(matches!(
       normalize_loudness(&x, f64::NAN, -23.0),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
     assert!(matches!(
       normalize_loudness(&x, -10.0, f64::INFINITY),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
     assert!(matches!(
       normalize_loudness(&x, f64::NEG_INFINITY, -23.0),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
   }
 
@@ -5614,7 +5558,7 @@ mod tests {
     let mut cache2 = ISTFTCache::new();
     assert!(matches!(
       cache2.istft(&spec_short, None),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
   }
 
@@ -5640,13 +5584,13 @@ mod tests {
     let tail_len = t - pad; // 20
     let free_tail = istft(&spec, Some(tail_len));
     assert!(
-      matches!(free_tail, Err(Error::Backend { .. })),
+      matches!(free_tail, Err(Error::Backend(_))),
       "free istft must reject the zero-coverage tail, got {free_tail:?}"
     );
     let mut cache = ISTFTCache::new();
     let cached_tail = cache.istft(&spec, Some(tail_len));
     assert!(
-      matches!(cached_tail, Err(Error::Backend { .. })),
+      matches!(cached_tail, Err(Error::Backend(_))),
       "ISTFTCache must reject the zero-coverage tail IDENTICALLY to free istft \
        (not divide by a floor + emit corrupt audio), got {cached_tail:?}"
     );
@@ -5670,7 +5614,7 @@ mod tests {
     // rejects the tail — the guard runs every call, not just on a cold cache.
     let warm_reject = cache.istft(&spec, Some(tail_len));
     assert!(
-      matches!(warm_reject, Err(Error::Backend { .. })),
+      matches!(warm_reject, Err(Error::Backend(_))),
       "warm-cache tail request must STILL reject (guard is per-call), got {warm_reject:?}"
     );
   }
@@ -5698,13 +5642,13 @@ mod tests {
     for len in [None, Some(10usize)] {
       let free_res = istft(&spec_no_center, len);
       assert!(
-        matches!(free_res, Err(Error::Backend { .. })),
+        matches!(free_res, Err(Error::Backend(_))),
         "free istft center=false head (len={len:?}) must reject, got {free_res:?}"
       );
       let mut cache = ISTFTCache::new();
       let cached_res = cache.istft(&spec_no_center, len);
       assert!(
-        matches!(cached_res, Err(Error::Backend { .. })),
+        matches!(cached_res, Err(Error::Backend(_))),
         "ISTFTCache center=false head (len={len:?}) must reject IDENTICALLY to \
          free istft, got {cached_res:?}"
       );
@@ -5800,17 +5744,17 @@ mod tests {
     let silence = Array::from_slice::<f32>(&[0.0, 0.0, 0.0], &[3]).unwrap();
     assert!(matches!(
       normalize_peak(&silence, 0.0),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
     // Non-finite target_peak_db.
     let data = Array::from_slice::<f32>(&[0.5, 0.1], &[2]).unwrap();
     assert!(matches!(
       normalize_peak(&data, f64::NAN),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
     assert!(matches!(
       normalize_peak(&data, f64::INFINITY),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
   }
 
@@ -5823,7 +5767,7 @@ mod tests {
 
     // Huge target_peak_db: 10^(1e30/20) overflows f32 → target_linear == +inf.
     assert!(
-      matches!(normalize_peak(&data, 1e30), Err(Error::Backend { .. })),
+      matches!(normalize_peak(&data, 1e30), Err(Error::Backend(_))),
       "huge finite target_peak_db must be rejected (target_linear overflows f32)"
     );
 
@@ -5838,10 +5782,7 @@ mod tests {
     );
     let subnormal_peak = Array::from_slice::<f32>(&[tiny, 0.0, -tiny], &[3]).unwrap();
     assert!(
-      matches!(
-        normalize_peak(&subnormal_peak, 0.0),
-        Err(Error::Backend { .. })
-      ),
+      matches!(normalize_peak(&subnormal_peak, 0.0), Err(Error::Backend(_))),
       "subnormal nonzero peak that overflows the gain must be rejected"
     );
 
@@ -5948,7 +5889,7 @@ mod tests {
     // `n_fft = 0` → recoverable Error::Backend.
     assert!(matches!(
       mel_filter_bank_cached(80, 0, 16_000, 0.0, None),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
     // A valid call AFTER the failed one still succeeds (the failure
     // didn't pollute the cache).
@@ -6045,7 +5986,7 @@ mod tests {
     // n_fft = 64 > 32, so without padding there is no frame.
     assert!(matches!(
       stft_aligned(&arr, 64, 16, None, WindowPad::Right),
-      Err(Error::Backend { .. })
+      Err(Error::Backend(_))
     ));
   }
 

@@ -53,7 +53,7 @@
 
 use crate::{
   array::Array,
-  error::{Error, Result, try_extend_from_slice, try_with_capacity},
+  error::{Error, InvariantViolationPayload, Result, try_extend_from_slice, try_with_capacity},
   lm::{
     cache::{KvCache, can_trim_prompt_cache, trim_prompt_cache},
     generate::{FinishReason, GenConfig, GenerationResponse, make_logits_processors, make_sampler},
@@ -530,23 +530,21 @@ impl<'a> SpeculativeDriver<'a> {
     // caches (we use `trim_prompt_cache` per step to rewind on partial
     // accept).
     if !can_trim_prompt_cache(&target_cache) {
-      return Err(Error::Backend {
-        message: "speculative_generate: target_cache must be trimmable (see mlx-lm \
-                  generate.py:529-533)"
-          .into(),
-      });
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "speculative_generate: target_cache",
+        "must be trimmable (see mlx-lm generate.py:529-533)",
+      )));
     }
     if !can_trim_prompt_cache(&draft_cache) {
-      return Err(Error::Backend {
-        message: "speculative_generate: draft_cache must be trimmable (see mlx-lm \
-                  generate.py:529-533)"
-          .into(),
-      });
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "speculative_generate: draft_cache",
+        "must be trimmable (see mlx-lm generate.py:529-533)",
+      )));
     }
     if prompt.is_empty() {
-      return Err(Error::ShapeMismatch {
-        message: "speculative_generate: prompt must be non-empty".into(),
-      });
+      return Err(Error::ShapeMismatch(
+        "speculative_generate: prompt must be non-empty".into(),
+      ));
     }
     // AUDIO-12 #136 — eager scalar-bound validation of every sampler /
     // logits-processor knob in `cfg` BEFORE any prefill / model work,
@@ -909,8 +907,8 @@ impl<'a> SpeculativeDriver<'a> {
     // newly committed token (the rest is the previous step's
     // last-accepted draft already in `self.history`). At subsequent
     // iters it is the prior iter's sampled draft.
-    let mut next_history_token: u32 = *y.last().ok_or_else(|| Error::ShapeMismatch {
-      message: "speculative_generate: draft_y_input must be non-empty".into(),
+    let mut next_history_token: u32 = *y.last().ok_or_else(|| {
+      Error::ShapeMismatch("speculative_generate: draft_y_input must be non-empty".into())
     })?;
     for _ in 0..num_draft {
       let arr = token_window(&y)?;
@@ -952,27 +950,21 @@ fn token_window(ids: &[u32]) -> Result<Array> {
 fn last_n_positions(logits: &Array, n: usize) -> Result<Array> {
   let shape = logits.shape();
   if shape.len() != 3 {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "speculative_generate: expected [B, S, V] logits from `forward`, got {shape:?}"
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "speculative_generate: expected [B, S, V] logits from `forward`, got {shape:?}"
+    )));
   }
   if shape[1] == 0 || shape[2] == 0 {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "speculative_generate: `forward` returned logits with a zero-length axis (got [B, S, V] \
+    return Err(Error::ShapeMismatch(format!(
+      "speculative_generate: `forward` returned logits with a zero-length axis (got [B, S, V] \
          {shape:?}); slicing the last `n` positions requires S >= 1 and V >= 1"
-      ),
-    });
+    )));
   }
   if n == 0 || n > shape[1] {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "speculative_generate: cannot slice last {n} positions from logits with S = {}",
-        shape[1]
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "speculative_generate: cannot slice last {n} positions from logits with S = {}",
+      shape[1]
+    )));
   }
   let (b, s, v) = (shape[0] as i32, shape[1] as i32, shape[2] as i32);
   let start = s - n as i32;
@@ -985,15 +977,15 @@ fn last_n_positions(logits: &Array, n: usize) -> Result<Array> {
 fn slice_position(logits: &Array, pos: i32) -> Result<Array> {
   let shape = logits.shape();
   if shape.len() != 3 {
-    return Err(Error::ShapeMismatch {
-      message: format!("slice_position: expected [B, S, V], got {shape:?}"),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "slice_position: expected [B, S, V], got {shape:?}"
+    )));
   }
   let s = shape[1] as i32;
   if pos < 0 || pos >= s {
-    return Err(Error::ShapeMismatch {
-      message: format!("slice_position: pos {pos} out of range for S = {s}"),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "slice_position: pos {pos} out of range for S = {s}"
+    )));
   }
   let (b, v) = (shape[0] as i32, shape[2] as i32);
   let sliced = ops::indexing::slice(logits, &[0, pos, 0], &[b, pos + 1, v], &[1, 1, 1])?;

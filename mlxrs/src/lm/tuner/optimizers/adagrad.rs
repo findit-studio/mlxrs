@@ -28,9 +28,9 @@ use crate::{
 /// Validate `eps` is finite and `>= 0.0`.
 fn validate_eps(eps: f32) -> Result<()> {
   if !eps.is_finite() || eps < 0.0 {
-    return Err(Error::Backend {
-      message: format!("Adagrad: eps must be finite and >= 0.0, got {eps}"),
-    });
+    return Err(Error::Backend(format!(
+      "Adagrad: eps must be finite and >= 0.0, got {eps}"
+    )));
   }
   Ok(())
 }

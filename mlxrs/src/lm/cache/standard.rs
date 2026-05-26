@@ -132,9 +132,9 @@ impl KvCache for StandardKvCache {
         self.offset = sk;
         Ok(())
       }
-      n => Err(Error::Backend {
-        message: format!("StandardKvCache state must have 0 or 2 arrays, got {n}"),
-      }),
+      n => Err(Error::Backend(format!(
+        "StandardKvCache state must have 0 or 2 arrays, got {n}"
+      ))),
     }
   }
 

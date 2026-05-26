@@ -87,12 +87,12 @@ fn max_axes_empty_on_zero_size_errors() {
   assert_eq!(a.size(), 0);
   let r_max = mlxrs::ops::reduction::max_axes(&a, &[], false);
   assert!(
-    matches!(r_max, Err(mlxrs::Error::Backend { .. })),
+    matches!(r_max, Err(mlxrs::Error::Backend(_))),
     "expected Err(Backend) for max_axes(zero_size, &[]), got {r_max:?}",
   );
   let r_min = mlxrs::ops::reduction::min_axes(&a, &[], false);
   assert!(
-    matches!(r_min, Err(mlxrs::Error::Backend { .. })),
+    matches!(r_min, Err(mlxrs::Error::Backend(_))),
     "expected Err(Backend) for min_axes(zero_size, &[]), got {r_min:?}",
   );
 }

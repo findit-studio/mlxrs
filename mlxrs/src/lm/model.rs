@@ -45,9 +45,9 @@ pub trait Model {
     _embeddings: &Array,
     _cache: &mut [Box<dyn KvCache>],
   ) -> Result<Array> {
-    Err(crate::error::Error::Backend {
-      message: "this model does not implement `forward_embeddings` (VLM seam, M4)".into(),
-    })
+    Err(crate::error::Error::Backend(
+      "this model does not implement `forward_embeddings` (VLM seam, M4)".into(),
+    ))
   }
 
   /// Whether this model accepts pre-computed input embeddings — the
@@ -110,9 +110,9 @@ impl Model for MockModel {
       [b, s] => (*b, *s),
       [s] => (1, *s),
       _ => {
-        return Err(crate::error::Error::ShapeMismatch {
-          message: format!("MockModel::forward expects [B, S] tokens, got {shape:?}"),
-        });
+        return Err(crate::error::Error::ShapeMismatch(format!(
+          "MockModel::forward expects [B, S] tokens, got {shape:?}"
+        )));
       }
     };
     let vocab = self.canned.len();

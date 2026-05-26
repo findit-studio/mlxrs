@@ -91,9 +91,9 @@ pub trait TtsModel {
   /// per-model-override default.
   fn synthesize_segment(&self, segment: &TtsSegment<'_>) -> Result<Array> {
     let _ = segment;
-    Err(Error::Backend {
-      message: "TTS model needs `synthesize_segment` override (per-model)".into(),
-    })
+    Err(Error::Backend(
+      "TTS model needs `synthesize_segment` override (per-model)".into(),
+    ))
   }
 
   /// The output PCM sample rate in Hz.

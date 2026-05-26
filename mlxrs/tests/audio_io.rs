@@ -180,7 +180,7 @@ fn save_rejects_nan_before_touching_destination() {
   let path = temp_wav("nan");
   fs::write(&path, b"PRESERVED").unwrap();
   let r = save_wav(&path, &[0.0_f32, f32::NAN, 0.0], 8_000);
-  assert!(matches!(r, Err(mlxrs::Error::Backend { .. })));
+  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
   // The destination must be untouched (validation runs before any
   // filesystem mutation, including the tempfile create).
   let stored = fs::read(&path).unwrap();
@@ -193,7 +193,7 @@ fn save_rejects_zero_sample_rate() {
   let path = temp_wav("zero_sr");
   fs::write(&path, b"PRESERVED").unwrap();
   let r = save_wav(&path, &[0.0_f32, 0.5, -0.5], 0);
-  assert!(matches!(r, Err(mlxrs::Error::Backend { .. })));
+  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
   // Same guarantee: destination preserved on header validation failure.
   let stored = fs::read(&path).unwrap();
   assert_eq!(stored, b"PRESERVED");
@@ -210,7 +210,7 @@ fn load_wav_rejects_multichannel() {
   let interleaved: &[i16] = &[100, -100, 200, -200, 300, -300, 400, -400];
   write_pcm16_wav(&path, interleaved, 16_000, 2);
   let r = load_audio(&path);
-  assert!(matches!(r, Err(mlxrs::Error::Backend { .. })));
+  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
   let _ = fs::remove_file(&path);
 }
 
@@ -245,13 +245,13 @@ fn resample_downsample_halves_length() {
 #[test]
 fn resample_rejects_zero_from_rate() {
   let r = resample_linear(&[0.0_f32, 1.0], 0, 16_000);
-  assert!(matches!(r, Err(mlxrs::Error::Backend { .. })));
+  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
 }
 
 #[test]
 fn resample_rejects_zero_to_rate() {
   let r = resample_linear(&[0.0_f32, 1.0], 16_000, 0);
-  assert!(matches!(r, Err(mlxrs::Error::Backend { .. })));
+  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
 }
 
 #[test]
@@ -266,7 +266,7 @@ fn resample_rejects_oversized_output_cap() {
   // which exceeds MAX_RESAMPLED_SAMPLES (64 Mi). Must error BEFORE any
   // allocation attempt.
   let r = resample_linear(&[0.5_f32, -0.5], 1, u32::MAX);
-  assert!(matches!(r, Err(mlxrs::Error::Backend { .. })));
+  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
 }
 
 #[test]
@@ -279,7 +279,7 @@ fn load_wav_missing_file_returns_backend_error() {
   // would mask the test).
   let _ = fs::remove_file(&path);
   let r = load_audio(&path);
-  assert!(matches!(r, Err(mlxrs::Error::Backend { .. })));
+  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
 }
 
 // -------- New tests covering the atomic-rename addition --------
@@ -382,7 +382,7 @@ fn load_wav_rejects_truncated_wav() {
   drop(f);
   let r = load_audio(&path);
   assert!(
-    matches!(r, Err(mlxrs::Error::Backend { .. })),
+    matches!(r, Err(mlxrs::Error::Backend(_))),
     "load_wav must reject a truncated WAV; got {r:?}"
   );
   let _ = fs::remove_file(&path);
@@ -397,7 +397,7 @@ fn save_wav_rejects_sample_rate_exceeding_byte_rate_u32_ceiling() {
   let path = temp_wav("sr_overflow");
   fs::write(&path, b"PRESERVED").unwrap();
   let r = save_wav(&path, &[0.0_f32], u32::MAX);
-  assert!(matches!(r, Err(mlxrs::Error::Backend { .. })));
+  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
   let stored = fs::read(&path).unwrap();
   assert_eq!(stored, b"PRESERVED");
   let _ = fs::remove_file(&path);
@@ -568,7 +568,7 @@ fn load_audio_rejects_truncated_flac() {
   write_fixture(&path, &FIXTURE_FLAC[..cut]);
   let r = load_audio(&path);
   assert!(
-    matches!(r, Err(mlxrs::Error::Backend { .. })),
+    matches!(r, Err(mlxrs::Error::Backend(_))),
     "truncated FLAC must be rejected (count mismatch / corruption), got {r:?}"
   );
   let _ = fs::remove_file(&path);
@@ -636,7 +636,7 @@ fn load_audio_rejects_unsupported_opus_like_garbage() {
   write_fixture(&path, &garbage);
   let r = load_audio(&path);
   assert!(
-    matches!(r, Err(mlxrs::Error::Backend { .. })),
+    matches!(r, Err(mlxrs::Error::Backend(_))),
     "unsupported/garbage input must return Backend error, got {r:?}"
   );
   let _ = fs::remove_file(&path);
@@ -665,7 +665,7 @@ fn load_audio_truncated_compressed_is_bounded_and_recoverable() {
     let cut = (bytes.len() * 2) / 5; // ~40%
     write_fixture(&path, &bytes[..cut]);
     match load_audio(&path) {
-      Err(mlxrs::Error::Backend { .. }) => { /* recoverable error: ok */ }
+      Err(mlxrs::Error::Backend(_)) => { /* recoverable error: ok */ }
       Ok((samples, _)) => {
         assert!(
           samples.len() <= mlxrs::audio::io::MAX_DECODED_SAMPLES,
@@ -752,7 +752,7 @@ fn load_audio_with_cap_rejects_oversized_wav_at_header_stage() {
   // Cap at 50 samples — strictly below the header's 100.
   let r = load_audio_with_cap(&path, 50);
   assert!(
-    matches!(r, Err(Error::Backend { .. })),
+    matches!(r, Err(Error::Backend(_))),
     "over-cap WAV header must reject with Backend, got {r:?}"
   );
 
@@ -943,7 +943,7 @@ fn load_audio_with_max_seconds_unified_probe_no_toctou() {
   let max_seconds_just_below = 7999.0 / 8000.0;
   let r = load_audio_with_max_seconds(&path, max_seconds_just_below);
   assert!(
-    matches!(r, Err(Error::Backend { .. })),
+    matches!(r, Err(Error::Backend(_))),
     "cap one frame below header must reject; got {r:?}"
   );
 
@@ -998,7 +998,7 @@ fn load_audio_with_max_seconds_mp3_genuinely_over_cap_rejects() {
   // header check is skipped for estimate formats.
   let r = load_audio_with_max_seconds(&path, 0.01);
   let msg = match &r {
-    Err(Error::Backend { message }) => message.clone(),
+    Err(Error::Backend(message)) => message.clone(),
     other => panic!("MP3 genuinely over cap must reject with Error::Backend; got {other:?}"),
   };
   // F2 post-fix marker: rejection is mid-decode via `push_samples`,

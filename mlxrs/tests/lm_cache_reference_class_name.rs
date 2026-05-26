@@ -119,9 +119,9 @@ impl KvCache for ExplicitMock {
     0
   }
   fn update(&mut self, _keys: &Array, _values: &Array) -> Result<(Array, Array)> {
-    Err(Error::Backend {
-      message: "ExplicitMock::update is not used in this test".into(),
-    })
+    Err(Error::Backend(
+      "ExplicitMock::update is not used in this test".into(),
+    ))
   }
   fn state(&self) -> Result<Vec<Array>> {
     Ok(Vec::new())

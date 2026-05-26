@@ -140,9 +140,7 @@ pub type QTriple = (Array, Array, Option<Array>);
 ///         // every update / make_mask / etc. inside the layer body.
 ///         let rot = c.as_any_mut()
 ///             .downcast_mut::<RotatingKvCache>()
-///             .ok_or_else(|| Error::Backend {
-///                 message: format!("layer cache type mismatch (expected RotatingKvCache)"),
-///             })?;
+///             .ok_or_else(|| Error::Backend(format!("layer cache type mismatch (expected RotatingKvCache)")))?;
 ///         let (k, v) = rot.update(&x_k, &x_v)?;       // static dispatch
 ///         let mask = rot.make_mask(s, None, false)?;  // static dispatch
 ///         x = layer.attention(&x, &k, &v, &mask)?;
@@ -339,13 +337,11 @@ pub trait KvCache {
   /// their own parsing logic.
   fn set_meta_state(&mut self, m: &[String]) -> Result<()> {
     if !m.is_empty() {
-      return Err(Error::Backend {
-        message: format!(
-          "KvCache has no meta_state but {} value(s) were provided: {m:?} \
+      return Err(Error::Backend(format!(
+        "KvCache has no meta_state but {} value(s) were provided: {m:?} \
            (mirrors mlx-lm `_BaseCache.meta_state` setter cache.py:142-145)",
-          m.len()
-        ),
-      });
+        m.len()
+      )));
     }
     Ok(())
   }
@@ -430,20 +426,16 @@ pub trait KvCache {
     let rollback =
       |cache: &mut Self, e: Error, snap_state: Vec<Array>, snap_meta: Vec<String>| -> Error {
         if let Err(rb_state_err) = cache.set_state(snap_state) {
-          return Error::Backend {
-            message: format!(
-              "KvCache::from_serialized: setter failed ({e}); \
+          return Error::Backend(format!(
+            "KvCache::from_serialized: setter failed ({e}); \
              rollback also failed (set_state on snapshot: {rb_state_err})"
-            ),
-          };
+          ));
         }
         if let Err(rb_meta_err) = cache.set_meta_state(&snap_meta) {
-          return Error::Backend {
-            message: format!(
-              "KvCache::from_serialized: setter failed ({e}); \
+          return Error::Backend(format!(
+            "KvCache::from_serialized: setter failed ({e}); \
              rollback also failed (set_meta_state on snapshot: {rb_meta_err})"
-            ),
-          };
+          ));
         }
         e
       };
@@ -748,9 +740,7 @@ impl KvCacheKind {
       "BatchRotatingKVCache" | "BatchRotatingKvCache" => Ok(Self::BatchRotatingKvCache),
       "ArraysCache" => Ok(Self::ArraysCache),
       "MambaCache" => Ok(Self::MambaCache),
-      other => Err(Error::Backend {
-        message: format!("unknown cache kind: {other}"),
-      }),
+      other => Err(Error::Backend(format!("unknown cache kind: {other}"))),
     }
   }
 }
@@ -826,9 +816,9 @@ pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<
       // idx==0` only here (so `set_state`/`set_meta_state` stay individually
       // 1:1 with cache.py:527-540), rejecting the inconsistent combination.
       if c.is_empty() && (c.offset() != 0 || c.idx() != 0) {
-        return Err(Error::Backend {
-          message: "RotatingKvCache: empty state with non-zero offset/idx is invalid".into(),
-        });
+        return Err(Error::Backend(
+          "RotatingKvCache: empty state with non-zero offset/idx is invalid".into(),
+        ));
       }
       Ok(Box::new(c))
     }
@@ -876,9 +866,9 @@ pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<
       // cache.py:294-304), exactly mirroring the `RotatingKvCache` restore
       // guard above.
       if c.is_empty() && c.offset() != 0 {
-        return Err(Error::Backend {
-          message: "QuantizedKvCache: empty state with non-zero offset is invalid".into(),
-        });
+        return Err(Error::Backend(
+          "QuantizedKvCache: empty state with non-zero offset is invalid".into(),
+        ));
       }
       // P2 stores the quant triples **exactly `offset`-length** (the
       // documented `ConcatenateKVCache` / `StandardKvCache` equivalence;
@@ -1030,11 +1020,9 @@ pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<
         }
       };
       if invalid {
-        return Err(Error::Backend {
-          message: format!(
-            "BatchRotatingKvCache: restored state/meta_state is inconsistent (not a state mlx-lm's own round-trip could produce): {reason}"
-          ),
-        });
+        return Err(Error::Backend(format!(
+          "BatchRotatingKvCache: restored state/meta_state is inconsistent (not a state mlx-lm's own round-trip could produce): {reason}"
+        )));
       }
       Ok(Box::new(c))
     }

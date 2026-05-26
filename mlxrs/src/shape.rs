@@ -44,9 +44,9 @@ pub trait IntoShape: sealed::Sealed {
 pub fn validate_dims(s: &[c_int]) -> Result<()> {
   for (i, &d) in s.iter().enumerate() {
     if d < 0 {
-      return Err(Error::ShapeMismatch {
-        message: format!("dim[{i}] = {d} is negative; shapes must be non-negative"),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "dim[{i}] = {d} is negative; shapes must be non-negative"
+      )));
     }
   }
   Ok(())
@@ -104,9 +104,8 @@ impl<const N: usize> IntoShape for [i32; N] {
 }
 
 fn convert_dim(d: usize) -> Result<c_int> {
-  i32::try_from(d).map_err(|_| Error::ShapeMismatch {
-    message: format!("dim {d} exceeds i32::MAX ({})", i32::MAX),
-  })
+  i32::try_from(d)
+    .map_err(|_| Error::ShapeMismatch(format!("dim {d} exceeds i32::MAX ({})", i32::MAX)))
 }
 
 impl IntoShape for &[usize] {

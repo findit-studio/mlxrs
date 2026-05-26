@@ -179,9 +179,9 @@ pub fn get_model_path(path: &str) -> Result<PathBuf> {
   // FileNotFoundError. Surface a clear Error::Backend instead of
   // (3)'s "would have fetched from Hub" message.
   if is_local_path(path) {
-    return Err(Error::Backend {
-      message: format!("audio model local path not found: {path}"),
-    });
+    return Err(Error::Backend(format!(
+      "audio model local path not found: {path}"
+    )));
   }
 
   // (3) mlx-audio would call snapshot_download here. mlxrs is local-only
@@ -197,14 +197,12 @@ pub fn get_model_path(path: &str) -> Result<PathBuf> {
     .or_else(|| path.strip_prefix("https://huggingface.co/"))
     .or_else(|| path.strip_prefix("http://huggingface.co/"))
     .unwrap_or(path);
-  Err(Error::Backend {
-    message: format!(
-      "audio model path {path:?} is not a local on-disk directory; \
+  Err(Error::Backend(format!(
+    "audio model path {path:?} is not a local on-disk directory; \
        mlxrs does not download from HuggingFace Hub. Fetch the model \
        directory out of process (e.g. `huggingface-cli download {repo_id}` \
        or `hf download {repo_id}`) and pass the resulting local path."
-    ),
-  })
+  )))
 }
 
 /// `path` starts with a marker that mlx-audio's
@@ -275,9 +273,10 @@ pub fn load_config(dir: &Path) -> Result<String> {
   let path = dir.join("config.json");
   match read_bounded_config_file(&path, "audio model config")? {
     Some(text) => Ok(text),
-    None => Err(Error::Backend {
-      message: format!("audio model config not found at {}", path.display()),
-    }),
+    None => Err(Error::Backend(format!(
+      "audio model config not found at {}",
+      path.display()
+    ))),
   }
 }
 
@@ -332,8 +331,10 @@ pub fn load_config(dir: &Path) -> Result<String> {
 pub fn apply_quantization(config_json: &str) -> Result<Option<PerLayerQuantization>> {
   use serde_json::Value;
 
-  let value: Value = serde_json::from_str(config_json).map_err(|e| Error::Backend {
-    message: format!("audio apply_quantization: invalid config JSON: {e}"),
+  let value: Value = serde_json::from_str(config_json).map_err(|e| {
+    Error::Backend(format!(
+      "audio apply_quantization: invalid config JSON: {e}"
+    ))
   })?;
 
   // (1) mlx-audio utils.py:221-223 — prefer top-level "quantization" if
@@ -354,11 +355,9 @@ pub fn apply_quantization(config_json: &str) -> Result<Option<PerLayerQuantizati
   };
 
   let Value::Object(map) = block else {
-    return Err(Error::Backend {
-      message: format!(
-        "audio apply_quantization: quantization block must be a JSON object, got {block:?}"
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "audio apply_quantization: quantization block must be a JSON object, got {block:?}"
+    )));
   };
 
   // (2) mlx-audio utils.py:226 — `group_size = quantization.get("group_size", 64)`.
@@ -371,10 +370,11 @@ pub fn apply_quantization(config_json: &str) -> Result<Option<PerLayerQuantizati
     .entry("group_size".to_string())
     .or_insert_with(|| Value::from(64));
 
-  let plq: PerLayerQuantization =
-    serde_json::from_value(Value::Object(patched)).map_err(|e| Error::Backend {
-      message: format!("audio apply_quantization: invalid quantization block: {e}"),
-    })?;
+  let plq: PerLayerQuantization = serde_json::from_value(Value::Object(patched)).map_err(|e| {
+    Error::Backend(format!(
+      "audio apply_quantization: invalid quantization block: {e}"
+    ))
+  })?;
   Ok(Some(plq))
 }
 

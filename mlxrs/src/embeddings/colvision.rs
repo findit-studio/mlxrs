@@ -86,7 +86,7 @@ use std::collections::HashMap;
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{Error, Result},
+  error::{Error, RankMismatchPayload, Result},
   ops::{
     linalg_basic::matmul,
     logical::select,
@@ -200,14 +200,10 @@ pub fn score_single_vector(qs: &[Array], ps: &[Array]) -> Result<Array> {
   // provided"); if len(ps) == 0: raise ValueError("No passages
   // provided")`. Preserve the exact message text for parity.
   if qs.is_empty() {
-    return Err(Error::ShapeMismatch {
-      message: "No queries provided".into(),
-    });
+    return Err(Error::ShapeMismatch("No queries provided".into()));
   }
   if ps.is_empty() {
-    return Err(Error::ShapeMismatch {
-      message: "No passages provided".into(),
-    });
+    return Err(Error::ShapeMismatch("No passages provided".into()));
   }
   // Reject zero-element vectors. This is the single-vector analog of
   // the `pad_to_max` zero-token guard used by [`score_multi_vector`]:
@@ -222,12 +218,10 @@ pub fn score_single_vector(qs: &[Array], ps: &[Array]) -> Result<Array> {
       // `shape[0] == 0` flags both `(0,)` rank-1 vectors and any
       // higher-rank input whose leading axis is empty.
       if sh.first().copied() == Some(0) {
-        return Err(Error::ShapeMismatch {
-          message: format!(
-            "score_single_vector: {label}[{i}] has zero tokens (shape[0] == 0); \
+        return Err(Error::ShapeMismatch(format!(
+          "score_single_vector: {label}[{i}] has zero tokens (shape[0] == 0); \
              non-empty embedding vectors are required"
-          ),
-        });
+        )));
       }
     }
   }
@@ -250,13 +244,11 @@ pub fn score_single_vector(qs: &[Array], ps: &[Array]) -> Result<Array> {
   // [`Error::ShapeMismatch`] (zero overhead for the success path).
   let s = scores.shape();
   if s.first().copied() != Some(qs.len()) {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "score_single_vector: expected {} scores, got shape {:?}",
-        qs.len(),
-        s
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "score_single_vector: expected {} scores, got shape {:?}",
+      qs.len(),
+      s
+    )));
   }
   // python line 63: `.astype(mx.float32)`. A no-op cast for f32 inputs.
   astype(&scores, Dtype::F32)
@@ -365,22 +357,18 @@ pub fn score_single_vector(qs: &[Array], ps: &[Array]) -> Result<Array> {
 pub fn score_multi_vector(qs: &[Array], ps: &[Array], batch_size: usize) -> Result<Array> {
   // python lines 75-78: same "No queries"/"No passages" guards.
   if qs.is_empty() {
-    return Err(Error::ShapeMismatch {
-      message: "No queries provided".into(),
-    });
+    return Err(Error::ShapeMismatch("No queries provided".into()));
   }
   if ps.is_empty() {
-    return Err(Error::ShapeMismatch {
-      message: "No passages provided".into(),
-    });
+    return Err(Error::ShapeMismatch("No passages provided".into()));
   }
   // Python `range(0, len(qs), batch_size)` would raise `ValueError:
   // range() arg 3 must not be zero` on `batch_size == 0`. Surface the
   // recoverable equivalent rather than enter an infinite loop.
   if batch_size == 0 {
-    return Err(Error::ShapeMismatch {
-      message: "score_multi_vector: batch_size must be non-zero".into(),
-    });
+    return Err(Error::ShapeMismatch(
+      "score_multi_vector: batch_size must be non-zero".into(),
+    ));
   }
   // Pre-validate zero-token inputs up front so the error identifies the
   // offending array by *global* index AND path tag (queries vs passages).
@@ -397,12 +385,10 @@ pub fn score_multi_vector(qs: &[Array], ps: &[Array], batch_size: usize) -> Resu
       // `shape[0] == 0` flags both `(0,)` rank-1 vectors and any
       // higher-rank input whose leading axis is empty.
       if sh.first().copied() == Some(0) {
-        return Err(Error::ShapeMismatch {
-          message: format!(
-            "score_multi_vector: {label}[{i}] has zero tokens (shape[0] == 0); \
+        return Err(Error::ShapeMismatch(format!(
+          "score_multi_vector: {label}[{i}] has zero tokens (shape[0] == 0); \
              non-empty token sequences are required for the masked MaxSim contract"
-          ),
-        });
+        )));
       }
     }
   }
@@ -488,13 +474,11 @@ pub fn score_multi_vector(qs: &[Array], ps: &[Array], batch_size: usize) -> Resu
   // for valid inputs; defensive).
   let s = scores.shape();
   if s.first().copied() != Some(qs.len()) {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "score_multi_vector: expected {} scores, got shape {:?}",
-        qs.len(),
-        s
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "score_multi_vector: expected {} scores, got shape {:?}",
+      qs.len(),
+      s
+    )));
   }
   // python line 110: `.astype(mx.float32)`. No-op cast for f32 inputs.
   astype(&scores, Dtype::F32)
@@ -556,22 +540,20 @@ pub fn score_multi_vector(qs: &[Array], ps: &[Array], batch_size: usize) -> Resu
 ///   the divergence note on [`score_multi_vector`].
 pub(crate) fn pad_to_max(arrays: &[Array]) -> Result<(Array, Vec<usize>)> {
   if arrays.is_empty() {
-    return Err(Error::ShapeMismatch {
-      message: "pad_to_max: arrays slice is empty".into(),
-    });
+    return Err(Error::ShapeMismatch(
+      "pad_to_max: arrays slice is empty".into(),
+    ));
   }
   // python line 81: `max_len = max(a.shape[0] for a in arrays)`. Also
   // validate rank-2 (the python ref assumes it; surface a recoverable
   // error if not).
   let first_shape = arrays[0].shape();
   if first_shape.len() != 2 {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "pad_to_max: arrays must be rank-2 (n, d), got rank {} shape {:?}",
-        first_shape.len(),
-        first_shape
-      ),
-    });
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "pad_to_max: arrays must be rank-2 (n, d)",
+      first_shape.len() as u32,
+      first_shape,
+    )));
   }
   let emb_dim = first_shape[1]; // python line 82
   let mut max_len: usize = 0;
@@ -579,21 +561,17 @@ pub(crate) fn pad_to_max(arrays: &[Array]) -> Result<(Array, Vec<usize>)> {
   for (i, a) in arrays.iter().enumerate() {
     let sh = a.shape();
     if sh.len() != 2 {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "pad_to_max: arrays must be rank-2 (n, d), got rank {} shape {:?}",
-          sh.len(),
-          sh
-        ),
-      });
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        "pad_to_max: arrays must be rank-2 (n, d)",
+        sh.len() as u32,
+        sh,
+      )));
     }
     if sh[1] != emb_dim {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "pad_to_max: all arrays must share emb_dim, got {} vs {}",
-          sh[1], emb_dim
-        ),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "pad_to_max: all arrays must share emb_dim, got {} vs {}",
+        sh[1], emb_dim
+      )));
     }
     // Reject zero-token sequences. A `(0, d)` array would record `0` in
     // `original_lengths`, which the [`score_multi_vector`] masking loop
@@ -608,12 +586,10 @@ pub(crate) fn pad_to_max(arrays: &[Array]) -> Result<(Array, Vec<usize>)> {
     // gives a `(len, 0, d)` stack and `max(axis=3)` of an empty axis
     // is undefined). See the divergence note on [`score_multi_vector`].
     if sh[0] == 0 {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "pad_to_max: array {i} has zero tokens (shape[0] == 0); \
+      return Err(Error::ShapeMismatch(format!(
+        "pad_to_max: array {i} has zero tokens (shape[0] == 0); \
            non-empty token sequences are required for the masked MaxSim contract"
-        ),
-      });
+      )));
     }
     if sh[0] > max_len {
       max_len = sh[0];
@@ -718,7 +694,7 @@ mod tests {
     let err =
       score_single_vector(std::slice::from_ref(&q_empty), std::slice::from_ref(&p)).unwrap_err();
     assert!(
-      matches!(err, Error::ShapeMismatch { .. }),
+      matches!(err, Error::ShapeMismatch(_)),
       "expected ShapeMismatch, got {err:?}"
     );
     let msg = format!("{err}");
@@ -740,7 +716,7 @@ mod tests {
     let err =
       score_single_vector(std::slice::from_ref(&q), std::slice::from_ref(&p_empty)).unwrap_err();
     assert!(
-      matches!(err, Error::ShapeMismatch { .. }),
+      matches!(err, Error::ShapeMismatch(_)),
       "expected ShapeMismatch, got {err:?}"
     );
     let msg = format!("{err}");
@@ -827,7 +803,7 @@ mod tests {
     )
     .unwrap_err();
     assert!(
-      matches!(err, Error::ShapeMismatch { .. }),
+      matches!(err, Error::ShapeMismatch(_)),
       "expected ShapeMismatch from score_multi_vector pre-validation, got {err:?}"
     );
     let msg = format!("{err}");
@@ -860,7 +836,7 @@ mod tests {
     // padded `p0` would otherwise produce an all-masked row.
     let err = score_multi_vector(std::slice::from_ref(&q), &[p0, p1], 2).unwrap_err();
     assert!(
-      matches!(err, Error::ShapeMismatch { .. }),
+      matches!(err, Error::ShapeMismatch(_)),
       "expected ShapeMismatch from pre-validation (NOT -inf propagation), got {err:?}"
     );
     let msg = format!("{err}");
@@ -889,7 +865,7 @@ mod tests {
     let qs = vec![q_valid_0, q_valid_1, q_valid_2, q_empty];
     let result = score_multi_vector(&qs, std::slice::from_ref(&p), 2);
     let msg = match result {
-      Err(Error::ShapeMismatch { message }) => message,
+      Err(Error::ShapeMismatch(message)) => message,
       other => panic!("expected ShapeMismatch, got {other:?}"),
     };
     assert!(
@@ -924,7 +900,7 @@ mod tests {
     // tile-local index 1 within its tile but global index 3.
     let err = score_multi_vector(std::slice::from_ref(&q), &[p0, p1, p2, p_empty], 2).unwrap_err();
     assert!(
-      matches!(err, Error::ShapeMismatch { .. }),
+      matches!(err, Error::ShapeMismatch(_)),
       "expected ShapeMismatch from pre-validation, got {err:?}"
     );
     let msg = format!("{err}");
@@ -1073,7 +1049,7 @@ mod tests {
     let zero = Array::from_slice::<f32>(&[], &(0, 2)).unwrap();
     let err = pad_to_max(std::slice::from_ref(&zero)).unwrap_err();
     assert!(
-      matches!(err, Error::ShapeMismatch { .. }),
+      matches!(err, Error::ShapeMismatch(_)),
       "expected ShapeMismatch, got {err:?}"
     );
     let msg = format!("{err}");

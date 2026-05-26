@@ -80,7 +80,10 @@ use std::{
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{Error, Result},
+  error::{
+    ConvertPostSavePartialPayload, DurabilityWarningPayload, EmptyInputPayload, Error,
+    FileIoPayload, FileOp, InvariantViolationPayload, Result,
+  },
   lm::{
     load::{self, Weights},
     quant::{self, PerLayerQuantization, QuantMode, Quantization, QuantizationOption},
@@ -427,11 +430,9 @@ pub fn mixed_quant_predicate(
   if down_keys.is_empty() {
     // `convert.py:40` — `raise ValueError("Model does not have expected
     // keys for mixed quant.")`.
-    return Err(Error::Backend {
-      message: "mixed_quant_predicate: model does not have expected keys for mixed quant \
-                (no `down_proj`-bearing layer in the weight map)"
-        .into(),
-    });
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "mixed_quant_predicate: model down_proj keys",
+    )));
   }
 
   // Sort `down_keys` so the `[0]` choice is deterministic regardless of
@@ -446,11 +447,11 @@ pub fn mixed_quant_predicate(
   let layer_location: usize = first
     .split('.')
     .position(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
-    .ok_or_else(|| Error::Backend {
-      message: format!(
+    .ok_or_else(|| {
+      Error::Backend(format!(
         "mixed_quant_predicate: cannot locate the layer-index segment in `down_proj` \
          path {first:?} (mirroring `convert.py:43-45`'s `if k.isdigit(): break`)"
-      ),
+      ))
     })?;
 
   // `num_layers = len(model.layers)` (`convert.py:46`). We compute it as
@@ -586,13 +587,11 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
   // anywhere counts as "exists" too (matches python's
   // `pathlib.Path.exists()` — follows symlinks).
   if mlx_path.exists() {
-    return Err(Error::Backend {
-      message: format!(
-        "convert: cannot save to the path {} as it already exists. Please delete \
+    return Err(Error::Backend(format!(
+      "convert: cannot save to the path {} as it already exists. Please delete \
          the file/directory or specify a new path to save to.",
-        mlx_path.display()
-      ),
-    });
+      mlx_path.display()
+    )));
   }
 
   // mlxrs is local-only; the python Hub upload / download surface is
@@ -600,29 +599,29 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
   // the `exists()` check so destination validation always runs first
   // (mirrors the reference's check order at `convert.py:101-109`).
   if upload_repo.is_some() {
-    return Err(Error::Backend {
-      message: "convert: `upload_repo` is unsupported in mlxrs (HuggingFace Hub upload \
+    return Err(Error::Backend(
+      "convert: `upload_repo` is unsupported in mlxrs (HuggingFace Hub upload \
                 is out of scope — mlxrs is local-path-only). Drop the kwarg or upload \
                 the result directory yourself."
         .into(),
-    });
+    ));
   }
   if revision.is_some() {
-    return Err(Error::Backend {
-      message: "convert: `revision` is unsupported in mlxrs (HuggingFace Hub download \
+    return Err(Error::Backend(
+      "convert: `revision` is unsupported in mlxrs (HuggingFace Hub download \
                 is out of scope — mlxrs is local-path-only). Download the checkpoint \
                 yourself and pass its local path as `hf_path`."
         .into(),
-    });
+    ));
   }
 
   // `convert.py:146-147` — `if quantize and dequantize: raise ValueError(...)`.
   if quantize && dequantize {
-    return Err(Error::Backend {
-      message: "convert: choose either `quantize` or `dequantize`, not both \
+    return Err(Error::Backend(
+      "convert: choose either `quantize` or `dequantize`, not both \
                 (convert.py:146-147)."
         .into(),
-    });
+    ));
   }
 
   // ─── 2. Load (`convert.py:111-118` → F2) ───
@@ -779,10 +778,7 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
   let committed_warning: Option<std::io::Error> =
     match load::save(&mlx_path, &out_weights, &out_config_json, &per_layer_cfg) {
       Ok(()) => None,
-      Err(Error::DurabilityWarning {
-        committed: true,
-        source,
-      }) => Some(source),
+      Err(Error::DurabilityWarning(p)) if p.committed() => Some(p.into_source()),
       Err(other) => return Err(other),
     };
 
@@ -894,10 +890,9 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
             .or(post_copy_file)
             .or(post_copy_dir)
             .expect("count() == 1 guarantees exactly one Some field");
-          Err(Error::DurabilityWarning {
-            committed: true,
-            source,
-          })
+          Err(Error::DurabilityWarning(DurabilityWarningPayload::new(
+            true, source,
+          )))
         }
         // 2+ — multi-warning case. F7 R5 Finding fix: surface the
         // typed aggregate so the caller can destructure each
@@ -918,11 +913,9 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
     // index rename succeeded before we even reached the copy step) —
     // weights + index + config are on disk; only the extras are
     // missing.
-    (None, Err(copy_err)) => Err(Error::ConvertPostSavePartial {
-      committed: true,
-      save_warning: None,
-      copy_error: std::io::Error::other(copy_err.to_string()),
-    }),
+    (None, Err(copy_err)) => Err(Error::ConvertPostSavePartial(
+      ConvertPostSavePartialPayload::new(true, None, copy_err),
+    )),
 
     // (Some, Err) — save raised a DurabilityWarning AND the copy
     // step's [`std::fs::copy`] failed for a file → both signals
@@ -930,11 +923,12 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
     // in `save_warning` and the actual copy failure in `copy_error`.
     // Both stay machine-readable; the variant tells the caller the
     // destination is structurally incomplete (not just fsync-warned).
-    (Some(save_source), Err(copy_err)) => Err(Error::ConvertPostSavePartial {
-      committed: true,
-      save_warning: Some(save_source),
-      copy_error: std::io::Error::other(copy_err.to_string()),
-    }),
+    // `copy_err` is passed through as the typed `crate::Error` so
+    // `Error::FileIo(FileIoPayload { .. })` survives intact for recovery
+    // code (R-final fix: no `io::Error::other(...)` stringification).
+    (Some(save_source), Err(copy_err)) => Err(Error::ConvertPostSavePartial(
+      ConvertPostSavePartialPayload::new(true, Some(save_source), copy_err),
+    )),
   }
 }
 
@@ -1003,12 +997,10 @@ fn resolve_target_dtype(explicit: Option<Dtype>, config_json: &str) -> Result<Op
     // error — see the [`ConvertArgs::dtype`] field-doc for the why.
     return match d {
       Dtype::F16 | Dtype::BF16 | Dtype::F32 => Ok(Some(d)),
-      other => Err(Error::Backend {
-        message: format!(
-          "convert: `dtype` must be one of float16, bfloat16, float32 — got {other:?}; \
+      other => Err(Error::Backend(format!(
+        "convert: `dtype` must be one of float16, bfloat16, float32 — got {other:?}; \
            matches mlx_lm/convert.py:82 supported set (MODEL_CONVERSION_DTYPES)"
-        ),
-      }),
+      ))),
     };
   }
   let parsed: serde_json::Value = match serde_json::from_str(config_json) {
@@ -1179,13 +1171,13 @@ fn build_quantize_config(
   decisions: &PredicateDecisions,
   weights: &Weights,
 ) -> Result<(PerLayerQuantization, String)> {
-  let value: serde_json::Value = serde_json::from_str(config_json).map_err(|e| Error::Backend {
-    message: format!("convert: source config is not valid JSON: {e}"),
-  })?;
+  let value: serde_json::Value = serde_json::from_str(config_json)
+    .map_err(|e| Error::Backend(format!("convert: source config is not valid JSON: {e}")))?;
   let serde_json::Value::Object(mut map) = value else {
-    return Err(Error::Backend {
-      message: "convert: source config JSON must be an object".into(),
-    });
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "convert: source config JSON",
+      "must be an object",
+    )));
   };
 
   // Python's `fine_grained_config` flag (`utils.py:815-820`).
@@ -1305,10 +1297,8 @@ fn build_quantize_config(
     serde_json::Value::Object(quant_block),
   );
 
-  let updated_text =
-    serde_json::to_string(&serde_json::Value::Object(map)).map_err(|e| Error::Backend {
-      message: format!("convert: cannot re-serialize patched config: {e}"),
-    })?;
+  let updated_text = serde_json::to_string(&serde_json::Value::Object(map))
+    .map_err(|e| Error::Backend(format!("convert: cannot re-serialize patched config: {e}")))?;
 
   let live_cfg = PerLayerQuantization::new(Some(global), per_layer_overrides);
   Ok((live_cfg, updated_text))
@@ -1319,20 +1309,19 @@ fn build_quantize_config(
 /// Used by the dequantize branch so the saved config doesn't carry a
 /// stale quant block.
 fn strip_quantization_blocks(config_json: &str) -> Result<String> {
-  let value: serde_json::Value = serde_json::from_str(config_json).map_err(|e| Error::Backend {
-    message: format!("convert: source config is not valid JSON: {e}"),
-  })?;
+  let value: serde_json::Value = serde_json::from_str(config_json)
+    .map_err(|e| Error::Backend(format!("convert: source config is not valid JSON: {e}")))?;
   let serde_json::Value::Object(mut map) = value else {
-    return Err(Error::Backend {
-      message: "convert: source config JSON must be an object".into(),
-    });
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "convert: source config JSON",
+      "must be an object",
+    )));
   };
   map.remove("quantization");
   map.remove("quantization_config");
   let stripped = serde_json::Value::Object(map);
-  serde_json::to_string(&stripped).map_err(|e| Error::Backend {
-    message: format!("convert: cannot re-serialize stripped config: {e}"),
-  })
+  serde_json::to_string(&stripped)
+    .map_err(|e| Error::Backend(format!("convert: cannot re-serialize stripped config: {e}")))
 }
 
 // ─────────────────── copy_tokenizer_and_extras ───────────────────
@@ -1612,12 +1601,20 @@ pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<CopyOutcome> 
       continue;
     }
     let d = dst.join(name);
-    std::fs::copy(&s, &d).map_err(|e| Error::Backend {
-      message: format!(
-        "copy_tokenizer_and_extras: cannot copy {} -> {}: {e}",
-        s.display(),
-        d.display()
-      ),
+    // Typed-error preservation (R-final+1 Codex finding): the underlying
+    // `std::io::ErrorKind` (PermissionDenied / NoSpace / ReadOnlyFilesystem
+    // / …) must reach `ConvertPostSavePartialPayload::copy_error` intact
+    // so callers can branch on `FileOp::Copy` + `path` + `inner.kind()`
+    // without parsing message text. Stringifying into `Error::Backend`
+    // here defeats the typed pass-through that the convert() handler
+    // sets up via `Box<Error>`.
+    std::fs::copy(&s, &d).map_err(|e| {
+      Error::FileIo(FileIoPayload::new(
+        "copy_tokenizer_and_extras",
+        FileOp::Copy,
+        d.clone(),
+        e,
+      ))
     })?;
     // Post-copy file fsync (F7 R4 Finding-1). The data IS on disk
     // after `std::fs::copy` returns Ok; this only converts "logically
@@ -1642,23 +1639,22 @@ pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<CopyOutcome> 
   }
 
   // The python `*.py` glob (HF model code; some loaders need it).
-  let entries = match std::fs::read_dir(src) {
-    Ok(e) => e,
-    Err(e) => {
-      return Err(Error::Backend {
-        message: format!(
-          "copy_tokenizer_and_extras: cannot read source dir {}: {e}",
-          src.display()
-        ),
-      });
-    }
-  };
+  let entries = std::fs::read_dir(src).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "copy_tokenizer_and_extras",
+      FileOp::Read,
+      src.to_path_buf(),
+      e,
+    ))
+  })?;
   for entry in entries {
-    let entry = entry.map_err(|e| Error::Backend {
-      message: format!(
-        "copy_tokenizer_and_extras: cannot read entry in {}: {e}",
-        src.display()
-      ),
+    let entry = entry.map_err(|e| {
+      Error::FileIo(FileIoPayload::new(
+        "copy_tokenizer_and_extras: cannot read entry in",
+        FileOp::Read,
+        src.to_path_buf(),
+        e,
+      ))
     })?;
     let path = entry.path();
     if !path.is_file() {
@@ -1671,12 +1667,17 @@ pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<CopyOutcome> 
       continue;
     }
     let d = dst.join(name);
-    std::fs::copy(&path, &d).map_err(|e| Error::Backend {
-      message: format!(
-        "copy_tokenizer_and_extras: cannot copy {} -> {}: {e}",
-        path.display(),
-        d.display()
-      ),
+    // Typed-error preservation (R-final+1 Codex finding): preserve the
+    // io::ErrorKind through the Error::FileIo variant for the *.py
+    // glob copies — same rationale as the TOKENIZER_EXTRA_FILES loop
+    // above.
+    std::fs::copy(&path, &d).map_err(|e| {
+      Error::FileIo(FileIoPayload::new(
+        "copy_tokenizer_and_extras",
+        FileOp::Copy,
+        d.clone(),
+        e,
+      ))
     })?;
     // Post-copy file fsync — same rationale + kind-preservation as
     // the TOKENIZER_EXTRA_FILES loop above (F7 R6 Finding). Wrapped
@@ -1845,7 +1846,7 @@ mod unit {
   fn resolve_target_dtype_explicit_i32_is_error() {
     let cfg = r#"{"torch_dtype":"float32"}"#;
     match resolve_target_dtype(Some(Dtype::I32), cfg) {
-      Err(Error::Backend { message }) => {
+      Err(Error::Backend(message)) => {
         assert!(
           message.contains("float16")
             && message.contains("bfloat16")
@@ -1865,7 +1866,7 @@ mod unit {
   fn resolve_target_dtype_explicit_f64_is_error() {
     let cfg = r#"{}"#;
     match resolve_target_dtype(Some(Dtype::F64), cfg) {
-      Err(Error::Backend { message }) => {
+      Err(Error::Backend(message)) => {
         assert!(message.contains("float16"));
       }
       other => panic!("expected Err(Backend), got {other:?}"),
@@ -1876,7 +1877,7 @@ mod unit {
   fn resolve_target_dtype_explicit_complex_is_error() {
     let cfg = r#"{}"#;
     match resolve_target_dtype(Some(Dtype::Complex64), cfg) {
-      Err(Error::Backend { message }) => {
+      Err(Error::Backend(message)) => {
         assert!(message.contains("float16"));
       }
       other => panic!("expected Err(Backend), got {other:?}"),
@@ -1887,7 +1888,7 @@ mod unit {
   fn resolve_target_dtype_explicit_bool_is_error() {
     let cfg = r#"{}"#;
     match resolve_target_dtype(Some(Dtype::Bool), cfg) {
-      Err(Error::Backend { message }) => {
+      Err(Error::Backend(message)) => {
         assert!(message.contains("float16"));
       }
       other => panic!("expected Err(Backend), got {other:?}"),
@@ -2142,14 +2143,17 @@ mod unit {
 
     // (a) convert's final return is `Err(DurabilityWarning{committed:true})`.
     match r {
-      Err(Error::DurabilityWarning { committed, source }) => {
+      Err(Error::DurabilityWarning(p)) => {
         assert!(
-          committed,
+          p.committed(),
           "convert's DurabilityWarning must carry committed=true"
         );
         assert!(
-          source.to_string().contains("injected fsync_dir failure"),
-          "underlying io::Error preserved: got {source}"
+          p.source()
+            .to_string()
+            .contains("injected fsync_dir failure"),
+          "underlying io::Error preserved: got {}",
+          p.source()
         );
       }
       other => panic!("expected Err(DurabilityWarning), got {other:?}"),
@@ -2313,13 +2317,9 @@ mod unit {
     //     BOTH the save-side warning AND the copy failure stay
     //     individually accessible via typed fields (no string parse).
     match &r {
-      Err(Error::ConvertPostSavePartial {
-        committed,
-        save_warning,
-        copy_error,
-      }) => {
+      Err(Error::ConvertPostSavePartial(p)) => {
         assert!(
-          *committed,
+          p.committed(),
           "ConvertPostSavePartial must carry committed=true (variant is \
            reachable only after the observable commit point)"
         );
@@ -2329,8 +2329,8 @@ mod unit {
         //     via `.kind()` and the verbatim original message
         //     (`injected fsync_dir failure ...`) is preserved (no
         //     string fold from R2).
-        let save_warning = save_warning
-          .as_ref()
+        let save_warning = p
+          .save_warning()
           .expect("save_warning must be Some — the fsync-dir injector fired");
         // `.kind()` is the machine-readable accessor — assert it's a
         // real IO error category (not the catch-all `Other` that
@@ -2348,12 +2348,18 @@ mod unit {
            message: got {save_warning}"
         );
         // (c) `copy_error` carries the actual tokenizer-copy failure
-        //     (the new R3 information). It's machine-readable via
-        //     `.kind()` and its message names
+        //     (the new R3 information). It's typed `Error::FileIo` so
+        //     callers can branch on `op` / `path` / `inner.kind()`
+        //     without string parsing; its Display names
         //     `copy_tokenizer_and_extras` (the function that returned
         //     it). The two errors are NOT folded into a single
         //     free-form string anymore.
-        let _ = copy_error.kind();
+        let copy_error = p.copy_error();
+        assert!(
+          matches!(copy_error, Error::FileIo(_)),
+          "copy_error is the typed FileIo variant (machine-readable, \
+           not stringified); got: {copy_error:?}"
+        );
         let copy_msg = copy_error.to_string();
         assert!(
           copy_msg.contains("copy_tokenizer_and_extras"),
@@ -2510,23 +2516,25 @@ mod unit {
     //     (no fsync warning) — distinct from the R2 test which has
     //     `save_warning: Some(_)`.
     match &r {
-      Err(Error::ConvertPostSavePartial {
-        committed,
-        save_warning,
-        copy_error,
-      }) => {
+      Err(Error::ConvertPostSavePartial(p)) => {
         assert!(
-          *committed,
+          p.committed(),
           "ConvertPostSavePartial must carry committed=true (variant is \
            reachable only after the observable commit point)"
         );
         assert!(
-          save_warning.is_none(),
+          p.save_warning().is_none(),
           "save_warning must be None — the save returned plain Ok(()) \
-           with no fsync warning; got: {save_warning:?}"
+           with no fsync warning; got: {:?}",
+          p.save_warning()
         );
-        // (b) `copy_error` is machine-readable.
-        let _ = copy_error.kind();
+        // (b) `copy_error` is the typed FileIo variant
+        //     (machine-readable: branch on `op`/`path`/`inner.kind()`).
+        let copy_error = p.copy_error();
+        assert!(
+          matches!(copy_error, Error::FileIo(_)),
+          "copy_error is the typed FileIo variant; got: {copy_error:?}"
+        );
         let copy_msg = copy_error.to_string();
         assert!(
           copy_msg.contains("copy_tokenizer_and_extras"),
@@ -2588,13 +2596,18 @@ mod unit {
     // Construct the variant directly so this test runs on every
     // platform (the (Some, Err) and (None, Err) paths above are
     // Unix-only because they rely on `chmod 000`).
-    let copy_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "EACCES on copy");
+    let copy_err = Error::FileIo(FileIoPayload::new(
+      "copy_tokenizer_and_extras",
+      crate::error::FileOp::Copy,
+      std::path::PathBuf::from("special_tokens_map.json"),
+      std::io::Error::new(std::io::ErrorKind::PermissionDenied, "EACCES on copy"),
+    ));
     let save_warning_inner = std::io::Error::other("fsync_dir warning");
-    let err = Error::ConvertPostSavePartial {
-      committed: true,
-      save_warning: Some(save_warning_inner),
-      copy_error: copy_err,
-    };
+    let err = Error::ConvertPostSavePartial(ConvertPostSavePartialPayload::new(
+      true,
+      Some(save_warning_inner),
+      copy_err,
+    ));
 
     // The error implements `std::error::Error` (free check: trait
     // object coercion only compiles if the trait is implemented).
@@ -2626,20 +2639,20 @@ mod unit {
 
     // The same field is independently reachable via destructuring
     // (machine-readable typed access, no string parse).
-    if let Error::ConvertPostSavePartial {
-      committed,
-      save_warning,
-      copy_error,
-    } = &err
-    {
-      assert!(*committed);
+    if let Error::ConvertPostSavePartial(p) = &err {
+      assert!(p.committed());
       assert_eq!(
-        save_warning.as_ref().map(|e| e.to_string()).as_deref(),
+        p.save_warning().map(|e| e.to_string()).as_deref(),
         Some("fsync_dir warning"),
         "save_warning is reachable via direct field access (typed accessor)"
       );
-      assert_eq!(copy_error.kind(), std::io::ErrorKind::PermissionDenied);
-      assert!(copy_error.to_string().contains("EACCES on copy"));
+      // copy_error is the typed FileIo variant — its inner io::Error
+      // carries the originating ErrorKind for machine-readable branching.
+      let Error::FileIo(io_p) = p.copy_error() else {
+        unreachable!("copy_error is FileIo (constructed above)");
+      };
+      assert_eq!(io_p.inner().kind(), std::io::ErrorKind::PermissionDenied);
+      assert!(p.copy_error().to_string().contains("EACCES on copy"));
     } else {
       unreachable!("constructed ConvertPostSavePartial above");
     }
@@ -2759,20 +2772,20 @@ mod unit {
     //     means data IS on disk; the variant distinction matters
     //     because callers' recovery contract differs.
     match &r {
-      Err(Error::DurabilityWarning { committed, source }) => {
+      Err(Error::DurabilityWarning(p)) => {
         assert!(
-          *committed,
+          p.committed(),
           "post-copy fsync warning carries committed=true (data IS on disk)"
         );
         // (c) The source message references the post-copy fsync (so
         //     the user can pinpoint the boundary that warned).
-        let msg = source.to_string();
+        let msg = p.source().to_string();
         assert!(
           msg.contains("injected fsync_path failure") || msg.contains("post-copy"),
           "source message references the post-copy fsync; got: {msg}"
         );
       }
-      Err(Error::ConvertPostSavePartial { .. }) => panic!(
+      Err(Error::ConvertPostSavePartial(_)) => panic!(
         "post-copy FSYNC warning must NOT surface as ConvertPostSavePartial — \
          that variant is reserved for `std::fs::copy` itself failing (file \
          did NOT reach disk). A post-copy fsync warning means data IS on \
@@ -2834,12 +2847,12 @@ mod unit {
     drop(_guard);
 
     match &r {
-      Err(Error::DurabilityWarning { committed, source }) => {
+      Err(Error::DurabilityWarning(p)) => {
         assert!(
-          *committed,
+          p.committed(),
           "post-copy dir-fsync warning carries committed=true (data IS on disk)"
         );
-        let msg = source.to_string();
+        let msg = p.source().to_string();
         // The source message references the post-copy dir fsync —
         // either via the verbatim injector marker or the "post-copy"
         // tag added by the convert-side fold.
@@ -2848,7 +2861,7 @@ mod unit {
           "source message references the post-copy dir fsync; got: {msg}"
         );
       }
-      Err(Error::ConvertPostSavePartial { .. }) => panic!(
+      Err(Error::ConvertPostSavePartial(_)) => panic!(
         "post-copy DIR fsync warning must NOT surface as ConvertPostSavePartial — \
          that variant is reserved for `std::fs::copy` itself failing. A \
          post-copy dir-fsync warning means data IS on disk (every file's \
@@ -2982,13 +2995,13 @@ mod unit {
            (post_copy_file when save is None); got: {source}"
         );
       }
-      Err(Error::DurabilityWarning { .. }) => panic!(
+      Err(Error::DurabilityWarning(_)) => panic!(
         "both-fsyncs-warn surfaces the multi-warning aggregate \
          ConvertDurabilityWarnings, NOT the single-warning \
          DurabilityWarning shape (R5 fix: typed access to each \
          boundary)"
       ),
-      Err(Error::ConvertPostSavePartial { .. }) => panic!(
+      Err(Error::ConvertPostSavePartial(_)) => panic!(
         "both-fsyncs-warn surfaces ConvertDurabilityWarnings, NOT \
          ConvertPostSavePartial (data IS on disk; only durability \
          uncertain on two boundaries)"
@@ -3064,13 +3077,7 @@ mod unit {
       });
       drop(_guard);
       assert!(
-        matches!(
-          r,
-          Err(Error::DurabilityWarning {
-            committed: true,
-            ..
-          })
-        ),
+        matches!(r, Err(Error::DurabilityWarning(_))),
         "fsync_path injector armed past every save-side call must be \
          observed by the post-copy file fsync loop — a silent removal \
          of that loop would leave the injector unfired and the result \
@@ -3095,13 +3102,7 @@ mod unit {
       });
       drop(_guard);
       assert!(
-        matches!(
-          r,
-          Err(Error::DurabilityWarning {
-            committed: true,
-            ..
-          })
-        ),
+        matches!(r, Err(Error::DurabilityWarning(_))),
         "fsync_dir injector armed past every save-side call must be \
          observed by the post-copy `fsync_dir(dst)` call — a silent \
          removal of that call would leave the injector unfired and \
@@ -3339,7 +3340,7 @@ mod unit {
           "first_warning() returns save when save is Some"
         );
       }
-      Err(Error::DurabilityWarning { .. }) => panic!(
+      Err(Error::DurabilityWarning(_)) => panic!(
         "save warned + post-copy file fsync warned MUST surface the \
          typed aggregate ConvertDurabilityWarnings (R5), NOT the \
          single-source DurabilityWarning (which folded the two via \
@@ -3540,7 +3541,7 @@ mod unit {
   /// — the assertion `agg.post_copy_file.unwrap().kind() ==
   /// PermissionDenied` (NOT `Other`) is the regression detector. A
   /// pre-R6 build would unwrap the injected io::Error via
-  /// `Err(Error::Backend { message }) => Err(io::Error::other(message))`
+  /// `Err(Error::Backend(message)) => Err(io::Error::other(message))`
   /// inside `copy_tokenizer_and_extras`'s `fsync_copied` closure,
   /// collapsing the kind to `Other`.
   ///
@@ -3575,20 +3576,24 @@ mod unit {
     // `post_copy_file` — its `.kind()` must equal the INJECTED kind,
     // NOT `Other`.
     match &r {
-      Err(Error::DurabilityWarning { committed, source }) => {
-        assert!(*committed, "committed=true (data IS on disk)");
+      Err(Error::DurabilityWarning(p)) => {
+        assert!(p.committed(), "committed=true (data IS on disk)");
         assert_eq!(
-          source.kind(),
+          p.source().kind(),
           std::io::ErrorKind::PermissionDenied,
           "post_copy_file warning preserves the injected ErrorKind \
            (PermissionDenied) end-to-end — a regression to the pre-R6 \
            `io::Error::other(message)` re-wrap would collapse this to \
-           ErrorKind::Other; got: {:?} ({source})",
-          source.kind()
+           ErrorKind::Other; got: {:?} ({})",
+          p.source().kind(),
+          p.source()
         );
         assert!(
-          source.to_string().contains("injected fsync_path failure"),
-          "source preserves the verbatim injector message: {source}"
+          p.source()
+            .to_string()
+            .contains("injected fsync_path failure"),
+          "source preserves the verbatim injector message: {}",
+          p.source()
         );
       }
       other => panic!("expected Err(DurabilityWarning), got {other:?}"),
@@ -3625,18 +3630,22 @@ mod unit {
     drop(_guard);
 
     match &r {
-      Err(Error::DurabilityWarning { committed, source }) => {
-        assert!(*committed, "committed=true (data IS on disk)");
+      Err(Error::DurabilityWarning(p)) => {
+        assert!(p.committed(), "committed=true (data IS on disk)");
         assert_eq!(
-          source.kind(),
+          p.source().kind(),
           std::io::ErrorKind::StorageFull,
           "post_copy_dir warning preserves the injected ErrorKind \
-           (StorageFull / ENOSPC) end-to-end; got: {:?} ({source})",
-          source.kind()
+           (StorageFull / ENOSPC) end-to-end; got: {:?} ({})",
+          p.source().kind(),
+          p.source()
         );
         assert!(
-          source.to_string().contains("injected fsync_dir failure"),
-          "source preserves the verbatim injector message: {source}"
+          p.source()
+            .to_string()
+            .contains("injected fsync_dir failure"),
+          "source preserves the verbatim injector message: {}",
+          p.source()
         );
       }
       other => panic!("expected Err(DurabilityWarning), got {other:?}"),
@@ -3687,21 +3696,25 @@ mod unit {
     drop(_guard);
 
     match &r {
-      Err(Error::DurabilityWarning { committed, source }) => {
-        assert!(*committed, "committed=true (save committed)");
+      Err(Error::DurabilityWarning(p)) => {
+        assert!(p.committed(), "committed=true (save committed)");
         assert_eq!(
-          source.kind(),
+          p.source().kind(),
           std::io::ErrorKind::ConnectionReset,
           "save-side warning preserves the injected ErrorKind \
            (ConnectionReset) end-to-end through \
            CommitOutcome::CommittedWithDurabilityWarning → \
            Error::DurabilityWarning → convert's committed_warning \
-           stash → ConvertDurabilityWarnings.save; got: {:?} ({source})",
-          source.kind()
+           stash → ConvertDurabilityWarnings.save; got: {:?} ({})",
+          p.source().kind(),
+          p.source()
         );
         assert!(
-          source.to_string().contains("injected fsync_dir failure"),
-          "source preserves the verbatim injector message: {source}"
+          p.source()
+            .to_string()
+            .contains("injected fsync_dir failure"),
+          "source preserves the verbatim injector message: {}",
+          p.source()
         );
       }
       other => panic!("expected Err(DurabilityWarning), got {other:?}"),
@@ -3779,19 +3792,20 @@ mod unit {
     drop(_guard);
 
     match &r {
-      Err(Error::DurabilityWarning { committed, source }) => {
-        assert!(*committed, "committed=true (data IS on disk)");
+      Err(Error::DurabilityWarning(p)) => {
+        assert!(p.committed(), "committed=true (data IS on disk)");
         // R6 contract intact: the wrap uses io::Error::new (kind
         // preserved), not io::Error::other (which would collapse to
         // `Other`).
         assert_eq!(
-          source.kind(),
+          p.source().kind(),
           std::io::ErrorKind::PermissionDenied,
           "R7 wrap preserves the underlying ErrorKind (R6 contract); \
-           got: {:?} ({source})",
-          source.kind()
+           got: {:?} ({})",
+          p.source().kind(),
+          p.source()
         );
-        let msg = source.to_string();
+        let msg = p.source().to_string();
         // R7 wrap added the operation tag — the injector's own message
         // does not contain this string, so this assertion fails if the
         // call-site wrap is removed.
@@ -3876,10 +3890,10 @@ mod unit {
     drop(_guard);
 
     match &r {
-      Err(Error::DurabilityWarning { committed, source }) => {
+      Err(Error::DurabilityWarning(p)) => {
         // (a) committed: true.
         assert!(
-          *committed,
+          p.committed(),
           "post-copy fsync warning carries committed=true (the file's \
            bytes reached disk via std::fs::copy BEFORE the fsync ran; \
            the durability-uncertain window is between copy returning \
@@ -3891,13 +3905,14 @@ mod unit {
         // `ErrorKind::Other` failure; only the natural File::open path
         // produces ErrorKind::NotFound.
         assert_eq!(
-          source.kind(),
+          p.source().kind(),
           std::io::ErrorKind::NotFound,
           "real OS failure path produces the natural File::open kind \
-           (NotFound) — observed {:?} ({source})",
-          source.kind()
+           (NotFound) — observed {:?} ({})",
+          p.source().kind(),
+          p.source()
         );
-        let msg = source.to_string();
+        let msg = p.source().to_string();
         // (c) Destination filename is in the wrap.
         assert!(
           msg.contains("tokenizer.json"),

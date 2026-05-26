@@ -35,7 +35,7 @@ use derive_more::{Display, IsVariant};
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{Error, Result},
+  error::{DtypeMismatchPayload, Error, Result},
   ops,
 };
 
@@ -961,12 +961,10 @@ impl<M: TtsModel> TtsGenerator<'_, M> {
     // `decode_step` `[1, V]` shape check.
     let shape = audio.shape();
     if shape.len() != 1 {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "tts_generate: `synthesize_segment` must return a rank-1 [samples] \
+      return Err(Error::ShapeMismatch(format!(
+        "tts_generate: `synthesize_segment` must return a rank-1 [samples] \
            audio tensor, got shape {shape:?} (segment {idx})"
-        ),
-      });
+      )));
     }
 
     // Validate the model's audio output is `f32` PCM — the other half of the
@@ -980,10 +978,10 @@ impl<M: TtsModel> TtsGenerator<'_, M> {
     // generator boundary, naming the actual dtype (the `expected`/`got` pair).
     let dtype = audio.dtype()?;
     if dtype != Dtype::F32 {
-      return Err(Error::DtypeMismatch {
-        expected: Dtype::F32,
-        got: dtype,
-      });
+      return Err(Error::DtypeMismatch(DtypeMismatchPayload::new(
+        Dtype::F32,
+        dtype,
+      )));
     }
 
     // `is_final_chunk` ⇔ this is the last segment. The driver yields one
@@ -1115,24 +1113,22 @@ pub fn tts_generate_with_reference<'a, M: TtsModel>(
   //    STT loop's `max_audio_seconds` up-front check). `text.len()` is the
   //    UTF-8 byte length.
   if text.len() > MAX_TEXT_BYTES {
-    return Err(Error::Backend {
-      message: format!(
-        "tts_generate: input text is {} bytes, exceeds the {MAX_TEXT_BYTES}-byte \
+    return Err(Error::Backend(format!(
+      "tts_generate: input text is {} bytes, exceeds the {MAX_TEXT_BYTES}-byte \
          (1 MiB) cap; split the request into smaller calls",
-        text.len()
-      ),
-    });
+      text.len()
+    )));
   }
 
   // 2. Segment. `segment_ranges` drops blank segments; an all-blank input
   //    (empty string, only whitespace / newlines) yields no segments.
   let segments = segment_ranges(text, cfg.segmentation());
   if segments.is_empty() {
-    return Err(Error::Backend {
-      message: "tts_generate: input text has no non-blank segments — nothing to \
+    return Err(Error::Backend(
+      "tts_generate: input text has no non-blank segments — nothing to \
                 synthesize; provide non-empty text"
         .into(),
-    });
+    ));
   }
 
   Ok(TtsGenerator {

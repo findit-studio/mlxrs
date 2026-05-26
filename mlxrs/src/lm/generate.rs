@@ -910,71 +910,57 @@ impl GenConfig {
     // temp: finite + non-negative (temp == 0 ⇒ argmax path; temp > 0 ⇒
     // stochastic path).
     if !self.temp.is_finite() || self.temp < 0.0 {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "`temp` must be a finite non-negative float (0.0 = argmax, > 0.0 = stochastic), \
+      return Err(Error::ShapeMismatch(format!(
+        "`temp` must be a finite non-negative float (0.0 = argmax, > 0.0 = stochastic), \
            but is {}",
-          self.temp
-        ),
-      });
+        self.temp
+      )));
     }
     // top_p: [0, 1]. `make_sampler` gates the stage on `(0, 1)`; 0 and 1
     // are no-op-equivalent and accepted as "off" / "include everything".
     if !self.top_p.is_finite() || !(0.0..=1.0).contains(&self.top_p) {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "`top_p` must be a finite float in [0, 1] (0 = off, (0, 1) = nucleus cutoff, \
+      return Err(Error::ShapeMismatch(format!(
+        "`top_p` must be a finite float in [0, 1] (0 = off, (0, 1) = nucleus cutoff, \
            1 = include everything), but is {}",
-          self.top_p
-        ),
-      });
+        self.top_p
+      )));
     }
     // min_p: [0, 1] (mirrors `apply_min_p`).
     if !self.min_p.is_finite() || !(0.0..=1.0).contains(&self.min_p) {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "`min_p` must be a finite float in [0, 1], but is {}",
-          self.min_p
-        ),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "`min_p` must be a finite float in [0, 1], but is {}",
+        self.min_p
+      )));
     }
     // min_tokens_to_keep >= 1 (mirrors `apply_min_p`; the `<= vocab_size`
     // bound is vocab-dependent and deferred to the first decode step).
     if self.min_tokens_to_keep < 1 {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "`min_tokens_to_keep` must be a positive integer (>= 1), but is {}",
-          self.min_tokens_to_keep
-        ),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "`min_tokens_to_keep` must be a positive integer (>= 1), but is {}",
+        self.min_tokens_to_keep
+      )));
     }
     // top_k >= 0 (`top_k == 0` is "off"; `top_k > 0` is "on" — the
     // `< vocab_size` bound is vocab-dependent and deferred).
     if self.top_k < 0 {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "`top_k` must be non-negative (0 = off, > 0 = top-k cutoff), but is {}",
-          self.top_k
-        ),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "`top_k` must be non-negative (0 = off, > 0 = top-k cutoff), but is {}",
+        self.top_k
+      )));
     }
     // xtc_probability: [0, 1] (mirrors `apply_xtc`).
     if !self.xtc_probability.is_finite() || !(0.0..=1.0).contains(&self.xtc_probability) {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "`xtc_probability` must be a finite float in [0, 1], but is {}",
-          self.xtc_probability
-        ),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "`xtc_probability` must be a finite float in [0, 1], but is {}",
+        self.xtc_probability
+      )));
     }
     // xtc_threshold: [0, 0.5] (mirrors `apply_xtc`).
     if !self.xtc_threshold.is_finite() || !(0.0..=0.5).contains(&self.xtc_threshold) {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "`xtc_threshold` must be a finite float in [0, 0.5], but is {}",
-          self.xtc_threshold
-        ),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "`xtc_threshold` must be a finite float in [0, 0.5], but is {}",
+        self.xtc_threshold
+      )));
     }
     // repetition_penalty: finite + non-negative (mirrors
     // `apply_repetition_penalty` + mlx-lm `make_repetition_penalty`'s
@@ -984,12 +970,10 @@ impl GenConfig {
     if let Some(p) = self.repetition_penalty
       && (!p.is_finite() || p < 0.0)
     {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "`repetition_penalty` must be a finite non-negative float when `Some(_)`, \
+      return Err(Error::ShapeMismatch(format!(
+        "`repetition_penalty` must be a finite non-negative float when `Some(_)`, \
            but is {p}"
-        ),
-      });
+      )));
     }
     // presence_penalty: finite-only. mlx-lm's `make_presence_penalty`
     // allows negative values (presence "boost" is a negative penalty), so
@@ -997,28 +981,26 @@ impl GenConfig {
     if let Some(p) = self.presence_penalty
       && !p.is_finite()
     {
-      return Err(Error::ShapeMismatch {
-        message: format!("`presence_penalty` must be a finite float when `Some(_)`, but is {p}"),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "`presence_penalty` must be a finite float when `Some(_)`, but is {p}"
+      )));
     }
     // frequency_penalty: finite-only (same rationale as presence).
     if let Some(p) = self.frequency_penalty
       && !p.is_finite()
     {
-      return Err(Error::ShapeMismatch {
-        message: format!("`frequency_penalty` must be a finite float when `Some(_)`, but is {p}"),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "`frequency_penalty` must be a finite float when `Some(_)`, but is {p}"
+      )));
     }
     // logit_bias: every `(id, value)` `value` finite. `id` is `i32` and
     // not bound here (the model's vocab is unknown; the `take`/scatter
     // primitive will reject an out-of-range id at the first decode step).
     for &(id, v) in &self.logit_bias {
       if !v.is_finite() {
-        return Err(Error::ShapeMismatch {
-          message: format!(
-            "`logit_bias` value for token id {id} must be a finite float, but is {v}"
-          ),
-        });
+        return Err(Error::ShapeMismatch(format!(
+          "`logit_bias` value for token id {id} must be a finite float, but is {v}"
+        )));
       }
     }
     Ok(())
@@ -1743,9 +1725,9 @@ fn token_window(ids: &[u32]) -> Result<Array> {
 fn last_position(logits: &Array) -> Result<Array> {
   let shape = logits.shape();
   if shape.len() != 3 {
-    return Err(Error::ShapeMismatch {
-      message: format!("generate: expected [B, S, V] logits from `forward`, got {shape:?}"),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "generate: expected [B, S, V] logits from `forward`, got {shape:?}"
+    )));
   }
   // `logits[:, -1, :]` is only defined for a non-empty sequence axis and a
   // non-empty vocab axis; mirror Python's `IndexError` on `S == 0` (the
@@ -1753,12 +1735,10 @@ fn last_position(logits: &Array) -> Result<Array> {
   // (an empty distribution the sampler cannot draw from) as a recoverable
   // `Err` BEFORE any index arithmetic.
   if shape[1] == 0 || shape[2] == 0 {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "generate: `forward` returned logits with a zero-length axis (got [B, S, V] {shape:?}); \
+    return Err(Error::ShapeMismatch(format!(
+      "generate: `forward` returned logits with a zero-length axis (got [B, S, V] {shape:?}); \
          `logits[:, -1, :]` requires S >= 1 and V >= 1"
-      ),
-    });
+    )));
   }
   let (b, s, v) = (shape[0] as i32, shape[1] as i32, shape[2] as i32);
   // `[ :, s-1 : s, : ]` (a 1-wide window at the last position); `s >= 1`
@@ -1829,9 +1809,9 @@ pub(crate) fn build_generator<'a, M: Model + ?Sized>(
   // contract is the single error channel.
   let built = (|| -> Result<(Sampler, Vec<LogitsProcessor>)> {
     if prompt.is_empty() {
-      return Err(Error::ShapeMismatch {
-        message: "generate: prompt must be non-empty".into(),
-      });
+      return Err(Error::ShapeMismatch(
+        "generate: prompt must be non-empty".into(),
+      ));
     }
     // AUDIO-12 #136: eager scalar-bound validation of every sampler /
     // logits-processor knob in `cfg` BEFORE any prompt prefill / model
@@ -2180,7 +2160,7 @@ pub fn stream_generate<'a, M: Model + ?Sized>(
     if matcher.is_active() {
       let full = detok.text();
       match matcher.step(&full) {
-        crate::lm::stop::StopDecision::Stop(ref p) => {
+        crate::lm::stop::StopDecision::Stop(p) => {
           finished = true;
           let end = p.trimmed_len().max(emitted_len).min(full.len());
           let text = full[emitted_len..end].to_string();
@@ -2201,7 +2181,7 @@ pub fn stream_generate<'a, M: Model + ?Sized>(
             finish_reason: Some(FinishReason::Stop(stop)),
           }));
         }
-        crate::lm::stop::StopDecision::Continue(ref p) => {
+        crate::lm::stop::StopDecision::Continue(p) => {
           // mlx-lm: `if (n + 1) == max_tokens: break` ⇒ a final
           // `finish_reason="length"` response with the finalized tail. But a
           // detokenizer may withhold tail text from `text()` until
@@ -2307,7 +2287,7 @@ fn finalize_active_tail(
 ) -> (String, FinishReason) {
   let full = detok.text();
   match matcher.step(&full) {
-    crate::lm::stop::StopDecision::Stop(ref p) => {
+    crate::lm::stop::StopDecision::Stop(p) => {
       let end = p.trimmed_len().max(*emitted_len).min(full.len());
       let text = full[*emitted_len..end].to_string();
       *emitted_len = end;
@@ -2601,12 +2581,10 @@ impl<M: Model + ?Sized> BatchGenerator<'_, M> {
     //    logprobs stay lazy.
     let tokens: Vec<u32> = sampled.to_vec::<u32>()?;
     if tokens.len() != b {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "batch_generate: sampler returned {} tokens, expected {b} (one per row)",
-          tokens.len()
-        ),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "batch_generate: sampler returned {} tokens, expected {b} (one per row)",
+        tokens.len()
+      )));
     }
 
     // Build per-row step results. The full per-row logprob slice `[V]` is
@@ -2806,22 +2784,22 @@ impl<M: Model + ?Sized> Iterator for BatchGenerator<'_, M> {
 /// `mx.array([[pad]*(max_len-len(p)) + p for p in prompts])`).
 fn left_pad_rows(prompts: &[&[u32]], pad_token_id: u32) -> Result<(Vec<Vec<u32>>, usize)> {
   if prompts.is_empty() {
-    return Err(Error::ShapeMismatch {
-      message: "batch_generate: prompts must be non-empty".into(),
-    });
+    return Err(Error::ShapeMismatch(
+      "batch_generate: prompts must be non-empty".into(),
+    ));
   }
   let max_len = prompts.iter().map(|p| p.len()).max().unwrap_or(0);
   if max_len == 0 {
-    return Err(Error::ShapeMismatch {
-      message: "batch_generate: every prompt must be non-empty".into(),
-    });
+    return Err(Error::ShapeMismatch(
+      "batch_generate: every prompt must be non-empty".into(),
+    ));
   }
   let mut padded: Vec<Vec<u32>> = try_with_capacity(prompts.len())?;
   for p in prompts {
     if p.is_empty() {
-      return Err(Error::ShapeMismatch {
-        message: "batch_generate: every prompt must be non-empty".into(),
-      });
+      return Err(Error::ShapeMismatch(
+        "batch_generate: every prompt must be non-empty".into(),
+      ));
     }
     let mut row: Vec<u32> = try_with_capacity(max_len)?;
     for _ in 0..(max_len - p.len()) {
@@ -3085,9 +3063,10 @@ pub fn batch_generate<M: Model + ?Sized>(
       // Defensive: a sampler / model returning an out-of-range row index
       // would corrupt results; surface as a recoverable Err rather than a
       // panic.
-      return Err(Error::Backend {
-        message: format!("batch_generate: step row {row} out of range for {b} prompts"),
-      });
+      // TODO(§5): promote to IndexOutOfRange { context: "batch_generate: step row", index: usize, len: usize } variant — both index and length are machine-inspectable.
+      return Err(Error::Backend(format!(
+        "batch_generate: step row {row} out of range for {b} prompts"
+      )));
     }
     match &step.finish_reason {
       Some(r) if r.is_eos() => {
@@ -3157,9 +3136,9 @@ mod batch_tests {
       let (batch, seq) = match shape.as_slice() {
         [b, s] => (*b, *s),
         other => {
-          return Err(Error::ShapeMismatch {
-            message: format!("MockBatchModel::forward expects [B, S] tokens, got {other:?}"),
-          });
+          return Err(Error::ShapeMismatch(format!(
+            "MockBatchModel::forward expects [B, S] tokens, got {other:?}"
+          )));
         }
       };
 
@@ -3507,9 +3486,7 @@ mod batch_tests {
       _cache: &mut [Box<dyn crate::lm::cache::KvCache>],
     ) -> Result<Array> {
       *self.calls.borrow_mut() += 1;
-      Err(Error::Backend {
-        message: "mock batch forward failure".into(),
-      })
+      Err(Error::Backend("mock batch forward failure".into()))
     }
   }
 
@@ -3603,9 +3580,9 @@ mod stop_sequence_tests {
         [b, s] => (*b, *s),
         [s] => (1usize, *s),
         other => {
-          return Err(Error::ShapeMismatch {
-            message: format!("ScriptModel::forward expects [B, S] tokens, got {other:?}"),
-          });
+          return Err(Error::ShapeMismatch(format!(
+            "ScriptModel::forward expects [B, S] tokens, got {other:?}"
+          )));
         }
       };
       // Advance every cache so `offset()` increments like a real layer.

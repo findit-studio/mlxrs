@@ -49,20 +49,18 @@ impl RecordingSink {
 impl AudioOutputStream for RecordingSink {
   fn write_samples(&mut self, samples: &[f32]) -> mlxrs::error::Result<usize> {
     if !self.running {
-      return Err(mlxrs::error::Error::Backend {
-        message: "RecordingSink: stream stopped".to_string(),
-      });
+      return Err(mlxrs::error::Error::Backend(
+        "RecordingSink: stream stopped".to_string(),
+      ));
     }
     let mut buf = self.buffer.lock().unwrap();
     if buf.len() + samples.len() > self.capacity {
-      return Err(mlxrs::error::Error::Backend {
-        message: format!(
-          "RecordingSink: capacity {} exceeded ({} + {})",
-          self.capacity,
-          buf.len(),
-          samples.len()
-        ),
-      });
+      return Err(mlxrs::error::Error::Backend(format!(
+        "RecordingSink: capacity {} exceeded ({} + {})",
+        self.capacity,
+        buf.len(),
+        samples.len()
+      )));
     }
     buf.extend_from_slice(samples);
     Ok(samples.len())
@@ -169,7 +167,7 @@ fn playback_config_cpal_config_rejects_zero_channels() {
     .with_queue_capacity_frames(1024);
   let err = cfg.cpal_config().unwrap_err();
   assert!(
-    matches!(err, mlxrs::error::Error::Backend { ref message } if message.contains("channel count")),
+    matches!(err, mlxrs::error::Error::Backend(ref message) if message.contains("channel count")),
     "expected Backend(channel count) error, got {err:?}"
   );
 }
@@ -226,7 +224,7 @@ fn audio_output_stream_stop_marks_not_running_and_rejects_writes() {
   // Post-stop writes return Err — the trait contract.
   let err = sink.write_samples(&[0.0_f32; 32]).unwrap_err();
   assert!(
-    matches!(err, mlxrs::error::Error::Backend { ref message } if message.contains("stopped")),
+    matches!(err, mlxrs::error::Error::Backend(ref message) if message.contains("stopped")),
     "expected stopped-stream Backend error, got {err:?}"
   );
 }
@@ -240,7 +238,7 @@ fn audio_output_stream_overflow_returns_err() {
   // Now full; next write blows the cap.
   let err = sink.write_samples(&[0.0_f32; 1]).unwrap_err();
   assert!(
-    matches!(err, mlxrs::error::Error::Backend { ref message } if message.contains("capacity")),
+    matches!(err, mlxrs::error::Error::Backend(ref message) if message.contains("capacity")),
     "expected capacity-overflow Backend error, got {err:?}"
   );
 }
@@ -430,7 +428,7 @@ fn audio_player_buffer_overflow_returns_err() {
   player.write_samples(&[0.0_f32; 1024]).unwrap();
   let err = player.write_samples(&[0.0_f32; 1]).unwrap_err();
   assert!(
-    matches!(err, mlxrs::error::Error::Backend { ref message } if message.contains("overflow")),
+    matches!(err, mlxrs::error::Error::Backend(ref message) if message.contains("overflow")),
     "expected overflow Backend error, got {err:?}"
   );
   let _ = player.stop();
@@ -503,7 +501,7 @@ fn audio_output_stream_rejects_writes_after_stop() {
   // error. The literal "after stop()" substring is the contract.
   let err = player.write_samples(&[0.0_f32; 32]).unwrap_err();
   match err {
-    mlxrs::error::Error::Backend { message } => {
+    mlxrs::error::Error::Backend(message) => {
       assert!(
         message.contains("after stop()"),
         "expected `after stop()` in error message, got: {message}"
@@ -542,7 +540,7 @@ fn audio_player_start_after_stop_returns_terminated_err() {
 
   let err = player.start().unwrap_err();
   match err {
-    mlxrs::error::Error::Backend { message } => {
+    mlxrs::error::Error::Backend(message) => {
       assert!(
         message.contains("terminated"),
         "expected `terminated` in start()-after-stop() error, got: {message}"
@@ -575,7 +573,7 @@ fn audio_player_write_samples_after_restart_attempt_still_rejected() {
 
   let err = player.write_samples(&[0.5_f32; 64]).unwrap_err();
   match err {
-    mlxrs::error::Error::Backend { message } => {
+    mlxrs::error::Error::Backend(message) => {
       assert!(
         message.contains("terminated"),
         "expected `terminated` in write_samples()-after-restart-attempt error, got: {message}"
@@ -600,7 +598,7 @@ fn audio_player_pause_after_stop_returns_terminated_err() {
 
   let err = player.pause().unwrap_err();
   match err {
-    mlxrs::error::Error::Backend { message } => {
+    mlxrs::error::Error::Backend(message) => {
       assert!(
         message.contains("terminated"),
         "expected `terminated` in pause()-after-stop() error, got: {message}"
@@ -625,7 +623,7 @@ fn audio_player_resume_after_stop_returns_terminated_err() {
 
   let err = player.resume().unwrap_err();
   match err {
-    mlxrs::error::Error::Backend { message } => {
+    mlxrs::error::Error::Backend(message) => {
       assert!(
         message.contains("terminated"),
         "expected `terminated` in resume()-after-stop() error, got: {message}"

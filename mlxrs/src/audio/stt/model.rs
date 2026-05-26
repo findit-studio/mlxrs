@@ -96,9 +96,9 @@ pub trait Model: crate::lm::model::Model {
     cache: &mut [Box<dyn KvCache>],
   ) -> Result<Array> {
     let _ = (token, encoder_states, cache);
-    Err(Error::Backend {
-      message: "STT model needs `decode_step` override (per-model)".into(),
-    })
+    Err(Error::Backend(
+      "STT model needs `decode_step` override (per-model)".into(),
+    ))
   }
 
   /// The mel-spectrogram extraction config this model expects.

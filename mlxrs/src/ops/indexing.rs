@@ -5,7 +5,7 @@ use std::ffi::c_int;
 
 use crate::{
   array::Array,
-  error::{Error, Result, check},
+  error::{Error, LengthMismatchPayload, MultiLengthMismatchPayload, Result, check},
   shape::dim_ptr,
   stream::default_stream,
 };
@@ -23,23 +23,21 @@ use crate::{
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.slice.html).
 pub fn slice(a: &Array, start: &[i32], stop: &[i32], strides: &[i32]) -> Result<Array> {
   if start.len() != stop.len() || start.len() != strides.len() {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "slice: length mismatch — start={}, stop={}, strides={}",
-        start.len(),
-        stop.len(),
-        strides.len()
-      ),
-    });
+    return Err(Error::MultiLengthMismatch(MultiLengthMismatchPayload::new(
+      "slice: start/stop/strides",
+      vec![
+        ("start", start.len()),
+        ("stop", stop.len()),
+        ("strides", strides.len()),
+      ],
+    )));
   }
   if start.len() != a.ndim() {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "slice: start/stop/strides length {} != a.ndim() {}",
-        start.len(),
-        a.ndim()
-      ),
-    });
+    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+      "slice: start/stop/strides length",
+      a.ndim(),
+      start.len(),
+    )));
   }
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
@@ -190,30 +188,26 @@ pub fn scatter_add_axis(a: &Array, indices: &Array, values: &Array, axis: i32) -
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.gather.html).
 pub fn gather(a: &Array, indices: &[&Array], axes: &[i32], slice_sizes: &[i32]) -> Result<Array> {
   if indices.is_empty() {
-    return Err(Error::ShapeMismatch {
-      message: "gather: indices slice is empty".into(),
-    });
+    return Err(Error::ShapeMismatch(
+      "gather: indices slice is empty".into(),
+    ));
   }
   if indices.len() != axes.len() {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "gather: indices.len() {} != axes.len() {}",
-        indices.len(),
-        axes.len()
-      ),
-    });
+    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+      "gather: indices.len() vs axes.len()",
+      axes.len(),
+      indices.len(),
+    )));
   }
   // slice_sizes is a shape extent (one per dim of `a`); it must be non-negative
   // and have rank == a.ndim(). Without these guards, negative or wrong-rank
   // values cross into mlx::core::Shape construction (Codex PR #7-target finding).
   if slice_sizes.len() != a.ndim() {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "gather: slice_sizes.len() {} != a.ndim() {}",
-        slice_sizes.len(),
-        a.ndim()
-      ),
-    });
+    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+      "gather: slice_sizes.len() vs a.ndim()",
+      a.ndim(),
+      slice_sizes.len(),
+    )));
   }
   crate::shape::validate_dims(slice_sizes)?;
   crate::error::ensure_handler_installed();
@@ -228,9 +222,9 @@ pub fn gather(a: &Array, indices: &[&Array], axes: &[i32], slice_sizes: &[i32]) 
     return Err(
       crate::error::LAST
         .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend {
-          message: "mlx_vector_array_new_data returned NULL".into(),
-        }),
+        .unwrap_or(Error::Backend(
+          "mlx_vector_array_new_data returned NULL".into(),
+        )),
     );
   }
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)

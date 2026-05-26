@@ -394,13 +394,11 @@ impl SessionRetryState {
         // (`discharge_stop_mel_flush_try_clone_err_preserves_mel_as_stop_encoder_feed`)
         // gives this branch deterministic regression coverage.
         self.resume_at = Some(RetryStage::StopEncoderFeed(mel));
-        Err(Error::Backend {
-          message: format!(
-            "StopMelFlush: failed to clone flushed mel for in-call use; \
+        Err(Error::Backend(format!(
+          "StopMelFlush: failed to clone flushed mel for in-call use; \
              obligation preserved as StopEncoderFeed with original payload \
              (retry stop() to discharge): {e}"
-          ),
-        })
+        )))
       }
     }
   }
@@ -808,16 +806,14 @@ mod tests {
     // Inject a clone fn that ALWAYS fails — simulates the rare
     // mlx_array_set host-allocator OOM that drives the R2-fix branch.
     let result = s.discharge_stop_mel_flush_with_clone(&mut mel_proc, |_arr| {
-      Err(Error::Backend {
-        message: "test-injected clone failure".into(),
-      })
+      Err(Error::Backend("test-injected clone failure".into()))
     });
 
     // The discharge MUST surface an Err so the caller's in-call path
     // bails out (it can't continue without a mel handle of its own).
     let err = result.expect_err("injected clone-Err MUST propagate as Err");
     assert!(
-      matches!(err, Error::Backend { .. }),
+      matches!(err, Error::Backend(_)),
       "discharge wraps the clone-Err in Error::Backend, got {err:?}"
     );
 

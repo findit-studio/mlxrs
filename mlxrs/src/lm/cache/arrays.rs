@@ -58,12 +58,10 @@ where
   let comma_count = s.bytes().filter(|&b| b == b',').count();
   let upper_bound = comma_count.saturating_add(1);
   if upper_bound > max_elems {
-    return Err(Error::Backend {
-      message: format!(
-        "ArraysCache meta_state {what}: element count ({upper_bound}) exceeds bound ({max_elems}) — \
+    return Err(Error::Backend(format!(
+      "ArraysCache meta_state {what}: element count ({upper_bound}) exceeds bound ({max_elems}) — \
          a forged CSV payload was rejected before allocation"
-      ),
-    });
+    )));
   }
   // Pre-reserve so the streamed parse can fail fast on OOM for a hostile
   // (but in-bound) `max_elems` rather than amortized grow.
@@ -72,9 +70,9 @@ where
     .try_reserve_exact(upper_bound)
     .map_err(|_| Error::OutOfMemory)?;
   for p in s.split(',') {
-    let v = p.parse::<T>().map_err(|e| Error::Backend {
-      message: format!("ArraysCache meta_state {what} ({p:?}): {e}"),
-    })?;
+    let v = p
+      .parse::<T>()
+      .map_err(|e| Error::Backend(format!("ArraysCache meta_state {what} ({p:?}): {e}")))?;
     out.push(v);
   }
   Ok(out)
@@ -315,12 +313,10 @@ impl ArraysCache {
       // mismatch — use `Error::Backend` so callers can distinguish "wrong
       // slot index" from "wrong tensor shape" via the variant alone
       // (Copilot review #3271124415).
-      None => Err(Error::Backend {
-        message: format!(
-          "ArraysCache: slot index {idx} out of range (size {})",
-          self.cache.len()
-        ),
-      }),
+      None => Err(Error::Backend(format!(
+        "ArraysCache: slot index {idx} out of range (size {})",
+        self.cache.len()
+      ))),
     }
   }
 
@@ -340,11 +336,9 @@ impl ArraysCache {
       let shape = slot.shape();
       return match shape.first() {
         Some(&b) => Ok(b),
-        None => Err(Error::ShapeMismatch {
-          message: format!(
-            "ArraysCache.batch_size: slot has rank 0, no leading axis (shape {shape:?})"
-          ),
-        }),
+        None => Err(Error::ShapeMismatch(format!(
+          "ArraysCache.batch_size: slot has rank 0, no leading axis (shape {shape:?})"
+        ))),
       };
     }
     if let Some(lp) = &self.left_padding {
@@ -379,9 +373,8 @@ impl ArraysCache {
     // surface as `Error::Backend` (Copilot review #3271308749) for the
     // same reason `set` and `update` switched: variants should reflect
     // the actual condition, not a misleading "shape" framing.
-    let n = i32::try_from(n).map_err(|_| Error::Backend {
-      message: format!("ArraysCache.advance: N {n} exceeds i32::MAX"),
-    })?;
+    let n = i32::try_from(n)
+      .map_err(|_| Error::Backend(format!("ArraysCache.advance: N {n} exceeds i32::MAX")))?;
     if let Some(l) = &mut self.lengths {
       for v in l.iter_mut() {
         *v = v.wrapping_sub(n);
@@ -424,9 +417,7 @@ impl KvCache for ArraysCache {
   /// `update_and_fetch`" — rather than misleadingly suggesting the caller
   /// passed wrong-shaped tensors (Copilot review #3271124426).
   fn update(&mut self, _keys: &Array, _values: &Array) -> Result<(Array, Array)> {
-    Err(Error::Backend {
-      message: "ArraysCache::update is unsupported (generic slot cache, not K/V; use `get`/`set`/`state` instead)".into(),
-    })
+    Err(Error::Backend("ArraysCache::update is unsupported (generic slot cache, not K/V; use `get`/`set`/`state` instead)".into()))
   }
 
   /// Present (non-`None`) slots in slot order — swift `ArraysCache`
@@ -522,14 +513,16 @@ impl KvCache for ArraysCache {
       return Ok(());
     }
     // Slot-aware: m[0]=slotCount, m[1]=presentSlots CSV, m[2]?=leftPadding.
-    let slot_count: usize = m[0].parse().map_err(|e| Error::Backend {
-      message: format!("ArraysCache meta_state slotCount ({:?}): {e}", m[0]),
+    let slot_count: usize = m[0].parse().map_err(|e| {
+      Error::Backend(format!(
+        "ArraysCache meta_state slotCount ({:?}): {e}",
+        m[0]
+      ))
     })?;
     if m.len() < 2 {
-      return Err(Error::Backend {
-        message: "ArraysCache slot-aware meta_state needs [slotCount, presentSlots, leftPadding?]"
-          .into(),
-      });
+      return Err(Error::Backend(
+        "ArraysCache slot-aware meta_state needs [slotCount, presentSlots, leftPadding?]".into(),
+      ));
     }
     // Atomicity is structural, not incidental: **every** fallible *and*
     // allocating step is staged here, with `self` still completely
@@ -571,20 +564,17 @@ impl KvCache for ArraysCache {
     //    pre-check, the residual `try_reserve_exact` failure is
     //    unambiguously OOM.
     if slot_count > MAX_SLOT_COUNT {
-      return Err(Error::Backend {
-        message: format!(
-          "ArraysCache meta_state: slot_count {slot_count} exceeds MAX_SLOT_COUNT ({MAX_SLOT_COUNT}) — \
+      return Err(Error::Backend(format!(
+        "ArraysCache meta_state: slot_count {slot_count} exceeds MAX_SLOT_COUNT ({MAX_SLOT_COUNT}) — \
            realistic SSM/Mamba caches use ≤ 64 slots; the cap fails fast on forged/corrupt meta_state"
-        ),
-      });
+      )));
     }
     let elem_size = std::mem::size_of::<Option<Array>>().max(1);
     if slot_count > (isize::MAX as usize) / elem_size {
-      return Err(Error::Backend {
-        message: format!(
-          "ArraysCache meta_state: invalid slot_count {slot_count} (capacity overflow — exceeds isize::MAX / sizeof::<Option<Array>>())"
-        ),
-      });
+      // TODO(§5): promote to ArithmeticOverflow — `slot_count` is dynamic; needs ArithmeticOverflow with a runtime context String or a dedicated SlotCountOverflow { slot_count: usize } variant.
+      return Err(Error::Backend(format!(
+        "ArraysCache meta_state: invalid slot_count {slot_count} (capacity overflow — exceeds isize::MAX / sizeof::<Option<Array>>())"
+      )));
     }
     // `presentSlots` is the producer's own `usize` slot index (emit at the
     // `meta_state` getter is `i.to_string()` where `i: usize`), so parse it

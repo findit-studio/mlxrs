@@ -66,7 +66,10 @@ use std::{
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{Error, Result},
+  error::{
+    DurabilityWarningPayload, EmptyInputPayload, Error, FileIoPayload, FileOp,
+    InvariantViolationPayload, Result,
+  },
 };
 
 /// Upper bound on a `config.json` we will read into memory, mirroring
@@ -190,9 +193,8 @@ impl Config {
   /// the codebase's config-parse error convention (twin of
   /// `embeddings::config`'s `serde_json::from_str(..).map_err(Backend)`).
   pub fn from_json(json: &str) -> Result<Config> {
-    serde_json::from_str(json).map_err(|e| Error::Backend {
-      message: format!("invalid model config JSON: {e}"),
-    })
+    serde_json::from_str(json)
+      .map_err(|e| Error::Backend(format!("invalid model config JSON: {e}")))
   }
 }
 
@@ -279,23 +281,19 @@ pub fn load_weights(dir: &Path) -> Result<Weights> {
     }
     #[cfg(not(feature = "gguf"))]
     {
-      return Err(Error::Backend {
-        message: format!(
-          "found a GGUF weight file ({}) but the `gguf` feature is disabled; \
+      return Err(Error::Backend(format!(
+        "found a GGUF weight file ({}) but the `gguf` feature is disabled; \
            enable it to load GGUF checkpoints",
-          gguf.display()
-        ),
-      });
+        gguf.display()
+      )));
     }
   }
 
-  Err(Error::Backend {
-    message: format!(
-      "no model weights found in {}: expected `model.safetensors.index.json`, \
+  Err(Error::Backend(format!(
+    "no model weights found in {}: expected `model.safetensors.index.json`, \
        `model.safetensors`, `weights.safetensors`, or a single `*.gguf`",
-      dir.display()
-    ),
-  })
+    dir.display()
+  )))
 }
 
 /// Load a checkpoint via its `model.safetensors.index.json`, if present.
@@ -327,20 +325,20 @@ fn load_via_index(dir: &Path) -> Result<Option<Weights>> {
     return Ok(None);
   };
 
-  let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|e| Error::Backend {
-    message: format!(
+  let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+    Error::Backend(format!(
       "model weight index {} is not valid JSON: {e}",
       index_path.display()
-    ),
+    ))
   })?;
   let weight_map = parsed
     .get("weight_map")
     .and_then(|v| v.as_object())
-    .ok_or_else(|| Error::Backend {
-      message: format!(
+    .ok_or_else(|| {
+      Error::Backend(format!(
         "model weight index {} is missing a `weight_map` object",
         index_path.display()
-      ),
+      ))
     })?;
 
   // Collect the UNIQUE shard filenames from the index (a `BTreeSet` so the
@@ -351,12 +349,12 @@ fn load_via_index(dir: &Path) -> Result<Option<Weights>> {
   // bare basenames living in the same directory).
   let mut shard_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
   for (weight_key, shard_value) in weight_map {
-    let shard = shard_value.as_str().ok_or_else(|| Error::Backend {
-      message: format!(
+    let shard = shard_value.as_str().ok_or_else(|| {
+      Error::Backend(format!(
         "model weight index {}: `weight_map[{}]` is not a string",
         index_path.display(),
         weight_key
-      ),
+      ))
     })?;
     if shard.is_empty()
       || shard.contains('/')
@@ -364,14 +362,12 @@ fn load_via_index(dir: &Path) -> Result<Option<Weights>> {
       || shard == "."
       || shard == ".."
     {
-      return Err(Error::Backend {
-        message: format!(
-          "model weight index {}: `weight_map[{}]` -> {shard:?} is not a bare \
+      return Err(Error::Backend(format!(
+        "model weight index {}: `weight_map[{}]` -> {shard:?} is not a bare \
            shard basename (must live in the same directory as the index)",
-          index_path.display(),
-          weight_key,
-        ),
-      });
+        index_path.display(),
+        weight_key,
+      )));
     }
     shard_names.insert(shard);
   }
@@ -380,13 +376,11 @@ fn load_via_index(dir: &Path) -> Result<Option<Weights>> {
   for shard in &shard_names {
     let shard_path = dir.join(shard);
     if !path_is_file(&shard_path)? {
-      return Err(Error::Backend {
-        message: format!(
-          "model weight index {} lists shard {shard:?} but {} is missing",
-          index_path.display(),
-          shard_path.display(),
-        ),
-      });
+      return Err(Error::Backend(format!(
+        "model weight index {} lists shard {shard:?} but {} is missing",
+        index_path.display(),
+        shard_path.display(),
+      )));
     }
     let part = crate::io::load_safetensors(&shard_path)?;
     weights.extend(part);
@@ -404,9 +398,10 @@ fn path_is_file(path: &Path) -> Result<bool> {
   match std::fs::metadata(path) {
     Ok(m) => Ok(m.is_file()),
     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-    Err(e) => Err(Error::Backend {
-      message: format!("cannot stat {}: {e}", path.display()),
-    }),
+    Err(e) => Err(Error::Backend(format!(
+      "cannot stat {}: {e}",
+      path.display()
+    ))),
   }
 }
 
@@ -415,13 +410,23 @@ fn path_is_file(path: &Path) -> Result<bool> {
 /// directory / permission) maps to [`Error::Backend`]. Only regular files
 /// are considered (a directory named `model….safetensors` is ignored).
 fn collect_sorted(dir: &Path, pred: impl Fn(&str) -> bool) -> Result<Vec<std::path::PathBuf>> {
-  let entries = std::fs::read_dir(dir).map_err(|e| Error::Backend {
-    message: format!("cannot read model directory {}: {e}", dir.display()),
+  let entries = std::fs::read_dir(dir).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "cannot read model directory",
+      FileOp::Read,
+      dir.to_path_buf(),
+      e,
+    ))
   })?;
   let mut out = Vec::new();
   for entry in entries {
-    let entry = entry.map_err(|e| Error::Backend {
-      message: format!("cannot read an entry of {}: {e}", dir.display()),
+    let entry = entry.map_err(|e| {
+      Error::FileIo(FileIoPayload::new(
+        "cannot read an entry of",
+        FileOp::Read,
+        dir.to_path_buf(),
+        e,
+      ))
     })?;
     let name = entry.file_name();
     let Some(name) = name.to_str() else { continue };
@@ -441,9 +446,11 @@ fn collect_sorted(dir: &Path, pred: impl Fn(&str) -> bool) -> Result<Vec<std::pa
       Ok(m) if m.is_file() => out.push(entry.path()),
       Ok(_) => continue,
       Err(e) => {
-        return Err(Error::Backend {
-          message: format!("cannot stat {} in {}: {e}", name, dir.display()),
-        });
+        return Err(Error::Backend(format!(
+          "cannot stat {} in {}: {e}",
+          name,
+          dir.display()
+        )));
       }
     }
   }
@@ -490,12 +497,10 @@ fn collect_sorted(dir: &Path, pred: impl Fn(&str) -> bool) -> Result<Vec<std::pa
 pub fn load_config(dir: &Path) -> Result<(Config, String)> {
   let path = dir.join("config.json");
   let Some(text) = read_bounded_config_file(&path, "model config")? else {
-    return Err(Error::Backend {
-      message: format!(
-        "cannot open model config {}: file not found",
-        path.display()
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "cannot open model config {}: file not found",
+      path.display()
+    )));
   };
   let mut config = Config::from_json(&text)?;
 
@@ -563,42 +568,43 @@ fn read_bounded_text_file(path: &Path, label: &str, max_bytes: u64) -> Result<Op
     Ok(f) => f,
     Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
     Err(e) => {
-      return Err(Error::Backend {
-        message: format!("cannot open {label} {}: {e}", path.display()),
-      });
+      return Err(Error::Backend(format!(
+        "cannot open {label} {}: {e}",
+        path.display()
+      )));
     }
   };
 
-  let meta = file.metadata().map_err(|e| Error::Backend {
-    message: format!("cannot stat opened {label} {}: {e}", path.display()),
+  let meta = file.metadata().map_err(|e| {
+    Error::Backend(format!(
+      "cannot stat opened {label} {}: {e}",
+      path.display()
+    ))
   })?;
   if !meta.is_file() {
-    return Err(Error::Backend {
-      message: format!(
-        "{label} {} is not a regular file; refusing to read",
-        path.display()
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "{label} {} is not a regular file; refusing to read",
+      path.display()
+    )));
   }
 
   let mut bytes = Vec::new();
   file
     .take(max_bytes + 1)
     .read_to_end(&mut bytes)
-    .map_err(|e| Error::Backend {
-      message: format!("cannot read {label} {}: {e}", path.display()),
-    })?;
+    .map_err(|e| Error::Backend(format!("cannot read {label} {}: {e}", path.display())))?;
   if bytes.len() as u64 > max_bytes {
-    return Err(Error::Backend {
-      message: format!(
-        "{label} {} exceeds the {max_bytes}-byte cap; refusing to read",
-        path.display(),
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "{label} {} exceeds the {max_bytes}-byte cap; refusing to read",
+      path.display(),
+    )));
   }
 
-  let text = String::from_utf8(bytes).map_err(|e| Error::Backend {
-    message: format!("{label} {} is not valid UTF-8: {e}", path.display()),
+  let text = String::from_utf8(bytes).map_err(|e| {
+    Error::Backend(format!(
+      "{label} {} is not valid UTF-8: {e}",
+      path.display()
+    ))
   })?;
   Ok(Some(text))
 }
@@ -718,9 +724,8 @@ pub fn load_tokenizer_with_eos(
   eos_token_id: Option<&EosTokenId>,
 ) -> Result<crate::tokenizer::Tokenizer> {
   let resolved_eos = eos_token_id.cloned().map(EosTokenId::into_ids);
-  crate::tokenizer::Tokenizer::from_path(dir, resolved_eos.as_deref()).map_err(|e| Error::Backend {
-    message: format!("cannot load tokenizer from {}: {e}", dir.display()),
-  })
+  crate::tokenizer::Tokenizer::from_path(dir, resolved_eos.as_deref())
+    .map_err(|e| Error::Backend(format!("cannot load tokenizer from {}: {e}", dir.display())))
 }
 
 // ───────────────────────────── save side ─────────────────────────────
@@ -902,19 +907,17 @@ pub fn get_total_parameters(
     if let Some(path) = key.strip_suffix(".weight") {
       let scales_key = format!("{path}.scales");
       if weights.contains_key(&scales_key) {
-        let q = quant.quantization_for(path).ok_or_else(|| Error::Backend {
-          message: format!(
+        let q = quant.quantization_for(path).ok_or_else(|| {
+          Error::Backend(format!(
             "get_total_parameters: quantized layer {path:?} (has `.scales`) \
              but no quantization params for it in the config"
-          ),
+          ))
         })?;
         if q.bits <= 0 {
-          return Err(Error::Backend {
-            message: format!(
-              "get_total_parameters: quantized layer {path:?} has non-positive bits {}",
-              q.bits
-            ),
-          });
+          return Err(Error::Backend(format!(
+            "get_total_parameters: quantized layer {path:?} has non-positive bits {}",
+            q.bits
+          )));
         }
         // `weight.size * 32 // bits` (`utils.py:204`), in `u64` so a large
         // packed matrix cannot overflow the multiply on a 32-bit host.
@@ -957,12 +960,12 @@ pub fn get_total_parameters(
       // (an unresolvable quantized layer is the same configuration error
       // there; HashMap iteration may reach `.biases` first, so error
       // here too rather than relying on the `.weight` visit).
-      let q = quant.quantization_for(path).ok_or_else(|| Error::Backend {
-        message: format!(
+      let q = quant.quantization_for(path).ok_or_else(|| {
+        Error::Backend(format!(
           "get_total_parameters: quantized layer {path:?} (has `.weight` \
            + `.scales` + `.biases`) but no quantization params for it in \
            the config"
-        ),
+        ))
       })?;
       match q.mode {
         // Affine zero-point buffer — metadata, skip (do not count).
@@ -970,14 +973,12 @@ pub fn get_total_parameters(
         // mxfp4 / mxfp8 / nvfp4 carry no `.biases`; a present one means
         // an invalid checkpoint — flag it, do not silently drop it.
         QuantMode::Mxfp4 | QuantMode::Mxfp8 | QuantMode::Nvfp4 => {
-          return Err(Error::Backend {
-            message: format!(
-              "get_total_parameters: layer {path:?} is quantized with \
+          return Err(Error::Backend(format!(
+            "get_total_parameters: layer {path:?} is quantized with \
                scale-only mode `{}`, which has no `.biases` buffer, yet a \
                `{key}` tensor is present — invalid checkpoint",
-              q.mode.as_str()
-            ),
-          });
+            q.mode.as_str()
+          )));
         }
       }
     }
@@ -1014,9 +1015,9 @@ pub fn compute_bits_per_weight(
   }
   let model_params = get_total_parameters(weights, quant)?;
   if model_params == 0 {
-    return Err(Error::Backend {
-      message: "compute_bits_per_weight: model has zero parameters".into(),
-    });
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "compute_bits_per_weight: model parameters",
+    )));
   }
   Ok(model_bytes as f64 * 8.0 / model_params as f64)
 }
@@ -1346,11 +1347,13 @@ pub fn save_model(
   quant: &crate::lm::quant::PerLayerQuantization,
 ) -> Result<CommitOutcome> {
   // 1. `save_path.mkdir(parents=True, exist_ok=True)` (`utils.py:723`).
-  std::fs::create_dir_all(save_path).map_err(|e| Error::Backend {
-    message: format!(
-      "save_model: cannot create directory {}: {e}",
-      save_path.display()
-    ),
+  std::fs::create_dir_all(save_path).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save_model: cannot create directory",
+      FileOp::Create,
+      save_path.to_path_buf(),
+      e,
+    ))
   })?;
 
   // Capture a collision-resistant generation id ONCE up front so every
@@ -1528,9 +1531,7 @@ pub fn save_model(
         if let Some((index_tmp, _)) = &staged_index {
           let _ = std::fs::remove_file(index_tmp);
         }
-        return Err(Error::ShardPathCollision {
-          path: final_path.clone(),
-        });
+        return Err(Error::ShardPathCollision(final_path.clone()));
       }
       Err(e) => {
         // Clean every still-unpublished shard tempfile + the staged
@@ -1541,13 +1542,11 @@ pub fn save_model(
         if let Some((index_tmp, _)) = &staged_index {
           let _ = std::fs::remove_file(index_tmp);
         }
-        return Err(Error::Backend {
-          message: format!(
-            "save_model: cannot hard_link shard {} -> {}: {e}",
-            tmp.display(),
-            final_path.display()
-          ),
-        });
+        return Err(Error::Backend(format!(
+          "save_model: cannot hard_link shard {} -> {}: {e}",
+          tmp.display(),
+          final_path.display()
+        )));
       }
     }
   }
@@ -1564,11 +1563,13 @@ pub fn save_model(
   //        rename), so a failure here is a genuine pre-commit error and
   //        propagates as `Err`. The post-commit fsync (b') is the one
   //        that gets demoted to a `CommitOutcome` warning.
-  fsync_dir(save_path).map_err(|e| Error::Backend {
-    message: format!(
-      "save_model: fsync parent directory {} after shard publish failed: {e}",
-      save_path.display()
-    ),
+  fsync_dir(save_path).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save_model: fsync parent directory",
+      FileOp::Fsync,
+      save_path.to_path_buf(),
+      e,
+    ))
   })?;
 
   //    b. Atomically rename the staged index over
@@ -1599,22 +1600,18 @@ pub fn save_model(
     && e.kind() != std::io::ErrorKind::NotFound
   {
     let _ = std::fs::remove_file(index_tmp);
-    return Err(Error::Backend {
-      message: format!(
-        "save_model: cannot stat index final path {} before rename: {e}",
-        index_final.display()
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "save_model: cannot stat index final path {} before rename: {e}",
+      index_final.display()
+    )));
   }
   if let Err(e) = std::fs::rename(index_tmp, index_final) {
     let _ = std::fs::remove_file(index_tmp);
-    return Err(Error::Backend {
-      message: format!(
-        "save_model: cannot rename index {} -> {}: {e}",
-        index_tmp.display(),
-        index_final.display()
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "save_model: cannot rename index {} -> {}: {e}",
+      index_tmp.display(),
+      index_final.display()
+    )));
   }
 
   //    b'. fsync the parent directory again so the index rename — THE
@@ -1678,11 +1675,11 @@ fn open_excl_temp_shard(final_path: &Path) -> Result<(std::fs::File, PathBuf)> {
   let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
   let file_name = final_path
     .file_name()
-    .ok_or_else(|| Error::Backend {
-      message: format!(
+    .ok_or_else(|| {
+      Error::Backend(format!(
         "save: destination {} has no file_name component",
         final_path.display()
-      ),
+      ))
     })?
     .to_string_lossy()
     .into_owned();
@@ -1713,23 +1710,19 @@ fn open_excl_temp_shard(final_path: &Path) -> Result<(std::fs::File, PathBuf)> {
         continue;
       }
       Err(e) => {
-        return Err(Error::Backend {
-          message: format!(
-            "save: create_new tempfile {} failed: {e}",
-            candidate.display()
-          ),
-        });
+        return Err(Error::Backend(format!(
+          "save: create_new tempfile {} failed: {e}",
+          candidate.display()
+        )));
       }
     }
   }
-  Err(Error::Backend {
-    message: format!(
-      "save: exhausted {MAX_RETRIES} tempfile retries (last error: {})",
-      last_err
-        .map(|e| e.to_string())
-        .unwrap_or_else(|| "<none>".into())
-    ),
-  })
+  Err(Error::Backend(format!(
+    "save: exhausted {MAX_RETRIES} tempfile retries (last error: {})",
+    last_err
+      .map(|e| e.to_string())
+      .unwrap_or_else(|| "<none>".into())
+  )))
 }
 
 /// fsync `path` so its bytes are durable on disk before it is renamed into
@@ -1767,8 +1760,13 @@ pub(crate) fn fsync_path(path: &Path) -> Result<()> {
   // (test-only) injector both produce a single canonical io::Error which
   // we then wrap in [`Error::Backend`] (string-collapsing the kind — the
   // historic API shape for callers that want the crate-wide Error type).
-  fsync_path_inner(path).map_err(|e| Error::Backend {
-    message: format!("save: fsync tempfile {} failed: {e}", path.display()),
+  fsync_path_inner(path).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save: fsync tempfile",
+      FileOp::Fsync,
+      path.to_path_buf(),
+      e,
+    ))
   })
 }
 
@@ -1809,8 +1807,13 @@ pub(crate) fn fsync_path_io(path: &Path) -> std::io::Result<()> {
 /// to the natural `sync_all` call, which will then return the OS's real
 /// error on the now-stale fd).
 pub(crate) fn fsync_open_file_for_path(file: &std::fs::File, path: &Path) -> Result<()> {
-  fsync_open_file_for_path_inner(file, path).map_err(|e| Error::Backend {
-    message: format!("save: fsync tempfile {} failed: {e}", path.display()),
+  fsync_open_file_for_path_inner(file, path).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save: fsync tempfile",
+      FileOp::Fsync,
+      path.to_path_buf(),
+      e,
+    ))
   })
 }
 
@@ -2201,10 +2204,9 @@ pub fn save_config(config: &str, config_path: &Path) -> Result<()> {
   let staged = stage_config(config, config_path)?;
   match commit_staged_config(staged, config_path)? {
     CommitOutcome::Committed => Ok(()),
-    CommitOutcome::CommittedWithDurabilityWarning(source) => Err(Error::DurabilityWarning {
-      committed: true,
-      source,
-    }),
+    CommitOutcome::CommittedWithDurabilityWarning(source) => Err(Error::DurabilityWarning(
+      DurabilityWarningPayload::new(true, source),
+    )),
   }
 }
 
@@ -2247,13 +2249,13 @@ impl Drop for StagedConfig {
 /// body is an [`Error::Backend`] surfaced here (before any IO failure can
 /// destroy a still-valid checkpoint).
 fn stage_config(config: &str, config_path: &Path) -> Result<StagedConfig> {
-  let value: serde_json::Value = serde_json::from_str(config).map_err(|e| Error::Backend {
-    message: format!("save_config: config is not valid JSON: {e}"),
-  })?;
+  let value: serde_json::Value = serde_json::from_str(config)
+    .map_err(|e| Error::Backend(format!("save_config: config is not valid JSON: {e}")))?;
   let serde_json::Value::Object(mut map) = value else {
-    return Err(Error::Backend {
-      message: "save_config: config JSON must be an object".into(),
-    });
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "save_config: config JSON",
+      "must be an object",
+    )));
   };
 
   // Clean unused keys (`utils.py:912-913`).
@@ -2269,8 +2271,10 @@ fn stage_config(config: &str, config_path: &Path) -> Result<StagedConfig> {
   // `preserve_order` feature is on workspace-wide for `minijinja`), so a
   // `BTreeMap` round-trip is the explicit sort.
   let sorted: BTreeMap<String, serde_json::Value> = map.into_iter().collect();
-  let sorted_value = serde_json::to_value(sorted).map_err(|e| Error::Backend {
-    message: format!("save_config: cannot re-serialize sorted config: {e}"),
+  let sorted_value = serde_json::to_value(sorted).map_err(|e| {
+    Error::Backend(format!(
+      "save_config: cannot re-serialize sorted config: {e}"
+    ))
   })?;
 
   let (mut tmp_file, tmp_path) = open_excl_temp_shard(config_path)?;
@@ -2304,13 +2308,11 @@ fn stage_config(config: &str, config_path: &Path) -> Result<StagedConfig> {
 fn commit_staged_config(mut staged: StagedConfig, config_path: &Path) -> Result<CommitOutcome> {
   if let Err(e) = std::fs::rename(&staged.tmp_path, config_path) {
     // Leave `cleanup_on_drop = true` so `Drop` removes the tempfile.
-    return Err(Error::Backend {
-      message: format!(
-        "save_config: cannot rename {} -> {}: {e}",
-        staged.tmp_path.display(),
-        config_path.display()
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "save_config: cannot rename {} -> {}: {e}",
+      staged.tmp_path.display(),
+      config_path.display()
+    )));
   }
   // The rename consumed the tempfile (it IS now `config_path`); the
   // tempfile path no longer exists, so don't try to `unlink` it on Drop.
@@ -2427,11 +2429,13 @@ pub fn save(
   // 1. Create the destination directory up front so step 2's same-dir
   //    tempfile open can land in it even on a brand-new destination.
   //    `save_model` would otherwise be the first step to create it.
-  std::fs::create_dir_all(dst_path).map_err(|e| Error::Backend {
-    message: format!(
-      "save: cannot create destination directory {}: {e}",
-      dst_path.display()
-    ),
+  std::fs::create_dir_all(dst_path).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save: cannot create destination directory",
+      FileOp::Create,
+      dst_path.to_path_buf(),
+      e,
+    ))
   })?;
 
   // 2. Validate + stage the config FIRST so an invalid JSON aborts BEFORE
@@ -2477,10 +2481,9 @@ pub fn save(
   //    didn't return success. A successful `Ok(())` therefore means
   //    "fully durable".
   if let Some(source) = durability {
-    return Err(Error::DurabilityWarning {
-      committed: true,
-      source,
-    });
+    return Err(Error::DurabilityWarning(DurabilityWarningPayload::new(
+      true, source,
+    )));
   }
   Ok(())
 }
@@ -2508,12 +2511,11 @@ fn write_json_pretty(
   let mut buf = Vec::new();
   let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
   let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
-  serde::Serialize::serialize(value, &mut ser).map_err(|e| Error::Backend {
-    message: format!("{label}: cannot serialize JSON: {e}"),
-  })?;
-  file.write_all(&buf).map_err(|e| Error::Backend {
-    message: format!("{label}: cannot write JSON body: {e}"),
-  })?;
+  serde::Serialize::serialize(value, &mut ser)
+    .map_err(|e| Error::Backend(format!("{label}: cannot serialize JSON: {e}")))?;
+  file
+    .write_all(&buf)
+    .map_err(|e| Error::Backend(format!("{label}: cannot write JSON body: {e}")))?;
   Ok(())
 }
 
@@ -2525,9 +2527,8 @@ fn write_json_pretty(
 /// [`open_excl_temp_shard`] and keeps the fd through to publish.
 #[cfg(test)]
 fn write_json_pretty_to_path(path: &Path, value: &serde_json::Value, label: &str) -> Result<()> {
-  let mut f = std::fs::File::create(path).map_err(|e| Error::Backend {
-    message: format!("{label}: cannot create {}: {e}", path.display()),
-  })?;
+  let mut f = std::fs::File::create(path)
+    .map_err(|e| Error::Backend(format!("{label}: cannot create {}: {e}", path.display())))?;
   write_json_pretty(&mut f, value, label)
 }
 
@@ -2768,7 +2769,7 @@ mod save_tests {
     );
     // No global default, no per-layer override → unresolvable.
     let err = get_total_parameters(&w, &PerLayerQuantization::default());
-    assert!(matches!(err, Err(Error::Backend { .. })));
+    assert!(matches!(err, Err(Error::Backend(_))));
   }
 
   // ─────────────────────── compute_bits_per_weight ───────────────────────
@@ -2825,7 +2826,7 @@ mod save_tests {
   fn compute_bits_per_weight_zero_params_errors() {
     let w: Weights = HashMap::new();
     let err = compute_bits_per_weight(&w, &PerLayerQuantization::default());
-    assert!(matches!(err, Err(Error::Backend { .. })));
+    assert!(matches!(err, Err(Error::Backend(_))));
   }
 
   // ─────────────────── does_model_support_input_embeddings ───────────────
@@ -3170,9 +3171,9 @@ mod save_tests {
   fn save_config_rejects_non_object_json() {
     let dir = fresh_dir("save-config-bad");
     let err = save_config("[1, 2, 3]", &dir.join("config.json"));
-    assert!(matches!(err, Err(Error::Backend { .. })));
+    assert!(matches!(err, Err(Error::Backend(_))));
     let err2 = save_config("not json at all", &dir.join("config.json"));
-    assert!(matches!(err2, Err(Error::Backend { .. })));
+    assert!(matches!(err2, Err(Error::Backend(_))));
     let _ = std::fs::remove_dir_all(&dir);
   }
 
@@ -3866,7 +3867,7 @@ mod save_tests {
     .unwrap();
 
     let r = load_weights(&dir);
-    let Err(Error::Backend { message }) = r else {
+    let Err(Error::Backend(message)) = r else {
       panic!("a missing indexed shard must be an Error::Backend, got {r:?}");
     };
     assert!(
@@ -3896,7 +3897,7 @@ mod save_tests {
     .unwrap();
 
     let r = load_weights(&dir);
-    let Err(Error::Backend { message }) = r else {
+    let Err(Error::Backend(message)) = r else {
       panic!("a path-traversal shard name must be an Error::Backend, got {r:?}");
     };
     assert!(
@@ -3919,7 +3920,7 @@ mod save_tests {
     )
     .unwrap();
     let r = load_weights(&dir);
-    assert!(matches!(r, Err(Error::Backend { .. })));
+    assert!(matches!(r, Err(Error::Backend(_))));
 
     let _ = std::fs::remove_dir_all(&dir);
   }
@@ -3931,7 +3932,7 @@ mod save_tests {
   fn load_weights_empty_dir_errors_listing_layouts() {
     let dir = fresh_dir("load-empty");
     let r = load_weights(&dir);
-    let Err(Error::Backend { message }) = r else {
+    let Err(Error::Backend(message)) = r else {
       panic!("an empty dir must be an Error::Backend, got {r:?}");
     };
     // Lists each resolver tier.
@@ -4381,12 +4382,12 @@ mod save_tests {
       });
       let err = get_total_parameters(&w, &quant);
       assert!(
-        matches!(err, Err(Error::Backend { .. })),
+        matches!(err, Err(Error::Backend(_))),
         "a `.biases` under scale-only `{}` must be an Error::Backend, got {err:?}",
         mode.as_str()
       );
       // The error names the offending layer and mode.
-      if let Err(Error::Backend { message }) = err {
+      if let Err(Error::Backend(message)) = err {
         assert!(
           message.contains("q_proj") && message.contains(mode.as_str()),
           "error should name the layer + the scale-only mode, got: {message}"
@@ -4504,7 +4505,7 @@ mod save_tests {
     //    offending path — the atomic no-replace `hard_link` mapped
     //    `ErrorKind::AlreadyExists` to this variant.
     match r {
-      Err(Error::ShardPathCollision { path }) => {
+      Err(Error::ShardPathCollision(path)) => {
         assert_eq!(
           path, collision_path,
           "the collision error names the planted path"
@@ -4564,7 +4565,7 @@ mod save_tests {
   /// test ALSO asserts no-tempfile-leak + no-NEW-index-commit, which
   /// the original does not.) Contract:
   ///
-  /// 1. `save_model` returns `Err(Error::ShardPathCollision { path })`
+  /// 1. `save_model` returns `Err(Error::ShardPathCollision(path))`
   ///    naming the planted path.
   /// 2. The planted file is byte-identical — `hard_link` cannot
   ///    overwrite, so no bytes are clobbered.
@@ -4596,7 +4597,7 @@ mod save_tests {
 
     // (1) `Err(ShardPathCollision { path: final_shard })`.
     match r {
-      Err(Error::ShardPathCollision { path }) => {
+      Err(Error::ShardPathCollision(path)) => {
         assert_eq!(
           path, final_shard,
           "collision error names the planted (racer) path"
@@ -4767,14 +4768,17 @@ mod save_tests {
 
     // (1) save's final return is `Err(DurabilityWarning{committed:true})`.
     match r {
-      Err(Error::DurabilityWarning { committed, source }) => {
+      Err(Error::DurabilityWarning(p)) => {
         assert!(
-          committed,
+          p.committed(),
           "save's DurabilityWarning must carry committed=true"
         );
         assert!(
-          source.to_string().contains("injected fsync_dir failure"),
-          "the underlying io::Error must be preserved: got {source}"
+          p.source()
+            .to_string()
+            .contains("injected fsync_dir failure"),
+          "the underlying io::Error must be preserved: got {}",
+          p.source()
         );
       }
       other => panic!("expected Err(DurabilityWarning), got {other:?}"),

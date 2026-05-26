@@ -201,7 +201,7 @@ fn apply_rejects_shape_count_mismatch() {
     .apply(&[&input], &cfg)
     .expect_err("declared 1 output_name but supplied 2 output_shapes");
   match err {
-    mlxrs::Error::ShapeMismatch { message } => {
+    mlxrs::Error::ShapeMismatch(message) => {
       assert!(
         message.contains("output_shapes.len()=2"),
         "got: {message:?}"

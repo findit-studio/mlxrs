@@ -168,19 +168,17 @@ const MAX_DECODED_IMAGE_BYTES: usize = 512 * 1024 * 1024;
 /// exceeds [`MAX_DECODED_IMAGE_BYTES`]; the message carries `what` and the
 /// offending byte count.
 fn checked_buffer_bytes(elems: usize, elem_size: usize, what: &str) -> Result<usize> {
-  let bytes = elems
-    .checked_mul(elem_size)
-    .ok_or_else(|| Error::ShapeMismatch {
-      message: format!("resize: {what} size overflows usize ({elems} elems * {elem_size} B/elem)"),
-    })?;
+  let bytes = elems.checked_mul(elem_size).ok_or_else(|| {
+    Error::ShapeMismatch(format!(
+      "resize: {what} size overflows usize ({elems} elems * {elem_size} B/elem)"
+    ))
+  })?;
   if bytes > MAX_DECODED_IMAGE_BYTES {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "resize: {what} needs {bytes} bytes, exceeds \
+    return Err(Error::ShapeMismatch(format!(
+      "resize: {what} needs {bytes} bytes, exceeds \
          MAX_DECODED_IMAGE_BYTES={MAX_DECODED_IMAGE_BYTES} \
          ({elems} elems * {elem_size} B/elem)"
-      ),
-    });
+    )));
   }
   Ok(bytes)
 }
@@ -284,9 +282,9 @@ fn precompute_coeffs(in_size: usize, out_size: usize, filter: Filter) -> Result<
   // would divide by zero in `scale`, a zero `in_size` makes the window
   // empty.
   if in_size == 0 || out_size == 0 {
-    return Err(Error::ShapeMismatch {
-      message: format!("precompute_coeffs: in_size={in_size} out_size={out_size} must be non-zero"),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "precompute_coeffs: in_size={in_size} out_size={out_size} must be non-zero"
+    )));
   }
   let scale = in_size as f64 / out_size as f64;
   let filterscale = if scale < 1.0 { 1.0 } else { scale };
@@ -297,8 +295,10 @@ fn precompute_coeffs(in_size: usize, out_size: usize, filter: Filter) -> Result<
   let ksize_unclamped = (support.ceil() as usize)
     .checked_mul(2)
     .and_then(|v| v.checked_add(1))
-    .ok_or_else(|| Error::ShapeMismatch {
-      message: format!("precompute_coeffs: ksize overflows for support={support}"),
+    .ok_or_else(|| {
+      Error::ShapeMismatch(format!(
+        "precompute_coeffs: ksize overflows for support={support}"
+      ))
     })?;
   let ksize = ksize_unclamped.min(in_size.max(1));
 
@@ -318,11 +318,11 @@ fn precompute_coeffs(in_size: usize, out_size: usize, filter: Filter) -> Result<
   // `131072`-wide output with a stretched downscale support could
   // otherwise reserve a multi-GiB coefficient table that
   // `try_reserve_exact` cannot bound on an overcommitting allocator.
-  let weight_len = out_size
-    .checked_mul(ksize)
-    .ok_or_else(|| Error::ShapeMismatch {
-      message: format!("precompute_coeffs: out_size*ksize overflows for {out_size}*{ksize}"),
-    })?;
+  let weight_len = out_size.checked_mul(ksize).ok_or_else(|| {
+    Error::ShapeMismatch(format!(
+      "precompute_coeffs: out_size*ksize overflows for {out_size}*{ksize}"
+    ))
+  })?;
   checked_buffer_bytes(
     weight_len,
     std::mem::size_of::<i32>(),
@@ -447,25 +447,23 @@ pub(crate) fn resize_rgba8(
   filter: Filter,
 ) -> Result<Vec<u8>> {
   if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "resize_rgba8: dimensions must be non-zero, got src {src_w}x{src_h} dst {dst_w}x{dst_h}"
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "resize_rgba8: dimensions must be non-zero, got src {src_w}x{src_h} dst {dst_w}x{dst_h}"
+    )));
   }
   let src_len = src_w
     .checked_mul(src_h)
     .and_then(|v| v.checked_mul(CHANNELS))
-    .ok_or_else(|| Error::ShapeMismatch {
-      message: format!("resize_rgba8: src_w*src_h*4 overflows usize for {src_w}x{src_h}"),
+    .ok_or_else(|| {
+      Error::ShapeMismatch(format!(
+        "resize_rgba8: src_w*src_h*4 overflows usize for {src_w}x{src_h}"
+      ))
     })?;
   if src.len() != src_len {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "resize_rgba8: src buffer is {} bytes, expected src_w*src_h*4={src_len} for {src_w}x{src_h}",
-        src.len()
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "resize_rgba8: src buffer is {} bytes, expected src_w*src_h*4={src_len} for {src_w}x{src_h}",
+      src.len()
+    )));
   }
   // Cap the source against the 512 MiB budget too: `src` is borrowed (not
   // allocated here), but the premultiplied copy below is `src.len()` bytes
@@ -475,8 +473,10 @@ pub(crate) fn resize_rgba8(
   let dst_len = dst_w
     .checked_mul(dst_h)
     .and_then(|v| v.checked_mul(CHANNELS))
-    .ok_or_else(|| Error::ShapeMismatch {
-      message: format!("resize_rgba8: dst_w*dst_h*4 overflows usize for {dst_w}x{dst_h}"),
+    .ok_or_else(|| {
+      Error::ShapeMismatch(format!(
+        "resize_rgba8: dst_w*dst_h*4 overflows usize for {dst_w}x{dst_h}"
+      ))
     })?;
   // Cap the destination against the 512 MiB budget. The public `resize`
   // wrapper already bounds it, but `resize_rgba8` is `pub(crate)` and may
@@ -530,8 +530,10 @@ pub(crate) fn resize_rgba8(
   let inter_len = src_h
     .checked_mul(dst_w)
     .and_then(|v| v.checked_mul(CHANNELS))
-    .ok_or_else(|| Error::ShapeMismatch {
-      message: format!("resize_rgba8: src_h*dst_w*4 overflows usize for {src_h}x{dst_w}"),
+    .ok_or_else(|| {
+      Error::ShapeMismatch(format!(
+        "resize_rgba8: src_h*dst_w*4 overflows usize for {src_h}x{dst_w}"
+      ))
     })?;
   checked_buffer_bytes(
     inter_len,
@@ -1114,7 +1116,7 @@ mod tests {
         Filter::Bilinear,
       );
       assert!(
-        matches!(r, Err(Error::ShapeMismatch { .. })),
+        matches!(r, Err(Error::ShapeMismatch(_))),
         "zero dim {sw}x{sh}->{dw}x{dh} must be ShapeMismatch, got {r:?}"
       );
     }
@@ -1126,7 +1128,7 @@ mod tests {
     // panic / OOB read).
     let src = [0u8; 4]; // claims 4 bytes but we say 2x2 (needs 16)
     let r = resize_rgba8(&src, 2, 2, 1, 1, Filter::Bilinear);
-    assert!(matches!(r, Err(Error::ShapeMismatch { .. })), "got {r:?}");
+    assert!(matches!(r, Err(Error::ShapeMismatch(_))), "got {r:?}");
   }
 
   #[test]
@@ -1136,7 +1138,7 @@ mod tests {
     let src = [0u8; 4];
     let big = usize::MAX / 2 + 1;
     let r = resize_rgba8(&src, 1, 1, big, big, Filter::Bilinear);
-    assert!(matches!(r, Err(Error::ShapeMismatch { .. })), "got {r:?}");
+    assert!(matches!(r, Err(Error::ShapeMismatch(_))), "got {r:?}");
   }
 
   #[test]
@@ -1155,12 +1157,12 @@ mod tests {
     for f in [Filter::Bilinear, Filter::Bicubic, Filter::Lanczos3] {
       let r = resize_rgba8(&src, 1, 131072, 131072, 1, f);
       assert!(
-        matches!(r, Err(Error::ShapeMismatch { .. })),
+        matches!(r, Err(Error::ShapeMismatch(_))),
         "{f:?}: 1x131072->131072x1 must reject the ~68 GiB intermediate, got {r:?}"
       );
       // The message must name the intermediate + its byte count so the
       // failure is diagnosable.
-      if let Err(Error::ShapeMismatch { message }) = &r {
+      if let Err(Error::ShapeMismatch(message)) = &r {
         assert!(
           message.contains("intermediate"),
           "{f:?}: error should name the intermediate buffer, got: {message}"
@@ -1191,7 +1193,7 @@ mod tests {
           131072 * CHANNELS,
           "{f:?}: wide->skinny output must be exactly dst_w*dst_h*4"
         ),
-        Err(Error::ShapeMismatch { .. }) => {}
+        Err(Error::ShapeMismatch(_)) => {}
         Err(other) => panic!("{f:?}: unexpected error {other:?}"),
       }
     }
@@ -1214,7 +1216,7 @@ mod tests {
     let src = vec![7u8; 131072 * CHANNELS];
     let r = resize_rgba8(&src, 1, 131072, 131072, 1, Filter::Bicubic);
     assert!(
-      matches!(r, Err(Error::ShapeMismatch { .. })),
+      matches!(r, Err(Error::ShapeMismatch(_))),
       "huge intermediate with tiny source+dest must be ShapeMismatch, got {r:?}"
     );
   }
@@ -1234,7 +1236,7 @@ mod tests {
     // `Coeffs` is not `Debug`; match the result rather than `{:?}`-ing it.
     let r = precompute_coeffs(1, 200_000_000, Filter::Bilinear);
     assert!(
-      matches!(r, Err(Error::ShapeMismatch { .. })),
+      matches!(r, Err(Error::ShapeMismatch(_))),
       "200M-wide coefficient table must exceed the 512 MiB cap (got Ok or wrong error)"
     );
     // And via the full resize: a `1x4` source upscaled to a
@@ -1246,7 +1248,7 @@ mod tests {
     let src = vec![0u8; 4 * CHANNELS];
     let r2 = resize_rgba8(&src, 1, 4, 200_000_000, 1, Filter::Bilinear);
     assert!(
-      matches!(r2, Err(Error::ShapeMismatch { .. })),
+      matches!(r2, Err(Error::ShapeMismatch(_))),
       "resize to a 200M-wide target must be ShapeMismatch, got {r2:?}"
     );
   }
@@ -1269,14 +1271,14 @@ mod tests {
     assert!(
       matches!(
         checked_buffer_bytes(MAX_DECODED_IMAGE_BYTES + 1, 1, "over"),
-        Err(Error::ShapeMismatch { .. })
+        Err(Error::ShapeMismatch(_))
       ),
       "one byte over the cap must be rejected"
     );
     assert!(
       matches!(
         checked_buffer_bytes(usize::MAX, 4, "overflow"),
-        Err(Error::ShapeMismatch { .. })
+        Err(Error::ShapeMismatch(_))
       ),
       "a product overflowing usize must be rejected (not wrap)"
     );

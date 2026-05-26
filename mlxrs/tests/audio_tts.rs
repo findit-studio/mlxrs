@@ -105,9 +105,9 @@ impl TtsModel for BadShapeModel {
 struct FailSynthModel;
 impl TtsModel for FailSynthModel {
   fn synthesize_segment(&self, _segment: &TtsSegment<'_>) -> mlxrs::Result<Array> {
-    Err(mlxrs::Error::Backend {
-      message: "mock synthesize_segment failure".into(),
-    })
+    Err(mlxrs::Error::Backend(
+      "mock synthesize_segment failure".into(),
+    ))
   }
   fn sample_rate(&self) -> u32 {
     24_000
@@ -328,7 +328,7 @@ fn join_audio_propagates_segment_error() {
   // `.err().expect()` because `TtsGenerator` is not Debug.
   let err = join_audio(&model, "boom", &cfg).expect_err("synthesize failure propagates");
   match err {
-    mlxrs::Error::Backend { message } => {
+    mlxrs::Error::Backend(message) => {
       assert!(
         message.contains("synthesize_segment failure"),
         "got {message}"
@@ -458,9 +458,9 @@ fn tts_generate_rejects_non_f32_audio_dtype() {
   let cfg = TtsGenConfig::default();
   let mut it = tts_generate(&model, "hi", &cfg).unwrap();
   match it.next().expect("an item") {
-    Err(mlxrs::Error::DtypeMismatch { expected, got }) => {
-      assert_eq!(expected, mlxrs::Dtype::F32, "f32 expected");
-      assert_eq!(got, mlxrs::Dtype::I32, "actual dtype named (i32)");
+    Err(mlxrs::Error::DtypeMismatch(p)) => {
+      assert_eq!(p.expected(), mlxrs::Dtype::F32, "f32 expected");
+      assert_eq!(p.got(), mlxrs::Dtype::I32, "actual dtype named (i32)");
     }
     other => panic!("expected DtypeMismatch, got {other:?}"),
   }
@@ -475,10 +475,7 @@ fn join_audio_rejects_non_f32_audio_dtype() {
   let model = NonF32Model;
   let cfg = TtsGenConfig::default();
   let err = join_audio(&model, "x\ny\nz", &cfg).expect_err("non-f32 audio rejected");
-  assert!(
-    matches!(err, mlxrs::Error::DtypeMismatch { .. }),
-    "got {err:?}"
-  );
+  assert!(matches!(err, mlxrs::Error::DtypeMismatch(_)), "got {err:?}");
 }
 
 /// A valid `f32` model still synthesizes successfully through the dtype guard
@@ -513,7 +510,7 @@ fn tts_generate_rejects_empty_text() {
     .err()
     .expect("empty text rejected");
   match err {
-    mlxrs::Error::Backend { message } => {
+    mlxrs::Error::Backend(message) => {
       assert!(message.contains("non-blank"), "got {message}");
     }
     other => panic!("expected Backend error, got {other:?}"),
@@ -533,7 +530,7 @@ fn tts_generate_rejects_whitespace_only_text() {
   let err = tts_generate(&model, "   \n\n  \t \n", &cfg)
     .err()
     .expect("whitespace-only text rejected");
-  assert!(matches!(err, mlxrs::Error::Backend { .. }));
+  assert!(matches!(err, mlxrs::Error::Backend(_)));
   assert!(model.seen.borrow().is_empty());
 }
 
@@ -549,7 +546,7 @@ fn tts_generate_rejects_oversized_text() {
     .err()
     .expect("oversized text rejected");
   match err {
-    mlxrs::Error::Backend { message } => {
+    mlxrs::Error::Backend(message) => {
       assert!(
         message.contains("cap"),
         "error mentions the cap, got {message}"
@@ -591,7 +588,7 @@ fn synthesize_segment_default_errors_with_clear_message() {
   let cfg = TtsGenConfig::default();
   let mut it = tts_generate(&model, "hi", &cfg).unwrap();
   match it.next().expect("an item") {
-    Err(mlxrs::Error::Backend { message }) => {
+    Err(mlxrs::Error::Backend(message)) => {
       assert!(
         message.contains("synthesize_segment"),
         "error mentions synthesize_segment, got {message}"
@@ -610,7 +607,7 @@ fn tts_generate_rejects_bad_audio_shape() {
   let cfg = TtsGenConfig::default();
   let mut it = tts_generate(&model, "hi", &cfg).unwrap();
   match it.next().expect("an item") {
-    Err(mlxrs::Error::ShapeMismatch { message }) => {
+    Err(mlxrs::Error::ShapeMismatch(message)) => {
       assert!(
         message.contains("rank-1"),
         "error mentions rank-1, got {message}"

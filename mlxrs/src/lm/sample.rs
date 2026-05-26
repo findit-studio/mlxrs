@@ -45,7 +45,7 @@
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{Error, LengthMismatchPayload, OutOfRangePayload, Result},
   ops,
 };
 
@@ -98,11 +98,11 @@ fn slice_last_axis(a: &Array, start: i32, end: i32) -> Result<Array> {
 pub fn apply_top_k(logprobs: &Array, top_k: i32) -> Result<Array> {
   let vocab_size = *logprobs.shape().last().unwrap_or(&0) as i32;
   if top_k <= 0 || top_k >= vocab_size {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "`top_k` has to be an integer in the (0, {vocab_size}) interval, but is {top_k}"
-      ),
-    });
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "top_k",
+      "must be an integer in the open interval (0, vocab_size)",
+      format!("{top_k} (vocab_size={vocab_size})"),
+    )));
   }
   let neg = ops::arithmetic::negative(logprobs)?;
   let part = ops::misc::argpartition_axis(&neg, top_k - 1, -1)?;
@@ -122,16 +122,18 @@ pub fn apply_top_k(logprobs: &Array, top_k: i32) -> Result<Array> {
 /// `[1, vocab_size]` (matching mlx-lm, which errors on a larger value).
 pub fn apply_min_p(logprobs: &Array, min_p: f32, min_tokens_to_keep: i32) -> Result<Array> {
   if !(0.0..=1.0).contains(&min_p) {
-    return Err(Error::ShapeMismatch {
-      message: format!("`min_p` has to be a float in the [0, 1] interval, but is {min_p}"),
-    });
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "min_p",
+      "must be a float in the closed interval [0, 1]",
+      format!("{min_p}"),
+    )));
   }
   if min_tokens_to_keep < 1 {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "`min_tokens_to_keep` has to be a positive integer, but is {min_tokens_to_keep}"
-      ),
-    });
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "min_tokens_to_keep",
+      "must be a positive integer (>= 1)",
+      format!("{min_tokens_to_keep}"),
+    )));
   }
   let vocab_size = *logprobs.shape().last().unwrap_or(&0) as i32;
   if min_tokens_to_keep > vocab_size {
@@ -140,11 +142,11 @@ pub fn apply_min_p(logprobs: &Array, min_p: f32, min_tokens_to_keep: i32) -> Res
     // Without this guard our pre-normalized `vocab_size - min_tokens_to_keep`
     // goes negative, MLX re-normalizes it, and we silently over-prune below
     // the documented keep guarantee — so reject it up front instead.
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "`min_tokens_to_keep` ({min_tokens_to_keep}) must not exceed the vocabulary size ({vocab_size})"
-      ),
-    });
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "min_tokens_to_keep",
+      "must not exceed the vocabulary size",
+      format!("{min_tokens_to_keep} (vocab_size={vocab_size})"),
+    )));
   }
 
   let top_logprobs = ops::reduction::max_axes(logprobs, &[-1], true)?;
@@ -177,9 +179,11 @@ pub fn apply_min_p(logprobs: &Array, min_p: f32, min_tokens_to_keep: i32) -> Res
 /// whose cumulative prob is `<= 1 - top_p` to `-inf`.
 pub fn apply_top_p(logprobs: &Array, top_p: f32) -> Result<Array> {
   if !top_p.is_finite() || top_p <= 0.0 || top_p > 1.0 {
-    return Err(Error::ShapeMismatch {
-      message: format!("`top_p` has to be a float in the (0, 1] interval, but is {top_p}"),
-    });
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "top_p",
+      "must be a finite float in the half-open interval (0, 1]",
+      format!("{top_p}"),
+    )));
   }
   let probs = ops::arithmetic::exp(logprobs)?;
   let sorted_indices = ops::misc::argsort_axis(logprobs, -1)?;
@@ -292,11 +296,11 @@ pub fn scale_logits_by_temp(logits: &Array, temp: f32) -> Result<Array> {
   // failure instead of returning `Err` (LM-6 R2 Codex finding).
   crate::error::ensure_handler_installed();
   if !temp.is_finite() || temp <= 0.0 {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "`temp` has to be a finite positive float (use `argmax_sample` for temperature-0 / greedy decoding), but is {temp}"
-      ),
-    });
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "temp",
+      "must be a finite positive float (use argmax_sample for temperature-0 / greedy decoding)",
+      format!("{temp}"),
+    )));
   }
   // Clamp from below to ensure `1/temp` is finite — see docstring part (2).
   // This keeps MLX's internal multiply-by-reciprocal on Apple Silicon from
@@ -319,19 +323,17 @@ pub fn scale_logits_by_temp(logits: &Array, temp: f32) -> Result<Array> {
       let scaled_f32 = ops::arithmetic::divide(&logits_f32, &divisor)?;
       ops::misc::astype(&scaled_f32, dtype)
     }
-    crate::Dtype::F64 => Err(Error::Backend {
-      message: "categorical_sampling does not support F64 logits — MLX's GPU stream \
+    crate::Dtype::F64 => Err(Error::Backend(
+      "categorical_sampling does not support F64 logits — MLX's GPU stream \
          does not implement float64, so a native F64 divide would error at \
          eval and the prior implicit F32 roundtrip silently lost precision on \
          near-tied logits (LM-6 R2 finding). Cast logits with \
          .astype(Dtype::F32) (or F16/BF16) before sampling."
         .to_string(),
-    }),
-    other => Err(Error::Backend {
-      message: format!(
-        "categorical_sampling requires floating-point logits (F32, F16, or BF16); got {other:?}. Cast logits with .astype(Dtype::F32) before sampling."
-      ),
-    }),
+    )),
+    other => Err(Error::Backend(format!(
+      "categorical_sampling requires floating-point logits (F32, F16, or BF16); got {other:?}. Cast logits with .astype(Dtype::F32) before sampling."
+    ))),
   }
 }
 
@@ -393,18 +395,18 @@ pub fn apply_xtc(
   key: &Array,
 ) -> Result<Array> {
   if !xtc_threshold.is_finite() || !(0.0..=0.5).contains(&xtc_threshold) {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "`xtc_threshold` has to be a float in the [0, 0.5] interval, but is {xtc_threshold}"
-      ),
-    });
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "xtc_threshold",
+      "must be a finite float in the closed interval [0, 0.5]",
+      format!("{xtc_threshold}"),
+    )));
   }
   if !xtc_probability.is_finite() || !(0.0..=1.0).contains(&xtc_probability) {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "`xtc_probability` has to be a float in the [0, 1] interval, but is {xtc_probability}"
-      ),
-    });
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "xtc_probability",
+      "must be a finite float in the closed interval [0, 1]",
+      format!("{xtc_probability}"),
+    )));
   }
 
   // mlx-lm: `mx.softmax(logits, -1)` — `precise=False` (the mlx default), so
@@ -476,9 +478,11 @@ fn token_index(like: &Array, ids: &[i32]) -> Result<Array> {
 /// (the per-column scaled value is deterministic, so duplicates are a no-op).
 pub fn apply_repetition_penalty(logits: &Array, token_ids: &[i32], penalty: f32) -> Result<Array> {
   if !penalty.is_finite() || penalty < 0.0 {
-    return Err(Error::ShapeMismatch {
-      message: format!("`penalty` must be a non-negative float, but is {penalty}"),
-    });
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "penalty",
+      "must be a finite non-negative float",
+      format!("{penalty}"),
+    )));
   }
   if token_ids.is_empty() {
     return logits.try_clone();
@@ -572,13 +576,11 @@ pub fn apply_logit_bias(logits: &Array, indices: &[i32], values: &Array) -> Resu
   // non-empty `values` is a caller length-mismatch, not a no-op (the
   // shortcut would otherwise silently drop the supplied bias).
   if values.size() != indices.len() {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "`logit_bias` indices ({}) and values ({}) must have the same length",
-        indices.len(),
-        values.size()
-      ),
-    });
+    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+      "apply_logit_bias: indices length vs values.size()",
+      indices.len(),
+      values.size(),
+    )));
   }
   if indices.is_empty() {
     return logits.try_clone();

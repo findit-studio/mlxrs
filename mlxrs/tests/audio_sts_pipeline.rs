@@ -423,9 +423,7 @@ fn voice_session_propagates_sink_write_error() {
   struct ErrSink;
   impl AudioOutputStream for ErrSink {
     fn write_samples(&mut self, _samples: &[f32]) -> Result<usize> {
-      Err(Error::Backend {
-        message: "sink-write-failure".into(),
-      })
+      Err(Error::Backend("sink-write-failure".into()))
     }
     fn flush(&mut self) -> Result<()> {
       Ok(())
@@ -449,7 +447,7 @@ fn voice_session_propagates_sink_write_error() {
   for _ in 0..12 {
     match sess.step(&silence, &mut sink, false) {
       Ok(_) => {}
-      Err(Error::Backend { message }) => {
+      Err(Error::Backend(message)) => {
         assert!(message.contains("sink-write-failure"), "msg: {message}");
         err_seen = true;
         break;

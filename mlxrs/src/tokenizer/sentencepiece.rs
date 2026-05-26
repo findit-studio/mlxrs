@@ -47,7 +47,9 @@ use serde_json::Value as JsonValue;
 
 use std::{collections::HashMap, fs, path::Path};
 
-use crate::error::{Error, Result};
+use crate::error::{
+  ArithmeticOverflowPayload, Error, FileIoPayload, FileOp, MissingFieldPayload, Result,
+};
 
 /// SentencePiece piece-type enum, matching the upstream
 /// `ModelProto.SentencePiece.Type` ordinals.
@@ -218,9 +220,9 @@ impl<'a> SentencePieceProtobufReader<'a> {
       }
       shift += 7;
     }
-    Err(Error::Backend {
-      message: "SentencePiece protobuf: malformed varint".into(),
-    })
+    Err(Error::Backend(
+      "SentencePiece protobuf: malformed varint".into(),
+    ))
   }
 
   fn read_length_delimited(&mut self) -> Result<&'a [u8]> {
@@ -228,13 +230,14 @@ impl<'a> SentencePieceProtobufReader<'a> {
     let end = self
       .index
       .checked_add(length)
-      .ok_or_else(|| Error::Backend {
-        message: "SentencePiece protobuf: length-delimited field overflow".into(),
-      })?;
+      .ok_or(Error::ArithmeticOverflow(ArithmeticOverflowPayload::new(
+        "SentencePiece protobuf: length-delimited field",
+        "usize",
+      )))?;
     if end > self.data.len() {
-      return Err(Error::Backend {
-        message: "SentencePiece protobuf: truncated length-delimited field".into(),
-      });
+      return Err(Error::Backend(
+        "SentencePiece protobuf: truncated length-delimited field".into(),
+      ));
     }
     let slice = &self.data[self.index..end];
     self.index = end;
@@ -242,13 +245,13 @@ impl<'a> SentencePieceProtobufReader<'a> {
   }
 
   fn read_fixed32(&mut self) -> Result<u32> {
-    let end = self.index.checked_add(4).ok_or_else(|| Error::Backend {
-      message: "SentencePiece protobuf: fixed32 offset overflow".into(),
-    })?;
+    let end = self.index.checked_add(4).ok_or(Error::ArithmeticOverflow(
+      ArithmeticOverflowPayload::new("SentencePiece protobuf: fixed32 offset", "usize"),
+    ))?;
     if end > self.data.len() {
-      return Err(Error::Backend {
-        message: "SentencePiece protobuf: truncated fixed32 field".into(),
-      });
+      return Err(Error::Backend(
+        "SentencePiece protobuf: truncated fixed32 field".into(),
+      ));
     }
     let slice = &self.data[self.index..end];
     self.index = end;
@@ -265,13 +268,13 @@ impl<'a> SentencePieceProtobufReader<'a> {
         let _ = self.read_varint()?;
       }
       1 => {
-        let end = self.index.checked_add(8).ok_or_else(|| Error::Backend {
-          message: "SentencePiece protobuf: fixed64 offset overflow".into(),
-        })?;
+        let end = self.index.checked_add(8).ok_or(Error::ArithmeticOverflow(
+          ArithmeticOverflowPayload::new("SentencePiece protobuf: fixed64 offset", "usize"),
+        ))?;
         if end > self.data.len() {
-          return Err(Error::Backend {
-            message: "SentencePiece protobuf: truncated fixed64 field".into(),
-          });
+          return Err(Error::Backend(
+            "SentencePiece protobuf: truncated fixed64 field".into(),
+          ));
         }
         self.index = end;
       }
@@ -282,9 +285,9 @@ impl<'a> SentencePieceProtobufReader<'a> {
         let _ = self.read_fixed32()?;
       }
       other => {
-        return Err(Error::Backend {
-          message: format!("SentencePiece protobuf: unsupported wire type {other}"),
-        });
+        return Err(Error::Backend(format!(
+          "SentencePiece protobuf: unsupported wire type {other}"
+        )));
       }
     }
     Ok(())
@@ -329,9 +332,9 @@ fn parse_pieces(data: &[u8]) -> Result<ParsedModel> {
   }
 
   if pieces.is_empty() {
-    return Err(Error::Backend {
-      message: "SentencePiece model: did not contain any vocabulary pieces".into(),
-    });
+    return Err(Error::Backend(
+      "SentencePiece model: did not contain any vocabulary pieces".into(),
+    ));
   }
 
   let resolved_unknown_id = unknown_token_id
@@ -716,11 +719,13 @@ impl SentencePieceTokenizer {
   /// file failed to read) or any of the protobuf-parse errors from
   /// [`Self::from_model_bytes`].
   pub fn from_model_file(path: &Path) -> Result<Self> {
-    let bytes = fs::read(path).map_err(|e| Error::Backend {
-      message: format!(
-        "SentencePieceTokenizer: failed to read model file {}: {e}",
-        path.display()
-      ),
+    let bytes = fs::read(path).map_err(|e| {
+      Error::FileIo(FileIoPayload::new(
+        "SentencePieceTokenizer: failed to read model file",
+        FileOp::Read,
+        path.to_path_buf(),
+        e,
+      ))
     })?;
     Self::from_model_bytes(&bytes)
   }
@@ -740,38 +745,43 @@ impl SentencePieceTokenizer {
   #[cfg(feature = "tokenizer-config")]
   #[cfg_attr(docsrs, doc(cfg(feature = "tokenizer-config")))]
   pub fn from_tokenizer_json(tokenizer_json: &JsonValue) -> Result<Self> {
-    let model = tokenizer_json.get("model").ok_or_else(|| Error::Backend {
-      message: "SentencePieceTokenizer: missing field `model`".into(),
-    })?;
+    let model =
+      tokenizer_json
+        .get("model")
+        .ok_or(Error::MissingField(MissingFieldPayload::new(
+          "SentencePieceTokenizer",
+          "model",
+        )))?;
     let unk_id = model
       .get("unk_id")
       .and_then(|v| v.as_u64())
-      .ok_or_else(|| Error::Backend {
-        message: "SentencePieceTokenizer: missing field `model.unk_id`".into(),
-      })? as usize;
+      .ok_or(Error::MissingField(MissingFieldPayload::new(
+        "SentencePieceTokenizer",
+        "model.unk_id",
+      )))? as usize;
     let vocab_list = model
       .get("vocab")
       .and_then(|v| v.as_array())
-      .ok_or_else(|| Error::Backend {
-        message: "SentencePieceTokenizer: missing field `model.vocab`".into(),
-      })?;
+      .ok_or(Error::MissingField(MissingFieldPayload::new(
+        "SentencePieceTokenizer",
+        "model.vocab",
+      )))?;
 
     let mut pieces: Vec<SentencePieceToken> = Vec::with_capacity(vocab_list.len());
     for entry in vocab_list {
-      let arr = entry.as_array().ok_or_else(|| Error::Backend {
-        message: "SentencePieceTokenizer: `model.vocab` entry not an array".into(),
+      let arr = entry.as_array().ok_or_else(|| {
+        Error::Backend("SentencePieceTokenizer: `model.vocab` entry not an array".into())
       })?;
       if arr.len() != 2 {
-        return Err(Error::Backend {
-          message: "SentencePieceTokenizer: `model.vocab` entry must be a [token, score] pair"
-            .into(),
-        });
+        return Err(Error::Backend(
+          "SentencePieceTokenizer: `model.vocab` entry must be a [token, score] pair".into(),
+        ));
       }
-      let token = arr[0].as_str().ok_or_else(|| Error::Backend {
-        message: "SentencePieceTokenizer: `model.vocab` entry[0] not a string".into(),
+      let token = arr[0].as_str().ok_or_else(|| {
+        Error::Backend("SentencePieceTokenizer: `model.vocab` entry[0] not a string".into())
       })?;
-      let score = arr[1].as_f64().ok_or_else(|| Error::Backend {
-        message: "SentencePieceTokenizer: `model.vocab` entry[1] not a number".into(),
+      let score = arr[1].as_f64().ok_or_else(|| {
+        Error::Backend("SentencePieceTokenizer: `model.vocab` entry[1] not a number".into())
       })? as f32;
       pieces.push(SentencePieceToken::new(
         token.to_string(),
@@ -796,8 +806,10 @@ impl SentencePieceTokenizer {
   #[cfg(feature = "tokenizer-config")]
   #[cfg_attr(docsrs, doc(cfg(feature = "tokenizer-config")))]
   pub fn from_tokenizer_json_bytes(data: &[u8]) -> Result<Self> {
-    let json: JsonValue = serde_json::from_slice(data).map_err(|e| Error::Backend {
-      message: format!("SentencePieceTokenizer: invalid tokenizer.json: {e}"),
+    let json: JsonValue = serde_json::from_slice(data).map_err(|e| {
+      Error::Backend(format!(
+        "SentencePieceTokenizer: invalid tokenizer.json: {e}"
+      ))
     })?;
     Self::from_tokenizer_json(&json)
   }
@@ -1115,7 +1127,7 @@ mod tests {
     bad.push((1 << 3) | 2);
     bad.push(50); // declared length = 50, but no body follows
     let err = SentencePieceTokenizer::from_model_bytes(&bad).unwrap_err();
-    let Error::Backend { message } = err else {
+    let Error::Backend(message) = err else {
       panic!("expected Error::Backend, got {err:?}");
     };
     assert!(message.contains("SentencePiece"), "message: {message}");
@@ -1133,7 +1145,7 @@ mod tests {
     write_varint(&mut data, trainer.len() as u64);
     data.extend_from_slice(&trainer);
     let err = SentencePieceTokenizer::from_model_bytes(&data).unwrap_err();
-    let Error::Backend { message } = err else {
+    let Error::Backend(message) = err else {
       panic!("expected Error::Backend, got {err:?}");
     };
     assert!(message.contains("vocabulary"));
@@ -1252,7 +1264,7 @@ mod tests {
   fn from_model_file_propagates_io_error_for_missing_path() {
     let err =
       SentencePieceTokenizer::from_model_file(Path::new("/nonexistent/path.model")).unwrap_err();
-    let Error::Backend { message } = err else {
+    let Error::Backend(message) = err else {
       panic!("expected Error::Backend, got {err:?}");
     };
     assert!(message.contains("failed to read"));
@@ -1283,7 +1295,7 @@ mod tests {
   #[test]
   fn from_tokenizer_json_bytes_rejects_invalid_json() {
     let err = SentencePieceTokenizer::from_tokenizer_json_bytes(b"not json").unwrap_err();
-    let Error::Backend { message } = err else {
+    let Error::Backend(message) = err else {
       panic!("expected Error::Backend, got {err:?}");
     };
     assert!(message.contains("invalid tokenizer.json"));
@@ -1294,7 +1306,7 @@ mod tests {
   fn from_tokenizer_json_errors_on_missing_model_field() {
     let json: serde_json::Value = serde_json::json!({"other": 1});
     let err = SentencePieceTokenizer::from_tokenizer_json(&json).unwrap_err();
-    let Error::Backend { message } = err else {
+    let Error::Backend(message) = err else {
       panic!("expected Error::Backend, got {err:?}");
     };
     assert!(message.contains("missing field `model`"));

@@ -134,16 +134,12 @@ impl ChunkedKvCache {
       // `usize::MAX` would wrap (release) / panic (debug) on the `+=`, so it
       // is a checked add (byte-identical for every non-overflowing input).
       let added = buf_len - chunk_size;
-      let new_start =
-        self
-          .start_position
-          .checked_add(added)
-          .ok_or_else(|| Error::ShapeMismatch {
-            message: format!(
-              "ChunkedKvCache::maybe_trim_front: start_position ({}) + {added} overflows usize",
-              self.start_position
-            ),
-          })?;
+      let new_start = self.start_position.checked_add(added).ok_or_else(|| {
+        Error::ShapeMismatch(format!(
+          "ChunkedKvCache::maybe_trim_front: start_position ({}) + {added} overflows usize",
+          self.start_position
+        ))
+      })?;
       // `self.keys = self.keys[..., -self.chunk_size:, :]` — keys' OWN last
       // `chunk_size` rows (`buf_len >= chunk_size`, so `start` is valid).
       // `self.values = self.values[..., -self.chunk_size:, :]` — VALUES' own
@@ -201,15 +197,15 @@ impl ChunkedKvCache {
   /// produces an array of exactly the buffer length).
   fn set_seq(name: &str, buf: &Array, a: usize, s: usize, new: &Array) -> Result<Array> {
     let l = seq_len(name, buf)?;
-    let end = a.checked_add(s).ok_or_else(|| Error::ShapeMismatch {
-      message: format!("ChunkedKvCache: {name} write start ({a}) + S ({s}) overflows usize"),
+    let end = a.checked_add(s).ok_or_else(|| {
+      Error::ShapeMismatch(format!(
+        "ChunkedKvCache: {name} write start ({a}) + S ({s}) overflows usize"
+      ))
     })?;
     if end > l {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "ChunkedKvCache: {name} write window [{a}, {end}) extends past buffer length {l}"
-        ),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "ChunkedKvCache: {name} write window [{a}, {end}) extends past buffer length {l}"
+      )));
     }
     // Structural class-kill (closes #78 P1 iter5): mlx-lm's
     // `self.<buf>[..., a:a+s, :] = new` slice-assignment routes through
@@ -289,11 +285,11 @@ impl KvCache for ChunkedKvCache {
     let prev = self
       .offset
       .checked_sub(self.start_position)
-      .ok_or_else(|| Error::ShapeMismatch {
-        message: format!(
+      .ok_or_else(|| {
+        Error::ShapeMismatch(format!(
           "ChunkedKvCache::update: start_position ({}) exceeds offset ({})",
           self.start_position, self.offset
-        ),
+        ))
       })?;
 
     let cur_buf = match &self.keys {
@@ -301,8 +297,10 @@ impl KvCache for ChunkedKvCache {
       None => None,
     };
     // `self.keys is None or (prev + S) > self.keys.shape[2]` (`cache.py:750`).
-    let prev_plus_s = prev.checked_add(s).ok_or_else(|| Error::ShapeMismatch {
-      message: format!("ChunkedKvCache::update: prev ({prev}) + S ({s}) overflows usize"),
+    let prev_plus_s = prev.checked_add(s).ok_or_else(|| {
+      Error::ShapeMismatch(format!(
+        "ChunkedKvCache::update: prev ({prev}) + S ({s}) overflows usize"
+      ))
     })?;
     let need_alloc = match cur_buf {
       None => true,
@@ -337,11 +335,11 @@ impl KvCache for ChunkedKvCache {
       // real KV update, but guard the subtraction for an empty-seq input
       // (saturating is exact for every `S >= 1`, mlx-lm's domain).
       let n_steps = (CHUNKED_STEP + s).saturating_sub(1) / CHUNKED_STEP;
-      let total = n_steps
-        .checked_mul(CHUNKED_STEP)
-        .ok_or_else(|| Error::ShapeMismatch {
-          message: format!("ChunkedKvCache::update: n_steps ({n_steps}) * step overflows usize"),
-        })?;
+      let total = n_steps.checked_mul(CHUNKED_STEP).ok_or_else(|| {
+        Error::ShapeMismatch(format!(
+          "ChunkedKvCache::update: n_steps ({n_steps}) * step overflows usize"
+        ))
+      })?;
       // `mx.zeros(shape, keys.dtype)` (`cache.py:756-757`): build f32 zeros
       // then cast (mirrors `RotatingKvCache`; `Array::zeros` is f32-only).
       let new_k = ops::misc::astype(
@@ -397,27 +395,22 @@ impl KvCache for ChunkedKvCache {
     // panic (debug). Compute the post-update offset checked BEFORE the
     // in-place splice so the overflow path performs NO partial mutation
     // (byte-identical to `self.offset + S` for every non-overflowing input).
-    let new_offset = self
-      .offset
-      .checked_add(s)
-      .ok_or_else(|| Error::ShapeMismatch {
-        message: format!(
-          "ChunkedKvCache::update: offset ({}) + S ({s}) overflows usize",
-          self.offset
-        ),
-      })?;
+    let new_offset = self.offset.checked_add(s).ok_or_else(|| {
+      Error::ShapeMismatch(format!(
+        "ChunkedKvCache::update: offset ({}) + S ({s}) overflows usize",
+        self.offset
+      ))
+    })?;
     // `end = self.offset - self.start_position` AFTER `offset += S`
     // (`cache.py:768`). `new_offset >= self.offset >= start_position` (the
     // `prev` checked-sub above already established `offset >=
     // start_position`), so this never underflows.
-    let end = new_offset
-      .checked_sub(self.start_position)
-      .ok_or_else(|| Error::ShapeMismatch {
-        message: format!(
-          "ChunkedKvCache::update: start_position ({}) exceeds new offset ({new_offset})",
-          self.start_position
-        ),
-      })?;
+    let end = new_offset.checked_sub(self.start_position).ok_or_else(|| {
+      Error::ShapeMismatch(format!(
+        "ChunkedKvCache::update: start_position ({}) exceeds new offset ({new_offset})",
+        self.start_position
+      ))
+    })?;
     // `self.keys[..., prev:end, :] = keys` (`cache.py:769-770`). `end - prev
     // == S` by construction, so the splice overwrites exactly the `S` new
     // rows and the `values` write uses the SAME `[prev, end)` window —
@@ -541,11 +534,9 @@ impl KvCache for ChunkedKvCache {
         self.offset = sk;
         Ok(())
       }
-      n => Err(Error::Backend {
-        message: format!(
-          "ChunkedKvCache state must have exactly 2 arrays (its setter unpacks keys, values = v; empty/other is invalid), got {n}"
-        ),
-      }),
+      n => Err(Error::Backend(format!(
+        "ChunkedKvCache state must have exactly 2 arrays (its setter unpacks keys, values = v; empty/other is invalid), got {n}"
+      ))),
     }
   }
 
@@ -571,23 +562,27 @@ impl KvCache for ChunkedKvCache {
   /// same two fields, same order/format as `cache.py:800-802`).
   fn set_meta_state(&mut self, m: &[String]) -> Result<()> {
     if m.len() != 2 {
-      return Err(Error::Backend {
-        message: format!(
-          "ChunkedKvCache meta_state must have 2 values, got {}",
-          m.len()
-        ),
-      });
+      return Err(Error::Backend(format!(
+        "ChunkedKvCache meta_state must have 2 values, got {}",
+        m.len()
+      )));
     }
     // Swift `if newValue[0] == "None" { chunkSize = nil } else { Int(...) }`.
     let chunk_size = if m[0] == "None" {
       None
     } else {
-      Some(m[0].parse::<usize>().map_err(|e| Error::Backend {
-        message: format!("ChunkedKvCache meta_state chunk_size ({:?}): {e}", m[0]),
+      Some(m[0].parse::<usize>().map_err(|e| {
+        Error::Backend(format!(
+          "ChunkedKvCache meta_state chunk_size ({:?}): {e}",
+          m[0]
+        ))
       })?)
     };
-    let start_position = m[1].parse::<usize>().map_err(|e| Error::Backend {
-      message: format!("ChunkedKvCache meta_state start_position ({:?}): {e}", m[1]),
+    let start_position = m[1].parse::<usize>().map_err(|e| {
+      Error::Backend(format!(
+        "ChunkedKvCache meta_state start_position ({:?}): {e}",
+        m[1]
+      ))
     })?;
     self.chunk_size = chunk_size;
     self.start_position = start_position;
@@ -612,11 +607,11 @@ impl KvCache for ChunkedKvCache {
     let span = self
       .offset
       .checked_sub(self.start_position)
-      .ok_or_else(|| Error::ShapeMismatch {
-        message: format!(
+      .ok_or_else(|| {
+        Error::ShapeMismatch(format!(
           "ChunkedKvCache::trim: start_position ({}) exceeds offset ({})",
           self.start_position, self.offset
-        ),
+        ))
       })?;
     let trimmed = span.min(n);
     self.offset -= trimmed;

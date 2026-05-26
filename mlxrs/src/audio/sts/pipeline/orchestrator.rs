@@ -296,12 +296,11 @@ where
     turn_policy: P,
   ) -> Result<Self> {
     if config.input_sample_rate() == 0 {
-      return Err(crate::error::Error::Backend {
-        message:
-          "VoicePipelineConfig::input_sample_rate must be > 0 (got 0); the orchestrator's per-chunk \
+      return Err(crate::error::Error::Backend(
+        "VoicePipelineConfig::input_sample_rate must be > 0 (got 0); the orchestrator's per-chunk \
            silence-ms accounting divides by the sample rate"
-            .into(),
-      });
+          .into(),
+      ));
     }
     let preroll_samples =
       (config.input_sample_rate() as usize) * (config.preroll_ms() as usize) / 1_000;
@@ -507,10 +506,9 @@ where
           if n == 0 {
             // Sink is fully backpressured and won't accept more
             // — surface as Backend error rather than spin.
-            return Err(crate::error::Error::Backend {
-              message: "VoiceSession: audio sink rejected TTS chunk (write_samples returned 0)"
-                .into(),
-            });
+            return Err(crate::error::Error::Backend(
+              "VoiceSession: audio sink rejected TTS chunk (write_samples returned 0)".into(),
+            ));
           }
           written += n;
         }
@@ -884,7 +882,7 @@ mod tests {
     }
     let err = sess.step(&silence_frame, &mut sink, false).unwrap_err();
     match err {
-      Error::Backend { message } => {
+      Error::Backend(message) => {
         assert!(message.contains("audio sink rejected"), "got: {message}")
       }
       other => panic!("expected Backend error, got: {other:?}"),
@@ -1132,7 +1130,7 @@ mod tests {
     );
     match result {
       Ok(_) => panic!("expected Err, got Ok"),
-      Err(Error::Backend { message }) => assert!(
+      Err(Error::Backend(message)) => assert!(
         message.contains("sample_rate"),
         "expected Backend error mentioning sample_rate, got: {message}"
       ),

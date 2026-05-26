@@ -164,7 +164,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::{
-  error::{Error, Result},
+  error::{
+    ConvertPostSavePartialPayload, DurabilityWarningPayload, Error, FileIoPayload, FileOp, Result,
+  },
   lm::{
     convert::{self, TOKENIZER_EXTRA_FILES},
     load::{self, Weights},
@@ -305,11 +307,13 @@ pub fn fuse(
   // guard's [`Drop`] removes the staging dir on every error exit so a
   // failure between here and promotion never leaves `<save_path>/.staging-fuse-*`
   // junk on disk.
-  std::fs::create_dir_all(save_path).map_err(|e| Error::Backend {
-    message: format!(
-      "fuse: cannot create save_path {} for staging: {e}",
-      save_path.display()
-    ),
+  std::fs::create_dir_all(save_path).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "fuse: cannot create save_path",
+      FileOp::Create,
+      save_path.to_path_buf(),
+      e,
+    ))
   })?;
   let staging = StagingDir::create(save_path)?;
   match convert::copy_tokenizer_and_extras(model_path, staging.path()) {
@@ -348,14 +352,12 @@ pub fn fuse(
   // path the caller needs to fix (the snapshot path is an internal
   // implementation detail).
   if let Err(e) = load::load_tokenizer(staging.path(), &cfg_typed) {
-    return Err(Error::Backend {
-      message: format!(
-        "fuse: source tokenizer at {} failed validation against the staged snapshot \
+    return Err(Error::Backend(format!(
+      "fuse: source tokenizer at {} failed validation against the staged snapshot \
          at {}: {e}",
-        model_path.display(),
-        staging.path().display()
-      ),
-    });
+      model_path.display(),
+      staging.path().display()
+    )));
   }
 
   // (3) Parse the on-disk per-layer quantization block (the loaded
@@ -457,8 +459,7 @@ pub fn fuse(
 
   // (8) Save — atomic, fsync-disciplined (F6). `save` does the
   // config-stage / weights-shard / index-commit sequence; a post-commit
-  // `fsync_dir` warning surfaces as `Error::DurabilityWarning {
-  // committed: true, .. }` so the caller can distinguish "saved but
+  // `fsync_dir` warning surfaces as `Error::DurabilityWarning(DurabilityWarningPayload::new(true, ))` so the caller can distinguish "saved but
   // durability uncertain" from a hard pre-commit failure.
   //
   // The save side returns one of three shapes:
@@ -475,7 +476,7 @@ pub fn fuse(
   let save_warning: Option<std::io::Error> =
     match load::save(save_path, &out_weights, &out_config_json, &save_quant) {
       Ok(()) => None,
-      Err(Error::DurabilityWarning { committed, source }) if committed => Some(source),
+      Err(Error::DurabilityWarning(p)) if p.committed() => Some(p.into_source()),
       Err(e) => return Err(e),
     };
 
@@ -529,10 +530,9 @@ pub fn fuse(
             .or(post_copy_file)
             .or(post_copy_dir)
             .expect("count() == 1 guarantees exactly one Some field");
-          Err(Error::DurabilityWarning {
-            committed: true,
-            source,
-          })
+          Err(Error::DurabilityWarning(DurabilityWarningPayload::new(
+            true, source,
+          )))
         }
         // 2+ — typed multi-warning aggregate so each warning is reachable
         // via direct destructuring (no string fold).
@@ -546,11 +546,13 @@ pub fn fuse(
     // `ConvertPostSavePartial` with `committed: true` + the save-side
     // fsync warning (if any) carried in `save_warning` and the
     // underlying promotion failure in `copy_error`.
-    Err(promote_err) => Err(Error::ConvertPostSavePartial {
-      committed: true,
-      save_warning,
-      copy_error: std::io::Error::other(promote_err.to_string()),
-    }),
+    // `promote_err` passed through as the typed `crate::Error` so
+    // `Error::FileIo(FileIoPayload { .. })` survives end-to-end for
+    // recovery code (R-final fix: no `io::Error::other(...)`
+    // stringification of the structured copy failure).
+    Err(promote_err) => Err(Error::ConvertPostSavePartial(
+      ConvertPostSavePartialPayload::new(true, save_warning, promote_err),
+    )),
   }
 }
 
@@ -625,25 +627,21 @@ impl StagingDir {
           continue;
         }
         Err(e) => {
-          return Err(Error::Backend {
-            message: format!(
-              "fuse: cannot create staging dir under {}: {e}",
-              parent.display()
-            ),
-          });
+          return Err(Error::Backend(format!(
+            "fuse: cannot create staging dir under {}: {e}",
+            parent.display()
+          )));
         }
       }
     }
-    Err(Error::Backend {
-      message: format!(
-        "fuse: cannot create unique staging dir under {} after {MAX_RETRIES} retries: {}",
-        parent.display(),
-        last_err.map_or_else(
-          || "no underlying error captured".to_string(),
-          |e| e.to_string()
-        )
-      ),
-    })
+    Err(Error::Backend(format!(
+      "fuse: cannot create unique staging dir under {} after {MAX_RETRIES} retries: {}",
+      parent.display(),
+      last_err.map_or_else(
+        || "no underlying error captured".to_string(),
+        |e| e.to_string()
+      )
+    )))
   }
 
   /// The on-disk path of the staging directory.
@@ -807,16 +805,23 @@ fn promote_staging_inner(staging: &Path, save_path: &Path) -> Result<Option<std:
   // Snapshot the staged file names BEFORE we move them — we need the
   // set for the stale-sweep below.
   let mut staged_names: HashSet<String> = HashSet::new();
-  let entries = std::fs::read_dir(staging).map_err(|e| Error::Backend {
-    message: format!("fuse: cannot read staging dir {}: {e}", staging.display()),
+  let entries = std::fs::read_dir(staging).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "fuse: cannot read staging dir",
+      FileOp::Read,
+      staging.to_path_buf(),
+      e,
+    ))
   })?;
   let mut staged_paths: Vec<PathBuf> = Vec::new();
   for entry in entries {
-    let entry = entry.map_err(|e| Error::Backend {
-      message: format!(
-        "fuse: cannot read entry in staging dir {}: {e}",
-        staging.display()
-      ),
+    let entry = entry.map_err(|e| {
+      Error::FileIo(FileIoPayload::new(
+        "fuse: cannot read entry in staging dir",
+        FileOp::Read,
+        staging.to_path_buf(),
+        e,
+      ))
     })?;
     let path = entry.path();
     if !path.is_file() {
@@ -844,12 +849,19 @@ fn promote_staging_inner(staging: &Path, save_path: &Path) -> Result<Option<std:
       continue;
     };
     let dst = save_path.join(name);
-    std::fs::rename(staged_path, &dst).map_err(|e| Error::Backend {
-      message: format!(
-        "fuse: cannot promote staged file {} -> {}: {e}",
-        staged_path.display(),
-        dst.display()
-      ),
+    // Typed-error preservation (R-final+1 Codex finding): preserve the
+    // io::ErrorKind through `Error::FileIo` so callers reading
+    // `ConvertPostSavePartialPayload::copy_error` can branch on
+    // `FileOp::Rename` + `path` + `inner.kind()`. The promote-rename is
+    // the moral equivalent of `copy_tokenizer_and_extras`'s std::fs::copy
+    // — both feed the same payload via `Err(promote_err)` below.
+    std::fs::rename(staged_path, &dst).map_err(|e| {
+      crate::Error::FileIo(FileIoPayload::new(
+        "fuse: cannot promote staged file to",
+        crate::error::FileOp::Rename,
+        dst.clone(),
+        e,
+      ))
     })?;
     if let Err(e) = crate::lm::load::fsync_path_io(&dst) {
       // Wrap with operation + destination-path context (mirrors
@@ -913,18 +925,22 @@ fn promote_staging_inner(staging: &Path, save_path: &Path) -> Result<Option<std:
   // staged_names, unlink. (The staged_names set already contains the
   // copied `*.py` basenames per the snapshot — see
   // `copy_tokenizer_and_extras`'s `*.py` glob.)
-  let entries = std::fs::read_dir(save_path).map_err(|e| Error::Backend {
-    message: format!(
-      "fuse: cannot read save_path {} for stale-extras sweep: {e}",
-      save_path.display()
-    ),
+  let entries = std::fs::read_dir(save_path).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "fuse: cannot read save_path",
+      FileOp::Read,
+      save_path.to_path_buf(),
+      e,
+    ))
   })?;
   for entry in entries {
-    let entry = entry.map_err(|e| Error::Backend {
-      message: format!(
-        "fuse: cannot read entry in save_path {}: {e}",
-        save_path.display()
-      ),
+    let entry = entry.map_err(|e| {
+      Error::FileIo(FileIoPayload::new(
+        "fuse: cannot read entry in save_path",
+        FileOp::Read,
+        save_path.to_path_buf(),
+        e,
+      ))
     })?;
     let path = entry.path();
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -978,21 +994,21 @@ fn remove_stale_reserved_path(path: &Path, name: &str) -> Result<()> {
     Ok(m) => m,
     Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
     Err(e) => {
-      return Err(Error::Backend {
-        message: format!(
-          "fuse: cannot stat stale destination path {}: {e}",
-          path.display()
-        ),
-      });
+      return Err(Error::Backend(format!(
+        "fuse: cannot stat stale destination path {}: {e}",
+        path.display()
+      )));
     }
   };
   let ft = meta.file_type();
   if ft.is_file() {
-    std::fs::remove_file(path).map_err(|e| Error::Backend {
-      message: format!(
-        "fuse: cannot remove stale destination file {}: {e}",
-        path.display()
-      ),
+    std::fs::remove_file(path).map_err(|e| {
+      Error::FileIo(FileIoPayload::new(
+        "fuse: cannot remove stale destination file",
+        FileOp::Remove,
+        path.to_path_buf(),
+        e,
+      ))
     })?;
     return Ok(());
   }
@@ -1007,15 +1023,13 @@ fn remove_stale_reserved_path(path: &Path, name: &str) -> Result<()> {
   } else {
     "non-regular file (FIFO, socket, or device)"
   };
-  Err(Error::Backend {
-    message: format!(
-      "fuse: stale destination path {} (basename {}) is a {}; non-regular reserved path; \
+  Err(Error::Backend(format!(
+    "fuse: stale destination path {} (basename {}) is a {}; non-regular reserved path; \
        remove manually or use a fresh save destination",
-      path.display(),
-      name,
-      kind
-    ),
-  })
+    path.display(),
+    name,
+    kind
+  )))
 }
 
 /// Replace the `<path>.weight` / `.scales` / `.biases` / `.bias` entries in
@@ -1153,20 +1167,18 @@ fn insert_base_embedding(weights: &mut Weights, path: &str, fused: BaseEmbedding
 /// than re-exported so each module's helper stays adjacent to its sole
 /// caller — they cannot diverge: both delete the same two top-level keys).
 fn strip_quantization_blocks(config_json: &str) -> Result<String> {
-  let value: serde_json::Value = serde_json::from_str(config_json).map_err(|e| Error::Backend {
-    message: format!("fuse: source config is not valid JSON: {e}"),
-  })?;
+  let value: serde_json::Value = serde_json::from_str(config_json)
+    .map_err(|e| Error::Backend(format!("fuse: source config is not valid JSON: {e}")))?;
   let serde_json::Value::Object(mut map) = value else {
-    return Err(Error::Backend {
-      message: "fuse: source config JSON must be an object".into(),
-    });
+    return Err(Error::Backend(
+      "fuse: source config JSON must be an object".into(),
+    ));
   };
   map.remove("quantization");
   map.remove("quantization_config");
   let stripped = serde_json::Value::Object(map);
-  serde_json::to_string(&stripped).map_err(|e| Error::Backend {
-    message: format!("fuse: cannot re-serialize stripped config: {e}"),
-  })
+  serde_json::to_string(&stripped)
+    .map_err(|e| Error::Backend(format!("fuse: cannot re-serialize stripped config: {e}")))
 }
 
 /// Reject a hub-style URL (`hf://...` / `https://huggingface.co/...` /
@@ -1184,14 +1196,12 @@ fn reject_hub_url(arg_name: &str, path: &Path) -> Result<()> {
     .or_else(|| s.strip_prefix("https://huggingface.co/"))
     .or_else(|| s.strip_prefix("http://huggingface.co/"));
   if let Some(repo_id) = repo_id {
-    return Err(Error::Backend {
-      message: format!(
-        "fuse: `{arg_name}` is a HuggingFace Hub URL ({s}); mlxrs is local-only \
+    return Err(Error::Backend(format!(
+      "fuse: `{arg_name}` is a HuggingFace Hub URL ({s}); mlxrs is local-only \
          and does not download from the Hub. Fetch the model directory out of \
          process (e.g. `huggingface-cli download {repo_id}` or \
          `hf download {repo_id}`) and pass the resulting local path."
-      ),
-    });
+    )));
   }
   Ok(())
 }
@@ -1211,7 +1221,7 @@ mod tests {
   fn reject_hub_url_strips_hf_prefix_in_hint() {
     let err =
       reject_hub_url("model_path", Path::new("hf://mlx-community/Qwen3-4B-bf16")).unwrap_err();
-    let Error::Backend { message } = err else {
+    let Error::Backend(message) = err else {
       panic!("expected Error::Backend");
     };
     assert!(
@@ -1231,7 +1241,7 @@ mod tests {
       Path::new("https://huggingface.co/owner/repo"),
     )
     .unwrap_err();
-    let Error::Backend { message } = err else {
+    let Error::Backend(message) = err else {
       panic!("expected Error::Backend");
     };
     assert!(
@@ -1288,7 +1298,7 @@ mod tests {
   fn strip_quantization_blocks_rejects_non_object_root() {
     let src = "[1, 2, 3]";
     let err = strip_quantization_blocks(src).unwrap_err();
-    let Error::Backend { message } = err else {
+    let Error::Backend(message) = err else {
       panic!("expected Error::Backend");
     };
     assert!(

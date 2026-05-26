@@ -174,19 +174,16 @@ impl<B: StreamingEncoderBackend> StreamingEncoder<B> {
   /// the backend's [`StreamingEncoderBackend::encode_window`].
   pub fn feed(&mut self, mel_frames: &Array) -> Result<usize> {
     if mel_frames.ndim() != 2 {
-      return Err(Error::Backend {
-        message: format!(
-          "StreamingEncoder::feed: expected 2-D mel_frames input, got {}-D",
-          mel_frames.ndim()
-        ),
-      });
+      return Err(Error::Backend(format!(
+        "StreamingEncoder::feed: expected 2-D mel_frames input, got {}-D",
+        mel_frames.ndim()
+      )));
     }
 
-    let window_size_i32 = i32::try_from(self.window_size).map_err(|_| Error::Backend {
-      message: "StreamingEncoder::feed: window_size does not fit i32".into(),
-    })?;
-    let stride_i32 = i32::try_from(self.window_stride).map_err(|_| Error::Backend {
-      message: "StreamingEncoder::feed: window_stride does not fit i32".into(),
+    let window_size_i32 = i32::try_from(self.window_size)
+      .map_err(|_| Error::Backend("StreamingEncoder::feed: window_size does not fit i32".into()))?;
+    let stride_i32 = i32::try_from(self.window_stride).map_err(|_| {
+      Error::Backend("StreamingEncoder::feed: window_stride does not fit i32".into())
     })?;
 
     // STAGE the merged pending buffer in a LOCAL. Use try_clone on the
@@ -364,10 +361,10 @@ fn pad_to_window_size(frames: &Array, valid_frames: usize, window_size: usize) -
     return frames.try_clone();
   }
   let high = window_size - valid_frames;
-  let high_i32 = i32::try_from(high).map_err(|_| Error::Backend {
-    message: format!(
+  let high_i32 = i32::try_from(high).map_err(|_| {
+    Error::Backend(format!(
       "StreamingEncoder: pad-high count {high} exceeds i32::MAX for window-size padding"
-    ),
+    ))
   })?;
   // 0-D scalar zero — `pad` casts it to the input dtype for the constant
   // fill (matches the convention used by `audio::dsp::place_window`).
@@ -491,7 +488,7 @@ mod tests {
     let mut stream = StreamingEncoder::new(encoder, 4, 0);
     let one_d = Array::from_slice::<f32>(&[0.0_f32; 8], &[8i32]).unwrap();
     let err = stream.feed(&one_d).unwrap_err();
-    assert!(matches!(err, Error::Backend { ref message } if message.contains("2-D")));
+    assert!(matches!(err, Error::Backend(ref message) if message.contains("2-D")));
   }
 
   #[test]
