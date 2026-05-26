@@ -10,7 +10,7 @@
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{Error, Result},
+  error::{EmptyInputPayload, Error, OutOfRangePayload, RankMismatchPayload, Result},
   ops,
 };
 
@@ -30,6 +30,9 @@ pub(crate) const SEQ_AXIS: i32 = -2;
 pub(crate) fn seq_len(name: &str, a: &Array) -> Result<usize> {
   let shape = a.shape();
   if shape.len() != KV_NDIM {
+    // migrate-C: kept as ShapeMismatch — `name` is runtime `&str` (keys/values),
+    // cannot feed RankMismatch's `&'static str` context without refactoring
+    // every caller's `name: &str` to `&'static str`.
     return Err(Error::ShapeMismatch(format!(
       "KV cache expects 4-D {name} [B, n_kv_heads, S, head_dim], got shape {shape:?}"
     )));
@@ -47,6 +50,7 @@ pub(crate) fn seq_len(name: &str, a: &Array) -> Result<usize> {
 pub(crate) fn head_dim(name: &str, a: &Array) -> Result<usize> {
   let shape = a.shape();
   if shape.len() != KV_NDIM {
+    // migrate-C: kept as ShapeMismatch — `name` is runtime `&str` (keys/values)
     return Err(Error::ShapeMismatch(format!(
       "KV cache expects 4-D {name} [B, n_kv_heads, S, head_dim], got shape {shape:?}"
     )));
@@ -100,11 +104,13 @@ pub(crate) fn broadcast_write_rhs(
   let bs = buf.shape();
   let ns = new.shape();
   if bs.len() != KV_NDIM {
+    // migrate-C: kept as ShapeMismatch — `name` is runtime `&str` (keys/values)
     return Err(Error::ShapeMismatch(format!(
       "KV cache expects 4-D {name} [B, n_kv_heads, S, head_dim], got shape {bs:?}"
     )));
   }
   if ns.len() != KV_NDIM {
+    // migrate-C: kept as ShapeMismatch — `name` is runtime `&str` (keys/values)
     return Err(Error::ShapeMismatch(format!(
       "KV cache expects 4-D {name} write RHS [B, n_kv_heads, S, head_dim], got shape {ns:?}"
     )));
@@ -112,6 +118,7 @@ pub(crate) fn broadcast_write_rhs(
   // Slice window length on the sequence axis — the broadcast target's seq
   // dim (mlx `slice_update`'s `upd_shape[seq]` is exactly `stop - start`).
   let win = end.checked_sub(a).ok_or_else(|| {
+    // migrate-C: kept as ShapeMismatch — `name` is runtime `&str` (keys/values)
     Error::ShapeMismatch(format!("set_seq: {name} write end ({end}) < start ({a})"))
   })?;
   // Per-axis: identity (`d == d`) OR size-1-broadcast (`new == 1`). mlx
@@ -123,6 +130,8 @@ pub(crate) fn broadcast_write_rhs(
     let target = if axis == KV_NDIM - 2 { win } else { bs[axis] };
     let got = ns[axis];
     if got != target && got != 1 {
+      // migrate-C: kept as ShapeMismatch — `name` is runtime `&str` (keys/values)
+      // and composite (per-axis broadcast-compat check)
       return Err(Error::ShapeMismatch(format!(
         "set_seq: {name} write RHS shape {ns:?} non-broadcastable on axis {axis} \
            (got {got}, target {target} — mlx-lm slice-assignment raises on \
@@ -167,24 +176,43 @@ pub(crate) fn slice_seq(a: &Array, start: usize, end: usize) -> Result<Array> {
   // Quantized/Batch/BatchRotating) all pre-validate rank before reaching
   // here, so this is a defense-in-depth guard, not a behavior change.
   if shape.len() != KV_NDIM {
-    return Err(Error::ShapeMismatch(format!(
-      "slice_seq: expects {KV_NDIM}-D array [B, n_kv_heads, S, head_dim], got shape {shape:?}"
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "slice_seq: expects 4-D KV array [B, n_kv_heads, S, head_dim]",
+      shape.len() as u32,
+      shape,
     )));
   }
   let mut starts = vec![0i32; KV_NDIM];
   let mut stops: Vec<i32> = shape
     .iter()
     .map(|&d| {
-      i32::try_from(d)
-        .map_err(|_| Error::ShapeMismatch(format!("slice_seq: shape dim {d} exceeds i32::MAX")))
+      i32::try_from(d).map_err(|_| {
+        // OutOfRange preserves the offending dim value in the payload (the
+        // original Backend diagnostic included `{d}`); ArithmeticOverflow's
+        // payload is value-less and would drop that runtime substitution.
+        Error::OutOfRange(OutOfRangePayload::new(
+          "slice_seq: shape dim",
+          "must be <= i32::MAX (mlx slice bounds are i32)",
+          d.to_string(),
+        ))
+      })
     })
     .collect::<Result<Vec<i32>>>()?;
   let strides = vec![1i32; KV_NDIM];
   starts[KV_NDIM - 2] = i32::try_from(start).map_err(|_| {
-    Error::ShapeMismatch(format!("slice_seq: start offset {start} exceeds i32::MAX"))
+    Error::OutOfRange(OutOfRangePayload::new(
+      "slice_seq: start offset",
+      "must be <= i32::MAX (mlx slice bounds are i32)",
+      start.to_string(),
+    ))
   })?;
-  stops[KV_NDIM - 2] = i32::try_from(end)
-    .map_err(|_| Error::ShapeMismatch(format!("slice_seq: end offset {end} exceeds i32::MAX")))?;
+  stops[KV_NDIM - 2] = i32::try_from(end).map_err(|_| {
+    Error::OutOfRange(OutOfRangePayload::new(
+      "slice_seq: end offset",
+      "must be <= i32::MAX (mlx slice bounds are i32)",
+      end.to_string(),
+    ))
+  })?;
   ops::indexing::slice(a, &starts, &stops, &strides)
 }
 
@@ -263,8 +291,10 @@ pub(crate) fn concat_parts(parts: &[&Array]) -> Result<Array> {
   let rank_checked = |a: &Array| -> Result<Array> {
     let shape = a.shape();
     if shape.len() != KV_NDIM {
-      return Err(Error::ShapeMismatch(format!(
-        "KV cache concat expects 4-D [B, n_kv_heads, S, head_dim] parts, got shape {shape:?}"
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        "KV cache concat expects 4-D [B, n_kv_heads, S, head_dim] parts",
+        shape.len() as u32,
+        shape,
       )));
     }
     a.try_clone()
@@ -276,9 +306,9 @@ pub(crate) fn concat_parts(parts: &[&Array]) -> Result<Array> {
     // `Error` rather than an indexing panic.
     [] => match parts.first() {
       Some(first) => rank_checked(first),
-      None => Err(Error::ShapeMismatch(
-        "concat_parts: no parts to concatenate".into(),
-      )),
+      None => Err(Error::EmptyInput(EmptyInputPayload::new(
+        "concat_parts: parts to concatenate",
+      ))),
     },
     [one] => rank_checked(one),
     many => ops::shape::concatenate(many, SEQ_AXIS),
@@ -311,17 +341,24 @@ mod tests {
     let bad_end = (i32::MAX as usize) + 1;
     let r = slice_seq(&a, 0, bad_end);
     match r {
-      Err(Error::ShapeMismatch(message)) => {
+      Err(Error::OutOfRange(payload)) => {
         assert!(
-          message.contains("end") && message.contains("i32::MAX"),
-          "expected message to name `end` and `i32::MAX`, got: {message:?}"
+          payload.context().contains("end"),
+          "expected context to name `end`, got: {}",
+          payload.context()
         );
         assert!(
-          message.contains(&bad_end.to_string()),
-          "expected message to include the offending value {bad_end}, got: {message:?}"
+          payload.requirement().contains("i32::MAX"),
+          "requirement should mention i32::MAX, got: {}",
+          payload.requirement()
+        );
+        assert_eq!(
+          payload.value(),
+          bad_end.to_string(),
+          "value should carry the offending end"
         );
       }
-      other => panic!("expected Err(ShapeMismatch), got {other:?}"),
+      other => panic!("expected Err(OutOfRange), got {other:?}"),
     }
   }
 
@@ -329,22 +366,29 @@ mod tests {
   fn slice_seq_rejects_start_above_i32_max() {
     let a = kv1();
     let bad_start = (i32::MAX as usize) + 1;
-    // `end` also overflows here; this test only asserts the start-bound
-    // overflow is surfaced (not that it wins over the end-bound check) —
-    // either error variant is correct, both name an offset > i32::MAX.
+    // `end` also overflows here; this test only asserts a start-or-end-bound
+    // overflow is surfaced (not which one wins). Both arms produce
+    // `OutOfRange` whose requirement names `i32::MAX`.
     let r = slice_seq(&a, bad_start, bad_start);
     match r {
-      Err(Error::ShapeMismatch(message)) => {
+      Err(Error::OutOfRange(payload)) => {
         assert!(
-          message.contains("i32::MAX"),
-          "expected message to mention `i32::MAX`, got: {message:?}"
+          payload.context().contains("start") || payload.context().contains("end"),
+          "expected context to name `start` or `end` offset, got: {}",
+          payload.context()
         );
         assert!(
-          message.contains("start") || message.contains("end"),
-          "expected message to name `start` or `end` offset, got: {message:?}"
+          payload.requirement().contains("i32::MAX"),
+          "requirement should mention i32::MAX, got: {}",
+          payload.requirement()
+        );
+        assert_eq!(
+          payload.value(),
+          bad_start.to_string(),
+          "value should carry the offending bound"
         );
       }
-      other => panic!("expected Err(ShapeMismatch), got {other:?}"),
+      other => panic!("expected Err(OutOfRange), got {other:?}"),
     }
   }
 
@@ -361,14 +405,14 @@ mod tests {
   #[test]
   fn slice_seq_rejects_rank_mismatch() {
     // Defense-in-depth: a rank-misuse must surface as recoverable
-    // ShapeMismatch rather than panicking on the `stops[KV_NDIM - 2]`
+    // RankMismatch rather than panicking on the `stops[KV_NDIM - 2]`
     // index (Copilot review #3273072304). All real callers pre-validate
     // rank, so this only fires on a programmer-error / misuse path.
     let a1: Array = Array::from_slice::<f32>(&[0.0, 1.0], &(2usize,)).unwrap(); // rank 1
     let r = slice_seq(&a1, 0, 0);
     assert!(
-      matches!(r, Err(Error::ShapeMismatch(_))),
-      "rank-1 must Err(ShapeMismatch), got {r:?}"
+      matches!(r, Err(Error::RankMismatch(_))),
+      "rank-1 must Err(RankMismatch), got {r:?}"
     );
     let err_msg = match r {
       Err(e) => format!("{e}"),

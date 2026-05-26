@@ -40,7 +40,7 @@ use std::{
 };
 
 use crate::{
-  error::{Error, Result},
+  error::{Error, OutOfRangePayload, Result},
   lm::cache::{KvCache, can_trim_prompt_cache, trim_prompt_cache},
 };
 
@@ -766,9 +766,13 @@ impl<M: Eq + Hash + Clone> LruPromptCache<M> {
     // / `self._lrus[...]` index, before `self._trie.add`). A bucket is
     // valid iff it is one of `CacheOrder`'s fixed ordering keys.
     if !self.lru.ordering.iter().any(|k| k == cache_type) {
-      return Err(Error::Backend(format!(
-        "LruPromptCache: unknown cache_type {cache_type:?}; expected one of {:?}",
-        self.lru.ordering
+      // migrate-C: kept runtime `self.lru.ordering` (the expected-set) interpolated;
+      // OutOfRange `requirement` is &'static so cannot carry the dynamic set —
+      // still upgraded to OutOfRange for the variant payload semantics
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "LruPromptCache::add: cache_type",
+        "must be one of the cache-ordering bucket keys",
+        format!("{cache_type:?} (expected one of {:?})", self.lru.ordering),
       )));
     }
 

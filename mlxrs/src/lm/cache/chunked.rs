@@ -2,7 +2,7 @@
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{Error, LengthMismatchPayload, OutOfRangePayload, Result},
   lm::cache::{
     KvCache, MaskMode, mask,
     util::{KV_NDIM, concat_seq, nbytes, seq_len, seq_slice},
@@ -135,9 +135,11 @@ impl ChunkedKvCache {
       // is a checked add (byte-identical for every non-overflowing input).
       let added = buf_len - chunk_size;
       let new_start = self.start_position.checked_add(added).ok_or_else(|| {
-        Error::ShapeMismatch(format!(
-          "ChunkedKvCache::maybe_trim_front: start_position ({}) + {added} overflows usize",
-          self.start_position
+        // OutOfRange preserves both operands the original message surfaced.
+        Error::OutOfRange(OutOfRangePayload::new(
+          "ChunkedKvCache::maybe_trim_front: start_position + (buf_len - chunk_size)",
+          "must fit usize",
+          format!("start_position={}, added={added}", self.start_position),
         ))
       })?;
       // `self.keys = self.keys[..., -self.chunk_size:, :]` — keys' OWN last
@@ -198,11 +200,13 @@ impl ChunkedKvCache {
   fn set_seq(name: &str, buf: &Array, a: usize, s: usize, new: &Array) -> Result<Array> {
     let l = seq_len(name, buf)?;
     let end = a.checked_add(s).ok_or_else(|| {
+      // migrate-C: kept as ShapeMismatch — `name` is runtime `&str` (keys/values)
       Error::ShapeMismatch(format!(
         "ChunkedKvCache: {name} write start ({a}) + S ({s}) overflows usize"
       ))
     })?;
     if end > l {
+      // migrate-C: kept as ShapeMismatch — `name` is runtime `&str` (keys/values)
       return Err(Error::ShapeMismatch(format!(
         "ChunkedKvCache: {name} write window [{a}, {end}) extends past buffer length {l}"
       )));
@@ -286,9 +290,15 @@ impl KvCache for ChunkedKvCache {
       .offset
       .checked_sub(self.start_position)
       .ok_or_else(|| {
-        Error::ShapeMismatch(format!(
-          "ChunkedKvCache::update: start_position ({}) exceeds offset ({})",
-          self.start_position, self.offset
+        // OutOfRange preserves the offending operands the original
+        // message surfaced (`start_position`, `offset`).
+        Error::OutOfRange(OutOfRangePayload::new(
+          "ChunkedKvCache::update: start_position vs offset",
+          "start_position must not exceed offset",
+          format!(
+            "start_position={}, offset={}",
+            self.start_position, self.offset
+          ),
         ))
       })?;
 
@@ -298,8 +308,11 @@ impl KvCache for ChunkedKvCache {
     };
     // `self.keys is None or (prev + S) > self.keys.shape[2]` (`cache.py:750`).
     let prev_plus_s = prev.checked_add(s).ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "ChunkedKvCache::update: prev ({prev}) + S ({s}) overflows usize"
+      // OutOfRange preserves both operands the original message surfaced.
+      Error::OutOfRange(OutOfRangePayload::new(
+        "ChunkedKvCache::update: prev + S",
+        "must fit usize",
+        format!("prev={prev}, S={s}"),
       ))
     })?;
     let need_alloc = match cur_buf {
@@ -336,8 +349,12 @@ impl KvCache for ChunkedKvCache {
       // (saturating is exact for every `S >= 1`, mlx-lm's domain).
       let n_steps = (CHUNKED_STEP + s).saturating_sub(1) / CHUNKED_STEP;
       let total = n_steps.checked_mul(CHUNKED_STEP).ok_or_else(|| {
-        Error::ShapeMismatch(format!(
-          "ChunkedKvCache::update: n_steps ({n_steps}) * step overflows usize"
+        // OutOfRange preserves the offending `n_steps` operand (the original
+        // `"ChunkedKvCache::update: n_steps ({n_steps}) * step overflows usize"`).
+        Error::OutOfRange(OutOfRangePayload::new(
+          "ChunkedKvCache::update: n_steps * CHUNKED_STEP",
+          "must fit usize",
+          format!("n_steps={n_steps}, CHUNKED_STEP={CHUNKED_STEP}"),
         ))
       })?;
       // `mx.zeros(shape, keys.dtype)` (`cache.py:756-757`): build f32 zeros
@@ -396,9 +413,11 @@ impl KvCache for ChunkedKvCache {
     // in-place splice so the overflow path performs NO partial mutation
     // (byte-identical to `self.offset + S` for every non-overflowing input).
     let new_offset = self.offset.checked_add(s).ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "ChunkedKvCache::update: offset ({}) + S ({s}) overflows usize",
-        self.offset
+      // OutOfRange preserves both operands the original message surfaced.
+      Error::OutOfRange(OutOfRangePayload::new(
+        "ChunkedKvCache::update: offset + S",
+        "must fit usize",
+        format!("offset={}, S={s}", self.offset),
       ))
     })?;
     // `end = self.offset - self.start_position` AFTER `offset += S`
@@ -406,9 +425,15 @@ impl KvCache for ChunkedKvCache {
     // `prev` checked-sub above already established `offset >=
     // start_position`), so this never underflows.
     let end = new_offset.checked_sub(self.start_position).ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "ChunkedKvCache::update: start_position ({}) exceeds new offset ({new_offset})",
-        self.start_position
+      // OutOfRange preserves the offending operands the original
+      // message surfaced.
+      Error::OutOfRange(OutOfRangePayload::new(
+        "ChunkedKvCache::update: start_position vs new offset",
+        "start_position must not exceed new offset",
+        format!(
+          "start_position={}, new_offset={new_offset}",
+          self.start_position
+        ),
       ))
     })?;
     // `self.keys[..., prev:end, :] = keys` (`cache.py:769-770`). `end - prev
@@ -534,8 +559,10 @@ impl KvCache for ChunkedKvCache {
         self.offset = sk;
         Ok(())
       }
-      n => Err(Error::Backend(format!(
-        "ChunkedKvCache state must have exactly 2 arrays (its setter unpacks keys, values = v; empty/other is invalid), got {n}"
+      n => Err(Error::OutOfRange(OutOfRangePayload::new(
+        "ChunkedKvCache::set_state: state array count",
+        "must be exactly 2 (its setter unpacks keys, values = v; empty/other is invalid)",
+        n.to_string(),
       ))),
     }
   }
@@ -562,9 +589,10 @@ impl KvCache for ChunkedKvCache {
   /// same two fields, same order/format as `cache.py:800-802`).
   fn set_meta_state(&mut self, m: &[String]) -> Result<()> {
     if m.len() != 2 {
-      return Err(Error::Backend(format!(
-        "ChunkedKvCache meta_state must have 2 values, got {}",
-        m.len()
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "ChunkedKvCache::set_meta_state: meta_state",
+        2,
+        m.len(),
       )));
     }
     // Swift `if newValue[0] == "None" { chunkSize = nil } else { Int(...) }`.
@@ -572,6 +600,7 @@ impl KvCache for ChunkedKvCache {
       None
     } else {
       Some(m[0].parse::<usize>().map_err(|e| {
+        // migrate-C: kept as Backend — runtime parser error `e` + meta_state element `m[0]`
         Error::Backend(format!(
           "ChunkedKvCache meta_state chunk_size ({:?}): {e}",
           m[0]
@@ -579,6 +608,7 @@ impl KvCache for ChunkedKvCache {
       })?)
     };
     let start_position = m[1].parse::<usize>().map_err(|e| {
+      // migrate-C: kept as Backend — runtime parser error `e` + meta_state element `m[1]`
       Error::Backend(format!(
         "ChunkedKvCache meta_state start_position ({:?}): {e}",
         m[1]
@@ -608,9 +638,15 @@ impl KvCache for ChunkedKvCache {
       .offset
       .checked_sub(self.start_position)
       .ok_or_else(|| {
-        Error::ShapeMismatch(format!(
-          "ChunkedKvCache::trim: start_position ({}) exceeds offset ({})",
-          self.start_position, self.offset
+        // OutOfRange preserves the offending operands the original
+        // message surfaced.
+        Error::OutOfRange(OutOfRangePayload::new(
+          "ChunkedKvCache::trim: start_position vs offset",
+          "start_position must not exceed offset",
+          format!(
+            "start_position={}, offset={}",
+            self.start_position, self.offset
+          ),
         ))
       })?;
     let trimmed = span.min(n);

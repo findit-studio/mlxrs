@@ -4,7 +4,7 @@ use std::str::FromStr;
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{Error, InvariantViolationPayload, OutOfRangePayload, RankMismatchPayload, Result},
   lm::cache::{KvCache, MaskMode, mask},
   ops,
 };
@@ -58,6 +58,8 @@ where
   let comma_count = s.bytes().filter(|&b| b == b',').count();
   let upper_bound = comma_count.saturating_add(1);
   if upper_bound > max_elems {
+    // migrate-C: kept as Backend — runtime `what` interpolated; no static
+    // context available for OutOfRange without restructuring callers.
     return Err(Error::Backend(format!(
       "ArraysCache meta_state {what}: element count ({upper_bound}) exceeds bound ({max_elems}) — \
          a forged CSV payload was rejected before allocation"
@@ -70,9 +72,10 @@ where
     .try_reserve_exact(upper_bound)
     .map_err(|_| Error::OutOfMemory)?;
   for p in s.split(',') {
-    let v = p
-      .parse::<T>()
-      .map_err(|e| Error::Backend(format!("ArraysCache meta_state {what} ({p:?}): {e}")))?;
+    let v = p.parse::<T>().map_err(|e| {
+      // migrate-C: kept as Backend — runtime parser error `e` + element `p` + `what` (Display chain)
+      Error::Backend(format!("ArraysCache meta_state {what} ({p:?}): {e}"))
+    })?;
     out.push(v);
   }
   Ok(out)
@@ -313,9 +316,10 @@ impl ArraysCache {
       // mismatch — use `Error::Backend` so callers can distinguish "wrong
       // slot index" from "wrong tensor shape" via the variant alone
       // (Copilot review #3271124415).
-      None => Err(Error::Backend(format!(
-        "ArraysCache: slot index {idx} out of range (size {})",
-        self.cache.len()
+      None => Err(Error::OutOfRange(OutOfRangePayload::new(
+        "ArraysCache::set: slot index",
+        "must be < cache.len()",
+        format!("{idx} (size {})", self.cache.len()),
       ))),
     }
   }
@@ -336,8 +340,10 @@ impl ArraysCache {
       let shape = slot.shape();
       return match shape.first() {
         Some(&b) => Ok(b),
-        None => Err(Error::ShapeMismatch(format!(
-          "ArraysCache.batch_size: slot has rank 0, no leading axis (shape {shape:?})"
+        None => Err(Error::RankMismatch(RankMismatchPayload::new(
+          "ArraysCache::batch_size: slot has rank 0, no leading axis",
+          0,
+          shape,
         ))),
       };
     }
@@ -373,8 +379,17 @@ impl ArraysCache {
     // surface as `Error::Backend` (Copilot review #3271308749) for the
     // same reason `set` and `update` switched: variants should reflect
     // the actual condition, not a misleading "shape" framing.
-    let n = i32::try_from(n)
-      .map_err(|_| Error::Backend(format!("ArraysCache.advance: N {n} exceeds i32::MAX")))?;
+    // OutOfRange (not ArithmeticOverflow) preserves the offending `n` in
+    // payload.value(): the operator needs the actual restored or supplied
+    // bound to identify the bad cache metadata or caller input.
+    let n_val = n;
+    let n = i32::try_from(n).map_err(|_| {
+      Error::OutOfRange(OutOfRangePayload::new(
+        "ArraysCache::advance: N",
+        "must be <= i32::MAX",
+        n_val.to_string(),
+      ))
+    })?;
     if let Some(l) = &mut self.lengths {
       for v in l.iter_mut() {
         *v = v.wrapping_sub(n);
@@ -417,7 +432,10 @@ impl KvCache for ArraysCache {
   /// `update_and_fetch`" — rather than misleadingly suggesting the caller
   /// passed wrong-shaped tensors (Copilot review #3271124426).
   fn update(&mut self, _keys: &Array, _values: &Array) -> Result<(Array, Array)> {
-    Err(Error::Backend("ArraysCache::update is unsupported (generic slot cache, not K/V; use `get`/`set`/`state` instead)".into()))
+    Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "ArraysCache::update",
+      "is unsupported on a generic slot cache (not K/V; use `get`/`set`/`state` instead)",
+    )))
   }
 
   /// Present (non-`None`) slots in slot order — swift `ArraysCache`
@@ -514,15 +532,17 @@ impl KvCache for ArraysCache {
     }
     // Slot-aware: m[0]=slotCount, m[1]=presentSlots CSV, m[2]?=leftPadding.
     let slot_count: usize = m[0].parse().map_err(|e| {
+      // migrate-C: kept as Backend — runtime parser error `e` + slotCount string (Display chain)
       Error::Backend(format!(
         "ArraysCache meta_state slotCount ({:?}): {e}",
         m[0]
       ))
     })?;
     if m.len() < 2 {
-      return Err(Error::Backend(
-        "ArraysCache slot-aware meta_state needs [slotCount, presentSlots, leftPadding?]".into(),
-      ));
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "ArraysCache::set_meta_state: slot-aware meta_state",
+        "needs [slotCount, presentSlots, leftPadding?]",
+      )));
     }
     // Atomicity is structural, not incidental: **every** fallible *and*
     // allocating step is staged here, with `self` still completely
@@ -564,16 +584,21 @@ impl KvCache for ArraysCache {
     //    pre-check, the residual `try_reserve_exact` failure is
     //    unambiguously OOM.
     if slot_count > MAX_SLOT_COUNT {
-      return Err(Error::Backend(format!(
-        "ArraysCache meta_state: slot_count {slot_count} exceeds MAX_SLOT_COUNT ({MAX_SLOT_COUNT}) — \
-           realistic SSM/Mamba caches use ≤ 64 slots; the cap fails fast on forged/corrupt meta_state"
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "ArraysCache::set_meta_state: slot_count",
+        "must not exceed MAX_SLOT_COUNT (realistic SSM/Mamba caches use ≤ 64 slots; the cap fails fast on forged/corrupt meta_state)",
+        slot_count.to_string(),
       )));
     }
     let elem_size = std::mem::size_of::<Option<Array>>().max(1);
     if slot_count > (isize::MAX as usize) / elem_size {
-      // TODO(§5): promote to ArithmeticOverflow — `slot_count` is dynamic; needs ArithmeticOverflow with a runtime context String or a dedicated SlotCountOverflow { slot_count: usize } variant.
-      return Err(Error::Backend(format!(
-        "ArraysCache meta_state: invalid slot_count {slot_count} (capacity overflow — exceeds isize::MAX / sizeof::<Option<Array>>())"
+      // OutOfRange (not ArithmeticOverflow) preserves the offending
+      // slot_count operand so the operator can identify the bad
+      // meta_state without reproducing internal sizing math.
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "ArraysCache::set_meta_state: slot_count",
+        "slot_count * sizeof::<Option<Array>>() must not exceed isize::MAX (capacity overflow)",
+        slot_count.to_string(),
       )));
     }
     // `presentSlots` is the producer's own `usize` slot index (emit at the

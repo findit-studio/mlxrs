@@ -45,7 +45,9 @@
 
 use crate::{
   array::Array,
-  error::{ArithmeticOverflowPayload, Error, InvariantViolationPayload, Result},
+  error::{
+    ArithmeticOverflowPayload, Error, InvariantViolationPayload, LengthMismatchPayload, Result,
+  },
   lm::cache::{KvCache, MaskMode, RopeOffset},
 };
 
@@ -248,10 +250,10 @@ impl KvCache for CacheList {
     }
     let total: usize = lengths.iter().sum();
     if total != state.len() {
-      return Err(Error::Backend(format!(
-        "CacheList::set_state: flattened state has {} arrays but the \
-           children expect {total}",
-        state.len()
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "CacheList::set_state: flattened state vs children-expected count",
+        total,
+        state.len(),
       )));
     }
     // Stage onto copies first: copy every child, apply each per-child
@@ -359,12 +361,10 @@ impl KvCache for CacheList {
   /// rebuilds children atomically. A recoverable [`Error::Backend`] — the
   /// no-panic equivalent of Swift's `assertionFailure`.
   fn set_meta_state(&mut self, _m: &[String]) -> Result<()> {
-    Err(Error::Backend(
-      "CacheList::set_meta_state is invalid — reconstruct via \
-                from_state(\"CacheList\", state, meta) (Swift: \
-                CacheList.fromState)"
-        .into(),
-    ))
+    Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "CacheList::set_meta_state",
+      "is invalid — reconstruct via from_state(\"CacheList\", state, meta) (Swift: CacheList.fromState)",
+    )))
   }
 
   /// `all(c.is_trimmable() for c in self.caches)` — mlx-lm
@@ -454,12 +454,10 @@ impl KvCache for CacheList {
     _window_size: Option<usize>,
     _return_array: bool,
   ) -> Result<MaskMode> {
-    Err(Error::Backend(
-      "CacheList::make_mask is invalid — mask per child via \
-                CacheList::get (mlx-lm CacheList/_BaseCache define no \
-                make_mask; masking is per child)"
-        .into(),
-    ))
+    Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "CacheList::make_mask",
+      "is invalid — mask per child via CacheList::get (mlx-lm CacheList/_BaseCache define no make_mask; masking is per child)",
+    )))
   }
 
   /// The **sum** of children's `nbytes` — mlx-lm `CacheList.nbytes`
@@ -679,6 +677,9 @@ fn build_cache_list_children(
   meta: &[String],
   depth_budget: usize,
 ) -> Result<Vec<Box<dyn KvCache>>> {
+  // migrate-C: kept as Backend — closure formats runtime `m: &str` interpolating
+  // dynamic child indices/depth, with each call-site composing its own runtime context;
+  // typed-variant migration would require restructuring each call-site individually.
   let err = |m: &str| Error::Backend(format!("CacheList: {m}"));
 
   // Reject the over-deep chain BEFORE parsing this level's frame: a forged

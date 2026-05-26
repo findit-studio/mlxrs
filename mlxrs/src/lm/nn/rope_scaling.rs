@@ -40,7 +40,7 @@
 
 use crate::{
   array::Array,
-  error::{Error, LengthMismatchPayload, OutOfRangePayload, Result},
+  error::{Error, LengthMismatchPayload, OutOfRangePayload, RankMismatchPayload, Result},
   lm::nn::rope::{RopeOffsetRef, rope_with_freqs_offset},
 };
 
@@ -98,11 +98,11 @@ fn freqs_array(freqs: &[f64]) -> Result<Array> {
   for &v in freqs {
     let f = v as f32;
     if !f.is_finite() || f <= 0.0 || !(1.0f32 / f).is_finite() {
-      return Err(Error::ShapeMismatch(format!(
-        "scaled RoPE computed a freq ({v}) that is non-positive, non-finite, or whose \
-           reciprocal 1/f overflows f32; check the scaling config (base / factor / embeddings \
-           / betas) — freqs are inverted as 1/freqs by mlx_fast_rope, so a zero / subnormal \
-           element would become +Inf at apply time"
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "scaled RoPE: derived freq",
+        "must be a positive finite f32 with finite reciprocal (1/f overflows or zero/subnormal would \
+           become +Inf at apply time — check the scaling config: base / factor / embeddings / betas)",
+        v.to_string(),
       )));
     }
     buf.push(f);
@@ -116,13 +116,15 @@ fn freqs_array(freqs: &[f64]) -> Result<Array> {
 /// catch-all: no scaled-RoPE constructor may return `Ok` carrying a NaN/±Inf
 /// scalar that `apply` would later multiply onto activations. `what` names the
 /// constant for the error message.
-fn finite_scalar(value: f64, what: &str) -> Result<f32> {
+fn finite_scalar(value: f64, what: &'static str) -> Result<f32> {
   let v = value as f32;
   if v.is_finite() {
     Ok(v)
   } else {
-    Err(Error::ShapeMismatch(format!(
-      "scaled RoPE computed a non-finite {what} ({value}); check the scaling config"
+    Err(Error::OutOfRange(OutOfRangePayload::new(
+      what,
+      "must be finite (check the scaling config)",
+      value.to_string(),
     )))
   }
 }
@@ -131,12 +133,14 @@ fn finite_scalar(value: f64, what: &str) -> Result<f32> {
 /// past the positivity/`> 1` comparisons that follow (`NaN <= 0.0` and
 /// `NaN > 1.0` are both `false`, so an unchecked NaN would pass every ordered
 /// guard and poison the arithmetic). `what` names the field for the message.
-fn require_finite_input(value: f32, what: &str) -> Result<()> {
+fn require_finite_input(value: f32, what: &'static str) -> Result<()> {
   if value.is_finite() {
     Ok(())
   } else {
-    Err(Error::ShapeMismatch(format!(
-      "scaled RoPE {what} must be finite, got {value}"
+    Err(Error::OutOfRange(OutOfRangePayload::new(
+      what,
+      "must be finite",
+      value.to_string(),
     )))
   }
 }
@@ -147,12 +151,14 @@ fn require_finite_input(value: f32, what: &str) -> Result<()> {
 /// `1/freqs[i]` so a zero element becomes `+Inf` at apply time, and a negative
 /// element flips the rotation direction). `NaN > 0.0` is `false`, so this
 /// rejects NaN too. `what` names the field for the message.
-fn require_positive_input(value: f32, what: &str) -> Result<()> {
+fn require_positive_input(value: f32, what: &'static str) -> Result<()> {
   if value.is_finite() && value > 0.0 {
     Ok(())
   } else {
-    Err(Error::ShapeMismatch(format!(
-      "scaled RoPE {what} must be a positive finite number, got {value}"
+    Err(Error::OutOfRange(OutOfRangePayload::new(
+      what,
+      "must be a positive finite number",
+      value.to_string(),
     )))
   }
 }
@@ -177,9 +183,11 @@ fn require_positive_input(value: f32, what: &str) -> Result<()> {
 fn scale_leading_dims(x: &Array, dims: i32, mscale: f32) -> Result<Array> {
   let ndim = x.ndim();
   if ndim == 0 {
-    return Err(Error::ShapeMismatch(
-      "scaled RoPE input must have at least one axis".to_string(),
-    ));
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "scaled RoPE input must have at least one axis",
+      0,
+      Vec::new(),
+    )));
   }
   // Build the scalar in `x`'s dtype so `multiply` does not promote half-precision
   // inputs to f32 (mirrors the references' in-place-into-`x` store).
@@ -190,8 +198,13 @@ fn scale_leading_dims(x: &Array, dims: i32, mscale: f32) -> Result<Array> {
   // and surface a recoverable error instead.
   let head_dim_usize = x.shape()[last];
   let head_dim = i32::try_from(head_dim_usize).map_err(|_| {
-    Error::ShapeMismatch(format!(
-      "scaled RoPE head_dim {head_dim_usize} exceeds i32::MAX"
+    // OutOfRange preserves the offending `head_dim_usize` the original
+    // `ShapeMismatch(format!("scaled RoPE head_dim {head_dim_usize} exceeds i32::MAX"))`
+    // surfaced; ArithmeticOverflow's value-less payload would lose it.
+    Error::OutOfRange(OutOfRangePayload::new(
+      "scaled RoPE: head_dim",
+      "must be <= i32::MAX",
+      head_dim_usize.to_string(),
     ))
   })?;
   if head_dim == dims {
@@ -199,8 +212,13 @@ fn scale_leading_dims(x: &Array, dims: i32, mscale: f32) -> Result<Array> {
     return x.multiply(&scalar);
   }
   if head_dim < dims {
-    return Err(Error::ShapeMismatch(format!(
-      "scaled RoPE dims {dims} exceeds head_dim {head_dim}"
+    // OutOfRange preserves the offending operands (`dims` and `head_dim`)
+    // so the operator can identify which rope config / input combo
+    // tripped the invariant.
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "scaled RoPE: dims vs head_dim",
+      "dims must not exceed head_dim",
+      format!("dims={dims}, head_dim={head_dim}"),
     )));
   }
   // head_dim > dims: scale only the leading `dims` features, keep the tail.
@@ -312,13 +330,13 @@ impl Llama3Rope {
     // (`wavelen > low_wl`, band selects) and poisons every freq. The
     // `freqs_array` positive-finite gate below is the catch-all, but
     // rejecting the inputs up front yields a clearer message.
-    require_positive_input(base, "base")?;
-    require_positive_input(scaling.factor, "factor")?;
-    require_positive_input(scaling.low_freq_factor, "low_freq_factor")?;
-    require_positive_input(scaling.high_freq_factor, "high_freq_factor")?;
+    require_positive_input(base, "Llama3Rope: base")?;
+    require_positive_input(scaling.factor, "Llama3Rope: factor")?;
+    require_positive_input(scaling.low_freq_factor, "Llama3Rope: low_freq_factor")?;
+    require_positive_input(scaling.high_freq_factor, "Llama3Rope: high_freq_factor")?;
     require_positive_input(
       scaling.original_max_position_embeddings,
-      "original_max_position_embeddings",
+      "Llama3Rope: original_max_position_embeddings",
     )?;
     // Catch-all: rejects any freq that came out non-positive or NaN/±Inf
     // (degenerate factors, equal-band singularities, etc.) before it is stored.
@@ -431,9 +449,9 @@ impl SuScaledRope {
     // — and a negative entry flips its rotation direction). The
     // `freqs_array` positive-finite gate below is the catch-all; this is the
     // clearer message.
-    require_positive_input(base, "base")?;
+    require_positive_input(base, "SuScaledRoPE: base")?;
     for &lf in long_factor {
-      require_positive_input(lf, "long_factor entry")?;
+      require_positive_input(lf, "SuScaledRoPE: long_factor entry")?;
     }
     let base_freqs = base_pair_freqs(f64::from(base), dims, half);
     let freqs: Vec<f64> = base_freqs
@@ -449,7 +467,7 @@ impl SuScaledRope {
       // values are then unused), so accept it verbatim — but it is still stored
       // and multiplied onto activations, so it must be finite.
       Some(mscale) => {
-        require_finite_input(mscale, "long_mscale")?;
+        require_finite_input(mscale, "SuScaledRoPE: long_mscale")?;
         mscale
       }
       None => {
@@ -458,6 +476,8 @@ impl SuScaledRope {
         // by it; a non-positive value would yield a NaN/Inf scale that silently
         // propagates. Reject it before computing the factor.
         if original_max_position_embeddings <= 0 || max_position_embeddings <= 0 {
+          // migrate-C: kept as ShapeMismatch — composite (two parallel positivity checks
+          // on max_position_embeddings + original_max_position_embeddings)
           return Err(Error::ShapeMismatch(format!(
             "SuScaledRoPE max_position_embeddings ({max_position_embeddings}) and \
                original_max_position_embeddings ({original_max_position_embeddings}) must be \
@@ -476,16 +496,16 @@ impl SuScaledRope {
           // this path explicitly (the `finite_scalar` gate below would also
           // catch the resulting `+Inf`, but the message here is precise).
           if original_max_position_embeddings <= 1 {
-            return Err(Error::ShapeMismatch(format!(
-              "SuScaledRoPE original_max_position_embeddings ({original_max_position_embeddings}) \
-                 must be > 1 on the derived-scale path (factor > 1): ln(1) = 0 divides the scale \
-                 to +Inf"
+            return Err(Error::OutOfRange(OutOfRangePayload::new(
+              "SuScaledRoPE: original_max_position_embeddings",
+              "must be > 1 on the derived-scale path (factor > 1): ln(1) = 0 divides the scale to +Inf",
+              original_max_position_embeddings.to_string(),
             )));
           }
           // sqrt(1 + ln(factor) / ln(orig_max)); finiteness is the catch-all.
           finite_scalar(
             (1.0 + factor.ln() / f64::from(original_max_position_embeddings).ln()).sqrt(),
-            "input scale",
+            "SuScaledRoPE: derived input scale",
           )?
         }
       }
@@ -588,12 +608,12 @@ impl YarnRope {
     // ordered `<= 0` / `<= 1` guards below (`NaN <= 0.0` and `NaN > 1.0` are
     // both `false`) and poison the correction dims, the ramp, the mscale, or the
     // freqs. Reject every float input used in the arithmetic first.
-    require_finite_input(base, "base")?;
-    require_finite_input(config.scaling_factor, "scaling_factor")?;
-    require_finite_input(config.beta_fast, "beta_fast")?;
-    require_finite_input(config.beta_slow, "beta_slow")?;
-    require_finite_input(config.mscale, "mscale")?;
-    require_finite_input(config.mscale_all_dim, "mscale_all_dim")?;
+    require_finite_input(base, "YarnRoPE: base")?;
+    require_finite_input(config.scaling_factor, "YarnRoPE: scaling_factor")?;
+    require_finite_input(config.beta_fast, "YarnRoPE: beta_fast")?;
+    require_finite_input(config.beta_slow, "YarnRoPE: beta_slow")?;
+    require_finite_input(config.mscale, "YarnRoPE: mscale")?;
+    require_finite_input(config.mscale_all_dim, "YarnRoPE: mscale_all_dim")?;
 
     let base = f64::from(base);
     let dims_f = f64::from(dims);
@@ -622,6 +642,8 @@ impl YarnRope {
       )));
     }
     if config.beta_fast <= 0.0 || config.beta_slow <= 0.0 {
+      // migrate-C: kept as ShapeMismatch — composite (two parallel positivity checks
+      // on beta_fast + beta_slow)
       return Err(Error::ShapeMismatch(format!(
         "YarnRoPE beta_fast ({}) and beta_slow ({}) must be positive",
         config.beta_fast, config.beta_slow
@@ -666,7 +688,7 @@ impl YarnRope {
     let mscale = finite_scalar(
       get_mscale(scaling_factor, f64::from(config.mscale))
         / get_mscale(scaling_factor, f64::from(config.mscale_all_dim)),
-      "mscale",
+      "YarnRoPE: derived mscale",
     )?;
 
     // freq_extra = base_freqs ; freq_inter = scaling_factor * base_freqs

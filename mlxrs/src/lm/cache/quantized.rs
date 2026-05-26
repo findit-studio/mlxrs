@@ -2,7 +2,7 @@
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{Error, InvariantViolationPayload, OutOfRangePayload, Result},
   lm::cache::{
     KvCache, MaskMode, QTriple, QuantizedKvCache, mask,
     util::{KV_NDIM, concat_seq, nbytes, seq_len, slice_seq},
@@ -230,6 +230,7 @@ impl QuantizedKvCacheImpl {
     // a recoverable error at the load boundary, not a panic via a blind
     // `shape[axis]` index later.
     if ks.len() != KV_NDIM || vs.len() != KV_NDIM {
+      // migrate-C: kept as ShapeMismatch — composite (rank check on K AND V) + runtime `element`
       return Err(Error::ShapeMismatch(format!(
         "QuantizedKvCache::set_state: K and V {element} must both be 4-D \
            [B, n_kv_heads, S, payload_dim] (K rank {} shape {ks:?} vs V rank \
@@ -250,6 +251,7 @@ impl QuantizedKvCacheImpl {
     // rejected those valid skewed caches on their own saved state.
     for (axis, (ka, va)) in ks.iter().zip(vs.iter()).take(KV_NDIM - 1).enumerate() {
       if ka != va {
+        // migrate-C: kept as ShapeMismatch — composite (per-axis K vs V check) + runtime `element` + `axis`
         return Err(Error::ShapeMismatch(format!(
           "QuantizedKvCache::set_state: K and V {element} leading axes \
              (B, n_kv_heads, S) must match; disagree on axis {axis} \
@@ -279,10 +281,10 @@ impl QuantizedKvCacheImpl {
       (Some(pb), Some(nb)) => Some(concat_seq(pb, nb)?),
       (None, None) => None,
       _ => {
-        return Err(Error::ShapeMismatch(
-          "QuantizedKvCache: biases present in only one of the stored / new quantized triple"
-            .into(),
-        ));
+        return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+          "QuantizedKvCache::concat_triple: biases presence",
+          "must be the same on stored and new triples (mixed: bias-less + affine pairing)",
+        )));
       }
     };
     Ok((w, s, b))
@@ -325,8 +327,11 @@ impl QuantizedKvCacheImpl {
     // `self.offset += num_steps` (cache.py:275) — checked (Python ints
     // never overflow; a corrupt restored `offset` could wrap/panic here).
     let new_offset = prev.checked_add(num_steps).ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "QuantizedKvCache update: offset ({prev}) + num_steps ({num_steps}) overflows usize"
+      // OutOfRange preserves both operands the original message surfaced.
+      Error::OutOfRange(OutOfRangePayload::new(
+        "QuantizedKvCache::compute_appended: offset + num_steps",
+        "must fit usize",
+        format!("offset={prev}, num_steps={num_steps}"),
       ))
     })?;
 
@@ -689,8 +694,10 @@ impl KvCache for QuantizedKvCacheImpl {
         self.values = Some((v_w, v_s, Some(v_b)));
         Ok(())
       }
-      n => Err(Error::Backend(format!(
-        "QuantizedKvCache state must have 0, 4, or 6 arrays, got {n}"
+      n => Err(Error::OutOfRange(OutOfRangePayload::new(
+        "QuantizedKvCache::set_state: state array count",
+        "must be 0, 4, or 6",
+        n.to_string(),
       ))),
     }
   }
@@ -766,25 +773,29 @@ impl KvCache for QuantizedKvCacheImpl {
       3 => (0, 1, 2),
       4 => (1, 2, 3),
       n => {
-        return Err(Error::Backend(format!(
-          "QuantizedKvCache meta_state must have 3 (mlx-lm form) or 4 \
-             (mlx-swift-lm form) values, got {n}"
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "QuantizedKvCache::set_meta_state: meta_state count",
+          "must be 3 (mlx-lm form) or 4 (mlx-swift-lm form)",
+          n.to_string(),
         )));
       }
     };
     let offset = m[offset_idx].parse::<usize>().map_err(|e| {
+      // migrate-C: kept as Backend — runtime parser error `e` + meta_state element
       Error::Backend(format!(
         "QuantizedKvCache meta_state offset ({:?}): {e}",
         m[offset_idx]
       ))
     })?;
     let group_size = m[group_size_idx].parse::<i32>().map_err(|e| {
+      // migrate-C: kept as Backend — runtime parser error `e` + meta_state element
       Error::Backend(format!(
         "QuantizedKvCache meta_state group_size ({:?}): {e}",
         m[group_size_idx]
       ))
     })?;
     let bits = m[bits_idx].parse::<i32>().map_err(|e| {
+      // migrate-C: kept as Backend — runtime parser error `e` + meta_state element
       Error::Backend(format!(
         "QuantizedKvCache meta_state bits ({:?}): {e}",
         m[bits_idx]
@@ -991,9 +1002,10 @@ impl KvCache for QuantizedKvCacheImpl {
     // stores the new triple — phantom context / stale tokens. Run BOTH
     // checks on `staged` so a failure leaves `self` byte-identical.
     if staged.is_empty() && staged.offset() != 0 {
-      return Err(Error::Backend(
-        "QuantizedKvCache: empty state with non-zero offset is invalid".into(),
-      ));
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "QuantizedKvCache: empty state",
+        "must have offset == 0 (non-zero offset on empty state is invalid)",
+      )));
     }
     staged.enforce_offset_len_invariant()?;
     *self = staged;

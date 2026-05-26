@@ -238,13 +238,13 @@ fn prepare_advance_finalize() {
 fn update_returns_err_not_kv() {
   // mlx-lm `ArraysCache` has NO `update_and_fetch`: it is a generic slot
   // cache, not K/V. The trait `update` must be a recoverable error.
-  // Surfaced as `Error::Backend` ("unsupported operation"), NOT
+  // Surfaced as `Error::InvariantViolation` ("unsupported operation"), NOT
   // `ShapeMismatch` — the condition isn't a wrong-shaped tensor (Copilot
   // review #3271124426).
   let mut c = ArraysCache::new(2);
   let a = slot(&[1.0]);
   let err = c.update(&a, &a).unwrap_err();
-  assert!(matches!(err, Error::Backend(_)));
+  assert!(matches!(err, Error::InvariantViolation(_)));
 }
 
 #[test]
@@ -472,17 +472,19 @@ fn set_meta_state_rejects_slot_count_above_max_cap() {
   let meta = vec![just_over.to_string(), "0,1".into()];
   let err = d.set_meta_state(&meta);
   match err {
-    Err(Error::Backend(message)) => {
+    Err(Error::OutOfRange(payload)) => {
       assert!(
-        message.contains("exceeds MAX_SLOT_COUNT"),
-        "expected message to mention MAX_SLOT_COUNT, got: {message}"
+        payload.requirement().contains("MAX_SLOT_COUNT"),
+        "expected requirement to mention MAX_SLOT_COUNT, got: {}",
+        payload.requirement()
       );
-      assert!(
-        message.contains(&just_over.to_string()),
-        "expected message to include offending slot_count {just_over}, got: {message}"
+      assert_eq!(
+        payload.value(),
+        just_over.to_string(),
+        "expected OutOfRange value to be the offending slot_count {just_over}"
       );
     }
-    other => panic!("expected Err(Backend) about MAX_SLOT_COUNT, got {other:?}"),
+    other => panic!("expected Err(OutOfRange) about MAX_SLOT_COUNT, got {other:?}"),
   }
   // Cache survived unchanged: the 2 compacted arrays are still present.
   let s = d.state().unwrap();
@@ -524,18 +526,20 @@ fn kvc2_arrayscache_rejects_huge_slot_count_before_csv_parse() {
     .join(",");
   let meta = vec![huge_slot_count, big_payload.clone()];
   match d.set_meta_state(&meta) {
-    Err(Error::Backend(message)) => {
+    Err(Error::OutOfRange(payload)) => {
       assert!(
-        message.contains("exceeds MAX_SLOT_COUNT"),
-        "cap MUST fire first: expected MAX_SLOT_COUNT error, got: {message}"
+        payload.requirement().contains("MAX_SLOT_COUNT"),
+        "cap MUST fire first: expected MAX_SLOT_COUNT requirement, got: {}",
+        payload.requirement()
       );
       // And NOT a CSV-parse error (would mean the parse ran first).
       assert!(
-        !message.contains("presentSlots"),
-        "MAX_SLOT_COUNT gate must precede CSV parse; got presentSlots-mentioning error: {message}"
+        !payload.context().contains("presentSlots")
+          && !payload.requirement().contains("presentSlots"),
+        "MAX_SLOT_COUNT gate must precede CSV parse; got presentSlots-mentioning context/requirement"
       );
     }
-    other => panic!("expected Err(Backend) about MAX_SLOT_COUNT, got {other:?}"),
+    other => panic!("expected Err(OutOfRange) about MAX_SLOT_COUNT, got {other:?}"),
   }
   // Also: the slot_count == 1 case (a small declared cap but a huge CSV
   // payload) — the per-CSV `max_elems = slot_count` bound MUST reject the

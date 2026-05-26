@@ -31,7 +31,10 @@
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{DtypeMismatchPayload, Error, Result},
+  error::{
+    DtypeMismatchPayload, Error, InvariantViolationPayload, LengthMismatchPayload,
+    OutOfRangePayload, RankMismatchPayload, Result,
+  },
   lm::cache::{
     BatchPositionedKvCache, KvCache, MaskMode,
     util::{KV_NDIM, concat_seq, nbytes, seq_len, slice_seq},
@@ -52,6 +55,7 @@ use crate::{
 pub(crate) fn batch_head_dim(name: &str, a: &Array) -> Result<usize> {
   let shape = a.shape();
   if shape.len() != KV_NDIM {
+    // migrate-C: kept as ShapeMismatch — `name` is runtime `&str` (keys/values)
     return Err(Error::ShapeMismatch(format!(
       "batched KV cache expects 4-D {name} [B, n_kv_heads, S, head_dim], got shape {shape:?}"
     )));
@@ -78,18 +82,24 @@ pub(crate) fn validate_kv_compat(keys: &Array, values: &Array) -> Result<()> {
   let ks = keys.shape();
   let vs = values.shape();
   if ks.len() != KV_NDIM {
-    return Err(Error::ShapeMismatch(format!(
-      "batched KV cache expects 4-D keys [B, n_kv_heads, S, head_dim], got shape {ks:?}"
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "batched KV cache expects 4-D keys [B, n_kv_heads, S, head_dim]",
+      ks.len() as u32,
+      ks,
     )));
   }
   if vs.len() != KV_NDIM {
-    return Err(Error::ShapeMismatch(format!(
-      "batched KV cache expects 4-D values [B, n_kv_heads, S, head_dim], got shape {vs:?}"
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "batched KV cache expects 4-D values [B, n_kv_heads, S, head_dim]",
+      vs.len() as u32,
+      vs,
     )));
   }
   // mlx-lm couples values to keys' B / n_kv_heads / S (head_dim free) via
   // the `new_v` buffer + `self.values[..., prev:_idx, :] = values` assign.
   if ks[0] != vs[0] || ks[1] != vs[1] || ks[2] != vs[2] {
+    // migrate-C: kept as ShapeMismatch — composite (three parallel dim checks
+    // on [B, n_kv_heads, S]; head_dim deliberately excluded)
     return Err(Error::ShapeMismatch(format!(
       "batched KV cache: values shape {vs:?} must match keys {ks:?} on \
          [B, n_kv_heads, S] (head_dim may differ) — mlx-lm raises at \
@@ -142,12 +152,14 @@ pub fn dynamic_roll(x: &Array, shifts: &Array, axis: i32) -> Result<Array> {
   // Callers are fixed (4-D, axis=2); validate rather than raw-index.
   let xshape = x.shape();
   if xshape.len() != KV_NDIM || axis != (KV_NDIM as i32) - 2 {
+    // migrate-C: kept as ShapeMismatch — composite (rank + axis-value fused check)
     return Err(Error::ShapeMismatch(format!(
       "dynamic_roll: expects 4-D x [B, n_kv_heads, S, head_dim] and axis=2, got shape {xshape:?} axis={axis}"
     )));
   }
   let sshape = shifts.shape();
   if sshape.len() != 2 || sshape[1] != 1 {
+    // migrate-C: kept as ShapeMismatch — composite (rank + sshape[1] dim fused check)
     return Err(Error::ShapeMismatch(format!(
       "dynamic_roll: expects shifts shaped [B, 1], got {sshape:?}"
     )));
@@ -174,10 +186,10 @@ pub fn dynamic_roll(x: &Array, shifts: &Array, axis: i32) -> Result<Array> {
   // rather than returning silently-wrong indices.
   const F32_EXACT_INT_MAX: usize = 1usize << 24;
   if n > F32_EXACT_INT_MAX {
-    return Err(Error::ShapeMismatch(format!(
-      "dynamic_roll: sequence axis n ({n}) exceeds f32 exact-int limit \
-         (2^24 = {F32_EXACT_INT_MAX}); arange/cast would silently alias \
-         indices and produce wrong rolls"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "dynamic_roll: sequence axis n",
+      "must not exceed f32 exact-int limit (2^24); arange/cast would silently alias indices and produce wrong rolls",
+      n.to_string(),
     )));
   }
   // arange(n) -> [S]; expand_indices = (..., None) -> [S, 1].
@@ -353,12 +365,10 @@ impl BatchKvCache {
             .collect::<Vec<i32>>()
         }
         Some(rp_host) => {
-          return Err(Error::ShapeMismatch(format!(
-            "BatchKvCache::finalize: right_padding length ({}) does not match \
-               pad_lengths length ({}) and is not a length-1 scalar broadcast — \
-               refusing to commit a desynchronized pad_lengths host mirror",
+          return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+            "BatchKvCache::finalize: right_padding length vs pad_lengths length (not a length-1 broadcast)",
+            self.pad_lengths.len(),
             rp_host.len(),
-            self.pad_lengths.len()
           )));
         }
       };
@@ -396,9 +406,10 @@ impl BatchKvCache {
   pub fn state_kv(&self) -> Result<(Array, Array)> {
     match (&self.keys, &self.values) {
       (Some(k), Some(v)) => Ok((slice_seq(k, 0, self.idx)?, slice_seq(v, 0, self.idx)?)),
-      _ => Err(Error::Backend(
-        "BatchKvCache.state_kv on an empty cache".into(),
-      )),
+      _ => Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "BatchKvCache::state_kv",
+        "cannot be called on an empty cache",
+      ))),
     }
   }
 }
@@ -461,9 +472,15 @@ impl KvCache for BatchKvCache {
     // `_idx` near usize::MAX could overflow on add, so guard it (the value
     // is byte-identical to `self.idx + s` for every realistic input).
     let new_idx = self.idx.checked_add(s).ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "BatchKvCache update: _idx ({}) + S ({s}) overflows usize",
-        self.idx
+      // OutOfRange preserves both `_idx` and `S` (the original
+      // `"BatchKvCache update: _idx ({}) + S ({s}) overflows usize"`
+      // surfaced both); ArithmeticOverflow's value-less payload loses them.
+      // The operator needs both to decide whether `_idx` is from a corrupt
+      // restored cache (near usize::MAX) or `s` is unreasonable input.
+      Error::OutOfRange(OutOfRangePayload::new(
+        "BatchKvCache::update: _idx + S",
+        "must fit usize",
+        format!("_idx={}, S={s}", self.idx),
       ))
     })?;
     let s_scalar = ops::misc::astype(&Array::full::<f32>(&(1usize,), s as f32)?, Dtype::I32)?;
@@ -597,15 +614,17 @@ impl KvCache for BatchKvCache {
         let lp_shape = left_padding.shape();
         let kb = keys.shape()[0];
         if lp_shape.len() != 1 {
-          return Err(Error::ShapeMismatch(format!(
-            "BatchKvCache::set_state: restored left_padding must be 1-D [B], got shape {lp_shape:?}"
+          return Err(Error::RankMismatch(RankMismatchPayload::new(
+            "BatchKvCache::set_state: restored left_padding must be 1-D [B]",
+            lp_shape.len() as u32,
+            lp_shape,
           )));
         }
         if lp_shape[0] != kb {
-          return Err(Error::ShapeMismatch(format!(
-            "BatchKvCache::set_state: restored left_padding length ({}) does not match \
-               keys batch dim ({kb})",
-            lp_shape[0]
+          return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+            "BatchKvCache::set_state: restored left_padding length vs keys batch dim",
+            kb,
+            lp_shape[0],
           )));
         }
         let lp_dtype = left_padding.dtype()?;
@@ -642,8 +661,10 @@ impl KvCache for BatchKvCache {
         self.right_padding_host = None;
         Ok(())
       }
-      n => Err(Error::Backend(format!(
-        "BatchKvCache state must have 0 or 4 arrays, got {n}"
+      n => Err(Error::OutOfRange(OutOfRangePayload::new(
+        "BatchKvCache::set_state: state array count",
+        "must be 0 or 4",
+        n.to_string(),
       ))),
     }
   }
@@ -840,8 +861,11 @@ pub(crate) fn create_causal_mask_batched(
 ) -> Result<Array> {
   use crate::lm::cache::mask::{iarange, scalar_i32};
   let total = offset.checked_add(n).ok_or_else(|| {
-    Error::ShapeMismatch(format!(
-      "create_causal_mask: offset ({offset}) + N ({n}) overflows usize"
+    // OutOfRange preserves both operands the original message surfaced.
+    Error::OutOfRange(OutOfRangePayload::new(
+      "create_causal_mask: offset + N",
+      "must fit usize",
+      format!("offset={offset}, N={n}"),
     ))
   })?;
   let rinds = iarange(0, total)?;
@@ -871,8 +895,13 @@ pub(crate) fn create_causal_mask_batched(
     // lengths), but the defensive cast costs nothing and closes the
     // wrap-on-cast hole (Copilot review #3271119551).
     let w_i32 = i32::try_from(w).map_err(|_| {
-      Error::ShapeMismatch(format!(
-        "window_size ({w}) exceeds i32::MAX; cannot fit into a scalar mask offset"
+      // OutOfRange preserves the offending `w` the original
+      // `"window_size ({w}) exceeds i32::MAX; cannot fit into a scalar mask offset"`
+      // surfaced.
+      Error::OutOfRange(OutOfRangePayload::new(
+        "create_causal_mask_batched: window_size",
+        "must be <= i32::MAX (scalar mask offset)",
+        w.to_string(),
       ))
     })?;
     let bound = ops::arithmetic::add(&rinds, &scalar_i32(w_i32)?)?;
@@ -891,9 +920,16 @@ pub(crate) fn create_causal_mask_batched(
     // windowed `w_i32` cast above already use. Reject `total > i32::MAX`
     // with a recoverable `Error::ShapeMismatch` so an overflowing prefill
     // never silently corrupts the mask.
-    let total_i32 = i32::try_from(total).map_err(|_| Error::ShapeMismatch(format!(
-        "create_causal_mask_batched: total ({total}) exceeds i32::MAX; cannot fit into a scalar mask offset"
-      )))?;
+    let total_i32 = i32::try_from(total).map_err(|_| {
+      // OutOfRange preserves the offending `total` so the operator can see
+      // the exact `offset + N` sum that won't fit i32 (the right-padding
+      // bound builder needs it as a scalar i32).
+      Error::OutOfRange(OutOfRangePayload::new(
+        "create_causal_mask_batched: total (offset + N)",
+        "must be <= i32::MAX (scalar mask bound)",
+        total.to_string(),
+      ))
+    })?;
     let total_s = scalar_i32(total_i32)?;
     let bound = ops::arithmetic::subtract(&total_s, rp)?; // [B]
     let bound = ops::shape::expand_dims_axes(&bound, &[1, 2, 3])?; // [B,1,1,1]

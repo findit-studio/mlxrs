@@ -1028,8 +1028,8 @@ fn dynamic_roll_rejects_n_above_f32_exact_int_max() {
   let too_big = Array::zeros::<f32>(&(1usize, 1, LIMIT + 1, 1)).unwrap();
   let r = dynamic_roll(&too_big, &shifts_small, 2);
   assert!(
-    matches!(&r, Err(mlxrs::Error::ShapeMismatch(_))),
-    "dynamic_roll(n=2^24+1) must Err(ShapeMismatch), got {r:?}"
+    matches!(&r, Err(mlxrs::Error::OutOfRange(_))),
+    "dynamic_roll(n=2^24+1) must Err(OutOfRange), got {r:?}"
   );
 
   // Small n: succeeds (no boundary triggered).

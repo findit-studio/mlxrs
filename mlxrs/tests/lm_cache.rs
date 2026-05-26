@@ -827,11 +827,13 @@ fn rotating_offset_overflow_is_rejected_without_partial_mutation() {
   let before_state_len = c.state().unwrap().len();
 
   // S == 2 -> `_update_concat`: `offset (MAX) + S (2)` overflows.
+  // The migration uses `OutOfRange` (not `ArithmeticOverflow`) because
+  // OutOfRange's value() preserves the offending offset + S operands.
   let two = kv(&[1.0, 2.0]);
   let r_concat = c.update(&two, &two);
   assert!(
-    matches!(r_concat, Err(mlxrs::Error::ShapeMismatch(_))),
-    "concat-path offset overflow must be Err(ShapeMismatch), got {r_concat:?}"
+    matches!(r_concat, Err(mlxrs::Error::OutOfRange(_))),
+    "concat-path offset overflow must be Err(OutOfRange), got {r_concat:?}"
   );
   // No partial mutation: all four meta fields + buffer presence unchanged.
   assert_eq!(
@@ -845,8 +847,8 @@ fn rotating_offset_overflow_is_rejected_without_partial_mutation() {
   let one = kv(&[3.0]);
   let r_inplace = c.update(&one, &one);
   assert!(
-    matches!(r_inplace, Err(mlxrs::Error::ShapeMismatch(_))),
-    "in-place-path offset overflow must be Err(ShapeMismatch), got {r_inplace:?}"
+    matches!(r_inplace, Err(mlxrs::Error::OutOfRange(_))),
+    "in-place-path offset overflow must be Err(OutOfRange), got {r_inplace:?}"
   );
   assert_eq!(
     c.meta_state(),
@@ -1040,11 +1042,22 @@ fn iarange_mask_exact_in_range_and_rejects_past_f32_limit() {
 fn create_causal_mask_offset_plus_n_overflow_is_err_not_panic() {
   // offset = usize::MAX, N = 2 -> offset + N overflows usize.
   // base.py: `rinds = mx.arange(offset + N)` — the very first line.
+  // The migration uses `OutOfRange` (not `ArithmeticOverflow`) because
+  // OutOfRange's value() preserves the offending operands the original
+  // diagnostic surfaced (offset + N).
   let r = create_causal_mask(2, usize::MAX, None);
-  assert!(
-    matches!(r, Err(mlxrs::Error::ShapeMismatch(_))),
-    "offset + N overflow must be Err::ShapeMismatch (no debug panic, no release wrap)"
-  );
+  match &r {
+    Err(mlxrs::Error::OutOfRange(p)) => {
+      assert!(
+        p.value().contains("offset=") && p.value().contains("N=2"),
+        "value should carry offset/N, got: {}",
+        p.value()
+      );
+    }
+    other => panic!(
+      "offset + N overflow must be Err::OutOfRange (no debug panic, no release wrap), got {other:?}"
+    ),
+  }
 
   // Through the StandardKvCache::make_mask -> create_attention_mask ->
   // create_causal_mask forward (cache.py:393 -> cache.py:117-118): a
@@ -1055,8 +1068,8 @@ fn create_causal_mask_offset_plus_n_overflow_is_err_not_panic() {
   // the windowed branch too (offset + N still the first computation).
   let rw = create_causal_mask(3, usize::MAX, Some(4));
   assert!(
-    matches!(rw, Err(mlxrs::Error::ShapeMismatch(_))),
-    "windowed create_causal_mask must also reject offset + N overflow before any range"
+    matches!(rw, Err(mlxrs::Error::OutOfRange(_))),
+    "windowed create_causal_mask must also reject offset + N overflow before any range, got {rw:?}"
   );
 }
 
@@ -1183,10 +1196,12 @@ fn rotating_make_mask_n_gt_1_offset_plus_n_overflow_is_err_not_panic() {
   // (cache.py:559). offset + N = (usize::MAX - 1) + 2 -> overflow ->
   // checked-add Err (NOT a debug panic, NOT a release wrap that would flip
   // the cache.py:560 decision to a wrong "causal"/array choice).
+  // The migration uses `OutOfRange` (not `ArithmeticOverflow`) because
+  // OutOfRange's value() preserves the offending offset + N operands.
   let r = c.make_mask(2, None, false);
   assert!(
-    matches!(r, Err(mlxrs::Error::ShapeMismatch(_))),
-    "RotatingKvCache::make_mask N>1 offset+N overflow must be Err::ShapeMismatch \
+    matches!(r, Err(mlxrs::Error::OutOfRange(_))),
+    "RotatingKvCache::make_mask N>1 offset+N overflow must be Err::OutOfRange \
      (no panic, no wrap-then-wrong-Causal-decision)"
   );
 
@@ -1196,7 +1211,7 @@ fn rotating_make_mask_n_gt_1_offset_plus_n_overflow_is_err_not_panic() {
   // return_array` short-circuit does not skip the overflowing sum).
   let r_arr = c.make_mask(2, None, true);
   assert!(
-    matches!(r_arr, Err(mlxrs::Error::ShapeMismatch(_))),
+    matches!(r_arr, Err(mlxrs::Error::OutOfRange(_))),
     "RotatingKvCache::make_mask N>1 offset+N overflow must be Err even with return_array=true"
   );
 

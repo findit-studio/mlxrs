@@ -289,21 +289,23 @@ fn kvc3_kvcachekind_parse_accepts_every_alias() {
 
 #[test]
 fn kvc3_kvcachekind_parse_unknown_is_recoverable_err() {
-  // Unknown kinds are a recoverable Error::Backend (replaces the prior
+  // Unknown kinds are a recoverable Error::OutOfRange (replaces the prior
   // string-keyed `other => Err(...)` arm). NEVER a panic.
   let result = KvCacheKind::parse("DefinitelyNotARealCacheKind");
   match result {
-    Err(Error::Backend(message)) => {
+    Err(Error::OutOfRange(payload)) => {
       assert!(
-        message.contains("unknown cache kind"),
-        "diagnostic must name the failure mode; got {message:?}"
+        payload.context().contains("KvCacheKind"),
+        "diagnostic context must name the parser; got {}",
+        payload.context()
       );
       assert!(
-        message.contains("DefinitelyNotARealCacheKind"),
-        "diagnostic must include the offending kind string; got {message:?}"
+        payload.value().contains("DefinitelyNotARealCacheKind"),
+        "diagnostic value must include the offending kind string; got {}",
+        payload.value()
       );
     }
-    other => panic!("expected Err(Error::Backend), got {other:?}"),
+    other => panic!("expected Err(Error::OutOfRange), got {other:?}"),
   }
 }
 

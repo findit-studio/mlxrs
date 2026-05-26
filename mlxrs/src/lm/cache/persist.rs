@@ -276,11 +276,12 @@ pub fn save_prompt_cache(
 /// file, so it is a recoverable [`Error::Backend`], never a silent huge
 /// allocation or a panic.
 fn dense_len(max_idx: usize, present: usize, what: &str) -> Result<usize> {
-  let n = max_idx
-    .checked_add(1)
-    // TODO(§5): promote to typed variant — `what` is dynamic so ArithmeticOverflow { context, op_type: "usize" } needs a runtime String context; leave as Backend until a DynamicContext variant covers this pattern.
-    .ok_or_else(|| Error::Backend(format!("prompt cache: {what} index overflows usize")))?;
+  let n = max_idx.checked_add(1).ok_or_else(|| {
+    // migrate-C: kept as Backend — runtime `what` interpolated into context
+    Error::Backend(format!("prompt cache: {what} index overflows usize"))
+  })?;
   if n != present {
+    // migrate-C: kept as Backend — runtime `what` + `max_idx` + `present` interpolated
     return Err(Error::Backend(format!(
       "prompt cache: non-dense {what} indices (max index {max_idx}, {present} entries); \
          corrupt or incompatible file"
@@ -576,6 +577,7 @@ pub fn load_prompt_cache(path: &Path) -> Result<(Vec<Box<dyn KvCache>>, HashMap<
       ))
     })?;
     if !meta.is_file() {
+      // migrate-C: kept as Backend — runtime path interpolated (no FileIo op matches "not a regular file")
       return Err(Error::Backend(format!(
         "prompt cache {} is not a regular file; refusing to read",
         path.display()
@@ -589,6 +591,8 @@ pub fn load_prompt_cache(path: &Path) -> Result<(Vec<Box<dyn KvCache>>, HashMap<
     // bytes — mlx-c reads the file itself — so a streaming size probe would
     // be a wasteful, itself-DoS-prone 2x read of a multi-GB cache.)
     if meta.len() > MAX_PROMPT_CACHE_BYTES {
+      // migrate-C: kept as Backend — runtime path + size interpolated (OutOfRange context
+      // would need static path-free phrasing, losing the file diagnostic)
       return Err(Error::Backend(format!(
         "prompt cache {} is {} bytes, exceeding the {}-byte cap; refusing to read",
         path.display(),
@@ -623,6 +627,7 @@ pub fn load_prompt_cache(path: &Path) -> Result<(Vec<Box<dyn KvCache>>, HashMap<
   // recoverable error.
   let n = cache_classes.len();
   if let Some(&bad) = cache_data.keys().find(|&&i| i >= n) {
+    // migrate-C: kept as Backend — runtime path + bad index + count interpolated
     return Err(Error::Backend(format!(
       "prompt cache {}: array group index {bad} >= class count {n}; corrupt or incompatible file",
       path.display()
@@ -679,6 +684,8 @@ pub fn load_prompt_cache(path: &Path) -> Result<(Vec<Box<dyn KvCache>>, HashMap<
       for (j, arr) in state.iter().enumerate() {
         let nd = arr.ndim();
         if nd != KV_NDIM {
+          // migrate-C: kept as Backend — runtime path + i + kind + j + nd interpolated
+          // (RankMismatch context would need to be `&'static str` but this is per-cache dynamic)
           return Err(Error::Backend(format!(
             "prompt cache {}: cache {i} (kind {kind:?}) state array {j} has rank {nd}, \
                expected {KV_NDIM} ([B, n_kv_heads, S, head_dim]); corrupt or incompatible file",
@@ -766,6 +773,7 @@ pub fn load_prompt_cache(path: &Path) -> Result<(Vec<Box<dyn KvCache>>, HashMap<
       "StandardKvCache",
     ];
     if NO_META_KINDS.contains(&kind.as_str()) && !meta.is_empty() {
+      // migrate-C: kept as Backend — runtime path + i + kind + meta interpolated
       return Err(Error::Backend(format!(
         "prompt cache {}: cache {i} (kind {kind:?}) is a no-meta cache but carries a \
            non-empty meta_state {meta:?}; mlx-lm rejects this (corrupt or schema-drifted file)",
@@ -778,6 +786,7 @@ pub fn load_prompt_cache(path: &Path) -> Result<(Vec<Box<dyn KvCache>>, HashMap<
     // corrupt/foreign payload — unknown kind, wrong meta_state length,
     // inconsistent empty-state-with-offset, …).
     let cache = from_state(&kind, state, meta).map_err(|e| {
+      // migrate-C: kept as Backend — runtime path + i + kind + chained `e` (Display chain)
       Error::Backend(format!(
         "prompt cache {}: cannot reconstruct cache {i} (kind {kind:?}): {e}",
         path.display()

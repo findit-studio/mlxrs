@@ -2,7 +2,7 @@
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{Error, OutOfRangePayload, Result},
   lm::cache::{
     KvCache, MaskMode, mask,
     util::{concat_seq, nbytes, seq_len, slice_seq},
@@ -132,8 +132,10 @@ impl KvCache for StandardKvCache {
         self.offset = sk;
         Ok(())
       }
-      n => Err(Error::Backend(format!(
-        "StandardKvCache state must have 0 or 2 arrays, got {n}"
+      n => Err(Error::OutOfRange(OutOfRangePayload::new(
+        "StandardKvCache::set_state: state array count",
+        "must be 0 or 2",
+        n.to_string(),
       ))),
     }
   }
