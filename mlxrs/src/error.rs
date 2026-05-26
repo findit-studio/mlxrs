@@ -19,6 +19,7 @@
 
 use std::{
   cell::RefCell,
+  collections::TryReserveError,
   ffi::{CStr, c_char, c_int, c_void},
   panic::{AssertUnwindSafe, catch_unwind},
   path::PathBuf,
@@ -28,6 +29,9 @@ use std::{
     atomic::{AtomicBool, Ordering},
   },
 };
+
+use smallvec::SmallVec;
+use smol_str::SmolStr;
 
 use crate::Dtype;
 
@@ -215,20 +219,48 @@ impl std::fmt::Display for MissingFieldPayload {
 
 impl std::error::Error for MissingFieldPayload {}
 
-/// Payload for [`Error::ArithmeticOverflow`]: the operation context and result type.
+/// Payload for [`Error::ArithmeticOverflow`]: the operation context, result type, and
+/// the offending runtime operands.
 ///
-/// Construct via [`ArithmeticOverflowPayload::new`]; access fields via
-/// `context()` and `op_type()`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Construct via [`ArithmeticOverflowPayload::new`] (no operands) or
+/// [`ArithmeticOverflowPayload::with_operands`]; access fields via
+/// `context()`, `op_type()`, and `operands()`. The `operands` field
+/// preserves the actual runtime values that triggered the overflow so
+/// the caller can diagnose oversized inputs without re-running the
+/// failing op or parsing message text.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArithmeticOverflowPayload {
   context: &'static str,
   op_type: &'static str,
+  operands: SmallVec<[(&'static str, u64); 4]>,
 }
 
 impl ArithmeticOverflowPayload {
-  /// Construct a new payload.
+  /// Construct a payload without operands. Prefer [`Self::with_operands`]
+  /// at every site where the runtime value(s) that triggered the
+  /// overflow are reachable — dropping the operands loses the
+  /// diagnostic at the cost of one `format!` to recover it.
   pub fn new(context: &'static str, op_type: &'static str) -> Self {
-    Self { context, op_type }
+    Self {
+      context,
+      op_type,
+      operands: SmallVec::new(),
+    }
+  }
+
+  /// Construct a payload carrying the named runtime operands that
+  /// triggered the overflow (e.g. `[("a", 1u64 << 32), ("b", 4)]` for an
+  /// overflowing `a * b`).
+  pub fn with_operands(
+    context: &'static str,
+    op_type: &'static str,
+    operands: impl IntoIterator<Item = (&'static str, u64)>,
+  ) -> Self {
+    Self {
+      context,
+      op_type,
+      operands: operands.into_iter().collect(),
+    }
   }
 
   /// The expression or operation that overflowed
@@ -243,11 +275,36 @@ impl ArithmeticOverflowPayload {
   pub const fn op_type(&self) -> &'static str {
     self.op_type
   }
+
+  /// The offending runtime operands (`(name, value)` pairs). Empty when
+  /// constructed via [`Self::new`].
+  #[inline(always)]
+  pub fn operands(&self) -> &[(&'static str, u64)] {
+    &self.operands
+  }
 }
 
 impl std::fmt::Display for ArithmeticOverflowPayload {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    write!(f, "{}: overflow ({})", self.context, self.op_type)
+    if self.operands.is_empty() {
+      write!(f, "{}: overflow ({})", self.context, self.op_type)
+    } else {
+      write!(
+        f,
+        "{}: overflow ({}) with operands",
+        self.context, self.op_type
+      )?;
+      let mut first = true;
+      f.write_str(" ")?;
+      for (name, value) in &self.operands {
+        if !first {
+          f.write_str(", ")?;
+        }
+        write!(f, "{name}={value}")?;
+        first = false;
+      }
+      Ok(())
+    }
   }
 }
 
@@ -440,22 +497,28 @@ impl std::error::Error for LengthMismatchPayload {}
 /// Payload for [`Error::OutOfRange`]: the call-site context, the violated
 /// constraint, and the formatted runtime value.
 ///
+/// `value` is a [`SmolStr`] — most range-violation values are short
+/// numeric strings ("1024", "-3.14") that fit the inline storage
+/// without a heap allocation.
+///
 /// Construct via [`OutOfRangePayload::new`]; access fields via `context()`,
 /// `requirement()`, and `value()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutOfRangePayload {
   context: &'static str,
   requirement: &'static str,
-  value: String,
+  value: SmolStr,
 }
 
 impl OutOfRangePayload {
-  /// Construct a new payload.
-  pub fn new(context: &'static str, requirement: &'static str, value: String) -> Self {
+  /// Construct a new payload. `value` accepts anything `impl Into<SmolStr>`
+  /// (`&str`, `String`, `SmolStr`, `format_smolstr!(…)` output) so call
+  /// sites do not need to think about which string type to pass.
+  pub fn new(context: &'static str, requirement: &'static str, value: impl Into<SmolStr>) -> Self {
     Self {
       context,
       requirement,
-      value,
+      value: value.into(),
     }
   }
 
@@ -736,16 +799,53 @@ impl std::error::Error for ConvertPostSavePartialPayload {
 }
 
 /// Errors surfaced from the mlx backend or detected at the safe-wrapper boundary.
+///
+/// # Modeling discipline (the §5 rule)
+///
+/// **Never construct an error variant with a `format!()`-built string payload.**
+/// Every error must use a typed variant whose payload carries every runtime
+/// substitution as a discrete field — this preserves typed access for
+/// callers and downstream tooling, and is the entire reason this is an
+/// `enum` rather than a `type Error = String`. If an existing variant
+/// doesn't fit the call site's needs, ADD A NEW PAYLOAD STRUCT to this
+/// module rather than falling back to [`Error::MlxC`] / [`Error::ShapeMismatch`].
+///
+/// The free-form-string variants in this enum are reserved for two
+/// narrow use cases ONLY:
+///
+/// 1. [`Error::MlxC`] is for the raw mlx-c handler thread-local drain
+///    when [`MlxOpKind::parse_prefix`] could not extract a typed
+///    `[op_name]` prefix from the upstream message. **Never construct
+///    this elsewhere** — every other call site has structured runtime
+///    data and must use a typed variant.
+/// 2. [`Error::ShapeMismatch`] is a stepping-stone for the in-progress
+///    migration of pre-§5 shape-mismatch sites and is being phased out
+///    in favor of [`Error::RankMismatch`] / [`Error::LengthMismatch`] /
+///    [`Error::MultiLengthMismatch`] / [`Error::ShapePairMismatch`] /
+///    [`Error::DivisibilityConstraint`]. **Never construct new
+///    `ShapeMismatch` sites** — pick the typed shape variant whose
+///    fields carry every runtime substitution.
 #[derive(Debug, thiserror::Error, derive_more::IsVariant)]
 #[non_exhaustive]
 pub enum Error {
-  /// Shape mismatch detected by mlx during graph construction or eval.
+  /// **DEPRECATED for new construction** — see the enum doc. Reserved for
+  /// in-progress migration of pre-§5 shape-mismatch sites; new code must
+  /// pick the typed shape variant whose fields carry every runtime
+  /// substitution ([`Error::RankMismatch`] / [`Error::LengthMismatch`] /
+  /// [`Error::MultiLengthMismatch`] / [`Error::ShapePairMismatch`] /
+  /// [`Error::DivisibilityConstraint`]).
   #[error("shape mismatch: {0}")]
   ShapeMismatch(String),
 
   /// Dtype mismatch (e.g. requesting `as_slice::<f32>` on an i32 array).
   #[error("dtype mismatch: expected {:?}, got {:?}", .0.expected(), .0.got())]
   DtypeMismatch(DtypeMismatchPayload),
+
+  /// A dtype gate rejected an input dtype that is not in the allowed set
+  /// (e.g. `Adam: weights must be floating, got Int32`). Carries the
+  /// rejected dtype and the static list of supported dtypes.
+  #[error(transparent)]
+  UnsupportedDtype(UnsupportedDtypePayload),
 
   /// `TryFrom<mlxrs_sys::mlx_dtype>` failed — mlx returned a dtype we don't recognize.
   #[error("unknown dtype value from mlx: {0}")]
@@ -761,7 +861,35 @@ pub enum Error {
   #[error("array is not contiguous; M2 will add .contiguous() to materialize")]
   NonContiguous,
 
-  /// Generic backend error with the message captured from mlx-c.
+  /// Typed mlx-c boundary error — the mlx C++ exception message starts
+  /// with a `[op_name]` prefix that we parsed into a typed
+  /// [`MlxOpKind`]. Carries the typed op + the full original message.
+  ///
+  /// Constructed by the crate-private `check` / `check_handle` boundary
+  /// helpers when [`MlxOpKind::parse_prefix`] succeeded. Most mlx-c
+  /// errors land here rather than [`Error::MlxC`] because mlx C++
+  /// consistently emits the `[op_name]` prefix.
+  #[error(transparent)]
+  MlxOp(MlxOpPayload),
+
+  /// Raw mlx-c handler message — fallback for when
+  /// [`MlxOpKind::parse_prefix`] could not extract a typed `[op_name]`
+  /// prefix from the upstream message (e.g. internal mlx debug strings,
+  /// non-primitive errors).
+  ///
+  /// **This is the ONLY string-typed error variant for new code, and
+  /// it MUST be constructed only from the mlx-c handler drain** inside
+  /// the crate-private `check` / `check_handle` /
+  /// `check_vector_array_handle` boundary helpers. Every other call
+  /// site has structured runtime data and must use a typed variant.
+  #[error("mlx-c: {0}")]
+  MlxC(SmolStr),
+
+  /// **DEPRECATED for new construction** — see the enum doc. Reserved
+  /// for in-progress migration of pre-§5 Backend(format!) sites. New
+  /// code MUST pick a typed variant (or [`Error::MlxOp`] / [`Error::MlxC`]
+  /// for genuine mlx-c handler pass-through). Final cleanup PR removes
+  /// this variant after the 6 per-module migrations land.
   #[error("mlx backend: {0}")]
   Backend(String),
 
@@ -841,12 +969,76 @@ pub enum Error {
   /// is being compared (e.g. `"pad: axes/low/high"`, `"slice:
   /// start/stop/strides"`); `lengths` is a sequence of `(name, length)`
   /// pairs for each mismatched collection.
-  ///
-  /// Prefer this over `ShapeMismatch(format!("pad: length mismatch — axes={}, low={}, high={}", …))`
-  /// at call sites that check three-or-more parallel slices (where
-  /// [`Error::LengthMismatch`]'s single expected/actual pair is insufficient).
   #[error(transparent)]
   MultiLengthMismatch(MultiLengthMismatchPayload),
+
+  /// Two FULL shapes disagree (e.g. `expected [B, S, D]`, `actual [B, T, D]`).
+  /// Distinct from [`Error::RankMismatch`] (rank differs) and
+  /// [`Error::LengthMismatch`] (single dim differs); carries both
+  /// complete shapes for downstream tooling.
+  #[error(transparent)]
+  ShapePairMismatch(ShapePairMismatchPayload),
+
+  /// A dividend is not a multiple of a divisor (e.g. AWQ `in_features`
+  /// not divisible by `group_size`).
+  #[error(transparent)]
+  DivisibilityConstraint(DivisibilityConstraintPayload),
+
+  /// A scalar that must be finite was NaN or Inf.
+  #[error(transparent)]
+  NonFiniteScalar(NonFiniteScalarPayload),
+
+  /// A runtime-keyed lookup failed (e.g. missing layer weight; distinct
+  /// from [`Error::MissingField`] which carries a static field name).
+  #[error(transparent)]
+  MissingKey(MissingKeyPayload),
+
+  /// A string-keyed dispatch missed every known variant (e.g. unknown
+  /// pooling mode); carries the static list of supported names.
+  #[error(transparent)]
+  UnknownEnumValue(UnknownEnumValuePayload),
+
+  /// Two mutually-exclusive keys were both present (e.g. AWQ qweight +
+  /// the converted weight in the same checkpoint).
+  #[error(transparent)]
+  KeyCollision(KeyCollisionPayload),
+
+  /// An input string/byte slice contained an interior NUL byte
+  /// (rejecting it before passing to mlx-c which uses NUL-terminated
+  /// strings).
+  #[error(transparent)]
+  InteriorNul(InteriorNulPayload),
+
+  /// An input or computed quantity exceeded a documented cap.
+  #[error(transparent)]
+  CapExceeded(CapExceededPayload),
+
+  /// A request-scaled `try_reserve`/`try_reserve_exact` failed (carries
+  /// the request size and the underlying allocator error).
+  #[error(transparent)]
+  AllocFailure(AllocFailurePayload),
+
+  /// An external parser (JSON, regex, tokenizer.json) failed (carries
+  /// the inner error as `Box<dyn Error>` for source-chain walking).
+  #[error(transparent)]
+  Parse(ParsePayload),
+
+  /// A decoder produced more elements than the documented cap
+  /// (e.g. truncated/malicious audio stream).
+  #[error(transparent)]
+  BoundedDecode(BoundedDecodePayload),
+
+  /// A typed inner error from a specific named layer — allows wrapping
+  /// any sub-error with a runtime layer identifier without losing the
+  /// inner variant.
+  #[error(transparent)]
+  LayerKeyed(LayerKeyedPayload),
+
+  /// A file I/O failure on a SLOTTED resource (e.g. `ArraysCache
+  /// meta_state[<slot>]`). Like [`Error::FileIo`] but carries a runtime
+  /// slot identifier too.
+  #[error(transparent)]
+  FileSlotIo(FileSlotIoPayload),
 
   /// Tokenizer subsystem error (HF tokenizer load/encode/decode, chat-template
   /// render, tool-call parse). Only constructed when the `tokenizer` feature
@@ -854,7 +1046,7 @@ pub enum Error {
   #[cfg(feature = "tokenizer")]
   #[cfg_attr(docsrs, doc(cfg(feature = "tokenizer")))]
   #[error("tokenizer: {0}")]
-  Tokenizer(String),
+  Tokenizer(SmolStr),
 
   /// Defense-in-depth shard-path collision:
   /// [`crate::lm::load::save_model`]'s atomic no-replace
@@ -1141,8 +1333,1172 @@ impl Error {
   /// Construct a [`Error::Tokenizer`] from anything stringifiable. Used
   /// throughout the `tokenizer` module to funnel HF / minijinja / serde
   /// failures into the crate's unified error type.
-  pub(crate) fn tokenizer(message: impl Into<String>) -> Self {
+  pub(crate) fn tokenizer(message: impl Into<SmolStr>) -> Self {
     Self::Tokenizer(message.into())
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// mlx-c boundary error: typed prefix + raw message fallback
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The mlx-c primitive whose C++-side exception surfaced via the error
+/// handler — parsed from the `[op_name] …` prefix the mlx C++ side
+/// consistently emits via `std::invalid_argument` / `std::runtime_error`.
+///
+/// Used as the `op` field of [`MlxOpPayload`] so callers can branch on
+/// the failing op without parsing message text. The catch-all
+/// [`MlxOpKind::Other`] carries the raw prefix when the message starts
+/// with `[…]` but the contents aren't in this enum's enumerated set; if
+/// the message has no `[…]` prefix at all, the boundary emits
+/// [`Error::MlxC`] (raw `SmolStr`) instead.
+///
+/// All discriminants except [`MlxOpKind::Other`] are statically known;
+/// [`MlxOpKind::Other`] carries a [`SmolStr`] of the unknown op prefix
+/// (inline-stored when short) so this enum is `Clone` but not `Copy`.
+///
+/// The enumerated set is built from the actual vendored mlx C++ throw
+/// prefixes (`mlxrs-sys/vendor/mlx/mlx/*.cpp`); both the lowercase
+/// function-name form (`[matmul]`) and the CapCase class-name form
+/// (`[QuantizedMatmul::vjp]`) map to the same typed variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MlxOpKind {
+  /// `[matmul]` / `[addmm]` / `[QuantizedMatmul]` (and `::vjp` / `::jvp`
+  /// / `::vmap` qualifiers) / `[block_masked_mm]` / `[BlockMaskedMM]` /
+  /// `[gather_mm]` / `[GatherMM]` / `[gather_qmm]` / `[GatherQMM::vjp]` /
+  /// `[qqmm]` / `[segmented_mm]` / `[inner]` / `[tensordot]` / `[kron]`.
+  Matmul,
+  /// `[reshape]` / `[unflatten]` / `[Unflatten]` / `[flatten]` /
+  /// `[expand_dims]` / `[squeeze]` / `[transpose]` / `[swapaxes]` /
+  /// `[moveaxis]` / `[view]`.
+  Reshape,
+  /// `[broadcast_shapes]` / `[broadcast_to]` / `[broadcast_arrays]` /
+  /// `[Broadcast]`.
+  Broadcast,
+  /// `[shape]` (mlx array shape accessor).
+  Shape,
+  /// `[slice]` / `[slice_update]` / `[SliceUpdate]` / `[DynamicSlice]`
+  /// (with `::vjp` / `::vmap` qualifiers) / `[DynamicSliceUpdate]` /
+  /// `[split]` / `[trace]` / `[diag]` / `[diagonal]` / `[tril]` / `[triu]`.
+  Slice,
+  /// `[concatenate]` / `[stack]` / `[repeat]` / `[meshgrid]`.
+  Concat,
+  /// `[gather]` / `[Gather]` / `[gather_axis]`.
+  Gather,
+  /// `[scatter]` / `[scatter_axis]` / `[scatter_add_axis]` /
+  /// `[masked_scatter]` / `[put_along_axis]`.
+  Scatter,
+  /// `[take]` / `[take_along_axis]`.
+  Take,
+  /// `[fftn]` / `[fftfreq]` / `[rfftfreq]` / `[fftshift]` / `[ifftshift]` /
+  /// `[hadamard_transform]`.
+  Fft,
+  /// `[quantize]` / `[quantized_matmul]` / `[from_fp8]` / `[to_fp8]`
+  /// (the `GatherQMM` / `QuantizedMatmul` aliases are routed to
+  /// [`Self::Matmul`]).
+  Quantize,
+  /// `[dequantize]`.
+  Dequantize,
+  /// `[conv]` (1-D/2-D/3-D/transpose variants share this prefix).
+  Conv,
+  /// Reduction ops: `[sum]` / `[mean]` / `[max]` / `[min]` / `[prod]` /
+  /// `[median]` / `[var]` / `[any]` / `[all]` / `[logsumexp]` /
+  /// `[logcumsumexp]` / `[cumsum]` / `[cumprod]` / `[cummax]` / `[cummin]` /
+  /// `[number_of_elements]` / `[softmax]` / `[topk]`.
+  Pool,
+  /// `[eval]` / `[async_eval]` / `[Compiled]` (compiled-graph eval-time
+  /// failure) / `[Primitive::vjp]` / `[Primitive::jvp]` / `[Primitive::vmap]` /
+  /// `[Primitive::output_shapes]`.
+  Eval,
+  /// `[sort]` / `[partition]`.
+  Sort,
+  /// `[argsort]` / `[argpartition]` / `[argmax]` / `[argmin]`.
+  ArgSort,
+  /// `[layer_norm]` / `[rms_norm]` / `[rope]` / `[RoPE::vjp]` /
+  /// `[scaled_dot_product_attention]` / `[scale_dot_product_attention]`.
+  Norm,
+  /// `[linalg::*]` family — `cholesky` / `cholesky_inv` / `cross` /
+  /// `eig` / `eigh` / `eigvals` / `eigvalsh` / `inv` / `lu` /
+  /// `lu_factor` / `norm` / `pinv` / `qr` / `solve` /
+  /// `solve_triangular` / `svd`.
+  Linalg,
+  /// Random-sampler ops: `[arange]` / `[full]` / `[eye]` / `[linspace]` /
+  /// `[uniform]` / `[normal]` / `[trunc_normal]` / `[bernoulli]` /
+  /// `[categorical]` / `[multivariate_normal]` / `[laplace]` /
+  /// `[randint]` / `[bits]` / `[finfo]` / `[iinfo]`.
+  Random,
+  /// `[grad]` / `[vjp]` / `[jvp]` / `[vmap]` / `[compile]` (transform-time
+  /// failure outside an eval).
+  Transform,
+  /// `[astype]` / `[nan_to_num]` / `[negative]` / `[floor]` /
+  /// `[bitwise_invert]` / `[divmod]` / `[Pad::vmap]` / general
+  /// element-wise op failure with no more-specific category.
+  Elementwise,
+  /// `[import_function]` / `[import_function::call]` / `[export_function]` /
+  /// `[deserialize_variant]` / `[Event::stream]` / `[StreamContext]` /
+  /// `[ThreadPool::enqueue]` / `[set_default_device]` /
+  /// `[set_default_stream]` / `[default_stream]` — runtime/system
+  /// infrastructure failure.
+  System,
+  /// `[roll]` / `[unflatten]`-style positional ops not better fit
+  /// elsewhere — currently empty in vendor, reserved for future.
+  Positional,
+  /// Distributed-collective ops: `[AllGather::eval_gpu]` /
+  /// `[AllReduce::eval_gpu]` / `[ReduceScatter]` / `[Send::eval_gpu]` /
+  /// `[Recv::eval_gpu]` / `[sum_scatter]` / `[distributed]` /
+  /// `[mpi]` / `[nccl]` / `[jaccl]` / `[ring]`.
+  Distributed,
+  /// IO primitives: `[load]` / `[save]` / `[load_safetensors]` /
+  /// `[save_safetensors]` / `[load_gguf]` / `[save_gguf]` /
+  /// `[safetensor]` / `[read]` / `[write]` / `[Load::eval_gpu]`.
+  ///
+  /// **Distinct from [`Error::FileIo`]** — this is the mlx C++ primitive
+  /// name surfaced via the boundary handler; [`Error::FileIo`] is the
+  /// safe-wrapper typed io payload constructed at Rust-side `std::fs`
+  /// call sites.
+  Io,
+  /// Any other `[op]` prefix not mapped above. Carries the raw prefix
+  /// (after stripping `::method` and `.qualifier` suffixes) as a
+  /// [`SmolStr`] so a future caller can pattern-match on the raw op
+  /// name without re-parsing the full message.
+  Other(SmolStr),
+}
+
+impl std::fmt::Display for MlxOpKind {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::Matmul => f.write_str("matmul"),
+      Self::Reshape => f.write_str("reshape"),
+      Self::Broadcast => f.write_str("broadcast"),
+      Self::Shape => f.write_str("shape"),
+      Self::Slice => f.write_str("slice"),
+      Self::Concat => f.write_str("concat"),
+      Self::Gather => f.write_str("gather"),
+      Self::Scatter => f.write_str("scatter"),
+      Self::Take => f.write_str("take"),
+      Self::Fft => f.write_str("fft"),
+      Self::Quantize => f.write_str("quantize"),
+      Self::Dequantize => f.write_str("dequantize"),
+      Self::Conv => f.write_str("conv"),
+      Self::Pool => f.write_str("reduce"),
+      Self::Eval => f.write_str("eval"),
+      Self::Sort => f.write_str("sort"),
+      Self::ArgSort => f.write_str("argsort"),
+      Self::Norm => f.write_str("norm"),
+      Self::Linalg => f.write_str("linalg"),
+      Self::Random => f.write_str("random"),
+      Self::Transform => f.write_str("transform"),
+      Self::Elementwise => f.write_str("elementwise"),
+      Self::System => f.write_str("system"),
+      Self::Positional => f.write_str("positional"),
+      Self::Distributed => f.write_str("distributed"),
+      Self::Io => f.write_str("io"),
+      Self::Other(s) => f.write_str(s),
+    }
+  }
+}
+
+impl MlxOpKind {
+  /// Parse the leading `[op_name]` prefix from an mlx-c handler message.
+  ///
+  /// mlx C++ consistently emits messages starting with `[op_name] …` for
+  /// every `std::invalid_argument` / `std::runtime_error` raised inside
+  /// the primitive validation paths. The op_name comes in three syntactic
+  /// shapes that all normalize to the same primary identifier here:
+  ///
+  /// 1. Bare function name: `[matmul]`, `[broadcast_shapes]`.
+  /// 2. Class name (UpperCamelCase): `[Broadcast]`, `[GatherMM]`,
+  ///    `[BlockMaskedMM]`, `[Compiled]`, `[SliceUpdate]`, `[Unflatten]`.
+  /// 3. Qualified class method: `[QuantizedMatmul::vjp]`,
+  ///    `[DynamicSlice::vmap]`, `[GatherQMM::vjp]`, `[Pad::vmap]`,
+  ///    `[Primitive::output_shapes]`, `[linalg::cholesky]`,
+  ///    `[import_function::call]`.
+  ///
+  /// The parser strips any `::method` and `.qualifier` suffixes, then
+  /// matches the primary identifier against the enumerated set
+  /// case-insensitively (so `Broadcast` and `broadcast_shapes` both
+  /// land in [`MlxOpKind::Broadcast`]).
+  ///
+  /// Returns `None` if the message has NO leading `[…]` prefix — the
+  /// caller should then emit [`Error::MlxC`] (raw message) instead.
+  ///
+  /// The full enumerated mapping is verified by
+  /// `init_smoke::mlx_op_kind_parses_real_vendor_prefixes` against the
+  /// actual prefixes extracted from `mlxrs-sys/vendor/mlx/mlx/*.cpp`.
+  pub fn parse_prefix(msg: &str) -> Option<Self> {
+    let rest = msg.strip_prefix('[')?;
+    let end = rest.find(']')?;
+    let prefix = &rest[..end];
+    // Namespace routing — the leading `namespace::` of a class path
+    // determines the typed bucket regardless of the trailing class /
+    // method name. Checked before the generic `::`-strip so the
+    // namespace itself doesn't get discarded as the "primary" name.
+    if let Some(rest_after_ns) = prefix.strip_prefix("linalg::") {
+      let _ = rest_after_ns;
+      return Some(Self::Linalg);
+    }
+    if let Some(rest_after_ns) = prefix.strip_prefix("Primitive::") {
+      let _ = rest_after_ns;
+      return Some(Self::Eval);
+    }
+    if let Some(rest_after_ns) = prefix.strip_prefix("import_function::") {
+      let _ = rest_after_ns;
+      return Some(Self::System);
+    }
+    // gpu::* / metal::* / Metal::* are all backend-runtime / system
+    // infrastructure prefixes from mlx's GPU / Metal backend layer.
+    if prefix.starts_with("gpu::")
+      || prefix.starts_with("metal::")
+      || prefix.starts_with("Metal::")
+      || prefix.starts_with("Event::")
+      || prefix.starts_with("Fence::")
+    {
+      return Some(Self::System);
+    }
+    // `fast::*` is the mlx fast-path namespace — strip it (iteratively,
+    // not recursively — adversarial input like `fast::fast::fast::…`
+    // would otherwise blow the stack and abort the process. `parse_prefix`
+    // is reachable from the mlx-c handler, which is called on inputs we
+    // do not control.) so `[fast::Quantize::eval_cpu]` reduces to
+    // `Quantize::eval_cpu` before the generic `::method`-strip runs below.
+    let stripped = {
+      let mut s = prefix;
+      while let Some(rest) = s.strip_prefix("fast::") {
+        s = rest;
+      }
+      s
+    };
+    // Strip `::method` qualifier (class-method form, e.g.
+    // `[QuantizedMatmul::vjp]`, `[Cholesky::eval_cpu]`), then `.qualifier`
+    // suffix (compiled-graph / sub-op form, e.g. `[matmul.gemm]`).
+    let no_method = stripped.split("::").next().unwrap_or(stripped);
+    let primary = no_method.split('.').next().unwrap_or(no_method);
+    // Case-insensitive primary-name match (mlx uses `[Broadcast]`
+    // class-style alongside `[broadcast_shapes]` function-style).
+    let lower = primary.to_lowercase();
+    Some(match lower.as_str() {
+      // matmul-family — both function-name forms (`[matmul]`,
+      // `[quantized_matmul]`) and class forms (`[QuantizedMatmul]`,
+      // `[GatherMM]`, `[Matmul::eval_cpu]`, `[QQMatmul::eval_gpu]`)
+      // route here; `quantized_matmul` is semantically a matmul
+      // operating on quantized weights, same as the class-form sibling
+      // `[QuantizedMatmul]`.
+      "matmul" | "addmm" | "quantizedmatmul" | "quantized_matmul" | "block_masked_mm"
+      | "blockmaskedmm" | "gather_mm" | "gathermm" | "gather_qmm" | "gatherqmm" | "qqmm"
+      | "qqmatmul" | "segmented_mm" | "inner" | "tensordot" | "kron" | "gemm_and_bias" => {
+        Self::Matmul
+      }
+      // reshape-family
+      "reshape" | "unflatten" | "flatten" | "expand_dims" | "squeeze" | "transpose"
+      | "swapaxes" | "moveaxis" | "view" => Self::Reshape,
+      // broadcast-family
+      "broadcast" | "broadcast_shapes" | "broadcast_to" | "broadcast_arrays" => Self::Broadcast,
+      // shape
+      "shape" => Self::Shape,
+      // slice-family (incl. trace/diag-family which thiserror-style trace
+      // shares the slice-into-array semantic)
+      "slice"
+      | "slice_update"
+      | "sliceupdate"
+      | "dynamicslice"
+      | "dynamicsliceupdate"
+      | "dynamic_slice"
+      | "dynamic_slice_update"
+      | "split"
+      | "trace"
+      | "diag"
+      | "diagonal"
+      | "tril"
+      | "triu" => Self::Slice,
+      // concat-family
+      "concatenate" | "stack" | "repeat" | "meshgrid" => Self::Concat,
+      // gather-family (incl. backend class `[GatherAxis::eval_cpu]`)
+      "gather" | "gather_axis" | "gatheraxis" => Self::Gather,
+      // scatter-family (incl. masked_scatter, put_along_axis, and backend
+      // class `[ScatterAxis::eval_cpu]`, `[MaskedScatter::eval_cpu]`)
+      "scatter" | "scatter_axis" | "scatter_add_axis" | "scatter_add" | "scatter_max"
+      | "scatter_min" | "scatter_prod" | "scatteraxis" | "masked_scatter" | "maskedscatter"
+      | "put_along_axis" => Self::Scatter,
+      // take-family
+      "take" | "take_along_axis" => Self::Take,
+      // fft-family (incl. bare `hadamard` and CapCase `[FFT]` via lowercase)
+      "fft" | "ifft" | "rfft" | "irfft" | "fft2" | "ifft2" | "fftn" | "ifftn" | "fftfreq"
+      | "rfftfreq" | "fftshift" | "ifftshift" | "hadamard" | "hadamard_transform" => Self::Fft,
+      // quantize-family (`quantized_matmul` is routed to Matmul above as
+      // a matmul-family op).
+      "quantize" | "block_quantized" | "from_fp8" | "to_fp8" | "quantize_dequantize" => {
+        Self::Quantize
+      }
+      // dequantize
+      "dequantize" => Self::Dequantize,
+      // conv-family (both bare `conv` and class-form `[Convolution::eval]`)
+      "conv" | "conv1d" | "conv2d" | "conv3d" | "conv_transpose" | "convolution" => Self::Conv,
+      // reduction-family
+      "max_pool" | "avg_pool" | "reduce" | "all" | "any" | "sum" | "prod" | "mean" | "var"
+      | "max" | "min" | "median" | "logsumexp" | "logcumsumexp" | "cumsum" | "cumprod"
+      | "cummax" | "cummin" | "number_of_elements" | "softmax" | "topk" => Self::Pool,
+      // eval / compiled-graph (incl. `[Copy::eval_gpu]`, `[Compile::eval_cpu]`,
+      // `[NanEqual::eval_cpu]` — primitive eval-time failures with no more-
+      // specific bucket).
+      "compiledarray" | "compiled" | "compile" | "eval" | "async_eval" | "copy" | "nanequal" => {
+        Self::Eval
+      }
+      // sort-family
+      "sort" | "partition" => Self::Sort,
+      // argsort-family
+      "argsort" | "argpartition" | "argmax" | "argmin" => Self::ArgSort,
+      // norm-family (incl. backend `[vjp_layer_norm]`)
+      "mlx_norm"
+      | "layer_norm"
+      | "rms_norm"
+      | "group_norm"
+      | "rope"
+      | "scaled_dot_product_attention"
+      | "scale_dot_product_attention"
+      | "vjp_layer_norm" => Self::Norm,
+      // transform-family (`grad` / `vjp` / `jvp` / `vmap` — the bare-form
+      // prefixes; the `Primitive::*` / `*::vjp` / `*::vmap` forms are
+      // routed to the parent op above; the bare `compile` already routed
+      // to Eval above).
+      "grad" | "vjp" | "jvp" | "vmap" | "pad" => Self::Transform,
+      // random / array-builder ops (incl. CapCase eval-time forms
+      // `[Arange::eval_gpu]`, `[RandomBits::eval_gpu]`)
+      "arange"
+      | "full"
+      | "eye"
+      | "linspace"
+      | "uniform"
+      | "normal"
+      | "trunc_normal"
+      | "bernoulli"
+      | "categorical"
+      | "multivariate_normal"
+      | "laplace"
+      | "randint"
+      | "bits"
+      | "finfo"
+      | "iinfo"
+      | "randombits" => Self::Random,
+      // elementwise / one-off (incl. backend dispatchers for binary/unary
+      // kernels and the bare `[Abs]` form)
+      "astype"
+      | "nan_to_num"
+      | "negative"
+      | "floor"
+      | "bitwise_invert"
+      | "divmod"
+      | "roll"
+      | "abs"
+      | "binary_float"
+      | "binary_int"
+      | "unary_fp"
+      | "unary_int"
+      | "unary_real"
+      | "extract_tensor_data" => Self::Elementwise,
+      // system / runtime infrastructure (incl. `Metal` / `metal` / `METAL`
+      // bare-form prefixes, `[malloc]` allocator, `[new_stream]`, and the
+      // `metal_kernel` / `cuda_kernel` / `custom_kernel` kernel-launch
+      // failures; the `metal::*` / `Metal::*` / `gpu::*` / `Event::*` /
+      // `Fence::*` namespace forms are routed in the up-front namespace
+      // check above)
+      "event"
+      | "streamcontext"
+      | "threadpool"
+      | "set_default_device"
+      | "set_default_stream"
+      | "default_stream"
+      | "deserialize_variant"
+      | "export_function"
+      | "import_function"
+      | "rope::vjp"
+      | "metal"
+      | "malloc"
+      | "new_stream"
+      | "metal_kernel"
+      | "cuda_kernel"
+      | "custom_kernel" => Self::System,
+      // linalg primitive class names (mlx C++ backend throws these as
+      // bare CapCase `[Cholesky::eval_cpu]`, `[SVD::eval_gpu]`, etc. —
+      // same family as the `linalg::*` namespace forms routed up-front).
+      "cholesky" | "eig" | "eigh" | "inverse" | "luf" | "qrf" | "svd" => Self::Linalg,
+      // distributed-collective ops (mpi/nccl/jaccl/ring are the transport
+      // backends; AllGather/AllReduce/ReduceScatter/Send/Recv are the
+      // primitive op names; sum_scatter is the function form)
+      "allgather" | "allreduce" | "reducescatter" | "send" | "recv" | "sum_scatter"
+      | "distributed" | "mpi" | "nccl" | "jaccl" | "ring" => Self::Distributed,
+      // IO primitives — mlx-c's load/save handlers (distinct from our
+      // safe-wrapper `Error::FileIo` payload at Rust `std::fs` sites).
+      "load" | "save" | "load_safetensors" | "save_safetensors" | "load_gguf" | "save_gguf"
+      | "safetensor" | "read" | "write" | "from_str" => Self::Io,
+      // Typed catch-all: preserve the original bracket-content as a
+      // SmolStr (post-stripping) so a future caller can pattern-match on
+      // the raw op name without re-parsing the full message.
+      _ => Self::Other(SmolStr::new(primary)),
+    })
+  }
+}
+
+/// Payload for [`Error::MlxOp`]: the typed mlx-c op + full message.
+///
+/// Construct via [`MlxOpPayload::new`]; access fields via `op()` and `message()`.
+/// The message preserves the FULL original mlx-c handler text (including the
+/// `[op]` prefix) so downstream display/logging matches what mlx emitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlxOpPayload {
+  op: MlxOpKind,
+  message: SmolStr,
+}
+
+impl MlxOpPayload {
+  /// Construct a new payload. `op` should be derived via [`MlxOpKind::parse_prefix`]
+  /// from `message`'s `[op]` prefix; the constructor does not re-parse.
+  pub fn new(op: MlxOpKind, message: impl Into<SmolStr>) -> Self {
+    Self {
+      op,
+      message: message.into(),
+    }
+  }
+
+  /// The typed mlx-c op kind (parsed from the `[op]` prefix).
+  pub fn op(&self) -> &MlxOpKind {
+    &self.op
+  }
+
+  /// The full mlx-c handler message, including the leading `[op]` prefix.
+  #[inline(always)]
+  pub fn message(&self) -> &str {
+    &self.message
+  }
+}
+
+impl std::fmt::Display for MlxOpPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "mlx {}: {}", self.op, self.message)
+  }
+}
+
+impl std::error::Error for MlxOpPayload {}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 13 new typed payload structs (foundation-PR: replace Backend(format!) +
+// ShapeMismatch(format!) sites with these in the per-module migration PRs).
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Payload for [`Error::MissingKey`]: a runtime-keyed lookup failure
+/// (e.g. "layer X is missing weight Y"). Distinct from
+/// [`Error::MissingField`] which carries a static field name; this
+/// variant carries a RUNTIME key (layer prefix, file name, etc.).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingKeyPayload {
+  context: &'static str,
+  key: SmolStr,
+}
+
+impl MissingKeyPayload {
+  /// Construct a new payload.
+  pub fn new(context: &'static str, key: impl Into<SmolStr>) -> Self {
+    Self {
+      context,
+      key: key.into(),
+    }
+  }
+  /// Call-site label (e.g. `"dequantize_weights: missing .weight"`).
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+  /// The runtime key that was looked up (e.g. layer prefix).
+  #[inline(always)]
+  pub fn key(&self) -> &str {
+    &self.key
+  }
+}
+
+impl std::fmt::Display for MissingKeyPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "{}: key `{}` not found", self.context, self.key)
+  }
+}
+
+impl std::error::Error for MissingKeyPayload {}
+
+/// Payload for [`Error::UnknownEnumValue`]: a string-keyed dispatch
+/// missed every known variant. `supported` is a static list of valid
+/// names so the error message can suggest them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownEnumValuePayload {
+  type_name: &'static str,
+  value: SmolStr,
+  supported: &'static [&'static str],
+}
+
+impl UnknownEnumValuePayload {
+  /// Construct a new payload.
+  pub fn new(
+    type_name: &'static str,
+    value: impl Into<SmolStr>,
+    supported: &'static [&'static str],
+  ) -> Self {
+    Self {
+      type_name,
+      value: value.into(),
+      supported,
+    }
+  }
+  /// The parent type whose enum the value didn't match
+  /// (e.g. `"PoolingStrategy"`).
+  #[inline(always)]
+  pub const fn type_name(&self) -> &'static str {
+    self.type_name
+  }
+  /// The runtime value that didn't match any known variant.
+  #[inline(always)]
+  pub fn value(&self) -> &str {
+    &self.value
+  }
+  /// The static list of supported variant names (for suggesting).
+  #[inline(always)]
+  pub const fn supported(&self) -> &'static [&'static str] {
+    self.supported
+  }
+}
+
+impl std::fmt::Display for UnknownEnumValuePayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "{}: unknown value `{}` (supported: {:?})",
+      self.type_name, self.value, self.supported
+    )
+  }
+}
+
+impl std::error::Error for UnknownEnumValuePayload {}
+
+/// Payload for [`Error::NonFiniteScalar`]: a scalar that must be finite
+/// was NaN or Inf. `value` is the offending f64.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NonFiniteScalarPayload {
+  context: &'static str,
+  value: f64,
+}
+
+impl NonFiniteScalarPayload {
+  /// Construct a new payload.
+  pub fn new(context: &'static str, value: f64) -> Self {
+    Self { context, value }
+  }
+  /// Call-site label (e.g. `"LearningRate: resolved value at step 5"`).
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+  /// The offending non-finite value.
+  #[inline(always)]
+  pub const fn value(&self) -> f64 {
+    self.value
+  }
+}
+
+impl std::fmt::Display for NonFiniteScalarPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "{}: value is non-finite (NaN or Inf): {}",
+      self.context, self.value
+    )
+  }
+}
+
+impl std::error::Error for NonFiniteScalarPayload {}
+
+/// Payload for [`Error::KeyCollision`]: two mutually-exclusive keys
+/// were both present (e.g. AWQ "qweight" + the converted "weight" in
+/// the same checkpoint).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyCollisionPayload {
+  context: &'static str,
+  key: SmolStr,
+}
+
+impl KeyCollisionPayload {
+  /// Construct a new payload.
+  pub fn new(context: &'static str, key: impl Into<SmolStr>) -> Self {
+    Self {
+      context,
+      key: key.into(),
+    }
+  }
+  /// Call-site label.
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+  /// The key that collided.
+  #[inline(always)]
+  pub fn key(&self) -> &str {
+    &self.key
+  }
+}
+
+impl std::fmt::Display for KeyCollisionPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "{}: key `{}` collides", self.context, self.key)
+  }
+}
+
+impl std::error::Error for KeyCollisionPayload {}
+
+/// Payload for [`Error::InteriorNul`]: an input string/byte slice
+/// contained an interior NUL byte (rejecting it before passing to mlx-c
+/// which uses NUL-terminated strings).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InteriorNulPayload {
+  context: &'static str,
+  bytes_kind: &'static str,
+}
+
+impl InteriorNulPayload {
+  /// Construct a new payload.
+  pub fn new(context: &'static str, bytes_kind: &'static str) -> Self {
+    Self {
+      context,
+      bytes_kind,
+    }
+  }
+  /// Call-site label.
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+  /// The kind of input that contained the NUL (e.g. `"array key"`,
+  /// `"metadata value"`).
+  #[inline(always)]
+  pub const fn bytes_kind(&self) -> &'static str {
+    self.bytes_kind
+  }
+}
+
+impl std::fmt::Display for InteriorNulPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "{}: {} contains an interior NUL byte",
+      self.context, self.bytes_kind
+    )
+  }
+}
+
+impl std::error::Error for InteriorNulPayload {}
+
+/// Payload for [`Error::CapExceeded`]: an input or computed quantity
+/// exceeded a documented cap (e.g. `MAX_DECODED_SAMPLES`,
+/// `MAX_LFILTER_SAMPLES`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapExceededPayload {
+  context: &'static str,
+  cap_name: &'static str,
+  cap: u64,
+  observed: u64,
+}
+
+impl CapExceededPayload {
+  /// Construct a new payload.
+  pub fn new(context: &'static str, cap_name: &'static str, cap: u64, observed: u64) -> Self {
+    Self {
+      context,
+      cap_name,
+      cap,
+      observed,
+    }
+  }
+  /// Call-site label.
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+  /// The name of the cap that was exceeded.
+  #[inline(always)]
+  pub const fn cap_name(&self) -> &'static str {
+    self.cap_name
+  }
+  /// The cap value.
+  #[inline(always)]
+  pub const fn cap(&self) -> u64 {
+    self.cap
+  }
+  /// The observed value that exceeded the cap.
+  #[inline(always)]
+  pub const fn observed(&self) -> u64 {
+    self.observed
+  }
+}
+
+impl std::fmt::Display for CapExceededPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "{}: observed {} exceeds cap {} ({})",
+      self.context, self.observed, self.cap_name, self.cap
+    )
+  }
+}
+
+impl std::error::Error for CapExceededPayload {}
+
+/// Payload for [`Error::ShapePairMismatch`]: two full shapes disagree
+/// (e.g. `expected [B, S, D]`, `actual [B, T, D]`). Distinct from
+/// [`Error::RankMismatch`] (rank differs) and [`Error::LengthMismatch`]
+/// (single dim differs); this variant carries BOTH complete shapes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShapePairMismatchPayload {
+  context: &'static str,
+  expected: SmallVec<[usize; 4]>,
+  actual: SmallVec<[usize; 4]>,
+}
+
+impl ShapePairMismatchPayload {
+  /// Construct a new payload.
+  pub fn new(
+    context: &'static str,
+    expected: impl Into<SmallVec<[usize; 4]>>,
+    actual: impl Into<SmallVec<[usize; 4]>>,
+  ) -> Self {
+    Self {
+      context,
+      expected: expected.into(),
+      actual: actual.into(),
+    }
+  }
+  /// Call-site label.
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+  /// The expected full shape.
+  #[inline(always)]
+  pub fn expected(&self) -> &[usize] {
+    &self.expected
+  }
+  /// The observed full shape.
+  #[inline(always)]
+  pub fn actual(&self) -> &[usize] {
+    &self.actual
+  }
+}
+
+impl std::fmt::Display for ShapePairMismatchPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "shape mismatch: {}: expected {:?}, got {:?}",
+      self.context,
+      self.expected.as_slice(),
+      self.actual.as_slice()
+    )
+  }
+}
+
+impl std::error::Error for ShapePairMismatchPayload {}
+
+/// Payload for [`Error::DivisibilityConstraint`]: `dividend` is not a
+/// multiple of `divisor` (e.g. `in_features` not divisible by
+/// `group_size` in AWQ).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DivisibilityConstraintPayload {
+  context: &'static str,
+  name_dividend: &'static str,
+  name_divisor: &'static str,
+  dividend: u64,
+  divisor: u64,
+}
+
+impl DivisibilityConstraintPayload {
+  /// Construct a new payload.
+  pub fn new(
+    context: &'static str,
+    name_dividend: &'static str,
+    dividend: u64,
+    name_divisor: &'static str,
+    divisor: u64,
+  ) -> Self {
+    Self {
+      context,
+      name_dividend,
+      name_divisor,
+      dividend,
+      divisor,
+    }
+  }
+  /// Call-site label.
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+  /// Name of the dividend operand.
+  #[inline(always)]
+  pub const fn name_dividend(&self) -> &'static str {
+    self.name_dividend
+  }
+  /// Name of the divisor operand.
+  #[inline(always)]
+  pub const fn name_divisor(&self) -> &'static str {
+    self.name_divisor
+  }
+  /// Dividend value.
+  #[inline(always)]
+  pub const fn dividend(&self) -> u64 {
+    self.dividend
+  }
+  /// Divisor value.
+  #[inline(always)]
+  pub const fn divisor(&self) -> u64 {
+    self.divisor
+  }
+}
+
+impl std::fmt::Display for DivisibilityConstraintPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "{}: {} ({}) must be divisible by {} ({})",
+      self.context, self.name_dividend, self.dividend, self.name_divisor, self.divisor
+    )
+  }
+}
+
+impl std::error::Error for DivisibilityConstraintPayload {}
+
+/// Payload for [`Error::UnsupportedDtype`]: a dtype gate rejected an
+/// input dtype that's not in the allowed set (e.g. `Adam: weights must
+/// be floating, got Int32`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedDtypePayload {
+  context: &'static str,
+  dtype: Dtype,
+  supported: &'static [Dtype],
+}
+
+impl UnsupportedDtypePayload {
+  /// Construct a new payload.
+  pub const fn new(context: &'static str, dtype: Dtype, supported: &'static [Dtype]) -> Self {
+    Self {
+      context,
+      dtype,
+      supported,
+    }
+  }
+  /// Call-site label.
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+  /// The dtype that was rejected.
+  #[inline(always)]
+  pub const fn dtype(&self) -> Dtype {
+    self.dtype
+  }
+  /// The static list of supported dtypes.
+  #[inline(always)]
+  pub const fn supported(&self) -> &'static [Dtype] {
+    self.supported
+  }
+}
+
+impl std::fmt::Display for UnsupportedDtypePayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "{}: unsupported dtype {:?} (supported: {:?})",
+      self.context, self.dtype, self.supported
+    )
+  }
+}
+
+impl std::error::Error for UnsupportedDtypePayload {}
+
+/// Payload for [`Error::FileSlotIo`]: a file I/O failure on a SLOTTED
+/// resource (e.g. `ArraysCache meta_state[<slot>]`). Like
+/// [`FileIoPayload`] but also carries a runtime slot identifier.
+#[derive(Debug)]
+pub struct FileSlotIoPayload {
+  context: &'static str,
+  slot: SmolStr,
+  op: FileOp,
+  path: PathBuf,
+  inner: std::io::Error,
+}
+
+impl FileSlotIoPayload {
+  /// Construct a new payload.
+  pub fn new(
+    context: &'static str,
+    slot: impl Into<SmolStr>,
+    op: FileOp,
+    path: PathBuf,
+    inner: std::io::Error,
+  ) -> Self {
+    Self {
+      context,
+      slot: slot.into(),
+      op,
+      path,
+      inner,
+    }
+  }
+  /// Call-site label.
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+  /// The runtime slot identifier.
+  #[inline(always)]
+  pub fn slot(&self) -> &str {
+    &self.slot
+  }
+  /// The operation kind that failed.
+  #[inline(always)]
+  pub const fn op(&self) -> FileOp {
+    self.op
+  }
+  /// The file or directory path involved.
+  #[inline(always)]
+  pub fn path(&self) -> &std::path::Path {
+    &self.path
+  }
+  /// The underlying I/O error.
+  #[inline(always)]
+  pub fn inner(&self) -> &std::io::Error {
+    &self.inner
+  }
+}
+
+impl std::fmt::Display for FileSlotIoPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "io: {} [{}]: {} {}: {}",
+      self.context,
+      self.slot,
+      self.op,
+      self.path.display(),
+      self.inner
+    )
+  }
+}
+
+impl std::error::Error for FileSlotIoPayload {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    Some(&self.inner)
+  }
+}
+
+/// Payload for [`Error::AllocFailure`]: a `try_reserve` / `try_reserve_exact`
+/// failed (request-scaled allocation that the OOM guard turned into a
+/// recoverable error rather than `Vec::with_capacity`'s abort).
+#[derive(Debug)]
+pub struct AllocFailurePayload {
+  context: &'static str,
+  item: &'static str,
+  count: u64,
+  inner: TryReserveError,
+}
+
+impl AllocFailurePayload {
+  /// Construct a new payload.
+  pub fn new(
+    context: &'static str,
+    item: &'static str,
+    count: u64,
+    inner: TryReserveError,
+  ) -> Self {
+    Self {
+      context,
+      item,
+      count,
+      inner,
+    }
+  }
+  /// Call-site label.
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+  /// The kind of item being reserved (e.g. `"samples"`, `"f32 elements"`).
+  #[inline(always)]
+  pub const fn item(&self) -> &'static str {
+    self.item
+  }
+  /// The number of items the allocator could not satisfy.
+  #[inline(always)]
+  pub const fn count(&self) -> u64 {
+    self.count
+  }
+  /// The underlying allocator error.
+  #[inline(always)]
+  pub fn inner(&self) -> &TryReserveError {
+    &self.inner
+  }
+}
+
+impl std::fmt::Display for AllocFailurePayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "{}: reservation for {} {} failed: {}",
+      self.context, self.count, self.item, self.inner
+    )
+  }
+}
+
+impl std::error::Error for AllocFailurePayload {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    Some(&self.inner)
+  }
+}
+
+/// Payload for [`Error::Parse`]: an external parser (JSON, regex,
+/// tokenizer.json, GGUF metadata) failed.
+#[derive(Debug)]
+pub struct ParsePayload {
+  context: &'static str,
+  input_kind: &'static str,
+  inner: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl ParsePayload {
+  /// Construct a new payload.
+  pub fn new(
+    context: &'static str,
+    input_kind: &'static str,
+    inner: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+  ) -> Self {
+    Self {
+      context,
+      input_kind,
+      inner: inner.into(),
+    }
+  }
+  /// Call-site label.
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+  /// The kind of input being parsed (e.g. `"JSON"`, `"tokenizer.json"`).
+  #[inline(always)]
+  pub const fn input_kind(&self) -> &'static str {
+    self.input_kind
+  }
+  /// The underlying parser error.
+  pub fn inner(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+    self.inner.as_ref()
+  }
+}
+
+impl std::fmt::Display for ParsePayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "{}: parse {} failed: {}",
+      self.context, self.input_kind, self.inner
+    )
+  }
+}
+
+impl std::error::Error for ParsePayload {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    Some(self.inner.as_ref())
+  }
+}
+
+/// Payload for [`Error::BoundedDecode`]: a decoder produced more
+/// elements than the documented cap (e.g. truncated/malicious audio
+/// stream).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundedDecodePayload {
+  context: &'static str,
+  cap: u64,
+  observed: u64,
+}
+
+impl BoundedDecodePayload {
+  /// Construct a new payload.
+  pub fn new(context: &'static str, cap: u64, observed: u64) -> Self {
+    Self {
+      context,
+      cap,
+      observed,
+    }
+  }
+  /// Call-site label.
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+  /// The cap value.
+  #[inline(always)]
+  pub const fn cap(&self) -> u64 {
+    self.cap
+  }
+  /// The observed element count.
+  #[inline(always)]
+  pub const fn observed(&self) -> u64 {
+    self.observed
+  }
+}
+
+impl std::fmt::Display for BoundedDecodePayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "{}: decoder produced {} elements (cap {})",
+      self.context, self.observed, self.cap
+    )
+  }
+}
+
+impl std::error::Error for BoundedDecodePayload {}
+
+/// Payload for [`Error::LayerKeyed`]: a typed inner error from a
+/// specific named layer. Allows wrapping any typed sub-error with a
+/// runtime layer identifier without losing the inner variant.
+///
+/// `Box<Error>` breaks the recursive size cycle.
+#[derive(Debug)]
+pub struct LayerKeyedPayload {
+  layer: SmolStr,
+  inner: Box<Error>,
+}
+
+impl LayerKeyedPayload {
+  /// Construct a new payload.
+  pub fn new(layer: impl Into<SmolStr>, inner: Error) -> Self {
+    Self {
+      layer: layer.into(),
+      inner: Box::new(inner),
+    }
+  }
+  /// The runtime layer identifier.
+  #[inline(always)]
+  pub fn layer(&self) -> &str {
+    &self.layer
+  }
+  /// The wrapped typed sub-error.
+  #[inline(always)]
+  pub fn inner(&self) -> &Error {
+    self.inner.as_ref()
+  }
+}
+
+impl std::fmt::Display for LayerKeyedPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "layer `{}`: {}", self.layer, self.inner)
+  }
+}
+
+impl std::error::Error for LayerKeyedPayload {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    Some(self.inner.as_ref() as &(dyn std::error::Error + 'static))
   }
 }
 
@@ -1250,11 +2606,9 @@ extern "C" fn handler(msg: *const c_char, _data: *mut c_void) {
   // Panics across `extern "C"` are UB. Wrap everything in catch_unwind.
   let _ = catch_unwind(AssertUnwindSafe(|| {
     // SAFETY: mlx-c guarantees `msg` is a valid NUL-terminated C string for the
-    // duration of this error-handler callback; the owned `String` copies it
-    // out so nothing escapes the callback.
-    let s = unsafe { CStr::from_ptr(msg) }
-      .to_string_lossy()
-      .into_owned();
+    // duration of this error-handler callback; the owned copy escapes via
+    // [`SmolStr`] (inline-stored for the typical short mlx-c message).
+    let s = unsafe { CStr::from_ptr(msg) }.to_string_lossy();
     // Preserve a trampoline-set user error against mlx-c's generic
     // closure-non-zero wrapper. When a [`crate::transforms::closure`]
     // trampoline returns a non-zero rc, mlx-c's C++ wrappers (see
@@ -1289,7 +2643,16 @@ extern "C" fn handler(msg: *const c_char, _data: *mut c_void) {
           // Preserve the trampoline's already-set user error.
           return;
         }
-        *g = Some(Error::Backend(s));
+        // Try to extract a typed `[op_name]` prefix into the typed
+        // [`Error::MlxOp`] variant; fall back to [`Error::MlxC`] (raw)
+        // when the message has no parseable prefix. Both variants carry
+        // the original message via [`SmolStr`] (inline-stored for short
+        // strings, no heap alloc).
+        let payload: SmolStr = s.as_ref().into();
+        *g = Some(match MlxOpKind::parse_prefix(&payload) {
+          Some(op) => Error::MlxOp(MlxOpPayload::new(op, payload)),
+          None => Error::MlxC(payload),
+        });
       }
     });
   }));
@@ -1361,11 +2724,15 @@ pub(crate) fn check(rc: c_int) -> Result<()> {
   if rc == 0 {
     Ok(())
   } else {
-    Err(
-      LAST
-        .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend(format!("mlx returned {rc} with no message"))),
-    )
+    Err(LAST.with(|c| c.borrow_mut().take()).unwrap_or_else(|| {
+      // No handler-set message — emit the rare "rc-set-but-no-handler-msg"
+      // case as raw `MlxC` (the genuine catch-all for an unparseable
+      // boundary signal). Use [`smol_str::format_smolstr`] so the small
+      // rc-only message stores inline without a heap allocation.
+      Error::MlxC(smol_str::format_smolstr!(
+        "mlx returned {rc} with no message"
+      ))
+    }))
   }
 }
 
@@ -1378,7 +2745,7 @@ pub(crate) fn check_handle(handle: mlxrs_sys::mlx_array) -> Result<crate::Array>
     Err(
       LAST
         .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend("mlx returned null handle".into())),
+        .unwrap_or_else(|| Error::MlxC(SmolStr::new_static("mlx returned null handle"))),
     )
   } else {
     Ok(crate::Array(handle))
@@ -1396,11 +2763,9 @@ pub(crate) fn check_handle(handle: mlxrs_sys::mlx_array) -> Result<crate::Array>
 pub(crate) fn check_vector_array_handle(handle: mlxrs_sys::mlx_vector_array) -> Result<()> {
   if handle.ctx.is_null() {
     Err(
-      LAST
-        .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend(
-          "mlx returned null vector_array handle".into(),
-        )),
+      LAST.with(|c| c.borrow_mut().take()).unwrap_or_else(|| {
+        Error::MlxC(SmolStr::new_static("mlx returned null vector_array handle"))
+      }),
     )
   } else {
     Ok(())
@@ -1428,10 +2793,358 @@ mod init_smoke {
 
     let r = crate::Array::ones::<f32>(&(2, 2)).and_then(|a| a.reshape(&(3,)));
 
+    // mlx C++ emits `[reshape] Cannot reshape …` — the handler's
+    // [`MlxOpKind::parse_prefix`] should map that to `MlxOpKind::Reshape`
+    // and emit [`Error::MlxOp`]. Anything else means either: (a) the
+    // handler is misinstalled and mlx-c aborted the process, (b) the
+    // prefix parser is missing a known op, or (c) mlx upstream changed
+    // their message prefix format (a regression worth catching).
     assert!(
-      matches!(r, Err(crate::Error::Backend(_))),
-      "failing op aborted process or produced wrong error variant; \
-       mlx-c++ may have overwritten our handler post-ctor — got: {r:?}"
+      matches!(
+        &r,
+        Err(crate::Error::MlxOp(p)) if matches!(p.op(), crate::error::MlxOpKind::Reshape)
+      ),
+      "failing reshape did not surface as MlxOp(Reshape); \
+       got: {r:?}"
+    );
+  }
+
+  #[test]
+  fn mlx_op_kind_parses_real_vendor_prefixes() {
+    use super::MlxOpKind;
+    // The enumerated cases are extracted verbatim from real mlx C++ throw
+    // sites in `mlxrs-sys/vendor/mlx/mlx/*.cpp`. If upstream mlx adds a
+    // new primitive whose prefix doesn't match, the boundary still
+    // surfaces it as `MlxOpKind::Other(prefix)` rather than a free-form
+    // string — but the migration follow-ups depend on the COMMON prefixes
+    // landing in their typed buckets.
+    let cases: &[(&str, MlxOpKind)] = &[
+      // matmul-family — both `[matmul]` bare and CapCase class forms
+      ("[matmul]", MlxOpKind::Matmul),
+      ("[addmm]", MlxOpKind::Matmul),
+      ("[block_masked_mm]", MlxOpKind::Matmul),
+      ("[BlockMaskedMM]", MlxOpKind::Matmul),
+      ("[gather_mm]", MlxOpKind::Matmul),
+      ("[GatherMM]", MlxOpKind::Matmul),
+      ("[gather_qmm]", MlxOpKind::Matmul),
+      ("[GatherQMM::vjp]", MlxOpKind::Matmul),
+      ("[QuantizedMatmul::vjp]", MlxOpKind::Matmul),
+      ("[QuantizedMatmul::jvp]", MlxOpKind::Matmul),
+      ("[QuantizedMatmul::vmap]", MlxOpKind::Matmul),
+      ("[qqmm]", MlxOpKind::Matmul),
+      ("[segmented_mm]", MlxOpKind::Matmul),
+      ("[inner]", MlxOpKind::Matmul),
+      ("[tensordot]", MlxOpKind::Matmul),
+      ("[kron]", MlxOpKind::Matmul),
+      // reshape-family
+      ("[reshape]", MlxOpKind::Reshape),
+      ("[unflatten]", MlxOpKind::Reshape),
+      ("[Unflatten]", MlxOpKind::Reshape),
+      ("[flatten]", MlxOpKind::Reshape),
+      ("[expand_dims]", MlxOpKind::Reshape),
+      ("[squeeze]", MlxOpKind::Reshape),
+      ("[transpose]", MlxOpKind::Reshape),
+      ("[swapaxes]", MlxOpKind::Reshape),
+      ("[moveaxis]", MlxOpKind::Reshape),
+      ("[view]", MlxOpKind::Reshape),
+      // broadcast-family
+      ("[broadcast_shapes]", MlxOpKind::Broadcast),
+      ("[broadcast_arrays]", MlxOpKind::Broadcast),
+      ("[Broadcast]", MlxOpKind::Broadcast),
+      // slice-family
+      ("[slice]", MlxOpKind::Slice),
+      ("[slice_update]", MlxOpKind::Slice),
+      ("[SliceUpdate]", MlxOpKind::Slice),
+      ("[DynamicSlice::vjp]", MlxOpKind::Slice),
+      ("[DynamicSlice::vmap]", MlxOpKind::Slice),
+      ("[DynamicSliceUpdate::vjp]", MlxOpKind::Slice),
+      ("[DynamicSliceUpdate::vmap]", MlxOpKind::Slice),
+      ("[split]", MlxOpKind::Slice),
+      ("[trace]", MlxOpKind::Slice),
+      ("[diag]", MlxOpKind::Slice),
+      ("[diagonal]", MlxOpKind::Slice),
+      ("[tril]", MlxOpKind::Slice),
+      ("[triu]", MlxOpKind::Slice),
+      // concat-family
+      ("[concatenate]", MlxOpKind::Concat),
+      ("[stack]", MlxOpKind::Concat),
+      ("[repeat]", MlxOpKind::Concat),
+      ("[meshgrid]", MlxOpKind::Concat),
+      // gather/scatter/take
+      ("[gather]", MlxOpKind::Gather),
+      ("[Gather]", MlxOpKind::Gather),
+      ("[gather_axis]", MlxOpKind::Gather),
+      ("[scatter]", MlxOpKind::Scatter),
+      ("[scatter_axis]", MlxOpKind::Scatter),
+      ("[scatter_add_axis]", MlxOpKind::Scatter),
+      ("[masked_scatter]", MlxOpKind::Scatter),
+      ("[put_along_axis]", MlxOpKind::Scatter),
+      ("[take]", MlxOpKind::Take),
+      ("[take_along_axis]", MlxOpKind::Take),
+      // fft-family
+      ("[fftn]", MlxOpKind::Fft),
+      ("[fftfreq]", MlxOpKind::Fft),
+      ("[rfftfreq]", MlxOpKind::Fft),
+      ("[fftshift]", MlxOpKind::Fft),
+      ("[ifftshift]", MlxOpKind::Fft),
+      ("[hadamard_transform]", MlxOpKind::Fft),
+      // quantize / dequantize
+      ("[quantize]", MlxOpKind::Quantize),
+      ("[quantized_matmul]", MlxOpKind::Matmul), // matmul-aliased
+      ("[from_fp8]", MlxOpKind::Quantize),
+      ("[to_fp8]", MlxOpKind::Quantize),
+      ("[dequantize]", MlxOpKind::Dequantize),
+      // conv
+      ("[conv]", MlxOpKind::Conv),
+      // reductions
+      ("[sum]", MlxOpKind::Pool),
+      ("[max]", MlxOpKind::Pool),
+      ("[min]", MlxOpKind::Pool),
+      ("[mean]", MlxOpKind::Pool),
+      ("[prod]", MlxOpKind::Pool),
+      ("[median]", MlxOpKind::Pool),
+      ("[logsumexp]", MlxOpKind::Pool),
+      ("[logcumsumexp]", MlxOpKind::Pool),
+      ("[cumsum]", MlxOpKind::Pool),
+      ("[cumprod]", MlxOpKind::Pool),
+      ("[cummax]", MlxOpKind::Pool),
+      ("[cummin]", MlxOpKind::Pool),
+      ("[number_of_elements]", MlxOpKind::Pool),
+      ("[softmax]", MlxOpKind::Pool),
+      ("[topk]", MlxOpKind::Pool),
+      // eval / compiled
+      ("[eval]", MlxOpKind::Eval),
+      ("[async_eval]", MlxOpKind::Eval),
+      ("[Compiled]", MlxOpKind::Eval),
+      ("[Primitive::vjp]", MlxOpKind::Eval),
+      ("[Primitive::jvp]", MlxOpKind::Eval),
+      ("[Primitive::vmap]", MlxOpKind::Eval),
+      ("[Primitive::output_shapes]", MlxOpKind::Eval),
+      // sort / argsort
+      ("[sort]", MlxOpKind::Sort),
+      ("[partition]", MlxOpKind::Sort),
+      ("[argsort]", MlxOpKind::ArgSort),
+      ("[argpartition]", MlxOpKind::ArgSort),
+      ("[argmax]", MlxOpKind::ArgSort),
+      ("[argmin]", MlxOpKind::ArgSort),
+      // norm-family
+      ("[layer_norm]", MlxOpKind::Norm),
+      ("[rms_norm]", MlxOpKind::Norm),
+      ("[rope]", MlxOpKind::Norm),
+      ("[scaled_dot_product_attention]", MlxOpKind::Norm),
+      ("[scale_dot_product_attention]", MlxOpKind::Norm),
+      // linalg::* family
+      ("[linalg::cholesky]", MlxOpKind::Linalg),
+      ("[linalg::cholesky_inv]", MlxOpKind::Linalg),
+      ("[linalg::cross]", MlxOpKind::Linalg),
+      ("[linalg::eig]", MlxOpKind::Linalg),
+      ("[linalg::eigh]", MlxOpKind::Linalg),
+      ("[linalg::eigvals]", MlxOpKind::Linalg),
+      ("[linalg::eigvalsh]", MlxOpKind::Linalg),
+      ("[linalg::inv]", MlxOpKind::Linalg),
+      ("[linalg::lu]", MlxOpKind::Linalg),
+      ("[linalg::lu_factor]", MlxOpKind::Linalg),
+      ("[linalg::norm]", MlxOpKind::Linalg),
+      ("[linalg::pinv]", MlxOpKind::Linalg),
+      ("[linalg::qr]", MlxOpKind::Linalg),
+      ("[linalg::solve]", MlxOpKind::Linalg),
+      ("[linalg::solve_triangular]", MlxOpKind::Linalg),
+      ("[linalg::svd]", MlxOpKind::Linalg),
+      // transform
+      ("[grad]", MlxOpKind::Transform),
+      ("[vjp]", MlxOpKind::Transform),
+      ("[jvp]", MlxOpKind::Transform),
+      ("[vmap]", MlxOpKind::Transform),
+      // `compile` is routed to Eval because the backend-eval form
+      // `[Compile::eval_cpu]` strips to the same primary identifier
+      // — both surface compile-failure paths together. The pure
+      // graph-setup failure is rare; eval-time compile failures dominate.
+      ("[compile]", MlxOpKind::Eval),
+      ("[Pad::vmap]", MlxOpKind::Transform),
+      // random / builder
+      ("[arange]", MlxOpKind::Random),
+      ("[full]", MlxOpKind::Random),
+      ("[eye]", MlxOpKind::Random),
+      ("[linspace]", MlxOpKind::Random),
+      ("[uniform]", MlxOpKind::Random),
+      ("[normal]", MlxOpKind::Random),
+      ("[trunc_normal]", MlxOpKind::Random),
+      ("[bernoulli]", MlxOpKind::Random),
+      ("[categorical]", MlxOpKind::Random),
+      ("[multivariate_normal]", MlxOpKind::Random),
+      ("[laplace]", MlxOpKind::Random),
+      ("[randint]", MlxOpKind::Random),
+      ("[bits]", MlxOpKind::Random),
+      ("[finfo]", MlxOpKind::Random),
+      ("[iinfo]", MlxOpKind::Random),
+      // elementwise / one-off
+      ("[astype]", MlxOpKind::Elementwise),
+      ("[nan_to_num]", MlxOpKind::Elementwise),
+      ("[negative]", MlxOpKind::Elementwise),
+      ("[floor]", MlxOpKind::Elementwise),
+      ("[bitwise_invert]", MlxOpKind::Elementwise),
+      ("[divmod]", MlxOpKind::Elementwise),
+      ("[roll]", MlxOpKind::Elementwise),
+      // system / infra (incl. the recursive vendor-tree backend prefixes
+      // `metal::*` / `Metal::*` / `gpu::*` / `Event::*` / `Fence::*`)
+      ("[Event::stream]", MlxOpKind::System),
+      ("[Event::Event]", MlxOpKind::System),
+      ("[Event::wait]", MlxOpKind::System),
+      ("[Fence::update]", MlxOpKind::System),
+      ("[Fence::wait]", MlxOpKind::System),
+      ("[StreamContext]", MlxOpKind::System),
+      ("[ThreadPool::enqueue]", MlxOpKind::System),
+      ("[set_default_device]", MlxOpKind::System),
+      ("[set_default_stream]", MlxOpKind::System),
+      ("[default_stream]", MlxOpKind::System),
+      ("[deserialize_variant]", MlxOpKind::System),
+      ("[export_function]", MlxOpKind::System),
+      ("[import_function]", MlxOpKind::System),
+      ("[import_function::call]", MlxOpKind::System),
+      ("[gpu::eval]", MlxOpKind::System),
+      ("[gpu::finalize]", MlxOpKind::System),
+      ("[gpu::synchronize]", MlxOpKind::System),
+      ("[metal::CommandEncoder]", MlxOpKind::System),
+      ("[metal::Device]", MlxOpKind::System),
+      ("[metal::device_info]", MlxOpKind::System),
+      ("[metal::load_device]", MlxOpKind::System),
+      ("[metal::malloc]", MlxOpKind::System),
+      ("[metal::set_wired_limit]", MlxOpKind::System),
+      ("[metal::start_capture]", MlxOpKind::System),
+      ("[Metal::binary]", MlxOpKind::System),
+      ("[Metal::compiled]", MlxOpKind::System),
+      ("[Metal::copy]", MlxOpKind::System),
+      ("[Metal::ternary]", MlxOpKind::System),
+      ("[Metal::unary]", MlxOpKind::System),
+      ("[METAL]", MlxOpKind::System),
+      ("[malloc]", MlxOpKind::System),
+      ("[new_stream]", MlxOpKind::System),
+      ("[metal_kernel]", MlxOpKind::System),
+      ("[cuda_kernel]", MlxOpKind::System),
+      ("[custom_kernel]", MlxOpKind::System),
+      // backend eval prefixes — the CapCase class-form variants from
+      // mlxrs-sys/vendor/mlx/mlx/backend/*/*.cpp recursive throw sites
+      ("[Matmul::eval_cpu]", MlxOpKind::Matmul),
+      ("[QQMatmul]", MlxOpKind::Matmul),
+      ("[QQMatmul::eval_gpu]", MlxOpKind::Matmul),
+      ("[BlockMaskedMM::eval]", MlxOpKind::Matmul),
+      ("[GatherMM::eval]", MlxOpKind::Matmul),
+      ("[gemm_and_bias]", MlxOpKind::Matmul),
+      ("[Gather::eval_cpu]", MlxOpKind::Gather),
+      ("[Gather::eval_gpu]", MlxOpKind::Gather),
+      ("[GatherAxis::eval_cpu]", MlxOpKind::Gather),
+      ("[Scatter::eval_cpu]", MlxOpKind::Scatter),
+      ("[Scatter::eval_gpu]", MlxOpKind::Scatter),
+      ("[ScatterAxis::eval_cpu]", MlxOpKind::Scatter),
+      ("[MaskedScatter::eval_cpu]", MlxOpKind::Scatter),
+      ("[Sort::eval_gpu]", MlxOpKind::Sort),
+      ("[Convolution::eval]", MlxOpKind::Conv),
+      ("[Convolution::eval_gpu]", MlxOpKind::Conv),
+      // linalg primitive class forms — both `linalg::*` namespace and
+      // bare CapCase backend `[Cholesky::eval_cpu]` route to Linalg
+      ("[Cholesky::eval_cpu]", MlxOpKind::Linalg),
+      ("[Cholesky::eval_gpu]", MlxOpKind::Linalg),
+      ("[Eig::eval_cpu]", MlxOpKind::Linalg),
+      ("[Eig::eval_gpu]", MlxOpKind::Linalg),
+      ("[Eigh::eval_cpu]", MlxOpKind::Linalg),
+      ("[Eigh::eval_gpu]", MlxOpKind::Linalg),
+      ("[Inverse::eval_cpu]", MlxOpKind::Linalg),
+      ("[Inverse::eval_gpu]", MlxOpKind::Linalg),
+      ("[LUF::eval_cpu]", MlxOpKind::Linalg),
+      ("[LUF::eval_gpu]", MlxOpKind::Linalg),
+      ("[QRF::eval_cpu]", MlxOpKind::Linalg),
+      ("[QRF::eval_gpu]", MlxOpKind::Linalg),
+      ("[SVD::eval_cpu]", MlxOpKind::Linalg),
+      ("[SVD::eval_gpu]", MlxOpKind::Linalg),
+      // eval / compile primitive class forms
+      ("[Compile::eval_cpu]", MlxOpKind::Eval),
+      ("[Compiled::eval_cpu]", MlxOpKind::Eval),
+      ("[Copy::eval_gpu]", MlxOpKind::Eval),
+      ("[NanEqual::eval_cpu]", MlxOpKind::Eval),
+      // quantize fast-path namespace + backend forms
+      ("[Quantize::eval_gpu]", MlxOpKind::Quantize),
+      ("[fast::Quantize::eval_cpu]", MlxOpKind::Quantize),
+      ("[quantize_dequantize]", MlxOpKind::Quantize),
+      // random backend forms
+      ("[Arange::eval_gpu]", MlxOpKind::Random),
+      ("[RandomBits::eval_gpu]", MlxOpKind::Random),
+      // FFT backend forms
+      ("[FFT]", MlxOpKind::Fft),
+      ("[hadamard]", MlxOpKind::Fft),
+      // norm backend form
+      ("[vjp_layer_norm]", MlxOpKind::Norm),
+      // distributed-collective ops
+      ("[AllGather::eval_gpu]", MlxOpKind::Distributed),
+      ("[AllReduce::eval_gpu]", MlxOpKind::Distributed),
+      ("[ReduceScatter]", MlxOpKind::Distributed),
+      ("[ReduceScatter::eval_gpu]", MlxOpKind::Distributed),
+      ("[Recv::eval_gpu]", MlxOpKind::Distributed),
+      ("[Send::eval_gpu]", MlxOpKind::Distributed),
+      ("[sum_scatter]", MlxOpKind::Distributed),
+      ("[distributed]", MlxOpKind::Distributed),
+      ("[mpi]", MlxOpKind::Distributed),
+      ("[nccl]", MlxOpKind::Distributed),
+      ("[jaccl]", MlxOpKind::Distributed),
+      ("[ring]", MlxOpKind::Distributed),
+      // IO primitives
+      ("[load]", MlxOpKind::Io),
+      ("[save]", MlxOpKind::Io),
+      ("[load_safetensors]", MlxOpKind::Io),
+      ("[save_safetensors]", MlxOpKind::Io),
+      ("[load_gguf]", MlxOpKind::Io),
+      ("[save_gguf]", MlxOpKind::Io),
+      ("[safetensor]", MlxOpKind::Io),
+      ("[read]", MlxOpKind::Io),
+      ("[write]", MlxOpKind::Io),
+      ("[Load::eval_gpu]", MlxOpKind::Io),
+      ("[from_str]", MlxOpKind::Io),
+      // elementwise backend dispatchers + bare CapCase forms
+      ("[Abs]", MlxOpKind::Elementwise),
+      ("[DivMod]", MlxOpKind::Elementwise),
+      ("[binary_float]", MlxOpKind::Elementwise),
+      ("[binary_int]", MlxOpKind::Elementwise),
+      ("[unary_fp]", MlxOpKind::Elementwise),
+      ("[unary_int]", MlxOpKind::Elementwise),
+      ("[unary_real]", MlxOpKind::Elementwise),
+      ("[extract_tensor_data]", MlxOpKind::Elementwise),
+    ];
+    for (vendor_prefix, expected) in cases {
+      let parsed = MlxOpKind::parse_prefix(&format!("{vendor_prefix} some message"))
+        .unwrap_or_else(|| {
+          panic!("vendor prefix {vendor_prefix:?} should classify, not return None")
+        });
+      assert_eq!(
+        &parsed, expected,
+        "vendor prefix {vendor_prefix:?} should classify as {expected:?}, got {parsed:?}",
+      );
+    }
+    // The `Other(SmolStr)` fallback preserves the post-stripped primary
+    // name verbatim so future tooling can still see what op the upstream
+    // message named.
+    let other = MlxOpKind::parse_prefix("[totally_invented_op] foo");
+    assert!(
+      matches!(other, Some(MlxOpKind::Other(ref s)) if s == "totally_invented_op"),
+      "got {other:?}",
+    );
+    // `::method` qualifier is stripped before fallback name preservation.
+    let other_method = MlxOpKind::parse_prefix("[totally_invented_op::vjp] foo");
+    assert!(
+      matches!(other_method, Some(MlxOpKind::Other(ref s)) if s == "totally_invented_op"),
+      "got {other_method:?}",
+    );
+    // No `[…]` prefix → None (boundary emits MlxC(SmolStr) instead).
+    assert!(MlxOpKind::parse_prefix("plain message without prefix").is_none());
+    assert!(MlxOpKind::parse_prefix("").is_none());
+    assert!(MlxOpKind::parse_prefix("[unterminated bracket").is_none());
+
+    // Adversarial: many repeated `fast::` segments must NOT blow the
+    // stack. The parser strips the namespace iteratively (not via
+    // recursive self-call) so any depth of nesting is safe.
+    let deeply_nested = "[".to_string() + &"fast::".repeat(10_000) + "Quantize::eval_cpu]";
+    assert_eq!(
+      MlxOpKind::parse_prefix(&deeply_nested),
+      Some(MlxOpKind::Quantize),
+      "deeply-nested fast:: must reduce to the inner op without recursing",
     );
   }
 }
