@@ -30,7 +30,7 @@ use std::collections::HashMap;
 
 use crate::{
   Array, Result,
-  error::Error,
+  error::{Error, OutOfRangePayload, RankMismatchPayload},
   lm::{
     load::Weights,
     tuner::optimizers::base::{LearningRate, Optimizer, zeros_like, zeros_like_map},
@@ -42,8 +42,10 @@ use crate::{
 /// into the velocity accumulator at the first `apply_gradients` call.
 fn validate_momentum_finite(momentum: f32) -> Result<()> {
   if !momentum.is_finite() {
-    return Err(Error::Backend(format!(
-      "Muon: momentum must be finite, got {momentum}"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "Muon: momentum",
+      "must be a finite float",
+      momentum.to_string(),
     )));
   }
   Ok(())
@@ -52,8 +54,10 @@ fn validate_momentum_finite(momentum: f32) -> Result<()> {
 /// Validate that `weight_decay` is finite and `>= 0.0`.
 fn validate_weight_decay(weight_decay: f32) -> Result<()> {
   if !weight_decay.is_finite() || weight_decay < 0.0 {
-    return Err(Error::Backend(format!(
-      "Muon: weight_decay must be finite and >= 0.0, got {weight_decay}"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "Muon: weight_decay",
+      "must be a finite float >= 0.0",
+      weight_decay.to_string(),
     )));
   }
   Ok(())
@@ -190,8 +194,10 @@ impl Muon {
   fn newton_schulz5(&self, x: &Array, steps: usize) -> Result<Array> {
     let shape = x.shape();
     if shape.len() != 2 {
-      return Err(crate::error::Error::ShapeMismatch(format!(
-        "Muon.newton_schulz5: expected 2D input, got shape {shape:?}"
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        "Muon::newton_schulz5: expected 2D input",
+        shape.len() as u32,
+        shape.to_vec(),
       )));
     }
     let (a, b, c) = (3.4445_f32, -4.7750_f32, 2.0315_f32);

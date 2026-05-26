@@ -45,7 +45,9 @@
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{Error, LengthMismatchPayload, Result, try_with_capacity},
+  error::{
+    Error, LengthMismatchPayload, OutOfRangePayload, RankMismatchPayload, Result, try_with_capacity,
+  },
   lm::{
     cache::{CacheConfig, make_prompt_cache},
     model::Model,
@@ -100,20 +102,30 @@ pub struct PerplexityResult {
 /// `len % sequence_length` tokens are dropped (exactly the reference). The
 /// result has `len(tokens) / sequence_length` rows.
 ///
-/// Errors with [`Error::ShapeMismatch`] if `sequence_length < MIN_WINDOW`
+/// Errors with [`Error::OutOfRange`] if `sequence_length < MIN_WINDOW`
 /// (a row must hold at least one input + one target) or if `tokens` is too
 /// short to fill a single window.
 pub fn make_windows(tokens: &[i32], sequence_length: usize) -> Result<Array> {
   if sequence_length < MIN_WINDOW {
-    return Err(Error::ShapeMismatch(format!(
-      "perplexity::make_windows: sequence_length {sequence_length} < MIN_WINDOW {MIN_WINDOW}"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "perplexity::make_windows: sequence_length",
+      "must be >= MIN_WINDOW (2)",
+      sequence_length.to_string(),
     )));
   }
   let num_rows = tokens.len() / sequence_length;
   if num_rows == 0 {
-    return Err(Error::ShapeMismatch(format!(
-      "perplexity::make_windows: {} tokens cannot fill one window of length {sequence_length}",
-      tokens.len()
+    // Typed shape-class variant (Codex R3 #1): caller-side rejection of
+    // a token stream too short to fill a single window. Use OutOfRange
+    // with both runtime values in `value` so callers can route on the
+    // variant without parsing a Backend string.
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "perplexity::make_windows: tokens.len() (must fill at least one window)",
+      "must be >= sequence_length",
+      format!(
+        "tokens.len()={}, sequence_length={sequence_length}",
+        tokens.len()
+      ),
     )));
   }
   // `data[: (len // L) * L]` — drop the ragged tail, then `reshape(-1, L)`.
@@ -148,9 +160,11 @@ pub fn make_windows(tokens: &[i32], sequence_length: usize) -> Result<Array> {
 pub fn cross_entropy_none(logits: &Array, targets: &Array) -> Result<Array> {
   let logits_ndim = logits.ndim();
   if logits_ndim == 0 {
-    return Err(Error::ShapeMismatch(
-      "perplexity::cross_entropy_none: logits must have a vocab axis (ndim >= 1)".into(),
-    ));
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "perplexity::cross_entropy_none: logits must have a vocab axis (rank >= 1)",
+      0,
+      Vec::new(),
+    )));
   }
   // Class indices: `targets.ndim == logits.ndim - 1` (mlx-lm checks
   // `targets.shape == logits.shape with axis removed`).
@@ -174,6 +188,11 @@ pub fn cross_entropy_none(logits: &Array, targets: &Array) -> Result<Array> {
   let expected = &logits_shape[..logits_ndim - 1];
   let targets_shape = targets.shape();
   if targets_shape.as_slice() != expected {
+    // Typed shape-class variant (Codex R3 #1): caller-side rejection of
+    // a target shape that mismatches logits.shape with the class axis
+    // dropped. Use the legacy ShapeMismatch (free-form, until a richer
+    // shape-pair payload exists) so callers can route on the variant
+    // without parsing a Backend string.
     return Err(Error::ShapeMismatch(format!(
       "perplexity::cross_entropy_none: targets shape {targets_shape:?} does not match logits \
          shape {logits_shape:?} with the class axis removed (expected {expected:?})"
@@ -212,8 +231,8 @@ pub fn cross_entropy_none(logits: &Array, targets: &Array) -> Result<Array> {
 /// layer count via [`CacheConfig::num_hidden_layers`].
 ///
 /// `batch_size` is clamped to at least 1. Errors with
-/// [`Error::ShapeMismatch`] if `data` is not rank-2 or its window length is
-/// `< MIN_WINDOW`.
+/// [`Error::RankMismatch`] if `data` is not rank-2, or [`Error::OutOfRange`]
+/// if its window length is `< MIN_WINDOW`.
 ///
 /// [`CacheConfig::num_hidden_layers`]: crate::lm::cache::CacheConfig::num_hidden_layers
 pub fn perplexity<M: Model>(
@@ -226,15 +245,18 @@ pub fn perplexity<M: Model>(
   let (num_rows, seq_len) = match shape.as_slice() {
     [n, l] => (*n, *l),
     other => {
-      return Err(Error::ShapeMismatch(format!(
-        "perplexity: data must be a rank-2 [N, L] token matrix, got {other:?}"
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        "perplexity: data must be a rank-2 [N, L] token matrix",
+        other.len() as u32,
+        other.to_vec(),
       )));
     }
   };
   if seq_len < MIN_WINDOW {
-    return Err(Error::ShapeMismatch(format!(
-      "perplexity: window length {seq_len} < MIN_WINDOW {MIN_WINDOW} \
-         (a window must hold one input + one target)"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "perplexity: window length (a window must hold one input + one target)",
+      "must be >= MIN_WINDOW (2)",
+      seq_len.to_string(),
     )));
   }
   // mlx-lm clamps nothing but a 0 batch size would loop forever; treat it as 1.
@@ -611,8 +633,10 @@ mod tests {
         let (batch, seq) = match tokens.shape().as_slice() {
           [b, s] => (*b, *s),
           other => {
-            return Err(Error::ShapeMismatch(format!(
-              "F16Model expects [B, S], got {other:?}"
+            return Err(Error::RankMismatch(RankMismatchPayload::new(
+              "F16Model expects [B, S] (rank 2)",
+              other.len() as u32,
+              other.to_vec(),
             )));
           }
         };

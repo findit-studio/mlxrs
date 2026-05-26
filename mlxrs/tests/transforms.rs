@@ -152,16 +152,16 @@ fn value_and_grad_rejects_empty_argnums() {
   let err = r.err().expect("empty argnums must be rejected");
   let msg = format!("{err}");
   assert!(
-    msg.contains("non-empty"),
-    "expected rejection mentioning non-empty argnums; got: {msg}"
+    msg.contains("is empty"),
+    "expected rejection mentioning empty argnums; got: {msg}"
   );
   // grad delegates to value_and_grad so it must reject too.
   let r = grad(|xs| Ok(vec![square(&xs[0])?]), &[]);
   let err = r.err().expect("empty argnums must be rejected by grad");
   let msg = format!("{err}");
   assert!(
-    msg.contains("non-empty"),
-    "expected rejection mentioning non-empty argnums; got: {msg}"
+    msg.contains("is empty"),
+    "expected rejection mentioning empty argnums; got: {msg}"
   );
 }
 

@@ -45,7 +45,7 @@
 
 use crate::{
   array::Array,
-  error::{Error, LengthMismatchPayload, OutOfRangePayload, Result},
+  error::{Error, InvariantViolationPayload, LengthMismatchPayload, OutOfRangePayload, Result},
   ops,
 };
 
@@ -210,17 +210,18 @@ pub fn apply_top_p(logprobs: &Array, top_p: f32) -> Result<Array> {
 ///   bit-identical to the pre-fix path).
 /// - **F16 / BF16**: upcast to f32, divide in f32, downcast back —
 ///   `temp` never gets cast down to the narrower dtype.
-/// - **F64**: rejected with an `Error::Backend`. MLX's GPU stream
-///   (`default_stream()`, which `ops::arithmetic::divide` routes through)
-///   does not support `float64` (`"float64 is not supported on the GPU"`),
-///   so a native F64 divide errors at eval; the prior implicit f32
-///   roundtrip silently lost precision on near-tied logits instead of
-///   surfacing the limitation (LM-6 R2 medium finding). The caller must
-///   cast logits down to F32 (or F16/BF16) before sampling — the
-///   reference Python `mlx_lm.sample_utils.categorical_sampling` only
-///   ever runs on F32/F16/BF16 logits.
-/// - **Anything else**: rejected with an `Error::Backend` (categorical
-///   sampling only makes sense on floating-point logits).
+/// - **F64**: rejected with [`Error::InvariantViolation`]. MLX's GPU
+///   stream (`default_stream()`, which `ops::arithmetic::divide` routes
+///   through) does not support `float64` (`"float64 is not supported on
+///   the GPU"`), so a native F64 divide errors at eval; the prior
+///   implicit f32 roundtrip silently lost precision on near-tied logits
+///   instead of surfacing the limitation (LM-6 R2 medium finding). The
+///   caller must cast logits down to F32 (or F16/BF16) before sampling —
+///   the reference Python `mlx_lm.sample_utils.categorical_sampling`
+///   only ever runs on F32/F16/BF16 logits.
+/// - **Anything else (non-floating)**: rejected with [`Error::OutOfRange`]
+///   carrying the rejected dtype in `value` (categorical sampling only
+///   makes sense on floating-point logits).
 ///
 /// **NaN-safety (LM-6 R1 follow-up).** The previous fix replaced
 /// `multiply(logits, scalar_like(1/temp))` with
@@ -269,11 +270,12 @@ pub fn apply_top_p(logprobs: &Array, top_p: f32) -> Result<Array> {
 ///    array. MLX's GPU stream does not support F64 (`"float64 is not
 ///    supported on the GPU"`), so a native F64 divide would error at
 ///    eval rather than preserve precision; F64 is now rejected up front
-///    with a clear `Error::Backend` instructing the caller to cast
-///    before sampling — bit-honest about the backend's actual F64
-///    capability. Any non-floating dtype is likewise rejected (mirroring
-///    the dtype-rejection pattern in `kl_div_loss`), so an i32/u32/etc.
-///    array does not silently astype through f32.
+///    with a clear [`Error::InvariantViolation`] instructing the caller
+///    to cast before sampling — bit-honest about the backend's actual F64
+///    capability. Any non-floating dtype is likewise rejected with
+///    [`Error::OutOfRange`] (mirroring the dtype-rejection pattern in
+///    `kl_div_loss`), so an i32/u32/etc. array does not silently astype
+///    through f32.
 ///
 /// **Handler safety.** `ensure_handler_installed()` runs as the FIRST
 /// executable statement — `Array::full::<f32>` invokes the fallible
@@ -323,16 +325,15 @@ pub fn scale_logits_by_temp(logits: &Array, temp: f32) -> Result<Array> {
       let scaled_f32 = ops::arithmetic::divide(&logits_f32, &divisor)?;
       ops::misc::astype(&scaled_f32, dtype)
     }
-    crate::Dtype::F64 => Err(Error::Backend(
-      "categorical_sampling does not support F64 logits — MLX's GPU stream \
-         does not implement float64, so a native F64 divide would error at \
-         eval and the prior implicit F32 roundtrip silently lost precision on \
-         near-tied logits (LM-6 R2 finding). Cast logits with \
-         .astype(Dtype::F32) (or F16/BF16) before sampling."
-        .to_string(),
-    )),
-    other => Err(Error::Backend(format!(
-      "categorical_sampling requires floating-point logits (F32, F16, or BF16); got {other:?}. Cast logits with .astype(Dtype::F32) before sampling."
+    crate::Dtype::F64 => Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "categorical_sampling: F64 logits",
+      "not supported — MLX's GPU stream does not implement float64; cast \
+       logits with .astype(Dtype::F32) (or F16/BF16) before sampling",
+    ))),
+    other => Err(Error::OutOfRange(OutOfRangePayload::new(
+      "categorical_sampling: logits dtype",
+      "must be a floating-point dtype (F32, F16, or BF16)",
+      format!("{other:?}"),
     ))),
   }
 }

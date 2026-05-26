@@ -1289,6 +1289,7 @@ extern "C" fn handler(msg: *const c_char, _data: *mut c_void) {
           // Preserve the trampoline's already-set user error.
           return;
         }
+        // migrate-F: kept as Backend — mlx-c handler scaffolding (catch-all)
         *g = Some(Error::Backend(s));
       }
     });
@@ -1361,11 +1362,10 @@ pub(crate) fn check(rc: c_int) -> Result<()> {
   if rc == 0 {
     Ok(())
   } else {
-    Err(
-      LAST
-        .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend(format!("mlx returned {rc} with no message"))),
-    )
+    Err(LAST.with(|c| c.borrow_mut().take()).unwrap_or(
+      // migrate-F: kept as Backend — mlx-c handler scaffolding (catch-all)
+      Error::Backend(format!("mlx returned {rc} with no message")),
+    ))
   }
 }
 
@@ -1375,11 +1375,10 @@ pub(crate) fn check(rc: c_int) -> Result<()> {
 #[inline]
 pub(crate) fn check_handle(handle: mlxrs_sys::mlx_array) -> Result<crate::Array> {
   if handle.ctx.is_null() {
-    Err(
-      LAST
-        .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend("mlx returned null handle".into())),
-    )
+    Err(LAST.with(|c| c.borrow_mut().take()).unwrap_or(
+      // migrate-F: kept as Backend — mlx-c handler scaffolding (catch-all)
+      Error::Backend("mlx returned null handle".into()),
+    ))
   } else {
     Ok(crate::Array(handle))
   }
@@ -1395,13 +1394,10 @@ pub(crate) fn check_handle(handle: mlxrs_sys::mlx_array) -> Result<crate::Array>
 #[inline]
 pub(crate) fn check_vector_array_handle(handle: mlxrs_sys::mlx_vector_array) -> Result<()> {
   if handle.ctx.is_null() {
-    Err(
-      LAST
-        .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend(
-          "mlx returned null vector_array handle".into(),
-        )),
-    )
+    Err(LAST.with(|c| c.borrow_mut().take()).unwrap_or(
+      // migrate-F: kept as Backend — mlx-c handler scaffolding (catch-all)
+      Error::Backend("mlx returned null vector_array handle".into()),
+    ))
   } else {
     Ok(())
   }

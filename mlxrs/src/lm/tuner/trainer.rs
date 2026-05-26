@@ -77,7 +77,9 @@
 //! - **`mx.random.state` thread-state** — out of scope; callers seed their
 //!   own RNG and pass it through `iterate_batches`'s `seed`.
 
-use crate::error::{EmptyInputPayload, InvariantViolationPayload};
+use crate::error::{
+  EmptyInputPayload, InvariantViolationPayload, OutOfRangePayload, RankMismatchPayload,
+};
 use std::{collections::HashMap, marker::PhantomData, time::Instant};
 
 use crate::{
@@ -399,19 +401,24 @@ where
   let (_b, s) = match shape.as_slice() {
     [b, s] => (*b, *s),
     other => {
-      return Err(Error::ShapeMismatch(format!(
-        "default_loss: batch must be [B, S], got {other:?}"
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        "default_loss: batch must be [B, S] (rank 2)",
+        other.len() as u32,
+        other.to_vec(),
       )));
     }
   };
   if s < 2 {
-    return Err(Error::ShapeMismatch(format!(
-      "default_loss: batch S={s} must be >= 2 for next-token prediction"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "default_loss: batch S (next-token prediction)",
+      "must be >= 2",
+      s.to_string(),
     )));
   }
   let lengths_shape = lengths.shape();
   if lengths_shape.len() != 2 || lengths_shape[1] != 2 {
-    return Err(Error::ShapeMismatch(format!(
+    // migrate-F: kept as Backend — composite condition (rank+col-width check w/ shape vec)
+    return Err(Error::Backend(format!(
       "default_loss: lengths must be [B, 2] = (offset, length), got {lengths_shape:?}"
     )));
   }
@@ -459,6 +466,7 @@ where
   // numerical fault.
   let ntoks_count = ntoks.item::<f32>()?;
   if ntoks_count == 0.0 {
+    // migrate-F: kept as Backend — instructive multi-line diagnostic (no clean typed map)
     return Err(Error::Backend(
       "default_loss: batch produced 0 supervised tokens after applying the length mask. \
                 All examples in the batch are too short (prompt-only or fully truncated) or have \
@@ -709,9 +717,10 @@ pub fn iterate_batches<'a, D: Dataset + 'a>(
   shuffle_seed: Option<u64>,
 ) -> Result<impl Iterator<Item = Result<Batch>> + 'a> {
   if dataset.len() < batch_size {
-    return Err(Error::Backend(format!(
-      "iterate_batches: dataset has {} examples; need at least batch_size={batch_size}",
-      dataset.len(),
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "iterate_batches: dataset.len() (need at least batch_size examples)",
+      "must be >= batch_size",
+      format!("dataset.len()={}, batch_size={batch_size}", dataset.len()),
     )));
   }
   // Length-sort indices.
@@ -1029,6 +1038,7 @@ where
   for _microbatch_it in 1..=args.iters() {
     let micro_start = Instant::now();
     let batch = iter.next().ok_or_else(|| {
+      // migrate-F: kept as Backend — should-be-unreachable invariant (loop=true), no typed mapping
       Error::Backend(
         "train: batch iterator exhausted unexpectedly (loop=true should never end)".into(),
       )
@@ -1185,15 +1195,18 @@ fn build_zero_grads(params: &Weights) -> Result<Weights> {
 /// reported via [`Error::Backend`] rather than silently dropped).
 fn add_weights(a: &Weights, b: &Weights) -> Result<Weights> {
   if a.len() != b.len() {
-    return Err(Error::Backend(format!(
-      "trainer::add_weights: mismatched key counts {} vs {}",
-      a.len(),
-      b.len()
-    )));
+    return Err(Error::LengthMismatch(
+      crate::error::LengthMismatchPayload::new(
+        "trainer::add_weights: a vs b key counts",
+        a.len(),
+        b.len(),
+      ),
+    ));
   }
   let mut out: Weights = HashMap::with_capacity(a.len());
   for (key, lhs) in a {
     let Some(rhs) = b.get(key) else {
+      // migrate-F: kept as Backend — composite condition (runtime key value, MissingField requires 'static)
       return Err(Error::Backend(format!(
         "trainer::add_weights: key `{key}` missing from rhs"
       )));
@@ -1238,6 +1251,7 @@ mod tests {
       self.samples.len()
     }
     fn get(&self, _idx: usize) -> Result<&serde_json::Value> {
+      // migrate-F: kept as Backend — test fixture (no business meaning)
       Err(Error::Backend(
         "FakeDataset::get not used by trainer iterator".into(),
       ))
@@ -1479,13 +1493,14 @@ mod tests {
       &mut cb,
     );
     match res {
-      Err(Error::Backend(message)) => {
+      Err(Error::InvariantViolation(p)) => {
         assert!(
-          message.contains("acknowledge_no_real_gradients"),
-          "error must reference the opt-in field; got {message}",
+          p.context().contains("acknowledge_no_real_gradients"),
+          "error must reference the opt-in field; got {:?}",
+          p.context(),
         );
       }
-      other => panic!("expected Err(Backend), got {other:?}"),
+      other => panic!("expected Err(InvariantViolation), got {other:?}"),
     }
     Ok(())
   }
@@ -1556,13 +1571,14 @@ mod tests {
     let args = args_for_zero_interval_tests().with_steps_per_report(0);
     let res = run_train_with_args(&args);
     match res {
-      Err(Error::Backend(message)) => {
+      Err(Error::InvariantViolation(p)) => {
         assert!(
-          message.contains("steps_per_report"),
-          "error must name the field; got {message}",
+          p.context().contains("steps_per_report"),
+          "error must name the field; got {:?}",
+          p.context(),
         );
       }
-      other => panic!("expected Err(Backend) for steps_per_report=0; got {other:?}"),
+      other => panic!("expected Err(InvariantViolation) for steps_per_report=0; got {other:?}"),
     }
   }
 
@@ -1571,13 +1587,14 @@ mod tests {
     let args = args_for_zero_interval_tests().with_steps_per_eval(0);
     let res = run_train_with_args(&args);
     match res {
-      Err(Error::Backend(message)) => {
+      Err(Error::InvariantViolation(p)) => {
         assert!(
-          message.contains("steps_per_eval"),
-          "error must name the field; got {message}",
+          p.context().contains("steps_per_eval"),
+          "error must name the field; got {:?}",
+          p.context(),
         );
       }
-      other => panic!("expected Err(Backend) for steps_per_eval=0; got {other:?}"),
+      other => panic!("expected Err(InvariantViolation) for steps_per_eval=0; got {other:?}"),
     }
   }
 
@@ -1586,13 +1603,14 @@ mod tests {
     let args = args_for_zero_interval_tests().with_steps_per_save(0);
     let res = run_train_with_args(&args);
     match res {
-      Err(Error::Backend(message)) => {
+      Err(Error::InvariantViolation(p)) => {
         assert!(
-          message.contains("steps_per_save"),
-          "error must name the field; got {message}",
+          p.context().contains("steps_per_save"),
+          "error must name the field; got {:?}",
+          p.context(),
         );
       }
-      other => panic!("expected Err(Backend) for steps_per_save=0; got {other:?}"),
+      other => panic!("expected Err(InvariantViolation) for steps_per_save=0; got {other:?}"),
     }
   }
 
@@ -1601,13 +1619,16 @@ mod tests {
     let args = args_for_zero_interval_tests().with_grad_accumulation_steps(0);
     let res = run_train_with_args(&args);
     match res {
-      Err(Error::Backend(message)) => {
+      Err(Error::InvariantViolation(p)) => {
         assert!(
-          message.contains("grad_accumulation_steps"),
-          "error must name the field; got {message}",
+          p.context().contains("grad_accumulation_steps"),
+          "error must name the field; got {:?}",
+          p.context(),
         );
       }
-      other => panic!("expected Err(Backend) for grad_accumulation_steps=0; got {other:?}"),
+      other => {
+        panic!("expected Err(InvariantViolation) for grad_accumulation_steps=0; got {other:?}")
+      }
     }
   }
 

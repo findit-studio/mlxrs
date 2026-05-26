@@ -63,7 +63,7 @@ impl LearningRate {
   }
 
   /// Resolve and validate the learning rate at `step`. Returns
-  /// [`crate::error::Error::Backend`] when the resolved value is
+  /// [`crate::error::Error::OutOfRange`] when the resolved value is
   /// non-finite (NaN/Inf would scale updates into garbage). Optimizers
   /// call this from `new` to reject a `Fixed(NaN)` or a `Schedule`
   /// whose step-0 value is non-finite, and from `preflight` to catch a
@@ -72,10 +72,13 @@ impl LearningRate {
   pub fn try_current(&self, step: usize) -> Result<f32> {
     let v = self.current(step);
     if !v.is_finite() {
-      return Err(crate::error::Error::Backend(format!(
-        "LearningRate: resolved value at step {step} is not finite ({v}); reject \
-         non-finite learning rates so they cannot scale updates into NaN/Inf weights"
-      )));
+      return Err(crate::error::Error::OutOfRange(
+        crate::error::OutOfRangePayload::new(
+          "LearningRate: resolved value (reject non-finite to prevent NaN/Inf weights)",
+          "must be a finite float",
+          format!("step={step}, value={v}"),
+        ),
+      ));
     }
     Ok(v)
   }

@@ -376,9 +376,9 @@ fn generate_step_zero_length_logits_axis_is_recoverable_err() {
     let mut it = generate_step(&model, &[1u32, 2], cache(1), cfg);
     let first = it.next().expect("an item is produced (no panic/underflow)");
     match first {
-      Err(mlxrs::Error::ShapeMismatch(_)) => {}
+      Err(mlxrs::Error::OutOfRange(_)) => {}
       other => panic!(
-        "expected a recoverable Err(ShapeMismatch) for a zero-length {} axis, got {other:?}",
+        "expected a recoverable Err(OutOfRange) for a zero-length {} axis, got {other:?}",
         if zero_seq { "S" } else { "V" }
       ),
     }

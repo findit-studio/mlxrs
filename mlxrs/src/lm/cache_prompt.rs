@@ -106,14 +106,18 @@ fn encode_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<Vec<u32>> {
     let messages = serde_json::json!([{ "role": "user", "content": prompt }]);
     let ids = tokenizer
       .apply_chat_template_ids(&messages, None, false, true, None)
-      .map_err(|e| Error::Backend(format!("cache_prompt: apply_chat_template failed: {e}")))?;
+      .map_err(|e| {
+        // migrate-F: kept as Backend — composite condition (tokenizer error stringified)
+        Error::Backend(format!("cache_prompt: apply_chat_template failed: {e}"))
+      })?;
     Ok(ids)
   } else {
     // mlx-lm `tokenizer.encode(args.prompt)` — the tokenizer's default
     // special-token handling (transformers `encode` adds specials).
-    tokenizer
-      .encode(prompt, true)
-      .map_err(|e| Error::Backend(format!("cache_prompt: encode failed: {e}")))
+    tokenizer.encode(prompt, true).map_err(|e| {
+      // migrate-F: kept as Backend — composite condition (tokenizer error stringified)
+      Error::Backend(format!("cache_prompt: encode failed: {e}"))
+    })
   }
 }
 
@@ -408,6 +412,7 @@ fn open_excl_temp_safetensors(final_path: &Path, max_retries: u32) -> Result<Pat
   let file_name = final_path
     .file_name()
     .ok_or_else(|| {
+      // migrate-F: kept as Backend — composite condition (dynamic path content)
       Error::Backend(format!(
         "cache_prompt: destination {} has no file_name component",
         final_path.display()
@@ -442,13 +447,16 @@ fn open_excl_temp_safetensors(final_path: &Path, max_retries: u32) -> Result<Pat
         continue;
       }
       Err(e) => {
-        return Err(Error::Backend(format!(
-          "cache_prompt: create_new tempfile {} failed: {e}",
-          candidate.display()
+        return Err(Error::FileIo(FileIoPayload::new(
+          "cache_prompt: create_new tempfile",
+          FileOp::Create,
+          candidate,
+          e,
         )));
       }
     }
   }
+  // migrate-F: kept as Backend — composite condition (retry budget + last io::Error)
   Err(Error::Backend(format!(
     "cache_prompt: exhausted {max_retries} tempfile retries (last error: {})",
     last_err
@@ -531,9 +539,11 @@ fn save_prompt_cache_atomic(
     && let Err(e) = fs::set_permissions(&tmp_path, perms)
   {
     let _ = fs::remove_file(&tmp_path);
-    return Err(Error::Backend(format!(
-      "cache_prompt: set_permissions on tempfile {} failed: {e}",
-      tmp_path.display()
+    return Err(Error::FileIo(FileIoPayload::new(
+      "cache_prompt: set_permissions on tempfile",
+      FileOp::Other("set_permissions"),
+      tmp_path,
+      e,
     )));
   }
 
@@ -542,6 +552,7 @@ fn save_prompt_cache_atomic(
   // destination keeps whatever it had before — never a partial file).
   if let Err(e) = fs::rename(&tmp_path, &dest) {
     let _ = fs::remove_file(&tmp_path);
+    // migrate-F: kept as Backend — composite condition (two paths in message: src + dst)
     return Err(Error::Backend(format!(
       "cache_prompt: rename {} -> {} failed: {e}",
       tmp_path.display(),
@@ -562,9 +573,12 @@ mod tests {
   use std::{cell::Cell, rc::Rc};
 
   use super::*;
-  use crate::lm::{
-    cache::{MaskMode, RotatingKvCache, StandardKvCache},
-    model::MockModel,
+  use crate::{
+    error::RankMismatchPayload,
+    lm::{
+      cache::{MaskMode, RotatingKvCache, StandardKvCache},
+      model::MockModel,
+    },
   };
 
   /// A [`CacheConfig`] for `layers` full-attention (non-sliding-window)
@@ -664,8 +678,10 @@ mod tests {
           [_, s] => *s,
           [s] => *s,
           other => {
-            return Err(Error::ShapeMismatch(format!(
-              "Recorder: expected [B,S], got {other:?}"
+            return Err(Error::RankMismatch(RankMismatchPayload::new(
+              "Recorder: expected [B,S] (rank 2) or [S] (rank 1)",
+              other.len() as u32,
+              other.to_vec(),
             )));
           }
         };

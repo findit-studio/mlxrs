@@ -387,6 +387,7 @@ impl std::error::Error for ChatSessionError {}
 
 impl From<ChatSessionError> for Error {
   fn from(e: ChatSessionError) -> Self {
+    // migrate-F: kept as Backend — composite condition (stringified domain error)
     Error::Backend(e.to_string())
   }
 }
@@ -712,7 +713,10 @@ impl ChatSession {
     let prompt_ids = self
       .tokenizer
       .apply_chat_template_ids(&json_messages, None, true, false, None)
-      .map_err(|e| Error::Backend(format!("ChatSession: apply_chat_template failed: {e}")))?;
+      .map_err(|e| {
+        // migrate-F: kept as Backend — composite condition (tokenizer error stringified)
+        Error::Backend(format!("ChatSession: apply_chat_template failed: {e}"))
+      })?;
     Ok((prompt_ids, replayed))
   }
 
@@ -2464,6 +2468,7 @@ mod tests {
     ) -> Result<crate::array::Array> {
       let remaining = self.ok_calls.get();
       if remaining == 0 {
+        // migrate-F: kept as Backend — test fixture (no business meaning)
         return Err(Error::Backend(
           "ErringAfterModel: budget exhausted (test fixture)".into(),
         ));

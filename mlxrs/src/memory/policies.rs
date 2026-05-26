@@ -507,6 +507,7 @@ pub fn tune(
   _prefill_step_size: usize,
   _streams: &[Stream],
 ) -> Result<WiredMemoryMeasurement> {
+  // migrate-F: kept as Backend — stub for unimplemented feature (issue #168)
   Err(Error::Backend(
     "WiredMemoryUtils::tune not yet implemented — requires the \
               mlxrs LM concurrency surface (Model::prefill_only) which is \

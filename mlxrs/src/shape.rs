@@ -1,6 +1,7 @@
 //! `IntoShape` trait — zero-allocation shape conversion via slice callback.
 //!
-//! Returns `Result` so we propagate `usize > i32::MAX` as `Error::ShapeMismatch`
+//! Returns `Result` so we propagate `usize > i32::MAX` as
+//! `Error::ArithmeticOverflow` and negative dims as `Error::OutOfRange`
 //! instead of silently saturating.
 //!
 //! `IntoShape` is **sealed**: downstream crates cannot implement it. The
@@ -11,7 +12,7 @@
 
 use std::ffi::c_int;
 
-use crate::error::{Error, Result};
+use crate::error::{ArithmeticOverflowPayload, Error, OutOfRangePayload, Result};
 
 mod sealed {
   pub trait Sealed {}
@@ -44,8 +45,10 @@ pub trait IntoShape: sealed::Sealed {
 pub fn validate_dims(s: &[c_int]) -> Result<()> {
   for (i, &d) in s.iter().enumerate() {
     if d < 0 {
-      return Err(Error::ShapeMismatch(format!(
-        "dim[{i}] = {d} is negative; shapes must be non-negative"
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "validate_dims: dim",
+        "must be non-negative",
+        format!("dim[{i}] = {d}"),
       )));
     }
   }
@@ -105,7 +108,7 @@ impl<const N: usize> IntoShape for [i32; N] {
 
 fn convert_dim(d: usize) -> Result<c_int> {
   i32::try_from(d)
-    .map_err(|_| Error::ShapeMismatch(format!("dim {d} exceeds i32::MAX ({})", i32::MAX)))
+    .map_err(|_| Error::ArithmeticOverflow(ArithmeticOverflowPayload::new("convert_dim", "i32")))
 }
 
 impl IntoShape for &[usize] {

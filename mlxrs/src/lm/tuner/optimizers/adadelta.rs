@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use crate::{
   Array, Result,
-  error::Error,
+  error::{Error, OutOfRangePayload},
   lm::{
     load::Weights,
     tuner::optimizers::base::{LearningRate, Optimizer, zeros_like},
@@ -49,13 +49,17 @@ impl AdaDelta {
   /// Construct an [`AdaDelta`] optimizer.
   pub fn new(learning_rate: impl Into<LearningRate>, rho: f32, eps: f32) -> Result<Self> {
     if !rho.is_finite() || !(0.0..1.0).contains(&rho) {
-      return Err(Error::Backend(format!(
-        "AdaDelta: rho must be finite and in [0.0, 1.0), got {rho}"
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "AdaDelta: rho",
+        "must be a finite float in [0.0, 1.0)",
+        rho.to_string(),
       )));
     }
     if !eps.is_finite() || eps < 0.0 {
-      return Err(Error::Backend(format!(
-        "AdaDelta: epsilon must be finite and >= 0.0, got {eps}"
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "AdaDelta: epsilon",
+        "must be a finite float >= 0.0",
+        eps.to_string(),
       )));
     }
     let lr = learning_rate.into();
@@ -109,8 +113,10 @@ impl AdaDelta {
   /// or is outside `[0.0, 1.0)`.
   pub fn with_rho(mut self, rho: f32) -> Result<Self> {
     if !rho.is_finite() || !(0.0..1.0).contains(&rho) {
-      return Err(Error::Backend(format!(
-        "AdaDelta: rho must be finite and in [0.0, 1.0), got {rho}"
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "AdaDelta: rho",
+        "must be a finite float in [0.0, 1.0)",
+        rho.to_string(),
       )));
     }
     self.rho = rho;
@@ -121,8 +127,10 @@ impl AdaDelta {
   /// finite or `< 0.0`.
   pub fn with_eps(mut self, eps: f32) -> Result<Self> {
     if !eps.is_finite() || eps < 0.0 {
-      return Err(Error::Backend(format!(
-        "AdaDelta: epsilon must be finite and >= 0.0, got {eps}"
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "AdaDelta: epsilon",
+        "must be a finite float >= 0.0",
+        eps.to_string(),
       )));
     }
     self.eps = eps;

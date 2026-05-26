@@ -7,7 +7,9 @@ use std::ffi::c_int;
 
 use crate::{
   array::Array,
-  error::{Error, LengthMismatchPayload, MultiLengthMismatchPayload, Result, check},
+  error::{
+    EmptyInputPayload, Error, LengthMismatchPayload, MultiLengthMismatchPayload, Result, check,
+  },
   shape::{IntoShape, dim_ptr, stride_ptr, validate_dims},
   stream::default_stream,
 };
@@ -49,9 +51,9 @@ pub fn concatenate(arrays: &[&Array], axis: i32) -> Result<Array> {
   // FFI rather than constructing an empty vector_array (which would also
   // hand mlx-c a Rust dangling pointer for `Vec::as_ptr()` on an empty Vec).
   if arrays.is_empty() {
-    return Err(Error::ShapeMismatch(
-      "concatenate: arrays slice is empty".into(),
-    ));
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "concatenate: arrays slice",
+    )));
   }
   // Install the error handler before the first fallible FFI call. Without
   // this, mlx_vector_array_new_data could fail and trigger mlx-c's default
@@ -76,9 +78,10 @@ pub fn concatenate(arrays: &[&Array], axis: i32) -> Result<Array> {
     return Err(
       crate::error::LAST
         .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend(
-          "mlx_vector_array_new_data returned NULL".into(),
-        )),
+        .unwrap_or(
+          // migrate-F: kept as Backend — mlx-c NULL-ctx sentinel pass-through
+          Error::Backend("mlx_vector_array_new_data returned NULL".into()),
+        ),
     );
   }
 
@@ -197,7 +200,9 @@ pub fn broadcast_to(a: &Array, shape: &impl IntoShape) -> Result<Array> {
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.stack.html).
 pub fn stack(arrays: &[&Array]) -> Result<Array> {
   if arrays.is_empty() {
-    return Err(Error::ShapeMismatch("stack: arrays slice is empty".into()));
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "stack: arrays slice",
+    )));
   }
   crate::error::ensure_handler_installed();
   let raw: Vec<mlxrs_sys::mlx_array> = arrays.iter().map(|a| a.0).collect();
@@ -211,9 +216,10 @@ pub fn stack(arrays: &[&Array]) -> Result<Array> {
     return Err(
       crate::error::LAST
         .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend(
-          "mlx_vector_array_new_data returned NULL".into(),
-        )),
+        .unwrap_or(
+          // migrate-F: kept as Backend — mlx-c NULL-ctx sentinel pass-through
+          Error::Backend("mlx_vector_array_new_data returned NULL".into()),
+        ),
     );
   }
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
@@ -232,9 +238,9 @@ pub fn stack(arrays: &[&Array]) -> Result<Array> {
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.stack.html).
 pub fn stack_axis(arrays: &[&Array], axis: i32) -> Result<Array> {
   if arrays.is_empty() {
-    return Err(Error::ShapeMismatch(
-      "stack_axis: arrays slice is empty".into(),
-    ));
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "stack_axis: arrays slice",
+    )));
   }
   crate::error::ensure_handler_installed();
   let raw: Vec<mlxrs_sys::mlx_array> = arrays.iter().map(|a| a.0).collect();
@@ -248,9 +254,10 @@ pub fn stack_axis(arrays: &[&Array], axis: i32) -> Result<Array> {
     return Err(
       crate::error::LAST
         .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend(
-          "mlx_vector_array_new_data returned NULL".into(),
-        )),
+        .unwrap_or(
+          // migrate-F: kept as Backend — mlx-c NULL-ctx sentinel pass-through
+          Error::Backend("mlx_vector_array_new_data returned NULL".into()),
+        ),
     );
   }
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)

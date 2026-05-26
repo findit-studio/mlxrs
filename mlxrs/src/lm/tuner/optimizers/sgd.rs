@@ -24,7 +24,7 @@ use std::collections::HashMap;
 
 use crate::{
   Array, Result,
-  error::Error,
+  error::{Error, InvariantViolationPayload, OutOfRangePayload},
   lm::{
     load::Weights,
     tuner::optimizers::base::{LearningRate, Optimizer, zeros_like, zeros_like_map},
@@ -71,8 +71,10 @@ impl SGD {
   /// Construct an [`SGD`] optimizer. Mirrors Python `SGD.__init__`
   /// (`optimizers.py:248..=266`).
   ///
-  /// Errors with [`Error::Backend`] if `nesterov && (momentum <= 0 ||
+  /// Errors with [`Error::InvariantViolation`] if `nesterov && (momentum <= 0 ||
   /// dampening != 0)` — same precondition as the Python `ValueError`.
+  /// Hyperparameter range failures (non-finite momentum, negative
+  /// `weight_decay`, negative `dampening`) surface as [`Error::OutOfRange`].
   pub fn new(
     learning_rate: impl Into<LearningRate>,
     momentum: f32,
@@ -116,9 +118,10 @@ impl SGD {
   /// NaN and propagate it into velocity/weights at the first `apply_gradients`.
   fn validate_nesterov(momentum: f32, dampening: f32, nesterov: bool) -> Result<()> {
     if nesterov && (!momentum.is_finite() || momentum <= 0.0 || dampening != 0.0) {
-      return Err(Error::Backend(
-        "SGD: Nesterov momentum requires momentum > 0 (finite) and dampening == 0".into(),
-      ));
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "SGD: Nesterov momentum",
+        "requires momentum > 0 (finite) and dampening == 0",
+      )));
     }
     Ok(())
   }
@@ -129,8 +132,10 @@ impl SGD {
   /// Called by both `new` and `with_momentum`.
   fn validate_momentum_finite(momentum: f32) -> Result<()> {
     if !momentum.is_finite() {
-      return Err(Error::Backend(format!(
-        "SGD: momentum must be finite, got {momentum}"
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "SGD: momentum",
+        "must be a finite float",
+        momentum.to_string(),
       )));
     }
     Ok(())
@@ -139,8 +144,10 @@ impl SGD {
   /// Validate `weight_decay` is finite and `>= 0.0`.
   fn validate_weight_decay(weight_decay: f32) -> Result<()> {
     if !weight_decay.is_finite() || weight_decay < 0.0 {
-      return Err(Error::Backend(format!(
-        "SGD: weight_decay must be finite and >= 0.0, got {weight_decay}"
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "SGD: weight_decay",
+        "must be a finite float >= 0.0",
+        weight_decay.to_string(),
       )));
     }
     Ok(())
@@ -149,8 +156,10 @@ impl SGD {
   /// Validate `dampening` is finite and `>= 0.0`.
   fn validate_dampening(dampening: f32) -> Result<()> {
     if !dampening.is_finite() || dampening < 0.0 {
-      return Err(Error::Backend(format!(
-        "SGD: dampening must be finite and >= 0.0, got {dampening}"
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "SGD: dampening",
+        "must be a finite float >= 0.0",
+        dampening.to_string(),
       )));
     }
     Ok(())
@@ -389,7 +398,7 @@ mod tests {
   #[test]
   fn sgd_nesterov_precondition_rejects_zero_momentum() {
     let res = SGD::new(0.1, 0.0, 0.0, 0.0, true);
-    assert!(matches!(res, Err(Error::Backend(_))));
+    assert!(matches!(res, Err(Error::InvariantViolation(_))));
   }
 
   #[test]

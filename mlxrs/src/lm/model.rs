@@ -37,16 +37,20 @@ pub trait Model {
   /// Optional embeddings entry point for multimodal models (VLM, M4): run the
   /// decoder over pre-computed input embeddings instead of token ids.
   ///
-  /// Declared, not required — the default returns [`crate::Error::Backend`]
-  /// so the text-only loop never depends on it while the seam exists for
-  /// later milestones. Text models inherit the default; VLMs override it.
+  /// Declared, not required — the default returns
+  /// [`crate::Error::InvariantViolation`] so the text-only loop never
+  /// depends on it while the seam exists for later milestones. Text models
+  /// inherit the default; VLMs override it.
   fn forward_embeddings(
     &self,
     _embeddings: &Array,
     _cache: &mut [Box<dyn KvCache>],
   ) -> Result<Array> {
-    Err(crate::error::Error::Backend(
-      "this model does not implement `forward_embeddings` (VLM seam, M4)".into(),
+    Err(crate::error::Error::InvariantViolation(
+      crate::error::InvariantViolationPayload::new(
+        "Model::forward_embeddings",
+        "not implemented for this model (VLM seam, M4)",
+      ),
     ))
   }
 
@@ -110,9 +114,13 @@ impl Model for MockModel {
       [b, s] => (*b, *s),
       [s] => (1, *s),
       _ => {
-        return Err(crate::error::Error::ShapeMismatch(format!(
-          "MockModel::forward expects [B, S] tokens, got {shape:?}"
-        )));
+        return Err(crate::error::Error::RankMismatch(
+          crate::error::RankMismatchPayload::new(
+            "MockModel::forward expects [B, S] (rank 2) or [S] (rank 1) tokens",
+            shape.len() as u32,
+            shape.to_vec(),
+          ),
+        ));
       }
     };
     let vocab = self.canned.len();

@@ -69,6 +69,7 @@ fn opt_array(a: Option<&Array>) -> (mlxrs_sys::mlx_array, Option<Array>) {
 #[inline(always)]
 fn mode_cstring(mode: &str) -> Result<CString> {
   CString::new(mode).map_err(|_| {
+    // migrate-F: kept as Backend — composite condition (dynamic mode string content)
     crate::Error::Backend(format!(
       "mlxrs::ops::quantized: `mode` contains an interior NUL byte: {mode:?}"
     ))
@@ -348,6 +349,7 @@ pub fn gather_qmm(
 /// (bias-less float modes: `{w_q, scales}`) nor 3 (affine:
 /// `{w_q, scales, biases}`) — the only arities mlx's `quantize` produces.
 fn unexpected_arity(n: usize) -> crate::Error {
+  // migrate-F: kept as Backend — raw mlx-c invariant pass-through
   crate::Error::Backend(format!(
     "mlxrs::ops::quantized::quantize: mlx_quantize returned {n} outputs; \
        expected 2 (bias-less float modes) or 3 (affine)"

@@ -96,7 +96,7 @@ use std::{
 use serde_json::Value;
 
 use crate::{
-  error::{Error, FileIoPayload, FileOp, Result},
+  error::{Error, FileIoPayload, FileOp, OutOfRangePayload, Result},
   tokenizer::Tokenizer,
 };
 
@@ -218,9 +218,10 @@ impl Dataset for TextDataset<'_> {
 
   fn get(&self, idx: usize) -> Result<&Value> {
     self.data.get(idx).ok_or_else(|| {
-      Error::Backend(format!(
-        "TextDataset: index {idx} out of range (len={})",
-        self.data.len()
+      Error::OutOfRange(OutOfRangePayload::new(
+        "TextDataset::get: idx",
+        "must be in [0, len)",
+        format!("idx={idx}, len={}", self.data.len()),
       ))
     })
   }
@@ -309,9 +310,10 @@ impl Dataset for ChatDataset<'_> {
 
   fn get(&self, idx: usize) -> Result<&Value> {
     self.data.get(idx).ok_or_else(|| {
-      Error::Backend(format!(
-        "ChatDataset: index {idx} out of range (len={})",
-        self.data.len()
+      Error::OutOfRange(OutOfRangePayload::new(
+        "ChatDataset::get: idx",
+        "must be in [0, len)",
+        format!("idx={idx}, len={}", self.data.len()),
       ))
     })
   }
@@ -320,13 +322,15 @@ impl Dataset for ChatDataset<'_> {
   fn process(&self, idx: usize) -> Result<Example> {
     let record = self.get(idx)?;
     let messages = record.get(&self.chat_key).ok_or_else(|| {
+      // migrate-F: kept as Backend — composite condition (dynamic chat_key value)
       Error::Backend(format!(
         "ChatDataset: jsonl record missing '{}' field",
         self.chat_key
       ))
     })?;
     if !messages.is_array() {
-      return Err(Error::ShapeMismatch(format!(
+      // migrate-F: kept as Backend — composite condition (dynamic chat_key + json kind)
+      return Err(Error::Backend(format!(
         "ChatDataset: '{}' field must be a JSON array, got {}",
         self.chat_key,
         json_kind(messages),
@@ -423,9 +427,10 @@ impl Dataset for CompletionsDataset<'_> {
 
   fn get(&self, idx: usize) -> Result<&Value> {
     self.data.get(idx).ok_or_else(|| {
-      Error::Backend(format!(
-        "CompletionsDataset: index {idx} out of range (len={})",
-        self.data.len()
+      Error::OutOfRange(OutOfRangePayload::new(
+        "CompletionsDataset::get: idx",
+        "must be in [0, len)",
+        format!("idx={idx}, len={}", self.data.len()),
       ))
     })
   }
@@ -513,9 +518,10 @@ impl<'a> ConcatenatedDataset<'a> {
       }
       remaining -= inner.len();
     }
-    Err(Error::Backend(format!(
-      "ConcatenatedDataset: index {idx} out of range (len={})",
-      self.len,
+    Err(Error::OutOfRange(OutOfRangePayload::new(
+      "ConcatenatedDataset::resolve: idx",
+      "must be in [0, len)",
+      format!("idx={idx}, len={}", self.len),
     )))
   }
 }
@@ -620,9 +626,10 @@ impl Dataset for CacheDataset<'_> {
     let computed = self.data.process(idx)?;
     let mut cache = self.proc_data.borrow_mut();
     if idx >= cache.len() {
-      return Err(Error::Backend(format!(
-        "CacheDataset: index {idx} out of range (len={})",
-        cache.len()
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "CacheDataset: idx",
+        "must be in [0, cache len)",
+        format!("idx={idx}, len={}", cache.len()),
       )));
     }
     cache[idx] = Some(computed.clone());
@@ -804,6 +811,7 @@ pub fn create_dataset<'a>(
   match resolved {
     DatasetType::Text => {
       if config.mask_prompt() {
+        // migrate-F: kept as Backend — Python-reference error string (no clean typed map)
         return Err(Error::Backend(
           "Prompt masking not supported for text dataset.".to_owned(),
         ));
@@ -835,6 +843,7 @@ pub fn create_dataset<'a>(
 /// detection.
 fn auto_detect(data: &[Value], config: &DatasetConfig) -> Result<DatasetType> {
   let sample = data.first().ok_or_else(|| {
+    // migrate-F: kept as Backend — instructive error string (no clean typed map)
     Error::Backend(
       "cannot auto-detect dataset type from an empty jsonl (pass an explicit DatasetType instead)"
         .to_owned(),
@@ -849,6 +858,7 @@ fn auto_detect(data: &[Value], config: &DatasetConfig) -> Result<DatasetType> {
     Ok(DatasetType::Text)
   } else {
     // Match Python `tuner/datasets.py:199..=202` verbatim.
+    // migrate-F: kept as Backend — Python-reference error string (no clean typed map)
     Err(Error::Backend(
       "Unsupported data format, check the supported formats here:\n\
                 https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md#Data."
@@ -908,6 +918,7 @@ pub fn load_dataset<'a>(
   if let Some(s) = path.to_str()
     && (s.starts_with("hf://") || s.starts_with("hf:"))
   {
+    // migrate-F: kept as Backend — composite condition (dynamic path string)
     return Err(Error::Backend(format!(
       "HF Hub datasets are out of scope for the local-only mlxrs build \
          (path: {s}); pass a local jsonl file path instead"
@@ -915,6 +926,7 @@ pub fn load_dataset<'a>(
   }
 
   if !path.exists() {
+    // migrate-F: kept as Backend — composite condition (dynamic path string)
     return Err(Error::Backend(format!(
       "jsonl path does not exist: {}",
       path.display()
@@ -969,6 +981,7 @@ pub fn load_dataset<'a>(
     ))
   })?;
   if !meta.is_file() {
+    // migrate-F: kept as Backend — composite condition (dynamic path string)
     return Err(Error::Backend(format!(
       "jsonl path is not a regular file: {} (directories, sockets, \
          FIFOs etc. are not accepted)",
@@ -976,6 +989,7 @@ pub fn load_dataset<'a>(
     )));
   }
   if meta.len() > MAX_DATASET_FILE_BYTES {
+    // migrate-F: kept as Backend — composite condition (dynamic path + sizes)
     return Err(Error::Backend(format!(
       "jsonl {} is {} bytes — refusing to read above the {}-byte cap; \
          pass a smaller file or shard the data",
@@ -992,6 +1006,7 @@ pub fn load_dataset<'a>(
   let data = read_jsonl_with_cap(BufReader::new(file), path, MAX_DATASET_FILE_BYTES)?;
 
   if data.is_empty() {
+    // migrate-F: kept as Backend — composite condition (dynamic path string)
     return Err(Error::Backend(format!(
       "jsonl {} is empty — refusing to construct an empty dataset; \
          non-empty jsonl is required (skip absent valid.jsonl/test.jsonl \
@@ -1045,6 +1060,7 @@ fn read_jsonl_with_cap<R: BufRead>(
       // is a cap overflow; if it's at EOF, normal exit.
       let mut peek = [0u8; 1];
       let n = std::io::Read::read(&mut reader, &mut peek).map_err(|e| {
+        // migrate-F: kept as Backend — composite condition (dynamic path + line + io::Error)
         Error::Backend(format!(
           "read jsonl {} after line {}: {e}",
           path_for_errors.display(),
@@ -1054,6 +1070,7 @@ fn read_jsonl_with_cap<R: BufRead>(
       if n == 0 {
         break;
       }
+      // migrate-F: kept as Backend — composite condition (dynamic path + cap + line)
       return Err(Error::Backend(format!(
         "jsonl {} exceeded the {}-byte cap during read (cumulative \
            bytes after line {} already at the cap, and more bytes \
@@ -1085,6 +1102,7 @@ fn read_jsonl_with_cap<R: BufRead>(
     let n = match std::io::BufRead::read_until(&mut take, b'\n', &mut line_buf) {
       Ok(n) => n,
       Err(e) => {
+        // migrate-F: kept as Backend — composite condition (dynamic path + line + io::Error)
         return Err(Error::Backend(format!(
           "read jsonl {} line {}: {e}",
           path_for_errors.display(),
@@ -1106,6 +1124,7 @@ fn read_jsonl_with_cap<R: BufRead>(
     // SINGLE giant line that alone exceeds the cap without
     // allocating past `remaining + 1` bytes.
     if total_bytes > max_bytes {
+      // migrate-F: kept as Backend — composite condition (dynamic path + cap + line + bytes)
       return Err(Error::Backend(format!(
         "jsonl {} exceeded the {}-byte cap during read (cumulative \
            bytes after line {} reached at least {}); the file may have \
@@ -1127,6 +1146,7 @@ fn read_jsonl_with_cap<R: BufRead>(
     // Bytes were read into `line_buf`; treat the contents as UTF-8
     // for the parsing path that follows.
     let line = std::str::from_utf8(&line_buf).map_err(|e| {
+      // migrate-F: kept as Backend — composite condition (dynamic path + line + utf8 err)
       Error::Backend(format!(
         "jsonl {} line {} is not valid UTF-8: {e}",
         path_for_errors.display(),
@@ -1138,6 +1158,7 @@ fn read_jsonl_with_cap<R: BufRead>(
       // Python `tuner/datasets.py` does `[json.loads(l) for l in fid]`,
       // which raises on an empty string. Silently dropping a blank
       // would shift subsequent indices and mask corruption.
+      // migrate-F: kept as Backend — composite condition (dynamic path + line)
       return Err(Error::Backend(format!(
         "jsonl {} line {} is blank — every line must be a valid JSON \
            record (matches Python `json.loads(l)` failing on \"\")",
@@ -1146,6 +1167,7 @@ fn read_jsonl_with_cap<R: BufRead>(
       )));
     }
     let v: Value = serde_json::from_str(trimmed).map_err(|e| {
+      // migrate-F: kept as Backend — composite condition (dynamic path + line + serde err)
       Error::Backend(format!(
         "parse jsonl {} line {}: {e}",
         path_for_errors.display(),
@@ -1162,12 +1184,13 @@ fn read_jsonl_with_cap<R: BufRead>(
 /// Extract a string field from a jsonl record, returning a clean error
 /// when missing or wrong-typed.
 fn field_as_str<'a>(record: &'a Value, key: &str, type_name: &str) -> Result<&'a str> {
-  let v = record
-    .get(key)
-    // TODO(§5): promote to MissingField — `type_name` and `key` are runtime &str, not 'static; needs a DynamicMissingField variant or Cow<'static, str> fields.
-    .ok_or_else(|| Error::Backend(format!("{type_name}: jsonl record missing '{key}' field")))?;
+  let v = record.get(key).ok_or_else(|| {
+    // migrate-F: kept as Backend — composite condition (dynamic type_name + key, MissingField requires 'static)
+    Error::Backend(format!("{type_name}: jsonl record missing '{key}' field"))
+  })?;
   v.as_str().ok_or_else(|| {
-    Error::ShapeMismatch(format!(
+    // migrate-F: kept as Backend — composite condition (dynamic type_name + key + json kind)
+    Error::Backend(format!(
       "{type_name}: '{key}' field must be a string, got {}",
       json_kind(v),
     ))
@@ -1392,8 +1415,8 @@ mod tests {
     let ds = TextDataset::new(data, &tok, DEFAULT_TEXT_KEY);
     let err = ds.process(0).unwrap_err();
     assert!(
-      matches!(err, Error::ShapeMismatch(_)),
-      "expected ShapeMismatch, got: {err:?}"
+      matches!(err, Error::Backend(_)),
+      "expected Backend (wrong-type field), got: {err:?}"
     );
   }
 
@@ -1454,8 +1477,8 @@ mod tests {
     let ds = ChatDataset::new(data, &tok, DEFAULT_CHAT_KEY, false);
     let err = ds.process(0).unwrap_err();
     assert!(
-      matches!(err, Error::ShapeMismatch(_)),
-      "expected ShapeMismatch, got: {err:?}"
+      matches!(err, Error::Backend(_)),
+      "expected Backend (wrong-type messages field), got: {err:?}"
     );
   }
 

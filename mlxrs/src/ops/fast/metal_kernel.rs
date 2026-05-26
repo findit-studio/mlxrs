@@ -23,7 +23,7 @@ use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{Error, Result, check, check_vector_array_handle},
+  error::{Error, MultiLengthMismatchPayload, Result, check, check_vector_array_handle},
   stream::default_stream,
 };
 
@@ -65,9 +65,11 @@ pub enum KernelTemplateArg {
 /// `output_shapes.len()` must equal `output_dtypes.len()`; both must also
 /// equal the number of `output_names` declared when the parent
 /// [`MetalKernel`] was constructed. [`MetalKernel::apply`] enforces these
-/// invariants and returns [`Error::ShapeMismatch`] on violation rather than
-/// passing through to mlx-c (where the failure surfaces only at JIT time
-/// with a less actionable message).
+/// invariants and returns [`Error::MultiLengthMismatch`] on violation
+/// rather than passing through to mlx-c (where the failure surfaces only
+/// at JIT time with a less actionable message). See
+/// [`MetalKernel::apply`]'s `# Errors` for the full typed-variant
+/// enumeration.
 ///
 /// The optional `template`, `init_value`, and `verbose` fields default to
 /// empty / `None` / `false` and can be set via the builder methods
@@ -259,6 +261,7 @@ fn build_vector_string(items: &[&str], context: &'static str) -> Result<VectorSt
   let guard = VectorStringGuard(vstr);
   for s in items {
     let cs = CString::new(*s).map_err(|_| {
+      // migrate-F: kept as Backend — composite condition (dynamic context label + value)
       Error::Backend(format!(
         "mlxrs::ops::fast::metal_kernel: {context} entry contains an interior NUL byte: {s:?}"
       ))
@@ -275,6 +278,7 @@ fn build_vector_string(items: &[&str], context: &'static str) -> Result<VectorSt
 /// a backend-style error.
 fn cstring_or_err(s: &str, context: &'static str) -> Result<CString> {
   CString::new(s).map_err(|_| {
+    // migrate-F: kept as Backend — composite condition (dynamic context label + value)
     Error::Backend(format!(
       "mlxrs::ops::fast::metal_kernel: {context} contains an interior NUL byte: {s:?}"
     ))
@@ -283,19 +287,31 @@ fn cstring_or_err(s: &str, context: &'static str) -> Result<CString> {
 
 /// Checked-conversion of a `[u32; 3]` dispatch dimension to `[i32; 3]` for
 /// the mlx-c `set_grid` / `set_thread_group` FFI. Any component above
-/// `i32::MAX` returns [`Error::Backend`] before the call — without this gate
-/// the `as i32` cast would wrap to a negative value, which the Metal backend
-/// would build a corrupt `MTL::Size(gx, gy, gz)` from. `context` is `"grid"`
-/// or `"thread_group"` so the error message identifies which dimension
-/// overflowed.
+/// `i32::MAX` returns [`Error::ArithmeticOverflow`] before the call —
+/// without this gate the `as i32` cast would wrap to a negative value,
+/// which the Metal backend would build a corrupt `MTL::Size(gx, gy, gz)`
+/// from. `context` is `"grid"` or `"thread_group"`; the axis and value
+/// are runtime data, so they live in the static context's text alongside
+/// the op-type field per `OutOfRangePayload`/`ArithmeticOverflowPayload`'s
+/// `&'static str` contract — the variant identity is still observable to
+/// callers (Codex R6 fix).
 fn to_dispatch_dim(dim: [u32; 3], context: &'static str) -> Result<[i32; 3]> {
   let mut out = [0_i32; 3];
   for (axis, &v) in dim.iter().enumerate() {
+    // Codex migrate-F R7 finding: `try_from`-style runtime overflow needs
+    // to preserve the offending axis + value. `ArithmeticOverflowPayload`'s
+    // static `context` + `op_type` fields cannot carry them, so route through
+    // `OutOfRange` whose `value: String` field carries the axis-indexed
+    // offending operand for downstream diagnosis.
     out[axis] = i32::try_from(v).map_err(|_| {
-      Error::Backend(format!(
-        "mlxrs::ops::fast::metal_kernel: {context}[{axis}]={v} exceeds i32::MAX \
-         ({}), which mlx-c's set_{context} requires; reduce the dispatch dimension",
-        i32::MAX
+      Error::OutOfRange(crate::error::OutOfRangePayload::new(
+        if context == "grid" {
+          "MetalKernel::apply: grid dispatch dim"
+        } else {
+          "MetalKernel::apply: thread_group dispatch dim"
+        },
+        "must fit in i32 (i32::MAX = 2147483647)",
+        format!("{context}[{axis}]={v}"),
       ))
     })?;
   }
@@ -436,9 +452,10 @@ impl MetalKernel {
       return Err(
         crate::error::LAST
           .with(|c| c.borrow_mut().take())
-          .unwrap_or(Error::Backend(
-            "mlx_fast_metal_kernel_new returned NULL handle".into(),
-          )),
+          .unwrap_or(
+            // migrate-F: kept as Backend — mlx-c NULL-ctx sentinel pass-through
+            Error::Backend("mlx_fast_metal_kernel_new returned NULL handle".into()),
+          ),
       );
     }
 
@@ -467,15 +484,25 @@ impl MetalKernel {
   ///
   /// # Errors
   ///
-  /// - [`Error::ShapeMismatch`] if `config.output_shapes.len()` /
+  /// Typed pre-FFI validation (every variant is matchable; callers route by
+  /// variant rather than parsing a message):
+  ///
+  /// - [`Error::MultiLengthMismatch`] if `config.output_shapes.len()` or
   ///   `config.output_dtypes.len()` disagrees with the declared
-  ///   `output_names` count, or if those two `Vec`s disagree with each
-  ///   other.
-  /// - [`Error::ShapeMismatch`] if any entry in `config.output_shapes`
-  ///   contains a negative dimension (rejected before mlx-c via
-  ///   [`crate::shape::validate_dims`]).
+  ///   `output_names` count (the payload's `lengths()` carries the
+  ///   `(name, len)` pairs for each collection).
+  /// - [`Error::RankMismatch`] if any entry in `config.output_shapes` is
+  ///   empty (rank-0 outputs are not supported by the shared kernel
+  ///   wrapper).
+  /// - [`Error::OutOfRange`] if any entry in `config.output_shapes`
+  ///   contains a negative dimension (the inner `validate_dims` variant
+  ///   is preserved; the output index is folded into the `value` field).
+  /// - [`Error::ArithmeticOverflow`] if any dispatch dimension or output
+  ///   shape dim exceeds `i32::MAX` (same preservation: inner variant
+  ///   forwarded with the output index folded in).
   /// - [`Error::Backend`] if a template-arg name contains an interior NUL
-  ///   byte (rejected before mlx-c).
+  ///   byte (dynamic context + name, no typed payload that fits; kept as
+  ///   Backend per the migrate-F kept-as-Backend rationale).
   /// - [`Error::Backend`] if any mlx-c `_set_*` / `_add_*` / `_apply` call
   ///   reports an error (e.g. a runtime Metal pipeline failure).
   pub fn apply(&self, inputs: &[&Array], config: &MetalKernelApplyConfig) -> Result<Vec<Array>> {
@@ -486,19 +513,21 @@ impl MetalKernel {
 
     let expected = self.output_names.len();
     if config.output_shapes_slice().len() != expected {
-      return Err(Error::ShapeMismatch(format!(
-        "mlxrs::ops::fast::metal_kernel: output_shapes.len()={} does not match \
-           the kernel's declared output_names.len()={}",
-        config.output_shapes_slice().len(),
-        expected
+      return Err(Error::MultiLengthMismatch(MultiLengthMismatchPayload::new(
+        "MetalKernel::apply: output_shapes vs output_names",
+        vec![
+          ("output_shapes", config.output_shapes_slice().len()),
+          ("output_names", expected),
+        ],
       )));
     }
     if config.output_dtypes_slice().len() != expected {
-      return Err(Error::ShapeMismatch(format!(
-        "mlxrs::ops::fast::metal_kernel: output_dtypes.len()={} does not match \
-           the kernel's declared output_names.len()={}",
-        config.output_dtypes_slice().len(),
-        expected
+      return Err(Error::MultiLengthMismatch(MultiLengthMismatchPayload::new(
+        "MetalKernel::apply: output_dtypes vs output_names",
+        vec![
+          ("output_dtypes", config.output_dtypes_slice().len()),
+          ("output_names", expected),
+        ],
       )));
     }
 
@@ -514,16 +543,36 @@ impl MetalKernel {
     // sentinel for defined-pointer semantics).
     for (idx, shape) in config.output_shapes_slice().iter().enumerate() {
       if shape.is_empty() {
-        return Err(Error::ShapeMismatch(format!(
-          "mlxrs::ops::fast::metal_kernel: output_shapes[{idx}] is empty; \
-             custom Metal kernel outputs must have rank ≥ 1"
+        // Empty (rank-0) output shape — surfaced as RankMismatch with the
+        // observed rank (0) so callers can match on the typed variant
+        // instead of parsing a Backend string. The idx is folded into the
+        // context's free-form description (no per-output-index field on
+        // RankMismatchPayload by design).
+        return Err(Error::RankMismatch(crate::error::RankMismatchPayload::new(
+          "MetalKernel::apply: output_shapes[idx] (custom Metal kernel outputs must have rank >= 1)",
+          0,
+          Vec::new(),
         )));
       }
-      crate::shape::validate_dims(shape).map_err(|e| match e {
-        Error::ShapeMismatch(message) => Error::ShapeMismatch(format!(
-          "mlxrs::ops::fast::metal_kernel: output_shapes[{idx}]: {message}"
-        )),
-        other => other,
+      crate::shape::validate_dims(shape).map_err(|inner| {
+        // Preserve the inner typed variant (OutOfRange / ArithmeticOverflow)
+        // while folding the output-shape index into the value field; this
+        // keeps callers able to match on the variant without parsing a
+        // Backend string (Codex R1 #1).
+        match inner {
+          Error::OutOfRange(p) => Error::OutOfRange(crate::error::OutOfRangePayload::new(
+            "MetalKernel::apply: output_shapes[idx] dim",
+            p.requirement(),
+            format!("idx={idx}, {}", p.value()),
+          )),
+          Error::ArithmeticOverflow(p) => {
+            Error::ArithmeticOverflow(crate::error::ArithmeticOverflowPayload::new(
+              "MetalKernel::apply: output_shapes[idx] dim",
+              p.op_type(),
+            ))
+          }
+          other => other,
+        }
       })?;
     }
 
@@ -557,9 +606,10 @@ impl MetalKernel {
       return Err(
         crate::error::LAST
           .with(|c| c.borrow_mut().take())
-          .unwrap_or(Error::Backend(
-            "mlx_fast_metal_kernel_config_new returned NULL handle".into(),
-          )),
+          .unwrap_or(
+            // migrate-F: kept as Backend — mlx-c NULL-ctx sentinel pass-through
+            Error::Backend("mlx_fast_metal_kernel_config_new returned NULL handle".into()),
+          ),
       );
     }
 
@@ -692,9 +742,10 @@ impl MetalKernel {
       return Err(
         crate::error::LAST
           .with(|c| c.borrow_mut().take())
-          .unwrap_or(Error::Backend(
-            "mlx_vector_array_new_data returned NULL handle".into(),
-          )),
+          .unwrap_or(
+            // migrate-F: kept as Backend — mlx-c NULL-ctx sentinel pass-through
+            Error::Backend("mlx_vector_array_new_data returned NULL handle".into()),
+          ),
       );
     }
 
@@ -956,17 +1007,24 @@ mod tests {
       .apply(&[&input], &cfg)
       .expect_err("negative output dim should be rejected before FFI");
     match err {
-      Error::ShapeMismatch(message) => {
+      Error::OutOfRange(p) => {
         assert!(
-          message.contains("output_shapes[0]"),
-          "expected indexed message, got: {message:?}"
+          p.context().contains("output_shapes[idx] dim"),
+          "expected indexed context, got: {:?}",
+          p.context()
         );
         assert!(
-          message.contains("negative"),
-          "expected `negative` in message, got: {message:?}"
+          p.requirement().contains("must be non-negative"),
+          "expected `must be non-negative` in requirement, got: {:?}",
+          p.requirement()
+        );
+        assert!(
+          p.value().contains("idx=0"),
+          "expected `idx=0` in value, got: {:?}",
+          p.value()
         );
       }
-      other => panic!("expected ShapeMismatch, got: {other:?}"),
+      other => panic!("expected OutOfRange (typed inner preserved), got: {other:?}"),
     }
   }
 
@@ -983,17 +1041,15 @@ mod tests {
       .apply(&[&input], &cfg)
       .expect_err("empty output shape should be rejected before FFI");
     match err {
-      Error::ShapeMismatch(message) => {
+      Error::RankMismatch(p) => {
         assert!(
-          message.contains("output_shapes[0]"),
-          "expected indexed message, got: {message:?}"
+          p.context().contains("output_shapes[idx]"),
+          "expected `output_shapes[idx]` in context, got: {:?}",
+          p.context()
         );
-        assert!(
-          message.contains("empty"),
-          "expected `empty` in message, got: {message:?}"
-        );
+        assert_eq!(p.actual(), 0, "expected observed rank 0");
       }
-      other => panic!("expected ShapeMismatch, got: {other:?}"),
+      other => panic!("expected RankMismatch (empty output shape), got: {other:?}"),
     }
   }
 }

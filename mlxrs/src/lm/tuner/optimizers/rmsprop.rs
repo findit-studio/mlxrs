@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use crate::{
   Array, Result,
-  error::Error,
+  error::{Error, OutOfRangePayload},
   lm::{
     load::Weights,
     tuner::optimizers::base::{LearningRate, Optimizer, zeros_like, zeros_like_map},
@@ -28,8 +28,10 @@ use crate::{
 /// Validate `alpha` is finite and in `[0.0, 1.0)`.
 fn validate_alpha(alpha: f32) -> Result<()> {
   if !alpha.is_finite() || !(0.0..1.0).contains(&alpha) {
-    return Err(Error::Backend(format!(
-      "RMSprop: alpha must be finite and in [0.0, 1.0), got {alpha}"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "RMSprop: alpha",
+      "must be a finite float in [0.0, 1.0)",
+      alpha.to_string(),
     )));
   }
   Ok(())
@@ -38,8 +40,10 @@ fn validate_alpha(alpha: f32) -> Result<()> {
 /// Validate `eps` is finite and `>= 0.0`.
 fn validate_eps(eps: f32) -> Result<()> {
   if !eps.is_finite() || eps < 0.0 {
-    return Err(Error::Backend(format!(
-      "RMSprop: eps must be finite and >= 0.0, got {eps}"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "RMSprop: eps",
+      "must be a finite float >= 0.0",
+      eps.to_string(),
     )));
   }
   Ok(())

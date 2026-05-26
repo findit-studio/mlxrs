@@ -5,7 +5,9 @@ use std::ffi::c_int;
 
 use crate::{
   array::Array,
-  error::{Error, LengthMismatchPayload, MultiLengthMismatchPayload, Result, check},
+  error::{
+    EmptyInputPayload, Error, LengthMismatchPayload, MultiLengthMismatchPayload, Result, check,
+  },
   shape::dim_ptr,
   stream::default_stream,
 };
@@ -188,9 +190,9 @@ pub fn scatter_add_axis(a: &Array, indices: &Array, values: &Array, axis: i32) -
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.gather.html).
 pub fn gather(a: &Array, indices: &[&Array], axes: &[i32], slice_sizes: &[i32]) -> Result<Array> {
   if indices.is_empty() {
-    return Err(Error::ShapeMismatch(
-      "gather: indices slice is empty".into(),
-    ));
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "gather: indices slice",
+    )));
   }
   if indices.len() != axes.len() {
     return Err(Error::LengthMismatch(LengthMismatchPayload::new(
@@ -222,9 +224,10 @@ pub fn gather(a: &Array, indices: &[&Array], axes: &[i32], slice_sizes: &[i32]) 
     return Err(
       crate::error::LAST
         .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend(
-          "mlx_vector_array_new_data returned NULL".into(),
-        )),
+        .unwrap_or(
+          // migrate-F: kept as Backend — mlx-c NULL-ctx sentinel pass-through
+          Error::Backend("mlx_vector_array_new_data returned NULL".into()),
+        ),
     );
   }
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)

@@ -101,9 +101,9 @@ fn stack_with_method_form() {
 #[test]
 fn stack_rejects_empty_input() {
   let r = ops::shape::stack(&[]);
-  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch(_))));
+  assert!(matches!(r, Err(mlxrs::Error::EmptyInput(_))));
   let r2 = ops::shape::stack_axis(&[], 0);
-  assert!(matches!(r2, Err(mlxrs::Error::ShapeMismatch(_))));
+  assert!(matches!(r2, Err(mlxrs::Error::EmptyInput(_))));
 }
 
 #[test]
@@ -190,7 +190,7 @@ fn pad_rejects_negative_low() {
   let zero = Array::from_slice::<f32>(&[0.0], &[0i32; 0]).unwrap();
   let mode = CString::new("constant").unwrap();
   let r = ops::shape::pad(&a, &[0], &[-1], &[1], &zero, &mode);
-  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch(_))));
+  assert!(matches!(r, Err(mlxrs::Error::OutOfRange(_))));
 }
 
 #[test]
@@ -199,7 +199,7 @@ fn pad_rejects_negative_high() {
   let zero = Array::from_slice::<f32>(&[0.0], &[0i32; 0]).unwrap();
   let mode = CString::new("constant").unwrap();
   let r = ops::shape::pad(&a, &[0], &[1], &[-2], &zero, &mode);
-  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch(_))));
+  assert!(matches!(r, Err(mlxrs::Error::OutOfRange(_))));
 }
 
 #[test]
@@ -240,7 +240,7 @@ fn as_strided_shape_strides_length_mismatch_errors() {
   let a = Array::from_slice::<f32>(&[0.0, 1.0, 2.0, 3.0], &[4i32]).unwrap();
   // SAFETY: the length mismatch is rejected pre-FFI; no buffer access.
   let r = unsafe { ops::shape::as_strided(&a, &(2usize, 2), &[1i64], 0) };
-  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch(_))));
+  assert!(matches!(r, Err(mlxrs::Error::LengthMismatch(_))));
 }
 
 #[test]
@@ -258,7 +258,7 @@ fn as_strided_rejects_negative_dim() {
   // no buffer access on the error path.
   let r = unsafe { ops::shape::as_strided(&a, &shape, &[2i64, 1], 0) };
   assert!(
-    matches!(r, Err(mlxrs::Error::ShapeMismatch(_))),
-    "negative dim must Err(ShapeMismatch), got {r:?}"
+    matches!(r, Err(mlxrs::Error::OutOfRange(_))),
+    "negative dim must Err(OutOfRange), got {r:?}"
   );
 }

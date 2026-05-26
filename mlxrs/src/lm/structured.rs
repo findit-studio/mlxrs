@@ -80,7 +80,7 @@ use toktrie_hf_tokenizers::{ByteTokenizer, ByteTokenizerEnv};
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{Error, LengthMismatchPayload, OutOfRangePayload, RankMismatchPayload, Result},
   lm::generate::LogitsProcessor,
   ops,
   tokenizer::Tokenizer,
@@ -153,10 +153,14 @@ fn tok_env_from_tokenizer(
   tokenizer: &Tokenizer,
   model_vocab_size: Option<usize>,
 ) -> Result<TokEnv> {
-  let json = serde_json::to_vec(tokenizer.hf())
-    .map_err(|e| Error::Backend(format!("llguidance: serialize HF tokenizer: {e}")))?;
-  let bt = ByteTokenizer::from_json_bytes(&json)
-    .map_err(|e| Error::Backend(format!("llguidance: build ByteTokenizer: {e}")))?;
+  let json = serde_json::to_vec(tokenizer.hf()).map_err(|e| {
+    // migrate-F: kept as Backend — composite condition (serde error stringified)
+    Error::Backend(format!("llguidance: serialize HF tokenizer: {e}"))
+  })?;
+  let bt = ByteTokenizer::from_json_bytes(&json).map_err(|e| {
+    // migrate-F: kept as Backend — composite condition (llguidance error stringified)
+    Error::Backend(format!("llguidance: build ByteTokenizer: {e}"))
+  })?;
 
   // Sync mlxrs's configured EOS ids into the resulting [`TokEnv`]'s
   // `tok_trie().eos_token_set()` so terminal-grammar EOS-only masks
@@ -205,7 +209,7 @@ fn tok_env_from_tokenizer(
   // `TokTrie::with_eos_tokens`'s `assert!`. The effective bound is the
   // widened `env.tok_trie.vocab_size()` — same value the upstream
   // assert checks against — surfaced as a recoverable
-  // [`Error::ShapeMismatch`] with the offending id + bound.
+  // [`Error::OutOfRange`] with the offending id + bound.
   //
   // The mlxrs `Tokenizer::eos_token_ids()` returns a `BTreeSet<u32>` —
   // iterating in sorted-numeric order is deterministic; for mask
@@ -217,16 +221,19 @@ fn tok_env_from_tokenizer(
   // upstream's hardcoded detection is the only signal we have anyway.
   let configured_eos: Vec<u32> = tokenizer.eos_token_ids_iter().collect();
 
-  let mut env = ByteTokenizerEnv::new(bt, model_vocab_size)
-    .map_err(|e| Error::Backend(format!("llguidance: build ByteTokenizerEnv: {e}")))?;
+  let mut env = ByteTokenizerEnv::new(bt, model_vocab_size).map_err(|e| {
+    // migrate-F: kept as Backend — composite condition (llguidance error stringified)
+    Error::Backend(format!("llguidance: build ByteTokenizerEnv: {e}"))
+  })?;
 
   if !configured_eos.is_empty() {
     let widened_vocab = env.tok_trie.vocab_size();
     for &eos in &configured_eos {
       if (eos as usize) >= widened_vocab {
-        return Err(Error::ShapeMismatch(format!(
-          "llguidance: configured EOS token id {eos} is out of range \
-             (vocab bound = {widened_vocab}); cannot register with the grammar matcher"
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "llguidance: configured EOS token id (cannot register with the grammar matcher)",
+          "must be in [0, vocab_bound)",
+          format!("eos={eos}, vocab_bound={widened_vocab}"),
         )));
       }
     }
@@ -287,17 +294,20 @@ impl LLGuidanceLogitsProcessor {
   /// (a common case — Llama-style models round the LM head's output dim
   /// up for hardware alignment, leaving 64+ "padding" ids that have no
   /// real bytes). Without it, `apply` would surface a
-  /// [`Error::ShapeMismatch`] on the first call. `None` keeps the
-  /// previous behaviour (mask width = tokenizer vocab size), fine for
-  /// models whose LM head matches the tokenizer exactly.
+  /// [`Error::LengthMismatch`] (matcher mask length vs logits last-axis
+  /// vocab width) on the first call. `None` keeps the previous behaviour
+  /// (mask width = tokenizer vocab size), fine for models whose LM head
+  /// matches the tokenizer exactly.
   pub fn new(
     grammar: GrammarSpec,
     tokenizer: &Tokenizer,
     model_vocab_size: Option<usize>,
   ) -> Result<Self> {
     let tok_env = tok_env_from_tokenizer(tokenizer, model_vocab_size)?;
-    let mut factory = ParserFactory::new_simple(&tok_env)
-      .map_err(|e| Error::Backend(format!("llguidance: ParserFactory: {e}")))?;
+    let mut factory = ParserFactory::new_simple(&tok_env).map_err(|e| {
+      // migrate-F: kept as Backend — composite condition (llguidance error stringified)
+      Error::Backend(format!("llguidance: ParserFactory: {e}"))
+    })?;
     // Match the Python reference's quiet default; the `mlx_vlm` Python
     // call sites don't set `log_level`, so llguidance's level-1
     // "warnings to stderr" default would print mid-decode.
@@ -310,6 +320,7 @@ impl LLGuidanceLogitsProcessor {
     // the caller hears about a bad grammar at construction time rather
     // than via every per-step `apply` call.
     if let Some(err) = matcher.get_error() {
+      // migrate-F: kept as Backend — composite condition (llguidance error stringified)
       return Err(Error::Backend(format!(
         "llguidance: grammar compile: {err}"
       )));
@@ -349,8 +360,10 @@ impl LLGuidanceLogitsProcessor {
       [v] => *v,
       [1, v] => *v,
       other => {
-        return Err(Error::ShapeMismatch(format!(
-          "LLGuidanceLogitsProcessor: expected logits shape `[V]` or `[1, V]`, got {other:?}"
+        return Err(Error::RankMismatch(RankMismatchPayload::new(
+          "LLGuidanceLogitsProcessor: expected logits shape `[V]` (rank 1) or `[1, V]` (rank 2)",
+          other.len() as u32,
+          other.to_vec(),
         )));
       }
     };
@@ -368,11 +381,10 @@ impl LLGuidanceLogitsProcessor {
         // `Err` on an invalid token (which would mean the sampler
         // picked a disallowed token — i.e. the constraint pipeline is
         // broken upstream), so surface it.
-        self
-          .matcher
-          .borrow_mut()
-          .consume_token(last)
-          .map_err(|e| Error::Backend(format!("llguidance: consume_token({last}): {e}")))?;
+        self.matcher.borrow_mut().consume_token(last).map_err(|e| {
+          // migrate-F: kept as Backend — composite condition (runtime token id + llguidance err)
+          Error::Backend(format!("llguidance: consume_token({last}): {e}"))
+        })?;
       }
     }
 
@@ -391,7 +403,10 @@ impl LLGuidanceLogitsProcessor {
       .matcher
       .borrow_mut()
       .compute_mask_or_eos()
-      .map_err(|e| Error::Backend(format!("llguidance: compute_mask_or_eos: {e}")))?;
+      .map_err(|e| {
+        // migrate-F: kept as Backend — composite condition (llguidance error stringified)
+        Error::Backend(format!("llguidance: compute_mask_or_eos: {e}"))
+      })?;
 
     // Validate sizes match: `mask.len()` is `tokrx_info.vocab_size`
     // (padded up to 32-bit granularity); the logits' last axis is the
@@ -400,10 +415,10 @@ impl LLGuidanceLogitsProcessor {
     // `tokenizers::Tokenizer::get_vocab_size(true)`, so this catches the
     // "wrong tokenizer for this model" footgun up front.
     if mask.len() < vocab {
-      return Err(Error::ShapeMismatch(format!(
-        "LLGuidanceLogitsProcessor: matcher mask length {} < logits vocab {}",
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "LLGuidanceLogitsProcessor: matcher mask length vs logits vocab (mask must be >= vocab)",
+        vocab,
         mask.len(),
-        vocab
       )));
     }
 
@@ -447,11 +462,10 @@ impl LLGuidanceLogitsProcessor {
   /// `reset()`. After this call the next `apply` is treated as the first
   /// step again.
   pub fn reset(&self) -> Result<()> {
-    self
-      .matcher
-      .borrow_mut()
-      .reset()
-      .map_err(|e| Error::Backend(format!("llguidance: reset: {e}")))?;
+    self.matcher.borrow_mut().reset().map_err(|e| {
+      // migrate-F: kept as Backend — composite condition (llguidance error stringified)
+      Error::Backend(format!("llguidance: reset: {e}"))
+    })?;
     *self.is_first_token.borrow_mut() = true;
     Ok(())
   }

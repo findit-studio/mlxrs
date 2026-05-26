@@ -54,7 +54,7 @@ fn gather_single_axis_slice_sizes_one() {
 fn gather_rejects_empty_indices() {
   let a = Array::from_slice::<f32>(&[1.0, 2.0], &[2i32]).unwrap();
   let r = ops::indexing::gather(&a, &[], &[], &[1]);
-  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch(_))));
+  assert!(matches!(r, Err(mlxrs::Error::EmptyInput(_))));
 }
 
 #[test]
@@ -82,7 +82,7 @@ fn gather_rejects_negative_slice_size() {
   let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3i32]).unwrap();
   let idx = Array::from_slice::<i32>(&[0], &[1i32]).unwrap();
   let r = ops::indexing::gather(&a, &[&idx], &[0], &[-1]);
-  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch(_))));
+  assert!(matches!(r, Err(mlxrs::Error::OutOfRange(_))));
 }
 
 #[test]

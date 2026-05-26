@@ -3,7 +3,7 @@
 use crate::{
   array::Array,
   dtype::{Dtype, Element},
-  error::{Error, Result, check, check_handle},
+  error::{ArithmeticOverflowPayload, Error, LengthMismatchPayload, Result, check, check_handle},
   shape::{IntoShape, dim_ptr, validate_dims},
   stream::default_stream,
 };
@@ -171,9 +171,10 @@ impl Array {
       // correctness improvement that propagates the original allocator
       // error rather than a downstream cascade).
       if scalar.0.ctx.is_null() {
-        return Err(crate::error::take_last().unwrap_or(Error::Backend(
-          "mlx_array_new_float32 returned null handle".into(),
-        )));
+        return Err(crate::error::take_last().unwrap_or(
+          // migrate-F: kept as Backend — mlx-c NULL-ctx sentinel pass-through
+          Error::Backend("mlx_array_new_float32 returned null handle".into()),
+        ));
       }
       // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
       // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
@@ -211,7 +212,7 @@ impl Array {
     // an executable regression test.
     crate::error::ensure_handler_installed();
     let n_i32 = i32::try_from(n)
-      .map_err(|_| Error::ShapeMismatch(format!("eye dim {n} exceeds i32::MAX")))?;
+      .map_err(|_| Error::ArithmeticOverflow(ArithmeticOverflowPayload::new("eye: dim", "i32")))?;
     // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
     // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
     // early return / panic frees it, then populated by the following call.
@@ -274,8 +275,9 @@ impl Array {
     // install-at-call-site requirement is enforced by code review, NOT by
     // an executable regression test.
     crate::error::ensure_handler_installed();
-    let n_i32 = i32::try_from(num)
-      .map_err(|_| Error::ShapeMismatch(format!("linspace num {num} exceeds i32::MAX")))?;
+    let n_i32 = i32::try_from(num).map_err(|_| {
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::new("linspace: num", "i32"))
+    })?;
     // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
     // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
     // early return / panic frees it, then populated by the following call.
@@ -330,18 +332,21 @@ impl Array {
         .iter()
         .try_fold(1usize, |acc, &d| acc.checked_mul(d as usize))
         .ok_or_else(|| {
-          Error::ShapeMismatch(format!(
-            "from_slice: shape product overflows usize for shape {s:?}"
+          Error::ArithmeticOverflow(ArithmeticOverflowPayload::new(
+            "from_slice: shape product",
+            "usize",
           ))
         })?;
       if total != data.len() {
-        return Err(Error::ShapeMismatch(format!(
-          "from_slice: shape product {total} != data.len() {}",
-          data.len()
+        return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+          "from_slice: shape product vs data.len()",
+          total,
+          data.len(),
         )));
       }
-      let dim_i32 = i32::try_from(s.len())
-        .map_err(|_| Error::ShapeMismatch(format!("ndim {} exceeds i32::MAX", s.len())))?;
+      let dim_i32 = i32::try_from(s.len()).map_err(|_| {
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::new("from_slice: ndim", "i32"))
+      })?;
       // SAFETY: fallible sentinel-handle ctor: the error handler is installed first;
       // the (data, dims, ndim) triple was validated above (shape product ==
       // data.len(), non-negative dims, real `T` allocation via `data_ptr`'s

@@ -46,7 +46,10 @@ use std::cell::OnceCell;
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{DtypeMismatchPayload, EmptyInputPayload, Error, Result},
+  error::{
+    ArithmeticOverflowPayload, DtypeMismatchPayload, EmptyInputPayload, Error,
+    InvariantViolationPayload, RankMismatchPayload, Result,
+  },
   ops::fast::metal_kernel::{KernelTemplateArg, MetalKernel, MetalKernelApplyConfig},
   transforms::custom_vjp,
 };
@@ -831,20 +834,24 @@ fn build_js_backward_kernel() -> Result<MetalKernel> {
 fn n_outs_of(logits: &Array) -> Result<i32> {
   let shape = logits.shape();
   let v = shape.last().copied().ok_or_else(|| {
-    Error::ShapeMismatch(
-      "mlxrs::lm::tuner::losses: logits must have rank ≥ 1 (got rank 0)".to_string(),
-    )
+    Error::RankMismatch(RankMismatchPayload::new(
+      "mlxrs::lm::tuner::losses::n_outs_of: logits must have rank >= 1",
+      0,
+      Vec::new(),
+    ))
   })?;
   if v == 0 {
-    return Err(Error::ShapeMismatch(
-      "mlxrs::lm::tuner::losses: logits last dimension must be > 0".to_string(),
-    ));
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "mlxrs::lm::tuner::losses::n_outs_of: logits last dimension",
+      "must be > 0",
+    )));
   }
   let total: usize = shape.iter().product();
   let n_outs = total / v;
   i32::try_from(n_outs).map_err(|_| {
-    Error::ShapeMismatch(format!(
-      "mlxrs::lm::tuner::losses: n_outs {n_outs} exceeds i32::MAX"
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::new(
+      "mlxrs::lm::tuner::losses::n_outs_of: n_outs",
+      "i32",
     ))
   })
 }
@@ -853,13 +860,16 @@ fn n_outs_of(logits: &Array) -> Result<i32> {
 fn vocab_of(logits: &Array) -> Result<i32> {
   let shape = logits.shape();
   let v = shape.last().copied().ok_or_else(|| {
-    Error::ShapeMismatch(
-      "mlxrs::lm::tuner::losses: logits must have rank ≥ 1 (got rank 0)".to_string(),
-    )
+    Error::RankMismatch(RankMismatchPayload::new(
+      "mlxrs::lm::tuner::losses::vocab_of: logits must have rank >= 1",
+      0,
+      Vec::new(),
+    ))
   })?;
   i32::try_from(v).map_err(|_| {
-    Error::ShapeMismatch(format!(
-      "mlxrs::lm::tuner::losses: vocab size {v} exceeds i32::MAX"
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::new(
+      "mlxrs::lm::tuner::losses::vocab_of: vocab size",
+      "i32",
     ))
   })
 }
@@ -873,16 +883,19 @@ fn vocab_of(logits: &Array) -> Result<i32> {
 fn leading_shape_i32(logits: &Array) -> Result<Vec<i32>> {
   let shape = logits.shape();
   if shape.is_empty() {
-    return Err(Error::ShapeMismatch(
-      "mlxrs::lm::tuner::losses: logits must have rank ≥ 1 (got rank 0)".to_string(),
-    ));
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "mlxrs::lm::tuner::losses::leading_shape_i32: logits must have rank >= 1",
+      0,
+      Vec::new(),
+    )));
   }
   shape[..shape.len() - 1]
     .iter()
     .map(|&d| {
       i32::try_from(d).map_err(|_| {
-        Error::ShapeMismatch(format!(
-          "mlxrs::lm::tuner::losses: shape dim {d} exceeds i32::MAX"
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::new(
+          "mlxrs::lm::tuner::losses::leading_shape_i32: shape dim",
+          "i32",
         ))
       })
     })
@@ -898,8 +911,9 @@ fn full_shape_i32(logits: &Array) -> Result<Vec<i32>> {
     .iter()
     .map(|&d| {
       i32::try_from(d).map_err(|_| {
-        Error::ShapeMismatch(format!(
-          "mlxrs::lm::tuner::losses: shape dim {d} exceeds i32::MAX"
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::new(
+          "mlxrs::lm::tuner::losses::full_shape_i32: shape dim",
+          "i32",
         ))
       })
     })
@@ -931,14 +945,15 @@ fn full_shape_i32(logits: &Array) -> Result<Vec<i32>> {
 /// with [`Array::astype`] before calling if your logits are not already
 /// floating-point.
 ///
-/// Zero-width vocab (last dim == 0) and i32-overflowing dims are also
-/// rejected here with [`Error::ShapeMismatch`], BEFORE the dtype checks,
-/// to match the documented precedence on [`kl_div_loss`] /
-/// [`js_div_loss`] (step 2 = shape-class errors, step 3 = dtype mismatch,
-/// step 4 = dtype admissibility). The shape-class rejections live in this
-/// validator so the public contract holds for every reachable dtype
-/// combination, including unsupported-but-equal dtypes (e.g. `i32 vs
-/// i32`) and mismatched dtypes (e.g. `f32 vs f16`).
+/// Zero-width vocab (last dim == 0) is rejected here with
+/// [`Error::OutOfRange`], and i32-overflowing dims are rejected here with
+/// [`Error::ArithmeticOverflow`], BEFORE the dtype checks, to match the
+/// documented precedence on [`kl_div_loss`] / [`js_div_loss`] (steps
+/// 3-4 = shape-class errors, step 5 = dtype mismatch, step 6 = dtype
+/// admissibility). The shape-class rejections live in this validator so
+/// the public contract holds for every reachable dtype combination,
+/// including unsupported-but-equal dtypes (e.g. `i32 vs i32`) and
+/// mismatched dtypes (e.g. `f32 vs f16`).
 ///
 /// [`Array::astype`]: crate::array::Array::astype
 fn validate_inputs(logits_q: &Array, logits_p: &Array, ctx: &str) -> Result<()> {
@@ -954,47 +969,66 @@ fn validate_inputs(logits_q: &Array, logits_p: &Array, ctx: &str) -> Result<()> 
   // contract message here instead. Mirrors the upstream `mlx_lm`
   // convention of `[B, ..., V]` logits from a model's forward pass.
   if logits_q.ndim() < 2 {
-    return Err(Error::Backend(format!(
-      "mlxrs::lm::tuner::losses::{ctx}: kl_div_loss / js_div_loss require \
-         logits of rank >= 2 (shape [B, ..., V]); got logits_q rank {} (shape {sq:?}). \
-         Rank-1 input [V] is not supported in v1; reshape to [1, V] for a \
-         scalar-like loss.",
-      logits_q.ndim()
+    // Typed shape-class variant (Codex R2 follow-up): rank check on logits_q.
+    // The dynamic `ctx` is the caller-fn name (kl_div_loss / js_div_loss);
+    // dropped from the static context (RankMismatchPayload requires
+    // &'static str) but the full shape is preserved in `actual_shape` for
+    // diagnostics.
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "kl_div_loss / js_div_loss: logits_q must be rank >= 2 (shape [B, ..., V])",
+      logits_q.ndim() as u32,
+      sq.to_vec(),
     )));
   }
   if logits_p.ndim() < 2 {
-    return Err(Error::Backend(format!(
-      "mlxrs::lm::tuner::losses::{ctx}: kl_div_loss / js_div_loss require \
-         logits of rank >= 2 (shape [B, ..., V]); got logits_p rank {} (shape {sp:?}). \
-         Rank-1 input [V] is not supported in v1; reshape to [1, V] for a \
-         scalar-like loss.",
-      logits_p.ndim()
+    // Typed shape-class variant (Codex R2 follow-up): same for logits_p.
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "kl_div_loss / js_div_loss: logits_p must be rank >= 2 (shape [B, ..., V])",
+      logits_p.ndim() as u32,
+      sp.to_vec(),
     )));
   }
   if sq != sp {
+    // Typed shape-class variant (Codex R2 follow-up): the shape mismatch
+    // is the canonical step-2 ShapeMismatch error per the documented
+    // precedence. Keep as ShapeMismatch (the legacy free-form variant
+    // retained for shape-pair comparisons until a typed payload arrives)
+    // so callers can route on `Error::ShapeMismatch` instead of parsing
+    // a Backend string — restoring the pre-PR behaviour.
     return Err(Error::ShapeMismatch(format!(
-      "mlxrs::lm::tuner::losses::{ctx}: logits_q shape {sq:?} != logits_p shape {sp:?}"
+      "kl_div_loss / js_div_loss: logits_q shape {sq:?} != logits_p shape {sp:?}"
     )));
   }
   // Zero-last-dim + i32-overflow checks run BEFORE dtype checks so the
-  // documented precedence (step 2 = ShapeMismatch for "last dim is 0 or
-  // any dim overflows i32") matches actual behavior. Without this, equal
-  // `i32` arrays shaped `[1, 0]` would route through the dtype-admissibility
-  // Backend error (step 4) and mixed-dtype `[1, 0]` arrays would route
+  // documented precedence (steps 3-4 = typed shape-class errors —
+  // OutOfRange for zero-last-dim, ArithmeticOverflow for i32 overflow)
+  // matches actual behavior. Without this, equal `i32` arrays shaped
+  // `[1, 0]` would route through the dtype-admissibility Backend error
+  // (step 6) and mixed-dtype `[1, 0]` arrays would route
   // through DtypeMismatch (step 3) — contrary to the contract. We also
   // mirror these checks defensively in `n_outs_of` / `leading_shape_i32` /
   // `full_shape_i32`, but they'll never fire on the public path now.
   let last = *sq.last().expect("rank>=2 guaranteed by checks above");
   if last == 0 {
-    return Err(Error::ShapeMismatch(format!(
-      "mlxrs::lm::tuner::losses::{ctx}: logits last dimension must be > 0 (got shape {sq:?})"
+    // Typed shape-class variant (Codex R1 #2): preserves the documented
+    // step-2 precedence (zero-last-dim BEFORE dtype admissibility) so
+    // callers can match on the variant. `ctx` is dynamic so the static
+    // OutOfRange context drops it; the call-site label lives in `value`
+    // alongside the observed shape.
+    return Err(Error::OutOfRange(crate::error::OutOfRangePayload::new(
+      "kl_div_loss / js_div_loss: logits last dimension",
+      "must be > 0",
+      format!("ctx={ctx}, shape={sq:?}"),
     )));
   }
   for &d in sq.iter() {
     if i32::try_from(d).is_err() {
-      return Err(Error::ShapeMismatch(format!(
-        "mlxrs::lm::tuner::losses::{ctx}: shape dim {d} exceeds i32::MAX (shape {sq:?})"
-      )));
+      // Typed shape-class variant (Codex R1 #2): i32 overflow on any
+      // shape dim — preserves step-2 precedence as ArithmeticOverflow.
+      let _ = d; // dim value folded into the typed variant's static context.
+      return Err(Error::ArithmeticOverflow(
+        crate::error::ArithmeticOverflowPayload::new("kl_div_loss / js_div_loss: shape dim", "i32"),
+      ));
     }
   }
   let dq = logits_q.dtype()?;
@@ -1009,6 +1043,7 @@ fn validate_inputs(logits_q: &Array, logits_p: &Array, ctx: &str) -> Result<()> 
   match dq {
     Dtype::F32 | Dtype::F16 | Dtype::BF16 => {}
     other => {
+      // migrate-F: kept as Backend — composite condition (dynamic ctx + dtype)
       return Err(Error::Backend(format!(
         "mlxrs::lm::tuner::losses::{ctx}: kl_div_loss / js_div_loss \
            require floating-point logits (F32, F16, or BF16); got {other:?}. \
@@ -1081,9 +1116,9 @@ fn kl_backward_apply(logits_q: &Array, logits_p: &Array, cotangent: &Array) -> R
   let dtype = logits_q.dtype()?;
   let vocab = vocab_of(logits_q)?;
   let cot_size = i32::try_from(cotangent.size()).map_err(|_| {
-    Error::ShapeMismatch(format!(
-      "mlxrs::lm::tuner::losses::kl_backward: cotangent size {} exceeds i32::MAX",
-      cotangent.size()
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::new(
+      "mlxrs::lm::tuner::losses::kl_backward: cotangent size",
+      "i32",
     ))
   })?;
   let out_shape = full_shape_i32(logits_q)?;
@@ -1127,10 +1162,13 @@ fn js_forward_apply(logits_q: &Array, logits_p: &Array) -> Result<(Array, Array)
   with_kernel(&JS_FORWARD, build_js_forward_kernel, |kernel| {
     let mut outputs = kernel.apply(&[logits_q, logits_p], &cfg)?;
     if outputs.len() != 2 {
-      return Err(Error::ShapeMismatch(format!(
-        "mlxrs::lm::tuner::losses::js_forward: expected 2 outputs, got {}",
-        outputs.len()
-      )));
+      return Err(Error::LengthMismatch(
+        crate::error::LengthMismatchPayload::new(
+          "mlxrs::lm::tuner::losses::js_forward: kernel outputs (expected 2)",
+          2,
+          outputs.len(),
+        ),
+      ));
     }
     let kl_q = outputs.swap_remove(1);
     let loss = outputs.swap_remove(0);
@@ -1150,9 +1188,9 @@ fn js_backward_apply(
   let dtype = logits_q.dtype()?;
   let vocab = vocab_of(logits_q)?;
   let cot_size = i32::try_from(cotan.size()).map_err(|_| {
-    Error::ShapeMismatch(format!(
-      "mlxrs::lm::tuner::losses::js_backward: cotan size {} exceeds i32::MAX",
-      cotan.size()
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::new(
+      "mlxrs::lm::tuner::losses::js_backward: cotan size",
+      "i32",
     ))
   })?;
   let out_shape = full_shape_i32(logits_q)?;
@@ -1185,16 +1223,17 @@ fn js_backward_apply(
 ///
 /// - **Rank >= 2.** Logits must be shaped `[B, ..., V]` (matching upstream
 ///   `mlx_lm`'s convention of logits emitted from a model forward pass).
-///   Rank-1 input `[V]` is rejected with [`Error::Backend`] — scalar Metal
-///   outputs are not supported by the shared kernel wrapper. Reshape to
-///   `[1, V]` for a scalar-like loss.
+///   Rank-1 input `[V]` is rejected with [`Error::RankMismatch`] — scalar
+///   Metal outputs are not supported by the shared kernel wrapper. Reshape
+///   to `[1, V]` for a scalar-like loss.
 /// - **Floating dtype only.** Logits must be `Dtype::F32`, `Dtype::F16`, or
 ///   `Dtype::BF16`. The kernel uses the input dtype as the template
 ///   parameter `T` and casts intermediate KL expressions back to `T`, so
 ///   integer / boolean / `F64` / `Complex64` inputs would silently truncate
-///   to corrupted numerics and are rejected with [`Error::Backend`]. Cast
-///   with [`Array::astype`] before calling if your logits aren't already
-///   floating.
+///   to corrupted numerics and are rejected with [`Error::Backend`] (the
+///   dtype-admissibility branch is the only one kept as `Backend`; every
+///   other validation path is a typed variant). Cast with
+///   [`Array::astype`] before calling if your logits aren't already floating.
 ///
 /// Differentiable via the custom backward kernel — wrap in
 /// [`crate::transforms::grad`] / [`crate::transforms::value_and_grad`] to
@@ -1209,19 +1248,24 @@ fn js_backward_apply(
 ///
 /// # Errors
 ///
-/// Validation precedence (in order):
+/// Validation precedence (in order — every step is a typed variant so
+/// callers route by variant, not by message substring):
 ///
 /// 1. Rank check (BOTH inputs) — rank `< 2` (including rank 0) returns
-///    [`Error::Backend`] with the "rank >= 2 required" message. This
+///    [`Error::RankMismatch`] with the observed rank + full shape. This
 ///    runs BEFORE shape comparison, so a rank-1 `logits_q` paired with a
-///    rank-2 `logits_p` returns the rank error and NOT [`Error::ShapeMismatch`].
-/// 2. Shape comparison — [`Error::ShapeMismatch`] if
-///    `logits_q.shape() != logits_p.shape()`, or if the last dimension is
-///    0, or if any dimension overflows `i32`.
-/// 3. Dtype comparison — [`Error::DtypeMismatch`] if the two arrays have
+///    rank-2 `logits_p` returns the rank error and NOT
+///    [`Error::ShapeMismatch`].
+/// 2. Shape vector comparison — [`Error::ShapeMismatch`] if
+///    `logits_q.shape() != logits_p.shape()`.
+/// 3. Zero-last-dim — [`Error::OutOfRange`] if `logits.shape().last() == 0`.
+/// 4. Shape-dim i32 overflow — [`Error::ArithmeticOverflow`] if any
+///    dimension exceeds `i32::MAX`.
+/// 5. Dtype comparison — [`Error::DtypeMismatch`] if the two arrays have
 ///    different dtypes.
-/// 4. Dtype admissibility — [`Error::Backend`] if the dtype is not one of
-///    `F32` / `F16` / `BF16`.
+/// 6. Dtype admissibility — [`Error::Backend`] if the dtype is not one of
+///    `F32` / `F16` / `BF16` (kept as Backend: dynamic dtype value with no
+///    structured payload that fits).
 ///
 /// Also returns [`Error::Backend`] if the Metal kernel apply fails (e.g.
 /// no Metal device available, kernel compile error).
@@ -1425,7 +1469,7 @@ mod tests {
       Error::ShapeMismatch(message) => {
         assert!(message.contains("shape"), "got: {message:?}");
       }
-      other => panic!("expected ShapeMismatch, got: {other:?}"),
+      other => panic!("expected ShapeMismatch (shape vec mismatch), got: {other:?}"),
     }
   }
 
@@ -1452,7 +1496,7 @@ mod tests {
       Error::ShapeMismatch(message) => {
         assert!(message.contains("kl_div_loss"), "got: {message:?}");
       }
-      other => panic!("expected ShapeMismatch, got: {other:?}"),
+      other => panic!("expected ShapeMismatch (shape vec mismatch), got: {other:?}"),
     }
   }
 
@@ -1465,7 +1509,7 @@ mod tests {
       Error::ShapeMismatch(message) => {
         assert!(message.contains("js_div_loss"), "got: {message:?}");
       }
-      other => panic!("expected ShapeMismatch, got: {other:?}"),
+      other => panic!("expected ShapeMismatch (shape vec mismatch), got: {other:?}"),
     }
   }
 
@@ -1481,10 +1525,11 @@ mod tests {
     let a = Array::full::<f32>(&[0i32; 0], 1.0).unwrap();
     let err = n_outs_of(&a).unwrap_err();
     match err {
-      Error::ShapeMismatch(message) => {
-        assert!(message.contains("rank ≥ 1") || message.contains("rank"));
+      Error::RankMismatch(p) => {
+        assert!(p.context().contains("rank"));
+        assert_eq!(p.actual(), 0);
       }
-      other => panic!("expected ShapeMismatch, got: {other:?}"),
+      other => panic!("expected RankMismatch, got: {other:?}"),
     }
   }
 

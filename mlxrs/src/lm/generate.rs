@@ -50,34 +50,26 @@
 //! exponentiate anything), so it still receives the raw post-processor
 //! logits.
 //!
-//! **Numerical-safety scope:** the opt-in logprobs + opt-out paths above
-//! work correctly for sane (non-subnormal) `temp` + non-f16-tiny-temp
-//! configs. Two extreme-`temp` configurations still produce non-finite
-//! distributions inside `sample::categorical_sampling` itself (the bug
-//! is in the primitive, not the generation loop): f16 logits +
-//! `temp < 1/65504 ≈ 1.526e-5`, and any logits dtype + subnormal
-//! positive `temp < 1.0/f32::MAX ≈ 2.94e-39`. Both share the same root:
-//! `categorical_sampling` computes `1.0/temp` in `f32` (because
-//! `GenConfig.temp` is `f32`) then multiplies by `scalar_like(1/temp,
-//! logits)` IN THE LOGITS DTYPE; the `f32` reciprocal overflows for
-//! subnormal `temp`, and the dtype cast overflows for f16 + tiny `temp`.
-//! VLM ([`crate::vlm::generate`]) and audio ([`crate::audio::stt::generate`])
-//! share the same defect via the same `make_sampler` chain. The
-//! structural fix lives in `sample::categorical_sampling` itself —
-//! the fix must avoid materializing an `+Inf` reciprocal OR casting an
-//! overflowing reciprocal into the logits dtype. Two viable shapes:
-//! (1) divide instead of multiply (`logits / scalar_like(temp,
-//! logits)` — never materializes `1/temp`, covers both overflow
-//! modes), or (2) route to argmax INSIDE the primitive after every
-//! upstream sampler stage runs (preserves XTC/top_k/min_p semantics).
-//! A naive `1/temp` upcast to f64 is only a partial mitigation — it
-//! closes the f32 subnormal path but the cast back into f16 still
-//! overflows for `temp < 1/65504`. A LM-only argmax bypass in the
-//! generation loop was prototyped and reverted (R3+R4 → R5 revert):
-//! it failed to cover VLM/STT and silently skipped configured sampler
-//! stages, so the fix must land in the primitive with regression
-//! tests across LM/VLM/STT. Deferred to a dedicated `fix(lm/sample)`
-//! follow-up PR after this one merges.
+//! **Numerical-safety scope:** the temperature divide is performed by
+//! [`crate::lm::sample::scale_logits_by_temp`] (the LM-6 R1+R2 fix shipped
+//! before this PR). It dispatches per dtype:
+//! - **F32**: in-dtype `divide(logits, scalar_like(temp))`.
+//! - **F16 / BF16**: upcast to f32, divide in f32, downcast back so `temp`
+//!   never gets cast to the narrower dtype. A below-`1/f32::MAX` clamp on
+//!   `temp` keeps the divide's f32-reciprocal-multiply lowering finite for
+//!   sub-normal positive `temp`.
+//! - **F64**: rejected with [`crate::Error::InvariantViolation`] (MLX's GPU
+//!   stream does not implement float64).
+//! - **Non-floating**: rejected with [`crate::Error::OutOfRange`].
+//!
+//! The two extreme-`temp` configurations historically called out here
+//! (f16 + `temp < 1/65504`, and any-dtype + subnormal `temp`) are both
+//! covered by the dispatch above. The shared `make_sampler` chain used by
+//! VLM ([`crate::vlm::generate`]) and audio
+//! ([`crate::audio::stt::generate`]) inherits the same safety. See
+//! [`crate::lm::sample::scale_logits_by_temp`]'s docs for the full
+//! per-dtype rationale and the rejected variant identity for callers that
+//! match on the typed error.
 //!
 //! **Exact per-step order (mlx-lm `generate_step._step`, lines 396-422):**
 //!
@@ -106,11 +98,10 @@
 //!    if neither did (pure-greedy opt-out). Every sampler in
 //!    [`make_sampler`] is shift-invariant or softmaxes internally except
 //!    `top_p`, which forces step 4 to run. Extreme-temp NaN-safety for
-//!    `categorical_sampling` itself (f16 + `temp < 1/65504`, any dtype +
-//!    subnormal `temp`) is deferred to a dedicated `fix(lm/sample)`
-//!    follow-up PR — see the module-level "numerical-safety scope"
-//!    note for the scope, fix options, and prior in-diff revert
-//!    rationale.
+//!    `categorical_sampling` is covered by
+//!    [`crate::lm::sample::scale_logits_by_temp`]'s per-dtype dispatch
+//!    (LM-6 R1+R2 shipped) — see the module-level "numerical-safety
+//!    scope" note for the full mapping.
 //! 6. yield `GenStep { token, logprobs }` — `logprobs` is
 //!    `Some(logprobs.squeeze(0))` when [`GenConfig::collect_logprobs`] is
 //!    `true`, `None` otherwise (L3 opt-in; mlx-lm always yields the
@@ -144,7 +135,10 @@ use std::cell::RefCell;
 
 use crate::{
   array::Array,
-  error::{Error, Result, try_extend_from_slice, try_with_capacity},
+  error::{
+    EmptyInputPayload, Error, LengthMismatchPayload, OutOfRangePayload, RankMismatchPayload,
+    Result, try_extend_from_slice, try_with_capacity,
+  },
   lm::{cache::KvCache, model::Model, sample},
   ops,
 };
@@ -819,11 +813,14 @@ impl GenConfig {
   /// front (AUDIO-12 polish #136) — `temp`, `top_p`, `min_p`,
   /// `min_tokens_to_keep`, `top_k`, `xtc_probability`, `xtc_threshold`,
   /// `repetition_penalty`, and the `logit_bias` `(id, value)` pair-arity.
-  /// Returns the **first** bound violated as an `Err(Error::ShapeMismatch)`
-  /// with a descriptive message (the same `Err` shape the per-step
-  /// validation in [`crate::lm::sample`] surfaces, so a caller migrating
-  /// from "fails on first decode step" to "fails at config-build" sees
-  /// the same error class).
+  /// Returns the **first** bound violated as an
+  /// [`Err(Error::OutOfRange)`](Error::OutOfRange) carrying a typed payload
+  /// (parameter `context`, violated `requirement`, formatted runtime
+  /// `value`). Callers can match on the variant rather than parsing a
+  /// message string — the per-step validation in [`crate::lm::sample`]
+  /// surfaces the same typed variant for the same scalar-bound class, so a
+  /// caller migrating from "fails on first decode step" to "fails at
+  /// config-build" sees the same error class.
   ///
   /// # Why eager
   ///
@@ -910,56 +907,61 @@ impl GenConfig {
     // temp: finite + non-negative (temp == 0 ⇒ argmax path; temp > 0 ⇒
     // stochastic path).
     if !self.temp.is_finite() || self.temp < 0.0 {
-      return Err(Error::ShapeMismatch(format!(
-        "`temp` must be a finite non-negative float (0.0 = argmax, > 0.0 = stochastic), \
-           but is {}",
-        self.temp
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "GenConfig::temp (0.0 = argmax, > 0.0 = stochastic)",
+        "must be a finite non-negative float",
+        self.temp.to_string(),
       )));
     }
     // top_p: [0, 1]. `make_sampler` gates the stage on `(0, 1)`; 0 and 1
     // are no-op-equivalent and accepted as "off" / "include everything".
     if !self.top_p.is_finite() || !(0.0..=1.0).contains(&self.top_p) {
-      return Err(Error::ShapeMismatch(format!(
-        "`top_p` must be a finite float in [0, 1] (0 = off, (0, 1) = nucleus cutoff, \
-           1 = include everything), but is {}",
-        self.top_p
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "GenConfig::top_p (0 = off, (0, 1) = nucleus cutoff, 1 = include everything)",
+        "must be a finite float in [0, 1]",
+        self.top_p.to_string(),
       )));
     }
     // min_p: [0, 1] (mirrors `apply_min_p`).
     if !self.min_p.is_finite() || !(0.0..=1.0).contains(&self.min_p) {
-      return Err(Error::ShapeMismatch(format!(
-        "`min_p` must be a finite float in [0, 1], but is {}",
-        self.min_p
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "GenConfig::min_p",
+        "must be a finite float in [0, 1]",
+        self.min_p.to_string(),
       )));
     }
     // min_tokens_to_keep >= 1 (mirrors `apply_min_p`; the `<= vocab_size`
     // bound is vocab-dependent and deferred to the first decode step).
     if self.min_tokens_to_keep < 1 {
-      return Err(Error::ShapeMismatch(format!(
-        "`min_tokens_to_keep` must be a positive integer (>= 1), but is {}",
-        self.min_tokens_to_keep
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "GenConfig::min_tokens_to_keep",
+        "must be a positive integer (>= 1)",
+        self.min_tokens_to_keep.to_string(),
       )));
     }
     // top_k >= 0 (`top_k == 0` is "off"; `top_k > 0` is "on" — the
     // `< vocab_size` bound is vocab-dependent and deferred).
     if self.top_k < 0 {
-      return Err(Error::ShapeMismatch(format!(
-        "`top_k` must be non-negative (0 = off, > 0 = top-k cutoff), but is {}",
-        self.top_k
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "GenConfig::top_k (0 = off, > 0 = top-k cutoff)",
+        "must be non-negative",
+        self.top_k.to_string(),
       )));
     }
     // xtc_probability: [0, 1] (mirrors `apply_xtc`).
     if !self.xtc_probability.is_finite() || !(0.0..=1.0).contains(&self.xtc_probability) {
-      return Err(Error::ShapeMismatch(format!(
-        "`xtc_probability` must be a finite float in [0, 1], but is {}",
-        self.xtc_probability
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "GenConfig::xtc_probability",
+        "must be a finite float in [0, 1]",
+        self.xtc_probability.to_string(),
       )));
     }
     // xtc_threshold: [0, 0.5] (mirrors `apply_xtc`).
     if !self.xtc_threshold.is_finite() || !(0.0..=0.5).contains(&self.xtc_threshold) {
-      return Err(Error::ShapeMismatch(format!(
-        "`xtc_threshold` must be a finite float in [0, 0.5], but is {}",
-        self.xtc_threshold
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "GenConfig::xtc_threshold",
+        "must be a finite float in [0, 0.5]",
+        self.xtc_threshold.to_string(),
       )));
     }
     // repetition_penalty: finite + non-negative (mirrors
@@ -970,9 +972,10 @@ impl GenConfig {
     if let Some(p) = self.repetition_penalty
       && (!p.is_finite() || p < 0.0)
     {
-      return Err(Error::ShapeMismatch(format!(
-        "`repetition_penalty` must be a finite non-negative float when `Some(_)`, \
-           but is {p}"
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "GenConfig::repetition_penalty",
+        "must be a finite non-negative float when `Some(_)`",
+        p.to_string(),
       )));
     }
     // presence_penalty: finite-only. mlx-lm's `make_presence_penalty`
@@ -981,16 +984,20 @@ impl GenConfig {
     if let Some(p) = self.presence_penalty
       && !p.is_finite()
     {
-      return Err(Error::ShapeMismatch(format!(
-        "`presence_penalty` must be a finite float when `Some(_)`, but is {p}"
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "GenConfig::presence_penalty",
+        "must be a finite float when `Some(_)`",
+        p.to_string(),
       )));
     }
     // frequency_penalty: finite-only (same rationale as presence).
     if let Some(p) = self.frequency_penalty
       && !p.is_finite()
     {
-      return Err(Error::ShapeMismatch(format!(
-        "`frequency_penalty` must be a finite float when `Some(_)`, but is {p}"
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "GenConfig::frequency_penalty",
+        "must be a finite float when `Some(_)`",
+        p.to_string(),
       )));
     }
     // logit_bias: every `(id, value)` `value` finite. `id` is `i32` and
@@ -998,8 +1005,10 @@ impl GenConfig {
     // primitive will reject an out-of-range id at the first decode step).
     for &(id, v) in &self.logit_bias {
       if !v.is_finite() {
-        return Err(Error::ShapeMismatch(format!(
-          "`logit_bias` value for token id {id} must be a finite float, but is {v}"
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "GenConfig::logit_bias value",
+          "must be a finite float",
+          format!("token id {id}: {v}"),
         )));
       }
     }
@@ -1725,8 +1734,10 @@ fn token_window(ids: &[u32]) -> Result<Array> {
 fn last_position(logits: &Array) -> Result<Array> {
   let shape = logits.shape();
   if shape.len() != 3 {
-    return Err(Error::ShapeMismatch(format!(
-      "generate: expected [B, S, V] logits from `forward`, got {shape:?}"
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "generate: expected [B, S, V] (rank 3) logits from `forward`",
+      shape.len() as u32,
+      shape.to_vec(),
     )));
   }
   // `logits[:, -1, :]` is only defined for a non-empty sequence axis and a
@@ -1735,9 +1746,15 @@ fn last_position(logits: &Array) -> Result<Array> {
   // (an empty distribution the sampler cannot draw from) as a recoverable
   // `Err` BEFORE any index arithmetic.
   if shape[1] == 0 || shape[2] == 0 {
-    return Err(Error::ShapeMismatch(format!(
-      "generate: `forward` returned logits with a zero-length axis (got [B, S, V] {shape:?}); \
-         `logits[:, -1, :]` requires S >= 1 and V >= 1"
+    // Typed shape-invariant (Codex R1 #3): caller-side rejection of a
+    // model's degenerate logits shape. Surface as OutOfRange with the
+    // full observed shape in `value`, preserving the variant so callers
+    // can distinguish buggy-model shape from a real backend failure
+    // without parsing a Backend string.
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "generate: forward logits S and V axes (logits[:, -1, :] requires both >= 1)",
+      "must be in S >= 1 and V >= 1",
+      format!("shape={shape:?}"),
     )));
   }
   let (b, s, v) = (shape[0] as i32, shape[1] as i32, shape[2] as i32);
@@ -1809,9 +1826,9 @@ pub(crate) fn build_generator<'a, M: Model + ?Sized>(
   // contract is the single error channel.
   let built = (|| -> Result<(Sampler, Vec<LogitsProcessor>)> {
     if prompt.is_empty() {
-      return Err(Error::ShapeMismatch(
-        "generate: prompt must be non-empty".into(),
-      ));
+      return Err(Error::EmptyInput(EmptyInputPayload::new(
+        "generate: prompt",
+      )));
     }
     // AUDIO-12 #136: eager scalar-bound validation of every sampler /
     // logits-processor knob in `cfg` BEFORE any prompt prefill / model
@@ -2581,9 +2598,10 @@ impl<M: Model + ?Sized> BatchGenerator<'_, M> {
     //    logprobs stay lazy.
     let tokens: Vec<u32> = sampled.to_vec::<u32>()?;
     if tokens.len() != b {
-      return Err(Error::ShapeMismatch(format!(
-        "batch_generate: sampler returned {} tokens, expected {b} (one per row)",
-        tokens.len()
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "batch_generate: sampler tokens vs batch rows (one token per row)",
+        b,
+        tokens.len(),
       )));
     }
 
@@ -2784,22 +2802,22 @@ impl<M: Model + ?Sized> Iterator for BatchGenerator<'_, M> {
 /// `mx.array([[pad]*(max_len-len(p)) + p for p in prompts])`).
 fn left_pad_rows(prompts: &[&[u32]], pad_token_id: u32) -> Result<(Vec<Vec<u32>>, usize)> {
   if prompts.is_empty() {
-    return Err(Error::ShapeMismatch(
-      "batch_generate: prompts must be non-empty".into(),
-    ));
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "batch_generate: prompts",
+    )));
   }
   let max_len = prompts.iter().map(|p| p.len()).max().unwrap_or(0);
   if max_len == 0 {
-    return Err(Error::ShapeMismatch(
-      "batch_generate: every prompt must be non-empty".into(),
-    ));
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "batch_generate: every prompt (max_len == 0)",
+    )));
   }
   let mut padded: Vec<Vec<u32>> = try_with_capacity(prompts.len())?;
   for p in prompts {
     if p.is_empty() {
-      return Err(Error::ShapeMismatch(
-        "batch_generate: every prompt must be non-empty".into(),
-      ));
+      return Err(Error::EmptyInput(EmptyInputPayload::new(
+        "batch_generate: every prompt",
+      )));
     }
     let mut row: Vec<u32> = try_with_capacity(max_len)?;
     for _ in 0..(max_len - p.len()) {
@@ -3063,9 +3081,10 @@ pub fn batch_generate<M: Model + ?Sized>(
       // Defensive: a sampler / model returning an out-of-range row index
       // would corrupt results; surface as a recoverable Err rather than a
       // panic.
-      // TODO(§5): promote to IndexOutOfRange { context: "batch_generate: step row", index: usize, len: usize } variant — both index and length are machine-inspectable.
-      return Err(Error::Backend(format!(
-        "batch_generate: step row {row} out of range for {b} prompts"
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "batch_generate: step row (out of range for {b} prompts)",
+        "must be in [0, batch_size)",
+        format!("row={row}, batch_size={b}"),
       )));
     }
     match &step.finish_reason {
@@ -3136,8 +3155,10 @@ mod batch_tests {
       let (batch, seq) = match shape.as_slice() {
         [b, s] => (*b, *s),
         other => {
-          return Err(Error::ShapeMismatch(format!(
-            "MockBatchModel::forward expects [B, S] tokens, got {other:?}"
+          return Err(Error::RankMismatch(RankMismatchPayload::new(
+            "MockBatchModel::forward expects [B, S] (rank 2) tokens",
+            other.len() as u32,
+            other.to_vec(),
           )));
         }
       };
@@ -3486,6 +3507,7 @@ mod batch_tests {
       _cache: &mut [Box<dyn crate::lm::cache::KvCache>],
     ) -> Result<Array> {
       *self.calls.borrow_mut() += 1;
+      // migrate-F: kept as Backend — test fixture (no business meaning)
       Err(Error::Backend("mock batch forward failure".into()))
     }
   }
@@ -3539,6 +3561,37 @@ mod batch_tests {
 }
 
 #[cfg(test)]
+mod validate_tests {
+  //! Codex R4 #2 — pin the typed-variant contract of `GenConfig::validate`:
+  //! every scalar-bound rejection must surface as `Err(Error::OutOfRange)`
+  //! with a typed payload so callers route by variant rather than parsing
+  //! a Backend message.
+
+  use super::*;
+
+  #[test]
+  fn validate_returns_typed_out_of_range_for_negative_temp() {
+    let cfg = GenConfig::default().with_temp(-1.0);
+    let err = cfg.validate().expect_err("negative temp must be rejected");
+    match err {
+      Error::OutOfRange(p) => {
+        assert!(
+          p.context().contains("temp"),
+          "context must name the field; got: {:?}",
+          p.context()
+        );
+        assert!(
+          p.value().contains("-1"),
+          "value must contain the runtime float; got: {:?}",
+          p.value()
+        );
+      }
+      other => panic!("expected Error::OutOfRange (typed scalar-bound class), got: {other:?}"),
+    }
+  }
+}
+
+#[cfg(test)]
 mod stop_sequence_tests {
   //! L5 — multi-token / string stop sequences driven through the real
   //! [`stream_generate`] / [`generate`] entry points with a deterministic,
@@ -3580,8 +3633,10 @@ mod stop_sequence_tests {
         [b, s] => (*b, *s),
         [s] => (1usize, *s),
         other => {
-          return Err(Error::ShapeMismatch(format!(
-            "ScriptModel::forward expects [B, S] tokens, got {other:?}"
+          return Err(Error::RankMismatch(RankMismatchPayload::new(
+            "ScriptModel::forward expects [B, S] (rank 2) or [S] (rank 1) tokens",
+            other.len() as u32,
+            other.to_vec(),
           )));
         }
       };
