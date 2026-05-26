@@ -63,6 +63,16 @@ needless_pass_by_value = "deny"
 large_types_passed_by_value = "deny"
 unnecessary_wraps = "deny"
 map_clone = "deny"
+# The crate `Error` enum is intentionally larger than clippy's 128-byte
+# `result_large_err` threshold (currently ~144B at `ArithmeticOverflow`).
+# The lint targets hot-path `Result<T, Err>` where the Err size bloats
+# every Result; ours is the opposite shape — Err path is by-definition
+# rare, and the typed-payload fidelity (every runtime operand carried
+# inline as a discrete field, no `format!`-built strings) is the §5
+# design contract this crate is built around. See the doc on `error::Error`
+# for the discipline this Error type enforces; allowed workspace-wide
+# so the lint stays quiet across the lib + every integration test bin.
+result_large_err = "allow"
 
 [profile.bench]
 opt-level = 3
