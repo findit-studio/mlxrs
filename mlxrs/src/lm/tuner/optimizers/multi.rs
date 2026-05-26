@@ -18,6 +18,7 @@
 //! gradients` walk that pushes the entry into the first matching
 //! sub-optimizer's gradient slice.
 
+use crate::error::EmptyInputPayload;
 use std::collections::HashMap;
 
 use crate::{
@@ -46,18 +47,16 @@ impl MultiOptimizer {
   /// `optimizers.len() - 1` (the last optimizer is the fallback).
   pub fn new(optimizers: Vec<Box<dyn Optimizer>>, filters: Vec<FilterFn>) -> Result<Self> {
     if optimizers.is_empty() {
-      return Err(Error::Backend {
-        message: "MultiOptimizer: at least one optimizer is required".into(),
-      });
+      return Err(Error::EmptyInput(EmptyInputPayload::new(
+        "MultiOptimizer: optimizers",
+      )));
     }
     if filters.len() != optimizers.len() - 1 {
-      return Err(Error::Backend {
-        message: format!(
-          "MultiOptimizer: expected {} filters (optimizers - 1), got {}",
-          optimizers.len() - 1,
-          filters.len(),
-        ),
-      });
+      return Err(Error::Backend(format!(
+        "MultiOptimizer: expected {} filters (optimizers - 1), got {}",
+        optimizers.len() - 1,
+        filters.len(),
+      )));
     }
     let current_lr = optimizers[0].learning_rate();
     Ok(Self {

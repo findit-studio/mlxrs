@@ -9,7 +9,7 @@
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{Error, Result, try_with_capacity},
+  error::{Error, RankMismatchPayload, Result, try_with_capacity},
   ops::{
     arithmetic::{divide, maximum, multiply, subtract},
     comparison::equal,
@@ -51,30 +51,24 @@ fn validate_token_embeddings_and_mask(
   let emb_shape = token_embeddings.shape();
   let mask_shape = attention_mask.shape();
   if emb_shape.len() != 3 {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "token_embeddings must be rank-3 (batch, seq_len, hidden), got rank {} shape {:?}",
-        emb_shape.len(),
-        emb_shape
-      ),
-    });
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "token_embeddings must be rank-3 (batch, seq_len, hidden)",
+      emb_shape.len() as u32,
+      emb_shape,
+    )));
   }
   if mask_shape.len() != 2 {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "attention_mask must be rank-2 (batch, seq_len), got rank {} shape {:?}",
-        mask_shape.len(),
-        mask_shape
-      ),
-    });
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "attention_mask must be rank-2 (batch, seq_len)",
+      mask_shape.len() as u32,
+      mask_shape,
+    )));
   }
   if emb_shape[0] != mask_shape[0] || emb_shape[1] != mask_shape[1] {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "token_embeddings (batch, seq_len) = ({}, {}) must match attention_mask ({}, {})",
-        emb_shape[0], emb_shape[1], mask_shape[0], mask_shape[1]
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "token_embeddings (batch, seq_len) = ({}, {}) must match attention_mask ({}, {})",
+      emb_shape[0], emb_shape[1], mask_shape[0], mask_shape[1]
+    )));
   }
   Ok(())
 }
@@ -85,13 +79,11 @@ fn validate_token_embeddings_and_mask(
 fn validate_token_embeddings_rank3(token_embeddings: &Array) -> Result<()> {
   let emb_shape = token_embeddings.shape();
   if emb_shape.len() != 3 {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "token_embeddings must be rank-3 (batch, seq_len, hidden), got rank {} shape {:?}",
-        emb_shape.len(),
-        emb_shape
-      ),
-    });
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "token_embeddings must be rank-3 (batch, seq_len, hidden)",
+      emb_shape.len() as u32,
+      emb_shape,
+    )));
   }
   Ok(())
 }
@@ -352,14 +344,12 @@ impl PoolingStrategy {
       "lasttoken" | "last" => Ok(Self::Last),
       "first" => Ok(Self::First),
       "none" => Ok(Self::None),
-      "weightedmean" | "mean_sqrt_len_tokens" => Err(Error::Backend {
-        message: format!(
-          "pooling mode {mode:?} is not supported (supported: cls, lasttoken, max, mean)"
-        ),
-      }),
-      other => Err(Error::Backend {
-        message: format!("unknown pooling mode {other:?} (supported: cls, lasttoken, max, mean)"),
-      }),
+      "weightedmean" | "mean_sqrt_len_tokens" => Err(Error::Backend(format!(
+        "pooling mode {mode:?} is not supported (supported: cls, lasttoken, max, mean)"
+      ))),
+      other => Err(Error::Backend(format!(
+        "unknown pooling mode {other:?} (supported: cls, lasttoken, max, mean)"
+      ))),
     }
   }
 }

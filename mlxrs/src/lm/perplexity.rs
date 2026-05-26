@@ -45,7 +45,7 @@
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{Error, Result, try_with_capacity},
+  error::{Error, LengthMismatchPayload, Result, try_with_capacity},
   lm::{
     cache::{CacheConfig, make_prompt_cache},
     model::Model,
@@ -105,20 +105,16 @@ pub struct PerplexityResult {
 /// short to fill a single window.
 pub fn make_windows(tokens: &[i32], sequence_length: usize) -> Result<Array> {
   if sequence_length < MIN_WINDOW {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "perplexity::make_windows: sequence_length {sequence_length} < MIN_WINDOW {MIN_WINDOW}"
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "perplexity::make_windows: sequence_length {sequence_length} < MIN_WINDOW {MIN_WINDOW}"
+    )));
   }
   let num_rows = tokens.len() / sequence_length;
   if num_rows == 0 {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "perplexity::make_windows: {} tokens cannot fill one window of length {sequence_length}",
-        tokens.len()
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "perplexity::make_windows: {} tokens cannot fill one window of length {sequence_length}",
+      tokens.len()
+    )));
   }
   // `data[: (len // L) * L]` — drop the ragged tail, then `reshape(-1, L)`.
   let kept = num_rows * sequence_length;
@@ -152,21 +148,18 @@ pub fn make_windows(tokens: &[i32], sequence_length: usize) -> Result<Array> {
 pub fn cross_entropy_none(logits: &Array, targets: &Array) -> Result<Array> {
   let logits_ndim = logits.ndim();
   if logits_ndim == 0 {
-    return Err(Error::ShapeMismatch {
-      message: "perplexity::cross_entropy_none: logits must have a vocab axis (ndim >= 1)".into(),
-    });
+    return Err(Error::ShapeMismatch(
+      "perplexity::cross_entropy_none: logits must have a vocab axis (ndim >= 1)".into(),
+    ));
   }
   // Class indices: `targets.ndim == logits.ndim - 1` (mlx-lm checks
   // `targets.shape == logits.shape with axis removed`).
   if targets.ndim() != logits_ndim - 1 {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "perplexity::cross_entropy_none: targets ndim {} != logits ndim {} - 1 \
-         (class-index targets only)",
-        targets.ndim(),
-        logits_ndim,
-      ),
-    });
+    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+      "perplexity::cross_entropy_none: targets ndim (must equal logits ndim - 1 for class-index targets)",
+      logits_ndim - 1,
+      targets.ndim(),
+    )));
   }
   let axis = (logits_ndim - 1) as i32;
   // mlx's `cross_entropy` rejects targets whose shape isn't *exactly* the logits
@@ -181,12 +174,10 @@ pub fn cross_entropy_none(logits: &Array, targets: &Array) -> Result<Array> {
   let expected = &logits_shape[..logits_ndim - 1];
   let targets_shape = targets.shape();
   if targets_shape.as_slice() != expected {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "perplexity::cross_entropy_none: targets shape {targets_shape:?} does not match logits \
+    return Err(Error::ShapeMismatch(format!(
+      "perplexity::cross_entropy_none: targets shape {targets_shape:?} does not match logits \
          shape {logits_shape:?} with the class axis removed (expected {expected:?})"
-      ),
-    });
+    )));
   }
   // `mx.take_along_axis(logits, mx.expand_dims(targets, axis), axis).squeeze(axis)`.
   let idx = targets.expand_dims_axes(&[axis])?;
@@ -235,18 +226,16 @@ pub fn perplexity<M: Model>(
   let (num_rows, seq_len) = match shape.as_slice() {
     [n, l] => (*n, *l),
     other => {
-      return Err(Error::ShapeMismatch {
-        message: format!("perplexity: data must be a rank-2 [N, L] token matrix, got {other:?}"),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "perplexity: data must be a rank-2 [N, L] token matrix, got {other:?}"
+      )));
     }
   };
   if seq_len < MIN_WINDOW {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "perplexity: window length {seq_len} < MIN_WINDOW {MIN_WINDOW} \
+    return Err(Error::ShapeMismatch(format!(
+      "perplexity: window length {seq_len} < MIN_WINDOW {MIN_WINDOW} \
          (a window must hold one input + one target)"
-      ),
-    });
+    )));
   }
   // mlx-lm clamps nothing but a 0 batch size would loop forever; treat it as 1.
   let batch_size = batch_size.max(1);
@@ -546,7 +535,7 @@ mod tests {
     assert!(
       matches!(
         cross_entropy_none(&logits, &bad_bs),
-        Err(Error::ShapeMismatch { .. })
+        Err(Error::ShapeMismatch(_))
       ),
       "targets [B, 1] should be rejected, not broadcast across S"
     );
@@ -556,7 +545,7 @@ mod tests {
     assert!(
       matches!(
         cross_entropy_none(&logits, &bad_1s),
-        Err(Error::ShapeMismatch { .. })
+        Err(Error::ShapeMismatch(_))
       ),
       "targets [1, S] should be rejected, not broadcast across B"
     );
@@ -622,9 +611,9 @@ mod tests {
         let (batch, seq) = match tokens.shape().as_slice() {
           [b, s] => (*b, *s),
           other => {
-            return Err(Error::ShapeMismatch {
-              message: format!("F16Model expects [B, S], got {other:?}"),
-            });
+            return Err(Error::ShapeMismatch(format!(
+              "F16Model expects [B, S], got {other:?}"
+            )));
           }
         };
         let vocab = self.canned.len();

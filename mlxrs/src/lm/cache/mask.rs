@@ -57,11 +57,9 @@ pub(crate) fn scalar_i32(value: i32) -> Result<Array> {
 /// instead of a wrong mask.
 pub(crate) fn iarange(start: usize, stop: usize) -> Result<Array> {
   if stop > F32_EXACT_INT_MAX {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "iarange: stop {stop} exceeds the exact f32 integer limit (2^24); the exclusive stop is cast to f32 for the f32-only Array::arange, so stop>2^24 would round and silently truncate the range — cache context too long for this path"
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "iarange: stop {stop} exceeds the exact f32 integer limit (2^24); the exclusive stop is cast to f32 for the f32-only Array::arange, so stop>2^24 would round and silently truncate the range — cache context too long for this path"
+    )));
   }
   ops::misc::astype(&Array::arange(start as f32, stop as f32, 1.0)?, Dtype::I32)
 }
@@ -121,8 +119,10 @@ pub(crate) fn roll_1d(a: &Array, shift: usize) -> Result<Array> {
 /// this both mirrors mlx-lm and removes the lossy-cast hazard of a
 /// `window_size > i32::MAX` wrapping.
 pub fn create_causal_mask(n: usize, offset: usize, window_size: Option<usize>) -> Result<Array> {
-  let total = offset.checked_add(n).ok_or_else(|| Error::ShapeMismatch {
-    message: format!("create_causal_mask: offset ({offset}) + N ({n}) overflows usize"),
+  let total = offset.checked_add(n).ok_or_else(|| {
+    Error::ShapeMismatch(format!(
+      "create_causal_mask: offset ({offset}) + N ({n}) overflows usize"
+    ))
   })?;
   let rinds = iarange(0, total)?;
   let linds = if offset != 0 {

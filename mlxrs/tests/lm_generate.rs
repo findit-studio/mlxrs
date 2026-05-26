@@ -90,9 +90,9 @@ impl Model for MockModel {
       [b, s] => (*b, *s),
       [s] => (1, *s),
       _ => {
-        return Err(mlxrs::Error::ShapeMismatch {
-          message: format!("MockModel::forward expects [B, S] tokens, got {shape:?}"),
-        });
+        return Err(mlxrs::Error::ShapeMismatch(format!(
+          "MockModel::forward expects [B, S] tokens, got {shape:?}"
+        )));
       }
     };
     let vocab = self.bias.len();
@@ -122,9 +122,7 @@ impl Model for MockModel {
 struct FailModel;
 impl Model for FailModel {
   fn forward(&self, _tokens: &Array, _cache: &mut [Box<dyn KvCache>]) -> mlxrs::Result<Array> {
-    Err(mlxrs::Error::Backend {
-      message: "mock forward failure".into(),
-    })
+    Err(mlxrs::Error::Backend("mock forward failure".into()))
   }
 }
 
@@ -154,9 +152,9 @@ impl Model for RecordingModel {
       [b, s] => (*b, *s),
       [s] => (1, *s),
       _ => {
-        return Err(mlxrs::Error::ShapeMismatch {
-          message: format!("RecordingModel::forward expects [B, S] tokens, got {shape:?}"),
-        });
+        return Err(mlxrs::Error::ShapeMismatch(format!(
+          "RecordingModel::forward expects [B, S] tokens, got {shape:?}"
+        )));
       }
     };
     self.seq_lens.borrow_mut().push(seq);
@@ -378,7 +376,7 @@ fn generate_step_zero_length_logits_axis_is_recoverable_err() {
     let mut it = generate_step(&model, &[1u32, 2], cache(1), cfg);
     let first = it.next().expect("an item is produced (no panic/underflow)");
     match first {
-      Err(mlxrs::Error::ShapeMismatch { .. }) => {}
+      Err(mlxrs::Error::ShapeMismatch(_)) => {}
       other => panic!(
         "expected a recoverable Err(ShapeMismatch) for a zero-length {} axis, got {other:?}",
         if zero_seq { "S" } else { "V" }

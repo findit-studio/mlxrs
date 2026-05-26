@@ -92,9 +92,9 @@ where
     let raw = (self.convert)(grapheme, &self.language)?;
     let ipa = raw.trim();
     if ipa.is_empty() {
-      return Err(Error::Backend {
-        message: format!("neural G2P returned empty output for token {grapheme:?}"),
-      });
+      return Err(Error::Backend(format!(
+        "neural G2P returned empty output for token {grapheme:?}"
+      )));
     }
     // Match swift: filter out whitespace, map each remaining char into
     // its own PhonemeUnit. Multi-codepoint IPA glyphs (e.g. tʃ, oʊ) end
@@ -143,11 +143,8 @@ mod tests {
 
   #[test]
   fn backend_error_propagates() {
-    let backend = |_w: &str, _l: &str| -> Result<String> {
-      Err(Error::Backend {
-        message: "model failure".into(),
-      })
-    };
+    let backend =
+      |_w: &str, _l: &str| -> Result<String> { Err(Error::Backend("model failure".into())) };
     let p = NeuralPhonemizer::new(backend, "eng-us");
     let err = p.phonemize("test").unwrap_err();
     assert!(err.to_string().contains("model failure"));

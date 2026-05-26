@@ -137,7 +137,7 @@ fn item_dtype_mismatch_returns_err() {
   let mut a = Array::from_slice(&[1_i64, 2, 3], &(3,)).unwrap();
   let r = a.item::<i32>();
   assert!(
-    matches!(r, Err(mlxrs::Error::DtypeMismatch { .. })),
+    matches!(r, Err(mlxrs::Error::DtypeMismatch(_))),
     "expected DtypeMismatch when reading i64 array as i32, got {r:?}",
   );
 }

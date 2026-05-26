@@ -35,23 +35,19 @@ fn validate_cosine_similarity_vectors(a: &Array, b: &Array) -> Result<()> {
   let a_shape = a.shape();
   let b_shape = b.shape();
   if a_shape.len() != 1 || b_shape.len() != 1 {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "cosine_similarity expects rank-1 vectors, got a rank {} shape {:?}, b rank {} shape {:?}",
-        a_shape.len(),
-        a_shape,
-        b_shape.len(),
-        b_shape
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "cosine_similarity expects rank-1 vectors, got a rank {} shape {:?}, b rank {} shape {:?}",
+      a_shape.len(),
+      a_shape,
+      b_shape.len(),
+      b_shape
+    )));
   }
   if a_shape[0] != b_shape[0] {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "cosine_similarity expects equal-length vectors, got a length {} != b length {}",
-        a_shape[0], b_shape[0]
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "cosine_similarity expects equal-length vectors, got a length {} != b length {}",
+      a_shape[0], b_shape[0]
+    )));
   }
   Ok(())
 }

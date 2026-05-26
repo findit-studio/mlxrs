@@ -16,6 +16,8 @@
 //! no-model-arch rule); the trait is the contract those impls — and the
 //! deterministic `MockEmbeddingModel` test fixture below — satisfy.
 
+#[cfg(test)]
+use crate::error::RankMismatchPayload;
 use crate::{array::Array, error::Result};
 
 /// The output of an [`EmbeddingModel`] forward pass.
@@ -200,20 +202,18 @@ impl EmbeddingModel for MockEmbeddingModel {
     let (batch, seq) = match shape.as_slice() {
       [b, s] => (*b, *s),
       _ => {
-        return Err(crate::error::Error::ShapeMismatch {
-          message: format!(
-            "MockEmbeddingModel::forward expects (batch, seq_len) ids, got {shape:?}"
-          ),
-        });
+        return Err(crate::error::Error::RankMismatch(RankMismatchPayload::new(
+          "MockEmbeddingModel::forward expects rank-2 (batch, seq_len) ids",
+          shape.len() as u32,
+          shape.clone(),
+        )));
       }
     };
     if seq > self.canned.len() {
-      return Err(crate::error::Error::ShapeMismatch {
-        message: format!(
-          "MockEmbeddingModel: seq_len {seq} exceeds canned positions {}",
-          self.canned.len()
-        ),
-      });
+      return Err(crate::error::Error::ShapeMismatch(format!(
+        "MockEmbeddingModel: seq_len {seq} exceeds canned positions {}",
+        self.canned.len()
+      )));
     }
     let hidden = self.canned.first().map_or(0, Vec::len);
     let mut data = Vec::with_capacity(batch * seq * hidden);
@@ -231,9 +231,9 @@ impl EmbeddingModel for MockEmbeddingModel {
       None => None,
       Some(pooled) => {
         if pooled.is_empty() {
-          return Err(crate::error::Error::ShapeMismatch {
-            message: "MockEmbeddingModel: pooled_output rows must be non-empty".to_string(),
-          });
+          return Err(crate::error::Error::ShapeMismatch(
+            "MockEmbeddingModel: pooled_output rows must be non-empty".to_string(),
+          ));
         }
         let pooled_hidden = pooled[0].len();
         let mut pdata = Vec::with_capacity(batch * pooled_hidden);

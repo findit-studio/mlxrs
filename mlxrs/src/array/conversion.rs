@@ -5,7 +5,7 @@ use std::ffi::CStr;
 use crate::{
   array::Array,
   dtype::{Dtype, Element},
-  error::{Error, Result},
+  error::{DtypeMismatchPayload, Error, Result},
 };
 
 impl Array {
@@ -61,10 +61,10 @@ impl Array {
   {
     let actual = self.dtype()?;
     if actual != T::DTYPE {
-      return Err(Error::DtypeMismatch {
-        expected: T::DTYPE,
-        got: actual,
-      });
+      return Err(Error::DtypeMismatch(DtypeMismatchPayload::new(
+        T::DTYPE,
+        actual,
+      )));
     }
     self.eval()?;
     // SAFETY: `self.0` was evaluated (`self.eval()` above) and its dtype verified
@@ -90,10 +90,10 @@ impl Array {
   {
     let actual = self.dtype()?;
     if actual != T::DTYPE {
-      return Err(Error::DtypeMismatch {
-        expected: T::DTYPE,
-        got: actual,
-      });
+      return Err(Error::DtypeMismatch(DtypeMismatchPayload::new(
+        T::DTYPE,
+        actual,
+      )));
     }
     self.eval()?;
     if !is_row_contiguous(self.0) {
@@ -127,10 +127,10 @@ impl Array {
   {
     let actual = self.dtype()?;
     if actual != T::DTYPE {
-      return Err(Error::DtypeMismatch {
-        expected: T::DTYPE,
-        got: actual,
-      });
+      return Err(Error::DtypeMismatch(DtypeMismatchPayload::new(
+        T::DTYPE,
+        actual,
+      )));
     }
     self.eval()?;
     if !is_row_contiguous(self.0) {
@@ -237,10 +237,10 @@ impl Array {
     crate::error::ensure_handler_installed();
     let actual = self.dtype()?;
     if actual != T::DTYPE {
-      return Err(Error::DtypeMismatch {
-        expected: T::DTYPE,
-        got: actual,
-      });
+      return Err(Error::DtypeMismatch(DtypeMismatchPayload::new(
+        T::DTYPE,
+        actual,
+      )));
     }
     // Cleared-thread poison guard, identical to `Array::eval` — mlx-c's
     // `item` reaches the backend and triggers eval internally (see the

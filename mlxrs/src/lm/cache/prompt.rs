@@ -766,12 +766,10 @@ impl<M: Eq + Hash + Clone> LruPromptCache<M> {
     // / `self._lrus[...]` index, before `self._trie.add`). A bucket is
     // valid iff it is one of `CacheOrder`'s fixed ordering keys.
     if !self.lru.ordering.iter().any(|k| k == cache_type) {
-      return Err(Error::Backend {
-        message: format!(
-          "LruPromptCache: unknown cache_type {cache_type:?}; expected one of {:?}",
-          self.lru.ordering
-        ),
-      });
+      return Err(Error::Backend(format!(
+        "LruPromptCache: unknown cache_type {cache_type:?}; expected one of {:?}",
+        self.lru.ordering
+      )));
     }
 
     // `entry = CacheEntry(prompt_cache, sum(c.nbytes for c in

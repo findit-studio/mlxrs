@@ -607,7 +607,7 @@ fn st_config_present_malformed_pooling_mode_rejected() {
   ] {
     let r = pooling_from_st_config_str(json);
     assert!(
-      matches!(r, Err(Error::Backend { .. })),
+      matches!(r, Err(Error::Backend(_))),
       "present malformed pooling_mode ({what}) must be Err(Backend), got {r:?}"
     );
     // Specifically must NOT silently resolve to a strategy (e.g. Mean).
@@ -623,7 +623,7 @@ fn st_config_present_malformed_pooling_mode_rejected() {
   // the malformed modern key).
   let r = pooling_from_st_config_str(r#"{"pooling_mode": null, "pooling_mode_mean_tokens": true}"#);
   assert!(
-    matches!(r, Err(Error::Backend { .. })),
+    matches!(r, Err(Error::Backend(_))),
     "malformed pooling_mode alongside legacy flags must still be Err, got {r:?}"
   );
 }
@@ -680,7 +680,7 @@ fn st_config_present_invalid_dimension_rejected() {
   ] {
     let r = pooling_from_st_config_str(json);
     assert!(
-      matches!(r, Err(Error::Backend { .. })),
+      matches!(r, Err(Error::Backend(_))),
       "present invalid dimension ({what}) must be Err(Backend), got {r:?}"
     );
   }
@@ -692,7 +692,7 @@ fn st_config_present_invalid_dimension_rejected() {
     r#"{"pooling_mode": "mean", "word_embedding_dimension": -1, "embedding_dimension": 384}"#,
   );
   assert!(
-    matches!(r, Err(Error::Backend { .. })),
+    matches!(r, Err(Error::Backend(_))),
     "invalid primary key must reject, not fall back to the alias, got {r:?}"
   );
 
@@ -917,7 +917,7 @@ fn st_config_path_rejects_oversize_file_without_oom() {
 
   let r = pooling_from_st_config_path(&dir);
   assert!(
-    matches!(r, Err(Error::Backend { .. })),
+    matches!(r, Err(Error::Backend(_))),
     "oversize config must yield recoverable Err(Backend), got {r:?}"
   );
 
@@ -955,7 +955,7 @@ fn st_config_path_rejects_non_regular_file_without_hang() {
 
   let r = pooling_from_st_config_path(&dir);
   assert!(
-    matches!(r, Err(Error::Backend { .. })),
+    matches!(r, Err(Error::Backend(_))),
     "non-regular (directory) config path must yield a recoverable \
      Err(Backend) without hang/panic, got {r:?}"
   );
@@ -1052,7 +1052,7 @@ fn st_config_path_fifo_returns_err_without_hang() {
   let (tx, rx) = mpsc::channel();
   let handle = std::thread::spawn(move || {
     let r = pooling_from_st_config_path(&probe_dir);
-    let _ = tx.send(matches!(r, Err(Error::Backend { .. })));
+    let _ = tx.send(matches!(r, Err(Error::Backend(_))));
   });
 
   match rx.recv_timeout(std::time::Duration::from_secs(30)) {
@@ -1160,31 +1160,31 @@ fn pooling_helpers_reject_non_rank3_token_embeddings_without_panic() {
   for emb in [&emb_1d, &emb_2d] {
     assert!(matches!(
       mean_pooling(emb, &mask),
-      Err(Error::ShapeMismatch { .. })
+      Err(Error::ShapeMismatch(_))
     ));
     assert!(matches!(
       max_pooling(emb, &mask),
-      Err(Error::ShapeMismatch { .. })
+      Err(Error::ShapeMismatch(_))
     ));
     assert!(matches!(
       cls_pooling(emb, &mask),
-      Err(Error::ShapeMismatch { .. })
+      Err(Error::ShapeMismatch(_))
     ));
     assert!(matches!(
       last_token_pooling(emb, &mask),
-      Err(Error::ShapeMismatch { .. })
+      Err(Error::ShapeMismatch(_))
     ));
     assert!(matches!(
       first_token_pooling(emb),
-      Err(Error::ShapeMismatch { .. })
+      Err(Error::ShapeMismatch(_))
     ));
     assert!(matches!(
       pool(emb, &mask, PoolingStrategy::Mean, false, None, false, false),
-      Err(Error::ShapeMismatch { .. })
+      Err(Error::ShapeMismatch(_))
     ));
     assert!(matches!(
       pool(emb, &mask, PoolingStrategy::Cls, false, None, false, false),
-      Err(Error::ShapeMismatch { .. })
+      Err(Error::ShapeMismatch(_))
     ));
   }
 }
@@ -1201,19 +1201,19 @@ fn pooling_helpers_reject_wrong_rank_mask_without_panic() {
   for mask in [&mask_1d, &mask_3d] {
     assert!(matches!(
       mean_pooling(&emb, mask),
-      Err(Error::ShapeMismatch { .. })
+      Err(Error::ShapeMismatch(_))
     ));
     assert!(matches!(
       max_pooling(&emb, mask),
-      Err(Error::ShapeMismatch { .. })
+      Err(Error::ShapeMismatch(_))
     ));
     assert!(matches!(
       cls_pooling(&emb, mask),
-      Err(Error::ShapeMismatch { .. })
+      Err(Error::ShapeMismatch(_))
     ));
     assert!(matches!(
       last_token_pooling(&emb, mask),
-      Err(Error::ShapeMismatch { .. })
+      Err(Error::ShapeMismatch(_))
     ));
   }
 }
@@ -1225,11 +1225,11 @@ fn pooling_helpers_reject_mismatched_batch_or_seq_dims() {
   let bad_mask = Array::from_slice(&[1.0_f32, 1.0, 1.0], &(1, 3)).unwrap();
   assert!(matches!(
     mean_pooling(&emb, &bad_mask),
-    Err(Error::ShapeMismatch { .. })
+    Err(Error::ShapeMismatch(_))
   ));
   assert!(matches!(
     cls_pooling(&emb, &bad_mask),
-    Err(Error::ShapeMismatch { .. })
+    Err(Error::ShapeMismatch(_))
   ));
 }
 
@@ -1767,7 +1767,7 @@ fn cosine_similarity_rejects_broadcastable_length_mismatch() {
   let b = Array::from_slice(&[1.0_f32], &(1,)).unwrap();
   let r = cosine_similarity(&a, &b);
   assert!(
-    matches!(r, Err(Error::ShapeMismatch { .. })),
+    matches!(r, Err(Error::ShapeMismatch(_))),
     "expected Err(ShapeMismatch), got {r:?}"
   );
   assert!(r.is_err(), "must not return a (possibly > 1) value: {r:?}");
@@ -1780,7 +1780,7 @@ fn cosine_similarity_rejects_unequal_lengths() {
   let b = Array::from_slice(&[1.0_f32, 2.0, 3.0], &(3,)).unwrap();
   assert!(matches!(
     cosine_similarity(&a, &b),
-    Err(Error::ShapeMismatch { .. })
+    Err(Error::ShapeMismatch(_))
   ));
 }
 
@@ -1792,18 +1792,18 @@ fn cosine_similarity_rejects_non_rank1() {
   // rank-2 a, rank-2 b.
   assert!(matches!(
     cosine_similarity(&m, &s),
-    Err(Error::ShapeMismatch { .. })
+    Err(Error::ShapeMismatch(_))
   ));
   // rank-1 a, rank-2 b (only one side wrong).
   let v = Array::from_slice(&[1.0_f32], &(1,)).unwrap();
   assert!(matches!(
     cosine_similarity(&v, &s),
-    Err(Error::ShapeMismatch { .. })
+    Err(Error::ShapeMismatch(_))
   ));
   // rank-2 a, rank-1 b (symmetric).
   assert!(matches!(
     cosine_similarity(&s, &v),
-    Err(Error::ShapeMismatch { .. })
+    Err(Error::ShapeMismatch(_))
   ));
 }
 

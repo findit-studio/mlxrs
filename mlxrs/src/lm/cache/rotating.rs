@@ -2,7 +2,7 @@
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{Error, InvariantViolationPayload, Result},
   lm::cache::{
     KvCache, MaskMode, mask,
     util::{KV_NDIM, concat_seq, head_dim, nbytes, seq_len, seq_slice},
@@ -166,17 +166,15 @@ impl RotatingKvCache {
     // `end` via `checked_add`, and reject `end > l` before any splice.
     // Faithful for valid inputs (the slice/concat path is unchanged).
     let l = seq_len(name, buf)?;
-    let end = a.checked_add(s).ok_or_else(|| Error::ShapeMismatch {
-      message: format!(
+    let end = a.checked_add(s).ok_or_else(|| {
+      Error::ShapeMismatch(format!(
         "RotatingKvCache::set_seq: {name} write start ({a}) + S ({s}) overflows usize"
-      ),
+      ))
     })?;
     if end > l {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "RotatingKvCache::set_seq: {name} write window [{a}, {end}) extends past buffer length {l}"
-        ),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "RotatingKvCache::set_seq: {name} write window [{a}, {end}) extends past buffer length {l}"
+      )));
     }
     let new = super::util::broadcast_write_rhs(name, buf, a, end, new)?;
     let head = seq_slice(buf, 0, a)?;
@@ -197,8 +195,10 @@ impl RotatingKvCache {
     // byte-identical to `self.offset + s` for every non-overflowing input,
     // so the ring algorithm outcome is unchanged.
     let off = self.offset;
-    let new_offset = off.checked_add(s).ok_or_else(|| Error::ShapeMismatch {
-      message: format!("RotatingKvCache update: offset ({off}) + S ({s}) overflows usize"),
+    let new_offset = off.checked_add(s).ok_or_else(|| {
+      Error::ShapeMismatch(format!(
+        "RotatingKvCache update: offset ({off}) + S ({s}) overflows usize"
+      ))
     })?;
     // `temporal_order` clones out so the `&self.keys` borrow ends before the
     // `self.idx` mutation mlx-lm does at `cache.py:458`.
@@ -289,8 +289,10 @@ impl RotatingKvCache {
     // overflow path performs NO partial mutation; the value is
     // byte-identical to `self.offset + 1` for every non-overflowing input,
     // so the ring algorithm outcome is unchanged.
-    let new_offset = prev.checked_add(1).ok_or_else(|| Error::ShapeMismatch {
-      message: format!("RotatingKvCache update: offset ({prev}) + S (1) overflows usize"),
+    let new_offset = prev.checked_add(1).ok_or_else(|| {
+      Error::ShapeMismatch(format!(
+        "RotatingKvCache update: offset ({prev}) + S (1) overflows usize"
+      ))
     })?;
 
     // ZERO-CLONE TRANSACTIONAL STAGING. The prior pattern `try_cloned`
@@ -513,9 +515,9 @@ impl KvCache for RotatingKvCache {
         self.values = Some(values);
         Ok(())
       }
-      n => Err(Error::Backend {
-        message: format!("RotatingKvCache state must have 0 or 2 arrays, got {n}"),
-      }),
+      n => Err(Error::Backend(format!(
+        "RotatingKvCache state must have 0 or 2 arrays, got {n}"
+      ))),
     }
   }
 
@@ -534,16 +536,17 @@ impl KvCache for RotatingKvCache {
   /// `self.keep, self.max_size, self.offset, self._idx = map(int, v)`.
   fn set_meta_state(&mut self, m: &[String]) -> Result<()> {
     if m.len() != 4 {
-      return Err(Error::Backend {
-        message: format!(
-          "RotatingKvCache meta_state must have 4 values, got {}",
-          m.len()
-        ),
-      });
+      return Err(Error::Backend(format!(
+        "RotatingKvCache meta_state must have 4 values, got {}",
+        m.len()
+      )));
     }
     let parse = |i: usize, name: &str| -> Result<usize> {
-      m[i].parse::<usize>().map_err(|e| Error::Backend {
-        message: format!("RotatingKvCache meta_state {name} ({:?}): {e}", m[i]),
+      m[i].parse::<usize>().map_err(|e| {
+        Error::Backend(format!(
+          "RotatingKvCache meta_state {name} ({:?}): {e}",
+          m[i]
+        ))
       })
     };
     // Parse ALL four into locals and validate before mutating ANY field, so
@@ -630,8 +633,10 @@ impl KvCache for RotatingKvCache {
       // (matching the round-2 `create_causal_mask` fix); the comparison
       // result is byte-identical to `offset + n` for every non-overflowing
       // input, so the decision outcome is unchanged.
-      let offset_plus_n = offset.checked_add(n).ok_or_else(|| Error::ShapeMismatch {
-        message: format!("RotatingKvCache::make_mask: offset ({offset}) + N ({n}) overflows usize"),
+      let offset_plus_n = offset.checked_add(n).ok_or_else(|| {
+        Error::ShapeMismatch(format!(
+          "RotatingKvCache::make_mask: offset ({offset}) + N ({n}) overflows usize"
+        ))
       })?;
       if offset_plus_n > ws || return_array {
         Ok(MaskMode::Array(mask::create_causal_mask(
@@ -772,9 +777,10 @@ impl KvCache for RotatingKvCache {
     // forged combination here so the new `from_serialized` public API
     // is observably identical to the canonical `from_state` loader.
     if staged.is_empty() && (staged.offset() != 0 || staged.idx() != 0) {
-      return Err(Error::Backend {
-        message: "RotatingKvCache: empty state with non-zero offset/idx is invalid".into(),
-      });
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "RotatingKvCache: empty state with non-zero offset/idx",
+        "is invalid (empty state must have offset=0 and idx=0)",
+      )));
     }
     *self = staged;
     Ok(())

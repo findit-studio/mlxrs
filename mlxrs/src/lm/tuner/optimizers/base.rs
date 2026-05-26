@@ -72,12 +72,10 @@ impl LearningRate {
   pub fn try_current(&self, step: usize) -> Result<f32> {
     let v = self.current(step);
     if !v.is_finite() {
-      return Err(crate::error::Error::Backend {
-        message: format!(
-          "LearningRate: resolved value at step {step} is not finite ({v}); reject \
-           non-finite learning rates so they cannot scale updates into NaN/Inf weights"
-        ),
-      });
+      return Err(crate::error::Error::Backend(format!(
+        "LearningRate: resolved value at step {step} is not finite ({v}); reject \
+         non-finite learning rates so they cannot scale updates into NaN/Inf weights"
+      )));
     }
     Ok(v)
   }

@@ -143,7 +143,7 @@ use std::{collections::HashMap, path::Path};
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{Error, FileIoPayload, FileOp, Result},
   // `KV_NDIM` is the canonical `[B, n_kv_heads, S, head_dim]` rank shared
   // by every KV cache (defined once in `super::util`); referenced — not
   // re-declared — so the hostile-file rank gate stays in lockstep with the
@@ -276,16 +276,15 @@ pub fn save_prompt_cache(
 /// file, so it is a recoverable [`Error::Backend`], never a silent huge
 /// allocation or a panic.
 fn dense_len(max_idx: usize, present: usize, what: &str) -> Result<usize> {
-  let n = max_idx.checked_add(1).ok_or_else(|| Error::Backend {
-    message: format!("prompt cache: {what} index overflows usize"),
-  })?;
+  let n = max_idx
+    .checked_add(1)
+    // TODO(§5): promote to typed variant — `what` is dynamic so ArithmeticOverflow { context, op_type: "usize" } needs a runtime String context; leave as Backend until a DynamicContext variant covers this pattern.
+    .ok_or_else(|| Error::Backend(format!("prompt cache: {what} index overflows usize")))?;
   if n != present {
-    return Err(Error::Backend {
-      message: format!(
-        "prompt cache: non-dense {what} indices (max index {max_idx}, {present} entries); \
+    return Err(Error::Backend(format!(
+      "prompt cache: non-dense {what} indices (max index {max_idx}, {present} entries); \
          corrupt or incompatible file"
-      ),
-    });
+    )));
   }
   Ok(n)
 }
@@ -545,29 +544,42 @@ pub fn load_prompt_cache(path: &Path) -> Result<(Vec<Box<dyn KvCache>>, HashMap<
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
-        .map_err(|e| Error::Backend {
-          message: format!("cannot open prompt cache {}: {e}", path.display()),
+        .map_err(|e| {
+          Error::FileIo(FileIoPayload::new(
+            "cannot open prompt cache",
+            FileOp::Open,
+            path.to_path_buf(),
+            e,
+          ))
         })?
     };
     #[cfg(not(unix))]
-    let file = std::fs::File::open(path).map_err(|e| Error::Backend {
-      message: format!("cannot open prompt cache {}: {e}", path.display()),
+    let file = std::fs::File::open(path).map_err(|e| {
+      Error::FileIo(FileIoPayload::new(
+        "cannot open prompt cache",
+        FileOp::Open,
+        path.to_path_buf(),
+        e,
+      ))
     })?;
 
     // fstat the *opened* fd (no stat-then-open TOCTOU). Reject a
     // non-regular target BEFORE handing the path to mlx-c: a FIFO / device
     // / directory / symlink-to-special has `len() == 0` yet would stream
     // unbounded data into the safetensors mmap (the `lm::load` discipline).
-    let meta = file.metadata().map_err(|e| Error::Backend {
-      message: format!("cannot stat opened prompt cache {}: {e}", path.display()),
+    let meta = file.metadata().map_err(|e| {
+      Error::FileIo(FileIoPayload::new(
+        "cannot stat opened prompt cache",
+        FileOp::Stat,
+        path.to_path_buf(),
+        e,
+      ))
     })?;
     if !meta.is_file() {
-      return Err(Error::Backend {
-        message: format!(
-          "prompt cache {} is not a regular file; refusing to read",
-          path.display()
-        ),
-      });
+      return Err(Error::Backend(format!(
+        "prompt cache {} is not a regular file; refusing to read",
+        path.display()
+      )));
     }
     // The fd is now proven a *regular file*, so the fstat `len()` is its
     // exact, O(1), authoritative size — reject an oversized file here,
@@ -577,14 +589,12 @@ pub fn load_prompt_cache(path: &Path) -> Result<(Vec<Box<dyn KvCache>>, HashMap<
     // bytes — mlx-c reads the file itself — so a streaming size probe would
     // be a wasteful, itself-DoS-prone 2x read of a multi-GB cache.)
     if meta.len() > MAX_PROMPT_CACHE_BYTES {
-      return Err(Error::Backend {
-        message: format!(
-          "prompt cache {} is {} bytes, exceeding the {}-byte cap; refusing to read",
-          path.display(),
-          meta.len(),
-          MAX_PROMPT_CACHE_BYTES
-        ),
-      });
+      return Err(Error::Backend(format!(
+        "prompt cache {} is {} bytes, exceeding the {}-byte cap; refusing to read",
+        path.display(),
+        meta.len(),
+        MAX_PROMPT_CACHE_BYTES
+      )));
     }
     // `file` is dropped here (fd closed); `crate::io` re-opens by path.
     // The window between this fstat and that re-open is the same one
@@ -613,12 +623,10 @@ pub fn load_prompt_cache(path: &Path) -> Result<(Vec<Box<dyn KvCache>>, HashMap<
   // recoverable error.
   let n = cache_classes.len();
   if let Some(&bad) = cache_data.keys().find(|&&i| i >= n) {
-    return Err(Error::Backend {
-      message: format!(
-        "prompt cache {}: array group index {bad} >= class count {n}; corrupt or incompatible file",
-        path.display()
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "prompt cache {}: array group index {bad} >= class count {n}; corrupt or incompatible file",
+      path.display()
+    )));
   }
 
   // `cache = [globals()[c].from_state(state, meta_state) for c, state,
@@ -671,13 +679,11 @@ pub fn load_prompt_cache(path: &Path) -> Result<(Vec<Box<dyn KvCache>>, HashMap<
       for (j, arr) in state.iter().enumerate() {
         let nd = arr.ndim();
         if nd != KV_NDIM {
-          return Err(Error::Backend {
-            message: format!(
-              "prompt cache {}: cache {i} (kind {kind:?}) state array {j} has rank {nd}, \
+          return Err(Error::Backend(format!(
+            "prompt cache {}: cache {i} (kind {kind:?}) state array {j} has rank {nd}, \
                expected {KV_NDIM} ([B, n_kv_heads, S, head_dim]); corrupt or incompatible file",
-              path.display()
-            ),
-          });
+            path.display()
+          )));
         }
       }
     }
@@ -760,24 +766,22 @@ pub fn load_prompt_cache(path: &Path) -> Result<(Vec<Box<dyn KvCache>>, HashMap<
       "StandardKvCache",
     ];
     if NO_META_KINDS.contains(&kind.as_str()) && !meta.is_empty() {
-      return Err(Error::Backend {
-        message: format!(
-          "prompt cache {}: cache {i} (kind {kind:?}) is a no-meta cache but carries a \
+      return Err(Error::Backend(format!(
+        "prompt cache {}: cache {i} (kind {kind:?}) is a no-meta cache but carries a \
            non-empty meta_state {meta:?}; mlx-lm rejects this (corrupt or schema-drifted file)",
-          path.display()
-        ),
-      });
+        path.display()
+      )));
     }
 
     // `from_state` validates the kind + meta_state arity and maps any
     // failure to a recoverable `Error::Backend` (it never panics on a
     // corrupt/foreign payload — unknown kind, wrong meta_state length,
     // inconsistent empty-state-with-offset, …).
-    let cache = from_state(&kind, state, meta).map_err(|e| Error::Backend {
-      message: format!(
+    let cache = from_state(&kind, state, meta).map_err(|e| {
+      Error::Backend(format!(
         "prompt cache {}: cannot reconstruct cache {i} (kind {kind:?}): {e}",
         path.display()
-      ),
+      ))
     })?;
     caches.push(cache);
   }

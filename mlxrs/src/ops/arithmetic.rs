@@ -20,7 +20,7 @@ use std::ffi::c_int;
 
 use crate::{
   array::Array,
-  error::{Error, Result, check},
+  error::{Error, LengthMismatchPayload, Result, check},
   stream::default_stream,
 };
 
@@ -800,9 +800,11 @@ pub fn divmod(a: &Array, b: &Array) -> Result<(Array, Array)> {
   // mutate or retain it and returns a plain length.
   let n = unsafe { mlxrs_sys::mlx_vector_array_size(vec_out) };
   if n != 2 {
-    return Err(Error::Backend {
-      message: format!("divmod: expected 2 outputs from mlx_divmod, got {n}"),
-    });
+    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+      "divmod: output count from mlx_divmod",
+      2,
+      n,
+    )));
   }
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an

@@ -22,7 +22,7 @@
 use crate::{
   Array,
   audio::dsp::{hann_window, mel_filter_bank},
-  error::{Error, Result},
+  error::{Error, InvariantViolationPayload, Result},
   ops::{
     arithmetic::{abs, add, divide, log10, maximum, multiply, square},
     fft::{FftNorm, rfft},
@@ -88,30 +88,28 @@ impl IncrementalMelSpectrogram {
   /// 0`, `n_mels > 0`) is delegated to [`mel_filter_bank`].
   pub fn new(sample_rate: u32, n_fft: usize, hop_length: usize, n_mels: usize) -> Result<Self> {
     if n_fft == 0 {
-      return Err(Error::Backend {
-        message: "IncrementalMelSpectrogram::new: n_fft must be > 0".into(),
-      });
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "IncrementalMelSpectrogram::new: n_fft",
+        "must be > 0",
+      )));
     }
     if !n_fft.is_multiple_of(2) {
-      return Err(Error::Backend {
-        message: format!(
-          "IncrementalMelSpectrogram::new: n_fft must be even (got {n_fft}); odd n_fft \
+      return Err(Error::Backend(format!(
+        "IncrementalMelSpectrogram::new: n_fft must be even (got {n_fft}); odd n_fft \
            is unsupported because the one-sided rfft is not invertible."
-        ),
-      });
+      )));
     }
     if hop_length == 0 {
-      return Err(Error::Backend {
-        message: "IncrementalMelSpectrogram::new: hop_length must be > 0".into(),
-      });
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "IncrementalMelSpectrogram::new: hop_length",
+        "must be > 0",
+      )));
     }
     if hop_length > n_fft {
-      return Err(Error::Backend {
-        message: format!(
-          "IncrementalMelSpectrogram::new: hop_length ({hop_length}) must be <= n_fft ({n_fft}) \
+      return Err(Error::Backend(format!(
+        "IncrementalMelSpectrogram::new: hop_length ({hop_length}) must be <= n_fft ({n_fft}) \
            — overlap-save framing requires `n_fft - hop_length >= 0`."
-        ),
-      });
+      )));
     }
     let window = hann_window(n_fft)?;
     let filters = mel_filter_bank(n_mels, n_fft, sample_rate, 0.0, None)?;
@@ -218,9 +216,9 @@ impl IncrementalMelSpectrogram {
     #[cfg(test)]
     if self.flush_err_inject_count > 0 {
       self.flush_err_inject_count -= 1;
-      return Err(Error::Backend {
-        message: "IncrementalMelSpectrogram::flush: scripted test injection".into(),
-      });
+      return Err(Error::Backend(
+        "IncrementalMelSpectrogram::flush: scripted test injection".into(),
+      ));
     }
 
     if self.overlap_buffer.is_empty() {
@@ -318,11 +316,10 @@ impl IncrementalMelSpectrogram {
   /// Compute the mel features for the given signal + frame count, then
   /// apply the running-log-max normalization in-place.
   fn compute_mel(&mut self, signal: &[f32], num_frames: usize) -> Result<Array> {
-    let n_fft_i32 = i32::try_from(self.n_fft).map_err(|_| Error::Backend {
-      message: "IncrementalMelSpectrogram: n_fft does not fit i32".into(),
-    })?;
-    let num_frames_i32 = i32::try_from(num_frames).map_err(|_| Error::Backend {
-      message: "IncrementalMelSpectrogram: num_frames does not fit i32".into(),
+    let n_fft_i32 = i32::try_from(self.n_fft)
+      .map_err(|_| Error::Backend("IncrementalMelSpectrogram: n_fft does not fit i32".into()))?;
+    let num_frames_i32 = i32::try_from(num_frames).map_err(|_| {
+      Error::Backend("IncrementalMelSpectrogram: num_frames does not fit i32".into())
     })?;
 
     let signal_array = Array::from_slice::<f32>(signal, &[signal.len() as i32])?;
@@ -382,29 +379,27 @@ mod tests {
   #[test]
   fn new_rejects_zero_n_fft() {
     let err = IncrementalMelSpectrogram::new(16_000, 0, 16, 8).unwrap_err();
-    assert!(matches!(err, Error::Backend { ref message } if message.contains("n_fft must be > 0")));
+    assert!(matches!(err, Error::InvariantViolation(ref p)
+        if p.context().contains("n_fft") && p.requirement().contains("must be > 0")));
   }
 
   #[test]
   fn new_rejects_odd_n_fft() {
     let err = IncrementalMelSpectrogram::new(16_000, 33, 16, 8).unwrap_err();
-    assert!(
-      matches!(err, Error::Backend { ref message } if message.contains("n_fft must be even"))
-    );
+    assert!(matches!(err, Error::Backend(ref message) if message.contains("n_fft must be even")));
   }
 
   #[test]
   fn new_rejects_zero_hop_length() {
     let err = IncrementalMelSpectrogram::new(16_000, 32, 0, 8).unwrap_err();
-    assert!(
-      matches!(err, Error::Backend { ref message } if message.contains("hop_length must be > 0"))
-    );
+    assert!(matches!(err, Error::InvariantViolation(ref p)
+        if p.context().contains("hop_length") && p.requirement().contains("must be > 0")));
   }
 
   #[test]
   fn new_rejects_hop_larger_than_n_fft() {
     let err = IncrementalMelSpectrogram::new(16_000, 32, 64, 8).unwrap_err();
-    assert!(matches!(err, Error::Backend { ref message } if message.contains("hop_length")));
+    assert!(matches!(err, Error::Backend(ref message) if message.contains("hop_length")));
   }
 
   #[test]

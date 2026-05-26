@@ -21,7 +21,10 @@
 //! capture set — enables runtime composition (e.g. building a vec of
 //! schedules from a config file).
 
-use crate::{Result, error::Error};
+use crate::{
+  Result,
+  error::{EmptyInputPayload, Error, InvariantViolationPayload},
+};
 
 /// Schedule closure shape: `Fn(step) -> learning_rate`.
 pub type Schedule = Box<dyn Fn(usize) -> f32>;
@@ -36,9 +39,10 @@ pub fn exponential_decay(init: f32, decay_rate: f32) -> Schedule {
 /// Mirrors Python `step_decay` (`schedulers.py:34..=58`).
 pub fn step_decay(init: f32, decay_rate: f32, step_size: usize) -> Result<Schedule> {
   if step_size == 0 {
-    return Err(Error::Backend {
-      message: "step_decay: step_size must be > 0".into(),
-    });
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "step_decay: step_size",
+      "must be > 0",
+    )));
   }
   Ok(Box::new(move |step| {
     init * decay_rate.powi((step / step_size) as i32)
@@ -55,9 +59,10 @@ pub fn step_decay(init: f32, decay_rate: f32, step_size: usize) -> Result<Schedu
 /// ```
 pub fn cosine_decay(init: f32, decay_steps: usize, end: f32) -> Result<Schedule> {
   if decay_steps == 0 {
-    return Err(Error::Backend {
-      message: "cosine_decay: decay_steps must be > 0".into(),
-    });
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "cosine_decay: decay_steps",
+      "must be > 0",
+    )));
   }
   let pi = std::f32::consts::PI;
   let decay_steps_f = decay_steps as f32;
@@ -72,9 +77,10 @@ pub fn cosine_decay(init: f32, decay_steps: usize, end: f32) -> Result<Schedule>
 /// beyond. Mirrors Python `linear_schedule` (`schedulers.py:131..=158`).
 pub fn linear_schedule(init: f32, end: f32, steps: usize) -> Result<Schedule> {
   if steps == 0 {
-    return Err(Error::Backend {
-      message: "linear_schedule: steps must be > 0".into(),
-    });
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "linear_schedule: steps",
+      "must be > 0",
+    )));
   }
   let steps_f = steps as f32;
   let slope = (end - init) / steps_f;
@@ -92,18 +98,16 @@ pub fn linear_schedule(init: f32, end: f32, steps: usize) -> Result<Schedule> {
 /// `b₁` the second schedule is consulted with `step - b₀`, etc.
 pub fn join_schedules(schedules: Vec<Schedule>, boundaries: Vec<usize>) -> Result<Schedule> {
   if schedules.is_empty() {
-    return Err(Error::Backend {
-      message: "join_schedules: must provide at least one schedule".into(),
-    });
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "join_schedules: schedules",
+    )));
   }
   if schedules.len() != boundaries.len() + 1 {
-    return Err(Error::Backend {
-      message: format!(
-        "join_schedules: expected {} boundaries (schedules - 1), got {}",
-        schedules.len() - 1,
-        boundaries.len(),
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "join_schedules: expected {} boundaries (schedules - 1), got {}",
+      schedules.len() - 1,
+      boundaries.len(),
+    )));
   }
   Ok(Box::new(move |step| {
     let mut output = schedules[0](step);

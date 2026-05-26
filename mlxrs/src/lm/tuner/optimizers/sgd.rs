@@ -116,9 +116,9 @@ impl SGD {
   /// NaN and propagate it into velocity/weights at the first `apply_gradients`.
   fn validate_nesterov(momentum: f32, dampening: f32, nesterov: bool) -> Result<()> {
     if nesterov && (!momentum.is_finite() || momentum <= 0.0 || dampening != 0.0) {
-      return Err(Error::Backend {
-        message: "SGD: Nesterov momentum requires momentum > 0 (finite) and dampening == 0".into(),
-      });
+      return Err(Error::Backend(
+        "SGD: Nesterov momentum requires momentum > 0 (finite) and dampening == 0".into(),
+      ));
     }
     Ok(())
   }
@@ -129,9 +129,9 @@ impl SGD {
   /// Called by both `new` and `with_momentum`.
   fn validate_momentum_finite(momentum: f32) -> Result<()> {
     if !momentum.is_finite() {
-      return Err(Error::Backend {
-        message: format!("SGD: momentum must be finite, got {momentum}"),
-      });
+      return Err(Error::Backend(format!(
+        "SGD: momentum must be finite, got {momentum}"
+      )));
     }
     Ok(())
   }
@@ -139,9 +139,9 @@ impl SGD {
   /// Validate `weight_decay` is finite and `>= 0.0`.
   fn validate_weight_decay(weight_decay: f32) -> Result<()> {
     if !weight_decay.is_finite() || weight_decay < 0.0 {
-      return Err(Error::Backend {
-        message: format!("SGD: weight_decay must be finite and >= 0.0, got {weight_decay}"),
-      });
+      return Err(Error::Backend(format!(
+        "SGD: weight_decay must be finite and >= 0.0, got {weight_decay}"
+      )));
     }
     Ok(())
   }
@@ -149,9 +149,9 @@ impl SGD {
   /// Validate `dampening` is finite and `>= 0.0`.
   fn validate_dampening(dampening: f32) -> Result<()> {
     if !dampening.is_finite() || dampening < 0.0 {
-      return Err(Error::Backend {
-        message: format!("SGD: dampening must be finite and >= 0.0, got {dampening}"),
-      });
+      return Err(Error::Backend(format!(
+        "SGD: dampening must be finite and >= 0.0, got {dampening}"
+      )));
     }
     Ok(())
   }
@@ -389,7 +389,7 @@ mod tests {
   #[test]
   fn sgd_nesterov_precondition_rejects_zero_momentum() {
     let res = SGD::new(0.1, 0.0, 0.0, 0.0, true);
-    assert!(matches!(res, Err(Error::Backend { .. })));
+    assert!(matches!(res, Err(Error::Backend(_))));
   }
 
   #[test]

@@ -387,9 +387,7 @@ impl std::error::Error for ChatSessionError {}
 
 impl From<ChatSessionError> for Error {
   fn from(e: ChatSessionError) -> Self {
-    Error::Backend {
-      message: e.to_string(),
-    }
+    Error::Backend(e.to_string())
   }
 }
 
@@ -714,9 +712,7 @@ impl ChatSession {
     let prompt_ids = self
       .tokenizer
       .apply_chat_template_ids(&json_messages, None, true, false, None)
-      .map_err(|e| Error::Backend {
-        message: format!("ChatSession: apply_chat_template failed: {e}"),
-      })?;
+      .map_err(|e| Error::Backend(format!("ChatSession: apply_chat_template failed: {e}")))?;
     Ok((prompt_ids, replayed))
   }
 
@@ -2468,9 +2464,9 @@ mod tests {
     ) -> Result<crate::array::Array> {
       let remaining = self.ok_calls.get();
       if remaining == 0 {
-        return Err(Error::Backend {
-          message: "ErringAfterModel: budget exhausted (test fixture)".into(),
-        });
+        return Err(Error::Backend(
+          "ErringAfterModel: budget exhausted (test fixture)".into(),
+        ));
       }
       self.ok_calls.set(remaining - 1);
       self.inner.forward(tokens, cache)

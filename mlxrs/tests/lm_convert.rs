@@ -311,7 +311,7 @@ fn convert_rejects_upload_repo() {
   })
   .unwrap_err();
   match err {
-    mlxrs::Error::Backend { message } => {
+    mlxrs::Error::Backend(message) => {
       assert!(
         message.contains("upload_repo"),
         "error names the rejected field: {message}"
@@ -338,7 +338,7 @@ fn convert_rejects_revision() {
   })
   .unwrap_err();
   match err {
-    mlxrs::Error::Backend { message } => {
+    mlxrs::Error::Backend(message) => {
       assert!(
         message.contains("revision"),
         "error names the rejected field: {message}"
@@ -368,7 +368,7 @@ fn convert_rejects_quantize_and_dequantize() {
   })
   .unwrap_err();
   match err {
-    mlxrs::Error::Backend { message } => {
+    mlxrs::Error::Backend(message) => {
       assert!(
         message.to_lowercase().contains("quantize")
           && message.to_lowercase().contains("dequantize"),
@@ -398,7 +398,7 @@ fn convert_rejects_existing_destination() {
   })
   .unwrap_err();
   match err {
-    mlxrs::Error::Backend { message } => {
+    mlxrs::Error::Backend(message) => {
       assert!(
         message.contains("already exists") || message.contains("Cannot save"),
         "error names the existing destination: {message}"
@@ -474,7 +474,7 @@ fn convert_rename_in_place_is_handled() {
   })
   .unwrap_err();
   match err {
-    mlxrs::Error::Backend { message } => {
+    mlxrs::Error::Backend(message) => {
       assert!(
         message.contains("already exists") || message.contains("Cannot save"),
         "error: {message}"
@@ -627,7 +627,7 @@ fn mixed_quant_predicate_no_down_proj_is_error() {
   // than `unwrap_err`.
   match mixed_quant_predicate(MixedQuantRecipe::Mixed3_6, &weights, 64) {
     Ok(_) => panic!("expected Err for empty weights"),
-    Err(mlxrs::Error::Backend { message }) => {
+    Err(mlxrs::Error::Backend(message)) => {
       assert!(
         message.to_lowercase().contains("down_proj") || message.to_lowercase().contains("expected"),
         "error mentions missing down_proj keys: {message}"
@@ -661,7 +661,7 @@ fn convert_rejects_explicit_dtype_i32() {
   })
   .unwrap_err();
   match err {
-    mlxrs::Error::Backend { message } => {
+    mlxrs::Error::Backend(message) => {
       assert!(
         message.contains("float16") && message.contains("bfloat16") && message.contains("float32"),
         "error names the supported set: {message}"
@@ -690,7 +690,7 @@ fn convert_rejects_explicit_dtype_f64() {
   })
   .unwrap_err();
   match err {
-    mlxrs::Error::Backend { message } => {
+    mlxrs::Error::Backend(message) => {
       assert!(
         message.contains("float16"),
         "error names supported set: {message}"
@@ -715,7 +715,7 @@ fn convert_rejects_explicit_dtype_complex() {
   })
   .unwrap_err();
   match err {
-    mlxrs::Error::Backend { message } => {
+    mlxrs::Error::Backend(message) => {
       assert!(
         message.contains("float16"),
         "error names supported set: {message}"

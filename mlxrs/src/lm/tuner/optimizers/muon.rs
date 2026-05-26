@@ -42,9 +42,9 @@ use crate::{
 /// into the velocity accumulator at the first `apply_gradients` call.
 fn validate_momentum_finite(momentum: f32) -> Result<()> {
   if !momentum.is_finite() {
-    return Err(Error::Backend {
-      message: format!("Muon: momentum must be finite, got {momentum}"),
-    });
+    return Err(Error::Backend(format!(
+      "Muon: momentum must be finite, got {momentum}"
+    )));
   }
   Ok(())
 }
@@ -52,9 +52,9 @@ fn validate_momentum_finite(momentum: f32) -> Result<()> {
 /// Validate that `weight_decay` is finite and `>= 0.0`.
 fn validate_weight_decay(weight_decay: f32) -> Result<()> {
   if !weight_decay.is_finite() || weight_decay < 0.0 {
-    return Err(Error::Backend {
-      message: format!("Muon: weight_decay must be finite and >= 0.0, got {weight_decay}"),
-    });
+    return Err(Error::Backend(format!(
+      "Muon: weight_decay must be finite and >= 0.0, got {weight_decay}"
+    )));
   }
   Ok(())
 }
@@ -190,9 +190,9 @@ impl Muon {
   fn newton_schulz5(&self, x: &Array, steps: usize) -> Result<Array> {
     let shape = x.shape();
     if shape.len() != 2 {
-      return Err(crate::error::Error::ShapeMismatch {
-        message: format!("Muon.newton_schulz5: expected 2D input, got shape {shape:?}"),
-      });
+      return Err(crate::error::Error::ShapeMismatch(format!(
+        "Muon.newton_schulz5: expected 2D input, got shape {shape:?}"
+      )));
     }
     let (a, b, c) = (3.4445_f32, -4.7750_f32, 2.0315_f32);
     let transpose_needed = shape[shape.len() - 2] > shape[shape.len() - 1];

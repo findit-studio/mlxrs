@@ -105,7 +105,7 @@ fn config_missing_required_is_backend_error() {
   }"#;
   let err = Config::from_json(json).unwrap_err();
   assert!(
-    matches!(err, mlxrs::Error::Backend { .. }),
+    matches!(err, mlxrs::Error::Backend(_)),
     "expected Error::Backend, got {err:?}"
   );
 }
@@ -113,7 +113,7 @@ fn config_missing_required_is_backend_error() {
 #[test]
 fn config_invalid_json_is_backend_error() {
   let err = Config::from_json("{ not json").unwrap_err();
-  assert!(matches!(err, mlxrs::Error::Backend { .. }));
+  assert!(matches!(err, mlxrs::Error::Backend(_)));
 }
 
 // ─────────── Task 2.2: Weights — sharded merge + quantized triples ───────────
@@ -190,7 +190,7 @@ fn weights_missing_is_backend_error() {
   let dir = temp_dir("empty");
   let err = load::load_weights(&dir).unwrap_err();
   assert!(
-    matches!(err, mlxrs::Error::Backend { .. }),
+    matches!(err, mlxrs::Error::Backend(_)),
     "expected Error::Backend for a dir with no weights, got {err:?}"
   );
 }
@@ -244,7 +244,7 @@ fn load_missing_config_is_backend_error() {
   // `Tokenizer` isn't `Debug`, so the `(Config, Weights, Tokenizer)` Ok
   // variant can't go through `unwrap_err()`; match the result directly.
   match load::load(&dir) {
-    Err(mlxrs::Error::Backend { .. }) => {}
+    Err(mlxrs::Error::Backend(_)) => {}
     Err(other) => panic!("expected Error::Backend when config.json absent, got {other:?}"),
     Ok(_) => panic!("expected Err when config.json absent, got Ok"),
   }

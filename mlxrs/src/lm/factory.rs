@@ -202,16 +202,13 @@ impl ModelTypeRegistry {
   /// `ValueError("Model type … not supported.")`).
   pub fn create(&self, loaded: &LoadedModel) -> Result<Box<dyn Model>> {
     let model_type = remap_model_type(loaded.config.model_type());
-    let constructor = self
-      .creators
-      .get(model_type)
-      .ok_or_else(|| Error::Backend {
-        message: format!(
-          "unsupported model type {:?}: no constructor registered (register one via \
+    let constructor = self.creators.get(model_type).ok_or_else(|| {
+      Error::Backend(format!(
+        "unsupported model type {:?}: no constructor registered (register one via \
          ModelTypeRegistry::register)",
-          loaded.config.model_type()
-        ),
-      })?;
+        loaded.config.model_type()
+      ))
+    })?;
     constructor(loaded)
   }
 }
@@ -386,13 +383,11 @@ pub fn load(
   // weight/tokenizer I/O (and never surfacing a weight error in place of the
   // recoverable unsupported-model one).
   if !registry.contains(config.model_type()) {
-    return Err(Error::Backend {
-      message: format!(
-        "unsupported model type {:?}: no constructor registered (register one via \
+    return Err(Error::Backend(format!(
+      "unsupported model type {:?}: no constructor registered (register one via \
          ModelTypeRegistry::register)",
-        config.model_type()
-      ),
-    });
+      config.model_type()
+    )));
   }
 
   // (3) Select the tokenizer directory FIRST: the separate `tokenizer_source`
@@ -682,6 +677,8 @@ mod tests {
     sync::atomic::{AtomicU64, Ordering},
   };
 
+  use crate::error::MissingFieldPayload;
+
   use super::*;
   use crate::{
     array::Array,
@@ -730,9 +727,9 @@ mod tests {
         [b, s] => (*b, *s),
         [s] => (1, *s),
         other => {
-          return Err(Error::ShapeMismatch {
-            message: format!("MockLoadedModel::forward expects [B, S], got {other:?}"),
-          });
+          return Err(Error::ShapeMismatch(format!(
+            "MockLoadedModel::forward expects [B, S], got {other:?}"
+          )));
         }
       };
       let vocab = self.vocab as usize;
@@ -752,16 +749,15 @@ mod tests {
       );
       // Model-specific key outside the typed Config subset, read from the
       // raw JSON (the analogue of mlx-swift-lm's per-model Codable init).
-      let raw: serde_json::Value =
-        serde_json::from_str(&loaded.config_json).map_err(|e| Error::Backend {
-          message: format!("mock ctor: bad config json: {e}"),
-        })?;
+      let raw: serde_json::Value = serde_json::from_str(&loaded.config_json)
+        .map_err(|e| Error::Backend(format!("mock ctor: bad config json: {e}")))?;
       let mock_extra = raw
         .get("mock_extra")
         .and_then(serde_json::Value::as_i64)
-        .ok_or_else(|| Error::Backend {
-          message: "mock ctor: missing mock_extra".into(),
-        })?;
+        .ok_or(Error::MissingField(MissingFieldPayload::new(
+          "mock ctor",
+          "mock_extra",
+        )))?;
       Ok(Box::new(MockLoadedModel {
         vocab: loaded.config.vocab_size,
         mock_extra,

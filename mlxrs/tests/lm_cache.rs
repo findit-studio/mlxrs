@@ -79,7 +79,7 @@ fn standard_wrong_rank_errors() {
 /// faithful-revert removed the non-faithful K/V seq cross-check, leaving
 /// `RotatingKvCache::update_in_place` (S==1) reading `values.shape()[3]`
 /// raw. A rank-invalid `values` (with valid 4-D `keys`) must surface as a
-/// recoverable `Err(Error::ShapeMismatch{..})` (the faithful equivalent of
+/// recoverable `Err(Error::ShapeMismatch(_))` (the faithful equivalent of
 /// mlx-lm `cache.py:478` `values.shape[3]` raising a catchable
 /// `IndexError`), NEVER a Rust slice out-of-bounds panic on the
 /// `Result`-returning public `update`.
@@ -92,7 +92,7 @@ fn rotating_update_in_place_rank_invalid_values_errors_no_panic() {
   let bad_values = Array::from_slice::<f32>(&[0.0, 1.0], &(1usize, 2)).unwrap();
   let r = c.update(&keys, &bad_values);
   assert!(
-    matches!(&r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    matches!(&r, Err(mlxrs::Error::ShapeMismatch(_))),
     "rank-invalid values on the S==1 path must be a recoverable \
      ShapeMismatch, got {r:?}"
   );
@@ -117,7 +117,7 @@ fn rotating_update_concat_rank_invalid_values_errors_no_panic() {
   let bad_values = Array::from_slice::<f32>(&[2.0, 3.0], &(1usize, 2)).unwrap();
   let r = c.update(&keys, &bad_values);
   assert!(
-    matches!(&r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    matches!(&r, Err(mlxrs::Error::ShapeMismatch(_))),
     "rank-invalid values on the empty-cache S>1 path must be a DETERMINISTIC \
      recoverable ShapeMismatch (per-tensor rank guard at update entry), got \
      {r:?}"
@@ -151,7 +151,7 @@ fn rotating_update_concat_single_part_fast_path_rank_invalid_no_corruption() {
   let bad_values = Array::from_slice::<f32>(&[1.0, 2.0], &(1usize, 2)).unwrap();
   let r = c.update(&keys, &bad_values);
   assert!(
-    matches!(&r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    matches!(&r, Err(mlxrs::Error::ShapeMismatch(_))),
     "rank-invalid lone-surviving values must be a DETERMINISTIC recoverable \
      ShapeMismatch (per-tensor rank guard at update entry rejects it before \
      dispatch), got {r:?}"
@@ -187,7 +187,7 @@ fn standard_rank_invalid_values_errors_no_panic() {
   let bad_values = Array::from_slice::<f32>(&[2.0, 3.0], &(1usize, 2)).unwrap();
   let r = c.update(&keys, &bad_values);
   assert!(
-    matches!(&r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    matches!(&r, Err(mlxrs::Error::ShapeMismatch(_))),
     "rank-invalid values must be a DETERMINISTIC recoverable ShapeMismatch \
      (per-tensor rank guard at update entry), got {r:?}"
   );
@@ -830,7 +830,7 @@ fn rotating_offset_overflow_is_rejected_without_partial_mutation() {
   let two = kv(&[1.0, 2.0]);
   let r_concat = c.update(&two, &two);
   assert!(
-    matches!(r_concat, Err(mlxrs::Error::ShapeMismatch { .. })),
+    matches!(r_concat, Err(mlxrs::Error::ShapeMismatch(_))),
     "concat-path offset overflow must be Err(ShapeMismatch), got {r_concat:?}"
   );
   // No partial mutation: all four meta fields + buffer presence unchanged.
@@ -845,7 +845,7 @@ fn rotating_offset_overflow_is_rejected_without_partial_mutation() {
   let one = kv(&[3.0]);
   let r_inplace = c.update(&one, &one);
   assert!(
-    matches!(r_inplace, Err(mlxrs::Error::ShapeMismatch { .. })),
+    matches!(r_inplace, Err(mlxrs::Error::ShapeMismatch(_))),
     "in-place-path offset overflow must be Err(ShapeMismatch), got {r_inplace:?}"
   );
   assert_eq!(
@@ -1042,7 +1042,7 @@ fn create_causal_mask_offset_plus_n_overflow_is_err_not_panic() {
   // base.py: `rinds = mx.arange(offset + N)` — the very first line.
   let r = create_causal_mask(2, usize::MAX, None);
   assert!(
-    matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    matches!(r, Err(mlxrs::Error::ShapeMismatch(_))),
     "offset + N overflow must be Err::ShapeMismatch (no debug panic, no release wrap)"
   );
 
@@ -1055,7 +1055,7 @@ fn create_causal_mask_offset_plus_n_overflow_is_err_not_panic() {
   // the windowed branch too (offset + N still the first computation).
   let rw = create_causal_mask(3, usize::MAX, Some(4));
   assert!(
-    matches!(rw, Err(mlxrs::Error::ShapeMismatch { .. })),
+    matches!(rw, Err(mlxrs::Error::ShapeMismatch(_))),
     "windowed create_causal_mask must also reject offset + N overflow before any range"
   );
 }
@@ -1185,7 +1185,7 @@ fn rotating_make_mask_n_gt_1_offset_plus_n_overflow_is_err_not_panic() {
   // the cache.py:560 decision to a wrong "causal"/array choice).
   let r = c.make_mask(2, None, false);
   assert!(
-    matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    matches!(r, Err(mlxrs::Error::ShapeMismatch(_))),
     "RotatingKvCache::make_mask N>1 offset+N overflow must be Err::ShapeMismatch \
      (no panic, no wrap-then-wrong-Causal-decision)"
   );
@@ -1196,7 +1196,7 @@ fn rotating_make_mask_n_gt_1_offset_plus_n_overflow_is_err_not_panic() {
   // return_array` short-circuit does not skip the overflowing sum).
   let r_arr = c.make_mask(2, None, true);
   assert!(
-    matches!(r_arr, Err(mlxrs::Error::ShapeMismatch { .. })),
+    matches!(r_arr, Err(mlxrs::Error::ShapeMismatch(_))),
     "RotatingKvCache::make_mask N>1 offset+N overflow must be Err even with return_array=true"
   );
 
@@ -1392,7 +1392,7 @@ fn from_state_no_meta_cache_rejects_truthy_meta_state() {
   ] {
     let bad = from_state(kind, fresh_state(), &["x".to_string()]);
     match bad {
-      Err(Error::Backend { message }) => {
+      Err(Error::Backend(message)) => {
         assert!(
           message.contains("no meta_state"),
           "kind {kind}: error message must explain the cause: got {message:?}"
@@ -1416,7 +1416,7 @@ fn from_state_no_meta_cache_rejects_truthy_meta_state() {
       &["x".to_string(), "y".to_string(), "z".to_string()],
     );
     assert!(
-      matches!(bad_multi, Err(Error::Backend { .. })),
+      matches!(bad_multi, Err(Error::Backend(_))),
       "kind {kind}: multi-value truthy meta_state must also be rejected"
     );
   }
@@ -1491,7 +1491,7 @@ fn rotating_set_seq_full_window_rejects_mismatched_batch_dim() {
   let bad_kv2 = Array::from_slice::<f32>(&[9.0, 9.5], &(2usize, 1, 1, 1)).unwrap();
   let r = c.update(&bad_kv2, &bad_kv2);
   assert!(
-    matches!(&r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    matches!(&r, Err(mlxrs::Error::ShapeMismatch(_))),
     "rotating full-window set_seq must reject batch-axis mismatch on the public \
      update API (closes #78 P1 iter5), got {r:?}"
   );
@@ -1529,7 +1529,7 @@ fn rotating_set_seq_full_window_rejects_mismatched_heads_and_head_dim() {
   .unwrap();
   let r1 = c1.update(&bad_kv_heads, &bad_kv_heads);
   assert!(
-    matches!(&r1, Err(mlxrs::Error::ShapeMismatch { .. })),
+    matches!(&r1, Err(mlxrs::Error::ShapeMismatch(_))),
     "rotating full-window set_seq must reject n_kv_heads mismatch, got {r1:?}"
   );
   c1.update(&seed, &seed).unwrap();
@@ -1547,7 +1547,7 @@ fn rotating_set_seq_full_window_rejects_mismatched_heads_and_head_dim() {
   .unwrap();
   let r2 = c2.update(&bad_kv_hd, &bad_kv_hd);
   assert!(
-    matches!(&r2, Err(mlxrs::Error::ShapeMismatch { .. })),
+    matches!(&r2, Err(mlxrs::Error::ShapeMismatch(_))),
     "rotating full-window set_seq must reject head_dim mismatch, got {r2:?}"
   );
   c2.update(&seed, &seed).unwrap();
@@ -1679,7 +1679,7 @@ fn rotating_update_in_place_partial_mutation_on_set_seq_err_is_rejected() {
   let bad_kv2 = Array::from_slice::<f32>(&[9.0, 9.5], &(2usize, 1, 1, 1)).unwrap();
   let r = c.update(&bad_kv2, &bad_kv2);
   assert!(
-    matches!(&r, Err(mlxrs::Error::ShapeMismatch { .. })),
+    matches!(&r, Err(mlxrs::Error::ShapeMismatch(_))),
     "non-broadcastable full-window RHS must be Err on the public update API \
      (Codex iter-2 follow-up to #78), got {r:?}"
   );

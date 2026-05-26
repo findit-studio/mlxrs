@@ -46,7 +46,7 @@ use std::cell::OnceCell;
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{Error, Result},
+  error::{DtypeMismatchPayload, EmptyInputPayload, Error, Result},
   ops::fast::metal_kernel::{KernelTemplateArg, MetalKernel, MetalKernelApplyConfig},
   transforms::custom_vjp,
 };
@@ -830,29 +830,37 @@ fn build_js_backward_kernel() -> Result<MetalKernel> {
 /// mlx-c's `grid` / `thread_group` are i32-typed.
 fn n_outs_of(logits: &Array) -> Result<i32> {
   let shape = logits.shape();
-  let v = shape.last().copied().ok_or_else(|| Error::ShapeMismatch {
-    message: "mlxrs::lm::tuner::losses: logits must have rank ≥ 1 (got rank 0)".to_string(),
+  let v = shape.last().copied().ok_or_else(|| {
+    Error::ShapeMismatch(
+      "mlxrs::lm::tuner::losses: logits must have rank ≥ 1 (got rank 0)".to_string(),
+    )
   })?;
   if v == 0 {
-    return Err(Error::ShapeMismatch {
-      message: "mlxrs::lm::tuner::losses: logits last dimension must be > 0".to_string(),
-    });
+    return Err(Error::ShapeMismatch(
+      "mlxrs::lm::tuner::losses: logits last dimension must be > 0".to_string(),
+    ));
   }
   let total: usize = shape.iter().product();
   let n_outs = total / v;
-  i32::try_from(n_outs).map_err(|_| Error::ShapeMismatch {
-    message: format!("mlxrs::lm::tuner::losses: n_outs {n_outs} exceeds i32::MAX"),
+  i32::try_from(n_outs).map_err(|_| {
+    Error::ShapeMismatch(format!(
+      "mlxrs::lm::tuner::losses: n_outs {n_outs} exceeds i32::MAX"
+    ))
   })
 }
 
 /// Compute `V = logits.shape[-1]` cast to `i32` (the per-row vocab size).
 fn vocab_of(logits: &Array) -> Result<i32> {
   let shape = logits.shape();
-  let v = shape.last().copied().ok_or_else(|| Error::ShapeMismatch {
-    message: "mlxrs::lm::tuner::losses: logits must have rank ≥ 1 (got rank 0)".to_string(),
+  let v = shape.last().copied().ok_or_else(|| {
+    Error::ShapeMismatch(
+      "mlxrs::lm::tuner::losses: logits must have rank ≥ 1 (got rank 0)".to_string(),
+    )
   })?;
-  i32::try_from(v).map_err(|_| Error::ShapeMismatch {
-    message: format!("mlxrs::lm::tuner::losses: vocab size {v} exceeds i32::MAX"),
+  i32::try_from(v).map_err(|_| {
+    Error::ShapeMismatch(format!(
+      "mlxrs::lm::tuner::losses: vocab size {v} exceeds i32::MAX"
+    ))
   })
 }
 
@@ -865,15 +873,17 @@ fn vocab_of(logits: &Array) -> Result<i32> {
 fn leading_shape_i32(logits: &Array) -> Result<Vec<i32>> {
   let shape = logits.shape();
   if shape.is_empty() {
-    return Err(Error::ShapeMismatch {
-      message: "mlxrs::lm::tuner::losses: logits must have rank ≥ 1 (got rank 0)".to_string(),
-    });
+    return Err(Error::ShapeMismatch(
+      "mlxrs::lm::tuner::losses: logits must have rank ≥ 1 (got rank 0)".to_string(),
+    ));
   }
   shape[..shape.len() - 1]
     .iter()
     .map(|&d| {
-      i32::try_from(d).map_err(|_| Error::ShapeMismatch {
-        message: format!("mlxrs::lm::tuner::losses: shape dim {d} exceeds i32::MAX"),
+      i32::try_from(d).map_err(|_| {
+        Error::ShapeMismatch(format!(
+          "mlxrs::lm::tuner::losses: shape dim {d} exceeds i32::MAX"
+        ))
       })
     })
     .collect()
@@ -887,8 +897,10 @@ fn full_shape_i32(logits: &Array) -> Result<Vec<i32>> {
     .shape()
     .iter()
     .map(|&d| {
-      i32::try_from(d).map_err(|_| Error::ShapeMismatch {
-        message: format!("mlxrs::lm::tuner::losses: shape dim {d} exceeds i32::MAX"),
+      i32::try_from(d).map_err(|_| {
+        Error::ShapeMismatch(format!(
+          "mlxrs::lm::tuner::losses: shape dim {d} exceeds i32::MAX"
+        ))
       })
     })
     .collect()
@@ -942,33 +954,27 @@ fn validate_inputs(logits_q: &Array, logits_p: &Array, ctx: &str) -> Result<()> 
   // contract message here instead. Mirrors the upstream `mlx_lm`
   // convention of `[B, ..., V]` logits from a model's forward pass.
   if logits_q.ndim() < 2 {
-    return Err(Error::Backend {
-      message: format!(
-        "mlxrs::lm::tuner::losses::{ctx}: kl_div_loss / js_div_loss require \
+    return Err(Error::Backend(format!(
+      "mlxrs::lm::tuner::losses::{ctx}: kl_div_loss / js_div_loss require \
          logits of rank >= 2 (shape [B, ..., V]); got logits_q rank {} (shape {sq:?}). \
          Rank-1 input [V] is not supported in v1; reshape to [1, V] for a \
          scalar-like loss.",
-        logits_q.ndim()
-      ),
-    });
+      logits_q.ndim()
+    )));
   }
   if logits_p.ndim() < 2 {
-    return Err(Error::Backend {
-      message: format!(
-        "mlxrs::lm::tuner::losses::{ctx}: kl_div_loss / js_div_loss require \
+    return Err(Error::Backend(format!(
+      "mlxrs::lm::tuner::losses::{ctx}: kl_div_loss / js_div_loss require \
          logits of rank >= 2 (shape [B, ..., V]); got logits_p rank {} (shape {sp:?}). \
          Rank-1 input [V] is not supported in v1; reshape to [1, V] for a \
          scalar-like loss.",
-        logits_p.ndim()
-      ),
-    });
+      logits_p.ndim()
+    )));
   }
   if sq != sp {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "mlxrs::lm::tuner::losses::{ctx}: logits_q shape {sq:?} != logits_p shape {sp:?}"
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "mlxrs::lm::tuner::losses::{ctx}: logits_q shape {sq:?} != logits_p shape {sp:?}"
+    )));
   }
   // Zero-last-dim + i32-overflow checks run BEFORE dtype checks so the
   // documented precedence (step 2 = ShapeMismatch for "last dim is 0 or
@@ -980,28 +986,21 @@ fn validate_inputs(logits_q: &Array, logits_p: &Array, ctx: &str) -> Result<()> 
   // `full_shape_i32`, but they'll never fire on the public path now.
   let last = *sq.last().expect("rank>=2 guaranteed by checks above");
   if last == 0 {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "mlxrs::lm::tuner::losses::{ctx}: logits last dimension must be > 0 (got shape {sq:?})"
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "mlxrs::lm::tuner::losses::{ctx}: logits last dimension must be > 0 (got shape {sq:?})"
+    )));
   }
   for &d in sq.iter() {
     if i32::try_from(d).is_err() {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "mlxrs::lm::tuner::losses::{ctx}: shape dim {d} exceeds i32::MAX (shape {sq:?})"
-        ),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "mlxrs::lm::tuner::losses::{ctx}: shape dim {d} exceeds i32::MAX (shape {sq:?})"
+      )));
     }
   }
   let dq = logits_q.dtype()?;
   let dp = logits_p.dtype()?;
   if dq != dp {
-    return Err(Error::DtypeMismatch {
-      expected: dq,
-      got: dp,
-    });
+    return Err(Error::DtypeMismatch(DtypeMismatchPayload::new(dq, dp)));
   }
   // Floating-only: the kernel casts the divergence + gradient expressions
   // back to `T == input dtype`, so an integer / boolean `T` would silently
@@ -1010,13 +1009,11 @@ fn validate_inputs(logits_q: &Array, logits_p: &Array, ctx: &str) -> Result<()> 
   match dq {
     Dtype::F32 | Dtype::F16 | Dtype::BF16 => {}
     other => {
-      return Err(Error::Backend {
-        message: format!(
-          "mlxrs::lm::tuner::losses::{ctx}: kl_div_loss / js_div_loss \
+      return Err(Error::Backend(format!(
+        "mlxrs::lm::tuner::losses::{ctx}: kl_div_loss / js_div_loss \
            require floating-point logits (F32, F16, or BF16); got {other:?}. \
            Cast logits with .astype(Dtype::F32) before calling."
-        ),
-      });
+      )));
     }
   }
   Ok(())
@@ -1083,11 +1080,11 @@ fn kl_forward_apply(logits_q: &Array, logits_p: &Array) -> Result<Array> {
 fn kl_backward_apply(logits_q: &Array, logits_p: &Array, cotangent: &Array) -> Result<Array> {
   let dtype = logits_q.dtype()?;
   let vocab = vocab_of(logits_q)?;
-  let cot_size = i32::try_from(cotangent.size()).map_err(|_| Error::ShapeMismatch {
-    message: format!(
+  let cot_size = i32::try_from(cotangent.size()).map_err(|_| {
+    Error::ShapeMismatch(format!(
       "mlxrs::lm::tuner::losses::kl_backward: cotangent size {} exceeds i32::MAX",
       cotangent.size()
-    ),
+    ))
   })?;
   let out_shape = full_shape_i32(logits_q)?;
 
@@ -1130,12 +1127,10 @@ fn js_forward_apply(logits_q: &Array, logits_p: &Array) -> Result<(Array, Array)
   with_kernel(&JS_FORWARD, build_js_forward_kernel, |kernel| {
     let mut outputs = kernel.apply(&[logits_q, logits_p], &cfg)?;
     if outputs.len() != 2 {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "mlxrs::lm::tuner::losses::js_forward: expected 2 outputs, got {}",
-          outputs.len()
-        ),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "mlxrs::lm::tuner::losses::js_forward: expected 2 outputs, got {}",
+        outputs.len()
+      )));
     }
     let kl_q = outputs.swap_remove(1);
     let loss = outputs.swap_remove(0);
@@ -1154,11 +1149,11 @@ fn js_backward_apply(
 ) -> Result<Array> {
   let dtype = logits_q.dtype()?;
   let vocab = vocab_of(logits_q)?;
-  let cot_size = i32::try_from(cotan.size()).map_err(|_| Error::ShapeMismatch {
-    message: format!(
+  let cot_size = i32::try_from(cotan.size()).map_err(|_| {
+    Error::ShapeMismatch(format!(
       "mlxrs::lm::tuner::losses::js_backward: cotan size {} exceeds i32::MAX",
       cotan.size()
-    ),
+    ))
   })?;
   let out_shape = full_shape_i32(logits_q)?;
 
@@ -1264,10 +1259,9 @@ pub fn kl_div_loss(logits_q: &Array, logits_p: &Array) -> Result<Array> {
   let inputs = [logits_q.try_clone()?, logits_p.try_clone()?];
   let mut outputs = wrapped(&inputs)?;
   if outputs.is_empty() {
-    return Err(Error::Backend {
-      message: "mlxrs::lm::tuner::losses::kl_div_loss: forward closure returned empty output"
-        .into(),
-    });
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "kl_div_loss: forward closure output",
+    )));
   }
   Ok(outputs.swap_remove(0))
 }
@@ -1333,10 +1327,9 @@ pub fn js_div_loss(logits_q: &Array, logits_p: &Array) -> Result<Array> {
   let inputs = [logits_q.try_clone()?, logits_p.try_clone()?];
   let mut outputs = wrapped(&inputs)?;
   if outputs.is_empty() {
-    return Err(Error::Backend {
-      message: "mlxrs::lm::tuner::losses::js_div_loss: forward closure returned empty output"
-        .into(),
-    });
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "js_div_loss: forward closure output",
+    )));
   }
   // The forward emits (loss, kl_q); the python public surface returns
   // `_js_div_loss(...)[0]`, the loss. We mirror that.
@@ -1429,7 +1422,7 @@ mod tests {
     let b = Array::ones::<f32>(&[2, 8]).unwrap();
     let err = validate_inputs(&a, &b, "kl_div_loss").unwrap_err();
     match err {
-      Error::ShapeMismatch { message } => {
+      Error::ShapeMismatch(message) => {
         assert!(message.contains("shape"), "got: {message:?}");
       }
       other => panic!("expected ShapeMismatch, got: {other:?}"),
@@ -1442,9 +1435,9 @@ mod tests {
     let b = Array::ones::<half::f16>(&[2, 4]).unwrap();
     let err = validate_inputs(&a, &b, "kl_div_loss").unwrap_err();
     match err {
-      Error::DtypeMismatch { expected, got } => {
-        assert_eq!(expected, Dtype::F32);
-        assert_eq!(got, Dtype::F16);
+      Error::DtypeMismatch(p) => {
+        assert_eq!(p.expected(), Dtype::F32);
+        assert_eq!(p.got(), Dtype::F16);
       }
       other => panic!("expected DtypeMismatch, got: {other:?}"),
     }
@@ -1456,7 +1449,7 @@ mod tests {
     let b = Array::ones::<f32>(&[2, 8]).unwrap();
     let err = kl_div_loss(&a, &b).unwrap_err();
     match err {
-      Error::ShapeMismatch { message } => {
+      Error::ShapeMismatch(message) => {
         assert!(message.contains("kl_div_loss"), "got: {message:?}");
       }
       other => panic!("expected ShapeMismatch, got: {other:?}"),
@@ -1469,7 +1462,7 @@ mod tests {
     let b = Array::ones::<f32>(&[2, 8]).unwrap();
     let err = js_div_loss(&a, &b).unwrap_err();
     match err {
-      Error::ShapeMismatch { message } => {
+      Error::ShapeMismatch(message) => {
         assert!(message.contains("js_div_loss"), "got: {message:?}");
       }
       other => panic!("expected ShapeMismatch, got: {other:?}"),
@@ -1488,7 +1481,7 @@ mod tests {
     let a = Array::full::<f32>(&[0i32; 0], 1.0).unwrap();
     let err = n_outs_of(&a).unwrap_err();
     match err {
-      Error::ShapeMismatch { message } => {
+      Error::ShapeMismatch(message) => {
         assert!(message.contains("rank ≥ 1") || message.contains("rank"));
       }
       other => panic!("expected ShapeMismatch, got: {other:?}"),

@@ -30,11 +30,9 @@ pub(crate) const SEQ_AXIS: i32 = -2;
 pub(crate) fn seq_len(name: &str, a: &Array) -> Result<usize> {
   let shape = a.shape();
   if shape.len() != KV_NDIM {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "KV cache expects 4-D {name} [B, n_kv_heads, S, head_dim], got shape {shape:?}"
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "KV cache expects 4-D {name} [B, n_kv_heads, S, head_dim], got shape {shape:?}"
+    )));
   }
   Ok(shape[KV_NDIM - 2])
 }
@@ -49,11 +47,9 @@ pub(crate) fn seq_len(name: &str, a: &Array) -> Result<usize> {
 pub(crate) fn head_dim(name: &str, a: &Array) -> Result<usize> {
   let shape = a.shape();
   if shape.len() != KV_NDIM {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "KV cache expects 4-D {name} [B, n_kv_heads, S, head_dim], got shape {shape:?}"
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "KV cache expects 4-D {name} [B, n_kv_heads, S, head_dim], got shape {shape:?}"
+    )));
   }
   Ok(shape[KV_NDIM - 1])
 }
@@ -104,23 +100,19 @@ pub(crate) fn broadcast_write_rhs(
   let bs = buf.shape();
   let ns = new.shape();
   if bs.len() != KV_NDIM {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "KV cache expects 4-D {name} [B, n_kv_heads, S, head_dim], got shape {bs:?}"
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "KV cache expects 4-D {name} [B, n_kv_heads, S, head_dim], got shape {bs:?}"
+    )));
   }
   if ns.len() != KV_NDIM {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "KV cache expects 4-D {name} write RHS [B, n_kv_heads, S, head_dim], got shape {ns:?}"
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "KV cache expects 4-D {name} write RHS [B, n_kv_heads, S, head_dim], got shape {ns:?}"
+    )));
   }
   // Slice window length on the sequence axis — the broadcast target's seq
   // dim (mlx `slice_update`'s `upd_shape[seq]` is exactly `stop - start`).
-  let win = end.checked_sub(a).ok_or_else(|| Error::ShapeMismatch {
-    message: format!("set_seq: {name} write end ({end}) < start ({a})"),
+  let win = end.checked_sub(a).ok_or_else(|| {
+    Error::ShapeMismatch(format!("set_seq: {name} write end ({end}) < start ({a})"))
   })?;
   // Per-axis: identity (`d == d`) OR size-1-broadcast (`new == 1`). mlx
   // `broadcast_to` (called by `slice_update`, `ops.cpp:843`) accepts a size-1
@@ -131,13 +123,11 @@ pub(crate) fn broadcast_write_rhs(
     let target = if axis == KV_NDIM - 2 { win } else { bs[axis] };
     let got = ns[axis];
     if got != target && got != 1 {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "set_seq: {name} write RHS shape {ns:?} non-broadcastable on axis {axis} \
+      return Err(Error::ShapeMismatch(format!(
+        "set_seq: {name} write RHS shape {ns:?} non-broadcastable on axis {axis} \
            (got {got}, target {target} — mlx-lm slice-assignment raises on \
            non-broadcastable non-seq axes; seq-axis target is the slice window length)"
-        ),
-      });
+      )));
     }
   }
   // Build the broadcast target shape `[buf[0], buf[1], win, buf[3]]` and
@@ -177,28 +167,24 @@ pub(crate) fn slice_seq(a: &Array, start: usize, end: usize) -> Result<Array> {
   // Quantized/Batch/BatchRotating) all pre-validate rank before reaching
   // here, so this is a defense-in-depth guard, not a behavior change.
   if shape.len() != KV_NDIM {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "slice_seq: expects {KV_NDIM}-D array [B, n_kv_heads, S, head_dim], got shape {shape:?}"
-      ),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "slice_seq: expects {KV_NDIM}-D array [B, n_kv_heads, S, head_dim], got shape {shape:?}"
+    )));
   }
   let mut starts = vec![0i32; KV_NDIM];
   let mut stops: Vec<i32> = shape
     .iter()
     .map(|&d| {
-      i32::try_from(d).map_err(|_| Error::ShapeMismatch {
-        message: format!("slice_seq: shape dim {d} exceeds i32::MAX"),
-      })
+      i32::try_from(d)
+        .map_err(|_| Error::ShapeMismatch(format!("slice_seq: shape dim {d} exceeds i32::MAX")))
     })
     .collect::<Result<Vec<i32>>>()?;
   let strides = vec![1i32; KV_NDIM];
-  starts[KV_NDIM - 2] = i32::try_from(start).map_err(|_| Error::ShapeMismatch {
-    message: format!("slice_seq: start offset {start} exceeds i32::MAX"),
+  starts[KV_NDIM - 2] = i32::try_from(start).map_err(|_| {
+    Error::ShapeMismatch(format!("slice_seq: start offset {start} exceeds i32::MAX"))
   })?;
-  stops[KV_NDIM - 2] = i32::try_from(end).map_err(|_| Error::ShapeMismatch {
-    message: format!("slice_seq: end offset {end} exceeds i32::MAX"),
-  })?;
+  stops[KV_NDIM - 2] = i32::try_from(end)
+    .map_err(|_| Error::ShapeMismatch(format!("slice_seq: end offset {end} exceeds i32::MAX")))?;
   ops::indexing::slice(a, &starts, &stops, &strides)
 }
 
@@ -277,11 +263,9 @@ pub(crate) fn concat_parts(parts: &[&Array]) -> Result<Array> {
   let rank_checked = |a: &Array| -> Result<Array> {
     let shape = a.shape();
     if shape.len() != KV_NDIM {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "KV cache concat expects 4-D [B, n_kv_heads, S, head_dim] parts, got shape {shape:?}"
-        ),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "KV cache concat expects 4-D [B, n_kv_heads, S, head_dim] parts, got shape {shape:?}"
+      )));
     }
     a.try_clone()
   };
@@ -292,9 +276,9 @@ pub(crate) fn concat_parts(parts: &[&Array]) -> Result<Array> {
     // `Error` rather than an indexing panic.
     [] => match parts.first() {
       Some(first) => rank_checked(first),
-      None => Err(Error::ShapeMismatch {
-        message: "concat_parts: no parts to concatenate".into(),
-      }),
+      None => Err(Error::ShapeMismatch(
+        "concat_parts: no parts to concatenate".into(),
+      )),
     },
     [one] => rank_checked(one),
     many => ops::shape::concatenate(many, SEQ_AXIS),
@@ -327,7 +311,7 @@ mod tests {
     let bad_end = (i32::MAX as usize) + 1;
     let r = slice_seq(&a, 0, bad_end);
     match r {
-      Err(Error::ShapeMismatch { message }) => {
+      Err(Error::ShapeMismatch(message)) => {
         assert!(
           message.contains("end") && message.contains("i32::MAX"),
           "expected message to name `end` and `i32::MAX`, got: {message:?}"
@@ -350,7 +334,7 @@ mod tests {
     // either error variant is correct, both name an offset > i32::MAX.
     let r = slice_seq(&a, bad_start, bad_start);
     match r {
-      Err(Error::ShapeMismatch { message }) => {
+      Err(Error::ShapeMismatch(message)) => {
         assert!(
           message.contains("i32::MAX"),
           "expected message to mention `i32::MAX`, got: {message:?}"
@@ -383,7 +367,7 @@ mod tests {
     let a1: Array = Array::from_slice::<f32>(&[0.0, 1.0], &(2usize,)).unwrap(); // rank 1
     let r = slice_seq(&a1, 0, 0);
     assert!(
-      matches!(r, Err(Error::ShapeMismatch { .. })),
+      matches!(r, Err(Error::ShapeMismatch(_))),
       "rank-1 must Err(ShapeMismatch), got {r:?}"
     );
     let err_msg = match r {

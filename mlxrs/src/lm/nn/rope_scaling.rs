@@ -40,7 +40,7 @@
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{Error, LengthMismatchPayload, OutOfRangePayload, Result},
   lm::nn::rope::{RopeOffsetRef, rope_with_freqs_offset},
 };
 
@@ -52,9 +52,11 @@ use super::rope::DEFAULT_BASE;
 /// rejects a non-positive `dims` (which would yield an empty rotation).
 fn freqs_half(dims: i32) -> Result<usize> {
   if dims <= 0 || dims % 2 != 0 {
-    return Err(Error::ShapeMismatch {
-      message: format!("scaled RoPE dims must be a positive even number, got {dims}"),
-    });
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "scaled RoPE: dims",
+      "must be a positive even number",
+      format!("{dims}"),
+    )));
   }
   Ok((dims / 2) as usize)
 }
@@ -96,14 +98,12 @@ fn freqs_array(freqs: &[f64]) -> Result<Array> {
   for &v in freqs {
     let f = v as f32;
     if !f.is_finite() || f <= 0.0 || !(1.0f32 / f).is_finite() {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "scaled RoPE computed a freq ({v}) that is non-positive, non-finite, or whose \
+      return Err(Error::ShapeMismatch(format!(
+        "scaled RoPE computed a freq ({v}) that is non-positive, non-finite, or whose \
            reciprocal 1/f overflows f32; check the scaling config (base / factor / embeddings \
            / betas) — freqs are inverted as 1/freqs by mlx_fast_rope, so a zero / subnormal \
            element would become +Inf at apply time"
-        ),
-      });
+      )));
     }
     buf.push(f);
   }
@@ -121,11 +121,9 @@ fn finite_scalar(value: f64, what: &str) -> Result<f32> {
   if v.is_finite() {
     Ok(v)
   } else {
-    Err(Error::ShapeMismatch {
-      message: format!(
-        "scaled RoPE computed a non-finite {what} ({value}); check the scaling config"
-      ),
-    })
+    Err(Error::ShapeMismatch(format!(
+      "scaled RoPE computed a non-finite {what} ({value}); check the scaling config"
+    )))
   }
 }
 
@@ -137,9 +135,9 @@ fn require_finite_input(value: f32, what: &str) -> Result<()> {
   if value.is_finite() {
     Ok(())
   } else {
-    Err(Error::ShapeMismatch {
-      message: format!("scaled RoPE {what} must be finite, got {value}"),
-    })
+    Err(Error::ShapeMismatch(format!(
+      "scaled RoPE {what} must be finite, got {value}"
+    )))
   }
 }
 
@@ -153,9 +151,9 @@ fn require_positive_input(value: f32, what: &str) -> Result<()> {
   if value.is_finite() && value > 0.0 {
     Ok(())
   } else {
-    Err(Error::ShapeMismatch {
-      message: format!("scaled RoPE {what} must be a positive finite number, got {value}"),
-    })
+    Err(Error::ShapeMismatch(format!(
+      "scaled RoPE {what} must be a positive finite number, got {value}"
+    )))
   }
 }
 
@@ -179,9 +177,9 @@ fn require_positive_input(value: f32, what: &str) -> Result<()> {
 fn scale_leading_dims(x: &Array, dims: i32, mscale: f32) -> Result<Array> {
   let ndim = x.ndim();
   if ndim == 0 {
-    return Err(Error::ShapeMismatch {
-      message: "scaled RoPE input must have at least one axis".to_string(),
-    });
+    return Err(Error::ShapeMismatch(
+      "scaled RoPE input must have at least one axis".to_string(),
+    ));
   }
   // Build the scalar in `x`'s dtype so `multiply` does not promote half-precision
   // inputs to f32 (mirrors the references' in-place-into-`x` store).
@@ -191,17 +189,19 @@ fn scale_leading_dims(x: &Array, dims: i32, mscale: f32) -> Result<Array> {
   // `head_dim` past `i32::MAX` would silently wrap with `as`. Convert checked
   // and surface a recoverable error instead.
   let head_dim_usize = x.shape()[last];
-  let head_dim = i32::try_from(head_dim_usize).map_err(|_| Error::ShapeMismatch {
-    message: format!("scaled RoPE head_dim {head_dim_usize} exceeds i32::MAX"),
+  let head_dim = i32::try_from(head_dim_usize).map_err(|_| {
+    Error::ShapeMismatch(format!(
+      "scaled RoPE head_dim {head_dim_usize} exceeds i32::MAX"
+    ))
   })?;
   if head_dim == dims {
     // Whole last axis is rotated: scale x directly (scalar broadcasts).
     return x.multiply(&scalar);
   }
   if head_dim < dims {
-    return Err(Error::ShapeMismatch {
-      message: format!("scaled RoPE dims {dims} exceeds head_dim {head_dim}"),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "scaled RoPE dims {dims} exceeds head_dim {head_dim}"
+    )));
   }
   // head_dim > dims: scale only the leading `dims` features, keep the tail.
   let axis = last as i32;
@@ -418,12 +418,11 @@ impl SuScaledRope {
   ) -> Result<Self> {
     let half = freqs_half(dims)?;
     if long_factor.len() != half {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "SuScaledRoPE long_factor length {} != dims/2 {half}",
-          long_factor.len()
-        ),
-      });
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "SuScaledRoPE long_factor length vs dims/2",
+        half,
+        long_factor.len(),
+      )));
     }
     // Input positive-finiteness: `base` raises to `2i/dims` (a non-positive
     // base would yield a zero/NaN base-freq), and each `long_factor` entry
@@ -459,13 +458,11 @@ impl SuScaledRope {
         // by it; a non-positive value would yield a NaN/Inf scale that silently
         // propagates. Reject it before computing the factor.
         if original_max_position_embeddings <= 0 || max_position_embeddings <= 0 {
-          return Err(Error::ShapeMismatch {
-            message: format!(
-              "SuScaledRoPE max_position_embeddings ({max_position_embeddings}) and \
+          return Err(Error::ShapeMismatch(format!(
+            "SuScaledRoPE max_position_embeddings ({max_position_embeddings}) and \
                original_max_position_embeddings ({original_max_position_embeddings}) must be \
                positive to derive the input scale"
-            ),
-          });
+          )));
         }
         // factor = max_pos / orig_max; scale = 1 if factor <= 1 else default.
         let factor =
@@ -479,13 +476,11 @@ impl SuScaledRope {
           // this path explicitly (the `finite_scalar` gate below would also
           // catch the resulting `+Inf`, but the message here is precise).
           if original_max_position_embeddings <= 1 {
-            return Err(Error::ShapeMismatch {
-              message: format!(
-                "SuScaledRoPE original_max_position_embeddings ({original_max_position_embeddings}) \
+            return Err(Error::ShapeMismatch(format!(
+              "SuScaledRoPE original_max_position_embeddings ({original_max_position_embeddings}) \
                  must be > 1 on the derived-scale path (factor > 1): ln(1) = 0 divides the scale \
                  to +Inf"
-              ),
-            });
+            )));
           }
           // sqrt(1 + ln(factor) / ln(orig_max)); finiteness is the catch-all.
           finite_scalar(
@@ -613,25 +608,24 @@ impl YarnRope {
     // `beta_fast`/`beta_slow` (the `num_rotations` in the inner denominator —
     // zero gives Inf, negative gives a NaN `ln`).
     if base <= 1.0 {
-      return Err(Error::ShapeMismatch {
-        message: format!("YarnRoPE base must be > 1 to derive correction dims, got {base}"),
-      });
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "YarnRoPE: base",
+        "must be > 1 to derive correction dims",
+        format!("{base}"),
+      )));
     }
     if config.original_max_position_embeddings <= 0 {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "YarnRoPE original_max_position_embeddings must be positive, got {}",
-          config.original_max_position_embeddings
-        ),
-      });
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "YarnRoPE: original_max_position_embeddings",
+        "must be positive",
+        format!("{}", config.original_max_position_embeddings),
+      )));
     }
     if config.beta_fast <= 0.0 || config.beta_slow <= 0.0 {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "YarnRoPE beta_fast ({}) and beta_slow ({}) must be positive",
-          config.beta_fast, config.beta_slow
-        ),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "YarnRoPE beta_fast ({}) and beta_slow ({}) must be positive",
+        config.beta_fast, config.beta_slow
+      )));
     }
     // `scaling_factor` scales the interpolation freqs (`freq_inter =
     // scaling_factor * base_freqs`). A non-positive value (e.g. `0`) makes
@@ -640,12 +634,11 @@ impl YarnRope {
     // freq_mask)` → `0` when `freq_mask == 1`) → `0/0 = NaN` freqs. Reject it
     // explicitly (the `freqs_array` gate below is the catch-all).
     if config.scaling_factor <= 0.0 {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "YarnRoPE scaling_factor must be positive, got {}",
-          config.scaling_factor
-        ),
-      });
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "YarnRoPE: scaling_factor",
+        "must be a positive value",
+        format!("{}", config.scaling_factor),
+      )));
     }
 
     // yarn_find_correction_dim(num_rotations)

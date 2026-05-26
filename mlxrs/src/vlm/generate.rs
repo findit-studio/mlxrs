@@ -461,24 +461,20 @@ pub fn vlm_generate<'a, M: Model + ?Sized>(
     let (rows, _d) = match enc_shape.as_slice() {
       [n, d] => (*n, *d),
       _ => {
-        return Err(Error::ShapeMismatch {
-          message: format!(
-            "vlm_generate: encode_image for image #{idx} must return rank-2 [N, D], got {enc_shape:?}"
-          ),
-        });
+        return Err(Error::ShapeMismatch(format!(
+          "vlm_generate: encode_image for image #{idx} must return rank-2 [N, D], got {enc_shape:?}"
+        )));
       }
     };
     if rows != cfg.num_tokens_per_image {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "vlm_generate: encode_image for image #{idx} returned {rows} feature rows; expected \
+      return Err(Error::ShapeMismatch(format!(
+        "vlm_generate: encode_image for image #{idx} returned {rows} feature rows; expected \
            exactly cfg.num_tokens_per_image ({}). The cross-model splice contract requires one \
            image to emit exactly `num_tokens_per_image` features — a model with \
            variable-per-image counts must pad/truncate inside its own `encode_image` or override \
            the `vlm_generate` entry point",
-          cfg.num_tokens_per_image,
-        ),
-      });
+        cfg.num_tokens_per_image,
+      )));
     }
     image_slabs.push(encoded);
   }
@@ -767,10 +763,9 @@ impl<M: Model + ?Sized> VlmDecode<'_, M> {
   ) -> Result<GenStep> {
     let t = prompt_tokens.len();
     if t == 0 {
-      return Err(Error::ShapeMismatch {
-        message: "vlm_generate: assembled prompt is empty (T=0); prefill cannot produce logits"
-          .into(),
-      });
+      return Err(Error::ShapeMismatch(
+        "vlm_generate: assembled prompt is empty (T=0); prefill cannot produce logits".into(),
+      ));
     }
     // The cache may already hold tokens (a restored / pre-populated
     // prompt cache, or a model that pre-seeds the cache). Read the
@@ -795,16 +790,14 @@ impl<M: Model + ?Sized> VlmDecode<'_, M> {
           let off = first.offset();
           for (i, layer) in iter.enumerate() {
             if layer.offset() != off {
-              return Err(Error::ShapeMismatch {
-                message: format!(
-                  "vlm_generate: KV cache layers disagree on offset (layer 0 = {off}, layer \
+              return Err(Error::ShapeMismatch(format!(
+                "vlm_generate: KV cache layers disagree on offset (layer 0 = {off}, layer \
                    {} = {}); chunked-multimodal prefill needs one consistent cache offset to \
                    size per-chunk attention masks (a faithfully restored prompt cache has all \
                    layers at the same offset)",
-                  i + 1,
-                  layer.offset()
-                ),
-              });
+                i + 1,
+                layer.offset()
+              )));
             }
           }
           off
@@ -873,14 +866,11 @@ impl<M: Model + ?Sized> VlmDecode<'_, M> {
       // restored offset (recoverable error, never a debug-panic /
       // release-wrap before the mask builder could reject it) — Codex
       // VLM-8 R2F1.
-      let chunk_offset =
-        initial_offset
-          .checked_add(cursor)
-          .ok_or_else(|| Error::ShapeMismatch {
-            message: format!(
-              "vlm_generate: cache offset {initial_offset} + chunk cursor {cursor} overflows usize"
-            ),
-          })?;
+      let chunk_offset = initial_offset.checked_add(cursor).ok_or_else(|| {
+        Error::ShapeMismatch(format!(
+          "vlm_generate: cache offset {initial_offset} + chunk cursor {cursor} overflows usize"
+        ))
+      })?;
       let logits = self.model.forward_embeddings_multimodal(
         &chunk_merged,
         &chunk_spans,
@@ -989,17 +979,15 @@ impl<M: Model + ?Sized> Iterator for VlmDecode<'_, M> {
 fn last_position(logits: &Array) -> Result<Array> {
   let shape = logits.shape();
   if shape.len() != 3 {
-    return Err(Error::ShapeMismatch {
-      message: format!("vlm_generate: expected [B, S, V] logits from forward, got {shape:?}"),
-    });
+    return Err(Error::ShapeMismatch(format!(
+      "vlm_generate: expected [B, S, V] logits from forward, got {shape:?}"
+    )));
   }
   if shape[1] == 0 || shape[2] == 0 {
-    return Err(Error::ShapeMismatch {
-      message: format!(
-        "vlm_generate: forward returned logits with a zero-length axis (got [B, S, V] \
+    return Err(Error::ShapeMismatch(format!(
+      "vlm_generate: forward returned logits with a zero-length axis (got [B, S, V] \
          {shape:?}); logits[:, -1, :] requires S >= 1 and V >= 1"
-      ),
-    });
+    )));
   }
   let (b, s, v) = (shape[0] as i32, shape[1] as i32, shape[2] as i32);
   let sliced = ops::indexing::slice(logits, &[0, s - 1, 0], &[b, s, v], &[1, 1, 1])?;

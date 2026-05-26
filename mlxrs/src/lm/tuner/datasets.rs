@@ -96,7 +96,7 @@ use std::{
 use serde_json::Value;
 
 use crate::{
-  error::{Error, Result},
+  error::{Error, FileIoPayload, FileOp, Result},
   tokenizer::Tokenizer,
 };
 
@@ -217,11 +217,11 @@ impl Dataset for TextDataset<'_> {
   }
 
   fn get(&self, idx: usize) -> Result<&Value> {
-    self.data.get(idx).ok_or_else(|| Error::Backend {
-      message: format!(
+    self.data.get(idx).ok_or_else(|| {
+      Error::Backend(format!(
         "TextDataset: index {idx} out of range (len={})",
         self.data.len()
-      ),
+      ))
     })
   }
 
@@ -308,31 +308,29 @@ impl Dataset for ChatDataset<'_> {
   }
 
   fn get(&self, idx: usize) -> Result<&Value> {
-    self.data.get(idx).ok_or_else(|| Error::Backend {
-      message: format!(
+    self.data.get(idx).ok_or_else(|| {
+      Error::Backend(format!(
         "ChatDataset: index {idx} out of range (len={})",
         self.data.len()
-      ),
+      ))
     })
   }
 
   /// Python `ChatDataset.process` (`tuner/datasets.py:57..=77`).
   fn process(&self, idx: usize) -> Result<Example> {
     let record = self.get(idx)?;
-    let messages = record.get(&self.chat_key).ok_or_else(|| Error::Backend {
-      message: format!(
+    let messages = record.get(&self.chat_key).ok_or_else(|| {
+      Error::Backend(format!(
         "ChatDataset: jsonl record missing '{}' field",
         self.chat_key
-      ),
+      ))
     })?;
     if !messages.is_array() {
-      return Err(Error::ShapeMismatch {
-        message: format!(
-          "ChatDataset: '{}' field must be a JSON array, got {}",
-          self.chat_key,
-          json_kind(messages),
-        ),
-      });
+      return Err(Error::ShapeMismatch(format!(
+        "ChatDataset: '{}' field must be a JSON array, got {}",
+        self.chat_key,
+        json_kind(messages),
+      )));
     }
     let tools = record.get("tools");
     let tokens = self
@@ -424,11 +422,11 @@ impl Dataset for CompletionsDataset<'_> {
   }
 
   fn get(&self, idx: usize) -> Result<&Value> {
-    self.data.get(idx).ok_or_else(|| Error::Backend {
-      message: format!(
+    self.data.get(idx).ok_or_else(|| {
+      Error::Backend(format!(
         "CompletionsDataset: index {idx} out of range (len={})",
         self.data.len()
-      ),
+      ))
     })
   }
 
@@ -515,12 +513,10 @@ impl<'a> ConcatenatedDataset<'a> {
       }
       remaining -= inner.len();
     }
-    Err(Error::Backend {
-      message: format!(
-        "ConcatenatedDataset: index {idx} out of range (len={})",
-        self.len,
-      ),
-    })
+    Err(Error::Backend(format!(
+      "ConcatenatedDataset: index {idx} out of range (len={})",
+      self.len,
+    )))
   }
 }
 
@@ -624,12 +620,10 @@ impl Dataset for CacheDataset<'_> {
     let computed = self.data.process(idx)?;
     let mut cache = self.proc_data.borrow_mut();
     if idx >= cache.len() {
-      return Err(Error::Backend {
-        message: format!(
-          "CacheDataset: index {idx} out of range (len={})",
-          cache.len()
-        ),
-      });
+      return Err(Error::Backend(format!(
+        "CacheDataset: index {idx} out of range (len={})",
+        cache.len()
+      )));
     }
     cache[idx] = Some(computed.clone());
     Ok(computed)
@@ -810,9 +804,9 @@ pub fn create_dataset<'a>(
   match resolved {
     DatasetType::Text => {
       if config.mask_prompt() {
-        return Err(Error::Backend {
-          message: "Prompt masking not supported for text dataset.".to_owned(),
-        });
+        return Err(Error::Backend(
+          "Prompt masking not supported for text dataset.".to_owned(),
+        ));
       }
       Ok(Box::new(TextDataset::new(
         data,
@@ -840,10 +834,11 @@ pub fn create_dataset<'a>(
 /// Python `tuner/datasets.py:185..=202` — `sample = data[0]` field
 /// detection.
 fn auto_detect(data: &[Value], config: &DatasetConfig) -> Result<DatasetType> {
-  let sample = data.first().ok_or_else(|| Error::Backend {
-    message:
+  let sample = data.first().ok_or_else(|| {
+    Error::Backend(
       "cannot auto-detect dataset type from an empty jsonl (pass an explicit DatasetType instead)"
         .to_owned(),
+    )
   })?;
   let has = |k: &str| sample.get(k).is_some();
   if has(config.prompt_feature()) && has(config.completion_feature()) {
@@ -854,11 +849,11 @@ fn auto_detect(data: &[Value], config: &DatasetConfig) -> Result<DatasetType> {
     Ok(DatasetType::Text)
   } else {
     // Match Python `tuner/datasets.py:199..=202` verbatim.
-    Err(Error::Backend {
-      message: "Unsupported data format, check the supported formats here:\n\
+    Err(Error::Backend(
+      "Unsupported data format, check the supported formats here:\n\
                 https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md#Data."
         .to_owned(),
-    })
+    ))
   }
 }
 
@@ -913,18 +908,17 @@ pub fn load_dataset<'a>(
   if let Some(s) = path.to_str()
     && (s.starts_with("hf://") || s.starts_with("hf:"))
   {
-    return Err(Error::Backend {
-      message: format!(
-        "HF Hub datasets are out of scope for the local-only mlxrs build \
+    return Err(Error::Backend(format!(
+      "HF Hub datasets are out of scope for the local-only mlxrs build \
          (path: {s}); pass a local jsonl file path instead"
-      ),
-    });
+    )));
   }
 
   if !path.exists() {
-    return Err(Error::Backend {
-      message: format!("jsonl path does not exist: {}", path.display()),
-    });
+    return Err(Error::Backend(format!(
+      "jsonl path does not exist: {}",
+      path.display()
+    )));
   }
 
   // Open FIRST, then validate against the handle's own metadata. This
@@ -948,36 +942,47 @@ pub fn load_dataset<'a>(
       .read(true)
       .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
       .open(path)
-      .map_err(|e| Error::Backend {
-        message: format!("open jsonl {}: {e}", path.display()),
+      .map_err(|e| {
+        Error::FileIo(FileIoPayload::new(
+          "open jsonl",
+          FileOp::Open,
+          ::std::path::PathBuf::from(path),
+          e,
+        ))
       })?
   };
   #[cfg(not(unix))]
-  let file = std::fs::File::open(path).map_err(|e| Error::Backend {
-    message: format!("open jsonl {}: {e}", path.display()),
+  let file = std::fs::File::open(path).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "open jsonl",
+      FileOp::Open,
+      ::std::path::PathBuf::from(path),
+      e,
+    ))
   })?;
-  let meta = file.metadata().map_err(|e| Error::Backend {
-    message: format!("stat jsonl {}: {e}", path.display()),
+  let meta = file.metadata().map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "stat jsonl",
+      FileOp::Stat,
+      ::std::path::PathBuf::from(path),
+      e,
+    ))
   })?;
   if !meta.is_file() {
-    return Err(Error::Backend {
-      message: format!(
-        "jsonl path is not a regular file: {} (directories, sockets, \
+    return Err(Error::Backend(format!(
+      "jsonl path is not a regular file: {} (directories, sockets, \
          FIFOs etc. are not accepted)",
-        path.display(),
-      ),
-    });
+      path.display(),
+    )));
   }
   if meta.len() > MAX_DATASET_FILE_BYTES {
-    return Err(Error::Backend {
-      message: format!(
-        "jsonl {} is {} bytes — refusing to read above the {}-byte cap; \
+    return Err(Error::Backend(format!(
+      "jsonl {} is {} bytes — refusing to read above the {}-byte cap; \
          pass a smaller file or shard the data",
-        path.display(),
-        meta.len(),
-        MAX_DATASET_FILE_BYTES,
-      ),
-    });
+      path.display(),
+      meta.len(),
+      MAX_DATASET_FILE_BYTES,
+    )));
   }
 
   // Delegate the read+parse loop to a path-agnostic helper so that
@@ -987,14 +992,12 @@ pub fn load_dataset<'a>(
   let data = read_jsonl_with_cap(BufReader::new(file), path, MAX_DATASET_FILE_BYTES)?;
 
   if data.is_empty() {
-    return Err(Error::Backend {
-      message: format!(
-        "jsonl {} is empty — refusing to construct an empty dataset; \
+    return Err(Error::Backend(format!(
+      "jsonl {} is empty — refusing to construct an empty dataset; \
          non-empty jsonl is required (skip absent valid.jsonl/test.jsonl \
          at the caller level)",
-        path.display(),
-      ),
-    });
+      path.display(),
+    )));
   }
 
   let inner = create_dataset(data, tokenizer, config, dataset_type)?;
@@ -1041,27 +1044,25 @@ fn read_jsonl_with_cap<R: BufRead>(
       // No budget left. If the reader still has bytes pending, that
       // is a cap overflow; if it's at EOF, normal exit.
       let mut peek = [0u8; 1];
-      let n = std::io::Read::read(&mut reader, &mut peek).map_err(|e| Error::Backend {
-        message: format!(
+      let n = std::io::Read::read(&mut reader, &mut peek).map_err(|e| {
+        Error::Backend(format!(
           "read jsonl {} after line {}: {e}",
           path_for_errors.display(),
           lineno,
-        ),
+        ))
       })?;
       if n == 0 {
         break;
       }
-      return Err(Error::Backend {
-        message: format!(
-          "jsonl {} exceeded the {}-byte cap during read (cumulative \
+      return Err(Error::Backend(format!(
+        "jsonl {} exceeded the {}-byte cap during read (cumulative \
            bytes after line {} already at the cap, and more bytes \
            remained in the reader); the file may have grown mid-read, \
            or the per-line size is unexpectedly large",
-          path_for_errors.display(),
-          max_bytes,
-          lineno,
-        ),
-      });
+        path_for_errors.display(),
+        max_bytes,
+        lineno,
+      )));
     }
     // Cap THIS line's read at `remaining + 1` so we detect the
     // overflow on the `+1` byte rather than allocating arbitrarily.
@@ -1084,13 +1085,11 @@ fn read_jsonl_with_cap<R: BufRead>(
     let n = match std::io::BufRead::read_until(&mut take, b'\n', &mut line_buf) {
       Ok(n) => n,
       Err(e) => {
-        return Err(Error::Backend {
-          message: format!(
-            "read jsonl {} line {}: {e}",
-            path_for_errors.display(),
-            lineno + 1,
-          ),
-        });
+        return Err(Error::Backend(format!(
+          "read jsonl {} line {}: {e}",
+          path_for_errors.display(),
+          lineno + 1,
+        )));
       }
     };
     if n == 0 {
@@ -1107,17 +1106,15 @@ fn read_jsonl_with_cap<R: BufRead>(
     // SINGLE giant line that alone exceeds the cap without
     // allocating past `remaining + 1` bytes.
     if total_bytes > max_bytes {
-      return Err(Error::Backend {
-        message: format!(
-          "jsonl {} exceeded the {}-byte cap during read (cumulative \
+      return Err(Error::Backend(format!(
+        "jsonl {} exceeded the {}-byte cap during read (cumulative \
            bytes after line {} reached at least {}); the file may have \
            grown mid-read, or the per-line size is unexpectedly large",
-          path_for_errors.display(),
-          max_bytes,
-          lineno,
-          total_bytes,
-        ),
-      });
+        path_for_errors.display(),
+        max_bytes,
+        lineno,
+        total_bytes,
+      )));
     }
     // Strip the trailing newline for downstream parsing, if any.
     if line_buf.last() == Some(&b'\n') {
@@ -1129,33 +1126,31 @@ fn read_jsonl_with_cap<R: BufRead>(
     }
     // Bytes were read into `line_buf`; treat the contents as UTF-8
     // for the parsing path that follows.
-    let line = std::str::from_utf8(&line_buf).map_err(|e| Error::Backend {
-      message: format!(
+    let line = std::str::from_utf8(&line_buf).map_err(|e| {
+      Error::Backend(format!(
         "jsonl {} line {} is not valid UTF-8: {e}",
         path_for_errors.display(),
         lineno,
-      ),
+      ))
     })?;
     let trimmed = line.trim();
     if trimmed.is_empty() {
       // Python `tuner/datasets.py` does `[json.loads(l) for l in fid]`,
       // which raises on an empty string. Silently dropping a blank
       // would shift subsequent indices and mask corruption.
-      return Err(Error::Backend {
-        message: format!(
-          "jsonl {} line {} is blank — every line must be a valid JSON \
+      return Err(Error::Backend(format!(
+        "jsonl {} line {} is blank — every line must be a valid JSON \
            record (matches Python `json.loads(l)` failing on \"\")",
-          path_for_errors.display(),
-          lineno,
-        ),
-      });
+        path_for_errors.display(),
+        lineno,
+      )));
     }
-    let v: Value = serde_json::from_str(trimmed).map_err(|e| Error::Backend {
-      message: format!(
+    let v: Value = serde_json::from_str(trimmed).map_err(|e| {
+      Error::Backend(format!(
         "parse jsonl {} line {}: {e}",
         path_for_errors.display(),
         lineno,
-      ),
+      ))
     })?;
     data.push(v);
   }
@@ -1167,14 +1162,15 @@ fn read_jsonl_with_cap<R: BufRead>(
 /// Extract a string field from a jsonl record, returning a clean error
 /// when missing or wrong-typed.
 fn field_as_str<'a>(record: &'a Value, key: &str, type_name: &str) -> Result<&'a str> {
-  let v = record.get(key).ok_or_else(|| Error::Backend {
-    message: format!("{type_name}: jsonl record missing '{key}' field"),
-  })?;
-  v.as_str().ok_or_else(|| Error::ShapeMismatch {
-    message: format!(
+  let v = record
+    .get(key)
+    // TODO(§5): promote to MissingField — `type_name` and `key` are runtime &str, not 'static; needs a DynamicMissingField variant or Cow<'static, str> fields.
+    .ok_or_else(|| Error::Backend(format!("{type_name}: jsonl record missing '{key}' field")))?;
+  v.as_str().ok_or_else(|| {
+    Error::ShapeMismatch(format!(
       "{type_name}: '{key}' field must be a string, got {}",
       json_kind(v),
-    ),
+    ))
   })
 }
 
@@ -1396,7 +1392,7 @@ mod tests {
     let ds = TextDataset::new(data, &tok, DEFAULT_TEXT_KEY);
     let err = ds.process(0).unwrap_err();
     assert!(
-      matches!(err, Error::ShapeMismatch { .. }),
+      matches!(err, Error::ShapeMismatch(_)),
       "expected ShapeMismatch, got: {err:?}"
     );
   }
@@ -1458,7 +1454,7 @@ mod tests {
     let ds = ChatDataset::new(data, &tok, DEFAULT_CHAT_KEY, false);
     let err = ds.process(0).unwrap_err();
     assert!(
-      matches!(err, Error::ShapeMismatch { .. }),
+      matches!(err, Error::ShapeMismatch(_)),
       "expected ShapeMismatch, got: {err:?}"
     );
   }
@@ -1903,7 +1899,7 @@ mod tests {
     let handle = std::thread::spawn(move || {
       let r = load_dataset(&path, &tok, DatasetType::Auto, &DatasetConfig::default());
       let msg = match &r {
-        Err(Error::Backend { message }) => Some(message.clone()),
+        Err(Error::Backend(message)) => Some(message.clone()),
         _ => None,
       };
       let _ = tx.send(msg);

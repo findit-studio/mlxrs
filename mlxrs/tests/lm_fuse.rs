@@ -449,7 +449,7 @@ fn fuse_rejects_missing_model_path() {
 
   let err = fuse::fuse(&model_dir, &adapter_dir, &save_dir, false).unwrap_err();
   match err {
-    Error::Backend { message } => {
+    Error::Backend(message) => {
       assert!(
         message.contains("does_not_exist") || message.contains("config"),
         "error mentions the missing path / file: {message}"
@@ -472,7 +472,7 @@ fn fuse_rejects_missing_adapter_path() {
 
   let err = fuse::fuse(&model_dir, &adapter_dir, &save_dir, false).unwrap_err();
   match err {
-    Error::Backend { message } => {
+    Error::Backend(message) => {
       assert!(
         message.contains("not_an_adapter") || message.contains("adapter"),
         "error mentions the missing adapter path: {message}"
@@ -498,7 +498,7 @@ fn fuse_rejects_hf_hub_url_in_model_path() {
   )
   .unwrap_err();
   match err {
-    Error::Backend { message } => {
+    Error::Backend(message) => {
       assert!(
         message.contains("huggingface-cli download mlx-community/Qwen3-4B-bf16"),
         "actionable workaround names the bare repo-id: {message}"
@@ -529,7 +529,7 @@ fn fuse_rejects_hf_hub_url_in_adapter_path() {
   )
   .unwrap_err();
   match err {
-    Error::Backend { message } => {
+    Error::Backend(message) => {
       assert!(
         message.contains("huggingface-cli download owner/adapter-repo"),
         "actionable workaround names the bare repo-id (no protocol): {message}"
@@ -563,7 +563,7 @@ fn fuse_with_no_adapter_layers_is_err() {
 
   let err = fuse::fuse(&model_dir, &adapter_dir, &save_dir, false).unwrap_err();
   match err {
-    Error::Backend { message } => {
+    Error::Backend(message) => {
       // The postcondition's diagnostic fires from one of the three arms
       // in `check_adapter_completeness`. Here `keys=["self_attn.q_proj"]`
       // is an EXPLICIT selection that matches blocks 0 + 1 in the base
@@ -1067,7 +1067,7 @@ fn fuse_load_adapters_with_config_skips_second_adapter_config_read() {
   )
   .expect_err("load_adapters wrapper re-reads adapter_config.json and must surface the corruption");
   match err {
-    Error::Backend { message } => {
+    Error::Backend(message) => {
       assert!(
         !message.is_empty(),
         "wrapper error must carry a parse diagnostic: {message}"
@@ -1108,7 +1108,7 @@ fn fuse_rejects_source_with_missing_tokenizer() {
   let err = fuse::fuse(&model_dir, &adapter_dir, &save_dir, false)
     .expect_err("fuse() must reject a source dir missing tokenizer.json");
   match err {
-    Error::Backend { message } => {
+    Error::Backend(message) => {
       assert!(
         message.contains("tokenizer"),
         "diagnostic names the tokenizer-construction failure: {message}"
@@ -1139,8 +1139,8 @@ fn fuse_rejects_source_with_malformed_tokenizer() {
   // Same fail-fast contract as `fuse_rejects_source_with_missing_tokenizer`
   // but with a truncated `tokenizer.json` body (the parser fails inside
   // `HfTokenizer::from_file` rather than at the open). Both error paths
-  // funnel through `Error::Backend { message: "cannot load tokenizer
-  // from {}: ..." }` per `load::load_tokenizer`.
+  // funnel through `Error::Backend("cannot load tokenizer
+  // from {}: ...")` per `load::load_tokenizer`.
   let weights = toy_base_weights(2);
   let model_dir =
     write_base_dir_no_tokenizer("malformed_tok_model", &weights, &plain_config_json(2));
@@ -1158,7 +1158,7 @@ fn fuse_rejects_source_with_malformed_tokenizer() {
   let err = fuse::fuse(&model_dir, &adapter_dir, &save_dir, false)
     .expect_err("fuse() must reject a source dir with a malformed tokenizer.json");
   match err {
-    Error::Backend { message } => {
+    Error::Backend(message) => {
       assert!(
         message.contains("tokenizer"),
         "diagnostic names the tokenizer-construction failure: {message}"
@@ -1571,7 +1571,7 @@ fn fuse_cleans_up_staging_dir_on_save_failure() {
 /// stays end-to-end machine-checkable.
 fn extract_promote_error_message(err: &Error) -> String {
   match err {
-    Error::ConvertPostSavePartial { copy_error, .. } => copy_error.to_string(),
+    Error::ConvertPostSavePartial(p) => p.copy_error().to_string(),
     other => {
       panic!("expected Error::ConvertPostSavePartial wrapping the promote err, got: {other:?}")
     }
@@ -1791,7 +1791,7 @@ fn fuse_cleans_up_staging_dir_on_stale_removal_failure() {
   // Failure-injection strategy: pre-create a NON-EMPTY directory at a
   // reserved basename the source lacks. The R4 F1 fix's stale-sweep
   // hits this entry, classifies it as `directory`, and returns
-  // `Err(Error::Backend { "non-regular reserved path" })`. This is a
+  // `Err(Error::Backend{"non-regular reserved path"})`. This is a
   // mid-promote Err — exactly the path the F2 fix is required to
   // clean up (pre-R4 it leaked because `consume()` had already
   // disarmed the guard).

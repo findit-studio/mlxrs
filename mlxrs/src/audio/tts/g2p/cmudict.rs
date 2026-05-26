@@ -30,7 +30,7 @@ use crate::{
     arpabet,
     types::{Lexicon, LexiconEntry},
   },
-  error::{Error, Result},
+  error::{Error, FileIoPayload, FileOp, Result},
 };
 
 /// One row of a parsed CMUDict file, BEFORE ARPAbet→IPA conversion.
@@ -98,12 +98,10 @@ impl RawEntry {
 /// 1-indexed `line_number`, the offending `word_token`, and a short
 /// `reason` describing why the parse failed.
 fn malformed_word(word_token: &str, line_number: usize, reason: &str) -> Error {
-  Error::Backend {
-    message: format!(
-      "CMUDict line {line_number}: malformed word '{word_token}' (expected WORD or WORD(N)) — \
+  Error::Backend(format!(
+    "CMUDict line {line_number}: malformed word '{word_token}' (expected WORD or WORD(N)) — \
        {reason}"
-    ),
-  }
+  ))
 }
 
 /// Strict parse of a CMUDict word token into its base spelling and
@@ -189,20 +187,18 @@ pub fn parse_line(line: &str, line_number: usize) -> Result<Option<RawEntry>> {
   // Split on first ASCII space: word is the first token, pronunciation is
   // the rest (handles both raw `cmudict.dict` and double-space formats).
   let Some(first_space) = trimmed.find(' ') else {
-    return Err(Error::Backend {
-      message: format!(
-        "CMUDict line {line_number}: missing whitespace between word and pronunciation"
-      ),
-    });
+    return Err(Error::Backend(format!(
+      "CMUDict line {line_number}: missing whitespace between word and pronunciation"
+    )));
   };
 
   let word_part = &trimmed[..first_space];
   let pron_part = trimmed[first_space + 1..].trim();
 
   if word_part.is_empty() || pron_part.is_empty() {
-    return Err(Error::Backend {
-      message: format!("CMUDict line {line_number}: empty word or pronunciation"),
-    });
+    return Err(Error::Backend(format!(
+      "CMUDict line {line_number}: empty word or pronunciation"
+    )));
   }
 
   // Strict split of `WORD` / `WORD(N)`: any other shape errors.
@@ -215,9 +211,9 @@ pub fn parse_line(line: &str, line_number: usize) -> Result<Option<RawEntry>> {
     .map(String::from)
     .collect();
   if arpabet.is_empty() {
-    return Err(Error::Backend {
-      message: format!("CMUDict line {line_number}: empty pronunciation"),
-    });
+    return Err(Error::Backend(format!(
+      "CMUDict line {line_number}: empty pronunciation"
+    )));
   }
 
   Ok(Some(RawEntry::new(word, arpabet, variant, line_number)))
@@ -286,23 +282,20 @@ impl CMUDict {
   pub fn from_raw_entries(raw: impl IntoIterator<Item = RawEntry>) -> Result<Self> {
     let mut entries = Vec::new();
     for r in raw {
-      let phonemes =
-        arpabet::try_convert_sequence_strict(r.arpabet()).map_err(|bad| Error::Backend {
-          message: format!(
-            "CMUDict line {}: word '{}' has unknown ARPAbet token '{}'",
-            r.line_number(),
-            r.word(),
-            bad.token(),
-          ),
-        })?;
+      let phonemes = arpabet::try_convert_sequence_strict(r.arpabet()).map_err(|bad| {
+        Error::Backend(format!(
+          "CMUDict line {}: word '{}' has unknown ARPAbet token '{}'",
+          r.line_number(),
+          r.word(),
+          bad.token(),
+        ))
+      })?;
       if phonemes.is_empty() {
-        return Err(Error::Backend {
-          message: format!(
-            "CMUDict line {}: word '{}' has empty pronunciation after ARPAbet → IPA conversion",
-            r.line_number(),
-            r.word(),
-          ),
-        });
+        return Err(Error::Backend(format!(
+          "CMUDict line {}: word '{}' has empty pronunciation after ARPAbet → IPA conversion",
+          r.line_number(),
+          r.word(),
+        )));
       }
       entries.push(LexiconEntry::new(r.word().to_owned(), phonemes));
     }
@@ -348,13 +341,19 @@ impl CMUDictLoader {
   pub fn load(directory: &Path) -> Result<CMUDict> {
     let path = directory.join("cmudict.dict");
     if !path.exists() {
-      return Err(Error::Backend {
-        message: format!("cmudict.dict missing at {}", path.display()),
-      });
+      return Err(Error::Backend(format!(
+        "cmudict.dict missing at {}",
+        path.display()
+      )));
     }
 
-    let bytes = fs::read(&path).map_err(|e| Error::Backend {
-      message: format!("read {} failed: {e}", path.display()),
+    let bytes = fs::read(&path).map_err(|e| {
+      Error::FileIo(FileIoPayload::new(
+        "read",
+        FileOp::Read,
+        path.to_path_buf(),
+        e,
+      ))
     })?;
 
     // UTF-8 first, then Latin-1 (every byte sequence is valid Latin-1, so

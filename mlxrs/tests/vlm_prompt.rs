@@ -1216,7 +1216,7 @@ fn get_message_json_extreme_num_images_returns_oom_error() {
   // Must be either Backend (cap-exceeded) or OutOfMemory — both are
   // recoverable, neither panics.
   assert!(
-    matches!(err, Error::Backend { .. } | Error::OutOfMemory),
+    matches!(err, Error::Backend(_) | Error::OutOfMemory),
     "expected Backend/OutOfMemory, got: {err:?}"
   );
   let msg = format!("{err}");
@@ -1313,7 +1313,7 @@ fn format_message_extreme_num_audios_returns_cap_error() {
     )
     .unwrap_err();
   assert!(
-    matches!(err, Error::Backend { .. }),
+    matches!(err, Error::Backend(_)),
     "expected Backend (cap-exceeded), got: {err:?}"
   );
   let msg = format!("{err}");
@@ -1342,7 +1342,7 @@ fn format_message_video_count_above_cap_returns_error() {
   )
   .unwrap_err();
   assert!(
-    matches!(err, Error::Backend { .. }),
+    matches!(err, Error::Backend(_)),
     "expected Backend (cap-exceeded), got: {err:?}"
   );
   let msg = format!("{err}");
@@ -1430,7 +1430,7 @@ fn format_message_paligemma_extreme_num_images_returns_cap_error() {
   // paligemma is in SINGLE_IMAGE_ONLY_MODELS, so the
   // num_images > 1 guard fires first as ShapeMismatch.
   assert!(
-    matches!(err, Error::ShapeMismatch { .. }),
+    matches!(err, Error::ShapeMismatch(_)),
     "expected ShapeMismatch (single-image guard), got: {err:?}"
   );
 
@@ -1451,7 +1451,7 @@ fn format_message_paligemma_extreme_num_images_returns_cap_error() {
     )
     .unwrap_err();
   assert!(
-    matches!(err, Error::Backend { .. }),
+    matches!(err, Error::Backend(_)),
     "expected Backend (cap-exceeded) on PromptWithImageToken cap, got: {err:?}"
   );
   let msg = format!("{err}");
@@ -1484,7 +1484,7 @@ fn format_message_paligemma_num_images_overflow_returns_error() {
     )
     .unwrap_err();
   assert!(
-    matches!(err, Error::Backend { .. } | Error::OutOfMemory),
+    matches!(err, Error::Backend(_) | Error::OutOfMemory),
     "expected Backend or OutOfMemory (no panic), got: {err:?}"
   );
 }
@@ -1564,7 +1564,7 @@ fn format_message_prompt_with_start_image_token_extreme_num_images_returns_cap_e
     )
     .unwrap_err();
   assert!(
-    matches!(err, Error::Backend { .. }),
+    matches!(err, Error::Backend(_)),
     "expected Backend (cap-exceeded), got: {err:?}"
   );
   let msg = format!("{err}");
@@ -1593,7 +1593,7 @@ fn format_message_prompt_with_start_image_token_num_images_overflow_returns_erro
     )
     .unwrap_err();
   assert!(
-    matches!(err, Error::Backend { .. } | Error::OutOfMemory),
+    matches!(err, Error::Backend(_) | Error::OutOfMemory),
     "expected Backend or OutOfMemory (no panic), got: {err:?}"
   );
 }

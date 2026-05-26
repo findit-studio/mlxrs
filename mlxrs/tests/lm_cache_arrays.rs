@@ -244,7 +244,7 @@ fn update_returns_err_not_kv() {
   let mut c = ArraysCache::new(2);
   let a = slot(&[1.0]);
   let err = c.update(&a, &a).unwrap_err();
-  assert!(matches!(err, Error::Backend { .. }));
+  assert!(matches!(err, Error::Backend(_)));
 }
 
 #[test]
@@ -472,7 +472,7 @@ fn set_meta_state_rejects_slot_count_above_max_cap() {
   let meta = vec![just_over.to_string(), "0,1".into()];
   let err = d.set_meta_state(&meta);
   match err {
-    Err(Error::Backend { message }) => {
+    Err(Error::Backend(message)) => {
       assert!(
         message.contains("exceeds MAX_SLOT_COUNT"),
         "expected message to mention MAX_SLOT_COUNT, got: {message}"
@@ -524,7 +524,7 @@ fn kvc2_arrayscache_rejects_huge_slot_count_before_csv_parse() {
     .join(",");
   let meta = vec![huge_slot_count, big_payload.clone()];
   match d.set_meta_state(&meta) {
-    Err(Error::Backend { message }) => {
+    Err(Error::Backend(message)) => {
       assert!(
         message.contains("exceeds MAX_SLOT_COUNT"),
         "cap MUST fire first: expected MAX_SLOT_COUNT error, got: {message}"
@@ -544,7 +544,7 @@ fn kvc2_arrayscache_rejects_huge_slot_count_before_csv_parse() {
   // evasion where slot_count itself is small but the CSV is hostile.
   let meta_small_count_huge_csv = vec!["1".to_string(), big_payload];
   match d.set_meta_state(&meta_small_count_huge_csv) {
-    Err(Error::Backend { message }) => {
+    Err(Error::Backend(message)) => {
       assert!(
         message.contains("element count") && message.contains("exceeds bound"),
         "CSV bound MUST fire before token parse: expected element-count error, got: {message}"
@@ -579,7 +579,7 @@ fn kvc2_arrayscache_csv_bound_rejects_oversized_left_padding() {
   // slot_count=2, presentSlots="0,1" (in-bound), leftPadding=10000 entries.
   let meta = vec!["2".to_string(), "0,1".to_string(), huge_lp_csv];
   match d.set_meta_state(&meta) {
-    Err(Error::Backend { message }) => {
+    Err(Error::Backend(message)) => {
       assert!(
         message.contains("element count") && message.contains("exceeds bound"),
         "leftPadding CSV bound must fire: expected element-count error, got: {message}"

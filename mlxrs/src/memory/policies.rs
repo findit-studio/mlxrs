@@ -507,10 +507,10 @@ pub fn tune(
   _prefill_step_size: usize,
   _streams: &[Stream],
 ) -> Result<WiredMemoryMeasurement> {
-  Err(Error::Backend {
-    message: "WiredMemoryUtils::tune not yet implemented — requires the \
+  Err(Error::Backend(
+    "WiredMemoryUtils::tune not yet implemented — requires the \
               mlxrs LM concurrency surface (Model::prefill_only) which is \
               still a stub. See issue #168 / LM-L6 follow-up."
       .into(),
-  })
+  ))
 }

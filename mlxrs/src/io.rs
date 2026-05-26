@@ -66,8 +66,11 @@ fn io_cpu_stream() -> mlxrs_sys::mlx_stream {
 
 /// Convert a path to a NUL-terminated C string, rejecting embedded NULs.
 fn path_cstring(path: &Path) -> Result<CString> {
-  CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| Error::Backend {
-    message: format!("path contains an interior NUL byte: {}", path.display()),
+  CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
+    Error::Backend(format!(
+      "path contains an interior NUL byte: {}",
+      path.display()
+    ))
   })
 }
 
@@ -291,14 +294,13 @@ where
   // on this thread).
   if guard.0.ctx.is_null() {
     let last = crate::error::take_last();
-    return Err(last.unwrap_or(Error::Backend {
-      message: "mlx_map_string_to_array_new() returned NULL sentinel (allocation failure)".into(),
-    }));
+    return Err(last.unwrap_or(Error::Backend(
+      "mlx_map_string_to_array_new() returned NULL sentinel (allocation failure)".into(),
+    )));
   }
   for (k, v) in arrays {
-    let ck = CString::new(k).map_err(|_| Error::Backend {
-      message: format!("array key contains an interior NUL byte: {k:?}"),
-    })?;
+    let ck = CString::new(k)
+      .map_err(|_| Error::Backend(format!("array key contains an interior NUL byte: {k:?}")))?;
     // SAFETY: `guard.0` is the valid handle from above; `ck.as_ptr()` is a
     // valid NUL-terminated C string that outlives the call (`ck` still in
     // scope); `v.0` is a valid borrowed `mlx_array`. mlx-c copies the key
@@ -341,16 +343,17 @@ fn build_string_map(meta: &HashMap<String, String>) -> Result<mlxrs_sys::mlx_map
   // poison the next unrelated mlx-c call on this thread).
   if guard.0.ctx.is_null() {
     let last = crate::error::take_last();
-    return Err(last.unwrap_or(Error::Backend {
-      message: "mlx_map_string_to_string_new() returned NULL sentinel (allocation failure)".into(),
-    }));
+    return Err(last.unwrap_or(Error::Backend(
+      "mlx_map_string_to_string_new() returned NULL sentinel (allocation failure)".into(),
+    )));
   }
   for (k, v) in meta {
-    let ck = CString::new(k.as_str()).map_err(|_| Error::Backend {
-      message: format!("metadata key contains an interior NUL byte: {k:?}"),
-    })?;
-    let cv = CString::new(v.as_str()).map_err(|_| Error::Backend {
-      message: format!("metadata value contains an interior NUL byte: {v:?}"),
+    let ck = CString::new(k.as_str())
+      .map_err(|_| Error::Backend(format!("metadata key contains an interior NUL byte: {k:?}")))?;
+    let cv = CString::new(v.as_str()).map_err(|_| {
+      Error::Backend(format!(
+        "metadata value contains an interior NUL byte: {v:?}"
+      ))
     })?;
     // SAFETY: `guard.0` is the valid handle from above; `ck`/`cv` are valid
     // NUL-terminated C strings still in scope for the call. mlx-c copies both
@@ -654,9 +657,9 @@ where
   // declaration order); `state` is Drop-less.
   if writer_guard.0.ctx.is_null() {
     let last = crate::error::take_last();
-    return Err(last.unwrap_or(Error::Backend {
-      message: "mlx_io_writer_new() returned NULL sentinel (allocation failure)".into(),
-    }));
+    return Err(last.unwrap_or(Error::Backend(
+      "mlx_io_writer_new() returned NULL sentinel (allocation failure)".into(),
+    )));
   }
   // Now that every fallible Rust- and FFI-level setup step has confirmed
   // Ok / non-NULL handles, rewind the file to byte 0 and truncate to a
@@ -681,11 +684,15 @@ where
   // comment. Do NOT route through the path-taking
   // `save_safetensors_view` for atomic replacement: it reopens by name
   // and reintroduces the TOCTOU window this API was built to close.
-  file.seek(SeekFrom::Start(0)).map_err(|e| Error::Backend {
-    message: format!("save_safetensors_to_file: failed to rewind file to byte 0: {e}"),
+  file.seek(SeekFrom::Start(0)).map_err(|e| {
+    Error::Backend(format!(
+      "save_safetensors_to_file: failed to rewind file to byte 0: {e}"
+    ))
   })?;
-  file.set_len(0).map_err(|e| Error::Backend {
-    message: format!("save_safetensors_to_file: failed to truncate file: {e}"),
+  file.set_len(0).map_err(|e| {
+    Error::Backend(format!(
+      "save_safetensors_to_file: failed to truncate file: {e}"
+    ))
   })?;
   // SAFETY: `writer` is the valid populated handle owned by `writer_guard`,
   // valid for the duration of this call. `amap` / `mmap` are valid
@@ -704,9 +711,9 @@ where
   // A captured io::Error from the write callback takes precedence over the
   // mlx-c rc (mlx-c will have raised once the write failed; rc != 0).
   if let Some(e) = state.into_err() {
-    return Err(Error::Backend {
-      message: format!("save_safetensors_to_file: write callback failed: {e}"),
-    });
+    return Err(Error::Backend(format!(
+      "save_safetensors_to_file: write callback failed: {e}"
+    )));
   }
   check(rc)?;
   Ok(())
@@ -1058,9 +1065,8 @@ pub fn load_gguf(path: &Path) -> Result<(HashMap<String, Array>, HashMap<String,
     let key = unsafe { CStr::from_ptr(raw) }
       .to_string_lossy()
       .into_owned();
-    let ckey = CString::new(key.as_str()).map_err(|_| Error::Backend {
-      message: format!("gguf key contains an interior NUL byte: {key:?}"),
-    })?;
+    let ckey = CString::new(key.as_str())
+      .map_err(|_| Error::Backend(format!("gguf key contains an interior NUL byte: {key:?}")))?;
 
     let mut f_arr = false;
     // SAFETY: `&mut f_arr` is a valid `bool` out-param; `gguf` is the valid
@@ -1185,8 +1191,10 @@ pub fn save_gguf(
   let guard = GgufGuard(gguf);
 
   for (k, v) in weights {
-    let ck = CString::new(k.as_str()).map_err(|_| Error::Backend {
-      message: format!("gguf weight key contains an interior NUL byte: {k:?}"),
+    let ck = CString::new(k.as_str()).map_err(|_| {
+      Error::Backend(format!(
+        "gguf weight key contains an interior NUL byte: {k:?}"
+      ))
     })?;
     // SAFETY: `gguf` is the valid handle owned by `guard`; `ck.as_ptr()` is a
     // valid in-scope NUL-terminated C string; `v.0` is a valid borrowed
@@ -1196,8 +1204,10 @@ pub fn save_gguf(
   }
 
   for (k, v) in metadata {
-    let ck = CString::new(k.as_str()).map_err(|_| Error::Backend {
-      message: format!("gguf metadata key contains an interior NUL byte: {k:?}"),
+    let ck = CString::new(k.as_str()).map_err(|_| {
+      Error::Backend(format!(
+        "gguf metadata key contains an interior NUL byte: {k:?}"
+      ))
     })?;
     match v {
       GgufMetadata::Array(arr) => {
@@ -1208,8 +1218,10 @@ pub fn save_gguf(
         check(unsafe { mlxrs_sys::mlx_io_gguf_set_metadata_array(gguf, ck.as_ptr(), arr.0) })?;
       }
       GgufMetadata::String(s) => {
-        let cs = CString::new(s.as_str()).map_err(|_| Error::Backend {
-          message: format!("gguf metadata string contains an interior NUL byte: {s:?}"),
+        let cs = CString::new(s.as_str()).map_err(|_| {
+          Error::Backend(format!(
+            "gguf metadata string contains an interior NUL byte: {s:?}"
+          ))
         })?;
         // SAFETY: `gguf` is the valid handle owned by `guard`; `ck` and `cs`
         // are valid in-scope NUL-terminated C strings. mlx-c copies both into
@@ -1227,8 +1239,10 @@ pub fn save_gguf(
         let vstr = unsafe { mlxrs_sys::mlx_vector_string_new() };
         let vstr_guard = VectorStringGuard(vstr);
         for s in list {
-          let cs = CString::new(s.as_str()).map_err(|_| Error::Backend {
-            message: format!("gguf metadata list entry contains an interior NUL byte: {s:?}"),
+          let cs = CString::new(s.as_str()).map_err(|_| {
+            Error::Backend(format!(
+              "gguf metadata list entry contains an interior NUL byte: {s:?}"
+            ))
           })?;
           // SAFETY: `vstr` is the valid vector owned by `vstr_guard`; `cs` is
           // a valid in-scope NUL-terminated C string. mlx-c `push_back`s a
