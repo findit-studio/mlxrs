@@ -29,6 +29,7 @@ use std::{
 
 use mlxrs::{
   Array, Error,
+  error::RankMismatchPayload,
   lm::{
     cache::{CacheConfig, KvCache, make_prompt_cache},
     generate::GenConfig,
@@ -155,8 +156,10 @@ impl LmModel for MockVlmModel {
       [b, s] => (*b, *s),
       [s] => (1, *s),
       _ => {
-        return Err(Error::ShapeMismatch(format!(
-          "MockVlmModel::forward expects [B, S] tokens, got {shape:?}"
+        return Err(Error::RankMismatch(RankMismatchPayload::new(
+          "MockVlmModel::forward expects [B, S] tokens (rank 1 or 2)",
+          shape.len() as u32,
+          shape.clone(),
         )));
       }
     };
@@ -187,8 +190,10 @@ impl LmModel for MockVlmModel {
     let (batch, seq) = match shape.as_slice() {
       [b, s, _d] => (*b, *s),
       _ => {
-        return Err(Error::ShapeMismatch(format!(
-          "MockVlmModel::forward_embeddings expects [B, T, D], got {shape:?}"
+        return Err(Error::RankMismatch(RankMismatchPayload::new(
+          "MockVlmModel::forward_embeddings expects [B, T, D] (rank 3)",
+          shape.len() as u32,
+          shape.clone(),
         )));
       }
     };
@@ -214,8 +219,10 @@ impl VlmModel for MockVlmModel {
     let (b, t) = match shape.as_slice() {
       [b, t] => (*b, *t),
       _ => {
-        return Err(Error::ShapeMismatch(format!(
-          "MockVlmModel::embed_tokens expects [B, T], got {shape:?}"
+        return Err(Error::RankMismatch(RankMismatchPayload::new(
+          "MockVlmModel::embed_tokens expects [B, T] (rank 2)",
+          shape.len() as u32,
+          shape.clone(),
         )));
       }
     };
@@ -487,10 +494,9 @@ fn vlm_generate_marker_required_missing_errors() {
   match res {
     Ok(_) => panic!("expected Err on missing marker under Required policy"),
     Err(e) => {
-      let msg = format!("{e}");
       assert!(
-        msg.contains("no image_marker_id"),
-        "unexpected message: {msg}"
+        matches!(e, Error::MissingField(_)),
+        "expected MissingField under MarkerPolicy::Required, got: {e:?}"
       );
     }
   }
@@ -786,24 +792,42 @@ fn default_merge_embeddings_rejects_wrong_image_shape() {
 
 #[test]
 fn default_merge_embeddings_rejects_dim_mismatch() {
-  // text_embeds D = 4, image_embeds D = 8 ⇒ ShapeMismatch.
+  // text_embeds D = 4, image_embeds D = 8 ⇒ LengthMismatch on hidden-dim D.
   let text = Array::from_slice::<f32>(&[0.0_f32; 5 * 4], &(1_usize, 5, 4)).unwrap();
   let img = Array::from_slice::<f32>(&[0.0_f32; 3 * 8], &(3_usize, 8_usize)).unwrap();
   let res = default_merge(&text, &img, &[(1_usize, 4_usize)]);
-  assert!(res.is_err());
-  let msg = format!("{}", res.unwrap_err());
-  assert!(msg.contains("hidden-dim mismatch"), "unexpected: {msg}");
+  match res.unwrap_err() {
+    Error::LengthMismatch(p) => {
+      assert!(
+        p.context().contains("hidden-dim D"),
+        "expected context to name hidden-dim D, got: {}",
+        p.context()
+      );
+      assert_eq!(p.expected(), 4);
+      assert_eq!(p.actual(), 8);
+    }
+    e => panic!("expected LengthMismatch, got: {e:?}"),
+  }
 }
 
 #[test]
 fn default_merge_embeddings_rejects_width_sum_mismatch() {
-  // image_embeds has 3 rows, spans sum to 2 ⇒ ShapeMismatch.
+  // image_embeds has 3 rows, spans sum to 2 ⇒ LengthMismatch (expected =
+  // caller-supplied placeholder span sum, actual = image_embeds row count).
   let text = Array::from_slice::<f32>(&[0.0_f32; 5 * 4], &(1_usize, 5, 4)).unwrap();
   let img = Array::from_slice::<f32>(&[0.0_f32; 3 * 4], &(3_usize, 4_usize)).unwrap();
   let res = default_merge(&text, &img, &[(1_usize, 3_usize)]); // width = 2, N = 3
-  assert!(res.is_err());
-  let msg = format!("{}", res.unwrap_err());
-  assert!(msg.contains("sum of span widths"), "unexpected: {msg}");
+  match res.unwrap_err() {
+    Error::LengthMismatch(p) => {
+      assert_eq!(
+        p.expected(),
+        2,
+        "expected = sum of caller-supplied span widths"
+      );
+      assert_eq!(p.actual(), 3, "actual = image_embeds row count");
+    }
+    e => panic!("expected LengthMismatch, got: {e:?}"),
+  }
 }
 
 #[test]
@@ -813,9 +837,10 @@ fn default_merge_embeddings_rejects_empty_spans() {
   let text = Array::from_slice::<f32>(&[0.0_f32; 5 * 4], &(1_usize, 5, 4)).unwrap();
   let img = Array::from_slice::<f32>(&[0.0_f32; 3 * 4], &(3_usize, 4_usize)).unwrap();
   let res = default_merge(&text, &img, &[]);
-  assert!(res.is_err());
-  let msg = format!("{}", res.unwrap_err());
-  assert!(msg.contains("image_spans is empty"), "unexpected: {msg}");
+  assert!(
+    matches!(res.unwrap_err(), Error::EmptyInput(_)),
+    "expected EmptyInput for empty image_spans"
+  );
 }
 
 #[test]
@@ -1008,13 +1033,13 @@ fn vlm_generate_rejects_per_image_shape_mismatch() {
   );
   match res {
     Ok(_) => panic!("expected Err on variable per-image encoder output"),
-    Err(e) => {
-      let msg = format!("{e}");
-      assert!(
-        msg.contains("image #0") && msg.contains("2 feature rows"),
-        "unexpected: {msg}"
-      );
-    }
+    Err(e) => match &e {
+      Error::LengthMismatch(p) => {
+        assert_eq!(p.expected(), 3, "expected = cfg.num_tokens_per_image");
+        assert_eq!(p.actual(), 2, "actual = encoded rows");
+      }
+      _ => panic!("expected LengthMismatch, got: {e:?}"),
+    },
   }
 }
 

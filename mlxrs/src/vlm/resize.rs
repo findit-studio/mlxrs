@@ -97,7 +97,10 @@
 //! feature: the dispatch is always-on. (This is self-contained in `vlm`;
 //! it can be refactored into a shared `mlxrs::simd` module later.)
 
-use crate::error::{Error, Result, try_with_capacity};
+use crate::error::{
+  ArithmeticOverflowPayload, CapExceededPayload, Error, LengthMismatchPayload, OutOfRangePayload,
+  Result, try_with_capacity,
+};
 
 /// Interpolation filter for [`resize_rgba8`], mirroring PIL's resampling
 /// filters. The variants line up 1:1 with
@@ -161,23 +164,27 @@ const MAX_DECODED_IMAGE_BYTES: usize = 512 * 1024 * 1024;
 /// faults (and kills the process) when the caller's zero-fill touches the
 /// pages. This ceiling check makes the *request itself* recoverable.
 ///
-/// `what` names the buffer (with its dimensions) for the error message.
+/// `what` is a static call-site label identifying the buffer (e.g.
+/// `"coefficient bounds table"`, `"RGBA8 source"`).
 ///
 /// # Errors
-/// [`Error::ShapeMismatch`] if `elems * elem_size` overflows `usize` or
-/// exceeds [`MAX_DECODED_IMAGE_BYTES`]; the message carries `what` and the
-/// offending byte count.
-fn checked_buffer_bytes(elems: usize, elem_size: usize, what: &str) -> Result<usize> {
+/// - [`Error::ArithmeticOverflow`] if `elems * elem_size` overflows `usize`.
+/// - [`Error::CapExceeded`] if `elems * elem_size` exceeds
+///   [`MAX_DECODED_IMAGE_BYTES`].
+fn checked_buffer_bytes(elems: usize, elem_size: usize, what: &'static str) -> Result<usize> {
   let bytes = elems.checked_mul(elem_size).ok_or_else(|| {
-    Error::ShapeMismatch(format!(
-      "resize: {what} size overflows usize ({elems} elems * {elem_size} B/elem)"
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "resize: buffer size (elems * elem_size)",
+      "usize",
+      [("elems", elems as u64), ("elem_size", elem_size as u64)],
     ))
   })?;
   if bytes > MAX_DECODED_IMAGE_BYTES {
-    return Err(Error::ShapeMismatch(format!(
-      "resize: {what} needs {bytes} bytes, exceeds \
-         MAX_DECODED_IMAGE_BYTES={MAX_DECODED_IMAGE_BYTES} \
-         ({elems} elems * {elem_size} B/elem)"
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      what,
+      "MAX_DECODED_IMAGE_BYTES",
+      MAX_DECODED_IMAGE_BYTES as u64,
+      bytes as u64,
     )));
   }
   Ok(bytes)
@@ -281,9 +288,18 @@ fn precompute_coeffs(in_size: usize, out_size: usize, filter: Filter) -> Result<
   // Caller guarantees non-zero, but guard defensively: a zero `out_size`
   // would divide by zero in `scale`, a zero `in_size` makes the window
   // empty.
-  if in_size == 0 || out_size == 0 {
-    return Err(Error::ShapeMismatch(format!(
-      "precompute_coeffs: in_size={in_size} out_size={out_size} must be non-zero"
+  if in_size == 0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "precompute_coeffs: in_size",
+      "must be non-zero",
+      format!("{in_size}"),
+    )));
+  }
+  if out_size == 0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "precompute_coeffs: out_size",
+      "must be non-zero",
+      format!("{out_size}"),
     )));
   }
   let scale = in_size as f64 / out_size as f64;
@@ -296,8 +312,10 @@ fn precompute_coeffs(in_size: usize, out_size: usize, filter: Filter) -> Result<
     .checked_mul(2)
     .and_then(|v| v.checked_add(1))
     .ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "precompute_coeffs: ksize overflows for support={support}"
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "precompute_coeffs: ksize (ceil(support) * 2 + 1)",
+        "usize",
+        [("ceil(support)", support.ceil() as u64)],
       ))
     })?;
   let ksize = ksize_unclamped.min(in_size.max(1));
@@ -319,8 +337,10 @@ fn precompute_coeffs(in_size: usize, out_size: usize, filter: Filter) -> Result<
   // otherwise reserve a multi-GiB coefficient table that
   // `try_reserve_exact` cannot bound on an overcommitting allocator.
   let weight_len = out_size.checked_mul(ksize).ok_or_else(|| {
-    Error::ShapeMismatch(format!(
-      "precompute_coeffs: out_size*ksize overflows for {out_size}*{ksize}"
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "precompute_coeffs: weight_len (out_size * ksize)",
+      "usize",
+      [("out_size", out_size as u64), ("ksize", ksize as u64)],
     ))
   })?;
   checked_buffer_bytes(
@@ -446,42 +466,78 @@ pub(crate) fn resize_rgba8(
   dst_h: usize,
   filter: Filter,
 ) -> Result<Vec<u8>> {
-  if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
-    return Err(Error::ShapeMismatch(format!(
-      "resize_rgba8: dimensions must be non-zero, got src {src_w}x{src_h} dst {dst_w}x{dst_h}"
+  if src_w == 0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "resize_rgba8: src_w",
+      "must be non-zero",
+      format!("{src_w}"),
+    )));
+  }
+  if src_h == 0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "resize_rgba8: src_h",
+      "must be non-zero",
+      format!("{src_h}"),
+    )));
+  }
+  if dst_w == 0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "resize_rgba8: dst_w",
+      "must be non-zero",
+      format!("{dst_w}"),
+    )));
+  }
+  if dst_h == 0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "resize_rgba8: dst_h",
+      "must be non-zero",
+      format!("{dst_h}"),
     )));
   }
   let src_len = src_w
     .checked_mul(src_h)
     .and_then(|v| v.checked_mul(CHANNELS))
     .ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "resize_rgba8: src_w*src_h*4 overflows usize for {src_w}x{src_h}"
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "resize_rgba8: src_len (src_w * src_h * CHANNELS)",
+        "usize",
+        [
+          ("src_w", src_w as u64),
+          ("src_h", src_h as u64),
+          ("CHANNELS", CHANNELS as u64),
+        ],
       ))
     })?;
   if src.len() != src_len {
-    return Err(Error::ShapeMismatch(format!(
-      "resize_rgba8: src buffer is {} bytes, expected src_w*src_h*4={src_len} for {src_w}x{src_h}",
-      src.len()
+    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+      "resize_rgba8: src buffer bytes vs src_w * src_h * CHANNELS",
+      src_len,
+      src.len(),
     )));
   }
   // Cap the source against the 512 MiB budget too: `src` is borrowed (not
   // allocated here), but the premultiplied copy below is `src.len()` bytes
   // — and a direct caller (not the public `resize` wrapper) has no other
   // guard. `src_len` already cleared the overflow check above.
-  checked_buffer_bytes(src_len, 1, &format!("RGBA8 source ({src_w}x{src_h})"))?;
+  checked_buffer_bytes(src_len, 1, "resize_rgba8: RGBA8 source")?;
   let dst_len = dst_w
     .checked_mul(dst_h)
     .and_then(|v| v.checked_mul(CHANNELS))
     .ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "resize_rgba8: dst_w*dst_h*4 overflows usize for {dst_w}x{dst_h}"
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "resize_rgba8: dst_len (dst_w * dst_h * CHANNELS)",
+        "usize",
+        [
+          ("dst_w", dst_w as u64),
+          ("dst_h", dst_h as u64),
+          ("CHANNELS", CHANNELS as u64),
+        ],
       ))
     })?;
   // Cap the destination against the 512 MiB budget. The public `resize`
   // wrapper already bounds it, but `resize_rgba8` is `pub(crate)` and may
   // be called directly — every entry path is covered here.
-  checked_buffer_bytes(dst_len, 1, &format!("destination ({dst_w}x{dst_h} RGBA8)"))?;
+  checked_buffer_bytes(dst_len, 1, "resize_rgba8: destination RGBA8")?;
 
   if filter == Filter::Nearest {
     // PIL exempts `NEAREST` from premultiplication: it is a pure pixel
@@ -531,14 +587,20 @@ pub(crate) fn resize_rgba8(
     .checked_mul(dst_w)
     .and_then(|v| v.checked_mul(CHANNELS))
     .ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "resize_rgba8: src_h*dst_w*4 overflows usize for {src_h}x{dst_w}"
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "resize_rgba8: inter_len (src_h * dst_w * CHANNELS)",
+        "usize",
+        [
+          ("src_h", src_h as u64),
+          ("dst_w", dst_w as u64),
+          ("CHANNELS", CHANNELS as u64),
+        ],
       ))
     })?;
   checked_buffer_bytes(
     inter_len,
     1,
-    &format!("horizontal-pass intermediate ({src_h}x{dst_w} RGBA8)"),
+    "resize_rgba8: horizontal-pass intermediate RGBA8",
   )?;
   let mut inter: Vec<u8> = try_with_capacity(inter_len)?;
   inter.resize(inter_len, 0u8);
@@ -672,7 +734,7 @@ fn resize_nearest(
   checked_buffer_bytes(
     dst_w,
     std::mem::size_of::<usize>(),
-    &format!("nearest x-index map ({dst_w} columns)"),
+    "resize_nearest: x-index map",
   )?;
   let mut xmap: Vec<usize> = try_with_capacity(dst_w)?;
   for ox in 0..dst_w {
@@ -682,11 +744,7 @@ fn resize_nearest(
   // Cap the destination too — `resize_rgba8` already caps `dst_len` before
   // the dispatch, but a direct caller of `resize_nearest` has no other
   // guard.
-  checked_buffer_bytes(
-    dst_len,
-    1,
-    &format!("nearest destination ({dst_len} bytes)"),
-  )?;
+  checked_buffer_bytes(dst_len, 1, "resize_nearest: destination RGBA8")?;
   let mut dst: Vec<u8> = try_with_capacity(dst_len)?;
   dst.resize(dst_len, 0u8);
   for oy in 0..dst_h {
@@ -1116,29 +1174,30 @@ mod tests {
         Filter::Bilinear,
       );
       assert!(
-        matches!(r, Err(Error::ShapeMismatch(_))),
-        "zero dim {sw}x{sh}->{dw}x{dh} must be ShapeMismatch, got {r:?}"
+        matches!(r, Err(Error::OutOfRange(_))),
+        "zero dim {sw}x{sh}->{dw}x{dh} must be OutOfRange, got {r:?}"
       );
     }
   }
 
   #[test]
   fn rejects_src_buffer_length_mismatch() {
-    // src buffer too short for the claimed dims -> ShapeMismatch (not a
+    // src buffer too short for the claimed dims -> LengthMismatch (not a
     // panic / OOB read).
     let src = [0u8; 4]; // claims 4 bytes but we say 2x2 (needs 16)
     let r = resize_rgba8(&src, 2, 2, 1, 1, Filter::Bilinear);
-    assert!(matches!(r, Err(Error::ShapeMismatch(_))), "got {r:?}");
+    assert!(matches!(r, Err(Error::LengthMismatch(_))), "got {r:?}");
   }
 
   #[test]
   fn rejects_overflowing_dst_product() {
-    // dst_w * dst_h * 4 overflows usize -> ShapeMismatch (the structural
-    // try_reserve guard's overflow branch). Use usize::MAX-ish dims.
+    // dst_w * dst_h * 4 overflows usize -> ArithmeticOverflow (the
+    // structural try_reserve guard's overflow branch). Use usize::MAX-ish
+    // dims.
     let src = [0u8; 4];
     let big = usize::MAX / 2 + 1;
     let r = resize_rgba8(&src, 1, 1, big, big, Filter::Bilinear);
-    assert!(matches!(r, Err(Error::ShapeMismatch(_))), "got {r:?}");
+    assert!(matches!(r, Err(Error::ArithmeticOverflow(_))), "got {r:?}");
   }
 
   #[test]
@@ -1156,17 +1215,16 @@ mod tests {
     let src = vec![0u8; 131072 * CHANNELS];
     for f in [Filter::Bilinear, Filter::Bicubic, Filter::Lanczos3] {
       let r = resize_rgba8(&src, 1, 131072, 131072, 1, f);
-      assert!(
-        matches!(r, Err(Error::ShapeMismatch(_))),
-        "{f:?}: 1x131072->131072x1 must reject the ~68 GiB intermediate, got {r:?}"
-      );
-      // The message must name the intermediate + its byte count so the
-      // failure is diagnosable.
-      if let Err(Error::ShapeMismatch(message)) = &r {
-        assert!(
-          message.contains("intermediate"),
-          "{f:?}: error should name the intermediate buffer, got: {message}"
-        );
+      match &r {
+        Err(Error::CapExceeded(p)) => {
+          assert_eq!(p.cap_name(), "MAX_DECODED_IMAGE_BYTES");
+          assert!(
+            p.context().contains("intermediate"),
+            "{f:?}: CapExceeded context should name the intermediate buffer, got: {}",
+            p.context()
+          );
+        }
+        _ => panic!("{f:?}: 1x131072->131072x1 must reject the ~68 GiB intermediate, got {r:?}"),
       }
     }
   }
@@ -1193,7 +1251,7 @@ mod tests {
           131072 * CHANNELS,
           "{f:?}: wide->skinny output must be exactly dst_w*dst_h*4"
         ),
-        Err(Error::ShapeMismatch(_)) => {}
+        Err(Error::CapExceeded(_)) | Err(Error::OutOfMemory) => {}
         Err(other) => panic!("{f:?}: unexpected error {other:?}"),
       }
     }
@@ -1204,59 +1262,37 @@ mod tests {
     // The horizontal-pass intermediate is `src_h * dst_w * 4` — it blows
     // up only when BOTH `src_h` (input height) and `dst_w` (untrusted
     // target width) are large, which is exactly the gap the public
-    // `resize` wrapper's source/destination caps miss. A `1x131072`
-    // source (`src_h = 131072`) resized to a `131072`-WIDE, 1-tall target
-    // gives a 512 KiB source, a 512 KiB destination, and an intermediate
-    // of `131072 * 131072 * 4` ≈ 68 GiB. Use `dst_h = 1` so the
-    // destination stays tiny and ONLY the intermediate trips the cap —
-    // this proves the intermediate guard fires, not the destination
-    // guard. (Same shape as `rejects_skinny_to_wide_oversized_intermediate`
-    // but kept distinct to document the both-ends-tiny adversarial framing
-    // explicitly.)
+    // `resize` wrapper's source/destination caps miss.
     let src = vec![7u8; 131072 * CHANNELS];
     let r = resize_rgba8(&src, 1, 131072, 131072, 1, Filter::Bicubic);
     assert!(
-      matches!(r, Err(Error::ShapeMismatch(_))),
-      "huge intermediate with tiny source+dest must be ShapeMismatch, got {r:?}"
+      matches!(r, Err(Error::CapExceeded(_))),
+      "huge intermediate with tiny source+dest must be CapExceeded, got {r:?}"
     );
   }
 
   #[test]
   fn rejects_oversized_coefficient_table() {
-    // Coefficient-buffer adversarial case, exercised directly through
-    // `precompute_coeffs`. The weight table is `out_size * ksize` `i32`s
-    // and the `bounds` table is `out_size` `(usize, usize)` pairs — both
-    // scale with the (untrusted) output dimension. With
-    // `out_size = 200_000_000` and `in_size = 1` the weight table is
-    // `200_000_000 * ksize(=1) * 4` = 800 MB and the `bounds` table is
-    // `200_000_000 * 16` = 3.2 GB — both far over the 512 MiB cap, so
-    // `checked_buffer_bytes` (whichever of the two is reached first)
-    // rejects with `ShapeMismatch` rather than reserving + zero-filling
-    // multiple GB.
-    // `Coeffs` is not `Debug`; match the result rather than `{:?}`-ing it.
+    // Coefficient-buffer adversarial case via `precompute_coeffs`.
     let r = precompute_coeffs(1, 200_000_000, Filter::Bilinear);
     assert!(
-      matches!(r, Err(Error::ShapeMismatch(_))),
+      matches!(r, Err(Error::CapExceeded(_))),
       "200M-wide coefficient table must exceed the 512 MiB cap (got Ok or wrong error)"
     );
-    // And via the full resize: a `1x4` source upscaled to a
-    // `200_000_000`-wide target must reject — recoverable, no abort. (The
-    // destination `200_000_000*1*4` = 800 MB already trips the
-    // destination cap; were it not for that, the h-axis coefficient table
-    // and the horizontal intermediate would. Every one of these guards
-    // yields `ShapeMismatch`.)
+    // And via the full resize: every guard yields a typed cap/overflow Err.
     let src = vec![0u8; 4 * CHANNELS];
     let r2 = resize_rgba8(&src, 1, 4, 200_000_000, 1, Filter::Bilinear);
     assert!(
-      matches!(r2, Err(Error::ShapeMismatch(_))),
-      "resize to a 200M-wide target must be ShapeMismatch, got {r2:?}"
+      matches!(r2, Err(Error::CapExceeded(_))),
+      "resize to a 200M-wide target must be CapExceeded, got {r2:?}"
     );
   }
 
   #[test]
   fn checked_buffer_bytes_caps_and_overflows() {
     // Direct unit test of the helper. Under-cap passes and returns the
-    // byte product; over-cap and overflow both yield ShapeMismatch.
+    // byte product; over-cap yields CapExceeded and overflow yields
+    // ArithmeticOverflow.
     assert_eq!(
       checked_buffer_bytes(1024, 4, "ok").unwrap(),
       4096,
@@ -1271,14 +1307,14 @@ mod tests {
     assert!(
       matches!(
         checked_buffer_bytes(MAX_DECODED_IMAGE_BYTES + 1, 1, "over"),
-        Err(Error::ShapeMismatch(_))
+        Err(Error::CapExceeded(_))
       ),
       "one byte over the cap must be rejected"
     );
     assert!(
       matches!(
         checked_buffer_bytes(usize::MAX, 4, "overflow"),
-        Err(Error::ShapeMismatch(_))
+        Err(Error::ArithmeticOverflow(_))
       ),
       "a product overflowing usize must be rejected (not wrap)"
     );

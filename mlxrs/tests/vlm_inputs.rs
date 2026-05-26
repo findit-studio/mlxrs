@@ -290,15 +290,18 @@ fn prepare_inputs_caller_mask_dimension_mismatch_errors() {
     .with_padding_side(PaddingSide::Left)
     .with_attention_mask(bad_mask);
   let err = prepare_inputs(batches, None, None, None, &opts).unwrap_err();
-  assert!(
-    matches!(err, Error::ShapeMismatch(_)),
-    "expected ShapeMismatch, got: {err:?}"
-  );
-  let msg = format!("{err}");
-  assert!(
-    msg.contains("attention_mask outer length") && msg.contains("1") && msg.contains("2"),
-    "expected outer-length mismatch text, got: {msg}"
-  );
+  match &err {
+    Error::LengthMismatch(p) => {
+      assert!(
+        p.context().contains("attention_mask outer"),
+        "expected outer-length mismatch context, got: {}",
+        p.context()
+      );
+      assert_eq!(p.expected(), 2);
+      assert_eq!(p.actual(), 1);
+    }
+    _ => panic!("expected LengthMismatch, got: {err:?}"),
+  }
 }
 
 #[test]
@@ -314,15 +317,18 @@ fn prepare_inputs_caller_mask_inner_dimension_mismatch_errors() {
     .with_padding_side(PaddingSide::Left)
     .with_attention_mask(bad_mask);
   let err = prepare_inputs(batches, None, None, None, &opts).unwrap_err();
-  assert!(
-    matches!(err, Error::ShapeMismatch(_)),
-    "expected ShapeMismatch, got: {err:?}"
-  );
-  let msg = format!("{err}");
-  assert!(
-    msg.contains("attention_mask[1]"),
-    "expected attention_mask[1] index in error message, got: {msg}"
-  );
+  match &err {
+    Error::LengthMismatch(p) => {
+      assert!(
+        p.context().contains("attention_mask[i]"),
+        "expected per-row inner-length mismatch context, got: {}",
+        p.context()
+      );
+      assert_eq!(p.expected(), 3);
+      assert_eq!(p.actual(), 2);
+    }
+    _ => panic!("expected LengthMismatch, got: {err:?}"),
+  }
 }
 
 // ──────────────────────── audio/video glue (cfg-gated) ───────────────────
