@@ -21,7 +21,7 @@ tokenizer-chat       = ["tokenizer-config", "dep:minijinja", "dep:minijinja-cont
 tokenizer-deepseek-v32 = ["tokenizer-chat"]                                        # the one shipped chat-template override
 tokenizer-tools      = ["tokenizer-config", "dep:serde_json"]                      # tool-call parsers + infer_tool_parser
 
-embeddings           = ["tokenizer", "dep:smol_str", "dep:memspan", "dep:glob"]
+embeddings           = ["tokenizer", "dep:memspan", "dep:glob"]
 lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm", "tokenizer-bpe", "tokenizer-chat", "tokenizer-deepseek-v32", "tokenizer-tools", "dep:regex"]
 # Grammar-constrained logits processing (`build_json_schema_logits_processor` /
 # `LLGuidanceLogitsProcessor`, the `lm::structured` module — port of
@@ -40,6 +40,11 @@ mlxrs-sys.workspace = true
 thiserror.workspace = true
 half.workspace = true
 smallvec.workspace = true
+# Small-string-optimized inline storage for short Error payload strings
+# (most error messages fit inline without a heap allocation). Always-on
+# because the typed Error variants in `error.rs` carry SmolStr fields and
+# the Error enum is in the core (no-feature) surface.
+smol_str = "0.3"
 static_assertions.workspace = true
 ctor.workspace = true
 derive_more.workspace = true
@@ -49,7 +54,6 @@ minijinja = { version = "2", features = ["loader", "json", "loop_controls", "bui
 minijinja-contrib = { version = "2", features = ["pycompat"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true, features = ["preserve_order"] }
-smol_str = { version = "0.3", optional = true }
 memspan = { version = "0.1", optional = true }
 glob = { version = "0.3", optional = true }
 jiff = { version = "0.2", optional = true }

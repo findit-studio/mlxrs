@@ -85,15 +85,24 @@ fn max_axes_empty_on_zero_size_errors() {
   // Locks in the Codex PR #6 round-2 fix. Same contract for min_axes.
   let a = Array::from_slice::<f32>(&[], &[0i32]).unwrap();
   assert_eq!(a.size(), 0);
+  // mlx C++ surfaces `[max]` / `[min]` "Cannot reduce zero size array …"
+  // via the boundary handler; the typed-prefix parser maps the bracketed
+  // op-name to `MlxOpKind::Pool` (the reduction-family bucket).
   let r_max = mlxrs::ops::reduction::max_axes(&a, &[], false);
   assert!(
-    matches!(r_max, Err(mlxrs::Error::Backend(_))),
-    "expected Err(Backend) for max_axes(zero_size, &[]), got {r_max:?}",
+    matches!(
+      &r_max,
+      Err(mlxrs::Error::MlxOp(p)) if matches!(p.op(), mlxrs::error::MlxOpKind::Pool)
+    ),
+    "expected Err(MlxOp(Pool)) for max_axes(zero_size, &[]), got {r_max:?}",
   );
   let r_min = mlxrs::ops::reduction::min_axes(&a, &[], false);
   assert!(
-    matches!(r_min, Err(mlxrs::Error::Backend(_))),
-    "expected Err(Backend) for min_axes(zero_size, &[]), got {r_min:?}",
+    matches!(
+      &r_min,
+      Err(mlxrs::Error::MlxOp(p)) if matches!(p.op(), mlxrs::error::MlxOpKind::Pool)
+    ),
+    "expected Err(MlxOp(Pool)) for min_axes(zero_size, &[]), got {r_min:?}",
   );
 }
 
