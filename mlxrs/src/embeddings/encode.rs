@@ -20,7 +20,10 @@
 
 use crate::{
   array::Array,
-  error::{Error, RankMismatchPayload, Result, try_with_capacity},
+  error::{
+    ArithmeticOverflowPayload, Error, LengthMismatchPayload, OutOfRangePayload,
+    RankMismatchPayload, Result, ShapePairMismatchPayload, try_with_capacity,
+  },
   tokenizer::{EncodeOptions, Tokenizer},
 };
 
@@ -258,11 +261,10 @@ fn tokenize_and_pad(
     // cloning (avoids the O(tokens) per-row copy that borrowed-accessor +
     // owned-flatten would otherwise pay).
     if enc.attention_mask().len() != enc.ids().len() {
-      return Err(Error::Backend(format!(
-        "encode: encode_with(return_attention_mask=true) returned mask.len()={} \
-           but ids.len()={}; they must match",
-        enc.attention_mask().len(),
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "encode: encode_with(return_attention_mask=true) mask.len() must match ids.len()",
         enc.ids().len(),
+        enc.attention_mask().len(),
       )));
     }
     rows.push(enc.into_parts());
@@ -277,16 +279,19 @@ fn tokenize_and_pad(
   // conversion so a token id `> i32::MAX` is a recoverable error, not a
   // silent wrap to a negative index.
   let total = batch.checked_mul(seq_len).ok_or_else(|| {
-    Error::ShapeMismatch(format!(
-      "encode: batch {batch} * seq_len {seq_len} overflows usize"
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "encode: batch * seq_len",
+      "usize",
+      [("batch", batch as u64), ("seq_len", seq_len as u64)],
     ))
   })?;
   // The padding id is written into every padded cell, so range-check it once
   // up front rather than per cell.
   let pad_id = i32::try_from(pad_token_id).map_err(|_| {
-    Error::ShapeMismatch(format!(
-      "encode: pad_token_id {pad_token_id} exceeds i32::MAX ({})",
-      i32::MAX
+    Error::OutOfRange(OutOfRangePayload::new(
+      "encode: pad_token_id",
+      "must fit in i32 (the MLX index dtype)",
+      smol_str::format_smolstr!("{pad_token_id}"),
     ))
   })?;
   let mut id_data: Vec<i32> = try_with_capacity(total)?;
@@ -295,9 +300,10 @@ fn tokenize_and_pad(
     let real = ids.len();
     for &id in ids {
       let id = i32::try_from(id).map_err(|_| {
-        Error::ShapeMismatch(format!(
-          "encode: token id {id} exceeds i32::MAX ({})",
-          i32::MAX
+        Error::OutOfRange(OutOfRangePayload::new(
+          "encode: token id",
+          "must fit in i32 (the MLX index dtype)",
+          smol_str::format_smolstr!("{id}"),
         ))
       })?;
       id_data.push(id);
@@ -397,11 +403,10 @@ pub fn encode(
       )));
     }
     if pooled_shape[0] != texts.len() {
-      return Err(Error::ShapeMismatch(format!(
-        "encode: model pooled_output batch {} must match texts {}, got shape {:?}",
-        pooled_shape[0],
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "encode: model pooled_output batch must match texts",
         texts.len(),
-        pooled_shape
+        pooled_shape[0],
       )));
     }
     // The pooler's hidden width must match the hidden states' (`(batch,
@@ -419,10 +424,10 @@ pub fn encode(
       )));
     }
     if pooled_shape[1] != hidden_shape[2] {
-      return Err(Error::ShapeMismatch(format!(
-        "encode: model pooled_output hidden width {} must match last_hidden_state hidden {}, \
-           got pooled shape {:?} vs hidden {:?}",
-        pooled_shape[1], hidden_shape[2], pooled_shape, hidden_shape
+      return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+        "encode: model pooled_output hidden width must match last_hidden_state hidden",
+        pooled_shape,
+        hidden_shape,
       )));
     }
     return pool_post(
@@ -869,8 +874,8 @@ mod tests {
       .with_normalize(false);
     let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
     assert!(
-      matches!(err, Error::ShapeMismatch(_)),
-      "expected ShapeMismatch, got {err:?}"
+      matches!(err, Error::LengthMismatch(_)),
+      "expected LengthMismatch, got {err:?}"
     );
   }
 
@@ -885,8 +890,8 @@ mod tests {
       .with_normalize(false);
     let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
     assert!(
-      matches!(err, Error::ShapeMismatch(_)),
-      "expected ShapeMismatch, got {err:?}"
+      matches!(err, Error::LengthMismatch(_)),
+      "expected LengthMismatch, got {err:?}"
     );
   }
 
@@ -907,8 +912,8 @@ mod tests {
       .with_normalize(false);
     let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
     assert!(
-      matches!(err, Error::ShapeMismatch(_)),
-      "expected ShapeMismatch, got {err:?}"
+      matches!(err, Error::ShapePairMismatch(_)),
+      "expected ShapePairMismatch, got {err:?}"
     );
   }
 
@@ -924,8 +929,8 @@ mod tests {
       .with_normalize(false);
     let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
     assert!(
-      matches!(err, Error::ShapeMismatch(_)),
-      "expected ShapeMismatch, got {err:?}"
+      matches!(err, Error::ShapePairMismatch(_)),
+      "expected ShapePairMismatch, got {err:?}"
     );
   }
 

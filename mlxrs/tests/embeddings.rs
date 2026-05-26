@@ -607,8 +607,8 @@ fn st_config_present_malformed_pooling_mode_rejected() {
   ] {
     let r = pooling_from_st_config_str(json);
     assert!(
-      matches!(r, Err(Error::Backend(_))),
-      "present malformed pooling_mode ({what}) must be Err(Backend), got {r:?}"
+      matches!(r, Err(Error::OutOfRange(_))),
+      "present malformed pooling_mode ({what}) must be Err(OutOfRange), got {r:?}"
     );
     // Specifically must NOT silently resolve to a strategy (e.g. Mean).
     assert!(
@@ -623,7 +623,7 @@ fn st_config_present_malformed_pooling_mode_rejected() {
   // the malformed modern key).
   let r = pooling_from_st_config_str(r#"{"pooling_mode": null, "pooling_mode_mean_tokens": true}"#);
   assert!(
-    matches!(r, Err(Error::Backend(_))),
+    matches!(r, Err(Error::OutOfRange(_))),
     "malformed pooling_mode alongside legacy flags must still be Err, got {r:?}"
   );
 }
@@ -679,9 +679,15 @@ fn st_config_present_invalid_dimension_rejected() {
     ),
   ] {
     let r = pooling_from_st_config_str(json);
+    // Invalid-dimension errors split between Parse (for the negative /
+    // fractional / out-of-range scanner-detected forms, which carry the
+    // byte-offset diagnostic) and OutOfRange (for the value-after-parse
+    // forms — non-number / zero). Both are non-recoverable typed Errs;
+    // accept either, mirroring the loose "any Err" contract the test
+    // originally enforced via the deprecated Backend variant.
     assert!(
-      matches!(r, Err(Error::Backend(_))),
-      "present invalid dimension ({what}) must be Err(Backend), got {r:?}"
+      matches!(r, Err(Error::Parse(_)) | Err(Error::OutOfRange(_))),
+      "present invalid dimension ({what}) must be Err(Parse) or Err(OutOfRange), got {r:?}"
     );
   }
 
@@ -692,7 +698,7 @@ fn st_config_present_invalid_dimension_rejected() {
     r#"{"pooling_mode": "mean", "word_embedding_dimension": -1, "embedding_dimension": 384}"#,
   );
   assert!(
-    matches!(r, Err(Error::Backend(_))),
+    matches!(r, Err(Error::Parse(_)) | Err(Error::OutOfRange(_))),
     "invalid primary key must reject, not fall back to the alias, got {r:?}"
   );
 
@@ -917,8 +923,8 @@ fn st_config_path_rejects_oversize_file_without_oom() {
 
   let r = pooling_from_st_config_path(&dir);
   assert!(
-    matches!(r, Err(Error::Backend(_))),
-    "oversize config must yield recoverable Err(Backend), got {r:?}"
+    matches!(r, Err(Error::CapExceeded(_))),
+    "oversize config must yield Err(CapExceeded), got {r:?}"
   );
 
   // A small valid config in the same layout still parses fine.
@@ -955,9 +961,9 @@ fn st_config_path_rejects_non_regular_file_without_hang() {
 
   let r = pooling_from_st_config_path(&dir);
   assert!(
-    matches!(r, Err(Error::Backend(_))),
+    matches!(r, Err(Error::FileIo(_))),
     "non-regular (directory) config path must yield a recoverable \
-     Err(Backend) without hang/panic, got {r:?}"
+     Err(FileIo) without hang/panic, got {r:?}"
   );
 
   // Replace the directory with a normal small config: still parses.
@@ -1052,7 +1058,7 @@ fn st_config_path_fifo_returns_err_without_hang() {
   let (tx, rx) = mpsc::channel();
   let handle = std::thread::spawn(move || {
     let r = pooling_from_st_config_path(&probe_dir);
-    let _ = tx.send(matches!(r, Err(Error::Backend(_))));
+    let _ = tx.send(matches!(r, Err(Error::FileIo(_))));
   });
 
   match rx.recv_timeout(std::time::Duration::from_secs(30)) {
@@ -1060,7 +1066,7 @@ fn st_config_path_fifo_returns_err_without_hang() {
       handle.join().unwrap();
       assert!(
         is_recoverable_err,
-        "FIFO at config.json must yield a recoverable Err(Backend) \
+        "FIFO at config.json must yield a recoverable Err(FileIo) \
          (rejected by is_file()==false), not Ok"
       );
     }
@@ -1158,33 +1164,34 @@ fn pooling_helpers_reject_non_rank3_token_embeddings_without_panic() {
   let emb_2d = Array::from_slice(&[1.0_f32, 2.0], &(1, 2)).unwrap();
 
   for emb in [&emb_1d, &emb_2d] {
+    // The rank-3 token_embeddings guard now produces a typed `RankMismatch`.
     assert!(matches!(
       mean_pooling(emb, &mask),
-      Err(Error::ShapeMismatch(_))
+      Err(Error::RankMismatch(_))
     ));
     assert!(matches!(
       max_pooling(emb, &mask),
-      Err(Error::ShapeMismatch(_))
+      Err(Error::RankMismatch(_))
     ));
     assert!(matches!(
       cls_pooling(emb, &mask),
-      Err(Error::ShapeMismatch(_))
+      Err(Error::RankMismatch(_))
     ));
     assert!(matches!(
       last_token_pooling(emb, &mask),
-      Err(Error::ShapeMismatch(_))
+      Err(Error::RankMismatch(_))
     ));
     assert!(matches!(
       first_token_pooling(emb),
-      Err(Error::ShapeMismatch(_))
+      Err(Error::RankMismatch(_))
     ));
     assert!(matches!(
       pool(emb, &mask, PoolingStrategy::Mean, false, None, false, false),
-      Err(Error::ShapeMismatch(_))
+      Err(Error::RankMismatch(_))
     ));
     assert!(matches!(
       pool(emb, &mask, PoolingStrategy::Cls, false, None, false, false),
-      Err(Error::ShapeMismatch(_))
+      Err(Error::RankMismatch(_))
     ));
   }
 }
@@ -1199,21 +1206,22 @@ fn pooling_helpers_reject_wrong_rank_mask_without_panic() {
   let mask_3d = Array::from_slice(&[1.0_f32, 1.0], &(1, 2, 1)).unwrap();
 
   for mask in [&mask_1d, &mask_3d] {
+    // Wrong-rank mask → typed `RankMismatch`.
     assert!(matches!(
       mean_pooling(&emb, mask),
-      Err(Error::ShapeMismatch(_))
+      Err(Error::RankMismatch(_))
     ));
     assert!(matches!(
       max_pooling(&emb, mask),
-      Err(Error::ShapeMismatch(_))
+      Err(Error::RankMismatch(_))
     ));
     assert!(matches!(
       cls_pooling(&emb, mask),
-      Err(Error::ShapeMismatch(_))
+      Err(Error::RankMismatch(_))
     ));
     assert!(matches!(
       last_token_pooling(&emb, mask),
-      Err(Error::ShapeMismatch(_))
+      Err(Error::RankMismatch(_))
     ));
   }
 }
@@ -1223,13 +1231,14 @@ fn pooling_helpers_reject_mismatched_batch_or_seq_dims() {
   let emb = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &(1, 2, 2)).unwrap();
   // mask seq_len 3 != emb seq_len 2.
   let bad_mask = Array::from_slice(&[1.0_f32, 1.0, 1.0], &(1, 3)).unwrap();
+  // (batch, seq_len) shape mismatch between emb + mask → ShapePairMismatch.
   assert!(matches!(
     mean_pooling(&emb, &bad_mask),
-    Err(Error::ShapeMismatch(_))
+    Err(Error::ShapePairMismatch(_))
   ));
   assert!(matches!(
     cls_pooling(&emb, &bad_mask),
-    Err(Error::ShapeMismatch(_))
+    Err(Error::ShapePairMismatch(_))
   ));
 }
 
@@ -1766,44 +1775,45 @@ fn cosine_similarity_rejects_broadcastable_length_mismatch() {
   let a = Array::from_slice(&[1.0_f32, 2.0, 3.0], &(3,)).unwrap();
   let b = Array::from_slice(&[1.0_f32], &(1,)).unwrap();
   let r = cosine_similarity(&a, &b);
+  // (3,) vs (1,) is equal-rank-1 + unequal length → LengthMismatch.
   assert!(
-    matches!(r, Err(Error::ShapeMismatch(_))),
-    "expected Err(ShapeMismatch), got {r:?}"
+    matches!(r, Err(Error::LengthMismatch(_))),
+    "expected Err(LengthMismatch), got {r:?}"
   );
   assert!(r.is_err(), "must not return a (possibly > 1) value: {r:?}");
 }
 
 #[test]
 fn cosine_similarity_rejects_unequal_lengths() {
-  // (4,) vs (3,): equal-rank but unequal length → Err(ShapeMismatch).
+  // (4,) vs (3,): equal-rank but unequal length → LengthMismatch.
   let a = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &(4,)).unwrap();
   let b = Array::from_slice(&[1.0_f32, 2.0, 3.0], &(3,)).unwrap();
   assert!(matches!(
     cosine_similarity(&a, &b),
-    Err(Error::ShapeMismatch(_))
+    Err(Error::LengthMismatch(_))
   ));
 }
 
 #[test]
 fn cosine_similarity_rejects_non_rank1() {
-  // Rank-2 (2,2) and a (1,1) input → Err(ShapeMismatch), no panic.
+  // Wrong-rank inputs → RankMismatch (was Error::ShapeMismatch pre-§5).
   let m = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
   let s = Array::from_slice(&[1.0_f32], &(1, 1)).unwrap();
   // rank-2 a, rank-2 b.
   assert!(matches!(
     cosine_similarity(&m, &s),
-    Err(Error::ShapeMismatch(_))
+    Err(Error::RankMismatch(_))
   ));
   // rank-1 a, rank-2 b (only one side wrong).
   let v = Array::from_slice(&[1.0_f32], &(1,)).unwrap();
   assert!(matches!(
     cosine_similarity(&v, &s),
-    Err(Error::ShapeMismatch(_))
+    Err(Error::RankMismatch(_))
   ));
   // rank-2 a, rank-1 b (symmetric).
   assert!(matches!(
     cosine_similarity(&s, &v),
-    Err(Error::ShapeMismatch(_))
+    Err(Error::RankMismatch(_))
   ));
 }
 
