@@ -33,37 +33,40 @@ fn scalar(v: f32) -> Result<Array> {
 /// AdaDelta optimizer.
 pub struct AdaDelta {
   /// Learning rate `λ`.
-  pub learning_rate: LearningRate,
+  learning_rate: LearningRate,
   /// Running-average coefficient `ρ`. Default Python: `0.9`.
-  pub rho: f32,
+  rho: f32,
   /// Numerical-stability epsilon. Default Python: `1e-6`.
-  pub eps: f32,
+  eps: f32,
   step_count: usize,
   current_lr: f32,
+  /// Skip-if-fresh stamp — `Some(N)` means `current_lr` is valid for step N.
+  lr_resolved_for_step: Option<usize>,
   state: HashMap<String, (Array, Array)>,
 }
 
 impl AdaDelta {
   /// Construct an [`AdaDelta`] optimizer.
   pub fn new(learning_rate: impl Into<LearningRate>, rho: f32, eps: f32) -> Result<Self> {
-    if rho < 0.0 {
+    if !rho.is_finite() || !(0.0..1.0).contains(&rho) {
       return Err(Error::Backend {
-        message: format!("AdaDelta: rho must be >= 0, got {rho}"),
+        message: format!("AdaDelta: rho must be finite and in [0.0, 1.0), got {rho}"),
       });
     }
-    if eps < 0.0 {
+    if !eps.is_finite() || eps < 0.0 {
       return Err(Error::Backend {
-        message: format!("AdaDelta: epsilon must be >= 0, got {eps}"),
+        message: format!("AdaDelta: epsilon must be finite and >= 0.0, got {eps}"),
       });
     }
     let lr = learning_rate.into();
-    let current_lr = lr.current(0);
+    let current_lr = lr.try_current(0)?;
     Ok(Self {
       learning_rate: lr,
       rho,
       eps,
       step_count: 0,
       current_lr,
+      lr_resolved_for_step: None,
       state: HashMap::new(),
     })
   }
@@ -71,6 +74,59 @@ impl AdaDelta {
   /// Python-default-args constructor (`rho=0.9`, `eps=1e-6`).
   pub fn default_with_lr(learning_rate: impl Into<LearningRate>) -> Result<Self> {
     Self::new(learning_rate, 0.9, 1e-6)
+  }
+
+  /// The learning rate (or schedule).
+  #[inline(always)]
+  pub fn learning_rate_ref(&self) -> &LearningRate {
+    &self.learning_rate
+  }
+
+  /// Running-average coefficient `ρ`.
+  #[inline(always)]
+  pub fn rho(&self) -> f32 {
+    self.rho
+  }
+
+  /// Numerical-stability epsilon.
+  #[inline(always)]
+  pub fn eps(&self) -> f32 {
+    self.eps
+  }
+
+  /// Set the learning rate. Returns `Ok(self)` on success or `Err` if the
+  /// resolved value at the current step is non-finite.
+  pub fn with_learning_rate(mut self, learning_rate: impl Into<LearningRate>) -> Result<Self> {
+    let lr = learning_rate.into();
+    let current_lr = lr.try_current(self.step_count)?;
+    self.learning_rate = lr;
+    self.current_lr = current_lr;
+    self.lr_resolved_for_step = Some(self.step_count);
+    Ok(self)
+  }
+
+  /// Set rho. Returns `Ok(self)` on success or `Err` if `rho` is not finite
+  /// or is outside `[0.0, 1.0)`.
+  pub fn with_rho(mut self, rho: f32) -> Result<Self> {
+    if !rho.is_finite() || !(0.0..1.0).contains(&rho) {
+      return Err(Error::Backend {
+        message: format!("AdaDelta: rho must be finite and in [0.0, 1.0), got {rho}"),
+      });
+    }
+    self.rho = rho;
+    Ok(self)
+  }
+
+  /// Set epsilon. Returns `Ok(self)` on success or `Err` if `eps` is not
+  /// finite or `< 0.0`.
+  pub fn with_eps(mut self, eps: f32) -> Result<Self> {
+    if !eps.is_finite() || eps < 0.0 {
+      return Err(Error::Backend {
+        message: format!("AdaDelta: epsilon must be finite and >= 0.0, got {eps}"),
+      });
+    }
+    self.eps = eps;
+    Ok(self)
   }
 }
 
@@ -84,13 +140,22 @@ impl Optimizer for AdaDelta {
     Ok(())
   }
 
+  fn preflight(&mut self) -> Result<()> {
+    if self.lr_resolved_for_step == Some(self.step_count) {
+      return Ok(()); // cache hit: schedule already consulted at this step
+    }
+    self.current_lr = self.learning_rate.try_current(self.step_count)?;
+    self.lr_resolved_for_step = Some(self.step_count);
+    Ok(())
+  }
+
   fn apply_gradients(&mut self, gradients: &Weights, params: &mut Weights) -> Result<()> {
     if self.state.is_empty() {
       self.init(gradients)?;
     }
-    // Resolve scheduled LR at the PRE-increment step, then increment
-    // (matches Python `optimizers.py:102..=106`).
-    self.current_lr = self.learning_rate.current(self.step_count);
+    // Resolve scheduled LR via skip-if-fresh cache (no-op if MultiOptimizer
+    // already preflighted this step). Matches Python `optimizers.py:102..=106`.
+    self.preflight()?;
     self.step_count += 1;
     let rho_s = scalar(self.rho)?;
     let one_minus_rho = scalar(1.0 - self.rho)?;
@@ -178,7 +243,61 @@ mod tests {
   }
 
   #[test]
+  fn adadelta_rejects_rho_at_one() {
+    // rho == 1.0 → running average never decays, equivalent to no update
+    assert!(AdaDelta::new(1.0, 1.0, 1e-6).is_err());
+  }
+
+  #[test]
+  fn adadelta_rejects_non_finite_rho() {
+    assert!(AdaDelta::new(1.0, f32::NAN, 1e-6).is_err());
+    assert!(AdaDelta::new(1.0, f32::INFINITY, 1e-6).is_err());
+  }
+
+  #[test]
   fn adadelta_rejects_negative_eps() {
     assert!(AdaDelta::new(1.0, 0.9, -1e-6).is_err());
+  }
+
+  #[test]
+  fn adadelta_rejects_non_finite_eps() {
+    assert!(AdaDelta::new(1.0, 0.9, f32::NAN).is_err());
+  }
+
+  #[test]
+  fn adadelta_builder_with_rho_rejects_negative() {
+    let res = AdaDelta::default_with_lr(1.0).and_then(|a| a.with_rho(-0.5));
+    assert!(res.is_err());
+  }
+
+  #[test]
+  fn adadelta_builder_with_rho_rejects_at_one() {
+    let res = AdaDelta::default_with_lr(1.0).and_then(|a| a.with_rho(1.0));
+    assert!(res.is_err());
+  }
+
+  #[test]
+  fn adadelta_builder_with_rho_rejects_non_finite() {
+    let res = AdaDelta::default_with_lr(1.0).and_then(|a| a.with_rho(f32::NAN));
+    assert!(res.is_err());
+  }
+
+  #[test]
+  fn adadelta_builder_with_eps_rejects_negative() {
+    let res = AdaDelta::default_with_lr(1.0).and_then(|a| a.with_eps(-1e-6));
+    assert!(res.is_err());
+  }
+
+  #[test]
+  fn adadelta_builder_with_eps_rejects_non_finite() {
+    let res = AdaDelta::default_with_lr(1.0).and_then(|a| a.with_eps(f32::NAN));
+    assert!(res.is_err());
+  }
+
+  #[test]
+  fn adadelta_with_learning_rate_rejects_fixed_nan() {
+    let res = AdaDelta::default_with_lr(1.0)
+      .and_then(|a| a.with_learning_rate(LearningRate::Fixed(f32::NAN)));
+    assert!(res.is_err(), "with_learning_rate must reject Fixed(NaN)");
   }
 }

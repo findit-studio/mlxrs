@@ -58,7 +58,7 @@ use crate::{
 /// `mlx_lm/tuner/losses.py` (the body between `source = """` and the closing
 /// `"""`). Re-formatting / re-flowing this string changes the emitted Metal IR
 /// and breaks numerical parity with python — leave the verbatim layout intact.
-fn kl_forward_msl_source() -> &'static str {
+const fn kl_forward_msl_source() -> &'static str {
   r#"
     constexpr int M = 4;
     constexpr int block = 1024 * M;
@@ -218,7 +218,7 @@ fn kl_forward_msl_source() -> &'static str {
 
 /// MSL source for the KL-divergence backward kernel — byte-for-byte from
 /// `_make_kl_backward_kernel` in the python reference.
-fn kl_backward_msl_source() -> &'static str {
+const fn kl_backward_msl_source() -> &'static str {
   r#"
     constexpr int M = 4;
     constexpr int block = 1024 * M;
@@ -372,7 +372,7 @@ fn kl_backward_msl_source() -> &'static str {
 /// MSL source for the JS-divergence forward kernel — byte-for-byte from
 /// `_make_js_forward_kernel` in the python reference. Emits TWO outputs:
 /// the loss `out` and a per-row `out_kl_q` consumed by the backward kernel.
-fn js_forward_msl_source() -> &'static str {
+const fn js_forward_msl_source() -> &'static str {
   r#"
     constexpr int M = 4;
     constexpr int block = 1024 * M;
@@ -550,7 +550,7 @@ fn js_forward_msl_source() -> &'static str {
 
 /// MSL source for the JS-divergence backward kernel — byte-for-byte from
 /// `_make_js_backward_kernel` in the python reference.
-fn js_backward_msl_source() -> &'static str {
+const fn js_backward_msl_source() -> &'static str {
   r#"
     constexpr int M = 4;
     constexpr int block = 1024 * M;

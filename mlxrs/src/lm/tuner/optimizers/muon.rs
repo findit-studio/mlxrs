@@ -30,12 +30,34 @@ use std::collections::HashMap;
 
 use crate::{
   Array, Result,
+  error::Error,
   lm::{
     load::Weights,
     tuner::optimizers::base::{LearningRate, Optimizer, zeros_like, zeros_like_map},
   },
   ops::{arithmetic, linalg_basic::addmm, linalg_full::norm_l2, shape::reshape},
 };
+
+/// Validate that `momentum` is finite. Non-finite momentum propagates NaN/Inf
+/// into the velocity accumulator at the first `apply_gradients` call.
+fn validate_momentum_finite(momentum: f32) -> Result<()> {
+  if !momentum.is_finite() {
+    return Err(Error::Backend {
+      message: format!("Muon: momentum must be finite, got {momentum}"),
+    });
+  }
+  Ok(())
+}
+
+/// Validate that `weight_decay` is finite and `>= 0.0`.
+fn validate_weight_decay(weight_decay: f32) -> Result<()> {
+  if !weight_decay.is_finite() || weight_decay < 0.0 {
+    return Err(Error::Backend {
+      message: format!("Muon: weight_decay must be finite and >= 0.0, got {weight_decay}"),
+    });
+  }
+  Ok(())
+}
 
 fn scalar(v: f32) -> Result<Array> {
   Array::full::<f32>(&[0i32; 0], v)
@@ -44,17 +66,19 @@ fn scalar(v: f32) -> Result<Array> {
 /// Muon optimizer.
 pub struct Muon {
   /// Learning rate `λ`.
-  pub learning_rate: LearningRate,
+  learning_rate: LearningRate,
   /// Momentum strength. Default Python: `0.95`.
-  pub momentum: f32,
+  momentum: f32,
   /// Weight decay (L2 penalty). Default Python: `0.01`.
-  pub weight_decay: f32,
+  weight_decay: f32,
   /// Enable Nesterov momentum. Default Python: `true`.
-  pub nesterov: bool,
+  nesterov: bool,
   /// Newton-Schulz iteration steps. Default Python: `5`.
-  pub ns_steps: usize,
+  ns_steps: usize,
   step_count: usize,
   current_lr: f32,
+  /// Skip-if-fresh stamp — `Some(N)` means `current_lr` is valid for step N.
+  lr_resolved_for_step: Option<usize>,
   state: HashMap<String, Array>,
 }
 
@@ -67,8 +91,10 @@ impl Muon {
     nesterov: bool,
     ns_steps: usize,
   ) -> Result<Self> {
+    validate_momentum_finite(momentum)?;
+    validate_weight_decay(weight_decay)?;
     let lr = learning_rate.into();
-    let current_lr = lr.current(0);
+    let current_lr = lr.try_current(0)?;
     Ok(Self {
       learning_rate: lr,
       momentum,
@@ -77,6 +103,7 @@ impl Muon {
       ns_steps,
       step_count: 0,
       current_lr,
+      lr_resolved_for_step: None,
       state: HashMap::new(),
     })
   }
@@ -84,6 +111,78 @@ impl Muon {
   /// Python-default-args constructor.
   pub fn default_with_lr(learning_rate: impl Into<LearningRate>) -> Result<Self> {
     Self::new(learning_rate, 0.95, 0.01, true, 5)
+  }
+
+  /// The learning rate (or schedule).
+  #[inline(always)]
+  pub fn learning_rate_ref(&self) -> &LearningRate {
+    &self.learning_rate
+  }
+
+  /// Momentum strength.
+  #[inline(always)]
+  pub fn momentum(&self) -> f32 {
+    self.momentum
+  }
+
+  /// Weight decay coefficient.
+  #[inline(always)]
+  pub fn weight_decay(&self) -> f32 {
+    self.weight_decay
+  }
+
+  /// Whether Nesterov momentum is enabled.
+  #[inline(always)]
+  pub fn nesterov(&self) -> bool {
+    self.nesterov
+  }
+
+  /// Newton-Schulz iteration step count.
+  #[inline(always)]
+  pub fn ns_steps(&self) -> usize {
+    self.ns_steps
+  }
+
+  /// Set the learning rate. Returns `Ok(self)` on success or `Err` if the
+  /// resolved value at the current step is non-finite.
+  pub fn with_learning_rate(mut self, learning_rate: impl Into<LearningRate>) -> Result<Self> {
+    let lr = learning_rate.into();
+    let current_lr = lr.try_current(self.step_count)?;
+    self.learning_rate = lr;
+    self.current_lr = current_lr;
+    self.lr_resolved_for_step = Some(self.step_count);
+    Ok(self)
+  }
+
+  /// Set momentum. Returns `Ok(self)` on success or `Err` if `momentum` is
+  /// not finite (NaN/Inf would corrupt velocity at the first
+  /// `apply_gradients` call).
+  pub fn with_momentum(mut self, momentum: f32) -> Result<Self> {
+    validate_momentum_finite(momentum)?;
+    self.momentum = momentum;
+    Ok(self)
+  }
+
+  /// Set weight decay. Returns `Ok(self)` on success or `Err` if
+  /// `weight_decay` is not finite or `< 0.0`.
+  pub fn with_weight_decay(mut self, weight_decay: f32) -> Result<Self> {
+    validate_weight_decay(weight_decay)?;
+    self.weight_decay = weight_decay;
+    Ok(self)
+  }
+
+  /// Set nesterov flag. Returns `self` for chaining.
+  #[must_use]
+  pub fn with_nesterov(mut self, nesterov: bool) -> Self {
+    self.nesterov = nesterov;
+    self
+  }
+
+  /// Set Newton-Schulz iteration steps. Returns `self` for chaining.
+  #[must_use]
+  pub fn with_ns_steps(mut self, ns_steps: usize) -> Self {
+    self.ns_steps = ns_steps;
+    self
   }
 
   /// Newton-Schulz 5 iteration on a 2D matrix. Mirrors the Python
@@ -130,13 +229,22 @@ impl Optimizer for Muon {
     Ok(())
   }
 
+  fn preflight(&mut self) -> Result<()> {
+    if self.lr_resolved_for_step == Some(self.step_count) {
+      return Ok(()); // cache hit: schedule already consulted at this step
+    }
+    self.current_lr = self.learning_rate.try_current(self.step_count)?;
+    self.lr_resolved_for_step = Some(self.step_count);
+    Ok(())
+  }
+
   fn apply_gradients(&mut self, gradients: &Weights, params: &mut Weights) -> Result<()> {
     if self.state.is_empty() {
       self.init(gradients)?;
     }
-    // Resolve scheduled LR at PRE-increment step, then increment
-    // (matches Python `optimizers.py:102..=106`).
-    self.current_lr = self.learning_rate.current(self.step_count);
+    // Resolve scheduled LR via skip-if-fresh cache (no-op if MultiOptimizer
+    // already preflighted this step). Matches Python `optimizers.py:102..=106`.
+    self.preflight()?;
     self.step_count += 1;
     let mu_s = scalar(self.momentum)?;
     let one_minus_mu = scalar(1.0 - self.momentum)?;
@@ -208,6 +316,49 @@ impl Optimizer for Muon {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  // ── Validation rejection tests ────────────────────────────────────────────
+
+  #[test]
+  fn muon_new_rejects_non_finite_momentum() {
+    assert!(Muon::new(0.01, f32::NAN, 0.01, true, 5).is_err());
+    assert!(Muon::new(0.01, f32::INFINITY, 0.01, true, 5).is_err());
+  }
+
+  #[test]
+  fn muon_new_rejects_negative_weight_decay() {
+    assert!(Muon::new(0.01, 0.95, -0.1, true, 5).is_err());
+  }
+
+  #[test]
+  fn muon_new_rejects_non_finite_weight_decay() {
+    assert!(Muon::new(0.01, 0.95, f32::NAN, true, 5).is_err());
+  }
+
+  #[test]
+  fn muon_with_momentum_rejects_non_finite() {
+    let res = Muon::default_with_lr(0.01).and_then(|m| m.with_momentum(f32::NAN));
+    assert!(res.is_err());
+  }
+
+  #[test]
+  fn muon_with_weight_decay_rejects_negative() {
+    let res = Muon::default_with_lr(0.01).and_then(|m| m.with_weight_decay(-0.1));
+    assert!(res.is_err());
+  }
+
+  #[test]
+  fn muon_with_weight_decay_rejects_non_finite() {
+    let res = Muon::default_with_lr(0.01).and_then(|m| m.with_weight_decay(f32::INFINITY));
+    assert!(res.is_err());
+  }
+
+  #[test]
+  fn muon_with_learning_rate_rejects_fixed_nan() {
+    let res =
+      Muon::default_with_lr(0.01).and_then(|m| m.with_learning_rate(LearningRate::Fixed(f32::NAN)));
+    assert!(res.is_err(), "with_learning_rate must reject Fixed(NaN)");
+  }
 
   #[test]
   fn muon_1d_param_runs_without_newton_schulz() -> Result<()> {

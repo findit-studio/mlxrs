@@ -25,6 +25,16 @@ use crate::{
   ops::arithmetic,
 };
 
+/// Validate `eps` is finite and `>= 0.0`.
+fn validate_eps(eps: f32) -> Result<()> {
+  if !eps.is_finite() || eps < 0.0 {
+    return Err(Error::Backend {
+      message: format!("Adagrad: eps must be finite and >= 0.0, got {eps}"),
+    });
+  }
+  Ok(())
+}
+
 fn scalar(v: f32) -> Result<Array> {
   Array::full::<f32>(&[0i32; 0], v)
 }
@@ -32,29 +42,28 @@ fn scalar(v: f32) -> Result<Array> {
 /// Adagrad optimizer.
 pub struct Adagrad {
   /// Learning rate `λ`.
-  pub learning_rate: LearningRate,
+  learning_rate: LearningRate,
   /// Numerical-stability epsilon. Default Python: `1e-8`.
-  pub eps: f32,
+  eps: f32,
   step_count: usize,
   current_lr: f32,
+  /// Skip-if-fresh stamp — `Some(N)` means `current_lr` is valid for step N.
+  lr_resolved_for_step: Option<usize>,
   state: HashMap<String, Array>,
 }
 
 impl Adagrad {
   /// Construct an [`Adagrad`] optimizer.
   pub fn new(learning_rate: impl Into<LearningRate>, eps: f32) -> Result<Self> {
-    if eps < 0.0 {
-      return Err(Error::Backend {
-        message: format!("Adagrad: epsilon must be >= 0, got {eps}"),
-      });
-    }
+    validate_eps(eps)?;
     let lr = learning_rate.into();
-    let current_lr = lr.current(0);
+    let current_lr = lr.try_current(0)?;
     Ok(Self {
       learning_rate: lr,
       eps,
       step_count: 0,
       current_lr,
+      lr_resolved_for_step: None,
       state: HashMap::new(),
     })
   }
@@ -62,6 +71,37 @@ impl Adagrad {
   /// Python-default-args constructor (`eps=1e-8`).
   pub fn default_with_lr(learning_rate: impl Into<LearningRate>) -> Result<Self> {
     Self::new(learning_rate, 1e-8)
+  }
+
+  /// The learning rate (or schedule).
+  #[inline(always)]
+  pub fn learning_rate_ref(&self) -> &LearningRate {
+    &self.learning_rate
+  }
+
+  /// Numerical-stability epsilon.
+  #[inline(always)]
+  pub fn eps(&self) -> f32 {
+    self.eps
+  }
+
+  /// Set the learning rate. Returns `Ok(self)` on success or `Err` if the
+  /// resolved value at the current step is non-finite.
+  pub fn with_learning_rate(mut self, learning_rate: impl Into<LearningRate>) -> Result<Self> {
+    let lr = learning_rate.into();
+    let current_lr = lr.try_current(self.step_count)?;
+    self.learning_rate = lr;
+    self.current_lr = current_lr;
+    self.lr_resolved_for_step = Some(self.step_count);
+    Ok(self)
+  }
+
+  /// Set epsilon. Returns `Ok(self)` on success or `Err` if `eps` is not
+  /// finite or `< 0.0`.
+  pub fn with_eps(mut self, eps: f32) -> Result<Self> {
+    validate_eps(eps)?;
+    self.eps = eps;
+    Ok(self)
   }
 }
 
@@ -71,13 +111,22 @@ impl Optimizer for Adagrad {
     Ok(())
   }
 
+  fn preflight(&mut self) -> Result<()> {
+    if self.lr_resolved_for_step == Some(self.step_count) {
+      return Ok(()); // cache hit: schedule already consulted at this step
+    }
+    self.current_lr = self.learning_rate.try_current(self.step_count)?;
+    self.lr_resolved_for_step = Some(self.step_count);
+    Ok(())
+  }
+
   fn apply_gradients(&mut self, gradients: &Weights, params: &mut Weights) -> Result<()> {
     if self.state.is_empty() {
       self.init(gradients)?;
     }
-    // Resolve scheduled LR at the PRE-increment step, then increment
-    // (matches Python `optimizers.py:102..=106`).
-    self.current_lr = self.learning_rate.current(self.step_count);
+    // Resolve scheduled LR via skip-if-fresh cache (no-op if MultiOptimizer
+    // already preflighted this step). Matches Python `optimizers.py:102..=106`.
+    self.preflight()?;
     self.step_count += 1;
     let eps_s = scalar(self.eps)?;
     let lr_s = scalar(self.current_lr)?;
@@ -144,5 +193,35 @@ mod tests {
   #[test]
   fn adagrad_rejects_negative_eps() {
     assert!(Adagrad::new(0.001, -1e-8).is_err());
+  }
+
+  #[test]
+  fn adagrad_new_rejects_nan_eps() {
+    assert!(Adagrad::new(0.001, f32::NAN).is_err());
+  }
+
+  #[test]
+  fn adagrad_builder_with_eps_rejects_negative() {
+    let res = Adagrad::default_with_lr(0.1).and_then(|a| a.with_eps(-1e-8));
+    assert!(res.is_err());
+  }
+
+  #[test]
+  fn adagrad_with_eps_rejects_nan() {
+    let res = Adagrad::default_with_lr(0.1).and_then(|a| a.with_eps(f32::NAN));
+    assert!(res.is_err());
+  }
+
+  #[test]
+  fn adagrad_with_eps_rejects_inf() {
+    let res = Adagrad::default_with_lr(0.1).and_then(|a| a.with_eps(f32::INFINITY));
+    assert!(res.is_err());
+  }
+
+  #[test]
+  fn adagrad_with_learning_rate_rejects_fixed_nan() {
+    let res = Adagrad::default_with_lr(0.1)
+      .and_then(|a| a.with_learning_rate(LearningRate::Fixed(f32::NAN)));
+    assert!(res.is_err(), "with_learning_rate must reject Fixed(NaN)");
   }
 }

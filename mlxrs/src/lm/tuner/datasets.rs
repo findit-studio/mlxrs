@@ -641,7 +641,8 @@ impl Dataset for CacheDataset<'_> {
 /// What dataset shape to construct — the explicit form of Python
 /// `create_dataset`'s sample-driven dispatch
 /// (`tuner/datasets.py:175..=202`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
+#[display("{}", self.as_str())]
 pub enum DatasetType {
   /// Tokenize a single `text` field verbatim — see [`TextDataset`].
   Text,
@@ -656,6 +657,19 @@ pub enum DatasetType {
   /// `messages` ⇒ [`DatasetType::Chat`]; else `text` ⇒ [`DatasetType::Text`];
   /// else error.
   Auto,
+}
+
+impl DatasetType {
+  /// Returns the canonical string representation of this variant:
+  /// `"text"`, `"chat"`, `"completions"`, or `"auto"`.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      DatasetType::Text => "text",
+      DatasetType::Chat => "chat",
+      DatasetType::Completions => "completions",
+      DatasetType::Auto => "auto",
+    }
+  }
 }
 
 /// Per-call dataset config — the typed analogue of Python's
@@ -673,19 +687,23 @@ pub enum DatasetType {
 pub struct DatasetConfig {
   /// Whether to set the prompt-mask offset (the `(tokens, offset)`'s second
   /// element). When `false`, every dataset returns `(tokens, 0)`.
-  pub mask_prompt: bool,
+  mask_prompt: bool,
   /// jsonl field name for [`TextDataset`].
-  pub text_feature: String,
+  text_feature: String,
   /// jsonl field name for [`ChatDataset`].
-  pub chat_feature: String,
+  chat_feature: String,
   /// jsonl field name for [`CompletionsDataset`]'s prompt.
-  pub prompt_feature: String,
+  prompt_feature: String,
   /// jsonl field name for [`CompletionsDataset`]'s completion.
-  pub completion_feature: String,
+  completion_feature: String,
 }
 
-impl Default for DatasetConfig {
-  fn default() -> Self {
+impl DatasetConfig {
+  /// Construct a [`DatasetConfig`] with the Python-default values.
+  ///
+  /// Equivalent to [`DatasetConfig::default()`]; prefer `.with_*` builder
+  /// methods to override individual fields.
+  pub fn new() -> Self {
     Self {
       mask_prompt: false,
       text_feature: DEFAULT_TEXT_KEY.to_owned(),
@@ -693,6 +711,77 @@ impl Default for DatasetConfig {
       prompt_feature: DEFAULT_PROMPT_KEY.to_owned(),
       completion_feature: DEFAULT_COMPLETION_KEY.to_owned(),
     }
+  }
+
+  /// Whether prompt masking is enabled.
+  #[inline(always)]
+  pub fn mask_prompt(&self) -> bool {
+    self.mask_prompt
+  }
+
+  /// The jsonl field name used for [`TextDataset`].
+  #[inline(always)]
+  pub fn text_feature(&self) -> &str {
+    &self.text_feature
+  }
+
+  /// The jsonl field name used for [`ChatDataset`].
+  #[inline(always)]
+  pub fn chat_feature(&self) -> &str {
+    &self.chat_feature
+  }
+
+  /// The jsonl field name used for [`CompletionsDataset`]'s prompt.
+  #[inline(always)]
+  pub fn prompt_feature(&self) -> &str {
+    &self.prompt_feature
+  }
+
+  /// The jsonl field name used for [`CompletionsDataset`]'s completion.
+  #[inline(always)]
+  pub fn completion_feature(&self) -> &str {
+    &self.completion_feature
+  }
+
+  /// Set `mask_prompt`. Returns `self` for chaining.
+  #[must_use]
+  pub fn with_mask_prompt(mut self, mask_prompt: bool) -> Self {
+    self.mask_prompt = mask_prompt;
+    self
+  }
+
+  /// Set `text_feature`. Returns `self` for chaining.
+  #[must_use]
+  pub fn with_text_feature(mut self, text_feature: impl Into<String>) -> Self {
+    self.text_feature = text_feature.into();
+    self
+  }
+
+  /// Set `chat_feature`. Returns `self` for chaining.
+  #[must_use]
+  pub fn with_chat_feature(mut self, chat_feature: impl Into<String>) -> Self {
+    self.chat_feature = chat_feature.into();
+    self
+  }
+
+  /// Set `prompt_feature`. Returns `self` for chaining.
+  #[must_use]
+  pub fn with_prompt_feature(mut self, prompt_feature: impl Into<String>) -> Self {
+    self.prompt_feature = prompt_feature.into();
+    self
+  }
+
+  /// Set `completion_feature`. Returns `self` for chaining.
+  #[must_use]
+  pub fn with_completion_feature(mut self, completion_feature: impl Into<String>) -> Self {
+    self.completion_feature = completion_feature.into();
+    self
+  }
+}
+
+impl Default for DatasetConfig {
+  fn default() -> Self {
+    Self::new()
   }
 }
 
@@ -720,7 +809,7 @@ pub fn create_dataset<'a>(
   };
   match resolved {
     DatasetType::Text => {
-      if config.mask_prompt {
+      if config.mask_prompt() {
         return Err(Error::Backend {
           message: "Prompt masking not supported for text dataset.".to_owned(),
         });
@@ -728,21 +817,21 @@ pub fn create_dataset<'a>(
       Ok(Box::new(TextDataset::new(
         data,
         tokenizer,
-        config.text_feature.clone(),
+        config.text_feature().to_owned(),
       )))
     }
     DatasetType::Chat => Ok(Box::new(ChatDataset::new(
       data,
       tokenizer,
-      config.chat_feature.clone(),
-      config.mask_prompt,
+      config.chat_feature().to_owned(),
+      config.mask_prompt(),
     ))),
     DatasetType::Completions => Ok(Box::new(CompletionsDataset::new(
       data,
       tokenizer,
-      config.prompt_feature.clone(),
-      config.completion_feature.clone(),
-      config.mask_prompt,
+      config.prompt_feature().to_owned(),
+      config.completion_feature().to_owned(),
+      config.mask_prompt(),
     ))),
     DatasetType::Auto => unreachable!("auto_detect returned Auto"),
   }
@@ -757,11 +846,11 @@ fn auto_detect(data: &[Value], config: &DatasetConfig) -> Result<DatasetType> {
         .to_owned(),
   })?;
   let has = |k: &str| sample.get(k).is_some();
-  if has(&config.prompt_feature) && has(&config.completion_feature) {
+  if has(config.prompt_feature()) && has(config.completion_feature()) {
     Ok(DatasetType::Completions)
-  } else if has(&config.chat_feature) {
+  } else if has(config.chat_feature()) {
     Ok(DatasetType::Chat)
-  } else if has(&config.text_feature) {
+  } else if has(config.text_feature()) {
     Ok(DatasetType::Text)
   } else {
     // Match Python `tuner/datasets.py:199..=202` verbatim.
@@ -1620,10 +1709,7 @@ mod tests {
     let dir = fresh_dir("load_text_mask_err_data");
     let p = dir.join("train.jsonl");
     write_jsonl(&p, &[json!({ "text": "hello" })]);
-    let cfg = DatasetConfig {
-      mask_prompt: true,
-      ..DatasetConfig::default()
-    };
+    let cfg = DatasetConfig::new().with_mask_prompt(true);
     let err = load_dataset(&p, &tok, DatasetType::Text, &cfg).unwrap_err();
     assert!(
       err.to_string().contains("not supported for text dataset"),

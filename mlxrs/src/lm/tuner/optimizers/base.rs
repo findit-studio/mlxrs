@@ -18,9 +18,10 @@
 //! either a `LearningRate::Fixed(f32)` (Python `float`) or a
 //! `LearningRate::Schedule(Box<dyn Fn(usize) -> f32>)` (Python
 //! `Callable[[step], float]`) — mirroring the Python `Union[float,
-//! Callable]` pattern. The optimizer queries the schedule on every
-//! [`Optimizer::apply_gradients`] call via [`LearningRate::current`],
-//! passing the optimizer's step counter.
+//! Callable]` pattern. The optimizer queries the schedule via
+//! [`LearningRate::try_current`] in [`Optimizer::preflight`], caching the
+//! result with a step stamp so the schedule closure is called at most ONCE
+//! per step (resolve-once guarantee, issue #244).
 
 use crate::{Array, Result, lm::load::Weights};
 
@@ -29,14 +30,23 @@ use crate::{Array, Result, lm::load::Weights};
 /// Mirrors Python's `Union[float, Callable[[mx.array], mx.array]]`
 /// argument shape on every optimizer's `learning_rate` parameter
 /// (`optimizers.py:230..=254`, `297..=325`, etc.).
+#[derive(derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum LearningRate {
   /// Fixed scalar learning rate (Python `float`).
   Fixed(f32),
   /// Step-driven schedule (Python `Callable[[step], float]`). The boxed
-  /// closure is called with the optimizer's step counter each time
-  /// [`Optimizer::apply_gradients`] is invoked, BEFORE the step is
-  /// incremented (so the first call sees step 0, the second call sees
-  /// step 1, matching Python's `optimizers.py:102..=106`).
+  /// closure is called at most ONCE per optimizer step, regardless of
+  /// whether the optimizer is wrapped in [`super::multi::MultiOptimizer`]
+  /// or called standalone — [`Optimizer::preflight`] resolves and caches
+  /// the value with a step stamp, and [`Optimizer::apply_gradients`]
+  /// reads from that cache without re-resolving.
+  ///
+  /// This means a stateful (interior-mutability) closure observes
+  /// exactly one call per step, matching the determinism contract
+  /// callers usually want; the MultiOptimizer atomicity guarantee (#244)
+  /// holds for any `Fn(usize) -> f32`, including stateful ones.
   Schedule(Box<dyn Fn(usize) -> f32>),
 }
 
@@ -50,6 +60,26 @@ impl LearningRate {
       LearningRate::Fixed(v) => *v,
       LearningRate::Schedule(f) => f(step),
     }
+  }
+
+  /// Resolve and validate the learning rate at `step`. Returns
+  /// [`crate::error::Error::Backend`] when the resolved value is
+  /// non-finite (NaN/Inf would scale updates into garbage). Optimizers
+  /// call this from `new` to reject a `Fixed(NaN)` or a `Schedule`
+  /// whose step-0 value is non-finite, and from `preflight` to catch a
+  /// schedule that goes non-finite mid-run (at most once per step via
+  /// the skip-if-fresh cache).
+  pub fn try_current(&self, step: usize) -> Result<f32> {
+    let v = self.current(step);
+    if !v.is_finite() {
+      return Err(crate::error::Error::Backend {
+        message: format!(
+          "LearningRate: resolved value at step {step} is not finite ({v}); reject \
+           non-finite learning rates so they cannot scale updates into NaN/Inf weights"
+        ),
+      });
+    }
+    Ok(v)
   }
 }
 
@@ -98,20 +128,41 @@ pub trait Optimizer {
   /// `optimizers.py:98..=99`).
   fn init(&mut self, params: &Weights) -> Result<()>;
 
+  /// Resolve the learning rate at the current step and cache it in
+  /// optimizer state. Idempotent within a step — the cache is stamped
+  /// with `step_count`, so calling `preflight` multiple times at the
+  /// same step resolves the schedule ONCE. [`Self::apply_gradients`]
+  /// calls this at the top, so single-optimizer callers don't need to
+  /// preflight explicitly. [`super::multi::MultiOptimizer`] calls it
+  /// on every child BEFORE any apply, gating the atomicity contract
+  /// (#244): a non-finite schedule rejects before any param mutation,
+  /// AND a stateful schedule cannot produce different values between
+  /// the atomicity gate and the commit because the commit reads from
+  /// the cache.
+  ///
+  /// Default impl: `Ok(())` — optimizers without LR state keep this no-op.
+  ///
+  /// [issue #244]: https://github.com/findit-studio/mlxrs/issues/244
+  fn preflight(&mut self) -> Result<()> {
+    Ok(())
+  }
+
   /// Apply `gradients` to `params` in-place. Mirrors Python
   /// `Optimizer.apply_gradients(gradients, parameters)`
   /// (`optimizers.py:85..=109`).
   ///
+  /// - Calls [`Self::preflight`] at the top (no-op if
+  ///   [`super::multi::MultiOptimizer`] already preflighted this step).
   /// - Lazy-inits per-parameter state on first call (matching Python's
   ///   `if not self._initialized: self.init(gradients)` guard).
-  /// - Resolves the learning-rate schedule (if any) at the PRE-increment
-  ///   step (matching Python's `state[scheduled_param] = scheduler(self.step)`
-  ///   at `optimizers.py:102..=103`), then increments the internal step
-  ///   counter (matching Python's `self.state["step"] = self.step + 1` at
-  ///   `optimizers.py:106`). Optimizers whose per-param formula uses the
-  ///   POST-increment step (e.g. Adam bias correction) read `step_count`
-  ///   AFTER the increment, matching Python's `step = self.step` reads in
-  ///   `apply_single`.
+  /// - Reads the cached learning rate (populated by `preflight`) at the
+  ///   PRE-increment step (matching Python's `state[scheduled_param] =
+  ///   scheduler(self.step)` at `optimizers.py:102..=103`), then
+  ///   increments the internal step counter (matching Python's
+  ///   `self.state["step"] = self.step + 1` at `optimizers.py:106`).
+  ///   Optimizers whose per-param formula uses the POST-increment step
+  ///   (e.g. Adam bias correction) read `step_count` AFTER the increment,
+  ///   matching Python's `step = self.step` reads in `apply_single`.
   /// - For each parameter present in `gradients`: looks up the matching
   ///   entry in `params`, computes the updated weight, and writes it back
   ///   into `params`. Parameters NOT in `gradients` are left untouched
