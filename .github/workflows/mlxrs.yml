@@ -44,7 +44,7 @@ jobs:
     name: codegen-drift
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install Rust toolchain
         # `rustfmt.toml` uses nightly-only directives (`imports_granularity = "Crate"`)
         # — formatting on stable diverges from local nightly output. Pin nightly
@@ -77,7 +77,7 @@ jobs:
           - features: 'lm,vlm,audio,embeddings,unstable-ops-overload'
             cache_suffix: 'all'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -139,7 +139,7 @@ jobs:
     runs-on: macos-14
     needs: build-test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
       - name: Install Rust nightly (for doc_cfg)
@@ -155,7 +155,7 @@ jobs:
     if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs: build-test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
       - name: Install Rust nightly
