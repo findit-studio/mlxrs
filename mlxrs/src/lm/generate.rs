@@ -142,9 +142,14 @@
 
 use std::cell::RefCell;
 
+use smol_str::format_smolstr;
+
 use crate::{
   array::Array,
-  error::{Error, Result, try_extend_from_slice, try_with_capacity},
+  error::{
+    Error, LengthMismatchPayload, NonFiniteScalarPayload, OutOfRangePayload, RankMismatchPayload,
+    Result, try_extend_from_slice, try_with_capacity,
+  },
   lm::{cache::KvCache, model::Model, sample},
   ops,
 };
@@ -909,57 +914,92 @@ impl GenConfig {
   pub fn validate(&self) -> Result<()> {
     // temp: finite + non-negative (temp == 0 ⇒ argmax path; temp > 0 ⇒
     // stochastic path).
-    if !self.temp.is_finite() || self.temp < 0.0 {
-      return Err(Error::ShapeMismatch(format!(
-        "`temp` must be a finite non-negative float (0.0 = argmax, > 0.0 = stochastic), \
-           but is {}",
-        self.temp
+    if !self.temp.is_finite() {
+      return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+        "GenConfig::validate: temp",
+        self.temp as f64,
+      )));
+    }
+    if self.temp < 0.0 {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "GenConfig::validate: temp",
+        "must be a finite non-negative float (0.0 = argmax, > 0.0 = stochastic)",
+        format_smolstr!("{}", self.temp),
       )));
     }
     // top_p: [0, 1]. `make_sampler` gates the stage on `(0, 1)`; 0 and 1
     // are no-op-equivalent and accepted as "off" / "include everything".
-    if !self.top_p.is_finite() || !(0.0..=1.0).contains(&self.top_p) {
-      return Err(Error::ShapeMismatch(format!(
-        "`top_p` must be a finite float in [0, 1] (0 = off, (0, 1) = nucleus cutoff, \
-           1 = include everything), but is {}",
-        self.top_p
+    if !self.top_p.is_finite() {
+      return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+        "GenConfig::validate: top_p",
+        self.top_p as f64,
+      )));
+    }
+    if !(0.0..=1.0).contains(&self.top_p) {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "GenConfig::validate: top_p",
+        "must be in [0, 1] (0 = off, (0, 1) = nucleus cutoff, 1 = include everything)",
+        format_smolstr!("{}", self.top_p),
       )));
     }
     // min_p: [0, 1] (mirrors `apply_min_p`).
-    if !self.min_p.is_finite() || !(0.0..=1.0).contains(&self.min_p) {
-      return Err(Error::ShapeMismatch(format!(
-        "`min_p` must be a finite float in [0, 1], but is {}",
-        self.min_p
+    if !self.min_p.is_finite() {
+      return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+        "GenConfig::validate: min_p",
+        self.min_p as f64,
+      )));
+    }
+    if !(0.0..=1.0).contains(&self.min_p) {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "GenConfig::validate: min_p",
+        "must be in [0, 1]",
+        format_smolstr!("{}", self.min_p),
       )));
     }
     // min_tokens_to_keep >= 1 (mirrors `apply_min_p`; the `<= vocab_size`
     // bound is vocab-dependent and deferred to the first decode step).
     if self.min_tokens_to_keep < 1 {
-      return Err(Error::ShapeMismatch(format!(
-        "`min_tokens_to_keep` must be a positive integer (>= 1), but is {}",
-        self.min_tokens_to_keep
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "GenConfig::validate: min_tokens_to_keep",
+        "must be a positive integer (>= 1)",
+        format_smolstr!("{}", self.min_tokens_to_keep),
       )));
     }
     // top_k >= 0 (`top_k == 0` is "off"; `top_k > 0` is "on" — the
     // `< vocab_size` bound is vocab-dependent and deferred).
     if self.top_k < 0 {
-      return Err(Error::ShapeMismatch(format!(
-        "`top_k` must be non-negative (0 = off, > 0 = top-k cutoff), but is {}",
-        self.top_k
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "GenConfig::validate: top_k",
+        "must be non-negative (0 = off, > 0 = top-k cutoff)",
+        format_smolstr!("{}", self.top_k),
       )));
     }
     // xtc_probability: [0, 1] (mirrors `apply_xtc`).
-    if !self.xtc_probability.is_finite() || !(0.0..=1.0).contains(&self.xtc_probability) {
-      return Err(Error::ShapeMismatch(format!(
-        "`xtc_probability` must be a finite float in [0, 1], but is {}",
-        self.xtc_probability
+    if !self.xtc_probability.is_finite() {
+      return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+        "GenConfig::validate: xtc_probability",
+        self.xtc_probability as f64,
+      )));
+    }
+    if !(0.0..=1.0).contains(&self.xtc_probability) {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "GenConfig::validate: xtc_probability",
+        "must be in [0, 1]",
+        format_smolstr!("{}", self.xtc_probability),
       )));
     }
     // xtc_threshold: [0, 0.5] (mirrors `apply_xtc`).
-    if !self.xtc_threshold.is_finite() || !(0.0..=0.5).contains(&self.xtc_threshold) {
-      return Err(Error::ShapeMismatch(format!(
-        "`xtc_threshold` must be a finite float in [0, 0.5], but is {}",
-        self.xtc_threshold
+    if !self.xtc_threshold.is_finite() {
+      return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+        "GenConfig::validate: xtc_threshold",
+        self.xtc_threshold as f64,
+      )));
+    }
+    if !(0.0..=0.5).contains(&self.xtc_threshold) {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "GenConfig::validate: xtc_threshold",
+        "must be in [0, 0.5]",
+        format_smolstr!("{}", self.xtc_threshold),
       )));
     }
     // repetition_penalty: finite + non-negative (mirrors
@@ -967,13 +1007,20 @@ impl GenConfig {
     // `ValueError`). `None` and `Some(0.0)` are both "off" — the latter
     // because `make_logits_processors` only includes the processor when
     // `penalty != 0`.
-    if let Some(p) = self.repetition_penalty
-      && (!p.is_finite() || p < 0.0)
-    {
-      return Err(Error::ShapeMismatch(format!(
-        "`repetition_penalty` must be a finite non-negative float when `Some(_)`, \
-           but is {p}"
-      )));
+    if let Some(p) = self.repetition_penalty {
+      if !p.is_finite() {
+        return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+          "GenConfig::validate: repetition_penalty",
+          p as f64,
+        )));
+      }
+      if p < 0.0 {
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "GenConfig::validate: repetition_penalty",
+          "must be a finite non-negative float when Some(_)",
+          format_smolstr!("{p}"),
+        )));
+      }
     }
     // presence_penalty: finite-only. mlx-lm's `make_presence_penalty`
     // allows negative values (presence "boost" is a negative penalty), so
@@ -981,25 +1028,28 @@ impl GenConfig {
     if let Some(p) = self.presence_penalty
       && !p.is_finite()
     {
-      return Err(Error::ShapeMismatch(format!(
-        "`presence_penalty` must be a finite float when `Some(_)`, but is {p}"
+      return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+        "GenConfig::validate: presence_penalty",
+        p as f64,
       )));
     }
     // frequency_penalty: finite-only (same rationale as presence).
     if let Some(p) = self.frequency_penalty
       && !p.is_finite()
     {
-      return Err(Error::ShapeMismatch(format!(
-        "`frequency_penalty` must be a finite float when `Some(_)`, but is {p}"
+      return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+        "GenConfig::validate: frequency_penalty",
+        p as f64,
       )));
     }
     // logit_bias: every `(id, value)` `value` finite. `id` is `i32` and
     // not bound here (the model's vocab is unknown; the `take`/scatter
     // primitive will reject an out-of-range id at the first decode step).
-    for &(id, v) in &self.logit_bias {
+    for &(_id, v) in &self.logit_bias {
       if !v.is_finite() {
-        return Err(Error::ShapeMismatch(format!(
-          "`logit_bias` value for token id {id} must be a finite float, but is {v}"
+        return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+          "GenConfig::validate: logit_bias value",
+          v as f64,
         )));
       }
     }
@@ -1725,8 +1775,10 @@ fn token_window(ids: &[u32]) -> Result<Array> {
 fn last_position(logits: &Array) -> Result<Array> {
   let shape = logits.shape();
   if shape.len() != 3 {
-    return Err(Error::ShapeMismatch(format!(
-      "generate: expected [B, S, V] logits from `forward`, got {shape:?}"
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "generate::last_position: expected [B, S, V] logits from `forward`",
+      shape.len() as u32,
+      shape.to_vec(),
     )));
   }
   // `logits[:, -1, :]` is only defined for a non-empty sequence axis and a
@@ -1735,9 +1787,10 @@ fn last_position(logits: &Array) -> Result<Array> {
   // (an empty distribution the sampler cannot draw from) as a recoverable
   // `Err` BEFORE any index arithmetic.
   if shape[1] == 0 || shape[2] == 0 {
-    return Err(Error::ShapeMismatch(format!(
-      "generate: `forward` returned logits with a zero-length axis (got [B, S, V] {shape:?}); \
-         `logits[:, -1, :]` requires S >= 1 and V >= 1"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "generate::last_position: forward logits axes (S and V)",
+      "must be >= 1 (logits[:, -1, :] requires S >= 1 and V >= 1)",
+      format_smolstr!("S={}, V={}", shape[1], shape[2]),
     )));
   }
   let (b, s, v) = (shape[0] as i32, shape[1] as i32, shape[2] as i32);
@@ -2581,9 +2634,10 @@ impl<M: Model + ?Sized> BatchGenerator<'_, M> {
     //    logprobs stay lazy.
     let tokens: Vec<u32> = sampled.to_vec::<u32>()?;
     if tokens.len() != b {
-      return Err(Error::ShapeMismatch(format!(
-        "batch_generate: sampler returned {} tokens, expected {b} (one per row)",
-        tokens.len()
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "batch_generate: sampler returned tokens (must be one per row)",
+        b,
+        tokens.len(),
       )));
     }
 
@@ -3063,9 +3117,10 @@ pub fn batch_generate<M: Model + ?Sized>(
       // Defensive: a sampler / model returning an out-of-range row index
       // would corrupt results; surface as a recoverable Err rather than a
       // panic.
-      // TODO(§5): promote to IndexOutOfRange { context: "batch_generate: step row", index: usize, len: usize } variant — both index and length are machine-inspectable.
-      return Err(Error::Backend(format!(
-        "batch_generate: step row {row} out of range for {b} prompts"
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "batch_generate: step row",
+        "must be < prompts count",
+        format_smolstr!("{row} (prompts={b})"),
       )));
     }
     match &step.finish_reason {
@@ -3136,8 +3191,10 @@ mod batch_tests {
       let (batch, seq) = match shape.as_slice() {
         [b, s] => (*b, *s),
         other => {
-          return Err(Error::ShapeMismatch(format!(
-            "MockBatchModel::forward expects [B, S] tokens, got {other:?}"
+          return Err(Error::RankMismatch(RankMismatchPayload::new(
+            "MockBatchModel::forward: tokens must be rank-2 [B, S]",
+            other.len() as u32,
+            other.to_vec(),
           )));
         }
       };
@@ -3580,8 +3637,10 @@ mod stop_sequence_tests {
         [b, s] => (*b, *s),
         [s] => (1usize, *s),
         other => {
-          return Err(Error::ShapeMismatch(format!(
-            "ScriptModel::forward expects [B, S] tokens, got {other:?}"
+          return Err(Error::RankMismatch(RankMismatchPayload::new(
+            "ScriptModel::forward: tokens must be rank-1 [S] or rank-2 [B, S]",
+            other.len() as u32,
+            other.to_vec(),
           )));
         }
       };

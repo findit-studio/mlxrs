@@ -54,9 +54,14 @@ use std::{
   path::{Path, PathBuf},
 };
 
+#[cfg(test)]
+use crate::error::RankMismatchPayload;
 use crate::{
   array::Array,
-  error::{EmptyInputPayload, Error, FileIoPayload, FileOp, Result, try_with_capacity},
+  error::{
+    EmptyInputPayload, Error, FileIoPayload, FileOp, MissingFieldPayload, ParsePayload, Result,
+    try_with_capacity,
+  },
   lm::{
     cache::{CacheConfig, KvCache, make_prompt_cache, save_prompt_cache},
     model::Model,
@@ -106,14 +111,24 @@ fn encode_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<Vec<u32>> {
     let messages = serde_json::json!([{ "role": "user", "content": prompt }]);
     let ids = tokenizer
       .apply_chat_template_ids(&messages, None, false, true, None)
-      .map_err(|e| Error::Backend(format!("cache_prompt: apply_chat_template failed: {e}")))?;
+      .map_err(|e| {
+        Error::Parse(ParsePayload::new(
+          "cache_prompt: apply_chat_template",
+          "chat template",
+          std::io::Error::other(e.to_string()),
+        ))
+      })?;
     Ok(ids)
   } else {
     // mlx-lm `tokenizer.encode(args.prompt)` — the tokenizer's default
     // special-token handling (transformers `encode` adds specials).
-    tokenizer
-      .encode(prompt, true)
-      .map_err(|e| Error::Backend(format!("cache_prompt: encode failed: {e}")))
+    tokenizer.encode(prompt, true).map_err(|e| {
+      Error::Parse(ParsePayload::new(
+        "cache_prompt: encode",
+        "prompt tokens",
+        std::io::Error::other(e.to_string()),
+      ))
+    })
   }
 }
 
@@ -408,9 +423,9 @@ fn open_excl_temp_safetensors(final_path: &Path, max_retries: u32) -> Result<Pat
   let file_name = final_path
     .file_name()
     .ok_or_else(|| {
-      Error::Backend(format!(
-        "cache_prompt: destination {} has no file_name component",
-        final_path.display()
+      Error::MissingField(MissingFieldPayload::new(
+        "cache_prompt: destination path",
+        "file_name component",
       ))
     })?
     .to_string_lossy()
@@ -442,18 +457,20 @@ fn open_excl_temp_safetensors(final_path: &Path, max_retries: u32) -> Result<Pat
         continue;
       }
       Err(e) => {
-        return Err(Error::Backend(format!(
-          "cache_prompt: create_new tempfile {} failed: {e}",
-          candidate.display()
+        return Err(Error::FileIo(FileIoPayload::new(
+          "cache_prompt: create_new tempfile",
+          FileOp::Create,
+          candidate,
+          e,
         )));
       }
     }
   }
-  Err(Error::Backend(format!(
-    "cache_prompt: exhausted {max_retries} tempfile retries (last error: {})",
-    last_err
-      .map(|e| e.to_string())
-      .unwrap_or_else(|| "<none>".into())
+  Err(Error::FileIo(FileIoPayload::new(
+    "cache_prompt: exhausted tempfile create_new retries (every candidate collided with an existing path)",
+    FileOp::Create,
+    final_path.to_path_buf(),
+    last_err.unwrap_or_else(|| std::io::Error::from(std::io::ErrorKind::AlreadyExists)),
   )))
 }
 
@@ -531,9 +548,11 @@ fn save_prompt_cache_atomic(
     && let Err(e) = fs::set_permissions(&tmp_path, perms)
   {
     let _ = fs::remove_file(&tmp_path);
-    return Err(Error::Backend(format!(
-      "cache_prompt: set_permissions on tempfile {} failed: {e}",
-      tmp_path.display()
+    return Err(Error::FileIo(FileIoPayload::new(
+      "cache_prompt: set_permissions on tempfile",
+      FileOp::Other("set_permissions"),
+      tmp_path,
+      e,
     )));
   }
 
@@ -542,10 +561,11 @@ fn save_prompt_cache_atomic(
   // destination keeps whatever it had before — never a partial file).
   if let Err(e) = fs::rename(&tmp_path, &dest) {
     let _ = fs::remove_file(&tmp_path);
-    return Err(Error::Backend(format!(
-      "cache_prompt: rename {} -> {} failed: {e}",
-      tmp_path.display(),
-      dest.display()
+    return Err(Error::FileIo(FileIoPayload::new(
+      "cache_prompt: rename tempfile -> destination",
+      FileOp::Rename,
+      tmp_path,
+      e,
     )));
   }
   Ok(())
@@ -664,8 +684,10 @@ mod tests {
           [_, s] => *s,
           [s] => *s,
           other => {
-            return Err(Error::ShapeMismatch(format!(
-              "Recorder: expected [B,S], got {other:?}"
+            return Err(Error::RankMismatch(RankMismatchPayload::new(
+              "Recorder::forward: tokens must be rank-1 [S] or rank-2 [B, S]",
+              other.len() as u32,
+              other.to_vec(),
             )));
           }
         };

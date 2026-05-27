@@ -22,9 +22,11 @@
 
 use std::collections::HashMap;
 
+use smol_str::format_smolstr;
+
 use crate::{
   Array, Result,
-  error::Error,
+  error::{Error, InvariantViolationPayload, NonFiniteScalarPayload, OutOfRangePayload},
   lm::{
     load::Weights,
     tuner::optimizers::base::{LearningRate, Optimizer, zeros_like},
@@ -38,9 +40,17 @@ use crate::{
 
 /// Validate `clip_threshold` is finite and `> 0.0` (used as a divisor).
 fn validate_clip_threshold(clip_threshold: f32) -> Result<()> {
-  if !clip_threshold.is_finite() || clip_threshold <= 0.0 {
-    return Err(Error::Backend(format!(
-      "Adafactor: clip_threshold must be finite and > 0.0, got {clip_threshold}"
+  if !clip_threshold.is_finite() {
+    return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+      "Adafactor: clip_threshold",
+      clip_threshold as f64,
+    )));
+  }
+  if clip_threshold <= 0.0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "Adafactor: clip_threshold",
+      "must be > 0.0 (used as a divisor)",
+      format_smolstr!("{clip_threshold}"),
     )));
   }
   Ok(())
@@ -54,10 +64,17 @@ fn validate_clip_threshold(clip_threshold: f32) -> Result<()> {
 /// Python default is `-0.8`; values `<= 0` keep `β₂` monotonically
 /// approaching 1 from below.
 fn validate_decay_rate(decay_rate: f32) -> Result<()> {
-  if !decay_rate.is_finite() || decay_rate > 0.0 {
-    return Err(Error::Backend(format!(
-      "Adafactor: decay_rate must be finite and <= 0.0 (so that 1 - step^decay_rate \
-         stays in [0, 1)), got {decay_rate}"
+  if !decay_rate.is_finite() {
+    return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+      "Adafactor: decay_rate",
+      decay_rate as f64,
+    )));
+  }
+  if decay_rate > 0.0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "Adafactor: decay_rate",
+      "must be <= 0.0 (so that 1 - step^decay_rate stays in [0, 1))",
+      format_smolstr!("{decay_rate}"),
     )));
   }
   Ok(())
@@ -66,9 +83,30 @@ fn validate_decay_rate(decay_rate: f32) -> Result<()> {
 /// Validate `eps = (ε₁, ε₂)` — both must be finite and `>= 0.0`.
 fn validate_eps(eps: (f32, f32)) -> Result<()> {
   let (e1, e2) = eps;
-  if !e1.is_finite() || e1 < 0.0 || !e2.is_finite() || e2 < 0.0 {
-    return Err(Error::Backend(format!(
-      "Adafactor: eps must be (finite >= 0, finite >= 0), got ({e1}, {e2})"
+  if !e1.is_finite() {
+    return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+      "Adafactor: eps.0",
+      e1 as f64,
+    )));
+  }
+  if !e2.is_finite() {
+    return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+      "Adafactor: eps.1",
+      e2 as f64,
+    )));
+  }
+  if e1 < 0.0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "Adafactor: eps.0",
+      "must be >= 0.0",
+      format_smolstr!("{e1}"),
+    )));
+  }
+  if e2 < 0.0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "Adafactor: eps.1",
+      "must be >= 0.0",
+      format_smolstr!("{e2}"),
     )));
   }
   Ok(())
@@ -76,21 +114,37 @@ fn validate_eps(eps: (f32, f32)) -> Result<()> {
 
 /// Validate `beta_1` is `None` or finite and in `[0.0, 1.0)`.
 fn validate_beta_1(beta_1: Option<f32>) -> Result<()> {
-  if let Some(b) = beta_1
-    && (!b.is_finite() || !(0.0..1.0).contains(&b))
-  {
-    return Err(Error::Backend(format!(
-      "Adafactor: beta_1 must be None or finite in [0.0, 1.0), got Some({b})"
-    )));
+  if let Some(b) = beta_1 {
+    if !b.is_finite() {
+      return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+        "Adafactor: beta_1",
+        b as f64,
+      )));
+    }
+    if !(0.0..1.0).contains(&b) {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "Adafactor: beta_1",
+        "must be None or in [0.0, 1.0)",
+        format_smolstr!("{b}"),
+      )));
+    }
   }
   Ok(())
 }
 
 /// Validate `weight_decay` is finite and `>= 0.0`.
 fn validate_weight_decay(weight_decay: f32) -> Result<()> {
-  if !weight_decay.is_finite() || weight_decay < 0.0 {
-    return Err(Error::Backend(format!(
-      "Adafactor: weight_decay must be finite and >= 0.0, got {weight_decay}"
+  if !weight_decay.is_finite() {
+    return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+      "Adafactor: weight_decay",
+      weight_decay as f64,
+    )));
+  }
+  if weight_decay < 0.0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "Adafactor: weight_decay",
+      "must be >= 0.0",
+      format_smolstr!("{weight_decay}"),
     )));
   }
   Ok(())
@@ -328,12 +382,12 @@ impl Adafactor {
   /// state.
   pub fn with_beta_1(mut self, beta_1: Option<f32>) -> Result<Self> {
     if !self.state.is_empty() {
-      return Err(Error::Backend(
-        "Adafactor::with_beta_1: cannot toggle beta_1 after parameter state is initialized \
-             (would desynchronize existing vs new parameters' exp_avg shape); construct a \
-             fresh Adafactor or use try_set_beta_1 (which preserves state on error)"
-          .into(),
-      ));
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "Adafactor::with_beta_1",
+        "cannot toggle beta_1 after parameter state is initialized (would desynchronize existing \
+         vs new parameters' exp_avg shape); construct a fresh Adafactor or use try_set_beta_1 \
+         (which preserves state on error)",
+      )));
     }
     validate_beta_1(beta_1)?;
     self.beta_1 = beta_1;
@@ -346,12 +400,11 @@ impl Adafactor {
   /// `state` is non-empty, leaving `self` unchanged on either branch.
   pub fn try_set_beta_1(&mut self, beta_1: Option<f32>) -> Result<()> {
     if !self.state.is_empty() {
-      return Err(Error::Backend(
-        "Adafactor::try_set_beta_1: cannot toggle beta_1 after parameter state is initialized \
-             (would desynchronize existing vs new parameters' exp_avg shape); construct a \
-             fresh Adafactor instead"
-          .into(),
-      ));
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "Adafactor::try_set_beta_1",
+        "cannot toggle beta_1 after parameter state is initialized (would desynchronize existing \
+         vs new parameters' exp_avg shape); construct a fresh Adafactor instead",
+      )));
     }
     validate_beta_1(beta_1)?;
     self.beta_1 = beta_1;

@@ -16,9 +16,11 @@
 
 use std::collections::HashMap;
 
+use smol_str::format_smolstr;
+
 use crate::{
   Array, Result,
-  error::Error,
+  error::{Error, NonFiniteScalarPayload, OutOfRangePayload},
   lm::{
     load::Weights,
     tuner::optimizers::base::{LearningRate, Optimizer, zeros_like, zeros_like_map},
@@ -29,9 +31,30 @@ use crate::{
 /// Validate that `betas` are both finite and in `[0.0, 1.0)`.
 fn validate_betas(betas: (f32, f32)) -> Result<()> {
   let (b1, b2) = betas;
-  if !b1.is_finite() || !b2.is_finite() || !(0.0..1.0).contains(&b1) || !(0.0..1.0).contains(&b2) {
-    return Err(Error::Backend(format!(
-      "Lion: betas must be finite and in [0.0, 1.0), got ({b1}, {b2})"
+  if !b1.is_finite() {
+    return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+      "Lion: betas.0",
+      b1 as f64,
+    )));
+  }
+  if !b2.is_finite() {
+    return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+      "Lion: betas.1",
+      b2 as f64,
+    )));
+  }
+  if !(0.0..1.0).contains(&b1) {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "Lion: betas.0",
+      "must be in [0.0, 1.0)",
+      format_smolstr!("{b1}"),
+    )));
+  }
+  if !(0.0..1.0).contains(&b2) {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "Lion: betas.1",
+      "must be in [0.0, 1.0)",
+      format_smolstr!("{b2}"),
     )));
   }
   Ok(())
@@ -39,9 +62,17 @@ fn validate_betas(betas: (f32, f32)) -> Result<()> {
 
 /// Validate that `weight_decay` is finite and `>= 0.0`.
 fn validate_weight_decay(weight_decay: f32) -> Result<()> {
-  if !weight_decay.is_finite() || weight_decay < 0.0 {
-    return Err(Error::Backend(format!(
-      "Lion: weight_decay must be finite and >= 0.0, got {weight_decay}"
+  if !weight_decay.is_finite() {
+    return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+      "Lion: weight_decay",
+      weight_decay as f64,
+    )));
+  }
+  if weight_decay < 0.0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "Lion: weight_decay",
+      "must be >= 0.0",
+      format_smolstr!("{weight_decay}"),
     )));
   }
   Ok(())

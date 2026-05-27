@@ -23,7 +23,11 @@
 //! result with a step stamp so the schedule closure is called at most ONCE
 //! per step (resolve-once guarantee, issue #244).
 
-use crate::{Array, Result, lm::load::Weights};
+use crate::{
+  Array, Result,
+  error::{Error, NonFiniteScalarPayload},
+  lm::load::Weights,
+};
 
 /// Learning-rate value or step-driven schedule.
 ///
@@ -63,18 +67,22 @@ impl LearningRate {
   }
 
   /// Resolve and validate the learning rate at `step`. Returns
-  /// [`crate::error::Error::Backend`] when the resolved value is
-  /// non-finite (NaN/Inf would scale updates into garbage). Optimizers
-  /// call this from `new` to reject a `Fixed(NaN)` or a `Schedule`
-  /// whose step-0 value is non-finite, and from `preflight` to catch a
-  /// schedule that goes non-finite mid-run (at most once per step via
-  /// the skip-if-fresh cache).
+  /// [`Error::NonFiniteScalar`] when the resolved value is non-finite
+  /// (NaN/Inf would scale updates into garbage). Optimizers call this
+  /// from `new` to reject a `Fixed(NaN)` or a `Schedule` whose step-0
+  /// value is non-finite, and from `preflight` to catch a schedule that
+  /// goes non-finite mid-run (at most once per step via the skip-if-fresh
+  /// cache). The runtime `step` is intentionally dropped from the typed
+  /// payload — the actionable information is that this `LearningRate`
+  /// produces non-finite values; callers that need the step number
+  /// already know which step they are calling from.
   pub fn try_current(&self, step: usize) -> Result<f32> {
     let v = self.current(step);
     if !v.is_finite() {
-      return Err(crate::error::Error::Backend(format!(
-        "LearningRate: resolved value at step {step} is not finite ({v}); reject \
-         non-finite learning rates so they cannot scale updates into NaN/Inf weights"
+      let _ = step;
+      return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+        "LearningRate::try_current: resolved value",
+        v as f64,
       )));
     }
     Ok(v)

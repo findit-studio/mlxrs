@@ -25,7 +25,7 @@ use std::{
 
 use crate::{
   array::Array,
-  error::{Error, Result, check},
+  error::{Error, FileIoPayload, FileOp, InteriorNulPayload, Result, check},
 };
 
 thread_local! {
@@ -67,10 +67,8 @@ fn io_cpu_stream() -> mlxrs_sys::mlx_stream {
 /// Convert a path to a NUL-terminated C string, rejecting embedded NULs.
 fn path_cstring(path: &Path) -> Result<CString> {
   CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
-    Error::Backend(format!(
-      "path contains an interior NUL byte: {}",
-      path.display()
-    ))
+    let _ = path;
+    Error::InteriorNul(InteriorNulPayload::new("io::path_cstring", "path"))
   })
 }
 
@@ -299,8 +297,13 @@ where
     )));
   }
   for (k, v) in arrays {
-    let ck = CString::new(k)
-      .map_err(|_| Error::Backend(format!("array key contains an interior NUL byte: {k:?}")))?;
+    let ck = CString::new(k).map_err(|_| {
+      let _ = k;
+      Error::InteriorNul(InteriorNulPayload::new(
+        "io::map_arrays insert",
+        "array key",
+      ))
+    })?;
     // SAFETY: `guard.0` is the valid handle from above; `ck.as_ptr()` is a
     // valid NUL-terminated C string that outlives the call (`ck` still in
     // scope); `v.0` is a valid borrowed `mlx_array`. mlx-c copies the key
@@ -348,11 +351,18 @@ fn build_string_map(meta: &HashMap<String, String>) -> Result<mlxrs_sys::mlx_map
     )));
   }
   for (k, v) in meta {
-    let ck = CString::new(k.as_str())
-      .map_err(|_| Error::Backend(format!("metadata key contains an interior NUL byte: {k:?}")))?;
+    let ck = CString::new(k.as_str()).map_err(|_| {
+      let _ = k;
+      Error::InteriorNul(InteriorNulPayload::new(
+        "io::map_meta insert",
+        "metadata key",
+      ))
+    })?;
     let cv = CString::new(v.as_str()).map_err(|_| {
-      Error::Backend(format!(
-        "metadata value contains an interior NUL byte: {v:?}"
+      let _ = v;
+      Error::InteriorNul(InteriorNulPayload::new(
+        "io::map_meta insert",
+        "metadata value",
       ))
     })?;
     // SAFETY: `guard.0` is the valid handle from above; `ck`/`cv` are valid
@@ -685,13 +695,19 @@ where
   // `save_safetensors_view` for atomic replacement: it reopens by name
   // and reintroduces the TOCTOU window this API was built to close.
   file.seek(SeekFrom::Start(0)).map_err(|e| {
-    Error::Backend(format!(
-      "save_safetensors_to_file: failed to rewind file to byte 0: {e}"
+    Error::FileIo(FileIoPayload::new(
+      "save_safetensors_to_file: seek to byte 0",
+      FileOp::Other("seek"),
+      std::path::PathBuf::new(),
+      e,
     ))
   })?;
   file.set_len(0).map_err(|e| {
-    Error::Backend(format!(
-      "save_safetensors_to_file: failed to truncate file: {e}"
+    Error::FileIo(FileIoPayload::new(
+      "save_safetensors_to_file: truncate to 0",
+      FileOp::Other("set_len"),
+      std::path::PathBuf::new(),
+      e,
     ))
   })?;
   // SAFETY: `writer` is the valid populated handle owned by `writer_guard`,
@@ -711,8 +727,11 @@ where
   // A captured io::Error from the write callback takes precedence over the
   // mlx-c rc (mlx-c will have raised once the write failed; rc != 0).
   if let Some(e) = state.into_err() {
-    return Err(Error::Backend(format!(
-      "save_safetensors_to_file: write callback failed: {e}"
+    return Err(Error::FileIo(FileIoPayload::new(
+      "save_safetensors_to_file: write callback",
+      FileOp::Write,
+      std::path::PathBuf::new(),
+      e,
     )));
   }
   check(rc)?;
@@ -1065,8 +1084,13 @@ pub fn load_gguf(path: &Path) -> Result<(HashMap<String, Array>, HashMap<String,
     let key = unsafe { CStr::from_ptr(raw) }
       .to_string_lossy()
       .into_owned();
-    let ckey = CString::new(key.as_str())
-      .map_err(|_| Error::Backend(format!("gguf key contains an interior NUL byte: {key:?}")))?;
+    let ckey = CString::new(key.as_str()).map_err(|_| {
+      let _ = &key;
+      Error::InteriorNul(InteriorNulPayload::new(
+        "io::gguf_load: key lookup",
+        "gguf key",
+      ))
+    })?;
 
     let mut f_arr = false;
     // SAFETY: `&mut f_arr` is a valid `bool` out-param; `gguf` is the valid
@@ -1192,8 +1216,10 @@ pub fn save_gguf(
 
   for (k, v) in weights {
     let ck = CString::new(k.as_str()).map_err(|_| {
-      Error::Backend(format!(
-        "gguf weight key contains an interior NUL byte: {k:?}"
+      let _ = &k;
+      Error::InteriorNul(InteriorNulPayload::new(
+        "io::gguf_save: weights insert",
+        "gguf weight key",
       ))
     })?;
     // SAFETY: `gguf` is the valid handle owned by `guard`; `ck.as_ptr()` is a
@@ -1205,8 +1231,10 @@ pub fn save_gguf(
 
   for (k, v) in metadata {
     let ck = CString::new(k.as_str()).map_err(|_| {
-      Error::Backend(format!(
-        "gguf metadata key contains an interior NUL byte: {k:?}"
+      let _ = &k;
+      Error::InteriorNul(InteriorNulPayload::new(
+        "io::gguf_save: metadata insert",
+        "gguf metadata key",
       ))
     })?;
     match v {
@@ -1219,8 +1247,10 @@ pub fn save_gguf(
       }
       GgufMetadata::String(s) => {
         let cs = CString::new(s.as_str()).map_err(|_| {
-          Error::Backend(format!(
-            "gguf metadata string contains an interior NUL byte: {s:?}"
+          let _ = &s;
+          Error::InteriorNul(InteriorNulPayload::new(
+            "io::gguf_save: metadata string insert",
+            "gguf metadata string value",
           ))
         })?;
         // SAFETY: `gguf` is the valid handle owned by `guard`; `ck` and `cs`
@@ -1240,8 +1270,10 @@ pub fn save_gguf(
         let vstr_guard = VectorStringGuard(vstr);
         for s in list {
           let cs = CString::new(s.as_str()).map_err(|_| {
-            Error::Backend(format!(
-              "gguf metadata list entry contains an interior NUL byte: {s:?}"
+            let _ = &s;
+            Error::InteriorNul(InteriorNulPayload::new(
+              "io::gguf_save: metadata list-entry append",
+              "gguf metadata list entry",
             ))
           })?;
           // SAFETY: `vstr` is the valid vector owned by `vstr_guard`; `cs` is

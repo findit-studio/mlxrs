@@ -95,8 +95,13 @@ use std::{
 
 use serde_json::Value;
 
+use smol_str::format_smolstr;
+
 use crate::{
-  error::{Error, FileIoPayload, FileOp, Result},
+  error::{
+    CapExceededPayload, EmptyInputPayload, Error, FileIoPayload, FileOp, MissingKeyPayload,
+    OutOfRangePayload, ParsePayload, Result,
+  },
   tokenizer::Tokenizer,
 };
 
@@ -218,9 +223,10 @@ impl Dataset for TextDataset<'_> {
 
   fn get(&self, idx: usize) -> Result<&Value> {
     self.data.get(idx).ok_or_else(|| {
-      Error::Backend(format!(
-        "TextDataset: index {idx} out of range (len={})",
-        self.data.len()
+      Error::OutOfRange(OutOfRangePayload::new(
+        "TextDataset: index",
+        "must be < len",
+        format_smolstr!("{idx} (len={})", self.data.len()),
       ))
     })
   }
@@ -309,9 +315,10 @@ impl Dataset for ChatDataset<'_> {
 
   fn get(&self, idx: usize) -> Result<&Value> {
     self.data.get(idx).ok_or_else(|| {
-      Error::Backend(format!(
-        "ChatDataset: index {idx} out of range (len={})",
-        self.data.len()
+      Error::OutOfRange(OutOfRangePayload::new(
+        "ChatDataset: index",
+        "must be < len",
+        format_smolstr!("{idx} (len={})", self.data.len()),
       ))
     })
   }
@@ -320,16 +327,16 @@ impl Dataset for ChatDataset<'_> {
   fn process(&self, idx: usize) -> Result<Example> {
     let record = self.get(idx)?;
     let messages = record.get(&self.chat_key).ok_or_else(|| {
-      Error::Backend(format!(
-        "ChatDataset: jsonl record missing '{}' field",
-        self.chat_key
+      Error::MissingKey(MissingKeyPayload::new(
+        "ChatDataset: jsonl record missing field",
+        self.chat_key.as_str(),
       ))
     })?;
     if !messages.is_array() {
-      return Err(Error::ShapeMismatch(format!(
-        "ChatDataset: '{}' field must be a JSON array, got {}",
-        self.chat_key,
-        json_kind(messages),
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "ChatDataset: chat field JSON kind (must be array)",
+        "must be a JSON array",
+        format_smolstr!("{}={}", self.chat_key, json_kind(messages)),
       )));
     }
     let tools = record.get("tools");
@@ -423,9 +430,10 @@ impl Dataset for CompletionsDataset<'_> {
 
   fn get(&self, idx: usize) -> Result<&Value> {
     self.data.get(idx).ok_or_else(|| {
-      Error::Backend(format!(
-        "CompletionsDataset: index {idx} out of range (len={})",
-        self.data.len()
+      Error::OutOfRange(OutOfRangePayload::new(
+        "CompletionsDataset: index",
+        "must be < len",
+        format_smolstr!("{idx} (len={})", self.data.len()),
       ))
     })
   }
@@ -513,9 +521,10 @@ impl<'a> ConcatenatedDataset<'a> {
       }
       remaining -= inner.len();
     }
-    Err(Error::Backend(format!(
-      "ConcatenatedDataset: index {idx} out of range (len={})",
-      self.len,
+    Err(Error::OutOfRange(OutOfRangePayload::new(
+      "ConcatenatedDataset: index",
+      "must be < len",
+      format_smolstr!("{idx} (len={})", self.len),
     )))
   }
 }
@@ -620,9 +629,10 @@ impl Dataset for CacheDataset<'_> {
     let computed = self.data.process(idx)?;
     let mut cache = self.proc_data.borrow_mut();
     if idx >= cache.len() {
-      return Err(Error::Backend(format!(
-        "CacheDataset: index {idx} out of range (len={})",
-        cache.len()
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "CacheDataset: index",
+        "must be < len",
+        format_smolstr!("{idx} (len={})", cache.len()),
       )));
     }
     cache[idx] = Some(computed.clone());
@@ -908,16 +918,19 @@ pub fn load_dataset<'a>(
   if let Some(s) = path.to_str()
     && (s.starts_with("hf://") || s.starts_with("hf:"))
   {
-    return Err(Error::Backend(format!(
-      "HF Hub datasets are out of scope for the local-only mlxrs build \
-         (path: {s}); pass a local jsonl file path instead"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "create_dataset: HF Hub URI rejected (local-only mlxrs build)",
+      "pass a local jsonl file path instead",
+      format_smolstr!("{s}"),
     )));
   }
 
   if !path.exists() {
-    return Err(Error::Backend(format!(
-      "jsonl path does not exist: {}",
-      path.display()
+    return Err(Error::FileIo(FileIoPayload::new(
+      "open jsonl",
+      FileOp::Open,
+      ::std::path::PathBuf::from(path),
+      std::io::Error::from(std::io::ErrorKind::NotFound),
     )));
   }
 
@@ -969,19 +982,19 @@ pub fn load_dataset<'a>(
     ))
   })?;
   if !meta.is_file() {
-    return Err(Error::Backend(format!(
-      "jsonl path is not a regular file: {} (directories, sockets, \
-         FIFOs etc. are not accepted)",
-      path.display(),
+    return Err(Error::FileIo(FileIoPayload::new(
+      "open jsonl: not a regular file (directories, sockets, FIFOs etc. are not accepted)",
+      FileOp::Stat,
+      ::std::path::PathBuf::from(path),
+      std::io::Error::from(std::io::ErrorKind::InvalidInput),
     )));
   }
   if meta.len() > MAX_DATASET_FILE_BYTES {
-    return Err(Error::Backend(format!(
-      "jsonl {} is {} bytes — refusing to read above the {}-byte cap; \
-         pass a smaller file or shard the data",
-      path.display(),
-      meta.len(),
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "open jsonl: file size",
+      "MAX_DATASET_FILE_BYTES",
       MAX_DATASET_FILE_BYTES,
+      meta.len(),
     )));
   }
 
@@ -992,11 +1005,8 @@ pub fn load_dataset<'a>(
   let data = read_jsonl_with_cap(BufReader::new(file), path, MAX_DATASET_FILE_BYTES)?;
 
   if data.is_empty() {
-    return Err(Error::Backend(format!(
-      "jsonl {} is empty — refusing to construct an empty dataset; \
-         non-empty jsonl is required (skip absent valid.jsonl/test.jsonl \
-         at the caller level)",
-      path.display(),
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "open jsonl: parsed records (file is empty; skip absent valid.jsonl/test.jsonl at caller level)",
     )));
   }
 
@@ -1035,7 +1045,6 @@ fn read_jsonl_with_cap<R: BufRead>(
 ) -> Result<Vec<Value>> {
   let mut data: Vec<Value> = Vec::new();
   let mut total_bytes: u64 = 0;
-  let mut lineno: usize = 0;
   let mut line_buf: Vec<u8> = Vec::with_capacity(4096);
   loop {
     line_buf.clear();
@@ -1045,23 +1054,21 @@ fn read_jsonl_with_cap<R: BufRead>(
       // is a cap overflow; if it's at EOF, normal exit.
       let mut peek = [0u8; 1];
       let n = std::io::Read::read(&mut reader, &mut peek).map_err(|e| {
-        Error::Backend(format!(
-          "read jsonl {} after line {}: {e}",
-          path_for_errors.display(),
-          lineno,
+        Error::FileIo(FileIoPayload::new(
+          "read jsonl: probing post-cap bytes",
+          FileOp::Read,
+          ::std::path::PathBuf::from(path_for_errors),
+          e,
         ))
       })?;
       if n == 0 {
         break;
       }
-      return Err(Error::Backend(format!(
-        "jsonl {} exceeded the {}-byte cap during read (cumulative \
-           bytes after line {} already at the cap, and more bytes \
-           remained in the reader); the file may have grown mid-read, \
-           or the per-line size is unexpectedly large",
-        path_for_errors.display(),
+      return Err(Error::CapExceeded(CapExceededPayload::new(
+        "read jsonl: cumulative bytes (more bytes remained in reader past the cap)",
+        "MAX_DATASET_FILE_BYTES",
         max_bytes,
-        lineno,
+        total_bytes.saturating_add(1),
       )));
     }
     // Cap THIS line's read at `remaining + 1` so we detect the
@@ -1085,10 +1092,11 @@ fn read_jsonl_with_cap<R: BufRead>(
     let n = match std::io::BufRead::read_until(&mut take, b'\n', &mut line_buf) {
       Ok(n) => n,
       Err(e) => {
-        return Err(Error::Backend(format!(
-          "read jsonl {} line {}: {e}",
-          path_for_errors.display(),
-          lineno + 1,
+        return Err(Error::FileIo(FileIoPayload::new(
+          "read jsonl: read_until",
+          FileOp::Read,
+          ::std::path::PathBuf::from(path_for_errors),
+          e,
         )));
       }
     };
@@ -1097,7 +1105,6 @@ fn read_jsonl_with_cap<R: BufRead>(
       break;
     }
     total_bytes = total_bytes.saturating_add(n as u64);
-    lineno += 1;
     // The cumulative cap is enforced INSIDE the read loop so that a
     // file which grows between the pre-open metadata check and the
     // actual read (or a custom reader that streams more bytes than
@@ -1106,13 +1113,10 @@ fn read_jsonl_with_cap<R: BufRead>(
     // SINGLE giant line that alone exceeds the cap without
     // allocating past `remaining + 1` bytes.
     if total_bytes > max_bytes {
-      return Err(Error::Backend(format!(
-        "jsonl {} exceeded the {}-byte cap during read (cumulative \
-           bytes after line {} reached at least {}); the file may have \
-           grown mid-read, or the per-line size is unexpectedly large",
-        path_for_errors.display(),
+      return Err(Error::CapExceeded(CapExceededPayload::new(
+        "read jsonl: cumulative bytes (file may have grown mid-read or per-line size is unexpectedly large)",
+        "MAX_DATASET_FILE_BYTES",
         max_bytes,
-        lineno,
         total_bytes,
       )));
     }
@@ -1127,10 +1131,10 @@ fn read_jsonl_with_cap<R: BufRead>(
     // Bytes were read into `line_buf`; treat the contents as UTF-8
     // for the parsing path that follows.
     let line = std::str::from_utf8(&line_buf).map_err(|e| {
-      Error::Backend(format!(
-        "jsonl {} line {} is not valid UTF-8: {e}",
-        path_for_errors.display(),
-        lineno,
+      Error::Parse(ParsePayload::new(
+        "read jsonl: line is not valid UTF-8",
+        "jsonl line UTF-8",
+        Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
       ))
     })?;
     let trimmed = line.trim();
@@ -1138,18 +1142,15 @@ fn read_jsonl_with_cap<R: BufRead>(
       // Python `tuner/datasets.py` does `[json.loads(l) for l in fid]`,
       // which raises on an empty string. Silently dropping a blank
       // would shift subsequent indices and mask corruption.
-      return Err(Error::Backend(format!(
-        "jsonl {} line {} is blank — every line must be a valid JSON \
-           record (matches Python `json.loads(l)` failing on \"\")",
-        path_for_errors.display(),
-        lineno,
+      return Err(Error::EmptyInput(EmptyInputPayload::new(
+        "read jsonl: blank line (every line must be a valid JSON record; matches Python `json.loads(l)` failing on \"\")",
       )));
     }
     let v: Value = serde_json::from_str(trimmed).map_err(|e| {
-      Error::Backend(format!(
-        "parse jsonl {} line {}: {e}",
-        path_for_errors.display(),
-        lineno,
+      Error::Parse(ParsePayload::new(
+        "read jsonl: serde_json::from_str",
+        "jsonl record",
+        Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
       ))
     })?;
     data.push(v);
@@ -1161,15 +1162,18 @@ fn read_jsonl_with_cap<R: BufRead>(
 
 /// Extract a string field from a jsonl record, returning a clean error
 /// when missing or wrong-typed.
-fn field_as_str<'a>(record: &'a Value, key: &str, type_name: &str) -> Result<&'a str> {
-  let v = record
-    .get(key)
-    // TODO(§5): promote to MissingField — `type_name` and `key` are runtime &str, not 'static; needs a DynamicMissingField variant or Cow<'static, str> fields.
-    .ok_or_else(|| Error::Backend(format!("{type_name}: jsonl record missing '{key}' field")))?;
+fn field_as_str<'a>(record: &'a Value, key: &str, type_name: &'static str) -> Result<&'a str> {
+  let v = record.get(key).ok_or_else(|| {
+    Error::MissingKey(MissingKeyPayload::new(
+      type_name,
+      format_smolstr!("jsonl record missing '{key}'"),
+    ))
+  })?;
   v.as_str().ok_or_else(|| {
-    Error::ShapeMismatch(format!(
-      "{type_name}: '{key}' field must be a string, got {}",
-      json_kind(v),
+    Error::OutOfRange(OutOfRangePayload::new(
+      type_name,
+      "field must be a JSON string",
+      format_smolstr!("'{key}'={}", json_kind(v)),
     ))
   })
 }
@@ -1378,11 +1382,10 @@ mod tests {
     let data = vec![json!({ "not_text": "hello" })];
     let ds = TextDataset::new(data, &tok, DEFAULT_TEXT_KEY);
     let err = ds.process(0).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-      msg.contains("missing 'text' field"),
-      "expected missing-field error, got: {msg}"
-    );
+    match err {
+      Error::MissingKey(p) => assert_eq!(p.key(), "jsonl record missing 'text'"),
+      other => panic!("expected MissingKey, got: {other:?}"),
+    }
   }
 
   #[test]
@@ -1392,8 +1395,8 @@ mod tests {
     let ds = TextDataset::new(data, &tok, DEFAULT_TEXT_KEY);
     let err = ds.process(0).unwrap_err();
     assert!(
-      matches!(err, Error::ShapeMismatch(_)),
-      "expected ShapeMismatch, got: {err:?}"
+      matches!(err, Error::OutOfRange(_)),
+      "expected OutOfRange, got: {err:?}"
     );
   }
 
@@ -1441,10 +1444,12 @@ mod tests {
     let data = vec![json!({ "no_messages_field": [] })];
     let ds = ChatDataset::new(data, &tok, DEFAULT_CHAT_KEY, false);
     let err = ds.process(0).unwrap_err();
-    assert!(
-      err.to_string().contains("missing 'messages' field"),
-      "got: {err}"
-    );
+    match err {
+      Error::MissingKey(p) => {
+        assert_eq!(p.key(), "messages");
+      }
+      other => panic!("expected MissingKey, got: {other:?}"),
+    }
   }
 
   #[test]
@@ -1454,8 +1459,8 @@ mod tests {
     let ds = ChatDataset::new(data, &tok, DEFAULT_CHAT_KEY, false);
     let err = ds.process(0).unwrap_err();
     assert!(
-      matches!(err, Error::ShapeMismatch(_)),
-      "expected ShapeMismatch, got: {err:?}"
+      matches!(err, Error::OutOfRange(_)),
+      "expected OutOfRange, got: {err:?}"
     );
   }
 
@@ -1504,10 +1509,10 @@ mod tests {
       false,
     );
     let err = ds.process(0).unwrap_err();
-    assert!(
-      err.to_string().contains("missing 'prompt' field"),
-      "got: {err}"
-    );
+    match err {
+      Error::MissingKey(p) => assert_eq!(p.key(), "jsonl record missing 'prompt'"),
+      other => panic!("expected MissingKey, got: {other:?}"),
+    }
   }
 
   // ───────────────────────── ConcatenatedDataset ─────────────────────────
@@ -1693,10 +1698,10 @@ mod tests {
     let tok = tokenizer_fixture("load_hf");
     let p = PathBuf::from("hf://datasets/mlx-community/some-dataset");
     let err = load_dataset(&p, &tok, DatasetType::Auto, &DatasetConfig::default()).unwrap_err();
-    assert!(
-      err.to_string().contains("HF Hub datasets are out of scope"),
-      "got: {err}"
-    );
+    match err {
+      Error::OutOfRange(p) => assert!(p.context().contains("HF Hub URI rejected"), "got: {p:?}"),
+      other => panic!("expected OutOfRange, got: {other:?}"),
+    }
   }
 
   #[test]
@@ -1720,14 +1725,15 @@ mod tests {
     let p = dir.join("train.jsonl");
     std::fs::write(&p, "").unwrap();
     let err = load_dataset(&p, &tok, DatasetType::Auto, &DatasetConfig::default()).unwrap_err();
-    let s = err.to_string();
     assert!(
-      s.contains("is empty"),
-      "expected empty-file rejection, got: {s}",
+      matches!(err, Error::EmptyInput(_)),
+      "expected EmptyInput rejection, got: {err:?}",
     );
+    let s = err.to_string();
+    let _ = &s;
     assert!(
-      s.contains("train.jsonl"),
-      "expected path in error message, got: {s}",
+      s.contains("empty"),
+      "expected 'empty' in error message, got: {s}",
     );
   }
 
@@ -1737,15 +1743,15 @@ mod tests {
     let dir = fresh_dir("load_blank_data");
     let p = dir.join("train.jsonl");
     // A valid record, then a literal blank line, then another valid
-    // record — the blank in the middle must surface as a hard error
-    // with the correct 1-based line number, not be silently dropped.
+    // record — the blank in the middle must surface as a hard error,
+    // not be silently dropped.
     std::fs::write(&p, "{\"text\": \"hello\"}\n\n{\"text\": \"world\"}\n").unwrap();
     let err = load_dataset(&p, &tok, DatasetType::Text, &DatasetConfig::default()).unwrap_err();
-    let s = err.to_string();
     assert!(
-      s.contains("line 2"),
-      "expected line 2 in blank-line error, got: {s}",
+      matches!(err, Error::EmptyInput(_)),
+      "expected EmptyInput on blank line, got: {err:?}",
     );
+    let s = err.to_string();
     assert!(
       s.contains("blank"),
       "expected 'blank' in blank-line error, got: {s}",
@@ -1782,19 +1788,18 @@ mod tests {
     let body = "{\"text\": \"aaa\"}\n{\"text\": \"bbb\"}\n{\"text\": \"ccc\"}\n";
     let path = std::path::PathBuf::from("/synthetic/grows.jsonl");
     let err = read_jsonl_with_cap(Cursor::new(body), &path, cap).unwrap_err();
-    let s = err.to_string();
-    assert!(
-      s.contains("exceeded the 40-byte cap"),
-      "expected in-loop cap error, got: {s}",
-    );
-    assert!(
-      s.contains("during read"),
-      "expected 'during read' phrasing in cap error, got: {s}",
-    );
-    assert!(
-      s.contains("/synthetic/grows.jsonl"),
-      "expected synthetic path in cap error, got: {s}",
-    );
+    match err {
+      Error::CapExceeded(p) => {
+        assert_eq!(p.cap(), 40);
+        assert_eq!(p.cap_name(), "MAX_DATASET_FILE_BYTES");
+        assert!(p.observed() > 40, "observed must exceed cap, got: {p:?}");
+        assert!(
+          p.context().contains("read jsonl"),
+          "expected read-jsonl context, got: {p:?}"
+        );
+      }
+      other => panic!("expected CapExceeded, got: {other:?}"),
+    }
   }
 
   #[test]
@@ -1808,10 +1813,9 @@ mod tests {
     )
     .unwrap();
     let err = load_dataset(&p, &tok, DatasetType::Text, &DatasetConfig::default()).unwrap_err();
-    let s = err.to_string();
     assert!(
-      s.contains("line 2"),
-      "expected line number in error, got: {s}"
+      matches!(err, Error::Parse(_)),
+      "expected Parse error on malformed line, got: {err:?}",
     );
   }
 
@@ -1823,7 +1827,12 @@ mod tests {
       std::process::id()
     ));
     let err = load_dataset(&p, &tok, DatasetType::Auto, &DatasetConfig::default()).unwrap_err();
-    assert!(err.to_string().contains("does not exist"), "got: {err}");
+    match err {
+      Error::FileIo(p) => {
+        assert_eq!(p.inner().kind(), std::io::ErrorKind::NotFound);
+      }
+      other => panic!("expected FileIo NotFound, got: {other:?}"),
+    }
   }
 
   #[test]
@@ -1899,7 +1908,7 @@ mod tests {
     let handle = std::thread::spawn(move || {
       let r = load_dataset(&path, &tok, DatasetType::Auto, &DatasetConfig::default());
       let msg = match &r {
-        Err(Error::Backend(message)) => Some(message.clone()),
+        Err(Error::FileIo(p)) => Some(p.to_string()),
         _ => None,
       };
       let _ = tx.send(msg);
@@ -1917,7 +1926,7 @@ mod tests {
       Ok(None) => {
         handle.join().unwrap();
         panic!(
-          "FIFO at dataset path must yield Err(Backend), got a \
+          "FIFO at dataset path must yield Err(FileIo), got a \
            different result"
         );
       }
@@ -1969,19 +1978,21 @@ mod tests {
     // the call returns.
     let mut counting = CountingReader::new(BufReader::new(Cursor::new(body)));
     let err = read_jsonl_with_cap(&mut counting, &path, cap).unwrap_err();
-    let s = err.to_string();
-    assert!(
-      s.contains("exceeded the 40-byte cap"),
-      "expected 40-byte cap error on a single giant line, got: {s}",
-    );
-    assert!(
-      s.contains("during read"),
-      "expected 'during read' phrasing in cap error, got: {s}",
-    );
-    assert!(
-      s.contains("/synthetic/giant.jsonl"),
-      "expected synthetic path in cap error, got: {s}",
-    );
+    match &err {
+      Error::CapExceeded(p) => {
+        assert_eq!(p.cap(), 40);
+        assert_eq!(p.cap_name(), "MAX_DATASET_FILE_BYTES");
+        assert!(
+          p.observed() >= cap,
+          "observed must be at or above cap, got: {p:?}"
+        );
+        assert!(
+          p.context().contains("read jsonl"),
+          "expected read-jsonl context, got: {p:?}"
+        );
+      }
+      other => panic!("expected CapExceeded, got: {other:?}"),
+    }
 
     // PROVE the `take(remaining + 1)` allocation cap held — at most
     // `cap + 1 = 41` bytes consumed from the underlying reader,

@@ -51,9 +51,14 @@
 //! ([`crate::lm::cache::can_trim_prompt_cache`]); a non-trimmable cache
 //! surfaces as an early `Err`, mirroring mlx-lm lines 529-533.
 
+use smol_str::format_smolstr;
+
 use crate::{
   array::Array,
-  error::{Error, InvariantViolationPayload, Result, try_extend_from_slice, try_with_capacity},
+  error::{
+    Error, InvariantViolationPayload, OutOfRangePayload, RankMismatchPayload, Result,
+    try_extend_from_slice, try_with_capacity,
+  },
   lm::{
     cache::{KvCache, can_trim_prompt_cache, trim_prompt_cache},
     generate::{FinishReason, GenConfig, GenerationResponse, make_logits_processors, make_sampler},
@@ -950,20 +955,24 @@ fn token_window(ids: &[u32]) -> Result<Array> {
 fn last_n_positions(logits: &Array, n: usize) -> Result<Array> {
   let shape = logits.shape();
   if shape.len() != 3 {
-    return Err(Error::ShapeMismatch(format!(
-      "speculative_generate: expected [B, S, V] logits from `forward`, got {shape:?}"
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "speculative_generate: expected [B, S, V] logits from `forward`",
+      shape.len() as u32,
+      shape.to_vec(),
     )));
   }
   if shape[1] == 0 || shape[2] == 0 {
-    return Err(Error::ShapeMismatch(format!(
-      "speculative_generate: `forward` returned logits with a zero-length axis (got [B, S, V] \
-         {shape:?}); slicing the last `n` positions requires S >= 1 and V >= 1"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "speculative_generate: forward logits axes (S and V)",
+      "must be >= 1 to slice the last n positions",
+      format_smolstr!("S={}, V={}", shape[1], shape[2]),
     )));
   }
   if n == 0 || n > shape[1] {
-    return Err(Error::ShapeMismatch(format!(
-      "speculative_generate: cannot slice last {n} positions from logits with S = {}",
-      shape[1]
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "speculative_generate: slice n",
+      "must be in 1..=S",
+      format_smolstr!("n={n} (S={})", shape[1]),
     )));
   }
   let (b, s, v) = (shape[0] as i32, shape[1] as i32, shape[2] as i32);
@@ -977,14 +986,18 @@ fn last_n_positions(logits: &Array, n: usize) -> Result<Array> {
 fn slice_position(logits: &Array, pos: i32) -> Result<Array> {
   let shape = logits.shape();
   if shape.len() != 3 {
-    return Err(Error::ShapeMismatch(format!(
-      "slice_position: expected [B, S, V], got {shape:?}"
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "slice_position: expected [B, S, V]",
+      shape.len() as u32,
+      shape.to_vec(),
     )));
   }
   let s = shape[1] as i32;
   if pos < 0 || pos >= s {
-    return Err(Error::ShapeMismatch(format!(
-      "slice_position: pos {pos} out of range for S = {s}"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "slice_position: pos",
+      "must be in 0..S",
+      format_smolstr!("pos={pos} (S={s})"),
     )));
   }
   let (b, v) = (shape[0] as i32, shape[2] as i32);

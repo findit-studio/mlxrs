@@ -15,9 +15,11 @@
 
 use std::collections::HashMap;
 
+use smol_str::format_smolstr;
+
 use crate::{
   Array, Result,
-  error::Error,
+  error::{Error, NonFiniteScalarPayload, OutOfRangePayload},
   lm::{
     load::Weights,
     tuner::optimizers::base::{LearningRate, Optimizer, zeros_like, zeros_like_map},
@@ -27,9 +29,17 @@ use crate::{
 
 /// Validate `eps` is finite and `>= 0.0`.
 fn validate_eps(eps: f32) -> Result<()> {
-  if !eps.is_finite() || eps < 0.0 {
-    return Err(Error::Backend(format!(
-      "Adagrad: eps must be finite and >= 0.0, got {eps}"
+  if !eps.is_finite() {
+    return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+      "Adagrad: eps",
+      eps as f64,
+    )));
+  }
+  if eps < 0.0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "Adagrad: eps",
+      "must be >= 0.0",
+      format_smolstr!("{eps}"),
     )));
   }
   Ok(())

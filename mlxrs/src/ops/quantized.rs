@@ -29,7 +29,7 @@ use std::ffi::CString;
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{Result, check},
+  error::{Error, InteriorNulPayload, LengthMismatchPayload, Result, check},
   stream::default_stream,
 };
 
@@ -69,8 +69,10 @@ fn opt_array(a: Option<&Array>) -> (mlxrs_sys::mlx_array, Option<Array>) {
 #[inline(always)]
 fn mode_cstring(mode: &str) -> Result<CString> {
   CString::new(mode).map_err(|_| {
-    crate::Error::Backend(format!(
-      "mlxrs::ops::quantized: `mode` contains an interior NUL byte: {mode:?}"
+    let _ = mode;
+    Error::InteriorNul(InteriorNulPayload::new(
+      "mlxrs::ops::quantized::mode_cstring",
+      "mode",
     ))
   })
 }
@@ -347,9 +349,14 @@ pub fn gather_qmm(
 /// Error for a `quantize` output vector whose length is neither 2
 /// (bias-less float modes: `{w_q, scales}`) nor 3 (affine:
 /// `{w_q, scales, biases}`) — the only arities mlx's `quantize` produces.
-fn unexpected_arity(n: usize) -> crate::Error {
-  crate::Error::Backend(format!(
-    "mlxrs::ops::quantized::quantize: mlx_quantize returned {n} outputs; \
-       expected 2 (bias-less float modes) or 3 (affine)"
+fn unexpected_arity(n: usize) -> Error {
+  // mlx_quantize emits 2 (bias-less float modes: {w_q, scales}) OR 3
+  // (affine: {w_q, scales, biases}). Treat 3 as the canonical expected
+  // arity for LengthMismatch and surface the observed `n` so callers can
+  // branch without re-parsing the message.
+  Error::LengthMismatch(LengthMismatchPayload::new(
+    "ops::quantized::quantize: mlx_quantize output arity (must be 2 for bias-less float modes or 3 for affine)",
+    3,
+    n,
   ))
 }

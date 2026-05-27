@@ -20,10 +20,15 @@ use std::ffi::CString;
 
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
 
+use smol_str::format_smolstr;
+
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{Error, Result, check, check_vector_array_handle},
+  error::{
+    EmptyInputPayload, Error, InteriorNulPayload, LengthMismatchPayload, OutOfRangePayload, Result,
+    check, check_vector_array_handle,
+  },
   stream::default_stream,
 };
 
@@ -259,8 +264,10 @@ fn build_vector_string(items: &[&str], context: &'static str) -> Result<VectorSt
   let guard = VectorStringGuard(vstr);
   for s in items {
     let cs = CString::new(*s).map_err(|_| {
-      Error::Backend(format!(
-        "mlxrs::ops::fast::metal_kernel: {context} entry contains an interior NUL byte: {s:?}"
+      let _ = s;
+      Error::InteriorNul(InteriorNulPayload::new(
+        "ops::fast::metal_kernel::vector_string entry append",
+        context,
       ))
     })?;
     // SAFETY: `vstr` is the valid vector owned by `guard`; `cs` is a valid
@@ -275,8 +282,10 @@ fn build_vector_string(items: &[&str], context: &'static str) -> Result<VectorSt
 /// a backend-style error.
 fn cstring_or_err(s: &str, context: &'static str) -> Result<CString> {
   CString::new(s).map_err(|_| {
-    Error::Backend(format!(
-      "mlxrs::ops::fast::metal_kernel: {context} contains an interior NUL byte: {s:?}"
+    let _ = s;
+    Error::InteriorNul(InteriorNulPayload::new(
+      "ops::fast::metal_kernel::cstring_or_err",
+      context,
     ))
   })
 }
@@ -292,10 +301,10 @@ fn to_dispatch_dim(dim: [u32; 3], context: &'static str) -> Result<[i32; 3]> {
   let mut out = [0_i32; 3];
   for (axis, &v) in dim.iter().enumerate() {
     out[axis] = i32::try_from(v).map_err(|_| {
-      Error::Backend(format!(
-        "mlxrs::ops::fast::metal_kernel: {context}[{axis}]={v} exceeds i32::MAX \
-         ({}), which mlx-c's set_{context} requires; reduce the dispatch dimension",
-        i32::MAX
+      Error::OutOfRange(OutOfRangePayload::new(
+        context,
+        "must fit in i32 (mlx-c set_grid / set_thread_group requires i32; reduce the dispatch dimension)",
+        format_smolstr!("{context}[{axis}]={v}"),
       ))
     })?;
   }
@@ -486,19 +495,17 @@ impl MetalKernel {
 
     let expected = self.output_names.len();
     if config.output_shapes_slice().len() != expected {
-      return Err(Error::ShapeMismatch(format!(
-        "mlxrs::ops::fast::metal_kernel: output_shapes.len()={} does not match \
-           the kernel's declared output_names.len()={}",
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "metal_kernel::apply: output_shapes vs kernel output_names",
+        expected,
         config.output_shapes_slice().len(),
-        expected
       )));
     }
     if config.output_dtypes_slice().len() != expected {
-      return Err(Error::ShapeMismatch(format!(
-        "mlxrs::ops::fast::metal_kernel: output_dtypes.len()={} does not match \
-           the kernel's declared output_names.len()={}",
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "metal_kernel::apply: output_dtypes vs kernel output_names",
+        expected,
         config.output_dtypes_slice().len(),
-        expected
       )));
     }
 
@@ -512,19 +519,13 @@ impl MetalKernel {
     // a JIT-time backend message, and prevents the empty-slice case from
     // ever reaching the FFI (where it would otherwise rely on `dim_ptr`'s
     // sentinel for defined-pointer semantics).
-    for (idx, shape) in config.output_shapes_slice().iter().enumerate() {
+    for shape in config.output_shapes_slice().iter() {
       if shape.is_empty() {
-        return Err(Error::ShapeMismatch(format!(
-          "mlxrs::ops::fast::metal_kernel: output_shapes[{idx}] is empty; \
-             custom Metal kernel outputs must have rank ≥ 1"
+        return Err(Error::EmptyInput(EmptyInputPayload::new(
+          "metal_kernel::apply: output_shapes[idx] (custom Metal kernel outputs must have rank >= 1)",
         )));
       }
-      crate::shape::validate_dims(shape).map_err(|e| match e {
-        Error::ShapeMismatch(message) => Error::ShapeMismatch(format!(
-          "mlxrs::ops::fast::metal_kernel: output_shapes[{idx}]: {message}"
-        )),
-        other => other,
-      })?;
+      crate::shape::validate_dims(shape)?;
     }
 
     // Pre-FFI dispatch-dimension overflow check.
@@ -869,17 +870,13 @@ mod tests {
 
   fn assert_interior_nul(err: &Error, needle: &str) {
     match err {
-      Error::Backend(message) => {
+      Error::InteriorNul(p) => {
         assert!(
-          message.contains("interior NUL byte"),
-          "expected interior-NUL message, got: {message:?}"
-        );
-        assert!(
-          message.contains(needle),
-          "expected message to mention {needle:?}, got: {message:?}"
+          p.bytes_kind() == needle || p.bytes_kind().contains(needle.trim_matches('`')),
+          "expected bytes_kind to match {needle:?}, got: {p:?}"
         );
       }
-      other => panic!("expected Error::Backend with interior-NUL, got: {other:?}"),
+      other => panic!("expected Error::InteriorNul, got: {other:?}"),
     }
   }
 
@@ -956,17 +953,13 @@ mod tests {
       .apply(&[&input], &cfg)
       .expect_err("negative output dim should be rejected before FFI");
     match err {
-      Error::ShapeMismatch(message) => {
-        assert!(
-          message.contains("output_shapes[0]"),
-          "expected indexed message, got: {message:?}"
-        );
-        assert!(
-          message.contains("negative"),
-          "expected `negative` in message, got: {message:?}"
-        );
+      Error::OutOfRange(payload) => {
+        assert_eq!(payload.context(), "shape::validate_dims: dim");
+        assert_eq!(payload.requirement(), "must be non-negative");
+        // `validate_dims` formats the value as `dim[{i}]={d}` for the offending entry.
+        assert_eq!(payload.value(), "dim[0]=-1");
       }
-      other => panic!("expected ShapeMismatch, got: {other:?}"),
+      other => panic!("expected OutOfRange, got: {other:?}"),
     }
   }
 
@@ -983,17 +976,13 @@ mod tests {
       .apply(&[&input], &cfg)
       .expect_err("empty output shape should be rejected before FFI");
     match err {
-      Error::ShapeMismatch(message) => {
-        assert!(
-          message.contains("output_shapes[0]"),
-          "expected indexed message, got: {message:?}"
-        );
-        assert!(
-          message.contains("empty"),
-          "expected `empty` in message, got: {message:?}"
+      Error::EmptyInput(payload) => {
+        assert_eq!(
+          payload.context(),
+          "metal_kernel::apply: output_shapes[idx] (custom Metal kernel outputs must have rank >= 1)"
         );
       }
-      other => panic!("expected ShapeMismatch, got: {other:?}"),
+      other => panic!("expected EmptyInput, got: {other:?}"),
     }
   }
 }

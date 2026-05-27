@@ -42,10 +42,15 @@
 //! [`make_prompt_cache`]: crate::lm::cache::make_prompt_cache
 //! [`CacheConfig`]: crate::lm::cache::CacheConfig
 
+use smol_str::format_smolstr;
+
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{Error, LengthMismatchPayload, Result, try_with_capacity},
+  error::{
+    Error, LengthMismatchPayload, OutOfRangePayload, RankMismatchPayload, Result,
+    ShapePairMismatchPayload, try_with_capacity,
+  },
   lm::{
     cache::{CacheConfig, make_prompt_cache},
     model::Model,
@@ -105,15 +110,18 @@ pub struct PerplexityResult {
 /// short to fill a single window.
 pub fn make_windows(tokens: &[i32], sequence_length: usize) -> Result<Array> {
   if sequence_length < MIN_WINDOW {
-    return Err(Error::ShapeMismatch(format!(
-      "perplexity::make_windows: sequence_length {sequence_length} < MIN_WINDOW {MIN_WINDOW}"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "perplexity::make_windows: sequence_length",
+      "must be >= MIN_WINDOW (one input + one target)",
+      format_smolstr!("{sequence_length} (MIN_WINDOW={MIN_WINDOW})"),
     )));
   }
   let num_rows = tokens.len() / sequence_length;
   if num_rows == 0 {
-    return Err(Error::ShapeMismatch(format!(
-      "perplexity::make_windows: {} tokens cannot fill one window of length {sequence_length}",
-      tokens.len()
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "perplexity::make_windows: tokens.len()",
+      "must be >= sequence_length to fill one window",
+      format_smolstr!("{} (sequence_length={sequence_length})", tokens.len()),
     )));
   }
   // `data[: (len // L) * L]` — drop the ragged tail, then `reshape(-1, L)`.
@@ -174,9 +182,10 @@ pub fn cross_entropy_none(logits: &Array, targets: &Array) -> Result<Array> {
   let expected = &logits_shape[..logits_ndim - 1];
   let targets_shape = targets.shape();
   if targets_shape.as_slice() != expected {
-    return Err(Error::ShapeMismatch(format!(
-      "perplexity::cross_entropy_none: targets shape {targets_shape:?} does not match logits \
-         shape {logits_shape:?} with the class axis removed (expected {expected:?})"
+    return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+      "perplexity::cross_entropy_none: targets must equal logits with the class axis removed",
+      expected.to_vec(),
+      targets_shape.to_vec(),
     )));
   }
   // `mx.take_along_axis(logits, mx.expand_dims(targets, axis), axis).squeeze(axis)`.
@@ -226,15 +235,18 @@ pub fn perplexity<M: Model>(
   let (num_rows, seq_len) = match shape.as_slice() {
     [n, l] => (*n, *l),
     other => {
-      return Err(Error::ShapeMismatch(format!(
-        "perplexity: data must be a rank-2 [N, L] token matrix, got {other:?}"
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        "perplexity: data must be a rank-2 [N, L] token matrix",
+        other.len() as u32,
+        other.to_vec(),
       )));
     }
   };
   if seq_len < MIN_WINDOW {
-    return Err(Error::ShapeMismatch(format!(
-      "perplexity: window length {seq_len} < MIN_WINDOW {MIN_WINDOW} \
-         (a window must hold one input + one target)"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "perplexity: window length (must hold one input + one target)",
+      "must be >= MIN_WINDOW",
+      format_smolstr!("{seq_len} (MIN_WINDOW={MIN_WINDOW})"),
     )));
   }
   // mlx-lm clamps nothing but a 0 batch size would loop forever; treat it as 1.
@@ -532,23 +544,27 @@ mod tests {
 
     // targets `[B, 1]` — class-index rank (ndim 2 == 3 - 1) but broadcasts over S.
     let bad_bs = Array::from_slice::<i32>(&[0, 1], &(b, 1usize)).unwrap();
-    assert!(
-      matches!(
-        cross_entropy_none(&logits, &bad_bs),
-        Err(Error::ShapeMismatch(_))
-      ),
-      "targets [B, 1] should be rejected, not broadcast across S"
-    );
+    let err_bs = cross_entropy_none(&logits, &bad_bs)
+      .expect_err("targets [B, 1] should be rejected, not broadcast across S");
+    match err_bs {
+      Error::ShapePairMismatch(payload) => {
+        assert_eq!(payload.expected(), &[b, s][..]);
+        assert_eq!(payload.actual(), &[b, 1][..]);
+      }
+      other => panic!("expected ShapePairMismatch, got: {other:?}"),
+    }
 
     // targets `[1, S]` — also right rank, broadcasts over B.
     let bad_1s = Array::from_slice::<i32>(&[0, 1, 2], &(1usize, s)).unwrap();
-    assert!(
-      matches!(
-        cross_entropy_none(&logits, &bad_1s),
-        Err(Error::ShapeMismatch(_))
-      ),
-      "targets [1, S] should be rejected, not broadcast across B"
-    );
+    let err_1s = cross_entropy_none(&logits, &bad_1s)
+      .expect_err("targets [1, S] should be rejected, not broadcast across B");
+    match err_1s {
+      Error::ShapePairMismatch(payload) => {
+        assert_eq!(payload.expected(), &[b, s][..]);
+        assert_eq!(payload.actual(), &[1, s][..]);
+      }
+      other => panic!("expected ShapePairMismatch, got: {other:?}"),
+    }
 
     // The exact-shape targets `[B, S]` are accepted.
     let good = Array::from_slice::<i32>(&[0, 1, 2, 3, 0, 1], &(b, s)).unwrap();
@@ -611,8 +627,10 @@ mod tests {
         let (batch, seq) = match tokens.shape().as_slice() {
           [b, s] => (*b, *s),
           other => {
-            return Err(Error::ShapeMismatch(format!(
-              "F16Model expects [B, S], got {other:?}"
+            return Err(Error::RankMismatch(RankMismatchPayload::new(
+              "F16Model::forward: tokens must be rank-2 [B, S]",
+              other.len() as u32,
+              other.to_vec(),
             )));
           }
         };

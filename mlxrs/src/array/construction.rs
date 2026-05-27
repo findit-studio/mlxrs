@@ -1,9 +1,14 @@
 //! Array constructors — generic over `T: Element` where applicable.
 
+use smol_str::format_smolstr;
+
 use crate::{
   array::Array,
   dtype::{Dtype, Element},
-  error::{Error, Result, check, check_handle},
+  error::{
+    ArithmeticOverflowPayload, Error, LengthMismatchPayload, OutOfRangePayload, Result, check,
+    check_handle,
+  },
   shape::{IntoShape, dim_ptr, validate_dims},
   stream::default_stream,
 };
@@ -210,8 +215,13 @@ impl Array {
     // install-at-call-site requirement is enforced by code review, NOT by
     // an executable regression test.
     crate::error::ensure_handler_installed();
-    let n_i32 = i32::try_from(n)
-      .map_err(|_| Error::ShapeMismatch(format!("eye dim {n} exceeds i32::MAX")))?;
+    let n_i32 = i32::try_from(n).map_err(|_| {
+      Error::OutOfRange(OutOfRangePayload::new(
+        "Array::eye: n",
+        "must fit in i32",
+        format_smolstr!("{n}"),
+      ))
+    })?;
     // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
     // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
     // early return / panic frees it, then populated by the following call.
@@ -274,8 +284,13 @@ impl Array {
     // install-at-call-site requirement is enforced by code review, NOT by
     // an executable regression test.
     crate::error::ensure_handler_installed();
-    let n_i32 = i32::try_from(num)
-      .map_err(|_| Error::ShapeMismatch(format!("linspace num {num} exceeds i32::MAX")))?;
+    let n_i32 = i32::try_from(num).map_err(|_| {
+      Error::OutOfRange(OutOfRangePayload::new(
+        "Array::linspace: num",
+        "must fit in i32",
+        format_smolstr!("{num}"),
+      ))
+    })?;
     // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
     // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
     // early return / panic frees it, then populated by the following call.
@@ -326,22 +341,37 @@ impl Array {
       // match data.len() and pass the equality guard with an undersized
       // buffer.
       validate_dims(s)?;
-      let total: usize = s
-        .iter()
-        .try_fold(1usize, |acc, &d| acc.checked_mul(d as usize))
-        .ok_or_else(|| {
-          Error::ShapeMismatch(format!(
-            "from_slice: shape product overflows usize for shape {s:?}"
+      // Carry the accumulated product, the offending dim, and its index in the
+      // overflow payload so a `Display` rendering identifies which dim multiply
+      // tripped the cap (vs. just naming the operation).
+      let total: usize = s.iter().enumerate().try_fold(1usize, |acc, (idx, &d)| {
+        let d_usize = d as usize;
+        acc.checked_mul(d_usize).ok_or_else(|| {
+          Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+            "Array::from_slice: shape product",
+            "usize",
+            [
+              ("acc", acc as u64),
+              ("dim", d_usize as u64),
+              ("dim_index", idx as u64),
+            ],
           ))
-        })?;
+        })
+      })?;
       if total != data.len() {
-        return Err(Error::ShapeMismatch(format!(
-          "from_slice: shape product {total} != data.len() {}",
-          data.len()
+        return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+          "Array::from_slice: shape product vs data.len()",
+          total,
+          data.len(),
         )));
       }
-      let dim_i32 = i32::try_from(s.len())
-        .map_err(|_| Error::ShapeMismatch(format!("ndim {} exceeds i32::MAX", s.len())))?;
+      let dim_i32 = i32::try_from(s.len()).map_err(|_| {
+        Error::OutOfRange(OutOfRangePayload::new(
+          "Array::from_slice: ndim",
+          "must fit in i32",
+          format_smolstr!("{}", s.len()),
+        ))
+      })?;
       // SAFETY: fallible sentinel-handle ctor: the error handler is installed first;
       // the (data, dims, ndim) triple was validated above (shape product ==
       // data.len(), non-negative dims, real `T` allocation via `data_ptr`'s

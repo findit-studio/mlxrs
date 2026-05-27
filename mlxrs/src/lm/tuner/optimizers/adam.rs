@@ -40,9 +40,11 @@
 
 use std::collections::HashMap;
 
+use smol_str::format_smolstr;
+
 use crate::{
   Array, Result,
-  error::Error,
+  error::{Error, NonFiniteScalarPayload, OutOfRangePayload},
   lm::{
     load::Weights,
     tuner::optimizers::base::{LearningRate, Optimizer, zeros_like},
@@ -50,32 +52,72 @@ use crate::{
   ops::arithmetic,
 };
 
-/// Validate that `betas` are both finite and in `[0.0, 1.0)`.
-fn validate_betas(optimizer: &str, betas: (f32, f32)) -> Result<()> {
+/// Validate that `betas` are both finite and in `[0.0, 1.0)`. `context` is the
+/// `<optimizer>: betas.<n>` site label and MUST be `'static` so the typed
+/// payload retains a static call-site (no `format!` allocation per error).
+fn validate_betas(
+  context_b1: &'static str,
+  context_b2: &'static str,
+  betas: (f32, f32),
+) -> Result<()> {
   let (b1, b2) = betas;
-  if !b1.is_finite() || !b2.is_finite() || !(0.0..1.0).contains(&b1) || !(0.0..1.0).contains(&b2) {
-    return Err(Error::Backend(format!(
-      "{optimizer}: betas must be finite and in [0.0, 1.0), got ({b1}, {b2})"
+  if !b1.is_finite() {
+    return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+      context_b1, b1 as f64,
+    )));
+  }
+  if !b2.is_finite() {
+    return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+      context_b2, b2 as f64,
+    )));
+  }
+  if !(0.0..1.0).contains(&b1) {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      context_b1,
+      "must be in [0.0, 1.0)",
+      format_smolstr!("{b1}"),
+    )));
+  }
+  if !(0.0..1.0).contains(&b2) {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      context_b2,
+      "must be in [0.0, 1.0)",
+      format_smolstr!("{b2}"),
     )));
   }
   Ok(())
 }
 
 /// Validate that `eps` is finite and `>= 0.0`.
-fn validate_eps(optimizer: &str, eps: f32) -> Result<()> {
-  if !eps.is_finite() || eps < 0.0 {
-    return Err(Error::Backend(format!(
-      "{optimizer}: epsilon must be finite and >= 0.0, got {eps}"
+fn validate_eps(context: &'static str, eps: f32) -> Result<()> {
+  if !eps.is_finite() {
+    return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+      context, eps as f64,
+    )));
+  }
+  if eps < 0.0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      context,
+      "must be >= 0.0",
+      format_smolstr!("{eps}"),
     )));
   }
   Ok(())
 }
 
 /// Validate that `weight_decay` is finite and `>= 0.0`.
-fn validate_weight_decay(optimizer: &str, weight_decay: f32) -> Result<()> {
-  if !weight_decay.is_finite() || weight_decay < 0.0 {
-    return Err(Error::Backend(format!(
-      "{optimizer}: weight_decay must be finite and >= 0.0, got {weight_decay}"
+fn validate_weight_decay(context: &'static str, weight_decay: f32) -> Result<()> {
+  if !weight_decay.is_finite() {
+    return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+      context,
+      weight_decay as f64,
+    )));
+  }
+  if weight_decay < 0.0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      context,
+      "must be >= 0.0",
+      format_smolstr!("{weight_decay}"),
     )));
   }
   Ok(())
@@ -127,8 +169,8 @@ impl Adam {
     eps: f32,
     bias_correction: bool,
   ) -> Result<Self> {
-    validate_betas("Adam", betas)?;
-    validate_eps("Adam", eps)?;
+    validate_betas("Adam: betas.0", "Adam: betas.1", betas)?;
+    validate_eps("Adam: eps", eps)?;
     let lr = learning_rate.into();
     let current_lr = lr.try_current(0)?;
     Ok(Self {
@@ -187,7 +229,7 @@ impl Adam {
   /// Set betas. Returns `Ok(self)` on success or `Err` if either beta is not
   /// finite or is outside `[0.0, 1.0)`.
   pub fn with_betas(mut self, betas: (f32, f32)) -> Result<Self> {
-    validate_betas("Adam", betas)?;
+    validate_betas("Adam: betas.0", "Adam: betas.1", betas)?;
     self.betas = betas;
     Ok(self)
   }
@@ -195,7 +237,7 @@ impl Adam {
   /// Set epsilon. Returns `Ok(self)` on success or `Err` if `eps` is not
   /// finite or `< 0.0`.
   pub fn with_eps(mut self, eps: f32) -> Result<Self> {
-    validate_eps("Adam", eps)?;
+    validate_eps("Adam: eps", eps)?;
     self.eps = eps;
     Ok(self)
   }
@@ -329,7 +371,7 @@ impl AdamW {
     weight_decay: f32,
     bias_correction: bool,
   ) -> Result<Self> {
-    validate_weight_decay("AdamW", weight_decay)?;
+    validate_weight_decay("AdamW: weight_decay", weight_decay)?;
     Ok(Self {
       inner: Adam::new(learning_rate, betas, eps, bias_correction)?,
       weight_decay,
@@ -363,7 +405,7 @@ impl AdamW {
   /// Set weight decay. Returns `Ok(self)` on success or `Err` if
   /// `weight_decay` is not finite or `< 0.0`.
   pub fn with_weight_decay(mut self, weight_decay: f32) -> Result<Self> {
-    validate_weight_decay("AdamW", weight_decay)?;
+    validate_weight_decay("AdamW: weight_decay", weight_decay)?;
     self.weight_decay = weight_decay;
     Ok(self)
   }
@@ -431,8 +473,8 @@ pub struct Adamax {
 impl Adamax {
   /// Construct an [`Adamax`] optimizer.
   pub fn new(learning_rate: impl Into<LearningRate>, betas: (f32, f32), eps: f32) -> Result<Self> {
-    validate_betas("Adamax", betas)?;
-    validate_eps("Adamax", eps)?;
+    validate_betas("Adamax: betas.0", "Adamax: betas.1", betas)?;
+    validate_eps("Adamax: eps", eps)?;
     let lr = learning_rate.into();
     let current_lr = lr.try_current(0)?;
     Ok(Self {
@@ -483,7 +525,7 @@ impl Adamax {
   /// Set betas. Returns `Ok(self)` on success or `Err` if either beta is not
   /// finite or is outside `[0.0, 1.0)`.
   pub fn with_betas(mut self, betas: (f32, f32)) -> Result<Self> {
-    validate_betas("Adamax", betas)?;
+    validate_betas("Adamax: betas.0", "Adamax: betas.1", betas)?;
     self.betas = betas;
     Ok(self)
   }
@@ -491,7 +533,7 @@ impl Adamax {
   /// Set epsilon. Returns `Ok(self)` on success or `Err` if `eps` is not
   /// finite or `< 0.0`.
   pub fn with_eps(mut self, eps: f32) -> Result<Self> {
-    validate_eps("Adamax", eps)?;
+    validate_eps("Adamax: eps", eps)?;
     self.eps = eps;
     Ok(self)
   }

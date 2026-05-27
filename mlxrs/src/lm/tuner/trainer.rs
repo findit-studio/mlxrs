@@ -77,12 +77,16 @@
 //! - **`mx.random.state` thread-state** — out of scope; callers seed their
 //!   own RNG and pass it through `iterate_batches`'s `seed`.
 
-use crate::error::{EmptyInputPayload, InvariantViolationPayload};
 use std::{collections::HashMap, marker::PhantomData, time::Instant};
+
+use smol_str::format_smolstr;
 
 use crate::{
   Array, Dtype, Result,
-  error::Error,
+  error::{
+    EmptyInputPayload, Error, InvariantViolationPayload, LengthMismatchPayload, MissingKeyPayload,
+    OutOfRangePayload, RankMismatchPayload, ShapePairMismatchPayload,
+  },
   lm::{
     cache::KvCache,
     load::Weights,
@@ -399,20 +403,27 @@ where
   let (_b, s) = match shape.as_slice() {
     [b, s] => (*b, *s),
     other => {
-      return Err(Error::ShapeMismatch(format!(
-        "default_loss: batch must be [B, S], got {other:?}"
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        "default_loss: batch must be rank-2 [B, S]",
+        other.len() as u32,
+        other.to_vec(),
       )));
     }
   };
   if s < 2 {
-    return Err(Error::ShapeMismatch(format!(
-      "default_loss: batch S={s} must be >= 2 for next-token prediction"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "default_loss: batch S",
+      "must be >= 2 for next-token prediction",
+      format_smolstr!("{s}"),
     )));
   }
   let lengths_shape = lengths.shape();
-  if lengths_shape.len() != 2 || lengths_shape[1] != 2 {
-    return Err(Error::ShapeMismatch(format!(
-      "default_loss: lengths must be [B, 2] = (offset, length), got {lengths_shape:?}"
+  let expected_lengths_shape = [shape[0], 2_usize];
+  if lengths_shape.as_slice() != expected_lengths_shape {
+    return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+      "default_loss: lengths must be [B, 2] = (offset, length)",
+      expected_lengths_shape.as_slice().to_vec(),
+      lengths_shape.to_vec(),
     )));
   }
   // inputs = batch[:, :-1], targets = batch[:, 1:]
@@ -709,9 +720,10 @@ pub fn iterate_batches<'a, D: Dataset + 'a>(
   shuffle_seed: Option<u64>,
 ) -> Result<impl Iterator<Item = Result<Batch>> + 'a> {
   if dataset.len() < batch_size {
-    return Err(Error::Backend(format!(
-      "iterate_batches: dataset has {} examples; need at least batch_size={batch_size}",
-      dataset.len(),
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "iterate_batches: dataset size",
+      "must be >= batch_size",
+      format_smolstr!("{} (batch_size={batch_size})", dataset.len()),
     )));
   }
   // Length-sort indices.
@@ -1185,17 +1197,18 @@ fn build_zero_grads(params: &Weights) -> Result<Weights> {
 /// reported via [`Error::Backend`] rather than silently dropped).
 fn add_weights(a: &Weights, b: &Weights) -> Result<Weights> {
   if a.len() != b.len() {
-    return Err(Error::Backend(format!(
-      "trainer::add_weights: mismatched key counts {} vs {}",
+    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+      "trainer::add_weights: lhs vs rhs key counts",
       a.len(),
-      b.len()
+      b.len(),
     )));
   }
   let mut out: Weights = HashMap::with_capacity(a.len());
   for (key, lhs) in a {
     let Some(rhs) = b.get(key) else {
-      return Err(Error::Backend(format!(
-        "trainer::add_weights: key `{key}` missing from rhs"
+      return Err(Error::MissingKey(MissingKeyPayload::new(
+        "trainer::add_weights: key missing from rhs",
+        key.as_str(),
       )));
     };
     out.insert(key.clone(), arithmetic::add(lhs, rhs)?);
@@ -1479,13 +1492,17 @@ mod tests {
       &mut cb,
     );
     match res {
-      Err(Error::Backend(message)) => {
-        assert!(
-          message.contains("acknowledge_no_real_gradients"),
-          "error must reference the opt-in field; got {message}",
+      Err(Error::InvariantViolation(payload)) => {
+        assert_eq!(
+          payload.context(),
+          "train: TrainingArgs::acknowledge_no_real_gradients"
+        );
+        assert_eq!(
+          payload.requirement(),
+          "must be set to `true` to run the v1 mechanics-only training path"
         );
       }
-      other => panic!("expected Err(Backend), got {other:?}"),
+      other => panic!("expected Err(InvariantViolation), got {other:?}"),
     }
     Ok(())
   }
@@ -1556,13 +1573,11 @@ mod tests {
     let args = args_for_zero_interval_tests().with_steps_per_report(0);
     let res = run_train_with_args(&args);
     match res {
-      Err(Error::Backend(message)) => {
-        assert!(
-          message.contains("steps_per_report"),
-          "error must name the field; got {message}",
-        );
+      Err(Error::InvariantViolation(payload)) => {
+        assert_eq!(payload.context(), "train: steps_per_report");
+        assert_eq!(payload.requirement(), "must be >= 1");
       }
-      other => panic!("expected Err(Backend) for steps_per_report=0; got {other:?}"),
+      other => panic!("expected Err(InvariantViolation) for steps_per_report=0; got {other:?}"),
     }
   }
 
@@ -1571,13 +1586,11 @@ mod tests {
     let args = args_for_zero_interval_tests().with_steps_per_eval(0);
     let res = run_train_with_args(&args);
     match res {
-      Err(Error::Backend(message)) => {
-        assert!(
-          message.contains("steps_per_eval"),
-          "error must name the field; got {message}",
-        );
+      Err(Error::InvariantViolation(payload)) => {
+        assert_eq!(payload.context(), "train: steps_per_eval");
+        assert_eq!(payload.requirement(), "must be >= 1");
       }
-      other => panic!("expected Err(Backend) for steps_per_eval=0; got {other:?}"),
+      other => panic!("expected Err(InvariantViolation) for steps_per_eval=0; got {other:?}"),
     }
   }
 
@@ -1586,13 +1599,11 @@ mod tests {
     let args = args_for_zero_interval_tests().with_steps_per_save(0);
     let res = run_train_with_args(&args);
     match res {
-      Err(Error::Backend(message)) => {
-        assert!(
-          message.contains("steps_per_save"),
-          "error must name the field; got {message}",
-        );
+      Err(Error::InvariantViolation(payload)) => {
+        assert_eq!(payload.context(), "train: steps_per_save");
+        assert_eq!(payload.requirement(), "must be >= 1");
       }
-      other => panic!("expected Err(Backend) for steps_per_save=0; got {other:?}"),
+      other => panic!("expected Err(InvariantViolation) for steps_per_save=0; got {other:?}"),
     }
   }
 
@@ -1601,13 +1612,13 @@ mod tests {
     let args = args_for_zero_interval_tests().with_grad_accumulation_steps(0);
     let res = run_train_with_args(&args);
     match res {
-      Err(Error::Backend(message)) => {
-        assert!(
-          message.contains("grad_accumulation_steps"),
-          "error must name the field; got {message}",
-        );
+      Err(Error::InvariantViolation(payload)) => {
+        assert_eq!(payload.context(), "train: grad_accumulation_steps");
+        assert_eq!(payload.requirement(), "must be >= 1");
       }
-      other => panic!("expected Err(Backend) for grad_accumulation_steps=0; got {other:?}"),
+      other => {
+        panic!("expected Err(InvariantViolation) for grad_accumulation_steps=0; got {other:?}")
+      }
     }
   }
 
@@ -1873,6 +1884,48 @@ mod tests {
         );
       }
       other => panic!("expected Error::Backend, got: {other:?}"),
+    }
+    Ok(())
+  }
+
+  #[test]
+  fn default_loss_rejects_lengths_with_extra_batch_row() -> Result<()> {
+    // batch is [B=2, S=2] but lengths is [B+1=3, 2] — the previous rank-
+    // only guard accepted this and silently sliced only the first 2 rows,
+    // building masks from mismatched metadata. The full-shape guard must
+    // reject up-front.
+    let model = FakeModel;
+    let batch = Array::from_slice::<i32>(&[1, 2, 3, 4], &(2, 2))?;
+    let lengths = Array::from_slice::<i32>(&[0, 2, 0, 2, 0, 2], &(3, 2))?;
+    let err = default_loss(&model, &batch, &lengths)
+      .expect_err("expected ShapePairMismatch for extra length row");
+    match err {
+      Error::ShapePairMismatch(p) => {
+        assert_eq!(p.expected(), &[2_usize, 2_usize][..]);
+        assert_eq!(p.actual(), &[3_usize, 2_usize][..]);
+      }
+      other => panic!("expected Error::ShapePairMismatch, got: {other:?}"),
+    }
+    Ok(())
+  }
+
+  #[test]
+  fn default_loss_rejects_lengths_with_missing_batch_row() -> Result<()> {
+    // batch is [B=2, S=2] but lengths is [B-1=1, 2] — the previous guard
+    // accepted this too (rank=2 and dim[1]=2 both held), then the per-row
+    // slice would either OOB or silently truncate metadata. The full-
+    // shape guard must reject up-front.
+    let model = FakeModel;
+    let batch = Array::from_slice::<i32>(&[1, 2, 3, 4], &(2, 2))?;
+    let lengths = Array::from_slice::<i32>(&[0, 2], &(1, 2))?;
+    let err = default_loss(&model, &batch, &lengths)
+      .expect_err("expected ShapePairMismatch for missing length row");
+    match err {
+      Error::ShapePairMismatch(p) => {
+        assert_eq!(p.expected(), &[2_usize, 2_usize][..]);
+        assert_eq!(p.actual(), &[1_usize, 2_usize][..]);
+      }
+      other => panic!("expected Error::ShapePairMismatch, got: {other:?}"),
     }
     Ok(())
   }

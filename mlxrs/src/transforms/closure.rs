@@ -35,7 +35,7 @@ use std::{
 
 use crate::{
   Array,
-  error::{Error, Result, ensure_handler_installed},
+  error::{Error, ParsePayload, Result, ensure_handler_installed},
 };
 
 /// Boxed type-erased Rust callable invoked by the mlx-c trampoline.
@@ -278,8 +278,10 @@ extern "C" fn trampoline(
       } else {
         "panic in mlxrs::transforms closure trampoline".to_string()
       };
-      crate::error::set_last(Error::Backend(format!(
-        "mlxrs::transforms closure trampoline caught panic: {msg}"
+      crate::error::set_last(Error::Parse(ParsePayload::new(
+        "transforms::closure trampoline: caught panic",
+        "Rust closure panic payload",
+        std::io::Error::other(msg),
       )));
       // SAFETY: same as above — leave the out-param holding an empty handle.
       unsafe {
@@ -587,8 +589,10 @@ extern "C" fn trampoline_custom(
       } else {
         "panic in mlxrs::transforms custom-VJP trampoline".to_string()
       };
-      crate::error::set_last(Error::Backend(format!(
-        "mlxrs::transforms custom-VJP trampoline caught panic: {msg}"
+      crate::error::set_last(Error::Parse(ParsePayload::new(
+        "transforms::custom_vjp trampoline: caught panic",
+        "Rust closure panic payload",
+        std::io::Error::other(msg),
       )));
       // SAFETY: leave out-param holding an empty vector handle.
       unsafe {

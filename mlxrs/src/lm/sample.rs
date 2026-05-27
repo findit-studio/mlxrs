@@ -45,7 +45,8 @@
 
 use crate::{
   array::Array,
-  error::{Error, LengthMismatchPayload, OutOfRangePayload, Result},
+  dtype::Dtype,
+  error::{Error, LengthMismatchPayload, OutOfRangePayload, Result, UnsupportedDtypePayload},
   ops,
 };
 
@@ -323,16 +324,10 @@ pub fn scale_logits_by_temp(logits: &Array, temp: f32) -> Result<Array> {
       let scaled_f32 = ops::arithmetic::divide(&logits_f32, &divisor)?;
       ops::misc::astype(&scaled_f32, dtype)
     }
-    crate::Dtype::F64 => Err(Error::Backend(
-      "categorical_sampling does not support F64 logits — MLX's GPU stream \
-         does not implement float64, so a native F64 divide would error at \
-         eval and the prior implicit F32 roundtrip silently lost precision on \
-         near-tied logits (LM-6 R2 finding). Cast logits with \
-         .astype(Dtype::F32) (or F16/BF16) before sampling."
-        .to_string(),
-    )),
-    other => Err(Error::Backend(format!(
-      "categorical_sampling requires floating-point logits (F32, F16, or BF16); got {other:?}. Cast logits with .astype(Dtype::F32) before sampling."
+    other => Err(Error::UnsupportedDtype(UnsupportedDtypePayload::new(
+      "categorical_sampling: logits dtype (MLX's GPU stream does not implement F64; cast with .astype(Dtype::F32) before sampling)",
+      other,
+      &[Dtype::F32, Dtype::F16, Dtype::BF16],
     ))),
   }
 }

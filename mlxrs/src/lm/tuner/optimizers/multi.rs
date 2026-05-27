@@ -18,12 +18,11 @@
 //! gradients` walk that pushes the entry into the first matching
 //! sub-optimizer's gradient slice.
 
-use crate::error::EmptyInputPayload;
 use std::collections::HashMap;
 
 use crate::{
   Array, Result,
-  error::Error,
+  error::{EmptyInputPayload, Error, LengthMismatchPayload},
   lm::{load::Weights, tuner::optimizers::base::Optimizer},
 };
 
@@ -52,8 +51,8 @@ impl MultiOptimizer {
       )));
     }
     if filters.len() != optimizers.len() - 1 {
-      return Err(Error::Backend(format!(
-        "MultiOptimizer: expected {} filters (optimizers - 1), got {}",
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "MultiOptimizer: filters (must equal optimizers - 1)",
         optimizers.len() - 1,
         filters.len(),
       )));

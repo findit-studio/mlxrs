@@ -16,9 +16,11 @@
 
 use std::collections::HashMap;
 
+use smol_str::format_smolstr;
+
 use crate::{
   Array, Result,
-  error::Error,
+  error::{Error, NonFiniteScalarPayload, OutOfRangePayload},
   lm::{
     load::Weights,
     tuner::optimizers::base::{LearningRate, Optimizer, zeros_like},
@@ -28,6 +30,40 @@ use crate::{
 
 fn scalar(v: f32) -> Result<Array> {
   Array::full::<f32>(&[0i32; 0], v)
+}
+
+fn validate_rho(rho: f32) -> Result<()> {
+  if !rho.is_finite() {
+    return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+      "AdaDelta: rho",
+      rho as f64,
+    )));
+  }
+  if !(0.0..1.0).contains(&rho) {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "AdaDelta: rho",
+      "must be in [0.0, 1.0)",
+      format_smolstr!("{rho}"),
+    )));
+  }
+  Ok(())
+}
+
+fn validate_eps(eps: f32) -> Result<()> {
+  if !eps.is_finite() {
+    return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+      "AdaDelta: eps",
+      eps as f64,
+    )));
+  }
+  if eps < 0.0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "AdaDelta: eps",
+      "must be >= 0.0",
+      format_smolstr!("{eps}"),
+    )));
+  }
+  Ok(())
 }
 
 /// AdaDelta optimizer.
@@ -48,16 +84,8 @@ pub struct AdaDelta {
 impl AdaDelta {
   /// Construct an [`AdaDelta`] optimizer.
   pub fn new(learning_rate: impl Into<LearningRate>, rho: f32, eps: f32) -> Result<Self> {
-    if !rho.is_finite() || !(0.0..1.0).contains(&rho) {
-      return Err(Error::Backend(format!(
-        "AdaDelta: rho must be finite and in [0.0, 1.0), got {rho}"
-      )));
-    }
-    if !eps.is_finite() || eps < 0.0 {
-      return Err(Error::Backend(format!(
-        "AdaDelta: epsilon must be finite and >= 0.0, got {eps}"
-      )));
-    }
+    validate_rho(rho)?;
+    validate_eps(eps)?;
     let lr = learning_rate.into();
     let current_lr = lr.try_current(0)?;
     Ok(Self {
@@ -108,11 +136,7 @@ impl AdaDelta {
   /// Set rho. Returns `Ok(self)` on success or `Err` if `rho` is not finite
   /// or is outside `[0.0, 1.0)`.
   pub fn with_rho(mut self, rho: f32) -> Result<Self> {
-    if !rho.is_finite() || !(0.0..1.0).contains(&rho) {
-      return Err(Error::Backend(format!(
-        "AdaDelta: rho must be finite and in [0.0, 1.0), got {rho}"
-      )));
-    }
+    validate_rho(rho)?;
     self.rho = rho;
     Ok(self)
   }
@@ -120,11 +144,7 @@ impl AdaDelta {
   /// Set epsilon. Returns `Ok(self)` on success or `Err` if `eps` is not
   /// finite or `< 0.0`.
   pub fn with_eps(mut self, eps: f32) -> Result<Self> {
-    if !eps.is_finite() || eps < 0.0 {
-      return Err(Error::Backend(format!(
-        "AdaDelta: epsilon must be finite and >= 0.0, got {eps}"
-      )));
-    }
+    validate_eps(eps)?;
     self.eps = eps;
     Ok(self)
   }

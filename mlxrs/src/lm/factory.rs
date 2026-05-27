@@ -55,8 +55,10 @@ use std::{
   path::{Path, PathBuf},
 };
 
+#[cfg(test)]
+use crate::error::RankMismatchPayload;
 use crate::{
-  error::{Error, Result},
+  error::{Error, MissingKeyPayload, Result},
   lm::{
     generate::{GenConfig, GenerationResponse, GenerationStats},
     load::{self, Config, Weights},
@@ -203,10 +205,9 @@ impl ModelTypeRegistry {
   pub fn create(&self, loaded: &LoadedModel) -> Result<Box<dyn Model>> {
     let model_type = remap_model_type(loaded.config.model_type());
     let constructor = self.creators.get(model_type).ok_or_else(|| {
-      Error::Backend(format!(
-        "unsupported model type {:?}: no constructor registered (register one via \
-         ModelTypeRegistry::register)",
-        loaded.config.model_type()
+      Error::MissingKey(MissingKeyPayload::new(
+        "ModelTypeRegistry::create: unsupported model type (no constructor registered; register one via ModelTypeRegistry::register)",
+        loaded.config.model_type(),
       ))
     })?;
     constructor(loaded)
@@ -383,10 +384,9 @@ pub fn load(
   // weight/tokenizer I/O (and never surfacing a weight error in place of the
   // recoverable unsupported-model one).
   if !registry.contains(config.model_type()) {
-    return Err(Error::Backend(format!(
-      "unsupported model type {:?}: no constructor registered (register one via \
-         ModelTypeRegistry::register)",
-      config.model_type()
+    return Err(Error::MissingKey(MissingKeyPayload::new(
+      "ModelTypeRegistry::create: unsupported model type (no constructor registered; register one via ModelTypeRegistry::register)",
+      config.model_type(),
     )));
   }
 
@@ -727,8 +727,10 @@ mod tests {
         [b, s] => (*b, *s),
         [s] => (1, *s),
         other => {
-          return Err(Error::ShapeMismatch(format!(
-            "MockLoadedModel::forward expects [B, S], got {other:?}"
+          return Err(Error::RankMismatch(RankMismatchPayload::new(
+            "MockLoadedModel::forward: tokens must be rank-1 [S] or rank-2 [B, S]",
+            other.len() as u32,
+            other.to_vec(),
           )));
         }
       };
@@ -749,8 +751,13 @@ mod tests {
       );
       // Model-specific key outside the typed Config subset, read from the
       // raw JSON (the analogue of mlx-swift-lm's per-model Codable init).
-      let raw: serde_json::Value = serde_json::from_str(&loaded.config_json)
-        .map_err(|e| Error::Backend(format!("mock ctor: bad config json: {e}")))?;
+      let raw: serde_json::Value = serde_json::from_str(&loaded.config_json).map_err(|e| {
+        Error::Parse(crate::error::ParsePayload::new(
+          "mock ctor: bad config json",
+          "config.json",
+          Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
+        ))
+      })?;
       let mock_extra = raw
         .get("mock_extra")
         .and_then(serde_json::Value::as_i64)

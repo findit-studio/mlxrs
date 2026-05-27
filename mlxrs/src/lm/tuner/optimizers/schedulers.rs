@@ -23,7 +23,7 @@
 
 use crate::{
   Result,
-  error::{EmptyInputPayload, Error, InvariantViolationPayload},
+  error::{EmptyInputPayload, Error, InvariantViolationPayload, LengthMismatchPayload},
 };
 
 /// Schedule closure shape: `Fn(step) -> learning_rate`.
@@ -103,8 +103,8 @@ pub fn join_schedules(schedules: Vec<Schedule>, boundaries: Vec<usize>) -> Resul
     )));
   }
   if schedules.len() != boundaries.len() + 1 {
-    return Err(Error::Backend(format!(
-      "join_schedules: expected {} boundaries (schedules - 1), got {}",
+    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+      "join_schedules: boundaries (must equal schedules - 1)",
       schedules.len() - 1,
       boundaries.len(),
     )));

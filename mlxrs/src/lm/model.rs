@@ -9,6 +9,8 @@
 //! arrives later in the M3 stack. The trait is the contract those impls — and
 //! the deterministic `MockModel` test fixture below — satisfy.
 
+#[cfg(test)]
+use crate::error::{Error, RankMismatchPayload};
 use crate::{array::Array, error::Result, lm::cache::KvCache};
 
 /// A causal language model: maps a token window and its per-layer KV cache to
@@ -110,8 +112,10 @@ impl Model for MockModel {
       [b, s] => (*b, *s),
       [s] => (1, *s),
       _ => {
-        return Err(crate::error::Error::ShapeMismatch(format!(
-          "MockModel::forward expects [B, S] tokens, got {shape:?}"
+        return Err(Error::RankMismatch(RankMismatchPayload::new(
+          "MockModel::forward: tokens must be rank-2 [B, S]",
+          shape.len() as u32,
+          shape.to_vec(),
         )));
       }
     };

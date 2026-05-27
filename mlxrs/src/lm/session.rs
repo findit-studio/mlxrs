@@ -105,7 +105,7 @@ use std::rc::Rc;
 use serde_json::{Value, json};
 
 use crate::{
-  error::{Error, Result},
+  error::{Error, ParsePayload, Result},
   lm::{
     cache::{CacheConfig, KvCache, make_prompt_cache, save_prompt_cache},
     generate::{FinishReason, GenConfig, GenerationResponse, Generator, build_generator},
@@ -712,7 +712,13 @@ impl ChatSession {
     let prompt_ids = self
       .tokenizer
       .apply_chat_template_ids(&json_messages, None, true, false, None)
-      .map_err(|e| Error::Backend(format!("ChatSession: apply_chat_template failed: {e}")))?;
+      .map_err(|e| {
+        Error::Parse(ParsePayload::new(
+          "ChatSession: apply_chat_template",
+          "chat template",
+          std::io::Error::other(e.to_string()),
+        ))
+      })?;
     Ok((prompt_ids, replayed))
   }
 

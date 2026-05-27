@@ -21,7 +21,11 @@ use std::{ffi::CStr, sync::Mutex};
 
 use static_assertions::assert_impl_all;
 
-use crate::error::{Result, check, ensure_handler_installed};
+use smol_str::format_smolstr;
+
+use crate::error::{
+  Error, FfiNullHandlePayload, OutOfRangePayload, Result, check, ensure_handler_installed,
+};
 
 /// Serializes safe-Rust access to mlx-c++'s non-atomic global default
 /// device. `Mutex::new` is const since Rust 1.63 (MSRV is far above that),
@@ -66,8 +70,10 @@ impl DeviceKind {
     match raw {
       mlxrs_sys::mlx_device_type__MLX_CPU => Ok(DeviceKind::Cpu),
       mlxrs_sys::mlx_device_type__MLX_GPU => Ok(DeviceKind::Gpu),
-      other => Err(crate::Error::Backend(format!(
-        "unknown mlx_device_type: {other}"
+      other => Err(Error::OutOfRange(OutOfRangePayload::new(
+        "DeviceKind::from_raw: mlx_device_type",
+        "must be MLX_CPU or MLX_GPU",
+        format_smolstr!("{other}"),
       ))),
     }
   }
@@ -142,8 +148,8 @@ impl Device {
     // case is checked by the caller before the handle is used.
     let raw = unsafe { mlxrs_sys::mlx_device_new_type(kind.to_raw(), index) };
     if raw.ctx.is_null() {
-      return Err(crate::Error::Backend(format!(
-        "mlx_device_new_type returned NULL ctx for kind={kind:?} index={index}",
+      return Err(Error::FfiNullHandle(FfiNullHandlePayload::new(
+        "mlx_device_new_type",
       )));
     }
     Ok(Self(raw))
