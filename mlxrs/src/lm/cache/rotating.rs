@@ -2,13 +2,17 @@
 
 use crate::{
   array::Array,
-  error::{Error, InvariantViolationPayload, Result},
+  error::{
+    ArithmeticOverflowPayload, Error, InvariantViolationPayload, LengthMismatchPayload,
+    OutOfRangePayload, ParsePayload, Result,
+  },
   lm::cache::{
     KvCache, MaskMode, mask,
     util::{KV_NDIM, concat_seq, head_dim, nbytes, seq_len, seq_slice},
   },
   ops,
 };
+use smol_str::format_smolstr;
 
 /// Sliding-window KV cache — the cache for models with a bounded attention
 /// window (`sliding_window` / `max_kv_size`).
@@ -167,13 +171,29 @@ impl RotatingKvCache {
     // Faithful for valid inputs (the slice/concat path is unchanged).
     let l = seq_len(name, buf)?;
     let end = a.checked_add(s).ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "RotatingKvCache::set_seq: {name} write start ({a}) + S ({s}) overflows usize"
+      let context: &'static str = match name {
+        "keys" => "RotatingKvCache::set_seq: keys write start + S",
+        "values" => "RotatingKvCache::set_seq: values write start + S",
+        _ => "RotatingKvCache::set_seq: write start + S",
+      };
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        context,
+        "usize",
+        [("start", a as u64), ("S", s as u64)],
       ))
     })?;
     if end > l {
-      return Err(Error::ShapeMismatch(format!(
-        "RotatingKvCache::set_seq: {name} write window [{a}, {end}) extends past buffer length {l}"
+      let context: &'static str = match name {
+        "keys" => "RotatingKvCache::set_seq: keys write window end (extends past buffer length)",
+        "values" => {
+          "RotatingKvCache::set_seq: values write window end (extends past buffer length)"
+        }
+        _ => "RotatingKvCache::set_seq: write window end (extends past buffer length)",
+      };
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        context,
+        "must be <= buffer length L",
+        format_smolstr!("start={a}, end={end}, L={l}"),
       )));
     }
     let new = super::util::broadcast_write_rhs(name, buf, a, end, new)?;
@@ -196,8 +216,10 @@ impl RotatingKvCache {
     // so the ring algorithm outcome is unchanged.
     let off = self.offset;
     let new_offset = off.checked_add(s).ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "RotatingKvCache update: offset ({off}) + S ({s}) overflows usize"
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "RotatingKvCache::update_concat: offset + S",
+        "usize",
+        [("offset", off as u64), ("S", s as u64)],
       ))
     })?;
     // `temporal_order` clones out so the `&self.keys` borrow ends before the
@@ -290,8 +312,10 @@ impl RotatingKvCache {
     // byte-identical to `self.offset + 1` for every non-overflowing input,
     // so the ring algorithm outcome is unchanged.
     let new_offset = prev.checked_add(1).ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "RotatingKvCache update: offset ({prev}) + S (1) overflows usize"
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "RotatingKvCache::update_in_place: offset + S (S=1)",
+        "usize",
+        [("offset", prev as u64), ("S", 1u64)],
       ))
     })?;
 
@@ -515,8 +539,10 @@ impl KvCache for RotatingKvCache {
         self.values = Some(values);
         Ok(())
       }
-      n => Err(Error::Backend(format!(
-        "RotatingKvCache state must have 0 or 2 arrays, got {n}"
+      n => Err(Error::OutOfRange(OutOfRangePayload::new(
+        "RotatingKvCache::set_state: state array count",
+        "must be 0 or 2",
+        format_smolstr!("{n}"),
       ))),
     }
   }
@@ -536,17 +562,24 @@ impl KvCache for RotatingKvCache {
   /// `self.keep, self.max_size, self.offset, self._idx = map(int, v)`.
   fn set_meta_state(&mut self, m: &[String]) -> Result<()> {
     if m.len() != 4 {
-      return Err(Error::Backend(format!(
-        "RotatingKvCache meta_state must have 4 values, got {}",
-        m.len()
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "RotatingKvCache::set_meta_state: meta_state values",
+        4,
+        m.len(),
       )));
     }
-    let parse = |i: usize, name: &str| -> Result<usize> {
-      m[i].parse::<usize>().map_err(|e| {
-        Error::Backend(format!(
-          "RotatingKvCache meta_state {name} ({:?}): {e}",
-          m[i]
-        ))
+    let parse = |i: usize, name: &'static str| -> Result<usize> {
+      m[i].parse::<usize>().map_err(|e: std::num::ParseIntError| {
+        // Distinguish the field via static context strings so the typed
+        // ParsePayload carries the per-field call site without runtime alloc.
+        let context: &'static str = match name {
+          "keep" => "RotatingKvCache::set_meta_state: keep",
+          "max_size" => "RotatingKvCache::set_meta_state: max_size",
+          "offset" => "RotatingKvCache::set_meta_state: offset",
+          "idx" => "RotatingKvCache::set_meta_state: idx",
+          _ => "RotatingKvCache::set_meta_state",
+        };
+        Error::Parse(ParsePayload::new(context, "usize", Box::new(e)))
       })
     };
     // Parse ALL four into locals and validate before mutating ANY field, so
@@ -634,8 +667,10 @@ impl KvCache for RotatingKvCache {
       // result is byte-identical to `offset + n` for every non-overflowing
       // input, so the decision outcome is unchanged.
       let offset_plus_n = offset.checked_add(n).ok_or_else(|| {
-        Error::ShapeMismatch(format!(
-          "RotatingKvCache::make_mask: offset ({offset}) + N ({n}) overflows usize"
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+          "RotatingKvCache::make_mask: offset + N",
+          "usize",
+          [("offset", offset as u64), ("N", n as u64)],
         ))
       })?;
       if offset_plus_n > ws || return_array {

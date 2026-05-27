@@ -39,15 +39,19 @@
 //! Swift makes this explicit with `fatalError("CacheList should not use
 //! update(keys:values:) - use subscript access instead")`
 //! (KVCache.swift:1270-1272). The merged [`KvCache`] trait requires both
-//! methods, so they are implemented as a **recoverable** [`Error::Backend`]
+//! methods, so they are implemented as a **recoverable** typed [`Error`] variant
 //! — the project's no-panic-on-recoverable-paths equivalent of Swift's
 //! trap; never an `unwrap`/`panic!`.
 
 use crate::{
   array::Array,
-  error::{ArithmeticOverflowPayload, Error, InvariantViolationPayload, Result},
+  error::{
+    ArithmeticOverflowPayload, CapExceededPayload, Error, InvariantViolationPayload,
+    LayerKeyedPayload, LengthMismatchPayload, ParsePayload, Result,
+  },
   lm::cache::{KvCache, MaskMode, RopeOffset},
 };
+use smol_str::format_smolstr;
 
 /// A composite cache delegating to an ordered list of child caches.
 ///
@@ -174,7 +178,7 @@ impl KvCache for CacheList {
   /// - use subscript access instead")` (KVCache.swift:1270-1272). Callers
   /// must index a child via [`get`](CacheList::get) /
   /// [`get_mut`](CacheList::get_mut) and update *that* child. A recoverable
-  /// [`Error::Backend`] — the no-panic equivalent of Swift's trap.
+  /// typed [`Error`] variant — the no-panic equivalent of Swift's trap.
   fn update(&mut self, _keys: &Array, _values: &Array) -> Result<(Array, Array)> {
     Err(Error::InvariantViolation(InvariantViolationPayload::new(
       "CacheList::update",
@@ -220,7 +224,7 @@ impl KvCache for CacheList {
   /// $0.state.count }`; per child slice `[start, start+length)`. Mirrors
   /// Python's `for c, s in zip(self.caches, v): c.state = s`
   /// (cache.py:834-836) once flattened. The split must consume the input
-  /// **exactly**; a length mismatch is a recoverable [`Error::Backend`]
+  /// **exactly**; a length mismatch is a recoverable typed [`Error`] variant
   /// (never a slice panic / silent truncation).
   ///
   /// **Transactional**: the restore is staged onto *copies* of the
@@ -248,10 +252,10 @@ impl KvCache for CacheList {
     }
     let total: usize = lengths.iter().sum();
     if total != state.len() {
-      return Err(Error::Backend(format!(
-        "CacheList::set_state: flattened state has {} arrays but the \
-           children expect {total}",
-        state.len()
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "CacheList::set_state: flattened state array count vs sum of children state_count",
+        total,
+        state.len(),
       )));
     }
     // Stage onto copies first: copy every child, apply each per-child
@@ -356,15 +360,13 @@ impl KvCache for CacheList {
   /// be set directly. Use CacheList.fromState() instead")`
   /// (KVCache.swift:1328-1331). The round-trip path is
   /// [`from_state`](super::from_state)`("CacheList", state, meta)`, which
-  /// rebuilds children atomically. A recoverable [`Error::Backend`] — the
+  /// rebuilds children atomically. A recoverable typed [`Error`] variant — the
   /// no-panic equivalent of Swift's `assertionFailure`.
   fn set_meta_state(&mut self, _m: &[String]) -> Result<()> {
-    Err(Error::Backend(
-      "CacheList::set_meta_state is invalid — reconstruct via \
-                from_state(\"CacheList\", state, meta) (Swift: \
-                CacheList.fromState)"
-        .into(),
-    ))
+    Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "CacheList::set_meta_state (direct call invalid)",
+      "must reconstruct via from_state(\"CacheList\", state, meta) (Swift: CacheList.fromState)",
+    )))
   }
 
   /// `all(c.is_trimmable() for c in self.caches)` — mlx-lm
@@ -445,7 +447,7 @@ impl KvCache for CacheList {
   /// **Container-illegal.** Neither mlx-lm `CacheList` nor `_BaseCache`
   /// defines `make_mask` (cache.py:127-175, 814-902): a composite is never
   /// masked directly — callers index a child via [`get`](CacheList::get)
-  /// and use *that* child's `make_mask`. A recoverable [`Error::Backend`]
+  /// and use *that* child's `make_mask`. A recoverable typed [`Error`] variant
   /// (the no-panic equivalent of the `AttributeError` a direct
   /// `CacheList.make_mask(...)` raises in mlx-lm).
   fn make_mask(
@@ -454,12 +456,10 @@ impl KvCache for CacheList {
     _window_size: Option<usize>,
     _return_array: bool,
   ) -> Result<MaskMode> {
-    Err(Error::Backend(
-      "CacheList::make_mask is invalid — mask per child via \
-                CacheList::get (mlx-lm CacheList/_BaseCache define no \
-                make_mask; masking is per child)"
-        .into(),
-    ))
+    Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "CacheList::make_mask (composite is never masked directly)",
+      "must mask per child via CacheList::get (mlx-lm CacheList/_BaseCache define no make_mask; masking is per child)",
+    )))
   }
 
   /// The **sum** of children's `nbytes` — mlx-lm `CacheList.nbytes`
@@ -594,7 +594,7 @@ impl KvCache for CacheList {
 ///
 /// Every malformed-framing case (missing/non-numeric child count,
 /// truncated per-child fields, a declared `stateCount`/`metaCount`
-/// exceeding what was provided) is a recoverable [`Error::Backend`] — never
+/// exceeding what was provided) is a recoverable typed [`Error`] variant — never
 /// an out-of-bounds slice panic. Unlike Swift (which clamps with
 /// `min(...)`, KVCache.swift:1357-1361, silently shortening an
 /// inconsistent child slice), this **rejects** the inconsistency so a
@@ -613,7 +613,7 @@ impl KvCache for CacheList {
 /// reconstruction therefore carries an explicit remaining-depth budget
 /// ([`CACHE_LIST_MAX_NESTING_DEPTH`]) and a `CacheList`-into-`CacheList`
 /// step that would exceed it is rejected as a recoverable
-/// [`Error::Backend`] (never a stack-overflow abort). The budget is far
+/// typed [`Error`] variant (never a stack-overflow abort). The budget is far
 /// above any real hybrid-model nesting (which is a couple of levels), so
 /// every faithful round-trip is unaffected — only a pathological forged
 /// chain is rejected.
@@ -645,7 +645,7 @@ const CACHE_LIST_MAX_NESTING_DEPTH: usize = 64;
 /// goes through the unchanged public [`from_state`](super::from_state).
 /// `depth_budget == 0` on entry means the chain is one level deeper than
 /// [`CACHE_LIST_MAX_NESTING_DEPTH`] allows — a recoverable
-/// [`Error::Backend`], never a stack-overflow abort.
+/// typed [`Error`] variant, never a stack-overflow abort.
 fn cache_list_from_state_bounded(
   state: Vec<Array>,
   meta: &[String],
@@ -679,27 +679,33 @@ fn build_cache_list_children(
   meta: &[String],
   depth_budget: usize,
 ) -> Result<Vec<Box<dyn KvCache>>> {
-  let err = |m: &str| Error::Backend(format!("CacheList: {m}"));
-
   // Reject the over-deep chain BEFORE parsing this level's frame: a forged
   // single-child `CacheList -> CacheList -> …` consumes one budget unit per
   // level, and `0` here means reconstructing *this* CacheList already
   // exceeds `CACHE_LIST_MAX_NESTING_DEPTH` — a recoverable error rather
   // than another native recursion frame toward a stack-overflow abort.
   let Some(child_depth_budget) = depth_budget.checked_sub(1) else {
-    return Err(err(&format!(
-      "CacheList nesting exceeds the maximum depth \
-       {CACHE_LIST_MAX_NESTING_DEPTH} (a deeper chain is rejected as a \
-       forged/corrupt prompt cache, not a stack-overflow abort)"
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "CacheList::from_state: nesting depth (deeper chain rejected as a forged/corrupt prompt cache, not a stack-overflow abort)",
+      "CACHE_LIST_MAX_NESTING_DEPTH",
+      CACHE_LIST_MAX_NESTING_DEPTH as u64,
+      CACHE_LIST_MAX_NESTING_DEPTH as u64,
     )));
   };
 
-  let first = meta
-    .first()
-    .ok_or_else(|| err("missing child count (empty meta_state)"))?;
-  let child_count: usize = first
-    .parse()
-    .map_err(|_| err(&format!("invalid child count {first:?}")))?;
+  let first = meta.first().ok_or_else(|| {
+    Error::InvariantViolation(InvariantViolationPayload::new(
+      "CacheList::from_state: meta_state",
+      "must be non-empty (first element is child count)",
+    ))
+  })?;
+  let child_count: usize = first.parse().map_err(|e: std::num::ParseIntError| {
+    Error::Parse(ParsePayload::new(
+      "CacheList::from_state: child count",
+      "usize",
+      Box::new(e),
+    ))
+  })?;
 
   // Bound `child_count` against the metadata length BEFORE any allocation.
   // Each child frame is at minimum 3 meta fields (`className`,
@@ -710,15 +716,16 @@ fn build_cache_list_children(
   // reach `Vec::with_capacity(child_count)` below and panic on capacity
   // overflow / abort on OOM *before* the per-child truncation checks could
   // reject it — a panic/abort on the public `from_state` load path. Reject
-  // it here as a recoverable `Error::Backend` instead, and (since the count
+  // it here as a recoverable `Error::CapExceeded` instead, and (since the count
   // is now bounded by `meta.len()`) grow the children `Vec` on demand
   // rather than pre-reserving an attacker-controlled capacity.
   let max_children = meta.len().saturating_sub(1) / 3;
   if child_count > max_children {
-    return Err(err(&format!(
-      "child count {child_count} exceeds the maximum {max_children} \
-       possible for {} meta value(s) (3 framing fields per child)",
-      meta.len()
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "CacheList::from_state: child count (3 framing fields per child)",
+      "max_children_for_meta",
+      max_children as u64,
+      child_count as u64,
     )));
   }
 
@@ -730,13 +737,24 @@ fn build_cache_list_children(
   let mut state_remaining = state_it.len();
 
   for child in 0..child_count {
+    // Layer key naming the offending child index — wraps the typed inner
+    // error so runtime `child` survives end-to-end without runtime String
+    // payloads in the inner variant.
+    let layer = |inner: Error| -> Error {
+      Error::LayerKeyed(LayerKeyedPayload::new(
+        format_smolstr!("child {child}"),
+        inner,
+      ))
+    };
     // Need `className`, `stateCount`, `metaCount` (Swift guard
     // `metaIdx + 2 < metaState.count`, KVCache.swift:1345; we use
     // `+ 2 >= len` since Rust slices are 0-based half-open).
     if meta_idx + 2 >= meta.len() {
-      return Err(err(&format!(
-        "meta_state truncated at child {child} (need class/state/meta \
-         counts at {meta_idx})"
+      return Err(layer(Error::InvariantViolation(
+        InvariantViolationPayload::new(
+          "CacheList::from_state: meta_state truncated at child frame (need class/state/meta counts)",
+          "must have at least 3 meta entries remaining for each child frame",
+        ),
       )));
     }
     // `class_name` is only consumed as `&str` (equality vs `"CacheList"` and
@@ -748,23 +766,44 @@ fn build_cache_list_children(
     let class_name: &str = &meta[meta_idx];
     let state_count: usize = meta[meta_idx + 1]
       .parse()
-      .map_err(|_| err(&format!("invalid stateCount for child {child}")))?;
+      .map_err(|e: std::num::ParseIntError| {
+        layer(Error::Parse(ParsePayload::new(
+          "CacheList::from_state: child stateCount",
+          "usize",
+          Box::new(e),
+        )))
+      })?;
     let meta_count: usize = meta[meta_idx + 2]
       .parse()
-      .map_err(|_| err(&format!("invalid metaCount for child {child}")))?;
+      .map_err(|e: std::num::ParseIntError| {
+        layer(Error::Parse(ParsePayload::new(
+          "CacheList::from_state: child metaCount",
+          "usize",
+          Box::new(e),
+        )))
+      })?;
     meta_idx += 3;
 
     // Slice `metaCount` child-meta strings. Reject (not clamp) an
     // out-of-range claim.
-    let meta_end = meta_idx
-      .checked_add(meta_count)
-      .ok_or_else(|| err("metaCount overflow"))?;
+    let meta_end = meta_idx.checked_add(meta_count).ok_or_else(|| {
+      layer(Error::ArithmeticOverflow(
+        ArithmeticOverflowPayload::with_operands(
+          "CacheList::from_state: meta_idx + metaCount",
+          "usize",
+          [
+            ("meta_idx", meta_idx as u64),
+            ("metaCount", meta_count as u64),
+          ],
+        ),
+      ))
+    })?;
     if meta_end > meta.len() {
-      return Err(err(&format!(
-        "child {child} declares metaCount {meta_count} but only \
-         {} meta values remain",
-        meta.len().saturating_sub(meta_idx)
-      )));
+      return Err(layer(Error::LengthMismatch(LengthMismatchPayload::new(
+        "CacheList::from_state: child metaCount exceeds remaining meta values",
+        meta.len().saturating_sub(meta_idx),
+        meta_count,
+      ))));
     }
     let child_meta = &meta[meta_idx..meta_end];
     meta_idx = meta_end;
@@ -773,10 +812,11 @@ fn build_cache_list_children(
     // unlike Swift's `min(...)`) a claim exceeding what remains, so a
     // corrupt cache cannot rebuild a child from a too-short state.
     if state_count > state_remaining {
-      return Err(err(&format!(
-        "child {child} declares stateCount {state_count} but only \
-         {state_remaining} state arrays remain"
-      )));
+      return Err(layer(Error::LengthMismatch(LengthMismatchPayload::new(
+        "CacheList::from_state: child stateCount exceeds remaining state arrays",
+        state_remaining,
+        state_count,
+      ))));
     }
     let child_state: Vec<Array> = state_it.by_ref().take(state_count).collect();
     state_remaining -= state_count;
@@ -801,16 +841,17 @@ fn build_cache_list_children(
   // unconsumed state/meta means the framing disagrees with the payload —
   // reject rather than silently ignore (a corrupt/forged prompt cache).
   if state_remaining != 0 {
-    return Err(err(&format!(
-      "{state_remaining} state array(s) left after {child_count} children \
-       (framing/payload mismatch)"
+    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+      "CacheList::from_state: state array consumption after all children (framing/payload mismatch)",
+      0,
+      state_remaining,
     )));
   }
   if meta_idx != meta.len() {
-    return Err(err(&format!(
-      "{} meta value(s) left after {child_count} children (framing/payload \
-       mismatch)",
-      meta.len() - meta_idx
+    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+      "CacheList::from_state: meta value consumption after all children (framing/payload mismatch)",
+      meta.len(),
+      meta_idx,
     )));
   }
 

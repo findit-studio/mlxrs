@@ -40,7 +40,7 @@ use std::{
 };
 
 use crate::{
-  error::{Error, Result},
+  error::{Error, MissingKeyPayload, Result},
   lm::cache::{KvCache, can_trim_prompt_cache, trim_prompt_cache},
 };
 
@@ -748,7 +748,7 @@ impl<M: Eq + Hash + Clone> LruPromptCache<M> {
   /// `cache_type` outside the `CacheOrder` ordering raises `KeyError`
   /// *before* the entry is durably inserted (the trie `add` at
   /// cache.py:1712 is never reached). The Rust-idiomatic mirror of that
-  /// fail-fast is an early `Err(Error::Backend)` validated **before any
+  /// fail-fast is an early `Err(Error::MissingKey)` validated **before any
   /// state mutation** — never silently dropping the bucket (which would
   /// leave a fetchable, untracked, un-evictable entry that
   /// `len`/`stats_by_type`/`trim_to`/the `max_bytes` loop cannot see and
@@ -766,9 +766,13 @@ impl<M: Eq + Hash + Clone> LruPromptCache<M> {
     // / `self._lrus[...]` index, before `self._trie.add`). A bucket is
     // valid iff it is one of `CacheOrder`'s fixed ordering keys.
     if !self.lru.ordering.iter().any(|k| k == cache_type) {
-      return Err(Error::Backend(format!(
-        "LruPromptCache: unknown cache_type {cache_type:?}; expected one of {:?}",
-        self.lru.ordering
+      // The supported set is RUNTIME-derived (`self.lru.ordering`, not a
+      // `&'static` list), so this uses `MissingKey` (runtime-keyed lookup
+      // miss) rather than `UnknownEnumValue` (which requires a static
+      // `supported` list).
+      return Err(Error::MissingKey(MissingKeyPayload::new(
+        "LruPromptCache::add: cache_type (must be one of the configured CacheOrder buckets)",
+        cache_type,
       )));
     }
 

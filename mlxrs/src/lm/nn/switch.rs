@@ -47,9 +47,13 @@
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::Result,
+  error::{
+    ArithmeticOverflowPayload, InvariantViolationPayload, LengthMismatchPayload, OutOfRangePayload,
+    RankMismatchPayload, Result, ShapePairMismatchPayload, UnknownEnumValuePayload,
+  },
   ops::{arithmetic, indexing, linalg_basic, misc, quantized, shape},
 };
+use smol_str::format_smolstr;
 
 use super::activations::silu;
 
@@ -122,19 +126,34 @@ impl SwitchLinear {
   pub fn from_parts(weight: Array, bias: Option<Array>) -> Result<Self> {
     let w_shape = weight.shape();
     if w_shape.len() != 3 {
-      return Err(crate::Error::ShapeMismatch(format!(
-        "SwitchLinear::from_parts: weight must be 3-D [num_experts, output_dims, \
-           input_dims], got {w_shape:?}"
+      return Err(crate::Error::RankMismatch(RankMismatchPayload::new(
+        "SwitchLinear::from_parts: weight must be 3-D [num_experts, output_dims, input_dims]",
+        w_shape.len() as u32,
+        w_shape.to_vec(),
       )));
     }
     if let Some(b) = &bias {
       let b_shape = b.shape();
-      if b_shape.len() != 2 || b_shape[0] != w_shape[0] || b_shape[1] != w_shape[1] {
-        return Err(crate::Error::ShapeMismatch(format!(
-          "SwitchLinear::from_parts: bias must be [num_experts={}, output_dims={}], \
-             got {b_shape:?}",
-          w_shape[0], w_shape[1]
+      // Split the bias-shape check into the precise taxonomy (Codex
+      // 2026-05-27 R2): a rank-1 or rank-3 bias must surface as
+      // `RankMismatch`, not `ShapePairMismatch` — `ShapePairMismatchPayload`
+      // is documented as distinct from `RankMismatchPayload` (rank differs).
+      // Only after the ranks match do we compare the full `[E, O]` shape.
+      if b_shape.len() != 2 {
+        return Err(crate::Error::RankMismatch(RankMismatchPayload::new(
+          "SwitchLinear::from_parts: bias must be rank-2 [num_experts, output_dims]",
+          b_shape.len() as u32,
+          b_shape.to_vec(),
         )));
+      }
+      if b_shape[0] != w_shape[0] || b_shape[1] != w_shape[1] {
+        return Err(crate::Error::ShapePairMismatch(
+          ShapePairMismatchPayload::new(
+            "SwitchLinear::from_parts: bias must be [num_experts, output_dims]",
+            vec![w_shape[0], w_shape[1]].as_slice(),
+            b_shape.to_vec().as_slice(),
+          ),
+        ));
       }
     }
     Ok(Self { weight, bias })
@@ -335,10 +354,13 @@ impl QuantizedSwitchLinear {
   ///   [`apply`](Self::apply), adding the wrong scalar across every output
   ///   channel.
   ///
-  /// Shape mismatches surface as
-  /// [`Error::ShapeMismatch`](crate::Error::ShapeMismatch); mode-arity /
-  /// unknown-mode / zero-param failures surface as
-  /// [`Error::Backend`](crate::Error::Backend). Does not evaluate (lazy;
+  /// Shape mismatches surface as typed
+  /// [`Error::RankMismatch`](crate::Error::RankMismatch) /
+  /// [`Error::ShapePairMismatch`](crate::Error::ShapePairMismatch); mode-arity /
+  /// unknown-mode / zero-param failures surface as typed
+  /// [`Error::InvariantViolation`](crate::Error::InvariantViolation) /
+  /// [`Error::UnknownEnumValue`](crate::Error::UnknownEnumValue) /
+  /// [`Error::OutOfRange`](crate::Error::OutOfRange). Does not evaluate (lazy;
   /// only `shape()` metadata is read).
   #[allow(clippy::too_many_arguments)]
   pub fn from_parts(
@@ -353,9 +375,10 @@ impl QuantizedSwitchLinear {
     let mode = mode.into();
     let w_shape = weight.shape();
     if w_shape.len() != 3 {
-      return Err(crate::Error::ShapeMismatch(format!(
-        "QuantizedSwitchLinear::from_parts: weight must be 3-D [num_experts, output_dims, \
-           packed_input_dims], got {w_shape:?}"
+      return Err(crate::Error::RankMismatch(RankMismatchPayload::new(
+        "QuantizedSwitchLinear::from_parts: weight must be 3-D [num_experts, output_dims, packed_input_dims]",
+        w_shape.len() as u32,
+        w_shape.to_vec(),
       )));
     }
     // Packed-quantization dtype signal: mlx packs the affine-quantized
@@ -368,11 +391,12 @@ impl QuantizedSwitchLinear {
     // that already requires `.weight` dtype == `U32` for quantized triples.
     let w_dtype = weight.dtype()?;
     if w_dtype != Dtype::U32 {
-      return Err(crate::Error::Backend(format!(
-        "QuantizedSwitchLinear::from_parts: weight must be packed `uint32` (the \
-           mlx-quantized-weight dtype — `gather_qmm` rejects non-`uint32` quantized \
-           weights), got {w_dtype:?}"
-      )));
+      return Err(crate::Error::InvariantViolation(
+        InvariantViolationPayload::new(
+          "QuantizedSwitchLinear::from_parts: weight dtype (gather_qmm rejects non-`uint32` quantized weights)",
+          "must be `uint32` (the mlx-quantized-weight dtype)",
+        ),
+      ));
     }
 
     let e = w_shape[0];
@@ -383,32 +407,45 @@ impl QuantizedSwitchLinear {
     // validated by mlx-c against `group_size`.
     let s_shape = scales.shape();
     if s_shape.len() != w_shape.len() {
-      return Err(crate::Error::ShapeMismatch(format!(
-        "QuantizedSwitchLinear::from_parts: scales rank ({}) does not match weight rank ({}) \
-           — mlx `quantize` preserves the leading shape across the (weight, scales, biases) \
-           triple (`mlx/ops.cpp:4789-4798`); got scales {s_shape:?}, weight {w_shape:?}",
-        s_shape.len(),
-        w_shape.len()
+      return Err(crate::Error::RankMismatch(RankMismatchPayload::new(
+        "QuantizedSwitchLinear::from_parts: scales rank must match weight rank (mlx `quantize` preserves leading shape across (weight, scales, biases))",
+        s_shape.len() as u32,
+        s_shape.to_vec(),
       )));
     }
     if s_shape[0] != e || s_shape[1] != o {
-      return Err(crate::Error::ShapeMismatch(format!(
-        "QuantizedSwitchLinear::from_parts: scales leading dims must match weight \
-           [num_experts={e}, output_dims={o}, ..], got {s_shape:?}"
-      )));
+      return Err(crate::Error::ShapePairMismatch(
+        ShapePairMismatchPayload::new(
+          "QuantizedSwitchLinear::from_parts: scales leading dims (E, O) must match weight",
+          vec![e, o].as_slice(),
+          vec![s_shape[0], s_shape[1]].as_slice(),
+        ),
+      ));
     }
 
     // `quant_biases`, when present, shares the per-group `[E, O, n_groups]`
     // layout with `scales` (`affine_quantize` produces both with the same
-    // shape, `mlx/ops.cpp:4793-4798`).
+    // shape, `mlx/ops.cpp:4793-4798`). Split the check (Codex 2026-05-27 R2)
+    // so a divergent RANK surfaces as `RankMismatch` rather than being
+    // collapsed into `ShapePairMismatch` — the latter is documented as
+    // same-rank shape disagreement.
     if let Some(qb) = &quant_biases {
       let qb_shape = qb.shape();
-      if qb_shape != s_shape {
-        return Err(crate::Error::ShapeMismatch(format!(
-          "QuantizedSwitchLinear::from_parts: quant_biases shape must match scales \
-             (mlx `affine_quantize` writes them with identical `[E, O, n_groups]` shape, \
-             `mlx/ops.cpp:4793-4798`); got quant_biases {qb_shape:?}, scales {s_shape:?}"
+      if qb_shape.len() != s_shape.len() {
+        return Err(crate::Error::RankMismatch(RankMismatchPayload::new(
+          "QuantizedSwitchLinear::from_parts: quant_biases rank must match scales rank (mlx `affine_quantize` writes identical `[E, O, n_groups]` shape)",
+          qb_shape.len() as u32,
+          qb_shape.to_vec(),
         )));
+      }
+      if qb_shape != s_shape {
+        return Err(crate::Error::ShapePairMismatch(
+          ShapePairMismatchPayload::new(
+            "QuantizedSwitchLinear::from_parts: quant_biases shape must match scales (mlx `affine_quantize` writes identical `[E, O, n_groups]` shape)",
+            s_shape.to_vec().as_slice(),
+            qb_shape.to_vec().as_slice(),
+          ),
+        ));
       }
     }
 
@@ -421,28 +458,32 @@ impl QuantizedSwitchLinear {
     // doesn't reach mlx-c with an unfamiliar tag.
     match (mode.as_str(), quant_biases.as_ref()) {
       ("affine", None) => {
-        return Err(crate::Error::Backend(
-          "QuantizedSwitchLinear::from_parts: `affine` mode requires `quant_biases` \
-                    (mlx `affine_quantize` always writes {w_q, scales, biases}, \
-                    `mlx/ops.cpp:4793-4798`); got None"
-            .to_string(),
+        return Err(crate::Error::InvariantViolation(
+          InvariantViolationPayload::new(
+            "QuantizedSwitchLinear::from_parts: `affine` mode quant_biases (mlx `affine_quantize` always writes {w_q, scales, biases})",
+            "must be Some for `affine` mode",
+          ),
         ));
       }
       ("mxfp4" | "mxfp8" | "nvfp4", Some(_)) => {
-        return Err(crate::Error::Backend(format!(
-          "QuantizedSwitchLinear::from_parts: `{mode}` mode is scale-only \
-             (mlx `fp_quantize` writes {{w_q, scales}} with no biases, \
-             `mlx/ops.cpp:4890,4898-4904`); got a stale `quant_biases`"
-        )));
+        return Err(crate::Error::InvariantViolation(
+          InvariantViolationPayload::new(
+            "QuantizedSwitchLinear::from_parts: mxfp4 / mxfp8 / nvfp4 mode is scale-only (mlx `fp_quantize` writes {w_q, scales} with no biases); got a stale `quant_biases`",
+            "must be None for mxfp4 / mxfp8 / nvfp4 mode",
+          ),
+        ));
       }
       ("affine", Some(_)) | ("mxfp4" | "mxfp8" | "nvfp4", None) => {
         // Expected layouts — fall through to the remaining checks.
       }
       (other, _) => {
-        return Err(crate::Error::Backend(format!(
-          "QuantizedSwitchLinear::from_parts: unknown mode {other:?}; allowed: \
-             \"affine\", \"mxfp4\", \"mxfp8\", \"nvfp4\""
-        )));
+        return Err(crate::Error::UnknownEnumValue(
+          UnknownEnumValuePayload::new(
+            "QuantizedSwitchLinear::mode",
+            other.to_string(),
+            &["affine", "mxfp4", "mxfp8", "nvfp4"],
+          ),
+        ));
       }
     }
 
@@ -453,25 +494,41 @@ impl QuantizedSwitchLinear {
     // discipline; checking them here would duplicate
     // `validate_quantized_input` and drift from upstream.
     if bits <= 0 {
-      return Err(crate::Error::Backend(format!(
-        "QuantizedSwitchLinear::from_parts: bits must be > 0, got {bits} (per-mode value \
-           tables are validated by mlx-c)"
+      return Err(crate::Error::OutOfRange(OutOfRangePayload::new(
+        "QuantizedSwitchLinear::from_parts: bits (per-mode value tables validated by mlx-c)",
+        "must be > 0",
+        format_smolstr!("{bits}"),
       )));
     }
     if group_size <= 0 {
-      return Err(crate::Error::Backend(format!(
-        "QuantizedSwitchLinear::from_parts: group_size must be > 0, got {group_size} \
-           (per-mode value tables are validated by mlx-c)"
+      return Err(crate::Error::OutOfRange(OutOfRangePayload::new(
+        "QuantizedSwitchLinear::from_parts: group_size (per-mode value tables validated by mlx-c)",
+        "must be > 0",
+        format_smolstr!("{group_size}"),
       )));
     }
 
     if let Some(b) = &bias {
       let b_shape = b.shape();
-      if b_shape.len() != 2 || b_shape[0] != e || b_shape[1] != o {
-        return Err(crate::Error::ShapeMismatch(format!(
-          "QuantizedSwitchLinear::from_parts: bias must be [num_experts={e}, \
-             output_dims={o}], got {b_shape:?}"
+      // Split the bias-shape check into the precise taxonomy (Codex
+      // 2026-05-27 R2): a rank-1 or rank-3 bias surfaces as
+      // `RankMismatch`, not `ShapePairMismatch`. Only after the ranks
+      // match do we compare the full `[E, O]` shape.
+      if b_shape.len() != 2 {
+        return Err(crate::Error::RankMismatch(RankMismatchPayload::new(
+          "QuantizedSwitchLinear::from_parts: bias must be rank-2 [num_experts, output_dims]",
+          b_shape.len() as u32,
+          b_shape.to_vec(),
         )));
+      }
+      if b_shape[0] != e || b_shape[1] != o {
+        return Err(crate::Error::ShapePairMismatch(
+          ShapePairMismatchPayload::new(
+            "QuantizedSwitchLinear::from_parts: bias must be [num_experts, output_dims]",
+            vec![e, o].as_slice(),
+            b_shape.to_vec().as_slice(),
+          ),
+        ));
       }
     }
     Ok(Self {
@@ -648,26 +705,67 @@ fn check_routing_indices(x: &Array, indices: &Array) -> Result<()> {
   // called with a rank-0 `x` (it `expand_dims`es `x` and routes per token),
   // but guard so the slice below cannot underflow.
   if x_shape.is_empty() {
-    return Err(crate::Error::ShapeMismatch(
-      "SwitchGLU/SwitchMLP::forward: x must have at least one axis \
-                ([..batch.., input_dims])"
-        .to_string(),
-    ));
+    return Err(crate::Error::RankMismatch(RankMismatchPayload::new(
+      "SwitchGLU/SwitchMLP::forward: x must have at least one axis ([..batch.., input_dims])",
+      0,
+      x_shape.to_vec(),
+    )));
   }
   let x_batch = &x_shape[..x_shape.len() - 1];
   let idx_shape = indices.shape();
   // `indices` must be `[..batch.., k]`: exactly one trailing axis (the
   // explicit top-`k`, ≥ 1) beyond `x`'s batch dims, and leading dims equal to
-  // them. `idx_shape.len() == x_batch.len()` is the ambiguous `[..batch..]`
-  // shape (`[N]` / `[B, S]`) — no `k` axis — which `_gather_sort` would
-  // silently mis-read as top-`k`; reject it.
-  if idx_shape.len() != x_batch.len() + 1 || idx_shape[..x_batch.len()] != *x_batch {
-    return Err(crate::Error::ShapeMismatch(format!(
-      "SwitchGLU/SwitchMLP::forward: indices must be [..batch.., k] with leading \
-         dims matching x's batch dims {x_batch:?} and one explicit trailing top-k \
-         axis (pass [..batch.., 1] for top-1 routing); got indices shape {idx_shape:?} \
-         for x shape {x_shape:?}"
+  // them.
+  //
+  // Taxonomy (Codex 2026-05-27): split the prior single `ShapePairMismatch`
+  // into the precise violation class so a `[N]`-vs-`[N]` ambiguous-rank case
+  // can't surface as "expected [N], got [N]":
+  //   1. `idx_shape.len() != x_batch.len() + 1` ⇒ `RankMismatch`
+  //      (missing/extra top-k axis — `[N]` for `x=[N,D]` falls here).
+  //   2. Same rank but exactly one leading dim differs ⇒ `LengthMismatch`.
+  //   3. Same rank with ≥ 2 leading dims differing ⇒ `ShapePairMismatch`
+  //      (true multi-dim shape disagreement on the batch prefix).
+  let expected_rank = x_batch.len() + 1;
+  if idx_shape.len() != expected_rank {
+    return Err(crate::Error::RankMismatch(RankMismatchPayload::new(
+      "SwitchGLU/SwitchMLP::forward: indices must be [..batch.., k] — missing or extra trailing top-k axis (pass [..batch.., 1] for top-1 routing)",
+      idx_shape.len() as u32,
+      idx_shape.to_vec(),
     )));
+  }
+  // Same rank: now compare leading batch dims.
+  let idx_lead = &idx_shape[..x_batch.len()];
+  if idx_lead != x_batch {
+    // Count differing dims to choose LengthMismatch (exactly one) vs
+    // ShapePairMismatch (≥ 2). At this point ranks agree, so an exact
+    // single-dim disparity has a well-defined expected/actual length pair.
+    let mut diff_idx: Option<usize> = None;
+    let mut diff_count = 0usize;
+    for (i, (e, a)) in x_batch.iter().zip(idx_lead.iter()).enumerate() {
+      if e != a {
+        diff_count += 1;
+        if diff_count == 1 {
+          diff_idx = Some(i);
+        }
+      }
+    }
+    debug_assert!(diff_count >= 1, "idx_lead != x_batch ⇒ at least one diff");
+    if diff_count == 1 {
+      // SAFETY: `diff_count == 1` ⇒ we set `diff_idx` exactly once above.
+      let i = diff_idx.expect("diff_count == 1 ⇒ diff_idx is Some");
+      return Err(crate::Error::LengthMismatch(LengthMismatchPayload::new(
+        "SwitchGLU/SwitchMLP::forward: indices leading-dim length must match x's corresponding batch dim",
+        x_batch[i],
+        idx_lead[i],
+      )));
+    }
+    return Err(crate::Error::ShapePairMismatch(
+      ShapePairMismatchPayload::new(
+        "SwitchGLU/SwitchMLP::forward: indices leading dims must match x's batch dims",
+        x_batch,
+        idx_lead,
+      ),
+    ));
   }
   Ok(())
 }
@@ -716,7 +814,11 @@ fn gather_sort(x: &Array, indices: &Array) -> Result<(Array, Array, Array)> {
   // `order // M` maps each sorted `(token, top-k-slot)` slot back to its
   // token row index; `m_arr` is the shape-`[1]` broadcast divisor.
   let m_u32 = u32::try_from(m).map_err(|_| {
-    crate::Error::ShapeMismatch(format!("gather_sort: top-k count {m} exceeds u32::MAX"))
+    crate::Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "gather_sort: top-k count exceeds u32::MAX",
+      "u32",
+      [("top_k", m as u64)],
+    ))
   })?;
   let m_arr = Array::from_slice::<u32>(&[m_u32], &(1usize,))?;
   let token_rows = arithmetic::floor_divide(&order, &m_arr)?;
@@ -986,25 +1088,34 @@ fn check_glu_shapes(
   );
   // `gate_proj` and `up_proj` are both `input_dims → hidden_dims`.
   if gi != ui || gh != uh {
-    return Err(crate::Error::ShapeMismatch(format!(
-      "SwitchGLU: gate_proj [{gi}→{gh}] and up_proj [{ui}→{uh}] must share \
-         [input_dims→hidden_dims]"
-    )));
+    return Err(crate::Error::ShapePairMismatch(
+      ShapePairMismatchPayload::new(
+        "SwitchGLU: gate_proj and up_proj must share [input_dims, hidden_dims]",
+        vec![gi, gh].as_slice(),
+        vec![ui, uh].as_slice(),
+      ),
+    ));
   }
   // `down_proj` is `hidden_dims → input_dims` — the inverse of the shared
   // gate/up projection shape.
   if di != gh || dh != gi {
-    return Err(crate::Error::ShapeMismatch(format!(
-      "SwitchGLU: down_proj [{di}→{dh}] must be the [hidden_dims={gh}→input_dims={gi}] \
-         inverse of gate_proj/up_proj [{gi}→{gh}]"
-    )));
+    return Err(crate::Error::ShapePairMismatch(
+      ShapePairMismatchPayload::new(
+        "SwitchGLU: down_proj must be the [hidden_dims, input_dims] inverse of gate_proj/up_proj",
+        vec![gh, gi].as_slice(),
+        vec![di, dh].as_slice(),
+      ),
+    ));
   }
   // Every projection routes the same expert population.
   if ge != ue || ge != de {
-    return Err(crate::Error::ShapeMismatch(format!(
-      "SwitchGLU: all projections must have the same num_experts \
-         (gate_proj={ge}, up_proj={ue}, down_proj={de})"
-    )));
+    return Err(crate::Error::ShapePairMismatch(
+      ShapePairMismatchPayload::new(
+        "SwitchGLU: all projections must have the same num_experts (gate_proj, up_proj, down_proj)",
+        vec![ge, ge, ge].as_slice(),
+        vec![ge, ue, de].as_slice(),
+      ),
+    ));
   }
   Ok(())
 }
@@ -1075,20 +1186,17 @@ impl SwitchMLP {
     // `fc2` is `hidden_dims → input_dims` — the inverse of `fc1`'s
     // `input_dims → hidden_dims`.
     if fc2.input_dims() != fc1.output_dims() || fc2.output_dims() != fc1.input_dims() {
-      return Err(crate::Error::ShapeMismatch(format!(
-        "SwitchMLP: fc2 [{}→{}] must be the [hidden_dims={}→input_dims={}] inverse of \
-           fc1 [{}→{}]",
-        fc2.input_dims(),
-        fc2.output_dims(),
-        fc1.output_dims(),
-        fc1.input_dims(),
-        fc1.input_dims(),
-        fc1.output_dims(),
-      )));
+      return Err(crate::Error::ShapePairMismatch(
+        ShapePairMismatchPayload::new(
+          "SwitchMLP: fc2 must be the [hidden_dims, input_dims] inverse of fc1 [input_dims, hidden_dims]",
+          vec![fc1.output_dims(), fc1.input_dims()].as_slice(),
+          vec![fc2.input_dims(), fc2.output_dims()].as_slice(),
+        ),
+      ));
     }
     if fc1.num_experts() != fc2.num_experts() {
-      return Err(crate::Error::ShapeMismatch(format!(
-        "SwitchMLP: fc1 and fc2 must have the same num_experts (fc1={}, fc2={})",
+      return Err(crate::Error::LengthMismatch(LengthMismatchPayload::new(
+        "SwitchMLP: fc1 and fc2 num_experts",
         fc1.num_experts(),
         fc2.num_experts(),
       )));
@@ -1301,7 +1409,7 @@ mod tests {
   fn switch_linear_from_parts_rejects_2d_weight() {
     let bad = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
     let err = SwitchLinear::from_parts(bad, None).unwrap_err();
-    assert!(matches!(err, crate::Error::ShapeMismatch(_)));
+    assert!(matches!(err, crate::Error::RankMismatch(_)));
   }
 
   #[test]
@@ -1311,7 +1419,40 @@ mod tests {
     let bad_bias =
       Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], &(3, 3)).unwrap();
     let err = SwitchLinear::from_parts(weight, Some(bad_bias)).unwrap_err();
-    assert!(matches!(err, crate::Error::ShapeMismatch(_)));
+    assert!(matches!(err, crate::Error::ShapePairMismatch(_)));
+  }
+
+  /// Bias-rank-mismatch split (Codex 2026-05-27 R2): a rank-1 (or rank-3)
+  /// bias must surface as `RankMismatch`, not as `ShapePairMismatch`, so
+  /// typed-error consumers can distinguish the rank-vs-shape categories.
+  /// Pre-split, every malformed-rank bias was collapsed into
+  /// `ShapePairMismatch` by the single combined check.
+  #[test]
+  fn switch_linear_from_parts_rejects_rank_mismatch_bias() {
+    let weight = hand_traced_weight(); // [2, 3, 4]
+    // Rank-1 bias `[2]` (a plausible per-expert flat scalar) — must now
+    // be `RankMismatch` with `actual == 1`.
+    let bad_bias_rank1 = Array::from_slice::<f32>(&[1.0, 2.0], &(2usize,)).unwrap();
+    let err =
+      SwitchLinear::from_parts(weight.try_clone().unwrap(), Some(bad_bias_rank1)).unwrap_err();
+    match err {
+      crate::Error::RankMismatch(payload) => {
+        assert_eq!(payload.actual(), 1, "rank-1 bias ⇒ actual rank 1");
+        assert_eq!(payload.actual_shape(), &[2usize]);
+      }
+      other => panic!("expected RankMismatch on rank-1 bias, got {other:?}"),
+    }
+    // Rank-3 bias `[2, 3, 1]` — must also be `RankMismatch`.
+    let bad_bias_rank3 =
+      Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2usize, 3usize, 1usize)).unwrap();
+    let err = SwitchLinear::from_parts(weight, Some(bad_bias_rank3)).unwrap_err();
+    match err {
+      crate::Error::RankMismatch(payload) => {
+        assert_eq!(payload.actual(), 3, "rank-3 bias ⇒ actual rank 3");
+        assert_eq!(payload.actual_shape(), &[2usize, 3, 1]);
+      }
+      other => panic!("expected RankMismatch on rank-3 bias, got {other:?}"),
+    }
   }
 
   #[test]
@@ -1428,7 +1569,62 @@ mod tests {
     let err =
       QuantizedSwitchLinear::from_parts(w_q, scales, q_biases, Some(bad_bias), 64, 4, "affine")
         .unwrap_err();
-    assert!(matches!(err, crate::Error::ShapeMismatch(_)));
+    assert!(matches!(err, crate::Error::ShapePairMismatch(_)));
+  }
+
+  /// Bias-rank-mismatch split (Codex 2026-05-27 R2): a rank-1 bias on the
+  /// QUANTIZED layer must surface as `RankMismatch`, not as
+  /// `ShapePairMismatch` — same taxonomy as the dense [`SwitchLinear`]
+  /// sibling.
+  #[test]
+  fn quantized_switch_linear_from_parts_rejects_rank_mismatch_bias() {
+    let dense_w = quant_dense_weight();
+    let (w_q, scales, q_biases) = quantized::quantize(&dense_w, 64, 4, "affine", None).unwrap();
+    // Rank-1 bias `[2]` — must now be `RankMismatch` with `actual == 1`.
+    let bad_bias_rank1 = Array::from_slice::<f32>(&[1.0, 2.0], &(2usize,)).unwrap();
+    let err = QuantizedSwitchLinear::from_parts(
+      w_q,
+      scales,
+      q_biases,
+      Some(bad_bias_rank1),
+      64,
+      4,
+      "affine",
+    )
+    .unwrap_err();
+    match err {
+      crate::Error::RankMismatch(payload) => {
+        assert_eq!(payload.actual(), 1, "rank-1 bias ⇒ actual rank 1");
+        assert_eq!(payload.actual_shape(), &[2usize]);
+      }
+      other => panic!("expected RankMismatch on rank-1 bias, got {other:?}"),
+    }
+  }
+
+  /// `quant_biases` rank must match `scales` rank — split out from the
+  /// shape-pair check (Codex 2026-05-27 R2): a divergent rank now surfaces
+  /// as `RankMismatch`, not `ShapePairMismatch`. Pre-split, `qb_shape !=
+  /// s_shape` collapsed both rank and shape divergences into the same
+  /// variant.
+  #[test]
+  fn quantized_switch_linear_from_parts_rejects_quant_biases_rank_mismatch() {
+    // Valid affine triple — `scales` is rank-3 `[E, O, n_groups]`. Supply a
+    // rank-2 `quant_biases` and observe `RankMismatch` with `actual == 2`.
+    let dense_w = quant_dense_weight(); // [2, 4, 64]
+    let (w_q, scales, _q_biases) = quantized::quantize(&dense_w, 64, 4, "affine", None).unwrap();
+    // Bad rank-2 quant_biases `[2, 4]` — wrong rank entirely.
+    let bad_qb =
+      Array::from_slice::<f32>(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], &(2usize, 4usize))
+        .unwrap();
+    let err = QuantizedSwitchLinear::from_parts(w_q, scales, Some(bad_qb), None, 64, 4, "affine")
+      .unwrap_err();
+    match err {
+      crate::Error::RankMismatch(payload) => {
+        assert_eq!(payload.actual(), 2, "rank-2 quant_biases ⇒ actual rank 2");
+        assert_eq!(payload.actual_shape(), &[2usize, 4]);
+      }
+      other => panic!("expected RankMismatch on rank-2 quant_biases, got {other:?}"),
+    }
   }
 
   #[test]
@@ -1524,8 +1720,8 @@ mod tests {
     let err =
       QuantizedSwitchLinear::from_parts(w_q, bad_scales, None, None, 64, 4, "mxfp4").unwrap_err();
     assert!(
-      matches!(err, crate::Error::ShapeMismatch(_)),
-      "expected ShapeMismatch on scales leading dims, got {err:?}"
+      matches!(err, crate::Error::ShapePairMismatch(_)),
+      "expected ShapePairMismatch on scales leading dims, got {err:?}"
     );
   }
 
@@ -1559,13 +1755,15 @@ mod tests {
     )
     .unwrap_err();
     match &err {
-      crate::Error::Backend(message) => {
+      crate::Error::InvariantViolation(payload) => {
         assert!(
-          message.contains("F32"),
-          "Backend error should name the offending dtype, got: {message}"
+          payload.context().contains("weight dtype") || payload.requirement().contains("uint32"),
+          "InvariantViolation context/requirement should name the dtype invariant, got context={:?} requirement={:?}",
+          payload.context(),
+          payload.requirement()
         );
       }
-      other => panic!("expected Backend naming the dtype, got {other:?}"),
+      other => panic!("expected InvariantViolation naming the dtype invariant, got {other:?}"),
     }
   }
 
@@ -1591,8 +1789,8 @@ mod tests {
     let err = QuantizedSwitchLinear::from_parts(w_q, scales, Some(bad_qb), None, 32, 4, "affine")
       .unwrap_err();
     assert!(
-      matches!(err, crate::Error::ShapeMismatch(_)),
-      "expected ShapeMismatch on quant_biases shape, got {err:?}"
+      matches!(err, crate::Error::ShapePairMismatch(_)),
+      "expected ShapePairMismatch on quant_biases shape, got {err:?}"
     );
   }
 
@@ -1606,8 +1804,8 @@ mod tests {
     let err =
       QuantizedSwitchLinear::from_parts(w_q, scales, None, None, 64, 4, "affine").unwrap_err();
     assert!(
-      matches!(err, crate::Error::Backend(_)),
-      "expected Backend on affine-missing-quant_biases, got {err:?}"
+      matches!(err, crate::Error::InvariantViolation(_)),
+      "expected InvariantViolation on affine-missing-quant_biases, got {err:?}"
     );
   }
 
@@ -1627,8 +1825,8 @@ mod tests {
     let err = QuantizedSwitchLinear::from_parts(w_q, scales, Some(stale_qb), None, 32, 4, "mxfp4")
       .unwrap_err();
     assert!(
-      matches!(err, crate::Error::Backend(_)),
-      "expected Backend on mxfp4-with-stale-quant_biases, got {err:?}"
+      matches!(err, crate::Error::InvariantViolation(_)),
+      "expected InvariantViolation on mxfp4-with-stale-quant_biases, got {err:?}"
     );
   }
 
@@ -1642,8 +1840,8 @@ mod tests {
     let err =
       QuantizedSwitchLinear::from_parts(w_q, scales, q_biases, None, 64, 4, "unknown").unwrap_err();
     assert!(
-      matches!(err, crate::Error::Backend(_)),
-      "expected Backend on unknown mode, got {err:?}"
+      matches!(err, crate::Error::UnknownEnumValue(_)),
+      "expected UnknownEnumValue on unknown mode, got {err:?}"
     );
   }
 
@@ -1666,15 +1864,15 @@ mod tests {
     )
     .unwrap_err();
     assert!(
-      matches!(err_bits, crate::Error::Backend(_)),
-      "expected Backend on bits=0, got {err_bits:?}"
+      matches!(err_bits, crate::Error::OutOfRange(_)),
+      "expected OutOfRange on bits=0, got {err_bits:?}"
     );
 
     let err_gs =
       QuantizedSwitchLinear::from_parts(w_q, scales, q_biases, None, 0, 4, "affine").unwrap_err();
     assert!(
-      matches!(err_gs, crate::Error::Backend(_)),
-      "expected Backend on group_size=0, got {err_gs:?}"
+      matches!(err_gs, crate::Error::OutOfRange(_)),
+      "expected OutOfRange on group_size=0, got {err_gs:?}"
     );
   }
 
@@ -1953,8 +2151,8 @@ mod tests {
     )
     .unwrap_err();
     assert!(
-      matches!(err, crate::Error::ShapeMismatch(_)),
-      "expected ShapeMismatch on mismatched down_proj, got {err:?}"
+      matches!(err, crate::Error::ShapePairMismatch(_)),
+      "expected ShapePairMismatch on mismatched down_proj, got {err:?}"
     );
   }
 
@@ -1971,8 +2169,8 @@ mod tests {
     )
     .unwrap_err();
     assert!(
-      matches!(err, crate::Error::ShapeMismatch(_)),
-      "expected ShapeMismatch on mismatched num_experts, got {err:?}"
+      matches!(err, crate::Error::ShapePairMismatch(_)),
+      "expected ShapePairMismatch on mismatched num_experts, got {err:?}"
     );
   }
 
@@ -2102,8 +2300,8 @@ mod tests {
     )
     .unwrap_err();
     assert!(
-      matches!(err, crate::Error::ShapeMismatch(_)),
-      "expected ShapeMismatch on mismatched fc2, got {err:?}"
+      matches!(err, crate::Error::ShapePairMismatch(_)),
+      "expected ShapePairMismatch on mismatched fc2, got {err:?}"
     );
   }
 
@@ -2177,10 +2375,16 @@ mod tests {
     let indices = Array::from_slice::<u32>(&idx_data, &(n,)).unwrap();
     assert!(indices.size() >= 64, "test must exercise the sorted path");
     let err = glu.forward(&x, &indices).unwrap_err();
-    assert!(
-      matches!(err, crate::Error::ShapeMismatch(_)),
-      "expected ShapeMismatch on ambiguous [N] indices, got {err:?}"
-    );
+    // x=[N, D] ⇒ x_batch=[N], expected_rank=2; indices=[N] is rank-1 (missing
+    // the trailing k axis) ⇒ now categorised as RankMismatch (Codex 2026-05-27)
+    // rather than a misleading "expected [N], got [N]" ShapePairMismatch.
+    match err {
+      crate::Error::RankMismatch(payload) => {
+        assert_eq!(payload.actual(), 1, "rank-1 indices ⇒ actual rank 1");
+        assert_eq!(payload.actual_shape(), &[64usize]);
+      }
+      other => panic!("expected RankMismatch on ambiguous [N] indices, got {other:?}"),
+    }
   }
 
   #[test]
@@ -2207,10 +2411,15 @@ mod tests {
     let indices = Array::from_slice::<u32>(&idx_data, &(b, s)).unwrap();
     assert!(indices.size() >= 64, "test must exercise the sorted path");
     let err = glu.forward(&x, &indices).unwrap_err();
-    assert!(
-      matches!(err, crate::Error::ShapeMismatch(_)),
-      "expected ShapeMismatch on ambiguous [B, S] indices, got {err:?}"
-    );
+    // x=[B, S, D] ⇒ x_batch=[B, S], expected_rank=3; indices=[B, S] is rank-2
+    // (missing the trailing k axis) ⇒ RankMismatch.
+    match err {
+      crate::Error::RankMismatch(payload) => {
+        assert_eq!(payload.actual(), 2, "rank-2 indices ⇒ actual rank 2");
+        assert_eq!(payload.actual_shape(), &[8usize, 8]);
+      }
+      other => panic!("expected RankMismatch on ambiguous [B, S] indices, got {other:?}"),
+    }
   }
 
   #[test]
@@ -2325,10 +2534,15 @@ mod tests {
     let indices = Array::from_slice::<u32>(&idx_data, &(n,)).unwrap();
     assert!(indices.size() >= 64, "test must exercise the sorted path");
     let err = mlp.forward(&x, &indices).unwrap_err();
-    assert!(
-      matches!(err, crate::Error::ShapeMismatch(_)),
-      "expected ShapeMismatch on ambiguous [N] indices, got {err:?}"
-    );
+    // Codex 2026-05-27: missing-k-axis case ⇒ RankMismatch (was a misleading
+    // ShapePairMismatch with expected==actual).
+    match err {
+      crate::Error::RankMismatch(payload) => {
+        assert_eq!(payload.actual(), 1, "rank-1 indices ⇒ actual rank 1");
+        assert_eq!(payload.actual_shape(), &[64usize]);
+      }
+      other => panic!("expected RankMismatch on ambiguous [N] indices, got {other:?}"),
+    }
   }
 
   #[test]
@@ -2354,10 +2568,14 @@ mod tests {
     let indices = Array::from_slice::<u32>(&idx_data, &(b, s)).unwrap();
     assert!(indices.size() >= 64, "test must exercise the sorted path");
     let err = mlp.forward(&x, &indices).unwrap_err();
-    assert!(
-      matches!(err, crate::Error::ShapeMismatch(_)),
-      "expected ShapeMismatch on ambiguous [B, S] indices, got {err:?}"
-    );
+    // Codex 2026-05-27: missing-k-axis case ⇒ RankMismatch.
+    match err {
+      crate::Error::RankMismatch(payload) => {
+        assert_eq!(payload.actual(), 2, "rank-2 indices ⇒ actual rank 2");
+        assert_eq!(payload.actual_shape(), &[8usize, 8]);
+      }
+      other => panic!("expected RankMismatch on ambiguous [B, S] indices, got {other:?}"),
+    }
   }
 
   #[test]

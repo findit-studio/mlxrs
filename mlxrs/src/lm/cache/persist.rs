@@ -136,14 +136,18 @@
 //! `load_prompt_cache` returns, so a wrong-rank array in a hostile file is
 //! a recoverable error here, not a deferred `shape()[2]` panic on first
 //! cache use. Every recoverable failure (missing / non-regular /
-//! oversized / corrupt / non-dense / wrong-rank / unknown-kind) is an
-//! [`Error::Backend`] — **never** a panic/`unwrap` on the load path.
+//! oversized / corrupt / non-dense / wrong-rank / unknown-kind) is a
+//! typed [`Error`] variant — **never** a panic/`unwrap` on the load path.
 
 use std::{collections::HashMap, path::Path};
 
 use crate::{
   array::Array,
-  error::{Error, FileIoPayload, FileOp, Result},
+  error::{
+    ArithmeticOverflowPayload, CapExceededPayload, Error, FileIoPayload, FileOp,
+    InvariantViolationPayload, LayerKeyedPayload, LengthMismatchPayload, OutOfRangePayload,
+    RankMismatchPayload, Result,
+  },
   // `KV_NDIM` is the canonical `[B, n_kv_heads, S, head_dim]` rank shared
   // by every KV cache (defined once in `super::util`); referenced — not
   // re-declared — so the hostile-file rank gate stays in lockstep with the
@@ -151,6 +155,7 @@ use crate::{
   // already-declared sibling module; it touches no other cache file.
   lm::cache::{KvCache, from_state, util::KV_NDIM},
 };
+use smol_str::format_smolstr;
 
 /// Upper bound on a prompt-cache file we will read, mirroring `lm::load`'s
 /// `MAX_CONFIG_BYTES` rationale (a hostile file must not OOM the loader).
@@ -273,17 +278,33 @@ pub fn save_prompt_cache(
 /// bounds) is what prevents a tiny hostile side-table (e.g. one
 /// `"2.4000000000"` key) from driving a multi-GB `vec!`. A non-dense list
 /// (`max_idx + 1 != present`) only arises from a corrupt / adversarial
-/// file, so it is a recoverable [`Error::Backend`], never a silent huge
+/// file, so it is a recoverable typed [`Error`] variant, never a silent huge
 /// allocation or a panic.
-fn dense_len(max_idx: usize, present: usize, what: &str) -> Result<usize> {
-  let n = max_idx
-    .checked_add(1)
-    // TODO(§5): promote to typed variant — `what` is dynamic so ArithmeticOverflow { context, op_type: "usize" } needs a runtime String context; leave as Backend until a DynamicContext variant covers this pattern.
-    .ok_or_else(|| Error::Backend(format!("prompt cache: {what} index overflows usize")))?;
+fn dense_len(max_idx: usize, present: usize, what: &'static str) -> Result<usize> {
+  let n = max_idx.checked_add(1).ok_or_else(|| {
+    // Distinguish by `what` so the static-string context is preserved per
+    // call site (array sub / meta_state / class) without runtime allocation.
+    let context: &'static str = match what {
+      "array sub" => "prompt cache: array sub index overflows usize",
+      "meta_state" => "prompt cache: meta_state index overflows usize",
+      "class" => "prompt cache: class index overflows usize",
+      _ => "prompt cache: index overflows usize",
+    };
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      context,
+      "usize",
+      [("max_idx", max_idx as u64)],
+    ))
+  })?;
   if n != present {
-    return Err(Error::Backend(format!(
-      "prompt cache: non-dense {what} indices (max index {max_idx}, {present} entries); \
-         corrupt or incompatible file"
+    let context: &'static str = match what {
+      "array sub" => "prompt cache: non-dense array sub indices (corrupt or incompatible file)",
+      "meta_state" => "prompt cache: non-dense meta_state indices (corrupt or incompatible file)",
+      "class" => "prompt cache: non-dense class indices (corrupt or incompatible file)",
+      _ => "prompt cache: non-dense indices (corrupt or incompatible file)",
+    };
+    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+      context, present, n,
     )));
   }
   Ok(n)
@@ -309,7 +330,7 @@ fn dense_len(max_idx: usize, present: usize, what: &str) -> Result<usize> {
 ///
 /// A key whose `i`/`j` is not a base-10 `usize` is **ignored** (swift
 /// parity — `unflattenArrays` silently skips non-`"i.j"` keys); a
-/// `usize`-overflowing sub-index is a recoverable [`Error::Backend`] (a
+/// `usize`-overflowing sub-index is a recoverable typed [`Error`] variant (a
 /// hostile file must not drive an unbounded `Vec` resize).
 fn unflatten_arrays(flat: HashMap<String, Array>) -> Result<HashMap<usize, Vec<Array>>> {
   // Collect into a doubly-sparse map first so out-of-order keys still order
@@ -358,8 +379,8 @@ fn unflatten_arrays(flat: HashMap<String, Array>) -> Result<HashMap<usize, Vec<A
 /// (the key is everything after the first `.`, so a metadata key may itself
 /// contain dots — matches swift `components.dropFirst().joined(".")`),
 /// `cache_classes[i]` from `"2.{i}"`. Unparseable indices are skipped
-/// (swift parity); a `usize`-overflowing index is a recoverable
-/// [`Error::Backend`].
+/// (swift parity); a `usize`-overflowing index is a recoverable typed
+/// [`Error`] variant.
 ///
 /// `cache_info` is returned as a **sparse** `HashMap<cache_index,
 /// Vec<String>>` (like the array map): a cache with an empty `meta_state`
@@ -457,7 +478,7 @@ fn unflatten_side(
         // Dense (checked) ⇒ every slot is filled, exactly as swift's
         // `while cacheInfo[i].count <= j { append("") }` on a dense list.
         // `meta_state` setters validate arity downstream, so any residual
-        // mismatch is a clean per-cache `Error::Backend` from
+        // mismatch is a clean per-cache typed [`Error`] variant from
         // `from_state`, never a panic.
         let mut v = vec![String::new(); cnt];
         for (j, s) in m {
@@ -513,16 +534,16 @@ fn unflatten_side(
 /// the module docs (a Swift-shaped 5-field `RotatingKVCache` is rejected
 /// by the merged 4-field `RotatingKvCache::set_meta_state` via
 /// `from_state`, exactly as it would be by authoritative mlx-lm; this is
-/// the inherited upstream divergence, surfaced as a clean
-/// [`Error::Backend`], never a panic). The hostile-file discipline — see
+/// the inherited upstream divergence, surfaced as a clean typed
+/// [`Error`] variant, never a panic). The hostile-file discipline — see
 /// the module-level
 /// "Path-read DoS discipline" for the full posture, **including the
 /// acknowledged residual TOCTOU that equals the merged `lm::load` weight
 /// path** — runs the non-regular/size gate **before** the path is handed
 /// to `crate::io`, then rank-validates every reconstructed state array; a
 /// missing / non-regular / oversized / corrupt / count-mismatch /
-/// non-dense / wrong-rank / unknown-kind file is a recoverable
-/// [`Error::Backend`], never a panic. No implicit eval — the reconstructed
+/// non-dense / wrong-rank / unknown-kind file is a recoverable typed
+/// [`Error`] variant, never a panic. No implicit eval — the reconstructed
 /// caches hold the loaded arrays lazily.
 #[allow(clippy::type_complexity)]
 pub fn load_prompt_cache(path: &Path) -> Result<(Vec<Box<dyn KvCache>>, HashMap<String, String>)> {
@@ -576,9 +597,11 @@ pub fn load_prompt_cache(path: &Path) -> Result<(Vec<Box<dyn KvCache>>, HashMap<
       ))
     })?;
     if !meta.is_file() {
-      return Err(Error::Backend(format!(
-        "prompt cache {} is not a regular file; refusing to read",
-        path.display()
+      return Err(Error::FileIo(FileIoPayload::new(
+        "prompt cache target is not a regular file; refusing to read",
+        FileOp::Open,
+        path.to_path_buf(),
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"),
       )));
     }
     // The fd is now proven a *regular file*, so the fstat `len()` is its
@@ -589,11 +612,11 @@ pub fn load_prompt_cache(path: &Path) -> Result<(Vec<Box<dyn KvCache>>, HashMap<
     // bytes — mlx-c reads the file itself — so a streaming size probe would
     // be a wasteful, itself-DoS-prone 2x read of a multi-GB cache.)
     if meta.len() > MAX_PROMPT_CACHE_BYTES {
-      return Err(Error::Backend(format!(
-        "prompt cache {} is {} bytes, exceeding the {}-byte cap; refusing to read",
-        path.display(),
+      return Err(Error::CapExceeded(CapExceededPayload::new(
+        "load_prompt_cache: file size; refusing to read",
+        "MAX_PROMPT_CACHE_BYTES",
+        MAX_PROMPT_CACHE_BYTES,
         meta.len(),
-        MAX_PROMPT_CACHE_BYTES
       )));
     }
     // `file` is dropped here (fd closed); `crate::io` re-opens by path.
@@ -623,9 +646,10 @@ pub fn load_prompt_cache(path: &Path) -> Result<(Vec<Box<dyn KvCache>>, HashMap<
   // recoverable error.
   let n = cache_classes.len();
   if let Some(&bad) = cache_data.keys().find(|&&i| i >= n) {
-    return Err(Error::Backend(format!(
-      "prompt cache {}: array group index {bad} >= class count {n}; corrupt or incompatible file",
-      path.display()
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "load_prompt_cache: array group index (corrupt or incompatible file)",
+      "must be < class count",
+      format_smolstr!("index={bad}, class_count={n}, path={}", path.display()),
     )));
   }
 
@@ -653,7 +677,7 @@ pub fn load_prompt_cache(path: &Path) -> Result<(Vec<Box<dyn KvCache>>, HashMap<
     // panic the first time a cache method indexes `shape()[2]`/`[3]`
     // (`util::seq_len`/`slice_seq`, which assume the 4-D `[B, n_kv_heads,
     // S, head_dim]` layout). Reject a non-4-D state array here so a
-    // corrupt/foreign payload is a recoverable [`Error::Backend`], not a
+    // corrupt/foreign payload is a recoverable typed [`Error`] variant, not a
     // deferred panic. (Empty state — `[]` — is the valid "fresh cache"
     // case and passes; this gate only rejects *present* arrays of the
     // wrong rank. `from_state`'s own `empty ⇒ offset==0 && idx==0`
@@ -664,7 +688,7 @@ pub fn load_prompt_cache(path: &Path) -> Result<(Vec<Box<dyn KvCache>>, HashMap<
     // Rust/Swift aliases — kept in lockstep with that match). A non-KV
     // kind (`ArraysCache`/`MambaCache`/… added by a later PR) is NOT
     // pre-rejected here on rank — `from_state` does its own kind-specific
-    // validation (today: unknown kind ⇒ `Error::Backend`), so this gate
+    // validation (today: unknown kind ⇒ `Error::UnknownEnumValue`), so this gate
     // stays forward-compatible and never false-rejects a future
     // non-4-D-state cache.
     const KV_RANK_KINDS: &[&str] = &[
@@ -679,10 +703,16 @@ pub fn load_prompt_cache(path: &Path) -> Result<(Vec<Box<dyn KvCache>>, HashMap<
       for (j, arr) in state.iter().enumerate() {
         let nd = arr.ndim();
         if nd != KV_NDIM {
-          return Err(Error::Backend(format!(
-            "prompt cache {}: cache {i} (kind {kind:?}) state array {j} has rank {nd}, \
-               expected {KV_NDIM} ([B, n_kv_heads, S, head_dim]); corrupt or incompatible file",
-            path.display()
+          return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+            format_smolstr!(
+              "load_prompt_cache: cache {i} (kind {kind:?}) state array {j} (path={})",
+              path.display()
+            ),
+            Error::RankMismatch(RankMismatchPayload::new(
+              "load_prompt_cache: KV state array must be 4-D [B, n_kv_heads, S, head_dim] (corrupt or incompatible file)",
+              nd as u32,
+              arr.shape().to_vec(),
+            )),
           )));
         }
       }
@@ -739,7 +769,7 @@ pub fn load_prompt_cache(path: &Path) -> Result<(Vec<Box<dyn KvCache>>, HashMap<
     // would silently accept a malformed `"0.{i}"="garbage"` /
     // `"0.{i}.{j}"`-on-KVCache file. Enforce mlx-lm's emptiness rule here
     // so such a schema-drifted / corrupt file is a clean recoverable
-    // `Error::Backend` on the **load path** (exactly mlx-lm's
+    // typed [`Error`] variant on the **load path** (exactly mlx-lm's
     // `ValueError`), not a silently-wrong `Ok`. `RotatingKVCache` (a real
     // 4-tuple meta_state) is intentionally excluded — only the no-meta
     // kinds carry this constraint.
@@ -766,21 +796,29 @@ pub fn load_prompt_cache(path: &Path) -> Result<(Vec<Box<dyn KvCache>>, HashMap<
       "StandardKvCache",
     ];
     if NO_META_KINDS.contains(&kind.as_str()) && !meta.is_empty() {
-      return Err(Error::Backend(format!(
-        "prompt cache {}: cache {i} (kind {kind:?}) is a no-meta cache but carries a \
-           non-empty meta_state {meta:?}; mlx-lm rejects this (corrupt or schema-drifted file)",
-        path.display()
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        format_smolstr!(
+          "load_prompt_cache: cache {i} (kind {kind:?}) (path={})",
+          path.display()
+        ),
+        Error::InvariantViolation(InvariantViolationPayload::new(
+          "load_prompt_cache: no-meta cache (KVCache / ConcatenateKVCache / KVCacheSimple / StandardKvCache) carries non-empty meta_state; mlx-lm rejects this (corrupt or schema-drifted file)",
+          "must have empty meta_state",
+        )),
       )));
     }
 
     // `from_state` validates the kind + meta_state arity and maps any
-    // failure to a recoverable `Error::Backend` (it never panics on a
+    // failure to a recoverable typed [`Error`] variant (it never panics on a
     // corrupt/foreign payload — unknown kind, wrong meta_state length,
     // inconsistent empty-state-with-offset, …).
     let cache = from_state(&kind, state, meta).map_err(|e| {
-      Error::Backend(format!(
-        "prompt cache {}: cannot reconstruct cache {i} (kind {kind:?}): {e}",
-        path.display()
+      Error::LayerKeyed(LayerKeyedPayload::new(
+        format_smolstr!(
+          "load_prompt_cache: cannot reconstruct cache {i} (kind {kind:?}, path={})",
+          path.display()
+        ),
+        e,
       ))
     })?;
     caches.push(cache);

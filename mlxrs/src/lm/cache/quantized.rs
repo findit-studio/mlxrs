@@ -2,7 +2,10 @@
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{
+    ArithmeticOverflowPayload, Error, OutOfRangePayload, ParsePayload, RankMismatchPayload, Result,
+    ShapePairMismatchPayload,
+  },
   lm::cache::{
     KvCache, MaskMode, QTriple, QuantizedKvCache, mask,
     util::{KV_NDIM, concat_seq, nbytes, seq_len, slice_seq},
@@ -222,22 +225,39 @@ impl QuantizedKvCacheImpl {
   /// so a forged prompt cache surfaces a precise diagnostic at the load
   /// boundary instead of a far-from-cause-site `concat_seq` failure at the
   /// first `update_quantized`.
-  fn validate_kv_leading_axes_match(k: &Array, v: &Array, element: &str) -> Result<()> {
+  fn validate_kv_leading_axes_match(k: &Array, v: &Array, element: &'static str) -> Result<()> {
     let ks = k.shape();
     let vs = v.shape();
     // Rank gate: the cache layout is the 4-D `[B, n_kv_heads, S, payload_dim]`
     // — `KV_NDIM == 4`. A non-4-D K or V is a forged / corrupt state and
     // a recoverable error at the load boundary, not a panic via a blind
     // `shape[axis]` index later.
-    if ks.len() != KV_NDIM || vs.len() != KV_NDIM {
-      return Err(Error::ShapeMismatch(format!(
-        "QuantizedKvCache::set_state: K and V {element} must both be 4-D \
-           [B, n_kv_heads, S, payload_dim] (K rank {} shape {ks:?} vs V rank \
-           {} shape {vs:?}); a forged or corrupt prompt cache mixed ranks — \
-           rejected upfront so the diagnostic points at the load boundary, not \
-           the first update_quantized concat",
-        ks.len(),
-        vs.len()
+    if ks.len() != KV_NDIM {
+      let context: &'static str = match element {
+        "w" => "QuantizedKvCache::set_state: K w must be 4-D [B, n_kv_heads, S, payload_dim]",
+        "scales" => {
+          "QuantizedKvCache::set_state: K scales must be 4-D [B, n_kv_heads, S, payload_dim]"
+        }
+        _ => "QuantizedKvCache::set_state: K must be 4-D [B, n_kv_heads, S, payload_dim]",
+      };
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        context,
+        ks.len() as u32,
+        ks.to_vec(),
+      )));
+    }
+    if vs.len() != KV_NDIM {
+      let context: &'static str = match element {
+        "w" => "QuantizedKvCache::set_state: V w must be 4-D [B, n_kv_heads, S, payload_dim]",
+        "scales" => {
+          "QuantizedKvCache::set_state: V scales must be 4-D [B, n_kv_heads, S, payload_dim]"
+        }
+        _ => "QuantizedKvCache::set_state: V must be 4-D [B, n_kv_heads, S, payload_dim]",
+      };
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        context,
+        vs.len() as u32,
+        vs.to_vec(),
       )));
     }
     // Compare ONLY the leading axes `[B, n_kv_heads, S]` (`0..rank-1`).
@@ -250,16 +270,24 @@ impl QuantizedKvCacheImpl {
     // rejected those valid skewed caches on their own saved state.
     for (axis, (ka, va)) in ks.iter().zip(vs.iter()).take(KV_NDIM - 1).enumerate() {
       if ka != va {
-        return Err(Error::ShapeMismatch(format!(
-          "QuantizedKvCache::set_state: K and V {element} leading axes \
-             (B, n_kv_heads, S) must match; disagree on axis {axis} \
-             (K[axis]={ka} vs V[axis]={va}; K shape {ks:?} V shape {vs:?}); \
-             the last (payload) axis can legitimately differ for \
-             v_head_dim != k_head_dim — but the leading axes are a \
-             cache-coherence requirement, so a mismatch is a forged or \
-             corrupt prompt cache, rejected upfront at the load boundary"
+        let context: &'static str = match element {
+          "w" => {
+            "QuantizedKvCache::set_state: K and V w leading axes (B, n_kv_heads, S) must match (last/payload axis may legitimately differ; leading-axes mismatch is a forged/corrupt prompt cache)"
+          }
+          "scales" => {
+            "QuantizedKvCache::set_state: K and V scales leading axes (B, n_kv_heads, S) must match (last/payload axis may legitimately differ; leading-axes mismatch is a forged/corrupt prompt cache)"
+          }
+          _ => {
+            "QuantizedKvCache::set_state: K and V leading axes (B, n_kv_heads, S) must match (last/payload axis may legitimately differ; leading-axes mismatch is a forged/corrupt prompt cache)"
+          }
+        };
+        return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+          context,
+          vec![ks[0], ks[1], ks[2]].as_slice(),
+          vec![vs[0], vs[1], vs[2]].as_slice(),
         )));
       }
+      let _ = axis; // axis is informative but the structured pair carries the whole [B, n_kv_heads, S] sub-shape.
     }
     Ok(())
   }
@@ -325,8 +353,10 @@ impl QuantizedKvCacheImpl {
     // `self.offset += num_steps` (cache.py:275) — checked (Python ints
     // never overflow; a corrupt restored `offset` could wrap/panic here).
     let new_offset = prev.checked_add(num_steps).ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "QuantizedKvCache update: offset ({prev}) + num_steps ({num_steps}) overflows usize"
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "QuantizedKvCache::update_quantized: offset + num_steps",
+        "usize",
+        [("offset", prev as u64), ("num_steps", num_steps as u64)],
       ))
     })?;
 
@@ -689,8 +719,10 @@ impl KvCache for QuantizedKvCacheImpl {
         self.values = Some((v_w, v_s, Some(v_b)));
         Ok(())
       }
-      n => Err(Error::Backend(format!(
-        "QuantizedKvCache state must have 0, 4, or 6 arrays, got {n}"
+      n => Err(Error::OutOfRange(OutOfRangePayload::new(
+        "QuantizedKvCache::set_state: state array count",
+        "must be 0, 4, or 6",
+        smol_str::format_smolstr!("{n}"),
       ))),
     }
   }
@@ -766,30 +798,40 @@ impl KvCache for QuantizedKvCacheImpl {
       3 => (0, 1, 2),
       4 => (1, 2, 3),
       n => {
-        return Err(Error::Backend(format!(
-          "QuantizedKvCache meta_state must have 3 (mlx-lm form) or 4 \
-             (mlx-swift-lm form) values, got {n}"
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "QuantizedKvCache::set_meta_state: meta_state value count",
+          "must be 3 (mlx-lm form) or 4 (mlx-swift-lm form)",
+          smol_str::format_smolstr!("{n}"),
         )));
       }
     };
-    let offset = m[offset_idx].parse::<usize>().map_err(|e| {
-      Error::Backend(format!(
-        "QuantizedKvCache meta_state offset ({:?}): {e}",
-        m[offset_idx]
-      ))
-    })?;
-    let group_size = m[group_size_idx].parse::<i32>().map_err(|e| {
-      Error::Backend(format!(
-        "QuantizedKvCache meta_state group_size ({:?}): {e}",
-        m[group_size_idx]
-      ))
-    })?;
-    let bits = m[bits_idx].parse::<i32>().map_err(|e| {
-      Error::Backend(format!(
-        "QuantizedKvCache meta_state bits ({:?}): {e}",
-        m[bits_idx]
-      ))
-    })?;
+    let offset = m[offset_idx]
+      .parse::<usize>()
+      .map_err(|e: std::num::ParseIntError| {
+        Error::Parse(ParsePayload::new(
+          "QuantizedKvCache::set_meta_state: offset",
+          "usize",
+          Box::new(e),
+        ))
+      })?;
+    let group_size = m[group_size_idx]
+      .parse::<i32>()
+      .map_err(|e: std::num::ParseIntError| {
+        Error::Parse(ParsePayload::new(
+          "QuantizedKvCache::set_meta_state: group_size",
+          "i32",
+          Box::new(e),
+        ))
+      })?;
+    let bits = m[bits_idx]
+      .parse::<i32>()
+      .map_err(|e: std::num::ParseIntError| {
+        Error::Parse(ParsePayload::new(
+          "QuantizedKvCache::set_meta_state: bits",
+          "i32",
+          Box::new(e),
+        ))
+      })?;
     // Infallible commit tail — all fallible parsing done above.
     self.offset = offset;
     self.group_size = group_size;

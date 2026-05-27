@@ -1027,9 +1027,12 @@ fn dynamic_roll_rejects_n_above_f32_exact_int_max() {
   // At LIMIT + 1: bound check fires → Err.
   let too_big = Array::zeros::<f32>(&(1usize, 1, LIMIT + 1, 1)).unwrap();
   let r = dynamic_roll(&too_big, &shifts_small, 2);
+  // Post-#248 typed-payload migration: the n>2^24 reject is `OutOfRange`
+  // (`n` exceeds the f32-exact-integer cap), not the legacy
+  // `ShapeMismatch(String)` it surfaced as before the migration.
   assert!(
-    matches!(&r, Err(mlxrs::Error::ShapeMismatch(_))),
-    "dynamic_roll(n=2^24+1) must Err(ShapeMismatch), got {r:?}"
+    matches!(&r, Err(mlxrs::Error::OutOfRange(_))),
+    "dynamic_roll(n=2^24+1) must Err(OutOfRange), got {r:?}"
   );
 
   // Small n: succeeds (no boundary triggered).
@@ -1038,6 +1041,123 @@ fn dynamic_roll_rejects_n_above_f32_exact_int_max() {
   assert!(
     r.is_ok(),
     "dynamic_roll on small input must succeed, got {r:?}"
+  );
+}
+
+/// Regression (Codex 2026-05-27 R3): `dynamic_roll` must surface a
+/// rank-1 (or rank-3, etc.) `shifts` as `Error::RankMismatch`, not
+/// `Error::ShapePairMismatch` — `ShapePairMismatchPayload` is documented
+/// for same-rank shape disagreement. Mirrors the C R1 `norm.rs` and C R2
+/// `switch.rs` rank-first-then-shape splits.
+#[test]
+fn dynamic_roll_rejects_rank_mismatch_shifts() {
+  // x: 4-D `[B=2, n_kv_heads=1, S=3, head_dim=1]`. shifts: rank-1 `[B]`
+  // instead of `[B, 1]` — the divergent RANK must surface as RankMismatch,
+  // not ShapePairMismatch.
+  let x = kvb(&[&[10.0, 20.0, 30.0], &[40.0, 50.0, 60.0]]);
+  let shifts_rank1 = Array::from_slice::<i32>(&[0, 1], &(2usize,)).unwrap();
+  let err = dynamic_roll(&x, &shifts_rank1, 2).expect_err("rank-1 shifts must Err");
+  match err {
+    mlxrs::Error::RankMismatch(p) => {
+      assert_eq!(p.actual(), 1, "rank-1 shifts: payload.actual must be 1");
+      assert_eq!(
+        p.actual_shape(),
+        &[2usize][..],
+        "rank-1 shifts: payload.actual_shape must be [B]"
+      );
+    }
+    other => panic!("expected RankMismatch, got {other:?}"),
+  }
+
+  // Rank-3 `shifts` (`[B, 1, 1]`) — also a rank divergence: must surface
+  // as RankMismatch, not as a [B, 1]-vs-[B, 1, 1] ShapePairMismatch.
+  let shifts_rank3 = Array::from_slice::<i32>(&[0, 1], &(2usize, 1usize, 1usize)).unwrap();
+  let err = dynamic_roll(&x, &shifts_rank3, 2).expect_err("rank-3 shifts must Err");
+  match err {
+    mlxrs::Error::RankMismatch(p) => {
+      assert_eq!(p.actual(), 3, "rank-3 shifts: payload.actual must be 3");
+      assert_eq!(
+        p.actual_shape(),
+        &[2usize, 1, 1][..],
+        "rank-3 shifts: payload.actual_shape must be [B, 1, 1]"
+      );
+    }
+    other => panic!("expected RankMismatch, got {other:?}"),
+  }
+
+  // Same-rank `[B', 1]` with wrong B' (neither equal to B=2 nor 1 — i.e.
+  // truly non-broadcastable) must still surface as ShapePairMismatch
+  // (proves the split preserved the shape-disagreement path now that rank
+  // is known to be 2). Use B'=3 (Codex 2026-05-27 R4): B'=1 is now a VALID
+  // scalar-broadcast shape after the broadcast-contract preservation fix
+  // (`BatchKvCache::finalize` arms length-1 `right_padding` → `[1, 1]`
+  // `pad_col`); only neither-B-nor-1 truly Errs.
+  let shifts_wrong_b = Array::from_slice::<i32>(&[0, 0, 0], &(3usize, 1usize)).unwrap();
+  let err = dynamic_roll(&x, &shifts_wrong_b, 2).expect_err("[3,1] shifts on B=2 must Err");
+  match err {
+    mlxrs::Error::ShapePairMismatch(p) => {
+      assert_eq!(p.expected(), &[2usize, 1][..]);
+      assert_eq!(p.actual(), &[3usize, 1][..]);
+    }
+    other => panic!("expected ShapePairMismatch, got {other:?}"),
+  }
+
+  // Same-rank `[B, k]` with `k != 1` must also surface as ShapePairMismatch.
+  let shifts_wrong_k = Array::from_slice::<i32>(&[0, 0, 1, 1], &(2usize, 2usize)).unwrap();
+  let err = dynamic_roll(&x, &shifts_wrong_k, 2).expect_err("[B, 2] shifts must Err");
+  match err {
+    mlxrs::Error::ShapePairMismatch(p) => {
+      assert_eq!(p.expected(), &[2usize, 1][..]);
+      assert_eq!(p.actual(), &[2usize, 2][..]);
+    }
+    other => panic!("expected ShapePairMismatch, got {other:?}"),
+  }
+}
+
+/// Regression (Codex 2026-05-27 R4): `dynamic_roll` MUST accept a
+/// `[1, 1]` (scalar broadcast) `shifts` against an `x` with `B > 1` —
+/// this is the contract `BatchKvCache::finalize` relies on when a
+/// length-1 `right_padding` is armed via `prepare_right_padding(&[k])`
+/// (the `expand_dims_axes(padding, &[1])` produces a `[1, 1]` `pad_col`
+/// which broadcasts across the `[B, n_kv_heads, S, head_dim]` buffer).
+/// Pins the broadcast contract that the C R4 rank-first-then-shape
+/// split previously regressed by adding a tightening `sshape[0] ==
+/// xshape[0]` check that rejected scalar broadcast as `[B, 1] vs [1, 1]`
+/// before `BatchKvCache::finalize` could commit.
+#[test]
+fn dynamic_roll_accepts_scalar_broadcast_shifts() {
+  // x: 4-D `[B=2, n_kv_heads=1, S=3, head_dim=1]`. shifts: `[1, 1]`
+  // (scalar broadcast). Per the broadcast contract, every row gets the
+  // same shift — so a shift of 1 should produce
+  // `out[b,:,i,:] = x[b,:,(i-1)%3,:]` for all b.
+  let x = kvb(&[&[10.0, 20.0, 30.0], &[40.0, 50.0, 60.0]]);
+  let shifts_scalar = Array::from_slice::<i32>(&[1], &(1usize, 1usize)).unwrap();
+  let result = dynamic_roll(&x, &shifts_scalar, 2);
+  assert!(
+    result.is_ok(),
+    "scalar broadcast [1,1] shifts must be accepted; got {result:?}"
+  );
+  let mut rolled = result.unwrap();
+  assert_eq!(
+    rolled.shape(),
+    vec![2, 1, 3, 1],
+    "broadcast result shape must match input shape"
+  );
+  // Row 0 shift 1: out[i] = x[(i-1)%3] -> [x[2], x[0], x[1]] = [30, 10, 20].
+  // Row 1 shift 1: same shift, so [60, 40, 50].
+  assert_eq!(
+    rolled.to_vec::<f32>().unwrap(),
+    vec![30.0, 10.0, 20.0, /* row1 */ 60.0, 40.0, 50.0],
+    "scalar broadcast shift=1 must roll every row by 1"
+  );
+
+  // Also pin the boundary: scalar broadcast with shift=0 is identity.
+  let shifts_zero = Array::from_slice::<i32>(&[0], &(1usize, 1usize)).unwrap();
+  let mut identity = dynamic_roll(&x, &shifts_zero, 2).expect("scalar broadcast [1,1] shift=0");
+  assert_eq!(
+    identity.to_vec::<f32>().unwrap(),
+    vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+    "scalar broadcast shift=0 must be identity"
   );
 }
 

@@ -4,10 +4,14 @@ use std::str::FromStr;
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{
+    ArithmeticOverflowPayload, CapExceededPayload, Error, InvariantViolationPayload,
+    OutOfRangePayload, ParsePayload, RankMismatchPayload, Result,
+  },
   lm::cache::{KvCache, MaskMode, mask},
   ops,
 };
+use smol_str::format_smolstr;
 
 /// Hard upper bound on the `slotCount` restored from a serialized
 /// `ArraysCache` meta_state — mlx-swift-lm's `Array(repeating: nil, count:
@@ -35,7 +39,7 @@ pub const MAX_SLOT_COUNT: usize = 1 << 20;
 ///
 /// **Bounded:** `max_elems` caps both the upfront capacity reservation and
 /// the streamed parse — a forged CSV whose comma-count exceeds `max_elems`
-/// is rejected with `Error::Backend` BEFORE any `Vec<T>` allocation
+/// is rejected with `Error::CapExceeded` BEFORE any `Vec<T>` allocation
 /// (Codex-R1 [high] #1, KVC-2 follow-up). The producer side of
 /// `meta_state` only ever emits `slotCount` indices for `presentSlots`
 /// and at most one entry per slot for `leftPadding`, so a `max_elems =
@@ -44,10 +48,15 @@ pub const MAX_SLOT_COUNT: usize = 1 << 20;
 /// huge CSV payload" evasion of the `MAX_SLOT_COUNT` gate. Comma-count
 /// is computed by `bytes().filter()`, NOT `split().count()`, so the
 /// pre-check itself allocates no `&str` slices.
-fn parse_csv<T>(s: &str, what: &str, max_elems: usize) -> Result<Vec<T>>
+fn parse_csv<T>(
+  s: &str,
+  what_context: &'static str,
+  what_input_kind: &'static str,
+  max_elems: usize,
+) -> Result<Vec<T>>
 where
   T: FromStr,
-  T::Err: std::fmt::Display,
+  T::Err: std::error::Error + Send + Sync + 'static,
 {
   if s.is_empty() {
     return Ok(Vec::new());
@@ -58,9 +67,11 @@ where
   let comma_count = s.bytes().filter(|&b| b == b',').count();
   let upper_bound = comma_count.saturating_add(1);
   if upper_bound > max_elems {
-    return Err(Error::Backend(format!(
-      "ArraysCache meta_state {what}: element count ({upper_bound}) exceeds bound ({max_elems}) — \
-         a forged CSV payload was rejected before allocation"
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      what_context,
+      "max_elems",
+      max_elems as u64,
+      upper_bound as u64,
     )));
   }
   // Pre-reserve so the streamed parse can fail fast on OOM for a hostile
@@ -70,9 +81,13 @@ where
     .try_reserve_exact(upper_bound)
     .map_err(|_| Error::OutOfMemory)?;
   for p in s.split(',') {
-    let v = p
-      .parse::<T>()
-      .map_err(|e| Error::Backend(format!("ArraysCache meta_state {what} ({p:?}): {e}")))?;
+    let v = p.parse::<T>().map_err(|e| {
+      Error::Parse(ParsePayload::new(
+        what_context,
+        what_input_kind,
+        Box::new(e),
+      ))
+    })?;
     out.push(v);
   }
   Ok(out)
@@ -99,7 +114,7 @@ where
 /// mlx-lm `__getitem__` / `__setitem__`) and [`state`](KvCache::state) — not
 /// `update_and_fetch`. mlx-lm's `ArraysCache` therefore has **no**
 /// `update_and_fetch`; consequently the [`KvCache::update`] trait method here
-/// is a recoverable [`Error::Backend`] ("ArraysCache::update is unsupported")
+/// is a recoverable [`Error::InvariantViolation`] ("ArraysCache::update is unsupported")
 /// — accurately reporting the unsupported-operation condition rather than
 /// misleadingly suggesting wrong-shaped tensors, exactly matching the
 /// reference's absence of a K/V update path. It
@@ -297,7 +312,7 @@ impl ArraysCache {
 
   /// Write slot `idx` — mlx-lm `__setitem__` (`cache.py:618-619`
   /// `self.cache[idx] = value`). An out-of-range `idx` is a recoverable
-  /// [`Error::Backend`] (Python's `IndexError`, surfaced as an indexing
+  /// [`Error::OutOfRange`] (Python's `IndexError`, surfaced as an indexing
   /// error rather than a tensor shape mismatch), never a panic.
   ///
   /// (Python's `__setitem__` also accepts `None`; SSM models only ever
@@ -310,12 +325,13 @@ impl ArraysCache {
         Ok(())
       }
       // Index-out-of-range is a range / indexing error, not a tensor shape
-      // mismatch — use `Error::Backend` so callers can distinguish "wrong
+      // mismatch — use `Error::OutOfRange` so callers can distinguish "wrong
       // slot index" from "wrong tensor shape" via the variant alone
       // (Copilot review #3271124415).
-      None => Err(Error::Backend(format!(
-        "ArraysCache: slot index {idx} out of range (size {})",
-        self.cache.len()
+      None => Err(Error::OutOfRange(OutOfRangePayload::new(
+        "ArraysCache::set: slot index (must be < cache size)",
+        "must be < cache size",
+        format_smolstr!("idx={idx}, size={}", self.cache.len()),
       ))),
     }
   }
@@ -326,7 +342,7 @@ impl ArraysCache {
   ///
   /// `c.shape[0]` on a rank-0 slot would be an `IndexError` in Python; here
   /// it is a recoverable error (never a raw `shape()[0]` panic on an
-  /// un-validated tensor) — currently surfaced as [`Error::ShapeMismatch`]
+  /// un-validated tensor) — currently surfaced as [`Error::RankMismatch`]
   /// because the underlying condition IS a wrong tensor rank (a rank-0
   /// slot has no leading axis to read as batch size).
   pub fn batch_size(&self) -> Result<usize> {
@@ -336,8 +352,10 @@ impl ArraysCache {
       let shape = slot.shape();
       return match shape.first() {
         Some(&b) => Ok(b),
-        None => Err(Error::ShapeMismatch(format!(
-          "ArraysCache.batch_size: slot has rank 0, no leading axis (shape {shape:?})"
+        None => Err(Error::RankMismatch(RankMismatchPayload::new(
+          "ArraysCache::batch_size: slot must have rank >= 1 (a leading axis to read as batch size)",
+          0,
+          shape.to_vec(),
         ))),
       };
     }
@@ -370,11 +388,16 @@ impl ArraysCache {
   /// Python would).
   pub fn advance(&mut self, n: usize) -> Result<()> {
     // Integer-conversion / range error, not a tensor shape mismatch —
-    // surface as `Error::Backend` (Copilot review #3271308749) for the
+    // surface as `Error::ArithmeticOverflow` (Copilot review #3271308749) for the
     // same reason `set` and `update` switched: variants should reflect
     // the actual condition, not a misleading "shape" framing.
-    let n = i32::try_from(n)
-      .map_err(|_| Error::Backend(format!("ArraysCache.advance: N {n} exceeds i32::MAX")))?;
+    let n = i32::try_from(n).map_err(|_| {
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "ArraysCache::advance: N exceeds i32::MAX",
+        "i32",
+        [("N", n as u64)],
+      ))
+    })?;
     if let Some(l) = &mut self.lengths {
       for v in l.iter_mut() {
         *v = v.wrapping_sub(n);
@@ -412,12 +435,15 @@ impl KvCache for ArraysCache {
   /// (it is a generic slot cache, not K/V; SSM models use `[]` / `state`).
   /// Recoverable, never a panic.
   ///
-  /// Surfaced as [`Error::Backend`] (NOT `ShapeMismatch`), so the variant
+  /// Surfaced as [`Error::InvariantViolation`] (NOT `RankMismatch`/etc), so the variant
   /// reflects the actual condition — "this cache type doesn't support
   /// `update_and_fetch`" — rather than misleadingly suggesting the caller
   /// passed wrong-shaped tensors (Copilot review #3271124426).
   fn update(&mut self, _keys: &Array, _values: &Array) -> Result<(Array, Array)> {
-    Err(Error::Backend("ArraysCache::update is unsupported (generic slot cache, not K/V; use `get`/`set`/`state` instead)".into()))
+    Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "ArraysCache::update (generic slot cache, not K/V)",
+      "must use get/set/state instead; update_and_fetch is unsupported",
+    )))
   }
 
   /// Present (non-`None`) slots in slot order — swift `ArraysCache`
@@ -497,7 +523,7 @@ impl KvCache for ArraysCache {
   /// possibly attacker-chosen) `slotCount` buffer allocation happen with
   /// `self` untouched; the receiver is then mutated by a single infallible
   /// block. So a non-numeric `slotCount`/slot index/left-padding is a
-  /// recoverable [`Error::Backend`], and a hostile huge `slotCount` whose
+  /// recoverable [`Error::Parse`] / [`Error::CapExceeded`] / [`Error::ArithmeticOverflow`], and a hostile huge `slotCount` whose
   /// buffer cannot be allocated is a recoverable [`Error::OutOfMemory`]
   /// (via `try_reserve_exact`, **not** an aborting `vec![None; n]`) — in
   /// every failure case the cache is left exactly as the prior `set_state`
@@ -513,16 +539,18 @@ impl KvCache for ArraysCache {
       return Ok(());
     }
     // Slot-aware: m[0]=slotCount, m[1]=presentSlots CSV, m[2]?=leftPadding.
-    let slot_count: usize = m[0].parse().map_err(|e| {
-      Error::Backend(format!(
-        "ArraysCache meta_state slotCount ({:?}): {e}",
-        m[0]
+    let slot_count: usize = m[0].parse().map_err(|e: std::num::ParseIntError| {
+      Error::Parse(ParsePayload::new(
+        "ArraysCache meta_state slotCount",
+        "usize",
+        Box::new(e),
       ))
     })?;
     if m.len() < 2 {
-      return Err(Error::Backend(
-        "ArraysCache slot-aware meta_state needs [slotCount, presentSlots, leftPadding?]".into(),
-      ));
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "ArraysCache::set_meta_state: slot-aware meta_state",
+        "must be [slotCount, presentSlots, leftPadding?] (length >= 2)",
+      )));
     }
     // Atomicity is structural, not incidental: **every** fallible *and*
     // allocating step is staged here, with `self` still completely
@@ -533,7 +561,7 @@ impl KvCache for ArraysCache {
     // end. Three failure modes for an untrusted `slot_count`:
     //
     // 0. **Hard cap exceeded** (`slot_count > MAX_SLOT_COUNT`) — surface as
-    //    `Error::Backend` ("slot_count exceeds MAX_SLOT_COUNT"). The
+    //    `Error::CapExceeded` ("slot_count exceeds MAX_SLOT_COUNT"). The
     //    **first** gate (KVC-2, #99) so a forged `INT32_MAX`-sized
     //    `slotCount` is rejected before either of the secondary gates
     //    (capacity-overflow / OOM) runs. Realistic SSM/Mamba caches have ≤
@@ -550,7 +578,7 @@ impl KvCache for ArraysCache {
     //    even though the cap above already protects the slot_count.
     // 1. **Capacity overflow** (`slot_count * size_of::<Option<Array>>()`
     //    exceeds `isize::MAX`, the Rust allocator's hard cap) — surface as
-    //    `Error::Backend` ("invalid slot_count: capacity overflow"). This
+    //    `Error::ArithmeticOverflow` ("invalid slot_count: capacity overflow"). This
     //    is a logic-error / hostile-input distinction (the request is
     //    *intrinsically* invalid, not just larger than this machine).
     //    Pre-checked here because `TryReserveError::kind()` is nightly-only
@@ -564,17 +592,25 @@ impl KvCache for ArraysCache {
     //    pre-check, the residual `try_reserve_exact` failure is
     //    unambiguously OOM.
     if slot_count > MAX_SLOT_COUNT {
-      return Err(Error::Backend(format!(
-        "ArraysCache meta_state: slot_count {slot_count} exceeds MAX_SLOT_COUNT ({MAX_SLOT_COUNT}) — \
-           realistic SSM/Mamba caches use ≤ 64 slots; the cap fails fast on forged/corrupt meta_state"
+      return Err(Error::CapExceeded(CapExceededPayload::new(
+        "ArraysCache::set_meta_state: slot_count (realistic SSM/Mamba caches use <= 64 slots; the cap fails fast on forged/corrupt meta_state)",
+        "MAX_SLOT_COUNT",
+        MAX_SLOT_COUNT as u64,
+        slot_count as u64,
       )));
     }
     let elem_size = std::mem::size_of::<Option<Array>>().max(1);
     if slot_count > (isize::MAX as usize) / elem_size {
-      // TODO(§5): promote to ArithmeticOverflow — `slot_count` is dynamic; needs ArithmeticOverflow with a runtime context String or a dedicated SlotCountOverflow { slot_count: usize } variant.
-      return Err(Error::Backend(format!(
-        "ArraysCache meta_state: invalid slot_count {slot_count} (capacity overflow — exceeds isize::MAX / sizeof::<Option<Array>>())"
-      )));
+      return Err(Error::ArithmeticOverflow(
+        ArithmeticOverflowPayload::with_operands(
+          "ArraysCache::set_meta_state: slot_count * sizeof::<Option<Array>>() (capacity overflow exceeds isize::MAX)",
+          "isize",
+          [
+            ("slot_count", slot_count as u64),
+            ("elem_size", elem_size as u64),
+          ],
+        ),
+      ));
     }
     // `presentSlots` is the producer's own `usize` slot index (emit at the
     // `meta_state` getter is `i.to_string()` where `i: usize`), so parse it
@@ -589,9 +625,19 @@ impl KvCache for ArraysCache {
     // entry, when populated), so `max_elems = slot_count` is the exact
     // legitimate upper bound. Codex-R1 [high] #1: rejects a forged
     // small-slot-count + huge-payload CSV before allocation.
-    let present = parse_csv::<usize>(&m[1], "presentSlots", slot_count)?;
+    let present = parse_csv::<usize>(
+      &m[1],
+      "ArraysCache meta_state presentSlots",
+      "CSV<usize>",
+      slot_count,
+    )?;
     let left_padding = match m.get(2) {
-      Some(s) => Some(parse_csv::<i32>(s, "leftPadding", slot_count)?),
+      Some(s) => Some(parse_csv::<i32>(
+        s,
+        "ArraysCache meta_state leftPadding",
+        "CSV<i32>",
+        slot_count,
+      )?),
       None => None,
     };
     let mut rebuilt: Vec<Option<Array>> = Vec::new();
@@ -649,7 +695,7 @@ impl KvCache for ArraysCache {
     // guarded [`mask::iarange`]: this crate's `Array::arange` is f32-only,
     // so an `N > 2^24` exclusive stop would round and *silently* return a
     // wrong-length range — `iarange` rejects that with a recoverable
-    // [`Error::ShapeMismatch`] instead of a corrupt mask (exactly the guard
+    // [`Error::OutOfRange`] instead of a corrupt mask (exactly the guard
     // the sibling `create_causal_mask` uses; mlx-lm's `mx.arange(N)` /
     // swift's `MLXArray(0..<N)` are integer-exact). Evaluated **lazily**,
     // only inside the branch that uses it — faithful to cache.py:691-699,
@@ -754,7 +800,7 @@ impl KvCache for ArraysCache {
   /// (`set_state` is infallible aside from `try_clone` paths it doesn't
   /// reach; `set_meta_state`'s slot-aware parse can fail on a malformed
   /// CSV, a non-numeric `slotCount`, or a hostile huge `slotCount` whose
-  /// buffer can't be allocated — `Error::Backend` / `Error::OutOfMemory`,
+  /// buffer can't be allocated — `Error::Parse` / `Error::CapExceeded` / `Error::OutOfMemory`,
   /// never a panic). The full restore is built into a fresh local via
   /// `ArraysCache::build_from_serialized` — the same constructor-style
   /// path `super::from_state`'s `"ArraysCache"` arm uses — and `self` is

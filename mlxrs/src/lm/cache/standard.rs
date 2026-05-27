@@ -2,12 +2,13 @@
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{Error, OutOfRangePayload, Result},
   lm::cache::{
     KvCache, MaskMode, mask,
     util::{concat_seq, nbytes, seq_len, slice_seq},
   },
 };
+use smol_str::format_smolstr;
 
 /// Append-and-fetch KV cache — the default cache for full-attention models.
 ///
@@ -53,7 +54,7 @@ impl KvCache for StandardKvCache {
     // The empty-cache branch below `try_clone`s `values` directly, so
     // without this a rank-invalid `values` on a fresh cache would be stored
     // raw and only surface (feature-combo-dependently) on a later op; the
-    // guard makes it a DETERMINISTIC recoverable `Err(Error::ShapeMismatch)`
+    // guard makes it a DETERMINISTIC recoverable `Err(Error::RankMismatch)`
     // on every path (empty/non-empty cache) on entry.
     let _ = seq_len("values", values)?;
     let (k, v) = match (&self.keys, &self.values) {
@@ -123,7 +124,7 @@ impl KvCache for StandardKvCache {
         // per-tensor 4-D check, symmetric — `keys` already was via the
         // `offset`-deriving `seq_len`; `values` likewise — still NOT a K/V
         // cross-check) so a rank-invalid loaded state is a DETERMINISTIC
-        // recoverable `Err(Error::ShapeMismatch)` here on every feature
+        // recoverable `Err(Error::RankMismatch)` here on every feature
         // combo rather than a (combo-dependent) later op error.
         let sk = seq_len("keys", &keys)?;
         let _ = seq_len("values", &values)?;
@@ -132,8 +133,10 @@ impl KvCache for StandardKvCache {
         self.offset = sk;
         Ok(())
       }
-      n => Err(Error::Backend(format!(
-        "StandardKvCache state must have 0 or 2 arrays, got {n}"
+      n => Err(Error::OutOfRange(OutOfRangePayload::new(
+        "StandardKvCache::set_state: state array count",
+        "must be 0 or 2",
+        format_smolstr!("{n}"),
       ))),
     }
   }

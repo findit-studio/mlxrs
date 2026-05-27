@@ -40,9 +40,13 @@
 
 use crate::{
   array::Array,
-  error::{Error, LengthMismatchPayload, OutOfRangePayload, Result},
+  error::{
+    ArithmeticOverflowPayload, Error, LengthMismatchPayload, NonFiniteScalarPayload,
+    OutOfRangePayload, RankMismatchPayload, Result,
+  },
   lm::nn::rope::{RopeOffsetRef, rope_with_freqs_offset},
 };
+use smol_str::format_smolstr;
 
 use super::rope::DEFAULT_BASE;
 
@@ -98,11 +102,14 @@ fn freqs_array(freqs: &[f64]) -> Result<Array> {
   for &v in freqs {
     let f = v as f32;
     if !f.is_finite() || f <= 0.0 || !(1.0f32 / f).is_finite() {
-      return Err(Error::ShapeMismatch(format!(
-        "scaled RoPE computed a freq ({v}) that is non-positive, non-finite, or whose \
-           reciprocal 1/f overflows f32; check the scaling config (base / factor / embeddings \
-           / betas) — freqs are inverted as 1/freqs by mlx_fast_rope, so a zero / subnormal \
-           element would become +Inf at apply time"
+      // The freq must be positive, finite, AND have a finite f32 reciprocal
+      // (mlx_fast_rope inverts as 1/freqs at apply time, so subnormals whose
+      // reciprocal overflows f32 are rejected too). The original `f64` is
+      // preserved in the OutOfRange payload's `value` for diagnosis.
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "scaled RoPE freq (check scaling config: base / factor / embeddings / betas)",
+        "must be positive, finite, AND have a finite f32 reciprocal (freqs are inverted as 1/freqs by mlx_fast_rope; zero / subnormal would become +Inf at apply time)",
+        format_smolstr!("{v}"),
       )));
     }
     buf.push(f);
@@ -116,13 +123,13 @@ fn freqs_array(freqs: &[f64]) -> Result<Array> {
 /// catch-all: no scaled-RoPE constructor may return `Ok` carrying a NaN/±Inf
 /// scalar that `apply` would later multiply onto activations. `what` names the
 /// constant for the error message.
-fn finite_scalar(value: f64, what: &str) -> Result<f32> {
+fn finite_scalar(value: f64, what: &'static str) -> Result<f32> {
   let v = value as f32;
   if v.is_finite() {
     Ok(v)
   } else {
-    Err(Error::ShapeMismatch(format!(
-      "scaled RoPE computed a non-finite {what} ({value}); check the scaling config"
+    Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+      what, value,
     )))
   }
 }
@@ -131,12 +138,13 @@ fn finite_scalar(value: f64, what: &str) -> Result<f32> {
 /// past the positivity/`> 1` comparisons that follow (`NaN <= 0.0` and
 /// `NaN > 1.0` are both `false`, so an unchecked NaN would pass every ordered
 /// guard and poison the arithmetic). `what` names the field for the message.
-fn require_finite_input(value: f32, what: &str) -> Result<()> {
+fn require_finite_input(value: f32, what: &'static str) -> Result<()> {
   if value.is_finite() {
     Ok(())
   } else {
-    Err(Error::ShapeMismatch(format!(
-      "scaled RoPE {what} must be finite, got {value}"
+    Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+      what,
+      value as f64,
     )))
   }
 }
@@ -147,12 +155,14 @@ fn require_finite_input(value: f32, what: &str) -> Result<()> {
 /// `1/freqs[i]` so a zero element becomes `+Inf` at apply time, and a negative
 /// element flips the rotation direction). `NaN > 0.0` is `false`, so this
 /// rejects NaN too. `what` names the field for the message.
-fn require_positive_input(value: f32, what: &str) -> Result<()> {
+fn require_positive_input(value: f32, what: &'static str) -> Result<()> {
   if value.is_finite() && value > 0.0 {
     Ok(())
   } else {
-    Err(Error::ShapeMismatch(format!(
-      "scaled RoPE {what} must be a positive finite number, got {value}"
+    Err(Error::OutOfRange(OutOfRangePayload::new(
+      what,
+      "must be a positive finite number",
+      format_smolstr!("{value}"),
     )))
   }
 }
@@ -177,9 +187,11 @@ fn require_positive_input(value: f32, what: &str) -> Result<()> {
 fn scale_leading_dims(x: &Array, dims: i32, mscale: f32) -> Result<Array> {
   let ndim = x.ndim();
   if ndim == 0 {
-    return Err(Error::ShapeMismatch(
-      "scaled RoPE input must have at least one axis".to_string(),
-    ));
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "scaled RoPE input must have rank >= 1 (at least one axis)",
+      0,
+      x.shape().to_vec(),
+    )));
   }
   // Build the scalar in `x`'s dtype so `multiply` does not promote half-precision
   // inputs to f32 (mirrors the references' in-place-into-`x` store).
@@ -190,8 +202,10 @@ fn scale_leading_dims(x: &Array, dims: i32, mscale: f32) -> Result<Array> {
   // and surface a recoverable error instead.
   let head_dim_usize = x.shape()[last];
   let head_dim = i32::try_from(head_dim_usize).map_err(|_| {
-    Error::ShapeMismatch(format!(
-      "scaled RoPE head_dim {head_dim_usize} exceeds i32::MAX"
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "scaled RoPE head_dim exceeds i32::MAX",
+      "i32",
+      [("head_dim", head_dim_usize as u64)],
     ))
   })?;
   if head_dim == dims {
@@ -199,8 +213,12 @@ fn scale_leading_dims(x: &Array, dims: i32, mscale: f32) -> Result<Array> {
     return x.multiply(&scalar);
   }
   if head_dim < dims {
-    return Err(Error::ShapeMismatch(format!(
-      "scaled RoPE dims {dims} exceeds head_dim {head_dim}"
+    // `dims` is the configured rotation width and must not exceed the last
+    // axis's `head_dim`.
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "scaled RoPE: dims (configured rotation width vs input last-axis head_dim)",
+      "must be <= head_dim (input last-axis)",
+      format_smolstr!("dims={dims}, head_dim={head_dim}"),
     )));
   }
   // head_dim > dims: scale only the leading `dims` features, keep the tail.
@@ -458,10 +476,12 @@ impl SuScaledRope {
         // by it; a non-positive value would yield a NaN/Inf scale that silently
         // propagates. Reject it before computing the factor.
         if original_max_position_embeddings <= 0 || max_position_embeddings <= 0 {
-          return Err(Error::ShapeMismatch(format!(
-            "SuScaledRoPE max_position_embeddings ({max_position_embeddings}) and \
-               original_max_position_embeddings ({original_max_position_embeddings}) must be \
-               positive to derive the input scale"
+          return Err(Error::OutOfRange(OutOfRangePayload::new(
+            "SuScaledRoPE max_position_embeddings / original_max_position_embeddings (required positive to derive the input scale)",
+            "must both be > 0",
+            format_smolstr!(
+              "max_position_embeddings={max_position_embeddings}, original_max_position_embeddings={original_max_position_embeddings}"
+            ),
           )));
         }
         // factor = max_pos / orig_max; scale = 1 if factor <= 1 else default.
@@ -476,10 +496,10 @@ impl SuScaledRope {
           // this path explicitly (the `finite_scalar` gate below would also
           // catch the resulting `+Inf`, but the message here is precise).
           if original_max_position_embeddings <= 1 {
-            return Err(Error::ShapeMismatch(format!(
-              "SuScaledRoPE original_max_position_embeddings ({original_max_position_embeddings}) \
-                 must be > 1 on the derived-scale path (factor > 1): ln(1) = 0 divides the scale \
-                 to +Inf"
+            return Err(Error::OutOfRange(OutOfRangePayload::new(
+              "SuScaledRoPE original_max_position_embeddings (derived-scale path, factor > 1)",
+              "must be > 1 (ln(1) = 0 divides the scale to +Inf)",
+              format_smolstr!("{original_max_position_embeddings}"),
             )));
           }
           // sqrt(1 + ln(factor) / ln(orig_max)); finiteness is the catch-all.
@@ -622,9 +642,14 @@ impl YarnRope {
       )));
     }
     if config.beta_fast <= 0.0 || config.beta_slow <= 0.0 {
-      return Err(Error::ShapeMismatch(format!(
-        "YarnRoPE beta_fast ({}) and beta_slow ({}) must be positive",
-        config.beta_fast, config.beta_slow
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "YarnRoPE beta_fast / beta_slow",
+        "must both be > 0",
+        format_smolstr!(
+          "beta_fast={}, beta_slow={}",
+          config.beta_fast,
+          config.beta_slow
+        ),
       )));
     }
     // `scaling_factor` scales the interpolation freqs (`freq_inter =

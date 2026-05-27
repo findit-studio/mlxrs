@@ -44,8 +44,12 @@
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{
+    Error, InvariantViolationPayload, LayerKeyedPayload, LengthMismatchPayload, OutOfRangePayload,
+    Result, UnknownEnumValuePayload,
+  },
 };
+use smol_str::format_smolstr;
 
 pub mod arrays;
 pub mod batch;
@@ -140,7 +144,12 @@ pub type QTriple = (Array, Array, Option<Array>);
 ///         // every update / make_mask / etc. inside the layer body.
 ///         let rot = c.as_any_mut()
 ///             .downcast_mut::<RotatingKvCache>()
-///             .ok_or_else(|| Error::Backend(format!("layer cache type mismatch (expected RotatingKvCache)")))?;
+///             .ok_or_else(|| Error::InvariantViolation(
+///                 InvariantViolationPayload::new(
+///                     "layer cache type",
+///                     "must downcast to RotatingKvCache",
+///                 ),
+///             ))?;
 ///         let (k, v) = rot.update(&x_k, &x_v)?;       // static dispatch
 ///         let mask = rot.make_mask(s, None, false)?;  // static dispatch
 ///         x = layer.attention(&x, &k, &v, &mask)?;
@@ -331,16 +340,16 @@ pub trait KvCache {
   /// Restore scalar metadata (mlx-lm `cache.meta_state` setter). The
   /// default mirrors mlx-lm `_BaseCache.meta_state` setter
   /// (`cache.py:142-145`): a no-meta cache that receives a non-empty
-  /// `meta_state` raises (recoverable [`Error::Backend`] here, not a
+  /// `meta_state` raises (recoverable [`Error::LengthMismatch`] here, not a
   /// panic). An empty `m` is the no-op success path. Concrete caches with
   /// metadata (`RotatingKvCache`, `ChunkedKvCache`) override this with
   /// their own parsing logic.
   fn set_meta_state(&mut self, m: &[String]) -> Result<()> {
     if !m.is_empty() {
-      return Err(Error::Backend(format!(
-        "KvCache has no meta_state but {} value(s) were provided: {m:?} \
-           (mirrors mlx-lm `_BaseCache.meta_state` setter cache.py:142-145)",
-        m.len()
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "KvCache::set_meta_state: meta_state value count for a no-meta cache (mirrors mlx-lm `_BaseCache.meta_state` setter cache.py:142-145)",
+        0,
+        m.len(),
       )));
     }
     Ok(())
@@ -423,22 +432,33 @@ pub trait KvCache {
     // Forward the primary error `e`, attempting both rollback setters
     // best-effort; if EITHER rollback step itself errors, wrap with a
     // rollback-failed suffix. Snapshots are moved into this block once.
-    let rollback =
-      |cache: &mut Self, e: Error, snap_state: Vec<Array>, snap_meta: Vec<String>| -> Error {
-        if let Err(rb_state_err) = cache.set_state(snap_state) {
-          return Error::Backend(format!(
-            "KvCache::from_serialized: setter failed ({e}); \
-             rollback also failed (set_state on snapshot: {rb_state_err})"
-          ));
-        }
-        if let Err(rb_meta_err) = cache.set_meta_state(&snap_meta) {
-          return Error::Backend(format!(
-            "KvCache::from_serialized: setter failed ({e}); \
-             rollback also failed (set_meta_state on snapshot: {rb_meta_err})"
-          ));
-        }
-        e
-      };
+    let rollback = |cache: &mut Self,
+                    e: Error,
+                    snap_state: Vec<Array>,
+                    snap_meta: Vec<String>|
+     -> Error {
+      if let Err(rb_state_err) = cache.set_state(snap_state) {
+        // Preserve the primary error `e` as the typed inner and annotate
+        // the rollback-step + failure via the runtime layer key. The
+        // primary's typed structure (variant + payload) survives end-to-end
+        // for downstream branching.
+        return Error::LayerKeyed(LayerKeyedPayload::new(
+          format_smolstr!(
+            "KvCache::from_serialized: rollback failed (set_state on snapshot: {rb_state_err})"
+          ),
+          e,
+        ));
+      }
+      if let Err(rb_meta_err) = cache.set_meta_state(&snap_meta) {
+        return Error::LayerKeyed(LayerKeyedPayload::new(
+          format_smolstr!(
+            "KvCache::from_serialized: rollback failed (set_meta_state on snapshot: {rb_meta_err})"
+          ),
+          e,
+        ));
+      }
+      e
+    };
     match self.set_state(state) {
       Ok(()) => match self.set_meta_state(meta) {
         Ok(()) => Ok(()),
@@ -740,7 +760,29 @@ impl KvCacheKind {
       "BatchRotatingKVCache" | "BatchRotatingKvCache" => Ok(Self::BatchRotatingKvCache),
       "ArraysCache" => Ok(Self::ArraysCache),
       "MambaCache" => Ok(Self::MambaCache),
-      other => Err(Error::Backend(format!("unknown cache kind: {other}"))),
+      other => Err(Error::UnknownEnumValue(UnknownEnumValuePayload::new(
+        "KvCacheKind",
+        other,
+        &[
+          "KVCache",
+          "ConcatenateKVCache",
+          "KVCacheSimple",
+          "StandardKvCache",
+          "RotatingKVCache",
+          "RotatingKvCache",
+          "ChunkedKVCache",
+          "ChunkedKvCache",
+          "QuantizedKVCache",
+          "QuantizedKvCacheImpl",
+          "CacheList",
+          "BatchKVCache",
+          "BatchKvCache",
+          "BatchRotatingKVCache",
+          "BatchRotatingKvCache",
+          "ArraysCache",
+          "MambaCache",
+        ],
+      ))),
     }
   }
 }
@@ -780,7 +822,7 @@ impl KvCacheKind {
 ///   save-after-load emits `"MambaCache"` again rather than degrading to
 ///   `"ArraysCache"`.
 ///
-/// An unrecognized `kind` is a recoverable [`Error::Backend`] (returned
+/// An unrecognized `kind` is a recoverable [`Error::UnknownEnumValue`] (returned
 /// by [`KvCacheKind::parse`]); adding a new variant to [`KvCacheKind`]
 /// causes a `non_exhaustive_patterns` compile error here until the
 /// matching arm is added (the structural-exhaustiveness benefit of the
@@ -816,9 +858,10 @@ pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<
       // idx==0` only here (so `set_state`/`set_meta_state` stay individually
       // 1:1 with cache.py:527-540), rejecting the inconsistent combination.
       if c.is_empty() && (c.offset() != 0 || c.idx() != 0) {
-        return Err(Error::Backend(
-          "RotatingKvCache: empty state with non-zero offset/idx is invalid".into(),
-        ));
+        return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+          "RotatingKvCache::from_state: empty state with non-zero offset/idx",
+          "must satisfy offset=0 AND idx=0 when buffer is empty",
+        )));
       }
       Ok(Box::new(c))
     }
@@ -866,9 +909,10 @@ pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<
       // cache.py:294-304), exactly mirroring the `RotatingKvCache` restore
       // guard above.
       if c.is_empty() && c.offset() != 0 {
-        return Err(Error::Backend(
-          "QuantizedKvCache: empty state with non-zero offset is invalid".into(),
-        ));
+        return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+          "QuantizedKvCache::from_state: empty state with non-zero offset",
+          "must satisfy offset=0 when buffer is empty",
+        )));
       }
       // P2 stores the quant triples **exactly `offset`-length** (the
       // documented `ConcatenateKVCache` / `StandardKvCache` equivalence;
@@ -972,20 +1016,19 @@ pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<
       // Report the EXACT conflict (which invariant failed and the offending
       // values) so a corrupt prompt-cache file is diagnosable from the
       // error message alone — Copilot review #3271119609.
-      let (invalid, reason) = if c.is_empty() {
+      if c.is_empty() {
         let offset = c.offset();
         let idx = c.ring_idx();
         let rotated = c.is_rotated();
         if offset != 0 || idx != 0 || rotated {
-          (
-            true,
-            format!(
-              "empty buffer (keys=None) requires fully-fresh meta: \
-               offset={offset} _idx={idx} rotated={rotated} (need 0/0/false)"
-            ),
-          )
-        } else {
-          (false, String::new())
+          // Empty buffer with non-fresh meta — surface the offending
+          // (offset, idx, rotated) triple via a structured InvariantViolation
+          // whose context names which fields must match the fully-fresh meta.
+          // `rotated` flag value is folded into operands as 0/1.
+          return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+            "BatchRotatingKvCache::from_serialized: empty buffer (keys=None) requires fully-fresh meta (offset=0, _idx=0, rotated=false)",
+            "must satisfy offset=0 AND _idx=0 AND rotated=false",
+          )));
         }
       } else {
         let l = c.buf_seq_len()?.unwrap_or(0);
@@ -994,35 +1037,29 @@ pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<
         let offset = c.offset();
         let rotated = c.is_rotated();
         if max_size == 0 {
-          (
-            true,
-            format!("non-empty buffer requires max_size >= 1, got max_size=0 (L={l})"),
-          )
+          return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+            "BatchRotatingKvCache::from_serialized: max_size",
+            "must be >= 1 for a non-empty buffer (max_size=0 is only the pre-setter placeholder)",
+          )));
         } else if idx > l {
-          (
-            true,
-            format!("_idx ({idx}) > keys seq-len L ({l}): write cursor beyond physical buffer"),
-          )
+          return Err(Error::OutOfRange(OutOfRangePayload::new(
+            "BatchRotatingKvCache::from_serialized: _idx (write cursor must not exceed physical buffer seq-len L)",
+            "must satisfy _idx <= L",
+            format_smolstr!("_idx={idx}, L={l}"),
+          )));
         } else if rotated && l != max_size {
-          (
-            true,
-            format!("rotated=true requires L == max_size, got L={l} max_size={max_size}"),
-          )
+          return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+            "BatchRotatingKvCache::from_serialized: rotated=true requires L == max_size",
+            max_size,
+            l,
+          )));
         } else if l > offset {
-          (
-            true,
-            format!(
-              "L ({l}) > _offset ({offset}): mlx-lm getter emits keys[:_offset, :], so L <= _offset always"
-            ),
-          )
-        } else {
-          (false, String::new())
+          return Err(Error::OutOfRange(OutOfRangePayload::new(
+            "BatchRotatingKvCache::from_serialized: L (keys seq-len; mlx-lm getter emits keys[:_offset,:], so L <= _offset always)",
+            "must satisfy L <= _offset",
+            format_smolstr!("L={l}, _offset={offset}"),
+          )));
         }
-      };
-      if invalid {
-        return Err(Error::Backend(format!(
-          "BatchRotatingKvCache: restored state/meta_state is inconsistent (not a state mlx-lm's own round-trip could produce): {reason}"
-        )));
       }
       Ok(Box::new(c))
     }

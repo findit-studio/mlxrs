@@ -10,7 +10,10 @@
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{Error, Result},
+  error::{
+    ArithmeticOverflowPayload, EmptyInputPayload, Error, InvariantViolationPayload,
+    RankMismatchPayload, Result, ShapePairMismatchPayload,
+  },
   ops,
 };
 
@@ -26,12 +29,19 @@ pub(crate) const SEQ_AXIS: i32 = -2;
 /// Validate a key/value tensor's rank and return its sequence length
 /// (`shape[-2]`). mlx-lm assumes the 4-D `[B, n_kv_heads, S, head_dim]`
 /// layout; we check it instead of indexing blindly so a misuse is a
-/// recoverable [`Error::ShapeMismatch`], not a panic.
+/// recoverable [`Error::RankMismatch`], not a panic.
 pub(crate) fn seq_len(name: &str, a: &Array) -> Result<usize> {
   let shape = a.shape();
   if shape.len() != KV_NDIM {
-    return Err(Error::ShapeMismatch(format!(
-      "KV cache expects 4-D {name} [B, n_kv_heads, S, head_dim], got shape {shape:?}"
+    let context: &'static str = match name {
+      "keys" => "seq_len: KV cache expects 4-D keys [B, n_kv_heads, S, head_dim]",
+      "values" => "seq_len: KV cache expects 4-D values [B, n_kv_heads, S, head_dim]",
+      _ => "seq_len: KV cache expects 4-D [B, n_kv_heads, S, head_dim]",
+    };
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      context,
+      shape.len() as u32,
+      shape.to_vec(),
     )));
   }
   Ok(shape[KV_NDIM - 2])
@@ -42,13 +52,20 @@ pub(crate) fn seq_len(name: &str, a: &Array) -> Result<usize> {
 /// `values.shape[-1]` directly on the assumed 4-D `[B, n_kv_heads, S,
 /// head_dim]` layout (`cache.py:337`/`cache.py:478`); we check the rank
 /// instead of indexing blindly so a rank-invalid `values` is a recoverable
-/// [`Error::ShapeMismatch`] (the faithful equivalent of Python's
+/// [`Error::RankMismatch`] (the faithful equivalent of Python's
 /// `IndexError`), not a Rust slice out-of-bounds panic.
 pub(crate) fn head_dim(name: &str, a: &Array) -> Result<usize> {
   let shape = a.shape();
   if shape.len() != KV_NDIM {
-    return Err(Error::ShapeMismatch(format!(
-      "KV cache expects 4-D {name} [B, n_kv_heads, S, head_dim], got shape {shape:?}"
+    let context: &'static str = match name {
+      "keys" => "head_dim: KV cache expects 4-D keys [B, n_kv_heads, S, head_dim]",
+      "values" => "head_dim: KV cache expects 4-D values [B, n_kv_heads, S, head_dim]",
+      _ => "head_dim: KV cache expects 4-D [B, n_kv_heads, S, head_dim]",
+    };
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      context,
+      shape.len() as u32,
+      shape.to_vec(),
     )));
   }
   Ok(shape[KV_NDIM - 1])
@@ -100,19 +117,45 @@ pub(crate) fn broadcast_write_rhs(
   let bs = buf.shape();
   let ns = new.shape();
   if bs.len() != KV_NDIM {
-    return Err(Error::ShapeMismatch(format!(
-      "KV cache expects 4-D {name} [B, n_kv_heads, S, head_dim], got shape {bs:?}"
+    let context: &'static str = match name {
+      "keys" => "broadcast_write_rhs: KV cache expects 4-D keys [B, n_kv_heads, S, head_dim]",
+      "values" => "broadcast_write_rhs: KV cache expects 4-D values [B, n_kv_heads, S, head_dim]",
+      _ => "broadcast_write_rhs: KV cache expects 4-D [B, n_kv_heads, S, head_dim]",
+    };
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      context,
+      bs.len() as u32,
+      bs.to_vec(),
     )));
   }
   if ns.len() != KV_NDIM {
-    return Err(Error::ShapeMismatch(format!(
-      "KV cache expects 4-D {name} write RHS [B, n_kv_heads, S, head_dim], got shape {ns:?}"
+    let context: &'static str = match name {
+      "keys" => {
+        "broadcast_write_rhs: KV cache expects 4-D keys write RHS [B, n_kv_heads, S, head_dim]"
+      }
+      "values" => {
+        "broadcast_write_rhs: KV cache expects 4-D values write RHS [B, n_kv_heads, S, head_dim]"
+      }
+      _ => "broadcast_write_rhs: KV cache expects 4-D write RHS [B, n_kv_heads, S, head_dim]",
+    };
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      context,
+      ns.len() as u32,
+      ns.to_vec(),
     )));
   }
   // Slice window length on the sequence axis — the broadcast target's seq
   // dim (mlx `slice_update`'s `upd_shape[seq]` is exactly `stop - start`).
   let win = end.checked_sub(a).ok_or_else(|| {
-    Error::ShapeMismatch(format!("set_seq: {name} write end ({end}) < start ({a})"))
+    let context: &'static str = match name {
+      "keys" => "set_seq: keys write end < start",
+      "values" => "set_seq: values write end < start",
+      _ => "set_seq: write end < start",
+    };
+    Error::InvariantViolation(InvariantViolationPayload::new(
+      context,
+      "must satisfy end >= start",
+    ))
   })?;
   // Per-axis: identity (`d == d`) OR size-1-broadcast (`new == 1`). mlx
   // `broadcast_to` (called by `slice_update`, `ops.cpp:843`) accepts a size-1
@@ -123,10 +166,28 @@ pub(crate) fn broadcast_write_rhs(
     let target = if axis == KV_NDIM - 2 { win } else { bs[axis] };
     let got = ns[axis];
     if got != target && got != 1 {
-      return Err(Error::ShapeMismatch(format!(
-        "set_seq: {name} write RHS shape {ns:?} non-broadcastable on axis {axis} \
-           (got {got}, target {target} — mlx-lm slice-assignment raises on \
-           non-broadcastable non-seq axes; seq-axis target is the slice window length)"
+      // Reconstruct the per-axis expected shape: target axes follow the buffer
+      // shape except seq-axis which is the slice window length. This carries
+      // the full pair (expected, actual) plus the call-site label naming
+      // axis kind/name; per-axis breakdown is preserved structurally.
+      let expected: Vec<usize> = (0..KV_NDIM)
+        .map(|i| if i == KV_NDIM - 2 { win } else { bs[i] })
+        .collect();
+      let context: &'static str = match name {
+        "keys" => {
+          "broadcast_write_rhs: keys write RHS non-broadcastable (mlx-lm slice-assignment raises on non-broadcastable non-seq axes; seq-axis target is the slice window length)"
+        }
+        "values" => {
+          "broadcast_write_rhs: values write RHS non-broadcastable (mlx-lm slice-assignment raises on non-broadcastable non-seq axes; seq-axis target is the slice window length)"
+        }
+        _ => {
+          "broadcast_write_rhs: write RHS non-broadcastable (mlx-lm slice-assignment raises on non-broadcastable non-seq axes; seq-axis target is the slice window length)"
+        }
+      };
+      return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+        context,
+        expected.as_slice(),
+        ns.to_vec().as_slice(),
       )));
     }
   }
@@ -150,7 +211,7 @@ pub(crate) fn broadcast_write_rhs(
 /// `usize > i32::MAX` (potentially to a negative `i32`), producing a wrong
 /// slice stop and a mis-spliced state. So we use the checked
 /// `i32::try_from(end)` (and `start`) and surface overflow as a recoverable
-/// [`Error::ShapeMismatch`] at this single integer-wrap boundary —
+/// [`Error::ArithmeticOverflow`] at this single integer-wrap boundary —
 /// observably-equivalent for every valid input
 /// (`start, end <= i32::MAX as usize`), which covers every real cache use
 /// case. The shape dims come from an `Array` that mlx itself already
@@ -167,24 +228,40 @@ pub(crate) fn slice_seq(a: &Array, start: usize, end: usize) -> Result<Array> {
   // Quantized/Batch/BatchRotating) all pre-validate rank before reaching
   // here, so this is a defense-in-depth guard, not a behavior change.
   if shape.len() != KV_NDIM {
-    return Err(Error::ShapeMismatch(format!(
-      "slice_seq: expects {KV_NDIM}-D array [B, n_kv_heads, S, head_dim], got shape {shape:?}"
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "slice_seq: expects 4-D array [B, n_kv_heads, S, head_dim]",
+      shape.len() as u32,
+      shape.to_vec(),
     )));
   }
   let mut starts = vec![0i32; KV_NDIM];
   let mut stops: Vec<i32> = shape
     .iter()
     .map(|&d| {
-      i32::try_from(d)
-        .map_err(|_| Error::ShapeMismatch(format!("slice_seq: shape dim {d} exceeds i32::MAX")))
+      i32::try_from(d).map_err(|_| {
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+          "slice_seq: shape dim exceeds i32::MAX",
+          "i32",
+          [("dim", d as u64)],
+        ))
+      })
     })
     .collect::<Result<Vec<i32>>>()?;
   let strides = vec![1i32; KV_NDIM];
   starts[KV_NDIM - 2] = i32::try_from(start).map_err(|_| {
-    Error::ShapeMismatch(format!("slice_seq: start offset {start} exceeds i32::MAX"))
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "slice_seq: start offset exceeds i32::MAX",
+      "i32",
+      [("start", start as u64)],
+    ))
   })?;
-  stops[KV_NDIM - 2] = i32::try_from(end)
-    .map_err(|_| Error::ShapeMismatch(format!("slice_seq: end offset {end} exceeds i32::MAX")))?;
+  stops[KV_NDIM - 2] = i32::try_from(end).map_err(|_| {
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "slice_seq: end offset exceeds i32::MAX",
+      "i32",
+      [("end", end as u64)],
+    ))
+  })?;
   ops::indexing::slice(a, &starts, &stops, &strides)
 }
 
@@ -257,14 +334,16 @@ pub(crate) fn concat_parts(parts: &[&Array]) -> Result<Array> {
   // `cache.py` and (b) store a rank-invalid buffer that a *later* valid
   // update would hit via a raw cached-shape read (`temporal_order` /
   // `set_seq`) → panic. So a fast-path part must be rank-checked: a
-  // rank-invalid one is the same recoverable `Error::ShapeMismatch`
+  // rank-invalid one is the same recoverable `Error::RankMismatch`
   // `mx.concatenate` would raise. A valid 4-D part is byte-identical
   // (`try_clone`) — `concatenate` of a single 4-D array is identity.
   let rank_checked = |a: &Array| -> Result<Array> {
     let shape = a.shape();
     if shape.len() != KV_NDIM {
-      return Err(Error::ShapeMismatch(format!(
-        "KV cache concat expects 4-D [B, n_kv_heads, S, head_dim] parts, got shape {shape:?}"
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        "concat_parts: KV cache concat expects 4-D [B, n_kv_heads, S, head_dim] parts",
+        shape.len() as u32,
+        shape.to_vec(),
       )));
     }
     a.try_clone()
@@ -276,9 +355,9 @@ pub(crate) fn concat_parts(parts: &[&Array]) -> Result<Array> {
     // `Error` rather than an indexing panic.
     [] => match parts.first() {
       Some(first) => rank_checked(first),
-      None => Err(Error::ShapeMismatch(
-        "concat_parts: no parts to concatenate".into(),
-      )),
+      None => Err(Error::EmptyInput(EmptyInputPayload::new(
+        "concat_parts: parts",
+      ))),
     },
     [one] => rank_checked(one),
     many => ops::shape::concatenate(many, SEQ_AXIS),
@@ -292,7 +371,7 @@ mod tests {
   //! flow a `usize > i32::MAX` through here; the unchecked `as i32` cast
   //! previously wrapped silently (potentially to a negative `i32`),
   //! producing a wrong slice stop. The checked cast surfaces overflow as
-  //! a recoverable `Error::ShapeMismatch` at this single source of
+  //! a recoverable `Error::ArithmeticOverflow` at this single source of
   //! truth — every cache (Standard / Rotating / Chunked / Quantized /
   //! Batch / BatchRotating) that flows restored offsets through
   //! `slice_seq` (via `enforce_offset_len_invariant` / `trim_triple` /
@@ -311,17 +390,23 @@ mod tests {
     let bad_end = (i32::MAX as usize) + 1;
     let r = slice_seq(&a, 0, bad_end);
     match r {
-      Err(Error::ShapeMismatch(message)) => {
+      Err(Error::ArithmeticOverflow(payload)) => {
         assert!(
-          message.contains("end") && message.contains("i32::MAX"),
-          "expected message to name `end` and `i32::MAX`, got: {message:?}"
+          payload.context().contains("end") && payload.context().contains("i32::MAX"),
+          "expected context to name `end` and `i32::MAX`, got: {:?}",
+          payload.context()
         );
+        let has_value = payload
+          .operands()
+          .iter()
+          .any(|(n, v)| *n == "end" && *v == bad_end as u64);
         assert!(
-          message.contains(&bad_end.to_string()),
-          "expected message to include the offending value {bad_end}, got: {message:?}"
+          has_value,
+          "expected operands to include `end` = {bad_end}, got: {:?}",
+          payload.operands()
         );
       }
-      other => panic!("expected Err(ShapeMismatch), got {other:?}"),
+      other => panic!("expected Err(ArithmeticOverflow), got {other:?}"),
     }
   }
 
@@ -334,17 +419,19 @@ mod tests {
     // either error variant is correct, both name an offset > i32::MAX.
     let r = slice_seq(&a, bad_start, bad_start);
     match r {
-      Err(Error::ShapeMismatch(message)) => {
+      Err(Error::ArithmeticOverflow(payload)) => {
         assert!(
-          message.contains("i32::MAX"),
-          "expected message to mention `i32::MAX`, got: {message:?}"
+          payload.context().contains("i32::MAX"),
+          "expected context to mention `i32::MAX`, got: {:?}",
+          payload.context()
         );
         assert!(
-          message.contains("start") || message.contains("end"),
-          "expected message to name `start` or `end` offset, got: {message:?}"
+          payload.context().contains("start") || payload.context().contains("end"),
+          "expected context to name `start` or `end` offset, got: {:?}",
+          payload.context()
         );
       }
-      other => panic!("expected Err(ShapeMismatch), got {other:?}"),
+      other => panic!("expected Err(ArithmeticOverflow), got {other:?}"),
     }
   }
 
@@ -361,22 +448,26 @@ mod tests {
   #[test]
   fn slice_seq_rejects_rank_mismatch() {
     // Defense-in-depth: a rank-misuse must surface as recoverable
-    // ShapeMismatch rather than panicking on the `stops[KV_NDIM - 2]`
+    // RankMismatch rather than panicking on the `stops[KV_NDIM - 2]`
     // index (Copilot review #3273072304). All real callers pre-validate
     // rank, so this only fires on a programmer-error / misuse path.
     let a1: Array = Array::from_slice::<f32>(&[0.0, 1.0], &(2usize,)).unwrap(); // rank 1
     let r = slice_seq(&a1, 0, 0);
-    assert!(
-      matches!(r, Err(Error::ShapeMismatch(_))),
-      "rank-1 must Err(ShapeMismatch), got {r:?}"
-    );
-    let err_msg = match r {
-      Err(e) => format!("{e}"),
-      Ok(_) => unreachable!(),
-    };
-    assert!(
-      err_msg.contains("4-D") && err_msg.contains("[2]"),
-      "error must name expected rank + got shape; got: {err_msg}"
-    );
+    match r {
+      Err(Error::RankMismatch(payload)) => {
+        assert!(
+          payload.context().contains("4-D") || payload.context().contains("slice_seq"),
+          "error context must name expected rank or call site; got: {:?}",
+          payload.context()
+        );
+        assert_eq!(payload.actual(), 1, "expected actual rank 1");
+        assert_eq!(
+          payload.actual_shape(),
+          &[2usize],
+          "expected actual shape [2]"
+        );
+      }
+      other => panic!("rank-1 must Err(RankMismatch), got {other:?}"),
+    }
   }
 }

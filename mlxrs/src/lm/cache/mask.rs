@@ -15,10 +15,11 @@
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{Error, Result},
+  error::{ArithmeticOverflowPayload, Error, OutOfRangePayload, Result},
   lm::cache::MaskMode,
   ops,
 };
+use smol_str::format_smolstr;
 
 /// The largest integer `f32` represents exactly. `f32` has a 24-bit
 /// significand, so every integer in `[0, 2^24]` round-trips losslessly;
@@ -52,13 +53,15 @@ pub(crate) fn scalar_i32(value: i32) -> Result<Array> {
 /// the largest produced value (`stop - 1 > 2^24`), `stop == 2^24 + 1` would
 /// pass yet `(2^24 + 1) as f32 == 2^24`, so `arange` would stop one element
 /// short and silently emit a too-short (corrupt) mask. An out-of-range
-/// `stop` is therefore **rejected** (a recoverable [`Error::ShapeMismatch`])
+/// `stop` is therefore **rejected** (a recoverable [`Error::OutOfRange`])
 /// rather than truncated — a too-long cache context surfaces an error here
 /// instead of a wrong mask.
 pub(crate) fn iarange(start: usize, stop: usize) -> Result<Array> {
   if stop > F32_EXACT_INT_MAX {
-    return Err(Error::ShapeMismatch(format!(
-      "iarange: stop {stop} exceeds the exact f32 integer limit (2^24); the exclusive stop is cast to f32 for the f32-only Array::arange, so stop>2^24 would round and silently truncate the range — cache context too long for this path"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "iarange: stop",
+      "must be <= 2^24 (f32 exact-integer limit; exclusive stop is cast to f32 for the f32-only Array::arange, so stop>2^24 would round and silently truncate the range — cache context too long for this path)",
+      format_smolstr!("{stop}"),
     )));
   }
   ops::misc::astype(&Array::arange(start as f32, stop as f32, 1.0)?, Dtype::I32)
@@ -106,7 +109,7 @@ pub(crate) fn roll_1d(a: &Array, shift: usize) -> Result<Array> {
 /// `set_meta_state`) could otherwise overflow → a debug panic, or a release
 /// wrap to a small value that then *passes* `iarange`'s `2^24` check and
 /// silently produces a wrong mask. The overflow is a recoverable
-/// [`Error::ShapeMismatch`] instead (behavior is identical for every valid
+/// [`Error::ArithmeticOverflow`] instead (behavior is identical for every valid
 /// input — `offset + N ≤ 2^24` always reaches `iarange` unchanged).
 ///
 /// `window_size` keeps mlx-lm's unbounded-Python-int semantics: there
@@ -120,8 +123,10 @@ pub(crate) fn roll_1d(a: &Array, shift: usize) -> Result<Array> {
 /// `window_size > i32::MAX` wrapping.
 pub fn create_causal_mask(n: usize, offset: usize, window_size: Option<usize>) -> Result<Array> {
   let total = offset.checked_add(n).ok_or_else(|| {
-    Error::ShapeMismatch(format!(
-      "create_causal_mask: offset ({offset}) + N ({n}) overflows usize"
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "create_causal_mask: offset + N",
+      "usize",
+      [("offset", offset as u64), ("N", n as u64)],
     ))
   })?;
   let rinds = iarange(0, total)?;

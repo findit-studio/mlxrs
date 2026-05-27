@@ -34,7 +34,11 @@
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{DtypeMismatchPayload, Error, Result},
+  error::{
+    ArithmeticOverflowPayload, DtypeMismatchPayload, Error, InvariantViolationPayload,
+    LengthMismatchPayload, OutOfRangePayload, ParsePayload, RankMismatchPayload, Result,
+    UnknownEnumValuePayload,
+  },
   lm::cache::{
     BatchPositionedKvCache, KvCache, MaskMode,
     batch::{batch_head_dim, create_causal_mask_batched, dynamic_roll, ivec, validate_kv_compat},
@@ -42,6 +46,7 @@ use crate::{
   },
   ops,
 };
+use smol_str::format_smolstr;
 
 /// mlx-lm `BatchRotatingKVCache.step` — the in-place buffer growth batch
 /// (`cache.py:1134`). Purely an allocation batch size: every grown row is
@@ -358,9 +363,10 @@ impl BatchRotatingKvCache {
     // partial-mutation-on-`Err` class structurally (not method-by-method)
     // for the `S>1` path.
     let new_off = self.off.checked_add(s).ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "BatchRotatingKvCache update: _offset ({}) + S ({s}) overflows usize",
-        self.off
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "BatchRotatingKvCache::update: _offset + S",
+        "usize",
+        [("_offset", self.off as u64), ("S", s as u64)],
       ))
     })?;
     let (wk, wv): (Array, Array);
@@ -419,8 +425,10 @@ impl BatchRotatingKvCache {
         // the cache fully unmutated). For every non-overflowing input the
         // value is byte-identical to mlx-lm's unbounded `self._idx + 1`.
         let idx_plus_1 = w_idx.checked_add(1).ok_or_else(|| {
-          Error::ShapeMismatch(format!(
-            "BatchRotatingKvCache update: _idx ({w_idx}) + 1 overflows usize"
+          Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+            "BatchRotatingKvCache::update_in_place: _idx + 1",
+            "usize",
+            [("_idx", w_idx as u64), ("one", 1u64)],
           ))
         })?;
         let trim_size = idx_plus_1.saturating_sub(self.max_size);
@@ -537,9 +545,10 @@ impl BatchRotatingKvCache {
     // the cache FULLY unmutated — no buffer-grown-but-offset-not /
     // keys-written-but-values-not desync, retry-safe.
     let new_off = self.off.checked_add(s).ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "BatchRotatingKvCache update: _offset ({}) + S ({s}) overflows usize",
-        self.off
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "BatchRotatingKvCache::update: _offset + S",
+        "usize",
+        [("_offset", self.off as u64), ("S", s as u64)],
       ))
     })?;
 
@@ -629,8 +638,10 @@ impl BatchRotatingKvCache {
     // wrong out-of-range `set_seq` splice never even runs). Byte-identical
     // to mlx-lm's unbounded `self._idx += S` for every valid input.
     let new_w_idx = w_idx.checked_add(s).ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "BatchRotatingKvCache update: _idx ({w_idx}) + S ({s}) overflows usize"
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "BatchRotatingKvCache::update_concat: _idx + S",
+        "usize",
+        [("_idx", w_idx as u64), ("S", s as u64)],
       ))
     })?;
 
@@ -880,15 +891,17 @@ impl KvCache for BatchRotatingKvCache {
         let lp_shape = left_padding.shape();
         let kb = keys.shape()[0];
         if lp_shape.len() != 1 {
-          return Err(Error::ShapeMismatch(format!(
-            "BatchRotatingKvCache::set_state: restored left_padding must be 1-D [B], got shape {lp_shape:?}"
+          return Err(Error::RankMismatch(RankMismatchPayload::new(
+            "BatchRotatingKvCache::set_state: restored left_padding must be 1-D [B]",
+            lp_shape.len() as u32,
+            lp_shape.to_vec(),
           )));
         }
         if lp_shape[0] != kb {
-          return Err(Error::ShapeMismatch(format!(
-            "BatchRotatingKvCache::set_state: restored left_padding length ({}) does not match \
-               keys batch dim ({kb})",
-            lp_shape[0]
+          return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+            "BatchRotatingKvCache::set_state: restored left_padding length vs keys batch dim",
+            kb,
+            lp_shape[0],
           )));
         }
         let lp_dtype = left_padding.dtype()?;
@@ -924,8 +937,10 @@ impl KvCache for BatchRotatingKvCache {
         self.lengths = None;
         Ok(())
       }
-      n => Err(Error::Backend(format!(
-        "BatchRotatingKvCache state must have 0 or 4 arrays, got {n}"
+      n => Err(Error::OutOfRange(OutOfRangePayload::new(
+        "BatchRotatingKvCache::set_state: state array count",
+        "must be 0 or 4",
+        format_smolstr!("{n}"),
       ))),
     }
   }
@@ -951,17 +966,21 @@ impl KvCache for BatchRotatingKvCache {
   /// malformed later field leaves the cache unmutated.
   fn set_meta_state(&mut self, m: &[String]) -> Result<()> {
     if m.len() != 4 {
-      return Err(Error::Backend(format!(
-        "BatchRotatingKvCache meta_state must have 4 values, got {}",
-        m.len()
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "BatchRotatingKvCache::set_meta_state: meta_state values",
+        4,
+        m.len(),
       )));
     }
-    let parse = |i: usize, name: &str| -> Result<usize> {
-      m[i].parse::<usize>().map_err(|e| {
-        Error::Backend(format!(
-          "BatchRotatingKvCache meta_state {name} ({:?}): {e}",
-          m[i]
-        ))
+    let parse = |i: usize, name: &'static str| -> Result<usize> {
+      m[i].parse::<usize>().map_err(|e: std::num::ParseIntError| {
+        let context: &'static str = match name {
+          "max_size" => "BatchRotatingKvCache::set_meta_state: max_size",
+          "_offset" => "BatchRotatingKvCache::set_meta_state: _offset",
+          "_idx" => "BatchRotatingKvCache::set_meta_state: _idx",
+          _ => "BatchRotatingKvCache::set_meta_state",
+        };
+        Error::Parse(ParsePayload::new(context, "usize", Box::new(e)))
       })
     };
     let max_size = parse(0, "max_size")?;
@@ -976,8 +995,10 @@ impl KvCache for BatchRotatingKvCache {
       "true" => true,
       "false" => false,
       other => {
-        return Err(Error::Backend(format!(
-          "BatchRotatingKvCache meta_state rotated ({other:?}): expected a bool"
+        return Err(Error::UnknownEnumValue(UnknownEnumValuePayload::new(
+          "BatchRotatingKvCache::set_meta_state: rotated",
+          other.to_string(),
+          &["true", "false"],
         )));
       }
     };
@@ -1081,9 +1102,13 @@ impl KvCache for BatchRotatingKvCache {
     // side-effect-free); byte-identical to mlx-lm's unbounded int for
     // every non-overflowing input.
     let idx_term = self.idx.checked_add(usize::from(n > 1)).ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "BatchRotatingKvCache::make_mask: _idx ({}) + int(N>1) overflows usize",
-        self.idx
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "BatchRotatingKvCache::make_mask: _idx + int(N>1)",
+        "usize",
+        [
+          ("_idx", self.idx as u64),
+          ("n_gt_1", usize::from(n > 1) as u64),
+        ],
       ))
     })?;
     let trim_size = idx_term.saturating_sub(self.max_size);
@@ -1111,8 +1136,13 @@ impl KvCache for BatchRotatingKvCache {
     // inherently side-effect-free).
     let mut lp = self.left_padding.try_clone()?;
     let delta = trim_size.checked_add(usize::from(rotated)).ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "BatchRotatingKvCache::make_mask: trim_size ({trim_size}) + int(rotated) overflows usize"
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "BatchRotatingKvCache::make_mask: trim_size + int(rotated)",
+        "usize",
+        [
+          ("trim_size", trim_size as u64),
+          ("rotated", usize::from(rotated) as u64),
+        ],
       ))
     })?;
     if delta != 0 {
@@ -1122,8 +1152,10 @@ impl KvCache for BatchRotatingKvCache {
       // (silent wrong mask) — reject it instead.
       const F32_EXACT_INT_MAX: usize = 1usize << 24;
       if delta > F32_EXACT_INT_MAX {
-        return Err(Error::ShapeMismatch(format!(
-          "BatchRotatingKvCache::make_mask: trim/rotate delta ({delta}) exceeds the exact f32 integer limit (2^24) — _idx restored too large for this path"
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "BatchRotatingKvCache::make_mask: trim/rotate delta (_idx restored too large for this path)",
+          "must be <= 2^24 (f32 exact-integer limit)",
+          format_smolstr!("{delta}"),
         )));
       }
       let d = ops::misc::astype(&Array::full::<f32>(&(1usize,), delta as f32)?, Dtype::I32)?;
@@ -1133,8 +1165,10 @@ impl KvCache for BatchRotatingKvCache {
     // mask &= rinds >= expand_dims(left_padding, (1,2,3)) (cache.py:1349).
     // rinds = arange(offset + N); rebuild it and broadcast lp to [B,1,1,1].
     let total = offset.checked_add(n).ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "BatchRotatingKvCache::make_mask: offset ({offset}) + N ({n}) overflows usize"
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "BatchRotatingKvCache::make_mask: offset + N",
+        "usize",
+        [("offset", offset as u64), ("N", n as u64)],
       ))
     })?;
     let rinds = super::mask::iarange(0, total)?;
@@ -1256,20 +1290,15 @@ impl KvCache for BatchRotatingKvCache {
     // !rotated). Non-empty buffer ⇒ max_size>=1 ∧ idx<=L ∧
     // (rotated ⇒ L==max_size) ∧ L<=offset. Apply on `staged` so a
     // failure leaves `self` byte-identical to its pre-call state.
-    let (invalid, reason) = if staged.is_empty() {
+    if staged.is_empty() {
       let offset = staged.offset();
       let idx = staged.ring_idx();
       let rotated = staged.is_rotated();
       if offset != 0 || idx != 0 || rotated {
-        (
-          true,
-          format!(
-            "empty buffer (keys=None) requires fully-fresh meta: \
-             offset={offset} _idx={idx} rotated={rotated} (need 0/0/false)"
-          ),
-        )
-      } else {
-        (false, String::new())
+        return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+          "BatchRotatingKvCache::from_serialized: empty buffer (keys=None) requires fully-fresh meta (offset=0, _idx=0, rotated=false)",
+          "must satisfy offset=0 AND _idx=0 AND rotated=false",
+        )));
       }
     } else {
       let l = staged.buf_seq_len()?.unwrap_or(0);
@@ -1278,35 +1307,29 @@ impl KvCache for BatchRotatingKvCache {
       let offset = staged.offset();
       let rotated = staged.is_rotated();
       if max_size == 0 {
-        (
-          true,
-          format!("non-empty buffer requires max_size >= 1, got max_size=0 (L={l})"),
-        )
+        return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+          "BatchRotatingKvCache::from_serialized: max_size",
+          "must be >= 1 for a non-empty buffer (max_size=0 is only the pre-setter placeholder)",
+        )));
       } else if idx > l {
-        (
-          true,
-          format!("_idx ({idx}) > keys seq-len L ({l}): write cursor beyond physical buffer"),
-        )
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "BatchRotatingKvCache::from_serialized: _idx (write cursor must not exceed physical buffer seq-len L)",
+          "must satisfy _idx <= L",
+          format_smolstr!("_idx={idx}, L={l}"),
+        )));
       } else if rotated && l != max_size {
-        (
-          true,
-          format!("rotated=true requires L == max_size, got L={l} max_size={max_size}"),
-        )
+        return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+          "BatchRotatingKvCache::from_serialized: rotated=true requires L == max_size",
+          max_size,
+          l,
+        )));
       } else if l > offset {
-        (
-          true,
-          format!(
-            "L ({l}) > _offset ({offset}): mlx-lm getter emits keys[:_offset, :], so L <= _offset always"
-          ),
-        )
-      } else {
-        (false, String::new())
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "BatchRotatingKvCache::from_serialized: L (keys seq-len; mlx-lm getter emits keys[:_offset,:], so L <= _offset always)",
+          "must satisfy L <= _offset",
+          format_smolstr!("L={l}, _offset={offset}"),
+        )));
       }
-    };
-    if invalid {
-      return Err(Error::Backend(format!(
-        "BatchRotatingKvCache: restored state/meta_state is inconsistent (not a state mlx-lm's own round-trip could produce): {reason}"
-      )));
     }
     *self = staged;
     Ok(())
