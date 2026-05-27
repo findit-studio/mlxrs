@@ -165,7 +165,8 @@ use std::path::{Path, PathBuf};
 
 use crate::{
   error::{
-    ConvertPostSavePartialPayload, DurabilityWarningPayload, Error, FileIoPayload, FileOp, Result,
+    ConvertPostSavePartialPayload, DurabilityWarningPayload, Error, FileIoPayload, FileOp,
+    InvariantViolationPayload, LayerKeyedPayload, ParsePayload, Result,
   },
   lm::{
     convert::{self, TOKENIZER_EXTRA_FILES},
@@ -352,11 +353,9 @@ pub fn fuse(
   // path the caller needs to fix (the snapshot path is an internal
   // implementation detail).
   if let Err(e) = load::load_tokenizer(staging.path(), &cfg_typed) {
-    return Err(Error::Backend(format!(
-      "fuse: source tokenizer at {} failed validation against the staged snapshot \
-         at {}: {e}",
-      model_path.display(),
-      staging.path().display()
+    return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+      model_path.display().to_string(),
+      e,
     )));
   }
 
@@ -627,20 +626,21 @@ impl StagingDir {
           continue;
         }
         Err(e) => {
-          return Err(Error::Backend(format!(
-            "fuse: cannot create staging dir under {}: {e}",
-            parent.display()
+          return Err(Error::FileIo(FileIoPayload::new(
+            "fuse: cannot create staging dir",
+            FileOp::Create,
+            parent.to_path_buf(),
+            e,
           )));
         }
       }
     }
-    Err(Error::Backend(format!(
-      "fuse: cannot create unique staging dir under {} after {MAX_RETRIES} retries: {}",
-      parent.display(),
-      last_err.map_or_else(
-        || "no underlying error captured".to_string(),
-        |e| e.to_string()
-      )
+    Err(Error::FileIo(FileIoPayload::new(
+      "fuse: exhausted staging-dir create_dir retries (MAX_RETRIES collisions — likely a \
+        hostile staging-dir race or a filesystem refusing mkdir)",
+      FileOp::Create,
+      parent.to_path_buf(),
+      last_err.unwrap_or_else(|| std::io::Error::from(std::io::ErrorKind::AlreadyExists)),
     )))
   }
 
@@ -994,9 +994,11 @@ fn remove_stale_reserved_path(path: &Path, name: &str) -> Result<()> {
     Ok(m) => m,
     Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
     Err(e) => {
-      return Err(Error::Backend(format!(
-        "fuse: cannot stat stale destination path {}: {e}",
-        path.display()
+      return Err(Error::FileIo(FileIoPayload::new(
+        "fuse: cannot stat stale destination path",
+        FileOp::Stat,
+        path.to_path_buf(),
+        e,
       )));
     }
   };
@@ -1016,19 +1018,36 @@ fn remove_stale_reserved_path(path: &Path, name: &str) -> Result<()> {
   // re-stat. is_symlink is checked BEFORE is_dir because symlink_metadata
   // never follows symlinks; a symlink-to-dir has is_symlink() == true
   // and is_dir() == false here.
-  let kind = if ft.is_symlink() {
+  let kind: &'static str = if ft.is_symlink() {
     "symlink"
   } else if ft.is_dir() {
     "directory"
   } else {
     "non-regular file (FIFO, socket, or device)"
   };
-  Err(Error::Backend(format!(
-    "fuse: stale destination path {} (basename {}) is a {}; non-regular reserved path; \
-       remove manually or use a fresh save destination",
-    path.display(),
-    name,
-    kind
+  // `name` is a known static reserved-basename string from the caller
+  // (the closed set of fuse-output basenames); embed it in `LayerKeyed.layer`
+  // alongside the path for machine inspection.
+  Err(Error::LayerKeyed(LayerKeyedPayload::new(
+    format!("{} ({})", path.display(), name),
+    Error::InvariantViolation(InvariantViolationPayload::new(
+      "fuse: stale destination path",
+      // `kind` is one of a closed set of static strings; the typed
+      // diagnostic carries the path + name via LayerKeyed and the
+      // requirement is "regular file or absent" — caller's branch is
+      // path + kind via the carried layer.
+      match kind {
+        "symlink" => {
+          "must not be a symlink (non-regular reserved path; remove manually or use a fresh save destination)"
+        }
+        "directory" => {
+          "must not be a directory (non-regular reserved path; remove manually or use a fresh save destination)"
+        }
+        _ => {
+          "must not be a non-regular file (FIFO, socket, or device) (non-regular reserved path; remove manually or use a fresh save destination)"
+        }
+      },
+    )),
   )))
 }
 
@@ -1168,17 +1187,23 @@ fn insert_base_embedding(weights: &mut Weights, path: &str, fused: BaseEmbedding
 /// caller — they cannot diverge: both delete the same two top-level keys).
 fn strip_quantization_blocks(config_json: &str) -> Result<String> {
   let value: serde_json::Value = serde_json::from_str(config_json)
-    .map_err(|e| Error::Backend(format!("fuse: source config is not valid JSON: {e}")))?;
+    .map_err(|e| Error::Parse(ParsePayload::new("fuse: source config", "JSON", e)))?;
   let serde_json::Value::Object(mut map) = value else {
-    return Err(Error::Backend(
-      "fuse: source config JSON must be an object".into(),
-    ));
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "fuse: source config JSON",
+      "must be an object",
+    )));
   };
   map.remove("quantization");
   map.remove("quantization_config");
   let stripped = serde_json::Value::Object(map);
-  serde_json::to_string(&stripped)
-    .map_err(|e| Error::Backend(format!("fuse: cannot re-serialize stripped config: {e}")))
+  serde_json::to_string(&stripped).map_err(|e| {
+    Error::Parse(ParsePayload::new(
+      "fuse: cannot re-serialize stripped config",
+      "JSON",
+      e,
+    ))
+  })
 }
 
 /// Reject a hub-style URL (`hf://...` / `https://huggingface.co/...` /
@@ -1187,7 +1212,7 @@ fn strip_quantization_blocks(config_json: &str) -> Result<String> {
 /// prefix before interpolating the repo-id into the actionable hint, so
 /// the user sees a copy-pasteable `huggingface-cli download <repo_id>`
 /// rather than `huggingface-cli download hf://<repo_id>` (broken advice).
-fn reject_hub_url(arg_name: &str, path: &Path) -> Result<()> {
+fn reject_hub_url(arg_name: &'static str, path: &Path) -> Result<()> {
   let Some(s) = path.to_str() else {
     return Ok(());
   };
@@ -1195,12 +1220,16 @@ fn reject_hub_url(arg_name: &str, path: &Path) -> Result<()> {
     .strip_prefix("hf://")
     .or_else(|| s.strip_prefix("https://huggingface.co/"))
     .or_else(|| s.strip_prefix("http://huggingface.co/"));
-  if let Some(repo_id) = repo_id {
-    return Err(Error::Backend(format!(
-      "fuse: `{arg_name}` is a HuggingFace Hub URL ({s}); mlxrs is local-only \
-         and does not download from the Hub. Fetch the model directory out of \
-         process (e.g. `huggingface-cli download {repo_id}` or \
-         `hf download {repo_id}`) and pass the resulting local path."
+  if let Some(_repo_id) = repo_id {
+    return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+      s.to_string(),
+      Error::InvariantViolation(InvariantViolationPayload::new(
+        arg_name,
+        "must be a LOCAL path, not a HuggingFace Hub URL (mlxrs is local-only and does \
+          not download from the Hub; fetch the model directory out of process — e.g. \
+          `huggingface-cli download <repo_id>` or `hf download <repo_id>` — and pass the \
+          resulting local path)",
+      )),
     )));
   }
   Ok(())
@@ -1221,16 +1250,21 @@ mod tests {
   fn reject_hub_url_strips_hf_prefix_in_hint() {
     let err =
       reject_hub_url("model_path", Path::new("hf://mlx-community/Qwen3-4B-bf16")).unwrap_err();
-    let Error::Backend(message) = err else {
-      panic!("expected Error::Backend");
+    let Error::LayerKeyed(payload) = err else {
+      panic!("expected Error::LayerKeyed");
     };
-    assert!(
-      message.contains("huggingface-cli download mlx-community/Qwen3-4B-bf16"),
-      "hint should carry the bare repo-id: {message}"
+    assert_eq!(
+      payload.layer(),
+      "hf://mlx-community/Qwen3-4B-bf16",
+      "carrier layer must be the rejected URL",
     );
-    assert!(
-      message.contains("model_path"),
-      "hint names the rejected arg: {message}"
+    let Error::InvariantViolation(inner) = payload.inner() else {
+      panic!("expected inner Error::InvariantViolation");
+    };
+    assert_eq!(
+      inner.context(),
+      "model_path",
+      "inner context must name the rejected arg"
     );
   }
 
@@ -1241,12 +1275,13 @@ mod tests {
       Path::new("https://huggingface.co/owner/repo"),
     )
     .unwrap_err();
-    let Error::Backend(message) = err else {
-      panic!("expected Error::Backend");
+    let Error::LayerKeyed(payload) = err else {
+      panic!("expected Error::LayerKeyed");
     };
-    assert!(
-      message.contains("huggingface-cli download owner/repo"),
-      "hint should carry the bare repo-id (no protocol): {message}"
+    assert_eq!(
+      payload.layer(),
+      "https://huggingface.co/owner/repo",
+      "carrier layer must be the rejected URL"
     );
   }
 
@@ -1298,12 +1333,10 @@ mod tests {
   fn strip_quantization_blocks_rejects_non_object_root() {
     let src = "[1, 2, 3]";
     let err = strip_quantization_blocks(src).unwrap_err();
-    let Error::Backend(message) = err else {
-      panic!("expected Error::Backend");
+    let Error::InvariantViolation(p) = err else {
+      panic!("expected Error::InvariantViolation, got {err:?}");
     };
-    assert!(
-      message.contains("must be an object"),
-      "diagnostic names the constraint: {message}"
-    );
+    assert_eq!(p.context(), "fuse: source config JSON");
+    assert_eq!(p.requirement(), "must be an object");
   }
 }

@@ -58,7 +58,10 @@ use std::{
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{ArithmeticOverflowPayload, Error, OutOfRangePayload, Result},
+  error::{
+    ArithmeticOverflowPayload, Error, InvariantViolationPayload, MissingKeyPayload,
+    OutOfRangePayload, ParsePayload, Result, UnknownEnumValuePayload,
+  },
   io::GgufMetadata,
   lm::load::{Config, Weights},
 };
@@ -193,8 +196,10 @@ impl HfVocab {
     // including added tokens (`mlx_lm/gguf.py:50`).
     let vocab_size_base_usize = hf.get_vocab_size(false);
     let vocab_size_base = u32::try_from(vocab_size_base_usize).map_err(|_| {
-      Error::Backend(format!(
-        "tokenizer base vocab size {vocab_size_base_usize} overflows u32"
+      Error::OutOfRange(OutOfRangePayload::new(
+        "HfVocab: tokenizer base vocab size",
+        "must fit in u32",
+        vocab_size_base_usize.to_string(),
       ))
     })?;
 
@@ -288,17 +293,23 @@ impl HfVocab {
       }
     }
 
-    let vocab_size = vocab_size_base
-      .checked_add(u32::try_from(added_tokens_list.len()).map_err(|_| {
-        Error::Backend(format!(
-          "added token count {} overflows u32",
-          added_tokens_list.len()
-        ))
-      })?)
-      .ok_or(Error::ArithmeticOverflow(ArithmeticOverflowPayload::new(
+    let added_u32 = u32::try_from(added_tokens_list.len()).map_err(|_| {
+      Error::OutOfRange(OutOfRangePayload::new(
+        "HfVocab: added token count",
+        "must fit in u32",
+        added_tokens_list.len().to_string(),
+      ))
+    })?;
+    let vocab_size = vocab_size_base.checked_add(added_u32).ok_or_else(|| {
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
         "vocab_size_base + added",
         "u32",
-      )))?;
+        [
+          ("vocab_size_base", u64::from(vocab_size_base)),
+          ("added", u64::from(added_u32)),
+        ],
+      ))
+    })?;
 
     Ok(HfVocab {
       added_tokens_list,
@@ -388,8 +399,12 @@ impl HfVocab {
       }
       let text = self.reverse_base_vocab[id as usize]
         .as_deref()
-        // TODO(§5): promote to MissingField — `id` is dynamic (u32); needs a TokenId variant or Cow<'static, str> field for `field`.
-        .ok_or_else(|| Error::Backend(format!("HfVocab: base vocab missing token id {id}")))?;
+        .ok_or_else(|| {
+          Error::MissingKey(MissingKeyPayload::new(
+            "HfVocab: base vocab token",
+            id.to_string(),
+          ))
+        })?;
       let score = self.get_token_score(id);
       let toktype = self.get_token_type(id, text);
       out.push((text.to_owned(), score, toktype));
@@ -577,26 +592,39 @@ pub fn permute_weights(weights: &Array, n_head: i32, n_head_kv: Option<i32>) -> 
   let original_shape_i32: Vec<i32> = original_shape
     .iter()
     .map(|&d| {
-      i32::try_from(d)
-        // TODO(§5): promote to ArithmeticOverflow — `d` is dynamic; needs ArithmeticOverflow with runtime context or a DimExceedsI32Max { dim: usize } variant.
-        .map_err(|_| Error::Backend(format!("permute_weights: dim {d} exceeds i32::MAX")))
+      i32::try_from(d).map_err(|_| {
+        Error::OutOfRange(OutOfRangePayload::new(
+          "permute_weights: shape dim",
+          "must fit in i32",
+          d.to_string(),
+        ))
+      })
     })
     .collect::<Result<_>>()?;
   if original_shape.is_empty() {
-    return Err(Error::Backend(
-      "permute_weights: requires at least 1-D weights".into(),
-    ));
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "permute_weights: weights rank",
+      "must be >= 1 (requires at least 1-D weights)",
+    )));
   }
   let d0 = original_shape_i32[0];
   let twice = 2_i32.checked_mul(effective).ok_or_else(|| {
-    Error::Backend(format!(
-      "permute_weights: 2 * n_head ({effective}) overflows i32"
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "permute_weights: 2 * n_head",
+      "i32",
+      [("two", 2u64), ("n_head", effective as u64)],
     ))
   })?;
   if d0 % twice != 0 {
-    return Err(Error::Backend(format!(
-      "permute_weights: leading dim {d0} not divisible by 2 * n_head ({twice})"
-    )));
+    return Err(Error::DivisibilityConstraint(
+      crate::error::DivisibilityConstraintPayload::new(
+        "permute_weights: leading dim must be divisible by 2 * n_head",
+        "leading_dim",
+        d0 as u64,
+        "2*n_head",
+        twice as u64,
+      ),
+    ));
   }
   let split = d0 / twice;
 
@@ -810,11 +838,13 @@ pub fn prepare_metadata(
   let triples = vocab.all_tokens()?;
   // assert len(tokens) == vocab.vocab_size (`mlx_lm/gguf.py:240`).
   if triples.len() as u32 != vocab.vocab_size {
-    return Err(Error::Backend(format!(
-      "prepare_metadata: emitted {} tokens but vocab.vocab_size is {}",
-      triples.len(),
-      vocab.vocab_size,
-    )));
+    return Err(Error::LengthMismatch(
+      crate::error::LengthMismatchPayload::new(
+        "prepare_metadata: emitted tokens vs vocab.vocab_size",
+        vocab.vocab_size as usize,
+        triples.len(),
+      ),
+    ));
   }
   let mut tokens = Vec::with_capacity(triples.len());
   let mut scores = Vec::with_capacity(triples.len());
@@ -999,10 +1029,10 @@ pub fn convert_to_gguf(args: &ConvertToGgufArgs) -> Result<()> {
   //       checkpoint. The reference's `prepare_metadata` hard-codes the
   //       `llama.*` key prefix — see `SUPPORTED_MODEL_TYPES`.
   if !SUPPORTED_MODEL_TYPES.contains(&config.model_type()) {
-    return Err(Error::Backend(format!(
-      "convert_to_gguf: model_type {:?} is not supported by the LM-side GGUF \
-         exporter (supported: {SUPPORTED_MODEL_TYPES:?})",
-      config.model_type(),
+    return Err(Error::UnknownEnumValue(UnknownEnumValuePayload::new(
+      "convert_to_gguf: model_type (LM-side GGUF exporter supported set)",
+      config.model_type().to_string(),
+      SUPPORTED_MODEL_TYPES,
     )));
   }
 
@@ -1013,14 +1043,19 @@ pub fn convert_to_gguf(args: &ConvertToGgufArgs) -> Result<()> {
   //       key — we reject either so an unsupported quantized checkpoint
   //       cannot slip through. The GGUF LM export targets dense F16/F32;
   //       dequantize first via `lm::convert` if needed.
-  let raw_config: serde_json::Value = serde_json::from_str(&raw_json)
-    .map_err(|e| Error::Backend(format!("convert_to_gguf: cannot re-parse config.json: {e}")))?;
+  let raw_config: serde_json::Value = serde_json::from_str(&raw_json).map_err(|e| {
+    Error::Parse(ParsePayload::new(
+      "convert_to_gguf: cannot re-parse config.json",
+      "JSON",
+      e,
+    ))
+  })?;
   if config.quantization.is_some() || raw_config.get("quantization_config").is_some() {
-    return Err(Error::Backend(
-      "convert_to_gguf: quantized checkpoints are not supported (the GGUF LM export \
-                targets dense F16/F32 GGUF); dequantize first via lm::convert"
-        .into(),
-    ));
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "convert_to_gguf: checkpoint quantization",
+      "must be None (the GGUF LM export targets dense F16/F32 GGUF; dequantize first \
+        via lm::convert)",
+    )));
   }
 
   //   2c. Tokenizer build — fail-fast (Codex round-2, Finding 2). The
@@ -1671,11 +1706,16 @@ mod tests {
       gguf_path,
     })
     .unwrap_err();
-    let msg = format!("{err:?}");
+    let Error::UnknownEnumValue(p) = &err else {
+      panic!("expected Error::UnknownEnumValue for unsupported arch, got {err:?}");
+    };
+    assert_eq!(p.value(), "qwen3");
     assert!(
-      msg.contains("qwen3") && msg.contains("not supported"),
-      "expected unsupported-arch error, got: {msg}"
+      p.type_name().contains("model_type"),
+      "type_name should name the rejected field: {}",
+      p.type_name()
     );
+    let msg = format!("{err:?}");
     assert_no_safetensors_load_signature(&msg);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -1710,11 +1750,12 @@ mod tests {
       gguf_path,
     })
     .unwrap_err();
+    let Error::InvariantViolation(p) = &err else {
+      panic!("expected Error::InvariantViolation for quantized checkpoint, got {err:?}");
+    };
+    assert_eq!(p.context(), "convert_to_gguf: checkpoint quantization");
+    assert!(p.requirement().contains("must be None"));
     let msg = format!("{err:?}");
-    assert!(
-      msg.contains("quantized") && msg.contains("not supported"),
-      "expected quantized-reject error, got: {msg}"
-    );
     assert_no_safetensors_load_signature(&msg);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -1755,11 +1796,12 @@ mod tests {
       gguf_path,
     })
     .unwrap_err();
+    let Error::InvariantViolation(p) = &err else {
+      panic!("expected Error::InvariantViolation for quantized checkpoint, got {err:?}");
+    };
+    assert_eq!(p.context(), "convert_to_gguf: checkpoint quantization");
+    assert!(p.requirement().contains("must be None"));
     let msg = format!("{err:?}");
-    assert!(
-      msg.contains("quantized") && msg.contains("not supported"),
-      "expected quantized-reject error, got: {msg}"
-    );
     assert_no_safetensors_load_signature(&msg);
 
     let _ = std::fs::remove_dir_all(&dir);

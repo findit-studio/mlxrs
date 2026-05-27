@@ -67,8 +67,9 @@ use crate::{
   array::Array,
   dtype::Dtype,
   error::{
-    DurabilityWarningPayload, EmptyInputPayload, Error, FileIoPayload, FileOp,
-    InvariantViolationPayload, Result,
+    CapExceededPayload, DurabilityWarningPayload, EmptyInputPayload, Error, FileIoPayload, FileOp,
+    InvariantViolationPayload, KeyCollisionPayload, LayerKeyedPayload, MissingKeyPayload,
+    OutOfRangePayload, ParsePayload, Result,
   },
 };
 
@@ -193,8 +194,13 @@ impl Config {
   /// the codebase's config-parse error convention (twin of
   /// `embeddings::config`'s `serde_json::from_str(..).map_err(Backend)`).
   pub fn from_json(json: &str) -> Result<Config> {
-    serde_json::from_str(json)
-      .map_err(|e| Error::Backend(format!("invalid model config JSON: {e}")))
+    serde_json::from_str(json).map_err(|e| {
+      Error::Parse(ParsePayload::new(
+        "Config::from_json",
+        "model config JSON",
+        e,
+      ))
+    })
   }
 }
 
@@ -281,18 +287,22 @@ pub fn load_weights(dir: &Path) -> Result<Weights> {
     }
     #[cfg(not(feature = "gguf"))]
     {
-      return Err(Error::Backend(format!(
-        "found a GGUF weight file ({}) but the `gguf` feature is disabled; \
-           enable it to load GGUF checkpoints",
-        gguf.display()
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        gguf.display().to_string(),
+        Error::InvariantViolation(InvariantViolationPayload::new(
+          "load_weights: GGUF weight file present but `gguf` feature",
+          "must be enabled to load GGUF checkpoints",
+        )),
       )));
     }
   }
 
-  Err(Error::Backend(format!(
-    "no model weights found in {}: expected `model.safetensors.index.json`, \
-       `model.safetensors`, `weights.safetensors`, or a single `*.gguf`",
-    dir.display()
+  Err(Error::FileIo(FileIoPayload::new(
+    "load_weights: no model weights file (expected `model.safetensors.index.json`, \
+      `model.safetensors`, `weights.safetensors`, or a single `*.gguf`)",
+    FileOp::Open,
+    dir.to_path_buf(),
+    std::io::Error::from(std::io::ErrorKind::NotFound),
   )))
 }
 
@@ -326,18 +336,25 @@ fn load_via_index(dir: &Path) -> Result<Option<Weights>> {
   };
 
   let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-    Error::Backend(format!(
-      "model weight index {} is not valid JSON: {e}",
-      index_path.display()
+    Error::LayerKeyed(LayerKeyedPayload::new(
+      index_path.display().to_string(),
+      Error::Parse(ParsePayload::new(
+        "load_via_index: model weight index",
+        "JSON",
+        e,
+      )),
     ))
   })?;
   let weight_map = parsed
     .get("weight_map")
     .and_then(|v| v.as_object())
     .ok_or_else(|| {
-      Error::Backend(format!(
-        "model weight index {} is missing a `weight_map` object",
-        index_path.display()
+      Error::LayerKeyed(LayerKeyedPayload::new(
+        index_path.display().to_string(),
+        Error::MissingKey(MissingKeyPayload::new(
+          "load_via_index: model weight index must contain a `weight_map` object",
+          "weight_map",
+        )),
       ))
     })?;
 
@@ -350,10 +367,12 @@ fn load_via_index(dir: &Path) -> Result<Option<Weights>> {
   let mut shard_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
   for (weight_key, shard_value) in weight_map {
     let shard = shard_value.as_str().ok_or_else(|| {
-      Error::Backend(format!(
-        "model weight index {}: `weight_map[{}]` is not a string",
-        index_path.display(),
-        weight_key
+      Error::LayerKeyed(LayerKeyedPayload::new(
+        format!("weight_map[{weight_key}]"),
+        Error::InvariantViolation(InvariantViolationPayload::new(
+          "load_via_index: weight_map shard value",
+          "must be a string",
+        )),
       ))
     })?;
     if shard.is_empty()
@@ -362,11 +381,12 @@ fn load_via_index(dir: &Path) -> Result<Option<Weights>> {
       || shard == "."
       || shard == ".."
     {
-      return Err(Error::Backend(format!(
-        "model weight index {}: `weight_map[{}]` -> {shard:?} is not a bare \
-           shard basename (must live in the same directory as the index)",
-        index_path.display(),
-        weight_key,
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        format!("weight_map[{weight_key}] -> {shard:?}"),
+        Error::InvariantViolation(InvariantViolationPayload::new(
+          "load_via_index: weight_map shard name",
+          "must be a bare basename (no path separators or `.`/`..`; lives in the same directory as the index)",
+        )),
       )));
     }
     shard_names.insert(shard);
@@ -376,10 +396,11 @@ fn load_via_index(dir: &Path) -> Result<Option<Weights>> {
   for shard in &shard_names {
     let shard_path = dir.join(shard);
     if !path_is_file(&shard_path)? {
-      return Err(Error::Backend(format!(
-        "model weight index {} lists shard {shard:?} but {} is missing",
-        index_path.display(),
-        shard_path.display(),
+      return Err(Error::FileIo(FileIoPayload::new(
+        "load_via_index: shard listed by the model weight index is missing on disk",
+        FileOp::Stat,
+        shard_path,
+        std::io::Error::from(std::io::ErrorKind::NotFound),
       )));
     }
     let part = crate::io::load_safetensors(&shard_path)?;
@@ -398,9 +419,11 @@ fn path_is_file(path: &Path) -> Result<bool> {
   match std::fs::metadata(path) {
     Ok(m) => Ok(m.is_file()),
     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-    Err(e) => Err(Error::Backend(format!(
-      "cannot stat {}: {e}",
-      path.display()
+    Err(e) => Err(Error::FileIo(FileIoPayload::new(
+      "path_is_file",
+      FileOp::Stat,
+      path.to_path_buf(),
+      e,
     ))),
   }
 }
@@ -446,10 +469,11 @@ fn collect_sorted(dir: &Path, pred: impl Fn(&str) -> bool) -> Result<Vec<std::pa
       Ok(m) if m.is_file() => out.push(entry.path()),
       Ok(_) => continue,
       Err(e) => {
-        return Err(Error::Backend(format!(
-          "cannot stat {} in {}: {e}",
-          name,
-          dir.display()
+        return Err(Error::FileIo(FileIoPayload::new(
+          "collect_sorted: cannot stat entry",
+          FileOp::Stat,
+          entry.path(),
+          e,
         )));
       }
     }
@@ -497,9 +521,11 @@ fn collect_sorted(dir: &Path, pred: impl Fn(&str) -> bool) -> Result<Vec<std::pa
 pub fn load_config(dir: &Path) -> Result<(Config, String)> {
   let path = dir.join("config.json");
   let Some(text) = read_bounded_config_file(&path, "model config")? else {
-    return Err(Error::Backend(format!(
-      "cannot open model config {}: file not found",
-      path.display()
+    return Err(Error::FileIo(FileIoPayload::new(
+      "load_config: model config",
+      FileOp::Open,
+      path,
+      std::io::Error::from(std::io::ErrorKind::NotFound),
     )));
   };
   let mut config = Config::from_json(&text)?;
@@ -541,7 +567,7 @@ pub fn load_config(dir: &Path) -> Result<(Config, String)> {
 /// guarantee on the *resolved* target), and the body is capped at
 /// [`MAX_CONFIG_BYTES`] via `Read::take` so a hostile model directory
 /// cannot OOM us by planting a huge config.
-pub(crate) fn read_bounded_config_file(path: &Path, label: &str) -> Result<Option<String>> {
+pub(crate) fn read_bounded_config_file(path: &Path, label: &'static str) -> Result<Option<String>> {
   read_bounded_text_file(path, label, MAX_CONFIG_BYTES)
 }
 
@@ -550,7 +576,11 @@ pub(crate) fn read_bounded_config_file(path: &Path, label: &str) -> Result<Optio
 /// unix + cap-via-`Read::take`) as [`read_bounded_config_file`]; factored out
 /// so the larger [`MAX_INDEX_BYTES`] cap for `model.safetensors.index.json`
 /// can reuse the *one* hardening path rather than restating it.
-fn read_bounded_text_file(path: &Path, label: &str, max_bytes: u64) -> Result<Option<String>> {
+fn read_bounded_text_file(
+  path: &Path,
+  label: &'static str,
+  max_bytes: u64,
+) -> Result<Option<String>> {
   use std::io::Read;
 
   #[cfg(unix)]
@@ -568,23 +598,29 @@ fn read_bounded_text_file(path: &Path, label: &str, max_bytes: u64) -> Result<Op
     Ok(f) => f,
     Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
     Err(e) => {
-      return Err(Error::Backend(format!(
-        "cannot open {label} {}: {e}",
-        path.display()
+      return Err(Error::FileIo(FileIoPayload::new(
+        label,
+        FileOp::Open,
+        path.to_path_buf(),
+        e,
       )));
     }
   };
 
   let meta = file.metadata().map_err(|e| {
-    Error::Backend(format!(
-      "cannot stat opened {label} {}: {e}",
-      path.display()
+    Error::FileIo(FileIoPayload::new(
+      label,
+      FileOp::Stat,
+      path.to_path_buf(),
+      e,
     ))
   })?;
   if !meta.is_file() {
-    return Err(Error::Backend(format!(
-      "{label} {} is not a regular file; refusing to read",
-      path.display()
+    return Err(Error::FileIo(FileIoPayload::new(
+      label,
+      FileOp::Stat,
+      path.to_path_buf(),
+      std::io::Error::from(std::io::ErrorKind::InvalidInput),
     )));
   }
 
@@ -592,18 +628,27 @@ fn read_bounded_text_file(path: &Path, label: &str, max_bytes: u64) -> Result<Op
   file
     .take(max_bytes + 1)
     .read_to_end(&mut bytes)
-    .map_err(|e| Error::Backend(format!("cannot read {label} {}: {e}", path.display())))?;
+    .map_err(|e| {
+      Error::FileIo(FileIoPayload::new(
+        label,
+        FileOp::Read,
+        path.to_path_buf(),
+        e,
+      ))
+    })?;
   if bytes.len() as u64 > max_bytes {
-    return Err(Error::Backend(format!(
-      "{label} {} exceeds the {max_bytes}-byte cap; refusing to read",
-      path.display(),
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      label,
+      "max_bytes",
+      max_bytes,
+      bytes.len() as u64,
     )));
   }
 
   let text = String::from_utf8(bytes).map_err(|e| {
-    Error::Backend(format!(
-      "{label} {} is not valid UTF-8: {e}",
-      path.display()
+    Error::LayerKeyed(LayerKeyedPayload::new(
+      path.display().to_string(),
+      Error::Parse(ParsePayload::new(label, "UTF-8", e)),
     ))
   })?;
   Ok(Some(text))
@@ -725,7 +770,7 @@ pub fn load_tokenizer_with_eos(
 ) -> Result<crate::tokenizer::Tokenizer> {
   let resolved_eos = eos_token_id.cloned().map(EosTokenId::into_ids);
   crate::tokenizer::Tokenizer::from_path(dir, resolved_eos.as_deref())
-    .map_err(|e| Error::Backend(format!("cannot load tokenizer from {}: {e}", dir.display())))
+    .map_err(|e| Error::LayerKeyed(LayerKeyedPayload::new(dir.display().to_string(), e)))
 }
 
 // ───────────────────────────── save side ─────────────────────────────
@@ -908,15 +953,22 @@ pub fn get_total_parameters(
       let scales_key = format!("{path}.scales");
       if weights.contains_key(&scales_key) {
         let q = quant.quantization_for(path).ok_or_else(|| {
-          Error::Backend(format!(
-            "get_total_parameters: quantized layer {path:?} (has `.scales`) \
-             but no quantization params for it in the config"
+          Error::LayerKeyed(LayerKeyedPayload::new(
+            path.to_string(),
+            Error::InvariantViolation(InvariantViolationPayload::new(
+              "get_total_parameters: quantized layer (has `.scales`)",
+              "must have quantization params resolvable in the config",
+            )),
           ))
         })?;
         if q.bits <= 0 {
-          return Err(Error::Backend(format!(
-            "get_total_parameters: quantized layer {path:?} has non-positive bits {}",
-            q.bits
+          return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+            path.to_string(),
+            Error::OutOfRange(OutOfRangePayload::new(
+              "get_total_parameters: quantized layer bits",
+              "must be > 0",
+              q.bits.to_string(),
+            )),
           )));
         }
         // `weight.size * 32 // bits` (`utils.py:204`), in `u64` so a large
@@ -961,10 +1013,12 @@ pub fn get_total_parameters(
       // there; HashMap iteration may reach `.biases` first, so error
       // here too rather than relying on the `.weight` visit).
       let q = quant.quantization_for(path).ok_or_else(|| {
-        Error::Backend(format!(
-          "get_total_parameters: quantized layer {path:?} (has `.weight` \
-           + `.scales` + `.biases`) but no quantization params for it in \
-           the config"
+        Error::LayerKeyed(LayerKeyedPayload::new(
+          path.to_string(),
+          Error::InvariantViolation(InvariantViolationPayload::new(
+            "get_total_parameters: quantized layer (has `.weight` + `.scales` + `.biases`)",
+            "must have quantization params resolvable in the config",
+          )),
         ))
       })?;
       match q.mode {
@@ -973,11 +1027,14 @@ pub fn get_total_parameters(
         // mxfp4 / mxfp8 / nvfp4 carry no `.biases`; a present one means
         // an invalid checkpoint — flag it, do not silently drop it.
         QuantMode::Mxfp4 | QuantMode::Mxfp8 | QuantMode::Nvfp4 => {
-          return Err(Error::Backend(format!(
-            "get_total_parameters: layer {path:?} is quantized with \
-               scale-only mode `{}`, which has no `.biases` buffer, yet a \
-               `{key}` tensor is present — invalid checkpoint",
-            q.mode.as_str()
+          return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+            key.clone(),
+            Error::KeyCollision(KeyCollisionPayload::new(
+              "get_total_parameters: layer is quantized with scale-only mode \
+                (mxfp4 / mxfp8 / nvfp4) which has no `.biases` buffer; a present \
+                `.biases` tensor signals an invalid checkpoint",
+              key.clone(),
+            )),
           )));
         }
       }
@@ -1443,6 +1500,7 @@ pub fn save_model(
     staged_index = Some((index_tmp.clone(), index_final));
     write_json_pretty(
       &mut index_file,
+      &index_tmp,
       &index,
       "save_model: model.safetensors.index.json",
     )?;
@@ -1542,10 +1600,11 @@ pub fn save_model(
         if let Some((index_tmp, _)) = &staged_index {
           let _ = std::fs::remove_file(index_tmp);
         }
-        return Err(Error::Backend(format!(
-          "save_model: cannot hard_link shard {} -> {}: {e}",
-          tmp.display(),
-          final_path.display()
+        return Err(Error::FileIo(FileIoPayload::new(
+          "save_model: cannot hard_link shard to final path",
+          FileOp::Rename,
+          final_path.clone(),
+          e,
         )));
       }
     }
@@ -1600,17 +1659,20 @@ pub fn save_model(
     && e.kind() != std::io::ErrorKind::NotFound
   {
     let _ = std::fs::remove_file(index_tmp);
-    return Err(Error::Backend(format!(
-      "save_model: cannot stat index final path {} before rename: {e}",
-      index_final.display()
+    return Err(Error::FileIo(FileIoPayload::new(
+      "save_model: cannot stat index final path before rename",
+      FileOp::Stat,
+      index_final.clone(),
+      e,
     )));
   }
   if let Err(e) = std::fs::rename(index_tmp, index_final) {
     let _ = std::fs::remove_file(index_tmp);
-    return Err(Error::Backend(format!(
-      "save_model: cannot rename index {} -> {}: {e}",
-      index_tmp.display(),
-      index_final.display()
+    return Err(Error::FileIo(FileIoPayload::new(
+      "save_model: cannot rename index",
+      FileOp::Rename,
+      index_final.clone(),
+      e,
     )));
   }
 
@@ -1676,9 +1738,11 @@ fn open_excl_temp_shard(final_path: &Path) -> Result<(std::fs::File, PathBuf)> {
   let file_name = final_path
     .file_name()
     .ok_or_else(|| {
-      Error::Backend(format!(
-        "save: destination {} has no file_name component",
-        final_path.display()
+      Error::FileIo(FileIoPayload::new(
+        "save: destination has no file_name component",
+        FileOp::Stat,
+        final_path.to_path_buf(),
+        std::io::Error::from(std::io::ErrorKind::InvalidInput),
       ))
     })?
     .to_string_lossy()
@@ -1710,18 +1774,22 @@ fn open_excl_temp_shard(final_path: &Path) -> Result<(std::fs::File, PathBuf)> {
         continue;
       }
       Err(e) => {
-        return Err(Error::Backend(format!(
-          "save: create_new tempfile {} failed: {e}",
-          candidate.display()
+        return Err(Error::FileIo(FileIoPayload::new(
+          "save: create_new tempfile",
+          FileOp::Create,
+          candidate,
+          e,
         )));
       }
     }
   }
-  Err(Error::Backend(format!(
-    "save: exhausted {MAX_RETRIES} tempfile retries (last error: {})",
-    last_err
-      .map(|e| e.to_string())
-      .unwrap_or_else(|| "<none>".into())
+  Err(Error::FileIo(FileIoPayload::new(
+    "save: exhausted tempfile retries (the per-process gen_id collided with foreign \
+      tempfile names MAX_RETRIES times — usually a hostile staging-dir race or a \
+      filesystem refusing create_new)",
+    FileOp::Create,
+    parent.to_path_buf(),
+    last_err.unwrap_or_else(|| std::io::Error::from(std::io::ErrorKind::AlreadyExists)),
   )))
 }
 
@@ -2250,7 +2318,7 @@ impl Drop for StagedConfig {
 /// destroy a still-valid checkpoint).
 fn stage_config(config: &str, config_path: &Path) -> Result<StagedConfig> {
   let value: serde_json::Value = serde_json::from_str(config)
-    .map_err(|e| Error::Backend(format!("save_config: config is not valid JSON: {e}")))?;
+    .map_err(|e| Error::Parse(ParsePayload::new("save_config: config", "JSON", e)))?;
   let serde_json::Value::Object(mut map) = value else {
     return Err(Error::InvariantViolation(InvariantViolationPayload::new(
       "save_config: config JSON",
@@ -2272,8 +2340,10 @@ fn stage_config(config: &str, config_path: &Path) -> Result<StagedConfig> {
   // `BTreeMap` round-trip is the explicit sort.
   let sorted: BTreeMap<String, serde_json::Value> = map.into_iter().collect();
   let sorted_value = serde_json::to_value(sorted).map_err(|e| {
-    Error::Backend(format!(
-      "save_config: cannot re-serialize sorted config: {e}"
+    Error::Parse(ParsePayload::new(
+      "save_config: cannot re-serialize sorted config",
+      "JSON",
+      e,
     ))
   })?;
 
@@ -2282,7 +2352,12 @@ fn stage_config(config: &str, config_path: &Path) -> Result<StagedConfig> {
     tmp_path,
     cleanup_on_drop: true,
   };
-  write_json_pretty(&mut tmp_file, &sorted_value, "save_config: config.json")?;
+  write_json_pretty(
+    &mut tmp_file,
+    &staged.tmp_path,
+    &sorted_value,
+    "save_config: config.json",
+  )?;
   fsync_open_file_for_path(&tmp_file, &staged.tmp_path)?;
   drop(tmp_file);
   Ok(staged)
@@ -2308,10 +2383,11 @@ fn stage_config(config: &str, config_path: &Path) -> Result<StagedConfig> {
 fn commit_staged_config(mut staged: StagedConfig, config_path: &Path) -> Result<CommitOutcome> {
   if let Err(e) = std::fs::rename(&staged.tmp_path, config_path) {
     // Leave `cleanup_on_drop = true` so `Drop` removes the tempfile.
-    return Err(Error::Backend(format!(
-      "save_config: cannot rename {} -> {}: {e}",
-      staged.tmp_path.display(),
-      config_path.display()
+    return Err(Error::FileIo(FileIoPayload::new(
+      "save_config: cannot rename staged config tempfile over destination",
+      FileOp::Rename,
+      config_path.to_path_buf(),
+      e,
     )));
   }
   // The rename consumed the tempfile (it IS now `config_path`); the
@@ -2504,18 +2580,24 @@ pub fn save(
 /// inode and closes that window.
 fn write_json_pretty(
   file: &mut std::fs::File,
+  path: &Path,
   value: &serde_json::Value,
-  label: &str,
+  label: &'static str,
 ) -> Result<()> {
   use std::io::Write;
   let mut buf = Vec::new();
   let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
   let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
   serde::Serialize::serialize(value, &mut ser)
-    .map_err(|e| Error::Backend(format!("{label}: cannot serialize JSON: {e}")))?;
-  file
-    .write_all(&buf)
-    .map_err(|e| Error::Backend(format!("{label}: cannot write JSON body: {e}")))?;
+    .map_err(|e| Error::Parse(ParsePayload::new(label, "JSON serialize", e)))?;
+  file.write_all(&buf).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      label,
+      FileOp::Write,
+      path.to_path_buf(),
+      e,
+    ))
+  })?;
   Ok(())
 }
 
@@ -2526,10 +2608,20 @@ fn write_json_pretty(
 /// the production save path — that path opens its files via
 /// [`open_excl_temp_shard`] and keeps the fd through to publish.
 #[cfg(test)]
-fn write_json_pretty_to_path(path: &Path, value: &serde_json::Value, label: &str) -> Result<()> {
-  let mut f = std::fs::File::create(path)
-    .map_err(|e| Error::Backend(format!("{label}: cannot create {}: {e}", path.display())))?;
-  write_json_pretty(&mut f, value, label)
+fn write_json_pretty_to_path(
+  path: &Path,
+  value: &serde_json::Value,
+  label: &'static str,
+) -> Result<()> {
+  let mut f = std::fs::File::create(path).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      label,
+      FileOp::Create,
+      path.to_path_buf(),
+      e,
+    ))
+  })?;
+  write_json_pretty(&mut f, path, value, label)
 }
 
 #[cfg(test)]
@@ -2767,9 +2859,20 @@ mod save_tests {
       "model.q.scales".to_string(),
       Array::from_slice::<f32>(&[0.0, 0.0], &(2usize,)).unwrap(),
     );
-    // No global default, no per-layer override → unresolvable.
+    // No global default, no per-layer override → unresolvable. The error is a
+    // typed [`Error::LayerKeyed`] wrapping an [`Error::InvariantViolation`]
+    // naming the offending layer.
     let err = get_total_parameters(&w, &PerLayerQuantization::default());
-    assert!(matches!(err, Err(Error::Backend(_))));
+    let Err(Error::LayerKeyed(p)) = err else {
+      panic!("expected Error::LayerKeyed, got {err:?}");
+    };
+    assert_eq!(p.layer(), "model.q");
+    assert!(
+      matches!(p.inner(), Error::InvariantViolation(iv)
+        if iv.context().contains("quantized layer") && iv.requirement().contains("resolvable")),
+      "expected inner InvariantViolation about resolvable quantization params, got {:?}",
+      p.inner()
+    );
   }
 
   // ─────────────────────── compute_bits_per_weight ───────────────────────
@@ -2826,7 +2929,11 @@ mod save_tests {
   fn compute_bits_per_weight_zero_params_errors() {
     let w: Weights = HashMap::new();
     let err = compute_bits_per_weight(&w, &PerLayerQuantization::default());
-    assert!(matches!(err, Err(Error::Backend(_))));
+    assert!(
+      matches!(&err, Err(Error::EmptyInput(p))
+        if p.context() == "compute_bits_per_weight: model parameters"),
+      "expected Error::EmptyInput naming `model parameters`, got {err:?}"
+    );
   }
 
   // ─────────────────── does_model_support_input_embeddings ───────────────
@@ -3170,10 +3277,22 @@ mod save_tests {
   #[test]
   fn save_config_rejects_non_object_json() {
     let dir = fresh_dir("save-config-bad");
+    // A valid-but-non-object JSON (array) → `InvariantViolation` naming the
+    // "must be an object" requirement; never reaches the JSON parser as an
+    // error.
     let err = save_config("[1, 2, 3]", &dir.join("config.json"));
-    assert!(matches!(err, Err(Error::Backend(_))));
+    assert!(
+      matches!(&err, Err(Error::InvariantViolation(iv))
+        if iv.context() == "save_config: config JSON" && iv.requirement() == "must be an object"),
+      "expected Error::InvariantViolation for non-object JSON, got {err:?}"
+    );
+    // A non-JSON body → `Parse` from the serde_json failure.
     let err2 = save_config("not json at all", &dir.join("config.json"));
-    assert!(matches!(err2, Err(Error::Backend(_))));
+    assert!(
+      matches!(&err2, Err(Error::Parse(p))
+        if p.context() == "save_config: config" && p.input_kind() == "JSON"),
+      "expected Error::Parse for non-JSON body, got {err2:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
   }
 
@@ -3867,12 +3986,17 @@ mod save_tests {
     .unwrap();
 
     let r = load_weights(&dir);
-    let Err(Error::Backend(message)) = r else {
-      panic!("a missing indexed shard must be an Error::Backend, got {r:?}");
+    // The missing shard surfaces a typed `Error::FileIo(NotFound)` naming the
+    // missing path with op = `Stat`.
+    let Err(Error::FileIo(p)) = r else {
+      panic!("a missing indexed shard must be an Error::FileIo, got {r:?}");
     };
-    assert!(
-      message.contains("model-00002-of-00002.safetensors"),
-      "error must name the missing shard, got: {message}"
+    assert_eq!(p.op(), FileOp::Stat);
+    assert_eq!(p.inner().kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(
+      p.path(),
+      dir.join("model-00002-of-00002.safetensors").as_path(),
+      "path must name the missing shard"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -3897,12 +4021,23 @@ mod save_tests {
     .unwrap();
 
     let r = load_weights(&dir);
-    let Err(Error::Backend(message)) = r else {
-      panic!("a path-traversal shard name must be an Error::Backend, got {r:?}");
+    // The path-traversal shard name surfaces a typed `Error::LayerKeyed`
+    // naming the offending `weight_map[<key>] -> <value>` and an inner
+    // `Error::InvariantViolation` calling out the basename rule.
+    let Err(Error::LayerKeyed(p)) = r else {
+      panic!("a path-traversal shard name must be an Error::LayerKeyed, got {r:?}");
     };
     assert!(
-      message.contains("bare shard basename"),
-      "error must call out the basename rule, got: {message}"
+      p.layer().contains("weight_map[evil.weight]") && p.layer().contains("../../etc/passwd"),
+      "layer should name the offending mapping, got `{}`",
+      p.layer()
+    );
+    assert!(
+      matches!(p.inner(), Error::InvariantViolation(iv)
+        if iv.context().contains("weight_map shard name")
+          && iv.requirement().contains("bare basename")),
+      "expected inner InvariantViolation about bare basename, got {:?}",
+      p.inner()
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -3920,27 +4055,48 @@ mod save_tests {
     )
     .unwrap();
     let r = load_weights(&dir);
-    assert!(matches!(r, Err(Error::Backend(_))));
+    // The malformed index is wrapped in `Error::LayerKeyed` naming the index
+    // path and an inner `Error::Parse` from the JSON parser.
+    let Err(Error::LayerKeyed(p)) = r else {
+      panic!("expected Error::LayerKeyed for a malformed index, got {r:?}");
+    };
+    assert!(
+      p.layer().contains("model.safetensors.index.json"),
+      "layer should name the index path, got `{}`",
+      p.layer()
+    );
+    assert!(
+      matches!(p.inner(), Error::Parse(pp)
+        if pp.context() == "load_via_index: model weight index" && pp.input_kind() == "JSON"),
+      "expected inner Error::Parse for malformed JSON, got {:?}",
+      p.inner()
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
   }
 
   /// An empty model directory (no index, no safetensors, no GGUF) is the
-  /// final fall-through to an error. Lists every layout the resolver
-  /// considered in the message.
+  /// final fall-through to an error. The `FileIo` payload's static `context()`
+  /// label lists every layout the resolver considered.
   #[test]
   fn load_weights_empty_dir_errors_listing_layouts() {
     let dir = fresh_dir("load-empty");
     let r = load_weights(&dir);
-    let Err(Error::Backend(message)) = r else {
-      panic!("an empty dir must be an Error::Backend, got {r:?}");
+    let Err(Error::FileIo(p)) = r else {
+      panic!("an empty dir must be an Error::FileIo, got {r:?}");
     };
-    // Lists each resolver tier.
+    // The path is the model directory; the `op` is `Open` (the final
+    // open-attempt that failed); the inner io::Error is `NotFound`.
+    assert_eq!(p.path(), dir.as_path());
+    assert_eq!(p.op(), FileOp::Open);
+    assert_eq!(p.inner().kind(), std::io::ErrorKind::NotFound);
+    // The static `context()` lists each resolver tier.
+    let ctx = p.context();
     assert!(
-      message.contains("model.safetensors.index.json")
-        && message.contains("model.safetensors")
-        && message.contains("weights.safetensors"),
-      "the error must list each resolver tier, got: {message}"
+      ctx.contains("model.safetensors.index.json")
+        && ctx.contains("model.safetensors")
+        && ctx.contains("weights.safetensors"),
+      "the context must list each resolver tier, got: {ctx}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -4381,18 +4537,32 @@ mod save_tests {
         mode,
       });
       let err = get_total_parameters(&w, &quant);
-      assert!(
-        matches!(err, Err(Error::Backend(_))),
-        "a `.biases` under scale-only `{}` must be an Error::Backend, got {err:?}",
-        mode.as_str()
-      );
-      // The error names the offending layer and mode.
-      if let Err(Error::Backend(message)) = err {
-        assert!(
-          message.contains("q_proj") && message.contains(mode.as_str()),
-          "error should name the layer + the scale-only mode, got: {message}"
+      // The error is a typed `Error::LayerKeyed` wrapping a typed
+      // `Error::KeyCollision` naming the offending `.biases` key and listing
+      // the scale-only mode set in the static context.
+      let Err(Error::LayerKeyed(p)) = &err else {
+        panic!(
+          "a `.biases` under scale-only `{}` must be an Error::LayerKeyed, got {err:?}",
+          mode.as_str()
         );
-      }
+      };
+      assert!(
+        p.layer().contains("q_proj") && p.layer().ends_with(".biases"),
+        "layer should name the offending `.biases` key, got `{}`",
+        p.layer()
+      );
+      let Error::KeyCollision(kp) = p.inner() else {
+        panic!("expected inner Error::KeyCollision, got {:?}", p.inner());
+      };
+      // The static context names the scale-only mode set explicitly.
+      assert!(
+        kp.context().contains("mxfp4")
+          && kp.context().contains("mxfp8")
+          && kp.context().contains("nvfp4"),
+        "context should list the scale-only modes, got: {}",
+        kp.context()
+      );
+      assert_eq!(kp.key(), p.layer());
     }
   }
 
@@ -4954,7 +5124,13 @@ mod save_tests {
       "metadata": { "total_size": 0, "total_parameters": 0 },
       "weight_map": {},
     });
-    write_json_pretty(&mut staging_file, &value, "LOAD-1: json fd-bound").unwrap();
+    write_json_pretty(
+      &mut staging_file,
+      &staging_path,
+      &value,
+      "LOAD-1: json fd-bound",
+    )
+    .unwrap();
     drop(staging_file);
     let decoy_after = std::fs::read(&decoy).unwrap();
     assert_eq!(
