@@ -17,7 +17,10 @@
 
 use crate::{
   array::Array,
-  error::{Error, Result, try_with_capacity},
+  error::{
+    ArithmeticOverflowPayload, EmptyInputPayload, Error, InvariantViolationPayload,
+    LengthMismatchPayload, OutOfRangePayload, RankMismatchPayload, Result, try_with_capacity,
+  },
   ops,
   vlm::image::ImageProcessorConfig,
 };
@@ -204,15 +207,28 @@ fn default_merge_embeddings(
   // data; surface as a recoverable `Err(ShapeMismatch)` per the rest of
   // the crate's error discipline.
   let text_shape = text_embeds.shape();
-  if text_shape.len() != 3 || text_shape[0] != 1 {
-    return Err(Error::ShapeMismatch(format!(
-      "merge_embeddings: text_embeds must be rank-3 [1, T, D], got {text_shape:?}"
+  let text_rank = text_shape.len() as u32;
+  if text_shape.len() != 3 {
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "merge_embeddings: text_embeds must be rank-3 [1, T, D]",
+      text_rank,
+      text_shape,
+    )));
+  }
+  if text_shape[0] != 1 {
+    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+      "merge_embeddings: text_embeds batch dim must be 1 (single-batch prompt)",
+      1,
+      text_shape[0],
     )));
   }
   let image_shape = image_embeds.shape();
+  let image_rank = image_shape.len() as u32;
   if image_shape.len() != 2 {
-    return Err(Error::ShapeMismatch(format!(
-      "merge_embeddings: image_embeds must be rank-2 [N, D], got {image_shape:?}"
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "merge_embeddings: image_embeds must be rank-2 [N, D]",
+      image_rank,
+      image_shape,
     )));
   }
   let t = text_shape[1];
@@ -220,8 +236,10 @@ fn default_merge_embeddings(
   let n_total = image_shape[0];
   let d_image = image_shape[1];
   if d_text != d_image {
-    return Err(Error::ShapeMismatch(format!(
-      "merge_embeddings: hidden-dim mismatch (text_embeds D={d_text}, image_embeds D={d_image})"
+    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+      "merge_embeddings: hidden-dim D (text_embeds vs image_embeds)",
+      d_text,
+      d_image,
     )));
   }
 
@@ -231,9 +249,9 @@ fn default_merge_embeddings(
   // forward through the embed path (which would still work but masks the
   // upstream defect of building an `image_embeds` with zero rows).
   if image_spans.is_empty() {
-    return Err(Error::ShapeMismatch(
-      "merge_embeddings: image_spans is empty; use forward(tokens) for the text-only path".into(),
-    ));
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "merge_embeddings: image_spans (use forward(tokens) for the text-only path)",
+    )));
   }
 
   // Validate spans (start<end, in-bounds, non-overlapping, monotone) and
@@ -247,38 +265,47 @@ fn default_merge_embeddings(
   // re-sorting and assigning out of order.
   let mut total_width: usize = 0;
   let mut prev_end: usize = 0;
-  for (idx, &(s, e)) in image_spans.iter().enumerate() {
+  for &(s, e) in image_spans.iter() {
     if s >= e {
-      return Err(Error::ShapeMismatch(format!(
-        "merge_embeddings: image span #{idx} ({s}, {e}) is empty (start>=end)"
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "merge_embeddings: image span (start, end)",
+        "start must be strictly less than end (empty spans not allowed)",
       )));
     }
     if e > t {
-      return Err(Error::ShapeMismatch(format!(
-        "merge_embeddings: image span #{idx} ({s}, {e}) end exceeds text seq_len T={t}"
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "merge_embeddings: image span end vs text seq_len T",
+        "must be <= T",
+        format!("end={e}, T={t}"),
       )));
     }
     if s < prev_end {
-      return Err(Error::ShapeMismatch(format!(
-        "merge_embeddings: image span #{idx} ({s}, {e}) overlaps or precedes previous \
-           span ending at {prev_end} (spans must be monotone non-overlapping; \
-           assemble_multimodal_prompt emits them in order)"
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "merge_embeddings: image span order (s vs prev_end)",
+        "spans must be monotone non-overlapping (assemble_multimodal_prompt emits them in order)",
       )));
     }
     // Checked add — a hostile span ((0, usize::MAX), …) is impossible
     // for any real prompt but we keep the discipline consistent with the
     // splice in `prompt.rs`.
     total_width = total_width.checked_add(e - s).ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "merge_embeddings: cumulative span width overflows usize at span #{idx} ({s}, {e})"
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "merge_embeddings: cumulative span width (total_width + (e - s))",
+        "usize",
+        [
+          ("total_width", total_width as u64),
+          ("span_width", (e - s) as u64),
+        ],
       ))
     })?;
     prev_end = e;
   }
   if total_width != n_total {
-    return Err(Error::ShapeMismatch(format!(
-      "merge_embeddings: sum of span widths ({total_width}) must match image_embeds row \
-         count N ({n_total})"
+    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+      "merge_embeddings: sum of caller-supplied placeholder span widths vs image_embeds row \
+         count N (expected = total_width, actual = n_total)",
+      total_width,
+      n_total,
     )));
   }
 
@@ -301,10 +328,10 @@ fn default_merge_embeddings(
     .checked_mul(2)
     .and_then(|n| n.checked_add(1))
     .ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "merge_embeddings: piece-count capacity (image_spans.len() * 2 + 1) overflows usize \
-         (image_spans.len()={})",
-        image_spans.len()
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "merge_embeddings: piece-count capacity (image_spans.len() * 2 + 1)",
+        "usize",
+        [("image_spans.len()", image_spans.len() as u64)],
       ))
     })?;
   let mut pieces: Vec<Array> = try_with_capacity(pieces_cap)?;

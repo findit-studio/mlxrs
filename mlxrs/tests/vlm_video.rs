@@ -14,11 +14,14 @@
 
 #![cfg(feature = "vlm")]
 
-use mlxrs::vlm::{
-  image::{ColorOrder, ImageProcessorConfig, Layout, ResizeFilter},
-  video::{
-    FrameSampling, MAX_PIXELS, MIN_PIXELS, ceil_by_factor, floor_by_factor, process_frames,
-    round_by_factor, sample_frame_indices, smart_nframes, smart_resize,
+use mlxrs::{
+  error::Error,
+  vlm::{
+    image::{ColorOrder, ImageProcessorConfig, Layout, ResizeFilter},
+    video::{
+      FrameSampling, MAX_PIXELS, MIN_PIXELS, ceil_by_factor, floor_by_factor, process_frames,
+      round_by_factor, sample_frame_indices, smart_nframes, smart_resize,
+    },
   },
 };
 
@@ -160,6 +163,60 @@ fn smart_resize_min_cell_guard_exact_i128_no_f64_bypass_no_overflow() {
     f2,
     "area equals the exact factor^2 budget"
   );
+}
+
+#[test]
+fn smart_resize_min_cell_guard_typed_payload_preserves_i128_value() {
+  // Regression for Codex R2 finding (medium): the previous migration cast
+  // `min_cell` (i128, up to ~2^126) to `u64` for `CapExceededPayload`'s
+  // `observed` field, which truncates silently on any positive `i64` factor
+  // whose square overflows `u64`. Concretely, `factor = 1 << 32` yields
+  // `min_cell = 2^64`, and `min_cell as u64` collapses to 0 — typed
+  // telemetry then reports `observed = 0 <= cap`, despite the function
+  // correctly rejecting. The fix: route through `Error::OutOfRange`, whose
+  // `OutOfRangePayload::value()` is a `SmolStr` that preserves the exact
+  // i128 magnitude via `format!("{min_cell}", …)`.
+  //
+  // factor = 1 << 32, height = width = 1, max_pixels = i64::MAX, min_pixels = 1.
+  //   min_cell = (1 << 32)^2 = 2^64 (≈ 1.844e19)
+  //   max_pixels = i64::MAX = 2^63 - 1 (≈ 9.223e18)
+  //   2^64 > 2^63 - 1 -> guard fires.
+  // The 0-cast bug would have produced `observed = 0`, which is NOT > the
+  // i64::MAX cap (cast to u64 = 9.223e18), so callers inspecting
+  // `observed > cap` to confirm the violation would see corrupted data.
+  let factor: i64 = 1_i64 << 32;
+  let huge_min_cell = (factor as i128) * (factor as i128);
+  assert_eq!(
+    huge_min_cell,
+    1_i128 << 64,
+    "sanity: factor^2 = 2^64 (the value that truncates to 0 as u64)"
+  );
+  let err = smart_resize(1, 1, factor, 1, i64::MAX)
+    .expect_err("factor=1<<32 with max_pixels=i64::MAX must Err (2^64 > 2^63-1)");
+  match err {
+    Error::OutOfRange(p) => {
+      // The SmolStr value must contain the EXACT i128 magnitude (a
+      // 20-digit decimal). If the migration regresses to `min_cell as u64`,
+      // the formatted value would be `0` and this contains() would fail.
+      let expected_min_cell = format!("{}", 1_u128 << 64);
+      assert!(
+        p.value().contains(&expected_min_cell),
+        "OutOfRange.value() must preserve the exact i128 min_cell ({expected_min_cell}); \
+         got context={:?} requirement={:?} value={:?}",
+        p.context(),
+        p.requirement(),
+        p.value(),
+      );
+      // And it must NOT contain a bare `min_cell=0` substring — the
+      // truncation-bug signature.
+      assert!(
+        !p.value().contains("min_cell=0,"),
+        "OutOfRange.value() must not show truncated min_cell=0; got {:?}",
+        p.value(),
+      );
+    }
+    other => panic!("expected Error::OutOfRange with preserved i128 min_cell, got {other:?}"),
+  }
 }
 
 #[test]
@@ -752,38 +809,65 @@ fn process_frames_empty_is_err() {
 fn process_frames_rejects_chw_layout() {
   // A planar per-frame Layout::Chw would yield `[T, 3, H, W]`, breaking
   // the documented `[T, H, W, 3]` stack contract. `process_frames` must
-  // reject it with a clear, recoverable Err pointing at the layout.
+  // reject it with a clear, recoverable Err pointing at the layout — we
+  // destructure the typed `UnknownEnumValue` payload via its accessors
+  // (`value()`/`supported()`/`type_name()`) rather than string-matching the
+  // `Display` output, so the assertion pins the on-the-wire contract (the
+  // lowercase enum tag from `Layout::as_str`) instead of the prose.
   let frames = [solid_frame(2, 2, [10, 20, 30])];
   let cfg = passthrough_cfg((2, 2)).with_layout(Layout::Chw);
   let err = process_frames(&frames, &cfg).expect_err("Chw must Err");
-  let msg = format!("{err}");
-  assert!(
-    msg.contains("Layout::Hwc"),
-    "error message must name the supported layout; got: {msg}"
-  );
-  assert!(
-    msg.contains("Chw"),
-    "error message must echo the offending layout; got: {msg}"
-  );
+  match err {
+    mlxrs::Error::UnknownEnumValue(p) => {
+      assert_eq!(
+        p.value(),
+        "chw",
+        "payload value must echo the offending layout tag"
+      );
+      assert_eq!(
+        p.supported(),
+        &["hwc"],
+        "payload supported list must name the only supported layout"
+      );
+      assert!(
+        p.type_name().contains("process_frames"),
+        "payload type_name must locate the rejection at process_frames; got: {}",
+        p.type_name()
+      );
+    }
+    other => panic!("expected UnknownEnumValue, got {other:?}"),
+  }
 }
 
 #[test]
 fn process_frames_rejects_bchw_layout() {
   // A batched-planar per-frame Layout::Bchw would yield a rank-5
   // `[T, 1, 3, H, W]` that matches no normal video layout. `process_frames`
-  // must reject it with the same recoverable Err.
+  // must reject it with the same recoverable Err. Destructure the typed
+  // `UnknownEnumValue` payload (see the Chw test for the rationale).
   let frames = [solid_frame(2, 2, [10, 20, 30])];
   let cfg = passthrough_cfg((2, 2)).with_layout(Layout::Bchw);
   let err = process_frames(&frames, &cfg).expect_err("Bchw must Err");
-  let msg = format!("{err}");
-  assert!(
-    msg.contains("Layout::Hwc"),
-    "error message must name the supported layout; got: {msg}"
-  );
-  assert!(
-    msg.contains("Bchw"),
-    "error message must echo the offending layout; got: {msg}"
-  );
+  match err {
+    mlxrs::Error::UnknownEnumValue(p) => {
+      assert_eq!(
+        p.value(),
+        "bchw",
+        "payload value must echo the offending layout tag"
+      );
+      assert_eq!(
+        p.supported(),
+        &["hwc"],
+        "payload supported list must name the only supported layout"
+      );
+      assert!(
+        p.type_name().contains("process_frames"),
+        "payload type_name must locate the rejection at process_frames; got: {}",
+        p.type_name()
+      );
+    }
+    other => panic!("expected UnknownEnumValue, got {other:?}"),
+  }
 }
 
 #[test]

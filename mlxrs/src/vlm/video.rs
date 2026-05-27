@@ -62,7 +62,10 @@
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{
+    EmptyInputPayload, Error, InvariantViolationPayload, NonFiniteScalarPayload, OutOfRangePayload,
+    Result, UnknownEnumValuePayload,
+  },
   ops::shape::stack,
   vlm::image::{ImageProcessorConfig, Layout, preprocess},
 };
@@ -127,30 +130,69 @@ const F64_TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
 /// quotients and any quotient outside the exactly-representable `i64` range
 /// before the cast, then `checked_mul` (== an i128 product bounds-checked to
 /// fit `i64`) the validated integer by `factor`.
-fn factor_product(quotient: f64, factor: i64, op: &str) -> Result<i64> {
-  if !quotient.is_finite() || quotient >= F64_TWO_POW_63 || quotient < i64::MIN as f64 {
-    return Err(Error::ShapeMismatch(format!(
-      "{op}_by_factor: quotient ({quotient}) out of i64 range before scaling by factor ({factor})"
+fn factor_product(quotient: f64, factor: i64, op: &'static str) -> Result<i64> {
+  if !quotient.is_finite() {
+    return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+      op, quotient,
     )));
   }
-  (quotient as i64).checked_mul(factor).ok_or_else(|| {
-    Error::ShapeMismatch(format!(
-      "{op}_by_factor: quotient ({quotient}) * factor ({factor}) overflows i64"
+  if quotient >= F64_TWO_POW_63 || quotient < i64::MIN as f64 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      op,
+      "must be in i64 range before scaling by factor",
+      format!("quotient={quotient}, factor={factor}"),
+    )));
+  }
+  let q_i64 = quotient as i64;
+  q_i64.checked_mul(factor).ok_or_else(|| {
+    // OutOfRange (not ArithmeticOverflow) — the latter casts both operands to
+    // `u64`, which misrepresents signed values: a legitimately reachable
+    // negative `q_i64` (the user passed a negative `number`) and / or a
+    // negative `factor` would surface as huge unsigned numbers. SmolStr-text
+    // preserves the signed values exactly. The public `*_by_factor` entries
+    // additionally reject `factor <= 0` up front (see `check_positive_factor`),
+    // so only `factor >= 1` reaches here; the residual overflow path is
+    // `q_i64 < 0` (a negative `number` input scaled past `i64::MIN`).
+    Error::OutOfRange(OutOfRangePayload::new(
+      op,
+      "i64 multiplication overflowed",
+      format!("quotient={q_i64}, factor={factor}"),
     ))
   })
+}
+
+/// Reject a non-positive `factor` BEFORE the f64 division inside the public
+/// `*_by_factor` family. A `factor <= 0` is both a numerical-correctness bug
+/// (floor / ceil / round semantics require a positive factor) and an overflow
+/// trap: `floor_by_factor(1, i64::MIN)` would otherwise reach
+/// `factor_product`'s `q_i64 * factor` with `q_i64 = -1`, `factor = i64::MIN`,
+/// and a downstream payload would lose the sign of `factor` when cast to
+/// `u64`. Surfacing the signed value here via `SmolStr` keeps the error
+/// faithful.
+fn check_positive_factor(factor: i64, op: &'static str) -> Result<()> {
+  if factor <= 0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      op,
+      "factor must be > 0",
+      format!("factor={factor}"),
+    )));
+  }
+  Ok(())
 }
 
 /// Guard an integer-input `*_by_factor` call before its lossy f64 division:
 /// reject a `number` whose magnitude exceeds [`F64_EXACT_INT_MAX`] (the f64
 /// round-trip would corrupt it) — see that constant. Normal frame-sized
 /// inputs pass untouched.
-fn check_factor_input(number: i64, op: &str) -> Result<()> {
+fn check_factor_input(number: i64, op: &'static str) -> Result<()> {
   // `unsigned_abs` (not `i64::abs`) — `i64::MIN.abs()` itself overflows/panics,
   // and a hostile caller can pass `i64::MIN` (e.g. `FrameSampling::Fixed`).
   if number.unsigned_abs() > F64_EXACT_INT_MAX as u64 {
-    return Err(Error::ShapeMismatch(format!(
-      "{op}_by_factor: number ({number}) exceeds the f64 exact-integer range \
-         (±2^53); the float division would lose precision and corrupt the result"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      op,
+      "must be within the f64 exact-integer range (|number| <= 2^53; the float division would \
+         lose precision and corrupt the result)",
+      format!("{number}"),
     )));
   }
   Ok(())
@@ -202,12 +244,18 @@ fn check_beta_domain_down(height: i64, width: i64, max_pixels: i64) -> Result<()
   // `height * width` can exceed `i64` (and is inexact in f64); i128 holds it
   // overflow-free and the comparison is exact.
   let area = (height as i128) * (width as i128);
-  if area > F64_EXACT_INT_MAX as i128 || max_pixels > F64_EXACT_INT_MAX {
-    return Err(Error::ShapeMismatch(format!(
-      "smart_resize (scale-down): height*width (= {area}) or max_pixels (= {max_pixels}) \
-         exceeds the exact-f64 range 2^53 ({F64_EXACT_INT_MAX}); the beta (sqrt) scale-down \
-         ratio (height*width / max_pixels) is not exactly computable there and is rejected \
-         rather than rounded imprecisely"
+  if area > F64_EXACT_INT_MAX as i128 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "smart_resize (scale-down): height*width area (beta sqrt ratio operand)",
+      "must be <= 2^53 (F64_EXACT_INT_MAX) so the f64 ratio is bit-exact with python's int/int",
+      format!("{area}"),
+    )));
+  }
+  if max_pixels > F64_EXACT_INT_MAX {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "smart_resize (scale-down): max_pixels (beta sqrt ratio operand)",
+      "must be <= 2^53 (F64_EXACT_INT_MAX) so the f64 ratio is bit-exact with python's int/int",
+      format!("{max_pixels}"),
     )));
   }
   Ok(())
@@ -220,12 +268,18 @@ fn check_beta_domain_down(height: i64, width: i64, max_pixels: i64) -> Result<()
 /// avoids.
 fn check_beta_domain_up(height: i64, width: i64, min_pixels: i64) -> Result<()> {
   let area = (height as i128) * (width as i128);
-  if area > F64_EXACT_INT_MAX as i128 || min_pixels > F64_EXACT_INT_MAX {
-    return Err(Error::ShapeMismatch(format!(
-      "smart_resize (scale-up): height*width (= {area}) or min_pixels (= {min_pixels}) \
-         exceeds the exact-f64 range 2^53 ({F64_EXACT_INT_MAX}); the beta (sqrt) scale-up \
-         ratio (min_pixels / (height*width)) is not exactly computable there and is rejected \
-         rather than rounded imprecisely"
+  if area > F64_EXACT_INT_MAX as i128 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "smart_resize (scale-up): height*width area (beta sqrt ratio operand)",
+      "must be <= 2^53 (F64_EXACT_INT_MAX) so the f64 ratio is bit-exact with python's int/int",
+      format!("{area}"),
+    )));
+  }
+  if min_pixels > F64_EXACT_INT_MAX {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "smart_resize (scale-up): min_pixels (beta sqrt ratio operand)",
+      "must be <= 2^53 (F64_EXACT_INT_MAX) so the f64 ratio is bit-exact with python's int/int",
+      format!("{min_pixels}"),
     )));
   }
   Ok(())
@@ -248,6 +302,7 @@ fn check_beta_domain_up(height: i64, width: i64, min_pixels: i64) -> Result<()> 
 /// inputs and never trips this; we surface it recoverably rather than panic
 /// (debug) or silently wrap to a small valid-looking size (release).
 pub fn round_by_factor(number: i64, factor: i64) -> Result<i64> {
+  check_positive_factor(factor, "round")?;
   check_factor_input(number, "round")?;
   factor_product(
     round_half_to_even_f(number as f64 / factor as f64),
@@ -266,6 +321,7 @@ pub fn round_by_factor(number: i64, factor: i64) -> Result<i64> {
 /// (precision loss past ±2^53 or `i64` product overflow) — see
 /// [`round_by_factor`].
 pub fn ceil_by_factor(number: i64, factor: i64) -> Result<i64> {
+  check_positive_factor(factor, "ceil")?;
   check_factor_input(number, "ceil")?;
   factor_product((number as f64 / factor as f64).ceil(), factor, "ceil")
 }
@@ -280,6 +336,7 @@ pub fn ceil_by_factor(number: i64, factor: i64) -> Result<i64> {
 /// (precision loss past ±2^53 or `i64` product overflow) — see
 /// [`round_by_factor`].
 pub fn floor_by_factor(number: i64, factor: i64) -> Result<i64> {
+  check_positive_factor(factor, "floor")?;
   check_factor_input(number, "floor")?;
   factor_product((number as f64 / factor as f64).floor(), factor, "floor")
 }
@@ -431,19 +488,45 @@ pub fn smart_resize(
   min_pixels: i64,
   max_pixels: i64,
 ) -> Result<(i64, i64)> {
-  if height <= 0 || width <= 0 {
-    return Err(Error::ShapeMismatch(format!(
-      "smart_resize: height ({height}) and width ({width}) must be positive"
+  if height <= 0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "smart_resize: height",
+      "must be > 0",
+      format!("{height}"),
+    )));
+  }
+  if width <= 0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "smart_resize: width",
+      "must be > 0",
+      format!("{width}"),
     )));
   }
   if factor <= 0 {
-    return Err(Error::ShapeMismatch(format!(
-      "smart_resize: factor ({factor}) must be positive"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "smart_resize: factor",
+      "must be > 0",
+      format!("{factor}"),
     )));
   }
-  if max_pixels <= 0 || min_pixels < 0 || min_pixels > max_pixels {
-    return Err(Error::ShapeMismatch(format!(
-      "smart_resize: require 0 <= min_pixels ({min_pixels}) <= max_pixels ({max_pixels}) and max_pixels > 0"
+  if max_pixels <= 0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "smart_resize: max_pixels",
+      "must be > 0",
+      format!("{max_pixels}"),
+    )));
+  }
+  if min_pixels < 0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "smart_resize: min_pixels",
+      "must be >= 0",
+      format!("{min_pixels}"),
+    )));
+  }
+  if min_pixels > max_pixels {
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "smart_resize: min_pixels vs max_pixels",
+      "min_pixels must be <= max_pixels",
     )));
   }
   // The smallest legal output is a `factor × factor` square (both sides are
@@ -461,18 +544,25 @@ pub fn smart_resize(
   // comparison and the error message are both exact for any positive `i64`.
   let min_cell = (factor as i128) * (factor as i128);
   if min_cell > max_pixels as i128 {
-    return Err(Error::ShapeMismatch(format!(
-      "smart_resize: budget max_pixels ({max_pixels}) cannot contain the smallest \
-         factor-aligned size ({factor}x{factor} = {min_cell})"
+    // EXACT i128 telemetry: `min_cell` can be up to `i64::MAX * i64::MAX`
+    // (~2^126), which truncates to garbage if cast to u64 — e.g. `factor =
+    // 1 << 32` yields `min_cell = 2^64`, and `as u64` collapses it to 0.
+    // Carry both values through `OutOfRangePayload`'s `SmolStr` so the
+    // typed observed value preserves the i128 magnitude exactly.
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "smart_resize: smallest factor-aligned size (factor x factor) vs max_pixels budget",
+      "factor*factor must be <= max_pixels",
+      format!("min_cell={min_cell}, cap={max_pixels}"),
     )));
   }
 
   let hi = height.max(width) as f64;
   let lo = height.min(width) as f64;
   if hi / lo > MAX_RATIO as f64 {
-    return Err(Error::ShapeMismatch(format!(
-      "smart_resize: absolute aspect ratio must be < {MAX_RATIO}, got {}",
-      hi / lo
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "smart_resize: absolute aspect ratio (max(h,w) / min(h,w))",
+      "must be < MAX_RATIO",
+      format!("{} (MAX_RATIO={MAX_RATIO})", hi / lo),
     )));
   }
 
@@ -545,10 +635,10 @@ pub fn smart_resize(
   // one factor step). Faithfulness requires accepting them.
   let representable = h_bar.checked_mul(w_bar).is_some();
   if h_bar <= 0 || w_bar <= 0 || !representable {
-    return Err(Error::ShapeMismatch(format!(
-      "smart_resize: no positive factor-aligned size fits budget \
-         [min_pixels={min_pixels}, max_pixels={max_pixels}] for input \
-         ({height}x{width}, factor={factor}); computed ({h_bar}x{w_bar})"
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "smart_resize: computed (h_bar, w_bar)",
+      "no positive factor-aligned size fits budget [min_pixels, max_pixels] for the given input \
+         (either an axis floored to <= 0 in the scale-down branch or h_bar*w_bar overflows i64)",
     )));
   }
   Ok((h_bar, w_bar))
@@ -625,8 +715,10 @@ impl Default for FrameSampling {
 ///   `[FRAME_FACTOR, total_frames]` — mirrors the python final check.
 pub fn smart_nframes(sampling: FrameSampling, total_frames: i64, video_fps: f64) -> Result<i64> {
   if total_frames <= 0 {
-    return Err(Error::ShapeMismatch(format!(
-      "smart_nframes: total_frames ({total_frames}) must be positive"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "smart_nframes: total_frames",
+      "must be > 0",
+      format!("{total_frames}"),
     )));
   }
   let nframes = match sampling {
@@ -641,14 +733,30 @@ pub fn smart_nframes(sampling: FrameSampling, total_frames: i64, video_fps: f64)
       // Reject non-positive AND non-finite (NaN/inf) rates: a zero
       // `video_fps` divides-by-zero and a non-positive/NaN budget would
       // break the clamp + the final `[FRAME_FACTOR, total_frames]` check.
-      if !video_fps.is_finite() || video_fps <= 0.0 {
-        return Err(Error::ShapeMismatch(format!(
-          "smart_nframes: video_fps ({video_fps}) must be a positive finite number"
+      if !video_fps.is_finite() {
+        return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+          "smart_nframes: video_fps",
+          video_fps,
         )));
       }
-      if !fps.is_finite() || fps <= 0.0 {
-        return Err(Error::ShapeMismatch(format!(
-          "smart_nframes: fps ({fps}) must be a positive finite number"
+      if video_fps <= 0.0 {
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "smart_nframes: video_fps",
+          "must be > 0",
+          format!("{video_fps}"),
+        )));
+      }
+      if !fps.is_finite() {
+        return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+          "smart_nframes: fps",
+          fps,
+        )));
+      }
+      if fps <= 0.0 {
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "smart_nframes: fps",
+          "must be > 0",
+          format!("{fps}"),
         )));
       }
       // Overflow-safe `?` on every factor-rounding (the clamp bounds and the
@@ -671,8 +779,10 @@ pub fn smart_nframes(sampling: FrameSampling, total_frames: i64, video_fps: f64)
     }
   };
   if !(FRAME_FACTOR <= nframes && nframes <= total_frames) {
-    return Err(Error::ShapeMismatch(format!(
-      "smart_nframes: nframes should be in [{FRAME_FACTOR}, {total_frames}], got {nframes}"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "smart_nframes: nframes",
+      "must be in [FRAME_FACTOR, total_frames]",
+      format!("nframes={nframes} (FRAME_FACTOR={FRAME_FACTOR}, total_frames={total_frames})"),
     )));
   }
   Ok(nframes)
@@ -706,13 +816,17 @@ pub fn smart_nframes(sampling: FrameSampling, total_frames: i64, video_fps: f64)
 ///   allocated (request-scaled; surfaced recoverably rather than aborting).
 pub fn sample_frame_indices(total_frames: i64, nframes: i64) -> Result<Vec<i64>> {
   if total_frames <= 0 {
-    return Err(Error::ShapeMismatch(format!(
-      "sample_frame_indices: total_frames ({total_frames}) must be positive"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "sample_frame_indices: total_frames",
+      "must be > 0",
+      format!("{total_frames}"),
     )));
   }
   if nframes <= 0 {
-    return Err(Error::ShapeMismatch(format!(
-      "sample_frame_indices: nframes ({nframes}) must be positive"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "sample_frame_indices: nframes",
+      "must be > 0",
+      format!("{nframes}"),
     )));
   }
   let n = nframes as usize;
@@ -796,9 +910,9 @@ pub fn process_frames(
   cfg: &ImageProcessorConfig,
 ) -> Result<Array> {
   if frames.is_empty() {
-    return Err(Error::ShapeMismatch(
-      "process_frames: frames slice is empty".into(),
-    ));
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "process_frames: frames",
+    )));
   }
   // Reject non-Hwc per-frame layouts. Applying a planar `Layout` per
   // frame here would silently break the documented `[T, H, W, 3]` stack
@@ -808,13 +922,12 @@ pub fn process_frames(
   // yet defined; callers wanting planar output should post-process the
   // returned `[T, H, W, 3]` themselves.
   if cfg.layout() != Layout::Hwc {
-    return Err(Error::Backend(format!(
-      "process_frames currently only supports Layout::Hwc per-frame configs; \
-         got {:?}. Video-tensor layout for Chw/Bchw is not yet defined — \
-         use Layout::Hwc for video inputs (and post-process the returned \
-         [T, H, W, 3] if a planar shape is needed) or wait for a future PR \
-         adding video layout semantics.",
-      cfg.layout()
+    return Err(Error::UnknownEnumValue(UnknownEnumValuePayload::new(
+      "process_frames: cfg.layout (video processing currently only supports Layout::Hwc; \
+         video-tensor layout for Chw/Bchw is not yet defined — use Layout::Hwc and post-process \
+         the returned [T, H, W, 3] if a planar shape is needed)",
+      cfg.layout().as_str(),
+      &["hwc"],
     )));
   }
   // Preprocess every frame to a channel-last [H, W, 3] f32 Array. The

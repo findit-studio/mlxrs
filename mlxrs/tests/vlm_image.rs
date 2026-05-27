@@ -91,22 +91,20 @@ fn resize_filters_all_succeed() {
 fn resize_rejects_zero_target_dimension() {
   // Regression for Codex Finding 1 (high): `ImageProcessorConfig::size`
   // now flows from an UNTRUSTED loaded processor config. A zero target
-  // dimension must be rejected as a recoverable `Error::ShapeMismatch`
+  // dimension must be rejected as a recoverable `Error::OutOfRange`
   // BEFORE the source-RGBA materialization / the own resize kernel's
   // allocations, not silently produce a degenerate / panicking
-  // allocation. The
-  // source fixture is a normal small image; only the (untrusted)
-  // target is degenerate.
+  // allocation.
   let img = synthetic_image(8, 6);
   for target in [(0, 16), (16, 0), (0, 0)] {
     let err = resize(&img, target, ResizeFilter::Bilinear)
       .expect_err("zero target dimension must be rejected");
     match err {
-      Error::ShapeMismatch(message) => assert!(
-        message.contains("resize") && message.contains("non-zero"),
-        "expected ShapeMismatch naming the zero dim; got: {message}"
+      Error::OutOfRange(p) => assert!(
+        p.context().contains("resize:") && p.requirement().contains("non-zero"),
+        "expected OutOfRange naming the zero dim; got: {p:?}"
       ),
-      other => panic!("expected ShapeMismatch, got {other:?}"),
+      other => panic!("expected OutOfRange, got {other:?}"),
     }
   }
 }
@@ -118,9 +116,8 @@ fn resize_rejects_oversized_target() {
   // allocation (`height * width * 4` bytes) to panic-abort the process,
   // taking down image + video preprocessing on the first request. The
   // target-byte guard must surface this as a recoverable
-  // `Error::ShapeMismatch`,
-  // bounded by `MAX_DECODED_IMAGE_BYTES` (the same 512 MiB ceiling
-  // `pad_to_square` and `load_image` enforce).
+  // `Error::CapExceeded`, bounded by `MAX_DECODED_IMAGE_BYTES` (the
+  // same 512 MiB ceiling `pad_to_square` and `load_image` enforce).
   //
   // The source fixture is a tiny 8x6 image (~144 bytes); only the
   // would-be resize destination (100_000² × 4 ≈ 37 GiB) trips the cap,
@@ -129,11 +126,8 @@ fn resize_rejects_oversized_target() {
   let err = resize(&img, (100_000, 100_000), ResizeFilter::Bicubic)
     .expect_err("oversized resize target must be rejected");
   match err {
-    Error::ShapeMismatch(message) => assert!(
-      message.contains("resize") && message.contains("MAX_DECODED_IMAGE_BYTES"),
-      "expected ShapeMismatch mentioning the budget; got: {message}"
-    ),
-    other => panic!("expected ShapeMismatch, got {other:?}"),
+    Error::CapExceeded(p) => assert_eq!(p.cap_name(), "MAX_DECODED_IMAGE_BYTES"),
+    other => panic!("expected CapExceeded, got {other:?}"),
   }
 }
 
@@ -142,17 +136,17 @@ fn resize_rejects_overflowing_target_product() {
   // Regression for Codex Finding 1 (high): the byte-budget guard
   // computes `height * width * 4` via `u64::checked_mul`. A target whose
   // product overflows u64 (`u32::MAX` on both axes) must surface as a
-  // recoverable `Error::ShapeMismatch` (overflow branch) rather than
-  // wrapping to a small valid-looking byte count that bypasses the cap.
+  // recoverable `Error::ArithmeticOverflow` rather than wrapping to a
+  // small valid-looking byte count that bypasses the cap.
   let img = synthetic_image(8, 6);
   let err = resize(&img, (u32::MAX, u32::MAX), ResizeFilter::Bilinear)
     .expect_err("overflowing target product must be rejected");
   match err {
-    Error::ShapeMismatch(message) => assert!(
-      message.contains("resize") && message.contains("overflow"),
-      "expected ShapeMismatch naming the overflow; got: {message}"
+    Error::ArithmeticOverflow(p) => assert!(
+      p.context().contains("resize:"),
+      "expected ArithmeticOverflow naming the overflow; got: {p:?}"
     ),
-    other => panic!("expected ShapeMismatch, got {other:?}"),
+    other => panic!("expected ArithmeticOverflow, got {other:?}"),
   }
 }
 
@@ -184,13 +178,15 @@ fn resize_rejects_source_rgba_staging_over_cap() {
   let err = resize(&luma, (8, 8), ResizeFilter::Bilinear)
     .expect_err("Luma8 source whose RGBA8 staging exceeds the cap must be rejected");
   match err {
-    Error::ShapeMismatch(message) => assert!(
-      message.contains("resize")
-        && message.contains("MAX_DECODED_IMAGE_BYTES")
-        && message.contains("staging"),
-      "expected ShapeMismatch naming the RGBA staging cap; got: {message}"
-    ),
-    other => panic!("expected ShapeMismatch for over-cap source staging, got {other:?}"),
+    Error::CapExceeded(p) => {
+      assert_eq!(p.cap_name(), "MAX_DECODED_IMAGE_BYTES");
+      assert!(
+        p.context().contains("staging"),
+        "expected CapExceeded naming the RGBA staging cap; got context: {}",
+        p.context()
+      );
+    }
+    other => panic!("expected CapExceeded for over-cap source staging, got {other:?}"),
   }
 }
 
@@ -1022,17 +1018,17 @@ fn rescale_preserves_dtype() {
 #[test]
 fn rescale_rejects_integer_dtypes() {
   // U8 [0, 255] with `1/255` scale would silently floor to 0 in the
-  // input dtype; we surface that as a clean ShapeMismatch instead.
+  // input dtype; we surface that as a clean UnsupportedDtype instead.
   let arr = Array::from_slice(&[0_u8, 128, 255], &(3usize,)).unwrap();
   let err = rescale(&arr, 1.0 / 255.0).unwrap_err();
   assert!(
-    matches!(err, Error::ShapeMismatch(_)),
-    "want ShapeMismatch, got {err:?}",
+    matches!(err, Error::UnsupportedDtype(_)),
+    "want UnsupportedDtype, got {err:?}",
   );
   // I32 input too — every integer dtype is rejected.
   let arr_i = Array::from_slice(&[0_i32, 1, 2], &(3usize,)).unwrap();
   let err_i = rescale(&arr_i, 0.5).unwrap_err();
-  assert!(matches!(err_i, Error::ShapeMismatch(_)));
+  assert!(matches!(err_i, Error::UnsupportedDtype(_)));
 }
 
 // ---------- normalize_imagenet ----------
@@ -1087,37 +1083,40 @@ fn normalize_imagenet_broadcasts_over_rank4_batch() {
 
 #[test]
 fn normalize_imagenet_rejects_non_3_channel_input() {
-  // [H, W, 4]: trailing dim 4 is not RGB → ShapeMismatch
+  // [H, W, 4]: trailing dim 4 is not RGB → LengthMismatch.
   let arr = Array::from_slice(&[0.0_f32; 16], &(2usize, 2, 4)).unwrap();
   let err = normalize_imagenet(&arr, &[0.0; 3], &[1.0; 3]).unwrap_err();
-  assert!(
-    matches!(err, Error::ShapeMismatch(_)),
-    "want ShapeMismatch, got {err:?}"
-  );
+  match &err {
+    Error::LengthMismatch(p) => {
+      assert_eq!(p.expected(), 3);
+      assert_eq!(p.actual(), 4);
+    }
+    _ => panic!("want LengthMismatch, got {err:?}"),
+  }
 }
 
 #[test]
 fn normalize_imagenet_rejects_non_three_trailing_dim() {
   // Trailing dim must equal 3 (R,G,B) for the per-channel mean/std
   // broadcast to be well-defined. A rank-1 `[1]` tensor has trailing
-  // dim 1 → ShapeMismatch. (Renamed from `_rejects_zero_rank` per
+  // dim 1 → LengthMismatch. (Renamed from `_rejects_zero_rank` per
   // Copilot review #3272880185 — the test never built a true 0-D
   // scalar; it validates the non-3-channel-trailing-dim path.)
   let arr = Array::from_slice(&[1.0_f32], &(1usize,)).unwrap();
   let err = normalize_imagenet(&arr, &[0.0; 3], &[1.0; 3]).unwrap_err();
-  assert!(matches!(err, Error::ShapeMismatch(_)));
+  assert!(matches!(err, Error::LengthMismatch(_)), "got {err:?}");
 }
 
 #[test]
 fn normalize_imagenet_rejects_integer_dtypes() {
   // U8 [H, W, 3]: ImageNet mean/std cast to U8 would floor to 0,
-  // producing garbage. Reject with ShapeMismatch so the caller is
+  // producing garbage. Reject with UnsupportedDtype so the caller is
   // forced to `astype(arr, Dtype::F32)` first.
   let arr = Array::from_slice(&[0_u8; 3], &(1usize, 1, 3)).unwrap();
   let err = normalize_imagenet(&arr, &[0.485, 0.456, 0.406], &[0.229, 0.224, 0.225]).unwrap_err();
   assert!(
-    matches!(err, Error::ShapeMismatch(_)),
-    "want ShapeMismatch, got {err:?}",
+    matches!(err, Error::UnsupportedDtype(_)),
+    "want UnsupportedDtype, got {err:?}",
   );
 }
 
@@ -1138,8 +1137,8 @@ fn patchify_non_divisible_dimensions_errors() {
   let arr = Array::from_slice(&[0.0_f32; 5 * 4 * 3], &(5usize, 4, 3)).unwrap();
   let err = patchify(&arr, 2).unwrap_err();
   assert!(
-    matches!(err, Error::ShapeMismatch(_)),
-    "want ShapeMismatch, got {err:?}"
+    matches!(err, Error::DivisibilityConstraint(_)),
+    "want DivisibilityConstraint, got {err:?}"
   );
 }
 
@@ -1147,7 +1146,7 @@ fn patchify_non_divisible_dimensions_errors() {
 fn patchify_zero_patch_size_errors() {
   let arr = Array::from_slice(&[0.0_f32; 12], &(2usize, 2, 3)).unwrap();
   let err = patchify(&arr, 0).unwrap_err();
-  assert!(matches!(err, Error::ShapeMismatch(_)));
+  assert!(matches!(err, Error::OutOfRange(_)), "got {err:?}");
 }
 
 #[test]
@@ -1155,7 +1154,7 @@ fn patchify_wrong_rank_errors() {
   // [2, 3] is rank 2 → reject.
   let arr = Array::from_slice(&[0.0_f32; 6], &(2usize, 3)).unwrap();
   let err = patchify(&arr, 1).unwrap_err();
-  assert!(matches!(err, Error::ShapeMismatch(_)));
+  assert!(matches!(err, Error::RankMismatch(_)), "got {err:?}");
 }
 
 #[test]
@@ -1303,7 +1302,7 @@ fn load_image_nonexistent_path_returns_err() {
     std::process::id(),
   ));
   let err = load_image(&path).unwrap_err();
-  assert!(matches!(err, Error::Backend(_)), "got {err:?}");
+  assert!(matches!(err, Error::FileIo(_)), "got {err:?}");
 }
 
 // ---------- resize_lanczos ----------
@@ -1583,13 +1582,15 @@ fn pad_to_square_rejects_oversized_canvas() {
   let img = ::image::DynamicImage::ImageRgb8(::image::RgbImage::new(100_000, 1));
   let err = pad_to_square(img, [0, 0, 0]).expect_err("oversized canvas must be rejected");
   match err {
-    Error::ShapeMismatch(message) => {
+    Error::CapExceeded(p) => {
+      assert_eq!(p.cap_name(), "MAX_DECODED_IMAGE_BYTES");
       assert!(
-        message.contains("pad_to_square") && message.contains("MAX_DECODED_IMAGE_BYTES"),
-        "expected ShapeMismatch mentioning the budget; got: {message}"
+        p.context().contains("pad_to_square"),
+        "expected CapExceeded naming pad_to_square; got context: {}",
+        p.context()
       );
     }
-    other => panic!("expected ShapeMismatch, got {other:?}"),
+    other => panic!("expected CapExceeded, got {other:?}"),
   }
 }
 
@@ -1744,15 +1745,15 @@ fn normalize_imagenet_is_alias_for_normalize() {
 
 #[test]
 fn normalize_rejects_integer_dtypes() {
-  // Integer input rejected with ShapeMismatch (mean/std cast to U8
+  // Integer input rejected with UnsupportedDtype (mean/std cast to U8
   // would floor to zero → division undefined). Mirror the
   // `rescale_rejects_integer_dtypes` coverage for the renamed
   // function.
   let arr = Array::from_slice(&[0_u8; 3], &(1usize, 1, 3)).unwrap();
   let err = normalize(&arr, &[0.485, 0.456, 0.406], &[0.229, 0.224, 0.225]).unwrap_err();
   assert!(
-    matches!(err, Error::ShapeMismatch(_)),
-    "want ShapeMismatch, got {err:?}",
+    matches!(err, Error::UnsupportedDtype(_)),
+    "want UnsupportedDtype, got {err:?}",
   );
 }
 
@@ -1872,8 +1873,8 @@ fn apply_layout_rejects_non_rank3_input() {
   let arr = Array::from_slice(&[0.0_f32; 12], &(2usize, 6)).unwrap();
   let err = apply_layout(arr, Layout::Chw).unwrap_err();
   assert!(
-    matches!(err, Error::ShapeMismatch(_)),
-    "want ShapeMismatch on non-rank-3 input, got {err:?}"
+    matches!(err, Error::RankMismatch(_)),
+    "want RankMismatch on non-rank-3 input, got {err:?}"
   );
 }
 
@@ -1885,8 +1886,8 @@ fn apply_layout_rejects_non_3channel_trailing() {
   let arr = Array::from_slice(&[0.0_f32; 16], &(2usize, 2, 4)).unwrap();
   let err = apply_layout(arr, Layout::Chw).unwrap_err();
   assert!(
-    matches!(err, Error::ShapeMismatch(_)),
-    "want ShapeMismatch on trailing != 3, got {err:?}"
+    matches!(err, Error::LengthMismatch(_)),
+    "want LengthMismatch on trailing != 3, got {err:?}"
   );
 }
 
@@ -2079,8 +2080,8 @@ fn resize_rejects_over_budget_target() {
   // 64K × 64K × 4 = ~17 GiB — well over the 512 MiB cap.
   let err = resize(&img, (65_536, 65_536), ResizeFilter::Bilinear).unwrap_err();
   assert!(
-    matches!(err, Error::ShapeMismatch(_)),
-    "want ShapeMismatch on over-budget target, got {err:?}"
+    matches!(err, Error::CapExceeded(_)),
+    "want CapExceeded on over-budget target, got {err:?}"
   );
 }
 
@@ -2091,7 +2092,7 @@ fn resize_rejects_zero_dim_target() {
   let img = synthetic_image(8, 8);
   let err = resize(&img, (0, 16), ResizeFilter::Bilinear).unwrap_err();
   assert!(
-    matches!(err, Error::ShapeMismatch(_)),
-    "want ShapeMismatch on zero target, got {err:?}"
+    matches!(err, Error::OutOfRange(_)),
+    "want OutOfRange on zero target, got {err:?}"
   );
 }

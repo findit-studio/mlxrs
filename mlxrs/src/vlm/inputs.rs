@@ -47,7 +47,10 @@
 
 use crate::{
   array::Array,
-  error::{Error, LengthMismatchPayload, Result, try_with_capacity},
+  error::{
+    ArithmeticOverflowPayload, Error, InvariantViolationPayload, LengthMismatchPayload,
+    OutOfRangePayload, Result, try_with_capacity,
+  },
 };
 
 /// Padding side for varying-length `input_ids` batches — mirrors the
@@ -382,13 +385,12 @@ pub fn prepare_inputs(
         masks.len(),
       )));
     }
-    for (i, (m, b)) in masks.iter().zip(text_token_batches.iter()).enumerate() {
+    for (m, b) in masks.iter().zip(text_token_batches.iter()) {
       if m.len() != b.len() {
-        return Err(Error::ShapeMismatch(format!(
-          "prepare_inputs: opts.attention_mask[{i}] length {} != text_token_batches[{i}] \
-             length {}",
+        return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+          "prepare_inputs: opts.attention_mask[i] vs text_token_batches[i] length",
+          b.len(),
           m.len(),
-          b.len()
         )));
       }
     }
@@ -403,9 +405,9 @@ pub fn prepare_inputs(
   } else {
     let first = lens[0];
     if !lens.iter().all(|&l| l == first) {
-      return Err(Error::ShapeMismatch(format!(
-        "prepare_inputs: padding=false but batches have varying lengths ({lens:?}); \
-           enable padding or pre-pad upstream"
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "prepare_inputs: text_token_batches",
+        "all batches must have equal length when padding=false (enable padding or pre-pad upstream)",
       )));
     }
     first
@@ -413,18 +415,30 @@ pub fn prepare_inputs(
 
   // mlx dimension limit: signed 32-bit. Reject early before the host
   // allocation.
-  if target_t > i32::MAX as usize || batch_size > i32::MAX as usize {
-    return Err(Error::ShapeMismatch(format!(
-      "prepare_inputs: batch_size ({batch_size}) or target_t ({target_t}) exceeds i32::MAX \
-         (mlx dimension limit)"
+  if target_t > i32::MAX as usize {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "prepare_inputs: target_t",
+      "must be <= i32::MAX (mlx dimension limit)",
+      format!("{target_t}"),
+    )));
+  }
+  if batch_size > i32::MAX as usize {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "prepare_inputs: batch_size",
+      "must be <= i32::MAX (mlx dimension limit)",
+      format!("{batch_size}"),
     )));
   }
 
   // Total cell count with overflow guard (request-scaled allocation).
   let total = batch_size.checked_mul(target_t).ok_or_else(|| {
-    Error::ShapeMismatch(format!(
-      "prepare_inputs: batch_size * target_t overflows usize \
-         (batch_size={batch_size}, target_t={target_t})"
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "prepare_inputs: batch_size * target_t",
+      "usize",
+      [
+        ("batch_size", batch_size as u64),
+        ("target_t", target_t as u64),
+      ],
     ))
   })?;
 

@@ -79,8 +79,10 @@ fn insert_image_tokens_rejects_non_contiguous_extra_marker() {
   // corrupt vision-feature alignment.
   let text = [1_u32, 7, 2, 7, 3];
   let err = insert_image_tokens(&text, 1, 7, 99, 2, MarkerPolicy::Required).unwrap_err();
-  let msg = format!("{err}");
-  assert!(msg.contains("non-contiguous"), "unexpected error: {msg}");
+  assert!(
+    matches!(err, Error::InvariantViolation(_)),
+    "expected InvariantViolation for non-contiguous marker, got {err:?}"
+  );
 }
 
 #[test]
@@ -119,11 +121,13 @@ fn insert_image_tokens_rejects_run_len_too_few() {
   // bug, must fail closed (not silently fan out one marker into 3 images).
   let text = [1_u32, 7, 2];
   let err = insert_image_tokens(&text, 3, 7, 99, 2, MarkerPolicy::Required).unwrap_err();
-  let msg = format!("{err}");
-  assert!(
-    msg.contains("run length") && msg.contains("does not match image_count"),
-    "unexpected error: {msg}"
-  );
+  match &err {
+    Error::LengthMismatch(p) => {
+      assert_eq!(p.expected(), 3, "expected = image_count");
+      assert_eq!(p.actual(), 1, "actual = run_len");
+    }
+    _ => panic!("expected LengthMismatch, got {err:?}"),
+  }
 }
 
 #[test]
@@ -133,11 +137,13 @@ fn insert_image_tokens_rejects_run_len_too_many() {
   // bug and could corrupt vision-feature alignment.
   let text = [1_u32, 7, 7, 7, 2];
   let err = insert_image_tokens(&text, 1, 7, 99, 2, MarkerPolicy::Required).unwrap_err();
-  let msg = format!("{err}");
-  assert!(
-    msg.contains("run length") && msg.contains("does not match image_count"),
-    "unexpected error: {msg}"
-  );
+  match &err {
+    Error::LengthMismatch(p) => {
+      assert_eq!(p.expected(), 1, "expected = image_count");
+      assert_eq!(p.actual(), 3, "actual = run_len");
+    }
+    _ => panic!("expected LengthMismatch, got {err:?}"),
+  }
 }
 
 #[test]
@@ -150,15 +156,14 @@ fn insert_image_tokens_prepended_when_no_marker() {
 
 #[test]
 fn insert_image_tokens_required_rejects_missing_marker() {
-  // No marker in text + Required + image_count>0 → ShapeMismatch.
+  // No marker in text + Required + image_count>0 → MissingField.
   // Fails closed against chat-template / tokenizer-version drift that
   // would silently rewrite prompt order under a marker-required template.
   let text = [1_u32, 2, 3];
   let err = insert_image_tokens(&text, 1, 7, 99, 3, MarkerPolicy::Required).unwrap_err();
-  let msg = format!("{err}");
   assert!(
-    msg.contains("no image_marker_id") && msg.contains("Required"),
-    "unexpected error: {msg}"
+    matches!(err, Error::MissingField(_)),
+    "expected MissingField under MarkerPolicy::Required, got {err:?}"
   );
 }
 
@@ -196,10 +201,9 @@ fn insert_image_tokens_rejects_zero_tokens_per_image_with_images() {
   // placeholders to bind to vision features). Fail closed.
   let text = [1_u32, 7, 2];
   let err = insert_image_tokens(&text, 1, 7, 99, 0, MarkerPolicy::Required).unwrap_err();
-  let msg = format!("{err}");
   assert!(
-    msg.contains("num_tokens_per_image=0") && msg.contains("degenerate"),
-    "unexpected error: {msg}"
+    matches!(err, Error::InvariantViolation(_)),
+    "expected InvariantViolation for degenerate config, got {err:?}"
   );
 }
 
@@ -215,13 +219,15 @@ fn insert_image_tokens_zero_tokens_per_image_with_zero_images_passes() {
 
 #[test]
 fn insert_image_tokens_rejects_overflow_image_count() {
-  // image_count * num_tokens_per_image overflows usize → ShapeMismatch,
+  // image_count * num_tokens_per_image overflows usize → ArithmeticOverflow,
   // no panic, no OOM-abort. Guards public primitives forwarding caller-
   // supplied request/config values.
   let text = [1_u32, 7, 2];
   let err = insert_image_tokens(&text, usize::MAX, 7, 99, 2, MarkerPolicy::Required).unwrap_err();
-  let msg = format!("{err}");
-  assert!(msg.contains("overflows usize"), "unexpected error: {msg}");
+  assert!(
+    matches!(err, Error::ArithmeticOverflow(_)),
+    "expected ArithmeticOverflow, got {err:?}"
+  );
 }
 
 #[test]
@@ -229,8 +235,10 @@ fn insert_image_tokens_rejects_overflow_tokens_per_image() {
   // Same overflow guard, symmetric in the other multiplicand.
   let text = [1_u32, 7, 2];
   let err = insert_image_tokens(&text, 2, 7, 99, usize::MAX, MarkerPolicy::Required).unwrap_err();
-  let msg = format!("{err}");
-  assert!(msg.contains("overflows usize"), "unexpected error: {msg}");
+  assert!(
+    matches!(err, Error::ArithmeticOverflow(_)),
+    "expected ArithmeticOverflow, got {err:?}"
+  );
 }
 
 // ──────────────────────── build_multimodal_mask ────────────────────────
@@ -337,8 +345,8 @@ fn build_multimodal_mask_with_past_rejects_chunk_local_span_out_of_bounds() {
   // caller's chunk-local shift must keep spans inside [0, seq_len)).
   let err = build_multimodal_mask_with_past(3, 4, &[(1, 5)]).unwrap_err();
   assert!(
-    format!("{err}").contains("end exceeds seq_len"),
-    "expected chunk-local out-of-bounds rejection, got: {err}"
+    matches!(err, Error::OutOfRange(_)),
+    "expected OutOfRange for chunk-local span out of bounds, got: {err:?}"
   );
 }
 
@@ -406,26 +414,32 @@ fn build_multimodal_mask_rejects_empty_span_with_zero_seq_len() {
 
 #[test]
 fn build_multimodal_mask_rejects_empty_span() {
-  // (3, 3) is empty (start>=end) → ShapeMismatch, no panic.
+  // (3, 3) is empty (start>=end) → InvariantViolation, no panic.
   let err = build_multimodal_mask(5, &[(3, 3)]).unwrap_err();
-  let msg = format!("{err}");
-  assert!(msg.contains("empty"), "unexpected error: {msg}");
+  assert!(
+    matches!(err, Error::InvariantViolation(_)),
+    "expected InvariantViolation for empty span, got {err:?}"
+  );
 }
 
 #[test]
 fn build_multimodal_mask_rejects_out_of_bounds_span() {
-  // span end exceeds seq_len.
+  // span end exceeds seq_len → OutOfRange.
   let err = build_multimodal_mask(4, &[(2, 5)]).unwrap_err();
-  let msg = format!("{err}");
-  assert!(msg.contains("exceeds seq_len"), "unexpected error: {msg}");
+  assert!(
+    matches!(err, Error::OutOfRange(_)),
+    "expected OutOfRange for span end > seq_len, got {err:?}"
+  );
 }
 
 #[test]
 fn build_multimodal_mask_rejects_overlapping_spans() {
-  // Spans (1,4) and (3,5) overlap at position 3.
+  // Spans (1,4) and (3,5) overlap at position 3 → InvariantViolation.
   let err = build_multimodal_mask(6, &[(1, 4), (3, 5)]).unwrap_err();
-  let msg = format!("{err}");
-  assert!(msg.contains("overlap"), "unexpected error: {msg}");
+  assert!(
+    matches!(err, Error::InvariantViolation(_)),
+    "expected InvariantViolation for overlapping spans, got {err:?}"
+  );
 }
 
 // ──────────────────────── assemble_multimodal_prompt ────────────────────────
@@ -550,8 +564,10 @@ fn assemble_multimodal_prompt_rejects_final_len_above_i32_max_early() {
   let text = [1_u32, 7, 2];
   let huge = (i32::MAX as usize) + 1;
   let err = assemble_multimodal_prompt(&text, huge, 7, 99, 1, MarkerPolicy::Required).unwrap_err();
-  let msg = format!("{err}");
-  assert!(msg.contains("exceeds i32::MAX"), "unexpected error: {msg}");
+  assert!(
+    matches!(err, Error::OutOfRange(_)),
+    "expected OutOfRange (i32::MAX dim limit), got {err:?}"
+  );
 }
 
 #[test]
@@ -572,14 +588,13 @@ fn assemble_multimodal_prompt_no_marker_prepends_then_spans_at_start() {
 
 #[test]
 fn assemble_multimodal_prompt_required_rejects_missing_marker() {
-  // No marker + Required + image_count>0 → ShapeMismatch (fails closed
+  // No marker + Required + image_count>0 → MissingField (fails closed
   // against chat-template drift).
   let text = [1_u32, 2, 3];
   let err = assemble_multimodal_prompt(&text, 1, 7, 99, 2, MarkerPolicy::Required).unwrap_err();
-  let msg = format!("{err}");
   assert!(
-    msg.contains("no image_marker_id") && msg.contains("Required"),
-    "unexpected error: {msg}"
+    matches!(err, Error::MissingField(_)),
+    "expected MissingField under MarkerPolicy::Required, got {err:?}"
   );
 }
 
@@ -708,8 +723,12 @@ fn message_formatter_for_model_lowercases_input() {
 fn message_formatter_for_model_unsupported_errors() {
   // Python lines 198–199: `ValueError(f"Unsupported model: {model_name}")`.
   let err = MessageFormatter::for_model("not_a_real_model").unwrap_err();
-  let msg = format!("{err}");
-  assert!(msg.contains("unsupported model"), "unexpected error: {msg}");
+  match &err {
+    Error::MissingKey(p) => {
+      assert_eq!(p.key(), "not_a_real_model");
+    }
+    _ => panic!("expected MissingKey for unsupported model, got {err:?}"),
+  }
 }
 
 // ──────────────────────── get_message_json shapes ────────────────────────
@@ -918,10 +937,9 @@ fn get_message_json_single_image_only_rejects_multi() {
     }),
   )
   .unwrap_err();
-  let msg = format!("{err}");
   assert!(
-    msg.contains("does not support multi-image"),
-    "unexpected error: {msg}"
+    matches!(err, Error::OutOfRange(_)),
+    "expected OutOfRange for SINGLE_IMAGE_ONLY model, got {err:?}"
   );
 }
 
@@ -1213,20 +1231,19 @@ fn get_message_json_extreme_num_images_returns_oom_error() {
     }),
   )
   .unwrap_err();
-  // Must be either Backend (cap-exceeded) or OutOfMemory — both are
-  // recoverable, neither panics.
+  // Must be either CapExceeded (cap-exceeded path) or OutOfMemory —
+  // both are recoverable, neither panics.
   assert!(
-    matches!(err, Error::Backend(_) | Error::OutOfMemory),
-    "expected Backend/OutOfMemory, got: {err:?}"
+    matches!(err, Error::CapExceeded(_) | Error::OutOfMemory),
+    "expected CapExceeded/OutOfMemory, got: {err:?}"
   );
-  let msg = format!("{err}");
   // The cap-exceeded path is the expected one (the value is way above
-  // MAX_MESSAGE_FORMAT_ITEMS = 1024); the message should reference
-  // the cap or num_images for triage.
-  assert!(
-    msg.contains("num_images") || msg.contains("MAX_MESSAGE_FORMAT_ITEMS"),
-    "expected cap/num_images in error message, got: {msg}"
-  );
+  // MAX_MESSAGE_FORMAT_ITEMS = 1024); the payload context names the
+  // count and cap_name names the cap for triage.
+  if let Error::CapExceeded(p) = &err {
+    assert_eq!(p.cap_name(), "MAX_MESSAGE_FORMAT_ITEMS");
+    assert_eq!(p.context(), "num_images");
+  }
 }
 
 #[test]
@@ -1312,15 +1329,13 @@ fn format_message_extreme_num_audios_returns_cap_error() {
       },
     )
     .unwrap_err();
-  assert!(
-    matches!(err, Error::Backend(_)),
-    "expected Backend (cap-exceeded), got: {err:?}"
-  );
-  let msg = format!("{err}");
-  assert!(
-    msg.contains("num_audios"),
-    "expected num_audios in error message, got: {msg}"
-  );
+  match &err {
+    Error::CapExceeded(p) => {
+      assert_eq!(p.cap_name(), "MAX_MESSAGE_FORMAT_ITEMS");
+      assert_eq!(p.context(), "num_audios");
+    }
+    _ => panic!("expected CapExceeded (cap-exceeded), got: {err:?}"),
+  }
 }
 
 #[test]
@@ -1341,15 +1356,13 @@ fn format_message_video_count_above_cap_returns_error() {
     }),
   )
   .unwrap_err();
-  assert!(
-    matches!(err, Error::Backend(_)),
-    "expected Backend (cap-exceeded), got: {err:?}"
-  );
-  let msg = format!("{err}");
-  assert!(
-    msg.contains("video.len()"),
-    "expected video.len() in error message, got: {msg}"
-  );
+  match &err {
+    Error::CapExceeded(p) => {
+      assert_eq!(p.cap_name(), "MAX_MESSAGE_FORMAT_ITEMS");
+      assert_eq!(p.context(), "video.len()");
+    }
+    _ => panic!("expected CapExceeded (cap-exceeded), got: {err:?}"),
+  }
 }
 
 // ──────────────── PROMPT_WITH_IMAGE_TOKEN / PROMPT_WITH_START_IMAGE_TOKEN ────────────────
@@ -1428,10 +1441,10 @@ fn format_message_paligemma_extreme_num_images_returns_cap_error() {
     )
     .unwrap_err();
   // paligemma is in SINGLE_IMAGE_ONLY_MODELS, so the
-  // num_images > 1 guard fires first as ShapeMismatch.
+  // num_images > 1 guard fires first as OutOfRange.
   assert!(
-    matches!(err, Error::ShapeMismatch(_)),
-    "expected ShapeMismatch (single-image guard), got: {err:?}"
+    matches!(err, Error::OutOfRange(_)),
+    "expected OutOfRange (single-image guard), got: {err:?}"
   );
 
   // Now exercise the helper's own cap by synthesizing a formatter
@@ -1450,15 +1463,13 @@ fn format_message_paligemma_extreme_num_images_returns_cap_error() {
       },
     )
     .unwrap_err();
-  assert!(
-    matches!(err, Error::Backend(_)),
-    "expected Backend (cap-exceeded) on PromptWithImageToken cap, got: {err:?}"
-  );
-  let msg = format!("{err}");
-  assert!(
-    msg.contains("num_images"),
-    "expected num_images in error message, got: {msg}"
-  );
+  match &err {
+    Error::CapExceeded(p) => {
+      assert_eq!(p.cap_name(), "MAX_MESSAGE_FORMAT_ITEMS");
+      assert_eq!(p.context(), "num_images");
+    }
+    _ => panic!("expected CapExceeded on PromptWithImageToken cap, got: {err:?}"),
+  }
 }
 
 #[test]
@@ -1484,8 +1495,8 @@ fn format_message_paligemma_num_images_overflow_returns_error() {
     )
     .unwrap_err();
   assert!(
-    matches!(err, Error::Backend(_) | Error::OutOfMemory),
-    "expected Backend or OutOfMemory (no panic), got: {err:?}"
+    matches!(err, Error::CapExceeded(_) | Error::OutOfMemory),
+    "expected CapExceeded or OutOfMemory (no panic), got: {err:?}"
   );
 }
 
@@ -1563,15 +1574,13 @@ fn format_message_prompt_with_start_image_token_extreme_num_images_returns_cap_e
       },
     )
     .unwrap_err();
-  assert!(
-    matches!(err, Error::Backend(_)),
-    "expected Backend (cap-exceeded), got: {err:?}"
-  );
-  let msg = format!("{err}");
-  assert!(
-    msg.contains("num_images"),
-    "expected num_images in error message, got: {msg}"
-  );
+  match &err {
+    Error::CapExceeded(p) => {
+      assert_eq!(p.cap_name(), "MAX_MESSAGE_FORMAT_ITEMS");
+      assert_eq!(p.context(), "num_images");
+    }
+    _ => panic!("expected CapExceeded (cap-exceeded), got: {err:?}"),
+  }
 }
 
 #[test]
@@ -1593,7 +1602,7 @@ fn format_message_prompt_with_start_image_token_num_images_overflow_returns_erro
     )
     .unwrap_err();
   assert!(
-    matches!(err, Error::Backend(_) | Error::OutOfMemory),
-    "expected Backend or OutOfMemory (no panic), got: {err:?}"
+    matches!(err, Error::CapExceeded(_) | Error::OutOfMemory),
+    "expected CapExceeded or OutOfMemory (no panic), got: {err:?}"
   );
 }

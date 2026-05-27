@@ -101,7 +101,10 @@ use std::{cell::RefCell, path::PathBuf};
 
 use crate::{
   array::Array,
-  error::{Error, Result, try_extend_from_slice, try_with_capacity},
+  error::{
+    ArithmeticOverflowPayload, Error, LengthMismatchPayload, OutOfRangePayload,
+    RankMismatchPayload, Result, try_extend_from_slice, try_with_capacity,
+  },
   lm::{
     cache::KvCache,
     generate::{
@@ -453,7 +456,7 @@ pub fn vlm_generate<'a, M: Model + ?Sized>(
   // processor's config explicitly. A caller that only has a model can
   // still pass `&model.image_processor_config()`.
   let mut image_slabs: Vec<Array> = try_with_capacity(images.len())?;
-  for (idx, path) in images.iter().enumerate() {
+  for path in images.iter() {
     let img = load_image(path)?;
     let pre = preprocess(&img, image_processor_config)?;
     let encoded = model.encode_image(&pre)?;
@@ -461,19 +464,20 @@ pub fn vlm_generate<'a, M: Model + ?Sized>(
     let (rows, _d) = match enc_shape.as_slice() {
       [n, d] => (*n, *d),
       _ => {
-        return Err(Error::ShapeMismatch(format!(
-          "vlm_generate: encode_image for image #{idx} must return rank-2 [N, D], got {enc_shape:?}"
+        return Err(Error::RankMismatch(RankMismatchPayload::new(
+          "vlm_generate: encode_image must return rank-2 [N, D]",
+          enc_shape.len() as u32,
+          enc_shape.clone(),
         )));
       }
     };
     if rows != cfg.num_tokens_per_image {
-      return Err(Error::ShapeMismatch(format!(
-        "vlm_generate: encode_image for image #{idx} returned {rows} feature rows; expected \
-           exactly cfg.num_tokens_per_image ({}). The cross-model splice contract requires one \
-           image to emit exactly `num_tokens_per_image` features — a model with \
-           variable-per-image counts must pad/truncate inside its own `encode_image` or override \
-           the `vlm_generate` entry point",
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "vlm_generate: encode_image feature rows vs cfg.num_tokens_per_image (cross-model splice \
+           contract requires exactly num_tokens_per_image per image — a variable-per-image model \
+           must pad/truncate inside encode_image or override vlm_generate)",
         cfg.num_tokens_per_image,
+        rows,
       )));
     }
     image_slabs.push(encoded);
@@ -788,15 +792,15 @@ impl<M: Model + ?Sized> VlmDecode<'_, M> {
         None => 0, // no layers (degenerate); treated as offset 0
         Some(first) => {
           let off = first.offset();
-          for (i, layer) in iter.enumerate() {
+          for layer in iter {
             if layer.offset() != off {
-              return Err(Error::ShapeMismatch(format!(
-                "vlm_generate: KV cache layers disagree on offset (layer 0 = {off}, layer \
-                   {} = {}); chunked-multimodal prefill needs one consistent cache offset to \
-                   size per-chunk attention masks (a faithfully restored prompt cache has all \
-                   layers at the same offset)",
-                i + 1,
-                layer.offset()
+              return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+                "vlm_generate: KV cache layer offsets must agree (layer 0 vs layer i; \
+                   chunked-multimodal prefill needs one consistent cache offset to size per-chunk \
+                   attention masks — a faithfully restored prompt cache has all layers at the \
+                   same offset)",
+                off,
+                layer.offset(),
               )));
             }
           }
@@ -867,8 +871,13 @@ impl<M: Model + ?Sized> VlmDecode<'_, M> {
       // release-wrap before the mask builder could reject it) — Codex
       // VLM-8 R2F1.
       let chunk_offset = initial_offset.checked_add(cursor).ok_or_else(|| {
-        Error::ShapeMismatch(format!(
-          "vlm_generate: cache offset {initial_offset} + chunk cursor {cursor} overflows usize"
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+          "vlm_generate: initial cache offset + chunk cursor",
+          "usize",
+          [
+            ("initial_offset", initial_offset as u64),
+            ("cursor", cursor as u64),
+          ],
         ))
       })?;
       let logits = self.model.forward_embeddings_multimodal(
@@ -978,15 +987,26 @@ impl<M: Model + ?Sized> Iterator for VlmDecode<'_, M> {
 /// behavior.
 fn last_position(logits: &Array) -> Result<Array> {
   let shape = logits.shape();
+  let rank = shape.len() as u32;
   if shape.len() != 3 {
-    return Err(Error::ShapeMismatch(format!(
-      "vlm_generate: expected [B, S, V] logits from forward, got {shape:?}"
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "vlm_generate: expected [B, S, V] logits from forward (rank 3)",
+      rank,
+      shape,
     )));
   }
-  if shape[1] == 0 || shape[2] == 0 {
-    return Err(Error::ShapeMismatch(format!(
-      "vlm_generate: forward returned logits with a zero-length axis (got [B, S, V] \
-         {shape:?}); logits[:, -1, :] requires S >= 1 and V >= 1"
+  if shape[1] == 0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "vlm_generate: forward logits S axis (logits[:, -1, :] requires S >= 1)",
+      "must be >= 1",
+      format!("{} (full shape {:?})", shape[1], shape),
+    )));
+  }
+  if shape[2] == 0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "vlm_generate: forward logits V axis (logits[:, -1, :] requires V >= 1)",
+      "must be >= 1",
+      format!("{} (full shape {:?})", shape[2], shape),
     )));
   }
   let (b, s, v) = (shape[0] as i32, shape[1] as i32, shape[2] as i32);

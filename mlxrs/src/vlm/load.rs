@@ -49,7 +49,7 @@
 use std::{collections::HashMap, path::Path};
 
 use crate::{
-  error::{Error, Result},
+  error::{Error, MissingFieldPayload, MissingKeyPayload, ParsePayload, Result},
   lm::{
     factory::{Identifier, ModelConfiguration},
     load::{self, EosTokenId, Quantization, Weights},
@@ -130,8 +130,13 @@ impl VlmBaseConfig {
   /// failure (malformed JSON or a missing `model_type`) maps to
   /// [`Error::Backend`] — the codebase config-parse convention.
   pub fn from_json(json: &str) -> Result<VlmBaseConfig> {
-    serde_json::from_str(json)
-      .map_err(|e| Error::Backend(format!("invalid VLM base config JSON: {e}")))
+    serde_json::from_str(json).map_err(|e| {
+      Error::Parse(ParsePayload::new(
+        "VlmBaseConfig::from_json",
+        "VLM base config.json",
+        e,
+      ))
+    })
   }
 
   // ── accessors ─────────────────────────────────────────────────────────────
@@ -179,9 +184,11 @@ impl VlmBaseConfig {
 pub fn load_vlm_base_config(dir: &Path) -> Result<(VlmBaseConfig, String)> {
   let path = dir.join("config.json");
   let Some(text) = load::read_bounded_config_file(&path, "VLM base config")? else {
-    return Err(Error::Backend(format!(
-      "cannot open VLM base config {}: file not found",
-      path.display()
+    return Err(Error::FileIo(crate::error::FileIoPayload::new(
+      "load_vlm_base_config: VLM base config.json",
+      crate::error::FileOp::Open,
+      path,
+      std::io::Error::from(std::io::ErrorKind::NotFound),
     )));
   };
   let mut config = VlmBaseConfig::from_json(&text)?;
@@ -503,10 +510,11 @@ pub fn load_processor_config(
     // A truly malformed (non-JSON) preferred file is still an error, since
     // the constructor would also choke on it.
     let parsed: ProcessorClassOnly = serde_json::from_str(&body).map_err(|e| {
-      Error::Backend(format!(
-        "invalid processor config JSON in {}: {e} (expected an OBJECT, optionally with a \
-         `processor_class` string field)",
-        preferred_path.display()
+      Error::Parse(ParsePayload::new(
+        "load_processor_config: preferred processor config (expected an OBJECT, optionally with a \
+           `processor_class` string field)",
+        "JSON",
+        e,
       ))
     })?;
 
@@ -538,25 +546,24 @@ pub fn load_processor_config(
     // `processor_config.json` for dispatch.
     let Some(fallback_body) = load::read_bounded_config_file(&fallback_path, "processor config")?
     else {
-      return Err(Error::Backend(format!(
-        "{PREFERRED} in {} has no `processor_class` field and no {FALLBACK} present to fall back \
-           to for the dispatch class",
-        dir.display()
+      return Err(Error::MissingField(MissingFieldPayload::new(
+        "ProcessorConfig (preferred file has no `processor_class`, and no fallback file present)",
+        "processor_class",
       )));
     };
     let fallback_parsed: ProcessorClassOnly =
       serde_json::from_str(&fallback_body).map_err(|e| {
-        Error::Backend(format!(
-          "invalid processor config JSON in {}: {e} (expected an OBJECT, optionally with a \
-           `processor_class` string field)",
-          fallback_path.display()
+        Error::Parse(ParsePayload::new(
+          "load_processor_config: fallback processor config (expected an OBJECT, optionally with \
+             a `processor_class` string field)",
+          "JSON",
+          e,
         ))
       })?;
     let Some(processor_class) = fallback_parsed.processor_class else {
-      return Err(Error::Backend(format!(
-        "neither {PREFERRED} nor {FALLBACK} in {} has a `processor_class` field for the \
-           dispatch class",
-        dir.display()
+      return Err(Error::MissingField(MissingFieldPayload::new(
+        "ProcessorConfig (neither preferred nor fallback file has `processor_class`)",
+        "processor_class",
       )));
     };
     // Carry BOTH file bodies: the constructor's primary image-
@@ -580,23 +587,26 @@ pub fn load_processor_config(
   // `processor_config.json` (strict parse for `processor_class`, use its
   // body as the constructor JSON).
   let Some(body) = load::read_bounded_config_file(&fallback_path, "processor config")? else {
-    return Err(Error::Backend(format!(
-      "no processor config found in {}: expected {PREFERRED} (preferred) or {FALLBACK}",
-      dir.display()
+    return Err(Error::FileIo(crate::error::FileIoPayload::new(
+      "load_processor_config: neither preferred nor fallback processor config present",
+      crate::error::FileOp::Open,
+      fallback_path,
+      std::io::Error::from(std::io::ErrorKind::NotFound),
     )));
   };
   let parsed: ProcessorClassOnly = serde_json::from_str(&body).map_err(|e| {
-    Error::Backend(format!(
-      "invalid processor config JSON in {}: {e} (expected an OBJECT, optionally with a \
-       `processor_class` string field)",
-      fallback_path.display()
+    Error::Parse(ParsePayload::new(
+      "load_processor_config: fallback processor config (expected an OBJECT, optionally with a \
+         `processor_class` string field)",
+      "JSON",
+      e,
     ))
   })?;
   let Some(processor_class) = parsed.processor_class else {
-    return Err(Error::Backend(format!(
-      "{FALLBACK} in {} has no `processor_class` field for the dispatch class \
-         (and no {PREFERRED} present to fall back from)",
-      dir.display()
+    return Err(Error::MissingField(MissingFieldPayload::new(
+      "ProcessorConfig (fallback file has no `processor_class` field for the dispatch class, and \
+         no preferred file present)",
+      "processor_class",
     )));
   };
   // No `preprocessor_config.json` → its body slot is `None`; the
@@ -871,10 +881,10 @@ impl VlmTypeRegistry {
   pub fn create(&self, loaded: &LoadedVlmModel) -> Result<Box<dyn VlmModel>> {
     let model_type = remap_vlm_model_type(&loaded.config.model_type);
     let constructor = self.creators.get(model_type).ok_or_else(|| {
-      Error::Backend(format!(
-        "unsupported VLM model type {:?}: no constructor registered (register one via \
+      Error::MissingKey(MissingKeyPayload::new(
+        "VlmTypeRegistry::create: no constructor registered for model_type (register one via \
            VlmTypeRegistry::register)",
-        loaded.config.model_type
+        loaded.config.model_type.clone(),
       ))
     })?;
     constructor(loaded)
@@ -1007,10 +1017,10 @@ impl VlmProcessorTypeRegistry {
   /// is a recoverable [`Error::Backend`].
   pub fn create(&self, loaded: &LoadedProcessor<'_>) -> Result<Box<dyn Processor>> {
     let constructor = self.creators.get(loaded.processor_class).ok_or_else(|| {
-      Error::Backend(format!(
-        "unsupported VLM processor class {:?}: no constructor registered (register one via \
-           VlmProcessorTypeRegistry::register)",
-        loaded.processor_class
+      Error::MissingKey(MissingKeyPayload::new(
+        "VlmProcessorTypeRegistry::create: no constructor registered for processor_class \
+           (register one via VlmProcessorTypeRegistry::register)",
+        loaded.processor_class.to_owned(),
       ))
     })?;
     constructor(loaded)
@@ -1187,10 +1197,10 @@ pub fn load(
   // the registry is normally empty — is a cheap, recoverable error
   // here, never paying for the rest of the load pipeline.
   if !model_registry.contains(&config.model_type) {
-    return Err(Error::Backend(format!(
-      "unsupported VLM model type {:?}: no constructor registered (register one via \
+    return Err(Error::MissingKey(MissingKeyPayload::new(
+      "load: no VLM model_type constructor registered (register one via \
          VlmTypeRegistry::register)",
-      config.model_type
+      config.model_type.as_str(),
     )));
   }
 
@@ -1212,18 +1222,11 @@ pub fn load(
     .unwrap_or(&proc_config.processor_class)
     .to_owned();
   if !processor_registry.contains(&processor_class) {
-    return Err(Error::Backend(format!(
-      "unsupported VLM processor class {processor_class:?} (from {proc_filename} in {}{}): \
-         no constructor registered (register one via VlmProcessorTypeRegistry::register)",
-      model_dir.display(),
-      if processor_class != proc_config.processor_class {
-        format!(
-          ", overridden from on-disk {:?} for model_type {:?}",
-          proc_config.processor_class, canonical_model_type,
-        )
-      } else {
-        String::new()
-      },
+    return Err(Error::MissingKey(MissingKeyPayload::new(
+      "load: no VLM processor_class constructor registered (register one via \
+         VlmProcessorTypeRegistry::register; a `processor_class_override` may have been applied \
+         to derive this key from the on-disk processor_class)",
+      processor_class.as_str(),
     )));
   }
 
@@ -1297,7 +1300,7 @@ mod tests {
   use super::*;
   use crate::{
     array::Array,
-    error::MissingFieldPayload,
+    error::{FileOp, MissingFieldPayload, RankMismatchPayload},
     lm::{cache::KvCache, generate::GenConfig, model::Model as LmModel},
     vlm::{
       generate::{VlmGenConfig, vlm_generate},
@@ -1396,9 +1399,11 @@ mod tests {
       let (batch, seq) = match tokens.shape().as_slice() {
         [b, s] => (*b, *s),
         [s] => (1, *s),
-        other => {
-          return Err(Error::ShapeMismatch(format!(
-            "MockVlmModel::forward expects [B, S], got {other:?}"
+        _ => {
+          return Err(Error::RankMismatch(RankMismatchPayload::new(
+            "MockVlmModel::forward expects [B, S] (rank 1 or 2)",
+            tokens.shape().len() as u32,
+            tokens.shape(),
           )));
         }
       };
@@ -1415,9 +1420,11 @@ mod tests {
       let shape = tokens.shape();
       let (b, t) = match shape.as_slice() {
         [b, t] => (*b, *t),
-        other => {
-          return Err(Error::ShapeMismatch(format!(
-            "MockVlmModel::embed_tokens expects [B, T], got {other:?}"
+        _ => {
+          return Err(Error::RankMismatch(RankMismatchPayload::new(
+            "MockVlmModel::embed_tokens expects [B, T] (rank 2)",
+            shape.len() as u32,
+            shape,
           )));
         }
       };
@@ -1485,7 +1492,7 @@ mod tests {
         "constructor should receive the loaded weights"
       );
       let raw: serde_json::Value = serde_json::from_str(loaded.config_json_ref())
-        .map_err(|e| Error::Backend(format!("mock vlm ctor: bad config json: {e}")))?;
+        .map_err(|e| Error::Parse(ParsePayload::new("mock vlm ctor: config.json", "JSON", e)))?;
       // Vocab can be top-level (the "flat" mock fixture) or nested under
       // text_config (the real-VLM-shaped mock fixture). The per-model
       // constructor decides how to decode its own model-specific fields;
@@ -1498,9 +1505,10 @@ mod tests {
         .and_then(serde_json::Value::as_i64)
         .and_then(|x| i32::try_from(x).ok())
         .ok_or_else(|| {
-          Error::Backend(
-            "mock vlm ctor: missing vocab_size (top-level or text_config.vocab_size)".into(),
-          )
+          Error::MissingField(MissingFieldPayload::new(
+            "mock vlm ctor",
+            "vocab_size (top-level or text_config.vocab_size)",
+          ))
         })?;
       let mock_extra = raw
         .get("mock_extra")
@@ -1533,11 +1541,16 @@ mod tests {
           .preprocessor_config_json
           .or(loaded.processor_config_json)
           .ok_or_else(|| {
-            Error::Backend("mock vlm processor ctor: no processor-config body carried".into())
+            Error::MissingField(MissingFieldPayload::new(
+              "mock vlm processor ctor",
+              "preprocessor_config_json or processor_config_json",
+            ))
           })?;
         let raw: serde_json::Value = serde_json::from_str(body).map_err(|e| {
-          Error::Backend(format!(
-            "mock vlm processor ctor: bad processor config json: {e}"
+          Error::Parse(ParsePayload::new(
+            "mock vlm processor ctor: processor config",
+            "JSON",
+            e,
           ))
         })?;
         let image_size = raw
@@ -1778,9 +1791,11 @@ mod tests {
         let (b, s) = match tokens.shape().as_slice() {
           [b, s] => (*b, *s),
           [s] => (1, *s),
-          other => {
-            return Err(Error::ShapeMismatch(format!(
-              "RecordingVlmModel::forward expects [B, S], got {other:?}"
+          _ => {
+            return Err(Error::RankMismatch(RankMismatchPayload::new(
+              "RecordingVlmModel::forward expects [B, S] (rank 1 or 2)",
+              tokens.shape().len() as u32,
+              tokens.shape(),
             )));
           }
         };
@@ -1795,9 +1810,11 @@ mod tests {
         // `[1, T, D]` merged embeds → `[1, T, vocab=5]` zero logits.
         let (b, t) = match embeddings.shape().as_slice() {
           [b, t, _d] => (*b, *t),
-          other => {
-            return Err(Error::ShapeMismatch(format!(
-              "RecordingVlmModel::forward_embeddings expects [B, T, D], got {other:?}"
+          _ => {
+            return Err(Error::RankMismatch(RankMismatchPayload::new(
+              "RecordingVlmModel::forward_embeddings expects [B, T, D] (rank 3)",
+              embeddings.shape().len() as u32,
+              embeddings.shape(),
             )));
           }
         };
@@ -1808,9 +1825,11 @@ mod tests {
       fn embed_tokens(&self, tokens: &Array) -> Result<Array> {
         let (b, t) = match tokens.shape().as_slice() {
           [b, t] => (*b, *t),
-          other => {
-            return Err(Error::ShapeMismatch(format!(
-              "RecordingVlmModel::embed_tokens expects [B, T], got {other:?}"
+          _ => {
+            return Err(Error::RankMismatch(RankMismatchPayload::new(
+              "RecordingVlmModel::embed_tokens expects [B, T] (rank 2)",
+              tokens.shape().len() as u32,
+              tokens.shape(),
             )));
           }
         };
@@ -2055,15 +2074,24 @@ mod tests {
     let Err(err) = load(&config, &model_registry, &processor_registry) else {
       panic!("unknown VLM model_type must error");
     };
-    let msg = err.to_string();
-    assert!(msg.contains("unsupported VLM model type"), "got: {msg}");
-    assert!(msg.contains("nope"), "error should name the type: {msg}");
+    match &err {
+      Error::MissingKey(p) => {
+        assert_eq!(p.key(), "nope", "error should carry the model_type as key");
+        assert!(
+          p.context().contains("model_type"),
+          "context should name model_type, got: {}",
+          p.context()
+        );
+      }
+      _ => panic!("expected MissingKey, got: {err:?}"),
+    }
     // The processor-config / weights / tokenizer paths must NOT have
     // run: their files are intentionally absent/invalid here, and a
-    // failure on any of them surfaces a different error message.
+    // failure on any of them surfaces a different error variant.
+    let msg = err.to_string();
     assert!(
-      !msg.contains("safetensors") && !msg.contains("processor") && !msg.contains("tokenizer.json"),
-      "weights/processor/tokenizer must not have been loaded, got: {msg}"
+      !msg.contains("safetensors") && !msg.contains("tokenizer.json"),
+      "weights/tokenizer must not have been loaded, got: {msg}"
     );
   }
 
@@ -2094,19 +2122,22 @@ mod tests {
     let Err(err) = load(&config, &model_registry, &processor_registry) else {
       panic!("unknown processor class must error");
     };
+    match &err {
+      Error::MissingKey(p) => {
+        assert_eq!(
+          p.key(),
+          "WrongProc",
+          "error should carry the processor_class as key"
+        );
+        assert!(
+          p.context().contains("processor_class"),
+          "context should name processor_class, got: {}",
+          p.context()
+        );
+      }
+      _ => panic!("expected MissingKey, got: {err:?}"),
+    }
     let msg = err.to_string();
-    assert!(
-      msg.contains("unsupported VLM processor class"),
-      "got: {msg}"
-    );
-    assert!(
-      msg.contains("WrongProc"),
-      "error should name the class: {msg}"
-    );
-    assert!(
-      msg.contains("preprocessor_config.json"),
-      "error should name the source file: {msg}"
-    );
     assert!(
       !msg.contains("safetensors") && !msg.contains("tokenizer.json"),
       "weights/tokenizer must not have been loaded, got: {msg}"
@@ -2126,12 +2157,17 @@ mod tests {
     let Err(err) = load(&config, &model_registry, &processor_registry) else {
       panic!("missing processor config must error");
     };
-    let msg = err.to_string();
-    assert!(msg.contains("no processor config found"), "got: {msg}");
-    assert!(
-      msg.contains("preprocessor_config.json") && msg.contains("processor_config.json"),
-      "error should name both candidate filenames: {msg}"
-    );
+    match &err {
+      Error::FileIo(p) => {
+        assert_eq!(p.op(), FileOp::Open);
+        let s = p.path().to_string_lossy();
+        assert!(
+          s.contains("processor_config.json"),
+          "FileIo path should be the fallback processor_config.json, got: {s}"
+        );
+      }
+      _ => panic!("expected FileIo for missing processor config, got: {err:?}"),
+    }
   }
 
   #[test]
@@ -2905,15 +2941,24 @@ mod tests {
     let asserting_processor_ctor: ProcessorConstructor = Box::new(
       |loaded: &LoadedProcessor<'_>| -> Result<Box<dyn Processor>> {
         let preprocessor = loaded.preprocessor_config_json.ok_or_else(|| {
-          Error::Backend("expected preprocessor_config.json body on LoadedProcessor".into())
+          Error::MissingField(MissingFieldPayload::new(
+            "LoadedProcessor",
+            "preprocessor_config_json",
+          ))
         })?;
         let processor = loaded.processor_config_json.ok_or_else(|| {
-          Error::Backend(
-            "expected processor_config.json body on LoadedProcessor (the carried body)".into(),
-          )
+          Error::MissingField(MissingFieldPayload::new(
+            "LoadedProcessor (the carried body)",
+            "processor_config_json",
+          ))
         })?;
-        let pre: serde_json::Value = serde_json::from_str(preprocessor)
-          .map_err(|e| Error::Backend(format!("bad preprocessor body: {e}")))?;
+        let pre: serde_json::Value = serde_json::from_str(preprocessor).map_err(|e| {
+          Error::Parse(ParsePayload::new(
+            "asserting_processor_ctor: preprocessor body",
+            "JSON",
+            e,
+          ))
+        })?;
         let image_size = pre
           .get("mock_image_size")
           .and_then(serde_json::Value::as_u64)
@@ -2922,20 +2967,30 @@ mod tests {
             "preprocessor body",
             "mock_image_size",
           )))?;
-        let proc: serde_json::Value = serde_json::from_str(processor)
-          .map_err(|e| Error::Backend(format!("bad processor_config.json body: {e}")))?;
+        let proc: serde_json::Value = serde_json::from_str(processor).map_err(|e| {
+          Error::Parse(ParsePayload::new(
+            "asserting_processor_ctor: processor_config.json body",
+            "JSON",
+            e,
+          ))
+        })?;
         let seq_len = proc
           .get("image_seq_len")
           .and_then(serde_json::Value::as_u64)
           .ok_or_else(|| {
-            Error::Backend(
-              "processor_config.json body missing image_seq_len (the discarded field)".into(),
-            )
+            Error::MissingField(MissingFieldPayload::new(
+              "processor_config.json body (the discarded field)",
+              "image_seq_len",
+            ))
           })?;
         if seq_len != 256 {
-          return Err(Error::Backend(format!(
-            "image_seq_len must round-trip as 256, got {seq_len}"
-          )));
+          return Err(Error::LengthMismatch(
+            crate::error::LengthMismatchPayload::new(
+              "asserting_processor_ctor: image_seq_len round-trip",
+              256,
+              seq_len as usize,
+            ),
+          ));
         }
         Ok(Box::new(MockVlmProcessor {
           processor_class: loaded.processor_class.to_owned(),
@@ -3031,15 +3086,24 @@ mod tests {
     let asserting_processor_ctor: ProcessorConstructor = Box::new(
       |loaded: &LoadedProcessor<'_>| -> Result<Box<dyn Processor>> {
         let preprocessor = loaded.preprocessor_config_json.ok_or_else(|| {
-          Error::Backend("expected preprocessor_config.json body on LoadedProcessor".into())
+          Error::MissingField(MissingFieldPayload::new(
+            "LoadedProcessor",
+            "preprocessor_config_json",
+          ))
         })?;
         let processor = loaded.processor_config_json.ok_or_else(|| {
-          Error::Backend(
-            "expected processor_config.json body on LoadedProcessor (the carried body)".into(),
-          )
+          Error::MissingField(MissingFieldPayload::new(
+            "LoadedProcessor (the carried body)",
+            "processor_config_json",
+          ))
         })?;
-        let pre: serde_json::Value = serde_json::from_str(preprocessor)
-          .map_err(|e| Error::Backend(format!("bad preprocessor body: {e}")))?;
+        let pre: serde_json::Value = serde_json::from_str(preprocessor).map_err(|e| {
+          Error::Parse(ParsePayload::new(
+            "asserting_processor_ctor: preprocessor body",
+            "JSON",
+            e,
+          ))
+        })?;
         let image_size = pre
           .get("mock_image_size")
           .and_then(serde_json::Value::as_u64)
@@ -3048,20 +3112,30 @@ mod tests {
             "preprocessor body",
             "mock_image_size",
           )))?;
-        let proc: serde_json::Value = serde_json::from_str(processor)
-          .map_err(|e| Error::Backend(format!("bad processor_config.json body: {e}")))?;
+        let proc: serde_json::Value = serde_json::from_str(processor).map_err(|e| {
+          Error::Parse(ParsePayload::new(
+            "asserting_processor_ctor: processor_config.json body",
+            "JSON",
+            e,
+          ))
+        })?;
         let seq_len = proc
           .get("image_seq_len")
           .and_then(serde_json::Value::as_u64)
           .ok_or_else(|| {
-            Error::Backend(
-              "processor_config.json body missing image_seq_len (the discarded field)".into(),
-            )
+            Error::MissingField(MissingFieldPayload::new(
+              "processor_config.json body (the discarded field)",
+              "image_seq_len",
+            ))
           })?;
         if seq_len != 256 {
-          return Err(Error::Backend(format!(
-            "image_seq_len must round-trip as 256, got {seq_len}"
-          )));
+          return Err(Error::LengthMismatch(
+            crate::error::LengthMismatchPayload::new(
+              "asserting_processor_ctor: image_seq_len round-trip",
+              256,
+              seq_len as usize,
+            ),
+          ));
         }
         Ok(Box::new(MockVlmProcessor {
           processor_class: loaded.processor_class.to_owned(),
@@ -3112,15 +3186,21 @@ mod tests {
     let Err(err) = load(&configuration, &model_registry, &processor_registry) else {
       panic!("missing-processor-class across both files must error");
     };
-    let msg = err.to_string();
-    assert!(
-      msg.contains("processor_class") || msg.contains("dispatch class"),
-      "error should name the missing dispatch field, got: {msg}"
-    );
-    assert!(
-      msg.contains("preprocessor_config.json") && msg.contains("processor_config.json"),
-      "error should name both candidate filenames, got: {msg}"
-    );
+    match &err {
+      Error::MissingField(p) => {
+        assert_eq!(
+          p.field(),
+          "processor_class",
+          "MissingField should name processor_class as the field"
+        );
+        assert!(
+          p.type_name().contains("ProcessorConfig"),
+          "type_name should name ProcessorConfig, got: {}",
+          p.type_name()
+        );
+      }
+      _ => panic!("expected MissingField for missing processor_class, got: {err:?}"),
+    }
   }
 
   /// A concrete processor with a method that is NOT on the [`Processor`]
@@ -3247,19 +3327,23 @@ mod tests {
         // Read the arch field off `LoadedProcessor.config_json` — the
         // SAME single-read body the model constructor saw. It is NOT in
         // either processor-config body.
-        let cfg: serde_json::Value = serde_json::from_str(loaded.config_json)
-          .map_err(|e| Error::Backend(format!("processor ctor: bad model config_json: {e}")))?;
+        let cfg: serde_json::Value = serde_json::from_str(loaded.config_json).map_err(|e| {
+          Error::Parse(ParsePayload::new(
+            "processor ctor: model config_json",
+            "JSON",
+            e,
+          ))
+        })?;
         let hidden_size = cfg
           .get("text_config")
           .and_then(|t| t.get("hidden_size"))
           .and_then(serde_json::Value::as_u64)
           .and_then(|x| u32::try_from(x).ok())
           .ok_or_else(|| {
-            Error::Backend(
-              "processor ctor: text_config.hidden_size must be readable off \
-                      LoadedProcessor.config_json (config.json-only arch field)"
-                .into(),
-            )
+            Error::MissingField(MissingFieldPayload::new(
+              "processor ctor: LoadedProcessor.config_json (config.json-only arch field)",
+              "text_config.hidden_size",
+            ))
           })?;
         // Drive `image_size` from the config.json-only field (NOT the
         // processor config's `mock_image_size`) so the test can assert

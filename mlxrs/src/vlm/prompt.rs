@@ -68,7 +68,11 @@
 
 use crate::{
   array::Array,
-  error::{Error, Result, try_to_vec, try_with_capacity},
+  error::{
+    ArithmeticOverflowPayload, CapExceededPayload, EmptyInputPayload, Error,
+    InvariantViolationPayload, LengthMismatchPayload, MissingFieldPayload, OutOfRangePayload,
+    Result, try_to_vec, try_with_capacity,
+  },
 };
 
 /// Defensive upper bound on the number of items (image / audio / video
@@ -94,12 +98,13 @@ pub const MAX_MESSAGE_FORMAT_ITEMS: usize = 1024;
 /// else `Ok(())`. `label` is interpolated into the error message
 /// (e.g. `"num_images"`, `"num_audios"`, `"video.len()"`) for caller
 /// triage.
-fn check_format_count(count: usize, label: &str, model_name: &str) -> Result<()> {
+fn check_format_count(count: usize, label: &'static str, _model_name: &str) -> Result<()> {
   if count > MAX_MESSAGE_FORMAT_ITEMS {
-    return Err(Error::Backend(format!(
-      "MessageFormatter::format_message: {label}={count} exceeds the cap \
-         MAX_MESSAGE_FORMAT_ITEMS={MAX_MESSAGE_FORMAT_ITEMS} (model {model_name}); \
-         reduce the per-turn count or raise the cap"
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      label,
+      "MAX_MESSAGE_FORMAT_ITEMS",
+      MAX_MESSAGE_FORMAT_ITEMS as u64,
+      count as u64,
     )));
   }
   Ok(())
@@ -288,9 +293,9 @@ pub fn insert_image_tokens(
   // caller's images on the floor (downstream generation proceeds with the
   // images invisible to attention). Fail closed.
   if num_tokens_per_image == 0 {
-    return Err(Error::ShapeMismatch(format!(
-      "insert_image_tokens: num_tokens_per_image=0 with image_count={image_count} > 0 \
-         would silently drop {image_count} image(s) — config/model state is degenerate"
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "insert_image_tokens: num_tokens_per_image (with image_count > 0)",
+      "must be > 0 — otherwise images would silently drop, config/model state is degenerate",
     )));
   }
 
@@ -300,9 +305,13 @@ pub fn insert_image_tokens(
   let placeholder_total = image_count
     .checked_mul(num_tokens_per_image)
     .ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "insert_image_tokens: image_count * num_tokens_per_image overflows usize \
-         (image_count={image_count}, num_tokens_per_image={num_tokens_per_image})"
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "insert_image_tokens: placeholder_total (image_count * num_tokens_per_image)",
+        "usize",
+        [
+          ("image_count", image_count as u64),
+          ("num_tokens_per_image", num_tokens_per_image as u64),
+        ],
       ))
     })?;
 
@@ -325,11 +334,10 @@ pub fn insert_image_tokens(
 
     // Reject extra markers after the consumed run.
     if text_tokens[run_end..].contains(&image_marker_id) {
-      return Err(Error::ShapeMismatch(format!(
-        "insert_image_tokens: input contains a non-contiguous additional \
-           image_marker_id ({image_marker_id}) after the first run \
-           [{run_start}..{run_end}); the splice supports at most one \
-           contiguous marker run"
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "insert_image_tokens: image_marker_id occurrences (after the first contiguous run)",
+        "must be 0 — the splice supports at most one contiguous marker run \
+         (mirrors python prompt_utils' `prompt.split(\"<image>\")` 2-chunk contract)",
       )));
     }
 
@@ -342,11 +350,12 @@ pub fn insert_image_tokens(
     // duplicate image features (over-count), corrupting vision-feature
     // alignment without surfacing the upstream defect.
     if run_len != image_count {
-      return Err(Error::ShapeMismatch(format!(
-        "insert_image_tokens: contiguous marker run length {run_len} does not match \
-           image_count {image_count} (the chat-template producer should emit exactly \
-           `marker * image_count` adjacent markers; mismatch suggests caller/template \
-           skew)"
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "insert_image_tokens: contiguous marker run length vs image_count (the chat-template \
+           producer should emit exactly `marker * image_count` adjacent markers; mismatch \
+           suggests caller/template skew)",
+        image_count,
+        run_len,
       )));
     }
 
@@ -358,10 +367,14 @@ pub fn insert_image_tokens(
       .checked_add(placeholder_total)
       .and_then(|n| n.checked_sub(run_len))
       .ok_or_else(|| {
-        Error::ShapeMismatch(format!(
-          "insert_image_tokens: text_len + placeholder_total - run_len overflows usize \
-           (text_len={}, placeholder_total={placeholder_total}, run_len={run_len})",
-          text_tokens.len()
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+          "insert_image_tokens: cap (text_len + placeholder_total - run_len)",
+          "usize",
+          [
+            ("text_len", text_tokens.len() as u64),
+            ("placeholder_total", placeholder_total as u64),
+            ("run_len", run_len as u64),
+          ],
         ))
       })?;
     // Recoverable reservation (Codex VLM-8 R3F1): a huge non-overflowing
@@ -377,11 +390,11 @@ pub fn insert_image_tokens(
   } else {
     // No marker: behavior is caller-selected via MarkerPolicy.
     if policy == MarkerPolicy::Required {
-      return Err(Error::ShapeMismatch(format!(
-        "insert_image_tokens: no image_marker_id ({image_marker_id}) found in \
-           text_tokens but image_count={image_count} > 0 under MarkerPolicy::Required \
-           (chat-template / tokenizer drift detected; pass MarkerPolicy::PrependIfAbsent \
-           if the model uses the PROMPT_WITH_IMAGE_TOKEN-family formatter)"
+      return Err(Error::MissingField(MissingFieldPayload::new(
+        "insert_image_tokens (MarkerPolicy::Required, image_count > 0; chat-template / tokenizer \
+           drift detected — pass MarkerPolicy::PrependIfAbsent if the model uses the \
+           PROMPT_WITH_IMAGE_TOKEN-family formatter)",
+        "image_marker_id token in text_tokens",
       )));
     }
     // PrependIfAbsent → PROMPT_WITH_IMAGE_TOKEN path.
@@ -389,10 +402,13 @@ pub fn insert_image_tokens(
       .len()
       .checked_add(placeholder_total)
       .ok_or_else(|| {
-        Error::ShapeMismatch(format!(
-          "insert_image_tokens: text_len + placeholder_total overflows usize \
-           (text_len={}, placeholder_total={placeholder_total})",
-          text_tokens.len()
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+          "insert_image_tokens: cap (text_len + placeholder_total)",
+          "usize",
+          [
+            ("text_len", text_tokens.len() as u64),
+            ("placeholder_total", placeholder_total as u64),
+          ],
         ))
       })?;
     // Recoverable reservation (Codex VLM-8 R3F1) — see the marker-present
@@ -499,8 +515,10 @@ pub fn build_multimodal_mask_with_past(
   image_spans: &[(usize, usize)],
 ) -> Result<Array> {
   let total_keys = past_len.checked_add(seq_len).ok_or_else(|| {
-    Error::ShapeMismatch(format!(
-      "build_multimodal_mask_with_past: past_len ({past_len}) + seq_len ({seq_len}) overflows usize"
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "build_multimodal_mask_with_past: total_keys (past_len + seq_len)",
+      "usize",
+      [("past_len", past_len as u64), ("seq_len", seq_len as u64)],
     ))
   })?;
 
@@ -508,10 +526,9 @@ pub fn build_multimodal_mask_with_past(
   // spans on a zero-length chunk is an inconsistent state — fail closed.
   if seq_len == 0 {
     if !image_spans.is_empty() {
-      return Err(Error::ShapeMismatch(format!(
-        "build_multimodal_mask_with_past: seq_len=0 but image_spans has {} entry(s); \
-           empty chunk cannot contain any image span",
-        image_spans.len()
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "build_multimodal_mask_with_past: image_spans (with seq_len=0)",
+        "must be empty — an empty chunk cannot contain any image span",
       )));
     }
     return Array::from_slice::<bool>(&[], &(1_usize, 1_usize, 0_usize, total_keys));
@@ -520,8 +537,10 @@ pub fn build_multimodal_mask_with_past(
   // mlx dimensions are signed 32-bit; reject oversized dims BEFORE any
   // host-side allocation.
   if total_keys > i32::MAX as usize {
-    return Err(Error::ShapeMismatch(format!(
-      "build_multimodal_mask_with_past: past_len + seq_len ({total_keys}) exceeds i32::MAX (mlx dimension limit)"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "build_multimodal_mask_with_past: total_keys (past_len + seq_len)",
+      "must be <= i32::MAX (mlx dimension limit)",
+      format!("{total_keys}"),
     )));
   }
 
@@ -531,18 +550,22 @@ pub fn build_multimodal_mask_with_past(
   let mut prev_end = 0usize;
   for &(s, e) in &sorted {
     if s >= e {
-      return Err(Error::ShapeMismatch(format!(
-        "build_multimodal_mask_with_past: image span ({s}, {e}) is empty (start>=end)"
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "build_multimodal_mask_with_past: image span (start, end)",
+        "start must be strictly less than end (empty spans not allowed)",
       )));
     }
     if e > seq_len {
-      return Err(Error::ShapeMismatch(format!(
-        "build_multimodal_mask_with_past: chunk-local image span ({s}, {e}) end exceeds seq_len {seq_len}"
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "build_multimodal_mask_with_past: chunk-local image span end vs seq_len",
+        "must be <= seq_len",
+        format!("end={e}, seq_len={seq_len}"),
       )));
     }
     if s < prev_end {
-      return Err(Error::ShapeMismatch(format!(
-        "build_multimodal_mask_with_past: image span ({s}, {e}) overlaps the previous span ending at {prev_end}"
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "build_multimodal_mask_with_past: image span order (s vs prev_end)",
+        "spans must be monotone non-overlapping",
       )));
     }
     prev_end = e;
@@ -550,8 +573,13 @@ pub fn build_multimodal_mask_with_past(
 
   // Total buffer size with overflow guard: seq_len rows × total_keys cols.
   let total = seq_len.checked_mul(total_keys).ok_or_else(|| {
-    Error::ShapeMismatch(format!(
-      "build_multimodal_mask_with_past: seq_len*({past_len}+{seq_len}) overflows usize"
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "build_multimodal_mask_with_past: total (seq_len * total_keys)",
+      "usize",
+      [
+        ("seq_len", seq_len as u64),
+        ("total_keys", total_keys as u64),
+      ],
     ))
   })?;
 
@@ -689,9 +717,9 @@ pub fn assemble_multimodal_prompt(
   // (matches `insert_image_tokens`'s guard; surfacing this from the
   // assembler avoids the silent text-only-prompt fail-open path).
   if image_count > 0 && num_tokens_per_image == 0 {
-    return Err(Error::ShapeMismatch(format!(
-      "assemble_multimodal_prompt: num_tokens_per_image=0 with image_count={image_count} > 0 \
-         would silently drop {image_count} image(s) — config/model state is degenerate"
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "assemble_multimodal_prompt: num_tokens_per_image (with image_count > 0)",
+      "must be > 0 — otherwise images would silently drop, config/model state is degenerate",
     )));
   }
 
@@ -724,9 +752,13 @@ pub fn assemble_multimodal_prompt(
   let placeholder_total = image_count
     .checked_mul(num_tokens_per_image)
     .ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "assemble_multimodal_prompt: image_count * num_tokens_per_image overflows usize \
-         (image_count={image_count}, num_tokens_per_image={num_tokens_per_image})"
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "assemble_multimodal_prompt: placeholder_total (image_count * num_tokens_per_image)",
+        "usize",
+        [
+          ("image_count", image_count as u64),
+          ("num_tokens_per_image", num_tokens_per_image as u64),
+        ],
       ))
     })?;
   let final_len = if placeholder_total == 0 {
@@ -736,16 +768,23 @@ pub fn assemble_multimodal_prompt(
       .len()
       .checked_add(placeholder_total)
       .and_then(|n| n.checked_sub(marker_run_len))
-      .ok_or_else(|| Error::ShapeMismatch(format!(
-          "assemble_multimodal_prompt: text_len + placeholder_total - marker_run_len overflows usize \
-           (text_len={}, placeholder_total={placeholder_total}, marker_run_len={marker_run_len})",
-          text_tokens.len()
-        )))?
+      .ok_or_else(|| {
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+          "assemble_multimodal_prompt: final_len (text_len + placeholder_total - marker_run_len)",
+          "usize",
+          [
+            ("text_len", text_tokens.len() as u64),
+            ("placeholder_total", placeholder_total as u64),
+            ("marker_run_len", marker_run_len as u64),
+          ],
+        ))
+      })?
   };
   if final_len > i32::MAX as usize {
-    return Err(Error::ShapeMismatch(format!(
-      "assemble_multimodal_prompt: final assembled length {final_len} exceeds i32::MAX \
-         (mlx dimension limit); reject before allocating splice buffer"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "assemble_multimodal_prompt: final assembled length",
+      "must be <= i32::MAX (mlx dimension limit; reject before allocating splice buffer)",
+      format!("{final_len}"),
     )));
   }
 
@@ -766,23 +805,31 @@ pub fn assemble_multimodal_prompt(
   if image_count > 0 && num_tokens_per_image > 0 {
     image_spans = try_with_capacity(image_count)?;
     for i in 0..image_count {
-      let start = base
-        .checked_add(i.checked_mul(num_tokens_per_image).ok_or_else(|| {
-          Error::ShapeMismatch(format!(
-            "assemble_multimodal_prompt: i * num_tokens_per_image overflows usize \
-               (i={i}, num_tokens_per_image={num_tokens_per_image})"
-          ))
-        })?)
-        .ok_or_else(|| {
-          Error::ShapeMismatch(format!(
-            "assemble_multimodal_prompt: base + i*num_tokens_per_image overflows usize \
-             (base={base}, i={i}, num_tokens_per_image={num_tokens_per_image})"
-          ))
-        })?;
+      let i_times_n = i.checked_mul(num_tokens_per_image).ok_or_else(|| {
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+          "assemble_multimodal_prompt: i * num_tokens_per_image",
+          "usize",
+          [
+            ("i", i as u64),
+            ("num_tokens_per_image", num_tokens_per_image as u64),
+          ],
+        ))
+      })?;
+      let start = base.checked_add(i_times_n).ok_or_else(|| {
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+          "assemble_multimodal_prompt: start (base + i * num_tokens_per_image)",
+          "usize",
+          [("base", base as u64), ("i_times_n", i_times_n as u64)],
+        ))
+      })?;
       let end = start.checked_add(num_tokens_per_image).ok_or_else(|| {
-        Error::ShapeMismatch(format!(
-          "assemble_multimodal_prompt: start + num_tokens_per_image overflows usize \
-             (start={start}, num_tokens_per_image={num_tokens_per_image})"
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+          "assemble_multimodal_prompt: end (start + num_tokens_per_image)",
+          "usize",
+          [
+            ("start", start as u64),
+            ("num_tokens_per_image", num_tokens_per_image as u64),
+          ],
         ))
       })?;
       image_spans.push((start, end));
@@ -1366,8 +1413,9 @@ impl MessageFormatter {
     let idx = MODEL_CONFIG
       .binary_search_by(|(k, _)| (*k).cmp(lower.as_str()))
       .map_err(|_| {
-        Error::ShapeMismatch(format!(
-          "MessageFormatter::for_model: unsupported model: {model_type}"
+        Error::MissingKey(crate::error::MissingKeyPayload::new(
+          "MessageFormatter::for_model: model_type not in MODEL_CONFIG",
+          model_type.to_owned(),
         ))
       })?;
     Ok(Self {
@@ -1403,10 +1451,11 @@ impl MessageFormatter {
         .binary_search(&self.model_name.as_str())
         .is_ok()
     {
-      return Err(Error::ShapeMismatch(format!(
-        "MessageFormatter::format_message: model {} does not support multi-image chat. \
-           Please only use 1 image.",
-        self.model_name
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "MessageFormatter::format_message: opts.num_images (this model is in \
+           SINGLE_IMAGE_ONLY_MODELS — please use only 1 image)",
+        "must be <= 1",
+        format!("{}", opts.num_images),
       )));
     }
 
@@ -1484,11 +1533,16 @@ impl MessageFormatter {
     let cap = effective_n
       .checked_mul(7) // "<image>".len()
       .and_then(|n| n.checked_add(prompt.len()))
-      .ok_or_else(|| Error::Backend(format!(
-          "MessageFormatter::format_prompt_with_image_token: 7*num_images + prompt.len() \
-           overflows usize (num_images={effective_n}, prompt.len()={})",
-          prompt.len()
-        )))?;
+      .ok_or_else(|| {
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+          "MessageFormatter::format_prompt_with_image_token: cap (7 * num_images + prompt.len())",
+          "usize",
+          [
+            ("num_images", effective_n as u64),
+            ("prompt_len", prompt.len() as u64),
+          ],
+        ))
+      })?;
     let mut s = String::new();
     s.try_reserve_exact(cap).map_err(|_| Error::OutOfMemory)?;
     for _ in 0..effective_n {
@@ -1522,11 +1576,17 @@ impl MessageFormatter {
     let cap = effective_n
       .checked_mul(16) // "<start_of_image>".len()
       .and_then(|n| n.checked_add(prompt.len()))
-      .ok_or_else(|| Error::Backend(format!(
-          "MessageFormatter::format_prompt_with_start_image_token: 16*num_images + prompt.len() \
-           overflows usize (num_images={effective_n}, prompt.len()={})",
-          prompt.len()
-        )))?;
+      .ok_or_else(|| {
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+          "MessageFormatter::format_prompt_with_start_image_token: cap (16 * num_images + \
+             prompt.len())",
+          "usize",
+          [
+            ("num_images", effective_n as u64),
+            ("prompt_len", prompt.len() as u64),
+          ],
+        ))
+      })?;
     let mut s = String::new();
     s.try_reserve_exact(cap).map_err(|_| Error::OutOfMemory)?;
     s.push_str(prompt);
@@ -1563,9 +1623,10 @@ impl MessageFormatter {
       0
     };
     let cap = 1usize.checked_add(effective_n).ok_or_else(|| {
-      Error::Backend(format!(
-        "MessageFormatter::format_list_with_image: 1 + num_images overflows usize \
-           (num_images={effective_n})"
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "MessageFormatter::format_list_with_image: cap (1 + num_images)",
+        "usize",
+        [("num_images", effective_n as u64)],
       ))
     })?;
     let mut content: Vec<ContentItem> = try_with_capacity(cap)?;
@@ -1649,9 +1710,10 @@ impl MessageFormatter {
       .checked_add(n_img)
       .and_then(|n| n.checked_add(n_aud))
       .ok_or_else(|| {
-        Error::Backend(format!(
-          "MessageFormatter::format_list_with_image_type: 1 + num_images + num_audios overflows \
-           usize (num_images={n_img}, num_audios={n_aud})"
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+          "MessageFormatter::format_list_with_image_type: cap (1 + num_images + num_audios)",
+          "usize",
+          [("num_images", n_img as u64), ("num_audios", n_aud as u64)],
         ))
       })?;
 
@@ -1725,26 +1787,37 @@ impl MessageFormatter {
     // under the cap).
     const AUDIO_BYTES_PER_AUDIO: usize = 32;
     let token_bytes = token.len().checked_mul(n_img).ok_or_else(|| {
-      Error::Backend(format!(
-        "MessageFormatter::format_with_token: token.len() * num_images overflows usize \
-           (token.len()={}, num_images={n_img})",
-        token.len()
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "MessageFormatter::format_with_token: token_bytes (token.len() * num_images)",
+        "usize",
+        [
+          ("token_len", token.len() as u64),
+          ("num_images", n_img as u64),
+        ],
       ))
     })?;
     let audio_bytes = AUDIO_BYTES_PER_AUDIO.checked_mul(n_aud).ok_or_else(|| {
-      Error::Backend(format!(
-        "MessageFormatter::format_with_token: audio prefix bytes overflow usize \
-           (num_audios={n_aud})"
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "MessageFormatter::format_with_token: audio_bytes (AUDIO_BYTES_PER_AUDIO * num_audios)",
+        "usize",
+        [
+          ("AUDIO_BYTES_PER_AUDIO", AUDIO_BYTES_PER_AUDIO as u64),
+          ("num_audios", n_aud as u64),
+        ],
       ))
     })?;
     let cap = token_bytes
       .checked_add(audio_bytes)
       .and_then(|n| n.checked_add(prompt.len()))
       .ok_or_else(|| {
-        Error::Backend(format!(
-          "MessageFormatter::format_with_token: total content bytes overflow usize \
-           (token_bytes={token_bytes}, audio_bytes={audio_bytes}, prompt.len()={})",
-          prompt.len()
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+          "MessageFormatter::format_with_token: cap (token_bytes + audio_bytes + prompt.len())",
+          "usize",
+          [
+            ("token_bytes", token_bytes as u64),
+            ("audio_bytes", audio_bytes as u64),
+            ("prompt_len", prompt.len() as u64),
+          ],
         ))
       })?;
 
@@ -1805,25 +1878,37 @@ impl MessageFormatter {
     // `<|audio_N|>` = 12 bytes, same width concern).
     const BYTES_PER_TOKEN: usize = 16;
     let img_bytes = BYTES_PER_TOKEN.checked_mul(n_img).ok_or_else(|| {
-      Error::Backend(format!(
-        "MessageFormatter::format_numbered_tokens: image-prefix bytes overflow usize \
-           (num_images={n_img})"
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "MessageFormatter::format_numbered_tokens: img_bytes (BYTES_PER_TOKEN * num_images)",
+        "usize",
+        [
+          ("BYTES_PER_TOKEN", BYTES_PER_TOKEN as u64),
+          ("num_images", n_img as u64),
+        ],
       ))
     })?;
     let aud_bytes = BYTES_PER_TOKEN.checked_mul(n_aud).ok_or_else(|| {
-      Error::Backend(format!(
-        "MessageFormatter::format_numbered_tokens: audio-prefix bytes overflow usize \
-           (num_audios={n_aud})"
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "MessageFormatter::format_numbered_tokens: aud_bytes (BYTES_PER_TOKEN * num_audios)",
+        "usize",
+        [
+          ("BYTES_PER_TOKEN", BYTES_PER_TOKEN as u64),
+          ("num_audios", n_aud as u64),
+        ],
       ))
     })?;
     let cap = img_bytes
       .checked_add(aud_bytes)
       .and_then(|n| n.checked_add(prompt.len()))
       .ok_or_else(|| {
-        Error::Backend(format!(
-          "MessageFormatter::format_numbered_tokens: total content bytes overflow usize \
-           (img_bytes={img_bytes}, aud_bytes={aud_bytes}, prompt.len()={})",
-          prompt.len()
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+          "MessageFormatter::format_numbered_tokens: cap (img_bytes + aud_bytes + prompt.len())",
+          "usize",
+          [
+            ("img_bytes", img_bytes as u64),
+            ("aud_bytes", aud_bytes as u64),
+            ("prompt_len", prompt.len() as u64),
+          ],
         ))
       })?;
 
@@ -1855,10 +1940,9 @@ impl MessageFormatter {
   /// fps_list and content `Vec`s both use fallible reservation.
   fn format_video_message(&self, prompt: &str, opts: &FormatOpts) -> Result<FormattedMessage> {
     if opts.video.is_empty() {
-      return Err(Error::ShapeMismatch(format!(
-        "MessageFormatter::format_video_message: model {} requires opts.video to be \
-           non-empty (the python branch unconditionally dereferences kwargs['video'])",
-        self.model_name
+      return Err(Error::EmptyInput(EmptyInputPayload::new(
+        "MessageFormatter::format_video_message: opts.video (the python branch unconditionally \
+           dereferences kwargs['video'])",
       )));
     }
 
@@ -1883,17 +1967,19 @@ impl MessageFormatter {
       v.extend_from_slice(&opts.fps);
       v
     } else {
-      return Err(Error::ShapeMismatch(format!(
-        "MessageFormatter::format_video_message: got {} fps values for {} videos.",
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "MessageFormatter::format_video_message: opts.fps vs opts.video length (fps must be empty, \
+           a scalar, or match video.len() exactly)",
+        n_vid,
         opts.fps.len(),
-        n_vid
       )));
     };
 
     let cap = n_vid.checked_add(1).ok_or_else(|| {
-      Error::Backend(format!(
-        "MessageFormatter::format_video_message: video.len() + 1 overflows usize \
-         (video.len()={n_vid})"
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "MessageFormatter::format_video_message: cap (video.len() + 1)",
+        "usize",
+        [("video_len", n_vid as u64)],
       ))
     })?;
     let mut content: Vec<ContentItem> = try_with_capacity(cap)?;
