@@ -1086,7 +1086,7 @@ fn kl_forward_apply(logits_q: &Array, logits_p: &Array) -> Result<Array> {
     /* thread_group */ [1024, 1, 1],
     /* output_shapes */ vec![out_shape],
     /* output_dtypes */ vec![dtype],
-  )
+  )?
   .with_template(template_for(dtype, vocab));
 
   with_kernel(&KL_FORWARD, build_kl_forward_kernel, |kernel| {
@@ -1127,7 +1127,7 @@ fn kl_backward_apply(logits_q: &Array, logits_p: &Array, cotangent: &Array) -> R
     [1024, 1, 1],
     vec![out_shape],
     vec![dtype],
-  )
+  )?
   .with_template(template_for(dtype, vocab));
 
   with_kernel(&KL_BACKWARD, build_kl_backward_kernel, |kernel| {
@@ -1155,7 +1155,7 @@ fn js_forward_apply(logits_q: &Array, logits_p: &Array) -> Result<(Array, Array)
     [1024, 1, 1],
     vec![leading.clone(), leading],
     vec![dtype, dtype],
-  )
+  )?
   .with_template(template_for(dtype, vocab));
 
   with_kernel(&JS_FORWARD, build_js_forward_kernel, |kernel| {
@@ -1198,7 +1198,7 @@ fn js_backward_apply(
     [1024, 1, 1],
     vec![out_shape],
     vec![dtype],
-  )
+  )?
   .with_template(template_for(dtype, vocab));
 
   with_kernel(&JS_BACKWARD, build_js_backward_kernel, |kernel| {

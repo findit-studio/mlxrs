@@ -65,13 +65,16 @@ fn kl_div_loss_rejects_rank_1_input() {
   let logits_p = Array::ones::<f32>(&[4]).unwrap();
   let err = kl_div_loss(&logits_q, &logits_p).unwrap_err();
   match err {
-    Error::Backend(message) => {
+    Error::RankMismatch(p) => {
+      assert_eq!(p.actual(), 1);
+      assert_eq!(p.actual_shape(), &[4]);
       assert!(
-        message.contains("rank >= 2"),
-        "expected rank-rejection message; got: {message:?}"
+        p.context().contains("kl_div_loss"),
+        "context names the loss site: {}",
+        p.context()
       );
     }
-    other => panic!("expected Error::Backend, got: {other:?}"),
+    other => panic!("expected Error::RankMismatch, got: {other:?}"),
   }
 }
 
@@ -82,13 +85,16 @@ fn js_div_loss_rejects_rank_1_input() {
   let logits_p = Array::ones::<f32>(&[4]).unwrap();
   let err = js_div_loss(&logits_q, &logits_p).unwrap_err();
   match err {
-    Error::Backend(message) => {
+    Error::RankMismatch(p) => {
+      assert_eq!(p.actual(), 1);
+      assert_eq!(p.actual_shape(), &[4]);
       assert!(
-        message.contains("rank >= 2"),
-        "expected rank-rejection message; got: {message:?}"
+        p.context().contains("js_div_loss"),
+        "context names the loss site: {}",
+        p.context()
       );
     }
-    other => panic!("expected Error::Backend, got: {other:?}"),
+    other => panic!("expected Error::RankMismatch, got: {other:?}"),
   }
 }
 
@@ -102,13 +108,12 @@ fn kl_div_loss_rejects_integer_dtype() {
   let logits_p = Array::ones::<i32>(&[1, 4]).unwrap();
   let err = kl_div_loss(&logits_q, &logits_p).unwrap_err();
   match err {
-    Error::Backend(message) => {
-      assert!(
-        message.contains("floating-point"),
-        "expected floating-only rejection message; got: {message:?}"
-      );
+    Error::UnsupportedDtype(p) => {
+      use mlxrs::Dtype;
+      assert_eq!(p.dtype(), Dtype::I32);
+      assert_eq!(p.supported(), &[Dtype::F32, Dtype::F16, Dtype::BF16]);
     }
-    other => panic!("expected Error::Backend, got: {other:?}"),
+    other => panic!("expected Error::UnsupportedDtype, got: {other:?}"),
   }
 }
 
@@ -119,13 +124,12 @@ fn kl_div_loss_rejects_bool_dtype() {
   let logits_p = Array::ones::<bool>(&[1, 4]).unwrap();
   let err = kl_div_loss(&logits_q, &logits_p).unwrap_err();
   match err {
-    Error::Backend(message) => {
-      assert!(
-        message.contains("floating-point"),
-        "expected floating-only rejection message; got: {message:?}"
-      );
+    Error::UnsupportedDtype(p) => {
+      use mlxrs::Dtype;
+      assert_eq!(p.dtype(), Dtype::Bool);
+      assert_eq!(p.supported(), &[Dtype::F32, Dtype::F16, Dtype::BF16]);
     }
-    other => panic!("expected Error::Backend, got: {other:?}"),
+    other => panic!("expected Error::UnsupportedDtype, got: {other:?}"),
   }
 }
 
@@ -136,13 +140,12 @@ fn js_div_loss_rejects_integer_dtype() {
   let logits_p = Array::ones::<i32>(&[1, 4]).unwrap();
   let err = js_div_loss(&logits_q, &logits_p).unwrap_err();
   match err {
-    Error::Backend(message) => {
-      assert!(
-        message.contains("floating-point"),
-        "expected floating-only rejection message; got: {message:?}"
-      );
+    Error::UnsupportedDtype(p) => {
+      use mlxrs::Dtype;
+      assert_eq!(p.dtype(), Dtype::I32);
+      assert_eq!(p.supported(), &[Dtype::F32, Dtype::F16, Dtype::BF16]);
     }
-    other => panic!("expected Error::Backend, got: {other:?}"),
+    other => panic!("expected Error::UnsupportedDtype, got: {other:?}"),
   }
 }
 
@@ -153,13 +156,12 @@ fn js_div_loss_rejects_bool_dtype() {
   let logits_p = Array::ones::<bool>(&[1, 4]).unwrap();
   let err = js_div_loss(&logits_q, &logits_p).unwrap_err();
   match err {
-    Error::Backend(message) => {
-      assert!(
-        message.contains("floating-point"),
-        "expected floating-only rejection message; got: {message:?}"
-      );
+    Error::UnsupportedDtype(p) => {
+      use mlxrs::Dtype;
+      assert_eq!(p.dtype(), Dtype::Bool);
+      assert_eq!(p.supported(), &[Dtype::F32, Dtype::F16, Dtype::BF16]);
     }
-    other => panic!("expected Error::Backend, got: {other:?}"),
+    other => panic!("expected Error::UnsupportedDtype, got: {other:?}"),
   }
 }
 
@@ -179,13 +181,15 @@ fn kl_div_loss_rejects_rank_0_input() {
   let logits_p = Array::ones::<f32>(&[]).unwrap();
   let err = kl_div_loss(&logits_q, &logits_p).unwrap_err();
   match err {
-    Error::Backend(message) => {
+    Error::RankMismatch(p) => {
+      assert_eq!(p.actual(), 0);
       assert!(
-        message.contains("rank >= 2"),
-        "expected rank-rejection message; got: {message:?}"
+        p.context().contains("kl_div_loss"),
+        "context names the loss site: {}",
+        p.context()
       );
     }
-    other => panic!("expected Error::Backend, got: {other:?}"),
+    other => panic!("expected Error::RankMismatch, got: {other:?}"),
   }
 }
 
@@ -199,17 +203,20 @@ fn kl_div_loss_rejects_rank_1_vs_rank_2_mismatch() {
   let logits_p = Array::ones::<f32>(&[1, 4]).unwrap();
   let err = kl_div_loss(&logits_q, &logits_p).unwrap_err();
   match err {
-    Error::Backend(message) => {
-      assert!(
-        message.contains("rank >= 2"),
-        "expected rank-rejection message (rank-first precedence); got: {message:?}"
+    Error::RankMismatch(p) => {
+      assert_eq!(
+        p.actual(),
+        1,
+        "rank-first precedence: q (rank 1) reported first"
       );
     }
-    Error::ShapeMismatch(message) => panic!(
-      "rank-first precedence violated: got ShapeMismatch instead of rank rejection; \
-       message was: {message:?}"
+    Error::ShapePairMismatch(p) => panic!(
+      "rank-first precedence violated: got ShapePairMismatch (expected={:?}, actual={:?}) \
+       instead of rank rejection",
+      p.expected(),
+      p.actual()
     ),
-    other => panic!("expected Error::Backend, got: {other:?}"),
+    other => panic!("expected Error::RankMismatch, got: {other:?}"),
   }
 }
 
@@ -220,13 +227,15 @@ fn js_div_loss_rejects_rank_0_input() {
   let logits_p = Array::ones::<f32>(&[]).unwrap();
   let err = js_div_loss(&logits_q, &logits_p).unwrap_err();
   match err {
-    Error::Backend(message) => {
+    Error::RankMismatch(p) => {
+      assert_eq!(p.actual(), 0);
       assert!(
-        message.contains("rank >= 2"),
-        "expected rank-rejection message; got: {message:?}"
+        p.context().contains("js_div_loss"),
+        "context names the loss site: {}",
+        p.context()
       );
     }
-    other => panic!("expected Error::Backend, got: {other:?}"),
+    other => panic!("expected Error::RankMismatch, got: {other:?}"),
   }
 }
 
@@ -238,17 +247,20 @@ fn js_div_loss_rejects_rank_1_vs_rank_2_mismatch() {
   let logits_p = Array::ones::<f32>(&[1, 4]).unwrap();
   let err = js_div_loss(&logits_q, &logits_p).unwrap_err();
   match err {
-    Error::Backend(message) => {
-      assert!(
-        message.contains("rank >= 2"),
-        "expected rank-rejection message (rank-first precedence); got: {message:?}"
+    Error::RankMismatch(p) => {
+      assert_eq!(
+        p.actual(),
+        1,
+        "rank-first precedence: q (rank 1) reported first"
       );
     }
-    Error::ShapeMismatch(message) => panic!(
-      "rank-first precedence violated: got ShapeMismatch instead of rank rejection; \
-       message was: {message:?}"
+    Error::ShapePairMismatch(p) => panic!(
+      "rank-first precedence violated: got ShapePairMismatch (expected={:?}, actual={:?}) \
+       instead of rank rejection",
+      p.expected(),
+      p.actual()
     ),
-    other => panic!("expected Error::Backend, got: {other:?}"),
+    other => panic!("expected Error::RankMismatch, got: {other:?}"),
   }
 }
 
@@ -278,17 +290,21 @@ fn kl_div_loss_rejects_zero_last_dim_before_unsupported_dtype() {
   let logits_p = Array::from_slice::<i32>(&[], &[1i32, 0]).unwrap();
   let err = kl_div_loss(&logits_q, &logits_p).unwrap_err();
   match err {
-    Error::ShapeMismatch(message) => {
+    Error::OutOfRange(p) => {
       assert!(
-        message.contains("last dimension must be > 0"),
-        "expected zero-last-dim ShapeMismatch message; got: {message:?}"
+        p.context().contains("last dimension"),
+        "context names the last-dim check: {}",
+        p.context()
       );
+      assert_eq!(p.value(), "0");
+      assert_eq!(p.requirement(), "must be > 0");
     }
-    Error::Backend(message) => panic!(
-      "precedence violated: got dtype-admissibility Backend instead of ShapeMismatch \
-       for zero-last-dim `i32` input; message was: {message:?}"
+    Error::UnsupportedDtype(p) => panic!(
+      "precedence violated: got dtype-admissibility UnsupportedDtype({:?}) instead of \
+       OutOfRange for zero-last-dim `i32` input",
+      p.dtype()
     ),
-    other => panic!("expected Error::ShapeMismatch, got: {other:?}"),
+    other => panic!("expected Error::OutOfRange, got: {other:?}"),
   }
 }
 
@@ -301,19 +317,21 @@ fn kl_div_loss_rejects_zero_last_dim_before_mixed_dtype() {
   let logits_p = Array::from_slice::<half::f16>(&[], &[1i32, 0]).unwrap();
   let err = kl_div_loss(&logits_q, &logits_p).unwrap_err();
   match err {
-    Error::ShapeMismatch(message) => {
+    Error::OutOfRange(p) => {
       assert!(
-        message.contains("last dimension must be > 0"),
-        "expected zero-last-dim ShapeMismatch message; got: {message:?}"
+        p.context().contains("last dimension"),
+        "context names the last-dim check: {}",
+        p.context()
       );
+      assert_eq!(p.value(), "0");
     }
     Error::DtypeMismatch(p) => panic!(
       "precedence violated: got DtypeMismatch (expected {:?}, got {:?}) \
-       instead of ShapeMismatch for zero-last-dim mixed-dtype input",
+       instead of OutOfRange for zero-last-dim mixed-dtype input",
       p.expected(),
       p.got()
     ),
-    other => panic!("expected Error::ShapeMismatch, got: {other:?}"),
+    other => panic!("expected Error::OutOfRange, got: {other:?}"),
   }
 }
 
@@ -326,17 +344,20 @@ fn js_div_loss_rejects_zero_last_dim_before_unsupported_dtype() {
   let logits_p = Array::from_slice::<i32>(&[], &[1i32, 0]).unwrap();
   let err = js_div_loss(&logits_q, &logits_p).unwrap_err();
   match err {
-    Error::ShapeMismatch(message) => {
+    Error::OutOfRange(p) => {
       assert!(
-        message.contains("last dimension must be > 0"),
-        "expected zero-last-dim ShapeMismatch message; got: {message:?}"
+        p.context().contains("last dimension"),
+        "context names the last-dim check: {}",
+        p.context()
       );
+      assert_eq!(p.value(), "0");
     }
-    Error::Backend(message) => panic!(
-      "precedence violated: got dtype-admissibility Backend instead of ShapeMismatch \
-       for zero-last-dim `i32` input; message was: {message:?}"
+    Error::UnsupportedDtype(p) => panic!(
+      "precedence violated: got dtype-admissibility UnsupportedDtype({:?}) instead of \
+       OutOfRange for zero-last-dim `i32` input",
+      p.dtype()
     ),
-    other => panic!("expected Error::ShapeMismatch, got: {other:?}"),
+    other => panic!("expected Error::OutOfRange, got: {other:?}"),
   }
 }
 
@@ -349,19 +370,21 @@ fn js_div_loss_rejects_zero_last_dim_before_mixed_dtype() {
   let logits_p = Array::from_slice::<half::f16>(&[], &[1i32, 0]).unwrap();
   let err = js_div_loss(&logits_q, &logits_p).unwrap_err();
   match err {
-    Error::ShapeMismatch(message) => {
+    Error::OutOfRange(p) => {
       assert!(
-        message.contains("last dimension must be > 0"),
-        "expected zero-last-dim ShapeMismatch message; got: {message:?}"
+        p.context().contains("last dimension"),
+        "context names the last-dim check: {}",
+        p.context()
       );
+      assert_eq!(p.value(), "0");
     }
     Error::DtypeMismatch(p) => panic!(
       "precedence violated: got DtypeMismatch (expected {:?}, got {:?}) \
-       instead of ShapeMismatch for zero-last-dim mixed-dtype input",
+       instead of OutOfRange for zero-last-dim mixed-dtype input",
       p.expected(),
       p.got()
     ),
-    other => panic!("expected Error::ShapeMismatch, got: {other:?}"),
+    other => panic!("expected Error::OutOfRange, got: {other:?}"),
   }
 }
 

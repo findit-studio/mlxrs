@@ -158,9 +158,20 @@ fn cmudict_parse_primary_only_drops_variants() {
 #[test]
 fn cmudict_parse_line_malformed_returns_err_with_line_number() {
   // Line 7 has no whitespace (i.e. word with no pronunciation) — must
-  // surface as `Err(Backend)` carrying the line number.
+  // surface as `Err(Error::OutOfRange)` whose payload carries the line
+  // number in `value()` (post-§5 typed-payload migration).
   let err = parse_line("nospaces", 7).unwrap_err();
-  assert!(err.to_string().contains("line 7"), "{}", err);
+  match err {
+    mlxrs::Error::OutOfRange(p) => {
+      assert_eq!(p.context(), "CMUDict line");
+      assert_eq!(
+        p.requirement(),
+        "must contain whitespace between word and pronunciation"
+      );
+      assert_eq!(p.value(), "7");
+    }
+    other => panic!("expected OutOfRange with line 7, got {other:?}"),
+  }
 }
 
 #[test]
@@ -171,7 +182,17 @@ fn cmudict_parse_bulk_malformed_surfaces_line_number() {
               world  W ER1 L D\n";
   // The bad row is on line 3 (1-indexed, comments count).
   let err = parse(text, false).unwrap_err();
-  assert!(err.to_string().contains("line 3"), "{}", err);
+  match err {
+    mlxrs::Error::OutOfRange(p) => {
+      assert_eq!(p.context(), "CMUDict line");
+      assert_eq!(
+        p.requirement(),
+        "must contain whitespace between word and pronunciation"
+      );
+      assert_eq!(p.value(), "3");
+    }
+    other => panic!("expected OutOfRange with line 3, got {other:?}"),
+  }
 }
 
 // ============================================================
@@ -265,7 +286,14 @@ fn cmudict_loader_errors_on_missing_dict_file() {
   let dir = temp_dir("loader_missing");
   // Don't write the fixture.
   let err = CMUDictLoader::load(&dir).unwrap_err();
-  assert!(err.to_string().contains("cmudict.dict missing"), "{}", err);
+  match err {
+    mlxrs::Error::MissingKey(p) => {
+      assert_eq!(p.context(), "CMUDictLoader::load: required file not found");
+      let expected_path = dir.join("cmudict.dict");
+      assert_eq!(p.key(), expected_path.display().to_string());
+    }
+    other => panic!("expected MissingKey for missing cmudict.dict, got {other:?}"),
+  }
 }
 
 // ============================================================

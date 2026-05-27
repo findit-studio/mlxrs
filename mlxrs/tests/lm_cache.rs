@@ -79,7 +79,7 @@ fn standard_wrong_rank_errors() {
 /// faithful-revert removed the non-faithful K/V seq cross-check, leaving
 /// `RotatingKvCache::update_in_place` (S==1) reading `values.shape()[3]`
 /// raw. A rank-invalid `values` (with valid 4-D `keys`) must surface as a
-/// recoverable `Err(Error::ShapeMismatch(_))` (the faithful equivalent of
+/// recoverable `Err(Error::RankMismatch(_))` (the faithful equivalent of
 /// mlx-lm `cache.py:478` `values.shape[3]` raising a catchable
 /// `IndexError`), NEVER a Rust slice out-of-bounds panic on the
 /// `Result`-returning public `update`.
@@ -91,11 +91,20 @@ fn rotating_update_in_place_rank_invalid_values_errors_no_panic() {
   // 2-D `values` (rank < 4): would hit the raw `values.shape()[3]`.
   let bad_values = Array::from_slice::<f32>(&[0.0, 1.0], &(1usize, 2)).unwrap();
   let r = c.update(&keys, &bad_values);
-  assert!(
-    matches!(&r, Err(mlxrs::Error::ShapeMismatch(_))),
-    "rank-invalid values on the S==1 path must be a recoverable \
-     ShapeMismatch, got {r:?}"
-  );
+  match &r {
+    Err(mlxrs::Error::RankMismatch(p)) => {
+      assert_eq!(
+        p.context(),
+        "seq_len: KV cache expects 4-D values [B, n_kv_heads, S, head_dim]"
+      );
+      assert_eq!(p.actual(), 2);
+      assert_eq!(p.actual_shape(), &[1usize, 2]);
+    }
+    _ => panic!(
+      "rank-invalid values on the S==1 path must be a recoverable \
+       RankMismatch, got {r:?}"
+    ),
+  }
 }
 
 /// Regression (rank-safety, no panic on a recoverable path): the S>1
@@ -116,12 +125,21 @@ fn rotating_update_concat_rank_invalid_values_errors_no_panic() {
   // 2-D `values` (rank < 4).
   let bad_values = Array::from_slice::<f32>(&[2.0, 3.0], &(1usize, 2)).unwrap();
   let r = c.update(&keys, &bad_values);
-  assert!(
-    matches!(&r, Err(mlxrs::Error::ShapeMismatch(_))),
-    "rank-invalid values on the empty-cache S>1 path must be a DETERMINISTIC \
-     recoverable ShapeMismatch (per-tensor rank guard at update entry), got \
-     {r:?}"
-  );
+  match &r {
+    Err(mlxrs::Error::RankMismatch(p)) => {
+      assert_eq!(
+        p.context(),
+        "seq_len: KV cache expects 4-D values [B, n_kv_heads, S, head_dim]"
+      );
+      assert_eq!(p.actual(), 2);
+      assert_eq!(p.actual_shape(), &[1usize, 2]);
+    }
+    _ => panic!(
+      "rank-invalid values on the empty-cache S>1 path must be a DETERMINISTIC \
+       recoverable RankMismatch (per-tensor rank guard at update entry), got \
+       {r:?}"
+    ),
+  }
   // A subsequent valid update must still succeed, proving the failed call
   // did not store the malformed 2-D values buffer in the cache.
   c.update(&keys, &keys).unwrap();
@@ -150,12 +168,21 @@ fn rotating_update_concat_single_part_fast_path_rank_invalid_no_corruption() {
   let keys = kv(&[1.0, 2.0]);
   let bad_values = Array::from_slice::<f32>(&[1.0, 2.0], &(1usize, 2)).unwrap();
   let r = c.update(&keys, &bad_values);
-  assert!(
-    matches!(&r, Err(mlxrs::Error::ShapeMismatch(_))),
-    "rank-invalid lone-surviving values must be a DETERMINISTIC recoverable \
-     ShapeMismatch (per-tensor rank guard at update entry rejects it before \
-     dispatch), got {r:?}"
-  );
+  match &r {
+    Err(mlxrs::Error::RankMismatch(p)) => {
+      assert_eq!(
+        p.context(),
+        "seq_len: KV cache expects 4-D values [B, n_kv_heads, S, head_dim]"
+      );
+      assert_eq!(p.actual(), 2);
+      assert_eq!(p.actual_shape(), &[1usize, 2]);
+    }
+    _ => panic!(
+      "rank-invalid lone-surviving values must be a DETERMINISTIC recoverable \
+       RankMismatch (per-tensor rank guard at update entry rejects it before \
+       dispatch), got {r:?}"
+    ),
+  }
   // The failed update must NOT have stored the rank-invalid buffer: a
   // subsequent VALID update must succeed without panicking on a raw
   // cached-shape read (`temporal_order`/`set_seq`).
@@ -173,7 +200,7 @@ fn rotating_update_concat_single_part_fast_path_rank_invalid_no_corruption() {
 /// `values` with a STANDALONE per-tensor `seq_len("values", values)?` check
 /// symmetric to the `keys` one (NOT a K/V seq cross-check), so a
 /// rank-invalid `values` is a DETERMINISTIC recoverable
-/// `Err(Error::ShapeMismatch)` on entry — independent of the feature combo
+/// `Err(Error::RankMismatch)` on entry — independent of the feature combo
 /// (i.e. no longer dependent on whether the downstream backend concat
 /// happens to reject it) — never a panic on the `Result` API.
 #[test]
@@ -186,11 +213,20 @@ fn standard_rank_invalid_values_errors_no_panic() {
   let keys = kv(&[2.0]);
   let bad_values = Array::from_slice::<f32>(&[2.0, 3.0], &(1usize, 2)).unwrap();
   let r = c.update(&keys, &bad_values);
-  assert!(
-    matches!(&r, Err(mlxrs::Error::ShapeMismatch(_))),
-    "rank-invalid values must be a DETERMINISTIC recoverable ShapeMismatch \
-     (per-tensor rank guard at update entry), got {r:?}"
-  );
+  match &r {
+    Err(mlxrs::Error::RankMismatch(p)) => {
+      assert_eq!(
+        p.context(),
+        "seq_len: KV cache expects 4-D values [B, n_kv_heads, S, head_dim]"
+      );
+      assert_eq!(p.actual(), 2);
+      assert_eq!(p.actual_shape(), &[1usize, 2]);
+    }
+    _ => panic!(
+      "rank-invalid values must be a DETERMINISTIC recoverable RankMismatch \
+       (per-tensor rank guard at update entry), got {r:?}"
+    ),
+  }
 }
 
 #[test]
@@ -829,10 +865,14 @@ fn rotating_offset_overflow_is_rejected_without_partial_mutation() {
   // S == 2 -> `_update_concat`: `offset (MAX) + S (2)` overflows.
   let two = kv(&[1.0, 2.0]);
   let r_concat = c.update(&two, &two);
-  assert!(
-    matches!(r_concat, Err(mlxrs::Error::ShapeMismatch(_))),
-    "concat-path offset overflow must be Err(ShapeMismatch), got {r_concat:?}"
-  );
+  match &r_concat {
+    Err(mlxrs::Error::ArithmeticOverflow(p)) => {
+      assert_eq!(p.context(), "RotatingKvCache::update_concat: offset + S");
+      assert_eq!(p.op_type(), "usize");
+      assert_eq!(p.operands(), &[("offset", usize::MAX as u64), ("S", 2u64)]);
+    }
+    _ => panic!("concat-path offset overflow must be Err(ArithmeticOverflow), got {r_concat:?}"),
+  }
   // No partial mutation: all four meta fields + buffer presence unchanged.
   assert_eq!(
     c.meta_state(),
@@ -844,10 +884,17 @@ fn rotating_offset_overflow_is_rejected_without_partial_mutation() {
   // S == 1 -> `_update_in_place`: `offset (MAX) + S (1)` overflows.
   let one = kv(&[3.0]);
   let r_inplace = c.update(&one, &one);
-  assert!(
-    matches!(r_inplace, Err(mlxrs::Error::ShapeMismatch(_))),
-    "in-place-path offset overflow must be Err(ShapeMismatch), got {r_inplace:?}"
-  );
+  match &r_inplace {
+    Err(mlxrs::Error::ArithmeticOverflow(p)) => {
+      assert_eq!(
+        p.context(),
+        "RotatingKvCache::update_in_place: offset + S (S=1)"
+      );
+      assert_eq!(p.op_type(), "usize");
+      assert_eq!(p.operands(), &[("offset", usize::MAX as u64), ("S", 1u64)]);
+    }
+    _ => panic!("in-place-path offset overflow must be Err(ArithmeticOverflow), got {r_inplace:?}"),
+  }
   assert_eq!(
     c.meta_state(),
     before_meta,
@@ -1041,10 +1088,16 @@ fn create_causal_mask_offset_plus_n_overflow_is_err_not_panic() {
   // offset = usize::MAX, N = 2 -> offset + N overflows usize.
   // base.py: `rinds = mx.arange(offset + N)` — the very first line.
   let r = create_causal_mask(2, usize::MAX, None);
-  assert!(
-    matches!(r, Err(mlxrs::Error::ShapeMismatch(_))),
-    "offset + N overflow must be Err::ShapeMismatch (no debug panic, no release wrap)"
-  );
+  match &r {
+    Err(mlxrs::Error::ArithmeticOverflow(p)) => {
+      assert_eq!(p.context(), "create_causal_mask: offset + N");
+      assert_eq!(p.op_type(), "usize");
+      assert_eq!(p.operands(), &[("offset", usize::MAX as u64), ("N", 2u64)]);
+    }
+    _ => panic!(
+      "offset + N overflow must be Err::ArithmeticOverflow (no debug panic, no release wrap), got {r:?}"
+    ),
+  }
 
   // Through the StandardKvCache::make_mask -> create_attention_mask ->
   // create_causal_mask forward (cache.py:393 -> cache.py:117-118): a
@@ -1054,10 +1107,17 @@ fn create_causal_mask_offset_plus_n_overflow_is_err_not_panic() {
   // asserts the function-level guard the cache forward depends on holds for
   // the windowed branch too (offset + N still the first computation).
   let rw = create_causal_mask(3, usize::MAX, Some(4));
-  assert!(
-    matches!(rw, Err(mlxrs::Error::ShapeMismatch(_))),
-    "windowed create_causal_mask must also reject offset + N overflow before any range"
-  );
+  match &rw {
+    Err(mlxrs::Error::ArithmeticOverflow(p)) => {
+      assert_eq!(p.context(), "create_causal_mask: offset + N");
+      assert_eq!(p.op_type(), "usize");
+      assert_eq!(p.operands(), &[("offset", usize::MAX as u64), ("N", 3u64)]);
+    }
+    _ => panic!(
+      "windowed create_causal_mask must also reject offset + N overflow as \
+       ArithmeticOverflow before any range, got {rw:?}"
+    ),
+  }
 }
 
 // ── Copilot finding 4: window_size >= range is mlx-lm's unbounded no-op ───
@@ -1184,21 +1244,47 @@ fn rotating_make_mask_n_gt_1_offset_plus_n_overflow_is_err_not_panic() {
   // checked-add Err (NOT a debug panic, NOT a release wrap that would flip
   // the cache.py:560 decision to a wrong "causal"/array choice).
   let r = c.make_mask(2, None, false);
-  assert!(
-    matches!(r, Err(mlxrs::Error::ShapeMismatch(_))),
-    "RotatingKvCache::make_mask N>1 offset+N overflow must be Err::ShapeMismatch \
-     (no panic, no wrap-then-wrong-Causal-decision)"
-  );
+  match &r {
+    Err(mlxrs::Error::ArithmeticOverflow(p)) => {
+      assert_eq!(p.context(), "RotatingKvCache::make_mask: offset + N");
+      assert_eq!(p.op_type(), "usize");
+      assert_eq!(
+        p.operands(),
+        &[("offset", (usize::MAX - 1) as u64), ("N", 2u64)]
+      );
+    }
+    Err(other) => panic!(
+      "RotatingKvCache::make_mask N>1 offset+N overflow must be Err::ArithmeticOverflow \
+       (no panic, no wrap-then-wrong-Causal-decision), got Err({other:?})"
+    ),
+    Ok(_) => {
+      panic!("RotatingKvCache::make_mask N>1 offset+N overflow must be Err, got Ok(<MaskMode>)")
+    }
+  }
 
   // Same overflow with return_array=true: cache.py:560 is
   // `if offset + N > window_size or return_array` — `offset + N` is still
   // evaluated first, so the checked-add Err still surfaces (the `or
   // return_array` short-circuit does not skip the overflowing sum).
   let r_arr = c.make_mask(2, None, true);
-  assert!(
-    matches!(r_arr, Err(mlxrs::Error::ShapeMismatch(_))),
-    "RotatingKvCache::make_mask N>1 offset+N overflow must be Err even with return_array=true"
-  );
+  match &r_arr {
+    Err(mlxrs::Error::ArithmeticOverflow(p)) => {
+      assert_eq!(p.context(), "RotatingKvCache::make_mask: offset + N");
+      assert_eq!(p.op_type(), "usize");
+      assert_eq!(
+        p.operands(),
+        &[("offset", (usize::MAX - 1) as u64), ("N", 2u64)]
+      );
+    }
+    Err(other) => panic!(
+      "RotatingKvCache::make_mask N>1 offset+N overflow must be Err::ArithmeticOverflow \
+       even with return_array=true, got Err({other:?})"
+    ),
+    Ok(_) => panic!(
+      "RotatingKvCache::make_mask N>1 offset+N overflow (return_array=true) must be Err, \
+       got Ok(<MaskMode>)"
+    ),
+  }
 
   // Regression: a VALID (non-overflowing) N>1 input still produces the
   // unchanged cache.py:557-563 decision. RotatingKvCache::new(8,4), no
@@ -1358,8 +1444,8 @@ fn rope_offset_default_is_scalar_for_non_batch_caches() {
 /// Regression (#76, P6 cycle-8): the `KvCache::set_meta_state` trait default
 /// must mirror mlx-lm `_BaseCache.meta_state` setter (`cache.py:142-145`):
 /// a no-meta cache that receives a non-empty `meta_state` MUST raise
-/// (`ValueError` upstream → recoverable `Err(Error::Backend)` here), and an
-/// empty `meta_state` is the no-op success path.
+/// (`ValueError` upstream → recoverable `Err(Error::LengthMismatch)` here),
+/// and an empty `meta_state` is the no-op success path.
 ///
 /// `StandardKvCache` is the Rust port of mlx-lm's no-meta `KVCache` /
 /// `ConcatenateKVCache` / mlx-swift-lm's `KVCacheSimple` (`from_state` aliases
@@ -1382,6 +1468,10 @@ fn from_state_no_meta_cache_rejects_truthy_meta_state() {
     vec![kv(&[0.0, 1.0, 2.0]), kv(&[0.0, 1.0, 2.0])]
   }
 
+  // Mirrors `KvCache::set_meta_state` trait-default context string in
+  // mlx/src/lm/cache/mod.rs (kept in lockstep with production).
+  const NO_META_CTX: &str = "KvCache::set_meta_state: meta_state value count for a no-meta cache (mirrors mlx-lm `_BaseCache.meta_state` setter cache.py:142-145)";
+
   // Every mlx-lm/swift NO-META alias of `StandardKvCache` must reject a
   // non-empty meta_state (the fix's faithful `_BaseCache` mirror).
   for kind in &[
@@ -1392,15 +1482,14 @@ fn from_state_no_meta_cache_rejects_truthy_meta_state() {
   ] {
     let bad = from_state(kind, fresh_state(), &["x".to_string()]);
     match bad {
-      Err(Error::Backend(message)) => {
-        assert!(
-          message.contains("no meta_state"),
-          "kind {kind}: error message must explain the cause: got {message:?}"
-        );
+      Err(Error::LengthMismatch(p)) => {
+        assert_eq!(p.context(), NO_META_CTX, "kind {kind}: context mismatch");
+        assert_eq!(p.expected(), 0, "kind {kind}: expected count must be 0");
+        assert_eq!(p.actual(), 1, "kind {kind}: actual count must be 1");
       }
       Err(other) => panic!(
-        "kind {kind}: truthy meta_state must be rejected as Error::Backend (mirroring \
-         mlx-lm _BaseCache.meta_state setter cache.py:142-145), got {other:?}"
+        "kind {kind}: truthy meta_state must be rejected as Error::LengthMismatch \
+         (mirroring mlx-lm _BaseCache.meta_state setter cache.py:142-145), got {other:?}"
       ),
       Ok(_) => panic!(
         "kind {kind}: truthy meta_state must NOT silently round-trip (issue #76 P6 \
@@ -1415,10 +1504,18 @@ fn from_state_no_meta_cache_rejects_truthy_meta_state() {
       fresh_state(),
       &["x".to_string(), "y".to_string(), "z".to_string()],
     );
-    assert!(
-      matches!(bad_multi, Err(Error::Backend(_))),
-      "kind {kind}: multi-value truthy meta_state must also be rejected"
-    );
+    match bad_multi {
+      Err(Error::LengthMismatch(p)) => {
+        assert_eq!(p.context(), NO_META_CTX, "kind {kind}: context mismatch");
+        assert_eq!(p.expected(), 0, "kind {kind}: expected count must be 0");
+        assert_eq!(p.actual(), 3, "kind {kind}: actual count must be 3");
+      }
+      Err(other) => panic!(
+        "kind {kind}: multi-value truthy meta_state must also be rejected as \
+         Error::LengthMismatch, got Err({other:?})"
+      ),
+      Ok(_) => panic!("kind {kind}: multi-value truthy meta_state must NOT silently round-trip"),
+    }
   }
 
   // Empty meta_state must STILL succeed for every alias (the no-op
@@ -1487,14 +1584,25 @@ fn rotating_set_seq_full_window_rejects_mismatched_batch_dim() {
   // Mismatched-batch single-token KV (`[2,1,1,1]`). update_in_place sees
   // prev=0, cur_len=1, no grow, no trim, idx=0 stays 0, set_seq("keys",
   // buf=[1,1,1,1], 0, 1, new=[2,1,1,1]) → full-window. BEFORE FIX: silent
-  // batch-axis mutation. WITH FIX: Err(ShapeMismatch).
+  // batch-axis mutation. WITH FIX: Err(ShapePairMismatch).
   let bad_kv2 = Array::from_slice::<f32>(&[9.0, 9.5], &(2usize, 1, 1, 1)).unwrap();
   let r = c.update(&bad_kv2, &bad_kv2);
-  assert!(
-    matches!(&r, Err(mlxrs::Error::ShapeMismatch(_))),
-    "rotating full-window set_seq must reject batch-axis mismatch on the public \
-     update API (closes #78 P1 iter5), got {r:?}"
-  );
+  match &r {
+    Err(mlxrs::Error::ShapePairMismatch(p)) => {
+      assert_eq!(
+        p.context(),
+        "broadcast_write_rhs: keys write RHS non-broadcastable (mlx-lm \
+         slice-assignment raises on non-broadcastable non-seq axes; seq-axis \
+         target is the slice window length)"
+      );
+      assert_eq!(p.expected(), &[1usize, 1, 1, 1]);
+      assert_eq!(p.actual(), &[2usize, 1, 1, 1]);
+    }
+    _ => panic!(
+      "rotating full-window set_seq must reject batch-axis mismatch on the public \
+       update API as ShapePairMismatch (closes #78 P1 iter5), got {r:?}"
+    ),
+  }
 
   // Cache must be unchanged: a well-formed [1,1,1,1] update still succeeds,
   // demonstrating the buffer's batch axis was not silently mutated to 2.
@@ -1528,10 +1636,22 @@ fn rotating_set_seq_full_window_rejects_mismatched_heads_and_head_dim() {
   ])
   .unwrap();
   let r1 = c1.update(&bad_kv_heads, &bad_kv_heads);
-  assert!(
-    matches!(&r1, Err(mlxrs::Error::ShapeMismatch(_))),
-    "rotating full-window set_seq must reject n_kv_heads mismatch, got {r1:?}"
-  );
+  match &r1 {
+    Err(mlxrs::Error::ShapePairMismatch(p)) => {
+      assert_eq!(
+        p.context(),
+        "broadcast_write_rhs: keys write RHS non-broadcastable (mlx-lm \
+         slice-assignment raises on non-broadcastable non-seq axes; seq-axis \
+         target is the slice window length)"
+      );
+      assert_eq!(p.expected(), &[1usize, 1, 1, 1]);
+      assert_eq!(p.actual(), &[1usize, 3, 1, 1]);
+    }
+    _ => panic!(
+      "rotating full-window set_seq must reject n_kv_heads mismatch as \
+       ShapePairMismatch, got {r1:?}"
+    ),
+  }
   c1.update(&seed, &seed).unwrap();
   assert_eq!(c1.offset(), 1);
 
@@ -1546,10 +1666,22 @@ fn rotating_set_seq_full_window_rejects_mismatched_heads_and_head_dim() {
   ])
   .unwrap();
   let r2 = c2.update(&bad_kv_hd, &bad_kv_hd);
-  assert!(
-    matches!(&r2, Err(mlxrs::Error::ShapeMismatch(_))),
-    "rotating full-window set_seq must reject head_dim mismatch, got {r2:?}"
-  );
+  match &r2 {
+    Err(mlxrs::Error::ShapePairMismatch(p)) => {
+      assert_eq!(
+        p.context(),
+        "broadcast_write_rhs: keys write RHS non-broadcastable (mlx-lm \
+         slice-assignment raises on non-broadcastable non-seq axes; seq-axis \
+         target is the slice window length)"
+      );
+      assert_eq!(p.expected(), &[1usize, 1, 1, 1]);
+      assert_eq!(p.actual(), &[1usize, 1, 1, 2]);
+    }
+    _ => panic!(
+      "rotating full-window set_seq must reject head_dim mismatch as \
+       ShapePairMismatch, got {r2:?}"
+    ),
+  }
   c2.update(&seed, &seed).unwrap();
   assert_eq!(c2.offset(), 1);
 }
@@ -1678,11 +1810,22 @@ fn rotating_update_in_place_partial_mutation_on_set_seq_err_is_rejected() {
   // fix, `self` stays at offset=2, idx=2, buffer [1,1,2,1].
   let bad_kv2 = Array::from_slice::<f32>(&[9.0, 9.5], &(2usize, 1, 1, 1)).unwrap();
   let r = c.update(&bad_kv2, &bad_kv2);
-  assert!(
-    matches!(&r, Err(mlxrs::Error::ShapeMismatch(_))),
-    "non-broadcastable full-window RHS must be Err on the public update API \
-     (Codex iter-2 follow-up to #78), got {r:?}"
-  );
+  match &r {
+    Err(mlxrs::Error::ShapePairMismatch(p)) => {
+      assert_eq!(
+        p.context(),
+        "broadcast_write_rhs: keys write RHS non-broadcastable (mlx-lm \
+         slice-assignment raises on non-broadcastable non-seq axes; seq-axis \
+         target is the slice window length)"
+      );
+      assert_eq!(p.expected(), &[1usize, 1, 1, 1]);
+      assert_eq!(p.actual(), &[2usize, 1, 1, 1]);
+    }
+    _ => panic!(
+      "non-broadcastable full-window RHS must be Err::ShapePairMismatch on the \
+       public update API (Codex iter-2 follow-up to #78), got {r:?}"
+    ),
+  }
 
   // Critical: `self` MUST be byte-identical to its pre-update state. The
   // trim to length 1 + `idx -> keep` cursor reset must NOT have committed
@@ -1822,7 +1965,7 @@ fn p1_kvcache_as_any_mut_downcasts_for_all_8_in_tree_impls() {
 
   // 4. QuantizedKvCacheImpl
   {
-    let mut boxed: Box<dyn KvCache> = Box::new(QuantizedKvCacheImpl::new(64, 8));
+    let mut boxed: Box<dyn KvCache> = Box::new(QuantizedKvCacheImpl::new(64, 8).unwrap());
     assert!(
       boxed
         .as_any_mut()

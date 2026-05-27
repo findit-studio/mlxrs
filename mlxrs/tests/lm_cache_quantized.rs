@@ -71,7 +71,7 @@ fn assert_close(got: &mut Array, want: &mut Array) {
 /// sequence-axis concatenation.
 #[test]
 fn update_quantized_roundtrips_and_grows() {
-  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   assert!(c.is_empty());
   assert_eq!(c.offset(), 0);
   assert_eq!(c.group_size(), GROUP_SIZE);
@@ -132,7 +132,7 @@ fn update_quantized_roundtrips_and_grows() {
 /// `update_quantized`.
 #[test]
 fn base_update_returns_dequantized() {
-  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   let mut k = kv(4);
   let mut v = kv(4);
   let (mut dk, mut dv) = c.update(&k, &v).unwrap();
@@ -162,7 +162,7 @@ fn base_update_returns_dequantized() {
 /// `Some` triples dequantize back to the original.
 #[test]
 fn quantized_state_none_then_some() {
-  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   assert!(c.quantized_state().unwrap().is_none());
   assert!(c.as_quantized().is_some());
 
@@ -190,7 +190,7 @@ fn quantized_state_none_then_some() {
 /// and a fresh cache restored from it dequantizes identically.
 #[test]
 fn state_set_state_roundtrip() {
-  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   // Empty cache: state is [] (mlx-swift-lm `KVCache.swift:919`).
   assert!(c.state().unwrap().is_empty());
 
@@ -211,7 +211,7 @@ fn state_set_state_roundtrip() {
     vec!["3".to_string(), "64".to_string(), "8".to_string()]
   );
 
-  let mut c2 = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut c2 = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   c2.set_state(st_clone).unwrap();
   c2.set_meta_state(&meta).unwrap();
   assert_eq!(c2.offset(), 3);
@@ -237,7 +237,7 @@ fn state_set_state_roundtrip() {
 /// `(offset, group_size, bits)` (`cache.py:302-304`).
 #[test]
 fn from_state_quantized_roundtrip() {
-  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   let mut k = kv(2);
   let mut v = kv(2);
   c.update_quantized(&k, &v).unwrap();
@@ -295,7 +295,7 @@ fn from_state_quantized_roundtrip() {
 /// multi-token → `Causal` (no array) unless `return_array`/`window_size`.
 #[test]
 fn make_mask_forwards_to_create_attention_mask() {
-  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   c.update_quantized(&kv(3), &kv(3)).unwrap();
   // N == 1 → no mask (offset != 0 but single decode token).
   assert!(matches!(
@@ -325,7 +325,7 @@ fn make_mask_forwards_to_create_attention_mask() {
 /// deep clone (mlx-swift-lm `KVCache.swift:972-980`).
 #[test]
 fn trim_nbytes_copy() {
-  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   assert_eq!(c.nbytes(), 0);
   assert!(c.is_trimmable());
 
@@ -360,7 +360,7 @@ fn trim_nbytes_copy() {
 /// index.
 #[test]
 fn wrong_rank_errors() {
-  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   let bad = Array::from_slice::<f32>(&[1.0, 2.0], &(1usize, 2)).unwrap();
   assert!(c.update_quantized(&bad, &bad).is_err());
   assert!(c.update(&bad, &bad).is_err());
@@ -394,7 +394,7 @@ fn wrong_rank_errors() {
 /// adversarial-review finding (append-onto-stale-storage after trim).
 #[test]
 fn update_after_trim_overwrites_not_appends() {
-  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
 
   // update_and_fetch(S=4): tokens t0..t3 (ramp, base 0). offset 4.
   let mut k4 = kv(4);
@@ -480,7 +480,7 @@ fn update_after_trim_overwrites_not_appends() {
 fn as_quantized_mut_reaches_update_quantized_through_dyn() {
   // Hold the quantized cache ONLY as a generic boxed `dyn KvCache` (what a
   // generation loop / `make_prompt_cache` vector actually carries).
-  let mut boxed: Box<dyn KvCache> = Box::new(QuantizedKvCacheImpl::new(GROUP_SIZE, BITS));
+  let mut boxed: Box<dyn KvCache> = Box::new(QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap());
 
   // The mutable downcast must succeed and let us call `update_quantized`.
   {
@@ -535,7 +535,7 @@ fn from_state_slices_forged_overlong_triples_to_offset() {
   // serialized prompt cache (mlx-lm's `state` setter assigns triples as-is;
   // its getter would have sliced to `[:offset]`, so a faithful save never
   // produces this, but a forged blob can).
-  let mut src = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut src = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   src.update_quantized(&kv(5), &kv(5)).unwrap();
   let st: Vec<Array> = src
     .state()
@@ -614,7 +614,7 @@ fn from_state_slices_forged_overlong_triples_to_offset() {
 
   // A CONSISTENT state (seq-len == offset) round-trips byte-identically:
   // the slice-to-offset is a pure no-op for a faithfully saved state.
-  let mut src2 = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut src2 = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   src2.update_quantized(&kv(4), &kv(4)).unwrap();
   let consistent_st: Vec<Array> = src2
     .state()
@@ -681,7 +681,7 @@ fn from_state_underlength_state_clamps_offset_down() {
   // underlength direction (mlx-lm's getter would have sliced to
   // `[:offset]` which is the full 3 here, so a faithful save never
   // produces this; a forged blob can).
-  let mut src = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut src = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   src.update_quantized(&kv(3), &kv(3)).unwrap();
   let st: Vec<Array> = src
     .state()
@@ -780,7 +780,7 @@ fn from_state_underlength_state_clamps_offset_down() {
 
   // A CONSISTENT state (seq-len == offset) round-trips byte-identically:
   // the symmetric clamp is a pure no-op for a faithfully saved state.
-  let mut src2 = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut src2 = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   src2.update_quantized(&kv(4), &kv(4)).unwrap();
   let consistent_st: Vec<Array> = src2
     .state()
@@ -841,7 +841,7 @@ fn from_state_underlength_state_clamps_offset_down() {
 /// boundary).
 #[test]
 fn from_state_asymmetric_keys_shorter_is_rejected_at_set_state() {
-  let mut src_short = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut src_short = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   src_short.update_quantized(&kv(3), &kv(3)).unwrap();
   let s_short: Vec<Array> = src_short
     .state()
@@ -849,7 +849,7 @@ fn from_state_asymmetric_keys_shorter_is_rejected_at_set_state() {
     .iter()
     .map(|a| a.try_clone().unwrap())
     .collect();
-  let mut src_long = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut src_long = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   src_long.update_quantized(&kv(5), &kv(5)).unwrap();
   let s_long: Vec<Array> = src_long
     .state()
@@ -881,7 +881,7 @@ fn from_state_asymmetric_keys_shorter_is_rejected_at_set_state() {
 /// post-KVC-8 it is REJECTED at set_state with a precise diagnostic.
 #[test]
 fn from_state_asymmetric_values_shorter_is_rejected_at_set_state() {
-  let mut src_short = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut src_short = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   src_short.update_quantized(&kv(3), &kv(3)).unwrap();
   let s_short: Vec<Array> = src_short
     .state()
@@ -889,7 +889,7 @@ fn from_state_asymmetric_values_shorter_is_rejected_at_set_state() {
     .iter()
     .map(|a| a.try_clone().unwrap())
     .collect();
-  let mut src_long = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut src_long = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   src_long.update_quantized(&kv(5), &kv(5)).unwrap();
   let s_long: Vec<Array> = src_long
     .state()
@@ -941,7 +941,7 @@ fn from_state_asymmetric_values_shorter_is_rejected_at_set_state() {
 #[test]
 fn from_state_underlength_state_within_triple_asymmetric_clamps_to_min() {
   // Honest 3-step source: every component of every triple is seq-len 3.
-  let mut src_short = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut src_short = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   src_short.update_quantized(&kv(3), &kv(3)).unwrap();
   let s_short: Vec<Array> = src_short
     .state()
@@ -950,7 +950,7 @@ fn from_state_underlength_state_within_triple_asymmetric_clamps_to_min() {
     .map(|a| a.try_clone().unwrap())
     .collect();
   // Honest 5-step source: every component of every triple is seq-len 5.
-  let mut src_long = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut src_long = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   src_long.update_quantized(&kv(5), &kv(5)).unwrap();
   let s_long: Vec<Array> = src_long
     .state()
@@ -1019,7 +1019,7 @@ fn from_state_underlength_state_within_triple_asymmetric_clamps_to_min() {
 fn from_state_underlength_state_within_triple_asymmetric_bias_less_clamps_to_min() {
   // Honest 3-step + 5-step sources, then strip biases (drop [2] and [5])
   // to build 4-array bias-less states.
-  let mut src_short = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut src_short = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   src_short.update_quantized(&kv(3), &kv(3)).unwrap();
   let s_short_full: Vec<Array> = src_short
     .state()
@@ -1027,7 +1027,7 @@ fn from_state_underlength_state_within_triple_asymmetric_bias_less_clamps_to_min
     .iter()
     .map(|a| a.try_clone().unwrap())
     .collect();
-  let mut src_long = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut src_long = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   src_long.update_quantized(&kv(5), &kv(5)).unwrap();
   let s_long_full: Vec<Array> = src_long
     .state()
@@ -1077,7 +1077,7 @@ fn from_state_underlength_state_within_triple_asymmetric_bias_less_clamps_to_min
 fn set_meta_state_accepts_swift_4string_form() {
   // Start from a fresh cache with placeholder group_size/bits; the swift
   // 4-string meta restores them to the saved values.
-  let mut c = QuantizedKvCacheImpl::new(0, 0);
+  let mut c = QuantizedKvCacheImpl::new_unchecked(0, 0);
   c.set_meta_state(&[
     "256".to_string(), // step (dropped, NOT stored)
     "10".to_string(),  // offset
@@ -1097,7 +1097,7 @@ fn set_meta_state_accepts_swift_4string_form() {
 /// observable behavior.
 #[test]
 fn set_meta_state_accepts_mlx_lm_3string_form() {
-  let mut c = QuantizedKvCacheImpl::new(0, 0);
+  let mut c = QuantizedKvCacheImpl::new_unchecked(0, 0);
   c.set_meta_state(&[
     "10".to_string(), // offset
     "64".to_string(), // group_size
@@ -1116,7 +1116,7 @@ fn set_meta_state_accepts_mlx_lm_3string_form() {
 /// invariant on bad arity).
 #[test]
 fn set_meta_state_rejects_2_or_5_string_form() {
-  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   // Too-short: 2 strings (was always rejected; combined message now lists
   // both accepted arities).
   let err2 = c
@@ -1158,7 +1158,7 @@ fn set_meta_state_rejects_2_or_5_string_form() {
 #[test]
 fn from_state_round_trip_via_swift_form() {
   // Build an honest 3-step source and capture its serialized state.
-  let mut src = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS);
+  let mut src = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
   let mut k = kv(3);
   let mut v = kv(3);
   src.update_quantized(&k, &v).unwrap();

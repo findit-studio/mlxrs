@@ -1,5 +1,7 @@
 //! [`QuantizedKvCacheImpl`] — the on-the-fly quantized KV cache.
 
+use smol_str::format_smolstr;
+
 use crate::{
   array::Array,
   error::{
@@ -74,6 +76,7 @@ type StoredTriple = (Array, Array, Option<Array>);
 ///
 /// No implicit eval: every op is a pure [`crate::ops`] composition
 /// returning a `Result`; nothing on a recoverable path panics/unwraps.
+#[derive(Debug)]
 pub struct QuantizedKvCacheImpl {
   keys: Option<StoredTriple>,
   values: Option<StoredTriple>,
@@ -92,14 +95,60 @@ impl Default for QuantizedKvCacheImpl {
   /// (`cache.py:235`) / mlx-swift-lm `QuantizedKVCache(groupSize: 64,
   /// bits: 8)` (`KVCache.swift:753`).
   fn default() -> Self {
-    Self::new(64, 8)
+    // `(64, 8)` are valid defaults; using `new_unchecked` keeps `Default`
+    // infallible (the trait signature requires `-> Self`).
+    Self::new_unchecked(64, 8)
   }
 }
 
 impl QuantizedKvCacheImpl {
   /// A new, empty quantized cache with the given `group_size` / `bits`
   /// (mlx-lm `QuantizedKVCache(group_size, bits)`, `cache.py:235`).
-  pub fn new(group_size: i32, bits: i32) -> Self {
+  ///
+  /// # Errors (audit issue #257 H4)
+  ///
+  /// - `Error::OutOfRange` if any of:
+  ///   - `group_size <= 0` — `dim // group_size` would divide by zero or
+  ///     negative (line 136), and mlx-c quant ops require `group_size > 0`.
+  ///   - `bits` not in `{2, 3, 4, 5, 6, 8}` — these are the valid affine
+  ///     quantization widths mlx supports (`mlx/ops.cpp:4745-4750`).
+  ///
+  /// Internal placeholder flows that need a zero-init cache (e.g.
+  /// `from_serialized` rebuilding from external state) must use
+  /// [`Self::new_unchecked`] explicitly; that opt-in alternative documents
+  /// the "I will overwrite this before any use" intent.
+  pub fn new(group_size: i32, bits: i32) -> Result<Self> {
+    if group_size <= 0 {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "QuantizedKvCacheImpl::new: group_size",
+        "must be > 0 (used as divisor in dim / group_size)",
+        format_smolstr!("group_size={group_size}"),
+      )));
+    }
+    if !matches!(bits, 2 | 3 | 4 | 5 | 6 | 8) {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "QuantizedKvCacheImpl::new: bits",
+        "must be one of {2, 3, 4, 5, 6, 8} (affine quantization widths supported by mlx)",
+        format_smolstr!("bits={bits}"),
+      )));
+    }
+    Ok(Self::new_unchecked(group_size, bits))
+  }
+
+  /// Raw constructor without parameter validation — escape hatch for the
+  /// placeholder pattern used by [`KvCache::from_serialized`] (the staged-
+  /// cache zero-init that gets fully overwritten by `set_state` +
+  /// `set_meta_state` before any consumer observes it).
+  ///
+  /// External callers must use [`Self::new`] instead. `new_unchecked` is
+  /// `#[doc(hidden)]` + `pub` so the integration-test restore flow can
+  /// exercise the placeholder pattern from a separate crate, but the API
+  /// is unlisted to discourage external misuse. The validation gap on
+  /// `new` (audit issue #257 H4) is closed; this entry point exists
+  /// solely to admit the "I will overwrite this before any consumer
+  /// observes it" pattern with explicit intent.
+  #[doc(hidden)]
+  pub fn new_unchecked(group_size: i32, bits: i32) -> Self {
     Self {
       keys: None,
       values: None,
@@ -1010,14 +1059,14 @@ impl KvCache for QuantizedKvCacheImpl {
   /// (`set_state` arity failures; the 3-string mlx-lm / 4-string
   /// mlx-swift-lm meta parse of `offset`/`group_size`/`bits`). All
   /// fallible work runs on a fresh placeholder
-  /// `QuantizedKvCacheImpl::new(0, 0)` (the exact placeholder the existing
+  /// `QuantizedKvCacheImpl::new_unchecked(0, 0)` (the exact placeholder the existing
   /// [`super::from_state`] dispatch uses); `self` is committed by a single
   /// infallible move only after both setters succeed. The default trait
   /// impl would mutate `self.keys`/`self.values` via `set_state` first and
   /// a later meta-parse failure (e.g. a non-numeric `bits`) would leave
   /// the cache half-restored.
   fn from_serialized(&mut self, state: Vec<Array>, meta: &[String]) -> Result<()> {
-    let mut staged = QuantizedKvCacheImpl::new(0, 0);
+    let mut staged = QuantizedKvCacheImpl::new_unchecked(0, 0);
     staged.set_state(state)?;
     staged.set_meta_state(meta)?;
     // Post-setter invariant guards — must match `super::from_state`'s

@@ -54,7 +54,16 @@ fn gather_single_axis_slice_sizes_one() {
 fn gather_rejects_empty_indices() {
   let a = Array::from_slice::<f32>(&[1.0, 2.0], &[2i32]).unwrap();
   let r = ops::indexing::gather(&a, &[], &[], &[1]);
-  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch(_))));
+  // Production still emits the deprecated free-form `Error::ShapeMismatch`
+  // for this guard (typed-variant migration pending); assert the message
+  // content so the test fails when production is migrated AND the typed
+  // variant is reached.
+  match r {
+    Err(mlxrs::Error::ShapeMismatch(msg)) => {
+      assert_eq!(msg, "gather: indices slice is empty");
+    }
+    other => panic!("expected ShapeMismatch for empty indices, got {other:?}"),
+  }
 }
 
 #[test]
@@ -82,7 +91,14 @@ fn gather_rejects_negative_slice_size() {
   let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3i32]).unwrap();
   let idx = Array::from_slice::<i32>(&[0], &[1i32]).unwrap();
   let r = ops::indexing::gather(&a, &[&idx], &[0], &[-1]);
-  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch(_))));
+  match r {
+    Err(mlxrs::Error::OutOfRange(p)) => {
+      assert_eq!(p.context(), "shape::validate_dims: dim");
+      assert_eq!(p.requirement(), "must be non-negative");
+      assert_eq!(p.value(), "dim[0]=-1");
+    }
+    other => panic!("expected OutOfRange (shape::validate_dims), got {other:?}"),
+  }
 }
 
 #[test]

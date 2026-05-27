@@ -265,7 +265,13 @@ impl Adafactor {
       warmup_init,
       step_count: 0,
       current_lr,
-      lr_resolved_for_step: None,
+      // Stamp the cache for step 0: the constructor's `try_current(0)` above
+      // already consumed one schedule slot (when `learning_rate` is `Some`).
+      // For the `None` arm no schedule call happened but `preflight()` at
+      // step 0 would still return `0.0` from the `None` arm — stamping
+      // `Some(0)` is harmless either way and keeps the cached value paired
+      // with the step it was resolved at, mirroring `with_learning_rate`.
+      lr_resolved_for_step: Some(0),
       state: HashMap::new(),
     })
   }

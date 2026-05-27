@@ -61,7 +61,8 @@ fn exp_kernel_writes_e_to_every_element() {
     /* thread_group */ [8, 1, 1],
     /* output_shapes */ vec![vec![8]],
     /* output_dtypes */ vec![Dtype::F32],
-  );
+  )
+  .unwrap();
   let mut outs = kernel.apply(&[&input], &cfg).unwrap();
   assert_eq!(outs.len(), 1);
   assert_eq!(outs[0].shape(), vec![8]);
@@ -92,6 +93,7 @@ fn saxpy_kernel_uses_template_alpha() {
   .unwrap();
 
   let cfg = MetalKernelApplyConfig::new([4, 1, 1], [4, 1, 1], vec![vec![4]], vec![Dtype::F32])
+    .unwrap()
     .with_template(vec![("ALPHA".to_string(), KernelTemplateArg::Int(2))]);
   let mut outs = kernel.apply(&[&x, &y], &cfg).unwrap();
   assert_eq!(outs.len(), 1);
@@ -125,7 +127,8 @@ fn multi_output_kernel_emits_two_arrays() {
     [4, 1, 1],
     vec![vec![4], vec![4]],
     vec![Dtype::F32, Dtype::F32],
-  );
+  )
+  .unwrap();
   let mut outs = kernel.apply(&[&input], &cfg).unwrap();
   assert_eq!(outs.len(), 2);
   assert_eq!(outs[0].shape(), vec![4]);
@@ -163,7 +166,8 @@ fn apply_accepts_valid_multi_dim_output_shape() {
     /* thread_group */ [32, 1, 1],
     /* output_shapes */ vec![vec![4, 8, 16]],
     /* output_dtypes */ vec![Dtype::F32],
-  );
+  )
+  .unwrap();
   let mut outs = kernel.apply(&[&input], &cfg).unwrap();
   assert_eq!(outs.len(), 1);
   assert_eq!(outs[0].shape(), vec![4, 8, 16]);
@@ -196,7 +200,8 @@ fn apply_rejects_shape_count_mismatch() {
     [4, 1, 1],
     vec![vec![4], vec![4]],
     vec![Dtype::F32, Dtype::F32],
-  );
+  )
+  .unwrap();
   let err = kernel
     .apply(&[&input], &cfg)
     .expect_err("declared 1 output_name but supplied 2 output_shapes");
