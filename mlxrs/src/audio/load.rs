@@ -61,8 +61,10 @@
 
 use std::path::{Path, PathBuf};
 
+use smol_str::format_smolstr;
+
 use crate::{
-  error::{Error, Result},
+  error::{Error, MissingKeyPayload, OutOfRangePayload, ParsePayload, Result},
   lm::{load::read_bounded_config_file, quant::PerLayerQuantization},
 };
 
@@ -179,8 +181,9 @@ pub fn get_model_path(path: &str) -> Result<PathBuf> {
   // FileNotFoundError. Surface a clear Error::Backend instead of
   // (3)'s "would have fetched from Hub" message.
   if is_local_path(path) {
-    return Err(Error::Backend(format!(
-      "audio model local path not found: {path}"
+    return Err(Error::MissingKey(MissingKeyPayload::new(
+      "audio model local path not found",
+      path,
     )));
   }
 
@@ -197,11 +200,12 @@ pub fn get_model_path(path: &str) -> Result<PathBuf> {
     .or_else(|| path.strip_prefix("https://huggingface.co/"))
     .or_else(|| path.strip_prefix("http://huggingface.co/"))
     .unwrap_or(path);
-  Err(Error::Backend(format!(
-    "audio model path {path:?} is not a local on-disk directory; \
-       mlxrs does not download from HuggingFace Hub. Fetch the model \
-       directory out of process (e.g. `huggingface-cli download {repo_id}` \
-       or `hf download {repo_id}`) and pass the resulting local path."
+  Err(Error::OutOfRange(OutOfRangePayload::new(
+    "audio model path (mlxrs does not download from HuggingFace Hub; \
+       fetch the model out of process via `huggingface-cli download <repo>` \
+       and pass the local path)",
+    "must be a local on-disk directory (starting with `.`, `/`, `~`, or `<drive>:`)",
+    format_smolstr!("path={path:?}, repo_id={repo_id}"),
   )))
 }
 
@@ -273,9 +277,9 @@ pub fn load_config(dir: &Path) -> Result<String> {
   let path = dir.join("config.json");
   match read_bounded_config_file(&path, "audio model config")? {
     Some(text) => Ok(text),
-    None => Err(Error::Backend(format!(
-      "audio model config not found at {}",
-      path.display()
+    None => Err(Error::MissingKey(MissingKeyPayload::new(
+      "audio model config not found",
+      format_smolstr!("{}", path.display()),
     ))),
   }
 }
@@ -332,8 +336,10 @@ pub fn apply_quantization(config_json: &str) -> Result<Option<PerLayerQuantizati
   use serde_json::Value;
 
   let value: Value = serde_json::from_str(config_json).map_err(|e| {
-    Error::Backend(format!(
-      "audio apply_quantization: invalid config JSON: {e}"
+    Error::Parse(ParsePayload::new(
+      "audio apply_quantization: config",
+      "JSON",
+      e,
     ))
   })?;
 
@@ -355,8 +361,10 @@ pub fn apply_quantization(config_json: &str) -> Result<Option<PerLayerQuantizati
   };
 
   let Value::Object(map) = block else {
-    return Err(Error::Backend(format!(
-      "audio apply_quantization: quantization block must be a JSON object, got {block:?}"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "audio apply_quantization: quantization block",
+      "must be a JSON object",
+      format_smolstr!("{block:?}"),
     )));
   };
 
@@ -371,8 +379,10 @@ pub fn apply_quantization(config_json: &str) -> Result<Option<PerLayerQuantizati
     .or_insert_with(|| Value::from(64));
 
   let plq: PerLayerQuantization = serde_json::from_value(Value::Object(patched)).map_err(|e| {
-    Error::Backend(format!(
-      "audio apply_quantization: invalid quantization block: {e}"
+    Error::Parse(ParsePayload::new(
+      "audio apply_quantization: quantization block",
+      "JSON",
+      e,
     ))
   })?;
   Ok(Some(plq))
@@ -458,7 +468,7 @@ mod tests {
       .expect_err("non-local repo id must be rejected, not silently fetched");
     let msg = err.to_string();
     assert!(
-      msg.contains("not a local on-disk directory"),
+      msg.contains("local on-disk directory"),
       "error should explain the no-network policy, got: {msg}"
     );
     assert!(
@@ -675,25 +685,38 @@ mod tests {
   fn get_model_path_hf_url_prefix_yields_clean_repo_id_in_error() {
     let err = get_model_path("hf://mlx-community/silero-vad")
       .expect_err("hf:// repo id must be rejected with a clean workaround");
-    let msg = err.to_string();
+    let Error::OutOfRange(payload) = &err else {
+      panic!("hf:// rejection must be OutOfRange, got: {err:?}");
+    };
+    // The structured `value` field carries `path=..., repo_id=...`: the
+    // repo_id MUST be the prefix-stripped clean form (used by the CLI
+    // workaround), even though the verbatim `path=` echoes the user's raw
+    // input.
+    let value = payload.value();
     assert!(
-      msg.contains("mlx-community/silero-vad"),
-      "workaround should print the clean repo id, got: {msg}"
+      value.contains("repo_id=mlx-community/silero-vad"),
+      "value should embed the clean repo id (repo_id=...), got: {value}"
     );
-    // Extract the CLI suggestion segment (between "Fetch" and the
-    // closing ")") and assert the prefix isn't there — the leading
-    // `audio model path "hf://…"` is the verbatim echo, deliberate.
-    let workaround = msg
-      .split_once("Fetch the model directory out of process")
+    // Split on `repo_id=` so the assertion only inspects the repo_id
+    // segment — the `path=` echo deliberately preserves the user's raw
+    // input (including the `hf://` prefix).
+    let repo_id_segment = value
+      .split_once("repo_id=")
       .map(|(_, after)| after)
-      .expect("workaround section present");
+      .expect("repo_id= segment present in value");
     assert!(
-      !workaround.contains("hf://"),
-      "CLI workaround must not embed the `hf://` prefix, got: {workaround}"
+      !repo_id_segment.contains("hf://"),
+      "clean repo_id must not embed the `hf://` prefix, got: {repo_id_segment}"
     );
+    // The context references the CLI workaround using the `<repo>` placeholder
+    // (the runtime repo id is in `value`, not interpolated into the static
+    // context string).
     assert!(
-      workaround.contains("huggingface-cli download mlx-community/silero-vad"),
-      "CLI workaround must use the clean repo id, got: {workaround}"
+      payload
+        .context()
+        .contains("huggingface-cli download <repo>"),
+      "context must reference the huggingface-cli workaround, got: {}",
+      payload.context()
     );
   }
 
@@ -703,22 +726,28 @@ mod tests {
   fn get_model_path_https_huggingface_url_yields_clean_repo_id_in_error() {
     let err = get_model_path("https://huggingface.co/mlx-community/silero-vad")
       .expect_err("https://huggingface.co/ URL must be rejected with a clean workaround");
-    let msg = err.to_string();
+    let Error::OutOfRange(payload) = &err else {
+      panic!("https://huggingface.co/ rejection must be OutOfRange, got: {err:?}");
+    };
+    let value = payload.value();
     assert!(
-      msg.contains("mlx-community/silero-vad"),
-      "workaround should print the clean repo id, got: {msg}"
+      value.contains("repo_id=mlx-community/silero-vad"),
+      "value should embed the clean repo id (repo_id=...), got: {value}"
     );
-    let workaround = msg
-      .split_once("Fetch the model directory out of process")
+    let repo_id_segment = value
+      .split_once("repo_id=")
       .map(|(_, after)| after)
-      .expect("workaround section present");
+      .expect("repo_id= segment present in value");
     assert!(
-      !workaround.contains("https://huggingface.co/"),
-      "CLI workaround must not embed the full URL, got: {workaround}"
+      !repo_id_segment.contains("https://huggingface.co/"),
+      "clean repo_id must not embed the full URL, got: {repo_id_segment}"
     );
     assert!(
-      workaround.contains("huggingface-cli download mlx-community/silero-vad"),
-      "CLI workaround must use the clean repo id, got: {workaround}"
+      payload
+        .context()
+        .contains("huggingface-cli download <repo>"),
+      "context must reference the huggingface-cli workaround, got: {}",
+      payload.context()
     );
   }
 

@@ -53,8 +53,8 @@ fn hann_window_is_symmetric() {
 
 #[test]
 fn hann_window_rejects_n_lt_2() {
-  assert!(matches!(hann_window(0), Err(mlxrs::Error::Backend(_))));
-  assert!(matches!(hann_window(1), Err(mlxrs::Error::Backend(_))));
+  assert!(matches!(hann_window(0), Err(mlxrs::Error::OutOfRange(_))));
+  assert!(matches!(hann_window(1), Err(mlxrs::Error::OutOfRange(_))));
 }
 
 #[test]
@@ -89,21 +89,21 @@ fn stft_shape_matches_formula() {
 fn stft_rejects_zero_n_fft() {
   let x = sine_1khz_16samples();
   let r = stft(&x, 0, 4, None, WindowPad::Center);
-  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
+  assert!(matches!(r, Err(mlxrs::Error::InvariantViolation(_))));
 }
 
 #[test]
 fn stft_rejects_zero_hop_length() {
   let x = sine_1khz_16samples();
   let r = stft(&x, 8, 0, None, WindowPad::Center);
-  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
+  assert!(matches!(r, Err(mlxrs::Error::InvariantViolation(_))));
 }
 
 #[test]
 fn stft_rejects_win_length_greater_than_n_fft() {
   let x = sine_1khz_16samples();
   let r = stft(&x, 8, 4, Some(16), WindowPad::Center);
-  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
+  assert!(matches!(r, Err(mlxrs::Error::OutOfRange(_))));
 }
 
 #[test]
@@ -135,7 +135,7 @@ fn stft_rejects_input_too_short_for_reflect_pad() {
   let buf = vec![0.0_f32, 0.1, 0.2, 0.3];
   let x = Array::from_slice::<f32>(&buf, &[4i32]).unwrap();
   let r = stft(&x, 16, 8, None, WindowPad::Center);
-  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
+  assert!(matches!(r, Err(mlxrs::Error::OutOfRange(_))));
 }
 
 #[test]
@@ -158,28 +158,28 @@ fn mel_filter_bank_shape_matches_n_mels_x_n_freqs() {
 #[test]
 fn mel_filter_bank_rejects_zero_n_mels() {
   let r = mel_filter_bank(0, 400, 16_000, 0.0, None);
-  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
+  assert!(matches!(r, Err(mlxrs::Error::InvariantViolation(_))));
 }
 
 #[test]
 fn mel_filter_bank_rejects_invalid_freq_range() {
   // f_max <= f_min is invalid.
   let r = mel_filter_bank(40, 400, 16_000, 1000.0, Some(500.0));
-  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
+  assert!(matches!(r, Err(mlxrs::Error::OutOfRange(_))));
 }
 
 #[test]
 fn mel_filter_bank_rejects_usize_overflow_inputs() {
   // n_mels = usize::MAX → n_mels + 2 overflows.
   let r = mel_filter_bank(usize::MAX, 400, 16_000, 0.0, None);
-  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
+  assert!(matches!(r, Err(mlxrs::Error::ArithmeticOverflow(_))));
   // n_mels * n_freqs overflows (with n_fft very large so n_freqs is huge).
   // Pick n_mels and n_fft such that n_mels.checked_mul(n_freqs) returns None
   // but n_mels.checked_add(2) succeeds.
   let big_n_mels = 1usize << 33;
   let big_n_fft = 1usize << 34;
   let r = mel_filter_bank(big_n_mels, big_n_fft, 16_000, 0.0, Some(8_000.0));
-  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
+  assert!(matches!(r, Err(mlxrs::Error::ArithmeticOverflow(_))));
 }
 
 #[test]

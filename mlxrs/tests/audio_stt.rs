@@ -318,13 +318,15 @@ fn stt_generate_rejects_sr_mismatch_when_resample_off() {
     .err()
     .expect("auto_resample=false rejects mismatched sample rate");
   match err {
-    mlxrs::Error::Backend(message) => {
+    mlxrs::Error::OutOfRange(p) => {
       assert!(
-        message.contains("auto_resample"),
-        "error mentions auto_resample, got {message}"
+        p.requirement().contains("auto_resample") || p.context().contains("auto_resample"),
+        "error mentions auto_resample, got context={:?} requirement={:?}",
+        p.context(),
+        p.requirement()
       );
     }
-    other => panic!("expected Backend error, got {other:?}"),
+    other => panic!("expected OutOfRange error, got {other:?}"),
   }
   assert_eq!(
     *model.decode_calls.borrow(),
@@ -349,20 +351,16 @@ fn stt_generate_rejects_audio_longer_than_max() {
   let err = stt_generate(&model, &path, cache(1), cfg)
     .err()
     .expect("over-cap audio rejected");
+  // Post P7 #137 layered cap: load-stage rejection fires for WAVs (the
+  // header is sample-exact); the STT-stage check remains the fallback
+  // for lossy formats. Accept EITHER:
+  //  - `Error::CapExceeded` from load_audio's exact-count header check
+  //    (load-stage layered cap), OR
+  //  - `Error::OutOfRange` from stt_generate's max_audio_seconds check
+  //    (STT-stage fallback). Both prove the encoder was bypassed.
   match err {
-    mlxrs::Error::Backend(message) => {
-      // Post P7 #137 layered cap: load-stage rejection fires for WAVs
-      // (the header is sample-exact); the STT-stage check remains the
-      // fallback for lossy formats. Accept EITHER message — both
-      // prove the encoder was bypassed.
-      let mentions_layered_cap = message.contains("max_audio_seconds")
-        || (message.contains("container declares") && message.contains("cap"));
-      assert!(
-        mentions_layered_cap,
-        "error mentions either max_audio_seconds or the load-stage layered cap, got {message}"
-      );
-    }
-    other => panic!("expected Backend error, got {other:?}"),
+    mlxrs::Error::CapExceeded(_) | mlxrs::Error::OutOfRange(_) => { /* ok */ }
+    other => panic!("expected CapExceeded or OutOfRange error, got {other:?}"),
   }
   assert!(
     model.last_mel_shape.borrow().is_none(),
@@ -396,20 +394,12 @@ fn stt_generate_rejects_over_cap_before_resample() {
   let err = stt_generate(&model, &path, cache(1), cfg)
     .err()
     .expect("over-cap source rejected pre-resample");
+  // Post P7 #137 layered cap: either path proves the resample was
+  // skipped. Load-stage: CapExceeded against the load-stage sample
+  // budget. STT-stage: OutOfRange against max_audio_seconds.
   match err {
-    mlxrs::Error::Backend(message) => {
-      // Post P7 #137 layered cap: either path proves the resample was
-      // skipped. Load-stage: container declares more samples than the
-      // load cap. STT-stage: source-duration check fires after load.
-      let load_layered = message.contains("container declares") && message.contains("cap");
-      let stt_max = message.contains("max_audio_seconds") && message.contains("44100");
-      assert!(
-        load_layered || stt_max,
-        "error mentions either the load-stage layered cap OR \
-         max_audio_seconds + source sample_rate 44100, got {message}"
-      );
-    }
-    other => panic!("expected Backend error, got {other:?}"),
+    mlxrs::Error::CapExceeded(_) | mlxrs::Error::OutOfRange(_) => { /* ok */ }
+    other => panic!("expected CapExceeded or OutOfRange error, got {other:?}"),
   }
   assert!(
     model.last_mel_shape.borrow().is_none(),
@@ -440,17 +430,21 @@ fn stt_generate_layered_cap_rejects_at_load_stage_for_wav() {
   let err = stt_generate(&model, &path, cache(1), cfg)
     .err()
     .expect("layered cap must reject at load stage");
+  // Load-stage origin: CapExceeded against the load-stage sample budget
+  // (was `container declares N samples (>M cap, ...)` pre-migration).
+  // Variant-typed so this distinction is machine-checked: a regression
+  // that fires the STT-stage fallback would produce OutOfRange instead
+  // of CapExceeded.
   match err {
-    mlxrs::Error::Backend(message) => {
-      // Load-stage origin: `load_audio: container declares N samples
-      // (>M cap, ...)` — proves the rejection fired BEFORE any
-      // sample-buffer allocation.
+    mlxrs::Error::CapExceeded(p) => {
       assert!(
-        message.contains("container declares"),
-        "expected load-stage layered-cap error, got {message}"
+        p.cap_name().contains("effective_cap") || p.context().contains("container"),
+        "expected load-stage CapExceeded; got cap_name={:?} context={:?}",
+        p.cap_name(),
+        p.context()
       );
     }
-    other => panic!("expected Backend error, got {other:?}"),
+    other => panic!("expected CapExceeded (load-stage), got {other:?}"),
   }
   assert!(
     model.last_mel_shape.borrow().is_none(),
@@ -472,15 +466,11 @@ fn stt_generate_rejects_empty_audio() {
   let err = stt_generate(&model, &path, cache(1), cfg)
     .err()
     .expect("empty audio rejected");
-  match err {
-    mlxrs::Error::Backend(message) => {
-      assert!(
-        message.contains("empty"),
-        "error mentions empty, got {message}"
-      );
-    }
-    other => panic!("expected Backend error, got {other:?}"),
-  }
+  // Empty audio surfaces as EmptyInput from stt_generate.
+  assert!(
+    matches!(err, mlxrs::Error::EmptyInput(_)),
+    "expected EmptyInput error, got {err:?}"
+  );
   assert!(
     model.last_mel_shape.borrow().is_none(),
     "encoder was NOT called for empty audio"
@@ -614,18 +604,25 @@ fn decode_step_default_errors_with_clear_message() {
 /// per-step rank/zero-axis guard.
 #[test]
 fn stt_generate_rejects_bad_decode_step_shape() {
+  // BadShapeModel.decode_step returns shape `[V]` (rank 1) — the loop's
+  // per-step shape gate now reports this via typed RankMismatch (rather
+  // than a loose OutOfRange), distinguishing rank failures from batch-
+  // size failures (LengthMismatch on shape[0] != 1) and empty-vocab
+  // (EmptyInput on V == 0). See stt/generate.rs split-gate.
   let path = make_wav("bad_shape", 16_000, ONE_SECOND_16K);
   let model = BadShapeModel;
   let cfg = SttGenConfig::default();
   let mut it = stt_generate(&model, &path, cache(1), cfg).unwrap();
   match it.next().expect("an item") {
-    Err(mlxrs::Error::ShapeMismatch(message)) => {
+    Err(mlxrs::Error::RankMismatch(p)) => {
+      assert_eq!(p.actual(), 1, "rank-1 input observed, got {}", p.actual());
       assert!(
-        message.contains("[1, V]"),
-        "error mentions [1, V], got {message}"
+        p.context().contains("rank 2") && p.context().contains("[1, V]"),
+        "context names the expected rank + canonical shape, got {:?}",
+        p.context()
       );
     }
-    other => panic!("expected ShapeMismatch, got {other:?}"),
+    other => panic!("expected RankMismatch (rank 2 expected, got 1), got {other:?}"),
   }
   assert!(it.next().is_none(), "iterator fuses after the Err");
   let _ = fs::remove_file(&path);

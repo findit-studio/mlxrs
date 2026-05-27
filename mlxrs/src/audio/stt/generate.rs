@@ -54,10 +54,15 @@
 
 use std::path::Path;
 
+use smol_str::format_smolstr;
+
 use crate::{
   array::Array,
   audio::{dsp, io as audio_io},
-  error::{Error, OutOfRangePayload, Result, try_extend_from_slice},
+  error::{
+    EmptyInputPayload, Error, LengthMismatchPayload, OutOfRangePayload, RankMismatchPayload,
+    Result, try_extend_from_slice,
+  },
   lm::{
     cache::KvCache,
     generate::{
@@ -275,12 +280,14 @@ fn audio_path_to_mel<M: super::model::Model>(
   let cap_f64 = f64::from(cfg.max_audio_seconds());
   let src_duration = samples.len() as f64 / f64::from(src_sr);
   if src_duration > cap_f64 {
-    return Err(Error::Backend(format!(
-      "stt_generate: audio duration {src_duration:.3}s (source sample_rate \
-         {src_sr}) exceeds `max_audio_seconds` cap {:.3}s (samples={}); reject \
-         before resample / mel-spec allocation",
-      cfg.max_audio_seconds(),
-      samples.len()
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt_generate: audio duration (rejected before resample / mel-spec allocation)",
+      "must be <= `max_audio_seconds` cap",
+      format_smolstr!(
+        "duration={src_duration:.3}s, src_sample_rate={src_sr}, samples={}, cap={:.3}s",
+        samples.len(),
+        cfg.max_audio_seconds()
+      ),
     )));
   }
 
@@ -305,9 +312,10 @@ fn audio_path_to_mel<M: super::model::Model>(
   } else if cfg.auto_resample() {
     audio_io::resample_linear(&samples, src_sr, target_sr)?
   } else {
-    return Err(Error::Backend(format!(
-      "stt_generate: audio sample rate {src_sr} != model.mel_config().sample_rate \
-         {target_sr} but `cfg.auto_resample` is false; enable auto_resample or pre-resample"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt_generate: audio sample rate (auto_resample=false)",
+      "must equal model.mel_config().sample_rate (or enable auto_resample / pre-resample)",
+      format_smolstr!("src_sr={src_sr}, target_sr={target_sr}"),
     )));
   };
 
@@ -321,15 +329,9 @@ fn audio_path_to_mel<M: super::model::Model>(
   //    reflect-pad guards, which already return a recoverable `Err` with
   //    a descriptive message.
   if samples.is_empty() {
-    return Err(Error::Backend(format!(
-      "stt_generate: audio input is empty (0 samples after load{}) — \
-         `model.encode_audio` requires at least one mel frame; provide a \
-         non-empty WAV",
-      if src_sr == target_sr {
-        ""
-      } else {
-        " + resample"
-      }
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "stt_generate: audio input (0 samples after load/resample; \
+         `model.encode_audio` requires at least one mel frame — provide a non-empty WAV)",
     )));
   }
 
@@ -337,9 +339,10 @@ fn audio_path_to_mel<M: super::model::Model>(
   //    `load_audio`'s `MAX_DECODED_SAMPLES = 64 Mi` and `resample_linear`'s
   //    `MAX_RESAMPLED_SAMPLES = 64 Mi` are both well below `i32::MAX`.
   let n_samples = i32::try_from(samples.len()).map_err(|_| {
-    Error::Backend(format!(
-      "stt_generate: samples.len() {} exceeds i32::MAX",
-      samples.len()
+    Error::OutOfRange(OutOfRangePayload::new(
+      "stt_generate: samples.len()",
+      "must fit in i32 (i32::MAX = 2147483647)",
+      format_smolstr!("{}", samples.len()),
     ))
   })?;
   let samples_arr = Array::from_slice::<f32>(&samples, &[n_samples])?;
@@ -436,10 +439,30 @@ impl<M: super::model::Model> SttGenerator<'_, M> {
     // anything else is a per-model defect; surface it as a recoverable
     // `Err` rather than letting `apply_logit_bias` / `logsumexp` produce a
     // confusing downstream error.
+    // Split the compound shape gate into typed sub-checks so callers can
+    // discriminate rank mismatch (rank != 2) from batch-size mismatch
+    // (rank 2 but batch != 1) from empty-vocab degeneracy (rank 2, batch
+    // 1, but V == 0). Per the typed-error contract, each failure-class
+    // gets its own variant rather than collapsing to a single OutOfRange.
     let shape = logits.shape();
-    if shape.len() != 2 || shape[0] != 1 || shape[1] == 0 {
-      return Err(Error::ShapeMismatch(format!(
-        "stt_generate: `decode_step` must return [1, V] logits with V >= 1, got {shape:?}"
+    if shape.len() != 2 {
+      let actual = shape.len() as u32;
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        "stt_generate: `decode_step` returned logits must be rank 2 (shape [1, V])",
+        actual,
+        shape,
+      )));
+    }
+    if shape[0] != 1 {
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "stt_generate: `decode_step` returned logits batch dim (must be 1; only single-utterance decoding is supported)",
+        1,
+        shape[0],
+      )));
+    }
+    if shape[1] == 0 {
+      return Err(Error::EmptyInput(EmptyInputPayload::new(
+        "stt_generate: `decode_step` returned logits vocab dim (V == 0)",
       )));
     }
 

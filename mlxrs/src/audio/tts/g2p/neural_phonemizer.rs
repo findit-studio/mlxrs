@@ -42,7 +42,7 @@
 
 use crate::{
   audio::tts::g2p::types::{PhonemeUnit, Phonemizer},
-  error::{Error, Result},
+  error::{Error, OutOfRangePayload, Result},
 };
 
 /// A neural-G2P orchestrator parameterized over an arbitrary backend
@@ -92,8 +92,10 @@ where
     let raw = (self.convert)(grapheme, &self.language)?;
     let ipa = raw.trim();
     if ipa.is_empty() {
-      return Err(Error::Backend(format!(
-        "neural G2P returned empty output for token {grapheme:?}"
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "neural G2P output",
+        "must be non-empty for input token",
+        grapheme,
       )));
     }
     // Match swift: filter out whitespace, map each remaining char into

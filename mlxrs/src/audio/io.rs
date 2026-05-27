@@ -66,8 +66,12 @@ use symphonia::core::{
   meta::MetadataOptions,
 };
 
+use smol_str::format_smolstr;
+
 use crate::error::{
-  Error, FileIoPayload, FileOp, InvariantViolationPayload, OutOfRangePayload, Result,
+  AllocFailurePayload, ArithmeticOverflowPayload, BoundedDecodePayload, CapExceededPayload, Error,
+  FileIoPayload, FileOp, InvariantViolationPayload, LayerKeyedPayload, LengthMismatchPayload,
+  MissingKeyPayload, NonFiniteScalarPayload, OutOfRangePayload, ParsePayload, Result,
 };
 
 /// PCM-16 full-scale on `read`. P6 / AUDIO-4 (#130): mlxrs uses the
@@ -410,10 +414,11 @@ fn load_audio_into_unified(path: &Path, out: &mut Vec<f32>, strategy: CapStrateg
       MetadataOptions::default(),
     )
     .map_err(|e| {
-      Error::Backend(format!(
-        "load_audio: probe {} failed: {e} (unsupported or corrupt format; \
+      Error::Parse(ParsePayload::new(
+        "load_audio: container probe (unsupported or corrupt format; \
          WAV/MP3/FLAC/OGG-Vorbis are supported, M4A/AAC/Opus/WebM are not)",
-        path.display()
+        "audio container",
+        e,
       ))
     })?;
 
@@ -433,9 +438,12 @@ fn load_audio_into_unified(path: &Path, out: &mut Vec<f32>, strategy: CapStrateg
   let is_wav = format_id == FORMAT_ID_WAVE;
   let is_flac = format_id == FORMAT_ID_FLAC;
 
-  let track = format
-    .default_track(TrackType::Audio)
-    .ok_or_else(|| Error::Backend(format!("load_audio: {} has no audio track", path.display())))?;
+  let track = format.default_track(TrackType::Audio).ok_or_else(|| {
+    Error::MissingKey(MissingKeyPayload::new(
+      "load_audio: container has no audio track",
+      format_smolstr!("{}", path.display()),
+    ))
+  })?;
   let track_id = track.id;
   // `Track::num_frames` is the per-channel frame count from the
   // container header (`None` if the container didn't declare one).
@@ -457,15 +465,15 @@ fn load_audio_into_unified(path: &Path, out: &mut Vec<f32>, strategy: CapStrateg
   let exact_count = is_wav || (is_flac && track_num_frames.is_some());
 
   let codec_params = track.codec_params.as_ref().ok_or_else(|| {
-    Error::Backend(format!(
-      "load_audio: {} has no codec parameters",
-      path.display()
+    Error::MissingKey(MissingKeyPayload::new(
+      "load_audio: track has no codec parameters",
+      format_smolstr!("{}", path.display()),
     ))
   })?;
   let audio_params = codec_params.audio().ok_or_else(|| {
-    Error::Backend(format!(
-      "load_audio: {} default track is not audio",
-      path.display()
+    Error::InvariantViolation(InvariantViolationPayload::new(
+      "load_audio: default track",
+      "must be an audio track (codec_params.audio() returned None)",
     ))
   })?;
 
@@ -477,27 +485,33 @@ fn load_audio_into_unified(path: &Path, out: &mut Vec<f32>, strategy: CapStrateg
     .as_ref()
     .map(|c| c.count())
     .ok_or_else(|| {
-      Error::Backend(format!(
-        "load_audio: {} has no channel layout",
-        path.display()
+      Error::MissingKey(MissingKeyPayload::new(
+        "load_audio: container has no channel layout",
+        format_smolstr!("{}", path.display()),
       ))
     })?;
   if nchannels == 0 {
-    return Err(Error::Backend(format!(
-      "load_audio: {} reports 0 channels",
-      path.display()
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "load_audio: container channel count",
+      "must be exactly 1 (mono input required)",
+      "0",
     )));
   }
   if nchannels != 1 {
-    return Err(Error::Backend(format!(
-      "load_audio: multi-channel input not supported (got {nchannels} channels); \
-         this API returns mono Vec<f32>. Downmix or split channels before calling."
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "load_audio: container channel count (multi-channel input not supported; \
+         this API returns mono Vec<f32>; downmix or split channels before calling)",
+      "must be exactly 1 (mono)",
+      format_smolstr!("{nchannels}"),
     )));
   }
 
-  let sample_rate = audio_params
-    .sample_rate
-    .ok_or_else(|| Error::Backend(format!("load_audio: {} has no sample_rate", path.display())))?;
+  let sample_rate = audio_params.sample_rate.ok_or_else(|| {
+    Error::MissingKey(MissingKeyPayload::new(
+      "load_audio: container has no sample_rate",
+      format_smolstr!("{}", path.display()),
+    ))
+  })?;
 
   // Resolve the cap strategy to `effective_cap` USING THE SAME
   // `sample_rate` JUST READ from the SAME `FormatReader` that drives
@@ -508,7 +522,13 @@ fn load_audio_into_unified(path: &Path, out: &mut Vec<f32>, strategy: CapStrateg
 
   let mut decoder = symphonia::default::get_codecs()
     .make_audio_decoder(audio_params, &AudioDecoderOptions::default())
-    .map_err(|e| Error::Backend(format!("load_audio: make_audio_decoder failed: {e}")))?;
+    .map_err(|e| {
+      Error::Parse(ParsePayload::new(
+        "load_audio: make_audio_decoder failed",
+        "audio codec",
+        e,
+      ))
+    })?;
 
   // Capped allocation. `num_frames` is the container-declared per-channel
   // frame count; for mono that equals the total f32 output length.
@@ -537,11 +557,13 @@ fn load_audio_into_unified(path: &Path, out: &mut Vec<f32>, strategy: CapStrateg
     && let Some(header_len) = header_len_opt
     && header_len > effective_cap
   {
-    return Err(Error::Backend(format!(
-      "load_audio: container declares {header_len} samples (>{effective_cap} cap, \
-         min(max_samples, {MAX_DECODED_SAMPLES})); refuse to allocate. Oversized / \
-         crafted inputs require a streaming decoder API (planned follow-up). \
-         (Exact-count format: WAV or FLAC-with-STREAMINFO.)"
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "load_audio: container-declared sample count exceeds cap (refuse to allocate; \
+         oversized / crafted inputs require a streaming decoder API, planned follow-up; \
+         exact-count format: WAV or FLAC-with-STREAMINFO)",
+      "effective_cap (= min(max_samples, MAX_DECODED_SAMPLES))",
+      effective_cap as u64,
+      header_len as u64,
     )));
   }
   // Reservation hint — used by `try_reserve_exact` below to avoid
@@ -561,8 +583,11 @@ fn load_audio_into_unified(path: &Path, out: &mut Vec<f32>, strategy: CapStrateg
   // is a no-op when `additional <= remaining capacity`).
   out.clear();
   out.try_reserve_exact(reserve_len).map_err(|e| {
-    Error::Backend(format!(
-      "load_audio: reservation for {reserve_len} samples failed: {e}"
+    Error::AllocFailure(AllocFailurePayload::new(
+      "load_audio: reservation",
+      "samples",
+      reserve_len as u64,
+      e,
     ))
   })?;
 
@@ -610,15 +635,18 @@ fn load_audio_into_unified(path: &Path, out: &mut Vec<f32>, strategy: CapStrateg
         // the decoder; this mono single-stream loader does not support
         // that, so fail loud rather than silently truncating at the
         // segment boundary.
-        return Err(Error::Backend(format!(
-          "load_audio: {} is a chained/multi-segment stream (ResetRequired); \
-             only single-stream audio is supported",
-          path.display()
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "load_audio: container kind (only single-stream audio is supported; \
+             chained/multi-segment streams surfaced as ResetRequired)",
+          "must be a single-stream container",
+          format_smolstr!("{}", path.display()),
         )));
       }
       Err(e) => {
-        return Err(Error::Backend(format!(
-          "load_audio: next_packet failed: {e}"
+        return Err(Error::Parse(ParsePayload::new(
+          "load_audio: next_packet failed",
+          "audio packet",
+          e,
         )));
       }
     };
@@ -629,9 +657,13 @@ fn load_audio_into_unified(path: &Path, out: &mut Vec<f32>, strategy: CapStrateg
     // path would let a truncated or malformed file come back as `Ok`
     // with missing audio, exactly the silent-corruption surface the
     // load_audio contract excludes.
-    let audio_buf = decoder
-      .decode(&packet)
-      .map_err(|e| Error::Backend(format!("load_audio: decode failed: {e}")))?;
+    let audio_buf = decoder.decode(&packet).map_err(|e| {
+      Error::Parse(ParsePayload::new(
+        "load_audio: decode failed",
+        "audio packet",
+        e,
+      ))
+    })?;
 
     // Push interleaved f32 samples into `out`. We match on the typed
     // GenericAudioBufferRef variant + apply our own `/2^(bits-1)`
@@ -668,10 +700,11 @@ fn load_audio_into_unified(path: &Path, out: &mut Vec<f32>, strategy: CapStrateg
     && let Some(header_len) = header_len_opt
     && out.len() != header_len
   {
-    return Err(Error::Backend(format!(
-      "load_audio: decoded {} samples but container header declared {header_len} \
+    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+      "load_audio: decoded vs container-header sample count \
          (truncated or malformed exact-count file: WAV or FLAC)",
-      out.len()
+      header_len,
+      out.len(),
     )));
   }
 
@@ -753,8 +786,17 @@ fn reserve_under_cap(out: &mut Vec<f32>, n: usize, cap: usize) -> Result<()> {
   // through this guard), so `cap - out.len()` does not underflow. This is
   // the hard cap enforcement and stays BEFORE the growth logic below.
   if n > cap - out.len() {
-    return Err(Error::Backend(format!(
-      "load_audio: stream produced more than the {cap}-sample cap"
+    // `out.len() + n` would panic in debug builds (or wrap in release) on a
+    // pathological `n` (e.g. `usize::MAX`) from a corrupt/hostile decoder
+    // buffer count. The observed value is for diagnostics only (no real
+    // allocation rides on it), so saturate at `u64::MAX` to keep the
+    // recoverable BoundedDecode error path intact. The cap-violation
+    // semantics are unchanged: any saturated count is also `> cap`.
+    let observed = (out.len() as u64).saturating_add(n as u64);
+    return Err(Error::BoundedDecode(BoundedDecodePayload::new(
+      "load_audio: stream produced more than the sample cap",
+      cap as u64,
+      observed,
     )));
   }
   // The over-cap check above guarantees `out.len() + n <= cap`, so `needed`
@@ -824,8 +866,10 @@ fn push_samples(buf: &GenericAudioBufferRef<'_>, out: &mut Vec<f32>, cap: usize)
       24 => 8_388_608.0,
       32 => 2_147_483_648.0,
       n => {
-        return Err(Error::Backend(format!(
-          "load_audio: int_divisor: unexpected bits={n} (programmer error)"
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "load_audio: int_divisor bit-width (programmer error)",
+          "must be one of {8, 16, 24, 32}",
+          format_smolstr!("{n}"),
         )));
       }
     })
@@ -1247,11 +1291,13 @@ pub fn save_wav_into(
   // (RF64 / W64 large-WAV variants are a planned follow-up.)
   const MAX_MONO_I16_SAMPLES: usize = ((u32::MAX - 36) as usize) / 2;
   if samples.len() > MAX_MONO_I16_SAMPLES {
-    return Err(Error::Backend(format!(
-      "save_wav: sample count {} exceeds the 16-bit WAV total-file-size limit \
-         ({MAX_MONO_I16_SAMPLES} samples = (u32::MAX - 36) bytes / \
-         2-bytes-per-sample); split into multiple files or use a large-WAV variant",
-      samples.len()
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "save_wav: sample count exceeds the 16-bit WAV total-file-size limit \
+         (split into multiple files or use a large-WAV variant; \
+         RF64 / W64 planned follow-up)",
+      "MAX_MONO_I16_SAMPLES (= (u32::MAX - 36) bytes / 2-bytes-per-sample)",
+      MAX_MONO_I16_SAMPLES as u64,
+      samples.len() as u64,
     )));
   }
   // byte_rate = sample_rate * channels * bytes_per_sample (= sample_rate * 2
@@ -1260,9 +1306,10 @@ pub fn save_wav_into(
   // above any real audio sample rate).
   const MAX_SAMPLE_RATE_FOR_MONO_I16: u32 = u32::MAX / 2;
   if sample_rate > MAX_SAMPLE_RATE_FOR_MONO_I16 {
-    return Err(Error::Backend(format!(
-      "save_wav: sample_rate {sample_rate} exceeds the {MAX_SAMPLE_RATE_FOR_MONO_I16} \
-         ceiling at which byte_rate (sample_rate * 2) fits in u32"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "save_wav: sample_rate (must keep byte_rate = sample_rate * 2 within u32)",
+      "must be <= MAX_SAMPLE_RATE_FOR_MONO_I16 (= u32::MAX / 2 = 2147483647)",
+      format_smolstr!("{sample_rate}"),
     )));
   }
   // Pre-validate ALL samples before any filesystem mutation, so a NaN/inf
@@ -1272,8 +1319,12 @@ pub fn save_wav_into(
   // the gain is "destination integrity is preserved on input error".
   for (i, &s) in samples.iter().enumerate() {
     if !s.is_finite() {
-      return Err(Error::Backend(format!(
-        "save_wav: non-finite sample at index {i} (NaN/inf) — cannot quantize"
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        format_smolstr!("save_wav: sample index {i}"),
+        Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+          "save_wav: sample (cannot quantize)",
+          s as f64,
+        )),
       )));
     }
   }
@@ -1381,9 +1432,14 @@ pub fn save_wav_into(
     header[34..36].copy_from_slice(&BITS_PER_SAMPLE.to_le_bytes());
     header[36..40].copy_from_slice(b"data");
     header[40..44].copy_from_slice(&data_size.to_le_bytes());
-    writer
-      .write_all(&header)
-      .map_err(|e| Error::Backend(format!("save_wav: header write failed: {e}")))?;
+    writer.write_all(&header).map_err(|e| {
+      Error::FileIo(FileIoPayload::new(
+        "save_wav: header write failed",
+        FileOp::Write,
+        tmp_path.clone(),
+        e,
+      ))
+    })?;
 
     // Quantize all samples first via the C7 SIMD dispatcher
     // (`simd::audio::quantize::f32_to_i16_quantize`) — clip to `[-1, 1]`,
@@ -1459,9 +1515,14 @@ pub fn save_wav_into(
           ),
         )
       };
-      writer
-        .write_all(byte_view)
-        .map_err(|e| Error::Backend(format!("save_wav: bulk sample write failed: {e}")))?;
+      writer.write_all(byte_view).map_err(|e| {
+        Error::FileIo(FileIoPayload::new(
+          "save_wav: bulk sample write failed",
+          FileOp::Write,
+          tmp_path.clone(),
+          e,
+        ))
+      })?;
     } else {
       // Big-endian host: byteswap each i16 into a small stack buffer
       // and write in chunks. Not benchmarked; rare path.
@@ -1473,18 +1534,28 @@ pub fn save_wav_into(
         for (i, &q) in quantized[idx..idx + n].iter().enumerate() {
           buf[i * 2..i * 2 + 2].copy_from_slice(&q.to_le_bytes());
         }
-        writer
-          .write_all(&buf[..n * 2])
-          .map_err(|e| Error::Backend(format!("save_wav: bulk sample write failed: {e}")))?;
+        writer.write_all(&buf[..n * 2]).map_err(|e| {
+          Error::FileIo(FileIoPayload::new(
+            "save_wav: bulk sample write failed",
+            FileOp::Write,
+            tmp_path.clone(),
+            e,
+          ))
+        })?;
         idx += n;
       }
     }
 
     // BufWriter does NOT auto-flush on drop into a Result, and a missed
     // flush would leave us renaming an incomplete tempfile into place.
-    writer
-      .flush()
-      .map_err(|e| Error::Backend(format!("save_wav: flush failed: {e}")))?;
+    writer.flush().map_err(|e| {
+      Error::FileIo(FileIoPayload::new(
+        "save_wav: flush failed",
+        FileOp::Flush,
+        tmp_path.clone(),
+        e,
+      ))
+    })?;
     // `flush()` only drains the in-process buffer to the OS; on delayed-
     // allocation filesystems, NFS, quotas, etc. a writeback / late-ENOSPC
     // failure would otherwise be observed only on close (whose result Drop
@@ -1492,12 +1563,22 @@ pub fn save_wav_into(
     // never actually hit the disk. `sync_all` (fsync) forces the data +
     // metadata to durable storage, and we propagate its error so we
     // never rename a not-yet-durable tempfile into place.
-    let inner = writer
-      .into_inner()
-      .map_err(|e| Error::Backend(format!("save_wav: BufWriter::into_inner failed: {e}")))?;
-    inner
-      .sync_all()
-      .map_err(|e| Error::Backend(format!("save_wav: sync_all failed: {e}")))?;
+    let inner = writer.into_inner().map_err(|e| {
+      Error::FileIo(FileIoPayload::new(
+        "save_wav: BufWriter::into_inner failed (final flush did not reach underlying File)",
+        FileOp::Flush,
+        tmp_path.clone(),
+        e.into_error(),
+      ))
+    })?;
+    inner.sync_all().map_err(|e| {
+      Error::FileIo(FileIoPayload::new(
+        "save_wav: sync_all failed",
+        FileOp::Fsync,
+        tmp_path.clone(),
+        e,
+      ))
+    })?;
     // P6 / Codex R2 (#138 follow-up): RETURN the writable `File`
     // handle to the outer scope instead of dropping it here. The outer
     // code re-uses this exact handle for the post-metadata `sync_all`
@@ -1540,9 +1621,11 @@ pub fn save_wav_into(
     && let Err(e) = fs::set_permissions(&tmp_path, perms)
   {
     let _ = fs::remove_file(&tmp_path);
-    return Err(Error::Backend(format!(
-      "save_wav: set_permissions on tempfile {} failed: {e}",
-      tmp_path.display()
+    return Err(Error::FileIo(FileIoPayload::new(
+      "save_wav: set_permissions on tempfile failed",
+      FileOp::Other("set_permissions"),
+      tmp_path,
+      e,
     )));
   }
 
@@ -1613,12 +1696,13 @@ pub fn save_wav_into(
     // would be visible to operators.
     drop(meta_file);
     let _ = fs::remove_file(&tmp_path);
-    return Err(Error::Backend(format!(
-      "save_wav: post-metadata sync_all on tempfile {} failed: {e} \
+    return Err(Error::FileIo(FileIoPayload::new(
+      "save_wav: post-metadata sync_all on tempfile failed \
          (perms/xattrs were restored but metadata is not yet durable; \
-          NOT renaming to {} — see Codex R2 #138 follow-up)",
-      tmp_path.display(),
-      path.display()
+          NOT renaming to final destination — see Codex R2 #138 follow-up)",
+      FileOp::Fsync,
+      tmp_path,
+      e,
     )));
   }
   // Drop the writable handle BEFORE the rename. Windows in particular
@@ -1632,10 +1716,11 @@ pub fn save_wav_into(
   // observer can see a half-written WAV at `path`.
   if let Err(e) = fs::rename(&tmp_path, path) {
     let _ = fs::remove_file(&tmp_path);
-    return Err(Error::Backend(format!(
-      "save_wav: rename {} -> {} failed: {e}",
-      tmp_path.display(),
-      path.display()
+    return Err(Error::FileIo(FileIoPayload::new(
+      "save_wav: rename tempfile -> destination failed",
+      FileOp::Rename,
+      tmp_path,
+      e,
     )));
   }
 
@@ -1822,9 +1907,10 @@ fn open_excl_tempfile(final_path: &Path, max_retries: u32) -> Result<(PathBuf, F
   let file_name = final_path
     .file_name()
     .ok_or_else(|| {
-      Error::Backend(format!(
-        "save_wav: destination {} has no file_name component",
-        final_path.display()
+      Error::OutOfRange(OutOfRangePayload::new(
+        "save_wav: destination path",
+        "must have a file_name component (not a bare directory or `..`)",
+        format_smolstr!("{}", final_path.display()),
       ))
     })?
     .to_string_lossy()
@@ -1850,18 +1936,26 @@ fn open_excl_tempfile(final_path: &Path, max_retries: u32) -> Result<(PathBuf, F
         continue;
       }
       Err(e) => {
-        return Err(Error::Backend(format!(
-          "save_wav: create_new {} failed: {e}",
-          candidate.display()
+        return Err(Error::FileIo(FileIoPayload::new(
+          "save_wav: tempfile create_new failed",
+          FileOp::Create,
+          candidate,
+          e,
         )));
       }
     }
   }
-  Err(Error::Backend(format!(
-    "save_wav: exhausted {max_retries} tempfile retries (last error: {})",
-    last_err
-      .map(|e| e.to_string())
-      .unwrap_or_else(|| "<none>".into())
+  Err(Error::FileIo(FileIoPayload::new(
+    "save_wav: exhausted tempfile retry budget (all candidate names collided \
+       with AlreadyExists)",
+    FileOp::Create,
+    final_path.to_path_buf(),
+    last_err.unwrap_or_else(|| {
+      std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "tempfile retries exhausted",
+      )
+    }),
   )))
 }
 
@@ -1909,14 +2003,18 @@ pub fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<
   // usize so we don't silently truncate on 32-bit targets.
   let in_len = samples.len() as u64;
   let out_len_u64 = in_len.checked_mul(u64::from(to_rate)).ok_or_else(|| {
-    Error::Backend(format!(
-      "resample_linear: in_len * to_rate overflows u64 (in_len={in_len}, to_rate={to_rate})"
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "resample_linear: in_len * to_rate",
+      "u64",
+      [("in_len", in_len), ("to_rate", u64::from(to_rate))],
     ))
   })?
     / u64::from(from_rate);
   let out_len = usize::try_from(out_len_u64).map_err(|_| {
-    Error::Backend(format!(
-      "resample_linear: output length {out_len_u64} exceeds usize::MAX"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "resample_linear: output length",
+      "must fit in usize",
+      format_smolstr!("{out_len_u64}"),
     ))
   })?;
   if out_len == 0 {
@@ -1928,16 +2026,22 @@ pub fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<
   // a tens-of-GB allocation. The cap matches `load_audio`'s
   // `MAX_DECODED_SAMPLES` (64 Mi-samples ≈ 256 MiB of f32).
   if out_len > MAX_RESAMPLED_SAMPLES {
-    return Err(Error::Backend(format!(
-      "resample_linear: output length {out_len} exceeds the {MAX_RESAMPLED_SAMPLES} cap; \
-         use chunked resampling or raise the cap manually"
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "resample_linear: output length exceeds cap \
+         (use chunked resampling or raise the cap manually)",
+      "MAX_RESAMPLED_SAMPLES",
+      MAX_RESAMPLED_SAMPLES as u64,
+      out_len as u64,
     )));
   }
 
   let mut out: Vec<f32> = Vec::new();
   out.try_reserve_exact(out_len).map_err(|e| {
-    Error::Backend(format!(
-      "resample_linear: reservation for {out_len} samples failed: {e}"
+    Error::AllocFailure(AllocFailurePayload::new(
+      "resample_linear: reservation",
+      "samples",
+      out_len as u64,
+      e,
     ))
   })?;
   let ratio = f64::from(from_rate) / f64::from(to_rate);
@@ -1991,8 +2095,8 @@ mod tests {
     out.resize(cap, 0.0); // out.len() == cap now (the "decoded up to cap" state)
     let r = reserve_under_cap(&mut out, 1, cap);
     assert!(
-      matches!(r, Err(Error::Backend(_))),
-      "over-cap buffer must return a recoverable Backend error, got {r:?}"
+      matches!(r, Err(Error::BoundedDecode(_))),
+      "over-cap buffer must return a recoverable BoundedDecode error, got {r:?}"
     );
     // The Vec must not have been grown past the cap by the rejected call.
     assert!(
@@ -2020,7 +2124,7 @@ mod tests {
     // A packet claiming more samples than the whole cap.
     let r = reserve_under_cap(&mut out, cap + 1, cap);
     assert!(
-      matches!(r, Err(Error::Backend(_))),
+      matches!(r, Err(Error::BoundedDecode(_))),
       "buffer larger than the cap must be rejected, got {r:?}"
     );
     assert_eq!(
@@ -2033,6 +2137,38 @@ mod tests {
       "rejected reservation must not allocate past the cap: capacity={}",
       out.capacity()
     );
+  }
+
+  /// Codex R3 (over-cap rejection arithmetic): a corrupt/hostile decoder
+  /// buffer count can present `n == usize::MAX` (or any value that, summed
+  /// with `out.len()`, overflows `usize`). The rejection branch must NOT
+  /// panic in debug or wrap in release while building the diagnostic
+  /// `observed` field of the BoundedDecode payload — it must return the
+  /// recoverable error with the saturated observed count.
+  #[test]
+  fn reserve_under_cap_rejects_overflowing_n_without_panic() {
+    let mut out: Vec<f32> = vec![0.0; 1]; // out.len() > 0 so the sum can overflow
+    let cap = 1024usize;
+    let n = usize::MAX;
+    let r = reserve_under_cap(&mut out, n, cap);
+    match r {
+      Err(Error::BoundedDecode(p)) => {
+        assert_eq!(p.cap(), cap as u64, "cap field must be the configured cap");
+        // The diagnostic observed count must be saturated, not wrapped.
+        // `out.len() (1) + usize::MAX` overflows usize, so the saturated
+        // u64 sum equals u64::MAX (since `usize::MAX as u64` already
+        // reaches u64::MAX on 64-bit, and the saturating_add to 1 stays
+        // at u64::MAX).
+        assert_eq!(
+          p.observed(),
+          u64::MAX,
+          "observed must be saturated at u64::MAX, not wrapped"
+        );
+      }
+      other => panic!("expected BoundedDecode err, got {other:?}"),
+    }
+    // The Vec must not have grown.
+    assert_eq!(out.len(), 1, "rejected reservation must not append");
   }
 
   /// An exactly-fitting buffer is accepted and reserves the room (so the
@@ -2637,10 +2773,11 @@ mod tests {
   /// the [`save_wav_post_metadata_fsync`] helper to return an injected
   /// `io::Error`, then asserts the error-propagation arm:
   ///
-  ///  1. `save_wav` returns `Err(Error::Backend(_))` whose message
-  ///     mentions `sync_all` and the tempfile path — proving the
-  ///     failure was NOT silently swallowed (the R1 bug) and the
-  ///     post-metadata fsync helper was actually invoked.
+  ///  1. `save_wav` returns `Err(Error::FileIo(_))` (op = `Fsync`) whose
+  ///     context mentions `sync_all` and whose path references the
+  ///     tempfile — proving the failure was NOT silently swallowed
+  ///     (the R1 bug) and the post-metadata fsync helper was actually
+  ///     invoked.
   ///  2. The destination at `path` still contains the ORIGINAL bytes
   ///     (the rename was NOT performed) — proving the failure path
   ///     short-circuits before `fs::rename`.
@@ -2718,24 +2855,31 @@ mod tests {
     let new_samples: Vec<f32> = (0..512).map(|i| ((i as f32) - 256.0) / 512.0).collect();
     let result = save_wav(&path, &new_samples, 16_000);
 
-    // Signal #1: Err(Error::Backend) whose message mentions the
-    // tempfile path AND the `sync_all` failure mode. We don't bind to
-    // the EXACT injected-error string (that's a test-implementation
-    // detail) — instead we assert the user-facing message reflects the
+    // Signal #1: Err(Error::FileIo) whose context mentions the
+    // tempfile path AND the `sync_all` failure mode (op=Fsync). We don't bind
+    // to the EXACT injected-error string (that's a test-implementation
+    // detail) — instead we assert the user-facing payload reflects the
     // failure class.
     match &result {
-      Err(Error::Backend(message)) => {
-        assert!(
-          message.contains("sync_all"),
-          "post-metadata fsync error message must mention sync_all; got {message}"
+      Err(Error::FileIo(payload)) => {
+        assert_eq!(
+          payload.op(),
+          FileOp::Fsync,
+          "post-metadata fsync error must carry FileOp::Fsync"
         );
         assert!(
-          message.contains("tempfile") || message.contains(".tmp"),
-          "post-metadata fsync error message must reference the tempfile; got {message}"
+          payload.context().contains("sync_all"),
+          "post-metadata fsync error context must mention sync_all; got {}",
+          payload.context()
+        );
+        let path_str = payload.path().display().to_string();
+        assert!(
+          path_str.contains(".tmp"),
+          "post-metadata fsync error path must reference the tempfile; got {path_str}"
         );
       }
       other => {
-        panic!("save_wav must return Err(Error::Backend) on injected fsync failure; got {other:?}")
+        panic!("save_wav must return Err(Error::FileIo) on injected fsync failure; got {other:?}")
       }
     }
 

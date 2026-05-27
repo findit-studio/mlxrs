@@ -180,7 +180,8 @@ fn save_rejects_nan_before_touching_destination() {
   let path = temp_wav("nan");
   fs::write(&path, b"PRESERVED").unwrap();
   let r = save_wav(&path, &[0.0_f32, f32::NAN, 0.0], 8_000);
-  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
+  // NaN sample is rejected as LayerKeyed(NonFiniteScalar(_)) — see save_wav.
+  assert!(matches!(r, Err(mlxrs::Error::LayerKeyed(_))));
   // The destination must be untouched (validation runs before any
   // filesystem mutation, including the tempfile create).
   let stored = fs::read(&path).unwrap();
@@ -193,7 +194,8 @@ fn save_rejects_zero_sample_rate() {
   let path = temp_wav("zero_sr");
   fs::write(&path, b"PRESERVED").unwrap();
   let r = save_wav(&path, &[0.0_f32, 0.5, -0.5], 0);
-  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
+  // sample_rate == 0 surfaces as InvariantViolation.
+  assert!(matches!(r, Err(mlxrs::Error::InvariantViolation(_))));
   // Same guarantee: destination preserved on header validation failure.
   let stored = fs::read(&path).unwrap();
   assert_eq!(stored, b"PRESERVED");
@@ -210,7 +212,8 @@ fn load_wav_rejects_multichannel() {
   let interleaved: &[i16] = &[100, -100, 200, -200, 300, -300, 400, -400];
   write_pcm16_wav(&path, interleaved, 16_000, 2);
   let r = load_audio(&path);
-  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
+  // Multi-channel input is rejected via OutOfRange (channel count must be 1).
+  assert!(matches!(r, Err(mlxrs::Error::OutOfRange(_))));
   let _ = fs::remove_file(&path);
 }
 
@@ -245,13 +248,14 @@ fn resample_downsample_halves_length() {
 #[test]
 fn resample_rejects_zero_from_rate() {
   let r = resample_linear(&[0.0_f32, 1.0], 0, 16_000);
-  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
+  // from_rate == 0 surfaces as InvariantViolation (pre-existing).
+  assert!(matches!(r, Err(mlxrs::Error::InvariantViolation(_))));
 }
 
 #[test]
 fn resample_rejects_zero_to_rate() {
   let r = resample_linear(&[0.0_f32, 1.0], 16_000, 0);
-  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
+  assert!(matches!(r, Err(mlxrs::Error::InvariantViolation(_))));
 }
 
 #[test]
@@ -266,7 +270,8 @@ fn resample_rejects_oversized_output_cap() {
   // which exceeds MAX_RESAMPLED_SAMPLES (64 Mi). Must error BEFORE any
   // allocation attempt.
   let r = resample_linear(&[0.5_f32, -0.5], 1, u32::MAX);
-  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
+  // Oversized output surfaces as CapExceeded against MAX_RESAMPLED_SAMPLES.
+  assert!(matches!(r, Err(mlxrs::Error::CapExceeded(_))));
 }
 
 #[test]
@@ -279,7 +284,9 @@ fn load_wav_missing_file_returns_backend_error() {
   // would mask the test).
   let _ = fs::remove_file(&path);
   let r = load_audio(&path);
-  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
+  // Missing file produces a FileIo error from the `File::open` step (the
+  // io::Error is wrapped in FileIoPayload with FileOp::Open and the path).
+  assert!(matches!(r, Err(mlxrs::Error::FileIo(_))));
 }
 
 // -------- New tests covering the atomic-rename addition --------
@@ -381,8 +388,13 @@ fn load_wav_rejects_truncated_wav() {
   f.flush().unwrap();
   drop(f);
   let r = load_audio(&path);
+  // A truncated WAV either fails the symphonia decode (Parse) or the
+  // post-loop sample-count cross-check (LengthMismatch).
   assert!(
-    matches!(r, Err(mlxrs::Error::Backend(_))),
+    matches!(
+      r,
+      Err(mlxrs::Error::Parse(_) | mlxrs::Error::LengthMismatch(_))
+    ),
     "load_wav must reject a truncated WAV; got {r:?}"
   );
   let _ = fs::remove_file(&path);
@@ -397,7 +409,8 @@ fn save_wav_rejects_sample_rate_exceeding_byte_rate_u32_ceiling() {
   let path = temp_wav("sr_overflow");
   fs::write(&path, b"PRESERVED").unwrap();
   let r = save_wav(&path, &[0.0_f32], u32::MAX);
-  assert!(matches!(r, Err(mlxrs::Error::Backend(_))));
+  // sample_rate > MAX_SAMPLE_RATE_FOR_MONO_I16 surfaces as OutOfRange.
+  assert!(matches!(r, Err(mlxrs::Error::OutOfRange(_))));
   let stored = fs::read(&path).unwrap();
   assert_eq!(stored, b"PRESERVED");
   let _ = fs::remove_file(&path);
@@ -567,8 +580,13 @@ fn load_audio_rejects_truncated_flac() {
   let cut = FIXTURE_FLAC.len() / 2;
   write_fixture(&path, &FIXTURE_FLAC[..cut]);
   let r = load_audio(&path);
+  // A truncated FLAC either fails the symphonia decode (Parse) or the
+  // post-loop sample-count cross-check (LengthMismatch).
   assert!(
-    matches!(r, Err(mlxrs::Error::Backend(_))),
+    matches!(
+      r,
+      Err(mlxrs::Error::Parse(_) | mlxrs::Error::LengthMismatch(_))
+    ),
     "truncated FLAC must be rejected (count mismatch / corruption), got {r:?}"
   );
   let _ = fs::remove_file(&path);
@@ -635,9 +653,10 @@ fn load_audio_rejects_unsupported_opus_like_garbage() {
   let garbage: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
   write_fixture(&path, &garbage);
   let r = load_audio(&path);
+  // Unsupported / garbage input fails the symphonia probe as Parse.
   assert!(
-    matches!(r, Err(mlxrs::Error::Backend(_))),
-    "unsupported/garbage input must return Backend error, got {r:?}"
+    matches!(r, Err(mlxrs::Error::Parse(_))),
+    "unsupported/garbage input must return Parse error, got {r:?}"
   );
   let _ = fs::remove_file(&path);
 }
@@ -665,7 +684,9 @@ fn load_audio_truncated_compressed_is_bounded_and_recoverable() {
     let cut = (bytes.len() * 2) / 5; // ~40%
     write_fixture(&path, &bytes[..cut]);
     match load_audio(&path) {
-      Err(mlxrs::Error::Backend(_)) => { /* recoverable error: ok */ }
+      // Recoverable error: Parse (codec/probe) or LengthMismatch (count
+      // cross-check for exact-count formats).
+      Err(mlxrs::Error::Parse(_) | mlxrs::Error::LengthMismatch(_)) => { /* ok */ }
       Ok((samples, _)) => {
         assert!(
           samples.len() <= mlxrs::audio::io::MAX_DECODED_SAMPLES,
@@ -751,9 +772,10 @@ fn load_audio_with_cap_rejects_oversized_wav_at_header_stage() {
 
   // Cap at 50 samples — strictly below the header's 100.
   let r = load_audio_with_cap(&path, 50);
+  // Exact-count header rejection surfaces as CapExceeded.
   assert!(
-    matches!(r, Err(Error::Backend(_))),
-    "over-cap WAV header must reject with Backend, got {r:?}"
+    matches!(r, Err(Error::CapExceeded(_))),
+    "over-cap WAV header must reject with CapExceeded, got {r:?}"
   );
 
   let _ = fs::remove_file(&path);
@@ -850,12 +872,12 @@ fn i16_quantizer_matches_simd_dispatcher() {
   use mlxrs::audio::io::{I16Quantizer, Quantizer};
 
   let src: Vec<f32> = vec![
-    -1.5, // clip down to -1.0 → -32767
-    -1.0, // exact -32767
+    -1.5, // clip down to -1.0 → -1.0 * 32768 = -32768 (i16::MIN, no saturation)
+    -1.0, // -1.0 * 32768 = -32768 (i16::MIN, no saturation)
     -0.5, // -16384 (round-half-away)
     0.0, 0.5,   // 16384
-    1.0,   // 32767
-    1.5,   // clip up to 1.0 → 32767
+    1.0,   // +1.0 * 32768 = +32768 → saturates to i16::MAX = 32767
+    1.5,   // clip up to +1.0 → same as above → 32767
     0.001, // tiny positive
   ];
   let mut dst_a: Vec<i16> = Vec::with_capacity(src.len());
@@ -874,9 +896,17 @@ fn i16_quantizer_matches_simd_dispatcher() {
     dst_a, dst_b,
     "I16Quantizer must produce identical output to the C7 SIMD dispatcher"
   );
-  // Clip bounds (Quantizer must clip outside [-1, 1] to ±32767).
-  assert_eq!(dst_a[0], -32767, "-1.5 should clip to -32767");
-  assert_eq!(dst_a[6], 32767, "+1.5 should clip to +32767");
+  // Clip bounds. The C7 SIMD convention is `* 32768` (NOT `* 32767`); the
+  // post-clip values land at the i16 extremes:
+  //   `-1.5` → clip to `-1.0` → `-1.0 * 32768 = -32768` → in-range as `i16::MIN`.
+  //   `+1.5` → clip to `+1.0` → `+1.0 * 32768 = +32768` → SATURATES to `i16::MAX = 32767`.
+  // The asymmetry comes from `i16`'s range `[-32768, 32767]` and the
+  // saturating-narrow on the positive boundary only.
+  assert_eq!(dst_a[0], -32768, "-1.5 should clip to -32768 (i16::MIN)");
+  assert_eq!(
+    dst_a[6], 32767,
+    "+1.5 should clip to +32767 (i16::MAX via saturating narrow)"
+  );
 }
 
 // ---- Codex R2 fixes: unified probe+decode (no TOCTOU) + lossy overestimate ---
@@ -942,8 +972,9 @@ fn load_audio_with_max_seconds_unified_probe_no_toctou() {
   // header_len = 8000 > 7999 → reject.
   let max_seconds_just_below = 7999.0 / 8000.0;
   let r = load_audio_with_max_seconds(&path, max_seconds_just_below);
+  // Exact-count header beats cap → CapExceeded.
   assert!(
-    matches!(r, Err(Error::Backend(_))),
+    matches!(r, Err(Error::CapExceeded(_))),
     "cap one frame below header must reject; got {r:?}"
   );
 
@@ -997,26 +1028,21 @@ fn load_audio_with_max_seconds_mp3_genuinely_over_cap_rejects() {
   // `push_samples` cap MUST reject this even though the upfront
   // header check is skipped for estimate formats.
   let r = load_audio_with_max_seconds(&path, 0.01);
-  let msg = match &r {
-    Err(Error::Backend(message)) => message.clone(),
-    other => panic!("MP3 genuinely over cap must reject with Error::Backend; got {other:?}"),
-  };
-  // F2 post-fix marker: rejection is mid-decode via `push_samples`,
-  // which uses the literal `"stream produced"` substring in its error
-  // message. A regression to the upfront-rejection path would emit
-  // `"container declares"` instead.
-  assert!(
-    msg.contains("stream produced"),
-    "F2 regression: MP3 over-cap rejection must emerge from the \
-     mid-decode `push_samples` cap (message contains \"stream produced\"); \
-     got {msg:?}"
-  );
-  assert!(
-    !msg.contains("container declares"),
-    "F2 regression: MP3 over-cap rejection must NOT come from the \
-     upfront `header_len > cap` path for estimate-count formats \
-     (message must NOT contain \"container declares\"); got {msg:?}"
-  );
+  // F2 post-fix marker: rejection is mid-decode via `push_samples`, which
+  // returns `Error::BoundedDecode(_)`. A regression to the upfront
+  // `header_len > cap` rejection would return `Error::CapExceeded(_)`
+  // instead — variant-typed so this distinction is machine-checked
+  // (no string-substring brittleness).
+  match &r {
+    Err(Error::BoundedDecode(_)) => { /* post-fix: mid-decode reject — ok */ }
+    Err(Error::CapExceeded(p)) => panic!(
+      "F2 regression: MP3 over-cap rejection came from the upfront \
+       `header_len > cap` path (CapExceeded against `{}`); estimate-count formats \
+       must reject mid-decode via BoundedDecode",
+      p.cap_name()
+    ),
+    other => panic!("MP3 genuinely over cap must reject with Error::BoundedDecode; got {other:?}"),
+  }
 
   let _ = fs::remove_file(&path);
 }

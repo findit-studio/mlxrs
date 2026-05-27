@@ -158,7 +158,12 @@ use super::{
   config::{PlaybackConfig, SampleFormat},
   output_stream::AudioOutputStream,
 };
-use crate::error::{ArithmeticOverflowPayload, Error, Result};
+use smol_str::format_smolstr;
+
+use crate::error::{
+  AllocFailurePayload, ArithmeticOverflowPayload, CapExceededPayload, Error, ExternalOpPayload,
+  OutOfRangePayload, Result,
+};
 
 /// Stopped — the cpal stream is built but not playing (Swift's
 /// `!isStreaming && !isPlaying`).
@@ -273,10 +278,12 @@ struct SharedState {
   /// surface it on the next producer call (`write_samples`, `flush`,
   /// `pause`, `resume`).
   ///
-  /// `Mutex<Option<String>>` (string-typed, not `Error`-typed) so
-  /// errors aren't lost if multiple device events fire — we keep the
+  /// `Mutex<Option<StreamError>>` — store the cpal error TYPED (not
+  /// stringified) so `take_callback_error` can surface it as the typed
+  /// [`crate::Error::ExternalOp`] variant with `cpal::StreamError` boxed
+  /// into the source chain. If multiple device events fire we keep the
   /// first one. Cleared by [`AudioPlayer::stop`].
-  callback_error: Mutex<Option<String>>,
+  callback_error: Mutex<Option<StreamError>>,
 }
 
 impl SharedState {
@@ -297,9 +304,11 @@ impl SharedState {
     queue
       .try_reserve_exact(queue_capacity_samples)
       .map_err(|e| {
-        Error::Backend(format!(
-          "AudioPlayer::with_device failed to pre-allocate queue capacity \
-           ({queue_capacity_samples} samples): {e}"
+        Error::AllocFailure(AllocFailurePayload::new(
+          "AudioPlayer::with_device: pre-allocate queue capacity",
+          "samples",
+          queue_capacity_samples as u64,
+          e,
         ))
       })?;
     Ok(Self {
@@ -413,22 +422,31 @@ impl AudioPlayer {
   ///   the config (zero channels) or the cpal stream build fails.
   pub fn with_device(device: &cpal::Device, config: PlaybackConfig) -> Result<Self> {
     if !matches!(config.sample_format(), SampleFormat::F32) {
-      return Err(Error::Backend(format!(
-        "AudioPlayer: only SampleFormat::F32 is currently supported (got {:?}); \
-           non-F32 device negotiation is reserved for a follow-up",
-        config.sample_format()
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "AudioPlayer: sample_format (non-F32 device negotiation reserved for a follow-up)",
+        "must be SampleFormat::F32",
+        format_smolstr!("{:?}", config.sample_format()),
       )));
     }
 
     let stream_config = config.cpal_config()?;
 
-    let queue_capacity_samples = config
-      .queue_capacity_frames()
-      .checked_mul(usize::from(config.channels().count()))
-      .ok_or(Error::ArithmeticOverflow(ArithmeticOverflowPayload::new(
+    // Defer error construction (`.ok_or_else` not `.ok_or`) so the
+    // success path doesn't pay the allocation; preserve both operands
+    // (queue_capacity_frames, channels) via `with_operands` so the
+    // diagnostic identifies which input drove the overflow.
+    let queue_frames = config.queue_capacity_frames();
+    let channels = usize::from(config.channels().count());
+    let queue_capacity_samples = queue_frames.checked_mul(channels).ok_or_else(|| {
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
         "AudioPlayer: queue_capacity_frames * channels",
         "usize",
-      )))?;
+        [
+          ("queue_capacity_frames", queue_frames as u64),
+          ("channels", channels as u64),
+        ],
+      ))
+    })?;
 
     let shared = Arc::new(SharedState::new(queue_capacity_samples)?);
 
@@ -486,9 +504,13 @@ impl AudioPlayer {
       }
     };
 
-    // cpal `err_fn`. Stash the first error; surface it on the next
-    // producer call. We don't have a logger dep in mlxrs, so silent
-    // capture is the chosen behavior (the producer will see it).
+    // cpal `err_fn`. Stash the first TYPED `StreamError`; surface it
+    // on the next producer call as `Error::ExternalOp` so the original
+    // cpal error chain is preserved (no `format!`-stringification —
+    // callers branching on `payload.inner().downcast_ref::<StreamError>()`
+    // can recover the original device-backend variant). We don't have a
+    // logger dep in mlxrs, so silent capture is the chosen behavior
+    // (the producer will see it).
     let err_shared = Arc::clone(&shared);
     let err_callback = move |err: StreamError| {
       let mut slot = match err_shared.callback_error.lock() {
@@ -496,13 +518,19 @@ impl AudioPlayer {
         Err(poisoned) => poisoned.into_inner(),
       };
       if slot.is_none() {
-        *slot = Some(format!("cpal stream error: {err}"));
+        *slot = Some(err);
       }
     };
 
     let stream = device
       .build_output_stream(&stream_config, data_callback, err_callback, None)
-      .map_err(|e| Error::Backend(format!("AudioPlayer: cpal build_output_stream failed: {e}")))?;
+      .map_err(|e| {
+        Error::ExternalOp(ExternalOpPayload::new(
+          "AudioPlayer: cpal build_output_stream failed",
+          "cpal stream config",
+          e,
+        ))
+      })?;
 
     Ok(Self {
       stream: Some(stream),
@@ -620,9 +648,13 @@ impl AudioPlayer {
     let stream = self.stream.as_ref().ok_or_else(|| {
       Error::Backend("AudioPlayer::start: stream has been dropped (post-stop)".to_string())
     })?;
-    stream
-      .play()
-      .map_err(|e| Error::Backend(format!("AudioPlayer::start: cpal play() failed: {e}")))?;
+    stream.play().map_err(|e| {
+      Error::ExternalOp(ExternalOpPayload::new(
+        "AudioPlayer::start: cpal play() failed",
+        "cpal stream",
+        e,
+      ))
+    })?;
     self.shared.state.store(STATE_RUNNING, Ordering::Release);
     Ok(())
   }
@@ -649,9 +681,13 @@ impl AudioPlayer {
     let stream = self.stream.as_ref().ok_or_else(|| {
       Error::Backend("AudioPlayer::pause: stream has been dropped (post-stop)".to_string())
     })?;
-    stream
-      .pause()
-      .map_err(|e| Error::Backend(format!("AudioPlayer::pause: cpal pause() failed: {e}")))?;
+    stream.pause().map_err(|e| {
+      Error::ExternalOp(ExternalOpPayload::new(
+        "AudioPlayer::pause: cpal pause() failed",
+        "cpal stream",
+        e,
+      ))
+    })?;
     self.shared.state.store(STATE_PAUSED, Ordering::Release);
     Ok(())
   }
@@ -735,9 +771,13 @@ impl AudioPlayer {
     // tears down the queue + error slot; the pause error (if any)
     // is reported AFTER the cleanup runs.
     let pause_result = if let Some(stream) = self.stream.as_ref() {
-      stream
-        .pause()
-        .map_err(|e| Error::Backend(format!("AudioPlayer::stop: cpal pause() failed: {e}")))
+      stream.pause().map_err(|e| {
+        Error::ExternalOp(ExternalOpPayload::new(
+          "AudioPlayer::stop: cpal pause() failed",
+          "cpal stream",
+          e,
+        ))
+      })
     } else {
       Ok(())
     };
@@ -822,12 +862,11 @@ impl AudioPlayer {
         )
       })?;
       if projected_len > self.shared.queue_capacity_samples {
-        return Err(Error::Backend(format!(
-          "AudioPlayer::write_samples: queue overflow (capacity {} samples, current {} \
-             samples, tried to push {})",
-          self.shared.queue_capacity_samples,
-          q.len(),
-          samples.len()
+        return Err(Error::CapExceeded(CapExceededPayload::new(
+          "AudioPlayer::write_samples: queue overflow",
+          "queue_capacity_samples",
+          self.shared.queue_capacity_samples as u64,
+          projected_len as u64,
         )));
       }
     }
@@ -884,15 +923,17 @@ impl AudioPlayer {
       }
       let state = self.shared.state.load(Ordering::Acquire);
       if state != STATE_RUNNING {
-        return Err(Error::Backend(format!(
-          "AudioPlayer::flush: queue has {depth} samples but state is {state} (not running) — \
-             call start() before flush()"
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "AudioPlayer::flush: player state with samples queued (call start() before flush())",
+          "must be STATE_RUNNING when queue is non-empty",
+          format_smolstr!("state={state}, depth={depth}"),
         )));
       }
       if start.elapsed() > FLUSH_TIMEOUT {
-        return Err(Error::Backend(format!(
-          "AudioPlayer::flush: timed out after {:?} with {depth} samples still queued",
-          FLUSH_TIMEOUT
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "AudioPlayer::flush: drain timeout (samples still queued past FLUSH_TIMEOUT)",
+          "FLUSH_TIMEOUT must elapse with queue depth reaching 0",
+          format_smolstr!("FLUSH_TIMEOUT={FLUSH_TIMEOUT:?}, depth={depth}"),
         )));
       }
       thread::sleep(FLUSH_POLL_INTERVAL);
@@ -908,8 +949,12 @@ impl AudioPlayer {
       Ok(g) => g,
       Err(poisoned) => poisoned.into_inner(),
     };
-    if let Some(msg) = slot.take() {
-      return Err(Error::Backend(msg));
+    if let Some(err) = slot.take() {
+      return Err(Error::ExternalOp(ExternalOpPayload::new(
+        "AudioPlayer: cpal stream callback (async) error",
+        "cpal stream",
+        err,
+      )));
     }
     Ok(())
   }
@@ -1000,7 +1045,10 @@ mod tests {
     }
     {
       let mut e = shared.callback_error.lock().unwrap();
-      *e = Some("simulated prior cpal err_fn capture".to_string());
+      // The slot is now typed `Option<StreamError>` (post-R2 Codex fix to
+      // surface typed `Error::ExternalOp` from the async cpal callback
+      // path); use a real `StreamError` variant.
+      *e = Some(StreamError::DeviceNotAvailable);
     }
 
     // Mirror `AudioPlayer::stop`'s ordering: latch FIRST, then

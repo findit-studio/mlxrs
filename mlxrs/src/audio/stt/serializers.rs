@@ -742,10 +742,22 @@ fn save_as_txt_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::i
 /// `BufWriter::flush()` and surface failures as `Error::Backend`
 /// (broken-pipe, `ENOSPC` on the receiving end, ...).
 fn save_as_txt_stdout<W: Write>(transcript: &Transcript, w: &mut W) -> Result<()> {
-  save_as_txt_to_writer(transcript, w)
-    .map_err(|e| Error::Backend(format!("save_as_txt: write to stdout failed: {e}")))?;
-  w.flush()
-    .map_err(|e| Error::Backend(format!("save_as_txt: stdout flush failed: {e}")))?;
+  save_as_txt_to_writer(transcript, w).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save_as_txt: write to stdout failed",
+      FileOp::Write,
+      ::std::path::PathBuf::from("<stdout>"),
+      e,
+    ))
+  })?;
+  w.flush().map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save_as_txt: stdout flush failed",
+      FileOp::Flush,
+      ::std::path::PathBuf::from("<stdout>"),
+      e,
+    ))
+  })?;
   Ok(())
 }
 
@@ -838,10 +850,22 @@ fn save_as_srt_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::i
 /// ends with `\n\n` after the last cue but the partial bytes can still sit
 /// in the stdout buffer when redirected, so the explicit flush is required.
 fn save_as_srt_stdout<W: Write>(transcript: &Transcript, w: &mut W) -> Result<()> {
-  save_as_srt_to_writer(transcript, w)
-    .map_err(|e| Error::Backend(format!("save_as_srt: write to stdout failed: {e}")))?;
-  w.flush()
-    .map_err(|e| Error::Backend(format!("save_as_srt: stdout flush failed: {e}")))?;
+  save_as_srt_to_writer(transcript, w).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save_as_srt: write to stdout failed",
+      FileOp::Write,
+      ::std::path::PathBuf::from("<stdout>"),
+      e,
+    ))
+  })?;
+  w.flush().map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save_as_srt: stdout flush failed",
+      FileOp::Flush,
+      ::std::path::PathBuf::from("<stdout>"),
+      e,
+    ))
+  })?;
   Ok(())
 }
 
@@ -934,10 +958,22 @@ fn save_as_vtt_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::i
 /// (including the `WEBVTT\n\n` header + every cue block) is pushed past
 /// the stdout buffer before [`save_as_vtt`] returns.
 fn save_as_vtt_stdout<W: Write>(transcript: &Transcript, w: &mut W) -> Result<()> {
-  save_as_vtt_to_writer(transcript, w)
-    .map_err(|e| Error::Backend(format!("save_as_vtt: write to stdout failed: {e}")))?;
-  w.flush()
-    .map_err(|e| Error::Backend(format!("save_as_vtt: stdout flush failed: {e}")))?;
+  save_as_vtt_to_writer(transcript, w).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save_as_vtt: write to stdout failed",
+      FileOp::Write,
+      ::std::path::PathBuf::from("<stdout>"),
+      e,
+    ))
+  })?;
+  w.flush().map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save_as_vtt: stdout flush failed",
+      FileOp::Flush,
+      ::std::path::PathBuf::from("<stdout>"),
+      e,
+    ))
+  })?;
   Ok(())
 }
 
@@ -1012,9 +1048,11 @@ pub fn save_as_json(transcript: &Transcript, path: &Path) -> Result<()> {
   })?;
   let mut w = BufWriter::new(f);
   save_as_json_to_writer(transcript, &mut w).map_err(|e| {
-    Error::Backend(format!(
-      "save_as_json: serialize {} failed: {e}",
-      final_path.display()
+    Error::FileIo(FileIoPayload::new(
+      "save_as_json: serialize",
+      FileOp::Write,
+      ::std::path::PathBuf::from(&final_path),
+      e,
     ))
   })?;
   w.flush().map_err(|e| {
@@ -1065,10 +1103,22 @@ fn save_as_json_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::
 /// buffer entirely on a redirected stdout — without an explicit flush the
 /// final JSON bytes can sit past [`save_as_json`]'s return.
 fn save_as_json_stdout<W: Write>(transcript: &Transcript, w: &mut W) -> Result<()> {
-  save_as_json_to_writer(transcript, w)
-    .map_err(|e| Error::Backend(format!("save_as_json: serialize to stdout failed: {e}")))?;
-  w.flush()
-    .map_err(|e| Error::Backend(format!("save_as_json: stdout flush failed: {e}")))?;
+  save_as_json_to_writer(transcript, w).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save_as_json: serialize to stdout failed",
+      FileOp::Write,
+      ::std::path::PathBuf::from("<stdout>"),
+      e,
+    ))
+  })?;
+  w.flush().map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "save_as_json: stdout flush failed",
+      FileOp::Flush,
+      ::std::path::PathBuf::from("<stdout>"),
+      e,
+    ))
+  })?;
   Ok(())
 }
 
@@ -1514,13 +1564,15 @@ mod tests {
     let err =
       super::save_as_txt_stdout(&t, &mut w).expect_err("flush-failing writer must produce an Err");
     match err {
-      Error::Backend(message) => {
+      Error::FileIo(p) => {
         assert!(
-          message.contains("save_as_txt") && message.contains("stdout flush failed"),
-          "Error::Backend message must mention save_as_txt + stdout flush failure (got: {message})"
+          p.context().contains("save_as_txt") && p.context().contains("stdout flush failed"),
+          "FileIo context must mention save_as_txt + stdout flush failure (got: {})",
+          p.context()
         );
+        assert_eq!(p.op(), FileOp::Flush, "op kind must be Flush");
       }
-      other => panic!("expected Error::Backend, got {other:?}"),
+      other => panic!("expected Error::FileIo, got {other:?}"),
     }
     assert_eq!(
       w.flush_calls, 1,
@@ -1535,13 +1587,15 @@ mod tests {
     let err =
       super::save_as_srt_stdout(&t, &mut w).expect_err("flush-failing writer must produce an Err");
     match err {
-      Error::Backend(message) => {
+      Error::FileIo(p) => {
         assert!(
-          message.contains("save_as_srt") && message.contains("stdout flush failed"),
-          "Error::Backend message must mention save_as_srt + stdout flush failure (got: {message})"
+          p.context().contains("save_as_srt") && p.context().contains("stdout flush failed"),
+          "FileIo context must mention save_as_srt + stdout flush failure (got: {})",
+          p.context()
         );
+        assert_eq!(p.op(), FileOp::Flush, "op kind must be Flush");
       }
-      other => panic!("expected Error::Backend, got {other:?}"),
+      other => panic!("expected Error::FileIo, got {other:?}"),
     }
     assert_eq!(
       w.flush_calls, 1,
@@ -1556,13 +1610,15 @@ mod tests {
     let err =
       super::save_as_vtt_stdout(&t, &mut w).expect_err("flush-failing writer must produce an Err");
     match err {
-      Error::Backend(message) => {
+      Error::FileIo(p) => {
         assert!(
-          message.contains("save_as_vtt") && message.contains("stdout flush failed"),
-          "Error::Backend message must mention save_as_vtt + stdout flush failure (got: {message})"
+          p.context().contains("save_as_vtt") && p.context().contains("stdout flush failed"),
+          "FileIo context must mention save_as_vtt + stdout flush failure (got: {})",
+          p.context()
         );
+        assert_eq!(p.op(), FileOp::Flush, "op kind must be Flush");
       }
-      other => panic!("expected Error::Backend, got {other:?}"),
+      other => panic!("expected Error::FileIo, got {other:?}"),
     }
     assert_eq!(
       w.flush_calls, 1,
@@ -1577,13 +1633,15 @@ mod tests {
     let err =
       super::save_as_json_stdout(&t, &mut w).expect_err("flush-failing writer must produce an Err");
     match err {
-      Error::Backend(message) => {
+      Error::FileIo(p) => {
         assert!(
-          message.contains("save_as_json") && message.contains("stdout flush failed"),
-          "Error::Backend message must mention save_as_json + stdout flush failure (got: {message})"
+          p.context().contains("save_as_json") && p.context().contains("stdout flush failed"),
+          "FileIo context must mention save_as_json + stdout flush failure (got: {})",
+          p.context()
         );
+        assert_eq!(p.op(), FileOp::Flush, "op kind must be Flush");
       }
-      other => panic!("expected Error::Backend, got {other:?}"),
+      other => panic!("expected Error::FileIo, got {other:?}"),
     }
     assert_eq!(
       w.flush_calls, 1,

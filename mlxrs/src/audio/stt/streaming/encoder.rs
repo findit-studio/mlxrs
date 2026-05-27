@@ -18,9 +18,11 @@
 //! [swift-ref]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioSTT/Streaming/StreamingEncoder.swift
 //! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 
+use smol_str::format_smolstr;
+
 use crate::{
   Array,
-  error::{Error, Result},
+  error::{Error, OutOfRangePayload, RankMismatchPayload, Result},
   ops::shape::{concatenate, pad},
 };
 
@@ -174,9 +176,10 @@ impl<B: StreamingEncoderBackend> StreamingEncoder<B> {
   /// the backend's [`StreamingEncoderBackend::encode_window`].
   pub fn feed(&mut self, mel_frames: &Array) -> Result<usize> {
     if mel_frames.ndim() != 2 {
-      return Err(Error::Backend(format!(
-        "StreamingEncoder::feed: expected 2-D mel_frames input, got {}-D",
-        mel_frames.ndim()
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        "StreamingEncoder::feed: mel_frames must be rank-2 (frames, n_mels)",
+        mel_frames.ndim() as u32,
+        mel_frames.shape(),
       )));
     }
 
@@ -362,8 +365,10 @@ fn pad_to_window_size(frames: &Array, valid_frames: usize, window_size: usize) -
   }
   let high = window_size - valid_frames;
   let high_i32 = i32::try_from(high).map_err(|_| {
-    Error::Backend(format!(
-      "StreamingEncoder: pad-high count {high} exceeds i32::MAX for window-size padding"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "StreamingEncoder: pad-high count for window-size padding",
+      "must fit in i32 (i32::MAX = 2147483647)",
+      format_smolstr!("{high}"),
     ))
   })?;
   // 0-D scalar zero — `pad` casts it to the input dtype for the constant
@@ -488,7 +493,8 @@ mod tests {
     let mut stream = StreamingEncoder::new(encoder, 4, 0);
     let one_d = Array::from_slice::<f32>(&[0.0_f32; 8], &[8i32]).unwrap();
     let err = stream.feed(&one_d).unwrap_err();
-    assert!(matches!(err, Error::Backend(ref message) if message.contains("2-D")));
+    assert!(matches!(err, Error::RankMismatch(ref p)
+        if p.actual() == 1 && p.context().contains("rank-2")));
   }
 
   #[test]
