@@ -36,9 +36,45 @@
 use smol_str::SmolStr;
 use std::path::Path;
 
-use crate::error::{Error, FileIoPayload, FileOp, Result};
+use crate::error::{
+  CapExceededPayload, Error, FileIoPayload, FileOp, InvariantViolationPayload, OutOfRangePayload,
+  ParsePayload, Result, UnknownEnumValuePayload,
+};
 
 use super::pooling::PoolingStrategy;
+
+/// Inner parse error for the hand-rolled `1_Pooling/config.json` scanner.
+/// Carries the byte offset and a free-form message; wrapped in
+/// [`Error::Parse`] (via [`ParsePayload`]) so the position-rich diagnostic
+/// is preserved without a `Backend(format!)` string.
+#[derive(Debug)]
+struct PoolingJsonParseError {
+  pos: usize,
+  msg: String,
+}
+
+impl std::fmt::Display for PoolingJsonParseError {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "at byte {}: {}", self.pos, self.msg)
+  }
+}
+
+impl std::error::Error for PoolingJsonParseError {}
+
+/// Build an [`Error::Parse`] wrapping a [`PoolingJsonParseError`] at the
+/// given byte offset with the supplied message. The static `context` /
+/// `input_kind` keep the §5 closed-payload contract while the position +
+/// dynamic detail live in the inner error.
+fn parse_err_at(pos: usize, msg: impl Into<String>) -> Error {
+  Error::Parse(ParsePayload::new(
+    "embeddings::pooling_from_st_config",
+    "1_Pooling/config.json",
+    PoolingJsonParseError {
+      pos,
+      msg: msg.into(),
+    },
+  ))
+}
 
 /// Upper bound on the on-disk size of a `1_Pooling/config.json` we will
 /// read into memory. Real `sentence-transformers` pooling configs are a
@@ -264,11 +300,7 @@ impl<'a> Scanner<'a> {
   }
 
   fn err(&self, msg: impl Into<String>) -> Error {
-    Error::Backend(format!(
-      "invalid pooling config JSON at byte {}: {}",
-      self.pos,
-      msg.into()
-    ))
+    parse_err_at(self.pos, msg)
   }
 
   fn peek(&self) -> Option<u8> {
@@ -487,18 +519,21 @@ impl<'a> Scanner<'a> {
       // SIMD-scan to the next `"` or `\`. Same dispatch as `parse_string`.
       let tail = &self.src[self.pos..];
       let n = memspan::skip::skip_until(tail, *b"\"\\").ok_or_else(|| {
-        Error::Backend(format!(
-          "invalid pooling config JSON: unterminated string starting at byte {open_pos}"
-        ))
+        parse_err_at(
+          open_pos,
+          "unterminated string starting at this position".to_string(),
+        )
       })?;
       // Reject control characters in the chunk we just skipped (RFC 8259 §7).
       let chunk = &tail[..n];
       if let Some(bad) = chunk.iter().position(|&b| b < 0x20) {
-        return Err(Error::Backend(format!(
-          "invalid pooling config JSON at byte {}: control character 0x{:02X} in string body {ctx} (RFC 8259 §7)",
+        return Err(parse_err_at(
           self.pos + bad,
-          chunk[bad]
-        )));
+          format!(
+            "control character 0x{:02X} in string body {ctx} (RFC 8259 §7)",
+            chunk[bad]
+          ),
+        ));
       }
       self.pos += n;
       let boundary = match self.bump() {
@@ -512,9 +547,10 @@ impl<'a> Scanner<'a> {
       let esc = match self.bump() {
         Some(b) => b,
         None => {
-          return Err(Error::Backend(format!(
-            "invalid pooling config JSON: unterminated escape in string starting at byte {open_pos}"
-          )));
+          return Err(parse_err_at(
+            open_pos,
+            "unterminated escape in string starting at this position".to_string(),
+          ));
         }
       };
       match esc {
@@ -601,11 +637,13 @@ impl<'a> Scanner<'a> {
         // the closing quote, and LLVM auto-vectorizes the per-byte
         // `< 0x20` test.
         if let Some(bad) = body.iter().position(|&b| b < 0x20) {
-          return Err(Error::Backend(format!(
-            "invalid pooling config JSON at byte {}: control character 0x{:02X} in string body {ctx} (RFC 8259 §7)",
+          return Err(parse_err_at(
             body_start + bad,
-            body[bad]
-          )));
+            format!(
+              "control character 0x{:02X} in string body {ctx} (RFC 8259 §7)",
+              body[bad]
+            ),
+          ));
         }
         let s = std::str::from_utf8(body)
           .map_err(|e| self.err(format!("string is not valid UTF-8 {ctx}: {e}")))?;
@@ -617,9 +655,10 @@ impl<'a> Scanner<'a> {
         // Slow path: there's at least one `\` before the closing `"`.
         self.parse_string_with_escapes(ctx, open_pos)
       }
-      None => Err(Error::Backend(format!(
-        "invalid pooling config JSON: unterminated string starting at byte {open_pos}"
-      ))),
+      None => Err(parse_err_at(
+        open_pos,
+        "unterminated string starting at this position".to_string(),
+      )),
     }
   }
 
@@ -634,17 +673,20 @@ impl<'a> Scanner<'a> {
       // SIMD-scan from the current `pos` to the next `"` or `\`.
       let tail = &self.src[self.pos..];
       let n = memspan::skip::skip_until(tail, *b"\"\\").ok_or_else(|| {
-        Error::Backend(format!(
-          "invalid pooling config JSON: unterminated string starting at byte {open_pos}"
-        ))
+        parse_err_at(
+          open_pos,
+          "unterminated string starting at this position".to_string(),
+        )
       })?;
       let chunk = &tail[..n];
       if let Some(bad) = chunk.iter().position(|&b| b < 0x20) {
-        return Err(Error::Backend(format!(
-          "invalid pooling config JSON at byte {}: control character 0x{:02X} in string body {ctx} (RFC 8259 §7)",
+        return Err(parse_err_at(
           self.pos + bad,
-          chunk[bad]
-        )));
+          format!(
+            "control character 0x{:02X} in string body {ctx} (RFC 8259 §7)",
+            chunk[bad]
+          ),
+        ));
       }
       buf.extend_from_slice(chunk);
       self.pos += n;
@@ -663,9 +705,10 @@ impl<'a> Scanner<'a> {
       let esc = match self.bump() {
         Some(b) => b,
         None => {
-          return Err(Error::Backend(format!(
-            "invalid pooling config JSON: unterminated escape in string starting at byte {open_pos}"
-          )));
+          return Err(parse_err_at(
+            open_pos,
+            "unterminated escape in string starting at this position".to_string(),
+          ));
         }
       };
       match esc {
@@ -952,11 +995,10 @@ fn resolve_strategy(cfg: &[(SmolStr, JVal<'_>)]) -> Result<PoolingStrategy> {
     return PoolingStrategy::from_mode(mode);
   }
   if let Some(JVal::Array) = find(cfg, "pooling_mode") {
-    return Err(Error::Backend(
-      "concatenated pooling mode (list) is not supported; \
-                only a single pooling mode is allowed"
-        .into(),
-    ));
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "pooling config: `pooling_mode`",
+      "concatenated pooling mode (list) is not supported; only a single pooling mode is allowed",
+    )));
   }
   // C6 (Copilot review 4307622782, #3256688299): a present-but-non-
   // string/non-array `pooling_mode` (null / bool / number / object).
@@ -984,11 +1026,12 @@ fn resolve_strategy(cfg: &[(SmolStr, JVal<'_>)]) -> Result<PoolingStrategy> {
       // Str/Array handled above; unreachable, but no panic.
       _ => "an unsupported JSON type".to_string(),
     };
-    return Err(Error::Backend(format!(
-      "`pooling_mode` is present but not a string or list (got {descr}); \
-         a malformed pooling mode is rejected (python `pool_by_config` \
-         raises `ValueError` for a non-string/non-list mode) rather than \
-         silently falling back to a different strategy"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "pooling config: `pooling_mode`",
+      "must be a string or list of strings (a malformed pooling mode is rejected; \
+       python `pool_by_config` raises `ValueError` for a non-string/non-list mode \
+       rather than silently falling back to a different strategy)",
+      descr,
     )));
   }
 
@@ -1031,8 +1074,10 @@ fn resolve_strategy(cfg: &[(SmolStr, JVal<'_>)]) -> Result<PoolingStrategy> {
   // unless an unsupported flag is the only thing present.
   for (key, name) in LEGACY_KEYS {
     if (*name == "weightedmean" || *name == "mean_sqrt_len_tokens") && truthy(key) {
-      return Err(Error::Backend(format!(
-        "pooling mode {name:?} is not supported (supported: cls, lasttoken, max, mean)"
+      return Err(Error::UnknownEnumValue(UnknownEnumValuePayload::new(
+        "embeddings::PoolingStrategy (legacy `pooling_mode_*` flag)",
+        *name,
+        &["cls", "lasttoken", "max", "mean"],
       )));
     }
   }
@@ -1046,11 +1091,10 @@ fn resolve_strategy(cfg: &[(SmolStr, JVal<'_>)]) -> Result<PoolingStrategy> {
     return Ok(PoolingStrategy::Mean);
   }
 
-  Err(Error::Backend(
-    "pooling config declares no pooling mode (no `pooling_mode` \
-              and no legacy `pooling_mode_*` flags)"
-      .into(),
-  ))
+  Err(Error::InvariantViolation(InvariantViolationPayload::new(
+    "pooling config",
+    "declares no pooling mode (no `pooling_mode` and no legacy `pooling_mode_*` flags)",
+  )))
 }
 
 /// Convert a parsed JSON number slice into a `usize`, applying the
@@ -1059,43 +1103,60 @@ fn resolve_strategy(cfg: &[(SmolStr, JVal<'_>)]) -> Result<PoolingStrategy> {
 /// `Value::as_u64()` → `usize::try_from` → `> 0` chain, with a
 /// faithful description for the recoverable `Err`.
 fn parse_dim_number(key: &str, raw: &str) -> Result<usize> {
+  // The matryoshka-dimension key (one of [`KNOWN_KEYS`]); a SmolStr makes
+  // the `OutOfRange::context` runtime-keyed text cheap.
+  let context: smol_str::SmolStr = smol_str::format_smolstr!("pooling config: `{key}`");
   // Negative / fractional / exponent → rejected (`as_u64()` would have
   // returned `None` for these cases, which the previous code mapped to
   // an explicit `Err`).
   if raw.starts_with('-') {
-    return Err(Error::Backend(format!(
-      "`{key}` is present but not a non-negative integer (got {raw}); \
+    return Err(parse_err_at(
+      0,
+      format!(
+        "`{key}` is present but not a non-negative integer (got {raw}); \
          a malformed matryoshka dimension is rejected rather than \
          silently skipping truncation (which would return a \
          full-width embedding the model author did not request)"
-    )));
+      ),
+    ));
   }
   if raw.contains('.') || raw.contains('e') || raw.contains('E') {
-    return Err(Error::Backend(format!(
-      "`{key}` is present but not a non-negative integer (got {raw}); \
+    return Err(parse_err_at(
+      0,
+      format!(
+        "`{key}` is present but not a non-negative integer (got {raw}); \
          a malformed matryoshka dimension is rejected rather than \
          silently skipping truncation (which would return a \
          full-width embedding the model author did not request)"
-    )));
+      ),
+    ));
   }
   // Parse as u64; > u64::MAX integer literal → ParseIntError, rejected
   // with the overflow message the previous code surfaced.
   let v: u64 = raw.parse().map_err(|_| {
-    Error::Backend(format!(
-      "`{key}` = {raw} exceeds usize::MAX; refusing to use it as a \
-       matryoshka dimension"
+    // Static SmolStr-form context is borrowed by OutOfRange's accessors via
+    // the field's `&str` view; keep the runtime key + raw value in `value`.
+    let _ = &context;
+    Error::OutOfRange(OutOfRangePayload::new(
+      "pooling config: matryoshka dimension",
+      "must fit in usize (a u64-overflowing integer literal cannot be a matryoshka dimension)",
+      smol_str::format_smolstr!("{key} = {raw}"),
     ))
   })?;
   let v = usize::try_from(v).map_err(|_| {
-    Error::Backend(format!(
-      "`{key}` = {v} exceeds usize::MAX; refusing to use it as a \
-       matryoshka dimension"
+    let _ = &context;
+    Error::OutOfRange(OutOfRangePayload::new(
+      "pooling config: matryoshka dimension",
+      "must fit in usize (a u64 value exceeding usize::MAX cannot be a matryoshka dimension)",
+      smol_str::format_smolstr!("{key} = {v}"),
     ))
   })?;
   if v == 0 {
-    return Err(Error::Backend(format!(
-      "`{key}` is 0; a zero matryoshka dimension would produce an \
-         empty embedding (rejected rather than silently skipped)"
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "pooling config: matryoshka dimension",
+      "must be > 0 (a zero matryoshka dimension would produce an empty embedding; \
+       rejected rather than silently skipped)",
+      smol_str::format_smolstr!("{key} = 0"),
     )));
   }
   Ok(v)
@@ -1105,9 +1166,10 @@ fn parse_pairs(cfg: &[(SmolStr, JVal<'_>)]) -> Result<StPoolingConfig> {
   // python `pool_by_config` rejects `include_prompt: false` (INSTRUCTOR
   // prompt-aware pooling unsupported).
   if let Some(JVal::Bool(false)) = find(cfg, "include_prompt") {
-    return Err(Error::Backend(
-      "prompt-aware pooling (include_prompt=false) is not supported".into(),
-    ));
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "pooling config: `include_prompt`",
+      "prompt-aware pooling (include_prompt=false) is not supported",
+    )));
   }
 
   let strategy = resolve_strategy(cfg)?;
@@ -1154,11 +1216,12 @@ fn parse_pairs(cfg: &[(SmolStr, JVal<'_>)]) -> Result<StPoolingConfig> {
         JVal::Object => "object".to_string(),
         JVal::Num(_) => "number".to_string(), // handled above
       };
-      return Err(Error::Backend(format!(
-        "`{key}` is present but not a non-negative integer (got {descr}); \
-           a malformed matryoshka dimension is rejected rather than \
-           silently skipping truncation (which would return a \
-           full-width embedding the model author did not request)"
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "pooling config: matryoshka dimension",
+        "must be a non-negative integer (a malformed matryoshka dimension is rejected \
+         rather than silently skipping truncation, which would return a full-width \
+         embedding the model author did not request)",
+        smol_str::format_smolstr!("{key} = {descr}"),
       )));
     }
   };
@@ -1185,8 +1248,10 @@ pub fn pooling_from_st_config_bytes(json: &[u8]) -> Result<StPoolingConfig> {
   // structural parse occurs. JSON is required to be UTF-8 (RFC 8259 §8.1),
   // so any byte input that fails this gate is malformed by spec.
   let s = std::str::from_utf8(json).map_err(|e| {
-    Error::Backend(format!(
-      "invalid pooling config JSON: input is not valid UTF-8: {e}"
+    Error::Parse(ParsePayload::new(
+      "embeddings::pooling_from_st_config_bytes",
+      "1_Pooling/config.json",
+      e,
     ))
   })?;
   pooling_from_st_config_str(s)
@@ -1306,9 +1371,19 @@ pub fn pooling_from_st_config_path(model_dir: impl AsRef<Path>) -> Result<StPool
     ))
   })?;
   if !meta.is_file() {
-    return Err(Error::Backend(format!(
-      "pooling config {} is not a regular file; refusing to read",
-      path.display()
+    // The opened handle is NOT a regular file (FIFO/device/dir/symlink-to-
+    // special). std::fs has no `io::Error` for "not a regular file" so route
+    // through Error::FileIo carrying a synthetic InvalidInput io::Error: the
+    // path + FileOp::Stat are real (the fstat that decided this is a Stat
+    // observation), and the inner error preserves the actionable reason.
+    return Err(Error::FileIo(FileIoPayload::new(
+      "pooling config: opened handle is not a regular file",
+      FileOp::Stat,
+      path,
+      std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "not a regular file (FIFO/device/directory/symlink-to-special)",
+      ),
     )));
   }
 
@@ -1329,10 +1404,11 @@ pub fn pooling_from_st_config_path(model_dir: impl AsRef<Path>) -> Result<StPool
       ))
     })?;
   if bytes.len() as u64 > MAX_ST_POOLING_CONFIG_BYTES {
-    return Err(Error::Backend(format!(
-      "pooling config {} exceeds the {}-byte cap; refusing to read",
-      path.display(),
-      MAX_ST_POOLING_CONFIG_BYTES
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "embeddings::pooling_from_st_config_path",
+      "MAX_ST_POOLING_CONFIG_BYTES",
+      MAX_ST_POOLING_CONFIG_BYTES,
+      bytes.len() as u64,
     )));
   }
   pooling_from_st_config_bytes(&bytes)

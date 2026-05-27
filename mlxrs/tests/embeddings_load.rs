@@ -23,6 +23,7 @@ use mlxrs::{
     EmbeddingModelTypeRegistry, EmbeddingWeights, LoadedEmbeddingModel, PoolingStrategy, load,
     remap_model_type,
   },
+  error::{FileOp, RankMismatchPayload},
   io,
 };
 
@@ -51,9 +52,12 @@ impl EmbeddingModel for MockEmbedding {
   ) -> Result<EmbeddingModelOutput, Error> {
     let (batch, seq) = match input_ids.shape().as_slice() {
       [b, s] => (*b, *s),
-      other => {
-        return Err(Error::ShapeMismatch(format!(
-          "expects (batch, seq), got {other:?}"
+      _ => {
+        let shape = input_ids.shape();
+        return Err(Error::RankMismatch(RankMismatchPayload::new(
+          "MockEmbedding::forward expects rank-2 (batch, seq) ids",
+          shape.len() as u32,
+          shape,
         )));
       }
     };
@@ -202,8 +206,8 @@ fn empty_model_directory_errors_before_filesystem_root_scan() {
       panic!("an empty model directory path must be a recoverable error, not a load");
     };
     assert!(
-      matches!(err, Error::Backend(_)),
-      "expected a recoverable Backend error; got {err:?}"
+      matches!(err, Error::EmptyInput(_)),
+      "expected EmptyInput error; got {err:?}"
     );
     let msg = err.to_string();
     assert!(
@@ -233,8 +237,8 @@ fn empty_tokenizer_source_errors() {
     panic!("an empty tokenizer_source path must be a recoverable error");
   };
   assert!(
-    matches!(err, Error::Backend(_)),
-    "expected a recoverable Backend error; got {err:?}"
+    matches!(err, Error::EmptyInput(_)),
+    "expected EmptyInput error; got {err:?}"
   );
   assert!(
     err
@@ -242,6 +246,85 @@ fn empty_tokenizer_source_errors() {
       .contains("tokenizer directory path must not be empty"),
     "the error should explain the empty tokenizer-path rejection; got: {err}"
   );
+}
+
+#[test]
+fn invalid_tokenizer_dir_surfaces_path_context_and_preserves_typed_source() {
+  // R3 regression: when `Tokenizer::from_path` fails (e.g. the selected
+  // tokenizer directory has no `tokenizer.json`), the factory must wrap the
+  // typed `Error::Tokenizer` failure in `Error::FileIo(FileOp::Other(
+  // "tokenizer_load"), tokenizer_dir, …)` so:
+  //  (a) the *selected* tokenizer directory is machine-readable via
+  //      `payload.path()` (recovery / multi-candidate debuggability), and
+  //  (b) the original typed `crate::Error` is preserved via the
+  //      `io::Error::source()` chain (caller can downcast or Display-walk).
+  //
+  // We use the split-tokenizer-source layout (`with_tokenizer_source`) so the
+  // model_dir is a valid, loadable model and the *only* failure path is the
+  // separately-supplied tokenizer dir — making the path-context assertion
+  // unambiguous (the wrapper carries the tokenizer dir, not the model dir).
+  let model_dir = temp_dir("invalid-tok-dir-model");
+  write_model_dir(&model_dir, "bert");
+  let tok_dir = temp_dir("invalid-tok-dir-tok");
+  // Plant NO tokenizer.json — `Tokenizer::from_path` returns
+  // `Error::Tokenizer("load tokenizer.json: ...")`.
+
+  let registry = EmbeddingModelTypeRegistry::new().with("bert", mock_constructor());
+  let config =
+    EmbeddingModelConfiguration::from_directory(&model_dir).with_tokenizer_source(&tok_dir);
+  let Err(err) = load(&config, &registry) else {
+    panic!("expected FileIo error when tokenizer.json is missing in the tokenizer_source dir");
+  };
+
+  match err {
+    Error::FileIo(p) => {
+      // (a) Path context: the *selected* tokenizer directory is preserved.
+      assert_eq!(
+        p.path(),
+        tok_dir.as_path(),
+        "FileIo payload must carry the selected tokenizer directory, got {:?}",
+        p.path()
+      );
+      // The op kind explicitly marks this as a tokenizer-load failure (the
+      // contract the factory comment claims).
+      assert_eq!(p.op(), FileOp::Other("tokenizer_load"));
+      assert_eq!(p.context(), "embeddings load: tokenizer");
+
+      // (b) Typed source chain: the original `Error::Tokenizer` is reachable
+      // through the io::Error's `get_ref()` (R1 invariant — typed variant +
+      // its Display message survive, not just a stringified prefix).
+      //
+      // NOTE: `io::Error::new(_, boxed)` / `io::Error::other(boxed)` exposes
+      // the boxed inner via `get_ref()` / `into_inner()`, but the stdlib
+      // implementation does NOT forward it through `std::error::Error::
+      // source()` for the io::Error itself — so the typed-chain assertion
+      // must use `get_ref()` (which is what `FileIoPayload`'s docs point
+      // callers at too: "the underlying io::Error" is `inner()`, and the
+      // boxed source under it is reachable via `get_ref()`).
+      let inner_dyn = p
+        .inner()
+        .get_ref()
+        .expect("io::Error must carry the boxed mlxrs::Error inner via get_ref()");
+      let inner_msg = format!("{inner_dyn}");
+      assert!(
+        inner_msg.contains("load tokenizer.json"),
+        "the inner typed Error::Tokenizer Display must be reachable via \
+         io::Error::get_ref(); got inner message: {inner_msg:?}"
+      );
+
+      // Downcast: the boxed inner IS a `crate::Error`, specifically the
+      // `Tokenizer` variant (proving the typed chain is preserved end-to-end,
+      // not just stringified).
+      let downcast = inner_dyn
+        .downcast_ref::<Error>()
+        .expect("the io::Error get_ref must downcast to the original mlxrs::Error");
+      assert!(
+        downcast.is_tokenizer(),
+        "the preserved typed source must be Error::Tokenizer; got {downcast:?}"
+      );
+    }
+    other => panic!("expected Error::FileIo wrapping the typed Tokenizer source, got {other:?}"),
+  }
 }
 
 #[test]
@@ -319,8 +402,8 @@ fn load_non_utf8_leaf_model_shard_is_recoverable_error() {
     panic!("a non-UTF-8 model*.safetensors leaf must be a recoverable error, not a panic");
   };
   assert!(
-    matches!(err, Error::Backend(_)),
-    "expected a recoverable Backend error; got {err:?}"
+    matches!(err, Error::FileIo(_)),
+    "expected FileIo error; got {err:?}"
   );
   let msg = err.to_string();
   assert!(
@@ -372,8 +455,8 @@ fn load_non_utf8_leaf_shard_wins_over_stale_weight_fallback() {
     );
   };
   assert!(
-    matches!(err, Error::Backend(_)),
-    "expected a recoverable Backend error; got {err:?}"
+    matches!(err, Error::FileIo(_)),
+    "expected FileIo error; got {err:?}"
   );
   let msg = err.to_string();
   // The error must be the non-UTF-8 shard rejection, proving the preflight
@@ -414,8 +497,8 @@ fn load_non_utf8_leaf_shard_nested_under_subfolder_is_recoverable_error() {
     panic!("a non-UTF-8 leaf shard nested under a subfolder must be a recoverable error");
   };
   assert!(
-    matches!(err, Error::Backend(_)),
-    "expected a recoverable Backend error; got {err:?}"
+    matches!(err, Error::FileIo(_)),
+    "expected FileIo error; got {err:?}"
   );
   let msg = err.to_string();
   assert!(
@@ -473,9 +556,133 @@ fn load_broken_symlink_pooling_config_is_recoverable_error() {
        NOT be silently treated as absent and fall back to default pooling"
     );
   };
+  // Strict FileIo destructure (NOT a Backend|FileIo allowlist). A dangling
+  // symlink at the config path means `symlink_metadata` itself observed a
+  // PRESENT entry (the link inode) and SUCCEEDED — `read_optional_pooling`
+  // then drives `pooling_from_st_config_path`, whose first real `std::fs` op
+  // is the `OpenOptions::open()` call (`File::open` on non-Unix). Following
+  // the link to a missing target yields a real `NotFound` from `open()`.
+  // The contract is exact: `FileOp::Open` (NOT `Stat`/`Read` — those run only
+  // *after* a successful open) carrying the REAL `io::Error::NotFound`
+  // (NOT a synthetic `InvalidInput` — that's the not-a-regular-file branch),
+  // pinned to the exact `1_Pooling/config.json` we planted.
+  let expected_pooling_config_path = pooling_dir.join("config.json");
+  match &err {
+    Error::FileIo(payload) => {
+      assert_eq!(
+        payload.op(),
+        FileOp::Open,
+        "expected the OPEN phase for a dangling-symlink target; got {:?}",
+        payload.op()
+      );
+      assert_eq!(
+        payload.inner().kind(),
+        std::io::ErrorKind::NotFound,
+        "expected the inner io::Error::NotFound from following a dangling symlink to a missing \
+         target; got {:?}",
+        payload.inner().kind()
+      );
+      assert_eq!(
+        payload.path(),
+        expected_pooling_config_path.as_path(),
+        "expected the FileIo path to be the planted broken-symlink config path"
+      );
+    }
+    other => panic!("expected a typed FileIo error; got {other:?}"),
+  }
+}
+
+#[cfg(unix)]
+#[test]
+fn load_broken_parent_symlink_pooling_dir_is_recoverable_error() {
+  // THE PARENT-SYMLINK CASE: `1_Pooling` itself is a DANGLING symlink (its
+  // target directory does not exist). An `lstat` of the CHILD path
+  // `1_Pooling/config.json` returns `NotFound` from the kernel (the parent
+  // component cannot be resolved) — yet `1_Pooling` is genuinely PRESENT as a
+  // directory entry; a naïve "child NotFound ⇒ absent ⇒ Ok(None)" gate would
+  // silently degrade to default pooling. The fix is a SECOND `lstat` on the
+  // parent: an `Ok` on a symlink whose followed target does not exist surfaces
+  // as a typed `Error::FileIo` naming the broken parent path, NOT a silent
+  // fall-back. This test pins the contract end-to-end through public `load()`.
+  let dir = temp_dir("pooling-broken-parent-symlink");
+  write_model_dir(&dir, "bert");
+  // A symlink at `1_Pooling` pointing at a target directory that does not
+  // exist — a present directory entry whose resolution fails.
+  std::os::unix::fs::symlink(dir.join("nonexistent_pooling_dir"), dir.join("1_Pooling")).unwrap();
+
+  let registry = EmbeddingModelTypeRegistry::new().with("bert", mock_constructor());
+  let Err(err) = load(
+    &EmbeddingModelConfiguration::from_directory(&dir),
+    &registry,
+  ) else {
+    panic!(
+      "a present-but-broken (dangling-symlink) 1_Pooling parent directory must fail the \
+       load, NOT be silently treated as absent and fall back to default pooling"
+    );
+  };
+  // Strict FileIo destructure: the parent-symlink probe is `metadata` (follows
+  // symlinks) on `1_Pooling`. Following the dangling link to a missing target
+  // yields a real `NotFound` from the kernel — NOT a synthetic value — and the
+  // typed payload's path is the exact `1_Pooling` parent we planted (NOT
+  // `1_Pooling/config.json`), so the caller can distinguish "broken parent"
+  // from "broken child" by `payload.path()`.
+  let expected_parent_path = dir.join("1_Pooling");
+  let Error::FileIo(payload) = &err else {
+    panic!("expected a typed FileIo error; got {err:?}");
+  };
+  assert_eq!(
+    payload.op(),
+    FileOp::Stat,
+    "broken-parent-symlink probe MUST surface as FileOp::Stat (the metadata \
+     follow-the-link call that failed); got {:?}",
+    payload.op()
+  );
+  assert_eq!(
+    payload.inner().kind(),
+    std::io::ErrorKind::NotFound,
+    "broken-parent-symlink MUST carry the REAL io::Error::NotFound from \
+     following the dangling parent symlink; got {:?}",
+    payload.inner().kind()
+  );
+  assert_eq!(
+    payload.path(),
+    expected_parent_path.as_path(),
+    "the FileIo path MUST be the broken 1_Pooling parent (NOT the unreachable \
+     1_Pooling/config.json child) so callers can distinguish parent-vs-child \
+     failure modes; got {}",
+    payload.path().display()
+  );
+}
+
+#[cfg(unix)]
+#[test]
+fn load_resolvable_parent_symlink_pooling_dir_with_no_config_is_absent() {
+  // The CONTROL for the parent-symlink fix: `1_Pooling` is a symlink that
+  // RESOLVES (its target directory exists), but the target directory contains
+  // no `config.json`. This is the "present-as-resolvable-symlink, child
+  // genuinely absent" case — the loader must still treat it as `Ok(None)`
+  // (no pooling override) rather than failing closed. Without this control
+  // the parent-symlink fix would over-tighten and break the legitimate HF
+  // cache layout (which uses symlinks heavily).
+  let dir = temp_dir("pooling-resolvable-parent-symlink");
+  write_model_dir(&dir, "bert");
+  // A real target directory that exists but has no config.json inside.
+  let target_dir = dir.join("real_pooling_target");
+  fs::create_dir_all(&target_dir).unwrap();
+  std::os::unix::fs::symlink(&target_dir, dir.join("1_Pooling")).unwrap();
+
+  let registry = EmbeddingModelTypeRegistry::new().with("bert", mock_constructor());
+  let ctx = load(
+    &EmbeddingModelConfiguration::from_directory(&dir),
+    &registry,
+  )
+  .expect(
+    "a resolvable 1_Pooling symlink pointing at a real (empty) directory must still load \
+     (no config.json inside ⇒ no pooling override)",
+  );
   assert!(
-    matches!(err, Error::Backend(_)),
-    "expected a recoverable Backend error; got {err:?}"
+    ctx.pooling.is_none(),
+    "no 1_Pooling/config.json inside the resolved target ⇒ no pooling override"
   );
 }
 
@@ -554,9 +761,38 @@ fn load_permission_denied_pooling_config_is_recoverable_error() {
        treated as absent and fall back to default pooling"
     );
   };
+  // Strict FileIo destructure (NOT a Backend|FileIo allowlist). The
+  // permission-denied path goes through the read_optional_pooling
+  // presence-probe `symlink_metadata` call, which fails with
+  // PermissionDenied (EACCES on the parent dir's search bit). The
+  // contract is that the typed FileIo payload carries:
+  // (a) FileOp::Stat (the symlink_metadata = lstat operation),
+  // (b) inner io::Error with kind() == PermissionDenied (the REAL kernel
+  //     error from std::fs::symlink_metadata — NOT a synthetic NotFound
+  //     from Path::exists()),
+  // (c) the config path we planted under the unreadable parent.
+  let Error::FileIo(payload) = &err else {
+    panic!("expected a typed FileIo error; got {err:?}");
+  };
+  assert_eq!(
+    payload.op(),
+    FileOp::Stat,
+    "permission-denied symlink_metadata MUST surface as FileOp::Stat \
+     (the lstat that failed), not Other; got {:?}",
+    payload.op()
+  );
+  assert_eq!(
+    payload.inner().kind(),
+    std::io::ErrorKind::PermissionDenied,
+    "permission-denied path MUST carry the REAL io::Error from \
+     symlink_metadata (PermissionDenied), not a synthetic NotFound from \
+     Path::exists(); got {:?}",
+    payload.inner().kind()
+  );
   assert!(
-    matches!(err, Error::Backend(_)),
-    "expected a recoverable Backend error; got {err:?}"
+    payload.path().ends_with("1_Pooling/config.json"),
+    "expected the FileIo path to end with 1_Pooling/config.json; got {}",
+    payload.path().display()
   );
 }
 
