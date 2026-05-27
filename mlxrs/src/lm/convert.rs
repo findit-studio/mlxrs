@@ -82,7 +82,8 @@ use crate::{
   dtype::Dtype,
   error::{
     ConvertPostSavePartialPayload, DurabilityWarningPayload, EmptyInputPayload, Error,
-    FileIoPayload, FileOp, InvariantViolationPayload, Result,
+    FileIoPayload, FileOp, InvariantViolationPayload, LayerKeyedPayload, ParsePayload, Result,
+    UnsupportedDtypePayload,
   },
   lm::{
     load::{self, Weights},
@@ -448,9 +449,13 @@ pub fn mixed_quant_predicate(
     .split('.')
     .position(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
     .ok_or_else(|| {
-      Error::Backend(format!(
-        "mixed_quant_predicate: cannot locate the layer-index segment in `down_proj` \
-         path {first:?} (mirroring `convert.py:43-45`'s `if k.isdigit(): break`)"
+      Error::LayerKeyed(LayerKeyedPayload::new(
+        first.to_string(),
+        Error::InvariantViolation(InvariantViolationPayload::new(
+          "mixed_quant_predicate: `down_proj` path",
+          "must contain a numeric layer-index segment (mirroring \
+            convert.py:43-45's `if k.isdigit(): break`)",
+        )),
       ))
     })?;
 
@@ -587,10 +592,12 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
   // anywhere counts as "exists" too (matches python's
   // `pathlib.Path.exists()` — follows symlinks).
   if mlx_path.exists() {
-    return Err(Error::Backend(format!(
-      "convert: cannot save to the path {} as it already exists. Please delete \
-         the file/directory or specify a new path to save to.",
-      mlx_path.display()
+    return Err(Error::FileIo(FileIoPayload::new(
+      "convert: destination must not already exist (delete the file/directory or specify \
+        a new path to save to)",
+      FileOp::Stat,
+      mlx_path,
+      std::io::Error::from(std::io::ErrorKind::AlreadyExists),
     )));
   }
 
@@ -599,29 +606,27 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
   // the `exists()` check so destination validation always runs first
   // (mirrors the reference's check order at `convert.py:101-109`).
   if upload_repo.is_some() {
-    return Err(Error::Backend(
-      "convert: `upload_repo` is unsupported in mlxrs (HuggingFace Hub upload \
-                is out of scope — mlxrs is local-path-only). Drop the kwarg or upload \
-                the result directory yourself."
-        .into(),
-    ));
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "convert: `upload_repo`",
+      "must be None in mlxrs (HuggingFace Hub upload is out of scope — mlxrs is \
+        local-path-only; drop the kwarg or upload the result directory yourself)",
+    )));
   }
   if revision.is_some() {
-    return Err(Error::Backend(
-      "convert: `revision` is unsupported in mlxrs (HuggingFace Hub download \
-                is out of scope — mlxrs is local-path-only). Download the checkpoint \
-                yourself and pass its local path as `hf_path`."
-        .into(),
-    ));
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "convert: `revision`",
+      "must be None in mlxrs (HuggingFace Hub download is out of scope — mlxrs is \
+        local-path-only; download the checkpoint yourself and pass its local path as `hf_path`)",
+    )));
   }
 
   // `convert.py:146-147` — `if quantize and dequantize: raise ValueError(...)`.
   if quantize && dequantize {
-    return Err(Error::Backend(
-      "convert: choose either `quantize` or `dequantize`, not both \
-                (convert.py:146-147)."
-        .into(),
-    ));
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "convert: `quantize` && `dequantize` flags",
+      "must not both be true — choose either quantize or dequantize, not both \
+        (convert.py:146-147)",
+    )));
   }
 
   // ─── 2. Load (`convert.py:111-118` → F2) ───
@@ -997,9 +1002,10 @@ fn resolve_target_dtype(explicit: Option<Dtype>, config_json: &str) -> Result<Op
     // error — see the [`ConvertArgs::dtype`] field-doc for the why.
     return match d {
       Dtype::F16 | Dtype::BF16 | Dtype::F32 => Ok(Some(d)),
-      other => Err(Error::Backend(format!(
-        "convert: `dtype` must be one of float16, bfloat16, float32 — got {other:?}; \
-           matches mlx_lm/convert.py:82 supported set (MODEL_CONVERSION_DTYPES)"
+      other => Err(Error::UnsupportedDtype(UnsupportedDtypePayload::new(
+        "convert: `dtype` (matches mlx_lm/convert.py:82 supported set MODEL_CONVERSION_DTYPES)",
+        other,
+        &[Dtype::F16, Dtype::BF16, Dtype::F32],
       ))),
     };
   }
@@ -1172,7 +1178,7 @@ fn build_quantize_config(
   weights: &Weights,
 ) -> Result<(PerLayerQuantization, String)> {
   let value: serde_json::Value = serde_json::from_str(config_json)
-    .map_err(|e| Error::Backend(format!("convert: source config is not valid JSON: {e}")))?;
+    .map_err(|e| Error::Parse(ParsePayload::new("convert: source config", "JSON", e)))?;
   let serde_json::Value::Object(mut map) = value else {
     return Err(Error::InvariantViolation(InvariantViolationPayload::new(
       "convert: source config JSON",
@@ -1297,8 +1303,13 @@ fn build_quantize_config(
     serde_json::Value::Object(quant_block),
   );
 
-  let updated_text = serde_json::to_string(&serde_json::Value::Object(map))
-    .map_err(|e| Error::Backend(format!("convert: cannot re-serialize patched config: {e}")))?;
+  let updated_text = serde_json::to_string(&serde_json::Value::Object(map)).map_err(|e| {
+    Error::Parse(ParsePayload::new(
+      "convert: cannot re-serialize patched config",
+      "JSON",
+      e,
+    ))
+  })?;
 
   let live_cfg = PerLayerQuantization::new(Some(global), per_layer_overrides);
   Ok((live_cfg, updated_text))
@@ -1310,7 +1321,7 @@ fn build_quantize_config(
 /// stale quant block.
 fn strip_quantization_blocks(config_json: &str) -> Result<String> {
   let value: serde_json::Value = serde_json::from_str(config_json)
-    .map_err(|e| Error::Backend(format!("convert: source config is not valid JSON: {e}")))?;
+    .map_err(|e| Error::Parse(ParsePayload::new("convert: source config", "JSON", e)))?;
   let serde_json::Value::Object(mut map) = value else {
     return Err(Error::InvariantViolation(InvariantViolationPayload::new(
       "convert: source config JSON",
@@ -1320,8 +1331,13 @@ fn strip_quantization_blocks(config_json: &str) -> Result<String> {
   map.remove("quantization");
   map.remove("quantization_config");
   let stripped = serde_json::Value::Object(map);
-  serde_json::to_string(&stripped)
-    .map_err(|e| Error::Backend(format!("convert: cannot re-serialize stripped config: {e}")))
+  serde_json::to_string(&stripped).map_err(|e| {
+    Error::Parse(ParsePayload::new(
+      "convert: cannot re-serialize stripped config",
+      "JSON",
+      e,
+    ))
+  })
 }
 
 // ─────────────────── copy_tokenizer_and_extras ───────────────────
@@ -1846,19 +1862,16 @@ mod unit {
   fn resolve_target_dtype_explicit_i32_is_error() {
     let cfg = r#"{"torch_dtype":"float32"}"#;
     match resolve_target_dtype(Some(Dtype::I32), cfg) {
-      Err(Error::Backend(message)) => {
+      Err(Error::UnsupportedDtype(p)) => {
+        assert_eq!(p.dtype(), Dtype::I32);
+        assert_eq!(p.supported(), &[Dtype::F16, Dtype::BF16, Dtype::F32]);
         assert!(
-          message.contains("float16")
-            && message.contains("bfloat16")
-            && message.contains("float32"),
-          "error names the supported set: {message}"
-        );
-        assert!(
-          message.contains("I32") || message.contains("got"),
-          "error names the rejected dtype: {message}"
+          p.context().contains("MODEL_CONVERSION_DTYPES"),
+          "context names the reference set: {}",
+          p.context()
         );
       }
-      other => panic!("expected Err(Backend), got {other:?}"),
+      other => panic!("expected Err(UnsupportedDtype), got {other:?}"),
     }
   }
 
@@ -1866,10 +1879,11 @@ mod unit {
   fn resolve_target_dtype_explicit_f64_is_error() {
     let cfg = r#"{}"#;
     match resolve_target_dtype(Some(Dtype::F64), cfg) {
-      Err(Error::Backend(message)) => {
-        assert!(message.contains("float16"));
+      Err(Error::UnsupportedDtype(p)) => {
+        assert_eq!(p.dtype(), Dtype::F64);
+        assert_eq!(p.supported(), &[Dtype::F16, Dtype::BF16, Dtype::F32]);
       }
-      other => panic!("expected Err(Backend), got {other:?}"),
+      other => panic!("expected Err(UnsupportedDtype), got {other:?}"),
     }
   }
 
@@ -1877,10 +1891,11 @@ mod unit {
   fn resolve_target_dtype_explicit_complex_is_error() {
     let cfg = r#"{}"#;
     match resolve_target_dtype(Some(Dtype::Complex64), cfg) {
-      Err(Error::Backend(message)) => {
-        assert!(message.contains("float16"));
+      Err(Error::UnsupportedDtype(p)) => {
+        assert_eq!(p.dtype(), Dtype::Complex64);
+        assert_eq!(p.supported(), &[Dtype::F16, Dtype::BF16, Dtype::F32]);
       }
-      other => panic!("expected Err(Backend), got {other:?}"),
+      other => panic!("expected Err(UnsupportedDtype), got {other:?}"),
     }
   }
 
@@ -1888,10 +1903,11 @@ mod unit {
   fn resolve_target_dtype_explicit_bool_is_error() {
     let cfg = r#"{}"#;
     match resolve_target_dtype(Some(Dtype::Bool), cfg) {
-      Err(Error::Backend(message)) => {
-        assert!(message.contains("float16"));
+      Err(Error::UnsupportedDtype(p)) => {
+        assert_eq!(p.dtype(), Dtype::Bool);
+        assert_eq!(p.supported(), &[Dtype::F16, Dtype::BF16, Dtype::F32]);
       }
-      other => panic!("expected Err(Backend), got {other:?}"),
+      other => panic!("expected Err(UnsupportedDtype), got {other:?}"),
     }
   }
 

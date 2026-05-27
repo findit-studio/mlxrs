@@ -111,7 +111,12 @@ use serde::{Deserialize, Deserializer};
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{Error, Result},
+  error::{
+    ArithmeticOverflowPayload, DivisibilityConstraintPayload, Error, InvariantViolationPayload,
+    KeyCollisionPayload, LayerKeyedPayload, LengthMismatchPayload, MissingKeyPayload,
+    OutOfRangePayload, ParsePayload, RankMismatchPayload, Result, ShapePairMismatchPayload,
+    UnknownEnumValuePayload, UnsupportedDtypePayload,
+  },
   lm::load::Weights,
   ops,
 };
@@ -443,13 +448,15 @@ impl<'de> Deserialize<'de> for PerLayerQuantization {
 /// [`Quantization`] for the simpler "just the defaults" case.
 pub fn parse_quantization(config_json: &str) -> Result<Option<PerLayerQuantization>> {
   let value: serde_json::Value = serde_json::from_str(config_json)
-    .map_err(|e| Error::Backend(format!("parse_quantization: invalid config JSON: {e}")))?;
+    .map_err(|e| Error::Parse(ParsePayload::new("parse_quantization", "config JSON", e)))?;
   let Some(block) = value.get("quantization") else {
     return Ok(None);
   };
   let plq: PerLayerQuantization = serde_json::from_value(block.clone()).map_err(|e| {
-    Error::Backend(format!(
-      "parse_quantization: invalid `quantization` block: {e}"
+    Error::Parse(ParsePayload::new(
+      "parse_quantization",
+      "`quantization` block",
+      e,
     ))
   })?;
   Ok(Some(plq))
@@ -548,10 +555,9 @@ enum TripleClass {
   Valid,
   /// A `.scales` and/or `.biases` sibling exists but does NOT match
   /// mlx's quantized layout — an orphan or a mismatch from a corrupted
-  /// / out-of-sync checkpoint. The message names the offending path and
-  /// the specific inconsistency; the caller surfaces it as
-  /// [`Error::Backend`].
-  Invalid(String),
+  /// / out-of-sync checkpoint. The wrapped typed [`Error`] carries the
+  /// structured diagnostic; the caller surfaces it directly.
+  Invalid(Error),
 }
 
 /// Inspect `<layer_path>.scales` and `<layer_path>.biases` in `weights`
@@ -605,11 +611,15 @@ fn classify_triple(
     // mlx-produced triple. The `fp` schemes (`mxfp4`/`mxfp8`/`nvfp4`)
     // don't write `.biases` at all (`mlx/ops.cpp:4898-4900`), so this
     // can't be a non-affine triple either.
-    (None, Some(_)) => TripleClass::Invalid(format!(
-      "quantize_weights: layer {layer_path}: input has a stale `{biases_key}` \
-       with no matching `{scales_key}` (mlx `quantize` always writes `.scales` \
-       alongside `.biases`); refusing to silently overwrite the generated bias"
-    )),
+    (None, Some(_)) => TripleClass::Invalid(Error::LayerKeyed(LayerKeyedPayload::new(
+      layer_path.to_string(),
+      Error::MissingKey(MissingKeyPayload::new(
+        "quantize_weights: stale `.biases` with no matching `.scales` \
+          (mlx `quantize` always writes `.scales` alongside `.biases`; refusing to \
+          silently overwrite the generated bias)",
+        scales_key.clone(),
+      )),
+    ))),
     // `.scales` present (with or without `.biases`). Validate the
     // layout matches what mlx's `quantize` produces — if not, it's
     // an orphan `.scales` next to a dense weight, or a corrupted
@@ -622,24 +632,30 @@ fn classify_triple(
       // Valid (see the function-level "Precondition" doc above).
       let q = match cfg.per_layer.get(layer_path) {
         Some(QuantizationOption::Skip) => {
-          return TripleClass::Invalid(format!(
-            "quantize_weights: layer {layer_path}: input carries `{scales_key}` \
-             but the per-layer config marks this layer as `Skip` (not \
-             quantized) — refusing to silently treat the stale triple as a \
-             valid already-quantized layer"
-          ));
+          return TripleClass::Invalid(Error::LayerKeyed(LayerKeyedPayload::new(
+            layer_path.to_string(),
+            Error::KeyCollision(KeyCollisionPayload::new(
+              "quantize_weights: input carries `.scales` but the per-layer config marks this \
+                layer as `Skip` (not quantized) — refusing to silently treat the stale triple \
+                as a valid already-quantized layer",
+              scales_key.clone(),
+            )),
+          )));
         }
         Some(QuantizationOption::Quantize(q)) => *q,
         None => match cfg.quantization {
           Some(q) => q,
           None => {
-            return TripleClass::Invalid(format!(
-              "quantize_weights: layer {layer_path}: input carries \
-               `{scales_key}` but `cfg` has no global `Quantization` and no \
-               per-layer override for this layer — cannot resolve expected \
-               `.scales` shape (this should not arise in production: any \
-               parsed `quantization` block carries `group_size` + `bits`)"
-            ));
+            return TripleClass::Invalid(Error::LayerKeyed(LayerKeyedPayload::new(
+              layer_path.to_string(),
+              Error::InvariantViolation(InvariantViolationPayload::new(
+                "quantize_weights: input carries `.scales` but `cfg` has no global \
+                  `Quantization` and no per-layer override for this layer — cannot resolve \
+                  expected `.scales` shape (defensive: any parsed `quantization` block \
+                  carries group_size + bits)",
+                "quantization parameters must be resolvable",
+              )),
+            )));
           }
         },
       };
@@ -659,25 +675,27 @@ fn classify_triple(
       // failure cites the offending mode, not a downstream shape mismatch.
       match (q.mode, b_opt) {
         (QuantMode::Affine, None) => {
-          return TripleClass::Invalid(format!(
-            "quantize_weights: layer {layer_path}: `affine` mode \
-             (bits={}, group_size={}) requires `{biases_key}` alongside \
-             `{scales_key}` (mlx `affine_quantize` always writes \
-             `{{w_q, scales, biases}}`, `mlx/ops.cpp:4793-4798`), but the \
-             input carries no `.biases` — this is a structurally incomplete \
-             affine triple",
-            q.bits, q.group_size
-          ));
+          return TripleClass::Invalid(Error::LayerKeyed(LayerKeyedPayload::new(
+            layer_path.to_string(),
+            Error::MissingKey(MissingKeyPayload::new(
+              "quantize_weights: `affine` mode requires `.biases` alongside `.scales` \
+                (mlx `affine_quantize` always writes `{w_q, scales, biases}`, \
+                mlx/ops.cpp:4793-4798); this is a structurally incomplete affine triple",
+              biases_key.clone(),
+            )),
+          )));
         }
         (QuantMode::Mxfp4 | QuantMode::Mxfp8 | QuantMode::Nvfp4, Some(_)) => {
-          return TripleClass::Invalid(format!(
-            "quantize_weights: layer {layer_path}: `{}` mode is scale-only \
-             (mlx `fp_quantize` writes `{{w_q, scales}}` with no biases, \
-             `mlx/ops.cpp:4890,4898-4904`), but the input carries a stale \
-             `{biases_key}` — refusing to silently retain a bias from a \
-             different (affine) mode",
-            q.mode.as_str()
-          ));
+          return TripleClass::Invalid(Error::LayerKeyed(LayerKeyedPayload::new(
+            layer_path.to_string(),
+            Error::KeyCollision(KeyCollisionPayload::new(
+              "quantize_weights: scale-only mode (mxfp4 / mxfp8 / nvfp4) must not carry \
+                `.biases` (mlx `fp_quantize` writes `{w_q, scales}` with no biases, \
+                mlx/ops.cpp:4890,4898-4904); refusing to silently retain a bias from a \
+                different (affine) mode",
+              biases_key.clone(),
+            )),
+          )));
         }
         // `(Affine, Some(_))` falls through to the existing
         // shape/dtype validation against `.scales` below.
@@ -692,49 +710,58 @@ fn classify_triple(
       let w_dtype = match layer_weight.dtype() {
         Ok(d) => d,
         Err(e) => {
-          return TripleClass::Invalid(format!(
-            "quantize_weights: layer {layer_path}: cannot read `.weight` dtype \
-             (required to validate already-quantized triple): {e}"
-          ));
+          return TripleClass::Invalid(Error::LayerKeyed(LayerKeyedPayload::new(
+            layer_path.to_string(),
+            e,
+          )));
         }
       };
       if w_dtype != Dtype::U32 {
-        return TripleClass::Invalid(format!(
-          "quantize_weights: layer {layer_path}: input has `{scales_key}` but \
-           `.weight` dtype is {w_dtype:?} (mlx-quantized `.weight` is always \
-           uint32 — `mlx/ops.cpp:4795,4900`); this is a stale `.scales` orphan \
-           next to a dense `.weight`, not a valid already-quantized triple"
-        ));
+        return TripleClass::Invalid(Error::LayerKeyed(LayerKeyedPayload::new(
+          layer_path.to_string(),
+          Error::UnsupportedDtype(UnsupportedDtypePayload::new(
+            "quantize_weights: input has `.scales` but `.weight` dtype must be uint32 \
+              (mlx-quantized `.weight` is always uint32 — mlx/ops.cpp:4795,4900); this is \
+              a stale `.scales` orphan next to a dense `.weight`, not a valid \
+              already-quantized triple",
+            w_dtype,
+            &[Dtype::U32],
+          )),
+        )));
       }
       // `.weight` rank must be ≥ 2 — mlx `quantize` requires rank ≥ 2
       // inputs (`mlx/ops.cpp:4925-4929`), so a rank-0/1 `.weight` next
       // to a `.scales` cannot be a real quantized triple even when the
       // dtype is `uint32` and the leading dims happen to match.
       let w_shape = layer_weight.shape();
-      if w_shape.len() < 2 {
-        return TripleClass::Invalid(format!(
-          "quantize_weights: layer {layer_path}: `.weight` has rank {} \
-           (shape {:?}), but mlx `quantize` requires rank ≥ 2 inputs \
-           (`mlx/ops.cpp:4925-4929`); this is a malformed triple (a \
-           uint32 1-D / scalar `.weight` next to a `.scales` is not a \
-           layout mlx's `quantize` can have produced)",
-          w_shape.len(),
-          w_shape
-        ));
+      let w_rank = w_shape.len();
+      if w_rank < 2 {
+        return TripleClass::Invalid(Error::LayerKeyed(LayerKeyedPayload::new(
+          layer_path.to_string(),
+          Error::RankMismatch(RankMismatchPayload::new(
+            "quantize_weights: `.weight` next to `.scales` must be rank-2 (mlx `quantize` \
+              requires rank >= 2 inputs — mlx/ops.cpp:4925-4929; a uint32 1-D / scalar \
+              `.weight` next to a `.scales` is not a layout mlx's `quantize` can have produced)",
+            w_rank as u32,
+            w_shape,
+          )),
+        )));
       }
       // `.scales` rank == `.weight` rank, and the leading dims (all
       // but the last) match — mlx `quantize` preserves the leading
       // shape (`mlx/ops.cpp:4789-4798`).
       let s_shape = s.shape();
       if s_shape.len() != w_shape.len() {
-        return TripleClass::Invalid(format!(
-          "quantize_weights: layer {layer_path}: `{scales_key}` rank ({}) \
-           does not match `.weight` rank ({}) — mlx `quantize` preserves the \
-           leading shape across the packed `.weight` / `.scales` / `.biases` \
-           outputs (`mlx/ops.cpp:4789-4798`)",
-          s_shape.len(),
-          w_shape.len()
-        ));
+        return TripleClass::Invalid(Error::LayerKeyed(LayerKeyedPayload::new(
+          layer_path.to_string(),
+          Error::LengthMismatch(LengthMismatchPayload::new(
+            "quantize_weights: `.scales` rank vs `.weight` rank — mlx `quantize` preserves \
+              the leading shape across the packed `.weight` / `.scales` / `.biases` outputs \
+              (mlx/ops.cpp:4789-4798)",
+            w_shape.len(),
+            s_shape.len(),
+          )),
+        )));
       }
       // Leading dims (all but the last) must match. Rank ≥ 2 is
       // already enforced above, so both slices are non-empty and the
@@ -743,13 +770,15 @@ fn classify_triple(
       // (`mlx/mlx/ops.cpp:97-105`); checking it here surfaces the
       // mismatch with a layer-named error before mlx-c sees it.
       if s_shape[..s_shape.len() - 1] != w_shape[..w_shape.len() - 1] {
-        return TripleClass::Invalid(format!(
-          "quantize_weights: layer {layer_path}: `{scales_key}` leading dims \
-           {:?} do not match `.weight` leading dims {:?} — mlx `quantize` \
-           preserves all-but-last dims",
-          &s_shape[..s_shape.len() - 1],
-          &w_shape[..w_shape.len() - 1],
-        ));
+        return TripleClass::Invalid(Error::LayerKeyed(LayerKeyedPayload::new(
+          layer_path.to_string(),
+          Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+            "quantize_weights: `.scales` leading dims (all but the last) must match \
+              `.weight` leading dims — mlx `quantize` preserves all-but-last dims",
+            w_shape[..w_shape.len() - 1].to_vec(),
+            s_shape[..s_shape.len() - 1].to_vec(),
+          )),
+        )));
       }
       // Per the [module-level validation contract](self#validation-contract):
       // per-mode bits/group_size pairings, the scales-last-axis invariant
@@ -864,7 +893,7 @@ pub fn quantize_weights(
     match classify_triple(&weights, layer_path, arr, cfg) {
       TripleClass::Absent => {}
       TripleClass::Valid => continue,
-      TripleClass::Invalid(message) => return Err(Error::Backend(message)),
+      TripleClass::Invalid(err) => return Err(err),
     }
     // Caller-supplied eligibility — the structural analogue of mlx-lm's
     // `hasattr(module, "to_quantized")` (`utils.py:824`). Pass 1 of the
@@ -887,9 +916,13 @@ pub fn quantize_weights(
     }
     let last = *shape.last().expect("len >= 2");
     let gs = usize::try_from(q.group_size).map_err(|_| {
-      Error::ShapeMismatch(format!(
-        "quantize_weights: layer {layer_path}: group_size ({}) must be a non-negative i32",
-        q.group_size
+      Error::LayerKeyed(LayerKeyedPayload::new(
+        layer_path.to_string(),
+        Error::OutOfRange(OutOfRangePayload::new(
+          "quantize_weights: group_size",
+          "must be a non-negative i32",
+          q.group_size.to_string(),
+        )),
       ))
     })?;
     if gs == 0 || last % gs != 0 {
@@ -1010,12 +1043,9 @@ pub fn dequantize_weights(weights: Weights, cfg: &PerLayerQuantization) -> Resul
       let Some(weight_arr) = weights.get(&weight_key) else {
         continue;
       };
-      let w_dtype = weight_arr.dtype().map_err(|e| {
-        Error::Backend(format!(
-          "dequantize_weights: layer {path}: cannot read `{weight_key}` dtype \
-           (required to classify orphan `.biases` against packed `.weight`): {e}"
-        ))
-      })?;
+      let w_dtype = weight_arr
+        .dtype()
+        .map_err(|e| Error::LayerKeyed(LayerKeyedPayload::new(path.to_string(), e)))?;
       // Mirror `classify_triple`: only `uint32` `.weight` is the
       // mlx-packed signal (`mlx/ops.cpp:4795,4900`). Any other dtype
       // (`F32` and friends) is a dense layer — pass through.
@@ -1029,13 +1059,16 @@ pub fn dequantize_weights(weights: Weights, cfg: &PerLayerQuantization) -> Resul
       if weight_arr.shape().len() < 2 {
         continue;
       }
-      return Err(Error::Backend(format!(
-        "dequantize_weights: layer {path}: input has a stale \
-           `{path}{BIASES_SUFFIX}` with no matching `{path}{SCALES_SUFFIX}` \
-           (mlx `quantize` always writes `.scales` alongside `.biases`, \
-           `mlx/ops.cpp:4793-4798`); this is a structurally incomplete \
-           triple — refusing to silently leave the `uint32`-packed \
-           `{path}{WEIGHT_SUFFIX}` as a pass-through in the dequantized output"
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        path.to_string(),
+        Error::MissingKey(MissingKeyPayload::new(
+          "dequantize_weights: stale `.biases` with no matching `.scales` \
+            (mlx `quantize` always writes `.scales` alongside `.biases`, \
+            `mlx/ops.cpp:4793-4798`); this is a structurally incomplete triple, \
+            refusing to silently leave the `uint32`-packed `.weight` as a \
+            pass-through in the dequantized output",
+          format!("{path}{SCALES_SUFFIX}"),
+        )),
       )));
     }
   }
@@ -1085,19 +1118,24 @@ pub fn dequantize_weights(weights: Weights, cfg: &PerLayerQuantization) -> Resul
 
   for (path, (w_opt, s_opt, b_opt)) in staged {
     let w = w_opt.ok_or_else(|| {
-      Error::Backend(format!(
-        "dequantize_weights: layer {path} is missing `.weight`"
+      Error::MissingKey(MissingKeyPayload::new(
+        "dequantize_weights: triple missing `.weight`",
+        format!("{path}{WEIGHT_SUFFIX}"),
       ))
     })?;
     let scales = s_opt.ok_or_else(|| {
-      Error::Backend(format!(
-        "dequantize_weights: layer {path} is missing `.scales`"
+      Error::MissingKey(MissingKeyPayload::new(
+        "dequantize_weights: triple missing `.scales`",
+        format!("{path}{SCALES_SUFFIX}"),
       ))
     })?;
     let q = cfg.quantization_for(&path).ok_or_else(|| {
-      Error::Backend(format!(
-        "dequantize_weights: no quantization parameters for layer {path} \
-           (no global default and no per-layer override)"
+      Error::LayerKeyed(LayerKeyedPayload::new(
+        path.to_string(),
+        Error::InvariantViolation(InvariantViolationPayload::new(
+          "dequantize_weights: quantization parameters",
+          "must be resolvable (no global default and no per-layer override)",
+        )),
       ))
     })?;
     // Symmetric mode-arity check with [`quantize_weights`] /
@@ -1112,24 +1150,25 @@ pub fn dequantize_weights(weights: Weights, cfg: &PerLayerQuantization) -> Resul
     // different mode); a clear early failure is better than silent corruption.
     match (q.mode, b_opt.as_ref()) {
       (QuantMode::Affine, None) => {
-        return Err(Error::Backend(format!(
-          "dequantize_weights: layer {path}: `affine` mode \
-             (bits={}, group_size={}) requires `{path}.biases` alongside \
-             `{path}.scales` (mlx `affine_dequantize` takes \
-             `{{w_q, scales, biases}}`, `mlx/ops.cpp:5085-5099`), but the \
-             input carries no `.biases` — this is a structurally incomplete \
-             affine triple",
-          q.bits, q.group_size
+        return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+          path.to_string(),
+          Error::MissingKey(MissingKeyPayload::new(
+            "dequantize_weights: `affine` mode requires `.biases` alongside `.scales` \
+              (mlx `affine_dequantize` takes `{w_q, scales, biases}`, mlx/ops.cpp:5085-5099)",
+            format!("{path}.biases"),
+          )),
         )));
       }
       (QuantMode::Mxfp4 | QuantMode::Mxfp8 | QuantMode::Nvfp4, Some(_)) => {
-        return Err(Error::Backend(format!(
-          "dequantize_weights: layer {path}: `{}` mode is scale-only \
-             (mlx `fp_dequantize` takes `{{w_q, scales}}` with no biases, \
-             `mlx/ops.cpp:5198-5210`), but the input carries a stale \
-             `{path}.biases` — refusing to silently retain a bias from a \
-             different (affine) mode",
-          q.mode.as_str()
+        return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+          path.to_string(),
+          Error::KeyCollision(KeyCollisionPayload::new(
+            "dequantize_weights: scale-only mode (mxfp4 / mxfp8 / nvfp4) must not carry \
+              `.biases` (mlx `fp_dequantize` takes `{w_q, scales}` with no biases, \
+              mlx/ops.cpp:5198-5210); refusing to silently retain a bias from a \
+              different (affine) mode",
+            format!("{path}.biases"),
+          )),
         )));
       }
       // `(Affine, Some(_))` / `(Mxfp4 | Mxfp8 | Nvfp4, None)` are the
@@ -1360,11 +1399,15 @@ const _: () = assert!(AWQ_BITS == 4 && AWQ_SHIFTS[1] == 4 * AWQ_BITS);
 /// other than `uint32` / `int32` are rejected as [`Error::Backend`].
 pub fn unpack_awq_weights(qweight: &Array) -> Result<Array> {
   let shape = qweight.shape();
-  if shape.len() != 2 {
-    return Err(Error::ShapeMismatch(format!(
-      "unpack_awq_weights: expected 2-D qweight `[rows, packed_cols]`, got shape {shape:?}"
+  let shape_len = shape.len();
+  if shape_len != 2 {
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "unpack_awq_weights: qweight must be 2-D [rows, packed_cols]",
+      shape_len as u32,
+      shape,
     )));
   }
+  let shape = qweight.shape();
   let dtype = qweight.dtype()?;
   // AutoAWQ allocates `qweight` / `qzeros` with `torch.int32` (signed) —
   // mlx-lm's `_unpack_awq_weights` (`utils.py:72-82`) does the shift-and-mask
@@ -1385,19 +1428,25 @@ pub fn unpack_awq_weights(qweight: &Array) -> Result<Array> {
       &owned_view
     }
     other => {
-      return Err(Error::Backend(format!(
-        "unpack_awq_weights: AutoAWQ stores `qweight` as 32-bit packed nibbles \
-           (`utils.py:72-82`) — accept `uint32` (mlx-lm canonical) or `int32` \
-           (AutoAWQ `WQLinear_GEMM`'s default `torch.int32` allocation); got dtype {other:?}"
+      return Err(Error::UnsupportedDtype(UnsupportedDtypePayload::new(
+        "unpack_awq_weights: qweight (AutoAWQ stores qweight as 32-bit packed nibbles, \
+          utils.py:72-82; accepts uint32 (mlx-lm canonical) or int32 (AutoAWQ WQLinear_GEMM's \
+          default torch.int32 allocation))",
+        other,
+        &[Dtype::U32, Dtype::I32],
       )));
     }
   };
   let rows = shape[0];
   let packed_cols = shape[1];
   let cols = packed_cols.checked_mul(AWQ_PACK_FACTOR).ok_or_else(|| {
-    Error::ShapeMismatch(format!(
-      "unpack_awq_weights: unpacked col count `packed_cols * 8` overflows usize \
-         (packed_cols={packed_cols})"
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "unpack_awq_weights: unpacked col count `packed_cols * 8`",
+      "usize",
+      [
+        ("packed_cols", packed_cols as u64),
+        ("multiplier", AWQ_PACK_FACTOR as u64),
+      ],
     ))
   })?;
 
@@ -1498,10 +1547,11 @@ fn resolve_awq_model_dtype(
   for prefix in qweight_prefixes {
     let scales_key = format!("{prefix}.scales");
     let scales = weights.get(&scales_key).ok_or_else(|| {
-      Error::Backend(format!(
-        "transform_awq_weights: layer `{prefix}.qweight` is missing its companion \
-           `{scales_key}` (AutoAWQ writes `.qweight` / `.scales` / `.qzeros` as a triple); \
-           refusing to silently drop the layer"
+      Error::MissingKey(MissingKeyPayload::new(
+        "transform_awq_weights: AWQ `.qweight` missing its `.scales` companion \
+          (AutoAWQ writes `.qweight` / `.scales` / `.qzeros` as a triple — refusing to \
+          silently drop the layer)",
+        scales_key.clone(),
       ))
     })?;
     let d = scales.dtype()?;
@@ -1582,10 +1632,14 @@ fn validate_awq_scales_are_floating(weights: &Weights, qweight_prefixes: &[Strin
     };
     let d = scales.dtype()?;
     if !is_floating(d) {
-      return Err(Error::Backend(format!(
-        "transform_awq_weights: layer `{scales_key}` has non-floating dtype {d:?}; \
-           AutoAWQ `.scales` MUST be a floating type (F16 / F32 / F64 / BF16) — \
-           any other dtype would corrupt the dtype-unification cast"
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        scales_key.clone(),
+        Error::UnsupportedDtype(UnsupportedDtypePayload::new(
+          "transform_awq_weights: AutoAWQ `.scales` (any other dtype would corrupt the \
+            dtype-unification cast)",
+          d,
+          &[Dtype::F16, Dtype::F32, Dtype::F64, Dtype::BF16],
+        )),
       )));
     }
   }
@@ -1661,34 +1715,31 @@ pub fn transform_awq_weights(
   // historically that has meant "any" / "gemm").
   match config.version.as_str() {
     "" | "gemm" => { /* proceed */ }
-    "gemv" => {
-      return Err(Error::Backend(
-        "AWQ version 'gemv' not yet supported — only 'gemm' is implemented. \
-                  GEMV checkpoints use a different qweight shape, scales layout, and \
-                  sequential packing; converting one through the GEMM path would silently \
-                  produce corrupt weights. See upstream AutoAWQ for GEMV-layout details. \
-                  Re-quantize with `awq --version gemm` if possible."
-          .to_string(),
-      ));
-    }
     other => {
-      return Err(Error::Backend(format!(
-        "transform_awq_weights: AWQ version '{other}' not recognized (expected 'gemm' or empty)"
+      return Err(Error::UnknownEnumValue(UnknownEnumValuePayload::new(
+        "transform_awq_weights: AWQ version (only `gemm` is implemented — GEMV checkpoints \
+          use a different qweight shape, scales layout, and sequential packing; converting one \
+          through the GEMM path would silently produce corrupt weights — re-quantize with \
+          `awq --version gemm` if possible)",
+        other.to_string(),
+        &["gemm", ""],
       )));
     }
   }
   // Faithful to mlx-lm's `if bits != 4: raise ValueError` (`utils.py:88`).
   if config.bits != AWQ_BITS {
-    return Err(Error::Backend(format!(
-      "transform_awq_weights: only bits=4 is supported for AutoAWQ/GPTQ models \
-         (`mlx-lm/mlx_lm/utils.py:88-89`); got bits={}",
-      config.bits
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "transform_awq_weights: AWQ bits (mlx-lm/mlx_lm/utils.py:88-89)",
+      "must be 4 (only 4-bit AutoAWQ/GPTQ is supported)",
+      config.bits.to_string(),
     )));
   }
   let group_size = config.group_size;
   let group_size_i32 = i32::try_from(group_size).map_err(|_| {
-    Error::ShapeMismatch(format!(
-      "transform_awq_weights: group_size {group_size} exceeds i32::MAX"
+    Error::OutOfRange(OutOfRangePayload::new(
+      "transform_awq_weights: group_size",
+      "must fit in i32",
+      group_size.to_string(),
     ))
   })?;
 
@@ -1697,11 +1748,14 @@ pub fn transform_awq_weights(
   // re-quantize via `mlx_lm.convert` or pick a model without `g_idx`.
   for key in weights.keys() {
     if key.ends_with(".g_idx") {
-      return Err(Error::Backend(format!(
-        "transform_awq_weights: found `{key}` in weights. Models with non-contiguous \
-           group indices (`g_idx`) are not supported by mlx-lm's AutoAWQ on-load \
-           converter (`mlx-lm/mlx_lm/utils.py:95-100`). Please use a model without `g_idx` \
-           or re-quantize the model via `mlx_lm.convert`."
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        key.clone(),
+        Error::InvariantViolation(InvariantViolationPayload::new(
+          "transform_awq_weights: GPTQ `.g_idx`",
+          "must not be present (models with non-contiguous group indices are not supported \
+            by mlx-lm's AutoAWQ on-load converter — mlx-lm/mlx_lm/utils.py:95-100 — please use \
+            a model without `g_idx` or re-quantize via `mlx_lm.convert`)",
+        )),
       )));
     }
   }
@@ -1746,34 +1800,38 @@ pub fn transform_awq_weights(
     // failure mode is a clear preflight error, not silent corruption.
     let weight_key = format!("{prefix}.weight");
     if weights.contains_key(&weight_key) {
-      return Err(Error::Backend(format!(
-        "AWQ conversion collision: input contains both `{qweight_key}` (to be converted) and \
-           `{weight_key}` (would be overwritten by the generated AWQ output). Remove the stale \
-           dense weight before fusing. (Precedent: the non-AWQ `quantize_weights` path also \
-           refuses analogous orphan/stale collisions — see `classify_triple` in this module.)"
+      return Err(Error::KeyCollision(KeyCollisionPayload::new(
+        "transform_awq_weights: input contains both `.qweight` and `.weight` (the generated \
+          AWQ output would overwrite the stale dense `.weight`); remove the stale dense weight \
+          before fusing (precedent: non-AWQ `quantize_weights` refuses analogous orphan/stale \
+          collisions via `classify_triple`)",
+        weight_key,
       )));
     }
     let biases_key = format!("{prefix}.biases");
     if weights.contains_key(&biases_key) {
-      return Err(Error::Backend(format!(
-        "AWQ conversion collision: input contains both `{qweight_key}` (to be converted) and \
-           `{biases_key}` (would be overwritten by the generated AWQ output). Remove the stale \
-           biases before fusing. (Precedent: the non-AWQ `quantize_weights` path also refuses \
-           analogous orphan/stale collisions — see `classify_triple` in this module.)"
+      return Err(Error::KeyCollision(KeyCollisionPayload::new(
+        "transform_awq_weights: input contains both `.qweight` and `.biases` (the generated \
+          AWQ output would overwrite the stale `.biases`); remove the stale biases before \
+          fusing (precedent: non-AWQ `quantize_weights` refuses analogous orphan/stale \
+          collisions via `classify_triple`)",
+        biases_key,
       )));
     }
     let Some(qweight) = weights.get(&qweight_key) else {
       // Should be unreachable (we built the prefix list FROM the keys),
       // but guard defensively.
-      return Err(Error::Backend(format!(
-        "transform_awq_weights: missing `{qweight_key}` after prefix scan"
+      return Err(Error::MissingKey(MissingKeyPayload::new(
+        "transform_awq_weights: `.qweight` missing after prefix scan (defensive)",
+        qweight_key,
       )));
     };
     let Some(scales) = weights.get(&scales_key) else {
-      return Err(Error::Backend(format!(
-        "transform_awq_weights: layer `{qweight_key}` is missing its companion `{scales_key}` \
-           (AutoAWQ writes `.qweight` / `.scales` / `.qzeros` as a triple); refusing to silently \
-           drop the layer"
+      return Err(Error::MissingKey(MissingKeyPayload::new(
+        "transform_awq_weights: AWQ `.qweight` missing its `.scales` companion \
+          (AutoAWQ writes `.qweight` / `.scales` / `.qzeros` as a triple — refusing to silently \
+          drop the layer)",
+        scales_key,
       )));
     };
     // Fix 1 [CRITICAL]: dtype preflight. AutoAWQ's `WQLinear_GEMM`
@@ -1786,10 +1844,15 @@ pub fn transform_awq_weights(
     // preflight rather than a per-layer error during the conversion pass.
     let qw_dtype = qweight.dtype()?;
     if !matches!(qw_dtype, Dtype::U32 | Dtype::I32) {
-      return Err(Error::Backend(format!(
-        "transform_awq_weights: layer `{qweight_key}`: qweight dtype {qw_dtype:?} not supported \
-           — AutoAWQ stores packed nibbles as `uint32` (mlx-lm canonical) or `int32` \
-           (AutoAWQ `WQLinear_GEMM` default `torch.int32` allocation); reject all other dtypes"
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        qweight_key.clone(),
+        Error::UnsupportedDtype(UnsupportedDtypePayload::new(
+          "transform_awq_weights: qweight (AutoAWQ stores packed nibbles as `uint32` \
+            (mlx-lm canonical) or `int32` (AutoAWQ `WQLinear_GEMM` default `torch.int32` \
+            allocation))",
+          qw_dtype,
+          &[Dtype::U32, Dtype::I32],
+        )),
       )));
     }
     // Shape validation: `qweight: [in_features, packed_out]` /
@@ -1797,40 +1860,77 @@ pub fn transform_awq_weights(
     // out_features (post-pack-factor), and `in_features` must be a
     // multiple of `group_size` (`utils.py:118` `n_groups = in_features //
     // group_size`).
+    let q_shape0 = qweight.shape();
+    let s_shape0 = scales.shape();
+    let q_rank = q_shape0.len();
+    let s_rank = s_shape0.len();
+    if q_rank != 2 {
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        qweight_key.clone(),
+        Error::RankMismatch(RankMismatchPayload::new(
+          "transform_awq_weights: qweight must be 2-D [in_features, packed_out]",
+          q_rank as u32,
+          q_shape0,
+        )),
+      )));
+    }
+    if s_rank != 2 {
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        scales_key.clone(),
+        Error::RankMismatch(RankMismatchPayload::new(
+          "transform_awq_weights: scales must be 2-D [n_groups, out_features]",
+          s_rank as u32,
+          s_shape0,
+        )),
+      )));
+    }
     let q_shape = qweight.shape();
     let s_shape = scales.shape();
-    if q_shape.len() != 2 {
-      return Err(Error::ShapeMismatch(format!(
-        "transform_awq_weights: layer `{qweight_key}`: qweight must be 2-D \
-           `[in_features, packed_out]`, got shape {q_shape:?}"
-      )));
-    }
-    if s_shape.len() != 2 {
-      return Err(Error::ShapeMismatch(format!(
-        "transform_awq_weights: layer `{scales_key}`: scales must be 2-D \
-           `[n_groups, out_features]`, got shape {s_shape:?}"
-      )));
-    }
     let in_features = q_shape[0];
     let packed_out = q_shape[1];
     let out_features = packed_out.checked_mul(AWQ_PACK_FACTOR).ok_or_else(|| {
-      Error::ShapeMismatch(format!(
-        "transform_awq_weights: layer `{qweight_key}`: out_features overflows usize \
-           (packed_out={packed_out})"
+      Error::LayerKeyed(LayerKeyedPayload::new(
+        qweight_key.clone(),
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+          "transform_awq_weights: out_features = packed_out * AWQ_PACK_FACTOR",
+          "usize",
+          [
+            ("packed_out", packed_out as u64),
+            ("multiplier", AWQ_PACK_FACTOR as u64),
+          ],
+        )),
       ))
     })?;
-    if group_size as usize == 0 || in_features % (group_size as usize) != 0 {
-      return Err(Error::ShapeMismatch(format!(
-        "transform_awq_weights: layer `{qweight_key}`: in_features {in_features} is not a \
-           multiple of group_size {group_size} (`utils.py:118`: n_groups = in_features // group_size)"
+    if group_size as usize == 0 {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "transform_awq_weights: group_size",
+        "must be > 0",
+        group_size.to_string(),
+      )));
+    }
+    if in_features % (group_size as usize) != 0 {
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        qweight_key.clone(),
+        Error::DivisibilityConstraint(DivisibilityConstraintPayload::new(
+          "transform_awq_weights: in_features must be a multiple of group_size \
+            (utils.py:118: n_groups = in_features // group_size)",
+          "in_features",
+          in_features as u64,
+          "group_size",
+          group_size as u64,
+        )),
       )));
     }
     let n_groups = in_features / (group_size as usize);
     if s_shape[0] != n_groups || s_shape[1] != out_features {
-      return Err(Error::ShapeMismatch(format!(
-        "transform_awq_weights: layer `{prefix}`: scales shape {s_shape:?} does not match \
-           the expected `[n_groups={n_groups}, out_features={out_features}]` derived from \
-           qweight shape {q_shape:?} with group_size={group_size}"
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        prefix.clone(),
+        Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+          "transform_awq_weights: scales must be [n_groups, out_features] \
+            (derived from qweight shape with group_size)",
+          vec![n_groups, out_features],
+          s_shape,
+        )),
       )));
     }
     let qzeros_key = format!("{prefix}.qzeros");
@@ -1839,17 +1939,26 @@ pub fn transform_awq_weights(
       // (AutoAWQ `torch.int32`), reject other dtypes here at preflight.
       let qz_dtype = qzeros.dtype()?;
       if !matches!(qz_dtype, Dtype::U32 | Dtype::I32) {
-        return Err(Error::Backend(format!(
-          "transform_awq_weights: layer `{qzeros_key}`: qzeros dtype {qz_dtype:?} not supported \
-             — accept `uint32` (mlx-lm canonical) or `int32` (AutoAWQ default `torch.int32`)"
+        return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+          qzeros_key.clone(),
+          Error::UnsupportedDtype(UnsupportedDtypePayload::new(
+            "transform_awq_weights: qzeros (accept `uint32` mlx-lm canonical or `int32` \
+              AutoAWQ default `torch.int32`)",
+            qz_dtype,
+            &[Dtype::U32, Dtype::I32],
+          )),
         )));
       }
       let z_shape = qzeros.shape();
       if z_shape.len() != 2 || z_shape[0] != n_groups || z_shape[1] != packed_out {
-        return Err(Error::ShapeMismatch(format!(
-          "transform_awq_weights: layer `{qzeros_key}`: qzeros shape {z_shape:?} does not match \
-             the expected `[n_groups={n_groups}, packed_out={packed_out}]` derived from qweight \
-             shape {q_shape:?} with group_size={group_size}"
+        return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+          qzeros_key.clone(),
+          Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+            "transform_awq_weights: qzeros must be [n_groups, packed_out] \
+              (derived from qweight shape with group_size)",
+            vec![n_groups, packed_out],
+            z_shape,
+          )),
         )));
       }
     }
@@ -1915,18 +2024,24 @@ pub fn transform_awq_weights(
   // insertion order, which is unspecified).
   for prefix in &qweight_prefixes {
     let (qw_opt, sc_opt, qz_opt) = awq_components.remove(prefix).ok_or_else(|| {
-      Error::Backend(format!(
-        "transform_awq_weights: layer `{prefix}` lost its components mid-pipeline"
+      Error::LayerKeyed(LayerKeyedPayload::new(
+        prefix.clone(),
+        Error::InvariantViolation(InvariantViolationPayload::new(
+          "transform_awq_weights: AWQ components",
+          "must be present (lost mid-pipeline — defensive)",
+        )),
       ))
     })?;
     let qweight = qw_opt.ok_or_else(|| {
-      Error::Backend(format!(
-        "transform_awq_weights: layer `{prefix}.qweight` disappeared mid-pipeline"
+      Error::MissingKey(MissingKeyPayload::new(
+        "transform_awq_weights: `.qweight` disappeared mid-pipeline (defensive)",
+        format!("{prefix}.qweight"),
       ))
     })?;
     let scales = sc_opt.ok_or_else(|| {
-      Error::Backend(format!(
-        "transform_awq_weights: layer `{prefix}.scales` disappeared mid-pipeline"
+      Error::MissingKey(MissingKeyPayload::new(
+        "transform_awq_weights: `.scales` disappeared mid-pipeline (defensive)",
+        format!("{prefix}.scales"),
       ))
     })?;
 
@@ -2042,9 +2157,10 @@ pub fn transform_awq_weights(
   let mlx_quantization = PerLayerQuantization::from_global(Quantization {
     group_size: group_size_i32,
     bits: i32::try_from(config.bits).map_err(|_| {
-      Error::ShapeMismatch(format!(
-        "transform_awq_weights: bits {} exceeds i32::MAX",
-        config.bits
+      Error::OutOfRange(OutOfRangePayload::new(
+        "transform_awq_weights: bits",
+        "must fit in i32",
+        config.bits.to_string(),
       ))
     })?,
     mode: QuantMode::Affine,
@@ -2511,17 +2627,19 @@ mod tests {
     let cfg = PerLayerQuantization::from_global(Quantization::affine(group_size as i32, 4));
     let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
     match err {
-      Error::Backend(message) => {
+      Error::LayerKeyed(ref payload) => {
         assert!(
-          message.contains("model.foo"),
-          "error should name the colliding layer, got: {message}"
+          payload.layer().contains("model.foo"),
+          "LayerKeyed must name the colliding layer, got layer={:?}",
+          payload.layer()
         );
         assert!(
-          message.contains(".biases"),
-          "error should name the colliding sibling, got: {message}"
+          matches!(payload.inner(), Error::MissingKey(_)),
+          "inner must be MissingKey for stale `.biases` without `.scales`, got: {:?}",
+          payload.inner()
         );
       }
-      other => panic!("expected Error::Backend, got: {other:?}"),
+      other => panic!("expected Error::LayerKeyed, got: {other:?}"),
     }
   }
 
@@ -2582,24 +2700,21 @@ mod tests {
     let cfg = PerLayerQuantization::from_global(Quantization::affine(group_size as i32, 4));
     let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
     match err {
-      Error::Backend(message) => {
+      Error::LayerKeyed(ref payload) => {
         assert!(
-          message.contains("model.foo"),
-          "error should name the colliding layer, got: {message}"
+          payload.layer().contains("model.foo"),
+          "LayerKeyed must name the colliding layer, got layer={:?}",
+          payload.layer()
         );
+        // The orphan `.scales` with a dense `.weight` is classified as a dtype
+        // mismatch in `classify_triple` (uint32 expected, F32 observed).
         assert!(
-          message.contains(".scales"),
-          "error should name the colliding sibling, got: {message}"
-        );
-        // The message should call out the dense-`.weight` mismatch
-        // (the load-bearing signal that this is an orphan, not a real
-        // already-quantized triple).
-        assert!(
-          message.contains("uint32") || message.contains("dense") || message.contains("F32"),
-          "error should explain the `.weight` dtype mismatch, got: {message}"
+          matches!(payload.inner(), Error::UnsupportedDtype(_)),
+          "inner must be UnsupportedDtype for dense-weight orphan, got: {:?}",
+          payload.inner()
         );
       }
-      other => panic!("expected Error::Backend, got: {other:?}"),
+      other => panic!("expected Error::LayerKeyed, got: {other:?}"),
     }
   }
 
@@ -2626,17 +2741,21 @@ mod tests {
     let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
     let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
     match err {
-      Error::Backend(message) => {
+      Error::LayerKeyed(ref payload) => {
         assert!(
-          message.contains("model.foo"),
-          "error should name the colliding layer, got: {message}"
+          payload.layer().contains("model.foo"),
+          "LayerKeyed must name the colliding layer, got layer={:?}",
+          payload.layer()
         );
+        // Mismatched scales shape: classify_triple emits ShapePairMismatch
+        // (leading-dim mismatch) inside the LayerKeyed wrapper.
         assert!(
-          message.contains("leading"),
-          "error should explain the leading-dim mismatch, got: {message}"
+          matches!(payload.inner(), Error::ShapePairMismatch(_)),
+          "inner must be ShapePairMismatch for leading-dim mismatch, got: {:?}",
+          payload.inner()
         );
       }
-      other => panic!("expected Error::Backend, got: {other:?}"),
+      other => panic!("expected Error::LayerKeyed, got: {other:?}"),
     }
   }
 
@@ -2675,17 +2794,20 @@ mod tests {
     let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
     let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
     match err {
-      Error::Backend(message) => {
+      Error::LayerKeyed(ref payload) => {
         assert!(
-          message.contains("model.bad"),
-          "error should name the malformed layer, got: {message}"
+          payload.layer().contains("model.bad"),
+          "LayerKeyed must name the malformed layer, got layer={:?}",
+          payload.layer()
         );
+        // rank-1 uint32 triple: classify_triple emits RankMismatch.
         assert!(
-          message.contains("rank"),
-          "error should call out the `.weight` rank, got: {message}"
+          matches!(payload.inner(), Error::RankMismatch(_)),
+          "inner must be RankMismatch for rank-1 `.weight`, got: {:?}",
+          payload.inner()
         );
       }
-      other => panic!("expected Error::Backend, got: {other:?}"),
+      other => panic!("expected Error::LayerKeyed, got: {other:?}"),
     }
   }
 
@@ -2809,17 +2931,20 @@ mod tests {
 
     let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
     match err {
-      Error::Backend(message) => {
+      Error::LayerKeyed(ref payload) => {
         assert!(
-          message.contains("model.embed_tokens"),
-          "error should name the Skip layer, got: {message}"
+          payload.layer().contains("model.embed_tokens"),
+          "LayerKeyed must name the Skip layer, got layer={:?}",
+          payload.layer()
         );
+        // Skip override → KeyCollision (stale `.scales` next to a Skip layer).
         assert!(
-          message.contains("Skip"),
-          "error should call out the Skip override, got: {message}"
+          matches!(payload.inner(), Error::KeyCollision(_)),
+          "inner must be KeyCollision for Skip-with-stale-scales, got: {:?}",
+          payload.inner()
         );
       }
-      other => panic!("expected Error::Backend, got: {other:?}"),
+      other => panic!("expected Error::LayerKeyed, got: {other:?}"),
     }
   }
 
@@ -2845,31 +2970,26 @@ mod tests {
     let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
     let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
     match err {
-      Error::Backend(message) => {
+      Error::LayerKeyed(ref payload) => {
         assert!(
-          message.contains("model.affine_missing"),
-          "error should name the incomplete layer, got: {message}"
+          payload.layer().contains("model.affine_missing"),
+          "LayerKeyed must name the incomplete layer, got layer={:?}",
+          payload.layer()
         );
+        // Affine triple missing biases → inner MissingKey (the `.biases` key).
+        let Error::MissingKey(inner) = payload.inner() else {
+          panic!(
+            "inner must be MissingKey for affine missing biases, got: {:?}",
+            payload.inner()
+          );
+        };
         assert!(
-          message.contains(".biases"),
-          "error should name the missing `.biases` sibling, got: {message}"
-        );
-        assert!(
-          message.contains("affine"),
-          "error should call out the `affine` mode requirement, got: {message}"
-        );
-        // The arity message also names `bits` / `group_size` (the cfg
-        // that fixed the resolved mode).
-        assert!(
-          message.contains("bits=4"),
-          "error should name the resolved bits, got: {message}"
-        );
-        assert!(
-          message.contains("group_size=64"),
-          "error should name the resolved group_size, got: {message}"
+          inner.key().contains(".biases"),
+          "MissingKey must name the missing `.biases` sibling, got key={:?}",
+          inner.key()
         );
       }
-      other => panic!("expected Error::Backend, got: {other:?}"),
+      other => panic!("expected Error::LayerKeyed, got: {other:?}"),
     }
   }
 
@@ -2902,21 +3022,25 @@ mod tests {
     });
     let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
     match err {
-      Error::Backend(message) => {
+      Error::LayerKeyed(ref payload) => {
         assert!(
-          message.contains("model.mxfp4_stale"),
-          "error should name the offending layer, got: {message}"
+          payload.layer().contains("model.mxfp4_stale"),
+          "LayerKeyed must name the offending layer, got layer={:?}",
+          payload.layer()
         );
+        let Error::KeyCollision(inner) = payload.inner() else {
+          panic!(
+            "inner must be KeyCollision for mxfp4-with-stale-biases, got: {:?}",
+            payload.inner()
+          );
+        };
         assert!(
-          message.contains("mxfp4"),
-          "error should call out the offending `mxfp4` mode, got: {message}"
-        );
-        assert!(
-          message.contains(".biases"),
-          "error should name the stale `.biases` sibling, got: {message}"
+          inner.key().contains(".biases"),
+          "KeyCollision must name the stale `.biases` sibling, got key={:?}",
+          inner.key()
         );
       }
-      other => panic!("expected Error::Backend, got: {other:?}"),
+      other => panic!("expected Error::LayerKeyed, got: {other:?}"),
     }
   }
 
@@ -2976,21 +3100,25 @@ mod tests {
     let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
     let err = dequantize_weights(weights, &cfg).unwrap_err();
     match err {
-      Error::Backend(message) => {
+      Error::LayerKeyed(ref payload) => {
         assert!(
-          message.contains("model.affine_no_bias"),
-          "error should name the layer, got: {message}"
+          payload.layer().contains("model.affine_no_bias"),
+          "LayerKeyed must name the layer, got layer={:?}",
+          payload.layer()
         );
+        let Error::MissingKey(inner) = payload.inner() else {
+          panic!(
+            "inner must be MissingKey for affine triple missing biases, got: {:?}",
+            payload.inner()
+          );
+        };
         assert!(
-          message.contains("affine"),
-          "error should name the resolved `affine` mode, got: {message}"
-        );
-        assert!(
-          message.contains(".biases"),
-          "error should name the missing `.biases` sibling, got: {message}"
+          inner.key().contains(".biases"),
+          "MissingKey must name the missing `.biases` sibling, got key={:?}",
+          inner.key()
         );
       }
-      other => panic!("expected Error::Backend, got: {other:?}"),
+      other => panic!("expected Error::LayerKeyed, got: {other:?}"),
     }
   }
 
@@ -3016,21 +3144,25 @@ mod tests {
     });
     let err = dequantize_weights(weights, &cfg).unwrap_err();
     match err {
-      Error::Backend(message) => {
+      Error::LayerKeyed(ref payload) => {
         assert!(
-          message.contains("model.mxfp4_stale"),
-          "error should name the layer, got: {message}"
+          payload.layer().contains("model.mxfp4_stale"),
+          "LayerKeyed must name the layer, got layer={:?}",
+          payload.layer()
         );
+        let Error::KeyCollision(inner) = payload.inner() else {
+          panic!(
+            "inner must be KeyCollision for mxfp4-with-stale-biases on dequantize, got: {:?}",
+            payload.inner()
+          );
+        };
         assert!(
-          message.contains("mxfp4"),
-          "error should name the offending `mxfp4` mode, got: {message}"
-        );
-        assert!(
-          message.contains(".biases"),
-          "error should name the stale `.biases` sibling, got: {message}"
+          inner.key().contains(".biases"),
+          "KeyCollision must name the stale `.biases` sibling, got key={:?}",
+          inner.key()
         );
       }
-      other => panic!("expected Error::Backend, got: {other:?}"),
+      other => panic!("expected Error::LayerKeyed, got: {other:?}"),
     }
   }
 
@@ -3057,17 +3189,25 @@ mod tests {
     let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
     let err = dequantize_weights(weights, &cfg).unwrap_err();
     match err {
-      Error::Backend(message) => {
+      Error::LayerKeyed(ref payload) => {
         assert!(
-          message.contains("model.orphan_bias"),
-          "error should name the layer, got: {message}"
+          payload.layer().contains("model.orphan_bias"),
+          "LayerKeyed must name the layer, got layer={:?}",
+          payload.layer()
         );
+        let Error::MissingKey(inner) = payload.inner() else {
+          panic!(
+            "inner must be MissingKey for orphan biases without scales, got: {:?}",
+            payload.inner()
+          );
+        };
         assert!(
-          message.contains(".scales"),
-          "error should name the missing `.scales` sibling, got: {message}"
+          inner.key().contains(".scales"),
+          "MissingKey must name the missing `.scales` sibling, got key={:?}",
+          inner.key()
         );
       }
-      other => panic!("expected Error::Backend, got: {other:?}"),
+      other => panic!("expected Error::LayerKeyed, got: {other:?}"),
     }
   }
 
@@ -3199,13 +3339,13 @@ mod tests {
     let r1 = Array::from_slice::<u32>(&[0u32; 4], &(4usize,)).unwrap();
     let err = unpack_awq_weights(&r1).unwrap_err();
     assert!(
-      matches!(err, Error::ShapeMismatch(_)),
-      "1-D should be ShapeMismatch, got {err:?}"
+      matches!(err, Error::RankMismatch(_)),
+      "1-D should be RankMismatch, got {err:?}"
     );
     let r3 = Array::from_slice::<u32>(&[0u32; 8], &(2usize, 2, 2)).unwrap();
     assert!(matches!(
       unpack_awq_weights(&r3).unwrap_err(),
-      Error::ShapeMismatch(_)
+      Error::RankMismatch(_)
     ));
   }
 
@@ -3217,12 +3357,12 @@ mod tests {
   #[test]
   fn unpack_awq_weights_rejects_non_32bit_int_dtype() {
     // f32 is the canonical "wrong" dtype to test against — narrow ints,
-    // bool, and floats all hit the same `other => Err(Backend)` arm.
+    // bool, and floats all hit the same `UnsupportedDtype` arm.
     let r = Array::from_slice::<f32>(&[0.0_f32; 4], &(2usize, 2)).unwrap();
     let err = unpack_awq_weights(&r).unwrap_err();
     assert!(
-      matches!(err, Error::Backend(_)),
-      "f32 dtype should be Backend, got {err:?}"
+      matches!(err, Error::UnsupportedDtype(_)),
+      "f32 dtype should be UnsupportedDtype, got {err:?}"
     );
   }
 
@@ -3516,8 +3656,9 @@ mod tests {
     assert!(plq.per_layer.is_empty());
   }
 
-  /// A `.qweight` with no `.scales` companion is rejected with a clear
-  /// message (mirrors mlx-lm's implicit `KeyError`, `utils.py:109`).
+  /// A `.qweight` with no `.scales` companion is rejected with a typed
+  /// [`Error::MissingKey`] naming the missing `.scales` key (mirrors mlx-lm's
+  /// implicit `KeyError`, `utils.py:109`).
   #[test]
   fn transform_awq_weights_rejects_missing_scales() {
     let in_features = 8usize;
@@ -3527,10 +3668,15 @@ mod tests {
     // No scales, no qzeros.
     let config = AwqLoadConfig::default();
     let err = transform_awq_weights(weights, &config).unwrap_err();
-    let msg = format!("{err:?}");
+    let Error::MissingKey(p) = &err else {
+      panic!("expected Error::MissingKey, got {err:?}");
+    };
+    assert_eq!(p.key(), "layer.scales");
     assert!(
-      msg.contains("scales") && msg.contains("layer.qweight"),
-      "error must name the missing scales + offending qweight key, got: {msg}"
+      p.context()
+        .contains("AWQ `.qweight` missing its `.scales` companion"),
+      "context names the rule: {}",
+      p.context()
     );
   }
 
@@ -3551,8 +3697,8 @@ mod tests {
     };
     let err = transform_awq_weights(weights, &config).unwrap_err();
     assert!(
-      matches!(err, Error::ShapeMismatch(_)),
-      "expected ShapeMismatch, got {err:?}"
+      matches!(err, Error::LayerKeyed(ref p) if matches!(p.inner(), Error::ShapePairMismatch(_))),
+      "expected LayerKeyed(ShapePairMismatch), got {err:?}"
     );
   }
 
@@ -3580,7 +3726,8 @@ mod tests {
     );
   }
 
-  /// Non-4 bits is rejected with a clear message.
+  /// Non-4 bits is rejected with a typed [`Error::OutOfRange`] that names the
+  /// `must be 4` requirement and the offending value.
   #[test]
   fn transform_awq_weights_rejects_non_4_bits() {
     let weights: Weights = HashMap::new();
@@ -3589,8 +3736,20 @@ mod tests {
       ..AwqLoadConfig::default()
     };
     let err = transform_awq_weights(weights, &config).unwrap_err();
-    let msg = format!("{err:?}");
-    assert!(msg.contains("bits=4"), "error must say bits=4, got: {msg}");
+    let Error::OutOfRange(p) = &err else {
+      panic!("expected Error::OutOfRange, got {err:?}");
+    };
+    assert!(
+      p.context().contains("AWQ bits"),
+      "context names the AWQ bits rule: {}",
+      p.context()
+    );
+    assert!(
+      p.requirement().contains("must be 4"),
+      "requirement names the constraint: {}",
+      p.requirement()
+    );
+    assert_eq!(p.value(), "8");
   }
 
   /// Symmetric quantization (`zero_point: false`): biases are computed from
@@ -3689,17 +3848,14 @@ mod tests {
     };
     let err = transform_awq_weights(awq_gemm_fixture_weights(), &config).unwrap_err();
     match err {
-      Error::Backend(message) => {
-        assert!(
-          message.contains("gemv"),
-          "error must name the offending 'gemv' version, got: {message}"
-        );
-        assert!(
-          message.contains("not yet supported"),
-          "error must say 'not yet supported', got: {message}"
+      Error::UnknownEnumValue(ref payload) => {
+        assert_eq!(
+          payload.value(),
+          "gemv",
+          "UnknownEnumValue must name the offending 'gemv' version"
         );
       }
-      other => panic!("expected Error::Backend, got: {other:?}"),
+      other => panic!("expected Error::UnknownEnumValue, got: {other:?}"),
     }
   }
 
@@ -3715,17 +3871,14 @@ mod tests {
     };
     let err = transform_awq_weights(awq_gemm_fixture_weights(), &config).unwrap_err();
     match err {
-      Error::Backend(message) => {
-        assert!(
-          message.contains("unsupported"),
-          "error must name the offending version, got: {message}"
-        );
-        assert!(
-          message.contains("not recognized"),
-          "error must say 'not recognized', got: {message}"
+      Error::UnknownEnumValue(ref payload) => {
+        assert_eq!(
+          payload.value(),
+          "unsupported",
+          "UnknownEnumValue must name the offending version"
         );
       }
-      other => panic!("expected Error::Backend, got: {other:?}"),
+      other => panic!("expected Error::UnknownEnumValue, got: {other:?}"),
     }
   }
 
@@ -3951,17 +4104,19 @@ mod tests {
     };
     let err = transform_awq_weights(weights, &cfg).unwrap_err();
     match err {
-      Error::Backend(message) => {
+      Error::LayerKeyed(ref payload) => {
         assert!(
-          message.contains("model.layer0.scales"),
-          "error must name the offending layer's `.scales` key, got: {message}"
+          payload.layer().contains("model.layer0.scales"),
+          "LayerKeyed must name the offending layer's `.scales` key, got layer={:?}",
+          payload.layer()
         );
         assert!(
-          message.contains("non-floating"),
-          "error must call out the 'non-floating' rejection, got: {message}"
+          matches!(payload.inner(), Error::UnsupportedDtype(_)),
+          "inner must be UnsupportedDtype for non-floating scales, got: {:?}",
+          payload.inner()
         );
       }
-      other => panic!("expected Error::Backend, got: {other:?}"),
+      other => panic!("expected Error::LayerKeyed, got: {other:?}"),
     }
   }
 
@@ -3993,17 +4148,19 @@ mod tests {
     };
     let err = transform_awq_weights(weights, &cfg).unwrap_err();
     match err {
-      Error::Backend(message) => {
+      Error::LayerKeyed(ref payload) => {
         assert!(
-          message.contains("model.layer0.scales"),
-          "error must name the offending layer's `.scales`, got: {message}"
+          payload.layer().contains("model.layer0.scales"),
+          "LayerKeyed must name the offending layer's `.scales`, got layer={:?}",
+          payload.layer()
         );
         assert!(
-          message.contains("non-floating"),
-          "error must call out 'non-floating', got: {message}"
+          matches!(payload.inner(), Error::UnsupportedDtype(_)),
+          "inner must be UnsupportedDtype for non-floating scales, got: {:?}",
+          payload.inner()
         );
       }
-      other => panic!("expected Error::Backend, got: {other:?}"),
+      other => panic!("expected Error::LayerKeyed, got: {other:?}"),
     }
   }
 
@@ -4437,23 +4594,15 @@ mod tests {
       version: "gemm".into(),
     };
     let err = transform_awq_weights(weights, &cfg).unwrap_err();
-    match err {
-      Error::Backend(message) => {
-        assert!(
-          message.contains("layer.qweight"),
-          "error must name the offending qweight, got: {message}"
-        );
-        assert!(
-          message.contains("collision"),
-          "error must call out 'collision', got: {message}"
-        );
-        assert!(
-          message.contains("layer.weight"),
-          "error must name the colliding stale .weight, got: {message}"
-        );
-      }
-      other => panic!("expected Error::Backend, got: {other:?}"),
-    }
+    let Error::KeyCollision(p) = &err else {
+      panic!("expected Error::KeyCollision, got: {err:?}");
+    };
+    assert_eq!(p.key(), "layer.weight");
+    assert!(
+      p.context().contains(".qweight") && p.context().contains(".weight"),
+      "context must name both the qweight and weight, got: {}",
+      p.context()
+    );
   }
 
   /// Fix 4: same collision, but with `<prefix>.biases` instead of `.weight`.
@@ -4469,23 +4618,15 @@ mod tests {
       version: "gemm".into(),
     };
     let err = transform_awq_weights(weights, &cfg).unwrap_err();
-    match err {
-      Error::Backend(message) => {
-        assert!(
-          message.contains("layer.qweight"),
-          "error must name the offending qweight, got: {message}"
-        );
-        assert!(
-          message.contains("collision"),
-          "error must call out 'collision', got: {message}"
-        );
-        assert!(
-          message.contains("layer.biases"),
-          "error must name the colliding stale .biases, got: {message}"
-        );
-      }
-      other => panic!("expected Error::Backend, got: {other:?}"),
-    }
+    let Error::KeyCollision(p) = &err else {
+      panic!("expected Error::KeyCollision, got: {err:?}");
+    };
+    assert_eq!(p.key(), "layer.biases");
+    assert!(
+      p.context().contains(".qweight") && p.context().contains(".biases"),
+      "context must name both the qweight and biases, got: {}",
+      p.context()
+    );
   }
 
   /// Fix 4: an UNRELATED `.weight` key (different prefix) must NOT trigger
@@ -4533,8 +4674,8 @@ mod tests {
     };
     let err = transform_awq_weights(weights, &cfg).unwrap_err();
     assert!(
-      matches!(err, Error::Backend(_)),
-      "must reject with Backend, got: {err:?}"
+      matches!(err, Error::KeyCollision(_)),
+      "must reject with KeyCollision, got: {err:?}"
     );
 
     // Now drop the .weight collision; the .biases collision alone must
@@ -4544,13 +4685,14 @@ mod tests {
     weights2.insert("layer.biases".to_string(), stale_b2);
     let err2 = transform_awq_weights(weights2, &cfg).unwrap_err();
     match err2 {
-      Error::Backend(message) => {
+      Error::KeyCollision(ref p) => {
         assert!(
-          message.contains("layer.biases"),
-          "must name the .biases collision when .weight is absent, got: {message}"
+          p.key().contains("layer.biases"),
+          "must name the .biases collision when .weight is absent, got key={:?}",
+          p.key()
         );
       }
-      other => panic!("expected Error::Backend, got: {other:?}"),
+      other => panic!("expected Error::KeyCollision, got: {other:?}"),
     }
   }
 

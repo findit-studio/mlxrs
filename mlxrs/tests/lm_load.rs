@@ -91,8 +91,9 @@ fn config_optionals_default_when_absent() {
 }
 
 #[test]
-fn config_missing_required_is_backend_error() {
-  // `num_hidden_layers` omitted → serde fails → mapped to Error::Backend.
+fn config_missing_required_is_parse_error() {
+  // `num_hidden_layers` omitted → serde fails → mapped to typed
+  // `Error::Parse` with the `Config::from_json` context.
   let json = r#"{
     "model_type": "qwen3",
     "hidden_size": 1024,
@@ -105,15 +106,20 @@ fn config_missing_required_is_backend_error() {
   }"#;
   let err = Config::from_json(json).unwrap_err();
   assert!(
-    matches!(err, mlxrs::Error::Backend(_)),
-    "expected Error::Backend, got {err:?}"
+    matches!(&err, mlxrs::Error::Parse(p)
+      if p.context() == "Config::from_json" && p.input_kind() == "model config JSON"),
+    "expected Error::Parse from Config::from_json, got {err:?}"
   );
 }
 
 #[test]
-fn config_invalid_json_is_backend_error() {
+fn config_invalid_json_is_parse_error() {
   let err = Config::from_json("{ not json").unwrap_err();
-  assert!(matches!(err, mlxrs::Error::Backend(_)));
+  assert!(
+    matches!(&err, mlxrs::Error::Parse(p)
+      if p.context() == "Config::from_json" && p.input_kind() == "model config JSON"),
+    "expected Error::Parse from Config::from_json, got {err:?}"
+  );
 }
 
 // ─────────── Task 2.2: Weights — sharded merge + quantized triples ───────────
@@ -186,12 +192,14 @@ fn weights_single_unsharded_safetensors() {
 }
 
 #[test]
-fn weights_missing_is_backend_error() {
+fn weights_missing_is_file_io_error() {
   let dir = temp_dir("empty");
   let err = load::load_weights(&dir).unwrap_err();
+  // `load_weights` synthesizes a `NotFound` after exhausting every layout.
   assert!(
-    matches!(err, mlxrs::Error::Backend(_)),
-    "expected Error::Backend for a dir with no weights, got {err:?}"
+    matches!(&err, mlxrs::Error::FileIo(p)
+      if p.path() == dir.as_path() && p.inner().kind() == std::io::ErrorKind::NotFound),
+    "expected Error::FileIo(NotFound) for a dir with no weights, got {err:?}"
   );
 }
 
@@ -232,8 +240,10 @@ fn load_returns_config_weights_tokenizer() {
 }
 
 #[test]
-fn load_missing_config_is_backend_error() {
-  // Weights + tokenizer present, but no config.json.
+fn load_missing_config_is_file_io_error() {
+  // Weights + tokenizer present, but no config.json. `load_config`
+  // synthesizes a typed `Error::FileIo` (`NotFound`) naming the missing
+  // `config.json`.
   let dir = temp_dir("no_config");
   let mut m = HashMap::new();
   m.insert("w".to_string(), small(&[1.0], (1, 1)));
@@ -244,8 +254,10 @@ fn load_missing_config_is_backend_error() {
   // `Tokenizer` isn't `Debug`, so the `(Config, Weights, Tokenizer)` Ok
   // variant can't go through `unwrap_err()`; match the result directly.
   match load::load(&dir) {
-    Err(mlxrs::Error::Backend(_)) => {}
-    Err(other) => panic!("expected Error::Backend when config.json absent, got {other:?}"),
+    Err(mlxrs::Error::FileIo(p))
+      if p.inner().kind() == std::io::ErrorKind::NotFound
+        && p.path() == dir.join("config.json") => {}
+    Err(other) => panic!("expected Error::FileIo(NotFound) for missing config.json, got {other:?}"),
     Ok(_) => panic!("expected Err when config.json absent, got Ok"),
   }
 }
