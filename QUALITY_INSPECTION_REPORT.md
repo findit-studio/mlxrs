@@ -129,3 +129,28 @@
 | embeddings/ | 8,645 | A+ | 零问题 |
 | simd/ | 8,913 | A+ | 零问题 |
 | 跨模块一致性 | - | A | 迁移债务 (97 Backend + 16 ShapeMismatch) |
+
+---
+
+## 补充审查（osv-scanner + 深度复核）
+
+### osv-scanner 依赖审计
+- 扫描 287 个 crate 依赖
+- 发现 1 个 informational：`paste` v1.0.15 (RUSTSEC-2024-0436) — 不再维护，非安全漏洞
+- 替代方案：`pastey`（drop-in replacement）
+- 0 个 Critical/High/Medium/Low 漏洞
+
+### mlxrs-sys/ 补充审查（此前遗漏）
+**评分：A**
+- build.rs 防御性极强：平台守卫 → 子模块哨兵检查 → SHA 锁定 → FetchContent 离线 → 唯一归档断言
+- 预提交 bindgen 输出消除 libclang 供应链向量
+- C++ shim 有正确的异常边界（try/catch）
+- CI bindings-drift 门禁 + 每周依赖看门狗
+- 仅 1 个 minor gap：无 CMAKE_OSX_DEPLOYMENT_TARGET 固定
+
+### 4 大文件深度复核
+io.rs (62K)、error.rs (116K)、lm/lora.rs (8.6K)、lm/load.rs (5.9K) 逐行复核均 PASS。
+- io.rs：所有 unsafe 有 SAFETY 注释，catch_unwind 防止 panic 跨 FFI
+- error.rs：fast:: 前缀剥离是迭代而非递归（防止栈溢出），TLS 安全
+- lm/lora.rs：8635 行零 unsafe，PEFT reject-unknown-active 防御
+- lm/load.rs：5908 行零 unsafe，所有大小计算用 saturating_add
