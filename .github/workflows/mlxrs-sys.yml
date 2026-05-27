@@ -56,7 +56,7 @@ jobs:
       # The `target/` cache covers cmake's build artifacts ($OUT_DIR is
       # under `target/`), so a hit avoids re-downloading + re-compiling MLX.
       - name: Cache cargo registry + target (incl. cmake $OUT_DIR)
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry

@@ -94,7 +94,7 @@ jobs:
       # by project policy; dep-watch.yml weekly cron is the safety net).
       # The target/ cache covers cmake's $OUT_DIR.
       - name: Cache cargo registry + target (incl. cmake $OUT_DIR)
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry

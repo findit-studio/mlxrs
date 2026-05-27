@@ -46,7 +46,7 @@ jobs:
       # on submodule + build.rs (not Cargo.lock), so it stays cacheable
       # across weekly runs and saves the bulk of the wall-clock cost.
       - name: Cache cargo registry + target (incl. cmake $OUT_DIR)
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
