@@ -265,10 +265,12 @@ pub fn locate_image_tokens(tokens: &[u32], image_token_id: u32) -> ImageTokenSpa
 /// assert_eq!(out, vec![99, 99, 99, 1, 2, 3]);
 ///
 /// // Required: no marker + image_count>0 → error (fails closed against
-/// // chat-template drift).
+/// // chat-template drift). Surfaced as `Error::MissingField` whose `field`
+/// // names the absent marker.
 /// let text = vec![1_u32, 2, 3];
 /// let err = insert_image_tokens(&text, 1, 7, 99, 3, MarkerPolicy::Required).unwrap_err();
-/// assert!(format!("{err}").contains("no image_marker_id"));
+/// assert!(matches!(err, mlxrs::Error::MissingField(_)));
+/// assert!(format!("{err}").contains("image_marker_id"));
 ///
 /// // Zero images: passthrough (marker left in place).
 /// let text = vec![1_u32, 7, 2];

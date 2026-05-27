@@ -116,18 +116,58 @@ impl MetalKernelApplyConfig {
   /// MetalKernelApplyConfig::new(
   ///     [8, 1, 1], [8, 1, 1],
   ///     vec![vec![8]], vec![Dtype::F32],
-  /// )
+  /// )?
   /// .with_template(vec![("ALPHA".to_string(), KernelTemplateArg::Int(2))])
   /// .with_init_value(0.0)
   /// .with_verbose(true)
   /// ```
+  ///
+  /// # Errors (audit issue #257)
+  ///
+  /// - `Error::OutOfRange` if any of:
+  ///   - `grid == [0, 0, 0]` — Metal launches no threads, silent no-op (H2).
+  ///   - `thread_group == [0, 0, 0]` — Metal rejects with an unclear dispatch
+  ///     error or undefined behavior (H1).
+  ///   - `thread_group.product() > 1024` — Metal hardware limit (H3); the
+  ///     dispatch would otherwise fail late with an unclear error.
+  ///
+  /// These rejections are intentionally fail-fast at construction so the
+  /// caller cannot build a `MetalKernel` apply that the GPU will silently
+  /// drop or crash on.
   pub fn new(
     grid: [u32; 3],
     thread_group: [u32; 3],
     output_shapes: Vec<Vec<i32>>,
     output_dtypes: Vec<Dtype>,
-  ) -> Self {
-    Self {
+  ) -> Result<Self> {
+    if grid == [0, 0, 0] {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "MetalKernelApplyConfig::new: grid",
+        "must have at least one non-zero dimension (a zero grid dispatches no threads)",
+        format_smolstr!("grid={grid:?}"),
+      )));
+    }
+    if thread_group == [0, 0, 0] {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "MetalKernelApplyConfig::new: thread_group",
+        "must have at least one non-zero dimension (Metal requires thread_group_size > 0)",
+        format_smolstr!("thread_group={thread_group:?}"),
+      )));
+    }
+    // Metal hardware limit: threads-per-threadgroup ≤ 1024 on all current
+    // Apple Silicon devices. Compute the product as u64 so even
+    // `[u32::MAX, u32::MAX, u32::MAX]` cannot overflow the check itself.
+    let tg_product: u64 = (thread_group[0] as u64)
+      .saturating_mul(thread_group[1] as u64)
+      .saturating_mul(thread_group[2] as u64);
+    if tg_product > 1024 {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "MetalKernelApplyConfig::new: thread_group product",
+        "must be <= 1024 (Metal hardware limit for threads per threadgroup)",
+        format_smolstr!("thread_group={thread_group:?}, product={tg_product}"),
+      )));
+    }
+    Ok(Self {
       grid,
       thread_group,
       output_shapes,
@@ -135,7 +175,7 @@ impl MetalKernelApplyConfig {
       template: Vec::new(),
       init_value: None,
       verbose: false,
-    }
+    })
   }
 
   /// Set the template arguments for this config.
@@ -807,7 +847,8 @@ mod tests {
 
   #[test]
   fn config_new_defaults_optional_fields() {
-    let cfg = MetalKernelApplyConfig::new([8, 1, 1], [4, 1, 1], vec![vec![8]], vec![Dtype::F32]);
+    let cfg =
+      MetalKernelApplyConfig::new([8, 1, 1], [4, 1, 1], vec![vec![8]], vec![Dtype::F32]).unwrap();
     assert_eq!(cfg.grid(), [8, 1, 1]);
     assert_eq!(cfg.thread_group(), [4, 1, 1]);
     assert_eq!(cfg.output_shapes_slice(), &[vec![8]]);
@@ -820,6 +861,7 @@ mod tests {
   #[test]
   fn config_struct_update_overrides_optional_fields() {
     let cfg = MetalKernelApplyConfig::new([16, 1, 1], [8, 1, 1], vec![vec![16]], vec![Dtype::F16])
+      .unwrap()
       .with_template(vec![("ALPHA".to_string(), KernelTemplateArg::Int(2))])
       .with_init_value(0.5)
       .with_verbose(true);
@@ -838,7 +880,8 @@ mod tests {
     // clone the config rather than rebuild it; pin the bound.
     fn assert_clone<T: Clone>() {}
     assert_clone::<MetalKernelApplyConfig>();
-    let cfg = MetalKernelApplyConfig::new([1, 1, 1], [1, 1, 1], vec![vec![1]], vec![Dtype::F32]);
+    let cfg =
+      MetalKernelApplyConfig::new([1, 1, 1], [1, 1, 1], vec![vec![1]], vec![Dtype::F32]).unwrap();
     let cloned = cfg.clone();
     assert_eq!(cloned.grid(), cfg.grid());
     assert_eq!(cloned.output_shapes_slice(), cfg.output_shapes_slice());
@@ -851,7 +894,8 @@ mod tests {
       [1, 1, 1],
       vec![vec![4], vec![4, 4]],
       vec![Dtype::F32, Dtype::I32],
-    );
+    )
+    .unwrap();
     assert_eq!(
       cfg.output_shapes_slice().len(),
       cfg.output_dtypes_slice().len()
@@ -948,7 +992,8 @@ mod tests {
     let kernel = make_validation_kernel(&["out"]);
     let input = Array::ones::<f32>(&(8usize,)).expect("ones alloc");
     let cfg =
-      MetalKernelApplyConfig::new([8, 1, 1], [8, 1, 1], vec![vec![-1, 8]], vec![Dtype::F32]);
+      MetalKernelApplyConfig::new([8, 1, 1], [8, 1, 1], vec![vec![-1, 8]], vec![Dtype::F32])
+        .unwrap();
     let err = kernel
       .apply(&[&input], &cfg)
       .expect_err("negative output dim should be rejected before FFI");
@@ -971,7 +1016,8 @@ mod tests {
     // message rather than waiting for a JIT-time backend error.
     let kernel = make_validation_kernel(&["out"]);
     let input = Array::ones::<f32>(&(8usize,)).expect("ones alloc");
-    let cfg = MetalKernelApplyConfig::new([1, 1, 1], [1, 1, 1], vec![vec![]], vec![Dtype::F32]);
+    let cfg =
+      MetalKernelApplyConfig::new([1, 1, 1], [1, 1, 1], vec![vec![]], vec![Dtype::F32]).unwrap();
     let err = kernel
       .apply(&[&input], &cfg)
       .expect_err("empty output shape should be rejected before FFI");

@@ -786,15 +786,23 @@ fn scale_logits_by_temp_rejects_integer_dtype() {
   let lp = Array::from_slice::<i32>(&[1, 2, 3, 4], &[1, 4]).unwrap();
   assert_eq!(lp.dtype().unwrap(), Dtype::I32);
   let err = sample::scale_logits_by_temp(&lp, 0.8).unwrap_err();
-  let msg = format!("{err}");
-  assert!(
-    msg.contains("floating-point"),
-    "i32 rejection message must mention floating-point: {msg}"
-  );
-  assert!(
-    msg.contains("I32"),
-    "i32 rejection message must name the rejected dtype: {msg}"
-  );
+  match err {
+    mlxrs::Error::UnsupportedDtype(p) => {
+      assert_eq!(
+        p.dtype(),
+        Dtype::I32,
+        "rejection payload names rejected dtype"
+      );
+      // The supported set is the floating sampling-eligible set.
+      assert_eq!(p.supported(), &[Dtype::F32, Dtype::F16, Dtype::BF16]);
+      assert!(
+        p.context().contains("logits dtype"),
+        "context names the logits-dtype site: {}",
+        p.context()
+      );
+    }
+    other => panic!("expected Error::UnsupportedDtype for i32 logits, got {other:?}"),
+  }
   // And via the public categorical_sampling entry — the same rejection
   // propagates.
   let key = mlxrs::ops::random::key(0).unwrap();

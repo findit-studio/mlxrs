@@ -376,9 +376,22 @@ fn generate_step_zero_length_logits_axis_is_recoverable_err() {
     let mut it = generate_step(&model, &[1u32, 2], cache(1), cfg);
     let first = it.next().expect("an item is produced (no panic/underflow)");
     match first {
-      Err(mlxrs::Error::ShapeMismatch(_)) => {}
+      Err(mlxrs::Error::OutOfRange(p)) => {
+        assert!(
+          p.context().contains("logits axes"),
+          "context names the logits-axis site: {}",
+          p.context()
+        );
+        // The payload value lists both axes ("S=0, V=3" or "S=1, V=0").
+        let val = p.value();
+        if zero_seq {
+          assert!(val.contains("S=0"), "value carries the zero S axis: {val}");
+        } else {
+          assert!(val.contains("V=0"), "value carries the zero V axis: {val}");
+        }
+      }
       other => panic!(
-        "expected a recoverable Err(ShapeMismatch) for a zero-length {} axis, got {other:?}",
+        "expected a recoverable Err(OutOfRange) for a zero-length {} axis, got {other:?}",
         if zero_seq { "S" } else { "V" }
       ),
     }

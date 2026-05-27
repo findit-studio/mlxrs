@@ -2327,7 +2327,20 @@ mod tests {
          {{ m['content'] }}{% endfor %}{% if add_generation_prompt %}<|assistant|>{% endif %}"
     });
 
-    let dir = std::env::temp_dir().join(format!("mlxrs-l11-bpe-withhold-{}", std::process::id()));
+    // Multiple `#[test]` fns call this fixture concurrently (cargo runs the
+    // lib-test binary multi-threaded by default); a shared `(pid)`-only dir
+    // races on `remove_dir_all` + `write` between parallel callers. Append a
+    // per-call atomic counter so each caller gets a unique dir and the race
+    // is impossible — pre-existing flake surfaced by `cargo hack test
+    // --each-feature` parallelism (see PR #256 cleanup follow-up).
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+      "mlxrs-l11-bpe-withhold-{}-{}",
+      std::process::id(),
+      seq
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("temp tokenizer dir");
     std::fs::write(

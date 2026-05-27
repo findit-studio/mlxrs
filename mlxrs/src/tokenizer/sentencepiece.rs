@@ -703,6 +703,9 @@ impl SentencePieceTokenizer {
   /// # Errors
   /// [`Error::Backend`] for any malformed-protobuf, truncated-field,
   /// unsupported-wire-type, or empty-vocabulary input.
+  /// [`Error::ArithmeticOverflow`] when a length-delimited / fixed32 /
+  /// fixed64 field's `checked_add` reader-index advance overflows
+  /// (oversized length varint after the reader index has advanced).
   pub fn from_model_bytes(data: &[u8]) -> Result<Self> {
     let parsed = parse_pieces(data)?;
     Ok(Self::new(
@@ -715,9 +718,9 @@ impl SentencePieceTokenizer {
   /// Load a `.model` protobuf from disk + parse it.
   ///
   /// # Errors
-  /// [`Error::Backend`] wrapping the underlying [`std::io::Error`] (the
-  /// file failed to read) or any of the protobuf-parse errors from
-  /// [`Self::from_model_bytes`].
+  /// [`Error::FileIo`] carrying the underlying [`std::io::Error`] when the
+  /// file fails to read, or any of the protobuf-parse [`Error::Backend`] /
+  /// [`Error::ArithmeticOverflow`] errors from [`Self::from_model_bytes`].
   pub fn from_model_file(path: &Path) -> Result<Self> {
     let bytes = fs::read(path).map_err(|e| {
       Error::FileIo(FileIoPayload::new(
@@ -737,8 +740,39 @@ impl SentencePieceTokenizer {
   /// ...]` array) and `tokenizer_json["model"]["unk_id"]` (an integer).
   /// Falls back to Unigram unless `model.type` is `"BPE"`.
   ///
+  /// ## PieceType inference
+  ///
+  /// HF `tokenizer.json` does not store SentencePiece's `PieceType` enum
+  /// (Normal/Unknown/Control/UserDefined/Byte/Unused) directly; this
+  /// loader reconstructs it from three sources so consumers that depend
+  /// on the type (byte-fallback encode, control-token decode-skip — see
+  /// `SentencePiecePieceType` doc) get behavior parity with the protobuf
+  /// `.model` path:
+  ///
+  /// 1. `model.unk_id` → that piece's type is marked
+  ///    [`SentencePiecePieceType::Unknown`].
+  /// 2. Pieces whose `content` matches the byte-fallback convention
+  ///    `<0xNN>` (where `NN` is two hex digits) are marked
+  ///    [`SentencePiecePieceType::Byte`]. These exist when the HF model
+  ///    was trained with `byte_fallback=true`; decoders that need to
+  ///    surface raw bytes for unencodable UTF-8 sequences rely on this.
+  /// 3. Tokens listed in the sibling `tokenizer_json["added_tokens"]`
+  ///    array (HF's special / added-token surface) are marked
+  ///    [`SentencePiecePieceType::Control`] when `special: true` and
+  ///    [`SentencePiecePieceType::UserDefined`] when `special: false`.
+  ///    Matching is by exact `content` string against the vocab piece.
+  ///
+  /// All other pieces stay [`SentencePiecePieceType::Normal`] (the
+  /// majority case). The precedence ordering is `Unknown > Byte > added
+  /// (Control/UserDefined) > Normal`: e.g. if a model declared
+  /// `unk_id = K` and `<0xK_hex>` happens to be the same vocab index,
+  /// the Unknown marking wins (matches the protobuf semantics).
+  ///
   /// # Errors
-  /// [`Error::Backend`] for missing-field or malformed-vocab entries.
+  /// [`Error::MissingField`] when `model`, `model.unk_id`, or
+  /// `model.vocab` is absent. [`Error::Backend`] for malformed
+  /// `model.vocab` entries (non-array entry, wrong arity, non-string
+  /// token, or non-numeric score).
   ///
   /// Available when the `tokenizer-config` feature is enabled (which
   /// any `audio` build pulls in transitively via `lm`).
@@ -767,6 +801,12 @@ impl SentencePieceTokenizer {
         "model.vocab",
       )))?;
 
+    // Pass 1: assemble all pieces with their tokens + scores.
+    // Initial piece_type derivation per the doc precedence:
+    //   - byte-fallback `<0xNN>` → Byte
+    //   - everything else → Normal (will be promoted to Control/UserDefined
+    //     by the added_tokens pass below if matched, or to Unknown by the
+    //     unk_id pass last so Unknown wins).
     let mut pieces: Vec<SentencePieceToken> = Vec::with_capacity(vocab_list.len());
     for entry in vocab_list {
       let arr = entry.as_array().ok_or_else(|| {
@@ -783,11 +823,52 @@ impl SentencePieceTokenizer {
       let score = arr[1].as_f64().ok_or_else(|| {
         Error::Backend("SentencePieceTokenizer: `model.vocab` entry[1] not a number".into())
       })? as f32;
+      let initial_type = if is_byte_fallback_piece(token) {
+        SentencePiecePieceType::Byte
+      } else {
+        SentencePiecePieceType::Normal
+      };
       pieces.push(SentencePieceToken::new(
         token.to_string(),
         score,
-        SentencePiecePieceType::Normal,
+        initial_type,
       ));
+    }
+
+    // Pass 2: promote pieces named in `added_tokens` to Control/UserDefined
+    // (does NOT overwrite Byte; an explicit byte-fallback token in
+    // added_tokens stays Byte since that's the more specific semantic).
+    if let Some(added) = tokenizer_json
+      .get("added_tokens")
+      .and_then(|v| v.as_array())
+    {
+      for at in added {
+        let Some(content) = at.get("content").and_then(|v| v.as_str()) else {
+          continue;
+        };
+        let special = at.get("special").and_then(|v| v.as_bool()).unwrap_or(false);
+        let target_type = if special {
+          SentencePiecePieceType::Control
+        } else {
+          SentencePiecePieceType::UserDefined
+        };
+        for p in &mut pieces {
+          if p.token() == content && p.piece_type() != SentencePiecePieceType::Byte {
+            *p = SentencePieceToken::new(p.token().to_string(), p.score(), target_type);
+          }
+        }
+      }
+    }
+
+    // Pass 3: the unk_id piece is Unknown — this wins over any prior
+    // Normal / Control / UserDefined / Byte marking (matches the protobuf
+    // path's precedence; `<unk>` is never anything but Unknown).
+    if let Some(unk_piece) = pieces.get_mut(unk_id) {
+      *unk_piece = SentencePieceToken::new(
+        unk_piece.token().to_string(),
+        unk_piece.score(),
+        SentencePiecePieceType::Unknown,
+      );
     }
 
     let model_type = match model.get("type").and_then(|v| v.as_str()) {
@@ -801,8 +882,9 @@ impl SentencePieceTokenizer {
   /// Build from raw `tokenizer.json` bytes.
   ///
   /// # Errors
-  /// [`Error::Backend`] for any JSON-parse failure or the same
-  /// missing-field errors as [`Self::from_tokenizer_json`].
+  /// [`Error::Backend`] for any JSON-parse failure, plus the same
+  /// [`Error::MissingField`] / [`Error::Backend`] errors propagated
+  /// from [`Self::from_tokenizer_json`].
   #[cfg(feature = "tokenizer-config")]
   #[cfg_attr(docsrs, doc(cfg(feature = "tokenizer-config")))]
   pub fn from_tokenizer_json_bytes(data: &[u8]) -> Result<Self> {
@@ -1019,6 +1101,13 @@ fn parse_byte_fallback_piece(piece: &str) -> Option<u8> {
   }
   let hex = &piece[3..5];
   u8::from_str_radix(hex, 16).ok()
+}
+
+/// Boolean wrapper around [`parse_byte_fallback_piece`] for use in
+/// [`SentencePieceTokenizer::from_tokenizer_json`]'s piece-type inference.
+#[cfg(feature = "tokenizer-config")]
+fn is_byte_fallback_piece(piece: &str) -> bool {
+  parse_byte_fallback_piece(piece).is_some()
 }
 
 /// SentencePiece metaspace preprocessing — `' '` → U+2581 + prefix the
@@ -1264,10 +1353,15 @@ mod tests {
   fn from_model_file_propagates_io_error_for_missing_path() {
     let err =
       SentencePieceTokenizer::from_model_file(Path::new("/nonexistent/path.model")).unwrap_err();
-    let Error::Backend(message) = err else {
-      panic!("expected Error::Backend, got {err:?}");
-    };
-    assert!(message.contains("failed to read"));
+    match err {
+      Error::FileIo(p) => {
+        assert_eq!(p.op(), FileOp::Read);
+        assert_eq!(p.path(), Path::new("/nonexistent/path.model"));
+        assert_eq!(p.inner().kind(), std::io::ErrorKind::NotFound);
+        assert!(p.context().contains("failed to read"));
+      }
+      other => panic!("expected Error::FileIo, got {other:?}"),
+    }
   }
 
   #[cfg(feature = "tokenizer-config")]
@@ -1306,9 +1400,99 @@ mod tests {
   fn from_tokenizer_json_errors_on_missing_model_field() {
     let json: serde_json::Value = serde_json::json!({"other": 1});
     let err = SentencePieceTokenizer::from_tokenizer_json(&json).unwrap_err();
-    let Error::Backend(message) = err else {
-      panic!("expected Error::Backend, got {err:?}");
-    };
-    assert!(message.contains("missing field `model`"));
+    match err {
+      Error::MissingField(p) => {
+        assert_eq!(p.type_name(), "SentencePieceTokenizer");
+        assert_eq!(p.field(), "model");
+      }
+      other => panic!("expected Error::MissingField, got {other:?}"),
+    }
+  }
+
+  /// PieceType inference from HF tokenizer.json (#258 MODERATE): the
+  /// 4 sources (unk_id → Unknown, `<0xNN>` → Byte, `added_tokens.special` →
+  /// Control, `added_tokens` non-special → UserDefined, all others →
+  /// Normal) must materialize correctly. This covers all 5 SentencePiece
+  /// PieceType variants the protobuf path preserves.
+  #[cfg(feature = "tokenizer-config")]
+  #[test]
+  fn from_tokenizer_json_infers_piece_types_from_unk_byte_and_added_tokens() {
+    let json: serde_json::Value = serde_json::json!({
+      "model": {
+        "type": "Unigram",
+        "unk_id": 0,
+        "vocab": [
+          ["<unk>", 0.0],         // id 0 — promoted to Unknown via unk_id
+          ["\u{2581}hello", -1.0],// id 1 — Normal
+          ["<0x41>", -2.0],       // id 2 — byte-fallback → Byte ('A')
+          ["<s>", -3.0],          // id 3 — added_tokens special → Control
+          ["<custom>", -4.0],     // id 4 — added_tokens non-special → UserDefined
+          ["\u{2581}world", -5.0],// id 5 — Normal
+        ],
+      },
+      "added_tokens": [
+        { "id": 3, "content": "<s>",      "special": true },
+        { "id": 4, "content": "<custom>", "special": false },
+      ],
+    });
+    let tok = SentencePieceTokenizer::from_tokenizer_json(&json).unwrap();
+    assert_eq!(tok.vocab_size(), 6);
+    assert_eq!(tok.unknown_token_id(), 0);
+    assert_eq!(
+      tok.piece(0).unwrap().piece_type(),
+      SentencePiecePieceType::Unknown
+    );
+    assert_eq!(
+      tok.piece(1).unwrap().piece_type(),
+      SentencePiecePieceType::Normal
+    );
+    assert_eq!(
+      tok.piece(2).unwrap().piece_type(),
+      SentencePiecePieceType::Byte
+    );
+    assert_eq!(
+      tok.piece(3).unwrap().piece_type(),
+      SentencePiecePieceType::Control
+    );
+    assert_eq!(
+      tok.piece(4).unwrap().piece_type(),
+      SentencePiecePieceType::UserDefined
+    );
+    assert_eq!(
+      tok.piece(5).unwrap().piece_type(),
+      SentencePiecePieceType::Normal
+    );
+  }
+
+  /// Precedence: when a byte-fallback token also appears in added_tokens,
+  /// `Byte` wins (it's the more specific decode contract). When the same
+  /// vocab id is both `unk_id` and looks like `<0xNN>`, Unknown wins
+  /// (matches the protobuf semantics: `<unk>` is never anything but Unknown).
+  #[cfg(feature = "tokenizer-config")]
+  #[test]
+  fn from_tokenizer_json_piece_type_precedence() {
+    let json: serde_json::Value = serde_json::json!({
+      "model": {
+        "type": "Unigram",
+        "unk_id": 1,
+        "vocab": [
+          ["<0xFF>", 0.0],        // id 0 — Byte; added_tokens entry must NOT promote.
+          ["<0x00>", 0.0],        // id 1 — would be Byte, but unk_id wins → Unknown.
+          ["\u{2581}x", 0.0],
+        ],
+      },
+      "added_tokens": [
+        { "id": 0, "content": "<0xFF>", "special": true },
+      ],
+    });
+    let tok = SentencePieceTokenizer::from_tokenizer_json(&json).unwrap();
+    assert_eq!(
+      tok.piece(0).unwrap().piece_type(),
+      SentencePiecePieceType::Byte
+    );
+    assert_eq!(
+      tok.piece(1).unwrap().piece_type(),
+      SentencePiecePieceType::Unknown
+    );
   }
 }
