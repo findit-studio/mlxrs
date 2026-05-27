@@ -311,13 +311,14 @@ fn convert_rejects_upload_repo() {
   })
   .unwrap_err();
   match err {
-    mlxrs::Error::Backend(message) => {
+    mlxrs::Error::InvariantViolation(p) => {
       assert!(
-        message.contains("upload_repo"),
-        "error names the rejected field: {message}"
+        p.context().contains("upload_repo"),
+        "context names the rejected field: {}",
+        p.context()
       );
     }
-    other => panic!("expected Error::Backend, got {other:?}"),
+    other => panic!("expected Error::InvariantViolation, got {other:?}"),
   }
 }
 
@@ -338,13 +339,14 @@ fn convert_rejects_revision() {
   })
   .unwrap_err();
   match err {
-    mlxrs::Error::Backend(message) => {
+    mlxrs::Error::InvariantViolation(p) => {
       assert!(
-        message.contains("revision"),
-        "error names the rejected field: {message}"
+        p.context().contains("revision"),
+        "context names the rejected field: {}",
+        p.context()
       );
     }
-    other => panic!("expected Error::Backend, got {other:?}"),
+    other => panic!("expected Error::InvariantViolation, got {other:?}"),
   }
 }
 
@@ -368,14 +370,15 @@ fn convert_rejects_quantize_and_dequantize() {
   })
   .unwrap_err();
   match err {
-    mlxrs::Error::Backend(message) => {
+    mlxrs::Error::InvariantViolation(p) => {
+      let ctx = p.context().to_lowercase();
       assert!(
-        message.to_lowercase().contains("quantize")
-          && message.to_lowercase().contains("dequantize"),
-        "error mentions both flags: {message}"
+        ctx.contains("quantize") && ctx.contains("dequantize"),
+        "context mentions both flags: {}",
+        p.context()
       );
     }
-    other => panic!("expected Error::Backend, got {other:?}"),
+    other => panic!("expected Error::InvariantViolation, got {other:?}"),
   }
 }
 
@@ -398,13 +401,16 @@ fn convert_rejects_existing_destination() {
   })
   .unwrap_err();
   match err {
-    mlxrs::Error::Backend(message) => {
+    mlxrs::Error::FileIo(p) => {
+      assert_eq!(p.op(), mlxrs::error::FileOp::Stat);
+      assert_eq!(p.inner().kind(), std::io::ErrorKind::AlreadyExists);
       assert!(
-        message.contains("already exists") || message.contains("Cannot save"),
-        "error names the existing destination: {message}"
+        p.context().contains("destination must not already exist"),
+        "context names the rejected destination: {}",
+        p.context()
       );
     }
-    other => panic!("expected Error::Backend, got {other:?}"),
+    other => panic!("expected Error::FileIo (AlreadyExists), got {other:?}"),
   }
 }
 
@@ -474,13 +480,16 @@ fn convert_rename_in_place_is_handled() {
   })
   .unwrap_err();
   match err {
-    mlxrs::Error::Backend(message) => {
+    mlxrs::Error::FileIo(p) => {
+      assert_eq!(p.op(), mlxrs::error::FileOp::Stat);
+      assert_eq!(p.inner().kind(), std::io::ErrorKind::AlreadyExists);
       assert!(
-        message.contains("already exists") || message.contains("Cannot save"),
-        "error: {message}"
+        p.context().contains("destination must not already exist"),
+        "context names the rejected destination: {}",
+        p.context()
       );
     }
-    other => panic!("expected Error::Backend, got {other:?}"),
+    other => panic!("expected Error::FileIo (AlreadyExists), got {other:?}"),
   }
 
   // The helper itself is independently a no-op when src == dst (rename-in-
@@ -627,13 +636,14 @@ fn mixed_quant_predicate_no_down_proj_is_error() {
   // than `unwrap_err`.
   match mixed_quant_predicate(MixedQuantRecipe::Mixed3_6, &weights, 64) {
     Ok(_) => panic!("expected Err for empty weights"),
-    Err(mlxrs::Error::Backend(message)) => {
+    Err(mlxrs::Error::EmptyInput(p)) => {
       assert!(
-        message.to_lowercase().contains("down_proj") || message.to_lowercase().contains("expected"),
-        "error mentions missing down_proj keys: {message}"
+        p.context().to_lowercase().contains("down_proj"),
+        "context mentions missing down_proj keys: {}",
+        p.context()
       );
     }
-    Err(other) => panic!("expected Error::Backend, got {other:?}"),
+    Err(other) => panic!("expected Error::EmptyInput, got {other:?}"),
   }
 }
 
@@ -661,17 +671,16 @@ fn convert_rejects_explicit_dtype_i32() {
   })
   .unwrap_err();
   match err {
-    mlxrs::Error::Backend(message) => {
+    mlxrs::Error::UnsupportedDtype(p) => {
+      assert_eq!(p.dtype(), Dtype::I32);
+      assert_eq!(p.supported(), &[Dtype::F16, Dtype::BF16, Dtype::F32]);
       assert!(
-        message.contains("float16") && message.contains("bfloat16") && message.contains("float32"),
-        "error names the supported set: {message}"
-      );
-      assert!(
-        message.to_lowercase().contains("dtype"),
-        "error names the dtype field: {message}"
+        p.context().to_lowercase().contains("dtype"),
+        "context names the dtype field: {}",
+        p.context()
       );
     }
-    other => panic!("expected Error::Backend, got {other:?}"),
+    other => panic!("expected Error::UnsupportedDtype, got {other:?}"),
   }
 }
 
@@ -690,13 +699,11 @@ fn convert_rejects_explicit_dtype_f64() {
   })
   .unwrap_err();
   match err {
-    mlxrs::Error::Backend(message) => {
-      assert!(
-        message.contains("float16"),
-        "error names supported set: {message}"
-      );
+    mlxrs::Error::UnsupportedDtype(p) => {
+      assert_eq!(p.dtype(), Dtype::F64);
+      assert_eq!(p.supported(), &[Dtype::F16, Dtype::BF16, Dtype::F32]);
     }
-    other => panic!("expected Error::Backend, got {other:?}"),
+    other => panic!("expected Error::UnsupportedDtype, got {other:?}"),
   }
 }
 
@@ -715,13 +722,11 @@ fn convert_rejects_explicit_dtype_complex() {
   })
   .unwrap_err();
   match err {
-    mlxrs::Error::Backend(message) => {
-      assert!(
-        message.contains("float16"),
-        "error names supported set: {message}"
-      );
+    mlxrs::Error::UnsupportedDtype(p) => {
+      assert_eq!(p.dtype(), Dtype::Complex64);
+      assert_eq!(p.supported(), &[Dtype::F16, Dtype::BF16, Dtype::F32]);
     }
-    other => panic!("expected Error::Backend, got {other:?}"),
+    other => panic!("expected Error::UnsupportedDtype, got {other:?}"),
   }
 }
 

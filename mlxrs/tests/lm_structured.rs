@@ -797,21 +797,29 @@ fn llguidance_terminal_grammar_rejects_out_of_range_eos_id_without_panic() {
   // manually rather than via `expect_err`.)
   let result = structured::LLGuidanceLogitsProcessor::new(grammar, &tok, None);
   match result {
-    Err(mlxrs::Error::ShapeMismatch(message)) => {
+    Err(mlxrs::Error::OutOfRange(p)) => {
       assert!(
-        message.contains("4242"),
-        "error message must name the offending id 4242, got: {message}"
+        p.context().contains("EOS token id") || p.context().contains("llguidance"),
+        "context names the offending parameter: {}",
+        p.context()
       );
       assert!(
-        message.contains("out of range"),
-        "error message must say `out of range`, got: {message}"
+        p.value().contains("4242"),
+        "value carries the offending id 4242, got: {}",
+        p.value()
       );
       assert!(
-        message.contains(&bound.to_string()),
-        "error message must name the vocab bound {bound}, got: {message}"
+        p.value().contains(&bound.to_string()),
+        "value carries the vocab bound {bound}, got: {}",
+        p.value()
+      );
+      assert!(
+        p.requirement().contains("vocab"),
+        "requirement names the vocab-bound rule: {}",
+        p.requirement()
       );
     }
-    Err(other) => panic!("expected Error::ShapeMismatch, got different Err: {other:?}"),
+    Err(other) => panic!("expected Error::OutOfRange, got different Err: {other:?}"),
     Ok(_) => panic!("out-of-range eos id must yield Err, not Ok"),
   }
 }

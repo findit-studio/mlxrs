@@ -238,13 +238,26 @@ fn prepare_advance_finalize() {
 fn update_returns_err_not_kv() {
   // mlx-lm `ArraysCache` has NO `update_and_fetch`: it is a generic slot
   // cache, not K/V. The trait `update` must be a recoverable error.
-  // Surfaced as `Error::Backend` ("unsupported operation"), NOT
-  // `ShapeMismatch` — the condition isn't a wrong-shaped tensor (Copilot
-  // review #3271124426).
+  // Surfaced as `Error::InvariantViolation` ("unsupported operation"), NOT
+  // `ShapeMismatch`/`RankMismatch` — the condition isn't a wrong-shaped
+  // tensor (Copilot review #3271124426).
   let mut c = ArraysCache::new(2);
   let a = slot(&[1.0]);
   let err = c.update(&a, &a).unwrap_err();
-  assert!(matches!(err, Error::Backend(_)));
+  match err {
+    Error::InvariantViolation(p) => {
+      assert_eq!(
+        p.context(),
+        "ArraysCache::update (generic slot cache, not K/V)"
+      );
+      assert!(
+        p.requirement().contains("update_and_fetch is unsupported"),
+        "unexpected requirement: {}",
+        p.requirement()
+      );
+    }
+    other => panic!("expected InvariantViolation about update_and_fetch, got {other:?}"),
+  }
 }
 
 #[test]
@@ -472,17 +485,23 @@ fn set_meta_state_rejects_slot_count_above_max_cap() {
   let meta = vec![just_over.to_string(), "0,1".into()];
   let err = d.set_meta_state(&meta);
   match err {
-    Err(Error::Backend(message)) => {
+    Err(Error::CapExceeded(p)) => {
       assert!(
-        message.contains("exceeds MAX_SLOT_COUNT"),
-        "expected message to mention MAX_SLOT_COUNT, got: {message}"
+        p.context()
+          .contains("ArraysCache::set_meta_state: slot_count"),
+        "expected context to mention slot_count, got: {}",
+        p.context()
       );
-      assert!(
-        message.contains(&just_over.to_string()),
-        "expected message to include offending slot_count {just_over}, got: {message}"
+      assert_eq!(p.cap_name(), "MAX_SLOT_COUNT");
+      assert_eq!(p.cap(), MAX_SLOT_COUNT as u64);
+      assert_eq!(
+        p.observed(),
+        just_over as u64,
+        "expected observed slot_count {just_over}, got {}",
+        p.observed()
       );
     }
-    other => panic!("expected Err(Backend) about MAX_SLOT_COUNT, got {other:?}"),
+    other => panic!("expected Err(CapExceeded) about MAX_SLOT_COUNT, got {other:?}"),
   }
   // Cache survived unchanged: the 2 compacted arrays are still present.
   let s = d.state().unwrap();
@@ -524,34 +543,47 @@ fn kvc2_arrayscache_rejects_huge_slot_count_before_csv_parse() {
     .join(",");
   let meta = vec![huge_slot_count, big_payload.clone()];
   match d.set_meta_state(&meta) {
-    Err(Error::Backend(message)) => {
-      assert!(
-        message.contains("exceeds MAX_SLOT_COUNT"),
-        "cap MUST fire first: expected MAX_SLOT_COUNT error, got: {message}"
+    Err(Error::CapExceeded(p)) => {
+      // The cap MUST fire first: must be the MAX_SLOT_COUNT cap, NOT the
+      // per-CSV max_elems cap (whose cap_name would be "max_elems").
+      assert_eq!(
+        p.cap_name(),
+        "MAX_SLOT_COUNT",
+        "cap MUST fire first: expected MAX_SLOT_COUNT cap, got cap_name={}",
+        p.cap_name()
       );
-      // And NOT a CSV-parse error (would mean the parse ran first).
       assert!(
-        !message.contains("presentSlots"),
-        "MAX_SLOT_COUNT gate must precede CSV parse; got presentSlots-mentioning error: {message}"
+        p.context().contains("slot_count"),
+        "expected slot_count context, got: {}",
+        p.context()
+      );
+      // And NOT a CSV-parse context (would mean the parse ran first).
+      assert!(
+        !p.context().contains("presentSlots"),
+        "MAX_SLOT_COUNT gate must precede CSV parse; got presentSlots context: {}",
+        p.context()
       );
     }
-    other => panic!("expected Err(Backend) about MAX_SLOT_COUNT, got {other:?}"),
+    other => panic!("expected Err(CapExceeded) about MAX_SLOT_COUNT, got {other:?}"),
   }
   // Also: the slot_count == 1 case (a small declared cap but a huge CSV
   // payload) — the per-CSV `max_elems = slot_count` bound MUST reject the
-  // CSV before allocation, with a "element count exceeds bound" message
-  // (NOT a token parse error). This closes the second variant of the
-  // evasion where slot_count itself is small but the CSV is hostile.
+  // CSV before allocation, with a CapExceeded(max_elems) (NOT a token
+  // parse error). This closes the second variant of the evasion where
+  // slot_count itself is small but the CSV is hostile.
   let meta_small_count_huge_csv = vec!["1".to_string(), big_payload];
   match d.set_meta_state(&meta_small_count_huge_csv) {
-    Err(Error::Backend(message)) => {
-      assert!(
-        message.contains("element count") && message.contains("exceeds bound"),
-        "CSV bound MUST fire before token parse: expected element-count error, got: {message}"
+    Err(Error::CapExceeded(p)) => {
+      assert_eq!(
+        p.cap_name(),
+        "max_elems",
+        "CSV bound MUST fire before token parse: expected max_elems cap, got cap_name={}",
+        p.cap_name()
       );
       assert!(
-        message.contains("presentSlots"),
-        "CSV bound message should identify the offending CSV (presentSlots), got: {message}"
+        p.context().contains("presentSlots"),
+        "CSV bound context should identify the offending CSV (presentSlots), got: {}",
+        p.context()
       );
     }
     other => panic!("small slot_count + huge CSV must hit CSV bound, got {other:?}"),
@@ -579,14 +611,17 @@ fn kvc2_arrayscache_csv_bound_rejects_oversized_left_padding() {
   // slot_count=2, presentSlots="0,1" (in-bound), leftPadding=10000 entries.
   let meta = vec!["2".to_string(), "0,1".to_string(), huge_lp_csv];
   match d.set_meta_state(&meta) {
-    Err(Error::Backend(message)) => {
-      assert!(
-        message.contains("element count") && message.contains("exceeds bound"),
-        "leftPadding CSV bound must fire: expected element-count error, got: {message}"
+    Err(Error::CapExceeded(p)) => {
+      assert_eq!(
+        p.cap_name(),
+        "max_elems",
+        "leftPadding CSV bound must fire: expected max_elems cap, got cap_name={}",
+        p.cap_name()
       );
       assert!(
-        message.contains("leftPadding"),
-        "CSV bound message should identify the offending CSV (leftPadding), got: {message}"
+        p.context().contains("leftPadding"),
+        "CSV bound context should identify the offending CSV (leftPadding), got: {}",
+        p.context()
       );
     }
     other => panic!("huge leftPadding CSV must hit bound, got {other:?}"),

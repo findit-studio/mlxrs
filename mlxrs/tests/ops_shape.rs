@@ -185,12 +185,28 @@ fn pad_rejects_length_mismatch() {
 #[test]
 fn pad_rejects_negative_low() {
   // `low`/`high` are shape extents — negatives must be rejected before
-  // reaching mlx::core::Shape construction (Codex review).
+  // reaching mlx::core::Shape construction (Codex review). `validate_dims`
+  // surfaces them as `Error::OutOfRange` with a `"dim[i]=<v>"` value.
   let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3i32]).unwrap();
   let zero = Array::from_slice::<f32>(&[0.0], &[0i32; 0]).unwrap();
   let mode = CString::new("constant").unwrap();
   let r = ops::shape::pad(&a, &[0], &[-1], &[1], &zero, &mode);
-  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch(_))));
+  match r {
+    Err(mlxrs::Error::OutOfRange(p)) => {
+      assert!(
+        p.context().contains("validate_dims"),
+        "context names the validator: {}",
+        p.context()
+      );
+      assert_eq!(p.requirement(), "must be non-negative");
+      assert!(
+        p.value().contains("-1"),
+        "value names the offending dim: {}",
+        p.value()
+      );
+    }
+    other => panic!("expected Err(OutOfRange) for negative low, got {other:?}"),
+  }
 }
 
 #[test]
@@ -199,7 +215,17 @@ fn pad_rejects_negative_high() {
   let zero = Array::from_slice::<f32>(&[0.0], &[0i32; 0]).unwrap();
   let mode = CString::new("constant").unwrap();
   let r = ops::shape::pad(&a, &[0], &[1], &[-2], &zero, &mode);
-  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch(_))));
+  match r {
+    Err(mlxrs::Error::OutOfRange(p)) => {
+      assert_eq!(p.requirement(), "must be non-negative");
+      assert!(
+        p.value().contains("-2"),
+        "value names the offending dim: {}",
+        p.value()
+      );
+    }
+    other => panic!("expected Err(OutOfRange) for negative high, got {other:?}"),
+  }
 }
 
 #[test]
@@ -240,7 +266,18 @@ fn as_strided_shape_strides_length_mismatch_errors() {
   let a = Array::from_slice::<f32>(&[0.0, 1.0, 2.0, 3.0], &[4i32]).unwrap();
   // SAFETY: the length mismatch is rejected pre-FFI; no buffer access.
   let r = unsafe { ops::shape::as_strided(&a, &(2usize, 2), &[1i64], 0) };
-  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch(_))));
+  match r {
+    Err(mlxrs::Error::LengthMismatch(p)) => {
+      assert!(
+        p.context().contains("as_strided") && p.context().contains("shape length"),
+        "context names the as_strided shape-vs-strides check: {}",
+        p.context()
+      );
+      assert_eq!(p.expected(), 2, "shape length");
+      assert_eq!(p.actual(), 1, "strides length");
+    }
+    other => panic!("expected Err(LengthMismatch), got {other:?}"),
+  }
 }
 
 #[test]
@@ -257,8 +294,20 @@ fn as_strided_rejects_negative_dim() {
   // SAFETY: rejection happens via `validate_dims` BEFORE any FFI call;
   // no buffer access on the error path.
   let r = unsafe { ops::shape::as_strided(&a, &shape, &[2i64, 1], 0) };
-  assert!(
-    matches!(r, Err(mlxrs::Error::ShapeMismatch(_))),
-    "negative dim must Err(ShapeMismatch), got {r:?}"
-  );
+  match r {
+    Err(mlxrs::Error::OutOfRange(p)) => {
+      assert!(
+        p.context().contains("validate_dims"),
+        "context names the validator: {}",
+        p.context()
+      );
+      assert_eq!(p.requirement(), "must be non-negative");
+      assert!(
+        p.value().contains("-1"),
+        "value names the offending dim: {}",
+        p.value()
+      );
+    }
+    other => panic!("negative dim must Err(OutOfRange), got {other:?}"),
+  }
 }

@@ -335,7 +335,7 @@ fn kv_quant(n_steps: usize) -> Array {
 
 #[test]
 fn quantized_from_serialized_round_trip() {
-  let mut original = QuantizedKvCacheImpl::new(64, 8);
+  let mut original = QuantizedKvCacheImpl::new(64, 8).unwrap();
   original
     .update_quantized(&kv_quant(3), &kv_quant(3))
     .unwrap();
@@ -343,7 +343,7 @@ fn quantized_from_serialized_round_trip() {
   let saved_meta = original.meta_state();
   let saved_offset = original.offset();
 
-  let mut restored = QuantizedKvCacheImpl::new(0, 0);
+  let mut restored = QuantizedKvCacheImpl::new_unchecked(0, 0);
   restored.from_serialized(saved_state, &saved_meta).unwrap();
   assert_eq!(restored.offset(), saved_offset);
   assert_eq!(restored.meta_state(), saved_meta);
@@ -366,7 +366,7 @@ fn quantized_from_serialized_round_trip() {
 
 #[test]
 fn quantized_from_serialized_wrong_arity_meta_leaves_self_unchanged() {
-  let mut cache = QuantizedKvCacheImpl::new(64, 8);
+  let mut cache = QuantizedKvCacheImpl::new(64, 8).unwrap();
   cache.update_quantized(&kv_quant(2), &kv_quant(2)).unwrap();
   let original_offset = cache.offset();
   let original_meta = cache.meta_state();
@@ -397,7 +397,7 @@ fn quantized_from_serialized_invalid_meta_value_leaves_self_unchanged() {
   // path AFTER set_state has already done its own (set_state)
   // sub-mutation in the staged cache, BUT the staged cache is local so
   // our own `cache` is unaffected.
-  let mut cache = QuantizedKvCacheImpl::new(64, 8);
+  let mut cache = QuantizedKvCacheImpl::new(64, 8).unwrap();
   cache.update_quantized(&kv_quant(2), &kv_quant(2)).unwrap();
   let original_offset = cache.offset();
   let original_meta = cache.meta_state();
@@ -428,7 +428,7 @@ fn build_heterogeneous_cache_list() -> CacheList {
   rot_cache
     .update(&kv(&[10.0, 11.0]), &kv(&[10.0, 11.0]))
     .unwrap();
-  let mut q_cache = QuantizedKvCacheImpl::new(64, 8);
+  let mut q_cache = QuantizedKvCacheImpl::new(64, 8).unwrap();
   q_cache
     .update_quantized(&kv_quant(2), &kv_quant(2))
     .unwrap();
@@ -791,7 +791,7 @@ fn rotating_from_serialized_empty_state_nonzero_meta_rejected() {
 #[test]
 fn quantized_from_serialized_empty_state_nonzero_offset_rejected() {
   // Pre-populated quantized cache that must remain unchanged.
-  let mut cache = QuantizedKvCacheImpl::new(64, 8);
+  let mut cache = QuantizedKvCacheImpl::new(64, 8).unwrap();
   cache.update_quantized(&kv_quant(2), &kv_quant(2)).unwrap();
   let original_meta = cache.meta_state();
   let original_offset = cache.offset();

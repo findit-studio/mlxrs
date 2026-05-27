@@ -126,12 +126,22 @@ jobs:
             cargo build -p mlxrs --features "${{ matrix.features }}"
           fi
 
+      # `--test-threads=1`: GHA macos-14 runners (M1, 3 vCPU) hit a Metal
+      # command-queue deadlock when multiple lib tests dispatch GPU ops
+      # concurrently — most reliably reproduced as a 6-hour hang on the
+      # `--features audio` job in `lm::nn::switch::tests::*` (see issue
+      # #261). The umbrella `all` job avoids it by accident (larger test
+      # pool → less unlucky scheduling), but multiple commits on `main`
+      # have hung audio too. Serial execution adds runtime but guarantees
+      # determinism. Same root class as the `peak_memory` flake
+      # (`feedback_no_global_peak_memory_assert`) and the `async_eval`
+      # `trace_stack_` pollution (`feedback_mlx_trace_stack_global`).
       - name: cargo test -p mlxrs (features=${{ matrix.features }})
         run: |
           if [ -z "${{ matrix.features }}" ]; then
-            cargo test -p mlxrs
+            cargo test -p mlxrs -- --test-threads=1
           else
-            cargo test -p mlxrs --features "${{ matrix.features }}"
+            cargo test -p mlxrs --features "${{ matrix.features }}" -- --test-threads=1
           fi
 
   docs:

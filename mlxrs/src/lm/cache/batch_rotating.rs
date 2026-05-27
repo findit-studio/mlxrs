@@ -1295,9 +1295,10 @@ impl KvCache for BatchRotatingKvCache {
       let idx = staged.ring_idx();
       let rotated = staged.is_rotated();
       if offset != 0 || idx != 0 || rotated {
-        return Err(Error::InvariantViolation(InvariantViolationPayload::new(
-          "BatchRotatingKvCache::from_serialized: empty buffer (keys=None) requires fully-fresh meta (offset=0, _idx=0, rotated=false)",
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "BatchRotatingKvCache::from_serialized: empty buffer (keys=None) requires fully-fresh meta",
           "must satisfy offset=0 AND _idx=0 AND rotated=false",
+          format_smolstr!("offset={offset}, _idx={idx}, rotated={rotated}"),
         )));
       }
     } else {

@@ -50,7 +50,7 @@ fn quantized_kv_cache_reference_name_is_quantized_kvcache() {
   // mlx-lm `type(QuantizedKVCache).__name__` / mlx-swift-lm
   // `case is QuantizedKVCache: return "QuantizedKVCache"`
   // (`KVCache.swift:1387`).
-  let c = QuantizedKvCacheImpl::new(64, 4);
+  let c = QuantizedKvCacheImpl::new(64, 4).unwrap();
   assert_eq!(c.reference_class_name(), "QuantizedKVCache");
 }
 

@@ -96,7 +96,12 @@ impl SGD {
       nesterov,
       step_count: 0,
       current_lr,
-      lr_resolved_for_step: None,
+      // Stamp the cache for step 0: the constructor's `try_current(0)` above
+      // already consumed one schedule slot. Leaving `None` would force the
+      // first `preflight()` at step 0 to re-resolve, double-calling stateful
+      // schedules (and producing a different value on the second call —
+      // breaking atomicity guarantees the multi-optimizer cache relies on).
+      lr_resolved_for_step: Some(0),
       state: HashMap::new(),
     })
   }

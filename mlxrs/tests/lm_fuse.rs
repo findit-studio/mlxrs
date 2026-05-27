@@ -437,9 +437,9 @@ fn fuse_dequantize_false_preserves_quantization_keys() {
 
 #[test]
 fn fuse_rejects_missing_model_path() {
-  // A nonexistent model_path bubbles up as `Error::Backend` from
-  // `load_config`'s file-not-found arm. The error message must name
-  // the missing path so the user can recover.
+  // A nonexistent model_path bubbles up as `Error::FileIo` (Open / NotFound)
+  // from `load_config`'s file-not-found arm. The payload's path must name
+  // the missing file so the user can recover.
   let bogus = temp_dir("missing_model_path_root");
   let model_dir = bogus.join("does_not_exist");
   // Build a real adapter dir so the failure attribution is unambiguous.
@@ -449,13 +449,21 @@ fn fuse_rejects_missing_model_path() {
 
   let err = fuse::fuse(&model_dir, &adapter_dir, &save_dir, false).unwrap_err();
   match err {
-    Error::Backend(message) => {
+    Error::FileIo(p) => {
+      assert_eq!(p.op(), mlxrs::error::FileOp::Open);
+      assert_eq!(p.inner().kind(), std::io::ErrorKind::NotFound);
+      let path_str = p.path().to_string_lossy();
       assert!(
-        message.contains("does_not_exist") || message.contains("config"),
-        "error mentions the missing path / file: {message}"
+        path_str.contains("does_not_exist") || path_str.contains("config"),
+        "FileIo path names the missing file: {path_str}"
+      );
+      assert!(
+        p.context().contains("config"),
+        "context names the load step: {}",
+        p.context()
       );
     }
-    other => panic!("expected Error::Backend, got {other:?}"),
+    other => panic!("expected Error::FileIo, got {other:?}"),
   }
 }
 
@@ -472,13 +480,16 @@ fn fuse_rejects_missing_adapter_path() {
 
   let err = fuse::fuse(&model_dir, &adapter_dir, &save_dir, false).unwrap_err();
   match err {
-    Error::Backend(message) => {
+    Error::FileIo(p) => {
+      assert_eq!(p.op(), mlxrs::error::FileOp::Open);
+      assert_eq!(p.inner().kind(), std::io::ErrorKind::NotFound);
+      let path_str = p.path().to_string_lossy();
       assert!(
-        message.contains("not_an_adapter") || message.contains("adapter"),
-        "error mentions the missing adapter path: {message}"
+        path_str.contains("not_an_adapter") || path_str.contains("adapter"),
+        "FileIo path names the missing adapter file: {path_str}"
       );
     }
-    other => panic!("expected Error::Backend, got {other:?}"),
+    other => panic!("expected Error::FileIo, got {other:?}"),
   }
 }
 
@@ -498,17 +509,23 @@ fn fuse_rejects_hf_hub_url_in_model_path() {
   )
   .unwrap_err();
   match err {
-    Error::Backend(message) => {
-      assert!(
-        message.contains("huggingface-cli download mlx-community/Qwen3-4B-bf16"),
-        "actionable workaround names the bare repo-id: {message}"
-      );
-      assert!(
-        message.contains("model_path"),
-        "error names the rejected arg: {message}"
-      );
+    Error::LayerKeyed(p) => {
+      // Carrier layer is the rejected URL verbatim — the caller can fix
+      // their input by stripping the prefix off it.
+      assert_eq!(p.layer(), "hf://mlx-community/Qwen3-4B-bf16");
+      match p.inner() {
+        Error::InvariantViolation(inner) => {
+          assert_eq!(inner.context(), "model_path");
+          assert!(
+            inner.requirement().contains("huggingface-cli download"),
+            "requirement gives actionable workaround: {}",
+            inner.requirement()
+          );
+        }
+        other => panic!("expected inner InvariantViolation, got {other:?}"),
+      }
     }
-    other => panic!("expected Error::Backend, got {other:?}"),
+    other => panic!("expected Error::LayerKeyed, got {other:?}"),
   }
 }
 
@@ -529,17 +546,21 @@ fn fuse_rejects_hf_hub_url_in_adapter_path() {
   )
   .unwrap_err();
   match err {
-    Error::Backend(message) => {
-      assert!(
-        message.contains("huggingface-cli download owner/adapter-repo"),
-        "actionable workaround names the bare repo-id (no protocol): {message}"
-      );
-      assert!(
-        message.contains("adapter_path"),
-        "error names the rejected arg: {message}"
-      );
+    Error::LayerKeyed(p) => {
+      assert_eq!(p.layer(), "https://huggingface.co/owner/adapter-repo");
+      match p.inner() {
+        Error::InvariantViolation(inner) => {
+          assert_eq!(inner.context(), "adapter_path");
+          assert!(
+            inner.requirement().contains("huggingface-cli download"),
+            "requirement gives actionable workaround: {}",
+            inner.requirement()
+          );
+        }
+        other => panic!("expected inner InvariantViolation, got {other:?}"),
+      }
     }
-    other => panic!("expected Error::Backend, got {other:?}"),
+    other => panic!("expected Error::LayerKeyed, got {other:?}"),
   }
 }
 
@@ -563,25 +584,26 @@ fn fuse_with_no_adapter_layers_is_err() {
 
   let err = fuse::fuse(&model_dir, &adapter_dir, &save_dir, false).unwrap_err();
   match err {
-    Error::Backend(message) => {
+    Error::MissingKey(p) => {
       // The postcondition's diagnostic fires from one of the three arms
       // in `check_adapter_completeness`. Here `keys=["self_attn.q_proj"]`
       // is an EXPLICIT selection that matches blocks 0 + 1 in the base
       // (both are q_projs in the trailing window), but the adapter
-      // supplies factors for block 99 only — so arm (a) fires
-      // ("adapter is missing factors for N explicitly-selected
-      // target(s)"). Either the missing-factors phrase OR the
-      // unused-factor / nothing-adapted phrases are acceptable
-      // postcondition-violation signals.
+      // supplies factors for block 99 only — so the explicitly-selected
+      // target is reported as a `MissingKey`.
       assert!(
-        message.contains("missing factors")
-          || message.contains("no base layer")
-          || message.contains("match no")
-          || message.contains("matched nothing"),
-        "diagnostic names the postcondition violation: {message}"
+        p.context().contains("load_adapters")
+          && (p.context().contains("explicitly-selected") || p.context().contains("target")),
+        "context names the load_adapters postcondition: {}",
+        p.context()
+      );
+      assert!(
+        p.key().contains("q_proj") && p.key().contains("layers.0"),
+        "key names the missing base layer: {}",
+        p.key()
       );
     }
-    other => panic!("expected Error::Backend, got {other:?}"),
+    other => panic!("expected Error::MissingKey, got {other:?}"),
   }
 }
 
@@ -1067,13 +1089,19 @@ fn fuse_load_adapters_with_config_skips_second_adapter_config_read() {
   )
   .expect_err("load_adapters wrapper re-reads adapter_config.json and must surface the corruption");
   match err {
-    Error::Backend(message) => {
+    Error::Parse(p) => {
       assert!(
-        !message.is_empty(),
-        "wrapper error must carry a parse diagnostic: {message}"
+        p.context().contains("LoraConfig"),
+        "wrapper Parse context names the parser: {}",
+        p.context()
+      );
+      assert_eq!(
+        p.input_kind(),
+        "adapter_config.json",
+        "wrapper Parse input_kind identifies the on-disk file"
       );
     }
-    other => panic!("expected Error::Backend from the wrapper's re-parse, got {other:?}"),
+    other => panic!("expected Error::Parse from the wrapper's re-parse, got {other:?}"),
   }
 }
 
@@ -1107,19 +1135,36 @@ fn fuse_rejects_source_with_missing_tokenizer() {
 
   let err = fuse::fuse(&model_dir, &adapter_dir, &save_dir, false)
     .expect_err("fuse() must reject a source dir missing tokenizer.json");
+  // The validate-on-staging failure is re-wrapped with `model_path`
+  // context by `fuse()` so the surface error carries the SOURCE path
+  // (the staging dir is an internal implementation detail). Inside that
+  // outer LayerKeyed is the staging-side LayerKeyed wrapping the
+  // underlying Tokenizer error.
   match err {
-    Error::Backend(message) => {
-      assert!(
-        message.contains("tokenizer"),
-        "diagnostic names the tokenizer-construction failure: {message}"
+    Error::LayerKeyed(outer) => {
+      assert_eq!(
+        outer.layer(),
+        model_dir.to_str().unwrap(),
+        "outer LayerKeyed layer names the source path so the caller can fix the input"
       );
-      assert!(
-        message.contains(model_dir.to_str().unwrap())
-          || message.contains(model_dir.file_name().unwrap().to_str().unwrap()),
-        "diagnostic names the source path so the caller can fix the input: {message}"
-      );
+      match outer.inner() {
+        // Walk to the innermost (Tokenizer) error — the staging-dir
+        // LayerKeyed is the load::load_tokenizer wrapper. The
+        // tokenizer-construction failure is the inner Error::Tokenizer.
+        Error::LayerKeyed(staging) => match staging.inner() {
+          #[cfg(feature = "tokenizer")]
+          Error::Tokenizer(msg) => {
+            assert!(
+              msg.contains("tokenizer.json"),
+              "Tokenizer error names the missing file: {msg}"
+            );
+          }
+          other => panic!("expected innermost Error::Tokenizer, got {other:?}"),
+        },
+        other => panic!("expected nested LayerKeyed staging wrapper, got {other:?}"),
+      }
     }
-    other => panic!("expected Error::Backend, got {other:?}"),
+    other => panic!("expected outer Error::LayerKeyed, got {other:?}"),
   }
   // Critical: NO save artifacts may have landed in save_dir. The whole
   // point of validate-before-save is to fail FAST so a doomed fuse
@@ -1157,14 +1202,30 @@ fn fuse_rejects_source_with_malformed_tokenizer() {
 
   let err = fuse::fuse(&model_dir, &adapter_dir, &save_dir, false)
     .expect_err("fuse() must reject a source dir with a malformed tokenizer.json");
+  // Same outer/inner LayerKeyed shape as the missing-tokenizer test;
+  // the innermost error is a tokenizer parse failure rather than NotFound.
   match err {
-    Error::Backend(message) => {
-      assert!(
-        message.contains("tokenizer"),
-        "diagnostic names the tokenizer-construction failure: {message}"
+    Error::LayerKeyed(outer) => {
+      assert_eq!(
+        outer.layer(),
+        model_dir.to_str().unwrap(),
+        "outer LayerKeyed layer names the source path"
       );
+      match outer.inner() {
+        Error::LayerKeyed(staging) => match staging.inner() {
+          #[cfg(feature = "tokenizer")]
+          Error::Tokenizer(msg) => {
+            assert!(
+              msg.contains("tokenizer.json"),
+              "Tokenizer error names the file: {msg}"
+            );
+          }
+          other => panic!("expected innermost Error::Tokenizer, got {other:?}"),
+        },
+        other => panic!("expected nested LayerKeyed staging wrapper, got {other:?}"),
+      }
     }
-    other => panic!("expected Error::Backend, got {other:?}"),
+    other => panic!("expected outer Error::LayerKeyed, got {other:?}"),
   }
   assert!(
     !save_dir.join("config.json").exists(),

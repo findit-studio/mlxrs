@@ -891,7 +891,7 @@ pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<
       // placeholder `group_size`/`bits` here are overwritten by
       // `set_meta_state` (a serialized prompt cache always carries the
       // 3-value meta_state).
-      let mut c = QuantizedKvCacheImpl::new(0, 0);
+      let mut c = QuantizedKvCacheImpl::new_unchecked(0, 0);
       c.set_state(state)?;
       c.set_meta_state(meta)?;
       // mlx-lm's `QuantizedKVCache.state` setter (cache.py:294-296:
@@ -1022,12 +1022,13 @@ pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<
         let rotated = c.is_rotated();
         if offset != 0 || idx != 0 || rotated {
           // Empty buffer with non-fresh meta — surface the offending
-          // (offset, idx, rotated) triple via a structured InvariantViolation
-          // whose context names which fields must match the fully-fresh meta.
-          // `rotated` flag value is folded into operands as 0/1.
-          return Err(Error::InvariantViolation(InvariantViolationPayload::new(
-            "BatchRotatingKvCache::from_serialized: empty buffer (keys=None) requires fully-fresh meta (offset=0, _idx=0, rotated=false)",
+          // (offset, idx, rotated) triple via OutOfRange whose `value`
+          // carries the runtime triple (mirrors the sibling `_idx > L`
+          // arm at lines 1044-1049 / `L > _offset` arm at 1056-1061).
+          return Err(Error::OutOfRange(OutOfRangePayload::new(
+            "BatchRotatingKvCache::from_serialized: empty buffer (keys=None) requires fully-fresh meta",
             "must satisfy offset=0 AND _idx=0 AND rotated=false",
+            format_smolstr!("offset={offset}, _idx={idx}, rotated={rotated}"),
           )));
         }
       } else {

@@ -5567,7 +5567,18 @@ mod save_tests {
     let array_fn = src
       .find("fn build_array_map")
       .expect("build_array_map must exist in io.rs");
-    let array_window = &src[array_fn..(array_fn + 3000).min(src.len())];
+    // Walk back to the nearest char boundary so a 3 KiB window that lands
+    // inside a multi-byte rune (e.g. an `─` in a doc-comment frame) does not
+    // panic. Cap matters more than exact-3000 — body fits comfortably.
+    let array_end = {
+      let target = (array_fn + 3000).min(src.len());
+      let mut end = target;
+      while end > array_fn && !src.is_char_boundary(end) {
+        end -= 1;
+      }
+      end
+    };
+    let array_window = &src[array_fn..array_end];
     assert!(
       array_window.contains("mlx_map_string_to_array_new"),
       "DEFENSE-IN-DEPTH STRUCTURAL: build_array_map must still call \
@@ -5583,7 +5594,15 @@ mod save_tests {
     let string_fn = src
       .find("fn build_string_map")
       .expect("build_string_map must exist in io.rs");
-    let string_window = &src[string_fn..(string_fn + 3000).min(src.len())];
+    let string_end = {
+      let target = (string_fn + 3000).min(src.len());
+      let mut end = target;
+      while end > string_fn && !src.is_char_boundary(end) {
+        end -= 1;
+      }
+      end
+    };
+    let string_window = &src[string_fn..string_end];
     assert!(
       string_window.contains("mlx_map_string_to_string_new"),
       "DEFENSE-IN-DEPTH STRUCTURAL: build_string_map must still call \

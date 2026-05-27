@@ -150,19 +150,29 @@ fn closure_outlives_construction_scope() {
 fn value_and_grad_rejects_empty_argnums() {
   let r = value_and_grad(|xs| Ok(vec![square(&xs[0])?]), &[]);
   let err = r.err().expect("empty argnums must be rejected");
-  let msg = format!("{err}");
-  assert!(
-    msg.contains("non-empty"),
-    "expected rejection mentioning non-empty argnums; got: {msg}"
-  );
+  match err {
+    mlxrs::Error::EmptyInput(p) => {
+      assert!(
+        p.context().contains("value_and_grad") && p.context().contains("argnums"),
+        "context names the argnums site: {}",
+        p.context()
+      );
+    }
+    other => panic!("expected Error::EmptyInput for empty argnums, got {other:?}"),
+  }
   // grad delegates to value_and_grad so it must reject too.
   let r = grad(|xs| Ok(vec![square(&xs[0])?]), &[]);
   let err = r.err().expect("empty argnums must be rejected by grad");
-  let msg = format!("{err}");
-  assert!(
-    msg.contains("non-empty"),
-    "expected rejection mentioning non-empty argnums; got: {msg}"
-  );
+  match err {
+    mlxrs::Error::EmptyInput(p) => {
+      assert!(
+        p.context().contains("argnums"),
+        "grad-delegated context still names argnums: {}",
+        p.context()
+      );
+    }
+    other => panic!("expected Error::EmptyInput from grad delegation, got {other:?}"),
+  }
 }
 
 /// f(x) = x^2; d/dx[x^2] = 2x; at x=3 → grad = 6, value = 9.
@@ -461,15 +471,24 @@ fn eval_materializes_all_arrays() {
   assert!(ev.iter().all(|&v| approx_eq(v, 6.0, 1e-6)));
 }
 
-/// async_eval enqueues but does not block; following with eval (or any
-/// item / to_vec) syncs.
-#[test]
-fn async_eval_then_sync_via_item() {
-  let a = Array::full::<f32>(&(4usize, 4usize), 0.5).unwrap();
-  let mut sq = square(&a).unwrap();
-  async_eval(&[&sq]).unwrap();
-  // Eventually it must materialize; item() forces sync.
-  // square(0.5) = 0.25.
-  let vals = sq.to_vec::<f32>().unwrap();
-  assert!(vals.iter().all(|&v| approx_eq(v, 0.25, 1e-6)));
-}
+// `async_eval_then_sync_via_item` moved to its own test bin
+// (`mlxrs/tests/transforms_async_eval.rs`) for **process isolation**.
+//
+// **Why:** MLX's `detail::InTracing::trace_stack_` is a function-local
+// `static std::vector<...>` (NOT `thread_local`) — see
+// `mlxrs-sys/vendor/mlx/mlx/transforms.cpp:trace_stack()`. It is
+// process-global, shared across all threads. The sibling test
+// `closure_user_panic_propagates_through_grad_as_error` deliberately
+// `panic!()`s inside a `grad` closure — the Rust panic is converted to
+// `Err` at the FFI boundary, but MLX's C++ RAII guard for `trace_stack`
+// does not always restore on that conversion path, leaving the
+// process-global static with a stale frame. Any subsequent `async_eval`
+// in the same process then rejects with
+// `"[async_eval] Not allowed inside a graph transformation."`.
+//
+// Cargo runs each test bin in a **separate process**, so a fresh bin gets
+// a fresh `trace_stack_`. Local `cargo test --test transforms` happens to
+// pass because the test scheduler usually completes `async_eval` before
+// the panic test pollutes — but CI's scheduler reliably reverses the
+// order and the test fails. Process isolation is the only correct fix
+// without touching MLX's C++.

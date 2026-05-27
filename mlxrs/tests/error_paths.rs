@@ -108,12 +108,17 @@ fn from_slice_rejects_negative_i32_dims() {
   // Without the IntoShape negative-dim guard, `-1i32 as usize` becomes
   // usize::MAX and the shape-product check would multiply that into a value
   // that may match data.len() — handing mlx-c a buffer smaller than the
-  // shape says. Must surface as ShapeMismatch.
+  // shape says. Must surface as a typed OutOfRange payload identifying the
+  // offending dim index and value.
   let r = mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[-1i32, 3]);
-  assert!(
-    matches!(r, Err(mlxrs::Error::ShapeMismatch(_))),
-    "expected Err(ShapeMismatch), got {r:?}"
-  );
+  match r {
+    Err(mlxrs::Error::OutOfRange(p)) => {
+      assert_eq!(p.context(), "shape::validate_dims: dim");
+      assert_eq!(p.requirement(), "must be non-negative");
+      assert_eq!(p.value(), "dim[0]=-1");
+    }
+    other => panic!("expected OutOfRange dim<0, got {other:?}"),
+  }
 }
 
 #[test]
@@ -121,10 +126,14 @@ fn from_slice_rejects_negative_i32_slice_dims() {
   // Same guard for the &[i32] IntoShape path (escape hatch for runtime shapes).
   let dims: &[i32] = &[2, -3];
   let r = mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &dims);
-  assert!(
-    matches!(r, Err(mlxrs::Error::ShapeMismatch(_))),
-    "expected Err(ShapeMismatch), got {r:?}"
-  );
+  match r {
+    Err(mlxrs::Error::OutOfRange(p)) => {
+      assert_eq!(p.context(), "shape::validate_dims: dim");
+      assert_eq!(p.requirement(), "must be non-negative");
+      assert_eq!(p.value(), "dim[1]=-3");
+    }
+    other => panic!("expected OutOfRange dim<0, got {other:?}"),
+  }
 }
 
 #[test]
@@ -133,10 +142,22 @@ fn from_slice_rejects_overflowing_shape_product() {
   // `i32::MAX^3 ≈ 9.9e27` >> `usize::MAX ≈ 1.8e19`, so wrapping is guaranteed.
   // Without checked_mul, the wrapped value could match data.len() and pass.
   let r = mlxrs::Array::from_slice::<f32>(&[1.0], &[i32::MAX, i32::MAX, i32::MAX]);
-  assert!(
-    matches!(r, Err(mlxrs::Error::ShapeMismatch(_))),
-    "expected Err(ShapeMismatch) on overflow, got {r:?}"
-  );
+  match r {
+    Err(mlxrs::Error::ArithmeticOverflow(p)) => {
+      assert!(
+        p.context().contains("Array::from_slice: shape product"),
+        "context should identify shape-product op, got {:?}",
+        p.context()
+      );
+      assert_eq!(p.op_type(), "usize");
+      let ops = p.operands();
+      assert!(
+        ops.iter().any(|(name, _)| *name == "dim_index"),
+        "operands must carry a `dim_index` entry identifying which multiply tripped, got {ops:?}"
+      );
+    }
+    other => panic!("expected ArithmeticOverflow on shape product, got {other:?}"),
+  }
 }
 
 #[test]

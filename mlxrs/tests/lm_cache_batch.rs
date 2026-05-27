@@ -1192,14 +1192,22 @@ fn batch_rotating_from_state_error_message_names_violated_invariant() {
     "false".to_string(),
   ];
   let r = from_state("BatchRotatingKVCache", vec![], &bad_empty);
-  let err_msg = match r {
-    Err(e) => format!("{e}"),
+  match r {
+    Err(mlxrs::Error::OutOfRange(p)) => {
+      assert!(
+        p.context().contains("empty buffer"),
+        "context must name the empty-arm condition; got: {}",
+        p.context()
+      );
+      assert!(
+        p.value().contains("offset=5"),
+        "value must name the offending offset; got: {}",
+        p.value()
+      );
+    }
+    Err(other) => panic!("expected OutOfRange empty-arm, got {other:?}"),
     Ok(_) => panic!("from_state empty + offset=5 must Err"),
-  };
-  assert!(
-    err_msg.contains("empty") && err_msg.contains("5"),
-    "empty-branch error must name the condition and offending offset; got: {err_msg}"
-  );
+  }
 
   // Branch 2: `_idx > L` (write cursor beyond physical buffer).
   let k = kv(3);

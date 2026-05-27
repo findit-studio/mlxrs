@@ -774,11 +774,21 @@ fn chunked_set_seq_full_window_rejects_mismatched_batch_dim() {
   // silently returned `new` (batch-axis silently mutated). WITH FIX:
   // Err(ShapeMismatch) at the broadcast_write_rhs boundary.
   let r = c.update(&bad_kv2, &bad_kv2);
-  assert!(
-    matches!(&r, Err(mlxrs::Error::ShapeMismatch(_))),
-    "full-window set_seq must reject batch-axis mismatch on the public update API \
-     (closes #78 P1 iter5), got {r:?}"
-  );
+  match &r {
+    Err(mlxrs::Error::ShapePairMismatch(p)) => {
+      assert!(
+        p.context().contains("broadcast_write_rhs"),
+        "expected broadcast_write_rhs context, got: {}",
+        p.context()
+      );
+      assert_eq!(p.expected(), &[1, 1, 1, 1]);
+      assert_eq!(p.actual(), &[2, 1, 1, 1]);
+    }
+    other => panic!(
+      "full-window set_seq must reject batch-axis mismatch on the public update API \
+       (closes #78 P1 iter5), got {other:?}"
+    ),
+  }
   // Cache must be unchanged (still single-batch). No silent mutation of
   // the buffer batch dim, no advanced offset, no split-brain.
   assert_eq!(c.offset(), 0, "offset must not advance on a failed update");
@@ -815,10 +825,18 @@ fn chunked_set_seq_full_window_rejects_mismatched_heads_and_head_dim() {
     .unwrap();
   c1.trim(1).unwrap();
   let r1 = c1.update(&bad_kv_heads, &bad_kv_heads);
-  assert!(
-    matches!(&r1, Err(mlxrs::Error::ShapeMismatch(_))),
-    "full-window set_seq must reject n_kv_heads (axis 1) mismatch, got {r1:?}"
-  );
+  match &r1 {
+    Err(mlxrs::Error::ShapePairMismatch(p)) => {
+      assert!(
+        p.context().contains("broadcast_write_rhs"),
+        "expected broadcast_write_rhs context, got: {}",
+        p.context()
+      );
+      assert_eq!(p.expected(), &[1, 1, 1, 1]);
+      assert_eq!(p.actual(), &[1, 3, 1, 1]);
+    }
+    other => panic!("full-window set_seq must reject n_kv_heads (axis 1) mismatch, got {other:?}"),
+  }
   // Buffer's n_kv_heads still 1: a well-formed [1,1,1,1] update succeeds.
   let ok = kv(&[8.0]);
   c1.update(&ok, &ok).unwrap();
@@ -830,10 +848,18 @@ fn chunked_set_seq_full_window_rejects_mismatched_heads_and_head_dim() {
     .unwrap();
   c2.trim(1).unwrap();
   let r2 = c2.update(&bad_kv_hd, &bad_kv_hd);
-  assert!(
-    matches!(&r2, Err(mlxrs::Error::ShapeMismatch(_))),
-    "full-window set_seq must reject head_dim (axis 3) mismatch, got {r2:?}"
-  );
+  match &r2 {
+    Err(mlxrs::Error::ShapePairMismatch(p)) => {
+      assert!(
+        p.context().contains("broadcast_write_rhs"),
+        "expected broadcast_write_rhs context, got: {}",
+        p.context()
+      );
+      assert_eq!(p.expected(), &[1, 1, 1, 1]);
+      assert_eq!(p.actual(), &[1, 1, 1, 2]);
+    }
+    other => panic!("full-window set_seq must reject head_dim (axis 3) mismatch, got {other:?}"),
+  }
   // Buffer's head_dim still 1: a well-formed [1,1,1,1] update succeeds.
   c2.update(&ok, &ok).unwrap();
   assert_eq!(c2.offset(), 1);

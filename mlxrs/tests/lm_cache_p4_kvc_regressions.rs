@@ -289,21 +289,21 @@ fn kvc3_kvcachekind_parse_accepts_every_alias() {
 
 #[test]
 fn kvc3_kvcachekind_parse_unknown_is_recoverable_err() {
-  // Unknown kinds are a recoverable Error::Backend (replaces the prior
-  // string-keyed `other => Err(...)` arm). NEVER a panic.
+  // Unknown kinds are a recoverable Error::UnknownEnumValue (typed payload
+  // — replaces the prior string-keyed `other => Err(...)` arm). NEVER a
+  // panic.
   let result = KvCacheKind::parse("DefinitelyNotARealCacheKind");
   match result {
-    Err(Error::Backend(message)) => {
+    Err(Error::UnknownEnumValue(p)) => {
+      assert_eq!(p.type_name(), "KvCacheKind");
+      assert_eq!(p.value(), "DefinitelyNotARealCacheKind");
       assert!(
-        message.contains("unknown cache kind"),
-        "diagnostic must name the failure mode; got {message:?}"
-      );
-      assert!(
-        message.contains("DefinitelyNotARealCacheKind"),
-        "diagnostic must include the offending kind string; got {message:?}"
+        p.supported().contains(&"KVCache"),
+        "supported list must include canonical names; got {:?}",
+        p.supported()
       );
     }
-    other => panic!("expected Err(Error::Backend), got {other:?}"),
+    other => panic!("expected Err(Error::UnknownEnumValue), got {other:?}"),
   }
 }
 
@@ -349,20 +349,24 @@ fn kvc8_quantized_set_state_4_arr_rejects_kv_shape_mismatch() {
   let v_s = Array::from_slice::<f32>(&[0.0; 3], &(1usize, 1, 3, 1)).unwrap();
   let state = vec![k_w, k_s, v_w, v_s];
 
-  let mut cache = QuantizedKvCacheImpl::new(64, 4);
+  let mut cache = QuantizedKvCacheImpl::new(64, 4).unwrap();
   let result = cache.set_state(state);
   match result {
-    Err(Error::ShapeMismatch(message)) => {
+    Err(Error::ShapePairMismatch(p)) => {
       assert!(
-        message.contains("set_state"),
-        "diagnostic must name the load boundary; got {message:?}"
+        p.context().contains("set_state") && p.context().contains("leading axes"),
+        "diagnostic must name the load boundary + leading-axes constraint; got {}",
+        p.context()
       );
-      assert!(
-        message.contains("axis 2") || message.contains("axis 1") || message.contains("axis"),
-        "diagnostic must name the mismatched axis; got {message:?}"
-      );
+      // K w shape = [1, 1, 4, 2]; V w shape = [1, 1, 3, 2]. The validator
+      // compares the first KV_NDIM-1 axes [B, n_kv_heads, S] = [1, 1, 4]
+      // vs [1, 1, 3].
+      assert_eq!(p.expected(), &[1, 1, 4]);
+      assert_eq!(p.actual(), &[1, 1, 3]);
     }
-    other => panic!("expected Err(Error::ShapeMismatch) for K/V seq_len mismatch, got {other:?}"),
+    other => {
+      panic!("expected Err(Error::ShapePairMismatch) for K/V seq_len mismatch, got {other:?}")
+    }
   }
   // Cache MUST be untouched (kept empty): the validation runs BEFORE
   // the field assignment.
@@ -389,17 +393,25 @@ fn kvc8_quantized_set_state_6_arr_rejects_kv_bias_shape_mismatch() {
   let v_b = Array::from_slice::<f32>(&[0.0; 3], &(1usize, 1, 3, 1)).unwrap();
   let state = vec![k_w, k_s, k_b, v_w, v_s, v_b];
 
-  let mut cache = QuantizedKvCacheImpl::new(64, 4);
+  let mut cache = QuantizedKvCacheImpl::new(64, 4).unwrap();
   let result = cache.set_state(state);
   match result {
-    Err(Error::ShapeMismatch(message)) => {
+    Err(Error::ShapePairMismatch(p)) => {
+      // `validate_kv_leading_axes_match` is called for element="biases"
+      // last; the context routes via the catch-all "K and V leading axes"
+      // arm (the per-element bias branch is the `_` arm in the matcher).
       assert!(
-        message.contains("biases"),
-        "diagnostic must name the offending element (biases); got {message:?}"
+        p.context().contains("leading axes"),
+        "diagnostic must name the leading-axes constraint; got {}",
+        p.context()
       );
+      // K bias shape = [1, 1, 2, 1]; V bias shape = [1, 1, 3, 1]. Leading
+      // [B, n_kv_heads, S] = [1, 1, 2] vs [1, 1, 3].
+      assert_eq!(p.expected(), &[1, 1, 2]);
+      assert_eq!(p.actual(), &[1, 1, 3]);
     }
     other => {
-      panic!("expected Err(Error::ShapeMismatch) for K/V bias shape mismatch, got {other:?}")
+      panic!("expected Err(Error::ShapePairMismatch) for K/V bias shape mismatch, got {other:?}")
     }
   }
   assert!(
@@ -420,7 +432,7 @@ fn kvc8_quantized_set_state_consistent_shapes_pass() {
   let v_s = Array::from_slice::<f32>(&[0.0; 4], &(1usize, 1, 4, 1)).unwrap();
   let state = vec![k_w, k_s, v_w, v_s];
 
-  let mut cache = QuantizedKvCacheImpl::new(64, 4);
+  let mut cache = QuantizedKvCacheImpl::new(64, 4).unwrap();
   cache
     .set_state(state)
     .expect("consistent 4-array state must pass");
@@ -455,7 +467,7 @@ fn kvc8_quantized_set_state_accepts_different_v_head_dim() {
   let v_b = Array::from_slice::<f32>(&[0.0; 8 * 2], &(1usize, 2, 4, 2)).unwrap();
   let state = vec![k_w, k_s, k_b, v_w, v_s, v_b];
 
-  let mut cache = QuantizedKvCacheImpl::new(64, 4);
+  let mut cache = QuantizedKvCacheImpl::new(64, 4).unwrap();
   cache
     .set_state(state)
     .expect("leading axes (B, H, S) match; differing payload axis is the v_head_dim skew the cache contract allows");
@@ -476,16 +488,20 @@ fn kvc8_quantized_set_state_rejects_non_4d_rank() {
   let v_s = Array::from_slice::<f32>(&[0.0; 8], &(1usize, 2, 4, 1)).unwrap();
   let state = vec![k_w, k_s, v_w, v_s];
 
-  let mut cache = QuantizedKvCacheImpl::new(64, 4);
+  let mut cache = QuantizedKvCacheImpl::new(64, 4).unwrap();
   let result = cache.set_state(state);
   match result {
-    Err(Error::ShapeMismatch(message)) => {
+    Err(Error::RankMismatch(p)) => {
       assert!(
-        message.contains("4-D") || message.contains("rank"),
-        "rank-gate diagnostic must name the 4-D requirement; got {message:?}"
+        p.context().contains("4-D"),
+        "rank-gate diagnostic must name the 4-D requirement; got {}",
+        p.context()
       );
+      // The forged K w has rank 2 (`(2usize, 3)`) and is checked first.
+      assert_eq!(p.actual(), 2);
+      assert_eq!(p.actual_shape(), &[2, 3]);
     }
-    other => panic!("expected Err(Error::ShapeMismatch) for non-4-D state, got {other:?}"),
+    other => panic!("expected Err(Error::RankMismatch) for non-4-D state, got {other:?}"),
   }
   assert!(
     cache.is_empty(),
@@ -524,7 +540,7 @@ fn kvc8_quantized_update_save_reload_with_v_head_dim_skew() {
     Array::from_slice::<f32>(&data, &(b, h, s, v_head_dim)).unwrap()
   };
 
-  let mut original = QuantizedKvCacheImpl::new(group_size, bits);
+  let mut original = QuantizedKvCacheImpl::new(group_size, bits).unwrap();
   original
     .update_quantized(&k, &v)
     .expect("update_quantized with v_head_dim != k_head_dim must succeed");
@@ -656,7 +672,7 @@ fn kvc10_every_concrete_cache_declares_its_reference_class_name() {
     ("RotatingKVCache", Box::new(RotatingKvCache::new(8, 1))),
     (
       "QuantizedKVCache",
-      Box::new(QuantizedKvCacheImpl::new(64, 4)),
+      Box::new(QuantizedKvCacheImpl::new(64, 4).unwrap()),
     ),
     ("ArraysCache", Box::new(ArraysCache::new(2))),
     ("MambaCache", Box::new(ArraysCache::mamba())),

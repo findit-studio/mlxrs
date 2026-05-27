@@ -1041,12 +1041,6 @@ pub enum Error {
   #[error(transparent)]
   LayerKeyed(LayerKeyedPayload),
 
-  /// A file I/O failure on a SLOTTED resource (e.g. `ArraysCache
-  /// meta_state[<slot>]`). Like [`Error::FileIo`] but carries a runtime
-  /// slot identifier too.
-  #[error(transparent)]
-  FileSlotIo(FileSlotIoPayload),
-
   /// Tokenizer subsystem error (HF tokenizer load/encode/decode, chat-template
   /// render, tool-call parse). Only constructed when the `tokenizer` feature
   /// is enabled. The message carries the underlying cause.
@@ -2223,82 +2217,6 @@ impl std::fmt::Display for UnsupportedDtypePayload {
 }
 
 impl std::error::Error for UnsupportedDtypePayload {}
-
-/// Payload for [`Error::FileSlotIo`]: a file I/O failure on a SLOTTED
-/// resource (e.g. `ArraysCache meta_state[<slot>]`). Like
-/// [`FileIoPayload`] but also carries a runtime slot identifier.
-#[derive(Debug)]
-pub struct FileSlotIoPayload {
-  context: &'static str,
-  slot: SmolStr,
-  op: FileOp,
-  path: PathBuf,
-  inner: std::io::Error,
-}
-
-impl FileSlotIoPayload {
-  /// Construct a new payload.
-  pub fn new(
-    context: &'static str,
-    slot: impl Into<SmolStr>,
-    op: FileOp,
-    path: PathBuf,
-    inner: std::io::Error,
-  ) -> Self {
-    Self {
-      context,
-      slot: slot.into(),
-      op,
-      path,
-      inner,
-    }
-  }
-  /// Call-site label.
-  #[inline(always)]
-  pub const fn context(&self) -> &'static str {
-    self.context
-  }
-  /// The runtime slot identifier.
-  #[inline(always)]
-  pub fn slot(&self) -> &str {
-    &self.slot
-  }
-  /// The operation kind that failed.
-  #[inline(always)]
-  pub const fn op(&self) -> FileOp {
-    self.op
-  }
-  /// The file or directory path involved.
-  #[inline(always)]
-  pub fn path(&self) -> &std::path::Path {
-    &self.path
-  }
-  /// The underlying I/O error.
-  #[inline(always)]
-  pub fn inner(&self) -> &std::io::Error {
-    &self.inner
-  }
-}
-
-impl std::fmt::Display for FileSlotIoPayload {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    write!(
-      f,
-      "io: {} [{}]: {} {}: {}",
-      self.context,
-      self.slot,
-      self.op,
-      self.path.display(),
-      self.inner
-    )
-  }
-}
-
-impl std::error::Error for FileSlotIoPayload {
-  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-    Some(&self.inner)
-  }
-}
 
 /// Payload for [`Error::AllocFailure`]: a `try_reserve` / `try_reserve_exact`
 /// failed (request-scaled allocation that the OOM guard turned into a

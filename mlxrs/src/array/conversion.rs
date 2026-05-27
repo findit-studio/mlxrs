@@ -5,7 +5,7 @@ use std::ffi::CStr;
 use crate::{
   array::Array,
   dtype::{Dtype, Element},
-  error::{DtypeMismatchPayload, Error, Result},
+  error::{DtypeMismatchPayload, Error, InvariantViolationPayload, Result},
 };
 
 impl Array {
@@ -96,23 +96,33 @@ impl Array {
       )));
     }
     self.eval()?;
+    // SAFETY: array materialized by the prior `eval()`, dtype verified `== T::DTYPE`.
+    // Zero-length is checked FIRST (#258 LOW: contiguity is meaningless for a
+    // zero-element array — a `[2, 0, 3]` shape that mlx reports as strided in
+    // its descriptor would otherwise yield `NonContiguous` instead of `Ok(vec![])`).
+    // Contiguity is then checked before the data-pointer read so the
+    // `from_raw_parts` precondition holds.
+    let (ptr, len) = unsafe { T::data(self.0) };
+    if len == 0 {
+      return Ok(Vec::new());
+    }
     if !is_row_contiguous(self.0) {
       return Err(Error::NonContiguous);
     }
-    // SAFETY: array materialized by the prior `eval()`, dtype verified `== T::DTYPE`
-    // and row-contiguity checked above; the NULL/zero-length case is guarded
-    // before this call, so `(ptr, len)` is a valid non-null slice.
-    unsafe {
-      let (ptr, len) = T::data(self.0);
-      // Zero-element arrays (shape `[0]`, `[2,0]`, ...) yield NULL from mlx;
-      // `from_raw_parts(NULL, 0)` is UB per Rust's slice contract, so return
-      // an empty Vec without touching the pointer.
-      if len == 0 {
-        return Ok(Vec::new());
-      }
-      assert!(!ptr.is_null(), "mlx data pointer NULL after eval");
-      Ok(std::slice::from_raw_parts(ptr, len).to_vec())
+    if ptr.is_null() {
+      // FFI invariant violation: mlx returned NULL data pointer for a non-empty
+      // contiguous array after a successful eval. Surfaced as a recoverable Err
+      // (#258 LOW) rather than `assert!`/panic — a library must not crash the
+      // caller's process on a backend anomaly.
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "Array::to_vec: mlx data pointer for an evaluated non-empty contiguous array",
+        "must be non-null",
+      )));
     }
+    // SAFETY: `(ptr, len)` are non-null + non-zero + row-contiguous + dtype-matched
+    // (all checked above). The pointed-to buffer is owned by `self` until the next
+    // mutating call, which cannot happen across this synchronous read.
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec())
   }
 
   /// Borrow the underlying buffer as `&[T]`. Forces eval. Errors with
@@ -133,22 +143,24 @@ impl Array {
       )));
     }
     self.eval()?;
+    // SAFETY: array materialized by the prior `eval()`, dtype verified `== T::DTYPE`.
+    // Same ordering as `to_vec`: zero-length first, then contiguity, then NULL
+    // guard. See `to_vec` for the rationale + #258 references.
+    let (ptr, len) = unsafe { T::data(self.0) };
+    if len == 0 {
+      return Ok(&[]);
+    }
     if !is_row_contiguous(self.0) {
       return Err(Error::NonContiguous);
     }
-    // SAFETY: array materialized by the prior `eval()`, dtype verified `== T::DTYPE`
-    // and row-contiguity checked above; the NULL/zero-length case is guarded
-    // before this call, so `(ptr, len)` is a valid non-null slice.
-    unsafe {
-      let (ptr, len) = T::data(self.0);
-      // Same zero-element guard as `to_vec`: NULL data ptr is legitimate
-      // when `len == 0`, and `from_raw_parts(NULL, 0)` is still UB.
-      if len == 0 {
-        return Ok(&[]);
-      }
-      assert!(!ptr.is_null(), "mlx data pointer NULL after eval");
-      Ok(std::slice::from_raw_parts(ptr, len))
+    if ptr.is_null() {
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "Array::as_slice: mlx data pointer for an evaluated non-empty contiguous array",
+        "must be non-null",
+      )));
     }
+    // SAFETY: `(ptr, len)` are non-null + non-zero + row-contiguous + dtype-matched.
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
   }
 
   /// `&self` scalar extraction — borrow-relaxation parallel of
@@ -372,8 +384,19 @@ impl std::fmt::Display for Array {
     }
     // SAFETY: `s` is a live `mlx_string` (freed only after this borrow); mlx-c
     // returns its internal NUL-terminated buffer, valid until the string is
-    // freed. The returned pointer is NULL-checked before use.
-    let cstr = unsafe { CStr::from_ptr(mlxrs_sys::mlx_string_data(s.0)) };
+    // freed. The returned pointer IS null-checked before `CStr::from_ptr` —
+    // `CStr::from_ptr(NULL)` is instant UB, and although `mlx_string_data` on
+    // a successfully-populated string is never NULL in practice, defending
+    // against a future mlx-c change (or an unexpected NULL on the error path)
+    // is correct (#258 HIGH).
+    let raw = unsafe { mlxrs_sys::mlx_string_data(s.0) };
+    if raw.is_null() {
+      return write!(f, "Array(<tostring returned NULL ptr>)");
+    }
+    // SAFETY: `raw` was just null-checked above. The pointed-to NUL-terminated
+    // C string is owned by `s` (still live) and is read-only for the duration
+    // of this borrow.
+    let cstr = unsafe { CStr::from_ptr(raw) };
     write!(f, "{}", cstr.to_string_lossy())
   }
 }
