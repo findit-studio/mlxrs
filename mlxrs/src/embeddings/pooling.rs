@@ -9,7 +9,10 @@
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{Error, RankMismatchPayload, Result, try_with_capacity},
+  error::{
+    Error, RankMismatchPayload, Result, ShapePairMismatchPayload, UnknownEnumValuePayload,
+    try_with_capacity,
+  },
   ops::{
     arithmetic::{divide, maximum, multiply, subtract},
     comparison::equal,
@@ -65,9 +68,10 @@ fn validate_token_embeddings_and_mask(
     )));
   }
   if emb_shape[0] != mask_shape[0] || emb_shape[1] != mask_shape[1] {
-    return Err(Error::ShapeMismatch(format!(
-      "token_embeddings (batch, seq_len) = ({}, {}) must match attention_mask ({}, {})",
-      emb_shape[0], emb_shape[1], mask_shape[0], mask_shape[1]
+    return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+      "token_embeddings (batch, seq_len) must match attention_mask (batch, seq_len)",
+      vec![emb_shape[0], emb_shape[1]],
+      vec![mask_shape[0], mask_shape[1]],
     )));
   }
   Ok(())
@@ -344,11 +348,14 @@ impl PoolingStrategy {
       "lasttoken" | "last" => Ok(Self::Last),
       "first" => Ok(Self::First),
       "none" => Ok(Self::None),
-      "weightedmean" | "mean_sqrt_len_tokens" => Err(Error::Backend(format!(
-        "pooling mode {mode:?} is not supported (supported: cls, lasttoken, max, mean)"
-      ))),
-      other => Err(Error::Backend(format!(
-        "unknown pooling mode {other:?} (supported: cls, lasttoken, max, mean)"
+      // `weightedmean` / `mean_sqrt_len_tokens` are the documented
+      // known-unsupported modes; an unknown mode (anything else) is the
+      // catch-all. Both surface the same typed UnknownEnumValue variant
+      // with the static supported-set so the caller routes uniformly.
+      _ => Err(Error::UnknownEnumValue(UnknownEnumValuePayload::new(
+        "embeddings::PoolingStrategy",
+        mode,
+        &["cls", "lasttoken", "max", "mean"],
       ))),
     }
   }

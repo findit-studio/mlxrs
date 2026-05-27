@@ -73,10 +73,15 @@ use std::{
 
 use glob::{MatchOptions, glob_with};
 
+#[cfg(test)]
+use crate::error::RankMismatchPayload;
 use crate::{
   array::Array,
   embeddings::{config::StPoolingConfig, model::EmbeddingModel},
-  error::{Error, FileIoPayload, FileOp, Result},
+  error::{
+    CapExceededPayload, EmptyInputPayload, Error, FileIoPayload, FileOp, MissingFieldPayload,
+    ParsePayload, Result, UnknownEnumValuePayload,
+  },
   tokenizer::Tokenizer,
 };
 
@@ -387,10 +392,16 @@ impl EmbeddingModelTypeRegistry {
   /// `ValueError("Model type … not supported.")`).
   pub fn create(&self, loaded: &LoadedEmbeddingModel) -> Result<Box<dyn EmbeddingModel>> {
     let constructor = self.creators.get(&loaded.model_type).ok_or_else(|| {
-      Error::Backend(format!(
-        "unsupported model type {:?}: no constructor registered (register one via \
-             EmbeddingModelTypeRegistry::register)",
-        loaded.model_type
+      // The registry's contents are runtime-keyed; carry the rejected
+      // model_type in the payload's `value` and leave the `supported` list
+      // empty (the keys are not `&'static` so they cannot satisfy
+      // `&'static [&'static str]`; the missing-constructor diagnostic
+      // remains actionable via the value).
+      Error::UnknownEnumValue(UnknownEnumValuePayload::new(
+        "EmbeddingModelTypeRegistry: unsupported model type — no constructor registered \
+         (register one via EmbeddingModelTypeRegistry::register)",
+        loaded.model_type.clone(),
+        &[],
       ))
     })?;
     constructor(loaded)
@@ -488,13 +499,13 @@ pub fn load(
   // normalized to `"."`; it is rejected here, ahead of `config.json` / pooling
   // / shard resolution (the same up-front spirit as the non-UTF-8 model-dir
   // rejection inside `collect_glob_shards`).
-  reject_empty_dir(model_dir, "model")?;
+  reject_empty_dir(model_dir, EmptyDirRole::Model)?;
   // The tokenizer directory, when supplied separately via `tokenizer_source`,
   // is rejected here too: an empty separate tokenizer path is the same caller
   // bug. (When `tokenizer_source` is `None` the tokenizer dir IS the model dir,
   // already checked above.)
   if let Some(tokenizer_source) = &configuration.tokenizer_source {
-    reject_empty_dir(tokenizer_source, "tokenizer")?;
+    reject_empty_dir(tokenizer_source, EmptyDirRole::Tokenizer)?;
   }
 
   // (1) Read the `config.json` `model_type` ONCE (bounded, dependency-free)
@@ -509,11 +520,16 @@ pub fn load(
   // since per-model architectures are out of scope and the registry is
   // normally empty — is a cheap, recoverable error here, never paying for
   // weight/tokenizer I/O.
+  // The unsupported-model-type rejection consumes `model_type` only on the
+  // error path; the success path keeps `model_type` owned for the
+  // `LoadedEmbeddingModel::new` constructor below. `contains` borrows the
+  // key so the destructure is safe.
   if !registry.contains(&model_type) {
-    // TODO(§5): promote to a typed UnsupportedModelType { model_type: String } variant — `model_type` is dynamic but structured (a model-type string); direct variant would avoid string construction on the hot error path.
-    return Err(Error::Backend(format!(
-      "unsupported model type {model_type:?}: no constructor registered (register one via \
-         EmbeddingModelTypeRegistry::register)"
+    return Err(Error::UnknownEnumValue(UnknownEnumValuePayload::new(
+      "embeddings::load: unsupported model type — no constructor registered (register \
+       one via EmbeddingModelTypeRegistry::register)",
+      model_type,
+      &[],
     )));
   }
 
@@ -538,10 +554,34 @@ pub fn load(
   // does not generate, so there is no eos override (mlx-embeddings' embedding
   // `load` builds a plain tokenizer); pass `None` — `Tokenizer::from_path`
   // then uses the tokenizer's own `eos_token`.
+  //
+  // The local tokenizer loader (`Tokenizer::from_path`) returns a typed crate
+  // `Error` (`Error::Tokenizer(SmolStr)` for `tokenizer.json` /
+  // `tokenizer_config.json` load failures, `Error::FileIo` for the few real
+  // `std::fs` reads it performs internally) — but its `Error::Tokenizer`
+  // messages (e.g. `load tokenizer.json: ...`) do NOT carry the *selected*
+  // tokenizer directory, so a split-tokenizer-source layout that fails would
+  // otherwise lose the "which directory was used" recovery context.
+  //
+  // Wrap the failure in `Error::FileIo` (`FileOp::Other("tokenizer_load")`)
+  // so the tokenizer directory remains machine-readable to callers
+  // (`p.path()`), while preserving the typed source chain by stuffing the
+  // original `crate::Error` into the `io::Error` as a `Box<dyn Error + Send
+  // + Sync>` — callers recover the inner `Tokenizer`/`Parse`/etc. variant
+  // via `p.inner().get_ref().and_then(|e| e.downcast_ref::<crate::Error>
+  // ())` (note: `io::Error::other` exposes the boxed inner via `get_ref()`
+  // / `into_inner()` but not via `std::error::Error::source()`).
   let tokenizer = Tokenizer::from_path(tokenizer_dir, None).map_err(|e| {
-    Error::Backend(format!(
-      "cannot load tokenizer from {}: {e}",
-      tokenizer_dir.display()
+    // `io::Error::other(boxed)` is the clippy-preferred shorthand for
+    // `io::Error::new(ErrorKind::Other, boxed)` and preserves the boxed
+    // source under `io::Error::source()` / `get_ref()` identically.
+    let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(e);
+    let io_err = std::io::Error::other(boxed);
+    Error::FileIo(FileIoPayload::new(
+      "embeddings load: tokenizer",
+      FileOp::Other("tokenizer_load"),
+      tokenizer_dir.to_path_buf(),
+      io_err,
     ))
   })?;
 
@@ -570,14 +610,29 @@ pub fn load(
 /// it is correct for a non-UTF-8 path too and never panics. A path that is
 /// merely whitespace or `"."` is *not* empty and is left to the existing I/O
 /// steps to resolve or reject; only the genuinely empty path is caught here.
-fn reject_empty_dir(dir: &Path, role: &str) -> Result<()> {
+fn reject_empty_dir(dir: &Path, role: EmptyDirRole) -> Result<()> {
   if dir.as_os_str().is_empty() {
-    // TODO(§5): promote to EmptyInput — `role` is a dynamic &str label; needs Cow<'static, str> or a PathEmpty { role: String } variant.
-    return Err(Error::Backend(format!(
-      "embeddings load: {role} directory path must not be empty"
-    )));
+    return Err(Error::EmptyInput(EmptyInputPayload::new(role.context())));
   }
   Ok(())
+}
+
+/// Role of the directory checked by [`reject_empty_dir`]. Routing through
+/// a closed enum keeps the [`EmptyInputPayload::context`] static so the §5
+/// no-`format!` contract holds (no runtime-keyed label allocation).
+#[derive(Clone, Copy)]
+enum EmptyDirRole {
+  Model,
+  Tokenizer,
+}
+
+impl EmptyDirRole {
+  const fn context(self) -> &'static str {
+    match self {
+      Self::Model => "embeddings load: model directory path must not be empty",
+      Self::Tokenizer => "embeddings load: tokenizer directory path must not be empty",
+    }
+  }
 }
 
 /// Read `<dir>/1_Pooling/config.json` if present, mirroring
@@ -600,30 +655,102 @@ fn reject_empty_dir(dir: &Path, role: &str) -> Result<()> {
 /// be silently treated as ABSENT and the loader would fall back to the wrong
 /// pooling strategy/dimension with no diagnostic. With `symlink_metadata`:
 ///
-/// - `Err(NotFound)` ⇒ the path genuinely does not exist (not even a dangling
-///   link) ⇒ `Ok(None)` — the faithful `_read_pooling_config` "absent" case.
-/// - `Ok(_)` ⇒ an entry *is* present — including a **broken symlink**, which an
-///   `lstat` reports as the link itself rather than erroring `NotFound`. The
-///   parse proceeds: [`pooling_from_st_config_path`] opens (following symlinks)
-///   and a broken/looping link, or a non-regular target, is rejected there as
-///   an [`Error::Backend`]. A "present but bad" config is thus an error, never
-///   silently-absent.
-/// - any other `Err` (permission-denied, …) ⇒ a present-but-unresolvable
-///   config ⇒ an [`Error::Backend`] naming the path, never `Ok(None)`.
+/// - `Ok(_)` on the CHILD `1_Pooling/config.json` ⇒ an entry *is* present —
+///   including a **broken symlink** at the child, which an `lstat` reports as
+///   the link itself rather than erroring `NotFound`. The parse proceeds:
+///   [`pooling_from_st_config_path`] opens (following symlinks) and a
+///   broken/looping link, or a non-regular target, is rejected there as a
+///   typed [`Error::FileIo`]. A "present but bad" config is thus an error,
+///   never silently-absent.
+/// - `Err(NotFound)` on the CHILD ⇒ the child path itself does not resolve;
+///   this is **ambiguous** — the parent `1_Pooling` may be genuinely absent
+///   (the common case ⇒ `Ok(None)`), OR it may be present-but-broken (a
+///   dangling symlink whose target dir does not exist, in which case an
+///   `lstat` on any child path returns `NotFound` even though `1_Pooling`
+///   exists as a directory entry). A SECOND probe disambiguates by `lstat`ing
+///   `1_Pooling` itself: if that returns `Ok` on a symlink whose followed
+///   target does not exist (or fails to resolve), we fail closed with a typed
+///   [`Error::FileIo`] rather than silently degrading.
+/// - any other `Err` (permission-denied, …) on the CHILD ⇒ a
+///   present-but-unresolvable config ⇒ an [`Error::FileIo`] naming the path,
+///   never `Ok(None)`.
 fn read_optional_pooling(dir: &Path) -> Result<Option<StPoolingConfig>> {
   // `_read_pooling_config`'s "absent ⇒ None" is a presence check on
   // `1_Pooling/config.json`; the existing reader maps an absent file to an
   // open-error `Err`, so the presence check is done here first. Probe with
   // `symlink_metadata` (`lstat`) so a present-but-broken entry (dangling
-  // symlink, EACCES) is NOT mistaken for absence — only a genuine `NotFound`
-  // is the "absent ⇒ None" case.
-  let config_path = dir.join("1_Pooling").join("config.json");
+  // symlink, EACCES) is NOT mistaken for absence. A child `NotFound` is
+  // followed by a parent probe (see the doc above and the inner match) so
+  // a broken-symlink `1_Pooling` (whose child lstats as `NotFound` even
+  // though the parent entry exists) is NOT collapsed into the "absent ⇒
+  // None" case. Any other stat failure (EACCES on the parent directory,
+  // EIO, …) surfaces as a typed `Error::FileIo` carrying the REAL
+  // `std::io::Error` from `symlink_metadata` — NOT a synthetic `NotFound`
+  // we would have to fabricate via `Path::exists()` — so a callsite that
+  // wants to distinguish dangling-symlink from permission-denied can do so
+  // via `payload.inner().kind()` without a string parse.
+  let pooling_dir = dir.join("1_Pooling");
+  let config_path = pooling_dir.join("config.json");
   match config_path.symlink_metadata() {
     Ok(_) => crate::embeddings::config::pooling_from_st_config_path(dir).map(Some),
-    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-    Err(e) => Err(Error::Backend(format!(
-      "embeddings load: pooling config at {} is present but unreadable: {e}",
-      config_path.display()
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+      // The CHILD lstat returned `NotFound` — this is ambiguous: the parent
+      // `1_Pooling` may be genuinely absent (the common case ⇒ `Ok(None)`),
+      // OR it may be PRESENT-BUT-BROKEN: a dangling symlink whose target
+      // directory does not exist. In the broken-symlink case, an `lstat` on
+      // any child path under it returns `NotFound` from the kernel because
+      // the parent component cannot be resolved — even though `1_Pooling`
+      // itself exists as a directory entry — and a naïve "child NotFound ⇒
+      // absent ⇒ None" silently degrades to default pooling. Disambiguate
+      // with a SECOND `lstat` on the parent itself:
+      //
+      //   - parent `Err(NotFound)` ⇒ parent genuinely absent ⇒ `Ok(None)`.
+      //   - parent `Ok` as a real directory ⇒ a real directory with no
+      //     `config.json` inside ⇒ `Ok(None)` (the common case for a plain
+      //     encoder that happens to ship an empty `1_Pooling/`).
+      //   - parent `Ok` as a SYMLINK ⇒ probe the followed target via
+      //     `metadata` (follows links): if the target resolves to a real
+      //     directory we treat the missing child as the empty-pooling case
+      //     (`Ok(None)`); if the target fails to resolve (NotFound or any
+      //     other I/O error) we fail closed with a typed `Error::FileIo`
+      //     naming the broken parent path.
+      //   - any other parent `Err` (permission-denied, …) ⇒ fail closed.
+      match pooling_dir.symlink_metadata() {
+        Err(parent_e) if parent_e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(parent_e) => Err(Error::FileIo(FileIoPayload::new(
+          "embeddings load: pooling parent directory presence probe failed",
+          FileOp::Stat,
+          pooling_dir,
+          parent_e,
+        ))),
+        Ok(parent_meta) if parent_meta.file_type().is_symlink() => {
+          match std::fs::metadata(&pooling_dir) {
+            Ok(target_meta) if target_meta.is_dir() => Ok(None),
+            Ok(_) => Err(Error::FileIo(FileIoPayload::new(
+              "embeddings load: 1_Pooling symlink target is not a directory",
+              FileOp::Stat,
+              pooling_dir,
+              std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "1_Pooling symlink target is not a directory",
+              ),
+            ))),
+            Err(target_e) => Err(Error::FileIo(FileIoPayload::new(
+              "embeddings load: 1_Pooling symlink target unresolvable",
+              FileOp::Stat,
+              pooling_dir,
+              target_e,
+            ))),
+          }
+        }
+        Ok(_) => Ok(None),
+      }
+    }
+    Err(e) => Err(Error::FileIo(FileIoPayload::new(
+      "embeddings load: pooling config presence probe failed",
+      FileOp::Stat,
+      config_path,
+      e,
     ))),
   }
 }
@@ -704,10 +831,20 @@ fn load_weights(dir: &Path) -> Result<EmbeddingWeights> {
   }
 
   if shards.is_empty() {
-    return Err(Error::Backend(format!(
-      "no model weights found in {}: expected `model*.safetensors` (recursively, or legacy \
-         root-level `weight*.safetensors`)",
-      dir.display()
+    // The missing-weights case is a present model directory whose shard
+    // discovery yielded zero matches in both passes. Surface as a typed
+    // `Error::FileIo` carrying the resolved directory path + a synthetic
+    // `NotFound` inner error so the caller can route on the file-op /
+    // path without parsing strings.
+    return Err(Error::FileIo(FileIoPayload::new(
+      "embeddings::load_weights: no model weights found (expected `model*.safetensors` \
+       recursively, or legacy root-level `weight*.safetensors`)",
+      FileOp::Other("weight_shard_discovery"),
+      dir.to_path_buf(),
+      std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no shards matched `model*.safetensors` or legacy `weight*.safetensors`",
+      ),
     )));
   }
 
@@ -943,15 +1080,18 @@ fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<Discovere
   // recursively scanning the filesystem root `/` (suppressing permission
   // errors per-entry) and could merge unrelated `safetensors` from outside the
   // intended directory. An empty `dir` is a bug, not a request to scan `/`.
-  reject_empty_dir(dir, "model")?;
+  reject_empty_dir(dir, EmptyDirRole::Model)?;
 
   // `glob_with` takes a `&str` and `unwrap()`s `to_str()` internally — reject a
   // non-UTF-8 model dir path here so that becomes a recoverable error, not a
   // panic inside the crate.
   let dir_str = dir.to_str().ok_or_else(|| {
-    Error::Backend(format!(
-      "model directory path {} is not valid UTF-8; cannot glob for weight shards",
-      dir.display()
+    Error::FileIo(FileIoPayload::new(
+      "embeddings::collect_glob_shards: model directory path is not valid UTF-8 \
+       (cannot glob for weight shards)",
+      FileOp::Other("weight_shard_discovery"),
+      dir.to_path_buf(),
+      std::io::Error::new(std::io::ErrorKind::InvalidData, "path is not valid UTF-8"),
     ))
   })?;
 
@@ -1001,8 +1141,10 @@ fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<Discovere
   };
 
   let matches = glob_with(&pattern, options).map_err(|e| {
-    Error::Backend(format!(
-      "internal error building weight-shard glob pattern {pattern:?}: {e}"
+    Error::Parse(ParsePayload::new(
+      "embeddings::collect_glob_shards: internal error building weight-shard glob pattern",
+      "glob pattern",
+      e,
     ))
   })?;
 
@@ -1035,16 +1177,32 @@ fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<Discovere
     match std::fs::metadata(&path) {
       Ok(m) if m.is_file() => {}
       Ok(_) => {
-        return Err(Error::Backend(format!(
-          "weight shard {} is a non-regular entry (directory / FIFO / device / socket); \
-             refusing to load",
-          path.display()
+        // Non-regular entry. std::fs has no io::Error for "wrong file type"
+        // so synthesize an `InvalidInput` inner error while preserving the
+        // real path + FileOp::Stat (the stat that classified it is the
+        // Stat observation).
+        return Err(Error::FileIo(FileIoPayload::new(
+          "embeddings::collect_glob_shards: weight shard is a non-regular entry \
+           (directory / FIFO / device / socket); refusing to load",
+          FileOp::Stat,
+          path,
+          std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file (directory / FIFO / device / socket)",
+          ),
         )));
       }
       Err(e) => {
-        return Err(Error::Backend(format!(
-          "weight shard {} cannot be resolved (broken symlink / unreadable target): {e}",
-          path.display()
+        // Metadata-failure path: surface the REAL `std::io::Error` from
+        // `std::fs::metadata` (broken symlink → NotFound, EACCES, EIO, …),
+        // NOT a synthesized message — so callsites can route on
+        // `payload.inner().kind()` without a string parse.
+        return Err(Error::FileIo(FileIoPayload::new(
+          "embeddings::collect_glob_shards: weight shard cannot be resolved \
+           (broken symlink / unreadable target)",
+          FileOp::Stat,
+          path,
+          e,
         )));
       }
     }
@@ -1071,10 +1229,15 @@ fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<Discovere
     // which would silently mis-merge its keys verbatim (and collide with a real
     // root shard). Fail loudly with a path-naming `Error::Backend` instead.
     let relative = path.strip_prefix(&glob_root).map_err(|_| {
-      Error::Backend(format!(
-        "weight shard {} is not under the model directory {}; cannot derive the key prefix",
-        path.display(),
-        glob_root.display()
+      Error::FileIo(FileIoPayload::new(
+        "embeddings::collect_glob_shards: weight shard is not under the model directory \
+         (cannot derive the key prefix)",
+        FileOp::Other("weight_shard_discovery"),
+        path.clone(),
+        std::io::Error::new(
+          std::io::ErrorKind::InvalidInput,
+          "shard path is not under the model directory",
+        ),
       ))
     })?;
     // `Path::components()` already collapses any interior `.` segment, so only
@@ -1091,10 +1254,15 @@ fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<Discovere
       // immediate parent folder name (the component just before the file name).
       Some((_file_name, [.., immediate_parent])) => {
         let folder = immediate_parent.to_str().ok_or_else(|| {
-          Error::Backend(format!(
-            "weight shard {} has a non-UTF-8 parent directory name; cannot derive the key \
-             prefix",
-            path.display()
+          Error::FileIo(FileIoPayload::new(
+            "embeddings::collect_glob_shards: weight shard has a non-UTF-8 parent directory \
+             name (cannot derive the key prefix)",
+            FileOp::Other("weight_shard_discovery"),
+            path.clone(),
+            std::io::Error::new(
+              std::io::ErrorKind::InvalidData,
+              "shard's immediate parent directory name is not valid UTF-8",
+            ),
           ))
         })?;
         Some(folder.to_owned())
@@ -1236,13 +1404,16 @@ fn scan_non_utf8_shards(dir: &Path, pattern_suffix: &str) -> Result<()> {
     // `glob` leaves open — fail loudly, naming the path (lossy display).
     if name.to_str().is_none() && name_bytes_match(&name, prefix, suffix) {
       let path = entry.path();
-      return Err(Error::Backend(format!(
-        "weight shard {} has a non-UTF-8 file name matching the `{}*{}` shard pattern; \
-           `glob` silently skips it (glob 0.3.3 leaf match drops non-UTF-8 names), which would \
-           let the load fall back to stale weights — refusing to load",
-        path.display(),
-        String::from_utf8_lossy(prefix),
-        String::from_utf8_lossy(suffix),
+      return Err(Error::FileIo(FileIoPayload::new(
+        "embeddings::scan_non_utf8_shards: weight shard has a non-UTF-8 file name matching \
+         the shard pattern; `glob` silently skips it (glob 0.3.3 leaf match drops non-UTF-8 \
+         names), which would let the load fall back to stale weights — refusing to load",
+        FileOp::Other("weight_shard_discovery"),
+        path,
+        std::io::Error::new(
+          std::io::ErrorKind::InvalidData,
+          "shard leaf file name is not valid UTF-8",
+        ),
       )));
     }
 
@@ -1332,9 +1503,14 @@ fn read_model_type(dir: &Path) -> Result<(String, String)> {
     ))
   })?;
   if !meta.is_file() {
-    return Err(Error::Backend(format!(
-      "model config {} is not a regular file; refusing to read",
-      path.display()
+    return Err(Error::FileIo(FileIoPayload::new(
+      "embeddings::read_model_type: opened model config handle is not a regular file",
+      FileOp::Stat,
+      path,
+      std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "not a regular file (FIFO/device/directory/symlink-to-special)",
+      ),
     )));
   }
 
@@ -1351,28 +1527,31 @@ fn read_model_type(dir: &Path) -> Result<(String, String)> {
       ))
     })?;
   if bytes.len() as u64 > MAX_CONFIG_BYTES {
-    return Err(Error::Backend(format!(
-      "model config {} exceeds the {}-byte cap; refusing to read",
-      path.display(),
-      MAX_CONFIG_BYTES
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "embeddings::read_model_type",
+      "MAX_CONFIG_BYTES",
+      MAX_CONFIG_BYTES,
+      bytes.len() as u64,
     )));
   }
 
   let text = String::from_utf8(bytes).map_err(|e| {
-    Error::Backend(format!(
-      "model config {} is not valid UTF-8: {e}",
-      path.display()
+    Error::Parse(ParsePayload::new(
+      "embeddings::read_model_type: model config is not valid UTF-8",
+      "config.json",
+      e.utf8_error(),
     ))
   })?;
 
-  let raw = extract_string_field(&text, "model_type")
-    .map_err(|e| Error::Backend(format!("invalid model config {}: {e}", path.display())))?;
-  let model_type = raw.ok_or_else(|| {
-    Error::Backend(format!(
-      "model config {} has no string `model_type` field (required to pick an architecture)",
-      path.display()
+  let raw = extract_string_field(&text, "model_type").map_err(|e| {
+    Error::Parse(ParsePayload::new(
+      "embeddings::read_model_type: invalid model config",
+      "config.json",
+      std::io::Error::other(e),
     ))
   })?;
+  let model_type = raw
+    .ok_or_else(|| Error::MissingField(MissingFieldPayload::new("config.json", "model_type")))?;
 
   Ok((remap_model_type(&model_type), text))
 }
@@ -1881,9 +2060,12 @@ mod tests {
     fn forward(&self, input_ids: &Array, _attention_mask: &Array) -> Result<EmbeddingModelOutput> {
       let (batch, seq) = match input_ids.shape().as_slice() {
         [b, s] => (*b, *s),
-        other => {
-          return Err(Error::ShapeMismatch(format!(
-            "MockLoadedEmbedding::forward expects (batch, seq), got {other:?}"
+        _ => {
+          let shape = input_ids.shape();
+          return Err(Error::RankMismatch(RankMismatchPayload::new(
+            "MockLoadedEmbedding::forward expects rank-2 (batch, seq) ids",
+            shape.len() as u32,
+            shape,
           )));
         }
       };
@@ -2135,8 +2317,8 @@ mod tests {
         panic!("an empty model directory path must be a recoverable error, not a load");
       };
       assert!(
-        matches!(err, Error::Backend(_)),
-        "expected a recoverable Backend error; got {err:?}"
+        matches!(err, Error::EmptyInput(_)),
+        "expected EmptyInput error; got {err:?}"
       );
       let msg = err.to_string();
       assert!(
@@ -2171,8 +2353,8 @@ mod tests {
       panic!("an empty tokenizer_source path must be a recoverable error");
     };
     assert!(
-      matches!(err, Error::Backend(_)),
-      "expected a recoverable Backend error; got {err:?}"
+      matches!(err, Error::EmptyInput(_)),
+      "expected EmptyInput error; got {err:?}"
     );
     let msg = err.to_string();
     assert!(
@@ -2192,8 +2374,8 @@ mod tests {
         panic!("collect_glob_shards must reject an empty dir, not scan the filesystem root");
       };
       assert!(
-        matches!(err, Error::Backend(_)),
-        "expected a recoverable Backend error; got {err:?}"
+        matches!(err, Error::EmptyInput(_)),
+        "expected EmptyInput error; got {err:?}"
       );
       assert!(
         err
@@ -2853,8 +3035,8 @@ mod tests {
     // A recoverable discovery error — must mention the broken shard, NOT be a
     // success that loaded `stale.weight`.
     assert!(
-      matches!(err, Error::Backend(_)),
-      "expected a recoverable Backend error; got {err:?}"
+      matches!(err, Error::FileIo(_)),
+      "expected FileIo error; got {err:?}"
     );
     let msg = err.to_string();
     assert!(
@@ -2885,8 +3067,8 @@ mod tests {
       );
     };
     assert!(
-      matches!(err, Error::Backend(_)),
-      "expected a recoverable Backend error; got {err:?}"
+      matches!(err, Error::FileIo(_)),
+      "expected FileIo error; got {err:?}"
     );
     let msg = err.to_string();
     assert!(
@@ -2914,8 +3096,8 @@ mod tests {
       panic!("a `model.safetensors` symlink-to-directory must fail the load");
     };
     assert!(
-      matches!(err, Error::Backend(_)),
-      "expected a recoverable Backend error; got {err:?}"
+      matches!(err, Error::FileIo(_)),
+      "expected FileIo error; got {err:?}"
     );
     let msg = err.to_string();
     assert!(
@@ -3054,8 +3236,8 @@ mod tests {
       panic!("a non-UTF-8 model dir path must be a recoverable error, not a panic");
     };
     assert!(
-      matches!(err, Error::Backend(_)),
-      "expected a recoverable Backend error; got {err:?}"
+      matches!(err, Error::FileIo(_)),
+      "expected FileIo error; got {err:?}"
     );
     assert!(
       err.to_string().contains("not valid UTF-8"),
@@ -3155,20 +3337,43 @@ mod tests {
          silent root-merge or a panic"
       );
     };
-    assert!(
-      matches!(err, Error::Backend(_)),
-      "expected a recoverable Backend error; got {err:?}"
+    // Strict typed FileIo destructure. The non-UTF-8 parent-directory
+    // rejection MUST surface as Error::FileIo with FileOp::Other
+    // ("weight_shard_discovery"), inner io::Error kind == InvalidData
+    // (UTF-8 conversion failure), and path == the offending shard.
+    let Error::FileIo(payload) = &err else {
+      panic!("expected Error::FileIo; got {err:?}");
+    };
+    assert_eq!(
+      payload.op(),
+      FileOp::Other("weight_shard_discovery"),
+      "non-UTF-8 parent rejection MUST surface as FileOp::Other(\"weight_shard_discovery\"); \
+       got {:?}",
+      payload.op()
+    );
+    assert_eq!(
+      payload.inner().kind(),
+      std::io::ErrorKind::InvalidData,
+      "non-UTF-8 parent rejection MUST carry io::ErrorKind::InvalidData; got {:?}",
+      payload.inner().kind()
     );
     let msg = err.to_string();
     assert!(
       msg.contains("non-UTF-8 parent directory name"),
       "the error should explain the non-UTF-8 parent rejection; got: {msg}"
     );
-    // The error must name the offending shard path: its UTF-8 prefix is the
-    // model directory, which is present in the path `Display`.
+    // The error path must be the offending nested shard (an ASCII-named
+    // model.safetensors under the bad-byte directory) — assert it sits
+    // inside the model dir AND ends with the shard file name.
     assert!(
-      msg.contains(&dir.display().to_string()),
-      "the error should name the offending shard path; got: {msg}"
+      payload.path().starts_with(&dir),
+      "the error path must sit under the model directory; got {}",
+      payload.path().display()
+    );
+    assert!(
+      payload.path().ends_with("model.safetensors"),
+      "the error path must end with the shard file name; got {}",
+      payload.path().display()
     );
   }
 
