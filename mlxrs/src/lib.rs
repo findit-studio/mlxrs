@@ -34,6 +34,7 @@ pub mod device;
 pub mod diagnostics;
 pub mod dtype;
 pub mod error;
+pub mod ffi;
 /// Model IO — safetensors + GGUF load/save (local files only).
 pub mod io;
 pub mod memory;

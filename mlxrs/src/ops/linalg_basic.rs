@@ -4,31 +4,9 @@
 use crate::{
   array::Array,
   error::{Result, check},
+  ffi::opt_array,
   stream::default_stream,
 };
-
-/// Raw handle for an `Option<&Array>`: the inner handle when `Some`, or a fresh
-/// NULL-ctx `mlx_array` when `None`. The returned guard owns the placeholder so
-/// its `Drop` frees it; keep it alive across the FFI call. Mirrors
-/// `ops::quantized::opt_array` (kept local rather than shared because the two
-/// callers are independent and the helper is trivially small; lifting it to a
-/// shared module is a separate refactor).
-#[inline(always)]
-fn opt_array(a: Option<&Array>) -> (mlxrs_sys::mlx_array, Option<Array>) {
-  match a {
-    Some(arr) => (arr.0, None),
-    None => {
-      // SAFETY: `mlx_array_new()` returns a fresh empty handle (NULL ctx) per the
-      // mlx-c convention; it is wrapped in the RAII newtype FIRST so an early
-      // return / panic frees it. It is not an out-param here: the NULL-ctx
-      // placeholder is what mlx-c's "may be null" parameters accept for an
-      // absent optional input, and the returned guard keeps it alive across
-      // the FFI call.
-      let placeholder = Array(unsafe { mlxrs_sys::mlx_array_new() });
-      (placeholder.0, Some(placeholder))
-    }
-  }
-}
 
 /// `alpha * (a @ b) + beta * c` — fused matmul + scaled add.
 ///

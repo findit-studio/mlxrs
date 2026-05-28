@@ -30,6 +30,7 @@ use crate::{
   array::Array,
   dtype::Dtype,
   error::{Error, InteriorNulPayload, LengthMismatchPayload, Result, check},
+  ffi::{VectorArrayGuard, drain_vector, opt_array},
   stream::default_stream,
 };
 
@@ -40,26 +41,6 @@ fn opt_int(v: i32) -> mlxrs_sys::mlx_optional_int {
   mlxrs_sys::mlx_optional_int {
     value: v,
     has_value: true,
-  }
-}
-
-/// Raw handle for an `Option<&Array>`: the inner handle when `Some`, or a
-/// fresh NULL-ctx `mlx_array` when `None`. The returned guard owns the
-/// placeholder so its `Drop` frees it; keep it alive across the FFI call.
-#[inline(always)]
-fn opt_array(a: Option<&Array>) -> (mlxrs_sys::mlx_array, Option<Array>) {
-  match a {
-    Some(arr) => (arr.0, None),
-    None => {
-      // SAFETY: `mlx_array_new()` returns a fresh empty handle (NULL ctx) per the
-      // mlx-c convention; it is wrapped in the RAII newtype FIRST so an early
-      // return / panic frees it. It is not an out-param here: the NULL-ctx
-      // placeholder is what mlx-c's "may be null" parameters accept for an
-      // absent optional input, and the returned guard keeps it alive across
-      // the FFI call.
-      let placeholder = Array(unsafe { mlxrs_sys::mlx_array_new() });
-      (placeholder.0, Some(placeholder))
-    }
   }
 }
 
@@ -75,40 +56,6 @@ fn mode_cstring(mode: &str) -> Result<CString> {
       "mode",
     ))
   })
-}
-
-/// Drain an `mlx_vector_array` into a `Vec<Array>`, copying out each handle.
-fn drain_vector(vec: mlxrs_sys::mlx_vector_array) -> Result<Vec<Array>> {
-  // SAFETY: pure read of a valid populated `mlx_vector_array`; mlx-c does not
-  // mutate or retain it and returns a plain length.
-  let n = unsafe { mlxrs_sys::mlx_vector_array_size(vec) };
-  let mut parts = Vec::with_capacity(n);
-  for i in 0..n {
-    // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
-    // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
-    // early return / panic frees it, then populated by the following call.
-    let mut part = Array(unsafe { mlxrs_sys::mlx_array_new() });
-    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
-    // not retained by mlx past it); the out-param was freshly allocated above
-    // and is written by this call; the backend rc is surfaced via `check()`.
-    check(unsafe { mlxrs_sys::mlx_vector_array_get(&mut part.0, vec, i) })?;
-    parts.push(part);
-  }
-  Ok(parts)
-}
-
-/// RAII guard for a temporary `mlx_vector_array`.
-struct VectorArrayGuard(mlxrs_sys::mlx_vector_array);
-impl Drop for VectorArrayGuard {
-  fn drop(&mut self) {
-    // SAFETY: frees a handle this guard owns exactly once. Runs during `Drop` /
-    // thread teardown: must not touch TLS, call `check()`, panic, or unwind
-    // across `extern "C"`; the rc is discarded silently per the crate's
-    // Drop convention.
-    unsafe {
-      let _ = mlxrs_sys::mlx_vector_array_free(self.0);
-    }
-  }
 }
 
 /// Quantize the matrix `w` using `bits`-bit grouped quantization over groups

@@ -1813,7 +1813,7 @@ pub fn istft(spectrum: &Spectrum, length: Option<usize>) -> Result<Array> {
            in the overlap-add and is not recoverable; \
            the requested region (e.g. center=false head/tail) includes a zero-coverage sample — \
            adjust length/center or the window)",
-        "must be > COVERAGE_EPS (1e-11) and finite",
+        "must be > COVERAGE_EPS (1e-10) and finite",
         format_smolstr!(
           "global_idx={global_idx}, local_idx={local_idx}, min_wsum={min_wsum:.3e}, \
            n_fft={n_fft}, win_length={win_length}, hop={hop_length}, window_pad={window_pad:?}"
@@ -2286,7 +2286,7 @@ impl ISTFTCache {
              in the overlap-add and is not recoverable; \
              the requested region (e.g. center=false head/tail) includes a zero-coverage sample — \
              adjust length/center or the window)",
-          "must be > COVERAGE_EPS (1e-11) and finite",
+          "must be > COVERAGE_EPS (1e-10) and finite",
           format_smolstr!(
             "global_idx={global_idx}, local_idx={local_idx}, min_wsum={min_wsum:.3e}, \
              n_fft={n_fft}, win_length={win_length}, hop={hop_length}, window_pad={window_pad:?}"

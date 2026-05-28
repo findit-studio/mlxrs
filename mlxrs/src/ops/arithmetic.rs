@@ -21,6 +21,7 @@ use std::ffi::c_int;
 use crate::{
   array::Array,
   error::{Error, LengthMismatchPayload, Result, check},
+  ffi::VectorArrayGuard,
   stream::default_stream,
 };
 
@@ -898,18 +899,4 @@ pub fn right_shift(a: &Array, b: &Array) -> Result<Array> {
   // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe { mlxrs_sys::mlx_right_shift(&mut out.0, a.0, b.0, default_stream()) })?;
   Ok(out)
-}
-
-/// RAII guard for a temporary `mlx_vector_array` (used by `divmod`'s 2-output return).
-struct VectorArrayGuard(mlxrs_sys::mlx_vector_array);
-impl Drop for VectorArrayGuard {
-  fn drop(&mut self) {
-    // SAFETY: frees a handle this guard owns exactly once. Runs during `Drop` /
-    // thread teardown: must not touch TLS, call `check()`, panic, or unwind
-    // across `extern "C"`; the rc is discarded silently per the crate's
-    // Drop convention.
-    unsafe {
-      let _ = mlxrs_sys::mlx_vector_array_free(self.0);
-    }
-  }
 }

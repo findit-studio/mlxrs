@@ -313,24 +313,13 @@ extern "C" fn destroy_payload(payload: *mut c_void) {
 
 // ─────────────────────── vector_array marshalling ───────────────────────
 
-/// Build a `Vec<Array>` from an mlx-c `mlx_vector_array` by copying out each
-/// handle (refcount bump on each via `mlx_array_set`).
-pub(crate) fn drain_vector(vec: mlxrs_sys::mlx_vector_array) -> Result<Vec<Array>> {
-  // SAFETY: pure read of a valid populated `mlx_vector_array`; mlx-c does not
-  // mutate or retain it and returns a plain length.
-  let n = unsafe { mlxrs_sys::mlx_vector_array_size(vec) };
-  let mut parts = Vec::with_capacity(n);
-  for i in 0..n {
-    // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL
-    // ctx); wrapping in `Array` first ensures `Drop` reclaims on early return.
-    let mut part = Array(unsafe { mlxrs_sys::mlx_array_new() });
-    // SAFETY: valid `vec` handle; `part.0` is the freshly-allocated out-param
-    // populated by this call. rc surfaced via `check()`.
-    crate::error::check(unsafe { mlxrs_sys::mlx_vector_array_get(&mut part.0, vec, i) })?;
-    parts.push(part);
-  }
-  Ok(parts)
-}
+/// Re-export of the shared FFI helpers (`crate::ffi`). `VectorArrayGuard`
+/// (RAII free) and `drain_vector` (pure read) were previously defined
+/// locally here and re-used by sibling transforms (`autograd`, `custom`,
+/// `checkpoint`) via `transforms::closure::{...}`; they now live in the
+/// shared module (audit issue #259) but stay reachable on this path so
+/// those consumers — and `borrow_inputs` below — are unaffected.
+pub(crate) use crate::ffi::{VectorArrayGuard, drain_vector};
 
 /// Borrow the input handles of a `mlx_vector_array` as a `Vec<Array>` of
 /// fresh refcount-shared copies. Same effect as [`drain_vector`] but used
@@ -369,27 +358,6 @@ fn write_outputs(out: *mut mlxrs_sys::mlx_vector_array, outputs: &[Array]) -> Re
 }
 
 // ─────────────────────── caller-side helpers ───────────────────────
-
-/// RAII guard for a temporary `mlx_vector_array`. Constructed *before* the
-/// populating call so an early return / panic still frees it.
-pub(crate) struct VectorArrayGuard(pub(crate) mlxrs_sys::mlx_vector_array);
-impl VectorArrayGuard {
-  /// Borrow the raw handle for a transient FFI call. Must not outlive `self`.
-  #[allow(dead_code)]
-  #[inline(always)]
-  pub(crate) const fn as_raw(&self) -> mlxrs_sys::mlx_vector_array {
-    self.0
-  }
-}
-impl Drop for VectorArrayGuard {
-  fn drop(&mut self) {
-    // SAFETY: frees a handle this guard owns exactly once. Same `Drop`
-    // discipline as elsewhere — discard rc silently.
-    unsafe {
-      let _ = mlxrs_sys::mlx_vector_array_free(self.0);
-    }
-  }
-}
 
 /// Pack a `&[Array]` (or `&[&Array]` via iterator) into a fresh
 /// `mlx_vector_array`. Returns the handle wrapped in a guard for RAII free.
