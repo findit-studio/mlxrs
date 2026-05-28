@@ -149,8 +149,7 @@ fn eigh_of_diagonal_matrix_yields_diagonal_eigenvalues() {
   // diag(1, 2, 3) — eigh should produce eigenvalues sorted ascending: [1, 2, 3].
   let data = [1.0_f32, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0];
   let a = Array::from_slice::<f32>(&data, &(3, 3)).unwrap();
-  let uplo = CString::new("L").unwrap();
-  let (mut vals, vecs) = linalg_full::eigh(&a, &uplo).unwrap();
+  let (mut vals, vecs) = linalg_full::eigh(&a, linalg_full::Uplo::Lower).unwrap();
   assert_eq!(vals.shape(), vec![3]);
   assert_eq!(vecs.shape(), vec![3, 3]);
   let mut v = vals.to_vec::<f32>().unwrap();
@@ -162,8 +161,7 @@ fn eigh_of_diagonal_matrix_yields_diagonal_eigenvalues() {
 fn eigvalsh_of_diagonal_matrix_yields_diagonal() {
   let data = [1.0_f32, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0];
   let a = Array::from_slice::<f32>(&data, &(3, 3)).unwrap();
-  let uplo = CString::new("L").unwrap();
-  let mut vals = linalg_full::eigvalsh(&a, &uplo).unwrap();
+  let mut vals = linalg_full::eigvalsh(&a, linalg_full::Uplo::Lower).unwrap();
   assert_eq!(vals.shape(), vec![3]);
   let mut v = vals.to_vec::<f32>().unwrap();
   v.sort_by(|a, b| a.partial_cmp(b).unwrap());

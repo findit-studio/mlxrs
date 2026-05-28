@@ -8,6 +8,7 @@ use std::ffi::c_int;
 use crate::{
   array::Array,
   error::{Error, LengthMismatchPayload, MultiLengthMismatchPayload, Result, check},
+  ffi::VectorArrayGuard,
   shape::{IntoShape, dim_ptr, stride_ptr, validate_dims},
   stream::default_stream,
 };
@@ -519,18 +520,4 @@ pub unsafe fn as_strided(
     })?;
     Ok(out)
   })
-}
-
-/// RAII guard for a temporary `mlx_vector_array`.
-struct VectorArrayGuard(mlxrs_sys::mlx_vector_array);
-impl Drop for VectorArrayGuard {
-  fn drop(&mut self) {
-    // SAFETY: frees a handle this guard owns exactly once. Runs during `Drop` /
-    // thread teardown: must not touch TLS, call `check()`, panic, or unwind
-    // across `extern "C"`; the rc is discarded silently per the crate's
-    // Drop convention.
-    unsafe {
-      let _ = mlxrs_sys::mlx_vector_array_free(self.0);
-    }
-  }
 }

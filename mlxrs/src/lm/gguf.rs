@@ -1076,29 +1076,22 @@ pub fn convert_to_gguf(args: &ConvertToGgufArgs) -> Result<()> {
   //       contract (a bad tokenizer cannot OOM us on the weight read).
   let tokenizer = crate::lm::load::load_tokenizer(&args.model_path, &config)?;
 
+  //   2d. Attention head counts. `num_attention_heads` /
+  //       `num_key_value_heads` are required typed `i32` fields on
+  //       [`Config`] — `load_config` (step 1) already rejects a config
+  //       whose head counts are missing or non-integer, so they are read
+  //       straight off the typed config here (no second `raw_config`
+  //       parse, and resolved BEFORE the multi-GB weight load). They feed
+  //       the Q/K permute in step 4.
+  let num_attention_heads = config.num_attention_heads;
+  let num_key_value_heads = config.num_key_value_heads;
+
   // 3. NOW load the multi-GB weights — only after every fail-fast
   //    validation in (2) has passed (including the tokenizer parse in
   //    2c), so an unsupported / malformed checkpoint never pays the
   //    weight-load cost. The tokenizer resolved above is re-used for
   //    the `HfVocab` builder; no second load.
   let weights = crate::lm::load::load_weights(&args.model_path)?;
-
-  // `raw_config` was parsed above (step 2b) before the weight load so the
-  // quantized-config gate could inspect `quantization_config`; it carries
-  // through to the head-count + rope-scaling reads below.
-  let num_attention_heads = raw_config
-    .get("num_attention_heads")
-    .and_then(|v| v.as_i64())
-    .and_then(|n| i32::try_from(n).ok())
-    .ok_or_else(|| {
-      // TODO(§5): promote to MissingField — currently "missing or invalid" conflates two failure modes; split into MissingField + a separate InvalidValue variant.
-      Error::Backend("convert_to_gguf: config.json missing or invalid `num_attention_heads`".into())
-    })?;
-  let num_key_value_heads = raw_config
-    .get("num_key_value_heads")
-    .and_then(|v| v.as_i64())
-    .and_then(|n| i32::try_from(n).ok())
-    .unwrap_or(num_attention_heads);
 
   // 4. Permute Q / K attention weights. The reference uses
   //    `n_head_kv = num_attention_heads` for Q and `num_key_value_heads`

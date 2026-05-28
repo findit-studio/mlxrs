@@ -29,6 +29,7 @@ use crate::{
     EmptyInputPayload, Error, InteriorNulPayload, LengthMismatchPayload, OutOfRangePayload, Result,
     check, check_vector_array_handle,
   },
+  ffi::VectorArrayGuard,
   stream::default_stream,
 };
 
@@ -256,20 +257,6 @@ impl Drop for VectorStringGuard {
     // silently per the crate's Drop convention.
     unsafe {
       let _ = mlxrs_sys::mlx_vector_string_free(self.0);
-    }
-  }
-}
-
-/// RAII guard for a temporary `mlx_vector_array`. Same Drop contract as
-/// [`VectorStringGuard`] — NULL-ctx-safe, never touches TLS, never panics.
-struct VectorArrayGuard(mlxrs_sys::mlx_vector_array);
-impl Drop for VectorArrayGuard {
-  fn drop(&mut self) {
-    // SAFETY: frees a handle this guard owns exactly once. `_free` is a
-    // defined no-op on NULL ctx (sentinel-handle pattern). Runs during
-    // `Drop` / thread teardown: discard rc silently.
-    unsafe {
-      let _ = mlxrs_sys::mlx_vector_array_free(self.0);
     }
   }
 }

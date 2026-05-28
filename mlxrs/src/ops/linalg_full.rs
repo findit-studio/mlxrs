@@ -27,6 +27,7 @@ use std::{
 use crate::{
   array::Array,
   error::{Result, check, check_vector_array_handle},
+  ffi::{VectorArrayGuard, drain_vector},
   shape::dim_ptr,
   stream::default_stream,
 };
@@ -299,12 +300,44 @@ pub fn eig(a: &Array) -> Result<(Array, Array)> {
   Ok((vals, vecs))
 }
 
+/// Triangle selection for symmetric / Hermitian decompositions (`eigh`,
+/// `eigvalsh`). Maps to mlx-c's `const char* UPLO` parameter as either
+/// `"U"` or `"L"`. The Rust enum is the idiomatic surface; upstream
+/// mlx-swift / mlx-python use `String = "L"`, which would force callers
+/// to construct a `CStr` in Rust — the enum closes that ergonomics gap
+/// (audit issue #259).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Uplo {
+  /// Upper triangle of the matrix is used.
+  Upper,
+  /// Lower triangle of the matrix is used. This is the upstream default.
+  Lower,
+}
+
+impl Uplo {
+  /// The `CStr` form mlx-c expects.
+  #[inline(always)]
+  pub const fn as_cstr(self) -> &'static std::ffi::CStr {
+    match self {
+      Uplo::Upper => c"U",
+      Uplo::Lower => c"L",
+    }
+  }
+}
+
+impl Default for Uplo {
+  /// Matches the upstream default (`UPLO = "L"`).
+  fn default() -> Self {
+    Uplo::Lower
+  }
+}
+
 /// Eigendecomposition of a symmetric / Hermitian matrix.
-/// Returns `(eigenvalues, eigenvectors)`. `uplo` is `b"L\0"` or `b"U\0"`
-/// indicating which triangle to use.
+/// Returns `(eigenvalues, eigenvectors)`. `uplo` is [`Uplo::Lower`] or
+/// [`Uplo::Upper`] (default [`Uplo::Lower`] matches upstream).
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.eigh.html).
-pub fn eigh(a: &Array, uplo: &CStr) -> Result<(Array, Array)> {
+pub fn eigh(a: &Array, uplo: Uplo) -> Result<(Array, Array)> {
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
   // early return / panic frees it, then populated by the following call.
@@ -321,7 +354,7 @@ pub fn eigh(a: &Array, uplo: &CStr) -> Result<(Array, Array)> {
       &mut vals.0,
       &mut vecs.0,
       a.0,
-      uplo.as_ptr(),
+      uplo.as_cstr().as_ptr(),
       linalg_cpu_stream(),
     )
   })?;
@@ -343,10 +376,12 @@ pub fn eigvals(a: &Array) -> Result<Array> {
   Ok(out)
 }
 
-/// Eigenvalues only of a symmetric / Hermitian matrix.
+/// Eigenvalues only of a symmetric / Hermitian matrix. `uplo` is
+/// [`Uplo::Lower`] or [`Uplo::Upper`] (default [`Uplo::Lower`] matches
+/// upstream).
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.eigvalsh.html).
-pub fn eigvalsh(a: &Array, uplo: &CStr) -> Result<Array> {
+pub fn eigvalsh(a: &Array, uplo: Uplo) -> Result<Array> {
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
   // early return / panic frees it, then populated by the following call.
@@ -355,7 +390,12 @@ pub fn eigvalsh(a: &Array, uplo: &CStr) -> Result<Array> {
   // not retained by mlx past it); the out-param was freshly allocated above
   // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
-    mlxrs_sys::mlx_linalg_eigvalsh(&mut out.0, a.0, uplo.as_ptr(), linalg_cpu_stream())
+    mlxrs_sys::mlx_linalg_eigvalsh(
+      &mut out.0,
+      a.0,
+      uplo.as_cstr().as_ptr(),
+      linalg_cpu_stream(),
+    )
   })?;
   Ok(out)
 }
@@ -455,40 +495,4 @@ pub fn cross(a: &Array, b: &Array, axis: i32) -> Result<Array> {
     mlxrs_sys::mlx_linalg_cross(&mut out.0, a.0, b.0, axis as c_int, default_stream())
   })?;
   Ok(out)
-}
-
-// ─────────────────────────── helpers ───────────────────────────
-
-/// Drain an `mlx_vector_array` into a `Vec<Array>`, copying out each handle.
-fn drain_vector(vec: mlxrs_sys::mlx_vector_array) -> Result<Vec<Array>> {
-  // SAFETY: pure read of a valid populated `mlx_vector_array`; mlx-c does not
-  // mutate or retain it and returns a plain length.
-  let n = unsafe { mlxrs_sys::mlx_vector_array_size(vec) };
-  let mut parts = Vec::with_capacity(n);
-  for i in 0..n {
-    // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
-    // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
-    // early return / panic frees it, then populated by the following call.
-    let mut part = Array(unsafe { mlxrs_sys::mlx_array_new() });
-    // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
-    // not retained by mlx past it); the out-param was freshly allocated above
-    // and is written by this call; the backend rc is surfaced via `check()`.
-    check(unsafe { mlxrs_sys::mlx_vector_array_get(&mut part.0, vec, i) })?;
-    parts.push(part);
-  }
-  Ok(parts)
-}
-
-/// RAII guard for a temporary `mlx_vector_array`.
-struct VectorArrayGuard(mlxrs_sys::mlx_vector_array);
-impl Drop for VectorArrayGuard {
-  fn drop(&mut self) {
-    // SAFETY: frees a handle this guard owns exactly once. Runs during `Drop` /
-    // thread teardown: must not touch TLS, call `check()`, panic, or unwind
-    // across `extern "C"`; the rc is discarded silently per the crate's
-    // Drop convention.
-    unsafe {
-      let _ = mlxrs_sys::mlx_vector_array_free(self.0);
-    }
-  }
 }

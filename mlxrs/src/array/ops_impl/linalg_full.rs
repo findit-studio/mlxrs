@@ -2,7 +2,7 @@
 
 use std::ffi::CStr;
 
-use crate::{array::Array, error::Result};
+use crate::{array::Array, error::Result, ops::linalg_full::Uplo};
 
 impl Array {
   /// Matrix inverse. See [`crate::ops::linalg_full::inv`].
@@ -66,7 +66,7 @@ impl Array {
   }
 
   /// Eigendecomposition (symmetric / Hermitian). See [`crate::ops::linalg_full::eigh`].
-  pub fn eigh(&self, uplo: &CStr) -> Result<(Array, Array)> {
+  pub fn eigh(&self, uplo: Uplo) -> Result<(Array, Array)> {
     crate::ops::linalg_full::eigh(self, uplo)
   }
 
@@ -76,7 +76,7 @@ impl Array {
   }
 
   /// Eigenvalues only (symmetric / Hermitian). See [`crate::ops::linalg_full::eigvalsh`].
-  pub fn eigvalsh(&self, uplo: &CStr) -> Result<Array> {
+  pub fn eigvalsh(&self, uplo: Uplo) -> Result<Array> {
     crate::ops::linalg_full::eigvalsh(self, uplo)
   }
 
