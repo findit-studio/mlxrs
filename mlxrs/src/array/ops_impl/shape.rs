@@ -87,4 +87,30 @@ impl Array {
   ) -> Result<Array> {
     crate::ops::shape::pad(self, axes, low, high, pad_value, mode)
   }
+
+  /// Move the axis at `source` to `destination`. See [`crate::ops::shape::moveaxis`].
+  pub fn moveaxis(&self, source: i32, destination: i32) -> Result<Array> {
+    crate::ops::shape::moveaxis(self, source, destination)
+  }
+
+  /// Roll the flattened array by `shift`. See [`crate::ops::shape::roll`].
+  pub fn roll(&self, shift: &[i32]) -> Result<Array> {
+    crate::ops::shape::roll(self, shift)
+  }
+
+  /// Roll along a single `axis` by `shift`. See [`crate::ops::shape::roll_axis`].
+  pub fn roll_axis(&self, shift: &[i32], axis: i32) -> Result<Array> {
+    crate::ops::shape::roll_axis(self, shift, axis)
+  }
+
+  /// Roll along each of the given `axes` by `shift`. See [`crate::ops::shape::roll_axes`].
+  pub fn roll_axes(&self, shift: &[i32], axes: &[i32]) -> Result<Array> {
+    crate::ops::shape::roll_axes(self, shift, axes)
+  }
+
+  /// Tile this array by `reps` repetitions per dimension.
+  /// See [`crate::ops::shape::tile`].
+  pub fn tile(&self, reps: &[i32]) -> Result<Array> {
+    crate::ops::shape::tile(self, reps)
+  }
 }
