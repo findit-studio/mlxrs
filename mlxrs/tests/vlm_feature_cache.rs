@@ -605,8 +605,8 @@ fn default_max_size_is_20() {
 fn zero_max_size_is_rejected() {
   let err = VisionFeatureCache::with_max_size(0).unwrap_err();
   assert!(
-    matches!(err, Error::ShapeMismatch(_)),
-    "zero capacity must be a ShapeMismatch error, got {err:?}"
+    matches!(err, Error::InvariantViolation(_)),
+    "zero capacity must be an InvariantViolation error, got {err:?}"
   );
 }
 
@@ -620,8 +620,8 @@ fn zero_max_size_is_rejected() {
 /// returned `Err(OutOfMemory)`. With empty-init nothing is reserved, so
 /// `usize::MAX` is just a (huge) eviction bound and construction succeeds
 /// *without* allocating — the abort/DoS class is gone because nothing is
-/// pre-allocated. (The zero-capacity `ShapeMismatch` guard still runs first;
-/// `usize::MAX` is non-zero, so it passes the guard and constructs `Ok`.)
+/// pre-allocated. (The zero-capacity `InvariantViolation` guard still runs
+/// first; `usize::MAX` is non-zero, so it passes the guard and constructs `Ok`.)
 #[test]
 fn with_max_size_pathological_capacity_is_cheap_not_abort() {
   let cache = VisionFeatureCache::with_max_size(usize::MAX)

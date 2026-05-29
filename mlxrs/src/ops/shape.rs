@@ -10,7 +10,7 @@ use smol_str::format_smolstr;
 use crate::{
   array::Array,
   error::{
-    ArithmeticOverflowPayload, CapExceededPayload, Error, LengthMismatchPayload,
+    ArithmeticOverflowPayload, CapExceededPayload, EmptyInputPayload, Error, LengthMismatchPayload,
     MultiLengthMismatchPayload, OutOfRangePayload, Result, check,
   },
   ffi::VectorArrayGuard,
@@ -170,9 +170,9 @@ pub fn concatenate(arrays: &[&Array], axis: i32) -> Result<Array> {
   // FFI rather than constructing an empty vector_array (which would also
   // hand mlx-c a Rust dangling pointer for `Vec::as_ptr()` on an empty Vec).
   if arrays.is_empty() {
-    return Err(Error::ShapeMismatch(
-      "concatenate: arrays slice is empty".into(),
-    ));
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "concatenate: arrays slice",
+    )));
   }
   // Install the error handler before the first fallible FFI call. Without
   // this, mlx_vector_array_new_data could fail and trigger mlx-c's default
@@ -318,7 +318,9 @@ pub fn broadcast_to(a: &Array, shape: &impl IntoShape) -> Result<Array> {
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.stack.html).
 pub fn stack(arrays: &[&Array]) -> Result<Array> {
   if arrays.is_empty() {
-    return Err(Error::ShapeMismatch("stack: arrays slice is empty".into()));
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "stack: arrays slice",
+    )));
   }
   crate::error::ensure_handler_installed();
   let raw: Vec<mlxrs_sys::mlx_array> = arrays.iter().map(|a| a.0).collect();
@@ -353,9 +355,9 @@ pub fn stack(arrays: &[&Array]) -> Result<Array> {
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.stack.html).
 pub fn stack_axis(arrays: &[&Array], axis: i32) -> Result<Array> {
   if arrays.is_empty() {
-    return Err(Error::ShapeMismatch(
-      "stack_axis: arrays slice is empty".into(),
-    ));
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "stack_axis: arrays slice",
+    )));
   }
   crate::error::ensure_handler_installed();
   let raw: Vec<mlxrs_sys::mlx_array> = arrays.iter().map(|a| a.0).collect();

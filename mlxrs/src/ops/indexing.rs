@@ -7,7 +7,7 @@ use crate::{
   array::Array,
   dtype::Dtype,
   error::{
-    CapExceededPayload, Error, InvariantViolationPayload, LengthMismatchPayload,
+    CapExceededPayload, EmptyInputPayload, Error, InvariantViolationPayload, LengthMismatchPayload,
     MultiLengthMismatchPayload, OutOfRangePayload, Result, check,
   },
   ffi::VectorArrayGuard,
@@ -193,9 +193,9 @@ pub fn scatter_add_axis(a: &Array, indices: &Array, values: &Array, axis: i32) -
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.gather.html).
 pub fn gather(a: &Array, indices: &[&Array], axes: &[i32], slice_sizes: &[i32]) -> Result<Array> {
   if indices.is_empty() {
-    return Err(Error::ShapeMismatch(
-      "gather: indices slice is empty".into(),
-    ));
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "gather: indices slice",
+    )));
   }
   if indices.len() != axes.len() {
     return Err(Error::LengthMismatch(LengthMismatchPayload::new(

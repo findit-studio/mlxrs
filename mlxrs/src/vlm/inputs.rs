@@ -48,8 +48,8 @@
 use crate::{
   array::Array,
   error::{
-    ArithmeticOverflowPayload, Error, InvariantViolationPayload, LengthMismatchPayload,
-    OutOfRangePayload, Result, try_with_capacity,
+    ArithmeticOverflowPayload, EmptyInputPayload, Error, InvariantViolationPayload,
+    LengthMismatchPayload, OutOfRangePayload, Result, try_with_capacity,
   },
 };
 
@@ -353,7 +353,7 @@ impl PrepareInputsOpts {
 ///
 /// # Errors
 ///
-/// - `Error::ShapeMismatch` if `text_token_batches` is empty.
+/// - `Error::EmptyInput` if `text_token_batches` is empty.
 /// - `Error::ShapeMismatch` if `padding=false` and the batches have
 ///   varying lengths.
 /// - `Error::ShapeMismatch` if any per-batch `T_b > i32::MAX` (mlx
@@ -369,9 +369,9 @@ pub fn prepare_inputs(
   opts: &PrepareInputsOpts,
 ) -> Result<PreparedInputs> {
   if text_token_batches.is_empty() {
-    return Err(Error::ShapeMismatch(
-      "prepare_inputs: text_token_batches is empty (need >= 1 batch entry)".into(),
-    ));
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "prepare_inputs: text_token_batches",
+    )));
   }
 
   // Validate caller-supplied attention_mask shape if non-empty. We do

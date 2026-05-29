@@ -147,8 +147,8 @@ use smol_str::format_smolstr;
 use crate::{
   array::Array,
   error::{
-    Error, LengthMismatchPayload, NonFiniteScalarPayload, OutOfRangePayload, RankMismatchPayload,
-    Result, try_extend_from_slice, try_with_capacity,
+    EmptyInputPayload, Error, LengthMismatchPayload, NonFiniteScalarPayload, OutOfRangePayload,
+    RankMismatchPayload, Result, try_extend_from_slice, try_with_capacity,
   },
   lm::{cache::KvCache, model::Model, sample},
   ops,
@@ -1862,9 +1862,9 @@ pub(crate) fn build_generator<'a, M: Model + ?Sized>(
   // contract is the single error channel.
   let built = (|| -> Result<(Sampler, Vec<LogitsProcessor>)> {
     if prompt.is_empty() {
-      return Err(Error::ShapeMismatch(
-        "generate: prompt must be non-empty".into(),
-      ));
+      return Err(Error::EmptyInput(EmptyInputPayload::new(
+        "generate: prompt",
+      )));
     }
     // AUDIO-12 #136: eager scalar-bound validation of every sampler /
     // logits-processor knob in `cfg` BEFORE any prompt prefill / model
@@ -2838,22 +2838,22 @@ impl<M: Model + ?Sized> Iterator for BatchGenerator<'_, M> {
 /// `mx.array([[pad]*(max_len-len(p)) + p for p in prompts])`).
 fn left_pad_rows(prompts: &[&[u32]], pad_token_id: u32) -> Result<(Vec<Vec<u32>>, usize)> {
   if prompts.is_empty() {
-    return Err(Error::ShapeMismatch(
-      "batch_generate: prompts must be non-empty".into(),
-    ));
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "batch_generate: prompts",
+    )));
   }
   let max_len = prompts.iter().map(|p| p.len()).max().unwrap_or(0);
   if max_len == 0 {
-    return Err(Error::ShapeMismatch(
-      "batch_generate: every prompt must be non-empty".into(),
-    ));
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "batch_generate: every prompt",
+    )));
   }
   let mut padded: Vec<Vec<u32>> = try_with_capacity(prompts.len())?;
   for p in prompts {
     if p.is_empty() {
-      return Err(Error::ShapeMismatch(
-        "batch_generate: every prompt must be non-empty".into(),
-      ));
+      return Err(Error::EmptyInput(EmptyInputPayload::new(
+        "batch_generate: every prompt",
+      )));
     }
     let mut row: Vec<u32> = try_with_capacity(max_len)?;
     for _ in 0..(max_len - p.len()) {
