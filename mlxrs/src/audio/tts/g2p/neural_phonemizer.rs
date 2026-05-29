@@ -145,8 +145,14 @@ mod tests {
 
   #[test]
   fn backend_error_propagates() {
-    let backend =
-      |_w: &str, _l: &str| -> Result<String> { Err(Error::Backend("model failure".into())) };
+    let backend = |_w: &str, _l: &str| -> Result<String> {
+      Err(Error::InvariantViolation(
+        crate::error::InvariantViolationPayload::new(
+          "neural_phonemizer test mock",
+          "simulated model failure",
+        ),
+      ))
+    };
     let p = NeuralPhonemizer::new(backend, "eng-us");
     let err = p.phonemize("test").unwrap_err();
     assert!(err.to_string().contains("model failure"));

@@ -22,7 +22,7 @@ use smol_str::format_smolstr;
 
 use crate::{
   Array,
-  error::{Error, OutOfRangePayload, RankMismatchPayload, Result},
+  error::{ArithmeticOverflowPayload, Error, OutOfRangePayload, RankMismatchPayload, Result},
   ops::shape::{concatenate, pad},
 };
 
@@ -183,10 +183,19 @@ impl<B: StreamingEncoderBackend> StreamingEncoder<B> {
       )));
     }
 
-    let window_size_i32 = i32::try_from(self.window_size)
-      .map_err(|_| Error::Backend("StreamingEncoder::feed: window_size does not fit i32".into()))?;
+    let window_size_i32 = i32::try_from(self.window_size).map_err(|_| {
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "StreamingEncoder::feed: window_size does not fit i32",
+        "i32",
+        [("window_size", self.window_size as u64)],
+      ))
+    })?;
     let stride_i32 = i32::try_from(self.window_stride).map_err(|_| {
-      Error::Backend("StreamingEncoder::feed: window_stride does not fit i32".into())
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "StreamingEncoder::feed: window_stride does not fit i32",
+        "i32",
+        [("window_stride", self.window_stride as u64)],
+      ))
     })?;
 
     // STAGE the merged pending buffer in a LOCAL. Use try_clone on the

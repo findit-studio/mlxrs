@@ -26,8 +26,8 @@ use crate::{
   array::Array,
   dtype::Dtype,
   error::{
-    EmptyInputPayload, Error, InteriorNulPayload, LengthMismatchPayload, OutOfRangePayload, Result,
-    check, check_vector_array_handle,
+    EmptyInputPayload, Error, FfiNullHandlePayload, InteriorNulPayload, LengthMismatchPayload,
+    OutOfRangePayload, Result, check, check_vector_array_handle,
   },
   ffi::VectorArrayGuard,
   stream::default_stream,
@@ -472,9 +472,9 @@ impl MetalKernel {
       return Err(
         crate::error::LAST
           .with(|c| c.borrow_mut().take())
-          .unwrap_or(Error::Backend(
-            "mlx_fast_metal_kernel_new returned NULL handle".into(),
-          )),
+          .unwrap_or(Error::FfiNullHandle(FfiNullHandlePayload::new(
+            "mlx_fast_metal_kernel_new",
+          ))),
       );
     }
 
@@ -585,9 +585,9 @@ impl MetalKernel {
       return Err(
         crate::error::LAST
           .with(|c| c.borrow_mut().take())
-          .unwrap_or(Error::Backend(
-            "mlx_fast_metal_kernel_config_new returned NULL handle".into(),
-          )),
+          .unwrap_or(Error::FfiNullHandle(FfiNullHandlePayload::new(
+            "mlx_fast_metal_kernel_config_new",
+          ))),
       );
     }
 
@@ -720,9 +720,9 @@ impl MetalKernel {
       return Err(
         crate::error::LAST
           .with(|c| c.borrow_mut().take())
-          .unwrap_or(Error::Backend(
-            "mlx_vector_array_new_data returned NULL handle".into(),
-          )),
+          .unwrap_or(Error::FfiNullHandle(FfiNullHandlePayload::new(
+            "mlx_vector_array_new_data",
+          ))),
       );
     }
 

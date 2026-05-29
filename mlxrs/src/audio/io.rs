@@ -849,9 +849,10 @@ fn push_samples(buf: &GenericAudioBufferRef<'_>, out: &mut Vec<f32>, cap: usize)
     if s.is_finite() {
       Ok(s)
     } else {
-      Err(Error::Backend(
-        "load_audio: non-finite f32 PCM sample".into(),
-      ))
+      Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+        "load_audio: non-finite f32 PCM sample",
+        s as f64,
+      )))
     }
   }
   /// Resolve the integer-PCM divisor `2^(bits-1)` for one of the

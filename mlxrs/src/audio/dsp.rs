@@ -3596,9 +3596,11 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
   // Input validation mirrors `_validate_loudness_audio` + the loudness
   // parameter ranges.
   if rate == 0 {
-    return Err(Error::Backend(
-      "integrated_loudness: rate must be > 0".into(),
-    ));
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "integrated_loudness: rate",
+      "must be > 0",
+      "0",
+    )));
   }
   if !(block_size > 0.0 && block_size.is_finite()) {
     return Err(Error::OutOfRange(OutOfRangePayload::new(
@@ -4165,9 +4167,9 @@ pub fn normalize_peak(data: &Array, target_peak_db: f64) -> Result<Array> {
     )));
   }
   if data.size() == 0 {
-    return Err(Error::Backend(
-      "normalize_peak: data must be non-empty (max over an empty array is undefined)".into(),
-    ));
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "normalize_peak: data must be non-empty (max over an empty array is undefined)",
+    )));
   }
   // current_peak = max(|data|). One explicit scalar readback.
   let abs_data = data.abs()?;
@@ -4182,11 +4184,11 @@ pub fn normalize_peak(data: &Array, target_peak_db: f64) -> Result<Array> {
   // `current_peak` is `max(|.|)`, so it is always `>= 0.0`; `== 0.0` means an
   // all-silence (or all-zero) input, which cannot be peak-normalized.
   if current_peak == 0.0 {
-    return Err(Error::Backend(
-      "normalize_peak: current peak max(|data|) is 0.0 — an all-silence input \
-                cannot be peak-normalized (the gain would divide by zero)"
-        .into(),
-    ));
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "normalize_peak: current peak max(|data|)",
+      "must be > 0 — an all-silence input cannot be peak-normalized (the gain would divide by zero)",
+      "0",
+    )));
   }
   // `gain = 10^(target_peak_db / 20) / current_peak`. Reference:
   // `np.power(10.0, target_peak_db / 20.0) / current_peak`. Compute the
@@ -5435,7 +5437,7 @@ mod tests {
     // rate == 0
     assert!(matches!(
       integrated_loudness(&x, 0, 0.4, 0.75),
-      Err(Error::Backend(_))
+      Err(Error::OutOfRange(_))
     ));
   }
 
@@ -6034,7 +6036,7 @@ mod tests {
     let silence = Array::from_slice::<f32>(&[0.0, 0.0, 0.0], &[3]).unwrap();
     assert!(matches!(
       normalize_peak(&silence, 0.0),
-      Err(Error::Backend(_))
+      Err(Error::OutOfRange(_))
     ));
     // Non-finite target_peak_db.
     let data = Array::from_slice::<f32>(&[0.5, 0.1], &[2]).unwrap();

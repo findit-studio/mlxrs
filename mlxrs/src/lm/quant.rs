@@ -164,10 +164,6 @@ impl QuantMode {
   /// The mlx-c mode tag string (the wire format mlx-c expects). Stable
   /// snake-case lower — matches the `serde(rename_all = "lowercase")` form
   /// in [`QuantMode`]'s `Deserialize` impl, so serialize/deserialize roundtrip.
-  ///
-  /// Previously named `as_mlx_str`; renamed to `as_str` per §2 for
-  /// consistency with the rest of the mlxrs enum surface (§2: unit-only
-  /// enums expose `const fn as_str() -> &'static str`).
   pub const fn as_str(self) -> &'static str {
     match self {
       QuantMode::Affine => "affine",
@@ -175,12 +171,6 @@ impl QuantMode {
       QuantMode::Mxfp8 => "mxfp8",
       QuantMode::Nvfp4 => "nvfp4",
     }
-  }
-
-  /// Compatibility alias — prefer [`as_str`](Self::as_str).
-  #[deprecated(since = "0.0.0", note = "renamed to `as_str`")]
-  pub const fn as_mlx_str(self) -> &'static str {
-    self.as_str()
   }
 }
 

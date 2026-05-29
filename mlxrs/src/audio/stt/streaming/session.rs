@@ -1213,7 +1213,10 @@ fn peak_memory_gb_or_zero() -> f64 {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::audio::stt::streaming::{encoder::StreamingEncoderBackend, types::DelayPreset};
+  use crate::{
+    audio::stt::streaming::{encoder::StreamingEncoderBackend, types::DelayPreset},
+    error::InvariantViolationPayload,
+  };
   use std::sync::Mutex;
 
   // -----------------------------------------------------------------
@@ -1268,8 +1271,11 @@ mod tests {
         script.remove(0)
       };
       if should_err {
-        return Err(crate::error::Error::Backend(
-          "scripted encode_window failure".into(),
+        return Err(crate::error::Error::InvariantViolation(
+          crate::error::InvariantViolationPayload::new(
+            "ScriptedEncoder::encode_window",
+            "scripted failure",
+          ),
         ));
       }
       let rows = mel_window.shape().first().copied().unwrap_or(0);
@@ -1508,7 +1514,10 @@ mod tests {
     let encoder = ScriptedEncoder::new(8, vec![]);
     let decoder = ScriptedDecoder::with_results(vec![
       Ok(vec![1]),
-      Err(Error::Backend("scripted finalize failure".into())),
+      Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "ScriptedDecoder",
+        "scripted finalize failure",
+      ))),
       Ok(vec![42]),
     ]);
     let mut session = finalize_session(encoder, decoder);
@@ -1540,7 +1549,10 @@ mod tests {
     let encoder = ScriptedEncoder::new(8, vec![]);
     let decoder = ScriptedDecoder::with_results(vec![
       Ok(vec![1]),
-      Err(Error::Backend("scripted finalize failure".into())),
+      Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "ScriptedDecoder",
+        "scripted finalize failure",
+      ))),
     ]);
     let mut session = finalize_session(encoder, decoder);
     let (partial_events, boundary_events) = drive_two_phase(&mut session);
@@ -1563,8 +1575,14 @@ mod tests {
     let encoder = ScriptedEncoder::new(8, vec![]);
     let decoder = ScriptedDecoder::with_results(vec![
       Ok(vec![1]),
-      Err(Error::Backend("scripted boundary finalize Err".into())),
-      Err(Error::Backend("scripted stop-retry finalize Err".into())),
+      Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "ScriptedDecoder",
+        "scripted boundary finalize Err",
+      ))),
+      Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "ScriptedDecoder",
+        "scripted stop-retry finalize Err",
+      ))),
       Ok(vec![42]),
     ]);
     let mut session = finalize_session(encoder, decoder);
@@ -1596,7 +1614,10 @@ mod tests {
     let encoder = ScriptedEncoder::new(8, vec![]);
     let decoder = ScriptedDecoder::with_results(vec![
       Ok(vec![1]),
-      Err(Error::Backend("scripted boundary finalize Err".into())),
+      Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "ScriptedDecoder",
+        "scripted boundary finalize Err",
+      ))),
       Ok(vec![77]),
     ]);
     let mut session = finalize_session(encoder, decoder);
@@ -1623,7 +1644,10 @@ mod tests {
     let encoder = ScriptedEncoder::new(8, vec![]);
     let decoder = ScriptedDecoder::with_results(vec![
       Ok(vec![123]),
-      Err(Error::Backend("scripted boundary finalize Err".into())),
+      Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "ScriptedDecoder",
+        "scripted boundary finalize Err",
+      ))),
       Ok(vec![]),
     ]);
     let mut session = finalize_session(encoder, decoder);
@@ -2237,8 +2261,11 @@ mod tests {
     // is left armed; third call (retry stop()'s fast path) succeeds.
     let decoder = ScriptedDecoder::with_results(vec![
       Ok(vec![1]),
-      Err(crate::error::Error::Backend(
-        "scripted stop-partial-decode Err".into(),
+      Err(crate::error::Error::InvariantViolation(
+        crate::error::InvariantViolationPayload::new(
+          "ScriptedDecoder",
+          "scripted stop-partial-decode Err",
+        ),
       )),
       Ok(vec![1, 2]),
     ]);
@@ -2292,8 +2319,11 @@ mod tests {
     // so the arm is the LAST mutation before the Err.
     let decoder = ScriptedDecoder::with_results(vec![
       Ok(vec![1]),
-      Err(crate::error::Error::Backend(
-        "scripted stop-partial-decode Err".into(),
+      Err(crate::error::Error::InvariantViolation(
+        crate::error::InvariantViolationPayload::new(
+          "ScriptedDecoder",
+          "scripted stop-partial-decode Err",
+        ),
       )),
     ]);
     let mut session = nonfinalize_session(encoder, decoder);

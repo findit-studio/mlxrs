@@ -508,9 +508,10 @@ impl BatchRotatingKvCache {
   fn update_in_place(&mut self, keys: &Array, values: &Array) -> Result<(Array, Array)> {
     if self.lengths.is_some() {
       // mlx-lm raises RuntimeError: finalize() must precede decoding.
-      return Err(Error::Backend(
-        "finalize() should be called before decoding with BatchRotatingKvCache".into(),
-      ));
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "BatchRotatingKvCache::update_in_place",
+        "finalize() must be called before decoding",
+      )));
     }
     // Rank validation is the public-`update` entry's responsibility
     // (`update` calls `validate_kv_compat(keys, values)?` before dispatching
@@ -592,9 +593,10 @@ impl BatchRotatingKvCache {
     let (kbuf, vbuf) = match (bk, bv) {
       (Some(k), Some(v)) => (k, v),
       _ => {
-        return Err(Error::Backend(
-          "BatchRotatingKvCache: empty buffer after grow (unreachable)".into(),
-        ));
+        return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+          "BatchRotatingKvCache::update_in_place",
+          "buffer is empty after grow (internal invariant violated)",
+        )));
       }
     };
     let mut bk = kbuf;
@@ -758,12 +760,10 @@ impl KvCache for BatchRotatingKvCache {
     // placeholder (set_meta_state restores max_size before the first
     // update).
     if self.max_size == 0 {
-      return Err(Error::Backend(
-        "BatchRotatingKvCache::update: max_size is 0 (the constructor placeholder \
-                  used by from_state); set max_size via set_meta_state or construct with \
-                  new(max_size > 0, left_padding) before calling update"
-          .into(),
-      ));
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "BatchRotatingKvCache::update",
+        "max_size is 0 (from_state placeholder); call set_meta_state or construct with new(max_size > 0, left_padding) before calling update",
+      )));
     }
     validate_kv_compat(keys, values)?;
     let s = seq_len("keys", keys)?;
@@ -1072,12 +1072,10 @@ impl KvCache for BatchRotatingKvCache {
     // (`ws == 0` and `offset == 0`). Reject as a recoverable error
     // (Copilot review #3271308764).
     if self.max_size == 0 {
-      return Err(Error::Backend(
-        "BatchRotatingKvCache::make_mask: max_size is 0 (the constructor placeholder \
-                  used by from_state); set max_size via set_meta_state or construct with \
-                  new(max_size > 0, left_padding) before calling make_mask"
-          .into(),
-      ));
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "BatchRotatingKvCache::make_mask",
+        "max_size is 0 (from_state placeholder); call set_meta_state or construct with new(max_size > 0, left_padding) before calling make_mask",
+      )));
     }
     // window_size = window_size or self.max_size (Python truthiness: 0 is
     // falsy → falls back to max_size, like the single-seq rotating port).

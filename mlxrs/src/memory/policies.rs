@@ -52,7 +52,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
   Stream,
-  error::{Error, Result},
+  error::{Error, InvariantViolationPayload, Result},
 };
 
 use super::recommended_working_set_bytes;
@@ -507,10 +507,8 @@ pub fn tune(
   _prefill_step_size: usize,
   _streams: &[Stream],
 ) -> Result<WiredMemoryMeasurement> {
-  Err(Error::Backend(
-    "WiredMemoryUtils::tune not yet implemented — requires the \
-              mlxrs LM concurrency surface (Model::prefill_only) which is \
-              still a stub. See issue #168 / LM-L6 follow-up."
-      .into(),
-  ))
+  Err(Error::InvariantViolation(InvariantViolationPayload::new(
+    "WiredMemoryUtils::tune",
+    "not yet implemented — requires Model::prefill_only (stub); see issue #168 / LM-L6",
+  )))
 }
