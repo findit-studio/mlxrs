@@ -35,7 +35,7 @@
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{Error, InvariantViolationPayload, Result},
 };
 
 use super::generate::{TtsGenConfig, TtsSegment};
@@ -91,9 +91,10 @@ pub trait TtsModel {
   /// per-model-override default.
   fn synthesize_segment(&self, segment: &TtsSegment<'_>) -> Result<Array> {
     let _ = segment;
-    Err(Error::Backend(
-      "TTS model needs `synthesize_segment` override (per-model)".into(),
-    ))
+    Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "TtsModel::synthesize_segment",
+      "needs `synthesize_segment` override (per-model)",
+    )))
   }
 
   /// The output PCM sample rate in Hz.

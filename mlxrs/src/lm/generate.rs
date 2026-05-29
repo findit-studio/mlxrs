@@ -3543,7 +3543,12 @@ mod batch_tests {
       _cache: &mut [Box<dyn crate::lm::cache::KvCache>],
     ) -> Result<Array> {
       *self.calls.borrow_mut() += 1;
-      Err(Error::Backend("mock batch forward failure".into()))
+      Err(Error::InvariantViolation(
+        crate::error::InvariantViolationPayload::new(
+          "BatchFailModel::forward",
+          "mock batch forward failure (test fixture)",
+        ),
+      ))
     }
   }
 

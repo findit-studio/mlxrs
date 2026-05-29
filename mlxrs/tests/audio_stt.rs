@@ -586,13 +586,13 @@ fn decode_step_default_errors_with_clear_message() {
     SttGenConfig::default().with_lm(mlxrs::lm::generate::GenConfig::default().with_max_tokens(5));
   let mut it = stt_generate(&model, &path, cache(1), cfg).unwrap();
   match it.next().expect("an item") {
-    Err(mlxrs::Error::Backend(message)) => {
+    Err(e @ mlxrs::Error::InvariantViolation(_)) => {
       assert!(
-        message.contains("decode_step"),
-        "error mentions decode_step, got {message}"
+        format!("{e}").contains("decode_step"),
+        "error mentions decode_step, got {e}"
       );
     }
-    other => panic!("expected Backend Err, got {other:?}"),
+    other => panic!("expected InvariantViolation Err, got {other:?}"),
   }
   // Fused after the error: no further items, no panic.
   assert!(it.next().is_none(), "iterator fuses after decode_step Err");

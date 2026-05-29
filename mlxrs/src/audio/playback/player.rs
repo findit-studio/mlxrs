@@ -162,7 +162,7 @@ use smol_str::format_smolstr;
 
 use crate::error::{
   AllocFailurePayload, ArithmeticOverflowPayload, CapExceededPayload, Error, ExternalOpPayload,
-  OutOfRangePayload, Result,
+  InvariantViolationPayload, OutOfRangePayload, Result,
 };
 
 /// Stopped — the cpal stream is built but not playing (Swift's
@@ -406,7 +406,11 @@ impl AudioPlayer {
   pub fn new(config: PlaybackConfig) -> Result<Self> {
     let host = cpal::default_host();
     let device = host.default_output_device().ok_or_else(|| {
-      Error::Backend("AudioPlayer: no default cpal output device available".to_string())
+      Error::ExternalOp(ExternalOpPayload::new(
+        "AudioPlayer: no default cpal output device available",
+        "cpal default_output_device",
+        std::io::Error::other("host returned None"),
+      ))
     })?;
     Self::with_device(&device, config)
   }
@@ -640,13 +644,17 @@ impl AudioPlayer {
     // subsequent `write_samples()` slip past its `STATE_STOPPED`
     // gate. Acquire-load pairs with the Release-store in `stop()`.
     if self.shared.terminated.load(Ordering::Acquire) {
-      return Err(Error::Backend(
-        "AudioPlayer::start called on terminated player — construct a new AudioPlayer".to_string(),
-      ));
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "AudioPlayer::start",
+        "called on terminated player — construct a new AudioPlayer",
+      )));
     }
     self.take_callback_error()?;
     let stream = self.stream.as_ref().ok_or_else(|| {
-      Error::Backend("AudioPlayer::start: stream has been dropped (post-stop)".to_string())
+      Error::InvariantViolation(InvariantViolationPayload::new(
+        "AudioPlayer::start",
+        "stream has been dropped (post-stop)",
+      ))
     })?;
     stream.play().map_err(|e| {
       Error::ExternalOp(ExternalOpPayload::new(
@@ -673,13 +681,17 @@ impl AudioPlayer {
   /// - [`Error::Backend`] if the cpal `Stream::pause()` call fails.
   pub fn pause(&mut self) -> Result<()> {
     if self.shared.terminated.load(Ordering::Acquire) {
-      return Err(Error::Backend(
-        "AudioPlayer::pause called on terminated player — construct a new AudioPlayer".to_string(),
-      ));
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "AudioPlayer::pause",
+        "called on terminated player — construct a new AudioPlayer",
+      )));
     }
     self.take_callback_error()?;
     let stream = self.stream.as_ref().ok_or_else(|| {
-      Error::Backend("AudioPlayer::pause: stream has been dropped (post-stop)".to_string())
+      Error::InvariantViolation(InvariantViolationPayload::new(
+        "AudioPlayer::pause",
+        "stream has been dropped (post-stop)",
+      ))
     })?;
     stream.pause().map_err(|e| {
       Error::ExternalOp(ExternalOpPayload::new(
@@ -709,9 +721,10 @@ impl AudioPlayer {
   /// - [`Error::Backend`] if the cpal `Stream::play()` call fails.
   pub fn resume(&mut self) -> Result<()> {
     if self.shared.terminated.load(Ordering::Acquire) {
-      return Err(Error::Backend(
-        "AudioPlayer::resume called on terminated player — construct a new AudioPlayer".to_string(),
-      ));
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "AudioPlayer::resume",
+        "called on terminated player — construct a new AudioPlayer",
+      )));
     }
     self.start()
   }
@@ -832,9 +845,10 @@ impl AudioPlayer {
     // chunks on the re-armed stream. Acquire-load pairs with the
     // Release-store in `stop()`.
     if self.shared.terminated.load(Ordering::Acquire) {
-      return Err(Error::Backend(
-        "AudioPlayer::write_samples called after stop() — player is terminated".to_string(),
-      ));
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "AudioPlayer::write_samples",
+        "called after stop() — player is terminated",
+      )));
     }
     self.take_callback_error()?;
 
@@ -843,9 +857,10 @@ impl AudioPlayer {
     // the first `start()` rather than start cleanly.
     let state = self.shared.state.load(Ordering::Acquire);
     if state == STATE_STOPPED {
-      return Err(Error::Backend(
-        "AudioPlayer::write_samples called after stop()".to_string(),
-      ));
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "AudioPlayer::write_samples",
+        "called on stopped player (STATE_STOPPED); call start() before writing samples",
+      )));
     }
 
     // Whole-payload overflow check up front (one lock acquisition).
@@ -856,10 +871,14 @@ impl AudioPlayer {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
       };
-      let projected_len = q.len().checked_add(samples.len()).ok_or_else(|| {
-        Error::Backend(
-          "AudioPlayer::write_samples: queue length + new samples overflows usize".to_string(),
-        )
+      let q_len = q.len();
+      let s_len = samples.len();
+      let projected_len = q_len.checked_add(s_len).ok_or_else(|| {
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+          "AudioPlayer::write_samples: queue length + new samples",
+          "usize",
+          [("queue_len", q_len as u64), ("samples_len", s_len as u64)],
+        ))
       })?;
       if projected_len > self.shared.queue_capacity_samples {
         return Err(Error::CapExceeded(CapExceededPayload::new(

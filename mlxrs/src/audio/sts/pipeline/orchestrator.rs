@@ -44,7 +44,7 @@
 
 use crate::{
   audio::{playback::AudioOutputStream, sts::pipeline::voice_pipeline::VoicePipeline},
-  error::Result,
+  error::{InvariantViolationPayload, Result},
 };
 
 use super::{
@@ -296,10 +296,11 @@ where
     turn_policy: P,
   ) -> Result<Self> {
     if config.input_sample_rate() == 0 {
-      return Err(crate::error::Error::Backend(
-        "VoicePipelineConfig::input_sample_rate must be > 0 (got 0); the orchestrator's per-chunk \
-           silence-ms accounting divides by the sample rate"
-          .into(),
+      return Err(crate::error::Error::InvariantViolation(
+        InvariantViolationPayload::new(
+          "VoiceSession::new: VoicePipelineConfig::input_sample_rate",
+          "must be > 0; the orchestrator's per-chunk silence-ms accounting divides by the sample rate",
+        ),
       ));
     }
     let preroll_samples =
@@ -505,9 +506,12 @@ where
           let n = output.write_samples(&samples[written..])?;
           if n == 0 {
             // Sink is fully backpressured and won't accept more
-            // — surface as Backend error rather than spin.
-            return Err(crate::error::Error::Backend(
-              "VoiceSession: audio sink rejected TTS chunk (write_samples returned 0)".into(),
+            // — surface as InvariantViolation rather than spin.
+            return Err(crate::error::Error::InvariantViolation(
+              InvariantViolationPayload::new(
+                "VoiceSession: audio sink",
+                "rejected TTS chunk (write_samples returned 0)",
+              ),
             ));
           }
           written += n;
@@ -882,10 +886,11 @@ mod tests {
     }
     let err = sess.step(&silence_frame, &mut sink, false).unwrap_err();
     match err {
-      Error::Backend(message) => {
-        assert!(message.contains("audio sink rejected"), "got: {message}")
+      Error::InvariantViolation(p) => {
+        let msg = p.to_string();
+        assert!(msg.contains("audio sink"), "got: {msg}")
       }
-      other => panic!("expected Backend error, got: {other:?}"),
+      other => panic!("expected InvariantViolation error, got: {other:?}"),
     }
   }
 
@@ -1130,11 +1135,14 @@ mod tests {
     );
     match result {
       Ok(_) => panic!("expected Err, got Ok"),
-      Err(Error::Backend(message)) => assert!(
-        message.contains("sample_rate"),
-        "expected Backend error mentioning sample_rate, got: {message}"
-      ),
-      Err(other) => panic!("expected Backend error, got: {other:?}"),
+      Err(Error::InvariantViolation(p)) => {
+        let msg = p.to_string();
+        assert!(
+          msg.contains("sample_rate"),
+          "expected InvariantViolation mentioning sample_rate, got: {msg}"
+        )
+      }
+      Err(other) => panic!("expected InvariantViolation error, got: {other:?}"),
     }
   }
 
