@@ -2070,10 +2070,20 @@ fn p1_kvcache_as_any_mut_downcasts_for_all_8_in_tree_impls() {
 /// an empty cache (`Ok(())`, still empty), and an in-place force-eval of the
 /// stored `keys`/`values` that leaves the cache observably unchanged (same
 /// offset, same retained ids, still non-empty) on a populated cache. The
-/// cache stores its tensors at exactly the logical `offset` length, so
-/// `materialize` evaluating `self.keys`/`self.values` is equivalent to
-/// evaluating what `state()` returns — assert the post-materialize `state()`
-/// is byte-identical.
+/// cache stores its tensors at exactly the logical `offset` length
+/// (standard.rs:88-102), so `materialize` evaluating `self.keys`/`self.values`
+/// is equivalent to evaluating what `state()` returns — asserted via the
+/// post-materialize `state()` and the `nbytes()` "stored buffer == offset
+/// length" invariant.
+///
+/// Strengthened per Codex #2 (which noted the original only checked
+/// values/offset unchanged, so a no-op materialize would pass): the `nbytes()`
+/// pin confirms the buffer `materialize` evals is exactly the 4-row stored
+/// buffer (== `state()`), i.e. this cache has no over-allocated ring where the
+/// slice and the stored buffer diverge (contrast the RotatingKvCache test).
+/// RESIDUAL (same as the rotating case): `Array` exposes no `is_evaled` query
+/// and `eval` is value/shape-preserving, so no public-API assertion can fail
+/// on a *complete* no-op materialize — flagged for the controller.
 #[test]
 fn standard_materialize_noop_empty_and_eval_populated() {
   // Empty cache: materialize is a no-op and the cache stays empty.
@@ -2081,13 +2091,28 @@ fn standard_materialize_noop_empty_and_eval_populated() {
   s.materialize().unwrap();
   assert!(s.is_empty());
   assert_eq!(s.offset(), 0);
+  assert_eq!(s.nbytes(), 0, "empty cache stores no buffer");
 
   // Populate, then materialize: offset/contents/non-emptiness unchanged.
   s.update(&kv(&[0.0, 1.0, 2.0, 3.0]), &kv(&[0.0, 1.0, 2.0, 3.0]))
     .unwrap();
+  // Stored buffer == offset length (no over-allocation): 4 rows * 1 f32 * 4
+  // bytes for keys + the same for values = 32 bytes. This pins that the
+  // buffer `materialize` evals (self.keys/self.values) is exactly the 4-row
+  // stored buffer, which here equals `state()`.
+  assert_eq!(
+    s.nbytes(),
+    32,
+    "StandardKvCache stores exactly offset-length buffers (no over-allocation)"
+  );
   s.materialize().unwrap();
   assert!(!s.is_empty());
   assert_eq!(s.offset(), 4);
+  assert_eq!(
+    s.nbytes(),
+    32,
+    "materialize is value/shape-preserving: stored buffer stays 4 rows"
+  );
   let st = s.state().unwrap();
   assert_eq!(st.len(), 2);
   let mut sk = st[0].try_clone().unwrap();
@@ -2104,10 +2129,24 @@ fn standard_materialize_noop_empty_and_eval_populated() {
 
 /// `RotatingKvCache::materialize` evals the FULL stored ring buffer (the
 /// array the next chunk reuses), NOT the `offset`-length `state()` slice.
-/// Functionally it must be a no-op on an empty cache and leave a populated
-/// cache observably unchanged (raw offset, retained ids via `state()`,
-/// non-emptiness), and a following decode must still walk the ring forward
-/// from the materialized buffer.
+///
+/// Strengthened per Codex #2: the original assertions only checked
+/// values/offset unchanged, so an empty (no-op) `materialize` would also pass.
+/// This now drives the ring into the OVER-ALLOCATED regime (`offset <
+/// buffer_len`) — the exact case the `materialize` doc says `state()` slices
+/// away (rotating.rs:486-507, mod.rs:281-309) — and pins the FULL stored buffer
+/// via `nbytes()` (which reads `self.keys`/`self.values`, the full ring, not
+/// the slice; util.rs:296-300). With `max_size=8` the first S==1 decode grows
+/// the ring to all 8 rows at once (`new_size = ROTATING_STEP.min(max_size -
+/// prev) = 256.min(8) = 8`, rotating.rs:339), so after 3 decodes the stored
+/// buffer is 8 rows while `state()` returns only 3 — making the full-buffer
+/// path that `materialize` evaluates observably distinct from the `state()`
+/// slice (Codex's "verify the full stored buffer path, not only the state
+/// slice"). RESIDUAL: `Array` exposes no `is_evaled`/`is_available` query and
+/// `eval` is value/shape-preserving (array/mod.rs:103-123), so NO public-API
+/// assertion can fail on a *complete* no-op materialize; the full-buffer
+/// regime + the `Ok` eval of that 8-row buffer are the strongest test-only
+/// pins (flagged for the controller).
 #[test]
 fn rotating_materialize_noop_empty_and_eval_populated() {
   // Empty: no-op, stays empty.
@@ -2115,28 +2154,61 @@ fn rotating_materialize_noop_empty_and_eval_populated() {
   c.materialize().unwrap();
   assert!(c.is_empty());
   assert_eq!(c.offset(), 0);
+  assert_eq!(c.nbytes(), 0, "empty cache stores no buffer");
 
   // Drive to a known in-place-decode state below the window (offset 3 <
-  // max_size 8): buffer [0,1,2], offset 3, idx 3.
+  // max_size 8): the first decode grows the ring to all 8 rows, so the
+  // stored buffer is 8 rows while only 3 are written (over-allocated).
   for id in 0..3 {
     let t = kv(&[id as f32]);
     c.update(&t, &t).unwrap();
   }
+
+  // OVER-ALLOCATION pin (the regime `materialize` exists for): the stored
+  // ring is the FULL 8-row buffer, NOT the 3-row `state()` slice. `kv` rows
+  // are 1 f32 (4 bytes) each, so keys(8*4) + values(8*4) = 64 bytes; a
+  // hypothetical non-over-allocated buffer (== offset length) would be only
+  // 3*4 + 3*4 = 24. Asserting 64 BEFORE materialize proves we are in the
+  // over-allocated regime and that `materialize`'s target (self.keys/values,
+  // the full ring) is strictly larger than what `state()` slices.
+  assert_eq!(
+    c.nbytes(),
+    64,
+    "stored ring is the full 8-row buffer (over-allocated), not the 3-row state() slice"
+  );
+  assert_eq!(
+    c.state().unwrap()[0].shape(),
+    vec![1, 1, 3, 1],
+    "state() slices the full ring down to the 3-row offset view"
+  );
+
+  // Materialize evals the FULL 8-row ring (rotating.rs:499-507). The call must
+  // succeed in the over-allocated regime (the full-buffer eval path, distinct
+  // from evaluating the 3-row state slice).
   c.materialize().unwrap();
   assert!(!c.is_empty());
   assert_eq!(c.offset(), 3);
   assert_eq!(c.meta_state(), vec!["4", "8", "3", "3"]);
-  // state() returns the offset-length slice [0,1,2] (offset 3 < buffer len).
+  // materialize is shape/value-preserving: the stored buffer is STILL the
+  // full 8 rows (64 bytes) — it neither shrank to the slice nor changed.
+  assert_eq!(
+    c.nbytes(),
+    64,
+    "materialize is value/shape-preserving: stored ring stays 8 rows"
+  );
+  // state() still returns the offset-length slice [0,1,2] (offset 3 < buf 8).
   let st = c.state().unwrap();
   let mut sk = st[0].try_clone().unwrap();
   assert_eq!(sk.to_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0]);
 
   // Next decode extends the ring exactly as if materialize had not run:
-  // token 3 -> [0,1,2,3], offset 4, idx 4 (still linear fill).
+  // token 3 -> [0,1,2,3], offset 4, idx 4 (still linear fill). The stored
+  // buffer is unchanged 8 rows; only one more slot is written.
   let (mut k, _) = c.update(&kv(&[3.0]), &kv(&[3.0])).unwrap();
   assert_eq!(c.offset(), 4);
   assert_eq!(k.to_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0, 3.0]);
   assert_eq!(c.meta_state(), vec!["4", "8", "4", "4"]);
+  assert_eq!(c.nbytes(), 64, "decode reuses the same 8-row ring");
 }
 
 /// `StandardKvCache::set_state` called DIRECTLY (mlx-lm `KVCache.state`

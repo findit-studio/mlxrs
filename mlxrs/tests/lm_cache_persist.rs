@@ -30,11 +30,12 @@
 use std::{collections::HashMap, fs, path::PathBuf, process};
 
 use mlxrs::{
-  Array, io,
+  Array, Error, io,
   lm::cache::{
     ArraysCache, CacheList, ChunkedKvCache, KvCache, QuantizedKvCache, QuantizedKvCacheImpl,
     RotatingKvCache, StandardKvCache, load_prompt_cache, reference_class_name, save_prompt_cache,
   },
+  ops,
 };
 
 /// Unique temp path per test name (PID-scoped so parallel test bins do not
@@ -125,15 +126,56 @@ fn chunked_kvcache_round_trips_through_persist() {
   let _ = fs::remove_file(&path);
 }
 
+/// Dequantize a 6-array quantized `state()` (`[k.w, k.scales, k.biases, v.w,
+/// v.scales, v.biases]`, quantized.rs:644-668) into `(dense_keys, dense_values)`
+/// via the merged `ops::quantized::dequantize` (gs=64, bits=8, affine — the
+/// `QuantizedKvCacheImpl::new(64, 8)` params). Identical packed bytes
+/// dequantize to identical dense values, so this is an EXACT (not banded)
+/// content comparison after a lossless safetensors round-trip.
+fn dequant_quant_state(state: &[Array]) -> (Array, Array) {
+  assert_eq!(state.len(), 6, "affine quantized state is 6 arrays");
+  let dk = ops::quantized::dequantize(
+    &state[0],
+    &state[1],
+    Some(&state[2]),
+    64,
+    8,
+    "affine",
+    None,
+    None,
+  )
+  .unwrap();
+  let dv = ops::quantized::dequantize(
+    &state[3],
+    &state[4],
+    Some(&state[5]),
+    64,
+    8,
+    "affine",
+    None,
+    None,
+  )
+  .unwrap();
+  (dk, dv)
+}
+
 #[test]
 fn quantized_kvcache_round_trips_through_persist() {
   // QuantizedKVCache carries a 3-element meta_state `[offset, group_size,
   // bits]` (quantized.rs:783-789) and a 6-array packed state — the
   // `"0.{i}.{0,1,2}"` list-meta path + the `QuantizedKVCache` from_state
-  // arm, neither covered by the existing persist tests. The reconstructed
-  // group_size/bits/offset are restored from meta_state; the packed state
-  // arrays round-trip in count + shape (exact quant bit-equality is the
-  // remit of the dedicated quantized tests). 1:1 port of cache.py:43-85.
+  // arm, neither covered by the existing persist tests.
+  //
+  // Strengthened per Codex #3 (which noted the original compared only meta +
+  // packed-state SHAPES, so a corrupted/zeroed packed payload would pass):
+  // this now compares the packed state by CONTENT. `Array::to_vec` errors
+  // `NonContiguous` on a strided slice and the packed weight is U32 while
+  // scales/biases are F32, so a per-array `to_vec` is dtype-fragile; instead
+  // the saved vs loaded state is compared through `dequantize` (the
+  // contiguity-safe, dtype-uniform F32 reconstruction the cache semantically
+  // holds — Codex's "compare dequantized state before/after"). Because
+  // safetensors round-trips the packed bytes losslessly, the two dequantize
+  // EXACTLY equal (not just within the quant band). 1:1 port of cache.py:43-85.
   let path = temp_path("quantized_rt.safetensors");
 
   let mut c = QuantizedKvCacheImpl::new(64, 8).unwrap();
@@ -143,7 +185,16 @@ fn quantized_kvcache_round_trips_through_persist() {
   assert_eq!(want_meta.len(), 3, "quantized meta is [offset, gs, bits]");
   // `Array::shape()` returns an owned `Vec<usize>` and does NOT eval, so it
   // is safe to read off the `&self` state arrays for a shape-only compare.
-  let want_state_shapes: Vec<Vec<usize>> = c.state().unwrap().iter().map(|a| a.shape()).collect();
+  let want_state = c.state().unwrap();
+  let want_state_shapes: Vec<Vec<usize>> = want_state.iter().map(|a| a.shape()).collect();
+  // Capture the saved dense K/V CONTENTS (before `c` is moved into `cache`).
+  let (mut want_dk, mut want_dv) = dequant_quant_state(&want_state);
+  let want_dk_vec = want_dk.to_vec::<f32>().unwrap();
+  let want_dv_vec = want_dv.to_vec::<f32>().unwrap();
+  assert!(
+    !want_dk_vec.is_empty() && !want_dv_vec.is_empty(),
+    "dense state must be non-empty (3 steps x 64 dims)"
+  );
 
   let cache: Vec<Box<dyn KvCache>> = vec![Box::new(c)];
   save_prompt_cache(&path, &cache, &HashMap::new()).unwrap();
@@ -167,15 +218,24 @@ fn quantized_kvcache_round_trips_through_persist() {
   assert_eq!(loaded[0].reference_class_name(), "QuantizedKVCache");
   assert_eq!(loaded[0].offset(), want_offset);
   assert_eq!(loaded[0].meta_state(), want_meta);
-  let loaded_shapes: Vec<Vec<usize>> = loaded[0]
-    .state()
-    .unwrap()
-    .iter()
-    .map(|a| a.shape())
-    .collect();
+  let loaded_state = loaded[0].state().unwrap();
+  let loaded_shapes: Vec<Vec<usize>> = loaded_state.iter().map(|a| a.shape()).collect();
   assert_eq!(
     loaded_shapes, want_state_shapes,
     "quantized packed-state shapes must round-trip"
+  );
+  // CONTENT round-trip: the loaded packed state dequantizes to the SAME dense
+  // K/V as the saved one, byte-for-byte (lossless packed-byte round-trip).
+  let (mut got_dk, mut got_dv) = dequant_quant_state(&loaded_state);
+  assert_eq!(
+    got_dk.to_vec::<f32>().unwrap(),
+    want_dk_vec,
+    "loaded quantized keys must dequantize to the saved dense keys exactly"
+  );
+  assert_eq!(
+    got_dv.to_vec::<f32>().unwrap(),
+    want_dv_vec,
+    "loaded quantized values must dequantize to the saved dense values exactly"
   );
 
   let _ = fs::remove_file(&path);
@@ -225,10 +285,21 @@ fn cache_list_round_trips_through_persist() {
   );
   assert_eq!(restored.get(0).unwrap().offset(), 2);
   assert_eq!(restored.get(1).unwrap().offset(), 3);
-  // Child 0 key/value contents round-trip.
+  // Child 0 (StandardKvCache) key/value contents round-trip.
   let mut s0 = restored.get(0).unwrap().state().unwrap();
   assert_eq!(s0[0].to_vec::<f32>().unwrap(), vec![1.0, 2.0]);
   assert_eq!(s0[1].to_vec::<f32>().unwrap(), vec![3.0, 4.0]);
+  // Child 1 (RotatingKvCache) key/value contents ALSO round-trip
+  // (Codex #3: the original only checked child 0, so a corrupted child-1
+  // state would go undetected). The single S=3 prefill update from empty
+  // takes `update_concat`'s empty-cache branch (`(keys, values).try_clone`,
+  // rotating.rs:249-251), so the buffer is exactly [5,6,7] / [8,8,8]; with
+  // offset 3 == buffer len 3 `state()` returns the full buffer (NOT a
+  // shorter slice) (rotating.rs:469-483).
+  let mut s1 = restored.get(1).unwrap().state().unwrap();
+  assert_eq!(s1.len(), 2, "rotating child state is [keys, values]");
+  assert_eq!(s1[0].to_vec::<f32>().unwrap(), vec![5.0, 6.0, 7.0]);
+  assert_eq!(s1[1].to_vec::<f32>().unwrap(), vec![8.0, 8.0, 8.0]);
 
   let _ = fs::remove_file(&path);
 }
@@ -389,10 +460,31 @@ fn unknown_cache_kind_is_err_not_panic() {
   side.insert("2.0".to_string(), "BogusCacheKind".to_string());
   io::save_safetensors_with_metadata(&path, &arrays, &side).unwrap();
 
-  assert!(
-    load_prompt_cache(&path).is_err(),
-    "an unknown cache kind must be a recoverable Err, got Ok"
-  );
+  // Codex #4: pin the CONCRETE nested variant, not just `is_err()` (a generic
+  // earlier failure would also be Err). `from_state` rejects the kind via
+  // `KvCacheKind::parse` → `Error::UnknownEnumValue` (mod.rs:763-764), which
+  // `load_prompt_cache` wraps in a `LayerKeyed` (persist.rs:815-823).
+  let err = load_prompt_cache(&path)
+    .err()
+    .expect("an unknown cache kind must be a recoverable Err");
+  match &err {
+    Error::LayerKeyed(p) => match p.inner() {
+      Error::UnknownEnumValue(inner) => {
+        assert_eq!(
+          inner.type_name(),
+          "KvCacheKind",
+          "the wrapped variant must name the KvCacheKind enum"
+        );
+        assert_eq!(
+          inner.value(),
+          "BogusCacheKind",
+          "and carry the offending kind string"
+        );
+      }
+      other => panic!("LayerKeyed inner must be UnknownEnumValue, got {other:?}"),
+    },
+    other => panic!("unknown kind must be Err(LayerKeyed(UnknownEnumValue)), got {other:?}"),
+  }
 
   let _ = fs::remove_file(&path);
 }
@@ -416,10 +508,27 @@ fn array_group_index_out_of_range_is_err() {
   side.insert("0.0".to_string(), String::new());
   io::save_safetensors_with_metadata(&path, &arrays, &side).unwrap();
 
-  assert!(
-    load_prompt_cache(&path).is_err(),
-    "an array group index past the class count must be Err, got Ok"
-  );
+  // Codex #4: pin the CONCRETE variant + payload. One class ("2.0") so
+  // class_count=1; the lone array group with `i >= 1` is index 5, surfaced as
+  // `Error::OutOfRange` with the index/class-count context (persist.rs:648-654).
+  let err = load_prompt_cache(&path)
+    .err()
+    .expect("an array group index past the class count must be Err");
+  match &err {
+    Error::OutOfRange(p) => {
+      assert_eq!(
+        p.context(),
+        "load_prompt_cache: array group index (corrupt or incompatible file)"
+      );
+      assert_eq!(p.requirement(), "must be < class count");
+      assert!(
+        p.value().contains("index=5") && p.value().contains("class_count=1"),
+        "value must name the offending index and class count, got: {}",
+        p.value()
+      );
+    }
+    other => panic!("array-group OOB must be Err(OutOfRange), got {other:?}"),
+  }
 
   let _ = fs::remove_file(&path);
 }
@@ -440,10 +549,26 @@ fn non_dense_class_indices_is_err() {
   side.insert("2.2".to_string(), "KVCache".to_string()); // gap at index 1
   io::save_safetensors_with_metadata(&path, &arrays, &side).unwrap();
 
-  assert!(
-    load_prompt_cache(&path).is_err(),
-    "non-dense class indices (gap) must be a recoverable Err, got Ok"
-  );
+  // Codex #4: pin the CONCRETE variant + the `dense_len` context. Classes are
+  // present at indices {0,2} (present=2) with max index 2 (n = 2+1 = 3), so
+  // `dense_len(.., "class")` rejects the gap as `Error::LengthMismatch` with
+  // expected=present=2, actual=n=3 (persist.rs:299-309, "class" call site at
+  // 513). The single dense array group ("0.0") passes `unflatten_arrays`
+  // first, so this class check is the failing one.
+  let err = load_prompt_cache(&path)
+    .err()
+    .expect("non-dense class indices (gap) must be a recoverable Err");
+  match &err {
+    Error::LengthMismatch(p) => {
+      assert_eq!(
+        p.context(),
+        "prompt cache: non-dense class indices (corrupt or incompatible file)"
+      );
+      assert_eq!(p.expected(), 2, "present (distinct) class indices");
+      assert_eq!(p.actual(), 3, "max class index + 1");
+    }
+    other => panic!("non-dense class indices must be Err(LengthMismatch), got {other:?}"),
+  }
 
   let _ = fs::remove_file(&path);
 }
@@ -465,10 +590,26 @@ fn non_dense_array_sub_indices_is_err() {
   side.insert("0.0".to_string(), String::new());
   io::save_safetensors_with_metadata(&path, &arrays, &side).unwrap();
 
-  assert!(
-    load_prompt_cache(&path).is_err(),
-    "non-dense array sub-indices (gap) must be a recoverable Err, got Ok"
-  );
+  // Codex #4: pin the CONCRETE variant + the `dense_len` context. Cache 0's
+  // arrays are at sub-indices {0,2} (present=2) with max 2 (n = 2+1 = 3), so
+  // `dense_len(.., "array sub")` rejects the gap as `Error::LengthMismatch`
+  // with expected=present=2, actual=n=3 (persist.rs:357, "array sub" call
+  // site). `unflatten_arrays` runs before `unflatten_side`, so this is the
+  // failing check.
+  let err = load_prompt_cache(&path)
+    .err()
+    .expect("non-dense array sub-indices (gap) must be a recoverable Err");
+  match &err {
+    Error::LengthMismatch(p) => {
+      assert_eq!(
+        p.context(),
+        "prompt cache: non-dense array sub indices (corrupt or incompatible file)"
+      );
+      assert_eq!(p.expected(), 2, "present (distinct) array sub-indices");
+      assert_eq!(p.actual(), 3, "max array sub-index + 1");
+    }
+    other => panic!("non-dense array sub-indices must be Err(LengthMismatch), got {other:?}"),
+  }
 
   let _ = fs::remove_file(&path);
 }
