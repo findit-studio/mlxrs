@@ -2132,9 +2132,11 @@ pub fn rescale(arr: &Array, scale: f32) -> Result<Array> {
 pub fn normalize(arr: &Array, mean: &[f32; 3], std: &[f32; 3]) -> Result<Array> {
   let ndim = arr.ndim();
   if ndim == 0 {
-    return Err(Error::ShapeMismatch(
-      "normalize: input must have at least 1 dimension".into(),
-    ));
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "normalize: input must be rank >= 1 (at least 1 dimension)",
+      ndim as u32,
+      arr.shape(),
+    )));
   }
   // Validate trailing channel dim == 3 with a clear error before falling
   // through to mlx's less-friendly broadcast failure.

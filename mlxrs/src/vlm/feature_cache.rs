@@ -87,7 +87,7 @@
 //!   only practical collision-resistance).
 //! - **Bounded memory** — the reference is already bounded (`max_size`,
 //!   default 20); mlxrs keeps that exact cap and default. The constructor
-//!   rejects `max_size == 0` ([`Error::ShapeMismatch`]) rather than
+//!   rejects `max_size == 0` ([`Error::InvariantViolation`]) rather than
 //!   silently building a cache that can hold nothing (Python would not
 //!   raise but every `put` would immediately self-evict — a faithful but
 //!   useless state; mlxrs surfaces the misuse).
@@ -108,7 +108,7 @@ use std::{
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{Error, InvariantViolationPayload, Result},
 };
 
 /// The default `max_size` — matches `VisionFeatureCache(max_size=20)` in
@@ -545,18 +545,17 @@ impl VisionFeatureCache {
   ///
   /// # Errors
   ///
-  /// - [`Error::ShapeMismatch`] if `max_size == 0`. The reference does not
+  /// - [`Error::InvariantViolation`] if `max_size == 0`. The reference does not
   ///   raise on a zero cap, but a zero-capacity cache is a useless state —
   ///   every [`put`](Self::put) would store then immediately self-evict its
   ///   own entry, so [`get`](Self::get) could never hit. mlxrs surfaces the
   ///   misuse instead of silently building a cache that can hold nothing.
   pub fn with_max_size(max_size: usize) -> Result<Self> {
     if max_size == 0 {
-      return Err(Error::ShapeMismatch(
-        "VisionFeatureCache: max_size must be >= 1 (a zero-capacity \
-                  cache can never hold an entry)"
-          .into(),
-      ));
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "VisionFeatureCache: max_size",
+        "must be >= 1 (a zero-capacity cache can never hold an entry)",
+      )));
     }
     // Create the containers EMPTY — do NOT pre-reserve the raw `max_size`.
     // `max_size` is caller-/config-/request-derived; reserving it up front

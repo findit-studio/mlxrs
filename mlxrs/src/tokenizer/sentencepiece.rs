@@ -47,8 +47,11 @@ use serde_json::Value as JsonValue;
 
 use std::{collections::HashMap, fs, path::Path};
 
+use smol_str::format_smolstr;
+
 use crate::error::{
-  ArithmeticOverflowPayload, Error, FileIoPayload, FileOp, MissingFieldPayload, Result,
+  ArithmeticOverflowPayload, Error, FileIoPayload, FileOp, MissingFieldPayload, ParsePayload,
+  Result, UnknownEnumValuePayload,
 };
 
 /// SentencePiece piece-type enum, matching the upstream
@@ -193,7 +196,7 @@ impl SentencePieceToken {
 /// Minimal hand-rolled protobuf reader for the
 /// `ModelProto` subset SentencePiece serializes. Handles wire types `0`
 /// (varint), `1` (fixed64), `2` (length-delimited), and `5` (fixed32);
-/// any other wire type errors with [`Error::Backend`].
+/// any other wire type errors with [`Error::UnknownEnumValue`].
 struct SentencePieceProtobufReader<'a> {
   data: &'a [u8],
   index: usize,
@@ -285,8 +288,15 @@ impl<'a> SentencePieceProtobufReader<'a> {
         let _ = self.read_fixed32()?;
       }
       other => {
-        return Err(Error::Backend(format!(
-          "SentencePiece protobuf: unsupported wire type {other}"
+        return Err(Error::UnknownEnumValue(UnknownEnumValuePayload::new(
+          "SentencePiece protobuf: wire type",
+          format_smolstr!("{other}"),
+          &[
+            "0 (varint)",
+            "1 (fixed64)",
+            "2 (length-delimited)",
+            "5 (fixed32)",
+          ],
         )));
       }
     }
@@ -701,8 +711,9 @@ impl SentencePieceTokenizer {
   /// Build from raw `.model` protobuf bytes.
   ///
   /// # Errors
-  /// [`Error::Backend`] for any malformed-protobuf, truncated-field,
-  /// unsupported-wire-type, or empty-vocabulary input.
+  /// [`Error::Backend`] for any malformed-protobuf, truncated-field, or
+  /// empty-vocabulary input; [`Error::UnknownEnumValue`] for an
+  /// unsupported protobuf wire type.
   /// [`Error::ArithmeticOverflow`] when a length-delimited / fixed32 /
   /// fixed64 field's `checked_add` reader-index advance overflows
   /// (oversized length varint after the reader index has advanced).
@@ -882,15 +893,17 @@ impl SentencePieceTokenizer {
   /// Build from raw `tokenizer.json` bytes.
   ///
   /// # Errors
-  /// [`Error::Backend`] for any JSON-parse failure, plus the same
+  /// [`Error::Parse`] for any JSON-parse failure, plus the same
   /// [`Error::MissingField`] / [`Error::Backend`] errors propagated
   /// from [`Self::from_tokenizer_json`].
   #[cfg(feature = "tokenizer-config")]
   #[cfg_attr(docsrs, doc(cfg(feature = "tokenizer-config")))]
   pub fn from_tokenizer_json_bytes(data: &[u8]) -> Result<Self> {
     let json: JsonValue = serde_json::from_slice(data).map_err(|e| {
-      Error::Backend(format!(
-        "SentencePieceTokenizer: invalid tokenizer.json: {e}"
+      Error::Parse(ParsePayload::new(
+        "SentencePieceTokenizer::from_tokenizer_json_bytes",
+        "tokenizer.json",
+        e,
       ))
     })?;
     Self::from_tokenizer_json(&json)
@@ -1389,10 +1402,14 @@ mod tests {
   #[test]
   fn from_tokenizer_json_bytes_rejects_invalid_json() {
     let err = SentencePieceTokenizer::from_tokenizer_json_bytes(b"not json").unwrap_err();
-    let Error::Backend(message) = err else {
-      panic!("expected Error::Backend, got {err:?}");
+    let Error::Parse(p) = err else {
+      panic!("expected Error::Parse, got {err:?}");
     };
-    assert!(message.contains("invalid tokenizer.json"));
+    assert_eq!(p.input_kind(), "tokenizer.json");
+    assert_eq!(
+      p.context(),
+      "SentencePieceTokenizer::from_tokenizer_json_bytes"
+    );
   }
 
   #[cfg(feature = "tokenizer-config")]

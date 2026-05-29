@@ -233,8 +233,8 @@ fn concatenate_rejects_empty_input() {
   // Codex PR #5 finding 3 / dangling-pointer concern for empty Vec::as_ptr().
   let r = mlxrs::ops::shape::concatenate(&[], 0);
   assert!(
-    matches!(r, Err(mlxrs::Error::ShapeMismatch(_))),
-    "expected Err(ShapeMismatch) on empty input, got {r:?}"
+    matches!(r, Err(mlxrs::Error::EmptyInput(_))),
+    "expected Err(EmptyInput) on empty input, got {r:?}"
   );
 }
 

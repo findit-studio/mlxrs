@@ -56,8 +56,8 @@ use smol_str::format_smolstr;
 use crate::{
   array::Array,
   error::{
-    Error, InvariantViolationPayload, OutOfRangePayload, RankMismatchPayload, Result,
-    try_extend_from_slice, try_with_capacity,
+    EmptyInputPayload, Error, InvariantViolationPayload, OutOfRangePayload, RankMismatchPayload,
+    Result, try_extend_from_slice, try_with_capacity,
   },
   lm::{
     cache::{KvCache, can_trim_prompt_cache, trim_prompt_cache},
@@ -547,9 +547,9 @@ impl<'a> SpeculativeDriver<'a> {
       )));
     }
     if prompt.is_empty() {
-      return Err(Error::ShapeMismatch(
-        "speculative_generate: prompt must be non-empty".into(),
-      ));
+      return Err(Error::EmptyInput(EmptyInputPayload::new(
+        "speculative_generate: prompt",
+      )));
     }
     // AUDIO-12 #136 — eager scalar-bound validation of every sampler /
     // logits-processor knob in `cfg` BEFORE any prefill / model work,
@@ -913,7 +913,9 @@ impl<'a> SpeculativeDriver<'a> {
     // last-accepted draft already in `self.history`). At subsequent
     // iters it is the prior iter's sampled draft.
     let mut next_history_token: u32 = *y.last().ok_or_else(|| {
-      Error::ShapeMismatch("speculative_generate: draft_y_input must be non-empty".into())
+      Error::EmptyInput(EmptyInputPayload::new(
+        "speculative_generate: draft_y_input",
+      ))
     })?;
     for _ in 0..num_draft {
       let arr = token_window(&y)?;

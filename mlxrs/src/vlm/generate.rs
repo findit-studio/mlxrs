@@ -102,7 +102,7 @@ use std::{cell::RefCell, path::PathBuf};
 use crate::{
   array::Array,
   error::{
-    ArithmeticOverflowPayload, Error, LengthMismatchPayload, OutOfRangePayload,
+    ArithmeticOverflowPayload, EmptyInputPayload, Error, LengthMismatchPayload, OutOfRangePayload,
     RankMismatchPayload, Result, try_extend_from_slice, try_with_capacity,
   },
   lm::{
@@ -767,9 +767,9 @@ impl<M: Model + ?Sized> VlmDecode<'_, M> {
   ) -> Result<GenStep> {
     let t = prompt_tokens.len();
     if t == 0 {
-      return Err(Error::ShapeMismatch(
-        "vlm_generate: assembled prompt is empty (T=0); prefill cannot produce logits".into(),
-      ));
+      return Err(Error::EmptyInput(EmptyInputPayload::new(
+        "vlm_generate: assembled prompt (T=0); prefill cannot produce logits",
+      )));
     }
     // The cache may already hold tokens (a restored / pre-populated
     // prompt cache, or a model that pre-seeds the cache). Read the

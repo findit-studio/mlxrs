@@ -101,9 +101,9 @@ fn stack_with_method_form() {
 #[test]
 fn stack_rejects_empty_input() {
   let r = ops::shape::stack(&[]);
-  assert!(matches!(r, Err(mlxrs::Error::ShapeMismatch(_))));
+  assert!(matches!(r, Err(mlxrs::Error::EmptyInput(_))));
   let r2 = ops::shape::stack_axis(&[], 0);
-  assert!(matches!(r2, Err(mlxrs::Error::ShapeMismatch(_))));
+  assert!(matches!(r2, Err(mlxrs::Error::EmptyInput(_))));
 }
 
 #[test]

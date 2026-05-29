@@ -54,15 +54,15 @@ fn gather_single_axis_slice_sizes_one() {
 fn gather_rejects_empty_indices() {
   let a = Array::from_slice::<f32>(&[1.0, 2.0], &[2i32]).unwrap();
   let r = ops::indexing::gather(&a, &[], &[], &[1]);
-  // Production still emits the deprecated free-form `Error::ShapeMismatch`
-  // for this guard (typed-variant migration pending); assert the message
-  // content so the test fails when production is migrated AND the typed
-  // variant is reached.
+  // Production now surfaces this guard as the typed `Error::EmptyInput`
+  // variant (migrated from the deprecated free-form `ShapeMismatch`);
+  // assert the variant and that the payload's call-site context label is
+  // preserved in the rendered message.
   match r {
-    Err(mlxrs::Error::ShapeMismatch(msg)) => {
-      assert_eq!(msg, "gather: indices slice is empty");
+    Err(mlxrs::Error::EmptyInput(payload)) => {
+      assert_eq!(payload.context(), "gather: indices slice");
     }
-    other => panic!("expected ShapeMismatch for empty indices, got {other:?}"),
+    other => panic!("expected EmptyInput for empty indices, got {other:?}"),
   }
 }
 
