@@ -57,4 +57,14 @@ impl Array {
   pub fn isnan(&self) -> Result<Array> {
     crate::ops::comparison::isnan(self)
   }
+
+  /// Element-wise negative-infinity check. See [`crate::ops::comparison::isneginf`].
+  pub fn isneginf(&self) -> Result<Array> {
+    crate::ops::comparison::isneginf(self)
+  }
+
+  /// Element-wise positive-infinity check. See [`crate::ops::comparison::isposinf`].
+  pub fn isposinf(&self) -> Result<Array> {
+    crate::ops::comparison::isposinf(self)
+  }
 }

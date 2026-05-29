@@ -120,3 +120,47 @@ fn isnan_marks_only_nan() {
     vec![false, false, false, false, true]
   );
 }
+
+#[test]
+fn isposinf_marks_only_positive_infinity() {
+  // +inf → true; everything else (finite, -inf, nan) → false. Distinguishes
+  // isposinf from isinf (which would also flag the -inf slot).
+  let a = Array::from_slice::<f32>(
+    &[0.0, 1.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN],
+    &(5,),
+  )
+  .unwrap();
+  let mut r = a.isposinf().unwrap();
+  assert_eq!(
+    r.to_vec::<bool>().unwrap(),
+    vec![false, false, true, false, false]
+  );
+}
+
+#[test]
+fn isneginf_marks_only_negative_infinity() {
+  // -inf → true; everything else (finite, +inf, nan) → false. The mirror of
+  // isposinf; together they partition isinf's two true positions.
+  let a = Array::from_slice::<f32>(
+    &[0.0, 1.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN],
+    &(5,),
+  )
+  .unwrap();
+  let mut r = a.isneginf().unwrap();
+  assert_eq!(
+    r.to_vec::<bool>().unwrap(),
+    vec![false, false, false, true, false]
+  );
+}
+
+#[test]
+fn isposinf_isneginf_on_integer_input_all_false() {
+  // Integer dtypes cannot hold inf; mlx returns an all-false bool mask for
+  // both predicates (the `issubdtype(integer)` early return in ops.cpp).
+  let a = Array::from_slice::<i32>(&[-5, 0, 7], &(3,)).unwrap();
+  let mut pos = a.isposinf().unwrap();
+  assert_eq!(pos.dtype().unwrap(), mlxrs::Dtype::Bool);
+  assert_eq!(pos.to_vec::<bool>().unwrap(), vec![false, false, false]);
+  let mut neg = a.isneginf().unwrap();
+  assert_eq!(neg.to_vec::<bool>().unwrap(), vec![false, false, false]);
+}

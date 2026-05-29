@@ -18,7 +18,7 @@ use std::ffi::c_int;
 
 use crate::{
   array::Array,
-  error::{Result, check},
+  error::{EmptyInputPayload, Error, OutOfRangePayload, Result, check},
   shape::dim_ptr,
   stream::default_stream,
 };
@@ -471,4 +471,79 @@ pub fn logsumexp(a: &Array, keepdims: bool) -> Result<Array> {
   // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe { mlxrs_sys::mlx_logsumexp(&mut out.0, a.0, keepdims, default_stream()) })?;
   Ok(out)
+}
+
+/// Median along the given axes. Promotes integer inputs to f32+ and computes
+/// the midpoint of the sorted values along the reduce axes.
+///
+/// Unlike `mean_axes`/`var_axes`, explicit empty `axes` on a rank >= 1 array is
+/// rejected with [`Error::EmptyInput`]: mlx core `median` cannot reduce over
+/// zero axes of a non-scalar — it transposes the reduce axes to the back and
+/// flattens them, and an empty reduce set is a degenerate flatten that mlx
+/// throws on (the numpy-style identity-promote for empty axes is not part of
+/// mlx). A rank-0 scalar is the exception: its only axis list is empty and mlx
+/// special-cases `ndim == 0` (flatten reshapes to length 1), so a scalar is
+/// allowed through to `mlx_median` and yields its own (float-promoted) value.
+///
+/// The result is a thin forward of `mlx_median` and may be strided (median
+/// transposes the reduce axes), so call `crate::ops::shape::contiguous` before
+/// [`Array::to_vec`] to read it.
+///
+/// DIRECT-ARG SOUNDNESS (issue #266): beyond the empty-axes rejection, no
+/// bounded guard is needed. Axis values are validated C-side (out-of-bounds
+/// throws) and core median iterates them via a range-for and a `std::set`, not
+/// a signed `int i` over `axes.size()`, so there is no direct-argument
+/// count-overflow path (matching the merged `sum_axes` family).
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.median.html).
+pub fn median_axes(a: &Array, axes: &[i32], keepdims: bool) -> Result<Array> {
+  // A rank-0 scalar's only axis list is empty, and mlx median special-cases
+  // ndim == 0 (flatten reshapes to length 1), so that case is valid and must
+  // delegate to mlx. Only reject an explicit empty axis list on a rank >= 1
+  // array, where mlx median throws on the degenerate flatten.
+  if axes.is_empty() && a.ndim() > 0 {
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "median_axes: axes",
+    )));
+  }
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
+  check(unsafe {
+    mlxrs_sys::mlx_median(
+      &mut out.0,
+      a.0,
+      dim_ptr(axes),
+      axes.len(),
+      keepdims,
+      default_stream(),
+    )
+  })?;
+  Ok(out)
+}
+
+/// Median of all elements (full reduction). Convenience over [`median_axes`]
+/// covering every axis (mlx's `median(a, keepdims)` overload, which expands to
+/// `median` over `axes_for_median(a)` = all axes).
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.median.html).
+pub fn median(a: &Array, keepdims: bool) -> Result<Array> {
+  // `median` has no all-reduce mlx-c entry (unlike `sum`/`mean`, which call a
+  // dedicated `mlx_sum`/`mlx_mean`), so the full reduction is expressed as
+  // `median_axes` over every axis. `ndim` is an array rank — mlx stores it as a
+  // C++ `int`, so it always fits `c_int` — but convert through a checked cast
+  // rather than `as` so building the axis range can never silently wrap.
+  let ndim = c_int::try_from(a.ndim()).map_err(|_| {
+    Error::OutOfRange(OutOfRangePayload::new(
+      "median: array rank",
+      "must fit in c_int to build the full-reduction axis list",
+      "exceeds i32::MAX",
+    ))
+  })?;
+  let all_axes: Vec<c_int> = (0..ndim).collect();
+  median_axes(a, &all_axes, keepdims)
 }

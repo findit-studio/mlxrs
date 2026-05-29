@@ -543,3 +543,26 @@ pub fn view(a: &Array, dtype: Dtype) -> Result<Array> {
   })?;
   Ok(out)
 }
+
+/// Stop-gradient: forward identity that severs the backward pass. The returned
+/// array has the same shape, dtype, and values as `a`, but is a leaf in the
+/// computation graph — gradients do not flow through it (mlx inserts a
+/// `StopGradient` primitive whose VJP is zero). Use to freeze a sub-expression
+/// (e.g. a target/detached activation) during differentiation.
+///
+/// DIRECT-ARG SOUNDNESS (issue #266): no bounded guard needed — `stop_gradient`
+/// is unary with no scalar args and performs no arithmetic; it forwards `a`'s
+/// shape/dtype verbatim into the new node.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.stop_gradient.html).
+pub fn stop_gradient(a: &Array) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
+  check(unsafe { mlxrs_sys::mlx_stop_gradient(&mut out.0, a.0, default_stream()) })?;
+  Ok(out)
+}

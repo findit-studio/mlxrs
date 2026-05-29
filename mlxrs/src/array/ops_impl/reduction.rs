@@ -102,4 +102,14 @@ impl Array {
   pub fn logsumexp(&self, keepdims: bool) -> Result<Array> {
     crate::ops::reduction::logsumexp(self, keepdims)
   }
+
+  /// Median along the given axes. See [`crate::ops::reduction::median_axes`].
+  pub fn median_axes(&self, axes: &[i32], keepdims: bool) -> Result<Array> {
+    crate::ops::reduction::median_axes(self, axes, keepdims)
+  }
+
+  /// Median of all elements. See [`crate::ops::reduction::median`].
+  pub fn median(&self, keepdims: bool) -> Result<Array> {
+    crate::ops::reduction::median(self, keepdims)
+  }
 }

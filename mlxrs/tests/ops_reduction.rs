@@ -159,6 +159,106 @@ fn prod_axes_empty_returns_clone() {
   assert_eq!(r.to_vec::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
 }
 
+// ───────── median ─────────
+
+#[test]
+fn median_odd_count_is_middle_element() {
+  // Odd element count: sorted [1, 2, 3], midpoint index 3/2 = 1 → element 2.
+  // No averaging (flat_size % 2 != 0), so the result is exactly the middle.
+  let a = Array::from_slice(&[3.0_f32, 1.0, 2.0], &(3,)).unwrap();
+  let mut r = a.median(false).unwrap();
+  assert_eq!(r.item::<f32>().unwrap(), 2.0);
+}
+
+#[test]
+fn median_even_count_averages_two_midpoints() {
+  // Even element count: sorted [1, 2, 3, 4], mp = 4/2 = 2; result =
+  // (sorted[mp-1] + sorted[mp]) * 0.5 = (2 + 3) * 0.5 = 2.5. A "lower
+  // midpoint" (numpy `lower` interpolation) impl would wrongly return 2.0.
+  let a = Array::from_slice(&[4.0_f32, 1.0, 3.0, 2.0], &(4,)).unwrap();
+  let mut r = a.median(false).unwrap();
+  assert_eq!(r.item::<f32>().unwrap(), 2.5);
+}
+
+#[test]
+fn median_promotes_int_input_to_float() {
+  // `median` runs on `at_least_float(dtype)`; an i32 input promotes to f32
+  // and the even-count midpoint average can be fractional (2 elements → 1.5),
+  // which an identity-dtype (int-preserving) path could not represent.
+  let a = Array::from_slice(&[1_i32, 2], &(2,)).unwrap();
+  assert_eq!(a.dtype().unwrap(), mlxrs::Dtype::I32);
+  let mut r = a.median(false).unwrap();
+  assert_eq!(
+    r.dtype().unwrap(),
+    mlxrs::Dtype::F32,
+    "median promotes int to f32"
+  );
+  assert_eq!(r.item::<f32>().unwrap(), 1.5);
+}
+
+#[test]
+fn median_axes_over_axis1_with_keepdims() {
+  // [[1, 2, 3, 4], [10, 20, 30, 40]] median over axis 1 (even count each row):
+  // row0 → (2 + 3) * 0.5 = 2.5, row1 → (20 + 30) * 0.5 = 25.0.
+  // keepdims=true retains the reduced axis as length 1 → shape [2, 1].
+  let a = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0], &(2, 4)).unwrap();
+  let r = a.median_axes(&[1], true).unwrap();
+  assert_eq!(r.shape(), vec![2, 1]);
+  let mut r = r;
+  assert_eq!(r.to_vec::<f32>().unwrap(), vec![2.5, 25.0]);
+}
+
+#[test]
+fn median_axes_over_axis0_no_keepdims() {
+  // [[1, 5], [3, 9], [2, 7]] median over axis 0 (odd count, 3 rows):
+  // col0 sorted [1, 2, 3] → 2, col1 sorted [5, 7, 9] → 7. Drops the axis.
+  let a = Array::from_slice(&[1.0_f32, 5.0, 3.0, 9.0, 2.0, 7.0], &(3, 2)).unwrap();
+  let r = a.median_axes(&[0], false).unwrap();
+  assert_eq!(r.shape(), vec![2]);
+  // median transposes the reduce axis to the back, so the result is strided;
+  // materialize it row-contiguous before to_vec (mlxrs to_vec requires
+  // row-contiguous storage and otherwise returns Error::NonContiguous).
+  let mut r = mlxrs::ops::shape::contiguous(&r, false).unwrap();
+  assert_eq!(r.to_vec::<f32>().unwrap(), vec![2.0, 7.0]);
+}
+
+#[test]
+fn median_axes_empty_is_rejected() {
+  // Unlike mean/var (which promote-identity over empty axes), mlx core median
+  // cannot reduce over zero axes: it transposes the reduce axes to the back and
+  // flattens them, and an empty reduce set is a degenerate flatten that mlx
+  // throws on. The binding rejects empty axes up front with a typed error
+  // rather than surfacing the cryptic internal flatten message.
+  let a = Array::from_slice(&[1_i32, 2, 3, 4], &(2, 2)).unwrap();
+  match a.median_axes(&[], false) {
+    Err(mlxrs::Error::EmptyInput(p)) => assert_eq!(p.context(), "median_axes: axes"),
+    other => panic!("expected EmptyInput for empty axes, got {other:?}"),
+  }
+}
+
+#[test]
+fn median_scalar_rank0_is_identity() {
+  // A rank-0 scalar's only axis list is empty, but mlx median special-cases
+  // ndim == 0 (flatten reshapes to length 1), so median(scalar) is valid and
+  // returns the scalar itself. Regression: the empty-axes guard must NOT reject
+  // rank-0 (it only rejects an explicit empty axis list on rank >= 1 arrays).
+  let a = Array::from_slice::<f32>(&[5.0], &[0i32; 0]).unwrap();
+  assert_eq!(a.ndim(), 0);
+  let mut r = a.median(false).unwrap();
+  assert_eq!(r.item::<f32>().unwrap(), 5.0);
+}
+
+#[test]
+fn median_scalar_rank0_promotes_int() {
+  // Rank-0 int scalar median promotes to f32 (at_least_float), like every other
+  // median path, rather than being rejected as empty axes.
+  let a = Array::from_slice::<i32>(&[7], &[0i32; 0]).unwrap();
+  assert_eq!(a.ndim(), 0);
+  let mut r = a.median(false).unwrap();
+  assert_eq!(r.dtype().unwrap(), mlxrs::Dtype::F32);
+  assert_eq!(r.item::<f32>().unwrap(), 7.0);
+}
+
 // ───────── free-fn parity sanity ─────────
 
 #[test]

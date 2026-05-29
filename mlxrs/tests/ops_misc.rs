@@ -355,3 +355,15 @@ fn softmax_axis_method_form() {
   let mut r = a.softmax_axis(1, false).unwrap();
   assert_eq!(r.to_vec::<f32>().unwrap(), vec![0.5, 0.5]);
 }
+
+#[test]
+fn stop_gradient_is_forward_identity() {
+  // stop_gradient is a forward no-op: shape, dtype, and values are preserved.
+  // (It only severs the backward pass, which mlxrs cannot yet exercise without
+  // a value_and_grad wrapper — autograd lands in a later milestone.)
+  let a = Array::from_slice(&[1.5f32, -2.0, 3.25, 0.0], &[2, 2]).unwrap();
+  let mut sg = a.stop_gradient().unwrap();
+  assert_eq!(sg.shape(), &[2, 2]);
+  assert_eq!(sg.dtype().unwrap(), Dtype::F32);
+  assert_eq!(sg.to_vec::<f32>().unwrap(), vec![1.5, -2.0, 3.25, 0.0]);
+}

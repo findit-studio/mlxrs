@@ -117,4 +117,9 @@ impl Array {
   pub fn astype(&self, dtype: Dtype) -> Result<Array> {
     crate::ops::misc::astype(self, dtype)
   }
+
+  /// Forward-identity that blocks gradients. See [`crate::ops::misc::stop_gradient`].
+  pub fn stop_gradient(&self) -> Result<Array> {
+    crate::ops::misc::stop_gradient(self)
+  }
 }

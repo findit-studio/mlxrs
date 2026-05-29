@@ -210,3 +210,38 @@ pub fn isnan(a: &Array) -> Result<Array> {
   check(unsafe { mlxrs_sys::mlx_isnan(&mut out.0, a.0, default_stream()) })?;
   Ok(out)
 }
+
+/// Element-wise negative-infinity check: `true` where `a[i]` is -inf.
+/// Output dtype is Bool. Integer inputs (which cannot hold inf) yield an
+/// all-`false` mask, matching mlx (`isneginf` returns `full(shape, false)`
+/// for non-inexact dtypes).
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.isneginf.html).
+pub fn isneginf(a: &Array) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
+  check(unsafe { mlxrs_sys::mlx_isneginf(&mut out.0, a.0, default_stream()) })?;
+  Ok(out)
+}
+
+/// Element-wise positive-infinity check: `true` where `a[i]` is +inf.
+/// Output dtype is Bool. Integer inputs yield an all-`false` mask (see
+/// [`isneginf`]).
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.isposinf.html).
+pub fn isposinf(a: &Array) -> Result<Array> {
+  // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
+  // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
+  // early return / panic frees it, then populated by the following call.
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
+  // not retained by mlx past it); the out-param was freshly allocated above
+  // and is written by this call; the backend rc is surfaced via `check()`.
+  check(unsafe { mlxrs_sys::mlx_isposinf(&mut out.0, a.0, default_stream()) })?;
+  Ok(out)
+}
