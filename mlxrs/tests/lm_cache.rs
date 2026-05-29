@@ -10,7 +10,7 @@
 #![cfg(feature = "lm")]
 
 use mlxrs::{
-  Array, Error,
+  Array, Error, Stream,
   lm::cache::{
     ArraysCache, BatchKvCache, BatchRotatingKvCache, CacheConfig, CacheList, ChunkedKvCache,
     KvCache, MaskMode, QuantizedKvCacheImpl, RopeOffset, RotatingKvCache, StandardKvCache,
@@ -2046,5 +2046,494 @@ fn p1_kvcache_as_any_mut_downcasts_for_all_8_in_tree_impls() {
         .is_none(),
       "CacheList: wrong-type downcast must return None"
     );
+  }
+}
+
+// ============================================================
+// #260 — coverage gaps for standard.rs / rotating.rs / mask.rs
+//
+// The behaviors below were not directly exercised by the tests above:
+//   - `KvCache::materialize` (functional contract, not just the comment
+//     mention at the iarange test).
+//   - `StandardKvCache::set_state` / `RotatingKvCache::set_state` called
+//     DIRECTLY (the arity-error `OutOfRange` arm, the empty-state reset
+//     semantics, and the `offset = keys.shape[-2]` derivation), rather than
+//     only indirectly through `from_state`.
+//   - `StandardKvCache::trim` stored-tensor sync on the no-trim / empty-cache
+//     paths, and `RotatingKvCache::trim`'s `_idx` adjustment.
+//   - `mask::roll_1d`'s `s == 0` identity branch (cache.py:577), reached when
+//     a windowed N==1 decode happens while the ring is still linearly filling
+//     (`idx + 1 == mask_size`, so `shift % L == 0`).
+// ============================================================
+
+/// `StandardKvCache::materialize` (mlx-lm prefill memory barrier): a no-op on
+/// an empty cache (`Ok(())`, still empty), and an in-place force-eval of the
+/// stored `keys`/`values` that leaves the cache observably unchanged (same
+/// offset, same retained ids, still non-empty) on a populated cache. The
+/// cache stores its tensors at exactly the logical `offset` length
+/// (standard.rs:88-102), so `materialize` evaluating `self.keys`/`self.values`
+/// is equivalent to evaluating what `state()` returns — asserted via the
+/// post-materialize `state()` and the `nbytes()` "stored buffer == offset
+/// length" invariant.
+///
+/// Strengthened per Codex #2 (which noted the original only checked
+/// values/offset unchanged, so a no-op materialize would pass): the `nbytes()`
+/// pin confirms the buffer `materialize` evals is exactly the 4-row stored
+/// buffer (== `state()`), i.e. this cache has no over-allocated ring where the
+/// slice and the stored buffer diverge (contrast the RotatingKvCache test).
+/// RESIDUAL (same as the rotating case): `Array` exposes no `is_evaled` query
+/// and `eval` is value/shape-preserving, so no public-API assertion can fail
+/// on a *complete* no-op materialize — flagged for the controller.
+#[test]
+fn standard_materialize_noop_empty_and_eval_populated() {
+  // Empty cache: materialize is a no-op and the cache stays empty.
+  let mut s = StandardKvCache::new();
+  s.materialize().unwrap();
+  assert!(s.is_empty());
+  assert_eq!(s.offset(), 0);
+  assert_eq!(s.nbytes(), 0, "empty cache stores no buffer");
+
+  // Populate, then materialize: offset/contents/non-emptiness unchanged.
+  s.update(&kv(&[0.0, 1.0, 2.0, 3.0]), &kv(&[0.0, 1.0, 2.0, 3.0]))
+    .unwrap();
+  // Stored buffer == offset length (no over-allocation): 4 rows * 1 f32 * 4
+  // bytes for keys + the same for values = 32 bytes. This pins that the
+  // buffer `materialize` evals (self.keys/self.values) is exactly the 4-row
+  // stored buffer, which here equals `state()`.
+  assert_eq!(
+    s.nbytes(),
+    32,
+    "StandardKvCache stores exactly offset-length buffers (no over-allocation)"
+  );
+  s.materialize().unwrap();
+  assert!(!s.is_empty());
+  assert_eq!(s.offset(), 4);
+  assert_eq!(
+    s.nbytes(),
+    32,
+    "materialize is value/shape-preserving: stored buffer stays 4 rows"
+  );
+  let st = s.state().unwrap();
+  assert_eq!(st.len(), 2);
+  let mut sk = st[0].try_clone().unwrap();
+  let mut sv = st[1].try_clone().unwrap();
+  assert_eq!(sk.to_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0, 3.0]);
+  assert_eq!(sv.to_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0, 3.0]);
+
+  // A subsequent update still extends correctly (materialize did not poison
+  // the running buffer): [0,1,2,3] + [4] -> [0,1,2,3,4], offset 5.
+  let (mut k, _) = s.update(&kv(&[4.0]), &kv(&[4.0])).unwrap();
+  assert_eq!(s.offset(), 5);
+  assert_eq!(k.to_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+}
+
+/// `RotatingKvCache::materialize` evals the FULL stored ring buffer (the
+/// array the next chunk reuses), NOT the `offset`-length `state()` slice.
+///
+/// Strengthened per Codex #2: the original assertions only checked
+/// values/offset unchanged, so an empty (no-op) `materialize` would also pass.
+/// This now drives the ring into the OVER-ALLOCATED regime (`offset <
+/// buffer_len`) — the exact case the `materialize` doc says `state()` slices
+/// away (rotating.rs:486-507, mod.rs:281-309) — and pins the FULL stored buffer
+/// via `nbytes()` (which reads `self.keys`/`self.values`, the full ring, not
+/// the slice; util.rs:296-300). With `max_size=8` the first S==1 decode grows
+/// the ring to all 8 rows at once (`new_size = ROTATING_STEP.min(max_size -
+/// prev) = 256.min(8) = 8`, rotating.rs:339), so after 3 decodes the stored
+/// buffer is 8 rows while `state()` returns only 3 — making the full-buffer
+/// path that `materialize` evaluates observably distinct from the `state()`
+/// slice (Codex's "verify the full stored buffer path, not only the state
+/// slice"). RESIDUAL: `Array` exposes no `is_evaled`/`is_available` query and
+/// `eval` is value/shape-preserving (array/mod.rs:103-123), so NO public-API
+/// assertion can fail on a *complete* no-op materialize; the full-buffer
+/// regime + the `Ok` eval of that 8-row buffer are the strongest test-only
+/// pins (flagged for the controller).
+#[test]
+fn rotating_materialize_noop_empty_and_eval_populated() {
+  // Empty: no-op, stays empty.
+  let mut c = RotatingKvCache::new(8, 4);
+  c.materialize().unwrap();
+  assert!(c.is_empty());
+  assert_eq!(c.offset(), 0);
+  assert_eq!(c.nbytes(), 0, "empty cache stores no buffer");
+
+  // Drive to a known in-place-decode state below the window (offset 3 <
+  // max_size 8): the first decode grows the ring to all 8 rows, so the
+  // stored buffer is 8 rows while only 3 are written (over-allocated).
+  for id in 0..3 {
+    let t = kv(&[id as f32]);
+    c.update(&t, &t).unwrap();
+  }
+
+  // OVER-ALLOCATION pin (the regime `materialize` exists for): the stored
+  // ring is the FULL 8-row buffer, NOT the 3-row `state()` slice. `kv` rows
+  // are 1 f32 (4 bytes) each, so keys(8*4) + values(8*4) = 64 bytes; a
+  // hypothetical non-over-allocated buffer (== offset length) would be only
+  // 3*4 + 3*4 = 24. Asserting 64 BEFORE materialize proves we are in the
+  // over-allocated regime and that `materialize`'s target (self.keys/values,
+  // the full ring) is strictly larger than what `state()` slices.
+  assert_eq!(
+    c.nbytes(),
+    64,
+    "stored ring is the full 8-row buffer (over-allocated), not the 3-row state() slice"
+  );
+  assert_eq!(
+    c.state().unwrap()[0].shape(),
+    vec![1, 1, 3, 1],
+    "state() slices the full ring down to the 3-row offset view"
+  );
+
+  // Materialize evals the FULL 8-row ring (rotating.rs:499-507). The call must
+  // succeed in the over-allocated regime (the full-buffer eval path, distinct
+  // from evaluating the 3-row state slice).
+  c.materialize().unwrap();
+  assert!(!c.is_empty());
+  assert_eq!(c.offset(), 3);
+  assert_eq!(c.meta_state(), vec!["4", "8", "3", "3"]);
+  // materialize is shape/value-preserving: the stored buffer is STILL the
+  // full 8 rows (64 bytes) — it neither shrank to the slice nor changed.
+  assert_eq!(
+    c.nbytes(),
+    64,
+    "materialize is value/shape-preserving: stored ring stays 8 rows"
+  );
+  // state() still returns the offset-length slice [0,1,2] (offset 3 < buf 8).
+  let st = c.state().unwrap();
+  let mut sk = st[0].try_clone().unwrap();
+  assert_eq!(sk.to_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0]);
+
+  // Next decode extends the ring exactly as if materialize had not run:
+  // token 3 -> [0,1,2,3], offset 4, idx 4 (still linear fill). The stored
+  // buffer is unchanged 8 rows; only one more slot is written.
+  let (mut k, _) = c.update(&kv(&[3.0]), &kv(&[3.0])).unwrap();
+  assert_eq!(c.offset(), 4);
+  assert_eq!(k.to_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0, 3.0]);
+  assert_eq!(c.meta_state(), vec!["4", "8", "4", "4"]);
+  assert_eq!(c.nbytes(), 64, "decode reuses the same 8-row ring");
+}
+
+/// `StandardKvCache::materialize` is NOT a complete no-op — it force-evals the
+/// stored `self.keys`/`self.values` (standard.rs:94-101 via `Array::eval`).
+///
+/// Codex #2 R2: the `*_noop_empty_and_eval_populated` tests above use
+/// `nbytes()` (metadata-only) and `state().to_vec()` (which self-evals its own
+/// clone), so replacing `materialize` with `Ok(())` still passes them — no
+/// public-API assertion can observe a missed eval, because `eval` is
+/// value/shape-preserving. This test closes that gap with a side channel:
+/// `Array::eval` calls `assert_streams_not_cleared` (array/mod.rs:118), which
+/// PANICS once `Stream::clear_current_thread_streams` has poisoned the current
+/// OS thread (stream.rs:69-81). So on a cleared thread a CORRECT `materialize`
+/// (which evals) panics, while a no-op (`Ok(())`) returns cleanly.
+///
+/// `Array` is `!Send`, so the cache cannot cross a thread boundary — it is
+/// built, poisoned, and materialized entirely INSIDE the spawned closure. The
+/// populated cache is built via `update` only (NO `state()`/`to_vec()` — those
+/// would eval the buffers early and defeat the test); `update` stores the
+/// concatenated buffers lazily (standard.rs:60-76, no `eval`). The cleared
+/// state is per-thread and dies with the worker, so no other (main-thread)
+/// test is polluted.
+#[test]
+fn standard_materialize_is_not_a_noop_evals_buffers() {
+  let joined = std::thread::spawn(|| {
+    // (1) Populate via `update` only — leaves self.keys/self.values lazy.
+    let mut s = StandardKvCache::new();
+    s.update(&kv(&[0.0, 1.0, 2.0, 3.0]), &kv(&[0.0, 1.0, 2.0, 3.0]))
+      .unwrap();
+
+    // (2) Poison THIS thread (end-of-thread cleanup; exempt from the guard).
+    Stream::clear_current_thread_streams()
+      .expect("test setup: clear_current_thread_streams must succeed");
+
+    // (3) materialize -> Array::eval -> assert_streams_not_cleared -> PANIC.
+    s.materialize().unwrap();
+  })
+  .join();
+
+  let payload = joined.expect_err("materialize must panic on a cleared-stream thread");
+  let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+    (*s).to_string()
+  } else if let Some(s) = payload.downcast_ref::<String>() {
+    s.clone()
+  } else {
+    "<non-string panic payload>".to_string()
+  };
+
+  assert!(
+    msg.contains("Stream::clear_current_thread_streams() was called on this thread"),
+    "unexpected panic payload: {msg}"
+  );
+}
+
+/// `RotatingKvCache::materialize` is NOT a complete no-op — it force-evals the
+/// stored ring `self.keys`/`self.values` (rotating.rs:499-507 via `Array::eval`).
+///
+/// Same Codex #2 R2 mechanism as `standard_materialize_is_not_a_noop_evals_buffers`:
+/// on a thread poisoned by `Stream::clear_current_thread_streams`, the `eval`
+/// inside `materialize` trips `assert_streams_not_cleared` and panics, whereas
+/// a no-op `Ok(())` joins cleanly. Built/poisoned/materialized inside the
+/// closure (`Array: !Send`); populated by `update` only (rotating fills the
+/// ring lazily, no eval), so the buffers reach `materialize` unevaluated.
+#[test]
+fn rotating_materialize_is_not_a_noop_evals_buffers() {
+  let joined = std::thread::spawn(|| {
+    // (1) Populate via `update` only — leaves the ring buffers lazy.
+    let mut c = RotatingKvCache::new(8, 4);
+    for id in 0..3 {
+      let t = kv(&[id as f32]);
+      c.update(&t, &t).unwrap();
+    }
+
+    // (2) Poison THIS thread.
+    Stream::clear_current_thread_streams()
+      .expect("test setup: clear_current_thread_streams must succeed");
+
+    // (3) materialize -> eval -> PANIC if it really evals the stored ring.
+    c.materialize().unwrap();
+  })
+  .join();
+
+  let payload = joined.expect_err("materialize must panic on a cleared-stream thread");
+  let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+    (*s).to_string()
+  } else if let Some(s) = payload.downcast_ref::<String>() {
+    s.clone()
+  } else {
+    "<non-string panic payload>".to_string()
+  };
+
+  assert!(
+    msg.contains("Stream::clear_current_thread_streams() was called on this thread"),
+    "unexpected panic payload: {msg}"
+  );
+}
+
+/// `StandardKvCache::set_state` called DIRECTLY (mlx-lm `KVCache.state`
+/// setter, `cache.py:371`): a 2-array state installs the buffers and derives
+/// `offset = keys.shape[-2]`; an empty state resets to the fresh cache
+/// (`_BaseCache` "no state"); a wrong-arity state (`n != 0 && n != 2`) is a
+/// recoverable `Error::OutOfRange` whose payload pins the count.
+#[test]
+fn standard_set_state_direct_arity_and_offset() {
+  let mut s = StandardKvCache::new();
+
+  // 2-array state: offset derived from keys' seq axis (-2). A 5-row buffer
+  // -> offset 5; state() round-trips the same ids.
+  let buf = kv(&[10.0, 11.0, 12.0, 13.0, 14.0]); // [1,1,5,1]
+  s.set_state(vec![buf.try_clone().unwrap(), buf.try_clone().unwrap()])
+    .unwrap();
+  assert_eq!(s.offset(), 5, "offset = keys.shape[-2]");
+  assert!(!s.is_empty());
+  let st = s.state().unwrap();
+  let mut sk = st[0].try_clone().unwrap();
+  assert_eq!(
+    sk.to_vec::<f32>().unwrap(),
+    vec![10.0, 11.0, 12.0, 13.0, 14.0]
+  );
+
+  // Empty state -> reset to a fresh cache (offset 0, empty, no buffers).
+  s.set_state(Vec::new()).unwrap();
+  assert!(s.is_empty());
+  assert_eq!(s.offset(), 0);
+  assert!(s.state().unwrap().is_empty());
+
+  // Wrong arity (1 array) -> Error::OutOfRange, count in the payload.
+  let r = s.set_state(vec![kv(&[0.0])]);
+  match &r {
+    Err(Error::OutOfRange(p)) => {
+      assert_eq!(p.context(), "StandardKvCache::set_state: state array count");
+      assert_eq!(p.requirement(), "must be 0 or 2");
+      assert_eq!(p.value(), "1");
+    }
+    _ => panic!("1-array state must be Err(OutOfRange), got {r:?}"),
+  }
+  // Wrong arity (3 arrays) -> same typed error, count 3.
+  let r3 = s.set_state(vec![kv(&[0.0]), kv(&[0.0]), kv(&[0.0])]);
+  match &r3 {
+    Err(Error::OutOfRange(p)) => {
+      assert_eq!(p.value(), "3");
+    }
+    _ => panic!("3-array state must be Err(OutOfRange), got {r3:?}"),
+  }
+  // Rejected arity left the cache in its prior (empty) state.
+  assert!(s.is_empty());
+  assert_eq!(s.offset(), 0);
+}
+
+/// `RotatingKvCache::set_state` called DIRECTLY (mlx-lm `RotatingKVCache.state`
+/// setter, `cache.py:295`): a 2-array state installs the buffers but DOES NOT
+/// derive offset/idx from the keys (those come from `set_meta_state`); an
+/// empty state nulls the buffers while leaving keep/max_size/offset/idx
+/// untouched; a wrong-arity state is a recoverable `Error::OutOfRange`.
+#[test]
+fn rotating_set_state_direct_arity_and_buffer_only() {
+  let mut c = RotatingKvCache::new(8, 4);
+  // Establish a known non-zero offset/idx via the public update path.
+  for id in 0..3 {
+    let t = kv(&[id as f32]);
+    c.update(&t, &t).unwrap();
+  }
+  assert_eq!(c.meta_state(), vec!["4", "8", "3", "3"]);
+
+  // 2-array set_state: buffers replaced, but offset/idx/keep/max_size are
+  // NOT touched by the state setter (cache.py:295 only assigns keys/values).
+  let buf = kv(&[20.0, 21.0, 22.0, 23.0, 24.0]); // 5 rows
+  c.set_state(vec![buf.try_clone().unwrap(), buf.try_clone().unwrap()])
+    .unwrap();
+  assert_eq!(
+    c.meta_state(),
+    vec!["4", "8", "3", "3"],
+    "set_state must not change offset/idx (they come from set_meta_state)"
+  );
+  // The buffer is now the 5-row array; offset(3) < buffer_len(5) so state()
+  // returns the offset-length slice [20,21,22].
+  let st = c.state().unwrap();
+  let mut sk = st[0].try_clone().unwrap();
+  assert_eq!(sk.to_vec::<f32>().unwrap(), vec![20.0, 21.0, 22.0]);
+
+  // Empty state -> buffers nulled (is_empty true) but the scalar ring fields
+  // (keep, max_size, offset, idx) are left as-is (cache.py:295 empty arm).
+  c.set_state(Vec::new()).unwrap();
+  assert!(c.is_empty());
+  assert_eq!(
+    c.meta_state(),
+    vec!["4", "8", "3", "3"],
+    "empty set_state nulls only the buffers; offset/idx/keep/max_size persist"
+  );
+
+  // Wrong arity (1 array) -> Error::OutOfRange with the count.
+  let r = c.set_state(vec![kv(&[0.0])]);
+  match &r {
+    Err(Error::OutOfRange(p)) => {
+      assert_eq!(p.context(), "RotatingKvCache::set_state: state array count");
+      assert_eq!(p.requirement(), "must be 0 or 2");
+      assert_eq!(p.value(), "1");
+    }
+    _ => panic!("1-array rotating state must be Err(OutOfRange), got {r:?}"),
+  }
+}
+
+/// `StandardKvCache::trim` stored-tensor sync details (mlx-lm `KVCache.trim`):
+///   - `trim(0)` is a no-op (`trimmed == 0`, buffers untouched, offset same);
+///   - trimming on an EMPTY cache returns 0 (nothing to drop) and stays empty;
+///   - a non-zero trim slices BOTH stored buffers to the new offset so a
+///     later append extends the trimmed prefix and `state()` reflects it.
+#[test]
+fn standard_trim_no_op_empty_and_buffer_sync() {
+  // Empty cache: trim(5) -> 0, still empty.
+  let mut empty = StandardKvCache::new();
+  assert_eq!(empty.trim(5).unwrap(), 0);
+  assert!(empty.is_empty());
+  assert_eq!(empty.offset(), 0);
+
+  let mut s = StandardKvCache::new();
+  s.update(
+    &kv(&[0.0, 1.0, 2.0, 3.0, 4.0]),
+    &kv(&[0.0, 1.0, 2.0, 3.0, 4.0]),
+  )
+  .unwrap();
+  assert_eq!(s.offset(), 5);
+
+  // trim(0) -> 0, offset unchanged, buffers untouched.
+  assert_eq!(s.trim(0).unwrap(), 0);
+  assert_eq!(s.offset(), 5);
+  let st = s.state().unwrap();
+  let mut sk0 = st[0].try_clone().unwrap();
+  assert_eq!(sk0.to_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+
+  // trim(2) -> 2; offset 3; BOTH stored buffers sliced to [0,1,2] so state()
+  // shows the trimmed prefix and the next append extends it.
+  assert_eq!(s.trim(2).unwrap(), 2);
+  assert_eq!(s.offset(), 3);
+  let st = s.state().unwrap();
+  let mut sk = st[0].try_clone().unwrap();
+  let mut sv = st[1].try_clone().unwrap();
+  assert_eq!(sk.to_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0]);
+  assert_eq!(sv.to_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0]);
+  assert_eq!(sk.shape(), vec![1, 1, 3, 1]);
+}
+
+/// `RotatingKvCache::trim` (mlx-lm `RotatingKVCache.trim`, `cache.py`): only
+/// valid before the ring fills (`is_trimmable` == `offset < max_size`). It
+/// drops `min(offset, n)` and ALSO rewinds `_idx` by the same amount
+/// (`idx = idx.saturating_sub(trimmed)`), so the next in-place decode rewrites
+/// from the moved cursor. `meta_state()` exposes `(keep, max_size, offset,
+/// idx)`, making the `_idx` adjustment directly assertable.
+#[test]
+fn rotating_trim_adjusts_offset_and_idx() {
+  let mut c = RotatingKvCache::new(8, 2);
+  // Linear-fill regime: 5 single tokens -> offset 5, idx 5 (no rotation,
+  // offset < max_size). Trimmable.
+  for id in 0..5 {
+    let t = kv(&[id as f32]);
+    c.update(&t, &t).unwrap();
+  }
+  assert!(c.is_trimmable());
+  assert_eq!(c.meta_state(), vec!["2", "8", "5", "5"]);
+
+  // trim(2): trimmed = min(5, 2) = 2; offset 5-2 = 3; idx 5-2 = 3.
+  assert_eq!(c.trim(2).unwrap(), 2);
+  assert_eq!(c.offset(), 3);
+  assert_eq!(
+    c.meta_state(),
+    vec!["2", "8", "3", "3"],
+    "trim rewinds BOTH offset and _idx by the trimmed count"
+  );
+
+  // trim(100) never removes more than offset: trimmed = min(3, 100) = 3;
+  // offset 0; idx saturating_sub(3) = 0.
+  assert_eq!(c.trim(100).unwrap(), 3);
+  assert_eq!(c.offset(), 0);
+  assert_eq!(c.meta_state(), vec!["2", "8", "0", "0"]);
+
+  // Once the window is full, the cache is no longer trimmable (mlx-lm
+  // `is_trimmable`): fill to offset == max_size.
+  let mut full = RotatingKvCache::new(4, 2);
+  for id in 0..4 {
+    let t = kv(&[id as f32]);
+    full.update(&t, &t).unwrap();
+  }
+  assert_eq!(full.offset(), 4);
+  assert!(
+    !full.is_trimmable(),
+    "offset == max_size -> not trimmable (cache.py is_trimmable)"
+  );
+}
+
+/// `mask::roll_1d`'s identity branch (`s == shift % L == 0`, cache.py:577):
+/// reached through `RotatingKvCache::make_mask`'s windowed N==1 decode when
+/// the ring is still LINEARLY filling. There `idx == offset` and
+/// `mask_size == offset + 1`, so the roll `shift = idx + 1 == mask_size`
+/// gives `s == mask_size % mask_size == 0` -> the mask is returned UNROLLED.
+/// This complements the existing rolled (`shift == 1`) case, which exercises
+/// the non-identity wrap path.
+#[test]
+fn rotating_make_mask_n1_window_unrolled_during_linear_fill() {
+  // max_size=8, keep=0; 3 single tokens (linear fill, no rotation):
+  // offset 3, idx 3, buffer [0,1,2].
+  let mut c = RotatingKvCache::new(8, 0);
+  for id in 0..3 {
+    let t = kv(&[id as f32]);
+    c.update(&t, &t).unwrap();
+  }
+  assert_eq!(c.offset(), 3);
+  assert_eq!(c.meta_state(), vec!["0", "8", "3", "3"]);
+
+  // make_mask(1, Some(2), false):
+  //   cache.py:568 offset(3) >= ws(2) AND max_size(8) > ws(2) -> rolled branch.
+  //   cache.py:569-571 idx = _idx(3); 3 >= max_size(8)? no -> idx = 3.
+  //   cache.py:572-575 offset(3) < max_size(8)? yes -> mask_size = offset+1 = 4.
+  //   cache.py:576 mask = arange(4) >= (mask_size - ws = 4-2 = 2)
+  //     = [0,1,2,3] >= 2 = [F, F, T, T].
+  //   cache.py:577 mask = roll(mask, shift = idx+1 = 4): L=4, s = 4%4 = 0 ->
+  //     IDENTITY (roll_1d early return) -> mask stays [F, F, T, T].
+  match c.make_mask(1, Some(2), false).unwrap() {
+    MaskMode::Array(mut m) => {
+      assert_eq!(m.shape(), vec![4]);
+      assert_eq!(
+        m.to_vec::<bool>().unwrap(),
+        vec![false, false, true, true],
+        "shift == mask_size -> s == 0 -> roll_1d identity (unrolled mask)"
+      );
+    }
+    _ => panic!("N==1 windowed (offset >= ws, max_size > ws) must be an Array"),
   }
 }
