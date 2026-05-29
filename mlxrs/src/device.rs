@@ -35,6 +35,27 @@ use crate::error::{
 /// provide their own synchronization.
 static DEFAULT_DEVICE_LOCK: Mutex<()> = Mutex::new(());
 
+/// RAII guard for an `mlx_string` handle obtained from a fallible mlx-c
+/// `*_tostring` call. The handle is freed exactly once on drop via
+/// `mlx_string_free` — crucially, *even if the formatting code that borrows
+/// the string unwinds*. The previous hand-rolled `mlx_string_free` at the end
+/// of the `Debug` impl was skipped on a `write!` panic, leaking the string;
+/// the guard moves the free onto the unwind path. Mirrors `ffi::VectorArrayGuard`.
+struct StringGuard(mlxrs_sys::mlx_string);
+
+impl Drop for StringGuard {
+  fn drop(&mut self) {
+    // SAFETY: frees a handle this guard owns exactly once. Runs during `Drop`
+    // / unwind / thread teardown: must not touch TLS, call `check()`, panic,
+    // or unwind across `extern "C"`; the rc is discarded silently per the
+    // crate's Drop convention. `mlx_string_free` is a defined no-op on a NULL
+    // ctx (sentinel-handle pattern).
+    unsafe {
+      let _ = mlxrs_sys::mlx_string_free(self.0);
+    }
+  }
+}
+
 /// Device kind tag — mirrors `mlx_device_type` (`MLX_CPU` / `MLX_GPU`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display, derive_more::IsVariant)]
 #[display("{}", self.as_str())]
@@ -114,7 +135,7 @@ unsafe impl Send for Device {}
 // across threads cannot race.
 unsafe impl Sync for Device {}
 
-assert_impl_all!(Device: Send, Sync);
+assert_impl_all!(Device: Send, Sync, std::hash::Hash, std::fmt::Display, std::fmt::Debug);
 
 impl Drop for Device {
   fn drop(&mut self) {
@@ -182,6 +203,16 @@ impl Device {
   /// Serialized against [`Device::set_default`] via `DEFAULT_DEVICE_LOCK` —
   /// reading the non-atomic mlx-c++ global concurrently with a write would
   /// be a C++ data race.
+  ///
+  /// **Naming (M7, #257).** This is the default-device *reader*; its writer
+  /// is [`Device::set_default`]. The analogous default-*stream* pair is the
+  /// free functions [`get_default_stream`](crate::stream::get_default_stream)
+  /// / [`set_default_stream`](crate::stream::set_default_stream) — those take
+  /// an explicit `device`/`stream` argument (a stream's default is per-device
+  /// and per-thread), whereas the default *device* is a single process global
+  /// with no argument, so it reads naturally as the method `Device::current()`.
+  /// [`Device::get_default`] is provided as a `get_default_*`-symmetric alias
+  /// for callers who prefer the verb to match the stream API.
   pub fn current() -> Result<Self> {
     ensure_handler_installed();
     let _g = DEFAULT_DEVICE_LOCK
@@ -196,6 +227,18 @@ impl Device {
     // and is written by this call; the backend rc is surfaced via `check()`.
     check(unsafe { mlxrs_sys::mlx_get_default_device(&mut out.0) })?;
     Ok(out)
+  }
+
+  /// Alias for [`Device::current`] (M7, #257) — same `mlx_get_default_device`
+  /// read, named to mirror the stream module's
+  /// [`get_default_stream`](crate::stream::get_default_stream) /
+  /// [`set_default_stream`](crate::stream::set_default_stream) verb. Provided
+  /// so callers can use a consistent `get_default*` vocabulary across the
+  /// device and stream APIs; `current()` remains the primary spelling. This
+  /// is a non-breaking addition, NOT a rename.
+  #[inline(always)]
+  pub fn get_default() -> Result<Self> {
+    Self::current()
   }
 
   /// Install `self` as the mlx-c++ process-wide default device. Wraps
@@ -295,47 +338,101 @@ impl PartialEq for Device {
 
 impl Eq for Device {}
 
+// `Hash` consistent with `PartialEq`/`Eq` (M9). `Device` equality is by
+// `{kind, index}` value (`mlx_device_equal`), NOT by handle identity, so
+// `Hash` must hash that same payload — hashing the raw `ctx` pointer would
+// violate the `k1 == k2 ⇒ hash(k1) == hash(k2)` law (two distinct handles
+// with the same `{kind, index}` compare equal but have different pointers).
+// `kind()` / `index()` reach fallible mlx-c; a getter error (only on a
+// stripped handle) is folded into a fixed sentinel so `Hash` stays total
+// and infallible. Cost is acceptable: `Device` is a tiny descriptor, hashed
+// rarely (e.g. as a `HashMap`/`HashSet` key for per-device bookkeeping).
+impl std::hash::Hash for Device {
+  fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+    match (self.kind(), self.index()) {
+      (Ok(kind), Ok(index)) => {
+        kind.hash(state);
+        index.hash(state);
+      }
+      // Unreadable handle: hash a stable sentinel. Two such handles collide
+      // (acceptable) and never collide with a readable `{kind, index}`.
+      _ => i32::MIN.hash(state),
+    }
+  }
+}
+
+/// Renders the device via mlx-c's `mlx_device_tostring` — which already emits
+/// a compact `Device(gpu, 0)`-style string — and shares that one fallible
+/// FFI call between [`Debug`](std::fmt::Debug) and [`Display`](std::fmt::Display).
+///
+/// `wrap = Some("Device")` produces `Debug`'s `Device(<mlx text>)` form
+/// (preserving the historical `Device(Device(gpu, 0))` rendering); `wrap =
+/// None` produces `Display`'s verbatim `<mlx text>` (`Device(gpu, 0)`) — the
+/// concise human form, mirroring how [`DeviceKind`]'s `Display` is the plain
+/// canonical name.
+///
+/// The borrowed `mlx_string` is owned by a [`StringGuard`], so it is freed
+/// exactly once even if `write!` unwinds (M1, #257: the previous explicit
+/// `mlx_string_free` at the tail was skipped on a formatter panic, leaking
+/// the string).
+fn fmt_device(
+  dev: &Device,
+  f: &mut std::fmt::Formatter<'_>,
+  wrap: Option<&str>,
+) -> std::fmt::Result {
+  // Reaches fallible mlx-c (mlx_device_tostring); install the handler first
+  // per the error.rs contract so a stripped/disabled ctor can't let mlx's
+  // default printf+exit abort the process. (No poison concept for Device —
+  // it is not thread-affine.)
+  crate::error::ensure_handler_installed();
+  // SAFETY: `mlx_string_new()` returns a fresh empty out-param `mlx_string`
+  // (NULL ctx) per the mlx-c convention; populated by the following call and
+  // owned by the RAII `StringGuard` so it is freed exactly once even if the
+  // `write!` below unwinds.
+  let mut guard = StringGuard(unsafe { mlxrs_sys::mlx_string_new() });
+  // SAFETY: `dev.0` is a valid borrowed handle; `&mut guard.0` is the fresh
+  // `mlx_string` out-param (freed by the guard); mlx-c writes the formatted
+  // string into it and the rc is surfaced (checked below).
+  let rc = unsafe { mlxrs_sys::mlx_device_tostring(&mut guard.0, dev.0) };
+  let text = if rc == 0 {
+    // SAFETY: `guard.0` is a live `mlx_string` (freed only when `guard` drops,
+    // after this borrow); mlx-c returns its internal NUL-terminated buffer,
+    // valid until the string is freed. The returned pointer is NULL-checked
+    // before use.
+    let p = unsafe { mlxrs_sys::mlx_string_data(guard.0) };
+    if p.is_null() {
+      None
+    } else {
+      // SAFETY: the pointer was NULL-checked just above and points into the
+      // live `mlx_string` (owned by `guard`, freed only after this borrow);
+      // the C string is NUL-terminated by mlx-c.
+      Some(unsafe { CStr::from_ptr(p) }.to_string_lossy())
+    }
+  } else {
+    None
+  };
+  let result = match (wrap, &text) {
+    (Some(prefix), Some(t)) => write!(f, "{prefix}({t})"),
+    (Some(prefix), None) => write!(f, "{prefix}(<unprintable>)"),
+    (None, Some(t)) => f.write_str(t.as_ref()),
+    (None, None) => f.write_str("<unprintable>"),
+  };
+  // `guard` drops here (and on any early panic), freeing the string.
+  result
+}
+
 impl std::fmt::Debug for Device {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    // Reaches fallible mlx-c (mlx_device_tostring); install the handler
-    // first per the error.rs contract so a stripped/disabled ctor can't
-    // let mlx's default printf+exit abort the process. (No poison concept
-    // for Device — it is not thread-affine.)
-    crate::error::ensure_handler_installed();
-    // Borrow the raw bytes from mlx_string. RAII via the local guard so a
-    // panic in `write!` still frees the string.
-    // SAFETY: `mlx_string_new()` returns a fresh empty out-param `mlx_string`
-    // (NULL ctx) per the mlx-c convention; populated by the following call
-    // and freed via the local guard / explicit `mlx_string_free`.
-    let mut s = unsafe { mlxrs_sys::mlx_string_new() };
-    // SAFETY: `self.0` is a valid borrowed handle; `s` is a fresh `mlx_string`
-    // out-param freed via the local guard/explicit free; mlx-c writes the
-    // formatted string into it and the rc is surfaced (checked below).
-    let rc = unsafe { mlxrs_sys::mlx_device_tostring(&mut s, self.0) };
-    let result = if rc == 0 {
-      // SAFETY: `s` is a live `mlx_string` (freed only after this borrow); mlx-c
-      // returns its internal NUL-terminated buffer, valid until the string is
-      // freed. The returned pointer is NULL-checked before use.
-      let p = unsafe { mlxrs_sys::mlx_string_data(s) };
-      if p.is_null() {
-        write!(f, "Device(<unprintable>)")
-      } else {
-        // SAFETY: the pointer was NULL-checked just above and points into the live
-        // `mlx_string` (still owned here, freed only after this borrow); the C
-        // string is NUL-terminated by mlx-c.
-        let cs = unsafe { CStr::from_ptr(p) };
-        write!(f, "Device({})", cs.to_string_lossy())
-      }
-    } else {
-      write!(f, "Device(<unprintable>)")
-    };
-    // SAFETY: frees a handle this guard owns exactly once. Runs during `Drop` /
-    // thread teardown: must not touch TLS, call `check()`, panic, or unwind
-    // across `extern "C"`; the rc is discarded silently per the crate's
-    // Drop convention.
-    unsafe {
-      let _ = mlxrs_sys::mlx_string_free(s);
-    }
-    result
+    fmt_device(self, f, Some("Device"))
+  }
+}
+
+/// `Display` (M3, #257): the concise human form. mlx-c's `mlx_device_tostring`
+/// already renders a compact `Device(gpu, 0)` string; `Display` surfaces it
+/// verbatim (no extra `Device(...)` wrapper that `Debug` adds), matching the
+/// `DeviceKind` convention where `Display` is the plain canonical form.
+impl std::fmt::Display for Device {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fmt_device(self, f, None)
   }
 }

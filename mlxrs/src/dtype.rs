@@ -9,7 +9,7 @@ use crate::error::{Error, Result, check};
 /// `#[non_exhaustive]` is intentionally NOT applied — the enum already covers
 /// all 14 mlx-c dtypes; adding a new dtype upstream is rare and warrants a
 /// SemVer-major bump.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display, derive_more::IsVariant)]
 #[display("{}", self.as_str())]
 pub enum Dtype {
   /// Boolean.
@@ -108,13 +108,84 @@ impl From<Dtype> for mlxrs_sys::mlx_dtype {
   }
 }
 
+/// A 64-bit complex value — the Rust counterpart of mlx-c's
+/// `mlx_complex64_t` (`std::complex<float>`): two `f32` lanes, real and
+/// imaginary.
+///
+/// Rust has no native complex scalar, so [`Dtype::Complex64`] arrays had no
+/// safe data-extraction path (#257 M2). `Complex64` closes that: it
+/// implements [`Element`], giving a safe round-trip through the generic
+/// `Array` API — `Array::from_slice::<Complex64>`, `Array::item::<Complex64>`,
+/// `Array::as_slice::<Complex64>`, `Array::to_vec::<Complex64>`.
+///
+/// `#[repr(C)]` with `re` first then `im` matches `mlx_complex64_t`
+/// (`__BindgenComplex<f32> { re, im }`) byte-for-byte, which is what makes the
+/// `data()` pointer-cast and the `from_slice` buffer copy sound.
+///
+/// No `Eq`/`Hash` — the `f32` lanes preclude them (NaN ≠ NaN), matching the
+/// type-convention rule for floating-point fields.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Complex64 {
+  re: f32,
+  im: f32,
+}
+
+impl Complex64 {
+  /// Construct from real and imaginary parts.
+  #[inline(always)]
+  pub const fn new(re: f32, im: f32) -> Self {
+    Self { re, im }
+  }
+
+  /// The real part.
+  #[inline(always)]
+  pub const fn re(&self) -> f32 {
+    self.re
+  }
+
+  /// The imaginary part.
+  #[inline(always)]
+  pub const fn im(&self) -> f32 {
+    self.im
+  }
+
+  /// The `(real, imaginary)` parts as a tuple — the ergonomic extraction the
+  /// audit asked for (#257 M2). Pairs with the `From<(f32, f32)>` /
+  /// `From<Complex64> for (f32, f32)` conversions below.
+  #[inline(always)]
+  pub const fn as_parts(&self) -> (f32, f32) {
+    (self.re, self.im)
+  }
+}
+
+impl From<(f32, f32)> for Complex64 {
+  /// `(re, im)` → `Complex64`.
+  #[inline(always)]
+  fn from((re, im): (f32, f32)) -> Self {
+    Self::new(re, im)
+  }
+}
+
+impl From<Complex64> for (f32, f32) {
+  /// `Complex64` → `(re, im)`.
+  #[inline(always)]
+  fn from(c: Complex64) -> Self {
+    (c.re, c.im)
+  }
+}
+
 /// Sealed trait for types that can serve as `Array` elements.
 ///
 /// M1 ships impls for `bool`, `i32`, `u32`, `f32`, `half::f16`. M2a adds
 /// `u8`, `u16`, `u64`, `i8`, `i16`, `i64`, `f64`, `half::bf16` — covering
 /// every non-complex `Dtype` variant. `f64` lives in mlx-c's CPU-only path
 /// (Metal has no native f64); use sparingly.
-/// `Complex64` has no native Rust scalar — use `Array::astype` if needed.
+///
+/// The 14th `Dtype` variant, [`Dtype::Complex64`], is represented by the
+/// crate's own [`Complex64`] value type (Rust has no native complex scalar),
+/// which also implements `Element` — so `Array::{from_slice, item, as_slice,
+/// to_vec}::<Complex64>()` give a safe round-trip for complex data (#257 M2).
 pub trait Element: sealed::Sealed + Copy + 'static {
   /// The mlx dtype this Rust type represents.
   const DTYPE: Dtype;
@@ -160,6 +231,7 @@ impl sealed::Sealed for f32 {}
 impl sealed::Sealed for f64 {}
 impl sealed::Sealed for half::f16 {}
 impl sealed::Sealed for half::bf16 {}
+impl sealed::Sealed for Complex64 {}
 
 impl Element for bool {
   const DTYPE: Dtype = Dtype::Bool;
@@ -528,5 +600,111 @@ impl Element for half::bf16 {
   fn sentinel_ptr() -> *const Self {
     static V: half::bf16 = half::bf16::ZERO;
     &V
+  }
+}
+
+// Complex64 — the crate's own value type (no native Rust complex scalar). It
+// is `#[repr(C)] { re: f32, im: f32 }`, byte-identical to mlx-c's
+// `mlx_complex64_t = __BindgenComplex<f32> { re, im }`, so the item out-param
+// and the data pointer-cast are layout-sound. Closes #257 M2: gives complex
+// arrays a safe data-extraction path through the generic `Array` accessors.
+impl Element for Complex64 {
+  const DTYPE: Dtype = Dtype::Complex64;
+  unsafe fn item(arr: mlxrs_sys::mlx_array) -> Result<Self> {
+    // `re`/`im` are plain `f32`s; the zero value is valid and is overwritten
+    // by the `mlx_array_item_complex64` call below before it is read.
+    let mut raw = mlxrs_sys::mlx_complex64_t { re: 0.0, im: 0.0 };
+    // SAFETY: trait contract (see `Element::item` # Safety): `arr` is a valid,
+    // evaluated handle whose dtype the caller verified `== Self::DTYPE`;
+    // `raw` is a live stack slot; the rc is surfaced via `check()`.
+    check(unsafe { mlxrs_sys::mlx_array_item_complex64(&mut raw, arr) })?;
+    Ok(Self::new(raw.re, raw.im))
+  }
+  unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize) {
+    // SAFETY: trait contract (see `Element::data` # Safety): `arr` is a valid,
+    // evaluated, dtype-/contiguity-checked handle; the call returns a
+    // borrowed `(ptr, len)` view into mlx's buffer (no retain, no rc). The
+    // cast is sound: `Complex64` and `mlx_complex64_t` are both
+    // `#[repr(C)] { re: f32, im: f32 }` with identical size/align/layout.
+    unsafe {
+      (
+        mlxrs_sys::mlx_array_data_complex64(arr) as *const Complex64,
+        mlxrs_sys::mlx_array_size(arr),
+      )
+    }
+  }
+  fn sentinel_ptr() -> *const Self {
+    static V: Complex64 = Complex64::new(0.0, 0.0);
+    &V
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn complex64_parts_round_trip() {
+    let c = Complex64::new(1.5, -2.25);
+    assert_eq!(c.re(), 1.5);
+    assert_eq!(c.im(), -2.25);
+    assert_eq!(c.as_parts(), (1.5, -2.25));
+  }
+
+  #[test]
+  fn complex64_tuple_conversions() {
+    let c: Complex64 = (3.0_f32, 4.0_f32).into();
+    assert_eq!(c, Complex64::new(3.0, 4.0));
+    let parts: (f32, f32) = c.into();
+    assert_eq!(parts, (3.0, 4.0));
+  }
+
+  #[test]
+  fn complex64_default_is_zero() {
+    assert_eq!(Complex64::default(), Complex64::new(0.0, 0.0));
+  }
+
+  // M2 soundness guard: `Element::data` casts `*const mlx_complex64_t` to
+  // `*const Complex64`, and `from_slice` copies a `&[Complex64]` buffer into an
+  // mlx complex array. Both are sound only if the two types share layout. This
+  // pins that invariant so a future field reorder / repr change fails here
+  // rather than as silent UB at the FFI boundary.
+  #[test]
+  fn complex64_layout_matches_mlx_complex64_t() {
+    use std::mem::{align_of, size_of};
+    assert_eq!(
+      size_of::<Complex64>(),
+      size_of::<mlxrs_sys::mlx_complex64_t>(),
+      "Complex64 size must match mlx_complex64_t"
+    );
+    assert_eq!(
+      align_of::<Complex64>(),
+      align_of::<mlxrs_sys::mlx_complex64_t>(),
+      "Complex64 align must match mlx_complex64_t"
+    );
+    // Field order: a known bit pattern set through the FFI struct must read
+    // back identically through Complex64 (re first, im second).
+    let raw = mlxrs_sys::mlx_complex64_t { re: 7.0, im: 9.0 };
+    // SAFETY: identical `#[repr(C)] { f32, f32 }` layout asserted just above.
+    let as_c: Complex64 = unsafe { std::mem::transmute(raw) };
+    assert_eq!(as_c, Complex64::new(7.0, 9.0));
+  }
+
+  #[test]
+  fn complex64_dtype_is_complex64() {
+    assert_eq!(<Complex64 as Element>::DTYPE, Dtype::Complex64);
+  }
+
+  #[test]
+  fn dtype_hash_consistent_with_eq() {
+    use std::collections::HashSet;
+    let mut set = HashSet::new();
+    set.insert(Dtype::F32);
+    set.insert(Dtype::Complex64);
+    set.insert(Dtype::F32); // duplicate value
+    assert_eq!(set.len(), 2);
+    assert!(set.contains(&Dtype::F32));
+    assert!(set.contains(&Dtype::Complex64));
+    assert!(!set.contains(&Dtype::I32));
   }
 }

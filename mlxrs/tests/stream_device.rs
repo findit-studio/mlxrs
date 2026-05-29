@@ -106,6 +106,63 @@ fn device_debug_prints_something() {
   assert!(s.starts_with("Device("), "unexpected debug format: {s}");
 }
 
+#[test]
+fn device_display_is_concise_and_consistent_with_debug() {
+  // M3 (#257): Display surfaces mlx's compact device string verbatim, WITHOUT
+  // the extra outer `Device(...)` wrapper that Debug adds. So Debug wraps
+  // Display exactly once: Debug == "Device(" + Display + ")".
+  let dev = Device::cpu().unwrap();
+  let disp = format!("{dev}");
+  let dbg = format!("{dev:?}");
+  assert!(!disp.is_empty(), "Display produced empty string");
+  // CPU device's mlx string mentions cpu.
+  assert!(
+    disp.to_lowercase().contains("cpu"),
+    "expected cpu device Display to mention cpu: {disp}"
+  );
+  // Debug is exactly Display wrapped once more in `Device(...)`.
+  assert_eq!(
+    dbg,
+    format!("Device({disp})"),
+    "Debug must wrap Display once"
+  );
+  // Display itself carries one fewer `Device(` than Debug (no double wrap).
+  assert_eq!(
+    disp.matches("Device(").count() + 1,
+    dbg.matches("Device(").count(),
+    "Display should have exactly one fewer Device( than Debug"
+  );
+}
+
+#[test]
+fn device_hash_consistent_with_eq_in_a_hashset() {
+  // M9 (#257): Hash must agree with Eq (by {kind, index} value, not handle
+  // identity). Two independently constructed CPU handles compare equal and
+  // must collapse to one entry; a GPU handle is distinct.
+  use std::collections::HashSet;
+  let a = Device::cpu().unwrap();
+  let b = Device::cpu().unwrap();
+  assert_eq!(a, b);
+
+  let mut set = HashSet::new();
+  set.insert(a);
+  // Equal value → already present, set size stays 1.
+  assert!(!set.insert(b), "equal Device must already be in the set");
+  assert_eq!(set.len(), 1);
+
+  let g = Device::gpu().unwrap();
+  assert!(set.insert(g), "a GPU device is distinct from CPU");
+  assert_eq!(set.len(), 2);
+}
+
+#[test]
+fn device_get_default_alias_agrees_with_current() {
+  // M7 (#257): `get_default` is a non-breaking alias for `current`.
+  let a = Device::get_default().expect("get_default");
+  let b = Device::current().expect("current");
+  assert_eq!(a, b);
+}
+
 // ───────────────────────── Stream ─────────────────────────
 
 #[test]

@@ -23,7 +23,7 @@
 
 pub use array::Array;
 pub use device::{Device, DeviceKind};
-pub use dtype::{Dtype, Element};
+pub use dtype::{Complex64, Dtype, Element};
 pub use error::{Error, Result};
 pub use shape::IntoShape;
 pub use stream::Stream;
