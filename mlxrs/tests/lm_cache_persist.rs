@@ -32,7 +32,7 @@ use std::{collections::HashMap, fs, path::PathBuf, process};
 use mlxrs::{
   Array, Error, io,
   lm::cache::{
-    ArraysCache, CacheList, ChunkedKvCache, KvCache, QuantizedKvCacheImpl,
+    ArraysCache, CacheList, ChunkedKvCache, KvCache, QuantizedKvCache, QuantizedKvCacheImpl,
     RotatingKvCache, StandardKvCache, load_prompt_cache, reference_class_name, save_prompt_cache,
   },
   ops,

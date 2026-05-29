@@ -50,8 +50,8 @@ use std::{collections::HashMap, fs, path::Path};
 use smol_str::format_smolstr;
 
 use crate::error::{
-  ArithmeticOverflowPayload, Error, FileIoPayload, FileOp, MissingFieldPayload, ParsePayload,
-  Result, UnknownEnumValuePayload,
+  ArithmeticOverflowPayload, EmptyInputPayload, Error, FileIoPayload, FileOp, MalformedDataPayload,
+  MissingFieldPayload, ParsePayload, Result, UnknownEnumValuePayload,
 };
 
 /// SentencePiece piece-type enum, matching the upstream
@@ -223,9 +223,10 @@ impl<'a> SentencePieceProtobufReader<'a> {
       }
       shift += 7;
     }
-    Err(Error::Backend(
-      "SentencePiece protobuf: malformed varint".into(),
-    ))
+    Err(Error::MalformedData(MalformedDataPayload::new(
+      "SentencePiece protobuf",
+      "malformed varint",
+    )))
   }
 
   fn read_length_delimited(&mut self) -> Result<&'a [u8]> {
@@ -238,9 +239,10 @@ impl<'a> SentencePieceProtobufReader<'a> {
         "usize",
       )))?;
     if end > self.data.len() {
-      return Err(Error::Backend(
-        "SentencePiece protobuf: truncated length-delimited field".into(),
-      ));
+      return Err(Error::MalformedData(MalformedDataPayload::new(
+        "SentencePiece protobuf",
+        "truncated length-delimited field",
+      )));
     }
     let slice = &self.data[self.index..end];
     self.index = end;
@@ -252,9 +254,10 @@ impl<'a> SentencePieceProtobufReader<'a> {
       ArithmeticOverflowPayload::new("SentencePiece protobuf: fixed32 offset", "usize"),
     ))?;
     if end > self.data.len() {
-      return Err(Error::Backend(
-        "SentencePiece protobuf: truncated fixed32 field".into(),
-      ));
+      return Err(Error::MalformedData(MalformedDataPayload::new(
+        "SentencePiece protobuf",
+        "truncated fixed32 field",
+      )));
     }
     let slice = &self.data[self.index..end];
     self.index = end;
@@ -275,9 +278,10 @@ impl<'a> SentencePieceProtobufReader<'a> {
           ArithmeticOverflowPayload::new("SentencePiece protobuf: fixed64 offset", "usize"),
         ))?;
         if end > self.data.len() {
-          return Err(Error::Backend(
-            "SentencePiece protobuf: truncated fixed64 field".into(),
-          ));
+          return Err(Error::MalformedData(MalformedDataPayload::new(
+            "SentencePiece protobuf",
+            "truncated fixed64 field",
+          )));
         }
         self.index = end;
       }
@@ -342,9 +346,9 @@ fn parse_pieces(data: &[u8]) -> Result<ParsedModel> {
   }
 
   if pieces.is_empty() {
-    return Err(Error::Backend(
-      "SentencePiece model: did not contain any vocabulary pieces".into(),
-    ));
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "SentencePiece model: vocabulary pieces",
+    )));
   }
 
   let resolved_unknown_id = unknown_token_id
@@ -711,9 +715,9 @@ impl SentencePieceTokenizer {
   /// Build from raw `.model` protobuf bytes.
   ///
   /// # Errors
-  /// [`Error::Backend`] for any malformed-protobuf, truncated-field, or
-  /// empty-vocabulary input; [`Error::UnknownEnumValue`] for an
-  /// unsupported protobuf wire type.
+  /// [`Error::MalformedData`] for any malformed-protobuf or truncated-field
+  /// input; [`Error::EmptyInput`] for an empty-vocabulary input;
+  /// [`Error::UnknownEnumValue`] for an unsupported protobuf wire type.
   /// [`Error::ArithmeticOverflow`] when a length-delimited / fixed32 /
   /// fixed64 field's `checked_add` reader-index advance overflows
   /// (oversized length varint after the reader index has advanced).
@@ -730,8 +734,9 @@ impl SentencePieceTokenizer {
   ///
   /// # Errors
   /// [`Error::FileIo`] carrying the underlying [`std::io::Error`] when the
-  /// file fails to read, or any of the protobuf-parse [`Error::Backend`] /
-  /// [`Error::ArithmeticOverflow`] errors from [`Self::from_model_bytes`].
+  /// file fails to read, or any of the protobuf-parse [`Error::MalformedData`]
+  /// / [`Error::EmptyInput`] / [`Error::ArithmeticOverflow`] errors from
+  /// [`Self::from_model_bytes`].
   pub fn from_model_file(path: &Path) -> Result<Self> {
     let bytes = fs::read(path).map_err(|e| {
       Error::FileIo(FileIoPayload::new(
@@ -781,7 +786,7 @@ impl SentencePieceTokenizer {
   ///
   /// # Errors
   /// [`Error::MissingField`] when `model`, `model.unk_id`, or
-  /// `model.vocab` is absent. [`Error::Backend`] for malformed
+  /// `model.vocab` is absent. [`Error::MalformedData`] for malformed
   /// `model.vocab` entries (non-array entry, wrong arity, non-string
   /// token, or non-numeric score).
   ///
@@ -821,18 +826,28 @@ impl SentencePieceTokenizer {
     let mut pieces: Vec<SentencePieceToken> = Vec::with_capacity(vocab_list.len());
     for entry in vocab_list {
       let arr = entry.as_array().ok_or_else(|| {
-        Error::Backend("SentencePieceTokenizer: `model.vocab` entry not an array".into())
+        Error::MalformedData(MalformedDataPayload::new(
+          "SentencePieceTokenizer: `model.vocab`",
+          "entry is not an array",
+        ))
       })?;
       if arr.len() != 2 {
-        return Err(Error::Backend(
-          "SentencePieceTokenizer: `model.vocab` entry must be a [token, score] pair".into(),
-        ));
+        return Err(Error::MalformedData(MalformedDataPayload::new(
+          "SentencePieceTokenizer: `model.vocab`",
+          "entry must be a [token, score] pair",
+        )));
       }
       let token = arr[0].as_str().ok_or_else(|| {
-        Error::Backend("SentencePieceTokenizer: `model.vocab` entry[0] not a string".into())
+        Error::MalformedData(MalformedDataPayload::new(
+          "SentencePieceTokenizer: `model.vocab`",
+          "entry[0] is not a string",
+        ))
       })?;
       let score = arr[1].as_f64().ok_or_else(|| {
-        Error::Backend("SentencePieceTokenizer: `model.vocab` entry[1] not a number".into())
+        Error::MalformedData(MalformedDataPayload::new(
+          "SentencePieceTokenizer: `model.vocab`",
+          "entry[1] is not a number",
+        ))
       })? as f32;
       let initial_type = if is_byte_fallback_piece(token) {
         SentencePiecePieceType::Byte
@@ -894,7 +909,7 @@ impl SentencePieceTokenizer {
   ///
   /// # Errors
   /// [`Error::Parse`] for any JSON-parse failure, plus the same
-  /// [`Error::MissingField`] / [`Error::Backend`] errors propagated
+  /// [`Error::MissingField`] / [`Error::MalformedData`] errors propagated
   /// from [`Self::from_tokenizer_json`].
   #[cfg(feature = "tokenizer-config")]
   #[cfg_attr(docsrs, doc(cfg(feature = "tokenizer-config")))]
@@ -1229,11 +1244,16 @@ mod tests {
     bad.push((1 << 3) | 2);
     bad.push(50); // declared length = 50, but no body follows
     let err = SentencePieceTokenizer::from_model_bytes(&bad).unwrap_err();
-    let Error::Backend(message) = err else {
-      panic!("expected Error::Backend, got {err:?}");
-    };
+    // The Display still carries both substrings the integration test
+    // (`tests/tokenizer_sentencepiece.rs`) asserts via `to_string()`.
+    let message = err.to_string();
     assert!(message.contains("SentencePiece"), "message: {message}");
     assert!(message.contains("truncated"), "message: {message}");
+    let Error::MalformedData(p) = err else {
+      panic!("expected Error::MalformedData, got {err:?}");
+    };
+    assert_eq!(p.context(), "SentencePiece protobuf");
+    assert!(p.detail().contains("truncated"), "detail: {}", p.detail());
   }
 
   #[test]
@@ -1247,10 +1267,14 @@ mod tests {
     write_varint(&mut data, trainer.len() as u64);
     data.extend_from_slice(&trainer);
     let err = SentencePieceTokenizer::from_model_bytes(&data).unwrap_err();
-    let Error::Backend(message) = err else {
-      panic!("expected Error::Backend, got {err:?}");
+    let Error::EmptyInput(p) = err else {
+      panic!("expected Error::EmptyInput, got {err:?}");
     };
-    assert!(message.contains("vocabulary"));
+    assert!(
+      p.context().contains("vocabulary"),
+      "context: {}",
+      p.context()
+    );
   }
 
   /// Build a small fixture matching the toy vocab used by the

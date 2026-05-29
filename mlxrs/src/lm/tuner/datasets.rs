@@ -76,16 +76,17 @@
 //!
 //! # Conventions
 //!
-//! - [`Result`]-fallible everywhere; recoverable IO / JSON / shape failures
-//!   map to [`Error::Backend`] / [`Error::Tokenizer`] / [`Error::ShapeMismatch`]
-//!   with clear messages.
+//! - [`Result`]-fallible everywhere; recoverable failures map to typed
+//!   variants: [`Error::FileIo`] / [`Error::Parse`] (IO + jsonl parse),
+//!   [`Error::MissingKey`] / [`Error::OutOfRange`] (missing / wrong-typed
+//!   jsonl fields), [`Error::MalformedData`] (unsupported data format),
+//!   [`Error::EmptyInput`] (empty / blank input), and [`Error::Tokenizer`]
+//!   (chat-template / encode failures).
 //! - The datasets themselves are `Send` (they hold only owned
 //!   [`serde_json::Value`]s and immutable borrows of the [`Tokenizer`]) — no
 //!   `Array` handle is touched on this side of the M3 split.
 //!
-//! [`Error::Backend`]: crate::Error::Backend
 //! [`Error::Tokenizer`]: crate::Error::Tokenizer
-//! [`Error::ShapeMismatch`]: crate::Error::ShapeMismatch
 
 use std::{
   cell::RefCell,
@@ -99,8 +100,8 @@ use smol_str::format_smolstr;
 
 use crate::{
   error::{
-    CapExceededPayload, EmptyInputPayload, Error, FileIoPayload, FileOp, MissingKeyPayload,
-    OutOfRangePayload, ParsePayload, Result,
+    CapExceededPayload, EmptyInputPayload, Error, FileIoPayload, FileOp, InvariantViolationPayload,
+    MalformedDataPayload, MissingKeyPayload, OutOfRangePayload, ParsePayload, Result,
   },
   tokenizer::Tokenizer,
 };
@@ -173,8 +174,8 @@ pub trait Dataset {
   /// `(tokens, mask_offset)`.
   ///
   /// Mirrors Python `tuner/datasets.py` per-type `process(d)`. Errors are
-  /// [`Error::Backend`] (missing/wrong-typed jsonl field) or
-  /// [`Error::Tokenizer`] (chat-template / encode failure).
+  /// [`Error::MissingKey`] / [`Error::OutOfRange`] (missing / wrong-typed
+  /// jsonl field) or [`Error::Tokenizer`] (chat-template / encode failure).
   fn process(&self, idx: usize) -> Result<Example>;
 }
 
@@ -795,11 +796,11 @@ impl Default for DatasetConfig {
 /// `data` is the parsed jsonl (one [`Value`] per line). The first record's
 /// shape drives auto-detection: `prompt_feature` + `completion_feature` ⇒
 /// [`CompletionsDataset`]; `chat_feature` ⇒ [`ChatDataset`]; `text_feature`
-/// ⇒ [`TextDataset`]; else an [`Error::Backend`] with the same
+/// ⇒ [`TextDataset`]; else an [`Error::MalformedData`] with the same
 /// "Unsupported data format" message as Python `tuner/datasets.py:199..=202`.
 ///
 /// `mask_prompt` on a [`DatasetType::Text`] is an error
-/// ([`Error::Backend`]), mirroring Python `tuner/datasets.py:195..=196`:
+/// ([`Error::InvariantViolation`]), mirroring Python `tuner/datasets.py:195..=196`:
 /// `raise ValueError("Prompt masking not supported for text dataset.")`.
 pub fn create_dataset<'a>(
   data: Vec<Value>,
@@ -814,9 +815,10 @@ pub fn create_dataset<'a>(
   match resolved {
     DatasetType::Text => {
       if config.mask_prompt() {
-        return Err(Error::Backend(
-          "Prompt masking not supported for text dataset.".to_owned(),
-        ));
+        return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+          "create_dataset: prompt masking",
+          "is not supported for text dataset",
+        )));
       }
       Ok(Box::new(TextDataset::new(
         data,
@@ -845,10 +847,9 @@ pub fn create_dataset<'a>(
 /// detection.
 fn auto_detect(data: &[Value], config: &DatasetConfig) -> Result<DatasetType> {
   let sample = data.first().ok_or_else(|| {
-    Error::Backend(
-      "cannot auto-detect dataset type from an empty jsonl (pass an explicit DatasetType instead)"
-        .to_owned(),
-    )
+    Error::EmptyInput(EmptyInputPayload::new(
+      "create_dataset: jsonl records for auto-detection (pass an explicit DatasetType instead)",
+    ))
   })?;
   let has = |k: &str| sample.get(k).is_some();
   if has(config.prompt_feature()) && has(config.completion_feature()) {
@@ -859,11 +860,11 @@ fn auto_detect(data: &[Value], config: &DatasetConfig) -> Result<DatasetType> {
     Ok(DatasetType::Text)
   } else {
     // Match Python `tuner/datasets.py:199..=202` verbatim.
-    Err(Error::Backend(
+    Err(Error::MalformedData(MalformedDataPayload::new(
+      "create_dataset: auto-detect",
       "Unsupported data format, check the supported formats here:\n\
-                https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md#Data."
-        .to_owned(),
-    ))
+                https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md#Data.",
+    )))
   }
 }
 
@@ -887,7 +888,7 @@ fn auto_detect(data: &[Value], config: &DatasetConfig) -> Result<DatasetType> {
 /// # Errors
 ///
 /// - HuggingFace Hub paths (`hf://...`-prefixed) are rejected with a clear
-///   [`Error::Backend`] message — they are out of scope per the project's
+///   [`Error::OutOfRange`] error — they are out of scope per the project's
 ///   local-only policy (see [the module docs](self#scope-boundary)).
 /// - A non-regular file (directory, socket, …) is rejected after open;
 ///   the [`Path`] must point at an actual file.
@@ -904,8 +905,8 @@ fn auto_detect(data: &[Value], config: &DatasetConfig) -> Result<DatasetType> {
 ///   silently constructing an empty dataset would mask a missing-shard
 ///   bug downstream in training. Callers wanting "skip absent splits"
 ///   should check for file presence themselves.
-/// - A malformed jsonl line surfaces as [`Error::Backend`] with the line
-///   number.
+/// - A malformed jsonl line surfaces as [`Error::Parse`] with the
+///   call-site context.
 pub fn load_dataset<'a>(
   path: &Path,
   tokenizer: &'a Tokenizer,
