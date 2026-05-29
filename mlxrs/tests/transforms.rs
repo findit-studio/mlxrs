@@ -757,7 +757,7 @@ where
 fn finite_diff_matches_grad_sin() {
   let h = 1e-3_f32;
   for &x in &[-1.5_f32, -0.3, 0.0, 0.7, 2.0] {
-    let analytic = analytic_grad(|a| sin(a), x).unwrap();
+    let analytic = analytic_grad(sin, x).unwrap();
     let numeric = central_difference(&(|a: &Array| sin(a)), x, h).unwrap();
     // Central difference is O(h²); with h=1e-3 and f32 round-off a 2e-3
     // absolute tolerance comfortably covers truncation + rounding error.
@@ -775,7 +775,7 @@ fn finite_diff_matches_grad_sin() {
 fn finite_diff_matches_grad_exp() {
   let h = 1e-3_f32;
   for &x in &[-1.0_f32, -0.2, 0.5, 1.2] {
-    let analytic = analytic_grad(|a| exp(a), x).unwrap();
+    let analytic = analytic_grad(exp, x).unwrap();
     let numeric = central_difference(&(|a: &Array| exp(a)), x, h).unwrap();
     assert!(
       approx_eq(analytic, numeric, 5e-3),
@@ -790,7 +790,7 @@ fn finite_diff_matches_grad_exp() {
 fn finite_diff_matches_grad_tanh() {
   let h = 1e-3_f32;
   for &x in &[-1.3_f32, -0.4, 0.0, 0.6, 1.5] {
-    let analytic = analytic_grad(|a| tanh(a), x).unwrap();
+    let analytic = analytic_grad(tanh, x).unwrap();
     let numeric = central_difference(&(|a: &Array| tanh(a)), x, h).unwrap();
     assert!(
       approx_eq(analytic, numeric, 2e-3),

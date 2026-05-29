@@ -26,7 +26,7 @@ use std::{
 
 use crate::{
   array::Array,
-  error::{EmptyInputPayload, Error, Result, check, check_vector_array_handle},
+  error::{EmptyInputPayload, Error, OutOfRangePayload, Result, check, check_vector_array_handle},
   ffi::{VectorArrayGuard, drain_vector},
   shape::dim_ptr,
   stream::default_stream,
@@ -83,6 +83,76 @@ fn linalg_cpu_stream() -> mlxrs_sys::mlx_stream {
 pub(crate) fn reject_empty_matrix(a: &Array, op: &'static str) -> Result<()> {
   let shape = a.shape();
   if shape.len() >= 2 && (shape[shape.len() - 1] == 0 || shape[shape.len() - 2] == 0) {
+    return Err(Error::EmptyInput(EmptyInputPayload::new(op)));
+  }
+  Ok(())
+}
+
+/// Reject an empty matrix for an SVD-backed *matrix-norm* mode, where the SVD is
+/// taken over two **explicitly selected** axes (not necessarily the trailing
+/// two).
+///
+/// mlx's `matrix_norm` (`mlx/mlx/linalg.cpp`) routes the spectral orders
+/// (`ord == 2.0` / `-2.0`) and the nuclear order (`ord == "nuc"`) through
+/// `svd(a_matrix, false)` after `moveaxis`-ing the two reduction axes (`row_axis`,
+/// `col_axis`) to the back. The CPU SVD kernel then computes
+/// `num_matrices = a.size() / (m * n)`, where `m` and `n` are the sizes of those
+/// two selected axes — so if **either selected axis** has length zero,
+/// `m * n == 0` and that is a `0 / 0` integer divide-by-zero (UB / a process
+/// crash, `mlx/backend/cpu/svd.cpp`). mlx's `svd`/`norm` only guard `ndim < 2`,
+/// so this rejects the empty case first with a recoverable
+/// [`Error::EmptyInput`].
+///
+/// `axes` are the two reduction axes (possibly negative, mlx-style). mlx's
+/// `matrix_norm` normalizes a negative axis as `axis + ndim` with NO range check
+/// and then `moveaxis`-es it, so an out-of-`[-ndim, ndim)` axis (e.g. `-3` on a
+/// rank-2 input → `-1`) is silently accepted by `moveaxis` and can route a
+/// zero-length axis into the SVD `m * n == 0` divide-by-zero. We therefore FULLY
+/// validate the axis range here, rejecting an out-of-range axis with a typed
+/// [`Error::OutOfRange`] BEFORE any SVD dispatch (Codex R4): yielding to mlx is
+/// unsafe because it raises no axis error for these. Duplicate axes (both
+/// resolving to the same dimension) are likewise rejected — mlx would collapse
+/// them and leak an UNSELECTED zero-length dim into the SVD (Codex R6); a valid
+/// matrix reduction is exactly two DISTINCT in-range axes. This is a cheap shape
+/// inspection with no `eval`, so it never enters mlx.
+fn reject_empty_matrix_axes(a: &Array, axes: [i32; 2], op: &'static str) -> Result<()> {
+  let shape = a.shape();
+  let ndim = shape.len();
+  // Resolve and range-check BOTH axes (mlx-style `axis + a.ndim()` for
+  // negatives). An out-of-range axis is rejected with a typed `OutOfRange`
+  // BEFORE any SVD dispatch (Codex R4 — mlx does not range-check matrix-norm
+  // axes, so yielding to it is unsafe). Only when both axes are validly in range
+  // do we fast-fail a zero-length selected axis ahead of the SVD divide-by-zero.
+  let mut resolved = [0usize; 2];
+  for (slot, ax) in resolved.iter_mut().zip(axes) {
+    let r = if ax < 0 {
+      ax as isize + ndim as isize
+    } else {
+      ax as isize
+    };
+    if r < 0 || (r as usize) >= ndim {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "linalg norm: matrix-norm reduction axis",
+        "must be in range [-ndim, ndim)",
+        format!("{ax}"),
+      )));
+    }
+    *slot = r as usize;
+  }
+  // A matrix reduction needs two DISTINCT axes; if both resolve to the same
+  // dimension (e.g. `[1, 1]` or `[1, -1]` on a rank-2 input) mlx's two `moveaxis`
+  // calls collapse them and can leak an UNSELECTED zero-length dim into the
+  // trailing SVD matrix → the same `m * n == 0` divide-by-zero (Codex R6, traced
+  // through the nuclear `sum(svd(...))` path). Reject the duplicate selection
+  // before the length check.
+  if resolved[0] == resolved[1] {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "linalg norm: matrix-norm reduction axes",
+      "the two reduction axes must be distinct (a matrix reduction needs two different axes)",
+      format!("{}", resolved[0]),
+    )));
+  }
+  if shape[resolved[0]] == 0 || shape[resolved[1]] == 0 {
     return Err(Error::EmptyInput(EmptyInputPayload::new(op)));
   }
   Ok(())
@@ -488,8 +558,41 @@ pub fn eigvalsh(a: &Array, uplo: Uplo) -> Result<Array> {
 /// `axis` selects the axes to reduce over (empty = full reduction, routed
 /// through the `dim_ptr` sentinel for FFI safety).
 ///
+/// # Empty matrix (spectral order over two axes)
+///
+/// The **only** SVD-backed scalar order is the spectral norm (`ord == 2.0` /
+/// `-2.0`) applied as a *matrix* reduction over exactly two axes
+/// (`mlx/mlx/linalg.cpp` `matrix_norm` calls `svd(a_matrix, false)`). For that
+/// case, a zero-length reduction axis would forward straight to the SVD kernel's
+/// `0 / 0` divide-by-zero (see [`svd`]); this wrapper rejects it first with a
+/// recoverable [`Error::EmptyInput`]. All other orders (`0`, `1`, `±inf`, any
+/// `p`-norm) and the 1-axis / >2-axis cases are **not** SVD-backed and are
+/// passed through to mlx unchanged. (An empty `axis` slice reaches mlx as
+/// `Some(empty vec)`, which mlx rejects with "too many axes" — not a full
+/// reduction through this API — so it is not SVD-backed either.)
+///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.norm.html).
 pub fn norm(a: &Array, ord: f64, axis: &[i32], keepdims: bool) -> Result<Array> {
+  // mlx's `matrix_norm` routes ONLY the spectral orders (2.0 / -2.0) through
+  // `svd` (`linalg.cpp`), and `matrix_norm` is selected ONLY when `axis.len() ==
+  // 2`. (An empty `axis` slice reaches mlx-c as a non-null pointer with len 0 →
+  // `Some(empty vec)`, NOT `nullopt`/full-reduction, so mlx rejects it with "too
+  // many axes" before any SVD — it is not guarded here.) Guard exactly the
+  // two-axis spectral case; every other order / axis arity is non-SVD, untouched.
+  if ord == 2.0 || ord == -2.0 {
+    let matrix_axes: Option<[i32; 2]> = match axis.len() {
+      2 => Some([axis[0], axis[1]]),
+      _ => None,
+    };
+    if let Some(axes) = matrix_axes {
+      reject_empty_matrix_axes(
+        a,
+        axes,
+        "norm: matrix has a zero-length axis for the SVD-backed spectral order \
+         (ord = 2 / -2)",
+      )?;
+    }
+  }
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
   // early return / panic frees it, then populated by the following call.
@@ -513,8 +616,38 @@ pub fn norm(a: &Array, ord: f64, axis: &[i32], keepdims: bool) -> Result<Array> 
 
 /// Matrix norm using a string-named order (`"fro"`, `"nuc"`, etc.).
 ///
+/// # Empty matrix (nuclear order)
+///
+/// `ord == "nuc"` (the nuclear norm) is the only SVD-backed string order:
+/// `mlx/mlx/linalg.cpp` `matrix_norm` computes it via `svd(a_matrix, false)`. A
+/// zero-length reduction axis would forward straight to the SVD kernel's `0 / 0`
+/// divide-by-zero (see [`svd`]); this wrapper rejects it first with a
+/// recoverable [`Error::EmptyInput`]. The Frobenius order (`"fro"` / `"f"`) is
+/// computed via `l2_norm` (a plain reduction, **not** SVD) and is passed through
+/// to mlx unchanged. (Nuclear reduces over exactly two axes — `axis.len() == 2`;
+/// any other arity, including an empty `axis` slice, is left to mlx, which raises
+/// its own "only supported for matrices" / "too many axes" error.)
+///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.norm.html).
 pub fn norm_matrix(a: &Array, ord: &CStr, axis: &[i32], keepdims: bool) -> Result<Array> {
+  // Only the nuclear order is SVD-backed (`matrix_norm` `ord == "nuc"` in mlx's
+  // `linalg.cpp`); "fro"/"f" is a plain `l2_norm` reduction. Guard the empty
+  // matrix against the SVD divide-by-zero ONLY for "nuc", over its two explicit
+  // reduction axes (`axis.len() == 2`).
+  if ord.to_bytes() == b"nuc" {
+    let matrix_axes: Option<[i32; 2]> = match axis.len() {
+      2 => Some([axis[0], axis[1]]),
+      _ => None,
+    };
+    if let Some(axes) = matrix_axes {
+      reject_empty_matrix_axes(
+        a,
+        axes,
+        "norm_matrix: matrix has a zero-length axis for the SVD-backed nuclear \
+         order (ord = \"nuc\")",
+      )?;
+    }
+  }
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
   // early return / panic frees it, then populated by the following call.
