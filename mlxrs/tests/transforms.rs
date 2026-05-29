@@ -6,7 +6,12 @@
 
 use mlxrs::{
   Array,
-  ops::arithmetic::{add, multiply, power, square},
+  ops::{
+    arithmetic::{add, multiply, power, square},
+    linalg_basic::{inner, matmul},
+    reduction::sum,
+    shape::contiguous,
+  },
   transforms::{Closure, async_eval, checkpoint, custom_vjp, eval, grad, jvp, value_and_grad, vjp},
 };
 
@@ -492,3 +497,208 @@ fn eval_materializes_all_arrays() {
 // the panic test pollutes — but CI's scheduler reliably reverses the
 // order and the test fails. Process isolation is the only correct fix
 // without touching MLX's C++.
+
+// ───────────────────── #260: extra closed-form grad coverage ─────────────────────
+//
+// All closures below are panic-free on the happy path: each differentiated
+// closure builds its graph with `?` and never calls `.unwrap()` inside the
+// closure body, so none can leak MLX's process-global `trace_stack_` frame
+// (see the long comment above + `tests/transforms_async_eval.rs`). Expected
+// gradients are hand-derivable closed forms; values are compared with a small
+// f32 epsilon after the implicit eval inside `item`/`to_vec`.
+
+// ───────────────── value_and_grad / grad: vector + reduction grads ─────────────────
+
+/// `grad` of a sum-reduction over a vector: f(x) = Σ_i x_i (scalar).
+/// ∂f/∂x_i = 1 for every element, so grad(x) = ones(shape(x)).
+/// Exercises `grad` directly (not via composition / custom_vjp) on a
+/// genuinely multi-element input, and confirms the gradient is full-shape.
+#[test]
+fn grad_of_sum_is_ones_vector() {
+  let g = grad(|xs| Ok(vec![sum(&xs[0], false)?]), &[0]).unwrap();
+  let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4]).unwrap();
+  let grads = g(&[x]).unwrap();
+  assert_eq!(grads.len(), 1);
+  // grad of a reduction is a stride-0 broadcast; materialize before reading.
+  let gv = contiguous(&grads[0], false)
+    .unwrap()
+    .to_vec::<f32>()
+    .unwrap();
+  assert_eq!(gv.len(), 4, "grad must keep the input's element count");
+  assert!(
+    gv.iter().all(|&v| approx_eq(v, 1.0, 1e-5)),
+    "d/dx_i[Σx] must be 1 everywhere; got {gv:?}"
+  );
+}
+
+/// `value_and_grad` of a dot product against a constant: f(x) = inner(x, c)
+/// = Σ_i x_i·c_i (scalar). The VALUE must equal the dot product and the GRAD
+/// w.r.t. x must equal `c` (∂/∂x_i[Σ x_j c_j] = c_i).
+/// x = [1,2,3], c = [4,5,6] → value = 4 + 10 + 18 = 32; grad = [4,5,6].
+/// Confirms `value_and_grad` returns BOTH the correct value and grad together.
+#[test]
+fn value_and_grad_of_dot_returns_value_and_constant_grad() {
+  // `c` is captured (constant w.r.t. differentiation); only x (arg 0) is
+  // differentiated, so c contributes to the value + grad but is not itself
+  // a grad target.
+  let c = Array::from_slice::<f32>(&[4.0, 5.0, 6.0], &[3]).unwrap();
+  let vag = value_and_grad(move |xs| Ok(vec![inner(&xs[0], &c)?]), &[0]).unwrap();
+  let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3]).unwrap();
+  let (mut vals, mut grads) = vag(&[x]).unwrap();
+  assert!(
+    approx_eq(vals[0].item::<f32>().unwrap(), 32.0, 1e-4),
+    "value must equal the dot product x·c = 32"
+  );
+  let gv = grads[0].to_vec::<f32>().unwrap();
+  assert_eq!(gv.len(), 3);
+  assert!(
+    approx_eq(gv[0], 4.0, 1e-5) && approx_eq(gv[1], 5.0, 1e-5) && approx_eq(gv[2], 6.0, 1e-5),
+    "d/dx[x·c] must equal c = [4,5,6]; got {gv:?}"
+  );
+}
+
+/// `grad` through a matmul: f(X) = Σ(X @ W) with W = ones(k, n).
+/// Y = X @ W (m×n); s = ΣY. ∂s/∂X = ones(m,n) @ Wᵀ. With W = ones(k,n),
+/// Wᵀ = ones(n,k) and ones(m,n) @ ones(n,k) = n · ones(m,k). So every
+/// element of grad_X is exactly `n`.
+/// Here k = 2, n = 3 → grad_X = 3 · ones(2,2). Value: X = ones(2,2) gives
+/// each Y row = [2,2,2] → ΣY = 12.
+#[test]
+fn grad_through_matmul_sum_is_n_times_ones() {
+  // W = ones(2, 3) captured as a differentiation constant.
+  let w = Array::full::<f32>(&(2usize, 3usize), 1.0).unwrap();
+  let vag = value_and_grad(
+    move |xs| {
+      let y = matmul(&xs[0], &w)?; // (2,2) @ (2,3) -> (2,3)
+      Ok(vec![sum(&y, false)?]) // scalar
+    },
+    &[0],
+  )
+  .unwrap();
+  let x = Array::full::<f32>(&(2usize, 2usize), 1.0).unwrap();
+  let (mut vals, mut grads) = vag(&[x]).unwrap();
+  assert!(
+    approx_eq(vals[0].item::<f32>().unwrap(), 12.0, 1e-4),
+    "Σ(ones(2,2) @ ones(2,3)) = 12"
+  );
+  let gv = grads[0].to_vec::<f32>().unwrap();
+  assert_eq!(gv.len(), 4, "grad_X must be 2x2 = 4 elements");
+  assert!(
+    gv.iter().all(|&v| approx_eq(v, 3.0, 1e-5)),
+    "∂Σ(XW)/∂X = n·ones with n=3; got {gv:?}"
+  );
+}
+
+// ───────────────── value_and_grad: argnums subset selection ─────────────────
+
+/// `argnums` must SELECT which positional input is differentiated. With
+/// f(x, y) = x² + y² and `argnums = [1]`, the result must contain exactly ONE
+/// gradient — ∂f/∂y = 2y — and NOT ∂f/∂x. x and y are chosen distinct
+/// (x=2, y=5) so a wrong arg selection (2x=4 vs 2y=10) is caught.
+#[test]
+fn value_and_grad_argnums_selects_second_arg_only() {
+  let vag = value_and_grad(
+    |xs| {
+      let x2 = square(&xs[0])?;
+      let y2 = square(&xs[1])?;
+      Ok(vec![add(&x2, &y2)?])
+    },
+    &[1],
+  )
+  .unwrap();
+  let x = Array::full::<f32>(&[0i32; 0], 2.0).unwrap();
+  let y = Array::full::<f32>(&[0i32; 0], 5.0).unwrap();
+  let (mut vals, mut grads) = vag(&[x, y]).unwrap();
+  // Forward value is unaffected by argnums: 2² + 5² = 29.
+  assert!(approx_eq(vals[0].item::<f32>().unwrap(), 29.0, 1e-4));
+  assert_eq!(
+    grads.len(),
+    1,
+    "argnums=[1] selects exactly one grad target"
+  );
+  assert!(
+    approx_eq(grads[0].item::<f32>().unwrap(), 10.0, 1e-4),
+    "grad must be ∂f/∂y = 2y = 10 (a value of 4 would mean arg 0 was differentiated)"
+  );
+}
+
+// ───────────────────────── vjp: cotangent scaling ─────────────────────────
+
+/// VJP scales the gradient by the cotangent: f(x) = x², primal x=3,
+/// cotangent c = 2 → vjp = c · (df/dx) = 2 · 2x = 12 (vs the unit-cotangent
+/// case = 6 covered above). The forward value is unchanged at 9.
+#[test]
+fn vjp_scales_by_nonunit_cotangent() {
+  let primals = vec![Array::full::<f32>(&[0i32; 0], 3.0).unwrap()];
+  let cot = vec![Array::full::<f32>(&[0i32; 0], 2.0).unwrap()];
+  let (mut vals, mut grads) = vjp(|xs| Ok(vec![square(&xs[0])?]), &primals, &cot).unwrap();
+  assert!(approx_eq(vals[0].item::<f32>().unwrap(), 9.0, 1e-5));
+  assert!(
+    approx_eq(grads[0].item::<f32>().unwrap(), 12.0, 1e-4),
+    "vjp = cotangent · 2x = 2 · 6 = 12"
+  );
+}
+
+/// VJP of a vector→scalar reduction broadcasts the scalar cotangent over the
+/// Jacobian. f(x) = Σx (Jacobian = ones row), cotangent c = 2 →
+/// vjp_i = c · ∂f/∂x_i = 2 · 1 = 2 for every element. x = [1,2,3] →
+/// vjp = [2,2,2], value = 6. Exercises a non-square (rank-1 → scalar) map.
+#[test]
+fn vjp_of_vector_sum_broadcasts_cotangent() {
+  let primals = vec![Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3]).unwrap()];
+  let cot = vec![Array::full::<f32>(&[0i32; 0], 2.0).unwrap()];
+  let (mut vals, grads) = vjp(|xs| Ok(vec![sum(&xs[0], false)?]), &primals, &cot).unwrap();
+  assert!(approx_eq(vals[0].item::<f32>().unwrap(), 6.0, 1e-5));
+  // vjp of a reduction broadcasts the cotangent (stride-0); materialize first.
+  let gv = contiguous(&grads[0], false)
+    .unwrap()
+    .to_vec::<f32>()
+    .unwrap();
+  assert_eq!(gv.len(), 3, "vjp output matches the primal's shape");
+  assert!(
+    gv.iter().all(|&v| approx_eq(v, 2.0, 1e-5)),
+    "vjp_i = cotangent · 1 = 2 everywhere; got {gv:?}"
+  );
+}
+
+// ───────────────────────── jvp: tangent + multi-primal ─────────────────────────
+
+/// JVP contracts the Jacobian with a non-unit tangent. f(x) = Σx
+/// (Jacobian = ones row), tangent v = [2,3,4] → jvp = Σ_i (∂f/∂x_i · v_i)
+/// = Σ v_i = 9 (distinct from the value Σx = 6). Confirms the directional
+/// derivative uses the supplied tangent, not the primal.
+#[test]
+fn jvp_of_vector_sum_contracts_tangent() {
+  let primals = vec![Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3]).unwrap()];
+  let tan = vec![Array::from_slice::<f32>(&[2.0, 3.0, 4.0], &[3]).unwrap()];
+  let (mut vals, mut jvp_out) = jvp(|xs| Ok(vec![sum(&xs[0], false)?]), &primals, &tan).unwrap();
+  assert!(approx_eq(vals[0].item::<f32>().unwrap(), 6.0, 1e-5));
+  assert!(
+    approx_eq(jvp_out[0].item::<f32>().unwrap(), 9.0, 1e-4),
+    "jvp = Σ(1 · v_i) = 2+3+4 = 9"
+  );
+}
+
+/// JVP with multiple primals sums each primal's directional contribution.
+/// f(x, y) = x · y (elementwise scalar). The total differential is
+/// df = y·dx + x·dy. At x=2, y=3 with unit tangents dx=dy=1 →
+/// jvp = 3·1 + 2·1 = 5 (distinct from value x·y = 6). Exercises the
+/// multi-primal tangent path.
+#[test]
+fn jvp_multi_primal_sums_directional_contributions() {
+  let primals = vec![
+    Array::full::<f32>(&[0i32; 0], 2.0).unwrap(),
+    Array::full::<f32>(&[0i32; 0], 3.0).unwrap(),
+  ];
+  let tan = vec![
+    Array::full::<f32>(&[0i32; 0], 1.0).unwrap(),
+    Array::full::<f32>(&[0i32; 0], 1.0).unwrap(),
+  ];
+  let (mut vals, mut jvp_out) =
+    jvp(|xs| Ok(vec![multiply(&xs[0], &xs[1])?]), &primals, &tan).unwrap();
+  assert!(approx_eq(vals[0].item::<f32>().unwrap(), 6.0, 1e-5));
+  assert!(
+    approx_eq(jvp_out[0].item::<f32>().unwrap(), 5.0, 1e-4),
+    "jvp = y·dx + x·dy = 3 + 2 = 5"
+  );
+}
