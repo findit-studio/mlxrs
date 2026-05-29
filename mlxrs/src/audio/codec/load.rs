@@ -22,7 +22,7 @@
 use crate::{
   array::Array,
   audio::load::{LoadedAudioModel, base_load_model},
-  error::{Error, Result},
+  error::{Error, InvariantViolationPayload, Result},
 };
 
 /// Uniform `MODEL_REMAPPING` table for codec architectures — empty for
@@ -69,9 +69,10 @@ pub trait CodecModel {
   /// `Encodec.encode` / `Mimi.encode` per-class implementations.
   fn encode(&self, audio: &Array) -> Result<Array> {
     let _ = audio;
-    Err(Error::Backend(
-      "codec needs `encode` override (per-architecture)".into(),
-    ))
+    Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "CodecModel::encode",
+      "needs `encode` override (per-architecture)",
+    )))
   }
 
   /// Decode codec codes back into a waveform.
@@ -84,9 +85,10 @@ pub trait CodecModel {
   /// concrete codec MUST override it.
   fn decode(&self, codes: &Array) -> Result<Array> {
     let _ = codes;
-    Err(Error::Backend(
-      "codec needs `decode` override (per-architecture)".into(),
-    ))
+    Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "CodecModel::decode",
+      "needs `decode` override (per-architecture)",
+    )))
   }
 
   /// The codec's output PCM sample rate in Hz.

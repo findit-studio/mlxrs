@@ -5,8 +5,8 @@ use smol_str::format_smolstr;
 use crate::{
   array::Array,
   error::{
-    ArithmeticOverflowPayload, Error, OutOfRangePayload, ParsePayload, RankMismatchPayload, Result,
-    ShapePairMismatchPayload,
+    ArithmeticOverflowPayload, Error, InvariantViolationPayload, OutOfRangePayload, ParsePayload,
+    RankMismatchPayload, Result, ShapePairMismatchPayload,
   },
   lm::cache::{
     KvCache, MaskMode, QTriple, QuantizedKvCache, mask,
@@ -1082,9 +1082,10 @@ impl KvCache for QuantizedKvCacheImpl {
     // stores the new triple — phantom context / stale tokens. Run BOTH
     // checks on `staged` so a failure leaves `self` byte-identical.
     if staged.is_empty() && staged.offset() != 0 {
-      return Err(Error::Backend(
-        "QuantizedKvCache: empty state with non-zero offset is invalid".into(),
-      ));
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "QuantizedKvCache::set_state",
+        "empty state with non-zero offset is invalid",
+      )));
     }
     staged.enforce_offset_len_invariant()?;
     *self = staged;

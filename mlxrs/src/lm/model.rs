@@ -47,8 +47,11 @@ pub trait Model {
     _embeddings: &Array,
     _cache: &mut [Box<dyn KvCache>],
   ) -> Result<Array> {
-    Err(crate::error::Error::Backend(
-      "this model does not implement `forward_embeddings` (VLM seam, M4)".into(),
+    Err(crate::error::Error::InvariantViolation(
+      crate::error::InvariantViolationPayload::new(
+        "Model::forward_embeddings",
+        "not implemented (VLM seam, M4; override this method in multimodal models)",
+      ),
     ))
   }
 

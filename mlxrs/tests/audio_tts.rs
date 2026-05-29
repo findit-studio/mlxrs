@@ -510,10 +510,8 @@ fn tts_generate_rejects_empty_text() {
     .err()
     .expect("empty text rejected");
   match err {
-    mlxrs::Error::Backend(message) => {
-      assert!(message.contains("non-blank"), "got {message}");
-    }
-    other => panic!("expected Backend error, got {other:?}"),
+    e @ mlxrs::Error::EmptyInput(_) => assert!(format!("{e}").contains("non-blank"), "got {e}"),
+    other => panic!("expected EmptyInput error, got {other:?}"),
   }
   assert!(
     model.seen.borrow().is_empty(),
@@ -530,7 +528,10 @@ fn tts_generate_rejects_whitespace_only_text() {
   let err = tts_generate(&model, "   \n\n  \t \n", &cfg)
     .err()
     .expect("whitespace-only text rejected");
-  assert!(matches!(err, mlxrs::Error::Backend(_)));
+  assert!(
+    matches!(err, mlxrs::Error::EmptyInput(_)),
+    "expected EmptyInput, got {err:?}"
+  );
   assert!(model.seen.borrow().is_empty());
 }
 
@@ -589,13 +590,13 @@ fn synthesize_segment_default_errors_with_clear_message() {
   let cfg = TtsGenConfig::default();
   let mut it = tts_generate(&model, "hi", &cfg).unwrap();
   match it.next().expect("an item") {
-    Err(mlxrs::Error::Backend(message)) => {
+    Err(e @ mlxrs::Error::InvariantViolation(_)) => {
       assert!(
-        message.contains("synthesize_segment"),
-        "error mentions synthesize_segment, got {message}"
+        format!("{e}").contains("synthesize_segment"),
+        "error mentions synthesize_segment, got {e}"
       );
     }
-    other => panic!("expected Backend Err, got {other:?}"),
+    other => panic!("expected InvariantViolation Err, got {other:?}"),
   }
   assert!(it.next().is_none(), "iterator fuses after the Err");
 }

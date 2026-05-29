@@ -24,7 +24,7 @@ use smol_str::format_smolstr;
 use crate::{
   Array,
   audio::dsp::{hann_window, mel_filter_bank},
-  error::{Error, InvariantViolationPayload, OutOfRangePayload, Result},
+  error::{ArithmeticOverflowPayload, Error, InvariantViolationPayload, OutOfRangePayload, Result},
   ops::{
     arithmetic::{abs, add, divide, log10, maximum, multiply, square},
     fft::{FftNorm, rfft},
@@ -220,9 +220,10 @@ impl IncrementalMelSpectrogram {
     #[cfg(test)]
     if self.flush_err_inject_count > 0 {
       self.flush_err_inject_count -= 1;
-      return Err(Error::Backend(
-        "IncrementalMelSpectrogram::flush: scripted test injection".into(),
-      ));
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "IncrementalMelSpectrogram::flush",
+        "scripted test injection",
+      )));
     }
 
     if self.overlap_buffer.is_empty() {
@@ -320,10 +321,19 @@ impl IncrementalMelSpectrogram {
   /// Compute the mel features for the given signal + frame count, then
   /// apply the running-log-max normalization in-place.
   fn compute_mel(&mut self, signal: &[f32], num_frames: usize) -> Result<Array> {
-    let n_fft_i32 = i32::try_from(self.n_fft)
-      .map_err(|_| Error::Backend("IncrementalMelSpectrogram: n_fft does not fit i32".into()))?;
+    let n_fft_i32 = i32::try_from(self.n_fft).map_err(|_| {
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "IncrementalMelSpectrogram: n_fft does not fit i32",
+        "i32",
+        [("n_fft", self.n_fft as u64)],
+      ))
+    })?;
     let num_frames_i32 = i32::try_from(num_frames).map_err(|_| {
-      Error::Backend("IncrementalMelSpectrogram: num_frames does not fit i32".into())
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "IncrementalMelSpectrogram: num_frames does not fit i32",
+        "i32",
+        [("num_frames", num_frames as u64)],
+      ))
     })?;
 
     let signal_array = Array::from_slice::<f32>(signal, &[signal.len() as i32])?;

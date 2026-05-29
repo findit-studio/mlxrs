@@ -114,7 +114,7 @@ mod tests {
   use crate::{
     array::Array,
     audio::stt::model::MelConfig,
-    error::Error,
+    error::{Error, InvariantViolationPayload},
     lm::{cache::KvCache, model::Model as LmModel},
   };
   use std::{fs, path::PathBuf};
@@ -125,9 +125,10 @@ mod tests {
 
   impl LmModel for FakeStt {
     fn forward(&self, _tokens: &Array, _cache: &mut [Box<dyn KvCache>]) -> Result<Array> {
-      Err(Error::Backend(
-        "FakeStt::forward (test stub) — unreachable in this test".into(),
-      ))
+      Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "FakeStt::forward",
+        "test stub — unreachable in this test",
+      )))
     }
   }
 

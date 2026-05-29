@@ -38,7 +38,8 @@ use crate::{
   array::Array,
   dtype::Dtype,
   error::{
-    CapExceededPayload, DtypeMismatchPayload, Error, LayerKeyedPayload, RankMismatchPayload, Result,
+    CapExceededPayload, DtypeMismatchPayload, EmptyInputPayload, Error, LayerKeyedPayload,
+    RankMismatchPayload, Result,
   },
   ops,
 };
@@ -1133,11 +1134,9 @@ pub fn tts_generate_with_reference<'a, M: TtsModel>(
   //    (empty string, only whitespace / newlines) yields no segments.
   let segments = segment_ranges(text, cfg.segmentation());
   if segments.is_empty() {
-    return Err(Error::Backend(
-      "tts_generate: input text has no non-blank segments — nothing to \
-                synthesize; provide non-empty text"
-        .into(),
-    ));
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "tts_generate: input text has no non-blank segments (provide non-empty text)",
+    )));
   }
 
   Ok(TtsGenerator {

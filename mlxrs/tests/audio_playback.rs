@@ -173,8 +173,12 @@ fn playback_config_cpal_config_rejects_zero_channels() {
     .with_queue_capacity_frames(1024);
   let err = cfg.cpal_config().unwrap_err();
   assert!(
-    matches!(err, mlxrs::error::Error::Backend(ref message) if message.contains("channel count")),
-    "expected Backend(channel count) error, got {err:?}"
+    matches!(err, mlxrs::error::Error::InvariantViolation(_)),
+    "expected InvariantViolation, got {err:?}"
+  );
+  assert!(
+    format!("{err}").contains("channel count"),
+    "message names channel count: {err}"
   );
 }
 
@@ -519,17 +523,17 @@ fn audio_output_stream_rejects_writes_after_stop() {
   player.stop().unwrap();
   assert!(!player.is_running());
 
-  // Post-stop: write is rejected with an `after stop()` Backend
+  // Post-stop: write is rejected with an `after stop()` InvariantViolation
   // error. The literal "after stop()" substring is the contract.
   let err = player.write_samples(&[0.0_f32; 32]).unwrap_err();
   match err {
-    mlxrs::error::Error::Backend(message) => {
+    e @ mlxrs::error::Error::InvariantViolation(_) => {
       assert!(
-        message.contains("after stop()"),
-        "expected `after stop()` in error message, got: {message}"
+        format!("{e}").contains("after stop()"),
+        "expected `after stop()` in error message, got: {e}"
       );
     }
-    other => panic!("expected Backend error, got {other:?}"),
+    other => panic!("expected InvariantViolation error, got {other:?}"),
   }
 }
 
@@ -551,7 +555,7 @@ fn audio_output_stream_rejects_writes_after_stop() {
 #[ignore = "requires real default audio output device"]
 fn audio_player_start_after_stop_returns_terminated_err() {
   // F1: `start(); stop(); start()` — the second `start()` MUST
-  // reject with a "terminated" Backend error rather than re-arm the
+  // reject with a "terminated" InvariantViolation error rather than re-arm the
   // player. Pre-R2 this returned Ok(()) and silently rehydrated the
   // producer surface.
   use mlxrs::audio::playback::AudioPlayer;
@@ -562,13 +566,13 @@ fn audio_player_start_after_stop_returns_terminated_err() {
 
   let err = player.start().unwrap_err();
   match err {
-    mlxrs::error::Error::Backend(message) => {
+    e @ mlxrs::error::Error::InvariantViolation(_) => {
       assert!(
-        message.contains("terminated"),
-        "expected `terminated` in start()-after-stop() error, got: {message}"
+        format!("{e}").contains("terminated"),
+        "expected `terminated` in start()-after-stop() error, got: {e}"
       );
     }
-    other => panic!("expected Backend error, got {other:?}"),
+    other => panic!("expected InvariantViolation error, got {other:?}"),
   }
 }
 
@@ -595,13 +599,13 @@ fn audio_player_write_samples_after_restart_attempt_still_rejected() {
 
   let err = player.write_samples(&[0.5_f32; 64]).unwrap_err();
   match err {
-    mlxrs::error::Error::Backend(message) => {
+    e @ mlxrs::error::Error::InvariantViolation(_) => {
       assert!(
-        message.contains("terminated"),
-        "expected `terminated` in write_samples()-after-restart-attempt error, got: {message}"
+        format!("{e}").contains("terminated"),
+        "expected `terminated` in write_samples()-after-restart-attempt error, got: {e}"
       );
     }
-    other => panic!("expected Backend error, got {other:?}"),
+    other => panic!("expected InvariantViolation error, got {other:?}"),
   }
 }
 
@@ -620,13 +624,13 @@ fn audio_player_pause_after_stop_returns_terminated_err() {
 
   let err = player.pause().unwrap_err();
   match err {
-    mlxrs::error::Error::Backend(message) => {
+    e @ mlxrs::error::Error::InvariantViolation(_) => {
       assert!(
-        message.contains("terminated"),
-        "expected `terminated` in pause()-after-stop() error, got: {message}"
+        format!("{e}").contains("terminated"),
+        "expected `terminated` in pause()-after-stop() error, got: {e}"
       );
     }
-    other => panic!("expected Backend error, got {other:?}"),
+    other => panic!("expected InvariantViolation error, got {other:?}"),
   }
 }
 
@@ -645,13 +649,13 @@ fn audio_player_resume_after_stop_returns_terminated_err() {
 
   let err = player.resume().unwrap_err();
   match err {
-    mlxrs::error::Error::Backend(message) => {
+    e @ mlxrs::error::Error::InvariantViolation(_) => {
       assert!(
-        message.contains("terminated"),
-        "expected `terminated` in resume()-after-stop() error, got: {message}"
+        format!("{e}").contains("terminated"),
+        "expected `terminated` in resume()-after-stop() error, got: {e}"
       );
     }
-    other => panic!("expected Backend error, got {other:?}"),
+    other => panic!("expected InvariantViolation error, got {other:?}"),
   }
 }
 
@@ -665,7 +669,7 @@ fn audio_player_resume_after_stop_returns_terminated_err() {
 // the cpal callback's `try_lock` would see WouldBlock for allocator time too
 // (not just `extend`). R2 pre-allocates the full bounded
 // `queue_capacity_samples` at construction (via `try_reserve_exact` so alloc
-// failure surfaces as `Error::Backend`) and removes the per-chunk
+// failure surfaces as `Error::AllocFailure`) and removes the per-chunk
 // `reserve_exact`. The two F2 invariant tests
 // (`audio_player_pre_allocates_queue_capacity_at_construction` +
 // `audio_player_write_samples_does_not_grow_queue_capacity_during_playback`)

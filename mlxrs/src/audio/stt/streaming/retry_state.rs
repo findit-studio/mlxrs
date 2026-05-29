@@ -807,7 +807,12 @@ mod tests {
     // Inject a clone fn that ALWAYS fails — simulates the rare
     // mlx_array_set host-allocator OOM that drives the R2-fix branch.
     let result = s.discharge_stop_mel_flush_with_clone(&mut mel_proc, |_arr| {
-      Err(Error::Backend("test-injected clone failure".into()))
+      Err(Error::InvariantViolation(
+        crate::error::InvariantViolationPayload::new(
+          "discharge_stop_mel_flush_with_clone",
+          "test-injected clone failure",
+        ),
+      ))
     });
 
     // The discharge MUST surface an Err so the caller's in-call path

@@ -252,11 +252,16 @@ impl Stream {
     // checked by the caller before the handle is used.
     let raw = unsafe { mlxrs_sys::mlx_default_gpu_stream_new() };
     if raw.ctx.is_null() {
-      return Err(crate::Error::Backend(
-        "mlx_default_gpu_stream_new returned NULL ctx \
-                  (GPU unavailable or init failed)"
-          .into(),
-      ));
+      // A NULL ctx is handler-backed: mlx-c catches the C++ exception, records it
+      // via `mlx_error`, then returns an empty handle. Drain that real error first
+      // (also clearing the thread-local LAST slot so a later boundary failure is
+      // not misattributed); fall back to a typed null-handle error only if none
+      // was recorded.
+      return Err(
+        crate::error::take_last().unwrap_or(crate::Error::FfiNullHandle(
+          crate::error::FfiNullHandlePayload::new("mlx_default_gpu_stream_new"),
+        )),
+      );
     }
     Ok(Self(raw))
   }
@@ -270,9 +275,12 @@ impl Stream {
     // checked by the caller before the handle is cached/used.
     let raw = unsafe { mlxrs_sys::mlx_default_cpu_stream_new() };
     if raw.ctx.is_null() {
-      return Err(crate::Error::Backend(
-        "mlx_default_cpu_stream_new returned NULL ctx".into(),
-      ));
+      // Handler-backed NULL ctx — drain the real mlx-c error first (see `default_gpu`).
+      return Err(
+        crate::error::take_last().unwrap_or(crate::Error::FfiNullHandle(
+          crate::error::FfiNullHandlePayload::new("mlx_default_cpu_stream_new"),
+        )),
+      );
     }
     Ok(Self(raw))
   }
@@ -297,9 +305,12 @@ impl Stream {
     // and the NULL-ctx case is checked by the caller.
     let raw = unsafe { mlxrs_sys::mlx_stream_new_device(device.0) };
     if raw.ctx.is_null() {
-      return Err(crate::Error::Backend(
-        "mlx_stream_new_device returned NULL ctx".into(),
-      ));
+      // Handler-backed NULL ctx — drain the real mlx-c error first (see `default_gpu`).
+      return Err(
+        crate::error::take_last().unwrap_or(crate::Error::FfiNullHandle(
+          crate::error::FfiNullHandlePayload::new("mlx_stream_new_device"),
+        )),
+      );
     }
     Ok(Self(raw))
   }

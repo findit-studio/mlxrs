@@ -18,7 +18,7 @@
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{Error, InvariantViolationPayload, Result},
   lm::cache::KvCache,
 };
 
@@ -96,9 +96,10 @@ pub trait Model: crate::lm::model::Model {
     cache: &mut [Box<dyn KvCache>],
   ) -> Result<Array> {
     let _ = (token, encoder_states, cache);
-    Err(Error::Backend(
-      "STT model needs `decode_step` override (per-model)".into(),
-    ))
+    Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "SttModel::decode_step",
+      "must be overridden by per-model implementation",
+    )))
   }
 
   /// The mel-spectrogram extraction config this model expects.

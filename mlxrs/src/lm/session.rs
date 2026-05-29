@@ -105,7 +105,7 @@ use std::rc::Rc;
 use serde_json::{Value, json};
 
 use crate::{
-  error::{Error, ParsePayload, Result},
+  error::{Error, InvariantViolationPayload, ParsePayload, Result},
   lm::{
     cache::{CacheConfig, KvCache, make_prompt_cache, save_prompt_cache},
     generate::{FinishReason, GenConfig, GenerationResponse, Generator, build_generator},
@@ -387,7 +387,26 @@ impl std::error::Error for ChatSessionError {}
 
 impl From<ChatSessionError> for Error {
   fn from(e: ChatSessionError) -> Self {
-    Error::Backend(e.to_string())
+    match e {
+      ChatSessionError::NoCacheAvailable => {
+        Error::InvariantViolation(InvariantViolationPayload::new(
+          "ChatSession::save_cache",
+          "no KV cache is available: call respond() / stream_respond() before save_cache()",
+        ))
+      }
+      ChatSessionError::SpeculativeCacheUnsupported => {
+        Error::InvariantViolation(InvariantViolationPayload::new(
+          "ChatSession::save_cache",
+          "speculative-decoding sessions do not support cache save",
+        ))
+      }
+      ChatSessionError::SpeculativeCacheRestoreUnsupported => {
+        Error::InvariantViolation(InvariantViolationPayload::new(
+          "ChatSessionBuilder::build",
+          "cache() and speculative() are mutually exclusive; build with only .cache() or only .speculative()",
+        ))
+      }
+    }
   }
 }
 
@@ -2483,9 +2502,10 @@ mod tests {
     ) -> Result<crate::array::Array> {
       let remaining = self.ok_calls.get();
       if remaining == 0 {
-        return Err(Error::Backend(
-          "ErringAfterModel: budget exhausted (test fixture)".into(),
-        ));
+        return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+          "ErringAfterModel::forward",
+          "budget exhausted (test fixture)",
+        )));
       }
       self.ok_calls.set(remaining - 1);
       self.inner.forward(tokens, cache)
