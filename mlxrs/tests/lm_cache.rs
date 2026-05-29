@@ -2238,18 +2238,28 @@ fn standard_materialize_is_not_a_noop_evals_buffers() {
     let mut s = StandardKvCache::new();
     s.update(&kv(&[0.0, 1.0, 2.0, 3.0]), &kv(&[0.0, 1.0, 2.0, 3.0]))
       .unwrap();
+
     // (2) Poison THIS thread (end-of-thread cleanup; exempt from the guard).
-    Stream::clear_current_thread_streams().unwrap();
-    // (3) materialize -> Array::eval -> assert_streams_not_cleared -> PANIC if
-    // it really evals; a no-op `Ok(())` would NOT panic and the thread would
-    // join cleanly, failing the assert below.
+    Stream::clear_current_thread_streams()
+      .expect("test setup: clear_current_thread_streams must succeed");
+
+    // (3) materialize -> Array::eval -> assert_streams_not_cleared -> PANIC.
     s.materialize().unwrap();
   })
   .join();
+
+  let payload = joined.expect_err("materialize must panic on a cleared-stream thread");
+  let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+    (*s).to_string()
+  } else if let Some(s) = payload.downcast_ref::<String>() {
+    s.clone()
+  } else {
+    "<non-string panic payload>".to_string()
+  };
+
   assert!(
-    joined.is_err(),
-    "materialize must force-eval the stored buffers (panic on a cleared-stream \
-     thread); a no-op would not"
+    msg.contains("Stream::clear_current_thread_streams() was called on this thread"),
+    "unexpected panic payload: {msg}"
   );
 }
 
@@ -2271,16 +2281,28 @@ fn rotating_materialize_is_not_a_noop_evals_buffers() {
       let t = kv(&[id as f32]);
       c.update(&t, &t).unwrap();
     }
+
     // (2) Poison THIS thread.
-    Stream::clear_current_thread_streams().unwrap();
+    Stream::clear_current_thread_streams()
+      .expect("test setup: clear_current_thread_streams must succeed");
+
     // (3) materialize -> eval -> PANIC if it really evals the stored ring.
     c.materialize().unwrap();
   })
   .join();
+
+  let payload = joined.expect_err("materialize must panic on a cleared-stream thread");
+  let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+    (*s).to_string()
+  } else if let Some(s) = payload.downcast_ref::<String>() {
+    s.clone()
+  } else {
+    "<non-string panic payload>".to_string()
+  };
+
   assert!(
-    joined.is_err(),
-    "materialize must force-eval the stored ring buffers (panic on a \
-     cleared-stream thread); a no-op would not"
+    msg.contains("Stream::clear_current_thread_streams() was called on this thread"),
+    "unexpected panic payload: {msg}"
   );
 }
 
