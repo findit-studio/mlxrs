@@ -158,7 +158,7 @@ pub struct TrainingArgs {
   /// ported). Default is `false` so a future production caller cannot
   /// accidentally run a long training job thinking the model is being
   /// updated. When `false`, [`train`] returns
-  /// [`Error::Backend`] pointing at this
+  /// [`Error::InvariantViolation`] pointing at this
   /// field; set to `true` to opt into the mechanics-only training path.
   ///
   /// **No Python parity:** this field is mlxrs-specific (Python's
@@ -470,12 +470,13 @@ where
   // numerical fault.
   let ntoks_count = ntoks.item::<f32>()?;
   if ntoks_count == 0.0 {
-    return Err(Error::Backend(
-      "default_loss: batch produced 0 supervised tokens after applying the length mask. \
-                All examples in the batch are too short (prompt-only or fully truncated) or have \
-                length <= 1. Filter such examples upstream."
-        .into(),
-    ));
+    // The supervised-token set is empty after the length mask: every
+    // example in the batch is too short (prompt-only or fully truncated)
+    // or has length <= 1. Reject before the divide rather than emitting
+    // NaN/Inf downstream; the caller should filter such examples upstream.
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "default_loss: supervised tokens after the length mask (batch produced 0 supervised tokens)",
+    )));
   }
   // loss = ce.astype(f32).sum() / ntoks
   let ce_sum = reduction::sum(&ce_masked.astype(Dtype::F32)?, false)?;
@@ -1041,9 +1042,10 @@ where
   for _microbatch_it in 1..=args.iters() {
     let micro_start = Instant::now();
     let batch = iter.next().ok_or_else(|| {
-      Error::Backend(
-        "train: batch iterator exhausted unexpectedly (loop=true should never end)".into(),
-      )
+      Error::InvariantViolation(InvariantViolationPayload::new(
+        "train: batch iterator",
+        "must never be exhausted (loop=true should never end)",
+      ))
     })??;
     // Compute loss + (placeholder) gradients. NOTE: this is the v1
     // mechanics-only path — production code threads `value_and_grad`
@@ -1194,7 +1196,7 @@ fn build_zero_grads(params: &Weights) -> Result<Weights> {
 /// Element-wise sum of two parameter-keyed gradient maps. `a` and `b`
 /// must share the same key set (the trainer always builds them from the
 /// same `params`, so this is an internal invariant — any missing key is
-/// reported via [`Error::Backend`] rather than silently dropped).
+/// reported via [`Error::MissingKey`] rather than silently dropped).
 fn add_weights(a: &Weights, b: &Weights) -> Result<Weights> {
   if a.len() != b.len() {
     return Err(Error::LengthMismatch(LengthMismatchPayload::new(
@@ -1251,9 +1253,10 @@ mod tests {
       self.samples.len()
     }
     fn get(&self, _idx: usize) -> Result<&serde_json::Value> {
-      Err(Error::Backend(
-        "FakeDataset::get not used by trainer iterator".into(),
-      ))
+      Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "FakeDataset::get",
+        "is not used by the trainer iterator",
+      )))
     }
     fn process(&self, idx: usize) -> Result<Example> {
       Ok((self.samples[idx].0.clone(), self.samples[idx].1))
@@ -1877,13 +1880,14 @@ mod tests {
     let err = default_loss(&model, &batch, &lengths)
       .expect_err("expected default_loss to reject zero-token batch");
     match err {
-      Error::Backend(message) => {
+      Error::EmptyInput(p) => {
         assert!(
-          message.contains("0 supervised tokens"),
-          "expected message to mention '0 supervised tokens', got: {message}",
+          p.context().contains("0 supervised tokens"),
+          "expected context to mention '0 supervised tokens', got: {}",
+          p.context(),
         );
       }
-      other => panic!("expected Error::Backend, got: {other:?}"),
+      other => panic!("expected Error::EmptyInput, got: {other:?}"),
     }
     Ok(())
   }

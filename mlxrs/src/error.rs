@@ -893,6 +893,17 @@ pub enum Error {
   #[error("mlx backend: {0}")]
   Backend(String),
 
+  /// A serialized / structured input is malformed, truncated, or in an
+  /// unsupported shape, as detected by one of mlxrs's own hand-rolled
+  /// readers / validators (e.g. a corrupt SentencePiece protobuf field,
+  /// a `tokenizer.json` `model.vocab` entry with the wrong arity, or a
+  /// fine-tuning jsonl record matching no supported dataset format).
+  /// `context` identifies the reader / format; `detail` is a static
+  /// description of the violation. Distinct from [`Error::Parse`] which
+  /// wraps an inner external-parser error.
+  #[error(transparent)]
+  MalformedData(MalformedDataPayload),
+
   /// FFI handle creation returned a NULL pointer (mlx-c idiomatic
   /// "constructor failed"). The `fn_name` identifies which mlx-c
   /// function returned the NULL, so callers can route on the failure
@@ -2489,6 +2500,56 @@ impl std::error::Error for LayerKeyedPayload {
     Some(self.inner.as_ref() as &(dyn std::error::Error + 'static))
   }
 }
+
+/// Payload for [`Error::MalformedData`]: a serialized / structured input
+/// is malformed, truncated, or in an unsupported shape (e.g. a corrupt
+/// SentencePiece protobuf field, a `tokenizer.json` `model.vocab` entry
+/// with the wrong arity / element type, or a fine-tuning jsonl record
+/// that matches none of the supported dataset formats).
+///
+/// **Distinct from [`Error::Parse`]** (which wraps an inner `std::error`
+/// from an external parser like serde_json) — `MalformedData` is for
+/// structural violations detected by mlxrs's OWN hand-rolled readers /
+/// validators, where there is no inner library error to carry, only a
+/// static call-site context and a static description of what was wrong.
+///
+/// Construct via [`MalformedDataPayload::new`]; access fields via
+/// `context()` and `detail()`. Both fields are `&'static str` (no
+/// `format!`) — the §5 typed-error rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MalformedDataPayload {
+  context: &'static str,
+  detail: &'static str,
+}
+
+impl MalformedDataPayload {
+  /// Construct a new payload.
+  pub const fn new(context: &'static str, detail: &'static str) -> Self {
+    Self { context, detail }
+  }
+
+  /// The call-site label identifying the reader / format
+  /// (e.g. `"SentencePiece protobuf"`, `"SentencePieceTokenizer: model.vocab"`).
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+
+  /// A static description of how the data was malformed
+  /// (e.g. `"truncated length-delimited field"`, `"entry must be a [token, score] pair"`).
+  #[inline(always)]
+  pub const fn detail(&self) -> &'static str {
+    self.detail
+  }
+}
+
+impl std::fmt::Display for MalformedDataPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "malformed data: {}: {}", self.context, self.detail)
+  }
+}
+
+impl std::error::Error for MalformedDataPayload {}
 
 /// Convenience alias for `Result<T, Error>`.
 pub type Result<T> = std::result::Result<T, Error>;
