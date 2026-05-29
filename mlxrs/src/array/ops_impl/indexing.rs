@@ -32,4 +32,64 @@ impl Array {
   pub fn gather(&self, indices: &[&Array], axes: &[i32], slice_sizes: &[i32]) -> Result<Array> {
     crate::ops::indexing::gather(self, indices, axes, slice_sizes)
   }
+
+  /// Overwrite a strided sub-region with `update`. See [`crate::ops::indexing::slice_update`].
+  pub fn slice_update(
+    &self,
+    update: &Array,
+    start: &[i32],
+    stop: &[i32],
+    strides: &[i32],
+  ) -> Result<Array> {
+    crate::ops::indexing::slice_update(self, update, start, stop, strides)
+  }
+
+  /// Add `update` into a strided sub-region. See [`crate::ops::indexing::slice_update_add`].
+  pub fn slice_update_add(
+    &self,
+    update: &Array,
+    start: &[i32],
+    stop: &[i32],
+    strides: &[i32],
+  ) -> Result<Array> {
+    crate::ops::indexing::slice_update_add(self, update, start, stop, strides)
+  }
+
+  /// Element-wise max into a strided sub-region. See [`crate::ops::indexing::slice_update_max`].
+  pub fn slice_update_max(
+    &self,
+    update: &Array,
+    start: &[i32],
+    stop: &[i32],
+    strides: &[i32],
+  ) -> Result<Array> {
+    crate::ops::indexing::slice_update_max(self, update, start, stop, strides)
+  }
+
+  /// Element-wise min into a strided sub-region. See [`crate::ops::indexing::slice_update_min`].
+  pub fn slice_update_min(
+    &self,
+    update: &Array,
+    start: &[i32],
+    stop: &[i32],
+    strides: &[i32],
+  ) -> Result<Array> {
+    crate::ops::indexing::slice_update_min(self, update, start, stop, strides)
+  }
+
+  /// Multiply a strided sub-region by `update`. See [`crate::ops::indexing::slice_update_prod`].
+  pub fn slice_update_prod(
+    &self,
+    update: &Array,
+    start: &[i32],
+    stop: &[i32],
+    strides: &[i32],
+  ) -> Result<Array> {
+    crate::ops::indexing::slice_update_prod(self, update, start, stop, strides)
+  }
+
+  /// Overwrite a dynamically-offset sub-region. See [`crate::ops::indexing::slice_update_dynamic`].
+  pub fn slice_update_dynamic(&self, update: &Array, start: &Array, axes: &[i32]) -> Result<Array> {
+    crate::ops::indexing::slice_update_dynamic(self, update, start, axes)
+  }
 }
