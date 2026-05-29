@@ -7,7 +7,7 @@
 use mlxrs::{
   Array,
   ops::{
-    arithmetic::{add, multiply, power, square},
+    arithmetic::{add, exp, multiply, power, sin, square, tanh},
     linalg_basic::{inner, matmul},
     reduction::sum,
     shape::contiguous,
@@ -700,5 +700,189 @@ fn jvp_multi_primal_sums_directional_contributions() {
   assert!(
     approx_eq(jvp_out[0].item::<f32>().unwrap(), 5.0, 1e-4),
     "jvp = y·dx + x·dy = 3 + 2 = 5"
+  );
+}
+
+// ───────────── #257 M18: finite-difference gradient cross-checks ─────────────
+//
+// The closed-form tests above compare the analytic `grad` against a
+// HAND-DERIVED symbolic derivative. These tests add a stronger, independent
+// angle: compare the analytic `grad` against a NUMERICAL central-difference
+// estimate of the same function,
+//
+//     f'(x) ≈ (f(x + h) − f(x − h)) / (2h)            (O(h²) accurate)
+//
+// computed by actually evaluating the forward function at perturbed inputs.
+// This catches sign/chain-rule/op-wiring bugs that a hand-derived symbolic
+// reference could share (both could be wrong the same way), since the numeric
+// estimate only ever runs the FORWARD op.
+//
+// Panic-safety: every closure handed to `grad` builds its graph with `?` and
+// never `.unwrap()`s inside the closure body, so none can leak MLX's
+// process-global `trace_stack_` frame (see the long note earlier in this file
+// and `tests/transforms_async_eval.rs`). The numeric side runs entirely
+// OUTSIDE any transform — plain forward `eval` via `item` — so `.unwrap()` there
+// is safe and cannot pollute the trace stack.
+
+/// Central-difference estimate of `df/dx` for a scalar→scalar forward function
+/// `f`, evaluated at scalar `x` with step `h`. Runs purely forward (no grad),
+/// so the `?`/`item` here cannot interact with MLX's trace stack.
+fn central_difference<F>(f: &F, x: f32, h: f32) -> mlxrs::Result<f32>
+where
+  F: Fn(&Array) -> mlxrs::Result<Array>,
+{
+  let mut up = f(&Array::full::<f32>(&[0i32; 0], x + h)?)?;
+  let mut down = f(&Array::full::<f32>(&[0i32; 0], x - h)?)?;
+  Ok((up.item::<f32>()? - down.item::<f32>()?) / (2.0 * h))
+}
+
+/// Analytic `grad` of a scalar→scalar function evaluated at scalar `x`.
+/// `f` is a plain forward closure; it is lifted into the `&[Array]` shape
+/// `grad` expects. Returns the single scalar gradient.
+fn analytic_grad<F>(f: F, x: f32) -> mlxrs::Result<f32>
+where
+  F: Fn(&Array) -> mlxrs::Result<Array> + 'static,
+{
+  // The differentiated closure is panic-free: it only uses `?` (never
+  // `.unwrap()`), so a failure surfaces as `Err` at the FFI boundary rather
+  // than unwinding through MLX's C++ trace-stack guard.
+  let g = grad(move |xs| Ok(vec![f(&xs[0])?]), &[0])?;
+  let mut grads = g(&[Array::full::<f32>(&[0i32; 0], x)?])?;
+  grads[0].item::<f32>()
+}
+
+/// `d/dx sin(x) = cos(x)`: analytic grad must match the central-difference
+/// estimate. Checked at a few points spanning sign changes of cos.
+#[test]
+fn finite_diff_matches_grad_sin() {
+  let h = 1e-3_f32;
+  for &x in &[-1.5_f32, -0.3, 0.0, 0.7, 2.0] {
+    let analytic = analytic_grad(sin, x).unwrap();
+    let numeric = central_difference(&(|a: &Array| sin(a)), x, h).unwrap();
+    // Central difference is O(h²); with h=1e-3 and f32 round-off a 2e-3
+    // absolute tolerance comfortably covers truncation + rounding error.
+    assert!(
+      approx_eq(analytic, numeric, 2e-3),
+      "d/dx sin at x={x}: analytic grad {analytic} vs central-diff {numeric}"
+    );
+  }
+}
+
+/// `d/dx exp(x) = exp(x)`: analytic grad vs central difference. The relative
+/// step error grows with |f|, so we keep |x| modest and use an absolute
+/// tolerance scaled to the largest expected magnitude (exp(1.2) ≈ 3.32).
+#[test]
+fn finite_diff_matches_grad_exp() {
+  let h = 1e-3_f32;
+  for &x in &[-1.0_f32, -0.2, 0.5, 1.2] {
+    let analytic = analytic_grad(exp, x).unwrap();
+    let numeric = central_difference(&(|a: &Array| exp(a)), x, h).unwrap();
+    assert!(
+      approx_eq(analytic, numeric, 5e-3),
+      "d/dx exp at x={x}: analytic grad {analytic} vs central-diff {numeric}"
+    );
+  }
+}
+
+/// `d/dx tanh(x) = 1 − tanh²(x)`: analytic grad vs central difference. tanh is
+/// smooth and bounded so the central-difference truncation error is small.
+#[test]
+fn finite_diff_matches_grad_tanh() {
+  let h = 1e-3_f32;
+  for &x in &[-1.3_f32, -0.4, 0.0, 0.6, 1.5] {
+    let analytic = analytic_grad(tanh, x).unwrap();
+    let numeric = central_difference(&(|a: &Array| tanh(a)), x, h).unwrap();
+    assert!(
+      approx_eq(analytic, numeric, 2e-3),
+      "d/dx tanh at x={x}: analytic grad {analytic} vs central-diff {numeric}"
+    );
+  }
+}
+
+/// Composite polynomial `f(x) = x³ + 2x` (`d/dx = 3x² + 2`): exercises a
+/// multi-term graph (`power` + `multiply` + `add`) against the numerical
+/// estimate, so a chain-rule/op-wiring bug in the composite path is caught
+/// independently of the single-op cases above.
+#[test]
+fn finite_diff_matches_grad_cubic_plus_linear() {
+  // f(x) = x^3 + 2x, built panic-free (`?` only). `power` needs an exponent
+  // array; `multiply` scales the linear term. Closures capture nothing
+  // non-`'static`, so they satisfy `analytic_grad`'s bound.
+  let f = |a: &Array| -> mlxrs::Result<Array> {
+    let three = Array::full::<f32>(&[0i32; 0], 3.0)?;
+    let two = Array::full::<f32>(&[0i32; 0], 2.0)?;
+    let cube = power(a, &three)?;
+    let lin = multiply(a, &two)?;
+    add(&cube, &lin)
+  };
+  let h = 1e-3_f32;
+  for &x in &[-1.4_f32, -0.5, 0.3, 1.1, 2.0] {
+    let analytic = analytic_grad(f, x).unwrap();
+    let numeric = central_difference(&f, x, h).unwrap();
+    // x³ grows the central-difference truncation error (∝ |f'''| h² = 6h²)
+    // and f32 cancellation near the larger |x|; 8e-3 absolute covers x=2.
+    assert!(
+      approx_eq(analytic, numeric, 8e-3),
+      "d/dx (x³+2x) at x={x}: analytic grad {analytic} vs central-diff {numeric} \
+       (closed form 3x²+2 = {})",
+      3.0 * x * x + 2.0
+    );
+  }
+}
+
+/// Multivariate partial-derivative cross-check. f(x, y) = x²·y + y, so
+/// ∂f/∂x = 2xy and ∂f/∂y = x² + 1. Each analytic partial (selected via
+/// `argnums`) is compared against a central difference that perturbs ONLY that
+/// variable, confirming the partials are wired to the correct input.
+#[test]
+fn finite_diff_matches_partial_grads_multivariate() {
+  let x0 = 1.5_f32;
+  let y0 = 2.0_f32;
+  let h = 1e-3_f32;
+
+  // f(x, y) = x²·y + y — panic-free (`?` only).
+  let forward = |xs: &[Array]| -> mlxrs::Result<Vec<Array>> {
+    let x2 = square(&xs[0])?;
+    let x2y = multiply(&x2, &xs[1])?;
+    Ok(vec![add(&x2y, &xs[1])?])
+  };
+
+  // Analytic partials via argnums selection.
+  let gx = grad(forward, &[0]).unwrap();
+  let gy = grad(forward, &[1]).unwrap();
+  let mut dx = gx(&[
+    Array::full::<f32>(&[0i32; 0], x0).unwrap(),
+    Array::full::<f32>(&[0i32; 0], y0).unwrap(),
+  ])
+  .unwrap();
+  let mut dy = gy(&[
+    Array::full::<f32>(&[0i32; 0], x0).unwrap(),
+    Array::full::<f32>(&[0i32; 0], y0).unwrap(),
+  ])
+  .unwrap();
+  let analytic_dx = dx[0].item::<f32>().unwrap();
+  let analytic_dy = dy[0].item::<f32>().unwrap();
+
+  // Numeric partials: evaluate the scalar forward at perturbed single vars.
+  // f is scalar-valued, so `item` reads it directly. Runs outside any
+  // transform (plain forward eval), so `.unwrap()` is trace-stack-safe.
+  let scalar_f = |x: f32, y: f32| -> f32 {
+    let xa = Array::full::<f32>(&[0i32; 0], x).unwrap();
+    let ya = Array::full::<f32>(&[0i32; 0], y).unwrap();
+    let mut out = forward(&[xa, ya]).unwrap();
+    out.remove(0).item::<f32>().unwrap()
+  };
+  let numeric_dx = (scalar_f(x0 + h, y0) - scalar_f(x0 - h, y0)) / (2.0 * h);
+  let numeric_dy = (scalar_f(x0, y0 + h) - scalar_f(x0, y0 - h)) / (2.0 * h);
+
+  assert!(
+    approx_eq(analytic_dx, numeric_dx, 5e-3),
+    "∂f/∂x: analytic {analytic_dx} vs central-diff {numeric_dx} (2xy = {})",
+    2.0 * x0 * y0
+  );
+  assert!(
+    approx_eq(analytic_dy, numeric_dy, 5e-3),
+    "∂f/∂y: analytic {analytic_dy} vs central-diff {numeric_dy} (x²+1 = {})",
+    x0 * x0 + 1.0
   );
 }

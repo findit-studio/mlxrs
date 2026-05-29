@@ -161,6 +161,12 @@ pub fn bernoulli(p: &Array, shape: &impl IntoShape, key: &Array) -> Result<Array
 /// Uniform draws in `[low, high)` of the given `shape` and `dtype`. `low` and
 /// `high` are arrays (broadcast to `shape`).
 ///
+/// mlx does **not** validate `low <= high`. With `low > high` the computed
+/// range `high - low` is negative, so samples fall in the reversed half-open
+/// interval `(high, low]` instead of `[low, high)` (no error is raised). This
+/// is upstream behavior, preserved here; see [`randint`] for why no value-based
+/// guard is added (it would force an implicit `eval` on the borrowed bounds).
+///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.random.uniform.html).
 pub fn uniform(
   low: &Array,
@@ -267,6 +273,22 @@ pub fn normal_broadcast(
 
 /// Random integer draws in `[low, high)` of the given `shape` and integer
 /// `dtype`. `low` and `high` are arrays (broadcast to `shape`).
+///
+/// # Inverted bounds (`low > high`)
+///
+/// mlx does **not** validate that `low <= high`. Internally `randint` is
+/// `astype(maximum(uniform(low, high), low), dtype)` (`mlx/mlx/random.cpp`):
+/// when `low > high` the underlying `uniform` draws from the reversed/empty
+/// range `(high, low]` and the `maximum(·, low)` then clamps every sample up to
+/// `low`, so the result is silently a constant array of `low` rather than an
+/// error. This is upstream behavior (mlx-core / mlx-python both forward without
+/// a guard), faithfully preserved here.
+///
+/// This wrapper deliberately does **not** add a value-based `low <= high` guard:
+/// `low`/`high` are borrowed (`&Array`) and may be lazy/unevaluated, so reading
+/// them to compare would force an implicit `eval` — a behavior change that
+/// violates the crate's "no implicit eval on `&self`" contract. Callers that
+/// need strict bounds should validate their scalar `low`/`high` before the call.
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.random.randint.html).
 pub fn randint(
@@ -448,6 +470,16 @@ pub fn truncated_normal(
 /// because mlx implements `multivariate_normal` via SVD on the covariance,
 /// which is not yet supported on the Metal GPU backend.
 ///
+/// # Empty covariance (a zero-length last-two dimension)
+///
+/// Because mlx computes the covariance square-root via `linalg::svd(cov, ...)`
+/// (`mlx/mlx/random.cpp`), a covariance with a zero-sized trailing matrix
+/// dimension (`0×0`, etc.) hits the same SVD-kernel divide-by-zero as
+/// [`crate::ops::linalg_full::svd`]: mlx's `multivariate_normal` only checks
+/// `cov.ndim() < 2` and that `cov` is square, both of which a `0×0` cov passes.
+/// This safe wrapper rejects such a `cov` first with a recoverable
+/// [`crate::error::Error::EmptyInput`] (a cheap shape check, no `eval`).
+///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.random.multivariate_normal.html).
 pub fn multivariate_normal(
   mean: &Array,
@@ -456,6 +488,14 @@ pub fn multivariate_normal(
   dtype: Dtype,
   key: &Array,
 ) -> Result<Array> {
+  // Guard the SVD divide-by-zero on the covariance: mlx forwards `cov` to
+  // `linalg::svd` and only checks `ndim < 2` / squareness, so a `0×0` (or
+  // `0×n` / `m×0`) `cov` would reach the kernel's `a.size() / (m * n)` (`0 / 0`,
+  // UB / SIGFPE). Reuse the shared SVD-input guard before entering mlx.
+  crate::ops::linalg_full::reject_empty_matrix(
+    cov,
+    "multivariate_normal: covariance matrix has a zero-length row or column dimension",
+  )?;
   shape.with_shape(|s| {
     validate_dims(s)?;
     // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)

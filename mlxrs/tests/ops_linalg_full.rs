@@ -249,3 +249,269 @@ fn cross_method_form_matches_freefn() {
   let v = c.to_vec::<f32>().unwrap();
   assert!(close_vec(&v, &[0.0, 0.0, 1.0]));
 }
+
+// ─────────────────── empty-matrix SVD guard (#257 M15 R2) ───────────────────
+//
+// Both `svd` and `pinv` are SVD-backed; mlx's CPU SVD kernel computes
+// `num_matrices = a.size() / (m * n)` and only guards `ndim < 2`, so a `>= 2`-D
+// matrix with a zero-length trailing dim (`0×0` / `0×n` / `m×0`) makes
+// `m * n == 0` and triggers a `0 / 0` integer divide-by-zero (UB / SIGFPE).
+// The shared `reject_empty_matrix` guard rejects these with `Error::EmptyInput`
+// via a cheap shape check, so the call returns `Err` WITHOUT entering mlx
+// (no `eval` / `to_vec`).
+
+/// Build a float matrix whose data is empty (product of `dims` is 0).
+fn empty_matrix(dims: &[i32]) -> Array {
+  // `from_slice` takes `shape: &impl IntoShape`; a runtime `&[i32]` slice
+  // satisfies `IntoShape` only when re-borrowed (the `&[i32]` impl), so pass
+  // `&dims` rather than `dims`.
+  Array::from_slice::<f32>(&[], &dims).unwrap()
+}
+
+#[test]
+fn svd_rejects_empty_matrix_dims() {
+  for dims in [[0i32, 0], [0, 3], [3, 0]] {
+    let a = empty_matrix(&dims);
+    match linalg_full::svd(&a, true) {
+      Err(mlxrs::Error::EmptyInput(p)) => assert_eq!(
+        p.context(),
+        "svd: input matrix has a zero-length row or column dimension"
+      ),
+      other => panic!("expected EmptyInput for svd of {dims:?}, got {other:?}"),
+    }
+    // compute_uv = false must take the same guard.
+    match linalg_full::svd(&a, false) {
+      Err(mlxrs::Error::EmptyInput(_)) => {}
+      other => panic!("expected EmptyInput for svd(no-uv) of {dims:?}, got {other:?}"),
+    }
+  }
+}
+
+#[test]
+fn pinv_rejects_empty_matrix_dims() {
+  for dims in [[0i32, 0], [0, 3], [3, 0]] {
+    let a = empty_matrix(&dims);
+    match linalg_full::pinv(&a) {
+      Err(mlxrs::Error::EmptyInput(p)) => assert_eq!(
+        p.context(),
+        "pinv: input matrix has a zero-length row or column dimension"
+      ),
+      other => panic!("expected EmptyInput for pinv of {dims:?}, got {other:?}"),
+    }
+  }
+}
+
+// ─────────────── empty-matrix guard for SVD-backed norms (#257 M15 R3) ───────
+//
+// mlx's `matrix_norm` (`mlx/mlx/linalg.cpp`) routes the *spectral* scalar orders
+// (`ord == 2.0` / `-2.0`) and the *nuclear* string order (`ord == "nuc"`) through
+// `svd(a_matrix, false)` over the two selected reduction axes. An empty matrix on
+// those modes would reach the same `0 / 0` SVD divide-by-zero as bare `svd`/
+// `pinv`, so the wrappers fast-fail with `Error::EmptyInput` (a cheap shape check,
+// no `eval`). The non-SVD orders (`fro`, `1`, `inf`, p-norms, 1-axis reductions)
+// are deliberately left unguarded — those tests assert our guard does NOT fire.
+
+const SPECTRAL_NORM_CONTEXT: &str =
+  "norm: matrix has a zero-length axis for the SVD-backed spectral order (ord = 2 / -2)";
+
+const NUCLEAR_NORM_CONTEXT: &str =
+  "norm_matrix: matrix has a zero-length axis for the SVD-backed nuclear order (ord = \"nuc\")";
+
+#[test]
+fn norm_spectral_rejects_empty_matrix_dims() {
+  // ord = 2.0 (max singular value) and ord = -2.0 (min singular value) both
+  // route through SVD in mlx; both must fast-fail on an empty matrix.
+  for ord in [2.0_f64, -2.0] {
+    for dims in [[0i32, 0], [0, 3], [3, 0]] {
+      let a = empty_matrix(&dims);
+      match linalg_full::norm(&a, ord, &[0, 1], false) {
+        Err(mlxrs::Error::EmptyInput(p)) => assert_eq!(p.context(), SPECTRAL_NORM_CONTEXT),
+        other => panic!("expected EmptyInput for norm(ord={ord}) of {dims:?}, got {other:?}"),
+      }
+    }
+  }
+}
+
+#[test]
+fn norm_spectral_rejects_empty_matrix_negative_axes() {
+  // Negative axes must be normalized the same way mlx does before the check.
+  let a = empty_matrix(&[0, 3]);
+  match linalg_full::norm(&a, 2.0, &[-2, -1], false) {
+    Err(mlxrs::Error::EmptyInput(p)) => assert_eq!(p.context(), SPECTRAL_NORM_CONTEXT),
+    other => panic!("expected EmptyInput for norm(ord=2, axes=[-2,-1]), got {other:?}"),
+  }
+}
+
+#[test]
+fn norm_spectral_empty_axis_is_not_svd_guarded() {
+  // An empty `axis` slice is passed to mlx-c as a NON-null pointer with len 0,
+  // which mlx-c turns into `Some(empty vec)` (NOT `nullopt`/full-reduction); mlx
+  // then rejects zero axes with "too many axes" BEFORE any SVD, so this is not an
+  // SVD-backed case and our spectral guard must NOT fire (Codex R4). The call
+  // still errors (mlx's axis error) — it just isn't OUR EmptyInput.
+  for dims in [[0i32, 0], [0, 3], [3, 0]] {
+    let a = empty_matrix(&dims);
+    match linalg_full::norm(&a, 2.0, &[], false) {
+      Err(mlxrs::Error::EmptyInput(p)) if p.context() == SPECTRAL_NORM_CONTEXT => {
+        panic!(
+          "norm(ord=2, axis=[]) is not SVD-backed (mlx rejects empty axis first); guard must not fire"
+        )
+      }
+      Err(_) => {}
+      Ok(_) => panic!("expected an error for norm(ord=2, axis=[]) of {dims:?}"),
+    }
+  }
+}
+
+#[test]
+fn norm_non_spectral_ord_is_not_guarded() {
+  // ord = 1 / inf are plain reductions (NOT SVD-backed); our empty-matrix guard
+  // must NOT fire for them. (mlx may itself accept or reject the empty
+  // reduction; we only assert this wrapper does not raise OUR spectral
+  // EmptyInput.)
+  let a = empty_matrix(&[0, 3]);
+  for ord in [1.0_f64, f64::INFINITY] {
+    match linalg_full::norm(&a, ord, &[0, 1], false) {
+      Err(mlxrs::Error::EmptyInput(p)) if p.context() == SPECTRAL_NORM_CONTEXT => {
+        panic!("norm(ord={ord}) must NOT hit the SVD spectral guard (non-SVD order)")
+      }
+      _ => {}
+    }
+  }
+}
+
+#[test]
+fn norm_spectral_single_axis_is_not_guarded() {
+  // A 1-axis reduction is a *vector* norm (NOT `matrix_norm`/SVD), so even
+  // ord = 2 over a single axis must not hit our matrix guard.
+  let a = empty_matrix(&[0, 3]);
+  match linalg_full::norm(&a, 2.0, &[1], false) {
+    Err(mlxrs::Error::EmptyInput(p)) if p.context() == SPECTRAL_NORM_CONTEXT => {
+      panic!("norm(ord=2) over a single axis is a vector norm, must not hit the matrix guard")
+    }
+    _ => {}
+  }
+}
+
+#[test]
+fn norm_spectral_out_of_range_axis_is_typed_error() {
+  // Codex R4: mlx's `matrix_norm` adds `ndim` once to a negative axis with NO
+  // range check, so an out-of-`[-ndim, ndim)` axis (positive OR negative) is not
+  // caught by mlx and could route a zero-length axis into the SVD divide-by-zero.
+  // The guard fully validates the axis range and returns a typed `OutOfRange`
+  // BEFORE any SVD — NOT our spectral `EmptyInput`, and never a crash. Checked on
+  // an empty matrix where a naive zero-length-first check would have masked it.
+  let a = empty_matrix(&[0, 3]);
+  for axes in [&[0i32, 99][..], &[99, 0][..], &[-3, 1][..], &[0, -3][..]] {
+    match linalg_full::norm(&a, 2.0, axes, false) {
+      Err(mlxrs::Error::OutOfRange(_)) => {}
+      other => {
+        panic!("norm(ord=2, axes={axes:?}) out-of-range axis must be OutOfRange, got {other:?}")
+      }
+    }
+  }
+}
+
+#[test]
+fn norm_matrix_nuc_out_of_range_axis_is_typed_error() {
+  // Codex R4: same full-range axis validation for the nuclear order — an
+  // out-of-`[-ndim, ndim)` axis is a typed `OutOfRange` before any SVD, not our
+  // nuclear `EmptyInput` and never a crash.
+  let ord = CString::new("nuc").unwrap();
+  let a = empty_matrix(&[0, 3]);
+  for axes in [&[0i32, 99][..], &[99, 0][..], &[-3, 1][..], &[0, -3][..]] {
+    match linalg_full::norm_matrix(&a, &ord, axes, false) {
+      Err(mlxrs::Error::OutOfRange(_)) => {}
+      other => {
+        panic!(
+          "norm_matrix(nuc, axes={axes:?}) out-of-range axis must be OutOfRange, got {other:?}"
+        )
+      }
+    }
+  }
+}
+
+#[test]
+fn norm_matrix_nuc_rejects_empty_matrix_dims() {
+  let ord = CString::new("nuc").unwrap();
+  for dims in [[0i32, 0], [0, 3], [3, 0]] {
+    let a = empty_matrix(&dims);
+    match linalg_full::norm_matrix(&a, &ord, &[0, 1], false) {
+      Err(mlxrs::Error::EmptyInput(p)) => assert_eq!(p.context(), NUCLEAR_NORM_CONTEXT),
+      other => panic!("expected EmptyInput for norm_matrix(nuc) of {dims:?}, got {other:?}"),
+    }
+  }
+}
+
+#[test]
+fn norm_matrix_nuc_empty_axis_is_not_svd_guarded() {
+  // Empty `axis` reaches mlx as `Some(empty vec)` → mlx rejects it with "too many
+  // axes" before any SVD, so the nuclear guard must NOT fire (Codex R4).
+  let ord = CString::new("nuc").unwrap();
+  let a = empty_matrix(&[3, 0]);
+  match linalg_full::norm_matrix(&a, &ord, &[], false) {
+    Err(mlxrs::Error::EmptyInput(p)) if p.context() == NUCLEAR_NORM_CONTEXT => {
+      panic!(
+        "norm_matrix(nuc, axis=[]) is not SVD-backed (mlx rejects empty axis first); guard must not fire"
+      )
+    }
+    Err(_) => {}
+    Ok(_) => panic!("expected an error for norm_matrix(nuc, axis=[])"),
+  }
+}
+
+#[test]
+fn norm_spectral_duplicate_axes_is_typed_error() {
+  // Codex R6: a matrix reduction needs two DISTINCT axes. Duplicate axes (both
+  // resolving to the same dim) are BOTH in range and length 3 here, so only a
+  // distinctness check catches them — mlx would otherwise collapse them and leak
+  // the unselected zero-length dim into the SVD divide-by-zero.
+  let a = empty_matrix(&[0, 3]);
+  for axes in [[1i32, 1], [1, -1]] {
+    match linalg_full::norm(&a, 2.0, &axes, false) {
+      Err(mlxrs::Error::OutOfRange(_)) => {}
+      other => {
+        panic!("norm(ord=2, axes={axes:?}) duplicate axes must be OutOfRange, got {other:?}")
+      }
+    }
+  }
+}
+
+#[test]
+fn norm_matrix_nuc_duplicate_axes_is_typed_error() {
+  // Codex R6: the nuclear `sum(svd(...))` path is where the duplicate-axis SVD
+  // divide-by-zero was traced; reject duplicate axes (each in range, length > 0)
+  // with a typed error before any SVD.
+  let ord = CString::new("nuc").unwrap();
+  for (dims, axes) in [
+    ([0i32, 3], [1i32, 1]),
+    ([0, 3], [1, -1]),
+    ([3, 0], [0, 0]),
+    ([3, 0], [0, -2]),
+  ] {
+    let a = empty_matrix(&dims);
+    match linalg_full::norm_matrix(&a, &ord, &axes, false) {
+      Err(mlxrs::Error::OutOfRange(_)) => {}
+      other => panic!(
+        "norm_matrix(nuc, dims={dims:?}, axes={axes:?}) duplicate axes must be OutOfRange, got {other:?}"
+      ),
+    }
+  }
+}
+
+#[test]
+fn norm_matrix_fro_is_not_guarded() {
+  // "fro"/"f" is computed via l2_norm (NOT SVD); our guard must NOT fire. (mlx
+  // may itself accept the empty Frobenius reduction; we only assert this wrapper
+  // does not raise OUR nuclear EmptyInput.)
+  let a = empty_matrix(&[0, 3]);
+  for name in ["fro", "f"] {
+    let ord = CString::new(name).unwrap();
+    match linalg_full::norm_matrix(&a, &ord, &[0, 1], false) {
+      Err(mlxrs::Error::EmptyInput(p)) if p.context() == NUCLEAR_NORM_CONTEXT => {
+        panic!("norm_matrix(\"{name}\") must NOT hit the SVD nuclear guard (l2_norm, not SVD)")
+      }
+      _ => {}
+    }
+  }
+}

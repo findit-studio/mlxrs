@@ -158,6 +158,27 @@ fn multivariate_normal_yields_correct_event_dim() {
 }
 
 #[test]
+fn multivariate_normal_rejects_empty_covariance() {
+  // mlx implements `multivariate_normal` via `linalg::svd(cov, ...)` and only
+  // checks `cov.ndim() < 2` / squareness — a `0×0` (or `0×n` / `m×0`) cov would
+  // reach the SVD kernel's `a.size() / (m * n)` (`0 / 0`, UB / SIGFPE). The
+  // shared SVD-input guard rejects it with `Error::EmptyInput` via a cheap shape
+  // check, so the call returns `Err` WITHOUT entering mlx (no `eval`).
+  let key = random::key(9).unwrap();
+  let mean = Array::from_slice::<f32>(&[], &[0i32]).unwrap();
+  for dims in [[0i32, 0], [0, 3], [3, 0]] {
+    let cov = Array::from_slice::<f32>(&[], &dims).unwrap();
+    match random::multivariate_normal(&mean, &cov, &(8usize,), Dtype::F32, &key) {
+      Err(mlxrs::Error::EmptyInput(p)) => assert_eq!(
+        p.context(),
+        "multivariate_normal: covariance matrix has a zero-length row or column dimension"
+      ),
+      other => panic!("expected EmptyInput for cov {dims:?}, got {other:?}"),
+    }
+  }
+}
+
+#[test]
 fn laplace_draws_have_correct_shape() {
   let key = random::key(10).unwrap();
   let l = random::laplace(&(8usize,), Dtype::F32, 0.0, 1.0, &key).unwrap();
