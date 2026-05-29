@@ -4,6 +4,31 @@
 //! Cum* (cumsum/cumprod/cummax/cummin) live in `misc.rs` per the Phase 4 LoC
 //! rebalancing.
 //!
+//! # NaN propagation
+//!
+//! Every floating-point reduction in this module is **NaN-propagating**, matching
+//! mlx-core's CPU/Metal reduce kernels (no NaN-skipping `nanmax`/`nansum`
+//! equivalents exist in mlx). If the reduced set contains any NaN, the result is
+//! NaN:
+//!
+//! - `sum` / `prod` / `mean` / `var` / `std` / `logsumexp` combine elements with
+//!   plain IEEE-754 arithmetic (`+`, `*`), so a NaN operand poisons the running
+//!   accumulator and the output is NaN (`mlx/backend/cpu/reduce.cpp`'s
+//!   `SumReduce`/`ProdReduce` are bare `x + y` / `x * y`).
+//! - `max` / `min` explicitly test for NaN and short-circuit to NaN: the kernel
+//!   does `if (simd::any(x != x)) return NAN;` and the pairwise `maximum`/
+//!   `minimum` return the NaN operand if either side is NaN (so NaN dominates
+//!   `+Inf`/`-Inf`, unlike a naive `>`/`<` compare which would drop it).
+//! - `median` sorts and averages the midpoint(s); a NaN in the reduce set sorts
+//!   to an implementation-defined position and propagates into the midpoint.
+//!
+//! Integer reductions have no NaN concept. `all` / `any` reduce to `bool` — a
+//! non-zero NaN bit-pattern is truthy, so a NaN element counts as `true`
+//! (consistent with `astype(a, bool)`).
+//!
+//! This is documentation of mlx-core's existing behavior; these wrappers are
+//! thin forwards and do not alter it.
+//!
 //! Identity-dtype reductions (`sum`, `prod`) short-circuit
 //! `_axes(empty_slice, _)` to `try_clone()`: MLX itself returns `a`
 //! unchanged for empty axes (`if (axes.empty()) return a;` in mlx
@@ -122,6 +147,10 @@ pub fn mean(a: &Array, keepdims: bool) -> Result<Array> {
 
 /// Maximum value along the given axes.
 ///
+/// NaN-propagating (floating types): if any element along the reduced axes is
+/// NaN the result is NaN — and NaN dominates `±Inf` (see the module-level
+/// "NaN propagation" note). Integer inputs have no NaN concept.
+///
 /// `max` errors on zero-size inputs (no defined max for an empty set). Unlike
 /// the identity-dtype reductions (`sum`/`prod`), we must NOT short-circuit
 /// `axes.is_empty()` to `try_clone` — MLX checks `a.size() == 0` BEFORE the
@@ -169,7 +198,8 @@ pub fn max(a: &Array, keepdims: bool) -> Result<Array> {
 /// Minimum value along the given axes.
 ///
 /// Same contract as `max_axes`: zero-size inputs error, no `try_clone`
-/// short-circuit. See `max_axes` doc for the rationale.
+/// short-circuit. See `max_axes` doc for the rationale. Also NaN-propagating
+/// for floating types (NaN dominates `±Inf`; see the module-level note).
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.min.html).
 pub fn min_axes(a: &Array, axes: &[i32], keepdims: bool) -> Result<Array> {

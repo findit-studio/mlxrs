@@ -161,6 +161,12 @@ pub fn bernoulli(p: &Array, shape: &impl IntoShape, key: &Array) -> Result<Array
 /// Uniform draws in `[low, high)` of the given `shape` and `dtype`. `low` and
 /// `high` are arrays (broadcast to `shape`).
 ///
+/// mlx does **not** validate `low <= high`. With `low > high` the computed
+/// range `high - low` is negative, so samples fall in the reversed half-open
+/// interval `(high, low]` instead of `[low, high)` (no error is raised). This
+/// is upstream behavior, preserved here; see [`randint`] for why no value-based
+/// guard is added (it would force an implicit `eval` on the borrowed bounds).
+///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.random.uniform.html).
 pub fn uniform(
   low: &Array,
@@ -267,6 +273,22 @@ pub fn normal_broadcast(
 
 /// Random integer draws in `[low, high)` of the given `shape` and integer
 /// `dtype`. `low` and `high` are arrays (broadcast to `shape`).
+///
+/// # Inverted bounds (`low > high`)
+///
+/// mlx does **not** validate that `low <= high`. Internally `randint` is
+/// `astype(maximum(uniform(low, high), low), dtype)` (`mlx/mlx/random.cpp`):
+/// when `low > high` the underlying `uniform` draws from the reversed/empty
+/// range `(high, low]` and the `maximum(·, low)` then clamps every sample up to
+/// `low`, so the result is silently a constant array of `low` rather than an
+/// error. This is upstream behavior (mlx-core / mlx-python both forward without
+/// a guard), faithfully preserved here.
+///
+/// This wrapper deliberately does **not** add a value-based `low <= high` guard:
+/// `low`/`high` are borrowed (`&Array`) and may be lazy/unevaluated, so reading
+/// them to compare would force an implicit `eval` — a behavior change that
+/// violates the crate's "no implicit eval on `&self`" contract. Callers that
+/// need strict bounds should validate their scalar `low`/`high` before the call.
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.random.randint.html).
 pub fn randint(

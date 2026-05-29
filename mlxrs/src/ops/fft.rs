@@ -21,7 +21,7 @@ use derive_more::{Display, IsVariant};
 
 use crate::{
   array::Array,
-  error::{Result, check},
+  error::{Error, LengthMismatchPayload, Result, check},
   shape::dim_ptr,
   stream::default_stream,
 };
@@ -74,7 +74,16 @@ impl From<FftNorm> for mlxrs_sys::mlx_fft_norm {
 /// bindings likewise materialize the default axes/n here. An out-of-range
 /// explicit axis is forwarded unchanged so mlx-c emits its own precise
 /// error instead of this panicking.
-fn resolve_fft(a: &Array, n: &[i32], axes: &[i32], last_two: bool) -> (Vec<i32>, Vec<i32>) {
+///
+/// When `n` is given but `axes` is empty, the default axes are the rightmost
+/// `n.len()` dims — which only exists if `n.len() <= a.ndim()`. If `n` is
+/// LONGER than the rank, there is no consistent default-axes assignment (the
+/// old clamp silently produced an `axes` vector SHORTER than `n`, forwarding a
+/// `n.len() != axes.len()` mismatch into mlx-c). That case is rejected here
+/// with a recoverable [`Error::LengthMismatch`], mirroring mlx core's own
+/// `"[fftn] Shape and axes have different sizes."` guard
+/// (`mlx/mlx/fft.cpp`).
+fn resolve_fft(a: &Array, n: &[i32], axes: &[i32], last_two: bool) -> Result<(Vec<i32>, Vec<i32>)> {
   let ndim = a.ndim() as i32;
   let norm = |ax: i32| if ax < 0 { ax + ndim } else { ax };
   if !axes.is_empty() {
@@ -89,14 +98,24 @@ fn resolve_fft(a: &Array, n: &[i32], axes: &[i32], last_two: bool) -> (Vec<i32>,
           .iter()
           .map(|&ax| shape[norm(ax) as usize] as i32)
           .collect();
-        return (nn, axes.to_vec());
+        return Ok((nn, axes.to_vec()));
       }
     }
-    return (n.to_vec(), axes.to_vec());
+    return Ok((n.to_vec(), axes.to_vec()));
   }
   if !n.is_empty() {
+    // Default axes = the rightmost `n.len()` dims. If `n` is longer than the
+    // rank there is no consistent assignment; reject instead of clamping (which
+    // would forward a shorter `axes` than `n` and silently mis-map the lengths).
+    if n.len() > a.ndim() {
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "fftn/fft2: n vs array rank (default axes)",
+        a.ndim(),
+        n.len(),
+      )));
+    }
     let cnt = n.len() as i32;
-    return (n.to_vec(), ((ndim - cnt).max(0)..ndim).collect());
+    return Ok((n.to_vec(), ((ndim - cnt).max(0)..ndim).collect()));
   }
   let ax: Vec<i32> = if last_two {
     ((ndim - 2).max(0)..ndim).collect()
@@ -108,7 +127,7 @@ fn resolve_fft(a: &Array, n: &[i32], axes: &[i32], last_two: bool) -> (Vec<i32>,
     .iter()
     .map(|&x| shape.get(x as usize).copied().unwrap_or(0) as i32)
     .collect();
-  (nn, ax)
+  Ok((nn, ax))
 }
 
 /// 1-D discrete Fourier transform along `axis`. `n` is the transform length
@@ -216,7 +235,7 @@ pub fn irfft(a: &Array, n: i32, axis: i32, norm: FftNorm) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.fft.fftn.html).
 pub fn fftn(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array> {
-  let (n, axes) = resolve_fft(a, n, axes, false);
+  let (n, axes) = resolve_fft(a, n, axes, false)?;
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
   // early return / panic frees it, then populated by the following call.
@@ -243,7 +262,7 @@ pub fn fftn(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array> 
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.fft.ifftn.html).
 pub fn ifftn(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array> {
-  let (n, axes) = resolve_fft(a, n, axes, false);
+  let (n, axes) = resolve_fft(a, n, axes, false)?;
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
   // early return / panic frees it, then populated by the following call.
@@ -271,7 +290,7 @@ pub fn ifftn(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array>
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.fft.fft2.html).
 pub fn fft2(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array> {
-  let (n, axes) = resolve_fft(a, n, axes, true);
+  let (n, axes) = resolve_fft(a, n, axes, true)?;
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
   // early return / panic frees it, then populated by the following call.
@@ -298,7 +317,7 @@ pub fn fft2(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array> 
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.fft.ifft2.html).
 pub fn ifft2(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array> {
-  let (n, axes) = resolve_fft(a, n, axes, true);
+  let (n, axes) = resolve_fft(a, n, axes, true)?;
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
   // early return / panic frees it, then populated by the following call.
@@ -325,7 +344,7 @@ pub fn ifft2(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array>
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.fft.rfftn.html).
 pub fn rfftn(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array> {
-  let (n, axes) = resolve_fft(a, n, axes, false);
+  let (n, axes) = resolve_fft(a, n, axes, false)?;
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
   // early return / panic frees it, then populated by the following call.
@@ -352,7 +371,7 @@ pub fn rfftn(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array>
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.fft.irfftn.html).
 pub fn irfftn(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array> {
-  let (n, axes) = resolve_fft(a, n, axes, false);
+  let (n, axes) = resolve_fft(a, n, axes, false)?;
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
   // early return / panic frees it, then populated by the following call.
@@ -379,7 +398,7 @@ pub fn irfftn(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.fft.rfft2.html).
 pub fn rfft2(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array> {
-  let (n, axes) = resolve_fft(a, n, axes, true);
+  let (n, axes) = resolve_fft(a, n, axes, true)?;
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
   // early return / panic frees it, then populated by the following call.
@@ -406,7 +425,7 @@ pub fn rfft2(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array>
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.fft.irfft2.html).
 pub fn irfft2(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array> {
-  let (n, axes) = resolve_fft(a, n, axes, true);
+  let (n, axes) = resolve_fft(a, n, axes, true)?;
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
   // early return / panic frees it, then populated by the following call.
@@ -464,7 +483,7 @@ pub fn rfftfreq(n: i32, d: f64) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.fft.fftshift.html).
 pub fn fftshift(a: &Array, axes: &[i32]) -> Result<Array> {
-  let (_, axes) = resolve_fft(a, &[], axes, false);
+  let (_, axes) = resolve_fft(a, &[], axes, false)?;
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
   // early return / panic frees it, then populated by the following call.
@@ -488,7 +507,7 @@ pub fn fftshift(a: &Array, axes: &[i32]) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.fft.ifftshift.html).
 pub fn ifftshift(a: &Array, axes: &[i32]) -> Result<Array> {
-  let (_, axes) = resolve_fft(a, &[], axes, false);
+  let (_, axes) = resolve_fft(a, &[], axes, false)?;
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
   // early return / panic frees it, then populated by the following call.

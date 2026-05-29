@@ -26,7 +26,7 @@ use std::{
 
 use crate::{
   array::Array,
-  error::{Result, check, check_vector_array_handle},
+  error::{EmptyInputPayload, Error, Result, check, check_vector_array_handle},
   ffi::{VectorArrayGuard, drain_vector},
   shape::dim_ptr,
   stream::default_stream,
@@ -69,6 +69,27 @@ fn linalg_cpu_stream() -> mlxrs_sys::mlx_stream {
 
 /// Matrix inverse (square `a`). Runs on the per-thread CPU stream
 /// (`linalg_cpu_stream`) — GPU kernel not yet implemented in mlx-c.
+///
+/// # Singular / ill-conditioned input
+///
+/// mlx does **not** report a dedicated "singular matrix" error, and this thin
+/// wrapper preserves that. The mlx CPU kernel (`mlx/backend/cpu/inverse.cpp`)
+/// factorizes with LAPACK `getrf` then inverts with `getri`, and the outcome
+/// depends on the kind of singularity:
+///
+/// - **Exactly singular** (a pivot is exactly zero): `getrf` returns a non-zero
+///   `info`, so mlx raises a runtime error. It surfaces here (after `eval`) as
+///   an [`Error::MlxC`] / [`Error::Backend`] carrying the LAPACK error code, not
+///   a typed "singular" variant.
+/// - **Numerically near-singular / ill-conditioned** (tiny but non-zero
+///   pivots): `getrf`/`getri` succeed and the returned inverse contains huge or
+///   non-finite (`±Inf` / `NaN`) entries. No error is raised — the non-finite
+///   output is the only signal. This matches numpy/mlx semantics; check the
+///   result with [`crate::ops::comparison::isfinite`] if you need to detect it.
+///
+/// Because the factorization happens lazily inside mlx, the exactly-singular
+/// error only materializes when the result is evaluated (e.g. via `eval` /
+/// `item` / `to_vec`), not at the `inv` call itself.
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.inv.html).
 pub fn inv(a: &Array) -> Result<Array> {
@@ -172,8 +193,31 @@ pub fn qr(a: &Array) -> Result<(Array, Array)> {
 /// Singular value decomposition. When `compute_uv = true`, returns
 /// `[U, S, Vt]`; when `false`, returns `[S]` only.
 ///
+/// # Empty matrix (a zero-length last-two dimension)
+///
+/// A matrix with a zero-sized row or column dimension (e.g. `0×0`, `0×n`,
+/// `m×0`) is rejected with a recoverable [`Error::EmptyInput`]. mlx core's
+/// `linalg::svd` only guards `ndim < 2`; for a `≥ 2`-D input with an empty
+/// trailing dim its CPU kernel computes `num_matrices = a.size() / (m * n)`
+/// (`mlx/backend/cpu/svd.cpp`), and with `m == 0` or `n == 0` that is an
+/// integer divide-by-zero (`0 / 0`) — undefined behavior / a process crash.
+/// This safe wrapper fails fast instead so an empty matrix can never reach
+/// that path. (`ndim < 2` is still delegated to mlx, which raises its own
+/// precise error.)
+///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.svd.html).
 pub fn svd(a: &Array, compute_uv: bool) -> Result<Vec<Array>> {
+  // Guard the divide-by-zero in mlx's CPU SVD kernel: an `>= 2`-D matrix whose
+  // last two dims include a zero (0×0 / 0×n / m×0) makes `m * n == 0`, and the
+  // kernel's `a.size() / (m * n)` is then `0 / 0` (UB / SIGFPE). mlx only checks
+  // `ndim < 2`, so we reject the empty-matrix case here before entering mlx-c.
+  // `ndim < 2` is intentionally left to mlx so it surfaces its own error.
+  let shape = a.shape();
+  if shape.len() >= 2 && (shape[shape.len() - 1] == 0 || shape[shape.len() - 2] == 0) {
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "svd: input matrix has a zero-length row or column dimension",
+    )));
+  }
   // Resolve the CPU stream FIRST — `linalg_cpu_stream()` runs the cleared-thread
   // poison guard (`assert_streams_not_cleared`) and installs the error handler
   // (`ensure_handler_installed`) before the fallible `mlx_vector_array_new()`
