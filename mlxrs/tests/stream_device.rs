@@ -349,7 +349,7 @@ fn post_clear_cpu_linalg_panics_fast() {
   // instead of continuing into mlx with torn-down stream state
   // (M2 deferred closeout: handler/poison audit).
   let outcome = std::thread::spawn(|| {
-    let a = mlxrs::Array::eye::<f32>(2).unwrap(); // build before poisoning
+    let a = mlxrs::Array::eye::<f32>(2, None, 0).unwrap(); // build before poisoning
     Stream::clear_current_thread_streams().unwrap(); // poison this thread
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
       let _ = mlxrs::ops::linalg_full::svd(&a, false); // -> linalg_cpu_stream -> must panic

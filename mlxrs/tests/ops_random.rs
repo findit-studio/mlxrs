@@ -151,7 +151,7 @@ fn multivariate_normal_yields_correct_event_dim() {
   let key = random::key(9).unwrap();
   // mean: shape [2], cov: shape [2,2] identity.
   let mean = Array::zeros::<f32>(&[2i32]).unwrap();
-  let cov = Array::eye::<f32>(2).unwrap();
+  let cov = Array::eye::<f32>(2, None, 0).unwrap();
   let r = random::multivariate_normal(&mean, &cov, &(8usize,), Dtype::F32, &key).unwrap();
   // Output shape is (8, 2) — sample shape with event dim appended.
   assert_eq!(r.shape(), vec![8, 2]);
