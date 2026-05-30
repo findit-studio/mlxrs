@@ -13,20 +13,6 @@ use crate::{
   stream::default_stream,
 };
 
-/// RAII guard for a temporary `mlx_array` (e.g. the scalar val passed to mlx_full).
-struct ScalarGuard(mlxrs_sys::mlx_array);
-impl Drop for ScalarGuard {
-  fn drop(&mut self) {
-    // SAFETY: frees a handle this guard owns exactly once. Runs during `Drop` /
-    // thread teardown: must not touch TLS, call `check()`, panic, or unwind
-    // across `extern "C"`; the rc is discarded silently per the crate's
-    // Drop convention.
-    unsafe {
-      let _ = mlxrs_sys::mlx_array_free(self.0);
-    }
-  }
-}
-
 /// Substitutes a real-`T` static for an empty data slice's dangling pointer,
 /// keeping zero-element FFI calls UB-free. mlx-c reinterprets the `void*` as
 /// `*const T` based on dtype before constructing `mlx::core::array`, so the
@@ -129,64 +115,34 @@ impl Array {
     })
   }
 
-  /// Creates an array filled with `value` (cast to f32 internally).
+  /// Creates an array of `shape` filled with `value` (dtype `T`).
   ///
-  /// `mlx_full` takes a scalar `mlx_array` for `vals`; this helper builds
-  /// the scalar via `mlx_array_new_float32(value)` and frees it on return.
-  pub fn full<T>(shape: &impl IntoShape, value: f32) -> Result<Self>
+  /// `value` is a `T`, so the fill is **exact** and an out-of-range value is a
+  /// *compile* error (you cannot write `300u8`). The scalar handed to
+  /// `mlx_full` is a 0-d `T` array built via [`Array::from_slice`], so mlx
+  /// never casts, rounds, or wraps the value. (`T = f64` only runs on a CPU
+  /// stream — Metal has no native f64, as for any f64 op.)
+  pub fn full<T>(shape: &impl IntoShape, value: T) -> Result<Self>
   where
     T: Element,
   {
-    // CRITICAL: must be the first call in this function. `Array::full` is the
-    // worst-case constructor for the stripped-ctor exit(-1) regression: the
-    // raw `mlx_array_new_float32(value)` below heap-allocates a fresh
-    // `mlx::core::array(val)` and is in mlx-c's standard
-    // `try/catch -> mlx_error(e.what())` wrapper, so a `std::bad_alloc`
-    // (or any other backend throw) would invoke mlx-c's default
-    // `printf + exit(-1)` handler and terminate the process before
-    // `check_handle` could observe the NULL handle. The later
-    // `mlx_full(..., default_stream())` would install the handler, but it
-    // is too late for failures in the scalar constructor itself. See issue
-    // #215 (stripped-ctor regression history).
-    //
-    // TEST COVERAGE: smoke-only (see `stripped_ctor_constructors`); the
-    // install-at-call-site requirement is enforced by code review, NOT by
-    // an executable regression test (a normal-input smoke does not throw
-    // — exercising `std::bad_alloc` requires an allocator-shim test build
-    // out of scope here, and the AST/syn-based structural alternative is
-    // forbidden by issue #215).
+    // The fill scalar is an exact 0-d `T` array. `from_slice` is itself
+    // stripped-ctor-safe (#215), validates, and installs the error handler, so
+    // the `mlx_array_new` / `mlx_full` calls below are guarded regardless of
+    // order. `mlx_full` broadcasts the scalar to `shape`; the scalar is already
+    // dtype `T`, so no value cast can occur.
+    let scalar = Self::from_slice(&[value], &[0i32; 0])?;
     crate::error::ensure_handler_installed();
     shape.with_shape(|s| {
       validate_dims(s)?;
-      // SAFETY: fallible sentinel-handle ctor: the error handler is installed before
-      // the call (no default `printf+exit`), the raw handle is wrapped in its
-      // RAII guard before the NULL-ctx check (free is a defined no-op on a
-      // NULL ctx), and the inputs are valid for the duration of the call.
-      let scalar = ScalarGuard(unsafe { mlxrs_sys::mlx_array_new_float32(value) });
-      // Explicit NULL-ctx check on the scalar handle BEFORE passing it to
-      // `mlx_full`. `mlx_array_new_float32` reports failure via the
-      // sentinel-handle pattern (NULL `ctx`, plus a message stashed in the
-      // TLS slot by our handler). Without this check, a scalar-constructor
-      // OOM would silently flow into `mlx_full(scalar=NULL_ctx, ...)` and
-      // surface as a generic backend error instead of the original
-      // bad-alloc message — and on a stripped-ctor build the original
-      // exit(-1) would already have fired in the line above (which is why
-      // the `ensure_handler_installed()` call at the top of this function
-      // is the load-bearing fix; this NULL check is a secondary
-      // correctness improvement that propagates the original allocator
-      // error rather than a downstream cascade).
-      if scalar.0.ctx.is_null() {
-        return Err(crate::error::take_last().unwrap_or(Error::Backend(
-          "mlx_array_new_float32 returned null handle".into(),
-        )));
-      }
-      // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
-      // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
-      // early return / panic frees it, then populated by the following call.
+      // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL
+      // ctx); it is wrapped in the RAII newtype FIRST so an early return / panic
+      // frees it, then populated by the following call.
       let mut out = Self(unsafe { mlxrs_sys::mlx_array_new() });
-      // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
-      // not retained by mlx past it); the out-param was freshly allocated above
-      // and is written by this call; the backend rc is surfaced via `check()`.
+      // SAFETY: `scalar.0` is a live, valid handle (the `from_slice` array,
+      // borrowed for the call, not retained by mlx past it); the out-param was
+      // freshly allocated above and is written by this call; the backend rc is
+      // surfaced via `check()`.
       check(unsafe {
         mlxrs_sys::mlx_full(
           &mut out.0,
@@ -201,8 +157,12 @@ impl Array {
     })
   }
 
-  /// Creates an `n×n` identity matrix.
-  pub fn eye<T>(n: usize) -> Result<Self>
+  /// Creates an `n × m` matrix with ones on the `k`-th diagonal, zeros elsewhere.
+  ///
+  /// Mirrors mlx-python `eye(n, m=None, k=0)`: `n` rows, `m` columns
+  /// (defaults to `n`, giving a square matrix), and `k` selects the diagonal
+  /// — `0` is the main diagonal, `> 0` shifts above it, `< 0` below it.
+  pub fn eye<T>(n: usize, m: Option<usize>, k: i32) -> Result<Self>
   where
     T: Element,
   {
@@ -215,6 +175,7 @@ impl Array {
     // install-at-call-site requirement is enforced by code review, NOT by
     // an executable regression test.
     crate::error::ensure_handler_installed();
+    let m = m.unwrap_or(n);
     let n_i32 = i32::try_from(n).map_err(|_| {
       Error::OutOfRange(OutOfRangePayload::new(
         "Array::eye: n",
@@ -222,6 +183,23 @@ impl Array {
         format_smolstr!("{n}"),
       ))
     })?;
+    let m_i32 = i32::try_from(m).map_err(|_| {
+      Error::OutOfRange(OutOfRangePayload::new(
+        "Array::eye: m",
+        "must fit in i32",
+        format_smolstr!("{m}"),
+      ))
+    })?;
+    // mlx's `eye` evaluates `-k` (`-k >= n` and `std::max(0, -k)` — see the
+    // vendored `mlx/ops.cpp`), so `k == i32::MIN` overflows in C++ (UB) from a
+    // safe call. Reject it pre-FFI. (#259 / Codex; upstream: mlx eye negates k.)
+    if k == i32::MIN {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "Array::eye: k",
+        "must be greater than i32::MIN (mlx evaluates -k, which overflows there)",
+        format_smolstr!("{k}"),
+      )));
+    }
     // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
     // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
     // early return / panic frees it, then populated by the following call.
@@ -229,12 +207,13 @@ impl Array {
     // SAFETY: all `mlx_*` handle args are valid borrowed handles (live for the call,
     // not retained by mlx past it); the out-param was freshly allocated above
     // and is written by this call; the backend rc is surfaced via `check()`.
+    // `k` is passed through directly: a negative `k` is the valid lower diagonal.
     check(unsafe {
       mlxrs_sys::mlx_eye(
         &mut out.0,
         n_i32,
-        n_i32,
-        0,
+        m_i32,
+        k,
         mlxrs_sys::mlx_dtype::from(T::DTYPE),
         default_stream(),
       )

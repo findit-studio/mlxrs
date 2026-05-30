@@ -232,14 +232,14 @@ pub fn last_token_pooling(token_embeddings: &Array, attention_mask: &Array) -> R
   // python all-pad fallback: `where(max(flipped, axis=1) == 0,
   // seq_len-1, flip_indices)`.
   let has_any_real = max_axes(&flipped, &[1], false)?;
-  let zero = Array::full::<i32>(&(1,), 0.0)?;
+  let zero = Array::full::<i32>(&(1,), 0)?;
   let is_all_pad = equal(&has_any_real, &zero)?;
-  let seq_len_m1 = Array::full::<i32>(&(1,), (seq_len as i32 - 1) as f32)?;
+  let seq_len_m1 = Array::full::<i32>(&(1,), seq_len as i32 - 1)?;
   let flip_indices = select(&is_all_pad, &seq_len_m1, &flip_indices)?;
 
   // python `last_indices = seq_len - flip_indices - 1`.
-  let seq_len_arr = Array::full::<i32>(&(1,), seq_len as f32)?;
-  let one = Array::full::<i32>(&(1,), 1.0)?;
+  let seq_len_arr = Array::full::<i32>(&(1,), seq_len as i32)?;
+  let one = Array::full::<i32>(&(1,), 1)?;
   let last_indices = subtract(&subtract(&seq_len_arr, &flip_indices)?, &one)?;
 
   // python gathers `token_embeddings * mask` (so the all-pad fallback

@@ -157,7 +157,7 @@ pub fn apply_min_p(logprobs: &Array, min_p: f32, min_tokens_to_keep: i32) -> Res
   if min_tokens_to_keep > 1 {
     let part = ops::misc::argpartition_axis(logprobs, vocab_size - min_tokens_to_keep, -1)?;
     let top_indices = slice_last_axis(&part, vocab_size - min_tokens_to_keep, vocab_size)?;
-    let keep = Array::full::<bool>(&(1,), 0.0)?;
+    let keep = Array::full::<bool>(&(1,), false)?;
     tokens_to_remove = ops::indexing::put_along_axis(&tokens_to_remove, &top_indices, &keep, -1)?;
   }
 
@@ -425,7 +425,7 @@ pub fn apply_xtc(
   // index array is a valid but pointless scatter).
   if !xtc_special_tokens.is_empty() {
     let special = token_index(logits, xtc_special_tokens)?;
-    let off = Array::full::<bool>(&(1,), 0.0)?;
+    let off = Array::full::<bool>(&(1,), false)?;
     mask = ops::indexing::put_along_axis(&mask, &special, &off, -1)?;
   }
 

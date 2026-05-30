@@ -19,7 +19,7 @@ fn close_vec(got: &[f32], want: &[f32]) -> bool {
 
 #[test]
 fn inv_of_identity_is_identity() {
-  let a = Array::eye::<f32>(3).unwrap();
+  let a = Array::eye::<f32>(3, None, 0).unwrap();
   let mut i = linalg_full::inv(&a).unwrap();
   let v = i.to_vec::<f32>().unwrap();
   let want = [1.0_f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
@@ -28,7 +28,7 @@ fn inv_of_identity_is_identity() {
 
 #[test]
 fn tri_inv_of_identity_is_identity() {
-  let a = Array::eye::<f32>(3).unwrap();
+  let a = Array::eye::<f32>(3, None, 0).unwrap();
   let mut i = linalg_full::tri_inv(&a, true).unwrap();
   let v = i.to_vec::<f32>().unwrap();
   assert!(close(v[0], 1.0));
@@ -38,7 +38,7 @@ fn tri_inv_of_identity_is_identity() {
 
 #[test]
 fn pinv_of_identity_is_identity() {
-  let a = Array::eye::<f32>(3).unwrap();
+  let a = Array::eye::<f32>(3, None, 0).unwrap();
   let mut p = linalg_full::pinv(&a).unwrap();
   let v = p.to_vec::<f32>().unwrap();
   assert!(close(v[0], 1.0));
@@ -48,7 +48,7 @@ fn pinv_of_identity_is_identity() {
 
 #[test]
 fn cholesky_inv_of_identity_works() {
-  let a = Array::eye::<f32>(2).unwrap();
+  let a = Array::eye::<f32>(2, None, 0).unwrap();
   let i = linalg_full::cholesky_inv(&a, false).unwrap();
   assert_eq!(i.shape(), vec![2, 2]);
 }
@@ -57,7 +57,7 @@ fn cholesky_inv_of_identity_works() {
 
 #[test]
 fn cholesky_of_identity_is_identity() {
-  let a = Array::eye::<f32>(3).unwrap();
+  let a = Array::eye::<f32>(3, None, 0).unwrap();
   let mut c = linalg_full::cholesky(&a, false).unwrap();
   let v = c.to_vec::<f32>().unwrap();
   assert!(close(v[0], 1.0));
@@ -67,7 +67,7 @@ fn cholesky_of_identity_is_identity() {
 
 #[test]
 fn qr_of_identity_yields_identity_pair() {
-  let a = Array::eye::<f32>(3).unwrap();
+  let a = Array::eye::<f32>(3, None, 0).unwrap();
   let (mut q, mut r) = linalg_full::qr(&a).unwrap();
   assert_eq!(q.shape(), vec![3, 3]);
   assert_eq!(r.shape(), vec![3, 3]);
@@ -80,7 +80,7 @@ fn qr_of_identity_yields_identity_pair() {
 
 #[test]
 fn svd_of_identity_yields_singular_values_one() {
-  let a = Array::eye::<f32>(3).unwrap();
+  let a = Array::eye::<f32>(3, None, 0).unwrap();
   // compute_uv = true → mlx returns [U, S, Vt].
   let mut parts = linalg_full::svd(&a, true).unwrap();
   assert_eq!(parts.len(), 3);
@@ -98,7 +98,7 @@ fn svd_of_identity_yields_singular_values_one() {
 
 #[test]
 fn svd_no_uv_yields_singular_values_only() {
-  let a = Array::eye::<f32>(3).unwrap();
+  let a = Array::eye::<f32>(3, None, 0).unwrap();
   let parts = linalg_full::svd(&a, false).unwrap();
   // compute_uv = false → just [S].
   assert_eq!(parts.len(), 1);
@@ -107,7 +107,7 @@ fn svd_no_uv_yields_singular_values_only() {
 
 #[test]
 fn lu_of_identity_yields_three_factors() {
-  let a = Array::eye::<f32>(3).unwrap();
+  let a = Array::eye::<f32>(3, None, 0).unwrap();
   let parts = linalg_full::lu(&a).unwrap();
   // mlx LU returns [P, L, U] (3 arrays).
   assert_eq!(parts.len(), 3);
@@ -115,7 +115,7 @@ fn lu_of_identity_yields_three_factors() {
 
 #[test]
 fn lu_factor_yields_two_outputs() {
-  let a = Array::eye::<f32>(3).unwrap();
+  let a = Array::eye::<f32>(3, None, 0).unwrap();
   let (lu, piv) = linalg_full::lu_factor(&a).unwrap();
   assert_eq!(lu.shape(), vec![3, 3]);
   // pivots are a 1-D vector.
@@ -126,7 +126,7 @@ fn lu_factor_yields_two_outputs() {
 
 #[test]
 fn solve_identity_yields_b() {
-  let a = Array::eye::<f32>(3).unwrap();
+  let a = Array::eye::<f32>(3, None, 0).unwrap();
   let b = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3i32]).unwrap();
   let mut x = linalg_full::solve(&a, &b).unwrap();
   let v = x.to_vec::<f32>().unwrap();
@@ -135,7 +135,7 @@ fn solve_identity_yields_b() {
 
 #[test]
 fn solve_triangular_identity_yields_b() {
-  let a = Array::eye::<f32>(3).unwrap();
+  let a = Array::eye::<f32>(3, None, 0).unwrap();
   let b = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3i32]).unwrap();
   let mut x = linalg_full::solve_triangular(&a, &b, false).unwrap();
   let v = x.to_vec::<f32>().unwrap();
@@ -170,7 +170,7 @@ fn eigvalsh_of_diagonal_matrix_yields_diagonal() {
 
 #[test]
 fn eig_yields_complex_pair() {
-  let a = Array::eye::<f32>(2).unwrap();
+  let a = Array::eye::<f32>(2, None, 0).unwrap();
   let (vals, vecs) = linalg_full::eig(&a).unwrap();
   assert_eq!(vals.shape(), vec![2]);
   assert_eq!(vecs.shape(), vec![2, 2]);
@@ -179,7 +179,7 @@ fn eig_yields_complex_pair() {
 
 #[test]
 fn eigvals_yields_complex() {
-  let a = Array::eye::<f32>(2).unwrap();
+  let a = Array::eye::<f32>(2, None, 0).unwrap();
   let vals = linalg_full::eigvals(&a).unwrap();
   assert_eq!(vals.shape(), vec![2]);
   assert_eq!(vals.dtype().unwrap(), Dtype::Complex64);
@@ -205,7 +205,7 @@ fn norm_p2_matches_l2() {
 #[test]
 fn norm_matrix_fro_matches_l2() {
   // ||I_2||_F = sqrt(2).
-  let a = Array::eye::<f32>(2).unwrap();
+  let a = Array::eye::<f32>(2, None, 0).unwrap();
   let ord = CString::new("fro").unwrap();
   let mut n = linalg_full::norm_matrix(&a, &ord, &[0, 1], false).unwrap();
   assert!(close(n.item::<f32>().unwrap(), 2.0_f32.sqrt()));
@@ -227,14 +227,14 @@ fn cross_x_y_yields_z() {
 
 #[test]
 fn inv_method_form_matches_freefn() {
-  let a = Array::eye::<f32>(3).unwrap();
+  let a = Array::eye::<f32>(3, None, 0).unwrap();
   let r = a.inv().unwrap();
   assert_eq!(r.shape(), vec![3, 3]);
 }
 
 #[test]
 fn solve_method_form_matches_freefn() {
-  let a = Array::eye::<f32>(3).unwrap();
+  let a = Array::eye::<f32>(3, None, 0).unwrap();
   let b = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3i32]).unwrap();
   let mut x = a.solve(&b).unwrap();
   let v = x.to_vec::<f32>().unwrap();

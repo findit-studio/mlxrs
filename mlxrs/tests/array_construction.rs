@@ -5,10 +5,13 @@
 //! overflow / zero-element guards and `archetypes.rs` smoke-tests the
 //! happy path of `ones`/`zeros`/`arange`, so this file deliberately
 //! targets the GENUINE gaps:
-//!   * `eye` and `linspace` — completely untested anywhere.
-//!   * `full`'s f32→dtype cast contract (the docstring says the value is
-//!     "cast to f32 internally"; the C++ `full(shape, vals, dtype)` then
-//!     re-casts to the requested dtype — verify on an integer dtype).
+//!   * `eye` and `linspace` — completely untested anywhere; plus `eye`'s
+//!     non-square (`m`) and off-diagonal (`k`) parameters (#259 construction
+//!     parity).
+//!   * `full`'s exact-fill contract: `value` is a `T`, so the 0-d scalar handed
+//!     to `mlx_full` is already dtype `T` and no value cast occurs — verify on
+//!     an integer dtype and on a wide `u32` value the old f32/i32 path couldn't
+//!     represent.
 //!   * `arange`'s half-open `[start, stop)` semantics with non-unit and
 //!     negative steps, plus the empty (`start == stop`) result.
 //!   * `linspace`'s inclusive `[start, stop]` endpoints and the `num == 1`
@@ -69,13 +72,37 @@ fn full_f32_fills_every_element() {
 }
 
 #[test]
-fn full_casts_f32_value_to_requested_integer_dtype() {
-  // `full::<i32>` builds the scalar as f32 then the C++ `full(shape, vals,
-  // dtype)` re-casts to the requested dtype. An exact-integer value (3.0)
-  // avoids truncation ambiguity: the result must be the I32 value 3.
-  let mut a = Array::full::<i32>(&(3,), 3.0).unwrap();
+fn full_fills_requested_integer_dtype() {
+  // `full::<i32>` takes an exact `i32` value; the 0-d scalar handed to
+  // `mlx_full` is already I32, so no cast occurs and the result is the I32
+  // value 3.
+  let mut a = Array::full::<i32>(&(3,), 3).unwrap();
   assert_eq!(a.dtype().unwrap(), Dtype::I32);
   assert_eq!(a.to_vec::<i32>().unwrap(), vec![3_i32; 3]);
+}
+
+#[test]
+fn full_i32_fill_keeps_dtype_and_value() {
+  // #259: the fill value is an exact `i32`, so dtype + value round-trip exactly
+  // (the 0-d scalar handed to `mlx_full` is already I32 — no float intermediate
+  // that could lose precision above 2^24).
+  let mut a = Array::full::<i32>(&(2,), 7).unwrap();
+  assert_eq!(a.shape(), vec![2]);
+  assert_eq!(a.dtype().unwrap(), Dtype::I32);
+  assert_eq!(a.to_vec::<i32>().unwrap(), vec![7_i32, 7]);
+}
+
+#[test]
+fn full_u32_wide_value_is_exact() {
+  // #259: `value: T` makes the fill exact for any in-range `T` value. A `u32`
+  // above i32::MAX (3e9) is faithfully represented — the old `impl Into<f64>` +
+  // i32-scalar path could not (it rejected/clipped it). No cast, no wrap.
+  let mut a = Array::full::<u32>(&(2,), 3_000_000_000u32).unwrap();
+  assert_eq!(a.dtype().unwrap(), Dtype::U32);
+  assert_eq!(
+    a.to_vec::<u32>().unwrap(),
+    vec![3_000_000_000, 3_000_000_000]
+  );
 }
 
 // ───────── eye ─────────
@@ -84,7 +111,7 @@ fn full_casts_f32_value_to_requested_integer_dtype() {
 fn eye_3_is_identity_matrix() {
   // mlx `eye(n, n, k=0)` → row-major identity. Flattened, the 1.0s sit on
   // indices 0, 4, 8 (the i*(n+1) diagonal) and everything else is 0.0.
-  let mut a = Array::eye::<f32>(3).unwrap();
+  let mut a = Array::eye::<f32>(3, None, 0).unwrap();
   assert_eq!(a.shape(), vec![3, 3]);
   assert_eq!(a.dtype().unwrap(), Dtype::F32);
   assert_eq!(
@@ -99,9 +126,60 @@ fn eye_3_is_identity_matrix() {
 
 #[test]
 fn eye_1_is_single_one() {
-  let mut a = Array::eye::<f32>(1).unwrap();
+  let mut a = Array::eye::<f32>(1, None, 0).unwrap();
   assert_eq!(a.shape(), vec![1, 1]);
   assert_eq!(a.to_vec::<f32>().unwrap(), vec![1.0]);
+}
+
+#[test]
+fn eye_non_square_uses_m_for_columns() {
+  // #259: `m = Some(4)` → 3 rows, 4 columns; the main diagonal (k=0) holds
+  // ones at flat indices 0, 5, 10 (i*(m+1)) and the rest are zero.
+  let mut a = Array::eye::<f32>(3, Some(4), 0).unwrap();
+  assert_eq!(a.shape(), vec![3, 4]);
+  assert_eq!(a.dtype().unwrap(), Dtype::F32);
+  assert_eq!(
+    a.to_vec::<f32>().unwrap(),
+    vec![
+      1.0, 0.0, 0.0, 0.0, //
+      0.0, 1.0, 0.0, 0.0, //
+      0.0, 0.0, 1.0, 0.0,
+    ]
+  );
+}
+
+#[test]
+fn eye_positive_k_is_super_diagonal() {
+  // #259: `k = 1` shifts the ones one column above the main diagonal. For a
+  // 3×3 that is flat indices 1 and 5; index 0 (main diagonal) is now 0.0.
+  let mut a = Array::eye::<f32>(3, None, 1).unwrap();
+  assert_eq!(a.shape(), vec![3, 3]);
+  let v = a.to_vec::<f32>().unwrap();
+  assert_eq!(v[1], 1.0);
+  assert_eq!(v[5], 1.0);
+  assert_eq!(v[0], 0.0);
+  assert_eq!(v[8], 0.0);
+}
+
+#[test]
+fn eye_negative_k_is_sub_diagonal() {
+  // #259: `k = -1` shifts the ones one row below the main diagonal — a valid
+  // negative offset. For a 3×3 that is flat indices 3 and 7.
+  let mut a = Array::eye::<f32>(3, None, -1).unwrap();
+  assert_eq!(a.shape(), vec![3, 3]);
+  let v = a.to_vec::<f32>().unwrap();
+  assert_eq!(v[3], 1.0);
+  assert_eq!(v[7], 1.0);
+  assert_eq!(v[0], 0.0);
+  assert_eq!(v[4], 0.0);
+}
+
+#[test]
+fn eye_k_i32_min_is_rejected_not_ub() {
+  // #259 / Codex: mlx's eye evaluates `-k`, so k == i32::MIN would overflow in
+  // C++ (UB). The wrapper rejects it with a typed error instead of calling FFI.
+  let err = Array::eye::<f32>(3, None, i32::MIN).unwrap_err();
+  assert!(matches!(err, mlxrs::Error::OutOfRange(_)), "got {err:?}");
 }
 
 // ───────── arange ─────────
