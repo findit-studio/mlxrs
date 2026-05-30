@@ -51,7 +51,7 @@ use smol_str::format_smolstr;
 /// `mlxrs::Array` `Result` API a raw `.shape()[3]` would **panic** on a
 /// wrong-rank input (the verified [medium] panic class of the merged
 /// single-seq rotating cache). This validates the rank and returns a
-/// recoverable [`Error::ShapeMismatch`] instead, never panicking. Kept
+/// recoverable [`Error::RankMismatch`] instead, never panicking. Kept
 /// local so this PR is self-contained / panic-free; when the
 /// `util::head_dim` hotfix lands this may switch to it (union-rebase).
 pub(crate) fn batch_head_dim(name: &str, a: &Array) -> Result<usize> {
@@ -85,7 +85,8 @@ pub(crate) fn batch_head_dim(name: &str, a: &Array) -> Result<usize> {
 /// values.shape[3]`). Our functional port's empty branch would otherwise
 /// just clone the mismatched `values` and return `Ok`, silently
 /// desynchronizing K/V — *less* faithful than mlx-lm. This restores
-/// mlx-lm's exact error point as a recoverable [`Error::ShapeMismatch`]
+/// mlx-lm's exact error point as a recoverable [`Error::RankMismatch`] /
+/// [`Error::ShapePairMismatch`]
 /// (both 4-D; `values` `B`/`n_kv_heads`/`S` == `keys`'; head_dim free).
 /// This is faithfulness parity, NOT extra validation beyond the reference.
 pub(crate) fn validate_kv_compat(keys: &Array, values: &Array) -> Result<()> {
@@ -156,7 +157,7 @@ fn neg_ivec(values: &[i32]) -> Result<Array> {
 /// — exactly `mx.roll` by `+shift[b]` per sequence.
 ///
 /// Rank-validated (not raw-indexed): a non-4-D `x` or a mis-shaped
-/// `shifts` is a recoverable [`Error::ShapeMismatch`], never a panic.
+/// `shifts` is a recoverable [`Error::RankMismatch`] / [`Error::ShapePairMismatch`], never a panic.
 /// `arange` is built through `f32` (the safe ops surface has no integer
 /// `arange`) then cast to `I32`; `S` ≤ a tiny cache length, far below
 /// `2^24`, so the round-trip is exact.
@@ -230,7 +231,7 @@ pub fn dynamic_roll(x: &Array, shifts: &Array, axis: i32) -> Result<Array> {
   // I32 silently produces wrong roll indices. Same aliasing class as
   // [`mask::iarange`](super::mask::iarange) and the local
   // `F32_EXACT_INT_MAX` guard in [`batch_rotating`](super::batch_rotating).
-  // Reject `n > 2^24` up front with a recoverable `Error::ShapeMismatch`
+  // Reject `n > 2^24` up front with a recoverable `Error::OutOfRange`
   // rather than returning silently-wrong indices.
   const F32_EXACT_INT_MAX: usize = 1usize << 24;
   if n > F32_EXACT_INT_MAX {
@@ -630,7 +631,7 @@ impl KvCache for BatchKvCache {
         // validation" (the head dim may legitimately differ; we do not
         // cross-check B/H/S), only enforcing the 4-D rank invariant the
         // rest of this module relies on so the failure is a recoverable
-        // `Error::ShapeMismatch`, never a panic. Validate BEFORE assigning
+        // `Error::RankMismatch`, never a panic. Validate BEFORE assigning
         // any field so a bad `values` leaves the cache unmutated.
         let sk = seq_len("keys", &keys)?;
         batch_head_dim("values", &values)?;
@@ -656,7 +657,7 @@ impl KvCache for BatchKvCache {
         // path. The restored `left_padding` MUST be a 1-D I32 vector
         // whose length equals the `keys` batch dim (`keys.shape[0]`);
         // any deviation rejects the restore as a recoverable
-        // `Error::ShapeMismatch`.
+        // `Error::RankMismatch` / `Error::LengthMismatch`.
         let lp_shape = left_padding.shape();
         let kb = keys.shape()[0];
         if lp_shape.len() != 1 {
@@ -896,7 +897,7 @@ impl BatchPositionedKvCache for BatchKvCache {
 /// Result `[B, 1, N, offset+N]` (broadcast from the `[1,N,offset+N]`
 /// causal grid against the `[B,1,1,1]` padding terms). `offset + N` is
 /// computed with [`usize::checked_add`] before any range is built so a
-/// hostile restored `offset` is a recoverable [`Error::ShapeMismatch`],
+/// hostile restored `offset` is a recoverable [`Error::ArithmeticOverflow`],
 /// never an overflow panic / silent wrong mask.
 pub(crate) fn create_causal_mask_batched(
   n: usize,
@@ -933,7 +934,7 @@ pub(crate) fn create_causal_mask_batched(
     //
     // For `w < total`, also guard against `w` itself exceeding `i32::MAX`
     // before the cast (`w` is `usize`, on 64-bit it can be > 2^31-1).
-    // Use `i32::try_from(w)` to surface a recoverable `Error::ShapeMismatch`
+    // Use `i32::try_from(w)` to surface a recoverable `Error::ArithmeticOverflow`
     // instead of silently wrapping to a negative value, which would
     // produce a wrong (inverted) windowed mask. The `w < total <
     // i32::MAX` invariant *usually* holds (total derives from real seq
@@ -960,7 +961,7 @@ pub(crate) fn create_causal_mask_batched(
     // hence a wrong mask. `scalar_i32` builds the I32 scalar directly with
     // no f32 intermediate — the same discipline `mask::iarange` and the
     // windowed `w_i32` cast above already use. Reject `total > i32::MAX`
-    // with a recoverable `Error::ShapeMismatch` so an overflowing prefill
+    // with a recoverable `Error::ArithmeticOverflow` so an overflowing prefill
     // never silently corrupts the mask.
     let total_i32 = i32::try_from(total).map_err(|_| {
       Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(

@@ -73,9 +73,13 @@ impl Model for MockModel {
       [b, s] => (*b, *s),
       [s] => (1, *s),
       _ => {
-        return Err(mlxrs::Error::ShapeMismatch(format!(
-          "MockModel::forward expects [B, S], got {shape:?}"
-        )));
+        return Err(mlxrs::Error::RankMismatch(
+          mlxrs::error::RankMismatchPayload::new(
+            "MockModel::forward expects [B, S]",
+            shape.len() as u32,
+            shape.to_vec(),
+          ),
+        ));
       }
     };
     let vocab = self.bias.len();
@@ -132,9 +136,13 @@ impl Model for DivergingDraft {
       [b, s] => (*b, *s),
       [s] => (1, *s),
       _ => {
-        return Err(mlxrs::Error::ShapeMismatch(format!(
-          "DivergingDraft::forward expects [B, S], got {shape:?}"
-        )));
+        return Err(mlxrs::Error::RankMismatch(
+          mlxrs::error::RankMismatchPayload::new(
+            "DivergingDraft::forward expects [B, S]",
+            shape.len() as u32,
+            shape.to_vec(),
+          ),
+        ));
       }
     };
     // Advance cache like a normal model.

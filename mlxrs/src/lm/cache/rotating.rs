@@ -157,7 +157,7 @@ impl RotatingKvCache {
   /// broadcasts `new` to it exactly as mlx's `slice_update` does (single
   /// helper, single tensor — NOT the fenced K/V cross-check). Identity
   /// broadcasts are no-ops; size-1 broadcasts expand; non-broadcastable
-  /// axes are a recoverable `Err(ShapeMismatch)`. Faithful to mlx-lm for
+  /// axes are a recoverable `Err(ShapePairMismatch)`. Faithful to mlx-lm for
   /// every input shape.
   fn set_seq(name: &str, buf: &Array, a: usize, s: usize, new: &Array) -> Result<Array> {
     // Mirror `ChunkedKvCache::set_seq`'s rank-safe + overflow-safe entry:
@@ -296,7 +296,7 @@ impl RotatingKvCache {
     // rank-safe `head_dim` accessor below is kept as defense-in-depth (it
     // is byte-identical to `values.shape[3]` for the now-guaranteed 4-D
     // `values`, mirroring mlx-lm's `values.shape[3]` at `cache.py:478`); it
-    // would still surface a recoverable `Error::ShapeMismatch` rather than
+    // would still surface a recoverable `Error::RankMismatch` rather than
     // a slice OOB panic if this private method were ever reached directly.
     let ks = keys.shape();
     let (b, h, k_hd) = (ks[0], ks[1], ks[3]);
@@ -451,7 +451,7 @@ impl KvCache for RotatingKvCache {
     // deliberately removed — `seq_len("values", values)` only checks
     // `values`'s OWN rank, never compares it to `keys`. Done BEFORE the S
     // dispatch so a rank-invalid `values` is a DETERMINISTIC recoverable
-    // `Err(Error::ShapeMismatch)` on EVERY path (empty/non-empty cache,
+    // `Err(Error::RankMismatch)` on EVERY path (empty/non-empty cache,
     // S==1's `_update_in_place`, S>1's `_update_concat` including the
     // empty-cache `try_clone` branch) regardless of which downstream MLX op
     // would otherwise (feature-combo-dependently) catch or miss it.
@@ -532,7 +532,7 @@ impl KvCache for RotatingKvCache {
         // per-tensor rank check on each (symmetric to the `seq_len` rank
         // check at `update` entry; still NOT a K/V cross-check) makes a
         // rank-invalid loaded state a DETERMINISTIC recoverable
-        // `Err(Error::ShapeMismatch)` here instead.
+        // `Err(Error::RankMismatch)` here instead.
         let _ = seq_len("keys", &keys)?;
         let _ = seq_len("values", &values)?;
         self.keys = Some(keys);

@@ -702,7 +702,7 @@ fn chunked_update_out_of_bounds_values_write_is_err_not_silent_corrupt() {
   // update(S=1): prev = 4-2 = 2; prev+1 = 3 <= keys_len=4 -> !need_alloc.
   // values buffer length is 1; write window [2,3) is out-of-bounds for
   // values. mlx-lm `self.values[..., 2:3, :] = ...` would raise IndexError;
-  // we surface a recoverable ShapeMismatch.
+  // we surface a recoverable error (OutOfRange — write window out-of-bounds).
   let t = kv(&[99.0]);
   let r = c.update(&t, &t);
   assert!(
@@ -743,7 +743,7 @@ fn chunked_update_out_of_bounds_values_write_is_err_not_silent_corrupt() {
 /// returning `new.try_clone()`) and silently mutate the cached buffer's
 /// batch axis. The fix validates non-seq axes at the `set_seq` boundary
 /// via `util::broadcast_write_rhs`, so EVERY window — partial or
-/// full — surfaces a recoverable `Err(ShapeMismatch)` on a mismatched
+/// full — surfaces a recoverable `Err(ShapePairMismatch)` on a mismatched
 /// non-seq axis. This is a single-tensor check (`new` vs target `buf`),
 /// NOT the fenced K/V cross-validation (keys vs values).
 #[test]
@@ -772,7 +772,7 @@ fn chunked_set_seq_full_window_rejects_mismatched_batch_dim() {
   // buf_len 1 -> !need_alloc. set_seq("keys", buf=[1,1,1,1], 0, 1,
   // new=[2,1,1,1]): full-window (head & tail both empty). BEFORE FIX:
   // silently returned `new` (batch-axis silently mutated). WITH FIX:
-  // Err(ShapeMismatch) at the broadcast_write_rhs boundary.
+  // Err(ShapePairMismatch) at the broadcast_write_rhs boundary.
   let r = c.update(&bad_kv2, &bad_kv2);
   match &r {
     Err(mlxrs::Error::ShapePairMismatch(p)) => {

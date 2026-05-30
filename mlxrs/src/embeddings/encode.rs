@@ -208,7 +208,7 @@ impl EncodeConfig {
 ///   [`EmbeddingModel`] performs (matching `lm/generate.rs::token_window`),
 ///   so the lookup never has to cast. Each `u32` id is converted with a
 ///   CHECKED `i32::try_from` (a token id `> i32::MAX` — realistically never —
-///   yields a recoverable [`Error::ShapeMismatch`] rather than silently
+///   yields a recoverable [`Error::OutOfRange`] rather than silently
 ///   wrapping negative);
 /// - `attention_mask` — `(batch, seq_len)` `f32` array (`1.0` / `0.0`);
 /// - `seq_len` — the batch max length (after per-text truncation).
@@ -825,7 +825,7 @@ mod tests {
   }
 
   /// A rank-1 (squeezed `[hidden]`) `pooled_output` must be rejected with
-  /// [`Error::ShapeMismatch`] for `Cls` — not normalized and returned as if it
+  /// [`Error::RankMismatch`] for `Cls` — not normalized and returned as if it
   /// covered the batch. Without the guard a custom / version-skewed model that
   /// squeezed a batch-1 pooler would silently yield a wrong-shape embedding.
   #[test]
@@ -861,8 +861,9 @@ mod tests {
   }
 
   /// A stale `[1, hidden]` `pooled_output` for a 2-text batch must be rejected
-  /// with [`Error::ShapeMismatch`] for `Cls` — the batch dim (1) does not cover
-  /// the request (2), so normalizing / returning it would silently drop a text.
+  /// with [`Error::LengthMismatch`] for `Cls` — the batch dim (1) does not
+  /// cover the request (2), so normalizing / returning it would silently drop a
+  /// text.
   #[test]
   fn encode_cls_rejects_wrong_batch_pooled_output() {
     let tok = word_tokenizer();
@@ -897,10 +898,10 @@ mod tests {
 
   /// A correctly-ranked, correctly-batched `pooled_output` whose hidden width
   /// differs from `last_hidden_state`'s hidden dim must be rejected with
-  /// [`Error::ShapeMismatch`] for `Cls` — otherwise it would be normalized /
-  /// truncated and returned as embeddings of an unexpected dimension. The
-  /// canned hidden states are `(.., .., 2)`, so a `(2, 3)` pooler is wrong-width
-  /// while still passing the rank-2 and batch checks.
+  /// [`Error::ShapePairMismatch`] for `Cls` — otherwise it would be normalized
+  /// / truncated and returned as embeddings of an unexpected dimension. The
+  /// canned hidden states are `(.., .., 2)`, so a `(2, 3)` pooler is
+  /// wrong-width while still passing the rank-2 and batch checks.
   #[test]
   fn encode_cls_rejects_wrong_hidden_width_pooled_output() {
     let tok = word_tokenizer();

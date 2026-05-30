@@ -77,7 +77,8 @@
 //! Conventions mirror [`crate::lm::sample`] / [`crate::lm::load`]:
 //! `Result`-fallible, no implicit eval (the weight `Array`s are returned
 //! lazily — no `eval`/`item`/`to_vec` here), recoverable failures map to
-//! [`Error::Backend`] / [`Error::ShapeMismatch`] with a clear message.
+//! [`Error::Backend`] / [`Error::RankMismatch`] / [`Error::ShapePairMismatch`]
+//! with a clear message.
 //!
 //! ## Validation contract
 //!
@@ -1384,7 +1385,7 @@ const _: () = assert!(AWQ_BITS == 4 && AWQ_SHIFTS[1] == 4 * AWQ_BITS);
 /// algebraic result is identical.
 ///
 /// Mirrors the mlx-lm 2-D contract verbatim; non-2D inputs are a
-/// [`Error::ShapeMismatch`] (the python version would `ValueError`
+/// [`Error::RankMismatch`] (the python version would `ValueError`
 /// during the trailing `.reshape(out_features, in_features)`). Dtypes
 /// other than `uint32` / `int32` are rejected as [`Error::Backend`].
 pub fn unpack_awq_weights(qweight: &Array) -> Result<Array> {
@@ -3670,7 +3671,7 @@ mod tests {
     );
   }
 
-  /// qweight/scales shape mismatch is rejected with a clear ShapeMismatch.
+  /// qweight/scales shape mismatch is rejected with a clear ShapePairMismatch.
   #[test]
   fn transform_awq_weights_rejects_mismatched_shapes() {
     let qw = Array::from_slice::<u32>(&[0u32; 8], &(8usize, 1)).unwrap();

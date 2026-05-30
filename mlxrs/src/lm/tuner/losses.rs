@@ -953,7 +953,7 @@ fn full_shape_i32(logits: &Array) -> Result<Vec<i32>> {
 /// floating-point.
 ///
 /// Zero-width vocab (last dim == 0) and i32-overflowing dims are also
-/// rejected here with [`Error::ShapeMismatch`], BEFORE the dtype checks,
+/// rejected here with [`Error::OutOfRange`], BEFORE the dtype checks,
 /// to match the documented precedence on [`kl_div_loss`] /
 /// [`js_div_loss`] (step 2 = shape-class errors, step 3 = dtype mismatch,
 /// step 4 = dtype admissibility). The shape-class rejections live in this
@@ -978,7 +978,7 @@ fn validate_inputs(
   // Rank >= 2 runs BEFORE the shape comparison so that a mismatched-rank
   // pair (e.g. rank-1 `logits_q` vs rank-2 `logits_p`) surfaces the
   // rank-rejection guidance — which tells the caller how to fix it
-  // (reshape to `[1, V]`) — rather than a generic ShapeMismatch that
+  // (reshape to `[1, V]`) — rather than a generic ShapePairMismatch that
   // hides the underlying contract. We check BOTH inputs so the error
   // names whichever side is rank-deficient. Scalar Metal outputs
   // (shape `[]`) are rejected by the shared kernel wrapper; surface a
@@ -1006,7 +1006,7 @@ fn validate_inputs(
     )));
   }
   // Zero-last-dim + i32-overflow checks run BEFORE dtype checks so the
-  // documented precedence (step 2 = ShapeMismatch for "last dim is 0 or
+  // documented precedence (step 2 = OutOfRange for "last dim is 0 or
   // any dim overflows i32") matches actual behavior. Without this, equal
   // `i32` arrays shaped `[1, 0]` would route through the dtype-admissibility
   // Backend error (step 4) and mixed-dtype `[1, 0]` arrays would route
@@ -1250,10 +1250,10 @@ fn js_backward_apply(
 /// 1. Rank check (BOTH inputs) — rank `< 2` (including rank 0) returns
 ///    [`Error::Backend`] with the "rank >= 2 required" message. This
 ///    runs BEFORE shape comparison, so a rank-1 `logits_q` paired with a
-///    rank-2 `logits_p` returns the rank error and NOT [`Error::ShapeMismatch`].
-/// 2. Shape comparison — [`Error::ShapeMismatch`] if
-///    `logits_q.shape() != logits_p.shape()`, or if the last dimension is
-///    0, or if any dimension overflows `i32`.
+///    rank-2 `logits_p` returns the rank error and NOT [`Error::ShapePairMismatch`].
+/// 2. Shape comparison — [`Error::ShapePairMismatch`] if
+///    `logits_q.shape() != logits_p.shape()`; [`Error::OutOfRange`] if the
+///    last dimension is 0 or any dimension overflows `i32`.
 /// 3. Dtype comparison — [`Error::DtypeMismatch`] if the two arrays have
 ///    different dtypes.
 /// 4. Dtype admissibility — [`Error::Backend`] if the dtype is not one of

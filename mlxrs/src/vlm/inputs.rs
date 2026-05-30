@@ -334,7 +334,7 @@ impl PrepareInputsOpts {
 /// - `padding=true` (default): pad to `max(T_b)` with `pad_token_id`,
 ///   left- or right-side per [`PrepareInputsOpts::padding_side`].
 /// - `padding=false`: the batches must all be the same length already
-///   (otherwise `Error::ShapeMismatch`).
+///   (otherwise `Error::InvariantViolation`).
 ///
 /// ## Attention-mask semantics
 ///
@@ -345,7 +345,7 @@ impl PrepareInputsOpts {
 ///   per-token mask is used directly. Required to have
 ///   `masks.len() == text_token_batches.len()` and
 ///   `masks[i].len() == text_token_batches[i].len()` for every `i`
-///   (otherwise `Error::ShapeMismatch`); the supplied mask is then
+///   (otherwise `Error::LengthMismatch`); the supplied mask is then
 ///   padded with `false` (per [`PaddingSide`]) to match the padded
 ///   `input_ids` shape. Use this path when you pre-padded the batches
 ///   yourself upstream and you need padding positions to be marked
@@ -354,11 +354,11 @@ impl PrepareInputsOpts {
 /// # Errors
 ///
 /// - `Error::EmptyInput` if `text_token_batches` is empty.
-/// - `Error::ShapeMismatch` if `padding=false` and the batches have
+/// - `Error::InvariantViolation` if `padding=false` and the batches have
 ///   varying lengths.
-/// - `Error::ShapeMismatch` if any per-batch `T_b > i32::MAX` (mlx
+/// - `Error::OutOfRange` if any per-batch `T_b > i32::MAX` (mlx
 ///   dimension limit).
-/// - `Error::ShapeMismatch` if `opts.attention_mask` is `Some(masks)`
+/// - `Error::LengthMismatch` if `opts.attention_mask` is `Some(masks)`
 ///   and `masks` has the wrong outer or inner dimensions.
 /// - `Error::OutOfMemory` if the row buffers cannot be allocated.
 pub fn prepare_inputs(

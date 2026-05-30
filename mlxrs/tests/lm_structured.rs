@@ -770,7 +770,7 @@ fn llguidance_processor_accepts_padded_model_vocab() {
 // R3 fix: validate every configured id against
 // `model_vocab_size.unwrap_or(bt.tokrx_info().vocab_size as usize)`
 // BEFORE crossing the FFI boundary, returning
-// `Error::ShapeMismatch` with the offending id + bound. Padded LM
+// `Error::OutOfRange` with the offending id + bound. Padded LM
 // heads (`Some(n)` > tokenizer vocab) are explicitly accepted: an
 // EOS id inside `[tokenizer_vocab, model_vocab)` is legitimate.
 
@@ -780,7 +780,7 @@ fn llguidance_terminal_grammar_rejects_out_of_range_eos_id_without_panic() {
   // total vocab is at most 99 (3 base specials + 95 printable ASCII +
   // 1 added special). With `model_vocab_size = None`, the validation
   // bound is the tokenizer's own vocab, so id 4242 is out of range
-  // and must surface as `Error::ShapeMismatch` — NOT a panic.
+  // and must surface as `Error::OutOfRange` — NOT a panic.
   let tok = fixture_tokenizer_with_eos_override(
     "out_of_range_eos",
     &[(CUSTOM_EOS_ID, "<|im_end|>")],

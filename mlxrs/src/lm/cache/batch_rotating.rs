@@ -747,10 +747,10 @@ impl KvCache for BatchRotatingKvCache {
   /// `B`/`n_kv_heads`/`S`-mismatched `values`. So `keys` *and* `values`
   /// are validated **here** (both 4-D; `values` `B`/`n_kv_heads`/`S` ==
   /// `keys`', head_dim free) before either path: a mismatch is a
-  /// recoverable [`Error::ShapeMismatch`] on **both** the `S==1` and
-  /// `S>1` paths (never a panic, never a silent K/V desync), exactly
-  /// mlx-lm's error semantics — observable behavior for every valid input
-  /// is unchanged.
+  /// recoverable [`Error::RankMismatch`] / [`Error::ShapePairMismatch`] on
+  /// **both** the `S==1` and `S>1` paths (never a panic, never a silent K/V
+  /// desync), exactly mlx-lm's error semantics — observable behavior for
+  /// every valid input is unchanged.
   fn update(&mut self, keys: &Array, values: &Array) -> Result<(Array, Array)> {
     // Reject the constructor placeholder `max_size == 0` here too —
     // symmetric with `make_mask` (Copilot review #3271308764). An update
@@ -868,7 +868,7 @@ impl KvCache for BatchRotatingKvCache {
         // API. We mirror mlx-lm's "no K/V *shape-compatibility*
         // validation" (head dim may differ; no B/H/S cross-check), only
         // enforcing the 4-D rank invariant so the failure is a recoverable
-        // `Error::ShapeMismatch`, never a panic. Validate before assigning
+        // `Error::RankMismatch`, never a panic. Validate before assigning
         // any field so a bad buffer leaves the cache unmutated.
         seq_len("keys", &keys)?;
         batch_head_dim("values", &values)?;
@@ -1130,7 +1130,7 @@ impl KvCache for BatchRotatingKvCache {
     // `mask::scalar_i32`/`iarange`): for every real `_idx` `trim_size`
     // is tiny so this is byte-identical to mlx-lm's unbounded
     // `_idx - max_size + int(N>1)`; only the corrupt huge value is a
-    // recoverable `ShapeMismatch` (this is `&self` — the `Err` is
+    // recoverable `ArithmeticOverflow` (this is `&self` — the `Err` is
     // inherently side-effect-free).
     let mut lp = self.left_padding.try_clone()?;
     let delta = trim_size.checked_add(usize::from(rotated)).ok_or_else(|| {

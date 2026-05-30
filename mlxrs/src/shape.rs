@@ -1,6 +1,6 @@
 //! `IntoShape` trait — zero-allocation shape conversion via slice callback.
 //!
-//! Returns `Result` so we propagate `usize > i32::MAX` as `Error::ShapeMismatch`
+//! Returns `Result` so we propagate `usize > i32::MAX` as `Error::OutOfRange`
 //! instead of silently saturating.
 //!
 //! `IntoShape` is **sealed**: downstream crates cannot implement it. The

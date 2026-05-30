@@ -274,8 +274,9 @@ struct Coeffs {
 ///
 /// Every buffer is `try_reserve_exact`-backed; an allocator refusal
 /// surfaces as [`Error::OutOfMemory`]. A degenerate `in_size`/`out_size`
-/// (zero), a `ksize` overflow, or a coefficient table exceeding
-/// [`MAX_DECODED_IMAGE_BYTES`] surfaces as [`Error::ShapeMismatch`].
+/// (zero) surfaces as [`Error::OutOfRange`]; a `ksize` overflow surfaces as
+/// [`Error::ArithmeticOverflow`]; a coefficient table exceeding
+/// [`MAX_DECODED_IMAGE_BYTES`] surfaces as [`Error::CapExceeded`].
 ///
 /// The coefficient table is `out_size * ksize` taps. `ksize` is small for
 /// a sane resize (`ceil(filter_support * filterscale) * 2 + 1`, clamped to
@@ -447,10 +448,11 @@ fn clip8(acc: i32) -> u8 {
 /// directly, not only through the public wrapper.
 ///
 /// # Errors
-/// - [`Error::ShapeMismatch`] if any dimension is `0`, if a byte/element
-///   product overflows `usize`, if `src.len() != src_w * src_h * 4`, or if
-///   ANY buffer in the resize path (source copy, coefficient tables,
-///   horizontal intermediate, destination) would exceed
+/// - [`Error::OutOfRange`] if any dimension is `0`;
+///   [`Error::ArithmeticOverflow`] if a byte/element product overflows
+///   `usize`; [`Error::LengthMismatch`] if `src.len() != src_w * src_h * 4`;
+///   [`Error::CapExceeded`] if ANY buffer in the resize path (source copy,
+///   coefficient tables, horizontal intermediate, destination) would exceed
 ///   [`MAX_DECODED_IMAGE_BYTES`].
 /// - [`Error::OutOfMemory`] if any `try_reserve_exact` fails.
 ///
@@ -579,8 +581,9 @@ pub(crate) fn resize_rgba8(
   // (`dst_w*dst_h*4`) the public `resize` wrapper enforces. A `1×131072`
   // source resized to `131072×1` has a 0.5 MiB source, a 0.5 MiB
   // destination, but a `131072 * 131072 * 4` ≈ 68 GiB intermediate. So
-  // cap it explicitly against `MAX_DECODED_IMAGE_BYTES` (overflow OR
-  // > 512 MiB -> ShapeMismatch) BEFORE the `try_reserve_exact` + zero-fill
+  // cap it explicitly against `MAX_DECODED_IMAGE_BYTES` (overflow →
+  // `ArithmeticOverflow`; > 512 MiB → `CapExceeded`) BEFORE the
+  // `try_reserve_exact` + zero-fill
   // — `try_reserve_exact` alone cannot stop an overcommitting allocator
   // from handing back 68 GiB that the `resize`/zero-fill then faults in.
   let inter_len = src_h

@@ -78,7 +78,7 @@
 //! broadcasted, allocation pressure on the inner batch-loop) return
 //! [`Result`] with an [`Error`] message naming the cause. Python
 //! `ValueError("No queries provided")` / `"No passages provided"`
-//! (lines 51-54 and 75-78) map to [`Error::ShapeMismatch`] with the
+//! (lines 51-54 and 75-78) map to [`Error::EmptyInput`] with the
 //! python message text preserved for parity.
 
 use std::collections::HashMap;
@@ -209,12 +209,12 @@ pub trait BaseColVisionProcessor {
 /// [`Dtype::F32`] (python `scores.astype(mx.float32)`).
 ///
 /// ## Errors
-/// - `qs.is_empty()` → [`Error::ShapeMismatch`] with the python message
+/// - `qs.is_empty()` → [`Error::EmptyInput`] with the python message
 ///   `"No queries provided"` (line 52).
-/// - `ps.is_empty()` → [`Error::ShapeMismatch`] with the python message
+/// - `ps.is_empty()` → [`Error::EmptyInput`] with the python message
 ///   `"No passages provided"` (line 54).
 /// - Any input with `shape[0] == 0` (zero-element vector / zero-token
-///   embedding) → [`Error::ShapeMismatch`] whose message contains
+///   embedding) → [`Error::OutOfRange`] whose message contains
 ///   `"zero tokens"`. A zero-element single vector would dot-product
 ///   with every passage to `0.0` regardless of content, silently
 ///   collapsing the ranking signal; the equivalent precondition that
@@ -275,7 +275,7 @@ pub fn score_single_vector(qs: &[Array], ps: &[Array]) -> Result<Array> {
   // matmul of `(b,d) @ (d,c)` always produces `(b,c)` so this is
   // structurally guaranteed for valid inputs; the python assert is a
   // defensive sanity check we mirror as a non-panicking
-  // [`Error::ShapeMismatch`] (zero overhead for the success path).
+  // [`Error::LengthMismatch`] (zero overhead for the success path).
   let s = scores.shape();
   if s.first().copied() != Some(qs.len()) {
     return Err(Error::LengthMismatch(LengthMismatchPayload::new(
@@ -357,7 +357,7 @@ pub fn score_single_vector(qs: &[Array], ps: &[Array]) -> Result<Array> {
 /// all-`-inf` row returns `-inf`, which `sum(axis=2)` would propagate
 /// as a non-finite ranking score. To preserve the invariant, the
 /// internal `pad_to_max` helper explicitly rejects any array with
-/// `shape[0] == 0` with an [`Error::ShapeMismatch`] whose message
+/// `shape[0] == 0` with an [`Error::OutOfRange`] whose message
 /// contains `"zero tokens"`. Both the query and passage paths of
 /// `score_multi_vector` inherit this precondition through their
 /// `pad_to_max` calls. Callers must filter out empty-tokenization
@@ -367,15 +367,15 @@ pub fn score_single_vector(qs: &[Array], ps: &[Array]) -> Result<Array> {
 /// <https://github.com/Blaizzy/mlx-embeddings> referencing this PR.
 ///
 /// ## Errors
-/// - `qs.is_empty()` → [`Error::ShapeMismatch`] with the python message
+/// - `qs.is_empty()` → [`Error::EmptyInput`] with the python message
 ///   `"No queries provided"` (line 76).
-/// - `ps.is_empty()` → [`Error::ShapeMismatch`] with the python message
+/// - `ps.is_empty()` → [`Error::EmptyInput`] with the python message
 ///   `"No passages provided"` (line 78).
-/// - `batch_size == 0` → [`Error::ShapeMismatch`] (the python `range(0,
-///   len(qs), batch_size)` would `ValueError` on `batch_size == 0`;
-///   surface the equivalent recoverable error instead of looping
-///   forever).
-/// - Any query or passage with `shape[0] == 0` → [`Error::ShapeMismatch`]
+/// - `batch_size == 0` → [`Error::InvariantViolation`] (the python
+///   `range(0, len(qs), batch_size)` would `ValueError` on
+///   `batch_size == 0`; surface the equivalent recoverable error
+///   instead of looping forever).
+/// - Any query or passage with `shape[0] == 0` → [`Error::OutOfRange`]
 ///   whose message identifies the offending input by path tag and
 ///   *global* index (e.g. `"score_multi_vector: passages[3] has zero
 ///   tokens (shape[0] == 0); ..."`) and contains the substring
@@ -511,7 +511,7 @@ pub fn score_multi_vector(qs: &[Array], ps: &[Array], batch_size: usize) -> Resu
   let scores_list_refs: Vec<&Array> = scores_list.iter().collect();
   let scores = concatenate(&scores_list_refs, 0)?;
   // python lines 107-109: `assert scores.shape[0] == len(qs)`. Mirror
-  // as a recoverable [`Error::ShapeMismatch`] (structurally guaranteed
+  // as a recoverable [`Error::LengthMismatch`] (structurally guaranteed
   // for valid inputs; defensive).
   let s = scores.shape();
   if s.first().copied() != Some(qs.len()) {
@@ -554,11 +554,11 @@ pub fn score_multi_vector(qs: &[Array], ps: &[Array], batch_size: usize) -> Resu
 /// Empty `arrays` is rejected by the callers
 /// ([`score_multi_vector`]'s outer guards), so this helper documents
 /// `!arrays.is_empty()` as a precondition; calling with an empty slice
-/// returns [`Error::ShapeMismatch`] (defensive — would otherwise panic
+/// returns [`Error::EmptyInput`] (defensive — would otherwise panic
 /// on `arrays[0].shape()`).
 ///
 /// Any **individual** array with `shape[0] == 0` is also rejected with
-/// an [`Error::ShapeMismatch`] whose message contains `"zero tokens"`.
+/// an [`Error::OutOfRange`] whose message contains `"zero tokens"`.
 /// A zero-token sequence would record `0` in `original_lengths`, and
 /// the [`score_multi_vector`] masking loop would then build an
 /// all-`false` row for that passage — every position in `sim` for that
@@ -729,7 +729,7 @@ mod tests {
   /// The single-vector path does not go through [`pad_to_max`]; it has
   /// its own early guard. A `(0,)` vector would dot-product to `0.0`
   /// against every passage regardless of content, silently collapsing
-  /// the ranking signal. Assertion: returns [`Error::ShapeMismatch`]
+  /// the ranking signal. Assertion: returns [`Error::OutOfRange`]
   /// whose message contains `"zero tokens"`.
   #[test]
   fn score_single_vector_rejects_zero_token_query() {
@@ -750,7 +750,7 @@ mod tests {
 
   /// REGRESSION (Codex finding, round 2 — single-vector analog): a
   /// `(0,)` passage embedding must be rejected for the same reasons as
-  /// the query analog. Assertion: returns [`Error::ShapeMismatch`]
+  /// the query analog. Assertion: returns [`Error::OutOfRange`]
   /// whose message contains `"zero tokens"` and identifies the
   /// passage path.
   #[test]
@@ -833,7 +833,7 @@ mod tests {
   /// path tag (`queries`) AND the *global* index, not a tile-local
   /// `array N` from the inner `pad_to_max` helper.
   ///
-  /// Assertion: returns [`Error::ShapeMismatch`] whose message
+  /// Assertion: returns [`Error::OutOfRange`] whose message
   /// contains `"zero tokens"` AND `"queries[0]"`, not a propagation of
   /// `-inf` through the masked MaxSim.
   #[test]
@@ -864,7 +864,7 @@ mod tests {
   /// `(b=1, c=0, n=1, s)` similarity with `-inf`, `max(axis=3)` would
   /// return `-inf` for that passage, and `sum(axis=2)` would propagate
   /// to a `-inf` ranking score. The guard surfaces a recoverable
-  /// [`Error::ShapeMismatch`] instead.
+  /// [`Error::OutOfRange`] instead.
   ///
   /// REGRESSION (Codex finding, round 3): the message must carry the
   /// path tag (`passages`) AND the *global* index — here `passages[0]`
@@ -1086,7 +1086,7 @@ mod tests {
   /// resulting ranking score is non-finite. Enforce the precondition
   /// here so the failure is observable, recoverable, and named.
   ///
-  /// Assertion: returns [`Error::ShapeMismatch`] whose message contains
+  /// Assertion: returns [`Error::OutOfRange`] whose message contains
   /// `"zero tokens"` and identifies the offending array index.
   #[test]
   fn pad_to_max_rejects_zero_token_array() {

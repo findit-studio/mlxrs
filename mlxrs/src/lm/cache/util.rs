@@ -220,7 +220,7 @@ pub(crate) fn broadcast_write_rhs(
 /// recoverably, never with a silent wrap).
 pub(crate) fn slice_seq(a: &Array, start: usize, end: usize) -> Result<Array> {
   let shape = a.shape();
-  // Rank check — surface a rank-misuse as recoverable `ShapeMismatch`
+  // Rank check — surface a rank-misuse as recoverable `RankMismatch`
   // rather than panicking on the `stops[KV_NDIM - 2]` index below
   // (Copilot review #3273072304). Surrounding helpers (`seq_len`,
   // `head_dim`, `concat_parts`) all enforce `KV_NDIM` the same way; the

@@ -602,7 +602,8 @@ fn synthesize_segment_default_errors_with_clear_message() {
 }
 
 /// A malformed (non-rank-1) audio tensor from the model surfaces a
-/// recoverable `Err(ShapeMismatch)` — the driver's audio-shape guard.
+/// recoverable `Err(LayerKeyed(RankMismatch))` — the driver's audio-shape
+/// guard.
 #[test]
 fn tts_generate_rejects_bad_audio_shape() {
   let model = BadShapeModel;

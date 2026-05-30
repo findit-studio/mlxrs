@@ -219,7 +219,7 @@ fn tok_env_from_tokenizer(
   // `TokTrie::with_eos_tokens`'s `assert!`. The effective bound is the
   // widened `env.tok_trie.vocab_size()` — same value the upstream
   // assert checks against — surfaced as a recoverable
-  // [`Error::ShapeMismatch`] with the offending id + bound.
+  // [`Error::OutOfRange`] with the offending id + bound.
   //
   // The mlxrs `Tokenizer::eos_token_ids()` returns a `BTreeSet<u32>` —
   // iterating in sorted-numeric order is deterministic; for mask
@@ -307,7 +307,7 @@ impl LLGuidanceLogitsProcessor {
   /// (a common case — Llama-style models round the LM head's output dim
   /// up for hardware alignment, leaving 64+ "padding" ids that have no
   /// real bytes). Without it, `apply` would surface a
-  /// [`Error::ShapeMismatch`] on the first call. `None` keeps the
+  /// [`Error::RankMismatch`] / [`Error::LengthMismatch`] on the first call. `None` keeps the
   /// previous behaviour (mask width = tokenizer vocab size), fine for
   /// models whose LM head matches the tokenizer exactly.
   pub fn new(

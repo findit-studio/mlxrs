@@ -1152,7 +1152,7 @@ fn st_config_path_follows_symlink_to_regular_file() {
 // (and mask shape) before validating rank — a 1-D/2-D token_embeddings
 // or wrong-rank mask panicked a safe public API. Each public helper now
 // validates rank-3 token_embeddings + rank-2 mask up front, returning
-// Err(ShapeMismatch) instead of panicking.
+// Err(RankMismatch) instead of panicking.
 
 #[test]
 fn pooling_helpers_reject_non_rank3_token_embeddings_without_panic() {
@@ -1766,12 +1766,13 @@ fn cosine_similarity_scalar_f32_unchanged_after_final_cast() {
 // across a longer `a` while `norm(b)` used the original 1-element vector,
 // yielding a "cosine" that can be > 1 (mathematically impossible) — silent
 // ranking corruption on a dim/config mismatch. The fn now validates rank-1
-// + equal length up front, returning Err(ShapeMismatch) instead.
+// + equal length up front, returning Err(LengthMismatch) / Err(RankMismatch)
+// instead.
 
 #[test]
 fn cosine_similarity_rejects_broadcastable_length_mismatch() {
   // (3,) vs (1,): MLX would broadcast b → an invalid score (can be > 1).
-  // Must be Err(ShapeMismatch), and specifically NOT any Ok value.
+  // Must be Err(LengthMismatch), and specifically NOT any Ok value.
   let a = Array::from_slice(&[1.0_f32, 2.0, 3.0], &(3,)).unwrap();
   let b = Array::from_slice(&[1.0_f32], &(1,)).unwrap();
   let r = cosine_similarity(&a, &b);
@@ -1796,7 +1797,7 @@ fn cosine_similarity_rejects_unequal_lengths() {
 
 #[test]
 fn cosine_similarity_rejects_non_rank1() {
-  // Wrong-rank inputs → RankMismatch (was Error::ShapeMismatch pre-§5).
+  // Wrong-rank inputs → RankMismatch.
   let m = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
   let s = Array::from_slice(&[1.0_f32], &(1, 1)).unwrap();
   // rank-2 a, rank-2 b.

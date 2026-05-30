@@ -184,7 +184,7 @@ impl QuantizedKvCacheImpl {
   /// triple array (weight `[B, H, S, dim/el_per_int]`, scales/biases `[B,
   /// H, S, dim/group_size]`) is the 4-D `[B, n_kv_heads, S, *]` KV layout,
   /// so the rank-safe `slice_seq` (axis `-2`, `KV_NDIM == 4`) applies
-  /// directly; a wrong rank is a recoverable [`Error::ShapeMismatch`] from
+  /// directly; a wrong rank is a recoverable [`Error::RankMismatch`] from
   /// `seq_len`, never a raw `.shape()[N]` panic.
   fn trim_triple(t: &StoredTriple, offset: usize) -> Result<StoredTriple> {
     Self::tree_map(t, |a| {
@@ -228,7 +228,7 @@ impl QuantizedKvCacheImpl {
   /// new_offset` and the re-trim is a no-op.
   ///
   /// Rank-safe: each `seq_len` call validates the 4-D KV rank; a
-  /// rank-invalid component is a recoverable [`Error::ShapeMismatch`].
+  /// rank-invalid component is a recoverable [`Error::RankMismatch`].
   fn triple_component_len_range(name: &str, t: &StoredTriple) -> Result<(usize, usize)> {
     let lw = seq_len(name, &t.0)?;
     let ls = seq_len(name, &t.1)?;
@@ -270,10 +270,10 @@ impl QuantizedKvCacheImpl {
   /// `w` vs `dim // group_size` for scales/biases), so this is checked
   /// per-axis only for the first `rank - 1` axes shared by K and V of the
   /// SAME element. A mismatch is a recoverable
-  /// [`Error::ShapeMismatch`] with the offending element / shapes named,
-  /// so a forged prompt cache surfaces a precise diagnostic at the load
-  /// boundary instead of a far-from-cause-site `concat_seq` failure at the
-  /// first `update_quantized`.
+  /// [`Error::RankMismatch`] or [`Error::ShapePairMismatch`] with the
+  /// offending element / shapes named, so a forged prompt cache surfaces a
+  /// precise diagnostic at the load boundary instead of a far-from-cause-site
+  /// `concat_seq` failure at the first `update_quantized`.
   fn validate_kv_leading_axes_match(k: &Array, v: &Array, element: &'static str) -> Result<()> {
     let ks = k.shape();
     let vs = v.shape();
@@ -356,10 +356,10 @@ impl QuantizedKvCacheImpl {
       (Some(pb), Some(nb)) => Some(concat_seq(pb, nb)?),
       (None, None) => None,
       _ => {
-        return Err(Error::ShapeMismatch(
-          "QuantizedKvCache: biases present in only one of the stored / new quantized triple"
-            .into(),
-        ));
+        return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+          "QuantizedKvCache: concatenating quantized triples",
+          "biases must be present in both the stored and new triples, or in neither",
+        )));
       }
     };
     Ok((w, s, b))
@@ -471,7 +471,7 @@ impl QuantizedKvCacheImpl {
   /// buffer when `offset == len`) is **unaffected** — both the slice and
   /// the offset clamp are no-ops for it. Rank-safe (`trim_triple` and the
   /// post-trim seq-len read both validate the 4-D KV rank via `seq_len`;
-  /// a wrong rank is a recoverable [`Error::ShapeMismatch`], never a
+  /// a wrong rank is a recoverable [`Error::RankMismatch`], never a
   /// panic).
   pub(crate) fn enforce_offset_len_invariant(&mut self) -> Result<()> {
     let offset = self.offset;
@@ -928,7 +928,7 @@ impl KvCache for QuantizedKvCacheImpl {
     // Re-establish the "stored triples are exactly `offset`-length"
     // invariant by slicing the sequence axis (`-2`) to the new `offset`
     // (rank-safe via `trim_triple`; a wrong rank is a recoverable
-    // `Error::ShapeMismatch`, never a panic).
+    // `Error::RankMismatch`, never a panic).
     //
     // Transactional commit (same principle as `update_quantized`): compute
     // BOTH sliced triples into locals while the cache is untouched; only
@@ -1144,7 +1144,7 @@ impl QuantizedKvCache for QuantizedKvCacheImpl {
   /// quantization. Each triple array (weight / scales / biases) is the 4-D
   /// `[B, n_kv_heads, S, *]` KV layout, so the rank-safe `seq_len` /
   /// `concat_seq` (axis `-2`, `KV_NDIM == 4`) apply directly; a wrong
-  /// rank is a recoverable [`Error::ShapeMismatch`], never a `.shape()[N]`
+  /// rank is a recoverable [`Error::RankMismatch`], never a `.shape()[N]`
   /// panic. `offset` is bumped with [`usize::checked_add`] *before* any
   /// state mutation so a hostile/corrupt restored `offset` near
   /// `usize::MAX` is a recoverable error, not a wrap/panic, with no partial

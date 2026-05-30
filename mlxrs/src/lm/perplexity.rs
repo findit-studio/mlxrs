@@ -105,7 +105,7 @@ pub struct PerplexityResult {
 /// `len % sequence_length` tokens are dropped (exactly the reference). The
 /// result has `len(tokens) / sequence_length` rows.
 ///
-/// Errors with [`Error::ShapeMismatch`] if `sequence_length < MIN_WINDOW`
+/// Errors with [`Error::OutOfRange`] if `sequence_length < MIN_WINDOW`
 /// (a row must hold at least one input + one target) or if `tokens` is too
 /// short to fill a single window.
 pub fn make_windows(tokens: &[i32], sequence_length: usize) -> Result<Array> {
@@ -148,17 +148,22 @@ pub fn make_windows(tokens: &[i32], sequence_length: usize) -> Result<Array> {
 /// smoothing / weights / non-`none` reductions are out of scope here — the
 /// reference perplexity uses none of them.
 ///
-/// Errors with [`Error::ShapeMismatch`] unless `targets.shape()` equals
-/// `logits.shape()` with the class axis removed — mirroring mlx's
-/// `cross_entropy` (`targets.shape != _drop_dim(logits.shape, axis)` raises).
-/// A merely broadcastable target shape (e.g. `[B, 1]` against `[B, S, V]`) is
+/// Errors with [`Error::RankMismatch`] if `logits` is rank-0, with
+/// [`Error::LengthMismatch`] if `targets.ndim()` does not equal
+/// `logits.ndim() - 1`, or with [`Error::ShapePairMismatch`] if the full
+/// shape of `targets` does not equal `logits.shape()` with the class axis
+/// removed — mirroring mlx's `cross_entropy`
+/// (`targets.shape != _drop_dim(logits.shape, axis)` raises). A merely
+/// broadcastable target shape (e.g. `[B, 1]` against `[B, S, V]`) is
 /// **rejected**, not silently broadcast across the missing positions.
 pub fn cross_entropy_none(logits: &Array, targets: &Array) -> Result<Array> {
   let logits_ndim = logits.ndim();
   if logits_ndim == 0 {
-    return Err(Error::ShapeMismatch(
-      "perplexity::cross_entropy_none: logits must have a vocab axis (ndim >= 1)".into(),
-    ));
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "perplexity::cross_entropy_none: logits must have a vocab axis (ndim >= 1)",
+      0,
+      Vec::new(),
+    )));
   }
   // Class indices: `targets.ndim == logits.ndim - 1` (mlx-lm checks
   // `targets.shape == logits.shape with axis removed`).
@@ -221,8 +226,8 @@ pub fn cross_entropy_none(logits: &Array, targets: &Array) -> Result<Array> {
 /// layer count via [`CacheConfig::num_hidden_layers`].
 ///
 /// `batch_size` is clamped to at least 1. Errors with
-/// [`Error::ShapeMismatch`] if `data` is not rank-2 or its window length is
-/// `< MIN_WINDOW`.
+/// [`Error::RankMismatch`] if `data` is not rank-2, or with
+/// [`Error::OutOfRange`] if its window length is `< MIN_WINDOW`.
 ///
 /// [`CacheConfig::num_hidden_layers`]: crate::lm::cache::CacheConfig::num_hidden_layers
 pub fn perplexity<M: Model>(

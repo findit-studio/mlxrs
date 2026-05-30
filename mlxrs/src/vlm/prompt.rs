@@ -128,7 +128,7 @@ pub type ImageTokenSpans = Vec<(usize, usize)>;
 /// with no expected marker. Modeling that as an explicit `MarkerPolicy`
 /// here forces the caller to declare intent at the call site, so a missing
 /// marker under a marker-required template surfaces as a hard
-/// `Error::ShapeMismatch` instead of silently corrupting prompt order.
+/// `Error::MissingField` instead of silently corrupting prompt order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
 #[display("{}", self.as_str())]
 pub enum MarkerPolicy {
@@ -209,12 +209,12 @@ pub fn locate_image_tokens(tokens: &[u32], image_token_id: u32) -> ImageTokenSpa
 ///   `prefix = token * num_images` pattern in `prompt_utils.py:350-371`,
 ///   which emits N adjacent markers as a single prefix that tokenizes to
 ///   one contiguous run of marker tokens. The contiguous run length MUST
-///   equal `image_count` (else `Error::ShapeMismatch`).
+///   equal `image_count` (else `Error::LengthMismatch`).
 /// - marker absent + `MarkerPolicy::PrependIfAbsent` → the placeholder run
 ///   is PREPENDED to `text_tokens` (mirrors the
 ///   `MessageFormat::PROMPT_WITH_IMAGE_TOKEN` `"<image>" * num_images + prompt`
 ///   path in `prompt_utils.py:265-267`).
-/// - marker absent + `MarkerPolicy::Required` → `Error::ShapeMismatch`.
+/// - marker absent + `MarkerPolicy::Required` → `Error::MissingField`.
 ///   Fails closed against chat-template / tokenizer-version drift that
 ///   would silently rewrite prompt order under a marker-required
 ///   formatter.
@@ -228,17 +228,17 @@ pub fn locate_image_tokens(tokens: &[u32], image_token_id: u32) -> ImageTokenSpa
 ///
 /// # Errors
 ///
-/// - `Error::ShapeMismatch` if `image_count * num_tokens_per_image` overflows
-///   `usize`, or if the resulting buffer capacity (text length + placeholder
-///   delta) overflows.
-/// - `Error::ShapeMismatch` if `text_tokens` contains an additional
+/// - `Error::ArithmeticOverflow` if `image_count * num_tokens_per_image`
+///   overflows `usize`, or if the resulting buffer capacity (text length +
+///   placeholder delta) overflows.
+/// - `Error::InvariantViolation` if `text_tokens` contains an additional
 ///   non-contiguous `image_marker_id` AFTER the first run (the python
 ///   reference's `prepare_inputs` splice has no support for multiple
 ///   non-adjacent marker positions).
-/// - `Error::ShapeMismatch` if the contiguous-marker-run length differs
+/// - `Error::LengthMismatch` if the contiguous-marker-run length differs
 ///   from `image_count` (chat-template producer should emit exactly
 ///   `image_count` adjacent markers).
-/// - `Error::ShapeMismatch` if `policy == MarkerPolicy::Required` and no
+/// - `Error::MissingField` if `policy == MarkerPolicy::Required` and no
 ///   `image_marker_id` is found while `image_count > 0`.
 ///
 /// # Examples
@@ -442,7 +442,7 @@ pub fn insert_image_tokens(
 /// - non-overlapping,
 /// - bounded by `seq_len` (i.e. `end <= seq_len`).
 ///
-/// Violations return `Error::ShapeMismatch` with a descriptive message;
+/// Violations return a typed error with a descriptive message;
 /// no panic.
 ///
 /// Shape `[1, 1, T, T]` matches the upstream `create_falcon_ocr_mask` return
@@ -453,9 +453,10 @@ pub fn insert_image_tokens(
 ///
 /// # Errors
 ///
-/// - `Error::ShapeMismatch` if any span is empty, out of bounds, or overlaps
-///   another span; or if `seq_len.checked_mul(seq_len)` overflows `usize`;
-///   or if `seq_len` exceeds `i32::MAX` (mlx dimensions are signed 32-bit).
+/// - `Error::InvariantViolation` if any span is empty or overlaps another;
+///   `Error::OutOfRange` if any span end exceeds `seq_len` or if `seq_len`
+///   exceeds `i32::MAX` (mlx dimensions are signed 32-bit);
+///   `Error::ArithmeticOverflow` if `seq_len * seq_len` overflows `usize`.
 ///
 /// # Examples
 ///
@@ -1406,7 +1407,7 @@ impl MessageFormatter {
   ///
   /// # Errors
   ///
-  /// `Error::ShapeMismatch` if `model_type` is not in [`MODEL_CONFIG`]
+  /// `Error::MissingKey` if `model_type` is not in [`MODEL_CONFIG`]
   /// (matches the python `raise ValueError(f"Unsupported model: ...")`).
   pub fn for_model(model_type: &str) -> Result<Self> {
     let lower = model_type.to_lowercase();
@@ -1431,14 +1432,14 @@ impl MessageFormatter {
   ///
   /// # Errors
   ///
-  /// - `Error::ShapeMismatch` if `opts.num_images > 1` and the model is
+  /// - `Error::OutOfRange` if `opts.num_images > 1` and the model is
   ///   in [`SINGLE_IMAGE_ONLY_MODELS`] (mirrors python lines 214–218).
-  /// - `Error::ShapeMismatch` if the [`MessageFormat::VideoWithText`]
+  /// - `Error::EmptyInput` if the [`MessageFormat::VideoWithText`]
   ///   branch is selected but `opts.video.is_empty()` (the python branch
   ///   at line 424 unconditionally dereferences `kwargs["video"]` — port
   ///   surfaces the missing-video case as a hard error instead of an
   ///   `IndexError`).
-  /// - `Error::ShapeMismatch` if [`FormatOpts::fps`] length differs from
+  /// - `Error::LengthMismatch` if [`FormatOpts::fps`] length differs from
   ///   [`FormatOpts::video`] length (mirrors python lines 431–434).
   /// - `Error::Backend` if `opts.num_images`, `opts.num_audios`, or
   ///   `opts.video.len()` exceeds [`MAX_MESSAGE_FORMAT_ITEMS`] (caller-
