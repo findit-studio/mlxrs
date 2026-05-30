@@ -51,7 +51,7 @@
 //!   shared `VecDeque<f32>` (capped at
 //!   [`super::config::PlaybackConfig::queue_capacity_frames`] × channel
 //!   count). Returns `Err` on overflow (a recoverable
-//!   [`crate::error::Error::Backend`] — no producer surprise OOM).
+//!   [`crate::error::Error::CapExceeded`] — no producer surprise OOM).
 //!   This is the cpal-equivalent of `AVAudioPlayerNode.scheduleBuffer`
 //!   returning even though the underlying scheduling chain is
 //!   bounded.
@@ -296,7 +296,7 @@ impl SharedState {
   /// allocator time on a growing queue.
   ///
   /// # Errors
-  /// - [`Error::Backend`] if `try_reserve_exact` fails on the bounded
+  /// - [`Error::AllocFailure`] if `try_reserve_exact` fails on the bounded
   ///   queue capacity (e.g. tiny-RAM or fragmented-heap on the
   ///   caller's host).
   fn new(queue_capacity_samples: usize) -> Result<Self> {
@@ -399,10 +399,9 @@ impl AudioPlayer {
   /// `playerNode.play()` (actual playback).
   ///
   /// # Errors
-  /// - [`Error::Backend`] if cpal has no default host, no default
-  ///   output device, the config rejects, or the cpal stream build
-  ///   fails (CoreAudio init failure, unsupported sample rate,
-  ///   etc.).
+  /// - [`Error::ExternalOp`] if cpal has no default output device, the config
+  ///   rejects, or the cpal stream build fails (CoreAudio init failure,
+  ///   unsupported sample rate, etc.).
   pub fn new(config: PlaybackConfig) -> Result<Self> {
     let host = cpal::default_host();
     let device = host.default_output_device().ok_or_else(|| {
@@ -422,8 +421,9 @@ impl AudioPlayer {
   /// cpal's multi-device support is a natural extension here).
   ///
   /// # Errors
-  /// - [`Error::Backend`] if [`PlaybackConfig::cpal_config`] rejects
-  ///   the config (zero channels) or the cpal stream build fails.
+  /// - [`Error::InvariantViolation`] / [`Error::OutOfRange`] if [`PlaybackConfig::cpal_config`]
+  ///   rejects the config (zero channels / unsupported format), or [`Error::ExternalOp`]
+  ///   if the cpal stream build fails.
   pub fn with_device(device: &cpal::Device, config: PlaybackConfig) -> Result<Self> {
     if !matches!(config.sample_format(), SampleFormat::F32) {
       return Err(Error::OutOfRange(OutOfRangePayload::new(
@@ -626,7 +626,7 @@ impl AudioPlayer {
   ///
   /// **Terminal-state contract.** [`AudioPlayer::stop`] is a
   /// one-way terminal transition; once `stop()` returns, `start()`
-  /// rejects with [`Error::Backend`] ("...called on terminated
+  /// rejects with [`Error::InvariantViolation`] ("...called on terminated
   /// player...") rather than re-arming the producer surface. The
   /// caller MUST construct a fresh [`AudioPlayer`] to resume
   /// playback. The cpal stream is preserved across `stop()` only so
@@ -634,10 +634,9 @@ impl AudioPlayer {
   /// restarting the producer pipeline.
   ///
   /// # Errors
-  /// - [`Error::Backend`] if [`AudioPlayer::stop`] has already been
-  ///   called on this player (one-way terminal latch).
-  /// - [`Error::Backend`] if the cpal `Stream::play()` call fails,
-  ///   or if the stream has already been dropped by a prior `stop`.
+  /// - [`Error::InvariantViolation`] if [`AudioPlayer::stop`] has already been
+  ///   called on this player (one-way terminal latch) or the stream is dropped.
+  /// - [`Error::ExternalOp`] if the cpal `Stream::play()` call fails.
   pub fn start(&mut self) -> Result<()> {
     // FIX 1: one-way terminal latch. Checked FIRST so a post-stop
     // `start()` doesn't re-arm `state = STATE_RUNNING` and let
@@ -676,9 +675,9 @@ impl AudioPlayer {
   /// (see [`AudioPlayer::start`] / [`AudioPlayer::stop`]).
   ///
   /// # Errors
-  /// - [`Error::Backend`] if [`AudioPlayer::stop`] has already been
+  /// - [`Error::InvariantViolation`] if [`AudioPlayer::stop`] has already been
   ///   called on this player (one-way terminal latch).
-  /// - [`Error::Backend`] if the cpal `Stream::pause()` call fails.
+  /// - [`Error::ExternalOp`] if the cpal `Stream::pause()` call fails.
   pub fn pause(&mut self) -> Result<()> {
     if self.shared.terminated.load(Ordering::Acquire) {
       return Err(Error::InvariantViolation(InvariantViolationPayload::new(
@@ -716,9 +715,9 @@ impl AudioPlayer {
   /// have surfaced).
   ///
   /// # Errors
-  /// - [`Error::Backend`] if [`AudioPlayer::stop`] has already been
+  /// - [`Error::InvariantViolation`] if [`AudioPlayer::stop`] has already been
   ///   called on this player (one-way terminal latch).
-  /// - [`Error::Backend`] if the cpal `Stream::play()` call fails.
+  /// - [`Error::ExternalOp`] if the cpal `Stream::play()` call fails.
   pub fn resume(&mut self) -> Result<()> {
     if self.shared.terminated.load(Ordering::Acquire) {
       return Err(Error::InvariantViolation(InvariantViolationPayload::new(
@@ -737,7 +736,7 @@ impl AudioPlayer {
   /// transition**: after it returns, every subsequent producer-side
   /// method ([`AudioPlayer::start`], [`AudioPlayer::pause`],
   /// [`AudioPlayer::resume`], [`AudioPlayer::write_samples`])
-  /// rejects with [`Error::Backend`] containing
+  /// rejects with [`Error::InvariantViolation`] containing
   /// "terminated"/"after stop()" so late producer chunks MUST NOT
   /// accumulate silently and replay on a later `start()` — honoring
   /// the [`super::output_stream::AudioOutputStream::stop`] contract.
@@ -760,7 +759,7 @@ impl AudioPlayer {
   /// rejected.
   ///
   /// # Errors
-  /// - [`Error::Backend`] if the cpal `Stream::pause()` call fails.
+  /// - [`Error::ExternalOp`] if the cpal `Stream::pause()` call fails.
   ///   Note: the terminal latch is already set by this point, so
   ///   subsequent producer calls still reject correctly.
   pub fn stop(&mut self) -> Result<()> {
@@ -820,22 +819,14 @@ impl AudioPlayer {
   /// the module-level `## Concurrency` doc-comment.
   ///
   /// # Errors
-  /// - [`Error::Backend`] if [`AudioPlayer::stop`] has been called
-  ///   on this player. `stop()` is a one-way terminal latch — writes
-  ///   after stop are rejected outright to honor the
-  ///   [`super::output_stream::AudioOutputStream::stop`] contract
-  ///   ("any queued samples MUST be dropped; subsequent
-  ///   `write_samples` calls MUST return `Err`"). Pause-state writes
-  ///   are still accepted (they buffer for `resume`).
-  /// - [`Error::Backend`] if the queue would overflow
+  /// - [`Error::InvariantViolation`] if [`AudioPlayer::stop`] has been called
+  ///   on this player (one-way terminal latch — writes after stop are rejected)
+  ///   or if the player is in `STATE_STOPPED` (call `start()` first).
+  /// - [`Error::CapExceeded`] if the queue would overflow
   ///   [`PlaybackConfig::queue_capacity_frames`] × channel count.
   ///   The write is rejected wholesale — no partial accept on
-  ///   overflow (the caller has no way to know how many fit, and a
-  ///   partial accept would invite torn audio at the chunk
-  ///   boundary). The overflow check uses the total payload length
-  ///   so chunking can't mask the cap.
-  /// - [`Error::Backend`] if a prior cpal callback error was
-  ///   captured.
+  ///   overflow.
+  /// - [`Error::ExternalOp`] if a prior cpal callback error was captured.
   pub fn write_samples(&mut self, samples: &[f32]) -> Result<usize> {
     // FIX 1: one-way terminal latch FIRST, before reading `state`.
     // A naive `state == STATE_STOPPED` gate is insufficient because
@@ -925,13 +916,13 @@ impl AudioPlayer {
   ///
   /// If the player is not [`STATE_RUNNING`] (stopped or paused) and
   /// the queue is non-empty, this method returns immediately with a
-  /// [`Error::Backend`] — flushing a stopped/paused player would
+  /// [`Error::OutOfRange`] — flushing a stopped/paused player would
   /// block forever (the callback doesn't drain unless running).
   ///
   /// # Errors
-  /// - [`Error::Backend`] if the flush times out, the player is not
-  ///   running and the queue is non-empty, or a cpal callback error
-  ///   surfaced mid-drain.
+  /// - [`Error::OutOfRange`] if the flush times out or the player is not
+  ///   running with a non-empty queue.
+  /// - [`Error::ExternalOp`] if a cpal callback error surfaced mid-drain.
   pub fn flush(&mut self) -> Result<()> {
     self.take_callback_error()?;
     let start = Instant::now();
@@ -961,7 +952,7 @@ impl AudioPlayer {
   }
 
   /// Pull the captured cpal `err_fn` message (if any) and surface it
-  /// as a [`Error::Backend`]. Called at the head of every public
+  /// as a [`Error::ExternalOp`]. Called at the head of every public
   /// producer method.
   fn take_callback_error(&self) -> Result<()> {
     let mut slot = match self.shared.callback_error.lock() {

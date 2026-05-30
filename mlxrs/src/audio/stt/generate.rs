@@ -91,7 +91,7 @@ pub const DEFAULT_MAX_AUDIO_SECONDS: f32 = 30.0;
 ///   Default `true` — matches the standard mlx-audio whisper preprocessing
 ///   path (which assumes a 16 kHz input and resamples otherwise).
 /// - `max_audio_seconds` — reject inputs longer than this (recoverable
-///   [`Error::Backend`]). Default [`DEFAULT_MAX_AUDIO_SECONDS`] = 30 s. The
+///   [`Error::OutOfRange`]). Default [`DEFAULT_MAX_AUDIO_SECONDS`] = 30 s. The
 ///   check runs against the **source** duration immediately after
 ///   `load_audio`, BEFORE the resample, mel-spectrogram, and encoder passes
 ///   allocate — so a crafted / fuzz input claiming long audio cannot drive
@@ -110,7 +110,7 @@ pub struct SttGenConfig {
   /// `sample_rate` when the source rate differs. Default `true`.
   auto_resample: bool,
   /// Maximum accepted audio duration in seconds; inputs longer than this
-  /// return [`Error::Backend`] **before** mel-spectrogram allocation.
+  /// return [`Error::OutOfRange`] **before** mel-spectrogram allocation.
   /// Default [`DEFAULT_MAX_AUDIO_SECONDS`] (30 s, mlx-audio whisper segment).
   max_audio_seconds: f32,
 }
@@ -303,7 +303,7 @@ fn audio_path_to_mel<M: super::model::Model>(
   //    was trained on; `resample_linear` is a verbatim copy when the
   //    rates match (no FP drift) and a naive linear pass otherwise (the
   //    `mlx-audio` default for Whisper-style models). `auto_resample` off
-  //    + mismatched rates surfaces as a recoverable `Error::Backend` so a
+  //    + mismatched rates surfaces as a recoverable `Error::OutOfRange` so a
   //    misconfigured pipeline cannot silently feed wrong-rate mels to the
   //    model.
   let target_sr = mc.sample_rate();
@@ -324,7 +324,7 @@ fn audio_path_to_mel<M: super::model::Model>(
   //    shape into `model.encode_audio` — concrete encoders can reasonably
   //    assume at least one frame and panic / fail deep in per-model code
   //    on a zero-T input. Surface the empty-WAV case as a clear pipeline
-  //    `Error::Backend` here (Codex round-1 medium); too-short-but-non-
+  //    `Error::EmptyInput` here (Codex round-1 medium); too-short-but-non-
   //    empty inputs are caught downstream by `log_mel_spectrogram`'s own
   //    reflect-pad guards, which already return a recoverable `Err` with
   //    a descriptive message.

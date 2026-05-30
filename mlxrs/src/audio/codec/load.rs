@@ -64,7 +64,7 @@ pub trait CodecModel {
   ///
   /// Per-architecture code wires the actual encoder forward.
   ///
-  /// Default impl is unsupported (`Err(Error::Backend)`) — every
+  /// Default impl is unsupported (`Err(Error::InvariantViolation)`) — every
   /// concrete codec MUST override it, matching mlx-audio's
   /// `Encodec.encode` / `Mimi.encode` per-class implementations.
   fn encode(&self, audio: &Array) -> Result<Array> {
@@ -81,7 +81,7 @@ pub trait CodecModel {
   /// [`CodecModel::encode`] output shape). The returned [`Array`] is the
   /// reconstructed waveform at [`CodecModel::sample_rate`].
   ///
-  /// Default impl is unsupported (`Err(Error::Backend)`) — every
+  /// Default impl is unsupported (`Err(Error::InvariantViolation)`) — every
   /// concrete codec MUST override it.
   fn decode(&self, codes: &Array) -> Result<Array> {
     let _ = codes;
@@ -113,10 +113,9 @@ pub trait CodecModel {
 /// is rejected by [`crate::audio::load::get_model_path`] with a clear
 /// no-network message).
 ///
-/// Failures (missing dir / missing config / malformed JSON / constructor
-/// error) are recoverable [`Error::Backend`].
-///
-/// [`Error::Backend`]: crate::Error::Backend
+/// Failures are typed: missing dir → [`Error::MissingKey`], hub path →
+/// [`Error::OutOfRange`], malformed JSON → [`Error::Parse`], constructor
+/// error → caller-defined.
 pub fn load_model<F>(path: &str, constructor: F) -> Result<Box<dyn CodecModel>>
 where
   F: FnOnce(LoadedAudioModel) -> Result<Box<dyn CodecModel>>,

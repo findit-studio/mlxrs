@@ -172,7 +172,8 @@ impl<B: StreamingEncoderBackend> StreamingEncoder<B> {
   /// partial windows are committed to the cache.
   ///
   /// # Errors
-  /// [`Error::Backend`] for a non-2-D input or a propagated error from
+  /// [`Error::RankMismatch`] for a non-2-D input, [`Error::ArithmeticOverflow`]
+  /// if `window_size` / `window_stride` exceed `i32`, or a propagated error from
   /// the backend's [`StreamingEncoderBackend::encode_window`].
   pub fn feed(&mut self, mel_frames: &Array) -> Result<usize> {
     if mel_frames.ndim() != 2 {

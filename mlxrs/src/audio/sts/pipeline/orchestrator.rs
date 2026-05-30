@@ -280,7 +280,7 @@ where
   /// (mirror of `voice_pipeline.py:613-615`).
   ///
   /// # Errors
-  /// Returns [`crate::error::Error::Backend`] when
+  /// Returns [`crate::error::Error::InvariantViolation`] when
   /// `config.input_sample_rate() == 0` — the per-chunk silence-ms
   /// accounting divides by the sample rate and a zero rate would
   /// either panic or silently produce nonsense durations.

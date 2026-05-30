@@ -280,7 +280,7 @@ impl CMUDict {
   /// sequence is mapped to IPA via
   /// [`arpabet::try_convert_sequence_strict`] — the STRICT path: the first
   /// unknown ARPAbet token in any row fails the whole build with
-  /// [`Error::Backend`] tagged by the source-line position.
+  /// [`Error::OutOfRange`] tagged by the source-line position.
   ///
   /// Empty post-conversion pronunciations (the row's `arpabet` was
   /// non-empty pre-conversion but every token was rejected — currently

@@ -62,7 +62,7 @@ pub struct IncrementalMelSpectrogram {
   total_frames: usize,
 
   /// Test-only error-injection counter: while `> 0`, the next
-  /// [`flush`](Self::flush) returns [`Error::Backend`] and decrements
+  /// [`flush`](Self::flush) returns [`Error::InvariantViolation`] and decrements
   /// the counter. Used by retry-state regression tests to script a
   /// recoverable `flush()` failure — there is no real-world Err the
   /// pure-MLX compute pipeline reliably surfaces, so a deterministic
@@ -83,8 +83,9 @@ impl IncrementalMelSpectrogram {
   /// reference's `init` default arguments.
   ///
   /// # Errors
-  /// [`Error::Backend`] if `n_fft` is zero, odd, or `n_fft <
-  /// hop_length` (cannot maintain the overlap-save invariant); or if
+  /// [`Error::InvariantViolation`] if `n_fft` is zero or `hop_length` is zero,
+  /// [`Error::OutOfRange`] if `n_fft` is odd or `hop_length > n_fft`
+  /// (cannot maintain the overlap-save invariant); or if
   /// the underlying [`hann_window`] / [`mel_filter_bank`] construction
   /// errors. Mel-filterbank parameter validation (e.g. `sample_rate >
   /// 0`, `n_mels > 0`) is delegated to [`mel_filter_bank`].

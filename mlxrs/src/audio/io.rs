@@ -39,7 +39,7 @@
 //! same "scope out the heavy-dep formats" decision as the decode side.
 //!
 //! Both load and save are **mono-only**: multi-channel input is rejected
-//! with [`Error::Backend`] (the `Vec<f32>` return shape cannot
+//! with [`Error::OutOfRange`] (the `Vec<f32>` return shape cannot
 //! faithfully carry the reference's 2-D `(samples, channels)` layout). A
 //! multi-channel variant returning `(Vec<f32>, u32, u16)` is a planned
 //! follow-up.
@@ -96,7 +96,7 @@ const I16_DIV: f32 = 32768.0;
 /// — about 30 min of mono 44.1 kHz audio — well above any realistic
 /// "load entire file into memory" use case, and well below "abort the
 /// host" territory. Crafted-attacker / fuzzer inputs above the cap get
-/// a recoverable [`Error::Backend`] instead of a Rust allocator abort.
+/// a recoverable typed error instead of a Rust allocator abort.
 ///
 /// For **lossy** formats (MP3 / OGG-Vorbis) this is the *primary* memory
 /// bound: a container's declared frame count is treated only as a
@@ -140,7 +140,7 @@ pub const MAX_RESAMPLED_SAMPLES: usize = MAX_DECODED_SAMPLES;
 /// `push_samples` normalizer handles identically — there is no
 /// per-format sample path.
 ///
-/// **Multi-channel files are rejected** with [`Error::Backend`] — the
+/// **Multi-channel files are rejected** with [`Error::OutOfRange`] — the
 /// reference `mlx_audio.audio_io.read` returns a 2-D `(samples, channels)`
 /// array, but the `Vec<f32>` return shape here cannot faithfully carry that
 /// information. Callers needing stereo / 5.1 / etc. must either preprocess
@@ -148,13 +148,13 @@ pub const MAX_RESAMPLED_SAMPLES: usize = MAX_DECODED_SAMPLES;
 /// multi-channel follow-up.
 ///
 /// # Errors
-/// - [`Error::Backend`] if the file cannot be opened, the format cannot be
-///   probed / is unsupported (e.g. an Opus or M4A file — scoped out, see
-///   the module doc), the input has `channels != 1`, the codec is
-///   unsupported, the declared frame count exceeds the
-///   [`MAX_DECODED_SAMPLES`] cap, decoding produces more than the cap, an
-///   uncompressed WAV's decoded sample count disagrees with its header,
-///   or any sample is non-finite (NaN/inf in the decoded PCM).
+/// - Typed errors: [`Error::FileIo`] if the file cannot be opened,
+///   [`Error::Parse`] if the format is unsupported or codec fails,
+///   [`Error::OutOfRange`] if `channels != 1` or a chained stream,
+///   [`Error::MissingKey`] if no audio track or codec params,
+///   [`Error::BoundedDecode`] if decoded samples exceed the cap,
+///   [`Error::LengthMismatch`] for WAV/FLAC frame-count mismatch,
+///   [`Error::NonFiniteScalar`] for NaN/inf samples.
 pub fn load_audio(path: &Path) -> Result<(Vec<f32>, u32)> {
   load_audio_with_cap(path, MAX_DECODED_SAMPLES)
 }
@@ -198,7 +198,7 @@ pub fn load_audio_into(path: &Path, out: &mut Vec<f32>) -> Result<u32> {
 ///   BEFORE the sample `Vec` is allocated. A 30-minute WAV with a
 ///   30-second cap therefore never touches the 256 MiB load-stage
 ///   ceiling — the rejection fires at the header-parse stage with one
-///   recoverable [`Error::Backend`].
+///   recoverable [`Error::BoundedDecode`].
 /// - The per-decoded-buffer cap (`reserve_under_cap` / `push_samples`)
 ///   uses the same `min(max_samples, MAX_DECODED_SAMPLES)` so a
 ///   compressed file lacking a declared frame count — MP3 Xing/Info
@@ -213,7 +213,7 @@ pub fn load_audio_into(path: &Path, out: &mut Vec<f32>) -> Result<u32> {
 ///
 /// # Errors
 /// - Same set as [`load_audio`], plus the early header-cap rejection
-///   above (also [`Error::Backend`]).
+///   above (also [`Error::BoundedDecode`]).
 pub fn load_audio_with_cap(path: &Path, max_samples: usize) -> Result<(Vec<f32>, u32)> {
   let mut out: Vec<f32> = Vec::new();
   let sample_rate = load_audio_into_with_cap(path, &mut out, max_samples)?;
@@ -244,7 +244,7 @@ pub fn load_audio_with_cap(path: &Path, max_samples: usize) -> Result<(Vec<f32>,
 /// rate (or asserts equality) after this returns.
 ///
 /// `max_seconds` must be a positive finite `f32`; NaN, ±∞, zero, and
-/// negatives surface as [`Error::Backend`] before any file IO. The
+/// negatives surface as [`Error::OutOfRange`] before any file IO. The
 /// `src_sr * max_seconds` product is computed in `f64` (the load-stage
 /// `MAX_DECODED_SAMPLES` ceiling fits comfortably in the `f64`
 /// mantissa) and any out-of-range product saturates to `usize::MAX`
@@ -266,7 +266,7 @@ pub fn load_audio_with_cap(path: &Path, max_samples: usize) -> Result<(Vec<f32>,
 /// the decode loop.
 ///
 /// # Errors
-/// - [`Error::Backend`] if `max_seconds` is not a finite value > 0
+/// - [`Error::OutOfRange`] if `max_seconds` is not a finite value > 0
 ///   (NaN, ±∞, zero, negative).
 /// - Same set as [`load_audio_with_cap`] for the open / probe / decode
 ///   pass (open / probe / no audio track / no codec params /
@@ -604,7 +604,7 @@ fn load_audio_into_unified(path: &Path, out: &mut Vec<f32>, strategy: CapStrateg
   //   `effective_cap` (= `min(max_samples, MAX_DECODED_SAMPLES)`); using
   //   the estimate as a hard cap would spuriously fail a valid file whose
   //   true length slightly exceeds an under-estimating Xing/Info header.
-  // Reaching `cap` makes `push_samples` return `Error::Backend` rather
+  // Reaching `cap` makes `push_samples` return `Error::BoundedDecode` rather
   // than re-grow into the infallible-alloc path.
   let cap = if exact_count {
     header_len_opt.unwrap_or(effective_cap).min(effective_cap)
@@ -760,7 +760,7 @@ impl CapStrategy {
 ///    no-declared-count path). Computed as `n > cap - out.len()` with the
 ///    subtraction order chosen so it cannot underflow (`out.len() <= cap`
 ///    is the invariant every caller maintains by routing each decoded
-///    buffer through this guard). Returns [`Error::Backend`] (the existing
+///    buffer through this guard). Returns [`Error::BoundedDecode`] (the existing
 ///    over-cap error).
 /// 2. **Cap-limited fallible reserve.** Grow capacity to fit `n` more
 ///    samples while STILL under the cap, mapping a
@@ -1148,7 +1148,7 @@ fn save_wav_post_metadata_fsync(meta_file: &File) -> std::io::Result<()> {
 /// `path`. On POSIX `rename(2)` is atomic-within-fs; on Windows
 /// `MoveFileEx` provides the same guarantee. Mid-write IO failures
 /// (disk full, signal interruption, etc.) clean up the tempfile and
-/// return [`Error::Backend`] with the destination untouched — a
+/// return [`Error::FileIo`] with the destination untouched — a
 /// partial WAV cannot be observed at `path`. Note: the tempfile lives
 /// in the same directory as `path` so the rename is single-fs
 /// (cross-fs rename would silently fall back to copy+unlink and lose
@@ -1171,21 +1171,21 @@ fn save_wav_post_metadata_fsync(meta_file: &File) -> std::io::Result<()> {
 /// reopened one), so a read-only captured destination mode (e.g.
 /// 0444) cannot cause the metadata fsync to be silently skipped via a
 /// reopen EACCES. A failed post-metadata sync_all is propagated as
-/// `Error::Backend` and the rename is NOT attempted — the destination
+/// `Error::FileIo` and the rename is NOT attempted — the destination
 /// stays at its pre-call contents.
 ///
 /// # Errors
-/// - [`Error::Backend`] if any sample is non-finite (NaN/inf), `sample_rate`
-///   is 0 or exceeds the byte-rate u32 ceiling (`u32::MAX / 2`),
-///   `samples.len()` exceeds the 16-bit-WAV total-file-size limit
-///   (`(u32::MAX - 36) / 2`), the destination directory has no
-///   `file_name` component, all tempfile retries (16) collide on
-///   `AlreadyExists`, or the tempfile cannot be created/written/
-///   flushed/renamed. On UPFRONT validation failure (NaN/inf, zero or
-///   oversized sample-rate, oversized buffer) the destination is
-///   untouched; on mid-write failure the destination is still
-///   untouched (tempfile path is removed, original `path` contents
-///   — if any — remain).
+/// - [`Error::InvariantViolation`] if `sample_rate == 0`,
+///   [`Error::CapExceeded`] if `samples.len()` exceeds the 16-bit-WAV limit
+///   (`(u32::MAX - 36) / 2`), [`Error::OutOfRange`] if `sample_rate` exceeds
+///   the byte-rate u32 ceiling (`u32::MAX / 2`),
+///   [`Error::LayerKeyed`]/[`Error::NonFiniteScalar`] if any sample is
+///   non-finite (NaN/inf), or [`Error::FileIo`] if the destination directory
+///   has no `file_name` component, all tempfile retries (16) collide on
+///   `AlreadyExists`, or the tempfile cannot be created / written /
+///   flushed / renamed. On upfront validation failure the destination is
+///   untouched; on mid-write failure the destination is still untouched
+///   (tempfile removed, original `path` contents — if any — remain).
 ///
 /// **Test-only failure injection** (`set_force_meta_fsync_failure`):
 /// under `cfg(test)`, the `save_wav_post_metadata_fsync` helper
@@ -1974,10 +1974,11 @@ fn open_excl_tempfile(final_path: &Path, max_retries: u32) -> Result<(PathBuf, F
 /// floating-point rounding drift).
 ///
 /// # Errors
-/// - [`Error::Backend`] if `from_rate == 0` (would divide by zero),
-///   `to_rate == 0`, the computed output length overflows `usize`,
-///   exceeds the [`MAX_RESAMPLED_SAMPLES`] cap (64 Mi-samples), or the
-///   recoverable Vec reservation fails.
+/// - [`Error::InvariantViolation`] if `from_rate == 0` or `to_rate == 0`,
+///   [`Error::ArithmeticOverflow`] if the output length overflows `usize`,
+///   [`Error::OutOfRange`] if the output length doesn't fit `usize`,
+///   [`Error::CapExceeded`] if it exceeds [`MAX_RESAMPLED_SAMPLES`] (64 Mi-samples),
+///   or [`Error::AllocFailure`] if the Vec reservation fails.
 pub fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f32>> {
   if from_rate == 0 {
     return Err(Error::InvariantViolation(InvariantViolationPayload::new(
@@ -2076,7 +2077,7 @@ mod tests {
   /// appended. A buffer that would push `out` past `cap` — the exact
   /// scenario a compressed header under-estimating the cap creates (header
   /// reserves `cap`, the decoder yields one more valid sample) — must
-  /// return a recoverable `Error::Backend`, and must NOT have grown `out`
+  /// return a recoverable `Error::BoundedDecode`, and must NOT have grown `out`
   /// past `cap` (no infallible `Vec` regrowth, no allocator abort).
   #[test]
   fn reserve_under_cap_rejects_buffer_that_would_exceed_cap() {
@@ -2678,7 +2679,7 @@ mod tests {
   /// [`save_wav_post_metadata_fsync_helper_is_called_before_rename_runtime`]
   /// which uses the test-only [`set_force_meta_fsync_failure`] hook to
   /// inject a failure at the fsync site and assert the cleanup
-  /// (tempfile gone, original bytes preserved, `Error::Backend`
+  /// (tempfile gone, original bytes preserved, `Error::FileIo`
   /// returned). This test STAYS as an end-to-end smoke test of the
   /// chmod-restore + rename path, and PAIRS with the source-structural
   /// test `save_wav_calls_post_metadata_fsync_helper_before_rename`
