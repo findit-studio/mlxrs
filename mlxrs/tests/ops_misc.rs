@@ -8,7 +8,7 @@ use mlxrs::{Array, Dtype, ops};
 #[test]
 fn argmin_arange_5_yields_0() {
   // argmin over [0, 1, 2, 3, 4] is index 0. mlx returns U32 for index outputs.
-  let a = Array::arange(0.0, 5.0, 1.0).unwrap();
+  let a = Array::arange::<f32>(0.0, 5.0, 1.0).unwrap();
   let mut r = ops::misc::argmin(&a, None, false).unwrap();
   assert_eq!(r.item::<u32>().unwrap(), 0);
 }
@@ -28,7 +28,7 @@ fn argmin_axis_2x3_yields_per_row_index() {
 #[test]
 fn cumsum_arange_5_yields_running_total() {
   // cumsum([0,1,2,3,4], axis=0, reverse=false, inclusive=true) = [0,1,3,6,10]
-  let a = Array::arange(0.0, 5.0, 1.0).unwrap();
+  let a = Array::arange::<f32>(0.0, 5.0, 1.0).unwrap();
   let mut r = ops::misc::cumsum(&a, 0, false, true).unwrap();
   assert_eq!(r.to_vec::<f32>().unwrap(), vec![0.0, 1.0, 3.0, 6.0, 10.0]);
 }
@@ -36,7 +36,7 @@ fn cumsum_arange_5_yields_running_total() {
 #[test]
 fn cumprod_method_arange_1_to_4_yields_factorials() {
   // cumprod([1,2,3,4], axis=0, inclusive) = [1, 2, 6, 24]
-  let a = Array::arange(1.0, 5.0, 1.0).unwrap();
+  let a = Array::arange::<f32>(1.0, 5.0, 1.0).unwrap();
   let mut r = a.cumprod(0, false, true).unwrap();
   assert_eq!(r.to_vec::<f32>().unwrap(), vec![1.0, 2.0, 6.0, 24.0]);
 }
@@ -223,7 +223,7 @@ fn clip_with_scalar_clamps_into_range() {
 #[test]
 fn clip_with_array_bounds() {
   // [0,1,2,3,4] clipped by min=1 (scalar bcast), max=3 (scalar bcast), array form.
-  let a = Array::arange(0.0, 5.0, 1.0).unwrap();
+  let a = Array::arange::<f32>(0.0, 5.0, 1.0).unwrap();
   let lo = Array::full::<f32>(&[1], 1.0).unwrap();
   let hi = Array::full::<f32>(&[1], 3.0).unwrap();
   let mut r = ops::misc::clip(&a, &lo, &hi).unwrap();
@@ -232,7 +232,7 @@ fn clip_with_array_bounds() {
 
 #[test]
 fn clip_method_form_matches_freefn() {
-  let a = Array::arange(0.0, 5.0, 1.0).unwrap();
+  let a = Array::arange::<f32>(0.0, 5.0, 1.0).unwrap();
   let mut r = a.clip_with_scalar(1.0, 3.0).unwrap();
   assert_eq!(r.to_vec::<f32>().unwrap(), vec![1.0, 1.0, 2.0, 3.0, 3.0]);
 }

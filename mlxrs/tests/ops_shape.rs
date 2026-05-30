@@ -109,7 +109,7 @@ fn stack_rejects_empty_input() {
 #[test]
 fn split_sections_at_indices_yields_three_parts() {
   // arange(0, 10) = [0,1,2,3,4,5,6,7,8,9]; split at [3, 5] -> 3 parts.
-  let a = Array::arange(0.0, 10.0, 1.0).unwrap();
+  let a = Array::arange::<f32>(0.0, 10.0, 1.0).unwrap();
   let parts = a.split_sections(&[3, 5], 0).unwrap();
   assert_eq!(parts.len(), 3);
   assert_eq!(parts[0].shape(), vec![3]);
@@ -121,7 +121,7 @@ fn split_sections_at_indices_yields_three_parts() {
 fn split_sections_empty_indices_yields_single_part() {
   // Splitting at no indices = whole array as a single part. Exercises the
   // empty-slice dim_ptr sentinel.
-  let a = Array::arange(0.0, 4.0, 1.0).unwrap();
+  let a = Array::arange::<f32>(0.0, 4.0, 1.0).unwrap();
   let parts = a.split_sections(&[], 0).unwrap();
   assert_eq!(parts.len(), 1);
   assert_eq!(parts[0].shape(), vec![4]);

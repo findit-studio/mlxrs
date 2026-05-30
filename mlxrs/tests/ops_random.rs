@@ -206,7 +206,7 @@ fn permutation_arange_yields_n_unique_indices() {
 #[test]
 fn permutation_method_form_works() {
   let key = random::key(13).unwrap();
-  let a = Array::arange(0.0, 5.0, 1.0).unwrap();
+  let a = Array::arange::<f32>(0.0, 5.0, 1.0).unwrap();
   let p = a.permutation(0, &key).unwrap();
   assert_eq!(p.shape(), vec![5]);
 }

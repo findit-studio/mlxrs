@@ -42,7 +42,7 @@ pub(crate) fn scalar_i32(value: i32) -> Result<Array> {
 /// [`Array::arange`] is `f32`-only (the safe ops surface has no integer
 /// `arange`; adding one is out of this PR's scope), so positions are built
 /// through `f32` and cast back to `I32`. Crucially, the **exclusive `stop`
-/// itself is cast to `f32`** to call `Array::arange(start, stop, 1.0)`. `f32`
+/// itself is cast to `f32`** to call `Array::arange::<f32>(start, stop, 1.0)`. `f32`
 /// represents every integer in `[0, 2^24]` exactly (24-bit significand) and
 /// rounds `2^24 + 1` *down* to `2^24`. So the bound rejects `stop > 2^24`
 /// (strictly): for the maximum allowed `stop == 2^24`, the `stop` cast is
@@ -64,7 +64,10 @@ pub(crate) fn iarange(start: usize, stop: usize) -> Result<Array> {
       format_smolstr!("{stop}"),
     )));
   }
-  ops::misc::astype(&Array::arange(start as f32, stop as f32, 1.0)?, Dtype::I32)
+  ops::misc::astype(
+    &Array::arange::<f32>(start as f32, stop as f32, 1.0)?,
+    Dtype::I32,
+  )
 }
 
 /// Port of `mx.roll(a, shift=shift)` for the 1-D `[L]` arrays

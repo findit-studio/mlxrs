@@ -436,7 +436,7 @@ where
   let logits = model.forward(&inputs, &mut cache)?;
   // steps = arange(1, targets.shape[1] + 1) → [1..T]
   let t_dim = targets.shape()[1] as f32;
-  let steps = Array::arange(1.0, t_dim + 1.0, 1.0)?;
+  let steps = Array::arange::<f32>(1.0, t_dim + 1.0, 1.0)?;
   // mask = (steps >= lengths[:, 0:1]) & (steps < lengths[:, 1:])
   // lengths[:, 0:1] is [B, 1]; lengths[:, 1:] is [B, 1].
   // Exclusive upper bound (`<`) drops the supervised target at

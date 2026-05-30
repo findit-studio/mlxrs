@@ -12,7 +12,7 @@ fn sum_2x2_ones_yields_4() {
 
 #[test]
 fn slice_arange_first_three() {
-  let a = Array::arange(0.0, 5.0, 1.0).unwrap();
+  let a = Array::arange::<f32>(0.0, 5.0, 1.0).unwrap();
   let mut s = a.slice(&[0], &[3], &[1]).unwrap();
   assert_eq!(s.to_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0]);
 }
@@ -40,7 +40,7 @@ fn addmm_2x2_alpha1_beta0_yields_2() {
 #[test]
 fn argmax_arange_5_yields_4() {
   // argmax over [0, 1, 2, 3, 4] should return 4. mlx returns U32 for index outputs.
-  let a = Array::arange(0.0, 5.0, 1.0).unwrap();
+  let a = Array::arange::<f32>(0.0, 5.0, 1.0).unwrap();
   let mut r = a.argmax(None, false).unwrap();
   assert_eq!(r.item::<u32>().unwrap(), 4);
 }

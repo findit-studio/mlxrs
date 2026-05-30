@@ -142,7 +142,7 @@ fn rfftfreq_yields_n_over_2_plus_one_samples() {
 #[test]
 fn fftshift_then_ifftshift_round_trips() {
   // arange [0, 8) -> shift -> ifftshift -> arange.
-  let mut a = Array::arange(0.0, 8.0, 1.0).unwrap();
+  let mut a = Array::arange::<f32>(0.0, 8.0, 1.0).unwrap();
   let want = a.to_vec::<f32>().unwrap();
   let s = fft::fftshift(&a, &[]).unwrap();
   let mut back = fft::ifftshift(&s, &[]).unwrap();
@@ -153,7 +153,7 @@ fn fftshift_then_ifftshift_round_trips() {
 
 #[test]
 fn fftshift_axes_specific_axis() {
-  let a = Array::arange(0.0, 8.0, 1.0).unwrap();
+  let a = Array::arange::<f32>(0.0, 8.0, 1.0).unwrap();
   let s = a.fftshift(&[0]).unwrap();
   assert_eq!(s.shape(), vec![8]);
 }

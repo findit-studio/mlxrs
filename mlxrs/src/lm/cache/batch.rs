@@ -224,7 +224,7 @@ pub fn dynamic_roll(x: &Array, shifts: &Array, axis: i32) -> Result<Array> {
   if n == 0 {
     return x.try_clone();
   }
-  // The `Array::arange(0.0, n as f32, 1.0)?` below builds the roll-index
+  // The `Array::arange::<f32>(0.0, n as f32, 1.0)?` below builds the roll-index
   // range via f32 and casts to I32. f32 can represent consecutive integers
   // exactly only up to `2^24` (the mantissa precision limit); beyond that,
   // successive integers alias to the same f32 value and the cast back to
@@ -242,7 +242,7 @@ pub fn dynamic_roll(x: &Array, shifts: &Array, axis: i32) -> Result<Array> {
     )));
   }
   // arange(n) -> [S]; expand_indices = (..., None) -> [S, 1].
-  let ar = ops::misc::astype(&Array::arange(0.0, n as f32, 1.0)?, Dtype::I32)?;
+  let ar = ops::misc::astype(&Array::arange::<f32>(0.0, n as f32, 1.0)?, Dtype::I32)?;
   let ar = ops::shape::expand_dims_axes(&ar, &[1])?; // [S, 1]
   // shifts[expand_shifts] = shifts[..., None, None]: [B,1] -> [B,1,1,1].
   let sh = ops::shape::expand_dims_axes(shifts, &[2, 3])?; // [B,1,1,1]
