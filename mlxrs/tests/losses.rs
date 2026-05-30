@@ -170,7 +170,7 @@ fn js_div_loss_rejects_bool_dtype() {
 // `validate_inputs` enforces `ndim() >= 2` on BOTH inputs BEFORE comparing
 // shapes, so a rank-0 pair and a mismatched-rank pair both surface the
 // rank-rejection guidance (Error::Backend, "rank >= 2") instead of a
-// generic ShapeMismatch. These tests pin that precedence rule for both
+// typed RankMismatch. These tests pin that precedence rule for both
 // losses (4 tests = 2 cases × 2 losses).
 
 /// R2: rank-0 (scalar) inputs are rejected with the rank message — NOT
@@ -195,8 +195,8 @@ fn kl_div_loss_rejects_rank_0_input() {
 
 /// R2: rank-1 `logits_q` paired with rank-2 `logits_p` is mismatched in
 /// BOTH rank and shape. Asserts rank-first precedence: the returned error
-/// is the rank-rejection (Error::Backend, "rank >= 2"), NOT a generic
-/// ShapeMismatch — proving the rank check fires before the shape compare.
+/// is the rank-rejection (`Error::RankMismatch`), NOT a shape compare —
+/// proving the rank check fires before shape comparison.
 #[test]
 fn kl_div_loss_rejects_rank_1_vs_rank_2_mismatch() {
   let logits_q = Array::ones::<f32>(&[4]).unwrap();
@@ -240,7 +240,7 @@ fn js_div_loss_rejects_rank_0_input() {
 }
 
 /// R2 mirror for `js_div_loss`: rank-1 vs rank-2 surfaces the rank error,
-/// not ShapeMismatch (proves rank-first precedence).
+/// not shape comparison (proves rank-first precedence).
 #[test]
 fn js_div_loss_rejects_rank_1_vs_rank_2_mismatch() {
   let logits_q = Array::ones::<f32>(&[4]).unwrap();
@@ -267,13 +267,13 @@ fn js_div_loss_rejects_rank_1_vs_rank_2_mismatch() {
 // ─── R3 contract: shape-class errors precede dtype errors ───
 //
 // The documented `# Errors` precedence on `kl_div_loss` / `js_div_loss`
-// promises step 2 (ShapeMismatch — incl. zero-last-dim + i32-overflow)
+// promises step 2 (typed shape error — incl. zero-last-dim + i32-overflow)
 // fires BEFORE step 3 (DtypeMismatch) and step 4 (dtype-admissibility
 // Backend). Pre-fix, the zero-last-dim rejection only fired inside
 // `n_outs_of` AFTER `validate_inputs` returned successfully, so dtype
 // errors won the precedence race for shape `[1, 0]` inputs. These 4
 // tests pin the corrected precedence: zero-last-dim is reported as
-// ShapeMismatch even when the dtype is unsupported (would otherwise
+// OutOfRange even when the dtype is unsupported (would otherwise
 // yield Backend) or mismatched between q and p (would otherwise yield
 // DtypeMismatch). Zero-sized rank-2 arrays are valid mlx constructs
 // (see `tests/error_paths.rs::from_slice_zero_element_uses_sentinel`),
@@ -282,7 +282,7 @@ fn js_div_loss_rejects_rank_1_vs_rank_2_mismatch() {
 /// R3: shape `[1, 0]` with same unsupported dtype (`i32`) — the
 /// pre-fix code would return `Error::Backend` (dtype admissibility,
 /// step 4). After moving the zero-last-dim check into `validate_inputs`
-/// before the dtype checks, the result is `Error::ShapeMismatch`
+/// before the dtype checks, the result is `Error::OutOfRange`
 /// (step 2), matching the documented contract.
 #[test]
 fn kl_div_loss_rejects_zero_last_dim_before_unsupported_dtype() {
@@ -310,7 +310,7 @@ fn kl_div_loss_rejects_zero_last_dim_before_unsupported_dtype() {
 
 /// R3: shape `[1, 0]` with mismatched dtypes (`f32` vs `f16`) — the
 /// pre-fix code would return `Error::DtypeMismatch` (step 3). After
-/// the precedence move, the result is `Error::ShapeMismatch` (step 2).
+/// the precedence move, the result is `Error::OutOfRange` (step 2).
 #[test]
 fn kl_div_loss_rejects_zero_last_dim_before_mixed_dtype() {
   let logits_q = Array::from_slice::<f32>(&[], &[1i32, 0]).unwrap();
@@ -337,7 +337,7 @@ fn kl_div_loss_rejects_zero_last_dim_before_mixed_dtype() {
 
 /// R3 mirror for `js_div_loss`: unsupported-dtype + zero-last-dim — the
 /// pre-fix code returned `Error::Backend` (dtype admissibility); after
-/// the precedence move it returns `Error::ShapeMismatch`.
+/// the precedence move it returns `Error::OutOfRange`.
 #[test]
 fn js_div_loss_rejects_zero_last_dim_before_unsupported_dtype() {
   let logits_q = Array::from_slice::<i32>(&[], &[1i32, 0]).unwrap();
@@ -363,7 +363,7 @@ fn js_div_loss_rejects_zero_last_dim_before_unsupported_dtype() {
 
 /// R3 mirror for `js_div_loss`: mixed-dtype + zero-last-dim — the
 /// pre-fix code returned `Error::DtypeMismatch`; after the precedence
-/// move it returns `Error::ShapeMismatch`.
+/// move it returns `Error::OutOfRange`.
 #[test]
 fn js_div_loss_rejects_zero_last_dim_before_mixed_dtype() {
   let logits_q = Array::from_slice::<f32>(&[], &[1i32, 0]).unwrap();
@@ -667,10 +667,14 @@ fn kl_div_loss_real_device_shape_mismatch() {
   let b = Array::ones::<f32>(&[2, 8]).unwrap();
   let err = kl_div_loss(&a, &b).unwrap_err();
   match err {
-    Error::ShapeMismatch(message) => {
-      assert!(message.contains("kl_div_loss"), "got: {message:?}");
+    Error::ShapePairMismatch(payload) => {
+      assert!(
+        payload.context().contains("kl_div_loss"),
+        "got: {:?}",
+        payload.context()
+      );
     }
-    other => panic!("expected ShapeMismatch, got: {other:?}"),
+    other => panic!("expected ShapePairMismatch, got: {other:?}"),
   }
 }
 

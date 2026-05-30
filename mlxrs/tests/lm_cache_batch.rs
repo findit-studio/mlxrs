@@ -1019,7 +1019,7 @@ fn dynamic_roll_rejects_n_above_f32_exact_int_max() {
   //
   // To test only the bound check without materializing 2^24 rows, we use
   // `Array::zeros` (graph-only; lazy) with shape `[1, 1, n, 1]`, then
-  // observe that dynamic_roll returns `Err(ShapeMismatch)` for `n > 2^24`
+  // observe that dynamic_roll returns `Err(OutOfRange)` for `n > 2^24`
   // BEFORE any arange materialization.
   const LIMIT: usize = 1usize << 24;
   let shifts_small = Array::from_slice::<i32>(&[0], &(1usize, 1)).unwrap();
@@ -1029,7 +1029,7 @@ fn dynamic_roll_rejects_n_above_f32_exact_int_max() {
   let r = dynamic_roll(&too_big, &shifts_small, 2);
   // Post-#248 typed-payload migration: the n>2^24 reject is `OutOfRange`
   // (`n` exceeds the f32-exact-integer cap), not the legacy
-  // `ShapeMismatch(String)` it surfaced as before the migration.
+  // `OutOfRange` (typed) it surfaced as after the migration.
   assert!(
     matches!(&r, Err(mlxrs::Error::OutOfRange(_))),
     "dynamic_roll(n=2^24+1) must Err(OutOfRange), got {r:?}"

@@ -120,8 +120,9 @@ impl SwitchLinear {
   /// - `bias`, if present, must be 2-D `[E, O]` with matching `E` and `O`.
   ///
   /// Mismatches are surfaced as recoverable
-  /// [`Error::ShapeMismatch`](crate::Error::ShapeMismatch) rather than left to
-  /// fail deep inside the FFI on first `apply`. Does not evaluate the arrays
+  /// [`Error::RankMismatch`](crate::Error::RankMismatch) /
+  /// [`Error::ShapePairMismatch`](crate::Error::ShapePairMismatch) rather than
+  /// left to fail deep inside the FFI on first `apply`. Does not evaluate the arrays
   /// (lazy; only `shape()` metadata is read).
   pub fn from_parts(weight: Array, bias: Option<Array>) -> Result<Self> {
     let w_shape = weight.shape();
@@ -687,7 +688,7 @@ pub type Activation = Box<dyn Fn(&Array) -> Result<Array>>;
 /// This port follows the reference faithfully — the reference's contract *is*
 /// an explicit `k` axis — so an ambiguous `[..batch..]` `indices` (whose shape
 /// equals `x`'s batch dims, with no extra trailing axis) is **rejected** here
-/// with a recoverable [`Error::ShapeMismatch`](crate::Error::ShapeMismatch).
+/// with a recoverable [`Error::RankMismatch`](crate::Error::RankMismatch).
 /// A caller doing top-1 routing must pass an explicit `[..batch.., 1]` (the
 /// same shape `argpartition(...)[..., -1:]` produces); that singleton-`k`
 /// shape sorts correctly (`M == 1`, `order // 1 == order`) and is accepted.
@@ -892,7 +893,7 @@ fn scatter_unsort(x: &Array, inv_order: &Array, shape: &[usize]) -> Result<Array
 /// materializes by broadcasting against `indices`. The result is
 /// `[..batch.., k, input_dims]`. An ambiguous `indices` shaped like the batch
 /// with no `k` axis (`[N]` / `[B, S]`) is rejected with
-/// [`Error::ShapeMismatch`](crate::Error::ShapeMismatch) — see the
+/// [`Error::RankMismatch`](crate::Error::RankMismatch) — see the
 /// `forward` method docs.
 pub struct SwitchGLU {
   /// `input_dims → hidden_dims` gate projection (`SwitchLinear`). Its output
@@ -935,8 +936,8 @@ impl SwitchGLU {
   /// must share `[input_dims, hidden_dims]`, and `down_proj` must be the
   /// `[hidden_dims, input_dims]` inverse — a mismatch (e.g. a `down_proj`
   /// whose `input_dims` is not the shared `hidden_dims`) surfaces as a
-  /// recoverable [`Error::ShapeMismatch`](crate::Error::ShapeMismatch) rather
-  /// than failing deep inside the FFI on the first `forward`.
+  /// recoverable [`Error::ShapePairMismatch`](crate::Error::ShapePairMismatch)
+  /// rather than failing deep inside the FFI on the first `forward`.
   pub fn new(
     gate_proj: SwitchLinear,
     up_proj: SwitchLinear,
@@ -977,7 +978,7 @@ impl SwitchGLU {
   ///
   /// An ambiguous `indices` shaped like the batch with **no** explicit `k`
   /// axis — `[N]` for a flat `x = [N, D]`, or `[B, S]` for `x = [B, S, D]` —
-  /// is rejected with [`Error::ShapeMismatch`](crate::Error::ShapeMismatch).
+  /// is rejected with [`Error::RankMismatch`](crate::Error::RankMismatch).
   /// The python reference always constructs `indices` via
   /// `argpartition(...)[..., -k:]`, which keeps an explicit length-`k` axis
   /// even for top-1; the `_gather_sort` rebatch reads `indices.shape[-1]` as
@@ -1065,7 +1066,7 @@ impl std::fmt::Debug for SwitchGLU {
 /// Validate [`SwitchGLU`]'s inter-projection shape contract: `gate_proj` and
 /// `up_proj` share `[input_dims → hidden_dims]`, and `down_proj` is the
 /// `[hidden_dims → input_dims]` inverse. Surfaces a mismatch as a recoverable
-/// [`Error::ShapeMismatch`](crate::Error::ShapeMismatch).
+/// [`Error::ShapePairMismatch`](crate::Error::ShapePairMismatch).
 fn check_glu_shapes(
   gate_proj: &SwitchLinear,
   up_proj: &SwitchLinear,
@@ -1142,7 +1143,7 @@ fn check_glu_shapes(
 /// `[..batch.., input_dims]` and `indices` of `[..batch.., k]` (an **explicit
 /// trailing top-`k` axis** required — `[..batch.., 1]` for top-1; an ambiguous
 /// `[..batch..]` shape is rejected with
-/// [`Error::ShapeMismatch`](crate::Error::ShapeMismatch), see the `forward`
+/// [`Error::RankMismatch`](crate::Error::RankMismatch), see the `forward`
 /// method docs), and returns `[..batch.., k, input_dims]`.
 pub struct SwitchMLP {
   /// `input_dims → hidden_dims` first projection (`SwitchLinear`); its output
@@ -1181,7 +1182,8 @@ impl SwitchMLP {
   /// `[hidden_dims, input_dims]` inverse of `fc1`'s `[input_dims,
   /// hidden_dims]`, and both must route the same expert population — a
   /// mismatch surfaces as a recoverable
-  /// [`Error::ShapeMismatch`](crate::Error::ShapeMismatch).
+  /// [`Error::ShapePairMismatch`](crate::Error::ShapePairMismatch) /
+  /// [`Error::LengthMismatch`](crate::Error::LengthMismatch).
   pub fn new(fc1: SwitchLinear, fc2: SwitchLinear, activation: Activation) -> Result<Self> {
     // `fc2` is `hidden_dims → input_dims` — the inverse of `fc1`'s
     // `input_dims → hidden_dims`.
@@ -1226,7 +1228,7 @@ impl SwitchMLP {
   /// trailing top-`k` axis** (pass `[..batch.., 1]` for top-1 routing).
   /// Returns `[..batch.., k, input_dims]`. An ambiguous `[..batch..]`
   /// `indices` with no `k` axis is rejected with
-  /// [`Error::ShapeMismatch`](crate::Error::ShapeMismatch) — identical
+  /// [`Error::RankMismatch`](crate::Error::RankMismatch) — identical
   /// contract to [`SwitchGLU::forward`], whose docs explain why.
   ///
   /// Identical rebatching skeleton to [`SwitchGLU::forward`] — `expand_dims`,
@@ -2354,7 +2356,7 @@ mod tests {
     // 64 routed tokens, `indices` shaped `[N]` (no trailing k axis) — the
     // sorted path is entered (`size >= 64`) but the shape is ambiguous: `N`
     // would be mis-read as the top-k count `M`. Must be a recoverable
-    // `ShapeMismatch`, not silent corruption.
+    // `RankMismatch`, not silent corruption.
     let glu = SwitchGLU::new(
       SwitchLinear::from_parts(identity_then_swap_weight(), None).unwrap(),
       SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),

@@ -200,7 +200,7 @@ impl ChunkedKvCache {
   /// `[..., :end, :]` returns), but for a *write* it would silently swallow
   /// an out-of-bounds splice, dropping or extending rows and corrupting the
   /// cache. So check `end <= l` up front (per-target, no K/V cross-check)
-  /// and surface a recoverable `ShapeMismatch`; the splice is then performed
+  /// and surface a recoverable `ArithmeticOverflow` / `OutOfRange`; the splice is then performed
   /// only on a provably-in-bounds window (every `head`/`tail`/`concat`
   /// produces an array of exactly the buffer length).
   fn set_seq(name: &str, buf: &Array, a: usize, s: usize, new: &Array) -> Result<Array> {
@@ -244,7 +244,7 @@ impl ChunkedKvCache {
     // broadcasts `new` to it exactly as mlx's `slice_update` does (single
     // helper, single tensor — NOT the fenced K/V cross-check). Identity
     // broadcasts are no-ops; size-1 broadcasts expand; non-broadcastable
-    // axes are a recoverable `Err(ShapeMismatch)`. Faithful to mlx-lm for
+    // axes are a recoverable `Err(ShapePairMismatch)`. Faithful to mlx-lm for
     // every input shape.
     let new = super::util::broadcast_write_rhs(name, buf, a, end, new)?;
     let head = seq_slice(buf, 0, a)?;

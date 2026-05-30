@@ -478,7 +478,7 @@ fn vlm_generate_zero_image_preserves_logprobs() {
 #[test]
 fn vlm_generate_marker_required_missing_errors() {
   // No marker in prompt + MarkerPolicy::Required ⇒ the assembler
-  // surfaces ShapeMismatch as the `Err` of the `Result` (synchronous).
+  // surfaces MissingField as the `Err` of the `Result` (synchronous).
   let model = MockVlmModel::new(5, 4, 3);
   let dir = temp_dir("marker_missing");
   let img = write_test_image(&dir, "img.png");
@@ -1095,7 +1095,7 @@ fn vlm_generate_first_token_sees_prompt_history_in_logit_bias() {
 #[test]
 fn vlm_generate_marker_missing_errors_before_any_image_work() {
   // A malformed prompt under MarkerPolicy::Required (no marker present)
-  // must surface ShapeMismatch SYNCHRONOUSLY without loading,
+  // must surface MissingField SYNCHRONOUSLY without loading,
   // preprocessing, or encoding any images. This pins Codex round-3
   // finding-2: validation ordering must come BEFORE the expensive
   // vision pipeline.

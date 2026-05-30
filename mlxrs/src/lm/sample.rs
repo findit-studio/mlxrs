@@ -369,8 +369,8 @@ pub fn argmax_sample(logits: &Array) -> Result<Array> {
 ///
 /// `xtc_threshold` must be finite in `[0, 0.5]` and `xtc_probability` finite
 /// in `[0, 1]` — exactly mlx-lm's `ValueError` bounds (its `threshold` gate
-/// is `[0, 0.5]`, not `[0, 1]`), surfaced via the file's `ShapeMismatch`
-/// idiom plus an explicit finiteness check (a `NaN` bound would slip mlx-lm's
+/// is `[0, 0.5]`, not `[0, 1]`), surfaced as [`Error::OutOfRange`] /
+/// [`Error::NonFiniteScalar`] plus an explicit finiteness check (a `NaN` bound would slip mlx-lm's
 /// bare `<=` comparison and silently no-op the mask).
 ///
 /// `key` seeds the single Bernoulli gate, mirroring mlx-lm's scalar

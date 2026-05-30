@@ -230,7 +230,8 @@ use crate::{
 ///   adapter weights file / config drift → [`Error::Backend`] from
 ///   [`lora::load_adapters`] (see that function's docs for the full list).
 /// - A LoRA factor shape that doesn't match its base layer →
-///   [`Error::ShapeMismatch`] from the layer constructor.
+///   [`Error::RankMismatch`] / [`Error::LengthMismatch`] / [`Error::ShapePairMismatch`]
+///   from the layer constructor.
 /// - Save-side failure (directory create, shard write, index commit) →
 ///   [`Error::Backend`] / [`crate::Error::ShardPathCollision`] from
 ///   [`load::save`]; a post-commit `fsync_dir` warning surfaces as

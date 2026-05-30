@@ -116,7 +116,7 @@ const F64_EXACT_INT_MAX: i64 = 1 << 53;
 const F64_TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
 
 /// Multiply a (already factor-divided + rounded, integral) `quotient` float
-/// by an `i64` `factor`, returning [`Error::ShapeMismatch`] instead of
+/// by an `i64` `factor`, returning [`Error::OutOfRange`] instead of
 /// panicking (debug) or silently wrapping (release) on overflow.
 ///
 /// The `*_by_factor` family computes `op(number / factor) * factor`. The
@@ -216,7 +216,7 @@ fn check_factor_input(number: i64, op: &'static str) -> Result<()> {
 /// this branch are `<= 2^53` the `as f64` casts lose nothing and IEEE-754
 /// division is correctly-rounded — i.e. the f64 ratio EQUALS python's
 /// `int / int -> float` to the bit. Above `2^53` we reject with a recoverable
-/// [`Error::ShapeMismatch`] naming the values rather than emit an
+/// [`Error::OutOfRange`] naming the values rather than emit an
 /// imprecisely-rounded size.
 ///
 /// **Branch-specific operands** (this is why the helper is per-branch — a
@@ -296,7 +296,7 @@ fn check_beta_domain_up(height: i64, width: i64, min_pixels: i64) -> Result<()> 
 /// (round-half-away-from-zero) would.
 ///
 /// # Errors
-/// [`Error::ShapeMismatch`] for an adversarial near-`i64::MAX` `number`: the
+/// [`Error::OutOfRange`] for an adversarial near-`i64::MAX` `number`: the
 /// f64 division/`* factor` cannot represent it faithfully (precision loss
 /// past ±2^53 or `i64` product overflow). The reference assumes frame-sized
 /// inputs and never trips this; we surface it recoverably rather than panic
@@ -317,7 +317,7 @@ pub fn round_by_factor(number: i64, factor: i64) -> Result<i64> {
 /// `ceil(number / factor) * factor`.
 ///
 /// # Errors
-/// [`Error::ShapeMismatch`] when `number` cannot be faithfully scaled in f64
+/// [`Error::OutOfRange`] when `number` cannot be faithfully scaled in f64
 /// (precision loss past ±2^53 or `i64` product overflow) — see
 /// [`round_by_factor`].
 pub fn ceil_by_factor(number: i64, factor: i64) -> Result<i64> {
@@ -332,7 +332,7 @@ pub fn ceil_by_factor(number: i64, factor: i64) -> Result<i64> {
 /// `floor(number / factor) * factor`.
 ///
 /// # Errors
-/// [`Error::ShapeMismatch`] when `number` cannot be faithfully scaled in f64
+/// [`Error::OutOfRange`] when `number` cannot be faithfully scaled in f64
 /// (precision loss past ±2^53 or `i64` product overflow) — see
 /// [`round_by_factor`].
 pub fn floor_by_factor(number: i64, factor: i64) -> Result<i64> {
@@ -434,7 +434,7 @@ fn round_half_to_even(x: f64) -> i64 {
 /// i64::MAX)` (small image + huge `max_pixels` sentinel + normal `min_pixels`)
 /// enters scale-up, where the actual ratio is `3136 / 1` (both far below
 /// `2^53`), so it must succeed and return `(56, 56)` like python. Inputs above
-/// the relevant bound are **rejected** with [`Error::ShapeMismatch`] rather
+/// the relevant bound are **rejected** with [`Error::OutOfRange`] rather
 /// than computed imprecisely — a naive `f64 / f64` would double-round and
 /// could diverge in the last bit there, and a correctly-rounded big-rational
 /// divider is out of scope. Every realistic frame size (dims in the thousands,
@@ -450,17 +450,18 @@ fn round_half_to_even(x: f64) -> i64 {
 /// `200` and pass.
 ///
 /// # Errors
-/// - [`Error::ShapeMismatch`] if `height <= 0` or `width <= 0` (the
+/// - [`Error::OutOfRange`] if `height <= 0` or `width <= 0` (the
 ///   reference assumes positive dims; we guard so the `min`/`max` and the
 ///   `sqrt` domain are well-defined).
-/// - [`Error::ShapeMismatch`] if `factor <= 0` (division by / alignment to
+/// - [`Error::OutOfRange`] if `factor <= 0` (division by / alignment to
 ///   a non-positive factor is undefined).
-/// - [`Error::ShapeMismatch`] if `max_pixels <= 0` or `min_pixels < 0` or
-///   `min_pixels > max_pixels` (the reference's pixel budget must be a
-///   valid non-empty interval; the `sqrt` arguments must be non-negative).
-/// - [`Error::ShapeMismatch`] if `max(h, w) / min(h, w) > MAX_RATIO`
+/// - [`Error::OutOfRange`] if `max_pixels <= 0` or `min_pixels < 0`;
+///   [`Error::InvariantViolation`] if `min_pixels > max_pixels`
+///   (the reference's pixel budget must be a valid non-empty interval;
+///   the `sqrt` arguments must be non-negative).
+/// - [`Error::OutOfRange`] if `max(h, w) / min(h, w) > MAX_RATIO`
 ///   (mirrors the python `raise ValueError`).
-/// - [`Error::ShapeMismatch`] if the budget **cannot contain a positive
+/// - [`Error::OutOfRange`] if the budget **cannot contain a positive
 ///   factor-aligned size** — i.e. `max_pixels < factor * factor` (the
 ///   smallest legal output, a `factor × factor` square, already overflows
 ///   the budget) or the scale-down branch floors a side to a non-positive
@@ -473,7 +474,7 @@ fn round_half_to_even(x: f64) -> i64 {
 ///   **kept**, not rejected: the reference's `floor_by_factor` /
 ///   `ceil_by_factor` do not re-clamp, so re-clamping here would diverge
 ///   from the python output.
-/// - [`Error::ShapeMismatch`] if a rescale (`beta`) is needed but the operands
+/// - [`Error::OutOfRange`] if a rescale (`beta`) is needed but the operands
 ///   of *that branch's* division exceed `2^53` — see the *`beta` (sqrt) path
 ///   exactness* note above for the per-branch bounds (scale-down: area /
 ///   `max_pixels`; scale-up: area / `min_pixels`). The f64 ratio cannot be
@@ -568,7 +569,7 @@ pub fn smart_resize(
 
   // Compute the factor-aligned bars BEFORE the branch decision. The
   // `*_by_factor` helpers are overflow-safe (`?`-propagating
-  // [`Error::ShapeMismatch`]): an adversarial near-`i64::MAX` `height`/
+  // [`Error::OutOfRange`]): an adversarial near-`i64::MAX` `height`/
   // `width` with `factor=28` would otherwise panic (debug) or wrap negative
   // (release) inside `round_by_factor`, after which `factor.max(..)` would
   // promote the wrapped value to a small valid-looking size and the late
@@ -703,15 +704,15 @@ impl Default for FrameSampling {
 ///   `total_frames`, then `floor_by_factor(_, FRAME_FACTOR)`.
 ///
 /// Both branches finally assert `FRAME_FACTOR <= nframes <= total_frames`
-/// (python raises `ValueError`; we return [`Error::ShapeMismatch`]).
+/// (python raises `ValueError`; we return [`Error::OutOfRange`]).
 ///
 /// # Errors
-/// - [`Error::ShapeMismatch`] if `total_frames <= 0` or `video_fps <= 0`
+/// - [`Error::OutOfRange`] if `total_frames <= 0` or `video_fps <= 0`
 ///   (the python flow assumes a real, non-empty clip; a zero `video_fps`
 ///   would divide-by-zero in the fps branch).
-/// - [`Error::ShapeMismatch`] if the `fps` is non-positive (the budget
+/// - [`Error::OutOfRange`] if the `fps` is non-positive (the budget
 ///   `total/video_fps*fps` would be non-positive).
-/// - [`Error::ShapeMismatch`] if the resulting count falls outside
+/// - [`Error::OutOfRange`] if the resulting count falls outside
 ///   `[FRAME_FACTOR, total_frames]` — mirrors the python final check.
 pub fn smart_nframes(sampling: FrameSampling, total_frames: i64, video_fps: f64) -> Result<i64> {
   if total_frames <= 0 {
@@ -811,7 +812,7 @@ pub fn smart_nframes(sampling: FrameSampling, total_frames: i64, video_fps: f64)
 /// total_frames - 1]` for safety against float-edge overshoot.
 ///
 /// # Errors
-/// - [`Error::ShapeMismatch`] if `total_frames <= 0` or `nframes <= 0`.
+/// - [`Error::OutOfRange`] if `total_frames <= 0` or `nframes <= 0`.
 /// - [`Error::OutOfMemory`] if the `nframes`-long index buffer cannot be
 ///   allocated (request-scaled; surfaced recoverably rather than aborting).
 pub fn sample_frame_indices(total_frames: i64, nframes: i64) -> Result<Vec<i64>> {
@@ -896,7 +897,7 @@ pub fn sample_frame_indices(total_frames: i64, nframes: i64) -> Result<Vec<i64>>
 /// `Array` is un-evaluated.
 ///
 /// # Errors
-/// - [`Error::ShapeMismatch`] if `frames` is empty (python `np.stack`
+/// - [`Error::EmptyInput`] if `frames` is empty (python `np.stack`
 ///   raises on an empty sequence; the swift `_asProcessedSequence` has a
 ///   `precondition(videoFrames.isEmpty == false)`).
 /// - [`Error::Backend`] if `cfg.layout != Layout::Hwc` (see the

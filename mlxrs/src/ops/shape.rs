@@ -596,7 +596,7 @@ pub fn contiguous(a: &Array, allow_col_major: bool) -> Result<Array> {
 ///
 /// The caller MUST ensure:
 /// - `shape.len() == strides.len()` (also enforced and surfaced as a
-///   recoverable [`Error::ShapeMismatch`] before any FFI call — checking
+///   recoverable [`Error::LengthMismatch`] before any FFI call — checking
 ///   it here is a redundant convenience, not a substitute for the caller's
 ///   own bounds-correctness reasoning).
 /// - every entry of `shape` is non-negative.

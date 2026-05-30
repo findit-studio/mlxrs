@@ -824,11 +824,11 @@ impl GenConfig {
   /// front (AUDIO-12 polish #136) — `temp`, `top_p`, `min_p`,
   /// `min_tokens_to_keep`, `top_k`, `xtc_probability`, `xtc_threshold`,
   /// `repetition_penalty`, and the `logit_bias` `(id, value)` pair-arity.
-  /// Returns the **first** bound violated as an `Err(Error::ShapeMismatch)`
-  /// with a descriptive message (the same `Err` shape the per-step
-  /// validation in [`crate::lm::sample`] surfaces, so a caller migrating
-  /// from "fails on first decode step" to "fails at config-build" sees
-  /// the same error class).
+  /// Returns the **first** bound violated as an `Err(`[`Error::OutOfRange`]`)`
+  /// (out-of-range scalar bound) or `Err(`[`Error::NonFiniteScalar`]`)` (NaN /
+  /// ±inf) — the same `Err` variants the per-step validation in
+  /// [`crate::lm::sample`] surfaces, so a caller migrating from "fails on
+  /// first decode step" to "fails at config-build" sees the same error class.
   ///
   /// # Why eager
   ///
@@ -1765,7 +1765,7 @@ fn token_window(ids: &[u32]) -> Result<Array> {
 /// matching mlx-lm's `logits[:, -1, :]` (`generate_step` line 407).
 ///
 /// A degenerate (buggy-model) `S == 0` or `V == 0` axis is a
-/// **DETERMINISTIC recoverable** `Err(Error::ShapeMismatch)` — the
+/// **DETERMINISTIC recoverable** `Err(`[`Error::OutOfRange`]`)` — the
 /// faithful-equivalent of Python `logits[:, -1, :]` raising `IndexError` on
 /// a zero-length sequence axis (and the same recoverable-`Err` discipline as
 /// the merged KV-cache rank guards). Guarded **before** the `s - 1`

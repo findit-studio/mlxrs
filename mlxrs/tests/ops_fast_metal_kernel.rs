@@ -21,7 +21,7 @@
 //!   `Array`s with the declared shapes / dtypes and the expected values.
 //! - `apply_rejects_shape_count_mismatch` — `MetalKernel::new` declares one
 //!   output_name but the per-call `MetalKernelApplyConfig` supplies two
-//!   output_shapes; `apply` returns `Error::ShapeMismatch` without touching
+//!   output_shapes; `apply` returns `Error::LengthMismatch` without touching
 //!   the device.
 //! - `apply_accepts_valid_multi_dim_output_shape` — a 1-input, 1-output
 //!   kernel produces a `[4, 8, 16]`-shaped output; sanity-checks that a
@@ -206,13 +206,11 @@ fn apply_rejects_shape_count_mismatch() {
     .apply(&[&input], &cfg)
     .expect_err("declared 1 output_name but supplied 2 output_shapes");
   match err {
-    mlxrs::Error::ShapeMismatch(message) => {
-      assert!(
-        message.contains("output_shapes.len()=2"),
-        "got: {message:?}"
-      );
-      assert!(message.contains("output_names.len()=1"), "got: {message:?}");
+    mlxrs::Error::LengthMismatch(payload) => {
+      // 1 output_name declared, 2 output_shapes supplied.
+      assert_eq!(payload.expected(), 1, "expected count: {:?}", payload);
+      assert_eq!(payload.actual(), 2, "actual count: {:?}", payload);
     }
-    other => panic!("expected ShapeMismatch, got: {other:?}"),
+    other => panic!("expected LengthMismatch, got: {other:?}"),
   }
 }

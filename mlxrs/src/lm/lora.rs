@@ -95,12 +95,12 @@
 //! Conventions mirror [`crate::lm::quant`] / [`crate::lm::load`]:
 //! `Result`-fallible, no implicit eval (the returned `Array`s are lazy — no
 //! `eval`/`item`/`to_vec`), recoverable IO / parse / shape failures map to
-//! [`Error::Backend`] / [`Error::ShapeMismatch`] with a clear message, and the
+//! [`Error::Backend`] / [`Error::RankMismatch`] / [`Error::LengthMismatch`] /
+//! [`Error::ShapePairMismatch`] with a clear message, and the
 //! `adapter_config.json` read is bounded against an untrusted adapter directory
 //! exactly as [`crate::lm::load::load_config`].
 //!
 //! [`Error::Backend`]: crate::Error::Backend
-//! [`Error::ShapeMismatch`]: crate::Error::ShapeMismatch
 //! [`feedback_no_per_model_arch_porting`]: crate::lm
 
 use std::{
@@ -2558,8 +2558,9 @@ impl DoRAEmbedding {
 /// `lora_b` `[r, dims]`). Cross-checks the shared rank axis (`a[1] == b[0]`),
 /// `lora_a`'s leading axis against `num_embeddings`, and `lora_b`'s last axis
 /// against `dims` — so a wrong-shape factor is a recoverable
-/// [`Error::ShapeMismatch`] at construct/load time, not an opaque mlx-c failure
-/// on the first lookup. Mirrors [`validate_factor_shapes`] for the linear side.
+/// [`Error::RankMismatch`] / [`Error::LengthMismatch`] at construct/load time,
+/// not an opaque mlx-c failure on the first lookup. Mirrors
+/// [`validate_factor_shapes`] for the linear side.
 fn validate_embedding_factor_shapes(
   base: &BaseEmbedding,
   params: &AdapterParams,
@@ -2829,8 +2830,8 @@ fn base_input_dims(base: &BaseLinear) -> Result<usize> {
 /// [`base_input_dims`]) and its last axis (`r`) must match `lora_b`'s leading
 /// axis (`r`); `lora_b` is `[r, output_dims]`, so its last axis must equal the
 /// base `output_dims`. Cross-checking the `input_dims` axis here means a wrong
-/// `lora_a` width is a recoverable [`Error::ShapeMismatch`] at validate/load
-/// time (not an opaque mlx-c matmul failure on the first forward).
+/// `lora_a` width is a recoverable [`Error::RankMismatch`] / [`Error::LengthMismatch`]
+/// at validate/load time (not an opaque mlx-c matmul failure on the first forward).
 fn validate_factor_shapes(
   base: &BaseLinear,
   params: &AdapterParams,
@@ -2966,7 +2967,7 @@ impl LinearValidationContext {
 ///
 /// Requiring `lora_a`'s rank axis (`[input_dims, r]`, last axis) and
 /// `lora_b`'s rank axis (`[r, output_dims]`, leading axis) to both equal
-/// `config_rank` makes that drift a loud, recoverable [`Error::ShapeMismatch`]
+/// `config_rank` makes that drift a loud, recoverable [`Error::LengthMismatch`]
 /// at load time instead. Indexing is defensive (a non-2-D factor reads as a
 /// `0` rank axis), so this is safe to call independently of
 /// [`validate_factor_shapes`].
@@ -3056,11 +3057,12 @@ fn validate_config_rank(
 /// no base layer, or (c) nothing was adapted at all.
 ///
 /// A selected path whose factor shapes don't match the base (or a DoRA path
-/// with no magnitude) is a recoverable [`Error::ShapeMismatch`] /
+/// with no magnitude) is a recoverable [`Error::RankMismatch`] /
+/// [`Error::LengthMismatch`] / [`Error::ShapePairMismatch`] /
 /// [`Error::Backend`]. A selected path whose factor tensors' rank axis
 /// disagrees with the module's resolved rank ([`LoraConfig::rank_for`] — the
 /// `rank_pattern`-overridden rank for a PEFT module) is a recoverable
-/// [`Error::ShapeMismatch`] (`validate_config_rank`) — caught before the
+/// [`Error::LengthMismatch`] (`validate_config_rank`) — caught before the
 /// scale is applied, so a rank drift cannot silently scale by the wrong
 /// divisor.
 pub fn linear_to_lora_layers(
@@ -3512,7 +3514,8 @@ fn parse_block_index(path: &str) -> Option<i32> {
 ///   An **unknown** `fine_tune_type` string is a serde parse error →
 ///   [`Error::Backend`] from [`LoraConfig::from_json`].
 /// - A target path with a magnitude-less DoRA factor, or factor shapes that
-///   don't match the base → [`Error::ShapeMismatch`] / [`Error::Backend`].
+///   don't match the base → [`Error::RankMismatch`] / [`Error::LengthMismatch`] /
+///   [`Error::ShapePairMismatch`] / [`Error::Backend`].
 /// - The completeness postcondition of [`linear_to_lora_layers`]: an explicit
 ///   target selection (mlx-lm `keys` / PEFT `target_modules`) missing factors,
 ///   an unused adapter factor group, or an empty result → [`Error::Backend`].
@@ -4957,7 +4960,7 @@ mod tests {
     // factor tensors are rank 16 (a stale `adapter_config.json` drift).
     // Without the config-vs-tensor rank cross-check this silently builds
     // rank-16 factors and scales by alpha/8 instead of alpha/16 — wrong
-    // strength. It must fail loudly at load with a ShapeMismatch.
+    // strength. It must fail loudly at load with a LengthMismatch.
     let tmp = std::env::temp_dir().join(format!("mlxrs_rankdrift_test_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let cfg = r#"{

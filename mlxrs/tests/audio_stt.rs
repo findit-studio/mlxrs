@@ -600,7 +600,7 @@ fn decode_step_default_errors_with_clear_message() {
 }
 
 /// A `decode_step` returning the wrong logits shape (`[V]` instead of
-/// `[1, V]`) surfaces a recoverable `Err(ShapeMismatch)` — the loop's
+/// `[1, V]`) surfaces a recoverable `Err(RankMismatch)` — the loop's
 /// per-step rank/zero-axis guard.
 #[test]
 fn stt_generate_rejects_bad_decode_step_shape() {

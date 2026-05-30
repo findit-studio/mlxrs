@@ -128,8 +128,9 @@
 //!   addressed via the target-dimension guard (`height * width * 4 <=
 //!   MAX_DECODED_IMAGE_BYTES`) that fires BEFORE any allocation. The
 //!   signature is `-> Result<DynamicImage>` — over-budget / zero /
-//!   overflow targets surface as a typed `Error::ShapeMismatch` with
-//!   the offending dims and the cap. See [`resize`]'s "Return type"
+//!   overflow targets surface as typed errors (`Error::OutOfRange`,
+//!   `Error::CapExceeded`, `Error::ArithmeticOverflow`) with the offending
+//!   dims and the cap. See [`resize`]'s "Return type"
 //!   doc paragraph for the full rationale.
 //! - **VLM-7 (#126)** — `to_rgb8()` clone elision in
 //!   [`image_to_array`]: addressed via the `as_rgb8()` fast path
@@ -159,8 +160,9 @@
 //!   "Y" guarantees the call cannot trigger quadratic / unbounded
 //!   allocation from hostile input.
 //! - **Recoverable-OOM:** an allocator failure surfaces as a typed
-//!   [`Error::OutOfMemory`] (or [`Error::ShapeMismatch`] on the
-//!   pre-allocation overflow gate) rather than aborting the process.
+//!   [`Error::OutOfMemory`] (or [`Error::CapExceeded`] /
+//!   [`Error::ArithmeticOverflow`] on the pre-allocation overflow gate)
+//!   rather than aborting the process.
 //!   "Y" requires every backing allocation under our direct control
 //!   to route through `try_reserve_exact` (or an equivalent fallible
 //!   primitive). "N" means image-crate-internal allocations
@@ -205,7 +207,7 @@
 //! emits 16-bit variants for `BitDepth::Sixteen` PNG inputs) and
 //! caller-supplied `Rgb32F`/`Rgba32F` inputs. [`resize`] also rejects an
 //! over-budget / zero / overflowing target as a typed
-//! [`Error::ShapeMismatch`] BEFORE allocating (its target now flows from
+//! [`Error::OutOfRange`] / [`Error::CapExceeded`] BEFORE allocating (its target now flows from
 //! an untrusted on-disk config), then materializes its source RGBA
 //! buffer (formerly an infallible `img.to_rgba8()` clone) via
 //! `try_reserve_exact` and hands it to the own `vlm::resize`
@@ -1068,7 +1070,7 @@ fn rotate_buf<T: Copy + Default>(
   // reservation has a precise length. Defend against an unexpected
   // overflow regardless — `try_reserve_exact` on a pathologically
   // large `usize` would still return Err, but the explicit overflow
-  // check yields a typed `ShapeMismatch` rather than the less
+  // check yields a typed `ArithmeticOverflow` rather than the less
   // specific `OutOfMemory`.
   let elements = w_usize
     .checked_mul(h_usize)
@@ -1264,12 +1266,13 @@ fn rotate_buf_u8_via_c5(
 /// transitively (both call `resize` via `?`).
 ///
 /// # Errors
-/// - [`Error::ShapeMismatch`] if either target dimension is `0`, if
-///   `height * width * 4` overflows `u64`, if it exceeds
-///   [`MAX_DECODED_IMAGE_BYTES`], if `source_width * source_height * 4`
-///   overflows `usize`, or if that RGBA8-expanded source staging size
-///   itself exceeds [`MAX_DECODED_IMAGE_BYTES`] — the message carries the
-///   offending dims and the cap. (The over-cap cases use `ShapeMismatch`
+/// - [`Error::OutOfRange`] if either target dimension is `0`.
+/// - [`Error::ArithmeticOverflow`] if `height * width * 4` overflows
+///   `u64`, or if `source_width * source_height * 4` overflows `usize`.
+/// - [`Error::CapExceeded`] if `height * width * 4` exceeds
+///   [`MAX_DECODED_IMAGE_BYTES`], or if the RGBA8-expanded source staging
+///   size exceeds [`MAX_DECODED_IMAGE_BYTES`] — the message carries the
+///   offending dims and the cap. (The over-cap cases use `CapExceeded`
 ///   rather than [`Error::OutOfMemory`] so they can name the dims +
 ///   ceiling, matching [`pad_to_square`]'s canvas gate.) The source guard
 ///   matters because `load_image`'s cap is on the *source* pixel format:
@@ -1359,7 +1362,7 @@ pub fn resize(
   // through `load_image`'s 512 MiB decoder cap so this product is bounded
   // in practice, but a `checked_mul` keeps the reservation honest on a
   // 32-bit `usize` (where the cap's byte count could still wrap) and
-  // routes any pathological product to a recoverable `ShapeMismatch`
+  // routes any pathological product to a recoverable `ArithmeticOverflow`
   // instead of a silent under-allocation.
   let src_bytes = (src_w as usize)
     .checked_mul(src_h as usize)
@@ -1477,7 +1480,8 @@ pub fn resize(
 ///
 /// # Errors
 /// Propagates [`resize`]'s target-dimension guard verbatim
-/// ([`Error::ShapeMismatch`] on zero/overflow/over-cap target dims).
+/// ([`Error::OutOfRange`] on zero dims, [`Error::ArithmeticOverflow`] on
+/// overflow, [`Error::CapExceeded`] on over-cap target dims).
 pub fn resize_lanczos(
   img: &::image::DynamicImage,
   target_h: u32,
@@ -1614,8 +1618,9 @@ pub fn center_crop(
 /// path). The per-pixel iteration touches that already-resident memory
 /// without spawning a second copy.
 ///
-/// Oversized inputs return [`Error::ShapeMismatch`] with the requested
-/// vs allowed byte count; allocator failures return
+/// Oversized inputs return [`Error::CapExceeded`] (or
+/// [`Error::ArithmeticOverflow`] on a product overflow) with the
+/// requested vs allowed byte count; allocator failures return
 /// [`Error::OutOfMemory`].
 pub fn pad_to_square(img: ::image::DynamicImage, fill: [u8; 3]) -> Result<::image::DynamicImage> {
   let w = img.width();
@@ -1848,7 +1853,7 @@ pub fn image_to_array(img: &::image::DynamicImage, color_order: ColorOrder) -> R
   // shape-product vs buffer length but does so in `usize` arithmetic
   // *after* our cast; on a 32-bit usize the multiplication
   // `h_usize * w_usize * 3` can wrap silently. Catch it here with a
-  // recoverable `Error::ShapeMismatch` so callers see a clean error rather
+  // recoverable `Error::ArithmeticOverflow` so callers see a clean error rather
   // than a panic downstream. This MUST run before any allocation so a
   // hostile dimension product cannot abort in the allocator.
   let total = h_usize
@@ -2072,7 +2077,7 @@ pub fn image_to_array(img: &::image::DynamicImage, color_order: ColorOrder) -> R
 /// multiplying; rescaling a u8/i32 input by a sub-unit factor in the
 /// input dtype would silently floor to zero (e.g.
 /// `astype(1/255, U8) = 0`). Non-float inputs are rejected with
-/// [`Error::ShapeMismatch`].
+/// [`Error::UnsupportedDtype`].
 ///
 /// Returns a *new* array; the source is unchanged (mlx's standard
 /// out-of-place op semantics).
@@ -2114,7 +2119,7 @@ pub fn rescale(arr: &Array, scale: f32) -> Result<Array> {
 /// CIFormat.RGBAf buffer (`MediaProcessing.swift:135-156`) and the
 /// HF python `BaseImageProcessor.normalize` converts to f32 before
 /// the subtract / divide. Non-float inputs are rejected with
-/// [`Error::ShapeMismatch`].
+/// [`Error::UnsupportedDtype`].
 ///
 /// **Dtype fidelity (float inputs):** the mean/std arrays adopt the
 /// input dtype (so an f16/bf16 input is not silently promoted to f32),
@@ -2173,7 +2178,7 @@ pub fn normalize_imagenet(arr: &Array, mean: &[f32; 3], std: &[f32; 3]) -> Resul
 /// space (CIFormat.RGBAf @ `MediaProcessing.swift:171`); the python
 /// HF processors call `array.astype(np.float32)` before rescale /
 /// normalize. We surface the dtype mismatch as a clean
-/// `Error::ShapeMismatch` rather than letting the caller discover it
+/// `Error::UnsupportedDtype` rather than letting the caller discover it
 /// as silent zeros downstream.
 fn require_float_dtype(op: &'static str, dtype: Dtype) -> Result<()> {
   match dtype {
@@ -2304,8 +2309,9 @@ fn dynamic_image_rgba_pixel(img: &::image::DynamicImage, x: u32, y: u32) -> [u8;
 /// extractors are aspect-ratio-aware variants that are out of scope
 /// (per-usecase per the no-per-model-arch rule).
 ///
-/// Returns `Err(Error::ShapeMismatch)` if the input is not rank-3,
-/// `patch_size == 0`, or `H % p != 0 || W % p != 0`.
+/// Returns `Err(Error::RankMismatch)` if the input is not rank-3;
+/// `Err(Error::OutOfRange)` if `patch_size == 0`; or
+/// `Err(Error::DivisibilityConstraint)` if `H % p != 0 || W % p != 0`.
 ///
 /// Layout: input `[H, W, C]` → reshape `[H/p, p, W/p, p, C]` →
 /// transpose `[H/p, W/p, p, p, C]` → reshape `[H/p * W/p, p, p, C]`.
@@ -2356,7 +2362,7 @@ pub fn patchify(arr: &Array, patch_size: usize) -> Result<Array> {
   // patch_size)` could overflow `usize` on the `hp * wp` product on a
   // 32-bit target (or, with extreme inputs, on a 64-bit target via
   // genuinely-large images). Surface as recoverable
-  // `Error::ShapeMismatch` rather than silently wrapping to a
+  // `Error::ArithmeticOverflow` rather than silently wrapping to a
   // smaller-than-expected first axis (which would later cause
   // reshape/broadcast misalignment) — Copilot review #3272880077.
   let n_patches = hp.checked_mul(wp).ok_or_else(|| {
@@ -2405,8 +2411,8 @@ pub fn patchify(arr: &Array, patch_size: usize) -> Result<Array> {
 /// [`resize`]'s target-dimension guard (Codex review: `cfg.size` now
 /// flows from an UNTRUSTED loaded processor config, so an over-budget /
 /// zero / overflowing `size` surfaces as a typed
-/// [`Error::ShapeMismatch`] from `resize` via `?` — NOT a process
-/// abort). The remaining stages — [`image_to_array`] (f32 widening),
+/// [`Error::OutOfRange`] / [`Error::CapExceeded`] / [`Error::ArithmeticOverflow`]
+/// from `resize` via `?` — NOT a process abort). The remaining stages — [`image_to_array`] (f32 widening),
 /// [`rescale`], and [`normalize_imagenet`] — are end-to-end recoverable
 /// ([`Error::OutOfMemory`] / mlx backend `Result`). The only residual
 /// abort path is `resize`'s two image-crate-internal `Vec` allocs
@@ -2454,7 +2460,8 @@ pub fn preprocess(img: &::image::DynamicImage, cfg: &ImageProcessorConfig) -> Re
 /// preprocessor's rank-3 channel-last output specifically — `Hwc`,
 /// `Chw`, and `Bchw` are all defined as `H W 3` permutations / batch
 /// expansions of that exact shape. Non-rank-3 / non-trailing-3-channel
-/// inputs are rejected with [`Error::ShapeMismatch`] before any FFI
+/// inputs are rejected with [`Error::RankMismatch`] (wrong ndim) or
+/// [`Error::LengthMismatch`] (trailing channel dim != 3) before any FFI
 /// call; per-model processors that produce different ranks (patchified
 /// `[N, P, P, 3]`, batched `[B, H, W, 3]`, etc.) compose their own
 /// trailing layout via `transpose_axes` / `expand_dims_axes` directly.
@@ -2480,15 +2487,15 @@ pub fn preprocess(img: &::image::DynamicImage, cfg: &ImageProcessorConfig) -> Re
 /// batch axis that `expand_dims_axes(&[0])` adds for the `Bchw` arm.
 ///
 /// # Errors
-/// - [`Error::ShapeMismatch`] if the input is not rank-3 with a
-///   trailing channel dim of 3.
+/// - [`Error::RankMismatch`] if the input is not rank-3;
+///   [`Error::LengthMismatch`] if the trailing channel dim is not 3.
 ///
 /// Tracking issue: [#120](https://github.com/Findit-AI/mlxrs/issues/120)
 /// (VLM-1).
 pub fn apply_layout(arr: Array, layout: Layout) -> Result<Array> {
   use crate::ops::shape::expand_dims_axes;
   // Validate rank-3 `[H, W, 3]` shape before any FFI call — surfaces a
-  // typed `ShapeMismatch` for batched / patchified / non-RGB inputs
+  // typed `RankMismatch` / `LengthMismatch` for batched / patchified / non-RGB inputs
   // rather than letting mlx's permutation-validation error message
   // surface (which would be less actionable).
   let shape = arr.shape();
@@ -2992,7 +2999,7 @@ mod apply_orientation_tests {
     // The byte-budget gate against `MAX_DECODED_IMAGE_BYTES` must
     // accept inputs that fit. Sanity check: a 1x1 Rgb8 image is
     // 3 bytes, well under the 512 MiB cap. The negative
-    // (overflow → ShapeMismatch) path uses the identical
+    // (overflow → ArithmeticOverflow) path uses the identical
     // `checked_mul` chain that `pad_to_square`'s overflow tests
     // already cover; we can't construct an image at hostile
     // dimensions without OOM-ing the test process itself.

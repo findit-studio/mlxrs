@@ -817,35 +817,24 @@ impl std::error::Error for ConvertPostSavePartialPayload {
 /// callers and downstream tooling, and is the entire reason this is an
 /// `enum` rather than a `type Error = String`. If an existing variant
 /// doesn't fit the call site's needs, ADD A NEW PAYLOAD STRUCT to this
-/// module rather than falling back to [`Error::MlxC`] / [`Error::ShapeMismatch`].
+/// module rather than falling back to one of the message-only variants
+/// described below.
 ///
-/// The free-form-string variants in this enum are reserved for two
-/// narrow use cases ONLY:
-///
-/// 1. [`Error::MlxC`] is for the raw mlx-c handler thread-local drain
-///    when [`MlxOpKind::parse_prefix`] could not extract a typed
-///    `[op_name]` prefix from the upstream message. **Never construct
-///    this elsewhere** — every other call site has structured runtime
-///    data and must use a typed variant.
-/// 2. [`Error::ShapeMismatch`] is a stepping-stone for the in-progress
-///    migration of pre-§5 shape-mismatch sites and is being phased out
-///    in favor of [`Error::RankMismatch`] / [`Error::LengthMismatch`] /
-///    [`Error::MultiLengthMismatch`] / [`Error::ShapePairMismatch`] /
-///    [`Error::DivisibilityConstraint`]. **Never construct new
-///    `ShapeMismatch` sites** — pick the typed shape variant whose
-///    fields carry every runtime substitution.
+/// A few variants are deliberately message-only — each documented at its own
+/// definition — while every other variant carries typed fields. The
+/// message-only ones are [`Error::MlxC`] (the sanctioned raw mlx-c handler
+/// drain, used when [`MlxOpKind::parse_prefix`] cannot extract a typed
+/// `[op_name]` prefix from the upstream message); the DEPRECATED
+/// [`Error::Backend`] (retained only for not-yet-migrated pre-§5 sites and
+/// slated for removal once the remaining per-module migrations land); and,
+/// under `feature = "tokenizer"`, `Error::Tokenizer` (the tokenizer
+/// subsystem's HF / JSON / chat-template / tool-parsing failures, carried as
+/// a message). **New code must not add
+/// message-only variants or route structured data into them** — every other
+/// call site has structured runtime data and must use a typed variant.
 #[derive(Debug, thiserror::Error, derive_more::IsVariant)]
 #[non_exhaustive]
 pub enum Error {
-  /// **DEPRECATED for new construction** — see the enum doc. Reserved for
-  /// in-progress migration of pre-§5 shape-mismatch sites; new code must
-  /// pick the typed shape variant whose fields carry every runtime
-  /// substitution ([`Error::RankMismatch`] / [`Error::LengthMismatch`] /
-  /// [`Error::MultiLengthMismatch`] / [`Error::ShapePairMismatch`] /
-  /// [`Error::DivisibilityConstraint`]).
-  #[error("shape mismatch: {0}")]
-  ShapeMismatch(String),
-
   /// Dtype mismatch (e.g. requesting `as_slice::<f32>` on an i32 array).
   #[error("dtype mismatch: expected {:?}, got {:?}", .0.expected(), .0.got())]
   DtypeMismatch(DtypeMismatchPayload),
@@ -1816,8 +1805,8 @@ impl std::fmt::Display for MlxOpPayload {
 impl std::error::Error for MlxOpPayload {}
 
 // ────────────────────────────────────────────────────────────────────────────
-// 13 new typed payload structs (foundation-PR: replace Backend(format!) +
-// ShapeMismatch(format!) sites with these in the per-module migration PRs).
+// 13 typed payload structs — each carries every runtime substitution as a
+// discrete field (the §5 typed-error foundation).
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Payload for [`Error::MissingKey`]: a runtime-keyed lookup failure

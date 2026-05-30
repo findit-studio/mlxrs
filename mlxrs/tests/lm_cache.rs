@@ -70,7 +70,7 @@ fn standard_append_offset_trim() {
 #[test]
 fn standard_wrong_rank_errors() {
   let mut c = StandardKvCache::new();
-  // 2-D, not the required 4-D [B, n_kv_heads, S, head_dim] -> ShapeMismatch.
+  // 2-D, not the required 4-D [B, n_kv_heads, S, head_dim] -> RankMismatch.
   let bad = Array::from_slice::<f32>(&[1.0, 2.0], &(1usize, 2)).unwrap();
   assert!(c.update(&bad, &bad).is_err());
 }
@@ -840,7 +840,7 @@ fn from_state_rotating_empty_with_nonzero_meta_is_invalid() {
 /// offset==0 && idx==0` invariant isn't tripped); the next update would then
 /// wrap (release) / panic (debug). Both physical paths
 /// (`_update_concat`, S>1; `_update_in_place`, S==1) must instead return
-/// `Err(ShapeMismatch)` BEFORE mutating any ring state (no partial
+/// `Err(ArithmeticOverflow)` BEFORE mutating any ring state (no partial
 /// mutation). Non-overflowing inputs are byte-identical (the ring algorithm
 /// outcome is unchanged — exercised by the #31 parity tests, untouched).
 #[test]
@@ -1217,8 +1217,9 @@ fn create_causal_mask_huge_window_is_unwindowed_noop() {
 ///   line 559: `offset = min(self.max_size - 1, self.offset)`
 ///             = `min(usize::MAX - 1, usize::MAX)` = `usize::MAX - 1`
 ///   line 560: `offset + N` = `(usize::MAX - 1) + 2` -> overflows usize
-/// so the checked-add yields `Err::ShapeMismatch` instead of wrapping into
-/// a wrong `create_causal_mask`/`"causal"` choice. A non-empty minimal valid
+/// so the checked-add yields `Err(ArithmeticOverflow)` instead of wrapping
+/// into a wrong `create_causal_mask`/`"causal"` choice. A non-empty minimal
+/// valid
 /// state keeps `is_empty()==false` so `from_state`'s empty-state invariant
 /// is not tripped (that path is unrelated and stays intact).
 #[test]
@@ -1560,7 +1561,7 @@ fn from_state_no_meta_cache_rejects_truthy_meta_state() {
 /// to `new.try_clone()` and silently mutates the cached buffer's batch axis.
 /// With the fix, `broadcast_write_rhs` rejects every non-broadcastable
 /// non-seq axis (batch / n_kv_heads / head_dim) at the boundary —
-/// recoverable `Err(ShapeMismatch)`, no silent mutation.
+/// recoverable `Err(ShapePairMismatch)`, no silent mutation.
 #[test]
 fn rotating_set_seq_full_window_rejects_mismatched_batch_dim() {
   let mut c = RotatingKvCache::new(1, 0); // max_size=1, keep=0.
@@ -1690,8 +1691,9 @@ fn rotating_set_seq_full_window_rejects_mismatched_heads_and_head_dim() {
 /// (the SINGLE-tensor, non-seq-axes write compatibility check that closes
 /// #78). Pure pass-through for matching non-seq axes (no error on a valid
 /// `[B, n_kv_heads, S, head_dim]` pair where the seq axis is unconstrained),
-/// `Err(ShapeMismatch)` on each of the three non-seq axes (batch / n_kv_heads
-/// / head_dim). Exercised end-to-end via the chunked + rotating full-window
+/// `Err(ShapePairMismatch)` on each of the three non-seq axes (batch /
+/// n_kv_heads / head_dim). Exercised end-to-end via the chunked + rotating
+/// full-window
 /// tests above; this asserts the boundary helper's semantics directly via
 /// its observable behavior on `set_seq`'s write path (which routes
 /// every `[head, new, tail]` concat through the helper first).

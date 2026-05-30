@@ -162,7 +162,7 @@ fn resize_rejects_source_rgba_staging_over_cap() {
   // 16384x8193 Luma8 = ~128 MiB (well under the 512 MiB source cap as
   // Luma8), but `16384*8193*4 = 536_936_448 bytes > 512 MiB` as the RGBA8
   // staging — so `resize` must reject it with a recoverable
-  // `ShapeMismatch` naming the RGBA-expanded byte count, BEFORE the
+  // `CapExceeded` naming the RGBA-expanded byte count, BEFORE the
   // `try_reserve_exact`. The target is tiny (8x8) so the destination
   // guard does NOT fire — this isolates the SOURCE-staging guard.
   let w = 16_384u32;
@@ -945,7 +945,7 @@ fn image_to_array_bgr_swaps_channels_correctly() {
 // `RgbImage` of dimensions whose product overflows `usize` — roughly
 // `u32::MAX * u32::MAX * 3` bytes of decoded pixel data (~50 EB), which
 // is unreachable through the public API. The guard exists to surface
-// the wrap as a recoverable `Error::ShapeMismatch` instead of a silent
+// the wrap as a recoverable `Error::ArithmeticOverflow` instead of a silent
 // `Vec::with_capacity` panic, and is covered by the algebraic
 // `checked_mul` operator itself.
 
@@ -1572,7 +1572,7 @@ fn pad_to_square_rejects_oversized_canvas() {
   // source would drive a 100_000² × 3 ≈ 30 GiB canvas — the prior
   // infallible `RgbImage::from_pixel(size, size, ...)` would
   // vec-overflow / OOM-abort the process. The fallible signature
-  // must surface this as a recoverable `Error::ShapeMismatch`,
+  // must surface this as a recoverable `Error::CapExceeded`,
   // bounded by `MAX_DECODED_IMAGE_BYTES` (matches `load_image`'s 512
   // MiB ceiling).
   //
@@ -2070,7 +2070,7 @@ fn image_to_array_luma8_broadcasts_to_rgb_via_bulk_fill() {
 // ─── P8 / VLM-2 (#125) byte-budget validation regression ─────────────
 
 /// [`resize`] rejects an over-budget target via a typed
-/// [`Error::ShapeMismatch`] BEFORE any allocation — closure regression
+/// [`Error::CapExceeded`] BEFORE any allocation — closure regression
 /// for VLM-2 (#125). Mirrors the audit-table guarantee: a hostile /
 /// mis-configured `ImageProcessorConfig.size` cannot drive a
 /// multi-GiB infallible alloc.

@@ -1426,8 +1426,8 @@ fn format_message_paligemma_extreme_num_images_returns_cap_error() {
   // paligemma → PROMPT_WITH_IMAGE_TOKEN. num_images=1_000_000 must hit
   // the SINGLE_IMAGE_ONLY_MODELS guard FIRST (paligemma is single-
   // image-only, so num_images > 1 short-circuits before the helper's
-  // own cap). Either way the result is `Err(ShapeMismatch)` for the
-  // single-image guard, or `Err(Backend)` had the model not been in
+  // own cap). Either way the result is `Err(OutOfRange)` for the
+  // single-image guard, or `Err(CapExceeded)` had the model not been in
   // SINGLE_IMAGE_ONLY_MODELS. We test the helper cap directly via
   // a non-single-image-only synthetic formatter below.
   let f = MessageFormatter::for_model("paligemma").unwrap();

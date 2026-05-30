@@ -239,8 +239,8 @@ fn update_returns_err_not_kv() {
   // mlx-lm `ArraysCache` has NO `update_and_fetch`: it is a generic slot
   // cache, not K/V. The trait `update` must be a recoverable error.
   // Surfaced as `Error::InvariantViolation` ("unsupported operation"), NOT
-  // `ShapeMismatch`/`RankMismatch` — the condition isn't a wrong-shaped
-  // tensor (Copilot review #3271124426).
+  // a shape-class error — the condition isn't a wrong-shaped tensor
+  // (Copilot review #3271124426).
   let mut c = ArraysCache::new(2);
   let a = slot(&[1.0]);
   let err = c.update(&a, &a).unwrap_err();

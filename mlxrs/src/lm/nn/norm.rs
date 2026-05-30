@@ -593,7 +593,8 @@ impl GroupNorm {
   /// `num_groups=1` would pass as `[C, 1, 1]` and normalize singleton
   /// groups to zero; a checkpoint configured for `dims=4` fed an `[1, 8]`
   /// input would pass the divisibility check but normalize the wrong
-  /// channel count) — surface the misuse as `Err(ShapeMismatch)` instead.
+  /// channel count) — surface the misuse as `Err(`[`Error::RankMismatch`]`)` /
+  /// `Err(`[`Error::LengthMismatch`]`)` / `Err(`[`Error::DivisibilityConstraint`]`)` instead.
   fn validate_input_shape(&self, orig_shape: &[usize]) -> Result<i32> {
     if orig_shape.len() < 2 {
       return Err(crate::error::Error::RankMismatch(RankMismatchPayload::new(

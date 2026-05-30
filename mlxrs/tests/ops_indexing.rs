@@ -54,8 +54,7 @@ fn gather_single_axis_slice_sizes_one() {
 fn gather_rejects_empty_indices() {
   let a = Array::from_slice::<f32>(&[1.0, 2.0], &[2i32]).unwrap();
   let r = ops::indexing::gather(&a, &[], &[], &[1]);
-  // Production now surfaces this guard as the typed `Error::EmptyInput`
-  // variant (migrated from the deprecated free-form `ShapeMismatch`);
+  // Production surfaces this guard as the typed `Error::EmptyInput` variant;
   // assert the variant and that the payload's call-site context label is
   // preserved in the rendered message.
   match r {

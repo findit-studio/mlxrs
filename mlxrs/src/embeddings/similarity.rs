@@ -21,8 +21,9 @@ use crate::{
 use super::{normalize::l2_normalize, scalar_like};
 
 /// Validate the scalar [`cosine_similarity`] rank/length contract *before*
-/// any arithmetic, so a wrong-rank or unequal-length caller gets a
-/// recoverable [`Error::ShapeMismatch`] instead of a *silently broadcast*
+/// any arithmetic, so a wrong-rank caller gets a recoverable
+/// [`Error::RankMismatch`] and an unequal-length caller gets
+/// [`Error::LengthMismatch`] instead of a *silently broadcast*
 /// (mathematically invalid) score. Mirrors the `pooling.rs`
 /// `validate_token_embeddings_*` panic→`Err` precondition style.
 ///
@@ -65,7 +66,7 @@ fn validate_cosine_similarity_vectors(a: &Array, b: &Array) -> Result<()> {
 /// Identical vectors give `≈ 1.0`, orthogonal vectors `≈ 0.0`. Both inputs
 /// must be 1-D with the same length; a non-rank-1 input or an unequal
 /// length (which MLX would otherwise *silently broadcast* into an invalid
-/// score) returns [`Err(Error::ShapeMismatch)`](Error::ShapeMismatch)
+/// score) returns [`Err(Error::LengthMismatch)`](Error::LengthMismatch)
 /// instead. A valid length-0 input (the rank/length validator treats
 /// `(0,)` vs `(0,)` as equal-length rank-1) short-circuits to a finite
 /// `0.0` (the empty-vector contract; no reduction over an empty array).

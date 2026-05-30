@@ -41,7 +41,8 @@ pub const RMS_NORM_EPS: f32 = 1e-5;
 /// Validate the `(token_embeddings, attention_mask)` rank/shape contract
 /// shared by every mask-aware pooling helper *before* any `shape[i]`
 /// indexing, so a wrong-rank caller gets a recoverable
-/// [`Error::ShapeMismatch`] instead of a panic on a safe public API.
+/// [`Error::RankMismatch`] (wrong rank) or [`Error::ShapePairMismatch`]
+/// (shape disagreement) instead of a panic on a safe public API.
 ///
 /// Requires `token_embeddings` rank-3 `(batch, seq_len, hidden)` and
 /// `attention_mask` rank-2 `(batch, seq_len)` with agreeing `batch` and
