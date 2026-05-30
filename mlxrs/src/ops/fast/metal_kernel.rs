@@ -71,9 +71,10 @@ pub enum KernelTemplateArg {
 /// `output_shapes.len()` must equal `output_dtypes.len()`; both must also
 /// equal the number of `output_names` declared when the parent
 /// [`MetalKernel`] was constructed. [`MetalKernel::apply`] enforces these
-/// invariants and returns [`Error::ShapeMismatch`] on violation rather than
-/// passing through to mlx-c (where the failure surfaces only at JIT time
-/// with a less actionable message).
+/// invariants and returns [`Error::LengthMismatch`] (arity mismatch) or
+/// [`Error::EmptyInput`] / [`Error::OutOfRange`] (invalid output shape) on
+/// violation rather than passing through to mlx-c (where the failure
+/// surfaces only at JIT time with a less actionable message).
 ///
 /// The optional `template`, `init_value`, and `verbose` fields default to
 /// empty / `None` / `false` and can be set via the builder methods
@@ -319,7 +320,7 @@ fn cstring_or_err(s: &str, context: &'static str) -> Result<CString> {
 
 /// Checked-conversion of a `[u32; 3]` dispatch dimension to `[i32; 3]` for
 /// the mlx-c `set_grid` / `set_thread_group` FFI. Any component above
-/// `i32::MAX` returns [`Error::Backend`] before the call — without this gate
+/// `i32::MAX` returns [`Error::OutOfRange`] before the call — without this gate
 /// the `as i32` cast would wrap to a negative value, which the Metal backend
 /// would build a corrupt `MTL::Size(gx, gy, gz)` from. `context` is `"grid"`
 /// or `"thread_group"` so the error message identifies which dimension
@@ -408,10 +409,11 @@ impl MetalKernel {
   ///
   /// # Errors
   ///
-  /// Returns [`Error::Backend`] if any of the four string arguments contains
-  /// an interior NUL byte (rejected before reaching mlx-c so the failure
-  /// surfaces as a recoverable [`Error`] rather than as an aborting C++
-  /// exception). Returns [`Error::Backend`] if mlx-c's
+  /// Returns [`Error::InteriorNul`] if any of the four string arguments
+  /// contains an interior NUL byte (rejected before reaching mlx-c so the
+  /// failure surfaces as a recoverable [`Error`] rather than as an aborting C++
+  /// exception). Returns the surfaced mlx-c error (or [`Error::FfiNullHandle`]
+  /// if the handle comes back null with no recorded message) if mlx-c's
   /// `mlx_fast_metal_kernel_new` fails — typically a JIT-compile error on the
   /// user-supplied source.
   pub fn new(
@@ -503,17 +505,28 @@ impl MetalKernel {
   ///
   /// # Errors
   ///
-  /// - [`Error::ShapeMismatch`] if `config.output_shapes.len()` /
+  /// - [`Error::LengthMismatch`] if `config.output_shapes.len()` /
   ///   `config.output_dtypes.len()` disagrees with the declared
   ///   `output_names` count, or if those two `Vec`s disagree with each
   ///   other.
-  /// - [`Error::ShapeMismatch`] if any entry in `config.output_shapes`
-  ///   contains a negative dimension (rejected before mlx-c via
+  /// - [`Error::EmptyInput`] if any entry in `config.output_shapes` is
+  ///   empty (rank-0 / scalar output); [`Error::OutOfRange`] if any
+  ///   entry contains a negative dimension (rejected before mlx-c via
   ///   [`crate::shape::validate_dims`]).
-  /// - [`Error::Backend`] if a template-arg name contains an interior NUL
+  /// - [`Error::InteriorNul`] if a template-arg name contains an interior NUL
   ///   byte (rejected before mlx-c).
-  /// - [`Error::Backend`] if any mlx-c `_set_*` / `_add_*` / `_apply` call
-  ///   reports an error (e.g. a runtime Metal pipeline failure).
+  /// - the surfaced mlx-c boundary error — [`Error::MlxOp`] when the handler
+  ///   parses a recognized bracketed mlx op message (e.g. a `[metal_kernel]`
+  ///   runtime Metal pipeline failure), else the raw [`Error::MlxC`] fallback —
+  ///   if any mlx-c `_set_*` / `_add_*` / `_apply` call reports an error.
+  ///
+  /// # Non-finite inputs (NaN / Inf)
+  ///
+  /// Input element VALUES are not validated or sanitized: NaN / ±Inf entries
+  /// are passed through to the Metal kernel as-is, and the kernel computes on
+  /// them under the IEEE-754 semantics defined by its own source, so non-finite
+  /// inputs may produce non-finite outputs. Only shape / dtype / arity and the
+  /// dispatch-dimension bounds are checked here, never the numeric payload.
   pub fn apply(&self, inputs: &[&Array], config: &MetalKernelApplyConfig) -> Result<Vec<Array>> {
     // ensure_handler_installed() is deferred until AFTER all pure-Rust
     // validation (arity, output_shapes, dispatch-dim overflow) so a wrapper

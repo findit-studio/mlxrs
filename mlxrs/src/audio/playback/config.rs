@@ -137,7 +137,7 @@ pub struct PlaybackConfig {
   buffer_size_frames: Option<u32>,
   /// Maximum queued *FRAMES* (NOT samples) before
   /// [`super::output_stream::AudioOutputStream::write_samples`]
-  /// returns [`crate::error::Error::Backend`]. Bounds memory; bound
+  /// returns [`crate::error::Error::CapExceeded`]. Bounds memory; bound
   /// is enforced in **frames** (one frame = `channels.count()`
   /// interleaved samples). The
   /// [`super::player::AudioPlayer::with_device`] constructor does the
@@ -250,12 +250,12 @@ impl PlaybackConfig {
   }
 
   /// Cpal `StreamConfig` equivalent of `self`. Returns
-  /// [`crate::error::Error::Backend`] if the channel count is zero
+  /// [`crate::error::Error::InvariantViolation`] if the channel count is zero
   /// (cpal would reject the stream build, but we surface a typed
   /// error pre-build).
   ///
   /// # Errors
-  /// - [`crate::error::Error::Backend`] if `self.channels.count() == 0`.
+  /// - [`crate::error::Error::InvariantViolation`] if `self.channels.count() == 0`.
   pub fn cpal_config(&self) -> crate::error::Result<cpal::StreamConfig> {
     let channels = self.channels.count();
     if channels == 0 {

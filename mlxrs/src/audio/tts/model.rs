@@ -85,7 +85,7 @@ pub trait TtsModel {
   /// [`TextProcessor`](super::TextProcessor) hook. The driver passes the
   /// segment text through unchanged; it does not phonemize.
   ///
-  /// Default impl is unsupported (`Err(Error::Backend)`) — every concrete
+  /// Default impl is unsupported (`Err(Error::InvariantViolation)`) — every concrete
   /// TTS model MUST override it, mirroring
   /// [`crate::audio::stt::model::Model::decode_step`]'s
   /// per-model-override default.

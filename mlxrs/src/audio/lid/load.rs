@@ -117,11 +117,13 @@ where
 /// handed to the caller-supplied `constructor` closure (per the
 /// no-per-model-arch rule mlxrs does not bundle a built-in registry).
 ///
-/// Failures (missing dir / missing config / malformed JSON / constructor
-/// error) are recoverable [`Error::Backend`].
+/// Failures are typed: missing dir →
+/// [`Error::MissingKey`](crate::error::Error::MissingKey), hub path →
+/// [`Error::OutOfRange`](crate::error::Error::OutOfRange), malformed JSON →
+/// [`Error::Parse`](crate::error::Error::Parse), constructor
+/// error → caller-defined.
 ///
 /// [lid-utils-loadmodel]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/lid/utils.py#L16-L38
-/// [`Error::Backend`]: crate::Error::Backend
 pub fn load_model<F>(path: &str, constructor: F) -> Result<Box<dyn LidModel>>
 where
   F: FnOnce(LoadedAudioModel) -> Result<Box<dyn LidModel>>,

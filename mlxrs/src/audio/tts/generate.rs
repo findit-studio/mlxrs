@@ -75,7 +75,7 @@ pub const DEFAULT_STREAMING_INTERVAL: f32 = 2.0;
 /// fuzzed multi-MB text blob would otherwise drive the per-segment split
 /// (and every per-model `synthesize_segment` allocation) without bound.
 /// 1 MiB of text is far longer than any realistic single TTS request
-/// (~150k words). Inputs above this return a recoverable [`Error::Backend`]
+/// (~150k words). Inputs above this return a recoverable [`Error::CapExceeded`]
 /// from the [`tts_generate`] constructor, before any segmentation work.
 ///
 /// [stt-cap]: crate::audio::stt::generate::SttGenConfig::max_audio_seconds
@@ -842,7 +842,7 @@ impl AudioChunk {
 /// A "blank" segment (empty or all-whitespace) is dropped, matching
 /// mlx-audio's `[p for p in prompt_text.split(...) if p.strip()]`. An input
 /// that is entirely blank yields an empty `Vec` — [`tts_generate`] turns
-/// that into a recoverable [`Error::Backend`] (it cannot synthesize
+/// that into a recoverable [`Error::EmptyInput`] (it cannot synthesize
 /// silence).
 fn segment_ranges(text: &str, mode: TextSegmentation) -> Vec<(usize, usize)> {
   match mode {
@@ -1057,7 +1057,7 @@ impl<M: TtsModel> Iterator for TtsGenerator<'_, M> {
 /// 1. Reject over-[`MAX_TEXT_BYTES`] input up front (pre-allocation cap).
 /// 2. Split `text` into segments per [`TtsGenConfig::segmentation`]
 ///    (mlx-audio's `split_pattern` split; blank segments dropped). An
-///    all-blank input is a recoverable [`Error::Backend`] — there is
+///    all-blank input is a recoverable [`Error::EmptyInput`] — there is
 ///    nothing to synthesize.
 /// 3. Return a [`TtsGenerator`] iterator; each [`Iterator::next`]
 ///    synthesizes one segment via [`TtsModel::synthesize_segment`] and

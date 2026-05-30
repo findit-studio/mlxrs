@@ -81,7 +81,7 @@ pub trait Model: crate::lm::model::Model {
   /// [`super::generate::stt_generate`] loop normalizes via the LM's exact
   /// `logits - logsumexp` and samples via the LM's sampler chain.
   ///
-  /// Default impl is unsupported (`Err(Error::Backend)`) — every concrete
+  /// Default impl is unsupported (`Err(Error::InvariantViolation)`) — every concrete
   /// STT model MUST override it. The trait does **not** route through
   /// [`crate::lm::model::Model::forward`] because the STT decode step's
   /// signature is fundamentally different (a single token id + the encoder

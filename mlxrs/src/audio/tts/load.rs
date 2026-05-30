@@ -84,12 +84,14 @@ pub const MODEL_REMAPPING: &[(&str, &str)] = &[
 /// rejected by [`crate::audio::load::get_model_path`] with a clear
 /// no-network message).
 ///
-/// Failures (missing dir / missing config / malformed JSON / constructor
-/// error) are recoverable [`Error::Backend`].
+/// Failures are typed: missing dir →
+/// [`Error::MissingKey`](crate::error::Error::MissingKey), hub path →
+/// [`Error::OutOfRange`](crate::error::Error::OutOfRange), malformed JSON →
+/// [`Error::Parse`](crate::error::Error::Parse), constructor
+/// error → caller-defined.
 ///
 /// [tts-utils-loadmodel]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/tts/utils.py#L98-L127
 /// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
-/// [`Error::Backend`]: crate::Error::Backend
 pub fn load_model<F>(path: &str, constructor: F) -> Result<Box<dyn TtsModel>>
 where
   F: FnOnce(LoadedAudioModel) -> Result<Box<dyn TtsModel>>,

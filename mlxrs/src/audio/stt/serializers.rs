@@ -676,7 +676,7 @@ pub fn format_vtt_timestamp(seconds: f64) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Backend`] when the destination file cannot be created
+/// Returns [`Error::FileIo`] when the destination file cannot be created
 /// (permission, missing directory, …) or any byte cannot be written
 /// (`ENOSPC`, broken pipe, …). The destination directory is **not** auto-
 /// created — that's the caller's responsibility (mlx-audio's
@@ -730,7 +730,7 @@ fn save_as_txt_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::i
 
 /// Stdout-branch delegate for [`save_as_txt`] — writes the TXT body via
 /// [`save_as_txt_to_writer`] AND explicitly flushes the writer, surfacing
-/// either failure as [`Error::Backend`]. Factored out of [`save_as_txt`] so
+/// either failure as [`Error::FileIo`]. Factored out of [`save_as_txt`] so
 /// the flush-error path is unit-testable without going through a real
 /// stdout fd (the test substitutes a flush-failing writer).
 ///
@@ -739,7 +739,7 @@ fn save_as_txt_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::i
 /// newline, so without an explicit flush the final bytes can sit in the
 /// stdout buffer past `save_as_txt`'s return (especially on
 /// redirect-to-file / redirect-to-pipe). Mirror the file branch's explicit
-/// `BufWriter::flush()` and surface failures as `Error::Backend`
+/// `BufWriter::flush()` and surface failures as [`Error::FileIo`]
 /// (broken-pipe, `ENOSPC` on the receiving end, ...).
 fn save_as_txt_stdout<W: Write>(transcript: &Transcript, w: &mut W) -> Result<()> {
   save_as_txt_to_writer(transcript, w).map_err(|e| {
@@ -845,7 +845,7 @@ fn save_as_srt_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::i
 
 /// Stdout-branch delegate for [`save_as_srt`] — writes the SRT body via
 /// [`save_as_srt_to_writer`] AND explicitly flushes the writer, surfacing
-/// either failure as [`Error::Backend`]. See
+/// either failure as [`Error::FileIo`]. See
 /// [`save_as_txt_stdout`] for the buffered-stdout rationale; the SRT body
 /// ends with `\n\n` after the last cue but the partial bytes can still sit
 /// in the stdout buffer when redirected, so the explicit flush is required.
@@ -953,7 +953,7 @@ fn save_as_vtt_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::i
 
 /// Stdout-branch delegate for [`save_as_vtt`] — writes the VTT body via
 /// [`save_as_vtt_to_writer`] AND explicitly flushes the writer, surfacing
-/// either failure as [`Error::Backend`]. See
+/// either failure as [`Error::FileIo`]. See
 /// [`save_as_txt_stdout`] for the buffered-stdout rationale; the VTT body
 /// (including the `WEBVTT\n\n` header + every cue block) is pushed past
 /// the stdout buffer before [`save_as_vtt`] returns.
@@ -1023,7 +1023,7 @@ fn save_as_vtt_stdout<W: Write>(transcript: &Transcript, w: &mut W) -> Result<()
 ///
 /// # Errors
 ///
-/// Returns [`Error::Backend`] for any file-creation / write / flush /
+/// Returns [`Error::FileIo`] for any file-creation / write / flush /
 /// serialization failure; the destination is left untouched on
 /// pre-serialization errors and may be partially written on a mid-write
 /// I/O failure (matching `save_as_txt` / `save_as_srt` / `save_as_vtt` —
@@ -1074,7 +1074,7 @@ pub fn save_as_json(transcript: &Transcript, path: &Path) -> Result<()> {
 /// `serde_json::Error` is folded into [`std::io::Error`] via
 /// [`std::io::Error::other`] so the writer-facing signature mirrors the
 /// txt/srt/vtt helpers; the outer [`save_as_json`] re-wraps into
-/// [`Error::Backend`] uniformly.
+/// [`Error::FileIo`] uniformly.
 fn save_as_json_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::io::Result<()> {
   // Build the python-shaped Value tree. We do NOT just `serde_json::to_value`
   // on `Transcript` directly because the python shape differs from
@@ -1096,7 +1096,7 @@ fn save_as_json_to_writer<W: Write>(transcript: &Transcript, w: &mut W) -> std::
 
 /// Stdout-branch delegate for [`save_as_json`] — writes the JSON body via
 /// [`save_as_json_to_writer`] AND explicitly flushes the writer, surfacing
-/// either failure as [`Error::Backend`]. See
+/// either failure as [`Error::FileIo`]. See
 /// [`save_as_txt_stdout`] for the buffered-stdout rationale; the JSON body
 /// ends with `\n}` (the trailing close-brace, NOT a final newline) which
 /// is never a flush trigger on a line-buffered tty, and is held in the
@@ -1473,7 +1473,7 @@ mod tests {
   ///   relying on the writer's drop).
   /// - `fail_flush = true` → returns [`io::Error::other`] from `.flush()`.
   ///   Used by the per-format `*_stdout_flush_failure_surfaces_as_backend_error`
-  ///   tests to assert the flush-error path surfaces as [`Error::Backend`]
+  ///   tests to assert the flush-error path surfaces as [`Error::FileIo`]
   ///   with the `"stdout flush failed"` marker.
   struct FailingFlushWriter {
     buf: Vec<u8>,

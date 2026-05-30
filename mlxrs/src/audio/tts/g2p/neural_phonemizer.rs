@@ -53,7 +53,7 @@ use crate::{
 /// transformer, &c.) is supplied by user code through the `convert`
 /// closure; mlxrs supplies the post-processing (trim + drop whitespace +
 /// split into per-glyph [`PhonemeUnit`]s) and the error handling (empty
-/// model output → [`Error::Backend`] with the offending grapheme), both
+/// model output → [`Error::OutOfRange`] with the offending grapheme), both
 /// matching the swift impl 1:1.
 ///
 /// The `language` field is the locale code threaded through to the

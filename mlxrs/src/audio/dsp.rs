@@ -138,7 +138,7 @@ const COVERAGE_EPS: f32 = 1e-10;
 ///   faithful inverse (the forward transform discards / distorts boundary
 ///   information, so the reconstruction is wrong even where the window-sum is
 ///   nonzero), so [`istft`] rejects `win_length != n_fft` under Right with a
-///   recoverable [`Error::Backend`]. Use [`WindowPad::Center`] for short-window
+///   recoverable [`Error::OutOfRange`]. Use [`WindowPad::Center`] for short-window
 ///   inversion.
 /// - [`WindowPad::Center`] places the window as `[zeros(pad_low), w,
 ///   zeros(pad_high)]` with `pad_low = (n_fft - win_length) / 2` and
@@ -420,16 +420,13 @@ impl Spectrum {
   /// check that [`stft`] enforces on the producer side is re-enforced here.
   ///
   /// # Errors
-  /// Returns a recoverable [`Error::Backend`] when:
-  /// - `data` is not 2-D (must be `(num_frames, n_freqs)`),
-  /// - `n_fft == 0` or `n_fft` is **odd** (the one-sided spectrum cannot be
-  ///   inverted unambiguously — see [`Spectrum`] / [`stft`]),
-  /// - `data`'s last dimension `!= n_fft / 2 + 1` (the bin count does not
-  ///   match the declared `n_fft`),
-  /// - `hop_length == 0` or `win_length == 0`,
-  /// - `win_length > n_fft` (the window cannot exceed the irfft frame),
-  /// - `num_frames == 0`,
-  /// - `data`'s dtype is not [`Dtype::Complex64`](crate::Dtype::Complex64).
+  /// Returns typed errors when:
+  /// - `data` is not 2-D → [`Error::RankMismatch`],
+  /// - `n_fft == 0`, `hop_length == 0`, `win_length == 0`, or `num_frames == 0`
+  ///   → [`Error::InvariantViolation`],
+  /// - `data`'s last dimension `!= n_fft / 2 + 1` → [`Error::LengthMismatch`],
+  /// - `n_fft` is **odd** or `win_length > n_fft` → [`Error::OutOfRange`],
+  /// - `data`'s dtype is not `Complex64` → [`Error::DtypeMismatch`].
   ///
   /// Note this does **not** itself reject [`WindowPad::Right`] with
   /// `win_length < n_fft`: such a spectrum is a perfectly valid forward
@@ -537,8 +534,9 @@ impl Spectrum {
 /// `caller` only flavors the error message prefix.
 ///
 /// # Errors
-/// - [`Error::Backend`] if `w` is not 1-D, its length is not exactly
-///   `win_length`, `win_length > n_fft`, or a pad extent exceeds `i32::MAX`.
+/// - [`Error::RankMismatch`] if `w` is not 1-D, [`Error::LengthMismatch`] if its
+///   length is not exactly `win_length`, [`Error::OutOfRange`] if `win_length > n_fft`
+///   or a pad extent exceeds `i32::MAX`.
 fn place_window(
   caller: &'static str,
   w: &Array,
@@ -756,13 +754,13 @@ fn symmetric_window(
 /// Matches `mlx_audio.dsp.hanning(n, periodic=False)` (the STFT default).
 ///
 /// # Errors
-/// - Returns [`Error::Backend`] when `n < 2`. The reference Python form
+/// - Returns [`Error::OutOfRange`] when `n < 2`. The reference Python form
 ///   would divide by zero for `n == 1` (silently producing `NaN`); we
 ///   reject upfront. `n == 0` would produce an empty zero-length window
 ///   which is never useful for spectral analysis.
-/// - Returns [`Error::Backend`] when `n` exceeds the
-///   [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) cap or
-///   `i32::MAX`, or if the backing allocation fails.
+/// - Returns [`Error::CapExceeded`] when `n` exceeds the
+///   [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) cap;
+///   [`Error::OutOfRange`] if `n > i32::MAX`; or if the backing allocation fails.
 pub fn hann_window(n: usize) -> Result<Array> {
   symmetric_window(
     "hann_window",
@@ -830,7 +828,7 @@ pub fn bartlett_window(n: usize) -> Result<Array> {
 /// All windows are the symmetric (`periodic=False`) form, as in `mlx-audio`.
 ///
 /// # Errors
-/// - [`Error::Backend`] for an unknown window name (mirrors the reference's
+/// - [`Error::UnknownEnumValue`] for an unknown window name (mirrors the reference's
 ///   `ValueError(f"Unknown window function: {window}")`).
 /// - Propagates the constructor errors of the selected window (see
 ///   [`hann_window`]).
@@ -858,7 +856,7 @@ pub fn window_from_name(name: &str, n: usize) -> Result<Array> {
 /// the python reference uses).
 ///
 /// # Errors
-/// - [`Error::Backend`] if `padding > samples_len - 1` (not enough samples
+/// - [`Error::OutOfRange`] if `padding > samples_len - 1` (not enough samples
 ///   to reflect — would require `samples[len-padding-1]` which underflows
 ///   for `padding >= len`). The reference Python form would index out of
 ///   bounds and return a malformed array.
@@ -941,7 +939,7 @@ fn reflect_pad_1d(samples: &Array, padding: usize) -> Result<Array> {
     // `len_i32` can be exactly `i32::MAX` (when `padding = i32::MAX - 1`,
     // `len = i32::MAX`). `len_i32 + 1` then overflows. Compute the
     // sentinel in `i64` and reject the (vanishingly rare) overflow as a
-    // recoverable `Error::Backend` rather than debug-panicking / wrapping.
+    // recoverable `Error::OutOfRange` rather than debug-panicking / wrapping.
     let sentinel_i64 = -(i64::from(len_i32) + 1);
     i32::try_from(sentinel_i64).map_err(|_| {
       Error::OutOfRange(OutOfRangePayload::new(
@@ -994,8 +992,9 @@ fn reflect_pad_1d(samples: &Array, padding: usize) -> Result<Array> {
 /// **Work cap.** Before building the strided frame view, the window multiply,
 /// or the rfft, `stft` computes `num_frames`, the frame element count
 /// `num_frames * n_fft`, and the output element count `num_frames * (n_fft/2 +
-/// 1)` with checked arithmetic and rejects (recoverable [`Error::Backend`]) any
-/// combination that overflows or exceeds `MAX_STFT_WORK`. A lazily-shaped huge
+/// 1)` with checked arithmetic and rejects (recoverable [`Error::CapExceeded`] /
+/// [`Error::ArithmeticOverflow`]) any combination that overflows or exceeds
+/// `MAX_STFT_WORK`. A lazily-shaped huge
 /// input (e.g. 64 Mi samples with `n_fft = 1024, hop = 1`) is rejected before
 /// any allocation, so it cannot drive a multi-GB framing/FFT allocation.
 ///
@@ -1020,23 +1019,12 @@ fn reflect_pad_1d(samples: &Array, padding: usize) -> Result<Array> {
 /// ([`Spectrum::from_parts`] enforces the same on external spectra).
 ///
 /// # Errors
-/// - [`Error::Backend`] when:
-///   - `samples` is not 1-D,
-///   - `n_fft == 0`, `hop_length == 0`, or `win_length == 0`,
-///   - `n_fft` is odd (the one-sided spectrum cannot be inverted
-///     unambiguously; see above and [`istft`]),
-///   - `win_length > n_fft`,
-///   - the input sample count, or the padded length `samples_len + n_fft`,
-///     exceeds the [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES)
-///     budget (a lazily-shaped huge input is rejected before the reflect pad,
-///     regardless of `hop_length`),
-///   - the post-pad sample count is too short to fit a single frame
-///     (matches the reference's `Input is too short` raise),
-///   - the frame work `num_frames * n_fft` or output element count
-///     `num_frames * (n_fft / 2 + 1)` overflows `usize` or exceeds
-///     `MAX_STFT_WORK` (a lazily-shaped huge input is rejected before any
-///     allocation),
-///   - any size exceeds `i32::MAX`.
+/// - Typed errors: [`Error::RankMismatch`] if `samples` is not 1-D;
+///   [`Error::InvariantViolation`] if `n_fft == 0`, `hop_length == 0`, or
+///   `win_length == 0`; [`Error::OutOfRange`] if `n_fft` is odd, `win_length
+///   > n_fft`, the post-pad count is too short, or any size exceeds `i32::MAX`;
+///   [`Error::CapExceeded`] if the input/padded length or frame work exceeds
+///   the cap; [`Error::ArithmeticOverflow`] if frame work overflows `usize`.
 pub fn stft(
   samples: &Array,
   n_fft: usize,
@@ -1442,7 +1430,7 @@ pub fn stft_with_config(
 ///   distorts boundary information, so the reconstruction is wrong even where
 ///   the window-sum is nonzero. [`istft`] therefore **rejects** a [`Spectrum`]
 ///   whose `window_pad` is Right with `win_length != n_fft` up front with a
-///   recoverable [`Error::Backend`] (such a [`Spectrum`] is a valid forward
+///   recoverable [`Error::OutOfRange`] (such a [`Spectrum`] is a valid forward
 ///   transform — it is what the mel front-end produces — only its *inverse* is
 ///   non-faithful). Use [`WindowPad::Center`] for short-window inversion.
 ///
@@ -1460,7 +1448,7 @@ pub fn stft_with_config(
 /// returned after the center-trim and `length` are applied) must have a
 /// window-sum `> COVERAGE_EPS` (`1e-10`). If any requested sample's
 /// window-sum is negligible, the un-normalized overlap-add value there is
-/// meaningless, so [`istft`] returns a recoverable [`Error::Backend`] naming
+/// meaningless, so [`istft`] returns a recoverable [`Error::OutOfRange`] naming
 /// the offending output index and parameters instead of silently emitting
 /// that corrupt sample. For supported configurations ([`WindowPad::Center`]
 /// any `win_length`, or [`WindowPad::Right`] with `win_length == n_fft`) the
@@ -1487,22 +1475,11 @@ pub fn stft_with_config(
 /// Returns the reconstructed 1-D real signal (`Dtype::F32`).
 ///
 /// # Errors
-/// - [`Error::Backend`] when:
-///   - the [`Spectrum`]'s `window_pad` is [`WindowPad::Right`] and
-///     `win_length != n_fft` (short-window right-pad inversion is not a
-///     faithful inverse — rejected up front; use [`WindowPad::Center`]),
-///   - **the coverage guard fires** — some requested output sample has a
-///     window-sum `<= COVERAGE_EPS` (a supported config should never trigger
-///     this; if it does it is a real reconstruction bug),
-///   - any derived size overflows `usize`/`i32`, the OLA output length `t`
-///     exceeds the
-///     [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) cap, or
-///     the real scatter workload `num_frames * n_fft` exceeds an internal
-///     work cap (`MAX_OLA_WORK`, checked before any allocation/broadcast —
-///     guards against small-hop combinations whose work explodes far past
-///     `t`),
-///   - the `length` trim is out of range (with `center = true`,
-///     `n_fft/2 + length > t`; with `center = false`, `length > t`).
+/// - Typed errors: [`Error::OutOfRange`] if `window_pad` is Right with
+///   `win_length != n_fft`, the coverage guard fires, sizes exceed `i32::MAX`,
+///   or the `length` trim is out of range;
+///   [`Error::CapExceeded`] if the OLA length or scatter work exceeds the cap;
+///   [`Error::ArithmeticOverflow`] if derived sizes overflow `usize`.
 /// - Propagates window-construction errors from `frame_window` (the shared
 ///   symmetric-Hann builder).
 ///
@@ -1988,15 +1965,15 @@ impl ISTFTCache {
   /// The **same error surface as [`istft`], including its coverage guard** (this
   /// path caches the raw window-sum and reproduces the guard exactly rather than
   /// flooring — see the [`ISTFTCache`] type docs):
-  /// - [`Error::Backend`] when the [`Spectrum`]'s `window_pad` is
+  /// - [`Error::OutOfRange`] when the [`Spectrum`]'s `window_pad` is
   ///   [`WindowPad::Right`] and `win_length != n_fft` (short-window right-pad
   ///   inversion is not a faithful inverse — rejected up front),
-  /// - [`Error::Backend`] when a derived size overflows `usize` / `i32`, the
-  ///   OLA length `t` exceeds the
+  /// - [`Error::ArithmeticOverflow`] / [`Error::CapExceeded`] when a derived
+  ///   size overflows `usize` / `i32`, the OLA length `t` exceeds the
   ///   [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) cap, or
   ///   the scatter work `num_frames * n_fft` exceeds `MAX_OLA_WORK`,
-  /// - [`Error::Backend`] when the `length` trim is out of range,
-  /// - [`Error::Backend`] when the **coverage guard** fires — a requested output
+  /// - [`Error::OutOfRange`] when the `length` trim is out of range,
+  /// - [`Error::OutOfRange`] when the **coverage guard** fires — a requested output
   ///   sample has window-sum `<= COVERAGE_EPS` (a `center=true` length reaching
   ///   into the zero-coverage tail, or a `center=false` head/tail). Identical to
   ///   the free [`istft`]; should never fire for a supported config,
@@ -2341,11 +2318,9 @@ fn mel_to_hz(mel: f32) -> f32 {
 /// `sample_rate as f32 / 2.0` would drift by 0.5 for odd sample rates).
 ///
 /// # Errors
-/// - [`Error::Backend`] when:
-///   - `n_fft == 0`,
-///   - `n_mels == 0` (no filters requested),
-///   - `f_min < 0` or `f_max <= f_min`,
-///   - any size exceeds `i32::MAX`.
+/// - Typed errors: [`Error::InvariantViolation`] if `n_fft == 0` or `n_mels == 0`;
+///   [`Error::OutOfRange`] if `f_min < 0`, `f_max <= f_min`, or sizes exceed `i32::MAX`;
+///   [`Error::AllocFailure`] if the filter-bank reservation fails.
 pub fn mel_filter_bank(
   n_mels: usize,
   n_fft: usize,
@@ -2466,13 +2441,10 @@ pub fn mel_filter_bank(
   // Logged in docs/rust-golden-standard-followups.md (AUDIO-2).
   //
   // Use `try_reserve_exact` so a multi-GB request from a forged input
-  // returns a recoverable `Error::Backend` rather than aborting on the
+  // returns a recoverable `Error::AllocFailure` rather than aborting on the
   // allocator's OOM panic (Rust's default behavior is to abort, not
   // unwind, on allocation failure — `Vec::with_capacity` and `vec![]`
   // share that abort path).
-  // Use `try_reserve_exact` so a multi-GB request from a forged input
-  // returns a recoverable `Error::Backend` rather than aborting on the
-  // allocator's OOM panic.
   let mut bank: Vec<f32> = Vec::new();
   bank.try_reserve_exact(bank_len).map_err(|e| {
     Error::AllocFailure(AllocFailurePayload::new(
@@ -2617,7 +2589,7 @@ pub fn mel_filter_bank_cached(
   }
 
   // Miss: build via the uncached path. The construction can fail with a
-  // recoverable `Error::Backend` (invalid params, work cap, etc.); we
+  // recoverable typed error (invalid params, work cap, etc.); we
   // propagate that error WITHOUT touching the cache, so a failed call
   // cannot poison the cache with an absent or invalid entry.
   let bank = mel_filter_bank(n_mels, n_fft, sample_rate, f_min, f_max)?;
@@ -2801,7 +2773,7 @@ pub fn log_mel_spectrogram_with(
 /// window family (see
 /// [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES)): a
 /// caller-controllable `data` length above the cap returns a recoverable
-/// [`Error::Backend`] instead of risking a multi-GB CPU allocation for the
+/// [`Error::CapExceeded`] instead of risking a multi-GB CPU allocation for the
 /// `f64` state buffer + output `Vec`.
 const MAX_LFILTER_SAMPLES: usize = crate::audio::io::MAX_DECODED_SAMPLES;
 
@@ -2818,7 +2790,7 @@ const MAX_LFILTER_SAMPLES: usize = crate::audio::io::MAX_DECODED_SAMPLES;
 /// streaming per-channel path keeps the peak working set bounded by
 /// `raw_f32 + 1 channel's f64 K-weighted buffer` (no de-interleaved-AND-
 /// weighted-full-channel duplication). Above the cap returns a recoverable
-/// [`Error::Backend`].
+/// [`Error::CapExceeded`].
 const MAX_LOUDNESS_SAMPLES: usize = crate::audio::io::MAX_DECODED_SAMPLES;
 
 /// Hard byte ceiling on the per-channel `f64` mean-square matrix
@@ -2835,7 +2807,7 @@ const MAX_LOUDNESS_SAMPLES: usize = crate::audio::io::MAX_DECODED_SAMPLES;
 /// caller distributes the (`num_blocks`, `n_channels`) product, and the
 /// gate-index iteration that re-reads the same matrix never sees more
 /// cells than this byte budget allows. Pathological overlaps return a
-/// recoverable [`Error::Backend`] BEFORE any allocation.
+/// recoverable [`Error::CapExceeded`] BEFORE any allocation.
 const MAX_LOUDNESS_BLOCK_BYTES: usize = 64 * 1024 * 1024;
 /// Hard ceiling on the **total sample-visit work** [`integrated_loudness`]
 /// performs across the per-block mean-square loop: `num_blocks *
@@ -2860,7 +2832,7 @@ const MAX_LOUDNESS_BLOCK_BYTES: usize = 64 * 1024 * 1024;
 /// mono ≈ 91 hours of audio, or ~2,730 5-channel blocks ≈ 18 hours of
 /// 5-channel audio — comfortable for any realistic loudness analysis,
 /// but rejects multi-trillion-visit pathological cases in microseconds).
-/// Pathological work returns a recoverable [`Error::Backend`] BEFORE
+/// Pathological work returns a recoverable [`Error::CapExceeded`] BEFORE
 /// the per-block loop.
 const MAX_LOUDNESS_WORK: usize = 256 * 1024 * 1024;
 
@@ -2904,13 +2876,11 @@ const BS1770_MAX_CHANNELS: usize = 5;
 /// `y[n-1..]`, so an mlx graph cannot express it as element-wise ops.
 ///
 /// # Errors
-/// - [`Error::Backend`] when:
-///   - `a` is empty,
-///   - `a[0] == 0` (the denominator's leading coefficient cannot be zero),
-///   - `data` is not 1-D,
-///   - `data`'s sample count exceeds the shared
-///     [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) cap,
-///   - any size exceeds `i32::MAX`.
+/// - [`Error::EmptyInput`] if `a` is empty,
+///   [`Error::InvariantViolation`] if `a[0] == 0`,
+///   [`Error::RankMismatch`] if `data` is not 1-D,
+///   [`Error::CapExceeded`] if `data`'s sample count exceeds the cap,
+///   [`Error::OutOfRange`] if sizes exceed `i32::MAX`.
 ///
 /// The reference returns `np.zeros_like(data)` when `b` is empty; we mirror
 /// that.
@@ -2995,12 +2965,10 @@ pub fn lfilter(b: &[f64], a: &[f64], data: &Array) -> Result<Array> {
 /// the split they were lost via the public `lfilter`'s f32 boundary.
 ///
 /// # Errors
-/// - [`Error::Backend`] when:
-///   - `a` is empty,
-///   - `a[0] == 0` (the denominator's leading coefficient cannot be zero),
-///   - `x.len()` exceeds the shared
-///     [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) cap
-///     (mirrors the public [`lfilter`]'s element budget).
+/// - [`Error::EmptyInput`] if `a` is empty,
+///   [`Error::InvariantViolation`] if `a[0] == 0`,
+///   [`Error::CapExceeded`] if `x.len()` exceeds the cap
+///   (mirrors the public [`lfilter`]'s element budget).
 ///
 /// The reference returns `np.zeros_like(data)` when `b` is empty; we mirror
 /// that.
@@ -3191,12 +3159,10 @@ fn lfilter_f64(b: &[f64], a: &[f64], x: &[f64]) -> Result<Vec<f64>> {
 /// chain-call boundary).
 ///
 /// # Errors
-/// - [`Error::Backend`] when:
-///   - `a` is empty,
-///   - `a[0] == 0` (the denominator's leading coefficient cannot be zero),
-///   - `x.len()` exceeds the shared
-///     [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) cap
-///     (mirrors [`lfilter_f64`]'s element budget).
+/// - [`Error::EmptyInput`] if `a` is empty,
+///   [`Error::InvariantViolation`] if `a[0] == 0`,
+///   [`Error::CapExceeded`] if `x.len()` exceeds the cap
+///   (mirrors [`lfilter_f64`]'s element budget).
 ///
 /// `b` empty mirrors [`lfilter_f64`]'s "zero-output" semantics by writing
 /// zeros into `x` (the in-place equivalent of returning `np.zeros_like`).
@@ -3536,31 +3502,17 @@ fn k_weight_channel(channel: &[f32], rate: u32) -> Result<Vec<f64>> {
 /// `divide` warning rather than raising).
 ///
 /// # Errors
-/// - [`Error::Backend`] when:
-///   - `data` is not 1-D or 2-D,
-///   - the 2-D case has more than 5 channels (BS.1770 only defines channel
-///     gains up to surround 5.0),
-///   - the input is shorter than `block_size * rate` samples (matches the
-///     reference's `Audio must have length greater than the block size`
-///     raise),
-///   - `rate == 0`, `block_size <= 0`, or `overlap` is not in `[0, 1)`,
-///   - the **total element count** `n_samples * n_channels` exceeds the
-///     shared
-///     [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) cap
-///     (the cap is on the materialized buffer the `to_vec` reads — not
-///     just the per-channel sample count — so 2-D inputs like
-///     `(MAX_DECODED_SAMPLES, 5)` can't bypass it),
-///   - the per-channel `f64` mean-square matrix would exceed the
-///     `MAX_LOUDNESS_BLOCK_BYTES` byte cap (64 MiB), OR the total
-///     per-block sum work `num_blocks * ceil(block_size_samples) *
-///     n_channels` exceeds the `MAX_LOUDNESS_WORK` sample-visit cap
-///     (256 Mi) — together these reject pathological overlaps very
-///     close to 1 BEFORE any `num_blocks`-scaled allocation OR the
-///     per-block loop runs (the byte cap dominates for normal block
-///     sizes; the visit cap catches near-1 overlaps with small block
-///     sizes that fit under the byte cap but multiply the per-block CPU
-///     sum work — once per channel, since the per-block loop runs once
-///     per channel — to multi-trillion visits),
+/// - Typed errors: [`Error::RankMismatch`] if `data` is not 1-D or 2-D;
+///   [`Error::OutOfRange`] if channels > 5, `rate == 0`, `block_size <= 0`,
+///   `overlap` not in `[0, 1)`, or input shorter than one block;
+///   [`Error::CapExceeded`] if the total element count, block-byte budget,
+///   or sample-visit work exceeds the respective cap (these reject pathological
+///   overlaps BEFORE any `num_blocks`-scaled allocation or the per-block loop
+///   runs (the byte cap dominates for normal block
+///   sizes; the visit cap catches near-1 overlaps with small block
+///   sizes that fit under the byte cap but multiply the per-block CPU
+///   sum work — once per channel, since the per-block loop runs once
+///   per channel — to multi-trillion visits),
 ///   - the number of blocks overflows `usize`,
 ///   - any size exceeds `i32::MAX`.
 ///
@@ -4088,10 +4040,9 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
 /// ```
 ///
 /// # Errors
-/// - [`Error::Backend`] when:
-///   - `input_loudness` or `target_loudness` is non-finite (NaN/+-inf would
-///     yield a non-finite gain, silently corrupting the output),
-///   - the input multiply propagates a backend error.
+/// - [`Error::OutOfRange`] if `input_loudness` or `target_loudness` is
+///   non-finite (NaN/±inf would yield a non-finite gain), or propagated
+///   errors from the underlying multiply.
 pub fn normalize_loudness(
   data: &Array,
   input_loudness: f64,
@@ -4143,19 +4094,10 @@ pub fn normalize_loudness(
 /// mlxrs audio surface).
 ///
 /// # Errors
-/// - [`Error::Backend`] when:
-///   - `target_peak_db` is non-finite (`NaN` / `±inf` — would yield a
-///     non-finite gain, silently corrupting the output),
-///   - `data` is empty (`max` over an empty array is undefined),
-///   - the current peak `max(|data|)` is `0.0` (an all-silence input cannot be
-///     peak-normalized — the gain would divide by zero) or non-finite (a
-///     `NaN` / `inf` sample in the input),
-///   - the linear target `10^(target_peak_db / 20)` is non-finite (a finite but
-///     enormous `target_peak_db` overflows the f32 amplitude), or the resulting
-///     `gain = target_linear / current_peak` is non-finite (a finite target
-///     divided by a subnormal nonzero peak overflows) — either would scale the
-///     signal into non-finite samples,
-///   - the underlying `abs` / `max` / multiply propagates a backend error.
+/// - [`Error::OutOfRange`] if `target_peak_db` is non-finite or `current_peak
+///   == 0.0`; [`Error::EmptyInput`] if `data` is empty;
+///   [`Error::NonFiniteScalar`] if the current peak or computed gain is
+///   non-finite; propagated errors from underlying `abs` / `max` / multiply.
 ///
 /// This reads back one scalar (the current peak) via an explicit `eval`.
 pub fn normalize_peak(data: &Array, target_peak_db: f64) -> Result<Array> {
@@ -4292,7 +4234,7 @@ mod tests {
     // (size - 1)))` divides by zero for `size == 1`, silently producing
     // `NaN` for every sample. mlxrs centralizes the rejection in
     // `symmetric_window` so EVERY window function (Hann / Hamming /
-    // Blackman / Bartlett) returns a recoverable `Error::Backend` for
+    // Blackman / Bartlett) returns a recoverable `Error::OutOfRange` for
     // both `n == 0` (empty window — pointless) and `n == 1` (denom = 0
     // — silent NaN in the reference). The cross-product is exhaustively
     // exercised below to lock the contract for all four window families.
@@ -5037,8 +4979,8 @@ mod tests {
     assert_eq!(y, vec![0.0_f32; 4]);
   }
 
-  /// `a` empty / `a[0] == 0` / non-1-D input must all be rejected with
-  /// `Error::Backend`, matching the reference's `ValueError` raises. (Note:
+  /// `a` empty / `a[0] == 0` / non-1-D input must all be rejected with typed
+  /// errors, matching the reference's `ValueError` raises. (Note:
   /// **empty `b`** is NOT a rejection — the reference returns
   /// `np.zeros_like(data)` and we mirror that fast-path; see
   /// `lfilter_empty_b_returns_zeros` for that case.)
@@ -5069,7 +5011,7 @@ mod tests {
   /// any `to_vec` materialization. We construct a lazy `Array::zeros` of
   /// `(MAX_LFILTER_SAMPLES + 1,)` f32 — which mlx does not eval until a
   /// data accessor runs — and assert `lfilter` rejects it with
-  /// `Error::Backend`. If the cap check still lived behind the `to_vec`
+  /// `Error::CapExceeded`. If the cap check still lived behind the `to_vec`
   /// (the pre-fix behavior), the rejected call would have first
   /// materialized `(MAX_LFILTER_SAMPLES + 1) * 4 bytes` (≈256 MiB) of f32
   /// plus a second `(MAX_LFILTER_SAMPLES + 1) * 8 bytes` (≈512 MiB) f64
