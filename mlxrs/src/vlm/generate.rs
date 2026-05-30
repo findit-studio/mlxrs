@@ -282,9 +282,10 @@ impl VlmGenConfig {
 ///
 /// - `Error::Backend` on image load / preprocess / encode failures (the
 ///   path's I/O / decode error propagates).
-/// - `Error::ShapeMismatch` on a span/embed/dim contract violation in
-///   [`Model::merge_embeddings`].
-/// - `Error::ShapeMismatch` on a per-image encoder output that is not
+/// - `Error::RankMismatch` / `Error::LengthMismatch` / `Error::EmptyInput`
+///   on a span/embed/dim contract violation in [`Model::merge_embeddings`].
+/// - `Error::RankMismatch` (wrong ndim) or `Error::LengthMismatch` (wrong
+///   row count) on a per-image encoder output that is not
 ///   `[cfg.num_tokens_per_image, D]` — every image MUST emit exactly
 ///   `num_tokens_per_image` feature rows, enforced per-image BEFORE
 ///   the slabs are concatenated (the cross-model splice contract; a
@@ -441,7 +442,7 @@ pub fn vlm_generate<'a, M: Model + ?Sized>(
   // widths == total rows" check (both = 6) but cause silent
   // marker-to-image misalignment (the first prompt span would consume
   // 2 rows from image 1 plus 1 row from image 2). Surface as
-  // `Error::ShapeMismatch` instead.
+  // `Error::LengthMismatch` instead.
   //
   // Image preprocessing uses the caller-supplied `image_processor_config`
   // — NOT `model.image_processor_config()`. mlx-vlm's `generate` /

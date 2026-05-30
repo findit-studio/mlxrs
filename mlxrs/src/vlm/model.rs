@@ -100,16 +100,17 @@ pub trait Model: crate::lm::model::Model {
   ///
   /// # Errors
   ///
-  /// - `Error::ShapeMismatch` if `text_embeds` is not rank-3 `[1, T, D]`,
-  ///   `image_embeds` is not rank-2 `[N, D]`, or the `D` dims differ.
-  /// - `Error::ShapeMismatch` if the sum of all span widths
+  /// - `Error::RankMismatch` if `text_embeds` is not rank-3 or `image_embeds`
+  ///   is not rank-2; `Error::LengthMismatch` if the batch dim is not 1 or
+  ///   the hidden dims `D` differ.
+  /// - `Error::LengthMismatch` if the sum of all span widths
   ///   `Σ(end - start)` differs from `image_embeds`' first axis `N`
   ///   (one image-feature per placeholder position is the splice
   ///   contract).
-  /// - `Error::ShapeMismatch` if any span is out of bounds, overlaps the
-  ///   previous span, or is empty (mirrors
-  ///   [`crate::vlm::prompt::build_multimodal_mask`]'s validation).
-  /// - `Error::ShapeMismatch` if `image_spans` is empty — there are no
+  /// - `Error::InvariantViolation` if any span is empty or overlaps the
+  ///   previous span; `Error::OutOfRange` if a span end exceeds `T`
+  ///   (mirrors [`crate::vlm::prompt::build_multimodal_mask`]'s validation).
+  /// - `Error::EmptyInput` if `image_spans` is empty — there are no
   ///   positions to merge into and the caller should use the
   ///   no-image text path (`forward(tokens)`) instead.
   fn merge_embeddings(
@@ -204,7 +205,7 @@ fn default_merge_embeddings(
   // output shape; `vlm_generate` always builds a single-batch prompt) and
   // image embeds must be [N, D] (post-`encode_image`/-projector). A wrong
   // rank is a programmer error in the per-model impl rather than user
-  // data; surface as a recoverable `Err(ShapeMismatch)` per the rest of
+  // data; surface as a recoverable typed error per the rest of
   // the crate's error discipline.
   let text_shape = text_embeds.shape();
   let text_rank = text_shape.len() as u32;
