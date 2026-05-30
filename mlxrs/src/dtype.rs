@@ -64,6 +64,58 @@ impl Dtype {
   }
 }
 
+impl std::str::FromStr for Dtype {
+  type Err = crate::error::Error;
+
+  /// Parse a canonical dtype name back into a [`Dtype`] — the inverse of
+  /// [`Dtype::as_str`] / the derived [`Display`](std::fmt::Display) (audit
+  /// #257 L-P1.3). The accepted strings are exactly the ones `as_str`
+  /// emits (`"bool"`, `"uint8"`, …, `"complex64"`), so
+  /// `Dtype::from_str(d.as_str()) == Ok(d)` round-trips for every variant.
+  /// Any other string yields a typed [`Error::UnknownEnumValue`] carrying
+  /// the rejected value and the full set of accepted names.
+  fn from_str(s: &str) -> Result<Self> {
+    match s {
+      "bool" => Ok(Self::Bool),
+      "uint8" => Ok(Self::U8),
+      "uint16" => Ok(Self::U16),
+      "uint32" => Ok(Self::U32),
+      "uint64" => Ok(Self::U64),
+      "int8" => Ok(Self::I8),
+      "int16" => Ok(Self::I16),
+      "int32" => Ok(Self::I32),
+      "int64" => Ok(Self::I64),
+      "float16" => Ok(Self::F16),
+      "float32" => Ok(Self::F32),
+      "float64" => Ok(Self::F64),
+      "bfloat16" => Ok(Self::BF16),
+      "complex64" => Ok(Self::Complex64),
+      _ => Err(Error::UnknownEnumValue(
+        crate::error::UnknownEnumValuePayload::new(
+          "Dtype",
+          s,
+          &[
+            "bool",
+            "uint8",
+            "uint16",
+            "uint32",
+            "uint64",
+            "int8",
+            "int16",
+            "int32",
+            "int64",
+            "float16",
+            "float32",
+            "float64",
+            "bfloat16",
+            "complex64",
+          ],
+        ),
+      )),
+    }
+  }
+}
+
 impl TryFrom<mlxrs_sys::mlx_dtype> for Dtype {
   type Error = Error;
   fn try_from(raw: mlxrs_sys::mlx_dtype) -> Result<Self> {
@@ -706,5 +758,45 @@ mod tests {
     assert!(set.contains(&Dtype::F32));
     assert!(set.contains(&Dtype::Complex64));
     assert!(!set.contains(&Dtype::I32));
+  }
+
+  // `FromStr` is the inverse of `as_str` (audit #257 L-P1.3): parsing the
+  // canonical name of EVERY variant must reproduce that variant exactly, and
+  // an unknown name must surface a typed `UnknownEnumValue` error.
+  #[test]
+  fn dtype_from_str_round_trips_every_variant() {
+    use std::str::FromStr;
+    const ALL: &[Dtype] = &[
+      Dtype::Bool,
+      Dtype::U8,
+      Dtype::U16,
+      Dtype::U32,
+      Dtype::U64,
+      Dtype::I8,
+      Dtype::I16,
+      Dtype::I32,
+      Dtype::I64,
+      Dtype::F16,
+      Dtype::F32,
+      Dtype::F64,
+      Dtype::BF16,
+      Dtype::Complex64,
+    ];
+    for &d in ALL {
+      // `Error` has no `PartialEq`, so assert on the unwrapped `Ok` value
+      // (the round-trip contract `from_str(as_str()) == Ok(d)`) rather than
+      // comparing the whole `Result`.
+      assert_eq!(
+        Dtype::from_str(d.as_str()).expect("as_str output must parse"),
+        d,
+        "round-trip failed for {d:?}"
+      );
+    }
+
+    let err = Dtype::from_str("not_a_dtype").unwrap_err();
+    assert!(
+      matches!(err, Error::UnknownEnumValue(_)),
+      "unknown dtype name must yield UnknownEnumValue, got {err:?}"
+    );
   }
 }
