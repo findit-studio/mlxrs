@@ -102,11 +102,13 @@ pub trait VadModel {
 /// rejected by [`crate::audio::load::get_model_path`] with a clear
 /// no-network message; see that function's docs).
 ///
-/// Failures (missing dir / missing config / malformed JSON / constructor
-/// error) are recoverable [`Error::Backend`].
+/// Failures are typed: missing dir →
+/// [`Error::MissingKey`](crate::error::Error::MissingKey), hub path →
+/// [`Error::OutOfRange`](crate::error::Error::OutOfRange), malformed JSON →
+/// [`Error::Parse`](crate::error::Error::Parse), constructor
+/// error → caller-defined.
 ///
 /// [vad-utils-loadmodel]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/vad/utils.py#L14-L36
-/// [`Error::Backend`]: crate::Error::Backend
 pub fn load_model<F>(path: &str, constructor: F) -> Result<Box<dyn VadModel>>
 where
   F: FnOnce(LoadedAudioModel) -> Result<Box<dyn VadModel>>,

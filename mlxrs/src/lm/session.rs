@@ -2472,7 +2472,7 @@ mod tests {
   }
 
   /// A model that delegates every call to `inner` for the first `ok_calls`
-  /// `forward` invocations and then returns a [`Error::Backend`] on every
+  /// `forward` invocations and then returns a [`Error::InvariantViolation`] on every
   /// later one. Used to drive a [`ChatSession`] stream into the `Err` branch
   /// of [`Iterator::next`] partway through generation so the round-3 Finding 2
   /// (detokenizer not finalized on an error-terminated stream) is exercised.

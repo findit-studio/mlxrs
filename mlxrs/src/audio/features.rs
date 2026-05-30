@@ -174,15 +174,13 @@ fn next_power_of_2(x: usize) -> usize {
 /// "Nyquist" and `high_freq = -200.0` means "Nyquist - 200 Hz".
 ///
 /// # Errors
-/// - [`Error::Backend`] when:
-///   - `num_bins <= 3` (the reference asserts `num_bins > 3`),
-///   - `n_fft_padded` is odd or zero,
-///   - `sample_freq <= 0.0`,
-///   - the resolved `low_freq` / `high_freq` violate `0 <= low_freq < nyquist`
-///     or `0 < high_freq <= nyquist`,
-///   - any size exceeds `i32::MAX`,
-///   - `num_bins * (n_fft_padded / 2)` overflows `usize` or exceeds the
-///     internal `MAX_FBANK_WORK` cap (~64 Mi elements).
+/// - Typed errors: [`Error::OutOfRange`] when `num_bins <= 3`, `n_fft_padded`
+///   is odd or zero, `sample_freq <= 0.0`, the resolved `low_freq`/`high_freq`
+///   violate range invariants, or any size exceeds `i32::MAX`;
+///   [`Error::ArithmeticOverflow`] if intermediate products overflow;
+///   [`Error::CapExceeded`] if `num_bins * (n_fft_padded / 2)` exceeds
+///   the internal `MAX_FBANK_WORK` cap (~64 Mi elements);
+///   [`Error::AllocFailure`] if the filter-bank reservation fails.
 pub fn get_mel_banks_kaldi(
   num_bins: usize,
   n_fft_padded: usize,
@@ -451,9 +449,10 @@ fn build_kaldi_window(win_type: KaldiWindow, win_size: usize) -> Result<Array> {
 /// Strided framing matching the reference's `_get_strided_kaldi` with
 /// `snip_edges=true` (`mlx_audio.dsp.py:777`).
 ///
-/// `snip_edges=false` is not implemented here (see the module-level scope
-/// fence); a `false` flag returns [`Error::Backend`] rather than silently
-/// flipping to `true`. The `(num_frames, win_size)` strided view is built via
+/// This helper builds the `snip_edges=true` framing only; the
+/// `snip_edges=false` reflect-bookend path is handled separately by
+/// `strided_frames_no_snip_edges` (dispatched from `compute_fbank_kaldi`).
+/// The `(num_frames, win_size)` strided view is built via
 /// the same `unsafe ops::shape::as_strided` `crate::audio::dsp::stft` uses,
 /// with the same `(num_frames - 1) * win_inc + win_size <= samples_len`
 /// pre-condition asserted before the FFI call.
@@ -549,8 +548,8 @@ fn strided_frames_snip_edges(
 /// the traversal `len-1, len-2, …, 0` (inclusive of 0).
 ///
 /// # Errors
-/// - [`Error::Backend`] if `a` is not 1-D, is empty, or `len`/`len + 1`
-///   exceeds `i32::MAX`.
+/// - [`Error::RankMismatch`] if `a` is not 1-D, [`Error::EmptyInput`] if empty,
+///   [`Error::OutOfRange`] if `len`/`len + 1` exceeds `i32::MAX`.
 fn reverse_1d(a: &Array) -> Result<Array> {
   let shape = a.shape();
   if shape.len() != 1 {
@@ -615,7 +614,7 @@ fn reverse_1d(a: &Array) -> Result<Array> {
 /// it gets away with only because numpy/mlx over-allocate). mlxrs's
 /// [`ops::shape::as_strided`] is bounds-checked; rather than reproduce that UB,
 /// this function asserts `last_index <= padded_len` and returns a recoverable
-/// [`Error::Backend`] for the degenerate regime (where there is not enough
+/// [`Error::OutOfRange`] for the degenerate regime (where there is not enough
 /// signal to reflect-pad a full centered window). Every realistic ASR config
 /// — a multi-frame signal whose padded length covers the strided read — is
 /// reproduced **bit-identically** to the reference. (The padded buffer is built
@@ -626,16 +625,11 @@ fn reverse_1d(a: &Array) -> Result<Array> {
 /// when `m == 0` (vanishingly short input).
 ///
 /// # Errors
-/// - [`Error::Backend`] when:
-///   - `waveform` is not 1-D,
-///   - the reflect-padded buffer's element count exceeds the internal
-///     `MAX_FBANK_WORK` cap (the reflect bookends roughly double the
-///     waveform's memory — checked BEFORE the `concatenate` materializes it),
-///   - the reflect bookends require indices outside the signal (e.g.
-///     `pad + 1 > n`, i.e. not enough samples to reflect `pad` on a side),
-///   - the strided read would exceed the padded-buffer length (degenerate
-///     `win_size`-vs-`n` regime — see the memory-safe deviation above),
-///   - any size overflows `usize` / `i32` / `i64`.
+/// - [`Error::RankMismatch`] if `waveform` is not 1-D;
+///   [`Error::CapExceeded`] if the reflect-padded buffer exceeds `MAX_FBANK_WORK`;
+///   [`Error::OutOfRange`] if reflect bookends exceed the signal, the strided read
+///   would exceed the padded length, or any size overflows `i32`/`i64`;
+///   [`Error::ArithmeticOverflow`] on `usize` overflow.
 /// - Propagates slice / concatenate / `as_strided` errors.
 fn strided_frames_no_snip_edges(
   waveform: &Array,
@@ -898,29 +892,14 @@ fn strided_frames_no_snip_edges(
 /// dithered features bit-for-bit, allowing reproducible training runs.
 ///
 /// # Errors
-/// - [`Error::Backend`] when:
-///   - `waveform` is not 1-D,
-///   - `win_len < 2`, `win_inc == 0`, or `win_len > MAX_DECODED_SAMPLES`,
-///   - `sample_rate == 0`,
-///   - `dither < 0.0` or non-finite,
-///   - `preemphasis` is not in `[0.0, 1.0]` (the reference accepts any float
-///     but the standard range is `[0.0, 1.0]`),
-///   - `snip_edges == false` and the signal is too short to reflect-pad a
-///     centered window (the degenerate `win_len`-vs-`samples_len` regime where
-///     the reference would read out of bounds — see
-///     `strided_frames_no_snip_edges`),
-///   - `dither != 0.0 && dither_key.is_none()` (deterministic-by-default rule),
-///   - `samples_len = waveform.shape()[0]` exceeds
-///     [`crate::audio::io::MAX_DECODED_SAMPLES`] — checked BEFORE materializing
-///     via [`ops::shape::contiguous`] so a broadcasted-view input can't drive
-///     a multi-GB allocation,
-///   - `num_frames * n_fft_padded`, the `rfft` output `num_frames *
-///     (n_fft_padded/2 + 1)`, the padded mel-bank operand `num_mels *
-///     (n_fft_padded/2 + 1)`, OR the final `num_frames * num_mels` matmul
-///     output overflows `usize` or exceeds the internal `MAX_FBANK_WORK`
-///     cap (~64 Mi elements),
-///   - any size exceeds `i32::MAX`.
-/// - Propagates errors from [`get_mel_banks_kaldi`] and the underlying ops.
+/// - Typed errors: [`Error::RankMismatch`] if `waveform` is not 1-D;
+///   [`Error::OutOfRange`] if `win_len < 2`, `dither < 0.0` or non-finite,
+///   `preemphasis` out of `[0.0, 1.0]`, or sizes exceed `i32::MAX`;
+///   [`Error::CapExceeded`] if `win_len > MAX_DECODED_SAMPLES` or work exceeds
+///   `MAX_FBANK_WORK`; [`Error::ArithmeticOverflow`] on `usize` overflow;
+///   [`Error::InvariantViolation`] if `sample_rate == 0`, `win_inc == 0`, or
+///   `dither != 0.0 && dither_key.is_none()`; plus errors from
+///   [`get_mel_banks_kaldi`] and the underlying ops.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_fbank_kaldi(
   waveform: &Array,
@@ -1403,27 +1382,12 @@ impl DeltaPadMode {
 /// `MAX_DELTA_WORK` cap (distinct from the input / padded-buffer size caps).
 ///
 /// # Errors
-/// - [`Error::Backend`] when:
-///   - `specgram` has rank `0` (no time axis),
-///   - `win_length < 3` (the reference raises `ValueError`),
-///   - `win_length` is even (a symmetric `[-n, n]` window needs an odd length;
-///     the reference's `n = (win_length - 1) // 2` silently truncates an even
-///     `win_length` to the next-lower odd window, which we reject rather than
-///     silently reinterpret),
-///   - `win_length` exceeds the small supported maximum (`1024`; delta windows
-///     are tiny in practice — the default is `5` — and a huge window drives the
-///     boundary pad / shifted-slice work into a CPU stall on a tiny input),
-///   - the element count `total` (== `num_features * time`) **or** the padded
-///     element count `num_features * (time + 2n)` exceeds the internal
-///     `MAX_FBANK_WORK` cap (~64 Mi elements) — the padded count is checked
-///     BEFORE any pad / broadcast / concatenate so a tiny input with a large
-///     `win_length` cannot allocate the bookends first,
-///   - the cumulative accumulation work `total * (win_length - 1)` (the
-///     `win_length - 1` full-width slice / multiply / add passes the delta
-///     loop performs) exceeds the internal `MAX_DELTA_WORK` budget — a
-///     separate cap from the buffer-size caps, checked BEFORE the loop so a
-///     wide window on a large input cannot stall the CPU / GPU,
-///   - the padded time extent `time + 2n` overflows `usize` / `i32`.
+/// - [`Error::RankMismatch`] if `specgram` has rank `0` (no time axis);
+///   [`Error::OutOfRange`] if `win_length < 3`, `win_length` is even, or
+///   `time + 2n` overflows `i32`; [`Error::CapExceeded`] if `win_length > 1024`
+///   (`MAX_DELTA_WIN_LENGTH`), or the element count or cumulative work exceeds
+///   the internal `MAX_FBANK_WORK` / `MAX_DELTA_WORK` caps;
+///   [`Error::ArithmeticOverflow`] if `time + 2n` overflows `usize`.
 /// - Propagates errors from the underlying slice / pad / concatenate ops.
 pub fn compute_deltas_kaldi(
   specgram: &Array,

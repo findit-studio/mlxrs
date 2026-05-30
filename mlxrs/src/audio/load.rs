@@ -11,9 +11,10 @@
 //! - [`get_model_path`] — local-path resolver mirroring
 //!   `mlx_audio.utils.get_model_path` ([utils.py:106-150][audio-utils-getpath]).
 //!   Per the project's no-network policy, mlxrs **rejects** `hf://`-style
-//!   paths with a clear [`Error::Backend`] rather than calling
-//!   `huggingface_hub.snapshot_download` — the (`hf://repo/id`)
-//!   path is purely a hosted-Hub artifact, never a real on-disk path.
+//!   paths with a clear [`Error::OutOfRange`] (hub path) or [`Error::MissingKey`]
+//!   (missing local path) rather than calling `huggingface_hub.snapshot_download`
+//!   — the (`hf://repo/id`) path is purely a hosted-Hub artifact, never a real
+//!   on-disk path.
 //! - [`load_config`] — bounded read of `<dir>/config.json`, reusing the
 //!   shared [`crate::lm::load`] `read_bounded_config_file` primitive,
 //!   so audio configs inherit the same hardening (TOCTOU-closed open,
@@ -57,7 +58,6 @@
 //! [audio-utils-quant]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/utils.py#L207-L254
 //! [audio-utils-base]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/utils.py#L319-L414
 //! [audio-utils-getters]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/utils.py#L417-L472
-//! [`Error::Backend`]: crate::Error::Backend
 
 use std::path::{Path, PathBuf};
 
@@ -145,7 +145,7 @@ impl LoadedAudioModel {
 /// **No-network**: per the project policy, mlxrs never downloads from
 /// HuggingFace Hub. A path that mlx-audio would forward to
 /// `snapshot_download` (a non-local repo id like `"mlx-community/foo"`
-/// or an `hf://…` URL) is **rejected** with a clear [`Error::Backend`]
+/// or an `hf://…` URL) is **rejected** with a clear typed error
 /// naming the offending input, instead of being silently fetched.
 /// Callers who need a Hub-fetched directory must run `huggingface-cli
 /// download …` (or its programmatic equivalent) **out of process** and
@@ -159,15 +159,14 @@ impl LoadedAudioModel {
 /// 2. If the input *looks* local (starts with `.` / `/` / `~` / `<drive>:`
 ///    — the [utils.py:96-103][audio-utils-islocal] heuristic) and the
 ///    path does NOT exist, surface
-///    [`Error::Backend`] (mlx-audio's `FileNotFoundError`).
+///    [`Error::MissingKey`] (mlx-audio's `FileNotFoundError`).
 /// 3. Otherwise the input would have been forwarded to
 ///    `snapshot_download` — mlxrs surfaces
-///    [`Error::Backend`] explaining the no-network policy and pointing
+///    [`Error::OutOfRange`] explaining the no-network policy and pointing
 ///    at the out-of-process workaround.
 ///
 /// [audio-utils-getpath]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/utils.py#L106-L150
 /// [audio-utils-islocal]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/utils.py#L96-L103
-/// [`Error::Backend`]: crate::Error::Backend
 pub fn get_model_path(path: &str) -> Result<PathBuf> {
   let expanded = expand_home(path);
 
@@ -178,7 +177,7 @@ pub fn get_model_path(path: &str) -> Result<PathBuf> {
   }
 
   // (2) Looks like a local path but doesn't exist → mlx-audio's
-  // FileNotFoundError. Surface a clear Error::Backend instead of
+  // FileNotFoundError. Surface a clear Error::MissingKey instead of
   // (3)'s "would have fetched from Hub" message.
   if is_local_path(path) {
     return Err(Error::MissingKey(MissingKeyPayload::new(
@@ -266,13 +265,15 @@ fn home_dir() -> Option<PathBuf> {
 /// hostile model directory cannot OOM the loader by planting a huge
 /// `config.json`.
 ///
-/// A missing / non-regular / oversized / unreadable / non-UTF-8
-/// `config.json` is a recoverable [`Error::Backend`] naming the offending
-/// path — matching mlx-audio's `FileNotFoundError(f"Config not found at
-/// {model_path}")`.
+/// An absent `config.json` is a recoverable [`Error::MissingKey`] naming the
+/// offending path — matching mlx-audio's `FileNotFoundError(f"Config not found
+/// at {model_path}")`. A present-but-unusable `config.json` instead propagates
+/// the typed error from the shared bounded reader: [`Error::FileIo`] for a
+/// non-regular or unreadable file, [`Error::CapExceeded`] when it exceeds the
+/// `MAX_CONFIG_BYTES` ceiling, and [`Error::LayerKeyed`] wrapping
+/// [`Error::Parse`] for non-UTF-8 content.
 ///
 /// [audio-utils-config]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/utils.py#L153-L174
-/// [`Error::Backend`]: crate::Error::Backend
 pub fn load_config(dir: &Path) -> Result<String> {
   let path = dir.join("config.json");
   match read_bounded_config_file(&path, "audio model config")? {
@@ -327,11 +328,10 @@ pub fn load_config(dir: &Path) -> Result<String> {
 /// `Ok(Some(plq))` ⇒ the checkpoint is quantized; `plq` carries the
 /// global default (`group_size` / `bits` / `mode`) plus any per-layer
 /// overrides. A malformed quantization block (e.g. `bits` missing or
-/// `quantization` not a JSON object) is a recoverable
-/// [`Error::Backend`].
+/// `quantization` not a JSON object) is a recoverable [`Error::OutOfRange`]
+/// (non-object block) or [`Error::Parse`] (invalid JSON / missing bits).
 ///
 /// [audio-utils-quant]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/utils.py#L207-L254
-/// [`Error::Backend`]: crate::Error::Backend
 pub fn apply_quantization(config_json: &str) -> Result<Option<PerLayerQuantization>> {
   use serde_json::Value;
 
@@ -421,12 +421,11 @@ pub fn apply_quantization(config_json: &str) -> Result<Option<PerLayerQuantizati
 /// model-specific args from), and `quantization` (to drive the optional
 /// `quantize_weights` call).
 ///
-/// Every recoverable failure (missing dir / config / quant-block-parse)
-/// is an [`Error::Backend`] whose message names the offending path.
+/// Failures are typed: missing dir → [`Error::MissingKey`], hub path →
+/// [`Error::OutOfRange`], malformed JSON → [`Error::Parse`].
 /// No implicit eval — this helper reads JSON only, no Array allocation.
 ///
 /// [audio-utils-base]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/utils.py#L319-L414
-/// [`Error::Backend`]: crate::Error::Backend
 pub fn base_load_model(path: &str) -> Result<LoadedAudioModel> {
   let model_path = get_model_path(path)?;
   let config_json = load_config(&model_path)?;

@@ -493,7 +493,7 @@ impl WiredMemoryMeasurement {
 /// LM concurrency surface (the equivalent of mlx-swift-lm's
 /// `LanguageModel.prepare(_:cache:windowSize:)`). The signature is shipped
 /// here so callers can program against it; the body returns
-/// [`Error::Backend`] with an actionable message until the upstream
+/// [`Error::InvariantViolation`] with an actionable message until the upstream
 /// concurrency surface lands. See follow-up
 /// [issue #168 / LM-L6](https://github.com/findit-studio/mlxrs/issues/168)
 /// for the tracking item.

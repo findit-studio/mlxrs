@@ -710,7 +710,7 @@ impl KvCache for QuantizedKvCacheImpl {
   /// `offset` is **not** derived here (mlx-lm restores it via `meta_state`,
   /// `cache.py:303-304`; the getter slices to whatever `offset`
   /// `set_meta_state` sets), and a length other than 0/4/6 is a recoverable
-  /// [`Error::Backend`] (mlx-swift-lm `fatalError`s, `KVCache.swift:945`;
+  /// [`Error::OutOfRange`] (mlx-swift-lm `fatalError`s, `KVCache.swift:945`;
   /// this crate forbids a panic on the recoverable load path).
   ///
   /// KVC-8 additionally cross-validates the K and V triples' rank and

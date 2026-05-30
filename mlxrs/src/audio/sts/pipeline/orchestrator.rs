@@ -71,8 +71,8 @@ pub trait VadFrameAdapter {
   /// Return whether `frame` contains speech.
   ///
   /// # Errors
-  /// Implementor-defined; the orchestrator surfaces an `Err` here
-  /// as [`crate::error::Error::Backend`].
+  /// Implementor-defined; `is_speech` returns [`crate::error::Error`] and the
+  /// orchestrator propagates the implementor's `Err` unchanged.
   fn is_speech(&mut self, frame: &[f32]) -> Result<bool>;
 }
 
@@ -280,7 +280,7 @@ where
   /// (mirror of `voice_pipeline.py:613-615`).
   ///
   /// # Errors
-  /// Returns [`crate::error::Error::Backend`] when
+  /// Returns [`crate::error::Error::InvariantViolation`] when
   /// `config.input_sample_rate() == 0` — the per-chunk silence-ms
   /// accounting divides by the sample rate and a zero rate would
   /// either panic or silently produce nonsense durations.
