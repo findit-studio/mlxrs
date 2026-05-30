@@ -82,8 +82,10 @@ pub const MODEL_REMAPPING: &[(&str, &str)] = &[
 /// rejected by [`crate::audio::load::get_model_path`] with a clear
 /// no-network message).
 ///
-/// Failures are typed: missing dir → [`Error::MissingKey`], hub path →
-/// [`Error::OutOfRange`], malformed JSON → [`Error::Parse`], constructor
+/// Failures are typed: missing dir →
+/// [`Error::MissingKey`](crate::error::Error::MissingKey), hub path →
+/// [`Error::OutOfRange`](crate::error::Error::OutOfRange), malformed JSON →
+/// [`Error::Parse`](crate::error::Error::Parse), constructor
 /// error → caller-defined.
 ///
 /// [stt-utils-loadmodel]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/utils.py#L64-L89

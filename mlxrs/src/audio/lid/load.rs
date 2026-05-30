@@ -117,8 +117,10 @@ where
 /// handed to the caller-supplied `constructor` closure (per the
 /// no-per-model-arch rule mlxrs does not bundle a built-in registry).
 ///
-/// Failures are typed: missing dir → [`Error::MissingKey`], hub path →
-/// [`Error::OutOfRange`], malformed JSON → [`Error::Parse`], constructor
+/// Failures are typed: missing dir →
+/// [`Error::MissingKey`](crate::error::Error::MissingKey), hub path →
+/// [`Error::OutOfRange`](crate::error::Error::OutOfRange), malformed JSON →
+/// [`Error::Parse`](crate::error::Error::Parse), constructor
 /// error → caller-defined.
 ///
 /// [lid-utils-loadmodel]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/lid/utils.py#L16-L38

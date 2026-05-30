@@ -3508,10 +3508,10 @@ fn k_weight_channel(channel: &[f32], rate: u32) -> Result<Vec<f64>> {
 ///   or sample-visit work exceeds the respective cap (these reject pathological
 ///   overlaps BEFORE any `num_blocks`-scaled allocation or the per-block loop
 ///   runs (the byte cap dominates for normal block
-///     sizes; the visit cap catches near-1 overlaps with small block
-///     sizes that fit under the byte cap but multiply the per-block CPU
-///     sum work — once per channel, since the per-block loop runs once
-///     per channel — to multi-trillion visits),
+///   sizes; the visit cap catches near-1 overlaps with small block
+///   sizes that fit under the byte cap but multiply the per-block CPU
+///   sum work — once per channel, since the per-block loop runs once
+///   per channel — to multi-trillion visits),
 ///   - the number of blocks overflows `usize`,
 ///   - any size exceeds `i32::MAX`.
 ///
