@@ -198,7 +198,7 @@ pub fn load_audio_into(path: &Path, out: &mut Vec<f32>) -> Result<u32> {
 ///   BEFORE the sample `Vec` is allocated. A 30-minute WAV with a
 ///   30-second cap therefore never touches the 256 MiB load-stage
 ///   ceiling — the rejection fires at the header-parse stage with one
-///   recoverable [`Error::BoundedDecode`].
+///   recoverable [`Error::CapExceeded`].
 /// - The per-decoded-buffer cap (`reserve_under_cap` / `push_samples`)
 ///   uses the same `min(max_samples, MAX_DECODED_SAMPLES)` so a
 ///   compressed file lacking a declared frame count — MP3 Xing/Info
@@ -213,7 +213,8 @@ pub fn load_audio_into(path: &Path, out: &mut Vec<f32>) -> Result<u32> {
 ///
 /// # Errors
 /// - Same set as [`load_audio`], plus the early header-cap rejection
-///   above (also [`Error::BoundedDecode`]).
+///   above (an [`Error::CapExceeded`] naming `effective_cap` and the
+///   container-declared `header_len`).
 pub fn load_audio_with_cap(path: &Path, max_samples: usize) -> Result<(Vec<f32>, u32)> {
   let mut out: Vec<f32> = Vec::new();
   let sample_rate = load_audio_into_with_cap(path, &mut out, max_samples)?;
@@ -1971,7 +1972,10 @@ fn open_excl_tempfile(final_path: &Path, max_retries: u32) -> Result<(PathBuf, F
 ///
 /// Returns an empty `Vec` when `samples` is empty. When `from_rate == to_rate`
 /// the input is returned as a verbatim copy (no interpolation, no
-/// floating-point rounding drift).
+/// floating-point rounding drift) — still subject to the same
+/// [`MAX_RESAMPLED_SAMPLES`] cap and fallible reservation as the resampling
+/// path, so an over-cap input yields [`Error::CapExceeded`] rather than an
+/// infallible allocation that could abort.
 ///
 /// # Errors
 /// - [`Error::InvariantViolation`] if `from_rate == 0` or `to_rate == 0`,
@@ -1996,8 +2000,31 @@ pub fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<
     return Ok(Vec::new());
   }
   if from_rate == to_rate {
-    // Verbatim copy — avoids any FP rounding drift on a no-op resample.
-    return Ok(samples.to_vec());
+    // Verbatim copy — avoids any FP rounding drift on a no-op resample. The
+    // output length equals the input length, so it is bounded by the same cap
+    // and built through the same fallible reservation as the resampling path
+    // below — never an infallible `to_vec` that could abort on OOM, and never
+    // a silent bypass of `MAX_RESAMPLED_SAMPLES`.
+    if samples.len() > MAX_RESAMPLED_SAMPLES {
+      return Err(Error::CapExceeded(CapExceededPayload::new(
+        "resample_linear: output length exceeds cap \
+           (use chunked resampling or raise the cap manually)",
+        "MAX_RESAMPLED_SAMPLES",
+        MAX_RESAMPLED_SAMPLES as u64,
+        samples.len() as u64,
+      )));
+    }
+    let mut out: Vec<f32> = Vec::new();
+    out.try_reserve_exact(samples.len()).map_err(|e| {
+      Error::AllocFailure(AllocFailurePayload::new(
+        "resample_linear: reservation",
+        "samples",
+        samples.len() as u64,
+        e,
+      ))
+    })?;
+    out.extend_from_slice(samples);
+    return Ok(out);
   }
 
   // Output length: `samples.len() * to_rate / from_rate`. Use u64 to avoid

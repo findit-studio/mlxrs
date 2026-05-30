@@ -71,9 +71,10 @@ pub enum KernelTemplateArg {
 /// `output_shapes.len()` must equal `output_dtypes.len()`; both must also
 /// equal the number of `output_names` declared when the parent
 /// [`MetalKernel`] was constructed. [`MetalKernel::apply`] enforces these
-/// invariants and returns [`Error::ShapeMismatch`] on violation rather than
-/// passing through to mlx-c (where the failure surfaces only at JIT time
-/// with a less actionable message).
+/// invariants and returns [`Error::LengthMismatch`] (arity mismatch) or
+/// [`Error::EmptyInput`] / [`Error::OutOfRange`] (invalid output shape) on
+/// violation rather than passing through to mlx-c (where the failure
+/// surfaces only at JIT time with a less actionable message).
 ///
 /// The optional `template`, `init_value`, and `verbose` fields default to
 /// empty / `None` / `false` and can be set via the builder methods
@@ -504,18 +505,20 @@ impl MetalKernel {
   ///
   /// # Errors
   ///
-  /// - [`Error::ShapeMismatch`] if `config.output_shapes.len()` /
+  /// - [`Error::LengthMismatch`] if `config.output_shapes.len()` /
   ///   `config.output_dtypes.len()` disagrees with the declared
   ///   `output_names` count, or if those two `Vec`s disagree with each
   ///   other.
-  /// - [`Error::ShapeMismatch`] if any entry in `config.output_shapes`
-  ///   contains a negative dimension (rejected before mlx-c via
+  /// - [`Error::EmptyInput`] if any entry in `config.output_shapes` is
+  ///   empty (rank-0 / scalar output); [`Error::OutOfRange`] if any
+  ///   entry contains a negative dimension (rejected before mlx-c via
   ///   [`crate::shape::validate_dims`]).
   /// - [`Error::InteriorNul`] if a template-arg name contains an interior NUL
   ///   byte (rejected before mlx-c).
-  /// - the surfaced mlx-c error ([`Error::MlxC`]) if any mlx-c `_set_*` /
-  ///   `_add_*` / `_apply` call reports an error (e.g. a runtime Metal pipeline
-  ///   failure).
+  /// - the surfaced mlx-c boundary error — [`Error::MlxOp`] when the handler
+  ///   parses a recognized bracketed mlx op message (e.g. a `[metal_kernel]`
+  ///   runtime Metal pipeline failure), else the raw [`Error::MlxC`] fallback —
+  ///   if any mlx-c `_set_*` / `_add_*` / `_apply` call reports an error.
   ///
   /// # Non-finite inputs (NaN / Inf)
   ///

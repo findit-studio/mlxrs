@@ -265,10 +265,13 @@ fn home_dir() -> Option<PathBuf> {
 /// hostile model directory cannot OOM the loader by planting a huge
 /// `config.json`.
 ///
-/// A missing / non-regular / oversized / unreadable / non-UTF-8
-/// `config.json` is a recoverable [`Error::MissingKey`] naming the offending
-/// path — matching mlx-audio's `FileNotFoundError(f"Config not found at
-/// {model_path}")`.
+/// An absent `config.json` is a recoverable [`Error::MissingKey`] naming the
+/// offending path — matching mlx-audio's `FileNotFoundError(f"Config not found
+/// at {model_path}")`. A present-but-unusable `config.json` instead propagates
+/// the typed error from the shared bounded reader: [`Error::FileIo`] for a
+/// non-regular or unreadable file, [`Error::CapExceeded`] when it exceeds the
+/// `MAX_CONFIG_BYTES` ceiling, and [`Error::LayerKeyed`] wrapping
+/// [`Error::Parse`] for non-UTF-8 content.
 ///
 /// [audio-utils-config]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/utils.py#L153-L174
 pub fn load_config(dir: &Path) -> Result<String> {

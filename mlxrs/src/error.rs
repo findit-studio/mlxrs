@@ -232,11 +232,16 @@ impl std::error::Error for MissingFieldPayload {}
 pub struct ArithmeticOverflowPayload {
   context: &'static str,
   op_type: &'static str,
-  // Boxed slice (not an inline `SmallVec`) so this payload — and therefore the
-  // whole `Error` enum — stays small: overflow operand lists are tiny and
-  // built once on the cold error path, so the heap indirection is free and the
-  // 16-byte fat pointer beats a 112-byte inline buffer (#257 M8/M10 size).
-  operands: Box<[(&'static str, u64)]>,
+  // Inline `SmallVec` sized to the common operand list (binary ops carry 2), so
+  // the usual overflow diagnostic is built with no heap allocation. The few
+  // 3-operand sites spill to one small bounded heap allocation — the same
+  // one-shot infallible alloc every `String` / `SmolStr` / `Vec` payload in this
+  // enum already performs on the cold error path, and bounded because operand
+  // arity is fixed and tiny. (The no-abort guarantee for UNBOUNDED buffers lives
+  // in the `MAX_*` decode/resample caps, not in error metadata.) Inline-2 keeps
+  // this payload — and the whole `Error` enum — within the 96-byte
+  // `size_of::<Error>()` budget asserted in this module (#257 M8/M10 size).
+  operands: SmallVec<[(&'static str, u64); 2]>,
 }
 
 impl ArithmeticOverflowPayload {
@@ -248,7 +253,7 @@ impl ArithmeticOverflowPayload {
     Self {
       context,
       op_type,
-      operands: Box::default(),
+      operands: SmallVec::new(),
     }
   }
 
@@ -1189,10 +1194,13 @@ pub enum Error {
 // M8 / M10 (#257): pin the `Error` enum size. It is feature-INVARIANT (no
 // feature-gated variant exceeds the largest always-present one), so a feature
 // flag never changes `size_of::<Error>()`. The two formerly-largest payloads
-// (`ArithmeticOverflow` 144 B, `ShapePairMismatch` 120 B) now box their
-// variable-length fields (#281), so `Error` is ~80 B instead of 144 B. This
-// guard fails the build if a payload change regrows the enum and silently
-// bloats every `Result<T, Error>`.
+// (`ArithmeticOverflow` 144 B, `ShapePairMismatch` 120 B) shrank their
+// variable-length fields to inline-2 `SmallVec`s (#281): the common small
+// operand / low-rank-shape lists stay inline, and the rare longer ones spill to
+// a small bounded heap allocation like the enum's other `String` / `Vec`
+// payloads — keeping `Error` within budget without an unbounded error-path
+// allocation. This guard fails the build if a payload change regrows the enum
+// and silently bloats every `Result<T, Error>`.
 const _: () = assert!(
   core::mem::size_of::<Error>() <= 96,
   "Error enum exceeded 96 bytes — box or shrink the offending variant payload (see the #257 M8/M10 size note)"
@@ -2081,23 +2089,28 @@ impl std::error::Error for CapExceededPayload {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShapePairMismatchPayload {
   context: &'static str,
-  // Boxed slices keep this payload (and `Error`) small — shape pairs are built
-  // once on the cold error path (#257 M8/M10 size).
-  expected: Box<[usize]>,
-  actual: Box<[usize]>,
+  // Inline `SmallVec`s sized for the common <=2-D shape pair: low-rank shapes
+  // stay inline (allocation-free), while a higher-rank shape side uses a small
+  // bounded `SmallVec` heap allocation — the same cold-path allocation the
+  // enum's other `Vec` / `String` payloads already perform (a `From<Vec>`
+  // caller hands its buffer over; a `From<&[T]>` caller is copied). Inline-2
+  // keeps this payload (and `Error`) within the 96-byte `size_of::<Error>()`
+  // budget asserted in this module (#257 M8/M10 size).
+  expected: SmallVec<[usize; 2]>,
+  actual: SmallVec<[usize; 2]>,
 }
 
 impl ShapePairMismatchPayload {
   /// Construct a new payload.
   pub fn new(
     context: &'static str,
-    expected: impl Into<SmallVec<[usize; 4]>>,
-    actual: impl Into<SmallVec<[usize; 4]>>,
+    expected: impl Into<SmallVec<[usize; 2]>>,
+    actual: impl Into<SmallVec<[usize; 2]>>,
   ) -> Self {
     Self {
       context,
-      expected: expected.into().into_vec().into_boxed_slice(),
-      actual: actual.into().into_vec().into_boxed_slice(),
+      expected: expected.into(),
+      actual: actual.into(),
     }
   }
   /// Call-site label.

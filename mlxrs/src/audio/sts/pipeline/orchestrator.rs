@@ -71,8 +71,8 @@ pub trait VadFrameAdapter {
   /// Return whether `frame` contains speech.
   ///
   /// # Errors
-  /// Implementor-defined; the orchestrator surfaces an `Err` here
-  /// as [`crate::error::Error::Backend`].
+  /// Implementor-defined; `is_speech` returns [`crate::error::Error`] and the
+  /// orchestrator propagates the implementor's `Err` unchanged.
   fn is_speech(&mut self, frame: &[f32]) -> Result<bool>;
 }
 

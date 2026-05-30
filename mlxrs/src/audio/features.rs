@@ -449,9 +449,10 @@ fn build_kaldi_window(win_type: KaldiWindow, win_size: usize) -> Result<Array> {
 /// Strided framing matching the reference's `_get_strided_kaldi` with
 /// `snip_edges=true` (`mlx_audio.dsp.py:777`).
 ///
-/// `snip_edges=false` is not implemented here (see the module-level scope
-/// fence); a `false` flag returns [`Error::InvariantViolation`] rather than silently
-/// flipping to `true`. The `(num_frames, win_size)` strided view is built via
+/// This helper builds the `snip_edges=true` framing only; the
+/// `snip_edges=false` reflect-bookend path is handled separately by
+/// `strided_frames_no_snip_edges` (dispatched from `compute_fbank_kaldi`).
+/// The `(num_frames, win_size)` strided view is built via
 /// the same `unsafe ops::shape::as_strided` `crate::audio::dsp::stft` uses,
 /// with the same `(num_frames - 1) * win_inc + win_size <= samples_len`
 /// pre-condition asserted before the FFI call.
@@ -892,12 +893,13 @@ fn strided_frames_no_snip_edges(
 ///
 /// # Errors
 /// - Typed errors: [`Error::RankMismatch`] if `waveform` is not 1-D;
-///   [`Error::OutOfRange`] if `win_len < 2`, `win_inc == 0`, `sample_rate == 0`,
-///   `dither < 0.0` or non-finite, `preemphasis` out of `[0.0, 1.0]`, or sizes
-///   exceed `i32::MAX`; [`Error::CapExceeded`] if `win_len > MAX_DECODED_SAMPLES`
-///   or work exceeds `MAX_FBANK_WORK`; [`Error::ArithmeticOverflow`] on `usize`
-///   overflow; [`Error::InvariantViolation`] if `dither != 0.0 && dither_key.is_none()`;
-///   plus errors from [`get_mel_banks_kaldi`] and the underlying ops.
+///   [`Error::OutOfRange`] if `win_len < 2`, `dither < 0.0` or non-finite,
+///   `preemphasis` out of `[0.0, 1.0]`, or sizes exceed `i32::MAX`;
+///   [`Error::CapExceeded`] if `win_len > MAX_DECODED_SAMPLES` or work exceeds
+///   `MAX_FBANK_WORK`; [`Error::ArithmeticOverflow`] on `usize` overflow;
+///   [`Error::InvariantViolation`] if `sample_rate == 0`, `win_inc == 0`, or
+///   `dither != 0.0 && dither_key.is_none()`; plus errors from
+///   [`get_mel_banks_kaldi`] and the underlying ops.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_fbank_kaldi(
   waveform: &Array,
@@ -1380,10 +1382,11 @@ impl DeltaPadMode {
 /// `MAX_DELTA_WORK` cap (distinct from the input / padded-buffer size caps).
 ///
 /// # Errors
-/// - [`Error::OutOfRange`] if `specgram` has rank `0`, `win_length < 3`,
-///   `win_length` is even, `win_length > 1024`, or `time + 2n` overflows `i32`;
-///   [`Error::CapExceeded`] if the element count or cumulative work exceeds the
-///   internal `MAX_FBANK_WORK` / `MAX_DELTA_WORK` caps;
+/// - [`Error::RankMismatch`] if `specgram` has rank `0` (no time axis);
+///   [`Error::OutOfRange`] if `win_length < 3`, `win_length` is even, or
+///   `time + 2n` overflows `i32`; [`Error::CapExceeded`] if `win_length > 1024`
+///   (`MAX_DELTA_WIN_LENGTH`), or the element count or cumulative work exceeds
+///   the internal `MAX_FBANK_WORK` / `MAX_DELTA_WORK` caps;
 ///   [`Error::ArithmeticOverflow`] if `time + 2n` overflows `usize`.
 /// - Propagates errors from the underlying slice / pad / concatenate ops.
 pub fn compute_deltas_kaldi(

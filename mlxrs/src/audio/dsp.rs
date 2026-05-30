@@ -138,7 +138,7 @@ const COVERAGE_EPS: f32 = 1e-10;
 ///   faithful inverse (the forward transform discards / distorts boundary
 ///   information, so the reconstruction is wrong even where the window-sum is
 ///   nonzero), so [`istft`] rejects `win_length != n_fft` under Right with a
-///   recoverable [`Error::InvariantViolation`]. Use [`WindowPad::Center`] for short-window
+///   recoverable [`Error::OutOfRange`]. Use [`WindowPad::Center`] for short-window
 ///   inversion.
 /// - [`WindowPad::Center`] places the window as `[zeros(pad_low), w,
 ///   zeros(pad_high)]` with `pad_low = (n_fft - win_length) / 2` and
@@ -422,9 +422,10 @@ impl Spectrum {
   /// # Errors
   /// Returns typed errors when:
   /// - `data` is not 2-D → [`Error::RankMismatch`],
-  /// - `n_fft == 0`, `hop_length == 0`, or `win_length == 0` → [`Error::InvariantViolation`],
-  /// - `n_fft` is **odd**, `data`'s last dimension `!= n_fft / 2 + 1`,
-  ///   `win_length > n_fft`, or `num_frames == 0` → [`Error::OutOfRange`],
+  /// - `n_fft == 0`, `hop_length == 0`, `win_length == 0`, or `num_frames == 0`
+  ///   → [`Error::InvariantViolation`],
+  /// - `data`'s last dimension `!= n_fft / 2 + 1` → [`Error::LengthMismatch`],
+  /// - `n_fft` is **odd** or `win_length > n_fft` → [`Error::OutOfRange`],
   /// - `data`'s dtype is not `Complex64` → [`Error::DtypeMismatch`].
   ///
   /// Note this does **not** itself reject [`WindowPad::Right`] with
@@ -1429,7 +1430,7 @@ pub fn stft_with_config(
 ///   distorts boundary information, so the reconstruction is wrong even where
 ///   the window-sum is nonzero. [`istft`] therefore **rejects** a [`Spectrum`]
 ///   whose `window_pad` is Right with `win_length != n_fft` up front with a
-///   recoverable [`Error::InvariantViolation`] (such a [`Spectrum`] is a valid forward
+///   recoverable [`Error::OutOfRange`] (such a [`Spectrum`] is a valid forward
 ///   transform — it is what the mel front-end produces — only its *inverse* is
 ///   non-faithful). Use [`WindowPad::Center`] for short-window inversion.
 ///
@@ -1474,9 +1475,9 @@ pub fn stft_with_config(
 /// Returns the reconstructed 1-D real signal (`Dtype::F32`).
 ///
 /// # Errors
-/// - Typed errors: [`Error::InvariantViolation`] if `window_pad` is Right
-///   with `win_length != n_fft`; [`Error::OutOfRange`] if the coverage guard
-///   fires, sizes exceed `i32::MAX`, or the `length` trim is out of range;
+/// - Typed errors: [`Error::OutOfRange`] if `window_pad` is Right with
+///   `win_length != n_fft`, the coverage guard fires, sizes exceed `i32::MAX`,
+///   or the `length` trim is out of range;
 ///   [`Error::CapExceeded`] if the OLA length or scatter work exceeds the cap;
 ///   [`Error::ArithmeticOverflow`] if derived sizes overflow `usize`.
 /// - Propagates window-construction errors from `frame_window` (the shared
@@ -1964,7 +1965,7 @@ impl ISTFTCache {
   /// The **same error surface as [`istft`], including its coverage guard** (this
   /// path caches the raw window-sum and reproduces the guard exactly rather than
   /// flooring — see the [`ISTFTCache`] type docs):
-  /// - [`Error::InvariantViolation`] when the [`Spectrum`]'s `window_pad` is
+  /// - [`Error::OutOfRange`] when the [`Spectrum`]'s `window_pad` is
   ///   [`WindowPad::Right`] and `win_length != n_fft` (short-window right-pad
   ///   inversion is not a faithful inverse — rejected up front),
   /// - [`Error::ArithmeticOverflow`] / [`Error::CapExceeded`] when a derived

@@ -399,9 +399,11 @@ impl AudioPlayer {
   /// `playerNode.play()` (actual playback).
   ///
   /// # Errors
-  /// - [`Error::ExternalOp`] if cpal has no default output device, the config
-  ///   rejects, or the cpal stream build fails (CoreAudio init failure,
-  ///   unsupported sample rate, etc.).
+  /// - [`Error::ExternalOp`] if cpal has no default output device, or the cpal
+  ///   stream build fails (CoreAudio init failure, unsupported sample rate, etc.).
+  /// - [`Error::InvariantViolation`] / [`Error::OutOfRange`] if config validation
+  ///   fails (e.g. zero channels, or a non-F32 sample format) — delegated to
+  ///   [`AudioPlayer::with_device`] / [`PlaybackConfig::cpal_config`].
   pub fn new(config: PlaybackConfig) -> Result<Self> {
     let host = cpal::default_host();
     let device = host.default_output_device().ok_or_else(|| {
