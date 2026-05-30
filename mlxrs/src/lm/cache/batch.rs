@@ -111,8 +111,8 @@ pub(crate) fn validate_kv_compat(keys: &Array, values: &Array) -> Result<()> {
   if ks[0] != vs[0] || ks[1] != vs[1] || ks[2] != vs[2] {
     return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
       "batched KV cache: values shape must match keys on [B, n_kv_heads, S] (head_dim free; mlx-lm raises at `self.values[..., prev:_idx, :] = values`)",
-      vec![ks[0], ks[1], ks[2]].as_slice(),
-      vec![vs[0], vs[1], vs[2]].as_slice(),
+      vec![ks[0], ks[1], ks[2]],
+      vec![vs[0], vs[1], vs[2]],
     )));
   }
   Ok(())
@@ -209,8 +209,8 @@ pub fn dynamic_roll(x: &Array, shifts: &Array, axis: i32) -> Result<Array> {
     // relaxation, not an alternate expectation).
     return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
       "dynamic_roll: shifts must be [B, 1] or [1, 1] (scalar broadcast)",
-      vec![xshape[0], 1usize].as_slice(),
-      sshape.to_vec().as_slice(),
+      vec![xshape[0], 1usize],
+      sshape.to_vec(),
     )));
   }
   let n = xshape[KV_NDIM - 2];

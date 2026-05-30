@@ -332,8 +332,8 @@ impl QuantizedKvCacheImpl {
         };
         return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
           context,
-          vec![ks[0], ks[1], ks[2]].as_slice(),
-          vec![vs[0], vs[1], vs[2]].as_slice(),
+          vec![ks[0], ks[1], ks[2]],
+          vec![vs[0], vs[1], vs[2]],
         )));
       }
       let _ = axis; // axis is informative but the structured pair carries the whole [B, n_kv_heads, S] sub-shape.

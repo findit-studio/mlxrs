@@ -186,8 +186,8 @@ pub(crate) fn broadcast_write_rhs(
       };
       return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
         context,
-        expected.as_slice(),
-        ns.to_vec().as_slice(),
+        expected,
+        ns.to_vec(),
       )));
     }
   }

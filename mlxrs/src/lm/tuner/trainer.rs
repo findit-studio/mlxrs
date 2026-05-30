@@ -422,7 +422,7 @@ where
   if lengths_shape.as_slice() != expected_lengths_shape {
     return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
       "default_loss: lengths must be [B, 2] = (offset, length)",
-      expected_lengths_shape.as_slice().to_vec(),
+      expected_lengths_shape.to_vec(),
       lengths_shape.to_vec(),
     )));
   }

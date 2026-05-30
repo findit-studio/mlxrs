@@ -151,8 +151,8 @@ impl SwitchLinear {
         return Err(crate::Error::ShapePairMismatch(
           ShapePairMismatchPayload::new(
             "SwitchLinear::from_parts: bias must be [num_experts, output_dims]",
-            vec![w_shape[0], w_shape[1]].as_slice(),
-            b_shape.to_vec().as_slice(),
+            vec![w_shape[0], w_shape[1]],
+            b_shape.to_vec(),
           ),
         ));
       }
@@ -418,8 +418,8 @@ impl QuantizedSwitchLinear {
       return Err(crate::Error::ShapePairMismatch(
         ShapePairMismatchPayload::new(
           "QuantizedSwitchLinear::from_parts: scales leading dims (E, O) must match weight",
-          vec![e, o].as_slice(),
-          vec![s_shape[0], s_shape[1]].as_slice(),
+          vec![e, o],
+          vec![s_shape[0], s_shape[1]],
         ),
       ));
     }
@@ -443,8 +443,8 @@ impl QuantizedSwitchLinear {
         return Err(crate::Error::ShapePairMismatch(
           ShapePairMismatchPayload::new(
             "QuantizedSwitchLinear::from_parts: quant_biases shape must match scales (mlx `affine_quantize` writes identical `[E, O, n_groups]` shape)",
-            s_shape.to_vec().as_slice(),
-            qb_shape.to_vec().as_slice(),
+            s_shape.to_vec(),
+            qb_shape.to_vec(),
           ),
         ));
       }
@@ -526,8 +526,8 @@ impl QuantizedSwitchLinear {
         return Err(crate::Error::ShapePairMismatch(
           ShapePairMismatchPayload::new(
             "QuantizedSwitchLinear::from_parts: bias must be [num_experts, output_dims]",
-            vec![e, o].as_slice(),
-            b_shape.to_vec().as_slice(),
+            vec![e, o],
+            b_shape.to_vec(),
           ),
         ));
       }
@@ -1092,8 +1092,8 @@ fn check_glu_shapes(
     return Err(crate::Error::ShapePairMismatch(
       ShapePairMismatchPayload::new(
         "SwitchGLU: gate_proj and up_proj must share [input_dims, hidden_dims]",
-        vec![gi, gh].as_slice(),
-        vec![ui, uh].as_slice(),
+        vec![gi, gh],
+        vec![ui, uh],
       ),
     ));
   }
@@ -1103,8 +1103,8 @@ fn check_glu_shapes(
     return Err(crate::Error::ShapePairMismatch(
       ShapePairMismatchPayload::new(
         "SwitchGLU: down_proj must be the [hidden_dims, input_dims] inverse of gate_proj/up_proj",
-        vec![gh, gi].as_slice(),
-        vec![di, dh].as_slice(),
+        vec![gh, gi],
+        vec![di, dh],
       ),
     ));
   }
@@ -1113,8 +1113,8 @@ fn check_glu_shapes(
     return Err(crate::Error::ShapePairMismatch(
       ShapePairMismatchPayload::new(
         "SwitchGLU: all projections must have the same num_experts (gate_proj, up_proj, down_proj)",
-        vec![ge, ge, ge].as_slice(),
-        vec![ge, ue, de].as_slice(),
+        vec![ge, ge, ge],
+        vec![ge, ue, de],
       ),
     ));
   }
@@ -1191,8 +1191,8 @@ impl SwitchMLP {
       return Err(crate::Error::ShapePairMismatch(
         ShapePairMismatchPayload::new(
           "SwitchMLP: fc2 must be the [hidden_dims, input_dims] inverse of fc1 [input_dims, hidden_dims]",
-          vec![fc1.output_dims(), fc1.input_dims()].as_slice(),
-          vec![fc2.input_dims(), fc2.output_dims()].as_slice(),
+          vec![fc1.output_dims(), fc1.input_dims()],
+          vec![fc2.input_dims(), fc2.output_dims()],
         ),
       ));
     }
