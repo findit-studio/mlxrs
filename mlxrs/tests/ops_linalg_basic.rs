@@ -34,8 +34,8 @@ fn matmul_method_form_matches_freefn() {
 #[test]
 fn inner_1d_arange_yields_dot_product() {
   // a = [0, 1, 2, 3], b = [0, 1, 2, 3] → inner = 0+1+4+9 = 14
-  let a = Array::arange(0.0, 4.0, 1.0).unwrap();
-  let b = Array::arange(0.0, 4.0, 1.0).unwrap();
+  let a = Array::arange::<f32>(0.0, 4.0, 1.0).unwrap();
+  let b = Array::arange::<f32>(0.0, 4.0, 1.0).unwrap();
   let mut r = ops::linalg_basic::inner(&a, &b).unwrap();
   assert_eq!(r.item::<f32>().unwrap(), 14.0);
 }
@@ -51,8 +51,8 @@ fn inner_method_form_matches_freefn() {
 #[test]
 fn outer_1d_arange_yields_outer_product_matrix() {
   // a = [1, 2, 3], b = [4, 5] → outer is 3×2 with rows [4,5], [8,10], [12,15]
-  let a = Array::arange(1.0, 4.0, 1.0).unwrap();
-  let b = Array::arange(4.0, 6.0, 1.0).unwrap();
+  let a = Array::arange::<f32>(1.0, 4.0, 1.0).unwrap();
+  let b = Array::arange::<f32>(4.0, 6.0, 1.0).unwrap();
   let mut r = ops::linalg_basic::outer(&a, &b).unwrap();
   assert_eq!(r.shape(), vec![3, 2]);
   assert_eq!(

@@ -126,8 +126,8 @@ fn invoke_constructor_child(name: &str) -> ! {
     "zeros" => mlxrs::Array::zeros::<f32>(&(2, 2)).map(drop),
     "full" => mlxrs::Array::full::<f32>(&(2, 2), 1.0).map(drop),
     "eye" => mlxrs::Array::eye::<f32>(3, None, 0).map(drop),
-    "arange" => mlxrs::Array::arange(0.0, 4.0, 1.0).map(drop),
-    "linspace" => mlxrs::Array::linspace(0.0, 1.0, 5).map(drop),
+    "arange" => mlxrs::Array::arange::<f32>(0.0, 4.0, 1.0).map(drop),
+    "linspace" => mlxrs::Array::linspace::<f32>(0.0, 1.0, 5).map(drop),
     "from_slice" => mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(3,)).map(drop),
     other => {
       eprintln!("stripped_ctor_constructors: unknown constructor selector {other:?}");

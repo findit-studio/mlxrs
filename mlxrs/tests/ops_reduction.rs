@@ -58,7 +58,7 @@ fn mean_axes_empty_promotes_int_to_float() {
 #[test]
 fn max_of_arange_yields_last() {
   // arange(0, 5) → [0, 1, 2, 3, 4]; max → 4
-  let a = Array::arange(0.0, 5.0, 1.0).unwrap();
+  let a = Array::arange::<f32>(0.0, 5.0, 1.0).unwrap();
   let mut r = a.max(false).unwrap();
   assert_eq!(r.item::<f32>().unwrap(), 4.0);
 }
@@ -120,7 +120,7 @@ fn max_axes_empty_on_non_zero_size_is_identity() {
 
 #[test]
 fn min_of_arange_yields_first() {
-  let a = Array::arange(0.0, 5.0, 1.0).unwrap();
+  let a = Array::arange::<f32>(0.0, 5.0, 1.0).unwrap();
   let mut r = a.min(false).unwrap();
   assert_eq!(r.item::<f32>().unwrap(), 0.0);
 }
