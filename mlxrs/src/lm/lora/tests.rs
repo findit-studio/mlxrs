@@ -5831,3 +5831,252 @@ fn read_adapter_config_non_utf8_body_is_parse_error() {
   }
   std::fs::remove_dir_all(&tmp).ok();
 }
+
+// ═════════════════ coverage backfill: dims helpers, quantized
+// build, requantize-dense, check_adapter_safetensors, dispatch ═════════════════
+
+#[test]
+fn base_input_dims_quantized_non_rank2_weight_is_rank_mismatch() {
+  // `base_input_dims` recovers the logical input width from the *packed*
+  // trailing axis of a quantized weight. A rank-1 packed weight has no
+  // trailing axis (`shape.get(1)` is None) ⇒ the defensive `ok_or_else`
+  // closure fires with Error::RankMismatch naming the quantized base. (Called
+  // directly: a malformed quantized base never passes `validate_factor_shapes`
+  // on the public path, so this exercises the helper's own guard.)
+  let bad_w = Array::zeros::<u32>(&(8usize,)).unwrap(); // rank-1
+  let scales = Array::zeros::<f32>(&(8usize,)).unwrap();
+  let qbiases = Array::zeros::<f32>(&(8usize,)).unwrap();
+  let base = BaseLinear::quantized(
+    bad_w,
+    scales,
+    Some(qbiases),
+    None,
+    32,
+    8,
+    "affine".to_string(),
+  )
+  .unwrap();
+  match base_input_dims(&base).unwrap_err() {
+    Error::RankMismatch(p) => {
+      assert_eq!(p.actual(), 1);
+      assert_eq!(p.actual_shape(), &[8]);
+      assert!(p.context().contains("quantized base weight"));
+    }
+    other => panic!("expected Error::RankMismatch, got {other:?}"),
+  }
+}
+
+#[test]
+fn base_output_dims_rank0_quantized_weight_is_rank_mismatch() {
+  // `base_output_dims` reads the leading weight axis. A rank-0 (scalar)
+  // quantized weight has no leading axis (`shape.first()` is None) ⇒ the
+  // defensive `ok_or_else` closure fires with Error::RankMismatch. Built via a
+  // 0-d `from_slice` (empty shape); `BaseLinear::quantized` does not validate
+  // weight rank, so this reaches the helper's guard directly.
+  let scalar_w = Array::from_slice::<u32>(&[0u32], &[0i32; 0]).unwrap(); // rank-0
+  let scales = Array::zeros::<f32>(&(1usize,)).unwrap();
+  let qbiases = Array::zeros::<f32>(&(1usize,)).unwrap();
+  let base = BaseLinear::quantized(
+    scalar_w,
+    scales,
+    Some(qbiases),
+    None,
+    32,
+    8,
+    "affine".to_string(),
+  )
+  .unwrap();
+  match base_output_dims(&base).unwrap_err() {
+    Error::RankMismatch(p) => {
+      assert_eq!(p.actual(), 0);
+      assert!(p.actual_shape().is_empty());
+      assert!(p.context().contains("output_dims"));
+    }
+    other => panic!("expected Error::RankMismatch, got {other:?}"),
+  }
+}
+
+#[test]
+fn build_base_linear_quantized_success_builds_quantized_base() {
+  // The QLoRA happy path of `build_base_linear`: `quant` resolves a
+  // Quantization for the path AND a `<path>.scales` sibling exists ⇒ a
+  // BaseLinear::Quantized is built from the weight/scales/biases triple plus an
+  // optional output bias (the `.biases` + `.bias` clone branch + the
+  // `BaseLinear::quantized` ctor — the success body the fan_in_fan_out reject
+  // test returns before reaching).
+  //
+  // Oracle: quantize a known dense weight, route it through `build_base_linear`,
+  // and require the reconstructed quantized base's bias-free output to match the
+  // reference dense `x @ Wᵀ` within affine-quant tolerance. The output bias is
+  // re-added on top, so a non-zero bias shifts the result by exactly that bias.
+  let input_dims = 64usize;
+  let output_dims = 2usize;
+  let mut wdata = vec![1.0f32; input_dims];
+  wdata.extend(vec![0.5f32; input_dims]);
+  let dense_w = Array::from_slice::<f32>(&wdata, &(output_dims, input_dims)).unwrap();
+  let x = Array::full::<f32>(&(1usize, input_dims), 1.0).unwrap();
+  // Reference base output WITHOUT bias: x @ Wᵀ = [sum(row0), sum(row1)]
+  //   = [64 * 1.0, 64 * 0.5] = [64, 32].
+  let path = "model.layers.0.self_attn.q_proj";
+  let weight_key = format!("{path}.weight");
+  let (w_q, scales, biases) = ops::quantized::quantize(&dense_w, 32, 8, "affine", None).unwrap();
+  let out_bias = Array::from_slice::<f32>(&[10.0, -20.0], &(output_dims,)).unwrap();
+
+  let mut weights = Weights::new();
+  weights.insert(weight_key.clone(), w_q);
+  weights.insert(format!("{path}.scales"), scales);
+  weights.insert(format!("{path}.biases"), biases.unwrap());
+  weights.insert(format!("{path}.bias"), out_bias);
+
+  let quant = crate::lm::quant::PerLayerQuantization::from_global(crate::lm::quant::Quantization {
+    group_size: 32,
+    bits: 8,
+    mode: crate::lm::quant::QuantMode::Affine,
+  });
+
+  let weight_ref = &weights[&weight_key];
+  let base = build_base_linear(
+    &weights,
+    path,
+    weight_ref,
+    Some(&quant),
+    false, // not fan_in_fan_out
+  )
+  .unwrap();
+  assert!(
+    matches!(base, BaseLinear::Quantized { .. }),
+    "a resolvable quant + .scales sibling must build a quantized base"
+  );
+  // The output bias was carried into the base.
+  assert!(base.bias().is_some());
+
+  // `base_output` adds the output bias: [64, 32] + [10, -20] = [74, 12].
+  let mut out = base.base_output(&x).unwrap();
+  approx_eq(&out.to_vec::<f32>().unwrap(), &[74.0, 12.0], 2e-1);
+}
+
+#[test]
+fn requantize_fused_on_dense_base_returns_dense_unchanged() {
+  // `requantize_fused`'s Dense arm: a dense base re-wraps the fused weight as a
+  // dense BaseLinear unchanged (the quantized re-quantize step is skipped). This
+  // arm is unreachable through `fuse` (which only calls it for a quantized
+  // base), so it is exercised directly to pin the documented dense passthrough.
+  let w = base_weight(); // [2, 3]
+  let bias = Array::from_slice::<f32>(&[1.0, 2.0], &(2usize,)).unwrap();
+  let dense = BaseLinear::dense(base_weight(), None).unwrap();
+  let out = dense
+    .requantize_fused(w, Some(bias))
+    .expect("dense requantize_fused must return a dense base");
+  assert!(
+    matches!(out, BaseLinear::Dense { .. }),
+    "requantize_fused over a dense base must stay dense"
+  );
+  // The fused weight + bias round-trip: x @ Wᵀ + bias with W = base_weight.
+  let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(1, 3)).unwrap();
+  let mut y = out.base_output(&x).unwrap();
+  // base(x) = [1, 2]; + bias [1, 2] = [2, 4].
+  approx_eq(&y.to_vec::<f32>().unwrap(), &[2.0, 4.0], 1e-5);
+}
+
+#[test]
+fn check_adapter_safetensors_missing_file_is_file_io_open() {
+  // Direct call: `check_adapter_safetensors` on a non-existent path surfaces
+  // Error::FileIo(NotFound) from the Open op. (`load_adapters` short-circuits on
+  // a missing file before reaching this helper, so the Open-error arm is only
+  // hit by a direct call.)
+  let tmp = std::env::temp_dir().join(format!("mlxrs_ckst_missing_{}", std::process::id()));
+  std::fs::create_dir_all(&tmp).unwrap();
+  let missing = tmp.join("does_not_exist.safetensors");
+  match check_adapter_safetensors(&missing).unwrap_err() {
+    Error::FileIo(p) => {
+      assert_eq!(p.path(), missing.as_path());
+      assert_eq!(p.op(), FileOp::Open);
+      assert_eq!(p.inner().kind(), std::io::ErrorKind::NotFound);
+    }
+    other => panic!("expected Error::FileIo(NotFound, Open), got {other:?}"),
+  }
+  std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn check_adapter_safetensors_regular_file_within_cap_is_ok() {
+  // The happy path: a small regular file under MAX_ADAPTER_SAFETENSORS_BYTES
+  // passes (open + fstat + is_file + size check all succeed → Ok(())).
+  let tmp = std::env::temp_dir().join(format!("mlxrs_ckst_ok_{}", std::process::id()));
+  std::fs::create_dir_all(&tmp).unwrap();
+  let f = tmp.join("adapters.safetensors");
+  std::fs::write(
+    &f,
+    b"not a real safetensors blob, but a regular file under cap",
+  )
+  .unwrap();
+  assert!(
+    check_adapter_safetensors(&f).is_ok(),
+    "a small regular file must pass the pre-mmap stat gate"
+  );
+  std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn lora_layer_base_on_dora_variant_returns_some() {
+  // `LoraLayer::base` Dora arm: a DoRA-linear layer exposes its BaseLinear via
+  // `base()` (Some), distinct from the embedding variant (None, covered
+  // elsewhere). Pins the Dora match arm of `base`.
+  let dora = LoraLayer::Dora(
+    DoRALinear::new(
+      BaseLinear::dense(base_weight(), None).unwrap(),
+      AdapterParams {
+        lora_a: lora_a(),
+        lora_b: lora_b(),
+        magnitude: Some(Array::from_slice::<f32>(&[3.0, 3.0], &(2usize,)).unwrap()),
+      },
+      2.0,
+    )
+    .unwrap(),
+  );
+  let base = dora.base().expect("Dora variant exposes a BaseLinear");
+  assert!(base.bias().is_none());
+  assert!(dora.base_embedding().is_none());
+}
+
+#[test]
+fn validate_config_rank_dora_context_lora_b_only_drift() {
+  // The DoraLinear arm of `config_rank_vs_lora_b_rank`: lora_a's rank axis
+  // matches the config rank (2) so the lora_a branch passes, but lora_b's
+  // leading axis (3) differs ⇒ the lora_b branch fires with the DoRALinear
+  // context label. (The existing DoRA config-rank test drifts lora_a and
+  // returns before reaching this arm.)
+  let params = AdapterParams {
+    lora_a: Array::zeros::<f32>(&(3usize, 2usize)).unwrap(), // rank axis 2 (matches config)
+    lora_b: Array::zeros::<f32>(&(3usize, 2usize)).unwrap(), // leading axis 3 (drifts)
+    magnitude: None,
+  };
+  let err = validate_config_rank(&params, 2, LinearValidationContext::DoraLinear).unwrap_err();
+  match err {
+    Error::LengthMismatch(p) => {
+      assert!(p.context().contains("DoRALinear"));
+      assert!(p.context().contains("lora_b"));
+      assert_eq!(p.expected(), 2);
+      assert_eq!(p.actual(), 3);
+    }
+    other => panic!("expected Error::LengthMismatch on lora_b (DoRA context), got {other:?}"),
+  }
+}
+
+#[test]
+fn base_embedding_as_linear_tied_head_hand_traced() {
+  // `BaseEmbedding::as_linear` is `x @ weightᵀ` (the tied-weight LM-head path).
+  // With a known table its output is a plain hand-computable matmul. Pins the
+  // helper directly (independently of the DoRAEmbedding fuse round-trip).
+  //
+  // weight (num_embeddings=2, dims=3):
+  //   [[1, 2, 3],
+  //    [4, 5, 6]]
+  // x = [[1, 0, 1]] (1×3). x @ weightᵀ = [[1*1+0*2+1*3, 1*4+0*5+1*6]] = [[4, 10]].
+  let weight = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
+  let base = BaseEmbedding::dense(weight).unwrap();
+  let x = Array::from_slice::<f32>(&[1.0, 0.0, 1.0], &(1, 3)).unwrap();
+  let mut out = base.as_linear(&x).unwrap();
+  assert_eq!(out.shape(), &[1, 2]);
+  approx_eq(&out.to_vec::<f32>().unwrap(), &[4.0, 10.0], 1e-5);
+}

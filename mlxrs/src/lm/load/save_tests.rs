@@ -4270,3 +4270,205 @@ fn write_json_pretty_write_failure_on_readonly_fd() {
   assert_eq!(p.path(), path.as_path());
   let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ─────────────────────── path_is_file: non-NotFound stat error ───────────────────────
+
+/// `path_is_file` distinguishes the absent path (`Ok(false)`) from a genuine
+/// stat *failure* (`Err`). A symlink whose target is itself makes
+/// `std::fs::metadata` (which FOLLOWS symlinks) fail with `ELOOP` — an error
+/// that is NOT `NotFound`, so the `Err(e) => Err(Error::FileIo(..Stat..))`
+/// arm fires rather than the absent-`Ok(false)` arm. Driven through
+/// `load_weights`: with no index file present (`load_via_index` returns
+/// `Ok(None)`), the second resolver tier probes `<dir>/model.safetensors`
+/// via `path_is_file`; a self-referential symlink at that path trips the
+/// stat-error arm.
+#[cfg(unix)]
+#[test]
+fn path_is_file_self_symlink_loop_is_stat_error() {
+  let dir = fresh_dir("path-is-file-eloop");
+  // No `model.safetensors.index.json` → `load_via_index` returns Ok(None),
+  // so resolution reaches step 2's `path_is_file(model.safetensors)`.
+  assert!(!dir.join("model.safetensors.index.json").exists());
+  // A symlink pointing at itself: `metadata` follows the link and loops →
+  // ELOOP (an error that is NOT NotFound). The absent-path arm would
+  // return Ok(false); this must instead surface the stat failure.
+  let loop_path = dir.join("model.safetensors");
+  std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+  // Sanity: the entry exists as a symlink even though its target resolution
+  // loops — so this is NOT the NotFound (absent) case.
+  assert!(
+    std::fs::symlink_metadata(&loop_path)
+      .unwrap()
+      .file_type()
+      .is_symlink(),
+    "the planted entry must be a symlink (the loop is in target resolution)"
+  );
+
+  let r = load_weights(&dir);
+  let Err(Error::FileIo(p)) = r else {
+    panic!("a self-symlink-loop model.safetensors must be an Error::FileIo, got {r:?}");
+  };
+  // The error originates in `path_is_file` (its static context), op = Stat,
+  // and names the offending path.
+  assert_eq!(p.context(), "path_is_file");
+  assert_eq!(p.op(), FileOp::Stat);
+  assert_eq!(p.path(), loop_path.as_path());
+  // The whole point of the arm: this is NOT the absent-`Ok(false)` NotFound
+  // path — a real stat error (ELOOP, surfaced by the OS) is preserved.
+  assert_ne!(
+    p.inner().kind(),
+    std::io::ErrorKind::NotFound,
+    "a stat ELOOP must NOT be classified as NotFound (that path returns Ok(false))"
+  );
+
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────────────── collect_sorted: per-entry stat error ───────────────────────
+
+/// `collect_sorted` stats every matching entry (following symlinks) to keep
+/// only regular files. A **dangling symlink** whose name matches the
+/// predicate makes `std::fs::metadata(entry.path())` fail (the target is
+/// missing) — and unlike `path_is_file`, this arm does NOT special-case
+/// `NotFound`: ANY stat error on a matched entry surfaces as
+/// [`Error::FileIo`] (`Stat`) naming the offending entry path. Exercises the
+/// `Err(e) => return Err(..)` arm of the per-entry metadata match (distinct
+/// from the `Ok(m) if m.is_file()` keep arm and the `Ok(_) => continue`
+/// skip-non-regular arm, both covered by
+/// `collect_sorted_skips_matching_subdirectory_keeps_file`).
+#[cfg(unix)]
+#[test]
+fn collect_sorted_dangling_symlink_entry_stat_error() {
+  let dir = fresh_dir("collect-sorted-dangling-symlink");
+  // A dangling symlink that matches the predicate: the link entry exists in
+  // the directory listing, but its target does not, so `fs::metadata`
+  // (which follows the link) fails. The entry name ends in `.safetensors`
+  // so the predicate selects it and the stat runs.
+  let link = dir.join("dangling.safetensors");
+  let missing_target = dir.join("nonexistent-target-file");
+  std::os::unix::fs::symlink(&missing_target, &link).unwrap();
+  // Sanity: the symlink entry IS listed (lstat sees it) but its target is
+  // absent (stat-through fails).
+  assert!(
+    std::fs::symlink_metadata(&link)
+      .unwrap()
+      .file_type()
+      .is_symlink(),
+    "the planted entry must be a (dangling) symlink"
+  );
+  assert!(
+    std::fs::metadata(&link).is_err(),
+    "stat-through the dangling symlink must fail (target is missing)"
+  );
+
+  let r = collect_sorted(&dir, |n| n.ends_with(".safetensors"));
+  let Err(Error::FileIo(p)) = r else {
+    panic!("a dangling matched symlink must be an Error::FileIo, got {r:?}");
+  };
+  assert_eq!(p.context(), "collect_sorted: cannot stat entry");
+  assert_eq!(p.op(), FileOp::Stat);
+  assert_eq!(
+    p.path(),
+    link.as_path(),
+    "the error must name the offending entry path"
+  );
+
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────── save_model: staged-failure cleanup (shard + index tmp) ───────────────
+
+/// `save_model`'s staging closure cleans up EVERY staged tempfile — both
+/// the shard tempfiles AND the index tempfile — when staging fails AFTER at
+/// least one shard plus the index have been staged. The earlier failure
+/// tests (`save_model_failed_save_keeps_previous_checkpoint_intact`) fail at
+/// the FIRST shard's `open_excl_temp_shard`, so `staged_shards` is still
+/// empty and `staged_index` is still `None` when the cleanup runs — neither
+/// the shard-cleanup loop nor the index-cleanup branch executes. This test
+/// drives a failure on the INDEX fsync (the last staging step), so when the
+/// closure returns `Err` there is exactly one staged shard tempfile (the
+/// shard fsync was skipped → passed) AND a staged index tempfile, exercising
+/// BOTH the `for (tmp, _) in &staged_shards { remove_file(tmp) }` loop and
+/// the `if let Some((tmp, _)) = &staged_index { remove_file(tmp) }` branch.
+///
+/// The injection: `arm_fsync_path_fault(1)` makes the FIRST
+/// `fsync_open_file_for_path` call (the single shard's fsync) pass and the
+/// SECOND (the index's fsync) fail. A single small weight produces exactly
+/// one shard, so the shard fsync is call #1 and the index fsync is call #2.
+/// The contract:
+///
+/// 1. `save_model` returns `Err(Error::FileIo(Fsync))` carrying the injected
+///    failure (the staged closure's error is propagated unchanged).
+/// 2. NO `.tmp.safetensors` remains on disk — both the staged shard
+///    tempfile (cleanup loop) and the staged index tempfile (cleanup
+///    branch) were removed.
+/// 3. NO final shard was published and NO index was committed (the failure
+///    is in staging, strictly before the publish/commit phase).
+#[test]
+fn save_model_staged_index_fsync_failure_cleans_shard_and_index_tempfiles() {
+  let dir = fresh_dir("save-staged-index-fsync-cleanup");
+  let mut w: Weights = HashMap::new();
+  // One small weight → exactly one shard (fits the 5-GiB cap), so the shard
+  // fsync is the 1st `fsync_open_file_for_path` call and the index fsync is
+  // the 2nd.
+  w.insert(
+    "only.weight".to_string(),
+    Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(3usize,)).unwrap(),
+  );
+
+  // skip=1: the shard fsync (call #1) is skipped → passes; the index fsync
+  // (call #2) fires. The staged closure then returns Err with one staged
+  // shard tempfile AND a staged index tempfile present.
+  let _guard = arm_fsync_path_fault(1);
+  let r = save_model(&dir, &w, &PerLayerQuantization::default());
+  drop(_guard);
+
+  // (1) The injected index-fsync failure propagates as Err(FileIo(Fsync)).
+  let Err(Error::FileIo(p)) = r else {
+    panic!("the staged index-fsync failure must propagate as Error::FileIo, got {r:?}");
+  };
+  assert_eq!(p.op(), FileOp::Fsync);
+  assert!(
+    p.inner()
+      .to_string()
+      .contains("injected fsync_path failure"),
+    "the propagated error must carry the injected fsync message, got: {}",
+    p.inner()
+  );
+
+  // (2) Both staged tempfiles were cleaned up — the shard-cleanup loop AND
+  // the index-cleanup branch both ran. No `.tmp.safetensors` may remain.
+  let leftover_tmp = std::fs::read_dir(&dir)
+    .unwrap()
+    .filter_map(|e| e.ok())
+    .any(|e| {
+      e.file_name()
+        .to_string_lossy()
+        .ends_with(".tmp.safetensors")
+    });
+  assert!(
+    !leftover_tmp,
+    "every staged tempfile (shard + index) must be removed on a staging failure"
+  );
+
+  // (3) The failure happened during STAGING — before any final shard was
+  // published and before the index was committed. The directory holds no
+  // published shard and no index file.
+  let published_shard = std::fs::read_dir(&dir)
+    .unwrap()
+    .filter_map(|e| e.ok())
+    .any(|e| {
+      let n = e.file_name().to_string_lossy().into_owned();
+      n.starts_with("model-gen-") && n.ends_with(".safetensors")
+    });
+  assert!(
+    !published_shard,
+    "no final shard may be published when staging fails"
+  );
+  assert!(
+    !dir.join("model.safetensors.index.json").exists(),
+    "no index may be committed when staging fails"
+  );
+
+  let _ = std::fs::remove_dir_all(&dir);
+}

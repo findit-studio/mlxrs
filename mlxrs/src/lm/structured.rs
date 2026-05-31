@@ -530,3 +530,6 @@ pub fn build_json_schema_logits_processor(
 ) -> Result<LLGuidanceLogitsProcessor> {
   LLGuidanceLogitsProcessor::new(GrammarSpec::JsonSchema(schema), tokenizer, model_vocab_size)
 }
+
+#[cfg(test)]
+mod tests;

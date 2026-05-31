@@ -183,3 +183,136 @@ fn load_image_corrupt_png_returns_parse_error() {
     other => panic!("expected Error::Parse from the decode path, got {other:?}"),
   }
 }
+
+// -- rotate_buf / rotate_buf_u8 element-count overflow gate -----------
+//
+// `rotate_buf<T>` and `rotate_buf_u8` each compute the destination
+// element count `w * h * channels` in `usize` via a `checked_mul`
+// chain and surface a wrap as a typed `ArithmeticOverflow` (naming the
+// w/h/channels operands) BEFORE the `try_reserve_exact` allocation and
+// the per-pixel copy loop. The sibling `apply_orientation_tests.rs`
+// notes (see `rotate90_accepts_small_image_within_budget`) that this
+// negative path "can't be constructed without OOM-ing the test
+// process" via a real `DynamicImage` — but the helpers take the
+// dimensions as plain `u32` arguments decoupled from any backing
+// buffer, so we can drive the overflow directly with hostile dims and
+// an EMPTY source slice: the `checked_mul` fires and returns `Err`
+// before the source slice is ever indexed (the `debug_assert_eq!` on
+// `src.len()` and the copy loop are both downstream of the early
+// return), so no allocation and no out-of-bounds read occurs.
+//
+// `u32::MAX as usize` * `u32::MAX as usize` = 18_446_744_065_119_617_025
+// which still FITS in a 64-bit `usize` (< usize::MAX), so the wrap
+// happens at the trailing `* channels` step (channels >= 2) — exercising
+// the full `and_then(|wh| wh.checked_mul(channels))` arm rather than the
+// first multiply. The project ships only 64-bit targets; on a (hypothetical)
+// 32-bit usize the wrap would instead fire at the `w * h` step but still
+// yield the same `ArithmeticOverflow` variant with all three operands, so
+// the assertions below hold regardless of pointer width.
+
+#[test]
+fn rotate_buf_element_count_overflow_is_typed_arithmetic_error() {
+  // `rotate_buf::<u8>` with `channels = 2` (the LumaA8 stride). Empty
+  // source slice — the overflow check precedes any `src` access.
+  let err = rotate_buf::<u8>(&[], u32::MAX, u32::MAX, 2, RotateKind::Rotate90)
+    .expect_err("w * h * channels must overflow usize for u32::MAX dims and channels=2");
+  match err {
+    Error::ArithmeticOverflow(p) => {
+      assert_eq!(
+        p.context(),
+        "rotate_buf: elements (w * h * channels)",
+        "context must name the rotate_buf element-count expression"
+      );
+      assert_eq!(p.op_type(), "usize", "the overflowing result type is usize");
+      // All three runtime operands are recorded for the diagnostic.
+      let ops = p.operands();
+      assert_eq!(ops.len(), 3, "w, h, and channels operands are all carried");
+      assert_eq!(ops[0], ("w", u64::from(u32::MAX)));
+      assert_eq!(ops[1], ("h", u64::from(u32::MAX)));
+      assert_eq!(ops[2], ("channels", 2));
+    }
+    other => panic!("expected ArithmeticOverflow from rotate_buf, got {other:?}"),
+  }
+}
+
+#[test]
+fn rotate_buf_element_count_overflow_independent_of_rotation_kind() {
+  // The overflow gate runs before the `match rotation` index math, so
+  // every `RotateKind` reaches it identically. Sweep all four with a
+  // wider channel stride (4 = Rgba) to cover the same closure from the
+  // other rotate variants without constructing a hostile image.
+  for kind in [
+    RotateKind::Rotate90,
+    RotateKind::Rotate270,
+    RotateKind::Rotate90FlipH,
+    RotateKind::Rotate270FlipH,
+  ] {
+    let err = rotate_buf::<f32>(&[], u32::MAX, u32::MAX, 4, kind)
+      .expect_err("w * h * 4 must overflow usize for u32::MAX dims regardless of rotation");
+    match err {
+      Error::ArithmeticOverflow(p) => {
+        assert_eq!(p.context(), "rotate_buf: elements (w * h * channels)");
+        assert_eq!(p.operands().last(), Some(&("channels", 4)));
+      }
+      other => panic!("expected ArithmeticOverflow for {kind:?}, got {other:?}"),
+    }
+  }
+}
+
+#[test]
+fn rotate_buf_u8_element_count_overflow_is_typed_arithmetic_error() {
+  // The SIMD-routed u8 helper shares the same `checked_mul` gate and
+  // the same early-return-before-alloc/SIMD ordering, with its own
+  // distinct context label. `channels = 4` is the Rgba8 hot-path
+  // stride. Empty source slice — the overflow returns before the
+  // `try_reserve_exact`, the `set_len`, and the SIMD dispatch.
+  let err = rotate_buf_u8(&[], u32::MAX, u32::MAX, 4, RotateKind::Rotate90)
+    .expect_err("w * h * 4 must overflow usize for u32::MAX dims");
+  match err {
+    Error::ArithmeticOverflow(p) => {
+      assert_eq!(
+        p.context(),
+        "rotate_buf_u8: elements (w * h * channels)",
+        "context must name the rotate_buf_u8 element-count expression"
+      );
+      assert_eq!(p.op_type(), "usize");
+      let ops = p.operands();
+      assert_eq!(ops.len(), 3);
+      assert_eq!(ops[0], ("w", u64::from(u32::MAX)));
+      assert_eq!(ops[1], ("h", u64::from(u32::MAX)));
+      assert_eq!(ops[2], ("channels", 4));
+    }
+    other => panic!("expected ArithmeticOverflow from rotate_buf_u8, got {other:?}"),
+  }
+}
+
+// -- rotate_buf success path on a non-overflowing tiny input ---------
+//
+// A direct (rather than via-`apply_orientation_fallible`) call to the
+// generic helper on a 2x1 buffer confirms the post-gate path — the
+// `try_reserve_exact` + `resize` + permutation loop — returns the
+// rotated buffer with the swapped-extent length, closing the bridge
+// between the overflow-gate tests above (which return before the loop)
+// and the byte-identical image-rs parity tests in
+// `apply_orientation_tests.rs` (which go through the public entry).
+
+#[test]
+fn rotate_buf_rotate90_tiny_luma_permutes_into_swapped_extent() {
+  // 2x1 Luma8 (channels = 1): source pixels [a, b] at (0,0) and (1,0).
+  // Rotate90 maps (x, y) -> (h-1-y, x) with output dims (h, w) = (1, 2),
+  // i.e. a 1-wide, 2-tall buffer. With h=1: (0,0)->(0,0), (1,0)->(0,1).
+  // Output buffer (row-major over out_w=1) is therefore [a, b] — the
+  // same two values, now stacked vertically. Length must be 2 (1*2*1).
+  let src: [u8; 2] = [7, 9];
+  let dst =
+    rotate_buf::<u8>(&src, 2, 1, 1, RotateKind::Rotate90).expect("2x1 rotate90 well under cap");
+  assert_eq!(dst.len(), 2, "1*2*channels(1) destination element count");
+  // out_w = rotated_dims(2,1).0 = src_h = 1. dst_off for (nx=h-1-y, ny=x):
+  //   src (0,0) -> (nx=0, ny=0) -> off 0
+  //   src (1,0) -> (nx=0, ny=1) -> off 1
+  assert_eq!(
+    dst,
+    vec![7, 9],
+    "Rotate90 of a single row stacks the pixels"
+  );
+}
