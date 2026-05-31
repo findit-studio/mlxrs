@@ -19,3 +19,7 @@ Cargo.lock
 
 **.claude/
 **docs/
+
+# Local model weights for dev/testing (whisper, wav2vec2, lfm2-vl, …) — never
+# committed. Root-anchored so it does NOT hide the source `src/**/models/` dirs.
+/models/
