@@ -530,4 +530,272 @@ mod tests {
     let spare = out.spare_capacity_mut();
     mel_filter_bank_rows(spare, &all_freqs, &f_pts, n_mels);
   }
+
+  // ── Scalar-reference direct coverage ──────────────────────────────
+  //
+  // The dispatcher routes to the NEON arm on a NEON-capable aarch64
+  // host, so the scalar reference's own preconditions / zero-width
+  // path are only exercised when the scalar kernel is called directly
+  // (here) or when the dispatcher falls through to it (a
+  // `--cfg mlxrs_force_scalar` build, or a non-aarch64 target). These
+  // tests call `mel_filter_bank_rows_scalar` directly so the scalar
+  // arm's lines are covered independent of the runtime NEON decision.
+
+  /// Hand-computed triangle oracle (NOT a self-comparison): a known
+  /// `(all_freqs, f_pts)` pair with closed-form rising/falling edges.
+  /// Row m=0 has left=0, center=200, right=400 (lc=cr=200); the
+  /// per-cell weight is `min((freq-left)/lc, (right-freq)/cr).max(0)`.
+  #[test]
+  fn mel_filter_bank_scalar_matches_handcomputed_triangle() {
+    let n_mels = 1usize;
+    let all_freqs = vec![0.0_f32, 100.0, 200.0, 300.0, 400.0, 500.0];
+    let n_freqs = all_freqs.len();
+    // n_mels + 2 == 3 points → one triangle [0, 200, 400].
+    let f_pts = vec![0.0_f32, 200.0, 400.0];
+    let mut out: Vec<f32> = Vec::with_capacity(n_mels * n_freqs);
+    let spare = out.spare_capacity_mut();
+    mel_filter_bank_rows_scalar(&mut spare[..n_mels * n_freqs], &all_freqs, &f_pts, n_mels);
+    // SAFETY: kernel contract initializes every slot.
+    unsafe { out.set_len(n_mels * n_freqs) };
+    // up   = (freq - 0) / 200, down = (400 - freq) / 200, v = min.max(0)
+    //   0   -> min(0.0, 2.0) = 0.0
+    //   100 -> min(0.5, 1.5) = 0.5
+    //   200 -> min(1.0, 1.0) = 1.0
+    //   300 -> min(1.5, 0.5) = 0.5
+    //   400 -> min(2.0, 0.0) = 0.0
+    //   500 -> min(2.5, -0.5).max(0) = 0.0
+    let expected = [0.0_f32, 0.5, 1.0, 0.5, 0.0, 0.0];
+    for (i, (&got, &want)) in out.iter().zip(expected.iter()).enumerate() {
+      assert!(
+        (got - want).abs() <= 1e-6,
+        "hand-computed triangle mismatch i={i}: got={got} want={want}"
+      );
+    }
+  }
+
+  /// Scalar zero-width row: collapse `f_pts[m+1] == f_pts[m]` so
+  /// `lc <= 0` and the whole row is written 0.0 via the scalar
+  /// zero-width loop. `n_freqs = 6` (not a multiple of 4) so the loop
+  /// spans the full row length, not just lane-aligned cells.
+  #[test]
+  fn mel_filter_bank_scalar_collapsed_row_is_zero() {
+    let n_mels = 3usize;
+    let n_freqs = 6usize; // n_freqs % 4 == 2
+    let all_freqs: Vec<f32> = (0..n_freqs).map(|k| 100.0 * k as f32).collect();
+    // f_pts[1] == f_pts[2] → row m=1 has lc = 0 (zero-width triangle).
+    let f_pts = vec![0.0_f32, 500.0, 500.0, 1500.0, 2000.0];
+    let mut out: Vec<f32> = Vec::with_capacity(n_mels * n_freqs);
+    let spare = out.spare_capacity_mut();
+    mel_filter_bank_rows_scalar(&mut spare[..n_mels * n_freqs], &all_freqs, &f_pts, n_mels);
+    // SAFETY: kernel writes every slot.
+    unsafe { out.set_len(n_mels * n_freqs) };
+    for k in 0..n_freqs {
+      assert_eq!(
+        out[n_freqs + k],
+        0.0,
+        "scalar collapsed row m=1 cell k={k} should be 0.0"
+      );
+    }
+  }
+
+  #[test]
+  #[should_panic(
+    expected = "mel_filter_bank_rows_scalar: out.len() (3) must equal n_mels * n_freqs"
+  )]
+  fn mel_filter_bank_scalar_panics_on_size_mismatch() {
+    let all_freqs = vec![100.0_f32, 200.0, 300.0, 400.0]; // n_freqs = 4
+    let f_pts = vec![0.0_f32, 200.0, 400.0, 600.0]; // n_mels = 2 → 4 pts
+    let mut out: Vec<f32> = Vec::with_capacity(3); // WRONG: should be 2*4 = 8
+    let spare = out.spare_capacity_mut();
+    mel_filter_bank_rows_scalar(&mut spare[..3], &all_freqs, &f_pts, 2);
+  }
+
+  #[test]
+  #[should_panic(
+    expected = "mel_filter_bank_rows_scalar: f_pts.len() (5) must equal n_mels + 2 (4)"
+  )]
+  fn mel_filter_bank_scalar_panics_on_f_pts_size_mismatch() {
+    let all_freqs = vec![100.0_f32, 200.0, 300.0]; // n_freqs = 3
+    let f_pts = vec![0.0_f32, 200.0, 400.0, 600.0, 800.0]; // n_mels=2 expects 4
+    let mut out: Vec<f32> = Vec::with_capacity(6);
+    let spare = out.spare_capacity_mut();
+    mel_filter_bank_rows_scalar(&mut spare[..6], &all_freqs, &f_pts, 2);
+  }
+
+  /// Scalar arm's `checked_mul` overflow guard (same defect class as
+  /// the dispatcher's). `n_mels = usize::MAX / 4 + 1, n_freqs = 4`
+  /// wraps the product; the explicit panic must fire before the
+  /// size-equality / `f_pts.len()` asserts (so the empty `out` and
+  /// short `f_pts` never reach their checks).
+  #[test]
+  #[should_panic(expected = "overflow usize")]
+  fn mel_filter_bank_scalar_panics_on_dimension_overflow() {
+    let n_mels = usize::MAX / 4 + 1;
+    let all_freqs = vec![0.0_f32; 4]; // n_freqs = 4 → product overflows
+    let f_pts = vec![0.0_f32; 4];
+    let mut out: Vec<f32> = Vec::new();
+    let spare = out.spare_capacity_mut();
+    mel_filter_bank_rows_scalar(spare, &all_freqs, &f_pts, n_mels);
+  }
+
+  // ── NEON-arm direct coverage (aarch64) ────────────────────────────
+  //
+  // The NEON kernel is `#[cfg(target_arch = "aarch64")]`, private, and
+  // `#[target_feature(enable = "neon")]`. Its own precondition asserts
+  // are defensive duplicates that the dispatcher's asserts shadow (the
+  // dispatcher validates before dispatching), so they are only
+  // reachable by calling `mel_filter_bank_rows_neon` directly. NEON is
+  // baseline-present on every aarch64 host (Apple silicon included),
+  // so the direct `unsafe` call is sound; the `is_neon_available()`
+  // guard mirrors the sibling kernels' idiom and keeps these tests
+  // green under `--cfg mlxrs_force_scalar` (where the dispatcher would
+  // route to scalar but the CPU still physically has NEON).
+
+  /// NEON zero-width row WITH a scalar tail: collapse row m=1 and use
+  /// `n_freqs = 6` (`% 4 == 2`) so `body_len = 4` and the tail loop
+  /// `for kk in body_len..n_freqs` writes the trailing 2 cells via the
+  /// scalar `out[row_off + kk].write(0.0)` path. Covers both the
+  /// 4-lane `vst1q_f32(_, zero)` body and the scalar zero tail.
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  fn mel_filter_bank_neon_collapsed_row_with_tail_is_zero() {
+    if !crate::simd::is_neon_available() {
+      return;
+    }
+    let n_mels = 3usize;
+    let n_freqs = 6usize; // body_len = 4, tail = 2
+    let all_freqs: Vec<f32> = (0..n_freqs).map(|k| 100.0 * k as f32).collect();
+    // f_pts[1] == f_pts[2] → row m=1 collapses (lc = 0).
+    let f_pts = vec![0.0_f32, 500.0, 500.0, 1500.0, 2000.0];
+    let mut out: Vec<f32> = Vec::with_capacity(n_mels * n_freqs);
+    let spare = out.spare_capacity_mut();
+    // SAFETY: NEON checked above; out.len() == n_mels * n_freqs and
+    // f_pts.len() == n_mels + 2; the kernel writes every slot.
+    unsafe {
+      super::mel_filter_bank_rows_neon(&mut spare[..n_mels * n_freqs], &all_freqs, &f_pts, n_mels);
+      out.set_len(n_mels * n_freqs);
+    }
+    for k in 0..n_freqs {
+      assert_eq!(
+        out[n_freqs + k],
+        0.0,
+        "NEON collapsed row m=1 cell k={k} should be 0.0 (incl. tail)"
+      );
+    }
+  }
+
+  /// NEON non-collapsed row through the direct kernel, with a tail
+  /// (`n_freqs = 6`), checked against the hand-computed triangle so the
+  /// 4-lane body AND scalar tail of the value path are exercised and
+  /// pinned to the closed-form (not a self-comparison).
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  fn mel_filter_bank_neon_matches_handcomputed_triangle_with_tail() {
+    if !crate::simd::is_neon_available() {
+      return;
+    }
+    let n_mels = 1usize;
+    let all_freqs = vec![0.0_f32, 100.0, 200.0, 300.0, 400.0, 500.0]; // 6 → tail of 2
+    let n_freqs = all_freqs.len();
+    let f_pts = vec![0.0_f32, 200.0, 400.0]; // triangle [0, 200, 400]
+    let mut out: Vec<f32> = Vec::with_capacity(n_mels * n_freqs);
+    let spare = out.spare_capacity_mut();
+    // SAFETY: NEON checked above; sizes match; kernel writes every slot.
+    unsafe {
+      super::mel_filter_bank_rows_neon(&mut spare[..n_mels * n_freqs], &all_freqs, &f_pts, n_mels);
+      out.set_len(n_mels * n_freqs);
+    }
+    let expected = [0.0_f32, 0.5, 1.0, 0.5, 0.0, 0.0];
+    for (i, (&got, &want)) in out.iter().zip(expected.iter()).enumerate() {
+      // Reciprocal-hoist body vs subtract-then-divide tail differ by
+      // <= 2 ULP from the closed form.
+      assert!(
+        (got - want).abs() <= 1e-6,
+        "NEON hand-computed triangle mismatch i={i}: got={got} want={want}"
+      );
+    }
+  }
+
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  #[should_panic(expected = "mel_filter_bank_rows_neon: out.len() (3) must equal n_mels * n_freqs")]
+  fn mel_filter_bank_neon_panics_on_size_mismatch() {
+    if !crate::simd::is_neon_available() {
+      panic!(
+        "mel_filter_bank_rows_neon: out.len() (3) must equal n_mels * n_freqs (skipped — NEON unavailable)"
+      );
+    }
+    let all_freqs = vec![100.0_f32, 200.0, 300.0, 400.0]; // n_freqs = 4
+    let f_pts = vec![0.0_f32, 200.0, 400.0, 600.0]; // n_mels = 2 → 4 pts
+    let mut out: Vec<f32> = Vec::with_capacity(3); // WRONG: should be 8
+    let spare = out.spare_capacity_mut();
+    // SAFETY: NEON checked; expected-panic test on the intentional size
+    // mismatch (precondition #2) before any pointer arithmetic.
+    unsafe { super::mel_filter_bank_rows_neon(&mut spare[..3], &all_freqs, &f_pts, 2) };
+  }
+
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  #[should_panic(expected = "mel_filter_bank_rows_neon: f_pts.len() (5) must equal n_mels + 2 (4)")]
+  fn mel_filter_bank_neon_panics_on_f_pts_size_mismatch() {
+    if !crate::simd::is_neon_available() {
+      panic!(
+        "mel_filter_bank_rows_neon: f_pts.len() (5) must equal n_mels + 2 (4) (skipped — NEON unavailable)"
+      );
+    }
+    let all_freqs = vec![100.0_f32, 200.0, 300.0]; // n_freqs = 3
+    let f_pts = vec![0.0_f32, 200.0, 400.0, 600.0, 800.0]; // n_mels = 2 expects 4
+    let mut out: Vec<f32> = Vec::with_capacity(6);
+    let spare = out.spare_capacity_mut();
+    // SAFETY: NEON checked; expected-panic on the f_pts length
+    // precondition, which fires before any pointer arithmetic.
+    unsafe { super::mel_filter_bank_rows_neon(&mut spare[..6], &all_freqs, &f_pts, 2) };
+  }
+
+  /// NEON arm's `checked_mul` overflow guard. The explicit panic fires
+  /// before the size-equality / `f_pts.len()` asserts, so the empty
+  /// `out` and short `f_pts` never reach their checks.
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  #[should_panic(expected = "overflow usize")]
+  fn mel_filter_bank_neon_panics_on_dimension_overflow() {
+    if !crate::simd::is_neon_available() {
+      panic!("dimensions overflow usize (skipped — NEON unavailable)");
+    }
+    let n_mels = usize::MAX / 4 + 1;
+    let all_freqs = vec![0.0_f32; 4]; // n_freqs = 4 → product overflows
+    let f_pts = vec![0.0_f32; 4];
+    let mut out: Vec<f32> = Vec::new();
+    let spare = out.spare_capacity_mut();
+    // SAFETY: NEON checked; expected-panic on the checked_mul overflow,
+    // which fires before any pointer arithmetic.
+    unsafe { super::mel_filter_bank_rows_neon(spare, &all_freqs, &f_pts, n_mels) };
+  }
+
+  /// Dispatcher fall-through to the scalar arm with a collapsed row and
+  /// a non-multiple-of-4 `n_freqs`. On a NEON host this routes through
+  /// the NEON arm; under `--cfg mlxrs_force_scalar` (or a non-aarch64
+  /// target) the dispatcher takes the scalar fall-through, exercising
+  /// the dispatcher's final `mel_filter_bank_rows_scalar(...)` call and
+  /// the scalar zero-width path through it. Asserted invariant (row is
+  /// all-zero) holds on both arms.
+  #[test]
+  fn mel_filter_bank_dispatch_collapsed_row_with_tail_is_zero() {
+    let n_mels = 3usize;
+    let n_freqs = 6usize; // n_freqs % 4 == 2
+    let all_freqs: Vec<f32> = (0..n_freqs).map(|k| 100.0 * k as f32).collect();
+    let f_pts = vec![0.0_f32, 500.0, 500.0, 1500.0, 2000.0]; // row m=1 collapses
+    let mut out: Vec<f32> = Vec::with_capacity(n_mels * n_freqs);
+    let spare = out.spare_capacity_mut();
+    mel_filter_bank_rows(&mut spare[..n_mels * n_freqs], &all_freqs, &f_pts, n_mels);
+    // SAFETY: kernel writes every slot.
+    unsafe { out.set_len(n_mels * n_freqs) };
+    for k in 0..n_freqs {
+      assert_eq!(
+        out[n_freqs + k],
+        0.0,
+        "dispatch collapsed row m=1 cell k={k} should be 0.0"
+      );
+    }
+  }
 }

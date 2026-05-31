@@ -455,3 +455,162 @@ fn rotate90_accepts_small_image_within_budget() {
   assert_eq!(out.width(), 1);
   assert_eq!(out.height(), 1);
 }
+
+// -- LumaA16 / Rgba16 / Rgba32F manual rotation parity ---------------
+//
+// The u8 (Luma8/LumaA8/Rgb8/Rgba8), Luma16/Rgb16, and Rgb32F per-variant
+// arms of `apply_rotate_fallible` are already exercised above. These
+// three close the remaining `DynamicImage` arms: `ImageLumaA16`
+// (2-channel u16), `ImageRgba16` (4-channel u16), and `ImageRgba32F`
+// (4-channel f32). Each compares byte-for-byte against the matching
+// `image::imageops::rotate*` reference so the per-variant `from_raw`
+// reconstruction + the generic `rotate_buf<T>` index math is verified
+// for these element widths.
+
+/// `LumaA16` (grayscale + alpha, both u16) test image: luma encodes the
+/// row-major index in the high byte, alpha its complement, so each
+/// subpixel position is individually traceable through a rotation.
+fn xy_encoded_luma_alpha16(width: u32, height: u32) -> DynamicImage {
+  let mut buf: ImageBuffer<LumaA<u16>, Vec<u16>> = ImageBuffer::new(width, height);
+  for y in 0..height {
+    for x in 0..width {
+      let idx = (y * width + x) as u16;
+      // luma = (idx << 8) | 0x33, alpha = 0xFF00 - luma-high so the two
+      // u16 channels carry distinct, non-zero high bytes.
+      buf.put_pixel(x, y, LumaA([(idx << 8) | 0x0033, 0xFF00 - (idx << 8)]));
+    }
+  }
+  DynamicImage::ImageLumaA16(buf)
+}
+
+/// `Rgba16` (four u16 channels) test image: each channel carries a
+/// distinct non-zero high byte so a stride bug surfaces as a visible
+/// channel swap.
+fn xy_encoded_rgba16(width: u32, height: u32) -> DynamicImage {
+  let mut buf: ImageBuffer<Rgba<u16>, Vec<u16>> = ImageBuffer::new(width, height);
+  for y in 0..height {
+    for x in 0..width {
+      buf.put_pixel(
+        x,
+        y,
+        Rgba([
+          (((x * 10) as u16) + 1) << 8,
+          (((y * 10) as u16) + 1) << 8,
+          0xBEEF,
+          0xA55A,
+        ]),
+      );
+    }
+  }
+  DynamicImage::ImageRgba16(buf)
+}
+
+/// `Rgba32F` (four f32 channels) test image with exactly-representable
+/// fractional values so equality against the rotated buffer is exact.
+fn xy_encoded_rgba32f(width: u32, height: u32) -> DynamicImage {
+  let mut buf: ImageBuffer<Rgba<f32>, Vec<f32>> = ImageBuffer::new(width, height);
+  for y in 0..height {
+    for x in 0..width {
+      // (x + 0.25, y + 0.5, 0.875, 0.125) — all exactly representable.
+      buf.put_pixel(
+        x,
+        y,
+        Rgba([(x as f32) + 0.25, (y as f32) + 0.5, 0.875, 0.125]),
+      );
+    }
+  }
+  DynamicImage::ImageRgba32F(buf)
+}
+
+#[test]
+fn rotate90_luma_alpha16_manual_matches_reference() {
+  // `ImageLumaA16` arm: 2 u16 subpixels per pixel. Non-square 4x3 -> 3x4.
+  let img = xy_encoded_luma_alpha16(4, 3);
+  let reference = ::image::imageops::rotate90(img.as_luma_alpha16().expect("luma_alpha16 source"));
+  let out = apply_orientation_fallible(img, Orientation::Rotate90)
+    .expect("manual LumaA16 rotate90 should succeed under MAX_DECODED_IMAGE_BYTES");
+  assert_eq!(out.width(), 3, "Rotate90 swaps width <- height");
+  assert_eq!(out.height(), 4, "Rotate90 swaps height <- width");
+  assert_eq!(
+    out.as_luma_alpha16().expect("luma_alpha16 output").as_raw(),
+    reference.as_raw(),
+    "manual LumaA16 rotate90 must yield byte-identical u16 subpixels to image::imageops::rotate90"
+  );
+}
+
+#[test]
+fn rotate270_rgba16_manual_matches_reference() {
+  // `ImageRgba16` arm: 4 u16 subpixels per pixel. Verifies the 4-wide
+  // u16 stride under Rotate270. Non-square 4x3 -> 3x4.
+  let img = xy_encoded_rgba16(4, 3);
+  let reference = ::image::imageops::rotate270(img.as_rgba16().expect("rgba16 source"));
+  let out =
+    apply_orientation_fallible(img, Orientation::Rotate270).expect("manual Rgba16 rotate270 ok");
+  assert_eq!(out.width(), 3);
+  assert_eq!(out.height(), 4);
+  assert_eq!(
+    out.as_rgba16().expect("rgba16 output").as_raw(),
+    reference.as_raw(),
+    "manual Rgba16 rotate270 must yield byte-identical u16 subpixels to image::imageops::rotate270"
+  );
+}
+
+#[test]
+fn rotate90_fliph_rgba32f_composite_matches_reference() {
+  // `ImageRgba32F` arm via the composite Rotate90FlipH orientation
+  // (collapses to `dst[y, x] = src[x, y]` in `rotate_buf`). Comparison
+  // is bit-exact (pure permutation, no FP arithmetic). 4x3 -> 3x4.
+  let img = xy_encoded_rgba32f(4, 3);
+  let rotated = ::image::imageops::rotate90(img.as_rgba32f().expect("rgba32f source"));
+  let reference = ::image::imageops::flip_horizontal(&rotated);
+  let out = apply_orientation_fallible(img, Orientation::Rotate90FlipH)
+    .expect("manual Rgba32F Rotate90FlipH ok");
+  assert_eq!(out.width(), 3);
+  assert_eq!(out.height(), 4);
+  assert_eq!(
+    out.as_rgba32f().expect("rgba32f output").as_raw(),
+    reference.as_raw(),
+    "manual Rgba32F Rotate90FlipH must yield bit-identical f32 subpixels to the \
+       image::imageops rotate90 + flip_horizontal composite (permutation only)"
+  );
+}
+
+// -- Rgba8 SIMD-dispatcher arm coverage (rotate_buf_u8) --------------
+//
+// Rgba8 (u8, channels=4) is the hot path that routes through
+// `rotate_buf_u8` -> the SIMD `rotate_buf` dispatcher, whose
+// `RotateKind`-to-internal mapping has one arm per orientation. The
+// Rotate90 and Rotate270FlipH arms are covered by sibling tests above;
+// these two close the Rotate270 and Rotate90FlipH dispatcher arms.
+
+#[test]
+fn rotate270_rgba8_manual_matches_reference() {
+  // Rgba8 Rotate270 -> `rotate_buf_u8` Rotate270 dispatcher arm.
+  let img = xy_encoded_rgba8(4, 3);
+  let reference = ::image::imageops::rotate270(img.as_rgba8().expect("rgba8 source"));
+  let out = apply_orientation_fallible(img, Orientation::Rotate270).expect("rgba8 rotate270 ok");
+  assert_eq!(out.width(), 3);
+  assert_eq!(out.height(), 4);
+  assert_eq!(
+    out.as_rgba8().expect("rgba8 output").as_raw(),
+    reference.as_raw(),
+    "manual Rgba8 rotate270 must match image::imageops::rotate270 byte-identical"
+  );
+}
+
+#[test]
+fn rotate90_fliph_rgba8_composite_matches_reference() {
+  // Rgba8 Rotate90FlipH -> `rotate_buf_u8` Rotate90FlipH dispatcher arm.
+  let img = xy_encoded_rgba8(4, 3);
+  let rotated = ::image::imageops::rotate90(img.as_rgba8().expect("rgba8 source"));
+  let reference = ::image::imageops::flip_horizontal(&rotated);
+  let out =
+    apply_orientation_fallible(img, Orientation::Rotate90FlipH).expect("rgba8 Rotate90FlipH ok");
+  assert_eq!(out.width(), 3);
+  assert_eq!(out.height(), 4);
+  assert_eq!(
+    out.as_rgba8().expect("rgba8 output").as_raw(),
+    reference.as_raw(),
+    "manual Rgba8 Rotate90FlipH must match the image::imageops rotate90 + flip_horizontal composite"
+  );
+}

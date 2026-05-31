@@ -613,4 +613,253 @@ mod tests {
     let spare = out.spare_capacity_mut();
     let _ = get_mel_banks_kaldi_rows(spare, num_bins, num_fft_bins, 30.0, 100.0, 50.0);
   }
+
+  // ── Scalar-reference direct coverage ──────────────────────────────
+  //
+  // The dispatcher routes to NEON on a NEON-capable aarch64 host, so the
+  // scalar arm's own overflow guard, size-equality assert-failure
+  // formatting, and zero-width-row branch are only reached by calling
+  // `get_mel_banks_kaldi_scalar` directly (or under
+  // `--cfg mlxrs_force_scalar`). These exercise the scalar reference in
+  // isolation.
+
+  /// Scalar reference's `checked_mul` overflow guard fires (not a
+  /// silent wrap) when `num_bins * num_fft_bins` overflows `usize`.
+  /// Pins the explicit panic message so a refactor cannot regress to a
+  /// plain multiply that would let an under-sized `out` satisfy the
+  /// size-equality assert and reach the per-cell init loop.
+  #[test]
+  #[should_panic(expected = "overflow usize")]
+  fn kaldi_mel_scalar_panics_on_dimension_overflow() {
+    let num_bins = usize::MAX / 4 + 1;
+    let num_fft_bins = 4usize;
+    let mut out: Vec<f32> = Vec::new();
+    let spare = out.spare_capacity_mut();
+    get_mel_banks_kaldi_scalar(spare, num_bins, num_fft_bins, 30.0, 100.0, 50.0);
+  }
+
+  /// Scalar reference's size-equality assertion fires (and formats its
+  /// `out.len()` / dims diagnostic) when `out.len() != num_bins *
+  /// num_fft_bins`. Covers the scalar arm's assert-failure args, which
+  /// the dispatcher-level size-mismatch test never reaches (it panics
+  /// at the dispatcher's own assert first).
+  #[test]
+  #[should_panic(expected = "get_mel_banks_kaldi_scalar: out.len() (3) must equal num_bins")]
+  fn kaldi_mel_scalar_panics_on_size_mismatch() {
+    let mut out: Vec<f32> = Vec::with_capacity(3); // WRONG: 2 * 4 = 8 expected
+    let spare = out.spare_capacity_mut();
+    get_mel_banks_kaldi_scalar(&mut spare[..3], 2, 4, 30.0, 100.0, 50.0);
+  }
+
+  /// Scalar reference's zero-width-triangle branch (`lc <= 0`): with
+  /// `mel_delta = 0` every row collapses (left == center == right), so
+  /// the `for k { out[..].write(0.0) }` + `continue` path runs for
+  /// every row and every cell ends up 0.0. Verifies the scalar arm's
+  /// own zero-row writes (the existing collapsed-row test goes through
+  /// the dispatcher / NEON arm, not the scalar fn).
+  #[test]
+  fn kaldi_mel_scalar_collapsed_row_is_zero() {
+    let num_bins = 4usize;
+    let num_fft_bins = 16usize;
+    let fft_bin_width = 30.0_f32;
+    let mel_low = 100.0_f32;
+    let mel_delta = 0.0_f32;
+    let mut out: Vec<f32> = Vec::with_capacity(num_bins * num_fft_bins);
+    let spare = out.spare_capacity_mut();
+    get_mel_banks_kaldi_scalar(
+      &mut spare[..num_bins * num_fft_bins],
+      num_bins,
+      num_fft_bins,
+      fft_bin_width,
+      mel_low,
+      mel_delta,
+    );
+    // SAFETY: the scalar zero-width branch writes every slot of every
+    // collapsed row.
+    unsafe { out.set_len(num_bins * num_fft_bins) };
+    for (i, &v) in out.iter().enumerate() {
+      assert_eq!(v, 0.0, "scalar collapsed-row cell i={i} should be 0.0");
+    }
+  }
+
+  /// Scalar reference's zero-width branch with a non-multiple-of-4
+  /// `num_fft_bins` (17): the scalar fn has no SIMD tail, but this
+  /// keeps the scalar zero-row coverage symmetric with the NEON
+  /// tail-zero test below and confirms the explicit 0.0 writes span an
+  /// odd row width.
+  #[test]
+  fn kaldi_mel_scalar_collapsed_row_odd_width_is_zero() {
+    let num_bins = 3usize;
+    let num_fft_bins = 17usize;
+    let mut out: Vec<f32> = Vec::with_capacity(num_bins * num_fft_bins);
+    let spare = out.spare_capacity_mut();
+    get_mel_banks_kaldi_scalar(
+      &mut spare[..num_bins * num_fft_bins],
+      num_bins,
+      num_fft_bins,
+      30.0,
+      100.0,
+      0.0, // mel_delta = 0 → every row collapses
+    );
+    // SAFETY: every slot written by the zero-width branch.
+    unsafe { out.set_len(num_bins * num_fft_bins) };
+    assert!(
+      out.iter().all(|&v| v == 0.0),
+      "odd-width collapsed rows should be all 0.0"
+    );
+  }
+
+  // ── NEON direct-arm coverage (aarch64) ────────────────────────────
+  //
+  // The NEON inner fn's own overflow guard and size-equality
+  // assert-failure formatting are unreachable through the public
+  // dispatcher (its own checks fire first), so — mirroring the sibling
+  // `lfilter` tests — we call `get_mel_banks_kaldi_neon` directly. Both
+  // panics happen at the top of the fn, before any NEON intrinsic
+  // executes, so the call is sound given NEON availability (guarded /
+  // baseline-mandatory on aarch64).
+
+  /// NEON arm's `checked_mul` overflow guard fires when `num_bins *
+  /// num_fft_bins` overflows `usize`. Panics before any `vst1q_f32` /
+  /// `vld1q_f32`, so an empty `out` is safe. Pins the NEON-specific
+  /// panic message.
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  #[should_panic(expected = "overflow usize")]
+  fn kaldi_mel_neon_panics_on_dimension_overflow() {
+    if !crate::simd::is_neon_available() {
+      // Force the panic so the `#[should_panic]` contract still holds
+      // on the (theoretical) NEON-absent aarch64 host.
+      panic!("overflow usize");
+    }
+    let num_bins = usize::MAX / 4 + 1;
+    let num_fft_bins = 4usize;
+    let mut out: Vec<f32> = Vec::new();
+    let spare = out.spare_capacity_mut();
+    // SAFETY: NEON available (guarded above); the overflow guard panics
+    // before any intrinsic runs, so the empty `out` is never indexed.
+    let _ =
+      unsafe { super::get_mel_banks_kaldi_neon(spare, num_bins, num_fft_bins, 30.0, 100.0, 50.0) };
+  }
+
+  /// NEON arm's size-equality assertion fires (and formats its
+  /// `out.len()` / dims diagnostic) when `out.len() != num_bins *
+  /// num_fft_bins`. Panics before any intrinsic runs.
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  #[should_panic(expected = "get_mel_banks_kaldi_neon: out.len() (3) must equal num_bins")]
+  fn kaldi_mel_neon_panics_on_size_mismatch() {
+    if !crate::simd::is_neon_available() {
+      panic!("get_mel_banks_kaldi_neon: out.len() (3) must equal num_bins");
+    }
+    let mut out: Vec<f32> = Vec::with_capacity(3); // WRONG: 2 * 4 = 8 expected
+    let spare = out.spare_capacity_mut();
+    // SAFETY: NEON available (guarded above); the size assert panics
+    // before any intrinsic runs, so the under-sized `out` is never
+    // indexed.
+    let _ = unsafe { super::get_mel_banks_kaldi_neon(&mut spare[..3], 2, 4, 30.0, 100.0, 50.0) };
+  }
+
+  /// NEON zero-width-row tail: with a non-multiple-of-4 `num_fft_bins`
+  /// (17 → `body_len = 16`), the collapsed-row path's scalar tail loop
+  /// (`body_len..num_fft_bins`) writes 0.0 to the last cell. Calling
+  /// the NEON arm directly guarantees this row-tail-zero line is hit on
+  /// a NEON-enabled coverage pass (the dispatcher would route to scalar
+  /// under `--cfg mlxrs_force_scalar`).
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  fn kaldi_mel_neon_collapsed_row_tail_is_zero() {
+    if !crate::simd::is_neon_available() {
+      return;
+    }
+    let num_bins = 3usize;
+    let num_fft_bins = 17usize; // 17 % 4 == 1 → one scalar-tail cell
+    let mut out: Vec<f32> = Vec::with_capacity(num_bins * num_fft_bins);
+    let spare = out.spare_capacity_mut();
+    // SAFETY: NEON available (guarded above); `out` sized exactly to
+    // num_bins * num_fft_bins; the kernel writes every slot (4-lane
+    // zero stores over the body + scalar zero writes over the tail) of
+    // every collapsed row before returning Ok.
+    let r = unsafe {
+      super::get_mel_banks_kaldi_neon(
+        &mut spare[..num_bins * num_fft_bins],
+        num_bins,
+        num_fft_bins,
+        30.0,
+        100.0,
+        0.0, // mel_delta = 0 → every row collapses (lc <= 0)
+      )
+    };
+    r.expect("tiny collapsed-row params should not OOM");
+    // SAFETY: kernel initialized every slot on the Ok path.
+    unsafe { out.set_len(num_bins * num_fft_bins) };
+    assert!(
+      out.iter().all(|&v| v == 0.0),
+      "NEON collapsed-row body + tail should be all 0.0"
+    );
+  }
+
+  /// NEON non-collapsed row with an odd `num_fft_bins` (17): exercises
+  /// the NEON body's FMA-hoisted 4-lane tile AND the per-row scalar
+  /// tail (`body_len..num_fft_bins`, the subtract-then-divide shape),
+  /// asserting bit-region parity against the scalar reference within
+  /// the documented Tolerance. Confirms the NEON tail's value writes
+  /// (non-zero-width path) agree with the scalar arm at the boundary.
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  fn kaldi_mel_neon_odd_width_matches_scalar_tolerance() {
+    if !crate::simd::is_neon_available() {
+      return;
+    }
+    let num_bins = 6usize;
+    let num_fft_bins = 17usize; // 17 % 4 == 1 → both body tile + tail
+    let fft_bin_width = 31.25_f32;
+    let mel_low = 1127.0_f32 * (1.0_f32 + 20.0_f32 / 700.0_f32).ln();
+    let mel_high = 1127.0_f32 * (1.0_f32 + 7800.0_f32 / 700.0_f32).ln();
+    let mel_delta = (mel_high - mel_low) / (num_bins as f32 + 1.0);
+
+    // Scalar reference.
+    let mut s_out: Vec<f32> = Vec::with_capacity(num_bins * num_fft_bins);
+    let s_spare = s_out.spare_capacity_mut();
+    get_mel_banks_kaldi_scalar(
+      &mut s_spare[..num_bins * num_fft_bins],
+      num_bins,
+      num_fft_bins,
+      fft_bin_width,
+      mel_low,
+      mel_delta,
+    );
+    // SAFETY: scalar kernel writes every slot.
+    unsafe { s_out.set_len(num_bins * num_fft_bins) };
+
+    // NEON arm, direct.
+    let mut n_out: Vec<f32> = Vec::with_capacity(num_bins * num_fft_bins);
+    let n_spare = n_out.spare_capacity_mut();
+    // SAFETY: NEON available (guarded above); `out` sized exactly; the
+    // kernel writes every slot on the Ok path (body tile + scalar tail
+    // for the non-collapsed rows).
+    let r = unsafe {
+      super::get_mel_banks_kaldi_neon(
+        &mut n_spare[..num_bins * num_fft_bins],
+        num_bins,
+        num_fft_bins,
+        fft_bin_width,
+        mel_low,
+        mel_delta,
+      )
+    };
+    r.expect("realistic odd-width params should not OOM");
+    // SAFETY: kernel initialized every slot on the Ok path.
+    unsafe { n_out.set_len(num_bins * num_fft_bins) };
+
+    assert_eq!(s_out.len(), n_out.len(), "odd-width shape parity");
+    for (i, (a, b)) in s_out.iter().zip(n_out.iter()).enumerate() {
+      let diff = (a - b).abs();
+      let tol = 1e-5_f32.max(1e-5_f32 * a.abs());
+      assert!(
+        diff <= tol,
+        "NEON/scalar Tolerance mismatch at i={i}: scalar={a} neon={b} diff={diff} tol={tol}"
+      );
+    }
+  }
 }
