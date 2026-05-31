@@ -21,6 +21,7 @@
 use crate::{
   array::Array,
   error::{Error, OutOfRangePayload, Result, check},
+  shape::dim_ptr,
   stream::default_stream,
 };
 use smol_str::format_smolstr;
@@ -49,10 +50,10 @@ fn conv_overflow_err(context: &'static str) -> Error {
 
 /// Verify MLX's int32 convolution shape arithmetic cannot overflow for these
 /// inputs. MLX evaluates the channel check (`groups * C_in_per_group`), the
-/// negative-padding normalization, the per-axis output shape, and — for the
-/// transposed convolutions — a `conv_transpose_general` prelude (which feeds a
-/// nested forward `conv_general`), all in int32, **statement by statement**,
-/// before it can return an error. So a safe call with extreme
+/// negative-padding normalization and slice, the per-axis output shape, and —
+/// for the transposed convolutions — a `conv_transpose_general` prelude (which
+/// feeds a nested forward `conv_general`), all in int32, **statement by
+/// statement**, before it can return an error. So a safe call with extreme
 /// `dilation`/`padding`/`stride`/`output_padding`/`groups` would be C++
 /// signed-overflow UB. This recomputes each of MLX's int32 intermediates in
 /// `i128` (which cannot overflow for `i32` inputs) and rejects any that does not
@@ -83,19 +84,81 @@ fn check_conv_no_overflow(
   }
   // Every MLX int32 intermediate is recomputed in i128 (no overflow for i32
   // inputs) and must fit back into i32.
-  let fits = |value: i128| -> Result<()> {
+  fn fits(context: &'static str, value: i128) -> Result<()> {
     if (i32::MIN as i128..=i32::MAX as i128).contains(&value) {
       Ok(())
     } else {
       Err(conv_overflow_err(context))
     }
-  };
+  }
+  // One forward `conv_general` axis: the negative-padding normalization +
+  // `slice` (numpy-style index wrap, then clamp to `[0, in]`), then
+  // `conv_out_shape` on the sliced length. Reused by the transposed path for
+  // the nested forward `conv_general` it dispatches.
+  #[allow(clippy::too_many_arguments)]
+  fn check_forward_axis(
+    context: &'static str,
+    in_d: i128,
+    wt_d: i128,
+    plo: i128,
+    phi: i128,
+    dil: i128,
+    idil: i128,
+    strd: i128,
+  ) -> Result<()> {
+    // Dilated kernel extent: dil * (wt - 1) + 1.
+    let dwt = dil * (wt_d - 1);
+    fits(context, dwt)?;
+    let kd = dwt + 1;
+    fits(context, kd)?;
+    // Negative-padding normalization: start -= pad_lo, stop += pad_hi.
+    let start = if plo < 0 { -plo } else { 0 };
+    if plo < 0 {
+      fits(context, start)?;
+    }
+    let stop = if phi < 0 { in_d + phi } else { in_d };
+    if phi < 0 {
+      fits(context, stop)?;
+    }
+    // slice normalize: wrap a negative index by + in, then clamp to [0, in].
+    let s = if start < 0 {
+      let wrapped = start + in_d;
+      fits(context, wrapped)?;
+      wrapped
+    } else {
+      start
+    };
+    let e = if stop < 0 {
+      let wrapped = stop + in_d;
+      fits(context, wrapped)?;
+      wrapped
+    } else {
+      stop
+    };
+    let st = s.clamp(0, in_d);
+    let ed = e.clamp(0, in_d).max(st);
+    let sliced_in = ed - st;
+    // conv_out_shape: id = idil * (sliced - 1) + 1;
+    // out = (id + pad_lo + pad_hi - kd) / stride + 1, negatives normalized to 0.
+    let din = idil * (sliced_in - 1);
+    fits(context, din)?;
+    let id = din + 1;
+    fits(context, id)?;
+    let pad_sum = plo.max(0) + phi.max(0);
+    fits(context, pad_sum)?;
+    let t = id + pad_sum;
+    fits(context, t)?;
+    let numer = t - kd;
+    fits(context, numer)?;
+    fits(context, numer / strd + 1)?;
+    Ok(())
+  }
   let in_shape = input.shape();
   let wt_shape = weight.shape();
   // run_conv_checks: groups * C_in_per_group.
   if let Some(&channels) = wt_shape.last() {
     let channels = i32::try_from(channels).map_err(|_| conv_overflow_err(context))?;
-    fits(groups as i128 * channels as i128)?;
+    fits(context, groups as i128 * channels as i128)?;
   }
   let nd = in_shape.len();
   if nd < 2 || wt_shape.len() != nd {
@@ -111,78 +174,45 @@ fn check_conv_no_overflow(
     let phi = i128::from(param(pad_hi, axis, 0));
     let dil = i128::from(param(kernel_dilation, axis, 1));
     let strd = i128::from(param(stride, axis, 1));
-    // Dilated kernel extent: dil * (wt - 1), then + 1.
-    let dwt = dil * (wt_d - 1);
-    fits(dwt)?;
-    let kd = dwt + 1; // == conv_transpose_general's wt_size
-    fits(kd)?;
     match output_padding {
       None => {
         let idil = i128::from(param(input_dilation, axis, 1));
-        // Negative-padding normalization slices the input.
-        if plo < 0 {
-          fits(-plo)?; // starts[i] -= pad_lo
-        }
-        if phi < 0 {
-          fits(in_d + phi)?; // stops[i] += pad_hi
-        }
-        // conv_out_shape: id = idil * (in - 1) + 1; out = (id + pad - kd) / stride + 1.
-        let din = idil * (in_d - 1);
-        fits(din)?;
-        let id = din + 1;
-        fits(id)?;
-        let pad_sum = plo.max(0) + phi.max(0); // negatives normalized to 0
-        fits(pad_sum)?;
-        let t = id + pad_sum;
-        fits(t)?;
-        let numer = t - kd;
-        fits(numer)?;
-        fits(numer / strd + 1)?;
+        check_forward_axis(context, in_d, wt_d, plo, phi, dil, idil, strd)?;
       }
       Some(out_pad) => {
         // conv_transpose_general prelude (padding symmetric, so pad == pad_lo).
         let pad = plo;
         let op = i128::from(param(out_pad, axis, 0));
-        let wt_size = kd;
+        let dwt = dil * (wt_d - 1);
+        fits(context, dwt)?;
+        let wt_size = dwt + 1;
+        fits(context, wt_size)?;
         let t = wt_size - pad;
-        fits(t)?;
+        fits(context, t)?;
         let padding_lo = t - 1;
-        fits(padding_lo)?;
+        fits(context, padding_lo)?;
         let t = (in_d - 1) * strd;
-        fits(t)?;
+        fits(context, t)?;
         let two_pad = 2 * pad;
-        fits(two_pad)?;
+        fits(context, two_pad)?;
         let t = t - two_pad;
-        fits(t)?;
+        fits(context, t)?;
         let t = t + dwt; // + dil * (wt - 1)
-        fits(t)?;
+        fits(context, t)?;
         let conv_output_shape = t + 1;
-        fits(conv_output_shape)?;
+        fits(context, conv_output_shape)?;
         let t = strd * (in_d - 1);
-        fits(t)?;
+        fits(context, t)?;
         let out_size = t + 1;
-        fits(out_size)?;
+        fits(context, out_size)?;
         let t = conv_output_shape - out_size; // in_size == conv_output_shape
-        fits(t)?;
+        fits(context, t)?;
         let t = t + pad;
-        fits(t)?;
+        fits(context, t)?;
         let padding_hi = t + op;
-        fits(padding_hi)?;
-        // Nested conv_general (forward; stride 1, input_dilation = stride): the
-        // dilated kernel is wt_size and the dilated input is out_size.
-        if padding_lo < 0 {
-          fits(-padding_lo)?;
-        }
-        if padding_hi < 0 {
-          fits(in_d + padding_hi)?;
-        }
-        let pad_sum = padding_lo.max(0) + padding_hi.max(0);
-        fits(pad_sum)?;
-        let t = out_size + pad_sum;
-        fits(t)?;
-        let numer = t - wt_size;
-        fits(numer)?;
-        fits(numer + 1)?;
+        fits(context, padding_hi)?;
+        // Nested conv_general (forward; stride 1, input_dilation = stride).
+        check_forward_axis(context, in_d, wt_d, padding_lo, padding_hi, dil, strd, 1)?;
       }
     }
   }
@@ -547,24 +577,26 @@ pub fn conv_general(
   )?;
   // SAFETY: fresh out-param handle, RAII-wrapped before the populating call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
-  // SAFETY: each `as_ptr()`/`len()` pair describes a slice valid for the whole
-  // call (lengths validated above); mlx-c copies the spatial-param arrays rather
-  // than retaining them. `out.0` was freshly allocated above and is written
-  // here; rc via `check`.
+  // SAFETY: each `dim_ptr`/`len()` pair describes a slice valid for the whole
+  // call (lengths validated above); `dim_ptr` routes an empty slice through a
+  // non-singular sentinel so mlx-c's `std::vector<int>(p, p + 0)` never receives
+  // a dangling iterator. mlx-c copies the spatial-param arrays rather than
+  // retaining them. `out.0` was freshly allocated above and is written here; rc
+  // via `check`.
   check(unsafe {
     mlxrs_sys::mlx_conv_general(
       &mut out.0,
       input.0,
       weight.0,
-      stride.as_ptr(),
+      dim_ptr(stride),
       stride.len(),
-      padding_lo.as_ptr(),
+      dim_ptr(padding_lo),
       padding_lo.len(),
-      padding_hi.as_ptr(),
+      dim_ptr(padding_hi),
       padding_hi.len(),
-      kernel_dilation.as_ptr(),
+      dim_ptr(kernel_dilation),
       kernel_dilation.len(),
-      input_dilation.as_ptr(),
+      dim_ptr(input_dilation),
       input_dilation.len(),
       groups,
       flip,
@@ -779,5 +811,41 @@ mod tests {
     let err = conv_transpose1d(&input, &weight, 1, 1_500_000_000, 1, 0, 1)
       .expect_err("transpose 2*padding overflow must be rejected");
     assert!(matches!(err, Error::OutOfRange(_)), "got {err:?}");
+  }
+
+  #[test]
+  fn conv_general_all_empty_slices_uses_defaults() {
+    // Empty spatial slices select MLX defaults (stride 1, no padding, dilation 1)
+    // and must cross the FFI through dim_ptr, not a dangling empty-slice pointer
+    // (Codex round-4 finding). The result matches conv1d with the same defaults.
+    let input = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[1, 4, 1]).unwrap();
+    let weight = Array::from_slice::<f32>(&[1.0, 0.0, -1.0], &[1, 3, 1]).unwrap();
+    let mut out = conv_general(&input, &weight, &[], &[], &[], &[], &[], 1, false)
+      .expect("all-empty conv_general must use defaults");
+    assert_eq!(out.shape(), vec![1, 2, 1]);
+    assert_eq!(out.to_vec::<f32>().unwrap(), vec![-2.0, -2.0]);
+  }
+
+  #[test]
+  fn conv_general_allows_negative_padding_crop() {
+    // Negative padding_hi crops the input before conv_out_shape, so MLX uses the
+    // sliced (shorter) length. A huge input_dilation overflows on the original
+    // length but not on the cropped length, so the guard must use the post-slice
+    // length and NOT false-reject (Codex round-4 counterexample).
+    let input = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[1, 3, 1]).unwrap();
+    let weight = Array::from_slice::<f32>(&[1.0], &[1, 1, 1]).unwrap();
+    let out = conv_general(
+      &input,
+      &weight,
+      &[1],
+      &[0],
+      &[-2],
+      &[1],
+      &[i32::MAX],
+      1,
+      false,
+    )
+    .expect("valid negative-padding crop must not be falsely rejected");
+    assert_eq!(out.shape(), vec![1, 1, 1]);
   }
 }
