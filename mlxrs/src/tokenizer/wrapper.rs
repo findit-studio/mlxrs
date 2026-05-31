@@ -49,9 +49,9 @@ use super::stream::{Detokenizer, DetokenizerClass, NaiveHfDetokenizer};
 use super::tools::{self, ToolParser};
 
 /// The `detokenizer()` factory return — the enum-unified
-/// [`Detokenizer`] (P1 #111).
+/// [`Detokenizer`] (#111).
 ///
-/// # Breaking change (P1 #111)
+/// # Breaking change (#111)
 ///
 /// Previously `pub type BoxedDetokenizer = Box<dyn StreamingDetokenizer>`
 /// — one vtable indirection per emitted token. This is now an alias for
@@ -436,7 +436,7 @@ impl Tokenizer {
     Ok(encs.iter().map(|e| e.get_ids().to_vec()).collect())
   }
 
-  /// Encode a batch of texts with explicit options (LM-2).
+  /// Encode a batch of texts with explicit options.
   ///
   /// Batch analogue of [`Self::encode_with`]: applies the SAME
   /// [`EncodeOptions`] (add_special, add_eos, truncate_to,
@@ -962,7 +962,7 @@ pub fn no_bos_or_eos(sequence: &[u32], bos: u32, eos: u32) -> Vec<u32> {
 }
 
 /// Shared per-`Encoding` post-processor for
-/// [`Tokenizer::encode_with`] and [`Tokenizer::encode_batch_with`] (LM-2).
+/// [`Tokenizer::encode_with`] and [`Tokenizer::encode_batch_with`].
 ///
 /// Applies (in order):
 ///   1. shape-skew guard on `ids.len() == attention_mask.len()`;
@@ -1031,7 +1031,7 @@ fn finalize_encoding(
 
   // Mask is constant-1 for the returned cells (all attended, including
   // the appended eos). Single bounded allocation matching `ids.len()`.
-  // §1 EMPTY MEANS ABSENT: empty Vec when mask was not requested.
+  // EMPTY MEANS ABSENT: empty Vec when mask was not requested.
   let attention_mask = if opts.return_attention_mask() {
     vec![1u8; ids.len()]
   } else {

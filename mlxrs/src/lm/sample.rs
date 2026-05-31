@@ -68,8 +68,8 @@ fn scalar_like(value: f32, like: &Array) -> Result<Array> {
   // first ctor could reach mlx-c with no error handler installed → its
   // default `printf + exit(-1)` instead of a recoverable `Err`. Install at
   // the entry point, before any fallible scalar construction — the same
-  // defense-in-depth as `embeddings::scalar_like` (Copilot 4307622782 C2)
-  // per the #13/#24 crate-wide error-handler contract.
+  // defense-in-depth as `embeddings::scalar_like`, per the #13/#24 crate-wide
+  // error-handler contract.
   crate::error::ensure_handler_installed();
   ops::misc::astype(&Array::full::<f32>(&(1,), value)?, like.dtype()?)
 }
@@ -207,8 +207,8 @@ pub fn apply_top_p(logprobs: &Array, top_p: f32) -> Result<Array> {
 
 /// Scale `logits` by `1 / temp`, returning a result in the **original**
 /// `logits` dtype. Dispatched per dtype:
-/// - **F32**: in-dtype `divide(logits, scalar_like(temp))` (hot path,
-///   bit-identical to the pre-fix path).
+/// - **F32**: in-dtype `divide(logits, scalar_like(temp))` (hot path, a
+///   plain in-dtype divide with no cast-roundtrip).
 /// - **F16 / BF16**: upcast to f32, divide in f32, downcast back —
 ///   `temp` never gets cast down to the narrower dtype.
 /// - **F64**: rejected with an `Error::Backend`. MLX's GPU stream
@@ -216,14 +216,14 @@ pub fn apply_top_p(logprobs: &Array, top_p: f32) -> Result<Array> {
 ///   does not support `float64` (`"float64 is not supported on the GPU"`),
 ///   so a native F64 divide errors at eval; the prior implicit f32
 ///   roundtrip silently lost precision on near-tied logits instead of
-///   surfacing the limitation (LM-6 R2 medium finding). The caller must
+///   surfacing the limitation. The caller must
 ///   cast logits down to F32 (or F16/BF16) before sampling — the
 ///   reference Python `mlx_lm.sample_utils.categorical_sampling` only
 ///   ever runs on F32/F16/BF16 logits.
 /// - **Anything else**: rejected with an `Error::Backend` (categorical
 ///   sampling only makes sense on floating-point logits).
 ///
-/// **NaN-safety (LM-6 R1 follow-up).** The previous fix replaced
+/// **NaN-safety.** The previous fix replaced
 /// `multiply(logits, scalar_like(1/temp))` with
 /// `divide(logits, scalar_like(temp, logits))`, which still casts `temp`
 /// down to the logits dtype BEFORE the divide via `scalar_like`. For f16
@@ -231,7 +231,7 @@ pub fn apply_top_p(logprobs: &Array, top_p: f32) -> Result<Array> {
 /// rounds to 0 in that cast; bf16 hits the same trap below its own min
 /// subnormal (~9.18e-41). A max-shifted row contains a 0 entry, so
 /// `0 / 0 = NaN` leaks into [`crate::ops::random::categorical`]'s softmax — exactly
-/// the original LM-6 attack surface, just reached through the dtype cast
+/// the original attack surface, just reached through the dtype cast
 /// instead of the `1/temp` overflow.
 ///
 /// **Fix has three parts:**
@@ -245,7 +245,7 @@ pub fn apply_top_p(logprobs: &Array, top_p: f32) -> Result<Array> {
 /// 2. **Below-`1/f32::MAX` clamp.** Empirically MLX's `divide` lowers to
 ///    multiply-by-reciprocal internally on Apple Silicon (the divisor's
 ///    f32 reciprocal is materialized inside the kernel), so the original
-///    `1/temp` overflow path the prior LM-6 fix claimed to eliminate is
+///    `1/temp` overflow path the prior fix claimed to eliminate is
 ///    actually still active for `temp < 1/f32::MAX ≈ 2.94e-39` (it just
 ///    moved into mlx-c). Without this clamp, `0 / temp` produces NaN
 ///    even after the upcast (since the kernel computes `0 * +Inf`).
@@ -256,14 +256,13 @@ pub fn apply_top_p(logprobs: &Array, top_p: f32) -> Result<Array> {
 ///    this limit anyway, and the post-divide `±Inf` overflows for
 ///    extreme logits resolve correctly inside
 ///    [`crate::ops::random::categorical`]'s internal softmax (one-hot at
-///    the max). This is the secondary recommendation in the LM-6 R1
-///    Codex finding ("explicitly route temperatures that would round to
-///    zero ... to an argmax-after-filtering path") for the bf16-only
+///    the max). This effectively routes temperatures that would round to
+///    zero to an argmax-after-filtering path, for the bf16-only
 ///    sub-min-subnormal regime where the f32 reciprocal trap is
 ///    unavoidable (bf16 and f32 share an exponent range, so any temp
 ///    below bf16 min subnormal is also below `1/f32::MAX`).
 ///
-/// 3. **F64 + non-floating dtype rejection (LM-6 R2 follow-up).** The
+/// 3. **F64 + non-floating dtype rejection.** The
 ///    prior single non-F32 branch quietly funneled F64 through an f32
 ///    roundtrip, so near-tied f64 logits at small `temp` could lose
 ///    ordering before the Gumbel draw while still returning an F64
@@ -283,7 +282,7 @@ pub fn apply_top_p(logprobs: &Array, top_p: f32) -> Result<Array> {
 /// the eager `#[ctor]` stripped that first ctor could reach mlx-c with
 /// no error handler installed → its default `printf + exit(-1)` instead
 /// of a recoverable `Err`. Same defense-in-depth as `scalar_like` and
-/// `embeddings::scalar_like` (LM-6 R2 Codex finding).
+/// `embeddings::scalar_like`.
 ///
 /// Exposed as `pub` so the [`categorical_sampling`] regression test can
 /// assert directly on the scaled logits (not just the eventual sampled
@@ -294,7 +293,7 @@ pub fn scale_logits_by_temp(logits: &Array, temp: f32) -> Result<Array> {
   // runs `mlx_array_new_float32` before its `mlx_full(default_stream())`
   // would lazily install it, so a ctor-stripped first sampling call could
   // otherwise trip mlx-c's default `printf + exit(-1)` on scalar allocation
-  // failure instead of returning `Err` (LM-6 R2 Codex finding).
+  // failure instead of returning `Err`.
   crate::error::ensure_handler_installed();
   if !temp.is_finite() || temp <= 0.0 {
     return Err(Error::OutOfRange(OutOfRangePayload::new(
@@ -311,14 +310,14 @@ pub fn scale_logits_by_temp(logits: &Array, temp: f32) -> Result<Array> {
   let dtype = logits.dtype()?;
   match dtype {
     crate::Dtype::F32 => {
-      // Bit-identical to the pre-fix path on the hot path most callers
-      // hit (no extra cast-roundtrip).
+      // The hot path most callers hit: a plain in-dtype divide with no
+      // extra cast-roundtrip.
       let divisor = Array::full::<f32>(&(1,), temp)?;
       ops::arithmetic::divide(logits, &divisor)
     }
     crate::Dtype::F16 | crate::Dtype::BF16 => {
       // Half precision — upcast-divide-downcast so `temp` never gets
-      // cast to the narrower dtype (the LM-6 R1 dtype-cast leg).
+      // cast to the narrower dtype (the dtype-cast leg).
       let logits_f32 = ops::misc::astype(logits, crate::Dtype::F32)?;
       let divisor = Array::full::<f32>(&(1,), temp)?;
       let scaled_f32 = ops::arithmetic::divide(&logits_f32, &divisor)?;
@@ -342,12 +341,11 @@ pub fn scale_logits_by_temp(logits: &Array, temp: f32) -> Result<Array> {
 /// the reference relies on instead of producing `inf`/`NaN` logits. Use
 /// [`argmax_sample`] for greedy / `temp == 0` decoding.
 ///
-/// **NaN-safety (LM-6).** The scaling is delegated to
+/// **NaN-safety.** The scaling is delegated to
 /// [`scale_logits_by_temp`], which uses an f32-denominator path so the
 /// inverse temperature is never materialized AND `temp` never gets cast
 /// down to f16/bf16 (where positive sub-min-subnormal values round to
-/// zero, opening a `0 / 0 = NaN` hole under the L3-R2 max-shift —
-/// the R1 follow-up to the original LM-6 fix).
+/// zero, opening a `0 / 0 = NaN` hole under the max-shift).
 pub fn categorical_sampling(logits: &Array, temp: f32, key: &Array) -> Result<Array> {
   let scaled = scale_logits_by_temp(logits, temp)?;
   ops::random::categorical(&scaled, -1, key)

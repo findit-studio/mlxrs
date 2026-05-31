@@ -1,4 +1,4 @@
-//! Phase 4 Branch B — happy-path tests for shape ops.
+//! Happy-path tests for shape ops.
 
 use std::ffi::CString;
 
@@ -170,7 +170,7 @@ fn pad_rejects_length_mismatch() {
   let zero = Array::from_slice::<f32>(&[0.0], &[0i32; 0]).unwrap();
   let mode = CString::new("constant").unwrap();
   let r = ops::shape::pad(&a, &[0], &[2], &[1, 2], &zero, &mode);
-  // §5 typed: `pad` returns `MultiLengthMismatch` carrying named
+  // `pad` returns `MultiLengthMismatch` carrying named
   // axes/low/high lengths so callers can identify which list diverged.
   assert!(
     matches!(
@@ -185,7 +185,7 @@ fn pad_rejects_length_mismatch() {
 #[test]
 fn pad_rejects_negative_low() {
   // `low`/`high` are shape extents — negatives must be rejected before
-  // reaching mlx::core::Shape construction (Codex review). `validate_dims`
+  // reaching mlx::core::Shape construction. `validate_dims`
   // surfaces them as `Error::OutOfRange` with a `"dim[i]=<v>"` value.
   let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3i32]).unwrap();
   let zero = Array::from_slice::<f32>(&[0.0], &[0i32; 0]).unwrap();
@@ -453,7 +453,7 @@ fn tile_reps_longer_than_ndim_prepends_axis() {
 }
 
 // ---------------------------------------------------------------------------
-// Bounded-soundness boundary tests (#259 Codex findings). Each asserts a SAFE
+// Bounded-soundness boundary tests (#259). Each asserts a SAFE
 // Rust call cannot drive the underlying MLX C++ into signed-overflow UB, and
 // instead returns a typed error. Hand-traced against ops.cpp:
 //   - roll(Shape)/roll(Shape, axis) sum shift into an unchecked `int` (~6369).
@@ -493,7 +493,7 @@ fn roll_int_min_shift_is_typed_range_error() {
   // A single i32::MIN shift reaches the `(-sh)` negation in MLX — UB. The
   // wrapper rejects it as a typed OutOfRange across all three roll forms.
   //
-  // INTENTIONAL STRICTER-THAN-MLX CONTRACT (#259 Codex LOW): mlx-core would
+  // INTENTIONAL STRICTER-THAN-MLX CONTRACT (#259): mlx-core would
   // no-op an i32::MIN shift on a size-0 axis (its `size == 0` check at
   // ops.cpp ~6348 runs before the `(-sh)` negation), so this rejection is
   // slightly stricter than mlx-core for that degenerate empty case. We take
@@ -579,7 +579,7 @@ fn tile_zero_reps_yields_empty_dim() {
 
 #[test]
 fn tile_multi_non_unit_reps_pass_intermediate_rank_guard() {
-  // The intermediate-rank guard (#259 Codex HIGH) caps `max(reps.len(), ndim) +
+  // The intermediate-rank guard (#259) caps `max(reps.len(), ndim) +
   // count(reps != 1)` — the rank of tile's expand/broadcast intermediates, which
   // carry one extra dim per non-unit rep. This must NOT reject a legitimate
   // multi-non-unit-rep tile: here both reps are non-unit (2 extra dims), so the
@@ -610,7 +610,6 @@ fn as_strided_rejects_negative_dim() {
   // Per the docs, `validate_dims` rejects any negative dim before any FFI
   // call. Locks in the recoverable-error path so a regression that drops
   // the check (e.g. moves it past `with_shape`) is caught here.
-  // (Lock-in regression test for Copilot review #3272546272.)
   let a = Array::from_slice::<f32>(&[0.0, 1.0, 2.0, 3.0], &[4i32]).unwrap();
   // Build the `&[i32]` slice with a negative dim — `&(usize, usize)`
   // can't express this since `usize` is unsigned, so we use the slice

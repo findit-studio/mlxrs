@@ -1,5 +1,5 @@
 //! Tests for `KvCache::from_serialized` — the transactional restore
-//! introduced by KVC-1.
+//! introduced by #98.
 //!
 //! Two axes per concrete cache that overrides:
 //!
@@ -24,7 +24,7 @@ use mlxrs::{
   Array,
   lm::cache::{
     ArraysCache, BatchKvCache, BatchRotatingKvCache, CacheList, ChunkedKvCache, KvCache, MaskMode,
-    QuantizedKvCache, QuantizedKvCacheImpl, RotatingKvCache, StandardKvCache,
+    QuantizedKvCache, RotatingKvCache, StandardKvCache, StandardQuantizedKvCache,
   },
 };
 
@@ -90,7 +90,7 @@ fn assert_state_eq_mixed_kv_then_i32(
 /// **trait-default** implementation (sequential `set_state` then
 /// `set_meta_state`) is actually exercised. Every concrete cache now
 /// overrides `from_serialized`, so without this probe the default path
-/// would be untested (Copilot #62 finding). The setters record their
+/// would be untested. The setters record their
 /// call order so a test can assert the default's sequencing; all other
 /// required methods are unreachable in that single code path.
 #[derive(Default)]
@@ -136,7 +136,7 @@ impl KvCache for DefaultProbeCache {
   fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
     self
   }
-  // KVC-10: `reference_class_name` is REQUIRED (no default) — declare
+  // `reference_class_name` is REQUIRED (no default) — declare
   // explicitly so the probe still compiles. The default-`from_serialized`
   // test below only cares about set_state / set_meta_state call ordering,
   // not the class name.
@@ -151,7 +151,7 @@ fn trait_default_from_serialized_calls_set_state_then_meta() {
   // all 8 override it) must call `set_state` THEN `set_meta_state`,
   // faithful to mlx-lm `cache.py:170-175`. `DefaultProbeCache` is the
   // only impl that inherits the default, so it's the sole coverage of
-  // this ordering (Copilot #62 finding).
+  // this ordering.
   let mut probe = DefaultProbeCache::default();
   probe.from_serialized(vec![kv(&[0.0])], &[]).unwrap();
   assert_eq!(
@@ -316,7 +316,7 @@ fn chunked_from_serialized_invalid_meta_leaves_self_unchanged() {
 }
 
 // ----------------------------------------------------------------------
-// 4. QuantizedKvCacheImpl — override path.
+// 4. StandardQuantizedKvCache — override path.
 // ----------------------------------------------------------------------
 
 /// 4-D ramp `[1, 1, S, 64]` for the quantized cache. group_size = 64, so
@@ -335,7 +335,7 @@ fn kv_quant(n_steps: usize) -> Array {
 
 #[test]
 fn quantized_from_serialized_round_trip() {
-  let mut original = QuantizedKvCacheImpl::new(64, 8).unwrap();
+  let mut original = StandardQuantizedKvCache::new(64, 8).unwrap();
   original
     .update_quantized(&kv_quant(3), &kv_quant(3))
     .unwrap();
@@ -343,7 +343,7 @@ fn quantized_from_serialized_round_trip() {
   let saved_meta = original.meta_state();
   let saved_offset = original.offset();
 
-  let mut restored = QuantizedKvCacheImpl::new_unchecked(0, 0);
+  let mut restored = StandardQuantizedKvCache::new_unchecked(0, 0);
   restored.from_serialized(saved_state, &saved_meta).unwrap();
   assert_eq!(restored.offset(), saved_offset);
   assert_eq!(restored.meta_state(), saved_meta);
@@ -366,7 +366,7 @@ fn quantized_from_serialized_round_trip() {
 
 #[test]
 fn quantized_from_serialized_wrong_arity_meta_leaves_self_unchanged() {
-  let mut cache = QuantizedKvCacheImpl::new(64, 8).unwrap();
+  let mut cache = StandardQuantizedKvCache::new(64, 8).unwrap();
   cache.update_quantized(&kv_quant(2), &kv_quant(2)).unwrap();
   let original_offset = cache.offset();
   let original_meta = cache.meta_state();
@@ -397,7 +397,7 @@ fn quantized_from_serialized_invalid_meta_value_leaves_self_unchanged() {
   // path AFTER set_state has already done its own (set_state)
   // sub-mutation in the staged cache, BUT the staged cache is local so
   // our own `cache` is unaffected.
-  let mut cache = QuantizedKvCacheImpl::new(64, 8).unwrap();
+  let mut cache = StandardQuantizedKvCache::new(64, 8).unwrap();
   cache.update_quantized(&kv_quant(2), &kv_quant(2)).unwrap();
   let original_offset = cache.offset();
   let original_meta = cache.meta_state();
@@ -428,7 +428,7 @@ fn build_heterogeneous_cache_list() -> CacheList {
   rot_cache
     .update(&kv(&[10.0, 11.0]), &kv(&[10.0, 11.0]))
     .unwrap();
-  let mut q_cache = QuantizedKvCacheImpl::new(64, 8).unwrap();
+  let mut q_cache = StandardQuantizedKvCache::new(64, 8).unwrap();
   q_cache
     .update_quantized(&kv_quant(2), &kv_quant(2))
     .unwrap();
@@ -719,7 +719,7 @@ fn arrays_from_serialized_invalid_meta_leaves_self_unchanged() {
 }
 
 // ----------------------------------------------------------------------
-// 9. Post-setter invariant guards (Codex round-2 hardening).
+// 9. Post-setter invariant guards.
 //
 // The `from_serialized` overrides must reject the same forged (state,
 // meta) combinations the canonical `super::from_state` loader rejects —
@@ -791,7 +791,7 @@ fn rotating_from_serialized_empty_state_nonzero_meta_rejected() {
 #[test]
 fn quantized_from_serialized_empty_state_nonzero_offset_rejected() {
   // Pre-populated quantized cache that must remain unchanged.
-  let mut cache = QuantizedKvCacheImpl::new(64, 8).unwrap();
+  let mut cache = StandardQuantizedKvCache::new(64, 8).unwrap();
   cache.update_quantized(&kv_quant(2), &kv_quant(2)).unwrap();
   let original_meta = cache.meta_state();
   let original_offset = cache.offset();

@@ -6,7 +6,7 @@
 //! joint network, etc.).
 //!
 //! Per the project's no-per-model-arch rule
-//! ([`project_no_per_model_arch_porting`][noarch]), mlxrs ships **no
+//! (`project_no_per_model_arch_porting`), mlxrs ships **no
 //! concrete STT model implementations**. This trait is the *shape* per-model
 //! code (whisper, parakeet, canary, …) must conform to so the
 //! [`crate::audio::stt::generate::stt_generate`] iterator can drive any
@@ -14,7 +14,6 @@
 //! [`crate::lm::generate`] loop uses for text-only LMs.
 //!
 //! [stt-base]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/base.py
-//! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 
 use crate::{
   array::Array,
@@ -156,7 +155,7 @@ pub struct MelConfig {
   /// STFT hop length in samples (mlx-audio whisper default `160`).
   hop_length: usize,
   /// Window length in samples; `None` ⇒ `n_fft` (mlx-audio default).
-  /// Per §1 scalar Option-with-meaningful-sentinel: kept as `Option`.
+  /// Scalar Option with a meaningful sentinel: kept as `Option`.
   win_length: Option<usize>,
   /// Number of mel filterbank bins (mlx-audio whisper default `80`; canary
   /// uses `128`).
@@ -170,7 +169,7 @@ pub struct MelConfig {
   f_min: f32,
   /// Upper mel band edge (Hz); `None` ⇒ `sample_rate / 2` (Nyquist), the
   /// `mel_filter_bank` default.
-  /// Per §1 scalar Option-with-meaningful-sentinel: kept as `Option`.
+  /// Scalar Option with a meaningful sentinel: kept as `Option`.
   f_max: Option<f32>,
   /// Numerical floor applied to mel energies before the **natural log**
   /// (`ln`, the `log_mel_spectrogram_with` `.log()` step)

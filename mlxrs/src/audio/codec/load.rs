@@ -6,7 +6,7 @@
 //! (VAD / LID / STS / STT / TTS): a per-domain factory that routes
 //! through the shared [`crate::audio::load::base_load_model`] and
 //! returns a [`CodecModel`] trait object the per-architecture loader's
-//! caller constructs (per the [no per-model arch porting][noarch] rule
+//! caller constructs (per the no per-model arch porting rule
 //! mlxrs does not bundle a built-in codec registry).
 //!
 //! The per-architecture codec classes (DAC, Encodec, Mimi,
@@ -17,7 +17,6 @@
 //! constructor).
 //!
 //! [codec-init]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/codec/__init__.py
-//! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 
 use crate::{
   array::Array,
@@ -44,7 +43,7 @@ pub const MODEL_REMAPPING: &[(&str, &str)] = &[];
 /// `MossAudioTokenizer`, `Vocos`, `StepAudio2Token2Wav`,
 /// `EcapaTdnnBackbone`) implements.
 ///
-/// Per the [no per-model arch porting][noarch] rule, mlxrs ships no
+/// Per the no per-model arch porting rule, mlxrs ships no
 /// concrete codecs; this trait is the *shape* per-architecture crates
 /// implement so a caller can hand-off any codec as a
 /// `Box<dyn CodecModel>` from [`load`] / [`load_model`].
@@ -52,7 +51,6 @@ pub const MODEL_REMAPPING: &[(&str, &str)] = &[];
 /// `&self` because weights are immutable after load.
 ///
 /// [codec-init]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/codec/__init__.py
-/// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 pub trait CodecModel {
   /// Encode a waveform into discrete (or continuous) codec codes.
   ///

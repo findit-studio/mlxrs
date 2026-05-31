@@ -250,7 +250,7 @@ fn empty_tokenizer_source_errors() {
 
 #[test]
 fn invalid_tokenizer_dir_surfaces_path_context_and_preserves_typed_source() {
-  // R3 regression: when `Tokenizer::from_path` fails (e.g. the selected
+  // Regression: when `Tokenizer::from_path` fails (e.g. the selected
   // tokenizer directory has no `tokenizer.json`), the factory must wrap the
   // typed `Error::Tokenizer` failure in `Error::FileIo(FileOp::Other(
   // "tokenizer_load"), tokenizer_dir, …)` so:
@@ -291,8 +291,8 @@ fn invalid_tokenizer_dir_surfaces_path_context_and_preserves_typed_source() {
       assert_eq!(p.context(), "embeddings load: tokenizer");
 
       // (b) Typed source chain: the original `Error::Tokenizer` is reachable
-      // through the io::Error's `get_ref()` (R1 invariant — typed variant +
-      // its Display message survive, not just a stringified prefix).
+      // through the io::Error's `get_ref()` (typed variant + its Display
+      // message survive, not just a stringified prefix).
       //
       // NOTE: `io::Error::new(_, boxed)` / `io::Error::other(boxed)` exposes
       // the boxed inner via `get_ref()` / `into_inner()`, but the stdlib

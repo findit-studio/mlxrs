@@ -262,7 +262,7 @@ impl Array {
     crate::stream::assert_streams_not_cleared();
     // SAFETY: dtype verified `== T::DTYPE` above.
     //
-    // **Contract reconciliation (#118 R1).** `Element::item`'s documented
+    // **Contract reconciliation (#118).** `Element::item`'s documented
     // `# Safety` precondition is "`arr` must be evaluated and have dtype
     // `DTYPE`" (see `dtype::Element::item`). `try_item` intentionally
     // relaxes the "must be evaluated" half — and that relaxation is sound

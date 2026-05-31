@@ -20,13 +20,12 @@
 //! family endpoint detector mlx-audio loads via
 //! `mlx_audio.vad.load("mlx-community/smart-turn-v3")`).
 //!
-//! Per the [no per-model arch porting][noarch] rule, mlxrs does not
+//! Per the no per-model arch porting rule, mlxrs does not
 //! bundle a smart-turn impl — the default is the silence-only
 //! policy which is correct without a model and lets callers opt into
 //! the smart-turn flow on their own.
 //!
 //! [vp-smart-turn]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/voice_pipeline.py#L287-L306
-//! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 
 /// The shape the orchestrator queries to decide whether the user
 /// has finished their turn.

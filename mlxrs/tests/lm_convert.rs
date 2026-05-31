@@ -1,11 +1,11 @@
-//! F7 — `convert()` library driver (`lm::convert`).
+//! `convert()` library driver (`lm::convert`).
 //!
 //! Integration tests for the port of `mlx_lm/convert.py::convert` (the
 //! conversion driver that ties load + quantize/dequantize + save together).
 //! Mirrors `lm_load.rs` style: gated on the `lm` umbrella, fixture-built
 //! synthetic HF directories under `temp_dir()`, hand-traced assertions.
 //!
-//! Test list (per F7 spec):
+//! Test list:
 //! - `convert_pass_through_no_quantize_no_dequantize`
 //! - `convert_quantize_int4_group64`
 //! - `convert_dequantize_round_trip`
@@ -16,7 +16,7 @@
 //! - `convert_rename_in_place_is_handled`
 //! - `mixed_quant_predicate_default_heuristics` — table test
 //!
-//! No `peak_memory()` magnitude asserts (per project memory).
+//! No `peak_memory()` magnitude asserts.
 #![cfg(feature = "lm")]
 
 use std::{collections::HashMap, fs, io::Write, path::PathBuf, process};
@@ -111,7 +111,7 @@ fn convert_pass_through_no_quantize_no_dequantize() {
 
   // The output dir has config.json + a single shard + index.
   assert!(dst.join("config.json").is_file(), "config.json written");
-  // F6 always writes the index (even for a single shard).
+  // The save layer always writes the index (even for a single shard).
   assert!(
     dst.join("model.safetensors.index.json").is_file(),
     "index.json written"
@@ -172,7 +172,7 @@ fn convert_quantize_int4_group64() {
 fn convert_dequantize_round_trip() {
   // Step 1: produce a quantized source dir by quantizing a known dense
   // input through the same `convert` driver. (Using the convert→reload
-  // path keeps the test invariant to F6's saved-shard layout.)
+  // path keeps the test invariant to the saved-shard layout.)
   let weights = make_quantizable_weights();
   let src = write_src_dir("dequant_src_dense", &weights, PLAIN_CONFIG_JSON);
   let quant_dir = temp_dir("dequant_src_quantized");
@@ -188,7 +188,7 @@ fn convert_dequantize_round_trip() {
   })
   .unwrap();
   // Now `quant_dir/config.json` carries a `quantization_config` block (per
-  // F6 `save_config`'s `quantization → quantization_config` mirror). For
+  // `save_config`'s `quantization → quantization_config` mirror). For
   // `dequantize_weights` to find the per-layer config, we patch the
   // `quantization` block back into the on-disk config — that's what mlx-lm
   // does in convert's own dequantize path (`config.pop("quantization_config")`
@@ -493,8 +493,8 @@ fn convert_rename_in_place_is_handled() {
   }
 
   // The helper itself is independently a no-op when src == dst (rename-in-
-  // place is what F6 + this helper combine to handle for the on-disk-only
-  // partial-convert scenarios). Calling the helper with the same path
+  // place is what the save path + this helper combine to handle for the
+  // on-disk-only partial-convert scenarios). Calling the helper with the same path
   // both ways must complete successfully without overwriting/clobbering.
   convert::copy_tokenizer_and_extras(&src, &src).unwrap();
   // Source files still present and unchanged.
@@ -647,9 +647,9 @@ fn mixed_quant_predicate_no_down_proj_is_error() {
   }
 }
 
-// ──────────────────────── Finding 1 — explicit-dtype gate ────────────────────────
+// ──────────────────────── explicit-dtype gate ────────────────────────
 
-/// F7 R1 Finding 1 — an explicit `Some(Dtype::I32)` MUST be a hard
+/// An explicit `Some(Dtype::I32)` MUST be a hard
 /// error from `convert`, not silently cast every floating weight to
 /// int. The reference's string-typed `if dtype in MODEL_CONVERSION_DTYPES`
 /// gate (`convert.py:133`) silently drops unknown spellings; the typed
@@ -730,9 +730,9 @@ fn convert_rejects_explicit_dtype_complex() {
   }
 }
 
-// ──────────────────────── Finding 2 — q_group_size / q_bits zero falsy ────────────────────────
+// ──────────────────────── q_group_size / q_bits zero falsy ────────────────────────
 
-/// F7 R1 Finding 2 — `q_group_size: Some(0)` is python-falsy
+/// `q_group_size: Some(0)` is python-falsy
 /// (`utils.py:808`: `group_size or default_group_size`) and MUST fall
 /// back to the per-mode default. The previous `unwrap_or` shape would
 /// have written a `quantization.group_size = 0` block to disk against
@@ -821,9 +821,9 @@ fn convert_q_bits_zero_falls_back_to_default() {
   );
 }
 
-// ──────────────────────── Finding 3 — predicate called once per layer ────────────────────────
+// ──────────────────────── predicate called once per layer ────────────────────────
 
-/// F7 R1 Finding 3 — the user-supplied `MixedQuantPredicate` MUST be
+/// The user-supplied `MixedQuantPredicate` MUST be
 /// called exactly ONCE per structurally-eligible layer across the full
 /// convert pipeline. The reference's `nn.quantize` invokes
 /// `wrapped_predicate` exactly once per module (`utils.py:837-843`),

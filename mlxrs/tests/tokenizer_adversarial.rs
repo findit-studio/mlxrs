@@ -1,5 +1,5 @@
-//! Adversarial / untrusted-input regression tests for the three Codex
-//! findings (streaming-detok sparse-vocab OOM, deepseek_v32 thinking-mode
+//! Adversarial / untrusted-input regression tests for three issue
+//! classes (streaming-detok sparse-vocab OOM, deepseek_v32 thinking-mode
 //! OOB panic, pythonic Unicode-slice panic) plus the byte-index parser
 //! audit fixes. Each test is gated on the specific capability feature it
 //! exercises so it also runs under `--features tokenizer-bpe` /
@@ -14,7 +14,7 @@
 ))]
 
 // ---------------------------------------------------------------------------
-// Finding 1 — streaming detokenizer dense-Vec OOM/overflow.
+// Streaming detokenizer dense-Vec OOM/overflow.
 // A huge sparse token id (u32::MAX) alongside small ids must construct
 // without a max-id-sized allocation and still detokenize correctly.
 // ---------------------------------------------------------------------------
@@ -100,7 +100,7 @@ fn bpe_huge_sparse_vocab_id_no_oom_and_detok_correct() {
   d.finalize();
   assert_eq!(d.text(), "Hello world");
 
-  // Sparse huge ids resolve via the HashMap. F3: the previous assertion
+  // Sparse huge ids resolve via the HashMap. The previous assertion
   // codified the WRONG `"!"` semantics — `tokenmap.get(&token).unwrap_or("!")`
   // returned `"!"` for *every* absent id. mlx-lm df1d3f3 is
   // `tokenmap[token] if token < len(tokenmap) else "!"` over a dense
@@ -121,7 +121,7 @@ fn bpe_huge_sparse_vocab_id_no_oom_and_detok_correct() {
 }
 
 // ---------------------------------------------------------------------------
-// Finding 2 — deepseek_v32 thinking-mode developer-message OOB panic.
+// deepseek_v32 thinking-mode developer-message OOB panic.
 // `[developer, user]` (and `[developer, user, assistant]`) in thinking mode
 // must not panic; output must match upstream rendering.
 // ---------------------------------------------------------------------------
@@ -168,7 +168,7 @@ fn deepseek_v32_thinking_developer_user_no_panic() {
 }
 
 // ---------------------------------------------------------------------------
-// Finding 3 — pythonic tool parser Unicode-after-space slice panic, plus the
+// Pythonic tool parser Unicode-after-space slice panic, plus the
 // audited function_gemma `<escape>` offset site. Malformed / Unicode model
 // output must return Err, never panic.
 // ---------------------------------------------------------------------------

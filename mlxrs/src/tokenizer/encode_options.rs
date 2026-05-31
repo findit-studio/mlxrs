@@ -2,8 +2,8 @@
 //!
 //! Exposes a richer encoding surface than the short positional
 //! [`Tokenizer::encode`]: explicit EOS appending, right-truncation (keep
-//! the head, drop the tail), and attention-mask emission. Per the mlxrs
-//! LM-2 tracker entry this is an additive Rust-idiom upgrade over the
+//! the head, drop the tail), and attention-mask emission. This is an
+//! additive Rust-idiom upgrade over the
 //! python reference (whose `tokenizer.encode(text, add_special)` is a
 //! single positional arg) — the old [`Tokenizer::encode`] API remains
 //! unchanged for back-compat.

@@ -750,7 +750,7 @@ mod tests {
   #[test]
   fn rope_offset_ref_scalar_saturates_instead_of_wrapping() {
     // `usize -> i32` must saturate at `i32::MAX`, not wrap to a negative offset
-    // (Copilot review: the prior `as` cast wrapped). A position past `i32::MAX`
+    // (the prior `as` cast wrapped). A position past `i32::MAX`
     // is pathological but must never silently rotate at a negative position.
     let huge = RopeOffset::Scalar(usize::MAX);
     match (&huge).into() {

@@ -246,7 +246,7 @@ pub type Weights = HashMap<String, Array>;
 ///
 /// No safetensors and no usable GGUF → [`Error::Backend`] (mlx-lm's
 /// `FileNotFoundError("No safetensors found in {model_path}")`). Keys are
-/// returned **verbatim** (no remap/sanitize — spec §7.2).
+/// returned **verbatim** (no remap/sanitize).
 ///
 /// The index is parsed with the same bounded-IO / `O_NONBLOCK` /
 /// non-regular-reject discipline `read_bounded_config_file` uses for
@@ -834,8 +834,8 @@ pub type Shard<'a> = BTreeMap<&'a str, &'a Array>;
 /// `shard_size + v.nbytes > max_file_size_bytes` **before** the weight is
 /// added (`utils.py:613`) — verbatim, with **no** empty-shard guard, exactly
 /// as the reference. Two edge cases follow directly from that and are
-/// reproduced faithfully (F6 is a faithful port — it matches mlx-lm even in
-/// the edge cases):
+/// reproduced faithfully (this is a faithful port — it matches mlx-lm even
+/// in the edge cases):
 ///
 /// - A single weight larger than the cap is flushed onto its own shard and
 ///   still placed (the cap is never *enforced*, only used as a split point).
@@ -1097,8 +1097,8 @@ pub fn does_model_support_input_embeddings(model: &dyn crate::lm::model::Model) 
 
 /// Process-global counter feeding [`new_gen_id`]: a `fetch_add(1)` per save
 /// gives every save *from this process* a distinct counter value, closing
-/// the same-millisecond / same-microsecond collision the F6 R5 timestamp-
-/// only tag left open. Combined with the PID (unique among live processes)
+/// the same-millisecond / same-microsecond collision a timestamp-only tag
+/// would leave open. Combined with the PID (unique among live processes)
 /// and the µs timestamp (monotone-ish across reboots) this makes the
 /// resulting `gen_id` collision-resistant by construction.
 static SAVE_GEN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1138,7 +1138,7 @@ fn force_next_gen_id(id: &str) {
 ///   *within* this process across the lifetime of the binary, so two saves
 ///   from the same process in the same microsecond can never collide on the
 ///   counter. The mlx-lm reference produced fixed names that *did* collide;
-///   the F6 R5 timestamp-only tag collided whenever two saves landed in the
+///   a timestamp-only tag would collide whenever two saves landed in the
 ///   same millisecond. This counter closes that hole.
 ///
 /// Concatenated together the resulting tag is collision-resistant by
@@ -1219,8 +1219,7 @@ fn shard_file_name(gen_id: &str, index_1based: usize, shards_count: usize) -> St
 /// This contract keeps the [`save`] driver from dropping a staged
 /// config-tempfile guard (and its cleanup-on-drop tempfile delete) just
 /// because a post-commit fsync hiccupped — which would leave NEW
-/// weights+index visible against the OLD config, the exact mismatch
-/// Finding 2 flagged.
+/// weights+index visible against the OLD config.
 #[derive(Debug)]
 pub enum CommitOutcome {
   /// The index rename succeeded and the post-commit parent-directory
@@ -1332,10 +1331,10 @@ pub enum CommitOutcome {
 ///     directory entry). The caller (e.g. [`save`]) MUST still proceed
 ///     to commit any other staged state.
 ///
-/// This contract closes the F6 R6 Finding-2 hole where a post-index-
-/// commit `fsync_dir` failure would propagate as `Err` and drop the
-/// staged config-tempfile guard (deleting its tempfile via [`Drop`]),
-/// leaving NEW weights+index visible against the OLD config.
+/// This contract closes the hole where a post-index-commit `fsync_dir`
+/// failure would propagate as `Err` and drop the staged config-tempfile
+/// guard (deleting its tempfile via [`Drop`]), leaving NEW weights+index
+/// visible against the OLD config.
 ///
 /// # Hostile-directory caveat
 ///
@@ -1687,8 +1686,9 @@ pub fn save_model(
   //        Returned as `Ok(CommittedWithDurabilityWarning(_))` rather
   //        than `Err(_)`, so the [`save`] driver does not drop a still-
   //        staged [`StagedConfig`] (which would delete its tempfile via
-  //        [`Drop`]), the F6 R6 Finding-2 hole. The caller surfaces it
-  //        to its own caller via [`crate::Error::DurabilityWarning`].
+  //        [`Drop`]), leaving NEW weights+index visible against the OLD
+  //        config. The caller surfaces it to its own caller via
+  //        [`crate::Error::DurabilityWarning`].
   match fsync_dir(save_path) {
     Ok(()) => Ok(CommitOutcome::Committed),
     Err(e) => Ok(CommitOutcome::CommittedWithDurabilityWarning(e)),
@@ -1703,9 +1703,9 @@ pub fn save_model(
 /// shard bodies / [`write_json_pretty`] for the index + config JSON) so
 /// the original-open identity carries through to every write.
 ///
-/// **TOCTOU rationale.** The earlier shape returned only the [`PathBuf`]
-/// and then dropped the open handle, leaving every subsequent write to
-/// re-open `path` by name. Between the `O_EXCL` create + that reopen, an
+/// **TOCTOU rationale.** Returning only the [`PathBuf`] and dropping the
+/// open handle would leave every subsequent write to re-open `path` by
+/// name. Between the `O_EXCL` create + that reopen, an
 /// attacker with write access to the destination directory could
 /// `unlink(path) + symlink(path, /etc/passwd)` and redirect the write —
 /// defeating the no-symlink guarantee `O_EXCL` was meant to provide.
@@ -1800,7 +1800,7 @@ fn open_excl_temp_shard(final_path: &Path) -> Result<(std::fs::File, PathBuf)> {
 /// read-only and `sync_all` it. Mirrors `cache_prompt::save_prompt_cache_atomic`.
 ///
 /// `pub(crate)` so sibling modules ([`crate::lm::convert`]'s post-copy
-/// durability step, F7 R4) can call the same well-tested helper rather
+/// durability step) can call the same well-tested helper rather
 /// than re-implement the open + `sync_all` boilerplate. Test-only fault
 /// injection is wired through [`arm_fsync_path_fault`].
 ///
@@ -1910,7 +1910,7 @@ fn fsync_open_file_for_path_inner(
       let _ = std::fs::remove_file(path);
       // Fall through — `file.sync_all()` on the now-unlinked fd will
       // still succeed on POSIX (the inode stays live while the fd is
-      // open), so the F7 R7 "real failure" path that depends on the
+      // open), so the "real failure" path that depends on the
       // file disappearing is exercised through the path-based variant
       // ([`fsync_path_io`]) which DOES reopen by name. This helper's
       // remove-then-fail behavior matches POSIX semantics; the test
@@ -1938,7 +1938,7 @@ fn fsync_open_file_for_path_inner(
 fn fsync_path_inner(path: &Path) -> std::io::Result<()> {
   // Test-only fault-injection knob — see [`arm_fsync_path_fault`] /
   // [`arm_fsync_path_fault_with_kind`]. Mirrors the `fsync_dir` injector
-  // shape so the F7 R4 post-copy durability tests can exercise the
+  // shape so the post-copy durability tests can exercise the
   // "file content is durable but fsync warned" branch without needing a
   // hostile filesystem. Production code path: always `None`, falls
   // straight through to the real fsync.
@@ -1957,14 +1957,14 @@ fn fsync_path_inner(path: &Path) -> std::io::Result<()> {
     }
   }
 
-  // F7 R7 Finding test hook — "real OS failure" injector. Unlike the
+  // Test hook — "real OS failure" injector. Unlike the
   // pre-existing injector above (which synthesizes a formatted
   // io::Error string that incidentally includes the path), this one
   // removes the target file then falls through to the natural
   // [`std::fs::File::open`] call so the test observes the AUTHENTIC
   // [`std::io::Error`] the OS produces — a context-free OS-level
   // message like `"No such file or directory (os error 2)"` with NO
-  // path embedded. Used by `convert.rs`'s F7 R7 "real failure" test to
+  // path embedded. Used by `convert.rs`'s "real failure" test to
   // prove the call-site wrap in `copy_tokenizer_and_extras` adds path
   // context INDEPENDENT of any injector-format coincidence.
   //
@@ -1994,7 +1994,7 @@ fn fsync_path_inner(path: &Path) -> std::io::Result<()> {
 // normally and the (n+1)-th returns
 // `std::io::Error::new(kind, "injected fsync_path ...")` (kind defaults
 // to `ErrorKind::Other`; can be overridden via
-// [`arm_fsync_path_fault_with_kind`]). Used by F7 R4's post-copy
+// [`arm_fsync_path_fault_with_kind`]). Used by the post-copy
 // durability tests to drive the
 // `CopyOutcome::CommittedWithDurabilityWarning` branch without needing a
 // hostile filesystem. Always `None` in production code (the thread-local
@@ -2010,7 +2010,7 @@ thread_local! {
   /// injector fires.
   static FSYNC_PATH_FAULT_KIND: std::cell::Cell<Option<std::io::ErrorKind>> =
     const { std::cell::Cell::new(None) };
-  /// F7 R7 — "real failure" injector skip counter. When `Some(n)`, the
+  /// "Real failure" injector skip counter. When `Some(n)`, the
   /// next `n` `fsync_path_inner` calls pass and the (n+1)-th
   /// `remove_file`s the target path then falls through to the natural
   /// [`std::fs::File::open`] which produces a real OS-level
@@ -2029,7 +2029,7 @@ thread_local! {
 /// the thread in a clean state for the next test).
 ///
 /// `pub(crate)` (test-only) so sibling modules' tests (e.g.
-/// [`crate::lm::convert`]'s F7 R4 post-copy durability closure) can
+/// [`crate::lm::convert`]'s post-copy durability closure) can
 /// drive the [`CopyOutcome::CommittedWithDurabilityWarning`] branch
 /// through the public [`crate::lm::convert::convert`] entrypoint.
 #[cfg(test)]
@@ -2040,13 +2040,12 @@ pub(crate) fn arm_fsync_path_fault(skip: usize) -> FsyncPathFaultGuard {
 /// Variant of [`arm_fsync_path_fault`] that lets the caller pick the
 /// injected [`std::io::ErrorKind`] (e.g.
 /// [`std::io::ErrorKind::PermissionDenied`] /
-/// [`std::io::ErrorKind::StorageFull`]). Used by F7 R6's
+/// [`std::io::ErrorKind::StorageFull`]). Used by the
 /// kind-preservation tests so the post-copy file fsync warning's
 /// `.kind()` can be asserted against a SPECIFIC non-`Other` kind —
 /// proving the convert()-side aggregate preserves the kind end-to-end
-/// (the F7 R6 finding was that the R5 fix's `fsync_copied` closure
-/// re-wrapped the injected io::Error via `io::Error::other(message)`,
-/// collapsing every kind to `Other`).
+/// (a `fsync_copied` closure that re-wrapped the injected io::Error via
+/// `io::Error::other(message)` would collapse every kind to `Other`).
 #[cfg(test)]
 pub(crate) fn arm_fsync_path_fault_with_kind(
   skip: usize,
@@ -2068,17 +2067,17 @@ impl Drop for FsyncPathFaultGuard {
   }
 }
 
-/// F7 R7 — arm the "real OS failure" injector: skip `skip` successful
+/// Arm the "real OS failure" injector: skip `skip` successful
 /// `fsync_path_inner` calls, then on the (skip+1)-th call remove the
 /// target file before the natural [`std::fs::File::open`] runs. The
 /// resulting [`std::io::Error`] is the AUTHENTIC OS-level error (kind
 /// [`std::io::ErrorKind::NotFound`], message like `"No such file or
 /// directory (os error 2)"`) with NO path embedded — exactly the kind
-/// of context-free failure the F7 R7 call-site wrap is designed to
+/// of context-free failure the call-site wrap is designed to
 /// catch. Returns a [`Drop`] guard that disarms the injector on scope
 /// exit (so a test panic still leaves the thread clean).
 ///
-/// `pub(crate)` (test-only) so [`crate::lm::convert`]'s F7 R7
+/// `pub(crate)` (test-only) so [`crate::lm::convert`]'s
 /// "real failure" test can drive a non-synthesized post-copy fsync
 /// warning through the public [`crate::lm::convert::convert`]
 /// entrypoint and assert the call-site wrap added path + operation
@@ -2128,7 +2127,7 @@ thread_local! {
 /// for the next test).
 ///
 /// `pub(crate)` (test-only) so sibling modules' tests (e.g.
-/// [`crate::lm::convert`]'s F7 R1 Finding-4 closure) can drive the same
+/// [`crate::lm::convert`]'s durability closure) can drive the same
 /// post-commit durability path through the public [`save`] entrypoint.
 #[cfg(test)]
 pub(crate) fn arm_fsync_dir_fault(skip: usize) -> FsyncDirFaultGuard {
@@ -2136,7 +2135,7 @@ pub(crate) fn arm_fsync_dir_fault(skip: usize) -> FsyncDirFaultGuard {
 }
 
 /// Variant of [`arm_fsync_dir_fault`] that lets the caller pick the
-/// injected [`std::io::ErrorKind`]. Used by F7 R6's kind-preservation
+/// injected [`std::io::ErrorKind`]. Used by the kind-preservation
 /// tests so the save-side warning + post-copy dir warning both carry a
 /// specific machine-readable kind end-to-end through the
 /// [`crate::error::ConvertDurabilityWarnings`] aggregate.
@@ -2178,7 +2177,7 @@ impl Drop for FsyncDirFaultGuard {
 /// silently succeeds rather than propagate a platform-specific error
 /// that has no corresponding fix at this layer.
 /// `pub(crate)` so sibling modules ([`crate::lm::convert`]'s post-copy
-/// directory-fsync step, F7 R4) can call the same well-tested helper
+/// directory-fsync step) can call the same well-tested helper
 /// rather than re-implement the `O_DIRECTORY` + `sync_all` boilerplate.
 /// Test-only fault injection is wired through [`arm_fsync_dir_fault`].
 pub(crate) fn fsync_dir(path: &Path) -> std::io::Result<()> {
@@ -2431,8 +2430,7 @@ fn commit_staged_config(mut staged: StagedConfig, config_path: &Path) -> Result<
 ///    the visible checkpoint is on disk and complete; `save` PROCEEDS to
 ///    commit the staged config (otherwise the staging guard's `Drop` would
 ///    delete the staged config tempfile, leaving NEW weights+index against
-///    the OLD config — the F6 R6 Finding-2 hole). The warning is
-///    accumulated for the final return.
+///    the OLD config). The warning is accumulated for the final return.
 /// 4. The staged config is **atomically renamed** over
 ///    `<dst_path>/config.json` LAST (`utils.py:943`). The config rename's
 ///    own post-rename `fsync_dir` failure is similarly demoted to a
@@ -2528,8 +2526,8 @@ pub fn save(
   //    checkpoint loads correctly and we MUST proceed to commit the
   //    config (dropping the staged config here would delete the config
   //    tempfile, leaving NEW weights+index against the OLD config —
-  //    the F6 R6 Finding-2 hole this entire shape closes). The warning
-  //    is accumulated for the final return.
+  //    the hole this entire shape closes). The warning is accumulated
+  //    for the final return.
   let mut durability: Option<std::io::Error> = match save_model(dst_path, weights, quant)? {
     CommitOutcome::Committed => None,
     CommitOutcome::CommittedWithDurabilityWarning(e) => Some(e),
@@ -2626,7 +2624,7 @@ fn write_json_pretty_to_path(
 
 #[cfg(test)]
 mod save_tests {
-  //! F6 — model save / shard / introspect, in isolation. Shard boundaries
+  //! Model save / shard / introspect, in isolation. Shard boundaries
   //! are hand-computed for a chosen cap; `save` then `load_weights` round-
   //! trips (weights byte-equal, index.json correct); introspection helpers
   //! are checked against hand-verified counts. No `peak_memory()` assert.
@@ -3352,7 +3350,7 @@ mod save_tests {
   /// checkpoint may remain on disk as orphans — they are deliberately
   /// invisible to load (the index is the authoritative manifest) and
   /// they are NOT inline-cleaned by `save_model` (the inline cleanup was
-  /// removed in F6 round-5 because it raced concurrent readers; see
+  /// removed because it raced concurrent readers; see
   /// `save_model` rustdoc). This test asserts the *load* contract — only
   /// the new keys appear — while letting orphan shards exist on disk;
   /// `save_model_no_overwrite_of_old_shards` covers the on-disk side.
@@ -3361,7 +3359,7 @@ mod save_tests {
     let dir = fresh_dir("save-model-overwrite-loads-new");
 
     // Stale 3-shard checkpoint, hand-written with the OLD reference-
-    // style multi-shard names (the form a pre-F6-round-5 build, or any
+    // style multi-shard names (the form an earlier build, or any
     // hand-crafted checkpoint, could leave behind).
     let stale_vals = [
       ("stale.a.weight", vec![100.0_f32]),
@@ -3584,7 +3582,7 @@ mod save_tests {
 
   // ─────────────────── save_model failure-atomicity ───────────────────
 
-  /// Failure-atomic save (Codex finding): when a `save_model` overwrite
+  /// Failure-atomic save: when a `save_model` overwrite
   /// FAILS partway, the previously-valid checkpoint in the directory is
   /// left **fully intact and loadable**, and no partial `.tmp.safetensors`
   /// remains. A direct (non-atomic) per-shard write would clobber a
@@ -4594,13 +4592,13 @@ mod save_tests {
     );
   }
 
-  // ────────── F6 R6: collision-resistant gen_id + fail-closed rename ──────────
+  // ────────── collision-resistant gen_id + fail-closed rename ──────────
 
   /// Two consecutive `save_model` calls from the same process — even in a
   /// tight loop where the µs timestamp may not advance between calls —
   /// produce on-disk shards with distinct basenames, because the process-
   /// global counter component of [`new_gen_id`] always advances. Without
-  /// the counter the timestamp-only F6 R5 tag would have collided
+  /// the counter a timestamp-only tag would have collided
   /// whenever two saves landed in the same ms / µs tick (and the second
   /// save would have overwritten the first save's shard via
   /// `fs::rename`); the counter closes that hole.
@@ -4715,7 +4713,7 @@ mod save_tests {
     let _ = std::fs::remove_dir_all(&dir);
   }
 
-  /// F6 R7: the shard publish primitive must be **atomic no-replace**,
+  /// The shard publish primitive must be **atomic no-replace**,
   /// not a `symlink_metadata` + `rename` pre-check. A check-then-act
   /// has a TOCTOU window: the stat returns `NotFound`, a concurrent
   /// writer creates the final path, then `rename(2)` SILENTLY replaces
@@ -4818,13 +4816,13 @@ mod save_tests {
     let _ = std::fs::remove_dir_all(&dir);
   }
 
-  // ────────── F6 R6: post-index-commit durability warning ──────────
+  // ────────── post-index-commit durability warning ──────────
 
   /// `save_model` returns `Ok(CommitOutcome::CommittedWithDurabilityWarning)`
   /// — NOT `Err` — when the post-index-rename `fsync_dir` fails. The
   /// visible checkpoint loads correctly; only the parent-directory
-  /// fsync hiccupped. This is the F6 R6 Finding-2 hole: returning `Err`
-  /// here would propagate through [`save`] and drop the staged
+  /// fsync hiccupped. This is the hole that returning `Err`
+  /// here would open: it would propagate through [`save`] and drop the staged
   /// [`StagedConfig`], deleting its tempfile and leaving NEW
   /// weights+index against the OLD config.
   ///
@@ -4902,7 +4900,7 @@ mod save_tests {
   /// MUST be byte-equal to the staged (cleaned/sorted) content, the OLD
   /// `config.json` is gone, and `save`'s final return is
   /// [`Error::DurabilityWarning`] with `committed: true`. This is the
-  /// end-to-end F6 R6 Finding-2 closure.
+  /// end-to-end closure for the config-staging durability contract.
   #[test]
   fn save_post_commit_durability_warning_still_commits_config() {
     let dir = fresh_dir("save-post-commit-warning-commits-config");
@@ -5234,7 +5232,7 @@ mod save_tests {
     // or suffix would push the size past the control. We can't hard-
     // code the byte count because mlx-c's JSON-header layout (key
     // order, whitespace) is an implementation detail, but parity with
-    // the path-based writer is the contract this fix establishes.
+    // the path-based writer is the contract this test establishes.
     let control_path = dir.join("control.safetensors");
     let mut control_arrays: HashMap<String, &Array> = HashMap::new();
     control_arrays.insert("w".to_string(), &arr);
@@ -5495,7 +5493,7 @@ mod save_tests {
   /// regress on the success path. See `save_safetensors_to_file`'s
   /// Destructive mutation doc section.
   #[test]
-  fn save_safetensors_to_file_empty_metadata_succeeds_post_r3_null_check() {
+  fn save_safetensors_to_file_empty_metadata_succeeds_with_null_check() {
     let dir = fresh_dir("load1-fd-r3-empty-meta-ok");
     let path = dir.join("empty_meta_ok.safetensors");
     let mut file = std::fs::OpenOptions::new()
@@ -5550,7 +5548,7 @@ mod save_tests {
   /// contract — see `save_safetensors_to_file`'s Destructive mutation
   /// doc section.
   #[test]
-  fn build_map_helpers_carry_r3_null_sentinel_check() {
+  fn build_map_helpers_carry_null_sentinel_check() {
     // Read the SOURCE we shipped (not the compiled binary) so a future
     // edit that deletes the guard fails this test deterministically,
     // independent of inlining / optimization. The path is relative to
@@ -5662,7 +5660,7 @@ mod save_tests {
   /// contract — see `save_safetensors_to_file`'s Destructive mutation
   /// doc section.
   #[test]
-  fn save_safetensors_to_file_writer_new_precedes_truncate_r4_structural() {
+  fn save_safetensors_to_file_writer_new_precedes_truncate() {
     // Read the SOURCE we shipped (not the compiled binary) so a future
     // edit that re-orders the writer ctor past the truncate fails this
     // test deterministically, independent of inlining / optimization.

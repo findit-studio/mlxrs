@@ -18,14 +18,14 @@
 //! `include_prompt` boolean, and the matryoshka `word_embedding_dimension`
 //! / `embedding_dimension` integers — tracking byte offsets for actionable
 //! parse-error messages. Unknown keys are structurally validated but
-//! discarded (forward-compat with future HF fields). Tracker entry
-//! `EMB-1`. The full `serde_json` dep is therefore not pulled in by the
+//! discarded (forward-compat with future HF fields).
+//! The full `serde_json` dep is therefore not pulled in by the
 //! `embeddings` feature as a direct dependency; other tokenizer
 //! features still pull `serde_json` independently and are unaffected.
 //! `tokenizers v0.23` itself transitively pulls `serde_json` for
 //! `tokenizer.json` parsing, so the `embeddings` build graph still
-//! *compiles* `serde_json` — EMB-1 closes the *direct mlxrs surface*
-//! claim, not the deep transitive graph.
+//! *compiles* `serde_json` — this only avoids the *direct mlxrs surface*
+//! dependency, not the deep transitive graph.
 //!
 //! String payloads in the parser's `JVal::Str` variant are stored as
 //! [`smol_str::SmolStr`] so the common short tokens (`"mean"` /
@@ -63,7 +63,7 @@ impl std::error::Error for PoolingJsonParseError {}
 
 /// Build an [`Error::Parse`] wrapping a [`PoolingJsonParseError`] at the
 /// given byte offset with the supplied message. The static `context` /
-/// `input_kind` keep the §5 closed-payload contract while the position +
+/// `input_kind` keep the closed-payload contract while the position +
 /// dynamic detail live in the inner error.
 fn parse_err_at(pos: usize, msg: impl Into<String>) -> Error {
   Error::Parse(ParsePayload::new(
@@ -160,7 +160,7 @@ impl StPoolingConfig {
 
 // ───────────────── hand-rolled strict-JSON scanner ────────────────────
 //
-// EMB-1: parse the ~10 known top-level keys `1_Pooling/config.json` uses
+// Parse the ~10 known top-level keys `1_Pooling/config.json` uses
 // (modern `pooling_mode` + 6 legacy boolean flags + `include_prompt` +
 // `word_embedding_dimension` + `embedding_dimension`) without pulling
 // `serde_json` into the `embeddings`-only feature. Unknown keys are
@@ -195,8 +195,8 @@ impl StPoolingConfig {
 /// Unknown top-level keys never reach this enum — they are discarded
 /// during parsing rather than accumulated in a `Vec`, which keeps the
 /// scanner O(n) on hostile configs that pack many unique keys into the
-/// 1 MiB read cap (Codex EMB-1 round 2: the previous `Vec`-of-pairs
-/// dedup was O(n²) on such input).
+/// 1 MiB read cap (the previous `Vec`-of-pairs dedup was O(n²) on such
+/// input).
 #[derive(Debug)]
 pub(crate) enum JVal<'a> {
   Null,
@@ -252,10 +252,9 @@ fn is_known_key(k: &str) -> bool {
 /// realistic HF config — those pooling configs are flat — yet caps
 /// stack growth at a constant well under any platform default.
 ///
-/// Codex adversarial-review (EMB-1, round 1) flagged the unbounded
-/// recursion as the only blocker. The fix is a per-scanner depth
-/// counter incremented at every `{`/`[` and decremented at the
-/// matching close; if it exceeds the cap we surface a recoverable
+/// Unbounded recursion would otherwise be a blocker. The fix is a
+/// per-scanner depth counter incremented at every `{`/`[` and decremented
+/// at the matching close; if it exceeds the cap we surface a recoverable
 /// error citing the byte offset.
 const MAX_NESTING_DEPTH: usize = 128;
 
@@ -352,7 +351,7 @@ impl<'a> Scanner<'a> {
   /// ignored field) but their values are *discarded* rather than
   /// retained — keeping per-key cost O(1) and the whole top-level pass
   /// O(n), regardless of how many unique unknown keys a hostile config
-  /// packs into the 1 MiB read cap (Codex EMB-1 round 2 fix).
+  /// packs into the 1 MiB read cap.
   ///
   /// The top-level `{` counts toward [`MAX_NESTING_DEPTH`] (`enter`/`leave`
   /// pair) so a config of `{"k": <nested>}` shares the same depth budget
@@ -395,7 +394,6 @@ impl<'a> Scanner<'a> {
         // A hostile config with 100k unique unknown keys (each carrying
         // a long string value) therefore parses in O(n) with zero per-
         // key heap traffic, instead of O(n) heap allocations.
-        // Copilot review #3277203298 (EMB-1 follow-up).
         self.skip_value(&format!("for value of key {key:?}"))?;
       }
       self.skip_ws();
@@ -466,8 +464,6 @@ impl<'a> Scanner<'a> {
   /// — fixed in this PR); booleans/numbers/null → existing
   /// `parse_bool` / `parse_number_slice` / `parse_keyword` (which
   /// already only advance `pos` without allocating).
-  ///
-  /// Copilot review #3277203298 (EMB-1 follow-up).
   fn skip_value(&mut self, ctx: &str) -> Result<()> {
     self.skip_ws();
     match self.peek() {
@@ -506,8 +502,6 @@ impl<'a> Scanner<'a> {
   /// known-key value is consistently rejected in an unknown-key value
   /// too). Control-character + invalid-escape rejections mirror
   /// `parse_string` exactly.
-  ///
-  /// Copilot review #3277203298 (EMB-1 follow-up).
   fn skip_string(&mut self, ctx: &str) -> Result<()> {
     self.skip_ws();
     if self.peek() != Some(b'"') {
@@ -589,8 +583,7 @@ impl<'a> Scanner<'a> {
   /// (which MUST be on a `"`, after `skip_ws`). Returns the decoded
   /// UTF-8 string.
   ///
-  /// Two-stage implementation (memspan-accelerated; closes Codex
-  /// EMB-1 round-4 perf finding):
+  /// Two-stage implementation (memspan-accelerated):
   ///
   /// 1. **Fast path — escape-free strings**: SIMD-scan ahead for the
   ///    next `"` or `\` via `memspan::skip::skip_until`. If the first
@@ -882,7 +875,7 @@ impl<'a> Scanner<'a> {
     }
     loop {
       self.skip_ws();
-      // Allocation-free key + value walk (Copilot review #3277203298):
+      // Allocation-free key + value walk:
       // a discarded nested object's string keys and string values would
       // otherwise allocate a fresh `String` per token even though we
       // immediately drop them. `skip_string` / `skip_value` validate
@@ -935,7 +928,7 @@ impl<'a> Scanner<'a> {
     }
     loop {
       self.skip_ws();
-      // Allocation-free (Copilot review #3277203298) — see `skip_object`.
+      // Allocation-free — see `skip_object`.
       self.skip_value("inside array")?;
       self.skip_ws();
       match self.peek() {
@@ -1000,7 +993,7 @@ fn resolve_strategy(cfg: &[(SmolStr, JVal<'_>)]) -> Result<PoolingStrategy> {
       "concatenated pooling mode (list) is not supported; only a single pooling mode is allowed",
     )));
   }
-  // C6 (Copilot review 4307622782, #3256688299): a present-but-non-
+  // A present-but-non-
   // string/non-array `pooling_mode` (null / bool / number / object).
   //
   // python parity: `_normalize_pooling_config` only synthesizes
@@ -1178,7 +1171,7 @@ fn parse_pairs(cfg: &[(SmolStr, JVal<'_>)]) -> Result<StPoolingConfig> {
   // also commonly use `embedding_dimension` (legacy ST). Accept either,
   // `word_embedding_dimension` taking precedence when both are present.
   //
-  // C7 (Copilot review 4307622782, #3256688310): a present-but-invalid
+  // A present-but-invalid
   // value (negative / fractional / string / `> usize`) previously went
   // `as_u64()` → `None` → treated as ABSENT → matryoshka truncation
   // silently SKIPPED, so the caller got a full-width embedding when the
@@ -1522,9 +1515,8 @@ mod tests {
     // BMP-codepoint encode path inside `parse_string`. A raw multibyte
     // `é` in the source would skip the escape branch entirely and pass
     // through the "raw multibyte UTF-8 input passes through unchanged"
-    // path, leaving the escape decoder untested (Copilot review
-    // #3277203315). Decoded output is U+00E9 LATIN SMALL LETTER E WITH
-    // ACUTE = "é".
+    // path, leaving the escape decoder untested. Decoded output is
+    // U+00E9 LATIN SMALL LETTER E WITH ACUTE = "é".
     let pairs = parse_pooling_json(r#"{"pooling_mode": "caf\u00E9"}"#).unwrap();
     match &pairs[0].1 {
       JVal::Str(s) => assert_eq!(s, "café"),
@@ -1539,8 +1531,8 @@ mod tests {
     // branch and the `0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)`
     // combine-into-supplementary-plane codepoint computation. A raw
     // 4-byte `😀` UTF-8 in the source would pass through unchanged and
-    // leave the surrogate-pair code path untested (Copilot review
-    // #3277203341). Decoded output is U+1F600 GRINNING FACE.
+    // leave the surrogate-pair code path untested. Decoded output is
+    // U+1F600 GRINNING FACE.
     let pairs = parse_pooling_json(r#"{"pooling_mode": "\uD83D\uDE00"}"#).unwrap();
     match &pairs[0].1 {
       JVal::Str(s) => assert_eq!(s, "\u{1F600}"),
@@ -1561,8 +1553,7 @@ mod tests {
 
   #[test]
   fn parse_pooling_json_rejects_overly_deep_nesting() {
-    // Codex adversarial-review (EMB-1, round 1) flagged that an
-    // attacker-controlled `1_Pooling/config.json` can pack hundreds of
+    // An attacker-controlled `1_Pooling/config.json` can pack hundreds of
     // thousands of `[`/`{` characters into the 1 MiB read cap. Without
     // a depth guard the recursive scanner would blow the thread stack
     // and abort the process instead of returning a recoverable
@@ -1614,8 +1605,7 @@ mod tests {
 
   #[test]
   fn parse_pooling_json_handles_many_unknown_keys_linearly() {
-    // Codex adversarial-review (EMB-1, round 2) flagged that the
-    // previous `Vec`-of-pairs dedup was O(n²) on hostile configs that
+    // The previous `Vec`-of-pairs dedup was O(n²) on hostile configs that
     // pack many unique top-level keys into the 1 MiB read cap (the
     // resolver discards them, but every parsed pair was still scanned
     // linearly before each new push). The fix: unknown keys are

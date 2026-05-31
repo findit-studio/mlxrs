@@ -40,14 +40,13 @@ use crate::{
 /// ([vad-utils.py:8-11][vad-utils-remap]) — a static array of
 /// `(alias, canonical_module_name)` pairs.
 ///
-/// **Reference-only**: per the [no per-model arch porting][noarch] rule,
+/// **Reference-only**: per the no per-model arch porting rule,
 /// mlxrs does NOT import per-architecture crates from this table — it
 /// exists purely so an end-of-pipeline caller (who DOES wire in concrete
 /// architectures) can mirror mlx-audio's alias resolution. Add new
 /// aliases here when the upstream table changes.
 ///
 /// [vad-utils-remap]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/vad/utils.py#L8-L11
-/// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 pub const MODEL_REMAPPING: &[(&str, &str)] =
   &[("silero", "silero_vad"), ("silero-vad", "silero_vad")];
 
@@ -55,7 +54,7 @@ pub const MODEL_REMAPPING: &[(&str, &str)] =
 /// of mlx-audio's per-arch `Model` class's
 /// [`generate(audio, sample_rate=…) -> VADOutput`][vad-generate] method.
 ///
-/// Per the [no per-model arch porting][noarch] rule, mlxrs ships no
+/// Per the no per-model arch porting rule, mlxrs ships no
 /// concrete VAD models; this trait is the *shape* per-architecture
 /// crates (silero_vad / sortformer / smart_turn / …) implement so a
 /// caller can hand-off any VAD architecture as a `Box<dyn VadModel>`
@@ -67,7 +66,6 @@ pub const MODEL_REMAPPING: &[(&str, &str)] =
 /// for inference).
 ///
 /// [vad-generate]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/vad/models/silero_vad/silero_vad.py#L243-L266
-/// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 pub trait VadModel {
   /// Run VAD inference on `audio` at `sample_rate` Hz, returning the
   /// per-frame probabilities + extracted speech timestamps — mirror of

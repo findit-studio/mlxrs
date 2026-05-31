@@ -1205,7 +1205,7 @@ mod tests {
 
   #[test]
   fn rejects_skinny_to_wide_oversized_intermediate() {
-    // Codex adversarial case: a `1x131072` source resized to `131072x1`.
+    // Adversarial case: a `1x131072` source resized to `131072x1`.
     // The RGBA source is `1*131072*4` = 512 KiB (under the 512 MiB cap)
     // and the destination is `131072*1*4` = 512 KiB (under the cap), but
     // the horizontal-pass intermediate is `src_h * dst_w * 4`
@@ -1443,7 +1443,7 @@ mod tests {
 
   #[test]
   fn resize_premultiplied_transparent_red_opaque_blue() {
-    // Codex example at the kernel level: transparent-red `(255,0,0,0)`
+    // Example at the kernel level: transparent-red `(255,0,0,0)`
     // next to opaque-blue `(0,0,255,255)`, 2x1 -> 1x1. The premultiplied
     // path must yield pure blue with half alpha `(0,0,255,128)` for every
     // non-NEAREST filter — NOT the straight-channel purple

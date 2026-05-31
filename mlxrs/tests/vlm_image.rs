@@ -89,7 +89,7 @@ fn resize_filters_all_succeed() {
 
 #[test]
 fn resize_rejects_zero_target_dimension() {
-  // Regression for Codex Finding 1 (high): `ImageProcessorConfig::size`
+  // Regression: `ImageProcessorConfig::size`
   // now flows from an UNTRUSTED loaded processor config. A zero target
   // dimension must be rejected as a recoverable `Error::OutOfRange`
   // BEFORE the source-RGBA materialization / the own resize kernel's
@@ -111,7 +111,7 @@ fn resize_rejects_zero_target_dimension() {
 
 #[test]
 fn resize_rejects_oversized_target() {
-  // Regression for Codex Finding 1 (high): a hostile/malformed loaded
+  // Regression: a hostile/malformed loaded
   // config with an enormous `size` would drive the resize destination
   // allocation (`height * width * 4` bytes) to panic-abort the process,
   // taking down image + video preprocessing on the first request. The
@@ -133,7 +133,7 @@ fn resize_rejects_oversized_target() {
 
 #[test]
 fn resize_rejects_overflowing_target_product() {
-  // Regression for Codex Finding 1 (high): the byte-budget guard
+  // Regression: the byte-budget guard
   // computes `height * width * 4` via `u64::checked_mul`. A target whose
   // product overflows u64 (`u32::MAX` on both axes) must surface as a
   // recoverable `Error::ArithmeticOverflow` rather than wrapping to a
@@ -152,7 +152,7 @@ fn resize_rejects_overflowing_target_product() {
 
 #[test]
 fn resize_rejects_source_rgba_staging_over_cap() {
-  // Regression for Codex Finding 2 (medium): `load_image`'s 512 MiB cap
+  // Regression: `load_image`'s 512 MiB cap
   // is enforced on `decoder.total_bytes()` — the SOURCE pixel format. A
   // low-bytes-per-pixel source (Luma8, 1 B/px) can pass that cap yet
   // expand 4x when projected to the RGBA8 staging buffer `resize`
@@ -208,8 +208,7 @@ fn resize_normal_luma8_source_still_resizes() {
 
 #[test]
 fn resize_accepted_target_uses_fallible_alloc_path_never_aborts() {
-  // Regression for Codex Finding (high, round 2) + the own-resize
-  // omnibus follow-up: an accepted target AT OR BELOW the 512 MiB cap
+  // Regression: an accepted target AT OR BELOW the 512 MiB cap
   // formerly still allocated through INFALLIBLE buffers — `img.to_rgba8()`
   // (an owned RGBA clone) and, inside `fast_image_resize`, its internal
   // coefficient tables + per-row work buffers (allocated infallibly
@@ -587,7 +586,7 @@ fn rgba8_image(w: u32, h: u32, bytes: &[u8]) -> ::image::DynamicImage {
 
 #[test]
 fn resize_premultiplied_alpha_transparent_red_opaque_blue_downscale() {
-  // The Codex example: a transparent-red pixel `(255,0,0,0)` next to an
+  // A transparent-red pixel `(255,0,0,0)` next to an
   // opaque-blue pixel `(0,0,255,255)`. PIL premultiplies before
   // resampling, so the transparent red contributes ZERO colour — the
   // downscaled pixel is pure blue with half alpha `(0,0,255,128)`. A
@@ -790,7 +789,7 @@ fn image_to_array_drops_alpha_from_rgba() {
   // 1x1 RGBA pixel with non-trivial alpha; alpha must be dropped (per
   // swift `MediaProcessing.swift:187` `array[..., :3]`).
   //
-  // Regression for Codex review (high): with the prior
+  // Regression: with the prior
   // `img.to_rgb8()` clone removed, this test now exercises the
   // non-`Rgb8` per-pixel `dynamic_image_rgb_pixel` projection rather
   // than the fast `as_rgb8()` path. The expected `[R, G, B]` triple
@@ -807,7 +806,7 @@ fn image_to_array_drops_alpha_from_rgba() {
 
 #[test]
 fn image_to_array_luma8_broadcasts_grey_across_rgb() {
-  // Regression for Codex review (high): the non-`Rgb8` per-pixel
+  // Regression: the non-`Rgb8` per-pixel
   // path replaces the prior infallible `img.to_rgb8()` clone.
   // Luma8 sources must broadcast the grey value across all three
   // RGB channels — identical projection to what `to_rgb8()` did
@@ -1099,9 +1098,8 @@ fn normalize_imagenet_rejects_non_3_channel_input() {
 fn normalize_imagenet_rejects_non_three_trailing_dim() {
   // Trailing dim must equal 3 (R,G,B) for the per-channel mean/std
   // broadcast to be well-defined. A rank-1 `[1]` tensor has trailing
-  // dim 1 → LengthMismatch. (Renamed from `_rejects_zero_rank` per
-  // Copilot review #3272880185 — the test never built a true 0-D
-  // scalar; it validates the non-3-channel-trailing-dim path.)
+  // dim 1 → LengthMismatch. This validates the
+  // non-3-channel-trailing-dim path (a rank-1 input is not a 0-D scalar).
   let arr = Array::from_slice(&[1.0_f32], &(1usize,)).unwrap();
   let err = normalize_imagenet(&arr, &[0.0; 3], &[1.0; 3]).unwrap_err();
   assert!(matches!(err, Error::LengthMismatch(_)), "got {err:?}");
@@ -1421,10 +1419,10 @@ fn center_crop_one_axis_smaller_clamps_and_crops_bigger_axis() {
 
 #[test]
 fn center_crop_height_only_larger_crops_height_keeps_width() {
-  // Regression for Codex Finding 1 (OR-bug): a source whose width
+  // Regression (OR-bug): a source whose width
   // exactly equals `target_w` but whose height exceeds `target_h`
-  // must still crop the height. Pre-fix code returned the source
-  // unchanged because `w <= target_w` short-circuited the OR.
+  // must still crop the height. A `w <= target_w || h <= target_h`
+  // short-circuit would wrongly return the source unchanged here.
   //
   // Source `(w=2, h=8)`, target `(target_h=4, target_w=2)` →
   // `crop_w = min(2, 2) = 2`, `crop_h = min(8, 4) = 4`,
@@ -1568,7 +1566,7 @@ fn pad_to_square_odd_difference_extra_row_on_bottom() {
 
 #[test]
 fn pad_to_square_rejects_oversized_canvas() {
-  // Regression for Codex Finding 2 (quadratic alloc OOM): a 100_000 x 1
+  // Regression (quadratic alloc OOM): a 100_000 x 1
   // source would drive a 100_000² × 3 ≈ 30 GiB canvas — the prior
   // infallible `RgbImage::from_pixel(size, size, ...)` would
   // vec-overflow / OOM-abort the process. The fallible signature
@@ -1596,7 +1594,7 @@ fn pad_to_square_rejects_oversized_canvas() {
 
 #[test]
 fn pad_to_square_near_budget_nonsquare_no_second_source_copy() {
-  // Regression for Codex Finding (high): the prior `img.to_rgb8()` call
+  // Regression: the prior `img.to_rgb8()` call
   // inside the nonsquare branch materialized a *second* source-sized
   // RGB buffer infallibly. A near-budget nonsquare RGB input
   // (e.g. 13377 × 13376) would pass the `MAX_DECODED_IMAGE_BYTES`
@@ -1647,7 +1645,7 @@ fn pad_to_square_near_budget_nonsquare_no_second_source_copy() {
 
 #[test]
 fn pad_to_square_non_rgb8_source_produces_rgb_output() {
-  // Regression for Codex Finding (high): the per-pixel non-`Rgb8`
+  // Regression: the per-pixel non-`Rgb8`
   // branch must produce correct RGB output without ever calling the
   // infallible `to_rgb8()` clone. Cover both Luma8 (grey →
   // broadcast across R/G/B) and Rgba8 (alpha → dropped, R/G/B
@@ -1757,7 +1755,7 @@ fn normalize_rejects_integer_dtypes() {
   );
 }
 
-// ─── P8 / VLM-1 (#120) trailing-layout post-step tests ───────────────
+// ─── #120 trailing-layout post-step tests ───────────────
 
 /// `Layout::Hwc` is the identity arm — `preprocess` and `apply_layout`
 /// must produce the historical `[H, W, 3]` shape for source
@@ -1910,7 +1908,7 @@ fn preprocess_default_layout_is_hwc_for_source_compat() {
 }
 
 /// `preprocess` with `Layout::Bchw` produces swift's
-/// `[1, 3, H, W]` — the breaking-change opt-in that VLM-1 (#120)
+/// `[1, 3, H, W]` — the breaking-change opt-in that #120
 /// surfaces. The H*W*C product is unchanged (both layouts hold the
 /// same number of f32s) so the post-step is shape-only.
 #[test]
@@ -1955,16 +1953,15 @@ fn imageprocessor_config_default_layout_is_hwc() {
   );
 }
 
-// ─── P8 / VLM-3 (#121) non-Rgb8 bulk-fill regression ─────────────────
+// ─── #121 non-Rgb8 bulk-fill regression ─────────────────
 
-/// The non-`Rgb8` branch of [`image_to_array`] used to per-pixel
-/// `buf.push(f32::from(...))` three times per pixel; the bulk-fill
-/// upgrade now builds a `Vec<u8>` then hands it to the same C3
-/// (`rgb_widen`) / C4 (`bgr_widen`) SIMD dispatcher the `Rgb8` fast
-/// path uses. This regression check verifies the non-`Rgb8` output is
-/// byte-identical to the `Rgb8` fast path for the SAME pixel values —
-/// proving the bulk-fill path produces the same f32 buffer as the
-/// per-pixel-push shape it replaced.
+/// The non-`Rgb8` branch of [`image_to_array`] builds a `Vec<u8>` then
+/// hands it to the same `rgb_widen` / `bgr_widen` SIMD dispatcher the
+/// `Rgb8` fast path uses (rather than per-pixel
+/// `buf.push(f32::from(...))` three times per pixel). This regression
+/// check verifies the non-`Rgb8` output is byte-identical to the `Rgb8`
+/// fast path for the SAME pixel values — proving the bulk-fill path
+/// produces the same f32 buffer as a per-pixel-push would.
 #[test]
 fn image_to_array_non_rgb8_bulk_fill_matches_rgb8_fast_path() {
   // Build a 3x4 Rgba8 source (the non-Rgb8 branch's hot path —
@@ -2067,11 +2064,11 @@ fn image_to_array_luma8_broadcasts_to_rgb_via_bulk_fill() {
   }
 }
 
-// ─── P8 / VLM-2 (#125) byte-budget validation regression ─────────────
+// ─── #125 byte-budget validation regression ─────────────
 
 /// [`resize`] rejects an over-budget target via a typed
 /// [`Error::CapExceeded`] BEFORE any allocation — closure regression
-/// for VLM-2 (#125). Mirrors the audit-table guarantee: a hostile /
+/// for #125. Mirrors the audit-table guarantee: a hostile /
 /// mis-configured `ImageProcessorConfig.size` cannot drive a
 /// multi-GiB infallible alloc.
 #[test]
@@ -2085,7 +2082,7 @@ fn resize_rejects_over_budget_target() {
   );
 }
 
-/// [`resize`] rejects a zero-dim target — the VLM-2 byte-budget guard
+/// [`resize`] rejects a zero-dim target — the byte-budget guard
 /// must reject zero/overflow targets before allocating.
 #[test]
 fn resize_rejects_zero_dim_target() {

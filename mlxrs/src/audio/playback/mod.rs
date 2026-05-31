@@ -1,7 +1,7 @@
 //! Device playback — the cpal-backed mlxrs port of
 //! `mlx-audio-swift`'s `MLXAudioCore.AudioPlayer` streaming surface.
 //!
-//! AUDIO-A11 (issue #174) ports the *streaming* branch of Swift's
+//! Ports the *streaming* branch (issue #174) of Swift's
 //! `AudioPlayer` (the `startStreaming(sampleRate:)` /
 //! `scheduleAudioChunk(_:withCrossfade:)` /
 //! `stopStreaming()` triad) over [cpal][cpal], the de-facto pure-Rust
@@ -21,7 +21,7 @@
 //! [`AudioPlayer`] owns the [`cpal::Stream`] and a shared queue the
 //! producer fills; the cpal callback pulls from the queue on the
 //! audio I/O thread. [`AudioOutputStream`] is the producer-side
-//! trait the A8 speech-to-speech pipeline ([`crate::audio::sts`])
+//! trait the speech-to-speech pipeline ([`crate::audio::sts`])
 //! consumes — same shape whether the sink is a real device, a file,
 //! or a unit-test recorder.
 //!
@@ -35,9 +35,9 @@
 //! - [`mod@player`] — [`AudioPlayer`] struct. The cpal-backed
 //!   default implementor of [`AudioOutputStream`].
 //!
-//! ## Scope cuts (explicit, A11)
+//! ## Scope cuts (explicit)
 //!
-//! Per the `[[feedback_match_official_binding_design]]` rule the
+//! To match the official binding design, the
 //! mlxrs port intentionally omits a few Swift-side capabilities; the
 //! full enumeration lives in the [`mod@player`] docstring. Quick
 //! summary:

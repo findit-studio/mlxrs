@@ -6,7 +6,7 @@
 //! (whisper / parakeet / canary / …) implements, and the
 //! [`stt_generate`](generate::stt_generate) Iterator that drives it.
 //!
-//! Per the project's [no per-model arch porting][noarch] rule, mlxrs ships
+//! Per the project's no per-model arch porting rule, mlxrs ships
 //! **no** concrete STT model implementations: those (the conv subsampling +
 //! transformer for whisper, the conformer + RNN-T joint for parakeet, etc.)
 //! live in user code on top of this trait. The two submodules here are the
@@ -27,7 +27,6 @@
 //!
 //! [stt-base]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/base.py
 //! [stt-gen]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/generate.py
-//! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 
 pub mod generate;
 pub mod load;

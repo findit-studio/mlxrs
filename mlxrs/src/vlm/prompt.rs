@@ -5,7 +5,7 @@
 //! `mlx-vlm/mlx_vlm/models/falcon_ocr/language.py::create_falcon_ocr_mask`
 //! (lines ~120–149).
 //!
-//! ## V4 addition: chat-format builder (`MessageFormat` + `MessageFormatter`)
+//! ## Chat-format builder (`MessageFormat` + `MessageFormatter`)
 //!
 //! The per-model chat-format selection layer (`MessageFormat` enum,
 //! `MODEL_CONFIG` per-family map, `SINGLE_IMAGE_ONLY_MODELS` set,
@@ -379,7 +379,7 @@ pub fn insert_image_tokens(
           ],
         ))
       })?;
-    // Recoverable reservation (Codex VLM-8 R3F1): a huge non-overflowing
+    // Recoverable reservation: a huge non-overflowing
     // `cap` (large `num_tokens_per_image` × `image_count`) would abort
     // the process via `Vec::with_capacity`; `try_reserve_exact` surfaces
     // it as `Error::OutOfMemory`. `vlm_generate` calls this before any
@@ -413,7 +413,7 @@ pub fn insert_image_tokens(
           ],
         ))
       })?;
-    // Recoverable reservation (Codex VLM-8 R3F1) — see the marker-present
+    // Recoverable reservation — see the marker-present
     // branch above.
     let mut out: Vec<u32> = try_with_capacity(cap)?;
     out.extend(std::iter::repeat_n(image_token_id, placeholder_total));
@@ -592,14 +592,14 @@ pub fn build_multimodal_mask_with_past(
   // sequence-scaled buffers (`block_id` is O(seq_len); `buf` is
   // O(seq_len · total_keys) — the dominant allocation, up to MBs), so a
   // large valid chunk would otherwise abort in `vec![0u32; seq_len]`
-  // before the recoverable `buf.try_reserve_exact` could report OOM
-  // (Codex VLM-8 R4F1). The small auxiliaries here (`sorted`, a clone of
+  // before the recoverable `buf.try_reserve_exact` could report OOM.
+  // The small auxiliaries here (`sorted`, a clone of
   // `image_spans` — O(num_images), a handful of `(usize,usize)` pairs)
   // follow the crate's standard infallible-`Vec` idiom: they cannot
   // realistically OOM (model image counts are small constants), and a
   // blanket try_reserve on every Vec would diverge from the rest of
   // mlxrs + the python/swift references without a real threat-model gain
-  // (see VLM-9 in docs/rust-golden-standard-followups.md for the
+  // (see the entry in docs/rust-golden-standard-followups.md for the
   // coordinated allocation-policy deferral).
   let mut block_id: Vec<u32> = try_with_capacity(seq_len)?;
   block_id.resize(seq_len, 0);
@@ -614,13 +614,13 @@ pub fn build_multimodal_mask_with_past(
   // Past keys (k < past_len) are unconditionally attended; current-chunk
   // keys use chunk-local causal + same-image-span.
   //
-  // Recoverable reservation (Codex VLM-8 R1F2): on late chunks
+  // Recoverable reservation: on late chunks
   // `total = seq_len * (past_len + seq_len)` grows with the cached
   // context, so a long prompt's mask can be large. `try_reserve_exact`
   // surfaces an allocator failure as a recoverable `Error::OutOfMemory`
   // instead of the `Vec::with_capacity` abort. (The mask is dense by
   // contract here; a symbolic causal-base + sparse image-overlay
-  // representation is the documented future optimization in VLM-8 — it
+  // representation is the documented future optimization — it
   // does not change this function's observable output.)
   let mut buf: Vec<bool> = Vec::new();
   buf
@@ -848,7 +848,7 @@ pub fn assemble_multimodal_prompt(
 }
 
 // ==========================================================================
-// V4: chat-format builder (`MessageFormat` + `MessageFormatter`)
+// Chat-format builder (`MessageFormat` + `MessageFormatter`)
 // ==========================================================================
 //
 // Faithful 1:1 port of the model-agnostic chat-format selection layer in
@@ -976,7 +976,7 @@ impl MessageFormat {
 /// `message_format_15_variants_table` test to assert the enum matches the
 /// Python `MessageFormat(Enum)` declaration faithfully.
 ///
-/// (The V4 dispatcher prompt referred to "18 variants" as an audit
+/// (The dispatcher prompt referred to "18 variants" as an audit
 /// estimate; the Python ref has EXACTLY 15 enum variants — verified by
 /// `grep '= "' prompt_utils.py | head -20`. The Rust port matches that
 /// count one-to-one. The other "shapes" alluded to by the audit are the

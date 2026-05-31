@@ -1,13 +1,13 @@
-//! LM-A3 — `fuse()` library orchestrator (`lm::fuse`).
+//! `fuse()` library orchestrator (`lm::fuse`).
 //!
 //! Integration tests for the port of `mlx_lm/fuse.py::main` — the
 //! adapter-fusion driver that ties `load_adapters` + per-layer
-//! [`LoraLayer::fuse`](mlxrs::lm::lora::LoraLayer::fuse) + the F6 save into
+//! [`LoraLayer::fuse`](mlxrs::lm::lora::LoraLayer::fuse) + the model save into
 //! a one-call pipeline. Mirrors `lm_convert.rs` style: gated on the `lm`
 //! umbrella, fixture-built synthetic source / adapter directories under
 //! `temp_dir()`, hand-traced assertions.
 //!
-//! Test list (per the A3 spec, #162):
+//! Test list (#162):
 //! - `fuse_round_trips_lora_into_dense_weights`
 //! - `fuse_dequantize_strips_quantization_keys_from_config`
 //! - `fuse_dequantize_false_preserves_quantization_keys`
@@ -18,7 +18,7 @@
 //! - `fuse_with_no_adapter_layers_is_err` — load_adapters' completeness
 //!   postcondition surfaces here (a fuse where no base layer matched the
 //!   adapter selection is an error, not a silent no-op save — same
-//!   contract A3 inherits from F5's adapter loader).
+//!   contract inherited from the adapter loader).
 //! - `fuse_save_path_is_created_when_absent`
 //! - `fuse_preserves_fan_in_fan_out_layout_for_non_square_peft_target` —
 //!   PEFT `fan_in_fan_out: true` on a non-square base ([in=4, out=3]); the
@@ -32,30 +32,29 @@
 //! - `fuse_output_is_loadable_through_default_lm_loader` — fuse output dir
 //!   loads end-to-end through `lm::load::load` (which constructs the
 //!   tokenizer from the same dir); a fused dir that shipped weights +
-//!   config only would silently fail to load. R2 strengthens the assertion
-//!   to compare encodings across multiple probes (single-probe equality is
-//!   compatible with a partial-corruption that happens to agree on one
-//!   input).
+//!   config only would silently fail to load. Compares encodings across
+//!   multiple probes (single-probe equality is compatible with a
+//!   partial-corruption that happens to agree on one input).
 //! - `fuse_copies_all_tokenizer_extras_present_in_source` — every
 //!   `tokenizer.json` / `tokenizer_config.json` / `chat_template.jinja` /
 //!   `generation_config.json` present at `model_path` lands at `save_path`
 //!   with byte-identical content (the verbatim-copy contract).
-//! - `fuse_load_adapters_with_config_skips_second_adapter_config_read` (R2
-//!   Finding 1) — `load_adapters_with_config` consumes a pre-parsed
+//! - `fuse_load_adapters_with_config_skips_second_adapter_config_read` —
+//!   `load_adapters_with_config` consumes a pre-parsed
 //!   [`mlxrs::lm::lora::LoraConfig`] and must NOT re-read
 //!   `adapter_config.json` on the load side. The test parses the config,
 //!   clobbers the on-disk file, then calls `load_adapters_with_config`
 //!   (success — proves no second read) AND `load_adapters` (failure —
 //!   proves the wrapper still does its own parse), closing the TOCTOU
 //!   window `fuse` previously had.
-//! - `fuse_rejects_source_with_missing_tokenizer` (R2 Finding 2) — a model
+//! - `fuse_rejects_source_with_missing_tokenizer` — a model
 //!   dir WITHOUT `tokenizer.json` causes `fuse()` to fail BEFORE any save
 //!   work, preventing the prior silent-Ok / unloadable-destination
 //!   regression.
-//! - `fuse_rejects_source_with_malformed_tokenizer` (R2 Finding 2) — a
+//! - `fuse_rejects_source_with_malformed_tokenizer` — a
 //!   truncated `tokenizer.json` body fails the same fail-fast validation
 //!   (corrupt source bytes can't be silently shipped to the destination).
-//! - `fuse_overwrites_stale_destination_tokenizer` (R2 Finding 2) — a
+//! - `fuse_overwrites_stale_destination_tokenizer` — a
 //!   `save_path` pre-populated with stale `tokenizer.json` bytes from a
 //!   different model has its contents OVERWRITTEN by the source's
 //!   tokenizer (the cross-model-contamination concern is mitigated by
@@ -63,52 +62,52 @@
 //!   fuse.py's permissive destination contract but the overwrite +
 //!   source-validate combo prevents stale data from leaking).
 //! - `fuse_drops_stale_destination_generation_config_when_source_lacks_it`
-//!   (R3 Finding 1) — a pre-existing `save_path/generation_config.json`
+//!   — a pre-existing `save_path/generation_config.json`
 //!   that the source dir does NOT carry is UNLINKED by the staging
 //!   stale-sweep, so the fused dir loads with the SOURCE's
 //!   (none-here) EOS contract — not the stale destination's.
 //! - `fuse_drops_stale_destination_chat_template_when_source_lacks_it`
-//!   (R3 Finding 1) — same shape for `chat_template.jinja`. Templating
+//!   — same shape for `chat_template.jinja`. Templating
 //!   is a tokenizer-surface contract; a stale jinja from a previous
 //!   model would silently load via the new model's tokenizer.
 //! - `fuse_drops_stale_destination_python_extras_when_source_lacks_them`
-//!   (R3 Finding 1) — same shape for `*.py`. Some HF model loaders
+//!   — same shape for `*.py`. Some HF model loaders
 //!   import these files for arch-specific custom code; a stale `*.py`
 //!   from a previous model could execute wrong-model code.
-//! - `fuse_snapshots_source_tokenizer_before_validate` (R3 Finding 2) —
+//! - `fuse_snapshots_source_tokenizer_before_validate` —
 //!   proves the validate step runs against `<save_path>/.staging-fuse-*`,
 //!   NOT `model_path`: deleting `model_path/tokenizer.json` AFTER the
 //!   snapshot has been taken but BEFORE the rest of fuse runs must NOT
 //!   surface a validate failure (the validate uses staged bytes), and
 //!   the SHIPPED tokenizer at `save_path` is byte-identical to the
 //!   pre-deletion source bytes.
-//! - `fuse_cleans_up_staging_dir_on_save_failure` (R3 staging guard) —
+//! - `fuse_cleans_up_staging_dir_on_save_failure` —
 //!   induces a save-side failure (read-only `save_path`) and asserts
 //!   no `<save_path>/.staging-fuse-*` directory survives. The staging
 //!   guard's `Drop` is the single mechanism that holds this invariant.
 //! - `fuse_fails_when_stale_destination_tokenizer_config_is_directory`
-//!   (R4 Finding 1 HIGH) — pre-existing `save_dir/tokenizer_config.json/`
-//!   as a DIRECTORY (source lacks the file). Pre-R4 the stale sweep
-//!   gated removal on `is_file()` and silently SKIPPED the directory,
-//!   then `lm::load::load(save_dir)` failed (or hung on a FIFO) reading
-//!   a dir as JSON. The R4 fix uses `symlink_metadata()` and fails
+//!   — pre-existing `save_dir/tokenizer_config.json/`
+//!   as a DIRECTORY (source lacks the file). A removal gated on
+//!   `is_file()` would silently SKIP the directory, then
+//!   `lm::load::load(save_dir)` would fail (or hang on a FIFO) reading
+//!   a dir as JSON. The fix uses `symlink_metadata()` and fails
 //!   promotion with [`Error::Backend`] naming the path + "non-regular".
 //! - `fuse_fails_when_stale_destination_python_extra_is_directory`
-//!   (R4 Finding 1 HIGH) — same `*.py` sweep variant for an
+//!   — same `*.py` sweep variant for an
 //!   attacker- or operator-planted `save_dir/custom_arch.py/`.
 //! - `fuse_fails_when_stale_destination_tokenizer_json_is_symlink_to_directory`
-//!   (R4 Finding 1 HIGH) — `tokenizer.json` as a symlink to a dir.
+//!   — `tokenizer.json` as a symlink to a dir.
 //!   `is_file()` follows symlinks, so it returns `false` (target is dir)
-//!   and the pre-R4 code SKIPPED. The R4 fix's `symlink_metadata()`
+//!   and a removal gated on it would SKIP. The fix's `symlink_metadata()`
 //!   never follows symlinks and surfaces the symlink as a fail.
 //! - `fuse_cleans_up_staging_dir_on_stale_removal_failure`
-//!   (R4 Finding 2 MEDIUM) — pre-create
-//!   `save_dir/tokenizer_config.json/{nested}` so the R4 F1 fix
-//!   returns `Err(Backend)` from the stale-sweep. The R4 F2 fix keeps
-//!   the staging guard ARMED until promotion success, so this
+//!   — pre-create
+//!   `save_dir/tokenizer_config.json/{nested}` so the non-regular gate
+//!   returns `Err(Backend)` from the stale-sweep. The staging guard stays
+//!   ARMED until promotion success, so this
 //!   mid-promote Err must NOT leak a `.staging-fuse-*` dir.
 //!
-//! No `peak_memory()` magnitude asserts (per project memory).
+//! No `peak_memory()` magnitude asserts.
 #![cfg(feature = "lm")]
 
 use std::{
@@ -159,9 +158,9 @@ fn plain_config_json(num_hidden_layers: i32) -> String {
 }
 
 /// A `Config` JSON carrying a `quantization` AND a `quantization_config`
-/// block — exactly the dual-key shape the F6 `save_config` mirror emits
+/// block — exactly the dual-key shape the `save_config` mirror emits
 /// (`quantization → quantization_config`), so a quantized base loaded from
-/// an F6-saved checkpoint carries both top-level keys.
+/// a saved checkpoint carries both top-level keys.
 fn config_json_with_quant_blocks(num_hidden_layers: i32) -> String {
   format!(
     r#"{{
@@ -205,7 +204,7 @@ fn minimal_tokenizer_json() -> &'static str {
 
 /// Write a synthetic base-model directory: `config.json` + a single
 /// `model.safetensors` carrying `weights` + a minimal valid
-/// `tokenizer.json`. The tokenizer is bundled by default so the R2
+/// `tokenizer.json`. The tokenizer is bundled by default so the
 /// validate-source-tokenizer-before-save step in `fuse()` is satisfied
 /// for every standard fixture — tests that EXPLICITLY want to exercise
 /// the missing-tokenizer / malformed-tokenizer error path use
@@ -217,9 +216,9 @@ fn write_base_dir(name: &str, weights: &HashMap<String, Array>, config_json: &st
 }
 
 /// Variant of [`write_base_dir`] that does NOT write `tokenizer.json`.
-/// Used by the R2 missing-tokenizer / malformed-tokenizer tests to
+/// Used by the missing-tokenizer / malformed-tokenizer tests to
 /// construct a structurally incomplete source directory; every OTHER
-/// fixture uses the bundled [`write_base_dir`] (so the R2
+/// fixture uses the bundled [`write_base_dir`] (so the
 /// validate-source-tokenizer step passes for the orthogonal
 /// fuse-behavior tests).
 fn write_base_dir_no_tokenizer(
@@ -299,7 +298,7 @@ fn fuse_round_trips_lora_into_dense_weights() {
   let model_dir = write_base_dir("rt_lora_model", &weights, &plain_config_json(2));
   let adapter_dir = write_mlxlm_adapter("rt_lora_adapter", &[0, 1], /* scale */ 2.0);
   let save_dir = temp_dir("rt_lora_save");
-  // F6's `save_model` happily overwrites into a created-but-empty dir;
+  // `save_model` happily overwrites into a created-but-empty dir;
   // remove the temp_dir-created scaffold so we can also exercise the
   // "save_path created when absent" branch implicitly.
   fs::remove_dir_all(&save_dir).unwrap();
@@ -312,7 +311,7 @@ fn fuse_round_trips_lora_into_dense_weights() {
   )
   .unwrap();
 
-  // Reload the saved fused weights through the F6 index loader.
+  // Reload the saved fused weights through the index loader.
   let mut reloaded = load::load_weights(&save_dir).unwrap();
   assert_eq!(reloaded.len(), 2, "only the two q_proj weights survive");
 
@@ -352,7 +351,7 @@ fn fuse_round_trips_lora_into_dense_weights() {
 #[test]
 fn fuse_dequantize_strips_quantization_keys_from_config() {
   // Start with a config that carries BOTH `quantization` AND
-  // `quantization_config` (the F6 `save_config` dual-key shape). The
+  // `quantization_config` (the `save_config` dual-key shape). The
   // base weights are dense (no quantized triples to actually
   // dequantize — exercises the config-strip path in isolation, plus
   // the `dequantize_weights` walk over a quant-free map which is a
@@ -396,7 +395,7 @@ fn fuse_dequantize_strips_quantization_keys_from_config() {
 
 #[test]
 fn fuse_dequantize_false_preserves_quantization_keys() {
-  // Same dual-key source config, but `dequantize=false`. The F6
+  // Same dual-key source config, but `dequantize=false`. The
   // `save_config` mirror preserves the original `quantization` key AND
   // mirrors it to `quantization_config` (the save side's two-key
   // contract), so a `dequantize=false` fuse must leave BOTH keys
@@ -425,11 +424,11 @@ fn fuse_dequantize_false_preserves_quantization_keys() {
     saved_cfg.get("quantization").is_some(),
     "`quantization` preserved by dequantize=false: {saved_cfg_text}"
   );
-  // F6 `save_config` mirrors `quantization → quantization_config`, so
+  // `save_config` mirrors `quantization → quantization_config`, so
   // the second key is also present.
   assert!(
     saved_cfg.get("quantization_config").is_some(),
-    "`quantization_config` preserved by F6 mirror: {saved_cfg_text}"
+    "`quantization_config` preserved by the save_config mirror: {saved_cfg_text}"
   );
 }
 
@@ -611,14 +610,14 @@ fn fuse_with_no_adapter_layers_is_err() {
 
 #[test]
 fn fuse_save_path_is_created_when_absent() {
-  // The F6 `save` path creates `save_path` if absent (`create_dir_all`).
+  // The `save` path creates `save_path` if absent (`create_dir_all`).
   // `fuse` inherits that contract — passing a never-created destination
   // must succeed and produce a valid directory.
   let weights = toy_base_weights(2);
   let model_dir = write_base_dir("absent_save_model", &weights, &plain_config_json(2));
   let adapter_dir = write_mlxlm_adapter("absent_save_adapter", &[0, 1], 2.0);
   // Build a path under a parent dir that DOES exist, but the leaf
-  // doesn't — exactly the F6 contract.
+  // doesn't — exactly the save-path contract.
   let save_parent = temp_dir("absent_save_parent");
   let save_dir = save_parent.join("brand_new_destination");
   assert!(!save_dir.exists(), "precondition: save_dir starts absent");
@@ -935,7 +934,7 @@ fn fuse_output_is_loadable_through_default_lm_loader() {
   // `lm::load::load(dir)` constructs the tokenizer from the same dir
   // immediately after the weights / config (`load.rs:683-685`). A fused
   // dir that shipped weights + config only would silently fail this load
-  // with a tokenizer-not-found error — the F2 fix is to copy tokenizer
+  // with a tokenizer-not-found error — the fix is to copy tokenizer
   // files from the original model dir to the destination so the dir loads
   // end-to-end.
   let weights = toy_base_weights(2);
@@ -960,11 +959,11 @@ fn fuse_output_is_loadable_through_default_lm_loader() {
 
   // The tokenizer was loaded from the COPIED file — same vocab as source.
   // Re-load directly from source to compare vocab-as-token-encoding ACROSS
-  // MULTIPLE distinct probes (the previous single "hello world" probe could
+  // MULTIPLE distinct probes (a single "hello world" probe could
   // pass even with a partially-corrupted copy where most ids happen to match;
-  // R2 strengthens the assertion by exercising 3 disjoint strings — multi-word
+  // exercising 3 disjoint strings — multi-word
   // mix, single in-vocab token, plus a string with an out-of-vocab token —
-  // so an identity-failure on any one fails the test).
+  // means an identity-failure on any one fails the test).
   let (_src_cfg, _src_w, src_tokenizer) =
     load::load(&model_dir).expect("source dir loads (sanity)");
   for probe in ["hello world", "hello", "world hello unknown"] {
@@ -1024,11 +1023,11 @@ fn fuse_copies_all_tokenizer_extras_present_in_source() {
   }
 }
 
-// ───────────────── R2 Finding 1 — single adapter-config snapshot ─────────────────
+// ───────────────── single adapter-config snapshot ─────────────────
 
 #[test]
 fn fuse_load_adapters_with_config_skips_second_adapter_config_read() {
-  // R2 Finding 1 — TOCTOU window between `read_adapter_config` (save-side
+  // TOCTOU window between `read_adapter_config` (save-side
   // `fan_in_fan_out` decision) and `load_adapters`' INTERNAL second read of
   // the same `adapter_config.json` (load-side transpose / quant-arm
   // decisions). The fix is `load_adapters_with_config`, a variant that
@@ -1105,11 +1104,11 @@ fn fuse_load_adapters_with_config_skips_second_adapter_config_read() {
   }
 }
 
-// ───────────────── R2 Finding 2 — tokenizer validate-before-save ─────────────────
+// ───────────────── tokenizer validate-before-save ─────────────────
 
 #[test]
 fn fuse_rejects_source_with_missing_tokenizer() {
-  // R2 Finding 2 — `fuse()` previously called `copy_tokenizer_and_extras`
+  // `fuse()` previously called `copy_tokenizer_and_extras`
   // AFTER save and mapped its `Ok(_)` to `Ok(())` without checking that
   // the source had a usable `tokenizer.json`. `copy_tokenizer_and_extras`
   // silently SKIPS absent files, so a source without `tokenizer.json` let
@@ -1235,10 +1234,10 @@ fn fuse_rejects_source_with_malformed_tokenizer() {
 
 #[test]
 fn fuse_overwrites_stale_destination_tokenizer() {
-  // R2 Finding 2 stale-destination audit: convert REJECTS pre-existing
+  // Stale-destination audit: convert REJECTS pre-existing
   // destinations wholesale (`convert.rs:588`); fuse.py PERMITS them
   // (writes-through via `save_pretrained`). mlxrs `fuse` matches fuse.py
-  // (permissive), but the cross-model-contamination concern from R2 is
+  // (permissive), but the cross-model-contamination concern is
   // mitigated by `std::fs::copy`'s default-overwrite semantics: a stale
   // `tokenizer.json` at `save_path` is OVERWRITTEN by the source's bytes
   // during `copy_tokenizer_and_extras`.
@@ -1292,14 +1291,14 @@ fn fuse_overwrites_stale_destination_tokenizer() {
   );
 }
 
-// ────────── R3 Finding 1 — staging stale-extras sweep drops dest files
+// ────────── staging stale-extras sweep drops dest files
 // the source did NOT carry (cross-model contamination via dest leftovers) ──────────
 
 /// Helper: count entries in `save_dir` whose name starts with the staging
 /// marker prefix `.staging-fuse-`. A successful fuse must leave ZERO of
 /// these — the staging guard's `Drop` and the explicit
 /// `remove_dir(staging_path)` at the end of `promote_staging_into_save_path`
-/// together guarantee it. Shared by every R3 test below.
+/// together guarantee it. Shared by every staging test below.
 fn staging_dir_count(save_dir: &Path) -> usize {
   fs::read_dir(save_dir)
     .map(|entries| {
@@ -1317,14 +1316,14 @@ fn staging_dir_count(save_dir: &Path) -> usize {
 
 #[test]
 fn fuse_drops_stale_destination_generation_config_when_source_lacks_it() {
-  // R3 Finding 1 — `copy_tokenizer_and_extras` only OVERWRITES destination
+  // `copy_tokenizer_and_extras` only OVERWRITES destination
   // files when the SOURCE carries the same name. A pre-existing
-  // `save_dir/generation_config.json` from a previous model SURVIVED the
-  // pre-R3 fuse when the new source lacked `generation_config.json`, and
+  // `save_dir/generation_config.json` from a previous model would SURVIVE
+  // when the new source lacked `generation_config.json`, and
   // `load_config` consumes `generation_config.json` as the EOS override —
-  // so the fused dir silently loaded with the wrong-model EOS contract.
+  // so the fused dir would silently load with the wrong-model EOS contract.
   //
-  // The R3 staging+promote fix sweeps stale extras: a destination
+  // The staging+promote fix sweeps stale extras: a destination
   // `generation_config.json` not present in the staging snapshot is
   // unlinked during promote.
   let weights = toy_base_weights(1);
@@ -1348,13 +1347,13 @@ fn fuse_drops_stale_destination_generation_config_when_source_lacks_it() {
   fuse::fuse(&model_dir, &adapter_dir, &save_dir, false)
     .expect("fuse must succeed on a permissive destination with stale generation_config");
 
-  // R3 F1: source LACKS generation_config.json → destination MUST NOT
+  // Source LACKS generation_config.json → destination MUST NOT
   // carry one after fuse. (The stale destination file is the bug; the
   // fix deletes it during the staging promote sweep.)
   assert!(
     !save_dir.join("generation_config.json").exists(),
     "stale destination generation_config.json must be REMOVED when source lacks it \
-     (R3 Finding 1 fix — pre-R3 shape silently kept the wrong-model EOS contract)"
+     (an unswept destination silently keeps the wrong-model EOS contract)"
   );
 
   // The staging dir mechanism cleaned up properly.
@@ -1367,10 +1366,10 @@ fn fuse_drops_stale_destination_generation_config_when_source_lacks_it() {
 
 #[test]
 fn fuse_drops_stale_destination_chat_template_when_source_lacks_it() {
-  // R3 Finding 1 — `chat_template.jinja` is templating consumed by the
-  // tokenizer surface. A stale jinja from an earlier model survived pre-R3
+  // `chat_template.jinja` is templating consumed by the
+  // tokenizer surface. A stale jinja from an earlier model would survive
   // when the new source lacked `chat_template.jinja`, so the fused dir
-  // silently loaded with the wrong-model chat formatter.
+  // would silently load with the wrong-model chat formatter.
   let weights = toy_base_weights(1);
   // Source has tokenizer.json (bundled) but NO chat_template.jinja.
   let model_dir = write_base_dir("stale_jinja_model", &weights, &plain_config_json(1));
@@ -1391,7 +1390,7 @@ fn fuse_drops_stale_destination_chat_template_when_source_lacks_it() {
   assert!(
     !save_dir.join("chat_template.jinja").exists(),
     "stale destination chat_template.jinja must be REMOVED when source lacks it \
-     (R3 Finding 1 fix — pre-R3 shape silently kept the wrong-model chat formatter)"
+     (an unswept destination silently keeps the wrong-model chat formatter)"
   );
   assert_eq!(
     staging_dir_count(&save_dir),
@@ -1402,10 +1401,10 @@ fn fuse_drops_stale_destination_chat_template_when_source_lacks_it() {
 
 #[test]
 fn fuse_drops_stale_destination_python_extras_when_source_lacks_them() {
-  // R3 Finding 1 — `*.py` extras are HF model loader auxiliary code
+  // `*.py` extras are HF model loader auxiliary code
   // (some VLM / custom-arch loaders import the model dir's `*.py` files
   // for arch-specific logic). A stale `*.py` from an earlier model
-  // survived pre-R3 when the new source lacked the same basename, and a
+  // would survive when the new source lacked the same basename, and a
   // downstream loader importing the dir could execute wrong-model code.
   let weights = toy_base_weights(1);
   // Source has tokenizer.json (bundled) but NO *.py files. The
@@ -1462,18 +1461,18 @@ fn fuse_drops_stale_destination_python_extras_when_source_lacks_them() {
   );
 }
 
-// ────────── R3 Finding 2 — staging snapshot closes the validate/copy TOCTOU ──────────
+// ────────── staging snapshot closes the validate/copy TOCTOU ──────────
 
 #[test]
 fn fuse_snapshots_source_tokenizer_before_validate() {
-  // R3 Finding 2 — pre-R3, `load_tokenizer(model_path)` validated source
+  // Previously, `load_tokenizer(model_path)` validated source
   // bytes at T0 and `copy_tokenizer_and_extras(model_path, save_path)`
   // RE-READ source bytes at T1 (post-save). Any mid-flight mutation
   // (deletion / swap / partial write) between T0 and T1 produced a fuse
   // that returned Ok(()) but shipped a tokenizer DIFFERENT from the one
   // that was validated.
   //
-  // The R3 fix collapses both reads to the staging snapshot: the
+  // The fix collapses both reads to the staging snapshot: the
   // tokenizer + extras are copied INTO staging FIRST, validate reads
   // from staging, the rest of fuse runs, then staging is promoted into
   // save_path. The single read of `model_path` makes the TOCTOU window
@@ -1565,11 +1564,11 @@ fn fuse_snapshots_source_tokenizer_before_validate() {
   );
 }
 
-// ────────── R3 staging guard — Drop cleans up on save failure ──────────
+// ────────── staging guard — Drop cleans up on save failure ──────────
 
 #[test]
 fn fuse_cleans_up_staging_dir_on_save_failure() {
-  // R3 staging guard — the `StagingDir::Drop` impl must remove the
+  // The `StagingDir::Drop` impl must remove the
   // staging directory on every error exit between snapshot creation
   // and a successful promote (the only paths that consume the guard).
   //
@@ -1607,7 +1606,7 @@ fn fuse_cleans_up_staging_dir_on_save_failure() {
     "fuse must fail when config.json is a non-empty directory at save_path: got {result:?}"
   );
 
-  // R3 contract: no `.staging-fuse-*` dir survived the failed fuse.
+  // Contract: no `.staging-fuse-*` dir survived the failed fuse.
   // The staging guard's `Drop` is the single mechanism that holds this.
   let leftover = staging_dir_count(&save_dir);
   assert_eq!(
@@ -1621,10 +1620,10 @@ fn fuse_cleans_up_staging_dir_on_save_failure() {
   let _ = fs::remove_dir_all(save_dir.join("config.json"));
 }
 
-// ────────── R4 Finding 1 [HIGH] — stale-sweep symlink_metadata + non-regular reject ──────────
+// ────────── stale-sweep symlink_metadata + non-regular reject ──────────
 
-/// Helper for the R4 F1 tests: extract the inner promotion error's
-/// message from the [`Error::ConvertPostSavePartial`] wrapper that
+/// Helper for the non-regular-reject tests: extract the inner promotion
+/// error's message from the [`Error::ConvertPostSavePartial`] wrapper that
 /// `fuse()` returns for any hard promotion failure (per the
 /// `promote_outcome -> Err(...)` arm in `fuse.rs::fuse`). Asserts on
 /// the WRAPPED `copy_error` (which carries the original
@@ -1641,14 +1640,14 @@ fn extract_promote_error_message(err: &Error) -> String {
 
 #[test]
 fn fuse_fails_when_stale_destination_tokenizer_config_is_directory() {
-  // R4 Finding 1 [HIGH] — pre-R4 the stale-sweep gated removal on
-  // `path.is_file()` and silently SKIPPED non-regular entries (dir,
-  // FIFO, symlink-to-dir). When the source LACKED `tokenizer_config.json`
-  // and the destination held a stale `tokenizer_config.json/` DIRECTORY,
-  // the dir survived into save_path, then `lm::load::load(save_path)`
-  // failed (or hung) reading a dir as a JSON file.
+  // A stale-sweep gating removal on `path.is_file()` would silently SKIP
+  // non-regular entries (dir, FIFO, symlink-to-dir). When the source
+  // LACKED `tokenizer_config.json` and the destination held a stale
+  // `tokenizer_config.json/` DIRECTORY, the dir would survive into
+  // save_path, then `lm::load::load(save_path)` would fail (or hang)
+  // reading a dir as a JSON file.
   //
-  // The R4 fix uses `symlink_metadata()` and returns
+  // The fix uses `symlink_metadata()` and returns
   // `Err(Error::Backend)` for any non-regular reserved basename. We
   // assert (a) fuse fails (b) the error wraps the path + the
   // "non-regular" hint so the operator can act.
@@ -1661,7 +1660,7 @@ fn fuse_fails_when_stale_destination_tokenizer_config_is_directory() {
 
   let adapter_dir = write_mlxlm_adapter("stale_tokcfg_dir_adapter", &[0], 2.0);
   let save_dir = temp_dir("stale_tokcfg_dir_save");
-  // Pre-create the reserved basename as an EMPTY directory. The R4
+  // Pre-create the reserved basename as an EMPTY directory. The
   // policy treats this as "non-regular reserved path; remove manually".
   fs::create_dir(save_dir.join("tokenizer_config.json")).unwrap();
 
@@ -1681,11 +1680,11 @@ fn fuse_fails_when_stale_destination_tokenizer_config_is_directory() {
     "error message must name the kind (directory); got: {msg}"
   );
 
-  // R4 F2 contract: no `.staging-fuse-*` survived a mid-promote Err.
+  // Staging-guard contract: no `.staging-fuse-*` survived a mid-promote Err.
   let leftover = staging_dir_count(&save_dir);
   assert_eq!(
     leftover, 0,
-    "the F2 fix must keep the staging guard armed until success; \
+    "the staging guard must stay armed until success; \
      found {leftover} leftover .staging-fuse-* dirs after a stale-sweep failure"
   );
 
@@ -1695,10 +1694,10 @@ fn fuse_fails_when_stale_destination_tokenizer_config_is_directory() {
 
 #[test]
 fn fuse_fails_when_stale_destination_python_extra_is_directory() {
-  // R4 Finding 1 [HIGH] — same shape for the `*.py` stale-sweep. Any
+  // Same shape for the `*.py` stale-sweep. Any
   // `save_dir/<name>.py/` directory in the destination at promotion
-  // time must fail with the named non-regular error; pre-R4 it was
-  // silently skipped by `is_file() == false`.
+  // time must fail with the named non-regular error; a removal gated on
+  // `is_file()` would silently skip it.
   let weights = toy_base_weights(1);
   // Source has no *.py — `write_base_dir` only writes tokenizer.json
   // + config.json + model.safetensors.
@@ -1707,7 +1706,7 @@ fn fuse_fails_when_stale_destination_python_extra_is_directory() {
   let adapter_dir = write_mlxlm_adapter("stale_py_dir_adapter", &[0], 2.0);
   let save_dir = temp_dir("stale_py_dir_save");
   // Pre-create custom_arch.py AS A DIRECTORY (with one entry so it is
-  // not unlink-replaceable as an empty dir; mirrors the R3
+  // not unlink-replaceable as an empty dir; mirrors the
   // save-failure test's non-empty config.json/sentinel shape).
   fs::create_dir_all(save_dir.join("custom_arch.py").join("nested")).unwrap();
 
@@ -1727,11 +1726,11 @@ fn fuse_fails_when_stale_destination_python_extra_is_directory() {
     "error message must name the kind (directory); got: {msg}"
   );
 
-  // R4 F2 contract: no `.staging-fuse-*` survived the stale-sweep fail.
+  // Staging-guard contract: no `.staging-fuse-*` survived the stale-sweep fail.
   let leftover = staging_dir_count(&save_dir);
   assert_eq!(
     leftover, 0,
-    "the F2 fix must keep the staging guard armed until success; \
+    "the staging guard must stay armed until success; \
      found {leftover} leftover .staging-fuse-* dirs after a *.py-sweep failure"
   );
 
@@ -1741,12 +1740,12 @@ fn fuse_fails_when_stale_destination_python_extra_is_directory() {
 #[cfg(unix)]
 #[test]
 fn fuse_fails_when_stale_destination_tokenizer_json_is_symlink_to_directory() {
-  // R4 Finding 1 [HIGH] — `is_file()` FOLLOWS symlinks, so a
+  // `is_file()` FOLLOWS symlinks, so a
   // `save_dir/tokenizer.json` symlink whose target is a directory
-  // returns `false` (target is dir) and was SILENTLY SKIPPED by the
-  // pre-R4 sweep. Worse: a symlink at a reserved basename pointing at
-  // an arbitrary path is an unbounded redirection vector (cross-FS
-  // escape via `/etc/passwd`). The R4 sweep uses
+  // returns `false` (target is dir) and would be SILENTLY SKIPPED by an
+  // `is_file()`-gated sweep. Worse: a symlink at a reserved basename
+  // pointing at an arbitrary path is an unbounded redirection vector
+  // (cross-FS escape via `/etc/passwd`). The sweep uses
   // `symlink_metadata()` (NEVER follows symlinks) and rejects ANY
   // symlink at a reserved basename via the same named-error path.
   //
@@ -1761,8 +1760,8 @@ fn fuse_fails_when_stale_destination_tokenizer_json_is_symlink_to_directory() {
     !model_dir.join("tokenizer.json").exists(),
     "fixture precondition: source has NO tokenizer.json"
   );
-  // R2 validate would normally fail with a missing tokenizer; we want
-  // the test to exercise the STALE-SWEEP path (not the
+  // Tokenizer validation would normally fail with a missing tokenizer; we
+  // want the test to exercise the STALE-SWEEP path (not the
   // validate-before-save path). So we substitute spiece.model — a
   // RESERVED basename that's NOT validated by `load_tokenizer` but IS
   // a member of TOKENIZER_EXTRA_FILES, so the stale sweep walks it.
@@ -1770,7 +1769,7 @@ fn fuse_fails_when_stale_destination_tokenizer_json_is_symlink_to_directory() {
   //
   // Cleaner approach: add a tokenizer.json so validate passes, but
   // pre-create the SYMLINK at a DIFFERENT reserved basename the
-  // source lacks (`special_tokens_map.json` or `vocab.json`). The R4
+  // source lacks (`special_tokens_map.json` or `vocab.json`). The
   // policy is basename-agnostic — any reserved basename that's a
   // symlink fails.
   fs::write(model_dir.join("tokenizer.json"), minimal_tokenizer_json()).unwrap();
@@ -1792,7 +1791,7 @@ fn fuse_fails_when_stale_destination_tokenizer_json_is_symlink_to_directory() {
   std::os::unix::fs::symlink(&target_dir, save_dir.join("special_tokens_map.json")).unwrap();
   // Sanity: the path EXISTS as a symlink and `is_file()` follows the
   // link (returns false because target is dir) — exactly the trap the
-  // R4 fix closes.
+  // fix closes.
   assert!(
     save_dir
       .join("special_tokens_map.json")
@@ -1802,7 +1801,7 @@ fn fuse_fails_when_stale_destination_tokenizer_json_is_symlink_to_directory() {
   );
   assert!(
     !save_dir.join("special_tokens_map.json").is_file(),
-    "fixture: pre-R4 `is_file()` follows the link and returns false (symlink-to-dir target)"
+    "fixture: `is_file()` follows the link and returns false (symlink-to-dir target)"
   );
 
   let result = fuse::fuse(&model_dir, &adapter_dir, &save_dir, false);
@@ -1822,11 +1821,11 @@ fn fuse_fails_when_stale_destination_tokenizer_json_is_symlink_to_directory() {
     "error message must name the kind (symlink); got: {msg}"
   );
 
-  // R4 F2 contract.
+  // Staging-guard contract.
   let leftover = staging_dir_count(&save_dir);
   assert_eq!(
     leftover, 0,
-    "the F2 fix must keep the staging guard armed until success; \
+    "the staging guard must stay armed until success; \
      found {leftover} leftover .staging-fuse-* dirs after a symlink-rejection failure"
   );
 
@@ -1834,28 +1833,28 @@ fn fuse_fails_when_stale_destination_tokenizer_json_is_symlink_to_directory() {
   let _ = fs::remove_dir_all(&target_dir);
 }
 
-// ────────── R4 Finding 2 [MEDIUM] — staging guard armed until promote success ──────────
+// ────────── staging guard armed until promote success ──────────
 
 #[test]
 fn fuse_cleans_up_staging_dir_on_stale_removal_failure() {
-  // R4 Finding 2 [MEDIUM] — pre-R4, `promote_staging_into_save_path`
-  // called `staging.consume()` as its FIRST step, disarming the RAII
-  // guard. Any later Err (rename failure, stale-sweep removal failure,
-  // the new R4 F1 non-regular rejection) returned WITHOUT cleanup and
-  // a `.staging-fuse-*` dir LEAKED into `save_path` permanently.
+  // A `promote_staging_into_save_path` that called `staging.consume()` as
+  // its FIRST step would disarm the RAII guard. Any later Err (rename
+  // failure, stale-sweep removal failure, the non-regular rejection)
+  // would then return WITHOUT cleanup and a `.staging-fuse-*` dir would
+  // LEAK into `save_path` permanently.
   //
-  // The R4 F2 fix keeps `staging` ARMED across the entire borrow-only
+  // The fix keeps `staging` ARMED across the entire borrow-only
   // inner pass; only the success path consumes the guard and removes
   // the (now-empty) staging dir explicitly. Every Err path drops the
   // guard, firing `StagingDir::Drop`'s `remove_dir_all`.
   //
   // Failure-injection strategy: pre-create a NON-EMPTY directory at a
-  // reserved basename the source lacks. The R4 F1 fix's stale-sweep
+  // reserved basename the source lacks. The stale-sweep
   // hits this entry, classifies it as `directory`, and returns
   // `Err(Error::Backend{"non-regular reserved path"})`. This is a
-  // mid-promote Err — exactly the path the F2 fix is required to
-  // clean up (pre-R4 it leaked because `consume()` had already
-  // disarmed the guard).
+  // mid-promote Err — exactly the path the armed-until-success guard is
+  // required to clean up (a `consume()`-first shape would leak because
+  // it had already disarmed the guard).
   let weights = toy_base_weights(1);
   let model_dir = write_base_dir("f2_cleanup_model", &weights, &plain_config_json(1));
   assert!(
@@ -1865,8 +1864,8 @@ fn fuse_cleans_up_staging_dir_on_stale_removal_failure() {
 
   let adapter_dir = write_mlxlm_adapter("f2_cleanup_adapter", &[0], 2.0);
   let save_dir = temp_dir("f2_cleanup_save");
-  // Non-empty dir at the reserved basename — F1 rejects, F2 must
-  // still clean up the staging dir.
+  // Non-empty dir at the reserved basename — the non-regular gate
+  // rejects, and the staging dir must still be cleaned up.
   fs::create_dir_all(save_dir.join("tokenizer_config.json").join("nested_file")).unwrap();
 
   let result = fuse::fuse(&model_dir, &adapter_dir, &save_dir, false);
@@ -1875,15 +1874,15 @@ fn fuse_cleans_up_staging_dir_on_stale_removal_failure() {
     "fuse must fail when stale tokenizer_config.json is a non-empty directory: got {result:?}"
   );
 
-  // R4 F2 contract: no `.staging-fuse-*` leaked. This is the WHOLE
-  // POINT of keeping the guard armed — the pre-R4 consume()-first
+  // Staging-guard contract: no `.staging-fuse-*` leaked. This is the WHOLE
+  // POINT of keeping the guard armed — a consume()-first
   // shape would leak here because the Err returned AFTER consume()
   // disarmed the guard.
   let leftover = staging_dir_count(&save_dir);
   assert_eq!(
     leftover, 0,
-    "the F2 fix MUST clean up the staging dir on a stale-sweep failure; \
-     found {leftover} leftover .staging-fuse-* dirs (pre-R4 regression signature)"
+    "the staging guard MUST clean up the staging dir on a stale-sweep failure; \
+     found {leftover} leftover .staging-fuse-* dirs"
   );
 
   let _ = fs::remove_dir_all(save_dir.join("tokenizer_config.json"));

@@ -1,4 +1,4 @@
-//! Deterministic sanity tests for the M3 sampling utilities
+//! Deterministic sanity tests for the sampling utilities
 //! (`mlxrs::lm::sample`), ported from `mlx_lm.sample_utils`.
 //!
 //! RNG-flaky assertions are avoided: the transforms are exercised on the
@@ -116,7 +116,7 @@ fn top_p_inverse_permutation_preserves_original_order() {
   assert_eq!(v[3], 0.0, "orig idx 3 kept with its logprob");
 }
 
-/// Regression (Codex f16/bf16 dtype fidelity): the masking transforms must
+/// Regression (f16/bf16 dtype fidelity): the masking transforms must
 /// PRESERVE the input dtype and keep threshold/mask arithmetic *in that
 /// dtype* — mirroring mlx-lm's weak Python scalars (`scalar_like`), not
 /// promoting f16/bf16 to f32 via a concrete f32 scalar. Asserts output
@@ -164,7 +164,7 @@ fn half_and_bfloat_preserve_dtype_and_mask() {
   }
 }
 
-/// Copilot 4309130407: `apply_top_p` must reject a non-finite or
+/// `apply_top_p` must reject a non-finite or
 /// out-of-`(0, 1]` `top_p` (consistent with `apply_top_k`/`apply_min_p`)
 /// instead of silently no-op'ing or masking everything. `1.0` is a valid
 /// no-op (mlx-lm's effective gate is the open interval).
@@ -182,7 +182,7 @@ fn top_p_out_of_range_errors() {
   );
 }
 
-/// Copilot 4309130407: `categorical_sampling` must reject a non-finite or
+/// `categorical_sampling` must reject a non-finite or
 /// non-positive `temp` (mlx-lm relies on `make_sampler` guaranteeing
 /// `temp > 0` — `temp == 0` → argmax; that dispatch is deferred here) rather
 /// than producing `inf`/`NaN` logits.
@@ -196,7 +196,7 @@ fn categorical_sampling_invalid_temp_errors() {
   assert!(sample::categorical_sampling(&lp, f32::INFINITY, &key).is_err());
 }
 
-/// LM-6 (#116) NaN-safety regression: a tiny `temp` whose `1/temp` would
+/// #116 NaN-safety regression: a tiny `temp` whose `1/temp` would
 /// overflow either (a) the logits dtype on the `scalar_like` astype cast
 /// (f16 + `temp < 1/f16::MAX ≈ 1.526e-5`) or (b) the upstream f32
 /// reciprocal itself (any dtype + subnormal positive `temp <
@@ -213,7 +213,7 @@ fn categorical_sampling_tiny_and_subnormal_temp_stays_finite() {
 
   // Path (a): f16 logits + tiny temp. 1/temp ≈ 1e7 overflows f16::MAX
   // (~65504); the multiply path would clamp to +Inf inside `scalar_like`,
-  // and `0 * +Inf = NaN` propagates over the L3-R2-max-shifted row.
+  // and `0 * +Inf = NaN` propagates over the max-shifted row.
   let lp_f16 = Array::from_slice::<f32>(&[-3.0, -2.0, -1.0, 0.0], &[1, 4])
     .unwrap()
     .astype(Dtype::F16)
@@ -253,7 +253,7 @@ fn categorical_sampling_tiny_and_subnormal_temp_stays_finite() {
   }
 }
 
-/// LM-6 R1 follow-up (Codex adversarial review): the previous fix moved
+/// Follow-up: the previous fix moved
 /// from `multiply(logits, scalar_like(1/temp))` to
 /// `divide(logits, scalar_like(temp, logits))`, killing the materialized-
 /// `1/temp` overflow but leaving the dtype-cast leg open — `scalar_like`
@@ -278,7 +278,7 @@ fn categorical_sampling_tiny_and_subnormal_temp_stays_finite() {
 /// `temp = 1e-40` regression below would trip without the clamp; bf16
 /// shares an exponent range with f32, so any `temp` below bf16's min
 /// subnormal is also below `1/f32::MAX` — the clamp is unavoidable for
-/// that specific Codex-finding sub-case).
+/// that specific sub-case).
 #[test]
 fn categorical_sampling_tiny_temp_produces_finite_scaled_logits() {
   // `temp = 1e-40_f32` — sub-min-subnormal for f16 (its min subnormal
@@ -287,7 +287,7 @@ fn categorical_sampling_tiny_temp_produces_finite_scaled_logits() {
   // so the divide kernel's internal multiply-by-reciprocal would
   // overflow for the f32 path too without the `f32::MIN_POSITIVE`
   // clamp — the test exercises BOTH the dtype-cast leg (f16) AND the
-  // f32-reciprocal-overflow leg (bf16 + f32) the LM-6 R1 fix closes.
+  // f32-reciprocal-overflow leg (bf16 + f32) the fix closes.
   let temp: f32 = 1e-40;
   assert!(
     temp.is_finite() && temp > 0.0,
@@ -308,7 +308,7 @@ fn categorical_sampling_tiny_temp_produces_finite_scaled_logits() {
     .unwrap();
 
     // (1) Direct assertion on the scaled logits themselves — the strong
-    // check the R1 finding mandates (not just sampled-index range). All
+    // check (not just sampled-index range). All
     // entries must be finite (the `0` entries must NOT have become NaN
     // via either of the two failure legs).
     let scaled = sample::scale_logits_by_temp(&lp, temp).unwrap();
@@ -356,7 +356,7 @@ fn categorical_sampling_tiny_temp_produces_finite_scaled_logits() {
 }
 
 // ---------------------------------------------------------------------------
-// M3 follow-up: XTC + penalty/bias logits-processor parity
+// XTC + penalty/bias logits-processor parity
 // ---------------------------------------------------------------------------
 
 /// `[1, 4]` raw logits with mixed signs for the penalty/bias transforms.
@@ -542,7 +542,7 @@ fn logit_bias_length_mismatch_errors_and_empty_is_identity() {
     "3 indices vs 2 values"
   );
   // Empty indices with NON-empty values is a length mismatch, not a no-op:
-  // the empty short-circuit must not mask it (Copilot #29 review).
+  // the empty short-circuit must not mask it.
   assert!(
     sample::apply_logit_bias(&lg, &[], &bv).is_err(),
     "0 indices vs 2 values must error, not silently drop the bias"
@@ -604,7 +604,7 @@ fn new_transforms_preserve_half_and_bfloat_dtype() {
   }
 }
 
-/// Codex review (#29): `apply_frequency_penalty` must NOT corrupt untouched
+/// `apply_frequency_penalty` must NOT corrupt untouched
 /// logits when a large `penalty` overflows a low-precision dtype. The prior
 /// `histogram * scalar` form computed `0 * +inf = NaN` on every unmentioned
 /// token for f16; mlx-lm's `.at[:, tokens].subtract(penalty)` only updates
@@ -635,7 +635,7 @@ fn apply_frequency_penalty_f16_large_penalty_no_nan_bleed() {
     vec![10.0, 20.0, 20.0],
     "id 2 twice → -10; others exact"
   );
-  // Codex #29 round-2: untouched columns must be the BITWISE-identical input
+  // Untouched columns must be the BITWISE-identical input
   // (direct indexed scatter-add performs no arithmetic on them) — IEEE
   // signed zero is the witness: an untouched `-0.0` must NOT become `+0.0`
   // (a global `logits + delta` would canonicalize it). f16 `[-0.0, 5.0]`,
@@ -658,10 +658,10 @@ fn apply_frequency_penalty_f16_large_penalty_no_nan_bleed() {
 }
 
 // ---------------------------------------------------------------------------
-// LM-6 R2 (Codex adversarial review) — `scale_logits_by_temp` follow-ups
+// `scale_logits_by_temp` follow-ups
 // ---------------------------------------------------------------------------
 
-/// LM-6 R2 (high): `scale_logits_by_temp` MUST install the error handler
+/// `scale_logits_by_temp` MUST install the error handler
 /// BEFORE any `Array::full` ctor — `Array::full::<f32>` runs the fallible
 /// `mlx_array_new_float32` ctor before its `mlx_full(default_stream())`
 /// would lazily install the handler. With the eager `#[ctor]` stripped, a
@@ -673,7 +673,7 @@ fn apply_frequency_penalty_f16_large_penalty_no_nan_bleed() {
 /// mode (process termination on scalar allocation failure) is impossible
 /// to exercise from a runtime test without a real allocation failure.
 #[test]
-fn scale_logits_by_temp_ensures_handler_installed_r2_structural() {
+fn scale_logits_by_temp_ensures_handler_installed() {
   let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lm/sample.rs");
   let src = std::fs::read_to_string(&path).expect("read sample.rs");
 
@@ -710,11 +710,11 @@ fn scale_logits_by_temp_ensures_handler_installed_r2_structural() {
   assert_eq!(
     executable[0], "crate::error::ensure_handler_installed();",
     "scale_logits_by_temp MUST call ensure_handler_installed() as the FIRST \
-     executable statement (LM-6 R2 high finding); first 3 executable lines were: {executable:?}"
+     executable statement; first 3 executable lines were: {executable:?}"
   );
 }
 
-/// LM-6 R2 (medium): F64 logits MUST be rejected — the prior non-F32
+/// F64 logits MUST be rejected — the prior non-F32
 /// branch silently funneled them through `astype(F32) → divide →
 /// astype(F64)`, losing precision on near-tied f64 logits before the
 /// Gumbel draw while still returning an F64 array downstream. A "native
@@ -776,7 +776,7 @@ fn scale_logits_by_temp_rejects_f64() {
   );
 }
 
-/// LM-6 R2 (medium): integer / boolean logits must be REJECTED (the prior
+/// Integer / boolean logits must be REJECTED (the prior
 /// branch treated every non-F32 dtype as a half type and would silently
 /// astype through f32). Mirrors the dtype-rejection pattern in
 /// `kl_div_loss` — the message must mention floating-point and name the

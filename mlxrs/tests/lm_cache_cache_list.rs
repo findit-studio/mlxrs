@@ -200,7 +200,7 @@ fn from_state_roundtrip_rebuilds_children() {
   assert_eq!(again.offset(), 5);
 }
 
-/// Regression (adversarial review, [high]): a `RotatingKvCache` whose
+/// Regression: a `RotatingKvCache` whose
 /// `keep == 1` has `meta_state() == ["1", max_size, "0", "0"]`, which is
 /// numerically a well-formed `childCount=1` CacheList frame. With the
 /// `reference_class_name` trait method, `RotatingKvCache` directly
@@ -307,7 +307,7 @@ fn set_state_splits_per_child() {
   );
 }
 
-/// Regression (adversarial review, [high]): `CacheList::set_state` must be
+/// Regression: `CacheList::set_state` must be
 /// **transactional** — if a *later* child rejects its chunk, every
 /// *earlier* child must remain exactly as it was (no half-applied
 /// old/new mix that corrupts generation state). Two `StandardKvCache`
@@ -484,7 +484,7 @@ fn from_state_rejects_malformed_meta() {
   );
 }
 
-/// Regression (adversarial review, [high]): a corrupt/forged prompt cache
+/// Regression: a corrupt/forged prompt cache
 /// whose leading `child_count` is a huge number (here `usize::MAX`) with
 /// truncated metadata must be a recoverable `Error`, NOT a
 /// `Vec::with_capacity` capacity-overflow panic / OOM abort. `child_count`
@@ -532,7 +532,7 @@ fn from_state_huge_child_count_is_err_not_panic_or_oom() {
   assert_eq!(ok.unwrap().offset(), 0);
 }
 
-/// Regression (adversarial review, [high]): a forged prompt cache can
+/// Regression: a forged prompt cache can
 /// encode an arbitrarily deep single-child `CacheList -> CacheList -> … ->
 /// []` chain using **only metadata strings and zero state arrays** — every
 /// level is a well-formed `childCount=1, stateCount=0` frame, so the
@@ -674,7 +674,7 @@ fn as_cache_list_downcast_through_dyn() {
   assert!(plain_rot.as_cache_list().is_none());
 }
 
-/// Regression (Codex adversarial review): a `CacheList` child that is a
+/// Regression: a `CacheList` child that is a
 /// `ChunkedKvCache` must be named `"ChunkedKVCache"` in `meta_state` (not
 /// the previous silent fallback `"KVCache"`), so a round-trip rebuilds the
 /// right concrete kind via the crate `from_state` dispatch. A misname
@@ -745,7 +745,7 @@ fn cache_list_state_count_matches_state_len() {
   assert_eq!(b.state_count().unwrap(), b.state().unwrap().len());
 }
 
-/// Regression (#83 — CacheList::trim transactional, Codex round-2 finding):
+/// Regression (#83 — CacheList::trim transactional):
 /// when any child is non-trimmable, `trim(n)` must short-circuit `Ok(0)`
 /// BEFORE mutating any child — matching `cache.py:88-111`'s
 /// `can_trim_prompt_cache`/`trim_prompt_cache` `all(is_trimmable())` gate.
@@ -831,7 +831,7 @@ fn cache_list_trim_transactional_short_circuits_on_non_trimmable_child() {
 
 #[test]
 fn state_into_buffer_reuse_matches_state_for_cache_list() {
-  // KVC-7 (#104): `state_into(&mut buf)` is the buffer-reuse companion to
+  // #104: `state_into(&mut buf)` is the buffer-reuse companion to
   // `state() -> Vec<Array>`. For a `CacheList` (which flattens every
   // child's state), `state_into` lets a parent composite avoid the per-
   // child `Vec<Array>` allocation the default trait method would pay.
@@ -858,7 +858,7 @@ fn state_into_buffer_reuse_matches_state_for_cache_list() {
 
 #[test]
 fn meta_state_into_buffer_reuse_matches_meta_state_for_cache_list() {
-  // KVC-6 (#103): `meta_state_into(&mut buf)` is the buffer-reuse
+  // #103: `meta_state_into(&mut buf)` is the buffer-reuse
   // companion to `meta_state() -> Vec<String>`. For a `CacheList`
   // (whose framing is O(children) — `[childCount, (className,
   // stateCount, metaCount, ...meta)*]`) this saves one Vec<String>
@@ -884,7 +884,7 @@ fn meta_state_into_buffer_reuse_matches_meta_state_for_cache_list() {
 
 #[test]
 fn meta_state_into_default_delegates_to_meta_state_for_standard_cache() {
-  // KVC-6 (#103): the trait DEFAULT `meta_state_into` delegates to
+  // #103: the trait DEFAULT `meta_state_into` delegates to
   // `meta_state()` and appends. A concrete cache that does NOT override
   // (e.g. `StandardKvCache` — its meta_state is the trait default empty
   // Vec, so meta_state_into appends nothing) must still produce the same
@@ -905,7 +905,7 @@ fn meta_state_into_default_delegates_to_meta_state_for_standard_cache() {
 
 #[test]
 fn state_into_default_delegates_to_state_for_standard_cache() {
-  // KVC-7 (#104): the trait DEFAULT `state_into` delegates to `state()`
+  // #104: the trait DEFAULT `state_into` delegates to `state()`
   // and appends. A concrete cache that does NOT override (every cache
   // EXCEPT `CacheList`) must still produce the same observable output.
   let mut s = StandardKvCache::new();

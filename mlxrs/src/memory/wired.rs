@@ -50,9 +50,9 @@ struct WiredLimitState {
 
 /// Process-global install-state for [`WiredLimitGuard`].
 ///
-/// CODEX R1 [HIGH] F2 fix — the previous design had NO synchronization on
-/// the install/Drop read-modify-restore cycle, so two concurrent guards
-/// on different threads could interleave their captures and corrupt the
+/// A design with NO synchronization on
+/// the install/Drop read-modify-restore cycle would let two concurrent guards
+/// on different threads interleave their captures and corrupt the
 /// process-global `mlx_set_wired_limit` state:
 /// ```text
 ///   T1 install: captures L0    (sets recommended)
@@ -63,9 +63,9 @@ struct WiredLimitState {
 /// Net effect: process-global limit ends at *recommended*, not the
 /// original L0, despite both scopes having "completed cleanly".
 ///
-/// ## Design: refcounted-guard (CODEX R2)
-/// The R1-fix took a **single-active-guard** approach (concurrent installs
-/// returned `Ok(None)`), which Codex R2 correctly flagged as silently losing
+/// ## Design: refcounted-guard
+/// A **single-active-guard** approach (concurrent installs
+/// returned `Ok(None)`) would silently lose
 /// in-scope protection for the second concurrent install:
 /// ```text
 ///   T1 install      → captures L0, sets recommended limit, returns Some(guard)
@@ -89,13 +89,12 @@ struct WiredLimitState {
 /// Python's `wired_limit` is a `@contextmanager` that simply saves the prior
 /// limit on entry and restores it on exit. Under the GIL, nesting is safe
 /// because only one context is active at a time; under genuine concurrency
-/// (sub-interpreters, free-threaded Python) the same bug as our pre-F2
-/// design would fire. mlxrs's refcounted design matches Python's *intended
+/// (sub-interpreters, free-threaded Python) the same unsynchronized bug
+/// would fire. mlxrs's refcounted design matches Python's *intended
 /// semantics* — "stack installs, restore the original at the bottom of the
-/// stack" — but enforces them race-free via this mutex. See `git log -p`
-/// on this file for the full F2/R2 audit trail (the R1 single-active-guard
-/// design preserved race-freedom at the cost of in-scope protection for
-/// the second concurrent install; R2's refcounted design preserves both).
+/// stack" — but enforces them race-free via this mutex. (A single-active-guard
+/// design preserves race-freedom at the cost of in-scope protection for
+/// the second concurrent install; the refcounted design preserves both.)
 ///
 /// ## Lock-hold discipline
 /// The `Mutex` is held ONLY across the install's read-modify-write
@@ -169,10 +168,10 @@ pub fn recommended_working_set_bytes() -> Result<Option<u64>> {
   // RAII guard FIRST so `mlx_device_info_free` runs on every early-return
   // path (the free path is null-safe — see `mlx_device_info_free_`).
   //
-  // CODEX R1 [HIGH] regression fix: the prior code branched
+  // Regression guard: branching
   // `if info.ctx.is_null() { return Ok(None); }` immediately after
-  // `_new()`, making this function ALWAYS return None on every host
-  // (because `_new()` *always* returns NULL ctx). That silently turned the
+  // `_new()` would make this function ALWAYS return None on every host
+  // (because `_new()` *always* returns NULL ctx). That would silently turn the
   // entire wired-memory feature into a no-op on supported Metal systems.
   // Don't reintroduce that check here; the populated-ctx check happens via
   // `has_key` / `get_size`'s rc surface below.
@@ -248,7 +247,7 @@ pub fn recommended_working_set_bytes() -> Result<Option<u64>> {
 /// yield` early return.
 ///
 /// ## Concurrency
-/// Concurrent installs use **refcounted-guard** semantics (CODEX R2 fix):
+/// Concurrent installs use **refcounted-guard** semantics:
 /// - The first install in an epoch captures the prior limit, sets the
 ///   limit to recommended, and yields `Ok(Some(guard))`.
 /// - Every subsequent install while the first epoch is still live bumps
@@ -261,8 +260,8 @@ pub fn recommended_working_set_bytes() -> Result<Option<u64>> {
 ///
 /// This matches Python's implicit-stacking semantics (Python's GIL hides
 /// the race; mlxrs makes it genuinely race-free via the internal mutex).
-/// See the crate-private `WIRED_LIMIT_STATE` static's doc-comment and
-/// `git log -p` on this file for the F2/R2 design rationale.
+/// See the crate-private `WIRED_LIMIT_STATE` static's doc-comment for the
+/// refcounted design rationale.
 ///
 /// Emits a `[WARNING]` to stderr (via [`eprintln`]) when `model_bytes >
 /// 0.9 * max_rec_size`, matching the Python helper's near-OOM warning
@@ -336,11 +335,10 @@ impl<'a> WiredLimitGuard<'a> {
       );
     }
 
-    // CODEX R2 [HIGH] fix — refcounted-guard semantics. Acquire the
+    // Refcounted-guard semantics. Acquire the
     // process-global state mutex BEFORE the conditional read-modify-write
     // so two concurrent installs cannot both observe `None` and race on
-    // the FFI capture (which is the race the R1-fix's flag already
-    // closed). The R2 change is to NO LONGER bail out with `Ok(None)` on
+    // the FFI capture. Crucially, do NOT bail out with `Ok(None)` on
     // a concurrent install — instead bump the refcount and yield a real
     // guard, so the second caller's scope is genuinely protected for its
     // full lifetime. See WIRED_LIMIT_STATE's doc-comment for the design.
@@ -411,8 +409,8 @@ impl Drop for WiredLimitGuard<'_> {
     // silently dropped per the crate's `Drop` convention (must not panic,
     // must not call check() through the TLS), the same as `Stream::drop`.
     //
-    // CODEX R1 [HIGH] F3 fix — Drop MUST be infallible.
-    // Previously, `Stream::default_gpu()` and `Stream::synchronize()` both
+    // Drop MUST be infallible.
+    // `Stream::default_gpu()` and `Stream::synchronize()` both
     // invoke `assert_streams_not_cleared()` which `panic!`s when the
     // thread's streams have been bulk-cleared via
     // `Stream::clear_current_thread_streams()`. A safe sequence —
@@ -449,7 +447,7 @@ impl Drop for WiredLimitGuard<'_> {
       }
     }
 
-    // CODEX R2 [HIGH] fix — refcount-aware restore. Decrement the shared
+    // Refcount-aware restore. Decrement the shared
     // refcount under the state lock; only the LAST guard in the epoch
     // restores the captured prior limit and clears the state. See
     // [`WIRED_LIMIT_STATE`]'s doc-comment for the rationale.

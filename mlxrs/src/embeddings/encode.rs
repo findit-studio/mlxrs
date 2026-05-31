@@ -670,7 +670,7 @@ mod tests {
     assert!(vclose(&v[2..4], &[9.0, 3.0]));
   }
 
-  // ---- Regression: finding 1 — tokenizer-applied padding must be masked ----
+  // ---- Regression: tokenizer-applied padding must be masked ----
 
   /// A tokenizer with HF padding enabled (`Fixed(4)`, `pad_id = 4`) must NOT
   /// leak its pad cells into the attention mask. With a single text the batch
@@ -744,7 +744,7 @@ mod tests {
     assert!(vclose(&vp[2..4], &[0.5, 0.5]));
   }
 
-  // ---- Regression: finding 2 — Cls/None honor the model's pooled_output ----
+  // ---- Regression: Cls/None honor the model's pooled_output ----
 
   /// `Cls` strategy with a model-provided `pooled_output` must return that
   /// trained pooler vector (swift `inputs.pooledOutput ?? …`), NOT the

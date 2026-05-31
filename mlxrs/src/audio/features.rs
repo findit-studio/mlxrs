@@ -105,7 +105,7 @@ const MAX_DELTA_WIN_LENGTH: usize = 1024;
 /// ignores. A `(1-D length = MAX_FBANK_WORK - 1022, win_length = 1023)`
 /// input passes both the original and the padded size caps yet schedules
 /// ~1022 passes over ~64 Mi elements ≈ tens of billions of element-ops —
-/// a CPU / GPU stall despite the size cap (Codex review). This is the
+/// a CPU / GPU stall despite the size cap. This is the
 /// delta analogue of [`crate::audio::dsp`]'s `MAX_LOUDNESS_WORK` (a
 /// sample-visit cap distinct from its `MAX_LOUDNESS_BLOCK_BYTES` byte
 /// cap). `512 Mi` element-ops is a generous ceiling — the default
@@ -305,7 +305,7 @@ pub fn get_mel_banks_kaldi(
 
   // Per-row center freqs (1-D output) — short loop, scalar `f32::ln`
   // via `inverse_mel_scale_kaldi`. Built separately from the bank
-  // because the bank is built by the C11 SIMD dispatcher below.
+  // because the bank is built by the SIMD dispatcher below.
   let mut centers: Vec<f32> = Vec::new();
   centers.try_reserve_exact(num_bins).map_err(|e| {
     Error::AllocFailure(AllocFailurePayload::new(
@@ -320,7 +320,7 @@ pub fn get_mel_banks_kaldi(
     centers.push(inverse_mel_scale_kaldi(center_mel));
   }
 
-  // C11 SIMD: dispatch the row-by-row Kaldi triangle construction
+  // SIMD: dispatch the row-by-row Kaldi triangle construction
   // through the SIMD kernel
   // (`simd::audio::kaldi_mel::get_mel_banks_kaldi_rows`). The
   // dispatcher writes 0.0 for collapsed-bin rows (lc <= 0 / cr <= 0)
@@ -335,7 +335,7 @@ pub fn get_mel_banks_kaldi(
     mel_low,
     mel_delta,
   )?;
-  // SAFETY: the C11 dispatcher's init contract guarantees every cell
+  // SAFETY: the SIMD dispatcher's init contract guarantees every cell
   // of the `bank_len`-prefix of `spare` is initialized before
   // returning `Ok(())`; `bank_len <= bank.capacity()` per
   // `try_reserve_exact`.
@@ -406,9 +406,9 @@ fn build_kaldi_window(win_type: KaldiWindow, win_size: usize) -> Result<Array> {
     ))
   })?;
 
-  // C12 SIMD: dispatch Hamming / Hanning / Rectangular through the
+  // SIMD: dispatch Hamming / Hanning / Rectangular through the
   // Kaldi-window NEON kernel (`simd::audio::window::kaldi_window`).
-  // Povey is **not** handled by C12 — its `powf(0.85)` cannot vectorize
+  // Povey is **not** handled by the SIMD path — its `powf(0.85)` cannot vectorize
   // via the polynomial cos path; we keep the scalar `theta.cos() +
   // .powf(0.85)` loop locally for that arm.
   let buf: Vec<f32> = match win_type {
@@ -662,7 +662,7 @@ fn strided_frames_no_snip_edges(
   let pad_i64 = (win_size as i64) / 2 - (win_inc as i64) / 2;
 
   // Cap the reflect-padded buffer's element count BEFORE the `concatenate`
-  // that materializes it (Codex review). The `compute_fbank_kaldi` caps
+  // that materializes it. The `compute_fbank_kaldi` caps
   // (`frame_work` / `out_elems` / `output_elems`) bound the *framed* matrix
   // `num_frames * n_fft_padded`, NOT this intermediate reflected buffer: a
   // `(samples_len = MAX_FBANK_WORK, win_len = 2, win_inc = 4)` input gives a
@@ -983,8 +983,8 @@ pub fn compute_fbank_kaldi(
   // is a broadcasted view (e.g. `broadcast_to([0.5], &[100_000_000])` with stride
   // 0), the underlying storage is tiny but `contiguous(waveform, false)` will
   // materialize the full logical extent into a fresh row-major buffer at eval
-  // time — a one-element broadcast can therefore drive a multi-GB allocation
-  // (Codex review R2). The existing `frame_work` / `out_elems` / `output_elems`
+  // time — a one-element broadcast can therefore drive a multi-GB allocation.
+  // The existing `frame_work` / `out_elems` / `output_elems`
   // caps run AFTER framing math and don't constrain `samples_len` directly: a
   // pathological `(samples_len=100M, win_len=2, win_inc=50M, num_mels=1)` input
   // gives `num_frames = 1` → `frame_work = 2` (well under the cap) but
@@ -1087,7 +1087,7 @@ pub fn compute_fbank_kaldi(
   // tiny (e.g. `win_len = 2 → n_fft_padded = 2 → num_fft_bins = 1`) satisfy
   // the mel-bank cap (`num_mels * 1 == num_mels`) and the frame-work cap, but
   // can still drive `num_frames * num_mels` into TB territory with a small
-  // `win_inc` and a huge `num_mels` (Codex review). Reject BEFORE building the
+  // `win_inc` and a huge `num_mels`. Reject BEFORE building the
   // mel filterbank, the matmul, or any of the intermediates they hold.
   let output_elems = num_frames.checked_mul(num_mels).ok_or_else(|| {
     Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
@@ -1113,7 +1113,7 @@ pub fn compute_fbank_kaldi(
   // column on the right below at `ops::shape::pad(&mel_bank, …, &[1_i32], …)`
   // so the trailing dim matches the rfft's `n_fft_padded/2 + 1` bin count).
   // The unpadded `bank_len` check inside `get_mel_banks_kaldi` only caps
-  // `num_mels * (n_fft_padded/2)` (Codex review R2): with `n_fft_padded == 2`
+  // `num_mels * (n_fft_padded/2)`: with `n_fft_padded == 2`
   // → `num_fft_bins == 1` → unpadded `bank_len == num_mels` passes the cap,
   // but the padded operand DOUBLES to `num_mels * 2` and a `num_mels =
   // MAX_FBANK_WORK` would push that to `128 Mi` (256 MiB of f32). Reject
@@ -1499,7 +1499,7 @@ pub fn compute_deltas_kaldi(
     )));
   }
   // Cap the CUMULATIVE accumulation work, distinct from the buffer-size caps
-  // above (Codex review). The `total` and `padded_work` caps bound buffer
+  // above. The `total` and `padded_work` caps bound buffer
   // *sizes* (`num_features * time` and `num_features * (time + 2n)`), but the
   // accumulation loop below runs `win_length - 1` (`== 2n`) full-width
   // slice / multiply / add passes over `num_features * time` elements — so the
@@ -2246,9 +2246,9 @@ mod tests {
     );
   }
 
-  // ---- Codex review follow-ups ------------------------------------------
+  // ---- work-cap follow-ups ----------------------------------------------
 
-  /// Finding 1 (output cap): a pathological `(win_len=2, win_inc=1, ~1M
+  /// Output cap: a pathological `(win_len=2, win_inc=1, ~1M
   /// samples, num_mels=1M)` input satisfies the existing `frame_work` /
   /// `rfft_out` / `mel_bank` caps (`n_fft_padded == 2 → num_fft_bins == 1`,
   /// so `num_mels * num_fft_bins == num_mels`) but would request a trillion-
@@ -2289,7 +2289,7 @@ mod tests {
     );
   }
 
-  /// Finding 2 (contiguity): a 1-D sliced waveform passes the rank-1 check
+  /// Contiguity: a 1-D sliced waveform passes the rank-1 check
   /// but its strided storage view would otherwise feed `as_strided` an
   /// out-of-bounds region. The `ops::shape::contiguous` materialization at
   /// the top of `compute_fbank_kaldi` MUST make it produce the SAME features
@@ -2351,7 +2351,7 @@ mod tests {
     }
   }
 
-  /// Finding 2 (contiguity): a broadcasted scalar `waveform` (rank-1 by
+  /// Contiguity: a broadcasted scalar `waveform` (rank-1 by
   /// `broadcast_to`, with stride 0 over a single-element buffer) must NOT
   /// produce out-of-bounds reads. With the `ops::shape::contiguous`
   /// materialization the broadcast is realized into a real buffer; the
@@ -2412,7 +2412,7 @@ mod tests {
     }
   }
 
-  /// Finding 3 (preemphasis): pin the kaldi-asr first-sample boundary by
+  /// Preemphasis: pin the kaldi-asr first-sample boundary by
   /// constructing a minimal signal where the boundary math is observable in
   /// closed form, then comparing the centered+preemphasized frame against
   /// the hand-computed Kaldi reference.
@@ -2527,9 +2527,9 @@ mod tests {
     }
   }
 
-  // ---- Codex review R2 follow-ups ---------------------------------------
+  // ---- additional work-cap follow-ups -----------------------------------
 
-  /// Codex R2 Finding 1 (samples_len cap): a broadcasted 1-element waveform
+  /// Samples_len cap: a broadcasted 1-element waveform
   /// has a tiny underlying buffer but its LOGICAL `shape()[0]` can be huge.
   /// Without an upfront `samples_len` cap, `ops::shape::contiguous(waveform,
   /// false)` would materialize the full logical extent at eval time, turning
@@ -2580,7 +2580,7 @@ mod tests {
     );
   }
 
-  /// Codex R2 Finding 2 (padded mel-bank cap): the right operand of the
+  /// Padded mel-bank cap: the right operand of the
   /// `power @ mel_padded.T` matmul has shape `(num_mels, n_fft_padded/2 + 1)`
   /// — `get_mel_banks_kaldi` builds `(num_mels, n_fft_padded/2)` and we pad
   /// one zero column on the right. The unpadded `bank_len` cap inside
@@ -2633,7 +2633,7 @@ mod tests {
     );
   }
 
-  /// Codex review: `snip_edges=false` reflect-buffer cap. `compute_fbank_kaldi`
+  /// `snip_edges=false` reflect-buffer cap. `compute_fbank_kaldi`
   /// caps the FRAMED matrix (`frame_work` / `out_elems` / `output_elems`)
   /// BEFORE `strided_frames_no_snip_edges`, but that helper then builds a
   /// reflected `padded` waveform by concatenating ≈ `2 * waveform_len`
@@ -2684,13 +2684,13 @@ mod tests {
     );
   }
 
-  /// Codex review (round 3): the same reflect-buffer cap, but for the
-  /// `pad == 1` branch — the regression the round-2 fix missed. That branch
+  /// The same reflect-buffer cap, but for the
+  /// `pad == 1` branch. That branch
   /// concatenates `pad_left` (`1`) ++ `waveform` (`n`) ++ `pad_right`
   /// (`reverse(wf[1..n])`, length `n - 1`) = `2*n`, NOT the `n + 2` a uniform
   /// `n + 2*pad` estimate gives. So a `pad == 1` input whose `n + 2` is within
   /// `MAX_FBANK_WORK` but whose true `2*n` exceeds it slipped a ~128 Mi
-  /// `concatenate` through. The Codex example: `win_len = 1_048_576`,
+  /// `concatenate` through. Example: `win_len = 1_048_576`,
   /// `win_inc = 1_048_574` ⇒ `pad = 524288 - 524287 = 1`; `n = MAX_FBANK_WORK
   /// - 2` ⇒ `n + 2 == 64 Mi` (an `n + 2*pad` estimate would PASS) yet
   /// `2*n ≈ 128 Mi > 64 Mi`. The per-branch `2*n` cap MUST reject it.
@@ -2772,7 +2772,7 @@ mod tests {
     );
   }
 
-  /// Codex review (round 3): the `pad == 1` branch concatenates `pad_left`
+  /// The `pad == 1` branch concatenates `pad_left`
   /// (`1`) ++ `waveform` (`n`) ++ `pad_right` (`n - 1`, the reference's
   /// over-long inert reflect tail) = `2*n` — NOT the `n + 2` a uniform
   /// `n + 2*pad` estimate would give. So a `pad == 1` waveform whose `n + 2`
@@ -3003,7 +3003,7 @@ mod tests {
     );
   }
 
-  /// Codex review: the delta CUMULATIVE-work cap (`MAX_DELTA_WORK`), distinct
+  /// The delta CUMULATIVE-work cap (`MAX_DELTA_WORK`), distinct
   /// from the buffer-size caps. `total` (`num_features * time`) and
   /// `padded_work` (`num_features * (time + 2n)`) only bound buffer *sizes*,
   /// but the accumulation loop runs `win_length - 1` full-width slice /

@@ -1,12 +1,10 @@
-//! C8 — `resample_linear` linear interpolation.
+//! `resample_linear` linear interpolation.
 //!
 //! Tracking: [#153](https://github.com/Findit-AI/mlxrs/issues/153).
-//! Plan: `docs/core-arch-simd-candidates.md` §2 row C8, §3.4 (resample
-//! linear).
 //!
 //! # The defect class
 //!
-//! Pre-C8 `crate::audio::io::resample_linear` is a per-output-sample loop:
+//! The original `crate::audio::io::resample_linear` is a per-output-sample loop:
 //!
 //! ```rust,ignore
 //! for i in 0..out_len {
@@ -71,10 +69,11 @@
 //! and the caller (`resample_linear`) wraps it with `Vec::with_capacity`
 //! + `spare_capacity_mut` + `set_len(out_len)`.
 //!
-//! # Verify-before-claim bench
+//! # Bench
 //!
-//! Report-only per the user directive 2026-05-23 (project memory rule
-//! **"SIMD ship NEON regardless"**).
+//! The NEON kernel ships unconditionally on aarch64 because
+//! auto-vectorization of the scalar arm is compiler-version-dependent,
+//! so bench numbers are report-only and do not drive the ship decision.
 
 use core::mem::MaybeUninit;
 
@@ -85,7 +84,7 @@ use core::arch::aarch64::{
 
 /// Scalar reference: linear-interpolation resample of `samples` into
 /// `out` using output-index → input-position factor `ratio = from / to`.
-/// Bit-exact match for the pre-C8 `resample_linear` inner loop, with
+/// Bit-exact match for the original `resample_linear` inner loop, with
 /// the caller-managed `out_len = samples.len() * to_rate / from_rate`
 /// length contract.
 ///
@@ -346,7 +345,7 @@ pub fn resample_linear(out: &mut [MaybeUninit<f32>], samples: &[f32], ratio: f64
 #[cfg(test)]
 mod tests {
   //! Scalar vs dispatcher Tolerance differential tests + edge coverage
-  //! for C8.
+  //! for the resample.
 
   use super::{resample_linear, resample_linear_scalar};
   use crate::simd::diff::assert_close_slice_over_lane_sweep;

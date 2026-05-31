@@ -5,7 +5,7 @@
 //! and mlx-audio-swift's [`SpeechGenerationModel`][swift-gen] protocol.
 //!
 //! Per the project's no-per-model-arch rule
-//! ([`project_no_per_model_arch_porting`][noarch]), mlxrs ships **no
+//! (`project_no_per_model_arch_porting`), mlxrs ships **no
 //! concrete TTS model implementations**: the per-model token decoder +
 //! vocoder / codec (kokoro's istftnet decoder, csm's RVQ + mimi codec,
 //! bark's coarse/fine transformers, …) live in user code on top of this
@@ -31,7 +31,6 @@
 //! [`super::generate::TtsSegment`].
 //!
 //! [swift-gen]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioTTS/Generation.swift
-//! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 
 use crate::{
   array::Array,

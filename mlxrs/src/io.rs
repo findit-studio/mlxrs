@@ -1006,11 +1006,10 @@ pub enum GgufMetadata {
 #[cfg(feature = "gguf")]
 impl GgufMetadata {
   /// Stable snake_case tag for the active variant — single source of truth
-  /// for [`std::fmt::Display`], log keys, and error messages. Per
-  /// rust-type-conventions §2, data-carrying enums get `as_str -> &str`
-  /// (non-`const`); the returned strings are `&'static str` here only
-  /// because every variant maps to a literal, not because `as_str` itself
-  /// is `const`.
+  /// for [`std::fmt::Display`], log keys, and error messages. Data-carrying
+  /// enums get `as_str -> &str` (non-`const`); the returned strings are
+  /// `&'static str` here only because every variant maps to a literal, not
+  /// because `as_str` itself is `const`.
   pub fn as_str(&self) -> &'static str {
     match self {
       Self::Array(_) => "array",

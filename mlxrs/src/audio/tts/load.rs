@@ -37,11 +37,10 @@ use crate::{
 /// ([tts-utils.py:19-45][tts-utils-remap]) — `(alias,
 /// canonical_module_name)` pairs.
 ///
-/// **Reference-only**: per the [no per-model arch porting][noarch]
+/// **Reference-only**: per the no per-model arch porting
 /// rule, mlxrs does NOT import per-architecture crates from this table.
 ///
 /// [tts-utils-remap]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/tts/utils.py#L19-L45
-/// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 pub const MODEL_REMAPPING: &[(&str, &str)] = &[
   ("qwen3_tts", "qwen3_tts"),
   ("outetts", "outetts"),
@@ -77,7 +76,7 @@ pub const MODEL_REMAPPING: &[(&str, &str)] = &[
 /// Routes through the shared
 /// [`crate::audio::load::base_load_model`] factory. The returned bundle
 /// is handed to the caller-supplied `constructor` closure (per the
-/// [no per-model arch porting][noarch] rule mlxrs does not bundle a
+/// no per-model arch porting rule mlxrs does not bundle a
 /// built-in registry).
 ///
 /// `path` is the local on-disk path (a `hf://…` / `org/name` repo id is
@@ -91,7 +90,6 @@ pub const MODEL_REMAPPING: &[(&str, &str)] = &[
 /// error → caller-defined.
 ///
 /// [tts-utils-loadmodel]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/tts/utils.py#L98-L127
-/// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 pub fn load_model<F>(path: &str, constructor: F) -> Result<Box<dyn TtsModel>>
 where
   F: FnOnce(LoadedAudioModel) -> Result<Box<dyn TtsModel>>,

@@ -1,4 +1,4 @@
-//! L7 — prompt-cache fill + save driver (`mlxrs::lm::cache_prompt`), ported
+//! Prompt-cache fill + save driver (`mlxrs::lm::cache_prompt`), ported
 //! from `mlx_lm.cache_prompt` (the `--prompt-cache-file` CLI's support core).
 //!
 //! Deterministic + dependency-free: a local `MockModel` (replicating the
@@ -242,7 +242,7 @@ fn driver_fill_save_load_matches_direct_prefill() {
 }
 
 /// A multi-chunk prompt (`P` >> `prefill_step_size`) completes and produces a
-/// **loadable** cache (Codex finding: the per-chunk eval barrier makes prefill
+/// **loadable** cache (the per-chunk eval barrier makes prefill
 /// memory-bounded — the lazy graph is materialized between chunks, not spanned
 /// across the whole prompt). With `P = 17`, `step = 4` the leading `P-1 = 16`
 /// tokens are 4 chunks `[4,4,4,4]`, so the barrier runs 4 times; the saved
@@ -599,7 +599,7 @@ fn driver_high_level_empty_string_is_consistent() {
 }
 
 // ---------------------------------------------------------------------------
-// `continue_final_message` regression (Codex finding).
+// `continue_final_message` regression.
 //
 // `cache_prompt.py` encodes the chat-template prompt with
 // `add_generation_prompt=False, continue_final_message=True`. For a chat
@@ -635,7 +635,7 @@ fn tokenizer_with_config(dir: &std::path::Path, config_json: &str) -> mlxrs::tok
 /// The chat-template encode used by `cache_prompt` (`continue_final_message =
 /// true`) drops the trailing end-of-turn token a non-continued encode keeps —
 /// so the cached prompt is one-or-more tokens SHORTER and ends exactly at the
-/// final message's content (the Codex finding's correctness contract).
+/// final message's content (the correctness contract).
 #[test]
 fn continue_final_message_encode_drops_trailing_terminator() {
   let dir = temp_dir("cfm_encode");
@@ -680,7 +680,7 @@ fn continue_final_message_encode_drops_trailing_terminator() {
   );
 }
 
-/// L7 round-trip with a terminator-appending chat template: driving
+/// Round-trip with a terminator-appending chat template: driving
 /// `cache_prompt` (which encodes with `continue_final_message=true`) saves a
 /// cache whose offset == the *continued* encode length (terminator stripped),
 /// NOT the longer plain-encode length — and the loaded cache continues like a
@@ -761,7 +761,7 @@ fn cache_prompt_chat_template_uses_continue_final_message_offset() {
 }
 
 // ---------------------------------------------------------------------------
-// Sliding-window / rotating-cache prefill (Codex finding).
+// Sliding-window / rotating-cache prefill.
 //
 // A sliding-window `CacheConfig` makes `cache_prompt` allocate a
 // `RotatingKvCache` per layer (via `make_prompt_cache`). The per-chunk barrier

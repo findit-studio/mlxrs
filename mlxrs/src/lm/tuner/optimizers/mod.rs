@@ -39,8 +39,8 @@
 //! - The Python `tree_map` walks the per-parameter `state` dict in lock-step
 //!   with the parameter tree; a flat `HashMap` keyed by the same flat path
 //!   is the structural equivalent, just spelled differently.
-//! - This matches the project memory rule on Rust-idiomatic API shape
-//!   ("ndarray-flavored ergonomics over verbatim Python/Swift mirroring").
+//! - This follows the Rust-idiomatic API shape: ndarray-flavored
+//!   ergonomics over verbatim Python/Swift mirroring.
 //!
 //! ## Scope cuts
 //!

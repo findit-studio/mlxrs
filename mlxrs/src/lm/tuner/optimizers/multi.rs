@@ -102,7 +102,7 @@ impl Optimizer for MultiOptimizer {
 
   /// Recursive preflight: validates EVERY descendant optimizer (including
   /// nested `MultiOptimizer` children) at the current step before any
-  /// param mutation. R10 finding (#244): without this override, an outer
+  /// param mutation (#244): without this override, an outer
   /// `MultiOptimizer` would call the trait-default no-op for a nested
   /// `MultiOptimizer` child, then commit earlier siblings before the
   /// nested child's own internal preflight (inside its `apply_gradients`)
@@ -125,7 +125,7 @@ impl Optimizer for MultiOptimizer {
     // and CACHES the LR with a step stamp so a stateful schedule closure
     // is called AT MOST ONCE per step.
     //
-    // **NOT atomic for non-LR apply failures** (R11 explicit scope cut):
+    // **NOT atomic for non-LR apply failures** (explicit scope cut):
     // if a later child's `apply_gradients` fails for a non-LR reason
     // (shape/dtype mismatch, FFI error, etc.) AFTER earlier children
     // have already committed their param + state updates, the call
@@ -137,7 +137,7 @@ impl Optimizer for MultiOptimizer {
     // snapshot params + optimizer state before the call.
     //
     // Routes through `self.preflight()` so nested `MultiOptimizer`
-    // children get their own recursive preflight (R10 finding).
+    // children get their own recursive preflight.
     self.preflight()?;
     let grad_split = self.split_dictionary(gradients)?;
     // Apply each child in order. The preflight gate above ensures none of

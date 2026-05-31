@@ -9,7 +9,7 @@
 
 use std::io::Write;
 
-// P1 #111: `Tokenizer::detokenizer()` returns the enum-unified
+// #111: `Tokenizer::detokenizer()` returns the enum-unified
 // [`Detokenizer`]; methods like `add_token` / `text` / `last_segment`
 // require the [`StreamingDetokenizer`] trait in scope.
 use mlxrs::tokenizer::{StreamingDetokenizer, Tokenizer};

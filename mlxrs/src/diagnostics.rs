@@ -8,9 +8,7 @@
 //!
 //! [`install`] adds best-effort diagnostics for both. It does **not** and
 //! cannot *recover* from an async Metal abort: mlx-c exposes no hook and the
-//! Metal command-buffer state is undefined after failure (see
-//! `docs/superpowers/specs/2026-05-16-m2-async-metal-recovery-deferred.md`).
-//! Diagnostics only.
+//! Metal command-buffer state is undefined after failure. Diagnostics only.
 //!
 //! **Chaining, not clobbering.** Both hooks are *additive*: the panic hook
 //! chains the previously-installed hook, and the `SIGABRT` handler chains

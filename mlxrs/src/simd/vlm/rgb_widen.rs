@@ -1,18 +1,16 @@
-//! C3 — `image_to_array` RGB u8 → f32 widen (no swap): de-interleave
+//! `image_to_array` RGB u8 → f32 widen (no swap): de-interleave
 //! a `&[u8]` of packed RGB pixels into a `&mut [MaybeUninit<f32>]`
 //! channel-last `[R, G, B]` f32 triples (same plane order as input).
 //!
 //! Tracking: [#148](https://github.com/Findit-AI/mlxrs/issues/148).
-//! Plan: `docs/core-arch-simd-candidates.md` §2 row C3, §3.3 (C3/C4
-//! image-to-array widen). The §5.5 doc originally deferred C3 pending
-//! a disassembly check on the auto-vectorized `buf.extend(raw.iter().map(...))`
-//! scalar shape; per the user directive 2026-05-23 (project memory
-//! rule **"SIMD ship NEON regardless"**), the NEON kernel ships
-//! unconditionally regardless of how the scalar bench compares.
+//! The NEON kernel ships unconditionally regardless of how the scalar
+//! bench compares: auto-vectorization is compiler-version-dependent and
+//! could silently de-vectorize on a toolchain upgrade, so the
+//! hand-rolled arm pins the SIMD contract.
 //!
 //! # The defect class
 //!
-//! The pre-C3 [`crate::vlm::image::image_to_array`] RGB arm is:
+//! The original [`crate::vlm::image::image_to_array`] RGB arm is:
 //!
 //! ```rust,ignore
 //! ColorOrder::Rgb => {
@@ -31,7 +29,7 @@
 //! 1. **Scalar restructure** — replace the `Vec::extend(map)` with a
 //!    `chunks_exact_mut(1) + iter()` pair-iteration into pre-reserved
 //!    spare capacity using `MaybeUninit::write`. Each iteration widens
-//!    one byte to one f32. Same shape as C4's scalar restructure
+//!    one byte to one f32. Same shape as the BGR scalar restructure
 //!    (sized destination, no per-iteration bounds check on `Vec` growth).
 //! 2. **Hand-rolled NEON kernel** — `vld1q_u8` (16 bytes per load) +
 //!    widen chain `vmovl_u8` (low/high) + `vmovl_u16` (low/high) +
@@ -40,9 +38,9 @@
 //!    layout matches the output). Tail (`len % 16` bytes ≤ 15) is
 //!    handled by the scalar arm.
 //!
-//! Unlike C4 (BGR), there's no R↔B swap; the widen is a pure
+//! Unlike the BGR widen, there's no R↔B swap; the widen is a pure
 //! u8 → f32 cast applied to every byte in source order. The
-//! 16-bytes-per-tile NEON loop is simpler than C4's 16-pixels-per-tile
+//! 16-bytes-per-tile NEON loop is simpler than the BGR 16-pixels-per-tile
 //! (which needed `vld3q_u8` + permuted `vst3q_f32`).
 //!
 //! # Correctness class — `Exact`
@@ -57,17 +55,17 @@
 //!
 //! # `MaybeUninit<f32>` API — type-encoded uninit safety
 //!
-//! Matches C4: takes `&mut [MaybeUninit<f32>]` so the
+//! Matches the BGR widen: takes `&mut [MaybeUninit<f32>]` so the
 //! `image_to_array` call site can pass `Vec::spare_capacity_mut()`
 //! directly and `set_len(total)` after every f32 has been written.
 //! No `from_raw_parts_mut` cast over uninit memory.
 //!
-//! # Verify-before-claim bench
+//! # Bench
 //!
-//! Bench numbers are **report-only** per the user directive 2026-05-23
-//! (project memory rule **"SIMD ship NEON regardless"**). The bench
-//! (`mlxrs/benches/simd_rgb_widen.rs`) exists as a regression guard
-//! against both a future scalar regression and a future NEON regression.
+//! Bench numbers are **report-only** (the NEON kernel ships regardless).
+//! The bench (`mlxrs/benches/simd_rgb_widen.rs`) exists as a regression
+//! guard against both a future scalar regression and a future NEON
+//! regression.
 //!
 //! # No new dependencies
 //!
@@ -115,7 +113,7 @@ pub fn rgb_widen_scalar(out: &mut [MaybeUninit<f32>], src: &[u8]) {
     src.len(),
   );
   // Per-byte widen into the pre-reserved slice. Sized-destination shape
-  // matches C4's scalar arm (LLVM auto-vectorizes this on aarch64 once
+  // matches the BGR scalar arm (LLVM auto-vectorizes this on aarch64 once
   // the destination is a fixed-size slice rather than a `Vec` growing
   // through `extend`).
   for (slot, &b) in out.iter_mut().zip(src.iter()) {
@@ -263,7 +261,7 @@ pub fn rgb_widen(out: &mut [MaybeUninit<f32>], src: &[u8]) {
 #[cfg(test)]
 mod tests {
   //! Scalar vs dispatcher + scalar vs NEON differential tests + edge
-  //! coverage for C3.
+  //! coverage for the RGB widen.
 
   use core::mem::MaybeUninit;
 
@@ -344,7 +342,7 @@ mod tests {
     }
   }
 
-  /// Lane-sweep covers C3-relevant boundary lengths.
+  /// Lane-sweep covers RGB-widen-relevant boundary lengths.
   #[test]
   fn rgb_widen_lane_sweep_covers_tile_boundaries() {
     let sweep = lane_sweep_lengths(16);
@@ -422,7 +420,7 @@ mod tests {
       let raw = make_pattern();
       assert_eq!(raw.len(), n, "pattern {name} length mismatch");
 
-      // OLD path — pre-C3 idiom.
+      // OLD path — original idiom.
       let mut old: Vec<f32> = Vec::with_capacity(n);
       old.extend(raw.iter().map(|&b| f32::from(b)));
       assert_eq!(old.len(), n, "OLD extend length mismatch ({name})");
@@ -432,7 +430,7 @@ mod tests {
 
       assert_eq!(
         new, old,
-        "C3 dispatcher must produce byte-identical output to OLD extend (pattern={name})"
+        "dispatcher must produce byte-identical output to the reference extend (pattern={name})"
       );
     }
   }

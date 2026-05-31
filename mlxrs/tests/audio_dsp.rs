@@ -109,8 +109,8 @@ fn stft_rejects_win_length_greater_than_n_fft() {
 #[test]
 fn stft_minimum_valid_input_boundary_padding_to_index_zero() {
   // Regression: when samples.len() == n_fft / 2 + 1, the reflect padding
-  // suffix must include samples[0] (padding == samples.len() - 1). An
-  // earlier formulation used stop=-1 which mlx slice post-normalizes to
+  // suffix must include samples[0] (padding == samples.len() - 1). A
+  // formulation using stop=-1 would have mlx slice post-normalize it to
   // len-1 with negative strides, silently dropping the right edge.
   //
   // For n_fft=8, samples_len = 8/2 + 1 = 5: padding = 4, suffix indices
@@ -322,13 +322,13 @@ fn log_mel_spectrogram_default_matches_explicit_whisper() {
   }
 }
 
-/// Regression — Codex P7 R1 MEDIUM: `mel_spectrogram` must call
+/// Regression: `mel_spectrogram` must call
 /// `mel_filter_bank_cached` (per-thread LRU bank cache) rather than the
-/// uncached `mel_filter_bank` constructor on the hot path. Pre-fix the
-/// cache was wired only into its own unit tests while `mel_spectrogram`
-/// (and every `log_mel_spectrogram` / `log_mel_spectrogram_with` / STT
-/// log-mel callsite that flows through it) kept rebuilding the bank on
-/// every call.
+/// uncached `mel_filter_bank` constructor on the hot path. Without this,
+/// the cache would be wired only into its own unit tests while
+/// `mel_spectrogram` (and every `log_mel_spectrogram` /
+/// `log_mel_spectrogram_with` / STT log-mel callsite that flows through
+/// it) rebuilds the bank on every call.
 ///
 /// **Structural assertion** rather than a runtime-cache-hit observation:
 /// the `mel_filter_bank_cached` thread-local store is private to the
@@ -339,7 +339,7 @@ fn log_mel_spectrogram_default_matches_explicit_whisper() {
 /// references `mel_filter_bank_cached` — without coupling to private
 /// state.
 #[test]
-fn mel_spectrogram_uses_cached_filter_bank_r1_structural() {
+fn mel_spectrogram_uses_cached_filter_bank() {
   // Source of `mlxrs/src/audio/dsp.rs` — `include_str!` resolves
   // relative to THIS test file at `mlxrs/tests/audio_dsp.rs`.
   let src = include_str!("../src/audio/dsp.rs");
@@ -359,7 +359,7 @@ fn mel_spectrogram_uses_cached_filter_bank_r1_structural() {
 
   assert!(
     body.contains("mel_filter_bank_cached("),
-    "Codex P7 R1 MEDIUM regression: `mel_spectrogram` must invoke \
+    "regression: `mel_spectrogram` must invoke \
      `mel_filter_bank_cached(...)` (per-thread LRU cache), not the \
      uncached `mel_filter_bank(...)`. Function body was:\n{body}"
   );
@@ -386,7 +386,7 @@ fn mel_spectrogram_uses_cached_filter_bank_r1_structural() {
     .count();
   assert_eq!(
     uncached_calls, 0,
-    "Codex P7 R1 MEDIUM regression: `mel_spectrogram` body must NOT \
+    "regression: `mel_spectrogram` body must NOT \
      contain any direct `mel_filter_bank(` call; only the cached \
      variant `mel_filter_bank_cached(` is allowed. Found {uncached_calls} \
      uncached call(s).\nBody:\n{body}"

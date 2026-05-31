@@ -10,8 +10,7 @@
 //!   `#[ignore]`). Smoke-test the cpal-driven `AudioPlayer`
 //!   end-to-end on a real default output device.
 //!
-//! NO `peak_memory()` magnitude asserts (per the project's
-//! `[[feedback_no_global_peak_memory_assert]]` rule).
+//! NO `peak_memory()` magnitude asserts.
 
 #![cfg(feature = "audio")]
 
@@ -96,7 +95,7 @@ impl AudioOutputStream for RecordingSink {
 #[test]
 fn playback_config_default_sample_rate_matches_swift_default() {
   // Swift `MLXAudioUI` voice-pipeline default is 24 kHz; the mlxrs
-  // `PlaybackConfig::default` should match so the A8 pipeline
+  // `PlaybackConfig::default` should match so the voice pipeline
   // composes without spelling out the rate.
   let cfg = PlaybackConfig::default();
   assert_eq!(cfg.sample_rate(), 24_000);
@@ -121,7 +120,7 @@ fn playback_config_stereo_constructor() {
   let cfg = PlaybackConfig::stereo(44_100);
   assert_eq!(cfg.channels(), ChannelLayout::Stereo);
   assert_eq!(cfg.channels().count(), 2);
-  // F4: `queue_capacity_frames` is in FRAMES (not samples), same
+  // `queue_capacity_frames` is in FRAMES (not samples), same
   // unit across mono and stereo. The player's `with_device`
   // constructor does the single frame-to-sample conversion via
   // `* channels.count()`; `stereo()` MUST NOT pre-multiply (doing
@@ -132,11 +131,11 @@ fn playback_config_stereo_constructor() {
 
 #[test]
 fn playback_config_stereo_queue_capacity_is_frames_not_samples() {
-  // F4 regression: pre-fix the stereo constructor stored
-  // `sample_rate * 4 * 2` and `with_device` then multiplied by
-  // channel count again — yielding 8 seconds of stereo capacity
-  // for what's advertised as 4 seconds. Post-fix the stored value
-  // is in frames and matches the mono constructor's unit.
+  // Regression: a stereo constructor that stored
+  // `sample_rate * 4 * 2` while `with_device` multiplied by channel
+  // count again would yield 8 seconds of stereo capacity for what's
+  // advertised as 4 seconds. The stored value is in frames and
+  // matches the mono constructor's unit.
   let cfg = PlaybackConfig::stereo(48_000);
   // 4 seconds @ 48 kHz = 192_000 frames (NOT 384_000 samples).
   assert_eq!(cfg.queue_capacity_frames(), 192_000);
@@ -149,7 +148,7 @@ fn playback_config_stereo_queue_capacity_is_frames_not_samples() {
 
 #[test]
 fn playback_config_mono_queue_capacity_is_frames_not_samples() {
-  // F4 invariant: the mono path is the unit-of-truth — frames are
+  // Invariant: the mono path is the unit-of-truth — frames are
   // frames whether the channel count is 1 or N. For mono,
   // `queue_capacity_frames * 1 == queue_capacity_frames`, which is
   // a degenerate case but pins the contract.
@@ -272,7 +271,7 @@ fn audio_output_stream_overflow_returns_err() {
 
 #[test]
 fn audio_player_write_chunk_max_splits_large_writes() {
-  // F2 contract: producer-side `write_samples` splits payloads
+  // Contract: producer-side `write_samples` splits payloads
   // larger than `WRITE_CHUNK_MAX` into per-chunk lock acquisitions
   // so the cpal callback's `try_lock` window is bounded by
   // `WRITE_CHUNK_MAX` samples (microseconds-scale `extend`), not
@@ -334,17 +333,16 @@ fn audio_player_rejects_non_f32_sample_format_pre_device() {
 
 #[test]
 fn audio_player_queue_capacity_frames_multiplied_by_channels() {
-  // F4 post-fix semantics: `queue_capacity_frames` is the frame
-  // count (constant across channel layouts); the player's
-  // `with_device` constructor does the single frame-to-sample
-  // conversion via `* channels.count()`. So a stereo config with
-  // `queue_capacity_frames = 1024` admits exactly 2048 interleaved
-  // L/R samples before overflow — NOT 4096 (the pre-fix bug
-  // double-counted the channel multiplier in the `stereo()`
-  // constructor; the assertion below is the post-fix unit-of-truth
-  // for both mono and stereo, set via an explicit-field struct
-  // literal so the constructor's frame/sample convention can't mask
-  // a future regression).
+  // `queue_capacity_frames` is the frame count (constant across
+  // channel layouts); the player's `with_device` constructor does the
+  // single frame-to-sample conversion via `* channels.count()`. So a
+  // stereo config with `queue_capacity_frames = 1024` admits exactly
+  // 2048 interleaved L/R samples before overflow — NOT 4096 (which is
+  // what double-counting the channel multiplier in the `stereo()`
+  // constructor would yield). The assertion below is the unit-of-truth
+  // for both mono and stereo, set via an explicit-field struct literal
+  // so the constructor's frame/sample convention can't mask a future
+  // regression.
   let stereo = PlaybackConfig::new(16_000, ChannelLayout::Stereo, SampleFormat::F32)
     .with_queue_capacity_frames(1024);
   assert_eq!(
@@ -436,7 +434,7 @@ fn audio_player_buffer_overflow_returns_err() {
   let cfg = PlaybackConfig::new(16_000, ChannelLayout::Mono, SampleFormat::F32)
     .with_queue_capacity_frames(1024);
   let mut player = AudioPlayer::new(cfg).unwrap();
-  // F1: writes pre-`start()` are rejected (STATE_STOPPED is the
+  // Writes pre-`start()` are rejected (STATE_STOPPED is the
   // initial state, and the write-gate is "reject when STOPPED").
   // Transition to STATE_PAUSED via start()+pause() so writes are
   // accepted but the cpal callback's STATE_RUNNING guard prevents
@@ -508,7 +506,7 @@ fn audio_player_store_volume_clamps_and_persists() {
 #[test]
 #[ignore = "requires real default audio output device"]
 fn audio_output_stream_rejects_writes_after_stop() {
-  // F1: terminal-state contract. After `stop()` returns,
+  // Terminal-state contract. After `stop()` returns,
   // `write_samples` MUST reject — late producer chunks MUST NOT
   // accumulate silently and replay on a later restart.
   use mlxrs::audio::playback::AudioPlayer;
@@ -538,26 +536,27 @@ fn audio_output_stream_rejects_writes_after_stop() {
 }
 
 // ---------------------------------------------------------------------------
-// F1 (HIGH) — one-way `terminated` latch independent of playback state
+// One-way `terminated` latch independent of playback state
 // ---------------------------------------------------------------------------
 //
-// Pre-R2 fix, `write_samples`' STATE_STOPPED gate only rejected while
-// state was CURRENTLY STOPPED, but `start()` unconditionally stored
-// STATE_RUNNING. The sequence `start(); stop(); start();` would slip
-// past the gate and let `write_samples()` resume accepting post-stop
-// chunks — silently violating `AudioOutputStream::stop`'s one-way
-// terminal contract. R2 adds a dedicated `SharedState::terminated`
+// Without the latch, `write_samples`' STATE_STOPPED gate would reject
+// only while state is CURRENTLY STOPPED, while `start()` unconditionally
+// stores STATE_RUNNING. The sequence `start(); stop(); start();` would
+// then slip past the gate and let `write_samples()` resume accepting
+// post-stop chunks — silently violating `AudioOutputStream::stop`'s
+// one-way terminal contract. A dedicated `SharedState::terminated`
 // AtomicBool latch (set in `stop()`, checked FIRST in every producer
-// method); these tests pin the new contract on a real device.
+// method) closes this; these tests pin the contract on a real device.
 
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires real default audio output device"]
 fn audio_player_start_after_stop_returns_terminated_err() {
-  // F1: `start(); stop(); start()` — the second `start()` MUST
-  // reject with a "terminated" InvariantViolation error rather than re-arm the
-  // player. Pre-R2 this returned Ok(()) and silently rehydrated the
-  // producer surface.
+  // `start(); stop(); start()` — the second `start()` MUST
+  // reject with a "terminated" InvariantViolation error rather than
+  // re-arm the player. Without the terminated latch the second
+  // `start()` would return Ok(()) and silently rehydrate the producer
+  // surface.
   use mlxrs::audio::playback::AudioPlayer;
 
   let mut player = AudioPlayer::new(PlaybackConfig::mono(16_000)).unwrap();
@@ -580,13 +579,13 @@ fn audio_player_start_after_stop_returns_terminated_err() {
 #[test]
 #[ignore = "requires real default audio output device"]
 fn audio_player_write_samples_after_restart_attempt_still_rejected() {
-  // F1 hardening: even if a caller IGNORES the `start()`-after-stop
+  // Hardening: even if a caller IGNORES the `start()`-after-stop
   // Err and pushes samples anyway, `write_samples` MUST still reject
   // (the terminated latch is checked FIRST, before the state
-  // tri-state). This is the regression test for the exact attack the
-  // R2 fix is closing: `start(); stop(); start(); write_samples()`
-  // pre-fix slipped past `state == STATE_STOPPED` because the second
-  // `start()` re-armed state to STATE_RUNNING.
+  // tri-state). This guards the exact path the latch closes:
+  // `start(); stop(); start(); write_samples()` would otherwise slip
+  // past `state == STATE_STOPPED` because the second `start()` re-arms
+  // state to STATE_RUNNING.
   use mlxrs::audio::playback::AudioPlayer;
 
   let mut player = AudioPlayer::new(PlaybackConfig::mono(16_000)).unwrap();
@@ -613,7 +612,7 @@ fn audio_player_write_samples_after_restart_attempt_still_rejected() {
 #[test]
 #[ignore = "requires real default audio output device"]
 fn audio_player_pause_after_stop_returns_terminated_err() {
-  // F1: `pause()` after `stop()` MUST reject — same terminated-latch
+  // `pause()` after `stop()` MUST reject — same terminated-latch
   // rule as `start()`. Without this, a caller could `start();
   // stop(); pause()` and surprise the state machine.
   use mlxrs::audio::playback::AudioPlayer;
@@ -638,7 +637,7 @@ fn audio_player_pause_after_stop_returns_terminated_err() {
 #[test]
 #[ignore = "requires real default audio output device"]
 fn audio_player_resume_after_stop_returns_terminated_err() {
-  // F1: `resume()` after `stop()` MUST reject. Resume delegates to
+  // `resume()` after `stop()` MUST reject. Resume delegates to
   // `start()` internally but the dedicated `resume`-named error
   // message keeps the call-site signal clear.
   use mlxrs::audio::playback::AudioPlayer;
@@ -660,34 +659,31 @@ fn audio_player_resume_after_stop_returns_terminated_err() {
 }
 
 // ---------------------------------------------------------------------------
-// F2 (MEDIUM) — queue pre-allocation at construction, NO per-chunk realloc
+// Queue pre-allocation at construction, NO per-chunk realloc
 // ---------------------------------------------------------------------------
 //
-// Pre-R2, `write_samples`' producer loop called `q.reserve_exact(chunk.len())`
-// under the queue lock on every chunk — if the underlying VecDeque needed to
-// grow past its initial capacity, the allocator path ran inside the lock and
-// the cpal callback's `try_lock` would see WouldBlock for allocator time too
-// (not just `extend`). R2 pre-allocates the full bounded
+// If `write_samples`' producer loop called `q.reserve_exact(chunk.len())`
+// under the queue lock on every chunk and the underlying VecDeque needed to
+// grow past its initial capacity, the allocator path would run inside the lock
+// and the cpal callback's `try_lock` would see WouldBlock for allocator time
+// too (not just `extend`). The queue therefore pre-allocates the full bounded
 // `queue_capacity_samples` at construction (via `try_reserve_exact` so alloc
-// failure surfaces as `Error::AllocFailure`) and removes the per-chunk
-// `reserve_exact`. The two F2 invariant tests
+// failure surfaces as `Error::AllocFailure`) and does no per-chunk
+// `reserve_exact`. The two invariant tests
 // (`audio_player_pre_allocates_queue_capacity_at_construction` +
 // `audio_player_write_samples_does_not_grow_queue_capacity_during_playback`)
-// were previously here and used `pub #[doc(hidden)] _test_*` accessors on
-// `AudioPlayer` to reach the private VecDeque capacity. The R3 MEDIUM fix
-// removes those leaked-public accessors and moves the tests INTO
-// `mlxrs/src/audio/playback/player.rs`'s `#[cfg(test)] mod tests` block,
-// where they can read `shared.queue.capacity()` +
+// live in `mlxrs/src/audio/playback/player.rs`'s `#[cfg(test)] mod tests`
+// block, where they can read `shared.queue.capacity()` +
 // `shared.queue_capacity_samples` directly without any `pub` surface.
 
-// F3 tests exercise the pure `sanitize_volume` helper directly so
+// These tests exercise the pure `sanitize_volume` helper directly so
 // they run in CI without a default audio output device. The
 // device-touching round-trip is exercised in
 // `audio_player_store_volume_clamps_and_persists` (real-device gate).
 
 #[test]
 fn audio_player_store_volume_sanitizes_nan_to_zero() {
-  // F3: NaN must NOT propagate into volume_bits — the callback's
+  // NaN must NOT propagate into volume_bits — the callback's
   // `sample * volume` would emit NaN PCM (audible as full-scale
   // noise on most DACs). `f32::clamp` preserves NaN, so the
   // sanitizer explicitly maps non-finite inputs to 0.0.
@@ -702,7 +698,7 @@ fn audio_player_store_volume_sanitizes_nan_to_zero() {
 
 #[test]
 fn audio_player_store_volume_sanitizes_infinity_to_zero() {
-  // F3: positive and negative infinity are both non-finite and
+  // Positive and negative infinity are both non-finite and
   // must sanitize to 0.0 (same policy as NaN — `f32::clamp` on +∞
   // returns 1.0, which is the wrong semantic for "you gave us
   // garbage"; we treat all non-finite inputs uniformly).
@@ -720,7 +716,7 @@ fn audio_player_store_volume_sanitizes_infinity_to_zero() {
 
 #[test]
 fn audio_player_store_volume_clamps_negative_to_zero() {
-  // F3: negative finite values are clamped (not sanitized) — the
+  // Negative finite values are clamped (not sanitized) — the
   // existing `clamp(0.0, 1.0)` path handles this. Explicit test so
   // a future regression (e.g. dropping the clamp in favor of the
   // is_finite branch) is caught.
@@ -731,7 +727,7 @@ fn audio_player_store_volume_clamps_negative_to_zero() {
 
 #[test]
 fn audio_player_store_volume_passes_through_in_range() {
-  // F3 sanity: finite in-range values pass through unchanged.
+  // Sanity: finite in-range values pass through unchanged.
   assert_eq!(sanitize_volume(0.0), 0.0);
   assert_eq!(sanitize_volume(0.5), 0.5);
   assert_eq!(sanitize_volume(1.0), 1.0);
@@ -739,7 +735,7 @@ fn audio_player_store_volume_passes_through_in_range() {
 
 #[test]
 fn audio_player_store_volume_clamps_above_unity() {
-  // F3: finite values >1.0 clamp to 1.0 (not sanitized to 0.0 —
+  // Finite values >1.0 clamp to 1.0 (not sanitized to 0.0 —
   // they're well-formed, just out of range).
   assert_eq!(sanitize_volume(1.5), 1.0);
   assert_eq!(sanitize_volume(100.0), 1.0);

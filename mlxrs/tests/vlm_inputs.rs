@@ -200,19 +200,18 @@ fn prepare_inputs_uniform_no_padding_needed() {
   assert!(mask.iter().all(|&b| b));
 }
 
-// ──────────────────────── V4 R1: attention_mask threading ─────────────────
+// ──────────────────────── V4: attention_mask threading ─────────────────
 //
-// Finding 3 regressions — caller-supplied attention_mask must override
-// the internal "every-token-true" computation so pre-padded uniform
-// batches survive into the output with their padding positions marked
-// `false`.
+// Caller-supplied attention_mask must override the internal
+// "every-token-true" computation so pre-padded uniform batches survive
+// into the output with their padding positions marked `false`.
 
 #[test]
 fn prepare_inputs_caller_supplied_attention_mask_overrides_default() {
   // Pre-padded uniform batches (length 4) with the LAST 2 positions of
   // batch a being pre-pads (caller's mask: [true,true,false,false]).
-  // Pre-fix: the internal step marked every position true. Post-fix:
-  // the caller's mask is threaded through.
+  // A naive internal step would mark every position true; instead the
+  // caller's mask is threaded through.
   let a = [10_u32, 20, 0, 0]; // last 2 = caller's pre-pads
   let b = [30_u32, 40, 50, 60]; // all real tokens
   let batches: &[&[u32]] = &[&a, &b];

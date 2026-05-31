@@ -65,11 +65,11 @@ fn closure_drop_releases_ffi_handle() {
 /// destructor runs `destroy_payload(payload)` as part of stack unwinding
 /// before the `catch` clause hands back a NULL closure.
 ///
-/// Pre-fix the Rust safe wrapper reclaimed the payload via
-/// `Box::from_raw(payload_ptr.cast())` on the NULL-ctx path; that produced
-/// a double-free / UAF on the OOM-then-NULL-return path. Post-fix the
-/// reclaim is removed (mlx-c's shared_ptr owns the payload after the call
-/// returns regardless of success / failure).
+/// A naive Rust safe wrapper would reclaim the payload via
+/// `Box::from_raw(payload_ptr.cast())` on the NULL-ctx path; that would
+/// produce a double-free / UAF on the OOM-then-NULL-return path. The
+/// reclaim is therefore omitted (mlx-c's shared_ptr owns the payload after
+/// the call returns regardless of success / failure).
 ///
 /// We can't deterministically inject an OOM at the C++ ctor without a
 /// custom shim. This test exercises the success path many times under the
@@ -144,7 +144,7 @@ fn closure_outlives_construction_scope() {
 
 // ──────────────────────── value_and_grad / grad ────────────────────────
 
-/// F2 contract: empty `argnums` must be rejected at the safe-wrapper
+/// Empty `argnums` must be rejected at the safe-wrapper
 /// boundary. mlx-c's `mlx_value_and_grad` would receive a NULL data
 /// pointer alongside `argnums_num == 0` and build
 /// `std::vector<int>(NULL, NULL + 0)` — pointer arithmetic on NULL is
@@ -233,17 +233,17 @@ fn grad_composition_yields_second_derivative() {
   assert!(approx_eq(grads[0].item::<f32>().unwrap(), 12.0, 1e-4));
 }
 
-// ───────────────────── F3: user error/panic propagation ─────────────────────
+// ───────────────────── user error/panic propagation ─────────────────────
 
-/// F3 contract: a user closure that returns `Err` must surface that
+/// A user closure that returns `Err` must surface that
 /// SAME error through `grad` / `value_and_grad`'s outer return — NOT
 /// mlx-c's generic "mlx_closure returned a non-zero value" wrapper.
 ///
-/// Pre-fix, mlx-c's outer catch in `mlx_closure_*_apply` re-entered our
-/// global error handler with the wrapper text after the trampoline had
-/// already stashed the user's `Err` in TLS via `set_last`, overwriting
-/// the user payload. Post-fix the handler preserves a trampoline-set
-/// error when the incoming message matches the
+/// Without the guard, mlx-c's outer catch in `mlx_closure_*_apply`
+/// re-enters our global error handler with the wrapper text after the
+/// trampoline has already stashed the user's `Err` in TLS via `set_last`,
+/// overwriting the user payload. The handler therefore preserves a
+/// trampoline-set error when the incoming message matches the
 /// `mlx_closure*…returned a non-zero value` wrapper shape.
 #[test]
 fn closure_user_error_propagates_through_grad() {
@@ -268,12 +268,12 @@ fn closure_user_error_propagates_through_grad() {
   );
 }
 
-/// F3 contract (panic case): a user closure that panics must surface a
+/// Panic case: a user closure that panics must surface a
 /// Rust-side error mentioning the panic payload + that the trampoline
 /// caught a panic — NOT mlx-c's generic wrapper text. The trampoline
 /// catches via `catch_unwind` so the panic never crosses the
 /// `extern "C"` boundary (which would be UB); the panic message is
-/// stashed in TLS via `set_last`, and the F3 preserve-check ensures it
+/// stashed in TLS via `set_last`, and the preserve-check ensures it
 /// survives mlx-c's subsequent wrapper invocation of the handler.
 #[test]
 fn closure_user_panic_propagates_through_grad_as_error() {
@@ -350,14 +350,14 @@ fn custom_vjp_overrides_autograd() {
 ///
 /// Upstream `mlx/primitives.cpp::CustomTransforms::vjp` invokes the user
 /// VJP callback positionally as `vjp_fun_(inputs, cotangents, outputs)`.
-/// A pre-fix transposition in `transforms::closure::trampoline_custom`
-/// bound the slots as `(primals, outputs, cotangents)` — semantically
+/// A transposition in `transforms::closure::trampoline_custom` that bound
+/// the slots as `(primals, outputs, cotangents)` would be semantically
 /// wrong for every downstream `custom_vjp` user (the closure would treat
 /// the cotangent vector as the forward outputs and vice versa).
 ///
-/// The fix (commit b9842b0) corrected the trampoline to bind
-/// `(primals, cotangents, outputs)`, matching mlx core. This test pins
-/// that ABI by constructing a backward closure whose return value depends
+/// The trampoline binds `(primals, cotangents, outputs)`, matching mlx
+/// core. This test pins that ABI by constructing a backward closure whose
+/// return value depends
 /// DISTINCTLY on each of `primals[0]`, `cotangents[0]`, and `outputs[0]`,
 /// so any future regression swapping the cotangent / output slots is
 /// caught deterministically in routine CI (this test is intentionally
@@ -374,9 +374,9 @@ fn custom_vjp_overrides_autograd() {
 /// Correct slot binding `(primals, cotangents, outputs)` yields:
 ///   `2.0 * 10.0 + 9.0 + 3.0 * 1000.0 = 3029.0`
 ///
-/// If the slots were swapped to the pre-fix `(primals, outputs,
-/// cotangents)`, the closure would receive `cotangents = [9.0]` and
-/// `outputs = [2.0]`, yielding:
+/// If the slots were swapped to `(primals, outputs, cotangents)`, the
+/// closure would receive `cotangents = [9.0]` and `outputs = [2.0]`,
+/// yielding:
 ///   `9.0 * 10.0 + 2.0 + 3.0 * 1000.0 = 3092.0` — a deterministic
 /// 63-unit gap that fails the assertion below.
 #[test]
@@ -405,12 +405,12 @@ fn custom_vjp_trampoline_argument_order_regression() {
 
   // Correct trampoline order: 2 * 10 + 9 + 3 * 1000 = 3029.
   let expected = 3029.0_f32;
-  // Pre-fix swapped order would yield: 9 * 10 + 2 + 3 * 1000 = 3092 (delta 63).
+  // A swapped order would yield: 9 * 10 + 2 + 3 * 1000 = 3092 (delta 63).
   let swapped_value = 3092.0_f32;
   assert!(
     approx_eq(got, expected, 1e-3),
     "trampoline arg order regression: got {got}, expected {expected} \
-     (a value near {swapped_value} would indicate the pre-fix \
+     (a value near {swapped_value} would indicate a \
      `(primals, outputs, cotangents)` slot ordering has been reintroduced)"
   );
 }

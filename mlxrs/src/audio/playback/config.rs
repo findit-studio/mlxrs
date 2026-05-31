@@ -30,7 +30,7 @@
 /// formats so a future caller can negotiate a different format with
 /// the device, but the shipping [`super::player::AudioPlayer`] path
 /// only emits [`SampleFormat::F32`]; the variants are reserved for
-/// future format-conversion work (out of scope for A11).
+/// future format-conversion work (out of scope).
 #[derive(
   Debug, Clone, Copy, PartialEq, Eq, Default, derive_more::Display, derive_more::IsVariant,
 )]
@@ -40,10 +40,10 @@ pub enum SampleFormat {
   /// only variant currently constructed by [`super::player::AudioPlayer`]).
   #[default]
   F32,
-  /// 16-bit signed interleaved integer. Reserved — A11 does not
+  /// 16-bit signed interleaved integer. Reserved — this crate does not
   /// convert to this format; callers must supply f32 PCM.
   I16,
-  /// 16-bit unsigned interleaved integer. Reserved — A11 does not
+  /// 16-bit unsigned interleaved integer. Reserved — this crate does not
   /// convert to this format; callers must supply f32 PCM.
   U16,
 }

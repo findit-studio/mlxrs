@@ -1,4 +1,4 @@
-//! Smoke tests for the Phase 3.5 archetype templates.
+//! Smoke tests for the archetype templates.
 //! Each test exercises one canonical wrapping pattern.
 
 use mlxrs::{Array, ops};

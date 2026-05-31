@@ -115,7 +115,7 @@ fn quantize_mxfp4_is_bias_less_and_round_trips() {
   let w = sample_matrix(); // [8, 128]
   let (w_q, scales, biases) = quantized::quantize(&w, MXFP4_GS, MXFP4_BITS, "mxfp4", None).unwrap();
 
-  // The whole point of F1: bias-less float modes return only (w_q, scales).
+  // The whole point: bias-less float modes return only (w_q, scales).
   assert!(
     biases.is_none(),
     "mxfp4 is bias-less: quantize must return biases == None"

@@ -1,4 +1,4 @@
-//! HF/Transformers chat-template extension parity (Codex round-6).
+//! HF/Transformers chat-template extension parity.
 //!
 //! Transformers' `_cached_compile_jinja_template` builds the jinja env as
 //! `ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
@@ -6,7 +6,7 @@
 //! `strftime_now(fmt) = datetime.now().strftime(fmt)`. Two facts gate
 //! prompt-byte parity for a whole class of real HF templates:
 //!
-//!  * F1 — `AssistantTracker` provides a custom `{% generation %}` /
+//!  * `AssistantTracker` provides a custom `{% generation %}` /
 //!    `{% endgeneration %}` block tag. Its only job is the *training-only*
 //!    `return_assistant_tokens_mask`; for inference the block is
 //!    semantically transparent (jinja2 renders the body, the tags emit
@@ -16,10 +16,9 @@
 //!    *identical* template strings through the real Transformers reference
 //!    (`transformers.utils.chat_template_utils._compile_jinja_template`,
 //!    transformers 5.8.1 / jinja2 3.1.6 — `AssistantTracker` active,
-//!    rendering the body and emitting nothing for the tags), exactly as the
-//!    round-5 agent derived parity bytes.
+//!    rendering the body and emitting nothing for the tags).
 //!
-//!  * F2 — `strftime_now` must format *local naive now* per Python
+//!  * `strftime_now` must format *local naive now* per Python
 //!    `strftime`, not return `""` (real Llama-3.x system prompts embed
 //!    `{{ strftime_now('%Y-%m-%d') }}`). Implemented via `jiff`. The
 //!    formatting is factored through `strftime_at(fixed_civil_dt, fmt)` so
@@ -47,7 +46,7 @@ fn render_gp(template: &str, messages: &Value, add_gen: bool, bos: Option<&str>)
 }
 
 // ---------------------------------------------------------------------------
-// F1 — `{% generation %}` / `{% endgeneration %}` rewrite (AssistantTracker)
+// `{% generation %}` / `{% endgeneration %}` rewrite (AssistantTracker)
 // ---------------------------------------------------------------------------
 
 /// Realistic HF shape: the assistant turn is wrapped in a generation block
@@ -160,7 +159,7 @@ fn generation_block_spacing_variants_recognized() {
 }
 
 // ---------------------------------------------------------------------------
-// F1 (Codex round-7) — `{% generation %}` rewrite must be Jinja
+// `{% generation %}` rewrite must be Jinja
 // context-aware: a `{% generation %}` *inside* a `{% raw %}` block is LITERAL
 // text in jinja2/Transformers (AssistantTracker never sees it) and must NOT
 // be rewritten; a non-target tag whose content merely contains the substring
@@ -215,7 +214,7 @@ fn generation_inside_ws_control_raw_block_matches_transformers() {
 /// feeding the byte-identical post-rewrite template to *both* engines). That
 /// is out of scope to fix and is intentionally not what this contract test
 /// asserts; this single-line shape renders byte-identically in minijinja and
-/// jinja2 while still proving the round-7 raw-context contract. Reference
+/// jinja2 while still proving the raw-context contract. Reference
 /// (transformers 5.8.1 / jinja2 3.1.6, AssistantTracker active):
 ///   render(messages=[{user,hi},{assistant,"hello there"}],
 ///          bos_token="<s>", add_generation_prompt=False|True)
@@ -273,12 +272,13 @@ fn quoted_generation_string_then_real_generation_tag_matches_transformers() {
 }
 
 // ---------------------------------------------------------------------------
-// F1 (Codex round-8) — the rewrite is now a COMPLETE Jinja delimiter
+// the rewrite is now a COMPLETE Jinja delimiter
 // pre-lexer: a `{% generation %}`-looking sequence inside a `{{ … }}`
 // expression string literal or a `{# … #}` comment is NOT a statement tag in
 // jinja2/Transformers and must be copied through byte-for-byte verbatim
-// (round-7 only guarded `{% raw %}` + non-target `{% … %}` tags and would
-// corrupt these). Every expected string below was produced by rendering the
+// (the earlier rewrite only guarded `{% raw %}` + non-target `{% … %}` tags
+// and would corrupt these). Every expected string below was produced by
+// rendering the
 // IDENTICAL template through the real reference
 // `transformers.utils.chat_template_utils._compile_jinja_template`
 // (venv `transformers==5.8.1 jinja2==3.1.6`, `AssistantTracker` active).
@@ -370,7 +370,7 @@ fn comment_text_inside_expression_and_mixed_constructs_matches_transformers() {
 }
 
 // ---------------------------------------------------------------------------
-// F1 (Codex round-9) — Jinja `+` whitespace-control parity. jinja2 3.1.6's
+// Jinja `+` whitespace-control parity. jinja2 3.1.6's
 // generic `block_begin` regex accepts `{%(\-|\+|)…(\-|\+|)%}`: `-` strips,
 // `+` *explicitly keeps* (overriding trim_blocks/lstrip_blocks), none =
 // default. Transformers parses `generation` with the standard jinja2 parser,
@@ -468,7 +468,7 @@ fn raw_plus_ws_control_block_is_literal_matches_transformers() {
 }
 
 // ---------------------------------------------------------------------------
-// F2 (Codex round-9) — `{% raw %}` is a pure raw-text region: ALL interior
+// `{% raw %}` is a pure raw-text region: ALL interior
 // `{%`/`{{`/`{#`/quotes are literal raw body, not tags. The old `find_endraw`
 // parsed every interior `{% … %}` as a tag and skipped past non-endraw ones,
 // so an interior unterminated-looking `{% foo` swallowed the real
@@ -534,7 +534,7 @@ fn raw_interior_mixed_constructs_and_ws_control_endraw_matches_transformers() {
 }
 
 // ---------------------------------------------------------------------------
-// F2 — strftime_now via jiff (injectable fixed-clock seam: strftime_at)
+// strftime_now via jiff (injectable fixed-clock seam: strftime_at)
 // ---------------------------------------------------------------------------
 
 /// `strftime_at(fixed, fmt)` must equal exactly what CPython
@@ -568,7 +568,7 @@ fn strftime_at_matches_python_datetime_strftime() {
   assert_eq!(s("100%% %Y"), "100% 2024");
 }
 
-/// Codex round-15: an untrusted `chat_template` must not panic the process
+/// An untrusted `chat_template` must not panic the process
 /// via `strftime_now`. `%z`/`%Z` on a naive datetime → CPython `""`;
 /// `%%z` is the literal text `%z` (not stripped); an unknown directive is a
 /// *recoverable* error, never a panic/abort.

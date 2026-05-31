@@ -1,4 +1,4 @@
-//! M3 WS-C PR-2 — model-load support surface (`lm::load`).
+//! Model-load support surface (`lm::load`).
 //!
 //! Mirrors the existing `mlxrs/tests` style: integration tests reachable from
 //! outside the crate, gated on the `lm` umbrella (which pulls the
@@ -47,7 +47,7 @@ const FULL_CONFIG_JSON: &str = r#"{
   "some_future_key": [1, 2, 3]
 }"#;
 
-// ───────────────────────── Task 2.1: Config serde ─────────────────────────
+// ───────────────────────── Config serde ─────────────────────────
 
 #[test]
 fn config_parses_minimal_and_ignores_extra() {
@@ -122,7 +122,7 @@ fn config_invalid_json_is_parse_error() {
   );
 }
 
-// ─────────── Task 2.2: Weights — sharded merge + quantized triples ───────────
+// ─────────── Weights — sharded merge + quantized triples ───────────
 
 fn small(v: &[f32], shape: (usize, usize)) -> Array {
   Array::from_slice(v, &shape).unwrap()
@@ -203,7 +203,7 @@ fn weights_missing_is_file_io_error() {
   );
 }
 
-// ───────────────────────── Task 2.3: load() wiring ─────────────────────────
+// ───────────────────────── load() wiring ─────────────────────────
 
 fn write_model_dir(name: &str) -> PathBuf {
   let dir = temp_dir(name);
@@ -284,7 +284,7 @@ fn loadable(name: &str) -> PathBuf {
   d
 }
 
-/// Codex #30 [high]: HF Hub snapshot dirs store `model*.safetensors` as
+/// HF Hub snapshot dirs store `model*.safetensors` as
 /// symlinks into `blobs/<hash>`. `collect_sorted` must resolve the symlink
 /// (via `fs::metadata`, which follows links) and load it — not skip it as a
 /// non-regular `DirEntry::file_type()`.
@@ -320,7 +320,7 @@ fn load_follows_symlinked_weights_hf_snapshot_layout() {
   assert_eq!(arr.shape(), vec![2, 2]);
 }
 
-/// Codex #30: faithful mlx-lm eos resolution. `mlx_lm.utils.load_config`
+/// Faithful mlx-lm eos resolution. `mlx_lm.utils.load_config`
 /// uses `config.json`'s `eos_token_id` as the base, a *truthy*
 /// `generation_config.json` `eos_token_id` OVERWRITES it, and the result is
 /// passed to `TokenizerWrapper` as the COMPLETE set — `set(eos_token_ids)`
@@ -356,7 +356,7 @@ fn load_resolves_eos_set_replace_not_merge() {
     !base.is_empty(),
     "fixture tokenizer must have its own eos for the replace guard"
   );
-  // Codex #30 r4: assert the tokenizer eos set AND the returned
+  // Assert the tokenizer eos set AND the returned
   // `Config.eos_token_id` TOGETHER for every case — Python overwrites
   // `config["eos_token_id"]` in place, so they must never disagree.
 

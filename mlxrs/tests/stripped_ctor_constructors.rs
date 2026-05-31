@@ -1,4 +1,4 @@
-//! Smoke test for issue #215 / Codex P9-r2 finding — verifies that
+//! Smoke test for issue #215 — verifies that
 //! every public `mlxrs::Array` constructor in `array::construction`
 //! returns normally (rather than process-exiting) in a stripped-ctor
 //! environment (eager `#[ctor]` install skipped, e.g. older rustc,

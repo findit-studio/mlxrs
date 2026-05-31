@@ -80,9 +80,9 @@
 //! [`preprocess`] composes the full chain off a decoded
 //! [`image::DynamicImage`] + an [`ImageProcessorConfig`].
 //!
-//! ## P8 polish bundle closure (#120 / #121 / #122 / #123 / #124 / #125 / #126)
+//! ## Related issues (#120 / #121 / #122 / #123 / #124 / #125 / #126)
 //!
-//! - **VLM-1 (#120)** — opt-in planar layout: addressed via
+//! - **#120** — opt-in planar layout: addressed via
 //!   [`ImageProcessorConfig::layout`] (a [`Layout`] enum defaulting to
 //!   `Hwc`, with `Chw` / `Bchw` for planar). Pre-existing callers see
 //!   no change (`Hwc` is the identity arm); per-model encoders that
@@ -91,14 +91,14 @@
 //!   composer applies one lazy `transpose_axes` + `expand_dims_axes` at
 //!   zero memory cost. See [`Layout`] for the per-arm rationale +
 //!   parity citations.
-//! - **VLM-3 (#121)** — bulk-fill widen in [`image_to_array`]:
-//!   addressed via the C3 (`rgb_widen`) / C4 (`bgr_widen`) NEON
+//! - **#121** — bulk-fill widen in [`image_to_array`]:
+//!   addressed via the `rgb_widen` / `bgr_widen` NEON
 //!   dispatchers wired into BOTH the `as_rgb8()` fast path AND the
 //!   non-`Rgb8` per-pixel-projection path (the latter builds a
 //!   contiguous `Vec<u8>` of length `H*W*3` then hands it to the same
 //!   SIMD dispatcher — the per-pixel `push` overhead the issue called
 //!   out is gone). See [`image_to_array`] for the per-branch wiring.
-//! - **VLM-5 (#122)** — SIMD resize: closed via the own
+//! - **#122** — SIMD resize: closed via the own
 //!   `vlm::resize` kernel (not `fast_image_resize`).
 //!   The issue's original ask was to adopt `fast_image_resize`; the
 //!   subsequent allocation-discipline audit showed `fast_image_resize`
@@ -109,13 +109,12 @@
 //!   internal buffer through `try_reserve_exact`, so the
 //!   recoverable-OOM contract is honest end-to-end. See [`resize`] for
 //!   the per-buffer fallibility breakdown.
-//! - **VLM-6 (#123)** — hand-written SIMD u8→f32 + BGR-swap:
-//!   addressed via the C3 (`rgb_widen` — 16-byte tile `vld1q_u8` + 4×
-//!   `vst1q_f32`) and C4 (`bgr_widen` — 16-pixel tile `vld3q_u8` +
+//! - **#123** — hand-written SIMD u8→f32 + BGR-swap:
+//!   addressed via the `rgb_widen` (16-byte tile `vld1q_u8` + 4×
+//!   `vst1q_f32`) and `bgr_widen` (16-pixel tile `vld3q_u8` +
 //!   permuted `vst3q_f32`) NEON kernels. Both ship unconditionally on
-//!   aarch64 per the project memory rule "SIMD ship NEON regardless"
-//!   (the user directive 2026-05-23 overriding §5.4 of the SIMD doc).
-//! - **VLM-4 (#124)** — fallible-allocation discipline in
+//!   aarch64 ("SIMD ship NEON regardless").
+//! - **#124** — fallible-allocation discipline in
 //!   [`crate::vlm::prompt`]: every production allocation in the splice
 //!   / mask / placeholder paths uses the crate-private
 //!   `error::try_with_capacity` helper (i.e. `try_reserve_exact` under
@@ -124,7 +123,7 @@
 //!   `Vec::with_capacity` in `vlm/prompt.rs` to verify: the only
 //!   matches are inline comments documenting what the new shape
 //!   replaces.
-//! - **VLM-2 (#125)** — byte-budget validation in [`resize`]:
+//! - **#125** — byte-budget validation in [`resize`]:
 //!   addressed via the target-dimension guard (`height * width * 4 <=
 //!   MAX_DECODED_IMAGE_BYTES`) that fires BEFORE any allocation. The
 //!   signature is `-> Result<DynamicImage>` — over-budget / zero /
@@ -132,7 +131,7 @@
 //!   `Error::CapExceeded`, `Error::ArithmeticOverflow`) with the offending
 //!   dims and the cap. See [`resize`]'s "Return type"
 //!   doc paragraph for the full rationale.
-//! - **VLM-7 (#126)** — `to_rgb8()` clone elision in
+//! - **#126** — `to_rgb8()` clone elision in
 //!   [`image_to_array`]: addressed via the `as_rgb8()` fast path
 //!   (borrows the source's backing `&[u8]` directly) + a per-pixel
 //!   `dynamic_image_rgb_pixel` projection on the non-`Rgb8` branch
@@ -140,7 +139,7 @@
 //!   `to_rgb8\|to_rgba8` in `vlm/image.rs` to verify: every match is
 //!   in an inline comment documenting what the new path replaces.
 //!
-//! ## Allocation-fallibility audit (Codex round-5 closure)
+//! ## Allocation-fallibility audit
 //!
 //! Every source-pixel-scaled allocation in this module is classified
 //! below — the table is exhaustive (a `grep` of `to_rgb*` / `to_rgba*`
@@ -148,7 +147,7 @@
 //! / `crop*` / `ImageBuffer::new` / `RgbImage::*` / the own resize
 //! kernel's buffers). The audit splits the guarantee into TWO honest
 //! columns rather than collapsing them into one ambiguous "fallible"
-//! flag (round-5 finding):
+//! flag:
 //!
 //! - **Bounded-memory:** an upper bound on the allocation's byte
 //!   count is enforced before it runs — by [`MAX_DECODED_IMAGE_BYTES`]
@@ -175,15 +174,15 @@
 //!
 //! | Site                                          | Scale         | Caller fn                | Bounded-memory | Recoverable-OOM | Notes                                       |
 //! |-----------------------------------------------|---------------|--------------------------|----------------|-----------------|---------------------------------------------|
-//! | `apply_orientation_fallible` u8 variants (Rotate90/270/+FlipH on Luma8/LumaA8/Rgb8/Rgba8) | source pixels | `load_image` →`Result` | Y (`MAX_DECODED_IMAGE_BYTES`) | **Y** | **FIXED (R5):** manual rotate over `try_reserve_exact`-backed buffer — no second alloc, no probe race |
-//! | `apply_orientation_fallible` non-u8 variants (Luma16/LumaA16/Rgb16/Rgba16/Rgb32F/Rgba32F + rotates) | source pixels | `load_image` →`Result` | Y (`MAX_DECODED_IMAGE_BYTES`) | **Y** | **FIXED (R6):** covered by manual generic rotate via `try_reserve_exact` over `T: Copy` — 16-bit PNGs (`Luma16`/`LumaA16`/`Rgb16`/`Rgba16` per image-rs PNG decoder) and 32-bit-float `DynamicImage` inputs (`Rgb32F`/`Rgba32F`) now route through the same fallible per-element-type buffer path as u8 |
+//! | `apply_orientation_fallible` u8 variants (Rotate90/270/+FlipH on Luma8/LumaA8/Rgb8/Rgba8) | source pixels | `load_image` →`Result` | Y (`MAX_DECODED_IMAGE_BYTES`) | **Y** | **FIXED:** manual rotate over `try_reserve_exact`-backed buffer — no second alloc, no probe race |
+//! | `apply_orientation_fallible` non-u8 variants (Luma16/LumaA16/Rgb16/Rgba16/Rgb32F/Rgba32F + rotates) | source pixels | `load_image` →`Result` | Y (`MAX_DECODED_IMAGE_BYTES`) | **Y** | **FIXED:** covered by manual generic rotate via `try_reserve_exact` over `T: Copy` — 16-bit PNGs (`Luma16`/`LumaA16`/`Rgb16`/`Rgba16` per image-rs PNG decoder) and 32-bit-float `DynamicImage` inputs (`Rgb32F`/`Rgba32F`) now route through the same fallible per-element-type buffer path as u8 |
 //! | `apply_orientation_fallible` (NoTransforms/Flip/Rot180, all variants) | in-place      | `load_image` →`Result`   | Y (in-place)   | Y (no alloc)    | Upstream `*_in_place` path — zero allocation |
-//! | `resize` source RGBA buffer (`try_reserve_exact` + `as_rgba8` fast path / per-pixel `dynamic_image_rgba_pixel`) | source pixels | `resize` →`Result<DynamicImage>` | Y (`MAX_DECODED_IMAGE_BYTES` via `load_image`) | **Y** | **FIXED (Codex review R2):** replaced the infallible `img.to_rgba8()` clone with a `try_reserve_exact`-backed buffer filled manually (borrowed RGBA8 fast path or per-pixel projection); handed to the own `vlm::resize` kernel; allocator failure → `Error::OutOfMemory` |
+//! | `resize` source RGBA buffer (`try_reserve_exact` + `as_rgba8` fast path / per-pixel `dynamic_image_rgba_pixel`) | source pixels | `resize` →`Result<DynamicImage>` | Y (`MAX_DECODED_IMAGE_BYTES` via `load_image`) | **Y** | **FIXED:** replaced the infallible `img.to_rgba8()` clone with a `try_reserve_exact`-backed buffer filled manually (borrowed RGBA8 fast path or per-pixel projection); handed to the own `vlm::resize` kernel; allocator failure → `Error::OutOfMemory` |
 //! | own resize kernel buffers — h+v coefficient tables, inter-pass intermediate, destination (`vlm::resize::resize_rgba8`) | target pixels (untrusted loaded config) | `resize` →`Result<DynamicImage>` | Y (`MAX_DECODED_IMAGE_BYTES` via `resize`'s target guard) | **Y** | **FIXED (own NEON resize, drop `fast_image_resize`):** every kernel buffer routes through `try_reserve_exact`; the target guard rejects zero/overflow/>512 MiB BEFORE any reservation; allocator failure → `Error::OutOfMemory`. Replaces `fast_image_resize`'s infallible internal scratch which could abort despite our `Result`. Output bit-exact with PIL `Image.resize`. |
 //! | `img.clone()` (early-return in `center_crop`) | source pixels | `center_crop` →`DynamicImage` | Y (via `load_image` cap) | N (image-rs infallible `Vec::clone`) | OUT-OF-SCOPE: `-> DynamicImage` by reference parity |
 //! | `img.crop_imm(...)` (in `center_crop`)        | min(source, target) | `center_crop` →`DynamicImage` | Y (≤ source bound) | N | OUT-OF-SCOPE: same parity rationale |
-//! | `Vec::<u8>::try_reserve_exact` canvas (in `pad_to_square`) | target square (bounded) | `pad_to_square` →`Result` | Y (`MAX_DECODED_IMAGE_BYTES`) | Y (`try_reserve_exact` + `Error::OutOfMemory`) | FALLIBLE (R3) |
-//! | `Vec::<f32>::try_reserve_exact` buf (in `image_to_array`) | source pixels (bounded by `load_image` cap) | `image_to_array` →`Result` | Y (via `load_image` cap) | Y (`try_reserve_exact` + `Error::OutOfMemory`) | FALLIBLE (R3) |
+//! | `Vec::<u8>::try_reserve_exact` canvas (in `pad_to_square`) | target square (bounded) | `pad_to_square` →`Result` | Y (`MAX_DECODED_IMAGE_BYTES`) | Y (`try_reserve_exact` + `Error::OutOfMemory`) | FALLIBLE |
+//! | `Vec::<f32>::try_reserve_exact` buf (in `image_to_array`) | source pixels (bounded by `load_image` cap) | `image_to_array` →`Result` | Y (via `load_image` cap) | Y (`try_reserve_exact` + `Error::OutOfMemory`) | FALLIBLE |
 //! | `dynamic_image_rgb_pixel` / `dynamic_image_rgba_pixel` per-pixel `get_pixel` | none (stack `Rgb`/`Rgba<u8>` only) | shared helpers | Y (zero alloc) | Y (no alloc) | OK — no full-image intermediate alloc |
 //! | mlx `Array` ops (rescale/normalize/patchify/preprocess) | output array | each `-> Result<Array>` | Y (output-shape) | Y (mlx backend `Result`) | OK — mlx backend allocator errors surface via `Array::*` `Result` |
 //!
@@ -384,8 +383,7 @@ impl ColorOrder {
 ///   `clip_image_processor`) call `np.transpose(arr, (2, 0, 1))` after
 ///   the ImageNet pipeline for the `Chw` arm.
 ///
-/// Tracking issue: [#120](https://github.com/Findit-AI/mlxrs/issues/120)
-/// (VLM-1).
+/// Tracking issue: [#120](https://github.com/Findit-AI/mlxrs/issues/120).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
 #[display("{}", self.as_str())]
 pub enum Layout {
@@ -450,8 +448,7 @@ pub struct ImageProcessorConfig {
   /// See [`Layout`] for the full per-arm rationale + cost analysis
   /// (zero copy — lazy `Array` metadata update only).
   ///
-  /// Tracking issue: [#120](https://github.com/Findit-AI/mlxrs/issues/120)
-  /// (VLM-1).
+  /// Tracking issue: [#120](https://github.com/Findit-AI/mlxrs/issues/120).
   layout: Layout,
 }
 
@@ -634,7 +631,7 @@ impl ImageProcessorConfig {
 /// [`preprocess`]. Oversized images are rejected with
 /// [`Error::Backend`] (the underlying `image::ImageError::Limits`).
 ///
-/// **EXIF rotate gate (Codex rounds 5–6).** The EXIF orientation step
+/// **EXIF rotate gate.** The EXIF orientation step
 /// is routed through the private `apply_orientation_fallible` helper.
 /// The decoder-side `set_limits` cap above does NOT protect the rotate
 /// variants (`Rotate90` / `Rotate270` / `Rotate90FlipH` /
@@ -680,8 +677,7 @@ pub fn load_image(path: &std::path::Path) -> Result<::image::DynamicImage> {
     .with_guessed_format()
     .map_err(io_err)?;
   let mut decoder = reader.into_decoder().map_err(parse_err)?;
-  // NOTE (Codex review, combined-wave1-fu): an adversarial-review concern
-  // observed that `into_decoder()` calls `JpegDecoder::new()` which does
+  // NOTE: `into_decoder()` calls `JpegDecoder::new()` which does
   // `r.read_to_end(&mut input)?` *before* any `Limits` check fires
   // (image 0.25 `codecs/jpeg/decoder.rs:30-33`), so a very large JPEG
   // file allocates the compressed bytes uncapped before `total_bytes()`
@@ -694,9 +690,8 @@ pub fn load_image(path: &std::path::Path) -> Result<::image::DynamicImage> {
   // documented scope is *local files only* — callers that need to
   // bound untrusted input should pre-validate with
   // `std::fs::metadata(path).len()` or use a `Take`-wrapped reader, the
-  // same as for any `std::fs::read`. Per project rule
-  // [[feedback_match_official_binding_design]] this primitive mirrors
-  // the references' behavior and does not add divergent hardening.
+  // same as for any `std::fs::read`. This primitive mirrors the
+  // references' behavior and does not add divergent hardening.
   // `decoder.orientation()` returns `Orientation::NoTransforms` for
   // formats that don't carry orientation metadata. With the current
   // `image` features (`png` + `jpeg`; TIFF/WebP NOT in the build,
@@ -704,8 +699,8 @@ pub fn load_image(path: &std::path::Path) -> Result<::image::DynamicImage> {
   // JpegDecoder parses APP1/Exif, and image 0.25 PngDecoder exposes
   // `exif_metadata` which the default `ImageDecoder::orientation`
   // parses — so 16-bit PNGs with EXIF `Rotate90`/`Rotate270` reach
-  // the rotate path here too (Codex review R8 — was previously
-  // documented as JPEG-only, false for `image` 0.25.10). All rotate
+  // the rotate path here too (this is NOT JPEG-only as of
+  // `image` 0.25.10). All rotate
   // orientations are handled by `apply_orientation_fallible` over
   // `rotate_buf<T>` covering u8/u16/f32 pixel variants. We read
   // orientation here while we still have a `&mut` borrow on the
@@ -735,26 +730,23 @@ pub fn load_image(path: &std::path::Path) -> Result<::image::DynamicImage> {
 /// (Luma16 / LumaA16 / Rgb16 / Rgba16), and `f32`
 /// (Rgb32F / Rgba32F).
 ///
-/// **The defect class this closes (Codex round-5 → round-6 finding).**
-/// Round 4 used a "probe-then-delegate" pattern (reserve a throwaway
-/// `Vec<u8>`, drop it, then call image-rs's `apply_orientation`) which
-/// is race-prone — allocator pressure between the probe drop and the
-/// real `rotate90` / `rotate270` alloc can flip the result from "would
-/// succeed" to "aborts". Round 5 replaced the u8 hot path with a
-/// *manual* rotation that builds the rotated buffer INSIDE a
-/// `try_reserve_exact`-backed `Vec<u8>` (no second alloc, no probe
-/// drop, no race window). Round 5 left the non-u8 variants on the
-/// infallible image-rs delegate, claiming they could not occur via
-/// [`load_image`]; that claim was wrong — image-rs 0.25's PNG decoder
-/// emits `Luma16` / `LumaA16` / `Rgb16` / `Rgba16` for 16-bit PNG
-/// inputs (`codecs/png.rs:64-71`), so a 16-bit PNG carrying an EXIF
-/// `Rotate90` / `Rotate270` orientation could reach the infallible
-/// fallback from [`load_image`] and abort on allocator pressure.
-/// Round 6 generalizes the manual rotate over the element type
-/// `T: Copy` (see [`rotate_buf`]) so the u16 and f32 variants share
-/// the same `try_reserve_exact` gate as u8. Allocator failure now
-/// surfaces as [`Error::OutOfMemory`] exactly once for every
-/// `DynamicImage` variant, before the pixel-copy loop runs.
+/// **The defect class this closes.** A "probe-then-delegate" pattern
+/// (reserve a throwaway `Vec<u8>`, drop it, then call image-rs's
+/// `apply_orientation`) is race-prone — allocator pressure between the
+/// probe drop and the real `rotate90` / `rotate270` alloc can flip the
+/// result from "would succeed" to "aborts". Instead, the rotated buffer
+/// is built INSIDE a `try_reserve_exact`-backed `Vec<T>` via a *manual*
+/// rotation (no second alloc, no probe drop, no race window),
+/// generalized over the element type `T: Copy` (see [`rotate_buf`]) so
+/// the u16 and f32 variants share the same `try_reserve_exact` gate as
+/// u8. Generalizing over all element types is required, not optional:
+/// image-rs 0.25's PNG decoder emits `Luma16` / `LumaA16` / `Rgb16` /
+/// `Rgba16` for 16-bit PNG inputs (`codecs/png.rs:64-71`), so a 16-bit
+/// PNG carrying an EXIF `Rotate90` / `Rotate270` orientation could
+/// otherwise reach an infallible fallback from [`load_image`] and abort
+/// on allocator pressure. Allocator failure now surfaces as
+/// [`Error::OutOfMemory`] exactly once for every `DynamicImage` variant,
+/// before the pixel-copy loop runs.
 ///
 /// **Dispatch.**
 /// - **All rotate orientations × all element types** (u8 / u16 / f32):
@@ -841,15 +833,15 @@ enum RotateKind {
 /// / Rgba16; f32: Rgb32F / Rgba32F). The rotated buffer is built
 /// INSIDE a `try_reserve_exact`-backed `Vec<T>` (via [`rotate_buf`])
 /// so an allocator failure surfaces as [`Error::OutOfMemory`]
-/// exactly once, before the pixel-copy loop runs (no race window
-/// like the round-4 probe, no infallible fallback to image-rs).
+/// exactly once, before the pixel-copy loop runs (no probe race
+/// window, no infallible fallback to image-rs).
 ///
-/// **Round-6 closure.** Round 5 left non-u8 variants on an infallible
-/// `apply_orientation` fallback under the assumption they could not
-/// be reached from [`load_image`]; that was wrong (image-rs 0.25's
-/// PNG decoder emits 16-bit variants for `BitDepth::Sixteen` PNG
-/// inputs — `codecs/png.rs:64-71`). Round 6 generalizes the rotate
-/// over `T: Copy` so the same fallible path covers u16 and f32.
+/// **Why all element types.** The rotate is generic over `T: Copy` so
+/// the same fallible path covers u16 and f32, not just u8: image-rs
+/// 0.25's PNG decoder emits 16-bit variants for `BitDepth::Sixteen`
+/// PNG inputs (`codecs/png.rs:64-71`), which can be reached from
+/// [`load_image`], so a non-u8 variant on an infallible
+/// `apply_orientation` fallback would abort on allocator pressure.
 /// `DynamicImage` is `#[non_exhaustive]` upstream, so a wildcard
 /// arm is required by the compiler; we surface any future-added
 /// variant as a typed [`Error::Backend`] rather than silently
@@ -924,12 +916,12 @@ fn apply_rotate_fallible(
       Ok(DynamicImage::ImageRgb8(out))
     }
     DynamicImage::ImageRgba8(buf) => {
-      // C5 SIMD: Rgba8 (u8 + channels=4) is the hot path — dispatch
-      // through the C5 NEON kernel (`simd::vlm::rotate_buf::rotate_buf_u8`)
+      // SIMD: Rgba8 (u8 + channels=4) is the hot path — dispatch
+      // through the NEON kernel (`simd::vlm::rotate_buf::rotate_buf_u8`)
       // which uses a 4-pixel-tile `vld1q_u8` load + per-pixel u32
       // scattered store. The other u8 channel counts (1/2/3) and
       // every u16/f32 arm continue to use the generic `rotate_buf<T>`.
-      let dst = rotate_buf_u8_via_c5(buf.as_raw(), src_w, src_h, 4, rotation)?;
+      let dst = rotate_buf_u8(buf.as_raw(), src_w, src_h, 4, rotation)?;
       let out: ::image::RgbaImage = ImageBuffer::from_raw(out_w, out_h, dst).expect(
         "ImageBuffer::from_raw: dst buffer length matches w*h*4 by construction in rotate_buf",
       );
@@ -982,7 +974,7 @@ fn apply_rotate_fallible(
     // above cover every variant defined in image-rs 0.25. Surface
     // any future addition as a typed `Backend` error rather than
     // silently calling the infallible `apply_orientation` (which
-    // reintroduces the abort-on-OOM behavior round 5/6 closes).
+    // would reintroduce the abort-on-OOM behavior this path avoids).
     // Recoverable by definition (it's an `Err`, not a panic), and
     // upgrading to a proper rotate arm becomes a localized edit
     // here the day a new variant ships.
@@ -1110,7 +1102,7 @@ fn rotate_buf<T: Copy + Default>(
   // implied by `rotation`. The inner per-pixel `copy_from_slice` is
   // a contiguous memcpy of `channels * size_of::<T>()` bytes (LLVM
   // unrolls / converts to single loads/stores for small fixed sizes
-  // — same code shape as the u8-only round-5 path, just parameterized
+  // — same code shape as the u8-only path, just parameterized
   // by `T`).
   //
   // Index math (verified against `imageops/affine.rs` upstream):
@@ -1134,17 +1126,17 @@ fn rotate_buf<T: Copy + Default>(
   Ok(dst)
 }
 
-/// C5 SIMD-routed u8 rotate helper — shares the same allocation /
+/// SIMD-routed u8 rotate helper — shares the same allocation /
 /// length contract as [`rotate_buf`] but dispatches the inner two-loop
 /// through [`crate::simd::vlm::rotate_buf::rotate_buf_u8`], whose
 /// aarch64 kernel uses a 4-pixel-tile `vld1q_u8` + per-pixel u32
 /// scattered store on the `channels = 4` (Rgba8) hot path.
 ///
-/// `channels = 1/2/3` fall through to the C5 dispatcher's scalar arm —
+/// `channels = 1/2/3` fall through to the SIMD dispatcher's scalar arm —
 /// bit-identical to [`rotate_buf::<u8>`]'s per-pixel `copy_from_slice`
 /// shape. Only `Rgba8` (the dominant call site post-image-decode) hits
-/// the NEON tile in the C5 dispatcher.
-fn rotate_buf_u8_via_c5(
+/// the NEON tile in the SIMD dispatcher.
+fn rotate_buf_u8(
   src: &[u8],
   src_w: u32,
   src_h: u32,
@@ -1158,7 +1150,7 @@ fn rotate_buf_u8_via_c5(
     .and_then(|wh| wh.checked_mul(channels))
     .ok_or_else(|| {
       Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
-        "rotate_buf_u8_via_c5: elements (w * h * channels)",
+        "rotate_buf_u8: elements (w * h * channels)",
         "usize",
         [
           ("w", w_usize as u64),
@@ -1170,7 +1162,7 @@ fn rotate_buf_u8_via_c5(
   debug_assert_eq!(
     src.len(),
     elements,
-    "rotate_buf_u8_via_c5: src.len() must equal w*h*channels by ImageBuffer::as_raw() contract"
+    "rotate_buf_u8: src.len() must equal w*h*channels by ImageBuffer::as_raw() contract"
   );
   let mut dst: Vec<u8> = Vec::new();
   dst
@@ -1216,7 +1208,7 @@ fn rotate_buf_u8_via_c5(
 /// concern and is intentionally not exposed here. Callers that need it
 /// can compute the target tuple themselves before calling `resize`.
 ///
-/// **Return type — fallible target-dimension guard (Codex review).**
+/// **Return type — fallible target-dimension guard.**
 /// The signature is `-> Result<DynamicImage>` rather than the
 /// infallible `-> DynamicImage` of the swift `resampleBicubic(_,
 /// to:) -> CIImage` (line 110-132) / python `Image.resize(new_size)
@@ -1289,7 +1281,7 @@ pub fn resize(
   filter: ResizeFilter,
 ) -> Result<::image::DynamicImage> {
   let (height, width) = target;
-  // Target-dimension guard (Codex review): `target` now flows from an
+  // Target-dimension guard: `target` now flows from an
   // UNTRUSTED loaded processor config, so validate it BEFORE the
   // source RGBA materialization and the `width * height * 4`
   // destination alloc. Mirrors `pad_to_square`'s canvas gate so the
@@ -1341,7 +1333,7 @@ pub fn resize(
   // `imageops::resize` over a `DynamicImage` projects to `Rgba8`
   // unconditionally; downstream `image_to_array` drops alpha as before).
   //
-  // FALLIBLE source materialization (Codex review round 2): the prior
+  // FALLIBLE source materialization: the prior
   // `img.to_rgba8()` was an OWNED source-sized copy/convert backed by an
   // INFALLIBLE `Vec` (image 0.25 returns a fresh `RgbaImage` and clones
   // even when the source is already `ImageRgba8`; only the consuming
@@ -1374,7 +1366,7 @@ pub fn resize(
         [("src_w", src_w as u64), ("src_h", src_h as u64)],
       ))
     })?;
-  // Source-staging cap (Codex review): `load_image`'s 512 MiB ceiling is
+  // Source-staging cap: `load_image`'s 512 MiB ceiling is
   // enforced on `decoder.total_bytes()` — the SOURCE pixel format. A
   // low-bytes-per-pixel source (e.g. `Luma8`, 1 B/px) accepted just under
   // that cap expands 4x when projected to the RGBA8 staging buffer below,
@@ -1671,15 +1663,14 @@ pub fn pad_to_square(img: ::image::DynamicImage, fill: [u8; 3]) -> Result<::imag
   canvas_buf
     .try_reserve_exact(bytes_usize)
     .map_err(|_| Error::OutOfMemory)?;
-  // Uniform RGB fill via the C6 `pad_canvas_fill` dispatcher
+  // Uniform RGB fill via the `pad_canvas_fill` dispatcher
   // (`crate::simd::vlm::pad_canvas_fill`). On `aarch64` this routes to
   // a 48-byte LCM(3, 16) NEON pre-broadcast tile (~2-4× faster than
-  // the new scalar at 4096²; ~10-50× faster than the pre-C6 per-3-byte
-  // `extend_from_slice` idiom this replaces — verify-before-claim
+  // the new scalar at 4096²; ~10-50× faster than the prior per-3-byte
+  // `extend_from_slice` idiom this replaces — see the
   // bench in `mlxrs/benches/simd_pad_canvas_fill.rs`); elsewhere it
   // falls back to the scalar `chunks_exact_mut(3) + copy_from_slice`
-  // path. See `docs/core-arch-simd-candidates.md` §2 row C6 + §5.5
-  // for the rationale + tracking ([#151]).
+  // path. Tracking ([#151]).
   //
   // The dispatcher takes `&mut [MaybeUninit<u8>]` (type-encoded uninit
   // safety — see the kernel-module doc), so we pass the pre-reserved
@@ -1822,7 +1813,7 @@ pub fn pad_to_square(img: ::image::DynamicImage, fill: [u8; 3]) -> Result<::imag
 /// that source imposed; pre-validating `img.dimensions()` (a cheap
 /// O(1) field read) is the standard escape hatch.
 ///
-/// **No infallible source clone (Codex review):** the prior
+/// **No infallible source clone:** the prior
 /// implementation called `img.to_rgb8()` unconditionally as its first
 /// step. `DynamicImage::to_rgb8()` is documented as "Returns a copy
 /// of this image as an RGB image" (image 0.25
@@ -1901,21 +1892,18 @@ pub fn image_to_array(img: &::image::DynamicImage, color_order: ColorOrder) -> R
     })?;
     match color_order {
       ColorOrder::Rgb => {
-        // C3 SIMD dispatcher (`crate::simd::vlm::rgb_widen`). On
+        // SIMD dispatcher (`crate::simd::vlm::rgb_widen`). On
         // `aarch64` this routes to a `vld1q_u8` + four `vst1q_f32`
         // 16-byte-per-tile NEON kernel (pure byte-for-byte widen, no
         // de-interleave needed for RGB-in-RGB-out); elsewhere it
         // falls back to the scalar `MaybeUninit::write` path. The
-        // pre-C3 `buf.extend(raw.iter().map(|&b| f32::from(b)))`
+        // prior `buf.extend(raw.iter().map(|&b| f32::from(b)))`
         // shape LLVM auto-vectorized cleanly, but the hand-rolled
-        // NEON arm pins the contract against compiler-version drift
-        // (per the user directive 2026-05-23 / project memory rule
-        // **"SIMD ship NEON regardless"**). See
-        // `docs/core-arch-simd-candidates.md` §2 row C3 + §3.3 +
-        // tracking [#148].
+        // NEON arm pins the contract against compiler-version drift.
+        // Tracking [#148].
         //
         // The dispatcher takes `&mut [MaybeUninit<f32>]` (type-
-        // encoded uninit safety, matching C4/C6); we pass the
+        // encoded uninit safety); we pass the
         // pre-reserved spare capacity directly and `set_len(total)`
         // after every f32 has been written.
         {
@@ -1938,15 +1926,14 @@ pub fn image_to_array(img: &::image::DynamicImage, color_order: ColorOrder) -> R
         unsafe { buf.set_len(total) };
       }
       ColorOrder::Bgr => {
-        // Per-pixel R↔B swap via the C4 `bgr_widen` dispatcher
+        // Per-pixel R↔B swap via the `bgr_widen` dispatcher
         // (`crate::simd::vlm::bgr_widen`). On `aarch64` this routes
         // to a `vld3q_u8` + permuted `vst3q_f32` 16-pixel-per-tile
         // NEON kernel (the R↔B swap is encoded by feeding the
         // de-interleaved planes to the interleave-store in reversed
         // R/B order); elsewhere it falls back to the scalar
-        // `chunks_exact_mut(3) + MaybeUninit::write` path. See
-        // `docs/core-arch-simd-candidates.md` §2 row C4 + §3.3 + §5.5
-        // for the rationale + tracking ([#149]).
+        // `chunks_exact_mut(3) + MaybeUninit::write` path. Tracking
+        // ([#149]).
         //
         // The dispatcher takes `&mut [MaybeUninit<f32>]` (type-encoded
         // uninit safety — see the kernel-module doc), so we pass the
@@ -1986,11 +1973,11 @@ pub fn image_to_array(img: &::image::DynamicImage, color_order: ColorOrder) -> R
     // build a contiguous `Vec<u8>` of length `H*W*3` via the shared
     // [`dynamic_image_rgb_pixel`] helper (one `Rgba<u8>` on the stack
     // per pixel — NO intermediate source-sized RGB image allocation),
-    // THEN hand the bulk buffer to the same C3/C4 SIMD dispatcher
+    // THEN hand the bulk buffer to the same SIMD dispatcher
     // the `Rgb8` fast path uses above. The earlier per-pixel
     // `buf.push(f32::from(...))` shape paid an iterator + per-element
     // capacity-check overhead even though `try_reserve_exact` had
-    // already reserved exact capacity — Copilot review (VLM-3, #121).
+    // already reserved exact capacity (#121).
     //
     // The intermediate `Vec<u8>` is itself fallibly reserved through
     // the crate-private `error::try_with_capacity` helper so allocator
@@ -2019,7 +2006,7 @@ pub fn image_to_array(img: &::image::DynamicImage, color_order: ColorOrder) -> R
       total,
       "non-Rgb8 RGB intermediate fill length must equal pre-computed total"
     );
-    // Dispatch through the same C3/C4 SIMD widener the Rgb8 fast path
+    // Dispatch through the same SIMD widener the Rgb8 fast path
     // uses. NEON kernel on aarch64; auto-vectorized scalar elsewhere.
     // Identical kernel-contract (every f32 in `0..total` of spare is
     // written before return), identical post-call `set_len` safety
@@ -2364,7 +2351,7 @@ pub fn patchify(arr: &Array, patch_size: usize) -> Result<Array> {
   // genuinely-large images). Surface as recoverable
   // `Error::ArithmeticOverflow` rather than silently wrapping to a
   // smaller-than-expected first axis (which would later cause
-  // reshape/broadcast misalignment) — Copilot review #3272880077.
+  // reshape/broadcast misalignment).
   let n_patches = hp.checked_mul(wp).ok_or_else(|| {
     Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
       "patchify: n_patches (hp * wp)",
@@ -2408,7 +2395,7 @@ pub fn patchify(arr: &Array, patch_size: usize) -> Result<Array> {
 /// is fully **bounded-memory**: the source is capped by
 /// [`MAX_DECODED_IMAGE_BYTES`] (512 MiB) via [`load_image`], and the
 /// [`resize`] destination is capped against the same ceiling by
-/// [`resize`]'s target-dimension guard (Codex review: `cfg.size` now
+/// [`resize`]'s target-dimension guard (`cfg.size` now
 /// flows from an UNTRUSTED loaded processor config, so an over-budget /
 /// zero / overflowing `size` surfaces as a typed
 /// [`Error::OutOfRange`] / [`Error::CapExceeded`] / [`Error::ArithmeticOverflow`]
@@ -2420,8 +2407,8 @@ pub fn patchify(arr: &Array, patch_size: usize) -> Result<Array> {
 /// system-wide OOM at a now-bounded ≤512 MiB request.
 ///
 /// See the module-level audit table for the per-site breakdown.
-// NOTE (Codex finding, round 2): a review request asked `preprocess`
-// to return swift's `[1, C, H, W]` directly. The cross-model primitive
+// NOTE: `preprocess` does not return swift's `[1, C, H, W]` directly.
+// The cross-model primitive
 // always runs the ImageNet pipeline on `[H, W, 3]` (so the `(3,)`
 // mean/std broadcast cleanly across the trailing axis — see the
 // module-doc `Conventions > Channel layout` block). The trailing
@@ -2490,8 +2477,7 @@ pub fn preprocess(img: &::image::DynamicImage, cfg: &ImageProcessorConfig) -> Re
 /// - [`Error::RankMismatch`] if the input is not rank-3;
 ///   [`Error::LengthMismatch`] if the trailing channel dim is not 3.
 ///
-/// Tracking issue: [#120](https://github.com/Findit-AI/mlxrs/issues/120)
-/// (VLM-1).
+/// Tracking issue: [#120](https://github.com/Findit-AI/mlxrs/issues/120).
 pub fn apply_layout(arr: Array, layout: Layout) -> Result<Array> {
   use crate::ops::shape::expand_dims_axes;
   // Validate rank-3 `[H, W, 3]` shape before any FFI call — surfaces a
@@ -2538,9 +2524,9 @@ pub fn apply_layout(arr: Array, layout: Layout) -> Result<Array> {
 }
 
 /// Private regression tests for [`apply_orientation_fallible`] and
-/// the round-5 truly-fallible [`rotate_buf`] helper.
+/// the truly-fallible [`rotate_buf`] helper.
 ///
-/// **Round-5 coverage.** The four EXIF rotate orientations
+/// **Rotate coverage.** The four EXIF rotate orientations
 /// (Rotate90 / Rotate270 / Rotate90FlipH / Rotate270FlipH) are
 /// exercised on all four u8 [`DynamicImage`] variants
 /// (Luma8 / LumaA8 / Rgb8 / Rgba8) and compared byte-for-byte
@@ -2673,11 +2659,11 @@ mod apply_orientation_tests {
     );
   }
 
-  // -- Rgb8 manual rotation parity (round-5) ---------------------------
+  // -- Rgb8 manual rotation parity -------------------------------------
 
   #[test]
   fn rotate90_rgb8_manual_matches_reference() {
-    // ROUND-5: Rotate90 on Rgb8 now goes through the truly-fallible
+    // Rotate90 on Rgb8 now goes through the truly-fallible
     // manual `rotate_buf` path. Must:
     //   (1) succeed for a small input under `MAX_DECODED_IMAGE_BYTES`,
     //   (2) swap dimensions (4x3 → 3x4),
@@ -2742,7 +2728,7 @@ mod apply_orientation_tests {
     );
   }
 
-  // -- Rgba8 manual rotation parity (round-5) --------------------------
+  // -- Rgba8 manual rotation parity ------------------------------------
 
   #[test]
   fn rotate90_rgba8_manual_matches_reference() {
@@ -2763,7 +2749,7 @@ mod apply_orientation_tests {
 
   #[test]
   fn rotate270_fliph_rgba8_composite_matches_reference() {
-    // Composite path × alpha channel — adversarial: verify the
+    // Composite path × alpha channel: verify the
     // collapsed `dst[h-1-y, w-1-x] = src[x, y]` index math handles
     // the 4-byte stride correctly.
     let img = xy_encoded_rgba8(4, 3);
@@ -2779,7 +2765,7 @@ mod apply_orientation_tests {
     );
   }
 
-  // -- Luma8 manual rotation parity (round-5) --------------------------
+  // -- Luma8 manual rotation parity ------------------------------------
 
   #[test]
   fn rotate90_luma8_manual_matches_reference() {
@@ -2810,7 +2796,7 @@ mod apply_orientation_tests {
     );
   }
 
-  // -- LumaA8 manual rotation parity (round-5) -------------------------
+  // -- LumaA8 manual rotation parity -----------------------------------
 
   #[test]
   fn rotate90_luma_alpha8_manual_matches_reference() {
@@ -2828,19 +2814,17 @@ mod apply_orientation_tests {
     );
   }
 
-  // -- Round-6 16-bit-PNG / float-pixel rotate parity ------------------
+  // -- 16-bit-PNG / float-pixel rotate parity ------------------
   //
   // image-rs 0.25's PNG decoder emits `Luma16`/`LumaA16`/`Rgb16`/
   // `Rgba16` for `BitDepth::Sixteen` PNG inputs (`codecs/png.rs:64-71`),
   // and caller-supplied `DynamicImage::ImageRgb32F`/`ImageRgba32F`
-  // round-trip through the same fallible rotate path. Round 5
-  // missed these and left them on an infallible image-rs delegate
-  // that could abort on allocator pressure for a 16-bit PNG with
-  // EXIF Rotate90/270 (the load_image entry-point closure was
-  // broken). Round 6 generalizes the manual rotate over `T: Copy`
-  // so the same `try_reserve_exact` gate covers u16 and f32 — the
-  // tests below verify byte-identical parity with `image::imageops`
-  // for the new element widths.
+  // round-trip through the same fallible rotate path. An infallible
+  // image-rs delegate could otherwise abort on allocator pressure for
+  // a 16-bit PNG with EXIF Rotate90/270; the manual rotate is generic
+  // over `T: Copy` so the same `try_reserve_exact` gate covers u16 and
+  // f32 — the tests below verify byte-identical parity with
+  // `image::imageops` for the new element widths.
 
   /// Build a non-square `Rgb16` image whose subpixels encode pixel
   /// position so any rotation is checkable byte-for-byte against
@@ -2904,12 +2888,11 @@ mod apply_orientation_tests {
 
   #[test]
   fn rotate90_rgb16_manual_matches_reference() {
-    // ROUND-6: Rotate90 on Rgb16 now routes through the same
+    // Rotate90 on Rgb16 routes through the same
     // truly-fallible `rotate_buf<u16>` path the u8 variants use.
     // A non-square 4x3 image must rotate to 3x4 with byte-identical
     // pixels to `image::imageops::rotate90`. This is the regression
-    // test for the 16-bit-PNG-EXIF-rotate `load_image` gap the audit
-    // missed in round 5.
+    // test for the 16-bit-PNG-EXIF-rotate `load_image` gap.
     let img = xy_encoded_rgb16(4, 3);
     let reference = ::image::imageops::rotate90(img.as_rgb16().expect("rgb16 source"));
     let out = apply_orientation_fallible(img, Orientation::Rotate90)
@@ -2962,15 +2945,15 @@ mod apply_orientation_tests {
 
   #[test]
   fn synthetic_16bit_rotate_succeeds_via_orientation_entry_point() {
-    // End-to-end check that mimics the broken-by-round-5 load_image
+    // End-to-end check that mimics the 16-bit `load_image`
     // closure: build a 16-bit `DynamicImage` directly (no on-disk
     // PNG needed; a unit test does not need a real decoder to
     // exercise the post-decode rotate path) and hand it to
     // `apply_orientation_fallible` with EXIF Rotate90 / Rotate270 /
     // composite orientations. All four allocating-rotate
-    // orientations must now succeed via the generic `rotate_buf`
-    // path — round 5 would have hit the infallible fallback for
-    // these. (The "real 16-bit PNG decode" path is exercised
+    // orientations must succeed via the generic `rotate_buf`
+    // path rather than the infallible fallback that would abort on
+    // allocator pressure. (The "real 16-bit PNG decode" path is exercised
     // implicitly through `load_image` once a 16-bit PNG with EXIF
     // orientation is supplied; we test the rotate-shaped subgoal
     // here without coupling to disk I/O.)
@@ -2982,7 +2965,7 @@ mod apply_orientation_tests {
     ] {
       let img = xy_encoded_rgb16(4, 3);
       let out = apply_orientation_fallible(img, rotation)
-        .expect("16-bit Rgb16 rotate must succeed via the round-6 fallible u16 path");
+        .expect("16-bit Rgb16 rotate must succeed via the fallible u16 path");
       assert_eq!(out.width(), 3, "all four rotate orientations swap w<->h");
       assert_eq!(out.height(), 4);
       assert!(

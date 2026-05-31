@@ -6,7 +6,7 @@
 //! `Model.generate` loops ([`kokoro/kokoro.py`][kokoro],
 //! [`llama/llama.py`][llama] — consulted for the segment-iteration +
 //! streaming-chunk shape, NOT the per-model decode algorithm, which lives in
-//! per-model code per the [`project_no_per_model_arch_porting`][noarch]
+//! per-model code per the `project_no_per_model_arch_porting`
 //! rule), and mlx-audio-swift's
 //! [`SpeechGenerationModel`][swift-gen] `generate` / `generateStream`.
 //!
@@ -27,7 +27,6 @@
 //! [kokoro]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/tts/models/kokoro/kokoro.py
 //! [llama]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/tts/models/llama/llama.py
 //! [swift-gen]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioTTS/Generation.swift
-//! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 //! [iter]: core::iter::Iterator
 
 use derive_more::{Display, IsVariant};

@@ -1,4 +1,4 @@
-//! Misc ops: argmax/argmin (Phase 3.5 optional-axis archetype, U32 output),
+//! Misc ops: argmax/argmin (optional-axis archetype, U32 output),
 //! cumulative reductions, sort/argsort/topk/partition, clip, *_like
 //! constructors, and astype.
 

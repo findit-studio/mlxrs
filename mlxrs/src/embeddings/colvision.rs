@@ -6,8 +6,7 @@
 //!
 //! ## What this module ships
 //!
-//! Mirroring the python reference's structure faithfully
-//! (`[[feedback_mirror_reference_structure]]`):
+//! Mirroring the python reference's structure faithfully:
 //!
 //! - [`BaseColVisionProcessor`] — a **trait** mirroring the python
 //!   abstract base class (python lines 9-41). It declares the three
@@ -45,12 +44,11 @@
 //! method is callable without an instance in the reference (it is invoked
 //! both as `BaseColVisionProcessor.score_single_vector(...)` and
 //! `self.score_multi_vector(...)`), and Rust trait dispatch adds nothing.
-//! This matches the `[[feedback_api_style]]` rule (Rust-idiomatic
-//! ergonomics over verbatim mirroring of OO sugar that has no Rust
-//! analog).
+//! This follows Rust-idiomatic ergonomics over verbatim mirroring of
+//! OO sugar that has no Rust analog.
 //!
-//! ## What this module deliberately does NOT ship (per
-//! `[[project_no_model_arch_porting]]`)
+//! ## What this module deliberately does NOT ship (no per-model
+//! arch porting)
 //!
 //! Concrete model-specific processors (the python
 //! `colidefics3.Processor` / `colqwen2_5.Processor` subclasses, which
@@ -101,7 +99,7 @@ use crate::{
 
 /// Which side of a `(queries, passages)` pair the colvision scoring code
 /// is inspecting. Routes the per-side context labels through a closed
-/// enum so the §5 typed-error payloads can carry static `&'static str`
+/// enum so the typed-error payloads can carry static `&'static str`
 /// contexts (no `format!` for the side tag).
 #[derive(Clone, Copy)]
 enum ColVisionSide {
@@ -143,7 +141,7 @@ pub type ProcessorBatch = HashMap<String, Array>;
 /// `ColQwen2_5` / …) own the image preprocessor + tokenizer + chat
 /// template and implement this trait. The trait itself only fixes the
 /// three abstract method shapes; no state lives on the seam. Per the
-/// `[[project_no_model_arch_porting]]` rule the per-model
+/// no-model-arch rule the per-model
 /// implementations are out of scope for this module.
 ///
 /// Each implementation is expected to be `!Send`-tolerant: [`Array`] is
@@ -547,8 +545,7 @@ pub fn score_multi_vector(qs: &[Array], ps: &[Array], batch_size: usize) -> Resu
 /// Padding is done with [`Array::zeros`] of the *input dtype*
 /// ([`Dtype`] preserved from the input, mirroring python's
 /// `dtype=a.dtype`) so a half-precision query batch stays half — no
-/// silent f32 promotion (the `[[feedback_no_implicit_eval]]` /
-/// dtype-fidelity discipline this module shares with the rest of
+/// silent f32 promotion (the dtype-fidelity discipline this module shares with the rest of
 /// `embeddings`).
 ///
 /// Empty `arrays` is rejected by the callers
@@ -724,7 +721,7 @@ mod tests {
     assert_eq!(v, vec![1.0, 2.0, 1.0, 0.0]);
   }
 
-  /// REGRESSION (Codex finding, round 2 — single-vector analog): a
+  /// REGRESSION (single-vector analog): a
   /// `(0,)` query embedding (zero-element vector) must be rejected.
   /// The single-vector path does not go through [`pad_to_max`]; it has
   /// its own early guard. A `(0,)` vector would dot-product to `0.0`
@@ -748,7 +745,7 @@ mod tests {
     );
   }
 
-  /// REGRESSION (Codex finding, round 2 — single-vector analog): a
+  /// REGRESSION (single-vector analog): a
   /// `(0,)` passage embedding must be rejected for the same reasons as
   /// the query analog. Assertion: returns [`Error::OutOfRange`]
   /// whose message contains `"zero tokens"` and identifies the
@@ -821,7 +818,7 @@ mod tests {
     assert!(format!("{err}").contains("batch_size"));
   }
 
-  /// REGRESSION (Codex finding, round 2): a zero-token query is
+  /// REGRESSION: a zero-token query is
   /// rejected by `score_multi_vector` — even though the outer
   /// `qs.is_empty()` guard passes, the per-array `shape[0] == 0` check
   /// must fire. The contract is that callers filter out
@@ -829,7 +826,7 @@ mod tests {
   /// don't, the failure must be observable and recoverable (not
   /// non-finite scores).
   ///
-  /// REGRESSION (Codex finding, round 3): the message must carry the
+  /// REGRESSION: the message must carry the
   /// path tag (`queries`) AND the *global* index, not a tile-local
   /// `array N` from the inner `pad_to_max` helper.
   ///
@@ -857,7 +854,7 @@ mod tests {
     );
   }
 
-  /// REGRESSION (Codex finding, round 2): the high-finding fixture.
+  /// REGRESSION: the high-severity fixture.
   /// `q = [[1, 0]]`, `p0 = [[0_size_2]]` (zero tokens), `p1 = [[2, 0],
   /// [0, 1]]`. Without the zero-token guard, the `(c=2, s_max=2)` mask
   /// row for `p0` would be all-`false`, [`select`] would replace every
@@ -866,7 +863,7 @@ mod tests {
   /// to a `-inf` ranking score. The guard surfaces a recoverable
   /// [`Error::OutOfRange`] instead.
   ///
-  /// REGRESSION (Codex finding, round 3): the message must carry the
+  /// REGRESSION: the message must carry the
   /// path tag (`passages`) AND the *global* index — here `passages[0]`
   /// — even though `p0` is also at tile-local index 0 (the
   /// distinguishing global-vs-local fixture is below).
@@ -890,7 +887,7 @@ mod tests {
     );
   }
 
-  /// REGRESSION (Codex finding, round 4): the distinguishing global-
+  /// REGRESSION: the distinguishing global-
   /// vs-tile-local fixture for the QUERY path. With `qs.len() = 4`
   /// and `batch_size = 2`, the offending zero-token query at global
   /// index 3 lives in the SECOND tile and would have been reported by
@@ -928,7 +925,7 @@ mod tests {
     );
   }
 
-  /// REGRESSION (Codex finding, round 3): the distinguishing global-
+  /// REGRESSION: the distinguishing global-
   /// vs-tile-local fixture. With `ps.len() = 4` and `batch_size = 2`,
   /// the offending zero-token passage at global index 3 lives in the
   /// SECOND tile and would have been reported by the inner
@@ -1078,7 +1075,7 @@ mod tests {
     assert!(format!("{err}").contains("emb_dim"));
   }
 
-  /// REGRESSION (Codex finding, round 2): a `(0, d)` array must be
+  /// REGRESSION: a `(0, d)` array must be
   /// rejected. Without the guard, [`pad_to_max`] records `0` in
   /// `original_lengths`, [`score_multi_vector`]'s mask loop builds an
   /// all-`false` row for the offending passage, [`select`] replaces
@@ -1154,7 +1151,7 @@ mod tests {
     );
   }
 
-  /// REGRESSION (Codex finding, round 1): zero-padded passages must not
+  /// REGRESSION: zero-padded passages must not
   /// win `max(axis=3)` for signed embeddings. With
   /// `q = [[1, 0]]`, `p0 = [[-1, 0]]`, `p1 = [[2, 0], [0, 1]]`:
   /// - Scoring `p0` alone (`batch_size = 1`, no padding): MaxSim is
@@ -1165,7 +1162,7 @@ mod tests {
   ///   `-1.0` (the unpadded answer) in BOTH cases — ranking is
   ///   batch-size-agnostic.
   ///
-  /// Codex finding rationale: the upstream
+  /// Rationale: the upstream
   /// `mlx_embeddings/colvision_processor.py` includes the zero-padded
   /// columns in `mx.max(sim, axis=3)`. mlxrs masks them to
   /// `f32::NEG_INFINITY` (cast to the input dtype) before the max.
@@ -1227,7 +1224,7 @@ mod tests {
       // Test-only stub: deposit a single `(len(images),)` int tensor
       // recording the batch size — the seam only checks the contract
       // shape, not the model preprocessor semantics (which are
-      // out-of-scope per `[[project_no_model_arch_porting]]`).
+      // out of scope).
       let mut batch = ProcessorBatch::new();
       let count = i32::try_from(images.len()).unwrap_or(0);
       batch.insert(

@@ -215,7 +215,7 @@ fn speculative_decoding_greedy_self_draft_byte_identical() {
   let cfg_baseline = GenConfig::default()
     .with_max_tokens(max_tokens)
     .with_eos(eos.clone());
-  // L3: `generate` now returns `(String, GenerationStats)`; the speculative
+  // `generate` returns `(String, GenerationStats)`; the speculative
   // parity assertions compare only the assembled text.
   let (baseline, _) = generate(&target, &tok, &[3u32], cache(1), cfg_baseline).unwrap();
 
@@ -277,7 +277,7 @@ fn speculative_decoding_diverging_draft_still_correct() {
   let cfg_baseline = GenConfig::default()
     .with_max_tokens(max_tokens)
     .with_eos(eos.clone());
-  // L3: `generate` now returns `(String, GenerationStats)`; the speculative
+  // `generate` returns `(String, GenerationStats)`; the speculative
   // parity assertions compare only the assembled text.
   let (baseline, _) = generate(&target, &tok, &[3u32], cache(1), cfg_baseline).unwrap();
 
@@ -445,7 +445,7 @@ fn speculative_n_draft_zero_degenerates_to_plain() {
   let draft = MockModel::ramp(5);
 
   let max_tokens = 4;
-  // L3: `generate` now returns `(String, GenerationStats)`; the speculative
+  // `generate` returns `(String, GenerationStats)`; the speculative
   // parity assertions compare only the assembled text.
   let (baseline, _) = generate(
     &target,
@@ -479,7 +479,7 @@ fn speculative_n_draft_zero_degenerates_to_plain() {
 
 /// **Self-draft + repetition penalty ⇒ output STILL byte-identical to plain `generate`.**
 ///
-/// Regression for the Fix 1 history-tracking bug: with a non-zero
+/// Regression for the history-tracking bug: with a non-zero
 /// `repetition_penalty` the per-step processor history must equal what
 /// plain `generate` would see at the SAME predict point — i.e. advance
 /// by `y_input` (current input) plus the accepted drafts, never by the
@@ -501,7 +501,7 @@ fn speculative_self_draft_with_repetition_penalty_byte_identical() {
     _c.repetition_penalty = Some(2.0);
     _c
   };
-  // L3: `generate` now returns `(String, GenerationStats)`; the speculative
+  // `generate` returns `(String, GenerationStats)`; the speculative
   // parity assertions compare only the assembled text.
   let (baseline, _) = generate(&target, &tok, &[3u32], cache(1), cfg_baseline).unwrap();
 
@@ -526,13 +526,13 @@ fn speculative_self_draft_with_repetition_penalty_byte_identical() {
 
   assert_eq!(
     spec, baseline,
-    "self-draft + rep_penalty: byte-identical to plain (Fix 1)"
+    "self-draft + rep_penalty: byte-identical to plain"
   );
 }
 
 /// **Self-draft + presence penalty ⇒ output STILL byte-identical to plain.**
 ///
-/// Same Fix 1 regression, exercising a *different* history-sensitive
+/// Same regression, exercising a *different* history-sensitive
 /// processor (presence penalty subtracts a constant — different
 /// per-history-token math than rep-penalty's multiplicative path). Either
 /// processor surfaces the bug if `self.history` doesn't faithfully match
@@ -549,7 +549,7 @@ fn speculative_self_draft_with_presence_penalty_byte_identical() {
     _c.presence_penalty = Some(3.0);
     _c
   };
-  // L3: `generate` now returns `(String, GenerationStats)`; the speculative
+  // `generate` returns `(String, GenerationStats)`; the speculative
   // parity assertions compare only the assembled text.
   let (baseline, _) = generate(&target, &tok, &[3u32], cache(1), cfg_baseline).unwrap();
 
@@ -574,7 +574,7 @@ fn speculative_self_draft_with_presence_penalty_byte_identical() {
 
   assert_eq!(
     spec, baseline,
-    "self-draft + presence_penalty: byte-identical to plain (Fix 1)"
+    "self-draft + presence_penalty: byte-identical to plain"
   );
 }
 
@@ -582,7 +582,7 @@ fn speculative_self_draft_with_presence_penalty_byte_identical() {
 ///
 /// Acceptance correctness PLUS correct history advance guarantees the
 /// yielded sequence matches plain: rejected drafts must not pollute
-/// `self.history` (Fix 1 — "Do NOT advance history by rejected drafts"),
+/// `self.history` (do NOT advance history by rejected drafts),
 /// otherwise the bonus / next step's sampling would see drafts that
 /// plain never fed.
 #[test]
@@ -592,7 +592,7 @@ fn speculative_diverging_draft_with_repetition_penalty_byte_identical() {
   // Diverging draft: alternates argmax across calls — disagrees with
   // target on the first call of every draft loop, then agrees. This
   // means some drafts are rejected — exercising the "do NOT advance
-  // history by rejected drafts" branch of Fix 1.
+  // history by rejected drafts" branch.
   let draft = DivergingDraft::new();
 
   let max_tokens = 6;
@@ -601,7 +601,7 @@ fn speculative_diverging_draft_with_repetition_penalty_byte_identical() {
     _c.repetition_penalty = Some(2.0);
     _c
   };
-  // L3: `generate` now returns `(String, GenerationStats)`; the speculative
+  // `generate` returns `(String, GenerationStats)`; the speculative
   // parity assertions compare only the assembled text.
   let (baseline, _) = generate(&target, &tok, &[3u32], cache(1), cfg_baseline).unwrap();
 
@@ -626,13 +626,13 @@ fn speculative_diverging_draft_with_repetition_penalty_byte_identical() {
 
   assert_eq!(
     spec, baseline,
-    "diverging draft + rep_penalty: byte-identical to plain (Fix 1 — rejected drafts excluded)"
+    "diverging draft + rep_penalty: byte-identical to plain (rejected drafts excluded)"
   );
 }
 
 /// **EOS as first accepted draft ⇒ stats committed only for yielded tokens.**
 ///
-/// Regression for the Fix 2 stats-at-yield-time bug: with
+/// Regression for the stats-at-yield-time bug: with
 /// `n_draft_tokens=2` and EOS as the first accepted token, 3 tokens are
 /// enqueued (2 accepts + 1 bonus) but the stream terminates after just
 /// the first yield. The final stats MUST reflect ONLY the yielded token,
@@ -680,7 +680,7 @@ fn speculative_eos_in_first_accepted_draft_stats_match_yields() {
   );
   assert_eq!(
     r.stats.generated_tokens, 1,
-    "stats counts ONLY the yielded EOS, NOT the 2 unyielded pending tokens (Fix 2); got {:?}",
+    "stats counts ONLY the yielded EOS, NOT the 2 unyielded pending tokens; got {:?}",
     r.stats
   );
   assert_eq!(
@@ -691,9 +691,9 @@ fn speculative_eos_in_first_accepted_draft_stats_match_yields() {
   );
 }
 
-/// **Final partial step still proposes drafts (R3 — `num_draft` clamp parity).**
+/// **Final partial step still proposes drafts (`num_draft` clamp parity).**
 ///
-/// Regression for the R3 finding: the old clamp reserved a bonus slot
+/// Regression: the old clamp reserved a bonus slot
 /// (`remaining.saturating_sub(1)`), which made the final 1-token remainder
 /// propose ZERO drafts and emit the last token as a bonus
 /// (`from_draft = false`). mlx-lm's clamp (`generate.py:613`) is
@@ -745,11 +745,11 @@ fn speculative_self_draft_final_partial_step_proposes_and_accepts() {
     Some(FinishReason::Length),
     "final yield is the length-cap stop"
   );
-  // R3: the last yielded token is an ACCEPTED DRAFT from step 2, not a
+  // The last yielded token is an ACCEPTED DRAFT from step 2, not a
   // bonus.
   assert!(
     last.from_draft,
-    "final partial step yields an accepted draft (R3 — NOT a bonus); got from_draft={}",
+    "final partial step yields an accepted draft (NOT a bonus); got from_draft={}",
     last.from_draft
   );
   // Step 1: 3 proposed + 3 accepted + bonus (4 tokens).
@@ -758,7 +758,7 @@ fn speculative_self_draft_final_partial_step_proposes_and_accepts() {
   // generated=5.
   assert_eq!(
     last.stats.proposed_drafts, 4,
-    "R3: final partial step proposes 1 draft (3 + 1 = 4 total); got {:?}",
+    "final partial step proposes 1 draft (3 + 1 = 4 total); got {:?}",
     last.stats
   );
   assert_eq!(

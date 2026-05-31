@@ -1,8 +1,7 @@
 //! `Array` core: RAII handle around `mlxrs_sys::mlx_array`.
 //!
-//! See `docs/superpowers/specs/` §6.2 for design rationale (Drop must not
-//! touch TLS; the only duplication is the fallible refcount-sharing
-//! [`Array::try_clone`]; M1 is single-thread only).
+//! Design rationale: Drop must not touch TLS; the only duplication is the
+//! fallible refcount-sharing [`Array::try_clone`]; M1 is single-thread only.
 
 use static_assertions::assert_not_impl_any;
 
@@ -33,7 +32,7 @@ pub struct Array(pub(super) mlxrs_sys::mlx_array);
 // failure, so it is not provided.
 //
 // `!Send`/`!Sync` is required by the underlying mlx-c array/backend, NOT to
-// keep any `Clone` cheap. The Phase-3 entry audit confirmed `array_desc_` is
+// keep any `Clone` cheap. `array_desc_` is
 // `std::shared_ptr<array_desc>` (atomic refcount) but `set_status const →
 // array_desc_->status = s` is a non-atomic mutation through `const` — so a
 // shared `&Array` across threads (`Sync`) would race on `array_desc->status`.

@@ -1,18 +1,15 @@
-//! C4 — `image_to_array` BGR R↔B swap widen: de-interleave a
+//! `image_to_array` BGR R↔B swap widen: de-interleave a
 //! `&[u8]` of packed BGR pixels into a `&mut [MaybeUninit<f32>]` of
 //! channel-last `[R, G, B]` f32 triples (R and B swapped from the
 //! input order).
 //!
 //! Tracking: [#149](https://github.com/Findit-AI/mlxrs/issues/149).
-//! Plan: `docs/core-arch-simd-candidates.md` §2 row C4, §3.3 (C3/C4
-//! image-to-array widen), §5.4 (verify-before-claim), §5.5 (execution
-//! order — third kernel after C6 + C1; the BGR arm is the one LLVM
-//! most likely fails to auto-vectorize because of the 3-element
-//! shuffle on the destination side).
+//! The BGR arm is the one LLVM most likely fails to auto-vectorize
+//! because of the 3-element shuffle on the destination side.
 //!
 //! # The defect class
 //!
-//! The pre-C4 [`crate::vlm::image::image_to_array`] BGR arm was:
+//! The original [`crate::vlm::image::image_to_array`] BGR arm was:
 //!
 //! ```rust,ignore
 //! ColorOrder::Bgr => {
@@ -53,17 +50,10 @@
 //!    ordered channels containing exactly the same per-channel values
 //!    the scalar reference emits.
 //!
-//! # Verify-before-claim bench (§5.4) — re-run on the shipping shape
+//! # Benchmark
 //!
-//! Per the verify-before-claim rule (§5.4 of the SIMD doc + project
-//! memory **"Verify review premise empirically"**), we benchmarked
-//! three implementations at 256² / 1024² / 4096² pixel counts (the
-//! same shape as C6's bench). The numbers below are the **re-run**
-//! after the dispatcher was re-pointed at the NEON arm; the OLD
-//! per-push loop is unchanged from the previous (pre-NEON-ship)
-//! round, the NEW scalar drifted within run-to-run noise, the NEW
-//! NEON is the new arm (was absent from the dispatcher in the prior
-//! round but the kernel function itself was unchanged):
+//! We benchmarked three implementations at 256² / 1024² / 4096² pixel
+//! counts (the same shape as the canvas-fill bench):
 //!
 //! | impl                                                  | 256² (≈196k B src) | 1024² (≈3.1M B src) | 4096² (≈50M B src) |
 //! | ----------------------------------------------------- | ------------------:| -------------------:| ------------------:|
@@ -78,22 +68,11 @@
 //! arms the scalar's auto-vectorized output is ~13–17 % faster than
 //! the hand-rolled NEON tile at every benched size.
 //!
-//! # Decision — RULE OVERRIDE: ship the NEON kernel anyway
+//! # Why the NEON kernel ships unconditionally
 //!
-//! The §5.4 default decision rule for this module says "ship the NEON
-//! kernel only if it is ≥ 2× faster than the new scalar at 4096²". By
-//! that rule, on these benched sizes on M-series Apple silicon, the
-//! NEON kernel **fails** (it is ~13–15 % *slower* than the auto-
-//! vectorized scalar). The earlier round of this PR therefore dropped
-//! it.
-//!
-//! **That decision has been reversed — this kernel ships the NEON
-//! arm despite being slower on the benched shape**, per explicit user
-//! directive:
-//!
-//! > "do not trust auto-vectorized, please impl the NEON backend"
-//!
-//! Rationale for overriding the §5.4 rule for this specific kernel:
+//! The NEON kernel ships even though it is ~13–15 % *slower* than the
+//! auto-vectorized scalar on the benched sizes (M-series Apple
+//! silicon). Rationale:
 //!
 //! 1. **Auto-vectorization is compiler-version-dependent.** The scalar
 //!    path's speed comes from LLVM's auto-vectorizer recognising the
@@ -104,13 +83,13 @@
 //!    scalar path — and the regression would not show up as a test
 //!    failure (the output is still bit-identical), only as a hidden
 //!    runtime cliff that we would catch only if someone re-ran the
-//!    bench. The §5.4 rule's "scalar is fast enough" reasoning is
+//!    bench. The default rule's "scalar is fast enough" reasoning is
 //!    silently load-bearing on LLVM heuristics that the SIMD module's
 //!    other contracts deliberately do **not** depend on.
 //! 2. **The SIMD module's contract is to provide a guaranteed arch-
 //!    specific kernel.** Every other kernel in `simd::*` ships a hand-
 //!    rolled `#[target_feature(enable = "neon")]` NEON arm whose
-//!    behaviour does not depend on auto-vectorization. C4 dropping the
+//!    behaviour does not depend on auto-vectorization. Dropping the
 //!    NEON arm was an unprincipled exception — the auto-vec scalar
 //!    cannot be relied on across toolchains the way an `unsafe fn`
 //!    annotated with the target feature can.
@@ -127,14 +106,6 @@
 //!    oracle and as the dispatcher's only routing target on non-
 //!    aarch64 targets — none of (1)/(2)/(3) costs us its presence.
 //!
-//! This override does **not** change the §5.4 decision rule itself
-//! (other kernel triples — current and future — still apply it
-//! verbatim). It is a kernel-specific exception, documented here so a
-//! later reader (or a future LLVM upgrade) sees both the bench numbers
-//! and the durability argument. The bench file (`mlxrs/benches/
-//! simd_bgr_widen.rs`) carries a matching note that its numbers do
-//! **not** drive the ship decision for this kernel.
-//!
 //! Why the NEON kernel "loses" on the bench: the `vld3q_u8` 3-way de-
 //! interleave + the `vst3q_f32` permuted 3-way interleave have higher
 //! per-iteration ALU cost than the scalar `MaybeUninit::write` triple's
@@ -146,15 +117,14 @@
 //! saturates that bandwidth on M-series silicon. None of that
 //! invalidates the durability argument above.
 //!
-//! Concrete bench numbers + the decision-reversal context live in the
-//! local-only `docs/core-arch-simd-candidates.md` C4 section and the
-//! bench file (`mlxrs/benches/simd_bgr_widen.rs` — kept in-tree as a
+//! Concrete bench numbers live in the bench file
+//! (`mlxrs/benches/simd_bgr_widen.rs` — kept in-tree as a
 //! regression guard against both a future scalar regression and a
 //! future NEON regression).
 //!
 //! # Correctness class — `Exact`
 //!
-//! C4 is pure data movement plus a lossless u8 → f32 widen (every u8
+//! This kernel is pure data movement plus a lossless u8 → f32 widen (every u8
 //! is exactly representable in f32). The scalar arm and the NEON arm
 //! produce **bit-identical** output for every input — the NEON kernel
 //! performs the same `f32::from(u8)` widen via `vcvtq_f32_u32`
@@ -252,7 +222,8 @@ use core::arch::aarch64::{
 /// (defeating the uninit-safe API) or an `assume_init_mut` cast over
 /// uninit memory (UB). LLVM auto-vectorizes this shape cleanly on
 /// aarch64; the NEON kernel ships anyway for the durability reasons
-/// in the module-level doc's "Decision" paragraph.
+/// in the module-level doc's "Why the NEON kernel ships unconditionally"
+/// section.
 #[inline]
 #[doc(hidden)]
 pub fn bgr_widen_scalar(out: &mut [MaybeUninit<f32>], src: &[u8]) {
@@ -278,7 +249,7 @@ pub fn bgr_widen_scalar(out: &mut [MaybeUninit<f32>], src: &[u8]) {
   for (out_px, src_px) in out.chunks_exact_mut(3).zip(src.chunks_exact(3)) {
     // R↔B swap encoded in the read indices: write R = src[2],
     // G = src[1], B = src[0]. Bit-exact match for the scalar arm at
-    // the pre-C4 call site (`buf.push(f32::from(px[2])); push(px[1]);
+    // the original call site (`buf.push(f32::from(px[2])); push(px[1]);
     // push(px[0]);`).
     out_px[0].write(f32::from(src_px[2]));
     out_px[1].write(f32::from(src_px[1]));
@@ -482,9 +453,9 @@ pub(crate) unsafe fn bgr_widen_neon(out: &mut [MaybeUninit<f32>], src: &[u8]) {
 /// - `out.len() == src.len()` — one output f32 per input byte.
 ///
 /// Both are asserted **unconditionally** (release-too — keeping the
-/// assertion shape consistent with C6's dispatcher and with the
-/// "dispatcher asserts unconditionally" rule in the X5 infrastructure
-/// doc). Both internal kernels ([`bgr_widen_scalar`] and
+/// assertion shape consistent with the canvas-fill dispatcher and with the
+/// "dispatcher asserts unconditionally" rule the SIMD kernels follow).
+/// Both internal kernels ([`bgr_widen_scalar`] and
 /// [`bgr_widen_neon`]) also assert these preconditions unconditionally
 /// at their own entry points so direct callers (the bench, the tests,
 /// any future caller bypassing the dispatcher) are equally protected
@@ -500,9 +471,7 @@ pub(crate) unsafe fn bgr_widen_neon(out: &mut [MaybeUninit<f32>], src: &[u8]) {
 /// `spare_capacity_mut()`).
 ///
 /// Tracking: [#149](https://github.com/Findit-AI/mlxrs/issues/149).
-/// See `docs/core-arch-simd-candidates.md` §2 row C4 + §3.3 + §5.5
-/// execution order — C4 is the third kernel after C6 (`pad_to_square`
-/// fill) and C1 (PCM decode widen), and is the BGR arm that LLVM
+/// This is the BGR arm that LLVM
 /// originally failed to auto-vectorize (the destination-side 3-element
 /// shuffle was opaque to the iterator-level loop analysis the
 /// auto-vectorizer ran on `Vec::push`). The fix is both a restructure
@@ -514,13 +483,11 @@ pub(crate) unsafe fn bgr_widen_neon(out: &mut [MaybeUninit<f32>], src: &[u8]) {
 ///
 /// Why ship the NEON arm despite the bench showing the auto-vec
 /// scalar is faster on the measured M-series sizes: see the module-
-/// level doc's "Decision — RULE OVERRIDE" paragraph. The TL;DR is
-/// auto-vectorization is compiler-version-dependent and the SIMD
-/// module's contract is to provide a guaranteed arch-specific kernel
-/// that does not depend on LLVM heuristics; the user directive ("do
-/// not trust auto-vectorized, please impl the NEON backend") makes
-/// this a deliberate per-kernel exception to the §5.4 2×-rule, not a
-/// blanket change to the rule itself.
+/// level doc's "Why the NEON kernel ships unconditionally" section.
+/// The TL;DR is auto-vectorization is compiler-version-dependent and the
+/// SIMD module's contract is to provide a guaranteed arch-specific kernel
+/// that does not depend on LLVM heuristics, so the hand-rolled NEON kernel
+/// is the durable arch-specific contract.
 ///
 /// # Correctness class
 ///
@@ -575,7 +542,7 @@ pub fn bgr_widen(out: &mut [MaybeUninit<f32>], src: &[u8]) {
 #[cfg(test)]
 mod tests {
   //! Scalar vs dispatcher + scalar vs NEON differential tests + edge
-  //! / behavioural coverage for C4.
+  //! / behavioural coverage for the BGR widen.
   //!
   //! # Test adapter pattern
   //!
@@ -595,8 +562,7 @@ mod tests {
   //!
   //! # Differential class
   //!
-  //! The dispatcher routes to the NEON arm on `aarch64` (per the §5.4
-  //! rule-override documented in the module-level doc). The
+  //! The dispatcher routes to the NEON arm on `aarch64`. The
   //! scalar-vs-dispatcher tests therefore exercise NEON-vs-scalar
   //! transitively; the explicit
   //! [`bgr_widen_neon_matches_scalar_bit_identical`] test asserts the
@@ -742,7 +708,7 @@ mod tests {
     }
   }
 
-  /// Lane-sweep coverage at `lanes = 16` includes the C4-relevant
+  /// Lane-sweep coverage at `lanes = 16` includes the BGR-widen-relevant
   /// boundary pixel-counts: 0 (empty), 1 (single pixel, body=0,
   /// tail=1), 15 (single-tile-just-below, body=0, tail=15), 16
   /// (one full NEON tile, body=16, tail=0), 17 (one tile + 1 tail
@@ -852,8 +818,8 @@ mod tests {
   /// tail for the NEON arm) and locks the NEON arm's plane-order
   /// against the OLD-loop byte sequence end-to-end.
   ///
-  /// Pins the contract that the C4 dispatcher is bit-exactly
-  /// equivalent to the pre-C4 idiom at the call site — a future kernel
+  /// Pins the contract that the BGR-widen dispatcher is bit-exactly
+  /// equivalent to the original idiom at the call site — a future kernel
   /// change that subtly altered the plane order or the widen
   /// arithmetic would regression-fail here loudly.
   #[test]
@@ -915,7 +881,7 @@ mod tests {
       let raw = make_pattern();
       assert_eq!(raw.len(), n_bytes, "pattern {name} length mismatch");
 
-      // OLD path — inline copy of the pre-C4 idiom (per-pixel three
+      // OLD path — inline copy of the original idiom (per-pixel three
       // `buf.push(f32::from(px[2|1|0]))` on a `Vec<f32>` grown from
       // `Vec::with_capacity(n_bytes)`).
       let mut old: Vec<f32> = Vec::with_capacity(n_bytes);
@@ -932,7 +898,7 @@ mod tests {
 
       assert_eq!(
         new, old,
-        "C4 dispatcher must produce byte-identical output to the OLD \
+        "dispatcher must produce byte-identical output to the reference \
          `chunks_exact(3) + push * 3` loop (pattern={name}, n_bytes={n_bytes})"
       );
     }

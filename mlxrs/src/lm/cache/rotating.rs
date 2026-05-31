@@ -142,7 +142,7 @@ impl RotatingKvCache {
   /// `name` identifies the target buffer (`"keys"` / `"values"`) for the
   /// non-seq-axes write-shape compatibility error message.
   ///
-  /// Structural class-kill (closes #78 P1 iter5): mlx-lm's
+  /// Structural class-kill (closes #78): mlx-lm's
   /// `self.<buf>[..., a:a+s, :] = new` slice-assignment routes through
   /// `slice_update`, which broadcasts the RHS to the slice shape
   /// (`mlx/ops.cpp:843` — `broadcast_to(update, upd_shape)`). Our
@@ -229,7 +229,7 @@ impl RotatingKvCache {
       _ => None,
     };
     let (bk, bv) = if let Some((tk, tv)) = reordered {
-      // CORE-1 v2 (Codex round-2 fix): compute `trim_size` from the
+      // Compute `trim_size` from the
       // temporal-order length WITHOUT mutating `self.idx`. Mirrors
       // mlx-lm's two-step at `cache.py:458 + cache.py:462`
       // (`self._idx = self.keys.shape[2]`, then
@@ -663,7 +663,7 @@ impl KvCache for RotatingKvCache {
       // loaded `max_size`/`offset` near `usize::MAX` would here wrap
       // (release) / panic (debug) BEFORE `create_causal_mask`'s checked-add
       // can catch it, possibly flipping this decision. Compute it checked
-      // (matching the round-2 `create_causal_mask` fix); the comparison
+      // (matching `create_causal_mask`'s checked-add); the comparison
       // result is byte-identical to `offset + n` for every non-overflowing
       // input, so the decision outcome is unchanged.
       let offset_plus_n = offset.checked_add(n).ok_or_else(|| {
@@ -779,7 +779,7 @@ impl KvCache for RotatingKvCache {
     "RotatingKVCache"
   }
 
-  /// P1 #110: per-layer fast-path downcast target — see the
+  /// Per-layer fast-path downcast target (#110) — see the
   /// [`KvCache`]-trait doc's **Per-layer fast-path convention**.
   fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
     self

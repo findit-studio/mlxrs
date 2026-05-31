@@ -1,4 +1,4 @@
-//! Deterministic tests for the M3 KV cache (`mlxrs::lm::cache`), ported from
+//! Deterministic tests for the KV cache (`mlxrs::lm::cache`), ported from
 //! `mlx_lm.models.cache` (`KVCache` / `ConcatenateKVCache` /
 //! `RotatingKVCache`) and cross-checked against mlx-swift-lm's `MLXLMCommon`
 //! KV cache.
@@ -13,7 +13,7 @@ use mlxrs::{
   Array, Error, Stream,
   lm::cache::{
     ArraysCache, BatchKvCache, BatchRotatingKvCache, CacheConfig, CacheList, ChunkedKvCache,
-    KvCache, MaskMode, QuantizedKvCacheImpl, RopeOffset, RotatingKvCache, StandardKvCache,
+    KvCache, MaskMode, RopeOffset, RotatingKvCache, StandardKvCache, StandardQuantizedKvCache,
     create_attention_mask, create_causal_mask, from_state, make_prompt_cache,
   },
 };
@@ -75,14 +75,13 @@ fn standard_wrong_rank_errors() {
   assert!(c.update(&bad, &bad).is_err());
 }
 
-/// Regression (rank-safety, no panic on a recoverable path): the merged
-/// faithful-revert removed the non-faithful K/V seq cross-check, leaving
-/// `RotatingKvCache::update_in_place` (S==1) reading `values.shape()[3]`
-/// raw. A rank-invalid `values` (with valid 4-D `keys`) must surface as a
-/// recoverable `Err(Error::RankMismatch(_))` (the faithful equivalent of
-/// mlx-lm `cache.py:478` `values.shape[3]` raising a catchable
-/// `IndexError`), NEVER a Rust slice out-of-bounds panic on the
-/// `Result`-returning public `update`.
+/// Regression (rank-safety, no panic on a recoverable path): without a
+/// per-tensor rank guard, `RotatingKvCache::update_in_place` (S==1) reads
+/// `values.shape()[3]` raw. A rank-invalid `values` (with valid 4-D
+/// `keys`) must surface as a recoverable `Err(Error::RankMismatch(_))`
+/// (the faithful equivalent of mlx-lm `cache.py:478` `values.shape[3]`
+/// raising a catchable `IndexError`), NEVER a Rust slice out-of-bounds
+/// panic on the `Result`-returning public `update`.
 #[test]
 fn rotating_update_in_place_rank_invalid_values_errors_no_panic() {
   let mut c = RotatingKvCache::new(8, 4);
@@ -236,7 +235,7 @@ fn rotating_keeps_prefix_and_window() {
   // physical ring overwriting slots `keep..max_size` IN PLACE. The expected
   // values are the *physical* buffer order (NOT temporal order) — traced
   // 1:1 from `mlx_lm/models/cache.py`: once the ring is active, token 8
-  // overwrites slot 4 → [0,1,2,3,8,5,6,7] (Codex's parity counterexample),
+  // overwrites slot 4 → [0,1,2,3,8,5,6,7],
   // token 9 slot 5, etc. `offset` is the raw monotone counter (mlx-lm
   // `.offset`), never capped at `max_size`.
   let mut c = RotatingKvCache::new(8, 4);
@@ -779,7 +778,7 @@ fn from_state_roundtrip_and_unknown_kind() {
   assert!(from_state("ChunkedKvCache", Vec::new(), &[]).is_err());
 }
 
-/// Regression (FINDING 2): mlx-lm/Swift rotating state setters require a
+/// Regression: mlx-lm/Swift rotating state setters require a
 /// non-empty (two-array) state, so an empty buffer paired with a non-zero
 /// `offset`/`idx` is unreachable upstream. `from_state` must reject that
 /// inconsistent combination (it would otherwise let the next `update`
@@ -831,9 +830,9 @@ fn from_state_rotating_empty_with_nonzero_meta_is_invalid() {
   assert_eq!(ok.max_size(), Some(8));
 }
 
-// ── Copilot: `offset += S` ring-update overflow ──────────────────────────
+// ── `offset += S` ring-update overflow ──────────────────────────
 
-/// Regression (Copilot): `RotatingKvCache`'s ring update advances
+/// Regression: `RotatingKvCache`'s ring update advances
 /// `self.offset += S` (mlx-lm `cache.py:464`/`:506`). A corrupt/hostile
 /// prompt cache can restore `offset` near `usize::MAX` via `set_meta_state`
 /// (a non-empty, minimal-valid state so `from_state`'s `empty ⇒
@@ -903,9 +902,9 @@ fn rotating_offset_overflow_is_rejected_without_partial_mutation() {
   assert_eq!(c.state().unwrap().len(), before_state_len);
 }
 
-// ── Copilot: `set_meta_state` atomic restore ─────────────────────────────
+// ── `set_meta_state` atomic restore ─────────────────────────────
 
-/// Regression (Copilot): `RotatingKvCache::set_meta_state` parses
+/// Regression: `RotatingKvCache::set_meta_state` parses
 /// `(keep, max_size, offset, idx)` (cache.py:531-533). A parse error on a
 /// later value must NOT leave earlier fields mutated — the call is atomic
 /// (all four parse OK, then all four assigned), so a failed `set_meta_state`
@@ -959,7 +958,7 @@ fn rotating_set_meta_state_is_atomic_on_malformed_input() {
   );
 }
 
-// ── iarange f32-exactness bound (Copilot finding 1) ──────────────────────
+// ── iarange f32-exactness bound ──────────────────────
 
 /// `iarange(start, stop)` (mask.rs) builds index positions through the
 /// `f32`-only `Array::arange` AND casts its own *exclusive* `stop` to `f32`.
@@ -1066,7 +1065,7 @@ fn iarange_mask_exact_in_range_and_rejects_past_f32_limit() {
   );
 }
 
-// ── Copilot finding 3: offset + N must not panic/wrap before iarange ─────
+// ── offset + N must not panic/wrap before iarange ─────
 
 /// `create_causal_mask` computes `offset + N` with `checked_add` *before*
 /// building any range. A hostile/corrupt loaded `offset` (mlx-lm prompt
@@ -1120,7 +1119,7 @@ fn create_causal_mask_offset_plus_n_overflow_is_err_not_panic() {
   }
 }
 
-// ── Copilot finding 4: window_size >= range is mlx-lm's unbounded no-op ───
+// ── window_size >= range is mlx-lm's unbounded no-op ───
 
 /// mlx-lm `base.py:create_causal_mask` applies
 /// `mask & (linds < rinds + window_size)` with unbounded Python ints, so a
@@ -1197,10 +1196,10 @@ fn create_causal_mask_huge_window_is_unwindowed_noop() {
   );
 }
 
-// ── Copilot finding 3: RotatingKvCache::make_mask N>1 offset+N overflow ──
+// ── RotatingKvCache::make_mask N>1 offset+N overflow ──
 
 /// `RotatingKvCache::make_mask`'s `N > 1` branch (cache.py:557-563) computes
-/// `offset + N` with `checked_add` (matching the round-2
+/// `offset + N` with `checked_add` (matching the
 /// `create_causal_mask` fix) BEFORE the `offset + N > window_size` decision.
 /// A hostile/corrupt loaded `max_size`/`offset` (mlx-lm prompt cache
 /// `set_meta_state`) near `usize::MAX` would otherwise overflow usize here —
@@ -1301,7 +1300,7 @@ fn rotating_make_mask_n_gt_1_offset_plus_n_overflow_is_err_not_panic() {
   );
 }
 
-// ── Copilot FINDING 2: window_size `or self.max_size` Python truthiness ───
+// ── window_size `or self.max_size` Python truthiness ───
 
 /// `RotatingKvCache::make_mask`'s `N > 1` branch ports
 /// `window_size = window_size or self.max_size` (cache.py:558). Python `or`
@@ -1388,7 +1387,7 @@ fn rotating_make_mask_n_gt_1_window_size_zero_is_max_size() {
   );
 }
 
-// ── Copilot FINDING 1: rope_offset default dispatch is non-batch-preserving
+// ── rope_offset default dispatch is non-batch-preserving
 
 /// `KvCache::rope_offset`'s default now auto-dispatches through
 /// [`KvCache::as_batch_positioned`] (mirroring mlx-swift-lm's
@@ -1442,7 +1441,7 @@ fn rope_offset_default_is_scalar_for_non_batch_caches() {
   }
 }
 
-/// Regression (#76, P6 cycle-8): the `KvCache::set_meta_state` trait default
+/// Regression (#76): the `KvCache::set_meta_state` trait default
 /// must mirror mlx-lm `_BaseCache.meta_state` setter (`cache.py:142-145`):
 /// a no-meta cache that receives a non-empty `meta_state` MUST raise
 /// (`ValueError` upstream → recoverable `Err(Error::LengthMismatch)` here),
@@ -1452,10 +1451,10 @@ fn rope_offset_default_is_scalar_for_non_batch_caches() {
 /// `ConcatenateKVCache` / mlx-swift-lm's `KVCacheSimple` (`from_state` aliases
 /// all three to `StandardKvCache::new() + set_state + set_meta_state`,
 /// `mod.rs:262-267`); it does NOT override `set_meta_state`, so it inherits
-/// the trait default. Pre-fix the default was a permissive `Ok(())` and a
-/// truthy meta_state silently round-tripped — this test pins the faithful
-/// behaviour for every alias of the no-meta cache and confirms an empty
-/// `meta` still succeeds.
+/// the trait default. A naive default would be a permissive `Ok(())` that
+/// lets a truthy meta_state silently round-trip — this test pins the
+/// faithful behaviour for every alias of the no-meta cache and confirms an
+/// empty `meta` still succeeds.
 ///
 /// (`RotatingKvCache` / `ChunkedKvCache` override `set_meta_state` with their
 /// own parsing and are unaffected — their meta-validation tests above
@@ -1493,8 +1492,8 @@ fn from_state_no_meta_cache_rejects_truthy_meta_state() {
          (mirroring mlx-lm _BaseCache.meta_state setter cache.py:142-145), got {other:?}"
       ),
       Ok(_) => panic!(
-        "kind {kind}: truthy meta_state must NOT silently round-trip (issue #76 P6 \
-         cycle-8 regression — pre-fix the trait default was a permissive Ok)"
+        "kind {kind}: truthy meta_state must NOT silently round-trip (issue #76 — \
+         a permissive Ok trait default would let it through)"
       ),
     }
 
@@ -1544,7 +1543,7 @@ fn from_state_no_meta_cache_rejects_truthy_meta_state() {
   }
 }
 
-/// Regression (closes #78 P1 iter5 — structural class-kill at `set_seq`'s
+/// Regression (closes #78 — structural class-kill at `set_seq`'s
 /// boundary, rotating cache half): the same defect class as the chunked test
 /// `chunked_set_seq_full_window_rejects_mismatched_batch_dim`. `RotatingKvCache`'s
 /// in-place `set_seq` is also implemented as `concat_parts([head, new,
@@ -1584,8 +1583,9 @@ fn rotating_set_seq_full_window_rejects_mismatched_batch_dim() {
 
   // Mismatched-batch single-token KV (`[2,1,1,1]`). update_in_place sees
   // prev=0, cur_len=1, no grow, no trim, idx=0 stays 0, set_seq("keys",
-  // buf=[1,1,1,1], 0, 1, new=[2,1,1,1]) → full-window. BEFORE FIX: silent
-  // batch-axis mutation. WITH FIX: Err(ShapePairMismatch).
+  // buf=[1,1,1,1], 0, 1, new=[2,1,1,1]) → full-window. An unchecked write
+  // would silently mutate the batch axis; the guard makes it
+  // Err(ShapePairMismatch).
   let bad_kv2 = Array::from_slice::<f32>(&[9.0, 9.5], &(2usize, 1, 1, 1)).unwrap();
   let r = c.update(&bad_kv2, &bad_kv2);
   match &r {
@@ -1601,7 +1601,7 @@ fn rotating_set_seq_full_window_rejects_mismatched_batch_dim() {
     }
     _ => panic!(
       "rotating full-window set_seq must reject batch-axis mismatch on the public \
-       update API as ShapePairMismatch (closes #78 P1 iter5), got {r:?}"
+       update API as ShapePairMismatch (closes #78), got {r:?}"
     ),
   }
 
@@ -1737,7 +1737,7 @@ fn set_seq_write_shape_compat_helper_semantics_via_chunked() {
 /// is byte-identical to what mlx-lm itself would produce; subsequent ops
 /// support strided/broadcast views via mlx's lazy primitives. Shape is the
 /// load-bearing claim (the buffer's batch axis was NOT silently shrunk to
-/// 1 — the bug Codex flagged in iter-2 review).
+/// 1).
 #[test]
 fn rotating_set_seq_full_window_broadcasts_size_one_rhs() {
   let seed2 = Array::from_slice::<f32>(&[10.0, 20.0], &(2usize, 1, 1, 1)).unwrap();
@@ -1773,14 +1773,13 @@ fn rotating_set_seq_full_window_broadcasts_size_one_rhs() {
   assert_eq!(v.shape(), vec![2, 1, 1, 1]);
 }
 
-/// Regression (Codex iter-2 follow-up to #78): the hotfix made
-/// `set_seq` fail recoverably on a non-broadcastable RHS; previously the
-/// `[one]` concat shortcut silently accepted any 4-D `new`, so the
-/// `update_in_place` "trim then splice" sequence was infallible on the
-/// splice step. Without `update_in_place` being transactional, a failing
-/// full-window splice would now commit the pre-write TRIM but reject the
-/// write — partial mutation, dropped context, divergent retry/persisted
-/// state.
+/// Regression (follow-up to #78): `set_seq` fails recoverably on a
+/// non-broadcastable RHS. A `[one]` concat shortcut that silently accepted
+/// any 4-D `new` would make the `update_in_place` "trim then splice"
+/// sequence infallible on the splice step. Without `update_in_place` being
+/// transactional, a failing full-window splice would commit the pre-write
+/// TRIM but reject the write — partial mutation, dropped context, divergent
+/// retry/persisted state.
 ///
 /// Concrete trigger via the public API: `max_size=1, keep=0`, an `S=2`
 /// prefill that leaves `shape[2] = 2 > max_size = 1` (the over-retained
@@ -1825,13 +1824,13 @@ fn rotating_update_in_place_partial_mutation_on_set_seq_err_is_rejected() {
     }
     _ => panic!(
       "non-broadcastable full-window RHS must be Err::ShapePairMismatch on the \
-       public update API (Codex iter-2 follow-up to #78), got {r:?}"
+       public update API (follow-up to #78), got {r:?}"
     ),
   }
 
   // Critical: `self` MUST be byte-identical to its pre-update state. The
   // trim to length 1 + `idx -> keep` cursor reset must NOT have committed
-  // (that was the partial-mutation defect Codex flagged).
+  // (that was the partial-mutation defect).
   assert_eq!(c.offset(), 2, "offset must NOT advance on a failed update");
   assert_eq!(
     c.meta_state(),
@@ -1850,16 +1849,16 @@ fn rotating_update_in_place_partial_mutation_on_set_seq_err_is_rejected() {
 }
 
 // ============================================================
-// P1 #110 — per-layer fast-path downcast via `as_any_mut`
+// Per-layer fast-path downcast via `as_any_mut` (#110)
 // ============================================================
 
-/// P1 #110: a `Box<dyn KvCache>` can downcast back to its concrete type
+/// A `Box<dyn KvCache>` can downcast back to its concrete type
 /// via `as_any_mut().downcast_mut::<ConcreteCache>()`. This is the
 /// **convention** the per-layer fast-path uses inside `Model::forward`:
 /// once per layer, the downcast amortizes the vtable cost; every
 /// subsequent per-layer method call is static dispatch.
 #[test]
-fn p1_kvcache_as_any_mut_downcasts_to_standard() {
+fn kvcache_as_any_mut_downcasts_to_standard() {
   let mut boxed: Box<dyn KvCache> = Box::new(StandardKvCache::new());
   let any = boxed.as_any_mut();
   let std_cache: Option<&mut StandardKvCache> = any.downcast_mut::<StandardKvCache>();
@@ -1873,10 +1872,10 @@ fn p1_kvcache_as_any_mut_downcasts_to_standard() {
   assert!(wrong.is_none(), "wrong-type downcast must return None");
 }
 
-/// P1 #110: same for `RotatingKvCache` — every in-tree cache overrides
+/// Same for `RotatingKvCache` — every in-tree cache overrides
 /// `as_any_mut` with the canonical `self` body so the downcast works.
 #[test]
-fn p1_kvcache_as_any_mut_downcasts_to_rotating() {
+fn kvcache_as_any_mut_downcasts_to_rotating() {
   let mut boxed: Box<dyn KvCache> = Box::new(RotatingKvCache::new(8, 1));
   let any = boxed.as_any_mut();
   assert!(any.downcast_mut::<RotatingKvCache>().is_some());
@@ -1884,15 +1883,15 @@ fn p1_kvcache_as_any_mut_downcasts_to_rotating() {
   assert!(any.downcast_mut::<StandardKvCache>().is_none());
 }
 
-/// P1 #110: same for `ChunkedKvCache`.
+/// Same for `ChunkedKvCache`.
 #[test]
-fn p1_kvcache_as_any_mut_downcasts_to_chunked() {
+fn kvcache_as_any_mut_downcasts_to_chunked() {
   let mut boxed: Box<dyn KvCache> = Box::new(ChunkedKvCache::new(Some(8)));
   let any = boxed.as_any_mut();
   assert!(any.downcast_mut::<ChunkedKvCache>().is_some());
 }
 
-/// P1 #110: parameterized coverage — every one of the 8 in-tree
+/// Parameterized coverage — every one of the 8 in-tree
 /// [`KvCache`] implementations must satisfy the
 /// `as_any_mut().downcast_mut::<ConcreteCache>()` round-trip with the
 /// canonical `self` body. This catches a missing `as_any_mut` override on
@@ -1907,7 +1906,7 @@ fn p1_kvcache_as_any_mut_downcasts_to_chunked() {
 /// the [`Any`](std::any::Any) `TypeId` carried through is the cache's
 /// own, not some uniform placeholder).
 #[test]
-fn p1_kvcache_as_any_mut_downcasts_for_all_8_in_tree_impls() {
+fn kvcache_as_any_mut_downcasts_for_all_8_in_tree_impls() {
   // 1. StandardKvCache
   {
     let mut boxed: Box<dyn KvCache> = Box::new(StandardKvCache::new());
@@ -1965,22 +1964,22 @@ fn p1_kvcache_as_any_mut_downcasts_for_all_8_in_tree_impls() {
     );
   }
 
-  // 4. QuantizedKvCacheImpl
+  // 4. StandardQuantizedKvCache
   {
-    let mut boxed: Box<dyn KvCache> = Box::new(QuantizedKvCacheImpl::new(64, 8).unwrap());
+    let mut boxed: Box<dyn KvCache> = Box::new(StandardQuantizedKvCache::new(64, 8).unwrap());
     assert!(
       boxed
         .as_any_mut()
-        .downcast_mut::<QuantizedKvCacheImpl>()
+        .downcast_mut::<StandardQuantizedKvCache>()
         .is_some(),
-      "QuantizedKvCacheImpl: positive downcast must succeed"
+      "StandardQuantizedKvCache: positive downcast must succeed"
     );
     assert!(
       boxed
         .as_any_mut()
         .downcast_mut::<StandardKvCache>()
         .is_none(),
-      "QuantizedKvCacheImpl: wrong-type downcast must return None"
+      "StandardQuantizedKvCache: wrong-type downcast must return None"
     );
   }
 
@@ -2078,14 +2077,14 @@ fn p1_kvcache_as_any_mut_downcasts_for_all_8_in_tree_impls() {
 /// post-materialize `state()` and the `nbytes()` "stored buffer == offset
 /// length" invariant.
 ///
-/// Strengthened per Codex #2 (which noted the original only checked
-/// values/offset unchanged, so a no-op materialize would pass): the `nbytes()`
-/// pin confirms the buffer `materialize` evals is exactly the 4-row stored
-/// buffer (== `state()`), i.e. this cache has no over-allocated ring where the
-/// slice and the stored buffer diverge (contrast the RotatingKvCache test).
-/// RESIDUAL (same as the rotating case): `Array` exposes no `is_evaled` query
-/// and `eval` is value/shape-preserving, so no public-API assertion can fail
-/// on a *complete* no-op materialize — flagged for the controller.
+/// Checking only values/offset unchanged would let a no-op materialize
+/// pass, so the `nbytes()` pin additionally confirms the buffer
+/// `materialize` evals is exactly the 4-row stored buffer (== `state()`),
+/// i.e. this cache has no over-allocated ring where the slice and the
+/// stored buffer diverge (contrast the RotatingKvCache test).
+/// Limitation (same as the rotating case): `Array` exposes no `is_evaled`
+/// query and `eval` is value/shape-preserving, so no public-API assertion
+/// can fail on a *complete* no-op materialize.
 #[test]
 fn standard_materialize_noop_empty_and_eval_populated() {
   // Empty cache: materialize is a no-op and the cache stays empty.
@@ -2132,23 +2131,22 @@ fn standard_materialize_noop_empty_and_eval_populated() {
 /// `RotatingKvCache::materialize` evals the FULL stored ring buffer (the
 /// array the next chunk reuses), NOT the `offset`-length `state()` slice.
 ///
-/// Strengthened per Codex #2: the original assertions only checked
-/// values/offset unchanged, so an empty (no-op) `materialize` would also pass.
-/// This now drives the ring into the OVER-ALLOCATED regime (`offset <
-/// buffer_len`) — the exact case the `materialize` doc says `state()` slices
-/// away (rotating.rs:486-507, mod.rs:281-309) — and pins the FULL stored buffer
-/// via `nbytes()` (which reads `self.keys`/`self.values`, the full ring, not
-/// the slice; util.rs:296-300). With `max_size=8` the first S==1 decode grows
-/// the ring to all 8 rows at once (`new_size = ROTATING_STEP.min(max_size -
-/// prev) = 256.min(8) = 8`, rotating.rs:339), so after 3 decodes the stored
-/// buffer is 8 rows while `state()` returns only 3 — making the full-buffer
-/// path that `materialize` evaluates observably distinct from the `state()`
-/// slice (Codex's "verify the full stored buffer path, not only the state
-/// slice"). RESIDUAL: `Array` exposes no `is_evaled`/`is_available` query and
-/// `eval` is value/shape-preserving (array/mod.rs:103-123), so NO public-API
-/// assertion can fail on a *complete* no-op materialize; the full-buffer
-/// regime + the `Ok` eval of that 8-row buffer are the strongest test-only
-/// pins (flagged for the controller).
+/// Checking only values/offset unchanged would let an empty (no-op)
+/// `materialize` pass, so this drives the ring into the OVER-ALLOCATED
+/// regime (`offset < buffer_len`) — the exact case the `materialize` doc
+/// says `state()` slices away (rotating.rs:486-507, mod.rs:281-309) — and
+/// pins the FULL stored buffer via `nbytes()` (which reads
+/// `self.keys`/`self.values`, the full ring, not the slice;
+/// util.rs:296-300). With `max_size=8` the first S==1 decode grows the ring
+/// to all 8 rows at once (`new_size = ROTATING_STEP.min(max_size - prev) =
+/// 256.min(8) = 8`, rotating.rs:339), so after 3 decodes the stored buffer
+/// is 8 rows while `state()` returns only 3 — making the full-buffer path
+/// that `materialize` evaluates observably distinct from the `state()`
+/// slice. Limitation: `Array` exposes no `is_evaled`/`is_available` query
+/// and `eval` is value/shape-preserving (array/mod.rs:103-123), so NO
+/// public-API assertion can fail on a *complete* no-op materialize; the
+/// full-buffer regime + the `Ok` eval of that 8-row buffer are the
+/// strongest test-only pins.
 #[test]
 fn rotating_materialize_noop_empty_and_eval_populated() {
   // Empty: no-op, stays empty.
@@ -2216,7 +2214,7 @@ fn rotating_materialize_noop_empty_and_eval_populated() {
 /// `StandardKvCache::materialize` is NOT a complete no-op — it force-evals the
 /// stored `self.keys`/`self.values` (standard.rs:94-101 via `Array::eval`).
 ///
-/// Codex #2 R2: the `*_noop_empty_and_eval_populated` tests above use
+/// The `*_noop_empty_and_eval_populated` tests above use
 /// `nbytes()` (metadata-only) and `state().to_vec()` (which self-evals its own
 /// clone), so replacing `materialize` with `Ok(())` still passes them — no
 /// public-API assertion can observe a missed eval, because `eval` is
@@ -2268,7 +2266,7 @@ fn standard_materialize_is_not_a_noop_evals_buffers() {
 /// `RotatingKvCache::materialize` is NOT a complete no-op — it force-evals the
 /// stored ring `self.keys`/`self.values` (rotating.rs:499-507 via `Array::eval`).
 ///
-/// Same Codex #2 R2 mechanism as `standard_materialize_is_not_a_noop_evals_buffers`:
+/// Same mechanism as `standard_materialize_is_not_a_noop_evals_buffers`:
 /// on a thread poisoned by `Stream::clear_current_thread_streams`, the `eval`
 /// inside `materialize` trips `assert_streams_not_cleared` and panics, whereas
 /// a no-op `Ok(())` joins cleanly. Built/poisoned/materialized inside the

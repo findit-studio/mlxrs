@@ -1,4 +1,4 @@
-//! [`QuantizedKvCacheImpl`] — the on-the-fly quantized KV cache.
+//! [`StandardQuantizedKvCache`] — the on-the-fly quantized KV cache.
 
 use smol_str::format_smolstr;
 
@@ -77,7 +77,7 @@ type StoredTriple = (Array, Array, Option<Array>);
 /// No implicit eval: every op is a pure [`crate::ops`] composition
 /// returning a `Result`; nothing on a recoverable path panics/unwraps.
 #[derive(Debug)]
-pub struct QuantizedKvCacheImpl {
+pub struct StandardQuantizedKvCache {
   keys: Option<StoredTriple>,
   values: Option<StoredTriple>,
   /// The cached sequence length — mlx-lm `QuantizedKVCache.offset`
@@ -90,7 +90,7 @@ pub struct QuantizedKvCacheImpl {
   bits: i32,
 }
 
-impl Default for QuantizedKvCacheImpl {
+impl Default for StandardQuantizedKvCache {
   /// mlx-lm `QuantizedKVCache.__init__(group_size=64, bits=8)`
   /// (`cache.py:235`) / mlx-swift-lm `QuantizedKVCache(groupSize: 64,
   /// bits: 8)` (`KVCache.swift:753`).
@@ -101,7 +101,7 @@ impl Default for QuantizedKvCacheImpl {
   }
 }
 
-impl QuantizedKvCacheImpl {
+impl StandardQuantizedKvCache {
   /// A new, empty quantized cache with the given `group_size` / `bits`
   /// (mlx-lm `QuantizedKVCache(group_size, bits)`, `cache.py:235`).
   ///
@@ -120,14 +120,14 @@ impl QuantizedKvCacheImpl {
   pub fn new(group_size: i32, bits: i32) -> Result<Self> {
     if group_size <= 0 {
       return Err(Error::OutOfRange(OutOfRangePayload::new(
-        "QuantizedKvCacheImpl::new: group_size",
+        "StandardQuantizedKvCache::new: group_size",
         "must be > 0 (used as divisor in dim / group_size)",
         format_smolstr!("group_size={group_size}"),
       )));
     }
     if !matches!(bits, 2 | 3 | 4 | 5 | 6 | 8) {
       return Err(Error::OutOfRange(OutOfRangePayload::new(
-        "QuantizedKvCacheImpl::new: bits",
+        "StandardQuantizedKvCache::new: bits",
         "must be one of {2, 3, 4, 5, 6, 8} (affine quantization widths supported by mlx)",
         format_smolstr!("bits={bits}"),
       )));
@@ -207,7 +207,7 @@ impl QuantizedKvCacheImpl {
   /// from `w` only would commit `offset=5` while `scales` is len 3 —
   /// violating the offset-length invariant on the *components within* a
   /// triple. The within-triple `min` collapses that axis the same way the
-  /// across-K/V `min` does — together they make P2's offset-length
+  /// across-K/V `min` does — together they make this port's offset-length
   /// representation observably identical to mlx-lm's per-component
   /// `[:offset]` for all inputs (consistent or forged), in **every**
   /// asymmetry direction (across-K/V *and* within-(w, scales, biases)). A
@@ -261,7 +261,7 @@ impl QuantizedKvCacheImpl {
     Self::tree_map(t, |a| a.try_clone())
   }
 
-  /// KVC-8 eager cross-validator for [`set_state`](KvCache::set_state).
+  /// Eager cross-validator for [`set_state`](KvCache::set_state).
   /// Checks that the K and V arrays of a given triple-element (one of
   /// `"w"`, `"scales"`, `"biases"`) have matching rank and matching leading
   /// axes — the `[B, n_kv_heads, S]` part of the `[B, n_kv_heads, S, *]`
@@ -585,7 +585,7 @@ impl QuantizedKvCacheImpl {
   }
 }
 
-impl KvCache for QuantizedKvCacheImpl {
+impl KvCache for StandardQuantizedKvCache {
   /// The cached sequence length — mlx-lm `QuantizedKVCache.offset`
   /// (`cache.py:238`).
   fn offset(&self) -> usize {
@@ -705,7 +705,7 @@ impl KvCache for QuantizedKvCacheImpl {
   /// triples; 4 arrays → `(w, scales, None)` triples (bias-less). An empty
   /// state resets to the fresh cache (`_BaseCache` "no state").
   ///
-  /// # Eager cross-validation (KVC-8)
+  /// # Eager cross-validation
   ///
   /// `offset` is **not** derived here (mlx-lm restores it via `meta_state`,
   /// `cache.py:303-304`; the getter slices to whatever `offset`
@@ -713,7 +713,7 @@ impl KvCache for QuantizedKvCacheImpl {
   /// [`Error::OutOfRange`] (mlx-swift-lm `fatalError`s, `KVCache.swift:945`;
   /// this crate forbids a panic on the recoverable load path).
   ///
-  /// KVC-8 additionally cross-validates the K and V triples' rank and
+  /// This additionally cross-validates the K and V triples' rank and
   /// per-axis-not-counting-the-quantization-axis shapes are consistent
   /// (rank match, batch / heads / seq_len match — the leading axes that
   /// the cache treats as a single `[B, n_kv_heads, S, *]` layout). The
@@ -742,7 +742,7 @@ impl KvCache for QuantizedKvCacheImpl {
         let v_w = state.pop().unwrap();
         let k_s = state.pop().unwrap();
         let k_w = state.pop().unwrap();
-        // KVC-8: cross-validate K/V shapes BEFORE assignment so a forged
+        // Cross-validate K/V shapes BEFORE assignment so a forged
         // state with mismatched K/V leading axes is rejected upfront with
         // a precise diagnostic. All four arrays remain in scope on Err
         // (drop-order is the natural Vec drop), and `self` is untouched.
@@ -760,7 +760,7 @@ impl KvCache for QuantizedKvCacheImpl {
         let k_b = state.pop().unwrap();
         let k_s = state.pop().unwrap();
         let k_w = state.pop().unwrap();
-        // KVC-8: cross-validate K/V shapes BEFORE assignment (see 4-arm).
+        // Cross-validate K/V shapes BEFORE assignment (see 4-arm).
         Self::validate_kv_leading_axes_match(&k_w, &v_w, "w")?;
         Self::validate_kv_leading_axes_match(&k_s, &v_s, "scales")?;
         Self::validate_kv_leading_axes_match(&k_b, &v_b, "biases")?;
@@ -814,15 +814,15 @@ impl KvCache for QuantizedKvCacheImpl {
   /// "Parsed" here means *successfully `usize`/`i32` parsed* — there is
   /// **no range / semantic validation** (no group_size > 0 check, no
   /// bits ∈ {2, 4, 8} check) per the NOTE in the body, since neither
-  /// reference impl validates here either (Copilot review #3272690923).
+  /// reference impl validates here either.
   fn set_meta_state(&mut self, m: &[String]) -> Result<()> {
-    // NOTE (Codex review needs-attention): No range-validation of
+    // NOTE: No range-validation of
     // offset/group_size/bits is performed here. Neither mlx-lm
     // `cache.py:302-304` (`map(int, v)`) nor mlx-swift-lm
     // `KVCache.swift:952-961` (only restores `offset`, ignores
     // groupSize/bits entirely on restore) range-validates these fields.
-    // Tightening beyond reference posture diverges from the contract per
-    // [[feedback_match_official_binding_design]]. Downstream `mx.quantize`
+    // Tightening beyond reference posture diverges from the official
+    // binding design. Downstream `mx.quantize`
     // calls error on invalid group_size/bits at the actual op (mlx-c's
     // contract).
     //
@@ -1048,7 +1048,7 @@ impl KvCache for QuantizedKvCacheImpl {
     "QuantizedKVCache"
   }
 
-  /// P1 #110: per-layer fast-path downcast target — see the
+  /// Per-layer fast-path downcast target (#110) — see the
   /// [`KvCache`]-trait doc's **Per-layer fast-path convention**.
   fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
     self
@@ -1059,14 +1059,14 @@ impl KvCache for QuantizedKvCacheImpl {
   /// (`set_state` arity failures; the 3-string mlx-lm / 4-string
   /// mlx-swift-lm meta parse of `offset`/`group_size`/`bits`). All
   /// fallible work runs on a fresh placeholder
-  /// `QuantizedKvCacheImpl::new_unchecked(0, 0)` (the exact placeholder the existing
+  /// `StandardQuantizedKvCache::new_unchecked(0, 0)` (the exact placeholder the existing
   /// [`super::from_state`] dispatch uses); `self` is committed by a single
   /// infallible move only after both setters succeed. The default trait
   /// impl would mutate `self.keys`/`self.values` via `set_state` first and
   /// a later meta-parse failure (e.g. a non-numeric `bits`) would leave
   /// the cache half-restored.
   fn from_serialized(&mut self, state: Vec<Array>, meta: &[String]) -> Result<()> {
-    let mut staged = QuantizedKvCacheImpl::new_unchecked(0, 0);
+    let mut staged = StandardQuantizedKvCache::new_unchecked(0, 0);
     staged.set_state(state)?;
     staged.set_meta_state(meta)?;
     // Post-setter invariant guards — must match `super::from_state`'s
@@ -1093,7 +1093,7 @@ impl KvCache for QuantizedKvCacheImpl {
   }
 }
 
-impl QuantizedKvCache for QuantizedKvCacheImpl {
+impl QuantizedKvCache for StandardQuantizedKvCache {
   /// mlx-lm `QuantizedKVCache.group_size` (`cache.py:239`).
   fn group_size(&self) -> i32 {
     self.group_size

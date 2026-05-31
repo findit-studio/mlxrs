@@ -36,7 +36,7 @@
 //! `/Users/user/Develop/findit-studio/mlx-lm/mlx_lm/gguf.py` so reviewers
 //! can diff line-by-line.
 //!
-//! **Scope boundaries** (`[[project_no_model_arch_porting]]`):
+//! **Scope boundaries:**
 //! - Per-architecture model implementations are NOT ported; the GGUF
 //!   key prefixes are emitted as `llama.*` because the mlx-lm reference
 //!   hard-codes that family (`mlx_lm/gguf.py:146-228` — every key is
@@ -131,8 +131,7 @@ pub struct HfVocab {
   /// the emission walk in [`Self::all_tokens`] can classify each added
   /// token by id against [`Self::special_ids`] — looking up by text via
   /// `specials` would miss config-declared specials whose
-  /// `added_tokens_decoder.special` flag is `false` (Codex round-2,
-  /// Finding 1).
+  /// `added_tokens_decoder.special` flag is `false`.
   added_tokens_list: Vec<(u32, String)>,
   /// Ids of added tokens (`mlx_lm/gguf.py:44`) used to skip them in the
   /// base-vocab walk so an id is never emitted twice.
@@ -414,18 +413,18 @@ impl HfVocab {
     // token whose id is in `special_ids` classifies as `Control`;
     // everything else is `UserDefined`.
     //
-    // Codex round-2 Finding 1: the prior implementation looked the
-    // added-token text up in `self.specials` (the `{text → id}` map
-    // populated only from `added_tokens_decoder` entries flagged
-    // `special=true`). That missed config-declared specials whose
-    // `added_tokens_decoder.special` flag is `false` — e.g. a token
-    // listed in `tokenizer_config.json`'s `additional_special_tokens`
-    // but with `special=false` in the decoder. Such ids ARE unioned
-    // into `special_ids` by the constructor (sources (a) AND (b)),
-    // but the emission walk would have classified them as
-    // `UserDefined`, emitting a `tokenizer.ggml.token_type` array
-    // inconsistent with the constructor's union semantics. Classifying
-    // via `special_ids.contains(&id)` directly (matching the base-vocab
+    // Looking the added-token text up in `self.specials` (the
+    // `{text → id}` map populated only from `added_tokens_decoder`
+    // entries flagged `special=true`) would miss config-declared
+    // specials whose `added_tokens_decoder.special` flag is `false` —
+    // e.g. a token listed in `tokenizer_config.json`'s
+    // `additional_special_tokens` but with `special=false` in the
+    // decoder. Such ids ARE unioned into `special_ids` by the
+    // constructor (sources (a) AND (b)), but a text-based lookup would
+    // classify them as `UserDefined`, emitting a
+    // `tokenizer.ggml.token_type` array inconsistent with the
+    // constructor's union semantics. Classifying via
+    // `special_ids.contains(&id)` directly (matching the base-vocab
     // walk's path) closes the gap.
     for (id, text) in &self.added_tokens_list {
       let (toktype, score) = if self.special_ids.contains(id) {
@@ -925,8 +924,8 @@ fn scalar_f32(value: f32) -> Result<Array> {
 ///
 /// A `model_type` outside this set causes [`convert_to_gguf`] to return
 /// a clear [`Error::Backend`] rather than silently produce a corrupt
-/// GGUF — see `[[project_no_model_arch_porting]]` (fail-fast on the
-/// LM-side surface; per-arch hooks are out of scope).
+/// GGUF (fail-fast on the LM-side surface; per-arch hooks are out of
+/// scope).
 const SUPPORTED_MODEL_TYPES: &[&str] = &["llama", "mistral", "mixtral"];
 
 /// Arguments to [`convert_to_gguf`] — the structured form of
@@ -941,7 +940,7 @@ const SUPPORTED_MODEL_TYPES: &[&str] = &["llama", "mistral", "mixtral"];
 #[derive(Debug, Clone)]
 pub struct ConvertToGgufArgs {
   /// Source model directory (HF-style `config.json` + safetensors
-  /// shards + `tokenizer.json`). The same shape the F2 / F6 loaders
+  /// shards + `tokenizer.json`). The same shape the loaders
   /// consume.
   pub model_path: PathBuf,
   /// Destination `.gguf` file. The reference appends `.gguf` if missing
@@ -1023,7 +1022,7 @@ pub fn convert_to_gguf(args: &ConvertToGgufArgs) -> Result<()> {
   //    + `convert_to_gguf_rejects_quantized`) prove these paths return
   //    the validation `Err(Backend)` WITHOUT touching the weights.
 
-  //   2a. Architecture gate (`[[project_no_model_arch_porting]]`):
+  //   2a. Architecture gate:
   //       reject any `model_type` outside the LM-side supported set so a
   //       non-Llama tag is never silently emitted on a non-Llama
   //       checkpoint. The reference's `prepare_metadata` hard-codes the
@@ -1058,16 +1057,15 @@ pub fn convert_to_gguf(args: &ConvertToGgufArgs) -> Result<()> {
     )));
   }
 
-  //   2c. Tokenizer build — fail-fast (Codex round-2, Finding 2). The
-  //       prior implementation only checked `tokenizer.json` exists via
-  //       `Path::exists()`, which accepted a directory at that path, a
-  //       zero-byte file, malformed JSON, or a structurally-invalid
-  //       tokenizer — all of which forced the multi-GB weight read
-  //       before the tokenizer error surfaced. Calling `load_tokenizer`
-  //       here parses the tokenizer up front (the file is at most a
-  //       few MB and the parse is cheap relative to the weight load).
-  //       The resolved `Tokenizer` is then threaded down to the
-  //       `HfVocab` builder below so we never re-load.
+  //   2c. Tokenizer build — fail-fast. Merely checking that
+  //       `tokenizer.json` exists via `Path::exists()` would accept a
+  //       directory at that path, a zero-byte file, malformed JSON, or a
+  //       structurally-invalid tokenizer — all of which would force the
+  //       multi-GB weight read before the tokenizer error surfaced.
+  //       Calling `load_tokenizer` here parses the tokenizer up front
+  //       (the file is at most a few MB and the parse is cheap relative
+  //       to the weight load). The resolved `Tokenizer` is then threaded
+  //       down to the `HfVocab` builder below so we never re-load.
   //
   //       The reference Python (`mlx_lm/gguf.py:297-298`) uses a
   //       `Path.exists()` check because its caller has already loaded
@@ -1164,10 +1162,10 @@ pub fn convert_to_gguf(args: &ConvertToGgufArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-  //! F8 — GGUF export pipeline tests, hand-traced from `mlx_lm/gguf.py`.
+  //! GGUF export pipeline tests, hand-traced from `mlx_lm/gguf.py`.
   //!
-  //! No `peak_memory()` magnitude asserts (project memory:
-  //! `[[feedback_no_global_peak_memory_assert]]`).
+  //! No `peak_memory()` magnitude asserts (the process-global monotonic
+  //! counter is polluted by concurrent tests).
 
   use super::*;
   use std::sync::atomic::{AtomicU64, Ordering};
@@ -1800,7 +1798,7 @@ mod tests {
     let _ = std::fs::remove_dir_all(&dir);
   }
 
-  // ─────────── HfVocab.special_ids union (Finding 1 — coverage) ───────────
+  // ─────────── HfVocab.special_ids union coverage ───────────
 
   /// A second tokenizer fixture where BOS/EOS/UNK live at BASE-VOCAB ids
   /// (NOT in `added_tokens_decoder`). The Python reference's
@@ -1863,7 +1861,7 @@ mod tests {
     let vocab = HfVocab::from_tokenizer(&tokenizer).unwrap();
 
     // (a) special_ids contains the base-vocab ids declared in
-    //     tokenizer_config.json (the Finding 1 fix is the only way these
+    //     tokenizer_config.json (the special-ids union is the only way these
     //     end up in the set — they are NOT in added_tokens_decoder).
     assert!(vocab.special_ids.contains(&0), "unk (id 0) missing");
     assert!(vocab.special_ids.contains(&1), "bos (id 1) missing");
@@ -1990,9 +1988,9 @@ mod tests {
     // (b) source: tokenizer_config.json bos_token → <s> at base id 1
     //     AND additional_special_tokens → <extra> at base id 3.
     //     Neither of these is in added_tokens_decoder, so the only way
-    //     they end up in special_ids is via the Finding 1 union — they
+    //     they end up in special_ids is via the special-ids union — they
     //     are the canonical "BOS/EOS/UNK as a base-vocab token" case
-    //     this finding exists to cover.
+    //     this union exists to cover.
     assert!(
       vocab.special_ids.contains(&1),
       "bos <s> (base id 1) missing — source (b) failed; special_ids={:?}",
@@ -2013,17 +2011,18 @@ mod tests {
     let _ = std::fs::remove_dir_all(&dir);
   }
 
-  /// Codex round-2 Finding 1 regression: an added token NAMED by
+  /// Regression: an added token NAMED by
   /// `tokenizer_config.json#additional_special_tokens` but flagged
   /// `special=false` in `tokenizer.json#added_tokens_decoder` must still
   /// classify as [`TokenType::Control`] in the emitted
   /// `tokenizer.ggml.token_type` array.
   ///
-  /// Before the fix, [`HfVocab::all_tokens`] looked the added-token text
-  /// up in `self.specials` (populated only from
-  /// `added_tokens_decoder.special=true`), so this case slipped through
-  /// as `UserDefined` even though the constructor unioned the id into
+  /// A text-based lookup in `self.specials` (populated only from
+  /// `added_tokens_decoder.special=true`) would classify this case as
+  /// `UserDefined` even though the constructor unioned the id into
   /// `special_ids` via the `additional_special_token_ids()` accessor.
+  /// [`HfVocab::all_tokens`] classifies by id against `special_ids`
+  /// instead, so it resolves to `Control`.
   ///
   /// Fixture shape:
   ///   - base vocab has `<unk>`(0), `<s>`(1), `</s>`(2), `a`(3) — 4
@@ -2054,7 +2053,7 @@ mod tests {
         "merges": []
       },
       // `<custom>` lives in added_tokens but with `special=false`. This
-      // is the exact gap Finding 1 covers — the prior emission walk
+      // is the exact gap the special-ids union covers — a prior emission walk
       // would look it up in `self.specials` (empty for this token because
       // special=false) and classify it as UserDefined.
       "added_tokens": [
@@ -2068,9 +2067,9 @@ mod tests {
       "eos_token": "</s>",
       "unk_token": "<unk>",
       // The same token text — declares `<custom>` as a special via
-      // tokenizer_config.json. With the Finding 1 fix unioning these ids
-      // into `special_ids`, AND the Finding 1 fix classifying the
-      // emission via `special_ids.contains(&id)`, this should resolve
+      // tokenizer_config.json. With these ids unioned
+      // into `special_ids`, AND the emission classified
+      // via `special_ids.contains(&id)`, this should resolve
       // to Control.
       "additional_special_tokens": ["<custom>"],
     });
@@ -2096,8 +2095,8 @@ mod tests {
       vocab.vocab_size_base(),
     );
 
-    // Pre-conditions for the test to be meaningful — the gap the fix
-    // closes:
+    // Pre-conditions for the test to be meaningful — the gap this test
+    // covers:
     //   (a) `<custom>` is in `special_ids` (source-b union via the
     //       `additional_special_token_ids()` accessor).
     //   (b) `<custom>` is NOT in `specials` (because
@@ -2108,13 +2107,13 @@ mod tests {
     //       the assertion documents the gap explicitly.
     assert!(
       vocab.special_ids.contains(&custom_id),
-      "Finding 1 union failed: special_ids should contain `<custom>` id {custom_id}; \
+      "special-ids union failed: special_ids should contain `<custom>` id {custom_id}; \
        special_ids={:?}",
       vocab.special_ids,
     );
     assert!(
       !vocab.specials.contains_key("<custom>"),
-      "fixture invariant: `<custom>` should NOT be in `specials` (the gap Finding 1 covers); \
+      "fixture invariant: `<custom>` should NOT be in `specials` (the gap this test covers); \
        specials={:?}",
       vocab.specials,
     );
@@ -2151,7 +2150,7 @@ mod tests {
     assert_eq!(
       toktype_vals[custom_id as usize],
       TokenType::Control as u32,
-      "Finding 1 regression: `<custom>` (id {custom_id}) should classify as Control, \
+      "`<custom>` (id {custom_id}) should classify as Control, \
        got {} (UserDefined would be {}); full token_type={:?}",
       toktype_vals[custom_id as usize],
       TokenType::UserDefined as u32,
@@ -2160,19 +2159,19 @@ mod tests {
     assert_ne!(
       toktype_vals[custom_id as usize],
       TokenType::UserDefined as u32,
-      "Finding 1 regression — explicit not-UserDefined check",
+      "explicit not-UserDefined check",
     );
 
     let _ = std::fs::remove_dir_all(&dir);
   }
 
-  // ───────── tokenizer-load fail-fast (Finding 2 — coverage) ─────────
+  // ───────── tokenizer-load fail-fast coverage ─────────
 
-  /// Codex round-2 Finding 2 regression: a `tokenizer.json` that exists
+  /// Regression: a `tokenizer.json` that exists
   /// but is malformed JSON must fail before the multi-GB weight load.
-  /// Before the fix, `convert_to_gguf` only checked `Path::exists()`,
-  /// so a malformed tokenizer.json forced `load_safetensors` to run
-  /// first. The new gate calls `load_tokenizer` in the validation
+  /// Merely checking `Path::exists()` would let a malformed
+  /// tokenizer.json force `load_safetensors` to run first.
+  /// `convert_to_gguf` instead calls `load_tokenizer` in the validation
   /// block, which parses the JSON up front.
   ///
   /// Asserts:
@@ -2200,8 +2199,8 @@ mod tests {
     });
     std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
     // Malformed tokenizer.json — exists, is not a directory, but is not
-    // valid JSON. Before the fix, the `Path::exists()` gate accepted
-    // this; `load_tokenizer` only ran AFTER `load_weights`.
+    // valid JSON. A bare `Path::exists()` gate would accept this and
+    // only run `load_tokenizer` AFTER `load_weights`.
     std::fs::write(
       dir.join("tokenizer.json"),
       "{ this is not valid tokenizer json }",
@@ -2233,10 +2232,10 @@ mod tests {
     let _ = std::fs::remove_dir_all(&dir);
   }
 
-  /// Codex round-2 Finding 2 regression: a *directory* at `tokenizer.json`
+  /// Regression: a *directory* at `tokenizer.json`
   /// (instead of a file) must fail before the multi-GB weight load.
-  /// Before the fix, `Path::exists()` returned `true` for a directory,
-  /// silently accepting it; the safetensors loader would then run.
+  /// A bare `Path::exists()` returns `true` for a directory and would
+  /// silently accept it, letting the safetensors loader run.
   #[test]
   fn convert_to_gguf_directory_at_tokenizer_path_rejects_before_weight_load() {
     let dir = fresh_dir("dir_at_tokenizer");
@@ -2255,8 +2254,8 @@ mod tests {
       "rms_norm_eps": 1e-5,
     });
     std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
-    // mkdir at `tokenizer.json` — `Path::exists()` returns true so the
-    // pre-fix gate accepted it.
+    // mkdir at `tokenizer.json` — `Path::exists()` returns true, so a
+    // bare existence gate would accept it.
     std::fs::create_dir_all(dir.join("tokenizer.json")).unwrap();
     // SENTINEL: 1 MiB of garbage bytes — if load_weights ran, the
     // safetensors loader would surface a parse signature.

@@ -229,7 +229,7 @@ impl ChunkedKvCache {
         format_smolstr!("start={a}, end={end}, L={l}"),
       )));
     }
-    // Structural class-kill (closes #78 P1 iter5): mlx-lm's
+    // Structural class-kill (closes #78): mlx-lm's
     // `self.<buf>[..., a:a+s, :] = new` slice-assignment routes through
     // `slice_update`, which broadcasts the RHS to the slice shape (`mlx/
     // ops.cpp:843` — `broadcast_to(update, upd_shape)`). Our write-emulation
@@ -756,7 +756,7 @@ impl KvCache for ChunkedKvCache {
     "ChunkedKVCache"
   }
 
-  /// P1 #110: per-layer fast-path downcast target — see the
+  /// Per-layer fast-path downcast target (#110) — see the
   /// [`KvCache`]-trait doc's **Per-layer fast-path convention**.
   fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
     self

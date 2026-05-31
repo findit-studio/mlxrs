@@ -1,4 +1,4 @@
-//! Happy-path tests for `ops::comparison` (Phase 4 Branch C).
+//! Happy-path tests for `ops::comparison`.
 //!
 //! Element-wise comparisons return Bool arrays; query ops (`isfinite`/etc.)
 //! exercise the unary template; `allclose`/`isclose` exercise the

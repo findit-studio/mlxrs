@@ -1,15 +1,11 @@
-//! C6 — `pad_to_square` canvas fill: tile a `&mut [MaybeUninit<u8>]`
+//! `pad_to_square` canvas fill: tile a `&mut [MaybeUninit<u8>]`
 //! with a repeating 3-byte RGB pattern.
 //!
 //! Tracking: [#151](https://github.com/Findit-AI/mlxrs/issues/151).
-//! Plan: `docs/core-arch-simd-candidates.md` §2 row C6, §5.5 execution
-//! order (first kernel after the X5 infrastructure — lowest risk,
-//! isolated, no intrinsics strictly required because the per-3-byte
-//! `extend_from_slice` idiom at the call site is the actual culprit).
 //!
 //! # The defect class
 //!
-//! The pre-C6 [`crate::vlm::image::pad_to_square`] canvas fill was:
+//! The original [`crate::vlm::image::pad_to_square`] canvas fill was:
 //!
 //! ```rust,ignore
 //! for _ in 0..(bytes_usize / 3) {
@@ -22,9 +18,8 @@
 //! update. For a near-budget `13377²` canvas (`~511 MiB / 3 ≈ 180M`
 //! iterations) this is a genuinely slow idiom — the per-call overhead
 //! dwarfs the actual byte writes by an order of magnitude in our
-//! benches. The §5.5 doc explicitly calls out C6 as "barely needs
-//! intrinsics; the per-3-byte `extend` is the slow idiom — fix that
-//! and most of the win is captured".
+//! benches. This kernel barely needs intrinsics; the per-3-byte
+//! `extend` is the slow idiom — fixing that captures most of the win.
 //!
 //! # The fix — `chunks_mut(3) + copy_from_slice`
 //!
@@ -34,9 +29,8 @@
 //! at memory bandwidth (~70 GB/s on M-series Apple silicon, capped by
 //! L3 / DRAM rather than the ALU).
 //!
-//! Per the verify-before-claim rule (§5.4 of the SIMD doc + project
-//! memory **"Verify review premise empirically"**), we benchmarked
-//! three implementations at 256² / 1024² / 4096² canvas sizes:
+//! Three implementations are benchmarked at 256² / 1024² / 4096² canvas
+//! sizes:
 //!
 //! | impl                                           | 256² (≈196k B) | 1024² (≈3.1M B) | 4096² (≈50M B) |
 //! | ---------------------------------------------- | --------------:| ---------------:| --------------:|
@@ -44,15 +38,12 @@
 //! | NEW scalar `chunks_mut(3) + copy_from_slice`    | (see bench)    | (see bench)     | (see bench)    |
 //! | NEW NEON 48-byte pre-broadcast `vst1q_u8` tile  | (see bench)    | (see bench)     | (see bench)    |
 //!
-//! Concrete numbers and the scalar-only vs scalar+NEON decision live
-//! in the local-only `docs/core-arch-simd-candidates.md` C6 section
-//! and the bench output (`mlxrs/benches/simd_pad_canvas_fill.rs`).
+//! Concrete numbers live in the bench output
+//! (`mlxrs/benches/simd_pad_canvas_fill.rs`).
 //!
 //! # NEON kernel — 48-byte LCM(3, 16) pre-broadcast
 //!
-//! The hand-rolled NEON kernel is included **only if** the bench shows
-//! it is ≥ 2× faster than the new scalar at 4096² (per §5.4 verify-
-//! before-claim). It builds a 48-byte pre-broadcast pattern once on
+//! The hand-rolled NEON kernel builds a 48-byte pre-broadcast pattern once on
 //! the stack (LCM(3, 16) — three RGB triples pack evenly into one
 //! 16-byte NEON register, so a 48-byte tile is the smallest power of
 //! the pattern that aligns with `vst1q_u8` chunks of 16). It then
@@ -62,7 +53,7 @@
 //!
 //! # Correctness class — `Exact`
 //!
-//! C6 is pure data movement (a `memset`-like tile fill with a 3-byte
+//! This kernel is pure data movement (a `memset`-like tile fill with a 3-byte
 //! period). The scalar and NEON paths produce **bit-identical** output
 //! — both write the same byte sequence `fill[0..3]` repeated
 //! `out.len() / 3` times, plus any partial-triple tail (handled
@@ -276,12 +267,8 @@ pub(crate) unsafe fn pad_canvas_fill_neon(out: &mut [MaybeUninit<u8>], rgb: [u8;
 /// `spare_capacity_mut()`).
 ///
 /// Tracking: [#151](https://github.com/Findit-AI/mlxrs/issues/151).
-/// See `docs/core-arch-simd-candidates.md` §2 row C6 + §5.5 execution
-/// order. C6 is the **first kernel** to ship after the X5 infrastructure
-/// — lowest risk, isolated, no intrinsics strictly required. The hand-
-/// rolled NEON 48-byte (`LCM(3, 16)`) pre-broadcast tile is included
-/// because the verify-before-claim bench (§5.4) shows it is ≥ 2×
-/// faster than the new scalar at the 4096² canvas size; if the bench
+/// No intrinsics strictly required. The hand-rolled NEON 48-byte
+/// (`LCM(3, 16)`) pre-broadcast tile ships unconditionally; if the bench
 /// regresses (LLVM auto-vec catches up, future toolchain), the NEON
 /// kernel can be removed and the dispatcher collapsed to the scalar
 /// arm without touching the call site.
@@ -319,7 +306,7 @@ pub fn pad_canvas_fill(out: &mut [MaybeUninit<u8>], rgb: [u8; 3]) {
 #[cfg(test)]
 mod tests {
   //! Scalar vs dispatcher differential tests + edge / behavioural
-  //! coverage for C6.
+  //! coverage for the canvas fill.
   //!
   //! # Test adapter pattern
   //!
@@ -432,7 +419,7 @@ mod tests {
     );
   }
 
-  /// Lane-sweep coverage at `lanes = 16` includes the C6-relevant
+  /// Lane-sweep coverage at `lanes = 16` includes the canvas-fill-relevant
   /// boundary lengths: 0 (empty), 1 (single partial-triple byte),
   /// 16 (one full NEON chunk — partial-triple last byte at
   /// position 15 since `16 mod 3 = 1`), 48 (one full NEON 48-byte
@@ -517,7 +504,7 @@ mod tests {
   fn pad_to_square_fill_matches_old_loop() {
     let canvas_bytes = 512usize * 512 * 3; // 786_432
     for &fill in &[[0u8, 0, 0], [255, 255, 255], [1, 128, 254]] {
-      // OLD path — inline copy of the pre-C6 idiom (per-3-byte
+      // OLD path — inline copy of the original idiom (per-3-byte
       // `extend_from_slice` on a `Vec<u8>` grown from `Vec::new()`).
       let mut old: Vec<u8> = Vec::with_capacity(canvas_bytes);
       for _ in 0..(canvas_bytes / 3) {
@@ -535,7 +522,7 @@ mod tests {
 
       assert_eq!(
         new, old,
-        "C6 dispatcher must produce byte-identical output to the OLD \
+        "dispatcher must produce byte-identical output to the reference \
          `extend_from_slice` loop (fill={fill:?}, canvas_bytes={canvas_bytes})"
       );
     }
@@ -556,7 +543,7 @@ mod tests {
       let new = pad_canvas_fill_scalar_init(canvas_bytes, fill);
       assert_eq!(
         new, old,
-        "C6 scalar must produce byte-identical output to the OLD \
+        "scalar must produce byte-identical output to the reference \
          `extend_from_slice` loop (fill={fill:?})"
       );
     }

@@ -94,7 +94,7 @@ fn argsort_yields_index_permutation_u32() {
 // The no-axis sort/argsort/topk/partition wrappers document "operating on the
 // flattened array". 1-D inputs can't distinguish flatten-first from
 // axis-default behavior; these tests use 2-D inputs and assert the output
-// shape collapses to 1-D, locking in the flatten semantics. Copilot PR #8.
+// shape collapses to 1-D, locking in the flatten semantics.
 
 #[test]
 fn sort_no_axis_flattens_2d() {

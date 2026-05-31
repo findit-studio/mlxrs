@@ -402,7 +402,7 @@ fn chunked_from_state_roundtrip() {
   );
 }
 
-/// Regression (adversarial review): a malformed/hostile prompt cache with
+/// Regression: a malformed/hostile prompt cache with
 /// rank-valid `keys` but a rank-invalid `values` must be a recoverable
 /// `Error`, NEVER a raw-`shape()[2]` index panic — neither at `from_state`
 /// (`set_state` rank-checks BOTH tensors, the same per-tensor guard
@@ -455,7 +455,7 @@ fn chunked_malformed_state_values_rank_is_err_not_panic() {
   assert_eq!(ok.meta_state(), vec!["4", "2"]);
 }
 
-/// Regression (adversarial review): `update` must be transactional — if ANY
+/// Regression: `update` must be transactional — if ANY
 /// fallible op AFTER the keys realloc-concat fails (the values concat /
 /// either splice / the return slice), the cache must be left **completely
 /// unchanged** (no poisoned grown-`keys` buffer with stale `values`/`offset`,
@@ -534,7 +534,7 @@ fn chunked_update_err_after_keys_realloc_leaves_cache_unchanged() {
   assert_eq!(ok_v.to_vec::<f32>().unwrap(), vec![7.0, 8.0, 1.0, 2.0]);
 }
 
-/// Regression (adversarial review): `maybe_trim_front` must keep EACH tensor's
+/// Regression: `maybe_trim_front` must keep EACH tensor's
 /// OWN last `chunk_size` rows. mlx-lm `cache.py:745-746` does
 /// `self.keys = self.keys[..., -chunk_size:, :]` and
 /// `self.values = self.values[..., -chunk_size:, :]` — each a negative slice
@@ -601,7 +601,7 @@ fn chunked_maybe_trim_front_seq_mismatched_kv_trims_each_independently() {
   assert_eq!(sv2.to_vec::<f32>().unwrap(), vec![40.0, 41.0, 42.0]);
 }
 
-/// Regression (adversarial review): `chunk_size == 0` is a degenerate case
+/// Regression: `chunk_size == 0` is a degenerate case
 /// mlx-lm does not guard against (`ChunkedKVCache(chunk_size)` accepts any
 /// int, `cache.py:734`). Python's negative-slice semantics evaluate
 /// `keys[..., -0:, :]` as `keys[..., 0:, :]` — the WHOLE tensor (Python's
@@ -667,7 +667,7 @@ fn chunked_maybe_trim_front_chunk_size_zero_is_python_neg_zero_noop() {
   assert_eq!(sv2.to_vec::<f32>().unwrap(), vec![200.0, 201.0, 202.0]);
 }
 
-/// Regression (adversarial review): `set_seq` must enforce per-target write
+/// Regression: `set_seq` must enforce per-target write
 /// bounds. mlx-lm's `self.<buf>[..., a:b, :] = new` raises an `IndexError` if
 /// the slice extends past the buffer (Python/MLX semantics); reusing
 /// `seq_slice` (which clamps for *reads*) for a *write* would silently
@@ -722,7 +722,7 @@ fn chunked_update_out_of_bounds_values_write_is_err_not_silent_corrupt() {
   assert_eq!(pv.to_vec::<f32>().unwrap(), pre_v);
 }
 
-/// Regression (closes #78 P1 iter5 — structural class-kill at `set_seq`'s
+/// Regression (closes #78 — structural class-kill at `set_seq`'s
 /// boundary): a full-window `set_seq` write (head AND tail empty) must NOT
 /// shortcut to silently returning `new`, mutating the cached buffer's
 /// non-seq axes (batch / n_kv_heads / head_dim). mlx-lm's
@@ -786,7 +786,7 @@ fn chunked_set_seq_full_window_rejects_mismatched_batch_dim() {
     }
     other => panic!(
       "full-window set_seq must reject batch-axis mismatch on the public update API \
-       (closes #78 P1 iter5), got {other:?}"
+       (closes #78), got {other:?}"
     ),
   }
   // Cache must be unchanged (still single-batch). No silent mutation of

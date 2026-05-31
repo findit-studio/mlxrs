@@ -228,7 +228,7 @@ impl KvCache for StandardKvCache {
     "KVCache"
   }
 
-  /// P1 #110: per-layer fast-path downcast target — see the
+  /// Per-layer fast-path downcast target (#110) — see the
   /// [`KvCache`]-trait doc's **Per-layer fast-path convention**.
   fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
     self

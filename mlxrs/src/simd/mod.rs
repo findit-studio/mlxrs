@@ -101,8 +101,8 @@
 //!
 //! - **`Exact`** — call
 //!   [`diff::assert_eq_over_lane_sweep`](crate::simd::diff::assert_eq_over_lane_sweep).
-//!   Use for data-movement / lossless-widening kernels (C1 integer
-//!   arms, C3, C4, C5, C6) — the SIMD output **must be bit-identical**
+//!   Use for data-movement / lossless-widening kernels (integer-widen
+//!   arms) — the SIMD output **must be bit-identical**
 //!   to scalar. For fp outputs that are deliberately bit-identical
 //!   (the in-tree `dot` is one — matched reduction tree), the
 //!   `differential_tests` module below compares on `f64::to_bits()`
@@ -110,13 +110,13 @@
 //! - **`Tolerance { abs, rel }` — scalar output** — call
 //!   [`diff::assert_close_over_lane_sweep`](crate::simd::diff::assert_close_over_lane_sweep).
 //!   Use for fp-reduction / FMA-rounding kernels that fold the input
-//!   to a single `f64` (C2 loudness sum-of-squares; any future fp
+//!   to a single `f64` (loudness sum-of-squares; any future fp
 //!   reduction without a matched scalar reduction tree).
 //! - **`Tolerance { abs, rel }` — vector output** — call
 //!   [`diff::assert_close_slice_over_lane_sweep`](crate::simd::diff::assert_close_slice_over_lane_sweep).
-//!   Use for fp kernels that return a `Vec<f64>` (C5 `rotate_buf`
-//!   permutation, C10 `mel_filter_bank` triangle construction, C12
-//!   window generation — the vector-producing fp candidates
+//!   Use for fp kernels that return a `Vec<f64>` (`rotate_buf`
+//!   permutation, `mel_filter_bank` triangle construction, window
+//!   generation — the vector-producing fp candidates
 //!   documented under `simd::audio` / `simd::vlm`). Asserts
 //!   dispatcher and scalar outputs have the same length **and** every
 //!   element pair satisfies the same `abs.max(rel * |s|)` tolerance
@@ -132,59 +132,14 @@
 //!
 //! See the [`diff`](crate::simd::diff) module doc for the full class
 //! catalog and the length-sweep rationale.
-//!
-//! ## Verify-before-claim (§5.4 of the SIMD doc)
-//!
-//! Before committing a hand-written NEON kernel for any new
-//! candidate, **benchmark scalar vs SIMD** in the `mlxrs-m2-benches`
-//! worktree under release. Some candidates (C3 RGB widen, the cold
-//! one-time table builds C10/C11/C12) are *suspected already
-//! auto-vectorized by LLVM* or *too cold to matter* — shipping a
-//! hand-rolled intrinsic kernel that LLVM already emits is dead
-//! weight (extra `unsafe`, extra maintenance, no perf win). The
-//! benchmark is the gate, not intuition or "it should be faster". See
-//! `docs/core-arch-simd-candidates.md` §5.4 and the
-//! [project memory rule "Verify review premise empirically"].
-//!
-//! ## Suggested execution order (§5.5 of the SIMD doc)
-//!
-//! The cross-cutting doc orders the candidate work by
-//! risk × benefit:
-//!
-//! 1. **C6** — `pad_to_square` fill (quick win, lowest risk).
-//! 2. **C1** — PCM decode widen (highest steady benefit, exact
-//!    semantics).
-//! 3. **C4** — BGR `vld3`/`vst3` de-interleave widen (clean NEON
-//!    fit, exact, the arm LLVM most likely misses).
-//! 4. **C3** — RGB widen, **only if** disassembly shows LLVM is not
-//!    already vectorizing.
-//! 5. **C2** — loudness sum-of-squares (fp-associativity / LUFS
-//!    bit-exactness risk; needs existing loudness test tolerances
-//!    re-baselined; do *after* C1/C3/C4).
-//! 6. **Defer C5, C7, C8, C10, C11, C12** — cold, gather-bound, or
-//!    transcendental-bound; revisit only if a benchmark proves a
-//!    real cost.
-//! 7. **Never** — C9 (`lfilter` recurrence — serial by
-//!    construction).
-//!
-//! ## No cargo feature — always on (project memory override)
-//!
-//! Per the project memory rule **"SIMD always-on"**, mlxrs's SIMD
-//! infrastructure has **no `simd` cargo feature**. Whether the NEON
-//! backend runs is gated purely on `#[cfg(target_arch = "aarch64")]`
-//! plus runtime CPU detection
-//! ([`is_neon_available`](crate::simd::is_neon_available)); on every
-//! other target the dispatchers route to the always-compiled scalar
-//! path. This explicitly overrides §5.2 of the SIMD doc, which had
-//! recommended a Cargo-feature gate before the project rule was set.
 
 #[cfg(target_arch = "aarch64")]
 pub mod arch;
 // `simd::audio` is **not** `aarch64`-gated (same rationale as `simd::vlm`
 // below): the scalar reference inside each kernel triple must compile on
 // every target so the dispatcher's scalar-fallback branch is a real,
-// linkable function (per the project memory rule "SIMD always-on" —
-// scalar fallback compiles on all targets, only the `arch` module is
+// linkable function (the scalar fallback compiles on all targets,
+// only the `arch` module is
 // `aarch64`-gated). The NEON kernels inside each kernel triple are
 // individually `#[cfg(target_arch = "aarch64")]`-gated at the
 // function level. The module is `audio`-feature-gated so the
@@ -195,8 +150,7 @@ pub mod arch;
 // `pub` (rather than `pub(crate)`) so the in-tree
 // `benches/simd_*.rs` micro-benchmarks — separate binaries that
 // only see the public API — can drive the dispatchers and scalar
-// references directly per the verify-before-claim rule (§5.4 of
-// the SIMD doc). Per-kernel items inside are individually
+// references directly. Per-kernel items inside are individually
 // `pub`/`pub(crate)` (only the dispatcher + the scalar reference
 // are exposed; the `unsafe` NEON kernel stays `pub(crate)`).
 #[cfg(feature = "audio")]
@@ -208,8 +162,8 @@ pub mod scalar;
 // `simd::vlm` is **not** `aarch64`-gated: the scalar reference inside
 // each kernel triple (e.g. `pad_canvas_fill_scalar`) must compile on
 // every target so the dispatcher's scalar-fallback branch is a real,
-// linkable function (per the project memory rule "SIMD always-on" —
-// scalar fallback compiles on all targets, only the `arch` module is
+// linkable function (the scalar fallback compiles on all targets,
+// only the `arch` module is
 // `aarch64`-gated). The NEON kernels inside each kernel triple are
 // individually `#[cfg(target_arch = "aarch64")]`-gated at the
 // function level. The module is `vlm`-feature-gated so the
@@ -221,8 +175,7 @@ pub mod scalar;
 // `pub` (rather than `pub(crate)`) so the in-tree
 // `benches/simd_pad_canvas_fill.rs` micro-benchmark — a separate
 // binary that only sees the public API — can drive the dispatcher
-// and scalar reference directly per the verify-before-claim rule
-// (§5.4 of the SIMD doc). Per-kernel items inside are individually
+// and scalar reference directly. Per-kernel items inside are individually
 // `pub`/`pub(crate)` (only the dispatcher + the scalar reference
 // are exposed; the `unsafe` NEON kernel stays `pub(crate)`).
 #[cfg(feature = "vlm")]
@@ -279,7 +232,7 @@ pub fn neon_available() -> bool {
 /// Canonical name matching the [`std::arch::is_aarch64_feature_detected`]
 /// idiom — wraps `is_aarch64_feature_detected!("neon")` on `aarch64`
 /// and is a `const false` stub on every other target. New per-kernel
-/// dispatchers (the C1–C12 follow-ups landing under `simd::audio` /
+/// dispatchers (the follow-ups landing under `simd::audio` /
 /// `simd::vlm`) call this directly so the runtime-detection branch
 /// has a uniform shape across the crate.
 ///
@@ -423,10 +376,10 @@ mod differential_tests {
 
   /// `scalar::dot` (the public scalar API, not the dispatcher) must
   /// `panic!` on mismatched lengths with the **shorter slice first**.
-  /// Pre-fix this branch used a `debug_assert!`, so in release it
-  /// silently returned the dot over `a.len()` (the shorter length) —
-  /// a wrong result, no panic. The unconditional `assert_eq!` makes
-  /// it fail loud, matching the dispatcher.
+  /// A `debug_assert!` guard here would, in release, silently return
+  /// the dot over `a.len()` (the shorter length) — a wrong result, no
+  /// panic. The unconditional `assert_eq!` makes it fail loud, matching
+  /// the dispatcher.
   #[test]
   #[should_panic(expected = "scalar::dot")]
   fn scalar_dot_panics_on_length_mismatch_shorter_first() {

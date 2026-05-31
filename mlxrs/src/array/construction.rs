@@ -17,7 +17,7 @@ use crate::{
 /// keeping zero-element FFI calls UB-free. mlx-c reinterprets the `void*` as
 /// `*const T` based on dtype before constructing `mlx::core::array`, so the
 /// pointer must be associated with a real `T` allocation — a `[u8]` cast to
-/// `*const T` is not enough (Codex PR #5 round-2 finding).
+/// `*const T` is not enough.
 #[inline]
 fn data_ptr<T>(data: &[T]) -> *const T
 where
@@ -192,7 +192,7 @@ impl Array {
     })?;
     // mlx's `eye` evaluates `-k` (`-k >= n` and `std::max(0, -k)` — see the
     // vendored `mlx/ops.cpp`), so `k == i32::MIN` overflows in C++ (UB) from a
-    // safe call. Reject it pre-FFI. (#259 / Codex; upstream: mlx eye negates k.)
+    // safe call. Reject it pre-FFI. (See #259; upstream: mlx eye negates k.)
     if k == i32::MIN {
       return Err(Error::OutOfRange(OutOfRangePayload::new(
         "Array::eye: k",

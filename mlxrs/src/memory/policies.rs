@@ -305,8 +305,8 @@ impl WiredBudgetPolicy {
   }
 
   /// Legacy alias of [`Self::id`] retained for one minor-version cycle.
-  /// New code should use [`Self::id`] directly (per rust-type-conventions
-  /// §3: a `String` getter takes the field name, not a `_str` suffix).
+  /// New code should use [`Self::id`] directly (a `String` getter takes the
+  /// field name, not a `_str` suffix).
   #[inline(always)]
   pub fn id_str(&self) -> &str {
     self.id()
@@ -495,7 +495,7 @@ impl WiredMemoryMeasurement {
 /// here so callers can program against it; the body returns
 /// [`Error::InvariantViolation`] with an actionable message until the upstream
 /// concurrency surface lands. See follow-up
-/// [issue #168 / LM-L6](https://github.com/findit-studio/mlxrs/issues/168)
+/// [issue #168](https://github.com/findit-studio/mlxrs/issues/168)
 /// for the tracking item.
 ///
 /// Caller contract (matches Swift): runs the model's prefill loop with
@@ -509,6 +509,6 @@ pub fn tune(
 ) -> Result<WiredMemoryMeasurement> {
   Err(Error::InvariantViolation(InvariantViolationPayload::new(
     "WiredMemoryUtils::tune",
-    "not yet implemented — requires Model::prefill_only (stub); see issue #168 / LM-L6",
+    "not yet implemented — requires Model::prefill_only (stub); see issue #168",
   )))
 }

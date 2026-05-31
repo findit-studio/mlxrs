@@ -1,8 +1,6 @@
-//! Reduction ops: sum (Phase 3.5 template), mean/max/min/prod (Phase 4 Branch A),
-//! var/std/all/any/logsumexp (M2a long-tail).
+//! Reduction ops: sum, mean/max/min/prod, var/std/all/any/logsumexp.
 //!
-//! Cum* (cumsum/cumprod/cummax/cummin) live in `misc.rs` per the Phase 4 LoC
-//! rebalancing.
+//! Cum* (cumsum/cumprod/cummax/cummin) live in `misc.rs`.
 //!
 //! # NaN propagation
 //!
@@ -106,7 +104,7 @@ pub fn sum(a: &Array, keepdims: bool) -> Result<Array> {
 /// producing a dtype split between the empty and non-empty paths (the empty
 /// branch would return int while every other path returns float). Empty axes
 /// route through `mlx_mean_axes` with a `dim_ptr` sentinel so MLX's promotion
-/// runs uniformly. Codex PR #6 finding.
+/// runs uniformly.
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.mean.html).
 pub fn mean_axes(a: &Array, axes: &[i32], keepdims: bool) -> Result<Array> {
@@ -155,7 +153,7 @@ pub fn mean(a: &Array, keepdims: bool) -> Result<Array> {
 /// the identity-dtype reductions (`sum`/`prod`), we must NOT short-circuit
 /// `axes.is_empty()` to `try_clone` — MLX checks `a.size() == 0` BEFORE the
 /// no-axes early return, so a clone here would silently accept zero-size
-/// inputs that every other reduction path rejects (Codex PR #6 round 2).
+/// inputs that every other reduction path rejects.
 /// Empty axes route through `mlx_max_axes` with a `dim_ptr` sentinel.
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.max.html).

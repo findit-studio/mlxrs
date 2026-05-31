@@ -206,7 +206,7 @@ pub fn save_prompt_cache(
   let mut arrays: HashMap<String, Array> = HashMap::new();
   let mut side: HashMap<String, String> = HashMap::new();
 
-  // KVC-6/KVC-7 (#103/#104): reuse a single per-loop `Vec<Array>` /
+  // #103/#104: reuse a single per-loop `Vec<Array>` /
   // `Vec<String>` across all caches via the trait's `state_into` /
   // `meta_state_into` buffer-reuse variants — one allocation per loop
   // iteration's clear, not one per cache. Each iteration `clear()`s the

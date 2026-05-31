@@ -1,13 +1,12 @@
-//! Integration tests for the A8 voice-pipeline orchestration —
+//! Integration tests for the voice-pipeline orchestration —
 //! end-to-end mock-driven shape coverage that exercises the same
 //! public surface a downstream caller composes (every type pulled in
 //! via `mlxrs::audio::sts::pipeline::*` rather than the crate's
 //! internal paths, so a refactor that moves a type silently breaks
 //! these tests rather than passing).
 //!
-//! Mock-driven by design — per the A8 spec ("NO real device tests
-//! required (mock-based primary)") + the
-//! `[[project_no_per_model_arch_porting]]` rule (no concrete VAD /
+//! Mock-driven by design ("NO real device tests
+//! required (mock-based primary)"): no concrete VAD /
 //! STT / LM / TTS architecture lives in mlxrs, so loading a real
 //! model in a test is impossible). The mocks here implement the
 //! adapter traits exactly as a real Voxtral / Silero / NeMo / Pocket

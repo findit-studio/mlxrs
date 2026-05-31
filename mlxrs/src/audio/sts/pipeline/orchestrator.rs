@@ -20,8 +20,8 @@
 //! [`crate::audio::tts::model::TtsModel`]), but their signatures speak
 //! in **whole-utterance** terms (full audio → tokens) — the
 //! orchestrator's per-frame loop needs a streaming-shaped view
-//! ("here's the next chunk, give me a probability"). Per the
-//! "do NOT alter existing public APIs" A8 constraint, this module
+//! ("here's the next chunk, give me a probability"). To avoid
+//! altering the existing public APIs, this module
 //! ships **thin per-step adapter traits** the caller wraps around
 //! their concrete models. The default implementors live in user
 //! code (e.g. a Silero adapter that calls `VadModel::generate` with
@@ -904,15 +904,15 @@ mod tests {
     assert_eq!(cfg.frame_duration_ms(), 20);
   }
 
-  // ---------- Fix 1 (HIGH): first speech chunk must not be ----------
-  // ---------- duplicated in the turn audio.                ----------
+  // ---------- first speech chunk must not be ----------
+  // ---------- duplicated in the turn audio.   ----------
   /// Pre-roll fills with idle silence; the first speech chunk that
-  /// follows must be appended to the turn audio EXACTLY ONCE — the
-  /// pre-fix idle branch appended the chunk to the pre-roll BEFORE
-  /// the VAD branch ran, then the start-of-turn snapshot prepended
-  /// the same pre-roll back onto the turn audio AND the speech
-  /// branch appended the chunk a second time. STT then saw the
-  /// chunk's samples twice (preroll-copy + direct-append).
+  /// follows must be appended to the turn audio EXACTLY ONCE. An idle
+  /// branch that appended the chunk to the pre-roll BEFORE
+  /// the VAD branch ran would double-count it: the start-of-turn snapshot
+  /// would prepend the same pre-roll back onto the turn audio AND the
+  /// speech branch would append the chunk a second time, so STT would see
+  /// the chunk's samples twice (preroll-copy + direct-append).
   ///
   /// We assert via a recording STT that captures the EXACT turn
   /// audio (not just its length) and verifies the speech-chunk's
@@ -982,14 +982,14 @@ mod tests {
     assert_eq!(
       n_marker, chunk_size,
       "the speech chunk (320 samples of 0.5) must appear EXACTLY \
-       ONCE in the turn audio — pre-fix the idle branch would have \
-       pushed it into the pre-roll BEFORE the VAD branch ran, \
-       then the start-of-turn snapshot would have copied it into \
+       ONCE in the turn audio — an idle branch that pushed it into \
+       the pre-roll BEFORE the VAD branch ran would let \
+       the start-of-turn snapshot copy it into \
        the turn audio AGAIN (640 marker samples total)."
     );
   }
 
-  // ---------- Fix 2 (HIGH): EOF flush must drain the chunker -------
+  // ---------- EOF flush must drain the chunker -------
   // ---------- residual so the partial chunk is not dropped. --------
   /// `run()` ends mid-turn with a partial chunk in the chunker —
   /// `flush_in_progress_turn` must drain that residual into the turn
@@ -1054,29 +1054,29 @@ mod tests {
     assert_eq!(stt_len, 3 * 320 + 50);
   }
 
-  // ---------- Fix 3 (MEDIUM): barge-in observations must not -------
-  // ---------- leak from idle noise into a later turn.        --------
-  /// Pre-fix: a non-speech "noisy idle" chunk fed while TTS was
-  /// playing would set `barge_in_observed = true` — and that flag
+  // ---------- barge-in observations must not -------
+  // ---------- leak from idle noise into a later turn. --------
+  /// A non-speech "noisy idle" chunk fed while TTS is
+  /// playing must not set `barge_in_observed = true`: such a flag
   /// would survive into the NEXT turn (cleared only on
-  /// `finalize_turn`, so the idle-noise event tagged a completely
-  /// unrelated later turn). Post-fix: barge-in only fires for
-  /// `is_speech && in_speech`, and is reset at start-of-turn.
+  /// `finalize_turn`), tagging a completely unrelated later turn.
+  /// Barge-in only fires for `is_speech && in_speech`, and is reset at
+  /// start-of-turn.
   #[test]
   fn voice_session_barge_in_observed_does_not_leak_from_idle_into_later_turn() {
     let mut sess = test_session();
     let mut sink = MockSink::new();
     let chunk_size = 320;
-    // The pre-fix bug used non-speech chunks below the VAD threshold
+    // The attack uses non-speech chunks below the VAD threshold
     // but ABOVE the barge-in detector's energy threshold (0.02).
     // RMS of a constant 0.04 signal = 0.04 ≥ 0.02 (barge-in
     // threshold) but < 0.05 (VAD threshold).
     let noisy_idle: Vec<f32> = vec![0.04_f32; chunk_size];
     let silence: Vec<f32> = vec![0.0; chunk_size];
 
-    // Step 1: noisy idle while TTS playing. Pre-fix: would set
-    // `barge_in_observed = true` even though no turn is in progress
-    // and the VAD did not detect speech. Post-fix: ignored.
+    // Step 1: noisy idle while TTS playing. This must NOT set
+    // `barge_in_observed = true` — no turn is in progress
+    // and the VAD did not detect speech, so it is ignored.
     sess
       .step(&noisy_idle, &mut sink, /* tts_playing = */ true)
       .unwrap();
@@ -1102,8 +1102,8 @@ mod tests {
     );
   }
 
-  // ---------- Fix 4 (MEDIUM): silence accounting must be per- ------
-  // ---------- chunk + sample-rate==0 must be rejected.        ------
+  // ---------- silence accounting must be per- ------
+  // ---------- chunk + sample-rate==0 must be rejected. ------
   /// `VoiceSession::new` rejects `input_sample_rate == 0` rather
   /// than panicking at the first chunk's `chunk_ms` division.
   #[test]
@@ -1147,29 +1147,28 @@ mod tests {
   }
 
   /// `step()` computes `chunk_ms` PER CHUNK so a variable-frame
-  /// chunker accumulates silence-ms faithfully (pre-fix used
-  /// `chunks[0].len()` for every chunk in the batch — a chunker
-  /// emitting 200-sample + 100-sample frames would attribute the
+  /// chunker accumulates silence-ms faithfully (reusing
+  /// `chunks[0].len()` for every chunk in the batch would be wrong — a
+  /// chunker emitting 200-sample + 100-sample frames would attribute the
   /// 100-sample frame's silence the same 12.5 ms the 200-sample
   /// frame deserves, double-counting the second frame's silence).
   ///
-  /// To make the per-chunk semantics OBSERVABLE (and so a pre-fix
-  /// regression cannot pass by accident — both pre-fix and post-fix
+  /// To make the per-chunk semantics OBSERVABLE (and so a
+  /// regression cannot pass by accident — both behaviors
   /// happen to cross a coarse threshold or deliver the same final
   /// audio length), this test installs a recording
   /// [`TurnTakingPolicy`] that captures every `silence_ms` value the
-  /// orchestrator passes to it and asserts the FULL SEQUENCE. Under
-  /// the fix the sequence is `[20, 30]`; the pre-fix code (which
-  /// reused `chunks[0].len()` for every chunk) would produce
-  /// `[20, 40]`.
+  /// orchestrator passes to it and asserts the FULL SEQUENCE. The
+  /// per-chunk computation yields `[20, 30]`; a `chunks[0].len()`-reusing
+  /// computation would produce `[20, 40]`.
   #[test]
   fn voice_session_silence_accounting_uses_per_chunk_duration_not_first_chunk() {
     // Two speech chunks (320 samples each, 20 ms each) to open the
     // turn, then two SILENCE chunks of DIFFERENT sizes: 320 (20 ms)
     // + 160 (10 ms). Per-chunk silence-ms must be observed as
     // `[20, 30]` (the 30 ms is the 20 ms accumulated from the first
-    // silence chunk plus 10 ms from the second). The pre-fix code
-    // would have produced `[20, 40]` (re-using chunks[0]'s 320
+    // silence chunk plus 10 ms from the second). A `chunks[0].len()`-reusing
+    // computation would produce `[20, 40]` (re-using chunks[0]'s 320
     // samples / 20 ms for the second silence chunk too).
     //
     // We use a one-shot chunker that emits all four pre-queued
@@ -1201,7 +1200,7 @@ mod tests {
     /// `user_finished`, then defers to a configurable threshold. We
     /// use a high threshold (so neither chunk finalizes the turn)
     /// and assert the recorded SEQUENCE — that is the observable
-    /// divergence between per-chunk (fix) and chunks[0] (pre-fix).
+    /// divergence between the per-chunk and chunks[0] computations.
     ///
     /// `RefCell` because [`TurnTakingPolicy::user_finished`] takes
     /// `&self` and the test is single-threaded.
@@ -1246,8 +1245,8 @@ mod tests {
       },
       one_shot,
       EnergyBargeInDetector::default(),
-      // Threshold = 100 ms — well above both the fix's max (30) and
-      // the pre-fix's max (40), so neither finalizes the turn. The
+      // Threshold = 100 ms — well above both the per-chunk max (30) and
+      // the chunks[0]-reuse max (40), so neither finalizes the turn. The
       // sequence of observed silence_ms values is the WHOLE assertion;
       // by NOT finalizing we keep the test focused on the per-chunk
       // accumulation (no confounding finalize-side effects).
@@ -1269,15 +1268,15 @@ mod tests {
 
     let observed = sess.turn_policy.observed_silence_ms.borrow().clone();
     // CRITICAL: assert the FULL SEQUENCE `[20, 30]`, not just the
-    // final value. The pre-fix code would record `[20, 40]` (it
-    // re-uses chunks[0].len() = 320 samples / 20 ms for every chunk
-    // in the batch, so the 160-sample second silence chunk would be
+    // final value. A `chunks[0].len()`-reusing computation would record
+    // `[20, 40]` (re-using chunks[0].len() = 320 samples / 20 ms for every
+    // chunk in the batch, so the 160-sample second silence chunk would be
     // double-counted as another 20 ms instead of its actual 10 ms).
     assert_eq!(
       observed,
       vec![20, 30],
       "per-chunk silence_ms must accumulate as variable-frame durations \
-       [20, 30]; pre-fix (chunks[0].len()) would produce [20, 40]; got {observed:?}",
+       [20, 30]; a chunks[0].len() reuse would produce [20, 40]; got {observed:?}",
     );
   }
 
@@ -1358,8 +1357,8 @@ mod tests {
     sess.step(&[], &mut sink, false).unwrap();
     let observed = sess.turn_policy.observed_silence_ms.borrow().clone();
     // Two 320-sample silence chunks at 16 kHz → 20 ms each, so the
-    // sequence is [20, 40] under both the fix and the pre-fix; this
-    // test fixes the uniform-chunk case as a sanity sibling.
+    // sequence is [20, 40] under both the per-chunk and chunks[0]
+    // computations; this test pins the uniform-chunk case as a sanity sibling.
     assert_eq!(observed, vec![20, 40], "uniform 320-sample silence chunks");
   }
 }

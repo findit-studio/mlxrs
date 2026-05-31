@@ -1,6 +1,6 @@
-//! Shape ops: reshape (Phase 3.5 archetype #3 — IntoShape pattern) and
-//! concatenate (Phase 3.5 archetype #4 — variadic input), plus the Phase 4
-//! Branch B fan-out: transpose/expand_dims/squeeze/broadcast_to/stack/split/
+//! Shape ops: reshape (the IntoShape pattern) and
+//! concatenate (variadic input), plus
+//! transpose/expand_dims/squeeze/broadcast_to/stack/split/
 //! flatten/swapaxes/pad.
 
 use std::ffi::c_int;
@@ -177,7 +177,7 @@ pub fn concatenate(arrays: &[&Array], axis: i32) -> Result<Array> {
   // Install the error handler before the first fallible FFI call. Without
   // this, mlx_vector_array_new_data could fail and trigger mlx-c's default
   // printf+exit handler before default_stream() (the usual install site)
-  // is reached. Codex PR #5 finding 3.
+  // is reached.
   crate::error::ensure_handler_installed();
 
   // Build a contiguous Vec<mlx_array> (mlx_array is Copy) and pass to
@@ -518,7 +518,7 @@ pub fn pad(
   }
   // `low`/`high` are shape extents (counts of padding entries), not axis
   // indices, so negatives are invalid and must be rejected before they reach
-  // mlx::core::Shape construction (Codex PR #7-target finding). `axes` itself
+  // mlx::core::Shape construction. `axes` itself
   // is an axis-index list — negative axes follow numpy semantics and are
   // intentionally NOT validated here.
   crate::shape::validate_dims(low)?;
@@ -955,7 +955,7 @@ pub fn tile(a: &Array, reps: &[i32]) -> Result<Array> {
 mod tests {
   use super::*;
 
-  // Boundary test for the `int`-loop count guard (#259 Codex MEDIUM). The
+  // Boundary test for the `int`-loop count guard (#259). The
   // real overflow path needs a slice with > i32::MAX entries, which is
   // impractical to allocate (~8GB+), so we exercise the guard at its boundary
   // by feeding `check_count` a synthetic `len` — no allocation required. This
@@ -981,7 +981,7 @@ mod tests {
     }
   }
 
-  // Boundary test for tile's INTERMEDIATE-rank guard (#259 Codex HIGH). The
+  // Boundary test for tile's INTERMEDIATE-rank guard (#259). The
   // real overflow needs a `reps` slice with ~i32::MAX entries (impractical to
   // allocate), so the cap logic is exercised synthetically: a small `reps`
   // whose non-unit count is known, paired with a crafted `ndim`, drives

@@ -878,7 +878,7 @@ mod alloc_discipline_tests {
     }
   }
 
-  /// **Finding 1 — evict-first, no wasteful `len+1` reserve.** Once the
+  /// **Evict-first, no wasteful `len+1` reserve.** Once the
   /// cache is full, a new-key `put` evicts the LRU entry *first* and
   /// refills the freed slot, so neither backing container ever grows past
   /// `max_size` capacity. This test fills to `max_size`, snapshots both
@@ -956,7 +956,7 @@ mod alloc_discipline_tests {
     }
   }
 
-  /// **Finding 2 — post-eviction key handoff is a refcount bump, not a
+  /// **Post-eviction key handoff is a refcount bump, not a
   /// heap `String` clone.** Keys are stored as `Arc<str>`: a `put` builds
   /// the `Arc<str>` *once* (in the `Key` constructor, before `put`), then
   /// the entry map and the recency queue each hold an [`Arc::clone`] — an

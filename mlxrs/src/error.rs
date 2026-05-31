@@ -111,8 +111,8 @@ impl std::fmt::Display for FileOp {
 ///
 /// Accessors are `const fn` for the `Copy` inner type. Construct via
 /// [`DtypeMismatchPayload::new`]; destructure via the accessors (not struct
-/// literal syntax — this type follows §2 of the rust-golden-skills conventions
-/// which forbids public struct-style variant fields).
+/// literal syntax — this type follows the convention that forbids public
+/// struct-style variant fields).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DtypeMismatchPayload {
   expected: Dtype,
@@ -744,8 +744,7 @@ pub struct ConvertPostSavePartialPayload {
   // Carrying the crate `Error` directly preserves the typed structure
   // of the underlying failure — e.g. `Error::FileIo(FileIoPayload { .. })`
   // survives end-to-end with `op` and `path` intact for recovery code,
-  // instead of being stringified into an opaque `io::Error::other(...)`
-  // (R-final finding on PR #243).
+  // instead of being stringified into an opaque `io::Error::other(...)`.
   copy_error: Box<Error>,
 }
 
@@ -809,7 +808,7 @@ impl std::error::Error for ConvertPostSavePartialPayload {
 
 /// Errors surfaced from the mlx backend or detected at the safe-wrapper boundary.
 ///
-/// # Modeling discipline (the §5 rule)
+/// # Modeling discipline
 ///
 /// **Never construct an error variant with a `format!()`-built string payload.**
 /// Every error must use a typed variant whose payload carries every runtime
@@ -825,7 +824,7 @@ impl std::error::Error for ConvertPostSavePartialPayload {
 /// message-only ones are [`Error::MlxC`] (the sanctioned raw mlx-c handler
 /// drain, used when [`MlxOpKind::parse_prefix`] cannot extract a typed
 /// `[op_name]` prefix from the upstream message); the DEPRECATED
-/// [`Error::Backend`] (retained only for not-yet-migrated pre-§5 sites and
+/// [`Error::Backend`] (retained only for not-yet-migrated legacy sites and
 /// slated for removal once the remaining per-module migrations land); and,
 /// under `feature = "tokenizer"`, `Error::Tokenizer` (the tokenizer
 /// subsystem's HF / JSON / chat-template / tool-parsing failures, carried as
@@ -884,7 +883,7 @@ pub enum Error {
   MlxC(SmolStr),
 
   /// **DEPRECATED for new construction** — see the enum doc. Reserved
-  /// for in-progress migration of pre-§5 Backend(format!) sites. New
+  /// for in-progress migration of legacy Backend(format!) sites. New
   /// code MUST pick a typed variant (or [`Error::MlxOp`] / [`Error::MlxC`]
   /// for genuine mlx-c handler pass-through). Final cleanup PR removes
   /// this variant after the 6 per-module migrations land.
@@ -1163,12 +1162,12 @@ pub enum Error {
   /// kernel — only a power loss before the FS internally drains could
   /// revert).
   ///
-  /// The F7 R4 fix had folded multi-warning sources into a single
+  /// Folding multi-warning sources into a single
   /// free-form `std::io::Error::other(format!(...))` message inside
-  /// the [`Error::DurabilityWarning`] `source` field, losing typed
-  /// access to the individual [`std::io::Error`]s. This R5 fix routes
+  /// the [`Error::DurabilityWarning`] `source` field would lose typed
+  /// access to the individual [`std::io::Error`]s. This variant routes
   /// the multi-warning
-  /// case to this new variant so each warning is reachable via direct
+  /// case so each warning is reachable via direct
   /// destructuring (and the first non-None warning is reachable via
   /// [`std::error::Error::source`] for chain walkers — see
   /// [`ConvertDurabilityWarnings`]).
@@ -1806,7 +1805,7 @@ impl std::error::Error for MlxOpPayload {}
 
 // ────────────────────────────────────────────────────────────────────────────
 // 13 typed payload structs — each carries every runtime substitution as a
-// discrete field (the §5 typed-error foundation).
+// discrete field (the typed-error foundation).
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Payload for [`Error::MissingKey`]: a runtime-keyed lookup failure
@@ -2535,7 +2534,7 @@ impl std::error::Error for LayerKeyedPayload {
 ///
 /// Construct via [`MalformedDataPayload::new`]; access fields via
 /// `context()` and `detail()`. Both fields are `&'static str` (no
-/// `format!`) — the §5 typed-error rule.
+/// `format!`) — the typed-error rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MalformedDataPayload {
   context: &'static str,
@@ -2586,7 +2585,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// buffers.
 ///
 /// Consumed by the `lm`, `vlm`, `audio`, and `embeddings` modules for
-/// request-scaled host-side buffers (the VLM-9 allocation-hardening pass,
+/// request-scaled host-side buffers (the allocation-hardening pass,
 /// now extended across lm/audio/embeddings). Gated to exactly the features
 /// that use it so `cargo hack --each-feature` sees no dead code (`vlm` and
 /// `audio` both enable `lm`).

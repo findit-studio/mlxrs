@@ -1,4 +1,4 @@
-//! Phase 4 Branch A: arithmetic op happy-path tests.
+//! Arithmetic op happy-path tests.
 //!
 //! Each wrapper gets at least one assertion against a non-trivial scalar/vec
 //! value. Method-form is exercised when convenient; free-fn parity is

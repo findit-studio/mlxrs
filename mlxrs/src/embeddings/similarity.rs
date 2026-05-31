@@ -178,7 +178,7 @@ pub fn cosine_similarity(a: &Array, b: &Array) -> Result<f32> {
 /// `(n, n)` similarity matrix (diagonal `≈ 1.0`). Mirrors the
 /// `mx.matmul(embeddings, embeddings.T)` pattern in `mlx-embeddings`.
 ///
-/// C5 (Copilot review 4307622782, #3256688269): the L2-normalize step
+/// The L2-normalize step
 /// uses [`l2_normalize`]'s python-faithful dtype-aware weak-scalar eps, so
 /// an all-zero **f16**/**bf16** row normalizes to `NaN` (the default
 /// `1e-9` eps underflows below the half subnormal floor — see the
@@ -191,7 +191,7 @@ pub fn cosine_similarity(a: &Array, b: &Array) -> Result<f32> {
 /// python reference. This is *deliberately distinct* from the scalar
 /// [`cosine_similarity`] (an mlxrs-only convenience with no python
 /// reference, which DOES guarantee finite `0.0` for f16/bf16 zero vectors
-/// via an f32-guarded final divide — C3). The two are intentionally
+/// via an f32-guarded final divide). The two are intentionally
 /// different by design (matrix path = reference parity; scalar =
 /// finite-0.0 convenience), not contradictory.
 pub fn cosine_similarity_matrix(embeddings: &Array) -> Result<Array> {

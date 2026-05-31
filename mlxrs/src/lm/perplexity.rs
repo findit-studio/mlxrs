@@ -585,7 +585,7 @@ mod tests {
 
   #[test]
   fn many_batches_match_single_batch_after_per_batch_eval() {
-    // Finding 1: per-batch `eval` materializes each batch's losses incrementally
+    // Per-batch `eval` materializes each batch's losses incrementally
     // (bounding the lazy graph) without changing the result. Drive *many* small
     // batches (batch_size 1 over a tall matrix) and assert the PPL equals both
     // the hand-traced closed form and the all-in-one-batch reduction.

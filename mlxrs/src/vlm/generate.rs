@@ -18,8 +18,8 @@
 //! **Exact per-step order** (faithful to mlx-vlm `generate_step`, lines
 //! 864–963):
 //!
-//! 1. *Assemble + validate prompt FIRST* (Codex round-3 finding-2:
-//!    deterministic validation must precede expensive vision work).
+//! 1. *Assemble + validate prompt FIRST* (deterministic validation must
+//!    precede expensive vision work).
 //!    [`crate::vlm::prompt::insert_image_tokens`] splices
 //!    `num_tokens_per_image` placeholders per image into `text_tokens`
 //!    at the marker run; per-image spans are computed inline as
@@ -50,12 +50,12 @@
 //!    contract. The per-image slabs are kept SEPARATE (one `[N_i, D]`
 //!    Array per image), NOT pre-concatenated — the prefill gathers only
 //!    the slabs whose span falls in the current chunk (step 4).
-//! 3. *(no global embed/merge).* VLM-8: text embedding + image merge are
+//! 3. *(no global embed/merge).* Text embedding + image merge are
 //!    NOT done over the full sequence here — they happen INCREMENTALLY
 //!    per chunk in step 4, so peak memory is bounded by `prefill_step_size
 //!    · D` plus the (inherent) vision-feature slabs, not the full
 //!    `T · D` merged sequence (which the image-token expansion inflates).
-//! 4. *Offset-aware, span-aware chunked prefill (VLM-8).* The assembled
+//! 4. *Offset-aware, span-aware chunked prefill.* The assembled
 //!    prompt is walked in chunks of `cfg.lm.prefill_step_size` that NEVER
 //!    split an image span (a boundary landing inside a span extends to
 //!    the span end). For each chunk: embed only the chunk's tokens,
@@ -306,7 +306,7 @@ pub fn vlm_generate<'a, M: Model + ?Sized>(
   cfg: VlmGenConfig,
 ) -> Result<impl Iterator<Item = Result<GenStep>> + 'a> {
   // ── EAGER `cfg.lm.validate()` ────────────────────────────────────────
-  // AUDIO-12 #136 — mirror single-seq [`crate::lm::generate::generate_step`]'s
+  // #136 — mirror single-seq [`crate::lm::generate::generate_step`]'s
   // eager validation gate ACROSS BOTH VLM branches. The zero-image branch
   // delegates to `generate_step` (which validates internally), but the
   // multimodal branch builds its own sampler / logits-processors below
@@ -329,8 +329,8 @@ pub fn vlm_generate<'a, M: Model + ?Sized>(
   // call. The VLM multimodal path does its vision work (load /
   // preprocess / encode_image / merge) EAGERLY at construction, so
   // without this guard a zero-output request would still trigger image
-  // I/O + vision compute + potential decode/OOM errors (Codex bundle-#62
-  // round-2 finding). Short-circuit to an empty iterator BEFORE any
+  // I/O + vision compute + potential decode/OOM errors.
+  // Short-circuit to an empty iterator BEFORE any
   // vision work — and before the zero-image split — so both paths are
   // identically free of work when nothing will be produced.
   if cfg.lm.max_tokens == 0 {
@@ -361,7 +361,7 @@ pub fn vlm_generate<'a, M: Model + ?Sized>(
   // which honors `cfg.lm.collect_logprobs` — and that field's `Default`
   // is `false`, so a default-cfg zero-image VLM run would otherwise
   // silently flip to `None`-logprobs and break the documented surface
-  // (Codex finding-2: contract drift between the two branches). Force
+  // (contract drift between the two branches). Force
   // the LM-level opt-in here so the zero-image branch yields the same
   // `Some(logprobs)` shape the multimodal branch does — the caller still
   // controls `collect_logprobs` end-to-end via [`VlmGenConfig::lm`], but
@@ -483,7 +483,7 @@ pub fn vlm_generate<'a, M: Model + ?Sized>(
     }
     image_slabs.push(encoded);
   }
-  // VLM-8 (offset-aware chunked multimodal prefill): we DELIBERATELY do
+  // Offset-aware chunked multimodal prefill: we DELIBERATELY do
   // NOT concat the slabs / embed the text / merge the full sequence here.
   // The embed + merge happen INCREMENTALLY per chunk inside
   // `prefill_step`, so peak memory is bounded by `prefill_step_size · D`
@@ -552,8 +552,8 @@ pub fn vlm_generate<'a, M: Model + ?Sized>(
       // iterators constructed against the same model with different
       // spans never share state and a model's
       // `forward_embeddings_multimodal` override receives the correct
-      // per-request spans (Codex round-2 finding: avoid the
-      // cross-request hazard of model-side mask state).
+      // per-request spans (avoid the cross-request hazard of model-side
+      // mask state).
       image_spans: Some(image_spans),
       // Stash the assembled prompt ids for the prefill `_step`'s
       // processor-history seeding — mirrors mlx-vlm `generate.py:845`
@@ -627,7 +627,7 @@ struct VlmDecode<'a, M: Model + ?Sized> {
   /// `encode_image`) consumed once at prefill; `take()`n so the storage
   /// is released after the single use. Kept per-image (NOT pre-concatenated)
   /// so [`Self::prefill_step`] can gather only the slabs whose span falls
-  /// in the current chunk and merge them incrementally (VLM-8).
+  /// in the current chunk and merge them incrementally.
   image_slabs: Option<Vec<Array>>,
   /// Per-image `(start, end)` ABSOLUTE spans (in the assembled prompt's
   /// position axis) the prefill threads — shifted to chunk-local
@@ -702,7 +702,7 @@ impl<M: Model + ?Sized> VlmDecode<'_, M> {
     // `step.logprobs.unwrap()` / `.as_ref()` — the same source-break the
     // LM crate accepts).
     let logprobs = ops::shape::squeeze_axes(&logprobs, &[0])?;
-    // LM-3 #114: provisional `step_index`/`finish_reason` — the iterator
+    // #114: provisional `step_index`/`finish_reason` — the iterator
     // overrides `finish_reason` to `Some("stop")` on the EOS-token step
     // (mirrors `lm::generate::Generator::step` + its `Iterator::next`).
     Ok(GenStep {
@@ -713,7 +713,7 @@ impl<M: Model + ?Sized> VlmDecode<'_, M> {
     })
   }
 
-  /// The embed-based prefill (VLM-8 offset-aware chunked design): walk
+  /// The embed-based prefill (offset-aware chunked design): walk
   /// the assembled prompt in span-aware chunks, embedding then merging
   /// then forwarding ONE chunk at a time. Populate the cache to position
   /// T, then sample the FIRST token from the FINAL chunk's last-position
@@ -726,7 +726,7 @@ impl<M: Model + ?Sized> VlmDecode<'_, M> {
   /// widest single image span (`= num_tokens_per_image` for the
   /// fixed-grid case): invariant 1 keeps each image span whole, so a
   /// span wider than `prefill_step_size` forces a chunk that wide
-  /// (Codex VLM-8 R1F1 — the bound is NOT `prefill_step_size · D` alone).
+  /// (the bound is NOT `prefill_step_size · D` alone).
   /// This is still bounded by a model constant, never the full expanded
   /// `T`; and `W_max · D <= Σ N_i · D`, the vision-feature slab floor
   /// that is resident regardless (vision encoding can't be chunked). So
@@ -735,7 +735,7 @@ impl<M: Model + ?Sized> VlmDecode<'_, M> {
   /// text length and of the image COUNT beyond the per-image width.
   ///
   /// **Two invariants make chunking correct for mask-requiring VLMs**
-  /// (the structural fix VLM-8 escalated to — Codex bundle rounds 1-3):
+  /// (the structural fix):
   ///
   /// 1. **Never split an image span.** When the natural
   ///    `cursor + prefill_step_size` boundary lands strictly inside a
@@ -777,7 +777,7 @@ impl<M: Model + ?Sized> VlmDecode<'_, M> {
     // starting offset so each chunk's `cache_offset` is ABSOLUTE
     // (`initial_offset + cursor`), not just the in-prefill `cursor` —
     // otherwise a mask-requiring override would size its mask too short
-    // against a non-empty cache (Codex VLM-8 R1F3).
+    // against a non-empty cache.
     //
     // All layers advance in lockstep during generation and a faithfully
     // saved/restored prompt cache loads every layer from the same state,
@@ -785,7 +785,7 @@ impl<M: Model + ?Sized> VlmDecode<'_, M> {
     // that, and a corrupt/hand-built cache could differ per layer. The
     // override receives a single scalar `cache_offset`, so a per-layer
     // mismatch would silently size the mask wrong for some layers.
-    // Validate equality up front and fail closed (Codex VLM-8 R2F1).
+    // Validate equality up front and fail closed.
     let initial_offset = {
       let cache = self.cache.borrow();
       let mut iter = cache.iter();
@@ -869,8 +869,7 @@ impl<M: Model + ?Sized> VlmDecode<'_, M> {
       // current keys, and chunk-local spans so its coordinates line up
       // with `chunk_merged`. `checked_add` guards a near-`usize::MAX`
       // restored offset (recoverable error, never a debug-panic /
-      // release-wrap before the mask builder could reject it) — Codex
-      // VLM-8 R2F1.
+      // release-wrap before the mask builder could reject it).
       let chunk_offset = initial_offset.checked_add(cursor).ok_or_else(|| {
         Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
           "vlm_generate: initial cache offset + chunk cursor",
@@ -964,7 +963,7 @@ impl<M: Model + ?Sized> Iterator for VlmDecode<'_, M> {
         // iterator fuses.
         if self.eos.contains(&step.token) {
           self.done = true;
-          // LM-3 #114: surface "stop" on the EOS-token step (matches
+          // #114: surface "stop" on the EOS-token step (matches
           // `lm::generate::Generator::next`).
           step.finish_reason = Some(FinishReason::Eos);
         }

@@ -50,8 +50,7 @@
 //!
 //! mlx-lm / mlx-swift apply LoRA by walking a live `nn.Module` tree, replacing
 //! `Linear` leaves with `LoRALinear` wrappers. mlxrs has **no** model-module
-//! tree (that is per-usecase — [see project memory:
-//! `feedback_no_per_model_arch_porting`]), so — exactly as
+//! tree (that is per-usecase), so — exactly as
 //! [`crate::lm::quant`] walks the [`Weights`] name-map instead of an
 //! `nn.Module` — this module builds [`LoRALinear`] objects keyed by their
 //! base-weight **path** in the loaded [`Weights`] map. [`linear_to_lora_layers`]
@@ -285,7 +284,8 @@ pub struct LoraParameters {
   #[serde(default)]
   pub alpha: Option<f32>,
   /// **mlx-lm-native** explicit target-projection allowlist (suffix paths like
-  /// `"self_attn.q_proj"`). Empty ⇒ adapt every eligible linear (§1 EMPTY=ABSENT).
+  /// `"self_attn.q_proj"`). Empty ⇒ adapt every eligible linear (an empty
+  /// allowlist is treated as absent).
   /// This is the `lora_parameters.keys` key. A PEFT config leaves this empty —
   /// PEFT's `target_modules` / `exclude_modules` selection lives in
   /// [`PeftSelection`].
@@ -318,7 +318,8 @@ impl Default for LoraParameters {
 
 impl LoraParameters {
   /// The mlx-lm-native explicit target-projection allowlist. Empty ⇒ adapt
-  /// every eligible linear (§1 EMPTY=ABSENT — the auto-discovery path).
+  /// every eligible linear (an empty allowlist is treated as absent — the
+  /// auto-discovery path).
   #[inline(always)]
   pub fn keys_slice(&self) -> &[String] {
     &self.keys
@@ -369,9 +370,8 @@ impl LoraParameters {
 /// - **regex** — a *full* match against the whole module key (PEFT:
 ///   `match_target_against_key` is `re.fullmatch(target_pattern, key)`).
 ///
-/// Unlike the previous port — which rejected the regex form — this models PEFT
-/// exactly via the `regex` crate, so a real PEFT config with a regex
-/// `target_modules` loads.
+/// The regex form is modeled exactly via the `regex` crate, so a real PEFT
+/// config with a regex `target_modules` loads.
 ///
 /// # The `"all-linear"` sentinel
 ///
@@ -669,7 +669,7 @@ pub enum AdapterSelection {
 /// `lora_alpha` / `target_modules` / `peft_type` (with no `lora_parameters`) ⇒
 /// the PEFT read. The resolved [`selection`](LoraConfig::selection) records
 /// which rule applies — PEFT has **no** `num_layers` trailing window (the
-/// round-4 bug a PEFT config wrongly inheriting `num_layers=16`); it selects by
+/// bug where a PEFT config wrongly inherited `num_layers=16`); it selects by
 /// `target_modules` / `layers_to_transform` instead.
 ///
 /// # PEFT scale — rsLoRA + rank/alpha patterns
@@ -3300,10 +3300,10 @@ fn peft_layer_index(path: &str, layers_pattern: &[String]) -> Option<i32> {
 /// reject a result that would leave inference silently-wrong.
 ///
 /// A base path matching the selection predicate but carrying no
-/// [`AdapterParams`] used to be skipped silently — a path-prefix mismatch,
+/// [`AdapterParams`] must not be skipped silently — a path-prefix mismatch,
 /// missing tensor group, empty `adapters.safetensors`, or `adapter_config.json`
-/// drift would then return `Ok` with a partially- or un-adapted model. This
-/// catches all three failure modes:
+/// drift would otherwise return `Ok` with a partially- or un-adapted model.
+/// This catches all three failure modes:
 ///
 /// - **(a) explicitly-selected target with no factors** — when the selection
 ///   is explicit (`explicit_selection`: an mlx-lm `keys` list or a PEFT
@@ -3747,7 +3747,7 @@ fn probe_candidate(path: &Path) -> CandidateProbe {
 ///
 /// # Why the typed lift
 ///
-/// Three prior shapes were considered and *rejected*:
+/// Three simpler shapes are *rejected*:
 /// - **`Path::exists()`** collapses NotFound, PermissionDenied, and ELOOP into
 ///   a single `false`, which would rebrand a permission failure as "missing
 ///   file" — diagnostic loss this dedicated probe avoids.
@@ -4495,7 +4495,7 @@ mod tests {
     // `lora_dropout` maps to `dropout` (carried, ignored at inference).
     assert_eq!(cfg.lora_parameters.dropout, Some(0.05));
     assert_eq!(cfg.fine_tune_type, FineTuneType::Lora);
-    // ROUND-4 BUG: a PEFT config must NOT inherit mlx-lm's `num_layers` window
+    // A PEFT config must NOT inherit mlx-lm's `num_layers` window
     // — PEFT adapts EVERY matching block. The selection is `Peft`, never
     // `MlxLm { num_layers }`.
     assert!(
@@ -4980,7 +4980,7 @@ mod tests {
 
   #[test]
   fn load_adapters_peft_rank_drift_is_shape_mismatch() {
-    // The round-2 rank-drift guard must also catch a PEFT-flat config: `r:8`
+    // The rank-drift guard must also catch a PEFT-flat config: `r:8`
     // declared but rank-16 factors shipped. The dual-shape `Deserialize`
     // reads `r` correctly, then `validate_config_rank` rejects the drift.
     let tmp =
@@ -5124,7 +5124,7 @@ mod tests {
     assert!(matches!(err, Error::LengthMismatch(_)));
   }
 
-  // ───────── Finding 5: lora_a input-dim cross-check ─────────
+  // ───────── lora_a input-dim cross-check ─────────
 
   #[test]
   fn lora_rejects_wrong_lora_a_input_dim_dense() {
@@ -5188,7 +5188,7 @@ mod tests {
     assert!(LoRALinear::new(q_base, params, 2.0).is_ok());
   }
 
-  // ───────── Finding 4: scale precedence (alpha wins) ─────────
+  // ───────── scale precedence (alpha wins) ─────────
 
   #[test]
   fn resolved_scale_alpha_only() {
@@ -5277,7 +5277,7 @@ mod tests {
     assert_eq!(cfg.scale(), 2.0); // 16 / 8, not the literal 50.0
   }
 
-  // ───────── Finding 1: num_layers <= 0 selects ALL blocks ─────────
+  // ───────── num_layers <= 0 selects ALL blocks ─────────
 
   #[test]
   fn lora_layers_num_layers_negative_one_selects_all_blocks() {
@@ -5303,7 +5303,7 @@ mod tests {
     assert_eq!(layers.len(), 4, "num_layers=0 must adapt all 4 blocks");
   }
 
-  // ───────── Finding 2: adapter-completeness postcondition ─────────
+  // ───────── adapter-completeness postcondition ─────────
 
   #[test]
   fn lora_layers_explicit_key_missing_factors_is_err() {
@@ -5456,7 +5456,7 @@ mod tests {
     std::fs::remove_dir_all(&tmp).ok();
   }
 
-  // ───────── Finding 3: QDoRA forward via quantized_matmul ─────────
+  // ───────── QDoRA forward via quantized_matmul ─────────
 
   #[test]
   fn qdora_forward_matches_dense_within_quant_error() {
@@ -5574,7 +5574,7 @@ mod tests {
     );
   }
 
-  // ───────── Finding 6: adapters.safetensors hardening ─────────
+  // ───────── adapters.safetensors hardening ─────────
 
   #[test]
   fn load_adapters_non_regular_safetensors_is_err() {
@@ -6461,7 +6461,7 @@ mod tests {
   #[test]
   fn peft_select_target_modules_list() {
     // PEFT `target_modules` list: every block's q_proj wraps (NO num_layers
-    // window — this is the round-4 bug), v_proj does not.
+    // window — the historical bug), v_proj does not.
     let weights = peft_toy_weights(4);
     let mut params = HashMap::new();
     for b in 0..4 {
@@ -6587,10 +6587,10 @@ mod tests {
 
   #[test]
   fn peft_select_no_restriction_adapts_all_blocks_over_16() {
-    // THE ROUND-4 BUG: a PEFT config with no `layers_to_transform` must adapt
-    // EVERY matching block — including blocks 16..19 on a 20-block model. The
-    // old code wrongly applied mlx-lm's `num_layers=16` trailing window, which
-    // would have dropped blocks 0..3.
+    // A PEFT config with no `layers_to_transform` must adapt
+    // EVERY matching block — including blocks 16..19 on a 20-block model.
+    // Applying mlx-lm's `num_layers=16` trailing window here would be
+    // wrong: it would drop blocks 0..3.
     let weights = peft_toy_weights(20);
     let mut params = HashMap::new();
     for b in 0..20 {
@@ -7065,9 +7065,9 @@ mod tests {
     assert!(!cfg.fan_in_fan_out());
   }
 
-  // ═════════════════════════════ A2: DoRA — spec-named tests ═════════════════════════════
+  // ═════════════════════════════ DoRA — spec-named tests ═════════════════════════════
   //
-  // Tests with the names called out by the A2 spec (#161). Some of these are
+  // Tests with the names called out by the DoRA spec (#161). Some of these are
   // (renamed) duplicates of pre-existing hand-traced tests; keeping both
   // preserves the existing coverage *and* surfaces the spec-named tests in the
   // test report (the spec asked for these exact names).
@@ -7472,7 +7472,7 @@ mod tests {
   /// targeted linear paths of a synthetic model and verify only the targeted
   /// layers are wrapped (and as the `Dora` variant), others are untouched.
   /// Uses [`linear_to_lora_layers`] with a `fine_tune_type: "dora"` config —
-  /// the existing entrypoint is the "sibling" referenced in the A2 spec
+  /// the existing entrypoint is the "sibling" referenced in the DoRA spec
   /// (dispatches to [`DoRALinear`] via `LoraConfig::is_dora()`).
   #[test]
   fn linear_to_dora_layers_grafts_correctly() {
@@ -7521,22 +7521,23 @@ mod tests {
     assert!(!layers.contains_key("lm_head"));
   }
 
-  // ════════════════ A2 round-2 — DoRAEmbedding mixed-precision dtype ════════════════
+  // ════════════════ DoRAEmbedding mixed-precision dtype ════════════════
   //
-  // Regression coverage for the Codex round-1 finding that
-  // `DoRAEmbedding::forward` and `DoRAEmbedding::as_linear` were casting the
-  // low-rank product (`z` / `delta`) and the renorm scale (`m[x]/denom`,
-  // `m/denom`) to the base / input dtype BEFORE the L2 norm and the final
-  // multiply, where mlx-lm `tuner/dora.py:198-224` keeps them uncast for the
-  // norm-and-scale compute and only casts the `out` accumulator. With f16 base
-  // and f32 adapter that upfront-cast silently dropped ~16 bits of precision
-  // through the renorm divisor (and ~7 bits with bf16 base, where rounding is
-  // much coarser).
+  // Regression coverage for the dtype flow in
+  // `DoRAEmbedding::forward` and `DoRAEmbedding::as_linear`: the low-rank
+  // product (`z` / `delta`) and the renorm scale (`m[x]/denom`,
+  // `m/denom`) must stay uncast through the L2 norm and the final
+  // multiply, matching mlx-lm `tuner/dora.py:198-224` (which keeps them
+  // uncast for the norm-and-scale compute and only casts the `out`
+  // accumulator). With f16 base and f32 adapter, casting them to the base
+  // / input dtype upfront silently drops ~16 bits of precision through the
+  // renorm divisor (and ~7 bits with bf16 base, where rounding is much
+  // coarser).
   //
   // Strategy: an `y ≈ -z` cancellation fixture so the f16/bf16 rounding of `z`
   // perturbs ‖y + z‖ by a *relative* amount well above the fp16/bf16 tolerance
-  // floor — the new (uncast) pipeline matches the f64 scalar reference; the
-  // old (upfront-cast) pipeline would not. The companion regression-oracle
+  // floor — the uncast pipeline matches the f64 scalar reference; an
+  // upfront-cast pipeline would not. The companion regression-oracle
   // test asserts this directly by computing both reference paths and
   // confirming the real output is closer to the uncast one.
 
@@ -7564,8 +7565,8 @@ mod tests {
   /// All weight values are chosen to be near (but NOT all exactly) on the f16
   /// representable grid — picking values like 1.0 (exact) for `y` and 0.99 …
   /// fractions for the cancelling `z` means the f32-precision `z` carries
-  /// mantissa bits that f16 rounds away, exactly the scenario the bug
-  /// magnifies through `‖adapted‖₂`.
+  /// mantissa bits that f16 rounds away, exactly the scenario an
+  /// upfront-cast divergence magnifies through `‖adapted‖₂`.
   #[allow(clippy::type_complexity)] // 5-tuple of nested Vec<Vec<f32>> is just
   // the fixture's "5 input tensors" shape; aliasing each would obscure more
   // than it'd clarify in a test fixture.
@@ -7577,7 +7578,8 @@ mod tests {
     f32,           // scale
   ) {
     // y = weight[tid] — chosen to be exactly representable in f16 so the
-    // round-trip is the identity on y (isolating the bug to z's rounding).
+    // round-trip is the identity on y (isolating the divergence to z's
+    // rounding).
     // Row 0: [1,1,1,1] — uniform, simplest cancellation.
     // Row 1: [0.5, 0.5, 0.5, 0.5] — half-scale, exact in f16/bf16.
     // Row 2: [0.25, 0.25, 0.25, 0.25] — quarter-scale.
@@ -7619,7 +7621,8 @@ mod tests {
 
   /// Build the scalar f64 reference for `DoRAEmbedding::forward` matching the
   /// mlx-lm pipeline (`tuner/dora.py:198-210`) with optional `cast_z_upfront`
-  /// to model the OLD buggy port. The reference operates on `rt(x)` — a
+  /// to model the divergent (cast-upfront) computation. The reference
+  /// operates on `rt(x)` — a
   /// pre-rounded version of the f32 source (f16 or bf16 round-trip) so it
   /// reflects the exact bits the kernel sees.
   ///
@@ -7666,17 +7669,17 @@ mod tests {
       let out_pre: Vec<f64> = (0..dims)
         .map(|d| rt((y_rt[d] + z_cast[d]) as f32))
         .collect();
-      // adapted = y + z_for_norm. The bug = `cast_z_upfront` true; the fix
-      // = false (uncast). mlx promotes y(f16/bf16) + z(f32) to f32; we work
-      // at f64 to give the reference bounded round-off well below the
-      // fp16/bf16 tolerance.
+      // adapted = y + z_for_norm. The divergent path = `cast_z_upfront`
+      // true; the correct path = false (uncast). mlx promotes
+      // y(f16/bf16) + z(f32) to f32; we work at f64 to give the reference
+      // bounded round-off well below the fp16/bf16 tolerance.
       let z_for_norm = if cast_z_upfront { &z_cast } else { &z_uncast };
       let adapted: Vec<f64> = (0..dims).map(|d| y_rt[d] + z_for_norm[d]).collect();
       let denom = adapted.iter().map(|v| v * v).sum::<f64>().sqrt();
       let norm_scale = (m_f32[tid] as f64) / denom;
       // scaled_out = norm_scale * out_pre — at f64; mlx runs at f32
       // (promotion from f16/bf16 * f32). NO final cast to y.dtype — `forward`
-      // now returns the promoted dtype directly (mlx-lm `tuner/dora.py:208`),
+      // returns the promoted dtype directly (mlx-lm `tuner/dora.py:208`),
       // so the reference is returned at the promoted dtype too (f32 for the
       // mixed-precision fixture). f64 → f32 narrowing is fine here: the f64
       // reference's round-off well below the fp16/bf16 tolerance floor used
@@ -7691,8 +7694,8 @@ mod tests {
 
   /// Build the scalar f64 reference for `DoRAEmbedding::as_linear` matching
   /// mlx-lm `tuner/dora.py:212-224`. With `cast_delta_upfront`, models the
-  /// OLD buggy port (delta cast to weight.dtype before the row-norm); without
-  /// it, the new (uncast) port. Output is the kernel-equivalent
+  /// divergent path (delta cast to weight.dtype before the row-norm);
+  /// without it, the uncast path. Output is the kernel-equivalent
   /// `[batch, num_embeddings]` flattened to `Vec<f32>` for direct comparison
   /// (the kernel returns the promoted dtype — for f16 base × f32 adapter →
   /// f32 — so we DON'T round-trip the final value to fp16, matching the new
@@ -7782,7 +7785,7 @@ mod tests {
         // Final: norm_scale[e] * out_pre. mlx promotes f32*f16 → f32; f64
         // reference returned as f32 for direct compare against the kernel
         // output extracted via `astype(F32)`. No final astype to base dtype
-        // — mlx-lm doesn't cast here and the new port doesn't either.
+        // — mlx-lm doesn't cast here and the port doesn't either.
         out.push((norm_scale[e] * out_pre) as f32);
       }
     }
@@ -7790,16 +7793,16 @@ mod tests {
   }
 
   /// `dora_embedding_forward_mixed_precision_matches_reference_f16_base_f32_adapter`
-  /// — exercise the round-1 dtype fix: with an f16 embedding weight and f32
+  /// — exercise the dtype fix: with an f16 embedding weight and f32
   /// adapter factors + magnitude, the renorm divisor must be computed at the
-  /// UNCAST dtype (the new `forward`'s `adapted = y + z` uses uncast `z`,
+  /// UNCAST dtype (`forward`'s `adapted = y + z` uses uncast `z`,
   /// mirroring mlx-lm `tuner/dora.py:204`). Adversarial `y ≈ -z` fixture so
   /// the f16 rounding of `z` perturbs ‖adapted‖ by a relative amount above
-  /// the fp16 tolerance — the OLD (upfront-cast) port would mismatch the
+  /// the fp16 tolerance — an upfront-cast computation would mismatch the
   /// scalar reference by orders of magnitude.
   ///
-  /// Also asserts the output dtype is **f32** — the round-2 fix removed the
-  /// trailing `astype(y.dtype)` so `forward` now returns mlx's promoted dtype
+  /// Also asserts the output dtype is **f32** — `forward` carries no
+  /// trailing `astype(y.dtype)`, so it returns mlx's promoted dtype
   /// directly (mlx-lm `tuner/dora.py:208` returns `(m[x]/denom)[..., None] *
   /// out` with no astype; f16 base × f32 adapter promotes to f32).
   #[test]
@@ -7830,8 +7833,8 @@ mod tests {
     let ids = Array::from_slice::<i32>(&ids_vec, &(num_embeddings,)).unwrap();
     let out = layer.forward(&ids).unwrap();
     // Final dtype must be f32 — mlx promotes f16 × f32 → f32 on the final
-    // `(m[x]/denom)[..., None] * out` multiply, and the round-2 fix removed
-    // the narrowing astype that used to pin the return to y.dtype.
+    // `(m[x]/denom)[..., None] * out` multiply, and there is no narrowing
+    // astype pinning the return to y.dtype.
     assert_eq!(
       out.dtype().unwrap(),
       Dtype::F32,
@@ -7848,7 +7851,7 @@ mod tests {
       scale,
       &ids_usize,
       f16_rt,
-      false, // new pipeline: uncast z for the renorm.
+      false, // uncast-z pipeline for the renorm.
     );
     // Promoted-dtype output. Tolerance still ~5e-3: the cancellation-fixture
     // f16 rounding of `y` (which enters `adapted = y + z`) dominates the
@@ -7889,8 +7892,8 @@ mod tests {
     let ids_vec: Vec<i32> = (0..num_embeddings as i32).collect();
     let ids = Array::from_slice::<i32>(&ids_vec, &(num_embeddings,)).unwrap();
     let out = layer.forward(&ids).unwrap();
-    // Promoted dtype = f32 (bf16 × f32 → f32 under mlx promotion); round-2
-    // fix removed the narrowing astype.
+    // Promoted dtype = f32 (bf16 × f32 → f32 under mlx promotion); the
+    // narrowing astype was removed.
     assert_eq!(
       out.dtype().unwrap(),
       Dtype::F32,
@@ -7918,9 +7921,9 @@ mod tests {
   /// — analogous mixed-precision test for `as_linear`: with f16 weight + f32
   /// adapter, the global adapted-row norm must be computed at the UNCAST
   /// delta (mlx-lm `tuner/dora.py:218`'s `weight + (scale·lora_a) @ lora_b`).
-  /// The OLD port cast delta to weight.dtype before the row-norm; the new
-  /// port doesn't. Returned dtype is f32 (mlx promotes f32·f16 — no final
-  /// astype, mlx-lm doesn't cast either).
+  /// Casting delta to weight.dtype before the row-norm would diverge; the
+  /// uncast path doesn't. Returned dtype is f32 (mlx promotes f32·f16 — no
+  /// final astype, mlx-lm doesn't cast either).
   #[test]
   fn dora_embedding_as_linear_mixed_precision_matches_reference_f16_base_f32_adapter() {
     let (weight_f32, lora_a_f32, lora_b_f32, m_f32, scale) = mp_fixture();
@@ -8016,17 +8019,16 @@ mod tests {
   }
 
   /// `dora_embedding_forward_loses_precision_with_upfront_cast_regression_oracle`
-  /// — assert the new (uncast-z, uncast-norm-scale, no-final-astype)
-  /// pipeline matches the f64 scalar reference WAY MORE TIGHTLY than the OLD
-  /// (upfront-cast) pipeline would. Cancellation fixture: with f16 base +
+  /// — assert the (uncast-z, uncast-norm-scale, no-final-astype)
+  /// pipeline matches the f64 scalar reference WAY MORE TIGHTLY than an
+  /// upfront-cast pipeline would. Cancellation fixture: with f16 base +
   /// f32 adapter and `y ≈ -z`, the f16 rounding of `z` perturbs ‖adapted‖
   /// by a relative amount that flows through `m/denom` and ends up well
-  /// above the fp16 tolerance floor on the final output — so the new code
-  /// matches the scalar reference at ≤ `5e-3`, while comparing against the
-  /// OLD (upfront-cast) reference would mismatch by ≥ `1e-2` on at least one
+  /// above the fp16 tolerance floor on the final output — so the uncast
+  /// code matches the scalar reference at ≤ `5e-3`, while comparing against
+  /// the upfront-cast reference mismatches by ≥ `1e-2` on at least one
   /// element. Also asserts the promoted return dtype (f32) — direct guard
-  /// against both the round-1 (upfront-cast) and round-2 (final-narrowing-
-  /// astype) regressions.
+  /// against both the upfront-cast and final-narrowing-astype regressions.
   #[test]
   fn dora_embedding_forward_loses_precision_with_upfront_cast_regression_oracle() {
     let (weight_f32, lora_a_f32, lora_b_f32, m_f32, scale) = mp_fixture();
@@ -8053,7 +8055,7 @@ mod tests {
     let ids_vec: Vec<i32> = (0..num_embeddings as i32).collect();
     let ids = Array::from_slice::<i32>(&ids_vec, &(num_embeddings,)).unwrap();
     let out = layer.forward(&ids).unwrap();
-    // Round-2 guard: forward returns the promoted dtype (f32), not the
+    // Guard: forward returns the promoted dtype (f32), not the
     // base's f16. Re-introducing the final `astype(y.dtype)` would flip this.
     assert_eq!(
       out.dtype().unwrap(),
@@ -8071,7 +8073,7 @@ mod tests {
       scale,
       &ids_usize,
       f16_rt,
-      false, // new pipeline reference
+      false, // uncast pipeline reference
     );
     let want_old = forward_scalar_reference(
       &weight_f32,
@@ -8081,7 +8083,7 @@ mod tests {
       scale,
       &ids_usize,
       f16_rt,
-      true, // OLD upfront-cast pipeline reference
+      true, // upfront-cast pipeline reference
     );
     let new_max_err = got
       .iter()
@@ -8095,23 +8097,23 @@ mod tests {
       .fold(0.0f32, f32::max);
     assert!(
       new_max_err <= 5e-3,
-      "new pipeline must match scalar reference at fp16 tol; got max err {new_max_err}",
+      "uncast pipeline must match scalar reference at fp16 tol; got max err {new_max_err}",
     );
     assert!(
       old_max_err >= 1e-2,
-      "old upfront-cast pipeline must mismatch the scalar reference noticeably; got max err {old_max_err} (cancellation fixture may need re-tuning)",
+      "upfront-cast pipeline must mismatch the scalar reference noticeably; got max err {old_max_err} (cancellation fixture may need re-tuning)",
     );
-    // Sanity gap: the new pipeline matches the reference at least 5× tighter
-    // than the old one would have — the dtype-flow fix is the difference.
+    // Sanity gap: the uncast pipeline matches the reference at least 5×
+    // tighter than the upfront-cast one — the dtype flow is the difference.
     assert!(
       new_max_err * 5.0 <= old_max_err,
-      "regression-oracle expected ≥5× tighter new-vs-old fit; got new={new_max_err}, old={old_max_err}",
+      "regression-oracle expected ≥5× tighter uncast-vs-upfront-cast fit; got uncast={new_max_err}, upfront-cast={old_max_err}",
     );
   }
 
   /// `dora_embedding_forward_returns_promoted_dtype_for_mixed_precision` —
-  /// explicit, focused dtype guard for the round-2 fix. Asserts that
-  /// `forward` returns the mlx-promoted dtype (f32) for both `f16 base × f32
+  /// explicit, focused dtype guard for the promoted-return-dtype fix. Asserts
+  /// that `forward` returns the mlx-promoted dtype (f32) for both `f16 base × f32
   /// adapter` and `bf16 base × f32 adapter`, NOT the embedding's narrow
   /// dtype. mlx-lm `tuner/dora.py:208` returns `(self.m[x] / denom)[...,
   /// None] * out` directly — no astype — and the port now mirrors that.
@@ -8169,13 +8171,12 @@ mod tests {
   /// fail THAT one, pinpointing the regression.
   ///
   /// Covers `(f32, f32)`, `(f16, f16)`, and `(bf16, bf16)`. The half-precision
-  /// cases exercise the round-3 fix to [`scaled`]: the scalar `self.scale` is
+  /// cases exercise [`scaled`]'s coercion: the scalar `self.scale` is
   /// coerced to `arr.dtype()` (mirroring mlx-lm `to_array(v, a.dtype())`) so
   /// `z = scale · (lora_a[x] @ lora_b)` stays in the adapter's narrow dtype
-  /// instead of promoting to f32. Before the round-3 fix, the helper created
-  /// an f32 mlx scalar that silently upcast uniform-half adapters to f32 —
-  /// this triple-test pins the helper's behavior across all three uniform
-  /// precisions.
+  /// instead of promoting to f32. An f32 mlx scalar would silently upcast
+  /// uniform-half adapters to f32 — this triple-test pins the helper's
+  /// behavior across all three uniform precisions.
   #[test]
   fn dora_embedding_forward_preserves_base_dtype_for_uniform_precision() {
     for (uniform, label) in [
@@ -8226,18 +8227,18 @@ mod tests {
     }
   }
 
-  // ───────────────────── round-3 scaled() coercion fix ─────────────────────
+  // ───────────────────── scaled() coercion ─────────────────────
 
   /// `scaled_helper_coerces_scalar_to_array_dtype` — unit test on the
   /// [`scaled`] helper: the scalar `scale` operand is cast to `arr`'s dtype
   /// BEFORE the multiply, mirroring mlx-lm's `to_array(v, a.dtype())`
   /// scalar-coercion (mlx-lm `lora.py:97`, `dora.py:200`).
   ///
-  /// Pre-fix: the helper created an f32 mlx scalar, so `scaled(f16_arr, …)`
-  /// would silently return an f32 array (mlx promotes f16 × f32 → f32) —
+  /// If the helper created an f32 mlx scalar, `scaled(f16_arr, …)` would
+  /// silently return an f32 array (mlx promotes f16 × f32 → f32) —
   /// silently diverging from mlx-lm for uniform-half adapters. This test
-  /// triangulates the fix across all three float dtypes the helper is
-  /// expected to round-trip preserving precision.
+  /// triangulates the coercion across all three float dtypes the helper
+  /// is expected to round-trip preserving precision.
   #[test]
   fn scaled_helper_coerces_scalar_to_array_dtype() {
     for (dt, label) in [
@@ -8258,12 +8259,12 @@ mod tests {
     }
   }
 
-  /// `dora_embedding_forward_uniform_f16_adapter_returns_f16` — round-3
-  /// finding: with a uniform-f16 base + adapter, `DoRAEmbedding::forward`
+  /// `dora_embedding_forward_uniform_f16_adapter_returns_f16` — the
+  /// `scaled` coercion: with a uniform-f16 base + adapter, `DoRAEmbedding::forward`
   /// must return f16 (mlx-lm `to_array(scale, a.dtype())` keeps the scalar
   /// at f16, so `z = scale · lora_a[x] @ lora_b` stays at f16 and no
-  /// downstream op promotes). Pre-fix `scaled` minted an f32 scalar, so the
-  /// final `out` was silently f32 — divergent from mlx-lm.
+  /// downstream op promotes). If `scaled` minted an f32 scalar, the
+  /// final `out` would be silently f32 — divergent from mlx-lm.
   ///
   /// Hand-constructed deterministic fixture (all values exact in f16/bf16):
   /// num_embeddings=2, dims=2, r=1; weight=[[1,0],[0,1]], lora_a=[[1],[0]],
@@ -8331,10 +8332,10 @@ mod tests {
     approx_eq(&got, &[1.0, 0.0, 0.0, 1.0], 1e-3);
   }
 
-  /// `dora_embedding_as_linear_uniform_f16_adapter_returns_f16` — round-3
-  /// finding for `as_linear`: with uniform-f16 base + adapter, the tied-weight
+  /// `dora_embedding_as_linear_uniform_f16_adapter_returns_f16` — the
+  /// `scaled` coercion for `as_linear`: with uniform-f16 base + adapter, the tied-weight
   /// LM-head forward must also return f16. The same `scaled` helper is on the
-  /// hot path (the scale·lora_a delta), so the fix applies symmetrically.
+  /// hot path (the scale·lora_a delta), so the coercion applies symmetrically.
   ///
   /// Hand-constructed fixture (all values exact in f16/bf16) with x=[[1, 1]]:
   /// - y = x @ weightᵀ = [1, 1]
@@ -8401,12 +8402,12 @@ mod tests {
     approx_eq(&got, &[1.0, 1.0], 1e-3);
   }
 
-  /// `dora_linear_forward_uniform_f16_adapter_returns_f16` — round-3 sibling
+  /// `dora_linear_forward_uniform_f16_adapter_returns_f16` — sibling
   /// for [`DoRALinear`]: the same [`scaled`] helper is on its hot path, so
-  /// the fix propagates. DoRALinear's `forward` has an explicit trailing
+  /// the coercion propagates. DoRALinear's `forward` has an explicit trailing
   /// `astype(x.dtype)` on the low-rank term (mlx-lm `tuner/lora.py:97` casts
   /// `(scale * z).astype(x.dtype)`), so the dtype contract here is "out
-  /// matches x.dtype" — the scaled() fix doesn't change THAT contract for
+  /// matches x.dtype" — the scaled() coercion doesn't change THAT contract for
   /// DoRALinear (the trailing astype already enforces it), but the test
   /// pins the contract as a regression oracle against a future refactor
   /// that elides the trailing astype.

@@ -1,5 +1,5 @@
-//! `EncodeOptions` + `Tokenizer::encode_with` tests (mlxrs LM-2 tracker
-//! entry). The richer-surface builder is gated on the bare `tokenizer`
+//! `EncodeOptions` + `Tokenizer::encode_with` tests.
+//! The richer-surface builder is gated on the bare `tokenizer`
 //! feature, but the tests below assert `add_eos`-appended ids against the
 //! tokenizer's `eos_token_id` (`tokenizer-config`-gated accessor), so the
 //! whole file gates on `tokenizer-config`. Mirrors the `tokenizer.rs`
@@ -69,7 +69,7 @@ fn encode_with_add_special_false_matches_legacy_false() {
 
 #[test]
 fn encode_with_add_eos_uses_primary_not_smallest_id() {
-  // Per Codex round-3 finding: when the eos set has multiple ids, the
+  // When the eos set has multiple ids, the
   // appended EOS must be the PRIMARY (first user-supplied), NOT the
   // numerically smallest. Construct a tokenizer with a caller-supplied
   // multi-id stop list `[2, 0]` — id 2 is the real "</s>" (primary), id
@@ -248,7 +248,7 @@ fn encode_with_truncate_zero_dominates_add_eos() {
   // The `n == 0` edge case of the "EOS guaranteed last" contract: an
   // empty cap dominates `add_eos`, so NO eos is appended (the output
   // must be empty). Pins the doc'd exception to the EOS+truncation
-  // guarantee (Copilot review: the guarantee qualifies as `n >= 1`).
+  // guarantee (the guarantee qualifies as `n >= 1`).
   let tok = Tokenizer::from_path(fixture_dir(), None).unwrap();
 
   let out = tok
@@ -274,7 +274,7 @@ fn encode_with_truncate_zero_dominates_add_eos() {
 #[cfg(feature = "tokenizer-stream")]
 #[test]
 fn encode_with_padded_tokenizer_strips_pads_and_eos_lands_after_real() {
-  // Per Codex finding 2: when the HF tokenizer has padding enabled, naively
+  // When the HF tokenizer has padding enabled, naively
   // `merge_with`-ing an EOS encoding places `[tokens, pad..., eos]` with the
   // pad cells preserved. `encode_with` instead inserts EOS at the unpadded
   // boundary AND drops trailing pads — the returned ids/mask describe only
@@ -347,7 +347,7 @@ fn encode_with_padded_tokenizer_strips_pads_and_eos_lands_after_real() {
 #[cfg(feature = "tokenizer-stream")]
 #[test]
 fn encode_with_left_padded_tokenizer_drops_leading_pads() {
-  // Per Codex round-2 finding 1: when the HF tokenizer has LEFT padding
+  // When the HF tokenizer has LEFT padding
   // enabled (`[0, 0, real, real]`), `encode_with` must drop the leading
   // pad cells just as it does the trailing ones — every `mask == 0` cell
   // is dropped regardless of position, and the returned mask is all-1s.
@@ -403,7 +403,7 @@ fn encode_with_left_padded_tokenizer_drops_leading_pads() {
 #[cfg(feature = "tokenizer-stream")]
 #[test]
 fn legacy_encode_preserves_hf_padding_layout() {
-  // Per Codex round-2 finding 2: the legacy `encode` API must NOT strip
+  // The legacy `encode` API must NOT strip
   // HF-applied padding cells — callers that pass a padded HfTokenizer
   // through `from_loaded` and read raw padded ids from `encode` rely on
   // the exact HF Encoding layout. Pad-stripping is opt-in via
@@ -440,7 +440,7 @@ fn legacy_encode_preserves_hf_padding_layout() {
 
 #[test]
 fn encode_with_add_eos_errors_without_calling_hf_encode() {
-  // Per Codex round-2 finding 3: the `add_eos` precondition is validated
+  // The `add_eos` precondition is validated
   // BEFORE the underlying `hf.encode` call. We can't observe "did hf.encode
   // run" directly, but we can use a large valid input that would be
   // comparatively expensive to tokenize. Empty eos set + add_eos=true must
@@ -467,7 +467,7 @@ fn encode_with_add_eos_errors_without_calling_hf_encode() {
 
 #[test]
 fn encode_with_truncate_far_below_input_is_bounded_alloc() {
-  // Per Codex finding 1: `Encoding::truncate(n)` preserves the discarded
+  // `Encoding::truncate(n)` preserves the discarded
   // tail in `Encoding::overflowing` (HF 0.23 behavior), so a 10k-token
   // input truncated to 8 would allocate the full 10k Encoding. `encode_with`
   // uses bounded slicing instead. Smoke check: a long input + tiny
@@ -570,7 +570,7 @@ fn encoded_and_options_are_debug_clone() {
 }
 
 // ---------------------------------------------------------------------------
-// LM-2 (#112) — `encode_batch_with`: batch analogue of `encode_with` with
+// #112 — `encode_batch_with`: batch analogue of `encode_with` with
 // the same `EncodeOptions` semantics applied per item, plus the same
 // fast-fail-on-missing-eos contract.
 // ---------------------------------------------------------------------------

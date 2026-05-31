@@ -7,7 +7,7 @@
 //! G2P backend (typically a ByT5 encoder-decoder) into a
 //! [`Phonemizer`]: one input grapheme → `Vec<PhonemeUnit>`.
 //!
-//! Per the project's [no per-model arch porting][noarch] rule the
+//! Per the project's no per-model arch porting rule the
 //! underlying T5 model architecture (encoder/decoder layers, attention,
 //! relative-position bias, weight loader) is **NOT** ported. mlxrs ships
 //! the trait + composition; user code on top of [`Phonemizer`] supplies
@@ -38,7 +38,6 @@
 //! ```
 //!
 //! [src]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioG2P/NeuralPhonemizer.swift
-//! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 
 use crate::{
   audio::tts::g2p::types::{PhonemeUnit, Phonemizer},

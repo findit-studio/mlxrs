@@ -1,7 +1,7 @@
-//! Basic linalg ops: addmm (Phase 3.5 trinary+scalar template), matmul, inner, outer,
+//! Basic linalg ops: addmm (trinary+scalar template), matmul, inner, outer,
 //! plus the gathered/batched matmul `gather_mm` (the mixture-of-experts primitive).
 //!
-//! Phase 4 / audit #259 adds the matrix-structure ops that live alongside these:
+//! The matrix-structure ops (#259) live alongside these:
 //! `tensordot` (int-axis + axes-lists forms), `diagonal`, `trace`, `tril`, `triu`.
 
 use crate::{
