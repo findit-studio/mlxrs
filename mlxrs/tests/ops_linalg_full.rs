@@ -515,3 +515,160 @@ fn norm_matrix_fro_is_not_guarded() {
     }
   }
 }
+
+// ─────────────────── determinant (det / slogdet) ───────────────────
+
+#[test]
+fn det_of_identity_is_one() {
+  for n in [1usize, 2, 3, 4, 5] {
+    let a = Array::eye::<f32>(n, None, 0).unwrap();
+    let v = linalg_full::det(&a).unwrap().item::<f32>().unwrap();
+    assert!(close(v, 1.0), "det(I_{n}) = {v}, want 1.0");
+  }
+}
+
+#[test]
+fn det_2x2_known_small_path() {
+  // [[1,2],[3,4]] = 1*4 - 2*3 = -2 (closed-form small-matrix path).
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2usize, 2)).unwrap();
+  let v = linalg_full::det(&a).unwrap().item::<f32>().unwrap();
+  assert!(close(v, -2.0), "det = {v}, want -2.0");
+}
+
+#[test]
+fn det_3x3_known_small_path() {
+  // [[6,1,1],[4,-2,5],[2,8,7]] = -306.
+  let a = Array::from_slice::<f32>(
+    &[6.0, 1.0, 1.0, 4.0, -2.0, 5.0, 2.0, 8.0, 7.0],
+    &(3usize, 3),
+  )
+  .unwrap();
+  let v = linalg_full::det(&a).unwrap().item::<f32>().unwrap();
+  assert!((v - (-306.0)).abs() < 0.1, "det = {v}, want -306.0");
+}
+
+#[test]
+fn det_4x4_general_lu_path() {
+  // diag(2,3,4,5) = 120 — exercises the LU path (n > 3), positive det.
+  let a = Array::from_slice::<f32>(
+    &[
+      2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 5.0,
+    ],
+    &(4usize, 4),
+  )
+  .unwrap();
+  let v = linalg_full::det(&a).unwrap().item::<f32>().unwrap();
+  assert!((v - 120.0).abs() < 0.05, "det = {v}, want 120.0");
+}
+
+#[test]
+fn det_4x4_negative_lu_path() {
+  // diag(2,3,4,5) with rows 0 and 1 swapped → one permutation → det = -120.
+  // Independently exercises the permutation-parity sign on the LU path.
+  let a = Array::from_slice::<f32>(
+    &[
+      0.0, 3.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 5.0,
+    ],
+    &(4usize, 4),
+  )
+  .unwrap();
+  let v = linalg_full::det(&a).unwrap().item::<f32>().unwrap();
+  assert!((v - (-120.0)).abs() < 0.05, "det = {v}, want -120.0");
+}
+
+#[test]
+fn det_4x4_even_permutation_lu_path() {
+  // diag(2,3,4,5) row-permuted by [1,0,3,2] = (0 1)(2 3): an EVEN permutation
+  // that forces TWO getrf row swaps → det = +120 (sign unchanged). Catches a
+  // regression where the pivot-mismatch parity is computed as `any` (nonzero→1)
+  // rather than a true count mod 2 — which would wrongly flip an even swap
+  // count back to -120.
+  let a = Array::from_slice::<f32>(
+    &[
+      0.0, 3.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 4.0, 0.0,
+    ],
+    &(4usize, 4),
+  )
+  .unwrap();
+  let v = linalg_full::det(&a).unwrap().item::<f32>().unwrap();
+  assert!(
+    (v - 120.0).abs() < 0.05,
+    "det = {v}, want +120.0 (even permutation)"
+  );
+}
+
+#[test]
+fn det_singular_is_zero() {
+  // [[1,2],[2,4]] is rank-1 → det 0.
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 2.0, 4.0], &(2usize, 2)).unwrap();
+  let v = linalg_full::det(&a).unwrap().item::<f32>().unwrap();
+  assert!(v.abs() < TOL, "singular det = {v}, want ~0");
+}
+
+#[test]
+fn slogdet_reconstructs_det_on_lu_path() {
+  // Diagonally-dominant SPD 4x4 (n > 3): det == sign * exp(logabsdet), sign +1.
+  let a = Array::from_slice::<f32>(
+    &[
+      2.0, 1.0, 0.0, 0.0, 1.0, 3.0, 1.0, 0.0, 0.0, 1.0, 4.0, 1.0, 0.0, 0.0, 1.0, 5.0,
+    ],
+    &(4usize, 4),
+  )
+  .unwrap();
+  let (mut sign, mut logabs) = linalg_full::slogdet(&a).unwrap();
+  let s = sign.item::<f32>().unwrap();
+  let la = logabs.item::<f32>().unwrap();
+  let det = linalg_full::det(&a).unwrap().item::<f32>().unwrap();
+  assert!(
+    close(s * la.exp(), det),
+    "sign*exp(logabs) = {} want det {det}",
+    s * la.exp()
+  );
+  assert!(close(s, 1.0), "SPD matrix sign should be +1, got {s}");
+}
+
+#[test]
+fn slogdet_singular_is_sign_zero_neg_inf() {
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 2.0, 4.0], &(2usize, 2)).unwrap();
+  let (mut sign, mut logabs) = linalg_full::slogdet(&a).unwrap();
+  assert_eq!(sign.item::<f32>().unwrap(), 0.0, "singular sign must be 0");
+  let la = logabs.item::<f32>().unwrap();
+  assert!(
+    la.is_infinite() && la < 0.0,
+    "singular logabsdet must be -inf, got {la}"
+  );
+}
+
+#[test]
+fn det_batched() {
+  // batch [2,2,2]: [[1,2],[3,4]] → -2, [[2,0],[0,3]] → 6.
+  let a =
+    Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 2.0, 0.0, 0.0, 3.0], &(2usize, 2, 2)).unwrap();
+  let v = linalg_full::det(&a).unwrap().to_vec::<f32>().unwrap();
+  assert!(
+    close_vec(&v, &[-2.0, 6.0]),
+    "batched det = {v:?}, want [-2, 6]"
+  );
+}
+
+#[test]
+fn det_rejects_non_square_and_low_rank() {
+  let rect = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2usize, 3)).unwrap();
+  assert!(matches!(
+    linalg_full::det(&rect),
+    Err(mlxrs::Error::InvariantViolation(_))
+  ));
+  let v1d = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(3usize,)).unwrap();
+  assert!(matches!(
+    linalg_full::det(&v1d),
+    Err(mlxrs::Error::RankMismatch(_))
+  ));
+}
+
+#[test]
+fn det_integer_input_promotes_to_f32() {
+  // diag(2,3) as i32 → promoted to f32, det 6.
+  let a = Array::from_slice::<i32>(&[2, 0, 0, 3], &(2usize, 2)).unwrap();
+  let v = linalg_full::det(&a).unwrap().item::<f32>().unwrap();
+  assert!(close(v, 6.0), "int det = {v}, want 6.0");
+}

@@ -26,8 +26,16 @@ use std::{
 
 use crate::{
   array::Array,
-  error::{EmptyInputPayload, Error, OutOfRangePayload, Result, check, check_vector_array_handle},
+  dtype::Dtype,
+  error::{
+    EmptyInputPayload, Error, InvariantViolationPayload, OutOfRangePayload, RankMismatchPayload,
+    Result, check, check_vector_array_handle,
+  },
   ffi::{VectorArrayGuard, drain_vector},
+  ops::{
+    reduction::{any_axes, sum_axes},
+    shape::squeeze_axes,
+  },
   shape::dim_ptr,
   stream::default_stream,
 };
@@ -710,4 +718,181 @@ pub fn cross(a: &Array, b: &Array, axis: i32) -> Result<Array> {
     mlxrs_sys::mlx_linalg_cross(&mut out.0, a.0, b.0, axis as c_int, default_stream())
   })?;
   Ok(out)
+}
+
+// ─────────────────────────── determinant ───────────────────────────
+//
+// mlx-c does not (yet) expose `mlx_linalg_det` / `mlx_linalg_slogdet`, so
+// these are composed in pure Rust from `lu_factor`, mirroring mlx's own
+// LU-based composition (`mlx/linalg.cpp`): `det = sign * exp(log|det|)`,
+// with the permutation parity folded into the sign and a closed-form fast
+// path for `n <= 3`.
+
+/// Validate a det/slogdet input and return the float dtype to compute in.
+///
+/// Mirrors mlx's `validate_det` + `at_least_float`: rejects complex inputs,
+/// requires `ndim >= 2` with a square trailing 2-D block, and promotes
+/// integer / boolean inputs to `f32` (float inputs keep their own dtype).
+fn validate_det(a: &Array, context: &'static str) -> Result<Dtype> {
+  let dtype = a.dtype()?;
+  if dtype == Dtype::Complex64 {
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      context,
+      "complex inputs are not supported",
+    )));
+  }
+  let shape = a.shape();
+  if shape.len() < 2 {
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "linalg det/slogdet: input must be rank >= 2 (a square matrix or a batch of them)",
+      shape.len() as u32,
+      shape,
+    )));
+  }
+  if shape[shape.len() - 1] != shape[shape.len() - 2] {
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      context,
+      "only defined for square matrices (the trailing two dimensions must be equal)",
+    )));
+  }
+  Ok(match dtype {
+    Dtype::F16 | Dtype::F32 | Dtype::F64 | Dtype::BF16 => dtype,
+    _ => Dtype::F32,
+  })
+}
+
+/// Closed-form determinant for a square trailing block of size `n <= 3`
+/// (mirrors mlx's `det_raw_small`): skips the LU + `log`/`exp` round-trip for
+/// tiny matrices. `a` is already a float dtype.
+fn det_raw_small(a: &Array, n: usize) -> Result<Array> {
+  let ndim = a.ndim();
+  // `a[..., i, j]`, with the two trailing singleton dims squeezed off.
+  let elem = |i: i32, j: i32| -> Result<Array> {
+    let mut start = vec![0i32; ndim];
+    let mut stop: Vec<i32> = a.shape().iter().map(|&d| d as i32).collect();
+    let strides = vec![1i32; ndim];
+    start[ndim - 2] = i;
+    stop[ndim - 2] = i + 1;
+    start[ndim - 1] = j;
+    stop[ndim - 1] = j + 1;
+    squeeze_axes(
+      &a.slice(&start, &stop, &strides)?,
+      &[(ndim - 2) as i32, (ndim - 1) as i32],
+    )
+  };
+  match n {
+    // Empty 0x0 matrix: the determinant is the empty product, 1.
+    0 => {
+      let shape = a.shape();
+      let batch = shape[..shape.len() - 2].to_vec();
+      Array::full::<f32>(&[0i32; 0], 1.0)?
+        .astype(a.dtype()?)?
+        .broadcast_to(&batch)
+    }
+    1 => elem(0, 0),
+    2 => elem(0, 0)?
+      .multiply(&elem(1, 1)?)?
+      .subtract(&elem(0, 1)?.multiply(&elem(1, 0)?)?),
+    // n == 3: cofactor expansion along the first row.
+    _ => {
+      let (a00, a01, a02) = (elem(0, 0)?, elem(0, 1)?, elem(0, 2)?);
+      let (a10, a11, a12) = (elem(1, 0)?, elem(1, 1)?, elem(1, 2)?);
+      let (a20, a21, a22) = (elem(2, 0)?, elem(2, 1)?, elem(2, 2)?);
+      let m0 = a00.multiply(&a11.multiply(&a22)?.subtract(&a12.multiply(&a21)?)?)?;
+      let m1 = a01.multiply(&a10.multiply(&a22)?.subtract(&a12.multiply(&a20)?)?)?;
+      let m2 = a02.multiply(&a10.multiply(&a21)?.subtract(&a11.multiply(&a20)?)?)?;
+      m0.subtract(&m1)?.add(&m2)
+    }
+  }
+}
+
+/// Core sign-log-determinant: returns `(sign, log|det|)`. `input` is already
+/// the float `dtype`; `n` is the trailing dimension. Mirrors mlx's
+/// `slogdet_impl` — a small-matrix fast path, otherwise LU factorization with
+/// the permutation parity folded into the sign.
+fn slogdet_impl(input: &Array, dtype: Dtype, n: usize) -> Result<(Array, Array)> {
+  if n <= 3 {
+    let raw = det_raw_small(input, n)?;
+    return Ok((raw.sign()?, raw.abs()?.log()?));
+  }
+
+  let (lu, pivots) = lu_factor(input)?;
+  let diag = lu.diagonal(0, -2, -1)?;
+
+  // Permutation parity: how many pivots moved (`pivots[i] != i`).
+  let shape = input.shape();
+  let k = shape[shape.len() - 1].min(shape[shape.len() - 2]);
+  let iota = Array::arange::<u32>(0, k as f64, 1)?;
+  let parity = sum_axes(&pivots.not_equal(&iota)?, &[-1], false)?.astype(Dtype::I32)?;
+
+  // A negative diagonal entry flips the product's sign.
+  let zero = Array::full::<f32>(&[0i32; 0], 0.0)?.astype(dtype)?;
+  let num_neg = sum_axes(&diag.less(&zero)?, &[-1], false)?.astype(Dtype::I32)?;
+
+  // sign = (-1)^(parity + num_neg) = 1 - 2 * ((parity + num_neg) mod 2).
+  let one = Array::full::<i32>(&[0i32; 0], 1)?;
+  let two = Array::full::<i32>(&[0i32; 0], 2)?;
+  let total = parity.add(&num_neg)?;
+  let sign_val = one
+    .subtract(&two.multiply(&total.remainder(&two)?)?)?
+    .astype(dtype)?;
+
+  // log|det| = Σ log|diag(U)|.
+  let logabsdet = sum_axes(&diag.abs()?.log()?, &[-1], false)?;
+
+  // Singular matrices (a zero on the diagonal): sign 0, log|det| = -inf.
+  let is_zero = any_axes(&diag.equal(&zero)?, &[-1], false)?;
+  let neg_inf = Array::full::<f32>(&[0i32; 0], f32::NEG_INFINITY)?.astype(dtype)?;
+  Ok((
+    is_zero.select(&zero, &sign_val)?,
+    is_zero.select(&neg_inf, &logabsdet)?,
+  ))
+}
+
+/// Determinant of a square matrix (or a batch of them, `[..., n, n]`).
+///
+/// Composed in pure Rust from [`lu_factor`] (mirroring mlx's own LU-based
+/// composition) since mlx-c does not yet expose `mlx_linalg_det`:
+/// `det = sign * exp(log|det|)`, with a closed-form fast path for `n <= 3`.
+/// Integer / boolean inputs are promoted to `f32`; complex is rejected.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.det.html).
+///
+/// # Errors
+/// - [`Error::InvariantViolation`] if `a` is complex or not square.
+/// - [`Error::RankMismatch`] if `a` has fewer than 2 dimensions.
+/// - Propagates any backend error from the underlying factorization.
+pub fn det(a: &Array) -> Result<Array> {
+  let dtype = validate_det(a, "linalg::det")?;
+  let input = a.astype(dtype)?;
+  let shape = input.shape();
+  let n = shape[shape.len() - 1];
+  if n <= 3 {
+    return det_raw_small(&input, n);
+  }
+  let (sign_val, logabsdet) = slogdet_impl(&input, dtype, n)?;
+  sign_val.multiply(&logabsdet.exp()?)
+}
+
+/// Sign and natural log of the absolute determinant of a square matrix (or a
+/// batch, `[..., n, n]`), returned as `(sign, log|det|)`.
+///
+/// `sign` is `-1`, `0`, or `+1` (0 for a singular matrix, whose `log|det|` is
+/// `-inf`); `det == sign * exp(log|det|)`. Composed in pure Rust from
+/// [`lu_factor`] (mirroring mlx's composition) since mlx-c does not yet expose
+/// `mlx_linalg_slogdet`. Integer / boolean inputs are promoted to `f32`;
+/// complex is rejected.
+///
+/// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.slogdet.html).
+///
+/// # Errors
+/// - [`Error::InvariantViolation`] if `a` is complex or not square.
+/// - [`Error::RankMismatch`] if `a` has fewer than 2 dimensions.
+/// - Propagates any backend error from the underlying factorization.
+pub fn slogdet(a: &Array) -> Result<(Array, Array)> {
+  let dtype = validate_det(a, "linalg::slogdet")?;
+  let input = a.astype(dtype)?;
+  let shape = input.shape();
+  let n = shape[shape.len() - 1];
+  slogdet_impl(&input, dtype, n)
 }
