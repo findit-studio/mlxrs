@@ -15,7 +15,7 @@ use mlxrs::{
   Array, Error, Result,
   lm::cache::{
     ArraysCache, BatchKvCache, BatchRotatingKvCache, CacheList, ChunkedKvCache, KvCache, MaskMode,
-    QuantizedKvCacheImpl, RotatingKvCache, StandardKvCache,
+    RotatingKvCache, StandardKvCache, StandardQuantizedKvCache,
   },
 };
 
@@ -50,7 +50,7 @@ fn quantized_kv_cache_reference_name_is_quantized_kvcache() {
   // mlx-lm `type(QuantizedKVCache).__name__` / mlx-swift-lm
   // `case is QuantizedKVCache: return "QuantizedKVCache"`
   // (`KVCache.swift:1387`).
-  let c = QuantizedKvCacheImpl::new(64, 4).unwrap();
+  let c = StandardQuantizedKvCache::new(64, 4).unwrap();
   assert_eq!(c.reference_class_name(), "QuantizedKVCache");
 }
 
@@ -90,16 +90,16 @@ fn batch_rotating_kv_cache_reference_name_is_batch_rotating_kvcache() {
   assert_eq!(c.reference_class_name(), "BatchRotatingKVCache");
 }
 
-// ───────── KVC-10: required method (no default) ─────────
+// ───────── required method (no default) ─────────
 //
-// Per KVC-10 (issue #107), `KvCache::reference_class_name` is now a
+// Per issue #107, `KvCache::reference_class_name` is now a
 // REQUIRED trait method (no default). Forgetting to declare it on a new
 // in-tree cache is a compile error — closing the silent runtime
-// label-loss the pre-KVC-10 `"KVCache"` default left open (a new
+// label-loss the earlier `"KVCache"` default left open (a new
 // state-shape-different cache would have round-tripped as a
 // `StandardKvCache`).
 //
-// The pre-KVC-10 `default_dyn_kvcache_falls_back_to_kvcache` test that
+// The earlier `default_dyn_kvcache_falls_back_to_kvcache` test that
 // asserted the default returns `"KVCache"` is REMOVED — the default no
 // longer exists, and the assertion is structurally incoherent. The
 // `RotatingForwardingWrapper` tests are updated below to assert the
@@ -108,7 +108,7 @@ fn batch_rotating_kv_cache_reference_name_is_batch_rotating_kvcache() {
 // in-tree caches/wrappers do so explicitly.
 
 /// Minimal `KvCache` impl that declares `reference_class_name`
-/// EXPLICITLY (post-KVC-10: required method, no default). The custom
+/// EXPLICITLY (required method, no default). The custom
 /// `"MyCustomCache"` name demonstrates the required-method contract — a
 /// new cache type chooses its own class name at trait-impl site, a
 /// compile-time guarantee.
@@ -149,7 +149,7 @@ impl KvCache for ExplicitMock {
   fn copy(&self) -> Result<Box<dyn KvCache>> {
     Ok(Box::new(ExplicitMock))
   }
-  // KVC-10 (issue #107): REQUIRED — no default.
+  // Issue #107: REQUIRED — no default.
   fn reference_class_name(&self) -> &'static str {
     "MyCustomCache"
   }
@@ -160,7 +160,7 @@ impl KvCache for ExplicitMock {
 
 #[test]
 fn explicit_kvcache_uses_declared_name() {
-  // KVC-10: a new cache impl declares its name at trait-impl site (no
+  // A new cache impl declares its name at trait-impl site (no
   // silent inheritance of a generic default). `ExplicitMock` returns
   // `"MyCustomCache"`, the exact string compiled into its impl body —
   // verifying the required-method contract holds via both direct call
@@ -177,12 +177,12 @@ fn explicit_kvcache_uses_declared_name() {
 }
 
 /// Wrapper around a `RotatingKvCache` that forwards every method,
-/// INCLUDING `reference_class_name`. Post-KVC-10 (issue #107), every
+/// INCLUDING `reference_class_name`. Per issue #107, every
 /// impl MUST declare its class name explicitly — the trait-default
 /// `"KVCache"` fallback is gone. This wrapper's `reference_class_name`
 /// forwards to `self.inner.reference_class_name()` (a one-liner — the
 /// documented pattern for any wrapper that wants the wrapped kind's
-/// label). The pre-KVC-10 silent-default behavior (`"KVCache"` for any
+/// label). The earlier silent-default behavior (`"KVCache"` for any
 /// type without override) would have been a compile error under the
 /// required method, not silent label loss.
 struct RotatingForwardingWrapper {
@@ -234,7 +234,7 @@ impl KvCache for RotatingForwardingWrapper {
   fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
     self
   }
-  // KVC-10 (issue #107): REQUIRED — forward to inner's declared name.
+  // Issue #107: REQUIRED — forward to inner's declared name.
   fn reference_class_name(&self) -> &'static str {
     self.inner.reference_class_name()
   }
@@ -242,12 +242,12 @@ impl KvCache for RotatingForwardingWrapper {
 
 #[test]
 fn rotating_forwarding_wrapper_inherits_inner_class_name() {
-  // Post-KVC-10 contract: a wrapper that forwards
+  // Contract: a wrapper that forwards
   // `reference_class_name` to its inner cache reports the inner's name —
   // exactly the documented one-liner for any wrapper that wants the
-  // wrapped kind's label. Pre-KVC-10 this was the trait default
+  // wrapped kind's label. Earlier this was the trait default
   // `"KVCache"` (a silent label loss for any state-shape-different
-  // wrapper); post-KVC-10 the explicit forward is the only path, which
+  // wrapper); now the explicit forward is the only path, which
   // means a future state-shape-different wrapper that omits the forward
   // is a COMPILE ERROR (the structural guarantee).
   let w = RotatingForwardingWrapper {
@@ -256,7 +256,7 @@ fn rotating_forwarding_wrapper_inherits_inner_class_name() {
   // Sanity: the inner is a rotating cache.
   assert!(w.max_size().is_some());
   assert_eq!(w.meta_state().len(), 4);
-  // The post-KVC-10 contract: explicit forward yields the inner's name.
+  // The contract: explicit forward yields the inner's name.
   assert_eq!(
     w.reference_class_name(),
     "RotatingKVCache",
@@ -272,7 +272,7 @@ fn rotating_forwarding_wrapper_inherits_inner_class_name() {
 
 #[test]
 fn rotating_forwarding_wrapper_nested_in_cache_list_inherits_inner_class_name() {
-  // The "top-level vs nested" consistency check (post-KVC-10): a
+  // The "top-level vs nested" consistency check: a
   // forwarding wrapper's class name must be the same in top-level vs
   // nested-in-CacheList positions. With the trait method REQUIRED, the
   // wrapper's explicit `self.inner.reference_class_name()` is the only

@@ -352,7 +352,7 @@ pub struct Spectrum {
 impl Spectrum {
   /// The `(num_frames, n_fft / 2 + 1)` `Dtype::Complex64` transform data.
   ///
-  /// Named `data_ref` (not `data`) per §3 non-Copy `&T` accessor naming
+  /// Named `data_ref` (not `data`) per the non-Copy `&T` accessor naming
   /// convention — [`Array`] is not `Copy`, so the accessor returns a
   /// reference rather than a copy and carries the `_ref` suffix to signal
   /// that the returned value borrows `self`.
@@ -609,8 +609,8 @@ fn place_window(
 /// transforms construct their window through this one function with the same
 /// `(win_length, n_fft, window_pad)` arguments, so the synthesis window is
 /// **identical to the analysis window by construction** — a synthesis/analysis
-/// mismatch (the historical source of silent round-trip corruption) is
-/// structurally impossible. `istft` no longer takes any custom-window input
+/// mismatch (a classic source of silent round-trip corruption) is
+/// structurally impossible. `istft` takes no custom-window input
 /// and `stft` has none to match against, so there is exactly one window per
 /// `(win_length, n_fft, window_pad)` triple.
 ///
@@ -695,12 +695,12 @@ impl LogFloor {
 
 /// Shared scaffolding for the symmetric (`periodic=False`) window family:
 /// validates `n`, applies the public-input allocation cap, and dispatches
-/// to the C12 SIMD window builder
+/// to the SIMD window builder
 /// ([`crate::simd::audio::window::symmetric_window`]).
 ///
 /// `name` only flavors the error messages so each public window keeps its
 /// own diagnostic prefix; `kind` selects the per-window formula (Hann /
-/// Hamming / Blackman / Bartlett). On `aarch64` the C12 dispatcher
+/// Hamming / Blackman / Bartlett). On `aarch64` the SIMD dispatcher
 /// routes to a 7-term Taylor cos polynomial NEON 4-lane tile;
 /// elsewhere it falls back to the per-element `f32::cos` scalar loop.
 fn symmetric_window(
@@ -736,7 +736,7 @@ fn symmetric_window(
     ))
   })?;
 
-  // C12 SIMD: dispatch to the symmetric-window NEON kernel
+  // SIMD: dispatch to the symmetric-window NEON kernel
   // (`simd::audio::window::symmetric_window`). The dispatcher does
   // its own fallible `try_reserve_exact(n)` + `spare_capacity_mut` +
   // `set_len(n)` internally; we feed the result straight into
@@ -932,7 +932,7 @@ fn reflect_pad_1d(samples: &Array, padding: usize) -> Result<Array> {
     // `padding == len - 1`. Inclusive-end is index 0 — needs the
     // post-normalize-to-`-1` sentinel form (`stop = -(n + 1)`).
     //
-    // Overflow note (Copilot review #3273868700): both `padding` and `len`
+    // Overflow note: both `padding` and `len`
     // were checked to fit `i32` above via `i32::try_from`; combined with
     // `len == padding + 1` in this branch (`padding + 1 >= len` from the
     // else condition, and `len >= padding + 1` from the early check),
@@ -1151,7 +1151,7 @@ pub fn stft_with_config(
     )));
   }
 
-  // INPUT-LENGTH CAP (Codex OOM finding). When `cfg.center == true` the
+  // INPUT-LENGTH CAP (OOM guard). When `cfg.center == true` the
   // reflect pad below (`reflect_pad_1d`) is a lazy slice+concatenate, but
   // *evaluating* the graph materializes a padded signal proportional to the
   // INPUT length — independent of `num_frames`. The post-framing
@@ -1273,7 +1273,7 @@ pub fn stft_with_config(
     )));
   }
 
-  // WORK CAP (Codex finding). Mirror `istft`'s `MAX_OLA_WORK` guard on the
+  // WORK CAP. Mirror `istft`'s `MAX_OLA_WORK` guard on the
   // forward side: BEFORE building the strided frame view, the window, or the
   // rfft, reject any `(num_frames, n_fft, hop)` whose framing work or output
   // size is pathological. The public-input *sample* length is already capped
@@ -2435,10 +2435,9 @@ pub fn mel_filter_bank(
 
   // Build the filterbank directly on the CPU as `(n_mels, n_freqs)` to
   // avoid the reference's allocation chain (linspace + 4 broadcast ops);
-  // this is the only place we elide an mlx-graph step in this PR — the
+  // this is the only place we elide an mlx-graph step — the
   // mel filter is a one-shot constant matrix per `(sample_rate, n_fft,
   // n_mels)` triple, and the on-device construction has no perf benefit.
-  // Logged in docs/rust-golden-standard-followups.md (AUDIO-2).
   //
   // Use `try_reserve_exact` so a multi-GB request from a forged input
   // returns a recoverable `Error::AllocFailure` rather than aborting on the
@@ -2455,10 +2454,10 @@ pub fn mel_filter_bank(
     ))
   })?;
 
-  // C10 SIMD: dispatch the row-by-row triangle construction through
+  // SIMD: dispatch the row-by-row triangle construction through
   // the SIMD kernel (`simd::audio::mel_triangle::mel_filter_bank_rows`).
   // The dispatcher writes 0.0 for collapsed-bin rows (lc <= 0 / cr <=
-  // 0) so we no longer need `Vec::resize(bank_len, 0.0)` upfront —
+  // 0) so there is no need for `Vec::resize(bank_len, 0.0)` upfront —
   // the kernel initializes every cell via `MaybeUninit::write`.
   let spare = bank.spare_capacity_mut();
   crate::simd::audio::mel_triangle::mel_filter_bank_rows(
@@ -2467,7 +2466,7 @@ pub fn mel_filter_bank(
     &f_pts,
     n_mels,
   );
-  // SAFETY: the C10 dispatcher's init contract guarantees every cell
+  // SAFETY: the SIMD dispatcher's init contract guarantees every cell
   // of the `bank_len`-prefix of `spare` is initialized before
   // returning; `bank_len <= bank.capacity()` per `try_reserve_exact`.
   unsafe { bank.set_len(bank_len) };
@@ -2669,8 +2668,8 @@ pub fn mel_spectrogram(
   // Mel-spec layout in mlx-audio / Whisper is `(n_mels, num_frames)` =
   // `mel @ power.T`. Uses `mel_filter_bank_cached` so repeated calls with
   // the same `(n_mels, n_fft, sample_rate, f_min, f_max)` share the
-  // per-thread LRU cache (Codex R1 medium finding — the uncached path
-  // rebuilt the bank on every chunk / per-utterance encode pass).
+  // per-thread LRU cache (the uncached path rebuilt the bank on every
+  // chunk / per-utterance encode pass).
   let mel = mel_filter_bank_cached(n_mels, n_fft, sample_rate, f_min, f_max)?;
   let power_t = power.transpose()?;
   ops::linalg_basic::matmul(&mel, &power_t)
@@ -2795,10 +2794,11 @@ const MAX_LOUDNESS_SAMPLES: usize = crate::audio::io::MAX_DECODED_SAMPLES;
 
 /// Hard byte ceiling on the per-channel `f64` mean-square matrix
 /// [`integrated_loudness`] allocates: `num_blocks * n_channels *
-/// size_of::<f64>() <= MAX_LOUDNESS_BLOCK_BYTES`. The previous revision
-/// capped `num_blocks * n_channels` against the 64 Mi-**element** sample
-/// budget — but the cells are `f64`, so the actual peak bytes were 8× the
-/// element budget (`64 Mi * 8 B = 512 MiB`). A caller-controllable
+/// size_of::<f64>() <= MAX_LOUDNESS_BLOCK_BYTES`. Capping
+/// `num_blocks * n_channels` against the 64 Mi-**element** sample
+/// budget alone would be wrong — the cells are `f64`, so the actual peak
+/// bytes would be 8× the element budget (`64 Mi * 8 B = 512 MiB`). A
+/// caller-controllable
 /// `overlap` close to 1 (e.g. `0.99999990`) on a small mono input derived
 /// tens of millions of blocks that all passed the element-only cap, then
 /// reserved hundreds of MB / ~2 GiB for the mean-square matrix alone. The
@@ -2819,11 +2819,11 @@ const MAX_LOUDNESS_BLOCK_BYTES: usize = 64 * 1024 * 1024;
 /// loop runs ONCE PER CHANNEL (the streaming K-weighting loop iterates
 /// `n_channels` times), so the actual visit count is `num_blocks *
 /// ceil(block_size_samples) * n_channels` regardless of the matrix byte
-/// footprint. A prior revision omitted the `n_channels` factor and
-/// admitted a 5-channel pathological case (Codex review:
-/// `num_blocks=1_677_721, block_samples=160, n_channels=5` — channel-less
-/// product `~268 Mi <= 256 Mi cap` BUT actual visits `~1.34 Bi`); the
-/// fix folds `n_channels` into the work product. `ceil` is used because
+/// footprint. Omitting the `n_channels` factor would
+/// admit a 5-channel pathological case
+/// (`num_blocks=1_677_721, block_samples=160, n_channels=5` — channel-less
+/// product `~268 Mi <= 256 Mi cap` BUT actual visits `~1.34 Bi`), so
+/// `n_channels` is folded into the work product. `ceil` is used because
 /// the per-block bounds `(floor(bi*step*bs*r), floor((bi*step+1)*bs*r))`
 /// can give `upper - lower = ceil(block_size_samples)` in the worst
 /// case for fractional `block_size_samples`. Cap the total visit count
@@ -3060,7 +3060,7 @@ fn lfilter_f64(b: &[f64], a: &[f64], x: &[f64]) -> Result<Vec<f64>> {
 
   // Reference's `state_len == 0` fast path: `y = b[0] * x` (no recurrence,
   // no feedback state to maintain). This is the FIR-of-length-1 case.
-  // C9 / [#154]: a NEON `vmulq_n_f64` 2-lane kernel exists at
+  // (#154): a NEON `vmulq_n_f64` 2-lane kernel exists at
   // [`crate::simd::audio::lfilter::lfilter_fir_b0`] but is NOT wired
   // here — the simd_lfilter bench (M2 Pro, release, 2026-05-24)
   // measured scalar at ~10 Gelem/s vs the NEON dispatcher at
@@ -3077,7 +3077,7 @@ fn lfilter_f64(b: &[f64], a: &[f64], x: &[f64]) -> Result<Vec<f64>> {
     return Ok(y);
   }
 
-  // C9 / [#154]: biquad fast path — `state_len == 2`, `b.len() ==
+  // (#154): biquad fast path — `state_len == 2`, `b.len() ==
   // a.len() == 3` — is NOT wired in this out-of-place path.
   //
   // The hand-unrolled biquad kernel in `simd::audio::lfilter` is
@@ -3094,10 +3094,10 @@ fn lfilter_f64(b: &[f64], a: &[f64], x: &[f64]) -> Result<Vec<f64>> {
   // through `k_weight_channel`, so the in-place arm (wired below in
   // `lfilter_f64_in_place`) IS the consumer that matters.
   //
-  // Per the user directive 2026-05-24 ("KEEP wiring only if benchmark
-  // proves > scalar at the actually-wired paths; prefer revert when
-  // in doubt"), this arm is reverted. The single-pass generic loop
-  // below handles `state_len == 2` along with all other shapes.
+  // This specialized arm is not separately wired: benchmarking did not
+  // show it beating the generic loop on the actually-wired paths, so
+  // the single-pass generic loop below handles `state_len == 2` along
+  // with all other shapes.
 
   // General direct-form II transposed recurrence (matching the reference's
   // per-sample loop body byte-for-byte) — for non-biquad / non-FIR shapes
@@ -3233,7 +3233,7 @@ fn lfilter_f64_in_place(b: &[f64], a: &[f64], x: &mut [f64]) -> Result<()> {
   // `state_len == 0` fast path: `y[n] = b[0] * x[n]`. Read each sample
   // BEFORE writing — both source and destination are the same slot, so
   // the multiplication is order-safe regardless (single-pass, no
-  // dependency on neighboring slots). C9 / [#154]: the SIMD FIR
+  // dependency on neighboring slots). (#154): the SIMD FIR
   // dispatcher at [`crate::simd::audio::lfilter::lfilter_fir_b0`]
   // exists, but the bench measured the scalar in-place `*v *= b0` loop
   // (which LLVM autovectorizes) at ~10 Gelem/s vs the NEON dispatcher
@@ -3248,7 +3248,7 @@ fn lfilter_f64_in_place(b: &[f64], a: &[f64], x: &mut [f64]) -> Result<()> {
     return Ok(());
   }
 
-  // C9 / [#154]: biquad fast path — `state_len == 2`, `b.len() ==
+  // (#154): biquad fast path — `state_len == 2`, `b.len() ==
   // a.len() == 3` (the actual BS.1770 K-weighting workload — the
   // chain through this kernel from [`k_weight_channel`] is the hot
   // path of [`integrated_loudness`]). Benchmarks (M2 Pro, release,
@@ -3273,7 +3273,7 @@ fn lfilter_f64_in_place(b: &[f64], a: &[f64], x: &mut [f64]) -> Result<()> {
   // channels). The hand-unrolled body is bit-identical to the generic
   // loop for any 3-tap biquad (asserted by `biquad_bit_exact_vs_generic_*`
   // tests in [`crate::simd::audio::lfilter`]); LUFS measurements
-  // through [`integrated_loudness`] remain byte-identical to pre-C9
+  // through [`integrated_loudness`] remain byte-identical to pre-SIMD
   // output.
   //
   // CAVEAT: see `simd::audio::lfilter` module docs for cross-run
@@ -3535,7 +3535,7 @@ fn k_weight_channel(channel: &[f32], rate: u32) -> Result<Vec<f64>> {
 ///   index allocation beyond the mean-square matrix itself).
 ///
 /// We do NOT allocate per-channel deinterleaved f32 buffers AND per-
-/// channel weighted f64 buffers all-at-once — the previous revision held
+/// channel weighted f64 buffers all-at-once — doing so would hold
 /// `3 * n_samples * n_channels`-worth of channel data simultaneously,
 /// which the [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES)
 /// cap could not bound (the cap is per-element, and the multiplier on the
@@ -3598,9 +3598,9 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
       )));
     }
   };
-  // Cap on the TOTAL materialized element count BEFORE the `to_vec`. The
-  // previous revision capped only `n_samples`, which a 2-D input like
-  // `(MAX_DECODED_SAMPLES, 5)` would bypass — the `to_vec` would then
+  // Cap on the TOTAL materialized element count BEFORE the `to_vec`.
+  // Capping only `n_samples` would let a 2-D input like
+  // `(MAX_DECODED_SAMPLES, 5)` bypass it — the `to_vec` would then
   // materialize `5 * MAX_DECODED_SAMPLES` f32 samples (multi-GB). Mirrors
   // the [`stft`] / OLA pattern of checking the materialized work cap
   // before any allocation.
@@ -3743,7 +3743,7 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
   // CHANNEL (see the per-channel streaming loop below), so the actual
   // sample-visit count is `num_blocks * block_size_samples * n_channels`
   // — bounding the channel-less product alone admitted a 5-channel input
-  // (Codex review: `num_blocks=1_677_721, block_samples=160, n_channels=5`
+  // (`num_blocks=1_677_721, block_samples=160, n_channels=5`
   // gives a channel-less work product of ~268 Mi ≤ 256 Mi cap BUT actual
   // visits ~1.34 Bi, defeating the bound for adversarial overlap × multi-
   // channel). Include `n_channels` in the work product.
@@ -3937,12 +3937,12 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
 
   // Per-channel gated mean of `mean_square`, computed directly from
   // `block_loudness` + `mean_square` WITHOUT materializing a `Vec<usize>`
-  // of gated block indices. The previous revision allocated TWO
+  // of gated block indices. Materializing TWO
   // `num_blocks`-sized `Vec<usize>` (one per gate pass) via
-  // `try_reserve_exact(num_blocks)` — each `8 * num_blocks` bytes on a
-  // 64-bit target, scaling with `num_blocks` even when very few blocks
-  // survive the gate. The byte/work caps above now bound `num_blocks`,
-  // so this is no longer a multi-GB risk; we still eliminate the
+  // `try_reserve_exact(num_blocks)` would cost `8 * num_blocks` bytes each
+  // on a 64-bit target, scaling with `num_blocks` even when very few blocks
+  // survive the gate. The byte/work caps above bound `num_blocks`,
+  // so this is not a multi-GB risk; we still eliminate the
   // intermediate `Vec`s because they're pure overhead — the gated mean
   // is a simple filter-fold over `block_loudness.iter().zip(ms_row)` that
   // visits the same cells either way. Returns NaN for an empty survivor
@@ -4178,7 +4178,7 @@ mod tests {
     a.try_clone().unwrap().to_vec::<f32>().unwrap()
   }
 
-  // ---- A2: window family closed-form parity (hand-derived) ----------------
+  // ---- window family closed-form parity (hand-derived) ----------------
 
   #[test]
   fn hamming_matches_closed_form_n5() {
@@ -4230,7 +4230,7 @@ mod tests {
 
   #[test]
   fn windows_reject_n_lt_2() {
-    // P6 / AUDIO-1 (#127): the reference Python form `0.5 * (1 - cos(2π n /
+    // The reference Python form `0.5 * (1 - cos(2π n /
     // (size - 1)))` divides by zero for `size == 1`, silently producing
     // `NaN` for every sample. mlxrs centralizes the rejection in
     // `symmetric_window` so EVERY window function (Hann / Hamming /
@@ -4284,13 +4284,13 @@ mod tests {
     ));
   }
 
-  // ---- A1: stft / istft WindowPad round-trips -----------------------------
+  // ---- stft / istft WindowPad round-trips -----------------------------
   //
   // Every reconstruction test below drives the REAL public `stft` and feeds
-  // its output straight into `istft` (`istft(&stft(signal, ..)?, ..)?`). The
-  // private periodic-forward-helper pattern that hid the historical
-  // synthesis/analysis window mismatch for 7 review rounds is BANNED — there
-  // is no helper that builds spectra with its own window; the only forward is
+  // its output straight into `istft` (`istft(&stft(signal, ..)?, ..)?`). A
+  // private periodic-forward-helper pattern that builds spectra with its own
+  // window can hide a synthesis/analysis window mismatch, so it is BANNED —
+  // there is no helper that builds spectra with its own window; the only forward is
   // `stft`, and `istft` rebuilds `stft`'s exact symmetric Hann via the shared
   // `frame_window`, so a window mismatch would surface here value-for-value.
   //
@@ -4324,7 +4324,7 @@ mod tests {
   /// typed spectrum metadata and always uses the `Σw²` inverse), and assert
   /// EVERY output sample equals the original.
   ///
-  /// This is the canary the previous review rounds were missing: it goes
+  /// This is the canary for synthesis/analysis window drift: it goes
   /// through `stft` itself (NOT a private periodic-forward helper), and the
   /// synthesis window `istft` rebuilds is the SAME symmetric Hann `stft`
   /// placed (both via `frame_window`) — so if the two ever drifted, this
@@ -4439,7 +4439,7 @@ mod tests {
 
   #[test]
   fn istft_right_short_window_rejected() {
-    // THE FIX. WindowPad::Right inversion supports ONLY win_length == n_fft.
+    // WindowPad::Right inversion supports ONLY win_length == n_fft.
     // For win_length < n_fft the right-pad geometry is not a faithful inverse
     // (the forward transform discards/distorts boundary info), so istft REJECTS
     // it up front with a recoverable Err, BEFORE any reconstruction. The forward
@@ -4451,7 +4451,7 @@ mod tests {
     // boundary sample is ALSO zero-covered) AND win=12 (> n_fft/2; the boundary
     // sample is COVERED — window-sum well above COVERAGE_EPS — yet would still
     // mis-reconstruct, so the coverage guard alone would NOT catch it; this is
-    // the heart of the fix and why the rejection is up-front, not guard-based).
+    // why the rejection is up-front, not guard-based).
     let buf = signal_16();
     let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
     for &win in &[8usize, 12usize] {
@@ -4578,8 +4578,8 @@ mod tests {
   fn spectrum_from_parts_rejects_inconsistent_metadata() {
     // `Spectrum::from_parts` is the validated constructor for EXTERNAL/raw
     // spectra: it must make it impossible to build a Spectrum whose metadata
-    // istft would misdecode. This closes the external-odd-spectrum hole (the
-    // bare-array path that allowed istft misdecodes for 11 review rounds) — a
+    // istft would misdecode. This closes the external-odd-spectrum hole (a
+    // bare-array path would allow istft misdecodes) — a
     // Spectrum cannot exist with odd/inconsistent metadata.
     //
     // A valid `(num_frames=5, n_freqs=5)` Complex64 array for n_fft=8.
@@ -4693,8 +4693,7 @@ mod tests {
 
   #[test]
   fn istft_rejects_pathological_scatter_work_before_window_alloc() {
-    // Codex OOM finding (+ the medium "work cap runs after window alloc"
-    // finding): the real scatter/update workload is `num_frames * n_fft`, which
+    // The real scatter/update workload is `num_frames * n_fft`, which
     // can dwarf the OLA *output* length `t` for small hops. The
     // `t <= MAX_DECODED_SAMPLES` cap does NOT catch this; the dedicated
     // MAX_OLA_WORK guard must reject it BEFORE the shared `frame_window`
@@ -4742,7 +4741,7 @@ mod tests {
 
   #[test]
   fn stft_rejects_pathological_work_before_alloc() {
-    // Codex finding: cap stft's forward work. A LAZILY-shaped huge input (no
+    // Cap stft's forward work. A LAZILY-shaped huge input (no
     // data materialized) with a small n_fft and hop=1 produces num_frames ≈
     // input length and a strided frame view of `num_frames * n_fft` elements —
     // orders of magnitude past the sample count. The MAX_STFT_WORK guard must
@@ -4768,7 +4767,7 @@ mod tests {
 
   #[test]
   fn stft_rejects_oversized_input_before_reflect_pad_large_hop() {
-    // Codex OOM finding: the reflect pad (`center=true`) is a lazy
+    // The reflect pad (`center=true`) is a lazy
     // slice+concatenate, but *evaluating* it materializes a signal proportional
     // to the INPUT length — independent of num_frames. The `MAX_STFT_WORK` cap
     // only bounds `num_frames * n_fft`, so a lazily-shaped huge input with a
@@ -4856,7 +4855,7 @@ mod tests {
     );
   }
 
-  // ---- A4: `lfilter` direct-form II transposed parity ---------------------
+  // ---- `lfilter` direct-form II transposed parity ---------------------
 
   /// Hand-trace the reference `mlx_audio.dsp.lfilter` for a single-pole IIR
   /// `y[n] = 0.5 * x[n] + 0.5 * y[n-1]` (i.e. `b=[0.5], a=[1, -0.5]`) on an
@@ -5011,9 +5010,9 @@ mod tests {
   /// any `to_vec` materialization. We construct a lazy `Array::zeros` of
   /// `(MAX_LFILTER_SAMPLES + 1,)` f32 — which mlx does not eval until a
   /// data accessor runs — and assert `lfilter` rejects it with
-  /// `Error::CapExceeded`. If the cap check still lived behind the `to_vec`
-  /// (the pre-fix behavior), the rejected call would have first
-  /// materialized `(MAX_LFILTER_SAMPLES + 1) * 4 bytes` (≈256 MiB) of f32
+  /// `Error::CapExceeded`. If the cap check lived behind the `to_vec`,
+  /// the rejected call would first
+  /// materialize `(MAX_LFILTER_SAMPLES + 1) * 4 bytes` (≈256 MiB) of f32
   /// plus a second `(MAX_LFILTER_SAMPLES + 1) * 8 bytes` (≈512 MiB) f64
   /// promotion before erroring — a ~768 MiB allocation for a call that
   /// the bounded-memory contract says must allocate nothing. The lazy
@@ -5034,8 +5033,8 @@ mod tests {
   }
 
   /// [`lfilter_f64_in_place`] is the in-place variant the K-weighting path
-  /// uses to keep the peak working set at ONE f64 channel buffer (the
-  /// pre-fix chained out-of-place form held TWO across the high-shelf →
+  /// uses to keep the peak working set at ONE f64 channel buffer (a
+  /// chained out-of-place form would hold TWO across the high-shelf →
   /// high-pass stage boundary). Numerically the two kernels must produce
   /// BIT-IDENTICAL output (same direct-form II transposed math, same f64
   /// precision, same state updates) — only the allocation strategy
@@ -5125,7 +5124,7 @@ mod tests {
     ));
   }
 
-  // ---- A3: BS.1770 K-weighted integrated loudness + normalize_loudness -----
+  // ---- BS.1770 K-weighted integrated loudness + normalize_loudness -----
 
   /// Generate a `seconds`-long mono sine at `freq` Hz with amplitude `amp`
   /// at `rate` samples/sec, as an `Array` of `Dtype::F32`.
@@ -5384,9 +5383,9 @@ mod tests {
   }
 
   /// Total-element cap (`n_samples * n_channels`) must reject oversized 2-D
-  /// inputs BEFORE the `to_vec`. The previous revision capped only
-  /// `n_samples`, so a `(MAX_DECODED_SAMPLES, 5)` lazily-shaped input
-  /// would slip past the per-channel cap and then materialize
+  /// inputs BEFORE the `to_vec`. Capping only
+  /// `n_samples` would let a `(MAX_DECODED_SAMPLES, 5)` lazily-shaped input
+  /// slip past the per-channel cap and then materialize
   /// `5 * MAX_DECODED_SAMPLES` f32 samples (multi-GB) in `to_vec`. We use a
   /// LAZY `Array::zeros` so nothing is materialized when the cap is
   /// honored — asserting `Err` proves the cap fired BEFORE the to_vec
@@ -5475,30 +5474,30 @@ mod tests {
     );
   }
 
-  /// Regression: the *just-below-the-old-element-cap* case Codex flagged.
-  /// The previous revision capped `num_blocks * n_channels` against
-  /// `MAX_DECODED_SAMPLES = 64 Mi-elements` — but each cell is `f64`, so
-  /// `64 Mi cells * 8 B = 512 MiB` of actual `mean_square` allocation
-  /// passed the element-only cap. A near-1 overlap like `0.99999990`
+  /// Regression: the *just-below-an-element-only-cap* case.
+  /// Capping `num_blocks * n_channels` against
+  /// `MAX_DECODED_SAMPLES = 64 Mi-elements` would be wrong — each cell is
+  /// `f64`, so `64 Mi cells * 8 B = 512 MiB` of actual `mean_square`
+  /// allocation would pass an element-only cap. A near-1 overlap like `0.99999990`
   /// on a tiny 3 s mono signal produces `num_blocks ≈ (3.0 - 0.4) /
-  /// (0.4 * 1e-7) ≈ 6.5e7` blocks, which sit JUST UNDER the old
-  /// 64 Mi-element cap (so the old guard would NOT reject and the
+  /// (0.4 * 1e-7) ≈ 6.5e7` blocks, which sit JUST UNDER a bare
+  /// 64 Mi-element cap (an element-only guard would NOT reject, and the
   /// `try_reserve_exact` would attempt a ~520 MiB `mean_square` matrix
   /// reservation followed by a per-block loop that re-sums 19,200
   /// samples per block — multi-trillion sample visits, hours of CPU).
-  /// The new `MAX_LOUDNESS_BLOCK_BYTES` (64 MiB) cap rejects this case
+  /// The `MAX_LOUDNESS_BLOCK_BYTES` (64 MiB) cap rejects this case
   /// at the byte-budget check BEFORE any allocation (block_bytes =
   /// 6.5e7 * 1 * 8 = 520 MiB > 64 MiB); the visit cap would also catch
   /// it (6.5e7 * 19200 = 1.25 trillion visits > 256 Mi). Asserting
   /// `Err` in microseconds proves the byte/work caps fire up-front,
-  /// not the old elements-only cap.
+  /// not a bare elements-only cap.
   #[test]
   fn integrated_loudness_rejects_overlap_just_below_old_element_cap() {
     let rate = 48_000u32;
     // 3 s of audio = 144,000 samples — well below MAX_LOUDNESS_SAMPLES.
-    // overlap = 0.99999990 ⇒ step = 1e-7 ⇒ num_blocks ≈ 6.5e7. The OLD
-    // element cap was 64 Mi ≈ 6.7e7, so 6.5e7 was UNDER the old cap;
-    // the new byte cap (64 MiB / 8 B = 8 Mi cells) rejects num_blocks
+    // overlap = 0.99999990 ⇒ step = 1e-7 ⇒ num_blocks ≈ 6.5e7. A bare
+    // element cap of 64 Mi ≈ 6.7e7 would leave 6.5e7 UNDER it;
+    // the byte cap (64 MiB / 8 B = 8 Mi cells) rejects num_blocks
     // > 8 Mi for n_channels=1, and the work cap (256 Mi) rejects
     // 6.5e7 * 19200 ≈ 1.25e12 visits — both fire well below 6.5e7.
     let x = sine_mono(1000.0, 0.5, rate, 3.0);
@@ -5510,15 +5509,15 @@ mod tests {
     );
   }
 
-  /// Regression: the work cap MUST include `n_channels` (Codex review).
+  /// Regression: the work cap MUST include `n_channels`.
   /// The per-block mean-square sum loop runs ONCE PER CHANNEL (the
   /// per-channel streaming K-weighting loop), so the actual sample-visit
-  /// count is `num_blocks * block_samples * n_channels`. A prior revision
-  /// bounded the channel-less product alone, so a 5-channel pathological
-  /// case slipped through: `num_blocks ≈ 500_000, block_samples = 160,
+  /// count is `num_blocks * block_samples * n_channels`. Bounding
+  /// the channel-less product alone would let a 5-channel pathological
+  /// case slip through: `num_blocks ≈ 500_000, block_samples = 160,
   /// n_channels = 5` gives a channel-less product of `8e7 < 256 Mi cap`
-  /// (would PASS the broken bound) BUT actual visits of `4e8 > 256 Mi`
-  /// (FAILS the corrected bound).
+  /// (would PASS a channel-less bound) BUT actual visits of `4e8 > 256 Mi`
+  /// (FAILS the channel-aware bound).
   ///
   /// We pick `rate = 16 kHz, block_size = 0.01 s` (⇒ `block_samples =
   /// 160`), `n_samples = 161` (just over the block size so the
@@ -5529,10 +5528,10 @@ mod tests {
   /// n_channels-aware work cap. The byte and total-elements caps both
   /// have wide headroom here (total elements = `161 * 5 = 805 << 64 Mi`).
   ///
-  /// Asserts `Err`: pre-fix this would silently allow ~400 M sample-
-  /// visits across the per-block × per-channel loops (a multi-second
-  /// CPU spike on a small input); post-fix the work cap fires up-front
-  /// in microseconds.
+  /// Asserts `Err`: without the n_channels-aware work cap this would
+  /// silently allow ~400 M sample-visits across the per-block ×
+  /// per-channel loops (a multi-second CPU spike on a small input); the
+  /// work cap fires up-front in microseconds.
   #[test]
   fn integrated_loudness_rejects_work_cap_only_when_n_channels_counted() {
     let rate = 16_000u32;
@@ -5548,10 +5547,10 @@ mod tests {
     //              = round(6.25e-5 / (0.01 * 1.25e-8)) + 1
     //              ≈ round(500_000) + 1 ≈ 500_001
     //
-    // Channel-less work product (broken bound):
-    //   500_001 * 160 ≈ 8.0e7 < MAX_LOUDNESS_WORK (256 Mi ≈ 2.68e8) → PASSES (defect)
-    // n_channels-aware work product (corrected bound):
-    //   500_001 * 160 * 5 ≈ 4.0e8 > MAX_LOUDNESS_WORK              → REJECTS (fix)
+    // Channel-less work product:
+    //   500_001 * 160 ≈ 8.0e7 < MAX_LOUDNESS_WORK (256 Mi ≈ 2.68e8) → would PASS
+    // n_channels-aware work product (the one used):
+    //   500_001 * 160 * 5 ≈ 4.0e8 > MAX_LOUDNESS_WORK              → REJECTS
     // Byte cap (independent, must NOT be the rejecting cap):
     //   500_001 * 5 * 8 ≈ 20 MB << MAX_LOUDNESS_BLOCK_BYTES (64 MiB) → PASSES
     let res = integrated_loudness(&x, rate, 0.01, 0.999_999_987_5);
@@ -5592,12 +5591,12 @@ mod tests {
   ///
   /// The f64-end-to-end K-weighting kernel (no intermediate f32 cast
   /// between the two biquad stages) should produce a value within tight
-  /// tolerance of the theoretical -9.0656. Before the f64-kernel split the
-  /// stage-boundary f32 cast dropped ~16 bits of precision between
+  /// tolerance of the theoretical -9.0656. An f32 cast at the
+  /// stage boundary would drop ~16 bits of precision between
   /// biquads, biasing this absolute value (and gate decisions near the
   /// absolute/relative thresholds). We assert ±0.05 LUFS — a tolerance
-  /// the previously-f32-between-stages path could overshoot for short
-  /// signals near the gate boundaries, and which the new f64 path
+  /// an f32-between-stages path could overshoot for short
+  /// signals near the gate boundaries, and which the f64 path
   /// comfortably meets.
   #[test]
   fn integrated_loudness_one_khz_sine_matches_theoretical() {
@@ -5798,7 +5797,7 @@ mod tests {
 
   #[test]
   fn istft_cache_center_zero_coverage_tail_rejects_like_free_istft() {
-    // THE F1 FIX. A `center=true` spectrum whose requested `length` reaches into
+    // A `center=true` spectrum whose requested `length` reaches into
     // the zero-coverage OLA tail must be REJECTED by the cached path, EXACTLY as
     // the free `istft` rejects it — not divided by a `1e-10` floor and silently
     // emitted as corrupt audio. n_fft=8, hop=4, win=8 symmetric Hann; 16-sample
@@ -5855,7 +5854,7 @@ mod tests {
 
   #[test]
   fn istft_cache_center_false_uncovered_head_rejects_like_free_istft() {
-    // F1 `center=false` consistency: the RAW OLA index 0 is reached only by
+    // `center=false` consistency: the RAW OLA index 0 is reached only by
     // frame 0 at window position 0 (Hann sample 0), so wsum[0] == 0. A
     // `center=false` request includes index 0, so BOTH the free `istft` and the
     // cached path must reject it — the cached path must NOT floor-divide and emit
@@ -6034,7 +6033,7 @@ mod tests {
     }
   }
 
-  // ---- P7 #128: mel_filter_bank_cached -------------------------------------
+  // ---- mel_filter_bank_cached (#128) ---------------------------------------
 
   /// Cached and uncached forms produce byte-identical banks.
   #[test]
@@ -6135,10 +6134,10 @@ mod tests {
     clear_mel_filter_cache();
   }
 
-  // ---- P7 #131: AUDIO-5 magic constants are named ---------------------------
+  // ---- magic constants are named ---------------------------
 
-  /// Pin the exact named-constant values that mlx-audio expects. Closes
-  /// AUDIO-5 by asserting the const surface (so a future refactor can't
+  /// Pin the exact named-constant values that mlx-audio expects by
+  /// asserting the const surface (so a future refactor can't
   /// quietly drift any of the five magic numbers).
   #[test]
   fn dsp_named_constants_match_mlx_audio_literals() {
@@ -6163,7 +6162,7 @@ mod tests {
     assert_eq!(LogFloor::Custom(0.0).value(), f32::MIN_POSITIVE);
   }
 
-  // ---- P7 #134: StftConfig + stft_with_config + stft_aligned ---------------
+  // ---- StftConfig + stft_with_config + stft_aligned (#134) -----------------
 
   /// `StftConfig::default()` is `(center: true, pad_mode: Reflect)` — the
   /// `mlx_audio.dsp.stft` reference defaults.
@@ -6227,7 +6226,7 @@ mod tests {
     ));
   }
 
-  // ---- P7 #129: reflect_pad_1d round-trip + zero-pad fast path -------------
+  // ---- reflect_pad_1d round-trip + zero-pad fast path (#129) ---------------
 
   /// `reflect_pad_1d` with `padding == 0` returns the input unchanged
   /// (the cheap rc-clone fast path — skips the slice + concatenate).

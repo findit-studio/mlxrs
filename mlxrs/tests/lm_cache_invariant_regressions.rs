@@ -1,4 +1,4 @@
-//! P4 KVC structural-soundness regression tests — issues #98, #100, #105,
+//! Cache structural-soundness regression tests — issues #98, #100, #105,
 //! #106, #107. Each section pins the post-fix contract with a focused
 //! negative + positive pair so a future regression is a deterministic test
 //! failure rather than a silent re-introduction.
@@ -8,8 +8,8 @@
 use mlxrs::{
   Array, Error, Result,
   lm::cache::{
-    ArraysCache, CacheList, KvCache, KvCacheKind, MaskMode, QuantizedKvCache, QuantizedKvCacheImpl,
-    RotatingKvCache, StandardKvCache, from_state,
+    ArraysCache, CacheList, KvCache, KvCacheKind, MaskMode, QuantizedKvCache, RotatingKvCache,
+    StandardKvCache, StandardQuantizedKvCache, from_state,
   },
 };
 
@@ -21,12 +21,12 @@ fn kv(ids: &[f32]) -> Array {
 }
 
 // =====================================================================
-// #98 KVC-1 — transactional default from_serialized
+// #98 — transactional default from_serialized
 // =====================================================================
 //
 // The trait-default `from_serialized` (used by no concrete cache — all 8
 // override it) now snapshots state + meta BEFORE the 2-setter chain and
-// rolls back on `set_meta_state` failure. Pre-KVC-1 the default was the
+// rolls back on `set_meta_state` failure. The earlier default was the
 // verbatim Python sequence and left self half-restored on the meta error.
 
 /// A test-only `KvCache` that:
@@ -83,7 +83,7 @@ impl KvCache for RollbackProbeCache {
     // `from_serialized` must restore the snapshot even on this arm.
     if self.recorded_state_id == -1 {
       return Err(Error::Backend(
-        "RollbackProbeCache: forced set_state failure (post-mutation) for KVC-1 test".into(),
+        "RollbackProbeCache: forced set_state failure (post-mutation)".into(),
       ));
     }
     Ok(())
@@ -96,7 +96,7 @@ impl KvCache for RollbackProbeCache {
     // Sentinel that triggers the rollback path deterministically.
     if m.first().map(String::as_str) == Some("FAIL_SENTINEL") {
       return Err(Error::Backend(
-        "RollbackProbeCache: forced failure for KVC-1 test".into(),
+        "RollbackProbeCache: forced set_meta_state failure".into(),
       ));
     }
     self.recorded_meta = m.first().cloned().unwrap_or_default();
@@ -127,7 +127,7 @@ impl KvCache for RollbackProbeCache {
 }
 
 #[test]
-fn kvc1_default_from_serialized_rolls_back_on_meta_failure() {
+fn default_from_serialized_rolls_back_on_meta_failure() {
   // Prime the cache with a non-default state (id=7) + meta ("PRIMED").
   let mut cache = RollbackProbeCache::default();
   cache
@@ -153,11 +153,11 @@ fn kvc1_default_from_serialized_rolls_back_on_meta_failure() {
   // snapshot — NOT left half-restored with id=99 + still-"PRIMED" meta.
   assert_eq!(
     cache.recorded_state_id, 7,
-    "rollback must restore state_id to the pre-call snapshot (KVC-1)"
+    "rollback must restore state_id to the pre-call snapshot"
   );
   assert_eq!(
     cache.recorded_meta, "PRIMED",
-    "rollback must restore meta to the pre-call snapshot (KVC-1)"
+    "rollback must restore meta to the pre-call snapshot"
   );
   // Call sequence pin: set_state (apply new) → set_meta_state (FAIL) →
   // set_state (rollback snapshot) → set_meta_state (rollback snapshot).
@@ -169,12 +169,12 @@ fn kvc1_default_from_serialized_rolls_back_on_meta_failure() {
 }
 
 #[test]
-fn kvc1_default_from_serialized_rolls_back_on_set_state_failure() {
-  // R1 follow-up: the trait does NOT require `set_state` to be atomic.
+fn default_from_serialized_rolls_back_on_set_state_failure() {
+  // The trait does NOT require `set_state` to be atomic.
   // An impl that mutates part of its state and THEN errors must still
   // leave `self` byte-identical to its pre-call state under the
-  // transactional `from_serialized` contract. Pre-fix the default did
-  // `self.set_state(state)?` (early-return on Err) and never restored
+  // transactional `from_serialized` contract. A naive default that did
+  // `self.set_state(state)?` (early-return on Err) would never restore
   // the snapshot on the `set_state` arm, leaving the cache corrupt.
   //
   // The probe `set_state` records the state_id BEFORE checking the
@@ -201,15 +201,15 @@ fn kvc1_default_from_serialized_rolls_back_on_set_state_failure() {
     result.is_err(),
     "expected Err on set_state failure (post-mutation sentinel)"
   );
-  // The KEY R1 post-fix assertion: the cache is rolled back to its
+  // The KEY post-fix assertion: the cache is rolled back to its
   // pre-call snapshot — NOT left mid-mutation at `recorded_state_id == -1`.
   assert_eq!(
     cache.recorded_state_id, 7,
-    "rollback must restore state_id on set_state failure (KVC-1 R1 follow-up)"
+    "rollback must restore state_id on set_state failure"
   );
   assert_eq!(
     cache.recorded_meta, "PRIMED",
-    "rollback must restore meta on set_state failure (KVC-1 R1 follow-up)"
+    "rollback must restore meta on set_state failure"
   );
   // Call sequence pin: set_state (apply NEW = mutate then FAIL) →
   // set_state (rollback snapshot) → set_meta_state (rollback snapshot).
@@ -223,7 +223,7 @@ fn kvc1_default_from_serialized_rolls_back_on_set_state_failure() {
 }
 
 #[test]
-fn kvc1_default_from_serialized_success_path_does_not_invoke_rollback() {
+fn default_from_serialized_success_path_does_not_invoke_rollback() {
   // Sanity: on the success path (no sentinel) the snapshot is captured
   // but never re-applied; only set_state + set_meta_state on the NEW
   // arguments run. The recorded state ends at the new values.
@@ -247,18 +247,18 @@ fn kvc1_default_from_serialized_success_path_does_not_invoke_rollback() {
 }
 
 // =====================================================================
-// #100 KVC-3 — typed enum dispatch (KvCacheKind)
+// #100 — typed enum dispatch (KvCacheKind)
 // =====================================================================
 //
 // `from_state` now dispatches through `KvCacheKind::parse(...)` — the
-// typed replacement for the pre-KVC-3 string-keyed `match kind { … }`
+// typed replacement for the earlier string-keyed `match kind { … }`
 // (mirroring mlx-lm `globals()[class_name].from_state(...)`,
 // cache.py:898). Parsing accepts every name + alias the prior match did;
 // adding a new variant + arm is compile-checked exhaustively.
 
 #[test]
-fn kvc3_kvcachekind_parse_accepts_every_alias() {
-  // All names the pre-KVC-3 `match kind { … }` accepted MUST still parse
+fn kvcachekind_parse_accepts_every_alias() {
+  // All names the earlier `match kind { … }` accepted MUST still parse
   // — the typed dispatch is back-compat with every alias.
   for (name, expected) in &[
     ("KVCache", KvCacheKind::KvCache),
@@ -270,7 +270,7 @@ fn kvc3_kvcachekind_parse_accepts_every_alias() {
     ("ChunkedKVCache", KvCacheKind::ChunkedKvCache),
     ("ChunkedKvCache", KvCacheKind::ChunkedKvCache),
     ("QuantizedKVCache", KvCacheKind::QuantizedKvCache),
-    ("QuantizedKvCacheImpl", KvCacheKind::QuantizedKvCache),
+    ("StandardQuantizedKvCache", KvCacheKind::QuantizedKvCache),
     ("CacheList", KvCacheKind::CacheList),
     ("BatchKVCache", KvCacheKind::BatchKvCache),
     ("BatchKvCache", KvCacheKind::BatchKvCache),
@@ -288,7 +288,7 @@ fn kvc3_kvcachekind_parse_accepts_every_alias() {
 }
 
 #[test]
-fn kvc3_kvcachekind_parse_unknown_is_recoverable_err() {
+fn kvcachekind_parse_unknown_is_recoverable_err() {
   // Unknown kinds are a recoverable Error::UnknownEnumValue (typed payload
   // — replaces the prior string-keyed `other => Err(...)` arm). NEVER a
   // panic.
@@ -308,7 +308,7 @@ fn kvc3_kvcachekind_parse_unknown_is_recoverable_err() {
 }
 
 #[test]
-fn kvc3_from_state_dispatches_through_typed_enum() {
+fn from_state_dispatches_through_typed_enum() {
   // Round-trip a Standard cache through `from_state` (via the
   // typed-dispatch entry point) and verify the rebuilt cache reports the
   // canonical `"KVCache"` reference class name — exactly the path
@@ -329,27 +329,27 @@ fn kvc3_from_state_dispatches_through_typed_enum() {
 }
 
 // =====================================================================
-// #105 KVC-8 — eager K/V cross-validation in QuantizedKvCacheImpl::set_state
+// #105 — eager K/V cross-validation in StandardQuantizedKvCache::set_state
 // =====================================================================
 //
-// Pre-KVC-8: a 4 or 6-array state with K and V having different leading
+// Before the fix: a 4 or 6-array state with K and V having different leading
 // shapes (e.g. mismatched batch size or seq_len) was accepted and only
 // errored at the first `update_quantized` `concat_seq` — lazy + far from
-// the cause. Post-KVC-8: a precise diagnostic at the load boundary
+// the cause. After the fix: a precise diagnostic at the load boundary
 // (`set_state`), so a corrupt prompt cache is surfaced eagerly.
 
 #[test]
-fn kvc8_quantized_set_state_4_arr_rejects_kv_shape_mismatch() {
+fn quantized_set_state_4_arr_rejects_kv_shape_mismatch() {
   // Construct a 4-array state where K and V have DIFFERENT seq_len
-  // (axis 2) — a forged prompt cache. Pre-KVC-8 this assigned silently;
-  // post-KVC-8 it MUST surface a precise diagnostic at set_state.
+  // (axis 2) — a forged prompt cache. Before the fix this assigned silently;
+  // after the fix it MUST surface a precise diagnostic at set_state.
   let k_w = Array::from_slice::<f32>(&[0.0; 8], &(1usize, 1, 4, 2)).unwrap();
   let v_w = Array::from_slice::<f32>(&[0.0; 6], &(1usize, 1, 3, 2)).unwrap();
   let k_s = Array::from_slice::<f32>(&[0.0; 4], &(1usize, 1, 4, 1)).unwrap();
   let v_s = Array::from_slice::<f32>(&[0.0; 3], &(1usize, 1, 3, 1)).unwrap();
   let state = vec![k_w, k_s, v_w, v_s];
 
-  let mut cache = QuantizedKvCacheImpl::new(64, 4).unwrap();
+  let mut cache = StandardQuantizedKvCache::new(64, 4).unwrap();
   let result = cache.set_state(state);
   match result {
     Err(Error::ShapePairMismatch(p)) => {
@@ -378,7 +378,7 @@ fn kvc8_quantized_set_state_4_arr_rejects_kv_shape_mismatch() {
 }
 
 #[test]
-fn kvc8_quantized_set_state_6_arr_rejects_kv_bias_shape_mismatch() {
+fn quantized_set_state_6_arr_rejects_kv_bias_shape_mismatch() {
   // 6-array state where K_bias and V_bias have different leading shapes
   // — exactly the K-6-affine / V-4-bias-less kind of corruption the
   // issue named, surfaced here as a K_bias shape that doesn't match
@@ -393,7 +393,7 @@ fn kvc8_quantized_set_state_6_arr_rejects_kv_bias_shape_mismatch() {
   let v_b = Array::from_slice::<f32>(&[0.0; 3], &(1usize, 1, 3, 1)).unwrap();
   let state = vec![k_w, k_s, k_b, v_w, v_s, v_b];
 
-  let mut cache = QuantizedKvCacheImpl::new(64, 4).unwrap();
+  let mut cache = StandardQuantizedKvCache::new(64, 4).unwrap();
   let result = cache.set_state(state);
   match result {
     Err(Error::ShapePairMismatch(p)) => {
@@ -421,7 +421,7 @@ fn kvc8_quantized_set_state_6_arr_rejects_kv_bias_shape_mismatch() {
 }
 
 #[test]
-fn kvc8_quantized_set_state_consistent_shapes_pass() {
+fn quantized_set_state_consistent_shapes_pass() {
   // Sanity: a consistent 4-array state (matching K/V shapes) passes the
   // eager validator unchanged — the validator only rejects corruption,
   // not faithful round-trip payloads.
@@ -432,7 +432,7 @@ fn kvc8_quantized_set_state_consistent_shapes_pass() {
   let v_s = Array::from_slice::<f32>(&[0.0; 4], &(1usize, 1, 4, 1)).unwrap();
   let state = vec![k_w, k_s, v_w, v_s];
 
-  let mut cache = QuantizedKvCacheImpl::new(64, 4).unwrap();
+  let mut cache = StandardQuantizedKvCache::new(64, 4).unwrap();
   cache
     .set_state(state)
     .expect("consistent 4-array state must pass");
@@ -443,14 +443,14 @@ fn kvc8_quantized_set_state_consistent_shapes_pass() {
 }
 
 // ---------------------------------------------------------------------
-// R1 follow-up: leading-axes-only validation (B, H, S); the last
+// Leading-axes-only validation (B, H, S); the last
 // (payload) axis can legitimately differ when `v_head_dim != k_head_dim`.
-// Pre-R1 `validate_kv_leading_axes_match` walked every axis including
+// An earlier `validate_kv_leading_axes_match` walked every axis including
 // the payload axis, so a valid skewed cache failed its own saved state.
 // ---------------------------------------------------------------------
 
 #[test]
-fn kvc8_quantized_set_state_accepts_different_v_head_dim() {
+fn quantized_set_state_accepts_different_v_head_dim() {
   // K shape `[1, 2, 4, 64]` and V shape `[1, 2, 4, 128]` — leading axes
   // (B=1, H=2, S=4) match; the last axis differs because v_head_dim
   // (128) != k_head_dim (64). `update_quantized` reads `keys.shape[-1]`
@@ -467,7 +467,7 @@ fn kvc8_quantized_set_state_accepts_different_v_head_dim() {
   let v_b = Array::from_slice::<f32>(&[0.0; 8 * 2], &(1usize, 2, 4, 2)).unwrap();
   let state = vec![k_w, k_s, k_b, v_w, v_s, v_b];
 
-  let mut cache = QuantizedKvCacheImpl::new(64, 4).unwrap();
+  let mut cache = StandardQuantizedKvCache::new(64, 4).unwrap();
   cache
     .set_state(state)
     .expect("leading axes (B, H, S) match; differing payload axis is the v_head_dim skew the cache contract allows");
@@ -478,7 +478,7 @@ fn kvc8_quantized_set_state_accepts_different_v_head_dim() {
 }
 
 #[test]
-fn kvc8_quantized_set_state_rejects_non_4d_rank() {
+fn quantized_set_state_rejects_non_4d_rank() {
   // A non-4-D K or V is a forged / corrupt state. The rank-only gate
   // rejects at the load boundary with a precise diagnostic instead of
   // panicking downstream via a blind `shape[axis]` index.
@@ -488,7 +488,7 @@ fn kvc8_quantized_set_state_rejects_non_4d_rank() {
   let v_s = Array::from_slice::<f32>(&[0.0; 8], &(1usize, 2, 4, 1)).unwrap();
   let state = vec![k_w, k_s, v_w, v_s];
 
-  let mut cache = QuantizedKvCacheImpl::new(64, 4).unwrap();
+  let mut cache = StandardQuantizedKvCache::new(64, 4).unwrap();
   let result = cache.set_state(state);
   match result {
     Err(Error::RankMismatch(p)) => {
@@ -510,15 +510,15 @@ fn kvc8_quantized_set_state_rejects_non_4d_rank() {
 }
 
 #[test]
-fn kvc8_quantized_update_save_reload_with_v_head_dim_skew() {
+fn quantized_update_save_reload_with_v_head_dim_skew() {
   // End-to-end round-trip: `update_quantized` with skewed dims
   // (k_head_dim=64, v_head_dim=128), then `state()` + `meta_state()`,
   // then `from_state("QuantizedKVCache", …)` rebuilds a cache.
-  // Pre-R1 fix: the rebuilt `from_state` path called `set_state` which
+  // Previously the rebuilt `from_state` path called `set_state` which
   // hit the over-eager every-axis validator and ERRORED on the cache's
   // own saved state ("K w axis 3 (=8 = k_head_dim/el_per_int)
-  // != V w axis 3 (=16 = v_head_dim/el_per_int)"). Post-R1 fix: the
-  // leading-axes-only validator accepts the skew, and the round-trip
+  // != V w axis 3 (=16 = v_head_dim/el_per_int)"). With the
+  // leading-axes-only validator the skew is accepted, and the round-trip
   // succeeds.
   let group_size: i32 = 64;
   let bits: i32 = 8;
@@ -540,7 +540,7 @@ fn kvc8_quantized_update_save_reload_with_v_head_dim_skew() {
     Array::from_slice::<f32>(&data, &(b, h, s, v_head_dim)).unwrap()
   };
 
-  let mut original = QuantizedKvCacheImpl::new(group_size, bits).unwrap();
+  let mut original = StandardQuantizedKvCache::new(group_size, bits).unwrap();
   original
     .update_quantized(&k, &v)
     .expect("update_quantized with v_head_dim != k_head_dim must succeed");
@@ -559,9 +559,9 @@ fn kvc8_quantized_update_save_reload_with_v_head_dim_skew() {
   assert_eq!(state[3].shape(), vec![b, h, s, v_head_dim / el_per_int]);
 
   // Reload via the project-canonical typed-dispatch entry point — the
-  // exact path that pre-R1 errored on its own saved state.
+  // exact path that previously errored on its own saved state.
   let rebuilt = from_state("QuantizedKVCache", state, &meta)
-    .expect("from_state round-trip with v_head_dim skew must succeed (R1 fix)");
+    .expect("from_state round-trip with v_head_dim skew must succeed");
   assert_eq!(
     rebuilt.reference_class_name(),
     "QuantizedKVCache",
@@ -572,11 +572,11 @@ fn kvc8_quantized_update_save_reload_with_v_head_dim_skew() {
 }
 
 // =====================================================================
-// #106 KVC-9 — MambaCache provenance preserved via ArraysCache::is_mamba
+// #106 — MambaCache provenance preserved via ArraysCache::is_mamba
 // =====================================================================
 
 #[test]
-fn kvc9_mamba_constructor_reports_mambacache_class_name() {
+fn mamba_constructor_reports_mambacache_class_name() {
   // Constructor-time provenance: `ArraysCache::mamba()` carries the
   // `MambaCache` class label across `reference_class_name` (state shape
   // identical to `ArraysCache::new(2)`).
@@ -595,10 +595,10 @@ fn kvc9_mamba_constructor_reports_mambacache_class_name() {
 }
 
 #[test]
-fn kvc9_mamba_round_trip_preserves_class_label() {
+fn mamba_round_trip_preserves_class_label() {
   // The KEY post-fix assertion: a swift-saved "MambaCache"-kind prompt
   // cache reloads via `from_state("MambaCache", …)` and reports
-  // `MambaCache` again on `reference_class_name` — pre-KVC-9 it would
+  // `MambaCache` again on `reference_class_name` — before the fix it would
   // have degraded to `ArraysCache` on save-after-load.
   let mut original = ArraysCache::mamba();
   // Drive in one slot of state (a minimal real-looking SSM slot).
@@ -615,7 +615,7 @@ fn kvc9_mamba_round_trip_preserves_class_label() {
 }
 
 #[test]
-fn kvc9_from_state_arrayscache_arm_does_not_set_mamba_flag() {
+fn from_state_arrayscache_arm_does_not_set_mamba_flag() {
   // The complementary case: `from_state("ArraysCache", …)` reconstructs
   // WITHOUT the mamba flag — the two arms are distinct (KvCacheKind has
   // separate ArraysCache and MambaCache variants).
@@ -634,7 +634,7 @@ fn kvc9_from_state_arrayscache_arm_does_not_set_mamba_flag() {
 }
 
 #[test]
-fn kvc9_mamba_copy_preserves_provenance() {
+fn mamba_copy_preserves_provenance() {
   // `copy()` must preserve the `is_mamba` flag — otherwise a deep-copy
   // of a `MambaCache` would silently downgrade to `ArraysCache` on the
   // copy.
@@ -648,7 +648,7 @@ fn kvc9_mamba_copy_preserves_provenance() {
 }
 
 // =====================================================================
-// #107 KVC-10 — required `reference_class_name` (compile-time enforcement)
+// #107 — required `reference_class_name` (compile-time enforcement)
 // =====================================================================
 //
 // Compile-time enforcement can only be tested at COMPILE TIME (a `KvCache`
@@ -661,18 +661,18 @@ fn kvc9_mamba_copy_preserves_provenance() {
 // `E0046: not all trait items implemented`.
 
 #[test]
-fn kvc10_every_concrete_cache_declares_its_reference_class_name() {
+fn every_concrete_cache_declares_its_reference_class_name() {
   // The required-method contract: every concrete cache returns its
   // declared name (no silent inheritance of a `"KVCache"` default).
   // This pins each in-tree cache's name; removing the trait method
-  // override would have inherited `"KVCache"` pre-KVC-10 but is now a
+  // override would have inherited `"KVCache"` before the fix but is now a
   // compile error.
   let pairs: Vec<(&str, Box<dyn KvCache>)> = vec![
     ("KVCache", Box::new(StandardKvCache::new())),
     ("RotatingKVCache", Box::new(RotatingKvCache::new(8, 1))),
     (
       "QuantizedKVCache",
-      Box::new(QuantizedKvCacheImpl::new(64, 4).unwrap()),
+      Box::new(StandardQuantizedKvCache::new(64, 4).unwrap()),
     ),
     ("ArraysCache", Box::new(ArraysCache::new(2))),
     ("MambaCache", Box::new(ArraysCache::mamba())),
@@ -682,7 +682,7 @@ fn kvc10_every_concrete_cache_declares_its_reference_class_name() {
     assert_eq!(
       cache.reference_class_name(),
       *expected,
-      "concrete cache MUST declare its `reference_class_name` explicitly (KVC-10)"
+      "concrete cache MUST declare its `reference_class_name` explicitly"
     );
   }
 }

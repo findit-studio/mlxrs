@@ -55,7 +55,7 @@ pub fn normalize(x: &Array, p: f64, axis: i32, keepdims: bool, eps: f32) -> Resu
   // for f32 `x` this is a no-op cast → bit-identical to the prior
   // `Array::full::<f32>`. The `divide` then stays in the input dtype.
   //
-  // C4/C5 (Copilot review 4307622782, #3256688284 / #3256688269): for a
+  // For a
   // f16 (or bf16) input the default `eps = 1e-9` ([`DEFAULT_NORMALIZE_-
   // EPS`]) is BELOW the half subnormal floor, so the dtype-cast weak
   // scalar rounds to `0.0` and an all-zero f16 vector normalizes to
@@ -69,7 +69,7 @@ pub fn normalize(x: &Array, p: f64, axis: i32, keepdims: bool, eps: f32) -> Resu
   // deliberately preserved. This is *intentionally distinct* from the
   // scalar [`super::cosine_similarity`] convenience, which has NO python
   // reference and therefore guards its final divide in f32 to guarantee
-  // finite `0.0` for all dtypes (C3). The two are intentionally
+  // finite `0.0` for all dtypes. The two are intentionally
   // different (reference-faithful vs. mlxrs-only convenience), not
   // contradictory.
   let floor = scalar_like(eps, &n)?;

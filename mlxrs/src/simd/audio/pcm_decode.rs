@@ -1,11 +1,10 @@
-//! C1 — PCM sample decode → normalized f32 widen.
+//! PCM sample decode → normalized f32 widen.
 //!
 //! Tracking: [#146](https://github.com/Findit-AI/mlxrs/issues/146).
-//! Plan: `docs/core-arch-simd-candidates.md` §2 row C1, §3.1 (PCM decode).
 //!
 //! # The defect class
 //!
-//! The pre-C1 `crate::audio::io::push_samples` inner loops were
+//! The original `crate::audio::io::push_samples` inner loops were
 //! per-sample `f32::from(s) / divisor` (or `s as f32 / divisor`)
 //! `Vec::push`es — each push has a bounds check, a `len` update, and
 //! a non-vectorizable iterator shape. Symphonia hands us decoded PCM
@@ -63,13 +62,11 @@
 //!
 //! # `MaybeUninit<f32>` API
 //!
-//! Matches C4/C7: each kernel takes `&mut [MaybeUninit<f32>]` so the
+//! Matches the widen/quantize kernels: each kernel takes `&mut [MaybeUninit<f32>]` so the
 //! call site can pass `Vec::spare_capacity_mut()` directly.
 //!
-//! # Verify-before-claim bench
+//! # Bench
 //!
-//! Bench numbers are **report-only** per the user directive 2026-05-23
-//! (project memory rule **"SIMD ship NEON regardless"**). Bench:
 //! `mlxrs/benches/simd_pcm_decode.rs`.
 
 use core::mem::MaybeUninit;
@@ -320,7 +317,7 @@ pub fn s32_to_f32_normalize(out: &mut [MaybeUninit<f32>], src: &[i32], inv_scale
 
 #[cfg(test)]
 mod tests {
-  //! Per-dtype differential tests + edge / behavioural coverage for C1.
+  //! Per-dtype differential tests + edge / behavioural coverage for the PCM decode.
 
   use core::mem::MaybeUninit;
 

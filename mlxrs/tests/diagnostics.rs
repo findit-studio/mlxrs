@@ -2,7 +2,7 @@
 //!
 //! `install_is_idempotent` checks repeated installs are a harmless no-op.
 //!
-//! `panic_hook_chains_previous` proves the panic hook chains (Finding 2):
+//! `panic_hook_chains_previous` proves the panic hook chains:
 //! a prior hook installed before `install()` must still run, and must run
 //! even though our diagnostic prelude executes first. The whole-binary
 //! global panic hook is process state shared with every other test in this

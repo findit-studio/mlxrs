@@ -19,7 +19,7 @@
 //!   `makeCache`, `callAsFunction`). mlxrs replaces that with the
 //!   [`StreamingDecoderBackend`] trait every per-architecture model
 //!   implements — same orchestration loop, no concrete model in the
-//!   port (per the [no per-model arch porting][noarch] rule).
+//!   port.
 //! - The Swift session uses Apple's `OSAllocatedUnfairLock` + tokenizer
 //!   protocol. mlxrs uses owned `&mut self` (single-threaded session) +
 //!   a [`StreamingTokenizer`] trait the caller supplies.
@@ -45,15 +45,14 @@
 //! fully commits or sets a resume-point that names exactly where the
 //! next call must resume.
 //!
-//! Pre-rewrite, the same retry plumbing lived in 3 separate session
-//! fields plus per-call locals. Five consecutive review rounds found
-//! a NEW way for one of those fields to desync from the others on a
-//! partial-failure path; the unified state machine kills the defect
-//! class structurally — no per-call locals, one source of truth for
-//! "what work is owed across the call boundary."
+//! An earlier design split the same retry plumbing across 3 separate
+//! session fields plus per-call locals, where one of those fields
+//! could desync from the others on a partial-failure path; the unified
+//! state machine kills the defect class structurally — no per-call
+//! locals, one source of truth for "what work is owed across the call
+//! boundary."
 //!
 //! [swift-ref]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioSTT/Streaming/StreamingInferenceSession.swift
-//! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 
 use std::time::Instant;
 
@@ -175,7 +174,7 @@ pub struct StreamingInferenceSession<B, D, T> {
   frozen_window_count: usize,
   /// Unified retry-state machine — the single source of truth for any
   /// in-flight retry obligation across `feed_audio` / `stop` calls.
-  /// Replaces the pre-rewrite trio of session fields
+  /// Replaces an earlier trio of session fields
   /// (`pending_finalize_queue`, `pending_stop_mel_frames`,
   /// `pending_bridge_drain_decode`) + per-call locals. See
   /// [`super::retry_state`] for the discharge protocol.
@@ -294,10 +293,10 @@ where
     let mut events: Vec<TranscriptionEvent> = Vec::new();
 
     // 1. Discharge any pending retry obligation FIRST. This is the
-    //    transactional bridge that replaces the pre-rewrite buffer-soup:
-    //    a prior call's failed encoder.feed (R4 corner), a prior call's
+    //    transactional bridge for all cross-call retry work:
+    //    a prior call's failed encoder.feed, a prior call's
     //    successful bridge drain that lost its decode obligation to a
-    //    later `?` (R6 corner), or a prior call's failed finalize-decode
+    //    later `?`, or a prior call's failed finalize-decode
     //    all resume HERE. `discharge_ran_decode` records whether the
     //    discharge fired run_decode_pass / finalize_completed_windows
     //    — if so, the normal feed-path below MUST NOT fire a second
@@ -331,7 +330,7 @@ where
     //    pipeline matches the Swift reference's "no recovery" stance.
     let mel_opt = self.mel_processor.process(samples)?;
     let new_windows = if let Some(mel_frames) = mel_opt.as_ref() {
-      // encoder.feed is transactional (R3-fix design): on Err
+      // encoder.feed is transactional (by design): on Err
       // self.encoder.pending_frames is preserved and the same
       // mel_frames can be re-fed by the caller. We propagate the Err
       // WITHOUT arming retry_state — the encoder rolled back, no
@@ -377,7 +376,7 @@ where
         self.has_new_encoder_content
       };
 
-    // R5/R6 corner structural fix: if the discharge already ran a
+    // If the discharge already ran a
     // decode pass (consuming the bridge-drained or queue-drained
     // windows), DO NOT fire a second decode in the normal path — the
     // encoder's pending_frames may still be non-empty (1-row carry
@@ -392,13 +391,14 @@ where
       if !is_boundary_finalize_pass {
         self.last_decode_time = Some(now);
       }
-      // R6 corner structural fix: encoder.feed above may have committed
+      // encoder.feed above may have committed
       // one or more new windows to encoder.newly_encoded_windows
       // (`new_windows > 0`). If `run_decode_pass` Errs, the windows are
       // stranded in the encoder — the next call MUST decode them. Arm
       // DecodeOwed BEFORE the fallible run_decode_pass so the obligation
-      // survives `?` propagation. On Ok we clear it. Pre-rewrite, this
-      // count was a per-call local lost to the `?` unwind.
+      // survives `?` propagation. On Ok we clear it. The DecodeOwed
+      // obligation is the cross-call source of truth — there is no
+      // per-call local count that would be lost to the `?` unwind.
       //
       // The arming is unconditional (even when new_windows == 0) for
       // the case where this decode is being run for `has_pending_retries`
@@ -441,7 +441,7 @@ where
   /// # Errors
   /// Propagates from the mel processor / encoder / decoder backend.
   pub fn stop(&mut self) -> Result<Vec<TranscriptionEvent>> {
-    // R2-style guard: "inactive AND nothing left to retry" exits. Fall
+    // Guard: "inactive AND nothing left to retry" exits. Fall
     // through if the retry state still owes work — a prior stop() Err
     // left obligations the second stop() must discharge.
     if !self.is_active && !self.retry_state.has_obligation() {
@@ -467,12 +467,11 @@ where
       // for the next stop()'s retry. Cloning the array is cheap
       // (refcount); the rare try_clone Err path is handled below.
       //
-      // F2-FIX (was: `audio_features.as_ref().and_then(|a|
-      // a.try_clone().ok())`): the pre-fix `.ok()` silently mapped a
-      // clone failure to `None`, so the next stop() would observe a
+      // Mapping a clone failure to `None` (via `try_clone().ok()`)
+      // would be wrong: the next stop() would observe a
       // `StopPartialDecode { audio_features: None }` obligation and
       // behave as "no partial audio to decode" — dropping the window.
-      // Now the clone failure propagates as `Err`, and we move the
+      // Instead the clone failure propagates as `Err`, and we move the
       // ORIGINAL audio_features back into the obligation so a third
       // stop() can still consume it. The current call's
       // finalize_partial_window_and_emit_ended is skipped on Err
@@ -566,13 +565,12 @@ where
     //    refcount-clone so an Err in the decode below re-arms the
     //    obligation for the next stop()'s fast path.
     //
-    //    F2-FIX (was: `audio_features.as_ref().and_then(|a|
-    //    a.try_clone().ok())`): the pre-fix `.ok()` silently dropped
-    //    a clone failure into `None`, so the obligation would be
-    //    armed as `StopPartialDecode { audio_features: None }` and
-    //    the next stop()'s fast path would treat the partial window
-    //    as absent. Now we propagate the clone Err BEFORE arming;
-    //    the original `audio_features` is preserved locally + the
+    //    Mapping a clone failure to `None` (via `try_clone().ok()`)
+    //    would be wrong: the obligation would be armed as
+    //    `StopPartialDecode { audio_features: None }` and the next
+    //    stop()'s fast path would treat the partial window as absent.
+    //    Instead we propagate the clone Err BEFORE arming; the
+    //    original `audio_features` is preserved locally + the
     //    fallible stages preceding step 6 are idempotent, so the
     //    next stop() recomputes `encode_pending` from the unchanged
     //    encoder state.
@@ -693,7 +691,7 @@ where
     }
 
     // (c) DecodeOwed — a prior call drained one or more bridge-drained
-    //     windows but the same-call decode never ran (R5/R6 corners).
+    //     windows but the same-call decode never ran.
     //     The encoder.newly_encoded_windows (or cached) hold the
     //     windows; we MUST decode them here BEFORE any new audio is
     //     accepted.
@@ -727,7 +725,7 @@ where
     //     unchanged + we re-arm DecodeOwed so future calls keep
     //     retrying. On Ok the queue drains.
     //
-    //     This covers the R2 contract that feed_audio(&[]) drains a
+    //     This covers the contract that feed_audio(&[]) drains a
     //     pending finalize-retry queue without consuming any new
     //     audio. It also lets a follow-up stop() drain the queue when
     //     a prior feed_audio errored mid-finalize.
@@ -826,7 +824,7 @@ where
     // If finalize_completed_windows is on AND we have newly-encoded
     // full windows, push them onto the finalize queue + drain.
     //
-    // F3: never drain newly-encoded windows out of the system in a path
+    // Never drain newly-encoded windows out of the system in a path
     // that can't replay them. Push freshly-drained windows into the
     // retry queue; `finalize_completed_windows` then pops them one at a
     // time as decodes succeed (and leaves any failed window at the
@@ -1012,19 +1010,19 @@ where
   /// decode over each, append its text to `completed_text`, and reset
   /// the streaming decode state.
   ///
-  /// F2: ALWAYS run `decoder.decode_all_tokens` for finalized windows.
+  /// ALWAYS run `decoder.decode_all_tokens` for finalized windows.
   /// The previously-streamed provisional/confirmed text is consulted
   /// only as an explicit fallback when the full decode for the first
   /// queued window returns empty text — otherwise the streamed
   /// preview's partial-text would freeze in place and the rest of the
   /// boundary audio would be dropped.
   ///
-  /// F3: pops one window at a time, advancing `frozen_window_count`
+  /// Pops one window at a time, advancing `frozen_window_count`
   /// after each successful append. On `Err` the failed window is left
   /// at the queue front so a subsequent `feed_audio` / `stop` call can
   /// retry it without losing already-encoded audio.
   ///
-  /// R2-style fallback gating: the per-entry `fallback_consumed` flag
+  /// Fallback gating: the per-entry `fallback_consumed` flag
   /// in [`PendingFinalize`] is set BEFORE the fallible decode call so
   /// a decode Err does NOT re-arm the fallback. The streamed-text
   /// fallback is offered AT MOST ONCE per queued window across all
@@ -1038,7 +1036,7 @@ where
 
     let mut events: Vec<TranscriptionEvent> = Vec::new();
     while let Some(pending) = self.retry_state.finalize_queue_mut().front_mut() {
-      // R2-style fallback gating: capture the streamed-text fallback
+      // Fallback gating: capture the streamed-text fallback
       // ONLY if THIS queue entry hasn't been offered it yet. The flag
       // flips to `true` BEFORE the fallible decode below so that on a
       // decode `Err`, the next retry sees `fallback_consumed == true`
@@ -1067,7 +1065,7 @@ where
         candidate_fallback.unwrap_or_default()
       } else {
         let start = Instant::now();
-        // F2 + F3: ALWAYS attempt the full decode. On `Err` the `?`
+        // ALWAYS attempt the full decode. On `Err` the `?`
         // propagates up; the queue front is unchanged so the next
         // pass retries this window. `frozen_window_count` has NOT
         // advanced yet, preserving the invariant
@@ -1082,7 +1080,7 @@ where
         total_decode_time += decode_time;
         total_generated_tokens = total_generated_tokens.saturating_add(token_ids.len());
         let full_text = self.tokenizer.decode_ids(&token_ids);
-        // F2: only fall back to streamed text when the FULL decode
+        // Only fall back to streamed text when the FULL decode
         // produced nothing. Otherwise the full decode wins.
         if full_text.trim().is_empty()
           && let Some(fallback) = candidate_fallback
@@ -1188,7 +1186,7 @@ fn concat_text(a: &str, b: &str) -> String {
 /// Propagates [`Array::try_clone`] errors with a contextual message
 /// instead of silently dropping the failure into `None` (which would
 /// have made the next retry behave as "no partial audio" and drop the
-/// real payload — see the `stop()` F2-FIX call-site comments).
+/// real payload — see the `stop()` call-site comments).
 fn clone_partial_decode_payload(features: Option<&Array>) -> Result<Option<Array>> {
   match features {
     None => Ok(None),
@@ -1460,10 +1458,10 @@ mod tests {
   }
 
   // -----------------------------------------------------------------
-  // F2 / F3 — completed-window finalization (preserved from R1 baseline)
+  // Completed-window finalization
   // -----------------------------------------------------------------
 
-  /// F2: when the first window is finalized, the FULL decode must run
+  /// When the first window is finalized, the FULL decode must run
   /// over the completed-window features — even when streamed-fallback
   /// text exists from a prior pending-window decode.
   #[test]
@@ -1481,7 +1479,7 @@ mod tests {
     );
   }
 
-  /// F2: when the streamed-fallback text differs from the full-decode
+  /// When the streamed-fallback text differs from the full-decode
   /// text, the FULL-decode text MUST land in `completed_text`.
   #[test]
   fn streaming_session_first_window_finalization_appends_full_decode_not_partial_text() {
@@ -1505,9 +1503,9 @@ mod tests {
     );
   }
 
-  /// F3: on a finalize-decode error the failed window stays in the
+  /// On a finalize-decode error the failed window stays in the
   /// retry queue so a subsequent `feed_audio` call can re-attempt it.
-  /// (R2 contract: feed_audio drains a pending retry queue.)
+  /// (feed_audio drains a pending retry queue.)
   #[test]
   fn streaming_session_decoder_error_keeps_window_for_retry_then_feed_audio_drains() {
     use crate::error::Error;
@@ -1542,7 +1540,7 @@ mod tests {
     );
   }
 
-  /// F3: `frozen_window_count` invariant across a finalize error.
+  /// `frozen_window_count` invariant across a finalize error.
   #[test]
   fn streaming_session_decoder_error_does_not_advance_frozen_window_count() {
     use crate::error::Error;
@@ -1564,10 +1562,10 @@ mod tests {
   }
 
   // -----------------------------------------------------------------
-  // R2-style: retry semantics around stop() / feed_audio()
+  // Retry semantics around stop() / feed_audio()
   // -----------------------------------------------------------------
 
-  /// R2 F1: when `stop()` errors inside finalize, the session must
+  /// When `stop()` errors inside finalize, the session must
   /// remain RETRYABLE — a second `stop()` call must drain the queue.
   #[test]
   fn streaming_session_stop_with_finalize_err_can_be_retried_with_second_stop() {
@@ -1606,7 +1604,7 @@ mod tests {
     assert_eq!(session.retry_state().finalize_queue().len(), 0);
   }
 
-  /// R2 F2: a follow-up `feed_audio` with EMPTY input must drive the
+  /// A follow-up `feed_audio` with EMPTY input must drive the
   /// retry path.
   #[test]
   fn streaming_session_pending_retry_finalizes_on_empty_feed_audio() {
@@ -1635,7 +1633,7 @@ mod tests {
     assert!(!retry_events.is_empty());
   }
 
-  /// R2 F3: after a finalize-decode Err, the streamed-text fallback
+  /// After a finalize-decode Err, the streamed-text fallback
   /// MUST NOT be re-armed on retry — `PendingFinalize::fallback_consumed`
   /// is sticky.
   #[test]
@@ -1665,18 +1663,18 @@ mod tests {
     // completed_text — the per-entry fallback flag prevented re-arm.
     assert!(
       !session.shared.completed_text.contains("t123"),
-      "R2 F3: stale streamed fallback must NOT be frozen, got {:?}",
+      "stale streamed fallback must NOT be frozen, got {:?}",
       session.shared.completed_text
     );
   }
 
   // -----------------------------------------------------------------
-  // R3 contract: stop() preserves tail audio across mel.flush / encoder
-  //              .feed Err. Uses the SessionRetryState's StopEncoderFeed
-  //              stage as the bridge.
+  // stop() preserves tail audio across mel.flush / encoder
+  // .feed Err. Uses the SessionRetryState's StopEncoderFeed
+  // stage as the bridge.
   // -----------------------------------------------------------------
 
-  /// R3 contract: stop()'s encoder.feed Err preserves the
+  /// stop()'s encoder.feed Err preserves the
   /// freshly-flushed mel_frames so a retry stop() can re-feed them.
   ///
   /// (Named for the misnomer — the scripted Err is on
@@ -1710,7 +1708,7 @@ mod tests {
     // Bridge holds the tail mel.
     assert!(
       session.retry_state().has_pending_stop_encoder_feed(),
-      "R3 contract: SessionRetryState StopEncoderFeed MUST hold the tail mel"
+      "SessionRetryState StopEncoderFeed MUST hold the tail mel"
     );
     assert!(
       session.is_active(),
@@ -1728,10 +1726,10 @@ mod tests {
   }
 
   // -----------------------------------------------------------------
-  // R4 corner: feed_audio MUST drain pending stop-tail BEFORE new audio.
+  // feed_audio MUST drain pending stop-tail BEFORE new audio.
   // -----------------------------------------------------------------
 
-  /// R4 corner structural fix: a `feed_audio(new_samples)` AFTER a
+  /// A `feed_audio(new_samples)` AFTER a
   /// transient stop()-Err MUST run the bridge drain BEFORE
   /// mel.process(new_samples) / encoder.feed(new_mel). The
   /// SessionRetryState's StopEncoderFeed discharge is called at the
@@ -1750,7 +1748,7 @@ mod tests {
     let stop_err_call_idx = session.encoder.backend().call_count() - 1;
     let stop_err_fingerprint = session.encoder.backend().fingerprints()[stop_err_call_idx];
 
-    // R4 PROBE: deliver NEW audio. The bridge drain MUST run FIRST.
+    // PROBE: deliver NEW audio. The bridge drain MUST run FIRST.
     let samples_b: Vec<f32> = (0..1200)
       .map(|i| ((i as f32 + 7.0) * 0.013).cos())
       .collect();
@@ -1761,7 +1759,7 @@ mod tests {
     // Bridge cleared on successful drain.
     assert!(
       !session.retry_state().has_pending_stop_encoder_feed(),
-      "R4: feed_audio MUST clear StopEncoderFeed after a successful drain"
+      "feed_audio MUST clear StopEncoderFeed after a successful drain"
     );
 
     // ORDER ASSERTION: the call immediately after stop-Err MUST be
@@ -1772,16 +1770,16 @@ mod tests {
     assert_eq!(
       fingerprints[bridge_drain_idx].to_bits(),
       stop_err_fingerprint.to_bits(),
-      "R4 ORDER: the call immediately after stop-Err MUST be the bridge \
+      "ORDER: the call immediately after stop-Err MUST be the bridge \
        drain (bit-identical fingerprint). fingerprints={fingerprints:?}"
     );
   }
 
-  /// R4 corner: `feed_audio(&[])` MUST drain the staged tail even with
+  /// `feed_audio(&[])` MUST drain the staged tail even with
   /// zero new samples. The drain commits 1 window (encode_window call);
   /// the SessionRetryState's discharge then drives a same-call decode
   /// pass for the drained window (a second encode_window call for the
-  /// 1-row carry's encode_pending — the R5 contract that drained
+  /// 1-row carry's encode_pending — the contract that drained
   /// windows must flow through a decode in THIS call). Total: 2
   /// encode_window calls in the same feed_audio.
   #[test]
@@ -1803,7 +1801,7 @@ mod tests {
       .feed_audio(&[])
       .expect("empty feed_audio MUST succeed by draining the bridge");
     assert!(!session.retry_state().has_pending_stop_encoder_feed());
-    // R5 contract: drained window decoded in THIS call.
+    // Contract: drained window decoded in THIS call.
     assert_eq!(
       session.decoder.call_count(),
       decoder_calls_before + 1,
@@ -1814,10 +1812,10 @@ mod tests {
   }
 
   // -----------------------------------------------------------------
-  // R5 corner: drained windows decoded in the SAME feed_audio call.
+  // Drained windows decoded in the SAME feed_audio call.
   // -----------------------------------------------------------------
 
-  /// R5 corner structural fix: a bridge drain that completes a full
+  /// A bridge drain that completes a full
   /// encoder window MUST route that window through `run_decode_pass`
   /// IN THE SAME `feed_audio` call. The `discharge_stop_encoder_feed`
   /// returns count > 0 and arms DecodeOwed, which immediately drives
@@ -1846,18 +1844,18 @@ mod tests {
     assert_eq!(
       session.encoder.encoded_window_count(),
       encoder_windows_before_drain + 1,
-      "R5: bridge drain MUST have committed exactly one full window"
+      "bridge drain MUST have committed exactly one full window"
     );
-    // R5 CORE: the decoder was invoked for the partial-window decode in
+    // CORE: the decoder was invoked for the partial-window decode in
     // the SAME call as the drain.
     assert_eq!(
       session.decoder.call_count(),
       decoder_calls_after_initial + 1,
-      "R5: bridge-drained window MUST drive run_decode_pass in this call"
+      "bridge-drained window MUST drive run_decode_pass in this call"
     );
   }
 
-  /// R5: sub-window drain → bridge cleared (no window completed). The
+  /// Sub-window drain → bridge cleared (no window completed). The
   /// decode-owed obligation MUST NOT be armed (only count > 0 arms it).
   #[test]
   fn session_retry_state_bridge_drain_no_windows_clears_bridge_no_obligation() {
@@ -1875,26 +1873,26 @@ mod tests {
     let _events = session
       .feed_audio(&[])
       .expect("empty feed_audio with non-completing drain MUST succeed");
-    // Bridge cleared (R4 contract: successful drain always clears).
+    // Bridge cleared (successful drain always clears).
     assert!(!session.retry_state().has_pending_stop_encoder_feed());
-    // R5 core: drain returned 0 windows → no DecodeOwed obligation
+    // Core: drain returned 0 windows → no DecodeOwed obligation
     // armed. (The encoder may have pending sub-window frames that the
     // normal pending-window decode picks up — that's a separate path
     // governed by the cadence gate, not the discharge.)
     assert!(
       !session.retry_state().has_decode_owed(),
-      "R5: drain with 0 windows MUST NOT arm DecodeOwed"
+      "drain with 0 windows MUST NOT arm DecodeOwed"
     );
     assert_eq!(session.encoder.encoded_window_count(), 0);
   }
 
   // -----------------------------------------------------------------
-  // R6 corner: a same-call decode obligation MUST survive a later `?`
-  //            propagation. The DecodeOwed stage is the cross-call
-  //            source of truth — no per-call locals.
+  // A same-call decode obligation MUST survive a later `?`
+  // propagation. The DecodeOwed stage is the cross-call
+  // source of truth — no per-call locals.
   // -----------------------------------------------------------------
 
-  /// R6 corner structural fix: a bridge drain SUCCESS in feed_audio
+  /// A bridge drain SUCCESS in feed_audio
   /// followed by a later Err on the new-audio encoder.feed must arm
   /// DecodeOwed; a retry feed_audio(&[]) MUST decode the drained
   /// window AND clear the obligation.
@@ -1910,22 +1908,21 @@ mod tests {
     let _ = session.stop();
     assert!(session.retry_state().has_pending_stop_encoder_feed());
 
-    // R6 PROBE: deliver new audio. Discharge drains successfully (1
+    // PROBE: deliver new audio. Discharge drains successfully (1
     // window committed) and arms DecodeOwed. The discharge's decode
     // pass runs and SUCCEEDS (clears DecodeOwed). Then back in
     // feed_audio normal path, encoder.feed(new_mel) Errs.
     //
-    // Actually — let me trace this more carefully for the R6 contract.
-    // The R6 contract specifically requires: the drained window's
-    // decode obligation survives a `?` from later. In MY design the
-    // discharge runs the decode IN THE DISCHARGE. So R6 is structurally
-    // impossible — there's no "drained but not decoded" state across
-    // call boundaries when the drain returns count > 0.
+    // The contract specifically requires: the drained window's
+    // decode obligation survives a `?` from later. The discharge runs
+    // the decode IN THE DISCHARGE, so the "drained but not decoded"
+    // state across call boundaries is structurally impossible when the
+    // drain returns count > 0.
     //
-    // But the alt R6 surface IS reachable: encoder.feed(new_mel)
+    // But the alternate surface IS reachable: encoder.feed(new_mel)
     // succeeds with new_windows > 0, then run_decode_pass Errs. The
-    // new windows are stranded. My fix arms DecodeOwed BEFORE
-    // run_decode_pass when new_windows > 0.
+    // new windows are stranded. DecodeOwed is armed BEFORE
+    // run_decode_pass when new_windows > 0 to cover this.
     let samples_b: Vec<f32> = (0..1500)
       .map(|i| ((i as f32 + 11.0) * 0.013).cos())
       .collect();
@@ -1937,7 +1934,7 @@ mod tests {
     // Bridge cleared (the discharge already drained it transactionally).
     assert!(!session.retry_state().has_pending_stop_encoder_feed());
 
-    // The R6-style obligation we MIGHT still have depends on whether the
+    // The obligation we MIGHT still have depends on whether the
     // discharge's decode armed DecodeOwed and propagated, or the later
     // encoder.feed Err armed DecodeOwed before propagating. Either way,
     // a retry feed_audio(&[]) MUST decode whatever is owed and clear.
@@ -1947,25 +1944,25 @@ mod tests {
       .expect("retry feed_audio MUST succeed");
     assert!(
       !session.retry_state().has_decode_owed(),
-      "R6: successful retry decode MUST clear DecodeOwed"
+      "successful retry decode MUST clear DecodeOwed"
     );
     assert!(
       session.decoder.call_count() > decoder_calls_after_initial,
-      "R6: retry MUST drive at least one decoder call"
+      "retry MUST drive at least one decoder call"
     );
     let _ = retry_events;
   }
 
   // -----------------------------------------------------------------
-  // R7 corner: NO flag bleeds across calls when cadence-throttle skips
-  //            the decode. Structurally, my design has no "force decode
-  //            next call" flag. The discharge runs decodes when an
-  //            obligation is owed; a cadence-throttled call doesn't
-  //            create an obligation (DecodeOwed is only armed by an
-  //            actual Err or a discharge_stop_encoder_feed with count > 0).
+  // NO flag bleeds across calls when cadence-throttle skips
+  // the decode. Structurally, this design has no "force decode
+  // next call" flag. The discharge runs decodes when an
+  // obligation is owed; a cadence-throttled call doesn't
+  // create an obligation (DecodeOwed is only armed by an
+  // actual Err or a discharge_stop_encoder_feed with count > 0).
   // -----------------------------------------------------------------
 
-  /// R7 corner structural fix: a bridge drain + successful same-call
+  /// A bridge drain + successful same-call
   /// decode + no later Err MUST clear all obligations. There is no
   /// flag that survives the call to force an unnecessary decode next
   /// time. The cadence throttle does NOT factor into the discharge's
@@ -1993,7 +1990,7 @@ mod tests {
 
     assert!(
       !session.retry_state().has_obligation(),
-      "R7: end-of-call MUST clear all obligations on happy path"
+      "end-of-call MUST clear all obligations on happy path"
     );
 
     let decoder_calls_after_discharge = session.decoder.call_count();
@@ -2011,7 +2008,7 @@ mod tests {
     assert_eq!(
       session.decoder.call_count(),
       decoder_calls_after_discharge,
-      "R7: second empty feed_audio MUST NOT trigger a phantom decode"
+      "second empty feed_audio MUST NOT trigger a phantom decode"
     );
     assert!(events_2.is_empty(), "no work ⇒ no events");
   }
@@ -2060,15 +2057,15 @@ mod tests {
   }
 
   // -----------------------------------------------------------------
-  // F1: StopMelFlush deadlock fix — discharge_stop_mel_flush wired
-  //     into discharge_retry_obligation. Pre-fix: stop() staged
-  //     StopMelFlush BEFORE mel.flush(); on flush Err the obligation
-  //     was set but discharge_retry_obligation had no branch for it
-  //     → has_obligation() returned true → stop() early-returned
-  //     without driving the retry → DEADLOCK.
+  // StopMelFlush deadlock avoidance — discharge_stop_mel_flush is
+  // wired into discharge_retry_obligation. stop() stages
+  // StopMelFlush BEFORE mel.flush(); on flush Err the obligation
+  // is set, and discharge_retry_obligation MUST have a branch for it
+  // — otherwise has_obligation() returns true, stop() early-returns
+  // without driving the retry, and the session DEADLOCKS.
   // -----------------------------------------------------------------
 
-  /// F1 contract: a stop() whose `mel.flush()` errors stages
+  /// A stop() whose `mel.flush()` errors stages
   /// `StopMelFlush` and keeps the session active so the next call can
   /// retry. Without the discharge wiring the obligation would be
   /// stranded.
@@ -2089,27 +2086,27 @@ mod tests {
     assert!(stop_first.is_err(), "stop() must propagate mel.flush Err");
     assert!(
       session.is_active(),
-      "F1: errored stop() MUST leave session active so retry is possible"
+      "errored stop() MUST leave session active so retry is possible"
     );
     assert!(
       session.retry_state().has_pending_stop_mel_flush(),
-      "F1: stop()'s mel.flush Err MUST stage StopMelFlush"
+      "stop()'s mel.flush Err MUST stage StopMelFlush"
     );
     assert!(
       session.retry_state().has_obligation(),
-      "F1: retry obligation MUST be visible to the next call"
+      "retry obligation MUST be visible to the next call"
     );
     // mel.flush is transactional — overlap preserved on Err.
     assert!(
       session.mel_processor.overlap_buffer_len() > 0,
-      "F1: transactional flush MUST preserve overlap on Err"
+      "transactional flush MUST preserve overlap on Err"
     );
   }
 
-  /// F1 contract: a second stop() after the first's mel.flush Err
+  /// A second stop() after the first's mel.flush Err
   /// drives `discharge_stop_mel_flush`, completes the flush + encoder
-  /// feed + decode + Ended emission. Pre-fix this would DEADLOCK
-  /// because no discharge branch existed for StopMelFlush.
+  /// feed + decode + Ended emission. Without a discharge branch for
+  /// StopMelFlush this would DEADLOCK.
   #[test]
   fn session_retry_state_stop_with_mel_flush_err_can_be_retried() {
     let encoder = ScriptedEncoder::new(8, vec![false, false, false, false]);
@@ -2134,10 +2131,10 @@ mod tests {
     // back in stop() body, finalize/freeze + partial decode + Ended.
     let stop_second = session
       .stop()
-      .expect("F1: retry stop() MUST succeed via discharge_stop_mel_flush");
+      .expect("retry stop() MUST succeed via discharge_stop_mel_flush");
     assert!(
       matches!(stop_second.last(), Some(TranscriptionEvent::Ended(_))),
-      "F1: second stop() MUST emit Ended after the discharge succeeds"
+      "second stop() MUST emit Ended after the discharge succeeds"
     );
     assert!(!session.is_active());
     assert!(!session.retry_state().has_obligation());
@@ -2145,7 +2142,7 @@ mod tests {
     assert_eq!(session.mel_processor.overlap_buffer_len(), 0);
   }
 
-  /// F1 contract: the cross-call discharge survives MULTIPLE mel.flush
+  /// The cross-call discharge survives MULTIPLE mel.flush
   /// failures — each call drives the retry and re-arms StopMelFlush
   /// on continued failure. Only when the flush eventually succeeds
   /// does the pipeline proceed.
@@ -2169,18 +2166,18 @@ mod tests {
     // remains discharge-able.
     assert!(
       session.stop().is_err(),
-      "F1: second stop() with continued flush Err MUST propagate Err"
+      "second stop() with continued flush Err MUST propagate Err"
     );
     assert!(
       session.retry_state().has_pending_stop_mel_flush(),
-      "F1: re-armed StopMelFlush MUST persist across the second Err"
+      "re-armed StopMelFlush MUST persist across the second Err"
     );
     assert!(session.is_active());
 
     // Third stop(): flush counter exhausted → flush Ok → full pipeline.
     let stop_third = session
       .stop()
-      .expect("F1: third stop() MUST succeed once flush stops erring");
+      .expect("third stop() MUST succeed once flush stops erring");
     assert!(matches!(
       stop_third.last(),
       Some(TranscriptionEvent::Ended(_))
@@ -2190,16 +2187,16 @@ mod tests {
   }
 
   // -----------------------------------------------------------------
-  // F2: StopPartialDecode rollback no longer silently drops the
-  //     audio_features payload on try_clone failure. Pre-fix:
-  //     `try_clone().ok()` mapped clone Err to `None`, which made
-  //     the next retry behave as "no partial audio" and drop the
-  //     window. Now the clone Err propagates AND the obligation is
-  //     re-armed with the original payload (fast path) or the
-  //     mainline body's idempotent recompute handles it.
+  // StopPartialDecode rollback must not silently drop the
+  // audio_features payload on try_clone failure. Mapping clone Err to
+  // `None` (via `try_clone().ok()`) would make the next retry behave
+  // as "no partial audio" and drop the window. Instead the clone Err
+  // propagates AND the obligation is re-armed with the original
+  // payload (fast path) or the mainline body's idempotent recompute
+  // handles it.
   // -----------------------------------------------------------------
 
-  /// F2 contract: the `clone_partial_decode_payload` helper returns
+  /// The `clone_partial_decode_payload` helper returns
   /// `Ok(None)` for absent features (the normal "no partial" path),
   /// `Ok(Some(_))` for a successful refcount clone, and propagates a
   /// clone failure as `Err` instead of silently dropping it. Tested
@@ -2214,7 +2211,7 @@ mod tests {
     let none_out = clone_partial_decode_payload(None).expect("None must succeed");
     assert!(
       none_out.is_none(),
-      "F2: None payload MUST round-trip as Ok(None) (no fabricated payload)"
+      "None payload MUST round-trip as Ok(None) (no fabricated payload)"
     );
 
     // Some in ⇒ Ok(Some(refcount-cloned)) on the happy path.
@@ -2222,19 +2219,19 @@ mod tests {
     let some_out = clone_partial_decode_payload(Some(&arr)).expect("happy-path clone must succeed");
     assert!(
       some_out.is_some(),
-      "F2: Some payload with successful clone MUST yield Ok(Some(_))"
+      "Some payload with successful clone MUST yield Ok(Some(_))"
     );
     // The clone is a separate handle (not the same allocation).
     let cloned = some_out.unwrap();
     assert_eq!(
       cloned.shape(),
       arr.shape(),
-      "F2: refcount clone preserves shape"
+      "refcount clone preserves shape"
     );
 
     // STRUCTURAL ASSERTION: the function signature returns `Result`,
-    // proving an `Err` PATH exists. The pre-fix `.ok()` API had NO
-    // Err path → any clone failure was dropped. The Err-path
+    // proving an `Err` PATH exists. A `.ok()`-based API would have NO
+    // Err path → any clone failure would be dropped. The Err-path
     // existence is what kills the silent-drop defect class
     // structurally; the propagation is exercised end-to-end by every
     // stop()-with-partial-window test in this module (those call
@@ -2242,11 +2239,11 @@ mod tests {
     // stop() Err).
   }
 
-  /// F2 contract: the stop() fast path's clone-failure rollback
+  /// The stop() fast path's clone-failure rollback
   /// re-arms `StopPartialDecode` with the ORIGINAL payload (moved
-  /// back into the obligation, no clone needed). The pre-fix code's
-  /// `try_clone().ok()` would have armed with `None`, silently
-  /// dropping the partial window for the next retry. We assert the
+  /// back into the obligation, no clone needed). A `try_clone().ok()`
+  /// approach would have armed with `None`, silently dropping the
+  /// partial window for the next retry. We assert the
   /// rollback's structural shape: after a successful fast-path stop,
   /// the obligation is cleared. (A clone-failure-injected fast path
   /// can't be triggered without an FFI hook into `mlx_array_set`'s
@@ -2283,7 +2280,7 @@ mod tests {
     );
     assert!(
       session.retry_state().has_pending_stop_partial_decode(),
-      "F2: stop()'s partial-decode Err MUST arm StopPartialDecode \
+      "stop()'s partial-decode Err MUST arm StopPartialDecode \
        (with the cloned audio_features payload, never silently None)"
     );
 
@@ -2291,9 +2288,7 @@ mod tests {
     // re-arm, calls finalize_partial_window_and_emit_ended, and on
     // success clears. The clone is real — never None when the
     // pre-arm payload was Some.
-    let stop_second = session
-      .stop()
-      .expect("F2: retry stop() fast path MUST succeed");
+    let stop_second = session.stop().expect("retry stop() fast path MUST succeed");
     assert!(matches!(
       stop_second.last(),
       Some(TranscriptionEvent::Ended(_))
@@ -2302,14 +2297,14 @@ mod tests {
     assert!(!session.is_active());
   }
 
-  /// F2 contract: the stop() mainline body's clone-for-arm step is
+  /// The stop() mainline body's clone-for-arm step is
   /// fallible-via-`?`-propagation now. We can't trigger
   /// `Array::try_clone` to fail deterministically, but we can
   /// confirm the structural shape: `clone_partial_decode_payload`
   /// returns `Result` so a clone Err propagates via `?` instead of
   /// being dropped into `None`. The helper test above proves the
   /// Err path exists; this test proves the call-site uses the
-  /// helper (not the pre-fix `.ok()` pattern) by exercising the
+  /// helper (not a `.ok()` pattern) by exercising the
   /// happy-path through the mainline body AND asserting the
   /// arm-payload was never `None` when audio_features was Some.
   #[test]
@@ -2332,7 +2327,7 @@ mod tests {
 
     // stop() reaches the mainline body, hits step 6's arm + decode.
     // The arm clones audio_features (real refcount handle); the
-    // decode then Errs. Without F2's fix, the arm would have been
+    // decode then Errs. Without the fix, the arm would have been
     // `None` if the clone failed silently — but we can assert that
     // when audio_features WAS Some (the encoder has a partial
     // window), the arm-payload is Some.
@@ -2343,7 +2338,7 @@ mod tests {
       "mainline-body Err must arm StopPartialDecode"
     );
 
-    // F2 STRUCTURAL CHECK: the obligation's payload is Some (not None).
+    // STRUCTURAL CHECK: the obligation's payload is Some (not None).
     // We inspect via take + immediate re-arm so the obligation isn't
     // permanently consumed.
     let taken = session
@@ -2352,7 +2347,7 @@ mod tests {
       .expect("guard above asserts arm");
     assert!(
       taken.is_some(),
-      "F2: mainline arm MUST carry the real cloned payload, never \
+      "mainline arm MUST carry the real cloned payload, never \
        silently None — the encoder had a partial window (1-row carry \
        after the 7-mel feed + stop-flush bridge), so encode_pending \
        returned Some, so the helper's Ok arm is Some"

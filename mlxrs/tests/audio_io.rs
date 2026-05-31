@@ -278,7 +278,7 @@ fn resample_rejects_oversized_output_cap() {
 fn load_wav_missing_file_returns_backend_error() {
   // Use `temp_wav` (pid-suffixed) so concurrent test processes don't
   // collide on a shared filename — same convention the rest of this
-  // module follows (Copilot review #3273868515).
+  // module follows.
   let path = temp_wav("missing");
   // Make absolutely sure it doesn't exist (a stale file from a prior run
   // would mask the test).
@@ -343,11 +343,11 @@ fn save_wav_atomically_replaces_existing_file() {
 
 #[test]
 fn load_wav_rejects_truncated_wav() {
-  // Pre-codex-round-1 regression: silently skipping a decoder
-  // IoError/DecodeError would return Ok with fewer samples than the
-  // header declared. The post-fix path either (a) fails the decode
-  // step with Error::Backend, or (b) reaches the post-loop
-  // header_len-vs-out.len mismatch check and fails there.
+  // Regression: silently skipping a decoder IoError/DecodeError would
+  // return Ok with fewer samples than the header declared. The load
+  // path either (a) fails the decode step with Error::Backend, or (b)
+  // reaches the post-loop header_len-vs-out.len mismatch check and
+  // fails there.
   //
   // Build a valid 16-bit mono WAV header that declares 32 samples,
   // but only write 8 samples of data. Either failure mode (decode
@@ -402,7 +402,7 @@ fn load_wav_rejects_truncated_wav() {
 
 #[test]
 fn save_wav_rejects_sample_rate_exceeding_byte_rate_u32_ceiling() {
-  // Post-codex-round-1 cap: save_wav rejects sample_rate values whose
+  // Cap: save_wav rejects sample_rate values whose
   // byte_rate = sample_rate * 2 would wrap u32. Upper bound is
   // u32::MAX / 2 = 2147483647; anything above that must error UPFRONT
   // before any tempfile is created.
@@ -419,7 +419,7 @@ fn save_wav_rejects_sample_rate_exceeding_byte_rate_u32_ceiling() {
 #[cfg(unix)]
 #[test]
 fn save_wav_preserves_existing_destination_mode_bits() {
-  // Post-codex-round-3 regression: when save_wav overwrites an
+  // Regression: when save_wav overwrites an
   // existing file, the post-rename mode bits must match the prior
   // mode bits — the fresh-tempfile-inode path would otherwise drop
   // back to the process umask. Pre-stage a 0600 file at the
@@ -442,7 +442,7 @@ fn save_wav_preserves_existing_destination_mode_bits() {
 
 #[test]
 fn load_wav_decodes_24bit_pcm_mono_wav() {
-  // Post-codex-round-2 regression: load_wav must accept 24-bit mono
+  // Regression: load_wav must accept 24-bit mono
   // PCM WAVs (not just 16-bit). Craft one by hand and assert load_wav
   // returns f32 samples in [-1, 1] with the expected per-sample value.
   // Three 24-bit samples: +max (0x7fffff = 8388607), 0, -max (0x800001 = -8388607).
@@ -516,7 +516,7 @@ fn load_wav_via_symphonia_roundtrip_matches_save_wav_output() {
   let _ = fs::remove_file(&path);
 }
 
-// -------- New tests: MP3 / FLAC / OGG-Vorbis decode (A6) --------
+// -------- New tests: MP3 / FLAC / OGG-Vorbis decode --------
 
 #[test]
 fn load_audio_decodes_mp3() {
@@ -544,13 +544,13 @@ fn load_audio_decodes_flac() {
 
 #[test]
 fn load_audio_flac_decodes_exact_streaminfo_sample_count() {
-  // Fix 2 (FLAC exact-count): FLAC's STREAMINFO carries an EXACT total
-  // sample count, which symphonia surfaces as the track's `num_frames`.
-  // `load_audio` now treats FLAC-with-a-declared-total like WAV (an
-  // exact-count format) and applies the strict post-decode equality
-  // cross-check — so the intact fixture must decode to EXACTLY its
-  // declared 2000 samples (not merely a tolerance band). If this drifts
-  // off 2000, either the fixture or the exact-count gate changed.
+  // FLAC's STREAMINFO carries an EXACT total sample count, which
+  // symphonia surfaces as the track's `num_frames`. `load_audio` treats
+  // FLAC-with-a-declared-total like WAV (an exact-count format) and
+  // applies the strict post-decode equality cross-check — so the intact
+  // fixture must decode to EXACTLY its declared 2000 samples (not merely
+  // a tolerance band). If this drifts off 2000, either the fixture or
+  // the exact-count gate changed.
   let path = temp_path("flac_exact", "flac");
   write_fixture(&path, FIXTURE_FLAC);
   let (samples, sr) = load_audio(&path).unwrap();
@@ -565,13 +565,13 @@ fn load_audio_flac_decodes_exact_streaminfo_sample_count() {
 
 #[test]
 fn load_audio_rejects_truncated_flac() {
-  // Fix 2 (FLAC exact-count): a FLAC truncated mid-stream declares (via
-  // STREAMINFO) more samples than survive in the truncated byte buffer.
-  // Symphonia can hit a clean EOF after the partial frames; the old
-  // WAV-only gate would then return `Ok` with missing audio (silent
-  // corruption). With FLAC promoted to an exact-count format, the
-  // post-decode `out.len() == declared` cross-check (or an earlier decode
-  // error) must surface `Error::Backend` instead.
+  // A FLAC truncated mid-stream declares (via STREAMINFO) more samples
+  // than survive in the truncated byte buffer. Symphonia can hit a clean
+  // EOF after the partial frames; a WAV-only gate would then return `Ok`
+  // with missing audio (silent corruption). With FLAC treated as an
+  // exact-count format, the post-decode `out.len() == declared`
+  // cross-check (or an earlier decode error) must surface `Error::Backend`
+  // instead.
   //
   // We truncate to the first half of the fixture bytes, which keeps the
   // STREAMINFO header (so `num_frames` = 2000 is known) but drops the
@@ -704,7 +704,7 @@ fn load_audio_truncated_compressed_is_bounded_and_recoverable() {
   }
 }
 
-// ---- P7 #132: load_audio_into buffer reuse -------------------------------
+// ---- #132: load_audio_into buffer reuse ----------------------------------
 
 /// `load_audio_into` decodes a WAV into the caller's existing `Vec<f32>`
 /// and reuses its pre-allocated capacity across calls. The returned
@@ -756,7 +756,7 @@ fn load_audio_into_reuses_buffer_across_calls() {
   let _ = fs::remove_file(&path2);
 }
 
-// ---- P7 #137: load_audio_with_cap rejects oversized before alloc ---------
+// ---- #137: load_audio_with_cap rejects oversized before alloc ------------
 
 /// `load_audio_with_cap` rejects a WAV declaring more samples than the
 /// caller's `max_samples` cap BEFORE allocating the sample buffer.
@@ -819,7 +819,7 @@ fn load_audio_equivalent_to_with_cap_at_max() {
   let _ = fs::remove_file(&path);
 }
 
-// ---- P7 #133: save_wav_into scratch-buffer reuse + Quantizer trait -------
+// ---- #133: save_wav_into scratch-buffer reuse + Quantizer trait ----------
 
 /// `save_wav_into` writes a WAV identical to `save_wav` while reusing a
 /// caller-provided `Vec<i16>` scratch buffer. Two consecutive calls
@@ -865,7 +865,7 @@ fn save_wav_into_reuses_scratch_buffer() {
 
 /// `I16Quantizer` is the `Quantizer<f32, i16>` impl used by `save_wav` /
 /// `save_wav_into` — clip + scale + cast in one pass. Wires through the
-/// C7 SIMD dispatcher; results are bit-identical regardless of caller.
+/// SIMD dispatcher; results are bit-identical regardless of caller.
 #[test]
 fn i16_quantizer_matches_simd_dispatcher() {
   use core::mem::MaybeUninit;
@@ -894,9 +894,9 @@ fn i16_quantizer_matches_simd_dispatcher() {
 
   assert_eq!(
     dst_a, dst_b,
-    "I16Quantizer must produce identical output to the C7 SIMD dispatcher"
+    "I16Quantizer must produce identical output to the SIMD dispatcher"
   );
-  // Clip bounds. The C7 SIMD convention is `* 32768` (NOT `* 32767`); the
+  // Clip bounds. The SIMD convention is `* 32768` (NOT `* 32767`); the
   // post-clip values land at the i16 extremes:
   //   `-1.5` → clip to `-1.0` → `-1.0 * 32768 = -32768` → in-range as `i16::MIN`.
   //   `+1.5` → clip to `+1.0` → `+1.0 * 32768 = +32768` → SATURATES to `i16::MAX = 32767`.
@@ -909,20 +909,20 @@ fn i16_quantizer_matches_simd_dispatcher() {
   );
 }
 
-// ---- Codex R2 fixes: unified probe+decode (no TOCTOU) + lossy overestimate ---
+// ---- unified probe+decode (no TOCTOU) + lossy overestimate -----------------
 
-/// Codex R2 finding [medium] / F1 — `load_audio_with_max_seconds` does
+/// `load_audio_with_max_seconds` does
 /// ONE `File::open` / probe, not two: the cap derivation and the decode
 /// pass share the same `FormatReader`, so the cap is structurally
 /// guaranteed to match the file actually being decoded.
 ///
-/// The earlier implementation re-opened the path for a probe-only
-/// `File::open` (to read `src_sr`) and then handed off to
-/// `load_audio_with_cap` which re-opened a SECOND time for the decode.
+/// A probe-then-decode design would re-open the path for a probe-only
+/// `File::open` (to read `src_sr`) and then hand off to
+/// `load_audio_with_cap` which re-opens a SECOND time for the decode.
 /// Between those two opens a path could be replaced / symlink-swapped,
 /// letting a high-rate probe authorize a much larger cap for a low-rate
-/// decode of a different file. The fix unifies probe + decode against
-/// the same handle.
+/// decode of a different file. Unifying probe + decode against the same
+/// handle closes that TOCTOU window.
 ///
 /// Structural-via-behavior test: we write a WAV at the EXACT capacity
 /// boundary (sample_rate * max_seconds == decoded_samples) and call
@@ -981,7 +981,7 @@ fn load_audio_with_max_seconds_unified_probe_no_toctou() {
   let _ = fs::remove_file(&path);
 }
 
-/// Codex R2 finding [medium] / F2 — lossy formats (MP3 / OGG-Vorbis)
+/// Lossy formats (MP3 / OGG-Vorbis)
 /// whose header can OVERESTIMATE the true decoded frame count must NOT
 /// be rejected upfront by `header_len > effective_cap`. The upfront
 /// rejection is reserved for exact-count formats (WAV / FLAC with
@@ -989,33 +989,18 @@ fn load_audio_with_max_seconds_unified_probe_no_toctou() {
 /// and let `push_samples` enforce the actual cap during decode using
 /// the REAL decoded sample count.
 ///
-/// NOTE: an earlier "overestimate-within-cap succeeds" companion test
-/// was removed in the R3 follow-up because the committed MP3 fixture's
-/// Xing/Info header declares only 6 MPEG frames (~3456 samples at 8
-/// kHz) — already BELOW the test's 4000-sample cap — so the upfront
-/// `header_len > cap` rejection would not have fired even on the
-/// pre-fix code path, meaning the test did not actually distinguish
-/// pre-fix from post-fix behavior. The genuinely-over-cap test below
-/// now carries the entire F2 regression budget by asserting the EXACT
-/// `"stream produced"` mid-decode error message (and NOT the pre-fix
-/// `"container declares"` upfront message), which only the post-fix
-/// `push_samples`-driven cap can produce.
+/// This covers the MP3 whose TRUE decoded length actually exceeds the
+/// cap: it must STILL reject — the cap is enforced mid-decode by
+/// `push_samples` for estimate formats (not upfront), so an over-cap
+/// MP3 fails after partial decode rather than passing silently.
 ///
-/// Companion to the F2 fix: an MP3 whose TRUE decoded length actually
-/// exceeds the cap must STILL reject — the cap is enforced mid-decode
-/// by `push_samples` for estimate formats (not upfront), so an
-/// over-cap MP3 fails with `Error::Backend` after partial decode rather
-/// than passing silently.
-///
-/// Pre-fix path returned an upfront `"container declares"` Err message
-/// (`load_audio: container declares N samples (>cap ...)`); the F2 fix
-/// makes MP3 over-cap rejection mid-decode via `push_samples`, which
-/// returns `"load_audio: stream produced more than the {cap}-sample
-/// cap"`. This assertion distinguishes them — a regression to the
-/// upfront path would produce a `"container declares"` message and
-/// fail the message-content checks below, even though both paths still
-/// return `Err(Error::Backend)` and a `matches!` check alone would not
-/// catch the regression.
+/// The two cap paths surface distinct error variants. An upfront
+/// `header_len > cap` rejection on an exact-count format surfaces
+/// `Error::CapExceeded`; an estimate-format MP3 over-cap rejection is
+/// mid-decode via `push_samples`, which surfaces `Error::BoundedDecode`.
+/// This test asserts the BoundedDecode variant — a regression that
+/// routed MP3 through the upfront path would produce CapExceeded
+/// instead, which a bare `matches!` on `Err(_)` alone would not catch.
 #[test]
 fn load_audio_with_max_seconds_mp3_genuinely_over_cap_rejects() {
   use mlxrs::{audio::io::load_audio_with_max_seconds, error::Error};
@@ -1028,15 +1013,15 @@ fn load_audio_with_max_seconds_mp3_genuinely_over_cap_rejects() {
   // `push_samples` cap MUST reject this even though the upfront
   // header check is skipped for estimate formats.
   let r = load_audio_with_max_seconds(&path, 0.01);
-  // F2 post-fix marker: rejection is mid-decode via `push_samples`, which
-  // returns `Error::BoundedDecode(_)`. A regression to the upfront
+  // For an estimate-count format the rejection is mid-decode via
+  // `push_samples`, which returns `Error::BoundedDecode(_)`. An upfront
   // `header_len > cap` rejection would return `Error::CapExceeded(_)`
   // instead — variant-typed so this distinction is machine-checked
   // (no string-substring brittleness).
   match &r {
-    Err(Error::BoundedDecode(_)) => { /* post-fix: mid-decode reject — ok */ }
+    Err(Error::BoundedDecode(_)) => { /* mid-decode reject — ok */ }
     Err(Error::CapExceeded(p)) => panic!(
-      "F2 regression: MP3 over-cap rejection came from the upfront \
+      "MP3 over-cap rejection came from the upfront \
        `header_len > cap` path (CapExceeded against `{}`); estimate-count formats \
        must reject mid-decode via BoundedDecode",
       p.cap_name()
@@ -1047,7 +1032,7 @@ fn load_audio_with_max_seconds_mp3_genuinely_over_cap_rejects() {
   let _ = fs::remove_file(&path);
 }
 
-/// Codex R3 / F1 — STRUCTURAL guard for the TOCTOU fix: read the
+/// STRUCTURAL guard for the TOCTOU fix: read the
 /// `mlxrs/src/audio/io.rs` source and assert the `load_audio_into_unified`
 /// worker function (the SOLE entry point for both `load_audio_with_cap`
 /// and `load_audio_with_max_seconds`) does at most ONE `File::open`
@@ -1062,11 +1047,12 @@ fn load_audio_with_max_seconds_mp3_genuinely_over_cap_rejects() {
 /// coincidentally pass (e.g. probe + decode both happen to read the
 /// SAME sample rate from the SAME path in test).
 ///
-/// The pre-fix path open-then-closed a `File::open` JUST to derive
-/// `src_sr`, then `load_audio_with_cap` reopened a SECOND `File::open`
-/// to decode. That is the structural defect this test forbids.
+/// A probe-then-decode design would open-then-close a `File::open` JUST
+/// to derive `src_sr`, then have `load_audio_with_cap` reopen a SECOND
+/// `File::open` to decode. That is the structural defect this test
+/// forbids.
 #[test]
-fn load_audio_into_unified_has_single_file_open_r3_structural() {
+fn load_audio_into_unified_has_single_file_open() {
   // Source of `mlxrs/src/audio/io.rs` — `include_str!` resolves
   // relative to THIS test file at `mlxrs/tests/audio_io.rs`.
   let src = include_str!("../src/audio/io.rs");
@@ -1160,26 +1146,26 @@ fn load_audio_into_unified_has_single_file_open_r3_structural() {
     .count();
   assert_eq!(
     file_open_count, 1,
-    "Codex R3 F1 STRUCTURAL regression: \
+    "STRUCTURAL regression: \
      `load_audio_into_unified` body must contain EXACTLY ONE \
      `File::open` (the unified probe+decode handle); found \
      {file_open_count} in the comment-stripped body. A reintroduced \
-     second open is the pre-fix TOCTOU defect. \
+     second open is the TOCTOU defect this test guards against. \
      Comment-stripped body was:\n{body_no_comments}"
   );
 
-  // The pre-fix code routed cap-derivation through a separate probe
-  // helper (`probe_source_sample_rate`) that did its own `File::open`.
-  // The R2 fix REMOVED that helper; if any reference to it reappears
-  // in the unified worker (in code, not just in comments), a
-  // probe-then-decode double-open has crept back in.
+  // A probe-then-decode design routes cap-derivation through a separate
+  // probe helper (`probe_source_sample_rate`) that does its own
+  // `File::open`. The unified worker has no such helper; if any
+  // reference to it appears in the worker body (in code, not just in
+  // comments), a probe-then-decode double-open has crept in.
   assert!(
     !body_no_comments.contains("probe_source_sample_rate"),
-    "Codex R3 F1 STRUCTURAL regression: \
-     `load_audio_into_unified` body must NOT reference the removed \
-     `probe_source_sample_rate` helper — that helper performed a \
-     SECOND `File::open` and was deleted as part of the R2 TOCTOU \
-     fix. Comment-stripped body was:\n{body_no_comments}"
+    "STRUCTURAL regression: \
+     `load_audio_into_unified` body must NOT reference a \
+     `probe_source_sample_rate` helper — such a helper performs a \
+     SECOND `File::open` and reintroduces the TOCTOU double-open. \
+     Comment-stripped body was:\n{body_no_comments}"
   );
 
   // Belt-and-braces: also assert the public-entry
@@ -1221,7 +1207,7 @@ fn load_audio_into_unified_has_single_file_open_r3_structural() {
     .count();
   assert_eq!(
     pub_file_open_count, 0,
-    "Codex R3 F1 STRUCTURAL regression: \
+    "STRUCTURAL regression: \
      `load_audio_with_max_seconds` must delegate to the unified \
      worker without performing its own `File::open` (found \
      {pub_file_open_count} direct opens). The unified worker is the \
@@ -1234,7 +1220,7 @@ fn load_audio_into_unified_has_single_file_open_r3_structural() {
 /// block comments (with nesting) from `src`, returning a `String`
 /// with comment regions elided. String literals are passed through
 /// verbatim — Rust string literals cannot embed an unescaped `//` or
-/// `/*` that would be misclassified, and the F1 source region this
+/// `/*` that would be misclassified, and the source region this
 /// is applied to (the audio-io worker function body) does not
 /// currently use raw string literals (`r"..."` / `r#"..."#`).
 ///
@@ -1245,7 +1231,7 @@ fn load_audio_into_unified_has_single_file_open_r3_structural() {
 /// stripped, so the output is ASCII-only.
 ///
 /// Test-internal helper only — lexer-faithful enough for the
-/// audio/io.rs function bodies the F1 R3 structural test inspects.
+/// audio/io.rs function bodies the structural test inspects.
 /// NOT a general Rust source preprocessor.
 fn strip_comments(src: &str) -> String {
   let bytes = src.as_bytes();

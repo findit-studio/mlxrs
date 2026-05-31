@@ -953,7 +953,7 @@ mod tests {
 
   #[test]
   fn tokenizer_source_loads_from_separate_directory() {
-    // REAL split layout (Codex finding #1): the model dir has config +
+    // REAL split layout: the model dir has config +
     // weights but NO `tokenizer.json`; a SEPARATE dir holds the tokenizer, and
     // `tokenizer_source` points the load there. This MUST fail on the old
     // orchestration (which always built `Tokenizer::from_path(model_dir)`
@@ -977,7 +977,7 @@ mod tests {
 
   #[test]
   fn unsupported_model_type_does_not_touch_weights_or_tokenizer() {
-    // Codex finding #2: an UNREGISTERED `model_type` must be rejected BEFORE
+    // An UNREGISTERED `model_type` must be rejected BEFORE
     // any weights/tokenizer are loaded. The model dir's `config.json` names an
     // unregistered type and its `model.safetensors` is deliberately INVALID
     // (not a real safetensors) — if `load()` tried to load weights it would
@@ -1019,7 +1019,7 @@ mod tests {
 
   #[test]
   fn raw_config_json_matches_parsed_config() {
-    // Codex finding #3: the `config_json` handed to the constructor must be the
+    // The `config_json` handed to the constructor must be the
     // SAME content that was parsed into the typed `Config` (one read, not two).
     // The constructor captures both and asserts they agree: the raw JSON
     // parses back to the same `model_type`/`vocab_size`/`mock_extra`, and is

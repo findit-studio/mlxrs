@@ -1,5 +1,5 @@
 //! Integration tests for the [`mlxrs::audio::stt::serializers`] surface
-//! (issue #176, AUDIO-A13): transcript file writers (TXT / SRT / WebVTT /
+//! (issue #176): transcript file writers (TXT / SRT / WebVTT /
 //! JSON) and the `format_timestamp` / `format_vtt_timestamp` helpers.
 //!
 //! Hand-traced fixtures + byte-exact file-content asserts so a regression in
@@ -261,7 +261,7 @@ fn save_as_txt_appends_extension_does_not_replace() {
   let _ = fs::remove_file(&appended);
 }
 
-// ---------- Finding 1 regression: empty `words` list is python-falsy ----------
+// ---------- regression: empty `words` list is python-falsy --------------------
 
 #[test]
 fn save_as_json_omits_empty_words_field() {
@@ -349,7 +349,7 @@ fn save_as_json_emits_words_when_non_empty() {
   let _ = fs::remove_file(&json_path);
 }
 
-// ---------- Finding 2 regression: `Path::new("-")` → stdout, NOT a file ----------
+// ---------- regression: `Path::new("-")` → stdout, NOT a file --------------------
 
 /// Stdout-passthrough fixture used by all four `save_as_*_writes_to_stdout`
 /// regression tests below.

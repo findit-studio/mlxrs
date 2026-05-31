@@ -38,11 +38,10 @@ use crate::{
 /// ([sts-utils.py:13-26][sts-utils-remap]) — `(alias,
 /// canonical_module_name)` pairs.
 ///
-/// **Reference-only**: per the [no per-model arch porting][noarch]
+/// **Reference-only**: per the no per-model arch porting
 /// rule, mlxrs does NOT import per-architecture crates from this table.
 ///
 /// [sts-utils-remap]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/utils.py#L13-L26
-/// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 pub const MODEL_REMAPPING: &[(&str, &str)] = &[
   ("deepfilter", "deepfilternet"),
   ("deepfilternet", "deepfilternet"),
@@ -63,7 +62,7 @@ pub const MODEL_REMAPPING: &[(&str, &str)] = &[
 /// `SAMAudio.separate(audio) -> SeparationResult` /
 /// DeepFilterNet's `enhance(audio) -> Array` shape.
 ///
-/// Per the [no per-model arch porting][noarch] rule, mlxrs ships no
+/// Per the no per-model arch porting rule, mlxrs ships no
 /// concrete STS models; this trait is the *shape* per-architecture
 /// crates (lfm_audio / sam_audio / deepfilternet / mossformer2_se /
 /// moshi) implement so a caller can hand-off any STS architecture as a
@@ -77,7 +76,6 @@ pub const MODEL_REMAPPING: &[(&str, &str)] = &[
 ///
 /// `&self` because weights are immutable after load.
 ///
-/// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 pub trait Model {
   /// Run STS inference on `audio`, returning the processed waveform.
   ///
@@ -106,7 +104,7 @@ pub trait Model {
 /// Routes through the shared
 /// [`crate::audio::load::base_load_model`] factory. The returned bundle
 /// is handed to the caller-supplied `constructor` closure — per the
-/// [no per-model arch porting][noarch] rule mlxrs does not bundle a
+/// no per-model arch porting rule mlxrs does not bundle a
 /// built-in registry / Moshi-special-case branch (the caller's
 /// closure dispatches on `bundle.config_json` if it wants per-model
 /// behavior).
@@ -122,7 +120,6 @@ pub trait Model {
 /// error → caller-defined.
 ///
 /// [sts-utils-loadmodel]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/utils.py#L112-L163
-/// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 pub fn load_model<F>(path: &str, constructor: F) -> Result<Box<dyn Model>>
 where
   F: FnOnce(LoadedAudioModel) -> Result<Box<dyn Model>>,

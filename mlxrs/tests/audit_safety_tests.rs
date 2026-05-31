@@ -99,17 +99,17 @@ mod finding_1_metal_kernel_validation {
 
 #[cfg(feature = "lm")] // needs lm::cache
 mod finding_2_quantized_cache_validation {
-  // H4 (#257) — the public `QuantizedKvCacheImpl::new(group_size, bits)`
+  // H4 (#257) — the public `StandardQuantizedKvCache::new(group_size, bits)`
   // now validates and returns `Result<Self>`. The internal placeholder
   // pattern used by `from_serialized` (where the cache is fully
   // overwritten by `set_state` + `set_meta_state` before any consumer
   // observes it) lives behind `pub(crate) fn new_unchecked(...)`, so the
   // public surface cannot reopen this gap by accident.
-  use mlxrs::{Error, lm::cache::QuantizedKvCacheImpl};
+  use mlxrs::{Error, lm::cache::StandardQuantizedKvCache};
 
   #[test]
   fn quantized_cache_rejects_zero_group_size() {
-    let err = QuantizedKvCacheImpl::new(0, 8).expect_err("group_size=0 must be rejected");
+    let err = StandardQuantizedKvCache::new(0, 8).expect_err("group_size=0 must be rejected");
     match err {
       Error::OutOfRange(p) => {
         assert!(p.context().contains("group_size"));
@@ -121,7 +121,7 @@ mod finding_2_quantized_cache_validation {
 
   #[test]
   fn quantized_cache_rejects_zero_bits() {
-    let err = QuantizedKvCacheImpl::new(64, 0).expect_err("bits=0 must be rejected");
+    let err = StandardQuantizedKvCache::new(64, 0).expect_err("bits=0 must be rejected");
     match err {
       Error::OutOfRange(p) => assert!(p.context().contains("bits")),
       other => panic!("expected OutOfRange, got {other:?}"),
@@ -130,7 +130,8 @@ mod finding_2_quantized_cache_validation {
 
   #[test]
   fn quantized_cache_rejects_negative_group_size() {
-    let err = QuantizedKvCacheImpl::new(-1, 8).expect_err("negative group_size must be rejected");
+    let err =
+      StandardQuantizedKvCache::new(-1, 8).expect_err("negative group_size must be rejected");
     match err {
       Error::OutOfRange(p) => assert!(p.context().contains("group_size")),
       other => panic!("expected OutOfRange, got {other:?}"),
@@ -142,7 +143,7 @@ mod finding_2_quantized_cache_validation {
   /// validation accepts 3 (mlx supports it) but rejects 7, 9, etc.
   #[test]
   fn quantized_cache_rejects_invalid_bits() {
-    let err = QuantizedKvCacheImpl::new(64, 7).expect_err("bits=7 must be rejected");
+    let err = StandardQuantizedKvCache::new(64, 7).expect_err("bits=7 must be rejected");
     match err {
       Error::OutOfRange(p) => assert!(p.context().contains("bits")),
       other => panic!("expected OutOfRange, got {other:?}"),
@@ -153,7 +154,7 @@ mod finding_2_quantized_cache_validation {
   #[test]
   fn quantized_cache_accepts_valid_params() {
     for &(gs, bits) in &[(64, 8), (32, 4), (128, 2), (64, 3), (64, 5), (64, 6)] {
-      QuantizedKvCacheImpl::new(gs, bits)
+      StandardQuantizedKvCache::new(gs, bits)
         .unwrap_or_else(|e| panic!("({gs}, {bits}) must be accepted, got: {e}"));
     }
   }

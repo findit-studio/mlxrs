@@ -135,7 +135,7 @@ impl RMSNorm {
 
   /// Read-only reference to the per-feature scale (`(dims,)` shape).
   ///
-  /// Named `weight_ref` per §3 (non-Copy `Array` returns `&Array`, not
+  /// Named `weight_ref` (non-Copy `Array` returns `&Array`, not
   /// `Array`; `_ref` suffix signals the borrow). Lazy — does not evaluate.
   #[inline(always)]
   pub fn weight_ref(&self) -> &Array {
@@ -212,7 +212,7 @@ impl LayerNorm {
   /// Read-only reference to the optional affine scale (`(dims,)` shape, or
   /// `None` when `affine=False`).
   ///
-  /// Named `weight_ref` per §3 (non-Copy `Array` returns `&Array`, not
+  /// Named `weight_ref` (non-Copy `Array` returns `&Array`, not
   /// `Array`; `_ref` suffix signals the borrow). Lazy — does not evaluate.
   #[inline(always)]
   pub fn weight_ref(&self) -> Option<&Array> {
@@ -222,7 +222,7 @@ impl LayerNorm {
   /// Read-only reference to the optional affine shift (`(dims,)` shape, or
   /// `None` when `bias=False`).
   ///
-  /// Named `bias_ref` per §3 (non-Copy `Array` returns `&Array`, not
+  /// Named `bias_ref` (non-Copy `Array` returns `&Array`, not
   /// `Array`; `_ref` suffix signals the borrow). Lazy — does not evaluate.
   #[inline(always)]
   pub fn bias_ref(&self) -> Option<&Array> {
@@ -796,8 +796,8 @@ fn inferred_dim(shape: &[usize], known_dims: &[i32]) -> Result<i32> {
   // boundary failure or, worse, a passing reshape with a corrupted layout.
   //
   // Build the payload at the failure site so the overflowing `acc`, the
-  // current `dim`, and its index are preserved (Codex 2026-05-27) — the
-  // previous `try_fold` returned `Option<usize>`, dropping every operand
+  // current `dim`, and its index are preserved — a plain
+  // `try_fold` returning `Option<usize>` would drop every operand
   // by the time we reached `ok_or_else`.
   let total: usize = shape
     .iter()
@@ -1186,7 +1186,7 @@ mod tests {
     assert_eq!(b.to_vec::<f32>().unwrap(), vec![0.0; 4]);
   }
 
-  // ─── GroupNorm::with_affine checkpoint-tensor regressions (Codex review) ───
+  // ─── GroupNorm::with_affine checkpoint-tensor regressions ───
 
   /// `with_affine` installs a checkpoint's LEARNED (non-identity)
   /// `(weight, bias)` — the gap `new`'s `affine: bool` couldn't fill
@@ -1353,7 +1353,7 @@ mod tests {
     ));
   }
 
-  // ─── GroupNorm shape-invariant regressions (Codex review) ───
+  // ─── GroupNorm shape-invariant regressions ───
 
   /// Rank-1 `[C]` with `num_groups=1` used to silently corrupt
   /// activations (passed as `[C, 1, 1]` and normalized singleton groups
@@ -1455,7 +1455,7 @@ mod tests {
     assert!(v.iter().all(|x| x.is_finite()));
   }
 
-  // ─── GroupNorm constructor validation regressions (Codex R2) ───
+  // ─── GroupNorm constructor validation regressions ───
 
   /// Constructor must reject negative `dims` on BOTH affine paths.
   /// Previously only the `affine=true` branch ran `usize::try_from`; the
@@ -1588,7 +1588,7 @@ mod tests {
     );
   }
 
-  // ─── GroupNorm field-visibility regressions (Codex R3) ───
+  // ─── GroupNorm field-visibility regressions ───
 
   /// `num_groups` and `dims` are PRIVATE fields with read-only public
   /// accessors. This test demonstrates the accessors return the
@@ -1610,7 +1610,7 @@ mod tests {
     // guarantee is what the regression turns on, not a runtime check.
   }
 
-  // ─── inferred_dim overflow regression (Codex review) ───
+  // ─── inferred_dim overflow regression ───
 
   /// `inferred_dim` used to compute `total = shape.iter().product()`
   /// unchecked, so a shape whose `usize` product wraps would yield the

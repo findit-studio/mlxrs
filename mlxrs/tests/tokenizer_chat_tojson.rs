@@ -2,7 +2,7 @@
 //! `_compile_jinja_template` override —
 //! `json.dumps(x, ensure_ascii=False, indent=indent)`.
 //!
-//! Codex round-4 F3: the previous one-arg `serde_json::to_string` closure
+//! The previous one-arg `serde_json::to_string` closure
 //! (a) rejected the `indent` kwarg HF tool-schema templates use
 //! (`{{ tools | tojson(indent=4) }}`) and (b) emitted serde_json's compact
 //! `,`/`:` separators instead of Python's `, `/`: `, and would HTML-escape
@@ -90,7 +90,7 @@ fn tojson_positional_indent_arg() {
 
 #[test]
 fn tojson_bool_indent_matches_python_bool_as_int() {
-  // Codex round-10: Python `bool` is a subclass of `int`, so HF's
+  // Python `bool` is a subclass of `int`, so HF's
   // `json.dumps(x, ensure_ascii=False, indent=<bool>)` treats `False` ≡ 0
   // and `True` ≡ 1 (both NOT None → indented path). Expected bytes captured
   // from CPython: json.dumps(v, ensure_ascii=False, indent=False|True).
@@ -121,7 +121,7 @@ fn tojson_bool_indent_matches_python_bool_as_int() {
 
 #[test]
 fn tojson_string_indent_matches_python_json_dumps() {
-  // Codex round-11: Python `json.dumps` accepts a STRING `indent`, used
+  // Python `json.dumps` accepts a STRING `indent`, used
   // verbatim as the per-level indent. Transformers forwards it directly.
   // Expected bytes captured from CPython
   // json.dumps(v, ensure_ascii=False, indent="<s>").
@@ -150,7 +150,7 @@ fn tojson_string_indent_matches_python_json_dumps() {
 
 #[test]
 fn tojson_enormous_integer_indent_errors_not_aborts() {
-  // Codex round-13: a model-controlled (untrusted) chat_template calling
+  // A model-controlled (untrusted) chat_template calling
   // `tojson(indent=<huge int>)` must NOT trigger an unbounded allocation /
   // process abort. `render_jinja` must return a recoverable Err instead.
   let tools = json!([1]);

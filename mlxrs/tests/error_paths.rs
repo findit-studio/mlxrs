@@ -42,15 +42,15 @@ fn each_thread_has_independent_error_slot() {
 
 #[test]
 fn to_vec_rejects_non_contiguous_view() {
-  // Regression test for the UB pathway Codex flagged: a strided view has the
+  // Regression test for the UB pathway: a strided view has the
   // same `mlx_array_size` as its source but reordered strides, so
   // `from_raw_parts(ptr, size)` reads in the wrong layout (and for broadcast
   // views, can read past the allocation entirely). The contiguity guard must
   // convert this into Err(NonContiguous).
   //
   // We construct the view via FFI + from_raw because the safe wrapper doesn't
-  // expose transpose/broadcast yet (Phase 4). Going through from_raw is also
-  // the exact pathway Codex identified as reachable from safe code.
+  // expose transpose/broadcast yet. Going through from_raw is also
+  // the exact pathway reachable from safe code.
   use mlxrs_sys::{mlx_array, mlx_array_new, mlx_default_gpu_stream_new, mlx_transpose};
 
   let src = mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
@@ -168,7 +168,7 @@ fn slice_rejects_len_ne_ndim() {
   // so the safe-FFI boundary is closed without rejecting 0-D-scalar slicing.)
   let a = mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
   let r = mlxrs::ops::indexing::slice(&a, &[], &[], &[]);
-  // §5 typed: `slice` returns `LengthMismatch` when start/stop/strides
+  // Typed: `slice` returns `LengthMismatch` when start/stop/strides
   // agree with each other (empty here) but disagree with `a.ndim()`.
   assert!(
     matches!(
@@ -187,7 +187,7 @@ fn slice_rejects_mismatched_lengths() {
   // start/stop/strides must agree on length (one entry per axis).
   let a = mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
   let r = mlxrs::ops::indexing::slice(&a, &[0, 0], &[1], &[1, 1]);
-  // §5 typed: when start/stop/strides disagree with each other (not just
+  // Typed: when start/stop/strides disagree with each other (not just
   // with ndim), `slice` returns `MultiLengthMismatch` with named lengths.
   assert!(
     matches!(
@@ -203,7 +203,7 @@ fn slice_rejects_mismatched_lengths() {
 fn slice_accepts_empty_for_zero_dim_scalar() {
   // 0-D scalar input → all three slice arrays must be empty (one entry per
   // axis = zero entries). Empty inputs route through dim_ptr's sentinel,
-  // not rejected. Copilot PR #5 finding.
+  // not rejected.
   let empty: [i32; 0] = [];
   let a = mlxrs::Array::from_slice::<f32>(&[42.0], &empty).unwrap();
   assert_eq!(a.ndim(), 0);
@@ -216,7 +216,6 @@ fn slice_accepts_empty_for_zero_dim_scalar() {
 fn sum_axes_empty_returns_clone() {
   // Empty axes = sum over no axes = identity (numpy/mlx semantics). Must
   // short-circuit to clone instead of crossing FFI with a dangling pointer.
-  // Codex PR #5 finding 2.
   let mut a = mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
   let mut r = mlxrs::ops::reduction::sum_axes(&a, &[], false).unwrap();
   assert_eq!(r.shape(), a.shape());
@@ -230,7 +229,7 @@ fn sum_axes_empty_returns_clone() {
 #[test]
 fn concatenate_rejects_empty_input() {
   // Concatenating zero arrays has no defined result; must reject before FFI.
-  // Codex PR #5 finding 3 / dangling-pointer concern for empty Vec::as_ptr().
+  // Dangling-pointer concern for empty Vec::as_ptr().
   let r = mlxrs::ops::shape::concatenate(&[], 0);
   assert!(
     matches!(r, Err(mlxrs::Error::EmptyInput(_))),
@@ -242,7 +241,7 @@ fn concatenate_rejects_empty_input() {
 fn from_slice_zero_element_uses_sentinel() {
   // Zero-element arrays are valid in numpy/mlx. The dangling-pointer concern
   // for Rust's `<&[T]>::as_ptr()` on an empty slice still needs a sentinel —
-  // this exercises the data_ptr helper. Codex PR #5 round-2 finding.
+  // this exercises the data_ptr helper.
   let mut a = mlxrs::Array::from_slice::<f32>(&[], &[0i32]).unwrap();
   assert_eq!(a.shape(), vec![0]);
   assert_eq!(a.size(), 0);
@@ -256,8 +255,8 @@ fn from_slice_zero_element_uses_sentinel() {
 
 #[test]
 fn from_slice_zero_element_all_element_types() {
-  // Every Element impl provides its own typed sentinel (Codex PR #5 round-3
-  // finding). Verify each compiles + constructs without UB.
+  // Every Element impl provides its own typed sentinel. Verify each
+  // compiles + constructs without UB.
   let mut b = mlxrs::Array::from_slice::<bool>(&[], &[0i32]).unwrap();
   assert_eq!(b.shape(), vec![0]);
   assert_eq!(b.to_vec::<bool>().unwrap(), Vec::<bool>::new());

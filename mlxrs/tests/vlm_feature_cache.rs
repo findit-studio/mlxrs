@@ -193,13 +193,13 @@ fn from_sources_is_stable_and_order_sensitive() {
   assert_eq!(Key::from_sources(&[]), Key::from_sources(&[]));
 }
 
-/// **Codex review — key encoding must not alias distinct image identities.**
+/// **Key encoding must not alias distinct image identities.**
 ///
-/// The previous encoding shared one raw-string namespace across all three
-/// constructors, so distinct image identities could collide and a cache hit
-/// would return a *different* image's features. The fix is a namespaced
-/// (`s:` / `l:` / `b:` variant tag) + length-prefixed encoding. This test
-/// pins every non-aliasing guarantee.
+/// A single raw-string namespace shared across all three constructors would
+/// let distinct image identities collide, so a cache hit could return a
+/// *different* image's features. The namespaced (`s:` / `l:` / `b:` variant
+/// tag) + length-prefixed encoding prevents that. This test pins every
+/// non-aliasing guarantee.
 #[test]
 fn key_encoding_non_aliasing() {
   // ── cross-variant: `from_source` vs `from_sources` ──
@@ -302,7 +302,8 @@ fn key_encoding_non_aliasing() {
 fn cache_does_not_serve_aliased_keys() {
   let mut cache = VisionFeatureCache::with_max_size(8).unwrap();
 
-  // Store under a `from_source` key that, pre-fix, aliased a list key.
+  // Store under a `from_source` key that a naive encoding would alias to a
+  // list key.
   cache
     .put(Key::from_source("a|b"), &features(10, 64, 1.0))
     .unwrap();
@@ -612,16 +613,16 @@ fn zero_max_size_is_rejected() {
 
 /// A pathological `max_size` (here `usize::MAX`) must construct cheaply.
 ///
-/// CHANGED (Codex review): the constructor no longer pre-reserves the raw
-/// `max_size`, so it allocates nothing proportional to it — the LRU eviction
-/// self-bounds live entries to `max_size`, making the upfront reserve
-/// unnecessary. Before this change the constructor `try_reserve`d `max_size`
-/// slots, so `usize::MAX` overflowed the `capacity * size_of` computation and
-/// returned `Err(OutOfMemory)`. With empty-init nothing is reserved, so
-/// `usize::MAX` is just a (huge) eviction bound and construction succeeds
-/// *without* allocating — the abort/DoS class is gone because nothing is
-/// pre-allocated. (The zero-capacity `InvariantViolation` guard still runs
-/// first; `usize::MAX` is non-zero, so it passes the guard and constructs `Ok`.)
+/// The constructor does not pre-reserve the raw `max_size`, so it allocates
+/// nothing proportional to it — the LRU eviction self-bounds live entries to
+/// `max_size`, making an upfront reserve unnecessary. A constructor that
+/// `try_reserve`d `max_size` slots would overflow the `capacity * size_of`
+/// computation for `usize::MAX` and return `Err(OutOfMemory)`. With
+/// empty-init nothing is reserved, so `usize::MAX` is just a (huge) eviction
+/// bound and construction succeeds *without* allocating — the abort/DoS class
+/// is gone because nothing is pre-allocated. (The zero-capacity
+/// `InvariantViolation` guard still runs first; `usize::MAX` is non-zero, so
+/// it passes the guard and constructs `Ok`.)
 #[test]
 fn with_max_size_pathological_capacity_is_cheap_not_abort() {
   let cache = VisionFeatureCache::with_max_size(usize::MAX)
@@ -637,16 +638,16 @@ fn with_max_size_pathological_capacity_is_cheap_not_abort() {
 }
 
 /// A large-but-allocatable `max_size` must NOT eagerly allocate memory
-/// proportional to it (Codex review — DoS-on-success guard).
+/// proportional to it (DoS-on-success guard).
 ///
 /// `1 << 40` (~1 trillion) is allocatable as a *number* but reserving that
 /// many HashMap/VecDeque slots would consume terabytes — the exact
-/// "converted from abort to memory-exhaustion-on-success" hazard the
-/// empty-init fix removes. With empty-init the constructor reserves nothing,
-/// so this returns `Ok` immediately and cheaply: an empty cache whose
-/// `max_size` is the requested value, ready to grow lazily (bounded by LRU
-/// eviction) only as real entries arrive. Pre-fix this line would either
-/// OOM-abort or consume gigabytes before returning.
+/// abort-or-memory-exhaustion-on-success hazard empty-init avoids. With
+/// empty-init the constructor reserves nothing, so this returns `Ok`
+/// immediately and cheaply: an empty cache whose `max_size` is the requested
+/// value, ready to grow lazily (bounded by LRU eviction) only as real entries
+/// arrive. A pre-reserving constructor would either OOM-abort or consume
+/// gigabytes before returning.
 #[test]
 fn with_max_size_large_value_does_not_eagerly_allocate() {
   let big = 1usize << 40;

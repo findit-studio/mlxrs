@@ -667,9 +667,8 @@ fn batch_from_state_rank_invalid_values_is_err_not_panic() {
 /// fail AFTER the `keys` roll. The recoverable `Err` must leave
 /// keys/values/offset/left_padding/right_padding EXACTLY unchanged (no
 /// keys-rolled-but-values-not desync, retry-safe) — the class-wide
-/// stage-then-commit contract. (Covers the round-3 review's recommended
-/// regression for both `BatchKvCache::finalize` and the
-/// `BatchRotatingKvCache` `_lengths`/finalize path.)
+/// stage-then-commit contract. Covers both `BatchKvCache::finalize` and the
+/// `BatchRotatingKvCache` `_lengths`/finalize path.
 #[test]
 fn batch_finalize_batch_mismatch_err_leaves_state_unchanged() {
   // B=2 keys, B=3 values, both 4-D (rank passes; B differs).
@@ -817,10 +816,10 @@ fn batch_update_kv_shape_mismatch_is_err_not_desync() {
 /// `meta_state`-injected `_idx` is impossible (`usize::MAX`, or simply
 /// `> keys.shape[-2]`) is rejected by `from_state`'s STRUCTURAL
 /// consistency guard at the single restore chokepoint — it never reaches
-/// a downstream op to overflow / lossily-cast / mis-splice. (Closes the
-/// whole corrupt-restored-`_idx` class — the round-6/7/8 symptoms —
-/// structurally rather than per-op. The in-op `checked_add`s remain a
-/// second defense layer for any non-`from_state` path.)
+/// a downstream op to overflow / lossily-cast / mis-splice. Closes the
+/// whole corrupt-restored-`_idx` class structurally rather than per-op. The
+/// in-op `checked_add`s remain a second defense layer for any
+/// non-`from_state` path.
 #[test]
 fn batch_rotating_idx_overflow_is_rejected_not_panic() {
   let p = kvb(&[&[0.0, 1.0, 2.0], &[10.0, 11.0, 12.0]]);
@@ -845,7 +844,7 @@ fn batch_rotating_idx_overflow_is_rejected_not_panic() {
   );
 
   // A merely out-of-range (non-overflowing) _idx is ALSO rejected: seed
-  // length 3, claim _idx=5 (> 3). This is the round-8 mis-splice vector
+  // length 3, claim _idx=5 (> 3). This is the mis-splice vector
   // — caught at the boundary, never reaching `set_seq`.
   let mut s2 = BatchRotatingKvCache::new(8, &[0, 0]);
   s2.update(&p, &p).unwrap();
@@ -911,7 +910,7 @@ fn batch_rotating_idx_overflow_is_rejected_not_panic() {
   assert!(ok.update(&d2, &d2).is_ok());
 }
 
-/// Regression (Copilot review 4324738927 — Fix A): `BatchKvCache::set_state(Vec::new())`
+/// Regression: `BatchKvCache::set_state(Vec::new())`
 /// must clear ALL per-seq runtime state, not just `keys`/`values` + `_idx`.
 /// Otherwise `offset` (per-seq `[B]` = current RoPE positions) and
 /// `right_padding` (pending finalize) carry stale metadata into a logically
@@ -943,7 +942,7 @@ fn batch_kv_set_state_empty_resets_offset_and_padding() {
   assert_eq!(after, vec![-1, -3, 0], "offset reset to -left_padding");
 }
 
-/// Regression (Copilot review 4324738927 — Fix B): `BatchRotatingKvCache::set_state(
+/// Regression: `BatchRotatingKvCache::set_state(
 /// Vec::new())` analogous — must clear ALL per-seq runtime state
 /// (offset, idx, off, rotated, lengths), preserving `left_padding`/`max_size`
 /// (constructor inputs).
@@ -979,8 +978,8 @@ fn batch_rotating_set_state_empty_resets_all_metadata() {
   // (c) Per-seq `offset` is reset to `-self.left_padding` semantically. We
   // verify by comparing to a freshly-constructed reference cache from the
   // CURRENT `self.left_padding` (read via the public accessor), which is
-  // exactly what the fix's `ops::negative(&self.left_padding)` does.
-  // Build the reference offset the same way Fix B does internally, via the
+  // exactly what `ops::negative(&self.left_padding)` does on reset.
+  // Build the reference offset the same way the reset does internally, via the
   // public observable: take `c`'s current `batch_offset` snapshot AFTER
   // reset and verify it matches a fresh cache's `batch_offset` (using the
   // same current `left_padding`). Functionally, the assertion below is:
@@ -1002,7 +1001,7 @@ fn batch_rotating_set_state_empty_resets_all_metadata() {
   );
 }
 
-/// Regression (Copilot review 4324738927 — Fix C): `dynamic_roll` builds
+/// Regression: `dynamic_roll` builds
 /// roll indices via `Array::arange(0.0, n as f32, 1.0)` + cast to I32.
 /// For `n > 2^24`, consecutive integers alias in f32 → wrong roll indices
 /// silently. Same aliasing class `mask::iarange` already guards against.
@@ -1044,10 +1043,10 @@ fn dynamic_roll_rejects_n_above_f32_exact_int_max() {
   );
 }
 
-/// Regression (Codex 2026-05-27 R3): `dynamic_roll` must surface a
+/// Regression: `dynamic_roll` must surface a
 /// rank-1 (or rank-3, etc.) `shifts` as `Error::RankMismatch`, not
 /// `Error::ShapePairMismatch` — `ShapePairMismatchPayload` is documented
-/// for same-rank shape disagreement. Mirrors the C R1 `norm.rs` and C R2
+/// for same-rank shape disagreement. Mirrors the `norm.rs` and
 /// `switch.rs` rank-first-then-shape splits.
 #[test]
 fn dynamic_roll_rejects_rank_mismatch_shifts() {
@@ -1088,7 +1087,7 @@ fn dynamic_roll_rejects_rank_mismatch_shifts() {
   // Same-rank `[B', 1]` with wrong B' (neither equal to B=2 nor 1 — i.e.
   // truly non-broadcastable) must still surface as ShapePairMismatch
   // (proves the split preserved the shape-disagreement path now that rank
-  // is known to be 2). Use B'=3 (Codex 2026-05-27 R4): B'=1 is now a VALID
+  // is known to be 2). Use B'=3: B'=1 is now a VALID
   // scalar-broadcast shape after the broadcast-contract preservation fix
   // (`BatchKvCache::finalize` arms length-1 `right_padding` → `[1, 1]`
   // `pad_col`); only neither-B-nor-1 truly Errs.
@@ -1114,13 +1113,13 @@ fn dynamic_roll_rejects_rank_mismatch_shifts() {
   }
 }
 
-/// Regression (Codex 2026-05-27 R4): `dynamic_roll` MUST accept a
+/// `dynamic_roll` MUST accept a
 /// `[1, 1]` (scalar broadcast) `shifts` against an `x` with `B > 1` —
 /// this is the contract `BatchKvCache::finalize` relies on when a
 /// length-1 `right_padding` is armed via `prepare_right_padding(&[k])`
 /// (the `expand_dims_axes(padding, &[1])` produces a `[1, 1]` `pad_col`
 /// which broadcasts across the `[B, n_kv_heads, S, head_dim]` buffer).
-/// Pins the broadcast contract that the C R4 rank-first-then-shape
+/// Pins the broadcast contract that the rank-first-then-shape
 /// split previously regressed by adding a tightening `sshape[0] ==
 /// xshape[0]` check that rejected scalar broadcast as `[B, 1] vs [1, 1]`
 /// before `BatchKvCache::finalize` could commit.
@@ -1161,8 +1160,7 @@ fn dynamic_roll_accepts_scalar_broadcast_shifts() {
   );
 }
 
-/// Regression (Copilot review #3271119609 / #3271308786 / #3271308805):
-/// the BatchRotating-restore structural validator's error message must
+/// The BatchRotating-restore structural validator's error message must
 /// include the offending values so a corrupt prompt-cache is diagnosable
 /// from the error alone. Test each of the 5 invariant-violation branches
 /// (1 empty + 4 non-empty: `_idx > L`, `rotated && L != max_size`,
@@ -1293,7 +1291,7 @@ fn batch_rotating_from_state_error_message_names_violated_invariant() {
   );
 }
 
-/// Regression (Copilot review #3271119572 / #3271119588): `dynamic_roll`
+/// Regression: `dynamic_roll`
 /// with `n == 0` (empty seq axis) would compute `remainder(idx, 0)` (a
 /// divide-by-zero) under the unguarded path. The early-`n == 0` clone
 /// return must surface as a pure no-op without ever evaluating the
@@ -1310,7 +1308,7 @@ fn dynamic_roll_n_zero_is_noop_clone() {
   assert_eq!(rolled.shape(), &[1, 1, 0, 1]);
 }
 
-/// Regression (Codex review on c189169 — `update_concat` stale `rotated`):
+/// Regression (`update_concat` stale `rotated`):
 /// after a mixed sequence (prefill → S==1 decodes that wrap the ring →
 /// S>1 update that temporal-orders), `update_concat`'s commit MUST clear
 /// `self.rotated` — otherwise `meta_state()` reports `rotated=true` while
@@ -1354,7 +1352,7 @@ fn batch_rotating_update_concat_clears_rotated_after_mixed_path() {
 
 #[test]
 fn batch_kv_pad_lengths_constructor_is_borrowed_slice() {
-  // KVC-4 (#101): `pad_lengths()` returns the constructor-supplied slice
+  // #101: `pad_lengths()` returns the constructor-supplied slice
   // as a borrowed `&[i32]` — no per-call `.item()` round-trip (mlx-lm's
   // `int(self.left_padding[i].item())` cache.py:947-955). Mirrors
   // `ArraysCache::left_padding` for cross-cache consistency.
@@ -1368,7 +1366,7 @@ fn batch_kv_pad_lengths_constructor_is_borrowed_slice() {
 
 #[test]
 fn batch_kv_pad_lengths_updates_after_set_state() {
-  // KVC-4 (#101): `set_state` materializes the restored `left_padding`
+  // #101: `set_state` materializes the restored `left_padding`
   // host mirror ONCE — subsequent `pad_lengths()` reads are zero-cost
   // borrows. Restore via the same Array round-trip a prompt cache load
   // would use, then verify the host mirror matches the restored values.
@@ -1390,7 +1388,7 @@ fn batch_kv_pad_lengths_updates_after_set_state() {
 
 #[test]
 fn batch_kv_pad_lengths_updates_after_finalize() {
-  // KVC-4 (#101): `finalize` applies `left_padding += right_padding`
+  // #101: `finalize` applies `left_padding += right_padding`
   // (cache.py:980-987). The host mirror must update in lockstep — using
   // the cached `right_padding_host` values from `prepare_right_padding`,
   // NOT a fresh eval of the Array form.
@@ -1411,7 +1409,7 @@ fn batch_kv_pad_lengths_updates_after_finalize() {
 
 #[test]
 fn batch_rotating_pad_lengths_constructor_and_set_state() {
-  // KVC-4 (#101): same accessor exists on `BatchRotatingKvCache` for
+  // #101: same accessor exists on `BatchRotatingKvCache` for
   // cross-cache consistency. Constructor + set_state both maintain the
   // host mirror.
   let lp = [2i32, 0];
@@ -1431,7 +1429,7 @@ fn batch_rotating_pad_lengths_constructor_and_set_state() {
 
 #[test]
 fn batch_rotating_rotated_flag_observable_through_meta_state() {
-  // KVC-5 (#102): the `rotated` flag MUST be the last mutation in the
+  // #102: the `rotated` flag MUST be the last mutation in the
   // commit tail of `update_in_place` / `update_concat` (mirrors swift's
   // late `self.rotated = false` at KVCache.swift:1330-1370). With every
   // post-`?` step infallible, an Ok-return is always coherent and an
@@ -1472,9 +1470,9 @@ fn batch_rotating_rotated_flag_observable_through_meta_state() {
   assert_eq!(restored.offset(), c.offset());
 }
 
-// ── Codex-R1 follow-ups ──────────────────────────────────────────────────
+// ── pad_lengths host-mirror propagation ──────────────────────────────────
 
-/// Codex-R1 [high] #2: `BatchKvCache::finalize` previously committed the
+/// `BatchKvCache::finalize` previously committed the
 /// new `left_padding`/`right_padding=None` even when
 /// `right_padding_host.len() != self.pad_lengths.len()`, leaving the
 /// public `pad_lengths()` slice permanently stale. Fix: explicit
@@ -1492,7 +1490,7 @@ fn batch_rotating_rotated_flag_observable_through_meta_state() {
 ///     `[2] + [3]` (no MLX broadcast rule for `[B] op [B']`, B != B'
 ///     != 1), so the same Err is reached structurally.
 #[test]
-fn kvc4_batch_kv_finalize_with_scalar_right_padding_broadcasts_or_errs() {
+fn batch_kv_finalize_with_scalar_right_padding_broadcasts_or_errs() {
   // Case 1: scalar broadcast — right_padding is length-1, pad_lengths is
   // length-2. The Array op broadcasts `[2] + [1] -> [2]`; the host
   // mirror MUST broadcast in lockstep, NOT silently skip the update.
@@ -1538,7 +1536,7 @@ fn kvc4_batch_kv_finalize_with_scalar_right_padding_broadcasts_or_errs() {
   );
 }
 
-/// Codex-R1 [medium] #3: `BatchKvCache::set_state` previously swallowed
+/// `BatchKvCache::set_state` previously swallowed
 /// `to_vec::<i32>` failures (non-I32, non-contiguous, etc.) via
 /// `unwrap_or_else(|_| self.pad_lengths.clone())` and then committed the
 /// new `left_padding` Array — leaving `pad_lengths()` permanently
@@ -1551,7 +1549,7 @@ fn kvc4_batch_kv_finalize_with_scalar_right_padding_broadcasts_or_errs() {
 /// (including the placeholder `left_padding` Array and the empty
 /// `pad_lengths`) MUST remain unchanged.
 #[test]
-fn kvc4_batch_kv_set_state_propagates_to_vec_failure() {
+fn batch_kv_set_state_propagates_to_vec_failure() {
   // Construct a `BatchKvCache` with a known initial `left_padding` so we
   // can verify it's left untouched on Err.
   let mut c = BatchKvCache::new(&[1i32, 2]);
@@ -1618,11 +1616,11 @@ fn kvc4_batch_kv_set_state_propagates_to_vec_failure() {
   );
 }
 
-/// Codex-R1 [medium] #3 sibling: same `to_vec` propagation fix for
+/// Sibling: same `to_vec` propagation fix for
 /// `BatchRotatingKvCache::set_state`. Same failure classes (non-I32,
 /// wrong-rank, length-mismatch) MUST Err with no partial mutation.
 #[test]
-fn kvc4_batch_rotating_set_state_propagates_to_vec_failure() {
+fn batch_rotating_set_state_propagates_to_vec_failure() {
   let mut c = BatchRotatingKvCache::new(4, &[1i32, 2]);
   let pl_before: Vec<i32> = c.pad_lengths().to_vec();
   let lp_before = iv(&c.left_padding_arr().unwrap());
@@ -1673,14 +1671,14 @@ fn kvc4_batch_rotating_set_state_propagates_to_vec_failure() {
   assert_eq!(c.pad_lengths(), &[3, 4]);
 }
 
-// ── Codex-R2 follow-ups ──────────────────────────────────────────────────
+// ── strict to_vec propagation in dirty-left_padding paths ────────────────
 
-/// Codex-R2 [medium]: `BatchRotatingKvCache::finalize` previously
+/// `BatchRotatingKvCache::finalize` previously
 /// swallowed `to_vec::<i32>` failures on the freshly-rolled
 /// `new_left_padding` via `unwrap_or_else(|_| self.pad_lengths.clone())`
 /// and then committed the new Array anyway — leaving `pad_lengths()`
 /// permanently desynchronized from the rolled Array state. Same class
-/// as R1 #3 (`BatchKvCache::set_state`); fix is to propagate the
+/// as the `BatchKvCache::set_state` case; fix is to propagate the
 /// extraction failure via `?` BEFORE the infallible commit tail so any
 /// `to_vec` error leaves keys/values/offset/left_padding/_lengths
 /// fully untouched.
@@ -1694,7 +1692,7 @@ fn kvc4_batch_rotating_set_state_propagates_to_vec_failure() {
 /// positive-path tests already covering finalize/concat/in-place, this
 /// pins the strict propagation discipline against future regressions.
 #[test]
-fn kvc4_batch_rotating_finalize_propagates_to_vec_failure() {
+fn batch_rotating_finalize_propagates_to_vec_failure() {
   let src = std::fs::read_to_string(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/lm/cache/batch_rotating.rs"
@@ -1703,27 +1701,25 @@ fn kvc4_batch_rotating_finalize_propagates_to_vec_failure() {
   assert!(
     !src.contains("to_vec::<i32>()\n        .unwrap_or_else"),
     "BatchRotatingKvCache must not swallow `to_vec::<i32>` failures via \
-     `unwrap_or_else(|_| self.pad_lengths.clone())` — Codex-R2 [medium] \
-     regression: such a fallback commits a stale `pad_lengths` host mirror \
-     against a freshly-rolled `left_padding` Array. Use `?` propagation \
-     BEFORE the infallible commit tail."
+     `unwrap_or_else(|_| self.pad_lengths.clone())`: such a fallback commits a \
+     stale `pad_lengths` host mirror against a freshly-rolled `left_padding` \
+     Array. Use `?` propagation BEFORE the infallible commit tail."
   );
   // Also assert no chained-form variant slipped in.
   assert!(
     !src.contains("to_vec::<i32>().unwrap_or_else"),
-    "BatchRotatingKvCache must not use any chained `to_vec::<i32>().unwrap_or_else` \
-     — Codex-R2 [medium] regression"
+    "BatchRotatingKvCache must not use any chained `to_vec::<i32>().unwrap_or_else`"
   );
 }
 
-/// Codex-R2 [medium] sibling: `update_concat` (the `S > 1` path) had
+/// Sibling: `update_concat` (the `S > 1` path) had
 /// the same swallowed-`to_vec` fallback on its `lp_dirty` branch. Same
 /// structural regression guard — the runtime `to_vec` failure is
 /// unreachable through the public API (Array is constructed from
 /// successful arithmetic ops), so the regression pin is the absence of
 /// the `unwrap_or_else` pattern in source.
 #[test]
-fn kvc4_batch_rotating_update_concat_propagates_to_vec_failure() {
+fn batch_rotating_update_concat_propagates_to_vec_failure() {
   let src = std::fs::read_to_string(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/lm/cache/batch_rotating.rs"
@@ -1731,17 +1727,17 @@ fn kvc4_batch_rotating_update_concat_propagates_to_vec_failure() {
   .expect("batch_rotating.rs must be readable for structural regression check");
   // Count `to_vec::<i32>()?` occurrences — finalize + update_concat +
   // update_in_place + set_state = 4 strict-propagation sites total
-  // (3 dirty paths + 1 set_state from R1).
+  // (3 dirty paths + 1 set_state).
   let strict_count = src.matches("to_vec::<i32>()?").count();
   assert!(
     strict_count >= 4,
     "Expected ≥4 strict `to_vec::<i32>()?` sites in batch_rotating.rs \
      (finalize + update_concat + update_in_place + set_state) — found {strict_count}. \
-     Codex-R2 [medium] requires the dirty-left_padding paths use `?` propagation."
+     The dirty-left_padding paths must use `?` propagation."
   );
 }
 
-/// Codex-R2 [medium] sibling: `update_in_place` (the `S == 1` decode
+/// Sibling: `update_in_place` (the `S == 1` decode
 /// path) had the same swallowed-`to_vec` fallback on its `lp_dirty`
 /// branch (trim and/or rotate dirty case). Structural guard, same
 /// rationale as the finalize/update_concat siblings.
@@ -1752,7 +1748,7 @@ fn kvc4_batch_rotating_update_concat_propagates_to_vec_failure() {
 /// this test pins the absence of the swallowing fallback so a future
 /// edit cannot silently reintroduce the desync.
 #[test]
-fn kvc4_batch_rotating_update_in_place_propagates_to_vec_failure() {
+fn batch_rotating_update_in_place_propagates_to_vec_failure() {
   let src = std::fs::read_to_string(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/lm/cache/batch_rotating.rs"
@@ -1768,7 +1764,7 @@ fn kvc4_batch_rotating_update_in_place_propagates_to_vec_failure() {
   assert!(
     !src.contains(".unwrap_or_else(|_| self.pad_lengths.clone())"),
     "BatchRotatingKvCache must not swallow extraction failures with \
-     `unwrap_or_else(|_| self.pad_lengths.clone())` — Codex-R2 [medium] \
-     regression in any of finalize / update_concat / update_in_place."
+     `unwrap_or_else(|_| self.pad_lengths.clone())` in any of \
+     finalize / update_concat / update_in_place."
   );
 }

@@ -97,20 +97,19 @@
 //!   `try_lock` + chunking pattern stays within the existing
 //!   surface).
 //!
-//! ## Scope cuts (explicit, A11)
+//! ## Scope cuts (explicit)
 //!
-//! The Swift `AudioPlayer` exposes a few capabilities A11 deliberately
-//! does NOT port; each is a separate follow-up issue per the
-//! `[[feedback_match_official_binding_design]]` rule:
+//! The Swift `AudioPlayer` exposes a few capabilities this player
+//! deliberately does NOT port; each is a separate follow-up issue:
 //!
-//! - **Audio input / recording.** A11 is playback-only.
+//! - **Audio input / recording.** This player is playback-only.
 //!   `AVAudioPlayer` / `AVAudioPlayerDelegate` are not mirrored.
-//! - **File I/O (`loadAudio(from: URL)`).** A11 plays raw PCM. WAV /
-//!   MP3 / FLAC loading already lives in [`crate::audio::io`]; a
+//! - **File I/O (`loadAudio(from: URL)`).** This player plays raw PCM.
+//!   WAV / MP3 / FLAC loading already lives in [`crate::audio::io`]; a
 //!   caller that wants to play a file decodes there and pipes the
 //!   resulting samples through [`AudioPlayer::write_samples`].
-//! - **Format conversion (`PCMStreamConverter`).** A11 expects the
-//!   caller to supply samples at the configured
+//! - **Format conversion (`PCMStreamConverter`).** This player expects
+//!   the caller to supply samples at the configured
 //!   [`super::config::PlaybackConfig::sample_rate`] /
 //!   [`super::config::PlaybackConfig::channels`]. Resampling +
 //!   format-conversion is a separate concern (already partially
@@ -118,8 +117,8 @@
 //!   covered by a future polyphase resampler follow-up).
 //! - **Crossfade / fade-in (`scheduleAudioChunk(_:withCrossfade:)`'s
 //!   `withCrossfade: true` branch).** Crossfade is an
-//!   application-level concern; A11 plays exactly the samples the
-//!   caller pushes. A future helper module can wrap `AudioPlayer`
+//!   application-level concern; this player plays exactly the samples
+//!   the caller pushes. A future helper module can wrap `AudioPlayer`
 //!   with a fade-in/crossfade transform without touching the
 //!   playback core.
 //! - **Per-buffer completion callbacks.** Swift schedules each
@@ -235,7 +234,7 @@ struct SharedState {
   /// samples; the cap is enforced in [`AudioPlayer::write_samples`].
   ///
   /// `Mutex` (not `parking_lot::Mutex`, not lock-free `ringbuf`) is
-  /// chosen for A11 because:
+  /// chosen here because:
   /// - cpal's audio thread takes the lock for a single
   ///   `pop_front`-loop per callback (microseconds at typical 64-1024
   ///   frame callback buffers),
@@ -361,8 +360,8 @@ impl SharedState {
 ///
 /// See the module-level docs for the cpal-callback + buffer-queue
 /// plumbing diagram and the explicit list of Swift-side capabilities
-/// A11 scopes out (input, file I/O, format conversion, crossfade,
-/// per-buffer completions, `@Published` properties).
+/// this player scopes out (input, file I/O, format conversion,
+/// crossfade, per-buffer completions, `@Published` properties).
 pub struct AudioPlayer {
   /// The cpal output stream. `None` only between
   /// [`AudioPlayer::stop`] + `Drop` (we tear the stream down on
@@ -377,8 +376,8 @@ pub struct AudioPlayer {
   /// while the queue + atomics are still live.
   ///
   /// `cpal::Stream` is `Send + Sync` (per cpal 0.17.x docs) so the
-  /// `AudioPlayer` can cross thread boundaries — the A8 pipeline can
-  /// drive a player from any thread.
+  /// `AudioPlayer` can cross thread boundaries — the playback pipeline
+  /// can drive a player from any thread.
   stream: Option<Stream>,
   /// Shared callback + producer state. See [`SharedState`].
   shared: Arc<SharedState>,
@@ -640,7 +639,7 @@ impl AudioPlayer {
   ///   called on this player (one-way terminal latch) or the stream is dropped.
   /// - [`Error::ExternalOp`] if the cpal `Stream::play()` call fails.
   pub fn start(&mut self) -> Result<()> {
-    // FIX 1: one-way terminal latch. Checked FIRST so a post-stop
+    // One-way terminal latch. Checked FIRST so a post-stop
     // `start()` doesn't re-arm `state = STATE_RUNNING` and let
     // subsequent `write_samples()` slip past its `STATE_STOPPED`
     // gate. Acquire-load pairs with the Release-store in `stop()`.
@@ -777,11 +776,11 @@ impl AudioPlayer {
 
     // Capture the cpal pause result WITHOUT `?`-propagating — we
     // must still run the unconditional queue + callback-error
-    // cleanup below even if pause fails. Pre-R3, an `?` here would
+    // cleanup below even if pause fails. An `?` here would
     // skip cleanup: the latch + state were terminated but the
     // VecDeque still held queued samples, so the cpal callback
     // (running until `Drop`) would keep emitting silence-on-stopped
-    // while the queue lingered. The R3 contract is: stop() always
+    // while the queue lingered. The contract is: stop() always
     // tears down the queue + error slot; the pause error (if any)
     // is reported AFTER the cleanup runs.
     let pause_result = if let Some(stream) = self.stream.as_ref() {
@@ -830,7 +829,7 @@ impl AudioPlayer {
   ///   overflow.
   /// - [`Error::ExternalOp`] if a prior cpal callback error was captured.
   pub fn write_samples(&mut self, samples: &[f32]) -> Result<usize> {
-    // FIX 1: one-way terminal latch FIRST, before reading `state`.
+    // One-way terminal latch FIRST, before reading `state`.
     // A naive `state == STATE_STOPPED` gate is insufficient because
     // `start()` unconditionally re-arms `state = STATE_RUNNING`; the
     // sequence `start(); stop(); start(); write_samples(...)` would
@@ -883,7 +882,7 @@ impl AudioPlayer {
       }
     }
 
-    // FIX 2: per-chunk lock acquisition with NO per-chunk
+    // Per-chunk lock acquisition with NO per-chunk
     // `reserve_exact`. The queue is pre-allocated to
     // `queue_capacity_samples` at construction (see
     // `SharedState::new` via `try_reserve_exact`), and the
@@ -1032,7 +1031,7 @@ mod tests {
   use super::*;
   use crate::audio::playback::config::{ChannelLayout, PlaybackConfig, SampleFormat};
 
-  /// F1 (R3 MEDIUM) — `stop()`'s unconditional cleanup path:
+  /// `stop()`'s unconditional cleanup path:
   /// `SharedState::stop_cleanup` MUST drain a non-empty queue + any
   /// captured callback error to None, regardless of how it was
   /// invoked. This is the cleanup branch `AudioPlayer::stop` runs
@@ -1041,7 +1040,7 @@ mod tests {
   ///
   /// Constructs `SharedState` directly (no cpal stream needed) so
   /// the test runs in CI without an audio device — this is the
-  /// "struct mock" path the R3 spec calls for when injecting a real
+  /// "struct mock" path used when injecting a real
   /// cpal pause failure is impractical (cpal `Stream::pause()` on
   /// macOS CoreAudio doesn't err on a healthy device, and there's
   /// no public hook to swap in a faulty stream).
@@ -1057,7 +1056,7 @@ mod tests {
     }
     {
       let mut e = shared.callback_error.lock().unwrap();
-      // The slot is now typed `Option<StreamError>` (post-R2 Codex fix to
+      // The slot is now typed `Option<StreamError>` (to
       // surface typed `Error::ExternalOp` from the async cpal callback
       // path); use a real `StreamError` variant.
       *e = Some(StreamError::DeviceNotAvailable);
@@ -1089,8 +1088,8 @@ mod tests {
     assert_eq!(
       shared.queue.lock().unwrap().len(),
       0,
-      "stop_cleanup must drain the queue unconditionally (R3: this branch \
-       runs even when cpal pause errs — pre-R3, an early `?` on pause would \
+      "stop_cleanup must drain the queue unconditionally (this branch \
+       runs even when cpal pause errs — an early `?` on pause would \
        skip this and leave samples lingering until Drop)"
     );
     assert!(
@@ -1099,7 +1098,7 @@ mod tests {
     );
   }
 
-  /// F1 corollary: `stop_cleanup` is also poison-safe — a panicked
+  /// Corollary: `stop_cleanup` is also poison-safe — a panicked
   /// callback that poisoned the queue or callback_error lock must
   /// not prevent stop from draining. We simulate poisoning by
   /// running a closure that panics while holding the lock.
@@ -1143,11 +1142,11 @@ mod tests {
     }));
     assert!(
       result.is_ok(),
-      "stop_cleanup must not panic on poisoned locks (R3: poison-recover via into_inner)"
+      "stop_cleanup must not panic on poisoned locks (poison-recover via into_inner)"
     );
   }
 
-  /// F2 (R3 MEDIUM, moved from `tests/audio_playback.rs`) — queue
+  /// Queue
   /// is pre-allocated to its full `queue_capacity_samples` bound at
   /// construction time, NOT on first producer write. Asserts the
   /// `try_reserve_exact` contract ("AT LEAST `additional` more").
@@ -1181,8 +1180,7 @@ mod tests {
     );
   }
 
-  /// F2 (R3 MEDIUM, moved from `tests/audio_playback.rs`) —
-  /// producer-side `write_samples` MUST NOT grow the underlying
+  /// Producer-side `write_samples` MUST NOT grow the underlying
   /// VecDeque capacity. The bound is pre-allocated at construction,
   /// so `extend` is a pure O(chunk) memcpy with no realloc inside
   /// the producer's lock window (the cpal callback's `try_lock`

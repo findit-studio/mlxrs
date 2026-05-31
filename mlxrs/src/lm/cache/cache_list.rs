@@ -196,7 +196,7 @@ impl KvCache for CacheList {
   /// Routes through [`state_into`](KvCache::state_into) so each child can
   /// push directly into the composite buffer — saves one `Vec<Array>`
   /// allocation per child compared to the previous per-child `state()` +
-  /// `extend` pattern (KVC-7, #104). Behavior is byte-identical.
+  /// `extend` pattern (#104). Behavior is byte-identical.
   fn state(&self) -> Result<Vec<Array>> {
     let mut out = Vec::new();
     for c in &self.caches {
@@ -208,7 +208,7 @@ impl KvCache for CacheList {
   /// Push every child's state into the caller's buffer — the buffer-reuse
   /// variant that lets a parent composite ([`super::save_prompt_cache`],
   /// a nested `CacheList`, …) avoid the per-call `Vec<Array>` allocation
-  /// the default trait method would pay (KVC-7, #104). Equivalent to
+  /// the default trait method would pay (#104). Equivalent to
   /// `caches.iter().try_for_each(|c| c.state_into(buf))` — appends each
   /// child's state in order, never clears `buf`.
   fn state_into(&self, buf: &mut Vec<Array>) -> Result<()> {
@@ -242,10 +242,9 @@ impl KvCache for CacheList {
   fn set_state(&mut self, state: Vec<Array>) -> Result<()> {
     // Per-child state-array counts, taken from the children's *current*
     // state (Swift's `caches.map { $0.state.count }`). Uses the cheap
-    // [`KvCache::state_count`] trait helper (added in this PR for exactly
-    // this — Copilot flagged the prior `c.state()?.len()` as wasteful
-    // because it cloned/materialized every child's full state just to
-    // read its length).
+    // [`KvCache::state_count`] trait helper instead of the prior
+    // `c.state()?.len()`, which cloned/materialized every child's full
+    // state just to read its length.
     let mut lengths = Vec::with_capacity(self.caches.len());
     for c in &self.caches {
       lengths.push(c.state_count()?);
@@ -306,7 +305,7 @@ impl KvCache for CacheList {
   /// Routes through [`meta_state_into`](KvCache::meta_state_into) so each
   /// child pushes directly into the composite buffer — saves one
   /// `Vec<String>` allocation per child compared to the previous per-child
-  /// `meta_state()` + `extend` pattern (KVC-6, #103). The `metaCount` slot
+  /// `meta_state()` + `extend` pattern (#103). The `metaCount` slot
   /// is reserved before each child appends, then patched in place by
   /// snapshotting `buf.len()` before/after — preserves the swift-faithful
   /// framing byte-identically.
@@ -320,7 +319,7 @@ impl KvCache for CacheList {
   /// the buffer-reuse variant ([`meta_state_into`](KvCache::meta_state_into))
   /// override for `CacheList`. A nested `CacheList` recurses through this
   /// same override so deep composites pay exactly **one** `Vec<String>`
-  /// allocation at the outermost call (KVC-6, #103). Layout is byte-
+  /// allocation at the outermost call (#103). Layout is byte-
   /// identical to [`meta_state`](KvCache::meta_state).
   fn meta_state_into(&self, buf: &mut Vec<String>) {
     buf.push(self.caches.len().to_string());
@@ -540,7 +539,7 @@ impl KvCache for CacheList {
     "CacheList"
   }
 
-  /// P1 #110: per-layer fast-path downcast target — see the
+  /// Per-layer fast-path downcast target (#110) — see the
   /// [`KvCache`]-trait doc's **Per-layer fast-path convention**.
   fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
     self

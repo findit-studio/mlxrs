@@ -1,12 +1,10 @@
-//! C11 — `get_mel_banks_kaldi` triangle construction.
+//! `get_mel_banks_kaldi` triangle construction.
 //!
 //! Tracking: [#156](https://github.com/Findit-AI/mlxrs/issues/156).
-//! Plan: `docs/core-arch-simd-candidates.md` §2 row C11, §3.6 (kaldi
-//! mel triangle).
 //!
 //! # The defect class
 //!
-//! Pre-C11 `crate::audio::features::get_mel_banks_kaldi` has a per-row
+//! The original `crate::audio::features::get_mel_banks_kaldi` has a per-row
 //! inner loop that evaluates the Kaldi triangle membership for each
 //! `(m, k)` cell — with an on-the-fly `mel_scale_kaldi` per cell:
 //!
@@ -33,7 +31,7 @@
 //! row `m`), so they can be **pre-computed once** outside the per-row
 //! loop into a `Vec<f32>` of length `num_fft_bins`. After that
 //! pre-pass, the per-row inner loop is the same 4-lane triangle shape
-//! as C10 (`crate::simd::audio::mel_triangle`) — `(mel - left_mel) /
+//! as the mel-triangle kernel (`crate::simd::audio::mel_triangle`) — `(mel - left_mel) /
 //! lc` and `(right_mel - mel) / cr`.
 //!
 //! # The fix — two-stage kernel
@@ -43,7 +41,7 @@
 //!    cleanly without a custom polynomial, and the pre-pass is
 //!    `O(num_fft_bins)` — small (typically 200 cells) and runs once
 //!    per `(sample_freq, n_fft_padded)` pair.
-//! 2. **Per-row 4-lane tile** — identical to C10:
+//! 2. **Per-row 4-lane tile** — identical to the mel-triangle kernel:
 //!    - Pre-compute reciprocals (`inv_lc`, `inv_cr`, `left_over_lc`,
 //!      `right_over_cr`) per row.
 //!    - 4-lane NEON FMA over `mel_values`.
@@ -53,7 +51,7 @@
 //!
 //! Zero-width triangles (`lc <= 0.0` or `cr <= 0.0`) — the kernel
 //! writes 0.0 to the whole row. (See `crate::simd::audio::mel_triangle`
-//! for the matching C10 rationale.)
+//! for the matching rationale.)
 //!
 //! # Correctness class — `Tolerance`
 //!
@@ -61,14 +59,14 @@
 //!
 //! 1. The reciprocal-hoist substitution `(mel - left_mel) / lc →
 //!    mel * inv_lc - left_mel * inv_lc` adds ~2 ULP per cell vs the
-//!    scalar arm's direct subtract-then-divide (same as C10).
+//!    scalar arm's direct subtract-then-divide (same as the mel-triangle kernel).
 //! 2. The pre-pass scalar `mel_values[k]` calls `f32::ln` (libm) which
 //!    is the same call the scalar reference would inline per cell.
 //!    Bit-equal up to the pre-pass + cell-evaluation ordering — `mel`
 //!    is exactly the same value either way.
 //!
 //! Per-cell worst case empirically: ~30 ULP (~3e-6 absolute) in the
-//! cell-by-cell comparison — wider than C10's ~2 ULP because the
+//! cell-by-cell comparison — wider than the mel-triangle kernel's ~2 ULP because the
 //! per-row `inv_lc = 1.0 / lc` reciprocal compounds its own ULP error
 //! into the subsequent `mel * inv_lc - left_mel * inv_lc` FMA chain
 //! (whereas the scalar arm's `(mel - left_mel) / lc` is a single
@@ -81,11 +79,6 @@
 //! dispatcher writes into a pre-reserved `&mut [MaybeUninit<f32>]`
 //! (sized to `num_bins * num_fft_bins`), and the caller wraps it
 //! with `Vec::with_capacity` + `spare_capacity_mut` + `set_len`.
-//!
-//! # Verify-before-claim bench
-//!
-//! Report-only per the user directive 2026-05-23 (project memory rule
-//! **"SIMD ship NEON regardless"**).
 
 use core::mem::MaybeUninit;
 
@@ -106,7 +99,7 @@ fn mel_scale_kaldi(hz: f32) -> f32 {
 
 /// Scalar reference: build a `(num_bins, num_fft_bins)` Kaldi mel
 /// filterbank into `out` from `fft_bin_width`, `mel_low`, and
-/// `mel_delta`. Bit-exact match for the pre-C11
+/// `mel_delta`. Bit-exact match for the original
 /// `get_mel_banks_kaldi` inner two-loop **plus** explicit 0.0 writes
 /// for the `lc <= 0` / `cr <= 0` zero-width-triangle rows.
 ///
@@ -341,7 +334,7 @@ unsafe fn get_mel_banks_kaldi_neon(
 ///   via `checked_mul` BEFORE the size-equality assertion, so a
 ///   wrapped product can never sneak past the size check and let the
 ///   inner kernels (scalar / NEON) compute per-row offsets from
-///   unwrapped loop dims (same defect class as C5 `rotate_buf_u8`).
+///   unwrapped loop dims (same defect class as `rotate_buf_u8`).
 ///
 /// # Panics
 ///
@@ -385,7 +378,7 @@ pub fn get_mel_banks_kaldi_rows(
   // `num_bins * num_fft_bins` in release mode could otherwise produce a
   // small `elements` that an under-sized `out` would satisfy, letting
   // either inner kernel compute per-row offsets from unwrapped loop
-  // dims (same defect class as C5 `rotate_buf_u8`).
+  // dims (same defect class as `rotate_buf_u8`).
   let elements = num_bins.checked_mul(num_fft_bins).unwrap_or_else(|| {
     panic!(
       "simd::audio::get_mel_banks_kaldi_rows: dimensions {num_bins}x{num_fft_bins} overflow usize"
@@ -433,7 +426,7 @@ pub fn get_mel_banks_kaldi_rows(
 #[cfg(test)]
 mod tests {
   //! Scalar vs dispatcher Tolerance differential tests + edge coverage
-  //! for C11.
+  //! for the kaldi mel triangle.
 
   use super::{get_mel_banks_kaldi_rows, get_mel_banks_kaldi_scalar};
 
@@ -592,14 +585,14 @@ mod tests {
     assert!(r.is_ok(), "small input should not OOM");
   }
 
-  /// Wrap-arith defence (same defect class as C5 `rotate_buf_u8`):
+  /// Wrap-arith defence (same defect class as `rotate_buf_u8`):
   /// `num_bins * num_fft_bins` MUST be evaluated via `checked_mul` —
   /// a wrapping multiply in release mode would otherwise let an
   /// under-sized (here zero-length) `out` satisfy the size-equality
   /// assertion (`out.len() == wrapped_elements`), reaching either
   /// inner kernel where per-row offsets (`m * num_fft_bins`) would
   /// then be computed from the unwrapped loop dims and produce
-  /// out-of-bounds NEON stores. The Codex-cited adversarial case:
+  /// out-of-bounds NEON stores. The adversarial case:
   /// `num_bins = usize::MAX / 4 + 1, num_fft_bins = 4` wraps the
   /// product to `4` (one slot per bin would no longer be enough; the
   /// wrapped value is in fact `0` on 64-bit hosts where the product

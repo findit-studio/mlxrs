@@ -182,7 +182,7 @@ fn eye_negative_k_is_sub_diagonal() {
 
 #[test]
 fn eye_k_i32_min_is_rejected_not_ub() {
-  // #259 / Codex: mlx's eye evaluates `-k`, so k == i32::MIN would overflow in
+  // #259: mlx's eye evaluates `-k`, so k == i32::MIN would overflow in
   // C++ (UB). The wrapper rejects it with a typed error instead of calling FFI.
   let err = Array::eye::<f32>(3, None, i32::MIN).unwrap_err();
   assert!(matches!(err, mlxrs::Error::OutOfRange(_)), "got {err:?}");
@@ -315,7 +315,7 @@ fn arange_empty_range_keeps_requested_dtype() {
 
 #[test]
 fn arange_signed_accumulation_overflow_is_rejected() {
-  // #286 / Codex R1: both seeds (2147483646, 2147483647) fit i32, but mlx's CPU
+  // #286: both seeds (2147483646, 2147483647) fit i32, but mlx's CPU
   // arange accumulates in the promoted `int` and the increment after writing
   // INT_MAX overflows it (UB). The post-last value 2147483650 is out of range,
   // so the signed-path guard rejects it.
@@ -327,7 +327,7 @@ fn arange_signed_accumulation_overflow_is_rejected() {
 
 #[test]
 fn arange_signed_delta_subtraction_overflow_is_rejected() {
-  // #286 / Codex R2: a one-element jump whose seeds (i32::MIN, i32::MAX) both fit
+  // #286: a one-element jump whose seeds (i32::MIN, i32::MAX) both fit
   // i32, but mlx forms `step = next - first` IN i32 = 2147483647 - (-2147483648)
   // = 4294967295, which overflows i32 at the subtraction itself (before any
   // accumulation). The exact i128 recurrence model rejects it on the `delta`.
@@ -339,7 +339,7 @@ fn arange_signed_delta_subtraction_overflow_is_rejected() {
 
 #[test]
 fn arange_signed_fractional_step_overflow_is_rejected() {
-  // #286 / Codex R2: mlx truncates the seeds, so start 0.5 / step 1.6 accumulate
+  // #286: mlx truncates the seeds, so start 0.5 / step 1.6 accumulate
   // with effective integer delta 2 (trunc(2.1) - trunc(0.5)). A ~1.2e9-element
   // i32 range then overflows the promoted int (post-last ≈ 2.4e9) even though the
   // naive f64 post-last (≈1.92e9) is in range — the i128 model catches it.
@@ -351,7 +351,7 @@ fn arange_signed_fractional_step_overflow_is_rejected() {
 
 #[test]
 fn arange_signed_fractional_boundary_seed_is_accepted() {
-  // #286 / Codex R3: the cast truncates toward zero, so a seed of -2147483648.5
+  // #286: the cast truncates toward zero, so a seed of -2147483648.5
   // truncates to i32::MIN — a VALID cast. The truncation-aware guard must accept
   // it (the old raw-f64 bound wrongly rejected it as below i32::MIN).
   let mut a = Array::arange::<i32>(-2_147_483_648.5, -2_147_483_646.5, 1.0).unwrap();
@@ -361,7 +361,7 @@ fn arange_signed_fractional_boundary_seed_is_accepted() {
 
 #[test]
 fn arange_i16_large_delta_is_accepted() {
-  // #286 / Codex R3: i8/i16 narrow back to `T` each step, so their promoted adds
+  // #286: i8/i16 narrow back to `T` each step, so their promoted adds
   // never overflow `int` — the i32/i64 post-last guard must NOT apply. This i16
   // range has an un-narrowed post-last above i32::MAX but mlx runs it fine, so it
   // must be accepted (only Ok + dtype asserted; the values wrap, backend-defined).
@@ -383,7 +383,7 @@ fn arange_unsigned_wrap_is_allowed() {
 
 #[test]
 fn arange_infinite_step_correct_direction_yields_start() {
-  // #286 / Codex R1: mlx returns a single `[start]` for an infinite step in the
+  // #286: mlx returns a single `[start]` for an infinite step in the
   // correct direction (NOT an empty array).
   let mut a = Array::arange::<f32>(0.0, 10.0, f32::INFINITY).unwrap();
   assert_eq!(a.size(), 1);
@@ -419,7 +419,7 @@ fn arange_nan_bound_is_rejected() {
 
 #[test]
 fn arange_bool_dtype_is_unsupported_even_when_empty() {
-  // #286 / Codex R1: mlx rejects bool arange for EVERY range. The empty fast
+  // #286: mlx rejects bool arange for EVERY range. The empty fast
   // path must not mask it — both a non-empty and a wrong-direction (empty)
   // bool range return UnsupportedDtype.
   assert!(matches!(
@@ -434,7 +434,7 @@ fn arange_bool_dtype_is_unsupported_even_when_empty() {
 
 #[test]
 fn arange_f32_seed_above_f32_max_is_rejected() {
-  // #286 / Codex R4: the f64 bounds are also narrowed for FLOAT outputs. mlx
+  // #286: the f64 bounds are also narrowed for FLOAT outputs. mlx
   // casts start + step (here f64::MAX) into `float`, which is out of f32's finite
   // range — C++ UB. The representability guard rejects it before the FFI.
   assert!(matches!(
@@ -528,7 +528,7 @@ fn linspace_num_1_ignores_out_of_range_stop() {
 
 #[test]
 fn linspace_num_1_f32_rounding_out_of_range_is_rejected() {
-  // #286 / Codex R5: num == 1 is astype(array({start}), dtype) where
+  // #286: num == 1 is astype(array({start}), dtype) where
   // array({start}) is FLOAT32 (TypeToDtype<double> -> float32, vendored
   // dtype.cpp), so start is narrowed f64 -> f32 -> T. i32::MAX (2147483647) rounds
   // UP to 2^31 in f32, which then astype's out of i32 range — UB — so it is
@@ -550,7 +550,7 @@ fn linspace_num_1_fractional_boundary_start_is_accepted() {
 
 #[test]
 fn linspace_num_0_is_empty_without_narrowing() {
-  // #286 / Codex R5: mlx's num == 0 still constructs array(start, f32) /
+  // #286: mlx's num == 0 still constructs array(start, f32) /
   // array(stop, f32) (a double -> float narrowing, UB for f64::MAX) before
   // producing the empty result. The wrapper returns the empty array directly, so
   // an out-of-f32-range endpoint is harmless.
@@ -561,7 +561,7 @@ fn linspace_num_0_is_empty_without_narrowing() {
 
 #[test]
 fn linspace_num_1_f64_output_still_narrows_through_f32() {
-  // #286 / Codex R5: array({start}) is float32 even when the OUTPUT is f64, so a
+  // #286: array({start}) is float32 even when the OUTPUT is f64, so a
   // num == 1 f64 linspace narrows start f64 -> f32. f64::MAX is out of f32 range,
   // so it is rejected — f64 outputs are NOT exempt for num == 1.
   assert!(matches!(
@@ -572,7 +572,7 @@ fn linspace_num_1_f64_output_still_narrows_through_f32() {
 
 #[test]
 fn linspace_f32_endpoint_above_f32_max_is_rejected() {
-  // #286 / Codex R4: for num >= 2 the ramp is built in an f32 inner dtype, so a
+  // #286: for num >= 2 the ramp is built in an f32 inner dtype, so a
   // start of f64::MAX is narrowed f64 -> f32 out of range (C++ UB). Rejected.
   assert!(matches!(
     Array::linspace::<f32>(f64::MAX, 0.0, 2).unwrap_err(),
@@ -590,7 +590,7 @@ fn linspace_f16_ramp_in_range_works() {
 
 #[test]
 fn linspace_f16_interior_overshoot_at_max_is_rejected() {
-  // #286 / Codex R6: both endpoints are exactly f16::MAX (65504), so an
+  // #286: both endpoints are exactly f16::MAX (65504), so an
   // endpoint-only check passes, but the f32 ramp `(1 - t) * 65504 + t * 65504`
   // rounds an INTERIOR sample to 65504.0039 > f16::MAX, which then astype's to f16
   // out of range (UB). The full-ramp margin bound rejects it before the FFI.

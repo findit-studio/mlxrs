@@ -721,7 +721,7 @@ impl StreamingDetokenizer for NaiveHfDetokenizer {
 /// A streaming detokenizer — the enum-unified replacement for the
 /// prior `Box<dyn StreamingDetokenizer>` trait-object alias.
 ///
-/// # Breaking change (P1 #111)
+/// # Breaking change (#111)
 ///
 /// Previously [`crate::tokenizer::wrapper::BoxedDetokenizer`] aliased
 /// `Box<dyn StreamingDetokenizer>` — one vtable indirection per
@@ -730,8 +730,8 @@ impl StreamingDetokenizer for NaiveHfDetokenizer {
 /// inlining the canonical Naive / SPM / BPE variants and reserving
 /// [`Self::Custom`] for out-of-tree detokenizers.
 ///
-/// The lower per-token dispatch cost of LM-1d (one indirection per
-/// token vs LM-1a/b's ~5 per token) is partly mitigated by
+/// The lower per-token dispatch cost of the enum (one indirection per
+/// token vs the prior boxed-trait design's ~5 per token) is partly mitigated by
 /// branch-prediction warming on the consistent variant — a single
 /// generation run hits the same variant every token. The enum
 /// unification still wins on:

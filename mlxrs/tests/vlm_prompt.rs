@@ -283,7 +283,7 @@ fn build_multimodal_mask_bidirectional_within_image_span() {
 
 #[test]
 fn build_multimodal_mask_with_past_zero_offset_equals_base() {
-  // VLM-8: `build_multimodal_mask_with_past(seq, 0, spans)` is the
+  // `build_multimodal_mask_with_past(seq, 0, spans)` is the
   // delegation target of `build_multimodal_mask(seq, spans)` — byte
   // identical at past_len=0.
   let mut base = build_multimodal_mask(6, &[(2, 5)]).unwrap();
@@ -294,7 +294,7 @@ fn build_multimodal_mask_with_past_zero_offset_equals_base() {
 
 #[test]
 fn build_multimodal_mask_with_past_chunk_after_prefix() {
-  // VLM-8: a chunk of seq_len=3 at cache_offset=4 (4 cached past tokens)
+  // A chunk of seq_len=3 at cache_offset=4 (4 cached past tokens)
   // with a chunk-local image span (0,3) — the WHOLE chunk is one image.
   // Mask shape is [1, 1, 3, 7] (3 queries × (4 past + 3 current) keys).
   //   - past keys (k < 4): ALWAYS attend (causal — past precedes chunk).
@@ -322,7 +322,7 @@ fn build_multimodal_mask_with_past_chunk_after_prefix() {
 
 #[test]
 fn build_multimodal_mask_with_past_text_chunk_after_prefix() {
-  // VLM-8: a pure-text chunk (no spans) of seq_len=3 at cache_offset=2.
+  // A pure-text chunk (no spans) of seq_len=3 at cache_offset=2.
   // Past keys always attend; current keys are causal (k'<=q). No
   // bidirectional block.
   let past = 2usize;
@@ -599,7 +599,7 @@ fn assemble_multimodal_prompt_required_rejects_missing_marker() {
 }
 
 // =================================================================
-// V4: MessageFormat / MessageFormatter / get_message_json tests
+// MessageFormat / MessageFormatter / get_message_json tests
 // =================================================================
 //
 // Reference: `mlx-vlm/mlx_vlm/prompt_utils.py` lines 6–23 (enum), 27–89
@@ -620,13 +620,10 @@ use mlxrs::{
 
 #[test]
 fn message_format_18_variants_table() {
-  // The V4 dispatcher prompt referenced "18 variants" as an audit
-  // estimate; counting `prompt_utils.py` lines 9–23 yields exactly
-  // 15 enum variants. Assert the count matches the python ref AND
-  // each declared variant string maps to the right Rust variant.
-  // (Renaming the test would lose the dispatcher-spec trace; we
-  // assert the precise 15-count under the dispatcher-named test
-  // so a `git log -p` shows the audit-vs-truth reconciliation.)
+  // Counting `prompt_utils.py` lines 9–23 yields exactly 15 enum variants
+  // (the test name's "18" is an earlier over-count). Assert the count
+  // matches the python ref AND each declared variant string maps to the
+  // right Rust variant.
   assert_eq!(
     MESSAGE_FORMAT_VARIANTS.len(),
     15,
@@ -1112,11 +1109,11 @@ fn message_formatter_list_with_image_type_text_image_last_variant() {
 }
 
 // =================================================================
-// V4 R1 regressions: Codex round-1 findings (FormatOpts split,
-// allocation hardening, attention_mask threading).
+// Regressions: FormatOpts split, allocation hardening,
+// attention_mask threading.
 // =================================================================
 
-// ──────────────────────── Finding 1: defaults split ───────────────────────
+// ──────────────────────── Defaults split ───────────────────────
 
 #[test]
 fn get_message_json_text_only_with_qwen2_vl_default_emits_no_image() {
@@ -1124,10 +1121,10 @@ fn get_message_json_text_only_with_qwen2_vl_default_emits_no_image() {
   // prompt_utils.py:444–480, num_images=0 num_audios=0) MUST be used
   // by `get_message_json(_, _, None)`, so a text-only call to a model
   // whose normal format would inject an image entry (qwen2_vl uses
-  // LIST_WITH_IMAGE) emits NO image-content entry. The pre-fix bug
-  // was: get_message_json forwarded `&FormatOpts::default()` which used
-  // num_images=1 (the formatter-internal default), spuriously
-  // injecting an image entry into a text-only call.
+  // LIST_WITH_IMAGE) emits NO image-content entry. Forwarding
+  // `&FormatOpts::default()` (num_images=1, the formatter-internal
+  // default) would spuriously inject an image entry into a text-only
+  // call; the public-API defaults avoid that.
   let out = get_message_json("qwen2_vl", "describe this", None).unwrap();
   match out {
     FormattedMessage::Message(m) => {
@@ -1213,15 +1210,15 @@ fn format_message_internal_default_keeps_one_image() {
   }
 }
 
-// ──────────────────────── Finding 2: allocation hardening ─────────────────
+// ──────────────────────── Allocation hardening ─────────────────
 
 #[test]
 fn get_message_json_extreme_num_images_returns_oom_error() {
   // num_images = usize::MAX / 2 → must return Err (cap-exceeded or
-  // OOM, NOT a panic). Pre-fix: format_list_with_image's
+  // OOM, NOT a panic). An unguarded `format_list_with_image`'s
   // `Vec::with_capacity(1 + opts.num_images)` would attempt a
-  // catastrophic allocation. Post-fix: the count is cap-checked
-  // against MAX_MESSAGE_FORMAT_ITEMS first → Error::Backend.
+  // catastrophic allocation; the count is cap-checked against
+  // MAX_MESSAGE_FORMAT_ITEMS first → Error::Backend.
   let err = get_message_json(
     "qwen2_vl",
     "describe",
@@ -1250,13 +1247,13 @@ fn get_message_json_extreme_num_images_returns_oom_error() {
 fn get_message_json_with_skip_image_token_does_not_allocate_for_num_images() {
   // skip_image_token=true with a pathological num_images MUST NOT
   // touch the count-scaled reserve — the gate is BEFORE the cap
-  // check. qwen2_vl uses LIST_WITH_IMAGE (Vec<ContentItem>), so the
-  // pre-fix bug was that `Vec::with_capacity(1 + num_images)` would
-  // panic on 1_000_000 long before reaching the skip-gate.
+  // check. qwen2_vl uses LIST_WITH_IMAGE (Vec<ContentItem>); if the
+  // skip-gate ran after the reserve, `Vec::with_capacity(1 + num_images)`
+  // would panic on 1_000_000 before reaching it.
   //
-  // Post-fix: the skip-gate sets `effective_n = 0`, bypassing the
-  // cap check entirely. Test asserts the call succeeds cheaply with
-  // a single text item.
+  // The skip-gate sets `effective_n = 0`, bypassing the cap check
+  // entirely. Test asserts the call succeeds cheaply with a single text
+  // item.
   let out = get_message_json(
     "qwen2_vl",
     "describe",
@@ -1287,9 +1284,9 @@ fn get_message_json_with_skip_image_token_does_not_allocate_for_num_images() {
 #[test]
 fn format_with_token_skip_image_does_not_allocate_for_num_images() {
   // Same skip-gate behavior on the IMAGE_TOKEN family
-  // (`<image>` * num_images + prompt) — minicpmo. Pre-fix:
+  // (`<image>` * num_images + prompt) — minicpmo. An unguarded
   // `String::with_capacity(token.len() * num_images)` would blow up
-  // on 1_000_000. Post-fix: skip gate sets effective_n=0.
+  // on 1_000_000; the skip gate sets effective_n=0 first.
   let out = get_message_json(
     "minicpmo",
     "describe",
@@ -1367,12 +1364,11 @@ fn format_message_video_count_above_cap_returns_error() {
 
 // ──────────────── PROMPT_WITH_IMAGE_TOKEN / PROMPT_WITH_START_IMAGE_TOKEN ────────────────
 //
-// Regression coverage for the role/skip-image-token gating bug
-// reported by Codex R2 medium on V4 R2:
-// `mlxrs/src/vlm/prompt.rs:1455-1495` had wrongly suppressed the
-// `<image>` marker when `role != "user"` or `skip_image_token=true`.
-// Python ref (`mlx-vlm/mlx_vlm/prompt_utils.py:265-269`) emits the
-// marker **unconditionally** for both PROMPT_WITH_IMAGE_TOKEN and
+// Regression coverage for role/skip-image-token gating: the `<image>`
+// marker must NOT be suppressed when `role != "user"` or
+// `skip_image_token=true`. Python ref
+// (`mlx-vlm/mlx_vlm/prompt_utils.py:265-269`) emits the marker
+// **unconditionally** for both PROMPT_WITH_IMAGE_TOKEN and
 // PROMPT_WITH_START_IMAGE_TOKEN: the lambda only closes over
 // `num_images` and `prompt`. These tests pin the unconditional
 // behavior and assert the allocation cap is still in place.

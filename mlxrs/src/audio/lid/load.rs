@@ -48,13 +48,12 @@ pub const LID_SAMPLE_RATE: u32 = 16_000;
 /// ([lid-utils.py:10-13][lid-utils-remap]) — `(alias,
 /// canonical_module_name)` pairs.
 ///
-/// **Reference-only**: per the [no per-model arch porting][noarch] rule,
+/// **Reference-only**: per the no per-model arch porting rule,
 /// mlxrs does NOT import per-architecture crates from this table — it
 /// exists purely so an end-of-pipeline caller can mirror mlx-audio's
 /// alias resolution.
 ///
 /// [lid-utils-remap]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/lid/utils.py#L10-L13
-/// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 pub const MODEL_REMAPPING: &[(&str, &str)] =
   &[("ecapa-tdnn", "ecapa_tdnn"), ("ecapa_tdnn", "ecapa_tdnn")];
 
@@ -63,7 +62,7 @@ pub const MODEL_REMAPPING: &[(&str, &str)] =
 /// float]]` ([wav2vec_lid.py:101-148][lid-predict-wav2vec2],
 /// [ecapa_tdnn.py:135-163][lid-predict-ecapa]).
 ///
-/// Per the [no per-model arch porting][noarch] rule, mlxrs ships no
+/// Per the no per-model arch porting rule, mlxrs ships no
 /// concrete LID models; this trait is the *shape* per-architecture
 /// crates (wav2vec2 / ecapa_tdnn) implement so a caller can hand-off
 /// any LID architecture as a `Box<dyn LidModel>` from the [`load`] /
@@ -73,7 +72,6 @@ pub const MODEL_REMAPPING: &[(&str, &str)] =
 ///
 /// [lid-predict-wav2vec2]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/lid/models/wav2vec2/wav2vec_lid.py#L101-L148
 /// [lid-predict-ecapa]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/lid/models/ecapa_tdnn/ecapa_tdnn.py#L135-L163
-/// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 pub trait LidModel {
   /// Run LID inference on `audio` (typically a 16 kHz mono float
   /// waveform — see [`LID_SAMPLE_RATE`]), returning the top-`top_k`

@@ -8,7 +8,7 @@
 //!
 //! Everything is generic over the [`Model`] trait: the loop only ever calls
 //! `model.forward(tokens, &mut cache)`. The decode loop is an idiomatic Rust
-//! [`Iterator`] (the spec's A1) — [`generate_step`] yields one [`GenStep`]
+//! [`Iterator`] — [`generate_step`] yields one [`GenStep`]
 //! per step (the typed step item: `token` + opt-in `logprobs`),
 //! [`stream_generate`] maps that through the #18 streaming detokenizer into
 //! [`GenerationResponse`]s, and [`generate`] collects the whole thing into a
@@ -34,7 +34,7 @@
 //! to mlx-lm's `logprobs.squeeze(0)` (the normalization is always run so
 //! the yielded vector is the true log-softmax).
 //!
-//! **Stochastic-opt-out numerical safety (Codex review R2):** the
+//! **Stochastic-opt-out numerical safety:** the
 //! shift-invariance argument above is mathematically valid but **not**
 //! numerically safe in low-precision compute dtypes. `categorical_sampling`
 //! multiplies its input by `1/temp` BEFORE the eventual `softmax` inside
@@ -73,7 +73,7 @@
 //! A naive `1/temp` upcast to f64 is only a partial mitigation — it
 //! closes the f32 subnormal path but the cast back into f16 still
 //! overflows for `temp < 1/65504`. A LM-only argmax bypass in the
-//! generation loop was prototyped and reverted (R3+R4 → R5 revert):
+//! generation loop was prototyped and reverted:
 //! it failed to cover VLM/STT and silently skipped configured sampler
 //! stages, so the fix must land in the primitive with regression
 //! tests across LM/VLM/STT. Deferred to a dedicated `fix(lm/sample)`
@@ -96,7 +96,7 @@
 //!    internally — see [`GenConfig::collect_logprobs`]). In the opt-out
 //!    path with `temp > 0` a cheap `logits - max(logits, keepdims=True)`
 //!    max-shift is applied instead, to keep the downstream `1/temp`
-//!    multiply finite in f16/bf16 (Codex review R2 — see the module-level
+//!    multiply finite in f16/bf16 (see the module-level
 //!    "stochastic-opt-out numerical safety" note).
 //! 5. `token = sampler(logits_or_logprobs)` — the [`make_sampler`] chain
 //!    (top-k/p, min-p, xtc, categorical) or the default temperature-0
@@ -123,7 +123,7 @@
 //! `prefill_step_size`-sized chunks (logits discarded, cache filled); the
 //! last token starts the first decode step.
 //!
-//! **Error model (spec §4):** every fallible op returns [`crate::Result`];
+//! **Error model:** every fallible op returns [`crate::Result`];
 //! [`generate_step`] / [`stream_generate`] are `Iterator<Item = Result<..>>`
 //! — a step error is yielded **once** as `Err` and then the iterator ends
 //! (it fuses — no panic, no poison, never re-entered). No implicit eval: the
@@ -132,7 +132,7 @@
 //!
 //! `make_sampler` / `make_logits_processors` **compose** the [`sample`] /
 //! #29 primitives and propagate their validation `Err`s — they do **not**
-//! re-validate ranges `sample.rs` already enforces (spec §2/§4). `temp == 0`
+//! re-validate ranges `sample.rs` already enforces. `temp == 0`
 //! ⇒ the argmax sampler (mlx-lm `make_sampler` line 46). All sampler /
 //! processor scalars stay in the compute dtype via the #29 `scalar_like`
 //! discipline.
@@ -153,7 +153,7 @@ use crate::{
   lm::{cache::KvCache, model::Model, sample},
   ops,
 };
-// P1 #111: bring the trait into scope so the `Detokenizer` enum's
+// #111: bring the trait into scope so the `Detokenizer` enum's
 // `StreamingDetokenizer` impl methods (`add_token` / `finalize` / `text` /
 // `last_segment` / …) are callable through the enum value.
 #[cfg(feature = "tokenizer-stream")]
@@ -285,7 +285,7 @@ impl FrequencyPenaltyPayload {
 /// `Callable[[mx.array, mx.array], mx.array]` (`make_logits_processors`
 /// closures).
 ///
-/// # Breaking change (P1 #109)
+/// # Breaking change (#109)
 ///
 /// Previously this was the trait-object alias
 /// `Box<dyn Fn(&[u32], &Array) -> Result<Array>>` — one vtable indirection
@@ -374,7 +374,7 @@ impl std::fmt::Debug for LogitsProcessor {
 /// A sampler: maps a log-probability vector to a sampled token id array
 /// (`[1]`, `U32`), exactly mlx-lm's `Callable[[mx.array], mx.array]`.
 ///
-/// # Breaking change (P1 #108)
+/// # Breaking change (#108)
 ///
 /// Previously this was the trait-object alias
 /// `Box<dyn FnMut(&Array) -> Result<Array>>` — ONE indirect call per
@@ -559,7 +559,7 @@ pub fn __resolved_unseeded_seed_for_test() -> u64 {
 
 /// Generation parameters — the union of mlx-lm `generate_step`'s loop knobs,
 /// `make_sampler`'s sampler params, and `make_logits_processors`' penalty /
-/// bias params, plus the resolved eos-id set (spec §2).
+/// bias params, plus the resolved eos-id set.
 ///
 /// [`Default`] mirrors mlx-lm's defaults: `max_tokens = 256`,
 /// `prefill_step_size = 2048`, `temp = 0` (⇒ the argmax sampler), every
@@ -709,7 +709,7 @@ impl GenConfig {
     Self::default()
   }
 
-  // ── §1 encapsulated Vec accessors ──────────────────────────────────────
+  // ── encapsulated Vec accessors ──────────────────────────────────────────
 
   /// The XTC special-token ids (token ids XTC never masks).
   #[inline(always)]
@@ -735,7 +735,7 @@ impl GenConfig {
     &self.stop_strings
   }
 
-  // ── §1 with_* builders ─────────────────────────────────────────────────
+  // ── with_* builders ─────────────────────────────────────────────────────
 
   /// Set `max_tokens` and return `self` (builder pattern). Equivalent to
   /// `cfg.max_tokens = n; cfg` but chainable: use `GenConfig::default().with_max_tokens(n)`.
@@ -780,9 +780,9 @@ impl GenConfig {
     self
   }
 
-  // In-place setters (per rust-type-conventions §3: plain non-optional
-  // fields get both `with_*` consuming AND `set_*` in-place returning
-  // `&mut Self` for chaining on an existing owned value).
+  // In-place setters: plain non-optional fields get both `with_*` consuming
+  // AND `set_*` in-place returning `&mut Self` for chaining on an existing
+  // owned value.
 
   /// Set the XTC special-token ids in place; chainable.
   pub fn set_xtc_special_tokens(&mut self, tokens: impl Into<Vec<i32>>) -> &mut Self {
@@ -821,7 +821,7 @@ impl GenConfig {
   }
 
   /// Eagerly validate every scalar sampler / logits-processor bound up
-  /// front (AUDIO-12 polish #136) — `temp`, `top_p`, `min_p`,
+  /// front (polish #136) — `temp`, `top_p`, `min_p`,
   /// `min_tokens_to_keep`, `top_k`, `xtc_probability`, `xtc_threshold`,
   /// `repetition_penalty`, and the `logit_bias` `(id, value)` pair-arity.
   /// Returns the **first** bound violated as an `Err(`[`Error::OutOfRange`]`)`
@@ -832,7 +832,6 @@ impl GenConfig {
   ///
   /// # Why eager
   ///
-  /// Codex #64 (the AUDIO-12 cross-reference) observed that
   /// [`make_sampler`] / [`make_logits_processors`] build closures whose
   /// purely-scalar bounds (`temp < 0`, `min_p > 1`, `xtc_probability` out
   /// of range, a negative `repetition_penalty`, …) are checked INSIDE the
@@ -1327,13 +1326,13 @@ impl FinishReason {
 /// migration mechanical (the previous `From<GenStep> for (u32, Array)`
 /// is replaced — the `Option` shift propagates through the tuple form
 /// so call sites can't silently drop the new semantic). Pattern-match
-/// destructures should use the rest pattern (`..`) since LM-3 added
-/// `step_index` and `finish_reason` as further fields; new fields may be
+/// destructures should use the rest pattern (`..`) since
+/// `step_index` and `finish_reason` were added as further fields; new fields may be
 /// added in the future under the same convention.
 ///
-/// # `step_index` + `finish_reason` (LM-3, polish #114)
+/// # `step_index` + `finish_reason` (polish #114)
 ///
-/// LM-3 added two more named fields to mirror the existing
+/// Two more named fields were added to mirror the existing
 /// [`BatchGenStep`]'s per-row shape (so a caller writing against either
 /// surface sees the same step envelope):
 ///
@@ -1366,13 +1365,13 @@ pub struct GenStep {
   /// [`GenConfig::collect_logprobs`] was `true` for this run.
   pub logprobs: Option<Array>,
   /// 0-based index of this step within the iterator's run (`0` for the
-  /// first yielded step, `1` for the second, …). LM-3 polish #114 — a
+  /// first yielded step, `1` for the second, …). Polish #114 — a
   /// stable per-step identifier so callers don't have to wrap the
   /// iterator in `enumerate()` just to know which step they're on.
   pub step_index: usize,
   /// `None` for ordinary steps; `Some(FinishReason::Eos)` on the EOS-token
   /// step (the final yielded item when a sampled token is in the eos set
-  /// configured via [`GenConfig::with_eos`]). LM-3 polish #114 — mirrors the existing
+  /// configured via [`GenConfig::with_eos`]). Polish #114 — mirrors the existing
   /// [`BatchGenStep::finish_reason`] field so single-seq + batch surfaces
   /// share a step envelope. NOTE: `Some(FinishReason::Length)` is NEVER
   /// emitted at this layer (mlx-lm `generate_step` `break`s BEFORE the
@@ -1391,7 +1390,7 @@ impl From<GenStep> for (u32, Option<Array>) {
 /// per-layer KV cache, the running token history, the sampler, and the
 /// logits processors. Constructed by [`generate_step`].
 ///
-/// # Breaking change (P1 #113)
+/// # Breaking change (#113)
 ///
 /// Previously `pub struct Generator<'a, M>` — the concrete iterator type
 /// was part of the public API surface, so downstream code could name it,
@@ -1409,10 +1408,10 @@ impl From<GenStep> for (u32, Option<Array>) {
 /// `main`, since `#48` introduced it) must switch to inference /
 /// `impl Iterator<_>`.
 ///
-/// The borrow of `&'a M` plus the owned cache means no aliasing (spec
-/// §7.5). The iterator **fuses**: after it yields `Err` (a step failed)
+/// The borrow of `&'a M` plus the owned cache means no aliasing. The
+/// iterator **fuses**: after it yields `Err` (a step failed)
 /// or finishes (eos / `max_tokens`) every further `next()` is `None` —
-/// never a panic, never a poisoned re-entry (spec §4).
+/// never a panic, never a poisoned re-entry.
 ///
 /// `M: Model + ?Sized` — the loop only ever touches the model behind the
 /// `&'a M` borrow (`model.forward(...)`), never by value and never via a
@@ -1467,7 +1466,7 @@ pub(crate) struct Generator<'a, M: Model + ?Sized> {
   /// loop is a single field check.
   needs_logprobs: bool,
   /// `true` iff `cfg.temp > 0` (stochastic sampling). Drives the
-  /// opt-out path's cheap `max + subtract` max-shift (Codex review R2):
+  /// opt-out path's cheap `max + subtract` max-shift:
   /// when the full normalization is skipped (`!needs_normalization`) but
   /// `temp > 0`, the sampler's downstream `logits * (1/temp)` would
   /// overflow in f16/bf16 with a large `logit_bias`, so the opt-out
@@ -1574,7 +1573,7 @@ impl<M: Model + ?Sized> Generator<'_, M> {
     // 4. `logprobs = logits - mx.logsumexp(logits, keepdims=True)` — the
     //    exact mlx-lm normalization (all-axes logsumexp, broadcast).
     //    **GATED, 3-way**: the per-step compute depends on
-    //    `(needs_normalization, temp > 0)` (Codex review R2):
+    //    `(needs_normalization, temp > 0)`:
     //      • `(true, _)`  — full `logsumexp + subtract` (collect_logprobs
     //         and/or top_p — `top_p` strictly needs the cumsum-to-1
     //         contract; collect_logprobs yields the true log-softmax).
@@ -1592,16 +1591,15 @@ impl<M: Model + ?Sized> Generator<'_, M> {
     //         (it doesn't exponentiate), so it stays the true zero-cost
     //         path: no reduce, no broadcast, no allocation.
     //
-    //    The R2 max-shift bounds the sampler input to ≤ 0, but it does
+    //    The max-shift bounds the sampler input to ≤ 0, but it does
     //    NOT protect against `categorical_sampling`'s own internal
     //    `1/temp` overflow for two extreme-`temp` configurations (f16
     //    logits + `temp < 1/65504`; any dtype + subnormal positive
     //    `temp < 1.0/f32::MAX ≈ 2.94e-39`). The structural fix lives in
     //    `sample::categorical_sampling` and is deferred to a dedicated
     //    `fix(lm/sample)` follow-up PR that updates `sample.rs` + all
-    //    three call sites (LM / VLM / STT) consistently per
-    //    `feedback_review_finding_must_be_in_diff` (a LM-only argmax
-    //    bypass was prototyped in R3+R4 and reverted in R5 because it
+    //    three call sites (LM / VLM / STT) consistently (a LM-only argmax
+    //    bypass was prototyped and reverted because it
     //    failed to cover VLM/STT and silently skipped configured
     //    sampler stages — XTC/top_k/min_p).
     let needs_normalization = self.collect_logprobs || self.needs_logprobs;
@@ -1653,7 +1651,7 @@ impl<M: Model + ?Sized> Generator<'_, M> {
     } else {
       None
     };
-    // LM-3 #114: `step_index` + `finish_reason` are set provisionally to
+    // #114: `step_index` + `finish_reason` are set provisionally to
     // `self.produced` (== "tokens yielded so far before this one") +
     // `None`; the [`Iterator::next`] impl overrides `finish_reason` to
     // `Some("stop")` on the EOS-token step (the only `Some(_)` value
@@ -1673,7 +1671,7 @@ impl<M: Model + ?Sized> Iterator for Generator<'_, M> {
 
   fn next(&mut self) -> Option<Self::Item> {
     // Fused: a prior Err or a finish ends iteration permanently — no
-    // panic, no poisoned re-entry into the model / mlx-c (spec §4).
+    // panic, no poisoned re-entry into the model / mlx-c.
     if self.done {
       return None;
     }
@@ -1728,12 +1726,12 @@ impl<M: Model + ?Sized> Iterator for Generator<'_, M> {
       Ok(mut step) => {
         self.produced += 1;
         self.last = Some(step.token);
-        // Spec §3: `generate_step` itself stops on an eos token (it carries
+        // `generate_step` itself stops on an eos token (it carries
         // the eos set); the eos token IS yielded (mlx-lm yields it, then
         // `stream_generate` breaks) — so yield it, then fuse.
         if self.eos.contains(&step.token) {
           self.done = true;
-          // LM-3 #114: surface the "stop" reason on the yielded EOS step
+          // #114: surface the "stop" reason on the yielded EOS step
           // (mirrors `BatchGenStep::finish_reason` semantics). `length` is
           // never set here — `if produced >= max_tokens` above returns
           // `None` BEFORE a step runs, mirroring mlx-lm `generate_step`'s
@@ -1743,7 +1741,7 @@ impl<M: Model + ?Sized> Iterator for Generator<'_, M> {
         Some(Ok(step))
       }
       Err(e) => {
-        // A step error is yielded once, then the iterator ends (spec §4).
+        // A step error is yielded once, then the iterator ends.
         self.done = true;
         Some(Err(e))
       }
@@ -1819,9 +1817,9 @@ fn last_position(logits: &Array) -> Result<Array> {
 /// token per step until a sampled token is in the eos set (configured via
 /// [`GenConfig::with_eos`]; the eos token is the final yielded item) or [`GenConfig::max_tokens`] tokens
 /// have been produced. A step error is yielded once as `Err`, after which
-/// the iterator ends (spec §4 — no panic, no poison).
+/// the iterator ends (no panic, no poison).
 ///
-/// # Breaking change (P1 #113)
+/// # Breaking change (#113)
 ///
 /// The return type is now `impl Iterator<Item = Result<GenStep>> + 'a`
 /// (previously the concrete `Generator<'a, M>`). Hiding the iterator's
@@ -1846,7 +1844,7 @@ pub fn generate_step<'a, M: Model + ?Sized>(
 ///
 /// Returns the concrete [`Generator<'a, M>`]; [`generate_step`] is a thin
 /// wrapper that hides this type behind `impl Iterator + 'a` for the
-/// public API surface (P1 #113).
+/// public API surface (#113).
 pub(crate) fn build_generator<'a, M: Model + ?Sized>(
   model: &'a M,
   prompt: &[u32],
@@ -1858,7 +1856,7 @@ pub(crate) fn build_generator<'a, M: Model + ?Sized>(
   // `ValueError("Either input_embeddings or prompt ... must be provided")`)
   // and any sampler / processor construction error are deferred into the
   // first `next()` as the iterator's first `Err` so the public surface
-  // stays a pure `Iterator` (the spec's A1) and the Iterator-yields-Err
+  // stays a pure `Iterator` and the Iterator-yields-Err
   // contract is the single error channel.
   let built = (|| -> Result<(Sampler, Vec<LogitsProcessor>)> {
     if prompt.is_empty() {
@@ -1866,9 +1864,9 @@ pub(crate) fn build_generator<'a, M: Model + ?Sized>(
         "generate: prompt",
       )));
     }
-    // AUDIO-12 #136: eager scalar-bound validation of every sampler /
+    // #136: eager scalar-bound validation of every sampler /
     // logits-processor knob in `cfg` BEFORE any prompt prefill / model
-    // work. Codex #64 surfaced that the sampler-build path only catches
+    // work. The sampler-build path only catches
     // a SUBSET of bounds at build time; the per-primitive validations
     // in `apply_*` only fire when the closure runs against logits, so
     // an invalid `cfg` would pass the constructor + run an entire
@@ -1985,7 +1983,7 @@ pub(crate) fn build_generator<'a, M: Model + ?Sized>(
 
 /// The final segment of a generation run — a 1:1 port of mlx-lm's
 /// `GenerationResponse` (`generate.py` lines 269-296), restricted to the
-/// fields the no-network / single-stream WS-C surface produces.
+/// fields the no-network / single-stream surface produces.
 ///
 /// Yielded by [`stream_generate`]: `text` is the streaming detokenizer's
 /// newly readable segment for this token (possibly empty), `token` /
@@ -2126,7 +2124,7 @@ pub fn stream_generate<'a, M: Model + ?Sized>(
     if finished {
       return None;
     }
-    // LM-3 #114: `..` for forward compatibility — `GenStep` now also
+    // #114: `..` for forward compatibility — `GenStep` now also
     // carries `step_index` + `finish_reason`. `stream_generate` recomputes
     // its OWN `finish_reason` for `GenerationResponse` (`"stop"` on eos,
     // `"length"` on `max_tokens`, factoring in stop-strings via the
@@ -2465,7 +2463,7 @@ pub struct BatchGenStep {
 ///
 /// The iterator **fuses**: after it yields `Err` (a step failed) or finishes
 /// (every row done) every further `next()` is `None` — never a panic, never a
-/// poisoned re-entry (spec §4).
+/// poisoned re-entry.
 ///
 /// `M: Model + ?Sized` — like the single-sequence
 /// [`generate_step`] iterator, the loop only ever
@@ -2916,7 +2914,7 @@ pub fn batch_left_padding(prompts: &[&[u32]]) -> Vec<i32> {
 /// EOS (`finish_reason = Some("stop")`) or `max_tokens` (`finish_reason =
 /// Some("length")`); the iterator ends when every row has finished. A step
 /// error is yielded once as `Err`, after which the iterator ends — never a
-/// panic, never a poisoned re-entry (spec §4).
+/// panic, never a poisoned re-entry.
 ///
 /// **Per-row logits processors.** Mirrors mlx-lm `GenerationBatch._step`
 /// lines 1336-1349: when processors exist, the per-step `[B, V]` logits are
@@ -2941,7 +2939,7 @@ pub fn batch_generate_step<'a, M: Model + ?Sized>(
 ) -> BatchGenerator<'a, M> {
   type Built = (Vec<Vec<u32>>, usize, Sampler, Vec<LogitsProcessor>);
   let built = (|| -> Result<Built> {
-    // AUDIO-12 #136 — eager scalar-bound validation of every sampler /
+    // #136 — eager scalar-bound validation of every sampler /
     // logits-processor knob in `cfg` BEFORE any prefill / model work,
     // mirroring single-seq [`generate_step`]. The sampler-build path
     // only catches a SUBSET of bounds at build time; the per-primitive
@@ -3552,7 +3550,7 @@ mod batch_tests {
     }
   }
 
-  /// AUDIO-12 #136 — eager `GenConfig::validate` MUST run inside
+  /// #136 — eager `GenConfig::validate` MUST run inside
   /// [`batch_generate_step`]'s `built` closure BEFORE sampler /
   /// processor construction (and so before any model / cache work).
   /// An invalid `cfg` (negative `temp`) must surface as the iterator's

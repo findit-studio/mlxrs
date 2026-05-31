@@ -423,7 +423,7 @@ fn vlm_generate_zero_images_passthrough() {
   assert!(!model.forward_calls.borrow().is_empty());
 }
 
-/// L3 / Codex review finding-2: the zero-image VLM branch delegates to
+/// L3: the zero-image VLM branch delegates to
 /// `lm::generate_step`, which honors `cfg.lm.collect_logprobs` — and that
 /// field's `Default` is `false`. The multimodal decode loop in
 /// `vlm::generate` ALWAYS emits `Some(logprobs)` (see the comment at the
@@ -460,8 +460,8 @@ fn vlm_generate_zero_image_preserves_logprobs() {
     assert!(
       s.logprobs.is_some(),
       "zero-image VLM must preserve Some(logprobs) even though \
-       cfg.lm.collect_logprobs defaults to false — see Codex review \
-       finding-2 (VLM contract drift across the two branches)"
+       cfg.lm.collect_logprobs defaults to false (VLM contract drift \
+       across the two branches)"
     );
     let lp = s.logprobs.as_ref().unwrap();
     // The mock returns `[1, S, vocab=5]`; per-step squeeze yields `[V]`.
@@ -967,7 +967,7 @@ fn vlm_model_image_processor_config_default_is_imagenet() {
   assert_eq!(cfg, want);
 }
 
-// ─────────────── Codex finding #1: per-image encoder shape contract ──────
+// ─────────────── Per-image encoder shape contract ──────
 
 #[test]
 fn vlm_generate_rejects_per_image_shape_mismatch() {
@@ -1043,7 +1043,7 @@ fn vlm_generate_rejects_per_image_shape_mismatch() {
   }
 }
 
-// ─────────────── Codex finding #3: prompt history → first-token processors ──
+// ─────────────── Prompt history → first-token processors ──
 
 #[test]
 fn vlm_generate_first_token_sees_prompt_history_in_logit_bias() {
@@ -1052,7 +1052,7 @@ fn vlm_generate_first_token_sees_prompt_history_in_logit_bias() {
   // the ramp logits is `vocab - 1 = 4`. With the logit_bias applied to
   // the prefill `_step`, the argmax becomes 0.
   //
-  // This was Codex finding #3 — the previous implementation passed an
+  // The previous implementation passed an
   // empty `step_inputs` to the prefill `sample_from_logits`, so the
   // `if !processors.is_empty() && !step_inputs.is_empty()` guard
   // skipped the processors entirely on the first token. Test that the
@@ -1086,19 +1086,18 @@ fn vlm_generate_first_token_sees_prompt_history_in_logit_bias() {
   // prefill `_step` and shifts the argmax to 0.
   assert_eq!(
     step.token, 0,
-    "first VLM token must be subject to logit_bias (Codex finding #3 regression)"
+    "first VLM token must be subject to logit_bias (regression)"
   );
 }
 
-// ── Codex round-3: validation precedes the vision pipeline ──────────────
+// ── Validation precedes the vision pipeline ──────────────
 
 #[test]
 fn vlm_generate_marker_missing_errors_before_any_image_work() {
   // A malformed prompt under MarkerPolicy::Required (no marker present)
   // must surface MissingField SYNCHRONOUSLY without loading,
-  // preprocessing, or encoding any images. This pins Codex round-3
-  // finding-2: validation ordering must come BEFORE the expensive
-  // vision pipeline.
+  // preprocessing, or encoding any images. Validation ordering must come
+  // BEFORE the expensive vision pipeline.
   let model = MockVlmModel::new(5, 4, 3);
   let dir = temp_dir("marker_missing_no_encode");
   let img = write_test_image(&dir, "img.png");
@@ -1116,7 +1115,7 @@ fn vlm_generate_marker_missing_errors_before_any_image_work() {
   assert_eq!(
     model.encode_calls.borrow().len(),
     0,
-    "encode_image must NOT run when prompt validation fails (Codex round-3 finding-2 regression)"
+    "encode_image must NOT run when prompt validation fails (regression)"
   );
   // Same for embed_tokens — the text-side pipeline starts only after
   // prompt validation has succeeded.
@@ -1151,11 +1150,11 @@ fn vlm_generate_marker_count_mismatch_errors_before_any_image_work() {
   );
 }
 
-// ── Codex round-3: chunked prefill respects cfg.lm.prefill_step_size ──────
+// ── Chunked prefill respects cfg.lm.prefill_step_size ──────
 
 #[test]
 fn vlm_generate_span_aware_chunking_never_splits_image_span() {
-  // **VLM-8 trait redesign (Codex bundle rounds 1-3 → option (b))**:
+  // **Trait redesign**:
   // chunked multimodal prefill is now offset-aware AND span-aware. It
   // chunks by `prefill_step_size` but (1) never splits an image span
   // across a chunk boundary — when the natural boundary lands inside a
@@ -1220,7 +1219,7 @@ fn vlm_generate_span_aware_chunking_never_splits_image_span() {
 
 #[test]
 fn vlm_generate_threads_cache_offset_and_chunk_local_spans() {
-  // VLM-8 R1F3: each chunk's `forward_embeddings_multimodal` must receive
+  // Each chunk's `forward_embeddings_multimodal` must receive
   // the ABSOLUTE cache offset (initial + cursor) and CHUNK-LOCAL spans.
   // With prompt [1,2,99,3,4] (T=7, span (2,5)) at prefill_step_size=2 the
   // span-aware chunks are [0,2) [2,5) [5,7), so the captured
@@ -1372,7 +1371,7 @@ fn vlm_generate_single_chunk_when_prefill_step_size_ge_t() {
 
 #[test]
 fn vlm_generate_max_tokens_zero_does_no_image_work() {
-  // **Bundle #62 Codex round-2 finding fix**: `max_tokens == 0` must
+  // **Bundle #62**: `max_tokens == 0` must
   // yield an empty iterator and do ZERO model/vision work — mirroring
   // the LM-side contract where `lm::generate`'s iterator checks
   // `produced >= max_tokens` BEFORE prefill. The VLM multimodal path
@@ -1425,11 +1424,11 @@ fn vlm_generate_max_tokens_zero_does_no_image_work() {
   assert_eq!(model.forward_calls.borrow().len(), 0, "no forward calls");
 }
 
-// ─── Codex round-2 finding: mask handoff via per-request spans, not &self ──
+// ─── Mask handoff via per-request spans, not &self ──
 
 #[test]
 fn vlm_generate_threads_per_request_spans_no_cross_iterator_pollution() {
-  // The mask-requiring path (per Codex round-2): each iterator's
+  // The mask-requiring path: each iterator's
   // `prefill_step` calls `forward_embeddings_multimodal(embeds, spans,
   // cache)` with THIS iterator's spans — never via &self state. Two
   // iterators with DIFFERENT spans constructed against the same model
@@ -1531,7 +1530,7 @@ fn vlm_generate_threads_per_request_spans_no_cross_iterator_pollution() {
   assert_eq!(
     cap[1],
     vec![(0_usize, 3_usize)],
-    "iter A (polled second) must see its OWN spans, not B's (Codex round-2 hazard)"
+    "iter A (polled second) must see its OWN spans, not B's"
   );
 }
 
@@ -1562,13 +1561,13 @@ fn vlm_generate_forward_embeddings_multimodal_default_dispatches_to_lm() {
   assert_eq!(model.forward_emb_calls.borrow().len(), 1);
 }
 
-// ────────────────────── Codex finding #2: attention mask elided ──────────
+// ────────────────────── Attention mask elided ──────────
 
 #[test]
 fn vlm_generate_does_not_build_unused_attention_mask() {
   // The previous implementation called `assemble_multimodal_prompt`
   // which builds an O(T*T) attention mask — but the mask was never
-  // threaded to `forward_embeddings` (Codex finding #2). The fix is
+  // threaded to `forward_embeddings`. The fix is
   // to call `insert_image_tokens` directly (no mask construction in
   // the hot path).
   //
@@ -1607,7 +1606,7 @@ fn vlm_generate_does_not_build_unused_attention_mask() {
   assert_eq!(model.forward_emb_calls.borrow()[0], vec![1_usize, 102, 4]);
 }
 
-// ────────────────────── AUDIO-12 #136: eager cfg.lm.validate ─────────────
+// ────────────────────── #136: eager cfg.lm.validate ─────────────
 
 /// `vlm_generate` MUST call `cfg.lm.validate()` at the TOP of the function
 /// — BEFORE the `max_tokens == 0` short-circuit, BEFORE the zero-image /

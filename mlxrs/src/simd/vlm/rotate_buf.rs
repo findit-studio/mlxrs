@@ -1,14 +1,13 @@
-//! C5 — `rotate_buf` pixel permutation.
+//! `rotate_buf` pixel permutation.
 //!
 //! Tracking: [#150](https://github.com/Findit-AI/mlxrs/issues/150).
-//! Plan: `docs/core-arch-simd-candidates.md` §2 row C5, §4 (image
-//! preprocessing). The §5.5 doc originally deferred C5 as "gather-bound";
-//! per the user directive 2026-05-23 (project memory rule **"SIMD ship
-//! NEON regardless"**), the NEON kernel ships unconditionally.
+//! The NEON kernel ships unconditionally: auto-vectorization is
+//! compiler-version-dependent and could silently de-vectorize on a
+//! toolchain upgrade, so the hand-rolled arm pins the SIMD contract.
 //!
 //! # The defect class
 //!
-//! Pre-C5 `crate::vlm::image::rotate_buf` is a per-pixel
+//! The original `crate::vlm::image::rotate_buf` is a per-pixel
 //! `copy_from_slice` loop over the source:
 //!
 //! ```rust,ignore
@@ -65,7 +64,7 @@
 //! The dispatcher writes into a caller-allocated `&mut [u8]` already
 //! sized to `src.len()` (per the caller's pre-existing
 //! `try_reserve_exact` + `resize` discipline in `rotate_buf`). Unlike
-//! the C3/C4 widen kernels, no `MaybeUninit` is needed — every
+//! the RGB/BGR widen kernels, no `MaybeUninit` is needed — every
 //! destination byte is written by exactly one source-pixel store.
 //!
 //! # Rotation arms (mirrors `RotateKind`)
@@ -110,7 +109,7 @@ impl RotateKind {
 }
 
 /// Scalar reference: per-pixel rotation of `src` into `dst`. Bit-exact
-/// match for the pre-C5 `rotate_buf` inner two-loop.
+/// match for the original `rotate_buf` inner two-loop.
 ///
 /// `channels` is the per-pixel subpixel count (1 / 2 / 3 / 4); `dst`
 /// and `src` are byte slices, so for `T = u8` the unit is bytes; the
@@ -379,7 +378,7 @@ pub fn rotate_buf_u8(
 
 #[cfg(test)]
 mod tests {
-  //! Scalar vs dispatcher Exact differential tests + edge coverage for C5.
+  //! Scalar vs dispatcher Exact differential tests + edge coverage for the rotate.
 
   use super::{RotateKind, rotate_buf_u8, rotate_buf_u8_scalar};
 
@@ -500,7 +499,7 @@ mod tests {
     rotate_buf_u8(&mut d, &s, 2, 2, 4, RotateKind::Rotate90);
   }
 
-  /// Wrap-arith defence: even though the wired `rotate_buf_u8_via_c5`
+  /// Wrap-arith defence: even though the wired `rotate_buf_u8`
   /// caller pre-checks `src_w * src_h * channels` via `checked_mul`,
   /// the public dispatcher entry is reachable directly (e.g. via a
   /// `pub use` from a future caller, or via the in-crate `unsafe`

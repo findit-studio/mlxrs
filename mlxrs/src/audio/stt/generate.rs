@@ -7,7 +7,7 @@
 //! consulted for the cross-attention shape, NOT for the per-model
 //! algorithm: greedy / beam / RNN-T expansion / segment alignment etc. live
 //! in per-model code per the
-//! [`project_no_per_model_arch_porting`][noarch] rule).
+//! `project_no_per_model_arch_porting` rule).
 //!
 //! [`stt_generate`] composes [`crate::audio::io::load_audio`],
 //! [`crate::audio::io::resample_linear`],
@@ -25,7 +25,7 @@
 //! [`stt_generate`] never materializes the encoder states or the logits
 //! itself.
 //!
-//! ## `wired_limit` / generation-stats parity (audit, AUDIO-A13)
+//! ## `wired_limit` / generation-stats parity
 //!
 //! mlx-audio's `generate_transcription` (`stt/generate.py:272-413`) wraps
 //! per-model decoding in a `wired_limit(model, [generation_stream])` context
@@ -49,7 +49,6 @@
 //! [stt-gen]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/generate.py
 //! [whisper]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/whisper/whisper.py
 //! [parakeet]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/parakeet/parakeet.py
-//! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 //! [iter]: core::iter::Iterator
 
 use std::path::Path;
@@ -241,18 +240,18 @@ fn audio_path_to_mel<M: super::model::Model>(
   //    src_sr` worth of decoded f32 frames, not the full 256 MiB
   //    load-stage ceiling.
   //
-  //    Source-rate cap (NOT target-rate): a Codex R1 high finding
-  //    flagged that deriving the cap from the model's target sample
-  //    rate spuriously rejected valid auto-resample inputs whose
+  //    Source-rate cap (NOT target-rate): deriving the cap from the
+  //    model's target sample rate would spuriously reject valid
+  //    auto-resample inputs whose
   //    `src_sr > target_sr` (e.g. a 1.0 s 44.1 kHz WAV at a 16 kHz
   //    model with `max_audio_seconds = 1.0` — declared 44 100 source
   //    samples vs `target_sr * 1.0 = 16 000` cap). Probing the source
   //    rate first and capping by `src_sr * max_audio_seconds` keeps
   //    every input whose source duration is `<= max_audio_seconds`
   //    decodable regardless of the model's resample target.
-  //    Closes the AUDIO-11 layered-cap gap.
+  //    Closes the layered-cap gap.
   //
-  // Snapshot the model's mel config ONCE (Codex #64 finding): the same
+  // Snapshot the model's mel config ONCE: the same
   // `mc` drives the resample target rate (step 3) and the log-mel
   // parameters (step 6). Calling `model.mel_config()` multiple times
   // risks subtle skew if a model computes it dynamically. The load-
@@ -268,7 +267,7 @@ fn audio_path_to_mel<M: super::model::Model>(
   //    buffer. The source duration is the ground truth: resampling can
   //    only refactor the same audio span into a different sample count, so
   //    a long-source over-cap input MUST reject here, before the resample
-  //    pass. Avoids the post-resample-only check Codex flagged: a source
+  //    pass. Avoids a post-resample-only check: a source
   //    just-over-cap could be truncated by `resample_linear`'s
   //    `floor(in * to / from)` and silently pass.
   //
@@ -291,7 +290,7 @@ fn audio_path_to_mel<M: super::model::Model>(
     )));
   }
 
-  // `mc` was snapshotted ONCE above (Codex #64 finding: calling
+  // `mc` was snapshotted ONCE above (calling
   // `model.mel_config()` twice risks subtle skew if a model computes it
   // dynamically, and duplicates the work). It drives the resample target
   // rate (step 3) and the log-mel parameters (step 6). The load-stage
@@ -324,7 +323,7 @@ fn audio_path_to_mel<M: super::model::Model>(
   //    shape into `model.encode_audio` — concrete encoders can reasonably
   //    assume at least one frame and panic / fail deep in per-model code
   //    on a zero-T input. Surface the empty-WAV case as a clear pipeline
-  //    `Error::EmptyInput` here (Codex round-1 medium); too-short-but-non-
+  //    `Error::EmptyInput` here; too-short-but-non-
   //    empty inputs are caught downstream by `log_mel_spectrogram`'s own
   //    reflect-pad guards, which already return a recoverable `Err` with
   //    a descriptive message.
@@ -350,9 +349,9 @@ fn audio_path_to_mel<M: super::model::Model>(
   // 6. log-mel spectrogram. Output shape `(n_mels, T)` per the
   //    mlx-audio / Whisper canonical layout — fed straight into
   //    `model.encode_audio`. Threads `mc.log_floor` through the
-  //    `_with` variant so a Kaldi/Custom-floor model (AUDIO-5 LogFloor)
+  //    `_with` variant so a Kaldi/Custom-floor model (custom `LogFloor`)
   //    is encoded with its own floor instead of the hard-coded Whisper
-  //    `1e-10` (Codex bundle-#64 finding). Reuses the `mc` snapshot
+  //    `1e-10`. Reuses the `mc` snapshot
   //    taken once at the top of this function.
   dsp::log_mel_spectrogram_with(
     &samples_arr,
@@ -498,7 +497,7 @@ impl<M: super::model::Model> SttGenerator<'_, M> {
     // the [`crate::lm::generate::GenConfig::collect_logprobs`] opt-in,
     // so we always emit `Some` to preserve the prior unconditional yield.
     let logprobs = ops::shape::squeeze_axes(&logprobs, &[0])?;
-    // LM-3 #114: provisional `step_index`/`finish_reason` — the iterator
+    // #114: provisional `step_index`/`finish_reason` — the iterator
     // overrides `finish_reason` to `Some("stop")` on the EOS step,
     // mirroring `lm::generate::Generator::step` + its `Iterator::next`.
     Ok(GenStep {
@@ -537,7 +536,7 @@ impl<M: super::model::Model> Iterator for SttGenerator<'_, M> {
         // detokenizer; iteration ends after.
         if self.eos.contains(&token) {
           self.done = true;
-          // LM-3 #114: "stop" reason on the EOS step (mirrors
+          // #114: "stop" reason on the EOS step (mirrors
           // `lm::generate::Generator::next` + VLM).
           step.finish_reason = Some(FinishReason::Eos);
         }
@@ -594,9 +593,9 @@ pub fn stt_generate<'a, M: super::model::Model>(
   cache: Vec<Box<dyn KvCache>>,
   cfg: SttGenConfig,
 ) -> Result<SttGenerator<'a, M>> {
-  // AUDIO-12 #136: eager scalar-bound validation of every sampler /
-  // logits-processor knob in `cfg.lm` BEFORE the audio pipeline runs.
-  // Codex #64 (the AUDIO-12 cross-reference) noted that the sampler-
+  // Eager scalar-bound validation of every sampler /
+  // logits-processor knob in `cfg.lm` BEFORE the audio pipeline runs
+  // (see #136). The sampler-
   // build path catches only a SUBSET of bounds at build time (the
   // per-primitive validations in `crate::lm::sample::apply_*` only fire
   // when the closure runs against logits), so an invalid `cfg` would
@@ -613,8 +612,8 @@ pub fn stt_generate<'a, M: super::model::Model>(
   // expensive audio load + resample + mel + `encode_audio` pipeline, so a
   // gen config that `make_sampler` / `make_logits_processors` rejects at
   // BUILD time (e.g. a logit_bias index/value-arity mismatch) fails fast
-  // from the constructor without paying the audio/encode cost (Codex #64
-  // finding). The eager `cfg.lm().validate()` above covers every scalar
+  // from the constructor without paying the audio/encode cost.
+  // The eager `cfg.lm().validate()` above covers every scalar
   // sampler / processor bound; the closure-build path still catches the
   // dynamic-bound + `make_sampler`-internal constraints (e.g. a
   // logit_bias `(indices, values)` arity check the eager pass can't

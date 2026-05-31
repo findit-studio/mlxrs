@@ -118,8 +118,8 @@ use crate::{array::Array, error::Result, ops::misc::astype};
 /// This is the crate's uniform stand-in for MLX *weak-scalar* / python
 /// `astype(x.dtype)` semantics: every constant or `-inf`/`eps`/`0` floor
 /// that meets the embedding tensor must adopt the embedding's dtype so a
-/// f16/bf16 input is **not** silently promoted to f32 (Codex round-4
-/// systemic dtype-fidelity finding). `mlx-embeddings` does exactly this
+/// f16/bf16 input is **not** silently promoted to f32 (dtype fidelity).
+/// `mlx-embeddings` does exactly this
 /// (`mask.astype(token_embeddings.dtype)`, and python scalars `-inf` /
 /// `eps` / `1e-9` are MLX weak scalars that adopt the array dtype).
 ///
@@ -127,7 +127,7 @@ use crate::{array::Array, error::Result, ops::misc::astype};
 /// `like` this is a dtype-preserving no-op cast, so f32 results are
 /// **bit-identical** to a direct `Array::full::<f32>` (regression-safe).
 fn scalar_like(value: f32, like: &Array) -> Result<Array> {
-  // C2 (Copilot review 4307622782, #3256688235): `Array::full` calls the
+  // `Array::full` calls the
   // fallible `mlx_array_new_float32` ctor BEFORE its `mlx_full` call (whose
   // `default_stream()` arg is what runs `ensure_handler_installed()`), so
   // with the eager `#[ctor]` stripped that first ctor could reach mlx-c

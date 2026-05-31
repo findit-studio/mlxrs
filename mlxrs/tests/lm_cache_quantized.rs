@@ -1,5 +1,5 @@
-//! Deterministic tests for the M3 quantized KV cache
-//! (`mlxrs::lm::cache::QuantizedKvCacheImpl`), hand-traced 1:1 from
+//! Deterministic tests for the quantized KV cache
+//! (`mlxrs::lm::cache::StandardQuantizedKvCache`), hand-traced 1:1 from
 //! `mlx_lm.models.cache.QuantizedKVCache` (`cache.py:232-324`) and
 //! cross-checked against mlx-swift-lm's `MLXLMCommon.QuantizedKVCache`
 //! (`KVCache.swift:744-1005`) + `QuantizedKVCacheProtocol`
@@ -16,7 +16,7 @@
 
 use mlxrs::{
   Array,
-  lm::cache::{KvCache, MaskMode, QuantizedKvCache, QuantizedKvCacheImpl, from_state},
+  lm::cache::{KvCache, MaskMode, QuantizedKvCache, StandardQuantizedKvCache, from_state},
   ops,
 };
 
@@ -71,7 +71,7 @@ fn assert_close(got: &mut Array, want: &mut Array) {
 /// sequence-axis concatenation.
 #[test]
 fn update_quantized_roundtrips_and_grows() {
-  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut c = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   assert!(c.is_empty());
   assert_eq!(c.offset(), 0);
   assert_eq!(c.group_size(), GROUP_SIZE);
@@ -132,7 +132,7 @@ fn update_quantized_roundtrips_and_grows() {
 /// `update_quantized`.
 #[test]
 fn base_update_returns_dequantized() {
-  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut c = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   let mut k = kv(4);
   let mut v = kv(4);
   let (mut dk, mut dv) = c.update(&k, &v).unwrap();
@@ -162,7 +162,7 @@ fn base_update_returns_dequantized() {
 /// `Some` triples dequantize back to the original.
 #[test]
 fn quantized_state_none_then_some() {
-  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut c = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   assert!(c.quantized_state().unwrap().is_none());
   assert!(c.as_quantized().is_some());
 
@@ -190,7 +190,7 @@ fn quantized_state_none_then_some() {
 /// and a fresh cache restored from it dequantizes identically.
 #[test]
 fn state_set_state_roundtrip() {
-  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut c = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   // Empty cache: state is [] (mlx-swift-lm `KVCache.swift:919`).
   assert!(c.state().unwrap().is_empty());
 
@@ -211,7 +211,7 @@ fn state_set_state_roundtrip() {
     vec!["3".to_string(), "64".to_string(), "8".to_string()]
   );
 
-  let mut c2 = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut c2 = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   c2.set_state(st_clone).unwrap();
   c2.set_meta_state(&meta).unwrap();
   assert_eq!(c2.offset(), 3);
@@ -237,7 +237,7 @@ fn state_set_state_roundtrip() {
 /// `(offset, group_size, bits)` (`cache.py:302-304`).
 #[test]
 fn from_state_quantized_roundtrip() {
-  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut c = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   let mut k = kv(2);
   let mut v = kv(2);
   c.update_quantized(&k, &v).unwrap();
@@ -295,7 +295,7 @@ fn from_state_quantized_roundtrip() {
 /// multi-token → `Causal` (no array) unless `return_array`/`window_size`.
 #[test]
 fn make_mask_forwards_to_create_attention_mask() {
-  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut c = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   c.update_quantized(&kv(3), &kv(3)).unwrap();
   // N == 1 → no mask (offset != 0 but single decode token).
   assert!(matches!(
@@ -325,7 +325,7 @@ fn make_mask_forwards_to_create_attention_mask() {
 /// deep clone (mlx-swift-lm `KVCache.swift:972-980`).
 #[test]
 fn trim_nbytes_copy() {
-  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut c = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   assert_eq!(c.nbytes(), 0);
   assert!(c.is_trimmable());
 
@@ -360,7 +360,7 @@ fn trim_nbytes_copy() {
 /// index.
 #[test]
 fn wrong_rank_errors() {
-  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut c = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   let bad = Array::from_slice::<f32>(&[1.0, 2.0], &(1usize, 2)).unwrap();
   assert!(c.update_quantized(&bad, &bad).is_err());
   assert!(c.update(&bad, &bad).is_err());
@@ -390,11 +390,11 @@ fn wrong_rank_errors() {
 /// token, NOT the stale trimmed `token1`. The new input uses a disjoint
 /// value range (`base = 100.0`) so a stale token (original `token1`,
 /// values ~0.43..1.25) is unmistakably distinguishable from the correct
-/// new token (~99.6..100.4). This is the regression for the Codex
-/// adversarial-review finding (append-onto-stale-storage after trim).
+/// new token (~99.6..100.4). This is the regression for the
+/// append-onto-stale-storage-after-trim defect.
 #[test]
 fn update_after_trim_overwrites_not_appends() {
-  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut c = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
 
   // update_and_fetch(S=4): tokens t0..t3 (ramp, base 0). offset 4.
   let mut k4 = kv(4);
@@ -468,7 +468,7 @@ fn update_after_trim_overwrites_not_appends() {
   let _ = v4.to_vec::<f32>().unwrap();
 }
 
-/// FIX 1 regression — the quantized cache's defining capability
+/// The quantized cache's defining capability
 /// `update_quantized` (`&mut self`) MUST be reachable through the generic
 /// `&mut dyn KvCache` / `Box<dyn KvCache>` a generation loop holds, via the
 /// **mutable** `as_quantized_mut` downcast (mlx-swift-lm `cache as?
@@ -480,13 +480,14 @@ fn update_after_trim_overwrites_not_appends() {
 fn as_quantized_mut_reaches_update_quantized_through_dyn() {
   // Hold the quantized cache ONLY as a generic boxed `dyn KvCache` (what a
   // generation loop / `make_prompt_cache` vector actually carries).
-  let mut boxed: Box<dyn KvCache> = Box::new(QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap());
+  let mut boxed: Box<dyn KvCache> =
+    Box::new(StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap());
 
   // The mutable downcast must succeed and let us call `update_quantized`.
   {
     let q = boxed
       .as_quantized_mut()
-      .expect("QuantizedKvCacheImpl must downcast via as_quantized_mut");
+      .expect("StandardQuantizedKvCache must downcast via as_quantized_mut");
     assert_eq!(q.group_size(), GROUP_SIZE);
     assert_eq!(q.bits(), BITS);
     let mut k = kv(3);
@@ -517,12 +518,12 @@ fn as_quantized_mut_reaches_update_quantized_through_dyn() {
   assert!(std_boxed.as_quantized_mut().is_none());
 }
 
-/// FIX 2 regression — `from_state("QuantizedKVCache", state, meta)` must
-/// re-establish P2's storage invariant (stored triples are exactly
-/// `offset`-length) by slicing each restored triple's sequence axis down to
-/// the restored `offset`, so a forged/inconsistent serialized cache (triple
-/// seq-len > meta `offset`) does NOT leak stale tokens past the logical
-/// offset on the next `update_quantized`. This makes P2's offset-length
+/// `from_state("QuantizedKVCache", state, meta)` must
+/// re-establish the offset-length storage invariant (stored triples are
+/// exactly `offset`-length) by slicing each restored triple's sequence axis
+/// down to the restored `offset`, so a forged/inconsistent serialized cache
+/// (triple seq-len > meta `offset`) does NOT leak stale tokens past the
+/// logical offset on the next `update_quantized`. This makes the offset-length
 /// representation observably IDENTICAL to mlx-lm, whose `state` getter
 /// already returns `[..., :offset, :]` (`cache.py:285-292`) — repr-
 /// equivalence maintenance, NOT a reject, and a no-op for consistent
@@ -535,7 +536,7 @@ fn from_state_slices_forged_overlong_triples_to_offset() {
   // serialized prompt cache (mlx-lm's `state` setter assigns triples as-is;
   // its getter would have sliced to `[:offset]`, so a faithful save never
   // produces this, but a forged blob can).
-  let mut src = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut src = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   src.update_quantized(&kv(5), &kv(5)).unwrap();
   let st: Vec<Array> = src
     .state()
@@ -614,7 +615,7 @@ fn from_state_slices_forged_overlong_triples_to_offset() {
 
   // A CONSISTENT state (seq-len == offset) round-trips byte-identically:
   // the slice-to-offset is a pure no-op for a faithfully saved state.
-  let mut src2 = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut src2 = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   src2.update_quantized(&kv(4), &kv(4)).unwrap();
   let consistent_st: Vec<Array> = src2
     .state()
@@ -657,7 +658,7 @@ fn from_state_slices_forged_overlong_triples_to_offset() {
   }
 }
 
-/// FIX 3 regression — symmetric to the FIX 2 overlength slice: when the
+/// Symmetric to the overlength slice above: when the
 /// restored state is UNDERLENGTH (stored triple seq-len < restored
 /// `offset`), `enforce_offset_len_invariant` must clamp `self.offset` DOWN
 /// to the actual stored seq-len. `slice_seq` uses mlx's NumPy-style
@@ -681,7 +682,7 @@ fn from_state_underlength_state_clamps_offset_down() {
   // underlength direction (mlx-lm's getter would have sliced to
   // `[:offset]` which is the full 3 here, so a faithful save never
   // produces this; a forged blob can).
-  let mut src = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut src = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   src.update_quantized(&kv(3), &kv(3)).unwrap();
   let st: Vec<Array> = src
     .state()
@@ -780,7 +781,7 @@ fn from_state_underlength_state_clamps_offset_down() {
 
   // A CONSISTENT state (seq-len == offset) round-trips byte-identically:
   // the symmetric clamp is a pure no-op for a faithfully saved state.
-  let mut src2 = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut src2 = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   src2.update_quantized(&kv(4), &kv(4)).unwrap();
   let consistent_st: Vec<Array> = src2
     .state()
@@ -828,11 +829,11 @@ fn from_state_underlength_state_clamps_offset_down() {
   }
 }
 
-/// **KVC-8 update (issue #105): post-fix behavior is REJECT, not clamp.**
-/// Pre-KVC-8 the across-K/V asymmetric forge (keys stored seq-len 3,
+/// **Update (issue #105): post-fix behavior is REJECT, not clamp.**
+/// Before the fix the across-K/V asymmetric forge (keys stored seq-len 3,
 /// values stored seq-len 5, meta offset 5) was accepted by `set_state` and
 /// later *converged* via `enforce_offset_len_invariant` (silent fix-up).
-/// Post-KVC-8 the eager K/V cross-validator in `set_state` REJECTS the
+/// After the fix the eager K/V cross-validator in `set_state` REJECTS the
 /// asymmetry upfront with a precise diagnostic at the load boundary — a
 /// forged/corrupt prompt cache surfaces immediately instead of running
 /// through a silent shape-converging code path. This is the documented
@@ -841,7 +842,7 @@ fn from_state_underlength_state_clamps_offset_down() {
 /// boundary).
 #[test]
 fn from_state_asymmetric_keys_shorter_is_rejected_at_set_state() {
-  let mut src_short = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut src_short = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   src_short.update_quantized(&kv(3), &kv(3)).unwrap();
   let s_short: Vec<Array> = src_short
     .state()
@@ -849,7 +850,7 @@ fn from_state_asymmetric_keys_shorter_is_rejected_at_set_state() {
     .iter()
     .map(|a| a.try_clone().unwrap())
     .collect();
-  let mut src_long = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut src_long = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   src_long.update_quantized(&kv(5), &kv(5)).unwrap();
   let s_long: Vec<Array> = src_long
     .state()
@@ -867,7 +868,7 @@ fn from_state_asymmetric_keys_shorter_is_rejected_at_set_state() {
   let result = from_state("QuantizedKVCache", forged_state, &forged_meta);
   let err = match result {
     Err(e) => e,
-    Ok(_) => panic!("post-KVC-8: asymmetric K/V forge must be REJECTED at set_state (not clamped)"),
+    Ok(_) => panic!("asymmetric K/V forge must be REJECTED at set_state (not clamped)"),
   };
   let msg = err.to_string();
   assert!(
@@ -876,12 +877,12 @@ fn from_state_asymmetric_keys_shorter_is_rejected_at_set_state() {
   );
 }
 
-/// **KVC-8 update (issue #105): see sibling test above.** Symmetric
-/// counterpart: keys longer than values. Pre-KVC-8 the forge was clamped;
-/// post-KVC-8 it is REJECTED at set_state with a precise diagnostic.
+/// **Update (issue #105): see sibling test above.** Symmetric
+/// counterpart: keys longer than values. Before the fix the forge was clamped;
+/// after the fix it is REJECTED at set_state with a precise diagnostic.
 #[test]
 fn from_state_asymmetric_values_shorter_is_rejected_at_set_state() {
-  let mut src_short = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut src_short = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   src_short.update_quantized(&kv(3), &kv(3)).unwrap();
   let s_short: Vec<Array> = src_short
     .state()
@@ -889,7 +890,7 @@ fn from_state_asymmetric_values_shorter_is_rejected_at_set_state() {
     .iter()
     .map(|a| a.try_clone().unwrap())
     .collect();
-  let mut src_long = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut src_long = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   src_long.update_quantized(&kv(5), &kv(5)).unwrap();
   let s_long: Vec<Array> = src_long
     .state()
@@ -907,7 +908,7 @@ fn from_state_asymmetric_values_shorter_is_rejected_at_set_state() {
   let result = from_state("QuantizedKVCache", forged_state, &forged_meta);
   let err = match result {
     Err(e) => e,
-    Ok(_) => panic!("post-KVC-8: asymmetric K/V forge must be REJECTED at set_state (not clamped)"),
+    Ok(_) => panic!("asymmetric K/V forge must be REJECTED at set_state (not clamped)"),
   };
   let msg = err.to_string();
   assert!(
@@ -916,7 +917,7 @@ fn from_state_asymmetric_values_shorter_is_rejected_at_set_state() {
   );
 }
 
-/// Regression for the Copilot finding rid=4324739111 on top of the post-#80
+/// Regression on top of the post-#80
 /// across-K/V asymmetric-clamp landing: a forged state can have ASYMMETRIC
 /// seq-lens *within* a single triple's `(weight, scales, biases)` components
 /// (the analog of the across-K/V case one level down — mlx-lm's `state`
@@ -941,7 +942,7 @@ fn from_state_asymmetric_values_shorter_is_rejected_at_set_state() {
 #[test]
 fn from_state_underlength_state_within_triple_asymmetric_clamps_to_min() {
   // Honest 3-step source: every component of every triple is seq-len 3.
-  let mut src_short = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut src_short = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   src_short.update_quantized(&kv(3), &kv(3)).unwrap();
   let s_short: Vec<Array> = src_short
     .state()
@@ -950,7 +951,7 @@ fn from_state_underlength_state_within_triple_asymmetric_clamps_to_min() {
     .map(|a| a.try_clone().unwrap())
     .collect();
   // Honest 5-step source: every component of every triple is seq-len 5.
-  let mut src_long = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut src_long = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   src_long.update_quantized(&kv(5), &kv(5)).unwrap();
   let s_long: Vec<Array> = src_long
     .state()
@@ -988,17 +989,17 @@ fn from_state_underlength_state_within_triple_asymmetric_clamps_to_min() {
   );
   let forged_meta = vec!["5".to_string(), "64".to_string(), "8".to_string()];
 
-  // **KVC-8 update (issue #105): post-fix behavior is REJECT, not clamp.**
+  // **Update (issue #105): post-fix behavior is REJECT, not clamp.**
   // The within-triple asymmetry on keys (k_w seq=5, k_s seq=3) makes
   // k_s.shape != v_s.shape (v_s is seq=5), so the eager K/V validator
   // rejects at set_state — the across-K/V projection of the within-triple
   // inconsistency lands directly on the cross-validator's axis check. The
-  // pre-KVC-8 silent "within-triple min" convergence path is gone.
+  // earlier silent "within-triple min" convergence path is gone.
   let result = from_state("QuantizedKVCache", forged_state, &forged_meta);
   let err = match result {
     Err(e) => e,
     Ok(_) => panic!(
-      "post-KVC-8: within-triple asymmetry surfaces as a K/V scales shape mismatch \
+      "within-triple asymmetry surfaces as a K/V scales shape mismatch \
        at set_state — REJECTED, not silently converged"
     ),
   };
@@ -1019,7 +1020,7 @@ fn from_state_underlength_state_within_triple_asymmetric_clamps_to_min() {
 fn from_state_underlength_state_within_triple_asymmetric_bias_less_clamps_to_min() {
   // Honest 3-step + 5-step sources, then strip biases (drop [2] and [5])
   // to build 4-array bias-less states.
-  let mut src_short = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut src_short = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   src_short.update_quantized(&kv(3), &kv(3)).unwrap();
   let s_short_full: Vec<Array> = src_short
     .state()
@@ -1027,7 +1028,7 @@ fn from_state_underlength_state_within_triple_asymmetric_bias_less_clamps_to_min
     .iter()
     .map(|a| a.try_clone().unwrap())
     .collect();
-  let mut src_long = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut src_long = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   src_long.update_quantized(&kv(5), &kv(5)).unwrap();
   let s_long_full: Vec<Array> = src_long
     .state()
@@ -1049,14 +1050,14 @@ fn from_state_underlength_state_within_triple_asymmetric_bias_less_clamps_to_min
   assert_eq!(forged_state[1].shape(), vec![1, 1, 3, 1]);
   let forged_meta = vec!["5".to_string(), "64".to_string(), "8".to_string()];
 
-  // **KVC-8 update (issue #105): post-fix behavior is REJECT, not clamp.**
+  // **Update (issue #105): post-fix behavior is REJECT, not clamp.**
   // Same as the 6-array within-triple test above: the k_s seq=3 vs v_s
   // seq=5 mismatch is rejected by the eager K/V cross-validator at
   // set_state.
   let result = from_state("QuantizedKVCache", forged_state, &forged_meta);
   let err = match result {
     Err(e) => e,
-    Ok(_) => panic!("post-KVC-8: bias-less within-triple asymmetry is REJECTED at set_state"),
+    Ok(_) => panic!("bias-less within-triple asymmetry is REJECTED at set_state"),
   };
   let msg = err.to_string();
   assert!(
@@ -1077,7 +1078,7 @@ fn from_state_underlength_state_within_triple_asymmetric_bias_less_clamps_to_min
 fn set_meta_state_accepts_swift_4string_form() {
   // Start from a fresh cache with placeholder group_size/bits; the swift
   // 4-string meta restores them to the saved values.
-  let mut c = QuantizedKvCacheImpl::new_unchecked(0, 0);
+  let mut c = StandardQuantizedKvCache::new_unchecked(0, 0);
   c.set_meta_state(&[
     "256".to_string(), // step (dropped, NOT stored)
     "10".to_string(),  // offset
@@ -1097,7 +1098,7 @@ fn set_meta_state_accepts_swift_4string_form() {
 /// observable behavior.
 #[test]
 fn set_meta_state_accepts_mlx_lm_3string_form() {
-  let mut c = QuantizedKvCacheImpl::new_unchecked(0, 0);
+  let mut c = StandardQuantizedKvCache::new_unchecked(0, 0);
   c.set_meta_state(&[
     "10".to_string(), // offset
     "64".to_string(), // group_size
@@ -1116,7 +1117,7 @@ fn set_meta_state_accepts_mlx_lm_3string_form() {
 /// invariant on bad arity).
 #[test]
 fn set_meta_state_rejects_2_or_5_string_form() {
-  let mut c = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut c = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   // Too-short: 2 strings (was always rejected; combined message now lists
   // both accepted arities).
   let err2 = c
@@ -1158,7 +1159,7 @@ fn set_meta_state_rejects_2_or_5_string_form() {
 #[test]
 fn from_state_round_trip_via_swift_form() {
   // Build an honest 3-step source and capture its serialized state.
-  let mut src = QuantizedKvCacheImpl::new(GROUP_SIZE, BITS).unwrap();
+  let mut src = StandardQuantizedKvCache::new(GROUP_SIZE, BITS).unwrap();
   let mut k = kv(3);
   let mut v = kv(3);
   src.update_quantized(&k, &v).unwrap();

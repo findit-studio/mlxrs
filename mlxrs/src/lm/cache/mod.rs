@@ -15,7 +15,7 @@
 //! [`RopeOffset`] (swift `RoPEOffset`) and [`MaskMode`] (swift
 //! `ScaledDotProductAttentionMaskMode`) enums. Concrete caches:
 //! [`StandardKvCache`], [`RotatingKvCache`], [`ChunkedKvCache`],
-//! [`QuantizedKvCacheImpl`], plus the prompt-cache/persist surface; the
+//! [`StandardQuantizedKvCache`], plus the prompt-cache/persist surface; the
 //! composite [`CacheList`]; the batch caches [`BatchKvCache`] /
 //! [`BatchRotatingKvCache`] with the [`dynamic_roll`] helper; and the SSM
 //! slot cache [`ArraysCache`] (added by this PR). [`from_state`] is left
@@ -120,7 +120,7 @@ pub type QTriple = (Array, Array, Option<Array>);
 /// later-PR Chunked/Quantized/… types) implement this; the generation loop
 /// and `make_prompt_cache` work uniformly over `Box<dyn KvCache>`.
 ///
-/// # Per-layer fast-path convention (P1 #110)
+/// # Per-layer fast-path convention (#110)
 ///
 /// `Model::forward` calls `cache[i].update(k, v)?` once per layer per token
 /// through the `Box<dyn KvCache>` vtable — `~32-80` vtables per token,
@@ -158,7 +158,7 @@ pub type QTriple = (Array, Array, Option<Array>);
 /// }
 /// ```
 ///
-/// # Breaking change (P1 #110)
+/// # Breaking change (#110)
 ///
 /// This trait now requires a `fn as_any_mut(&mut self) -> &mut dyn std::any::Any`
 /// method with NO default. Out-of-tree implementations of [`KvCache`] MUST add
@@ -208,7 +208,7 @@ pub trait KvCache {
   /// [`offset`](KvCache::offset). This mirrors mlx-swift-lm's
   /// `BatchPositionedKVCache` `ropeOffset` protocol extension
   /// (`extension BatchPositionedKVCache { var ropeOffset { .batch(...) } }`),
-  /// whose automatic conformance Rust lacks — so a P5 batch cache need only
+  /// whose automatic conformance Rust lacks — so a batch cache need only
   /// implement [`as_batch_positioned`](KvCache::as_batch_positioned) /
   /// [`BatchPositionedKvCache::batch_offset`] and inherits the correct
   /// `Batch` RoPE offset here without re-overriding `rope_offset`.
@@ -242,7 +242,7 @@ pub trait KvCache {
   fn state(&self) -> Result<Vec<Array>>;
 
   /// Push the serializable array state into a caller-provided buffer —
-  /// the buffer-reuse companion to [`state`](KvCache::state) (KVC-7, #104).
+  /// the buffer-reuse companion to [`state`](KvCache::state) (#104).
   ///
   /// Python's `_BaseCache.state` getter (`cache.py:152-156`) returns a
   /// fresh tuple per call, and swift's `var state: [MLXArray]` allocates a
@@ -316,7 +316,7 @@ pub trait KvCache {
 
   /// Push the serializable scalar metadata into a caller-provided buffer —
   /// the buffer-reuse companion to [`meta_state`](KvCache::meta_state)
-  /// (KVC-6, #103).
+  /// (#103).
   ///
   /// Python's `_BaseCache.meta_state` getter (`cache.py:158-165`) returns
   /// a fresh tuple per call and swift's `metaState: [String]` allocates a
@@ -357,7 +357,7 @@ pub trait KvCache {
 
   /// Restore the cache from a serialized `(state, meta)` pair.
   ///
-  /// # Transactional default (KVC-1)
+  /// # Transactional default
   ///
   /// The default implementation **snapshots** the current `state()` +
   /// `meta_state()` BEFORE calling [`set_state`](KvCache::set_state) and
@@ -365,7 +365,7 @@ pub trait KvCache {
   /// `set_meta_state` failure *after* `set_state` has already mutated
   /// `self`, the default rolls back to the snapshot (best-effort, see
   /// "Rollback failure" below). This closes the half-restore window the
-  /// pre-KVC-1 default left open (the verbatim
+  /// earlier default left open (the verbatim
   /// `mlx_lm/models/cache.py:170-175` two-setter sequence).
   ///
   /// The snapshot is captured as `Vec<Array>` (via `state()`, which
@@ -380,7 +380,7 @@ pub trait KvCache {
   /// `set_meta_state` returns `Err`), the original `set_meta_state` error
   /// is returned with a `(rollback also failed: …)` suffix appended for
   /// diagnostics. In that pathological case `self` may be left
-  /// half-restored — the same failure mode the pre-KVC-1 default had
+  /// half-restored — the same failure mode the earlier default had
   /// unconditionally. The rollback path runs only on the
   /// previously-valid snapshot, so this is a defense-in-depth annotation
   /// of an extreme failure scenario, not the common case.
@@ -412,7 +412,7 @@ pub trait KvCache {
   /// tokens that an impl may want to parse multiple times.
   #[allow(clippy::wrong_self_convention)] // mirrors mlx-lm `from_state` / swift `restoreFromMetaState`
   fn from_serialized(&mut self, state: Vec<Array>, meta: &[String]) -> Result<()> {
-    // KVC-1 (issue #98 + R1 follow-up): transactional default — snapshot
+    // Issue #98: transactional default — snapshot
     // pre-call `state()` + `meta_state()`, attempt the 2-setter chain, and
     // on EITHER setter's failure roll back to the snapshot so `self` is
     // not left half-restored.
@@ -554,7 +554,7 @@ pub trait KvCache {
   }
 
   /// Mutable [`Any`](std::any::Any) hook for the per-layer fast-path
-  /// downcast (P1 #110 — see the **Per-layer fast-path convention**
+  /// downcast (#110 — see the **Per-layer fast-path convention**
   /// section on the trait doc above).
   ///
   /// Each per-model `Model::forward` calls `cache[i].update(k, v)?`
@@ -625,7 +625,7 @@ pub trait KvCache {
   /// is exactly what mlx-lm `save_prompt_cache` writes (`cache.py:56`,
   /// `type(c).__name__`) and what [`from_state`] keys on.
   ///
-  /// # REQUIRED method — no default (KVC-10)
+  /// # REQUIRED method — no default
   ///
   /// This is intentionally a **required** trait method (no default).
   /// Forgetting to declare the class name on a new in-tree cache is a
@@ -690,7 +690,7 @@ pub trait BatchPositionedKvCache: KvCache {
 /// (`cache.py:898`) with a Rust enum whose variants are an exhaustive
 /// match. Adding a new in-tree cache kind requires adding a variant AND
 /// the dispatch arm in [`from_state`] — both compile-checked, so a
-/// forgotten arm is a `non_exhaustive_patterns` warning/error (KVC-3).
+/// forgotten arm is a `non_exhaustive_patterns` warning/error.
 ///
 /// `parse` accepts both the reference Python/Swift class names AND the
 /// Rust struct-name round-trip aliases — every key the previous
@@ -707,8 +707,8 @@ pub enum KvCacheKind {
   /// [`ChunkedKvCache`]: `"ChunkedKVCache"` | `"ChunkedKvCache"`
   /// (Rust alias).
   ChunkedKvCache,
-  /// [`QuantizedKvCacheImpl`]: `"QuantizedKVCache"` |
-  /// `"QuantizedKvCacheImpl"` (Rust alias).
+  /// [`StandardQuantizedKvCache`]: `"QuantizedKVCache"` |
+  /// `"StandardQuantizedKvCache"` (Rust alias).
   QuantizedKvCache,
   /// [`CacheList`]: `"CacheList"` (the composite).
   CacheList,
@@ -722,7 +722,7 @@ pub enum KvCacheKind {
   /// [`ArraysCache`] aliased as `MambaCache` — mlx-swift-lm's
   /// `class MambaCache: ArraysCache` (`KVCache.swift:1229`, a 2-slot
   /// `ArraysCache`). Distinct variant from [`KvCacheKind::ArraysCache`]
-  /// so the `is_mamba` provenance flag (KVC-9) survives the round trip.
+  /// so the `is_mamba` provenance flag survives the round trip.
   MambaCache,
 }
 
@@ -747,14 +747,14 @@ impl KvCacheKind {
 
   /// Parse a reference class name (or Rust round-trip alias) into the
   /// typed dispatch tag, or `Err` for an unknown kind — the typed
-  /// replacement for the pre-KVC-3 `match kind { ... other => Err(...) }`
+  /// replacement for the earlier `match kind { ... other => Err(...) }`
   /// string-keyed dispatch.
   pub fn parse(kind: &str) -> Result<Self> {
     match kind {
       "KVCache" | "ConcatenateKVCache" | "KVCacheSimple" | "StandardKvCache" => Ok(Self::KvCache),
       "RotatingKVCache" | "RotatingKvCache" => Ok(Self::RotatingKvCache),
       "ChunkedKVCache" | "ChunkedKvCache" => Ok(Self::ChunkedKvCache),
-      "QuantizedKVCache" | "QuantizedKvCacheImpl" => Ok(Self::QuantizedKvCache),
+      "QuantizedKVCache" | "StandardQuantizedKvCache" => Ok(Self::QuantizedKvCache),
       "CacheList" => Ok(Self::CacheList),
       "BatchKVCache" | "BatchKvCache" => Ok(Self::BatchKvCache),
       "BatchRotatingKVCache" | "BatchRotatingKvCache" => Ok(Self::BatchRotatingKvCache),
@@ -773,7 +773,7 @@ impl KvCacheKind {
           "ChunkedKVCache",
           "ChunkedKvCache",
           "QuantizedKVCache",
-          "QuantizedKvCacheImpl",
+          "StandardQuantizedKvCache",
           "CacheList",
           "BatchKVCache",
           "BatchKvCache",
@@ -795,7 +795,7 @@ impl KvCacheKind {
 /// **reference Python class name**, `cache.py:56`) and `load_prompt_cache`
 /// reconstructs via `globals()[that_name]` (`cache.py:80`), so a prompt
 /// cache produced by mlx-lm / mlx-swift names the cache by its reference
-/// class — KVC-3 replaces the string-keyed `match kind { … }` with a
+/// class — the string-keyed `match kind { … }` is replaced with a
 /// typed [`KvCacheKind`] enum dispatched via [`KvCacheKind::parse`]. The
 /// match is keyed primarily on those source names, with our Rust struct
 /// names kept as back-compat aliases (see [`KvCacheKind`]):
@@ -806,8 +806,8 @@ impl KvCacheKind {
 ///   (Rust alias)
 /// - → [`ChunkedKvCache`]: `"ChunkedKVCache"` | `"ChunkedKvCache"`
 ///   (Rust alias)
-/// - → [`QuantizedKvCacheImpl`]: `"QuantizedKVCache"` |
-///   `"QuantizedKvCacheImpl"` (Rust alias)
+/// - → [`StandardQuantizedKvCache`]: `"QuantizedKVCache"` |
+///   `"StandardQuantizedKvCache"` (Rust alias)
 /// - → [`CacheList`]: `"CacheList"` (the composite — rebuilds each child
 ///   recursively through this same dispatcher)
 /// - → [`BatchKvCache`]: `"BatchKVCache"` | `"BatchKvCache"` (Rust alias)
@@ -817,8 +817,8 @@ impl KvCacheKind {
 ///   `"MambaCache"` (mlx-swift-lm's `class MambaCache: ArraysCache`,
 ///   `KVCache.swift:1229` — a 2-slot `ArraysCache` adding **no** extra
 ///   state/metadata; swift saves this kind, `KVCache.swift:1384`, and
-///   reconstructs it identically, `KVCache.swift:1531`); KVC-9 preserves
-///   the `MambaCache` provenance via [`ArraysCache::mamba`] so a
+///   reconstructs it identically, `KVCache.swift:1531`); the
+///   `MambaCache` provenance is preserved via [`ArraysCache::mamba`] so a
 ///   save-after-load emits `"MambaCache"` again rather than degrading to
 ///   `"ArraysCache"`.
 ///
@@ -881,7 +881,7 @@ pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<
       c.set_meta_state(meta)?;
       Ok(Box::new(c))
     }
-    // mlx-lm / mlx-swift-lm `QuantizedKVCache`; `"QuantizedKvCacheImpl"` is
+    // mlx-lm / mlx-swift-lm `QuantizedKVCache`; `"StandardQuantizedKvCache"` is
     // our own round-trip alias.
     KvCacheKind::QuantizedKvCache => {
       // mlx-lm reconstructs without __init__ then assigns state/meta_state
@@ -891,7 +891,7 @@ pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<
       // placeholder `group_size`/`bits` here are overwritten by
       // `set_meta_state` (a serialized prompt cache always carries the
       // 3-value meta_state).
-      let mut c = QuantizedKvCacheImpl::new_unchecked(0, 0);
+      let mut c = StandardQuantizedKvCache::new_unchecked(0, 0);
       c.set_state(state)?;
       c.set_meta_state(meta)?;
       // mlx-lm's `QuantizedKVCache.state` setter (cache.py:294-296:
@@ -914,7 +914,7 @@ pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<
           "must satisfy offset=0 when buffer is empty",
         )));
       }
-      // P2 stores the quant triples **exactly `offset`-length** (the
+      // The quant triples are stored **exactly `offset`-length** (the
       // documented `ConcatenateKVCache` / `StandardKvCache` equivalence;
       // `mlxrs::Array` is functional, no in-place buffer slice). `set_state`
       // and `set_meta_state` each stay individually 1:1 with mlx-lm
@@ -934,7 +934,7 @@ pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<
       // validation the reference lacks: mlx-lm's `state` *getter* already
       // returns `[..., :offset, :]` (cache.py:285-292), which is
       // `[:min(offset, buf_len)]` under Python slice semantics — so this
-      // converge makes P2's offset-length representation observably
+      // converge makes the offset-length representation observably
       // IDENTICAL to mlx-lm's for ALL inputs (including forged ones in
       // either direction) — repr-equivalence maintenance mirroring mlx-lm's
       // `[:offset]`, not a reject. A faithfully saved consistent state
@@ -1015,7 +1015,7 @@ pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<
       //    produce — the structural class-kill, complete.
       // Report the EXACT conflict (which invariant failed and the offending
       // values) so a corrupt prompt-cache file is diagnosable from the
-      // error message alone — Copilot review #3271119609.
+      // error message alone.
       if c.is_empty() {
         let offset = c.offset();
         let idx = c.ring_idx();
@@ -1073,7 +1073,7 @@ pub fn from_state(kind: &str, state: Vec<Array>, meta: &[String]) -> Result<Box<
     // fixing `size = 2`; swift *saves* the kind `"MambaCache"`
     // (`KVCache.swift:1384`) and its own load arm rebuilds it via the
     // identical `restoreFromMetaState` (`KVCache.swift:1531-1533`,
-    // == `ArraysCache(size: 2)`). KVC-9 preserves the provenance via a
+    // == `ArraysCache(size: 2)`). The provenance is preserved via a
     // constructor-time `is_mamba` flag on [`ArraysCache`] so a
     // save-after-load emits `"MambaCache"` again (not `"ArraysCache"`); the
     // slot state itself is identical (the no-per-model-arch-porting rule is

@@ -1,6 +1,6 @@
 //! Grammar-constrained decoding — port of
 //! [`mlx_vlm/structured.py`](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/structured.py)
-//! (V6 / issue #180). At each decode step the processor masks the model's
+//! (issue #180). At each decode step the processor masks the model's
 //! logits to `-inf` for any token id that cannot be the next byte-grammar-
 //! valid continuation, leaving only allowed tokens samplable. Backed by the
 //! upstream Rust [`llguidance`] crate (the same engine the Python reference
@@ -27,7 +27,7 @@
 //!   common "give me a JSON-schema-constrained processor" path.
 //!
 //! **Per-step contract.** [`crate::lm::generate::LogitsProcessor`] is now a
-//! public `enum` (P1 #109) with built-in variants for common cases
+//! public `enum` (#109) with built-in variants for common cases
 //! (`LogitBias`, `RepetitionPenalty`, `PresencePenalty`, `FrequencyPenalty`).
 //! Custom or stateful logits processors plug in through the
 //! `LogitsProcessor::Custom(Box::new(...))` escape hatch, which preserves
@@ -189,7 +189,7 @@ fn tok_env_from_tokenizer(
   //   - and `compute_mask_or_eos` returns an EOS-only mask gated by the
   //     WRONG eos id (id `0`).
   //
-  // **Padded-vocab support (V6 R4).** We register the configured EOS ids
+  // **Padded-vocab support.** We register the configured EOS ids
   // AFTER widening the toktrie via `ByteTokenizerEnv::new(bt,
   // model_vocab_size)`. The widened `TokTrie::vocab_size()` then equals
   // `model_vocab_size.unwrap_or(bt_vocab)`, and
@@ -199,7 +199,7 @@ fn tok_env_from_tokenizer(
   // with `bt_vocab=99` + `model_vocab_size=Some(128)`) is now legitimate
   // and fully registered in `tok_trie.eos_token_set()`.
   //
-  // The earlier R3 design called `bt.set_eos_tokens` BEFORE
+  // An earlier design called `bt.set_eos_tokens` BEFORE
   // `into_tok_env`, against the still-unpadded
   // `bt.tokrx_info().vocab_size`. That meant padded-range ids could
   // only be silently filtered out (otherwise upstream's `assert!`
@@ -271,7 +271,7 @@ fn tok_env_from_tokenizer(
 /// # Mutability
 ///
 /// [`crate::lm::generate::LogitsProcessor`] is now a public `enum`
-/// (P1 #109); stateful custom processors plug in via
+/// (#109); stateful custom processors plug in via
 /// `LogitsProcessor::Custom(Box::new(...))`, whose closure type is
 /// `Box<dyn Fn(&[u32], &Array) -> Result<Array>>` (not `FnMut`). Processors
 /// that own mutable state — exactly this one — therefore hold it behind a

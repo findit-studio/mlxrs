@@ -506,9 +506,10 @@ pub fn load_processor_config(
 
   if let Some(body) = preferred_body {
     // Tolerant parse — image-preprocessor-only files (no `processor_class`)
-    // are NOT a parse error at this layer; that's the case Fix 2 unblocks.
-    // A truly malformed (non-JSON) preferred file is still an error, since
-    // the constructor would also choke on it.
+    // are NOT a parse error at this layer; the dispatch class comes from
+    // `processor_config.json` in that case (handled below). A truly
+    // malformed (non-JSON) preferred file is still an error, since the
+    // constructor would also choke on it.
     let parsed: ProcessorClassOnly = serde_json::from_str(&body).map_err(|e| {
       Error::Parse(ParsePayload::new(
         "load_processor_config: preferred processor config (expected an OBJECT, optionally with a \
@@ -1338,8 +1339,8 @@ mod tests {
   /// `config.setdefault("text_config", ...)`), and an arbitrary
   /// `vision_config` block. NO top-level `hidden_size` / `num_hidden_layers`
   /// / `vocab_size` / etc. — the regression case the
-  /// [`crate::lm::load::Config`] parse would have *fatally rejected*
-  /// before this PR's fix (since those fields are required there).
+  /// [`crate::lm::load::Config`] parse would *fatally reject* (since those
+  /// fields are required there).
   fn mock_nested_config_json(model_type: &str) -> String {
     format!(
       r#"{{
@@ -1704,16 +1705,16 @@ mod tests {
 
   #[test]
   fn loaded_model_drives_vlm_generate_end_to_end() {
-    // Codex review (load↔generate integration gap): `load()` hands back a
+    // load↔generate integration gap: `load()` hands back a
     // `LoadedVlmContext` whose `model` is a `Box<dyn VlmModel>`, and the
     // public `vlm_generate` is generic over `M: vlm::Model + ?Sized`. This
     // test proves the loader's trait-object output drives the generation
     // loop *directly* — `ctx.model()` deref-coerces `Box<dyn VlmModel>` to
     // `&dyn VlmModel`, an UNSIZED `M`, which satisfies the relaxed bound.
-    // Before the `?Sized` relaxation this call did not compile at all (the
-    // implicit `Sized` bound rejected `dyn VlmModel`), so the loader's
-    // output was unusable by the generation loop; that regression is now
-    // caught here. Zero-image path — `vlm_generate` dispatches straight to
+    // Without the `?Sized` relaxation this call would not compile at all
+    // (the implicit `Sized` bound would reject `dyn VlmModel`), so the
+    // loader's output would be unusable by the generation loop; that
+    // regression is caught here. Zero-image path — `vlm_generate` dispatches straight to
     // `lm::generate::generate_step` (also `?Sized`-generic, accepted
     // because `VlmModel: Model`) — so this needs no image fixture.
     let dir = fresh_dir("e2e-generate");
@@ -1755,7 +1756,7 @@ mod tests {
 
   #[test]
   fn loaded_processor_config_drives_image_preprocessing_not_model_default() {
-    // Codex review (load↔generate gap, [high]): `vlm_generate` must
+    // load↔generate gap: `vlm_generate` must
     // preprocess real image prompts with the *loaded* processor's
     // `ImageProcessorConfig` — the one parsed from
     // `preprocessor_config.json` / `processor_config.json` and carried on
@@ -1773,7 +1774,8 @@ mod tests {
     // the loaded processor's config + one real image, and asserts the
     // model's `encode_image` saw a `[48, 48, 3]` preprocessed array —
     // proof the LOADED config (not the 224×224 model default) drove
-    // preprocessing. Before the fix this preprocessed to `[224, 224, 3]`.
+    // preprocessing. Re-deriving the config from the model default would
+    // instead preprocess to `[224, 224, 3]`.
     use std::sync::{Arc, Mutex};
 
     // A VLM model whose `encode_image` records the shape of the
@@ -2253,13 +2255,13 @@ mod tests {
 
   #[test]
   fn load_succeeds_for_nested_vlm_config_with_no_top_level_lm_fields() {
-    // **Regression** for the Codex finding: real VLM `config.json` files
+    // **Regression** test: real VLM `config.json` files
     // commonly nest the text-model fields (`hidden_size` /
     // `num_hidden_layers` / `vocab_size` / etc.) under `text_config` and
     // only carry `model_type` at the top — exactly what
-    // `mock_nested_config_json` shapes. Before the fix, the VLM load path
-    // ran the LM `lm::load::Config` parse upfront, which REQUIRES those
-    // top-level fields → every real VLM checkpoint fatally errored
+    // `mock_nested_config_json` shapes. Routing the VLM load path through
+    // the LM `lm::load::Config` parse upfront would REQUIRE those
+    // top-level fields → every real VLM checkpoint would fatally error
     // BEFORE a registered VLM constructor could see the raw JSON. With
     // the VLM-minimal `VlmBaseConfig` parse, the dispatch goes through,
     // the per-model constructor reads its nested `text_config.vocab_size`
@@ -2453,7 +2455,7 @@ mod tests {
   }
 
   // ────────────────────────────────────────────────────────────────────
-  // Fix 1: nested-EOS promotion regression tests.
+  // Nested-EOS promotion regression tests.
   // ────────────────────────────────────────────────────────────────────
 
   /// Write a `tokenizer_config.json` that pins the tokenizer-config
@@ -2471,9 +2473,9 @@ mod tests {
     // carries a list `[42, 50]`. The tokenizer_config pins a different
     // fallback EOS (`"c"` → id 2). After load, the tokenizer's COMPLETE
     // eos set MUST be exactly {42, 50} — the nested promotion happened
-    // and REPLACED the tokenizer-config default. Before Fix 1, the
-    // nested value was silently dropped → eos set = {2}, wrong generation
-    // stop.
+    // and REPLACED the tokenizer-config default. Without the promotion,
+    // the nested value would be silently dropped → eos set = {2}, wrong
+    // generation stop.
     let dir = fresh_dir("nested-text-config-eos");
     let cfg = r#"{
       "model_type": "mockvlm",
@@ -2785,13 +2787,13 @@ mod tests {
   }
 
   // ────────────────────────────────────────────────────────────────────
-  // Fix 2: preprocessor + processor_config dispatch fallback.
+  // preprocessor + processor_config dispatch fallback.
   // ────────────────────────────────────────────────────────────────────
 
   /// A minimal **image-preprocessor-only** `preprocessor_config.json` —
   /// the real HF VLM layout: `image_mean` / `image_std` and a
   /// model-specific `mock_image_size`, NO `processor_class`. Used by the
-  /// Fix 2 regression case where dispatch metadata must come from
+  /// regression case where dispatch metadata must come from
   /// `processor_config.json` instead.
   fn mock_image_only_preprocessor_config_json(image_size: u32) -> String {
     format!(
@@ -2820,16 +2822,17 @@ mod tests {
 
   #[test]
   fn processor_class_falls_back_to_processor_config_when_preprocessor_has_none() {
-    // **Regression** for Codex Fix 2: real HF VLM dir where the
+    // **Regression** test: real HF VLM dir where the
     // preprocessor file carries ONLY image-preprocessor metadata (no
     // `processor_class`) and `processor_config.json` carries the dispatch
-    // class. Before the fix, the strict parse of `preprocessor_config.json`
-    // failed immediately → `processor_config.json` was never tried →
-    // otherwise-loadable VLM dir was rejected. After the fix: dispatch
-    // class comes from `processor_config.json`, but the constructor still
-    // sees the `preprocessor_config.json` body (image-preprocessor
-    // metadata) — its `mock_image_size = 24` round-trips through the
-    // mock processor, proving the constructor body source.
+    // class. A strict parse of `preprocessor_config.json` would fail
+    // immediately → `processor_config.json` would never be tried →
+    // otherwise-loadable VLM dir rejected. The tolerant resolution makes
+    // the dispatch class come from `processor_config.json`, while the
+    // constructor still sees the `preprocessor_config.json` body
+    // (image-preprocessor metadata) — its `mock_image_size = 24`
+    // round-trips through the mock processor, proving the constructor
+    // body source.
     let dir = fresh_dir("split-dispatch-preprocessor-no-class");
     std::fs::write(dir.join("config.json"), mock_config_json("mockvlm")).unwrap();
     std::fs::write(
@@ -2873,15 +2876,15 @@ mod tests {
 
   #[test]
   fn split_layout_carries_both_preprocessor_and_processor_config_bodies() {
-    // **Regression** for the Codex finding: in the split layout
+    // **Regression** test: in the split layout
     // (`preprocessor_config.json` has the image-preprocessor metadata but
     // NO `processor_class`; `processor_config.json` supplies the dispatch
-    // class) the loader used to extract ONLY the dispatch class from
-    // `processor_config.json` and discard that file's body. A per-model
-    // processor needing a processor-level field from `processor_config.
-    // json` (here `image_seq_len`) AND the image-preprocessor metadata
-    // had no way to reach the discarded body. After the fix BOTH bodies
-    // are carried.
+    // class) extracting ONLY the dispatch class from
+    // `processor_config.json` and discarding that file's body would leave
+    // a per-model processor needing a processor-level field from
+    // `processor_config.json` (here `image_seq_len`) AND the
+    // image-preprocessor metadata with no way to reach the discarded
+    // body. BOTH bodies are therefore carried.
     let dir = fresh_dir("split-carries-both-bodies");
     // `preprocessor_config.json`: image-preprocessor metadata, no class.
     std::fs::write(
@@ -3014,17 +3017,17 @@ mod tests {
 
   #[test]
   fn preferred_class_layout_still_carries_processor_config_body() {
-    // **Regression** for the Codex finding on the *preferred-class* path:
+    // **Regression** test for the *preferred-class* path:
     // `preprocessor_config.json` carries the `processor_class` (so it
     // wins dispatch) AND its own image-preprocessor metadata, while
     // `processor_config.json` ALSO exists with a required non-class
-    // processor-level field (`image_seq_len`). Before the fix this path
-    // returned `processor_config_json: None` and discarded the
-    // `processor_config.json` body even though it was on disk — a
-    // per-model processor needing that field had to re-open the file
-    // (the TOCTOU/config-divergence the loader exists to prevent). After
-    // the fix BOTH bodies are carried, and the dispatch class still
-    // comes from `preprocessor_config.json` (precedence unchanged).
+    // processor-level field (`image_seq_len`). Returning
+    // `processor_config_json: None` and discarding the
+    // `processor_config.json` body even though it was on disk would force
+    // a per-model processor needing that field to re-open the file (the
+    // TOCTOU/config-divergence the loader exists to prevent). BOTH bodies
+    // are therefore carried, and the dispatch class still comes from
+    // `preprocessor_config.json` (precedence unchanged).
     let dir = fresh_dir("preferred-class-carries-processor-body");
     // `preprocessor_config.json`: HAS `processor_class` + image metadata.
     std::fs::write(
@@ -3244,16 +3247,16 @@ mod tests {
 
   #[test]
   fn loaded_processor_downcasts_to_concrete_per_model_type() {
-    // Codex review: `LoadedVlmContext.processor` is an erased
+    // `LoadedVlmContext.processor` is an erased
     // `Box<dyn Processor>`, but a caller needs the CONCRETE per-model
     // processor (`Qwen2VLProcessor` / `PixtralProcessor` / …) to reach
     // its concrete-only methods (multimodal prompt assembly / video /
-    // tool+chat formatting). The trait now upcasts to `Any` via
-    // `as_any`, so the erased processor handed back by `load()` can be
-    // downcast to its concrete type end-to-end. Before the `as_any` +
-    // `'static` change there was no way to recover the concrete type off
-    // `load()`'s output, so the concrete-only API was unreachable; this
-    // proves the round-trip works.
+    // tool+chat formatting). The trait upcasts to `Any` via `as_any`, so
+    // the erased processor handed back by `load()` can be downcast to its
+    // concrete type end-to-end. Without the `as_any` + `'static` bound
+    // there would be no way to recover the concrete type off `load()`'s
+    // output and the concrete-only API would be unreachable; this proves
+    // the round-trip works.
     let dir = fresh_dir("processor-downcast");
     write_vlm_dir(
       &dir,
@@ -3289,16 +3292,16 @@ mod tests {
 
   #[test]
   fn loaded_processor_reads_model_config_json_only_arch_field() {
-    // Codex review (Finding 2): a concrete per-model processor's
+    // A concrete per-model processor's
     // downcast-only methods may need an arch field that lives ONLY in the
     // model `config.json` (e.g. a `hidden_size` / `image_token_index`
     // nested under `text_config`), NOT in either processor-config body.
-    // Before this fix `LoadedProcessor` exposed only the processor configs
-    // + the typed `VlmBaseConfig` subset, so such a processor had to
-    // re-open `config.json` itself — losing the single-read TOCTOU
-    // consistency the loader provides. `LoadedProcessor.config_json` now
-    // carries the SAME body the model constructor received, so the
-    // processor reads the field off the loader's single read.
+    // If `LoadedProcessor` exposed only the processor configs + the typed
+    // `VlmBaseConfig` subset, such a processor would have to re-open
+    // `config.json` itself — losing the single-read TOCTOU consistency the
+    // loader provides. `LoadedProcessor.config_json` instead carries the
+    // SAME body the model constructor received, so the processor reads the
+    // field off the loader's single read.
     let dir = fresh_dir("processor-reads-model-config-json");
     // `config.json`: nested-shaped, carries `text_config.hidden_size = 8`
     // — an arch field present ONLY here (the processor configs below do

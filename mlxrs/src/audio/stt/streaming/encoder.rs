@@ -9,14 +9,13 @@
 //! [`StreamingEncoderBackend::encode_window`] hook. Consecutive
 //! windows can overlap by a configurable number of mel frames.
 //!
-//! Per the project's [no per-model arch porting][noarch] rule, mlxrs
+//! Per the project's no per-model arch porting rule, mlxrs
 //! does **not** ship concrete encoder bodies (Qwen3ASR / Whisper /
 //! Voxtral / Moshi / etc.). Per-architecture code implements
 //! [`StreamingEncoderBackend`] and constructs a [`StreamingEncoder`]
 //! over it.
 //!
 //! [swift-ref]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioSTT/Streaming/StreamingEncoder.swift
-//! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 
 use smol_str::format_smolstr;
 
@@ -644,7 +643,7 @@ mod tests {
     }
   }
 
-  /// F1 regression: a strict-contract backend that demands shape ==
+  /// Regression: a strict-contract backend that demands shape ==
   /// `(window_size, n_mels)` MUST accept a partial-window flush — the
   /// accumulator zero-pads the buffer and signals the real prefix length
   /// via `valid_frames`.
@@ -665,7 +664,7 @@ mod tests {
     );
   }
 
-  /// F1 regression: the full-window path passes `valid_frames ==
+  /// Regression: the full-window path passes `valid_frames ==
   /// window_size` so backends can disambiguate "padded partial" from
   /// "real full window".
   #[test]

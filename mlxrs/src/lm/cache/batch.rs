@@ -179,8 +179,8 @@ pub fn dynamic_roll(x: &Array, shifts: &Array, axis: i32) -> Result<Array> {
     )));
   }
   let sshape = shifts.shape();
-  // Split rank-first-then-shape (Codex 2026-05-27 R3, mirroring the C R1
-  // `norm.rs` + C R2 `switch.rs` patterns): a rank-1 or rank-3 `shifts`
+  // Split rank-first-then-shape (mirroring the `norm.rs` + `switch.rs`
+  // patterns): a rank-1 or rank-3 `shifts`
   // would otherwise reach the collapsed guard and surface as
   // `ShapePairMismatch`, but `ShapePairMismatchPayload` is documented for
   // same-rank shape disagreement. Surface a divergent RANK as
@@ -193,12 +193,12 @@ pub fn dynamic_roll(x: &Array, shifts: &Array, axis: i32) -> Result<Array> {
       sshape.to_vec(),
     )));
   }
-  // Accept the per-row shape `[B, 1]` OR the scalar broadcast `[1, 1]`
-  // (Codex 2026-05-27 R4): `BatchKvCache::finalize` arms a length-1
+  // Accept the per-row shape `[B, 1]` OR the scalar broadcast `[1, 1]`:
+  // `BatchKvCache::finalize` arms a length-1
   // `right_padding` via `prepare_right_padding(&[k])`, which becomes a
   // `[1, 1]` `pad_col` after the `expand_dims_axes` and must broadcast
   // across `keys`/`values`' batch dim — exactly the contract the existing
-  // `kvc4_batch_kv_finalize_with_scalar_right_padding_broadcasts_or_errs`
+  // `batch_kv_finalize_with_scalar_right_padding_broadcasts_or_errs`
   // test pins. The leading dim must be `xshape[0]` OR `1`; the trailing
   // dim must be exactly `1` (matches mlx-lm `padding[:, None]`).
   let valid_b = sshape[0] == xshape[0] || sshape[0] == 1;
@@ -217,7 +217,7 @@ pub fn dynamic_roll(x: &Array, shifts: &Array, axis: i32) -> Result<Array> {
   // `n == 0` is the empty-axis no-op: logically `roll([], k) == []` (mlx-lm
   // mx.roll on a zero-length axis also returns the input unchanged), and
   // computing `remainder(idx, 0)` below would be a divide-by-zero. Early
-  // return a clone (Copilot review #3271119572). This is symmetric with
+  // return a clone. This is symmetric with
   // the `n > 2^24` reject below: both are degenerate-`n` guards for cases
   // the reference's unbounded-int / overflow-defined semantics handle
   // implicitly but our finite-precision ops require explicit handling for.
@@ -269,7 +269,7 @@ pub struct BatchKvCache {
   /// (`[B]`, `I32`).
   left_padding: Array,
   /// Cached host-readable mirror of `left_padding`, set in lockstep with
-  /// the `Array` form (KVC-4, #101). mlx-lm's `int(self.left_padding[i]
+  /// the `Array` form (#101). mlx-lm's `int(self.left_padding[i]
   /// .item())` pattern (`cache.py:947-955` / swift `leftPaddingValues:
   /// asArray(Int.self)`, `KVCache.swift:1223-1226`) round-trips each
   /// scalar through the GPU→CPU boundary inside a hot loop. Caching the
@@ -291,7 +291,7 @@ pub struct BatchKvCache {
   /// Deferred right-pad counts set by [`Self::prepare_right_padding`],
   /// applied by [`Self::finalize`] — mlx-lm `BatchKVCache._right_padding`.
   right_padding: Option<Array>,
-  /// Cached host-readable mirror of `right_padding` (KVC-4, #101). Set in
+  /// Cached host-readable mirror of `right_padding` (#101). Set in
   /// lockstep with the `Array` form by [`Self::prepare_right_padding`] so
   /// [`Self::finalize`] can update `pad_lengths` without re-evaling the
   /// array. Cleared together with `right_padding` (a `None` means there is
@@ -328,7 +328,7 @@ impl BatchKvCache {
 
   /// Per-sequence left-pad counts as a borrowed `&[i32]` — the cached
   /// host-readable mirror of [`left_padding_arr`](Self::left_padding_arr)
-  /// (KVC-4, #101). mlx-lm's `int(self.left_padding[i].item())` per-batch-
+  /// (#101). mlx-lm's `int(self.left_padding[i].item())` per-batch-
   /// entry GPU→CPU round-trip (`cache.py:947-955`) is replaced by a
   /// borrowed slice into the cached `Vec<i32>` — kept in lockstep with the
   /// underlying `Array` form. Reuses the exact same accessor name as
@@ -351,7 +351,7 @@ impl BatchKvCache {
       // `right_padding_host` unchanged (no half-armed state).
       let rp = ivec(right_padding)?;
       self.right_padding = Some(rp);
-      // KVC-4 (#101): keep the cached host mirror in lockstep — `finalize`
+      // #101: keep the cached host mirror in lockstep — `finalize`
       // uses it to update `pad_lengths` without re-evaling the array.
       self.right_padding_host = Some(right_padding.to_vec());
     }
@@ -371,13 +371,13 @@ impl BatchKvCache {
     // left_padding/right_padding EXACTLY as they were — retry-safe, no
     // keys-rolled-but-values-not desync and no lost `right_padding`.
     if let Some(padding) = &self.right_padding {
-      // **Codex-R1 [high] #2 — stale `pad_lengths` fix.** The previous
-      // version silently skipped the host mirror update when
+      // **Stale `pad_lengths` guard.** A naive implementation would
+      // silently skip the host mirror update when
       // `right_padding_host.len() != self.pad_lengths.len()` and
-      // continued committing `left_padding`/`right_padding=None`,
+      // continue committing `left_padding`/`right_padding=None`,
       // leaving `pad_lengths()` permanently stale (a length-1 padding
       // vector broadcasts across the `[B]` array op, so the commit
-      // succeeded with the mirror frozen at the OLD values). Fix:
+      // succeeds with the mirror frozen at the OLD values). So:
       // validate the host length FIRST — BEFORE any Array op work or
       // commit — so the failure path does ZERO wasted ops and leaves
       // the cache exactly as it was. Three supported cases:
@@ -635,7 +635,7 @@ impl KvCache for BatchKvCache {
         // any field so a bad `values` leaves the cache unmutated.
         let sk = seq_len("keys", &keys)?;
         batch_head_dim("values", &values)?;
-        // KVC-4 (#101): materialize the restored `left_padding` to a host
+        // #101: materialize the restored `left_padding` to a host
         // `Vec<i32>` mirror ONCE here, at restore time — replaces the
         // per-call `.item()` round-trip mlx-lm's `int(self.left_padding
         // [i].item())` would do on every consumer access. This is the
@@ -644,13 +644,13 @@ impl KvCache for BatchKvCache {
         // local FIRST (eval can fail on a backend error) so a failed
         // host extraction leaves the cache fully unmutated.
         //
-        // **Codex-R1 [medium] #3 — propagate extraction failures.** The
-        // previous version fell back to `self.pad_lengths.clone()` on a
+        // **Propagate extraction failures.** A naive implementation would
+        // fall back to `self.pad_lengths.clone()` on a
         // non-1-D / non-I32 / non-contiguous restored `left_padding`,
-        // then committed `self.left_padding` to the new (corrupt) Array
+        // then commit `self.left_padding` to the new (corrupt) Array
         // anyway — leaving `pad_lengths()` permanently desynchronized
         // (and often at the empty placeholder from `BatchKvCache::new(
-        // &[])`, which `from_state("BatchKVCache")` opens with). Fix:
+        // &[])`, which `from_state("BatchKVCache")` opens with). So:
         // VALIDATE rank/dtype against the restored `keys`'s batch dim
         // before extracting, then propagate any `to_vec::<i32>` error
         // via `?` — the cache is left fully unmutated on every error
@@ -695,7 +695,7 @@ impl KvCache for BatchKvCache {
         self.pad_lengths = new_pad_lengths;
         self.idx = sk;
         // Also clear `right_padding` here, matching the empty-state branch
-        // above (Copilot review #3271560108). `set_state` fully defines
+        // above. `set_state` fully defines
         // the cache's runtime state: leaving a previously-armed
         // `right_padding` from a prior `prepare_right_padding` call would
         // make the next `finalize()` unexpectedly roll the freshly-restored
@@ -839,7 +839,7 @@ impl KvCache for BatchKvCache {
     "BatchKVCache"
   }
 
-  /// P1 #110: per-layer fast-path downcast target — see the
+  /// Per-layer fast-path downcast target (#110) — see the
   /// [`KvCache`]-trait doc's **Per-layer fast-path convention**.
   fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
     self
@@ -939,7 +939,7 @@ pub(crate) fn create_causal_mask_batched(
     // produce a wrong (inverted) windowed mask. The `w < total <
     // i32::MAX` invariant *usually* holds (total derives from real seq
     // lengths), but the defensive cast costs nothing and closes the
-    // wrap-on-cast hole (Copilot review #3271119551).
+    // wrap-on-cast hole.
     let w_i32 = i32::try_from(w).map_err(|_| {
       Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
         "create_causal_mask_batched: window_size exceeds i32::MAX (cannot fit into a scalar mask offset)",
@@ -955,7 +955,7 @@ pub(crate) fn create_causal_mask_batched(
     // rinds < expand_dims((offset+N) - right_padding, (1,2,3))
     //
     // Build the `total` scalar via the integer-exact `scalar_i32` helper
-    // instead of round-tripping through `f32` (Copilot review #3271308731).
+    // instead of round-tripping through `f32`.
     // For `total > 2^24`, an `f32` cast would lossily round (consecutive
     // integers alias) and silently produce a wrong right-padding bound,
     // hence a wrong mask. `scalar_i32` builds the I32 scalar directly with

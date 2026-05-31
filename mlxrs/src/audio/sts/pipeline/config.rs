@@ -15,7 +15,7 @@
 //!
 //! Model-name strings (`stt_model` / `vad_model` / `turn_model` /
 //! `response_model` / `tts_model`) are intentionally **non-resolved**:
-//! mlxrs's [no per-model arch porting][noarch] rule means the per-model
+//! mlxrs's no per-model arch porting rule means the per-model
 //! loader is the caller's responsibility — this config carries the
 //! repo / path string for the caller to feed into the per-domain
 //! `load` entry points
@@ -25,7 +25,6 @@
 //! [`crate::lm::load::load()`]).
 //!
 //! [vp-cfg]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/voice_pipeline.py#L25-L89
-//! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 
 use derive_more::Display;
 
@@ -134,7 +133,7 @@ impl LatencyProfile {
 /// and tune via the `with_*` builder methods (each returns `Self`
 /// and is `#[must_use]`).
 ///
-/// Per [no per-model arch porting][noarch] the per-model name strings
+/// Per no per-model arch porting the per-model name strings
 /// (`stt_model` / `vad_model` / `turn_model` / `response_model` /
 /// `tts_model`) carry the upstream repo / path string verbatim; the
 /// caller resolves them into concrete trait objects via the per-domain
@@ -147,7 +146,6 @@ impl LatencyProfile {
 /// [session]: crate::audio::sts::pipeline::orchestrator::VoiceSession
 ///
 /// [vp-cfg]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/voice_pipeline.py#L25-L89
-/// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 #[derive(Debug, Clone)]
 pub struct VoicePipelineConfig {
   /// Mic capture sample rate (Hz). mlx-audio default `16_000`.

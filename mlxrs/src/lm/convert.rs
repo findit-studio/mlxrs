@@ -1,8 +1,8 @@
 //! `convert()` — the model-conversion driver, ported from
 //! [`mlx_lm/convert.py`](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/convert.py).
 //!
-//! Wires the load-side (F2 [`crate::lm::load`]), the quantize / dequantize side
-//! (F3 [`crate::lm::quant`]) and the save-side (F6 [`crate::lm::load::save`] +
+//! Wires the load-side ([`crate::lm::load`]), the quantize / dequantize side
+//! ([`crate::lm::quant`]) and the save-side ([`crate::lm::load::save`] +
 //! [`crate::lm::load::save_model`] + [`crate::lm::load::save_config`]) into a
 //! one-call pipeline: read an HF-style checkpoint at `hf_path`, optionally
 //! apply a quantization (with an optional per-layer predicate) or its
@@ -20,7 +20,7 @@
 //!      │   ─ quantize && dequantize? (mutually exclusive)
 //!      │   ─ upload_repo / revision? (REJECTED — local-only)
 //!      ▼
-//!   load(hf_path)                    (convert.py:111-118)  →  F2
+//!   load(hf_path)                    (convert.py:111-118)
 //!      → (Config, Weights, Tokenizer, raw_config_json)
 //!      │
 //!      ▼
@@ -28,13 +28,13 @@
 //!      │   ─ explicit override OR  config["torch_dtype"] OR  text_config["dtype"]
 //!      ▼
 //!   branch:
-//!      │  quantize  → quantize_weights(weights, …)         (convert.py:149-158)  →  F3
+//!      │  quantize  → quantize_weights(weights, …)         (convert.py:149-158)
 //!      │             + patch config "quantization" block   (utils.py:813-845)
-//!      │  dequantize→ dequantize_weights(weights, cfg)     (convert.py:160-164)  →  F3
+//!      │  dequantize→ dequantize_weights(weights, cfg)     (convert.py:160-164)
 //!      │             + strip "quantization" / "quantization_config"
 //!      │  neither   → pass through unchanged
 //!      ▼
-//!   save(mlx_path, weights, config, per_layer_q)           (convert.py:166-172)  →  F6
+//!   save(mlx_path, weights, config, per_layer_q)           (convert.py:166-172)
 //!      │
 //!      ▼
 //!   copy_tokenizer_and_extras(hf_path, mlx_path)           (utils.py:944-948)
@@ -66,7 +66,7 @@
 //!
 //! ## API style
 //!
-//! Per [project memory `feedback_api_style`] the keyword-arg surface
+//! The keyword-arg surface
 //! (`convert.py:85-100`) becomes the Rust-idiomatic [`ConvertArgs`] struct
 //! with [`Default`]; the python `Callable[[str, nn.Module, dict], …]`
 //! closure becomes the [`MixedQuantPredicate`] trait. Every public item
@@ -107,7 +107,7 @@ use crate::{
 /// value at [`convert`]-call time returns [`Error::Backend`] —
 /// HuggingFace Hub upload + download are excluded surface.
 ///
-/// **`!Send`-compatible.** Per project memory, [`Array`] is `!Send` /
+/// **`!Send`-compatible.** [`Array`] is `!Send` /
 /// `!Sync`; the trait object [`Box<dyn MixedQuantPredicate>`](MixedQuantPredicate)
 /// uses no `Send`/`Sync` bound, so [`ConvertArgs`] is `!Send`-compatible too.
 pub struct ConvertArgs {
@@ -174,7 +174,7 @@ pub struct ConvertArgs {
   /// `upload_repo` (`convert.py:93`). HuggingFace Hub destination repo.
   /// **REJECTED.** A non-`None` value at [`convert`]-call time returns
   /// [`Error::Backend`] — mlxrs is local-only per the module-level
-  /// "Scope decisions" + [project memory `project_no_model_arch_porting`].
+  /// "Scope decisions".
   pub upload_repo: Option<String>,
 
   /// `revision` (`convert.py:94`). HuggingFace Hub `git` rev for the
@@ -502,7 +502,7 @@ pub fn mixed_quant_predicate(
 /// disk AND every fsync along the way (save-side parent-directory
 /// fsync, post-copy per-file fsync for each tokenizer / `*.py`, and
 /// the post-copy destination-directory fsync) reported success.
-/// `Ok = durable across power loss` end-to-end (F7 R4).
+/// `Ok = durable across power loss` end-to-end.
 ///
 /// Every recoverable failure is an [`Error`] with a meaning that lets the
 /// caller decide whether the on-disk destination is usable as-is, needs a
@@ -629,7 +629,7 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
     )));
   }
 
-  // ─── 2. Load (`convert.py:111-118` → F2) ───
+  // ─── 2. Load (`convert.py:111-118`) ───
   //
   // Python: `model, tokenizer, config = load(hf_path, revision=..., return_config=True,
   //   tokenizer_config={"trust_remote_code": ...}, lazy=True)`.
@@ -688,7 +688,7 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
     //   q_bits, mode=q_mode, quant_predicate=quant_predicate)`.
     let (gs, bits) = defaults_for_mode(q_mode, q_group_size, q_bits);
 
-    // F7 R1 Finding-3 closure: evaluate the predicate ONCE per
+    // Single-evaluation closure: evaluate the predicate ONCE per
     // structurally-eligible layer into a decision map BEFORE walking
     // either the config builder OR the `quantize_weights` eligibility
     // closure. The python reference's `wrapped_predicate` is called
@@ -697,12 +697,12 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
     // (`utils.py:831-834`) AND back to `nn.quantize`'s decision —
     // a stateful predicate is therefore consistent across both views.
     //
-    // The mlxrs port previously evaluated the predicate twice (once in
-    // `build_quantize_config`, again in the `eligible` closure), so a
-    // stateful / non-deterministic predicate could write one decision
-    // into the saved config and apply a different one to the weights.
-    // Caching the per-eligible-layer decision in a `HashMap` collapses
-    // both reads to the same source-of-truth, matching the reference's
+    // Evaluating the predicate twice (once in `build_quantize_config`,
+    // again in the `eligible` closure) would let a stateful /
+    // non-deterministic predicate write one decision into the saved
+    // config and apply a different one to the weights. Caching the
+    // per-eligible-layer decision in a `HashMap` collapses both reads to
+    // the same source-of-truth, matching the reference's
     // call-the-callable-once semantics.
     let decisions = build_predicate_decisions(quant_predicate.as_deref(), &weights, gs);
 
@@ -761,15 +761,15 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
     (weights, config_json_text, cfg)
   };
 
-  // ─── 5. Save (`convert.py:166-172` → F6) ───
+  // ─── 5. Save (`convert.py:166-172`) ───
   //
   // `save(mlx_path, hf_path, model, tokenizer, config)`. mlxrs's `save`
   // doesn't carry the tokenizer (no `tokenizer.save_pretrained` is
   // ported — the tokenizer surface is load-only) or the source-`*.py` /
-  // `generation_config.json` copy: those are this F7 driver's
+  // `generation_config.json` copy: those are this driver's
   // `copy_tokenizer_and_extras` step below.
   //
-  // F7 R1 Finding-4: a [`Error::DurabilityWarning`] with `committed:
+  // A [`Error::DurabilityWarning`] with `committed:
   // true` from [`load::save`] is NOT a hard failure — the weights +
   // index + config are already visible on disk (only the post-rename
   // parent-directory `fsync` returned an error). A plain `?` early-
@@ -794,9 +794,9 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
   // durability-warning branch — so the destination dir is fully
   // populated before we propagate the warning to the caller.
   //
-  // F7 R3 Finding-1: the R2 fix folded a post-save copy failure INTO
-  // the DurabilityWarning's `source` via [`std::io::Error::other(format!
-  // (...))`], conflating two semantically-different cases:
+  // A post-save copy failure must NOT be folded into the
+  // DurabilityWarning's `source` (e.g. via [`std::io::Error::other(format!
+  // (...))`]) because that conflates two semantically-different cases:
   //
   //   (a) save committed + only durability uncertain (the documented
   //       [`Error::DurabilityWarning`] contract = logically-complete
@@ -804,14 +804,14 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
   //   (b) save committed + extras copy partially failed (destination
   //       MAY be incomplete — tokenizer files missing).
   //
-  // The R2 fold also HID the copy failure inside a free-form
+  // Such a fold would also HIDE the copy failure inside a free-form
   // `source.to_string()` — callers couldn't machine-detect it via
-  // `ErrorKind` / typed accessors. Existing callers treating
+  // `ErrorKind` / typed accessors. Callers treating
   // `committed=true DurabilityWarning` as "success-with-warning" per
-  // the documented contract could consume an INCOMPLETE checkpoint.
+  // the documented contract could then consume an INCOMPLETE checkpoint.
   //
-  // The R3 fix routes (b) (and the symmetric clean-save + copy-fail
-  // case) to a NEW structured variant [`Error::ConvertPostSavePartial`]
+  // So (b) (and the symmetric clean-save + copy-fail
+  // case) routes to the structured variant [`Error::ConvertPostSavePartial`]
   // so the two cases are machine-detectable at the type level: the
   // typed `save_warning: Option<io::Error>` field disambiguates the
   // save side, the typed `copy_error: io::Error` field carries the
@@ -820,7 +820,7 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
   // structurally incomplete (tokenizer files missing) — NOT merely
   // committed-with-fsync-warning.
   //
-  // F7 R4 Finding-1: [`copy_tokenizer_and_extras`] now fsyncs each
+  // [`copy_tokenizer_and_extras`] fsyncs each
   // copied file + the dst dir, so the documented "Ok = durable"
   // contract holds for tokenizer extras too. The fsync step
   // distinguishes a POST-COPY fsync warning (data on disk, durability
@@ -835,12 +835,12 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
 
   // ─── 7. (Hub upload — `convert.py:174-175`) — REJECTED at step 1. ───
 
-  // F7 R5 Finding: assemble per-boundary durability warnings into a
+  // Assemble per-boundary durability warnings into a
   // single typed aggregate so the caller can machine-detect WHICH
   // boundary(ies) warned via direct destructuring — no string parse
-  // (the R4 fix folded multi-warnings into a free-form
+  // (folding multi-warnings into a free-form
   // `std::io::Error::other(format!(...))` message inside
-  // `DurabilityWarning.source`, hiding the typed errors). The
+  // `DurabilityWarning.source` would hide the typed errors). The
   // 0/1/2+-non-None counting routes the result through the right
   // shape:
   //   - 0 non-None warnings → `Ok(())` (happy path).
@@ -855,7 +855,7 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
   //                           chain walkers).
   // A hard copy failure (`copy_result == Err`) bypasses the aggregate
   // and routes to `ConvertPostSavePartial` (the structurally-
-  // incomplete-destination contract from R3) — orthogonal to the
+  // incomplete-destination contract) — orthogonal to the
   // durability-only multi-warning case below.
   match (committed_warning, copy_result) {
     // copy_result == Ok: 0 / 1 / 2+ durability-warning routing.
@@ -899,7 +899,7 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
             true, source,
           )))
         }
-        // 2+ — multi-warning case. F7 R5 Finding fix: surface the
+        // 2+ — multi-warning case: surface the
         // typed aggregate so the caller can destructure each
         // boundary's [`std::io::Error`] separately (no string fold).
         // The first non-None is also reachable via
@@ -930,7 +930,7 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
     // destination is structurally incomplete (not just fsync-warned).
     // `copy_err` is passed through as the typed `crate::Error` so
     // `Error::FileIo(FileIoPayload { .. })` survives intact for recovery
-    // code (R-final fix: no `io::Error::other(...)` stringification).
+    // code (no `io::Error::other(...)` stringification).
     (Some(save_source), Err(copy_err)) => Err(Error::ConvertPostSavePartial(
       ConvertPostSavePartialPayload::new(true, Some(save_source), copy_err),
     )),
@@ -948,7 +948,7 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
 /// MUST fall back to the per-mode default, not survive as `0`. A
 /// surviving `0` would skip every layer at the `last % group_size == 0`
 /// gate (`quantize_weights` would write dense weights against an invalid
-/// `group_size: 0` quantization block on disk — see F7 R1 Finding-2).
+/// `group_size: 0` quantization block on disk).
 ///
 /// We mirror with `Option::filter(|&v| v > 0).unwrap_or(default)` —
 /// faithful one-line transcription of `value or default` for the
@@ -1066,7 +1066,7 @@ fn cast_floats_to_dtype(weights: Weights, target: Dtype) -> Result<Weights> {
   Ok(out)
 }
 
-/// Per-eligible-layer cached predicate decision — the F7 R1 Finding-3
+/// Per-eligible-layer cached predicate decision — the
 /// "evaluate the predicate exactly once per layer" data structure.
 ///
 /// A path appears in the map iff it cleared the python `wrapped_predicate`'s
@@ -1089,15 +1089,15 @@ type PredicateDecisions = HashMap<String, Option<Quantization>>;
 /// Walk `weights`, run the structural eligibility gate
 /// (`utils.py:824-827`) per layer, and call the predicate exactly once
 /// for each surviving path. The returned map keys the eligible paths
-/// onto the predicate's single decision. F7 R1 Finding-3.
+/// onto the predicate's single decision.
 ///
 /// When `predicate` is `None`, the returned map is empty — the
 /// downstream `eligible` closure short-circuits to "every layer is
 /// eligible" in that case (matching the python `quant_predicate=None`
 /// arm's `bool_or_params = True` default at `utils.py:828`).
 ///
-/// `group_size <= 0` is a defensive guard — `defaults_for_mode` now
-/// clamps `Some(0)` to the mode default (F7 R1 Finding-2), so a 0 here
+/// `group_size <= 0` is a defensive guard — `defaults_for_mode`
+/// clamps `Some(0)` to the mode default, so a 0 here
 /// would mean the global default itself is 0 (which the config
 /// builder's `if last % (group_size as usize) != 0` guard would catch
 /// anyway). We early-return an empty map in that case so the divisor
@@ -1158,12 +1158,12 @@ fn build_predicate_decisions(
 ///   overrides.
 ///
 /// `quantization_config` is mirrored to `quantization` per `utils.py:845`
-/// — F6's `save_config` already does that mirror at write-time, so the
+/// — `save_config` already does that mirror at write-time, so the
 /// returned config text carries only the `quantization` key (the mirror
 /// happens inside `save_config`).
 ///
 /// **Predicate decisions are pre-computed.** The `decisions` arg is the
-/// F7 R1 Finding-3 single-evaluation map (see
+/// single-evaluation map (see
 /// [`build_predicate_decisions`]); the builder NEVER re-invokes the
 /// predicate. An empty map means "no user predicate / nothing eligible
 /// for an override" — the global block alone is written. The `weights`
@@ -1352,17 +1352,17 @@ fn strip_quantization_blocks(config_json: &str) -> Result<String> {
 /// - The explicit `*.py` + `generation_config.json` glob at
 ///   `utils.save:946-948`.
 ///
-/// `config.json` is intentionally NOT in the list — F6's `save_config`
+/// `config.json` is intentionally NOT in the list — `save_config`
 /// emits the cleaned (`_name_or_path` / `vision_config` removed,
 /// `quantization` mirrored to `quantization_config`, sorted) version
 /// inside `save`. Weight files (`*.safetensors` / `*.bin` / `*.gguf`)
-/// are NOT copied — F6's `save_model` writes the new sharded layout.
+/// are NOT copied — `save_model` writes the new sharded layout.
 ///
 /// [`tokenizer.save_pretrained`]: https://huggingface.co/docs/transformers/v4.46.0/en/main_classes/tokenizer
 ///
 /// `pub(crate)` so [`crate::lm::fuse::fuse`]'s staging-promote step can
 /// walk the SAME fixed-name family to drop stale destination files that
-/// the source dir does not carry (Codex R3 Finding 1: a destination
+/// the source dir does not carry (a destination
 /// pre-populated with e.g. a stale `generation_config.json` /
 /// `chat_template.jinja` would otherwise survive the fuse, since the
 /// permissive `copy_tokenizer_and_extras` only OVERWRITES files present
@@ -1401,9 +1401,8 @@ pub(crate) const TOKENIZER_EXTRA_FILES: &[&str] = &[
 /// [`convert`] can route the multi-warning case (`save` warned + at
 /// least one post-copy fsync warned, or both post-copy fsyncs warned)
 /// to the typed [`Error::ConvertDurabilityWarnings`] aggregate instead
-/// of an `std::io::Error::other(format!(...))` fold that the F7 R4
-/// fix had used (which lost typed access to the individual warnings —
-/// F7 R5 Finding).
+/// of an `std::io::Error::other(format!(...))` fold (which would lose
+/// typed access to the individual warnings).
 #[derive(Debug, Default)]
 pub struct CopyDurabilityWarnings {
   /// First per-file `fsync_path_io` warning observed (preserves the
@@ -1411,19 +1410,19 @@ pub struct CopyDurabilityWarnings {
   /// fsync was the first to lose durability). `None` if every per-file
   /// fsync passed.
   ///
-  /// F7 R6 Finding: the carried [`std::io::Error`] preserves the raw
+  /// The carried [`std::io::Error`] preserves the raw
   /// underlying [`std::io::ErrorKind`] (ENOSPC / EIO /
-  /// PermissionDenied / ...) — the pre-R6 shape called the (crate-
-  /// internal) `fsync_path` helper (which returns the crate-wide
+  /// PermissionDenied / ...). Calling the (crate-
+  /// internal) `fsync_path` helper instead (which returns the crate-wide
   /// [`crate::Error::Backend`] variant — string-wrapping the
-  /// underlying io::Error and losing its kind) and then re-wrapped the
-  /// message via [`std::io::Error::other`], collapsing every kind to
-  /// [`std::io::ErrorKind::Other`] and forcing callers to parse the
-  /// message text. The R6 fix routes through a new kind-preserving
-  /// `fsync_path_io` sibling (returns [`std::io::Result`]) so callers
-  /// can branch on `.kind()` directly.
+  /// underlying io::Error and losing its kind) and then re-wrapping the
+  /// message via [`std::io::Error::other`] would collapse every kind to
+  /// [`std::io::ErrorKind::Other`] and force callers to parse the
+  /// message text. Routing through the kind-preserving
+  /// `fsync_path_io` sibling (returns [`std::io::Result`]) instead lets callers
+  /// branch on `.kind()` directly.
   ///
-  /// F7 R7 Finding: the message is also wrapped at the call site with
+  /// The message is also wrapped at the call site with
   /// `"copy_tokenizer_and_extras: fsync <destination-path> failed:
   /// <inner>"` so callers (and humans reading the warning) can pinpoint
   /// WHICH copied tokenizer file warned — without this a real OS
@@ -1431,7 +1430,7 @@ pub struct CopyDurabilityWarnings {
   /// context-free OS text like `"No such file or directory (os error
   /// 2)"`) would surface no path information. The wrap preserves the
   /// underlying `kind()` (uses [`std::io::Error::new`], not
-  /// [`std::io::Error::other`]) so the F7 R6 contract is intact.
+  /// [`std::io::Error::other`]) so the kind-preservation contract is intact.
   pub post_copy_file: Option<std::io::Error>,
   /// Post-copy `fsync_dir(dst)` warning, after every per-file fsync
   /// has been observed. `None` if the directory fsync passed.
@@ -1440,8 +1439,7 @@ pub struct CopyDurabilityWarnings {
 
 /// Outcome of a successful [`copy_tokenizer_and_extras`] call —
 /// disambiguates "all files are durable on disk" from "all files'
-/// content reached disk but at least one post-copy `fsync` warned"
-/// (F7 R4 Finding-1).
+/// content reached disk but at least one post-copy `fsync` warned".
 ///
 /// A copy is considered **logically complete** the moment
 /// [`std::fs::copy`] returns `Ok`: the file's bytes are in the page
@@ -1452,7 +1450,7 @@ pub struct CopyDurabilityWarnings {
 /// therefore does NOT mean the data is missing — only that durability
 /// is uncertain.
 ///
-/// The R3 [`Error::ConvertPostSavePartial`] variant stays reserved for
+/// The [`Error::ConvertPostSavePartial`] variant stays reserved for
 /// the genuine "copy actually failed" case where [`std::fs::copy`]
 /// itself returned `Err` (the file did NOT reach disk); the
 /// `CommittedWithDurabilityWarning` variant carries the post-copy
@@ -1466,12 +1464,12 @@ pub struct CopyDurabilityWarnings {
 /// recovery flows) — those callers need the same machine-detectable
 /// "data on disk, durability uncertain" signal.
 ///
-/// F7 R5 Finding: pre-R5 this variant carried a single
-/// [`std::io::Error`] folded from the per-file + dir fsync warnings
-/// (via `std::io::Error::other(format!(...))`) — losing typed access
-/// to the two underlying errors. The R5 fix carries each warning
-/// separately in [`CopyDurabilityWarnings`] so the caller (and the
-/// convert()-side aggregate) can destructure WHICH boundary warned.
+/// Folding the per-file + dir fsync warnings into a single
+/// [`std::io::Error`] (via `std::io::Error::other(format!(...))`) would
+/// lose typed access to the two underlying errors. This variant carries
+/// each warning separately in [`CopyDurabilityWarnings`] so the caller
+/// (and the convert()-side aggregate) can destructure WHICH boundary
+/// warned.
 #[derive(Debug)]
 pub enum CopyOutcome {
   /// All [`std::fs::copy`] calls returned `Ok` AND all post-copy
@@ -1509,21 +1507,21 @@ pub enum CopyOutcome {
 ///
 /// Files explicitly NOT copied (per the module-level "scope decisions"):
 ///
-/// - `config.json` — F6's `save_config` already writes the cleaned
+/// - `config.json` — `save_config` already writes the cleaned
 ///   version inside `convert`'s save step.
 /// - `*.safetensors` / `*.bin` / `*.gguf` / `model.safetensors.index.json`
-///   — F6's `save_model` writes the new sharded layout.
+///   — `save_model` writes the new sharded layout.
 ///
 /// **Rename-in-place** (`src == dst`): no-op. Same-path copies would
 /// either truncate-to-zero or no-op depending on `std::fs::copy`'s
 /// implementation; the explicit guard short-circuits the entire walk.
 /// `src`'s files are left untouched.
 ///
-/// **Post-copy durability** (F7 R4 Finding-1): after each successful
+/// **Post-copy durability:** after each successful
 /// [`std::fs::copy`], the copied file is `fsync`ed (via the
 /// `crate::lm::load::fsync_path_io` helper — the `io::Result<()>`
 /// variant of `fsync_path` that preserves the underlying
-/// [`std::io::ErrorKind`], F7 R6 Finding) so its bytes are durable on
+/// [`std::io::ErrorKind`]) so its bytes are durable on
 /// disk. After ALL copies complete, the destination directory is
 /// `fsync`ed (via the `crate::lm::load::fsync_dir` helper) so the new
 /// directory entries are durable. Without these, an `Ok` return would
@@ -1561,7 +1559,7 @@ pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<CopyOutcome> 
   // WHOLE batch of copies runs (data durability is best-effort
   // post-copy) and so the caller (convert()) can route the multi-
   // warning case to the typed [`Error::ConvertDurabilityWarnings`]
-  // aggregate (F7 R5 Finding).
+  // aggregate.
   let mut warnings = CopyDurabilityWarnings::default();
 
   // Record a per-file fsync warning iff none has been observed yet —
@@ -1576,7 +1574,7 @@ pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<CopyOutcome> 
     }
   };
 
-  // F7 R7 Finding: wrap `fsync_path_io`'s raw [`std::io::Error`] with
+  // Wrap `fsync_path_io`'s raw [`std::io::Error`] with
   // operation + destination-path context BEFORE recording. Without this
   // a REAL post-copy fsync failure (where [`std::fs::File::open`] /
   // [`std::fs::File::sync_all`] return an [`std::io::Error`] whose
@@ -1589,7 +1587,7 @@ pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<CopyOutcome> 
   // failure in production would surface a context-free OS string.
   //
   // [`std::io::Error::new`] preserves the underlying [`ErrorKind`]
-  // (the F7 R6 contract — callers branch on `.kind()` to disambiguate
+  // (callers branch on `.kind()` to disambiguate
   // ENOSPC / EIO / PermissionDenied / NotFound / ...) while the wrap
   // adds the missing operation + path context to the message. The
   // helper is closed over `dst`'s display lifetime per-call so each
@@ -1617,7 +1615,7 @@ pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<CopyOutcome> 
       continue;
     }
     let d = dst.join(name);
-    // Typed-error preservation (R-final+1 Codex finding): the underlying
+    // Typed-error preservation: the underlying
     // `std::io::ErrorKind` (PermissionDenied / NoSpace / ReadOnlyFilesystem
     // / …) must reach `ConvertPostSavePartialPayload::copy_error` intact
     // so callers can branch on `FileOp::Copy` + `path` + `inner.kind()`
@@ -1632,12 +1630,12 @@ pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<CopyOutcome> 
         e,
       ))
     })?;
-    // Post-copy file fsync (F7 R4 Finding-1). The data IS on disk
+    // Post-copy file fsync. The data IS on disk
     // after `std::fs::copy` returns Ok; this only converts "logically
     // complete" into "durable across a power loss". A failure here
     // does NOT mean the file is missing — record + continue.
     //
-    // F7 R6 Finding: use the kind-preserving
+    // Use the kind-preserving
     // [`crate::lm::load::fsync_path_io`] variant so the underlying
     // [`std::io::ErrorKind`] (ENOSPC / EIO / PermissionDenied / ...)
     // carries through to the structured aggregate intact. The previous
@@ -1647,7 +1645,7 @@ pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<CopyOutcome> 
     // [`std::io::ErrorKind::Other`] and forcing callers to parse the
     // message text to disambiguate quota / permission / disk failures.
     //
-    // F7 R7 Finding: wrap with operation + destination-path context at
+    // Wrap with operation + destination-path context at
     // the call site (kind preserved). See `wrap_fsync_err` above.
     if let Err(e) = crate::lm::load::fsync_path_io(&d) {
       record_file_fsync_warning(wrap_fsync_err(&d, &e));
@@ -1683,7 +1681,7 @@ pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<CopyOutcome> 
       continue;
     }
     let d = dst.join(name);
-    // Typed-error preservation (R-final+1 Codex finding): preserve the
+    // Typed-error preservation: preserve the
     // io::ErrorKind through the Error::FileIo variant for the *.py
     // glob copies — same rationale as the TOKENIZER_EXTRA_FILES loop
     // above.
@@ -1696,8 +1694,8 @@ pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<CopyOutcome> 
       ))
     })?;
     // Post-copy file fsync — same rationale + kind-preservation as
-    // the TOKENIZER_EXTRA_FILES loop above (F7 R6 Finding). Wrapped
-    // with operation + destination-path context (F7 R7 Finding).
+    // the TOKENIZER_EXTRA_FILES loop above. Wrapped
+    // with operation + destination-path context.
     if let Err(e) = crate::lm::load::fsync_path_io(&d) {
       record_file_fsync_warning(wrap_fsync_err(&d, &e));
     }
@@ -1712,7 +1710,7 @@ pub fn copy_tokenizer_and_extras(src: &Path, dst: &Path) -> Result<CopyOutcome> 
   // [`CopyDurabilityWarnings`] (separate from `post_copy_file`) so the
   // convert()-side aggregate can route the multi-warning case to
   // [`Error::ConvertDurabilityWarnings`] with each warning machine-
-  // readable via destructuring (F7 R5 Finding — no string fold).
+  // readable via destructuring (no string fold).
   if let Err(dir_err) = crate::lm::load::fsync_dir(dst) {
     warnings.post_copy_dir = Some(dir_err);
   }
@@ -1767,7 +1765,7 @@ mod unit {
     );
   }
 
-  /// Finding 2 (Codex F7 R1) — `Some(0)` is python-falsy and MUST fall
+  /// `Some(0)` is python-falsy and MUST fall
   /// back to the per-mode default (`utils.py:808`: `group_size or
   /// default_group_size, bits or default_bits`). A surviving `0` would
   /// later make `quantize_weights` skip every layer at the
@@ -1851,7 +1849,7 @@ mod unit {
     assert_eq!(resolve_target_dtype(None, cfg).unwrap(), None);
   }
 
-  /// Finding 1 (Codex F7 R1) — an explicit `Some(Dtype::I32)` (or any
+  /// An explicit `Some(Dtype::I32)` (or any
   /// non-floating dtype) is a hard `Error::Backend`, NOT a silent
   /// "cast every float to int" wrecking-ball. The reference's
   /// string-typed `if dtype in MODEL_CONVERSION_DTYPES` gate
@@ -1929,12 +1927,12 @@ mod unit {
     );
   }
 
-  // ─────────── Finding 3 — single-evaluation predicate ───────────
+  // ─────────── single-evaluation predicate ───────────
 
   use std::cell::RefCell;
 
   /// Test-only predicate that counts how many times `decide` was called
-  /// per layer path. Used by the F7 R1 Finding-3 closure test to assert
+  /// per layer path. Used by the single-evaluation closure test to assert
   /// `nn.quantize`'s single-call-per-module semantics
   /// (`utils.py:837-843`).
   struct CountingPredicate {
@@ -1976,9 +1974,9 @@ mod unit {
         .entry(layer_name.to_string())
         .or_insert(0) += 1;
       // Bump cycle — used to make the predicate flip-flop. The
-      // Finding-3 desync (config-says-quantize, weights-say-skip)
-      // would manifest if the predicate were called twice and saw
-      // different cycle values.
+      // desync (config-says-quantize, weights-say-skip) would manifest
+      // if the predicate were called twice and saw different cycle
+      // values.
       *self.cycle.borrow_mut() += 1;
       Some(Quantization {
         group_size: 64,
@@ -1988,15 +1986,14 @@ mod unit {
     }
   }
 
-  /// Finding 3 (Codex F7 R1) — `build_predicate_decisions` must call
-  /// the predicate exactly ONCE per structurally-eligible layer. The
-  /// previous shape evaluated the predicate twice (once in
-  /// `build_quantize_config`, again in the `eligible` closure of
-  /// `convert`); a stateful predicate could record one decision in the
-  /// saved config and apply a different one to weights. This test
-  /// counts invocations per path and asserts max <= 1, mirroring the
-  /// python `nn.quantize`'s single-call-per-module contract
-  /// (`utils.py:837-843`).
+  /// `build_predicate_decisions` must call
+  /// the predicate exactly ONCE per structurally-eligible layer.
+  /// Evaluating the predicate twice (once in `build_quantize_config`,
+  /// again in the `eligible` closure of `convert`) would let a stateful
+  /// predicate record one decision in the saved config and apply a
+  /// different one to weights. This test counts invocations per path and
+  /// asserts max <= 1, mirroring the python `nn.quantize`'s
+  /// single-call-per-module contract (`utils.py:837-843`).
   #[test]
   fn build_predicate_decisions_calls_predicate_once_per_eligible_layer() {
     let mut weights: Weights = HashMap::new();
@@ -2045,7 +2042,7 @@ mod unit {
     }
   }
 
-  /// Finding 3 followup — re-call after the map is built must NOT
+  /// Re-call after the map is built must NOT
   /// re-invoke the predicate. The full convert pipeline runs the
   /// predicate once (in `build_predicate_decisions`); both downstream
   /// consumers (`build_quantize_config` + the `eligible` closure) read
@@ -2082,21 +2079,21 @@ mod unit {
     assert_eq!(paths, vec!["layer.a".to_string(), "layer.b".to_string()]);
   }
 
-  // ─────────── Finding 4 — DurabilityWarning still copies tokenizer ───────────
+  // ─────────── DurabilityWarning still copies tokenizer ───────────
 
-  /// Finding 4 (Codex F7 R1) — when `load::save` returns
+  /// When `load::save` returns
   /// [`Error::DurabilityWarning`] with `committed: true`, the weights +
   /// config are visible on disk; `convert` MUST continue with the
   /// tokenizer / extras copy (so the destination dir is COMPLETE)
-  /// before re-surfacing the warning. The previous shape used `?` on
-  /// the `load::save` call, which early-returned and SKIPPED the
-  /// `copy_tokenizer_and_extras` step — a non-fatal durability warning
-  /// became a partial, hard-to-recover conversion (the destination dir
-  /// existed so the `mlx_path.exists()` gate of a retry would reject
-  /// it, but tokenizer files were missing).
+  /// before re-surfacing the warning. Using `?` on the `load::save`
+  /// call would early-return and SKIP the `copy_tokenizer_and_extras`
+  /// step — turning a non-fatal durability warning into a partial,
+  /// hard-to-recover conversion (the destination dir would exist so the
+  /// `mlx_path.exists()` gate of a retry would reject it, but tokenizer
+  /// files would be missing).
   ///
   /// This test:
-  ///   (a) arms the F6 `fsync_dir` fault injector to fire AFTER the
+  ///   (a) arms the `fsync_dir` fault injector to fire AFTER the
   ///       shard fsync (skip=1, fires on the index-fsync) — driving
   ///       `save` into the `CommittedWithDurabilityWarning` branch.
   ///   (b) runs `convert` end-to-end through this driver.
@@ -2203,21 +2200,21 @@ mod unit {
     let _ = std::fs::remove_dir_all(&dir);
   }
 
-  // ─── Finding 1 (Codex F7 R2) — DurabilityWarning preserved across
+  // ─── DurabilityWarning preserved across
   //     a post-save tokenizer-copy failure ────────────────────────────
   //
-  // The R1 fix stashed the committed-DurabilityWarning into a local
-  // and then called `copy_tokenizer_and_extras(...)?` — the `?`
-  // discarded the stashed warning on copy failure, surfacing the copy
-  // IO error instead. The caller then loses the only signal that the
-  // checkpoint is already committed: `mlx_path` exists on disk, and a
-  // retry's `mlx_path.exists()` gate would reject — silently dropping
+  // Stashing the committed-DurabilityWarning into a local and then
+  // calling `copy_tokenizer_and_extras(...)?` would let the `?`
+  // discard the stashed warning on copy failure, surfacing the copy
+  // IO error instead. The caller would then lose the only signal that
+  // the checkpoint is already committed: `mlx_path` exists on disk, and
+  // a retry's `mlx_path.exists()` gate would reject — silently dropping
   // the already-committed save.
   //
   // This test exercises BOTH faults together:
-  //   (1) Arm the F6 `fsync_dir` injector (`skip=1`) so save returns
-  //       `Err(DurabilityWarning { committed: true, .. })` — the same
-  //       branch the R1 test drives.
+  //   (1) Arm the `fsync_dir` injector (`skip=1`) so save returns
+  //       `Err(DurabilityWarning { committed: true, .. })` — the
+  //       committed-durability-warning branch.
   //   (2) `chmod 000` one of the tokenizer-extras files in `src` so
   //       `copy_tokenizer_and_extras` hits an EACCES on `fs::copy` for
   //       that file (a real OS-level copy failure, not an injector).
@@ -2239,7 +2236,7 @@ mod unit {
   //       chmod-000 file itself MUST NOT have been copied (the
   //       source's perm prevents the read).
   //
-  // Unix-only: relies on `chmod 000` to produce the EACCES; the F6
+  // Unix-only: relies on `chmod 000` to produce the EACCES; the
   // `fsync_dir` injector is also a Unix-only meaningful path (the
   // injector is `#[cfg(test)]` but `fsync_dir` itself is a no-op on
   // non-Unix). Keep the test gated to `#[cfg(unix)]` to match.
@@ -2271,7 +2268,7 @@ mod unit {
     );
     crate::io::save_safetensors(&src.join("model.safetensors"), &weights).unwrap();
 
-    // Same tokenizer fixtures the R1 test uses — `load_tokenizer`
+    // Same tokenizer fixtures the other tests use — `load_tokenizer`
     // succeeds because both files are readable.
     let tokenizer_json = include_str!("../../tests/fixtures/tokenizer.json");
     let tokenizer_config_json = include_str!("../../tests/fixtures/tokenizer_config.json");
@@ -2322,11 +2319,11 @@ mod unit {
     });
     drop(_guard);
 
-    // (a) Final return is the NEW structured
+    // (a) Final return is the structured
     //     `Err(ConvertPostSavePartial { committed: true, save_warning:
-    //     Some(_), copy_error: _ })` (R3 fix) — NOT a free-form
+    //     Some(_), copy_error: _ })` — NOT a free-form
     //     [`DurabilityWarning`] with the copy error folded into its
-    //     `source` string. The R3 contract: a post-commit copy failure
+    //     `source` string. The contract: a post-commit copy failure
     //     MUST surface a distinct variant so the caller can
     //     machine-detect "destination structurally incomplete" vs
     //     "logically-complete checkpoint with fsync warning", AND
@@ -2344,7 +2341,7 @@ mod unit {
         //     skip=1). The underlying IO error is machine-readable
         //     via `.kind()` and the verbatim original message
         //     (`injected fsync_dir failure ...`) is preserved (no
-        //     string fold from R2).
+        //     string fold).
         let save_warning = p
           .save_warning()
           .expect("save_warning must be Some — the fsync-dir injector fired");
@@ -2363,8 +2360,8 @@ mod unit {
           "save_warning preserves the verbatim fsync_dir io::Error \
            message: got {save_warning}"
         );
-        // (c) `copy_error` carries the actual tokenizer-copy failure
-        //     (the new R3 information). It's typed `Error::FileIo` so
+        // (c) `copy_error` carries the actual tokenizer-copy failure.
+        //     It's typed `Error::FileIo` so
         //     callers can branch on `op` / `path` / `inner.kind()`
         //     without string parsing; its Display names
         //     `copy_tokenizer_and_extras` (the function that returned
@@ -2436,18 +2433,17 @@ mod unit {
     let _ = std::fs::remove_dir_all(&dir);
   }
 
-  // ─── Finding 1 (Codex F7 R3) — clean-save + tokenizer-copy failure
-  //     surfaces `ConvertPostSavePartial` with `save_warning = None` ───
+  // ─── clean-save + tokenizer-copy failure surfaces
+  //     `ConvertPostSavePartial` with `save_warning = None` ───
   //
-  // The R3 fix routes BOTH the "committed + durability warning + copy
+  // The handler routes BOTH the "committed + durability warning + copy
   // failure" AND the "committed + clean save + copy failure" cases to
-  // the new structured [`Error::ConvertPostSavePartial`] variant. The
-  // R2 fix's (None, Err) arm returned the bare copy `Error::Backend`,
-  // which was correct for "not committed" but the save HAS committed
-  // by this point (the index rename succeeded BEFORE the
-  // copy_tokenizer_and_extras step runs) — so the destination dir is
-  // structurally incomplete, and the caller needs the structured
-  // variant's recovery contract.
+  // the structured [`Error::ConvertPostSavePartial`] variant. A bare
+  // copy `Error::Backend` on the (None, Err) arm would be correct for
+  // "not committed" but the save HAS committed by this point (the index
+  // rename succeeded BEFORE the copy_tokenizer_and_extras step runs) —
+  // so the destination dir is structurally incomplete, and the caller
+  // needs the structured variant's recovery contract.
   //
   // This test exercises the (None, Err) arm in isolation:
   //   (1) No fsync-dir fault injector — `save` returns plain `Ok(())`.
@@ -2464,8 +2460,8 @@ mod unit {
   //   (c) The destination dir has the committed artifacts (weights +
   //       index + config) but NOT the chmod-000 file.
   //
-  // Unix-only for the same reason as the R2 test: `chmod 000` to
-  // produce EACCES.
+  // Unix-only for the same reason as the durability-warning test:
+  // `chmod 000` to produce EACCES.
   #[cfg(unix)]
   #[test]
   fn convert_no_durability_warning_then_tokenizer_copy_failure_returns_partial_with_no_save_warning()
@@ -2529,8 +2525,8 @@ mod unit {
     // (a) `Err(ConvertPostSavePartial { committed: true, save_warning:
     //     None, copy_error: _ })`. The `None` arm of `save_warning`
     //     is the machine-readable signal that the save was clean
-    //     (no fsync warning) — distinct from the R2 test which has
-    //     `save_warning: Some(_)`.
+    //     (no fsync warning) — distinct from the durability-warning
+    //     test which has `save_warning: Some(_)`.
     match &r {
       Err(Error::ConvertPostSavePartial(p)) => {
         assert!(
@@ -2597,10 +2593,10 @@ mod unit {
     let _ = std::fs::remove_dir_all(&dir);
   }
 
-  // ─── Finding 1 (Codex F7 R3) — `ConvertPostSavePartial` error chain
-  //     is iterable via `std::error::Error::source()` ─────────────────
+  // ─── `ConvertPostSavePartial` error chain is iterable via
+  //     `std::error::Error::source()` ─────────────────
   //
-  // The R3 variant uses `#[source]` on `copy_error` so callers walking
+  // The variant uses `#[source]` on `copy_error` so callers walking
   // the error chain via [`std::error::Error::source`] reach the
   // tokenizer-copy failure (the actually-actionable signal the caller
   // needs to retry or recover from). This test asserts the chain is
@@ -2675,15 +2671,15 @@ mod unit {
   }
 
   // ──────────────────────────────────────────────────────────────────
-  // F7 R4 Finding-1 closures — post-copy durability (fsync_path +
-  // fsync_dir AFTER tokenizer/extras `std::fs::copy`).
+  // Post-copy durability closures (fsync_path + fsync_dir AFTER
+  // tokenizer/extras `std::fs::copy`).
   //
-  // Before R4 `copy_tokenizer_and_extras` did not fsync the copied
-  // files or the dst dir, so a crash AFTER `convert() → Ok(())` could
-  // leave weights+config durable but tokenizer files torn/missing —
-  // the documented "Ok = durable" contract was broken for extras.
+  // Without these `copy_tokenizer_and_extras` would not fsync the
+  // copied files or the dst dir, so a crash AFTER `convert() → Ok(())`
+  // could leave weights+config durable but tokenizer files torn/missing
+  // — breaking the documented "Ok = durable" contract for extras.
   //
-  // The R4 fix:
+  // The post-copy durability step:
   //   (1) fsyncs each copied file via [`crate::lm::load::fsync_path`]
   //   (2) fsyncs the dst dir via [`crate::lm::load::fsync_dir`] after
   //       all copies complete
@@ -2698,7 +2694,7 @@ mod unit {
   // [`#[cfg(test)] pub(crate)`] (sibling-test access) and `Drop`-guarded
   // so a test panic leaves the thread clean.
   //
-  // The shared fixture is the same shape as the R1/R2/R3 tests:
+  // The shared fixture is the same shape as the other convert tests:
   // build a synthetic src with config + weights + a tokenizer the
   // load step accepts, then arm the relevant injector and call
   // `convert`. The skip counts target the post-copy fsync(s): the
@@ -2709,14 +2705,13 @@ mod unit {
   // save-side fsync pass and fires on the first post-copy call.
   // ──────────────────────────────────────────────────────────────────
 
-  /// Build the synthetic src+dst dir pair used by the R4 post-copy
-  /// fsync tests. Mirrors the R1/R2/R3 fixture but extracted so the
-  /// four new tests don't each duplicate ~30 lines. Returns
+  /// Build the synthetic src+dst dir pair used by the post-copy
+  /// fsync tests. Mirrors the other convert fixtures but extracted so
+  /// the four tests don't each duplicate ~30 lines. Returns
   /// `(workdir, src, dst)` so the caller controls cleanup via
   /// `remove_dir_all(workdir)`.
-  fn build_r4_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
-    let workdir =
-      std::env::temp_dir().join(format!("mlxrs_convert_r4_{tag}_{}", std::process::id()));
+  fn build_save_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let workdir = std::env::temp_dir().join(format!("mlxrs_convert_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&workdir);
     let src = workdir.join("src");
     let dst = workdir.join("dst");
@@ -2751,7 +2746,7 @@ mod unit {
     (workdir, src, dst)
   }
 
-  /// F7 R4 Finding-1 — post-copy FILE fsync failure surfaces
+  /// Post-copy FILE fsync failure surfaces
   /// `Err(DurabilityWarning)` (NOT `ConvertPostSavePartial`).
   ///
   /// The post-copy fsync runs AFTER `std::fs::copy` returns Ok, so the
@@ -2769,7 +2764,7 @@ mod unit {
   /// `tokenizer.json` by the const-array's order).
   #[test]
   fn convert_post_copy_file_fsync_failure_returns_durability_warning() {
-    let (workdir, src, dst) = build_r4_fixture("file_fsync_fail");
+    let (workdir, src, dst) = build_save_fixture("file_fsync_fail");
 
     // Arm the fsync_path injector: skip the 3 save-side calls, fail
     // on the 4th (first post-copy per-file fsync). The dir injector
@@ -2832,7 +2827,7 @@ mod unit {
     let _ = std::fs::remove_dir_all(&workdir);
   }
 
-  /// F7 R4 Finding-1 — post-copy DIR fsync failure surfaces
+  /// Post-copy DIR fsync failure surfaces
   /// `Err(DurabilityWarning)` (NOT `ConvertPostSavePartial`).
   ///
   /// Same shape as the file-fsync test above — the only difference
@@ -2848,7 +2843,7 @@ mod unit {
   /// post-copy `fsync_dir(dst)`).
   #[test]
   fn convert_post_copy_dir_fsync_failure_returns_durability_warning() {
-    let (workdir, src, dst) = build_r4_fixture("dir_fsync_fail");
+    let (workdir, src, dst) = build_save_fixture("dir_fsync_fail");
 
     // Arm the fsync_dir injector: skip the 3 save-side calls, fail
     // on the 4th (post-copy fsync_dir(dst)). The path injector is
@@ -2903,14 +2898,14 @@ mod unit {
     let _ = std::fs::remove_dir_all(&workdir);
   }
 
-  /// F7 R4 + R5 Finding — BOTH the per-file fsync AND the post-copy
-  /// dir fsync warn. R5 fix: surfaces the typed aggregate
+  /// BOTH the per-file fsync AND the post-copy dir fsync warn.
+  /// Surfaces the typed aggregate
   /// [`Error::ConvertDurabilityWarnings`] with each warning carried
   /// in a separate `Option<std::io::Error>` field (no
   /// `io::Error::other(format!(...))` fold) so the caller can
-  /// machine-detect WHICH boundaries warned via destructuring (R4
-  /// returned a string-folded `DurabilityWarning` that hid typed
-  /// access to the individual warnings).
+  /// machine-detect WHICH boundaries warned via destructuring (a
+  /// string-folded `DurabilityWarning` would hide typed access to the
+  /// individual warnings).
   ///
   /// Skip counts: 3 on each injector. The path injector fires on
   /// the first post-copy file fsync; the dir injector fires on the
@@ -2921,7 +2916,7 @@ mod unit {
   /// and returns both in the typed `CopyDurabilityWarnings` shape.
   #[test]
   fn convert_post_copy_both_fsyncs_fail_combined_message() {
-    let (workdir, src, dst) = build_r4_fixture("both_fsyncs_fail");
+    let (workdir, src, dst) = build_save_fixture("both_fsyncs_fail");
 
     // Arm BOTH injectors. The path injector skips the 3 save-side
     // fsync_path calls (config-stage, shard tmp, index tmp) and
@@ -2970,7 +2965,7 @@ mod unit {
             .to_string()
             .contains("injected fsync_path failure"),
           "post_copy_file preserves the verbatim file-fsync io::Error \
-           message (no string fold from R4); got: {post_copy_file}"
+           message (no string fold); got: {post_copy_file}"
         );
 
         // (d) Dir fsync warning IS present + machine-readable via
@@ -2985,7 +2980,7 @@ mod unit {
             .to_string()
             .contains("injected fsync_dir failure"),
           "post_copy_dir preserves the verbatim dir-fsync io::Error \
-           message (no string fold from R4); got: {post_copy_dir}"
+           message (no string fold); got: {post_copy_dir}"
         );
 
         // (e) count() reports the multi-warning shape (exactly 2
@@ -3014,7 +3009,7 @@ mod unit {
       Err(Error::DurabilityWarning(_)) => panic!(
         "both-fsyncs-warn surfaces the multi-warning aggregate \
          ConvertDurabilityWarnings, NOT the single-warning \
-         DurabilityWarning shape (R5 fix: typed access to each \
+         DurabilityWarning shape (typed access to each \
          boundary)"
       ),
       Err(Error::ConvertPostSavePartial(_)) => panic!(
@@ -3028,7 +3023,7 @@ mod unit {
     let _ = std::fs::remove_dir_all(&workdir);
   }
 
-  /// F7 R4 Finding-1 — happy-path: `convert() → Ok(())` implies every
+  /// Happy-path: `convert() → Ok(())` implies every
   /// post-copy fsync was actually invoked. Asserted by reading the
   /// on-disk state: every copied file's bytes match the source AND
   /// the destination dir is observable. A regression that silently
@@ -3048,7 +3043,7 @@ mod unit {
     // ── Sub-test A: no injector → happy path returns Ok(()) AND
     //                every copied file is on disk byte-equal.
     {
-      let (workdir, src, dst) = build_r4_fixture("happy_path");
+      let (workdir, src, dst) = build_save_fixture("happy_path");
       let r = convert(ConvertArgs {
         hf_path: src.clone(),
         mlx_path: dst.clone(),
@@ -3084,7 +3079,7 @@ mod unit {
     //                convert and the result would be Ok(()) — a
     //                clear signal that the fsync was skipped.
     {
-      let (workdir, src, dst) = build_r4_fixture("happy_path_spy_file");
+      let (workdir, src, dst) = build_save_fixture("happy_path_spy_file");
       let _guard = crate::lm::load::arm_fsync_path_fault(3);
       let r = convert(ConvertArgs {
         hf_path: src,
@@ -3109,7 +3104,7 @@ mod unit {
     //                injector would not fire and the result would be
     //                Ok(()).
     {
-      let (workdir, src, dst) = build_r4_fixture("happy_path_spy_dir");
+      let (workdir, src, dst) = build_save_fixture("happy_path_spy_dir");
       let _guard = crate::lm::load::arm_fsync_dir_fault(3);
       let r = convert(ConvertArgs {
         hf_path: src,
@@ -3129,13 +3124,13 @@ mod unit {
   }
 
   // ──────────────────────────────────────────────────────────────────
-  // F7 R5 Finding — multi-warning save+post-copy aggregate tests.
+  // Multi-warning save+post-copy aggregate tests.
   //
-  // Before R5 the (save warned, post-copy fsync warned) branch folded
+  // A naive (save warned, post-copy fsync warned) branch would fold
   // the two io::Errors into a single free-form
   // `std::io::Error::other(format!(...))` message inside
-  // `DurabilityWarning.source`, losing typed access. The R5 fix
-  // routes multi-warning convert()s through the typed
+  // `DurabilityWarning.source`, losing typed access. Instead,
+  // multi-warning convert()s are routed through the typed
   // `Error::ConvertDurabilityWarnings(ConvertDurabilityWarnings { ... })`
   // aggregate so the caller can destructure each warning by field.
   //
@@ -3149,76 +3144,28 @@ mod unit {
   // fsync_{path,dir} call).
   // ──────────────────────────────────────────────────────────────────
 
-  /// F7 R5 Finding — save warned (save-side parent-dir fsync) AND
-  /// the post-copy dir fsync warned. Asserts the typed aggregate
+  /// Aggregate routing — save warned AND the post-copy dir fsync
+  /// warned. Asserts the typed aggregate
   /// `Err(ConvertDurabilityWarnings { save: Some, post_copy_file:
-  /// None, post_copy_dir: Some })` is surfaced (NOT the old folded
+  /// None, post_copy_dir: Some })` is surfaced (NOT a folded
   /// single-source `DurabilityWarning`).
   ///
-  /// Skip counts:
-  ///   - fsync_dir injector at skip=2 → save's 3rd fsync_dir call
-  ///     (the config-commit fsync) fires + sets up the save warning;
-  ///     subsequent calls are unarmed by default but a NEW guard arms
-  ///     the next batch for the post-copy dir fsync. Since the
-  ///     injector is single-shot (re-arm needed each time), we arm
-  ///     a SECOND fsync_dir guard at skip=0 just before re-entering
-  ///     convert()... but convert() is one call. Easier approach:
-  ///     arm fsync_dir at skip=2 with a longer fire window.
+  /// The fault injector's contract (`arm_fsync_dir_fault(skip)` fires
+  /// on the (skip+1)-th call, single-shot drop guard) makes a
+  /// two-specific-dir-fsync-failure topology impossible to set up via
+  /// injection alone: arming `skip=2` fires once at save's 3rd
+  /// fsync_dir call (the config commit) and the post-copy `fsync_dir(dst)`
+  /// then runs unimpeded, since the guard has already fired. Failing
+  /// TWO specific dir-fsync calls would require re-arming mid-convert,
+  /// which isn't possible.
   ///
-  /// Looking at the injector contract: `arm_fsync_dir_fault(skip)`
-  /// fires on the (skip+1)-th call. Each guard fires ONCE per
-  /// armed call. We need TWO failures from the same injector — so
-  /// we arm the injector for the SAVE-side warn (skip=2) and the
-  /// post-copy DIR warn separately. The cleanest mechanism: arm
-  /// fsync_dir at skip=2 to make save warn (the post-copy fsync_dir
-  /// then passes naturally, since the guard has already fired).
-  /// To ALSO make the post-copy dir fsync warn, we'd need a way to
-  /// fail TWO specific calls.
-  ///
-  /// The injector's contract (single-shot drop guard) means we need
-  /// a DIFFERENT mechanism for the per-test fault topology. The
-  /// helper supports `arm_fsync_dir_fault(skip)` for one-shot at
-  /// a specific call index; to make two specific dir-fsync calls
-  /// warn we need the fixture to re-arm at the right boundary —
-  /// which is impossible mid-convert.
-  ///
-  /// Realistic test: make save side warn via fsync_dir skip=2
-  /// (save's 3rd dir fsync, the config commit), then make the
-  /// post-copy fsync_path skip=3 fire on the first post-copy file
-  /// fsync. This exercises (save: Some, post_copy_file: Some,
-  /// post_copy_dir: None) — a perfectly good multi-warning test
-  /// even though the field names differ from this docstring's
-  /// dir-only hypothetical.
-  ///
-  /// This test exercises (save: Some, post_copy_dir: Some) by
-  /// arming fsync_dir at skip=2 (save's 3rd call → save warns) and
-  /// relying on the injector to ALSO fire on the post-copy
-  /// fsync_dir if its fault list re-arms.
-  ///
-  /// Reading the injector source: each guard is single-shot. So
-  /// arming `skip=2` alone fires once at save's 3rd fsync_dir call
-  /// and the post-copy fsync_dir runs unimpeded. We rename this
-  /// test to test (save: Some, post_copy_file: Some) which IS
-  /// realizable with two independent injectors (fsync_dir skip=2
-  /// for save + fsync_path skip=3 for post-copy file).
-  ///
-  /// See `convert_save_and_post_copy_file_warn_returns_aggregate`
-  /// for the (save: Some, post_copy_file: Some) case.
-  ///
-  /// For (save: Some, post_copy_dir: Some) we use fsync_dir at
-  /// skip=5 (skip past the 3 save-side calls + the post-copy file
-  /// fsync's _absent_ dir call... but the post-copy `fsync_dir(dst)`
-  /// is the only dir fsync after save's 3 — so skip=3 would fire
-  /// on the post-copy dir fsync, NOT make save warn). To make save
-  /// warn we need an EARLIER skip count.
-  ///
-  /// Resolution: implement the test using TWO drop guards on the
-  /// fsync_dir injector via re-arming inside convert is not
-  /// possible without modifying the injector. We exercise the
-  /// (save: Some, post_copy_dir: Some) shape by direct construction
-  /// in `convert_durability_aggregate_error_chain_walkable` and
-  /// rely on the (save: Some, post_copy_file: Some) injection test
-  /// below for end-to-end coverage.
+  /// So the (save: Some, post_copy_dir: Some) shape is exercised by
+  /// direct construction here (and the convert()-side aggregate-count
+  /// routing it drives), while the (save: Some, post_copy_file: Some)
+  /// shape — realizable with two independent injectors (fsync_dir
+  /// skip=2 for save + fsync_path skip=3 for post-copy file) — is
+  /// covered end-to-end by
+  /// `convert_save_and_post_copy_file_warn_returns_aggregate` below.
   #[test]
   fn convert_save_and_post_copy_dir_warn_returns_aggregate() {
     // Direct construction (no injector — the fault model can't
@@ -3276,18 +3223,17 @@ mod unit {
     }
   }
 
-  /// F7 R5 Finding — save warned (save-side fsync_dir at skip=2 fires
-  /// on save's 3rd fsync_dir call — the config-commit dir fsync) AND
-  /// the post-copy file fsync warned (fsync_path at skip=3 fires on
-  /// the first post-copy per-file fsync — the first
-  /// TOKENIZER_EXTRA_FILES entry, `tokenizer.json`). Asserts the
-  /// typed aggregate `Err(ConvertDurabilityWarnings { save: Some,
-  /// post_copy_file: Some, post_copy_dir: None })` is surfaced (R5
-  /// fix — pre-R5 returned a single `DurabilityWarning` with a
-  /// string-folded source).
+  /// Save warned (save-side fsync_dir at skip=2 fires on save's 3rd
+  /// fsync_dir call — the config-commit dir fsync) AND the post-copy
+  /// file fsync warned (fsync_path at skip=3 fires on the first
+  /// post-copy per-file fsync — the first TOKENIZER_EXTRA_FILES entry,
+  /// `tokenizer.json`). Asserts the typed aggregate
+  /// `Err(ConvertDurabilityWarnings { save: Some, post_copy_file: Some,
+  /// post_copy_dir: None })` is surfaced (a folded shape would return a
+  /// single `DurabilityWarning` with a string-folded source).
   #[test]
   fn convert_save_and_post_copy_file_warn_returns_aggregate() {
-    let (workdir, src, dst) = build_r4_fixture("save_and_postcopy_file_warn");
+    let (workdir, src, dst) = build_save_fixture("save_and_postcopy_file_warn");
 
     // Arm fsync_dir at skip=2: save's 3 fsync_dir calls are
     // (shard publish, index publish, config commit) — skip 2 lets
@@ -3358,9 +3304,9 @@ mod unit {
       }
       Err(Error::DurabilityWarning(_)) => panic!(
         "save warned + post-copy file fsync warned MUST surface the \
-         typed aggregate ConvertDurabilityWarnings (R5), NOT the \
-         single-source DurabilityWarning (which folded the two via \
-         io::Error::other(format!(...)) in R4)"
+         typed aggregate ConvertDurabilityWarnings, NOT the \
+         single-source DurabilityWarning (which would fold the two via \
+         io::Error::other(format!(...)))"
       ),
       other => panic!("expected Err(ConvertDurabilityWarnings), got {other:?}"),
     }
@@ -3382,7 +3328,7 @@ mod unit {
     let _ = std::fs::remove_dir_all(&workdir);
   }
 
-  /// F7 R5 Finding — the aggregate's `std::error::Error::source()`
+  /// The aggregate's `std::error::Error::source()`
   /// chain is walkable and returns the FIRST non-None warning in
   /// deterministic `save -> post_copy_file -> post_copy_dir`
   /// priority order. Asserts (a) the chain is non-empty when any
@@ -3515,18 +3461,18 @@ mod unit {
     }
   }
 
-  // ─── F7 R6 Finding — io::Error kind preserved end-to-end ─────────
+  // ─── io::Error kind preserved end-to-end ─────────
   //
-  // Codex R6 finding: the convert()-side aggregate carries an
+  // The convert()-side aggregate carries an
   // `Option<std::io::Error>` per fsync boundary that is advertised as
   // machine-readable (callers branch on `.kind()` to disambiguate
-  // ENOSPC / EIO / PermissionDenied / ...), but the pre-R6 shape used
+  // ENOSPC / EIO / PermissionDenied / ...). Routing through
   // [`crate::lm::load::fsync_path`] (which returns
   // [`crate::Error::Backend`] — string-wrapping the underlying
-  // io::Error and losing its kind) and then re-wrapped the message via
-  // [`std::io::Error::other`], collapsing EVERY post_copy_file
-  // warning's kind to [`std::io::ErrorKind::Other`]. The fix routes
-  // through the new kind-preserving sibling
+  // io::Error and losing its kind) and then re-wrapping the message via
+  // [`std::io::Error::other`] would collapse EVERY post_copy_file
+  // warning's kind to [`std::io::ErrorKind::Other`]. Instead we route
+  // through the kind-preserving sibling
   // [`crate::lm::load::fsync_path_io`] (returns
   // [`std::io::Result<()>`]) so the underlying kind survives intact.
   //
@@ -3542,13 +3488,13 @@ mod unit {
   //
   // Driven via the kind-injecting [`arm_fsync_path_fault_with_kind`] /
   // [`arm_fsync_dir_fault_with_kind`] sibling injectors — they extend
-  // the pre-R6 single-arg variants with an [`std::io::ErrorKind`]
+  // the single-arg variants with an [`std::io::ErrorKind`]
   // override so the test can inject a SPECIFIC non-`Other` kind
-  // (defaulting to `Other` would mask the bug — the pre-R6 code path
-  // also produced `Other`, so a kind-equality assertion would pass
+  // (defaulting to `Other` would mask the bug — a kind-collapsing code
+  // path also produces `Other`, so a kind-equality assertion would pass
   // even with the regression).
 
-  /// F7 R6 Finding — post-copy per-file fsync warning preserves the
+  /// Post-copy per-file fsync warning preserves the
   /// underlying [`std::io::ErrorKind`] (NOT collapsed to `Other`).
   ///
   /// Drives the same path as
@@ -3556,7 +3502,7 @@ mod unit {
   /// but injects [`std::io::ErrorKind::PermissionDenied`] specifically
   /// — the assertion `agg.post_copy_file.unwrap().kind() ==
   /// PermissionDenied` (NOT `Other`) is the regression detector. A
-  /// pre-R6 build would unwrap the injected io::Error via
+  /// kind-collapsing build would unwrap the injected io::Error via
   /// `Err(Error::Backend(message)) => Err(io::Error::other(message))`
   /// inside `copy_tokenizer_and_extras`'s `fsync_copied` closure,
   /// collapsing the kind to `Other`.
@@ -3565,18 +3511,18 @@ mod unit {
   /// stage, shard tmp, index tmp), fires on the 4th call (first post-
   /// copy per-file fsync). The dir injector is NOT armed so the only
   /// non-None field is `post_copy_file` and the single-warning
-  /// surface is the existing [`Error::DurabilityWarning`] shape (R5
-  /// routing — count() == 1 takes the single-source branch).
+  /// surface is the existing [`Error::DurabilityWarning`] shape
+  /// (count() == 1 takes the single-source branch).
   #[test]
   fn convert_post_copy_file_warning_preserves_io_error_kind() {
-    let (workdir, src, dst) = build_r4_fixture("post_copy_file_kind");
+    let (workdir, src, dst) = build_save_fixture("post_copy_file_kind");
 
     // Arm the path injector with skip=3 + a SPECIFIC non-`Other` kind.
-    // Pre-R6 would collapse to `Other` regardless of what the injector
-    // produces (the convert()-side `fsync_copied` re-wrapped via
-    // `io::Error::other(message)` — kind unconditionally `Other`).
-    // Post-R6 the kind survives through `fsync_path_io` → the typed
-    // aggregate's `post_copy_file` field.
+    // A kind-collapsing path would force `Other` regardless of what the
+    // injector produces (the convert()-side `fsync_copied` re-wrapped
+    // via `io::Error::other(message)` — kind unconditionally `Other`).
+    // Routing through `fsync_path_io` lets the kind survive into the
+    // typed aggregate's `post_copy_file` field.
     let _guard =
       crate::lm::load::arm_fsync_path_fault_with_kind(3, std::io::ErrorKind::PermissionDenied);
 
@@ -3587,10 +3533,9 @@ mod unit {
     });
     drop(_guard);
 
-    // Single warning → existing single-source DurabilityWarning shape
-    // (R5 routing). The `source` field is the raw io::Error from
-    // `post_copy_file` — its `.kind()` must equal the INJECTED kind,
-    // NOT `Other`.
+    // Single warning → existing single-source DurabilityWarning shape.
+    // The `source` field is the raw io::Error from `post_copy_file` —
+    // its `.kind()` must equal the INJECTED kind, NOT `Other`.
     match &r {
       Err(Error::DurabilityWarning(p)) => {
         assert!(p.committed(), "committed=true (data IS on disk)");
@@ -3598,7 +3543,7 @@ mod unit {
           p.source().kind(),
           std::io::ErrorKind::PermissionDenied,
           "post_copy_file warning preserves the injected ErrorKind \
-           (PermissionDenied) end-to-end — a regression to the pre-R6 \
+           (PermissionDenied) end-to-end — an \
            `io::Error::other(message)` re-wrap would collapse this to \
            ErrorKind::Other; got: {:?} ({})",
           p.source().kind(),
@@ -3618,10 +3563,10 @@ mod unit {
     let _ = std::fs::remove_dir_all(&workdir);
   }
 
-  /// F7 R6 Finding — post-copy directory fsync warning preserves the
+  /// Post-copy directory fsync warning preserves the
   /// underlying [`std::io::ErrorKind`]. The dir path already returned
-  /// raw [`std::io::Result`] (no `Error::Backend` wrap) so the
-  /// pre-R6 code path was kind-preserving HERE — this test guards
+  /// raw [`std::io::Result`] (no `Error::Backend` wrap) so this code
+  /// path is kind-preserving HERE — this test guards
   /// against a regression that adds a fold (e.g. a future "uniform
   /// shape with fsync_path" refactor that wraps in
   /// `io::Error::other(message)`).
@@ -3631,7 +3576,7 @@ mod unit {
   /// (post-copy `fsync_dir(dst)`).
   #[test]
   fn convert_post_copy_dir_warning_preserves_io_error_kind() {
-    let (workdir, src, dst) = build_r4_fixture("post_copy_dir_kind");
+    let (workdir, src, dst) = build_save_fixture("post_copy_dir_kind");
 
     // Use `StorageFull` (commonly ENOSPC) — a kind a real durability
     // recovery flow MUST be able to distinguish from PermissionDenied
@@ -3670,7 +3615,7 @@ mod unit {
     let _ = std::fs::remove_dir_all(&workdir);
   }
 
-  /// F7 R6 Finding — save-side warning preserves the underlying
+  /// Save-side warning preserves the underlying
   /// [`std::io::ErrorKind`]. Drives the same path as
   /// `convert_durability_warning_still_copies_tokenizer_and_returns_warning`
   /// but asserts the SPECIFIC injected kind (rather than just the
@@ -3688,16 +3633,16 @@ mod unit {
   /// `Err(DurabilityWarning)` after also committing the config.
   /// No post-copy fsync is faulted, so the only non-None field is
   /// `save` and the single-warning surface is the existing
-  /// `Error::DurabilityWarning` shape (R5 routing — count() == 1).
+  /// `Error::DurabilityWarning` shape (count() == 1).
   #[test]
   fn convert_save_warning_preserves_io_error_kind() {
-    let (workdir, src, dst) = build_r4_fixture("save_kind");
+    let (workdir, src, dst) = build_save_fixture("save_kind");
 
     // Inject ConnectionReset just to ensure the test is asserting a
     // SPECIFIC kind that's neither `Other` (the default) nor
-    // PermissionDenied / StorageFull (used by the other two R6 tests)
-    // — a pre-R6-style fold that collapsed every kind to `Other` (or
-    // any non-ConnectionReset default) would fail this assertion. The
+    // PermissionDenied / StorageFull (used by the other two kind tests)
+    // — a fold that collapsed every kind to `Other` (or any
+    // non-ConnectionReset default) would fail this assertion. The
     // kind is otherwise arbitrary — fsync errors in real life are
     // commonly `Other` (errno EIO with no narrower std mapping), so
     // the realism of the kind isn't the point; preservation is.
@@ -3739,9 +3684,9 @@ mod unit {
     let _ = std::fs::remove_dir_all(&workdir);
   }
 
-  // ─── F7 R7 Finding — call-site wrap adds path + operation context ──
+  // ─── call-site wrap adds path + operation context ──
   //
-  // Codex R7 finding: `fsync_path_io` returns the raw [`std::io::Error`]
+  // `fsync_path_io` returns the raw [`std::io::Error`]
   // from [`std::fs::File::open`] / [`std::fs::File::sync_all`] without
   // adding path/operation context. For REAL failures (not the injected
   // ones whose message happens to include the path), callers get only
@@ -3750,15 +3695,14 @@ mod unit {
   // tokenizer file warned or whether the failure was the reopen vs the
   // sync_all.
   //
-  // The fix wraps at the call site (in `copy_tokenizer_and_extras`)
+  // The call site (in `copy_tokenizer_and_extras`) wraps the error
   // with `"copy_tokenizer_and_extras: fsync <dst-path> failed: <inner>"`
-  // via [`std::io::Error::new`] (kind preserved — the R6 contract is
-  // intact).
+  // via [`std::io::Error::new`] (kind preserved).
   //
   // The two tests below cover BOTH halves of the assurance:
   //
   // 1. `convert_post_copy_file_warning_includes_destination_path` —
-  //    drives the existing R6 injected-kind path and asserts the wrap
+  //    drives the injected-kind path and asserts the wrap
   //    added BOTH the destination filename AND the operation tag. This
   //    verifies the wrap fires on the standard injected path
   //    (regression detector: if the wrap is removed, the assertion
@@ -3767,7 +3711,7 @@ mod unit {
   //    fsync"`).
   //
   // 2. `convert_post_copy_file_real_failure_includes_path_and_kind` —
-  //    drives the F7 R7 "real failure" injector (which removes the
+  //    drives the "real failure" injector (which removes the
   //    target file then falls through to the natural
   //    [`std::fs::File::open`] for an AUTHENTIC OS-level
   //    [`std::io::ErrorKind::NotFound`] with NO path in the message).
@@ -3775,27 +3719,27 @@ mod unit {
   //    free OS error — proving the path-context assertion isn't passing
   //    only because the injector pre-formats the path into its message.
 
-  /// F7 R7 Finding — the post-copy per-file fsync warning message
+  /// The post-copy per-file fsync warning message
   /// contains the destination filename + operation tag (added by the
   /// call-site wrap in `copy_tokenizer_and_extras`).
   ///
   /// Drives the same injected-kind path as
   /// `convert_post_copy_file_warning_preserves_io_error_kind` but adds
-  /// the R7 path-context assertions. A regression that removes the
+  /// the path-context assertions. A regression that removes the
   /// call-site wrap would still pass the kind assertion (because
   /// `fsync_path_io` returns the raw io::Error directly) but would FAIL
   /// the operation-tag assertion because the injector's own message
   /// (`"injected fsync_path failure for ..."`) does NOT contain
   /// `"copy_tokenizer_and_extras: fsync"`.
   ///
-  /// Skip count: 3 — same shape as the R6 test. The first post-copy
+  /// Skip count: 3 — same shape as the kind test. The first post-copy
   /// per-file fsync is for `tokenizer.json` (first
   /// `TOKENIZER_EXTRA_FILES` entry that exists at src). Asserts the
   /// warning message contains BOTH `"tokenizer.json"` and the
   /// operation tag `"copy_tokenizer_and_extras: fsync"`.
   #[test]
   fn convert_post_copy_file_warning_includes_destination_path() {
-    let (workdir, src, dst) = build_r4_fixture("post_copy_file_path_ctx");
+    let (workdir, src, dst) = build_save_fixture("post_copy_file_path_ctx");
 
     let _guard =
       crate::lm::load::arm_fsync_path_fault_with_kind(3, std::io::ErrorKind::PermissionDenied);
@@ -3810,29 +3754,29 @@ mod unit {
     match &r {
       Err(Error::DurabilityWarning(p)) => {
         assert!(p.committed(), "committed=true (data IS on disk)");
-        // R6 contract intact: the wrap uses io::Error::new (kind
-        // preserved), not io::Error::other (which would collapse to
-        // `Other`).
+        // Kind-preservation contract intact: the wrap uses
+        // io::Error::new (kind preserved), not io::Error::other (which
+        // would collapse to `Other`).
         assert_eq!(
           p.source().kind(),
           std::io::ErrorKind::PermissionDenied,
-          "R7 wrap preserves the underlying ErrorKind (R6 contract); \
+          "the wrap preserves the underlying ErrorKind; \
            got: {:?} ({})",
           p.source().kind(),
           p.source()
         );
         let msg = p.source().to_string();
-        // R7 wrap added the operation tag — the injector's own message
+        // The wrap added the operation tag — the injector's own message
         // does not contain this string, so this assertion fails if the
         // call-site wrap is removed.
         assert!(
           msg.contains("copy_tokenizer_and_extras: fsync"),
-          "R7 wrap adds the operation tag `copy_tokenizer_and_extras: \
+          "the wrap adds the operation tag `copy_tokenizer_and_extras: \
            fsync ...`; got: {msg}"
         );
-        // R7 wrap added the destination filename (tokenizer.json is
+        // The wrap added the destination filename (tokenizer.json is
         // the first entry of TOKENIZER_EXTRA_FILES present in src per
-        // build_r4_fixture).
+        // build_save_fixture).
         assert!(
           msg.contains("tokenizer.json"),
           "wrap names the destination filename (tokenizer.json); got: \
@@ -3846,8 +3790,8 @@ mod unit {
           "wrap names the full destination path ({}); got: {msg}",
           expected_dst.display()
         );
-        // R6 contract intact: the wrap PRESERVES the inner injector
-        // message via the trailing `: {e}` interpolation.
+        // Kind-preservation contract intact: the wrap PRESERVES the
+        // inner injector message via the trailing `: {e}` interpolation.
         assert!(
           msg.contains("injected fsync_path failure"),
           "wrap preserves the verbatim inner io::Error message; got: \
@@ -3860,37 +3804,37 @@ mod unit {
     let _ = std::fs::remove_dir_all(&workdir);
   }
 
-  /// F7 R7 Finding — REAL OS-level fsync failure (not the synthesized
+  /// REAL OS-level fsync failure (not the synthesized
   /// "injected fsync_path failure for {path}" string from the standard
   /// injector) carries path + operation context via the call-site wrap.
   ///
-  /// Drives the F7 R7 "remove_then_fail" injector — on the 4th
+  /// Drives the "remove_then_fail" injector — on the 4th
   /// `fsync_path_inner` call (past the 3 save-side calls), the injector
   /// removes the target file then FALLS THROUGH to the natural
   /// [`std::fs::File::open`] which returns the AUTHENTIC OS-level
   /// [`std::io::ErrorKind::NotFound`] error. That error's message is
   /// the platform OS text (`"No such file or directory (os error 2)"`
-  /// on Unix) — it does NOT include the path. Without the F7 R7 call-
-  /// site wrap, the recorded warning would surface this context-free
+  /// on Unix) — it does NOT include the path. Without the call-site
+  /// wrap, the recorded warning would surface this context-free
   /// string to the caller, who would have no way to tell WHICH copied
   /// tokenizer file warned.
   ///
   /// Asserts:
   ///   (a) result is `Err(DurabilityWarning)` (single warning →
-  ///       single-source shape, R5 routing) with `committed: true`;
+  ///       single-source shape) with `committed: true`;
   ///   (b) source.kind() is the REAL OS kind (NotFound) — not the
   ///       injector-default Other (proves we're observing the natural
   ///       failure, not a synthesized one);
   ///   (c) source.to_string() contains the destination filename
-  ///       (tokenizer.json — added by the R7 wrap);
+  ///       (tokenizer.json — added by the wrap);
   ///   (d) source.to_string() does NOT contain `"injected fsync_path
   ///       failure"` (the standard injector's marker — proves this is
   ///       a real OS failure path, not the synthesized one);
   ///   (e) source.to_string() contains `"copy_tokenizer_and_extras:
-  ///       fsync"` (the operation tag — added by the R7 wrap).
+  ///       fsync"` (the operation tag — added by the wrap).
   #[test]
   fn convert_post_copy_file_real_failure_includes_path_and_kind() {
-    let (workdir, src, dst) = build_r4_fixture("post_copy_file_real_fail");
+    let (workdir, src, dst) = build_save_fixture("post_copy_file_real_fail");
 
     // Skip 3 (save-side fsync_path calls); fire on the 4th (first
     // post-copy per-file fsync — tokenizer.json). The injector removes
@@ -3966,7 +3910,7 @@ mod unit {
       }
       other => panic!(
         "expected Err(DurabilityWarning) carrying the real OS NotFound \
-         (kind from File::open on a removed file) wrapped with R7 path + \
+         (kind from File::open on a removed file) wrapped with the operation path + \
          operation context, got {other:?}"
       ),
     }

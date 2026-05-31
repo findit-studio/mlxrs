@@ -1,4 +1,4 @@
-//! A7 — `audio::tts::TtsModel` trait + `audio::tts::tts_generate` Iterator:
+//! `audio::tts::TtsModel` trait + `audio::tts::tts_generate` Iterator:
 //! end-to-end text → audio-chunk synthesis driven by a mock TTS model.
 //!
 //! Deterministic, dependency-free: a local `MockTtsModel` emits, per text
@@ -122,7 +122,7 @@ type SeenRef = (bool, Option<String>);
 /// A [`TtsModel`] that records the [`TtsSegment::ref_audio`] /
 /// [`TtsSegment::ref_text`] it received on every segment — so a test can prove
 /// the voice-clone reference is threaded through the public path onto each
-/// segment (Fix 1).
+/// segment.
 struct RecordingRefModel {
   /// One [`SeenRef`] per `synthesize_segment` call, in order.
   seen_refs: RefCell<Vec<SeenRef>>,
@@ -151,7 +151,7 @@ impl TtsModel for RecordingRefModel {
 }
 
 /// A `synthesize_segment` returning a rank-1 but NON-`f32` (here `i32`) tensor
-/// — drives the driver's "must be f32 PCM" dtype guard (Fix 2). The shape is
+/// — drives the driver's "must be f32 PCM" dtype guard. The shape is
 /// valid rank-1, so only the dtype check can reject it.
 struct NonF32Model;
 impl TtsModel for NonF32Model {
@@ -338,7 +338,7 @@ fn join_audio_propagates_segment_error() {
   }
 }
 
-// ─────────────────── voice-clone reference (Fix 1) ───────────────────
+// ─────────────────── voice-clone reference ───────────────────
 
 /// `tts_generate_with_reference` threads the [`TtsReference`]'s `ref_audio` /
 /// `ref_text` onto EVERY segment: a 3-segment input with a `Some` reference
@@ -446,7 +446,7 @@ fn join_audio_with_reference_threads_reference() {
   }
 }
 
-// ──────────────────── f32 PCM dtype enforcement (Fix 2) ────────────────────
+// ──────────────────── f32 PCM dtype enforcement ────────────────────
 
 /// A rank-1 but NON-`f32` (`i32`) audio tensor from the model surfaces a
 /// recoverable `Err(DtypeMismatch)` at the generator boundary — NOT a

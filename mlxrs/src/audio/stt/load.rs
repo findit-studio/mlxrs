@@ -47,11 +47,10 @@ pub const STT_SAMPLE_RATE: u32 = 16_000;
 /// ([stt-utils.py:12-26][stt-utils-remap]) — `(alias,
 /// canonical_module_name)` pairs.
 ///
-/// **Reference-only**: per the [no per-model arch porting][noarch]
+/// **Reference-only**: per the no per-model arch porting
 /// rule, mlxrs does NOT import per-architecture crates from this table.
 ///
 /// [stt-utils-remap]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/utils.py#L12-L26
-/// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 pub const MODEL_REMAPPING: &[(&str, &str)] = &[
   ("cohere_asr", "cohere_asr"),
   ("fireredasr2", "fireredasr2"),
@@ -75,7 +74,7 @@ pub const MODEL_REMAPPING: &[(&str, &str)] = &[
 /// Routes through the shared
 /// [`crate::audio::load::base_load_model`] factory. The returned bundle
 /// is handed to the caller-supplied `constructor` closure (per the
-/// [no per-model arch porting][noarch] rule mlxrs does not bundle a
+/// no per-model arch porting rule mlxrs does not bundle a
 /// built-in registry).
 ///
 /// `path` is the local on-disk path (a `hf://…` / `org/name` repo id is
@@ -89,7 +88,6 @@ pub const MODEL_REMAPPING: &[(&str, &str)] = &[
 /// error → caller-defined.
 ///
 /// [stt-utils-loadmodel]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/utils.py#L64-L89
-/// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 pub fn load_model<F>(path: &str, constructor: F) -> Result<Box<dyn SttModel>>
 where
   F: FnOnce(LoadedAudioModel) -> Result<Box<dyn SttModel>>,

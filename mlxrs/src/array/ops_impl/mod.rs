@@ -1,7 +1,6 @@
 //! Method-form bridges: `a.add(&b)`, `a.reshape(...)`, etc.
 //!
-//! One submodule per ops group, mirroring `crate::ops`. Phase 3.5 ships the
-//! 7 archetype templates; Phase 4 fans the rest out across 4 parallel branches.
+//! One submodule per ops group, mirroring `crate::ops`.
 
 pub mod arithmetic;
 pub mod comparison;

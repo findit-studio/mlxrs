@@ -1,7 +1,6 @@
 //! mlxrs — safe Rust bindings for [MLX](https://github.com/ml-explore/mlx) on Apple silicon.
 //!
-//! M1 ships `Array` + `Dtype` + `Error` + a subset of `ops.h`. See
-//! `docs/superpowers/specs/` for the full design.
+//! M1 ships `Array` + `Dtype` + `Error` + a subset of `ops.h`.
 //!
 //! ## Caveats
 //! - `Array` is **`!Send` and `!Sync`** — single-thread use only, like MLX's

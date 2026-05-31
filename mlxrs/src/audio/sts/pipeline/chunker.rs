@@ -250,7 +250,7 @@ mod tests {
 
   /// 16 kHz × 20 ms chunks = 320 samples per chunk; pushing 1000
   /// samples should emit 3 chunks (3 × 320 = 960) and leave 40 in the
-  /// buffer. The doc-spec example fence in the A8 task.
+  /// buffer. The doc-spec example fence.
   #[test]
   fn fixed_size_chunker_emits_aligned_chunks() {
     let chunk_size = (16_000 * 20) / 1_000;

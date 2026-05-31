@@ -1,4 +1,4 @@
-//! M3 WS-C PR-3 — the architecture-agnostic generation loop
+//! The architecture-agnostic generation loop
 //! (`mlxrs::lm::generate`), ported 1:1 from `mlx_lm.generate`
 //! (`generate_step` / `stream_generate` / `generate`) and
 //! `mlx_lm.sample_utils` (`make_sampler` / `make_logits_processors`).
@@ -122,7 +122,7 @@ impl Model for MockModel {
 
 /// A `Model` whose every `forward` returns an [`mlxrs::Error`] — drives the
 /// "a step error is yielded as `Err` and ends iteration (no panic, no
-/// poison)" contract (spec §4).
+/// poison)" contract.
 struct FailModel;
 impl Model for FailModel {
   fn forward(&self, _tokens: &Array, _cache: &mut [Box<dyn KvCache>]) -> mlxrs::Result<Array> {
@@ -294,7 +294,7 @@ fn generate_step_prefill_chunks_by_prefill_step_size() {
   assert_eq!(toks, vec![4, 4], "chunked prefill + 2 decode steps");
 }
 
-/// Regression (Copilot fix #1): the O(P) index-cursor prefill must produce
+/// Regression: the O(P) index-cursor prefill must produce
 /// **byte-identical** chunk boundaries to mlx-lm `generate_step`
 /// (lines 430-453) — `n = min(prefill_step_size, (total - processed) - 1)`
 /// per chunk, then the first decode step consumes the unconsumed tail
@@ -370,12 +370,12 @@ fn generate_step_prefill_chunk_boundaries_are_exact() {
   );
 }
 
-/// Regression (Copilot fix #2): a buggy model returning logits with a
+/// Regression: a buggy model returning logits with a
 /// zero-length sequence (`[1, 0, V]`) or vocab (`[1, S, 0]`) axis must
 /// surface a **recoverable** `Err(OutOfRange)` (mirroring Python
 /// `logits[:, -1, :]` raising `IndexError`) — never a `usize` underflow on
 /// `s - 1`, a malformed `[0, -1, 0]` slice, or a panic. The iterator yields
-/// the `Err` once and then fuses (spec §4).
+/// the `Err` once and then fuses.
 #[test]
 fn generate_step_zero_length_logits_axis_is_recoverable_err() {
   for zero_seq in [true, false] {
@@ -411,7 +411,7 @@ fn generate_step_zero_length_logits_axis_is_recoverable_err() {
 }
 
 /// A `forward` error is surfaced as `Err` and the iterator then ends — no
-/// panic, no poison (spec §4).
+/// panic, no poison.
 #[test]
 fn generate_step_forward_error_yields_err_then_ends() {
   let model = FailModel;
@@ -440,7 +440,7 @@ fn generate_step_zero_max_tokens_is_empty() {
 fn make_sampler_default_is_argmax() {
   let mut s = make_sampler(0.0, 0.0, 0.0, 1, 0, 0.0, 0.0, &[], None).unwrap();
   let lp = Array::from_slice::<f32>(&[-3.0, -1.0, -2.0], &[1, 3]).unwrap();
-  // P1 #108: `Sampler` is now an enum — `sample()` dispatches the
+  // #108: `Sampler` is now an enum — `sample()` dispatches the
   // canonical chain via match (`Sampler::Argmax` here).
   let mut tok = s.sample(&lp).unwrap();
   assert_eq!(tok.to_vec::<u32>().unwrap(), vec![1], "argmax index");
@@ -484,7 +484,7 @@ fn make_logits_processors_composition_and_order() {
   );
 }
 
-/// Regression (Codex adversarial-review): repetition / presence / frequency
+/// Regression: repetition / presence / frequency
 /// penalties each use their **own** context window, exactly as
 /// `sample_utils.make_logits_processors`'s independent
 /// `repetition_context_size` / `presence_context_size` /
@@ -529,7 +529,7 @@ fn make_logits_processors_independent_context_windows() {
   );
 }
 
-/// Regression (Codex adversarial-review): a `*_context_size` of `0` must
+/// Regression: a `*_context_size` of `0` must
 /// mirror Python `tokens[-0:]` == `tokens[0:]` == the **entire** history
 /// (NOT an empty slice / no-op), for repetition, presence, AND frequency —
 /// the `sample_utils.make_logits_processors` closures' exact slicing edge
@@ -585,7 +585,7 @@ fn make_sampler_propagates_sample_rs_errors() {
   );
 }
 
-/// Regression (Codex adversarial-review): stochastic (`temp > 0`) generation
+/// Regression: stochastic (`temp > 0`) generation
 /// must be reproducible under an explicit `seed` and must NOT restart from
 /// the same RNG sequence on independent unseeded runs — mirroring mlx-lm's
 /// advancing process-global `mx.random.state` (+ `mx.random.seed`).
@@ -795,7 +795,7 @@ fn stream_generate_propagates_forward_error() {
 // ---------------------------------------------------------------------------
 
 /// `GenStep.token` matches the value the prior `(u32, Array)` tuple's `.0`
-/// would have carried — the typed-struct refactor (LM-3) is a pure
+/// would have carried — the typed-struct refactor is a pure
 /// ergonomics upgrade with **no semantic change** to the iterator's
 /// payload. `MockModel::ramp(5)`'s argmax is always 4 (the last vocab id),
 /// the exact same value the old tuple's `.0` would have yielded.
@@ -823,7 +823,7 @@ fn gen_step_token_field_matches_prior_tuple_zero() {
 /// `GenStep` is `Debug` so test failures stay diagnosable (and the public
 /// API doc-comment promises it via `#[derive(Debug)]`). Enforced via a
 /// compile-time `T: Debug` bound — Rust's `Debug` format string is not
-/// guaranteed stable across compiler versions (Copilot review #3272760827),
+/// guaranteed stable across compiler versions,
 /// so asserting on the formatted *contents* is brittle. The bound check
 /// catches the only regression that matters (the derive being removed).
 #[test]
@@ -847,7 +847,7 @@ fn gen_step_is_debug() {
 /// `From<GenStep> for (u32, Option<Array>)` back-compat: a `GenStep`
 /// round-trips into the (u32, Option<Array>) tuple via `.into()`, so call
 /// sites that preferred tuple destructure (`let (tok, lp) = step.into();`)
-/// keep working unchanged (the inner `Option` honors the L3 opt-in).
+/// keep working unchanged (the inner `Option` honors the collect-logprobs opt-in).
 #[test]
 fn gen_step_into_tuple_roundtrip() {
   let model = MockModel::ramp(5);
@@ -885,7 +885,7 @@ fn gen_step_into_tuple_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
-// L3 — `collect_logprobs` opt-in + `GenerationStats` aggregate
+// `collect_logprobs` opt-in + `GenerationStats` aggregate
 // ---------------------------------------------------------------------------
 
 /// Default flow: with [`GenConfig::collect_logprobs`] = `false` (the
@@ -914,7 +914,7 @@ fn generate_step_default_skips_logprobs() {
   }
 }
 
-/// Hand-traced parity (L3 spec): with a deterministic argmax sampler
+/// Hand-traced parity: with a deterministic argmax sampler
 /// (`temp == 0`, the default) and an explicit `[V]` logits bias, the
 /// yielded `[V]` logprobs is **exactly** `log_softmax(logits)` —
 /// equivalently `logits - logsumexp(logits)` (mlx-lm `generate_step` line
@@ -1036,7 +1036,7 @@ fn stream_generate_peak_memory_is_monotonic() {
   }
 }
 
-/// L3 zero-cost opt-out (Codex review fix): with
+/// Zero-cost opt-out: with
 /// `collect_logprobs == false` and the default greedy sampler
 /// (`temp == 0`), the `logits - logsumexp(logits)` normalization is
 /// SKIPPED entirely — not just the `[V]` squeeze. The sampler reads raw
@@ -1065,7 +1065,7 @@ fn stream_generate_peak_memory_is_monotonic() {
 #[test]
 fn generate_step_default_skips_logprobs_node() {
   // Same prompt + model fixture for both runs, so the only difference is
-  // the L3 normalization gate.
+  // the normalization gate.
   let prompt = [1u32];
   let max_tokens = 8;
   let bias = [1.0_f32, 2.0, 5.0, 3.0, 4.0];
@@ -1118,7 +1118,7 @@ fn generate_step_default_skips_logprobs_node() {
   }
 }
 
-/// L3 normalization gate respects `top_p` (the only sampler in
+/// The normalization gate respects `top_p` (the only sampler in
 /// [`make_sampler`] that strictly requires normalized log-probs — its
 /// `exp(logprobs)` cumsum assumes a `1.0` total). With `top_p ∈ (0, 1)`
 /// AND `collect_logprobs == false`, the gate MUST still run the
@@ -1171,8 +1171,8 @@ fn generate_step_top_p_forces_normalization_even_when_off() {
   );
 }
 
-/// L3 zero-cost opt-out — stochastic max-shift numerical safety (Codex
-/// review R2). The opt-out path used to feed RAW post-processor logits to
+/// Zero-cost opt-out — stochastic max-shift numerical safety.
+/// The opt-out path used to feed RAW post-processor logits to
 /// `categorical_sampling`, which multiplies by `1/temp` BEFORE the eventual
 /// internal `softmax`. With a large `logit_bias` (e.g. `+50`) and a small
 /// `temp` (e.g. `0.1` ⇒ `1/temp = 10`), the scaled logit reaches `+500`,
@@ -1219,8 +1219,8 @@ fn generate_step_opt_out_max_shift_stable_with_large_bias() {
     .map(|r| r.unwrap().token)
     .collect();
 
-  // Run B: opt-out (default collect_logprobs=false). With the R2 fix the
-  // sampler input is `logits - max(logits)` ⇒ same argmax as full
+  // Run B: opt-out (default collect_logprobs=false). With the max-shift
+  // fix the sampler input is `logits - max(logits)` ⇒ same argmax as full
   // normalization, same stable softmax in `categorical_sampling`.
   let model_b = MockModel::with_bias(bias);
   let cfg_b = cfg_base(); // collect_logprobs: false (default)
@@ -1243,7 +1243,7 @@ fn generate_step_opt_out_max_shift_stable_with_large_bias() {
   }
 }
 
-/// L3 zero-cost opt-out — pure-greedy (`temp == 0`) still feeds RAW logits
+/// Zero-cost opt-out — pure-greedy (`temp == 0`) still feeds RAW logits
 /// (no max-shift), matching the documented "true zero-cost path" for
 /// `argmax_sample`. The sampled token must be byte-identical to the
 /// `collect_logprobs == true` (full normalization) reference, since
@@ -1308,15 +1308,15 @@ fn generate_zero_max_tokens_stats() {
 }
 
 // ============================================================
-// P1 hot-loop monomorphize regression tests
+// hot-loop monomorphize regression tests
 // (#108 sampler + #109 processors + #111 detokenizer + #113 generate_step)
 // ============================================================
 
-/// P1 #108: `make_sampler(temp == 0, …)` returns the [`Sampler::Argmax`]
+/// #108: `make_sampler(temp == 0, …)` returns the [`Sampler::Argmax`]
 /// variant, not a closure-bearing chain. This is the cheapest fast-path —
 /// no allocation, no PRNG key, no per-token closure indirection.
 #[test]
-fn p1_sampler_argmax_variant_for_temp_zero() {
+fn sampler_argmax_variant_for_temp_zero() {
   use mlxrs::lm::generate::Sampler;
   let s = make_sampler(0.0, 0.7, 0.0, 1, 0, 0.0, 0.0, &[], None).unwrap();
   // Even with non-zero `top_p` set, `temp == 0` short-circuits to argmax
@@ -1324,11 +1324,11 @@ fn p1_sampler_argmax_variant_for_temp_zero() {
   assert!(matches!(s, Sampler::Argmax), "temp == 0 ⇒ Sampler::Argmax");
 }
 
-/// P1 #108: any `temp > 0` returns the [`Sampler::Chain`] variant
+/// #108: any `temp > 0` returns the [`Sampler::Chain`] variant
 /// regardless of the other gates; `Chain` owns the PRNG key + all
 /// per-stage `do_*` flags.
 #[test]
-fn p1_sampler_chain_variant_for_temp_positive() {
+fn sampler_chain_variant_for_temp_positive() {
   use mlxrs::lm::generate::Sampler;
   // No `do_*` flags set — still `Chain` (chain is the categorical-only
   // path, mlx-lm `make_sampler` always reaches `categorical_sampling`).
@@ -1340,11 +1340,11 @@ fn p1_sampler_chain_variant_for_temp_positive() {
   assert!(matches!(s, Sampler::Chain(_)));
 }
 
-/// P1 #108: `Sampler::Custom` provides the escape hatch for out-of-tree
+/// #108: `Sampler::Custom` provides the escape hatch for out-of-tree
 /// samplers — the boxed closure is still dispatched once via the variant
 /// match, but the caller can carry any `FnMut(&Array) -> Result<Array>`.
 #[test]
-fn p1_sampler_custom_escape_hatch() {
+fn sampler_custom_escape_hatch() {
   use mlxrs::lm::generate::Sampler;
   // Custom: always-return-row-0 (Array of shape `[1]` with `0u32`).
   let mut s = Sampler::custom(|_logits: &Array| Array::from_slice::<u32>(&[0u32], &(1,)));
@@ -1354,13 +1354,13 @@ fn p1_sampler_custom_escape_hatch() {
   assert_eq!(tok.to_vec::<u32>().unwrap(), vec![0u32]);
 }
 
-/// P1 #109: each canonical processor lands in its named typed variant
+/// #109: each canonical processor lands in its named typed variant
 /// (`LogitBias` / `RepetitionPenalty` / `PresencePenalty` /
 /// `FrequencyPenalty`), not the `Custom` escape hatch. The variant
 /// match in `apply()` then dispatches to the [`crate::lm::sample`]
 /// primitive directly — no per-token vtable indirection.
 #[test]
-fn p1_logits_processor_typed_variants() {
+fn logits_processor_typed_variants() {
   use mlxrs::lm::generate::LogitsProcessor;
   let procs = make_logits_processors(
     &[(1i32, 1.5f32)], // logit bias
@@ -1391,11 +1391,11 @@ fn p1_logits_processor_typed_variants() {
   );
 }
 
-/// P1 #109: `LogitsProcessor::Custom` is the escape hatch for out-of-tree
+/// #109: `LogitsProcessor::Custom` is the escape hatch for out-of-tree
 /// processors (e.g. `LLGuidanceLogitsProcessor`); the inner closure is
 /// dispatched once via the variant match.
 #[test]
-fn p1_logits_processor_custom_escape_hatch() {
+fn logits_processor_custom_escape_hatch() {
   use mlxrs::lm::generate::LogitsProcessor;
   let p = LogitsProcessor::Custom(Box::new(|_tokens: &[u32], logits: &Array| {
     // Identity processor — `try_clone` to return owned without mutation.
@@ -1407,7 +1407,7 @@ fn p1_logits_processor_custom_escape_hatch() {
   assert_eq!(out.to_vec::<f32>().unwrap(), vec![1.0, 2.0, 3.0]);
 }
 
-/// P1 #113: [`generate_step`]'s return type is opaque
+/// #113: [`generate_step`]'s return type is opaque
 /// (`impl Iterator<Item = Result<GenStep>> + 'a`). Concretely: a binding
 /// declared as the `impl Iterator<…>` trait object compiles, but the
 /// concrete `Generator<'a, M>` is no longer publicly nameable. This test
@@ -1416,7 +1416,7 @@ fn p1_logits_processor_custom_escape_hatch() {
 /// `Generator` satisfies `Iterator`), so we instead require that the
 /// return type IS the iterator trait through `Iterator` method calls.
 #[test]
-fn p1_generate_step_returns_impl_iterator() {
+fn generate_step_returns_impl_iterator() {
   let tok = tokenizer("p1_impl_iter");
   let model = MockModel::ramp(8);
   let cfg = GenConfig::default()
@@ -1440,12 +1440,12 @@ fn p1_generate_step_returns_impl_iterator() {
   assert!(it.next().is_some(), "iterator must yield at least one step");
 }
 
-/// P1 #113: A `let _gen: mlxrs::lm::generate::Generator<…>` binding would
+/// #113: A `let _gen: mlxrs::lm::generate::Generator<…>` binding would
 /// fail to compile because `Generator` is now `pub(crate)`. We can't
 /// negative-test "this code fails to compile" inline, so instead pin the
 /// `impl Iterator` shape: chaining iterator combinators works.
 #[test]
-fn p1_generate_step_chains_iterator_methods() {
+fn generate_step_chains_iterator_methods() {
   let tok = tokenizer("p1_chain");
   let model = MockModel::ramp(8);
   let cfg = GenConfig::default()
@@ -1462,12 +1462,12 @@ fn p1_generate_step_chains_iterator_methods() {
 }
 
 // ---------------------------------------------------------------------------
-// LM-3 #114 — `GenStep::step_index` + `GenStep::finish_reason`
+// #114 — `GenStep::step_index` + `GenStep::finish_reason`
 // ---------------------------------------------------------------------------
 
 /// `GenStep::step_index` increases monotonically from 0 across consecutive
 /// steps — the same 0-based counter mlx-lm's internal `n` carries. Drives
-/// the polish-#114 "stable per-step identifier without `enumerate()`" goal.
+/// the #114 "stable per-step identifier without `enumerate()`" goal.
 #[test]
 fn gen_step_step_index_is_zero_based_monotonic() {
   let model = MockModel::ramp(5);
@@ -1555,7 +1555,7 @@ fn gen_step_fields_uniform_across_lm_vlm_stt() {
 }
 
 // ---------------------------------------------------------------------------
-// AUDIO-12 #136 — eager `GenConfig::validate`
+// #136 — eager `GenConfig::validate`
 // ---------------------------------------------------------------------------
 
 /// Default `GenConfig` validates cleanly — every default is in-range.

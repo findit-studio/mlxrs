@@ -1,12 +1,10 @@
-//! C10 — `mel_filter_bank` triangle construction.
+//! `mel_filter_bank` triangle construction.
 //!
 //! Tracking: [#155](https://github.com/Findit-AI/mlxrs/issues/155).
-//! Plan: `docs/core-arch-simd-candidates.md` §2 row C10, §3.6 (mel
-//! triangle).
 //!
 //! # The defect class
 //!
-//! Pre-C10 `crate::audio::dsp::mel_filter_bank` has a per-row inner
+//! The original `crate::audio::dsp::mel_filter_bank` has a per-row inner
 //! loop over `all_freqs` that evaluates the triangle membership for
 //! each `(m, f)` cell:
 //!
@@ -74,11 +72,6 @@
 //! writes into a pre-reserved `&mut [MaybeUninit<f32>]` (sized to
 //! `n_mels * n_freqs`), and the caller wraps it with
 //! `Vec::with_capacity` + `spare_capacity_mut` + `set_len`.
-//!
-//! # Verify-before-claim bench
-//!
-//! Report-only per the user directive 2026-05-23 (project memory rule
-//! **"SIMD ship NEON regardless"**).
 
 use core::mem::MaybeUninit;
 
@@ -89,7 +82,7 @@ use core::arch::aarch64::{
 
 /// Scalar reference: build a `(n_mels, n_freqs)` mel filterbank into
 /// `out` from the precomputed `all_freqs` (length `n_freqs`) and
-/// `f_pts` (length `n_mels + 2`). Bit-exact match for the pre-C10
+/// `f_pts` (length `n_mels + 2`). Bit-exact match for the original
 /// `mel_filter_bank` inner two-loop **plus** explicit 0.0 writes for
 /// the `lc <= 0` / `cr <= 0` zero-width-triangle rows (the scalar
 /// reference relied on `Vec::resize(_, 0.0)` to pre-zero those rows;
@@ -110,7 +103,7 @@ use core::arch::aarch64::{
 /// # Panics
 ///
 /// Panics explicitly (not silently wraps) on `n_mels * n_freqs`
-/// `usize` overflow — same defect class as C5 `rotate_buf_u8`.
+/// `usize` overflow — same defect class as `rotate_buf_u8`.
 /// Silently wrapping would let an under-sized `out` satisfy the
 /// size-equality assertion and reach the per-cell init loop.
 ///
@@ -310,7 +303,7 @@ unsafe fn mel_filter_bank_rows_neon(
 /// - `f_pts.len() == n_mels + 2` — asserted unconditionally.
 /// - `n_mels * all_freqs.len()` does not overflow `usize` — checked
 ///   via `checked_mul` BEFORE the size-equality assertion (same
-///   defect class as C5 `rotate_buf_u8` and the sibling C11
+///   defect class as `rotate_buf_u8` and the sibling
 ///   `get_mel_banks_kaldi_rows`).
 ///
 /// # Panics
@@ -344,7 +337,7 @@ pub fn mel_filter_bank_rows(
   // `n_mels * n_freqs` in release mode could otherwise produce a small
   // `elements` that an under-sized `out` would satisfy, letting either
   // inner kernel compute per-row offsets from unwrapped loop dims
-  // (same defect class as C5 `rotate_buf_u8`).
+  // (same defect class as `rotate_buf_u8`).
   let elements = n_mels.checked_mul(n_freqs).unwrap_or_else(|| {
     panic!("simd::audio::mel_filter_bank_rows: dimensions {n_mels}x{n_freqs} overflow usize")
   });
@@ -380,7 +373,7 @@ pub fn mel_filter_bank_rows(
 #[cfg(test)]
 mod tests {
   //! Scalar vs dispatcher Tolerance differential tests + edge coverage
-  //! for C10.
+  //! for the mel triangle.
 
   use super::{mel_filter_bank_rows, mel_filter_bank_rows_scalar};
 
@@ -506,8 +499,8 @@ mod tests {
     mel_filter_bank_rows(&mut spare[..6], &all_freqs, &f_pts, 2);
   }
 
-  /// Wrap-arith defence (same defect class as C5 `rotate_buf_u8` /
-  /// the sibling C11 `get_mel_banks_kaldi_rows`): `n_mels * n_freqs`
+  /// Wrap-arith defence (same defect class as `rotate_buf_u8` /
+  /// the sibling `get_mel_banks_kaldi_rows`): `n_mels * n_freqs`
   /// MUST be evaluated via `checked_mul`. A wrapping multiply in
   /// release mode would otherwise let an under-sized (here
   /// zero-length) `out` satisfy the size-equality assertion,

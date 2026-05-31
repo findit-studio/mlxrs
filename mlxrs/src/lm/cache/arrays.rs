@@ -20,7 +20,7 @@ use smol_str::format_smolstr;
 /// upper bound, so a forged/corrupt prompt cache carrying `slotCount =
 /// INT32_MAX` would attempt a multi-GB allocation that `try_reserve_exact`
 /// rejects as OOM only **after** the allocator has been asked. Add an
-/// explicit cap that fails fast on absurd values (KVC-2, #99 — derived from
+/// explicit cap that fails fast on absurd values (#99 — derived from
 /// realistic model maxes: Mamba's `MambaCache` is 2 slots,
 /// `KVCache.swift:1230-1245`; SSM models typically ≤ 64 slots; the cap is
 /// chosen ~4 orders of magnitude above that real-world ceiling so a
@@ -39,8 +39,8 @@ pub const MAX_SLOT_COUNT: usize = 1 << 20;
 ///
 /// **Bounded:** `max_elems` caps both the upfront capacity reservation and
 /// the streamed parse — a forged CSV whose comma-count exceeds `max_elems`
-/// is rejected with `Error::CapExceeded` BEFORE any `Vec<T>` allocation
-/// (Codex-R1 [high] #1, KVC-2 follow-up). The producer side of
+/// is rejected with `Error::CapExceeded` BEFORE any `Vec<T>` allocation.
+/// The producer side of
 /// `meta_state` only ever emits `slotCount` indices for `presentSlots`
 /// and at most one entry per slot for `leftPadding`, so a `max_elems =
 /// slotCount` (already cap-gated by [`MAX_SLOT_COUNT`]) bounds the
@@ -132,7 +132,7 @@ where
 /// (the 2-slot `(conv_state, ssm_state)` layout) — that is the documented
 /// alias, nothing more.
 ///
-/// ## Provenance flag (KVC-9)
+/// ## Provenance flag
 ///
 /// To preserve the original `"MambaCache"` class label across a
 /// swift→Rust→swift round-trip, [`ArraysCache::mamba`] sets a constructor-
@@ -206,7 +206,7 @@ pub struct ArraysCache {
   /// / `self.lengths -= N`). Transient (never serialized — mlx-lm does not
   /// put it in `state`/`meta_state`).
   lengths: Option<Vec<i32>>,
-  /// KVC-9 provenance flag: `true` iff this `ArraysCache` was constructed
+  /// Provenance flag: `true` iff this `ArraysCache` was constructed
   /// via [`ArraysCache::mamba`] (i.e. it represents mlx-swift-lm's
   /// `MambaCache: ArraysCache`, `KVCache.swift:1229`). When set,
   /// [`reference_class_name`](KvCache::reference_class_name) returns
@@ -230,7 +230,7 @@ impl ArraysCache {
   }
 
   /// A 2-slot `ArraysCache` flagged with the `MambaCache` provenance
-  /// (KVC-9) — mlx-swift-lm's `class MambaCache: ArraysCache` whose only
+  /// — mlx-swift-lm's `class MambaCache: ArraysCache` whose only
   /// specialization is `init { super.init(size: 2) }`
   /// (`KVCache.swift:1230-1245`). State shape is identical to
   /// [`ArraysCache::new(2)`](ArraysCache::new); the only observable
@@ -263,7 +263,7 @@ impl ArraysCache {
   }
 
   /// `true` iff this `ArraysCache` carries the `MambaCache` provenance
-  /// (KVC-9) — see [`ArraysCache::mamba`].
+  /// — see [`ArraysCache::mamba`].
   pub fn is_mamba(&self) -> bool {
     self.is_mamba
   }
@@ -289,7 +289,7 @@ impl ArraysCache {
   /// own `self` (the trait-method override) is *never* mutated on an
   /// error path — the leaves-self-unchanged guarantee, end to end.
   ///
-  /// `is_mamba` carries the KVC-9 provenance through the constructor —
+  /// `is_mamba` carries the provenance through the constructor —
   /// preserves [`ArraysCache::reference_class_name`] returning
   /// `"MambaCache"` across [`KvCache::from_serialized`] (so calling
   /// `from_serialized` on an `ArraysCache::mamba()` keeps it Mamba) and
@@ -326,8 +326,7 @@ impl ArraysCache {
       }
       // Index-out-of-range is a range / indexing error, not a tensor shape
       // mismatch — use `Error::OutOfRange` so callers can distinguish "wrong
-      // slot index" from "wrong tensor shape" via the variant alone
-      // (Copilot review #3271124415).
+      // slot index" from "wrong tensor shape" via the variant alone.
       None => Err(Error::OutOfRange(OutOfRangePayload::new(
         "ArraysCache::set: slot index (must be < cache size)",
         "must be < cache size",
@@ -388,7 +387,7 @@ impl ArraysCache {
   /// Python would).
   pub fn advance(&mut self, n: usize) -> Result<()> {
     // Integer-conversion / range error, not a tensor shape mismatch —
-    // surface as `Error::ArithmeticOverflow` (Copilot review #3271308749) for the
+    // surface as `Error::ArithmeticOverflow` for the
     // same reason `set` and `update` switched: variants should reflect
     // the actual condition, not a misleading "shape" framing.
     let n = i32::try_from(n).map_err(|_| {
@@ -438,7 +437,7 @@ impl KvCache for ArraysCache {
   /// Surfaced as [`Error::InvariantViolation`] (NOT `RankMismatch`/etc), so the variant
   /// reflects the actual condition — "this cache type doesn't support
   /// `update_and_fetch`" — rather than misleadingly suggesting the caller
-  /// passed wrong-shaped tensors (Copilot review #3271124426).
+  /// passed wrong-shaped tensors.
   fn update(&mut self, _keys: &Array, _values: &Array) -> Result<(Array, Array)> {
     Err(Error::InvariantViolation(InvariantViolationPayload::new(
       "ArraysCache::update (generic slot cache, not K/V)",
@@ -562,14 +561,13 @@ impl KvCache for ArraysCache {
     //
     // 0. **Hard cap exceeded** (`slot_count > MAX_SLOT_COUNT`) — surface as
     //    `Error::CapExceeded` ("slot_count exceeds MAX_SLOT_COUNT"). The
-    //    **first** gate (KVC-2, #99) so a forged `INT32_MAX`-sized
+    //    **first** gate (#99) so a forged `INT32_MAX`-sized
     //    `slotCount` is rejected before either of the secondary gates
     //    (capacity-overflow / OOM) runs. Realistic SSM/Mamba caches have ≤
     //    64 slots (`MambaCache` is 2), so `MAX_SLOT_COUNT = 1 << 20` is far
     //    above any legitimate use while still well below `isize::MAX`.
     //
-    //    **Codex-R1 [high] #1 (KVC-2 follow-up):** moved BEFORE the
-    //    `parse_csv` calls below (was previously after them) so a forged
+    //    This gate is placed BEFORE the `parse_csv` calls below so a forged
     //    `slotCount` rejects *before* either CSV's `Vec<T>` allocation —
     //    closing the "small slot_count + huge presentSlots/leftPadding
     //    payload" evasion. The CSVs themselves are then parsed with a
@@ -584,7 +582,7 @@ impl KvCache for ArraysCache {
     //    Pre-checked here because `TryReserveError::kind()` is nightly-only
     //    (#48043) — we can't distinguish OOM from capacity-overflow via
     //    the std `TryReserveError` accessors on stable, so we route the
-    //    overflow case explicitly (Copilot review #3271554056). Kept as a
+    //    overflow case explicitly. Kept as a
     //    secondary gate after `MAX_SLOT_COUNT` so the hard cap can shrink
     //    without losing the allocator-level safety net.
     // 2. **Out-of-memory** (the allocator can't satisfy a valid request) —
@@ -623,8 +621,8 @@ impl KvCache for ArraysCache {
     // emits at most `slot_count` `presentSlots` indices (one per occupied
     // slot) and at most `slot_count` `leftPadding` entries (one per slot
     // entry, when populated), so `max_elems = slot_count` is the exact
-    // legitimate upper bound. Codex-R1 [high] #1: rejects a forged
-    // small-slot-count + huge-payload CSV before allocation.
+    // legitimate upper bound — rejecting a forged small-slot-count +
+    // huge-payload CSV before allocation.
     let present = parse_csv::<usize>(
       &m[1],
       "ArraysCache meta_state presentSlots",
@@ -761,19 +759,19 @@ impl KvCache for ArraysCache {
       cache,
       left_padding: self.left_padding.clone(),
       lengths: self.lengths.clone(),
-      // KVC-9: preserve `MambaCache` provenance across `copy()` so the
+      // Preserve `MambaCache` provenance across `copy()` so the
       // deep-copied cache reports the same `reference_class_name`.
       is_mamba: self.is_mamba,
     }))
   }
 
-  /// `"ArraysCache"` (or `"MambaCache"` when the `is_mamba` flag is set —
-  /// KVC-9) — mlx-lm's `type(ArraysCache).__name__` (`cache.py:56`) /
+  /// `"ArraysCache"` (or `"MambaCache"` when the `is_mamba` flag is set)
+  /// — mlx-lm's `type(ArraysCache).__name__` (`cache.py:56`) /
   /// mlx-swift-lm `cacheClassName` switch (`KVCache.swift:1381-1390`),
   /// where the `MambaCache: ArraysCache` arm precedes the `ArraysCache`
   /// arm.
   ///
-  /// **KVC-9 provenance.** Constructing via [`ArraysCache::mamba`] (or
+  /// **`MambaCache` provenance.** Constructing via [`ArraysCache::mamba`] (or
   /// loading via [`super::from_state`]'s `"MambaCache"` arm) sets the
   /// `is_mamba` flag, so the swift→Rust→swift round-trip preserves the
   /// `"MambaCache"` class label rather than degrading to `"ArraysCache"`.
@@ -789,7 +787,7 @@ impl KvCache for ArraysCache {
     }
   }
 
-  /// P1 #110: per-layer fast-path downcast target — see the
+  /// Per-layer fast-path downcast target (#110) — see the
   /// [`KvCache`]-trait doc's **Per-layer fast-path convention**.
   fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
     self
@@ -805,15 +803,15 @@ impl KvCache for ArraysCache {
   /// `ArraysCache::build_from_serialized` — the same constructor-style
   /// path `super::from_state`'s `"ArraysCache"` arm uses — and `self` is
   /// committed by a single infallible move only after that whole local
-  /// build succeeds. `set_meta_state` is already itself transactional
-  /// (Copilot review #3271554056 hardened it), but this override extends
+  /// build succeeds. `set_meta_state` is already itself transactional, but
+  /// this override extends
   /// the leaves-self-unchanged guarantee across the *combined* `set_state`
   /// and `set_meta_state` sequence — closing the (today narrow, since
   /// the `set_state` body cannot fail without a `try_clone` it doesn't
   /// issue) 2-step window the default trait impl would leave open if
   /// `set_state` ever grew a fallible step.
   ///
-  /// KVC-9: preserves the cache's current `is_mamba` provenance flag
+  /// Preserves the cache's current `is_mamba` provenance flag
   /// across `from_serialized` (the trait-method override on `self`), so
   /// calling `from_serialized` on an [`ArraysCache::mamba`]-constructed
   /// cache keeps it Mamba. The [`super::from_state`] `"MambaCache"` arm
@@ -830,7 +828,7 @@ impl KvCache for ArraysCache {
 /// class names (`cache.py:56` / the `load_prompt_cache` path
 /// `cache.py:79-82`). Kept out of [`super::from_state`]'s body so this file
 /// owns the whole port; the module's `match` adds two arms delegating here
-/// with `is_mamba` set accordingly (KVC-9 provenance preservation).
+/// with `is_mamba` set accordingly (provenance preservation).
 pub(super) fn from_state_arrays(
   state: Vec<Array>,
   meta: &[String],

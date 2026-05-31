@@ -1,4 +1,4 @@
-//! [`AudioOutputStream`] — the producer-side trait the A8
+//! [`AudioOutputStream`] — the producer-side trait the
 //! speech-to-speech pipeline (`crate::audio::sts`) consumes to push
 //! decoded PCM samples at an audio sink.
 //!
@@ -21,7 +21,7 @@
 //!   state-introspection hook (mirrors Swift's `isPlaying`).
 //!
 //! [`super::player::AudioPlayer`] is the default device-backed
-//! implementor; A8's pipeline tests can supply a mock via the same
+//! implementor; pipeline tests can supply a mock via the same
 //! trait without pulling in cpal.
 
 use crate::error::Result;
@@ -49,7 +49,7 @@ use crate::error::Result;
 ///   impl.
 ///
 /// `Send` is required so the trait can cross thread boundaries (the
-/// A8 pipeline runs the decoder on a worker thread and pushes
+/// speech-to-speech pipeline runs the decoder on a worker thread and pushes
 /// samples to the sink without dragging it back to the orchestrator
 /// thread). `Sync` is *not* required — write paths are inherently
 /// single-producer.
@@ -91,7 +91,7 @@ pub trait AudioOutputStream: Send {
   /// [`AudioOutputStream`] (e.g. a sink-specific `start()` /
   /// `resume()` / a second `stop()`) MUST NOT re-arm the producer
   /// surface. The caller MUST drop the implementor and construct a
-  /// fresh one to resume — this is the contract that lets the A8
+  /// fresh one to resume — this is the contract that lets the
   /// pipeline treat `stop()` as a hard end-of-stream marker without
   /// auditing the implementor's internal state-machine on every
   /// transition. The [`super::player::AudioPlayer`] impl enforces

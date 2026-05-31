@@ -1,5 +1,5 @@
-//! Indexing ops: slice (Phase 3.5 template — start/stop/strides), plus the
-//! Phase 4 Branch B fan-out: take / take_axis / take_along_axis / gather.
+//! Indexing ops: slice (start/stop/strides), plus
+//! take / take_axis / take_along_axis / gather.
 
 use std::ffi::c_int;
 
@@ -23,7 +23,7 @@ use crate::{
 /// All three slices must be the same length and equal to `a.ndim()`. For a
 /// 0-D scalar input that means three empty slices, which is the correct
 /// no-op slice — empty inputs are routed through `dim_ptr`'s static sentinel
-/// (the Codex PR #5 dangling-pointer concern), not rejected.
+/// (avoiding a dangling pointer), not rejected.
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.slice.html).
 pub fn slice(a: &Array, start: &[i32], stop: &[i32], strides: &[i32]) -> Result<Array> {
@@ -206,7 +206,7 @@ pub fn gather(a: &Array, indices: &[&Array], axes: &[i32], slice_sizes: &[i32]) 
   }
   // slice_sizes is a shape extent (one per dim of `a`); it must be non-negative
   // and have rank == a.ndim(). Without these guards, negative or wrong-rank
-  // values cross into mlx::core::Shape construction (Codex PR #7-target finding).
+  // values cross into mlx::core::Shape construction.
   if slice_sizes.len() != a.ndim() {
     return Err(Error::LengthMismatch(LengthMismatchPayload::new(
       "gather: slice_sizes.len() vs a.ndim()",

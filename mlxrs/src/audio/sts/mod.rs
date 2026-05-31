@@ -2,7 +2,7 @@
 //! from [`mlx_audio.sts`][sts-init] (the per-domain `load` /
 //! `load_model` entry points the upstream `__init__` re-exports).
 //!
-//! Per the project's [no per-model arch porting][noarch] rule, mlxrs
+//! Per the project's no per-model arch porting rule, mlxrs
 //! ships **no** concrete STS model implementations: the LFM-audio
 //! end-to-end speech model, the SAM-audio source-separator,
 //! DeepFilterNet, MossFormer2, Moshi — all per-model and excluded. The
@@ -16,7 +16,7 @@
 //!
 //! mlx-audio's [`sts/voice_pipeline.py`][sts-pipeline] composes a full
 //! voice-pipeline (VAD + STT + LLM + TTS); per the
-//! [mirror-reference-structure][mirror] rule, mlxrs keeps STS as the
+//! mirror-reference-structure rule, mlxrs keeps STS as the
 //! per-domain `load` surface (the [`mod@load`] submodule) and lifts
 //! the voice-pipeline composition into a separate [`mod@pipeline`]
 //! sibling that consumes the [`crate::audio::vad`] +
@@ -29,15 +29,13 @@
 //! - [`mod@load`] — the per-domain [`load::load`] / [`load::load_model`]
 //!   entry points + the [`load::Model`] trait every concrete STS
 //!   architecture implements.
-//! - [`mod@pipeline`] — A8 voice-pipeline orchestration (the
+//! - [`mod@pipeline`] — voice-pipeline orchestration (the
 //!   [`pipeline::VoiceSession`] default + the [`pipeline::VoicePipeline`]
 //!   trait + the chunker / barge-in / turn-taking primitive
 //!   submodules).
 //!
 //! [sts-init]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/utils.py
 //! [sts-pipeline]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/voice_pipeline.py
-//! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
-//! [mirror]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/mirror-reference-structure.md
 
 pub mod load;
 pub mod pipeline;

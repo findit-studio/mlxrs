@@ -254,7 +254,7 @@ fn device_can_move_to_another_thread() {
 // `Stream` is `!Send + !Sync` (mlx-c++ keys CommandEncoders by thread; even
 // the CPU path is not worth exposing as cross-thread-movable when the GPU
 // path silently fails). Compile-fail coverage lives in
-// `tests/ui-tests/stream_no_send.rs` + `stream_no_sync.rs`. Codex PR #13.
+// `tests/ui-tests/stream_no_send.rs` + `stream_no_sync.rs`.
 
 #[test]
 fn device_can_be_shared_across_threads() {
@@ -271,7 +271,7 @@ fn concurrent_set_default_and_current_is_race_free() {
   // mlx-c++'s default device is a non-atomic function-static. Without the
   // crate-level lock, hammering set_default + current from many threads is
   // a C++ data race. With it, this completes deterministically and the
-  // final default is always one of the two valid values. Codex PR #13.
+  // final default is always one of the two valid values.
   use std::thread;
   // Held for the whole test: this one mutates the process-global default
   // from 8 threads, so it must not interleave with the other tests that
@@ -319,7 +319,7 @@ fn concurrent_set_default_and_current_is_race_free() {
 #[test]
 fn post_clear_array_display_also_panics_fast() {
   // `Display::fmt` → mlx_array_tostring → upstream streams via eval(), so it
-  // re-enters eval and must honor the poison guard too (Codex PR #13 r7).
+  // re-enters eval and must honor the poison guard too.
   let outcome = std::thread::spawn(|| {
     let a = mlxrs::Array::ones::<f32>(&(2usize, 2)).unwrap(); // lazy
     Stream::clear_current_thread_streams().unwrap(); // poison this thread
@@ -491,7 +491,7 @@ fn reusing_a_cleared_thread_panics_fast_with_actionable_message() {
 #[test]
 fn post_clear_every_public_stream_entry_point_panics_fast() {
   // The poison guard must cover EVERY safe public Stream API that touches
-  // mlx stream FFI, not just eval/synchronize (Codex PR #13 r6). After a
+  // mlx stream FFI, not just eval/synchronize. After a
   // successful clear, each of these must panic-fast.
   let outcome = std::thread::spawn(|| {
     // Construct a Device + a Stream BEFORE poisoning so the accessor checks
@@ -540,7 +540,7 @@ fn post_clear_every_public_stream_entry_point_panics_fast() {
 #[test]
 fn post_clear_eval_of_existing_array_also_panics_fast() {
   // `eval`/`to_vec` reach mlx WITHOUT going through default_stream(), so the
-  // poison guard must also cover that path (Codex PR #13 r5). Build a lazy
+  // poison guard must also cover that path. Build a lazy
   // array BEFORE clearing, then assert materializing it after the clear
   // panics immediately rather than failing deep in the backend.
   let outcome = std::thread::spawn(|| {

@@ -98,7 +98,7 @@ pub struct BatchRotatingKvCache {
   /// Per-sequence left-pad counts — mlx-lm `left_padding` (`[B]`, `I32`).
   left_padding: Array,
   /// Cached host-readable mirror of `left_padding`, kept in lockstep with
-  /// the `Array` form (KVC-4, #101). See [`super::BatchKvCache::pad_lengths`]
+  /// the `Array` form (#101). See [`super::BatchKvCache::pad_lengths`]
   /// for the rationale — same per-call-`.item()` cost mlx-lm pays
   /// (cache.py:947-955 / KVCache.swift:1310-1325) is paid here exactly
   /// ONCE at construction / `set_state` time; consumers reach the host
@@ -112,7 +112,7 @@ pub struct BatchRotatingKvCache {
   /// Physical ring write cursor — mlx-lm `_idx`. Wraps to `0` (no `keep`)
   /// once it reaches `max_size`.
   ///
-  /// **Mutation discipline** (KVC-5, #102): `idx`, `off`, and `rotated`
+  /// **Mutation discipline** (#102): `idx`, `off`, and `rotated`
   /// jointly form the ring's invariant `(rotated ⇔ off ≥ max_size && idx
   /// has wrapped)`. Every state-changing op MUST commit these three in
   /// the infallible commit tail of a stage-then-commit body — see
@@ -128,7 +128,7 @@ pub struct BatchRotatingKvCache {
   /// Whether the ring has wrapped — mlx-lm `rotated` (the returned buffer
   /// is then in physical, not temporal, order).
   ///
-  /// **Last-mutation rule** (KVC-5, #102): per the discipline above, this
+  /// **Last-mutation rule** (#102): per the discipline above, this
   /// flag MUST be the **last** field assigned in any state-changing op's
   /// commit tail. Swift's reference `_update_in_place` (`KVCache.swift:
   /// 1330-1370`) mutates the buffer first and sets `rotated = false` late
@@ -172,7 +172,7 @@ impl BatchRotatingKvCache {
 
   /// Per-sequence left-pad counts as a borrowed `&[i32]` — the cached
   /// host-readable mirror of [`left_padding_arr`](Self::left_padding_arr)
-  /// (KVC-4, #101). Mirrors [`super::BatchKvCache::pad_lengths`] for
+  /// (#101). Mirrors [`super::BatchKvCache::pad_lengths`] for
   /// cross-cache consistency; the value is updated in lockstep with the
   /// underlying `Array` form by [`set_state`](KvCache::set_state) /
   /// [`finalize`](Self::finalize) — never re-evaluated per call.
@@ -259,19 +259,19 @@ impl BatchRotatingKvCache {
       };
       let new_left_padding = ops::arithmetic::add(&self.left_padding, &roll)?;
       let new_offset = ops::arithmetic::subtract(&self.offset, &roll)?;
-      // KVC-4 (#101): refresh the cached host mirror by evaluating the
+      // #101: refresh the cached host mirror by evaluating the
       // newly-computed `new_left_padding`. This is a finalize-time eval
       // (rare — once per request, not per token); the alternative
       // (host-side `max(0, off - lengths)` mirror) needs the `_lengths`
       // host values too, which would balloon the field set. Eval the
       // CLONED local (we already need `new_left_padding` for the commit).
       //
-      // **Codex-R2 [medium] — propagate extraction failures.** The prior
-      // version fell back to `self.pad_lengths.clone()` on a `to_vec`
-      // error and then committed the new `left_padding` Array anyway,
+      // **Propagate extraction failures.** A naive implementation would
+      // fall back to `self.pad_lengths.clone()` on a `to_vec`
+      // error and then commit the new `left_padding` Array anyway,
       // leaving `pad_lengths()` permanently desynchronized from the
-      // freshly-rolled Array state. Same class as R1 #3
-      // (`BatchKvCache::set_state`/`BatchRotatingKvCache::set_state`):
+      // freshly-rolled Array state. Same class as
+      // `BatchKvCache::set_state`/`BatchRotatingKvCache::set_state`:
       // propagate via `?` BEFORE the commit tail so an extraction/eval
       // failure leaves keys/values/offset/left_padding/_lengths fully
       // untouched.
@@ -372,7 +372,7 @@ impl BatchRotatingKvCache {
     let (wk, wv): (Array, Array);
     let mut w_offset = self.offset.try_clone()?;
     let mut w_left_padding = self.left_padding.try_clone()?;
-    // KVC-4 (#101): track whether the host-side `pad_lengths` mirror
+    // #101: track whether the host-side `pad_lengths` mirror
     // needs refreshing. The common decode case (empty cache OR `bk` fits
     // without trim/roll) leaves `w_left_padding` byte-identical to the
     // current `self.left_padding` (just a `try_clone`), so `pad_lengths`
@@ -454,15 +454,15 @@ impl BatchRotatingKvCache {
     let new_offset_arr = ops::arithmetic::add(&w_offset, &s_arr)?;
     let new_idx = seq_len("keys", &wk)?;
     let (rk, rv) = (wk.try_clone()?, wv.try_clone()?);
-    // KVC-4 (#101): If `lp_dirty`, eval the new left_padding ONCE here
+    // #101: If `lp_dirty`, eval the new left_padding ONCE here
     // (still in the staged region, before any commit). For the common
     // case (`lp_dirty == false` — no `lengths`, no trim), zero eval cost.
     //
-    // **Codex-R2 [medium] — propagate extraction failures.** The prior
-    // version fell back to `self.pad_lengths.clone()` on a `to_vec`
-    // error and then committed the new `w_left_padding` Array anyway,
+    // **Propagate extraction failures.** A naive implementation would
+    // fall back to `self.pad_lengths.clone()` on a `to_vec`
+    // error and then commit the new `w_left_padding` Array anyway,
     // leaving `pad_lengths()` permanently desynchronized. Same class as
-    // R1 #3 + the finalize sibling above: propagate via `?` BEFORE the
+    // the finalize sibling above: propagate via `?` BEFORE the
     // commit tail so an extraction/eval failure leaves the cache fully
     // unmutated.
     let new_pad_lengths = if lp_dirty {
@@ -518,8 +518,8 @@ impl BatchRotatingKvCache {
     // to either `update_in_place` (S==1) or `update_concat` (S>1) — see
     // `update`'s body above). The previous in-method rank check here was
     // redundant with that centralized validation; remove to keep error
-    // reporting consistent across both update paths (Copilot review
-    // #3271560177). The `keys.shape()` index reads below are now backed
+    // reporting consistent across both update paths. The `keys.shape()`
+    // index reads below are now backed
     // by the public entry's pre-validation.
     let ks = keys.shape();
     let (b, h, s, k_hd) = (ks[0], ks[1], ks[2], ks[3]);
@@ -561,7 +561,7 @@ impl BatchRotatingKvCache {
     let mut w_idx = self.idx;
     let mut w_rotated = self.rotated;
     let mut w_left_padding = self.left_padding.try_clone()?;
-    // KVC-4 (#101): track whether `w_left_padding` diverges from
+    // #101: track whether `w_left_padding` diverges from
     // `self.left_padding`. The common decode case (no trim, no rotate)
     // leaves `pad_lengths` unchanged → zero eval cost.
     let mut lp_dirty = false;
@@ -662,16 +662,16 @@ impl BatchRotatingKvCache {
     } else {
       (nk.try_clone()?, nv.try_clone()?)
     };
-    // KVC-4 (#101): refresh the host mirror only when `w_left_padding`
+    // #101: refresh the host mirror only when `w_left_padding`
     // actually diverged from `self.left_padding` (trim and/or rotate
     // mutated it). Zero eval cost for the common decode steady-state
     // (no trim, no rotate).
     //
-    // **Codex-R2 [medium] — propagate extraction failures.** The prior
-    // version fell back to `self.pad_lengths.clone()` on a `to_vec`
-    // error and then committed the new `w_left_padding` Array anyway,
+    // **Propagate extraction failures.** A naive implementation would
+    // fall back to `self.pad_lengths.clone()` on a `to_vec`
+    // error and then commit the new `w_left_padding` Array anyway,
     // leaving `pad_lengths()` permanently desynchronized. Same class as
-    // R1 #3 + the finalize/update_concat siblings above: propagate via
+    // the finalize/update_concat siblings above: propagate via
     // `?` BEFORE the commit tail so an extraction/eval failure leaves
     // `self` fully unmutated.
     let new_pad_lengths = if lp_dirty {
@@ -682,7 +682,7 @@ impl BatchRotatingKvCache {
     };
 
     // ── Infallible commit tail (no `?` past this point) ──────────────
-    // KVC-5 (#102): commit the ring state in the documented order — `idx`
+    // #102: commit the ring state in the documented order — `idx`
     // and `off` first, `rotated` LAST. Swift's `_update_in_place` mutates
     // the buffer then sets `rotated = false` late (KVCache.swift:1330-
     // 1370), which would leave a half-committed `rotated=true` against a
@@ -698,7 +698,7 @@ impl BatchRotatingKvCache {
     self.pad_lengths = new_pad_lengths;
     self.off = new_off; // _offset += S (overflow already rejected above)
     self.idx = new_w_idx;
-    self.rotated = w_rotated; // LAST: enforces the KVC-5 commit-tail rule
+    self.rotated = w_rotated; // LAST: enforces the commit-tail rule
     Ok((rk, rv))
   }
 }
@@ -753,7 +753,7 @@ impl KvCache for BatchRotatingKvCache {
   /// every valid input is unchanged.
   fn update(&mut self, keys: &Array, values: &Array) -> Result<(Array, Array)> {
     // Reject the constructor placeholder `max_size == 0` here too —
-    // symmetric with `make_mask` (Copilot review #3271308764). An update
+    // symmetric with `make_mask`. An update
     // against `max_size == 0` would otherwise drive `trim_size` /
     // `_idx - max_size + ...` arithmetic into degenerate / silently
     // wrong values; the from_state path never reaches here on the
@@ -872,19 +872,19 @@ impl KvCache for BatchRotatingKvCache {
         // any field so a bad buffer leaves the cache unmutated.
         seq_len("keys", &keys)?;
         batch_head_dim("values", &values)?;
-        // KVC-4 (#101): materialize the restored `left_padding` to the
+        // #101: materialize the restored `left_padding` to the
         // host mirror ONCE here (same one-time eval cost as
         // `BatchKvCache::set_state` above). Staged on a local FIRST so an
         // eval failure leaves `self` fully unmutated.
         //
-        // **Codex-R1 [medium] #3 — propagate extraction failures.** Same
-        // class as `BatchKvCache::set_state`: the prior version fell back
-        // to `self.pad_lengths.clone()` on extraction failure and then
-        // committed the new `left_padding` Array anyway, leaving
+        // **Propagate extraction failures.** Same
+        // class as `BatchKvCache::set_state`: a naive implementation would
+        // fall back to `self.pad_lengths.clone()` on extraction failure and
+        // then commit the new `left_padding` Array anyway, leaving
         // `pad_lengths()` permanently desynchronized from the actual
         // restored state (often at the empty placeholder from
         // `BatchRotatingKvCache::new(0, &[])`, which
-        // `from_state("BatchRotatingKVCache")` opens with). Fix:
+        // `from_state("BatchRotatingKVCache")` opens with). So:
         // VALIDATE rank/dtype/length against the restored `keys` batch
         // dim BEFORE extraction, then propagate any `to_vec::<i32>`
         // error via `?` — cache stays untouched on every error path.
@@ -921,8 +921,8 @@ impl KvCache for BatchRotatingKvCache {
         self.offset = offset;
         self.left_padding = left_padding;
         self.pad_lengths = new_pad_lengths;
-        // Also clear `lengths` here, matching the empty-state branch above
-        // (Copilot review #3271560146). If `prepare_right_padding()` armed
+        // Also clear `lengths` here, matching the empty-state branch above.
+        // If `prepare_right_padding()` armed
         // `lengths` and a caller then `set_state`s with 4 arrays, the stale
         // `lengths` would (a) make `update_in_place` error
         // (`finalize() should be called…`) and/or (b) cause `finalize()`
@@ -1069,8 +1069,7 @@ impl KvCache for BatchRotatingKvCache {
     // `make_mask` against `max_size == 0` is therefore a USER-side misuse
     // (constructing `new(0, &[])` directly without restoring meta_state
     // afterwards) and would yield a degenerate / silently-wrong mask
-    // (`ws == 0` and `offset == 0`). Reject as a recoverable error
-    // (Copilot review #3271308764).
+    // (`ws == 0` and `offset == 0`). Reject as a recoverable error.
     if self.max_size == 0 {
       return Err(Error::InvariantViolation(InvariantViolationPayload::new(
         "BatchRotatingKvCache::make_mask",
@@ -1122,7 +1121,7 @@ impl KvCache for BatchRotatingKvCache {
     // `trim_size as i64` / `delta as f32` would WRAP/lose precision
     // (e.g. `(usize::MAX-8) as i64 == -9`), flipping the `left_padding`
     // adjustment direction and returning a plausible-but-WRONG decode
-    // mask instead of erroring (the round-1/6 overflow class, at the
+    // mask instead of erroring (the same overflow class, at the
     // lossy cast rather than the add). Keep `delta` in `usize`
     // (`trim_size + int(rotated)`, checked), then require it to be
     // **exactly** representable through the `f32`-built I32 scalar the
@@ -1256,7 +1255,7 @@ impl KvCache for BatchRotatingKvCache {
     "BatchRotatingKVCache"
   }
 
-  /// P1 #110: per-layer fast-path downcast target — see the
+  /// Per-layer fast-path downcast target (#110) — see the
   /// [`KvCache`]-trait doc's **Per-layer fast-path convention**.
   fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
     self

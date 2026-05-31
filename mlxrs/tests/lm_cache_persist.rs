@@ -32,8 +32,9 @@ use std::{collections::HashMap, fs, path::PathBuf, process};
 use mlxrs::{
   Array, Error, io,
   lm::cache::{
-    ArraysCache, CacheList, ChunkedKvCache, KvCache, QuantizedKvCache, QuantizedKvCacheImpl,
-    RotatingKvCache, StandardKvCache, load_prompt_cache, reference_class_name, save_prompt_cache,
+    ArraysCache, CacheList, ChunkedKvCache, KvCache, QuantizedKvCache, RotatingKvCache,
+    StandardKvCache, StandardQuantizedKvCache, load_prompt_cache, reference_class_name,
+    save_prompt_cache,
   },
   ops,
 };
@@ -77,7 +78,7 @@ fn kv_quant_keys(n_steps: usize) -> Array {
 /// Distinct VALUE fixture `[1, 1, S, 64]` paired with [`kv_quant_keys`]. Row
 /// `s`, column `j` holds `(63 - j)*2 + s*128 + 4096` — column-reversed,
 /// sequence-position-varying, offset by +4096. Crucially the per-row SPAN is
-/// 126 (spacing 2) versus the keys' span of 63 (R5): a DIFFERENT per-row range
+/// 126 (spacing 2) versus the keys' span of 63: a DIFFERENT per-row range
 /// yields a different affine SCALE, a different min yields a different BIAS, and
 /// the reversed pattern yields different packed WEIGHTS — so all three of the
 /// value's quantized slots differ from the key's, and a persist bug swapping
@@ -157,7 +158,7 @@ fn chunked_kvcache_round_trips_through_persist() {
 /// Dequantize a 6-array quantized `state()` (`[k.w, k.scales, k.biases, v.w,
 /// v.scales, v.biases]`, quantized.rs:644-668) into `(dense_keys, dense_values)`
 /// via the merged `ops::quantized::dequantize` (gs=64, bits=8, affine — the
-/// `QuantizedKvCacheImpl::new(64, 8)` params). Identical packed bytes
+/// `StandardQuantizedKvCache::new(64, 8)` params). Identical packed bytes
 /// dequantize to identical dense values, so this is an EXACT (not banded)
 /// content comparison after a lossless safetensors round-trip.
 fn dequant_quant_state(state: &[Array]) -> (Array, Array) {
@@ -194,26 +195,25 @@ fn quantized_kvcache_round_trips_through_persist() {
   // `"0.{i}.{0,1,2}"` list-meta path + the `QuantizedKVCache` from_state
   // arm, neither covered by the existing persist tests.
   //
-  // Strengthened per Codex #3 (which noted the original compared only meta +
-  // packed-state SHAPES, so a corrupted/zeroed packed payload would pass):
-  // this now compares the packed state by CONTENT. `Array::to_vec` errors
-  // `NonContiguous` on a strided slice and the packed weight is U32 while
-  // scales/biases are F32, so a per-array `to_vec` is dtype-fragile; instead
-  // the saved vs loaded state is compared through `dequantize` (the
-  // contiguity-safe, dtype-uniform F32 reconstruction the cache semantically
-  // holds — Codex's "compare dequantized state before/after"). Because
-  // safetensors round-trips the packed bytes losslessly, the two dequantize
-  // EXACTLY equal (not just within the quant band). 1:1 port of cache.py:43-85.
+  // Rather than comparing only meta + packed-state SHAPES (a corrupted/zeroed
+  // packed payload would pass), this compares the packed state by CONTENT.
+  // `Array::to_vec` errors `NonContiguous` on a strided slice and the packed
+  // weight is U32 while scales/biases are F32, so a per-array `to_vec` is
+  // dtype-fragile; instead the saved vs loaded state is compared through
+  // `dequantize` (the contiguity-safe, dtype-uniform F32 reconstruction the
+  // cache semantically holds). Because safetensors round-trips the packed
+  // bytes losslessly, the two dequantize EXACTLY equal (not just within the
+  // quant band). 1:1 port of cache.py:43-85.
   let path = temp_path("quantized_rt.safetensors");
 
-  let mut c = QuantizedKvCacheImpl::new(64, 8).unwrap();
-  // Codex #3 R2: the keys/values fixtures are now DISTINCT and vary by
+  let mut c = StandardQuantizedKvCache::new(64, 8).unwrap();
+  // The keys/values fixtures are DISTINCT and vary by
   // sequence position (`kv_quant_keys` row = `j + s*64`; `kv_quant_values`
-  // row = `(63 - j) + s*64 + 4096`). The old test reused `kv_quant` (the
-  // identical `[0..63]` row for K, V, and EVERY step), so its dequant-equality
-  // checks were blind to a persist bug that swaps K↔V, duplicates one side, or
-  // reorders sequence rows (all shape-preserving). With distinct, per-step,
-  // per-column fixtures those bugs now change at least one dequantized cell.
+  // row = `(63 - j) + s*64 + 4096`). A shared `[0..63]` row for K, V, and
+  // EVERY step would leave the dequant-equality checks blind to a persist bug
+  // that swaps K↔V, duplicates one side, or reorders sequence rows (all
+  // shape-preserving). With distinct, per-step, per-column fixtures those bugs
+  // change at least one dequantized cell.
   c.update_quantized(&kv_quant_keys(3), &kv_quant_values(3))
     .unwrap();
   let want_offset = c.offset();
@@ -244,7 +244,7 @@ fn quantized_kvcache_round_trips_through_persist() {
     !want_dk_vec.is_empty() && !want_dv_vec.is_empty(),
     "dense state must be non-empty (3 steps x 64 dims)"
   );
-  // PRECONDITIONS (Codex #3 R2) — prove the fixtures genuinely exercise
+  // PRECONDITIONS — prove the fixtures genuinely exercise
   // side (K vs V) and sequence-order sensitivity on the dequantized in-memory
   // state, so the round-trip equality below is not vacuous:
   //   (a) dequantized K differs from dequantized V (distinct sides, +4096
@@ -287,7 +287,7 @@ fn quantized_kvcache_round_trips_through_persist() {
     Some(want_meta[2].as_str())
   );
 
-  // Codex R3+R4: verify the RAW on-disk array slots against an oracle that is
+  // Verify the RAW on-disk array slots against an oracle that is
   // INDEPENDENT of `c.state()`. The six packed arrays are written under "0.{j}"
   // (cache 0, array j) in order [k.w, k.scales, k.biases, v.w, v.scales,
   // v.biases]. Dequantizing the on-disk slots IN ORDER and comparing them to the
@@ -295,8 +295,8 @@ fn quantized_kvcache_round_trips_through_persist() {
   // the test — NOT derived from `state()`/`save_prompt_cache`) pins the semantic
   // wire format: a save/load that writes arrays to the wrong slots, swaps K<->V,
   // or reorders sequence rows diverges from the input here even if it round-trips
-  // self-consistently. (R4: the prior compare to `want_*` was self-referential —
-  // both `want_*` and the slots derive from `state()`.)
+  // self-consistently. (Comparing to `want_*` would be self-referential — both
+  // `want_*` and the slots derive from `state()`.)
   let mut raw_state: Vec<Array> = (0..6)
     .map(|j| {
       arrays
@@ -304,7 +304,7 @@ fn quantized_kvcache_round_trips_through_persist() {
         .unwrap_or_else(|| panic!("missing on-disk quantized array slot 0.{j}"))
     })
     .collect();
-  // R5: every one of the six slots must be individually distinguishable, so a
+  // Every one of the six slots must be individually distinguishable, so a
   // swap/duplicate of ANY single on-disk array changes the dequantized output.
   // Keys span 63 / values span 126 give DIFFERENT affine scales (slots 0.1 vs
   // 0.4); different mins give different biases (slots 0.2 vs 0.5). Assert those
@@ -432,8 +432,8 @@ fn cache_list_round_trips_through_persist() {
   assert_eq!(s0[0].to_vec::<f32>().unwrap(), vec![1.0, 2.0]);
   assert_eq!(s0[1].to_vec::<f32>().unwrap(), vec![3.0, 4.0]);
   // Child 1 (RotatingKvCache) key/value contents ALSO round-trip
-  // (Codex #3: the original only checked child 0, so a corrupted child-1
-  // state would go undetected). The single S=3 prefill update from empty
+  // (checking only child 0 would leave a corrupted child-1 state
+  // undetected). The single S=3 prefill update from empty
   // takes `update_concat`'s empty-cache branch (`(keys, values).try_clone`,
   // rotating.rs:249-251), so the buffer is exactly [5,6,7] / [8,8,8]; with
   // offset 3 == buffer len 3 `state()` returns the full buffer (NOT a
@@ -449,7 +449,7 @@ fn cache_list_round_trips_through_persist() {
 #[test]
 fn mamba_arrays_cache_round_trips_through_persist() {
   // A `MambaCache` (an `ArraysCache` with the swift `MambaCache`
-  // provenance, KVC-9) is a NON-KV kind: it is in neither persist's
+  // provenance) is a NON-KV kind: it is in neither persist's
   // `KV_RANK_KINDS` (so the 4-D rank gate is skipped — forward-compat path
   // for non-4-D-state caches) NOR `NO_META_KINDS` (its meta_state is a
   // genuine slot-aware list). An EMPTY one still writes its class +
@@ -602,7 +602,7 @@ fn unknown_cache_kind_is_err_not_panic() {
   side.insert("2.0".to_string(), "BogusCacheKind".to_string());
   io::save_safetensors_with_metadata(&path, &arrays, &side).unwrap();
 
-  // Codex #4: pin the CONCRETE nested variant, not just `is_err()` (a generic
+  // Pin the CONCRETE nested variant, not just `is_err()` (a generic
   // earlier failure would also be Err). `from_state` rejects the kind via
   // `KvCacheKind::parse` → `Error::UnknownEnumValue` (mod.rs:763-764), which
   // `load_prompt_cache` wraps in a `LayerKeyed` (persist.rs:815-823).
@@ -650,7 +650,7 @@ fn array_group_index_out_of_range_is_err() {
   side.insert("0.0".to_string(), String::new());
   io::save_safetensors_with_metadata(&path, &arrays, &side).unwrap();
 
-  // Codex #4: pin the CONCRETE variant + payload. One class ("2.0") so
+  // Pin the CONCRETE variant + payload. One class ("2.0") so
   // class_count=1; the lone array group with `i >= 1` is index 5, surfaced as
   // `Error::OutOfRange` with the index/class-count context (persist.rs:648-654).
   let err = load_prompt_cache(&path)
@@ -691,7 +691,7 @@ fn non_dense_class_indices_is_err() {
   side.insert("2.2".to_string(), "KVCache".to_string()); // gap at index 1
   io::save_safetensors_with_metadata(&path, &arrays, &side).unwrap();
 
-  // Codex #4: pin the CONCRETE variant + the `dense_len` context. Classes are
+  // Pin the CONCRETE variant + the `dense_len` context. Classes are
   // present at indices {0,2} (present=2) with max index 2 (n = 2+1 = 3), so
   // `dense_len(.., "class")` rejects the gap as `Error::LengthMismatch` with
   // expected=present=2, actual=n=3 (persist.rs:299-309, "class" call site at
@@ -732,7 +732,7 @@ fn non_dense_array_sub_indices_is_err() {
   side.insert("0.0".to_string(), String::new());
   io::save_safetensors_with_metadata(&path, &arrays, &side).unwrap();
 
-  // Codex #4: pin the CONCRETE variant + the `dense_len` context. Cache 0's
+  // Pin the CONCRETE variant + the `dense_len` context. Cache 0's
   // arrays are at sub-indices {0,2} (present=2) with max 2 (n = 2+1 = 3), so
   // `dense_len(.., "array sub")` rejects the gap as `Error::LengthMismatch`
   // with expected=present=2, actual=n=3 (persist.rs:357, "array sub" call
@@ -768,7 +768,7 @@ fn reference_class_name_free_fn_matches_concrete_kinds() {
   let std_c = StandardKvCache::new();
   let rot_c = RotatingKvCache::new(8, 4);
   let chunk_c = ChunkedKvCache::new(Some(8));
-  let quant_c = QuantizedKvCacheImpl::new(64, 8).unwrap();
+  let quant_c = StandardQuantizedKvCache::new(64, 8).unwrap();
   let mamba_c = ArraysCache::mamba();
   let list_c = CacheList::new(Vec::new());
 

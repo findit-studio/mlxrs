@@ -221,8 +221,8 @@ pub(crate) fn broadcast_write_rhs(
 pub(crate) fn slice_seq(a: &Array, start: usize, end: usize) -> Result<Array> {
   let shape = a.shape();
   // Rank check — surface a rank-misuse as recoverable `RankMismatch`
-  // rather than panicking on the `stops[KV_NDIM - 2]` index below
-  // (Copilot review #3273072304). Surrounding helpers (`seq_len`,
+  // rather than panicking on the `stops[KV_NDIM - 2]` index below.
+  // Surrounding helpers (`seq_len`,
   // `head_dim`, `concat_parts`) all enforce `KV_NDIM` the same way; the
   // happy path through the existing callers (Standard/Rotating/Chunked/
   // Quantized/Batch/BatchRotating) all pre-validate rank before reaching
@@ -449,7 +449,7 @@ mod tests {
   fn slice_seq_rejects_rank_mismatch() {
     // Defense-in-depth: a rank-misuse must surface as recoverable
     // RankMismatch rather than panicking on the `stops[KV_NDIM - 2]`
-    // index (Copilot review #3273072304). All real callers pre-validate
+    // index. All real callers pre-validate
     // rank, so this only fires on a programmer-error / misuse path.
     let a1: Array = Array::from_slice::<f32>(&[0.0, 1.0], &(2usize,)).unwrap(); // rank 1
     let r = slice_seq(&a1, 0, 0);

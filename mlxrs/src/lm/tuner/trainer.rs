@@ -1032,8 +1032,8 @@ where
   )?;
   // Pre-loop val — emit BEFORE the first optimizer step (Python
   // trainer.py:286..=317 does this implicitly by checking `it == 1`
-  // before its first step body). `iteration: 0` matches the previous
-  // microbatch-based semantics which fired at `iteration: it - 1 = 0`.
+  // before its first step body). `iteration: 0` matches the
+  // microbatch-based semantics, which fire at `iteration: it - 1 = 0`.
   if let Some(val) = val_dataset
     && total_optim_steps >= 1
   {
@@ -1098,7 +1098,7 @@ where
       // microbatch (line ~767), so dividing by `window_steps` (=
       // window_microbatches / grad_accumulation_steps) inflates the
       // reported loss by `grad_accumulation_steps×`. See trainer module
-      // doc note + the F1 regression test
+      // doc note + the regression test
       // `grad_accumulation_steps_4_reports_constant_loss_at_2_not_8`.
       let mean_loss = if window_microbatches > 0 {
         window_loss / (window_microbatches as f32)
@@ -1332,9 +1332,9 @@ mod tests {
     //   step 1: 1 >= 0 AND 1 < 2 → ✓ (target[0] = batch[1] = valid)
     //   step 2: 2 >= 0 AND 2 < 2 → ✗ (would be target[1] = batch[2] = PAD)
     //   step 3: 3 >= 0 AND 3 < 2 → ✗
-    // Old code with `<=` would have INCLUDED step 2 (the boundary pad),
-    // counting batch[2] = 0 as a supervised target and skewing training
-    // toward predicting the pad token. ntoks must be 1, not 2.
+    // An inclusive `<=` upper bound would INCLUDE step 2 (the boundary
+    // pad), counting batch[2] = 0 as a supervised target and skewing
+    // training toward predicting the pad token. ntoks must be 1, not 2.
     let model = FakeModel;
     let batch = Array::from_slice::<i32>(&[1, 2, 0, 0], &(1, 4))?;
     let lengths = Array::from_slice::<i32>(&[0, 2], &(1, 2))?;
@@ -1467,7 +1467,7 @@ mod tests {
     Ok(())
   }
 
-  // ─────────── F1 — acknowledge_no_real_gradients gate ───────────
+  // ─────────── acknowledge_no_real_gradients gate ───────────
 
   #[test]
   fn train_rejects_when_acknowledge_no_real_gradients_is_false() -> Result<()> {
@@ -1541,7 +1541,7 @@ mod tests {
     Ok(())
   }
 
-  // ─────────── F5 — zero-interval rejection ───────────
+  // ─────────── zero-interval rejection ───────────
 
   fn args_for_zero_interval_tests() -> TrainingArgs {
     TrainingArgs::new()
@@ -1625,7 +1625,7 @@ mod tests {
     }
   }
 
-  // ─────────── F3 — grad accumulation respects window cadence ───────────
+  // ─────────── grad accumulation respects window cadence ───────────
 
   /// Counting optimizer wrapper: counts `apply_gradients` invocations
   /// without modifying params. Used to assert the train loop fires the
@@ -1772,7 +1772,7 @@ mod tests {
     Ok(())
   }
 
-  // ─────────── F1-R2 — report-loss denominator parity with mlx-lm ───────────
+  // ─────────── report-loss denominator parity with mlx-lm ───────────
 
   /// Recording callback: captures `train_loss` from every
   /// `on_train_loss_report` call. Used to prove the report denominator
@@ -1790,15 +1790,15 @@ mod tests {
 
   #[test]
   fn grad_accumulation_steps_4_reports_constant_loss_at_2_not_8() -> Result<()> {
-    // Regression for the R2 inflation bug: when each microbatch's loss is
-    // constant 2.0 and `grad_accumulation_steps = 4`, summing one term per
-    // microbatch into `window_loss` and then dividing by `window_steps`
-    // (which only increments per completed accumulation window) produced
-    // an 8.0 reported loss — every callback / log line / early-stop
-    // monitor saw the per-microbatch loss multiplied by 4×.
+    // Regression guard against loss inflation: when each microbatch's loss
+    // is constant 2.0 and `grad_accumulation_steps = 4`, summing one term
+    // per microbatch into `window_loss` and then dividing by `window_steps`
+    // (which only increments per completed accumulation window) would
+    // report an 8.0 loss — every callback / log line / early-stop monitor
+    // would see the per-microbatch loss multiplied by 4×.
     //
-    // After the fix, the denominator is the completed-microbatch count, so
-    // every report fires at the true per-microbatch loss 2.0.
+    // The denominator is the completed-microbatch count, so every report
+    // fires at the true per-microbatch loss 2.0.
     let dataset = FakeDataset::new(4, 6);
     let model = FakeModel;
     let mut params: Weights = HashMap::new();
@@ -1851,25 +1851,25 @@ mod tests {
     for (i, &loss) in cb.losses.iter().enumerate() {
       assert!(
         (loss - 2.0).abs() < 1e-6,
-        "report #{i} train_loss = {loss}, expected 2.0 (per-microbatch loss); pre-R2 bug \
-         reported 8.0 because `window_loss / window_steps` divided 4×constant-2.0 by 1 \
-         optimizer-step",
+        "report #{i} train_loss = {loss}, expected 2.0 (per-microbatch loss); dividing \
+         `window_loss / window_steps` (4×constant-2.0 by 1 optimizer-step) would wrongly \
+         report 8.0",
       );
     }
     Ok(())
   }
 
-  // ─────────── F2-R2 — default_loss rejects zero-supervised-token batches ───────────
+  // ─────────── default_loss rejects zero-supervised-token batches ───────────
 
   #[test]
   fn default_loss_rejects_zero_token_batch_after_mask() -> Result<()> {
     // Construct a [B=2, S=2] batch where BOTH rows have lengths=(0, 1).
     // - Shifted targets has T=S-1=1 position; arange runs over [1, 2).
     // - Mask is `steps >= 0 && steps < 1` over step ∈ {1}: never true.
-    // After R1's exclusive `<` upper bound, mask.sum() == 0 → without the
-    // R2 zero-token guard, `ce_sum / ntoks` produced NaN/Inf and poisoned
+    // With the exclusive `<` upper bound, mask.sum() == 0 → without the
+    // zero-token guard, `ce_sum / ntoks` would produce NaN/Inf and poison
     // every downstream accumulator (`train`'s `window_loss`, `evaluate`'s
-    // `total_loss`) silently. The fix is to return an explicit `Backend`
+    // `total_loss`) silently. The guard returns an explicit `Backend`
     // error before the divide so the caller filters the offending rows.
     let model = FakeModel;
     // Two rows, two tokens each; padding is fine since the mask zeros
@@ -1894,8 +1894,8 @@ mod tests {
 
   #[test]
   fn default_loss_rejects_lengths_with_extra_batch_row() -> Result<()> {
-    // batch is [B=2, S=2] but lengths is [B+1=3, 2] — the previous rank-
-    // only guard accepted this and silently sliced only the first 2 rows,
+    // batch is [B=2, S=2] but lengths is [B+1=3, 2] — a rank-only guard
+    // would accept this and silently slice only the first 2 rows,
     // building masks from mismatched metadata. The full-shape guard must
     // reject up-front.
     let model = FakeModel;
@@ -1915,10 +1915,10 @@ mod tests {
 
   #[test]
   fn default_loss_rejects_lengths_with_missing_batch_row() -> Result<()> {
-    // batch is [B=2, S=2] but lengths is [B-1=1, 2] — the previous guard
-    // accepted this too (rank=2 and dim[1]=2 both held), then the per-row
-    // slice would either OOB or silently truncate metadata. The full-
-    // shape guard must reject up-front.
+    // batch is [B=2, S=2] but lengths is [B-1=1, 2] — a rank-only guard
+    // would accept this too (rank=2 and dim[1]=2 both held), then the
+    // per-row slice would either OOB or silently truncate metadata. The
+    // full-shape guard must reject up-front.
     let model = FakeModel;
     let batch = Array::from_slice::<i32>(&[1, 2, 3, 4], &(2, 2))?;
     let lengths = Array::from_slice::<i32>(&[0, 2], &(1, 2))?;

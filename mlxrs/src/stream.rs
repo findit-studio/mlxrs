@@ -163,9 +163,9 @@ pub(crate) fn current_thread_streams_cleared() -> bool {
 /// ## Threading
 /// `Stream` is intentionally **`!Send` and `!Sync`**.
 ///
-/// The `mlx::core::Stream` struct is a `{DeviceType, int}` POD, so the
-/// Phase-3 audit originally concluded Send/Sync was sound. That conclusion
-/// was layout-only and is wrong in practice: a `Stream` is an *index into
+/// The `mlx::core::Stream` struct is a `{DeviceType, int}` POD, so a
+/// layout-only view would conclude Send/Sync is sound. That conclusion
+/// is layout-only and is wrong in practice: a `Stream` is an *index into
 /// per-thread state*. mlx-c++ stores the default-stream and the per-stream
 /// `CommandEncoder` in C++ thread-local storage, so a GPU stream constructed
 /// on thread A cannot be used to eval (or `synchronize`) on thread B —
@@ -366,7 +366,7 @@ impl Stream {
   /// The returned `Result` carries only the underlying mlx-c rc; the
   /// caller (a `Drop`) discards it per the crate-wide Drop convention.
   ///
-  /// CODEX R1 [HIGH] F3 fix: lets [`crate::memory::WiredLimitGuard::drop`]
+  /// Lets [`crate::memory::WiredLimitGuard::drop`]
   /// safely no-op the sync step when its scope ended after
   /// `clear_current_thread_streams`, while still completing the
   /// `set_wired_limit` restore step.
@@ -389,7 +389,7 @@ impl Stream {
   /// failure instead of `Err`, since the only legitimate caller is a
   /// `Drop` impl that has no good way to surface an error.
   ///
-  /// CODEX R1 [HIGH] F3 fix companion to [`Self::try_synchronize`] — lets
+  /// Companion to [`Self::try_synchronize`] — lets
   /// [`crate::memory::WiredLimitGuard::drop`] decide whether to sync the
   /// default stream (when no explicit streams were passed) or skip it
   /// entirely on a poisoned thread, without panicking.

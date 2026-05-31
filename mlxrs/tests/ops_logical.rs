@@ -1,4 +1,4 @@
-//! Happy-path tests for `ops::logical` (Phase 4 Branch C).
+//! Happy-path tests for `ops::logical`.
 
 use mlxrs::Array;
 

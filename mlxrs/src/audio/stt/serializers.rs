@@ -88,7 +88,7 @@
 //! [`crate::lm::generate::GenerationResponse`] with the `prompt_tps` /
 //! `generation_tps` fields). A `GenerationStats`-shaped aggregator wrapper
 //! around `stt_generate` is the natural follow-up to ship alongside the
-//! LM-L6 `wired_limit` integration (the same wrapping idiom both loops will
+//! `wired_limit` integration (the same wrapping idiom both loops will
 //! share); it doesn't belong in the per-step iterator itself.
 //!
 //! [stt-gen]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/generate.py
@@ -183,7 +183,7 @@ impl Word {
 /// (`{"start": ..., "end": ..., "text": ..., ["words": ...], ["speaker_id":
 /// ...]}`).
 ///
-/// Per §1 EMPTY=ABSENT: `words` is a `Vec<Word>` (empty = no word-level
+/// EMPTY=ABSENT: `words` is a `Vec<Word>` (empty = no word-level
 /// alignment) and `speaker_id` is a `String` (empty = no diarization). The
 /// serde wire form skips both fields when they are empty, so JSON consumers
 /// see the field absent rather than `null` or `[]`/`""` — matching the
@@ -321,7 +321,7 @@ impl SentenceToken {
 /// alignment plus optional speaker-id (the only `hasattr(s, "speaker_id")`
 /// branch in `save_as_json`).
 ///
-/// Per §1 EMPTY=ABSENT: `speaker_id` is a `String` (empty = no diarization).
+/// EMPTY=ABSENT: `speaker_id` is a `String` (empty = no diarization).
 /// The serde wire form skips the field when empty, so JSON consumers see the
 /// field absent rather than `null` or `""` — matching the python
 /// `hasattr(s, "speaker_id")` null/missing convention.
@@ -1389,7 +1389,7 @@ mod tests {
     ))
   }
 
-  // ---------- Finding 2 regression: writer-helper round-trip ----------
+  // ---------- regression: writer-helper round-trip ----------
 
   #[test]
   fn save_as_txt_to_writer_matches_python_body() {
@@ -1460,7 +1460,7 @@ mod tests {
     );
   }
 
-  // ---------- Round-2 finding: dash-stdout flush coverage ----------
+  // ---------- dash-stdout flush coverage ----------
 
   /// Test-only [`Write`] adapter that records whether [`flush`] was called +
   /// (optionally) returns an [`io::Error`] from [`flush`]. Used to exercise

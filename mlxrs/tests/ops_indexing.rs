@@ -1,4 +1,4 @@
-//! Phase 4 Branch B — happy-path tests for indexing ops.
+//! Happy-path tests for indexing ops.
 
 use mlxrs::{Array, ops};
 
@@ -86,7 +86,7 @@ fn gather_rejects_indices_axes_length_mismatch() {
 #[test]
 fn gather_rejects_negative_slice_size() {
   // `slice_sizes` is a shape extent — negative values must be rejected before
-  // they can reach mlx::core::Shape construction (Codex review).
+  // they can reach mlx::core::Shape construction.
   let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3i32]).unwrap();
   let idx = Array::from_slice::<i32>(&[0], &[1i32]).unwrap();
   let r = ops::indexing::gather(&a, &[&idx], &[0], &[-1]);
@@ -274,7 +274,7 @@ fn slice_update_rejects_overflowing_stride() {
 
 #[test]
 fn slice_update_rejects_i32_min_stride_on_empty_axis() {
-  // Regression (Codex R4): for a zero-length axis the magnitude bound
+  // Regression: for a zero-length axis the magnitude bound
   // `0 + abs(i32::MIN) - 1` equals i32::MAX exactly (not greater), so i32::MIN
   // is NOT caught by the magnitude check — it must be rejected by the explicit
   // negation guard, since mlx normalize_slice computes `-stride` (UB at INT_MIN)

@@ -1,4 +1,4 @@
-//! M5 final piece — `audio::stt::Model` trait + `audio::stt::stt_generate`
+//! `audio::stt::Model` trait + `audio::stt::stt_generate`
 //! Iterator: end-to-end audio → token decoding driven by a mock STT model.
 //!
 //! Deterministic, dependency-free: a local `MockSttModel` returns a canned
@@ -338,11 +338,11 @@ fn stt_generate_rejects_sr_mismatch_when_resample_off() {
 
 /// `max_audio_seconds` cap: a 2-second WAV with a 1-second cap rejects
 /// **before** the mel-spec allocation (the encoder MUST NOT have been
-/// called). Post P7 #137: the WAV header rejects at the LOAD stage
-/// (`load_audio_with_cap` sees the container's declared sample count
-/// exceeds `max_audio_seconds * target_sr`), before any decoded buffer
-/// is allocated. The error variant is still recoverable
-/// [`mlxrs::Error::Backend`] and the encoder is still never called.
+/// called). The WAV header rejects at the LOAD stage (#137):
+/// `load_audio_with_cap` sees the container's declared sample count
+/// exceeds `max_audio_seconds * target_sr`, before any decoded buffer
+/// is allocated. The error variant is recoverable
+/// [`mlxrs::Error::Backend`] and the encoder is never called.
 #[test]
 fn stt_generate_rejects_audio_longer_than_max() {
   let path = make_wav("too_long", 16_000, 2 * ONE_SECOND_16K);
@@ -351,8 +351,8 @@ fn stt_generate_rejects_audio_longer_than_max() {
   let err = stt_generate(&model, &path, cache(1), cfg)
     .err()
     .expect("over-cap audio rejected");
-  // Post P7 #137 layered cap: load-stage rejection fires for WAVs (the
-  // header is sample-exact); the STT-stage check remains the fallback
+  // Layered cap (#137): load-stage rejection fires for WAVs (the
+  // header is sample-exact); the STT-stage check is the fallback
   // for lossy formats. Accept EITHER:
   //  - `Error::CapExceeded` from load_audio's exact-count header check
   //    (load-stage layered cap), OR
@@ -369,7 +369,7 @@ fn stt_generate_rejects_audio_longer_than_max() {
   let _ = fs::remove_file(&path);
 }
 
-/// Regression (Codex adversarial-review round 1, high): the
+/// Regression: the
 /// `max_audio_seconds` cap is checked against the **source** duration —
 /// the load_audio `(samples, src_sr)` pair — BEFORE the resample pass
 /// allocates a second buffer. A 2-second 44.1 kHz source (88200 samples)
@@ -377,12 +377,12 @@ fn stt_generate_rejects_audio_longer_than_max() {
 /// resampling. The encoder never being called is the proxy for the
 /// resample-then-reject path being closed.
 ///
-/// Post P7 #137: the load-stage layered cap (`load_audio_with_cap`,
-/// invoked with `target_sr * max_audio_seconds = 16000` samples) is
-/// hit first because 88200 > 16000; the source WAV header is sample-
-/// exact, so the rejection fires at header parse before any buffer is
-/// allocated. The resample-then-reject path is still closed because
-/// the encoder is never called.
+/// The load-stage layered cap (#137: `load_audio_with_cap`, invoked
+/// with `target_sr * max_audio_seconds = 16000` samples) is hit first
+/// because 88200 > 16000; the source WAV header is sample-exact, so the
+/// rejection fires at header parse before any buffer is allocated. The
+/// resample-then-reject path is closed because the encoder is never
+/// called.
 #[test]
 fn stt_generate_rejects_over_cap_before_resample() {
   // 2 seconds of audio at 44.1 kHz: 88200 samples; target_sr = 16000.
@@ -394,7 +394,7 @@ fn stt_generate_rejects_over_cap_before_resample() {
   let err = stt_generate(&model, &path, cache(1), cfg)
     .err()
     .expect("over-cap source rejected pre-resample");
-  // Post P7 #137 layered cap: either path proves the resample was
+  // Layered cap (#137): either path proves the resample was
   // skipped. Load-stage: CapExceeded against the load-stage sample
   // budget. STT-stage: OutOfRange against max_audio_seconds.
   match err {
@@ -408,7 +408,7 @@ fn stt_generate_rejects_over_cap_before_resample() {
   let _ = fs::remove_file(&path);
 }
 
-/// P7 #137 (AUDIO-11): the STT pipeline now invokes
+/// #137: the STT pipeline now invokes
 /// `load_audio_with_cap(path, target_sr * max_audio_seconds)` so an
 /// oversized WAV header rejects at the LOAD stage, before the
 /// load-stage sample buffer is allocated. Verifies the load-layer
@@ -430,8 +430,7 @@ fn stt_generate_layered_cap_rejects_at_load_stage_for_wav() {
   let err = stt_generate(&model, &path, cache(1), cfg)
     .err()
     .expect("layered cap must reject at load stage");
-  // Load-stage origin: CapExceeded against the load-stage sample budget
-  // (was `container declares N samples (>M cap, ...)` pre-migration).
+  // Load-stage origin: CapExceeded against the load-stage sample budget.
   // Variant-typed so this distinction is machine-checked: a regression
   // that fires the STT-stage fallback would produce OutOfRange instead
   // of CapExceeded.
@@ -453,7 +452,7 @@ fn stt_generate_layered_cap_rejects_at_load_stage_for_wav() {
   let _ = fs::remove_file(&path);
 }
 
-/// Regression (Codex adversarial-review round 1, medium): an empty WAV
+/// Regression: an empty WAV
 /// surfaces as a clear `Error::Backend` from `stt_generate` — the encoder
 /// is NEVER called. Concrete encoders can reasonably assume at least one
 /// mel frame; fabricating a zero-frame mel would silently push the failure
@@ -502,8 +501,7 @@ fn stt_generate_uses_mel_config_override() {
 
 #[test]
 fn stt_generate_threads_mel_config_log_floor() {
-  // **Bundle #64 Codex finding fix**: `MelConfig::log_floor` (AUDIO-5
-  // `LogFloor`) MUST be threaded through `audio_path_to_mel` so a
+  // `MelConfig::log_floor` MUST be threaded through `audio_path_to_mel` so a
   // Kaldi-style model gets the 1e-8 floor instead of the hard-coded
   // Whisper 1e-10. Run the SAME audio through two models differing only
   // in `log_floor` and assert the resulting mel's MIN differs by the
@@ -687,25 +685,26 @@ fn stt_gen_config_defaults_are_whisper_shape() {
   assert!(c.auto_resample(), "auto_resample default = true");
 }
 
-/// Regression — Codex P7 R1 HIGH: the STT load cap must be derived from
+/// Regression: the STT load cap must be derived from
 /// the **source** sample rate, not the model's target rate. A valid
 /// 1.0 s, 44.1 kHz WAV at a 16 kHz target model with
-/// `max_audio_seconds = 1.0` was previously rejected at the load stage
-/// because `load_cap = target_sr * max_audio_seconds = 16 000`
-/// undershot the WAV header's declared 44 100 source samples.
+/// `max_audio_seconds = 1.0` must NOT be rejected at the load stage. A
+/// target-rate cap (`load_cap = target_sr * max_audio_seconds = 16 000`)
+/// would undershoot the WAV header's declared 44 100 source samples and
+/// wrongly reject.
 ///
-/// Post-fix: `audio_path_to_mel` invokes
-/// `load_audio_with_max_seconds(path, 1.0)` which probes the source
-/// sample rate first and computes `load_cap = 44 100 * 1.0 = 44 100`,
-/// so the 44 100-sample header passes the load-stage cap, the source-
-/// duration check (`1.0 s == 1.0 s`) passes, the resample pass runs
-/// down to 16 kHz, and the encoder receives a real mel.
+/// `audio_path_to_mel` invokes `load_audio_with_max_seconds(path, 1.0)`
+/// which probes the source sample rate first and computes
+/// `load_cap = 44 100 * 1.0 = 44 100`, so the 44 100-sample header passes
+/// the load-stage cap, the source-duration check (`1.0 s == 1.0 s`)
+/// passes, the resample pass runs down to 16 kHz, and the encoder
+/// receives a real mel.
 #[test]
 fn audio_path_to_mel_accepts_44_1k_wav_with_16k_model_resample() {
   // 1.0 s @ 44.1 kHz = 44 100 samples. Default model = whisper-style at
-  // 16 kHz target. `max_audio_seconds = 1.0` makes the bug bite (pre-
-  // fix `load_cap = 16 000 < 44 100`, so the header would reject).
-  let path = make_wav("p7_r1_44k_16k_resample", 44_100, 44_100);
+  // 16 kHz target. `max_audio_seconds = 1.0` is where a target-rate cap
+  // would bite (`load_cap = 16 000 < 44 100`, so the header would reject).
+  let path = make_wav("44k_16k_resample", 44_100, 44_100);
   let model = MockSttModel::new(3);
   let cfg = SttGenConfig::default()
     .with_lm(mlxrs::lm::generate::GenConfig::default().with_max_tokens(1))
@@ -714,13 +713,12 @@ fn audio_path_to_mel_accepts_44_1k_wav_with_16k_model_resample() {
 
   // Drive via `encode_audio_file` (the public proxy for
   // `audio_path_to_mel` — same load + resample + log-mel chain, minus
-  // the decode loop). Pre-fix this returned `Err(Backend)` from the
-  // load-stage layered cap. Post-fix it returns `Ok(encoded)` and the
-  // encoder observes a `(80, T)` mel computed off the resampled 16 kHz
-  // samples (so T is the post-resample frame count, ~101 for 1 s at
-  // hop 160).
+  // the decode loop). It returns `Ok(encoded)` and the encoder observes
+  // a `(80, T)` mel computed off the resampled 16 kHz samples (so T is
+  // the post-resample frame count, ~101 for 1 s at hop 160). A
+  // target-rate load cap would instead return `Err(Backend)` here.
   let enc = encode_audio_file(&model, &path, &cfg)
-    .expect("post-fix: 1.0 s 44.1 kHz WAV at 16 kHz model + 1.0 s cap must decode");
+    .expect("1.0 s 44.1 kHz WAV at 16 kHz model + 1.0 s cap must decode");
   assert_eq!(
     enc.shape(),
     vec![1, 1, 1],

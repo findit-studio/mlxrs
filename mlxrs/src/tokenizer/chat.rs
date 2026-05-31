@@ -359,7 +359,7 @@ pub fn override_by_name(name: &str) -> Option<Box<dyn ChatTemplateOverride>> {
 /// `{% generation %}` → `{% if true %}` and `{% endgeneration %}` →
 /// `{% endif %}`, preserving the `{%` / `%}` delimiters and the exact
 /// leading/trailing whitespace-control markers — `-` (strip), `+` (keep), or
-/// none — *byte-identically* (round-6/7/8/9 verified behaviour; see the
+/// none — *byte-identically* (see the
 /// whitespace discussion and [`WsCtrl`]). The `-`/`+`/none marker on each
 /// side is the only part of a block tag that influences whitespace under
 /// `trim_blocks`+`lstrip_blocks`; minijinja 2.19 implements `-`/`+` with
@@ -614,7 +614,7 @@ enum TagKw {
 /// Split one optional leading whitespace-control marker (`-` or `+`) off the
 /// front of a tag body, then ASCII whitespace, returning the marker and the
 /// remaining text. Mirrors jinja2's `block_begin` regex `\{%(\-|\+|)\s*`,
-/// generalizing the round-6/7/8 leading-`-` handling to `-`/`+`/none with
+/// generalizing the leading-`-` handling to `-`/`+`/none with
 /// byte-identical structure (trim, then strip one marker, then trim) so every
 /// already-covered case is preserved verbatim — only the `+` arm is new.
 fn split_lead_ws_ctrl(inner: &str) -> (WsCtrl, &str) {
@@ -631,7 +631,7 @@ fn split_lead_ws_ctrl(inner: &str) -> (WsCtrl, &str) {
 /// Split one optional trailing whitespace-control marker (`-` or `+`) off the
 /// end of a tag body, after trimming trailing ASCII whitespace, returning the
 /// remaining text and the marker. Mirrors jinja2's tail `\s*(\-|\+|)%\}`,
-/// generalizing the round-6/7/8 trailing-`-` handling to `-`/`+`/none with
+/// generalizing the trailing-`-` handling to `-`/`+`/none with
 /// byte-identical structure (trim, then strip one marker) so every
 /// already-covered case is preserved verbatim — only the `+` arm is new.
 fn split_trail_ws_ctrl(inner: &str) -> (&str, WsCtrl) {

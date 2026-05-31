@@ -165,7 +165,7 @@ fn token_window(ids: &[u32]) -> Result<Array> {
 /// temporary slices would materialize the slice's output buffer, not the
 /// stored buffer the next chunk's `update` reads and extends, so the live
 /// graph could still chain across chunks and peak memory would not be bounded
-/// (the Codex finding this hook closes). Evaluating the live arrays via the
+/// (the hazard this hook closes). Evaluating the live arrays via the
 /// `&mut` hook is faithful to mlx-lm's `mx.eval([c.state ...])` (per-chunk
 /// full materialization of the live cache) without that hazard.
 ///
@@ -196,7 +196,7 @@ fn materialize_caches(cache: &mut [Box<dyn KvCache>]) -> Result<()> {
 /// to a `generate_step` run that prefilled the same prompt. No `logits` are
 /// kept (every `forward` return is dropped — the chunk only fills the cache).
 ///
-/// ## Why the per-chunk barrier (Codex finding — memory-bounded prefill)
+/// ## Why the per-chunk barrier (memory-bounded prefill)
 ///
 /// `mlxrs::Array` is lazy, so without [`materialize_caches`] the chunk loop
 /// would accumulate a single lazy graph spanning **every** chunk and only
@@ -373,7 +373,7 @@ pub fn cache_prompt_ids<M: Model>(
   );
   // Atomic save: write to a same-directory tempfile, fsync, then rename over
   // the destination — a crash / IO error mid-save never leaves a partial or
-  // corrupt cache at `out_path` (Codex finding). Mirrors `audio::io::save_wav`.
+  // corrupt cache at `out_path`. Mirrors `audio::io::save_wav`.
   save_prompt_cache_atomic(out_path, &cache, &metadata)?;
 
   Ok(CachePromptInfo {
@@ -480,7 +480,7 @@ fn open_excl_temp_safetensors(final_path: &Path, max_retries: u32) -> Result<Pat
 /// `save_prompt_cache` calls `mlx_save_safetensors` straight onto the final
 /// path (no temp / fsync / rename), so a crash or IO error mid-save would
 /// leave a partial/corrupt `.safetensors` at the destination — clobbering a
-/// previously valid cache (Codex finding). This mirrors `audio::io::save_wav`'s
+/// previously valid cache. This mirrors `audio::io::save_wav`'s
 /// atomic discipline: write to a same-directory `O_EXCL` tempfile, fsync it to
 /// durable storage, restore the destination's prior permissions, then
 /// `fs::rename` it over the destination (atomic-within-fs). On ANY failure the
@@ -644,7 +644,7 @@ mod tests {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
       self
     }
-    // KVC-10: `reference_class_name` is REQUIRED (no default) — forward
+    // `reference_class_name` is REQUIRED (no default) — forward
     // to the wrapped cache so persistence/dispatch sees the inner's name.
     fn reference_class_name(&self) -> &'static str {
       self.inner.reference_class_name()
@@ -804,7 +804,7 @@ mod tests {
   /// [`RotatingKvCache`] whose ring buffer has *over-allocated* (`offset <
   /// buffer_len`, the regime an `S == 1` `prefill_step_size == 1` update grows
   /// the ring into) it must materialize the genuine stored ring buffers, not
-  /// the offset-length `state()` serialization slices (the Codex finding).
+  /// the offset-length `state()` serialization slices.
   /// This wraps a `RotatingKvCache` and records, on each `materialize()` call,
   /// whether the full stored ring (`nbytes()`) exceeded the offset-length
   /// serialized `state()` — i.e. the over-allocated regime — proving the
@@ -864,7 +864,7 @@ mod tests {
       fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
       }
-      // KVC-10: `reference_class_name` is REQUIRED (no default) — forward
+      // `reference_class_name` is REQUIRED (no default) — forward
       // to the wrapped rotating cache so persistence/dispatch sees the
       // inner's name.
       fn reference_class_name(&self) -> &'static str {
@@ -1054,7 +1054,7 @@ mod tests {
     );
   }
 
-  /// Atomic-save crash safety (Codex finding): when the save FAILS, a
+  /// Atomic-save crash safety: when the save FAILS, a
   /// previously valid cache at the destination is left **intact** and no
   /// partial tempfile remains. We first write a good cache, then point a
   /// second save into a directory made read-only so mlx's write into the
@@ -1149,7 +1149,7 @@ mod tests {
     let _ = fs::remove_dir_all(&dir);
   }
 
-  /// Atomic-save crash safety (Codex finding), fresh-path variant: a FAILED
+  /// Atomic-save crash safety, fresh-path variant: a FAILED
   /// save to a destination that did not previously exist leaves it **absent**
   /// (no partial file). Injects failure via a read-only parent directory.
   #[cfg(unix)]

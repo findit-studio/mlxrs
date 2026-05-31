@@ -5,7 +5,7 @@
 //! `MossAudioTokenizer`, `Vocos`, `StepAudio2Token2Wav`, etc.) — every
 //! codec the upstream package re-exports from its `models/` directory.
 //!
-//! Per the project's [no per-model arch porting][noarch] rule, mlxrs
+//! Per the project's no per-model arch porting rule, mlxrs
 //! ships **no** concrete codec model implementations: each codec (DAC,
 //! Encodec, Mimi, Vocos, …) is per-architecture and excluded. The
 //! single submodule here is the shared support surface every
@@ -26,7 +26,6 @@
 //! every audio domain.
 //!
 //! [codec-init]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/codec/__init__.py
-//! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 
 pub mod load;
 

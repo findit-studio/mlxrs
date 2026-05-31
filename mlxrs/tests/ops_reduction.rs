@@ -1,4 +1,4 @@
-//! Phase 4 Branch A: reduction op happy-path tests.
+//! Reduction op happy-path tests.
 //!
 //! Mean / max / min / prod each get a full-reduction scalar test plus an
 //! axis-reduction test that exercises the `_axes` form. Empty-axes contract
@@ -36,7 +36,7 @@ fn mean_axes_empty_promotes_int_to_float() {
   // mean over no axes is the identity in shape/value, but `mean` always
   // promotes int inputs to float — both the empty and non-empty paths must
   // agree on dtype. The previous short-circuit-via-try_clone preserved the
-  // input dtype, splitting the contract (Codex PR #6 finding).
+  // input dtype, splitting the contract.
   let a = Array::from_slice(&[1_i32, 2, 3, 4], &(2, 2)).unwrap();
   assert_eq!(a.dtype().unwrap(), mlxrs::Dtype::I32);
   let r_empty = a.mean_axes(&[], false).unwrap();
@@ -82,7 +82,7 @@ fn max_axes_keepdims_preserves_axis() {
 fn max_axes_empty_on_zero_size_errors() {
   // MLX checks size==0 BEFORE the no-axes early return for max/min, so empty
   // axes on a zero-size array must error (not silently return a clone).
-  // Locks in the Codex PR #6 round-2 fix. Same contract for min_axes.
+  // Same contract for min_axes.
   let a = Array::from_slice::<f32>(&[], &[0i32]).unwrap();
   assert_eq!(a.size(), 0);
   // mlx C++ surfaces `[max]` / `[min]` "Cannot reduce zero size array …"

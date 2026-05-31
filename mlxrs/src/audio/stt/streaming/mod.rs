@@ -34,13 +34,11 @@
 //!
 //! [swift-session]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioSTT/Streaming/StreamingInferenceSession.swift
 //!
-//! Per the project's [no per-model arch porting][noarch] rule, mlxrs
-//! ships **no** concrete encoder / decoder implementations:
+//! mlxrs ships **no** concrete encoder / decoder implementations:
 //! per-architecture encoders / decoders implement the streaming traits
 //! and pass themselves into the streaming session.
 //!
 //! [swift-dir]: https://github.com/Blaizzy/mlx-audio-swift/tree/main/Sources/MLXAudioSTT/Streaming
-//! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 
 pub mod encoder;
 pub mod mel_spectrogram;

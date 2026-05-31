@@ -55,8 +55,8 @@ fn ceil_floor_by_factor_edges() {
 
 #[test]
 fn factor_helpers_reject_overflow_instead_of_panic_or_wrap() {
-  // Regression for the Codex "factor rounding can overflow before
-  // validation" finding. `round/ceil/floor_by_factor(i64::MAX, 28)` would
+  // Regression: factor rounding can overflow before
+  // validation. `round/ceil/floor_by_factor(i64::MAX, 28)` would
   // compute `quotient * 28`, which overflows i64: debug builds PANIC,
   // release WRAPS negative. All three must instead return a recoverable
   // Err (NOT a panic, NOT a wrapped/garbage value).
@@ -84,7 +84,7 @@ fn factor_helpers_reject_overflow_instead_of_panic_or_wrap() {
 
 #[test]
 fn smart_resize_rejects_overflow_dimension() {
-  // The Codex finding's exact silent-corruption scenario: a positive
+  // The exact silent-corruption scenario: a positive
   // near-i64::MAX height/width with factor=28. Before the fix this
   // overflowed inside `round_by_factor` (panic debug / wrap release), and
   // on release the wrapped-negative bar was promoted by `factor.max(..)` to
@@ -107,8 +107,8 @@ fn smart_resize_rejects_overflow_dimension() {
 
 #[test]
 fn smart_resize_min_cell_guard_exact_i128_no_f64_bypass_no_overflow() {
-  // Regression for the Codex "inexact/overflowing factor-square validation"
-  // finding (3rd round on the min-cell guard). The guard now compares
+  // Regression: inexact/overflowing factor-square validation
+  // on the min-cell guard. The guard now compares
   // `factor*factor` to `max_pixels` in EXACT i128, never f64 (precision
   // bypass) or unchecked i64 (debug overflow panic in the error message).
 
@@ -167,7 +167,7 @@ fn smart_resize_min_cell_guard_exact_i128_no_f64_bypass_no_overflow() {
 
 #[test]
 fn smart_resize_min_cell_guard_typed_payload_preserves_i128_value() {
-  // Regression for Codex R2 finding (medium): the previous migration cast
+  // Regression: the previous migration cast
   // `min_cell` (i128, up to ~2^126) to `u64` for `CapExceededPayload`'s
   // `observed` field, which truncates silently on any positive `i64` factor
   // whose square overflows `u64`. Concretely, `factor = 1 << 32` yields
@@ -221,8 +221,8 @@ fn smart_resize_min_cell_guard_typed_payload_preserves_i128_value() {
 
 #[test]
 fn smart_resize_beta_path_rejects_outside_exact_f64_domain() {
-  // Regression for the Codex "beta path diverges from python for huge dims"
-  // finding: when `height * width` (exact, i128) OR `max_pixels` exceeds the
+  // Regression: the beta path can diverge from python for huge dims
+  // when `height * width` (exact, i128) OR `max_pixels` exceeds the
   // f64 exact-integer range 2^53, the naive `f64 / f64` ratio double-rounds
   // and can disagree with python's `int / int -> float` in the last bit.
   // Faithfully bit-matching python for arbitrary magnitudes would need a
@@ -274,8 +274,8 @@ fn smart_resize_beta_path_accepts_just_under_exact_f64_domain() {
 
 #[test]
 fn smart_resize_scale_up_accepts_huge_max_pixels_sentinel() {
-  // Regression for the Codex "scale-up over-rejects on huge max_pixels"
-  // finding. The scale-UP branch's `beta` ratio is `min_pixels / (height *
+  // Regression: scale-up must not over-reject on huge max_pixels.
+  // The scale-UP branch's `beta` ratio is `min_pixels / (height *
   // width)` — `max_pixels` is NOT an operand. A combined `max_pixels`-keyed
   // domain guard would over-reject this case even though python returns
   // (56, 56) exactly; the fix splits `check_beta_domain` per branch so
@@ -438,7 +438,7 @@ fn smart_resize_rejects_impossible_budget() {
   // factor=28 -> the smallest legal output is a 28x28 = 784-pixel square.
   // A max_pixels of 1 cannot contain it, so there is no positive
   // factor-aligned solution. The python reference silently scales to
-  // (0, 0); we reject. (Regression for the zero-dim Codex finding.)
+  // (0, 0); we reject. (Regression for the zero-dim case.)
   assert!(
     smart_resize(28, 28, 28, 1, 1).is_err(),
     "max_pixels=1 < 28*28 -> no positive factor-aligned size -> Err"
@@ -796,7 +796,7 @@ fn process_frames_empty_is_err() {
   assert!(process_frames(&frames, &cfg).is_err());
 }
 
-// ---------- process_frames cfg.layout rejection (Codex r1 high) ----------
+// ---------- process_frames cfg.layout rejection ----------
 //
 // `process_frames` documents a `[T, H, W, 3]` stack contract. Applying a
 // planar `Layout` per frame inside `preprocess` would silently break that

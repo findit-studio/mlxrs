@@ -21,7 +21,7 @@
 //! (`adapter_config.json` + `adapters.safetensors`) to a base model's weight
 //! map (mlx-lm `tuner/{lora,dora,utils}.py`, swift `Adapters/LoRA/`); the
 //! [`crate::lm::fuse::fuse`] driver wires `load_adapters` + the per-layer
-//! [`fuse`](crate::lm::lora::LoraLayer::fuse) + the F6 save into a one-call
+//! [`fuse`](crate::lm::lora::LoraLayer::fuse) + the save into a one-call
 //! "fold the adapter into the base model and write the result as a
 //! standalone checkpoint" pipeline (mlx-lm `fuse.py`).
 //!
@@ -52,8 +52,8 @@ pub mod sample;
 pub mod session;
 pub mod speculative;
 pub mod stop;
-/// Grammar-constrained decoding — port of `mlx_vlm/structured.py` (V6,
-/// issue #180). [`LLGuidanceLogitsProcessor`] +
+/// Grammar-constrained decoding — port of `mlx_vlm/structured.py`
+/// (issue #180). [`LLGuidanceLogitsProcessor`] +
 /// [`build_json_schema_logits_processor`] mask each step's logits down
 /// to the tokens that keep the next sequence valid against a JSON
 /// schema / regex / Lark grammar. Backed by the

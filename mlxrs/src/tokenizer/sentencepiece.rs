@@ -24,11 +24,10 @@
 //! `prost-build` / a vendored `.proto` file would pull in a non-trivial
 //! transitive dep tree for parsing only the `pieces` and
 //! `trainer_spec.model_type` subset of the full SentencePiece schema.
-//! See the [hand-rolled vs. `prost` decision][decision] in this module's
+//! See the hand-rolled vs. `prost` decision in this module's
 //! commit message.
 //!
 //! [swift-ref]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioCore/SentencePieceTokenizer.swift
-//! [decision]: https://github.com/uqio/mlxrs/pulls?q=AUDIO-A14
 //!
 //! # Example
 //!

@@ -69,10 +69,9 @@
 //!   are **excluded** per the project's local-only policy — see
 //!   [`load_dataset`]'s `hf://`-path rejection. Mirrors the same fence
 //!   already applied in [`crate::lm::lora`] and [`crate::lm::factory`].
-//! - The training-loop side (`tuner/trainer.py`) is blocked on autograd
-//!   (the A4 milestone); this module ships the data side only.
-//! - Per-model arch hooks are out of scope — see the project memory rule on
-//!   no per-model arch porting.
+//! - The training-loop side (`tuner/trainer.py`) is blocked on autograd;
+//!   this module ships the data side only.
+//! - Per-model arch hooks are out of scope (no per-model arch porting).
 //!
 //! # Conventions
 //!
@@ -1032,7 +1031,7 @@ pub fn load_dataset<'a>(
 /// yielding, so a single mid-read-grown gigantic line (or a hostile
 /// stream containing one giant unterminated line) would allocate
 /// arbitrarily many bytes BEFORE the post-yield cap check could fire
-/// → OOM. The fix is to bound EACH per-iteration read at
+/// → OOM. The manual `read_until` bounds EACH per-iteration read at
 /// `remaining + 1` bytes via `(&mut reader).take(remaining + 1)`:
 /// this enforces the cap on the read ITSELF (the `BufReader` cannot
 /// pull more than `remaining + 1` bytes into the line buffer per
@@ -1208,8 +1207,8 @@ mod tests {
   /// the helper consumed from the inner reader. Used by
   /// `load_dataset_cap_enforced_on_single_giant_line` to PROVE the
   /// `take(remaining + 1)` allocation cap held — i.e. the helper read at
-  /// most `cap + 1` bytes before erroring, NOT the full input. The old
-  /// `BufRead::lines()` impl would have pulled the entire line into a
+  /// most `cap + 1` bytes before erroring, NOT the full input. A
+  /// `BufRead::lines()` impl would pull the entire line into a
   /// `String` before yielding, so this counter distinguishes the two
   /// implementations.
   ///
@@ -1869,10 +1868,10 @@ mod tests {
     assert_ne!(first.0, second.0);
   }
 
-  // Codex round-2 [high]: `File::open` blocks read-only on a FIFO
+  // `File::open` blocks read-only on a FIFO
   // until a writer appears; the `meta.is_file()` rejection runs AFTER
-  // the open, so an adversarial FIFO at the dataset path used to hang
-  // the loader indefinitely. The fix opens with
+  // the open, so an adversarial FIFO at the dataset path could hang
+  // the loader indefinitely. The loader opens with
   // `O_NONBLOCK | O_CLOEXEC` (mirroring the rest of mlxrs's hardened
   // loaders) so the open returns immediately and the post-open
   // `is_file()` check rejects the non-regular target before any read
@@ -1881,7 +1880,7 @@ mod tests {
   // "not a regular file" message PROMPTLY (within a 2 s budget).
   //
   // Determinism / non-flakiness: the loader runs on a worker thread
-  // and is joined with a 2 s budget. With the fix, the open is
+  // and is joined with a 2 s budget. With `O_NONBLOCK`, the open is
   // instantaneous (sub-millisecond), so the budget is never
   // approached. If the `O_NONBLOCK` open regresses, the blocking
   // `File::open()` wedges on the writer-less FIFO → the budget
@@ -1946,20 +1945,20 @@ mod tests {
     std::fs::remove_dir_all(&dir).ok();
   }
 
-  // Codex round-2 [high]: `BufRead::lines()` reads a FULL line into a
+  // `BufRead::lines()` reads a FULL line into a
   // `String` BEFORE yielding, so a single mid-read-grown gigantic
-  // line bypasses the cumulative cap → OOM. The fix replaces
-  // `lines()` with manual `read_until(b'\n')` plus a per-iteration
-  // `take(remaining + 1)` so the cap is enforced on the READ itself —
+  // line bypasses the cumulative cap → OOM. The reader uses manual
+  // `read_until(b'\n')` plus a per-iteration `take(remaining + 1)`
+  // instead of `lines()`, so the cap is enforced on the READ itself —
   // the buffered reader cannot allocate more than `remaining + 1`
   // bytes per iteration, regardless of how long the underlying
   // (unterminated) line is.
   //
   // This test drives `read_jsonl_with_cap` with a 40-byte cap and a
-  // SINGLE 100-byte line containing no newline. Before the fix the
-  // reader would allocate all 100 bytes; after the fix it allocates
-  // at most `cap + 1 = 41` bytes before the cap error fires. We
-  // assert both the cap error and (via `line_buf` indirectly through
+  // SINGLE 100-byte line containing no newline. A `lines()` reader
+  // would allocate all 100 bytes; the `read_until` + `take` reader
+  // allocates at most `cap + 1 = 41` bytes before the cap error fires.
+  // We assert both the cap error and (via `line_buf` indirectly through
   // error message structure) that the implementation is operating
   // under the truncation.
   #[test]
@@ -1997,17 +1996,17 @@ mod tests {
 
     // PROVE the `take(remaining + 1)` allocation cap held — at most
     // `cap + 1 = 41` bytes consumed from the underlying reader,
-    // regardless of how long the unterminated line is. The OLD
-    // `BufRead::lines()` impl would have consumed all 100 bytes
+    // regardless of how long the unterminated line is. A
+    // `BufRead::lines()` impl would consume all 100 bytes
     // before erroring (since `lines()` reads a full line into a
     // `String` BEFORE yielding). This assertion distinguishes the
     // safe-allocation `read_until` + `take` path from the OOM-prone
-    // `lines()` path, which is the actual subject of the R2 fix.
+    // `lines()` path it replaces.
     let consumed = counting.consumed();
     assert!(
       consumed <= (cap as usize) + 1,
       "take(remaining + 1) allocation cap violated: consumed {consumed} bytes from a 100-byte \
-       fixture with cap={cap} (expected <= {}); the old lines() impl would have consumed 100",
+       fixture with cap={cap} (expected <= {}); a lines() impl would consume 100",
       cap as usize + 1,
     );
 

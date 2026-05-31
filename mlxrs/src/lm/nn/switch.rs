@@ -135,8 +135,8 @@ impl SwitchLinear {
     }
     if let Some(b) = &bias {
       let b_shape = b.shape();
-      // Split the bias-shape check into the precise taxonomy (Codex
-      // 2026-05-27 R2): a rank-1 or rank-3 bias must surface as
+      // Split the bias-shape check into the precise taxonomy: a rank-1 or
+      // rank-3 bias must surface as
       // `RankMismatch`, not `ShapePairMismatch` — `ShapePairMismatchPayload`
       // is documented as distinct from `RankMismatchPayload` (rank differs).
       // Only after the ranks match do we compare the full `[E, O]` shape.
@@ -165,7 +165,7 @@ impl SwitchLinear {
   ///
   /// The field is private specifically so the constructor's rank-3 shape
   /// validation is the only construction path; see the struct doc for the
-  /// invariant rationale. Named `weight_ref` per §3 (non-Copy `&Array`
+  /// invariant rationale. Named `weight_ref` (non-Copy `&Array`
   /// accessor). Lazy — does not evaluate.
   pub fn weight_ref(&self) -> &Array {
     &self.weight
@@ -426,7 +426,7 @@ impl QuantizedSwitchLinear {
 
     // `quant_biases`, when present, shares the per-group `[E, O, n_groups]`
     // layout with `scales` (`affine_quantize` produces both with the same
-    // shape, `mlx/ops.cpp:4793-4798`). Split the check (Codex 2026-05-27 R2)
+    // shape, `mlx/ops.cpp:4793-4798`). Split the check
     // so a divergent RANK surfaces as `RankMismatch` rather than being
     // collapsed into `ShapePairMismatch` — the latter is documented as
     // same-rank shape disagreement.
@@ -511,8 +511,8 @@ impl QuantizedSwitchLinear {
 
     if let Some(b) = &bias {
       let b_shape = b.shape();
-      // Split the bias-shape check into the precise taxonomy (Codex
-      // 2026-05-27 R2): a rank-1 or rank-3 bias surfaces as
+      // Split the bias-shape check into the precise taxonomy: a rank-1 or
+      // rank-3 bias surfaces as
       // `RankMismatch`, not `ShapePairMismatch`. Only after the ranks
       // match do we compare the full `[E, O]` shape.
       if b_shape.len() != 2 {
@@ -547,7 +547,7 @@ impl QuantizedSwitchLinear {
   ///
   /// The field is private specifically so the constructor's rank-3 shape
   /// validation is the only construction path; see the struct doc for the
-  /// invariant rationale. Named `weight_ref` per §3 (non-Copy `&Array`
+  /// invariant rationale. Named `weight_ref` (non-Copy `&Array`
   /// accessor). Lazy — does not evaluate.
   pub fn weight_ref(&self) -> &Array {
     &self.weight
@@ -558,7 +558,7 @@ impl QuantizedSwitchLinear {
   /// The field is private to preserve the `(weight, scales, quant_biases)`
   /// triple's internal consistency — they're only well-formed when produced
   /// together by [`ops::quantized::quantize`](crate::ops::quantized::quantize).
-  /// Named `scales_ref` per §3 (non-Copy `&Array` accessor). Lazy — does not
+  /// Named `scales_ref` (non-Copy `&Array` accessor). Lazy — does not
   /// evaluate.
   pub fn scales_ref(&self) -> &Array {
     &self.scales
@@ -718,7 +718,7 @@ fn check_routing_indices(x: &Array, indices: &Array) -> Result<()> {
   // explicit top-`k`, ≥ 1) beyond `x`'s batch dims, and leading dims equal to
   // them.
   //
-  // Taxonomy (Codex 2026-05-27): split the prior single `ShapePairMismatch`
+  // Taxonomy: split the prior single `ShapePairMismatch`
   // into the precise violation class so a `[N]`-vs-`[N]` ambiguous-rank case
   // can't surface as "expected [N], got [N]":
   //   1. `idx_shape.len() != x_batch.len() + 1` ⇒ `RankMismatch`
@@ -1424,7 +1424,7 @@ mod tests {
     assert!(matches!(err, crate::Error::ShapePairMismatch(_)));
   }
 
-  /// Bias-rank-mismatch split (Codex 2026-05-27 R2): a rank-1 (or rank-3)
+  /// Bias-rank-mismatch split: a rank-1 (or rank-3)
   /// bias must surface as `RankMismatch`, not as `ShapePairMismatch`, so
   /// typed-error consumers can distinguish the rank-vs-shape categories.
   /// Pre-split, every malformed-rank bias was collapsed into
@@ -1574,7 +1574,7 @@ mod tests {
     assert!(matches!(err, crate::Error::ShapePairMismatch(_)));
   }
 
-  /// Bias-rank-mismatch split (Codex 2026-05-27 R2): a rank-1 bias on the
+  /// Bias-rank-mismatch split: a rank-1 bias on the
   /// QUANTIZED layer must surface as `RankMismatch`, not as
   /// `ShapePairMismatch` — same taxonomy as the dense [`SwitchLinear`]
   /// sibling.
@@ -1604,7 +1604,7 @@ mod tests {
   }
 
   /// `quant_biases` rank must match `scales` rank — split out from the
-  /// shape-pair check (Codex 2026-05-27 R2): a divergent rank now surfaces
+  /// shape-pair check: a divergent rank now surfaces
   /// as `RankMismatch`, not `ShapePairMismatch`. Pre-split, `qb_shape !=
   /// s_shape` collapsed both rank and shape divergences into the same
   /// variant.
@@ -1673,7 +1673,7 @@ mod tests {
     }
   }
 
-  // ─── QuantizedSwitchLinear::from_parts structural-invariant tests (Codex R4) ───
+  // ─── QuantizedSwitchLinear::from_parts structural-invariant tests ───
   //
   // Mirrors the `classify_triple` `match (q.mode, b_opt)` mode-arity pattern
   // (`mlxrs/src/lm/quant.rs:613-640`): validates STRUCTURAL invariants on the
@@ -1893,7 +1893,7 @@ mod tests {
     assert_eq!(layer.mode(), "mxfp4");
   }
 
-  // ─── SwitchLinear / QuantizedSwitchLinear field-visibility regressions (Codex R3) ───
+  // ─── SwitchLinear / QuantizedSwitchLinear field-visibility regressions ───
 
   /// `SwitchLinear`'s `weight` / `bias` are PRIVATE fields with read-only
   /// public accessors. This test exercises the accessors and — by virtue of
@@ -2378,7 +2378,7 @@ mod tests {
     assert!(indices.size() >= 64, "test must exercise the sorted path");
     let err = glu.forward(&x, &indices).unwrap_err();
     // x=[N, D] ⇒ x_batch=[N], expected_rank=2; indices=[N] is rank-1 (missing
-    // the trailing k axis) ⇒ now categorised as RankMismatch (Codex 2026-05-27)
+    // the trailing k axis) ⇒ now categorised as RankMismatch
     // rather than a misleading "expected [N], got [N]" ShapePairMismatch.
     match err {
       crate::Error::RankMismatch(payload) => {
@@ -2536,7 +2536,7 @@ mod tests {
     let indices = Array::from_slice::<u32>(&idx_data, &(n,)).unwrap();
     assert!(indices.size() >= 64, "test must exercise the sorted path");
     let err = mlp.forward(&x, &indices).unwrap_err();
-    // Codex 2026-05-27: missing-k-axis case ⇒ RankMismatch (was a misleading
+    // Missing-k-axis case ⇒ RankMismatch (was a misleading
     // ShapePairMismatch with expected==actual).
     match err {
       crate::Error::RankMismatch(payload) => {
@@ -2570,7 +2570,7 @@ mod tests {
     let indices = Array::from_slice::<u32>(&idx_data, &(b, s)).unwrap();
     assert!(indices.size() >= 64, "test must exercise the sorted path");
     let err = mlp.forward(&x, &indices).unwrap_err();
-    // Codex 2026-05-27: missing-k-axis case ⇒ RankMismatch.
+    // Missing-k-axis case ⇒ RankMismatch.
     match err {
       crate::Error::RankMismatch(payload) => {
         assert_eq!(payload.actual(), 2, "rank-2 indices ⇒ actual rank 2");

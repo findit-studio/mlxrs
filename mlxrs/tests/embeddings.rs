@@ -87,9 +87,9 @@ fn last_token_pooling_selects_last_real_token() {
   assert_eq!(pooled.to_vec::<f32>().unwrap(), vec![2.0, 2.0]);
 }
 
-// ───────── F1: last_token_pooling left/mixed-pad correctness ─────────
+// ───────── last_token_pooling left/mixed-pad correctness ─────────
 //
-// Codex round-2 [high]: the old `sum(mask)-1` index is correct only for
+// The old `sum(mask)-1` index is correct only for
 // RIGHT-padding; a left-padded row `[0,0,1,1]` gathered the padding at
 // index 1 instead of the last real token at index 3 — silent wrong
 // embeddings for left-padded last-token models (Qwen3-embed). The impl
@@ -589,7 +589,7 @@ fn st_config_concatenated_list_mode_rejected() {
 
 #[test]
 fn st_config_present_malformed_pooling_mode_rejected() {
-  // C6 (Copilot review 4307622782, #3256688299): a present-but-non-
+  // A present-but-non-
   // string/non-array `pooling_mode` (null / bool / number / object).
   // python `pool_by_config` does `mode = cfg["pooling_mode"]` and falls
   // through to `raise ValueError(f"Unknown pooling mode {mode!r}...")`
@@ -630,7 +630,7 @@ fn st_config_present_malformed_pooling_mode_rejected() {
 
 #[test]
 fn st_config_present_invalid_dimension_rejected() {
-  // C7 (Copilot review 4307622782, #3256688310): a present-but-invalid
+  // A present-but-invalid
   // `word_embedding_dimension`/`embedding_dimension` (negative,
   // fractional, non-numeric, > usize, or 0) previously went `as_u64()` →
   // `None` → treated as ABSENT → matryoshka truncation silently SKIPPED,
@@ -773,9 +773,9 @@ fn pooling_strategy_from_mode() {
   assert!(PoolingStrategy::from_mode("xyzzy").is_err());
 }
 
-// ───────────── F1: config-driven CLS must be mask-aware ─────────────
+// ───────────── config-driven CLS must be mask-aware ─────────────
 //
-// Codex round-1 [high]: the dispatcher routed `PoolingStrategy::Cls` to
+// The dispatcher routed `PoolingStrategy::Cls` to
 // `first_token_pooling` (strict token-0, ignores the mask), so a
 // LEFT-PADDED batch under `Cls` (incl. via ST config) silently embedded
 // the pad token. python `mlx-embeddings` `pool_by_config` mode `"cls"`
@@ -893,9 +893,9 @@ fn cls_and_first_coincide_when_no_left_padding() {
   ));
 }
 
-// ───────────── F2: bound the ST config read (OOM guard) ─────────────
+// ───────────── bound the ST config read (OOM guard) ─────────────
 //
-// Codex round-1 [medium]: `pooling_from_st_config_path` did a raw
+// `pooling_from_st_config_path` did a raw
 // `std::fs::read` on an untrusted model dir → unbounded allocation. Now
 // it stats first and rejects > 1 MiB with a recoverable Error::Backend
 // (no OOM/panic). A normal small config still parses.
@@ -935,7 +935,7 @@ fn st_config_path_rejects_oversize_file_without_oom() {
   std::fs::remove_dir_all(&dir).ok();
 }
 
-// Codex round-2 [medium] completeness: the round-1 stat-then-read was
+// The prior stat-then-read was
 // TOCTOU/non-regular-file bypassable (FIFO/device/symlink report len 0,
 // then `fs::read` streams unbounded). The path now opens ONCE, rejects a
 // non-regular file from the opened handle's metadata, and reads via
@@ -1009,7 +1009,7 @@ fn st_config_path_accepts_file_at_exact_cap() {
   std::fs::remove_dir_all(&dir).ok();
 }
 
-// Codex round-3 [medium]: a *directory* at `config.json` (round-2 test)
+// A *directory* at `config.json`
 // makes `open()` return immediately, so it never exercised the one
 // non-regular file whose blocking `open()` HANGS: a FIFO. On Unix a
 // read-only blocking `open()` of a writer-less FIFO blocks forever —
@@ -1092,7 +1092,7 @@ fn st_config_path_fifo_returns_err_without_hang() {
   std::fs::remove_dir_all(&dir).ok();
 }
 
-// Codex round-6 [high]: round-3 added `O_NOFOLLOW` to the open flags,
+// An earlier change added `O_NOFOLLOW` to the open flags,
 // which makes `open()` fail (ELOOP) on a symlink at `config.json`. But
 // HuggingFace Hub caches store `.../snapshots/<rev>/1_Pooling/config.json`
 // as a *symlink into `.../blobs/<hash>`* — the dominant real cached-model
@@ -1146,9 +1146,9 @@ fn st_config_path_follows_symlink_to_regular_file() {
   std::fs::remove_dir_all(&dir).ok();
 }
 
-// ───────────── F3: validate rank before indexing shape ─────────────
+// ───────────── validate rank before indexing shape ─────────────
 //
-// Codex round-1 [medium]: pooling helpers indexed shape[0]/shape[2]
+// Pooling helpers indexed shape[0]/shape[2]
 // (and mask shape) before validating rank — a 1-D/2-D token_embeddings
 // or wrong-rank mask panicked a safe public API. Each public helper now
 // validates rank-3 token_embeddings + rank-2 mask up front, returning
@@ -1242,7 +1242,7 @@ fn pooling_helpers_reject_mismatched_batch_or_seq_dims() {
   ));
 }
 
-// ════════════════ Codex round-4: f16 / bf16 dtype fidelity ════════════════
+// ════════════════ f16 / bf16 dtype fidelity ════════════════
 //
 // SYSTEMIC dtype bug guard. Before the fix, f32 constant `Array`s
 // (`eps`/`-inf`/`0` floors, and `max_pooling`'s f32 mask cast) force-
@@ -1682,7 +1682,7 @@ fn cosine_similarity_matrix_f16_bf16_preserve_dtype() {
 #[test]
 fn cosine_similarity_scalar_f16_bf16_returns_similarity() {
   // Regression: scalar `cosine_similarity` extracts with `item::<f32>()`,
-  // which is STRICT (no implicit cast). After the round-4 dtype-preserving
+  // which is STRICT (no implicit cast). With the dtype-preserving
   // fixes, the dot/norm/divide stay in the INPUT dtype, so for f16/bf16
   // inputs `sim` was f16/bf16 → `item::<f32>()` => Err(DtypeMismatch).
   // The fix widens ONLY the final scalar to f32 (lossless, python computes
@@ -1694,7 +1694,7 @@ fn cosine_similarity_scalar_f16_bf16_returns_similarity() {
   // f16 ≤2048 and bf16 ≤256). python-parity reference = the SAME cosine
   // computed by the crate at f32 then snapped to the target dtype grid
   // (`f32→half→f32`), compared at the dtype's own ULP via `half_close`
-  // (the rigorous non-flaky bound used by the round-4 divide-path tests).
+  // (the rigorous non-flaky bound used by the divide-path tests).
   let av = [3.0_f32, 4.0];
   let bv = [4.0_f32, 3.0];
 
@@ -1760,7 +1760,7 @@ fn cosine_similarity_scalar_f32_unchanged_after_final_cast() {
 
 // ---- scalar cosine_similarity: rank/length precondition ----
 //
-// Codex round-7: scalar `cosine_similarity` documented same-length 1-D
+// Scalar `cosine_similarity` documented same-length 1-D
 // vectors but never validated rank/shape before `multiply(a, b)`. MLX
 // broadcasting let a length-1 (or otherwise mismatched) `b` broadcast
 // across a longer `a` while `norm(b)` used the original 1-element vector,
@@ -1820,9 +1820,9 @@ fn cosine_similarity_rejects_non_rank1() {
 
 // ---- scalar cosine_similarity: zero-norm / length-0 → finite 0.0 ----
 //
-// Copilot review 4307433657 (#3256523014): `cosine_similarity` divided
+// `cosine_similarity` divided
 // `dot` by the raw `||a||*||b||` with no eps floor, so a zero vector (or a
-// valid length-0 input the round-7 rank/length validator allows) returned
+// valid length-0 input the rank/length validator allows) returned
 // NaN/Inf — silent retrieval/ranking corruption, and inconsistent with
 // `cosine_similarity_matrix` (eps-guarded `l2_normalize`). The denominator
 // is now eps-floored (`DEFAULT_NORMALIZE_EPS`, dtype-aware, same guard as
@@ -1855,7 +1855,7 @@ fn cosine_similarity_zero_vector_is_finite_zero() {
 
 #[test]
 fn cosine_similarity_length_zero_is_finite() {
-  // The round-7 validator treats `(0,)` vs `(0,)` as equal-length rank-1
+  // The validator treats `(0,)` vs `(0,)` as equal-length rank-1
   // (rank == 1 each, lengths 0 == 0) so it passes through; the empty dot
   // sums to 0 and both norms are 0 → without the floor this was 0/0 = NaN.
   // With the eps floor it is a finite 0.0.
@@ -1874,14 +1874,14 @@ fn cosine_similarity_length_zero_is_finite() {
 
 #[test]
 fn cosine_similarity_zero_vector_f16_bf16_is_finite_zero() {
-  // C3 (Copilot review 4307622782, #3256688255): the prior eps-floor used
+  // The prior eps-floor used
   // `scalar_like(1e-9, &norm)`, casting `1e-9` into the NORM dtype. For
   // f16/bf16 `1e-9` is below the half subnormal floor → rounds to `0.0`,
   // so a zero f16/bf16 vector still did `0 / (0 * ||b||) = 0/0 = NaN` —
   // the documented finite-0.0 guarantee was FALSE for halves (the
   // f32-only zero-vector test masked it). The fix computes the final
   // ratio in f32 with a REAL f32 `1e-9` floor, so the guarantee now holds
-  // for f16 AND bf16 too. This is the exact gap C3 identifies.
+  // for f16 AND bf16 too. This is the exact gap this test covers.
   for dt in [Dtype::F16, Dtype::BF16] {
     let zero = Array::from_slice(&[0.0_f32, 0.0, 0.0], &(3,))
       .unwrap()
@@ -1926,9 +1926,9 @@ fn cosine_similarity_zero_vector_f16_bf16_is_finite_zero() {
   }
 }
 
-// ---- scalar cosine_similarity: scale-invariance (D2 regression) ----
+// ---- scalar cosine_similarity: scale-invariance (regression) ----
 //
-// Codex scoped-delta re-review [high]: the C3 fix unconditionally clamped
+// The previous eps-floor fix unconditionally clamped
 // each f32-widened norm with `max(norm, 1e-9)`. Cosine is scale-invariant,
 // so colinear `a=[1e-12]`, `b=[1.0]` MUST be `1.0` (`1e-12/(1e-12*1)`),
 // but the unconditional clamp yielded `1e-12/(1e-9*1) ≈ 0.001` — silent
@@ -1994,22 +1994,22 @@ fn cosine_similarity_scale_invariant_tiny_norm_f32_bf16() {
 
 // ---- scalar cosine_similarity: zero norm vs overflowed (+Inf) norm ----
 //
-// Codex scoped-delta re-review [high]: the D2 formulation derived the
+// The earlier formulation derived the
 // zero predicate from `denom = na_f32 * nb_f32` via `equal(denom, 0.0)`.
 // If one vector is a zero vector (`na_f32 == 0`) while the other is a
 // *finite valid* input whose f32 L2 norm overflows to `+Inf` (e.g.
 // `b = [f32::MAX, f32::MAX]` → `‖b‖₂ = +Inf`), then `denom = 0 * Inf =
 // NaN`, `equal(NaN, 0.0)` is false, the NaN `safe_denom` leaks through,
 // and the divide returns `NaN` — violating the documented finite-`0.0`
-// contract for a one-zero-norm input. The D3 fix computes the predicate
+// contract for a one-zero-norm input. The current code computes the predicate
 // `‖a‖₂ == 0 ∨ ‖b‖₂ == 0` DIRECTLY on the widened norms (a real L2 norm
 // is only ever 0/finite/+Inf, never NaN), so this case is finite `0.0`.
-// This test FAILS on the D2 product-derived predicate and PASSES after.
+// This test FAILS on the product-derived predicate and PASSES after.
 #[test]
 fn cosine_similarity_zero_vs_overflowed_norm_is_finite_zero() {
   // (1) f32: a is the zero vector; b = [f32::MAX, f32::MAX] is a finite
   //     valid input whose f32 L2 norm overflows to +Inf
-  //     (f32::MAX^2 = +Inf, sqrt(+Inf) = +Inf). The D2 code did
+  //     (f32::MAX^2 = +Inf, sqrt(+Inf) = +Inf). The product-derived predicate did
   //     0 * Inf = NaN → NaN leaked. Must be a finite, exact 0.0.
   let zero = Array::from_slice(&[0.0_f32, 0.0], &(2,)).unwrap();
   let overflowed = Array::from_slice(&[f32::MAX, f32::MAX], &(2,)).unwrap();
@@ -2024,8 +2024,8 @@ fn cosine_similarity_zero_vs_overflowed_norm_is_finite_zero() {
   );
 
   // (2) symmetric: overflowed-norm vs zero → same finite 0.0 (the
-  //     `‖a‖₂ == 0 ∨ ‖b‖₂ == 0` predicate is order-independent; D2's
-  //     `0 * Inf` is also `Inf * 0 = NaN`, so this direction broke too).
+  //     `‖a‖₂ == 0 ∨ ‖b‖₂ == 0` predicate is order-independent; the
+  //     product-derived predicate's `0 * Inf` is also `Inf * 0 = NaN`, so this direction broke too).
   let got_sym = cosine_similarity(&overflowed, &zero).unwrap();
   assert!(
     got_sym.is_finite() && got_sym == 0.0_f32,
@@ -2079,7 +2079,7 @@ fn cosine_similarity_zero_vs_overflowed_norm_is_finite_zero() {
 // zero/result underflowed (`square(1e-23) → 0`) or overflowed
 // (`square(f32::MAX) → +Inf`), misclassifying tiny nonzero vectors as zero
 // and leaking `NaN`. These cases span the full tiny→huge finite range and
-// the Codex round-4 f16 counterexample class; all are exact/ULP-correct
+// the f16 counterexample class; all are exact/ULP-correct
 // scale-invariant cosines (NOT the finite-0.0 zero path).
 #[test]
 fn cosine_similarity_tiny_and_huge_nonzero_are_scale_invariant() {
@@ -2122,13 +2122,13 @@ fn cosine_similarity_tiny_and_huge_nonzero_are_scale_invariant() {
   );
 
   // (4) f16 tiny vs unit, colinear: a=[6.1035e-5], b=[1.0]. `6.1035e-5`
-  //     is `2^-14`, the smallest normal f16 — the Codex round-4
+  //     is `2^-14`, the smallest normal f16 — the
   //     counterexample class (a half-cast tiny value whose `square`
   //     underflows in f16). Widened to f32, max-abs scaling → â=[1.0]
   //     (exact: `s/s == 1.0`), b̂=[1.0] → exactly 1.0 (single-element
   //     scaled vector is bit-exact ±1.0 in f32). (f16 1e-30 underflows to
   //     0 in f16 itself, so 6.1e-5 is the correct tiny-but-representable
-  //     f16 magnitude per the round-4 class.)
+  //     f16 magnitude.)
   let small = 6.1035e-5_f32; // 2^-14, exact smallest normal f16
   let af16 = Array::from_slice(&[small], &(1,))
     .unwrap()
@@ -2142,12 +2142,12 @@ fn cosine_similarity_tiny_and_huge_nonzero_are_scale_invariant() {
     .unwrap_or_else(|e| panic!("f16 tiny [6.1e-5] vs [1.0] errored: {e:?}"));
   assert!(
     gotf.is_finite() && gotf == 1.0_f32,
-    "f16 tiny [6.1035e-5] vs [1.0] colinear must be exactly 1.0 (round-4 class), got {gotf}"
+    "f16 tiny [6.1035e-5] vs [1.0] colinear must be exactly 1.0 (scale-invariant), got {gotf}"
   );
 
   // (5) f16 tiny ANTI-colinear: a=[6.1035e-5], b=[-6.1035e-5] (both exact
   //     f16). Max-abs scaling → â=[1.0], b̂=[-1.0] → exactly -1.0. The
-  //     round-4 counterexample direction (tiny half anti-colinear).
+  //     counterexample direction (tiny half anti-colinear).
   let af16n = Array::from_slice(&[small], &(1,))
     .unwrap()
     .astype(Dtype::F16)
@@ -2285,13 +2285,13 @@ fn pool_post_equivalent_to_pool_dispatcher_tail() {
   }
 }
 
-// ── pool_post norm steps: CLOSED-FORM, independent of `pool` (Codex #1) ──
+// ── pool_post norm steps: CLOSED-FORM, independent of `pool` ──
 //
 // These pin the LayerNorm / RMSNorm / precedence / step-order CONTRACT of
 // `pool_post` against values hand-computed from the documented formulas in
 // `embeddings/fast.rs` + the call-site eps in `embeddings/pooling.rs`, with
 // NO reference to `pool` (which delegates to `pool_post`, so a `pool`-vs-
-// `pool_post` comparison would be tautological — Codex finding #1). Formulas:
+// `pool_post` comparison would be tautological). Formulas:
 //   LayerNorm (no affine): (x-mean)/sqrt(var+eps), population var over the
 //     last axis, eps = LAYER_NORM_EPS = 1e-5 (pooling.rs:34, applied at
 //     pooling.rs:458 via fast::layer_norm, fast.rs:43-77).

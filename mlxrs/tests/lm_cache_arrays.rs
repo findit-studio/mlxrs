@@ -172,7 +172,7 @@ fn make_mask_none() {
 
 #[test]
 fn make_mask_arange_f32_boundary() {
-  // Codex regression: `mx.arange(N)` must be integer-exact. This crate's
+  // `mx.arange(N)` must be integer-exact. This crate's
   // `Array::arange` is f32-only, so `N > 2^24` would silently round the
   // exclusive stop and return a WRONG-length mask. `make_mask` routes
   // through the guarded `mask::iarange`, so `N == 2^24` is accepted and
@@ -239,8 +239,7 @@ fn update_returns_err_not_kv() {
   // mlx-lm `ArraysCache` has NO `update_and_fetch`: it is a generic slot
   // cache, not K/V. The trait `update` must be a recoverable error.
   // Surfaced as `Error::InvariantViolation` ("unsupported operation"), NOT
-  // a shape-class error — the condition isn't a wrong-shaped tensor
-  // (Copilot review #3271124426).
+  // a shape-class error — the condition isn't a wrong-shaped tensor.
   let mut c = ArraysCache::new(2);
   let a = slot(&[1.0]);
   let err = c.update(&a, &a).unwrap_err();
@@ -393,7 +392,7 @@ fn from_state_mamba_cache_is_arrays_cache_alias() {
 
 #[test]
 fn sparse_slot_state_round_trips() {
-  // Codex regression: a cache with ONLY slot 1 populated must restore with
+  // A cache with ONLY slot 1 populated must restore with
   // get(1) == the value and get(0) empty (NOT silently re-packed to slot
   // 0). Faithful to mlx-lm's full-slot-list state (cache.py:624-630) via
   // swift's slot-aware metaState (KVCache.swift:1173-1212).
@@ -416,7 +415,7 @@ fn sparse_slot_state_round_trips() {
   d.set_meta_state(&meta).unwrap();
 
   // Slot 1 holds the value; slots 0 and 2 are empty — slot identity
-  // preserved (the Codex defect was slot 1 silently re-packed to slot 0).
+  // preserved (the defect class was slot 1 silently re-packed to slot 0).
   assert!(d.get(0).is_none());
   assert!(d.get(2).is_none());
   let mut g1 = d.get(1).unwrap().try_clone().unwrap();
@@ -426,7 +425,7 @@ fn sparse_slot_state_round_trips() {
 
 #[test]
 fn set_meta_state_is_atomic_on_malformed_meta() {
-  // Codex regression: a malformed slot-aware meta must NOT half-destroy the
+  // A malformed slot-aware meta must NOT half-destroy the
   // cache. Both a non-numeric slotCount and a hostile huge slotCount (whose
   // slot buffer cannot be allocated) return Err with the prior `set_state`
   // arrays fully intact (never emptied), and never panic/abort.
@@ -473,12 +472,12 @@ fn left_padding_round_trips_via_meta() {
 
 #[test]
 fn set_meta_state_rejects_slot_count_above_max_cap() {
-  // KVC-2 (#99): a forged/corrupt prompt cache with slotCount > MAX_SLOT_COUNT
+  // #99: a forged/corrupt prompt cache with slotCount > MAX_SLOT_COUNT
   // is rejected fast with Error::Backend BEFORE try_reserve_exact runs (which
   // would otherwise hit the allocator with a multi-GB request). Realistic
   // SSM/Mamba caches have ≤ 64 slots, so the cap (1 << 20) is far above any
   // legitimate use. The prior `set_state` arrays must be left fully intact —
-  // staged-then-commit transactional discipline (Copilot review #3271554056).
+  // staged-then-commit transactional discipline.
   let mut d = ArraysCache::new(0);
   d.set_state(vec![slot(&[1.0, 2.0]), slot(&[3.0])]).unwrap();
   let just_over = MAX_SLOT_COUNT + 1;
@@ -513,8 +512,8 @@ fn set_meta_state_rejects_slot_count_above_max_cap() {
 }
 
 #[test]
-fn kvc2_arrayscache_rejects_huge_slot_count_before_csv_parse() {
-  // Codex-R1 [high] #1 (KVC-2 follow-up): a forged meta with a `slotCount >
+fn arrayscache_rejects_huge_slot_count_before_csv_parse() {
+  // A forged meta with a `slotCount >
   // MAX_SLOT_COUNT` AND a huge `presentSlots`/`leftPadding` CSV payload
   // must be rejected by the `MAX_SLOT_COUNT` gate BEFORE the CSV is parsed
   // into a `Vec<T>` — closing the "forged slotCount + huge CSV" evasion
@@ -597,8 +596,8 @@ fn kvc2_arrayscache_rejects_huge_slot_count_before_csv_parse() {
 }
 
 #[test]
-fn kvc2_arrayscache_csv_bound_rejects_oversized_left_padding() {
-  // Codex-R1 [high] #1 sibling assertion: the `leftPadding` CSV is also
+fn arrayscache_csv_bound_rejects_oversized_left_padding() {
+  // Sibling assertion: the `leftPadding` CSV is also
   // bounded by `slot_count` — a forged meta with a valid small
   // `slot_count` + valid small `presentSlots` but a HUGE `leftPadding`
   // CSV must be rejected before allocating the `Vec<i32>`.
@@ -632,7 +631,7 @@ fn kvc2_arrayscache_csv_bound_rejects_oversized_left_padding() {
 
 #[test]
 fn set_meta_state_accepts_slot_count_at_max_cap() {
-  // KVC-2 sanity: a meta with `slotCount = MAX_SLOT_COUNT` (the boundary)
+  // Sanity: a meta with `slotCount = MAX_SLOT_COUNT` (the boundary)
   // must succeed — only `> MAX_SLOT_COUNT` is rejected. Use an EMPTY
   // presentSlots CSV so the test does not actually allocate the full
   // MAX_SLOT_COUNT × sizeof::<Option<Array>>() backing buffer in CI; the

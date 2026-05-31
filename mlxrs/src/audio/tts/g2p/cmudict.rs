@@ -659,7 +659,7 @@ mod tests {
   }
 
   // ============================================================
-  // F1 strict variant-parser tests — every malformed `WORD(...)` shape
+  // Strict variant-parser tests — every malformed `WORD(...)` shape
   // surfaces as `Err(Backend)` carrying the 1-indexed line number + the
   // offending token. Previously these slipped through and (often) wrote
   // a malformed `variant: None` entry as if it were the canonical
@@ -705,7 +705,7 @@ mod tests {
   }
 
   // ============================================================
-  // F2 strict ARPAbet-conversion tests — driven through the loader so we
+  // Strict ARPAbet-conversion tests — driven through the loader so we
   // exercise the same path real callers hit (parse → from_raw_entries),
   // and so the surfaced error carries the 1-indexed line number.
   // ============================================================

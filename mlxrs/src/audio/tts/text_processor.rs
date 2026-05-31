@@ -35,7 +35,7 @@ use crate::error::Result;
 /// target model expects.
 ///
 /// Phonemization / G2P itself is **model-specific** and out of scope per
-/// the project's [no per-model arch porting][noarch] rule — mlxrs ships the
+/// the project's no per-model arch porting rule — mlxrs ships the
 /// hook, not a Misaki/eSpeak G2P implementation. A per-model crate
 /// implements [`TextProcessor`] (e.g. a Misaki G2P adapter) and the model's
 /// [`crate::audio::tts::model::TtsModel::synthesize_segment`] runs it; the
@@ -48,12 +48,10 @@ use crate::error::Result;
 /// G2P adapter can be shared across several models, and so a caller can
 /// *inject* a custom processor at load time (the swift `loadModel(...,
 /// textProcessor:)` parameter). mlxrs mirrors that separation — per the
-/// [mirror-reference-structure][mirror] rule, the reference's two distinct
+/// mirror-reference-structure rule, the reference's two distinct
 /// protocols stay two distinct traits.
 ///
 /// [swift-tp]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioTTS/TextProcessor.swift
-/// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
-/// [mirror]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/mirror-reference-structure.md
 pub trait TextProcessor {
   /// Download or initialize any resources the processor needs before
   /// [`TextProcessor::process`] can run (a G2P lexicon, a weights file, …).

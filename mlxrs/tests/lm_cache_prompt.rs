@@ -193,7 +193,7 @@ fn prompt_trie_empty_tokens_and_pop() {
 
 #[test]
 fn prompt_trie_longer_tie_breaks_by_insertion_order() {
-  // Adversarial-review regression: equal-length `longer` extensions must
+  // Regression: equal-length `longer` extensions must
   // resolve EXACTLY as mlx-lm's `search` (cache.py:1610-1620) —
   // Python-dict **insertion order** of children + a **LIFO** stack, with
   // `best` replaced only on a *strictly* shorter `extra`. Trace for
@@ -385,7 +385,7 @@ fn lru_prefix_pop_on_trimmable_insert() {
 
 #[test]
 fn lru_unknown_cache_type_is_err_and_no_untracked_entry() {
-  // Adversarial-review regression: authoritative mlx-lm indexes fixed
+  // Regression: authoritative mlx-lm indexes fixed
   // per-type dicts (`self._n_bytes_by_type[cache_type]` cache.py:1711,
   // `self._lrus[cache_type]` cache.py:1639) → an unsupported `cache_type`
   // raises `KeyError` BEFORE `self._trie.add` (cache.py:1712), so nothing
@@ -612,7 +612,7 @@ fn corrupt_or_missing_cache_file_is_err_not_panic() {
 
 #[test]
 fn corrupt_wrong_rank_rotating_state_is_err_not_panic() {
-  // Adversarial-review regression: a *well-formed safetensors* whose
+  // Regression: a *well-formed safetensors* whose
   // cross-tool layout names cache 1 `RotatingKVCache` with a valid 4-item
   // meta_state but **rank-1** state arrays. `RotatingKvCache::set_state`
   // mirrors mlx-lm verbatim (`self.keys, self.values = v`, no rank check),
@@ -656,7 +656,7 @@ fn corrupt_wrong_rank_rotating_state_is_err_not_panic() {
 
 #[test]
 fn swift_shaped_5field_rotating_meta_is_err_not_panic() {
-  // Adversarial-review regression: a prompt-cache file in the shared
+  // Regression: a prompt-cache file in the shared
   // cross-tool wire format whose `RotatingKVCache` carries mlx-swift-lm's
   // **5**-field `meta_state` `(keep, maxCacheSize, step, offset, idx)`
   // (`MLXLMCommon/KVCache.swift`) instead of authoritative mlx-lm's
@@ -783,7 +783,7 @@ fn rank_valid_but_inconsistent_rotating_state_is_faithful_not_panic() {
 
 #[test]
 fn all_kvcache_save_emits_mlx_lm_scalar_meta_and_round_trips() {
-  // Adversarial-review regression (cross-loadability): authoritative
+  // Regression (cross-loadability): authoritative
   // mlx-lm `_BaseCache.meta_state` is the empty STRING "" (cache.py
   // :138-139), which `mlx.utils.tree_flatten` serializes as the SCALAR
   // key `"0.{i}" -> ""` per no-meta cache. An all-`KVCache`/StandardKvCache
@@ -859,7 +859,7 @@ fn mlx_lm_style_scalar_meta_file_loads() {
 
 #[test]
 fn malformed_no_meta_kvcache_metadata_is_err() {
-  // Adversarial-review regression (cycle 7): authoritative mlx-lm
+  // Regression: authoritative mlx-lm
   // `_BaseCache.meta_state` SETTER `raise`s on any truthy value
   // (`if v is not None and v: raise ValueError`, cache.py:142-145). So a
   // file naming cache 0 `KVCache` but carrying a *truthy* meta_state —

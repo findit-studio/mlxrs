@@ -4,8 +4,7 @@
 //! and mlx-swift-lm's `MLXLMCommon.BaseConfiguration.Quantization` /
 //! `PerLayerQuantization` (`Libraries/MLXLMCommon/BaseConfiguration.swift`),
 //! adapted to mlxrs's per-project scope: mlxrs has no model-module tree
-//! (that is per-usecase, [see project memory:
-//! `feedback_no_per_model_arch_porting`](../index.html)), so where mlx-lm
+//! (that is per-usecase), so where mlx-lm
 //! walks `nn.Module` leaves replacing `Linear` / `Embedding` with their
 //! quantized counterparts, this module walks the [`Weights`] **name map**
 //! (the loaded `HashMap<String, Array>` from
@@ -98,9 +97,8 @@
 //! (`Libraries/MLXLMCommon/BaseConfiguration.swift:139-171`, which only decodes
 //! group_size/bits/mode + per-layer overrides) — both trust mlx-c.
 //!
-//! See [project memory `feedback_match_official_binding_design`]: mlxrs
-//! wrappers are thin forwards mirroring mlx-swift/python; we do not chase
-//! mlx-core-internal hardening. Per-mode contracts (e.g. `bits ∈ {2,3,4,5,6,8}`
+//! mlxrs wrappers are thin forwards mirroring mlx-swift/python; we do not
+//! chase mlx-core-internal hardening. Per-mode contracts (e.g. `bits ∈ {2,3,4,5,6,8}`
 //! for affine — `mlx/mlx/ops.cpp:4745-4750`; `mxfp4` requires `(32, 4)`,
 //! `nvfp4` requires `(16, 4)` — `mlx/mlx/ops.cpp:4808-4823`) are upstream of
 //! this module.
@@ -481,7 +479,7 @@ const BIASES_SUFFIX: &str = ".biases";
 pub type Eligible<'a> = dyn Fn(&str, &Array) -> bool + 'a;
 
 /// The "every `.weight` is a candidate" eligibility predicate — the
-/// pre-Codex-fix default behavior. Pass this to [`quantize_weights`]
+/// permissive default behavior. Pass this to [`quantize_weights`]
 /// when the caller does not have an architecture-specific allowlist
 /// and wants every weight that passes the structural guards
 /// (suffix / rank ≥ 2 / `last_dim % group_size == 0`) to be quantized.
@@ -564,8 +562,8 @@ enum TripleClass {
 ///
 /// **Precondition.** `cfg` must carry a resolvable [`Quantization`] for
 /// `layer_path` whenever a triple is present: either via the global
-/// `cfg.quantization` (the common case — Fix 2 enforces that any parsed
-/// `"quantization"` block contains `group_size` + `bits`) or via a
+/// `cfg.quantization` (the common case — the deserializer enforces that any
+/// parsed `"quantization"` block contains `group_size` + `bits`) or via a
 /// per-layer [`QuantizationOption::Quantize`] override. A per-layer
 /// [`QuantizationOption::Skip`] for `layer_path` means the layer was
 /// intentionally not quantized — any sibling `.scales` / `.biases` at
@@ -1217,8 +1215,7 @@ pub fn dequantize_weights(weights: Weights, cfg: &PerLayerQuantization) -> Resul
 //      unpack-and-repack we DO port (see `convertAutoAWQ` in the
 //      swift ref, which is a re-implementation of
 //      `_transform_awq_weights` parameterized on the PARO key set).
-//      Per `[[project_no_per_model_arch_porting]]`: mlxrs ports
-//      loaders/tokenizers/pooling — not per-usecase
+//      mlxrs ports loaders/tokenizers/pooling — not per-usecase
 //      model-architecture loaders.
 //
 //   2. `RotateQuantizedLinear` is a `QuantizedLinear` subclass that
@@ -1460,14 +1457,15 @@ pub fn unpack_awq_weights(qweight: &Array) -> Result<Array> {
 /// post-transform floating weights, so heterogeneous-precision
 /// checkpoints settle onto one type before the MLX quantize pass.
 ///
-/// **Fix 3 [HIGH]**: mlx-lm takes the LAST iterated layer's `scales.dtype`
+/// mlx-lm takes the LAST iterated layer's `scales.dtype`
 /// as the target (`utils.py:156` overwrites `model_dtype` each iteration).
 /// In Python that's `dict` insertion order, which for AutoAWQ checkpoints
-/// usually means the last weight in the safetensors file. mlxrs originally
-/// picked the LEX-LAST prefix to get a stable choice across HashMap
-/// iteration orders, but for HETEROGENEOUS-PRECISION checkpoints
+/// usually means the last weight in the safetensors file. Picking the
+/// LEX-LAST prefix would give a stable choice across HashMap iteration
+/// orders, but for HETEROGENEOUS-PRECISION checkpoints
 /// (e.g. some layers f16, some bf16) the lex-last pick is arbitrary and
-/// would silently downcast the higher-precision layers.
+/// would silently downcast the higher-precision layers — so mlxrs
+/// resolves by precision instead.
 ///
 /// Resolution policy: **highest precision wins** in HIERARCHICAL cases —
 /// `F64 > F32 > BF16 / F16` (a wider format is a superset, so the cast
@@ -1475,7 +1473,7 @@ pub fn unpack_awq_weights(qweight: &Array) -> Result<Array> {
 /// (e.g. all bf16) the result is the first dtype with that rank — stable
 /// across runs.
 ///
-/// **F5 [HIGH] — F16 + BF16 mixed escalation**: F16 and BF16 are NOT
+/// **F16 + BF16 mixed escalation**: F16 and BF16 are NOT
 /// mutually-convertible without loss. Neither is a superset of the other:
 /// - F16 has 10 mantissa bits + a 5-bit exponent (high precision, narrow range).
 /// - BF16 has 7 mantissa bits + an 8-bit exponent (F32-equivalent range, low precision).
@@ -1497,17 +1495,17 @@ pub fn unpack_awq_weights(qweight: &Array) -> Result<Array> {
 /// `transform_awq_weights_preserves_f16_precision_when_mixed_with_bf16`
 /// (end-to-end value preservation via the unification cast).
 ///
-/// **F5 \[MEDIUM\] R3 — scope**: the dtype this fn resolves applies to the
+/// **Scope**: the dtype this fn resolves applies to the
 /// AWQ-generated `.scales` / `.biases` outputs ONLY, **not** to the
 /// pass-through floating tensors in the same checkpoint (embeddings, LM
-/// head, norms, etc.). Earlier revisions ran the unification cast over
-/// every floating key in `new_weights`, which for a large quantized model
-/// with BF16/F16 embeddings + one mixed-half AWQ pair could DOUBLE the
-/// resident size of those pass-through tensors and add a full-size cast
-/// allocation during load — capable of turning a fitting model into OOM.
-/// [`transform_awq_weights`] now iterates the unification loop over a
-/// `BTreeSet<String>` of generated keys only; pass-through tensors retain
-/// their on-disk dtype. See
+/// head, norms, etc.). Running the unification cast over every floating
+/// key in `new_weights` would, for a large quantized model with BF16/F16
+/// embeddings + one mixed-half AWQ pair, DOUBLE the resident size of
+/// those pass-through tensors and add a full-size cast allocation during
+/// load — capable of turning a fitting model into OOM.
+/// [`transform_awq_weights`] therefore iterates the unification loop over
+/// a `BTreeSet<String>` of generated keys only; pass-through tensors
+/// retain their on-disk dtype. See
 /// `transform_awq_weights_does_not_widen_passthrough_bf16_tensor` and
 /// siblings for the regression coverage.
 ///
@@ -1560,7 +1558,7 @@ fn resolve_awq_model_dtype(
       }
     }
   }
-  // F5 escalation: F16+BF16 mixed without F32/F64 → promote to F32 to
+  // Escalation: F16+BF16 mixed without F32/F64 → promote to F32 to
   // avoid the lossy F16 → BF16 cast (see doc-comment above for the
   // bit-layout reason). When F32 or F64 is already present, its higher
   // rank wins via the loop above and is a superset of both halves —
@@ -1576,12 +1574,12 @@ fn resolve_awq_model_dtype(
   Ok(best)
 }
 
-/// Fix 3 [HIGH]: precision rank for the floating dtypes that may appear as
+/// Precision rank for the floating dtypes that may appear as
 /// AWQ `.scales`. Higher rank = more precision.
 ///
 /// Order: `F64 > F32 > BF16 > F16 > anything-else (sentinel 0)`.
 ///
-/// **Caveat (F5 [HIGH])**: this rank treats BF16 > F16 because BF16 has
+/// **Caveat**: this rank treats BF16 > F16 because BF16 has
 /// the wider exponent (F32-equivalent dynamic range), but BF16 has
 /// FEWER mantissa bits (7 vs F16's 10). Neither half is a superset of
 /// the other, so when both appear together [`resolve_awq_model_dtype`]
@@ -1598,7 +1596,7 @@ fn floating_dtype_precision_rank(d: Dtype) -> u8 {
   }
 }
 
-/// Fix 3 [HIGH]: validate that every AWQ `.scales` tensor is a SUPPORTED
+/// Validate that every AWQ `.scales` tensor is a SUPPORTED
 /// FLOATING dtype. Without this gate, a hostile/malformed checkpoint with
 /// integer `.scales` (e.g. `i32`, `u8`) would propagate that dtype through
 /// [`resolve_awq_model_dtype`] and the unification loop would then CAST
@@ -1669,7 +1667,7 @@ fn is_floating(d: Dtype) -> bool {
 /// 6. **Floating-dtype unification** (`utils.py:163-165`): every AWQ-
 ///    generated `.scales` / `.biases` is cast to the resolved
 ///    `model_dtype` (see `resolve_awq_model_dtype` in this module).
-///    **F5 \[MEDIUM\] R3** — scope: the cast walks only the keys this
+///    Scope: the cast walks only the keys this
 ///    function INSERTED into `new_weights` (the generated `.scales` +
 ///    `.biases` per converted prefix), tracked in a `BTreeSet<String>`
 ///    during the conversion pass. Pass-through floating tensors
@@ -1694,7 +1692,7 @@ pub fn transform_awq_weights(
   weights: Weights,
   config: &AwqLoadConfig,
 ) -> Result<(Weights, PerLayerQuantization)> {
-  // Fix 2 [HIGH]: reject `version = "gemv"` and any other non-GEMM version
+  // Reject `version = "gemv"` and any other non-GEMM version
   // BEFORE any processing. AwqLoadConfig advertises {"gemm" / "gemv"} but
   // the converter unconditionally assumes GEMM layout. GEMV has different
   // qweight shape + scales layout + sequential packing — a GEMV checkpoint
@@ -1753,14 +1751,14 @@ pub fn transform_awq_weights(
 
   // Collect every prefix of a `.qweight` key (sorted, for deterministic
   // iteration in tests; `resolve_awq_model_dtype` uses a precision rank
-  // independent of order — see Fix 3 below).
+  // independent of order — see the dtype-validation step below).
   let mut qweight_prefixes: Vec<String> = weights
     .keys()
     .filter_map(|k| k.strip_suffix(".qweight").map(str::to_string))
     .collect();
   qweight_prefixes.sort();
 
-  // Fix 3 [HIGH]: gate every `.scales` dtype as floating BEFORE resolving
+  // Gate every `.scales` dtype as floating BEFORE resolving
   // model_dtype. Without this, an integer `.scales` would propagate to the
   // unification loop and cast every model float to that integer — silently
   // corrupting the model. Spec'd `validate_awq_scales_are_floating`.
@@ -1777,7 +1775,7 @@ pub fn transform_awq_weights(
   for prefix in &qweight_prefixes {
     let qweight_key = format!("{prefix}.qweight");
     let scales_key = format!("{prefix}.scales");
-    // Fix 4 [HIGH]: collision check with `<prefix>.weight` / `<prefix>.biases`
+    // Collision check with `<prefix>.weight` / `<prefix>.biases`
     // siblings. The converter emits `<prefix>.weight` + `<prefix>.scales`
     // (+ `<prefix>.biases` for affine) and then unconditionally inserts the
     // remainder keys into the output map. If the input ALSO carries a stale
@@ -1825,7 +1823,7 @@ pub fn transform_awq_weights(
         scales_key,
       )));
     };
-    // Fix 1 [CRITICAL]: dtype preflight. AutoAWQ's `WQLinear_GEMM`
+    // Dtype preflight. AutoAWQ's `WQLinear_GEMM`
     // allocates `qweight` / `qzeros` as `torch.int32` (signed); mlx-lm's
     // canonical converter expects `uint32`. Accept BOTH — but reject other
     // dtypes (floats, narrower ints, etc.) here with a clear message, so a
@@ -1958,7 +1956,7 @@ pub fn transform_awq_weights(
   // Now do the conversion. Move every key out of the input map exactly
   // once — non-AWQ keys flow straight through.
   let mut new_weights: Weights = HashMap::with_capacity(weights.len());
-  // F5 R3 [MEDIUM] — track the AWQ-generated `.scales` / `.biases` keys
+  // Track the AWQ-generated `.scales` / `.biases` keys
   // INSERTED by the conversion pass below. The post-loop unification cast
   // walks only this set, so pass-through floating tensors (embeddings, LM
   // head, norms, etc.) keep their on-disk dtype and are not widened when a
@@ -2109,7 +2107,7 @@ pub fn transform_awq_weights(
     new_weights.insert(format!("{prefix}.weight"), new_weight);
     new_weights.insert(scales_key.clone(), scales_c);
     new_weights.insert(biases_key.clone(), biases);
-    // F5 R3 [MEDIUM]: record the AWQ-generated floating outputs so the
+    // Record the AWQ-generated floating outputs so the
     // unification cast below can scope itself to them. (`.weight` is U32,
     // not in scope for floating unification.)
     awq_generated_floating_keys.insert(scales_key);
@@ -2121,12 +2119,12 @@ pub fn transform_awq_weights(
   for (key, arr) in remainder {
     new_weights.insert(key, arr);
   }
-  // F5 R3 [MEDIUM] — Floating-dtype unification (`utils.py:163-165`)
+  // Floating-dtype unification (`utils.py:163-165`)
   // scoped to AWQ-generated `.scales` / `.biases` ONLY. mlx-lm runs this
   // cast over every floating key in the resulting dict, but doing so in a
   // Rust port (where the input map carries every pass-through tensor —
   // embeddings, LM head, norms, etc.) means a single mixed-half AWQ pair
-  // (F16+BF16 → F32 escalation, see `resolve_awq_model_dtype` F5 [HIGH])
+  // (F16+BF16 → F32 escalation, see `resolve_awq_model_dtype`)
   // can double the resident size of every BF16/F16 pass-through tensor
   // plus allocate a full-size cast buffer per tensor during load. For
   // large quantized models that turns a fitting checkpoint into OOM.
@@ -2497,9 +2495,9 @@ mod tests {
     assert_eq!(w_q.shape(), vec![n_rows, 4]);
   }
 
-  // ──────────────── new Codex-review fixtures ────────────────
+  // ──────────────── triple-classification fixtures ────────────────
 
-  /// Fix 1: a weight whose key ends in `.weight` AND meets every
+  /// A weight whose key ends in `.weight` AND meets every
   /// structural guard (rank ≥ 2, last-axis divisible by group_size) but
   /// the caller-supplied eligibility predicate rejects → passes through
   /// unchanged (no `.scales` / `.biases` emitted). Mirrors mlx-lm's
@@ -2525,7 +2523,7 @@ mod tests {
     assert!(!out.contains_key("model.some_future_module.biases"));
   }
 
-  /// Fix 1: a predicate that selects a SPECIFIC path AND every other
+  /// A predicate that selects a SPECIFIC path AND every other
   /// structural guard passes → that path IS quantized (.weight replaced,
   /// .scales / .biases emitted), while a sibling path the predicate
   /// rejects passes through unchanged. Confirms the predicate is the
@@ -2564,7 +2562,7 @@ mod tests {
     assert!(!out.contains_key("model.other_class.biases"));
   }
 
-  // Fix 2: schema-required keys.
+  // Schema-required keys.
 
   #[test]
   fn quantization_missing_bits_errors() {
@@ -2597,7 +2595,7 @@ mod tests {
     assert_eq!(q.bits, 4);
   }
 
-  // Fix 3: stale sibling collision.
+  // Stale sibling collision.
 
   #[test]
   fn quantize_weights_orphan_biases_collision_errors() {
@@ -2634,7 +2632,7 @@ mod tests {
     }
   }
 
-  /// Fix 3: a VALID already-quantized triple (`.weight` uint32 packed +
+  /// A VALID already-quantized triple (`.weight` uint32 packed +
   /// `.scales` (+ `.biases`) of matching leading dims, the exact layout
   /// mlx's `affine_quantize` writes — `mlx/ops.cpp:4789-4798`) STILL
   /// passes through unchanged. The new [`TripleClass`] validation must
@@ -2662,15 +2660,15 @@ mod tests {
     assert!(out.contains_key("model.already.biases"));
   }
 
-  /// Fix 4 (this PR): a dense `.weight` (float dtype) next to a stale
+  /// A dense `.weight` (float dtype) next to a stale
   /// `.scales` orphan (no valid quantized layout) → [`TripleClass::Invalid`]
   /// → `Err(Backend)` naming the layer and the offending `.scales`. This is
-  /// the case the Codex review surfaced: the old presence-only
+  /// the case where the old presence-only
   /// `is_already_quantized` check would have classified this as "already
   /// quantized" and silently passed through, leaving a dense `.weight` next
   /// to a corrupt `.scales` for `dequantize_weights` to choke on.
   ///
-  /// `.biases` is included so the triple advances past Fix 6's affine-arity
+  /// `.biases` is included so the triple advances past the affine-arity
   /// check and reaches the `.weight` dtype check (the regression this
   /// fixture is asserting); a separate fixture covers the missing-`.biases`
   /// arity case under `affine`.
@@ -2709,7 +2707,7 @@ mod tests {
     }
   }
 
-  /// Fix 4 (this PR): a `.weight` + `.scales` with MISMATCHED leading
+  /// A `.weight` + `.scales` with MISMATCHED leading
   /// dims (the `.weight` claims to be uint32 packed, but its rank or
   /// leading shape doesn't match `.scales` as mlx's `quantize` would
   /// produce). Classified as [`TripleClass::Invalid`] → `Err(Backend)`.
@@ -2721,7 +2719,7 @@ mod tests {
     // `.scales` with a different leading dim ([3, 1] vs `.weight`
     // leading dim of [2]).
     let bad_scales = arr_f32(&[1.0_f32; 3], &[3, 1]);
-    // `.biases` matching `.scales` so the triple advances past Fix 6's
+    // `.biases` matching `.scales` so the triple advances past the
     // affine-arity check and reaches the leading-dim mismatch check.
     let biases = arr_f32(&[0.0_f32; 3], &[3, 1]);
     let mut weights: Weights = HashMap::new();
@@ -2750,8 +2748,8 @@ mod tests {
     }
   }
 
-  // R5 structural pivot: the `quantize_weights_mismatched_biases_dtype_errors`
-  // test from R4 asserted a `.biases`/`.scales` dtype-equality check we are
+  // A `quantize_weights_mismatched_biases_dtype_errors`
+  // test once asserted a `.biases`/`.scales` dtype-equality check we are
   // intentionally removing to match the mlx-lm / mlx-swift reference loader
   // paths (which trust mlx-c to validate scale dtypes at the
   // `quantize` / `dequantize` call site — `mlx/mlx/ops.cpp:75-115`). The
@@ -2761,12 +2759,12 @@ mod tests {
 
   // ──────────────── Structural shape sanity ────────────────
 
-  /// Fix 5: a uint32 rank-1 `.weight` next to a uint32 rank-1 `.scales`
+  /// A uint32 rank-1 `.weight` next to a uint32 rank-1 `.scales`
   /// (rank-equal, even leading-dim-equal trivially since both have only
-  /// a last axis). Pre-fix `classify_triple` would have classified this
-  /// as [`TripleClass::Valid`] (dtype `uint32` + ranks equal + no
-  /// rank ≥ 2 check). The fix rejects it because mlx `quantize` requires
-  /// rank ≥ 2 inputs (`mlx/ops.cpp:4925-4929`).
+  /// a last axis). On dtype `uint32` + ranks equal alone this would look
+  /// like a [`TripleClass::Valid`] triple, but `classify_triple` rejects
+  /// it because mlx `quantize` requires rank ≥ 2 inputs
+  /// (`mlx/ops.cpp:4925-4929`).
   #[test]
   fn quantize_weights_rank1_uint32_triple_errors() {
     // Both `.weight` and `.scales` are rank-1 uint32 — would slip past
@@ -2775,7 +2773,7 @@ mod tests {
     let w = arr_u32(&[0_u32, 0, 0, 0], &[4]);
     let scales = arr_u32(&[1_u32], &[1]);
     // `.biases` matching `.scales` shape/dtype so the triple advances past
-    // Fix 6's affine-arity check and reaches the rank-≥-2 check.
+    // the affine-arity check and reaches the rank-≥-2 check.
     let biases = arr_u32(&[0_u32], &[1]);
     let mut weights: Weights = HashMap::new();
     weights.insert("model.bad.weight".to_string(), w);
@@ -2802,7 +2800,7 @@ mod tests {
     }
   }
 
-  /// R5 structural pivot: a `.weight` + `.scales` triple whose
+  /// A `.weight` + `.scales` triple whose
   /// `.scales` last-axis does NOT match the mlx invariant
   /// `w.shape(-1) * 32 / bits == scales.shape(-1) * group_size`
   /// (`mlx/ops.cpp:107`) now passes `classify_triple` (which only
@@ -2821,9 +2819,9 @@ mod tests {
   #[test]
   fn quantize_weights_pre_quantized_triple_passes_through_to_mlxc() {
     // Packed `.weight` `[2, 8]` u32 + `.scales` `[2, 2]` f32 (+ `.biases`
-    // matching). Under the OLD R4 check, `bits=4, group_size=64` would
-    // have rejected this (expected scales-last = 8 * 32 / 4 / 64 = 1, not
-    // 2). Under R5, this passes through — mlx-c is the validator.
+    // matching). A last-axis invariant check would have
+    // rejected this (expected scales-last = 8 * 32 / 4 / 64 = 1, not
+    // 2). Instead, this passes through — mlx-c is the validator.
     let n_rows = 2_usize;
     let w = arr_u32(&vec![0_u32; n_rows * 8], &[n_rows, 8]);
     let scales = arr_f32(&vec![1.0_f32; n_rows * 2], &[n_rows, 2]);
@@ -2845,10 +2843,10 @@ mod tests {
     assert!(out.contains_key("model.foo.biases"));
   }
 
-  /// R5 faithful-port: an affine triple with `bits=3` (mlx-supported,
+  /// An affine triple with `bits=3` (mlx-supported,
   /// `mlx/ops.cpp:4745-4750`: bits ∈ {2,3,4,5,6,8}) passes through.
-  /// The old R4 `32 % bits == 0` guard incorrectly rejected `bits ∈
-  /// {3, 5, 6}`; per the new validation contract, per-mode bits
+  /// A `32 % bits == 0` guard would incorrectly reject `bits ∈
+  /// {3, 5, 6}`; per the validation contract, per-mode bits
   /// validation is delegated to mlx-c.
   #[test]
   fn quantize_weights_pre_quantized_bits3_triple_passes_through() {
@@ -2874,7 +2872,7 @@ mod tests {
     assert_eq!(w_out.dtype().unwrap(), crate::dtype::Dtype::U32);
   }
 
-  /// R5 structural-shape regression: a CORRECT `.weight` `[2, 8]`
+  /// Structural-shape regression: a CORRECT `.weight` `[2, 8]`
   /// packed at `bits=4, group_size=64` with `.scales` `[2, 1]` (+
   /// `.biases` matching `.scales` shape — affine-arity holds). Still
   /// passes through (the basic shape-sanity checks all hold).
@@ -2900,7 +2898,7 @@ mod tests {
     assert!(out.contains_key("model.foo.biases"));
   }
 
-  /// Fix 5: a triple at a path that the per-layer config marks as
+  /// A triple at a path that the per-layer config marks as
   /// `Skip`. The layer was intentionally not quantized — a pre-existing
   /// triple at that path is a stale collision. Classified as
   /// [`TripleClass::Invalid`] (the doc-level "Precondition" branch).
@@ -2939,9 +2937,9 @@ mod tests {
     }
   }
 
-  // ──────────────── Fix 6 (this PR): per-mode bias arity ────────────────
+  // ──────────────── per-mode bias arity ────────────────
 
-  /// Fix 6: an `affine` triple with NO `.biases` (only `.weight` + `.scales`)
+  /// An `affine` triple with NO `.biases` (only `.weight` + `.scales`)
   /// is structurally incomplete. mlx `affine_quantize` emits
   /// `{w_q, scales, biases}` unconditionally (`mlx/ops.cpp:4793-4798`); a
   /// matching shape/dtype on `.scales` is not enough — the resolved mode
@@ -2984,7 +2982,7 @@ mod tests {
     }
   }
 
-  /// Fix 6: an `mxfp4` triple with `.biases` present is a stale sibling
+  /// An `mxfp4` triple with `.biases` present is a stale sibling
   /// from a different mode. mlx `fp_quantize` emits `{w_q, scales}`
   /// only — never `.biases` (`mlx/ops.cpp:4890,4898-4904`). Even if
   /// shape/dtype happen to align with `.scales`, the bias slot MUST be
@@ -3035,7 +3033,7 @@ mod tests {
     }
   }
 
-  /// Fix 6 regression: a structurally valid `mxfp4` triple
+  /// Regression: a structurally valid `mxfp4` triple
   /// (`.weight` u32 + `.scales` matching, NO `.biases`) — the scale-only
   /// layout `fp_quantize` actually writes (`mlx/ops.cpp:4890,4898-4904`).
   /// Must pass through unchanged: the new arity check accepts the
@@ -3068,15 +3066,15 @@ mod tests {
     assert!(!out.contains_key("model.mxfp4_ok.biases"));
   }
 
-  // ──────────────── R5 dequantize_weights mode-arity symmetry ────────────────
+  // ──────────────── dequantize_weights mode-arity symmetry ────────────────
 
-  /// R5 Finding 1: `dequantize_weights` is symmetric with
+  /// `dequantize_weights` is symmetric with
   /// `quantize_weights`'s mode-arity check (the `affine`-requires-biases
-  /// / `mxfp*|nvfp4`-forbids-biases contract). An affine triple WITHOUT
-  /// `.biases` was previously forwarded to mlx-c's `dequantize`, which
-  /// would silently reconstruct without the zero-point. The arity check
-  /// now catches this upfront and returns a clear error naming the layer
-  /// and the resolved `affine` mode.
+  /// / `mxfp*|nvfp4`-forbids-biases contract). Forwarding an affine
+  /// triple WITHOUT `.biases` to mlx-c's `dequantize` would silently
+  /// reconstruct without the zero-point. The arity check catches this
+  /// upfront and returns a clear error naming the layer and the resolved
+  /// `affine` mode.
   #[test]
   fn dequantize_weights_affine_missing_biases_errors() {
     let n_rows = 2_usize;
@@ -3113,7 +3111,7 @@ mod tests {
     }
   }
 
-  /// R5 Finding 1: an `mxfp4` triple WITH a stale `.biases` would be
+  /// An `mxfp4` triple WITH a stale `.biases` would be
   /// forwarded to mlx-c, which silently dequantizes (ignoring the
   /// biases). The arity check now catches this upfront and returns a
   /// clear error naming the layer and the offending `mxfp4` mode.
@@ -3157,14 +3155,14 @@ mod tests {
     }
   }
 
-  /// R6 Finding: `dequantize_weights` is symmetric with
+  /// `dequantize_weights` is symmetric with
   /// `classify_triple`'s orphan-`.biases` guard. A map carrying
   /// `.weight` (`uint32` packed) + `.biases` but NO `.scales` is never
   /// a valid mlx-produced triple (mlx `affine_quantize` always writes
-  /// `.scales` alongside `.biases`, `mlx/ops.cpp:4793-4798`). Pre-fix
-  /// the orphan would fall through the discovery walk (which only
-  /// indexed `.scales` keys) and the `uint32` packed `.weight` would
-  /// pass through to the dequantized output as-is. The new orphan-bias
+  /// `.scales` alongside `.biases`, `mlx/ops.cpp:4793-4798`). Without a
+  /// dedicated guard the orphan falls through the discovery walk (which
+  /// only indexes `.scales` keys) and the `uint32` packed `.weight`
+  /// passes through to the dequantized output as-is. The orphan-bias
   /// guard catches this upfront with the same exit point + message
   /// style as the dequantize arity check.
   #[test]
@@ -3202,7 +3200,7 @@ mod tests {
     }
   }
 
-  /// R7 Finding: the R6 orphan-bias guard over-rejected a normal dense
+  /// A too-broad orphan-bias guard would over-reject a normal dense
   /// Linear layer carrying `P.weight` (F32) + `P.biases` (F32) with no
   /// `P.scales` — that combination is a standard dense+bias layer, not a
   /// malformed quantized triple. The narrowed guard only fires when
@@ -3357,7 +3355,7 @@ mod tests {
     );
   }
 
-  /// Fix 1 [CRITICAL]: i32 input is accepted (AutoAWQ's `WQLinear_GEMM`
+  /// i32 input is accepted (AutoAWQ's `WQLinear_GEMM`
   /// allocates packed buffers as `torch.int32`, so standard on-disk
   /// checkpoints carry the signed dtype). Output matches what the equivalent
   /// u32 input would produce — verifying the bit-preserving reinterpret.
@@ -3389,7 +3387,7 @@ mod tests {
     );
   }
 
-  /// Fix 1: existing u32 inputs continue to work (regression guard for the
+  /// Existing u32 inputs continue to work (regression guard for the
   /// `Cow::Borrowed(qweight)` short-circuit path).
   #[test]
   fn unpack_awq_weights_accepts_u32_input() {
@@ -3806,10 +3804,10 @@ mod tests {
     assert_eq!(g.mode, QuantMode::Affine);
   }
 
-  // ──────────────── Fix 2 [HIGH]: version validation ────────────────
+  // ──────────────── version validation ────────────────
 
   /// Helper: build a minimal valid GEMM-shaped weights map (in=8, out=8,
-  /// gs=4, ng=2). Lets the F2 tests focus on the version field without
+  /// gs=4, ng=2). Lets the version tests focus on the version field without
   /// re-deriving the shape arithmetic each time.
   fn awq_gemm_fixture_weights() -> Weights {
     let in_features = 8usize;
@@ -3826,7 +3824,7 @@ mod tests {
     w
   }
 
-  /// Fix 2: `version = "gemv"` is REJECTED at the top of transform_awq_weights
+  /// `version = "gemv"` is REJECTED at the top of transform_awq_weights
   /// (before any conversion work). The error message must name the offending
   /// version and call out "not yet supported" — the spec-required signal.
   #[test]
@@ -3850,7 +3848,7 @@ mod tests {
     }
   }
 
-  /// Fix 2: an unknown version string is REJECTED with the version named
+  /// An unknown version string is REJECTED with the version named
   /// in the message.
   #[test]
   fn transform_awq_weights_rejects_unknown_version() {
@@ -3873,7 +3871,7 @@ mod tests {
     }
   }
 
-  /// Fix 2: empty version (the serde default) is ACCEPTED — older AutoAWQ
+  /// Empty version (the serde default) is ACCEPTED — older AutoAWQ
   /// checkpoints + mlxrs-internal construction both leave it empty.
   #[test]
   fn transform_awq_weights_accepts_empty_version() {
@@ -3887,7 +3885,7 @@ mod tests {
       .expect("empty version (serde default) must be accepted");
   }
 
-  /// Fix 2: explicit `"gemm"` is ACCEPTED.
+  /// Explicit `"gemm"` is ACCEPTED.
   #[test]
   fn transform_awq_weights_accepts_gemm_version() {
     let config = AwqLoadConfig {
@@ -3900,9 +3898,9 @@ mod tests {
       .expect("explicit 'gemm' version must be accepted");
   }
 
-  // ──────────────── Fix 1 [CRITICAL]: I32 qweight/qzeros acceptance ────────────────
+  // ──────────────── I32 qweight/qzeros acceptance ────────────────
 
-  /// Fix 1: a full I32 fixture (both qweight + qzeros allocated as `torch.int32`,
+  /// A full I32 fixture (both qweight + qzeros allocated as `torch.int32`,
   /// as AutoAWQ's `WQLinear_GEMM` does) round-trips through `transform_awq_weights`.
   /// Includes a qweight value with the high bit SET — the bit-pattern that
   /// would corrupt under a value-preserving `astype`.
@@ -3979,7 +3977,7 @@ mod tests {
     assert_eq!(g.group_size, group_size as i32);
   }
 
-  /// Fix 1: pack a known-negative i32 fixture and verify the resulting
+  /// Pack a known-negative i32 fixture and verify the resulting
   /// MLX-format output bit-pattern matches what the equivalent U32 input
   /// produces — confirming the i32 path is bit-preserving end-to-end
   /// (NOT value-preserving via `astype`, which would clamp negatives to 0).
@@ -4063,9 +4061,9 @@ mod tests {
     );
   }
 
-  // ──────────────── Fix 3 [HIGH]: .scales dtype validation ────────────────
+  // ──────────────── .scales dtype validation ────────────────
 
-  /// Fix 3: integer `.scales` (`i32`) is REJECTED — a hostile/malformed
+  /// Integer `.scales` (`i32`) is REJECTED — a hostile/malformed
   /// checkpoint with integer scales would silently CAST every model float
   /// to that integer through the dtype-unification loop. The validator
   /// fires first and names the offending layer + the rejection reason.
@@ -4111,7 +4109,7 @@ mod tests {
     }
   }
 
-  /// Fix 3: `u8` (unsigned narrow int) `.scales` is REJECTED with the same
+  /// `u8` (unsigned narrow int) `.scales` is REJECTED with the same
   /// error shape. Confirms the gate fires for narrow ints too — not just
   /// the canonical `i32` case.
   #[test]
@@ -4155,10 +4153,10 @@ mod tests {
     }
   }
 
-  /// Fix 3 / F5: HIERARCHICAL heterogeneous-precision `.scales` (mixing
+  /// HIERARCHICAL heterogeneous-precision `.scales` (mixing
   /// dtypes where one IS a true superset of the others) must resolve to
   /// the higher-precision target. This covers F32+F16 → F32 and F64+BF16
-  /// → F64. The F5 fix carved out the F16+BF16 case (no superset relation,
+  /// → F64. The F16+BF16 case is carved out (no superset relation,
   /// see `..._escalates_f16_plus_bf16_to_f32`) — this test guards the
   /// remaining cases where the simple "highest rank wins" answer IS still
   /// correct (and lossless).
@@ -4235,7 +4233,7 @@ mod tests {
     );
   }
 
-  /// F5 [HIGH]: F16 and BF16 mixed alone (no F32/F64 present) must
+  /// F16 and BF16 mixed alone (no F32/F64 present) must
   /// escalate to F32. Neither half-float is a superset of the other —
   /// F16 has more mantissa bits, BF16 has more exponent bits — so any
   /// pick within the halves would be lossy for one side. The escalation
@@ -4298,7 +4296,7 @@ mod tests {
     );
   }
 
-  /// F5: when F32 is already present alongside F16+BF16, it short-circuits
+  /// When F32 is already present alongside F16+BF16, it short-circuits
   /// the escalation — F32 wins on rank and is already a superset of both
   /// halves, no need to "escalate" further.
   #[test]
@@ -4349,7 +4347,7 @@ mod tests {
     );
   }
 
-  /// F5: when F64 is already present alongside F16+BF16, it stays at F64
+  /// When F64 is already present alongside F16+BF16, it stays at F64
   /// (F64 outranks F32; F64 is also a superset of both halves so no
   /// escalation is needed).
   #[test]
@@ -4400,16 +4398,16 @@ mod tests {
     );
   }
 
-  /// F5 [HIGH] END-TO-END value preservation: a checkpoint with F16
+  /// END-TO-END value preservation: a checkpoint with F16
   /// `.scales` carrying the value `1.0009765625` (= 1 + 2⁻¹⁰, exactly
   /// representable in F16 but NOT in BF16 — BF16's smallest delta near
   /// 1 is 2⁻⁷ ≈ 0.0078) and a sibling BF16 `.scales` layer must round-
   /// trip through `transform_awq_weights` with that F16 value PRESERVED.
   ///
-  /// Under the pre-fix policy, the resolver returned BF16, the unification
-  /// loop cast F16 → BF16, and `1.0009765625` collapsed to `1.0`
-  /// (silently corrupting every F16 scale value). Under F5 the resolver
-  /// escalates to F32, the cast is F16 → F32 (lossless), and the original
+  /// Under a rank-only policy, the resolver returns BF16, the unification
+  /// loop casts F16 → BF16, and `1.0009765625` collapses to `1.0`
+  /// (silently corrupting every F16 scale value). With the escalation the
+  /// resolver picks F32, the cast is F16 → F32 (lossless), and the original
   /// value survives.
   #[test]
   fn transform_awq_weights_preserves_f16_precision_when_mixed_with_bf16() {
@@ -4433,7 +4431,7 @@ mod tests {
       bf_round.to_f32(),
       1.0,
       "pre-condition: casting F16 1.0009765625 → BF16 must truncate to 1.0 \
-       (this is the lossy behavior F5 prevents)"
+       (this is the lossy behavior the F16+BF16→F32 escalation prevents)"
     );
 
     let f16_scales_data: Vec<half::f16> = vec![f16_value; n_groups * out_features];
@@ -4471,7 +4469,7 @@ mod tests {
     assert_eq!(
       sc_a_out.dtype().unwrap(),
       Dtype::F32,
-      "unified dtype must be F32 under F5 escalation (was BF16 pre-fix)"
+      "unified dtype must be F32 under the F16+BF16→F32 escalation"
     );
 
     // Read back as F32 and verify EVERY element still holds 1.0009765625.
@@ -4498,7 +4496,7 @@ mod tests {
     );
   }
 
-  /// F5 [HIGH] END-TO-END order-independence: same as the preservation
+  /// END-TO-END order-independence: same as the preservation
   /// test above, but with prefix names swapped lexicographically (BF16
   /// layer named to sort BEFORE the F16 layer). Guards against any
   /// regression that would reintroduce the lex-last-wins behavior — the
@@ -4518,9 +4516,9 @@ mod tests {
       .map(|i| half::bf16::from_f32(0.5 + 0.01 * (i as f32)))
       .collect();
 
-    // Naming: "alpha" (BF16) sorts BEFORE "zeta" (F16). Under the old
+    // Naming: "alpha" (BF16) sorts BEFORE "zeta" (F16). Under a
     // lex-last policy this would have picked F16 (zeta last); under
-    // the rank-only policy it would pick BF16. Under F5 it MUST be F32.
+    // a rank-only policy it would pick BF16. With the escalation it MUST be F32.
     let qw_alpha = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
     let sc_alpha =
       Array::from_slice::<half::bf16>(&bf16_scales_data, &(n_groups, out_features)).unwrap();
@@ -4563,9 +4561,9 @@ mod tests {
     }
   }
 
-  // ──────────────── Fix 4 [HIGH]: collision with stale `.weight`/`.biases` ────────────────
+  // ──────────────── collision with stale `.weight`/`.biases` ────────────────
 
-  /// Fix 4: input carries `<prefix>.qweight + .scales + .qzeros + .weight` —
+  /// Input carries `<prefix>.qweight + .scales + .qzeros + .weight` —
   /// a stale dense `.weight` next to a valid AWQ triple. The converter would
   /// emit `<prefix>.weight` from the AWQ conversion, then the remainder pass
   /// would OVERWRITE it with the stale input. Preflight collision check
@@ -4596,7 +4594,7 @@ mod tests {
     );
   }
 
-  /// Fix 4: same collision, but with `<prefix>.biases` instead of `.weight`.
+  /// Same collision, but with `<prefix>.biases` instead of `.weight`.
   #[test]
   fn transform_awq_weights_rejects_collision_with_stale_biases() {
     let mut weights = awq_gemm_fixture_weights();
@@ -4620,7 +4618,7 @@ mod tests {
     );
   }
 
-  /// Fix 4: an UNRELATED `.weight` key (different prefix) must NOT trigger
+  /// An UNRELATED `.weight` key (different prefix) must NOT trigger
   /// the collision check — the conversion proceeds and the unrelated dense
   /// key passes through verbatim.
   #[test]
@@ -4647,7 +4645,7 @@ mod tests {
     );
   }
 
-  /// Fix 4: BOTH stale `.weight` + `.biases` present → still errors (the
+  /// BOTH stale `.weight` + `.biases` present → still errors (the
   /// first detected one is fine; this confirms the second one wouldn't
   /// somehow be quiet either, by removing the first and re-running).
   #[test]
@@ -4687,17 +4685,17 @@ mod tests {
     }
   }
 
-  // ──────────────── F5 R3 [MEDIUM]: scoped unification ────────────────
+  // ──────────────── scoped unification ────────────────
 
-  /// F5 R3: a BF16 pass-through tensor (e.g. `embed_tokens.weight`) sitting
+  /// A BF16 pass-through tensor (e.g. `embed_tokens.weight`) sitting
   /// next to a single AWQ-quantized layer with BF16 `.scales` must keep its
   /// ORIGINAL dtype (BF16) after `transform_awq_weights`. The unification
   /// cast applies only to the AWQ-generated `.scales` / `.biases`, not to
-  /// pass-through floating tensors. (Pre-fix, the unification loop walked
-  /// every floating key in the output map, so for a checkpoint whose
-  /// pass-through tensors were already at the resolved dtype this was a
-  /// no-op — but the *bytes-equivalence* contract is what we want: the
-  /// pass-through value is not touched at all.)
+  /// pass-through floating tensors. (Walking every floating key in the
+  /// output map would be a no-op for a checkpoint whose pass-through
+  /// tensors are already at the resolved dtype — but the
+  /// *bytes-equivalence* contract is what we want: the pass-through value
+  /// is not touched at all.)
   #[test]
   fn transform_awq_weights_does_not_widen_passthrough_bf16_tensor() {
     let in_features = 8usize;
@@ -4777,12 +4775,12 @@ mod tests {
     }
   }
 
-  /// F5 R3: a F16 pass-through `lm_head.weight` next to TWO AWQ layers
-  /// (one F16 scales, one BF16 scales — triggers the F5 [HIGH] F32
+  /// A F16 pass-through `lm_head.weight` next to TWO AWQ layers
+  /// (one F16 scales, one BF16 scales — triggers the F32
   /// escalation per `resolve_awq_model_dtype`) must STILL be F16 after
   /// `transform_awq_weights`. The escalation only applies to the
   /// AWQ-generated `.scales` / `.biases`, NOT to pass-through tensors.
-  /// Pre-fix this would have cast `lm_head.weight` from F16 to F32,
+  /// An unscoped cast would widen `lm_head.weight` from F16 to F32,
   /// doubling its resident size + adding a full-size cast allocation.
   #[test]
   fn transform_awq_weights_does_not_widen_passthrough_f16_tensor_when_mixed_with_bf16_awq_scales() {
@@ -4826,7 +4824,7 @@ mod tests {
 
     let (out, _) = transform_awq_weights(weights, &cfg).expect("transform");
 
-    // AWQ-generated outputs ESCALATED to F32 (per F5 [HIGH]).
+    // AWQ-generated outputs ESCALATED to F32.
     let sc_a_out = out.get("layer_a.scales").expect("layer_a.scales");
     assert_eq!(
       sc_a_out.dtype().unwrap(),
@@ -4882,7 +4880,7 @@ mod tests {
     }
   }
 
-  /// F5 R3: explicit contrast — with 1 AWQ layer (BF16 scales, no
+  /// Explicit contrast — with 1 AWQ layer (BF16 scales, no
   /// escalation: resolves to BF16) + 1 F16 pass-through key, the
   /// AWQ-generated `.scales` IS cast (to the resolved BF16) but the
   /// pass-through F16 tensor is left at F16. Confirms the cast is
@@ -4958,11 +4956,11 @@ mod tests {
     }
   }
 
-  /// F5 R3: resident-size proxy — a large-ish pass-through tensor next to
+  /// Resident-size proxy — a large-ish pass-through tensor next to
   /// a single AWQ layer triggering F32 escalation (via a mixed F16+BF16
   /// pair). The pass-through `Array::size()` × `dtype_size()` must be
   /// IDENTICAL pre- vs post-transform (same shape, same dtype → identical
-  /// resident bytes). Pre-fix, the pass-through would have been cast from
+  /// resident bytes). An unscoped cast would widen the pass-through from
   /// BF16 → F32, doubling its resident size.
   #[test]
   fn transform_awq_weights_preserves_resident_size_for_passthrough() {
@@ -4978,7 +4976,7 @@ mod tests {
     let out_features = 8usize;
     let n_groups = 2usize;
 
-    // Mixed F16+BF16 AWQ pair → resolver escalates to F32 (per F5 [HIGH]).
+    // Mixed F16+BF16 AWQ pair → resolver escalates to F32.
     let f16_scales_data: Vec<half::f16> = (0..n_groups * out_features)
       .map(|i| half::f16::from_f32(0.1 * (i + 1) as f32))
       .collect();
@@ -5040,7 +5038,7 @@ mod tests {
       pt_size_post,
       pt_size_pre,
       "pass-through resident size must be IDENTICAL post-transform \
-       (pre-fix this would have doubled from {pt_size_pre} to {} bytes)",
+       (an unscoped cast would double it from {pt_size_pre} to {} bytes)",
       pt_size_pre * 2
     );
   }

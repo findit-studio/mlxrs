@@ -1,23 +1,23 @@
-//! Codex round-2 streaming-detokenizer **correctness** regressions (F1/F2/F3).
+//! Streaming-detokenizer **correctness** regressions.
 //!
-//! These complement `tokenizer_adversarial.rs` (panic/OOM classes) with the
-//! three semantic defects found in round 2:
+//! These complement `tokenizer_adversarial.rs` (panic/OOM classes) with
+//! three semantic defects:
 //!
-//! * **F1** — Naive `text()`/`last_segment()` exposed no incremental text
+//! * Naive `text()`/`last_segment()` exposed no incremental text
 //!   before a newline/`finalize()` (Python returns `_text + _current_text`).
-//! * **F2** — BPE `decode_bytes` corrupted the valid byte `0x00` token
+//! * BPE `decode_bytes` corrupted the valid byte `0x00` token
 //!   (U+0100) into utf-8 text instead of pushing the raw byte.
-//! * **F3** — BPE HashMap fallback injected `"!"` for *every* absent id;
+//! * BPE HashMap fallback injected `"!"` for *every* absent id;
 //!   mlx-lm only does so for ids `>= len(tokenmap)` (`token > max_id`),
 //!   while an in-range hole decodes to `""`.
 //!
 //! Each test is gated on the narrowest feature that provides the type it
-//! exercises so F1 runs under bare `tokenizer-stream` and F2/F3 under
+//! exercises so the naive-streaming test runs under bare `tokenizer-stream` and the two BPE tests under
 //! `tokenizer-bpe` (both of which also run via the `lm` umbrella).
 #![cfg(feature = "tokenizer-stream")]
 
 // ---------------------------------------------------------------------------
-// F1 — Naive streaming exposes in-progress text BEFORE any newline/finalize.
+// Naive streaming exposes in-progress text BEFORE any newline/finalize.
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "tokenizer-stream")]
@@ -76,7 +76,7 @@ fn naive_text_and_last_segment_expose_partial_before_newline() {
 }
 
 // ---------------------------------------------------------------------------
-// F1 (continued) — SPM/BPE still accumulate into `self.text` and stream
+// (continued) — SPM/BPE still accumulate into `self.text` and stream
 // exactly as before the `text() -> Cow` change (zero behaviour delta).
 // ---------------------------------------------------------------------------
 
@@ -126,7 +126,7 @@ fn bpe_streaming_unchanged_after_cow_text() {
 }
 
 // ---------------------------------------------------------------------------
-// F2 — a token decoding (via the GPT-2 byte map) to raw byte 0x00 must
+// a token decoding (via the GPT-2 byte map) to raw byte 0x00 must
 // stream as "\0", NOT the U+0100 text the old `b != 0` guard produced. The
 // state-independence guarantee: `finalize()` yields the same bytes.
 // ---------------------------------------------------------------------------
@@ -168,7 +168,7 @@ fn bpe_byte_zero_token_streams_as_nul_not_u0100() {
 }
 
 // ---------------------------------------------------------------------------
-// F3 — BPE absent-id boundary matches mlx-lm `token < len(tokenmap)`:
+// BPE absent-id boundary matches mlx-lm `token < len(tokenmap)`:
 // an in-range hole (`id <= max_id`, absent) -> "", out-of-range -> "!".
 // Must stay HashMap-backed (a `u32::MAX` id never allocates a dense Vec).
 // ---------------------------------------------------------------------------
@@ -212,7 +212,7 @@ fn bpe_sparse_inrange_hole_is_empty_out_of_range_is_bang() {
 }
 
 // ---------------------------------------------------------------------------
-// F1-perf — Codex round-3 [medium]: `last_segment()` must allocate only the
+// Perf — `last_segment()` must allocate only the
 // per-step delta, NOT clone the whole accumulated output buffer every call
 // (the old `self.text().into_owned()` made a generation loop O(total²)).
 //
@@ -315,10 +315,10 @@ fn last_segment_allocates_only_the_per_step_delta_not_the_whole_buffer() {
 }
 
 // ============================================================
-// P1 #111 — Detokenizer enum unification (kills per-token vtable)
+// #111 — Detokenizer enum unification (kills per-token vtable)
 // ============================================================
 
-/// P1 #111: the [`crate::tokenizer::Tokenizer::detokenizer`] factory
+/// #111: the [`crate::tokenizer::Tokenizer::detokenizer`] factory
 /// returns the enum-unified [`Detokenizer`] variant, not a
 /// `Box<dyn StreamingDetokenizer>`. Naive / SPM / BPE each land in
 /// their typed variant; the per-token `add_token` then dispatches via
@@ -328,7 +328,7 @@ fn last_segment_allocates_only_the_per_step_delta_not_the_whole_buffer() {
 /// `Detokenizer::Naive(NaiveHfDetokenizer)`.
 #[cfg(feature = "tokenizer-stream")]
 #[test]
-fn p1_detokenizer_factory_returns_typed_variant_for_naive() {
+fn detokenizer_factory_returns_typed_variant_for_naive() {
   use mlxrs::tokenizer::{Detokenizer, NaiveHfDetokenizer, StreamingDetokenizer};
   use tokenizers::Tokenizer as HfTokenizer;
   // Load the shipped fixture's HF tokenizer (no network).
@@ -342,12 +342,12 @@ fn p1_detokenizer_factory_returns_typed_variant_for_naive() {
   let _: &[u32] = d.tokens();
 }
 
-/// P1 #111: [`Detokenizer::Custom`] is the escape hatch for out-of-tree
+/// #111: [`Detokenizer::Custom`] is the escape hatch for out-of-tree
 /// streaming detokenizers — the boxed `Box<dyn StreamingDetokenizer>`
 /// adds one indirection per call (same cost as the prior alias).
 #[cfg(feature = "tokenizer-stream")]
 #[test]
-fn p1_detokenizer_custom_escape_hatch() {
+fn detokenizer_custom_escape_hatch() {
   use mlxrs::tokenizer::{Detokenizer, StreamingDetokenizer};
 
   // A no-op detokenizer: every observer returns the empty default.
@@ -391,7 +391,7 @@ fn p1_detokenizer_custom_escape_hatch() {
 
 #[cfg(all(feature = "tokenizer-stream", feature = "tokenizer-spm"))]
 #[test]
-fn p1_detokenizer_spm_variant_exists() {
+fn detokenizer_spm_variant_exists() {
   use mlxrs::tokenizer::{Detokenizer, StreamingDetokenizer, stream::SpmStreamingDetokenizer};
   let vocab = vec![("\u{2581}foo".to_string(), 0u32)];
   let d = Detokenizer::Spm(SpmStreamingDetokenizer::new(vocab, false));
@@ -401,7 +401,7 @@ fn p1_detokenizer_spm_variant_exists() {
 
 #[cfg(all(feature = "tokenizer-stream", feature = "tokenizer-bpe"))]
 #[test]
-fn p1_detokenizer_bpe_variant_exists() {
+fn detokenizer_bpe_variant_exists() {
   use mlxrs::tokenizer::{Detokenizer, StreamingDetokenizer, stream::BpeStreamingDetokenizer};
   let vocab = vec![("\u{0120}foo".to_string(), 0u32)];
   let d = Detokenizer::Bpe(BpeStreamingDetokenizer::new(vocab, false));

@@ -69,7 +69,7 @@ impl std::str::FromStr for Dtype {
 
   /// Parse a canonical dtype name back into a [`Dtype`] — the inverse of
   /// [`Dtype::as_str`] / the derived [`Display`](std::fmt::Display) (audit
-  /// #257 L-P1.3). The accepted strings are exactly the ones `as_str`
+  /// #257). The accepted strings are exactly the ones `as_str`
   /// emits (`"bool"`, `"uint8"`, …, `"complex64"`), so
   /// `Dtype::from_str(d.as_str()) == Ok(d)` round-trips for every variant.
   /// Any other string yields a typed [`Error::UnknownEnumValue`] carrying
@@ -760,7 +760,7 @@ mod tests {
     assert!(!set.contains(&Dtype::I32));
   }
 
-  // `FromStr` is the inverse of `as_str` (audit #257 L-P1.3): parsing the
+  // `FromStr` is the inverse of `as_str` (audit #257): parsing the
   // canonical name of EVERY variant must reproduce that variant exactly, and
   // an unknown name must surface a typed `UnknownEnumValue` error.
   #[test]

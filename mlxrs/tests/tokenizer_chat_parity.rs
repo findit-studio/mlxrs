@@ -1,4 +1,4 @@
-//! HF/Transformers chat-template byte-fidelity regressions (Codex round-5).
+//! HF/Transformers chat-template byte-fidelity regressions.
 //!
 //! Transformers' `_compile_jinja_template` builds the jinja environment as
 //! `ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
@@ -7,10 +7,10 @@
 //! `json.dumps` preserves dict insertion order. These two facts gate
 //! prompt-byte parity:
 //!
-//!  * F1 — `trim_blocks`/`lstrip_blocks` must be enabled so multi-line
+//!  * `trim_blocks`/`lstrip_blocks` must be enabled so multi-line
 //!    templates (real HF templates put `{% for %}`/`{% if %}` on their own
 //!    indented lines) render without spurious blank lines / indentation.
-//!  * F2 — JSON objects flowing through the chat context / `tojson` must keep
+//!  * JSON objects flowing through the chat context / `tojson` must keep
 //!    *insertion* order, not be lexically sorted (serde_json's default
 //!    `BTreeMap`), to match Python `json.dumps`.
 //!
@@ -37,7 +37,7 @@ fn render(template: &str, messages: &Value, tools: Option<&Value>, extra: &Value
 }
 
 // ---------------------------------------------------------------------------
-// F1 — trim_blocks + lstrip_blocks (Transformers jinja env parity)
+// trim_blocks + lstrip_blocks (Transformers jinja env parity)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -77,7 +77,7 @@ USER: {{ m[\"content\"] }}
 }
 
 // ---------------------------------------------------------------------------
-// F2 — JSON object insertion order preserved (Python json.dumps parity)
+// JSON object insertion order preserved (Python json.dumps parity)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -155,7 +155,7 @@ fn tojson_nested_tool_schema_preserves_insertion_order_compact_and_indented() {
 }
 
 // ---------------------------------------------------------------------------
-// Codex round-14 — `documents` is always defined (Transformers passes
+// `documents` is always defined (Transformers passes
 // `documents=documents`, default None, to every render call).
 // ---------------------------------------------------------------------------
 
@@ -248,7 +248,7 @@ fn continue_final_message_strips_trailing_end_of_turn_token() {
 #[test]
 fn continue_final_message_difference_is_exactly_the_terminator() {
   // The two renders differ by *exactly* the trailing end-of-turn run — the
-  // cache-offset divergence the Codex finding flagged. `</s>` here.
+  // cache-offset divergence this guards against. `</s>` here.
   let template = "{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] }}</s>{% endfor %}";
   let messages = json!([{"role": "user", "content": "the quick brown fox"}]);
 
@@ -339,7 +339,7 @@ fn render_continue_result(template: &str, messages: &Value) -> Result<String, ml
 
 #[test]
 fn continue_final_message_template_emits_literal_sentinel_but_drops_content_errors() {
-  // ADVERSARIAL (Codex finding): a template that emits a LITERAL sentinel
+  // ADVERSARIAL: a template that emits a LITERAL sentinel
   // independent of the user's content, and never renders the content itself.
   // HF's guard (`final_message.strip() not in rendered_chat`) rejects this —
   // a trim that keyed only off the sentinel would silently return the literal

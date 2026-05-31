@@ -1,12 +1,10 @@
-//! C7 — `save_wav` f32 → i16 quantize.
+//! `save_wav` f32 → i16 quantize.
 //!
 //! Tracking: [#152](https://github.com/Findit-AI/mlxrs/issues/152).
-//! Plan: `docs/core-arch-simd-candidates.md` §2 row C7, §3.5 (save_wav
-//! quantize).
 //!
 //! # The defect class
 //!
-//! The pre-C7 [`crate::audio::io::save_wav`] inner loop was:
+//! The original [`crate::audio::io::save_wav`] inner loop was:
 //!
 //! ```rust,ignore
 //! for &s in samples {
@@ -64,19 +62,19 @@
 //!
 //! # `MaybeUninit<i16>` API — type-encoded uninit safety
 //!
-//! Matches C4/C6: the kernel API takes `&mut [MaybeUninit<i16>]` so the
+//! Matches the widen/fill kernels: the kernel API takes `&mut [MaybeUninit<i16>]` so the
 //! `save_wav` call site can allocate via `Vec::with_capacity(n)` +
 //! `spare_capacity_mut()` and `set_len(n)` after the kernel returns.
 //! No `from_raw_parts_mut` over uninit memory.
 //!
-//! # Verify-before-claim bench
+//! # Bench
 //!
-//! Bench numbers are **report-only** per the user directive 2026-05-23
-//! (project memory rule **"SIMD ship NEON regardless"**): the NEON
-//! kernel ships unconditionally on aarch64 regardless of how the bench
-//! compares to the auto-vectorized scalar. The bench
-//! (`mlxrs/benches/simd_quantize.rs`) exists as a regression guard
-//! against both a future scalar regression and a future NEON regression.
+//! The NEON kernel ships unconditionally on aarch64 because
+//! auto-vectorization of the scalar arm is compiler-version-dependent,
+//! so bench numbers are report-only and do not drive the ship decision.
+//! The bench (`mlxrs/benches/simd_quantize.rs`) exists as a regression
+//! guard against both a future scalar regression and a future NEON
+//! regression.
 
 use core::mem::MaybeUninit;
 
@@ -88,11 +86,11 @@ use core::arch::aarch64::{
 
 /// The f32-to-i16 quantization scale.
 ///
-/// P6 / AUDIO-4 (#130): mlxrs uses the **symmetric** convention
+/// #130: mlxrs uses the **symmetric** convention
 /// (`* 32768.0` on write + `/ 32768.0` on read — matches `torchaudio.save`'s
 /// default and avoids the 1-LSB drift the asymmetric `mlx_audio.audio_io`
-/// convention introduces on `read → write → read` round-trips). The earlier
-/// port mirrored the reference's `write = * 32767` for byte-faithfulness;
+/// convention introduces on `read → write → read` round-trips). The
+/// reference's asymmetric `write = * 32767` is byte-faithful but lossy;
 /// the symmetric form is correctness-preserving (round-trip is exact within
 /// `[-1.0, 1.0)` and only `+1.0` clips by one LSB on the positive extreme).
 ///
@@ -110,7 +108,7 @@ const I16_MUL: f32 = 32_768.0;
 /// **Always compiled** — independent of `target_arch`. Anchors the
 /// math contract (each input `s` becomes
 /// `(s.clamp(-1.0, 1.0) * I16_MUL).round() as i16`, where `I16_MUL =
-/// 32768.0` — see [`I16_MUL`] / AUDIO-4 (#130) for the symmetric
+/// 32768.0` — see [`I16_MUL`] / #130 for the symmetric
 /// `read = / 32768.0` / `write = * 32768.0` convention), is the
 /// differential-test oracle, and is the fallback path.
 ///
@@ -239,7 +237,7 @@ pub(crate) unsafe fn f32_to_i16_quantize_neon(out: &mut [MaybeUninit<i16>], src:
       let v_lo = vminq_f32(vmaxq_f32(v_lo, lo_bound), hi_bound);
       let v_hi = vminq_f32(vmaxq_f32(v_hi, lo_bound), hi_bound);
 
-      // Scale by I16_MUL = 32768.0 (P6 / AUDIO-4: symmetric `* 32768`
+      // Scale by I16_MUL = 32768.0 (symmetric `* 32768`
       // convention matching `torchaudio.save`).
       let v_lo = vmulq_n_f32(v_lo, I16_MUL);
       let v_hi = vmulq_n_f32(v_hi, I16_MUL);
@@ -275,7 +273,7 @@ pub(crate) unsafe fn f32_to_i16_quantize_neon(out: &mut [MaybeUninit<i16>], src:
 ///
 /// Used by [`crate::audio::io::save_wav`] to pre-quantize the f32
 /// sample buffer to i16 before a single bulk byte write — replacing
-/// the pre-C7 per-sample `writer.write_all(&q.to_le_bytes())` BufWriter
+/// the original per-sample `writer.write_all(&q.to_le_bytes())` BufWriter
 /// loop.
 ///
 /// # Preconditions
@@ -320,7 +318,7 @@ pub fn f32_to_i16_quantize(out: &mut [MaybeUninit<i16>], src: &[f32]) {
 #[cfg(test)]
 mod tests {
   //! Scalar vs dispatcher + scalar vs NEON differential tests + edge
-  //! coverage for C7.
+  //! coverage for the quantize.
 
   use core::mem::MaybeUninit;
 
@@ -408,7 +406,7 @@ mod tests {
     }
   }
 
-  /// Lane-sweep covers C7-relevant boundary lengths.
+  /// Lane-sweep covers quantize-relevant boundary lengths.
   #[test]
   fn quantize_lane_sweep_covers_tile_boundaries() {
     let sweep = lane_sweep_lengths(8);
@@ -424,7 +422,7 @@ mod tests {
 
   /// Edge: pin specific values to lock contract.
   ///
-  /// P6 / AUDIO-4 (#130): with `I16_MUL = 32768.0` (symmetric `* 32768`
+  /// #130: with `I16_MUL = 32768.0` (symmetric `* 32768`
   /// convention matching `torchaudio.save`):
   ///
   /// - `0.0` → `0` (no rounding ambiguity).
@@ -447,8 +445,8 @@ mod tests {
 
   /// Behavioural test — the dispatcher must produce byte-identical
   /// output to the per-sample `(s.clamp(-1.0, 1.0) * 32768.0).round() as
-  /// i16` loop over a representative sample population. P6 / AUDIO-4
-  /// (#130): scale is `32768.0`, matching the symmetric write convention.
+  /// i16` loop over a representative sample population. #130: scale is
+  /// `32768.0`, matching the symmetric write convention.
   #[test]
   fn quantize_matches_reference_loop() {
     let n = 65_536_usize;
@@ -472,7 +470,7 @@ mod tests {
     assert_eq!(new, reference);
   }
 
-  /// P6 / AUDIO-4 (#130) regression — `read` divides by `I16_DIV =
+  /// #130 regression — `read` divides by `I16_DIV =
   /// 32768.0` and `write` multiplies by `I16_MUL = 32768.0`, so the
   /// symmetric `f32 → i16 → f32` round-trip is exact (within rounding)
   /// for in-range samples. This pins the symmetry so a future asymmetric

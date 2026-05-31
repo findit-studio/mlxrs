@@ -9,7 +9,7 @@
 //! current playback state, runs an echo-correlation check via the
 //! [`AudioOutputStream::echo_correlation`][vp-echo], and waits for a
 //! partial transcript before confirming the candidate. Per the
-//! [mirror-reference-structure][mirror] rule mlxrs lifts the **decision
+//! mirror-reference-structure rule mlxrs lifts the **decision
 //! shape** out as a trait so callers can swap in a custom detector
 //! (e.g. one that uses a smarter echo cancellation model) without
 //! rewriting [`super::orchestrator::VoiceSession`]; the default
@@ -27,7 +27,6 @@
 //!
 //! [vp-barge]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/voice_pipeline.py#L951-L1075
 //! [vp-echo]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/voice_pipeline.py#L544-L563
-//! [mirror]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/mirror-reference-structure.md
 
 /// The shape the orchestrator queries per input frame to ask:
 /// "given this user audio and whether TTS is playing, should this be

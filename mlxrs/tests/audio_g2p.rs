@@ -159,7 +159,7 @@ fn cmudict_parse_primary_only_drops_variants() {
 fn cmudict_parse_line_malformed_returns_err_with_line_number() {
   // Line 7 has no whitespace (i.e. word with no pronunciation) — must
   // surface as `Err(Error::OutOfRange)` whose payload carries the line
-  // number in `value()` (post-§5 typed-payload migration).
+  // number in `value()`.
   let err = parse_line("nospaces", 7).unwrap_err();
   match err {
     mlxrs::Error::OutOfRange(p) => {

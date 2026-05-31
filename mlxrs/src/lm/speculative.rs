@@ -66,7 +66,7 @@ use crate::{
   },
   ops,
 };
-// P1 #111: bring the trait into scope so the `Detokenizer` enum's
+// Bring the trait into scope so the `Detokenizer` enum's
 // `StreamingDetokenizer` impl methods dispatch through the enum value.
 #[cfg(feature = "tokenizer-stream")]
 use crate::tokenizer::StreamingDetokenizer as _;
@@ -451,7 +451,7 @@ struct TokenOut {
 ///
 /// Stats are tracked at YIELD time, not at step-build time, so an early
 /// EOS that drops un-yielded pending entries does NOT count them as
-/// generated / accepted / proposed (per Fix 2). The `delta` carries:
+/// generated / accepted / proposed. The `delta` carries:
 ///
 /// - `proposed`: how many drafts this yield "covers" (1 per accepted-draft
 ///   yield, `num_draft - n_accept` on the bonus so the **bonus** yield
@@ -513,8 +513,8 @@ struct SpeculativeDriver<'a> {
   /// Pending tokens to yield (accepted drafts + bonus), drained one per
   /// `next_token` call so each yields a single token to the streaming
   /// detokenizer. Each entry carries a per-token stats **delta** that is
-  /// applied at yield time (Fix 2 — early EOS that drops the remaining
-  /// entries does NOT count them).
+  /// applied at yield time (early EOS that drops the remaining entries
+  /// does NOT count them).
   pending: std::collections::VecDeque<PendingToken>,
   /// Running stats.
   stats: GenerationStats,
@@ -551,8 +551,8 @@ impl<'a> SpeculativeDriver<'a> {
         "speculative_generate: prompt",
       )));
     }
-    // AUDIO-12 #136 — eager scalar-bound validation of every sampler /
-    // logits-processor knob in `cfg` BEFORE any prefill / model work,
+    // Eager scalar-bound validation of every sampler /
+    // logits-processor knob in `cfg` BEFORE any prefill / model work (#136),
     // mirroring single-seq [`crate::lm::generate::generate_step`] and
     // [`crate::lm::generate::batch_generate_step`]. Without this gate
     // an invalid `cfg` would pass the sampler / processor constructors
@@ -630,8 +630,8 @@ impl<'a> SpeculativeDriver<'a> {
   }
 
   /// Pull the next token (or `None` at end). Drains the pending queue from
-  /// the prior speculative step before starting a new one. Per Fix 2,
-  /// committing the pending entry's [`StatsDelta`] happens HERE (yield
+  /// the prior speculative step before starting a new one.
+  /// Committing the pending entry's [`StatsDelta`] happens HERE (yield
   /// time), not at step-build time — so an early EOS in `stream_generate`
   /// that drops the remaining pending tokens leaves `self.stats` reflecting
   /// only what was actually yielded.
@@ -659,7 +659,7 @@ impl<'a> SpeculativeDriver<'a> {
   /// covers `num_draft - n_accept` proposals); accepted-draft yields each
   /// account for one proposal. If EOS interrupts before the bonus yields,
   /// those rejected drafts are NOT counted as proposed — which matches
-  /// the "discard unyielded" semantics of the Fix 2 spec.
+  /// the "discard unyielded" semantics.
   fn commit_pending(&mut self, t: PendingToken) -> TokenOut {
     self.stats.proposed_drafts += t.delta.proposed;
     self.stats.accepted_drafts += t.delta.accepted;
@@ -675,7 +675,7 @@ impl<'a> SpeculativeDriver<'a> {
   /// One speculative step: draft, verify, accept-prefix, emit bonus,
   /// rewind. Pushes every yielded token onto `self.pending`.
   ///
-  /// **History semantics (Fix 1).** The processor history (`self.history`)
+  /// **History semantics.** The processor history (`self.history`)
   /// is "tokens FED to the target model up to and including the current
   /// step's `y_input`", exactly matching plain
   /// [`crate::lm::generate`]'s `Generator::history` after the same number
@@ -688,7 +688,7 @@ impl<'a> SpeculativeDriver<'a> {
   /// history-sensitive logits-processor (rep / presence / frequency
   /// penalties, logit bias).
   ///
-  /// **Stats semantics (Fix 2).** `self.stats` is mutated only when a
+  /// **Stats semantics.** `self.stats` is mutated only when a
   /// pending token is YIELDED (see [`Self::commit_pending`]); this method
   /// just records each yield's [`StatsDelta`] alongside the [`PendingToken`].
   /// An early EOS in `stream_generate` that drops the remaining pending
@@ -701,7 +701,7 @@ impl<'a> SpeculativeDriver<'a> {
     // `remaining == 1` we still propose 1 draft; the bonus block then
     // skips because `produced` reaches `max_tokens` after the accept loop
     // (`hit_max == true`), and the pending entries are committed at yield
-    // time only (R2's `commit_pending` already drops any over-enqueued
+    // time only (`commit_pending` already drops any over-enqueued
     // pending past the length boundary because `next_token` stops calling
     // `run_speculative_step` once `produced >= max_tokens`). This matches
     // mlx-lm exactly: a final 1-token remainder still gets ONE draft
@@ -742,8 +742,7 @@ impl<'a> SpeculativeDriver<'a> {
     // (the "permanent" history before this step) that we extend by the
     // tokens FED at each position (`combined[pos]`). `self.history`
     // itself is NOT mutated here — we wait until `n_accept` is known
-    // (the Fix 1 invariant: only kept-by-verifier tokens get
-    // committed).
+    // (the invariant: only kept-by-verifier tokens get committed).
     let mut target_tokens: Vec<u32> = try_with_capacity(n_predict)?;
     let mut target_logprobs: Vec<Array> = try_with_capacity(n_predict)?;
     let have_procs = !self.processors.is_empty();
@@ -776,7 +775,7 @@ impl<'a> SpeculativeDriver<'a> {
     }
 
     // (4) Accept loop (mlx-lm lines 622-634): walk drafts, break on first
-    // mismatch, then emit bonus. Per Fix 2, we push `PendingToken`s with
+    // mismatch, then emit bonus. We push `PendingToken`s with
     // a `StatsDelta` but DO NOT mutate `self.stats` here — the delta is
     // applied at yield time in [`Self::commit_pending`].
     let mut n_accept = 0usize;
@@ -793,7 +792,7 @@ impl<'a> SpeculativeDriver<'a> {
       let lp = std::mem::replace(&mut target_logprobs[i], empty_logprobs()?);
       // Each accepted-draft yield "covers" one proposal (the bonus's
       // delta picks up the remaining `num_draft - n_accept` rejected
-      // proposals — see below). Per Fix 2, a yield that never happens
+      // proposals — see below). A yield that never happens
       // does not count toward `proposed_drafts`.
       self.pending.push_back(PendingToken {
         token: t_n,
@@ -832,7 +831,7 @@ impl<'a> SpeculativeDriver<'a> {
       });
     }
 
-    // (Fix 1) Permanent history update: advance `self.history` by tokens
+    // Permanent history update: advance `self.history` by tokens
     // FED this step that the verifier kept — `y_input` (the current
     // input) plus `accepted_drafts[0..n_accept]` (the drafts that target
     // verification accepted). Do NOT push the bonus (it gets fed on the
@@ -883,7 +882,7 @@ impl<'a> SpeculativeDriver<'a> {
   /// sampler / processors as the target (mlx-lm `_step(draft_model,
   /// draft_cache, y)`, same per-call sampler).
   ///
-  /// **Draft processor history (Fix 1).** The draft's `draft_history`
+  /// **Draft processor history.** The draft's `draft_history`
   /// snapshot starts as `self.history.clone()` (the permanent history
   /// after the previous step's commit), then grows by exactly ONE token
   /// per draft iteration — the most recently committed yielded token. At

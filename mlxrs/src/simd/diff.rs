@@ -9,15 +9,15 @@
 //!
 //! # Two correctness classes
 //!
-//! Per `docs/core-arch-simd-candidates.md` §5.3, split kernels into:
+//! Split kernels into:
 //!
 //! - **[`assert_eq_over_lane_sweep`]** — the `Exact` class. Used for
 //!   data-movement / lossless-widening kernels:
-//!     - **C1**  ([#146](https://github.com/Findit-AI/mlxrs/issues/146)) integer arms of PCM decode-widen,
-//!     - **C3**  ([#148](https://github.com/Findit-AI/mlxrs/issues/148)) u8→f32 RGB widen,
-//!     - **C4**  ([#149](https://github.com/Findit-AI/mlxrs/issues/149)) BGR R↔B swap widen,
-//!     - **C6**  ([#151](https://github.com/Findit-AI/mlxrs/issues/151)) `pad_to_square` fill,
-//!     - **C5**  ([#150](https://github.com/Findit-AI/mlxrs/issues/150)) `rotate_buf` permutation.
+//!     - integer arms of PCM decode-widen ([#146](https://github.com/Findit-AI/mlxrs/issues/146)),
+//!     - u8→f32 RGB widen ([#148](https://github.com/Findit-AI/mlxrs/issues/148)),
+//!     - BGR R↔B swap widen ([#149](https://github.com/Findit-AI/mlxrs/issues/149)),
+//!     - `pad_to_square` fill ([#151](https://github.com/Findit-AI/mlxrs/issues/151)),
+//!     - `rotate_buf` permutation ([#150](https://github.com/Findit-AI/mlxrs/issues/150)).
 //!
 //!   The SIMD output **must be bit-identical** to scalar; the helper
 //!   asserts `scalar_out == simd_out`. For `f32`/`f64` outputs you
@@ -33,7 +33,7 @@
 //!   scalar tree mirrors NEON's, but the generic `Tolerance` shape is
 //!   the right shape for *new* fp reductions where that property has
 //!   not been engineered):
-//!     - **C2**  ([#147](https://github.com/Findit-AI/mlxrs/issues/147)) loudness sum-of-squares,
+//!     - loudness sum-of-squares ([#147](https://github.com/Findit-AI/mlxrs/issues/147)),
 //!     - any future fp reduction without a matched reduction tree.
 //!
 //!   The helper asserts
@@ -43,9 +43,9 @@
 //!   class, *vector* output. The elementwise twin of
 //!   [`assert_close_over_lane_sweep`] for fp kernels that return a
 //!   `Vec<f64>`:
-//!     - **C5**  ([#150](https://github.com/Findit-AI/mlxrs/issues/150)) `rotate_buf` permutation (vector output),
-//!     - **C10** ([#155](https://github.com/Findit-AI/mlxrs/issues/155)) `mel_filter_bank` triangle construction,
-//!     - **C12** ([#157](https://github.com/Findit-AI/mlxrs/issues/157)) window generation (Hann / Hamming),
+//!     - `rotate_buf` permutation, vector output ([#150](https://github.com/Findit-AI/mlxrs/issues/150)),
+//!     - `mel_filter_bank` triangle construction ([#155](https://github.com/Findit-AI/mlxrs/issues/155)),
+//!     - window generation, Hann / Hamming ([#157](https://github.com/Findit-AI/mlxrs/issues/157)),
 //!     - any future fp kernel that emits a vector rather than a scalar.
 //!
 //!   The helper asserts the dispatcher and scalar outputs have the
@@ -58,7 +58,7 @@
 //! All three helpers call the input generator at lengths
 //! `{0, 1, lanes-1, lanes, lanes+1, 2*lanes-1, 2*lanes, 3*lanes, 3*lanes+1}`
 //! so the kernel's head / body / tail paths are *all* exercised
-//! (§5.3 — "Cover the tail / remainder"). The two clean-multi-block
+//! (covering the tail / remainder). The two clean-multi-block
 //! lengths (`2*lanes`, `3*lanes`) specifically catch off-by-one bugs
 //! on the chunk-loop bound that a sweep without them would miss (a
 //! kernel that mis-handles `len == k * lanes && tail == 0` can pass a
@@ -164,7 +164,8 @@ pub fn lane_sweep_lengths(lanes: usize) -> [usize; 9] {
 /// Use for data-movement / lossless-widening kernels — the SIMD output
 /// must be bit-identical to scalar (no rounding, no FMA, no
 /// re-association). See the module doc for the kernel-class catalog
-/// (C1 integer arms, C3, C4, C5, C6).
+/// (the integer-widen arms, RGB and BGR widen, `rotate_buf`, and
+/// `pad_to_square` fill).
 ///
 /// For `f32`/`f64` outputs, prefer comparing on `.to_bits()` at the
 /// call site (the existing `dot` / `sum_of_squares` differential tests
@@ -211,7 +212,7 @@ pub fn assert_eq_over_lane_sweep<T, R, S, D, G>(
 /// output is within `abs.max(rel * scalar.abs())` of the scalar
 /// reference at every length in [`lane_sweep_lengths`].
 ///
-/// Use for fp-reduction / FMA-rounding kernels (C2 loudness
+/// Use for fp-reduction / FMA-rounding kernels (loudness
 /// sum-of-squares; any future fp reduction without a deliberately
 /// matched reduction tree). The check shape mirrors `numpy.isclose` /
 /// `approx::abs_diff_eq` / `assert_relative_eq!`: pass if
@@ -268,14 +269,14 @@ pub fn assert_close_over_lane_sweep<T, S, D, G>(
 ///   `(s - d).abs() <= abs.max(rel * s.abs())` — the same combined
 ///   abs/rel shape as [`assert_close_over_lane_sweep`].
 ///
-/// Use for vector-producing fp kernels — the C5 `rotate_buf`
-/// permutation, C10 `mel_filter_bank` triangle construction, C12
-/// window-generation candidates documented under `simd::audio` /
-/// `simd::vlm` (the C-series catalog; both modules are `pub(crate)`
-/// so are not intra-doc-linked from this public helper). The
-/// existing scalar [`assert_close_over_lane_sweep`] only covers fp
-/// *scalar* reductions (C2 loudness sum-of-squares); this sibling
-/// covers their vector-output counterparts.
+/// Use for vector-producing fp kernels — the `rotate_buf`
+/// permutation, `mel_filter_bank` triangle construction, and
+/// window-generation kernels documented under `simd::audio` /
+/// `simd::vlm` (both modules are `pub(crate)` so are not
+/// intra-doc-linked from this public helper). The existing scalar
+/// [`assert_close_over_lane_sweep`] only covers fp *scalar*
+/// reductions (loudness sum-of-squares); this sibling covers their
+/// vector-output counterparts.
 ///
 /// # Output type
 ///

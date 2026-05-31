@@ -1,12 +1,12 @@
 //! Arithmetic ops: element-wise binary and unary primitives.
 //!
-//! Phase 4 Branch A subset:
+//! Core:
 //! - Binary: `add` (template), `subtract`, `multiply`, `divide`, `maximum`,
 //!   `minimum`, `power`.
 //! - Unary: `negative`, `abs`, `sqrt`, `square`, `exp`, `log`, `sin`, `cos`,
 //!   `tan`, `tanh`.
 //!
-//! M2a long-tail extensions:
+//! Long-tail extensions:
 //! - Binary: `arctan2`, `divmod` (returns `(quot, rem)`), `floor_divide`,
 //!   `remainder`, `bitwise_and`, `bitwise_or`, `bitwise_xor`, `left_shift`,
 //!   `right_shift`.

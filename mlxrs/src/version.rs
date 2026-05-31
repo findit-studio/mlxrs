@@ -11,7 +11,7 @@ pub fn version() -> &'static str {
   VERSION.get_or_init(|| {
     // SAFETY: mlx_string_new + mlx_version + mlx_string_data + mlx_string_free
     // are an idiomatic mlx-c sequence. Errors here would surface via the global
-    // error handler installed in Phase 3; for Phase 1 we trust the call.
+    // error handler once it is installed; until then we trust the call.
     unsafe {
       let mut s = mlxrs_sys::mlx_string_new();
       let rc = mlxrs_sys::mlx_version(&mut s);

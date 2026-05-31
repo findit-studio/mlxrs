@@ -2,8 +2,8 @@
 //! VAD + STT + LLM + TTS + audio-out composition surface, ported from
 //! [`mlx_audio.sts.voice_pipeline`][vp].
 //!
-//! Per the [no per-model arch porting][noarch] rule and the
-//! [mirror-reference-structure][mirror] rule, mlxrs lifts the
+//! Per the no per-model arch porting rule and the
+//! mirror-reference-structure rule, mlxrs lifts the
 //! *orchestration shape* mlx-audio's [`VoicePipeline`][vp-class]
 //! exposes as a typed trait surface every caller composes:
 //!
@@ -34,13 +34,13 @@
 //!   [`crate::audio::tts::model::TtsModel`] trait surfaces
 //!   expose).
 //!
-//! ## Scope cuts (explicit, A8)
+//! ## Scope cuts (explicit)
 //!
 //! mlx-audio's `voice_pipeline.py` carries 1500+ lines of
 //! `asyncio` orchestration, real-time logging, and per-architecture
 //! state (Voxtral streaming sessions, smart-turn endpoint
-//! detectors). Per the project's [match-official-binding-design][match]
-//! and [no per-model arch porting][noarch] rules, mlxrs ports only
+//! detectors). Per the project's match-official-binding-design
+//! and no per-model arch porting rules, mlxrs ports only
 //! the **shape** of that orchestration as composable traits + a
 //! synchronous default `VoiceSession`. Out-of-scope:
 //!
@@ -72,9 +72,6 @@
 //! [vp]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/voice_pipeline.py
 //! [vp-class]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/voice_pipeline.py#L570-L572
 //! [orch-session]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/voice_pipeline.py#L570-L572
-//! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
-//! [mirror]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/mirror-reference-structure.md
-//! [match]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/match-official-binding-design.md
 
 pub mod barge_in;
 pub mod chunker;

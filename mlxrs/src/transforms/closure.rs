@@ -99,8 +99,9 @@ impl Closure {
     // In production we call mlx-c directly. In `cfg(test)` builds we route
     // through a swappable function pointer (`test_seam::closure_new_fn`) so
     // unit tests can inject a NULL-returning stub that exercises the
-    // `inner.ctx.is_null()` branch where the pre-fix F1 double-free lived —
-    // see the `tests::closure_new_returns_err_*` cases in this file. The
+    // `inner.ctx.is_null()` branch where a double-free could otherwise
+    // occur — see the `tests::closure_new_returns_err_*` cases in this
+    // file. The
     // `#[cfg(test)]` arm defaults to the same FFI symbol; test stubs satisfy
     // the same ABI + ownership contract (see `test_seam` docs), so the
     // unsafe contract is identical between the two arms.
@@ -486,8 +487,8 @@ where
   // before the `catch` clause returns NULL. Therefore the NULL-ctx return
   // path below MUST NOT reclaim the box — that would double-free / UAF.
   // Production: direct FFI; tests: route through the swappable seam so the
-  // NULL-ctx branch (which used to double-free in F1) is exercised
-  // deterministically by `tests::closure_custom_new_returns_err_*`.
+  // NULL-ctx branch (where a double-free could otherwise occur) is
+  // exercised deterministically by `tests::closure_custom_new_returns_err_*`.
   // SAFETY: `payload_ptr` is a freshly leaked `Box<BoxedFn3>` whose
   // ownership transfers to mlx-c per the contract documented above.
   let inner = unsafe { call_closure_custom_new_ffi(payload_ptr) };
@@ -597,11 +598,12 @@ extern "C" fn destroy_payload_3(payload: *mut c_void) {
 /// below swap in a deterministic stub that simulates mlx-c's
 /// shared_ptr-then-throw failure mode (invokes the destructor we registered,
 /// then returns NULL ctx) to exercise the `inner.ctx.is_null()` branch
-/// where the pre-fix F1 double-free lived. Without this seam the NULL-ctx
-/// branch is unreachable from Rust (we cannot inject OOM into mlx-c) and
-/// CI would be blind to a regression that re-introduced the reclaim.
+/// where a double-free could otherwise occur. Without this seam the
+/// NULL-ctx branch is unreachable from Rust (we cannot inject OOM into
+/// mlx-c) and CI would be blind to a regression that re-introduced the
+/// reclaim.
 ///
-/// ## R3-F2 fix: serialization + non-reentrant install lock
+/// ## Serialization + non-reentrant install lock
 ///
 /// Each per-constructor slot now has TWO collaborators:
 ///
@@ -796,17 +798,17 @@ pub(crate) mod test_seam {
 
 #[cfg(test)]
 mod tests {
-  //! Deterministic regression tests for F1 (NULL-ctx UAF) via the
+  //! Deterministic regression tests for the NULL-ctx UAF via the
   //! [`test_seam`] function-pointer indirection.
   //!
-  //! Pre-fix `Closure::new` and `closure_custom_new` reclaimed the payload
-  //! via `Box::from_raw(payload_ptr.cast())` when mlx-c returned a NULL
-  //! `ctx`. Per `mlx-c/mlx/c/closure.cpp` lines 70 / 471 mlx-c constructs a
-  //! `std::shared_ptr<void>(payload, dtor)` as the first statement of the
-  //! `try` block, so on any later throw the shared_ptr destructor has
-  //! already invoked the registered Rust destructor (`destroy_payload` /
-  //! `destroy_payload_3`) during stack unwinding — the Rust-side reclaim
-  //! was a double-free / UAF.
+  //! A naive `Closure::new` / `closure_custom_new` would reclaim the
+  //! payload via `Box::from_raw(payload_ptr.cast())` when mlx-c returned a
+  //! NULL `ctx`. Per `mlx-c/mlx/c/closure.cpp` lines 70 / 471 mlx-c
+  //! constructs a `std::shared_ptr<void>(payload, dtor)` as the first
+  //! statement of the `try` block, so on any later throw the shared_ptr
+  //! destructor has already invoked the registered Rust destructor
+  //! (`destroy_payload` / `destroy_payload_3`) during stack unwinding —
+  //! such a Rust-side reclaim would be a double-free / UAF.
   //!
   //! We can't deterministically inject OOM into mlx-c, so the integration
   //! tests in `tests/transforms.rs` only ever exercise the success path
@@ -815,30 +817,30 @@ mod tests {
   //! that gap by swapping in a stub constructor that simulates the
   //! shared_ptr-then-throw failure mode.
   //!
-  //! ## R3-F1 fix: ground-truth Drop sentinel
+  //! ## Ground-truth Drop sentinel
   //!
-  //! Earlier seam tests asserted on a `static CLOSURE_DTOR_CALLS` counter
-  //! that the STUB itself incremented before invoking the destructor.
-  //! That counter does NOT observe the actual `Box<BoxedFn>` drop: a
-  //! regression re-introducing `Box::from_raw(payload_ptr)` on the
-  //! NULL-ctx branch would still produce `CLOSURE_DTOR_CALLS == 1` (the
-  //! stub bumps it exactly once), even though TWO drops happened (the
-  //! stub's `d(payload)` call ran the destructor, then the Rust reclaim
-  //! ran it again → UB). The deliberate-breakage test caught it
-  //! incidentally via SIGSEGV, but that is not a deterministic
-  //! observation: under different allocator state or with the `_no_dtor`
-  //! variant the regression would silently pass.
+  //! A `static CLOSURE_DTOR_CALLS` counter that the STUB itself
+  //! incremented before invoking the destructor would NOT observe the
+  //! actual `Box<BoxedFn>` drop: a regression re-introducing
+  //! `Box::from_raw(payload_ptr)` on the NULL-ctx branch would still
+  //! produce `CLOSURE_DTOR_CALLS == 1` (the stub bumps it exactly once),
+  //! even though TWO drops happened (the stub's `d(payload)` call ran the
+  //! destructor, then the Rust reclaim ran it again → UB). Such a
+  //! regression would surface only incidentally via SIGSEGV, which is not
+  //! a deterministic observation: under different allocator state or with
+  //! the `_no_dtor` variant the regression would silently pass.
   //!
-  //! These tests now capture a [`DropSentinel`] in the user closure via
-  //! `move`. The sentinel's `Drop` impl increments a per-test
+  //! These tests instead capture a [`DropSentinel`] in the user closure
+  //! via `move`. The sentinel's `Drop` impl increments a per-test
   //! `Arc<AtomicUsize>` — counting the ACTUAL number of times the boxed
-  //! closure was reclaimed. Pre-fix would produce `drop_counter == 2`
-  //! (double-free); post-fix produces exactly `1` on the dtor-invoked
-  //! stub and `0` on the no-dtor stub (leak-over-UAF contract: when
-  //! mlx-c did not run the destructor, Rust MUST NOT reclaim — a leak is
-  //! strictly preferable to UB).
+  //! closure was reclaimed. A `Box::from_raw` reclaim on the NULL-ctx
+  //! branch would produce `drop_counter == 2` (double-free); the correct
+  //! code produces exactly `1` on the dtor-invoked stub and `0` on the
+  //! no-dtor stub (leak-over-UAF contract: when mlx-c did not run the
+  //! destructor, Rust MUST NOT reclaim — a leak is strictly preferable to
+  //! UB).
   //!
-  //! ## R3-F2 fix: serial_guard
+  //! ## serial_guard
   //!
   //! Every seam test acquires [`serial_guard`] as its FIRST action. This
   //! is a crate-local `Mutex<()>` that strictly serializes the seam
@@ -879,13 +881,13 @@ mod tests {
   /// the shared `Arc<AtomicUsize>`, giving ground truth on how many
   /// times the boxed closure was reclaimed.
   ///
-  /// Expected post-fix counts:
+  /// Expected counts for the correct code:
   /// * dtor-invoked stub: 1 (mlx-c's shared_ptr destructor — modelled
   ///   by the stub — runs `destroy_payload`, which drops the box).
   /// * no-dtor stub: 0 (mlx-c surfaced NULL without ever constructing
   ///   the shared_ptr — Rust accepts a tiny leak rather than reclaim).
   ///
-  /// Pre-fix (`Box::from_raw` on the NULL-ctx branch): 2 on the
+  /// A `Box::from_raw` reclaim on the NULL-ctx branch: 2 on the
   /// dtor-invoked path (double-free) and 1 on the no-dtor path (UAF on
   /// any subsequent mlx-c-internal shared_ptr drop the test can't
   /// observe; instrumented here so the regression fails deterministically
@@ -978,23 +980,23 @@ mod tests {
       "Closure::new must surface Err when mlx-c returns NULL ctx"
     );
 
-    // CRITICAL F1 regression assert: the boxed closure was reclaimed
+    // Regression assert: the boxed closure was reclaimed
     // EXACTLY ONCE — via the stub's invocation of `destroy_payload`,
     // which `Box::from_raw`'s the payload and drops the inner closure
     // (and with it, the captured sentinel).
     //
-    // Pre-fix the production NULL-ctx branch ALSO called
-    // `Box::from_raw(payload_ptr)` — that's a second drop on the same
-    // pointer → double-free / UB. The earlier `CLOSURE_DTOR_CALLS`
-    // static (incremented in the STUB) could not detect this; it would
-    // still read 1 because the stub only bumps it once. The sentinel-
-    // backed `drop_counter` here counts ACTUAL drops, so a pre-fix
-    // regression deterministically fails this assertion with the value 2.
+    // A NULL-ctx branch that ALSO called `Box::from_raw(payload_ptr)`
+    // would do a second drop on the same pointer → double-free / UB. A
+    // `CLOSURE_DTOR_CALLS` static (incremented in the STUB) could not
+    // detect this; it would still read 1 because the stub only bumps it
+    // once. The sentinel-backed `drop_counter` here counts ACTUAL drops,
+    // so such a regression deterministically fails this assertion with
+    // the value 2.
     let observed = drop_counter.load(Ordering::SeqCst);
     assert_eq!(
       observed, 1,
-      "F1 REGRESSION: boxed closure was dropped {observed} times; expected \
-       EXACTLY 1 (a pre-fix `Box::from_raw` on the NULL-ctx branch produces \
+      "REGRESSION: boxed closure was dropped {observed} times; expected \
+       EXACTLY 1 (a `Box::from_raw` reclaim on the NULL-ctx branch produces \
        2 = double-free / UAF; a missing-dtor regression produces 0)."
     );
   }
@@ -1023,9 +1025,9 @@ mod tests {
     // an mlx-c-internal later drop on the still-live payload would
     // make a Rust-side reclaim a UAF. We accept the (tiny) leak.
     //
-    // The sentinel-backed `drop_counter` deterministically reads 0 in
-    // the post-fix world. A pre-fix `Box::from_raw` regression on the
-    // NULL-ctx branch would advance it to 1, failing the assertion.
+    // The sentinel-backed `drop_counter` deterministically reads 0 for
+    // the correct code. A `Box::from_raw` reclaim on the NULL-ctx branch
+    // would advance it to 1, failing the assertion.
     let observed = drop_counter.load(Ordering::SeqCst);
     assert_eq!(
       observed, 0,
@@ -1104,14 +1106,14 @@ mod tests {
       "closure_custom_new must surface Err when mlx-c returns NULL ctx"
     );
 
-    // F1 regression assert for the `BoxedFn3` path. Same rationale as
-    // `Closure::new`: pre-fix `Box::from_raw` produces 2 (double-free);
-    // post-fix is exactly 1 (stub-invoked `destroy_payload_3`).
+    // Regression assert for the `BoxedFn3` path. Same rationale as
+    // `Closure::new`: a `Box::from_raw` reclaim produces 2 (double-free);
+    // the correct code is exactly 1 (stub-invoked `destroy_payload_3`).
     let observed = drop_counter.load(Ordering::SeqCst);
     assert_eq!(
       observed, 1,
-      "F1 REGRESSION (custom-VJP): boxed closure was dropped {observed} times; \
-       expected EXACTLY 1 (pre-fix `Box::from_raw` on the NULL-ctx branch \
+      "REGRESSION (custom-VJP): boxed closure was dropped {observed} times; \
+       expected EXACTLY 1 (a `Box::from_raw` reclaim on the NULL-ctx branch \
        produces 2 = double-free / UAF)."
     );
   }

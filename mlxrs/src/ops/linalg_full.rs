@@ -109,10 +109,10 @@ pub(crate) fn reject_empty_matrix(a: &Array, op: &'static str) -> Result<()> {
 /// rank-2 input → `-1`) is silently accepted by `moveaxis` and can route a
 /// zero-length axis into the SVD `m * n == 0` divide-by-zero. We therefore FULLY
 /// validate the axis range here, rejecting an out-of-range axis with a typed
-/// [`Error::OutOfRange`] BEFORE any SVD dispatch (Codex R4): yielding to mlx is
+/// [`Error::OutOfRange`] BEFORE any SVD dispatch: yielding to mlx is
 /// unsafe because it raises no axis error for these. Duplicate axes (both
 /// resolving to the same dimension) are likewise rejected — mlx would collapse
-/// them and leak an UNSELECTED zero-length dim into the SVD (Codex R6); a valid
+/// them and leak an UNSELECTED zero-length dim into the SVD; a valid
 /// matrix reduction is exactly two DISTINCT in-range axes. This is a cheap shape
 /// inspection with no `eval`, so it never enters mlx.
 fn reject_empty_matrix_axes(a: &Array, axes: [i32; 2], op: &'static str) -> Result<()> {
@@ -120,7 +120,7 @@ fn reject_empty_matrix_axes(a: &Array, axes: [i32; 2], op: &'static str) -> Resu
   let ndim = shape.len();
   // Resolve and range-check BOTH axes (mlx-style `axis + a.ndim()` for
   // negatives). An out-of-range axis is rejected with a typed `OutOfRange`
-  // BEFORE any SVD dispatch (Codex R4 — mlx does not range-check matrix-norm
+  // BEFORE any SVD dispatch (mlx does not range-check matrix-norm
   // axes, so yielding to it is unsafe). Only when both axes are validly in range
   // do we fast-fail a zero-length selected axis ahead of the SVD divide-by-zero.
   let mut resolved = [0usize; 2];
@@ -142,7 +142,7 @@ fn reject_empty_matrix_axes(a: &Array, axes: [i32; 2], op: &'static str) -> Resu
   // A matrix reduction needs two DISTINCT axes; if both resolve to the same
   // dimension (e.g. `[1, 1]` or `[1, -1]` on a rank-2 input) mlx's two `moveaxis`
   // calls collapse them and can leak an UNSELECTED zero-length dim into the
-  // trailing SVD matrix → the same `m * n == 0` divide-by-zero (Codex R6, traced
+  // trailing SVD matrix → the same `m * n == 0` divide-by-zero (traced
   // through the nuclear `sum(svd(...))` path). Reject the duplicate selection
   // before the length check.
   if resolved[0] == resolved[1] {

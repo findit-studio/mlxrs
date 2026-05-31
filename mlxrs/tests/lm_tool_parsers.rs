@@ -695,7 +695,7 @@ fn infer_tool_parser_full_marker_matrix() {
 }
 
 // ---------------------------------------------------------------------------
-// LM-5 (#115) — schema-coercion regression: `number`/`float` schemas must
+// #115 — schema-coercion regression: `number`/`float` schemas must
 // emit a JSON FLOAT for every parsed `f64`, never silently saturate via
 // `as i64`. Covers both `convert_param_value` (Qwen3Coder path) and
 // `convert_with_types` (MinimaxM2 path).

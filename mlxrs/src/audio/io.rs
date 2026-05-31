@@ -74,7 +74,7 @@ use crate::error::{
   MissingKeyPayload, NonFiniteScalarPayload, OutOfRangePayload, ParsePayload, Result,
 };
 
-/// PCM-16 full-scale on `read`. P6 / AUDIO-4 (#130): mlxrs uses the
+/// PCM-16 full-scale on `read` (see #130). mlxrs uses the
 /// **symmetric** `32768.0` convention on both sides — `read` divides by
 /// `I16_DIV = 32768.0` and `write` multiplies by `I16_MUL = 32768.0`,
 /// matching `torchaudio.save`'s default. The asymmetric `read=32768.0`
@@ -84,7 +84,7 @@ use crate::error::{
 /// saturates by one LSB on the positive boundary — see the `I16_MUL`
 /// constant in [`crate::simd::audio::quantize`] for the cast contract).
 ///
-/// On `write`, the C7 SIMD quantizer in
+/// On `write`, the SIMD quantizer in
 /// [`crate::simd::audio::quantize`] carries the matching `32768`
 /// multiplier; that constant lives in the SIMD module so the NEON
 /// kernel and scalar reference share one source of truth.
@@ -253,16 +253,16 @@ pub fn load_audio_with_cap(path: &Path, max_samples: usize) -> Result<(Vec<f32>,
 /// [`MAX_DECODED_SAMPLES`].
 ///
 /// **TOCTOU-free unified probe + decode.** The function opens the file
-/// EXACTLY ONCE (Codex R2 finding, severity medium): the probe pass that reads
+/// EXACTLY ONCE: the probe pass that reads
 /// `src_sr` and the decode pass that produces samples share the same
 /// `File` handle / `FormatReader` / `Track`, so a path that is
 /// mutated, replaced, or symlink-swapped between the two phases
-/// cannot drift the cap from the decoded stream. Earlier prototypes
-/// re-opened the file for a probe-only `File::open` and then handed
-/// off to [`load_audio_with_cap`] (which re-opened a second time);
-/// that pattern let a high-rate probe authorize a much larger cap for
-/// a subsequent low-rate decode of a different file. The current
-/// implementation funnels through a single internal worker that
+/// cannot drift the cap from the decoded stream. Re-opening the file
+/// for a probe-only `File::open` and then handing off to
+/// [`load_audio_with_cap`] (which re-opens a second time) would let a
+/// high-rate probe authorize a much larger cap for a subsequent
+/// low-rate decode of a different file. The implementation instead
+/// funnels through a single internal worker that
 /// derives `effective_cap` from the SAME `FormatReader` that drives
 /// the decode loop.
 ///
@@ -342,20 +342,19 @@ pub fn load_audio_into_with_cap(
 /// Unified open + probe + decode worker shared by every load-audio entry
 /// point.
 ///
-/// **One `File::open` per call (Codex R2 TOCTOU fix).** Both the
+/// **One `File::open` per call (TOCTOU fix).** Both the
 /// explicit-sample-cap path ([`CapStrategy::MaxSamples`]) and the
 /// duration-derived path ([`CapStrategy::SrcRateMaxSeconds`]) flow
 /// through this function: it opens `path` ONCE, probes the container
 /// ONCE, and runs the decode loop against the SAME `FormatReader` —
 /// no second `File::open` ever appears between the probe that reads
-/// `src_sr` and the decode that consumes the audio. An earlier
-/// implementation re-opened the path for a separate probe-only pass
-/// and then handed off to `load_audio_with_cap` (which opened it a
-/// third time); that pattern let a high-rate probe of `foo.wav`
-/// authorize a much larger cap for a low-rate decode of a different
-/// `foo.wav` whose contents had been swapped between opens. Funneling
-/// every entry through one open + one probe + one decode eliminates
-/// the TOCTOU window structurally.
+/// `src_sr` and the decode that consumes the audio. Re-opening the path
+/// for a separate probe-only pass and then handing off to
+/// `load_audio_with_cap` (which opens it a third time) would let a
+/// high-rate probe of `foo.wav` authorize a much larger cap for a
+/// low-rate decode of a different `foo.wav` whose contents had been
+/// swapped between opens. Funneling every entry through one open + one
+/// probe + one decode eliminates the TOCTOU window structurally.
 ///
 /// **Cap resolution.** The strategy is resolved to `effective_cap`
 /// AFTER reading `sample_rate` from the same `FormatReader` that drives
@@ -365,7 +364,7 @@ pub fn load_audio_into_with_cap(
 ///   usize, MAX_DECODED_SAMPLES)`, with the product computed in `f64`
 ///   and saturated to `usize::MAX` per the `as usize` spec.
 ///
-/// **Header cap policy (Codex R2 lossy-overestimate fix).** The
+/// **Header cap policy (lossy-overestimate fix).** The
 /// container-declared `num_frames` is treated differently depending on
 /// `exact_count`:
 /// - **Exact-count formats** (WAV always, FLAC with STREAMINFO total):
@@ -516,8 +515,8 @@ fn load_audio_into_unified(path: &Path, out: &mut Vec<f32>, strategy: CapStrateg
 
   // Resolve the cap strategy to `effective_cap` USING THE SAME
   // `sample_rate` JUST READ from the SAME `FormatReader` that drives
-  // the decode loop below. This is the Codex R2 TOCTOU fix: the
-  // duration-cap path no longer derives `src_sr` from a separate probe
+  // the decode loop below. This closes the TOCTOU window: the
+  // duration-cap path does not derive `src_sr` from a separate probe
   // open whose decode could be a different file.
   let effective_cap = strategy.resolve(sample_rate);
 
@@ -536,7 +535,7 @@ fn load_audio_into_unified(path: &Path, out: &mut Vec<f32>, strategy: CapStrateg
   // `Vec::with_capacity` is infallible (aborts on allocator OOM), so we
   // fall back to `try_reserve_exact` against `MAX_DECODED_SAMPLES`.
   //
-  // Header-cap policy (Codex R2 lossy-overestimate fix):
+  // Header-cap policy (lossy-overestimate fix):
   // - **Exact-count formats** (WAV always, FLAC-with-STREAMINFO): a
   //   `header_len > effective_cap` declaration is rejected upfront. The
   //   count is sample-exact by construction, so an over-cap declaration
@@ -964,7 +963,7 @@ fn push_samples(buf: &GenericAudioBufferRef<'_>, out: &mut Vec<f32>, cap: usize)
     GenericAudioBufferRef::S16(b) => {
       let _ = int_divisor(16)?; // validate the bits arm (for parity + error shape)
       reserve_under_cap(out, b.samples_interleaved(), cap)?;
-      // C1 SIMD widen — collect the symphonia interleaved iterator
+      // SIMD widen — collect the symphonia interleaved iterator
       // into a contiguous `Vec<i16>` once, then dispatch the NEON
       // s16-to-f32 normalizer over it in one shot. This keeps the
       // (1) cap discipline above and (2) the per-iteration sample
@@ -1000,7 +999,7 @@ fn push_samples(buf: &GenericAudioBufferRef<'_>, out: &mut Vec<f32>, cap: usize)
       // `i24.inner()` returns the `[-2^23, 2^23)` value as `i32`.
       let divisor = int_divisor(24)?;
       reserve_under_cap(out, b.samples_interleaved(), cap)?;
-      // C1 SIMD widen — collect the symphonia i24 iterator
+      // SIMD widen — collect the symphonia i24 iterator
       // (`.inner()` → i32 in `[-2^23, 2^23)`) into a contiguous
       // Vec<i32> once, then dispatch the NEON s32-to-f32 normalizer
       // with the 24-bit divisor (`1.0 / 2^23`). Same shape as the
@@ -1022,7 +1021,7 @@ fn push_samples(buf: &GenericAudioBufferRef<'_>, out: &mut Vec<f32>, cap: usize)
     GenericAudioBufferRef::S32(b) => {
       let divisor = int_divisor(32)?;
       reserve_under_cap(out, b.samples_interleaved(), cap)?;
-      // C1 SIMD widen — collect symphonia's i32 iterator into a
+      // SIMD widen — collect symphonia's i32 iterator into a
       // contiguous Vec<i32>, then dispatch the NEON s32-to-f32
       // normalizer with the 32-bit divisor (`1.0 / 2^31`).
       let n = b.samples_interleaved();
@@ -1043,7 +1042,7 @@ fn push_samples(buf: &GenericAudioBufferRef<'_>, out: &mut Vec<f32>, cap: usize)
   Ok(())
 }
 
-// P6 / Codex R3 (#138 follow-up) failure-injection hook for the
+// Failure-injection hook for the
 // post-metadata `meta_file.sync_all()` site inside `save_wav`. Only
 // compiled under `cfg(test)`; the production binary never sees this
 // flag. See `set_force_meta_fsync_failure` below for the full
@@ -1062,14 +1061,14 @@ thread_local! {
 /// only the in-crate tests inside the [`tests`] module can flip the
 /// flag.
 ///
-/// **Codex R4 (#138 follow-up): thread-local scoping.** The previous
-/// implementation used a process-global `AtomicBool`. `SeqCst`
-/// ordering prevented a data race but did NOT scope the injected
+/// **Thread-local scoping.** A process-global
+/// `AtomicBool` would not work here: `SeqCst`
+/// ordering prevents a data race but does NOT scope the injected
 /// failure to the calling test — under the Rust test harness's
 /// default parallel execution, any unrelated audio test that reached
 /// the post-metadata fsync site while the flag was true would receive
 /// the injected `sync_all` error instead of exercising real IO. The
-/// flag is now a `thread_local!` `Cell<bool>` so the injection is
+/// flag is a `thread_local!` `Cell<bool>` so the injection is
 /// scoped to the thread that called `set_force_meta_fsync_failure` —
 /// concurrent tests on other threads observe the default `false` and
 /// run their real-IO paths unaffected. The injecting test still uses
@@ -1087,22 +1086,22 @@ pub(crate) fn set_force_meta_fsync_failure(b: bool) {
 /// rename. Returns `Err` if the sync fails; the caller is responsible
 /// for tempfile cleanup and `Err` propagation.
 ///
-/// **P6 / Codex R5 (#138 follow-up).** Factoring this site into a
-/// named helper eliminates the source-substring fragility of the prior
-/// R4 structural guard: instead of asserting that `meta_file.sync_all(`
+/// Factoring this site into a
+/// named helper eliminates source-substring fragility: rather than
+/// asserting that `meta_file.sync_all(`
 /// appears in BOTH cfg-branches of an inline `let sync_result = ...`
 /// binding (which a regression could satisfy with a stale comment or
-/// string-literal mention of the token), the guard now asserts a single
-/// distinctive call to this helper appears between `restore_xattrs(`
-/// and `fs::rename(` in the `save_wav` body. The test-only
-/// failure-injection branch lives HERE, not at the call site — so the
-/// call site is a single uncommented function call that cannot be
+/// string-literal mention of the token), the structural guard asserts a
+/// single distinctive call to this helper appears between
+/// `restore_xattrs(` and `fs::rename(` in the `save_wav` body. The
+/// test-only failure-injection branch lives HERE, not at the call site —
+/// so the call site is a single uncommented function call that cannot be
 /// satisfied by a string-literal collision.
 ///
 /// In a production build (`cfg(not(test))`) the function collapses to a
 /// direct `meta_file.sync_all()` call with no flag-load overhead. The
 /// `#[inline]` hint lets the optimiser fold the helper into the call
-/// site exactly as the prior inline `let sync_result = ...` form did.
+/// site as if it were an inline `let sync_result = ...` binding.
 #[inline]
 fn save_wav_post_metadata_fsync(meta_file: &File) -> std::io::Result<()> {
   #[cfg(test)]
@@ -1118,7 +1117,7 @@ fn save_wav_post_metadata_fsync(meta_file: &File) -> std::io::Result<()> {
 ///
 /// Samples outside `[-1.0, 1.0]` are clipped (matches `mlx_audio.audio_io.write`'s
 /// `np.clip(data, -1.0, 1.0)` pre-quantization), then multiplied by
-/// `32768` (P6 / AUDIO-4: symmetric `* 32768` convention matching
+/// `32768` (symmetric `* 32768` convention matching
 /// `torchaudio.save` — `read` divides by `32768.0`, `write` multiplies
 /// by `32768.0`, so the round-trip is bit-exact for in-range samples)
 /// and converted to `i16` via Rust's saturating-cast (`+1.0 * 32768 =
@@ -1130,7 +1129,7 @@ fn save_wav_post_metadata_fsync(meta_file: &File) -> std::io::Result<()> {
 /// on disk. This is stricter than `mlx_audio.audio_io.write` (which
 /// would silently corrupt the WAV by casting `NaN → i16` to 0).
 ///
-/// **Mid-write IO failure no longer leaves a partial WAV** — the
+/// **Mid-write IO failure does not leave a partial WAV** — the
 /// destination is updated atomically via tempfile + rename. The bytes
 /// are first written to a tempfile in the SAME directory as `path`
 /// (suffix `.<pid>.<rand>.tmp`), opened with `OpenOptions::create_new`
@@ -1153,20 +1152,20 @@ fn save_wav_post_metadata_fsync(meta_file: &File) -> std::io::Result<()> {
 /// partial WAV cannot be observed at `path`. Note: the tempfile lives
 /// in the same directory as `path` so the rename is single-fs
 /// (cross-fs rename would silently fall back to copy+unlink and lose
-/// the atomicity guarantee). **AUDIO-10 (#138)**: extended attributes
+/// the atomicity guarantee). **Extended attributes** (see #138):
 /// (Linux user xattrs, POSIX-1.e ACLs stored as
 /// `system.posix_acl_access`, SELinux contexts in `security.selinux`,
 /// macOS xattrs, etc.) are captured from the existing destination
 /// before the write and re-applied to the tempfile before the rename
 /// (best-effort — per-xattr failures are silently dropped so a
 /// security-namespace EPERM does not poison the entire save).
-/// **AUDIO-9 (#135)**: after the rename the parent directory is
+/// **Parent-dir fsync** (see #135): after the rename the parent directory is
 /// `fsync(dirfd)`'d so the directory-entry update is durable on disk
 /// — without this, a crash between rename and writeback can leave the
 /// FS with no entry for the new file on ext4/xfs/APFS. Windows skips
 /// the dirfd-fsync (no equivalent primitive); the pre-rename data
 /// fsync we already issue covers that case.
-/// **Codex R2 #138 follow-up**: the writable tempfile handle is kept
+/// **Original-handle fsync**: the writable tempfile handle is kept
 /// alive across `set_permissions` + `restore_xattrs` and the
 /// post-metadata `sync_all` runs on that ORIGINAL handle (not a
 /// reopened one), so a read-only captured destination mode (e.g.
@@ -1190,7 +1189,7 @@ fn save_wav_post_metadata_fsync(meta_file: &File) -> std::io::Result<()> {
 ///
 /// **Test-only failure injection** (`set_force_meta_fsync_failure`):
 /// under `cfg(test)`, the `save_wav_post_metadata_fsync` helper
-/// honors a thread-local flag (Codex R4 #138 follow-up) that forces
+/// honors a thread-local flag that forces
 /// an injected `io::Error` in place of the real fsync on the calling
 /// thread only. This exists so the regression test
 /// `save_wav_post_metadata_fsync_helper_is_called_before_rename_runtime`
@@ -1207,7 +1206,7 @@ pub fn save_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
   save_wav_into(path, samples, sample_rate, &mut scratch)
 }
 
-/// Quantize `src` into the `MaybeUninit<i16>` slice via the C7 SIMD
+/// Quantize `src` into the `MaybeUninit<i16>` slice via the SIMD
 /// dispatcher (`simd::audio::quantize::f32_to_i16_quantize`): clip to
 /// `[-1, 1]`, multiply by `I16_MUL = 32767`, round-half-away-from-zero,
 /// cast to `i16`. The single-source-of-truth quantizer used by
@@ -1233,7 +1232,7 @@ pub trait Quantizer<Source, Target> {
 }
 
 /// `f32` → `i16` quantizer used by [`save_wav`] / [`save_wav_into`] and
-/// the shared C7 SIMD path. Stateless newtype so the buffer-reuse
+/// the shared SIMD path. Stateless newtype so the buffer-reuse
 /// helper's signature is `&dyn Quantizer<f32, i16>` (vs. a free fn
 /// taking a `&mut [MaybeUninit<i16>]`).
 ///
@@ -1339,7 +1338,7 @@ pub fn save_wav_into(
   // its umask-granted mode.
   let existing_perms = fs::metadata(path).ok().map(|m| m.permissions());
 
-  // P6 / AUDIO-10 (#138): capture the existing destination's extended
+  // Capture the existing destination's extended
   // attributes (Linux user xattrs, macOS xattrs, SELinux contexts, etc.)
   // so the post-rename file inherits the user's pre-existing xattr set.
   // Pre-C performance: the read happens ONCE upfront before any
@@ -1355,8 +1354,7 @@ pub fn save_wav_into(
   // Note: POSIX-1.e ACLs (stored in `system.posix_acl_access`) and
   // SELinux contexts (`security.selinux`) are explicitly probed by
   // `capture_xattrs` because `listxattr` is allowed to omit them — the
-  // generic `xattr::list` walk alone is NOT sufficient (Codex R1 #138
-  // follow-up).
+  // generic `xattr::list` walk alone is NOT sufficient.
   let existing_xattrs: Option<Vec<(std::ffi::OsString, Vec<u8>)>> = capture_xattrs(path);
 
   // Open a tempfile in the SAME directory as `path` so the subsequent
@@ -1374,8 +1372,8 @@ pub fn save_wav_into(
 
   // Inner write closure: returns the writable `File` handle on success
   // so we can KEEP IT ALIVE past `set_permissions` and `restore_xattrs`
-  // and call the post-metadata `sync_all` ON THE ORIGINAL handle (Codex
-  // R2 #138 follow-up — see the post-metadata-fsync block below). On
+  // and call the post-metadata `sync_all` ON THE ORIGINAL handle (see
+  // the post-metadata-fsync block below). On
   // failure we clean up the tempfile (best-effort) before the rename.
   let write_result = (|| -> Result<File> {
     let mut writer = BufWriter::new(file);
@@ -1443,17 +1441,16 @@ pub fn save_wav_into(
       ))
     })?;
 
-    // Quantize all samples first via the C7 SIMD dispatcher
+    // Quantize all samples first via the SIMD dispatcher
     // (`simd::audio::quantize::f32_to_i16_quantize`) — clip to `[-1, 1]`,
-    // multiply by `I16_MUL = 32768` (P6 / AUDIO-4: symmetric `* 32768`
+    // multiply by `I16_MUL = 32768` (symmetric `* 32768`
     // convention; the +1.0 extreme saturates to i16::MAX via the cast),
     // round-half-away-from-zero, cast to i16. On `aarch64` this routes
     // to an 8-lane NEON tile (vminq/vmaxq clamp → vmulq_n scale →
     // vcvtaq_s32 round (FCVTAS, ties away from zero — bit-exact match
     // for `f32::round`) → vqmovn+vcombine narrow → vst1q_s16 store);
     // elsewhere it falls back to the scalar `clamp + round + cast` loop.
-    // See `docs/core-arch-simd-candidates.md` §2 row C7 + §3.5 +
-    // tracking [#152].
+    // Tracking [#152].
     //
     // The dispatcher takes `&mut [MaybeUninit<i16>]` (type-encoded
     // uninit safety), so we pre-reserve via `try_reserve_exact` (so a
@@ -1466,7 +1463,7 @@ pub fn save_wav_into(
     // `clear()` drops the prior contents but retains the allocated
     // capacity, so a streaming caller (one `Vec<i16>` shared across
     // many `save_wav_into` calls) pays one growth at the high-water
-    // mark and skips per-call allocations afterward. The shared C7
+    // mark and skips per-call allocations afterward. The shared
     // quantizer dispatcher is invoked through the `Quantizer` trait
     // so future encoder writers (flac/opus, when those land) reuse
     // the same fused f32 → i16 path.
@@ -1581,16 +1578,16 @@ pub fn save_wav_into(
         e,
       ))
     })?;
-    // P6 / Codex R2 (#138 follow-up): RETURN the writable `File`
+    // RETURN the writable `File`
     // handle to the outer scope instead of dropping it here. The outer
     // code re-uses this exact handle for the post-metadata `sync_all`
-    // (after `set_permissions` + `restore_xattrs`), which avoids the
-    // earlier reopen-with-OpenOptions-write-true bug: if the captured
+    // (after `set_permissions` + `restore_xattrs`), which avoids a
+    // reopen-with-OpenOptions-write-true hazard: if the captured
     // destination perms were read-only (e.g. 0444) we already restored
     // those perms onto the tempfile via `fs::set_permissions`, so a
     // subsequent reopen-for-write would correctly fail with `EACCES`
-    // — but in the earlier code path that EACCES was silently
-    // swallowed by `if let Ok(..)` and the metadata fsync was
+    // — and that EACCES would be silently
+    // swallowed by `if let Ok(..)` and the metadata fsync
     // skipped, letting the rename publish a file whose chmod/xattrs
     // weren't yet on stable storage. Keeping the original RW handle
     // alive sidesteps that whole reopen — `sync_all` on an already-
@@ -1631,7 +1628,7 @@ pub fn save_wav_into(
     )));
   }
 
-  // P6 / AUDIO-10 (#138): restore the destination's prior xattrs onto
+  // Restore the destination's prior xattrs onto
   // the tempfile BEFORE the rename so the published file inherits the
   // pre-existing extended-attribute set (Linux user xattrs, POSIX-1.e
   // ACLs as `system.posix_acl_access`, SELinux contexts in
@@ -1649,9 +1646,9 @@ pub fn save_wav_into(
     restore_xattrs(&tmp_path, xattrs);
   }
 
-  // P6 / Codex R2 (#138 follow-up): post-metadata fsync via the
+  // Post-metadata fsync via the
   // ORIGINAL writable handle kept alive from tempfile creation. The
-  // earlier `inner.sync_all()` (inside the closure, above the
+  // `inner.sync_all()` (inside the closure, above the
   // `set_permissions` / `restore_xattrs` block) made the WAV BYTES
   // durable, but the subsequent `set_permissions` and per-xattr `set`
   // calls mutate inode metadata (mode bits, ACL/security xattrs) which
@@ -1662,12 +1659,12 @@ pub fn save_wav_into(
   // file with the new bytes but STALE permissions/xattrs (mode
   // reverted to umask, ACLs lost, SELinux label gone).
   //
-  // The R1 version reopened the tempfile with `OpenOptions::write(true)`
-  // — but after `set_permissions(tmp_path, captured_perms)` restored a
+  // Reopening the tempfile with `OpenOptions::write(true)` would be unsafe
+  // here: after `set_permissions(tmp_path, captured_perms)` restores a
   // read-only captured mode (e.g. 0444 from the destination), the
   // reopen could fail with EACCES (the process owns the inode so the
   // chmod succeeded, but a subsequent write-open is gated by the inode
-  // mode), AND that failure was silently swallowed by `if let Ok(..)`
+  // mode), AND that failure would be silently swallowed by `if let Ok(..)`
   // — letting the rename publish a file whose chmod/xattrs weren't on
   // stable storage. Use the ORIGINAL handle we kept open from tempfile
   // creation; `sync_all` on an existing writable File handle is
@@ -1677,7 +1674,7 @@ pub fn save_wav_into(
   // fresh destination (no metadata to restore) the post-write
   // `sync_all` already inside the closure covers data + metadata, so
   // we skip the redundant second sync.
-  // P6 / Codex R5 (#138 follow-up): the post-metadata fsync now lives
+  // The post-metadata fsync lives
   // in the [`save_wav_post_metadata_fsync`] helper, which folds the
   // test-only failure-injection branch inside the helper body. The call
   // site is a single uncommented function call, so the source-structural
@@ -1701,7 +1698,7 @@ pub fn save_wav_into(
     return Err(Error::FileIo(FileIoPayload::new(
       "save_wav: post-metadata sync_all on tempfile failed \
          (perms/xattrs were restored but metadata is not yet durable; \
-          NOT renaming to final destination — see Codex R2 #138 follow-up)",
+          NOT renaming to final destination — see #138)",
       FileOp::Fsync,
       tmp_path,
       e,
@@ -1726,7 +1723,7 @@ pub fn save_wav_into(
     )));
   }
 
-  // P6 / AUDIO-9 (#135): fsync the PARENT directory after the rename.
+  // Fsync the PARENT directory after the rename.
   // On most filesystems (ext4 default, xfs, APFS) the rename itself is
   // atomic, but the directory-entry update isn't durable until the
   // parent inode is fsync'd. A crash between rename and parent-fsync
@@ -1742,7 +1739,7 @@ pub fn save_wav_into(
   Ok(())
 }
 
-/// P6 / AUDIO-10 (#138) helper: read every extended attribute from
+/// Helper (see #138): read every extended attribute from
 /// `path`, returning `Some(vec)` on success (including the empty case
 /// when the file exists but has no xattrs) and `None` when the read
 /// cannot be attempted (path doesn't exist, the platform doesn't
@@ -1752,8 +1749,8 @@ pub fn save_wav_into(
 /// read, and the caller's `restore_xattrs` is best-effort.
 ///
 /// Unix arm. In addition to walking `xattr::list(path)`, we EXPLICITLY
-/// probe a fixed set of known ACL/security xattr names (Codex R1
-/// follow-up #138). The `xattr` crate documents that `list` may omit
+/// probe a fixed set of known ACL/security xattr names (see #138). The
+/// `xattr` crate documents that `list` may omit
 /// `system.*` names entirely on some kernels (POSIX-1.e ACLs are
 /// commonly hidden from `listxattr`) and that `trusted.*` is only
 /// listed when the caller is root; SELinux's `security.selinux` and
@@ -1821,20 +1818,20 @@ fn capture_xattrs(path: &Path) -> Option<Vec<(std::ffi::OsString, Vec<u8>)>> {
   Some(out)
 }
 
-/// P6 / AUDIO-10 (#138) helper, Windows / non-Unix arm. The `xattr`
+/// Helper (see #138), Windows / non-Unix arm. The `xattr`
 /// crate isn't linked on non-Unix targets (see Cargo.toml — `xattr` is
 /// declared under `[target.'cfg(unix)'.dependencies]` because the
 /// crate imports `std::os::unix::io` unconditionally and does not
 /// compile on Windows). Return `None` so the call site's
 /// `restore_xattrs` arm is also a no-op — the published WAV simply
 /// gets the tempfile's default (umask-granted) metadata on Windows,
-/// matching the pre-AUDIO-10 behavior on that platform.
+/// matching that platform's umask-default behavior.
 #[cfg(not(unix))]
 fn capture_xattrs(_path: &Path) -> Option<Vec<(std::ffi::OsString, Vec<u8>)>> {
   None
 }
 
-/// P6 / AUDIO-10 (#138) helper: re-apply the xattrs captured by
+/// Helper (see #138): re-apply the xattrs captured by
 /// [`capture_xattrs`] onto `path`. Per-xattr write failures are
 /// silently dropped (see the call-site comment in `save_wav` for the
 /// rationale).
@@ -1853,7 +1850,7 @@ fn restore_xattrs(path: &Path, xattrs: &[(std::ffi::OsString, Vec<u8>)]) {
 #[cfg(not(unix))]
 fn restore_xattrs(_path: &Path, _xattrs: &[(std::ffi::OsString, Vec<u8>)]) {}
 
-/// P6 / AUDIO-9 (#135) helper: open the parent directory of `path` in
+/// Helper (see #135): open the parent directory of `path` in
 /// read mode and `fsync` it, so the directory entry produced by the
 /// preceding `fs::rename` is durable on the filesystem. Best-effort —
 /// any failure (no parent, parent-open failure, sync failure) is
@@ -2075,7 +2072,7 @@ pub fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<
   })?;
   let ratio = f64::from(from_rate) / f64::from(to_rate);
 
-  // C8 SIMD: dispatch to the resample-linear NEON kernel
+  // SIMD: dispatch to the resample-linear NEON kernel
   // (`crate::simd::audio::resample`). On `aarch64` this routes to a
   // 4-lane NEON tile (`vmulq_f64` index math + `vfmaq_f32` FMA + scalar
   // gather for `samples[lo_idx]` / `samples[hi_idx]`); elsewhere it
@@ -2087,7 +2084,7 @@ pub fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<
   // `set_len(out_len)` after the kernel returns is sound.
   let spare = out.spare_capacity_mut();
   crate::simd::audio::resample::resample_linear(&mut spare[..out_len], samples, ratio);
-  // SAFETY: the C8 dispatcher's init contract guarantees every f32 of
+  // SAFETY: the SIMD dispatcher's init contract guarantees every f32 of
   // the `out_len`-prefix of `spare` is initialized before returning;
   // `out_len <= out.capacity()` per the `try_reserve_exact(out_len)`
   // above.
@@ -2099,7 +2096,7 @@ pub fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<
 mod tests {
   use super::*;
 
-  /// Fix 1 (bounded compressed decode): `reserve_under_cap` is the single
+  /// Bounded compressed decode: `reserve_under_cap` is the single
   /// gate every decoded buffer passes through before its samples are
   /// appended. A buffer that would push `out` past `cap` — the exact
   /// scenario a compressed header under-estimating the cap creates (header
@@ -2168,7 +2165,7 @@ mod tests {
     );
   }
 
-  /// Codex R3 (over-cap rejection arithmetic): a corrupt/hostile decoder
+  /// Over-cap rejection arithmetic: a corrupt/hostile decoder
   /// buffer count can present `n == usize::MAX` (or any value that, summed
   /// with `out.len()`, overflows `usize`). The rejection branch must NOT
   /// panic in debug or wrap in release while building the diagnostic
@@ -2220,7 +2217,7 @@ mod tests {
     assert_eq!(out.len(), cap);
   }
 
-  /// Codex review (cap-limited reserve growth): a plain amortized
+  /// Cap-limited reserve growth: a plain amortized
   /// `Vec::try_reserve(n)` can grow capacity to ~2× the *current* capacity
   /// even when only a few samples remain under `cap`. With a near-cap
   /// header hint (capacity already reserved up to `cap` by
@@ -2277,27 +2274,26 @@ mod tests {
     assert_eq!(out2.len(), cap);
   }
 
-  // ---- P6 AUDIO-9 (#135) + AUDIO-10 (#138): save_wav atomic-rename
-  //      durability + xattr preservation ----------------------------------
+  // ---- save_wav atomic-rename durability + xattr preservation
+  //      (see #135, #138) -------------------------------------------------
 
   /// Unique per-test temp dir under `std::env::temp_dir()`. Process-scoped
   /// + test-named so parallel test binaries / cases never collide.
-  fn p6_temp_dir(name: &str) -> PathBuf {
-    let dir =
-      std::env::temp_dir().join(format!("mlxrs_audio_io_p6_{}_{}", std::process::id(), name));
+  fn audio_temp_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("mlxrs_audio_io_{}_{}", std::process::id(), name));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
   }
 
-  /// P6 / Codex R2 (#138 follow-up): comment-stripper for the
+  /// Comment-stripper for the
   /// source-structural tests. Removes line comments (`// ... \n`) and
   /// non-nested block comments (`/* ... */`) so a probe / fsync ident
   /// hidden in commentary cannot satisfy `contains`-style assertions.
   /// Rust block comments are nestable but the call sites here only run
   /// on hand-written code slices, so the simpler non-nested pass is
   /// sufficient — and a future regression that buries a probe inside
-  /// a nested block comment is no more permissive than the R1 baseline.
+  /// a nested block comment is no more permissive than the baseline.
   /// String-literal contents are preserved verbatim (the test cases
   /// explicitly look for `"system.posix_acl_access"` etc. AS strings).
   ///
@@ -2355,7 +2351,7 @@ mod tests {
     out
   }
 
-  /// P6 / AUDIO-9 (#135): `save_wav` must call `fsync(dirfd)` on the
+  /// `save_wav` must call `fsync(dirfd)` on the
   /// parent directory after the atomic rename, so the directory-entry
   /// update is durable on disk (otherwise a crash between rename and
   /// writeback can leave the FS with no entry for the new file on
@@ -2377,7 +2373,7 @@ mod tests {
   /// best-effort contract documented at the call site.
   #[test]
   fn save_wav_fsyncs_parent_dir_after_rename() {
-    let dir = p6_temp_dir("audio9_fsync_parent");
+    let dir = audio_temp_dir("audio9_fsync_parent");
     let path = dir.join("out.wav");
     let samples = vec![0.0_f32, 0.5, -0.5, 0.25, -0.25, 1.0, -1.0, 0.0];
     save_wav(&path, &samples, 16_000).expect("save_wav must succeed on a fresh path");
@@ -2401,7 +2397,7 @@ mod tests {
     );
   }
 
-  /// P6 / AUDIO-10 (#138): on Unix `save_wav` must preserve the
+  /// On Unix `save_wav` must preserve the
   /// destination's extended attributes (Linux user xattrs, POSIX-1.e
   /// ACLs in `system.posix_acl_access`, SELinux contexts, macOS
   /// xattrs, etc.) across the atomic-rename. Without preservation, a
@@ -2427,7 +2423,7 @@ mod tests {
     if !xattr::SUPPORTED_PLATFORM {
       return; // Unsupported Unix variant — the read returns ENOTSUP.
     }
-    let dir = p6_temp_dir("audio10_xattr_preserve");
+    let dir = audio_temp_dir("audio10_xattr_preserve");
     let path = dir.join("out.wav");
     let samples = vec![0.0_f32, 0.1, -0.1, 0.0];
     // Create the destination first (so an xattr can be attached before
@@ -2457,7 +2453,7 @@ mod tests {
     );
   }
 
-  /// P6 / Codex R1 (#138 follow-up): `capture_xattrs` on Unix must
+  /// `capture_xattrs` on Unix must
   /// EXPLICITLY probe known ACL/security xattr names in addition to
   /// walking `xattr::list`, because the kernel is allowed to omit
   /// `system.*` from `listxattr` (POSIX-1.e ACLs commonly are) and
@@ -2486,7 +2482,7 @@ mod tests {
     if !xattr::SUPPORTED_PLATFORM {
       return;
     }
-    let dir = p6_temp_dir("audio10_xattr_capture");
+    let dir = audio_temp_dir("audio10_xattr_capture");
     let path = dir.join("probe.wav");
     let samples = vec![0.0_f32, 0.0];
     save_wav(&path, &samples, 16_000).expect("save_wav must succeed");
@@ -2500,17 +2496,16 @@ mod tests {
     );
   }
 
-  /// P6 / Codex R1+R2 (#138 follow-up): source-structural guard. The
+  /// Source-structural guard. The
   /// explicit-probe set inside `capture_xattrs` (Unix arm) must
   /// continue to include the ACL/security xattr names — a future
   /// refactor that drops these probes would silently regress
-  /// preservation of POSIX ACLs and SELinux labels (the original
-  /// Codex R1 finding).
+  /// preservation of POSIX ACLs and SELinux labels.
   ///
-  /// **Codex R2 #138 follow-up**: the R1 guard scanned the whole
-  /// `io.rs` file with `src.contains(needle)`, which would pass even
+  /// **Narrowed scan**: a guard that scanned the whole
+  /// `io.rs` file with `src.contains(needle)` would pass even
   /// if `EXPLICIT_PROBES` were entirely removed — the probe names
-  /// appear in doc-comments above (`AUDIO-10` rationale) and in this
+  /// appear in the xattr-rationale doc-comments above and in this
   /// test's own assertion array. Narrow the scan to the slice of
   /// source bytes between `const EXPLICIT_PROBES:` and the closing
   /// `;`, strip line + block comments from that slice, and assert
@@ -2555,13 +2550,13 @@ mod tests {
         stripped.contains(&quoted),
         "capture_xattrs EXPLICIT_PROBES must include {needle:?} as a \
          string literal (the ACL/security namespace `listxattr` may \
-         omit) — removing it silently regresses #138 Codex R1 fix.\n\
+         omit) — removing it silently regresses the #138 ACL/security xattr capture.\n\
          Inspected (comments stripped) slice:\n{stripped}"
       );
     }
   }
 
-  /// P6 / Codex R1+R2+R3+R4+R5 (#138 follow-up): source-structural
+  /// Source-structural
   /// guard. The `save_wav` body must call the
   /// [`save_wav_post_metadata_fsync`] helper AFTER `restore_xattrs`
   /// AND BEFORE the `fs::rename` that publishes the tempfile. Without
@@ -2572,14 +2567,14 @@ mod tests {
   /// we cannot observe an fsync syscall from userspace without a
   /// syscall tracer.
   ///
-  /// **Codex R5 #138 follow-up: helper extraction kills the substring
-  /// fragility.** The R4 guard sliced each cfg-branch of the inline
+  /// **Helper extraction kills the substring
+  /// fragility.** A guard that sliced each cfg-branch of an inline
   /// `let sync_result = ...` binding and asserted that the
-  /// `meta_file.sync_all(` token appeared in BOTH — but even with
-  /// comment-stripping, a regression that dropped the real call while
+  /// `meta_file.sync_all(` token appeared in BOTH would be fragile — even
+  /// with comment-stripping, a regression that dropped the real call while
   /// leaving the token in an error/debug string literal inside the
   /// same branch would keep the guard green (string literals survive
-  /// comment-stripping by design). R5 factors the post-metadata fsync
+  /// comment-stripping by design). We factor the post-metadata fsync
   /// into a named helper [`save_wav_post_metadata_fsync`] so the call
   /// site becomes a single distinctive function call. We assert the
   /// token `save_wav_post_metadata_fsync(` appears between
@@ -2587,14 +2582,14 @@ mod tests {
   /// a string-literal collision on a name that specific is implausible
   /// in calling code (callers don't pass function names as string
   /// arguments). The test-only failure-injection branch lives inside
-  /// the helper, not at the call site, so the inline `#[cfg(test)] /
-  /// #[cfg(not(test))]` split that motivated R4 is gone — there is
+  /// the helper, not at the call site, so there is no inline
+  /// `#[cfg(test)] / #[cfg(not(test))]` split — there is
   /// exactly one call site to find.
   ///
-  /// The R2 + R4 motivations remain valid (substring-based ordering
-  /// guards are still inherently fragile around comments and string
-  /// literals); R5 just narrows the substring to a single distinctive
-  /// helper name that is implausible to collide with non-call source.
+  /// Substring-based ordering guards are inherently fragile around
+  /// comments and string literals; narrowing the substring to a single
+  /// distinctive helper name that is implausible to collide with
+  /// non-call source keeps the guard robust.
   ///
   /// PAIRS with the behavioral test
   /// [`save_wav_post_metadata_fsync_helper_is_called_before_rename_runtime`]
@@ -2639,13 +2634,13 @@ mod tests {
       .map(|o| restore_idx + o)
       .expect(
         "save_wav must call fs::rename AFTER restore_xattrs — \
-         see Codex R1 #138 follow-up",
+         see #138",
       );
     // The slice between `restore_xattrs(` and `fs::rename(` is where
     // the post-metadata fsync helper call must live.
     let between = &stripped[restore_idx..rename_idx];
 
-    // Codex R5 #138 follow-up: assert the distinctive helper-call
+    // Assert the distinctive helper-call
     // token appears between `restore_xattrs(` and `fs::rename(`. The
     // call form is `save_wav_post_metadata_fsync(&meta_file)`; we
     // match the leading `save_wav_post_metadata_fsync(` token because
@@ -2655,7 +2650,7 @@ mod tests {
     let helper_token = "save_wav_post_metadata_fsync(";
     let helper_rel = between.find(helper_token).expect(
       "save_wav must call `save_wav_post_metadata_fsync(` between \
-       restore_xattrs and fs::rename — see Codex R5 #138 follow-up. \
+       restore_xattrs and fs::rename — see #138. \
        The helper folds the test-only failure-injection branch + the \
        real `meta_file.sync_all()` call so the call site is a single \
        distinctive function call (no cfg-branch substring matching). \
@@ -2670,7 +2665,7 @@ mod tests {
     // `restore_xattrs(` and `fs::rename(` in absolute index space.
     // The `between` slice was carved from that range, so the find
     // above already satisfies this — we re-assert with absolute
-    // indices for the same diagnostic shape as the prior guard.
+    // indices for a clearer diagnostic.
     assert!(
       restore_idx < helper_abs && helper_abs < rename_idx,
       "save_wav ordering broken: restore_xattrs @ {restore_idx}, \
@@ -2680,28 +2675,29 @@ mod tests {
     );
   }
 
-  /// P6 / Codex R2 (#138 follow-up) — **SMOKE TEST** of the
+  /// **SMOKE TEST** of the
   /// chmod-restore path; NOT the behavioral guard for the post-metadata
   /// fsync regression. Pre-create the destination with mode `0o444` (no
-  /// write bit for owner), then call `save_wav` to overwrite. The R1
-  /// implementation captured those perms, restored them onto the
+  /// write bit for owner), then call `save_wav` to overwrite. An
+  /// implementation that captured those perms, restored them onto the
   /// tempfile, then REOPENED the tempfile with
-  /// `OpenOptions::new().write(true)` for the post-metadata fsync —
-  /// that reopen could fail with EACCES (the process owns the inode so
-  /// the chmod succeeded, but the inode mode now lacks the owner write
-  /// bit so a subsequent write-open is rejected), and the
-  /// `if let Ok(..)` silently swallowed the EACCES — letting the
+  /// `OpenOptions::new().write(true)` for the post-metadata fsync would
+  /// be unsafe — that reopen could fail with EACCES (the process owns the
+  /// inode so the chmod succeeded, but the inode mode now lacks the owner
+  /// write bit so a subsequent write-open is rejected), and an
+  /// `if let Ok(..)` would silently swallow the EACCES — letting the
   /// rename publish a file whose chmod/xattrs were not yet on stable
-  /// storage. The R2 fix keeps the ORIGINAL writable handle alive from
+  /// storage. The code keeps the ORIGINAL writable handle alive from
   /// tempfile creation and `sync_all`s on that handle, so the inode
   /// mode bits don't block the metadata flush.
   ///
-  /// **Codex R3 (#138 follow-up): regression-class clarification.**
-  /// Under the R1 bug the perms were restored *before* the buggy
-  /// reopen, the reopen EACCES was swallowed, and the rename still
-  /// proceeded — meaning the assertions below (Ok return, new bytes
-  /// observable, mode restored) ALL still passed. This test cannot
-  /// distinguish the R1 bug from the R2 fix on its own; the behavioral
+  /// **Regression-class clarification.**
+  /// Under the reopen-EACCES bug the perms would be restored *before* the
+  /// buggy reopen, the reopen EACCES would be swallowed, and the rename
+  /// would still proceed — meaning the assertions below (Ok return, new
+  /// bytes observable, mode restored) would ALL still pass. This test
+  /// cannot distinguish that bug from the correct path on its own; the
+  /// behavioral
   /// guard for the post-metadata fsync regression is
   /// [`save_wav_post_metadata_fsync_helper_is_called_before_rename_runtime`]
   /// which uses the test-only [`set_force_meta_fsync_failure`] hook to
@@ -2712,8 +2708,8 @@ mod tests {
   /// test `save_wav_calls_post_metadata_fsync_helper_before_rename`
   /// (which asserts the distinctive helper-call token
   /// `save_wav_post_metadata_fsync(` appears between `restore_xattrs(`
-  /// and `fs::rename(` in the function body — Codex R5 #138
-  /// follow-up replaced the prior `meta_file.sync_all(` token scan to
+  /// and `fs::rename(` in the function body — a later refactor
+  /// replaced the prior `meta_file.sync_all(` token scan to
   /// kill string-literal false positives). The three together cover
   /// the regression class: smoke (end-to-end chmod-restore),
   /// structural (helper-call ordering preserved across refactors), and
@@ -2739,7 +2735,7 @@ mod tests {
   #[test]
   fn save_wav_read_only_overwrite_fsyncs_metadata_before_rename() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = p6_temp_dir("audio138_ro_overwrite");
+    let dir = audio_temp_dir("audio138_ro_overwrite");
     let path = dir.join("ro.wav");
 
     // Pre-create the destination with some initial bytes, then flip
@@ -2751,18 +2747,18 @@ mod tests {
     fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))
       .expect("set_permissions(0o444) on pre-existing file must succeed");
 
-    // Now overwrite via save_wav. With the R2 fix the writable handle
+    // Now overwrite via save_wav. The writable handle
     // is kept alive past `set_permissions(tmp, 0o444)`, so the
     // post-metadata sync_all does NOT need to reopen-for-write —
     // EACCES on the inode is irrelevant for an already-open handle.
-    // With the R1 bug the call would STILL return Ok (the bug is
-    // durability, not visibility), so signal #1 alone is a
+    // The reopen-EACCES bug would STILL return Ok (it is a
+    // durability bug, not a visibility one), so signal #1 alone is a
     // smoke-only regression guard; signal #3 (mode restored) is the
     // proof that the perms-restore-then-fsync ordering executed end
     // to end on this code path.
     let new_samples: Vec<f32> = (0..32).map(|i| ((i as f32) - 16.0) / 32.0).collect();
     save_wav(&path, &new_samples, 16_000)
-      .expect("save_wav overwrite of 0o444 destination must succeed (Codex R2 #138)");
+      .expect("save_wav overwrite of 0o444 destination must succeed (#138)");
 
     // Signal #1 + #2: the new bytes must be observable at the
     // published path.
@@ -2776,8 +2772,8 @@ mod tests {
 
     // Signal #3: the pre-existing 0o444 mode bits must be restored on
     // the published file — proving `set_permissions` ran AND
-    // `fs::rename` proceeded AFTER the metadata-restoration block
-    // (the R2 fix path). A regression that skipped restore_xattrs /
+    // `fs::rename` proceeded AFTER the metadata-restoration block.
+    // A regression that skipped restore_xattrs /
     // set_permissions would leave the file at the tempfile's umask
     // mode (typically 0o644).
     let mode = meta.permissions().mode() & 0o777;
@@ -2786,15 +2782,15 @@ mod tests {
       "captured 0o444 mode must be restored on the published file \
        (got {mode:#o}); the post-metadata fsync must run on the \
        ORIGINAL writable handle so it doesn't fail with EACCES on \
-       reopen — see Codex R2 #138 follow-up"
+       reopen — see #138"
     );
 
-    // Restore writable mode so p6_temp_dir's `remove_dir_all` on the
+    // Restore writable mode so audio_temp_dir's `remove_dir_all` on the
     // next run can unlink the file.
     let _ = fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
   }
 
-  /// P6 / Codex R3+R5 (#138 follow-up) — **BEHAVIORAL guard** for the
+  /// **BEHAVIORAL guard** for the
   /// post-metadata fsync regression, and the RUNTIME counterpart to
   /// the structural test
   /// [`save_wav_calls_post_metadata_fsync_helper_before_rename`].
@@ -2805,7 +2801,7 @@ mod tests {
   ///  1. `save_wav` returns `Err(Error::FileIo(_))` (op = `Fsync`) whose
   ///     context mentions `sync_all` and whose path references the
   ///     tempfile — proving the failure was NOT silently swallowed
-  ///     (the R1 bug) and the post-metadata fsync helper was actually
+  ///     and the post-metadata fsync helper was actually
   ///     invoked.
   ///  2. The destination at `path` still contains the ORIGINAL bytes
   ///     (the rename was NOT performed) — proving the failure path
@@ -2814,18 +2810,18 @@ mod tests {
   ///     leftovers — proving `fs::remove_file(&tmp_path)` ran on the
   ///     error path (operator visibility hygiene).
   ///
-  /// This is the test the R3 review identifies as the actual
+  /// This is the actual
   /// behavioral guard for the durability bug — the sibling smoke test
   /// `save_wav_read_only_overwrite_fsyncs_metadata_before_rename`
-  /// could not distinguish the R1 bug from the R2 fix on its own (perms
-  /// were restored before the buggy reopen and the EACCES was
-  /// swallowed, so the smoke test's three signals all still passed).
+  /// cannot distinguish the reopen-EACCES bug from the correct path on its
+  /// own (perms would be restored before the buggy reopen and the EACCES
+  /// swallowed, so the smoke test's three signals would all still pass).
   /// Failure injection on a writable destination is the only way to
   /// behaviorally observe the fsync-error arm from userspace without a
   /// crash-and-restart harness.
   ///
-  /// **Codex R5 #138 follow-up: runtime helper-invocation contract.**
-  /// After R5 factored the post-metadata fsync into
+  /// **Runtime helper-invocation contract.**
+  /// After factoring the post-metadata fsync into
   /// [`save_wav_post_metadata_fsync`], this test simultaneously proves
   /// the helper IS called at runtime (signal #1 — only the helper's
   /// `cfg(test)` branch produces the injected error string, so a
@@ -2839,7 +2835,7 @@ mod tests {
   /// Flag-reset discipline: the test sets the flag, then RAII-resets
   /// it in a `Drop` guard so a subsequent test scheduled by the harness
   /// on the SAME WORKER THREAD doesn't observe an injected failure
-  /// even if this test panics. **Codex R4 (#138 follow-up)**: the flag
+  /// even if this test panics. **Thread-local scoping**: the flag
   /// is now thread-local (`thread_local!` `Cell<bool>`), so concurrent
   /// tests on other worker threads cannot be poisoned by the
   /// injection — they observe the default `false` regardless of
@@ -2860,7 +2856,7 @@ mod tests {
       }
     }
 
-    let dir = p6_temp_dir("audio138_r3_fsync_failure");
+    let dir = audio_temp_dir("audio138_fsync_failure");
     let path = dir.join("dest.wav");
 
     // Pre-create the destination with known bytes (a valid WAV so
@@ -2914,7 +2910,7 @@ mod tests {
 
     // Signal #2: the destination MUST still contain the ORIGINAL
     // bytes — proves `fs::rename` was NEVER called on the failure
-    // path (the R3 guarantee).
+    // path (the no-rename-on-failure guarantee).
     let post_bytes =
       fs::read(&path).expect("destination must still exist (rename was not attempted)");
     assert_eq!(
@@ -2943,7 +2939,7 @@ mod tests {
     );
   }
 
-  /// P6 / AUDIO-4 (#130) — file-level round-trip regression. Save a
+  /// File-level round-trip regression. Save a
   /// known sample, decode it back via `load_audio`, and assert
   /// bit-perfect reconstruction for in-range samples (the symmetric
   /// `read = / 32768.0` + `write = * 32768.0` convention guarantees
@@ -2959,7 +2955,7 @@ mod tests {
   /// kernel test passes.
   #[test]
   fn save_wav_then_load_audio_round_trip_is_bit_exact() {
-    let dir = p6_temp_dir("audio4_roundtrip");
+    let dir = audio_temp_dir("audio4_roundtrip");
     let path = dir.join("rt.wav");
     // A spread of in-range samples representable as exact i16 codepoints
     // under the 32768 scale: f = k / 32768 for various k in

@@ -36,7 +36,7 @@
 //!
 //! ## Shared loaders reused (not re-implemented)
 //!
-//! The `embeddings` feature is deliberately `serde_json`-free (EMB-1: the
+//! The `embeddings` feature is deliberately `serde_json`-free (the
 //! `1_Pooling/config.json` parse is a hand-rolled strict-JSON scanner) and does
 //! **not** enable the `lm` feature, so [`crate::lm::load`]'s
 //! `serde`-derived `Config` reader is unreachable here. "Reuse the shared
@@ -618,7 +618,7 @@ fn reject_empty_dir(dir: &Path, role: EmptyDirRole) -> Result<()> {
 }
 
 /// Role of the directory checked by [`reject_empty_dir`]. Routing through
-/// a closed enum keeps the [`EmptyInputPayload::context`] static so the §5
+/// a closed enum keeps the [`EmptyInputPayload::context`] static so the
 /// no-`format!` contract holds (no runtime-keyed label allocation).
 #[derive(Clone, Copy)]
 enum EmptyDirRole {
@@ -1558,7 +1558,7 @@ fn read_model_type(dir: &Path) -> Result<(String, String)> {
 
 /// Extract a single top-level string field `key` from a strict-JSON object
 /// `src`, **dependency-free** (the `embeddings` feature carries no
-/// `serde_json` — EMB-1).
+/// `serde_json`).
 ///
 /// Returns `Ok(Some(value))` when `key` is present with a JSON string value,
 /// `Ok(None)` when `key` is absent, and `Err` when `src` is not a JSON object,
@@ -2814,7 +2814,7 @@ mod tests {
     assert_eq!(weights.len(), 1);
   }
 
-  // ───────── glob-faithful recursive-walk tests (Codex review) ─────────
+  // ───────── glob-faithful recursive-walk tests ─────────
   // `collect_glob_shards` drives `glob::glob_with` with
   // `MatchOptions { require_literal_leading_dot: false, .. }` — the faithful
   // port of `glob.glob("**/model*.safetensors", recursive=True,

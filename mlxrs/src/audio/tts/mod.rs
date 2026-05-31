@@ -40,7 +40,7 @@
 //!
 //! ## Out of scope — per-model architectures
 //!
-//! Per the project's [no per-model arch porting][noarch] rule, mlxrs ships
+//! Per the project's no per-model arch porting rule, mlxrs ships
 //! **no** concrete TTS model implementations. Every `tts/models/*`
 //! architecture in mlx-audio — kokoro (ALBERT prosody encoder + iSTFT
 //! decoder), csm / sesame (RVQ backbone + mimi codec), bark
@@ -67,7 +67,6 @@
 //! [swift-tts]: https://github.com/Blaizzy/mlx-audio-swift/tree/main/Sources/MLXAudioTTS
 //! [swift-gen]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioTTS/Generation.swift
 //! [swift-tp]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioTTS/TextProcessor.swift
-//! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 
 pub mod g2p;
 pub mod generate;
