@@ -1591,4 +1591,388 @@ mod tests {
     assert_eq!(t[1].0, "V");
     assert_eq!(t[1].1, KernelTemplateArg::Int(128));
   }
+
+  // ───────────────────────── Lazy-init `with_kernel` + builders ─────────────────────────
+  //
+  // `MetalKernel::new` succeeds without a Metal device (it only validates
+  // names + records the source — the JIT compile happens lazily at apply
+  // time), so the lazy-init plumbing in `with_kernel` and all four
+  // `build_*_kernel` constructors are exercisable on a headless host as long
+  // as the `f` closure does NOT call `kernel.apply(...)`. We pass a closure
+  // that only reads `kernel.output_arity()` so we cover the fast-path-miss
+  // build+set branch and the post-set fetch+invoke branch without touching
+  // the GPU pipeline.
+
+  #[test]
+  fn with_kernel_lazily_builds_then_reuses_on_second_call() {
+    // First call: cell empty → build + set, then fetch + invoke `f`.
+    let arity1 = with_kernel(&KL_FORWARD, build_kl_forward_kernel, |kernel| {
+      Ok(kernel.output_arity())
+    })
+    .expect("kl_forward kernel construction should not need a Metal device");
+    assert_eq!(arity1, 1, "kl_forward declares a single `out`");
+
+    // Second call on the same thread: cell already initialized → fast path
+    // skips `build` and re-invokes `f` against the cached kernel. The
+    // returned value must be identical (same cached handle).
+    let arity2 = with_kernel(&KL_FORWARD, build_kl_forward_kernel, |kernel| {
+      Ok(kernel.output_arity())
+    })
+    .expect("cached kl_forward kernel re-fetch should succeed");
+    assert_eq!(arity2, arity1);
+  }
+
+  #[test]
+  fn with_kernel_builds_all_four_kernels() {
+    // KL backward declares one output (`out`).
+    let kl_bwd = with_kernel(&KL_BACKWARD, build_kl_backward_kernel, |kernel| {
+      Ok((kernel.output_arity(), kernel.output_names_slice().to_vec()))
+    })
+    .expect("kl_backward construction");
+    assert_eq!(kl_bwd.0, 1);
+    assert_eq!(kl_bwd.1, vec!["out".to_string()]);
+
+    // JS forward declares TWO outputs (`out`, `out_kl_q`).
+    let js_fwd = with_kernel(&JS_FORWARD, build_js_forward_kernel, |kernel| {
+      Ok((kernel.output_arity(), kernel.output_names_slice().to_vec()))
+    })
+    .expect("js_forward construction");
+    assert_eq!(js_fwd.0, 2);
+    assert_eq!(js_fwd.1, vec!["out".to_string(), "out_kl_q".to_string()]);
+
+    // JS backward declares one output (`out_q`).
+    let js_bwd = with_kernel(&JS_BACKWARD, build_js_backward_kernel, |kernel| {
+      Ok((kernel.output_arity(), kernel.output_names_slice().to_vec()))
+    })
+    .expect("js_backward construction");
+    assert_eq!(js_bwd.0, 1);
+    assert_eq!(js_bwd.1, vec!["out_q".to_string()]);
+  }
+
+  // ───────────────────────── Shape-helper rank-0 rejections ─────────────────────────
+
+  #[test]
+  fn vocab_of_rejects_rank_0() {
+    let a = Array::full::<f32>(&[0i32; 0], 1.0).unwrap();
+    let err = vocab_of(&a).unwrap_err();
+    match err {
+      Error::RankMismatch(p) => {
+        assert!(p.context().contains("rank"), "got: {p:?}");
+        assert_eq!(p.actual(), 0);
+      }
+      other => panic!("expected RankMismatch, got: {other:?}"),
+    }
+  }
+
+  #[test]
+  fn leading_shape_i32_rejects_rank_0() {
+    let a = Array::full::<f32>(&[0i32; 0], 1.0).unwrap();
+    let err = leading_shape_i32(&a).unwrap_err();
+    match err {
+      Error::RankMismatch(p) => {
+        assert!(p.context().contains("rank"), "got: {p:?}");
+        assert_eq!(p.actual(), 0);
+      }
+      other => panic!("expected RankMismatch, got: {other:?}"),
+    }
+  }
+
+  // ───────────────────────── validate_inputs branch coverage ─────────────────────────
+
+  #[test]
+  fn validate_inputs_rejects_rank_1_logits_p() {
+    // Rank check runs BEFORE shape comparison and checks BOTH inputs in
+    // order; a rank-2 `logits_q` with a rank-1 `logits_p` must surface the
+    // `logits_p` rank rejection (NOT a ShapePairMismatch).
+    let q = Array::ones::<f32>(&[1, 4]).unwrap();
+    let p = Array::ones::<f32>(&[4]).unwrap();
+    let err = validate_inputs(
+      &q,
+      &p,
+      "ctx_q rank",
+      "ctx_p rank",
+      "ctx_pair",
+      "ctx_last",
+      "ctx_dim",
+      "ctx_dtype",
+    )
+    .unwrap_err();
+    match err {
+      Error::RankMismatch(p) => {
+        assert_eq!(p.context(), "ctx_p rank");
+        assert_eq!(p.actual(), 1);
+        assert_eq!(p.actual_shape(), &[4]);
+      }
+      other => panic!("expected RankMismatch on logits_p, got: {other:?}"),
+    }
+  }
+
+  #[test]
+  fn validate_inputs_accepts_f16_and_bf16() {
+    // The dtype-admissibility match arm accepts F32 / F16 / BF16; cover the
+    // F16 + BF16 legs (F32 is exercised by the happy-path Metal tests).
+    let q16 = Array::ones::<half::f16>(&[1, 4]).unwrap();
+    let p16 = Array::ones::<half::f16>(&[1, 4]).unwrap();
+    validate_inputs(
+      &q16,
+      &p16,
+      "ctx_q",
+      "ctx_p",
+      "ctx_pair",
+      "ctx_last",
+      "ctx_dim",
+      "ctx_dtype",
+    )
+    .expect("f16 logits should validate");
+
+    let qbf = Array::ones::<half::bf16>(&[1, 4]).unwrap();
+    let pbf = Array::ones::<half::bf16>(&[1, 4]).unwrap();
+    validate_inputs(
+      &qbf,
+      &pbf,
+      "ctx_q",
+      "ctx_p",
+      "ctx_pair",
+      "ctx_last",
+      "ctx_dim",
+      "ctx_dtype",
+    )
+    .expect("bf16 logits should validate");
+  }
+
+  #[test]
+  fn validate_inputs_rejects_unsupported_dtype() {
+    // Equal-but-unsupported dtype (i32 vs i32) routes through the dtype-
+    // admissibility arm with `Error::UnsupportedDtype`, AFTER passing the
+    // rank / shape / dtype-equality gates.
+    let q = Array::ones::<i32>(&[1, 4]).unwrap();
+    let p = Array::ones::<i32>(&[1, 4]).unwrap();
+    let err = validate_inputs(
+      &q,
+      &p,
+      "ctx_q",
+      "ctx_p",
+      "ctx_pair",
+      "ctx_last",
+      "ctx_dim",
+      "ctx_dtype: cast",
+    )
+    .unwrap_err();
+    match err {
+      Error::UnsupportedDtype(p) => {
+        assert_eq!(p.context(), "ctx_dtype: cast");
+        assert_eq!(p.dtype(), Dtype::I32);
+        assert_eq!(p.supported(), &[Dtype::F32, Dtype::F16, Dtype::BF16]);
+      }
+      other => panic!("expected UnsupportedDtype, got: {other:?}"),
+    }
+  }
+
+  #[test]
+  fn kl_div_loss_rejects_rank_1_input() {
+    // Public-path rank rejection: rank-1 logits_q surfaces the kl_div_loss
+    // rank-context RankMismatch before any kernel work.
+    let a = Array::ones::<f32>(&[4]).unwrap();
+    let b = Array::ones::<f32>(&[4]).unwrap();
+    let err = kl_div_loss(&a, &b).unwrap_err();
+    match err {
+      Error::RankMismatch(p) => {
+        assert!(p.context().contains("kl_div_loss"), "got: {p:?}");
+        assert_eq!(p.actual(), 1);
+      }
+      other => panic!("expected RankMismatch, got: {other:?}"),
+    }
+  }
+
+  #[test]
+  fn js_div_loss_rejects_unsupported_dtype() {
+    // Public-path dtype-admissibility rejection through js_div_loss.
+    let a = Array::ones::<i32>(&[1, 4]).unwrap();
+    let b = Array::ones::<i32>(&[1, 4]).unwrap();
+    let err = js_div_loss(&a, &b).unwrap_err();
+    match err {
+      Error::UnsupportedDtype(p) => {
+        assert!(p.context().contains("js_div_loss"), "got: {p:?}");
+        assert_eq!(p.dtype(), Dtype::I32);
+      }
+      other => panic!("expected UnsupportedDtype, got: {other:?}"),
+    }
+  }
+
+  // ───────────────────────── End-to-end Metal forward/backward ─────────────────────────
+  //
+  // The `_apply` helpers, the public `kl_div_loss` / `js_div_loss` forward
+  // paths, and the custom_vjp backward closures all reach `MetalKernel::apply`
+  // → the JIT'd Metal pipeline, which requires a real GPU. These are gated
+  // `#[cfg(target_os = "macos")] #[ignore]` and run with:
+  //
+  //     cargo test -p mlxrs --lib lm::tuner::losses -- --ignored --test-threads=1
+  //
+  // Each oracle is computed CLOSED-FORM from the test inputs, independent of
+  // the loss implementation:
+  //
+  //   * KL(P||Q) = Σ_j P_j (log P_j − log Q_j), gradient wrt logits_q = Q − P.
+  //   * JS(P,Q)  = 0.5·D_KL(P||M) + 0.5·D_KL(Q||M), M = (P+Q)/2.
+  //
+  // For the worked case logits_p = [0, 0] → P = [0.5, 0.5] and
+  // logits_q = [0, ln 3] → Q = [0.25, 0.75]:
+  //   KL(P||Q) = 0.5·ln(0.5/0.25) + 0.5·ln(0.5/0.75) = 0.5·(2·ln2 − ln3)
+  //            ≈ 0.143841;
+  //   JS(P,Q)  ≈ 0.033822 (see the module-level worked derivation).
+
+  /// Natural log of 3, used to build the Q = [1/4, 3/4] softmax target.
+  #[cfg(target_os = "macos")]
+  const LN3: f32 = 1.098_612_3;
+
+  #[cfg(target_os = "macos")]
+  #[test]
+  #[ignore = "requires a Metal-capable GPU"]
+  fn kl_div_loss_matches_closed_form() {
+    // logits_q = [0, ln3] → Q = [1/4, 3/4]; logits_p = [0, 0] → P = [1/2, 1/2].
+    let q = Array::from_slice::<f32>(&[0.0, LN3], &[1, 2]).unwrap();
+    let p = Array::from_slice::<f32>(&[0.0, 0.0], &[1, 2]).unwrap();
+    let mut loss = kl_div_loss(&q, &p).unwrap();
+    // Output shape mirrors logits_q.shape[:-1] = [1] (NOT a bare scalar).
+    assert_eq!(loss.shape(), vec![1]);
+    let buf: Vec<f32> = loss.to_vec().unwrap();
+    // 0.5 * (2*ln2 - ln3) ≈ 0.143841.
+    let expected = 0.5 * (2.0 * std::f32::consts::LN_2 - LN3);
+    assert!(
+      (buf[0] - expected).abs() < 1e-4,
+      "KL loss = {}, expected ≈ {expected}",
+      buf[0]
+    );
+  }
+
+  #[cfg(target_os = "macos")]
+  #[test]
+  #[ignore = "requires a Metal-capable GPU"]
+  fn kl_div_loss_identity_is_zero() {
+    // D_KL(P || P) = 0 for any logits (here arbitrary, non-uniform).
+    let x = Array::from_slice::<f32>(&[0.3, -1.2, 2.5, 0.0], &[1, 4]).unwrap();
+    let y = x.try_clone().unwrap();
+    let mut loss = kl_div_loss(&x, &y).unwrap();
+    let buf: Vec<f32> = loss.to_vec().unwrap();
+    assert!(buf[0].abs() < 1e-5, "KL(P||P) = {}, expected ≈ 0", buf[0]);
+  }
+
+  #[cfg(target_os = "macos")]
+  #[test]
+  #[ignore = "requires a Metal-capable GPU"]
+  fn kl_div_loss_batched_rows_are_independent() {
+    // Row 0 = the worked KL case → ≈0.143841; row 1 = identity (q==p) → 0.
+    // Exercises n_outs = 2 and the leading-shape output `[2]`.
+    let q = Array::from_slice::<f32>(&[0.0, LN3, 0.7, 0.7], &[2, 2]).unwrap();
+    let p = Array::from_slice::<f32>(&[0.0, 0.0, 0.7, 0.7], &[2, 2]).unwrap();
+    let mut loss = kl_div_loss(&q, &p).unwrap();
+    assert_eq!(loss.shape(), vec![2]);
+    let buf: Vec<f32> = loss.to_vec().unwrap();
+    let row0 = 0.5 * (2.0 * std::f32::consts::LN_2 - LN3);
+    assert!(
+      (buf[0] - row0).abs() < 1e-4,
+      "row0 = {}, expected {row0}",
+      buf[0]
+    );
+    assert!(buf[1].abs() < 1e-5, "row1 = {}, expected ≈ 0", buf[1]);
+  }
+
+  #[cfg(target_os = "macos")]
+  #[test]
+  #[ignore = "requires a Metal-capable GPU"]
+  fn kl_div_loss_grad_equals_q_minus_p() {
+    // grad of the scalar loss wrt logits_q is Q − P (the cotangent is 1 for a
+    // scalar reduction); grad wrt logits_p is exactly zero (zeros_like).
+    // Q = [1/4, 3/4], P = [1/2, 1/2] → grad_q = [-1/4, 1/4].
+    let q = Array::from_slice::<f32>(&[0.0, LN3], &[1, 2]).unwrap();
+    let p = Array::from_slice::<f32>(&[0.0, 0.0], &[1, 2]).unwrap();
+    let g = crate::transforms::grad(
+      |xs: &[Array]| Ok(vec![kl_div_loss(&xs[0], &xs[1])?.sum(false)?]),
+      &[0, 1],
+    )
+    .unwrap();
+    let mut grads = g(&[q, p]).unwrap();
+    assert_eq!(grads.len(), 2);
+    let dq: Vec<f32> = grads[0].to_vec().unwrap();
+    let dp: Vec<f32> = grads[1].to_vec().unwrap();
+    assert!(
+      (dq[0] - (-0.25)).abs() < 1e-4,
+      "dq[0] = {}, expected -0.25",
+      dq[0]
+    );
+    assert!(
+      (dq[1] - 0.25).abs() < 1e-4,
+      "dq[1] = {}, expected 0.25",
+      dq[1]
+    );
+    assert!(
+      dp[0].abs() < 1e-6 && dp[1].abs() < 1e-6,
+      "dp = {dp:?}, expected zeros"
+    );
+  }
+
+  #[cfg(target_os = "macos")]
+  #[test]
+  #[ignore = "requires a Metal-capable GPU"]
+  fn js_div_loss_matches_closed_form() {
+    let q = Array::from_slice::<f32>(&[0.0, LN3], &[1, 2]).unwrap();
+    let p = Array::from_slice::<f32>(&[0.0, 0.0], &[1, 2]).unwrap();
+    let mut loss = js_div_loss(&q, &p).unwrap();
+    assert_eq!(loss.shape(), vec![1]);
+    let buf: Vec<f32> = loss.to_vec().unwrap();
+    // Closed-form JS for P=[.5,.5], Q=[.25,.75]: ≈ 0.033822.
+    let expected = 0.033_822_08_f32;
+    assert!(
+      (buf[0] - expected).abs() < 1e-4,
+      "JS loss = {}, expected ≈ {expected}",
+      buf[0]
+    );
+  }
+
+  #[cfg(target_os = "macos")]
+  #[test]
+  #[ignore = "requires a Metal-capable GPU"]
+  fn js_div_loss_identity_is_zero() {
+    // JS(P, P) = 0 for any logits.
+    let x = Array::from_slice::<f32>(&[0.3, -1.2, 2.5, 0.0], &[1, 4]).unwrap();
+    let y = x.try_clone().unwrap();
+    let mut loss = js_div_loss(&x, &y).unwrap();
+    let buf: Vec<f32> = loss.to_vec().unwrap();
+    assert!(buf[0].abs() < 1e-5, "JS(P,P) = {}, expected ≈ 0", buf[0]);
+  }
+
+  #[cfg(target_os = "macos")]
+  #[test]
+  #[ignore = "requires a Metal-capable GPU"]
+  fn js_div_loss_grad_runs_and_sums_to_zero() {
+    // The JS backward gradient wrt logits_q has no compact closed form, but
+    // softmax shift-invariance forces Σ_j (dL/dq_j) = 0 (verified analytically
+    // against the backward kernel: the per-row kl_q term cancels Σ q_j·(...)).
+    // grad wrt logits_p is exactly zero (zeros_like).
+    let q = Array::from_slice::<f32>(&[0.0, LN3], &[1, 2]).unwrap();
+    let p = Array::from_slice::<f32>(&[0.0, 0.0], &[1, 2]).unwrap();
+    let g = crate::transforms::grad(
+      |xs: &[Array]| Ok(vec![js_div_loss(&xs[0], &xs[1])?.sum(false)?]),
+      &[0, 1],
+    )
+    .unwrap();
+    let mut grads = g(&[q, p]).unwrap();
+    assert_eq!(grads.len(), 2);
+    let dq: Vec<f32> = grads[0].to_vec().unwrap();
+    let dp: Vec<f32> = grads[1].to_vec().unwrap();
+    assert_eq!(dq.len(), 2);
+    assert!(
+      (dq[0] + dq[1]).abs() < 1e-4,
+      "Σ dq = {}, expected ≈ 0",
+      dq[0] + dq[1]
+    );
+    // Gradient is non-trivial (Q != P), so it must not be all-zero.
+    assert!(
+      dq[0].abs() > 1e-4 || dq[1].abs() > 1e-4,
+      "dq unexpectedly ≈ 0: {dq:?}"
+    );
+    assert!(
+      dp[0].abs() < 1e-6 && dp[1].abs() < 1e-6,
+      "dp = {dp:?}, expected zeros"
+    );
+  }
 }
