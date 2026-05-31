@@ -3295,3 +3295,1180 @@ fn save_safetensors_to_file_truncates_on_mlx_internal_error_zero_element_array()
 
   let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ─────────────────────── dtype_size: 2-byte + 8-byte classes ───────────────────────
+
+/// `array_nbytes` exercises every `dtype_size` arm. The 1-byte and 4-byte
+/// classes are covered by `array_nbytes_is_count_times_dtype_size`; this
+/// covers the 2-byte arm (`u16`/`i16`/`f16`/`bf16`) and the 8-byte arm
+/// (`u64`/`i64`/`f64`/`Complex64` — a single match arm, so `u64`/`i64`/`f64`
+/// cover it). Hand-computed: `n` elements of a `k`-byte dtype is `n * k`
+/// bytes.
+#[test]
+fn array_nbytes_two_byte_and_eight_byte_dtype_classes() {
+  // 2-byte classes.
+  let u16s = Array::from_slice::<u16>(&[0u16; 5], &(5usize,)).unwrap();
+  assert_eq!(array_nbytes(&u16s).unwrap(), 10);
+  let i16s = Array::from_slice::<i16>(&[0i16; 3], &(3usize,)).unwrap();
+  assert_eq!(array_nbytes(&i16s).unwrap(), 6);
+  let f16s = Array::from_slice::<half::f16>(&[half::f16::ZERO; 4], &(4usize,)).unwrap();
+  assert_eq!(array_nbytes(&f16s).unwrap(), 8);
+  let bf16s = Array::from_slice::<half::bf16>(&[half::bf16::ZERO; 2], &(2usize,)).unwrap();
+  assert_eq!(array_nbytes(&bf16s).unwrap(), 4);
+
+  // 8-byte classes (`u64`/`i64`/`f64` — the same match arm as `Complex64`).
+  let u64s = Array::from_slice::<u64>(&[0u64; 3], &(3usize,)).unwrap();
+  assert_eq!(array_nbytes(&u64s).unwrap(), 24);
+  let i64s = Array::from_slice::<i64>(&[0i64; 2], &(2usize,)).unwrap();
+  assert_eq!(array_nbytes(&i64s).unwrap(), 16);
+  let f64s = Array::from_slice::<f64>(&[0.0f64; 5], &(5usize,)).unwrap();
+  assert_eq!(array_nbytes(&f64s).unwrap(), 40);
+}
+
+// ─────────────────────── Config::from_json parse surface ───────────────────────
+
+/// A complete, valid `config.json` body parses into the typed [`Config`]
+/// subset; unknown keys (`quantization_config`, `max_position_embeddings`)
+/// are tolerated (forward-compatible — no `deny_unknown_fields`), and the
+/// optional `#[serde(default)]` fields default to `None` when absent.
+#[test]
+fn config_from_json_parses_required_subset_ignores_unknown_keys() {
+  let json = r#"{
+    "model_type": "qwen3",
+    "hidden_size": 64,
+    "num_hidden_layers": 12,
+    "num_attention_heads": 8,
+    "num_key_value_heads": 2,
+    "head_dim": 8,
+    "rope_theta": 10000.0,
+    "vocab_size": 32000,
+    "tie_word_embeddings": true,
+    "max_position_embeddings": 4096,
+    "quantization_config": {"unmodeled": "ignored"}
+  }"#;
+  let config = Config::from_json(json).unwrap();
+  assert_eq!(config.model_type(), "qwen3");
+  assert_eq!(config.hidden_size, 64);
+  assert_eq!(config.num_hidden_layers, 12);
+  assert_eq!(config.num_attention_heads, 8);
+  assert_eq!(config.num_key_value_heads, 2);
+  assert_eq!(config.head_dim, 8);
+  assert!((config.rope_theta - 10000.0).abs() < 1e-3);
+  assert_eq!(config.vocab_size, 32000);
+  assert!(config.tie_word_embeddings);
+  // Absent optionals default to None.
+  assert!(config.sliding_window.is_none());
+  assert!(config.quantization.is_none());
+  assert!(config.eos_token_id.is_none());
+}
+
+/// `eos_token_id` accepts BOTH the scalar form (`Single`) and the list
+/// form (`Many`) — the untagged enum tries scalar first, then list. Also
+/// covers `EosTokenId::into_ids` (scalar → one-element vec; list → vec).
+#[test]
+fn config_from_json_eos_token_id_scalar_and_list_forms() {
+  let base = r#""model_type":"m","hidden_size":1,"num_hidden_layers":1,
+    "num_attention_heads":1,"num_key_value_heads":1,"head_dim":1,
+    "rope_theta":1.0,"vocab_size":2,"tie_word_embeddings":false"#;
+  // Scalar form → Single.
+  let scalar = format!("{{{base},\"eos_token_id\":128001}}");
+  let c = Config::from_json(&scalar).unwrap();
+  assert_eq!(c.eos_token_id, Some(EosTokenId::Single(128001)));
+  assert!(c.eos_token_id.as_ref().unwrap().is_single());
+  assert_eq!(c.eos_token_id.unwrap().into_ids(), vec![128001]);
+  // List form → Many.
+  let list = format!("{{{base},\"eos_token_id\":[1,2,3]}}");
+  let c2 = Config::from_json(&list).unwrap();
+  assert_eq!(c2.eos_token_id, Some(EosTokenId::Many(vec![1, 2, 3])));
+  assert!(c2.eos_token_id.as_ref().unwrap().is_many());
+  assert_eq!(c2.eos_token_id.unwrap().into_ids(), vec![1, 2, 3]);
+}
+
+/// A missing **required** field (`vocab_size` dropped) is a typed
+/// [`Error::Parse`] from serde — mlx-lm raises on an incomplete config.
+#[test]
+fn config_from_json_missing_required_field_is_parse_error() {
+  let json = r#"{
+    "model_type": "m", "hidden_size": 1, "num_hidden_layers": 1,
+    "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 1,
+    "rope_theta": 1.0, "tie_word_embeddings": false
+  }"#; // no vocab_size
+  let err = Config::from_json(json);
+  assert!(
+    matches!(&err, Err(Error::Parse(p))
+        if p.context() == "Config::from_json" && p.input_kind() == "model config JSON"),
+    "expected Error::Parse for a missing required field, got {err:?}"
+  );
+}
+
+/// Malformed (non-JSON) config body is a typed [`Error::Parse`].
+#[test]
+fn config_from_json_malformed_is_parse_error() {
+  let err = Config::from_json("this is not json {{{");
+  assert!(
+    matches!(&err, Err(Error::Parse(p)) if p.context() == "Config::from_json"),
+    "expected Error::Parse for malformed JSON, got {err:?}"
+  );
+}
+
+// ─────────────────────── read_bounded_text_file: hardening branches ───────────────────────
+
+/// A `config.json` whose **parent path component is a regular file** makes
+/// the `O_NONBLOCK` open fail with an error OTHER than `NotFound` (POSIX
+/// `ENOTDIR`), exercising the open-error → [`Error::FileIo`] (`Open`)
+/// branch of `read_bounded_config_file` (distinct from the absent-file
+/// `Ok(None)` path).
+#[cfg(unix)]
+#[test]
+fn read_bounded_config_file_open_error_other_than_notfound() {
+  let dir = fresh_dir("read-bounded-enotdir");
+  // Plant a regular file, then ask to read a path THROUGH it as if it were
+  // a directory — `open("<file>/config.json")` fails ENOTDIR (NOT
+  // NotFound), so the open-error branch fires.
+  let as_file = dir.join("not_a_dir");
+  std::fs::write(&as_file, b"x").unwrap();
+  let through = as_file.join("config.json");
+  let r = read_bounded_config_file(&through, "model config");
+  let Err(Error::FileIo(p)) = r else {
+    panic!("expected Error::FileIo for an ENOTDIR open, got {r:?}");
+  };
+  assert_eq!(p.op(), FileOp::Open);
+  assert_eq!(p.context(), "model config");
+  assert_ne!(
+    p.inner().kind(),
+    std::io::ErrorKind::NotFound,
+    "the ENOTDIR open error must NOT be classified as NotFound (that path returns Ok(None))"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An absent file is the `Ok(None)` "try the next candidate" signal — the
+/// open returns `NotFound`, which is NOT an error.
+#[test]
+fn read_bounded_config_file_absent_is_ok_none() {
+  let dir = fresh_dir("read-bounded-absent");
+  let missing = dir.join("does-not-exist.json");
+  let r = read_bounded_config_file(&missing, "model config").unwrap();
+  assert!(r.is_none(), "an absent file must yield Ok(None)");
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A path that resolves to a **directory** opens successfully but its
+/// post-open `is_file()` fstat is false, so the non-regular-reject branch
+/// fires with [`Error::FileIo`] (`Stat`, `InvalidInput`) — the guard that
+/// keeps a planted FIFO/device/directory from being streamed unbounded.
+#[test]
+fn read_bounded_config_file_rejects_non_regular_directory() {
+  let dir = fresh_dir("read-bounded-isdir");
+  // The directory itself is a valid (openable) path whose target is not a
+  // regular file.
+  let r = read_bounded_config_file(&dir, "model config");
+  let Err(Error::FileIo(p)) = r else {
+    panic!("expected Error::FileIo for a directory target, got {r:?}");
+  };
+  assert_eq!(p.op(), FileOp::Stat);
+  assert_eq!(p.context(), "model config");
+  assert_eq!(p.inner().kind(), std::io::ErrorKind::InvalidInput);
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A body strictly larger than the cap is rejected with
+/// [`Error::CapExceeded`] naming the cap and the observed size. Driven
+/// through the shared `read_bounded_text_file` with a tiny explicit cap so
+/// the test writes only a few bytes (no multi-MiB fixture): a 4-byte file
+/// against a 3-byte cap trips `bytes.len() > max_bytes`.
+#[test]
+fn read_bounded_text_file_cap_exceeded() {
+  let dir = fresh_dir("read-bounded-cap");
+  let path = dir.join("big.json");
+  std::fs::write(&path, b"abcd").unwrap(); // 4 bytes
+  let r = read_bounded_text_file(&path, "model config", 3);
+  let Err(Error::CapExceeded(p)) = r else {
+    panic!("expected Error::CapExceeded for an over-cap body, got {r:?}");
+  };
+  assert_eq!(p.context(), "model config");
+  assert_eq!(p.cap_name(), "max_bytes");
+  assert_eq!(p.cap(), 3);
+  assert_eq!(p.observed(), 4);
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A body exactly AT the cap is accepted (the cap is inclusive — the
+/// reject is `len > max_bytes`, and the `take(max + 1)` reads one extra
+/// only to detect overflow). 3 bytes against a 3-byte cap reads back
+/// verbatim.
+#[test]
+fn read_bounded_text_file_exactly_at_cap_ok() {
+  let dir = fresh_dir("read-bounded-at-cap");
+  let path = dir.join("ok.json");
+  std::fs::write(&path, b"abc").unwrap(); // exactly 3 bytes
+  let r = read_bounded_text_file(&path, "model config", 3).unwrap();
+  assert_eq!(r.as_deref(), Some("abc"));
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A non-UTF-8 body is rejected with [`Error::LayerKeyed`] naming the path
+/// and an inner [`Error::Parse`] (`UTF-8`) — covers the `from_utf8` failure
+/// arm of `read_bounded_text_file`.
+#[test]
+fn read_bounded_text_file_non_utf8_is_layer_keyed_parse() {
+  let dir = fresh_dir("read-bounded-non-utf8");
+  let path = dir.join("bad.json");
+  // 0xFF is never a valid UTF-8 lead byte.
+  std::fs::write(&path, [0xFF_u8, 0xFE, 0x00]).unwrap();
+  let r = read_bounded_text_file(&path, "model config", 1024);
+  let Err(Error::LayerKeyed(p)) = r else {
+    panic!("expected Error::LayerKeyed for non-UTF-8, got {r:?}");
+  };
+  assert!(
+    p.layer().contains("bad.json"),
+    "layer should name the path, got `{}`",
+    p.layer()
+  );
+  assert!(
+    matches!(p.inner(), Error::Parse(pp)
+        if pp.context() == "model config" && pp.input_kind() == "UTF-8"),
+    "expected inner Error::Parse(UTF-8), got {:?}",
+    p.inner()
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────────────── load_config + read_generation_eos ───────────────────────
+
+/// `load_config` reads `<dir>/config.json` once and returns BOTH the typed
+/// [`Config`] and the verbatim JSON text. With no `generation_config.json`
+/// present, the `config.json` `eos_token_id` is returned unchanged.
+#[test]
+fn load_config_returns_typed_and_raw_no_generation_override() {
+  let dir = fresh_dir("load-config-basic");
+  let body = r#"{"model_type":"qwen3","hidden_size":16,"num_hidden_layers":2,
+    "num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,
+    "rope_theta":10000.0,"vocab_size":100,"tie_word_embeddings":false,
+    "eos_token_id":7}"#;
+  std::fs::write(dir.join("config.json"), body).unwrap();
+  let (config, raw) = load_config(&dir).unwrap();
+  assert_eq!(config.model_type(), "qwen3");
+  // No generation_config.json → config.json's eos survives.
+  assert_eq!(config.eos_token_id, Some(EosTokenId::Single(7)));
+  // The raw text is the on-disk body verbatim.
+  assert_eq!(raw, body);
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A missing `config.json` is a hard error (mlx-lm raises) — the absent-
+/// file `Ok(None)` from the bounded reader is mapped to
+/// [`Error::FileIo`] (`Open`, `NotFound`) by `load_config`.
+#[test]
+fn load_config_missing_config_json_errors() {
+  let dir = fresh_dir("load-config-missing");
+  let r = load_config(&dir);
+  let Err(Error::FileIo(p)) = r else {
+    panic!("expected Error::FileIo for a missing config.json, got {r:?}");
+  };
+  assert_eq!(p.op(), FileOp::Open);
+  assert_eq!(p.inner().kind(), std::io::ErrorKind::NotFound);
+  assert_eq!(p.path(), dir.join("config.json").as_path());
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A *truthy* `generation_config.json` `eos_token_id` OVERWRITES the
+/// `config.json` value in the RETURNED `Config` (mlx-lm's in-place
+/// override), shape-preserving (list → `Many`). The raw text is left
+/// untouched (it is the on-disk `config.json` verbatim, not rewritten).
+#[test]
+fn load_config_generation_config_eos_override_replaces_in_place() {
+  let dir = fresh_dir("load-config-gen-override");
+  let body = r#"{"model_type":"m","hidden_size":1,"num_hidden_layers":1,
+    "num_attention_heads":1,"num_key_value_heads":1,"head_dim":1,
+    "rope_theta":1.0,"vocab_size":2,"tie_word_embeddings":false,
+    "eos_token_id":1}"#;
+  std::fs::write(dir.join("config.json"), body).unwrap();
+  // A truthy LIST override.
+  std::fs::write(
+    dir.join("generation_config.json"),
+    r#"{"eos_token_id":[10,20]}"#,
+  )
+  .unwrap();
+  let (config, raw) = load_config(&dir).unwrap();
+  assert_eq!(
+    config.eos_token_id,
+    Some(EosTokenId::Many(vec![10, 20])),
+    "generation_config eos must REPLACE config.json's in place"
+  );
+  // Raw text is the verbatim config.json (still carries the OLD eos: 1).
+  assert_eq!(raw, body);
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `read_generation_eos` truthiness, exactly mirroring mlx-lm's
+/// `if eos_token_id := generation_config.get(...)`:
+///  - absent file → `None`;
+///  - scalar `0` → `None` (falsy);
+///  - empty list `[]` → `None` (falsy);
+///  - truthy scalar → `Single`;
+///  - non-empty list (even one containing `0`) → `Many` preserving contents;
+///  - malformed JSON / missing key → `None` (optional metadata).
+#[test]
+fn read_generation_eos_truthiness_matrix() {
+  let dir = fresh_dir("gen-eos-matrix");
+  let gp = dir.join("generation_config.json");
+
+  // Absent file.
+  let _ = std::fs::remove_file(&gp);
+  assert_eq!(read_generation_eos(&dir), None, "absent → None");
+
+  // Scalar 0 is falsy.
+  std::fs::write(&gp, r#"{"eos_token_id":0}"#).unwrap();
+  assert_eq!(read_generation_eos(&dir), None, "scalar 0 → None");
+
+  // Empty list is falsy.
+  std::fs::write(&gp, r#"{"eos_token_id":[]}"#).unwrap();
+  assert_eq!(read_generation_eos(&dir), None, "empty list → None");
+
+  // Truthy scalar.
+  std::fs::write(&gp, r#"{"eos_token_id":42}"#).unwrap();
+  assert_eq!(read_generation_eos(&dir), Some(EosTokenId::Single(42)));
+
+  // Non-empty list keeps a 0 (the list is truthy regardless of contents).
+  std::fs::write(&gp, r#"{"eos_token_id":[0,5]}"#).unwrap();
+  assert_eq!(
+    read_generation_eos(&dir),
+    Some(EosTokenId::Many(vec![0, 5])),
+    "a non-empty list is truthy and preserves contents (incl. 0)"
+  );
+
+  // Malformed JSON → None (except: pass parity).
+  std::fs::write(&gp, b"not json {{{").unwrap();
+  assert_eq!(read_generation_eos(&dir), None, "malformed → None");
+
+  // Missing key → None.
+  std::fs::write(&gp, r#"{"something_else":1}"#).unwrap();
+  assert_eq!(read_generation_eos(&dir), None, "missing key → None");
+
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────────────── load_via_index: structural-reject branches ───────────────────────
+
+/// An index whose `weight_map` value is a NON-string (a number) is rejected
+/// with [`Error::LayerKeyed`] naming `weight_map[<key>]` and an inner
+/// [`Error::InvariantViolation`] ("must be a string").
+#[test]
+fn load_weights_index_non_string_shard_value_errors() {
+  let dir = fresh_dir("load-index-non-string");
+  write_json_pretty_to_path(
+    &dir.join("model.safetensors.index.json"),
+    &serde_json::json!({
+      "metadata": { "total_size": 0, "total_parameters": 0 },
+      "weight_map": { "w.weight": 123 },
+    }),
+    "test: non-string shard value",
+  )
+  .unwrap();
+  let r = load_weights(&dir);
+  let Err(Error::LayerKeyed(p)) = r else {
+    panic!("expected Error::LayerKeyed for a non-string shard value, got {r:?}");
+  };
+  assert!(
+    p.layer().contains("weight_map[w.weight]"),
+    "layer should name the offending mapping, got `{}`",
+    p.layer()
+  );
+  assert!(
+    matches!(p.inner(), Error::InvariantViolation(iv)
+        if iv.context().contains("weight_map shard value") && iv.requirement().contains("string")),
+    "expected inner InvariantViolation about string value, got {:?}",
+    p.inner()
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An index whose top-level `weight_map` is missing (or not an object) is
+/// rejected with [`Error::LayerKeyed`] wrapping an [`Error::MissingKey`]
+/// naming `weight_map`.
+#[test]
+fn load_weights_index_without_weight_map_object_errors() {
+  let dir = fresh_dir("load-index-no-weight-map");
+  // `weight_map` present but a string, not an object → as_object() is None.
+  write_json_pretty_to_path(
+    &dir.join("model.safetensors.index.json"),
+    &serde_json::json!({
+      "metadata": { "total_size": 0, "total_parameters": 0 },
+      "weight_map": "not-an-object",
+    }),
+    "test: weight_map not an object",
+  )
+  .unwrap();
+  let r = load_weights(&dir);
+  let Err(Error::LayerKeyed(p)) = r else {
+    panic!("expected Error::LayerKeyed for a missing weight_map object, got {r:?}");
+  };
+  assert!(
+    p.layer().contains("model.safetensors.index.json"),
+    "layer should name the index path, got `{}`",
+    p.layer()
+  );
+  assert!(
+    matches!(p.inner(), Error::MissingKey(mk) if mk.key() == "weight_map"),
+    "expected inner MissingKey naming `weight_map`, got {:?}",
+    p.inner()
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An empty `weight_map` (no shards listed at all) drives an empty merge:
+/// `load_via_index` returns `Ok(Some(empty))`, so `load_weights` succeeds
+/// with a zero-entry map (the index IS the manifest; an empty manifest is
+/// an empty checkpoint, not a fall-through to the next tier).
+#[test]
+fn load_weights_index_empty_weight_map_yields_empty_weights() {
+  let dir = fresh_dir("load-index-empty-map");
+  write_json_pretty_to_path(
+    &dir.join("model.safetensors.index.json"),
+    &serde_json::json!({
+      "metadata": { "total_size": 0, "total_parameters": 0 },
+      "weight_map": {},
+    }),
+    "test: empty weight_map",
+  )
+  .unwrap();
+  let loaded = load_weights(&dir).unwrap();
+  assert!(
+    loaded.is_empty(),
+    "an empty index weight_map yields an empty (but successful) load"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────────────── load_weights: GGUF-unsupported fall-through ───────────────────────
+
+/// With no safetensors of any layout, a present `*.gguf` is reported as
+/// unsupported in the default build (the `gguf` feature is OFF and mlxrs-sys
+/// does not yet link gguflib). The error is an [`Error::LayerKeyed`] naming
+/// the gguf file with an inner [`Error::InvariantViolation`] about the
+/// `gguf` feature. (When the `gguf` feature is enabled this path instead
+/// loads the file; that arm needs MLX so is not exercised here.)
+#[cfg(not(feature = "gguf"))]
+#[test]
+fn load_weights_gguf_present_without_feature_is_unsupported() {
+  let dir = fresh_dir("load-gguf-unsupported");
+  // A bare (non-safetensors) `*.gguf` — content is irrelevant; the
+  // resolver reaches the gguf tier purely by file extension, and the
+  // not-`gguf`-feature arm errors before any parse.
+  std::fs::write(dir.join("model.gguf"), b"GGUF placeholder bytes").unwrap();
+  let r = load_weights(&dir);
+  let Err(Error::LayerKeyed(p)) = r else {
+    panic!("expected Error::LayerKeyed for an unsupported GGUF, got {r:?}");
+  };
+  assert!(
+    p.layer().contains("model.gguf"),
+    "layer should name the gguf file, got `{}`",
+    p.layer()
+  );
+  assert!(
+    matches!(p.inner(), Error::InvariantViolation(iv)
+        if iv.context().contains("GGUF") && iv.requirement().contains("enabled")),
+    "expected inner InvariantViolation about the gguf feature, got {:?}",
+    p.inner()
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────────────── path_is_file + collect_sorted error branches ───────────────────────
+
+/// `path_is_file` on a path THROUGH a regular file (POSIX `ENOTDIR`, a stat
+/// error that is NOT `NotFound`) surfaces a typed error — the `Err(e)` arm
+/// distinct from the `Ok(false)` absent path. Exercised through the public
+/// `load_weights` probe: with the model "directory" replaced by a regular
+/// file, resolving paths inside it fails ENOTDIR (never a panic).
+#[cfg(unix)]
+#[test]
+fn load_weights_dir_is_regular_file_stat_error() {
+  let dir = fresh_dir("load-dir-is-file");
+  let as_file = dir.join("modelfile");
+  std::fs::write(&as_file, b"x").unwrap();
+  let r = load_weights(&as_file);
+  assert!(
+    matches!(&r, Err(Error::FileIo(_)) | Err(Error::LayerKeyed(_))),
+    "a non-directory model path must be a typed FileIo/LayerKeyed error, got {r:?}"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `collect_sorted` on an absent / non-directory `dir` surfaces
+/// [`Error::FileIo`] (`Read`) — the `read_dir` failure arm. Exercised
+/// directly (it is a private helper reachable via `use super::*`).
+#[test]
+fn collect_sorted_unreadable_directory_errors() {
+  let dir = fresh_dir("collect-sorted-missing");
+  let missing = dir.join("no-such-subdir");
+  let r = collect_sorted(&missing, |n| n.ends_with(".safetensors"));
+  let Err(Error::FileIo(p)) = r else {
+    panic!("expected Error::FileIo for an unreadable directory, got {r:?}");
+  };
+  assert_eq!(p.op(), FileOp::Read);
+  assert_eq!(p.context(), "cannot read model directory");
+  assert_eq!(p.path(), missing.as_path());
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `collect_sorted` only returns REGULAR files: a subdirectory whose name
+/// matches the predicate is skipped (the `Ok(_) => continue` arm), while a
+/// matching regular file is kept. Hand-built: one matching dir + one
+/// matching file → exactly the file is returned.
+#[test]
+fn collect_sorted_skips_matching_subdirectory_keeps_file() {
+  let dir = fresh_dir("collect-sorted-skip-dir");
+  // A subdirectory whose name matches the predicate — must be skipped.
+  std::fs::create_dir_all(dir.join("subdir.safetensors")).unwrap();
+  // A regular file that matches — must be kept.
+  std::fs::write(dir.join("real.safetensors"), b"x").unwrap();
+  let out = collect_sorted(&dir, |n| n.ends_with(".safetensors")).unwrap();
+  assert_eq!(
+    out.len(),
+    1,
+    "only the regular file is collected, the dir is skipped"
+  );
+  assert_eq!(out[0], dir.join("real.safetensors"));
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────────────── get_total_parameters: bits<=0 + biases-unresolvable ───────────────────────
+
+/// A quantized layer whose resolved [`Quantization`] has `bits <= 0` is an
+/// [`Error::LayerKeyed`] wrapping [`Error::OutOfRange`] ("must be > 0") — the
+/// guard before the `* 32 / bits` divide (covers the `q.bits <= 0` branch).
+#[test]
+fn get_total_parameters_nonpositive_bits_errors() {
+  let mut w: Weights = HashMap::new();
+  w.insert(
+    "model.q.weight".to_string(),
+    Array::from_slice::<u32>(&[0u32; 8], &(2usize, 4)).unwrap(),
+  );
+  w.insert(
+    "model.q.scales".to_string(),
+    Array::from_slice::<f32>(&[0.0, 0.0], &(2usize,)).unwrap(),
+  );
+  // bits = 0 (affine helper takes group_size, bits) — resolvable but
+  // non-positive, tripping the explicit guard.
+  let quant = PerLayerQuantization::from_global(Quantization::affine(64, 0));
+  let err = get_total_parameters(&w, &quant);
+  let Err(Error::LayerKeyed(p)) = err else {
+    panic!("expected Error::LayerKeyed for bits<=0, got {err:?}");
+  };
+  assert_eq!(p.layer(), "model.q");
+  assert!(
+    matches!(p.inner(), Error::OutOfRange(or)
+        if or.context().contains("bits") && or.requirement().contains("> 0")),
+    "expected inner OutOfRange about bits>0, got {:?}",
+    p.inner()
+  );
+}
+
+/// When HashMap iteration reaches the `.biases` of a quantized affine
+/// triple BEFORE its `.weight`, the `.biases` branch itself resolves
+/// `quantization_for` — an unresolvable layer there is the same config
+/// error (covers the `.ok_or_else` on the `.biases`-first path). Forced by
+/// supplying a triple with NO resolvable quantization: the error fires
+/// regardless of which sibling iteration visits first.
+#[test]
+fn get_total_parameters_biases_branch_unresolvable_quant_errors() {
+  let mut w: Weights = HashMap::new();
+  w.insert(
+    "model.q.weight".to_string(),
+    Array::from_slice::<u32>(&[0u32; 8], &(2usize, 4)).unwrap(),
+  );
+  w.insert(
+    "model.q.scales".to_string(),
+    Array::from_slice::<f32>(&[0.0, 0.0], &(2usize,)).unwrap(),
+  );
+  w.insert(
+    "model.q.biases".to_string(),
+    Array::from_slice::<f32>(&[0.0, 0.0], &(2usize,)).unwrap(),
+  );
+  // No global, no per-layer override → unresolvable for BOTH the .weight
+  // and the .biases branch.
+  let err = get_total_parameters(&w, &PerLayerQuantization::default());
+  let Err(Error::LayerKeyed(p)) = err else {
+    panic!("expected Error::LayerKeyed for an unresolvable quantized triple, got {err:?}");
+  };
+  assert_eq!(p.layer(), "model.q");
+  assert!(
+    matches!(p.inner(), Error::InvariantViolation(iv)
+        if iv.requirement().contains("resolvable")),
+    "expected inner InvariantViolation about resolvable quant params, got {:?}",
+    p.inner()
+  );
+}
+
+// ─────────────────────── save_model: create_dir + final-path branches ───────────────────────
+
+/// `save_model` into a path whose parent component is a regular file fails
+/// at the up-front `create_dir_all` with [`Error::FileIo`] (`Create`) — the
+/// directory-create error arm.
+#[cfg(unix)]
+#[test]
+fn save_model_create_dir_failure_on_nondir_parent() {
+  let dir = fresh_dir("save-model-create-dir-fail");
+  let blocker = dir.join("iam_a_file");
+  std::fs::write(&blocker, b"x").unwrap();
+  // Ask to save INTO a path nested under the regular file → create_dir_all
+  // cannot make `iam_a_file/sub` because `iam_a_file` is not a directory.
+  let target = blocker.join("sub");
+  let mut w: Weights = HashMap::new();
+  w.insert("w.weight".to_string(), f32_weight(2));
+  let r = save_model(&target, &w, &PerLayerQuantization::default());
+  let Err(Error::FileIo(p)) = r else {
+    panic!("expected Error::FileIo(Create) for a non-dir parent, got {r:?}");
+  };
+  assert_eq!(p.op(), FileOp::Create);
+  assert_eq!(p.context(), "save_model: cannot create directory");
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `save` (the driver) into a path whose parent is a regular file fails at
+/// its own up-front `create_dir_all` with [`Error::FileIo`] (`Create`,
+/// "save: cannot create destination directory") — before any config staging
+/// or weight write.
+#[cfg(unix)]
+#[test]
+fn save_driver_create_dir_failure_on_nondir_parent() {
+  let dir = fresh_dir("save-driver-create-dir-fail");
+  let blocker = dir.join("iam_a_file");
+  std::fs::write(&blocker, b"x").unwrap();
+  let target = blocker.join("sub");
+  let mut w: Weights = HashMap::new();
+  w.insert("w.weight".to_string(), f32_weight(2));
+  let r = save(
+    &target,
+    &w,
+    r#"{"model_type":"m"}"#,
+    &PerLayerQuantization::default(),
+  );
+  let Err(Error::FileIo(p)) = r else {
+    panic!("expected Error::FileIo(Create) for a non-dir destination parent, got {r:?}");
+  };
+  assert_eq!(p.op(), FileOp::Create);
+  assert_eq!(p.context(), "save: cannot create destination directory");
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────────────── open_excl_temp_shard: no-file_name branch ───────────────────────
+
+/// `open_excl_temp_shard` on a path with NO `file_name` component (the
+/// filesystem root `/`) errors with [`Error::FileIo`] (`Stat`,
+/// `InvalidInput`) — the `final_path.file_name().ok_or_else(...)` arm.
+#[cfg(unix)]
+#[test]
+fn open_excl_temp_shard_no_file_name_component_errors() {
+  // `/` has no file_name component.
+  let r = open_excl_temp_shard(std::path::Path::new("/"));
+  let Err(Error::FileIo(p)) = r else {
+    panic!("expected Error::FileIo for a path with no file_name, got {r:?}");
+  };
+  assert_eq!(p.op(), FileOp::Stat);
+  assert_eq!(p.context(), "save: destination has no file_name component");
+  assert_eq!(p.inner().kind(), std::io::ErrorKind::InvalidInput);
+}
+
+// ─────────────────────── fsync_path / fsync_path_io / fsync_open_file_for_path ───────────────────────
+
+/// `fsync_path` succeeds on a real, readable file (the happy path of the
+/// `pub(crate)` path-based durability helper) and returns the crate-wide
+/// `Result<()>` shape.
+#[test]
+fn fsync_path_succeeds_on_regular_file() {
+  let dir = fresh_dir("fsync-path-ok");
+  let path = dir.join("f.bin");
+  std::fs::write(&path, b"durable").unwrap();
+  let r: Result<()> = fsync_path(&path);
+  r.expect("fsync_path must succeed on a regular file");
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The `fsync_path` injector with `skip=1` decrements on the FIRST call
+/// (the else-branch of the skip counter) and FIRES on the SECOND, wrapping
+/// the injected `io::Error` in [`Error::FileIo`] (`Fsync`). Covers both the
+/// decrement-else and the fire arms of the path-based `fsync_path_inner`
+/// injector.
+#[test]
+fn fsync_path_injector_skip_then_fail() {
+  let dir = fresh_dir("fsync-path-inject");
+  let path = dir.join("f.bin");
+  std::fs::write(&path, b"x").unwrap();
+  let _guard = arm_fsync_path_fault(1);
+  // First call: skip counter is 1 → decrements to 0, real fsync runs (Ok).
+  fsync_path(&path).expect("first call must pass (injector skip=1)");
+  // Second call: counter is 0 → injector fires.
+  let r = fsync_path(&path);
+  drop(_guard);
+  let Err(Error::FileIo(p)) = r else {
+    panic!("expected Error::FileIo(Fsync) from the fired injector, got {r:?}");
+  };
+  assert_eq!(p.op(), FileOp::Fsync);
+  assert!(
+    p.inner()
+      .to_string()
+      .contains("injected fsync_path failure"),
+    "the wrapped io::Error must carry the injected message, got: {}",
+    p.inner()
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `fsync_path_io` preserves the raw `io::Result` (no `Error::Backend`
+/// collapse) and the injected [`std::io::ErrorKind`] end-to-end. Armed with
+/// a specific non-`Other` kind via `arm_fsync_path_fault_with_kind`.
+#[test]
+fn fsync_path_io_preserves_injected_kind() {
+  let dir = fresh_dir("fsync-path-io-kind");
+  let path = dir.join("f.bin");
+  std::fs::write(&path, b"x").unwrap();
+  let _guard = arm_fsync_path_fault_with_kind(0, std::io::ErrorKind::PermissionDenied);
+  let r: std::io::Result<()> = fsync_path_io(&path);
+  drop(_guard);
+  let e = r.expect_err("injector fires on the first call (skip=0)");
+  assert_eq!(
+    e.kind(),
+    std::io::ErrorKind::PermissionDenied,
+    "fsync_path_io must preserve the injected kind without collapsing to Other"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `fsync_path_io` REMOVE_THEN_FAIL injector with `skip=1` decrements on
+/// the first call (else-branch) and on the second removes the target then
+/// falls through to the natural `File::open`, which returns the AUTHENTIC
+/// OS-level `NotFound` (no synthetic message). Covers the remove-then-fail
+/// decrement-else + fire arms of `fsync_path_inner`.
+#[test]
+fn fsync_path_io_remove_then_fail_real_os_error() {
+  let dir = fresh_dir("fsync-path-remove-fail");
+  let path = dir.join("f.bin");
+  std::fs::write(&path, b"x").unwrap();
+  let _guard = arm_fsync_path_fault_remove_then_fail(1);
+  // First call: counter 1 → decrement, real fsync runs (Ok).
+  fsync_path_io(&path).expect("first remove-then-fail call passes (skip=1)");
+  // Second call: counter 0 → removes the file, then File::open returns
+  // the real NotFound OS error.
+  let r = fsync_path_io(&path);
+  drop(_guard);
+  let e = r.expect_err("the second call removes the file then fails on open");
+  assert_eq!(
+    e.kind(),
+    std::io::ErrorKind::NotFound,
+    "the OS-level open of a removed file is NotFound"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `fsync_open_file_for_path` (the fd-bound durability helper `save_model`
+/// uses for shards) succeeds on an open file, and its SKIP_THEN_FAIL
+/// injector fires through the SAME thread-local knob: armed with `skip=0`
+/// it returns [`Error::FileIo`] (`Fsync`) wrapping the injected error.
+/// Covers the fd-bound `fsync_open_file_for_path_inner` skip-then-fail
+/// fire arm + the `Error::FileIo` wrap in `fsync_open_file_for_path`.
+#[test]
+fn fsync_open_file_for_path_injector_fires() {
+  let dir = fresh_dir("fsync-fd-inject");
+  let path = dir.join("f.bin");
+  // Happy path first (no injector): a real open fd fsyncs cleanly.
+  {
+    let f = std::fs::File::create(&path).unwrap();
+    fsync_open_file_for_path(&f, &path).expect("fd-bound fsync must succeed on an open file");
+  }
+  // Now arm skip=0 so the next fd-bound fsync fires immediately.
+  let f = std::fs::File::open(&path).unwrap();
+  let _guard = arm_fsync_path_fault(0);
+  let r = fsync_open_file_for_path(&f, &path);
+  drop(_guard);
+  let Err(Error::FileIo(p)) = r else {
+    panic!("expected Error::FileIo(Fsync) from the fd-bound injector, got {r:?}");
+  };
+  assert_eq!(p.op(), FileOp::Fsync);
+  assert!(
+    p.inner()
+      .to_string()
+      .contains("injected fsync_path failure"),
+    "fd-bound injector must carry the injected message, got: {}",
+    p.inner()
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `fsync_open_file_for_path` SKIP_THEN_FAIL with `skip=1` exercises the
+/// decrement-else arm of the fd-bound inner (first call passes), then fires
+/// on the second.
+#[test]
+fn fsync_open_file_for_path_injector_skip_then_fail() {
+  let dir = fresh_dir("fsync-fd-skip-then-fail");
+  let path = dir.join("f.bin");
+  let f = std::fs::File::create(&path).unwrap();
+  let _guard = arm_fsync_path_fault(1);
+  fsync_open_file_for_path(&f, &path).expect("first fd-bound call passes (skip=1)");
+  let r = fsync_open_file_for_path(&f, &path);
+  drop(_guard);
+  assert!(
+    matches!(&r, Err(Error::FileIo(p)) if p.op() == FileOp::Fsync),
+    "second fd-bound call must fire the injector, got {r:?}"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `fsync_open_file_for_path` REMOVE_THEN_FAIL injector: armed with
+/// `skip=0`, the fd-bound inner removes the path then falls through to
+/// `file.sync_all()` on the still-open fd — which SUCCEEDS on POSIX (the
+/// inode stays live while the fd is open). Covers the fd-bound
+/// remove-then-fail fire arm (remove the path, fall through to sync_all),
+/// documenting the POSIX-semantics difference from the path-based variant.
+#[cfg(unix)]
+#[test]
+fn fsync_open_file_for_path_remove_then_fail_still_succeeds() {
+  let dir = fresh_dir("fsync-fd-remove-then-fail");
+  let path = dir.join("f.bin");
+  let f = std::fs::File::create(&path).unwrap();
+  let _guard = arm_fsync_path_fault_remove_then_fail(0);
+  // The injector removes the path, then sync_all on the open fd succeeds.
+  let r = fsync_open_file_for_path(&f, &path);
+  drop(_guard);
+  r.expect("fd-bound remove-then-fail still syncs the live inode (POSIX)");
+  // The path was unlinked by the injector.
+  assert!(!path.exists(), "the injector unlinked the path");
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────────────── save_config: durability-warning surface ───────────────────────
+
+/// `save_config`'s post-rename `fsync_dir` failure is surfaced as
+/// [`Error::DurabilityWarning`] with `committed: true` — the NEW
+/// `config.json` IS on disk; only the directory-entry fsync hiccupped.
+/// Covers the `CommittedWithDurabilityWarning` arm of `save_config`.
+#[test]
+fn save_config_post_rename_fsync_failure_is_durability_warning() {
+  let dir = fresh_dir("save-config-durability");
+  let path = dir.join("config.json");
+  // Arm skip=0 so the config-commit's post-rename fsync_dir fails.
+  let _guard = arm_fsync_dir_fault(0);
+  let r = save_config(r#"{"model_type":"qwen3","hidden_size":8}"#, &path);
+  drop(_guard);
+  match r {
+    Err(Error::DurabilityWarning(p)) => {
+      assert!(
+        p.committed(),
+        "config DurabilityWarning must be committed=true"
+      );
+      assert!(
+        p.source()
+          .to_string()
+          .contains("injected fsync_dir failure"),
+        "the underlying io::Error must be preserved, got: {}",
+        p.source()
+      );
+    }
+    other => panic!("expected Err(DurabilityWarning), got {other:?}"),
+  }
+  // The NEW config IS on disk (the rename committed before the fsync).
+  assert!(path.is_file(), "config.json must be visible on disk");
+  let text = std::fs::read_to_string(&path).unwrap();
+  assert!(text.contains("qwen3"), "the new config content is on disk");
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────────────── save_model: PRE-index fsync failure is a hard Err ───────────────────────
+
+/// The `fsync_dir` that runs AFTER the shard `hard_link`s but BEFORE the
+/// index rename is a genuine PRE-commit error: a failure there propagates
+/// as [`Error::FileIo`] (`Fsync`, "save_model: fsync parent directory"),
+/// NOT a durability warning (the index rename — the observable commit point
+/// — has not happened yet). Driven with `arm_fsync_dir_fault(0)` so the
+/// FIRST `fsync_dir` (the pre-index one) fails. Distinct from
+/// `save_model_post_index_fsync_failure_keeps_visible_checkpoint`, which
+/// uses `skip=1` to fail the POST-index fsync (the warning path).
+#[test]
+fn save_model_pre_index_fsync_failure_is_hard_error() {
+  let dir = fresh_dir("save-model-pre-index-fsync-fail");
+  let mut w: Weights = HashMap::new();
+  w.insert("w.weight".to_string(), f32_weight(2));
+
+  // skip=0 → the very first fsync_dir call (after the shard hard_links,
+  // before the index rename) fails.
+  let _guard = arm_fsync_dir_fault(0);
+  let r = save_model(&dir, &w, &PerLayerQuantization::default());
+  drop(_guard);
+
+  let Err(Error::FileIo(p)) = r else {
+    panic!("a pre-index fsync_dir failure must be a hard Error::FileIo, got {r:?}");
+  };
+  assert_eq!(p.op(), FileOp::Fsync);
+  assert_eq!(p.context(), "save_model: fsync parent directory");
+  assert!(
+    p.inner().to_string().contains("injected fsync_dir failure"),
+    "the wrapped io::Error must carry the injected message, got: {}",
+    p.inner()
+  );
+  // The index rename never happened (pre-commit failure), so no index file
+  // was committed — load sees no checkpoint.
+  assert!(
+    !dir.join("model.safetensors.index.json").is_file(),
+    "no index may be committed on a pre-index fsync failure"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────────────── write_json_pretty_to_path: create failure ───────────────────────
+
+/// `write_json_pretty_to_path` (the test/back-compat sidecar writer)
+/// surfaces [`Error::FileIo`] (`Create`) when `File::create` fails — here
+/// the target path's parent component is a regular file (POSIX `ENOTDIR`).
+#[cfg(unix)]
+#[test]
+fn write_json_pretty_to_path_create_failure() {
+  let dir = fresh_dir("write-json-create-fail");
+  let blocker = dir.join("iam_a_file");
+  std::fs::write(&blocker, b"x").unwrap();
+  let target = blocker.join("index.json"); // parent is a file → ENOTDIR
+  let r = write_json_pretty_to_path(
+    &target,
+    &serde_json::json!({ "weight_map": {} }),
+    "test: create failure",
+  );
+  let Err(Error::FileIo(p)) = r else {
+    panic!("expected Error::FileIo(Create) for an ENOTDIR create, got {r:?}");
+  };
+  assert_eq!(p.op(), FileOp::Create);
+  assert_eq!(p.context(), "test: create failure");
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────────────── write_json_pretty: write failure ───────────────────────
+
+/// `write_json_pretty` surfaces [`Error::FileIo`] (`Write`) when the
+/// underlying `write_all` fails. Driven by handing it a [`File`] opened
+/// **read-only**: serialization succeeds (the buffer builds in memory), then
+/// `write_all` on a read-only fd fails, exercising the
+/// `file.write_all(..).map_err(...)` arm.
+#[cfg(unix)]
+#[test]
+fn write_json_pretty_write_failure_on_readonly_fd() {
+  let dir = fresh_dir("write-json-write-fail");
+  let path = dir.join("ro.json");
+  std::fs::write(&path, b"placeholder").unwrap();
+  // Open read-only — write_all must fail.
+  let mut f = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+  let r = write_json_pretty(
+    &mut f,
+    &path,
+    &serde_json::json!({ "k": "v" }),
+    "test: write failure",
+  );
+  let Err(Error::FileIo(p)) = r else {
+    panic!("expected Error::FileIo(Write) on a read-only fd, got {r:?}");
+  };
+  assert_eq!(p.op(), FileOp::Write);
+  assert_eq!(p.context(), "test: write failure");
+  assert_eq!(p.path(), path.as_path());
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────────────── path_is_file: non-NotFound stat error ───────────────────────
+
+/// `path_is_file` distinguishes the absent path (`Ok(false)`) from a genuine
+/// stat *failure* (`Err`). A symlink whose target is itself makes
+/// `std::fs::metadata` (which FOLLOWS symlinks) fail with `ELOOP` — an error
+/// that is NOT `NotFound`, so the `Err(e) => Err(Error::FileIo(..Stat..))`
+/// arm fires rather than the absent-`Ok(false)` arm. Driven through
+/// `load_weights`: with no index file present (`load_via_index` returns
+/// `Ok(None)`), the second resolver tier probes `<dir>/model.safetensors`
+/// via `path_is_file`; a self-referential symlink at that path trips the
+/// stat-error arm.
+#[cfg(unix)]
+#[test]
+fn path_is_file_self_symlink_loop_is_stat_error() {
+  let dir = fresh_dir("path-is-file-eloop");
+  // No `model.safetensors.index.json` → `load_via_index` returns Ok(None),
+  // so resolution reaches step 2's `path_is_file(model.safetensors)`.
+  assert!(!dir.join("model.safetensors.index.json").exists());
+  // A symlink pointing at itself: `metadata` follows the link and loops →
+  // ELOOP (an error that is NOT NotFound). The absent-path arm would
+  // return Ok(false); this must instead surface the stat failure.
+  let loop_path = dir.join("model.safetensors");
+  std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+  // Sanity: the entry exists as a symlink even though its target resolution
+  // loops — so this is NOT the NotFound (absent) case.
+  assert!(
+    std::fs::symlink_metadata(&loop_path)
+      .unwrap()
+      .file_type()
+      .is_symlink(),
+    "the planted entry must be a symlink (the loop is in target resolution)"
+  );
+
+  let r = load_weights(&dir);
+  let Err(Error::FileIo(p)) = r else {
+    panic!("a self-symlink-loop model.safetensors must be an Error::FileIo, got {r:?}");
+  };
+  // The error originates in `path_is_file` (its static context), op = Stat,
+  // and names the offending path.
+  assert_eq!(p.context(), "path_is_file");
+  assert_eq!(p.op(), FileOp::Stat);
+  assert_eq!(p.path(), loop_path.as_path());
+  // The whole point of the arm: this is NOT the absent-`Ok(false)` NotFound
+  // path — a real stat error (ELOOP, surfaced by the OS) is preserved.
+  assert_ne!(
+    p.inner().kind(),
+    std::io::ErrorKind::NotFound,
+    "a stat ELOOP must NOT be classified as NotFound (that path returns Ok(false))"
+  );
+
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────────────── collect_sorted: per-entry stat error ───────────────────────
+
+/// `collect_sorted` stats every matching entry (following symlinks) to keep
+/// only regular files. A **dangling symlink** whose name matches the
+/// predicate makes `std::fs::metadata(entry.path())` fail (the target is
+/// missing) — and unlike `path_is_file`, this arm does NOT special-case
+/// `NotFound`: ANY stat error on a matched entry surfaces as
+/// [`Error::FileIo`] (`Stat`) naming the offending entry path. Exercises the
+/// `Err(e) => return Err(..)` arm of the per-entry metadata match (distinct
+/// from the `Ok(m) if m.is_file()` keep arm and the `Ok(_) => continue`
+/// skip-non-regular arm, both covered by
+/// `collect_sorted_skips_matching_subdirectory_keeps_file`).
+#[cfg(unix)]
+#[test]
+fn collect_sorted_dangling_symlink_entry_stat_error() {
+  let dir = fresh_dir("collect-sorted-dangling-symlink");
+  // A dangling symlink that matches the predicate: the link entry exists in
+  // the directory listing, but its target does not, so `fs::metadata`
+  // (which follows the link) fails. The entry name ends in `.safetensors`
+  // so the predicate selects it and the stat runs.
+  let link = dir.join("dangling.safetensors");
+  let missing_target = dir.join("nonexistent-target-file");
+  std::os::unix::fs::symlink(&missing_target, &link).unwrap();
+  // Sanity: the symlink entry IS listed (lstat sees it) but its target is
+  // absent (stat-through fails).
+  assert!(
+    std::fs::symlink_metadata(&link)
+      .unwrap()
+      .file_type()
+      .is_symlink(),
+    "the planted entry must be a (dangling) symlink"
+  );
+  assert!(
+    std::fs::metadata(&link).is_err(),
+    "stat-through the dangling symlink must fail (target is missing)"
+  );
+
+  let r = collect_sorted(&dir, |n| n.ends_with(".safetensors"));
+  let Err(Error::FileIo(p)) = r else {
+    panic!("a dangling matched symlink must be an Error::FileIo, got {r:?}");
+  };
+  assert_eq!(p.context(), "collect_sorted: cannot stat entry");
+  assert_eq!(p.op(), FileOp::Stat);
+  assert_eq!(
+    p.path(),
+    link.as_path(),
+    "the error must name the offending entry path"
+  );
+
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────── save_model: staged-failure cleanup (shard + index tmp) ───────────────
+
+/// `save_model`'s staging closure cleans up EVERY staged tempfile — both
+/// the shard tempfiles AND the index tempfile — when staging fails AFTER at
+/// least one shard plus the index have been staged. The earlier failure
+/// tests (`save_model_failed_save_keeps_previous_checkpoint_intact`) fail at
+/// the FIRST shard's `open_excl_temp_shard`, so `staged_shards` is still
+/// empty and `staged_index` is still `None` when the cleanup runs — neither
+/// the shard-cleanup loop nor the index-cleanup branch executes. This test
+/// drives a failure on the INDEX fsync (the last staging step), so when the
+/// closure returns `Err` there is exactly one staged shard tempfile (the
+/// shard fsync was skipped → passed) AND a staged index tempfile, exercising
+/// BOTH the `for (tmp, _) in &staged_shards { remove_file(tmp) }` loop and
+/// the `if let Some((tmp, _)) = &staged_index { remove_file(tmp) }` branch.
+///
+/// The injection: `arm_fsync_path_fault(1)` makes the FIRST
+/// `fsync_open_file_for_path` call (the single shard's fsync) pass and the
+/// SECOND (the index's fsync) fail. A single small weight produces exactly
+/// one shard, so the shard fsync is call #1 and the index fsync is call #2.
+/// The contract:
+///
+/// 1. `save_model` returns `Err(Error::FileIo(Fsync))` carrying the injected
+///    failure (the staged closure's error is propagated unchanged).
+/// 2. NO `.tmp.safetensors` remains on disk — both the staged shard
+///    tempfile (cleanup loop) and the staged index tempfile (cleanup
+///    branch) were removed.
+/// 3. NO final shard was published and NO index was committed (the failure
+///    is in staging, strictly before the publish/commit phase).
+#[test]
+fn save_model_staged_index_fsync_failure_cleans_shard_and_index_tempfiles() {
+  let dir = fresh_dir("save-staged-index-fsync-cleanup");
+  let mut w: Weights = HashMap::new();
+  // One small weight → exactly one shard (fits the 5-GiB cap), so the shard
+  // fsync is the 1st `fsync_open_file_for_path` call and the index fsync is
+  // the 2nd.
+  w.insert(
+    "only.weight".to_string(),
+    Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(3usize,)).unwrap(),
+  );
+
+  // skip=1: the shard fsync (call #1) is skipped → passes; the index fsync
+  // (call #2) fires. The staged closure then returns Err with one staged
+  // shard tempfile AND a staged index tempfile present.
+  let _guard = arm_fsync_path_fault(1);
+  let r = save_model(&dir, &w, &PerLayerQuantization::default());
+  drop(_guard);
+
+  // (1) The injected index-fsync failure propagates as Err(FileIo(Fsync)).
+  let Err(Error::FileIo(p)) = r else {
+    panic!("the staged index-fsync failure must propagate as Error::FileIo, got {r:?}");
+  };
+  assert_eq!(p.op(), FileOp::Fsync);
+  assert!(
+    p.inner()
+      .to_string()
+      .contains("injected fsync_path failure"),
+    "the propagated error must carry the injected fsync message, got: {}",
+    p.inner()
+  );
+
+  // (2) Both staged tempfiles were cleaned up — the shard-cleanup loop AND
+  // the index-cleanup branch both ran. No `.tmp.safetensors` may remain.
+  let leftover_tmp = std::fs::read_dir(&dir)
+    .unwrap()
+    .filter_map(|e| e.ok())
+    .any(|e| {
+      e.file_name()
+        .to_string_lossy()
+        .ends_with(".tmp.safetensors")
+    });
+  assert!(
+    !leftover_tmp,
+    "every staged tempfile (shard + index) must be removed on a staging failure"
+  );
+
+  // (3) The failure happened during STAGING — before any final shard was
+  // published and before the index was committed. The directory holds no
+  // published shard and no index file.
+  let published_shard = std::fs::read_dir(&dir)
+    .unwrap()
+    .filter_map(|e| e.ok())
+    .any(|e| {
+      let n = e.file_name().to_string_lossy().into_owned();
+      n.starts_with("model-gen-") && n.ends_with(".safetensors")
+    });
+  assert!(
+    !published_shard,
+    "no final shard may be published when staging fails"
+  );
+  assert!(
+    !dir.join("model.safetensors.index.json").exists(),
+    "no index may be committed when staging fails"
+  );
+
+  let _ = std::fs::remove_dir_all(&dir);
+}

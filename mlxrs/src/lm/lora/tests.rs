@@ -4500,3 +4500,1583 @@ fn locate_adapter_safetensors_surfaces_symlink_loop_as_typed_file_io() {
 
   let _ = std::fs::remove_dir_all(&tmp);
 }
+
+// ═════════════════════ coverage fill — line-coverage targets ═════════════════════
+//
+// The tests below close the remaining line-coverage gaps in this module: the
+// enum-tag accessors, the constructor validation branches (BaseLinear /
+// BaseEmbedding / DoRALinear / DoRAEmbedding shape + mode checks), the
+// `LoraLayer` dispatch arms and their wrong-variant errors, the
+// `validate_*` / `pattern_lookup` / `scale_for` degenerate branches, the
+// `split_adapter_params` mismatch errors, and the bounded-config-read /
+// safetensors-locate failure paths. Each error-branch test pins the EXACT
+// typed `Error` variant + payload; each value test hand-computes its oracle.
+
+// ───────────── FineTuneType::as_str + IsVariant tags ─────────────
+
+#[test]
+fn fine_tune_type_as_str_and_display_and_variant_tags() {
+  // `as_str` returns the lowercase on-disk tag, and `Display` (derive_more,
+  // `#[display("{}", self.as_str())]`) forwards to it.
+  assert_eq!(FineTuneType::Lora.as_str(), "lora");
+  assert_eq!(FineTuneType::Dora.as_str(), "dora");
+  assert_eq!(FineTuneType::Full.as_str(), "full");
+  assert_eq!(FineTuneType::Lora.to_string(), "lora");
+  assert_eq!(FineTuneType::Dora.to_string(), "dora");
+  assert_eq!(FineTuneType::Full.to_string(), "full");
+  // derive_more::IsVariant predicates.
+  assert!(FineTuneType::Lora.is_lora());
+  assert!(FineTuneType::Dora.is_dora());
+  assert!(FineTuneType::Full.is_full());
+  assert!(!FineTuneType::Lora.is_dora());
+  // Default is Lora (mlx-lm `getattr(config, "fine_tune_type", "lora")`).
+  assert_eq!(FineTuneType::default(), FineTuneType::Lora);
+}
+
+// ───────────── PeftSelection::scale_for degenerate rank ─────────────
+
+#[test]
+fn peft_scale_for_nonpositive_resolved_rank_is_zero() {
+  // PEFT `update_layer` divides by `r`; a `rank_pattern` that resolves a
+  // module's rank to 0 cannot form `alpha / r`, so `scale_for` returns the
+  // degenerate `0.0` (the `if r <= 0 { return 0.0 }` floor). Constructed via a
+  // `rank_pattern` override of 0 for q_proj; a non-matching module keeps the
+  // positive config-wide rank.
+  let peft = PeftSelection {
+    target_modules: Some(ModuleMatcher::List(vec!["q_proj".to_string()])),
+    exclude_modules: None,
+    layers_to_transform: None,
+    layers_pattern: Vec::new(),
+    rank_pattern: vec![("q_proj".to_string(), 0i32)],
+    alpha_pattern: Vec::new(),
+    use_rslora: false,
+    fan_in_fan_out: false,
+  };
+  // q_proj resolves rank 0 ⇒ scale 0.0 (the degenerate floor).
+  assert_eq!(
+    peft.scale_for("model.layers.0.self_attn.q_proj", 8, 16.0),
+    0.0
+  );
+  // v_proj (no pattern) keeps the config-wide rank 8 ⇒ 16/8 = 2.0.
+  assert_eq!(
+    peft.scale_for("model.layers.0.self_attn.v_proj", 8, 16.0),
+    2.0
+  );
+}
+
+// ───────────── pattern_lookup: uncompilable pattern key is skipped ─────────────
+
+#[test]
+fn pattern_lookup_skips_uncompilable_pattern_key() {
+  // A `rank_pattern` key that is not a valid regex (`(unclosed`) cannot
+  // compile, so `pattern_lookup` skips it (the `let Ok(re) … else continue`
+  // arm) — a malformed key simply never matches, rather than crashing the
+  // load. A later well-formed key still matches.
+  let patterns = vec![
+    ("(unclosed".to_string(), 11i32),
+    ("q_proj".to_string(), 22i32),
+  ];
+  // The malformed key is skipped; `q_proj` matches the dotted suffix.
+  assert_eq!(
+    pattern_lookup(&patterns, "model.layers.0.self_attn.q_proj"),
+    Some(22)
+  );
+  // A path matching ONLY the malformed key ⇒ None (the bad key never matches).
+  assert_eq!(
+    pattern_lookup::<i32>(&[("(bad".to_string(), 5)], "anything"),
+    None
+  );
+}
+
+// ───────────── OrderedPattern: non-map JSON is a parse error ─────────────
+
+#[test]
+fn ordered_pattern_non_map_value_is_parse_error() {
+  // `rank_pattern` must be a JSON object; a scalar/string there is a type
+  // mismatch the `OrderedPattern` Visitor rejects (exercises its `expecting`
+  // message). The failure surfaces as a typed `Error::Parse`.
+  let json = r#"{
+      "peft_type": "LORA", "r": 8, "lora_alpha": 16.0,
+      "target_modules": ["q_proj"], "rank_pattern": "not-a-map"
+    }"#;
+  let err =
+    LoraConfig::from_json(json).expect_err("a non-object `rank_pattern` must be a parse error");
+  assert!(
+    matches!(err, Error::Parse(_)),
+    "expected Error::Parse for non-map rank_pattern, got {err:?}"
+  );
+  // Same for `alpha_pattern`.
+  let json2 = r#"{
+      "peft_type": "LORA", "r": 8, "lora_alpha": 16.0,
+      "target_modules": ["q_proj"], "alpha_pattern": 7
+    }"#;
+  assert!(matches!(LoraConfig::from_json(json2), Err(Error::Parse(_))));
+}
+
+// ───────────── exclude_modules invalid regex ─────────────
+
+#[test]
+fn config_parse_peft_invalid_regex_exclude_modules_is_err() {
+  // The `exclude_modules` single-string form is a regex too (the
+  // `is_target_modules = false` arm of `module_matcher_from`); an uncompilable
+  // pattern is a recoverable parse error, exactly as for `target_modules`.
+  let json = r#"{ "peft_type": "LORA", "r": 8, "target_modules": ["q_proj"],
+      "exclude_modules": "(unclosed" }"#;
+  let err = LoraConfig::from_json(json)
+    .expect_err("an uncompilable `exclude_modules` regex must be rejected");
+  assert!(matches!(err, Error::Parse(_)), "got {err:?}");
+}
+
+#[test]
+fn config_parse_peft_exclude_modules_all_linear_is_literal_regex() {
+  // `all-linear` is the sentinel ONLY for `target_modules` (PEFT's
+  // `_maybe_include_all_linear_layers` rewrites `target_modules` alone). In
+  // `exclude_modules` it falls through to the regex path, compiling to a
+  // pattern that full-matches the literal string `all-linear` (i.e. nothing in
+  // practice) — NOT the AllLinear sentinel.
+  let json = r#"{ "peft_type": "LORA", "r": 8, "target_modules": ["q_proj"],
+      "exclude_modules": "all-linear" }"#;
+  let cfg = LoraConfig::from_json(json).unwrap();
+  let peft = cfg.peft().unwrap();
+  assert!(
+    matches!(&peft.exclude_modules, Some(ModuleMatcher::Regex(_))),
+    "all-linear in exclude_modules must be a literal Regex, not the AllLinear sentinel"
+  );
+}
+
+// ───────────── BaseLinear::dense shape validation ─────────────
+
+#[test]
+fn base_linear_dense_rejects_non_rank2_weight() {
+  // A 1-D weight is not `[output_dims, input_dims]` ⇒ Error::RankMismatch
+  // carrying the observed rank + shape.
+  let w = Array::zeros::<f32>(&(6usize,)).unwrap();
+  let err = BaseLinear::dense(w, None).unwrap_err();
+  match err {
+    Error::RankMismatch(p) => {
+      assert_eq!(p.actual(), 1);
+      assert_eq!(p.actual_shape(), &[6]);
+      assert!(p.context().contains("BaseLinear::dense"));
+    }
+    other => panic!("expected Error::RankMismatch, got {other:?}"),
+  }
+}
+
+#[test]
+fn base_linear_dense_rejects_mismatched_bias_shape() {
+  // bias must be `[output_dims]`; a `[output_dims+1]` bias (or a rank-2 bias)
+  // is an Error::ShapePairMismatch (expected [output_dims], got the bad shape).
+  let w = base_weight(); // [2, 3] ⇒ output_dims = 2
+  let bad_bias = Array::zeros::<f32>(&(3usize,)).unwrap(); // length 3 != 2
+  let err = BaseLinear::dense(w, Some(bad_bias)).unwrap_err();
+  match err {
+    Error::ShapePairMismatch(p) => {
+      assert_eq!(p.expected(), &[2]);
+      assert_eq!(p.actual(), &[3]);
+      assert!(p.context().contains("bias"));
+    }
+    other => panic!("expected Error::ShapePairMismatch, got {other:?}"),
+  }
+  // A rank-2 bias is also rejected (len != 1).
+  let w2 = base_weight();
+  let rank2_bias = Array::zeros::<f32>(&(2, 1)).unwrap();
+  assert!(matches!(
+    BaseLinear::dense(w2, Some(rank2_bias)),
+    Err(Error::ShapePairMismatch(_))
+  ));
+}
+
+// ───────────── BaseLinear::quantized mode/arity validation ─────────────
+
+#[test]
+fn base_linear_quantized_affine_requires_quant_biases() {
+  // affine mode REQUIRES quant_biases (mlx affine_quantize writes
+  // {w_q, scales, biases}); passing None is Error::MissingField.
+  let w = Array::zeros::<u32>(&(2, 1)).unwrap();
+  let scales = Array::zeros::<f32>(&(2, 1)).unwrap();
+  let err = BaseLinear::quantized(w, scales, None, None, 32, 8, "affine".to_string()).unwrap_err();
+  match err {
+    Error::MissingField(p) => {
+      assert_eq!(p.type_name(), "BaseLinear::quantized");
+      assert!(p.field().contains("quant_biases"));
+    }
+    other => panic!("expected Error::MissingField, got {other:?}"),
+  }
+}
+
+#[test]
+fn base_linear_quantized_float_modes_forbid_quant_biases() {
+  // The scale-only float modes (mxfp4/mxfp8/nvfp4) must NOT carry quant_biases
+  // (mlx fp_quantize writes {w_q, scales}); a Some(_) is Error::InvariantViolation.
+  for mode in ["mxfp4", "mxfp8", "nvfp4"] {
+    let w = Array::zeros::<u32>(&(2, 1)).unwrap();
+    let scales = Array::zeros::<f32>(&(2, 1)).unwrap();
+    let qb = Array::zeros::<f32>(&(2, 1)).unwrap();
+    let err =
+      BaseLinear::quantized(w, scales, Some(qb), None, 32, 8, mode.to_string()).unwrap_err();
+    assert!(
+      matches!(err, Error::InvariantViolation(ref p) if p.context().contains("quant_biases")),
+      "mode {mode:?}: expected InvariantViolation on quant_biases, got {err:?}"
+    );
+  }
+}
+
+#[test]
+fn base_linear_quantized_unknown_mode_is_err() {
+  // An unrecognized mode string is Error::UnknownEnumValue listing the
+  // supported modes.
+  let w = Array::zeros::<u32>(&(2, 1)).unwrap();
+  let scales = Array::zeros::<f32>(&(2, 1)).unwrap();
+  let err = BaseLinear::quantized(w, scales, None, None, 32, 8, "int3".to_string()).unwrap_err();
+  match err {
+    Error::UnknownEnumValue(p) => {
+      assert_eq!(p.value(), "int3");
+      assert_eq!(p.supported(), &["affine", "mxfp4", "mxfp8", "nvfp4"]);
+    }
+    other => panic!("expected Error::UnknownEnumValue, got {other:?}"),
+  }
+}
+
+#[test]
+fn base_linear_quantized_rejects_nonpositive_bits_and_group_size() {
+  // bits <= 0 and group_size <= 0 are Error::OutOfRange (validated after the
+  // mode/arity check passes, so use a valid affine triple).
+  let w = Array::zeros::<u32>(&(2, 1)).unwrap();
+  let scales = Array::zeros::<f32>(&(2, 1)).unwrap();
+  let qb = Array::zeros::<f32>(&(2, 1)).unwrap();
+  let err = BaseLinear::quantized(
+    w,
+    scales,
+    Some(qb.try_clone().unwrap()),
+    None,
+    32,
+    0,
+    "affine".to_string(),
+  )
+  .unwrap_err();
+  assert!(
+    matches!(err, Error::OutOfRange(ref p) if p.context().contains("bits") && p.value() == "0"),
+    "expected OutOfRange on bits, got {err:?}"
+  );
+
+  let w2 = Array::zeros::<u32>(&(2, 1)).unwrap();
+  let scales2 = Array::zeros::<f32>(&(2, 1)).unwrap();
+  let err2 =
+    BaseLinear::quantized(w2, scales2, Some(qb), None, 0, 8, "affine".to_string()).unwrap_err();
+  assert!(
+    matches!(err2, Error::OutOfRange(ref p) if p.context().contains("group_size") && p.value() == "0"),
+    "expected OutOfRange on group_size, got {err2:?}"
+  );
+}
+
+// ───────────── LoRALinear::fuse(false) over a quantized base re-quantizes ─────────────
+
+#[test]
+fn lora_fuse_requantize_quantized_base_stays_quantized() {
+  // fuse(dequantize=false) on a quantized base must re-quantize the fused
+  // weight back into a BaseLinear::Quantized (mlx-lm `QuantizedLinear
+  // .from_linear`), exercising `requantize_fused`'s quantized arm. The fused
+  // quantized forward must still match the un-fused QLoRA forward within
+  // quant error.
+  let input_dims = 64usize;
+  let output_dims = 2usize;
+  let mut wdata = vec![1.0f32; input_dims];
+  wdata.extend(vec![0.5f32; input_dims]);
+  let dense_w = Array::from_slice::<f32>(&wdata, &(output_dims, input_dims)).unwrap();
+  let la = Array::full::<f32>(&(input_dims, 2usize), 0.01).unwrap();
+  let lb = Array::from_slice::<f32>(&[1.0, 0.0, 0.0, 1.0], &(2, 2)).unwrap();
+  let params = AdapterParams {
+    lora_a: la,
+    lora_b: lb,
+    magnitude: None,
+  };
+  let x = Array::full::<f32>(&(1usize, input_dims), 1.0).unwrap();
+
+  let (w_q, scales, biases) = ops::quantized::quantize(&dense_w, 32, 8, "affine", None).unwrap();
+  let q_base =
+    BaseLinear::quantized(w_q, scales, biases, None, 32, 8, "affine".to_string()).unwrap();
+  let q_layer = LoRALinear::new(q_base, params, 2.0).unwrap();
+  let mut via_forward = q_layer.forward(&x).unwrap();
+
+  let fused = q_layer.fuse(false).unwrap();
+  // Re-quantized — the fused base is still Quantized, NOT dense.
+  assert!(
+    matches!(fused, BaseLinear::Quantized { .. }),
+    "fuse(false) over a quantized base must re-quantize"
+  );
+  let mut via_fused = fused.base_output(&x).unwrap();
+  approx_eq(
+    &via_fused.to_vec::<f32>().unwrap(),
+    &via_forward.to_vec::<f32>().unwrap(),
+    2e-2,
+  );
+}
+
+#[test]
+fn dora_fuse_requantize_quantized_base_stays_quantized() {
+  // QDoRA fuse(false) re-quantizes too (DoRALinear::fuse's quantized arm via
+  // requantize_fused, plus the fused_bias = Some clone path).
+  let input_dims = 64usize;
+  let output_dims = 2usize;
+  let mut wdata = vec![1.0f32; input_dims];
+  wdata.extend(vec![0.5f32; input_dims]);
+  let dense_w = Array::from_slice::<f32>(&wdata, &(output_dims, input_dims)).unwrap();
+  let la = Array::full::<f32>(&(input_dims, 2usize), 0.01).unwrap();
+  let lb = Array::from_slice::<f32>(&[1.0, 0.0, 0.0, 1.0], &(2, 2)).unwrap();
+  let m = Array::from_slice::<f32>(&[1.5, 2.5], &(output_dims,)).unwrap();
+  let bias = Array::from_slice::<f32>(&[0.25, -0.5], &(output_dims,)).unwrap();
+
+  let (w_q, scales, biases) = ops::quantized::quantize(&dense_w, 32, 8, "affine", None).unwrap();
+  let q_base =
+    BaseLinear::quantized(w_q, scales, biases, Some(bias), 32, 8, "affine".to_string()).unwrap();
+  let q_layer = DoRALinear::new(
+    q_base,
+    AdapterParams {
+      lora_a: la,
+      lora_b: lb,
+      magnitude: Some(m),
+    },
+    2.0,
+  )
+  .unwrap();
+  let fused = q_layer.fuse(false).unwrap();
+  assert!(
+    matches!(fused, BaseLinear::Quantized { .. }),
+    "QDoRA fuse(false) must re-quantize the fused weight"
+  );
+  // The fused quantized base carries the re-attached output bias.
+  assert!(
+    fused.bias().is_some(),
+    "the original output bias is re-attached"
+  );
+}
+
+// ───────────── LoRALinear / DoRALinear / BaseLinear accessors ─────────────
+
+#[test]
+fn linear_layer_accessors_expose_base_and_scale() {
+  // LoRALinear::base()/scale() and DoRALinear::base()/scale()/magnitude().
+  let bias = Array::from_slice::<f32>(&[1.0, 2.0], &(2usize,)).unwrap();
+  let base = BaseLinear::dense(base_weight(), Some(bias)).unwrap();
+  let lora = LoRALinear::new(base, plain_params(), 7.0).unwrap();
+  assert_eq!(lora.scale(), 7.0);
+  // base() returns the wrapped dense base (with its bias still attached).
+  assert!(matches!(lora.base(), BaseLinear::Dense { .. }));
+  assert!(lora.base().bias().is_some());
+
+  let m = Array::from_slice::<f32>(&[3.0, 3.0], &(2usize,)).unwrap();
+  let dora = DoRALinear::new(
+    BaseLinear::dense(base_weight(), None).unwrap(),
+    AdapterParams {
+      lora_a: lora_a(),
+      lora_b: lora_b(),
+      magnitude: Some(m),
+    },
+    9.0,
+  )
+  .unwrap();
+  assert_eq!(dora.scale(), 9.0);
+  assert!(matches!(dora.base(), BaseLinear::Dense { .. }));
+  assert_eq!(dora.magnitude().shape(), &[2]);
+}
+
+// ───────────── DoRALinear::new magnitude shape mismatch ─────────────
+
+#[test]
+fn dora_linear_rejects_wrong_magnitude_shape() {
+  // The magnitude `m` must be `[output_dims]`; a `[output_dims+1]` magnitude
+  // (or a rank-2 one) is Error::ShapePairMismatch (expected [2], got the bad
+  // shape). Distinct from the missing-magnitude MissingField case.
+  let bad_m = Array::from_slice::<f32>(&[3.0, 3.0, 3.0], &(3usize,)).unwrap(); // len 3 != 2
+  let params = AdapterParams {
+    lora_a: lora_a(),
+    lora_b: lora_b(),
+    magnitude: Some(bad_m),
+  };
+  let base = BaseLinear::dense(base_weight(), None).unwrap();
+  let err = DoRALinear::new(base, params, 2.0).unwrap_err();
+  match err {
+    Error::ShapePairMismatch(p) => {
+      assert_eq!(p.expected(), &[2]);
+      assert_eq!(p.actual(), &[3]);
+      assert!(p.context().contains("magnitude"));
+    }
+    other => panic!("expected Error::ShapePairMismatch, got {other:?}"),
+  }
+}
+
+// ───────────── DoRALinear DoraLinear-arm validation context ─────────────
+
+#[test]
+fn dora_linear_rank_mismatch_uses_dora_validation_context() {
+  // A DoRALinear with a non-rank-2 lora_a hits the DoraLinear arm of
+  // LinearValidationContext::lora_a_rank2 (distinct from the LoRALinear arm),
+  // surfacing Error::RankMismatch whose context names DoRALinear.
+  let bad_a = Array::zeros::<f32>(&(3usize,)).unwrap(); // rank-1
+  let m = Array::from_slice::<f32>(&[3.0, 3.0], &(2usize,)).unwrap();
+  let params = AdapterParams {
+    lora_a: bad_a,
+    lora_b: lora_b(),
+    magnitude: Some(m),
+  };
+  let base = BaseLinear::dense(base_weight(), None).unwrap();
+  let err = DoRALinear::new(base, params, 2.0).unwrap_err();
+  match err {
+    Error::RankMismatch(p) => {
+      assert!(
+        p.context().contains("DoRALinear") && p.context().contains("lora_a"),
+        "context must name the DoRALinear lora_a check: {}",
+        p.context()
+      );
+    }
+    other => panic!("expected Error::RankMismatch, got {other:?}"),
+  }
+}
+
+#[test]
+fn dora_linear_lora_b_rank_and_output_dim_mismatch() {
+  // A DoRALinear with a non-rank-2 lora_b hits the DoraLinear lora_b_rank2 arm.
+  let bad_b = Array::zeros::<f32>(&(2usize,)).unwrap(); // rank-1
+  let m = Array::from_slice::<f32>(&[3.0, 3.0], &(2usize,)).unwrap();
+  let base = BaseLinear::dense(base_weight(), None).unwrap();
+  let err = DoRALinear::new(
+    base,
+    AdapterParams {
+      lora_a: lora_a(),
+      lora_b: bad_b,
+      magnitude: Some(m.try_clone().unwrap()),
+    },
+    2.0,
+  )
+  .unwrap_err();
+  assert!(
+    matches!(err, Error::RankMismatch(ref p) if p.context().contains("DoRALinear") && p.context().contains("lora_b")),
+    "got {err:?}"
+  );
+
+  // A DoRALinear whose lora_b last axis != base output_dims hits the
+  // DoraLinear b_last_vs_output_dims arm (Error::LengthMismatch).
+  let wrong_out_b = Array::from_slice::<f32>(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0], &(2, 3)).unwrap(); // [r=2, 3] but base output=2
+  let base2 = BaseLinear::dense(base_weight(), None).unwrap();
+  let err2 = DoRALinear::new(
+    base2,
+    AdapterParams {
+      lora_a: lora_a(),
+      lora_b: wrong_out_b,
+      magnitude: Some(m),
+    },
+    2.0,
+  )
+  .unwrap_err();
+  assert!(
+    matches!(err2, Error::LengthMismatch(ref p)
+        if p.context().contains("DoRALinear") && p.context().contains("output_dims")
+          && p.expected() == 2 && p.actual() == 3),
+    "got {err2:?}"
+  );
+}
+
+// ───────────── validate_config_rank: lora_b drift (lora_a ok) ─────────────
+
+#[test]
+fn validate_config_rank_catches_lora_b_only_drift() {
+  // `validate_config_rank` requires BOTH factors' rank axis to equal the
+  // config rank. Here lora_a's rank axis matches (2) but lora_b's leading axis
+  // is 3 ⇒ the lora_b branch fires (Error::LengthMismatch, expected=2, got=3).
+  // Called directly (it is defensive and independent of validate_factor_shapes).
+  let a = Array::zeros::<f32>(&(3usize, 2usize)).unwrap(); // [input, r=2]
+  let b = Array::zeros::<f32>(&(3usize, 2usize)).unwrap(); // [r=3, output] — rank axis 3
+  let params = AdapterParams {
+    lora_a: a,
+    lora_b: b,
+    magnitude: None,
+  };
+  let err = validate_config_rank(&params, 2, LinearValidationContext::LoraLinear).unwrap_err();
+  match err {
+    Error::LengthMismatch(p) => {
+      assert!(p.context().contains("lora_b"));
+      assert_eq!(p.expected(), 2);
+      assert_eq!(p.actual(), 3);
+    }
+    other => panic!("expected Error::LengthMismatch on lora_b, got {other:?}"),
+  }
+  // The all-good case returns Ok.
+  let good = AdapterParams {
+    lora_a: Array::zeros::<f32>(&(3usize, 2usize)).unwrap(),
+    lora_b: Array::zeros::<f32>(&(2usize, 2usize)).unwrap(),
+    magnitude: None,
+  };
+  assert!(validate_config_rank(&good, 2, LinearValidationContext::DoraLinear).is_ok());
+}
+
+#[test]
+fn validate_config_rank_dora_context_lora_a_drift() {
+  // The DoraLinear arms of `config_rank_vs_lora_a_rank`: lora_a rank axis (2)
+  // != config rank (4) ⇒ the lora_a branch fires first with the DoRALinear
+  // context label.
+  let params = AdapterParams {
+    lora_a: Array::zeros::<f32>(&(3usize, 2usize)).unwrap(), // rank axis 2
+    lora_b: Array::zeros::<f32>(&(2usize, 2usize)).unwrap(),
+    magnitude: None,
+  };
+  let err = validate_config_rank(&params, 4, LinearValidationContext::DoraLinear).unwrap_err();
+  match err {
+    Error::LengthMismatch(p) => {
+      assert!(
+        p.context().contains("DoRALinear") && p.context().contains("lora_a"),
+        "DoRALinear config-rank lora_a context: {}",
+        p.context()
+      );
+      assert_eq!(p.expected(), 4);
+      assert_eq!(p.actual(), 2);
+    }
+    other => panic!("expected Error::LengthMismatch, got {other:?}"),
+  }
+}
+
+// ───────────── LinearValidationContext: remaining LoRALinear/DoraLinear arms ─────────────
+
+#[test]
+fn lora_linear_rejects_rank1_lora_a_with_lora_context() {
+  // A rank-1 lora_a hits the LoRALinear arm of `lora_a_rank2` (Error::RankMismatch
+  // whose context names LoRALinear) — distinct from the wrong-leading-axis
+  // LengthMismatch the existing tests cover.
+  let bad_a = Array::zeros::<f32>(&(3usize,)).unwrap(); // rank-1
+  let params = AdapterParams {
+    lora_a: bad_a,
+    lora_b: lora_b(),
+    magnitude: None,
+  };
+  let base = BaseLinear::dense(base_weight(), None).unwrap();
+  match LoRALinear::new(base, params, 2.0).unwrap_err() {
+    Error::RankMismatch(p) => {
+      assert!(
+        p.context().contains("LoRALinear") && p.context().contains("lora_a"),
+        "context: {}",
+        p.context()
+      );
+    }
+    other => panic!("expected Error::RankMismatch, got {other:?}"),
+  }
+}
+
+#[test]
+fn dora_linear_shared_rank_and_input_dim_mismatch_use_dora_context() {
+  // DoraLinear `shared_rank` arm: lora_a last axis (2) != lora_b leading axis
+  // (3) ⇒ LengthMismatch naming the DoRALinear shared-rank check.
+  let m = Array::from_slice::<f32>(&[3.0, 3.0], &(2usize,)).unwrap();
+  let base = BaseLinear::dense(base_weight(), None).unwrap();
+  let err = DoRALinear::new(
+    base,
+    AdapterParams {
+      lora_a: Array::zeros::<f32>(&(3usize, 2usize)).unwrap(), // r=2
+      lora_b: Array::zeros::<f32>(&(3usize, 2usize)).unwrap(), // r=3
+      magnitude: Some(m.try_clone().unwrap()),
+    },
+    2.0,
+  )
+  .unwrap_err();
+  assert!(
+    matches!(err, Error::LengthMismatch(ref p)
+        if p.context().contains("DoRALinear") && p.context().contains("shared rank")),
+    "got {err:?}"
+  );
+
+  // DoraLinear `a_leading_vs_input_dims` arm: lora_a leading axis (2) != base
+  // input_dims (3) ⇒ LengthMismatch naming the DoRALinear input_dims check.
+  let base2 = BaseLinear::dense(base_weight(), None).unwrap();
+  let err2 = DoRALinear::new(
+    base2,
+    AdapterParams {
+      lora_a: Array::zeros::<f32>(&(2usize, 2usize)).unwrap(), // leading 2 != input 3
+      lora_b: lora_b(),
+      magnitude: Some(m),
+    },
+    2.0,
+  )
+  .unwrap_err();
+  assert!(
+    matches!(err2, Error::LengthMismatch(ref p)
+        if p.context().contains("DoRALinear") && p.context().contains("input_dims")
+          && p.expected() == 3 && p.actual() == 2),
+    "got {err2:?}"
+  );
+}
+
+// ───────────── BaseEmbedding::dense rank validation + accessors ─────────────
+
+#[test]
+fn base_embedding_dense_rejects_non_rank2_and_exposes_weight() {
+  // A rank-1 embedding weight is rejected (must be [num_embeddings, dims]).
+  let bad = Array::zeros::<f32>(&(6usize,)).unwrap();
+  match BaseEmbedding::dense(bad).unwrap_err() {
+    Error::RankMismatch(p) => {
+      assert_eq!(p.actual(), 1);
+      assert!(p.context().contains("BaseEmbedding::dense"));
+    }
+    other => panic!("expected Error::RankMismatch, got {other:?}"),
+  }
+  // A rank-2 weight constructs; weight() returns it.
+  let w = Array::zeros::<f32>(&(4usize, 3usize)).unwrap();
+  let base = BaseEmbedding::dense(w).unwrap();
+  assert_eq!(base.weight().shape(), &[4, 3]);
+}
+
+// ───────────── DoRAEmbedding::new magnitude shape + accessors ─────────────
+
+#[test]
+fn dora_embedding_rejects_wrong_magnitude_shape() {
+  // The magnitude must be `[num_embeddings]`; a wrong-length one is
+  // Error::ShapePairMismatch (expected [num_embeddings], got the bad shape).
+  let num_embeddings = 3usize;
+  let dims = 3usize;
+  let r = 2usize;
+  let base = BaseEmbedding::dense(Array::zeros::<f32>(&(num_embeddings, dims)).unwrap()).unwrap();
+  let bad_m = Array::zeros::<f32>(&(num_embeddings + 1,)).unwrap(); // len 4 != 3
+  let params = AdapterParams {
+    lora_a: Array::zeros::<f32>(&(num_embeddings, r)).unwrap(),
+    lora_b: Array::zeros::<f32>(&(r, dims)).unwrap(),
+    magnitude: Some(bad_m),
+  };
+  let err = DoRAEmbedding::new(base, params, 1.0).unwrap_err();
+  match err {
+    Error::ShapePairMismatch(p) => {
+      assert_eq!(p.expected(), &[3]);
+      assert_eq!(p.actual(), &[4]);
+      assert!(p.context().contains("num_embeddings"));
+    }
+    other => panic!("expected Error::ShapePairMismatch, got {other:?}"),
+  }
+}
+
+#[test]
+fn dora_embedding_accessors_expose_base_scale_magnitude() {
+  let num_embeddings = 3usize;
+  let dims = 3usize;
+  let r = 2usize;
+  let base = BaseEmbedding::dense(Array::zeros::<f32>(&(num_embeddings, dims)).unwrap()).unwrap();
+  let m = Array::from_slice::<f32>(&[1.0, 1.0, 1.0], &(num_embeddings,)).unwrap();
+  let layer = DoRAEmbedding::new(
+    base,
+    AdapterParams {
+      lora_a: Array::zeros::<f32>(&(num_embeddings, r)).unwrap(),
+      lora_b: Array::zeros::<f32>(&(r, dims)).unwrap(),
+      magnitude: Some(m),
+    },
+    5.0,
+  )
+  .unwrap();
+  assert_eq!(layer.scale(), 5.0);
+  assert_eq!(layer.base().weight().shape(), &[3, 3]);
+  assert_eq!(layer.magnitude().shape(), &[3]);
+}
+
+// ───────────── validate_embedding_factor_shapes branches ─────────────
+
+#[test]
+fn dora_embedding_rejects_non_rank2_lora_a_and_lora_b() {
+  // rank-1 lora_a ⇒ RankMismatch (lora_a_rank2 arm).
+  let num_embeddings = 3usize;
+  let dims = 3usize;
+  let r = 2usize;
+  let m = Array::zeros::<f32>(&(num_embeddings,)).unwrap();
+  let base = BaseEmbedding::dense(Array::zeros::<f32>(&(num_embeddings, dims)).unwrap()).unwrap();
+  let err = DoRAEmbedding::new(
+    base,
+    AdapterParams {
+      lora_a: Array::zeros::<f32>(&(num_embeddings,)).unwrap(), // rank-1
+      lora_b: Array::zeros::<f32>(&(r, dims)).unwrap(),
+      magnitude: Some(m.try_clone().unwrap()),
+    },
+    1.0,
+  )
+  .unwrap_err();
+  assert!(
+    matches!(err, Error::RankMismatch(ref p) if p.context().contains("DoRAEmbedding") && p.context().contains("lora_a")),
+    "got {err:?}"
+  );
+
+  // rank-1 lora_b ⇒ RankMismatch (lora_b_rank2 arm).
+  let base2 = BaseEmbedding::dense(Array::zeros::<f32>(&(num_embeddings, dims)).unwrap()).unwrap();
+  let err2 = DoRAEmbedding::new(
+    base2,
+    AdapterParams {
+      lora_a: Array::zeros::<f32>(&(num_embeddings, r)).unwrap(),
+      lora_b: Array::zeros::<f32>(&(r,)).unwrap(), // rank-1
+      magnitude: Some(m),
+    },
+    1.0,
+  )
+  .unwrap_err();
+  assert!(
+    matches!(err2, Error::RankMismatch(ref p) if p.context().contains("DoRAEmbedding") && p.context().contains("lora_b")),
+    "got {err2:?}"
+  );
+}
+
+#[test]
+fn dora_embedding_rejects_shared_rank_and_dims_mismatch() {
+  // lora_a last axis (r) != lora_b leading axis (r) ⇒ LengthMismatch
+  // (shared_rank arm).
+  let num_embeddings = 3usize;
+  let dims = 3usize;
+  let m = Array::zeros::<f32>(&(num_embeddings,)).unwrap();
+  let base = BaseEmbedding::dense(Array::zeros::<f32>(&(num_embeddings, dims)).unwrap()).unwrap();
+  let err = DoRAEmbedding::new(
+    base,
+    AdapterParams {
+      lora_a: Array::zeros::<f32>(&(num_embeddings, 2usize)).unwrap(), // r=2
+      lora_b: Array::zeros::<f32>(&(3usize, dims)).unwrap(),           // r=3
+      magnitude: Some(m.try_clone().unwrap()),
+    },
+    1.0,
+  )
+  .unwrap_err();
+  assert!(
+    matches!(err, Error::LengthMismatch(ref p) if p.context().contains("shared rank")),
+    "got {err:?}"
+  );
+
+  // lora_b last axis != base dims ⇒ LengthMismatch (b_last_vs_dims arm).
+  // lora_a leading axis must still equal num_embeddings to reach this check.
+  let base2 = BaseEmbedding::dense(Array::zeros::<f32>(&(num_embeddings, dims)).unwrap()).unwrap();
+  let err2 = DoRAEmbedding::new(
+    base2,
+    AdapterParams {
+      lora_a: Array::zeros::<f32>(&(num_embeddings, 2usize)).unwrap(), // [num_emb=3, r=2]
+      lora_b: Array::zeros::<f32>(&(2usize, dims + 1)).unwrap(),       // [r=2, 4] but dims=3
+      magnitude: Some(m),
+    },
+    1.0,
+  )
+  .unwrap_err();
+  assert!(
+    matches!(err2, Error::LengthMismatch(ref p)
+        if p.context().contains("dims") && p.expected() == dims && p.actual() == dims + 1),
+    "got {err2:?}"
+  );
+}
+
+// ───────────── LoraLayer dispatch + wrong-variant errors ─────────────
+
+/// Build a small DoRAEmbedding-backed `LoraLayer::DoraEmbedding` (one-hot,
+/// identity renorm) for the dispatch tests.
+fn one_hot_dora_embedding_layer() -> LoraLayer {
+  let num_embeddings = 3usize;
+  let dims = 3usize;
+  let r = 2usize;
+  #[rustfmt::skip]
+  let weight = Array::from_slice::<f32>(
+    &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    &(num_embeddings, dims),
+  ).unwrap();
+  let base = BaseEmbedding::dense(weight).unwrap();
+  let params = AdapterParams {
+    lora_a: Array::zeros::<f32>(&(num_embeddings, r)).unwrap(),
+    lora_b: Array::zeros::<f32>(&(r, dims)).unwrap(),
+    magnitude: Some(Array::from_slice::<f32>(&[1.0, 1.0, 1.0], &(num_embeddings,)).unwrap()),
+  };
+  LoraLayer::DoraEmbedding(DoRAEmbedding::new(base, params, 2.0).unwrap())
+}
+
+#[test]
+fn lora_layer_forward_dispatches_per_variant() {
+  // Lora variant — forward matches the hand-traced [3, 6].
+  let lora = LoraLayer::Lora(
+    LoRALinear::new(
+      BaseLinear::dense(base_weight(), None).unwrap(),
+      plain_params(),
+      2.0,
+    )
+    .unwrap(),
+  );
+  let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(1, 3)).unwrap();
+  let mut o1 = lora.forward(&x).unwrap();
+  approx_eq(&o1.to_vec::<f32>().unwrap(), &[3.0, 6.0], 1e-5);
+
+  // Dora variant — identity renorm ⇒ also [3, 6].
+  let dora = LoraLayer::Dora(
+    DoRALinear::new(
+      BaseLinear::dense(base_weight(), None).unwrap(),
+      AdapterParams {
+        lora_a: lora_a(),
+        lora_b: lora_b(),
+        magnitude: Some(Array::from_slice::<f32>(&[3.0, 3.0], &(2usize,)).unwrap()),
+      },
+      2.0,
+    )
+    .unwrap(),
+  );
+  let mut o2 = dora.forward(&x).unwrap();
+  approx_eq(&o2.to_vec::<f32>().unwrap(), &[3.0, 6.0], 1e-5);
+
+  // DoraEmbedding variant — token-id lookup of rows 0,2 of I_3 ⇒ identity.
+  let emb = one_hot_dora_embedding_layer();
+  let ids = Array::from_slice::<i32>(&[0, 2], &(2usize,)).unwrap();
+  let mut o3 = emb.forward(&ids).unwrap();
+  approx_eq(
+    &o3.to_vec::<f32>().unwrap(),
+    &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+    1e-5,
+  );
+}
+
+#[test]
+fn lora_layer_base_and_base_embedding_accessors() {
+  // The linear variants expose base() (Some) and base_embedding() (None).
+  let lora = LoraLayer::Lora(
+    LoRALinear::new(
+      BaseLinear::dense(base_weight(), None).unwrap(),
+      plain_params(),
+      2.0,
+    )
+    .unwrap(),
+  );
+  assert!(lora.base().is_some());
+  assert!(lora.base_embedding().is_none());
+
+  // The embedding variant: base() None, base_embedding() Some.
+  let emb = one_hot_dora_embedding_layer();
+  assert!(emb.base().is_none());
+  assert!(emb.base_embedding().is_some());
+  assert_eq!(emb.base_embedding().unwrap().weight().shape(), &[3, 3]);
+}
+
+#[test]
+fn lora_layer_fuse_on_embedding_variant_is_err() {
+  // `fuse` (→ BaseLinear) on a DoraEmbedding is the wrong call — it must be
+  // Error::InvariantViolation steering the caller to `fuse_embedding`.
+  let emb = one_hot_dora_embedding_layer();
+  match emb.fuse(false).unwrap_err() {
+    Error::InvariantViolation(p) => {
+      assert!(p.context().contains("LoraLayer::fuse"));
+      assert!(p.requirement().contains("fuse_embedding"));
+    }
+    other => panic!("expected Error::InvariantViolation, got {other:?}"),
+  }
+}
+
+#[test]
+fn lora_layer_fuse_embedding_on_linear_variant_is_err() {
+  // `fuse_embedding` (→ BaseEmbedding) on a linear variant is the wrong call —
+  // Error::InvariantViolation steering to `fuse`.
+  let lora = LoraLayer::Lora(
+    LoRALinear::new(
+      BaseLinear::dense(base_weight(), None).unwrap(),
+      plain_params(),
+      2.0,
+    )
+    .unwrap(),
+  );
+  match lora.fuse_embedding().unwrap_err() {
+    Error::InvariantViolation(p) => {
+      assert!(p.context().contains("LoraLayer::fuse_embedding"));
+      assert!(p.requirement().contains("call `fuse`"));
+    }
+    other => panic!("expected Error::InvariantViolation, got {other:?}"),
+  }
+
+  // The Dora linear variant takes the same `Lora(_) | Dora(_)` arm.
+  let dora = LoraLayer::Dora(
+    DoRALinear::new(
+      BaseLinear::dense(base_weight(), None).unwrap(),
+      AdapterParams {
+        lora_a: lora_a(),
+        lora_b: lora_b(),
+        magnitude: Some(Array::from_slice::<f32>(&[3.0, 3.0], &(2usize,)).unwrap()),
+      },
+      2.0,
+    )
+    .unwrap(),
+  );
+  assert!(matches!(
+    dora.fuse_embedding(),
+    Err(Error::InvariantViolation(_))
+  ));
+}
+
+#[test]
+fn lora_layer_fuse_embedding_round_trips_via_as_linear() {
+  // `LoraLayer::fuse_embedding` forwards to DoRAEmbedding::fuse; the fused
+  // dense embedding's as_linear matches the un-fused layer's as_linear (the
+  // global-renorm path fuse mirrors). One-hot table + zero adapter + m=1 ⇒
+  // identity, so as_linear(x) == x.
+  let emb = one_hot_dora_embedding_layer();
+  let fused = emb.fuse_embedding().unwrap();
+  let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(1, 3)).unwrap();
+  let mut out = fused.as_linear(&x).unwrap();
+  approx_eq(&out.to_vec::<f32>().unwrap(), &[1.0, 2.0, 3.0], 1e-5);
+}
+
+#[test]
+fn lora_layer_fuse_on_linear_variants_ok() {
+  // The Lora/Dora arms of `fuse` return a BaseLinear (positive companion to
+  // the embedding error case).
+  let lora = LoraLayer::Lora(
+    LoRALinear::new(
+      BaseLinear::dense(base_weight(), None).unwrap(),
+      plain_params(),
+      2.0,
+    )
+    .unwrap(),
+  );
+  assert!(lora.fuse(false).is_ok());
+  let dora = LoraLayer::Dora(
+    DoRALinear::new(
+      BaseLinear::dense(base_weight(), None).unwrap(),
+      AdapterParams {
+        lora_a: lora_a(),
+        lora_b: lora_b(),
+        magnitude: Some(Array::from_slice::<f32>(&[3.0, 3.0], &(2usize,)).unwrap()),
+      },
+      2.0,
+    )
+    .unwrap(),
+  );
+  assert!(dora.fuse(false).is_ok());
+}
+
+// ───────────── base_input_dims for a quantized base ─────────────
+
+#[test]
+fn base_input_dims_recovers_logical_width_for_quantized_base() {
+  // base_input_dims on a quantized base recovers the LOGICAL input width from
+  // the packed last axis: packed * 32 / bits. dense [2, 64] affine-quantized at
+  // 8 bits ⇒ packed [2, 16]; 16 * 32 / 8 = 64. base_output_dims = 2 (leading).
+  let input_dims = 64usize;
+  let mut wdata = vec![1.0f32; input_dims];
+  wdata.extend(vec![0.5f32; input_dims]);
+  let dense_w = Array::from_slice::<f32>(&wdata, &(2, input_dims)).unwrap();
+  let (w_q, scales, biases) = ops::quantized::quantize(&dense_w, 32, 8, "affine", None).unwrap();
+  let q_base =
+    BaseLinear::quantized(w_q, scales, biases, None, 32, 8, "affine".to_string()).unwrap();
+  assert_eq!(base_input_dims(&q_base).unwrap(), 64);
+  assert_eq!(base_output_dims(&q_base).unwrap(), 2);
+
+  // Dense base: input_dims = trailing axis, output_dims = leading axis.
+  let dense_base = BaseLinear::dense(base_weight(), None).unwrap();
+  assert_eq!(base_input_dims(&dense_base).unwrap(), 3);
+  assert_eq!(base_output_dims(&dense_base).unwrap(), 2);
+}
+
+// ───────────── module_is_selected / peft_module_is_selected auto-discovery rank-2 ─────────────
+
+#[test]
+fn mlxlm_autodiscovery_skips_non_rank2_weights() {
+  // mlx-lm-native with EMPTY keys ⇒ auto-discovery: only rank-2 weights are
+  // "linears". A rank-1 weight (e.g. a norm gain) inside the window is skipped
+  // (module_is_selected's `weight.shape().len() != 2` branch). The lone rank-2
+  // q_proj IS adapted.
+  let mut weights = Weights::new();
+  weights.insert(
+    "model.layers.0.self_attn.q_proj.weight".to_string(),
+    base_weight(),
+  ); // rank-2
+  weights.insert(
+    "model.layers.0.input_layernorm.weight".to_string(),
+    Array::zeros::<f32>(&(2usize,)).unwrap(),
+  ); // rank-1
+  let mut params = HashMap::new();
+  params.insert(
+    "model.layers.0.self_attn.q_proj".to_string(),
+    plain_params(),
+  );
+  // EMPTY keys ⇒ auto-discovery path.
+  let cfg = mlxlm_config(16, keyed_params(Vec::new()));
+  let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 1).unwrap();
+  assert_eq!(layers.len(), 1, "only the rank-2 q_proj is auto-discovered");
+  assert!(layers.contains_key("model.layers.0.self_attn.q_proj"));
+  assert!(!layers.contains_key("model.layers.0.input_layernorm"));
+}
+
+#[test]
+fn peft_autodiscovery_none_target_skips_non_rank2() {
+  // PEFT with `target_modules: None` ⇒ rank-2 auto-discovery (mlxrs has no
+  // module tree). A rank-1 weight is skipped (peft_module_is_selected's
+  // `None => weight.shape().len() != 2` branch); the rank-2 q_proj is adapted.
+  let peft = PeftSelection {
+    target_modules: None,
+    exclude_modules: None,
+    layers_to_transform: None,
+    layers_pattern: Vec::new(),
+    rank_pattern: Vec::new(),
+    alpha_pattern: Vec::new(),
+    use_rslora: false,
+    fan_in_fan_out: false,
+  };
+  let rank2 = base_weight();
+  let rank1 = Array::zeros::<f32>(&(4usize,)).unwrap();
+  assert!(peft_module_is_selected(
+    "model.layers.0.self_attn.q_proj",
+    &rank2,
+    &peft
+  ));
+  assert!(!peft_module_is_selected(
+    "model.layers.0.input_layernorm",
+    &rank1,
+    &peft
+  ));
+}
+
+#[test]
+fn peft_layers_to_transform_no_extractable_index_deselects() {
+  // PEFT sets `target_module_found = False` when `layers_to_transform` is set
+  // but the module has no extractable block index. A target-matching but
+  // non-block path (`lm_head`) with `layers_to_transform: [0]` is NOT selected
+  // (peft_module_is_selected's `None => return false` arm).
+  let peft = PeftSelection {
+    target_modules: Some(ModuleMatcher::List(vec!["lm_head".to_string()])),
+    exclude_modules: None,
+    layers_to_transform: Some(vec![0]),
+    layers_pattern: Vec::new(),
+    rank_pattern: Vec::new(),
+    alpha_pattern: Vec::new(),
+    use_rslora: false,
+    fan_in_fan_out: false,
+  };
+  // `lm_head` matches the target but has no `layers.N` index ⇒ de-selected.
+  assert!(!peft_module_is_selected("lm_head", &base_weight(), &peft));
+  // A block path WITH an index in the list IS selected.
+  assert!(peft_module_is_selected(
+    "model.layers.0.lm_head",
+    &base_weight(),
+    &peft
+  ));
+}
+
+#[test]
+fn peft_layers_to_transform_index_not_in_list_deselects() {
+  // A module whose extracted block index is NOT in `layers_to_transform` is
+  // de-selected (the `Some(idx) => layers.contains(&idx)` returning false).
+  let peft = PeftSelection {
+    target_modules: Some(ModuleMatcher::List(vec!["q_proj".to_string()])),
+    exclude_modules: None,
+    layers_to_transform: Some(vec![5]),
+    layers_pattern: Vec::new(),
+    rank_pattern: Vec::new(),
+    alpha_pattern: Vec::new(),
+    use_rslora: false,
+    fan_in_fan_out: false,
+  };
+  // block 0 not in [5] ⇒ false.
+  assert!(!peft_module_is_selected(
+    "model.layers.0.self_attn.q_proj",
+    &base_weight(),
+    &peft
+  ));
+  // block 5 in [5] ⇒ true.
+  assert!(peft_module_is_selected(
+    "model.layers.5.self_attn.q_proj",
+    &base_weight(),
+    &peft
+  ));
+}
+
+// ───────────── linear_to_lora_layers: non-.weight keys skipped ─────────────
+
+#[test]
+fn linear_to_lora_layers_skips_non_weight_keys() {
+  // A weight-map entry whose key does NOT end in `.weight` (e.g. a `.scales`
+  // sibling, or a bare metadata key) is skipped by the `strip_suffix(".weight")
+  // else continue` guard — it is never a layer target.
+  let mut weights = Weights::new();
+  weights.insert(
+    "model.layers.0.self_attn.q_proj.weight".to_string(),
+    base_weight(),
+  );
+  // Non-.weight keys: must be ignored by the strip-suffix continue.
+  weights.insert(
+    "model.layers.0.self_attn.q_proj.scales".to_string(),
+    Array::zeros::<f32>(&(2, 1)).unwrap(),
+  );
+  weights.insert("metadata_only_key".to_string(), base_weight());
+  let mut params = HashMap::new();
+  params.insert(
+    "model.layers.0.self_attn.q_proj".to_string(),
+    plain_params(),
+  );
+  let cfg = mlxlm_config(16, keyed_params(vec!["self_attn.q_proj".to_string()]));
+  // No `quant` ⇒ the `.scales` sibling is not consulted as a quantized layout;
+  // the dense q_proj wraps and the non-.weight keys are ignored.
+  let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 1).unwrap();
+  assert_eq!(layers.len(), 1);
+  assert!(layers.contains_key("model.layers.0.self_attn.q_proj"));
+}
+
+// ───────────── load_adapters_with_config: non-positive rank ─────────────
+
+#[test]
+fn load_adapters_nonpositive_rank_is_out_of_range() {
+  // A config whose resolved rank is <= 0 is a degenerate adapter (empty
+  // factors); load_adapters_with_config rejects it with Error::OutOfRange
+  // BEFORE locating the weights file. mlx-lm-native config with rank 0.
+  let tmp = std::env::temp_dir().join(format!("mlxrs_zerorank_{}", std::process::id()));
+  std::fs::create_dir_all(&tmp).unwrap();
+  // No safetensors needed — the rank check fires first.
+  let cfg = LoraConfig {
+    fine_tune_type: FineTuneType::Lora,
+    lora_parameters: LoraParameters {
+      rank: 0,
+      scale: Some(2.0),
+      alpha: None,
+      keys: vec!["self_attn.q_proj".to_string()],
+      dropout: None,
+    },
+    use_dora: false,
+    selection: AdapterSelection::MlxLm { num_layers: 16 },
+  };
+  let weights = toy_weights();
+  let err = load_adapters_with_config(&weights, &tmp, &cfg, None, 4).unwrap_err();
+  match err {
+    Error::OutOfRange(p) => {
+      assert!(p.context().contains("rank"));
+      assert_eq!(p.value(), "0");
+    }
+    other => panic!("expected Error::OutOfRange, got {other:?}"),
+  }
+  std::fs::remove_dir_all(&tmp).ok();
+}
+
+// ───────────── locate_adapter_safetensors: both candidates absent ─────────────
+
+#[test]
+fn load_adapters_no_weights_file_at_all_is_not_found() {
+  // A dir with a valid adapter_config.json but NEITHER `adapters.safetensors`
+  // NOR `adapter_model.safetensors` ⇒ locate_adapter_safetensors synthesizes a
+  // FileIo(NotFound) naming the PREFERRED (config-shape) candidate.
+  let tmp = std::env::temp_dir().join(format!("mlxrs_nost_{}", std::process::id()));
+  std::fs::create_dir_all(&tmp).unwrap();
+  let config = r#"{
+      "fine_tune_type": "lora", "num_layers": 16,
+      "lora_parameters": { "rank": 2, "scale": 2.0, "keys": ["self_attn.q_proj"] }
+    }"#;
+  std::fs::write(tmp.join("adapter_config.json"), config).unwrap();
+  // Deliberately write NO safetensors of either name.
+  let weights = toy_weights();
+  let err = load_adapters(&weights, &tmp, None, 4).unwrap_err();
+  match err {
+    Error::FileIo(p) => {
+      // mlx-lm-native ⇒ the preferred (named) candidate is adapters.safetensors.
+      assert_eq!(p.path(), tmp.join("adapters.safetensors").as_path());
+      assert_eq!(p.op(), FileOp::Open);
+      assert_eq!(p.inner().kind(), std::io::ErrorKind::NotFound);
+    }
+    other => panic!("expected Error::FileIo(NotFound), got {other:?}"),
+  }
+  std::fs::remove_dir_all(&tmp).ok();
+}
+
+// ───────────── split_adapter_params: a/b pairing errors ─────────────
+
+#[test]
+fn split_adapter_params_lora_a_without_lora_b_is_err() {
+  // A `.lora_a` with no matching `.lora_b` is Error::MissingKey naming the
+  // missing `.lora_b` key.
+  let mut arrays: HashMap<String, Array> = HashMap::new();
+  arrays.insert("p.lora_a".to_string(), lora_a());
+  // No `p.lora_b`.
+  let err = split_adapter_params(arrays, false).unwrap_err();
+  match err {
+    Error::MissingKey(p) => {
+      assert_eq!(p.key(), "p.lora_b");
+      assert!(p.context().contains("no matching `lora_b`"));
+    }
+    other => panic!("expected Error::MissingKey, got {other:?}"),
+  }
+}
+
+#[test]
+fn split_adapter_params_lora_b_without_lora_a_is_err() {
+  // A `.lora_b` with no matching `.lora_a` is Error::MissingKey naming the
+  // missing `.lora_a` key (the leftover-b sweep at the end).
+  let mut arrays: HashMap<String, Array> = HashMap::new();
+  arrays.insert("p.lora_b".to_string(), lora_b());
+  let err = split_adapter_params(arrays, false).unwrap_err();
+  match err {
+    Error::MissingKey(p) => {
+      assert_eq!(p.key(), "p.lora_a");
+      assert!(p.context().contains("no matching `lora_a`"));
+    }
+    other => panic!("expected Error::MissingKey, got {other:?}"),
+  }
+}
+
+#[test]
+fn split_adapter_params_dora_missing_m_is_err_but_lora_ignores_stray_m() {
+  // expect_dora=true: a group missing its `.m` is Error::MissingKey naming
+  // `<path>.m`.
+  let mut arrays: HashMap<String, Array> = HashMap::new();
+  arrays.insert("p.lora_a".to_string(), lora_a());
+  arrays.insert("p.lora_b".to_string(), lora_b());
+  let err = split_adapter_params(arrays, true).unwrap_err();
+  assert!(
+    matches!(err, Error::MissingKey(ref p) if p.key() == "p.m"),
+    "expected MissingKey naming p.m, got {err:?}"
+  );
+
+  // expect_dora=false: a stray `.m` is ignored, the group still parses, and a
+  // non-factor key (no recognized suffix) is dropped.
+  let mut arrays2: HashMap<String, Array> = HashMap::new();
+  arrays2.insert("p.lora_a".to_string(), lora_a());
+  arrays2.insert("p.lora_b".to_string(), lora_b());
+  arrays2.insert(
+    "p.m".to_string(),
+    Array::from_slice::<f32>(&[3.0, 3.0], &(2usize,)).unwrap(),
+  );
+  arrays2.insert("unrelated.weight".to_string(), base_weight());
+  let out = split_adapter_params(arrays2, false).unwrap();
+  assert_eq!(out.len(), 1);
+  let p = out.get("p").unwrap();
+  // For plain LoRA the stray magnitude is still attached (split keeps any `.m`
+  // it finds; only DoRA REQUIRES it). The factors round-trip.
+  assert_eq!(p.lora_a.shape(), &[3, 2]);
+  assert_eq!(p.lora_b.shape(), &[2, 2]);
+}
+
+// ───────────── read_bounded_adapter_config / read_adapter_config ─────────────
+
+#[test]
+fn read_adapter_config_parses_valid_config() {
+  // The public `read_adapter_config` reads + parses adapter_config.json
+  // without loading the weight map (used by callers that need only the typed
+  // config, e.g. the fuse path's fan_in_fan_out flag).
+  let tmp = std::env::temp_dir().join(format!("mlxrs_readcfg_{}", std::process::id()));
+  std::fs::create_dir_all(&tmp).unwrap();
+  let config = r#"{
+      "fine_tune_type": "dora", "num_layers": 5,
+      "lora_parameters": { "rank": 4, "alpha": 16.0 }
+    }"#;
+  std::fs::write(tmp.join("adapter_config.json"), config).unwrap();
+  let cfg = read_adapter_config(&tmp).unwrap();
+  assert!(cfg.is_dora());
+  assert_eq!(cfg.rank(), 4);
+  assert_eq!(cfg.scale(), 4.0); // 16 / 4
+  assert!(matches!(
+    cfg.selection,
+    AdapterSelection::MlxLm { num_layers: 5 }
+  ));
+  std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn read_adapter_config_missing_file_is_file_io() {
+  // No adapter_config.json in the dir ⇒ FileIo(NotFound) on Open naming the
+  // adapter_config.json path.
+  let tmp = std::env::temp_dir().join(format!("mlxrs_readcfg_missing_{}", std::process::id()));
+  std::fs::create_dir_all(&tmp).unwrap();
+  match read_adapter_config(&tmp).unwrap_err() {
+    Error::FileIo(p) => {
+      assert_eq!(p.path(), tmp.join("adapter_config.json").as_path());
+      assert_eq!(p.op(), FileOp::Open);
+      assert_eq!(p.inner().kind(), std::io::ErrorKind::NotFound);
+    }
+    other => panic!("expected Error::FileIo(NotFound, Open), got {other:?}"),
+  }
+  std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn read_adapter_config_non_regular_file_is_err() {
+  // adapter_config.json is a DIRECTORY (non-regular) ⇒ FileIo(InvalidInput) on
+  // Stat (the regular-file check after open).
+  let tmp = std::env::temp_dir().join(format!("mlxrs_readcfg_dir_{}", std::process::id()));
+  std::fs::create_dir_all(&tmp).unwrap();
+  std::fs::create_dir_all(tmp.join("adapter_config.json")).unwrap();
+  match read_adapter_config(&tmp).unwrap_err() {
+    Error::FileIo(p) => {
+      assert_eq!(p.path(), tmp.join("adapter_config.json").as_path());
+      assert_eq!(p.op(), FileOp::Stat);
+      assert_eq!(p.inner().kind(), std::io::ErrorKind::InvalidInput);
+    }
+    other => panic!("expected Error::FileIo(InvalidInput, Stat), got {other:?}"),
+  }
+  std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn read_adapter_config_oversized_body_is_cap_exceeded() {
+  // A config body beyond MAX_CONFIG_BYTES is rejected with Error::CapExceeded
+  // (Read::take caps at cap+1, then the len check fires). Build a body of
+  // cap+1 bytes of valid-ish JSON whitespace padding.
+  let tmp = std::env::temp_dir().join(format!("mlxrs_readcfg_big_{}", std::process::id()));
+  std::fs::create_dir_all(&tmp).unwrap();
+  let cap = crate::lm::load::MAX_CONFIG_BYTES;
+  // `{}` then enough trailing spaces (JSON-insignificant) to exceed the cap.
+  let mut body = String::from("{}");
+  body.push_str(&" ".repeat((cap as usize) + 1));
+  std::fs::write(tmp.join("adapter_config.json"), &body).unwrap();
+  match read_adapter_config(&tmp).unwrap_err() {
+    Error::CapExceeded(p) => {
+      assert_eq!(p.cap_name(), "MAX_CONFIG_BYTES");
+      assert_eq!(p.cap(), cap);
+      assert!(p.observed() > cap);
+    }
+    other => panic!("expected Error::CapExceeded, got {other:?}"),
+  }
+  std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn read_adapter_config_non_utf8_body_is_parse_error() {
+  // A config file whose bytes are not valid UTF-8 ⇒ Error::Parse (the
+  // String::from_utf8 failure). Write a lone invalid byte 0xFF.
+  let tmp = std::env::temp_dir().join(format!("mlxrs_readcfg_badutf8_{}", std::process::id()));
+  std::fs::create_dir_all(&tmp).unwrap();
+  std::fs::write(tmp.join("adapter_config.json"), [0xFFu8, 0xFE, 0x00]).unwrap();
+  match read_adapter_config(&tmp).unwrap_err() {
+    Error::Parse(p) => {
+      assert!(p.context().contains("adapter_config.json"));
+    }
+    other => panic!("expected Error::Parse for non-UTF-8 body, got {other:?}"),
+  }
+  std::fs::remove_dir_all(&tmp).ok();
+}
+
+// ═════════════════ coverage backfill: dims helpers, quantized
+// build, requantize-dense, check_adapter_safetensors, dispatch ═════════════════
+
+#[test]
+fn base_input_dims_quantized_non_rank2_weight_is_rank_mismatch() {
+  // `base_input_dims` recovers the logical input width from the *packed*
+  // trailing axis of a quantized weight. A rank-1 packed weight has no
+  // trailing axis (`shape.get(1)` is None) ⇒ the defensive `ok_or_else`
+  // closure fires with Error::RankMismatch naming the quantized base. (Called
+  // directly: a malformed quantized base never passes `validate_factor_shapes`
+  // on the public path, so this exercises the helper's own guard.)
+  let bad_w = Array::zeros::<u32>(&(8usize,)).unwrap(); // rank-1
+  let scales = Array::zeros::<f32>(&(8usize,)).unwrap();
+  let qbiases = Array::zeros::<f32>(&(8usize,)).unwrap();
+  let base = BaseLinear::quantized(
+    bad_w,
+    scales,
+    Some(qbiases),
+    None,
+    32,
+    8,
+    "affine".to_string(),
+  )
+  .unwrap();
+  match base_input_dims(&base).unwrap_err() {
+    Error::RankMismatch(p) => {
+      assert_eq!(p.actual(), 1);
+      assert_eq!(p.actual_shape(), &[8]);
+      assert!(p.context().contains("quantized base weight"));
+    }
+    other => panic!("expected Error::RankMismatch, got {other:?}"),
+  }
+}
+
+#[test]
+fn base_output_dims_rank0_quantized_weight_is_rank_mismatch() {
+  // `base_output_dims` reads the leading weight axis. A rank-0 (scalar)
+  // quantized weight has no leading axis (`shape.first()` is None) ⇒ the
+  // defensive `ok_or_else` closure fires with Error::RankMismatch. Built via a
+  // 0-d `from_slice` (empty shape); `BaseLinear::quantized` does not validate
+  // weight rank, so this reaches the helper's guard directly.
+  let scalar_w = Array::from_slice::<u32>(&[0u32], &[0i32; 0]).unwrap(); // rank-0
+  let scales = Array::zeros::<f32>(&(1usize,)).unwrap();
+  let qbiases = Array::zeros::<f32>(&(1usize,)).unwrap();
+  let base = BaseLinear::quantized(
+    scalar_w,
+    scales,
+    Some(qbiases),
+    None,
+    32,
+    8,
+    "affine".to_string(),
+  )
+  .unwrap();
+  match base_output_dims(&base).unwrap_err() {
+    Error::RankMismatch(p) => {
+      assert_eq!(p.actual(), 0);
+      assert!(p.actual_shape().is_empty());
+      assert!(p.context().contains("output_dims"));
+    }
+    other => panic!("expected Error::RankMismatch, got {other:?}"),
+  }
+}
+
+#[test]
+fn build_base_linear_quantized_success_builds_quantized_base() {
+  // The QLoRA happy path of `build_base_linear`: `quant` resolves a
+  // Quantization for the path AND a `<path>.scales` sibling exists ⇒ a
+  // BaseLinear::Quantized is built from the weight/scales/biases triple plus an
+  // optional output bias (the `.biases` + `.bias` clone branch + the
+  // `BaseLinear::quantized` ctor — the success body the fan_in_fan_out reject
+  // test returns before reaching).
+  //
+  // Oracle: quantize a known dense weight, route it through `build_base_linear`,
+  // and require the reconstructed quantized base's bias-free output to match the
+  // reference dense `x @ Wᵀ` within affine-quant tolerance. The output bias is
+  // re-added on top, so a non-zero bias shifts the result by exactly that bias.
+  let input_dims = 64usize;
+  let output_dims = 2usize;
+  let mut wdata = vec![1.0f32; input_dims];
+  wdata.extend(vec![0.5f32; input_dims]);
+  let dense_w = Array::from_slice::<f32>(&wdata, &(output_dims, input_dims)).unwrap();
+  let x = Array::full::<f32>(&(1usize, input_dims), 1.0).unwrap();
+  // Reference base output WITHOUT bias: x @ Wᵀ = [sum(row0), sum(row1)]
+  //   = [64 * 1.0, 64 * 0.5] = [64, 32].
+  let path = "model.layers.0.self_attn.q_proj";
+  let weight_key = format!("{path}.weight");
+  let (w_q, scales, biases) = ops::quantized::quantize(&dense_w, 32, 8, "affine", None).unwrap();
+  let out_bias = Array::from_slice::<f32>(&[10.0, -20.0], &(output_dims,)).unwrap();
+
+  let mut weights = Weights::new();
+  weights.insert(weight_key.clone(), w_q);
+  weights.insert(format!("{path}.scales"), scales);
+  weights.insert(format!("{path}.biases"), biases.unwrap());
+  weights.insert(format!("{path}.bias"), out_bias);
+
+  let quant = crate::lm::quant::PerLayerQuantization::from_global(crate::lm::quant::Quantization {
+    group_size: 32,
+    bits: 8,
+    mode: crate::lm::quant::QuantMode::Affine,
+  });
+
+  let weight_ref = &weights[&weight_key];
+  let base = build_base_linear(
+    &weights,
+    path,
+    weight_ref,
+    Some(&quant),
+    false, // not fan_in_fan_out
+  )
+  .unwrap();
+  assert!(
+    matches!(base, BaseLinear::Quantized { .. }),
+    "a resolvable quant + .scales sibling must build a quantized base"
+  );
+  // The output bias was carried into the base.
+  assert!(base.bias().is_some());
+
+  // `base_output` adds the output bias: [64, 32] + [10, -20] = [74, 12].
+  let mut out = base.base_output(&x).unwrap();
+  approx_eq(&out.to_vec::<f32>().unwrap(), &[74.0, 12.0], 2e-1);
+}
+
+#[test]
+fn requantize_fused_on_dense_base_returns_dense_unchanged() {
+  // `requantize_fused`'s Dense arm: a dense base re-wraps the fused weight as a
+  // dense BaseLinear unchanged (the quantized re-quantize step is skipped). This
+  // arm is unreachable through `fuse` (which only calls it for a quantized
+  // base), so it is exercised directly to pin the documented dense passthrough.
+  let w = base_weight(); // [2, 3]
+  let bias = Array::from_slice::<f32>(&[1.0, 2.0], &(2usize,)).unwrap();
+  let dense = BaseLinear::dense(base_weight(), None).unwrap();
+  let out = dense
+    .requantize_fused(w, Some(bias))
+    .expect("dense requantize_fused must return a dense base");
+  assert!(
+    matches!(out, BaseLinear::Dense { .. }),
+    "requantize_fused over a dense base must stay dense"
+  );
+  // The fused weight + bias round-trip: x @ Wᵀ + bias with W = base_weight.
+  let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(1, 3)).unwrap();
+  let mut y = out.base_output(&x).unwrap();
+  // base(x) = [1, 2]; + bias [1, 2] = [2, 4].
+  approx_eq(&y.to_vec::<f32>().unwrap(), &[2.0, 4.0], 1e-5);
+}
+
+#[test]
+fn check_adapter_safetensors_missing_file_is_file_io_open() {
+  // Direct call: `check_adapter_safetensors` on a non-existent path surfaces
+  // Error::FileIo(NotFound) from the Open op. (`load_adapters` short-circuits on
+  // a missing file before reaching this helper, so the Open-error arm is only
+  // hit by a direct call.)
+  let tmp = std::env::temp_dir().join(format!("mlxrs_ckst_missing_{}", std::process::id()));
+  std::fs::create_dir_all(&tmp).unwrap();
+  let missing = tmp.join("does_not_exist.safetensors");
+  match check_adapter_safetensors(&missing).unwrap_err() {
+    Error::FileIo(p) => {
+      assert_eq!(p.path(), missing.as_path());
+      assert_eq!(p.op(), FileOp::Open);
+      assert_eq!(p.inner().kind(), std::io::ErrorKind::NotFound);
+    }
+    other => panic!("expected Error::FileIo(NotFound, Open), got {other:?}"),
+  }
+  std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn check_adapter_safetensors_regular_file_within_cap_is_ok() {
+  // The happy path: a small regular file under MAX_ADAPTER_SAFETENSORS_BYTES
+  // passes (open + fstat + is_file + size check all succeed → Ok(())).
+  let tmp = std::env::temp_dir().join(format!("mlxrs_ckst_ok_{}", std::process::id()));
+  std::fs::create_dir_all(&tmp).unwrap();
+  let f = tmp.join("adapters.safetensors");
+  std::fs::write(
+    &f,
+    b"not a real safetensors blob, but a regular file under cap",
+  )
+  .unwrap();
+  assert!(
+    check_adapter_safetensors(&f).is_ok(),
+    "a small regular file must pass the pre-mmap stat gate"
+  );
+  std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn lora_layer_base_on_dora_variant_returns_some() {
+  // `LoraLayer::base` Dora arm: a DoRA-linear layer exposes its BaseLinear via
+  // `base()` (Some), distinct from the embedding variant (None, covered
+  // elsewhere). Pins the Dora match arm of `base`.
+  let dora = LoraLayer::Dora(
+    DoRALinear::new(
+      BaseLinear::dense(base_weight(), None).unwrap(),
+      AdapterParams {
+        lora_a: lora_a(),
+        lora_b: lora_b(),
+        magnitude: Some(Array::from_slice::<f32>(&[3.0, 3.0], &(2usize,)).unwrap()),
+      },
+      2.0,
+    )
+    .unwrap(),
+  );
+  let base = dora.base().expect("Dora variant exposes a BaseLinear");
+  assert!(base.bias().is_none());
+  assert!(dora.base_embedding().is_none());
+}
+
+#[test]
+fn validate_config_rank_dora_context_lora_b_only_drift() {
+  // The DoraLinear arm of `config_rank_vs_lora_b_rank`: lora_a's rank axis
+  // matches the config rank (2) so the lora_a branch passes, but lora_b's
+  // leading axis (3) differs ⇒ the lora_b branch fires with the DoRALinear
+  // context label. (The existing DoRA config-rank test drifts lora_a and
+  // returns before reaching this arm.)
+  let params = AdapterParams {
+    lora_a: Array::zeros::<f32>(&(3usize, 2usize)).unwrap(), // rank axis 2 (matches config)
+    lora_b: Array::zeros::<f32>(&(3usize, 2usize)).unwrap(), // leading axis 3 (drifts)
+    magnitude: None,
+  };
+  let err = validate_config_rank(&params, 2, LinearValidationContext::DoraLinear).unwrap_err();
+  match err {
+    Error::LengthMismatch(p) => {
+      assert!(p.context().contains("DoRALinear"));
+      assert!(p.context().contains("lora_b"));
+      assert_eq!(p.expected(), 2);
+      assert_eq!(p.actual(), 3);
+    }
+    other => panic!("expected Error::LengthMismatch on lora_b (DoRA context), got {other:?}"),
+  }
+}
+
+#[test]
+fn base_embedding_as_linear_tied_head_hand_traced() {
+  // `BaseEmbedding::as_linear` is `x @ weightᵀ` (the tied-weight LM-head path).
+  // With a known table its output is a plain hand-computable matmul. Pins the
+  // helper directly (independently of the DoRAEmbedding fuse round-trip).
+  //
+  // weight (num_embeddings=2, dims=3):
+  //   [[1, 2, 3],
+  //    [4, 5, 6]]
+  // x = [[1, 0, 1]] (1×3). x @ weightᵀ = [[1*1+0*2+1*3, 1*4+0*5+1*6]] = [[4, 10]].
+  let weight = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
+  let base = BaseEmbedding::dense(weight).unwrap();
+  let x = Array::from_slice::<f32>(&[1.0, 0.0, 1.0], &(1, 3)).unwrap();
+  let mut out = base.as_linear(&x).unwrap();
+  assert_eq!(out.shape(), &[1, 2]);
+  approx_eq(&out.to_vec::<f32>().unwrap(), &[4.0, 10.0], 1e-5);
+}

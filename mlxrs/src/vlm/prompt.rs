@@ -2054,3 +2054,1284 @@ pub fn get_message_json(
   };
   formatter.format_message(prompt, resolved)
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  // Test-local helpers — build a `FormatOpts` from the formatter defaults
+  // (num_images=1, num_audios=1) with selected overrides, so each test
+  // declares only the fields it cares about.
+
+  fn opts_with(role: &str, num_images: usize, num_audios: usize) -> FormatOpts {
+    FormatOpts {
+      role: role.to_string(),
+      num_images,
+      num_audios,
+      ..FormatOpts::formatter_default()
+    }
+  }
+
+  // Pull the `Vec<ContentItem>` out of a `FormattedMessage::Message` whose
+  // content is `Items`; panic with a clear message otherwise.
+  fn items(fm: &FormattedMessage) -> Vec<ContentItem> {
+    match fm {
+      FormattedMessage::Message(Message {
+        content: MessageContent::Items(v),
+        ..
+      }) => v.clone(),
+      other => panic!("expected Message(Items), got {other:?}"),
+    }
+  }
+
+  // Pull the flat `String` out of a `FormattedMessage::Message` whose content
+  // is `Text`.
+  fn text_content(fm: &FormattedMessage) -> String {
+    match fm {
+      FormattedMessage::Message(Message {
+        content: MessageContent::Text(s),
+        ..
+      }) => s.clone(),
+      other => panic!("expected Message(Text), got {other:?}"),
+    }
+  }
+
+  // ── MarkerPolicy::as_str + Display + IsVariant (lines 149–152) ──────────
+
+  #[test]
+  fn marker_policy_as_str_and_display() {
+    assert_eq!(MarkerPolicy::Required.as_str(), "required");
+    assert_eq!(MarkerPolicy::PrependIfAbsent.as_str(), "prepend_if_absent");
+    // derive_more::Display delegates to as_str.
+    assert_eq!(format!("{}", MarkerPolicy::Required), "required");
+    assert_eq!(
+      format!("{}", MarkerPolicy::PrependIfAbsent),
+      "prepend_if_absent"
+    );
+    // derive_more::IsVariant.
+    assert!(MarkerPolicy::Required.is_required());
+    assert!(MarkerPolicy::PrependIfAbsent.is_prepend_if_absent());
+    assert!(!MarkerPolicy::Required.is_prepend_if_absent());
+  }
+
+  // ── locate_image_tokens edge cases ──────────────────────────────────────
+
+  #[test]
+  fn locate_image_tokens_empty_and_runs() {
+    // Empty input → empty Vec.
+    assert_eq!(locate_image_tokens(&[], 99), ImageTokenSpans::new());
+    // No matches.
+    assert_eq!(locate_image_tokens(&[1, 2, 3], 99), ImageTokenSpans::new());
+    // Run at the very end (exercises the `i == len` loop exit inside the run).
+    assert_eq!(locate_image_tokens(&[1, 99, 99], 99), vec![(1, 3)]);
+    // Run at the very start.
+    assert_eq!(locate_image_tokens(&[99, 1], 99), vec![(0, 1)]);
+  }
+
+  // ── insert_image_tokens: marker-present cap overflow (lines 372–378) ────
+  //
+  // `placeholder_total = image_count * num_tokens_per_image` computes
+  // (does NOT overflow at the earlier guard), the contiguous marker run
+  // length equals image_count, but `text.len() + placeholder_total`
+  // overflows usize. The `.checked_add` returns None BEFORE any allocation,
+  // so the error surfaces with no heap pressure.
+
+  #[test]
+  fn insert_image_tokens_marker_cap_overflow() {
+    // image_count=2 markers `[7,7]`; num_tokens_per_image = usize::MAX/2 so
+    // placeholder_total = usize::MAX-1 (no overflow at the product guard),
+    // then 2 + (usize::MAX-1) overflows.
+    let text = [7_u32, 7];
+    let err =
+      insert_image_tokens(&text, 2, 7, 99, usize::MAX / 2, MarkerPolicy::Required).unwrap_err();
+    assert!(
+      matches!(err, Error::ArithmeticOverflow(_)),
+      "expected ArithmeticOverflow, got {err:?}"
+    );
+    if let Error::ArithmeticOverflow(p) = &err {
+      assert_eq!(
+        p.context(),
+        "insert_image_tokens: cap (text_len + placeholder_total - run_len)"
+      );
+    }
+  }
+
+  // ── insert_image_tokens: prepend cap overflow (lines 407–412) ───────────
+  //
+  // No marker present + PrependIfAbsent: `cap = text.len() + placeholder_total`
+  // overflows. Same usize::MAX/2 trick.
+
+  #[test]
+  fn insert_image_tokens_prepend_cap_overflow() {
+    let text = [1_u32, 2]; // no marker token (7) present
+    let err = insert_image_tokens(
+      &text,
+      2,
+      7,
+      99,
+      usize::MAX / 2,
+      MarkerPolicy::PrependIfAbsent,
+    )
+    .unwrap_err();
+    assert!(
+      matches!(err, Error::ArithmeticOverflow(_)),
+      "expected ArithmeticOverflow, got {err:?}"
+    );
+    if let Error::ArithmeticOverflow(p) = &err {
+      assert_eq!(
+        p.context(),
+        "insert_image_tokens: cap (text_len + placeholder_total)"
+      );
+    }
+  }
+
+  // Supporting coverage of the other insert_image_tokens error branches
+  // (degenerate zero-width, product overflow, extra-marker, run-length
+  // mismatch, missing-marker) so the function is exercised end-to-end.
+
+  #[test]
+  fn insert_image_tokens_degenerate_and_overflow_and_invariant() {
+    // num_tokens_per_image == 0 with image_count > 0 → InvariantViolation.
+    let err = insert_image_tokens(&[1, 7, 2], 1, 7, 99, 0, MarkerPolicy::Required).unwrap_err();
+    assert!(matches!(err, Error::InvariantViolation(_)));
+
+    // image_count * num_tokens_per_image overflows the product guard.
+    let err =
+      insert_image_tokens(&[7, 7], 2, 7, 99, usize::MAX, MarkerPolicy::Required).unwrap_err();
+    assert!(matches!(err, Error::ArithmeticOverflow(_)));
+    if let Error::ArithmeticOverflow(p) = &err {
+      assert_eq!(
+        p.context(),
+        "insert_image_tokens: placeholder_total (image_count * num_tokens_per_image)"
+      );
+    }
+
+    // Extra non-contiguous marker after the first run → InvariantViolation.
+    let err = insert_image_tokens(&[7, 1, 7], 1, 7, 99, 3, MarkerPolicy::Required).unwrap_err();
+    assert!(matches!(err, Error::InvariantViolation(_)));
+
+    // Run length (2) != image_count (1) → LengthMismatch.
+    let err = insert_image_tokens(&[1, 7, 7, 2], 1, 7, 99, 3, MarkerPolicy::Required).unwrap_err();
+    assert!(matches!(err, Error::LengthMismatch(_)));
+    if let Error::LengthMismatch(p) = &err {
+      assert_eq!(p.expected(), 1);
+      assert_eq!(p.actual(), 2);
+    }
+
+    // Missing marker under Required → MissingField.
+    let err = insert_image_tokens(&[1, 2], 1, 7, 99, 3, MarkerPolicy::Required).unwrap_err();
+    assert!(matches!(err, Error::MissingField(_)));
+    if let Error::MissingField(p) = &err {
+      assert_eq!(p.field(), "image_marker_id token in text_tokens");
+    }
+  }
+
+  // ── build_multimodal_mask_with_past: total_keys overflow (lines 521–524) ─
+
+  #[test]
+  fn mask_with_past_total_keys_overflow() {
+    let err = build_multimodal_mask_with_past(1, usize::MAX, &[]).unwrap_err();
+    assert!(matches!(err, Error::ArithmeticOverflow(_)));
+    if let Error::ArithmeticOverflow(p) = &err {
+      assert_eq!(
+        p.context(),
+        "build_multimodal_mask_with_past: total_keys (past_len + seq_len)"
+      );
+    }
+  }
+
+  // ── build_multimodal_mask_with_past: total_keys > i32::MAX (lines 543–546)
+  //
+  // past_len + seq_len exceeds i32::MAX but does NOT overflow usize, and
+  // seq_len != 0 so the empty-chunk branch is skipped.
+
+  #[test]
+  fn mask_with_past_total_keys_exceeds_i32_max() {
+    let err = build_multimodal_mask_with_past(1, i32::MAX as usize, &[]).unwrap_err();
+    assert!(matches!(err, Error::OutOfRange(_)));
+    if let Error::OutOfRange(p) = &err {
+      assert_eq!(
+        p.context(),
+        "build_multimodal_mask_with_past: total_keys (past_len + seq_len)"
+      );
+    }
+  }
+
+  // Empty-chunk branch (seq_len == 0): valid zero-query mask, plus the
+  // non-empty-spans-on-zero-chunk InvariantViolation.
+
+  #[test]
+  fn mask_with_past_empty_chunk() {
+    // seq_len=0, no spans → [1,1,0,past_len] array.
+    let mask = build_multimodal_mask_with_past(0, 3, &[]).unwrap();
+    assert_eq!(mask.shape(), vec![1, 1, 0, 3]);
+    // seq_len=0 but a span supplied → InvariantViolation.
+    let err = build_multimodal_mask_with_past(0, 3, &[(0, 1)]).unwrap_err();
+    assert!(matches!(err, Error::InvariantViolation(_)));
+  }
+
+  // Span validation branches: empty span, end>seq_len, overlap.
+
+  #[test]
+  fn mask_span_validation_errors() {
+    // start >= end (empty span).
+    let err = build_multimodal_mask(4, &[(2, 2)]).unwrap_err();
+    assert!(matches!(err, Error::InvariantViolation(_)));
+    // end > seq_len.
+    let err = build_multimodal_mask(4, &[(2, 5)]).unwrap_err();
+    assert!(matches!(err, Error::OutOfRange(_)));
+    // overlapping spans (sorted, second starts before first ends).
+    let err = build_multimodal_mask(8, &[(1, 4), (3, 6)]).unwrap_err();
+    assert!(matches!(err, Error::InvariantViolation(_)));
+  }
+
+  // ── build_multimodal_mask: full semantic oracle with an image span ──────
+  //
+  // seq_len=4, one image span (1,3). Independent closed-form expectation:
+  // attend iff a past-style causal rule OR same-image-span bidirectionality.
+  // Positions 1,2 are in image block 1; 0,3 are text.
+
+  #[test]
+  fn mask_image_span_bidirectional_oracle() {
+    let mut mask = build_multimodal_mask(4, &[(1, 3)]).unwrap();
+    assert_eq!(mask.shape(), vec![1, 1, 4, 4]);
+    let v = mask.to_vec::<bool>().unwrap();
+    // block_id = [0, 1, 1, 0].
+    let block = [0u32, 1, 1, 0];
+    for q in 0..4usize {
+      for k in 0..4usize {
+        let causal = k <= q;
+        let same_img = block[q] != 0 && block[q] == block[k];
+        let expected = causal || same_img;
+        assert_eq!(v[q * 4 + k], expected, "mask[{q}][{k}] expected {expected}");
+      }
+    }
+    // Spot-check the only non-causal cell: q=1 (image), k=2 (image, k>q) →
+    // bidirectional within the same span → attend. Row q=1, col k=2.
+    assert!(v[6]);
+  }
+
+  // Offset-aware (chunked-prefill) oracle with past keys all-attend.
+
+  #[test]
+  fn mask_with_past_attends_all_past_keys() {
+    // seq_len=2, past_len=2, one chunk-local span (0,2): both current
+    // positions are image block 1 → bidirectional with each other; both
+    // past keys always attend.
+    let mut mask = build_multimodal_mask_with_past(2, 2, &[(0, 2)]).unwrap();
+    assert_eq!(mask.shape(), vec![1, 1, 2, 4]);
+    let v = mask.to_vec::<bool>().unwrap();
+    let block = [1u32, 1]; // chunk-local block ids
+    for q in 0..2usize {
+      for k in 0..4usize {
+        let expected = if k < 2 {
+          true
+        } else {
+          let kl = k - 2;
+          (kl <= q) || (block[q] != 0 && block[q] == block[kl])
+        };
+        assert_eq!(v[q * 4 + k], expected, "mask[{q}][{k}]");
+      }
+    }
+  }
+
+  // ── assemble_multimodal_prompt: degenerate zero-width (lines 723–725) ───
+
+  #[test]
+  fn assemble_degenerate_zero_width() {
+    let err =
+      assemble_multimodal_prompt(&[1, 7, 2], 1, 7, 99, 0, MarkerPolicy::Required).unwrap_err();
+    assert!(matches!(err, Error::InvariantViolation(_)));
+    if let Error::InvariantViolation(p) = &err {
+      assert_eq!(
+        p.context(),
+        "assemble_multimodal_prompt: num_tokens_per_image (with image_count > 0)"
+      );
+    }
+  }
+
+  // ── assemble_multimodal_prompt: placeholder_total overflow (758–763) ────
+
+  #[test]
+  fn assemble_placeholder_total_overflow() {
+    let err = assemble_multimodal_prompt(&[7, 7], 2, 7, 99, usize::MAX, MarkerPolicy::Required)
+      .unwrap_err();
+    assert!(matches!(err, Error::ArithmeticOverflow(_)));
+    if let Error::ArithmeticOverflow(p) = &err {
+      assert_eq!(
+        p.context(),
+        "assemble_multimodal_prompt: placeholder_total (image_count * num_tokens_per_image)"
+      );
+    }
+  }
+
+  // ── assemble_multimodal_prompt: final_len overflow (lines 775–781) ──────
+  //
+  // No marker present (marker_run_len=0), placeholder_total computes
+  // (= usize::MAX-1), then text.len() + placeholder_total overflows.
+
+  #[test]
+  fn assemble_final_len_overflow() {
+    let err = assemble_multimodal_prompt(
+      &[1, 2],
+      2,
+      7,
+      99,
+      usize::MAX / 2,
+      MarkerPolicy::PrependIfAbsent,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::ArithmeticOverflow(_)));
+    if let Error::ArithmeticOverflow(p) = &err {
+      assert_eq!(
+        p.context(),
+        "assemble_multimodal_prompt: final_len (text_len + placeholder_total - marker_run_len)"
+      );
+    }
+  }
+
+  // ── assemble_multimodal_prompt: final_len > i32::MAX (early reject) ──────
+
+  #[test]
+  fn assemble_final_len_exceeds_i32_max() {
+    // 1 image, num_tokens_per_image just over i32::MAX, no marker, prepend.
+    let n = i32::MAX as usize + 1;
+    let err =
+      assemble_multimodal_prompt(&[1], 1, 7, 99, n, MarkerPolicy::PrependIfAbsent).unwrap_err();
+    assert!(matches!(err, Error::OutOfRange(_)));
+    if let Error::OutOfRange(p) = &err {
+      assert_eq!(
+        p.context(),
+        "assemble_multimodal_prompt: final assembled length"
+      );
+    }
+  }
+
+  // ── assemble_multimodal_prompt: multi-image happy path (lines 807–840) ──
+  //
+  // Two images, 3 tokens each, marker run of 2. Per-image spans must be
+  // (2,5) and (5,8), NOT one collapsed (2,8). Closed-form expected tokens.
+
+  #[test]
+  fn assemble_multi_image_spans() {
+    let text = [1_u32, 2, 7, 7, 3];
+    let p = assemble_multimodal_prompt(&text, 2, 7, 99, 3, MarkerPolicy::Required).unwrap();
+    assert_eq!(p.tokens, vec![1, 2, 99, 99, 99, 99, 99, 99, 3]);
+    assert_eq!(p.image_spans, vec![(2, 5), (5, 8)]);
+    assert_eq!(p.attention_mask.shape(), vec![1, 1, 9, 9]);
+  }
+
+  // Zero-image assemble: passthrough tokens, empty spans, pure-causal mask.
+
+  #[test]
+  fn assemble_zero_images() {
+    let text = [1_u32, 2, 3];
+    let p = assemble_multimodal_prompt(&text, 0, 7, 99, 3, MarkerPolicy::Required).unwrap();
+    assert_eq!(p.tokens, vec![1, 2, 3]);
+    assert!(p.image_spans.is_empty());
+    assert_eq!(p.attention_mask.shape(), vec![1, 1, 3, 3]);
+  }
+
+  // ── MessageFormat::as_str — all 15 variants (lines 954–970) ─────────────
+
+  #[test]
+  fn message_format_as_str_all_variants() {
+    let pairs: &[(MessageFormat, &str)] = &[
+      (MessageFormat::ListWithImage, "list_with_image"),
+      (MessageFormat::ListWithImageFirst, "list_with_image_first"),
+      (
+        MessageFormat::ListWithImageUrlFirst,
+        "list_with_image_url_first",
+      ),
+      (MessageFormat::ListWithImageType, "list_with_image_type"),
+      (
+        MessageFormat::ListWithImageTypeText,
+        "list_with_image_type_text",
+      ),
+      (
+        MessageFormat::ListWithImageTypeTextImageLast,
+        "list_with_image_type_text_image_last",
+      ),
+      (MessageFormat::ImageToken, "image_token"),
+      (MessageFormat::ImageTokenPipe, "image_token_pipe"),
+      (MessageFormat::StartImageToken, "start_image_token"),
+      (MessageFormat::ImageTokenNewline, "image_token_newline"),
+      (MessageFormat::NumberedImageTokens, "numbered_image_tokens"),
+      (MessageFormat::PromptOnly, "prompt_only"),
+      (
+        MessageFormat::PromptWithImageToken,
+        "prompt_with_image_token",
+      ),
+      (
+        MessageFormat::PromptWithStartImageToken,
+        "prompt_with_start_image_token",
+      ),
+      (MessageFormat::VideoWithText, "video_with_text"),
+    ];
+    for (fmt, s) in pairs {
+      assert_eq!(fmt.as_str(), *s);
+      // derive_more::Display delegates to as_str.
+      assert_eq!(format!("{fmt}"), *s);
+    }
+    // The constant table must enumerate exactly these 15 in order.
+    assert_eq!(MESSAGE_FORMAT_VARIANTS.len(), 15);
+    for (i, (fmt, _)) in pairs.iter().enumerate() {
+      assert_eq!(MESSAGE_FORMAT_VARIANTS[i], *fmt);
+    }
+  }
+
+  // ── MessageBuilder constructors ─────────────────────────────────────────
+
+  #[test]
+  fn message_builder_constructors() {
+    assert_eq!(
+      MessageBuilder::text_message("hi"),
+      ContentItem::Text {
+        text: "hi".to_string()
+      }
+    );
+    assert_eq!(
+      MessageBuilder::content_message("hi"),
+      ContentItem::ContentText {
+        text: "hi".to_string()
+      }
+    );
+    assert_eq!(MessageBuilder::image_message(), ContentItem::Image);
+    assert_eq!(MessageBuilder::image_url_message(), ContentItem::ImageUrl);
+    assert_eq!(MessageBuilder::audio_message(), ContentItem::Audio);
+    assert_eq!(
+      MessageBuilder::video_message("v.mp4", 100, 2),
+      ContentItem::Video {
+        video: "v.mp4".to_string(),
+        max_pixels: 100,
+        fps: 2,
+      }
+    );
+  }
+
+  // ── FormatOpts default variants ─────────────────────────────────────────
+
+  #[test]
+  fn format_opts_defaults() {
+    let f = FormatOpts::formatter_default();
+    assert_eq!(f.num_images, 1);
+    assert_eq!(f.num_audios, 1);
+    assert_eq!(f.role, "user");
+    assert_eq!(f.max_pixels, 224 * 224);
+    // Default::default() == formatter_default().
+    let d = FormatOpts::default();
+    assert_eq!(d.num_images, 1);
+    assert_eq!(d.num_audios, 1);
+    // get_message_default → 0/0.
+    let g = FormatOpts::get_message_default();
+    assert_eq!(g.num_images, 0);
+    assert_eq!(g.num_audios, 0);
+    assert_eq!(g.role, "user");
+  }
+
+  // ── MessageFormatter::for_model: lookup + lowercasing + missing-key ─────
+
+  #[test]
+  fn for_model_lookup_and_errors() {
+    let f = MessageFormatter::for_model("Qwen2_VL").unwrap();
+    // Lowercased to match the python `model_name.lower()`.
+    assert_eq!(f.model_name, "qwen2_vl");
+    assert_eq!(f.format_type, MessageFormat::ListWithImage);
+
+    // Unknown model → MissingKey.
+    let err = MessageFormatter::for_model("nonexistent_model").unwrap_err();
+    assert!(matches!(err, Error::MissingKey(_)));
+    if let Error::MissingKey(p) = &err {
+      assert_eq!(p.key(), "nonexistent_model");
+    }
+  }
+
+  // ── format_message dispatch: single-image guard (SINGLE_IMAGE_ONLY) ─────
+
+  #[test]
+  fn dispatch_single_image_guard() {
+    // paligemma is in SINGLE_IMAGE_ONLY_MODELS; num_images=2 → OutOfRange.
+    let f = MessageFormatter::for_model("paligemma").unwrap();
+    let opts = opts_with("user", 2, 0);
+    let err = f.format_message("hi", &opts).unwrap_err();
+    assert!(matches!(err, Error::OutOfRange(_)));
+  }
+
+  // ── format_message dispatch arms ────────────────────────────────────────
+  //
+  // Each arm is selected by the model's MODEL_CONFIG entry. We assert the
+  // exact formatted content as an independent closed-form oracle.
+
+  // ListWithImage (text-first): qwen2_vl. (line 1480)
+  #[test]
+  fn dispatch_list_with_image() {
+    let f = MessageFormatter::for_model("qwen2_vl").unwrap();
+    let it = items(&f.format_message("hi", &opts_with("user", 1, 0)).unwrap());
+    assert_eq!(
+      it,
+      vec![
+        ContentItem::Text {
+          text: "hi".to_string()
+        },
+        ContentItem::Image
+      ]
+    );
+  }
+
+  // ListWithImageFirst (image-first): qwen2_5_vl. (line 1481)
+  #[test]
+  fn dispatch_list_with_image_first() {
+    let f = MessageFormatter::for_model("qwen2_5_vl").unwrap();
+    let it = items(&f.format_message("hi", &opts_with("user", 2, 0)).unwrap());
+    assert_eq!(
+      it,
+      vec![
+        ContentItem::Image,
+        ContentItem::Image,
+        ContentItem::Text {
+          text: "hi".to_string()
+        },
+      ]
+    );
+  }
+
+  // ListWithImageUrlFirst (image_url, image-first): ernie4_5_moe_vl. (line 1482)
+  #[test]
+  fn dispatch_list_with_image_url_first() {
+    let f = MessageFormatter::for_model("ernie4_5_moe_vl").unwrap();
+    let it = items(&f.format_message("hi", &opts_with("user", 1, 0)).unwrap());
+    assert_eq!(
+      it,
+      vec![
+        ContentItem::ImageUrl,
+        ContentItem::Text {
+          text: "hi".to_string()
+        },
+      ]
+    );
+  }
+
+  // ListWithImageType (Content kind, image-first): internvl_chat. (lines 1483–1485)
+  #[test]
+  fn dispatch_list_with_image_type_content() {
+    let f = MessageFormatter::for_model("internvl_chat").unwrap();
+    // 1 image, 1 audio, user role.
+    let it = items(&f.format_message("hi", &opts_with("user", 1, 1)).unwrap());
+    // image-first: [image, content_text, audio].
+    assert_eq!(
+      it,
+      vec![
+        ContentItem::Image,
+        ContentItem::ContentText {
+          text: "hi".to_string()
+        },
+        ContentItem::Audio,
+      ]
+    );
+  }
+
+  // ListWithImageTypeText (Text kind, image-first): pixtral. (lines 1486–1488)
+  #[test]
+  fn dispatch_list_with_image_type_text() {
+    let f = MessageFormatter::for_model("pixtral").unwrap();
+    let it = items(&f.format_message("hi", &opts_with("user", 1, 0)).unwrap());
+    assert_eq!(
+      it,
+      vec![
+        ContentItem::Image,
+        ContentItem::Text {
+          text: "hi".to_string()
+        },
+      ]
+    );
+  }
+
+  // ImageToken ("<image>", image_first): minicpmo. (line 1492)
+  #[test]
+  fn dispatch_image_token() {
+    let f = MessageFormatter::for_model("minicpmo").unwrap();
+    let s = text_content(&f.format_message("hi", &opts_with("user", 2, 0)).unwrap());
+    assert_eq!(s, "<image><image>hi");
+  }
+
+  // ImageTokenPipe ("<|image|>"): jina_vlm. (line 1493)
+  #[test]
+  fn dispatch_image_token_pipe() {
+    let f = MessageFormatter::for_model("jina_vlm").unwrap();
+    let s = text_content(&f.format_message("hi", &opts_with("user", 1, 0)).unwrap());
+    assert_eq!(s, "<|image|>hi");
+  }
+
+  // StartImageToken ("<start_of_image>", image LAST): gemma3. (lines 1494–1496)
+  #[test]
+  fn dispatch_start_image_token() {
+    let f = MessageFormatter::for_model("gemma3").unwrap();
+    let s = text_content(&f.format_message("hi", &opts_with("user", 1, 0)).unwrap());
+    assert_eq!(s, "hi<start_of_image>");
+  }
+
+  // ImageTokenNewline ("<image>\n"): deepseek_vl_v2. (line 1497)
+  #[test]
+  fn dispatch_image_token_newline() {
+    let f = MessageFormatter::for_model("deepseek_vl_v2").unwrap();
+    let s = text_content(&f.format_message("hi", &opts_with("user", 1, 0)).unwrap());
+    assert_eq!(s, "<image>\nhi");
+  }
+
+  // NumberedImageTokens: phi3_v. (line 1498)
+  #[test]
+  fn dispatch_numbered_image_tokens() {
+    let f = MessageFormatter::for_model("phi3_v").unwrap();
+    let s = text_content(&f.format_message("hi", &opts_with("user", 2, 1)).unwrap());
+    assert_eq!(s, "<|image_1|><|image_2|><|audio_1|>hi");
+  }
+
+  // PromptOnly: florence2 → bare String. (line 1499)
+  #[test]
+  fn dispatch_prompt_only() {
+    let f = MessageFormatter::for_model("florence2").unwrap();
+    let out = f.format_message("hi", &opts_with("user", 1, 0)).unwrap();
+    assert_eq!(out, FormattedMessage::String("hi".to_string()));
+  }
+
+  // PromptWithImageToken: paligemma → "<image>" * N + prompt. (line 1500,
+  // body lines 1525–1556)
+  #[test]
+  fn dispatch_prompt_with_image_token() {
+    let f = MessageFormatter::for_model("paligemma").unwrap();
+    // Single image (paligemma is single-image-only; >1 errors).
+    let out = f.format_message("hi", &opts_with("user", 1, 0)).unwrap();
+    assert_eq!(out, FormattedMessage::String("<image>hi".to_string()));
+    // Unconditional: assistant role still emits the prefix.
+    let out = f
+      .format_message("hi", &opts_with("assistant", 1, 0))
+      .unwrap();
+    assert_eq!(out, FormattedMessage::String("<image>hi".to_string()));
+    // num_images=0 → bare prompt.
+    let out = f.format_message("hi", &opts_with("user", 0, 0)).unwrap();
+    assert_eq!(out, FormattedMessage::String("hi".to_string()));
+  }
+
+  // ── VideoWithText dispatch + format_video_message branches (line 1504) ──
+  //
+  // qwen2_vl with a non-empty `video` routes to format_video_message via the
+  // special-case at lines 1470–1476. We also drive the fps branches and the
+  // empty-video error directly through models in VIDEO_FORMAT_MODELS.
+
+  #[test]
+  fn dispatch_video_with_text_default_fps() {
+    let f = MessageFormatter::for_model("qwen2_vl").unwrap();
+    let opts = FormatOpts {
+      role: "user".to_string(),
+      video: vec!["a.mp4".to_string(), "b.mp4".to_string()],
+      fps: Vec::new(), // empty → default fps=1 for each (lines 1960–1963)
+      max_pixels: 256,
+      ..FormatOpts::formatter_default()
+    };
+    let it = items(&f.format_message("cap", &opts).unwrap());
+    assert_eq!(
+      it,
+      vec![
+        ContentItem::Video {
+          video: "a.mp4".to_string(),
+          max_pixels: 256,
+          fps: 1,
+        },
+        ContentItem::Video {
+          video: "b.mp4".to_string(),
+          max_pixels: 256,
+          fps: 1,
+        },
+        ContentItem::Text {
+          text: "cap".to_string()
+        },
+      ]
+    );
+  }
+
+  #[test]
+  fn video_message_scalar_fps_broadcast() {
+    // fps.len()==1 → scalar applied to all (lines 1964–1967).
+    let f = MessageFormatter::for_model("qwen2_5_vl").unwrap();
+    let opts = FormatOpts {
+      role: "user".to_string(),
+      video: vec!["a.mp4".to_string(), "b.mp4".to_string()],
+      fps: vec![5],
+      max_pixels: 224 * 224,
+      ..FormatOpts::formatter_default()
+    };
+    let it = items(&f.format_message("cap", &opts).unwrap());
+    assert_eq!(
+      it,
+      vec![
+        ContentItem::Video {
+          video: "a.mp4".to_string(),
+          max_pixels: 224 * 224,
+          fps: 5,
+        },
+        ContentItem::Video {
+          video: "b.mp4".to_string(),
+          max_pixels: 224 * 224,
+          fps: 5,
+        },
+        ContentItem::Text {
+          text: "cap".to_string()
+        },
+      ]
+    );
+  }
+
+  #[test]
+  fn video_message_per_video_fps() {
+    // fps.len()==video.len() → per-video (lines 1968–1971).
+    let f = MessageFormatter::for_model("qwen3_vl").unwrap();
+    let opts = FormatOpts {
+      role: "user".to_string(),
+      video: vec!["a.mp4".to_string(), "b.mp4".to_string()],
+      fps: vec![2, 3],
+      ..FormatOpts::formatter_default()
+    };
+    let it = items(&f.format_message("cap", &opts).unwrap());
+    match (&it[0], &it[1]) {
+      (ContentItem::Video { fps: f0, .. }, ContentItem::Video { fps: f1, .. }) => {
+        assert_eq!(*f0, 2);
+        assert_eq!(*f1, 3);
+      }
+      _ => panic!("expected two Video items"),
+    }
+  }
+
+  #[test]
+  fn video_message_fps_length_mismatch() {
+    // fps.len() neither 1 nor video.len() → LengthMismatch (lines 1972–1979).
+    let f = MessageFormatter::for_model("qwen2_vl").unwrap();
+    let opts = FormatOpts {
+      role: "user".to_string(),
+      video: vec![
+        "a.mp4".to_string(),
+        "b.mp4".to_string(),
+        "c.mp4".to_string(),
+      ],
+      fps: vec![1, 2],
+      ..FormatOpts::formatter_default()
+    };
+    let err = f.format_message("cap", &opts).unwrap_err();
+    assert!(matches!(err, Error::LengthMismatch(_)));
+    if let Error::LengthMismatch(p) = &err {
+      assert_eq!(p.expected(), 3);
+      assert_eq!(p.actual(), 2);
+    }
+  }
+
+  // (The empty-video EmptyInput guard at lines 1946–1948 is covered through
+  // the synthetic `VideoWithText` base-format arm in
+  // `video_with_text_base_format_arm` below, the only public surface that
+  // can reach `format_video_message` with an empty video list — the video
+  // special-case route short-circuits on an empty list.)
+
+  // ── format_list_with_image: assistant / skip gates (else-0 branch) ──────
+
+  #[test]
+  fn list_with_image_assistant_role_no_images() {
+    // role != "user" → effective_n = 0 (the else branch at ~1626): just text.
+    let f = MessageFormatter::for_model("qwen2_vl").unwrap();
+    let it = items(
+      &f.format_message("hi", &opts_with("assistant", 3, 0))
+        .unwrap(),
+    );
+    assert_eq!(
+      it,
+      vec![ContentItem::Text {
+        text: "hi".to_string()
+      }]
+    );
+  }
+
+  #[test]
+  fn list_with_image_skip_image_token() {
+    // skip_image_token=true → effective_n = 0.
+    let f = MessageFormatter::for_model("qwen2_vl").unwrap();
+    let opts = FormatOpts {
+      role: "user".to_string(),
+      num_images: 3,
+      skip_image_token: true,
+      ..FormatOpts::formatter_default()
+    };
+    let it = items(&f.format_message("hi", &opts).unwrap());
+    assert_eq!(
+      it,
+      vec![ContentItem::Text {
+        text: "hi".to_string()
+      }]
+    );
+  }
+
+  // ── format_list_with_image_type: assistant collapse + else-0 gates ──────
+  //
+  // assistant role → collapse-to-string fast path (lines 1687–1695).
+
+  #[test]
+  fn list_with_image_type_assistant_collapse() {
+    let f = MessageFormatter::for_model("internvl_chat").unwrap();
+    let out = f
+      .format_message("hi", &opts_with("assistant", 2, 2))
+      .unwrap();
+    assert_eq!(out, text_content_msg("assistant", "hi"));
+  }
+
+  // System role (neither user nor assistant): image/audio gates → 0
+  // (lines 1702, 1708 else branches). Content built with just the text msg.
+  #[test]
+  fn list_with_image_type_system_role_no_media() {
+    let f = MessageFormatter::for_model("internvl_chat").unwrap();
+    let it = items(&f.format_message("sys", &opts_with("system", 5, 5)).unwrap());
+    // Not user → n_img=0, n_aud=0 → [content_text] only.
+    assert_eq!(
+      it,
+      vec![ContentItem::ContentText {
+        text: "sys".to_string()
+      }]
+    );
+  }
+
+  // ListWithImageType with image LAST + audio (text_first path, lines
+  // 1731–1745). ListWithImageTypeTextImageLast is declared but no model
+  // maps to it; we still cover the text-first (image-last) ordering + audio
+  // loop through ListWithImageType by using num_images>0 with image_first
+  // true is image-first; to hit the text-first-then-images branch we use a
+  // 0-image + audio case so `text_first` is true and the audio loop runs.
+  #[test]
+  fn list_with_image_type_text_first_with_audio() {
+    let f = MessageFormatter::for_model("internvl_chat").unwrap();
+    // image_first is true for ListWithImageType, but n_img==0 forces
+    // text_first=true (line 1731), so [content_text, audio, audio].
+    let it = items(&f.format_message("hi", &opts_with("user", 0, 2)).unwrap());
+    assert_eq!(
+      it,
+      vec![
+        ContentItem::ContentText {
+          text: "hi".to_string()
+        },
+        ContentItem::Audio,
+        ContentItem::Audio,
+      ]
+    );
+  }
+
+  // ── format_with_token: else-0 audio gate + audio prefix loop ────────────
+  //
+  // ImageToken format ("<image>", image_first). With audio, the audio prefix
+  // `<|audio_i|>` is emitted FIRST (line 1835 loop), then image tokens, then
+  // prompt.
+
+  #[test]
+  fn with_token_audio_prefix_then_images() {
+    let f = MessageFormatter::for_model("minicpmo").unwrap();
+    // minicpmo is single-image-only; use 1 image + 2 audios.
+    let s = text_content(&f.format_message("hi", &opts_with("user", 1, 2)).unwrap());
+    assert_eq!(s, "<|audio_1|><|audio_2|><image>hi");
+  }
+
+  #[test]
+  fn with_token_assistant_no_media() {
+    // assistant role → n_img=0, n_aud=0 (else branches incl. line 1782):
+    // bare prompt, no tokens.
+    let f = MessageFormatter::for_model("jina_vlm").unwrap();
+    let s = text_content(
+      &f.format_message("hi", &opts_with("assistant", 3, 3))
+        .unwrap(),
+    );
+    assert_eq!(s, "hi");
+  }
+
+  #[test]
+  fn with_token_skip_audio_only() {
+    // skip_audio_token=true → n_aud=0 (else branch at line 1782), images
+    // still emitted.
+    let f = MessageFormatter::for_model("minicpmo").unwrap();
+    let opts = FormatOpts {
+      role: "user".to_string(),
+      num_images: 1,
+      num_audios: 3,
+      skip_audio_token: true,
+      ..FormatOpts::formatter_default()
+    };
+    let s = text_content(&f.format_message("hi", &opts).unwrap());
+    assert_eq!(s, "<image>hi");
+  }
+
+  // ── format_numbered_tokens: else-0 gates (lines 1868, 1874) ─────────────
+
+  #[test]
+  fn numbered_tokens_assistant_no_media() {
+    let f = MessageFormatter::for_model("phi3_v").unwrap();
+    let s = text_content(
+      &f.format_message("hi", &opts_with("assistant", 3, 3))
+        .unwrap(),
+    );
+    assert_eq!(s, "hi");
+  }
+
+  #[test]
+  fn numbered_tokens_skip_image_keeps_audio() {
+    // skip_image_token → n_img=0 (line 1868 else), audio still numbered.
+    let f = MessageFormatter::for_model("phi4mm").unwrap();
+    let opts = FormatOpts {
+      role: "user".to_string(),
+      num_images: 3,
+      num_audios: 2,
+      skip_image_token: true,
+      ..FormatOpts::formatter_default()
+    };
+    let s = text_content(&f.format_message("hi", &opts).unwrap());
+    assert_eq!(s, "<|audio_1|><|audio_2|>hi");
+  }
+
+  // ── check_format_count cap (CapExceeded) via format_message ─────────────
+  //
+  // num_images above MAX_MESSAGE_FORMAT_ITEMS → CapExceeded. Use a model
+  // NOT in SINGLE_IMAGE_ONLY (qwen2_vl) so the single-image guard does not
+  // pre-empt the cap check.
+
+  #[test]
+  fn format_count_cap_exceeded() {
+    let f = MessageFormatter::for_model("qwen2_vl").unwrap();
+    let opts = opts_with("user", MAX_MESSAGE_FORMAT_ITEMS + 1, 0);
+    let err = f.format_message("hi", &opts).unwrap_err();
+    assert!(matches!(err, Error::CapExceeded(_)));
+    if let Error::CapExceeded(p) = &err {
+      assert_eq!(p.cap(), MAX_MESSAGE_FORMAT_ITEMS as u64);
+      assert_eq!(p.observed(), (MAX_MESSAGE_FORMAT_ITEMS + 1) as u64);
+      assert_eq!(p.cap_name(), "MAX_MESSAGE_FORMAT_ITEMS");
+    }
+  }
+
+  // At exactly the cap it must NOT error (boundary). Use a small prompt so
+  // the 1025-element content Vec is a cheap allocation.
+  #[test]
+  fn format_count_at_cap_ok() {
+    assert!(check_format_count(MAX_MESSAGE_FORMAT_ITEMS, "num_images", "m").is_ok());
+    assert!(check_format_count(MAX_MESSAGE_FORMAT_ITEMS + 1, "num_images", "m").is_err());
+  }
+
+  // ── format_prompt_with_start_image_token (lines 1571–1599) ──────────────
+  //
+  // No model in MODEL_CONFIG maps to PromptWithStartImageToken, so it cannot
+  // be reached through `format_message` dispatch. The helper is private;
+  // we exercise its observable behavior through a hand-built formatter whose
+  // format_type we set to PromptWithStartImageToken (struct fields are pub).
+
+  #[test]
+  fn prompt_with_start_image_token_direct() {
+    let f = MessageFormatter {
+      model_name: "synthetic".to_string(),
+      format_type: MessageFormat::PromptWithStartImageToken,
+    };
+    let out = f.format_message("hi", &opts_with("user", 2, 0)).unwrap();
+    assert_eq!(
+      out,
+      FormattedMessage::String("hi<start_of_image><start_of_image>".to_string())
+    );
+    // Unconditional even for assistant.
+    let out = f
+      .format_message("hi", &opts_with("assistant", 1, 0))
+      .unwrap();
+    assert_eq!(
+      out,
+      FormattedMessage::String("hi<start_of_image>".to_string())
+    );
+  }
+
+  // ── ListWithImageTypeTextImageLast (lines 1489–1491) ────────────────────
+  //
+  // Also unreachable via MODEL_CONFIG; drive through a synthetic formatter.
+  // image_first=false → text first, then images, then audio.
+
+  #[test]
+  fn list_with_image_type_text_image_last_direct() {
+    let f = MessageFormatter {
+      model_name: "synthetic".to_string(),
+      format_type: MessageFormat::ListWithImageTypeTextImageLast,
+    };
+    let it = items(&f.format_message("hi", &opts_with("user", 2, 1)).unwrap());
+    // text_message (Text kind), image LAST, then audio.
+    assert_eq!(
+      it,
+      vec![
+        ContentItem::Text {
+          text: "hi".to_string()
+        },
+        ContentItem::Image,
+        ContentItem::Image,
+        ContentItem::Audio,
+      ]
+    );
+  }
+
+  // ── VideoWithText as the base format_type (line 1504) ───────────────────
+  //
+  // Reach the explicit `MessageFormat::VideoWithText => format_video_message`
+  // dispatch arm (line 1504), distinct from the video special-case route
+  // (lines 1470–1476). Built synthetically since no model maps to it. Also
+  // covers the EmptyInput guard (lines 1946–1948) directly via this arm.
+
+  #[test]
+  fn video_with_text_base_format_arm() {
+    let f = MessageFormatter {
+      model_name: "synthetic".to_string(),
+      format_type: MessageFormat::VideoWithText,
+    };
+    // Non-empty video → one Video + trailing text.
+    let opts = FormatOpts {
+      role: "user".to_string(),
+      video: vec!["v.mp4".to_string()],
+      fps: vec![4],
+      max_pixels: 64,
+      ..FormatOpts::formatter_default()
+    };
+    let it = items(&f.format_message("cap", &opts).unwrap());
+    assert_eq!(
+      it,
+      vec![
+        ContentItem::Video {
+          video: "v.mp4".to_string(),
+          max_pixels: 64,
+          fps: 4,
+        },
+        ContentItem::Text {
+          text: "cap".to_string()
+        },
+      ]
+    );
+
+    // Empty video through the VideoWithText arm → EmptyInput (lines 1946–1948).
+    let empty = FormatOpts {
+      role: "user".to_string(),
+      video: Vec::new(),
+      ..FormatOpts::formatter_default()
+    };
+    let err = f.format_message("cap", &empty).unwrap_err();
+    assert!(matches!(err, Error::EmptyInput(_)));
+    if let Error::EmptyInput(p) = &err {
+      assert!(p.context().contains("format_video_message"));
+    }
+  }
+
+  // ── get_message_json: None opts → public-API defaults (0 images) ────────
+
+  #[test]
+  fn get_message_json_default_text_only() {
+    // qwen2_vl + None → num_images=0 → content == [text] only.
+    let out = get_message_json("qwen2_vl", "hi", None).unwrap();
+    let it = items(&out);
+    assert_eq!(
+      it,
+      vec![ContentItem::Text {
+        text: "hi".to_string()
+      }]
+    );
+  }
+
+  #[test]
+  fn get_message_json_explicit_opts_and_unknown_model() {
+    // Explicit opts with 1 image → image appears.
+    let opts = opts_with("user", 1, 0);
+    let out = get_message_json("qwen2_vl", "hi", Some(&opts)).unwrap();
+    assert_eq!(
+      items(&out),
+      vec![
+        ContentItem::Text {
+          text: "hi".to_string()
+        },
+        ContentItem::Image,
+      ]
+    );
+    // Unknown model propagates MissingKey.
+    let err = get_message_json("does_not_exist", "hi", None).unwrap_err();
+    assert!(matches!(err, Error::MissingKey(_)));
+  }
+
+  // Helper: an assistant collapse-to-string expectation.
+  fn text_content_msg(role: &str, text: &str) -> FormattedMessage {
+    FormattedMessage::Message(Message {
+      role: role.to_string(),
+      content: MessageContent::Text(text.to_string()),
+    })
+  }
+
+  // ── const-table sort invariants ─────────────────────────────────────────
+  //
+  // `for_model` (binary_search_by over MODEL_CONFIG) and `format_message`
+  // (binary_search over SINGLE_IMAGE_ONLY_MODELS and VIDEO_FORMAT_MODELS) all
+  // assume their tables are sorted lexicographically by key. An unsorted
+  // insertion in a future edit would silently break those lookups (a present
+  // model would `Err(MissingKey)` / a single-image model would skip its
+  // guard) WITHOUT a compile error. Pin the invariant with a closed-form
+  // monotonicity check (independent of the production binary-search code).
+
+  #[test]
+  fn model_config_keys_strictly_sorted_and_unique() {
+    for pair in MODEL_CONFIG.windows(2) {
+      let (a, _) = pair[0];
+      let (b, _) = pair[1];
+      assert!(
+        a < b,
+        "MODEL_CONFIG must be strictly ascending for binary_search_by: {a:?} !< {b:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn single_image_only_models_strictly_sorted_and_unique() {
+    for pair in SINGLE_IMAGE_ONLY_MODELS.windows(2) {
+      assert!(
+        pair[0] < pair[1],
+        "SINGLE_IMAGE_ONLY_MODELS must be strictly ascending for binary_search: \
+         {:?} !< {:?}",
+        pair[0],
+        pair[1]
+      );
+    }
+  }
+
+  #[test]
+  fn video_format_models_strictly_sorted_and_unique() {
+    for pair in VIDEO_FORMAT_MODELS.windows(2) {
+      assert!(
+        pair[0] < pair[1],
+        "VIDEO_FORMAT_MODELS must be strictly ascending for binary_search: {:?} !< {:?}",
+        pair[0],
+        pair[1]
+      );
+    }
+  }
+
+  // Every MODEL_CONFIG key must resolve through `for_model` to the table's
+  // declared format (round-trips the binary_search lookup against the
+  // independently-iterated table; also confirms lowercased keys are
+  // already-lowercase so `to_lowercase()` is a no-op for the canonical
+  // entries).
+  #[test]
+  fn model_config_every_key_resolves() {
+    for &(key, fmt) in MODEL_CONFIG {
+      let f = MessageFormatter::for_model(key).unwrap();
+      assert_eq!(f.format_type, fmt, "for_model({key:?}) format mismatch");
+      assert_eq!(
+        f.model_name, key,
+        "for_model({key:?}) should lowercase to itself"
+      );
+    }
+  }
+
+  // Every SINGLE_IMAGE_ONLY_MODELS entry that is ALSO in MODEL_CONFIG must
+  // reject num_images>1 (the guard at format_message lines 1452–1463). This
+  // exercises the guard against the actual allow-list rather than a single
+  // hand-picked model.
+  #[test]
+  fn single_image_only_models_reject_multi_image() {
+    for &model in SINGLE_IMAGE_ONLY_MODELS {
+      // Only those present in MODEL_CONFIG are constructible via for_model.
+      if let Ok(f) = MessageFormatter::for_model(model) {
+        let err = f
+          .format_message("hi", &opts_with("user", 2, 0))
+          .unwrap_err();
+        assert!(
+          matches!(err, Error::OutOfRange(_)),
+          "model {model:?} should reject num_images=2, got {err:?}"
+        );
+      }
+    }
+  }
+
+  // ── MESSAGE_FORMAT_VARIANTS ↔ as_str round-trip (no two tags collide) ───
+  //
+  // Independent of `message_format_as_str_all_variants` (which checks fixed
+  // expected strings): here we assert the 15 tags are pairwise-distinct, so
+  // the snake_case mapping is injective (a duplicated tag would make two
+  // formats indistinguishable to a string-driven chat-template renderer).
+  #[test]
+  fn message_format_tags_are_pairwise_distinct() {
+    let tags: Vec<&'static str> = MESSAGE_FORMAT_VARIANTS.iter().map(|f| f.as_str()).collect();
+    for i in 0..tags.len() {
+      for j in (i + 1)..tags.len() {
+        assert_ne!(
+          tags[i], tags[j],
+          "duplicate MessageFormat tag {:?}",
+          tags[i]
+        );
+      }
+    }
+  }
+
+  // ── locate_image_tokens: adjacent-run collapse contract (closed-form) ────
+  //
+  // The module doc states adjacent multi-image placeholders collapse into a
+  // single contiguous run; a single non-marker token between two marker runs
+  // splits them. Hand-written oracle, byte-exact spans.
+  #[test]
+  fn locate_image_tokens_collapse_and_split() {
+    // Two runs separated by one text token (split into two spans).
+    assert_eq!(
+      locate_image_tokens(&[5, 9, 9, 5, 9, 5], 9),
+      vec![(1, 3), (4, 5)]
+    );
+    // A contiguous block of 4 markers is ONE run (collapse), even though it
+    // could represent several images post-tokenization.
+    assert_eq!(locate_image_tokens(&[9, 9, 9, 9], 9), vec![(0, 4)]);
+  }
+
+  // ── build_multimodal_mask: span end == seq_len is in-bounds (boundary) ──
+  //
+  // The end-vs-seq_len check is strict (`e > seq_len` errors), so a span
+  // whose end equals seq_len is valid. Closed-form oracle over the resulting
+  // mask (block_id = [0, 1, 1] for span (1,3) in seq_len=3).
+  #[test]
+  fn mask_span_end_equals_seq_len_is_valid() {
+    let mut mask = build_multimodal_mask(3, &[(1, 3)]).unwrap();
+    assert_eq!(mask.shape(), vec![1, 1, 3, 3]);
+    let v = mask.to_vec::<bool>().unwrap();
+    let block = [0u32, 1, 1];
+    for q in 0..3usize {
+      for k in 0..3usize {
+        let causal = k <= q;
+        let same_img = block[q] != 0 && block[q] == block[k];
+        assert_eq!(v[q * 3 + k], causal || same_img, "mask[{q}][{k}]");
+      }
+    }
+  }
+
+  // ── format_list_with_image: image-first model in a NON-user role ────────
+  //
+  // Distinct from `list_with_image_assistant_role_no_images` (which uses an
+  // image_first=FALSE model, qwen2_vl). Here an image_first=TRUE model
+  // (qwen2_5_vl) in the assistant role takes the `effective_n == 0` →
+  // text_first short-circuit (line 1636 `!image_first || effective_n == 0`),
+  // emitting only the text item with no trailing image push.
+  #[test]
+  fn list_with_image_first_assistant_role_text_only() {
+    let f = MessageFormatter::for_model("qwen2_5_vl").unwrap();
+    let it = items(
+      &f.format_message("hi", &opts_with("assistant", 4, 0))
+        .unwrap(),
+    );
+    assert_eq!(
+      it,
+      vec![ContentItem::Text {
+        text: "hi".to_string()
+      }]
+    );
+  }
+
+  // ── get_message_json: String branch (PromptOnly) via the top-level helper ─
+  //
+  // The existing get_message_json tests only reach the Items branch. Route a
+  // PromptOnly model (florence2) through get_message_json with explicit opts
+  // to cover the FormattedMessage::String return flowing back through the
+  // free function.
+  #[test]
+  fn get_message_json_prompt_only_string_branch() {
+    let opts = opts_with("user", 1, 0);
+    let out = get_message_json("florence2", "describe", Some(&opts)).unwrap();
+    assert_eq!(out, FormattedMessage::String("describe".to_string()));
+  }
+}

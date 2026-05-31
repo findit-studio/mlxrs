@@ -328,6 +328,131 @@ mod tests {
     assert!(res.is_err(), "with_learning_rate must reject Fixed(NaN)");
   }
 
+  // ── Config getters echo constructor inputs ────────────────────────────────
+
+  #[test]
+  fn lion_getters_echo_inputs() -> Result<()> {
+    // Distinct non-default values so every getter is observably distinct.
+    // Covers `learning_rate_ref`, `betas`, `weight_decay`, plus the trait
+    // `step()` / `learning_rate()` on a fresh optimizer.
+    let lion = Lion::new(LearningRate::Fixed(0.02), (0.8, 0.95), 0.05)?;
+    assert!(
+      lion.learning_rate_ref().is_fixed(),
+      "learning_rate_ref must echo the Fixed schedule"
+    );
+    assert_eq!(lion.betas(), (0.8, 0.95));
+    assert_eq!(lion.weight_decay(), 0.05);
+    assert_eq!(lion.learning_rate(), 0.02);
+    assert_eq!(lion.step(), 0);
+    Ok(())
+  }
+
+  #[test]
+  fn lion_default_with_lr_getters() -> Result<()> {
+    // Exercises the Python-default getter values.
+    let lion = Lion::default_with_lr(0.001)?;
+    assert_eq!(lion.betas(), (0.9, 0.99));
+    assert_eq!(lion.weight_decay(), 0.0);
+    assert!(lion.learning_rate_ref().is_fixed());
+    Ok(())
+  }
+
+  // ── Builder success paths (echo the set value) ────────────────────────────
+
+  #[test]
+  fn lion_builder_success_paths_echo() -> Result<()> {
+    // Each `with_*` success arm must echo its input. `with_learning_rate`'s
+    // success arm resolves the fixed value at step 0.
+    let lion = Lion::default_with_lr(0.001)?
+      .with_learning_rate(LearningRate::Fixed(0.05))?
+      .with_betas((0.7, 0.95))?
+      .with_weight_decay(0.2)?;
+    assert_eq!(lion.learning_rate(), 0.05);
+    assert!(lion.learning_rate_ref().is_fixed());
+    assert_eq!(lion.betas(), (0.7, 0.95));
+    assert_eq!(lion.weight_decay(), 0.2);
+    Ok(())
+  }
+
+  // ── Two-step apply: preflight re-resolution + trait step()/learning_rate() ─
+
+  #[test]
+  fn lion_two_steps_preflight_re_resolves() -> Result<()> {
+    // First apply hits preflight's step-0 cache (stamped by `new`); the second
+    // apply lands at step_count=1 with the stamp still Some(0), so `preflight`
+    // re-resolves the fixed LR via its non-cache body. Also covers the trait
+    // `init`, `step()`, and `learning_rate()`.
+    let mut lion = Lion::default_with_lr(0.001)?;
+    let mut params: Weights = HashMap::new();
+    params.insert("w".into(), scalar(1.0)?);
+    let mut grads: Weights = HashMap::new();
+    grads.insert("w".into(), scalar(0.5)?);
+    lion.init(&params)?;
+    assert_eq!(lion.step(), 0);
+    lion.apply_gradients(&grads, &mut params)?;
+    let after_one = read_scalar(&params["w"])?;
+    assert_eq!(lion.step(), 1);
+    lion.apply_gradients(&grads, &mut params)?;
+    let after_two = read_scalar(&params["w"])?;
+    assert_eq!(lion.step(), 2);
+    assert_eq!(lion.learning_rate(), 0.001);
+    // Constant positive grad ⇒ sign(c) = +1 each step ⇒ weight keeps shrinking.
+    assert!(after_two < after_one, "weight should keep decreasing");
+    Ok(())
+  }
+
+  // ── None-state arm + skip-absent-grad-key ─────────────────────────────────
+
+  #[test]
+  fn lion_step_none_state_arm_via_uninit_grad_key() -> Result<()> {
+    // The per-key `None` momentum arm (no prior `m` for the key) is reached
+    // when a grad key was NOT pre-initialized: explicit `init` with a SUBSET
+    // of params, then `apply_gradients` with an extra present grad key that
+    // hits `None => zeros_like(param)` — equivalent to a fresh moment, so the
+    // single-step closed form applies.
+    //   w=1.0, g=0.5, lr=0.001, m=0 ⇒ c = (1-β₁)·g > 0 ⇒ sign(c)=1;
+    //   w_new = w - lr·1 = 0.999.
+    let mut lion = Lion::default_with_lr(0.001)?;
+    let mut init_params: Weights = HashMap::new();
+    init_params.insert("a".into(), scalar(1.0)?);
+    lion.init(&init_params)?;
+    assert!(
+      !lion.state.is_empty(),
+      "explicit init populated state for 'a'"
+    );
+    let mut params: Weights = HashMap::new();
+    params.insert("a".into(), scalar(1.0)?);
+    params.insert("b".into(), scalar(1.0)?);
+    let mut grads: Weights = HashMap::new();
+    grads.insert("a".into(), scalar(0.5)?);
+    grads.insert("b".into(), scalar(0.5)?);
+    lion.apply_gradients(&grads, &mut params)?;
+    let got_b = read_scalar(&params["b"])?;
+    assert!((got_b - 0.999).abs() < 1e-5, "b got {got_b}");
+    Ok(())
+  }
+
+  #[test]
+  fn lion_skips_grad_key_absent_from_params() -> Result<()> {
+    // A gradient whose key has no matching parameter must be skipped (the
+    // `let Some(param) = params.get(key) else { continue }` guard), leaving
+    // the present parameter updated and the absent one never materialized.
+    let mut lion = Lion::default_with_lr(0.001)?;
+    let mut params: Weights = HashMap::new();
+    params.insert("present".into(), scalar(1.0)?);
+    let mut grads: Weights = HashMap::new();
+    grads.insert("present".into(), scalar(0.5)?);
+    grads.insert("absent".into(), scalar(0.5)?);
+    lion.apply_gradients(&grads, &mut params)?;
+    let got = read_scalar(&params["present"])?;
+    assert!((got - 0.999).abs() < 1e-5, "present got {got}");
+    assert!(
+      !params.contains_key("absent"),
+      "absent grad must not be added to params"
+    );
+    Ok(())
+  }
+
   #[test]
   fn lion_with_weight_decay_applies_before_sign_step() -> Result<()> {
     // Python: w = (1 - lr·wd)·w then w_new = w - lr·sign(c).

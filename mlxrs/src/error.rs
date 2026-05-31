@@ -3216,3 +3216,696 @@ mod init_smoke {
     );
   }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Pure payload / Display / accessor coverage. Every test here is MLX-free
+// (constructs payloads + the std-only `check*` failure paths directly), so it
+// runs without a backend. Oracles are hand-computed from the constructor
+// inputs — never by calling the thing under test to produce the expected.
+// ────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod pure_payload_tests {
+  use super::*;
+  use std::io::{Error as IoError, ErrorKind};
+
+  // ── FileOp Display: every arm ──────────────────────────────────────────
+  #[test]
+  fn file_op_display_all_arms() {
+    assert_eq!(FileOp::Create.to_string(), "create");
+    assert_eq!(FileOp::Write.to_string(), "write");
+    assert_eq!(FileOp::Flush.to_string(), "flush");
+    assert_eq!(FileOp::Read.to_string(), "read");
+    assert_eq!(FileOp::Open.to_string(), "open");
+    assert_eq!(FileOp::Stat.to_string(), "stat");
+    assert_eq!(FileOp::Copy.to_string(), "copy");
+    assert_eq!(FileOp::Remove.to_string(), "remove");
+    assert_eq!(FileOp::Rename.to_string(), "rename");
+    assert_eq!(FileOp::Fsync.to_string(), "fsync");
+    assert_eq!(FileOp::Other("symlink").to_string(), "symlink");
+  }
+
+  // ── DtypeMismatchPayload: accessors + Display + the enum-variant Display ─
+  #[test]
+  fn dtype_mismatch_payload() {
+    let p = DtypeMismatchPayload::new(Dtype::F32, Dtype::I32);
+    assert_eq!(p.expected(), Dtype::F32);
+    assert_eq!(p.got(), Dtype::I32);
+    // Display uses `{:?}` (Debug) on the dtypes => variant names F32 / I32.
+    assert_eq!(p.to_string(), "expected F32, got I32");
+    // The enum-level `#[error(...)]` arm prefixes "dtype mismatch: ".
+    let e = Error::DtypeMismatch(p);
+    assert_eq!(e.to_string(), "dtype mismatch: expected F32, got I32");
+  }
+
+  // ── FfiNullHandlePayload: new + fn_name + Display ──────────────────────
+  #[test]
+  fn ffi_null_handle_payload() {
+    let p = FfiNullHandlePayload::new("mlx_array_new_float32");
+    assert_eq!(p.fn_name(), "mlx_array_new_float32");
+    assert_eq!(
+      p.to_string(),
+      "FFI: mlx_array_new_float32 returned NULL handle"
+    );
+    assert_eq!(
+      Error::FfiNullHandle(p).to_string(),
+      "FFI: mlx_array_new_float32 returned NULL handle"
+    );
+  }
+
+  // ── MissingFieldPayload: accessors + Display ───────────────────────────
+  #[test]
+  fn missing_field_payload() {
+    let p = MissingFieldPayload::new("SentencePieceTokenizer", "model.unk_id");
+    assert_eq!(p.type_name(), "SentencePieceTokenizer");
+    assert_eq!(p.field(), "model.unk_id");
+    assert_eq!(
+      p.to_string(),
+      "SentencePieceTokenizer: missing required field `model.unk_id`"
+    );
+  }
+
+  // ── ArithmeticOverflowPayload: BOTH Display branches + accessors ───────
+  #[test]
+  fn arithmetic_overflow_no_operands() {
+    let p = ArithmeticOverflowPayload::new("vocab_size_base + added", "u32");
+    assert_eq!(p.context(), "vocab_size_base + added");
+    assert_eq!(p.op_type(), "u32");
+    assert!(p.operands().is_empty());
+    // Empty-operands branch.
+    assert_eq!(p.to_string(), "vocab_size_base + added: overflow (u32)");
+  }
+
+  #[test]
+  fn arithmetic_overflow_with_operands() {
+    let p =
+      ArithmeticOverflowPayload::with_operands("a * b", "usize", [("a", 1u64 << 32), ("b", 4u64)]);
+    assert_eq!(p.context(), "a * b");
+    assert_eq!(p.op_type(), "usize");
+    assert_eq!(p.operands(), &[("a", 1u64 << 32), ("b", 4u64)]);
+    // Non-empty branch: header, then " ", then comma-joined name=value pairs.
+    assert_eq!(
+      p.to_string(),
+      "a * b: overflow (usize) with operands a=4294967296, b=4"
+    );
+  }
+
+  // ── EmptyInputPayload: accessor + Display ──────────────────────────────
+  #[test]
+  fn empty_input_payload() {
+    let p = EmptyInputPayload::new("value_and_grad: argnums");
+    assert_eq!(p.context(), "value_and_grad: argnums");
+    assert_eq!(
+      p.to_string(),
+      "value_and_grad: argnums is empty (at least one element required)"
+    );
+  }
+
+  // ── InvariantViolationPayload: accessors + Display ─────────────────────
+  #[test]
+  fn invariant_violation_payload() {
+    let p = InvariantViolationPayload::new("train: steps_per_eval", "must be >= 1");
+    assert_eq!(p.context(), "train: steps_per_eval");
+    assert_eq!(p.requirement(), "must be >= 1");
+    assert_eq!(p.to_string(), "backend: train: steps_per_eval must be >= 1");
+  }
+
+  // ── RankMismatchPayload: accessors + Display ───────────────────────────
+  #[test]
+  fn rank_mismatch_payload() {
+    let p = RankMismatchPayload::new("token_embeddings must be rank-3", 2, vec![4, 8]);
+    assert_eq!(p.context(), "token_embeddings must be rank-3");
+    assert_eq!(p.actual(), 2);
+    assert_eq!(p.actual_shape(), &[4usize, 8]);
+    assert_eq!(
+      p.to_string(),
+      "shape mismatch: token_embeddings must be rank-3: got rank 2 (shape [4, 8])"
+    );
+  }
+
+  // ── LengthMismatchPayload: accessors + Display ─────────────────────────
+  #[test]
+  fn length_mismatch_payload() {
+    let p = LengthMismatchPayload::new("pad: axes vs low/high", 3, 2);
+    assert_eq!(p.context(), "pad: axes vs low/high");
+    assert_eq!(p.expected(), 3);
+    assert_eq!(p.actual(), 2);
+    assert_eq!(
+      p.to_string(),
+      "shape mismatch: pad: axes vs low/high: expected length 3, got 2"
+    );
+  }
+
+  // ── OutOfRangePayload: accessors + Display ─────────────────────────────
+  #[test]
+  fn out_of_range_payload() {
+    let p = OutOfRangePayload::new("top_k: parameter", "must be in (0, vocab_size)", "1024");
+    assert_eq!(p.context(), "top_k: parameter");
+    assert_eq!(p.requirement(), "must be in (0, vocab_size)");
+    assert_eq!(p.value(), "1024");
+    assert_eq!(
+      p.to_string(),
+      "shape mismatch: top_k: parameter: must be in (0, vocab_size), got 1024"
+    );
+  }
+
+  // ── FileIoPayload: accessors + Display + source() ──────────────────────
+  #[test]
+  fn file_io_payload() {
+    let inner = IoError::new(ErrorKind::NotFound, "no such file");
+    let p = FileIoPayload::new(
+      "load_audio",
+      FileOp::Read,
+      PathBuf::from("/tmp/a.wav"),
+      inner,
+    );
+    assert_eq!(p.context(), "load_audio");
+    assert_eq!(p.op(), FileOp::Read);
+    assert_eq!(p.path(), std::path::Path::new("/tmp/a.wav"));
+    // inner Display of an io::Error::new(kind, msg) is exactly `msg`.
+    assert_eq!(p.inner().to_string(), "no such file");
+    assert_eq!(
+      p.to_string(),
+      "io: load_audio: read /tmp/a.wav: no such file"
+    );
+    // source() returns the inner io::Error.
+    let src = std::error::Error::source(&p).expect("source present");
+    assert_eq!(src.to_string(), "no such file");
+  }
+
+  // ── MultiLengthMismatchPayload: accessor + Display (also covers
+  //    MultiLengthsFmt's both branches: first + subsequent ", " join) ─────
+  #[test]
+  fn multi_length_mismatch_payload() {
+    let lengths = vec![("axes", 3usize), ("low", 2), ("high", 3)];
+    let p = MultiLengthMismatchPayload::new("pad: axes/low/high", lengths.clone());
+    assert_eq!(p.context(), "pad: axes/low/high");
+    assert_eq!(p.lengths(), lengths.as_slice());
+    assert_eq!(
+      p.to_string(),
+      "shape mismatch: pad: axes/low/high: length mismatch — axes=3, low=2, high=3"
+    );
+  }
+
+  #[test]
+  fn multi_length_mismatch_single_entry_no_separator() {
+    // Single entry exercises the `first == true` branch with no ", ".
+    let p = MultiLengthMismatchPayload::new("x", vec![("only", 7usize)]);
+    assert_eq!(p.to_string(), "shape mismatch: x: length mismatch — only=7");
+  }
+
+  // ── MlxOpKind Display: every statically-known arm + Other ──────────────
+  #[test]
+  fn mlx_op_kind_display_all_arms() {
+    assert_eq!(MlxOpKind::Matmul.to_string(), "matmul");
+    assert_eq!(MlxOpKind::Reshape.to_string(), "reshape");
+    assert_eq!(MlxOpKind::Broadcast.to_string(), "broadcast");
+    assert_eq!(MlxOpKind::Shape.to_string(), "shape");
+    assert_eq!(MlxOpKind::Slice.to_string(), "slice");
+    assert_eq!(MlxOpKind::Concat.to_string(), "concat");
+    assert_eq!(MlxOpKind::Gather.to_string(), "gather");
+    assert_eq!(MlxOpKind::Scatter.to_string(), "scatter");
+    assert_eq!(MlxOpKind::Take.to_string(), "take");
+    assert_eq!(MlxOpKind::Fft.to_string(), "fft");
+    assert_eq!(MlxOpKind::Quantize.to_string(), "quantize");
+    assert_eq!(MlxOpKind::Dequantize.to_string(), "dequantize");
+    assert_eq!(MlxOpKind::Conv.to_string(), "conv");
+    // Pool maps to the "reduce" label (not "pool").
+    assert_eq!(MlxOpKind::Pool.to_string(), "reduce");
+    assert_eq!(MlxOpKind::Eval.to_string(), "eval");
+    assert_eq!(MlxOpKind::Sort.to_string(), "sort");
+    assert_eq!(MlxOpKind::ArgSort.to_string(), "argsort");
+    assert_eq!(MlxOpKind::Norm.to_string(), "norm");
+    assert_eq!(MlxOpKind::Linalg.to_string(), "linalg");
+    assert_eq!(MlxOpKind::Random.to_string(), "random");
+    assert_eq!(MlxOpKind::Transform.to_string(), "transform");
+    assert_eq!(MlxOpKind::Elementwise.to_string(), "elementwise");
+    assert_eq!(MlxOpKind::System.to_string(), "system");
+    assert_eq!(MlxOpKind::Positional.to_string(), "positional");
+    assert_eq!(MlxOpKind::Distributed.to_string(), "distributed");
+    assert_eq!(MlxOpKind::Io.to_string(), "io");
+    assert_eq!(
+      MlxOpKind::Other(SmolStr::new("weird_op")).to_string(),
+      "weird_op"
+    );
+  }
+
+  // ── MlxOpPayload: accessors + Display ──────────────────────────────────
+  #[test]
+  fn mlx_op_payload() {
+    let p = MlxOpPayload::new(MlxOpKind::Reshape, "[reshape] Cannot reshape array");
+    assert_eq!(p.op(), &MlxOpKind::Reshape);
+    assert_eq!(p.message(), "[reshape] Cannot reshape array");
+    // Display => "mlx {op}: {message}".
+    assert_eq!(p.to_string(), "mlx reshape: [reshape] Cannot reshape array");
+    assert_eq!(
+      Error::MlxOp(p).to_string(),
+      "mlx reshape: [reshape] Cannot reshape array"
+    );
+  }
+
+  // ── MissingKeyPayload: accessors + Display ─────────────────────────────
+  #[test]
+  fn missing_key_payload() {
+    let p = MissingKeyPayload::new("dequantize_weights: missing .weight", "layers.0");
+    assert_eq!(p.context(), "dequantize_weights: missing .weight");
+    assert_eq!(p.key(), "layers.0");
+    assert_eq!(
+      p.to_string(),
+      "dequantize_weights: missing .weight: key `layers.0` not found"
+    );
+  }
+
+  // ── UnknownEnumValuePayload: accessors + Display ───────────────────────
+  #[test]
+  fn unknown_enum_value_payload() {
+    let supported: &'static [&'static str] = &["mean", "max"];
+    let p = UnknownEnumValuePayload::new("PoolingStrategy", "median", supported);
+    assert_eq!(p.type_name(), "PoolingStrategy");
+    assert_eq!(p.value(), "median");
+    assert_eq!(p.supported(), supported);
+    // `{:?}` on a &[&str] => `["mean", "max"]`.
+    assert_eq!(
+      p.to_string(),
+      r#"PoolingStrategy: unknown value `median` (supported: ["mean", "max"])"#
+    );
+  }
+
+  // ── NonFiniteScalarPayload: accessors + Display ────────────────────────
+  #[test]
+  fn non_finite_scalar_payload() {
+    let p = NonFiniteScalarPayload::new("LearningRate: resolved value at step 5", f64::INFINITY);
+    assert_eq!(p.context(), "LearningRate: resolved value at step 5");
+    assert!(p.value().is_infinite() && p.value() > 0.0);
+    // f64::INFINITY Displays as "inf".
+    assert_eq!(
+      p.to_string(),
+      "LearningRate: resolved value at step 5: value is non-finite (NaN or Inf): inf"
+    );
+  }
+
+  // ── KeyCollisionPayload: accessors + Display ───────────────────────────
+  #[test]
+  fn key_collision_payload() {
+    let p = KeyCollisionPayload::new("awq checkpoint", "qweight");
+    assert_eq!(p.context(), "awq checkpoint");
+    assert_eq!(p.key(), "qweight");
+    assert_eq!(p.to_string(), "awq checkpoint: key `qweight` collides");
+  }
+
+  // ── InteriorNulPayload: accessors + Display ────────────────────────────
+  #[test]
+  fn interior_nul_payload() {
+    let p = InteriorNulPayload::new("save_safetensors", "array key");
+    assert_eq!(p.context(), "save_safetensors");
+    assert_eq!(p.bytes_kind(), "array key");
+    assert_eq!(
+      p.to_string(),
+      "save_safetensors: array key contains an interior NUL byte"
+    );
+  }
+
+  // ── CapExceededPayload: accessors + Display ────────────────────────────
+  #[test]
+  fn cap_exceeded_payload() {
+    let p = CapExceededPayload::new("decode_audio", "MAX_DECODED_SAMPLES", 1000, 4096);
+    assert_eq!(p.context(), "decode_audio");
+    assert_eq!(p.cap_name(), "MAX_DECODED_SAMPLES");
+    assert_eq!(p.cap(), 1000);
+    assert_eq!(p.observed(), 4096);
+    assert_eq!(
+      p.to_string(),
+      "decode_audio: observed 4096 exceeds cap MAX_DECODED_SAMPLES (1000)"
+    );
+  }
+
+  // ── ShapePairMismatchPayload: accessors + Display ──────────────────────
+  #[test]
+  fn shape_pair_mismatch_payload() {
+    let p = ShapePairMismatchPayload::new("attn", vec![2usize, 8, 64], vec![2usize, 4, 64]);
+    assert_eq!(p.context(), "attn");
+    assert_eq!(p.expected(), &[2usize, 8, 64]);
+    assert_eq!(p.actual(), &[2usize, 4, 64]);
+    assert_eq!(
+      p.to_string(),
+      "shape mismatch: attn: expected [2, 8, 64], got [2, 4, 64]"
+    );
+  }
+
+  // ── DivisibilityConstraintPayload: accessors + Display ─────────────────
+  #[test]
+  fn divisibility_constraint_payload() {
+    let p = DivisibilityConstraintPayload::new("awq", "in_features", 100, "group_size", 32);
+    assert_eq!(p.context(), "awq");
+    assert_eq!(p.name_dividend(), "in_features");
+    assert_eq!(p.name_divisor(), "group_size");
+    assert_eq!(p.dividend(), 100);
+    assert_eq!(p.divisor(), 32);
+    assert_eq!(
+      p.to_string(),
+      "awq: in_features (100) must be divisible by group_size (32)"
+    );
+  }
+
+  // ── UnsupportedDtypePayload: accessors + Display + enum-variant ────────
+  #[test]
+  fn unsupported_dtype_payload() {
+    let supported: &'static [Dtype] = &[Dtype::F32, Dtype::F16];
+    let p = UnsupportedDtypePayload::new("Adam: weights must be floating", Dtype::I32, supported);
+    assert_eq!(p.context(), "Adam: weights must be floating");
+    assert_eq!(p.dtype(), Dtype::I32);
+    assert_eq!(p.supported(), supported);
+    // `{:?}` on Dtype => variant name; on the slice => [F32, F16].
+    assert_eq!(
+      p.to_string(),
+      "Adam: weights must be floating: unsupported dtype I32 (supported: [F32, F16])"
+    );
+  }
+
+  // ── AllocFailurePayload: accessors + Display + source() ────────────────
+  #[test]
+  fn alloc_failure_payload() {
+    // Force a real TryReserveError (no public constructor exists).
+    let inner: TryReserveError = Vec::<u8>::new()
+      .try_reserve_exact(usize::MAX)
+      .expect_err("usize::MAX reservation must fail");
+    let inner_display = inner.to_string();
+    let p = AllocFailurePayload::new("decode_audio", "samples", 4096, inner);
+    assert_eq!(p.context(), "decode_audio");
+    assert_eq!(p.item(), "samples");
+    assert_eq!(p.count(), 4096);
+    // Display: "{context}: reservation for {count} {item} failed: {inner}".
+    // The inner TryReserveError text is not stable across toolchains, so
+    // assert the controlled prefix + that the inner Display is the suffix.
+    let s = p.to_string();
+    let controlled = s
+      .strip_suffix(&inner_display)
+      .expect("inner Display must be the message suffix");
+    assert_eq!(
+      controlled,
+      "decode_audio: reservation for 4096 samples failed: "
+    );
+    // source() returns the inner allocator error.
+    let src = std::error::Error::source(&p).expect("source present");
+    assert_eq!(src.to_string(), inner_display);
+    // inner() accessor returns the same error.
+    assert_eq!(p.inner().to_string(), inner_display);
+  }
+
+  // ── ParsePayload: accessors + Display + source() ───────────────────────
+  #[test]
+  fn parse_payload() {
+    let inner = IoError::new(ErrorKind::InvalidData, "bad json at line 3");
+    let p = ParsePayload::new("load_config", "JSON", inner);
+    assert_eq!(p.context(), "load_config");
+    assert_eq!(p.input_kind(), "JSON");
+    assert_eq!(p.inner().to_string(), "bad json at line 3");
+    assert_eq!(
+      p.to_string(),
+      "load_config: parse JSON failed: bad json at line 3"
+    );
+    let src = std::error::Error::source(&p).expect("source present");
+    assert_eq!(src.to_string(), "bad json at line 3");
+  }
+
+  // ── ExternalOpPayload: accessors + Display + source() ──────────────────
+  #[test]
+  fn external_op_payload() {
+    let inner = IoError::other("device busy");
+    let p = ExternalOpPayload::new("play_audio", "cpal stream", inner);
+    assert_eq!(p.context(), "play_audio");
+    assert_eq!(p.op_kind(), "cpal stream");
+    assert_eq!(p.inner().to_string(), "device busy");
+    assert_eq!(
+      p.to_string(),
+      "play_audio: external cpal stream failed: device busy"
+    );
+    let src = std::error::Error::source(&p).expect("source present");
+    assert_eq!(src.to_string(), "device busy");
+  }
+
+  // ── BoundedDecodePayload: accessors + Display ──────────────────────────
+  #[test]
+  fn bounded_decode_payload() {
+    let p = BoundedDecodePayload::new("decode_wav", 1024, 5000);
+    assert_eq!(p.context(), "decode_wav");
+    assert_eq!(p.cap(), 1024);
+    assert_eq!(p.observed(), 5000);
+    assert_eq!(
+      p.to_string(),
+      "decode_wav: decoder produced 5000 elements (cap 1024)"
+    );
+  }
+
+  // ── LayerKeyedPayload: accessors + Display + source() ──────────────────
+  #[test]
+  fn layer_keyed_payload() {
+    let inner = Error::OutOfMemory;
+    let p = LayerKeyedPayload::new("layers.3.attn", inner);
+    assert_eq!(p.layer(), "layers.3.attn");
+    // inner Display: Error::OutOfMemory => "out of memory".
+    assert_eq!(p.inner().to_string(), "out of memory");
+    assert_eq!(p.to_string(), "layer `layers.3.attn`: out of memory");
+    // source() returns the wrapped inner Error.
+    let src = std::error::Error::source(&p).expect("source present");
+    assert_eq!(src.to_string(), "out of memory");
+  }
+
+  // ── MalformedDataPayload: accessors + Display ──────────────────────────
+  #[test]
+  fn malformed_data_payload() {
+    let p = MalformedDataPayload::new("SentencePiece protobuf", "truncated length-delimited field");
+    assert_eq!(p.context(), "SentencePiece protobuf");
+    assert_eq!(p.detail(), "truncated length-delimited field");
+    assert_eq!(
+      p.to_string(),
+      "malformed data: SentencePiece protobuf: truncated length-delimited field"
+    );
+  }
+
+  // ── Message-only enum variants Display ─────────────────────────────────
+  #[test]
+  fn message_only_enum_variants_display() {
+    assert_eq!(
+      Error::UnknownDtype(99).to_string(),
+      "unknown dtype value from mlx: 99"
+    );
+    assert_eq!(Error::OutOfMemory.to_string(), "out of memory");
+    assert_eq!(
+      Error::NonContiguous.to_string(),
+      "array is not contiguous; M2 will add .contiguous() to materialize"
+    );
+    assert_eq!(Error::MlxC(SmolStr::new("boom")).to_string(), "mlx-c: boom");
+    assert_eq!(
+      Error::Backend("legacy".to_string()).to_string(),
+      "mlx backend: legacy"
+    );
+  }
+
+  // ── check(rc) fallback path: rc != 0 + empty TLS => MlxC(no-message) ────
+  #[test]
+  fn check_nonzero_rc_with_empty_tls_falls_back_to_mlxc() {
+    // Drain TLS first so no stale handler message rescues the fallback.
+    let _ = take_last();
+    let err = check(7).expect_err("non-zero rc must be an Err");
+    match err {
+      Error::MlxC(ref s) => assert_eq!(s.as_str(), "mlx returned 7 with no message"),
+      other => panic!("expected MlxC fallback, got {other:?}"),
+    }
+    // rc == 0 is the Ok path.
+    assert!(check(0).is_ok());
+  }
+
+  // ── check(rc) drains a handler-set TLS error (the non-fallback path) ────
+  #[test]
+  fn check_nonzero_rc_drains_tls_error() {
+    let _ = take_last();
+    set_last(Error::OutOfMemory);
+    let err = check(1).expect_err("non-zero rc must be an Err");
+    assert!(matches!(err, Error::OutOfMemory));
+    // TLS was drained by check().
+    assert!(take_last().is_none());
+  }
+
+  // ── check_handle: NULL ctx (Err) vs the empty-TLS fallback message ─────
+  #[test]
+  fn check_handle_null_ctx_falls_back() {
+    let _ = take_last();
+    let handle = mlxrs_sys::mlx_array {
+      ctx: std::ptr::null_mut(),
+    };
+    let err = check_handle(handle).expect_err("null ctx handle must be an Err");
+    match err {
+      Error::MlxC(ref s) => assert_eq!(s.as_str(), "mlx returned null handle"),
+      other => panic!("expected MlxC fallback, got {other:?}"),
+    }
+  }
+
+  // ── check_vector_array_handle: NULL ctx (Err) fallback message ─────────
+  #[test]
+  fn check_vector_array_handle_null_ctx_falls_back() {
+    let _ = take_last();
+    let handle = mlxrs_sys::mlx_vector_array {
+      ctx: std::ptr::null_mut(),
+    };
+    let err = check_vector_array_handle(handle).expect_err("null ctx must be an Err");
+    match err {
+      Error::MlxC(ref s) => assert_eq!(s.as_str(), "mlx returned null vector_array handle"),
+      other => panic!("expected MlxC fallback, got {other:?}"),
+    }
+  }
+
+  // ── TLS helpers: set_last / take_last / last_error_message ─────────────
+  #[test]
+  fn tls_set_take_and_last_message() {
+    let _ = take_last();
+    assert!(last_error_message().is_none());
+    set_last(Error::MlxC(SmolStr::new("stashed")));
+    // last_error_message() reads (does NOT drain) and returns the Display.
+    assert_eq!(last_error_message().as_deref(), Some("mlx-c: stashed"));
+    // take_last() drains it.
+    let taken = take_last().expect("a stashed error");
+    assert_eq!(taken.to_string(), "mlx-c: stashed");
+    assert!(take_last().is_none());
+    assert!(last_error_message().is_none());
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Pure payload coverage for the `lm`-gated payload types. Same MLX-free
+// discipline; gated to match the payloads' own `#[cfg(feature = "lm")]`.
+// ────────────────────────────────────────────────────────────────────────────
+#[cfg(all(test, feature = "lm"))]
+mod pure_lm_payload_tests {
+  use super::*;
+  use std::io::{Error as IoError, ErrorKind};
+
+  // ── DurabilityWarningPayload: accessors + Display + source + into_source
+  #[test]
+  fn durability_warning_payload() {
+    let p = DurabilityWarningPayload::new(true, IoError::other("fsync failed"));
+    assert!(p.committed());
+    assert_eq!(p.source().to_string(), "fsync failed");
+    assert_eq!(
+      p.to_string(),
+      "save committed but durability fsync failed (committed=true): fsync failed"
+    );
+    // std::error::Error::source returns the inner io::Error directly.
+    let src = std::error::Error::source(&p).expect("source present");
+    assert_eq!(src.to_string(), "fsync failed");
+    // into_source consumes and yields the owned io::Error.
+    let owned = p.into_source();
+    assert_eq!(owned.to_string(), "fsync failed");
+  }
+
+  // ── ConvertPostSavePartialPayload: accessors + Display + source +
+  //    into_parts ──────────────────────────────────────────────────────
+  #[test]
+  fn convert_post_save_partial_payload() {
+    let warn = IoError::other("dir fsync warned");
+    let copy_err = Error::FileIo(FileIoPayload::new(
+      "copy_tokenizer_and_extras",
+      FileOp::Copy,
+      PathBuf::from("/dst/tokenizer.json"),
+      IoError::new(ErrorKind::PermissionDenied, "denied"),
+    ));
+    let p = ConvertPostSavePartialPayload::new(true, Some(warn), copy_err);
+    assert!(p.committed());
+    assert_eq!(
+      p.save_warning().map(|e| e.to_string()).as_deref(),
+      Some("dir fsync warned")
+    );
+    assert_eq!(
+      p.copy_error().to_string(),
+      "io: copy_tokenizer_and_extras: copy /dst/tokenizer.json: denied"
+    );
+    assert_eq!(
+      p.to_string(),
+      "convert: save committed but post-save extras copy partially failed (committed=true); \
+       destination directory may be incomplete (missing tokenizer/extras files)"
+    );
+    // source() delegates to the copy_error.
+    let src = std::error::Error::source(&p).expect("source present");
+    assert_eq!(
+      src.to_string(),
+      "io: copy_tokenizer_and_extras: copy /dst/tokenizer.json: denied"
+    );
+    // into_parts yields (committed, save_warning, copy_error).
+    let (committed, save_warning, copy_error) = p.into_parts();
+    assert!(committed);
+    assert_eq!(
+      save_warning.map(|e| e.to_string()).as_deref(),
+      Some("dir fsync warned")
+    );
+    assert_eq!(
+      copy_error.to_string(),
+      "io: copy_tokenizer_and_extras: copy /dst/tokenizer.json: denied"
+    );
+  }
+
+  #[test]
+  fn convert_post_save_partial_no_save_warning() {
+    let copy_err = Error::OutOfMemory;
+    let p = ConvertPostSavePartialPayload::new(true, None, copy_err);
+    assert!(p.save_warning().is_none());
+    assert_eq!(p.copy_error().to_string(), "out of memory");
+  }
+
+  // ── ConvertDurabilityWarnings: new + every accessor + first_warning +
+  //    count + into_parts + Display + source ─────────────────────────────
+  #[test]
+  fn convert_durability_warnings_full() {
+    let save = IoError::other("save warn");
+    let file = IoError::other("file warn");
+    let p = ConvertDurabilityWarnings::new(true, Some(save), Some(file), None);
+    assert!(p.committed());
+    assert_eq!(
+      p.save().map(|e| e.to_string()).as_deref(),
+      Some("save warn")
+    );
+    assert_eq!(
+      p.post_copy_file().map(|e| e.to_string()).as_deref(),
+      Some("file warn")
+    );
+    assert!(p.post_copy_dir().is_none());
+    // 2 non-None fields.
+    assert_eq!(p.count(), 2);
+    // first_warning => save (highest priority).
+    assert_eq!(
+      p.first_warning().map(|e| e.to_string()).as_deref(),
+      Some("save warn")
+    );
+    assert_eq!(
+      p.to_string(),
+      "convert: save committed but post-save durability warnings (committed=true); \
+       destination is on-disk and load-correct, but one or more fsync boundaries returned a warning"
+    );
+    // source() => first_warning.
+    let src = std::error::Error::source(&p).expect("source present");
+    assert_eq!(src.to_string(), "save warn");
+    // into_parts yields the four fields in order.
+    let (committed, s, fcp, dcp) = p.into_parts();
+    assert!(committed);
+    assert_eq!(s.map(|e| e.to_string()).as_deref(), Some("save warn"));
+    assert_eq!(fcp.map(|e| e.to_string()).as_deref(), Some("file warn"));
+    assert!(dcp.is_none());
+  }
+
+  #[test]
+  fn convert_durability_warnings_first_warning_priority_skips_none() {
+    // save=None, post_copy_file=None, post_copy_dir=Some => dir is first.
+    let dir = IoError::other("dir warn");
+    let p = ConvertDurabilityWarnings::new(true, None, None, Some(dir));
+    assert_eq!(p.count(), 1);
+    assert_eq!(
+      p.first_warning().map(|e| e.to_string()).as_deref(),
+      Some("dir warn")
+    );
+    assert_eq!(
+      p.post_copy_dir().map(|e| e.to_string()).as_deref(),
+      Some("dir warn")
+    );
+    // The `From` impl routes it into the Error enum transparently.
+    let e: Error = p.into();
+    assert!(matches!(e, Error::ConvertDurabilityWarnings(_)));
+  }
+}

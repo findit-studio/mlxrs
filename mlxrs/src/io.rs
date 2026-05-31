@@ -989,7 +989,7 @@ fn make_writer_vtable() -> mlxrs_sys::mlx_io_vtable {
 #[cfg_attr(docsrs, doc(cfg(feature = "gguf")))]
 #[non_exhaustive]
 #[derive(
-  derive_more::Display, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
+  Debug, derive_more::Display, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
 )]
 #[display("{}", self.as_str())]
 #[unwrap(ref, ref_mut)]
@@ -1302,3 +1302,6 @@ pub fn save_gguf(
   drop(guard);
   Ok(())
 }
+
+#[cfg(test)]
+mod tests;

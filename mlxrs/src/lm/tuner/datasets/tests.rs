@@ -825,3 +825,553 @@ fn load_dataset_cap_enforced_on_single_giant_line() {
   assert_eq!(v.len(), 1);
   assert_eq!(v[0]["text"].as_str(), Some("abc"));
 }
+
+// ───────────────────────── Debug impls ─────────────────────────
+
+#[test]
+fn text_dataset_debug_reports_len_and_key() {
+  let tok = tokenizer_fixture("text_debug");
+  let ds = TextDataset::new(
+    vec![json!({ "text": "hello" }), json!({ "text": "world" })],
+    &tok,
+    "body",
+  );
+  // Hand-computed: the manual Debug impl prints the struct name plus the
+  // `len` (== 2 records) and the `text_key` field verbatim.
+  let s = format!("{ds:?}");
+  assert!(s.contains("TextDataset"), "got: {s}");
+  assert!(s.contains("len: 2"), "got: {s}");
+  assert!(s.contains("text_key: \"body\""), "got: {s}");
+}
+
+#[test]
+fn chat_dataset_debug_reports_len_key_and_mask() {
+  let tok = tokenizer_fixture("chat_debug");
+  let ds = ChatDataset::new(vec![json!({ "messages": [] })], &tok, "msgs", true);
+  let s = format!("{ds:?}");
+  assert!(s.contains("ChatDataset"), "got: {s}");
+  assert!(s.contains("len: 1"), "got: {s}");
+  assert!(s.contains("chat_key: \"msgs\""), "got: {s}");
+  assert!(s.contains("mask_prompt: true"), "got: {s}");
+}
+
+#[test]
+fn completions_dataset_debug_reports_all_fields() {
+  let tok = tokenizer_fixture("comp_debug");
+  let ds = CompletionsDataset::new(
+    vec![json!({ "prompt": "p", "completion": "c" })],
+    &tok,
+    "pk",
+    "ck",
+    false,
+  );
+  let s = format!("{ds:?}");
+  assert!(s.contains("CompletionsDataset"), "got: {s}");
+  assert!(s.contains("len: 1"), "got: {s}");
+  assert!(s.contains("prompt_key: \"pk\""), "got: {s}");
+  assert!(s.contains("completion_key: \"ck\""), "got: {s}");
+  assert!(s.contains("mask_prompt: false"), "got: {s}");
+}
+
+#[test]
+fn concatenated_dataset_debug_reports_inner_count_and_len() {
+  let tok = tokenizer_fixture("concat_debug");
+  let a = TextDataset::new(vec![json!({ "text": "hello" })], &tok, DEFAULT_TEXT_KEY);
+  let b = TextDataset::new(
+    vec![json!({ "text": "world" }), json!({ "text": "hello" })],
+    &tok,
+    DEFAULT_TEXT_KEY,
+  );
+  // 2 inner datasets, total len = 1 + 2 = 3.
+  let cat = ConcatenatedDataset::new(vec![Box::new(a), Box::new(b)]);
+  let s = format!("{cat:?}");
+  assert!(s.contains("ConcatenatedDataset"), "got: {s}");
+  assert!(s.contains("inner_count: 2"), "got: {s}");
+  assert!(s.contains("len: 3"), "got: {s}");
+}
+
+#[test]
+fn cache_dataset_debug_reports_len_and_cached_count() {
+  let tok = tokenizer_fixture("cache_debug");
+  let inner = TextDataset::new(
+    vec![json!({ "text": "hello" }), json!({ "text": "world" })],
+    &tok,
+    DEFAULT_TEXT_KEY,
+  );
+  let cache = CacheDataset::new(Box::new(inner));
+  // Nothing processed yet → cached_count == Some(0).
+  let s0 = format!("{cache:?}");
+  assert!(s0.contains("CacheDataset"), "got: {s0}");
+  assert!(s0.contains("len: 2"), "got: {s0}");
+  assert!(s0.contains("cached_count: Some(0)"), "got: {s0}");
+  // Process one index → exactly one cache slot populated.
+  let _ = cache.process(0).unwrap();
+  let s1 = format!("{cache:?}");
+  assert!(s1.contains("cached_count: Some(1)"), "got: {s1}");
+}
+
+// ───────────────────────── get() dispatch (vs process) ─────────────────────────
+
+#[test]
+fn chat_dataset_get_out_of_range_errors() {
+  let tok = tokenizer_fixture("chat_get_oor");
+  let ds = ChatDataset::new(
+    vec![json!({ "messages": [] })],
+    &tok,
+    DEFAULT_CHAT_KEY,
+    false,
+  );
+  // In-range get returns the underlying record.
+  assert!(ds.get(0).is_ok());
+  // idx == len → OutOfRange with the "ChatDataset: index" context.
+  let err = ds.get(1).unwrap_err();
+  match err {
+    Error::OutOfRange(p) => {
+      assert_eq!(p.context(), "ChatDataset: index");
+      assert!(p.value().contains("1 (len=1)"), "got: {p:?}");
+    }
+    other => panic!("expected OutOfRange, got: {other:?}"),
+  }
+}
+
+#[test]
+fn completions_dataset_get_out_of_range_errors() {
+  let tok = tokenizer_fixture("comp_get_oor");
+  let ds = CompletionsDataset::new(
+    vec![json!({ "prompt": "p", "completion": "c" })],
+    &tok,
+    DEFAULT_PROMPT_KEY,
+    DEFAULT_COMPLETION_KEY,
+    false,
+  );
+  assert!(ds.get(0).is_ok());
+  let err = ds.get(5).unwrap_err();
+  match err {
+    Error::OutOfRange(p) => {
+      assert_eq!(p.context(), "CompletionsDataset: index");
+      assert!(p.value().contains("5 (len=1)"), "got: {p:?}");
+    }
+    other => panic!("expected OutOfRange, got: {other:?}"),
+  }
+}
+
+#[test]
+fn concatenated_dataset_get_routes_to_inner() {
+  let tok = tokenizer_fixture("concat_get");
+  let a = TextDataset::new(vec![json!({ "text": "hello" })], &tok, DEFAULT_TEXT_KEY);
+  let b = TextDataset::new(
+    vec![json!({ "text": "world" }), json!({ "text": "extra" })],
+    &tok,
+    DEFAULT_TEXT_KEY,
+  );
+  let cat = ConcatenatedDataset::new(vec![Box::new(a), Box::new(b)]);
+  // idx 0 → a[0]; idx 1 → b[0]; idx 2 → b[1] (resolve subtracts inner lens).
+  assert_eq!(cat.get(0).unwrap()["text"].as_str(), Some("hello"));
+  assert_eq!(cat.get(1).unwrap()["text"].as_str(), Some("world"));
+  assert_eq!(cat.get(2).unwrap()["text"].as_str(), Some("extra"));
+  // Past the end → OutOfRange against the total len (3).
+  let err = cat.get(3).unwrap_err();
+  match err {
+    Error::OutOfRange(p) => {
+      assert_eq!(p.context(), "ConcatenatedDataset: index");
+      assert!(p.value().contains("3 (len=3)"), "got: {p:?}");
+    }
+    other => panic!("expected OutOfRange, got: {other:?}"),
+  }
+}
+
+#[test]
+fn cache_dataset_get_routes_to_inner() {
+  let tok = tokenizer_fixture("cache_get");
+  let inner = TextDataset::new(vec![json!({ "text": "hello" })], &tok, DEFAULT_TEXT_KEY);
+  let cache = CacheDataset::new(Box::new(inner));
+  // get() forwards to the inner dataset's raw record (NOT the cache).
+  assert_eq!(cache.get(0).unwrap()["text"].as_str(), Some("hello"));
+  assert!(cache.get(1).is_err());
+}
+
+// ───────────────────────── CacheDataset post-compute OOR guard ─────────────────────────
+
+/// Test-only inner dataset whose `process` SUCCEEDS for an index beyond
+/// its advertised `len()`. This exercises the defensive
+/// `idx >= cache.len()` guard in `CacheDataset::process` (the cache vec
+/// is pre-sized to `inner.len()`, so a process that returns Ok for an
+/// out-of-cache index must be rejected rather than panic-indexing).
+struct OverreachingDataset;
+
+impl Dataset for OverreachingDataset {
+  fn len(&self) -> usize {
+    0
+  }
+
+  fn get(&self, _idx: usize) -> Result<&Value> {
+    // Never used by this test's path.
+    Err(Error::OutOfRange(OutOfRangePayload::new(
+      "OverreachingDataset: get",
+      "unused",
+      "0",
+    )))
+  }
+
+  fn process(&self, _idx: usize) -> Result<Example> {
+    // Succeeds for ANY index, including ones past `len()`.
+    Ok((vec![1, 2, 3], 0))
+  }
+}
+
+#[test]
+fn cache_dataset_process_rejects_index_past_presized_cache() {
+  // inner.len() == 0 → the cache vec is pre-sized to 0 entries. But the
+  // inner `process(0)` returns Ok, so the post-compute guard
+  // `idx >= cache.len()` (0 >= 0) must fire with OutOfRange.
+  let cache = CacheDataset::new(Box::new(OverreachingDataset));
+  assert_eq!(cache.len(), 0);
+  let err = cache.process(0).unwrap_err();
+  match err {
+    Error::OutOfRange(p) => {
+      assert_eq!(p.context(), "CacheDataset: index");
+      assert!(p.value().contains("0 (len=0)"), "got: {p:?}");
+    }
+    other => panic!("expected OutOfRange from post-compute cache guard, got: {other:?}"),
+  }
+}
+
+// ───────────────────────── DatasetType ─────────────────────────
+
+#[test]
+fn dataset_type_as_str_and_display_cover_all_variants() {
+  // Hand-computed canonical strings (datasets.rs `as_str`).
+  assert_eq!(DatasetType::Text.as_str(), "text");
+  assert_eq!(DatasetType::Chat.as_str(), "chat");
+  assert_eq!(DatasetType::Completions.as_str(), "completions");
+  assert_eq!(DatasetType::Auto.as_str(), "auto");
+  // Display delegates to as_str.
+  assert_eq!(DatasetType::Text.to_string(), "text");
+  assert_eq!(DatasetType::Chat.to_string(), "chat");
+  assert_eq!(DatasetType::Completions.to_string(), "completions");
+  assert_eq!(DatasetType::Auto.to_string(), "auto");
+}
+
+// ───────────────────────── DatasetConfig builders ─────────────────────────
+
+#[test]
+fn dataset_config_builders_override_each_feature() {
+  // Each `with_*` builder replaces exactly one field; defaults elsewhere.
+  let cfg = DatasetConfig::new()
+    .with_text_feature("body")
+    .with_chat_feature("turns")
+    .with_prompt_feature("question")
+    .with_completion_feature("answer")
+    .with_mask_prompt(true);
+  assert_eq!(cfg.text_feature(), "body");
+  assert_eq!(cfg.chat_feature(), "turns");
+  assert_eq!(cfg.prompt_feature(), "question");
+  assert_eq!(cfg.completion_feature(), "answer");
+  assert!(cfg.mask_prompt());
+
+  // A fresh default carries the Python-default field names.
+  let d = DatasetConfig::default();
+  assert_eq!(d.text_feature(), "text");
+  assert_eq!(d.chat_feature(), "messages");
+  assert_eq!(d.prompt_feature(), "prompt");
+  assert_eq!(d.completion_feature(), "completion");
+  assert!(!d.mask_prompt());
+}
+
+#[test]
+fn create_dataset_honors_custom_features_per_type() {
+  let tok = tokenizer_fixture("create_custom");
+
+  // Text via a non-default text_feature ("body").
+  let cfg_text = DatasetConfig::new().with_text_feature("body");
+  let text_ds = create_dataset(
+    vec![json!({ "body": "hello" })],
+    &tok,
+    &cfg_text,
+    DatasetType::Text,
+  )
+  .unwrap();
+  assert_eq!(text_ds.len(), 1);
+  // hello </s> → [3, 2]; text never masks.
+  assert_eq!(text_ds.process(0).unwrap(), (vec![3, 2], 0));
+
+  // Chat via an explicit DatasetType::Chat with the default key.
+  let chat_ds = create_dataset(
+    vec![json!({ "messages": [{"role": "user", "content": "hello"}] })],
+    &tok,
+    &DatasetConfig::default(),
+    DatasetType::Chat,
+  )
+  .unwrap();
+  assert_eq!(chat_ds.len(), 1);
+  // "user : hello " → [5, 7, 3]; no mask → offset 0.
+  assert_eq!(chat_ds.process(0).unwrap(), (vec![5, 7, 3], 0));
+
+  // Completions via custom prompt/completion features.
+  let cfg_comp = DatasetConfig::new()
+    .with_prompt_feature("q")
+    .with_completion_feature("a");
+  let comp_ds = create_dataset(
+    vec![json!({ "q": "hello", "a": "world" })],
+    &tok,
+    &cfg_comp,
+    DatasetType::Completions,
+  )
+  .unwrap();
+  assert_eq!(comp_ds.len(), 1);
+  // "user : hello assistant : world " → [5, 7, 3, 6, 7, 4]; no mask.
+  assert_eq!(comp_ds.process(0).unwrap(), (vec![5, 7, 3, 6, 7, 4], 0));
+}
+
+// ───────────────────────── auto_detect (via create_dataset Auto) ─────────────────────────
+
+#[test]
+fn create_dataset_auto_empty_records_errors() {
+  let tok = tokenizer_fixture("auto_empty");
+  // Empty parsed jsonl → auto-detection has no `data[0]` sample.
+  // `create_dataset` returns `Box<dyn Dataset>` (not Debug), so `.unwrap_err()`
+  // can't format the Ok arm — extract the Err via let-else instead.
+  let Err(err) = create_dataset(vec![], &tok, &DatasetConfig::default(), DatasetType::Auto) else {
+    panic!("expected EmptyInput error from empty auto-detect, got Ok(dataset)");
+  };
+  match err {
+    Error::EmptyInput(p) => {
+      assert!(
+        p.context().contains("auto-detection"),
+        "expected auto-detection context, got: {p:?}"
+      );
+    }
+    other => panic!("expected EmptyInput, got: {other:?}"),
+  }
+}
+
+#[test]
+fn create_dataset_auto_detects_chat_when_only_messages_present() {
+  let tok = tokenizer_fixture("auto_chat");
+  // No prompt+completion, but a `messages` key → ChatDataset branch.
+  let ds = create_dataset(
+    vec![json!({ "messages": [{"role": "user", "content": "hello"}] })],
+    &tok,
+    &DatasetConfig::default(),
+    DatasetType::Auto,
+  )
+  .unwrap();
+  assert_eq!(ds.len(), 1);
+  // ChatDataset render of a single user turn: "user : hello " → [5, 7, 3].
+  assert_eq!(ds.process(0).unwrap(), (vec![5, 7, 3], 0));
+}
+
+#[test]
+fn create_dataset_auto_detects_text_when_only_text_present() {
+  let tok = tokenizer_fixture("auto_text");
+  // Neither prompt+completion nor messages, but a `text` key → TextDataset.
+  let ds = create_dataset(
+    vec![json!({ "text": "hello world" })],
+    &tok,
+    &DatasetConfig::default(),
+    DatasetType::Auto,
+  )
+  .unwrap();
+  assert_eq!(ds.len(), 1);
+  // hello world </s> → [3, 4, 2].
+  assert_eq!(ds.process(0).unwrap(), (vec![3, 4, 2], 0));
+}
+
+// ───────────────────────── json_kind via wrong-typed fields ─────────────────────────
+
+#[test]
+fn text_dataset_array_valued_field_reports_array_kind() {
+  // field_as_str on an ARRAY value → OutOfRange whose value embeds the
+  // json_kind tag "array".
+  let tok = tokenizer_fixture("text_array_kind");
+  let data = vec![json!({ "text": [1, 2, 3] })];
+  let ds = TextDataset::new(data, &tok, DEFAULT_TEXT_KEY);
+  let err = ds.process(0).unwrap_err();
+  match err {
+    Error::OutOfRange(p) => {
+      assert_eq!(p.requirement(), "field must be a JSON string");
+      assert!(p.value().contains("=array"), "got: {p:?}");
+    }
+    other => panic!("expected OutOfRange, got: {other:?}"),
+  }
+}
+
+#[test]
+fn chat_dataset_non_array_messages_report_json_kind() {
+  let tok = tokenizer_fixture("chat_kinds");
+  // null → "null"
+  for (field, kind) in [
+    (json!(null), "null"),
+    (json!(true), "bool"),
+    (json!(7), "number"),
+    (json!({ "a": 1 }), "object"),
+  ] {
+    let data = vec![json!({ "messages": field })];
+    let ds = ChatDataset::new(data, &tok, DEFAULT_CHAT_KEY, false);
+    let err = ds.process(0).unwrap_err();
+    match err {
+      Error::OutOfRange(p) => {
+        let needle = format!("messages={kind}");
+        assert!(
+          p.value().contains(needle.as_str()),
+          "expected json_kind '{kind}', got: {p:?}"
+        );
+      }
+      other => panic!("expected OutOfRange for kind {kind}, got: {other:?}"),
+    }
+  }
+}
+
+// ───────────────────────── read_jsonl_with_cap branches ─────────────────────────
+
+#[test]
+fn read_jsonl_with_cap_exact_cap_at_eof_succeeds() {
+  use std::io::Cursor;
+  // Single complete line whose total bytes (incl. the trailing \n) equal
+  // the cap EXACTLY. After consuming it the loop re-enters with
+  // remaining == 0, peeks, finds EOF (n == 0) and breaks cleanly with the
+  // record parsed.
+  let body = "{\"text\":\"a\"}\n";
+  let cap = body.len() as u64; // 13
+  let path = std::path::PathBuf::from("/synthetic/exact.jsonl");
+  let v = read_jsonl_with_cap(Cursor::new(body), &path, cap).unwrap();
+  assert_eq!(v.len(), 1);
+  assert_eq!(v[0]["text"].as_str(), Some("a"));
+}
+
+#[test]
+fn read_jsonl_with_cap_zero_remaining_with_pending_bytes_errors() {
+  use std::io::Cursor;
+  // First line's bytes (incl. \n) == cap exactly; a SECOND line follows.
+  // Iteration 1 parses line 1 and reaches total_bytes == cap. Iteration 2
+  // has remaining == 0, peeks, finds a pending byte (n == 1) → CapExceeded
+  // via the post-cap "more bytes remained" branch (NOT the in-loop
+  // total > max branch).
+  let line1 = "{\"text\":\"a\"}\n";
+  let cap = line1.len() as u64; // 13
+  let body = format!("{line1}{{\"text\":\"b\"}}\n");
+  let path = std::path::PathBuf::from("/synthetic/pending.jsonl");
+  let err = read_jsonl_with_cap(Cursor::new(body), &path, cap).unwrap_err();
+  match err {
+    Error::CapExceeded(p) => {
+      assert_eq!(p.cap(), cap);
+      assert_eq!(p.cap_name(), "MAX_DATASET_FILE_BYTES");
+      // observed == total_bytes.saturating_add(1) == cap + 1.
+      assert_eq!(p.observed(), cap + 1);
+      assert!(
+        p.context().contains("more bytes remained"),
+        "expected post-cap probe context, got: {p:?}"
+      );
+    }
+    other => panic!("expected CapExceeded (post-cap probe), got: {other:?}"),
+  }
+}
+
+#[test]
+fn read_jsonl_with_cap_strips_crlf_line_ending() {
+  use std::io::Cursor;
+  // A `\r\n`-terminated line: the helper strips BOTH the \n and the
+  // preceding \r before parsing. If the \r were NOT stripped the trailing
+  // byte would make `{"text":"a"}\r` invalid JSON and parsing would fail;
+  // a successful parse of exactly {"text":"a"} proves the CR strip ran.
+  let body = "{\"text\":\"a\"}\r\n";
+  let path = std::path::PathBuf::from("/synthetic/crlf.jsonl");
+  let v = read_jsonl_with_cap(Cursor::new(body), &path, 1000).unwrap();
+  assert_eq!(v.len(), 1);
+  assert_eq!(v[0]["text"].as_str(), Some("a"));
+}
+
+#[test]
+fn read_jsonl_with_cap_invalid_utf8_line_errors_parse() {
+  use std::io::Cursor;
+  // 0xFF 0xFE is not valid UTF-8; followed by a newline so read_until
+  // yields a complete (binary) line that fails the from_utf8 conversion.
+  let body: Vec<u8> = vec![0xFF, 0xFE, b'\n'];
+  let path = std::path::PathBuf::from("/synthetic/badutf8.jsonl");
+  let err = read_jsonl_with_cap(Cursor::new(body), &path, 1000).unwrap_err();
+  match err {
+    Error::Parse(p) => {
+      assert!(
+        p.context().contains("not valid UTF-8"),
+        "expected UTF-8 parse context, got: {p:?}"
+      );
+    }
+    other => panic!("expected Parse (invalid UTF-8), got: {other:?}"),
+  }
+}
+
+/// Test-only reader whose `fill_buf` always returns an `io::Error`,
+/// driving the `read_until` error arm in `read_jsonl_with_cap`.
+struct ErroringReader;
+
+impl std::io::Read for ErroringReader {
+  fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+    Err(std::io::Error::other("synthetic read failure"))
+  }
+}
+
+impl std::io::BufRead for ErroringReader {
+  fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+    Err(std::io::Error::other("synthetic fill_buf failure"))
+  }
+
+  fn consume(&mut self, _amt: usize) {}
+}
+
+#[test]
+fn read_jsonl_with_cap_read_until_error_surfaces_fileio() {
+  // cap > 0 so the helper takes the read_until path (not the
+  // remaining == 0 probe). `read_until` → `fill_buf` → Err → the helper's
+  // `Err(e)` arm wraps it as a FileIo(Read) error with read_until context.
+  let path = std::path::PathBuf::from("/synthetic/ioerror.jsonl");
+  let err = read_jsonl_with_cap(ErroringReader, &path, 100).unwrap_err();
+  match err {
+    Error::FileIo(p) => {
+      assert_eq!(p.op(), FileOp::Read);
+      assert!(
+        p.context().contains("read_until"),
+        "expected read_until context, got: {p:?}"
+      );
+    }
+    other => panic!("expected FileIo(Read) from read_until error, got: {other:?}"),
+  }
+}
+
+// ───────────────────────── unix open-error path ─────────────────────────
+
+// A path that `exists()` but cannot be `open()`ed for read drives the
+// post-`exists()` open-error closure in `load_dataset` (the unix
+// O_NONBLOCK|O_CLOEXEC OpenOptions::open map_err). We plant a regular
+// file with mode 0o000. Running as root bypasses DAC permission checks,
+// so if the open unexpectedly succeeds we skip the assertion rather than
+// fail flakily.
+#[cfg(unix)]
+#[test]
+fn load_dataset_open_permission_denied_errors() {
+  use std::os::unix::fs::PermissionsExt;
+  let tok = tokenizer_fixture("load_perm_tok");
+  let dir = fresh_dir("load_perm");
+  let p = dir.join("train.jsonl");
+  std::fs::write(&p, "{\"text\": \"hello\"}\n").unwrap();
+  std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+  // Probe: can we still read it (i.e. are we root)? If so, the open will
+  // succeed and the error path is unreachable — skip.
+  let readable = std::fs::File::open(&p).is_ok();
+  let res = load_dataset(&p, &tok, DatasetType::Auto, &DatasetConfig::default());
+  // Restore permissions so cleanup can remove the file.
+  let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+  std::fs::remove_dir_all(&dir).ok();
+
+  if readable {
+    // Root (or a permissive mount): the open path can't fail here.
+    return;
+  }
+  match res {
+    Err(Error::FileIo(payload)) => {
+      assert_eq!(payload.op(), FileOp::Open);
+      assert_eq!(payload.inner().kind(), std::io::ErrorKind::PermissionDenied);
+    }
+    other => panic!("expected FileIo(Open, PermissionDenied), got: {other:?}"),
+  }
+}

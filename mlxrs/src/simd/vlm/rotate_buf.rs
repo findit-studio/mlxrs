@@ -539,4 +539,209 @@ mod tests {
     // src (1, 1) = [12..16]; nx=1, ny=1; dst_off = (1*2 + 1)*4 = 12.
     assert_eq!(&d[12..16], &s[12..16]);
   }
+
+  /// [`RotateKind::as_str`] is only reached via the `Display` derive
+  /// (`#[display("{}", self.as_str())]`); the differential tests format
+  /// with `{:?}` (Debug), so the four `as_str` arms are otherwise never
+  /// executed. Pin every variant's lowercase tag here and assert the
+  /// `Display` impl routes through `as_str` (so `to_string()` matches).
+  #[test]
+  fn rotate_kind_as_str_and_display_all_variants() {
+    let cases = [
+      (RotateKind::Rotate90, "rotate90"),
+      (RotateKind::Rotate270, "rotate270"),
+      (RotateKind::Rotate90FlipH, "rotate90fliph"),
+      (RotateKind::Rotate270FlipH, "rotate270fliph"),
+    ];
+    for (kind, tag) in cases {
+      assert_eq!(kind.as_str(), tag, "as_str mismatch for {kind:?}");
+      // `Display` is derived as `self.as_str()`, so `to_string()` must
+      // equal the tag — this drives the same match arms via the
+      // formatter path.
+      assert_eq!(kind.to_string(), tag, "Display mismatch for {kind:?}");
+    }
+  }
+
+  /// Scalar reference, dimension-overflow arm. The existing
+  /// [`rotate_buf_u8_panics_on_dimension_overflow`] exercises the
+  /// *dispatcher*'s `checked_mul`; this drives the **scalar** kernel's
+  /// own pre-assert overflow guard (a distinct `unwrap_or_else` panic
+  /// closure). `src_w * src_h` saturates `usize`, so the product wraps
+  /// without `checked_mul` and the explicit `panic!` is the only
+  /// correct response. Small `src` / `dst` so the overflow is the only
+  /// failure mode (the asserts come *after* the checked math).
+  #[test]
+  #[should_panic(expected = "rotate_buf_u8_scalar: dimensions")]
+  fn rotate_buf_u8_scalar_panics_on_dimension_overflow() {
+    let s = vec![0u8; 16];
+    let mut d = vec![0u8; 16];
+    rotate_buf_u8_scalar(&mut d, &s, usize::MAX / 2 + 1, 2, 4, RotateKind::Rotate90);
+  }
+
+  /// Scalar reference, `src.len()` size-mismatch arm. The existing
+  /// size-mismatch test only drives the *dispatcher*; calling the
+  /// scalar kernel directly with a too-short `src` (correct,
+  /// non-overflowing dims so the `checked_mul` passes) exercises the
+  /// scalar arm's first `assert_eq!` and its full message-formatting
+  /// args (`src.len()`, `src_w`, `src_h`, `channels`, `elements`).
+  #[test]
+  #[should_panic(
+    expected = "rotate_buf_u8_scalar: src.len() (3) must equal src_w * src_h * channels (2 * 2 * 4 = 16)"
+  )]
+  fn rotate_buf_u8_scalar_panics_on_src_size_mismatch() {
+    let s = vec![0u8; 3]; // WRONG: 2*2*4 = 16
+    let mut d = vec![0u8; 16];
+    rotate_buf_u8_scalar(&mut d, &s, 2, 2, 4, RotateKind::Rotate90);
+  }
+
+  /// Scalar reference, `dst.len()` size-mismatch arm. `src` is sized
+  /// correctly (so the first `assert_eq!` passes), but `dst` is
+  /// undersized — driving the scalar arm's **second** `assert_eq!` and
+  /// its message-formatting args (`dst.len()`, `elements`). This is the
+  /// only shape that reaches the second scalar assert (a `src`
+  /// mismatch short-circuits at the first).
+  #[test]
+  #[should_panic(expected = "rotate_buf_u8_scalar: dst.len() (3) must equal src.len() (16)")]
+  fn rotate_buf_u8_scalar_panics_on_dst_size_mismatch() {
+    let s = vec![0u8; 16]; // correct: 2*2*4
+    let mut d = vec![0u8; 3]; // WRONG
+    rotate_buf_u8_scalar(&mut d, &s, 2, 2, 4, RotateKind::Rotate90);
+  }
+
+  /// Dispatcher, `dst.len()` size-mismatch arm. The existing
+  /// [`rotate_buf_u8_panics_on_size_mismatch`] supplies a too-short
+  /// `src` (hitting the dispatcher's *first* `assert_eq!`); here `src`
+  /// is correct and `dst` is undersized, so the dispatcher's **second**
+  /// `assert_eq!` (`dst.len()` vs `src.len()`) and its message args are
+  /// covered. The mismatch is caught before any routing to the unsafe
+  /// NEON kernel.
+  #[test]
+  #[should_panic(expected = "simd::vlm::rotate_buf_u8: dst.len() (3) must equal src.len() (16)")]
+  fn rotate_buf_u8_dispatch_panics_on_dst_size_mismatch() {
+    let s = vec![0u8; 16]; // correct: 2*2*4
+    let mut d = vec![0u8; 3]; // WRONG
+    rotate_buf_u8(&mut d, &s, 2, 2, 4, RotateKind::Rotate90);
+  }
+
+  /// NEON kernel, dimension-overflow arm. The `channels=4` NEON kernel
+  /// has its own pre-assert `checked_mul` guard (distinct panic closure
+  /// from the dispatcher's). Driven through the kernel **directly** so
+  /// the guard is covered even if dispatcher routing changes; gated on
+  /// `is_neon_available()` so it no-ops (forcing the expected panic
+  /// message) on non-NEON CPUs / `mlxrs_force_scalar`. `src_w * src_h`
+  /// saturates `usize`; small `src` / `dst` so the overflow is the only
+  /// failure mode, and the panic fires at the `unwrap_or_else` closure
+  /// **before** any pointer arithmetic (so no UB despite the
+  /// intentionally undersized buffers).
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  #[should_panic(expected = "rotate_buf_u8_channels4_neon: dimensions")]
+  fn rotate_buf_u8_neon_panics_on_dimension_overflow() {
+    if !crate::simd::is_neon_available() {
+      // Force the expected panic without invoking the kernel — the
+      // guard under test only applies when the NEON arm is reachable.
+      panic!("rotate_buf_u8_channels4_neon: dimensions (skipped — NEON unavailable)");
+    }
+    let s = vec![0u8; 16];
+    let mut d = vec![0u8; 16];
+    // SAFETY: `is_neon_available()` checked immediately above
+    // (precondition #1); `channels == 4` is implicit in the kernel
+    // (precondition #2). The kernel's `checked_mul` overflow guard
+    // fires before any `vld1q_u8` / `write_unaligned`, so the
+    // intentionally tiny `src` / `dst` are never dereferenced.
+    unsafe {
+      super::rotate_buf_u8_channels4_neon(&mut d, &s, usize::MAX / 2 + 1, 2, RotateKind::Rotate90)
+    };
+  }
+
+  /// NEON kernel, `src.len()` size-mismatch arm. Non-overflowing dims
+  /// (so the `checked_mul` passes) but a too-short `src` drives the
+  /// kernel's first `assert_eq!` and its message args (`src.len()`,
+  /// `src_w`, `src_h`, `elements`). The assert sits **before** the
+  /// `unsafe` tile-loop block, so no OOB load occurs. Gated +
+  /// no-op-panic on non-NEON, matching the bgr_widen NEON precondition
+  /// tests.
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  #[should_panic(
+    expected = "rotate_buf_u8_channels4_neon: src.len() (3) must equal src_w * src_h * 4 (2 * 2 * 4 = 16)"
+  )]
+  fn rotate_buf_u8_neon_panics_on_src_size_mismatch() {
+    if !crate::simd::is_neon_available() {
+      panic!(
+        "rotate_buf_u8_channels4_neon: src.len() (3) must equal src_w * src_h * 4 (2 * 2 * 4 = 16) (skipped — NEON unavailable)"
+      );
+    }
+    let s = vec![0u8; 3]; // WRONG: 2*2*4 = 16
+    let mut d = vec![0u8; 16];
+    // SAFETY: NEON checked above. The size `assert_eq!` precedes the
+    // `unsafe` pointer loop, so the kernel panics before any
+    // `vld1q_u8` / `write_unaligned` — the undersized `src` is never
+    // read past its length.
+    unsafe { super::rotate_buf_u8_channels4_neon(&mut d, &s, 2, 2, RotateKind::Rotate90) };
+  }
+
+  /// NEON kernel, `dst.len()` size-mismatch arm. `src` is correct (so
+  /// the first `assert_eq!` passes) and `dst` is undersized — driving
+  /// the kernel's **second** `assert_eq!` and its message args
+  /// (`dst.len()`, `elements`). As with the src-mismatch test, the
+  /// assert precedes the `unsafe` block, so no OOB write occurs.
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  #[should_panic(
+    expected = "rotate_buf_u8_channels4_neon: dst.len() (3) must equal src.len() (16)"
+  )]
+  fn rotate_buf_u8_neon_panics_on_dst_size_mismatch() {
+    if !crate::simd::is_neon_available() {
+      panic!(
+        "rotate_buf_u8_channels4_neon: dst.len() (3) must equal src.len() (16) (skipped — NEON unavailable)"
+      );
+    }
+    let s = vec![0u8; 16]; // correct: 2*2*4
+    let mut d = vec![0u8; 3]; // WRONG
+    // SAFETY: NEON checked above. The `dst` size `assert_eq!` precedes
+    // the `unsafe` pointer loop, so the kernel panics before any
+    // `write_unaligned` — the undersized `dst` is never written.
+    unsafe { super::rotate_buf_u8_channels4_neon(&mut d, &s, 2, 2, RotateKind::Rotate90) };
+  }
+
+  /// NEON kernel vs scalar reference, **direct** bit-identical
+  /// differential (not via the dispatcher) so the `(u8, channels=4)`
+  /// NEON arm is covered independent of dispatcher routing. Sweeps
+  /// widths straddling the 4-pixel tile boundary (so both the
+  /// `while x + 4 <= row_x` body and the `while x < src_w` scalar tail
+  /// of the kernel run) and several heights. No-op-skips on non-NEON
+  /// CPUs / `mlxrs_force_scalar`.
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  fn rotate_buf_u8_neon_matches_scalar_bit_identical() {
+    if !crate::simd::is_neon_available() {
+      return;
+    }
+    let channels = 4usize;
+    for &w in &[1usize, 2, 3, 4, 5, 7, 8, 9, 16, 17] {
+      for &h in &[1usize, 2, 3, 5, 8] {
+        for &rotation in &[
+          RotateKind::Rotate90,
+          RotateKind::Rotate270,
+          RotateKind::Rotate90FlipH,
+          RotateKind::Rotate270FlipH,
+        ] {
+          let s = src(w, h, channels);
+          let mut scalar = vec![0u8; s.len()];
+          rotate_buf_u8_scalar(&mut scalar, &s, w, h, channels, rotation);
+          let mut neon = vec![0u8; s.len()];
+          // SAFETY: `is_neon_available()` checked at the top of the
+          // test (precondition #1); `channels == 4` (precondition #2);
+          // `scalar`/`neon`/`s` are all sized exactly `w*h*4`
+          // (precondition #3, asserted inside the kernel too).
+          unsafe { super::rotate_buf_u8_channels4_neon(&mut neon, &s, w, h, rotation) };
+          assert_eq!(
+            neon, scalar,
+            "NEON vs scalar Exact mismatch (w={w}, h={h}, channels=4, rotation={rotation:?})"
+          );
+        }
+      }
+    }
+  }
 }

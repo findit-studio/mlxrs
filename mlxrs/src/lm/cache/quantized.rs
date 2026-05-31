@@ -1196,3 +1196,6 @@ impl QuantizedKvCache for StandardQuantizedKvCache {
     }
   }
 }
+
+#[cfg(test)]
+mod tests;

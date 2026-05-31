@@ -3139,3 +3139,6 @@ mod batch_tests;
 
 #[cfg(test)]
 mod stop_sequence_tests;
+
+#[cfg(test)]
+mod tests;
