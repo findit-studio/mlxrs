@@ -1380,3 +1380,91 @@ fn roll_last_axis(a: &Array, shift: usize) -> Result<Array> {
   let head = slice_last(0, l - s)?;
   ops::shape::concatenate(&[&tail, &head], -1)
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  // A `[B, n_heads, S, head_dim]` kv token batch (the cache's 4-D layout).
+  fn kv(data: &[f32], b: usize, s: usize, d: usize) -> Array {
+    Array::from_slice::<f32>(data, &(b, 1usize, s, d)).unwrap()
+  }
+
+  #[test]
+  fn new_initial_state_is_empty_and_unrotated() {
+    let c = BatchRotatingKvCache::new(4, &[0, 2]);
+    assert_eq!(c.offset(), 0, "monotone _offset starts at 0");
+    assert_eq!(c.max_size(), Some(4));
+    assert_eq!(c.ring_idx(), 0, "ring write cursor starts at 0");
+    assert!(!c.is_rotated(), "a fresh ring is not rotated");
+    assert_eq!(c.max_window(), 4);
+    assert_eq!(c.pad_lengths(), &[0, 2], "host mirror of left_padding");
+    assert!(c.state().unwrap().is_empty(), "an empty cache yields []");
+    assert_eq!(c.buf_seq_len().unwrap(), None, "no physical buffer yet");
+    let mut lp = c.left_padding_arr().unwrap();
+    assert_eq!(lp.to_vec::<i32>().unwrap(), vec![0, 2]);
+  }
+
+  #[test]
+  fn reference_class_name_matches_mlx() {
+    let c = BatchRotatingKvCache::new(2, &[0]);
+    assert_eq!(c.reference_class_name(), "BatchRotatingKVCache");
+  }
+
+  #[test]
+  fn update_against_zero_max_size_placeholder_errs() {
+    // `max_size == 0` is the from_state placeholder; updating before
+    // set_meta_state restores a real window must fail fast, not run the
+    // degenerate ring arithmetic.
+    let mut c = BatchRotatingKvCache::new(0, &[0]);
+    let k = kv(&[1.0], 1, 1, 1);
+    assert!(matches!(
+      c.update(&k, &k),
+      Err(Error::InvariantViolation(_))
+    ));
+  }
+
+  #[test]
+  fn update_rejects_kv_batch_mismatch() {
+    let mut c = BatchRotatingKvCache::new(4, &[0]);
+    let k = kv(&[1.0, 2.0], 1, 1, 2); // [B=1, H=1, S=1, D=2]
+    let v = kv(&[1.0, 2.0, 3.0, 4.0], 2, 1, 2); // [B=2, …] — batch mismatch
+    assert!(
+      c.update(&k, &v).is_err(),
+      "K/V batch mismatch must be rejected"
+    );
+  }
+
+  #[test]
+  fn single_token_update_advances_cursors() {
+    let mut c = BatchRotatingKvCache::new(4, &[0]);
+    let k = kv(&[1.0, 2.0], 1, 1, 2);
+    let v = kv(&[3.0, 4.0], 1, 1, 2);
+    let _ = c.update(&k, &v).unwrap();
+    assert_eq!(c.offset(), 1, "_offset advances by S=1");
+    assert_eq!(c.ring_idx(), 1, "write cursor advances by 1");
+    assert!(!c.is_rotated(), "no wrap yet (idx 1 < max_size 4)");
+    assert_eq!(
+      c.state().unwrap().len(),
+      4,
+      "non-empty state is [keys, values, offset, left_padding]"
+    );
+  }
+
+  #[test]
+  fn ring_caps_and_rotates_past_max_size() {
+    let mut c = BatchRotatingKvCache::new(2, &[0]); // window of 2
+    for _ in 0..3 {
+      let k = kv(&[1.0], 1, 1, 1);
+      let _ = c.update(&k, &k).unwrap();
+    }
+    assert_eq!(c.offset(), 3, "monotone _offset counts all 3 tokens");
+    assert!(c.is_rotated(), "ring wrapped after exceeding max_size");
+    let st = c.state().unwrap();
+    assert_eq!(
+      st[0].shape()[2],
+      2,
+      "the windowed buffer never exceeds max_size tokens"
+    );
+  }
+}
