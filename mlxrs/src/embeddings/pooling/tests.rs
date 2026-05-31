@@ -282,20 +282,25 @@ fn single_token_sequence_all_strategies_return_that_token() {
 
 #[test]
 fn pool_dispatches_each_strategy_to_its_reduction() {
-  // emb (1,3,2) rows [2,2],[4,4],[8,8]; mask [1,1,0] (pos 2 masked).
-  // mean: ([2,2]+[4,4])/2 = [3,3]
-  // max : per-dim max over rows 0,1 (pad -inf) = [4,4]
-  // cls : argmax([1,1,0])=0 → row 0 = [2,2]
-  // first: strict row 0 = [2,2]
-  // last: flipped=[0,1,1],argmax=1,last=3-1-1=1 → row 1 = [4,4]
-  let emb = Array::from_slice(&[2.0_f32, 2.0, 4.0, 4.0, 8.0, 8.0], &(1, 3, 2)).unwrap();
-  let mask = Array::from_slice(&[1.0_f32, 1.0, 0.0], &(1, 3)).unwrap();
+  // A LEFT-PADDED mask [0,1,1] plus three distinct rows make every arm
+  // produce a DISTINCT output, so the dispatcher is load-bearing for each
+  // PoolingStrategy — crucially Cls (first REAL token) must differ from
+  // First (strict token 0). row0 also carries a large value (99) that would
+  // win an unmasked max, so the Max arm confirms masking flows through pool().
+  // emb (1,3,2) rows: r0 [99,1], r1 [2,9], r2 [8,3]; mask [0,1,1].
+  //   mean : (r1 + r2)/2 = ([2,9]+[8,3])/2 = [5,6]
+  //   max  : per-dim max over the unmasked r1,r2 (r0 forced -inf) = [8,9]
+  //   cls  : argmax([0,1,1]) = 1 → r1 = [2,9]   (first real token)
+  //   first: strict row 0, ignoring the mask = [99,1]
+  //   last : flipped [1,1,0], argmax 0, last = 3-0-1 = 2 → r2 = [8,3]
+  let emb = Array::from_slice(&[99.0_f32, 1.0, 2.0, 9.0, 8.0, 3.0], &(1, 3, 2)).unwrap();
+  let mask = Array::from_slice(&[0.0_f32, 1.0, 1.0], &(1, 3)).unwrap();
   for (strat, want) in [
-    (PoolingStrategy::Mean, [3.0_f32, 3.0]),
-    (PoolingStrategy::Max, [4.0, 4.0]),
-    (PoolingStrategy::Cls, [2.0, 2.0]),
-    (PoolingStrategy::First, [2.0, 2.0]),
-    (PoolingStrategy::Last, [4.0, 4.0]),
+    (PoolingStrategy::Mean, [5.0_f32, 6.0]),
+    (PoolingStrategy::Max, [8.0, 9.0]),
+    (PoolingStrategy::Cls, [2.0, 9.0]),
+    (PoolingStrategy::First, [99.0, 1.0]),
+    (PoolingStrategy::Last, [8.0, 3.0]),
   ] {
     let mut p = pool(&emb, &mask, strat, false, None, false, false).unwrap();
     assert_eq!(p.shape(), vec![1, 2], "shape for {strat:?}");
@@ -539,7 +544,17 @@ fn pooling_strategy_from_mode_accepts_known_modes_and_last_alias() {
 fn pooling_strategy_from_mode_rejects_unsupported_with_typed_payload() {
   // `weightedmean` / `mean_sqrt_len_tokens` are documented-unsupported;
   // anything else is the catch-all. Both → UnknownEnumValue carrying the
-  // type name, the offending value, and the static supported set.
+  // type name, the offending value, and the suggestion set.
+  //
+  // NOTE on `supported()`: it is intentionally the python
+  // `_SUPPORTED_POOL_MODES` reference set — exactly
+  // `["cls", "lasttoken", "max", "mean"]`, which the impl mirrors verbatim
+  // for a python-faithful diagnostic. It is the *suggestion* set, NOT the
+  // full set of accepted inputs: `from_mode` also accepts the swift-name
+  // aliases `first`, `last`, and `none` (proven by
+  // `pooling_strategy_from_mode_accepts_known_modes_and_last_alias`). This
+  // assertion pins that deliberate python-faithful subset; it does not claim
+  // those aliases are rejected.
   match PoolingStrategy::from_mode("weightedmean") {
     Err(Error::UnknownEnumValue(p)) => {
       assert_eq!(p.type_name(), "embeddings::PoolingStrategy");
