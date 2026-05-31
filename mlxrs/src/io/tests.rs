@@ -499,6 +499,96 @@ fn cb_free_is_noop() {
   let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ───────────────── fd-bound writer (non-seekable error paths) ─────────────────
+//
+// A pipe's write end is a NON-seekable fd: `File::seek`/`stream_position`
+// fail with `ESPIPE`. Wrapping it as a `File` lets us deterministically
+// drive the seek-failure branch of `save_safetensors_to_file` (the
+// `file.seek(SeekFrom::Start(0))` rewind) and the `cb_tell` / `cb_seek`
+// error-capture arms, which a regular seekable file never exercises.
+
+/// On a non-seekable fd, `save_safetensors_to_file` fails at the initial
+/// rewind (`file.seek(SeekFrom::Start(0))`) with a typed `Error::FileIo`
+/// whose op is `Other("seek")` — BEFORE any byte is written. Covers the
+/// seek-to-byte-0 error branch.
+#[cfg(unix)]
+#[test]
+fn save_safetensors_to_file_non_seekable_fd_fails_at_seek() {
+  use std::os::unix::io::FromRawFd;
+  let mut fds = [0_i32; 2];
+  // SAFETY: `fds` is a valid 2-int out-buffer; `libc::pipe` fills it with a
+  // (read, write) fd pair or returns non-zero on failure (asserted below).
+  let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+  assert_eq!(rc, 0, "pipe() must succeed to set up the non-seekable fd");
+  let read_fd = fds[0];
+  let write_fd = fds[1];
+  // SAFETY: `write_fd` is a freshly-created, owned pipe write-end fd; wrapping
+  // it in a `File` transfers ownership so it is closed exactly once on drop.
+  let mut wf = unsafe { File::from_raw_fd(write_fd) };
+
+  let arr = Array::from_slice::<f32>(&[1.0_f32, 2.0], &(2usize,)).unwrap();
+  let meta: HashMap<String, String> = HashMap::new();
+  match save_safetensors_to_file(&mut wf, std::iter::once(("w", &arr)), &meta) {
+    Err(Error::FileIo(p)) => {
+      assert_eq!(
+        p.op(),
+        FileOp::Other("seek"),
+        "a non-seekable fd must fail at the rewind seek, got op {:?}",
+        p.op()
+      );
+    }
+    other => panic!("expected Error::FileIo(seek) on a non-seekable fd, got {other:?}"),
+  }
+  drop(wf);
+  // SAFETY: `read_fd` is the owned read-end of the pipe, still open and not
+  // wrapped elsewhere; closing it exactly once releases the pipe.
+  unsafe {
+    libc::close(read_fd);
+  }
+}
+
+/// Driven directly: `cb_tell` on a non-seekable fd captures the
+/// `stream_position` `ESPIPE` error (returning 0), and `cb_seek` on the same
+/// fd captures its `seek` error. Both feed the err-cell so the safe wrapper
+/// can surface a `FileIo`. Covers the `cb_tell` and `cb_seek` IO-error arms.
+#[cfg(unix)]
+#[test]
+fn cb_tell_and_seek_on_non_seekable_fd_capture_error() {
+  use std::os::unix::io::FromRawFd;
+  let mut fds = [0_i32; 2];
+  // SAFETY: as above — valid out-buffer; rc asserted.
+  let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+  assert_eq!(rc, 0, "pipe() must succeed to set up the non-seekable fd");
+  let read_fd = fds[0];
+  let write_fd = fds[1];
+  // SAFETY: owns the write-end fd; `File` closes it exactly once on drop.
+  let mut wf = unsafe { File::from_raw_fd(write_fd) };
+
+  {
+    let state = WriterState::new(&mut wf);
+    let desc = state.as_desc();
+    // SAFETY: `desc` is the live `WriterState` pointer; the callbacks run
+    // synchronously here and only touch the borrowed (non-seekable) `File`
+    // and the err-cell. `cb_tell` returns 0 on the captured ESPIPE error;
+    // `cb_seek` records its own seek error.
+    let tell = unsafe {
+      let t = cb_tell(desc);
+      cb_seek(desc, 0, libc::SEEK_SET);
+      t
+    };
+    assert_eq!(tell, 0, "cb_tell on a non-seekable fd reports 0 on error");
+    assert!(
+      state.into_err().is_some(),
+      "tell/seek on a non-seekable fd must capture an io::Error"
+    );
+  }
+  drop(wf);
+  // SAFETY: `read_fd` is the owned, still-open read-end; closed exactly once.
+  unsafe {
+    libc::close(read_fd);
+  }
+}
+
 // ─────────────────────── GGUF (feature-gated) ───────────────────────
 
 /// `gguf_has_meta` is a pure rc → `Result<bool>` mapper, exercisable
@@ -576,6 +666,234 @@ fn gguf_round_trips_weights_and_typed_metadata() {
   }
   if let Some(GgufMetadata::StringList(v)) = lm.get("tokenizer.tokens") {
     assert_eq!(v, &vec!["<a>".to_string(), "<b>".to_string()]);
+  }
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Deterministically exercise the THREE metadata-resolving arms of
+/// `load_gguf` (the `is_meta_arr` / `is_meta_str` / `is_meta_vstr`
+/// branches) plus the `StringGuard` / inner `VectorStringGuard` drops.
+///
+/// **Why the previous round-trip test could not reach these arms.** mlx-c's
+/// `mlx_io_gguf_get_keys` enumerates the *tensor* map only (the GGUF
+/// `.first` map, populated from `gguf_get_tensor`); typed metadata lives in
+/// the disjoint `.second` map (populated from `gguf_get_key`). The load loop
+/// iterates the tensor keys and probes `has_metadata_*` for each — so a key
+/// present ONLY as metadata is never visited, and a key present only as a
+/// tensor probes `has_metadata_*` → rc 2 (absent) → always lands in the
+/// weight (else) arm. The metadata arms therefore fire only for a name that
+/// is present in BOTH the tensor section and the KV-metadata section.
+///
+/// GGUF stores tensors and KV-metadata in separate sections with no
+/// cross-section name dedup (vendored `gguflib.c::gguf_append_kv` /
+/// `gguf_append_tensor_info` write names verbatim; `gguf_append_kv` only
+/// requires all KV to precede any tensor, which mlx-core's `save_gguf`
+/// already honors). So saving a weight AND a typed-metadata entry under the
+/// same key name yields a file where that name resolves as a tensor key
+/// (listed by `get_keys`) whose `has_metadata_<type>` probe succeeds —
+/// driving the load into the matching metadata arm.
+///
+/// INDEPENDENT closed-form oracle: every expected value/shape/dtype below is
+/// a literal written into the maps here, never produced by `load_gguf`.
+///
+/// NOTE: relies on the disjoint-namespace + same-name-collision behavior of
+/// the vendored gguflib/mlx-core round-trip documented above. If a future
+/// mlx-core/gguflib bump rejects a name shared across the tensor and KV
+/// sections, this test's collision premise (and these load arms) would need
+/// revisiting.
+#[cfg(feature = "gguf")]
+#[test]
+fn gguf_load_resolves_array_string_list_metadata_branches() {
+  let dir = fresh_dir("gguf-meta-branches");
+  let path = dir.join("model.gguf");
+
+  // A 1-D int32 metadata array (mlx-core forbids ndim > 1 and empty arrays
+  // for GGUF metadata). Round-trips to shape [3], dtype I32.
+  let meta_arr = Array::from_slice::<i32>(&[7_i32, 8, 9], &(3usize,)).unwrap();
+  // A plain (non-colliding) weight to also cover the weight (else) arm and
+  // prove tensors still resolve when no metadata shares the name.
+  let plain_w = Array::from_slice::<f32>(&[1.5_f32, 2.5], &(2usize,)).unwrap();
+  // Tensors written under the SAME names as the typed metadata so the load
+  // loop visits these keys (they are in the tensor key list) and the
+  // per-key `has_metadata_<type>` probe succeeds, selecting the metadata arm.
+  let collide_arr_w = Array::from_slice::<f32>(&[0.0_f32], &(1usize,)).unwrap();
+  let collide_str_w = Array::from_slice::<f32>(&[0.0_f32], &(1usize,)).unwrap();
+  let collide_list_w = Array::from_slice::<f32>(&[0.0_f32], &(1usize,)).unwrap();
+
+  let mut weights: HashMap<String, Array> = HashMap::new();
+  weights.insert("blk.0.weight".to_string(), plain_w);
+  weights.insert("meta.array.key".to_string(), collide_arr_w);
+  weights.insert("meta.string.key".to_string(), collide_str_w);
+  weights.insert("meta.list.key".to_string(), collide_list_w);
+
+  let mut metadata: HashMap<String, GgufMetadata> = HashMap::new();
+  metadata.insert("meta.array.key".to_string(), GgufMetadata::Array(meta_arr));
+  metadata.insert(
+    "meta.string.key".to_string(),
+    GgufMetadata::String("hello-gguf".to_string()),
+  );
+  metadata.insert(
+    "meta.list.key".to_string(),
+    GgufMetadata::StringList(vec![
+      "tok0".to_string(),
+      "tok1".to_string(),
+      "tok2".to_string(),
+    ]),
+  );
+
+  save_gguf(&path, &weights, &metadata).unwrap();
+  assert!(path.exists());
+
+  let (mut lw, lm) = load_gguf(&path).unwrap();
+
+  // The non-colliding weight resolves through the weight (else) arm.
+  assert_eq!(
+    lw.get_mut("blk.0.weight").unwrap().to_vec::<f32>().unwrap(),
+    vec![1.5_f32, 2.5]
+  );
+
+  // Array metadata arm: the colliding key resolves as metadata (its
+  // `has_metadata_array` probe succeeds), so it is NOT in the weight map and
+  // its int32 values/shape/dtype round-trip from the literals written above.
+  assert!(
+    !lw.contains_key("meta.array.key"),
+    "a tensor+array-metadata name resolves into metadata, not weights"
+  );
+  match lm.get("meta.array.key") {
+    Some(GgufMetadata::Array(a)) => {
+      let mut a = a.try_clone().unwrap();
+      assert_eq!(a.shape(), vec![3]);
+      assert_eq!(a.dtype().unwrap(), Dtype::I32);
+      assert_eq!(a.to_vec::<i32>().unwrap(), vec![7, 8, 9]);
+    }
+    other => panic!("expected Array metadata for meta.array.key, got {other:?}"),
+  }
+
+  // String metadata arm (exercises the `StringGuard` create/populate/drop and
+  // the `mlx_string_data` copy-out).
+  match lm.get("meta.string.key") {
+    Some(GgufMetadata::String(s)) => assert_eq!(s, "hello-gguf"),
+    other => panic!("expected String metadata for meta.string.key, got {other:?}"),
+  }
+
+  // StringList metadata arm (exercises the inner `VectorStringGuard` + the
+  // per-element `mlx_vector_string_get` copy loop and `drop(vstr_guard)`).
+  match lm.get("meta.list.key") {
+    Some(GgufMetadata::StringList(v)) => {
+      assert_eq!(
+        v,
+        &vec!["tok0".to_string(), "tok1".to_string(), "tok2".to_string()]
+      );
+    }
+    other => panic!("expected StringList metadata for meta.list.key, got {other:?}"),
+  }
+
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ───────────────── GGUF save interior-NUL validation ─────────────────
+//
+// `save_gguf` rejects interior-NUL bytes in weight keys, metadata keys,
+// metadata string values, and metadata list entries with a typed
+// `Error::InteriorNul` BEFORE the `mlx_save_gguf` write, each keyed by a
+// distinct (context, bytes_kind) pair. Each test uses a SINGLE offending
+// map entry so the failing branch is reached deterministically regardless
+// of `HashMap` iteration order.
+
+/// A weight KEY with an interior NUL is rejected in the weights-insert loop
+/// (`gguf weight key`).
+#[cfg(feature = "gguf")]
+#[test]
+fn gguf_save_weight_key_with_interior_nul_is_rejected() {
+  let dir = fresh_dir("gguf-nul-weight-key");
+  let path = dir.join("m.gguf");
+  let w = Array::from_slice::<f32>(&[1.0_f32], &(1usize,)).unwrap();
+  let mut weights: HashMap<String, Array> = HashMap::new();
+  weights.insert("bad\0weight".to_string(), w);
+  let metadata: HashMap<String, GgufMetadata> = HashMap::new();
+  match save_gguf(&path, &weights, &metadata).unwrap_err() {
+    Error::InteriorNul(payload) => {
+      assert_eq!(payload.context(), "io::gguf_save: weights insert");
+      assert_eq!(payload.bytes_kind(), "gguf weight key");
+    }
+    other => panic!("expected InteriorNul(gguf weight key), got {other:?}"),
+  }
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A metadata KEY with an interior NUL is rejected in the metadata-insert
+/// loop (`gguf metadata key`). No weights, so the weights loop is skipped
+/// and the metadata loop's per-key `CString::new` is the first failure.
+#[cfg(feature = "gguf")]
+#[test]
+fn gguf_save_metadata_key_with_interior_nul_is_rejected() {
+  let dir = fresh_dir("gguf-nul-meta-key");
+  let path = dir.join("m.gguf");
+  let weights: HashMap<String, Array> = HashMap::new();
+  let mut metadata: HashMap<String, GgufMetadata> = HashMap::new();
+  metadata.insert(
+    "bad\0meta".to_string(),
+    GgufMetadata::String("v".to_string()),
+  );
+  match save_gguf(&path, &weights, &metadata).unwrap_err() {
+    Error::InteriorNul(payload) => {
+      assert_eq!(payload.context(), "io::gguf_save: metadata insert");
+      assert_eq!(payload.bytes_kind(), "gguf metadata key");
+    }
+    other => panic!("expected InteriorNul(gguf metadata key), got {other:?}"),
+  }
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `String`-metadata VALUE with an interior NUL is rejected inside the
+/// `GgufMetadata::String` arm (`gguf metadata string value`). The key is
+/// NUL-free so the per-key `CString::new` succeeds and the value check is
+/// the failure.
+#[cfg(feature = "gguf")]
+#[test]
+fn gguf_save_metadata_string_value_with_interior_nul_is_rejected() {
+  let dir = fresh_dir("gguf-nul-meta-strval");
+  let path = dir.join("m.gguf");
+  let weights: HashMap<String, Array> = HashMap::new();
+  let mut metadata: HashMap<String, GgufMetadata> = HashMap::new();
+  metadata.insert(
+    "general.name".to_string(),
+    GgufMetadata::String("bad\0value".to_string()),
+  );
+  match save_gguf(&path, &weights, &metadata).unwrap_err() {
+    Error::InteriorNul(payload) => {
+      assert_eq!(payload.context(), "io::gguf_save: metadata string insert");
+      assert_eq!(payload.bytes_kind(), "gguf metadata string value");
+    }
+    other => panic!("expected InteriorNul(gguf metadata string value), got {other:?}"),
+  }
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `StringList`-metadata ENTRY with an interior NUL is rejected inside the
+/// list-append loop of the `GgufMetadata::StringList` arm (`gguf metadata
+/// list entry`). Single metadata entry + single offending list element →
+/// deterministic.
+#[cfg(feature = "gguf")]
+#[test]
+fn gguf_save_metadata_list_entry_with_interior_nul_is_rejected() {
+  let dir = fresh_dir("gguf-nul-meta-listentry");
+  let path = dir.join("m.gguf");
+  let weights: HashMap<String, Array> = HashMap::new();
+  let mut metadata: HashMap<String, GgufMetadata> = HashMap::new();
+  metadata.insert(
+    "tokenizer.tokens".to_string(),
+    GgufMetadata::StringList(vec!["ok".to_string(), "bad\0entry".to_string()]),
+  );
+  match save_gguf(&path, &weights, &metadata).unwrap_err() {
+    Error::InteriorNul(payload) => {
+      assert_eq!(
+        payload.context(),
+        "io::gguf_save: metadata list-entry append"
+      );
+      assert_eq!(payload.bytes_kind(), "gguf metadata list entry");
+    }
+    other => panic!("expected InteriorNul(gguf metadata list entry), got {other:?}"),
   }
   let _ = std::fs::remove_dir_all(&dir);
 }

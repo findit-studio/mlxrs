@@ -324,4 +324,131 @@ mod tests {
       .and_then(|a| a.with_learning_rate(LearningRate::Fixed(f32::NAN)));
     assert!(res.is_err(), "with_learning_rate must reject Fixed(NaN)");
   }
+
+  // ── Config getters echo constructor inputs ────────────────────────────────
+
+  #[test]
+  fn adadelta_getters_echo_inputs() -> Result<()> {
+    // Distinct non-default values so every getter is observably distinct.
+    // Covers `learning_rate_ref`, `rho`, `eps`, plus the trait `step()` /
+    // `learning_rate()` on a fresh optimizer.
+    let ad = AdaDelta::new(LearningRate::Fixed(0.5), 0.8, 1e-5)?;
+    assert!(
+      ad.learning_rate_ref().is_fixed(),
+      "learning_rate_ref must echo the Fixed schedule"
+    );
+    assert_eq!(ad.rho(), 0.8);
+    assert_eq!(ad.eps(), 1e-5);
+    assert_eq!(ad.learning_rate(), 0.5);
+    assert_eq!(ad.step(), 0);
+    Ok(())
+  }
+
+  #[test]
+  fn adadelta_default_with_lr_getters() -> Result<()> {
+    // Exercises the Python-default getter values.
+    let ad = AdaDelta::default_with_lr(1.0)?;
+    assert_eq!(ad.rho(), 0.9);
+    assert_eq!(ad.eps(), 1e-6);
+    assert!(ad.learning_rate_ref().is_fixed());
+    Ok(())
+  }
+
+  // ── Builder success paths (echo the set value) ────────────────────────────
+
+  #[test]
+  fn adadelta_builder_success_paths_echo() -> Result<()> {
+    // Each `with_*` success arm must echo its input. `with_learning_rate`'s
+    // success arm resolves the fixed value at step 0.
+    let ad = AdaDelta::default_with_lr(1.0)?
+      .with_learning_rate(LearningRate::Fixed(0.5))?
+      .with_rho(0.7)?
+      .with_eps(2e-7)?;
+    assert_eq!(ad.learning_rate(), 0.5);
+    assert!(ad.learning_rate_ref().is_fixed());
+    assert_eq!(ad.rho(), 0.7);
+    assert_eq!(ad.eps(), 2e-7);
+    Ok(())
+  }
+
+  // ── Two-step apply: preflight re-resolution + trait step()/learning_rate() ─
+
+  #[test]
+  fn adadelta_two_steps_preflight_re_resolves() -> Result<()> {
+    // First apply hits preflight's step-0 cache (stamped by `new`); the second
+    // apply lands at step_count=1 with the stamp still Some(0), so `preflight`
+    // re-resolves the fixed LR via its non-cache body. Also covers the trait
+    // `init`, `step()`, and `learning_rate()`.
+    let mut ad = AdaDelta::default_with_lr(1.0)?;
+    let mut params: Weights = HashMap::new();
+    params.insert("w".into(), scalar(1.0)?);
+    let mut grads: Weights = HashMap::new();
+    grads.insert("w".into(), scalar(0.5)?);
+    ad.init(&params)?;
+    assert_eq!(ad.step(), 0);
+    ad.apply_gradients(&grads, &mut params)?;
+    let after_one = read_scalar(&params["w"])?;
+    assert_eq!(ad.step(), 1);
+    ad.apply_gradients(&grads, &mut params)?;
+    let after_two = read_scalar(&params["w"])?;
+    assert_eq!(ad.step(), 2);
+    assert_eq!(ad.learning_rate(), 1.0);
+    // Constant positive grad ⇒ weight keeps decreasing.
+    assert!(after_two < after_one, "weight should keep decreasing");
+    Ok(())
+  }
+
+  // ── None-state arm + skip-absent-grad-key ─────────────────────────────────
+
+  #[test]
+  fn adadelta_step_none_state_arm_via_uninit_grad_key() -> Result<()> {
+    // The per-key `None` state arm (no prior `(v, u)` for the key) is reached
+    // when a grad key was NOT pre-initialized: explicit `init` with a SUBSET
+    // of params, then `apply_gradients` with an extra present grad key that
+    // hits `None => (zeros_like, zeros_like)` — equivalent to fresh zero
+    // moments, so the single-step closed form applies.
+    //   w=1.0, g=0.5, lr=1.0, ρ=0.9, eps=1e-6 (u=v=0):
+    //     v   = 0.1·0.25 = 0.025
+    //     Δw  = sqrt(1e-6) / sqrt(0.025+1e-6) · 0.5 ≈ 0.003163
+    //     w_new ≈ 0.996837.
+    let mut ad = AdaDelta::default_with_lr(1.0)?;
+    let mut init_params: Weights = HashMap::new();
+    init_params.insert("a".into(), scalar(1.0)?);
+    ad.init(&init_params)?;
+    assert!(
+      !ad.state.is_empty(),
+      "explicit init populated state for 'a'"
+    );
+    let mut params: Weights = HashMap::new();
+    params.insert("a".into(), scalar(1.0)?);
+    params.insert("b".into(), scalar(1.0)?);
+    let mut grads: Weights = HashMap::new();
+    grads.insert("a".into(), scalar(0.5)?);
+    grads.insert("b".into(), scalar(0.5)?);
+    ad.apply_gradients(&grads, &mut params)?;
+    let got_b = read_scalar(&params["b"])?;
+    assert!((got_b - 0.996_837).abs() < 1e-4, "b got {got_b}");
+    Ok(())
+  }
+
+  #[test]
+  fn adadelta_skips_grad_key_absent_from_params() -> Result<()> {
+    // A gradient whose key has no matching parameter must be skipped (the
+    // `let Some(param) = params.get(key) else { continue }` guard), leaving
+    // the present parameter updated and the absent one never materialized.
+    let mut ad = AdaDelta::default_with_lr(1.0)?;
+    let mut params: Weights = HashMap::new();
+    params.insert("present".into(), scalar(1.0)?);
+    let mut grads: Weights = HashMap::new();
+    grads.insert("present".into(), scalar(0.5)?);
+    grads.insert("absent".into(), scalar(0.5)?);
+    ad.apply_gradients(&grads, &mut params)?;
+    let got = read_scalar(&params["present"])?;
+    assert!((got - 0.996_837).abs() < 1e-4, "present got {got}");
+    assert!(
+      !params.contains_key("absent"),
+      "absent grad must not be added to params"
+    );
+    Ok(())
+  }
 }

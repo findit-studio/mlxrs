@@ -495,3 +495,241 @@ fn encode_cls_accepts_correct_shape_raw_pooled_output() {
   assert!(vclose(&v[0..2], &[7.0, 5.0]));
   assert!(vclose(&v[2..4], &[6.0, 4.0]));
 }
+
+// ---- EncodeConfig builders + accessors (round-trip) ----
+
+/// Every `with_*` builder must persist its value and every accessor must
+/// return it. Covers the builders/accessors the orchestration tests above do
+/// not already touch (`with_max_length` / `with_pad_token_id` /
+/// `with_dimension` / `with_apply_layer_norm` / `with_apply_rms_norm` and all
+/// eight getters), and pins the documented defaults.
+#[test]
+fn encode_config_builders_and_accessors_round_trip() {
+  // Documented defaults (mirrors `EncodeConfig::default`).
+  let d = EncodeConfig::new();
+  assert_eq!(d.strategy(), PoolingStrategy::Mean);
+  assert!(d.normalize());
+  assert!(d.add_special_tokens());
+  assert_eq!(d.max_length(), Some(512));
+  assert_eq!(d.pad_token_id(), 0);
+  assert_eq!(d.dimension(), None);
+  assert!(!d.apply_layer_norm());
+  assert!(!d.apply_rms_norm());
+
+  // Override every field to a non-default value and read it back.
+  let cfg = EncodeConfig::new()
+    .with_strategy(PoolingStrategy::Max)
+    .with_normalize(false)
+    .with_add_special_tokens(false)
+    .with_max_length(None)
+    .with_pad_token_id(7)
+    .with_dimension(Some(3))
+    .with_apply_layer_norm(true)
+    .with_apply_rms_norm(true);
+  assert_eq!(cfg.strategy(), PoolingStrategy::Max);
+  assert!(!cfg.normalize());
+  assert!(!cfg.add_special_tokens());
+  assert_eq!(cfg.max_length(), None);
+  assert_eq!(cfg.pad_token_id(), 7);
+  assert_eq!(cfg.dimension(), Some(3));
+  assert!(cfg.apply_layer_norm());
+  assert!(cfg.apply_rms_norm());
+
+  // `with_max_length(Some(n))` and `with_dimension(Some(n))` carry the inner
+  // value (the `None` arm is covered above).
+  let some = EncodeConfig::new()
+    .with_max_length(Some(8))
+    .with_dimension(Some(16));
+  assert_eq!(some.max_length(), Some(8));
+  assert_eq!(some.dimension(), Some(16));
+}
+
+// ---- tokenize_and_pad: id-overflow guards ----
+
+/// A whitespace word-level tokenizer whose single vocab entry maps to a token
+/// id `> i32::MAX` (`0x8000_0000` = 2_147_483_648). Encoding that word yields
+/// an id that does NOT fit in `i32` (MLX's index dtype), so
+/// `tokenize_and_pad`'s CHECKED `u32 -> i32` conversion of a *real* token id
+/// must reject it with [`Error::OutOfRange`] rather than wrapping to a
+/// negative index. Built + loaded the same `from_path` way as
+/// [`word_tokenizer`], in its own temp dir.
+fn huge_id_tokenizer() -> Tokenizer {
+  use tokenizers::{
+    Tokenizer as HfTokenizer, models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace,
+  };
+
+  // One word -> an id beyond i32::MAX. `unk_token` must be a key present in
+  // the vocab, so it shares the same out-of-range id (every produced id is
+  // therefore out of i32 range).
+  let big_id: u32 = 0x8000_0000; // 2_147_483_648 > i32::MAX (2_147_483_647)
+  let vocab = [("big".to_string(), big_id)].into_iter().collect();
+  let wl = WordLevel::builder()
+    .vocab(vocab)
+    .unk_token("big".to_string())
+    .build()
+    .unwrap();
+  let mut hf = HfTokenizer::new(wl);
+  hf.with_pre_tokenizer(Some(Whitespace {}));
+
+  static FIXTURE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+  let dir = FIXTURE.get_or_init(|| {
+    let dir =
+      std::env::temp_dir().join(format!("mlxrs-emb-encode-huge-tok-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    hf.save(dir.join("tokenizer.json"), false).unwrap();
+    dir
+  });
+  Tokenizer::from_path(dir, None).unwrap()
+}
+
+/// A real token id `> i32::MAX` must be rejected with [`Error::OutOfRange`]
+/// (the CHECKED per-id `u32 -> i32` conversion), not silently wrapped to a
+/// negative index. `pad_token_id` is left at a valid `0` so the failure is
+/// unambiguously the token-id path, not the pad-id pre-check.
+#[test]
+fn tokenize_and_pad_rejects_token_id_above_i32_max() {
+  let tok = huge_id_tokenizer();
+  let err = tokenize_and_pad(&tok, &["big"], false, None, 0).unwrap_err();
+  match err {
+    Error::OutOfRange(p) => {
+      assert_eq!(p.context(), "encode: token id");
+      assert_eq!(p.value(), "2147483648");
+    }
+    other => panic!("expected OutOfRange(token id), got {other:?}"),
+  }
+}
+
+/// The same overflow surfaces through the public [`encode`] entry (which calls
+/// `tokenize_and_pad` first): a vocab id `> i32::MAX` is a recoverable
+/// `OutOfRange`, never a panic or wrapped index.
+#[test]
+fn encode_rejects_token_id_above_i32_max() {
+  let tok = huge_id_tokenizer();
+  let model = MockEmbeddingModel::new(vec![vec![1.0, 0.0]]);
+  let cfg = EncodeConfig::new().with_add_special_tokens(false);
+  let err = encode(&model, &tok, &["big"], &cfg).unwrap_err();
+  assert!(
+    matches!(err, Error::OutOfRange(ref p) if p.context() == "encode: token id"),
+    "expected OutOfRange(token id), got {err:?}"
+  );
+}
+
+/// A `pad_token_id` `> i32::MAX` must be rejected up front with
+/// [`Error::OutOfRange`] (the single pad-id range-check), independent of
+/// whether the batch actually needs any padding. A single in-range word keeps
+/// the per-token id path clean, so the only out-of-range value is the pad id.
+#[test]
+fn tokenize_and_pad_rejects_pad_token_id_above_i32_max() {
+  let tok = word_tokenizer();
+  let bad_pad: u32 = 0x8000_0000; // > i32::MAX
+  let err = tokenize_and_pad(&tok, &["a b"], false, None, bad_pad).unwrap_err();
+  match err {
+    Error::OutOfRange(p) => {
+      assert_eq!(p.context(), "encode: pad_token_id");
+      assert_eq!(p.value(), "2147483648");
+    }
+    other => panic!("expected OutOfRange(pad_token_id), got {other:?}"),
+  }
+}
+
+/// The `pad_token_id` overflow also surfaces through the public [`encode`]
+/// entry via its [`EncodeConfig::with_pad_token_id`] knob.
+#[test]
+fn encode_rejects_pad_token_id_above_i32_max() {
+  let tok = word_tokenizer();
+  let model = MockEmbeddingModel::new(vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+  let cfg = EncodeConfig::new()
+    .with_add_special_tokens(false)
+    .with_pad_token_id(0x8000_0000);
+  let err = encode(&model, &tok, &["a b"], &cfg).unwrap_err();
+  assert!(
+    matches!(err, Error::OutOfRange(ref p) if p.context() == "encode: pad_token_id"),
+    "expected OutOfRange(pad_token_id), got {err:?}"
+  );
+}
+
+// ---- pooled_output fast-path: last_hidden_state rank-3 guard ----
+
+/// A model returning a caller-supplied `last_hidden_state` AND `pooled_output`
+/// of exact shapes (no tiling / reshaping). Lets a test drive the pooled-output
+/// fast-path with a `last_hidden_state` of arbitrary rank to exercise the
+/// rank-3 guard that [`RawPooledModel`] (which always forwards
+/// [`MockEmbeddingModel`]'s rank-3 hidden states) cannot reach.
+struct RawShapeModel {
+  hidden_data: Vec<f32>,
+  hidden_shape: Vec<usize>,
+  pooled_data: Vec<f32>,
+  pooled_shape: Vec<usize>,
+}
+
+impl EmbeddingModel for RawShapeModel {
+  fn forward(&self, _input_ids: &Array, _attention_mask: &Array) -> Result<EmbeddingModelOutput> {
+    let last_hidden_state =
+      Array::from_slice::<f32>(&self.hidden_data, &self.hidden_shape.as_slice())?;
+    let pooled = Array::from_slice::<f32>(&self.pooled_data, &self.pooled_shape.as_slice())?;
+    Ok(EmbeddingModelOutput::new(last_hidden_state, Some(pooled)))
+  }
+}
+
+/// In the `Cls` pooled-output fast-path, after the pooler passes the rank-2 and
+/// batch checks, a `last_hidden_state` that is NOT rank-3 must be rejected with
+/// [`Error::RankMismatch`] (the guard at the hidden-axis-width comparison).
+/// Here the pooler is a valid `(2, 2)` for the 2-text batch, but the hidden
+/// states are rank-2 `(2, 2)` — so the width comparison cannot index axis 2
+/// and the rank check fires first.
+#[test]
+fn encode_cls_rejects_non_rank3_hidden_state_in_pooled_path() {
+  let tok = word_tokenizer();
+  let model = RawShapeModel {
+    // Rank-2 hidden states (missing the seq_len axis).
+    hidden_data: vec![1.0, 2.0, 3.0, 4.0],
+    hidden_shape: vec![2, 2],
+    // Valid rank-2 pooler covering the 2-text batch.
+    pooled_data: vec![7.0, 5.0, 6.0, 4.0],
+    pooled_shape: vec![2, 2],
+  };
+  let cfg = EncodeConfig::new()
+    .with_add_special_tokens(false)
+    .with_strategy(PoolingStrategy::Cls)
+    .with_normalize(false);
+  let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
+  match err {
+    Error::RankMismatch(p) => {
+      assert_eq!(
+        p.context(),
+        "encode: model last_hidden_state must be rank-3 (batch, seq_len, hidden)"
+      );
+      assert_eq!(p.actual(), 2);
+    }
+    other => panic!("expected RankMismatch(last_hidden_state), got {other:?}"),
+  }
+}
+
+/// Same rank-3-hidden-state guard for the `None` strategy's pooled-output
+/// bypass: a rank-1 `last_hidden_state` alongside a valid `(2, 2)` pooler is a
+/// [`Error::RankMismatch`].
+#[test]
+fn encode_none_rejects_non_rank3_hidden_state_in_pooled_path() {
+  let tok = word_tokenizer();
+  let model = RawShapeModel {
+    // Rank-1 hidden states.
+    hidden_data: vec![1.0, 2.0, 3.0, 4.0],
+    hidden_shape: vec![4],
+    pooled_data: vec![7.0, 5.0, 6.0, 4.0],
+    pooled_shape: vec![2, 2],
+  };
+  let cfg = EncodeConfig::new()
+    .with_add_special_tokens(false)
+    .with_strategy(PoolingStrategy::None)
+    .with_normalize(false);
+  let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
+  assert!(
+    matches!(
+      err,
+      Error::RankMismatch(ref p)
+        if p.context() == "encode: model last_hidden_state must be rank-3 (batch, seq_len, hidden)"
+        && p.actual() == 1
+    ),
+    "expected RankMismatch(last_hidden_state, actual=1), got {err:?}"
+  );
+}
