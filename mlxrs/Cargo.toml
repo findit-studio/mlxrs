@@ -29,7 +29,7 @@ llguidance           = ["lm", "dep:llguidance", "dep:toktrie_hf_tokenizers", "de
 vlm                  = ["lm", "dep:image"]
 audio                = ["lm", "dep:symphonia", "dep:cpal", "dep:unicode-normalization", "dep:xattr"]
 unstable-ops-overload = []
-gguf                 = [] # opt-in GGUF load/save API (mlx-c `mlx_io_gguf*`); gguflib is vendored + linked by mlxrs-sys (#28).
+gguf                 = []
 
 [dependencies]
 mlxrs-sys.workspace = true
