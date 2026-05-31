@@ -1533,3 +1533,946 @@ mod deepseek_v32 {
     }
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  // ---------------------------------------------------------------------
+  // coerce_indent — the full `json.dumps(indent=...)` domain (None /
+  // undefined / bool / str / int / over-cap / negative / non-coercible).
+  // Closed-form: each input maps to a hand-derived Option<Vec<u8>> / JErr.
+  // ---------------------------------------------------------------------
+
+  #[test]
+  fn coerce_indent_none_and_undefined_yield_none() {
+    // `none` literal and an undefined value both take the compact path.
+    assert_eq!(coerce_indent(&JValue::from(())).unwrap(), None);
+    assert_eq!(coerce_indent(&JValue::UNDEFINED).unwrap(), None);
+  }
+
+  #[test]
+  fn coerce_indent_bool_maps_to_one_or_zero_spaces() {
+    // Python `json.dumps(indent=True)` ≡ indent=1 → one space.
+    assert_eq!(
+      coerce_indent(&JValue::from(true)).unwrap(),
+      Some(b" ".to_vec())
+    );
+    // `False` ≡ indent=0 → empty per-level indent (newline, no indent).
+    assert_eq!(
+      coerce_indent(&JValue::from(false)).unwrap(),
+      Some(Vec::new())
+    );
+  }
+
+  #[test]
+  fn coerce_indent_str_used_verbatim() {
+    assert_eq!(
+      coerce_indent(&JValue::from("\t")).unwrap(),
+      Some(b"\t".to_vec())
+    );
+    // empty string → no-indent (like indent=0).
+    assert_eq!(coerce_indent(&JValue::from("")).unwrap(), Some(Vec::new()));
+  }
+
+  #[test]
+  fn coerce_indent_int_yields_that_many_spaces() {
+    assert_eq!(
+      coerce_indent(&JValue::from(4i64)).unwrap(),
+      Some(b"    ".to_vec())
+    );
+    // negative → clamped to empty (Python: 0/negative → no indent).
+    assert_eq!(
+      coerce_indent(&JValue::from(-3i64)).unwrap(),
+      Some(Vec::new())
+    );
+    // boundary: exactly the cap is allowed.
+    assert_eq!(
+      coerce_indent(&JValue::from(1024i64)).unwrap(),
+      Some(vec![b' '; 1024])
+    );
+  }
+
+  #[test]
+  fn coerce_indent_over_cap_is_recoverable_error() {
+    // An enormous indent must NOT attempt a multi-exabyte allocation; it
+    // returns a recoverable JErr instead of aborting the process.
+    let err = coerce_indent(&JValue::from(2000i64)).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidOperation);
+  }
+
+  #[test]
+  fn coerce_indent_non_int_string_bool_is_error() {
+    // A value that is neither none/undefined, bool, str, nor int-coercible
+    // (here a JSON array) → typed JErr (line 138-143). A non-integral float
+    // likewise fails i64 coercion.
+    let arr = JValue::from_serialize(serde_json::json!([1, 2]));
+    let err = coerce_indent(&arr).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidOperation);
+
+    let frac = JValue::from(3.5f64);
+    assert!(coerce_indent(&frac).is_err());
+  }
+
+  // ---------------------------------------------------------------------
+  // py_json_dumps — compact (Python separators) vs. pretty (indent bytes).
+  // ---------------------------------------------------------------------
+
+  #[test]
+  fn py_json_dumps_compact_uses_python_separators() {
+    // None indent → compact with `", "` / `": "` (NOT serde's `,`/`:`).
+    let v = serde_json::json!({"a": 1, "b": [2, 3]});
+    let out = py_json_dumps(&v, None).unwrap();
+    assert_eq!(out, r#"{"a": 1, "b": [2, 3]}"#);
+  }
+
+  #[test]
+  fn py_json_dumps_pretty_uses_indent_bytes() {
+    let v = serde_json::json!({"a": 1});
+    let out = py_json_dumps(&v, Some(b"  ")).unwrap();
+    assert_eq!(out, "{\n  \"a\": 1\n}");
+  }
+
+  // ---------------------------------------------------------------------
+  // strip_generation_tags — delimiter pre-lexer branches.
+  // ---------------------------------------------------------------------
+
+  #[test]
+  fn strip_generation_tags_fast_path_no_keyword() {
+    // No "generation" substring → borrowed, untouched.
+    let t = "{% for x in y %}{{ x }}{% endfor %}";
+    assert!(matches!(
+      strip_generation_tags(t),
+      std::borrow::Cow::Borrowed(_)
+    ));
+  }
+
+  #[test]
+  fn strip_generation_tags_rewrites_block_and_preserves_raw() {
+    // generation → `if true`, endgeneration → `endif`; the `{% raw %}` block
+    // (with an interior generation-looking literal) is copied verbatim.
+    let t = "{% generation %}X{% raw %}{% generation %}{% endraw %}Y{% endgeneration %}";
+    let out = strip_generation_tags(t);
+    let s = out.as_ref();
+    assert!(s.starts_with("{% if true %}X{% raw %}{% generation %}{% endraw %}Y"));
+    assert!(s.ends_with("{% endif %}"));
+    // The raw body's interior `{% generation %}` must NOT be rewritten.
+    assert!(s.contains("{% raw %}{% generation %}{% endraw %}"));
+  }
+
+  #[test]
+  fn strip_generation_tags_preserves_ws_control_markers() {
+    // `-`/`+`/none markers on each side are preserved verbatim.
+    let out = strip_generation_tags("{%- generation +%}body{%+ endgeneration -%}");
+    assert_eq!(out.as_ref(), "{%- if true +%}body{%+ endif -%}");
+  }
+
+  #[test]
+  fn strip_generation_tags_unterminated_tag_copied_to_eof() {
+    // `{%` with the keyword but no closing `%}` → copy the rest verbatim
+    // (lines 467-468). Keyword present only inside an unterminated tag →
+    // not rewritten → borrowed.
+    let out = strip_generation_tags("before {% generation");
+    assert_eq!(out.as_ref(), "before {% generation");
+  }
+
+  #[test]
+  fn strip_generation_tags_lone_brace_is_literal_text() {
+    // `{x` (second byte not `{`/`%`/`#`) is literal text (line 472).
+    let out = strip_generation_tags("{x has generation word");
+    assert_eq!(out.as_ref(), "{x has generation word");
+  }
+
+  #[test]
+  fn strip_generation_tags_non_target_tag_passed_through() {
+    // A non-target `{% if %}` tag whose keyword embeds nothing is copied
+    // opaquely; the bare "generation" word in text is left alone.
+    let out = strip_generation_tags("{% if generation %}hi{% endif %}");
+    assert_eq!(out.as_ref(), "{% if generation %}hi{% endif %}");
+  }
+
+  // ---------------------------------------------------------------------
+  // find_comment_close / find_expr_close / find_tag_close / find_endraw /
+  // match_endraw_delim — byte-level scanner edge branches.
+  // ---------------------------------------------------------------------
+
+  #[test]
+  fn find_comment_close_terminated_and_unterminated() {
+    // Closed at first `#}` (index just past it).
+    assert_eq!(find_comment_close("{# abc #} z", 2), "{# abc #}".len());
+    // Unterminated → template length (line 509).
+    let t = "{# no close";
+    assert_eq!(find_comment_close(t, 2), t.len());
+  }
+
+  #[test]
+  fn find_expr_close_string_escape_and_unterminated() {
+    // A `}}` inside a string literal does not close; an escaped quote does
+    // not toggle string state (lines 529-530); real close is after the
+    // string ends.
+    let t = "{{ \"a\\\"}}b\" }}";
+    // Bytes: {{ "a\"}}b" }}  — the inner }} is inside the string, real close
+    // is the trailing }}.
+    assert_eq!(find_expr_close(t, 2), t.len());
+    // Unterminated expression → template length (line 546).
+    let u = "{{ x + y";
+    assert_eq!(find_expr_close(u, 2), u.len());
+  }
+
+  #[test]
+  fn find_tag_close_string_escape_and_unterminated() {
+    // Escaped quote inside a tag string does not toggle state (694-695);
+    // the `%}` after the string closes the tag.
+    let t = "{% x \"a\\\"b\" %}";
+    let close = find_tag_close(t, 2).unwrap();
+    // `close` is the index of `%` in the final `%}`.
+    assert_eq!(&t[close..close + 2], "%}");
+    // A `%}` inside a string does NOT close the tag.
+    let s = "{% set q = \"%}\" %}";
+    let close2 = find_tag_close(s, 2).unwrap();
+    assert_eq!(&s[close2..close2 + 2], "%}");
+    assert!(close2 > s.find("\"%}\"").unwrap());
+    // Unterminated tag → None (line 711).
+    assert_eq!(find_tag_close("{% foo", 2), None);
+  }
+
+  #[test]
+  fn match_endraw_delim_branches() {
+    // Not a `{%` at all → None (line 743).
+    assert_eq!(match_endraw_delim("xy", 0), None);
+    // Proper endraw forms.
+    assert_eq!(
+      match_endraw_delim("{% endraw %}", 0),
+      Some("{% endraw %}".len())
+    );
+    assert_eq!(
+      match_endraw_delim("{%- endraw -%}", 0),
+      Some("{%- endraw -%}".len())
+    );
+    assert_eq!(
+      match_endraw_delim("{% endraw +%}", 0),
+      Some("{% endraw +%}".len())
+    );
+    // `-`/`+` followed by `%` but no closing `}` (truncated) → None (768).
+    assert_eq!(match_endraw_delim("{%endraw-%", 0), None);
+    // endraw followed by neither a marker-close nor a bare `%}` → None (773).
+    assert_eq!(match_endraw_delim("{% endraw xx", 0), None);
+    // The literal isn't `endraw`.
+    assert_eq!(match_endraw_delim("{% endfor %}", 0), None);
+  }
+
+  #[test]
+  fn find_endraw_skips_interior_and_handles_unterminated() {
+    // Interior `{% foo %}` is literal raw text; scan continues to the real
+    // endraw (covers the inner i+=1 continue and the success return).
+    let t = "raw {% foo %} body {% endraw %} after";
+    let end = find_endraw(t, 0);
+    assert_eq!(&t[..end], "raw {% foo %} body {% endraw %}");
+    // No endraw at all → template length (line 808).
+    let u = "raw body {% foo %} no end";
+    assert_eq!(find_endraw(u, 0), u.len());
+  }
+
+  #[test]
+  fn utf8_char_len_all_widths() {
+    assert_eq!(utf8_char_len(0x41), 1); // ASCII 'A'
+    assert_eq!(utf8_char_len(0xC3), 2); // 110xxxxx lead
+    assert_eq!(utf8_char_len(0xE2), 3); // 1110xxxx lead
+    assert_eq!(utf8_char_len(0xF0), 4); // 11110xxx lead
+    assert_eq!(utf8_char_len(0x80), 1); // continuation byte → 1 (fallback)
+  }
+
+  // ---------------------------------------------------------------------
+  // continue_final_message_mutate / continue_final_message_trim.
+  // ---------------------------------------------------------------------
+
+  #[test]
+  fn continue_final_message_mutate_appends_sentinel() {
+    let msgs = serde_json::json!([{"role": "assistant", "content": "Hello"}]);
+    let (mutated, original) = continue_final_message_mutate(&msgs).unwrap();
+    assert_eq!(original, "Hello");
+    let last = mutated.as_array().unwrap().last().unwrap();
+    assert_eq!(
+      last.get("content").unwrap().as_str().unwrap(),
+      "HelloCONTINUE_FINAL_MESSAGE_TAG "
+    );
+  }
+
+  #[test]
+  fn continue_final_message_mutate_errors() {
+    // Not a list.
+    let not_list = serde_json::json!({"role": "user"});
+    assert!(matches!(
+      continue_final_message_mutate(&not_list).unwrap_err(),
+      Error::Tokenizer(_)
+    ));
+    // Empty conversation.
+    let empty = serde_json::json!([]);
+    assert!(matches!(
+      continue_final_message_mutate(&empty).unwrap_err(),
+      Error::Tokenizer(_)
+    ));
+    // Final message lacks a STRING content (line 882).
+    let no_str = serde_json::json!([{"role": "assistant", "content": 42}]);
+    assert!(matches!(
+      continue_final_message_mutate(&no_str).unwrap_err(),
+      Error::Tokenizer(_)
+    ));
+  }
+
+  #[test]
+  fn continue_final_message_trim_full_tag_plain_truncates() {
+    // Full tag (with trailing space) survives verbatim → plain truncate.
+    let rendered = "Hi there CONTINUE_FINAL_MESSAGE_TAG <eot>";
+    let out = continue_final_message_trim(rendered, "Hi there").unwrap();
+    assert_eq!(out, "Hi there ");
+  }
+
+  #[test]
+  fn continue_final_message_trim_transformed_tag_rstrips() {
+    // Trailing space eaten (sentinel at very end) → rstrip the truncation.
+    let rendered = "Hi there CONTINUE_FINAL_MESSAGE_TAG";
+    let out = continue_final_message_trim(rendered, "Hi there").unwrap();
+    assert_eq!(out, "Hi there");
+  }
+
+  #[test]
+  fn continue_final_message_trim_guard_errors() {
+    // Sentinel absent → Err.
+    assert!(matches!(
+      continue_final_message_trim("no sentinel", "x").unwrap_err(),
+      Error::Tokenizer(_)
+    ));
+    // Sentinel present but the original content is NOT in the rendered text.
+    let rendered = "unrelated CONTINUE_FINAL_MESSAGE_TAG tail";
+    assert!(matches!(
+      continue_final_message_trim(rendered, "missing-content").unwrap_err(),
+      Error::Tokenizer(_)
+    ));
+  }
+
+  #[test]
+  fn continue_final_message_trim_empty_content_is_valid() {
+    // "".trim() is "" and contains("") is always true → prefix up to sentinel.
+    let rendered = "prefixCONTINUE_FINAL_MESSAGE_TAG suffix";
+    let out = continue_final_message_trim(rendered, "").unwrap();
+    assert_eq!(out, "prefix");
+  }
+
+  // ---------------------------------------------------------------------
+  // render_jinja — full pipeline + the HF jinja extensions.
+  // ---------------------------------------------------------------------
+
+  #[test]
+  fn render_jinja_basic_with_generation_prompt() {
+    let messages = serde_json::json!([{"role": "user", "content": "hi"}]);
+    let out = render_jinja(
+      "{% for m in messages %}{{ m.role }}: {{ m.content }}|{% endfor %}{% if add_generation_prompt %}assistant:{% endif %}",
+      &messages,
+      None,
+      true,
+      false,
+      None,
+      None,
+      false,
+      &Value::Null,
+    )
+    .unwrap();
+    assert_eq!(out, "user: hi|assistant:");
+  }
+
+  #[test]
+  fn render_jinja_no_generation_prompt_omits_suffix() {
+    let messages = serde_json::json!([{"role": "user", "content": "hi"}]);
+    let out = render_jinja(
+      "{% for m in messages %}{{ m.content }}{% endfor %}{% if add_generation_prompt %}!{% endif %}",
+      &messages,
+      None,
+      false,
+      false,
+      None,
+      None,
+      false,
+      &Value::Null,
+    )
+    .unwrap();
+    assert_eq!(out, "hi");
+  }
+
+  #[test]
+  fn render_jinja_bos_eos_tools_extra_in_context() {
+    let messages = serde_json::json!([{"role": "user", "content": "x"}]);
+    let tools = serde_json::json!([{"name": "f"}]);
+    let extra = serde_json::json!({"custom": "C"});
+    let out = render_jinja(
+      "{{ bos_token }}{{ eos_token }}{{ tools[0].name }}{{ custom }}{% if documents is none %}D{% endif %}",
+      &messages,
+      Some(&tools),
+      false,
+      false,
+      Some("<s>"),
+      Some("</s>"),
+      false,
+      &extra,
+    )
+    .unwrap();
+    assert_eq!(out, "<s></s>fCD");
+  }
+
+  #[test]
+  fn render_jinja_tojson_compact_and_indented() {
+    let messages = serde_json::json!([{"role": "user", "content": {"a": 1, "b": 2}}]);
+    // Compact path (no indent) → Python separators.
+    let out = render_jinja(
+      "{{ messages[0].content | tojson }}",
+      &messages,
+      None,
+      false,
+      false,
+      None,
+      None,
+      false,
+      &Value::Null,
+    )
+    .unwrap();
+    assert_eq!(out, r#"{"a": 1, "b": 2}"#);
+    // Indented path via kwarg.
+    let out2 = render_jinja(
+      "{{ messages[0].content | tojson(indent=2) }}",
+      &messages,
+      None,
+      false,
+      false,
+      None,
+      None,
+      false,
+      &Value::Null,
+    )
+    .unwrap();
+    assert_eq!(out2, "{\n  \"a\": 1,\n  \"b\": 2\n}");
+  }
+
+  #[test]
+  fn render_jinja_tojson_indent_none_kwarg_compact() {
+    // `indent=none` exercises coerce_indent's none branch through the filter.
+    let messages = serde_json::json!([{"role": "user", "content": [1, 2]}]);
+    let out = render_jinja(
+      "{{ messages[0].content | tojson(indent=none) }}",
+      &messages,
+      None,
+      false,
+      false,
+      None,
+      None,
+      false,
+      &Value::Null,
+    )
+    .unwrap();
+    assert_eq!(out, "[1, 2]");
+  }
+
+  #[test]
+  fn render_jinja_tojson_bad_indent_is_render_error() {
+    // A non-int/bool/str indent (a list) surfaces as a render error, never
+    // a panic (coerce_indent's typed-error path, mapped to Error::Tokenizer).
+    let messages = serde_json::json!([{"role": "user", "content": 1}]);
+    let err = render_jinja(
+      "{{ messages[0].content | tojson(indent=[1, 2]) }}",
+      &messages,
+      None,
+      false,
+      false,
+      None,
+      None,
+      false,
+      &Value::Null,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Tokenizer(_)));
+  }
+
+  #[test]
+  fn render_jinja_raise_exception_is_error() {
+    let messages = serde_json::json!([{"role": "user", "content": "x"}]);
+    let err = render_jinja(
+      "{{ raise_exception('boom') }}",
+      &messages,
+      None,
+      false,
+      false,
+      None,
+      None,
+      false,
+      &Value::Null,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Tokenizer(_)));
+    assert!(err.to_string().contains("boom"));
+  }
+
+  #[test]
+  fn render_jinja_strftime_now_renders_some_digits() {
+    // strftime_now is wired; rendering a year must produce 4 digits (we do
+    // not assert the actual date — only that the function path executes and
+    // yields a plausible value rather than "").
+    let messages = serde_json::json!([{"role": "user", "content": "x"}]);
+    let out = render_jinja(
+      "{{ strftime_now('%Y') }}",
+      &messages,
+      None,
+      false,
+      false,
+      None,
+      None,
+      false,
+      &Value::Null,
+    )
+    .unwrap();
+    assert_eq!(out.len(), 4);
+    assert!(out.chars().all(|c| c.is_ascii_digit()));
+  }
+
+  #[test]
+  fn render_jinja_strftime_now_bad_directive_is_error() {
+    // An unknown strftime directive in an (untrusted) template must surface
+    // as a recoverable error, never a panic unwinding through minijinja.
+    let messages = serde_json::json!([{"role": "user", "content": "x"}]);
+    let err = render_jinja(
+      "{{ strftime_now('%Q') }}",
+      &messages,
+      None,
+      false,
+      false,
+      None,
+      None,
+      false,
+      &Value::Null,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Tokenizer(_)));
+  }
+
+  #[test]
+  fn render_jinja_parse_error_is_typed() {
+    // A malformed template → typed parse error.
+    let messages = serde_json::json!([{"role": "user", "content": "x"}]);
+    let err = render_jinja(
+      "{% for x in %}",
+      &messages,
+      None,
+      false,
+      false,
+      None,
+      None,
+      false,
+      &Value::Null,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Tokenizer(_)));
+  }
+
+  #[test]
+  fn render_jinja_continue_final_message_trims_at_content() {
+    // The template appends an end-of-turn marker after the content; with
+    // continue_final_message the rendered prompt is cut at the content.
+    let messages = serde_json::json!([
+      {"role": "user", "content": "Q"},
+      {"role": "assistant", "content": "partial"}
+    ]);
+    let out = render_jinja(
+      "{% for m in messages %}{{ m.content }}<eot>{% endfor %}",
+      &messages,
+      None,
+      false,
+      true,
+      None,
+      None,
+      false,
+      &Value::Null,
+    )
+    .unwrap();
+    // Without continuation this would be "Q<eot>partial<eot>"; the trim cuts
+    // everything from the sentinel (appended after "partial") onward.
+    assert_eq!(out, "Q<eot>partial");
+  }
+
+  // ---------------------------------------------------------------------
+  // strftime_at / strip_naive_unsupported — deterministic civil datetime.
+  // ---------------------------------------------------------------------
+
+  #[test]
+  fn strftime_at_fixed_datetime_is_deterministic() {
+    let dt = jiff::civil::date(2024, 3, 5).at(13, 7, 9, 0);
+    assert_eq!(strftime_at(dt, "%Y-%m-%d").unwrap(), "2024-03-05");
+    assert_eq!(strftime_at(dt, "%H:%M:%S").unwrap(), "13:07:09");
+    // `%z` / `%Z` render empty for a naive datetime (stripped); `%%` is a
+    // literal percent and preserved.
+    assert_eq!(strftime_at(dt, "[%z%Z]").unwrap(), "[]");
+    assert_eq!(strftime_at(dt, "100%%").unwrap(), "100%");
+  }
+
+  #[test]
+  fn strftime_at_bad_directive_errors_not_panics() {
+    let dt = jiff::civil::date(2024, 1, 1).at(0, 0, 0, 0);
+    assert!(strftime_at(dt, "%Q").is_err());
+  }
+
+  #[test]
+  fn strip_naive_unsupported_branches() {
+    // %z / %Z dropped; %% preserved; other directives pass through; a
+    // trailing lone `%` is kept (line 1187).
+    assert_eq!(strip_naive_unsupported("%z%Z%%zx"), "%%zx");
+    assert_eq!(strip_naive_unsupported("%Y-%d"), "%Y-%d");
+    assert_eq!(strip_naive_unsupported("end%"), "end%");
+    assert_eq!(strip_naive_unsupported("plain"), "plain");
+  }
+}
+
+#[cfg(all(test, feature = "tokenizer-deepseek-v32"))]
+mod deepseek_v32_tests {
+  use serde_json::Value;
+
+  use super::{ChatTemplateOverride, DeepseekV32, override_by_name};
+  use crate::Error;
+
+  // By-value `Value` / `Option<Value>` keeps the 16 call sites ergonomic
+  // (they pass owned `json!(...)`); the body only borrows both args.
+  #[allow(clippy::needless_pass_by_value)]
+  fn render(
+    messages: Value,
+    tools: Option<Value>,
+    add_generation_prompt: bool,
+    continue_final_message: bool,
+    enable_thinking: bool,
+  ) -> Result<String, Error> {
+    let arr = messages.as_array().unwrap().clone();
+    DeepseekV32.apply(
+      &arr,
+      tools.as_ref(),
+      add_generation_prompt,
+      continue_final_message,
+      enable_thinking,
+    )
+  }
+
+  #[test]
+  fn override_by_name_known_and_unknown() {
+    assert!(override_by_name("deepseek_v32").is_some());
+    assert!(override_by_name("does_not_exist").is_none());
+  }
+
+  #[test]
+  fn apply_user_chat_mode_appends_think_end() {
+    // chat mode (enable_thinking=false): user → `<｜User｜>..<｜Assistant｜></think>`.
+    let out = render(
+      serde_json::json!([{"role": "user", "content": "hello"}]),
+      None,
+      true,
+      false,
+      false,
+    )
+    .unwrap();
+    assert_eq!(
+      out,
+      "<｜begin▁of▁sentence｜><｜User｜>hello<｜Assistant｜></think>"
+    );
+  }
+
+  #[test]
+  fn apply_user_no_generation_prompt_thinking_strips_think_suffix() {
+    // thinking mode + last is user + add_generation_prompt=false strips the
+    // trailing `<｜Assistant｜><think>` (lines 1520-1524).
+    let out = render(
+      serde_json::json!([{"role": "user", "content": "hi"}]),
+      None,
+      false,
+      false,
+      true,
+    )
+    .unwrap();
+    assert_eq!(out, "<｜begin▁of▁sentence｜><｜User｜>hi");
+  }
+
+  #[test]
+  fn apply_assistant_thinking_includes_reasoning_and_eos() {
+    // assistant after the last user, thinking mode → reasoning_content +
+    // </think> + content + EOS.
+    let out = render(
+      serde_json::json!([
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "answer", "reasoning_content": "because"}
+      ]),
+      None,
+      true,
+      false,
+      true,
+    )
+    .unwrap();
+    assert!(out.contains("because</think>answer"));
+    assert!(out.ends_with("<｜end▁of▁sentence｜>"));
+  }
+
+  #[test]
+  fn apply_assistant_tool_calls_render_dsml() {
+    // assistant with tool_calls → DSML invoke/parameter blocks; both string
+    // and non-string argument values (encode_arguments_to_dsml).
+    let out = render(
+      serde_json::json!([
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": [
+          {"function": {"name": "search", "arguments": {"q": "cats", "n": 5}}}
+        ]}
+      ]),
+      None,
+      true,
+      false,
+      false,
+    )
+    .unwrap();
+    assert!(out.contains("<｜DSML｜invoke name=\"search\">"));
+    assert!(out.contains("<｜DSML｜function_calls>"));
+    // string param → string="true"; numeric param → string="false".
+    assert!(out.contains("name=\"q\" string=\"true\">cats"));
+    assert!(out.contains("name=\"n\" string=\"false\">5"));
+  }
+
+  #[test]
+  fn apply_assistant_tool_call_arguments_as_json_string() {
+    // tool_calls[].function.arguments given as a JSON *string* → parsed
+    // (encode_arguments_to_dsml string branch).
+    let out = render(
+      serde_json::json!([
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": [
+          {"function": {"name": "f", "arguments": "{\"k\": \"v\"}"}}
+        ]}
+      ]),
+      None,
+      true,
+      false,
+      false,
+    )
+    .unwrap();
+    assert!(out.contains("name=\"k\" string=\"true\">v"));
+  }
+
+  #[test]
+  fn apply_assistant_tool_call_bad_arguments_json_errors() {
+    // A non-JSON arguments string → typed tokenizer error, not a panic.
+    let err = render(
+      serde_json::json!([
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": [
+          {"function": {"name": "f", "arguments": "not json"}}
+        ]}
+      ]),
+      None,
+      true,
+      false,
+      false,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Tokenizer(_)));
+  }
+
+  #[test]
+  fn apply_assistant_tool_call_arguments_not_object_errors() {
+    // arguments that is neither a string nor an object (a JSON array) →
+    // "arguments not object" tokenizer error.
+    let err = render(
+      serde_json::json!([
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": [
+          {"function": {"name": "f", "arguments": [1, 2]}}
+        ]}
+      ]),
+      None,
+      true,
+      false,
+      false,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Tokenizer(_)));
+  }
+
+  #[test]
+  fn apply_system_with_tools_and_response_format() {
+    // system role: content + rendered tools (render_tools / tools_from_openai
+    // function-unwrap) + response_format block.
+    let out = render(
+      serde_json::json!([
+        {
+          "role": "system",
+          "content": "SYS",
+          "tools": [{"type": "function", "function": {"name": "g"}}],
+          "response_format": {"type": "json"}
+        },
+        {"role": "user", "content": "u"}
+      ]),
+      None,
+      true,
+      false,
+      false,
+    )
+    .unwrap();
+    assert!(out.contains("SYS"));
+    // render_tools emitted the externalized template's structural markers.
+    assert!(out.contains("<functions>"));
+    assert!(out.contains("<｜DSML｜function_calls>"));
+    // tools_from_openai unwrapped `function` → the schema mentions "name":"g".
+    assert!(out.contains("\"name\":\"g\""));
+    assert!(out.contains("## Response Format:"));
+  }
+
+  #[test]
+  fn apply_developer_role_renders_like_user_with_tools() {
+    // developer role: tools + response_format + "# The user's message is:"
+    // then the user/assistant framing.
+    let out = render(
+      serde_json::json!([
+        {
+          "role": "developer",
+          "content": "DEV",
+          "tools": [{"name": "h"}],
+          "response_format": {"type": "x"}
+        }
+      ]),
+      None,
+      false,
+      false,
+      false,
+    )
+    .unwrap();
+    assert!(out.contains("# The user's message is: DEV"));
+    assert!(out.contains("## Response Format:"));
+    assert!(out.contains("<｜User｜>"));
+    assert!(out.contains("<｜Assistant｜>"));
+  }
+
+  #[test]
+  fn apply_tools_arg_non_array_yields_empty_schemas() {
+    // A `tools` ARG that is not an array drives tools_from_openai's None
+    // branch (empty array) — render still succeeds with the template shell.
+    let out = render(
+      serde_json::json!([
+        {"role": "system", "content": "S"},
+        {"role": "user", "content": "u"}
+      ]),
+      Some(serde_json::json!({"not": "an array"})),
+      true,
+      false,
+      false,
+    )
+    .unwrap();
+    assert!(out.contains("<functions>"));
+  }
+
+  #[test]
+  fn apply_tool_role_function_results_block() {
+    // tool role after an assistant with one tool_call → a single
+    // <function_results> block closed after the first result.
+    let out = render(
+      serde_json::json!([
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "", "tool_calls": [
+          {"function": {"name": "f", "arguments": {}}}
+        ]},
+        {"role": "tool", "content": "RESULT"}
+      ]),
+      None,
+      true,
+      false,
+      false,
+    )
+    .unwrap();
+    assert!(out.contains("<function_results>"));
+    assert!(out.contains("<result>RESULT</result>"));
+    assert!(out.contains("</function_results>"));
+  }
+
+  #[test]
+  fn apply_unknown_role_errors() {
+    let err = render(
+      serde_json::json!([{"role": "wizard", "content": "x"}]),
+      None,
+      false,
+      false,
+      false,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Tokenizer(_)));
+    assert!(err.to_string().contains("unknown role"));
+  }
+
+  #[test]
+  fn apply_continue_and_generation_prompt_rejected() {
+    // Both flags set → error (lines 1511-1514). Note DeepseekV32::apply
+    // checks this AFTER rendering, so a renderable conversation is needed.
+    let err = render(
+      serde_json::json!([{"role": "user", "content": "x"}]),
+      None,
+      true,
+      true,
+      false,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Tokenizer(_)));
+  }
+
+  #[test]
+  fn apply_continue_final_message_strips_eos_for_assistant() {
+    // continue_final_message + last is assistant strips the trailing EOS
+    // (lines 1526-1530).
+    let out = render(
+      serde_json::json!([
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "draft"}
+      ]),
+      None,
+      false,
+      true,
+      false,
+    )
+    .unwrap();
+    assert!(out.ends_with("draft"));
+    assert!(!out.ends_with("<｜end▁of▁sentence｜>"));
+  }
+
+  #[test]
+  fn apply_thinking_drops_prior_assistant_reasoning() {
+    // enable_thinking=true triggers drop_thinking_messages; an assistant
+    // BEFORE the last user keeps its content but loses reasoning_content
+    // (lines 1476-1480). Render must still succeed and not leak the
+    // reasoning text.
+    let out = render(
+      serde_json::json!([
+        {"role": "assistant", "content": "earlier", "reasoning_content": "SECRET_THOUGHT"},
+        {"role": "user", "content": "now"}
+      ]),
+      None,
+      true,
+      false,
+      true,
+    )
+    .unwrap();
+    assert!(!out.contains("SECRET_THOUGHT"));
+    assert!(out.contains("earlier"));
+    assert!(out.contains("<｜User｜>now"));
+  }
+
+  #[test]
+  fn apply_no_user_message_find_last_user_index_negative() {
+    // No user/developer role anywhere → find_last_user_index returns -1
+    // (its fall-through). A lone assistant renders content + EOS.
+    let out = render(
+      serde_json::json!([{"role": "assistant", "content": "solo"}]),
+      None,
+      false,
+      false,
+      false,
+    )
+    .unwrap();
+    assert!(out.contains("solo"));
+    assert!(out.ends_with("<｜end▁of▁sentence｜>"));
+  }
+}

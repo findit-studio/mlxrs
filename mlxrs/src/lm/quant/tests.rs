@@ -2890,3 +2890,869 @@ fn awq_load_config_default_matches_serde_default() {
   let from_serde: AwqLoadConfig = serde_json::from_str("{}").unwrap();
   assert_eq!(from_default, from_serde);
 }
+
+// ──────────────── QuantMode::as_str (all variants) ────────────────
+
+/// `as_str` returns the lowercase mlx-c wire tag for every variant, and
+/// the tag round-trips through `Deserialize` (the `rename_all = "lowercase"`
+/// contract). The existing parse tests only exercise `affine` / `mxfp4`;
+/// this pins `mxfp8` / `nvfp4` (and the affine-default) too.
+#[test]
+fn quant_mode_as_str_covers_all_variants() {
+  assert_eq!(QuantMode::Affine.as_str(), "affine");
+  assert_eq!(QuantMode::Mxfp4.as_str(), "mxfp4");
+  assert_eq!(QuantMode::Mxfp8.as_str(), "mxfp8");
+  assert_eq!(QuantMode::Nvfp4.as_str(), "nvfp4");
+  // Default is affine.
+  assert_eq!(QuantMode::default(), QuantMode::Affine);
+  // serde round-trip: the tag string deserializes back to the variant.
+  for (tag, mode) in [
+    ("affine", QuantMode::Affine),
+    ("mxfp4", QuantMode::Mxfp4),
+    ("mxfp8", QuantMode::Mxfp8),
+    ("nvfp4", QuantMode::Nvfp4),
+  ] {
+    let json = format!("{{ \"group_size\": 32, \"bits\": 4, \"mode\": {tag:?} }}");
+    let q = parse_quantization(&format!("{{ \"quantization\": {json} }}"))
+      .unwrap()
+      .unwrap()
+      .quantization
+      .unwrap();
+    assert_eq!(q.mode, mode, "tag {tag:?} must deserialize to {mode:?}");
+    // Display impl forwards to `as_str`.
+    assert_eq!(format!("{mode}"), tag);
+  }
+}
+
+// ──────────────── PerLayerQuantization::per_layer_ref ────────────────
+
+/// `per_layer_ref` exposes the same map the private field carries — empty
+/// for a flat global config, populated when per-layer overrides are parsed.
+#[test]
+fn per_layer_ref_exposes_override_map() {
+  // Flat global: empty per-layer map.
+  let flat = PerLayerQuantization::from_global(Quantization::affine(64, 4));
+  assert!(flat.per_layer_ref().is_empty());
+
+  // With overrides via `new`.
+  let mut overrides = HashMap::new();
+  overrides.insert("model.embed_tokens".to_string(), QuantizationOption::Skip);
+  overrides.insert(
+    "model.layers.0.q_proj".to_string(),
+    QuantizationOption::Quantize(Quantization::affine(32, 4)),
+  );
+  let plq = PerLayerQuantization::new(Some(Quantization::affine(64, 4)), overrides);
+  let map = plq.per_layer_ref();
+  assert_eq!(map.len(), 2);
+  assert_eq!(
+    map.get("model.embed_tokens").copied(),
+    Some(QuantizationOption::Skip)
+  );
+  assert!(matches!(
+    map.get("model.layers.0.q_proj"),
+    Some(QuantizationOption::Quantize(_))
+  ));
+}
+
+// ──────────────── PerLayerQuantization Deserialize edge arms ────────────────
+
+/// A non-object `"quantization"` value (here a JSON array) is a deserialize
+/// error — the `Value::Object(map)` let-else fires its custom message.
+#[test]
+fn quantization_block_non_object_errors() {
+  // `parse_quantization` only short-circuits on a MISSING key; a present-but-
+  // non-object `quantization` value flows into the `PerLayerQuantization`
+  // deserializer, which rejects it.
+  let cfg_json = r#"{ "quantization": [1, 2, 3] }"#;
+  let err = parse_quantization(cfg_json).unwrap_err();
+  let msg = format!("{err}");
+  assert!(
+    msg.contains("must be a JSON object"),
+    "error should explain the block must be a JSON object, got: {msg}"
+  );
+}
+
+/// A per-layer key whose value is `true` is SILENTLY IGNORED (mlx-swift's
+/// `if !f { .skip }` falls through for `true`) — the `Value::Bool(true) =>
+/// continue` arm. The layer must NOT appear in the per-layer map, and an
+/// unlisted layer falls back to the global default.
+#[test]
+fn quantization_per_layer_true_is_ignored() {
+  let cfg_json = r#"{
+      "quantization": {
+        "group_size": 64,
+        "bits": 4,
+        "model.layers.0.kept": true,
+        "model.layers.1.skipped": false
+      }
+    }"#;
+  let plq = parse_quantization(cfg_json).unwrap().unwrap();
+  // Only the `false` key is recorded; the `true` key is dropped.
+  assert_eq!(plq.per_layer_ref().len(), 1);
+  assert!(!plq.per_layer_ref().contains_key("model.layers.0.kept"));
+  assert_eq!(
+    plq.per_layer_ref().get("model.layers.1.skipped").copied(),
+    Some(QuantizationOption::Skip)
+  );
+  // The `true`-tagged layer resolves to the global default (not skipped).
+  assert_eq!(
+    plq.quantization_for("model.layers.0.kept"),
+    Some(Quantization::affine(64, 4))
+  );
+}
+
+/// A per-layer key whose value is a non-bool, non-object scalar (here a
+/// number) is a deserialize error — the `other =>` arm with the
+/// "must be `false` or a quantization object" message.
+#[test]
+fn quantization_per_layer_scalar_value_errors() {
+  let cfg_json = r#"{
+      "quantization": {
+        "group_size": 64,
+        "bits": 4,
+        "model.layers.0.bad": 7
+      }
+    }"#;
+  let err = parse_quantization(cfg_json).unwrap_err();
+  let msg = format!("{err}");
+  assert!(
+    msg.contains("must be `false` or a quantization object"),
+    "error should explain the per-layer value contract, got: {msg}"
+  );
+  assert!(
+    msg.contains("model.layers.0.bad"),
+    "error should name the offending key, got: {msg}"
+  );
+}
+
+// ──────────────── classify_triple: per-layer-override + no-default arms ────────────────
+
+/// A pre-existing triple at a path with a per-layer `Quantize` OVERRIDE
+/// (not the global default) resolves its mode from the override and passes
+/// through as Valid. Exercises the `Some(QuantizationOption::Quantize(q))`
+/// arm of `classify_triple`'s param resolution.
+#[test]
+fn quantize_weights_valid_triple_resolves_via_per_layer_override() {
+  let n_rows = 2_usize;
+  // mxfp4 override (scale-only) → a NO-biases triple is the valid layout.
+  let w = arr_u32(&vec![0_u32; n_rows * 4], &[n_rows, 4]);
+  let scales = arr_f32(&vec![1.0_f32; n_rows], &[n_rows, 1]);
+  let mut weights: Weights = HashMap::new();
+  weights.insert("model.special.weight".to_string(), w);
+  weights.insert("model.special.scales".to_string(), scales);
+
+  // Global default is affine (would REQUIRE biases), but the per-layer
+  // override is mxfp4 (scale-only) — the triple resolves via the override
+  // and is Valid without `.biases`.
+  let mut per_layer = HashMap::new();
+  per_layer.insert(
+    "model.special".to_string(),
+    QuantizationOption::Quantize(Quantization {
+      group_size: 32,
+      bits: 4,
+      mode: QuantMode::Mxfp4,
+    }),
+  );
+  let cfg = PerLayerQuantization::new(Some(Quantization::affine(64, 4)), per_layer);
+
+  let out = quantize_weights(weights, &cfg, &default_eligible)
+    .expect("triple resolves via per-layer mxfp4 override, passes through");
+  let w_out = out.get("model.special.weight").expect(".weight");
+  assert_eq!(w_out.dtype().unwrap(), Dtype::U32);
+  assert!(out.contains_key("model.special.scales"));
+  assert!(!out.contains_key("model.special.biases"));
+}
+
+/// A pre-existing triple when `cfg` has NO global default AND no per-layer
+/// override is classified Invalid (the defensive `None => match
+/// cfg.quantization { None => InvariantViolation }` arm) — the mode cannot
+/// be resolved, so the triple's layout cannot be validated.
+#[test]
+fn quantize_weights_triple_with_no_resolvable_params_errors() {
+  let n_rows = 2_usize;
+  let w = arr_u32(&vec![0_u32; n_rows * 8], &[n_rows, 8]);
+  let scales = arr_f32(&vec![1.0_f32; n_rows], &[n_rows, 1]);
+  let biases = arr_f32(&vec![0.0_f32; n_rows], &[n_rows, 1]);
+  let mut weights: Weights = HashMap::new();
+  weights.insert("model.foo.weight".to_string(), w);
+  weights.insert("model.foo.scales".to_string(), scales);
+  weights.insert("model.foo.biases".to_string(), biases);
+
+  // No global default, no per-layer override.
+  let cfg = PerLayerQuantization::new(None, HashMap::new());
+  let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
+  match err {
+    Error::LayerKeyed(ref payload) => {
+      assert!(
+        payload.layer().contains("model.foo"),
+        "LayerKeyed must name the layer, got layer={:?}",
+        payload.layer()
+      );
+      assert!(
+        matches!(payload.inner(), Error::InvariantViolation(_)),
+        "inner must be InvariantViolation when params are unresolvable, got: {:?}",
+        payload.inner()
+      );
+    }
+    other => panic!("expected Error::LayerKeyed, got: {other:?}"),
+  }
+}
+
+/// A uint32 `.weight` whose rank EQUALS `.scales` rank is fine, but a
+/// `.scales` whose RANK differs from the `.weight` rank is classified
+/// Invalid via the `LengthMismatch` arm (rank-vs-rank check), which runs
+/// before the leading-dim `ShapePairMismatch` check.
+#[test]
+fn quantize_weights_scales_rank_mismatch_errors() {
+  let n_rows = 2_usize;
+  // `.weight` is rank-2 uint32 [2, 8].
+  let w = arr_u32(&vec![0_u32; n_rows * 8], &[n_rows, 8]);
+  // `.scales` is rank-3 [2, 1, 1] — rank differs from `.weight`'s rank-2.
+  let scales = arr_f32(&vec![1.0_f32; n_rows], &[n_rows, 1, 1]);
+  // `.biases` matching `.scales` so the triple advances past affine-arity.
+  let biases = arr_f32(&vec![0.0_f32; n_rows], &[n_rows, 1, 1]);
+  let mut weights: Weights = HashMap::new();
+  weights.insert("model.foo.weight".to_string(), w);
+  weights.insert("model.foo.scales".to_string(), scales);
+  weights.insert("model.foo.biases".to_string(), biases);
+
+  let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
+  let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
+  match err {
+    Error::LayerKeyed(ref payload) => {
+      assert!(
+        payload.layer().contains("model.foo"),
+        "LayerKeyed must name the layer, got layer={:?}",
+        payload.layer()
+      );
+      assert!(
+        matches!(payload.inner(), Error::LengthMismatch(_)),
+        "inner must be LengthMismatch for `.scales` rank != `.weight` rank, got: {:?}",
+        payload.inner()
+      );
+    }
+    other => panic!("expected Error::LayerKeyed, got: {other:?}"),
+  }
+}
+
+// ──────────────── quantize_weights: pass-1 shape + group_size guards ────────────────
+
+/// A 1-D `.weight` (rank < 2) with NO `.scales`/`.biases` siblings passes
+/// `classify_triple` (Absent) and the eligibility predicate, then hits the
+/// `shape.len() < 2 { continue }` guard in pass 1 → passes through
+/// unchanged (no quantization, no `.scales` emitted). The existing
+/// fixtures only test rank<2 via a `.bias`-suffixed key (stripped earlier);
+/// this exercises the rank guard for a genuine `.weight` key.
+#[test]
+fn quantize_weights_rank1_weight_passes_through() {
+  let w = arr_f32(&[1.0_f32, 2.0, 3.0, 4.0], &[4]);
+  let mut weights: Weights = HashMap::new();
+  weights.insert("model.scalar_like.weight".to_string(), w);
+
+  let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
+  let out = quantize_weights(weights, &cfg, &default_eligible).expect("rank-1 weight passes");
+  let pass = out.get("model.scalar_like.weight").expect(".weight");
+  assert_eq!(pass.shape(), vec![4]);
+  assert_eq!(pass.dtype().unwrap(), Dtype::F32);
+  assert!(!out.contains_key("model.scalar_like.scales"));
+}
+
+/// A NEGATIVE `group_size` in a per-layer override fails the
+/// `usize::try_from(q.group_size)` conversion in pass 1 → a layer-keyed
+/// `OutOfRange` error. The weight is rank-2 with no siblings (Absent) and
+/// passes eligibility, so the chain reaches the group_size conversion.
+#[test]
+fn quantize_weights_negative_group_size_errors() {
+  let n_rows = 2_usize;
+  let last = 64_usize;
+  let w = arr_f32(&vec![0.5_f32; n_rows * last], &[n_rows, last]);
+  let mut weights: Weights = HashMap::new();
+  weights.insert("model.bad_gs.weight".to_string(), w);
+
+  // Per-layer override with a negative group_size — `usize::try_from` fails.
+  let mut per_layer = HashMap::new();
+  per_layer.insert(
+    "model.bad_gs".to_string(),
+    QuantizationOption::Quantize(Quantization {
+      group_size: -1,
+      bits: 4,
+      mode: QuantMode::Affine,
+    }),
+  );
+  let cfg = PerLayerQuantization::new(Some(Quantization::affine(64, 4)), per_layer);
+
+  let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
+  match err {
+    Error::LayerKeyed(ref payload) => {
+      assert!(
+        payload.layer().contains("model.bad_gs"),
+        "LayerKeyed must name the layer, got layer={:?}",
+        payload.layer()
+      );
+      assert!(
+        matches!(payload.inner(), Error::OutOfRange(_)),
+        "inner must be OutOfRange for negative group_size, got: {:?}",
+        payload.inner()
+      );
+    }
+    other => panic!("expected Error::LayerKeyed, got: {other:?}"),
+  }
+}
+
+/// A `group_size` of 0 (per the override) makes `gs == 0` true at the
+/// `gs == 0 || last % gs != 0` guard → the weight passes through unchanged
+/// (not an error — mlx-lm's divisibility gate just skips). Covers the
+/// `gs == 0` short-circuit of that guard.
+#[test]
+fn quantize_weights_zero_group_size_passes_through() {
+  let n_rows = 2_usize;
+  let last = 64_usize;
+  let w = arr_f32(&vec![0.5_f32; n_rows * last], &[n_rows, last]);
+  let mut weights: Weights = HashMap::new();
+  weights.insert("model.zero_gs.weight".to_string(), w);
+
+  let mut per_layer = HashMap::new();
+  per_layer.insert(
+    "model.zero_gs".to_string(),
+    QuantizationOption::Quantize(Quantization {
+      group_size: 0,
+      bits: 4,
+      mode: QuantMode::Affine,
+    }),
+  );
+  let cfg = PerLayerQuantization::new(Some(Quantization::affine(64, 4)), per_layer);
+
+  let out =
+    quantize_weights(weights, &cfg, &default_eligible).expect("group_size 0 skips, passes through");
+  let pass = out.get("model.zero_gs.weight").expect(".weight");
+  assert_eq!(pass.shape(), vec![n_rows, last]);
+  assert_eq!(pass.dtype().unwrap(), Dtype::F32);
+  assert!(!out.contains_key("model.zero_gs.scales"));
+}
+
+// ──────────────── dequantize_weights: orphan + pass-through + unresolvable ────────────────
+
+/// An orphan `.biases` with NO matching `.weight` (and no `.scales`) passes
+/// through verbatim — the `weights.get(&weight_key)` returns None and the
+/// guard `continue`s. Covers the orphan-bias-without-weight branch.
+#[test]
+fn dequantize_weights_orphan_biases_without_weight_passes_through() {
+  let biases = arr_f32(&[0.5_f32, 1.5], &[2, 1]);
+  let mut weights: Weights = HashMap::new();
+  weights.insert("model.lonely.biases".to_string(), biases);
+
+  let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
+  let out = dequantize_weights(weights, &cfg).expect("orphan biases pass through");
+  let pass = out.get("model.lonely.biases").expect(".biases preserved");
+  assert_eq!(pass.shape(), vec![2, 1]);
+  assert!(!out.contains_key("model.lonely.weight"));
+}
+
+/// A rank-1 uint32 `.weight` + `.biases` with NO `.scales` is NOT flagged
+/// as an orphan-bias hazard — a rank<2 uint32 weight is not a real mlx
+/// packed matrix, so the `weight_arr.shape().len() < 2 { continue }` guard
+/// lets both keys pass through verbatim.
+#[test]
+fn dequantize_weights_rank1_uint32_weight_with_biases_passes_through() {
+  let w = arr_u32(&[1_u32, 2, 3, 4], &[4]);
+  let biases = arr_f32(&[0.5_f32; 4], &[4]);
+  let mut weights: Weights = HashMap::new();
+  weights.insert("model.r1.weight".to_string(), w);
+  weights.insert("model.r1.biases".to_string(), biases);
+
+  let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
+  let out =
+    dequantize_weights(weights, &cfg).expect("rank-1 uint32 weight + biases passes through");
+  // Both preserved, `.weight` still uint32 (not dequantized).
+  let w_out = out.get("model.r1.weight").expect(".weight preserved");
+  assert_eq!(w_out.dtype().unwrap(), Dtype::U32);
+  assert_eq!(w_out.shape(), vec![4]);
+  assert!(out.contains_key("model.r1.biases"));
+}
+
+/// A plain non-triple key (no `.weight`/`.scales`/`.biases` suffix, here
+/// a `.gamma`) passes through verbatim — the `else { None }` arm of the
+/// dequantize component classifier. Asserted alongside a real triple so the
+/// staging path is also exercised.
+#[test]
+fn dequantize_weights_non_suffix_key_passes_through() {
+  let n_rows = 2_usize;
+  // A valid affine triple to dequantize (all-zero packed weight → the
+  // dequantized output is just the bias; we only check shape/dtype + that
+  // the pass-through key survives).
+  let w = arr_u32(&vec![0_u32; n_rows * 8], &[n_rows, 8]);
+  let scales = arr_f32(&vec![1.0_f32; n_rows], &[n_rows, 1]);
+  let biases = arr_f32(&vec![0.0_f32; n_rows], &[n_rows, 1]);
+  let gamma = arr_f32(&[3.0_f32, 4.0], &[2]);
+  let mut weights: Weights = HashMap::new();
+  weights.insert("model.q.weight".to_string(), w);
+  weights.insert("model.q.scales".to_string(), scales);
+  weights.insert("model.q.biases".to_string(), biases);
+  weights.insert("model.norm.gamma".to_string(), gamma);
+
+  let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
+  let out = dequantize_weights(weights, &cfg).expect("dequantize");
+  // Pass-through key preserved verbatim.
+  let mut g_out = out
+    .get("model.norm.gamma")
+    .expect("pass-through gamma")
+    .try_clone()
+    .unwrap();
+  assert_eq!(g_out.shape(), vec![2]);
+  assert_eq!(g_out.to_vec::<f32>().unwrap(), vec![3.0_f32, 4.0]);
+  // Triple was dequantized to a dense `.weight` of shape [2, 64].
+  let deq = out.get("model.q.weight").expect("dequantized .weight");
+  assert_eq!(deq.shape(), vec![n_rows, 64]);
+  assert!(!out.contains_key("model.q.scales"));
+}
+
+/// A complete triple but `cfg` has NO global default and no per-layer
+/// override → `quantization_for` returns None → the staged-triple
+/// `InvariantViolation` (unresolvable params) error. Covers
+/// `dequantize_weights`'s param-resolution failure arm.
+#[test]
+fn dequantize_weights_unresolvable_params_errors() {
+  let n_rows = 2_usize;
+  let w = arr_u32(&vec![0_u32; n_rows * 8], &[n_rows, 8]);
+  let scales = arr_f32(&vec![1.0_f32; n_rows], &[n_rows, 1]);
+  let biases = arr_f32(&vec![0.0_f32; n_rows], &[n_rows, 1]);
+  let mut weights: Weights = HashMap::new();
+  weights.insert("model.q.weight".to_string(), w);
+  weights.insert("model.q.scales".to_string(), scales);
+  weights.insert("model.q.biases".to_string(), biases);
+
+  // No global default, no override — there is no way to resolve the mode.
+  let cfg = PerLayerQuantization::new(None, HashMap::new());
+  let err = dequantize_weights(weights, &cfg).unwrap_err();
+  match err {
+    Error::LayerKeyed(ref payload) => {
+      assert!(
+        payload.layer().contains("model.q"),
+        "LayerKeyed must name the layer, got layer={:?}",
+        payload.layer()
+      );
+      assert!(
+        matches!(payload.inner(), Error::InvariantViolation(_)),
+        "inner must be InvariantViolation for unresolvable params, got: {:?}",
+        payload.inner()
+      );
+    }
+    other => panic!("expected Error::LayerKeyed, got: {other:?}"),
+  }
+}
+
+// ──────────────── floating_dtype_precision_rank sentinel ────────────────
+
+/// The precision rank assigns the documented order to floating dtypes and
+/// a `0` sentinel to non-floating ones (the `_ => 0` arm). The escalation
+/// tests cover the floating ranks indirectly; this pins the ordering and
+/// the non-floating sentinel directly.
+#[test]
+fn floating_dtype_precision_rank_orders_and_sentinels() {
+  assert!(floating_dtype_precision_rank(Dtype::F64) > floating_dtype_precision_rank(Dtype::F32));
+  assert!(floating_dtype_precision_rank(Dtype::F32) > floating_dtype_precision_rank(Dtype::BF16));
+  assert!(floating_dtype_precision_rank(Dtype::BF16) > floating_dtype_precision_rank(Dtype::F16));
+  // Non-floating dtypes get the 0 sentinel (the `_ =>` arm).
+  assert_eq!(floating_dtype_precision_rank(Dtype::U32), 0);
+  assert_eq!(floating_dtype_precision_rank(Dtype::I32), 0);
+  assert!(floating_dtype_precision_rank(Dtype::F16) > 0);
+}
+
+// ──────────────── transform_awq_weights: preflight guards ────────────────
+
+/// A `group_size` that exceeds `i32::MAX` fails the `i32::try_from`
+/// conversion BEFORE any per-layer shape work → an `OutOfRange` error that
+/// names the `group_size` rule. Uses an empty weights map so the failure is
+/// unambiguously the group_size conversion (which runs before the qweight
+/// scan).
+#[test]
+fn transform_awq_weights_group_size_overflows_i32_errors() {
+  let weights: Weights = HashMap::new();
+  let config = AwqLoadConfig {
+    bits: 4,
+    group_size: (i32::MAX as u32) + 1, // 0x8000_0000 — too large for i32.
+    zero_point: true,
+    version: "gemm".into(),
+  };
+  let err = transform_awq_weights(weights, &config).unwrap_err();
+  let Error::OutOfRange(p) = &err else {
+    panic!("expected Error::OutOfRange, got {err:?}");
+  };
+  assert!(
+    p.context().contains("group_size"),
+    "context must name the group_size rule, got: {}",
+    p.context()
+  );
+  assert!(
+    p.requirement().contains("i32"),
+    "requirement must mention the i32 bound, got: {}",
+    p.requirement()
+  );
+}
+
+/// A `qweight` with a dtype other than U32/I32 (here F32) is rejected at
+/// the preflight dtype gate with a layer-keyed `UnsupportedDtype` naming
+/// the `.qweight` key.
+#[test]
+fn transform_awq_weights_rejects_non_int_qweight_dtype() {
+  let in_features = 8usize;
+  let out_features = 8usize;
+  let n_groups = 2usize;
+  // F32 qweight — wrong dtype.
+  let qw = Array::from_slice::<f32>(&vec![0.0_f32; in_features], &(in_features, 1)).unwrap();
+  let sc = Array::from_slice::<f32>(
+    &vec![1.0_f32; n_groups * out_features],
+    &(n_groups, out_features),
+  )
+  .unwrap();
+  let mut weights: Weights = HashMap::new();
+  weights.insert("layer.qweight".to_string(), qw);
+  weights.insert("layer.scales".to_string(), sc);
+
+  let cfg = AwqLoadConfig {
+    bits: 4,
+    group_size: 4,
+    zero_point: false,
+    version: "gemm".into(),
+  };
+  let err = transform_awq_weights(weights, &cfg).unwrap_err();
+  match err {
+    Error::LayerKeyed(ref payload) => {
+      assert!(
+        payload.layer().contains("layer.qweight"),
+        "LayerKeyed must name the qweight key, got layer={:?}",
+        payload.layer()
+      );
+      assert!(
+        matches!(payload.inner(), Error::UnsupportedDtype(_)),
+        "inner must be UnsupportedDtype for non-int qweight, got: {:?}",
+        payload.inner()
+      );
+    }
+    other => panic!("expected Error::LayerKeyed, got: {other:?}"),
+  }
+}
+
+/// A 1-D `qweight` (rank != 2) is rejected with a layer-keyed
+/// `RankMismatch` naming the `.qweight` key.
+#[test]
+fn transform_awq_weights_rejects_non_2d_qweight() {
+  let n_groups = 2usize;
+  let out_features = 8usize;
+  // Rank-1 qweight.
+  let qw = Array::from_slice::<u32>(&[0u32; 8], &(8usize,)).unwrap();
+  let sc = Array::from_slice::<f32>(
+    &vec![1.0_f32; n_groups * out_features],
+    &(n_groups, out_features),
+  )
+  .unwrap();
+  let mut weights: Weights = HashMap::new();
+  weights.insert("layer.qweight".to_string(), qw);
+  weights.insert("layer.scales".to_string(), sc);
+
+  let cfg = AwqLoadConfig {
+    bits: 4,
+    group_size: 4,
+    zero_point: false,
+    version: "gemm".into(),
+  };
+  let err = transform_awq_weights(weights, &cfg).unwrap_err();
+  match err {
+    Error::LayerKeyed(ref payload) => {
+      assert!(
+        payload.layer().contains("layer.qweight"),
+        "LayerKeyed must name the qweight key, got layer={:?}",
+        payload.layer()
+      );
+      assert!(
+        matches!(payload.inner(), Error::RankMismatch(_)),
+        "inner must be RankMismatch for non-2D qweight, got: {:?}",
+        payload.inner()
+      );
+    }
+    other => panic!("expected Error::LayerKeyed, got: {other:?}"),
+  }
+}
+
+/// A 1-D `scales` (rank != 2) is rejected with a layer-keyed `RankMismatch`
+/// naming the `.scales` key (the qweight is well-formed 2-D, so the failure
+/// is the scales rank check).
+#[test]
+fn transform_awq_weights_rejects_non_2d_scales() {
+  let in_features = 8usize;
+  let qw = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+  // Rank-1 scales.
+  let sc = Array::from_slice::<f32>(&[1.0_f32; 8], &(8usize,)).unwrap();
+  let mut weights: Weights = HashMap::new();
+  weights.insert("layer.qweight".to_string(), qw);
+  weights.insert("layer.scales".to_string(), sc);
+
+  let cfg = AwqLoadConfig {
+    bits: 4,
+    group_size: 4,
+    zero_point: false,
+    version: "gemm".into(),
+  };
+  let err = transform_awq_weights(weights, &cfg).unwrap_err();
+  match err {
+    Error::LayerKeyed(ref payload) => {
+      assert!(
+        payload.layer().contains("layer.scales"),
+        "LayerKeyed must name the scales key, got layer={:?}",
+        payload.layer()
+      );
+      assert!(
+        matches!(payload.inner(), Error::RankMismatch(_)),
+        "inner must be RankMismatch for non-2D scales, got: {:?}",
+        payload.inner()
+      );
+    }
+    other => panic!("expected Error::LayerKeyed, got: {other:?}"),
+  }
+}
+
+/// `group_size = 0` is rejected with an `OutOfRange` "must be > 0" before
+/// the divisibility check. The qweight/scales shapes are otherwise
+/// well-formed (rank-2, consistent out_features).
+#[test]
+fn transform_awq_weights_rejects_zero_group_size() {
+  let in_features = 8usize;
+  let out_features = 8usize;
+  let qw = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+  // scales must be rank-2 to reach the group_size==0 check (rank check is
+  // first); use [1, out_features] so the rank gate passes.
+  let sc = Array::from_slice::<f32>(&vec![1.0_f32; out_features], &(1usize, out_features)).unwrap();
+  let mut weights: Weights = HashMap::new();
+  weights.insert("layer.qweight".to_string(), qw);
+  weights.insert("layer.scales".to_string(), sc);
+
+  let config = AwqLoadConfig {
+    bits: 4,
+    group_size: 0,
+    zero_point: false,
+    version: "gemm".into(),
+  };
+  let err = transform_awq_weights(weights, &config).unwrap_err();
+  let Error::OutOfRange(p) = &err else {
+    panic!("expected Error::OutOfRange, got {err:?}");
+  };
+  assert!(
+    p.context().contains("group_size"),
+    "context names group_size, got: {}",
+    p.context()
+  );
+  assert!(
+    p.requirement().contains("> 0"),
+    "requirement names the > 0 bound, got: {}",
+    p.requirement()
+  );
+}
+
+/// `in_features` not a multiple of `group_size` is rejected with a
+/// layer-keyed `DivisibilityConstraint` (mlx-lm `n_groups = in_features //
+/// group_size` requires exact division).
+#[test]
+fn transform_awq_weights_rejects_indivisible_in_features() {
+  // in_features = 8, group_size = 3 → 8 % 3 != 0.
+  let in_features = 8usize;
+  let out_features = 8usize;
+  let qw = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+  // scales rank-2 so the rank gate passes; the divisibility check fires first
+  // on in_features (8) vs group_size (3) before the shape derivation.
+  let sc = Array::from_slice::<f32>(&vec![1.0_f32; out_features], &(1usize, out_features)).unwrap();
+  let mut weights: Weights = HashMap::new();
+  weights.insert("layer.qweight".to_string(), qw);
+  weights.insert("layer.scales".to_string(), sc);
+
+  let config = AwqLoadConfig {
+    bits: 4,
+    group_size: 3,
+    zero_point: false,
+    version: "gemm".into(),
+  };
+  let err = transform_awq_weights(weights, &config).unwrap_err();
+  match err {
+    Error::LayerKeyed(ref payload) => {
+      assert!(
+        payload.layer().contains("layer.qweight"),
+        "LayerKeyed must name the qweight key, got layer={:?}",
+        payload.layer()
+      );
+      assert!(
+        matches!(payload.inner(), Error::DivisibilityConstraint(_)),
+        "inner must be DivisibilityConstraint, got: {:?}",
+        payload.inner()
+      );
+    }
+    other => panic!("expected Error::LayerKeyed, got: {other:?}"),
+  }
+}
+
+/// A `qzeros` with a dtype other than U32/I32 (here F32) is rejected at the
+/// qzeros dtype gate with a layer-keyed `UnsupportedDtype` naming `.qzeros`.
+#[test]
+fn transform_awq_weights_rejects_non_int_qzeros_dtype() {
+  let in_features = 8usize;
+  let out_features = 8usize;
+  let n_groups = 2usize;
+  let qw = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+  let sc = Array::from_slice::<f32>(
+    &vec![1.0_f32; n_groups * out_features],
+    &(n_groups, out_features),
+  )
+  .unwrap();
+  // F32 qzeros — wrong dtype (must be U32/I32). Shape is the valid
+  // [n_groups, packed_out] = [2, 1] so the dtype gate (which runs before
+  // the shape check) is what fires.
+  let qz = Array::from_slice::<f32>(&vec![0.0_f32; n_groups], &(n_groups, 1)).unwrap();
+  let mut weights: Weights = HashMap::new();
+  weights.insert("layer.qweight".to_string(), qw);
+  weights.insert("layer.scales".to_string(), sc);
+  weights.insert("layer.qzeros".to_string(), qz);
+
+  let cfg = AwqLoadConfig {
+    bits: 4,
+    group_size: 4,
+    zero_point: true,
+    version: "gemm".into(),
+  };
+  let err = transform_awq_weights(weights, &cfg).unwrap_err();
+  match err {
+    Error::LayerKeyed(ref payload) => {
+      assert!(
+        payload.layer().contains("layer.qzeros"),
+        "LayerKeyed must name the qzeros key, got layer={:?}",
+        payload.layer()
+      );
+      assert!(
+        matches!(payload.inner(), Error::UnsupportedDtype(_)),
+        "inner must be UnsupportedDtype for non-int qzeros, got: {:?}",
+        payload.inner()
+      );
+    }
+    other => panic!("expected Error::LayerKeyed, got: {other:?}"),
+  }
+}
+
+/// A `qzeros` with the wrong shape (not `[n_groups, packed_out]`) is
+/// rejected with a layer-keyed `ShapePairMismatch` naming `.qzeros`.
+#[test]
+fn transform_awq_weights_rejects_mismatched_qzeros_shape() {
+  let in_features = 8usize;
+  let out_features = 8usize;
+  let n_groups = 2usize;
+  let qw = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+  let sc = Array::from_slice::<f32>(
+    &vec![1.0_f32; n_groups * out_features],
+    &(n_groups, out_features),
+  )
+  .unwrap();
+  // qzeros should be [n_groups=2, packed_out=1]; give a wrong [3, 1].
+  let qz = Array::from_slice::<u32>(&[0u32, 0, 0], &(3usize, 1)).unwrap();
+  let mut weights: Weights = HashMap::new();
+  weights.insert("layer.qweight".to_string(), qw);
+  weights.insert("layer.scales".to_string(), sc);
+  weights.insert("layer.qzeros".to_string(), qz);
+
+  let cfg = AwqLoadConfig {
+    bits: 4,
+    group_size: 4,
+    zero_point: true,
+    version: "gemm".into(),
+  };
+  let err = transform_awq_weights(weights, &cfg).unwrap_err();
+  match err {
+    Error::LayerKeyed(ref payload) => {
+      assert!(
+        payload.layer().contains("layer.qzeros"),
+        "LayerKeyed must name the qzeros key, got layer={:?}",
+        payload.layer()
+      );
+      assert!(
+        matches!(payload.inner(), Error::ShapePairMismatch(_)),
+        "inner must be ShapePairMismatch for wrong qzeros shape, got: {:?}",
+        payload.inner()
+      );
+    }
+    other => panic!("expected Error::LayerKeyed, got: {other:?}"),
+  }
+}
+
+// ──────────────── transform_awq_weights: orphan .scales / .qzeros pass-through ────────────────
+
+/// An orphan `.scales` (no matching `.qweight` prefix) and an orphan
+/// `.qzeros` pass through verbatim alongside a real AWQ triple. Covers the
+/// `remainder.insert(key, arr)` arms for non-AWQ `.scales` / `.qzeros`.
+#[test]
+fn transform_awq_weights_orphan_scales_and_qzeros_pass_through() {
+  let mut weights = awq_gemm_fixture_weights();
+  // Orphan `.scales` whose prefix has NO `.qweight`.
+  let orphan_scales = Array::from_slice::<f32>(&[0.1_f32, 0.2], &(2usize,)).unwrap();
+  weights.insert("orphan.scales".to_string(), orphan_scales);
+  // Orphan `.qzeros` whose prefix has NO `.qweight`.
+  let orphan_qzeros = Array::from_slice::<u32>(&[0u32, 0], &(2usize,)).unwrap();
+  weights.insert("orphan.qzeros".to_string(), orphan_qzeros);
+
+  let cfg = AwqLoadConfig {
+    bits: 4,
+    group_size: 4,
+    zero_point: true,
+    version: "gemm".into(),
+  };
+  let (out, _) = transform_awq_weights(weights, &cfg).expect("orphans pass through");
+  // Real layer converted.
+  assert!(out.contains_key("layer.weight"));
+  // Orphans preserved verbatim under their original keys.
+  assert!(
+    out.contains_key("orphan.scales"),
+    "orphan .scales must pass through"
+  );
+  assert!(
+    out.contains_key("orphan.qzeros"),
+    "orphan .qzeros must pass through"
+  );
+}
+
+// ──────────────── transform_awq_weights: zero_point but no qzeros ────────────────
+
+/// `zero_point: true` but NO `.qzeros` on disk falls through to the
+/// symmetric implicit-zero path (mlx-lm `utils.py:136` checks
+/// `qzeros_key in weights`). The biases are `-2^(bits-1) * scale = -8 *
+/// scale` — here scale=1.0 everywhere → biases = -8.0. Distinct from the
+/// existing `zero_point: false` symmetric test: this exercises the
+/// `zero_point=true, qz_opt=None` arm.
+#[test]
+fn transform_awq_weights_zero_point_true_without_qzeros_uses_symmetric() {
+  let in_features = 8usize;
+  let out_features = 8usize;
+  let n_groups = 2usize;
+  let qw = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+  let scales_data: Vec<f32> = vec![1.0_f32; n_groups * out_features];
+  let sc = Array::from_slice::<f32>(&scales_data, &(n_groups, out_features)).unwrap();
+  let mut weights: Weights = HashMap::new();
+  weights.insert("layer.qweight".to_string(), qw);
+  weights.insert("layer.scales".to_string(), sc);
+  // NOTE: no `layer.qzeros` — asymmetric requested but data absent.
+
+  let config = AwqLoadConfig {
+    bits: 4,
+    group_size: 4,
+    zero_point: true, // asymmetric requested...
+    version: "gemm".into(),
+  };
+  let (out, _) =
+    transform_awq_weights(weights, &config).expect("zero_point=true w/o qzeros falls to symmetric");
+  let mut biases_arr = out
+    .get("layer.biases")
+    .expect("layer.biases")
+    .try_clone()
+    .unwrap();
+  let biases: Vec<f32> = biases_arr.to_vec().unwrap();
+  // Implicit-zero symmetric: bias = -8 * scale = -8.0 for scale=1.0.
+  for &b in &biases {
+    assert!(
+      (b + 8.0_f32).abs() < 1e-5,
+      "implicit-zero symmetric bias must be -8.0, got {b}"
+    );
+  }
+}
