@@ -698,3 +698,360 @@ fn default_loss_rejects_lengths_with_missing_batch_row() -> Result<()> {
   }
   Ok(())
 }
+
+// ─────────── TrainingArgs: remaining getters + builders ───────────
+
+#[test]
+fn training_args_clear_cache_threshold_getter_and_builder() {
+  // Default is 0 (disabled); the builder overwrites the field and the
+  // getter reads it back verbatim. Closed-form: input == output.
+  let a = TrainingArgs::new();
+  assert_eq!(a.clear_cache_threshold(), 0);
+  let a = a.with_clear_cache_threshold(4096);
+  assert_eq!(a.clear_cache_threshold(), 4096);
+}
+
+#[test]
+fn training_args_adapter_file_builder_accepts_str_and_string() {
+  // `with_adapter_file(impl Into<String>)` — exercise both a &str and a
+  // String argument; getter returns the exact stored path.
+  let a = TrainingArgs::new();
+  // Python default path.
+  assert_eq!(a.adapter_file(), "adapters.safetensors");
+  let a = a.with_adapter_file("custom/path.safetensors");
+  assert_eq!(a.adapter_file(), "custom/path.safetensors");
+  let owned = String::from("owned/adapters.safetensors");
+  let a = a.with_adapter_file(owned);
+  assert_eq!(a.adapter_file(), "owned/adapters.safetensors");
+}
+
+#[test]
+fn training_args_grad_checkpoint_builder_flips_flag() {
+  // Default false → builder sets true → getter observes true.
+  let a = TrainingArgs::new();
+  assert!(!a.grad_checkpoint());
+  let a = a.with_grad_checkpoint(true);
+  assert!(a.grad_checkpoint());
+}
+
+// ─────────── default_loss: shape-guard branches ───────────
+
+#[test]
+fn default_loss_rejects_non_rank_2_batch() -> Result<()> {
+  // A rank-1 batch must be rejected with RankMismatch BEFORE any forward
+  // pass. Closed-form: actual rank = 1, actual_shape = [3].
+  let model = FakeModel;
+  let batch = Array::from_slice::<i32>(&[1, 2, 3], &(3usize,))?;
+  // `lengths` shape is irrelevant — the rank guard fires first.
+  let lengths = Array::from_slice::<i32>(&[0, 3], &(1, 2))?;
+  let err =
+    default_loss(&model, &batch, &lengths).expect_err("expected RankMismatch for rank-1 batch");
+  match err {
+    Error::RankMismatch(p) => {
+      assert_eq!(p.context(), "default_loss: batch must be rank-2 [B, S]");
+      assert_eq!(p.actual(), 1);
+      assert_eq!(p.actual_shape(), &[3_usize][..]);
+    }
+    other => panic!("expected Error::RankMismatch, got: {other:?}"),
+  }
+  Ok(())
+}
+
+#[test]
+fn default_loss_rejects_rank_3_batch() -> Result<()> {
+  // A rank-3 batch also fails the `[b, s]` match arm. Closed-form: actual
+  // rank = 3, actual_shape = [1, 1, 2].
+  let model = FakeModel;
+  let batch = Array::from_slice::<i32>(&[1, 2], &(1usize, 1usize, 2usize))?;
+  let lengths = Array::from_slice::<i32>(&[0, 2], &(1, 2))?;
+  let err =
+    default_loss(&model, &batch, &lengths).expect_err("expected RankMismatch for rank-3 batch");
+  match err {
+    Error::RankMismatch(p) => {
+      assert_eq!(p.actual(), 3);
+      assert_eq!(p.actual_shape(), &[1_usize, 1, 2][..]);
+    }
+    other => panic!("expected Error::RankMismatch, got: {other:?}"),
+  }
+  Ok(())
+}
+
+#[test]
+fn default_loss_rejects_seq_len_below_2() -> Result<()> {
+  // S=1 cannot form a next-token (input, target) pair, so default_loss must
+  // reject with OutOfRange before forwarding. Closed-form: value = "1".
+  let model = FakeModel;
+  let batch = Array::from_slice::<i32>(&[5], &(1usize, 1usize))?;
+  let lengths = Array::from_slice::<i32>(&[0, 1], &(1, 2))?;
+  let err = default_loss(&model, &batch, &lengths).expect_err("expected OutOfRange for S < 2");
+  match err {
+    Error::OutOfRange(p) => {
+      assert_eq!(p.context(), "default_loss: batch S");
+      assert_eq!(p.requirement(), "must be >= 2 for next-token prediction");
+      assert_eq!(p.value(), "1");
+    }
+    other => panic!("expected Error::OutOfRange, got: {other:?}"),
+  }
+  Ok(())
+}
+
+// ─────────── TrainInfo / ValInfo accessors ───────────
+
+#[test]
+fn train_info_accessors_return_constructor_inputs() {
+  // Closed-form: every getter must echo the exact value passed to `new`.
+  let info = TrainInfo::new(7, 1.5, 0.001, 12.0, 480.0, 3_200);
+  assert_eq!(info.iteration(), 7);
+  assert_eq!(info.train_loss(), 1.5);
+  assert_eq!(info.learning_rate(), 0.001);
+  assert_eq!(info.iterations_per_second(), 12.0);
+  assert_eq!(info.tokens_per_second(), 480.0);
+  assert_eq!(info.trained_tokens(), 3_200);
+}
+
+#[test]
+fn val_info_accessors_return_constructor_inputs() {
+  // Closed-form: getters echo the constructor inputs verbatim.
+  let info = ValInfo::new(42, 2.25, 0.75);
+  assert_eq!(info.iteration(), 42);
+  assert_eq!(info.val_loss(), 2.25);
+  assert_eq!(info.val_time(), 0.75);
+}
+
+#[test]
+fn noop_callback_default_methods_are_no_ops() -> Result<()> {
+  // The default trait impls (train/val report + save) must be reachable and
+  // side-effect-free for `NoopCallback`. on_save returns Ok(()).
+  let mut cb = NoopCallback;
+  cb.on_train_loss_report(&TrainInfo::new(1, 0.0, 0.0, 0.0, 0.0, 0));
+  cb.on_val_loss_report(&ValInfo::new(0, 0.0, 0.0));
+  cb.on_save(3, "adapters.safetensors")?;
+  Ok(())
+}
+
+// ─────────── iterate_batches / build_batch / shuffle internals ───────────
+
+#[test]
+fn build_batch_clamps_padded_length_to_max_seq_length() -> Result<()> {
+  // Examples are length 4; the pad heuristic wants
+  //   1 + 32 * ceil(4/32) = 1 + 32 = 33
+  // columns, but max_seq_length = 8 forces the clamp to 8. The yielded
+  // token tensor must therefore be [B=4, 8], proving line 816's clamp ran.
+  let dataset = FakeDataset::new(4, 4);
+  let iter = iterate_batches(&dataset, 4, 8, false, None)?;
+  let mut saw = false;
+  for b in iter {
+    let b = b?;
+    assert_eq!(
+      b.tokens_ref().shape(),
+      &[4, 8],
+      "padded width must be clamped to max_seq_length=8 (un-clamped would be 33)",
+    );
+    saw = true;
+  }
+  assert!(saw, "expected at least one batch");
+  Ok(())
+}
+
+#[test]
+fn fisher_yates_shuffle_is_a_deterministic_permutation() {
+  // Independent oracle: a Fisher-Yates shuffle is a PERMUTATION, so the
+  // multiset of elements is invariant; and it is seeded-deterministic, so
+  // the same seed yields the identical ordering on a repeat. Both checks
+  // avoid re-deriving the SplitMix64 stream by hand.
+  let mut a: Vec<usize> = (0..16).collect();
+  let mut b: Vec<usize> = (0..16).collect();
+  fisher_yates_shuffle(&mut a, 0xDEAD_BEEF);
+  fisher_yates_shuffle(&mut b, 0xDEAD_BEEF);
+  assert_eq!(a, b, "same seed must produce the same permutation");
+  let mut sorted = a.clone();
+  sorted.sort_unstable();
+  assert_eq!(
+    sorted,
+    (0..16).collect::<Vec<_>>(),
+    "shuffle must be a permutation (no lost/duplicated elements)",
+  );
+}
+
+#[test]
+fn fisher_yates_shuffle_different_seeds_can_differ() {
+  // Two distinct seeds over a 16-element slice should not collapse to the
+  // identical ordering (guards against the swap body being a no-op).
+  let mut a: Vec<usize> = (0..16).collect();
+  let mut b: Vec<usize> = (0..16).collect();
+  fisher_yates_shuffle(&mut a, 1);
+  fisher_yates_shuffle(&mut b, 999_999);
+  assert_ne!(a, b, "distinct seeds should yield distinct permutations");
+}
+
+#[test]
+fn iterate_batches_shuffle_over_multiple_batches_runs_shuffle_body() -> Result<()> {
+  // 8 examples / batch_size 4 = 2 batch groups. With a shuffle seed the
+  // BatchIter refreshes `order` = [0, 1] and runs fisher_yates_shuffle
+  // (loop body executes for a 2-element order). We only assert the
+  // iterator yields valid batches across more than one pass (loop_forever)
+  // — the shuffle internals are covered by the unit tests above.
+  let dataset = FakeDataset::new(8, 4);
+  let mut iter = iterate_batches(&dataset, 4, 64, true, Some(0x1234))?;
+  for _ in 0..4 {
+    let b = iter.next().expect("loop_forever must not exhaust")?;
+    assert_eq!(b.tokens_ref().shape()[0], 4);
+  }
+  Ok(())
+}
+
+#[test]
+fn batch_iter_with_empty_batch_idx_yields_none() {
+  // Directly drive a BatchIter whose `batch_idx` is empty (a state
+  // `iterate_batches` rejects up front, but the iterator must still
+  // terminate cleanly): the first `next()` refreshes `order` to empty and
+  // hits the `order.is_empty()` early-None. loop_forever=true ensures the
+  // first-pass guard does not short-circuit before reaching that branch.
+  let dataset = FakeDataset::new(4, 4);
+  let mut iter = BatchIter {
+    dataset: &dataset,
+    batch_idx: Vec::new(),
+    max_seq_length: 64,
+    cursor: 0,
+    order: Vec::new(),
+    loop_forever: true,
+    shuffle_seed: None,
+    rng_state: None,
+    first_pass: true,
+  };
+  assert!(
+    iter.next().is_none(),
+    "empty batch_idx must yield None even with loop_forever=true",
+  );
+}
+
+// ─────────── evaluate: cap + zero-token branches ───────────
+
+#[test]
+fn evaluate_stops_after_num_batches_cap() -> Result<()> {
+  // 8 examples / batch_size 4 = 2 available batches, but num_batches=Some(1)
+  // caps the loop at one batch (the `i >= cap` break fires at i=1). The
+  // returned loss is the single batch's per-token loss = log(8) for uniform
+  // vocab=8 logits (closed-form, independent of the second batch).
+  let dataset = FakeDataset::new(8, 6);
+  let model = FakeModel;
+  let loss = evaluate(&model, &dataset, 4, Some(1), 64, |m, b, l| {
+    default_loss(m, b, l)
+  })?;
+  assert!(
+    (loss - 8.0_f32.ln()).abs() < 1e-4,
+    "capped eval over 1 batch must report log(8); got {loss}",
+  );
+  Ok(())
+}
+
+#[test]
+fn evaluate_rejects_eval_set_that_produces_no_tokens() {
+  // A loss closure that always reports ntoks=0 keeps total_tokens at 0,
+  // tripping the post-loop EmptyInput guard. Uses a custom closure (NOT
+  // default_loss, which rejects zero-token batches earlier) so the loop
+  // body runs to completion and the guard at the end is what fires.
+  let dataset = FakeDataset::new(4, 6);
+  let model = FakeModel;
+  let zero_tok = |_m: &FakeModel, _b: &Array, _l: &Array| -> Result<(Array, Array)> {
+    let loss = Array::full::<f32>(&[0i32; 0], 1.0)?;
+    let ntoks = Array::full::<f32>(&[0i32; 0], 0.0)?;
+    Ok((loss, ntoks))
+  };
+  let err = evaluate(&model, &dataset, 4, Some(1), 64, zero_tok)
+    .expect_err("expected EmptyInput when eval produces no tokens");
+  match err {
+    Error::EmptyInput(p) => {
+      assert!(
+        p.context().contains("produced no batches with tokens"),
+        "unexpected context: {}",
+        p.context(),
+      );
+    }
+    other => panic!("expected Error::EmptyInput, got: {other:?}"),
+  }
+}
+
+// ─────────── train: iters == 0 fast path ───────────
+
+#[test]
+fn train_with_zero_iters_returns_ok_without_firing_callbacks() -> Result<()> {
+  // iters=0 hits the early `return Ok(())` (before the interval-zero checks
+  // and the loop), so NO save / report / eval callback ever fires —
+  // including the final save hook, which lives after the loop.
+  let dataset = FakeDataset::new(4, 6);
+  let model = FakeModel;
+  let mut params: Weights = HashMap::new();
+  params.insert("w".into(), Array::full::<f32>(&[0i32; 0], 1.0)?);
+  let mut sgd = SGD::vanilla(0.01)?;
+  let mut cb = CountingCallback {
+    train_reports: 0,
+    val_reports: 0,
+    saves: 0,
+  };
+  let args = TrainingArgs::new()
+    .with_iters(0)
+    .with_batch_size(4)
+    .with_max_seq_length(64)
+    .with_val_batches(Some(1))
+    .with_acknowledge_no_real_gradients(true);
+  train(
+    &model,
+    &mut sgd,
+    &mut params,
+    &dataset,
+    Some(&dataset),
+    &args,
+    default_loss,
+    &mut cb,
+  )?;
+  assert_eq!(cb.train_reports, 0, "no train reports for iters=0");
+  assert_eq!(cb.val_reports, 0, "no eval for iters=0");
+  assert_eq!(
+    cb.saves, 0,
+    "iters=0 returns before the final save hook, so no save fires",
+  );
+  Ok(())
+}
+
+// ─────────── add_weights: error branches ───────────
+
+#[test]
+fn add_weights_rejects_mismatched_key_counts() -> Result<()> {
+  // lhs has 2 keys, rhs has 1 → LengthMismatch. Closed-form: expected=2
+  // (lhs len), actual=1 (rhs len). Drives the private helper directly.
+  let mut a: Weights = HashMap::new();
+  a.insert("x".into(), Array::full::<f32>(&[0i32; 0], 1.0)?);
+  a.insert("y".into(), Array::full::<f32>(&[0i32; 0], 2.0)?);
+  let mut b: Weights = HashMap::new();
+  b.insert("x".into(), Array::full::<f32>(&[0i32; 0], 3.0)?);
+  let err = add_weights(&a, &b).expect_err("expected LengthMismatch for key-count skew");
+  match err {
+    Error::LengthMismatch(p) => {
+      assert_eq!(p.context(), "trainer::add_weights: lhs vs rhs key counts");
+      assert_eq!(p.expected(), 2);
+      assert_eq!(p.actual(), 1);
+    }
+    other => panic!("expected Error::LengthMismatch, got: {other:?}"),
+  }
+  Ok(())
+}
+
+#[test]
+fn add_weights_rejects_key_present_in_lhs_but_missing_from_rhs() -> Result<()> {
+  // Equal key counts but disjoint key sets: lhs={"x"}, rhs={"y"}. The loop
+  // over lhs looks up "x" in rhs, fails, and returns MissingKey naming "x".
+  let mut a: Weights = HashMap::new();
+  a.insert("x".into(), Array::full::<f32>(&[0i32; 0], 1.0)?);
+  let mut b: Weights = HashMap::new();
+  b.insert("y".into(), Array::full::<f32>(&[0i32; 0], 2.0)?);
+  let err = add_weights(&a, &b).expect_err("expected MissingKey for disjoint key sets");
+  match err {
+    Error::MissingKey(p) => {
+      assert_eq!(p.context(), "trainer::add_weights: key missing from rhs");
+      assert_eq!(p.key(), "x");
+    }
+    other => panic!("expected Error::MissingKey, got: {other:?}"),
+  }
+  Ok(())
+}

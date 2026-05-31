@@ -1040,3 +1040,6 @@ fn finalize_encoding(
 
   Ok(Encoded::new(ids, attention_mask))
 }
+
+#[cfg(test)]
+mod tests;
