@@ -217,7 +217,11 @@ fn emit_byte_decoder(out: &mut String) {
 fn emit_bpe_space_matches(out: &mut String, data: &Path) {
   let src =
     fs::read_to_string(data.join("bpe_space_matches.toml")).expect("read bpe_space_matches.toml");
-  let doc: toml::Value = src.parse().expect("parse bpe_space_matches.toml");
+  // `toml::from_str` (serde document parse), not `str::parse::<Value>`: toml
+  // 1.x's `FromStr for Value` parses a single bare value and rejects a
+  // `key = value` document ("unexpected content, expected nothing"), whereas
+  // `from_str` deserializes the whole document. Works on toml 0.8 and 1.x.
+  let doc: toml::Value = toml::from_str(&src).expect("parse bpe_space_matches.toml");
   let arr = doc
     .get("matches")
     .and_then(toml::Value::as_array)
@@ -241,7 +245,8 @@ fn emit_bpe_space_matches(out: &mut String, data: &Path) {
 /// only the literal markers / selection substrings live here.
 fn emit_tool_parser_table(out: &mut String, data: &Path) {
   let src = fs::read_to_string(data.join("tool_parsers.toml")).expect("read tool_parsers.toml");
-  let doc: toml::Value = src.parse().expect("parse tool_parsers.toml");
+  // Document parse via `toml::from_str` (see `emit_bpe_space_matches`).
+  let doc: toml::Value = toml::from_str(&src).expect("parse tool_parsers.toml");
   let parsers = doc
     .get("parser")
     .and_then(toml::Value::as_array)
