@@ -502,3 +502,6 @@ pub fn truncate_last_dim(x: &Array, dimension: usize) -> Result<Array> {
   let indices = broadcast_to(&indices, &bshape.as_slice())?;
   take_along_axis(x, &indices, (ndim - 1) as i32)
 }
+
+#[cfg(test)]
+mod tests;

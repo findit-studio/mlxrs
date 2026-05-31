@@ -1380,3 +1380,203 @@ fn roll_last_axis(a: &Array, shift: usize) -> Result<Array> {
   let head = slice_last(0, l - s)?;
   ops::shape::concatenate(&[&tail, &head], -1)
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  // A `[B, n_heads, S, head_dim]` kv token batch (the cache's 4-D layout).
+  fn kv(data: &[f32], b: usize, s: usize, d: usize) -> Array {
+    Array::from_slice::<f32>(data, &(b, 1usize, s, d)).unwrap()
+  }
+
+  #[test]
+  fn new_initial_state_is_empty_and_unrotated() {
+    let c = BatchRotatingKvCache::new(4, &[0, 2]);
+    assert_eq!(c.offset(), 0, "monotone _offset starts at 0");
+    assert_eq!(c.max_size(), Some(4));
+    assert_eq!(c.ring_idx(), 0, "ring write cursor starts at 0");
+    assert!(!c.is_rotated(), "a fresh ring is not rotated");
+    assert_eq!(c.max_window(), 4);
+    assert_eq!(c.pad_lengths(), &[0, 2], "host mirror of left_padding");
+    assert!(c.state().unwrap().is_empty(), "an empty cache yields []");
+    assert_eq!(c.buf_seq_len().unwrap(), None, "no physical buffer yet");
+    let mut lp = c.left_padding_arr().unwrap();
+    assert_eq!(lp.to_vec::<i32>().unwrap(), vec![0, 2]);
+  }
+
+  #[test]
+  fn reference_class_name_matches_mlx() {
+    let c = BatchRotatingKvCache::new(2, &[0]);
+    assert_eq!(c.reference_class_name(), "BatchRotatingKVCache");
+  }
+
+  #[test]
+  fn update_against_zero_max_size_placeholder_errs() {
+    // `max_size == 0` is the from_state placeholder; updating before
+    // set_meta_state restores a real window must fail fast, not run the
+    // degenerate ring arithmetic.
+    let mut c = BatchRotatingKvCache::new(0, &[0]);
+    let k = kv(&[1.0], 1, 1, 1);
+    assert!(matches!(
+      c.update(&k, &k),
+      Err(Error::InvariantViolation(_))
+    ));
+  }
+
+  #[test]
+  fn update_rejects_kv_batch_mismatch() {
+    let mut c = BatchRotatingKvCache::new(4, &[0]);
+    let k = kv(&[1.0, 2.0], 1, 1, 2); // [B=1, H=1, S=1, D=2]
+    let v = kv(&[1.0, 2.0, 3.0, 4.0], 2, 1, 2); // [B=2, …] — batch mismatch
+    assert!(
+      c.update(&k, &v).is_err(),
+      "K/V batch mismatch must be rejected"
+    );
+  }
+
+  #[test]
+  fn single_token_update_advances_cursors() {
+    let mut c = BatchRotatingKvCache::new(4, &[0]);
+    let k = kv(&[1.0, 2.0], 1, 1, 2);
+    let v = kv(&[3.0, 4.0], 1, 1, 2);
+    let _ = c.update(&k, &v).unwrap();
+    assert_eq!(c.offset(), 1, "_offset advances by S=1");
+    assert_eq!(c.ring_idx(), 1, "write cursor advances by 1");
+    assert!(!c.is_rotated(), "no wrap yet (idx 1 < max_size 4)");
+    assert_eq!(
+      c.state().unwrap().len(),
+      4,
+      "non-empty state is [keys, values, offset, left_padding]"
+    );
+  }
+
+  #[test]
+  fn ring_caps_and_rotates_past_max_size() {
+    // Window of 2, fed three DISTINCT tokens with INDEPENDENT key and value
+    // streams (keys 10/20/30, values 100/200/300), so the assertion is
+    // load-bearing on data retention AND on the K and V buffers staying
+    // distinct — a ring that overwrote the wrong slot, kept stale data,
+    // zeroed a slot, or sourced values from keys would change the retained
+    // contents, not merely the offset/rotated/shape metadata.
+    let mut c = BatchRotatingKvCache::new(2, &[0]);
+    let mut fetched = None;
+    for (kval, vval) in [(10.0_f32, 100.0_f32), (20.0, 200.0), (30.0, 300.0)] {
+      let k = kv(&[kval], 1, 1, 1);
+      let v = kv(&[vval], 1, 1, 1);
+      // `update` IS update_and_fetch — keep the LAST returned (K, V), the
+      // buffers a decoder attends over immediately after the wrapping write.
+      fetched = Some(c.update(&k, &v).unwrap());
+    }
+    assert_eq!(c.offset(), 3, "monotone _offset counts all 3 tokens");
+    assert!(c.is_rotated(), "ring wrapped after exceeding max_size");
+    assert_eq!(
+      c.ring_idx(),
+      1,
+      "the 3rd write wrapped to slot 0, leaving the cursor at slot 1"
+    );
+    let st = c.state().unwrap();
+    assert_eq!(
+      st.len(),
+      4,
+      "non-empty state is [keys, values, offset, left_padding]"
+    );
+    // Assert the FULL [B, n_kv_heads, max_size, head_dim] shape, not just the
+    // seq axis: the decoder attends over this exact 4-D shape, so a regression
+    // that kept the right flat data but widened head_dim, dropped a rank, or
+    // mis-placed the seq axis would corrupt attention while to_vec (which
+    // flattens) stayed equal. [B,H,S,D] = [1,1,2,1] here (window of 2).
+    let want_shape = vec![1usize, 1, 2, 1];
+    assert_eq!(
+      st[0].shape(),
+      want_shape,
+      "stored key ring shape [B,H,max_size,D]"
+    );
+    assert_eq!(
+      st[1].shape(),
+      want_shape,
+      "stored value ring shape [B,H,max_size,D]"
+    );
+    // Once rotated (_offset >= physical buffer length) state() returns the
+    // FULL physical ring (no logical 0..off slice). The 3rd token overwrote
+    // slot 0 (evicting the 1st); slot 1 still holds the 2nd — physical order
+    // [third, second]. K and V are asserted against their OWN independent
+    // streams; the 1st token must NOT survive in either.
+    let mut keys = st[0].try_clone().unwrap();
+    let mut vals = st[1].try_clone().unwrap();
+    assert_eq!(
+      keys.to_vec::<f32>().unwrap(),
+      vec![30.0, 20.0],
+      "key ring holds [k3, k2]; k1 evicted"
+    );
+    assert_eq!(
+      vals.to_vec::<f32>().unwrap(),
+      vec![300.0, 200.0],
+      "value ring holds [v3, v2]; v1 evicted"
+    );
+    // The wrap ALSO mutates the per-sequence RoPE offset and left_padding
+    // that state() returns at [2]/[3] (and the batch_offset / left_padding_arr
+    // / pad_lengths mirrors): offset += S each step (-> [3]) and left_padding
+    // decrements by S on the rotate (-> [-1]). These drive RoPE + windowed
+    // masking, so a regression leaving them stale would corrupt later batched
+    // decoding while the K/V buffers above still looked correct.
+    let mut off_arr = st[2].try_clone().unwrap();
+    let mut lp_arr = st[3].try_clone().unwrap();
+    assert_eq!(off_arr.shape(), vec![1usize], "per-seq RoPE offset is [B]");
+    assert_eq!(
+      off_arr.to_vec::<i32>().unwrap(),
+      vec![3],
+      "RoPE offset advanced by S three times"
+    );
+    assert_eq!(lp_arr.shape(), vec![1usize], "left_padding is [B]");
+    assert_eq!(
+      lp_arr.to_vec::<i32>().unwrap(),
+      vec![-1],
+      "left_padding decremented once, on the wrap"
+    );
+    let mut bo = c.batch_offset().unwrap();
+    let mut lpa = c.left_padding_arr().unwrap();
+    assert_eq!(
+      bo.to_vec::<i32>().unwrap(),
+      vec![3],
+      "batch_offset() mirrors state()[2]"
+    );
+    assert_eq!(
+      lpa.to_vec::<i32>().unwrap(),
+      vec![-1],
+      "left_padding_arr() mirrors state()[3]"
+    );
+    assert_eq!(
+      c.pad_lengths(),
+      &[-1],
+      "pad_lengths() host mirror tracks left_padding"
+    );
+    // update_and_fetch's RETURN is the decode-time attention buffer — a
+    // separate observable from the stored state() above. It must carry the
+    // same independent K/V physical ring AND the same 4-D shape: a regression
+    // that committed self.values correctly but returned the key buffer as
+    // values, or returned a mis-shaped buffer, would corrupt attention while
+    // leaving state() intact.
+    let (mut ret_k, mut ret_v) = fetched.unwrap();
+    assert_eq!(
+      ret_k.shape(),
+      want_shape,
+      "fetched key shape matches the stored ring"
+    );
+    assert_eq!(
+      ret_v.shape(),
+      want_shape,
+      "fetched value shape matches the stored ring"
+    );
+    assert_eq!(
+      ret_k.to_vec::<f32>().unwrap(),
+      vec![30.0, 20.0],
+      "fetched keys mirror the key ring [k3, k2]"
+    );
+    assert_eq!(
+      ret_v.to_vec::<f32>().unwrap(),
+      vec![300.0, 200.0],
+      "fetched values mirror the value ring [v3, v2]"
+    );
+  }
+}

@@ -858,3 +858,6 @@ pub fn trim_prompt_cache(cache: &mut [Box<dyn KvCache>], num_tokens: usize) -> R
   }
   Ok(first)
 }
+
+#[cfg(test)]
+mod tests;
