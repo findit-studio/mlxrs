@@ -2540,3 +2540,12 @@ pub fn apply_layout(arr: Array, layout: Layout) -> Result<Array> {
 /// surface for no caller benefit.
 #[cfg(test)]
 mod apply_orientation_tests;
+
+/// Private unit tests for the `vlm::image` helpers and enum string tags
+/// the public-API integration suite (`tests/vlm_image.rs`) cannot reach:
+/// the `as_str` / `Display` surface of [`ResizeFilter`] / [`ColorOrder`]
+/// / [`Layout`], the private [`make_channel_broadcast`] rank arms, the
+/// rank-0 and W-axis validation branches of [`normalize`] / [`patchify`],
+/// and the `load_image` parse-error closure.
+#[cfg(test)]
+mod tests;

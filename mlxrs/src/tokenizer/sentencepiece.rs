@@ -1535,4 +1535,812 @@ mod tests {
       SentencePiecePieceType::Unknown
     );
   }
+
+  // ================================================================
+  // SentencePiecePieceType: as_str / as_raw / from_raw — all variants
+  // ================================================================
+
+  #[test]
+  fn piece_type_as_str_covers_every_variant() {
+    // Closed-form: each variant maps to its documented lowercase tag.
+    // `UnknownOrdinal` collapses to "unknown" (shares the catch-all label).
+    assert_eq!(SentencePiecePieceType::Normal.as_str(), "normal");
+    assert_eq!(SentencePiecePieceType::Unknown.as_str(), "unknown");
+    assert_eq!(SentencePiecePieceType::Control.as_str(), "control");
+    assert_eq!(SentencePiecePieceType::UserDefined.as_str(), "user_defined");
+    assert_eq!(SentencePiecePieceType::Unused.as_str(), "unused");
+    assert_eq!(SentencePiecePieceType::Byte.as_str(), "byte");
+    assert_eq!(
+      SentencePiecePieceType::UnknownOrdinal(99).as_str(),
+      "unknown"
+    );
+  }
+
+  #[test]
+  fn piece_type_display_delegates_to_as_str() {
+    // `#[display("{}", self.as_str())]` — Display must equal as_str().
+    assert_eq!(
+      SentencePiecePieceType::UserDefined.to_string(),
+      "user_defined"
+    );
+    assert_eq!(SentencePiecePieceType::Byte.to_string(), "byte");
+    assert_eq!(
+      SentencePiecePieceType::UnknownOrdinal(7).to_string(),
+      "unknown"
+    );
+  }
+
+  #[test]
+  fn piece_type_as_raw_covers_every_variant() {
+    // Closed-form ordinals per the upstream ModelProto.SentencePiece.Type.
+    assert_eq!(SentencePiecePieceType::Normal.as_raw(), 1);
+    assert_eq!(SentencePiecePieceType::Unknown.as_raw(), 2);
+    assert_eq!(SentencePiecePieceType::Control.as_raw(), 3);
+    assert_eq!(SentencePiecePieceType::UserDefined.as_raw(), 4);
+    assert_eq!(SentencePiecePieceType::Unused.as_raw(), 5);
+    assert_eq!(SentencePiecePieceType::Byte.as_raw(), 6);
+    // UnknownOrdinal round-trips its stored ordinal verbatim.
+    assert_eq!(SentencePiecePieceType::UnknownOrdinal(42).as_raw(), 42);
+    assert_eq!(SentencePiecePieceType::UnknownOrdinal(-1).as_raw(), -1);
+  }
+
+  #[test]
+  fn piece_type_from_raw_round_trips_known_ordinals() {
+    // from_raw(as_raw(x)) == x for every compile-time-known variant.
+    for v in [
+      SentencePiecePieceType::Normal,
+      SentencePiecePieceType::Unknown,
+      SentencePiecePieceType::Control,
+      SentencePiecePieceType::UserDefined,
+      SentencePiecePieceType::Unused,
+      SentencePiecePieceType::Byte,
+    ] {
+      let raw = v.as_raw() as u64;
+      assert_eq!(SentencePiecePieceType::from_raw(raw), v, "raw={raw}");
+    }
+  }
+
+  #[test]
+  fn piece_type_from_raw_maps_each_ordinal_explicitly() {
+    // Independent oracle: hand-enumerated ordinal → variant table.
+    assert_eq!(
+      SentencePiecePieceType::from_raw(1),
+      SentencePiecePieceType::Normal
+    );
+    assert_eq!(
+      SentencePiecePieceType::from_raw(2),
+      SentencePiecePieceType::Unknown
+    );
+    assert_eq!(
+      SentencePiecePieceType::from_raw(3),
+      SentencePiecePieceType::Control
+    );
+    assert_eq!(
+      SentencePiecePieceType::from_raw(4),
+      SentencePiecePieceType::UserDefined
+    );
+    assert_eq!(
+      SentencePiecePieceType::from_raw(5),
+      SentencePiecePieceType::Unused
+    );
+    assert_eq!(
+      SentencePiecePieceType::from_raw(6),
+      SentencePiecePieceType::Byte
+    );
+  }
+
+  #[test]
+  fn piece_type_from_raw_unknown_ordinal_is_captured() {
+    // Ordinal 7 is not a known variant → UnknownOrdinal(7), preserving the
+    // raw value (cast u64 -> i32). Confirms the `n =>` catch-all arm.
+    assert_eq!(
+      SentencePiecePieceType::from_raw(7),
+      SentencePiecePieceType::UnknownOrdinal(7)
+    );
+    assert_eq!(
+      SentencePiecePieceType::from_raw(255),
+      SentencePiecePieceType::UnknownOrdinal(255)
+    );
+    // is_variant predicate (derive_more::IsVariant) on the catch-all arm.
+    assert!(SentencePiecePieceType::from_raw(7).is_unknown_ordinal());
+    assert!(SentencePiecePieceType::Normal.is_normal());
+  }
+
+  // ================================================================
+  // SentencePieceModelType: as_str / from_raw
+  // ================================================================
+
+  #[test]
+  fn model_type_as_str_and_display() {
+    assert_eq!(SentencePieceModelType::Unigram.as_str(), "unigram");
+    assert_eq!(SentencePieceModelType::Bpe.as_str(), "bpe");
+    assert_eq!(SentencePieceModelType::Unigram.to_string(), "unigram");
+    assert_eq!(SentencePieceModelType::Bpe.to_string(), "bpe");
+    assert!(SentencePieceModelType::Unigram.is_unigram());
+    assert!(SentencePieceModelType::Bpe.is_bpe());
+  }
+
+  #[test]
+  fn model_type_from_raw_maps_1_and_2_and_rejects_others() {
+    // Verified indirectly via the public protobuf path: trainer_spec
+    // model_type ordinal 1 -> Unigram, 2 -> Bpe, anything else -> default
+    // Unigram (from_raw returns None, parse keeps the Unigram default).
+    let unigram = build_model_with_pieces(
+      &[("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8)],
+      1,
+    );
+    assert_eq!(
+      SentencePieceTokenizer::from_model_bytes(&unigram)
+        .unwrap()
+        .model_type(),
+      SentencePieceModelType::Unigram
+    );
+    let bpe = build_model_with_pieces(
+      &[("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8)],
+      2,
+    );
+    assert_eq!(
+      SentencePieceTokenizer::from_model_bytes(&bpe)
+        .unwrap()
+        .model_type(),
+      SentencePieceModelType::Bpe
+    );
+    // model_type = 3 is unrecognized: from_raw -> None, so the parse keeps
+    // its default (Unigram). Exercises the `_ => None` arm.
+    let unknown_kind = build_model_with_pieces(
+      &[("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8)],
+      3,
+    );
+    assert_eq!(
+      SentencePieceTokenizer::from_model_bytes(&unknown_kind)
+        .unwrap()
+        .model_type(),
+      SentencePieceModelType::Unigram
+    );
+  }
+
+  // ================================================================
+  // Protobuf reader: read_varint / read_fixed32 / skip_field
+  // ================================================================
+
+  #[test]
+  fn read_varint_unterminated_is_malformed() {
+    // A single byte with the continuation bit set and no following byte:
+    // the read_varint loop advances (shift 0 -> 7) then runs out of input,
+    // exiting the loop and returning the "malformed varint" error.
+    let bad = vec![0x80u8];
+    let err = SentencePieceTokenizer::from_model_bytes(&bad).unwrap_err();
+    let Error::MalformedData(p) = err else {
+      panic!("expected Error::MalformedData, got {err:?}");
+    };
+    assert_eq!(p.context(), "SentencePiece protobuf");
+    assert_eq!(p.detail(), "malformed varint");
+  }
+
+  #[test]
+  fn read_varint_multi_byte_continuation_then_eof_is_malformed() {
+    // Several continuation bytes with no terminator: forces multiple
+    // `shift += 7` iterations before the buffer is exhausted.
+    let bad = vec![0x80u8, 0x80, 0x80];
+    let err = SentencePieceTokenizer::from_model_bytes(&bad).unwrap_err();
+    let Error::MalformedData(p) = err else {
+      panic!("expected Error::MalformedData, got {err:?}");
+    };
+    assert_eq!(p.detail(), "malformed varint");
+  }
+
+  #[test]
+  fn read_fixed32_truncated_is_malformed() {
+    // Top-level field tagged (field 9, wire 5 = fixed32) with only 2 of the
+    // required 4 bytes following: skip_field(5) -> read_fixed32 hits the
+    // `end > data.len()` truncation branch.
+    let mut bad = Vec::new();
+    bad.push((9 << 3) | 5); // field 9, wire 5
+    bad.push(0x01);
+    bad.push(0x02); // only 2 bytes, need 4
+    let err = SentencePieceTokenizer::from_model_bytes(&bad).unwrap_err();
+    let Error::MalformedData(p) = err else {
+      panic!("expected Error::MalformedData, got {err:?}");
+    };
+    assert_eq!(p.context(), "SentencePiece protobuf");
+    assert_eq!(p.detail(), "truncated fixed32 field");
+  }
+
+  #[test]
+  fn skip_field_fixed32_full_then_pieces_parse() {
+    // A well-formed top-level fixed32 field (4 bytes) on an unknown field
+    // number is skipped cleanly (the non-truncated read_fixed32 path), and
+    // the subsequent pieces still parse. Exercises skip_field wire 5 + the
+    // read_fixed32 success advance.
+    let mut data = Vec::new();
+    data.push((9 << 3) | 5); // field 9, wire 5 fixed32
+    data.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+    // followed by a normal piece (field 1, wire 2)
+    let piece = build_piece("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8);
+    data.push((1 << 3) | 2);
+    write_varint(&mut data, piece.len() as u64);
+    data.extend_from_slice(&piece);
+    let tok = SentencePieceTokenizer::from_model_bytes(&data).unwrap();
+    assert_eq!(tok.vocab_size(), 1);
+  }
+
+  #[test]
+  fn skip_field_varint_unknown_field_number() {
+    // Unknown top-level field 9 wire 0 (varint) is skipped via skip_field(0).
+    let mut data = Vec::new();
+    data.push((9 << 3) | 0); // field 9, wire 0
+    write_varint(&mut data, 123_456);
+    let piece = build_piece("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8);
+    data.push((1 << 3) | 2);
+    write_varint(&mut data, piece.len() as u64);
+    data.extend_from_slice(&piece);
+    let tok = SentencePieceTokenizer::from_model_bytes(&data).unwrap();
+    assert_eq!(tok.vocab_size(), 1);
+  }
+
+  #[test]
+  fn skip_field_fixed64_full_then_pieces_parse() {
+    // Unknown top-level field 9 wire 1 (fixed64, 8 bytes) is skipped via the
+    // skip_field wire-1 advance (index += 8), then pieces parse.
+    let mut data = Vec::new();
+    data.push((9 << 3) | 1); // field 9, wire 1 fixed64
+    data.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+    let piece = build_piece("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8);
+    data.push((1 << 3) | 2);
+    write_varint(&mut data, piece.len() as u64);
+    data.extend_from_slice(&piece);
+    let tok = SentencePieceTokenizer::from_model_bytes(&data).unwrap();
+    assert_eq!(tok.vocab_size(), 1);
+  }
+
+  #[test]
+  fn skip_field_fixed64_truncated_is_malformed() {
+    // field 9 wire 1 (fixed64) with only 3 of 8 bytes -> the wire-1
+    // `end > data.len()` truncation branch in skip_field.
+    let mut bad = Vec::new();
+    bad.push((9 << 3) | 1);
+    bad.extend_from_slice(&[0x01, 0x02, 0x03]); // 3 of 8
+    let err = SentencePieceTokenizer::from_model_bytes(&bad).unwrap_err();
+    let Error::MalformedData(p) = err else {
+      panic!("expected Error::MalformedData, got {err:?}");
+    };
+    assert_eq!(p.detail(), "truncated fixed64 field");
+  }
+
+  #[test]
+  fn skip_field_length_delimited_unknown_field_number() {
+    // Unknown top-level field 9 wire 2 (length-delimited) is skipped via
+    // skip_field(2) -> read_length_delimited, then pieces parse.
+    let mut data = Vec::new();
+    data.push((9 << 3) | 2); // field 9, wire 2
+    let blob = b"ignored-bytes";
+    write_varint(&mut data, blob.len() as u64);
+    data.extend_from_slice(blob);
+    let piece = build_piece("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8);
+    data.push((1 << 3) | 2);
+    write_varint(&mut data, piece.len() as u64);
+    data.extend_from_slice(&piece);
+    let tok = SentencePieceTokenizer::from_model_bytes(&data).unwrap();
+    assert_eq!(tok.vocab_size(), 1);
+  }
+
+  #[test]
+  fn skip_field_unsupported_wire_type_errors() {
+    // Wire type 3 (group-start, unsupported) -> skip_field `other` arm ->
+    // Error::UnknownEnumValue with the offending value + supported list.
+    let mut bad = Vec::new();
+    bad.push((1 << 3) | 3); // field 1, wire 3 (unsupported)
+    let err = SentencePieceTokenizer::from_model_bytes(&bad).unwrap_err();
+    let Error::UnknownEnumValue(p) = err else {
+      panic!("expected Error::UnknownEnumValue, got {err:?}");
+    };
+    assert_eq!(p.type_name(), "SentencePiece protobuf: wire type");
+    assert_eq!(p.value(), "3");
+    assert!(
+      p.supported().contains(&"0 (varint)"),
+      "supported: {:?}",
+      p.supported()
+    );
+    // Message carries the wire-type context for the integration boundary.
+    assert!(p.to_string().contains("wire type"), "{p}");
+  }
+
+  // ================================================================
+  // parse_piece / parse_trainer_spec_model_type skip-field arms
+  // ================================================================
+
+  #[test]
+  fn parse_piece_skips_unknown_subfields() {
+    // A piece sub-message carrying an extra field (field 7, wire 0) that is
+    // not (1,2)/(2,5)/(3,0): the parse_piece `_ => skip_field` arm runs and
+    // the piece still parses with token/score/type intact.
+    let mut piece = Vec::new();
+    // field 1, wire 2 (token)
+    piece.push((1 << 3) | 2);
+    write_varint(&mut piece, "\u{2581}hi".len() as u64);
+    piece.extend_from_slice("\u{2581}hi".as_bytes());
+    // field 7, wire 0 — unknown subfield, must be skipped
+    piece.push((7 << 3) | 0);
+    write_varint(&mut piece, 999);
+    // field 3, wire 0 (type = Normal)
+    piece.push((3 << 3) | 0);
+    write_varint(
+      &mut piece,
+      u64::from(SentencePiecePieceType::Normal.as_raw() as u8),
+    );
+
+    let mut data = Vec::new();
+    data.push((1 << 3) | 2);
+    write_varint(&mut data, piece.len() as u64);
+    data.extend_from_slice(&piece);
+
+    let tok = SentencePieceTokenizer::from_model_bytes(&data).unwrap();
+    assert_eq!(tok.vocab_size(), 1);
+    assert_eq!(tok.piece(0).map(|p| p.token()), Some("\u{2581}hi"));
+    assert_eq!(
+      tok.piece(0).unwrap().piece_type(),
+      SentencePiecePieceType::Normal
+    );
+  }
+
+  #[test]
+  fn parse_piece_with_no_token_field_is_dropped() {
+    // A piece sub-message with only a score field (field 2, wire 5) and no
+    // token (field 1): parse_piece returns None (token stays None) so the
+    // piece is dropped; the model then has only the real piece.
+    let mut tokenless = Vec::new();
+    tokenless.push((2 << 3) | 5); // field 2, wire 5 (score), no token
+    tokenless.extend_from_slice(&(-1.0f32).to_bits().to_le_bytes());
+
+    let mut data = Vec::new();
+    // empty/tokenless piece first
+    data.push((1 << 3) | 2);
+    write_varint(&mut data, tokenless.len() as u64);
+    data.extend_from_slice(&tokenless);
+    // then a valid piece
+    let real = build_piece("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8);
+    data.push((1 << 3) | 2);
+    write_varint(&mut data, real.len() as u64);
+    data.extend_from_slice(&real);
+
+    let tok = SentencePieceTokenizer::from_model_bytes(&data).unwrap();
+    // Tokenless piece dropped -> only the `<unk>` survives.
+    assert_eq!(tok.vocab_size(), 1);
+    assert_eq!(tok.piece(0).map(|p| p.token()), Some("<unk>"));
+  }
+
+  #[test]
+  fn trainer_spec_skips_unknown_subfield_and_returns_none() {
+    // trainer_spec sub-message containing an unrelated field (field 5,
+    // wire 0) but NO model_type (field 3): parse_trainer_spec_model_type
+    // skips field 5, runs to end, and returns Ok(None) -> default Unigram.
+    let mut trainer = Vec::new();
+    trainer.push((5 << 3) | 0); // unrelated field 5, wire 0
+    write_varint(&mut trainer, 7);
+
+    let mut data = Vec::new();
+    let piece = build_piece("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8);
+    data.push((1 << 3) | 2);
+    write_varint(&mut data, piece.len() as u64);
+    data.extend_from_slice(&piece);
+    // trainer_spec (field 2, wire 2) with only the unrelated subfield
+    data.push((2 << 3) | 2);
+    write_varint(&mut data, trainer.len() as u64);
+    data.extend_from_slice(&trainer);
+
+    let tok = SentencePieceTokenizer::from_model_bytes(&data).unwrap();
+    assert_eq!(tok.model_type(), SentencePieceModelType::Unigram);
+  }
+
+  // ================================================================
+  // TokenLattice degenerate paths (private API, same-module access)
+  // ================================================================
+
+  #[test]
+  fn lattice_viterbi_returns_empty_on_gap_with_no_begin_node() {
+    // A lattice with characters but no inserted nodes: begin_nodes[0] is
+    // empty, so the Viterbi pass takes the early `return Vec::new()`.
+    let mut lattice = TokenLattice::new("ab", 0, 0);
+    assert_eq!(lattice.char_count(), 2);
+    let path = lattice.viterbi();
+    assert!(
+      path.is_empty(),
+      "expected empty path, got {} nodes",
+      path.len()
+    );
+  }
+
+  #[test]
+  fn lattice_viterbi_returns_empty_when_eos_has_no_predecessor() {
+    // Every begin offset is non-empty (so the offset loop completes), but no
+    // node ends at `count`, so EOS never acquires a `prev` and the
+    // path-reconstruction takes the `None => return Vec::new()` branch.
+    let mut lattice = TokenLattice::new("a", 5, 7);
+    // Zero-length node at offset 0 -> begin_nodes[0] non-empty, but nothing
+    // ends at offset 1 (where EOS lives), so end_nodes[1] stays empty.
+    lattice.insert(0, 0, -1.0, 9);
+    let path = lattice.viterbi();
+    assert!(
+      path.is_empty(),
+      "expected empty path (EOS unreachable), got {} nodes",
+      path.len()
+    );
+  }
+
+  #[test]
+  fn lattice_piece_extracts_char_range_substring() {
+    // piece() slices by character offsets, not bytes -> multi-byte chars
+    // must be reassembled whole. Build a node covering chars[1..3] of "▁é!".
+    let mut lattice = TokenLattice::new("\u{2581}\u{00e9}!", 0, 0);
+    assert_eq!(lattice.char_count(), 3);
+    lattice.insert(1, 2, -1.0, 0); // chars index 1..=2 -> "é!"
+    // The just-inserted node is the last one in the arena.
+    let node = lattice.nodes.last().unwrap().clone();
+    assert_eq!(lattice.piece(&node), "\u{00e9}!");
+  }
+
+  // ================================================================
+  // from_model_file SUCCESS path (line that calls from_model_bytes)
+  // ================================================================
+
+  #[test]
+  fn from_model_file_reads_and_parses_a_real_file() {
+    // Process- + thread-unique temp path so parallel test bins never collide
+    // (tempfile is not a workspace dev-dep; mirror the audio_io convention).
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+      "mlxrs_spm_model_{}_{:?}.model",
+      std::process::id(),
+      std::thread::current().id()
+    ));
+    let data = build_model_with_pieces(
+      &[
+        ("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8),
+        (
+          "\u{2581}hi",
+          -1.0,
+          SentencePiecePieceType::Normal.as_raw() as u8,
+        ),
+      ],
+      1,
+    );
+    fs::write(&path, &data).expect("write temp model");
+    let tok = SentencePieceTokenizer::from_model_file(&path).expect("parse temp model");
+    let _ = fs::remove_file(&path);
+    assert_eq!(tok.vocab_size(), 2);
+    assert_eq!(tok.unknown_token_id(), 0);
+    assert_eq!(tok.model_type(), SentencePieceModelType::Unigram);
+    // Exercise the `piece(id)` out-of-range accessor too (None branch).
+    assert!(tok.piece(99).is_none());
+  }
+
+  // ================================================================
+  // decode: skip-unknown-id + in-loop byte-buffer flush
+  // ================================================================
+
+  #[test]
+  fn decode_skips_out_of_range_ids() {
+    // An id >= vocab_size hits `vocab.get(id) => None => continue`; the
+    // valid pieces around it still decode.
+    let tok = toy_tokenizer(); // vocab_size 6
+    // [▁hello (1), 999 (OOB), ▁world (2)] -> "hello world".
+    let decoded = tok.decode(&[1, 999, 2]);
+    assert_eq!(decoded, "hello world");
+  }
+
+  #[test]
+  fn decode_flushes_byte_buffer_before_a_following_normal_piece() {
+    // Byte-fallback bytes FOLLOWED BY a normal piece: the in-loop flush
+    // (decode the accumulated UTF-8 bytes, push, clear) fires when the
+    // normal piece is reached — distinct from the post-loop trailing flush.
+    let data = build_model_with_pieces(
+      &[
+        ("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8),
+        ("<0xC3>", -5.0, SentencePiecePieceType::Byte.as_raw() as u8),
+        ("<0xA9>", -5.0, SentencePiecePieceType::Byte.as_raw() as u8),
+        (
+          "\u{2581}hi",
+          -1.0,
+          SentencePiecePieceType::Normal.as_raw() as u8,
+        ),
+      ],
+      1,
+    );
+    let tok = SentencePieceTokenizer::from_model_bytes(&data).unwrap();
+    // [0xC3, 0xA9, ▁hi] -> "é" (flushed mid-loop) + " hi" -> "é hi".
+    let decoded = tok.decode(&[1, 2, 3]);
+    assert_eq!(decoded, "\u{00e9} hi");
+  }
+
+  // ================================================================
+  // BPE: piece-type skip on merge + byte-fallback on leftover symbol +
+  //      atomic-piece (UserDefined) initial split
+  // ================================================================
+
+  #[test]
+  fn bpe_skips_merge_into_non_normal_piece_type() {
+    // A BPE model where the only mergeable pair "xy" exists in the vocab but
+    // is typed Control: the merge loop hits the
+    // `!matches!(Normal | UserDefined) => continue` skip, finds no eligible
+    // merge, and breaks — leaving the chars as separate symbols.
+    let data = build_model_with_pieces(
+      &[
+        ("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8),
+        (
+          "\u{2581}",
+          -3.0,
+          SentencePiecePieceType::Normal.as_raw() as u8,
+        ),
+        ("x", -2.0, SentencePiecePieceType::Normal.as_raw() as u8),
+        ("y", -2.0, SentencePiecePieceType::Normal.as_raw() as u8),
+        // "xy" present in vocab but Control -> never an eligible merge.
+        ("xy", -0.1, SentencePiecePieceType::Control.as_raw() as u8),
+      ],
+      2, // bpe
+    );
+    let tok = SentencePieceTokenizer::from_model_bytes(&data).unwrap();
+    assert_eq!(tok.model_type(), SentencePieceModelType::Bpe);
+    // "xy" -> metaspace "▁xy" -> symbols [▁, x, y]; merge "xy" is Control so
+    // it's skipped. Result is the three separate ids [▁(1), x(2), y(3)].
+    let ids = tok.encode_with_byte_fallback("xy");
+    assert_eq!(ids, vec![1, 2, 3], "ids={ids:?}");
+  }
+
+  #[test]
+  fn bpe_leftover_symbol_falls_back_to_bytes() {
+    // A BPE symbol that is NOT a vocab token decomposes to its bytes via
+    // byte_map in the final id assembly (the `else { for b in bytes }` arm).
+    // Here "z" has no vocab entry, but its single byte 0x7A has a <0x7A>
+    // byte-fallback piece.
+    let data = build_model_with_pieces(
+      &[
+        ("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8),
+        (
+          "\u{2581}",
+          -3.0,
+          SentencePiecePieceType::Normal.as_raw() as u8,
+        ),
+        // byte-fallback for 'z' (0x7A)
+        ("<0x7A>", -5.0, SentencePiecePieceType::Byte.as_raw() as u8),
+      ],
+      2, // bpe
+    );
+    let tok = SentencePieceTokenizer::from_model_bytes(&data).unwrap();
+    // "z" -> metaspace "▁z" -> symbols [▁, z]; no merges possible.
+    // ▁ is a vocab token (id 1); z is not -> byte-fallback to <0x7A> (id 2).
+    let ids = tok.encode_with_byte_fallback("z");
+    assert_eq!(ids, vec![1, 2], "ids={ids:?}");
+    // The id-2 byte piece round-trips back to 'z' on decode.
+    assert_eq!(tok.decode(&[2]), "z");
+  }
+
+  #[test]
+  fn bpe_leftover_symbol_without_byte_piece_uses_unknown_id() {
+    // Same as above but with NO byte-fallback piece for the leftover byte:
+    // the `unwrap_or(self.unknown_token_id)` arm of the byte fallback fires.
+    let data = build_model_with_pieces(
+      &[
+        ("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8),
+        (
+          "\u{2581}",
+          -3.0,
+          SentencePiecePieceType::Normal.as_raw() as u8,
+        ),
+      ],
+      2, // bpe
+    );
+    let tok = SentencePieceTokenizer::from_model_bytes(&data).unwrap();
+    // "z" -> [▁(1), z]; z has neither a vocab token nor a byte piece ->
+    // its byte maps to the unknown id (0).
+    let ids = tok.encode_with_byte_fallback("z");
+    assert_eq!(ids, vec![1, 0], "ids={ids:?}");
+  }
+
+  #[test]
+  fn bpe_initial_symbols_consume_user_defined_atomic_piece() {
+    // A UserDefined piece is an atomic BPE symbol: initial_bpe_symbols must
+    // emit it WHOLE (longest-match-first), not split it into characters.
+    // "▁tag" is UserDefined -> the `bpe_atomic_pieces` prefix-match arm runs.
+    let data = build_model_with_pieces(
+      &[
+        ("<unk>", 0.0, SentencePiecePieceType::Unknown.as_raw() as u8),
+        (
+          "\u{2581}",
+          -3.0,
+          SentencePiecePieceType::Normal.as_raw() as u8,
+        ),
+        (
+          "\u{2581}tag",
+          -0.5,
+          SentencePiecePieceType::UserDefined.as_raw() as u8,
+        ),
+      ],
+      2, // bpe
+    );
+    let tok = SentencePieceTokenizer::from_model_bytes(&data).unwrap();
+    // "tag" -> metaspace "▁tag" -> atomic "▁tag" matched whole -> single
+    // symbol -> single id (2). No per-char splitting.
+    let ids = tok.encode_with_byte_fallback("tag");
+    assert_eq!(ids, vec![2], "ids={ids:?}");
+    assert_eq!(tok.decode(&ids), "tag");
+  }
+
+  // ================================================================
+  // Unigram: empty input + unused-vocab-piece never inserts a node
+  // ================================================================
+
+  #[test]
+  fn encode_unigram_empty_input_yields_no_or_metaspace_only_ids() {
+    // apply_metaspace("") -> "▁"; with a "▁" vocab piece the single char is
+    // resolved to that piece. Confirms the encode path handles empty input
+    // without panic and routes through the Unigram branch.
+    let tok = toy_tokenizer();
+    let ids = tok.encode_with_byte_fallback("");
+    // The only character is the prefix ▁, which is vocab id 3.
+    assert_eq!(ids, vec![3], "ids={ids:?}");
+    assert_eq!(tok.decode(&ids), "");
+  }
+
+  // ================================================================
+  // SentencePieceToken accessors
+  // ================================================================
+
+  #[test]
+  fn token_accessors_round_trip_constructor_args() {
+    let t = SentencePieceToken::new("\u{2581}hi", -1.25, SentencePiecePieceType::Normal);
+    assert_eq!(t.token(), "\u{2581}hi");
+    assert_eq!(t.score(), -1.25);
+    assert_eq!(t.piece_type(), SentencePiecePieceType::Normal);
+  }
+
+  // ================================================================
+  // from_tokenizer_json_bytes SUCCESS path + malformed-vocab branches
+  // ================================================================
+
+  #[cfg(feature = "tokenizer-config")]
+  #[test]
+  fn from_tokenizer_json_bytes_parses_valid_json() {
+    // The success branch of from_tokenizer_json_bytes (delegates to
+    // from_tokenizer_json after a successful serde parse). Built from a
+    // `&str` (not a `b"..."` literal) so the U+2581 metaspace char encodes
+    // as real UTF-8 bytes — byte-string literals reject non-ASCII.
+    let json: &str = "{\"model\":{\"type\":\"Unigram\",\"unk_id\":0,\
+      \"vocab\":[[\"<unk>\",0.0],[\"\u{2581}hi\",-1.0]]}}";
+    let tok = SentencePieceTokenizer::from_tokenizer_json_bytes(json.as_bytes()).unwrap();
+    assert_eq!(tok.vocab_size(), 2);
+    assert_eq!(tok.unknown_token_id(), 0);
+    assert_eq!(tok.piece(1).map(|p| p.token()), Some("\u{2581}hi"));
+  }
+
+  #[cfg(feature = "tokenizer-config")]
+  #[test]
+  fn from_tokenizer_json_errors_on_missing_unk_id() {
+    let json: serde_json::Value = serde_json::json!({
+      "model": { "type": "Unigram", "vocab": [["<unk>", 0.0]] }
+    });
+    let err = SentencePieceTokenizer::from_tokenizer_json(&json).unwrap_err();
+    let Error::MissingField(p) = err else {
+      panic!("expected Error::MissingField, got {err:?}");
+    };
+    assert_eq!(p.type_name(), "SentencePieceTokenizer");
+    assert_eq!(p.field(), "model.unk_id");
+  }
+
+  #[cfg(feature = "tokenizer-config")]
+  #[test]
+  fn from_tokenizer_json_errors_on_missing_vocab() {
+    let json: serde_json::Value = serde_json::json!({
+      "model": { "type": "Unigram", "unk_id": 0 }
+    });
+    let err = SentencePieceTokenizer::from_tokenizer_json(&json).unwrap_err();
+    let Error::MissingField(p) = err else {
+      panic!("expected Error::MissingField, got {err:?}");
+    };
+    assert_eq!(p.field(), "model.vocab");
+  }
+
+  #[cfg(feature = "tokenizer-config")]
+  #[test]
+  fn from_tokenizer_json_errors_on_non_array_vocab_entry() {
+    // A vocab entry that is not an array -> `entry is not an array`.
+    let json: serde_json::Value = serde_json::json!({
+      "model": { "type": "Unigram", "unk_id": 0, "vocab": [42] }
+    });
+    let err = SentencePieceTokenizer::from_tokenizer_json(&json).unwrap_err();
+    let Error::MalformedData(p) = err else {
+      panic!("expected Error::MalformedData, got {err:?}");
+    };
+    assert_eq!(p.context(), "SentencePieceTokenizer: `model.vocab`");
+    assert_eq!(p.detail(), "entry is not an array");
+  }
+
+  #[cfg(feature = "tokenizer-config")]
+  #[test]
+  fn from_tokenizer_json_errors_on_wrong_arity_vocab_entry() {
+    // A vocab entry with !=2 elements -> `entry must be a [token, score] pair`.
+    let json: serde_json::Value = serde_json::json!({
+      "model": { "type": "Unigram", "unk_id": 0, "vocab": [["<unk>", 0.0, 99]] }
+    });
+    let err = SentencePieceTokenizer::from_tokenizer_json(&json).unwrap_err();
+    let Error::MalformedData(p) = err else {
+      panic!("expected Error::MalformedData, got {err:?}");
+    };
+    assert_eq!(p.detail(), "entry must be a [token, score] pair");
+  }
+
+  #[cfg(feature = "tokenizer-config")]
+  #[test]
+  fn from_tokenizer_json_errors_on_non_string_token() {
+    // entry[0] not a string -> `entry[0] is not a string`.
+    let json: serde_json::Value = serde_json::json!({
+      "model": { "type": "Unigram", "unk_id": 0, "vocab": [[7, 0.0]] }
+    });
+    let err = SentencePieceTokenizer::from_tokenizer_json(&json).unwrap_err();
+    let Error::MalformedData(p) = err else {
+      panic!("expected Error::MalformedData, got {err:?}");
+    };
+    assert_eq!(p.detail(), "entry[0] is not a string");
+  }
+
+  #[cfg(feature = "tokenizer-config")]
+  #[test]
+  fn from_tokenizer_json_errors_on_non_numeric_score() {
+    // entry[1] not a number -> `entry[1] is not a number`.
+    let json: serde_json::Value = serde_json::json!({
+      "model": { "type": "Unigram", "unk_id": 0, "vocab": [["<unk>", "bad"]] }
+    });
+    let err = SentencePieceTokenizer::from_tokenizer_json(&json).unwrap_err();
+    let Error::MalformedData(p) = err else {
+      panic!("expected Error::MalformedData, got {err:?}");
+    };
+    assert_eq!(p.detail(), "entry[1] is not a number");
+  }
+
+  #[cfg(feature = "tokenizer-config")]
+  #[test]
+  fn from_tokenizer_json_added_token_without_content_is_skipped() {
+    // An added_tokens entry lacking a `content` string hits the `let Some(..)
+    // else { continue }` guard and is ignored; the real special token still
+    // gets promoted to Control.
+    let json: serde_json::Value = serde_json::json!({
+      "model": {
+        "type": "Unigram",
+        "unk_id": 0,
+        "vocab": [["<unk>", 0.0], ["<s>", -1.0], ["\u{2581}hi", -2.0]],
+      },
+      "added_tokens": [
+        { "id": 9, "special": true },                // no `content` -> skipped
+        { "id": 1, "content": "<s>", "special": true } // promotes id 1
+      ],
+    });
+    let tok = SentencePieceTokenizer::from_tokenizer_json(&json).unwrap();
+    assert_eq!(tok.vocab_size(), 3);
+    assert_eq!(
+      tok.piece(1).unwrap().piece_type(),
+      SentencePiecePieceType::Control
+    );
+    // The skipped entry didn't perturb the other pieces.
+    assert_eq!(
+      tok.piece(2).unwrap().piece_type(),
+      SentencePiecePieceType::Normal
+    );
+  }
+
+  #[cfg(feature = "tokenizer-config")]
+  #[test]
+  fn from_tokenizer_json_defaults_to_unigram_without_bpe_type() {
+    // model.type absent / non-"BPE" -> Unigram default (the `_ =>` arm).
+    let json: serde_json::Value = serde_json::json!({
+      "model": { "unk_id": 0, "vocab": [["<unk>", 0.0]] }
+    });
+    let tok = SentencePieceTokenizer::from_tokenizer_json(&json).unwrap();
+    assert_eq!(tok.model_type(), SentencePieceModelType::Unigram);
+
+    // Explicit "BPE" (case-insensitive) -> Bpe.
+    let json_bpe: serde_json::Value = serde_json::json!({
+      "model": { "type": "bpe", "unk_id": 0, "vocab": [["<unk>", 0.0]] }
+    });
+    let tok_bpe = SentencePieceTokenizer::from_tokenizer_json(&json_bpe).unwrap();
+    assert_eq!(tok_bpe.model_type(), SentencePieceModelType::Bpe);
+  }
 }

@@ -1579,4 +1579,660 @@ mod tests {
       "fetched values mirror the value ring [v3, v2]"
     );
   }
+
+  // ── multi-token concat-then-decode: the `update_in_place` trim+rotate
+  // branch (lines 607-633), unreachable from S==1-only streams ───────────
+  #[test]
+  fn concat_prefill_then_single_decode_trims_and_rotates() {
+    // max_size=2, S=3 prefill over-allocates the buffer to max_size+S-1=3
+    // via `_update_concat` (empty branch stores verbatim). The next S==1
+    // decode then hits `_update_in_place`'s trim branch (buffer len 3 >
+    // max_size 2) AND the rotate branch (post-trim _idx == max_size), a
+    // path the S==1-only ring test cannot reach. DISTINCT K/V streams so
+    // the value buffer cannot be silently sourced from keys.
+    let mut c = BatchRotatingKvCache::new(2, &[0]);
+    let pk = kv(&[10.0, 20.0, 30.0], 1, 3, 1);
+    let pv = kv(&[100.0, 200.0, 300.0], 1, 3, 1);
+    let _ = c.update(&pk, &pv).unwrap();
+    assert_eq!(c.offset(), 3, "_offset = S after the prefill");
+    assert_eq!(c.ring_idx(), 3, "_idx = buffer seq-len 3 after concat");
+    assert!(!c.is_rotated(), "verbatim prefill is temporally ordered");
+
+    // S==1 decode: trim_size = 3 - max_size 2 = 1 -> trim to [20,30];
+    // _idx becomes max_size(2) -> rotate -> _idx=0, left_padding -= 1 -> -1
+    // then rotate decrement -> -2; write slot 0 -> [40,30]/[400,300].
+    let dk = kv(&[40.0], 1, 1, 1);
+    let dv = kv(&[400.0], 1, 1, 1);
+    let (mut rk, mut rv) = c.update(&dk, &dv).unwrap();
+    assert_eq!(c.offset(), 4, "monotone _offset advanced to 4");
+    assert!(
+      c.is_rotated(),
+      "post-trim _idx==max_size set the rotate flag"
+    );
+    assert_eq!(c.ring_idx(), 1, "wrapped to slot 0 then advanced to 1");
+    let st = c.state().unwrap();
+    let mut keys = st[0].try_clone().unwrap();
+    let mut vals = st[1].try_clone().unwrap();
+    assert_eq!(
+      keys.shape(),
+      vec![1usize, 1, 2, 1],
+      "ring shrank to max_size"
+    );
+    assert_eq!(
+      keys.to_vec::<f32>().unwrap(),
+      vec![40.0, 30.0],
+      "physical ring [k_new, k3]; the trimmed-off k1 is gone"
+    );
+    assert_eq!(
+      vals.to_vec::<f32>().unwrap(),
+      vec![400.0, 300.0],
+      "value ring tracks its OWN stream [v_new, v3]"
+    );
+    // left_padding decremented twice (trim by 1, rotate by 1) -> -2.
+    let mut lp = st[3].try_clone().unwrap();
+    assert_eq!(lp.to_vec::<i32>().unwrap(), vec![-2], "trim(-1)+rotate(-1)");
+    assert_eq!(
+      c.pad_lengths(),
+      &[-2],
+      "host mirror tracked both decrements"
+    );
+    // The returned decode buffer mirrors the stored ring (buffer full now).
+    assert_eq!(rk.to_vec::<f32>().unwrap(), vec![40.0, 30.0]);
+    assert_eq!(rv.to_vec::<f32>().unwrap(), vec![400.0, 300.0]);
+  }
+
+  // ── update_in_place: the empty-cache grow branch on its OWN (S==1 onto a
+  // never-concated cache) so the buffer-grow + zero-fill path is exercised
+  // for a single batch row with distinct K/V ────────────────────────────
+  #[test]
+  fn single_decode_on_empty_grows_and_returns_logical_slice() {
+    // A fresh cache + S==1 update goes straight through `_update_in_place`'s
+    // grow branch (bk.is_none()): allocate min(step, max_size) rows, write
+    // slot 0, and (since _offset 1 < max_size 4) return only the logical
+    // [0:1] slice. DISTINCT K/V.
+    let mut c = BatchRotatingKvCache::new(4, &[0]);
+    let k = kv(&[7.0], 1, 1, 1);
+    let v = kv(&[70.0], 1, 1, 1);
+    let (rk, rv) = c.update(&k, &v).unwrap();
+    assert_eq!(c.offset(), 1);
+    assert_eq!(c.ring_idx(), 1);
+    assert!(!c.is_rotated());
+    // The returned view is sliced to the logical length (1), NOT the grown
+    // physical buffer (the grow allocates up to max_size). The slice may be a
+    // strided view, so route every host read through `contiguous` first.
+    assert_eq!(
+      rk.shape(),
+      vec![1usize, 1, 1, 1],
+      "returned the [0:_offset] slice"
+    );
+    let mut rk_c = ops::shape::contiguous(&rk, false).unwrap();
+    let mut rv_c = ops::shape::contiguous(&rv, false).unwrap();
+    assert_eq!(rk_c.to_vec::<f32>().unwrap(), vec![7.0]);
+    assert_eq!(rv_c.to_vec::<f32>().unwrap(), vec![70.0]);
+    // `state()` likewise slices to the logical length while _offset < L.
+    let st = c.state().unwrap();
+    let mut keys = ops::shape::contiguous(&st[0], false).unwrap();
+    let mut vals = ops::shape::contiguous(&st[1], false).unwrap();
+    assert_eq!(keys.to_vec::<f32>().unwrap(), vec![7.0]);
+    assert_eq!(vals.to_vec::<f32>().unwrap(), vec![70.0]);
+  }
+
+  // ── prepare_right_padding + finalize SUCCESS path (lines 226-290): the
+  // right-roll that repositions valid tokens, with a closed-form oracle ──
+  #[test]
+  fn finalize_rolls_buffer_and_fixes_padding() {
+    // Order mirrors mlx-lm generation: prepare() (arms _lengths on the
+    // fresh cache), THEN prefill (builds the buffer), THEN finalize() (rolls
+    // it). max_size 8 is wide enough that the S=3 prefill never trims.
+    let mut c = BatchRotatingKvCache::new(8, &[0]);
+    // prepare(lengths=[2], right_padding=[1]): max(right_padding)=1>0 ->
+    // _lengths = [2] + offset[0] = [2] (offset is -left_padding = 0 here).
+    c.prepare_right_padding(&[2], &[1]).unwrap();
+    // S=3 prefill: empty branch stores verbatim, offset -> [3]; _lengths is
+    // NOT consumed by the empty concat branch.
+    let pk = kv(&[10.0, 20.0, 30.0], 1, 3, 1);
+    let pv = kv(&[100.0, 200.0, 300.0], 1, 3, 1);
+    let _ = c.update(&pk, &pv).unwrap();
+    assert_eq!(c.offset(), 3);
+    // finalize: roll = max(0, offset[3] - _lengths[2]) = 1. Right-roll the
+    // length-3 buffer by 1 (dynamic_roll: out[i] = x[(i-1) % 3]) ->
+    // [x2, x0, x1]. left_padding += 1 -> [1]; offset -= 1 -> [2].
+    c.finalize().unwrap();
+    let st = c.state().unwrap();
+    let mut keys = st[0].try_clone().unwrap();
+    let mut vals = st[1].try_clone().unwrap();
+    assert_eq!(
+      keys.to_vec::<f32>().unwrap(),
+      vec![30.0, 10.0, 20.0],
+      "right-roll by 1 over the seq axis"
+    );
+    assert_eq!(
+      vals.to_vec::<f32>().unwrap(),
+      vec![300.0, 100.0, 200.0],
+      "values rolled by the same per-row shift (own stream)"
+    );
+    let mut off_arr = st[2].try_clone().unwrap();
+    let mut lp_arr = st[3].try_clone().unwrap();
+    assert_eq!(off_arr.to_vec::<i32>().unwrap(), vec![2], "offset -= roll");
+    assert_eq!(
+      lp_arr.to_vec::<i32>().unwrap(),
+      vec![1],
+      "left_padding += roll"
+    );
+    assert_eq!(
+      c.pad_lengths(),
+      &[1],
+      "host mirror refreshed after finalize"
+    );
+    // _lengths cleared: a subsequent S==1 decode no longer errors.
+    let dk = kv(&[40.0], 1, 1, 1);
+    let dv = kv(&[400.0], 1, 1, 1);
+    assert!(
+      c.update(&dk, &dv).is_ok(),
+      "finalize cleared _lengths so decoding is allowed"
+    );
+  }
+
+  // ── finalize with NO armed _lengths is a no-op; a roll of 0 still
+  // round-trips (covers the `lengths` None early-return) ─────────────────
+  #[test]
+  fn finalize_without_lengths_is_noop() {
+    let mut c = BatchRotatingKvCache::new(4, &[0]);
+    let k = kv(&[1.0, 2.0], 1, 2, 1);
+    let _ = c.update(&k, &k).unwrap();
+    let before = c.offset();
+    c.finalize().unwrap();
+    assert_eq!(c.offset(), before, "no _lengths -> finalize is a no-op");
+  }
+
+  // ── prepare_right_padding with all-zero right_padding leaves _lengths
+  // unarmed (the `max(right_padding) > 0` guard is false) ────────────────
+  #[test]
+  fn prepare_right_padding_zero_does_not_arm_lengths() {
+    let mut c = BatchRotatingKvCache::new(4, &[0]);
+    let k = kv(&[1.0], 1, 1, 1);
+    let _ = c.update(&k, &k).unwrap();
+    // right_padding all-zero -> _lengths stays None -> a later S==1 decode
+    // does NOT trip the "finalize() must be called" guard.
+    c.prepare_right_padding(&[1], &[0]).unwrap();
+    let k2 = kv(&[2.0], 1, 1, 1);
+    assert!(
+      c.update(&k2, &k2).is_ok(),
+      "unarmed _lengths must not block decoding"
+    );
+  }
+
+  // ── update_in_place guard: a decode while _lengths is armed errors
+  // (mlx-lm RuntimeError "finalize() must precede decoding") ─────────────
+  #[test]
+  fn decode_before_finalize_errors() {
+    let mut c = BatchRotatingKvCache::new(4, &[0]);
+    let k = kv(&[1.0, 2.0], 1, 2, 1);
+    let _ = c.update(&k, &k).unwrap(); // prefill so the buffer is non-empty
+    c.prepare_right_padding(&[2], &[1]).unwrap(); // arm _lengths
+    let d = kv(&[3.0], 1, 1, 1);
+    assert!(
+      matches!(c.update(&d, &d), Err(Error::InvariantViolation(_))),
+      "S==1 decode with _lengths armed must be an InvariantViolation"
+    );
+  }
+
+  // ── multi-token update_concat onto a NON-empty, NON-rotated cache (the
+  // temporal_order=None + slice-off-end + the lengths-roll branch) ───────
+  #[test]
+  fn concat_onto_nonrotated_with_lengths_rolls_and_advances() {
+    // Wide window so nothing trims; arm _lengths, prefill S=2 (empty branch
+    // verbatim), then a second S=2 update hits `_update_concat`'s
+    // (Some,Some) arm: temporal_order returns None (not rotated -> covers
+    // the None match), the slice-off-end check, and the `_lengths` roll.
+    let mut c = BatchRotatingKvCache::new(16, &[0]);
+    c.prepare_right_padding(&[1], &[1]).unwrap(); // _lengths = [1] + 0 = [1]
+    let p1k = kv(&[1.0, 2.0], 1, 2, 1);
+    let p1v = kv(&[11.0, 12.0], 1, 2, 1);
+    let _ = c.update(&p1k, &p1v).unwrap(); // offset -> [2], _lengths=[1]
+    assert_eq!(c.offset(), 2);
+    let p2k = kv(&[3.0, 4.0], 1, 2, 1);
+    let p2v = kv(&[13.0, 14.0], 1, 2, 1);
+    // Second concat: temporal_order None; slice check (L==_idx, no slice);
+    // _lengths roll = max(0, offset[2] - _lengths[1]) = 1 applied per-row to
+    // the EXISTING [1,2] buffer before appending [3,4]. offset += S.
+    let (mut rk, _) = c.update(&p2k, &p2v).unwrap();
+    assert_eq!(c.offset(), 4, "_offset counts 2 + 2 tokens");
+    assert!(!c.is_rotated(), "still under max_size -> not rotated");
+    // The buffer holds the (rolled) prior context ++ the appended tokens; we
+    // assert the length + the appended-tail tokens (closed-form on the tail,
+    // which the roll never touches) and that the offset bookkeeping is right.
+    assert_eq!(rk.shape(), vec![1usize, 1, 4, 1], "2 retained + 2 appended");
+    let kvec = rk.to_vec::<f32>().unwrap();
+    assert_eq!(
+      &kvec[2..],
+      &[3.0, 4.0],
+      "appended tokens are verbatim at the tail"
+    );
+  }
+
+  // ── state()/meta_state() <-> set_state()/set_meta_state() round-trip and
+  // the empty-set_state reset (covers both set_state arms + meta parse) ──
+  #[test]
+  fn state_meta_set_state_round_trip() {
+    let mut c = BatchRotatingKvCache::new(4, &[1, 0]);
+    let pk = kv(&[1.0, 2.0], 2, 1, 1); // [B=2,H=1,S=1,D=1] -> 2 elements
+    let pv = kv(&[10.0, 20.0], 2, 1, 1);
+    let _ = c.update(&pk, &pv).unwrap(); // S==1 -> _offset/_idx = 1
+    let meta = c.meta_state();
+    assert_eq!(meta.len(), 4, "(max_size, _offset, _idx, rotated)");
+    assert_eq!(meta[0], "4");
+    assert_eq!(meta[1], "1", "_offset advanced by S=1");
+    assert_eq!(meta[3], "false");
+    let st = c.state().unwrap();
+    assert_eq!(st.len(), 4);
+
+    // Restore into a placeholder via the two setters (the from_serialized
+    // sub-steps): set_state (4-arm) then set_meta_state.
+    let mut restored = BatchRotatingKvCache::new(0, &[]);
+    restored.set_state(st).unwrap();
+    restored.set_meta_state(&meta).unwrap();
+    assert_eq!(restored.offset(), 1, "restored _offset matches meta[1]");
+    assert_eq!(
+      restored.max_size(),
+      Some(4),
+      "restored max_size matches meta[0]"
+    );
+    assert!(!restored.is_rotated());
+    assert_eq!(
+      restored.pad_lengths(),
+      &[1, 0],
+      "left_padding host mirror restored"
+    );
+
+    // Empty set_state resets ALL per-seq runtime state but keeps left_padding
+    // and recomputes offset = -left_padding.
+    restored.set_meta_state(&meta).unwrap();
+    restored.set_state(Vec::new()).unwrap();
+    assert!(restored.is_empty(), "empty set_state clears the buffer");
+    assert_eq!(restored.offset(), 0, "scalar _offset reset to 0");
+    assert_eq!(restored.ring_idx(), 0, "ring cursor reset");
+    assert!(!restored.is_rotated());
+    let mut bo = restored.batch_offset().unwrap();
+    assert_eq!(
+      bo.to_vec::<i32>().unwrap(),
+      vec![-1, 0],
+      "offset reset to -left_padding"
+    );
+  }
+
+  // ── set_state arity guard: any count other than 0 or 4 is OutOfRange ───
+  #[test]
+  fn set_state_wrong_arity_errs() {
+    let mut c = BatchRotatingKvCache::new(4, &[0]);
+    let a = kv(&[1.0], 1, 1, 1);
+    let three = vec![
+      a.try_clone().unwrap(),
+      a.try_clone().unwrap(),
+      a.try_clone().unwrap(),
+    ];
+    assert!(
+      matches!(c.set_state(three), Err(Error::OutOfRange(_))),
+      "a 3-array state is neither empty nor the 4-tuple"
+    );
+  }
+
+  // ── set_meta_state guards: wrong length, unparseable int, bad bool ─────
+  #[test]
+  fn set_meta_state_guards() {
+    let mut c = BatchRotatingKvCache::new(4, &[0]);
+    // Wrong length.
+    assert!(matches!(
+      c.set_meta_state(&["4".to_string(), "0".to_string()]),
+      Err(Error::LengthMismatch(_))
+    ));
+    // Unparseable _offset.
+    assert!(matches!(
+      c.set_meta_state(&[
+        "4".to_string(),
+        "nope".to_string(),
+        "0".to_string(),
+        "false".to_string()
+      ]),
+      Err(Error::Parse(_))
+    ));
+    // Unknown rotated token.
+    assert!(matches!(
+      c.set_meta_state(&[
+        "4".to_string(),
+        "0".to_string(),
+        "0".to_string(),
+        "maybe".to_string()
+      ]),
+      Err(Error::UnknownEnumValue(_))
+    ));
+    // Valid round-trip accepts BOTH Rust "true" and Python-style "True".
+    assert!(
+      c.set_meta_state(&[
+        "4".to_string(),
+        "4".to_string(),
+        "2".to_string(),
+        "True".to_string()
+      ])
+      .is_ok()
+    );
+    assert!(c.is_rotated(), "case-insensitive True parsed as rotated");
+  }
+
+  // ── trim: the n==0 early return + the decrementing path ────────────────
+  #[test]
+  fn trim_zero_is_noop_and_positive_decrements() {
+    let mut c = BatchRotatingKvCache::new(8, &[0]);
+    let p = kv(&[1.0, 2.0, 3.0], 1, 3, 1);
+    let _ = c.update(&p, &p).unwrap(); // _offset 3 (< 8 -> trimmable)
+    assert!(c.is_trimmable(), "_offset 3 < max_size 8");
+    // n==0 (and also n clamped to 0 when _offset is small) -> early Ok(0).
+    assert_eq!(c.trim(0).unwrap(), 0, "trimming 0 is a no-op");
+    assert_eq!(c.offset(), 3, "offset unchanged by a 0-trim");
+    // Positive trim: n = min(_offset, n); _offset/_idx/offset -= n.
+    assert_eq!(c.trim(2).unwrap(), 2);
+    assert_eq!(c.offset(), 1, "_offset 3 - 2");
+    let mut bo = c.batch_offset().unwrap();
+    assert_eq!(bo.to_vec::<i32>().unwrap(), vec![1], "per-seq offset -= 2");
+    // Fill past max_size -> no longer trimmable.
+    let mut c2 = BatchRotatingKvCache::new(2, &[0]);
+    let big = kv(&[1.0, 2.0, 3.0, 4.0], 1, 4, 1);
+    let _ = c2.update(&big, &big).unwrap();
+    assert!(!c2.is_trimmable(), "_offset 4 >= max_size 2");
+  }
+
+  // ── make_mask: max_size==0 placeholder is rejected before any arithmetic
+  #[test]
+  fn make_mask_against_zero_max_size_placeholder_errs() {
+    let c = BatchRotatingKvCache::new(0, &[0]);
+    assert!(matches!(
+      c.make_mask(1, None, false),
+      Err(Error::InvariantViolation(_))
+    ));
+  }
+
+  // ── make_mask: the rotated N==1 path with idx>=max_size folds idx->0
+  // before the roll (covers the `idx >= max_size { 0 }` branch) ──────────
+  #[test]
+  fn make_mask_rotated_with_idx_at_window_rolls() {
+    // Restore a (corrupt-but-rank-free) rotated state where _idx == max_size
+    // via set_meta_state: the rotate branch then folds idx -> 0 before the
+    // last-axis roll. keys=None is fine (make_mask never reads the buffer).
+    let mut c = BatchRotatingKvCache::new(2, &[0]);
+    c.set_meta_state(&[
+      "2".to_string(),
+      "5".to_string(),
+      "2".to_string(),
+      "true".to_string(),
+    ])
+    .unwrap();
+    match c.make_mask(1, Some(2), false).unwrap() {
+      MaskMode::Array(mut m) => {
+        // N=1, window 2, offset = min(max_size-1=1, _offset=5) = 1 ->
+        // total = offset + N = 2; the mask's last axis is `total`.
+        assert_eq!(m.shape()[m.shape().len() - 1], 2);
+        // The rolled mask is built by `concatenate` (contiguous); reading it
+        // back exercises the full rotated codepath without panicking.
+        let _ = m.to_vec::<bool>().unwrap();
+      }
+      _ => panic!("rotated N==1 must return a rolled mask array"),
+    }
+  }
+
+  // ── make_mask: trim/rotate delta exceeding the f32 exact-int limit is a
+  // recoverable OutOfRange (corrupt restored _idx) ───────────────────────
+  #[test]
+  fn make_mask_huge_restored_idx_is_out_of_range() {
+    // A restored _idx far beyond 2^24 makes the trim/rotate `delta` exceed
+    // the f32 exact-integer limit; make_mask must reject it (not silently
+    // build a wrong mask). N==1 so the `_idx + int(N>1)` add doesn't catch
+    // it first; the delta-vs-2^24 guard does.
+    let mut c = BatchRotatingKvCache::new(4, &[0]);
+    let huge = (1usize << 25).to_string();
+    c.set_meta_state(&["4".to_string(), huge.clone(), huge, "false".to_string()])
+      .unwrap();
+    assert!(matches!(
+      c.make_mask(1, None, false),
+      Err(Error::OutOfRange(_))
+    ));
+  }
+
+  // ── make_mask: usize::MAX restored _idx with N>1 overflows `_idx + 1`
+  // (the checked-add `idx_term`) -> ArithmeticOverflow ───────────────────
+  #[test]
+  fn make_mask_idx_max_with_n_gt_1_overflows() {
+    let mut c = BatchRotatingKvCache::new(4, &[0]);
+    let max = usize::MAX.to_string();
+    c.set_meta_state(&["4".to_string(), max.clone(), max, "false".to_string()])
+      .unwrap();
+    assert!(matches!(
+      c.make_mask(2, None, false),
+      Err(Error::ArithmeticOverflow(_))
+    ));
+  }
+
+  // ── nbytes: 0 when empty, keys.nbytes + values.nbytes once populated ───
+  #[test]
+  fn nbytes_tracks_buffers() {
+    let mut c = BatchRotatingKvCache::new(4, &[0]);
+    assert_eq!(c.nbytes(), 0, "an empty cache has no buffer bytes");
+    // S=2 prefill, [B=1,H=1,S=2,D=1] f32 = 2 elements * 4 bytes, for BOTH
+    // keys and values -> 2*(2*4) = 16.
+    let k = kv(&[1.0, 2.0], 1, 2, 1);
+    let _ = c.update(&k, &k).unwrap();
+    assert_eq!(
+      c.nbytes(),
+      16,
+      "keys.nbytes + values.nbytes (2 elems each, f32)"
+    );
+  }
+
+  // ── materialize: evals every live buffer in place; idempotent + no
+  // observable state change (covers the keys/values/lengths Some arms) ───
+  #[test]
+  fn materialize_evals_live_buffers() {
+    let mut c = BatchRotatingKvCache::new(8, &[0]);
+    // Arm _lengths so the lengths Some-arm of materialize is exercised too.
+    c.prepare_right_padding(&[1], &[1]).unwrap();
+    let pk = kv(&[1.0, 2.0], 1, 2, 1);
+    let pv = kv(&[11.0, 12.0], 1, 2, 1);
+    let _ = c.update(&pk, &pv).unwrap();
+    let before = c.state().unwrap();
+    let mut kb = before[0].try_clone().unwrap();
+    let kvec = kb.to_vec::<f32>().unwrap();
+    c.materialize().unwrap();
+    // No observable change: the same logical state survives the eval.
+    let after = c.state().unwrap();
+    let mut ka = after[0].try_clone().unwrap();
+    assert_eq!(
+      ka.to_vec::<f32>().unwrap(),
+      kvec,
+      "materialize preserves data"
+    );
+    assert_eq!(c.offset(), 2);
+    // Materialize on an EMPTY cache (keys/values/lengths None arms) is a
+    // no-op over the [B] position arrays only.
+    let mut empty = BatchRotatingKvCache::new(4, &[0, 0]);
+    assert!(empty.materialize().is_ok(), "empty materialize is a no-op");
+  }
+
+  // ── copy: an independent deep clone whose mutation does not touch the
+  // original (covers every Some/None field arm + scalars) ────────────────
+  #[test]
+  fn copy_is_independent() {
+    let mut c = BatchRotatingKvCache::new(4, &[2, 0]);
+    // Populate keys/values; leave _lengths None (covers both arms across the
+    // two clones below). [B=2,H=1,S=1,D=1] -> 2 elements.
+    let pk = kv(&[1.0, 2.0], 2, 1, 1);
+    let pv = kv(&[10.0, 20.0], 2, 1, 1);
+    let _ = c.update(&pk, &pv).unwrap();
+    let cloned = c.copy().unwrap();
+    assert_eq!(cloned.offset(), c.offset(), "scalar _offset copied");
+    assert_eq!(cloned.max_size(), c.max_size(), "max_size copied");
+    assert!(!cloned.is_empty(), "buffers copied (not None)");
+    let cst = cloned.state().unwrap();
+    assert_eq!(cst.len(), 4);
+    // Mutating the ORIGINAL after the copy must not change the clone.
+    let d = kv(&[5.0, 6.0], 2, 1, 1);
+    let _ = c.update(&d, &d).unwrap();
+    assert_eq!(c.offset(), 2, "original advanced");
+    assert_eq!(cloned.offset(), 1, "clone is independent of the original");
+
+    // A copy of an EMPTY cache hits the keys/values/lengths None arms.
+    let empty = BatchRotatingKvCache::new(4, &[0]);
+    let ec = empty.copy().unwrap();
+    assert!(ec.is_empty(), "empty cache copies to an empty cache");
+  }
+
+  // ── from_serialized SUCCESS round-trip + the empty-buffer structural
+  // guard (empty state must carry fully-fresh meta) ──────────────────────
+  #[test]
+  fn from_serialized_round_trip_and_empty_guard() {
+    let mut c = BatchRotatingKvCache::new(4, &[0, 0]);
+    // B=2 (left_padding len 2), H=1, S=1, D=1 → 2 elements total.
+    let pk = kv(&[1.0, 2.0], 2, 1, 1);
+    let pv = kv(&[10.0, 20.0], 2, 1, 1);
+    let _ = c.update(&pk, &pv).unwrap();
+    let st = c.state().unwrap();
+    let meta = c.meta_state();
+    let mut dst = BatchRotatingKvCache::new(0, &[]);
+    dst.from_serialized(st, &meta).unwrap();
+    assert_eq!(dst.offset(), 1);
+    assert_eq!(dst.max_size(), Some(4));
+    assert!(!dst.is_empty());
+
+    // Empty state (keys=None) with NON-fresh meta (offset != 0) is the
+    // impossible combination -> rejected (OutOfRange), self left unchanged.
+    let mut guard = BatchRotatingKvCache::new(4, &[0]);
+    let prev_off = guard.offset();
+    let bad_meta = vec![
+      "4".to_string(),
+      "2".to_string(),
+      "0".to_string(),
+      "false".to_string(),
+    ];
+    assert!(matches!(
+      guard.from_serialized(Vec::new(), &bad_meta),
+      Err(Error::OutOfRange(_))
+    ));
+    assert_eq!(
+      guard.offset(),
+      prev_off,
+      "rejected restore leaves self unchanged"
+    );
+  }
+
+  // ── from_serialized non-empty structural guards: rotated requires
+  // L==max_size, and L must not exceed _offset ───────────────────────────
+  #[test]
+  fn from_serialized_nonempty_structural_guards() {
+    // Build a valid non-empty (keys, values, offset, left_padding) state by
+    // hand: B=1, L=2 physical buffer, _offset >= L.
+    let keys = kv(&[1.0, 2.0], 1, 2, 1);
+    let vals = kv(&[11.0, 12.0], 1, 2, 1);
+    let off = Array::from_slice::<i32>(&[2], &(1usize,)).unwrap();
+    let lp = Array::from_slice::<i32>(&[0], &(1usize,)).unwrap();
+    let mk_state = || {
+      vec![
+        keys.try_clone().unwrap(),
+        vals.try_clone().unwrap(),
+        off.try_clone().unwrap(),
+        lp.try_clone().unwrap(),
+      ]
+    };
+
+    // rotated=true but L(2) != max_size(4) -> LengthMismatch.
+    let mut a = BatchRotatingKvCache::new(0, &[]);
+    let rotated_bad = vec![
+      "4".to_string(),
+      "2".to_string(),
+      "2".to_string(),
+      "true".to_string(),
+    ];
+    assert!(matches!(
+      a.from_serialized(mk_state(), &rotated_bad),
+      Err(Error::LengthMismatch(_))
+    ));
+
+    // L(2) > _offset(1) is impossible from mlx-lm's getter -> OutOfRange.
+    let mut b = BatchRotatingKvCache::new(0, &[]);
+    let l_gt_off = vec![
+      "4".to_string(),
+      "1".to_string(),
+      "2".to_string(),
+      "false".to_string(),
+    ];
+    assert!(matches!(
+      b.from_serialized(mk_state(), &l_gt_off),
+      Err(Error::OutOfRange(_))
+    ));
+
+    // A consistent rotated=true with L == max_size(2) and _idx <= L is
+    // accepted (the happy non-empty rotated branch).
+    let keys2 = kv(&[1.0, 2.0], 1, 2, 1);
+    let vals2 = kv(&[11.0, 12.0], 1, 2, 1);
+    let off2 = Array::from_slice::<i32>(&[5], &(1usize,)).unwrap();
+    let lp2 = Array::from_slice::<i32>(&[0], &(1usize,)).unwrap();
+    let mut ok = BatchRotatingKvCache::new(0, &[]);
+    let good = vec![
+      "2".to_string(),
+      "5".to_string(),
+      "2".to_string(),
+      "true".to_string(),
+    ];
+    ok.from_serialized(vec![keys2, vals2, off2, lp2], &good)
+      .unwrap();
+    assert!(ok.is_rotated(), "consistent rotated state restored");
+    assert_eq!(ok.max_size(), Some(2));
+  }
+
+  // ── corrupt restored `_idx == usize::MAX` (injected directly via the
+  // two setters, bypassing the from_serialized structural guard) overflows
+  // the checked `_idx + S` in BOTH update paths -> ArithmeticOverflow with
+  // no partial mutation ──────────────────────────────────────────────────
+  fn restore_corrupt_idx_cache() -> BatchRotatingKvCache {
+    // A valid non-empty 4-D buffer (B=1, L=2) so the grow branch does NOT
+    // fire (which would overwrite `w_idx`); `_offset` is small so the
+    // `_offset + S` add does NOT overflow first, isolating the `_idx + S`
+    // checked-add. `_idx` is the hostile `usize::MAX`.
+    let mut c = BatchRotatingKvCache::new(4, &[0]);
+    let keys = Array::from_slice::<f32>(&[1.0, 2.0], &(1usize, 1, 2, 1)).unwrap();
+    let vals = Array::from_slice::<f32>(&[11.0, 12.0], &(1usize, 1, 2, 1)).unwrap();
+    let offset = Array::from_slice::<i32>(&[0], &(1usize,)).unwrap();
+    let lp = Array::from_slice::<i32>(&[0], &(1usize,)).unwrap();
+    c.set_state(vec![keys, vals, offset, lp]).unwrap();
+    // off=0 (no _offset+S overflow), idx=usize::MAX, not rotated.
+    let max = usize::MAX.to_string();
+    c.set_meta_state(&["4".to_string(), "0".to_string(), max, "false".to_string()])
+      .unwrap();
+    c
+  }
+
+  #[test]
+  fn corrupt_idx_overflow_rejected_update_in_place() {
+    // S==1 -> `_update_in_place`: new_w_idx = w_idx(usize::MAX) + 1 overflows.
+    let mut c = restore_corrupt_idx_cache();
+    let d = kv(&[9.0], 1, 1, 1);
+    assert!(matches!(
+      c.update(&d, &d),
+      Err(Error::ArithmeticOverflow(_))
+    ));
+    // No partial mutation: the restored corrupt _idx is still in place.
+    assert_eq!(c.ring_idx(), usize::MAX, "rejected update mutated nothing");
+    assert_eq!(c.offset(), 0);
+  }
+
+  #[test]
+  fn corrupt_idx_overflow_rejected_update_concat() {
+    // S>1 -> `_update_concat`: idx_plus_1 = w_idx(usize::MAX) + 1 overflows
+    // (the slice/trim pivot add), before any commit.
+    let mut c = restore_corrupt_idx_cache();
+    let d = kv(&[9.0, 8.0], 1, 2, 1);
+    assert!(matches!(
+      c.update(&d, &d),
+      Err(Error::ArithmeticOverflow(_))
+    ));
+    assert_eq!(c.ring_idx(), usize::MAX, "rejected update mutated nothing");
+    assert_eq!(c.offset(), 0);
+  }
 }

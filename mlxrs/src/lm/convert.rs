@@ -300,6 +300,7 @@ impl MixedQuantRecipe {
 /// Hidden as `pub` because [`mixed_quant_predicate`] returns it through
 /// the [`MixedQuantPredicate`] trait, but the concrete type is kept
 /// accessible for callers who want to introspect / re-use it.
+#[derive(Debug)]
 pub struct DefaultMixedQuantPredicate {
   low_bits: i32,
   high_bits: i32,
@@ -3916,5 +3917,684 @@ mod unit {
     }
 
     let _ = std::fs::remove_dir_all(&workdir);
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Helper-level coverage: error / continue / pass-through branches in
+  // `mixed_quant_predicate`, `resolve_target_dtype`,
+  // `cast_floats_to_dtype`, `build_predicate_decisions`,
+  // `build_quantize_config`, `strip_quantization_blocks`,
+  // `copy_tokenizer_and_extras`, and `paths_are_same`.
+  //
+  // Each oracle is independent + closed-form: known JSON / path / shape
+  // inputs drive the branch, and the expected output is computed by hand
+  // (typed-error matching for the error arms). No fn-under-test is used
+  // to produce its own expected.
+  // ──────────────────────────────────────────────────────────────────
+
+  /// `mixed_quant_predicate` — a `down_proj`-bearing key with NO numeric
+  /// layer-index segment trips the `.ok_or_else(...)` arm
+  /// (`convert.rs` ~452-457): an [`Error::LayerKeyed`] wrapping an
+  /// [`Error::InvariantViolation`]. Mirrors `convert.py:43-45`'s
+  /// `if k.isdigit(): break` finding no digit segment.
+  #[test]
+  fn mixed_quant_predicate_no_numeric_segment_is_layer_keyed_error() {
+    // One down_proj key whose every `.`-segment is non-numeric — the
+    // `position(... all ascii_digit)` scan returns None.
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "model.decoder.down_proj.weight".to_string(),
+      Array::from_slice::<f32>(&[0.0_f32; 128], &(2usize, 64usize)).unwrap(),
+    );
+
+    match mixed_quant_predicate(MixedQuantRecipe::Mixed3_6, &weights, 64) {
+      Err(Error::LayerKeyed(p)) => {
+        // The offending path is recorded as the layer key (the
+        // `.weight` suffix is stripped by the builder before the scan).
+        assert_eq!(
+          p.layer(),
+          "model.decoder.down_proj",
+          "LayerKeyed names the offending down_proj path"
+        );
+        // The wrapped sub-error is the structural InvariantViolation.
+        match p.inner() {
+          Error::InvariantViolation(iv) => {
+            assert!(
+              iv.context().contains("down_proj"),
+              "inner InvariantViolation names the down_proj path context: {}",
+              iv.context()
+            );
+            assert!(
+              iv.requirement().contains("numeric layer-index segment"),
+              "inner requirement quotes the numeric-segment rule: {}",
+              iv.requirement()
+            );
+          }
+          other => panic!("expected inner InvariantViolation, got {other:?}"),
+        }
+      }
+      other => panic!("expected Err(LayerKeyed), got {other:?}"),
+    }
+  }
+
+  /// `resolve_target_dtype` — a config string that is NOT valid JSON
+  /// takes the `Err(_) => Ok(None)` arm (`convert.rs` ~1014). Documented
+  /// as "unreachable in practice" (the config is parsed once already)
+  /// but the defensive arm must still resolve to "no cast". `explicit`
+  /// is `None` so the dtype-gate above is skipped and the parse arm is
+  /// reached.
+  #[test]
+  fn resolve_target_dtype_unparseable_config_is_none() {
+    // `{` alone is not valid JSON → serde_json::from_str returns Err.
+    assert_eq!(resolve_target_dtype(None, "{ not json").unwrap(), None);
+    // A bare non-JSON token too.
+    assert_eq!(resolve_target_dtype(None, "@@@").unwrap(), None);
+  }
+
+  /// `resolve_target_dtype` — `torch_dtype` is present but an UNKNOWN
+  /// spelling, so `parse_conversion_dtype` returns `None`; the
+  /// `text_config.dtype` fallback (also absent/unknown) then yields the
+  /// final `Ok(None)`. Exercises the fall-through past both `if let`
+  /// chains (the `&& let Some(d) = ...` short-circuits on the parse).
+  #[test]
+  fn resolve_target_dtype_known_key_unknown_value_falls_through() {
+    // torch_dtype present, value unknown → first chain's parse is None.
+    // text_config present, dtype unknown → second chain's parse is None.
+    let cfg = r#"{"torch_dtype":"int8","text_config":{"dtype":"qint4"}}"#;
+    assert_eq!(resolve_target_dtype(None, cfg).unwrap(), None);
+    // text_config present but WITHOUT a `dtype` key → the inner
+    // `.get("dtype")` is None, second chain short-circuits.
+    let cfg2 = r#"{"text_config":{"hidden_size":16}}"#;
+    assert_eq!(resolve_target_dtype(None, cfg2).unwrap(), None);
+  }
+
+  /// `cast_floats_to_dtype` (`convert.rs` ~1052-1066) — floating arrays
+  /// whose dtype differs from `target` are cast; floating arrays already
+  /// at `target` AND non-floating arrays are passed through untouched.
+  ///
+  /// Oracle: build a known mix — an F32 weight (must cast to F16), a
+  /// pre-F16 weight (must stay, the `dt != target` arm is false), and a
+  /// non-floating (U32) weight (the `is_floating` arm is false). Assert
+  /// each output array's dtype against the hand-computed expectation.
+  #[test]
+  fn cast_floats_to_dtype_casts_floats_passes_through_rest() {
+    let mut weights: Weights = HashMap::new();
+    // F32 → must be cast to F16.
+    weights.insert(
+      "a.weight".to_string(),
+      Array::from_slice::<f32>(&[1.0_f32, 2.0, 3.0, 4.0], &(2usize, 2usize)).unwrap(),
+    );
+    // Already F16 → must be left as F16 (the `dt != target` guard skips
+    // the cast — exercises the `else` arm for a floating array).
+    weights.insert(
+      "b.weight".to_string(),
+      Array::from_slice::<f32>(&[5.0_f32, 6.0], &(1usize, 2usize))
+        .unwrap()
+        .astype(Dtype::F16)
+        .unwrap(),
+    );
+    // Non-floating (U32) → `is_floating` is false, passed through.
+    weights.insert(
+      "c.weight".to_string(),
+      Array::from_slice::<f32>(&[7.0_f32, 8.0], &(1usize, 2usize))
+        .unwrap()
+        .astype(Dtype::U32)
+        .unwrap(),
+    );
+
+    let out = cast_floats_to_dtype(weights, Dtype::F16).unwrap();
+    assert_eq!(out.len(), 3, "every key is preserved");
+    assert_eq!(
+      out.get("a.weight").unwrap().dtype().unwrap(),
+      Dtype::F16,
+      "F32 weight cast to the F16 target"
+    );
+    assert_eq!(
+      out.get("b.weight").unwrap().dtype().unwrap(),
+      Dtype::F16,
+      "already-F16 weight left at F16 (no redundant cast)"
+    );
+    assert_eq!(
+      out.get("c.weight").unwrap().dtype().unwrap(),
+      Dtype::U32,
+      "non-floating U32 weight passed through untouched"
+    );
+  }
+
+  /// `build_predicate_decisions` — `group_size <= 0` short-circuits to an
+  /// EMPTY decision map (`convert.rs` ~1116) so the divisor is never
+  /// used. A predicate IS supplied (so we pass the `let Some(pred)`
+  /// guard) and the weights ARE structurally eligible — proving the
+  /// early-return is the `group_size <= 0` guard, not the no-predicate
+  /// or no-eligible-layer path.
+  #[test]
+  fn build_predicate_decisions_nonpositive_group_size_returns_empty() {
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "layer.a.weight".to_string(),
+      Array::from_slice::<f32>(&[0.0_f32; 128], &(2usize, 64usize)).unwrap(),
+    );
+    let pred = CountingPredicate::new();
+
+    // group_size == 0 → empty map, predicate never invoked.
+    let d0 = build_predicate_decisions(Some(&pred), &weights, 0);
+    assert!(d0.is_empty(), "group_size==0 yields an empty decision map");
+    // group_size < 0 → same.
+    let dn = build_predicate_decisions(Some(&pred), &weights, -8);
+    assert!(dn.is_empty(), "negative group_size yields an empty map");
+    // The predicate was NEVER called (the guard returns before the walk).
+    assert_eq!(
+      pred.max_count(),
+      0,
+      "the predicate is not invoked when group_size <= 0"
+    );
+  }
+
+  /// `build_predicate_decisions` — the two per-key `continue` arms
+  /// (`convert.rs` ~1121, ~1135): a key WITHOUT a `.weight` suffix is
+  /// skipped (strip_suffix → None), and a `.weight` key whose last axis
+  /// is NOT divisible by `group_size` is skipped (the structural shape
+  /// gate). Only the eligible key reaches the predicate.
+  #[test]
+  fn build_predicate_decisions_skips_non_weight_and_indivisible_keys() {
+    let mut weights: Weights = HashMap::new();
+    // (1) No `.weight` suffix → skipped at the strip_suffix `continue`.
+    weights.insert(
+      "layer.a.bias".to_string(),
+      Array::from_slice::<f32>(&[0.0_f32; 64], &(1usize, 64usize)).unwrap(),
+    );
+    // (2) `.weight` but last axis 50 is NOT divisible by group_size 64 →
+    //     skipped at the `last % gs != 0` `continue`.
+    weights.insert(
+      "layer.b.weight".to_string(),
+      Array::from_slice::<f32>(&[0.0_f32; 100], &(2usize, 50usize)).unwrap(),
+    );
+    // (3) `.weight`, rank < 2 → skipped at the `shape.len() < 2`
+    //     `continue` (covered alongside).
+    weights.insert(
+      "layer.c.weight".to_string(),
+      Array::from_slice::<f32>(&[0.0_f32; 64], &(64usize,)).unwrap(),
+    );
+    // (4) Eligible: `.weight`, rank 2, last axis 64 divisible by 64.
+    weights.insert(
+      "layer.d.weight".to_string(),
+      Array::from_slice::<f32>(&[0.0_f32; 128], &(2usize, 64usize)).unwrap(),
+    );
+
+    let pred = CountingPredicate::new();
+    let decisions = build_predicate_decisions(Some(&pred), &weights, 64);
+
+    // ONLY layer.d reached the predicate / decision map.
+    assert_eq!(decisions.len(), 1, "exactly the one eligible layer");
+    assert!(
+      matches!(decisions.get("layer.d"), Some(Some(_))),
+      "layer.d recorded with the predicate's decision"
+    );
+    assert_eq!(pred.paths_seen(), vec!["layer.d".to_string()]);
+    // The skipped keys never appear.
+    for skipped in ["layer.a", "layer.b", "layer.c"] {
+      assert!(
+        !decisions.contains_key(skipped),
+        "{skipped} skipped before reaching the predicate"
+      );
+    }
+  }
+
+  /// `build_quantize_config` — a source config JSON that is NOT an object
+  /// (e.g. a top-level array) trips the
+  /// `let serde_json::Value::Object(..) else` arm (`convert.rs`
+  /// ~1183-1185): [`Error::InvariantViolation`] "must be an object".
+  #[test]
+  fn build_quantize_config_non_object_config_is_error() {
+    let weights: Weights = HashMap::new();
+    let decisions: PredicateDecisions = HashMap::new();
+    match build_quantize_config("[1,2,3]", 64, 4, QuantMode::Affine, &decisions, &weights) {
+      Err(Error::InvariantViolation(p)) => {
+        assert!(
+          p.context().contains("source config JSON"),
+          "context names the source config: {}",
+          p.context()
+        );
+        assert_eq!(p.requirement(), "must be an object");
+      }
+      other => panic!("expected Err(InvariantViolation), got {other:?}"),
+    }
+  }
+
+  /// `build_quantize_config` — the `Quantize(q)` per-layer override arm
+  /// (`convert.rs` ~1237 + the nested-object block ~1286-1297). With a
+  /// NON-fine-grained source config (no `"quantization"` key), a
+  /// per-layer decision whose params DIFFER from the global default is
+  /// written as an explicit nested override; the emitted `quantization`
+  /// block carries the nested `{group_size,bits,mode}`.
+  ///
+  /// Oracle: decisions = {"layer.a": Some(q_diff)} where q_diff differs
+  /// from the global (group_size 64, bits 4) by bits=8. Expect the live
+  /// `PerLayerQuantization` to carry exactly that override, and the
+  /// re-serialized config's `quantization["layer.a"]` to be the nested
+  /// object with bits=8.
+  #[test]
+  fn build_quantize_config_quantize_override_emits_nested_object() {
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "layer.a.weight".to_string(),
+      Array::from_slice::<f32>(&[0.0_f32; 128], &(2usize, 64usize)).unwrap(),
+    );
+    let q_diff = Quantization {
+      group_size: 64,
+      bits: 8, // differs from the global bits=4 → override is emitted
+      mode: QuantMode::Affine,
+    };
+    let mut decisions: PredicateDecisions = HashMap::new();
+    decisions.insert("layer.a".to_string(), Some(q_diff));
+
+    // NON-fine-grained source (no "quantization" key).
+    let (live, text) =
+      build_quantize_config("{}", 64, 4, QuantMode::Affine, &decisions, &weights).unwrap();
+
+    // Live config: global default + the per-layer override.
+    assert_eq!(
+      live.quantization,
+      Some(Quantization {
+        group_size: 64,
+        bits: 4,
+        mode: QuantMode::Affine
+      }),
+      "global default is the call's (group_size, bits, mode)"
+    );
+    assert_eq!(
+      live.per_layer_ref().get("layer.a"),
+      Some(&QuantizationOption::Quantize(q_diff)),
+      "layer.a carries the differing-params Quantize override"
+    );
+
+    // Re-serialized config text: global keys + nested override object.
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let block = parsed.get("quantization").unwrap();
+    assert_eq!(block.get("group_size").and_then(|v| v.as_i64()), Some(64));
+    assert_eq!(block.get("bits").and_then(|v| v.as_i64()), Some(4));
+    assert_eq!(block.get("mode").and_then(|v| v.as_str()), Some("affine"));
+    let nested = block.get("layer.a").expect("per-layer override emitted");
+    assert_eq!(
+      nested.get("bits").and_then(|v| v.as_i64()),
+      Some(8),
+      "nested override carries the differing bits=8"
+    );
+    assert_eq!(nested.get("group_size").and_then(|v| v.as_i64()), Some(64));
+    assert_eq!(nested.get("mode").and_then(|v| v.as_str()), Some("affine"));
+  }
+
+  /// `build_quantize_config` — a per-layer `Some(q)` decision EQUAL to
+  /// the global default writes NO override when NOT fine-grained
+  /// (`convert.rs` ~1236: `if *q != global || fine_grained`). So the
+  /// live map is empty and the emitted block has only the global keys.
+  #[test]
+  fn build_quantize_config_equal_default_no_override_when_not_fine_grained() {
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "layer.a.weight".to_string(),
+      Array::from_slice::<f32>(&[0.0_f32; 128], &(2usize, 64usize)).unwrap(),
+    );
+    let global = Quantization {
+      group_size: 64,
+      bits: 4,
+      mode: QuantMode::Affine,
+    };
+    let mut decisions: PredicateDecisions = HashMap::new();
+    decisions.insert("layer.a".to_string(), Some(global)); // EQUAL to global
+
+    let (live, text) =
+      build_quantize_config("{}", 64, 4, QuantMode::Affine, &decisions, &weights).unwrap();
+
+    assert!(
+      live.per_layer_ref().is_empty(),
+      "no override when the decision equals the global and config is not fine-grained"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let block = parsed.get("quantization").unwrap().as_object().unwrap();
+    // Only the 3 global keys — no per-layer key.
+    assert_eq!(
+      block.len(),
+      3,
+      "block carries only the global keys: {block:?}"
+    );
+    assert!(block.contains_key("group_size"));
+    assert!(block.contains_key("bits"));
+    assert!(block.contains_key("mode"));
+  }
+
+  /// `build_quantize_config` — fine-grained source config (already
+  /// carries a `"quantization"` key) makes BOTH the `Some(q)`-equal-to-
+  /// global arm (`convert.rs` ~1237, via `|| fine_grained`) AND the
+  /// `None` decision arm (`convert.rs` ~1257, the `Skip` write) fire.
+  /// Also covers the `Skip` → JSON `false` emission (`convert.rs`
+  /// ~1282-1285).
+  ///
+  /// Oracle: decisions = {"keep": Some(global), "drop": None}; fine-
+  /// grained source. Expect `keep` → Quantize(global) override (written
+  /// because fine_grained), `drop` → Skip override (written because
+  /// fine_grained), and the emitted block has `keep` = nested object,
+  /// `drop` = literal `false`.
+  #[test]
+  fn build_quantize_config_fine_grained_writes_skip_and_default_overrides() {
+    let mut weights: Weights = HashMap::new();
+    for path in ["keep", "drop"] {
+      weights.insert(
+        format!("{path}.weight"),
+        Array::from_slice::<f32>(&[0.0_f32; 128], &(2usize, 64usize)).unwrap(),
+      );
+    }
+    let global = Quantization {
+      group_size: 64,
+      bits: 4,
+      mode: QuantMode::Affine,
+    };
+    let mut decisions: PredicateDecisions = HashMap::new();
+    decisions.insert("keep".to_string(), Some(global)); // equal-to-global
+    decisions.insert("drop".to_string(), None); // explicit skip
+
+    // Fine-grained: the source config ALREADY carries a quantization
+    // block (any shape — `contains_key("quantization")` is the gate).
+    let src = r#"{"quantization":{"group_size":64,"bits":4}}"#;
+    let (live, text) =
+      build_quantize_config(src, 64, 4, QuantMode::Affine, &decisions, &weights).unwrap();
+
+    // Live map: equal-to-global override IS written (fine_grained), and
+    // the skip override IS written.
+    assert_eq!(
+      live.per_layer_ref().get("keep"),
+      Some(&QuantizationOption::Quantize(global)),
+      "equal-to-global decision still written under fine_grained"
+    );
+    assert_eq!(
+      live.per_layer_ref().get("drop"),
+      Some(&QuantizationOption::Skip),
+      "None decision written as Skip under fine_grained"
+    );
+
+    // Emitted block: `keep` is a nested object, `drop` is literal false.
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let block = parsed.get("quantization").unwrap();
+    assert!(
+      block.get("keep").map(|v| v.is_object()).unwrap_or(false),
+      "keep emitted as a nested object: {block:?}"
+    );
+    assert_eq!(
+      block.get("drop"),
+      Some(&serde_json::Value::Bool(false)),
+      "Skip emitted as a literal false (BaseConfiguration shape)"
+    );
+  }
+
+  /// `build_quantize_config` — a weight key WITHOUT a `.weight` suffix is
+  /// skipped in the override-emit walk (`convert.rs` ~1217), and a
+  /// `.weight` key with NO cached decision is skipped (`convert.rs`
+  /// ~1223). Both `continue` arms are exercised with a non-empty
+  /// `decisions` map (so the `if !decisions.is_empty()` walk runs).
+  #[test]
+  fn build_quantize_config_skips_non_weight_and_undecided_keys() {
+    let mut weights: Weights = HashMap::new();
+    // (1) No `.weight` suffix → skipped at the strip_suffix `continue`.
+    weights.insert(
+      "layer.bias".to_string(),
+      Array::from_slice::<f32>(&[0.0_f32; 64], &(1usize, 64usize)).unwrap(),
+    );
+    // (2) `.weight` but absent from `decisions` → skipped at the
+    //     `decisions.get(path)` None `continue`.
+    weights.insert(
+      "layer.undecided.weight".to_string(),
+      Array::from_slice::<f32>(&[0.0_f32; 128], &(2usize, 64usize)).unwrap(),
+    );
+    // (3) `.weight` WITH a decision → the override IS written.
+    weights.insert(
+      "layer.decided.weight".to_string(),
+      Array::from_slice::<f32>(&[0.0_f32; 128], &(2usize, 64usize)).unwrap(),
+    );
+
+    let q = Quantization {
+      group_size: 64,
+      bits: 8,
+      mode: QuantMode::Affine,
+    };
+    let mut decisions: PredicateDecisions = HashMap::new();
+    // Non-empty so the walk runs; only `layer.decided` has an entry.
+    decisions.insert("layer.decided".to_string(), Some(q));
+
+    let (live, _text) =
+      build_quantize_config("{}", 64, 4, QuantMode::Affine, &decisions, &weights).unwrap();
+
+    // Exactly one override — the decided key. The non-`.weight` key and
+    // the undecided `.weight` key both hit a `continue`.
+    assert_eq!(
+      live.per_layer_ref().len(),
+      1,
+      "only the decided key produced an override"
+    );
+    assert_eq!(
+      live.per_layer_ref().get("layer.decided"),
+      Some(&QuantizationOption::Quantize(q))
+    );
+    assert!(!live.per_layer_ref().contains_key("layer.bias"));
+    assert!(!live.per_layer_ref().contains_key("layer.undecided"));
+  }
+
+  /// `strip_quantization_blocks` — a non-object config JSON trips the
+  /// `let serde_json::Value::Object(..) else` arm (`convert.rs`
+  /// ~1326-1328): [`Error::InvariantViolation`] "must be an object".
+  #[test]
+  fn strip_quantization_blocks_non_object_config_is_error() {
+    match strip_quantization_blocks("[\"not\",\"an\",\"object\"]") {
+      Err(Error::InvariantViolation(p)) => {
+        assert!(
+          p.context().contains("source config JSON"),
+          "context names the source config: {}",
+          p.context()
+        );
+        assert_eq!(p.requirement(), "must be an object");
+      }
+      other => panic!("expected Err(InvariantViolation), got {other:?}"),
+    }
+  }
+
+  /// `copy_tokenizer_and_extras` — the `*.py` glob branch (`convert.rs`
+  /// ~1664-1700): a `.py` file in `src` is copied to `dst`, a
+  /// non-`.py` regular file is NOT, and a sub-DIRECTORY (which fails the
+  /// `path.is_file()` gate ~1675) is skipped. Drives the helper directly
+  /// (no MLX) over a real temp dir pair, and asserts a clean
+  /// [`CopyOutcome::Committed`] (no fsync faults armed).
+  #[test]
+  fn copy_tokenizer_and_extras_copies_py_skips_non_py_and_dirs() {
+    let dir = std::env::temp_dir().join(format!("mlxrs_convert_pyglob_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let src = dir.join("src");
+    let dst = dir.join("dst");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+
+    // A `.py` file (must be copied via the glob).
+    std::fs::write(src.join("modeling_custom.py"), b"# hf model code\n").unwrap();
+    // A second `.py` file (the loop handles >1 entry).
+    std::fs::write(src.join("configuration_custom.py"), b"# hf config code\n").unwrap();
+    // A non-`.py` regular file NOT in TOKENIZER_EXTRA_FILES → skipped at
+    // the `!name.ends_with(".py")` `continue`.
+    std::fs::write(src.join("README.md"), b"readme\n").unwrap();
+    // A sub-directory whose name ends with `.py` — must be skipped at
+    // the `!path.is_file()` gate (a dir is not a file).
+    std::fs::create_dir_all(src.join("package.py")).unwrap();
+
+    let outcome = copy_tokenizer_and_extras(&src, &dst).unwrap();
+    assert!(
+      matches!(outcome, CopyOutcome::Committed),
+      "no fsync faults → fully-durable Committed; got {outcome:?}"
+    );
+
+    // The two `.py` files were copied byte-equal.
+    for name in ["modeling_custom.py", "configuration_custom.py"] {
+      assert!(dst.join(name).is_file(), "{name} copied via the *.py glob");
+      assert_eq!(
+        std::fs::read(src.join(name)).unwrap(),
+        std::fs::read(dst.join(name)).unwrap(),
+        "{name} byte-equal at dst"
+      );
+    }
+    // The non-`.py` file was NOT copied.
+    assert!(
+      !dst.join("README.md").is_file(),
+      "non-.py regular file is not copied by the glob"
+    );
+    // The `.py`-named DIRECTORY was NOT copied (skipped at is_file gate).
+    assert!(
+      !dst.join("package.py").exists(),
+      ".py-named sub-directory is skipped (not a file)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// `copy_tokenizer_and_extras` — a NON-EXISTENT `src` directory makes
+  /// the `std::fs::read_dir(src)` call fail, tripping the
+  /// `.map_err(...)` arm (`convert.rs` ~1656-1663): an
+  /// [`Error::FileIo`] with [`FileOp::Read`] naming `src`. The
+  /// TOKENIZER_EXTRA_FILES loop above it is a no-op (every `is_file()`
+  /// is false), so the read_dir error is the first failure reached.
+  #[test]
+  fn copy_tokenizer_and_extras_missing_src_dir_is_read_error() {
+    let dir =
+      std::env::temp_dir().join(format!("mlxrs_convert_missing_src_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    // `src` deliberately does NOT exist; `dst` does.
+    let src = dir.join("does_not_exist_src");
+    let dst = dir.join("dst");
+    std::fs::create_dir_all(&dst).unwrap();
+
+    match copy_tokenizer_and_extras(&src, &dst) {
+      Err(Error::FileIo(p)) => {
+        assert_eq!(p.op(), FileOp::Read, "read_dir failure is a Read op");
+        assert_eq!(p.path(), src.as_path(), "the failing path is src");
+        assert!(
+          p.context().contains("copy_tokenizer_and_extras"),
+          "context names the helper: {}",
+          p.context()
+        );
+      }
+      other => panic!("expected Err(FileIo{{op:Read}}), got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// `paths_are_same` — when BOTH paths fail to canonicalize (neither
+  /// exists), the fallback arm `_ => src == dst` (`convert.rs` ~1741)
+  /// compares the original args textually. Two distinct non-existent
+  /// paths → `false`; the same non-existent path → `true`.
+  #[test]
+  fn paths_are_same_fallback_textual_compare_when_uncanonicalizable() {
+    let base =
+      std::env::temp_dir().join(format!("mlxrs_convert_paths_same_{}", std::process::id()));
+    // Neither sub-path exists, so canonicalize() errors for both →
+    // the `_ => src == dst` fallback runs.
+    let a = base.join("nonexistent_a");
+    let b = base.join("nonexistent_b");
+    assert!(
+      !paths_are_same(&a, &b),
+      "distinct uncanonicalizable paths compare unequal via the fallback"
+    );
+    assert!(
+      paths_are_same(&a, &a),
+      "identical uncanonicalizable path compares equal via the fallback"
+    );
+  }
+
+  /// `convert` end-to-end — the `eligible` closure's `(true, None)` arm
+  /// (`convert.rs` ~734): a predicate IS supplied AND a `.weight` key is
+  /// structurally INELIGIBLE (it never entered `build_predicate_decisions`'s
+  /// map), so `decisions.get(path)` is `None` and the closure returns
+  /// `false` (skip). The eligible rank-2 layer is still quantized.
+  ///
+  /// Fixture mirrors the inline durability tests. The ineligible key is a
+  /// rank-1 `.weight` (fails the `shape.len() >= 2` gate inside
+  /// `build_predicate_decisions`), so it is never offered to the
+  /// predicate yet IS walked by `quantize_weights`'s pass-1 eligibility
+  /// closure — the exact path that reaches the `(true, None)` arm.
+  #[test]
+  fn convert_predicate_with_ineligible_weight_skips_via_true_none_arm() {
+    let dir = std::env::temp_dir().join(format!(
+      "mlxrs_convert_true_none_arm_{}",
+      std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let src = dir.join("src");
+    let dst = dir.join("dst");
+    std::fs::create_dir_all(&src).unwrap();
+
+    let plain_config = r#"{
+      "model_type":"qwen3","hidden_size":16,"num_hidden_layers":1,
+      "num_attention_heads":2,"num_key_value_heads":2,"head_dim":8,
+      "rope_theta":10000.0,"vocab_size":128,"tie_word_embeddings":false
+    }"#;
+    std::fs::write(src.join("config.json"), plain_config).unwrap();
+
+    let blob: Vec<f32> = (0..128).map(|i| (i as f32) * 0.01).collect();
+    let mut weights: Weights = HashMap::new();
+    // Eligible: rank-2, last axis 64 → divisible by group_size 64.
+    weights.insert(
+      "model.layers.0.self_attn.q_proj.weight".to_string(),
+      Array::from_slice::<f32>(&blob, &(2usize, 64usize)).unwrap(),
+    );
+    // INELIGIBLE: rank-1 `.weight` → fails the `shape.len() >= 2` gate in
+    // build_predicate_decisions (never offered to the predicate), but IS
+    // walked by quantize_weights's eligibility closure → the (true, None)
+    // arm returns false (stays dense).
+    weights.insert(
+      "model.norm.weight".to_string(),
+      Array::from_slice::<f32>(&[0.0_f32; 64], &(64usize,)).unwrap(),
+    );
+    crate::io::save_safetensors(&src.join("model.safetensors"), &weights).unwrap();
+
+    let tokenizer_json = include_str!("../../tests/fixtures/tokenizer.json");
+    let tokenizer_config_json = include_str!("../../tests/fixtures/tokenizer_config.json");
+    std::fs::write(src.join("tokenizer.json"), tokenizer_json).unwrap();
+    std::fs::write(src.join("tokenizer_config.json"), tokenizer_config_json).unwrap();
+
+    /// Predicate that quantizes every layer it is offered. The rank-1
+    /// `model.norm.weight` is never offered (ineligible), so it can only
+    /// be skipped via the eligible closure's `(true, None)` arm.
+    struct QuantizeAll;
+    impl MixedQuantPredicate for QuantizeAll {
+      fn decide(&self, _layer_name: &str, _weight: &Array) -> Option<Quantization> {
+        Some(Quantization::affine(64, 4))
+      }
+    }
+
+    convert(ConvertArgs {
+      hf_path: src,
+      mlx_path: dst.clone(),
+      quantize: true,
+      q_bits: Some(4),
+      q_group_size: Some(64),
+      q_mode: QuantMode::Affine,
+      quant_predicate: Some(Box::new(QuantizeAll)),
+      ..Default::default()
+    })
+    .unwrap();
+
+    let reloaded = load::load_weights(&dst).unwrap();
+    // The eligible q_proj was quantized (has a `.scales` sibling).
+    assert!(
+      reloaded.contains_key("model.layers.0.self_attn.q_proj.scales"),
+      "eligible rank-2 layer quantized"
+    );
+    // The ineligible rank-1 norm stayed dense (the (true, None) arm
+    // returned false → quantize_weights skipped it → no `.scales`).
+    assert!(
+      reloaded.contains_key("model.norm.weight"),
+      "ineligible rank-1 weight still present"
+    );
+    assert!(
+      !reloaded.contains_key("model.norm.scales"),
+      "ineligible rank-1 weight NOT quantized (skipped via the (true, None) arm)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
   }
 }

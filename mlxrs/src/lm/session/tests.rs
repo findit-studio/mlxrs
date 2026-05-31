@@ -1260,3 +1260,469 @@ fn speculative_error_terminated_stream_flushes_detokenizer_tail() {
        (streamed {streamed:?}, recorded {recorded:?})"
   );
 }
+
+// ---------------------------------------------------------------------------
+// Small closed-form unit coverage for the value types + private helpers that
+// the full-generation tests above don't exercise directly.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn role_as_str_round_trips_every_variant() {
+  // The lowercase template keys `messages[i]["role"]` — covering the `Tool`
+  // arm the full-generation tests never tag a turn with.
+  assert_eq!(Role::System.as_str(), "system");
+  assert_eq!(Role::User.as_str(), "user");
+  assert_eq!(Role::Assistant.as_str(), "assistant");
+  assert_eq!(Role::Tool.as_str(), "tool");
+  // `Display` is defined as `self.as_str()`, so it agrees on every variant.
+  assert_eq!(format!("{}", Role::Tool), "tool");
+  // `derive_more::IsVariant` predicates line up with the named variant.
+  assert!(Role::Tool.is_tool());
+  assert!(!Role::User.is_tool());
+}
+
+#[test]
+fn chat_message_constructors_set_role_and_content() {
+  // Each role-specific constructor tags the right `Role` and keeps the text
+  // verbatim — including `tool`, which the generation tests never build.
+  let t = ChatMessage::tool("tool result payload");
+  assert_eq!(t.role, Role::Tool);
+  assert_eq!(t.content(), "tool result payload");
+
+  let s = ChatMessage::system("sys");
+  assert_eq!(s.role, Role::System);
+  assert_eq!(s.content(), "sys");
+
+  let u = ChatMessage::user("u");
+  assert_eq!(u.role, Role::User);
+  let a = ChatMessage::assistant("a");
+  assert_eq!(a.role, Role::Assistant);
+
+  // `ChatMessage::new` is the common path the role constructors delegate to.
+  let n = ChatMessage::new(Role::Tool, String::from("owned"));
+  assert_eq!(n, ChatMessage::tool("owned"));
+}
+
+#[test]
+fn chat_session_error_display_messages_are_distinct_and_actionable() {
+  // `ChatSessionError`'s OWN `Display` (distinct from the
+  // `From<ChatSessionError> for Error` conversion the `save_cache` tests
+  // observe — that surfaces an `InvariantViolation` message instead).
+  let no_cache = format!("{}", ChatSessionError::NoCacheAvailable);
+  assert!(
+    no_cache.contains("no KV cache") && no_cache.contains("save_cache"),
+    "NoCacheAvailable Display points at the missing-generation cause: {no_cache}"
+  );
+
+  let spec_save = format!("{}", ChatSessionError::SpeculativeCacheUnsupported);
+  assert!(
+    spec_save.contains("speculative") && spec_save.contains("consumes its KV caches"),
+    "SpeculativeCacheUnsupported Display explains the consumed-cache reason: {spec_save}"
+  );
+
+  let spec_restore = format!("{}", ChatSessionError::SpeculativeCacheRestoreUnsupported);
+  assert!(
+    spec_restore.contains(".cache(") && spec_restore.contains(".speculative("),
+    "SpeculativeCacheRestoreUnsupported Display points at both workarounds: {spec_restore}"
+  );
+
+  // The three messages are pairwise distinct (no copy/paste collision).
+  assert_ne!(no_cache, spec_save);
+  assert_ne!(no_cache, spec_restore);
+  assert_ne!(spec_save, spec_restore);
+
+  // `std::error::Error` is implemented (no `source`, like the Swift enum).
+  let e: &dyn std::error::Error = &ChatSessionError::NoCacheAvailable;
+  assert!(e.source().is_none());
+}
+
+#[test]
+fn save_cache_writes_a_safetensors_file_after_a_real_turn() {
+  // The `CacheSlot::Realised` arm of `save_cache`: after a turn realises the
+  // cache, persisting it succeeds and writes the file. (The error arms are
+  // covered by `save_cache_errors_before_any_generation` +
+  // `speculative_session_does_not_expose_a_saveable_cache`.)
+  let mut s = session(3);
+  let _ = s.respond("hello").expect("turn");
+  assert!(s.has_cache(), "the turn realised the cache");
+
+  let path = std::env::temp_dir().join(format!(
+    "mlxrs-l11-chat-session-savecache-{}.safetensors",
+    std::process::id()
+  ));
+  let _ = std::fs::remove_file(&path);
+  s.save_cache(&path).expect("save the realised cache");
+  assert!(path.exists(), "save_cache wrote the safetensors file");
+  // It is round-trip-loadable (the standard cache-restore path).
+  let (restored, _meta) =
+    crate::lm::cache::load_prompt_cache(&path).expect("reload the saved cache");
+  assert_eq!(
+    restored.len(),
+    cache_config().num_hidden_layers,
+    "the saved cache has one entry per decoder layer"
+  );
+  let _ = std::fs::remove_file(&path);
+}
+
+/// A temp-dir tokenizer with a valid `tokenizer.json` but **no chat template**
+/// (no `tokenizer_config.json` at all), so `Tokenizer::from_path` succeeds yet
+/// `apply_chat_template` returns an `Err` — the input needed to drive
+/// `build_turn_prompt`'s template-error closure.
+fn templateless_tokenizer() -> Tokenizer {
+  let tokenizer_json = json!({
+    "version": "1.0",
+    "truncation": Value::Null,
+    "padding": Value::Null,
+    "added_tokens": [],
+    "normalizer": Value::Null,
+    "pre_tokenizer": { "type": "Whitespace" },
+    "post_processor": Value::Null,
+    "decoder": Value::Null,
+    "model": {
+      "type": "WordLevel",
+      "vocab": { "<unk>": 0, "hello": 1, "world": 2 },
+      "unk_token": "<unk>"
+    }
+  });
+  use std::sync::atomic::{AtomicU64, Ordering};
+  static SEQ: AtomicU64 = AtomicU64::new(0);
+  let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+  let dir = std::env::temp_dir().join(format!(
+    "mlxrs-l11-no-template-{}-{}",
+    std::process::id(),
+    seq
+  ));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).expect("temp tokenizer dir");
+  // No `tokenizer_config.json` ⇒ `chat_template` is `None`.
+  std::fs::write(
+    dir.join("tokenizer.json"),
+    serde_json::to_string(&tokenizer_json).expect("serialize tokenizer.json"),
+  )
+  .expect("write tokenizer.json");
+  Tokenizer::from_path(&dir, Some(&[2u32])).expect("load templateless tokenizer")
+}
+
+#[test]
+fn build_turn_prompt_maps_a_template_failure_to_a_parse_error() {
+  // A tokenizer with no chat template makes `apply_chat_template_ids` fail;
+  // `build_turn_prompt` must wrap that into an `Error::Parse` (its
+  // `map_err` closure), not panic or pass the raw tokenizer error through.
+  let s = ChatSession::builder(
+    Box::new(MockModel::new(3)),
+    templateless_tokenizer(),
+    cache_config(),
+  )
+  .generate_params(GenConfig {
+    max_tokens: 1,
+    ..Default::default()
+  })
+  .build()
+  .expect("build");
+
+  let err = s
+    .build_turn_prompt("hello", Role::User)
+    .expect_err("templateless render must fail");
+  assert!(
+    matches!(err, Error::Parse(_)),
+    "the template failure is surfaced as Error::Parse, got {err:?}"
+  );
+  // The wrapped message identifies the failing stage + carries the cause.
+  let msg = format!("{err}");
+  assert!(
+    msg.contains("chat template"),
+    "the parse error names the chat-template stage: {msg}"
+  );
+
+  // The whole turn surfaces the same error through `respond` (the render is
+  // step 1 of `stream_respond_as`, before any model call).
+  let mut s2 = ChatSession::builder(
+    Box::new(MockModel::new(3)),
+    templateless_tokenizer(),
+    cache_config(),
+  )
+  .build()
+  .expect("build");
+  let resp_err = s2.respond("hello").expect_err("respond must propagate it");
+  assert!(matches!(resp_err, Error::Parse(_)));
+}
+
+#[test]
+fn respond_propagates_a_generation_error_after_recording_the_turn() {
+  // `respond_as`'s `Err` arm: a model that errors on its first `forward`
+  // makes the first stream poll yield `Err`; `respond_as` breaks the drain
+  // loop, then returns that error. The turn is still recorded (the stream's
+  // `Drop` commits the user prompt + an empty assistant reply).
+  let inner = MockModel::new(11);
+  // `ok_calls = 0` ⇒ the very first `forward` (prefill / first decode) errors.
+  let model = ErringAfterModel::new(inner, 0);
+  let mut s = ChatSession::builder(Box::new(model), fixture_tokenizer(), cache_config())
+    .generate_params(GenConfig {
+      max_tokens: 8,
+      ..Default::default()
+    })
+    .build()
+    .expect("build");
+
+  let err = s
+    .respond("hello")
+    .expect_err("generation error must propagate");
+  assert!(
+    matches!(err, Error::InvariantViolation(_)),
+    "the model's error is propagated verbatim, got {err:?}"
+  );
+  // The interrupted turn was still recorded (user + assistant messages).
+  assert_eq!(s.history().len(), 2, "the failed turn is still recorded");
+  assert_eq!(s.history()[0].role, Role::User);
+  assert_eq!(s.history()[0].content(), "hello");
+  assert_eq!(s.history()[1].role, Role::Assistant);
+}
+
+#[test]
+fn standard_zero_max_tokens_yields_nothing_and_realises_the_cache() {
+  // `max_tokens = 0`: the inner `Generator` returns `None` on its first poll
+  // (`produced(0) >= max_tokens(0)` before any model call), so the stream's
+  // standard `next()` hits the unexpected-`None` arm — fuses, yields no
+  // token. `commit()` then finalizes the (empty) detok and realises the
+  // offset-0 cache.
+  let mut s = session(0);
+  let mut count = 0usize;
+  {
+    let stream = s.stream_respond("hello").expect("stream");
+    for resp in stream {
+      let _ = resp.expect("no error on the empty path");
+      count += 1;
+    }
+  }
+  assert_eq!(count, 0, "max_tokens = 0 yields no tokens");
+  // The turn is recorded with an empty assistant reply, and the cache is
+  // realised (offset 0 — prefill never ran).
+  assert!(s.has_cache(), "the empty turn still realised the cache");
+  assert_eq!(s.history().len(), 2);
+  assert_eq!(s.history()[1].role, Role::Assistant);
+  assert_eq!(s.history()[1].content(), "", "no reply was produced");
+  assert_eq!(
+    s.current_cache().expect("realised")[0].offset(),
+    0,
+    "prefill never ran on the zero-token path"
+  );
+}
+
+#[test]
+fn speculative_zero_max_tokens_yields_nothing_and_marks_spent() {
+  // `max_tokens = 0` on the speculative path: the inner speculative iterator
+  // returns `None` on its first poll, so the stream's speculative `next()`
+  // hits its `None` arm (sets `finished` + `detok_finalized`). The slot
+  // becomes `SpeculativeSpent` and an empty assistant turn is recorded.
+  let mut s = ChatSession::builder(
+    Box::new(MockModel::new(11)),
+    fixture_tokenizer(),
+    cache_config(),
+  )
+  .speculative(SpeculativeDecodingConfig::new(
+    Rc::new(MockModel::new(11)),
+    cache_config(),
+  ))
+  .generate_params(GenConfig {
+    max_tokens: 0,
+    ..Default::default()
+  })
+  .build()
+  .expect("build");
+
+  let mut count = 0usize;
+  {
+    let stream = s.stream_respond("hello").expect("speculative stream");
+    for resp in stream {
+      let _ = resp.expect("no error on the empty speculative path");
+      count += 1;
+    }
+  }
+  assert_eq!(count, 0, "max_tokens = 0 yields no speculative tokens");
+  assert_eq!(s.history().len(), 2, "the empty turn is recorded");
+  assert_eq!(s.history()[1].content(), "");
+  // Speculative sessions never expose a realised cache (the slot is spent).
+  assert!(!s.has_cache());
+  assert!(s.current_cache().is_none());
+}
+
+#[test]
+fn standard_turn_finishes_on_eos_with_a_stop_reason() {
+  // The standard `next()` eos arm: a `MockModel` whose argmax is the
+  // tokenizer's eos id (`</s>` = 2) ends generation on the very first decode
+  // step with `finish_reason = Eos` — distinct from the `Length` stop the
+  // last-vocab-index `MockModel::new` always hits.
+  let mut canned = vec![0.0_f32; 11];
+  canned[2] = 10.0; // argmax == eos id 2
+  let model = MockModel {
+    canned,
+    n_kv_heads: 1,
+    head_dim: 2,
+  };
+  let mut s = ChatSession::builder(Box::new(model), fixture_tokenizer(), cache_config())
+    .generate_params(GenConfig {
+      // High cap so termination is the eos token, not `max_tokens`.
+      max_tokens: 32,
+      ..Default::default()
+    })
+    .build()
+    .expect("build");
+
+  let mut reasons = Vec::new();
+  let mut tokens = Vec::new();
+  {
+    let stream = s.stream_respond("hello").expect("stream");
+    for resp in stream {
+      let r = resp.expect("step");
+      reasons.push(r.finish_reason);
+      tokens.push(r.token);
+    }
+  }
+  // Exactly one yielded response — the eos token itself — carrying `Eos`.
+  assert_eq!(reasons, vec![Some(FinishReason::Eos)]);
+  assert_eq!(
+    tokens,
+    vec![2],
+    "the eos token (id 2) was the yielded token"
+  );
+  // The turn was recorded and the cache realised (eos finalized the detok).
+  assert!(s.has_cache());
+  assert_eq!(s.history().len(), 2);
+}
+
+#[test]
+fn take_cache_allocates_the_draft_cache_for_a_realised_speculative_slot() {
+  // The `(Some(spec), None)` arm of `take_cache`: a speculative session whose
+  // `Realised` slot carries no draft cache yet gets one allocated, once. This
+  // state isn't reachable through the public builder (`.cache(..)` +
+  // `.speculative(..)` is rejected at `build()`), so the session is assembled
+  // directly from its parts (the test module is a child of `session`).
+  let mut s = ChatSession {
+    model: Box::new(MockModel::new(11)),
+    tokenizer: fixture_tokenizer(),
+    cache_config: cache_config(),
+    instructions: None,
+    generate_params: GenConfig::default(),
+    speculative: Some(SpeculativeDecodingConfig::new(
+      Rc::new(MockModel::new(11)),
+      cache_config(),
+    )),
+    cache: CacheSlot::Realised {
+      cache: make_prompt_cache(&cache_config()),
+      draft_cache: None,
+      cached: CachedTokens::empty(),
+    },
+    history: Vec::new(),
+  };
+
+  let (main, draft, cached) = s.take_cache();
+  assert_eq!(
+    main.len(),
+    cache_config().num_hidden_layers,
+    "the main cache is returned unchanged"
+  );
+  let draft = draft.expect("a speculative session's draft cache is allocated");
+  assert_eq!(
+    draft.len(),
+    cache_config().num_hidden_layers,
+    "the freshly-built draft cache has one entry per draft-model layer"
+  );
+  assert_eq!(cached.opaque_len, 0, "an empty cached-token record carried");
+  assert!(cached.known.is_empty());
+}
+
+#[test]
+fn rc_model_forwards_and_forward_embeddings_delegate_to_the_inner_model() {
+  // `RcModel` (the `Rc`-shared draft-model adaptor `DraftConfig` is fed each
+  // speculative turn) forwards both entry points to the inner `Rc<dyn Model>`.
+  let rc: Rc<dyn Model> = Rc::new(MockModel::new(5));
+  let m = RcModel(Rc::clone(&rc));
+
+  // `forward` delegates: a `[1, 3]` window advances the cache by 3 and
+  // returns `[1, 3, 5]` logits (exactly `MockModel::forward`).
+  let mut cache = make_prompt_cache(&cache_config());
+  let tokens = crate::array::Array::from_slice::<i32>(&[0, 1, 2], &(1usize, 3)).expect("tokens");
+  let logits = m.forward(&tokens, &mut cache).expect("forward delegates");
+  assert_eq!(logits.shape(), vec![1, 3, 5]);
+  assert!(cache.iter().all(|c| c.offset() == 3));
+
+  // `forward_embeddings` delegates to `MockModel`'s default (the
+  // unimplemented VLM seam ⇒ `Err`), proving the override forwards rather
+  // than re-implementing.
+  let mut cache2: Vec<Box<dyn KvCache>> = Vec::new();
+  let emb = crate::array::Array::from_slice::<f32>(&[0.0, 1.0], &(1usize, 1, 2)).expect("emb");
+  assert!(
+    m.forward_embeddings(&emb, &mut cache2).is_err(),
+    "forward_embeddings forwards to the inner model's erroring default seam"
+  );
+}
+
+#[test]
+fn commit_falls_back_to_opaque_when_the_cache_outruns_the_named_tokens() {
+  // `commit()`'s defensive fallback (the `else` arm): if the realised cache's
+  // `offset()` exceeds everything the stream can name
+  // (`opaque_len + prompt_ids + generated`), the whole cache is recorded as
+  // an opaque prefix rather than truncating a too-short `known` region. The
+  // standard `Generator` never produces this (offset grows in lockstep with
+  // the fed tokens), so the stream is assembled directly with a generator
+  // whose cache is pre-advanced far past its (deliberately tiny) `prompt_ids`.
+  let model = MockModel::new(11);
+  let m: &dyn Model = &model;
+  // A cache already advanced to 20 tokens, but a `prompt_ids` of length 1 and
+  // no generated tokens ⇒ `known_len (20) > logical.len() (1)`.
+  let advanced = prefilled_opaque_cache(20);
+  assert_eq!(advanced[0].offset(), 20);
+
+  let generator = build_generator(m, &[3u32], advanced, GenConfig::default());
+  let driver: Driver<'_> = Driver::Standard(Box::new(StandardTurn {
+    generator,
+    draft_cache: None,
+  }));
+
+  let mut slot = CacheSlot::Empty;
+  let mut history: Vec<ChatMessage> = Vec::new();
+  {
+    let mut stream = ChatResponseStream {
+      cache_slot: &mut slot,
+      history: &mut history,
+      driver: Some(driver),
+      detok: fixture_tokenizer().detokenizer(),
+      eos: vec![2],
+      max_tokens: 4,
+      prompt_tokens: 1,
+      produced: 0,
+      reply: String::new(),
+      // Deliberately far shorter than the cache's offset.
+      prompt_ids: vec![3],
+      opaque_len: 0,
+      generated: Vec::new(),
+      finished: false,
+      detok_finalized: false,
+      committed: false,
+    };
+    // Commit WITHOUT polling the generator (so `into_cache()` returns the
+    // pre-advanced offset-20 cache verbatim).
+    stream.commit();
+  }
+
+  match slot {
+    CacheSlot::Realised { cache, cached, .. } => {
+      assert_eq!(cache[0].offset(), 20, "the advanced cache was stored");
+      // The fallback recorded the WHOLE cache as opaque (no nameable known
+      // region), so the next turn rebuilds rather than feeding a bogus
+      // suffix.
+      assert_eq!(
+        cached.opaque_len, 20,
+        "the cache that outran the named tokens is treated as fully opaque"
+      );
+      assert!(
+        cached.known.is_empty(),
+        "no known region recorded for the opaque fallback"
+      );
+    }
+    _ => panic!("commit() must realise the cache"),
+  }
+  // The assistant turn is still appended (empty reply — nothing streamed).
+  assert_eq!(history.len(), 1);
+  assert_eq!(history[0].role, Role::Assistant);
+}

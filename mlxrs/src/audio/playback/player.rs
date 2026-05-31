@@ -1221,4 +1221,211 @@ mod tests {
 
     let _ = player.stop();
   }
+
+  // ── SharedState::new — error + success field invariants ────────────────
+  //
+  // Device-free: `SharedState::new` is the queue-preallocation step
+  // `AudioPlayer::with_device` runs BEFORE building the cpal stream, so
+  // both its `try_reserve_exact` error branch and its success-path field
+  // initialization are exercisable without opening an audio device.
+
+  /// `SharedState::new` MUST surface a `try_reserve_exact` failure as a
+  /// typed [`Error::AllocFailure`] (not a panic / abort). A
+  /// `usize::MAX` requested capacity overflows the
+  /// `usize::MAX * size_of::<f32>()` byte-size computation inside
+  /// `VecDeque::try_reserve_exact`, which returns
+  /// `Err(TryReserveError { kind: CapacityOverflow })` — the fallible
+  /// reservation that this branch maps to `AllocFailure`. No real
+  /// allocation is attempted (the overflow is caught pre-allocation),
+  /// so the test is deterministic on any host.
+  ///
+  /// Oracle is the literal payload the source constructs at the
+  /// reservation site (context / item / count), matched independently
+  /// of calling the function to derive any of them.
+  #[test]
+  fn shared_state_new_allocfailure_on_overflowing_capacity() {
+    let err = SharedState::new(usize::MAX)
+      .err()
+      .expect("usize::MAX sample capacity must overflow try_reserve_exact -> AllocFailure");
+    match err {
+      Error::AllocFailure(p) => {
+        assert_eq!(
+          p.context(),
+          "AudioPlayer::with_device: pre-allocate queue capacity",
+          "AllocFailure context must name the queue-preallocation site"
+        );
+        assert_eq!(p.item(), "samples", "AllocFailure item must be \"samples\"");
+        assert_eq!(
+          p.count(),
+          usize::MAX as u64,
+          "AllocFailure count must echo the overflowing capacity argument"
+        );
+      }
+      other => panic!("expected Error::AllocFailure, got {other:?}"),
+    }
+  }
+
+  /// `SharedState::new` success path stores the bounded sample cap and
+  /// initializes every atomic to its documented default: `state =
+  /// STATE_STOPPED`, `terminated = false`, `volume_bits = 1.0`
+  /// (unity gain, matching Swift's `AVAudioPlayerNode.volume` default),
+  /// `callback_error = None`, and an empty queue. Oracles are the
+  /// documented constants, not reads derived from the constructor.
+  #[test]
+  fn shared_state_new_success_initializes_default_fields() {
+    let shared = SharedState::new(2048).expect("small bounded capacity reserves fine");
+
+    assert_eq!(
+      shared.queue_capacity_samples, 2048,
+      "queue_capacity_samples must be stored verbatim from the constructor argument"
+    );
+    assert_eq!(
+      shared.state.load(Ordering::Acquire),
+      STATE_STOPPED,
+      "freshly-built SharedState must start STATE_STOPPED (built-but-not-playing)"
+    );
+    assert!(
+      !shared.terminated.load(Ordering::Acquire),
+      "terminated latch must start cleared (not yet stopped)"
+    );
+    // Volume default is unity gain. Compare against the independently
+    // known constant 1.0, decoded through the same f32-bits transport
+    // the cpal callback uses.
+    assert_eq!(
+      f32::from_bits(shared.volume_bits.load(Ordering::Relaxed)),
+      1.0_f32,
+      "volume_bits default must decode to unity gain (1.0)"
+    );
+    assert!(
+      shared.callback_error.lock().unwrap().is_none(),
+      "callback_error must start empty (no captured device error)"
+    );
+    assert_eq!(
+      shared.queue.lock().unwrap().len(),
+      0,
+      "queue must start empty regardless of reserved capacity"
+    );
+  }
+
+  /// `SharedState::load_volume` decodes the `AtomicU32`-stored f32 bits
+  /// the cpal callback reads each sample. Round-trip a known,
+  /// exactly-representable f32 (`0.375 = 3/8`) through a raw
+  /// `volume_bits.store(..)` and assert `load_volume` returns it
+  /// bit-exact. The store side is a plain atomic write (NOT the fn
+  /// under test), so the expected value is independent of `load_volume`
+  /// itself. `0.375` is chosen because it has an exact binary f32
+  /// representation, so the assertion can use `==` without an epsilon.
+  #[test]
+  fn shared_state_load_volume_decodes_stored_bits() {
+    let shared = SharedState::new(16).expect("tiny capacity reserves fine");
+
+    // Default before any store: unity gain.
+    assert_eq!(
+      shared.load_volume(),
+      1.0_f32,
+      "load_volume must decode the unity-gain default"
+    );
+
+    // Store a known exact value via the raw atomic (independent of the
+    // fn under test) and confirm load_volume decodes it bit-exact.
+    shared
+      .volume_bits
+      .store(0.375_f32.to_bits(), Ordering::Relaxed);
+    assert_eq!(
+      shared.load_volume(),
+      0.375_f32,
+      "load_volume must bit-exactly decode a stored f32 (0.375 is exactly representable)"
+    );
+
+    // Zero round-trips too (the sanitized non-finite/clamped-negative
+    // sink value the callback would multiply by).
+    shared
+      .volume_bits
+      .store(0.0_f32.to_bits(), Ordering::Relaxed);
+    assert_eq!(
+      shared.load_volume(),
+      0.0_f32,
+      "load_volume must decode a stored 0.0 (silence gain)"
+    );
+  }
+
+  // ── Device-reachable producer-gate error paths ─────────────────────────
+  //
+  // These two error branches need a constructed `AudioPlayer` (hence a
+  // real cpal output device) but ARE reachable on a healthy device — the
+  // CI-skipped, locally-runnable `#[ignore]` gate matches the existing
+  // real-device tests in this module. They cover the pre-`start()`
+  // write rejection and the flush-while-not-RUNNING-with-queued-samples
+  // rejection that the happy-path real-device tests don't hit.
+
+  /// `write_samples` BEFORE `start()` (state still `STATE_STOPPED`,
+  /// terminated latch clear) MUST reject with an
+  /// [`Error::InvariantViolation`] naming the stopped state — pre-start
+  /// writes would otherwise accumulate and replay on the first
+  /// `start()`. Independent oracle: the literal context + requirement
+  /// strings the source constructs at this gate.
+  #[cfg(target_os = "macos")]
+  #[test]
+  #[ignore = "requires real default audio output device"]
+  fn audio_player_write_before_start_rejected_state_stopped() {
+    let cfg = PlaybackConfig::new(16_000, ChannelLayout::Mono, SampleFormat::F32)
+      .with_queue_capacity_frames(1024);
+    let mut player = AudioPlayer::new(cfg).unwrap();
+    // No start() — the player is in STATE_STOPPED with the terminated
+    // latch clear, so the STATE_STOPPED branch (not the terminated
+    // branch) is the one that fires.
+    let err = player.write_samples(&[0.5_f32; 16]).unwrap_err();
+    match err {
+      Error::InvariantViolation(p) => {
+        assert_eq!(p.context(), "AudioPlayer::write_samples");
+        assert!(
+          p.requirement().contains("STATE_STOPPED"),
+          "pre-start write rejection must name STATE_STOPPED, got: {}",
+          p.requirement()
+        );
+      }
+      other => panic!("expected InvariantViolation (STATE_STOPPED), got {other:?}"),
+    }
+    let _ = player.stop();
+  }
+
+  /// `flush` on a paused player with a non-empty queue MUST return
+  /// immediately with an [`Error::OutOfRange`] rather than spin-poll to
+  /// the 30s timeout: the cpal callback only drains while
+  /// `STATE_RUNNING`, so a paused queue can never reach depth 0. We
+  /// reach the non-RUNNING-with-queue branch via `start(); pause();
+  /// write_samples(...)` — the same fixture pattern the existing
+  /// overflow real-device test uses to fill a non-draining queue.
+  /// Oracle: the literal requirement phrase + a `depth>0` check derived
+  /// from the known pushed length (independent of the flush call).
+  #[cfg(target_os = "macos")]
+  #[test]
+  #[ignore = "requires real default audio output device"]
+  fn audio_player_flush_on_paused_with_queued_samples_errs() {
+    let cfg = PlaybackConfig::new(16_000, ChannelLayout::Mono, SampleFormat::F32)
+      .with_queue_capacity_frames(1024);
+    let mut player = AudioPlayer::new(cfg).unwrap();
+    player.start().unwrap();
+    player.pause().unwrap();
+    // Paused: writes still buffer but the callback won't drain.
+    player.write_samples(&[0.25_f32; 64]).unwrap();
+    assert_eq!(
+      player.buffer_depth(),
+      64,
+      "paused player must retain the 64 pushed samples (callback drains only when RUNNING)"
+    );
+
+    let err = player.flush().unwrap_err();
+    match err {
+      Error::OutOfRange(p) => {
+        assert!(
+          p.requirement().contains("STATE_RUNNING"),
+          "flush-on-non-running requirement must name STATE_RUNNING, got: {}",
+          p.requirement()
+        );
+      }
+      other => panic!("expected OutOfRange (flush on paused with queue), got {other:?}"),
+    }
+    let _ = player.stop();
+  }
 }

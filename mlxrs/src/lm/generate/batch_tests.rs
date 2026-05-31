@@ -452,3 +452,174 @@ fn batch_generate_step_propagates_validate_err_before_forward() {
   );
   assert!(it.next().is_none(), "iterator fuses after the yielded Err");
 }
+
+// ════════════════════════════════════════════════════════════════════════
+//   left_pad_rows error paths + batch_generate / batch_stream_generate
+// ════════════════════════════════════════════════════════════════════════
+
+/// `left_pad_rows` rejects an empty `prompts` slice and an all-empty batch
+/// (`max_len == 0`) up front with `EmptyInput`.
+#[test]
+fn left_pad_rows_rejects_empty_inputs() {
+  let empty: Vec<&[u32]> = vec![];
+  assert!(matches!(
+    left_pad_rows(&empty, 0),
+    Err(Error::EmptyInput(_))
+  ));
+  // Non-empty slice but every row empty ⇒ max_len == 0 ⇒ EmptyInput.
+  let all_empty: Vec<&[u32]> = vec![&[], &[]];
+  assert!(matches!(
+    left_pad_rows(&all_empty, 0),
+    Err(Error::EmptyInput(_))
+  ));
+}
+
+/// `left_pad_rows` rejects a RAGGED batch where `max_len > 0` but one row is
+/// empty — the per-row empty check fires AFTER the `max_len == 0` guard, so
+/// `[1,2]` + `[]` reaches the per-row branch and errs with `EmptyInput`.
+#[test]
+fn left_pad_rows_rejects_ragged_empty_row() {
+  let ragged: Vec<&[u32]> = vec![&[1u32, 2], &[]];
+  let err = left_pad_rows(&ragged, 0).unwrap_err();
+  assert!(
+    matches!(err, Error::EmptyInput(ref p) if p.context().contains("every prompt")),
+    "a ragged empty row ⇒ EmptyInput(every prompt), got {err:?}"
+  );
+}
+
+/// `left_pad_rows` left-pads shorter rows with `pad_token_id` to `max_len`,
+/// preserving each row's tail. Closed-form oracle: `[1,2,3]` + `[7]` with
+/// pad=99 ⇒ `[[1,2,3],[99,99,7]]`, max_len=3.
+#[test]
+fn left_pad_rows_pads_and_preserves_tail() {
+  let prompts: Vec<&[u32]> = vec![&[1u32, 2, 3], &[7u32]];
+  let (padded, max_len) = left_pad_rows(&prompts, 99).unwrap();
+  assert_eq!(max_len, 3);
+  assert_eq!(padded, vec![vec![1, 2, 3], vec![99, 99, 7]]);
+}
+
+/// Resolve the committed fixture tokenizer (`</s>` == id 2 ⇒ eos set {2}).
+fn fixture_tokenizer() -> crate::tokenizer::Tokenizer {
+  let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    .join("tests")
+    .join("fixtures");
+  crate::tokenizer::Tokenizer::from_path(&dir, None).expect("load fixture tokenizer")
+}
+
+/// `batch_generate` aggregates per-row tokens: EOS-finish tokens are DROPPED,
+/// `length`-finish + in-progress tokens are KEPT (mlx-lm `batch_generate`
+/// `generate.py:1945-1946`). The tokenizer's eos set ({2}) overrides cfg.eos.
+///
+/// Equal-length prompts ⇒ left_pad `[0, 0]`, trivial prefill. Row 0 scripts
+/// `[7, 2]` (token 7, then eos) ⇒ output `[7]` (eos dropped). Row 1 scripts
+/// `[8, 9, 10]` and runs to `max_tokens = 3` ⇒ output `[8, 9, 10]` (the
+/// length-finish token 10 is kept).
+#[test]
+fn batch_generate_drops_eos_keeps_length_tokens() {
+  let tok = fixture_tokenizer();
+  let prompts: Vec<&[u32]> = vec![&[1u32, 1], &[1u32, 1]];
+  let left_pad = batch_left_padding(&prompts);
+  assert_eq!(left_pad, vec![0, 0]);
+  let max_len = 2;
+  let scripts = vec![
+    vec![7u32, 2, 99, 99], // token 7 then eos(2)
+    vec![8u32, 9, 10, 99], // runs to max_tokens
+  ];
+  let model = MockBatchModel::new(32, max_len, scripts);
+  let cache: Vec<Box<dyn crate::lm::cache::KvCache>> = vec![Box::new(BatchKvCache::new(&left_pad))];
+  let cfg = GenConfig {
+    max_tokens: 3,
+    ..Default::default()
+  };
+
+  let out = batch_generate(&model, &tok, &prompts, 0, cache, cfg).expect("batch_generate ok");
+  assert_eq!(out.len(), 2, "one output row per prompt");
+  assert_eq!(out[0], vec![7], "row 0: token 7 kept, eos(2) dropped");
+  assert_eq!(out[1], vec![8, 9, 10], "row 1: length-finish token kept");
+}
+
+/// `batch_generate` with `max_tokens == 0` returns an empty `Vec` per row
+/// (the zero-budget guard fires before any step). Independent of the model
+/// script (no decode runs).
+#[test]
+fn batch_generate_zero_max_tokens_empty_rows() {
+  let tok = fixture_tokenizer();
+  let prompts: Vec<&[u32]> = vec![&[1u32, 1], &[1u32, 1], &[1u32, 1]];
+  let left_pad = batch_left_padding(&prompts);
+  let model = MockBatchModel::new(16, 2, vec![vec![], vec![], vec![]]);
+  let cache: Vec<Box<dyn crate::lm::cache::KvCache>> = vec![Box::new(BatchKvCache::new(&left_pad))];
+  let cfg = GenConfig {
+    max_tokens: 0,
+    ..Default::default()
+  };
+  let out = batch_generate(&model, &tok, &prompts, 0, cache, cfg).unwrap();
+  assert_eq!(out, vec![Vec::<u32>::new(); 3]);
+}
+
+/// `batch_stream_generate` overrides `cfg.eos` with the tokenizer's set
+/// ({2}) before constructing the iterator, so a row scripting token 2
+/// terminates with `FinishReason::Eos` even when `cfg.eos` was left empty.
+#[test]
+fn batch_stream_generate_uses_tokenizer_eos() {
+  let tok = fixture_tokenizer();
+  let prompts: Vec<&[u32]> = vec![&[1u32, 1]];
+  let left_pad = batch_left_padding(&prompts);
+  let model = MockBatchModel::new(16, 2, vec![vec![5u32, 2, 99]]); // token 5 then eos(2)
+  let cache: Vec<Box<dyn crate::lm::cache::KvCache>> = vec![Box::new(BatchKvCache::new(&left_pad))];
+  // cfg.eos intentionally empty — the tokenizer's {2} must take over.
+  let cfg = GenConfig {
+    max_tokens: 5,
+    ..Default::default()
+  };
+
+  let mut last_reason: Option<FinishReason> = None;
+  let mut tokens = Vec::new();
+  for item in batch_stream_generate(&model, &tok, &prompts, 0, cache, cfg) {
+    let step = item.expect("step ok");
+    match &step.finish_reason {
+      Some(r) if r.is_eos() => last_reason = step.finish_reason.clone(),
+      _ => tokens.push(step.token),
+    }
+  }
+  assert_eq!(tokens, vec![5], "token 5 emitted before eos");
+  assert_eq!(
+    last_reason,
+    Some(FinishReason::Eos),
+    "tokenizer eos {{2}} drove the stop even with empty cfg.eos"
+  );
+}
+
+/// A batch run WITH a logits processor (repetition penalty) exercises the
+/// per-row slice → process → concat branch in `BatchGenerator::step`. The
+/// scripted tokens are all distinct per step, so the penalty never down-
+/// weights the (fresh) argmax token — the output stays exactly the script,
+/// giving a deterministic oracle while still driving the processor code path.
+#[test]
+fn batch_generate_with_repetition_penalty_runs_per_row_processor() {
+  let tok = fixture_tokenizer();
+  let prompts: Vec<&[u32]> = vec![&[1u32, 1], &[1u32, 1]];
+  let left_pad = batch_left_padding(&prompts);
+  let max_len = 2;
+  // Distinct tokens per step per row ⇒ no repeats ⇒ penalty is a no-op on
+  // the argmax, so the script is reproduced exactly.
+  let scripts = vec![vec![10u32, 11, 12, 99], vec![20u32, 21, 22, 99]];
+  let model = MockBatchModel::new(32, max_len, scripts);
+  let cache: Vec<Box<dyn crate::lm::cache::KvCache>> = vec![Box::new(BatchKvCache::new(&left_pad))];
+  let cfg = GenConfig {
+    max_tokens: 3,
+    repetition_penalty: Some(2.0), // ⇒ make_logits_processors yields 1 processor
+    ..Default::default()
+  };
+
+  let out = batch_generate(&model, &tok, &prompts, 0, cache, cfg).expect("ok");
+  assert_eq!(
+    out[0],
+    vec![10, 11, 12],
+    "row 0 unaffected by no-repeat penalty"
+  );
+  assert_eq!(
+    out[1],
+    vec![20, 21, 22],
+    "row 1 unaffected by no-repeat penalty"
+  );
+}

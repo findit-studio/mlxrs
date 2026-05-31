@@ -415,3 +415,117 @@ fn finalized_tail_completes_multichar_stop_spanning_into_tail() {
   // emitted_len clamped to match start (0) max emitted (2) = 2.
   assert_eq!(emitted_len, 2);
 }
+
+// ════════════════════════════════════════════════════════════════════════
+//   EOS through the stream_generate active-matcher path + generate() entry
+// ════════════════════════════════════════════════════════════════════════
+
+/// EOS terminal path WITH an active (but non-matching) stop matcher: the eos
+/// token reaches `stream_generate`'s `if eos.contains(&token)` branch, which
+/// — because `matcher.is_active()` — calls `finalize_active_tail` with
+/// `FinishReason::Eos`. The never-matching stop string means the tail is
+/// emitted as-is and the reason stays `Eos`. Exercises the active-matcher
+/// EOS branch the existing Stop/Length tests skip.
+#[test]
+fn eos_with_active_non_matching_matcher_reports_eos() {
+  // hello world </s>(eos) ...; stop "ZZZ" never matches.
+  let prompt = [1u32, 3];
+  let script = vec![4u32, 5, 2, 6, 7]; // world the </s> ...
+  let (text, reasons) = run(&prompt, script, 32, vec!["ZZZ".to_string()]);
+  // eos(2) is not detokenized ⇒ output is decode of the pre-eos tokens.
+  assert_eq!(text, decode(&[4, 5]));
+  assert_eq!(reasons.last().unwrap(), &Some(FinishReason::Eos));
+  // Exactly one terminal reason (the eos), no premature stop.
+  assert_eq!(reasons.iter().filter(|r| r.is_some()).count(), 1);
+}
+
+/// `generate` collects every `stream_generate` segment into one `String`
+/// and returns the final response's stats. Closed-form oracle: an
+/// eos-terminated script `[4, 5, 2]` yields text == decode([4, 5]) (eos not
+/// detokenized) and `generation_tokens == 3` (mlx-lm `n + 1`: two emitted
+/// tokens + the eos-bearing final response).
+#[test]
+fn generate_collects_text_and_reports_stats_on_eos() {
+  let tok = fixture_tokenizer();
+  let model = ScriptModel {
+    vocab: 16,
+    prompt_len: 2,
+    script: vec![4u32, 5, 2, 6, 7], // world the </s>
+  };
+  let cache = make_prompt_cache(&CacheConfig {
+    num_hidden_layers: 1,
+    sliding_window: None,
+  });
+  let cfg = GenConfig {
+    max_tokens: 32,
+    ..Default::default()
+  };
+  let (text, stats) = generate(&model, &tok, &[1u32, 3], cache, cfg).expect("generate ok");
+  assert_eq!(text, decode(&[4, 5]), "eos token contributes no text");
+  assert_eq!(stats.prompt_tokens, 2, "prompt was 2 tokens");
+  assert_eq!(
+    stats.generation_tokens, 3,
+    "two emitted tokens + the eos-bearing final response (n + 1)"
+  );
+  // tps are non-negative (wall-clock derived; exact value not asserted).
+  assert!(stats.prompt_tps >= 0.0 && stats.generation_tps >= 0.0);
+}
+
+/// `generate` with `max_tokens == 0`: `stream_generate` yields nothing, so
+/// the `None`-final-response branch returns the empty string + a zero-counts
+/// `GenerationStats` that still carries the original `prompt_tokens`.
+#[test]
+fn generate_zero_max_tokens_empty_text_zero_stats() {
+  let tok = fixture_tokenizer();
+  let model = ScriptModel {
+    vocab: 16,
+    prompt_len: 3,
+    script: vec![4u32, 5, 6],
+  };
+  let cache = make_prompt_cache(&CacheConfig {
+    num_hidden_layers: 1,
+    sliding_window: None,
+  });
+  let cfg = GenConfig {
+    max_tokens: 0,
+    ..Default::default()
+  };
+  let (text, stats) = generate(&model, &tok, &[1u32, 3, 4], cache, cfg).expect("generate ok");
+  assert_eq!(text, "", "no tokens produced ⇒ empty output");
+  assert_eq!(stats.generation_tokens, 0);
+  assert_eq!(
+    stats.prompt_tokens, 3,
+    "prompt_tokens preserved on the empty run"
+  );
+  assert_eq!(stats.prompt_tps, 0.0);
+  assert_eq!(stats.generation_tps, 0.0);
+}
+
+/// `generate` propagates an underlying step error as `Err` (short-circuits
+/// the collection). A model whose `forward` always fails drives the
+/// `stream_generate` Iterator-`Err` contract through `generate`.
+#[test]
+fn generate_propagates_step_error() {
+  struct FailModel;
+  impl Model for FailModel {
+    fn forward(&self, _t: &Array, _c: &mut [Box<dyn KvCache>]) -> Result<Array> {
+      Err(Error::InvariantViolation(
+        crate::error::InvariantViolationPayload::new("FailModel::forward", "mock forward failure"),
+      ))
+    }
+  }
+  let tok = fixture_tokenizer();
+  let cache = make_prompt_cache(&CacheConfig {
+    num_hidden_layers: 1,
+    sliding_window: None,
+  });
+  let cfg = GenConfig {
+    max_tokens: 4,
+    ..Default::default()
+  };
+  let res = generate(&FailModel, &tok, &[1u32, 3], cache, cfg);
+  assert!(
+    res.is_err(),
+    "a forward failure surfaces as Err from generate"
+  );
+}

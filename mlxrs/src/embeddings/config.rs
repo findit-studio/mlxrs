@@ -1627,4 +1627,1017 @@ mod tests {
     let cfg = pooling_from_st_config_str(&json).unwrap();
     assert_eq!(cfg.strategy(), super::PoolingStrategy::Mean);
   }
+
+  // ──────────────────── scanner structural edge cases ─────────────────
+
+  #[test]
+  fn parse_pooling_json_empty_object_is_no_keys() {
+    // `{}` is structurally valid: the early `}`-after-`{` return in
+    // `parse_top_object` yields an empty pair list (no keys parsed).
+    let pairs = parse_pooling_json("{}").unwrap();
+    assert!(pairs.is_empty(), "expected no pairs, got {pairs:?}");
+  }
+
+  #[test]
+  fn parse_pooling_json_empty_object_with_leading_ws() {
+    // Leading whitespace before `{` and an empty body still parses to no
+    // pairs (covers the top-level `skip_ws` + empty-object early return).
+    let pairs = parse_pooling_json("  \t\n {}").unwrap();
+    assert!(pairs.is_empty(), "expected no pairs, got {pairs:?}");
+  }
+
+  #[test]
+  fn parse_pooling_json_duplicate_known_key_last_wins() {
+    // `swap_remove` in `parse_top_object` dedups a repeated KNOWN key,
+    // keeping the LAST occurrence. Two `pooling_mode` entries → one pair
+    // with the second value ("cls").
+    let pairs = parse_pooling_json(r#"{"pooling_mode": "mean", "pooling_mode": "cls"}"#).unwrap();
+    assert_eq!(pairs.len(), 1, "duplicate key must collapse to one pair");
+    match &pairs[0].1 {
+      JVal::Str(s) => assert_eq!(s, "cls", "last duplicate must win"),
+      other => panic!("expected Str(\"cls\"), got {other:?}"),
+    }
+    // End-to-end: the surviving value resolves to the Cls strategy.
+    assert_eq!(
+      pooling_from_st_config_str(r#"{"pooling_mode": "mean", "pooling_mode": "cls"}"#)
+        .unwrap()
+        .strategy(),
+      super::PoolingStrategy::Cls,
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_expect_colon_wrong_char() {
+    // After the key, `expect(b':')` finds `"` instead → the wrong-char
+    // arm of `expect`. Byte offset points at the offending `"`: the
+    // input is `{"k" "v"}`; bytes 0=`{` 1=`"` 2=`k` 3=`"` 4=` ` 5=`"`,
+    // `skip_ws` lands `pos` on byte 5 (the second `"`).
+    let err = parse_pooling_json(r#"{"k" "v"}"#).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("expected ':'") && msg.contains("found '\"'"),
+      "expected colon-not-found-citing-quote error, got: {msg}"
+    );
+    assert!(msg.contains("byte 5"), "expected byte 5, got: {msg}");
+  }
+
+  #[test]
+  fn parse_pooling_json_object_unexpected_char_after_pair() {
+    // After a complete pair, a byte that is neither `,` nor `}` triggers
+    // the `Some(c)` arm of the top-level object loop's trailing match.
+    let err = parse_pooling_json(r#"{"pooling_mode": "mean" @}"#).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("expected `,` or `}`") && msg.contains("'@'"),
+      "expected comma-or-brace error citing '@', got: {msg}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_object_unterminated_after_pair() {
+    // EOF right after a complete pair (no `,`/`}`) → the `None` arm of the
+    // top-level object loop's trailing match.
+    let err = parse_pooling_json(r#"{"pooling_mode": "mean""#).unwrap_err();
+    assert!(
+      format!("{err}").contains("reached end of input"),
+      "expected end-of-input error, got: {err}"
+    );
+  }
+
+  // ────────────────── parse_value branch coverage (known key) ─────────
+
+  #[test]
+  fn parse_pooling_json_known_key_object_value() {
+    // A KNOWN key (`pooling_mode`) whose value is an object routes through
+    // `parse_value`'s `{`-branch → `JVal::Object`.
+    let pairs = parse_pooling_json(r#"{"pooling_mode": {"a": 1}}"#).unwrap();
+    assert_eq!(pairs.len(), 1);
+    assert!(matches!(pairs[0].1, JVal::Object), "expected Object");
+  }
+
+  #[test]
+  fn parse_pooling_json_known_key_array_value() {
+    // KNOWN key with an array value → `parse_value`'s `[`-branch →
+    // `JVal::Array`.
+    let pairs = parse_pooling_json(r#"{"pooling_mode": ["cls", "mean"]}"#).unwrap();
+    assert_eq!(pairs.len(), 1);
+    assert!(matches!(pairs[0].1, JVal::Array), "expected Array");
+  }
+
+  #[test]
+  fn parse_pooling_json_known_key_null_value() {
+    // KNOWN key with `null` → `parse_value`'s `n`-branch → `JVal::Null`.
+    let pairs = parse_pooling_json(r#"{"pooling_mode": null}"#).unwrap();
+    assert_eq!(pairs.len(), 1);
+    assert!(matches!(pairs[0].1, JVal::Null), "expected Null");
+  }
+
+  #[test]
+  fn parse_pooling_json_known_key_value_eof() {
+    // EOF immediately after the `:` for a KNOWN key → `parse_value`'s
+    // `None` (unexpected-end) arm.
+    let err = parse_pooling_json(r#"{"pooling_mode":"#).unwrap_err();
+    assert!(
+      format!("{err}").contains("unexpected end of input while parsing value"),
+      "expected parse-value EOF error, got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_known_key_value_unexpected_char() {
+    // A bogus leading byte for a KNOWN key's value → `parse_value`'s
+    // catch-all `Some(c)` arm (already pinned via `pooling_mode` + `@` in
+    // an existing test; re-assert the message phrasing for the value
+    // dispatch explicitly).
+    let err = parse_pooling_json(r#"{"pooling_mode": %}"#).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("unexpected character") && msg.contains("'%'"),
+      "expected unexpected-char-while-parsing-value error, got: {msg}"
+    );
+  }
+
+  // ─────────────── skip_value branch coverage (unknown key) ───────────
+
+  #[test]
+  fn parse_pooling_json_unknown_key_bool_value_dropped() {
+    // An UNKNOWN key with a bool value routes through `skip_value`'s
+    // `t`/`f` arm and is discarded (not retained in the pair list).
+    let pairs = parse_pooling_json(r#"{"future_flag": true}"#).unwrap();
+    assert!(
+      pairs.is_empty(),
+      "unknown key must be dropped, got {pairs:?}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_unknown_key_null_value_dropped() {
+    // UNKNOWN key + `null` → `skip_value`'s `n`-arm; dropped.
+    let pairs = parse_pooling_json(r#"{"future_flag": null}"#).unwrap();
+    assert!(pairs.is_empty(), "unknown null value must be dropped");
+  }
+
+  #[test]
+  fn parse_pooling_json_unknown_key_number_value_dropped() {
+    // UNKNOWN key + number → `skip_value`'s digit-arm → `parse_number_slice`;
+    // dropped.
+    let pairs = parse_pooling_json(r#"{"future_flag": 42}"#).unwrap();
+    assert!(pairs.is_empty(), "unknown number value must be dropped");
+  }
+
+  #[test]
+  fn parse_pooling_json_unknown_key_string_value_dropped() {
+    // UNKNOWN key + escape-free string → `skip_value` → `skip_string`;
+    // dropped without materializing a payload.
+    let pairs = parse_pooling_json(r#"{"future_flag": "hello"}"#).unwrap();
+    assert!(pairs.is_empty(), "unknown string value must be dropped");
+  }
+
+  #[test]
+  fn parse_pooling_json_unknown_key_value_unexpected_char() {
+    // UNKNOWN key with a bogus value byte → `skip_value`'s catch-all
+    // `Some(c)` arm (distinct message from `parse_value`'s).
+    let err = parse_pooling_json(r#"{"future_flag": @}"#).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("unexpected character") && msg.contains("skipping value") && msg.contains("'@'"),
+      "expected skip-value unexpected-char error, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_unknown_key_value_eof() {
+    // EOF right after an UNKNOWN key's `:` → `skip_value`'s `None` arm.
+    let err = parse_pooling_json(r#"{"future_flag":"#).unwrap_err();
+    assert!(
+      format!("{err}").contains("unexpected end of input while skipping value"),
+      "expected skip-value EOF error, got: {err}"
+    );
+  }
+
+  // ───────────────── skip_string escape/error coverage ────────────────
+
+  #[test]
+  fn parse_pooling_json_unknown_key_string_escapes_dropped() {
+    // UNKNOWN key string containing simple escapes exercises
+    // `skip_string`'s escape-walk (`\"`, `\\`, `\n`) — discarded payload.
+    let pairs = parse_pooling_json(r#"{"future_field": "a\"b\\c\nd"}"#).unwrap();
+    assert!(pairs.is_empty(), "escaped unknown string must be dropped");
+  }
+
+  #[test]
+  fn parse_pooling_json_unknown_key_string_surrogate_pair_dropped() {
+    // A well-formed surrogate-pair ESCAPE `😀` in an UNKNOWN-key
+    // string is validated and walked by `skip_string`'s high+low-surrogate
+    // branch (`0xD800..=0xDBFF` then the trailing `\uDCxx` consume), then
+    // dropped. A raw 4-byte `😀` would bypass the escape branch entirely
+    // (scanned as plain bytes), so the literal escape form is used.
+    let pairs = parse_pooling_json(r#"{"future_field": "\uD83D\uDE00"}"#).unwrap();
+    assert!(
+      pairs.is_empty(),
+      "surrogate-pair unknown string must be dropped"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_unknown_key_string_unpaired_high_surrogate() {
+    // High surrogate not followed by `\u` low surrogate → `skip_string`
+    // rejects it symmetrically with `parse_string`.
+    let err = parse_pooling_json(r#"{"future_field": "\uD83Dx"}"#).unwrap_err();
+    assert!(
+      format!("{err}").contains("expected low surrogate"),
+      "expected unpaired-high-surrogate error, got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_unknown_key_string_unpaired_low_surrogate() {
+    // A lone low surrogate in an UNKNOWN-key string is rejected by
+    // `skip_string`'s low-surrogate-without-high branch.
+    let err = parse_pooling_json(r#"{"future_field": "\uDC00"}"#).unwrap_err();
+    assert!(
+      format!("{err}").contains("unpaired low surrogate"),
+      "expected unpaired-low-surrogate error, got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_unknown_key_string_invalid_escape() {
+    // `\x` is not a valid JSON escape → `skip_string`'s `other =>` arm.
+    let err = parse_pooling_json(r#"{"future_field": "a\xb"}"#).unwrap_err();
+    assert!(
+      format!("{err}").contains("invalid escape sequence"),
+      "expected invalid-escape error, got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_unknown_key_string_control_char() {
+    // A raw control char inside an UNKNOWN-key string body → the per-chunk
+    // control-char rejection in `skip_string`.
+    let src = "{\"future_field\": \"a\x01b\"}";
+    let err = parse_pooling_json(src).unwrap_err();
+    assert!(
+      format!("{err}").contains("control character"),
+      "expected control-char rejection in skip_string, got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_unknown_key_string_unterminated() {
+    // An UNKNOWN-key string with no closing quote → `skip_string`'s
+    // `skip_until` None → unterminated-string error.
+    let err = parse_pooling_json(r#"{"future_field": "no close"#).unwrap_err();
+    assert!(
+      format!("{err}").contains("unterminated string"),
+      "expected unterminated-string error (skip_string), got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_nested_object_non_string_key() {
+    // A nested object (under an UNKNOWN key) whose key is not a string →
+    // `skip_object` calls `skip_string` which finds `4`, not `"` → the
+    // "expected string" arm of `skip_string`.
+    let err = parse_pooling_json(r#"{"future_field": {42: 1}}"#).unwrap_err();
+    assert!(
+      format!("{err}").contains("expected string"),
+      "expected non-string-nested-key error, got: {err}"
+    );
+  }
+
+  // ───────────────── parse_unicode_escape invalid hex ─────────────────
+
+  #[test]
+  fn parse_pooling_json_invalid_hex_in_unicode_escape() {
+    // `\uXYZW` — `X` is not a hex digit → `parse_unicode_escape`'s
+    // invalid-hex arm. Driven through a KNOWN key so `parse_string`
+    // (slow path) reaches `parse_unicode_escape`.
+    let err = parse_pooling_json(r#"{"pooling_mode": "\uXYZW"}"#).unwrap_err();
+    assert!(
+      format!("{err}").contains("invalid hex digit") && format!("{err}").contains("'X'"),
+      "expected invalid-hex-digit error citing 'X', got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_incomplete_unicode_escape() {
+    // `\u00` then closing quote — fewer than 4 hex digits → the
+    // `incomplete \uXXXX escape` arm (the `bump()` returns the closing
+    // quote, which is not a hex digit, so this actually surfaces the
+    // invalid-hex arm citing the `"`). Assert it is rejected as a hex
+    // problem either way.
+    let err = parse_pooling_json(r#"{"pooling_mode": "\u00"}"#).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("invalid hex digit") || msg.contains("incomplete"),
+      "expected incomplete/invalid \\u escape error, got: {msg}"
+    );
+  }
+
+  // ─────────────── parse_keyword / parse_bool coverage ────────────────
+
+  #[test]
+  fn parse_pooling_json_keyword_truncated_eof() {
+    // `tru` at EOF: `parse_keyword("true")` sees `pos + 4 > len` → the
+    // reached-end-of-input arm.
+    let err = parse_pooling_json(r#"{"pooling_mode": tru"#).unwrap_err();
+    assert!(
+      format!("{err}").contains("keyword `true`") && format!("{err}").contains("end of input"),
+      "expected truncated-keyword EOF error, got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_keyword_mismatch() {
+    // `trux` has 4 bytes but does not equal `true` → `parse_keyword`'s
+    // byte-mismatch arm.
+    let err = parse_pooling_json(r#"{"pooling_mode": trux}"#).unwrap_err();
+    assert!(
+      format!("{err}").contains("expected keyword `true`"),
+      "expected keyword-mismatch error, got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_false_keyword_parsed() {
+    // `false` exercises `parse_bool`'s `f`-arm + `parse_keyword("false")`.
+    // `include_prompt: false` is a KNOWN key, so it is retained as
+    // `JVal::Bool(false)`.
+    let pairs = parse_pooling_json(r#"{"include_prompt": false}"#).unwrap();
+    assert_eq!(pairs.len(), 1);
+    assert!(
+      matches!(pairs[0].1, JVal::Bool(false)),
+      "expected Bool(false), got {:?}",
+      pairs[0].1
+    );
+  }
+
+  // ────────────── parse_number_slice branch coverage ──────────────────
+
+  #[test]
+  fn parse_pooling_json_number_bad_first_char_after_minus() {
+    // `-}` — after consuming `-`, the next byte is `}` (not `0` nor a
+    // digit) → `parse_number_slice`'s invalid-leading-char arm.
+    let err = parse_pooling_json(r#"{"future_field": -}"#).unwrap_err();
+    assert!(
+      format!("{err}").contains("invalid number") && format!("{err}").contains("unexpected"),
+      "expected invalid-number (bad char after -) error, got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_number_eof_after_minus() {
+    // `-` then EOF → `parse_number_slice`'s reached-end-of-input arm.
+    let err = parse_pooling_json(r#"{"future_field": -"#).unwrap_err();
+    assert!(
+      format!("{err}").contains("invalid number") && format!("{err}").contains("end of input"),
+      "expected invalid-number (EOF after -) error, got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_number_fraction_without_digit() {
+    // `1.` then `}` — a `.` with no following digit → the
+    // expected-digit-after-`.` arm of `parse_number_slice`.
+    let err = parse_pooling_json(r#"{"future_field": 1.}"#).unwrap_err();
+    assert!(
+      format!("{err}").contains("expected digit after `.`"),
+      "expected fraction-without-digit error, got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_number_exponent_without_digit() {
+    // `1e` then `}` — exponent marker with no following digit → the
+    // expected-digit-after-exponent arm.
+    let err = parse_pooling_json(r#"{"future_field": 1e}"#).unwrap_err();
+    assert!(
+      format!("{err}").contains("expected digit after exponent"),
+      "expected exponent-without-digit error, got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_number_full_float_with_signed_exponent_dropped() {
+    // A full float `-1.5e+10` under an UNKNOWN key walks every optional
+    // segment of `parse_number_slice` (sign, integer-digit-loop, fraction,
+    // signed exponent) and is then dropped.
+    let pairs = parse_pooling_json(r#"{"future_field": -1.5e+10}"#).unwrap();
+    assert!(pairs.is_empty(), "unknown float value must be dropped");
+    // Negative-sign exponent variant too (the `e-` arm).
+    let pairs = parse_pooling_json(r#"{"future_field": 1.5e-3}"#).unwrap();
+    assert!(pairs.is_empty(), "unknown float value must be dropped");
+  }
+
+  // ───────────── skip_object / skip_array branch coverage ─────────────
+
+  #[test]
+  fn parse_pooling_json_nested_empty_object_dropped() {
+    // `{"future": {}}` — `skip_object` empty early return.
+    let pairs = parse_pooling_json(r#"{"future_field": {}}"#).unwrap();
+    assert!(pairs.is_empty(), "nested empty object must be dropped");
+  }
+
+  #[test]
+  fn parse_pooling_json_nested_empty_array_dropped() {
+    // `{"future": []}` — `skip_array` empty early return.
+    let pairs = parse_pooling_json(r#"{"future_field": []}"#).unwrap();
+    assert!(pairs.is_empty(), "nested empty array must be dropped");
+  }
+
+  #[test]
+  fn parse_pooling_json_nested_object_multi_pair_dropped() {
+    // A multi-pair nested object exercises `skip_object`'s comma arm and
+    // its `}`-close arm; whole thing dropped (unknown key).
+    let pairs = parse_pooling_json(r#"{"future_field": {"a": 1, "b": 2}}"#).unwrap();
+    assert!(pairs.is_empty(), "multi-pair nested object must be dropped");
+  }
+
+  #[test]
+  fn parse_pooling_json_nested_object_trailing_comma() {
+    // Trailing comma inside a nested object → `skip_object`'s
+    // trailing-comma rejection.
+    let err = parse_pooling_json(r#"{"future_field": {"a": 1,}}"#).unwrap_err();
+    assert!(
+      format!("{err}").contains("trailing comma"),
+      "expected nested-object trailing-comma error, got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_nested_object_unexpected_char() {
+    // A byte that is neither `,` nor `}` after a nested pair →
+    // `skip_object`'s `Some(c)` arm.
+    let err = parse_pooling_json(r#"{"future_field": {"a": 1 @}}"#).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("expected `,` or `}`") && msg.contains("nested object") && msg.contains("'@'"),
+      "expected nested-object comma-or-brace error, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_nested_object_unterminated() {
+    // EOF inside a nested object after a pair → `skip_object`'s `None` arm.
+    let err = parse_pooling_json(r#"{"future_field": {"a": 1"#).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("nested object") && msg.contains("end of input"),
+      "expected nested-object EOF error, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_nested_array_multi_value_dropped() {
+    // A multi-element array exercises `skip_array`'s comma arm and its
+    // `]`-close arm; dropped (unknown key).
+    let pairs = parse_pooling_json(r#"{"future_field": [1, 2, 3]}"#).unwrap();
+    assert!(pairs.is_empty(), "multi-value nested array must be dropped");
+  }
+
+  #[test]
+  fn parse_pooling_json_nested_array_unexpected_char() {
+    // `[1 2]` — after the first value, a byte that is neither `,` nor `]`
+    // → `skip_array`'s `Some(c)` arm.
+    let err = parse_pooling_json(r#"{"future_field": [1 2]}"#).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("expected `,` or `]`") && msg.contains("array") && msg.contains("'2'"),
+      "expected array comma-or-bracket error, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_nested_array_unterminated() {
+    // EOF inside an array after a value → `skip_array`'s `None` arm.
+    let err = parse_pooling_json(r#"{"future_field": [1"#).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("array") && msg.contains("end of input"),
+      "expected array EOF error, got: {msg}"
+    );
+  }
+
+  // ──────────────── resolve_strategy / parse_pairs typed errors ───────
+
+  #[test]
+  fn pooling_from_st_config_str_no_mode_invariant_violation() {
+    // A structurally valid config with neither `pooling_mode` nor any
+    // legacy `pooling_mode_*` flag → `resolve_strategy`'s final
+    // InvariantViolation. `{}` and `{"include_prompt": true}` both hit it.
+    use crate::error::Error;
+    for json in ["{}", r#"{"include_prompt": true}"#] {
+      let err = pooling_from_st_config_str(json).unwrap_err();
+      match err {
+        Error::InvariantViolation(p) => {
+          assert_eq!(p.context(), "pooling config");
+          assert!(
+            p.requirement().contains("declares no pooling mode"),
+            "unexpected requirement: {}",
+            p.requirement()
+          );
+        }
+        other => panic!("expected InvariantViolation for {json:?}, got {other:?}"),
+      }
+    }
+  }
+
+  #[test]
+  fn pooling_from_st_config_str_present_nonstring_mode_out_of_range() {
+    // A present-but-non-string/non-array `pooling_mode` (null / bool /
+    // number / object) is rejected with OutOfRange carrying a `descr`
+    // matching the JSON type — NOT silently resolved to a strategy.
+    use crate::error::Error;
+    for (json, descr) in [
+      (r#"{"pooling_mode": null}"#, "null"),
+      (r#"{"pooling_mode": true}"#, "bool true"),
+      (r#"{"pooling_mode": false}"#, "bool false"),
+      (r#"{"pooling_mode": 7}"#, "number 7"),
+      (r#"{"pooling_mode": {"a": 1}}"#, "object"),
+    ] {
+      let err = pooling_from_st_config_str(json).unwrap_err();
+      match err {
+        Error::OutOfRange(p) => {
+          assert_eq!(p.context(), "pooling config: `pooling_mode`");
+          assert_eq!(p.value(), descr, "value descr mismatch for {json:?}");
+        }
+        other => panic!("expected OutOfRange for {json:?}, got {other:?}"),
+      }
+    }
+  }
+
+  #[test]
+  fn pooling_from_st_config_str_concatenated_mode_array_rejected() {
+    // A `pooling_mode` array (concatenated modes) → InvariantViolation
+    // (distinct from the OutOfRange non-string path).
+    use crate::error::Error;
+    let err = pooling_from_st_config_str(r#"{"pooling_mode": ["cls", "mean"]}"#).unwrap_err();
+    match err {
+      Error::InvariantViolation(p) => {
+        assert_eq!(p.context(), "pooling config: `pooling_mode`");
+        assert!(
+          p.requirement().contains("concatenated pooling mode"),
+          "unexpected requirement: {}",
+          p.requirement()
+        );
+      }
+      other => panic!("expected InvariantViolation, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn pooling_from_st_config_str_unsupported_legacy_flag_unknown_enum() {
+    // A known-but-unsupported legacy flag set alone (`weightedmean` /
+    // `mean_sqrt_len_tokens`) → UnknownEnumValue with the static
+    // supported set.
+    use crate::error::Error;
+    for (json, name) in [
+      (
+        r#"{"pooling_mode_weightedmean_tokens": true}"#,
+        "weightedmean",
+      ),
+      (
+        r#"{"pooling_mode_mean_sqrt_len_tokens": true}"#,
+        "mean_sqrt_len_tokens",
+      ),
+    ] {
+      let err = pooling_from_st_config_str(json).unwrap_err();
+      match err {
+        Error::UnknownEnumValue(p) => {
+          assert_eq!(p.value(), name);
+          assert_eq!(p.supported(), &["cls", "lasttoken", "max", "mean"]);
+        }
+        other => panic!("expected UnknownEnumValue for {json:?}, got {other:?}"),
+      }
+    }
+  }
+
+  #[test]
+  fn pooling_from_st_config_str_unsupported_modern_mode_unknown_enum() {
+    // A modern `pooling_mode` string that `PoolingStrategy::from_mode`
+    // rejects (`weightedmean`) surfaces UnknownEnumValue from
+    // `from_mode` with `type_name` "embeddings::PoolingStrategy".
+    use crate::error::Error;
+    let err = pooling_from_st_config_str(r#"{"pooling_mode": "weightedmean"}"#).unwrap_err();
+    match err {
+      Error::UnknownEnumValue(p) => {
+        assert_eq!(p.type_name(), "embeddings::PoolingStrategy");
+        assert_eq!(p.value(), "weightedmean");
+      }
+      other => panic!("expected UnknownEnumValue, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn pooling_from_st_config_str_legacy_priority_cls_over_mean() {
+    // CLS > Mean > Max > Last priority over supported legacy flags: with
+    // cls + mean + max + last all true, CLS wins.
+    let cfg = pooling_from_st_config_str(
+      r#"{"pooling_mode_cls_token": true, "pooling_mode_mean_tokens": true, "pooling_mode_max_tokens": true, "pooling_mode_lasttoken": true}"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.strategy(), super::PoolingStrategy::Cls);
+    // Drop CLS → Mean wins.
+    let cfg = pooling_from_st_config_str(
+      r#"{"pooling_mode_mean_tokens": true, "pooling_mode_max_tokens": true, "pooling_mode_lasttoken": true}"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.strategy(), super::PoolingStrategy::Mean);
+    // Drop Mean → Max wins.
+    let cfg = pooling_from_st_config_str(
+      r#"{"pooling_mode_max_tokens": true, "pooling_mode_lasttoken": true}"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.strategy(), super::PoolingStrategy::Max);
+    // Drop Max → Last wins.
+    let cfg = pooling_from_st_config_str(r#"{"pooling_mode_lasttoken": true}"#).unwrap();
+    assert_eq!(cfg.strategy(), super::PoolingStrategy::Last);
+  }
+
+  #[test]
+  fn pooling_from_st_config_str_all_false_legacy_defaults_mean() {
+    // Any legacy flag key present (even all-false) → python `("mean",)`
+    // default (the `has_legacy` branch).
+    let cfg = pooling_from_st_config_str(r#"{"pooling_mode_cls_token": false}"#).unwrap();
+    assert_eq!(cfg.strategy(), super::PoolingStrategy::Mean);
+    assert!(cfg.normalize(), "normalize is always true for ST configs");
+    assert_eq!(cfg.dimension(), None);
+  }
+
+  #[test]
+  fn pooling_from_st_config_str_include_prompt_false_rejected() {
+    // `include_prompt: false` (prompt-aware pooling) → InvariantViolation,
+    // checked before strategy resolution.
+    use crate::error::Error;
+    let err = pooling_from_st_config_str(r#"{"pooling_mode": "mean", "include_prompt": false}"#)
+      .unwrap_err();
+    match err {
+      Error::InvariantViolation(p) => {
+        assert_eq!(p.context(), "pooling config: `include_prompt`");
+        assert!(
+          p.requirement().contains("include_prompt=false"),
+          "unexpected requirement: {}",
+          p.requirement()
+        );
+      }
+      other => panic!("expected InvariantViolation, got {other:?}"),
+    }
+  }
+
+  // ─────────────────── matryoshka dimension coverage ──────────────────
+
+  #[test]
+  fn pooling_from_st_config_str_valid_word_embedding_dimension() {
+    // A valid positive integer `word_embedding_dimension` → `Some(d)`.
+    let cfg =
+      pooling_from_st_config_str(r#"{"pooling_mode": "cls", "word_embedding_dimension": 384}"#)
+        .unwrap();
+    assert_eq!(cfg.strategy(), super::PoolingStrategy::Cls);
+    assert_eq!(cfg.dimension(), Some(384));
+  }
+
+  #[test]
+  fn pooling_from_st_config_str_word_dim_precedence_over_embedding_dim() {
+    // `word_embedding_dimension` takes precedence over `embedding_dimension`
+    // when both are present + valid.
+    let cfg = pooling_from_st_config_str(
+      r#"{"pooling_mode": "mean", "word_embedding_dimension": 128, "embedding_dimension": 256}"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.dimension(), Some(128));
+  }
+
+  #[test]
+  fn pooling_from_st_config_str_embedding_dimension_alias() {
+    // The legacy `embedding_dimension` alias is honored when
+    // `word_embedding_dimension` is absent.
+    let cfg =
+      pooling_from_st_config_str(r#"{"pooling_mode": "mean", "embedding_dimension": 64}"#).unwrap();
+    assert_eq!(cfg.dimension(), Some(64));
+  }
+
+  #[test]
+  fn pooling_from_st_config_str_zero_dimension_out_of_range() {
+    // `word_embedding_dimension: 0` → `parse_dim_number`'s `v == 0`
+    // rejection (OutOfRange).
+    use crate::error::Error;
+    let err =
+      pooling_from_st_config_str(r#"{"pooling_mode": "mean", "word_embedding_dimension": 0}"#)
+        .unwrap_err();
+    match err {
+      Error::OutOfRange(p) => {
+        assert_eq!(p.context(), "pooling config: matryoshka dimension");
+        assert!(
+          p.requirement().contains("must be > 0"),
+          "unexpected requirement: {}",
+          p.requirement()
+        );
+        assert_eq!(p.value(), "word_embedding_dimension = 0");
+      }
+      other => panic!("expected OutOfRange for zero dim, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn pooling_from_st_config_str_u64_overflow_dimension_out_of_range() {
+    // An integer literal exceeding u64::MAX → `parse_dim_number`'s
+    // `raw.parse::<u64>()` failure → OutOfRange (the matryoshka-overflow
+    // message). `99999999999999999999999999` >> u64::MAX.
+    use crate::error::Error;
+    let err = pooling_from_st_config_str(
+      r#"{"pooling_mode": "mean", "embedding_dimension": 99999999999999999999999999}"#,
+    )
+    .unwrap_err();
+    match err {
+      Error::OutOfRange(p) => {
+        assert_eq!(p.context(), "pooling config: matryoshka dimension");
+        assert!(
+          p.requirement().contains("u64-overflowing"),
+          "unexpected requirement: {}",
+          p.requirement()
+        );
+      }
+      other => panic!("expected OutOfRange for u64-overflow dim, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn pooling_from_st_config_str_negative_dimension_parse_error() {
+    // A negative `word_embedding_dimension` → `parse_dim_number`'s
+    // `raw.starts_with('-')` branch → Error::Parse (carries the byte
+    // offset diagnostic).
+    use crate::error::Error;
+    let err =
+      pooling_from_st_config_str(r#"{"pooling_mode": "mean", "word_embedding_dimension": -1}"#)
+        .unwrap_err();
+    assert!(
+      matches!(err, Error::Parse(_)),
+      "expected Parse for negative dim, got {err:?}"
+    );
+    assert!(
+      format!("{err}").contains("non-negative integer"),
+      "expected non-negative-integer message, got: {err}"
+    );
+  }
+
+  #[test]
+  fn pooling_from_st_config_str_fractional_dimension_parse_error() {
+    // A fractional `word_embedding_dimension` (contains `.`) →
+    // `parse_dim_number`'s `contains('.')` branch → Error::Parse.
+    use crate::error::Error;
+    let err =
+      pooling_from_st_config_str(r#"{"pooling_mode": "mean", "word_embedding_dimension": 1.5}"#)
+        .unwrap_err();
+    assert!(
+      matches!(err, Error::Parse(_)),
+      "expected Parse for fractional dim, got {err:?}"
+    );
+  }
+
+  #[test]
+  fn pooling_from_st_config_str_nonnumber_dimension_out_of_range() {
+    // A present-but-non-number dimension (string / bool / null / array /
+    // object) → `parse_pairs`'s non-Num match arm → OutOfRange whose
+    // `value` embeds the per-type descr.
+    use crate::error::Error;
+    for (json, expect_descr) in [
+      (
+        r#"{"pooling_mode": "mean", "word_embedding_dimension": "384"}"#,
+        r#"word_embedding_dimension = string "384""#,
+      ),
+      (
+        r#"{"pooling_mode": "mean", "word_embedding_dimension": true}"#,
+        "word_embedding_dimension = bool true",
+      ),
+      (
+        r#"{"pooling_mode": "mean", "word_embedding_dimension": null}"#,
+        "word_embedding_dimension = null",
+      ),
+      (
+        r#"{"pooling_mode": "mean", "word_embedding_dimension": [1, 2]}"#,
+        "word_embedding_dimension = array",
+      ),
+      (
+        r#"{"pooling_mode": "mean", "word_embedding_dimension": {"a": 1}}"#,
+        "word_embedding_dimension = object",
+      ),
+    ] {
+      let err = pooling_from_st_config_str(json).unwrap_err();
+      match err {
+        Error::OutOfRange(p) => {
+          assert_eq!(p.context(), "pooling config: matryoshka dimension");
+          assert_eq!(p.value(), expect_descr, "descr mismatch for {json:?}");
+        }
+        other => panic!("expected OutOfRange for {json:?}, got {other:?}"),
+      }
+    }
+  }
+
+  #[test]
+  fn pooling_from_st_config_str_invalid_primary_dim_no_fallback_to_alias() {
+    // A present-but-invalid `word_embedding_dimension` is rejected and
+    // does NOT silently fall back to a valid `embedding_dimension`
+    // (precedence: only the FIRST present key is consulted).
+    use crate::error::Error;
+    let err = pooling_from_st_config_str(
+      r#"{"pooling_mode": "mean", "word_embedding_dimension": -1, "embedding_dimension": 384}"#,
+    )
+    .unwrap_err();
+    assert!(
+      matches!(err, Error::Parse(_) | Error::OutOfRange(_)),
+      "invalid primary dim must reject, not fall back, got {err:?}"
+    );
+  }
+
+  // ───────────────────── bytes entry-point coverage ───────────────────
+
+  #[test]
+  fn pooling_from_st_config_bytes_invalid_utf8_parse_error() {
+    // Non-UTF-8 bytes are rejected at the `str::from_utf8` gate in
+    // `pooling_from_st_config_bytes` → Error::Parse before any structural
+    // parse. `0xFF` is never a valid UTF-8 lead byte.
+    use super::pooling_from_st_config_bytes;
+    use crate::error::Error;
+    let err = pooling_from_st_config_bytes(&[b'{', 0xFF, 0xFE, b'}']).unwrap_err();
+    assert!(
+      matches!(err, Error::Parse(_)),
+      "expected Parse for invalid UTF-8 bytes, got {err:?}"
+    );
+  }
+
+  #[test]
+  fn pooling_from_st_config_bytes_valid_roundtrips_to_str() {
+    // Valid UTF-8 bytes pass the gate and parse identically to the str
+    // entry point.
+    use super::pooling_from_st_config_bytes;
+    let cfg = pooling_from_st_config_bytes(br#"{"pooling_mode": "cls"}"#).unwrap();
+    assert_eq!(cfg.strategy(), super::PoolingStrategy::Cls);
+    assert!(cfg.normalize());
+    assert_eq!(cfg.dimension(), None);
+  }
+
+  // ─────────────── expect()/EOF + escape-decode residual coverage ──────
+  //
+  // The remaining gaps the structural/error tests above do not reach:
+  // `expect`'s reached-end-of-input arm, the KNOWN-key slow-path string
+  // decoder's simple-escape + surrogate + invalid-escape + unterminated-
+  // escape arms (`parse_string_with_escapes`), the unknown-key
+  // `skip_string` unterminated-escape arm, and the lowercase-hex digit
+  // branch of `parse_unicode_escape`.
+
+  #[test]
+  fn parse_pooling_json_expect_colon_reached_eof() {
+    // After a complete object key, EOF before the `:` → `expect(b':')`'s
+    // `None` (reached-end-of-input) arm. Input `{"k"` ends right after the
+    // closing quote of the key, so `skip_ws` then `peek()` yields `None`.
+    // `parse_string` for the key succeeds (escape-free `"k"`), so the EOF is
+    // observed by `expect`, not by the string scanner.
+    let err = parse_pooling_json(r#"{"k""#).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("expected ':'") && msg.contains("reached end of input"),
+      "expected colon-EOF error from expect(), got: {msg}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_known_key_string_simple_escapes_decoded() {
+    // A KNOWN key (`pooling_mode`) whose string value BEGINS with `\`
+    // forces `parse_string`'s slow path (`parse_string_with_escapes`).
+    // Each simple two-char escape arm is exercised: `\/` → `/`, `\b` →
+    // 0x08, `\f` → 0x0C, `\r` → CR, `\t` → TAB (plus a leading `\n` to be
+    // sure the very first needle is a backslash). The decoded payload is
+    // retained verbatim as the `JVal::Str` (the resolver would reject it
+    // as an unknown mode, but we assert the PARSER output, not the
+    // resolver, by going through `parse_pooling_json` directly).
+    let pairs = parse_pooling_json(r#"{"pooling_mode": "\n\/\b\f\r\t"}"#).unwrap();
+    assert_eq!(pairs.len(), 1);
+    match &pairs[0].1 {
+      super::JVal::Str(s) => {
+        assert_eq!(
+          s.as_str(),
+          "\n/\u{08}\u{0C}\r\t",
+          "decoded escape bytes mismatch"
+        );
+      }
+      other => panic!("expected Str, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn parse_pooling_json_known_key_string_lowercase_hex_unicode_escape() {
+    // The literal escape `«` uses LOWERCASE hex digits `a`/`b`,
+    // exercising `parse_unicode_escape`'s `b'a'..=b'f'` arm (the existing
+    // `é` test only hits the uppercase `A`..=`F` arm + digits). The
+    // JSON content is built from a normal (non-raw) string so the `\u`
+    // escape is unambiguous SOURCE bytes (`\`,`u`,`0`,`0`,`a`,`b`) — a raw
+    // multibyte `«` in the source would skip the escape branch entirely via
+    // the fast path. U+00AB decodes to « (LEFT-POINTING DOUBLE ANGLE
+    // QUOTATION MARK); the leading `x` forces the slow-path decoder.
+    let json = "{\"pooling_mode\": \"x\\u00abz\"}";
+    let pairs = parse_pooling_json(json).unwrap();
+    match &pairs[0].1 {
+      super::JVal::Str(s) => assert_eq!(s.as_str(), "x\u{00AB}z"),
+      other => panic!("expected Str, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn parse_pooling_json_known_key_string_raw_4byte_scalar_fast_path() {
+    // A raw 4-byte UTF-8 scalar (`😀`, U+1F600) in the source — NOT an
+    // escape — has no backslash in its body, so `parse_string` takes the
+    // escape-free FAST path: the source slice is borrowed, scanned for
+    // control chars, `from_utf8`-validated, and handed to `SmolStr::new`
+    // unchanged (the slow-path surrogate-pair ESCAPE combine is pinned
+    // separately by `..._handles_utf16_surrogate_pair`). Confirms a
+    // supplementary-plane scalar round-trips through the fast path intact.
+    let pairs = parse_pooling_json(r#"{"pooling_mode": "😀"}"#).unwrap();
+    match &pairs[0].1 {
+      super::JVal::Str(s) => assert_eq!(s.as_str(), "\u{1F600}"),
+      other => panic!("expected Str, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn parse_pooling_json_known_key_string_high_surrogate_not_followed_by_escape() {
+    // KNOWN-key slow path: a high surrogate `\uD83D` followed by a plain
+    // char (not `\u`) → `parse_string_with_escapes`'s
+    // "expected low surrogate" arm (the `self.bump() != Some(b'\\')` guard).
+    let err = parse_pooling_json(r#"{"pooling_mode": "\uD83Dx"}"#).unwrap_err();
+    assert!(
+      format!("{err}").contains("expected low surrogate"),
+      "expected high-surrogate-without-low error (parse_string slow path), got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_known_key_string_high_surrogate_then_out_of_range_low() {
+    // KNOWN-key slow path: a high surrogate `\uD83D` immediately followed by
+    // a SECOND well-formed `\u` escape whose value is NOT in the
+    // low-surrogate range `0xDC00..=0xDFFF` → the
+    // "expected low surrogate but got U+...." arm of
+    // `parse_string_with_escapes` (distinct from the high-surrogate-not-
+    // followed-by-`\u` arm above). The `A` second escape passes the
+    // `bump()==\\` and `bump()==u` guards but decodes to 'A' (0x0041), a
+    // valid BMP scalar outside the low-surrogate range. The JSON content is
+    // built from a normal (non-raw) string so the two `\u` escapes are
+    // unambiguous source bytes.
+    let json = "{\"pooling_mode\": \"\\uD83D\\u0041\"}";
+    let err = parse_pooling_json(json).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("expected low surrogate but got") && msg.contains("U+0041"),
+      "expected out-of-range-low-surrogate error citing U+0041, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_known_key_string_unpaired_low_surrogate() {
+    // KNOWN-key slow path: a lone low surrogate `\uDC00` (not preceded by a
+    // high surrogate) → `parse_string_with_escapes`'s
+    // "unpaired low surrogate" arm. A leading `\n` guarantees the slow path
+    // is taken (first needle is a backslash).
+    let err = parse_pooling_json(r#"{"pooling_mode": "\n\uDC00"}"#).unwrap_err();
+    assert!(
+      format!("{err}").contains("unpaired low surrogate"),
+      "expected unpaired-low-surrogate error (parse_string slow path), got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_known_key_string_invalid_escape() {
+    // KNOWN-key slow path: `\x` is not a valid JSON escape →
+    // `parse_string_with_escapes`'s `other =>` invalid-escape arm.
+    let err = parse_pooling_json(r#"{"pooling_mode": "a\xb"}"#).unwrap_err();
+    assert!(
+      format!("{err}").contains("invalid escape sequence"),
+      "expected invalid-escape error (parse_string slow path), got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_known_key_string_unterminated_escape_eof() {
+    // KNOWN-key slow path: a backslash as the final byte before EOF (no
+    // escape character follows) → `parse_string_with_escapes`'s
+    // unterminated-escape arm (the inner `bump()` returns `None`). A
+    // leading `\n` forces the slow path; the trailing `\` then hits EOF.
+    let err = parse_pooling_json("{\"pooling_mode\": \"\\n\\").unwrap_err();
+    assert!(
+      format!("{err}").contains("unterminated escape"),
+      "expected unterminated-escape error (parse_string slow path), got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_unknown_key_string_unterminated_escape_eof() {
+    // UNKNOWN-key `skip_string`: a backslash as the final byte before EOF →
+    // `skip_string`'s unterminated-escape arm (mirrors the KNOWN-key path
+    // above but on the non-materializing scanner).
+    let err = parse_pooling_json("{\"future_field\": \"a\\").unwrap_err();
+    assert!(
+      format!("{err}").contains("unterminated escape"),
+      "expected unterminated-escape error (skip_string), got: {err}"
+    );
+  }
 }

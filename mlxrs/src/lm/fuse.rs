@@ -581,6 +581,7 @@ pub fn fuse(
 /// existing [`open_excl_temp_shard`] / test [`fresh_dir`] code uses
 /// the same hand-rolled pid+nanos+counter pattern. Matching that pattern
 /// avoids introducing a new crate dependency for a one-call use site.
+#[derive(Debug)]
 struct StagingDir {
   /// Absolute (or save-path-relative) path of the staging directory.
   /// `None` after [`consume`](Self::consume) so [`Drop`] is a no-op for
@@ -1341,5 +1342,579 @@ mod tests {
     };
     assert_eq!(p.context(), "fuse: source config JSON");
     assert_eq!(p.requirement(), "must be an object");
+  }
+
+  // ─────────────────────── fresh-dir helper ───────────────────────
+
+  /// A process-unique scratch directory under the system temp dir. Mirrors
+  /// the `fresh_dir` pattern used by the gguf / convert tests (no
+  /// `tempfile` crate dependency in `mlxrs`).
+  fn fresh_dir(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("mlxrs-fuse-ut-{tag}-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+  }
+
+  // ─────────────────────── StagingDir ───────────────────────
+
+  /// `StagingDir::create` makes a fresh `.staging-fuse-*` subdir of the
+  /// parent, `path()` returns it, the dir actually exists on disk, and
+  /// `consume()` hands back the path WITHOUT removing it (covers the
+  /// create-success arm, `path()`, and `consume()`).
+  #[test]
+  fn staging_dir_create_path_consume_keeps_dir() {
+    let parent = fresh_dir("staging_create");
+    let staging = StagingDir::create(&parent).unwrap();
+    let p = staging.path().to_path_buf();
+    assert!(p.is_dir(), "staging dir must exist after create");
+    assert_eq!(p.parent(), Some(parent.as_path()), "staged under parent");
+    assert!(
+      p.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with(".staging-fuse-")),
+      "staging dir basename must carry the `.staging-fuse-` prefix",
+    );
+    // `consume` disarms the guard and returns the path; the dir must
+    // still be present (the caller owns cleanup on the success path).
+    let returned = staging.consume();
+    assert_eq!(returned, p, "consume returns the staged path");
+    assert!(returned.is_dir(), "consume must NOT remove the dir");
+    std::fs::remove_dir_all(&parent).unwrap();
+  }
+
+  /// `StagingDir::Drop` removes the staging dir on an error exit (the guard
+  /// was never `consume()`d). Covers the `Drop` `remove_dir_all` success arm.
+  #[test]
+  fn staging_dir_drop_removes_dir() {
+    let parent = fresh_dir("staging_drop");
+    let staged_path;
+    {
+      let staging = StagingDir::create(&parent).unwrap();
+      staged_path = staging.path().to_path_buf();
+      assert!(staged_path.is_dir());
+      // Drop here without consuming.
+    }
+    assert!(
+      !staged_path.exists(),
+      "Drop must remove the un-consumed staging dir",
+    );
+    std::fs::remove_dir_all(&parent).unwrap();
+  }
+
+  /// `StagingDir::Drop` on an already-vanished directory hits the
+  /// best-effort `remove_dir_all` failure arm (the `eprintln!` warning at
+  /// the tail of `Drop`). We pre-delete the staging dir out from under the
+  /// guard so `remove_dir_all` returns `NotFound`; the test only asserts the
+  /// drop does not panic (the warning path is exercised).
+  #[test]
+  fn staging_dir_drop_tolerates_missing_dir() {
+    let parent = fresh_dir("staging_drop_missing");
+    {
+      let staging = StagingDir::create(&parent).unwrap();
+      // Yank the directory before the guard's Drop fires.
+      std::fs::remove_dir_all(staging.path()).unwrap();
+      // Drop now runs `remove_dir_all` on a missing path → Err → warn arm.
+    }
+    std::fs::remove_dir_all(&parent).unwrap();
+  }
+
+  /// `StagingDir::create` against a NON-EXISTENT parent surfaces the hard
+  /// `create_dir` error arm (a `NotFound`, not `AlreadyExists`) as a typed
+  /// [`Error::FileIo`] with [`FileOp::Create`] naming the parent.
+  #[test]
+  fn staging_dir_create_errors_when_parent_missing() {
+    let parent = fresh_dir("staging_no_parent");
+    let missing = parent.join("does-not-exist");
+    // `missing` has no on-disk entry, so `create_dir(missing/.staging-*)`
+    // fails with NotFound (the non-AlreadyExists hard-error arm).
+    let err = StagingDir::create(&missing).unwrap_err();
+    let Error::FileIo(p) = err else {
+      panic!("expected Error::FileIo, got {err:?}");
+    };
+    assert_eq!(p.op(), FileOp::Create);
+    assert_eq!(p.path(), missing.as_path(), "payload names the parent");
+    assert_eq!(p.inner().kind(), std::io::ErrorKind::NotFound);
+    std::fs::remove_dir_all(&parent).unwrap();
+  }
+
+  // ─────────────────── remove_stale_reserved_path ───────────────────
+
+  /// A `NotFound` basename is a no-op (the normal absent case).
+  #[test]
+  fn remove_stale_reserved_path_absent_is_ok() {
+    let dir = fresh_dir("rsrp_absent");
+    let missing = dir.join("generation_config.json");
+    remove_stale_reserved_path(&missing, "generation_config.json").unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+  }
+
+  /// A regular stale file at a reserved basename is removed.
+  #[test]
+  fn remove_stale_reserved_path_removes_regular_file() {
+    let dir = fresh_dir("rsrp_file");
+    let path = dir.join("chat_template.jinja");
+    std::fs::write(&path, b"stale").unwrap();
+    assert!(path.is_file());
+    remove_stale_reserved_path(&path, "chat_template.jinja").unwrap();
+    assert!(!path.exists(), "stale regular file must be unlinked");
+    std::fs::remove_dir_all(&dir).unwrap();
+  }
+
+  /// A DIRECTORY at a reserved basename is rejected (NOT recursively
+  /// removed): a typed `LayerKeyed`-wrapped `InvariantViolation` naming the
+  /// path + the "directory" kind in the requirement string.
+  #[test]
+  fn remove_stale_reserved_path_rejects_directory() {
+    let dir = fresh_dir("rsrp_dir");
+    let path = dir.join("tokenizer_config.json");
+    std::fs::create_dir_all(&path).unwrap();
+    let err = remove_stale_reserved_path(&path, "tokenizer_config.json").unwrap_err();
+    let Error::LayerKeyed(payload) = err else {
+      panic!("expected Error::LayerKeyed, got {err:?}");
+    };
+    assert!(
+      payload.layer().contains("tokenizer_config.json"),
+      "carrier layer must name the offending basename; got {}",
+      payload.layer(),
+    );
+    let Error::InvariantViolation(inner) = payload.inner() else {
+      panic!("expected inner Error::InvariantViolation");
+    };
+    assert_eq!(inner.context(), "fuse: stale destination path");
+    assert!(
+      inner.requirement().contains("directory"),
+      "requirement must mark the kind as directory; got {}",
+      inner.requirement(),
+    );
+    // The directory must survive (the sweep refuses to remove it).
+    assert!(path.is_dir(), "directory must NOT be removed by the sweep");
+    std::fs::remove_dir_all(&dir).unwrap();
+  }
+
+  /// A SYMLINK at a reserved basename (regardless of target) is rejected —
+  /// `symlink_metadata` never follows, so the symlink itself is classified.
+  /// Covers the `is_symlink` kind arm.
+  #[cfg(unix)]
+  #[test]
+  fn remove_stale_reserved_path_rejects_symlink() {
+    let dir = fresh_dir("rsrp_symlink");
+    let target = dir.join("real_target_dir");
+    std::fs::create_dir_all(&target).unwrap();
+    let link = dir.join("special_tokens_map.json");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let err = remove_stale_reserved_path(&link, "special_tokens_map.json").unwrap_err();
+    let Error::LayerKeyed(payload) = err else {
+      panic!("expected Error::LayerKeyed, got {err:?}");
+    };
+    let Error::InvariantViolation(inner) = payload.inner() else {
+      panic!("expected inner Error::InvariantViolation");
+    };
+    assert!(
+      inner.requirement().contains("symlink"),
+      "requirement must mark the kind as symlink; got {}",
+      inner.requirement(),
+    );
+    // The symlink must survive (operator-visible boundary, not auto-removed).
+    assert!(
+      link.symlink_metadata().is_ok(),
+      "symlink must NOT be removed by the sweep",
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+  }
+
+  /// A FIFO (named pipe) at a reserved basename is the non-regular,
+  /// non-symlink, non-directory branch: rejected with the FIFO/socket/device
+  /// requirement string. Covers the `_ =>` kind fallback arms.
+  #[cfg(unix)]
+  #[test]
+  fn remove_stale_reserved_path_rejects_fifo() {
+    use std::ffi::CString;
+    let dir = fresh_dir("rsrp_fifo");
+    let path = dir.join("vocab.json");
+    let c = CString::new(path.as_os_str().to_str().unwrap()).unwrap();
+    // SAFETY: `c` is a valid NUL-terminated C string pointing at a path in
+    // a fresh scratch dir; 0o644 is a valid mode. mkfifo returns 0 on success.
+    let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
+    assert_eq!(rc, 0, "mkfifo must succeed for the fixture");
+    let err = remove_stale_reserved_path(&path, "vocab.json").unwrap_err();
+    let Error::LayerKeyed(payload) = err else {
+      panic!("expected Error::LayerKeyed, got {err:?}");
+    };
+    let Error::InvariantViolation(inner) = payload.inner() else {
+      panic!("expected inner Error::InvariantViolation");
+    };
+    assert!(
+      inner.requirement().contains("non-regular"),
+      "requirement must mark the FIFO as non-regular; got {}",
+      inner.requirement(),
+    );
+    let _ = std::fs::remove_file(&path);
+    std::fs::remove_dir_all(&dir).unwrap();
+  }
+
+  // ─────────────────── promote_staging_inner ───────────────────
+
+  /// `promote_staging_inner` renames every staged regular file into
+  /// `save_path`, leaves non-regular staged entries behind (the `is_file`
+  /// skip), and runs both stale-extras sweeps:
+  /// - a `TOKENIZER_EXTRA_FILES` member NOT carried by the snapshot is
+  ///   unlinked,
+  /// - a `*.py` NOT carried by the snapshot is unlinked,
+  /// - a `*.py` that IS carried by the snapshot survives (it was promoted),
+  /// - a non-family file (`config.json`) is left untouched.
+  #[test]
+  fn promote_staging_inner_promotes_and_sweeps() {
+    let save = fresh_dir("promote_inner");
+    let staging = save.join(".staging-fuse-test");
+    std::fs::create_dir_all(&staging).unwrap();
+
+    // Snapshot contents: a tokenizer file + a python extra.
+    std::fs::write(staging.join("tokenizer.json"), b"{}\n").unwrap();
+    std::fs::write(staging.join("keep_me.py"), b"# keep\n").unwrap();
+    // A non-regular staged entry (subdir) must be SKIPPED by the
+    // `!path.is_file()` guard, not promoted.
+    std::fs::create_dir_all(staging.join("a_subdir")).unwrap();
+
+    // Pre-existing destination state:
+    // - a stale TOKENIZER_EXTRA_FILES member the snapshot lacks → drop
+    std::fs::write(save.join("generation_config.json"), b"stale").unwrap();
+    // - a stale *.py the snapshot lacks → drop
+    std::fs::write(save.join("stale_mod.py"), b"# stale").unwrap();
+    // - a non-family file → untouched
+    std::fs::write(save.join("config.json"), b"{}\n").unwrap();
+
+    let warn = promote_staging_inner(&staging, &save).unwrap();
+    assert!(warn.is_none(), "no fsync fault injected → no warning");
+
+    // Promoted snapshot files now live at save_path.
+    assert!(save.join("tokenizer.json").is_file(), "tokenizer promoted");
+    assert!(
+      save.join("keep_me.py").is_file(),
+      "snapshot *.py promoted + survives the sweep",
+    );
+    // Stale extras the snapshot did not carry are swept.
+    assert!(
+      !save.join("generation_config.json").exists(),
+      "stale TOKENIZER_EXTRA_FILES member must be swept",
+    );
+    assert!(
+      !save.join("stale_mod.py").exists(),
+      "stale *.py must be swept",
+    );
+    // Non-family file untouched.
+    assert!(save.join("config.json").is_file(), "config.json untouched");
+    // The non-regular staged subdir was skipped, so it remains in staging.
+    assert!(
+      staging.join("a_subdir").is_dir(),
+      "non-regular staged entry must be skipped (left in staging)",
+    );
+    std::fs::remove_dir_all(&save).unwrap();
+  }
+
+  /// `promote_staging_inner` surfaces a `read_dir(staging)` failure as a
+  /// typed [`Error::FileIo`] with [`FileOp::Read`] when the staging path
+  /// does not exist.
+  #[test]
+  fn promote_staging_inner_read_dir_error() {
+    let save = fresh_dir("promote_inner_readdir");
+    let missing_staging = save.join(".staging-fuse-absent");
+    let err = promote_staging_inner(&missing_staging, &save).unwrap_err();
+    let Error::FileIo(p) = err else {
+      panic!("expected Error::FileIo, got {err:?}");
+    };
+    assert_eq!(p.op(), FileOp::Read);
+    assert_eq!(p.path(), missing_staging.as_path());
+    std::fs::remove_dir_all(&save).unwrap();
+  }
+
+  /// `promote_staging_inner` propagates a stale-sweep rejection: a
+  /// `TOKENIZER_EXTRA_FILES` member that is a DIRECTORY at `save_path` (and
+  /// not carried by the snapshot) fails promotion via
+  /// `remove_stale_reserved_path`.
+  #[test]
+  fn promote_staging_inner_rejects_stale_directory_member() {
+    let save = fresh_dir("promote_inner_dir_member");
+    let staging = save.join(".staging-fuse-test");
+    std::fs::create_dir_all(&staging).unwrap();
+    // Snapshot carries nothing matching the offending name.
+    std::fs::write(staging.join("tokenizer.json"), b"{}\n").unwrap();
+    // A stale TOKENIZER_EXTRA_FILES member that is a directory.
+    std::fs::create_dir_all(save.join("added_tokens.json")).unwrap();
+
+    let err = promote_staging_inner(&staging, &save).unwrap_err();
+    let Error::LayerKeyed(payload) = err else {
+      panic!("expected Error::LayerKeyed, got {err:?}");
+    };
+    assert!(payload.layer().contains("added_tokens.json"));
+    std::fs::remove_dir_all(&save).unwrap();
+  }
+
+  // ───────────── promote_staging_into_save_path ─────────────
+
+  /// The happy path: every staged file lands in `save_path` and the
+  /// now-empty staging dir is removed. Returns no warnings.
+  #[test]
+  fn promote_staging_into_save_path_success() {
+    let save = fresh_dir("promote_outer_ok");
+    let staging = StagingDir::create(&save).unwrap();
+    let staging_path = staging.path().to_path_buf();
+    std::fs::write(staging_path.join("tokenizer.json"), b"{}\n").unwrap();
+
+    let out = promote_staging_into_save_path(staging, &save).unwrap();
+    assert!(out.post_promote_file.is_none());
+    assert!(
+      save.join("tokenizer.json").is_file(),
+      "staged file promoted to save_path",
+    );
+    assert!(
+      !staging_path.exists(),
+      "empty staging dir removed on success",
+    );
+    std::fs::remove_dir_all(&save).unwrap();
+  }
+
+  /// On success with a STRAY non-regular entry left in staging (skipped by
+  /// the `is_file` guard), `remove_dir` (not `remove_dir_all`) fails with
+  /// `ENOTEMPTY`; the promotion still succeeds (the warning is best-effort)
+  /// and the destination is correct. Covers the `remove_dir` warning arm.
+  #[test]
+  fn promote_staging_into_save_path_warns_on_nonempty_staging() {
+    let save = fresh_dir("promote_outer_nonempty");
+    let staging = StagingDir::create(&save).unwrap();
+    let staging_path = staging.path().to_path_buf();
+    std::fs::write(staging_path.join("tokenizer.json"), b"{}\n").unwrap();
+    // A stray subdir is skipped by promote_staging_inner's is_file guard,
+    // so the success-path `remove_dir` sees a NON-empty staging dir → warns.
+    std::fs::create_dir_all(staging_path.join("stray_subdir")).unwrap();
+
+    let out = promote_staging_into_save_path(staging, &save).unwrap();
+    assert!(out.post_promote_file.is_none());
+    assert!(save.join("tokenizer.json").is_file(), "file still promoted");
+    // remove_dir refused the non-empty dir, so the stray dir survives.
+    assert!(
+      staging_path.join("stray_subdir").is_dir(),
+      "remove_dir leaves the non-empty staging dir in place (warn-only)",
+    );
+    std::fs::remove_dir_all(&save).unwrap();
+  }
+
+  // ─────────────────── reject_hub_url non-utf8 ───────────────────
+
+  /// A path whose bytes are not valid UTF-8 (`to_str()` → `None`) passes the
+  /// hub-URL check (it cannot be a hub URL), covering the early `Ok(())` arm.
+  #[cfg(unix)]
+  #[test]
+  fn reject_hub_url_passes_non_utf8_path() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+    let bytes = b"/tmp/\xff\xfe-not-utf8";
+    let p = Path::new(OsStr::from_bytes(bytes));
+    assert!(
+      reject_hub_url("model_path", p).is_ok(),
+      "non-utf8 path is not a hub URL → Ok",
+    );
+  }
+
+  // ─────────────── insert_base_linear / insert_base_embedding ───────────────
+
+  /// `insert_base_linear` for a Dense fused output writes `<path>.weight`
+  /// verbatim and, when present, `<path>.bias` — and writes NO `.scales` /
+  /// `.biases` (the dense output has no quantized siblings).
+  #[test]
+  fn insert_base_linear_dense_with_bias() {
+    let mut weights: Weights = std::collections::HashMap::new();
+    // [output_dims=2, input_dims=3]
+    let w = crate::Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
+    let b = crate::Array::from_slice::<f32>(&[10.0, 20.0], &(2usize,)).unwrap();
+    let fused = BaseLinear::dense(w, Some(b)).unwrap();
+
+    insert_base_linear(&mut weights, "model.layer", fused, false).unwrap();
+
+    let mut wt = weights
+      .remove("model.layer.weight")
+      .expect(".weight written");
+    assert_eq!(
+      wt.shape(),
+      vec![2, 3],
+      "weight shape preserved (no transpose)"
+    );
+    assert_eq!(
+      wt.to_vec::<f32>().unwrap(),
+      vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "weight bytes inserted verbatim",
+    );
+    let mut bias = weights.remove("model.layer.bias").expect(".bias written");
+    assert_eq!(bias.to_vec::<f32>().unwrap(), vec![10.0, 20.0]);
+    assert!(
+      !weights.contains_key("model.layer.scales"),
+      "dense output writes no .scales",
+    );
+    assert!(
+      !weights.contains_key("model.layer.biases"),
+      "dense output writes no .biases",
+    );
+  }
+
+  /// `insert_base_linear` with `fan_in_fan_out=true` transposes the dense
+  /// weight back to the persisted `[in_features, out_features]` orientation
+  /// before insertion. Closed-form oracle: a `[2, 3]` weight becomes `[3, 2]`
+  /// and element `(i, j)` maps to `(j, i)`.
+  #[test]
+  fn insert_base_linear_dense_fan_in_fan_out_transposes() {
+    let mut weights: Weights = std::collections::HashMap::new();
+    // canonical [out=2, in=3]:
+    //   [[1, 2, 3],
+    //    [4, 5, 6]]
+    let w = crate::Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
+    let fused = BaseLinear::dense(w, None).unwrap();
+
+    insert_base_linear(&mut weights, "ffn", fused, true).unwrap();
+
+    let wt = weights.remove("ffn.weight").expect(".weight written");
+    assert_eq!(
+      wt.shape(),
+      vec![3, 2],
+      "fan_in_fan_out transposes [out, in] → [in, out]",
+    );
+    // `transpose()` yields a STRIDED view; materialize it before `to_vec`
+    // (a strided read would error `NonContiguous`). Transpose of the above
+    // is [[1,4],[2,5],[3,6]] in row-major.
+    let mut wt_c = crate::ops::shape::contiguous(&wt, false).unwrap();
+    assert_eq!(
+      wt_c.to_vec::<f32>().unwrap(),
+      vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0],
+      "transposed weight bytes match the hand-computed Wᵀ",
+    );
+    assert!(!weights.contains_key("ffn.bias"), "no bias inserted");
+  }
+
+  /// `insert_base_linear` for a Quantized fused output writes the full
+  /// `(weight, scales, biases)` triple plus the optional output bias. The
+  /// `affine` mode requires `quant_biases`, so all four keys land.
+  #[test]
+  fn insert_base_linear_quantized_full_triple() {
+    let mut weights: Weights = std::collections::HashMap::new();
+    // Shapes are irrelevant to the insert (no eval / no validation in the
+    // insert path); `BaseLinear::quantized` only checks mode/arity/bits.
+    let w = crate::Array::from_slice::<u32>(&[0u32, 1, 2, 3], &(2, 2)).unwrap();
+    let scales = crate::Array::from_slice::<f32>(&[0.5, 0.25], &(2usize,)).unwrap();
+    let qb = crate::Array::from_slice::<f32>(&[1.0, 2.0], &(2usize,)).unwrap();
+    let bias = crate::Array::from_slice::<f32>(&[7.0, 8.0], &(2usize,)).unwrap();
+    let fused =
+      BaseLinear::quantized(w, scales, Some(qb), Some(bias), 32, 8, "affine".to_string()).unwrap();
+
+    insert_base_linear(&mut weights, "attn", fused, false).unwrap();
+
+    assert!(weights.contains_key("attn.weight"), ".weight written");
+    assert!(weights.contains_key("attn.scales"), ".scales written");
+    assert!(
+      weights.contains_key("attn.biases"),
+      ".biases (quant_biases) written",
+    );
+    let mut bias = weights.remove("attn.bias").expect(".bias written");
+    assert_eq!(bias.to_vec::<f32>().unwrap(), vec![7.0, 8.0]);
+  }
+
+  /// `insert_base_embedding` writes just the `[num_embeddings, dims]` weight
+  /// under `<path>.weight` (dense-only; no bias / quantized siblings).
+  #[test]
+  fn insert_base_embedding_writes_weight_only() {
+    let mut weights: Weights = std::collections::HashMap::new();
+    let w = crate::Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+    let fused = BaseEmbedding::dense(w).unwrap();
+
+    insert_base_embedding(&mut weights, "tok_emb", fused);
+
+    let mut wt = weights.remove("tok_emb.weight").expect(".weight written");
+    assert_eq!(wt.shape(), vec![2, 2]);
+    assert_eq!(wt.to_vec::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(weights.len(), 0, "embedding writes ONLY the .weight key");
+  }
+
+  // ─────────────────── apply_fuse_to_weights (embedding path) ───────────────────
+
+  /// `apply_fuse_to_weights` for a `LoraLayer::DoraEmbedding` routes through
+  /// `fuse_embedding` + `insert_base_embedding`: it drops the pre-existing
+  /// `.weight` / `.scales` / `.biases` / `.bias` entries for `path` and
+  /// writes a fresh `.weight`. Structural oracle (key presence) — the
+  /// numerical DoRA-embedding fuse correctness is covered by
+  /// `dora_embedding_fuse_round_trip` in the lora tests; here we only assert
+  /// the weight-map rewrite contract of the embedding dispatch arm.
+  #[test]
+  fn apply_fuse_to_weights_embedding_rewrites_weight_and_drops_siblings() {
+    let num_embeddings = 3usize;
+    let dims = 3usize;
+    let r = 2usize;
+    let weight = crate::Array::from_slice::<f32>(
+      &[1.0, 0.5, 0.0, 0.0, 1.0, 0.5, 0.5, 0.0, 1.0],
+      &(num_embeddings, dims),
+    )
+    .unwrap();
+    let base = BaseEmbedding::dense(weight).unwrap();
+    let lora_a =
+      crate::Array::from_slice::<f32>(&[0.1, 0.0, 0.0, 0.1, 0.1, 0.1], &(num_embeddings, r))
+        .unwrap();
+    let lora_b =
+      crate::Array::from_slice::<f32>(&[0.2, 0.0, 0.1, 0.0, 0.1, 0.2], &(r, dims)).unwrap();
+    let m = crate::Array::from_slice::<f32>(&[1.5, 2.0, 1.2], &(num_embeddings,)).unwrap();
+    let params = lora::AdapterParams {
+      lora_a,
+      lora_b,
+      magnitude: Some(m),
+    };
+    let layer = LoraLayer::DoraEmbedding(lora::DoRAEmbedding::new(base, params, 2.0).unwrap());
+
+    let mut weights: Weights = std::collections::HashMap::new();
+    // Seed stale siblings the dispatch must drop (a quantized source that is
+    // now dense): .weight + .scales + .biases + .bias.
+    let path = "model.embed_tokens";
+    weights.insert(
+      format!("{path}.weight"),
+      crate::Array::from_slice::<f32>(&[0.0], &(1usize,)).unwrap(),
+    );
+    weights.insert(
+      format!("{path}.scales"),
+      crate::Array::from_slice::<f32>(&[0.0], &(1usize,)).unwrap(),
+    );
+    weights.insert(
+      format!("{path}.biases"),
+      crate::Array::from_slice::<f32>(&[0.0], &(1usize,)).unwrap(),
+    );
+    weights.insert(
+      format!("{path}.bias"),
+      crate::Array::from_slice::<f32>(&[0.0], &(1usize,)).unwrap(),
+    );
+
+    // `fan_in_fan_out` is ignored on the embedding path; pass true to prove it.
+    apply_fuse_to_weights(&mut weights, path, &layer, false, true).unwrap();
+
+    assert!(
+      weights.contains_key(&format!("{path}.weight")),
+      "fused embedding weight written",
+    );
+    // The fused embedding output keeps its [num_embeddings, dims] shape.
+    // `shape()` is `&self` (no eval), so the fused weight need not be
+    // materialized here — the numerical correctness lives in the lora tests.
+    let wt = weights.remove(&format!("{path}.weight")).unwrap();
+    assert_eq!(
+      wt.shape(),
+      vec![num_embeddings, dims],
+      "fused embedding weight is [num_embeddings, dims]",
+    );
+    assert!(
+      !weights.contains_key(&format!("{path}.scales")),
+      "stale .scales dropped on the dense embedding output",
+    );
+    assert!(
+      !weights.contains_key(&format!("{path}.biases")),
+      "stale .biases dropped",
+    );
+    assert!(
+      !weights.contains_key(&format!("{path}.bias")),
+      "stale .bias dropped (embedding has no bias)",
+    );
   }
 }

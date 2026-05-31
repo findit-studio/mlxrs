@@ -753,3 +753,309 @@ fn inferred_dim_overflow_errors() {
     other => panic!("expected ArithmeticOverflow, got {other:?}"),
   }
 }
+
+// ─── accessor coverage (weight_ref / bias_ref) ───
+
+/// `RMSNorm::weight_ref` returns a borrow of the installed weight (lazy,
+/// no eval). Pins the read path goes through the accessor (the field is
+/// private). The `Array` is already materialized — `shape()` does not
+/// evaluate.
+#[test]
+fn rms_norm_weight_ref_returns_installed_weight() {
+  let w = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(3,)).unwrap();
+  let rn = RMSNorm::new(w, 1e-5);
+  let got = rn.weight_ref();
+  assert_eq!(got.shape(), vec![3]);
+  // The borrowed handle is the same weight we can read back element-wise.
+  let mut got = got.try_clone().unwrap();
+  assert_eq!(got.to_vec::<f32>().unwrap(), vec![1.0, 2.0, 3.0]);
+}
+
+/// `LayerNorm::weight_ref` is `Some(&weight)` when affine weight is
+/// installed and `None` when it is absent (the `affine=false` arm).
+#[test]
+fn layer_norm_weight_ref_some_and_none() {
+  // Present: weight installed ⇒ Some(&weight), borrow exposes the values.
+  let w = Array::from_slice::<f32>(&[2.0, 2.0, 2.0, 2.0], &(4,)).unwrap();
+  let ln = LayerNorm::new(Some(w), None, 1e-5);
+  let got = ln.weight_ref().expect("weight installed ⇒ Some");
+  assert_eq!(got.shape(), vec![4]);
+  let mut got = got.try_clone().unwrap();
+  assert_eq!(got.to_vec::<f32>().unwrap(), vec![2.0; 4]);
+  // Absent: no weight ⇒ None.
+  let plain = LayerNorm::new(None, None, 1e-5);
+  assert!(plain.weight_ref().is_none());
+}
+
+/// `LayerNorm::bias_ref` is `Some(&bias)` when affine bias is installed
+/// and `None` when it is absent.
+#[test]
+fn layer_norm_bias_ref_some_and_none() {
+  // Present: bias installed ⇒ Some(&bias).
+  let b = Array::from_slice::<f32>(&[1.0, 1.0, 1.0, 1.0], &(4,)).unwrap();
+  let ln = LayerNorm::new(None, Some(b), 1e-5);
+  let got = ln.bias_ref().expect("bias installed ⇒ Some");
+  assert_eq!(got.shape(), vec![4]);
+  let mut got = got.try_clone().unwrap();
+  assert_eq!(got.to_vec::<f32>().unwrap(), vec![1.0; 4]);
+  // Absent: no bias ⇒ None.
+  let plain = LayerNorm::new(None, None, 1e-5);
+  assert!(plain.bias_ref().is_none());
+}
+
+// ─── validate_input_shape branch coverage ───
+
+/// `validate_input_shape` rejects a feature (last) axis past `i32::MAX`
+/// with `ArithmeticOverflow` BEFORE the dims-equality comparison (the
+/// `i32::try_from(dims)` map_err). Pure integer logic — exercised by
+/// feeding the private method a synthetic shape directly (no MLX array,
+/// which could never allocate `i32::MAX + 1` elements anyway). Built on
+/// a validly-constructed GroupNorm so the call site is the real method.
+#[test]
+fn validate_input_shape_feature_dim_overflow_errors() {
+  let gn = GroupNorm::new(2, 4, 1e-5, false, false).unwrap();
+  let big = (i32::MAX as usize) + 1;
+  let err = gn.validate_input_shape(&[2, big]).unwrap_err();
+  match err {
+    crate::error::Error::ArithmeticOverflow(payload) => {
+      assert!(
+        payload.context().contains("feature dim"),
+        "unexpected context: {:?}",
+        payload.context()
+      );
+      assert_eq!(payload.op_type(), "i32");
+      assert_eq!(payload.operands(), &[("dim", big as u64)]);
+    }
+    other => panic!("expected ArithmeticOverflow, got {other:?}"),
+  }
+}
+
+/// `validate_input_shape`'s divisibility check (`dims_i32 %
+/// self.num_groups != 0`) is documented as belt-and-suspenders —
+/// unreachable through the public constructors (which enforce `dims %
+/// num_groups == 0`). To exercise it we build a `GroupNorm` via a
+/// struct literal with a deliberately broken invariant (`dims = 4` NOT
+/// divisible by `num_groups = 3`) — possible only because the test
+/// module is a child of `norm` and so can name the private fields. The
+/// input's last axis (4) equals the configured `dims` (4), so the
+/// dims-equality check passes and control reaches the divisibility arm:
+/// `4 % 3 != 0` ⇒ `DivisibilityConstraint`.
+#[test]
+fn validate_input_shape_divisibility_belt_and_suspenders() {
+  let gn = GroupNorm {
+    num_groups: 3,
+    dims: 4,
+    affine: None,
+    eps: 1e-5,
+    pytorch_compatible: false,
+  };
+  let err = gn.validate_input_shape(&[1, 4]).unwrap_err();
+  match err {
+    crate::error::Error::DivisibilityConstraint(payload) => {
+      assert_eq!(payload.name_dividend(), "feature_dim");
+      assert_eq!(payload.dividend(), 4);
+      assert_eq!(payload.name_divisor(), "num_groups");
+      assert_eq!(payload.divisor(), 3);
+    }
+    other => panic!("expected DivisibilityConstraint, got {other:?}"),
+  }
+}
+
+// ─── shape_to_i32 overflow ───
+
+/// `shape_to_i32` errors with `ArithmeticOverflow` on a `usize` dim past
+/// `i32::MAX`. Pure function over a slice — no MLX. Operand carries the
+/// offending dim value.
+#[test]
+fn shape_to_i32_overflow_errors() {
+  let big = (i32::MAX as usize) + 1;
+  let err = shape_to_i32(&[2, big]).unwrap_err();
+  match err {
+    crate::error::Error::ArithmeticOverflow(payload) => {
+      assert!(
+        payload.context().contains("exceeds i32::MAX"),
+        "unexpected context: {:?}",
+        payload.context()
+      );
+      assert_eq!(payload.op_type(), "i32");
+      assert_eq!(payload.operands(), &[("dim", big as u64)]);
+    }
+    other => panic!("expected ArithmeticOverflow, got {other:?}"),
+  }
+}
+
+/// A well-formed shape round-trips through `shape_to_i32` unchanged
+/// (the success arm of the `try_from` collect).
+#[test]
+fn shape_to_i32_ok_roundtrip() {
+  assert_eq!(shape_to_i32(&[2, 3, 4]).unwrap(), vec![2i32, 3, 4]);
+}
+
+// ─── batch_dim branches ───
+
+/// `batch_dim` of a rank-0 (empty) shape errors with `RankMismatch`
+/// (`first()` is `None`). Pure function — no MLX.
+#[test]
+fn batch_dim_rank0_errors() {
+  let err = batch_dim(&[]).unwrap_err();
+  match err {
+    crate::error::Error::RankMismatch(payload) => {
+      assert!(
+        payload.context().contains("rank >= 1"),
+        "unexpected context: {:?}",
+        payload.context()
+      );
+      assert_eq!(payload.actual(), 0);
+      assert_eq!(payload.actual_shape(), &[] as &[usize]);
+    }
+    other => panic!("expected RankMismatch, got {other:?}"),
+  }
+}
+
+/// `batch_dim` errors with `ArithmeticOverflow` when the leading dim is
+/// past `i32::MAX` (the `i32::try_from(b)` map_err). Pure function.
+#[test]
+fn batch_dim_overflow_errors() {
+  let big = (i32::MAX as usize) + 1;
+  let err = batch_dim(&[big, 3]).unwrap_err();
+  match err {
+    crate::error::Error::ArithmeticOverflow(payload) => {
+      assert!(
+        payload.context().contains("batch dim exceeds i32::MAX"),
+        "unexpected context: {:?}",
+        payload.context()
+      );
+      assert_eq!(payload.op_type(), "i32");
+      assert_eq!(payload.operands(), &[("batch_dim", big as u64)]);
+    }
+    other => panic!("expected ArithmeticOverflow, got {other:?}"),
+  }
+}
+
+/// `batch_dim` of a well-formed shape returns the leading dim as `i32`
+/// (the success arm).
+#[test]
+fn batch_dim_ok() {
+  assert_eq!(batch_dim(&[7, 2, 5]).unwrap(), 7i32);
+}
+
+// ─── inferred_dim remaining branches ───
+
+/// `inferred_dim` rejects a negative `known_dims` entry with `OutOfRange`
+/// (the `usize::try_from(d)` map_err). Pure function — `[4]` reshaped
+/// with a `-1` literal known dim (distinct from mlx's `-1` sentinel,
+/// which the safe layer resolves numerically, never passing it here).
+#[test]
+fn inferred_dim_negative_known_dim_errors() {
+  let err = inferred_dim(&[4], &[-1]).unwrap_err();
+  match err {
+    crate::error::Error::OutOfRange(payload) => {
+      assert!(
+        payload.context().contains("known reshape dim"),
+        "unexpected context: {:?}",
+        payload.context()
+      );
+      assert!(
+        payload.requirement().contains("non-negative"),
+        "unexpected requirement: {:?}",
+        payload.requirement()
+      );
+      assert_eq!(payload.value(), "-1");
+    }
+    other => panic!("expected OutOfRange, got {other:?}"),
+  }
+}
+
+/// `inferred_dim` errors with `ArithmeticOverflow` when the PRODUCT of
+/// `known_dims` overflows `usize` (the divisor `checked_mul`). The
+/// `shape` product (total = 1) is kept tiny so it does not overflow
+/// first; three `i32::MAX` factors overflow on the third multiply
+/// (`i32::MAX^2 ≈ 4.6e18 < usize::MAX`, `* i32::MAX` overflows). Pure
+/// function — distinct from the existing `inferred_dim_overflow_errors`,
+/// which exercises the `shape`-product (total) overflow instead.
+#[test]
+fn inferred_dim_divisor_product_overflow_errors() {
+  let err = inferred_dim(&[1], &[i32::MAX, i32::MAX, i32::MAX]).unwrap_err();
+  match err {
+    crate::error::Error::ArithmeticOverflow(payload) => {
+      assert!(
+        payload.context().contains("divisor product"),
+        "unexpected context: {:?}",
+        payload.context()
+      );
+      assert_eq!(payload.op_type(), "usize");
+    }
+    other => panic!("expected ArithmeticOverflow, got {other:?}"),
+  }
+}
+
+/// `inferred_dim` errors with `InvariantViolation` when a `known_dims`
+/// entry is `0` (the divisor collapses to 0). Pure function — `[4]`
+/// reshaped against a known dim of `0`.
+#[test]
+fn inferred_dim_zero_divisor_errors() {
+  let err = inferred_dim(&[4], &[0]).unwrap_err();
+  match err {
+    crate::error::Error::InvariantViolation(payload) => {
+      assert!(
+        payload.context().contains("reshape divisor"),
+        "unexpected context: {:?}",
+        payload.context()
+      );
+      assert!(
+        payload.requirement().contains("non-zero"),
+        "unexpected requirement: {:?}",
+        payload.requirement()
+      );
+    }
+    other => panic!("expected InvariantViolation, got {other:?}"),
+  }
+}
+
+/// `inferred_dim` errors with `DivisibilityConstraint` when `total` is
+/// not an exact multiple of the divisor (`5 % 2 != 0`). Pure function.
+#[test]
+fn inferred_dim_not_multiple_errors() {
+  let err = inferred_dim(&[5], &[2]).unwrap_err();
+  match err {
+    crate::error::Error::DivisibilityConstraint(payload) => {
+      assert_eq!(payload.name_dividend(), "total_elements");
+      assert_eq!(payload.dividend(), 5);
+      assert_eq!(payload.name_divisor(), "divisor_per_slot");
+      assert_eq!(payload.divisor(), 2);
+    }
+    other => panic!("expected DivisibilityConstraint, got {other:?}"),
+  }
+}
+
+/// `inferred_dim` errors with `ArithmeticOverflow` when the resolved
+/// quotient (`total / divisor`) exceeds `i32::MAX` (the final
+/// `i32::try_from(inferred)` map_err). `total = i32::MAX + 1` with a
+/// divisor of `1` ⇒ the quotient is one past `i32::MAX`. Pure function.
+#[test]
+fn inferred_dim_result_overflow_errors() {
+  let big = (i32::MAX as usize) + 1;
+  let err = inferred_dim(&[big], &[1]).unwrap_err();
+  match err {
+    crate::error::Error::ArithmeticOverflow(payload) => {
+      assert!(
+        payload.context().contains("inferred dim exceeds i32::MAX"),
+        "unexpected context: {:?}",
+        payload.context()
+      );
+      assert_eq!(payload.op_type(), "i32");
+      assert_eq!(payload.operands(), &[("inferred_dim", big as u64)]);
+    }
+    other => panic!("expected ArithmeticOverflow, got {other:?}"),
+  }
+}
+
+/// `inferred_dim` happy path: `total = product(shape)` divided by
+/// `product(known_dims)` yields the residual `-1`-replacement dim. For
+/// `shape = [2, 12]` (total 24) and `known_dims = [2, 3]` (divisor 6),
+/// the inferred middle dim is `24 / 6 = 4`. Pure function — pins the
+/// success arm independently of any reshape.
+#[test]
+fn inferred_dim_happy_path() {
+  assert_eq!(inferred_dim(&[2, 12], &[2, 3]).unwrap(), 4i32);
+}

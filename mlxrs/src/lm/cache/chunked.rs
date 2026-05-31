@@ -780,3 +780,6 @@ impl KvCache for ChunkedKvCache {
     Ok(())
   }
 }
+
+#[cfg(test)]
+mod tests;

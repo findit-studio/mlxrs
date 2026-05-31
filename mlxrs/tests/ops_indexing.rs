@@ -388,3 +388,367 @@ fn gather_rejects_bool_index() {
     other => panic!("expected InvariantViolation for bool index (gather), got {other:?}"),
   }
 }
+
+// ===========================================================================
+// Multi-axis scatter reduce family — `scatter_add` / `scatter_max` /
+// `scatter_min` / `scatter_prod`. Each delegates to `scatter_multi` with a
+// distinct reduce mode. All four use a 4-element 1-D source and a SINGLE
+// non-duplicate scatter location, so the result at that location is
+// unambiguously `reduce(existing, update)` (no duplicate-accumulation to
+// reason about) and every other element is unchanged. `updates` shape mirrors
+// `scatter_overwrites_block`: indices.shape (=[1]) ++ a per-location block
+// (=[1] scalar for a 1-D source) -> [1, 1].
+// ===========================================================================
+
+#[test]
+fn scatter_add_multi_axis_sums_at_location() {
+  // existing[2] = 30; scatter-add 5 at location 2 -> 35; others unchanged.
+  let a = Array::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[2], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[5.0], &[1i32, 1]).unwrap();
+  let mut r = ops::indexing::scatter_add(&a, &[&idx], &upd, &[0]).unwrap();
+  assert_eq!(r.shape(), vec![4]);
+  assert_eq!(r.to_vec::<f32>().unwrap(), vec![10.0, 20.0, 35.0, 40.0]);
+}
+
+#[test]
+fn scatter_max_multi_axis_keeps_larger() {
+  // location 1: max(20, 99) = 99 (update wins). location 3 left untouched so
+  // we also confirm a non-updated cell keeps its larger original.
+  let a = Array::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[1], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[99.0], &[1i32, 1]).unwrap();
+  let mut r = ops::indexing::scatter_max(&a, &[&idx], &upd, &[0]).unwrap();
+  assert_eq!(r.shape(), vec![4]);
+  assert_eq!(r.to_vec::<f32>().unwrap(), vec![10.0, 99.0, 30.0, 40.0]);
+}
+
+#[test]
+fn scatter_max_multi_axis_keeps_original_when_update_smaller() {
+  // location 1: max(20, 5) = 20 (existing wins); the reduce is a true max.
+  let a = Array::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[1], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[5.0], &[1i32, 1]).unwrap();
+  let mut r = ops::indexing::scatter_max(&a, &[&idx], &upd, &[0]).unwrap();
+  assert_eq!(r.to_vec::<f32>().unwrap(), vec![10.0, 20.0, 30.0, 40.0]);
+}
+
+#[test]
+fn scatter_min_multi_axis_keeps_smaller() {
+  // location 2: min(30, 7) = 7 (update wins); others unchanged.
+  let a = Array::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[2], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[7.0], &[1i32, 1]).unwrap();
+  let mut r = ops::indexing::scatter_min(&a, &[&idx], &upd, &[0]).unwrap();
+  assert_eq!(r.shape(), vec![4]);
+  assert_eq!(r.to_vec::<f32>().unwrap(), vec![10.0, 20.0, 7.0, 40.0]);
+}
+
+#[test]
+fn scatter_prod_multi_axis_multiplies_at_location() {
+  // location 3: 40 * 2 = 80 (Prod reduce); others unchanged.
+  let a = Array::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[3], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[2.0], &[1i32, 1]).unwrap();
+  let mut r = ops::indexing::scatter_prod(&a, &[&idx], &upd, &[0]).unwrap();
+  assert_eq!(r.shape(), vec![4]);
+  assert_eq!(r.to_vec::<f32>().unwrap(), vec![10.0, 20.0, 30.0, 80.0]);
+}
+
+// ===========================================================================
+// Multi-axis scatter reduce family — typed-error guards (no GPU needed). Each
+// public reduce wrapper threads its own `context` label through `scatter_multi`,
+// so cover the `indices.len() != axes.len()` LengthMismatch branch for each of
+// the four reduce variants (the equality guard runs before any FFI / index
+// vector allocation, so these stay pure validation paths).
+// ===========================================================================
+
+#[test]
+fn scatter_add_rejects_indices_axes_length_mismatch() {
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let idx = Array::from_slice::<i32>(&[0], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[9.0], &[1i32, 1, 1]).unwrap();
+  let r = ops::indexing::scatter_add(&a, &[&idx], &upd, &[0, 1]);
+  assert!(
+    matches!(
+      r,
+      Err(mlxrs::Error::LengthMismatch(ref p))
+        if p.context() == "scatter_add: indices.len() vs axes.len()"
+          && p.expected() == 2
+          && p.actual() == 1
+    ),
+    "expected LengthMismatch; got {r:?}"
+  );
+}
+
+#[test]
+fn scatter_max_rejects_indices_axes_length_mismatch() {
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let idx = Array::from_slice::<i32>(&[0], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[9.0], &[1i32, 1, 1]).unwrap();
+  let r = ops::indexing::scatter_max(&a, &[&idx], &upd, &[0, 1]);
+  assert!(
+    matches!(
+      r,
+      Err(mlxrs::Error::LengthMismatch(ref p))
+        if p.context() == "scatter_max: indices.len() vs axes.len()"
+          && p.expected() == 2
+          && p.actual() == 1
+    ),
+    "expected LengthMismatch; got {r:?}"
+  );
+}
+
+#[test]
+fn scatter_min_rejects_indices_axes_length_mismatch() {
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let idx = Array::from_slice::<i32>(&[0], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[9.0], &[1i32, 1, 1]).unwrap();
+  let r = ops::indexing::scatter_min(&a, &[&idx], &upd, &[0, 1]);
+  assert!(
+    matches!(
+      r,
+      Err(mlxrs::Error::LengthMismatch(ref p))
+        if p.context() == "scatter_min: indices.len() vs axes.len()"
+          && p.expected() == 2
+          && p.actual() == 1
+    ),
+    "expected LengthMismatch; got {r:?}"
+  );
+}
+
+#[test]
+fn scatter_prod_rejects_indices_axes_length_mismatch() {
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let idx = Array::from_slice::<i32>(&[0], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[9.0], &[1i32, 1, 1]).unwrap();
+  let r = ops::indexing::scatter_prod(&a, &[&idx], &upd, &[0, 1]);
+  assert!(
+    matches!(
+      r,
+      Err(mlxrs::Error::LengthMismatch(ref p))
+        if p.context() == "scatter_prod: indices.len() vs axes.len()"
+          && p.expected() == 2
+          && p.actual() == 1
+    ),
+    "expected LengthMismatch; got {r:?}"
+  );
+}
+
+// ===========================================================================
+// Single-axis scatter reduce family — `scatter_max_single` /
+// `scatter_min_single` / `scatter_prod_single` (mirrors `scatter_add_single`).
+// Each is a thin `scatter_single` dispatch with a distinct reduce mode. 1-D
+// source, single non-duplicate location, `updates` shape = indices.shape (=[1])
+// ++ scalar block (=[1]) -> [1].
+// ===========================================================================
+
+#[test]
+fn scatter_max_single_keeps_larger() {
+  // location 1: max(20, 99) = 99; others unchanged.
+  let a = Array::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0, 50.0], &[5i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[1], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[99.0], &[1i32, 1]).unwrap();
+  let mut r = ops::indexing::scatter_max_single(&a, &idx, &upd, 0).unwrap();
+  assert_eq!(r.shape(), vec![5]);
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    vec![10.0, 99.0, 30.0, 40.0, 50.0]
+  );
+}
+
+#[test]
+fn scatter_min_single_keeps_smaller() {
+  // location 3: min(40, 4) = 4; others unchanged.
+  let a = Array::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0, 50.0], &[5i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[3], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[4.0], &[1i32, 1]).unwrap();
+  let mut r = ops::indexing::scatter_min_single(&a, &idx, &upd, 0).unwrap();
+  assert_eq!(r.shape(), vec![5]);
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    vec![10.0, 20.0, 30.0, 4.0, 50.0]
+  );
+}
+
+#[test]
+fn scatter_prod_single_multiplies_at_location() {
+  // location 2: 30 * 3 = 90; others unchanged.
+  let a = Array::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0, 50.0], &[5i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[2], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[3.0], &[1i32, 1]).unwrap();
+  let mut r = ops::indexing::scatter_prod_single(&a, &idx, &upd, 0).unwrap();
+  assert_eq!(r.shape(), vec![5]);
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    vec![10.0, 20.0, 90.0, 40.0, 50.0]
+  );
+}
+
+// ===========================================================================
+// slice-update reduce family — `slice_update_max` / `slice_update_min` /
+// `slice_update_prod` (mirrors `slice_update` / `slice_update_add`). Each is a
+// thin `slice_update_impl` dispatch with a distinct reduce mode; exercise the
+// method-form bridge with an element-exact closed-form on a 2x3 matrix where a
+// single cell [0:1, 1:2] is the targeted region.
+// ===========================================================================
+
+#[test]
+fn slice_update_max_keeps_larger_in_region() {
+  // cell [0,1] = 2; max(2, 50) = 50 (update wins); everything else unchanged.
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
+  let upd = Array::from_slice::<f32>(&[50.0], &(1, 1)).unwrap();
+  let mut r = a.slice_update_max(&upd, &[0, 1], &[1, 2], &[1, 1]).unwrap();
+  assert_eq!(r.shape(), vec![2, 3]);
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    vec![1.0, 50.0, 3.0, 4.0, 5.0, 6.0]
+  );
+}
+
+#[test]
+fn slice_update_max_keeps_original_when_update_smaller() {
+  // cell [0,1] = 2; max(2, 0) = 2 (existing wins); confirms a true max, not an
+  // overwrite. The whole matrix is unchanged.
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
+  let upd = Array::from_slice::<f32>(&[0.0], &(1, 1)).unwrap();
+  let mut r = a.slice_update_max(&upd, &[0, 1], &[1, 2], &[1, 1]).unwrap();
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+  );
+}
+
+#[test]
+fn slice_update_min_keeps_smaller_in_region() {
+  // cell [1,2] = 6; min(6, 1) = 1 (update wins); everything else unchanged.
+  // Region is [1:2, 2:3] (row 1, col 2).
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
+  let upd = Array::from_slice::<f32>(&[1.0], &(1, 1)).unwrap();
+  let mut r = a.slice_update_min(&upd, &[1, 2], &[2, 3], &[1, 1]).unwrap();
+  assert_eq!(r.shape(), vec![2, 3]);
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    vec![1.0, 2.0, 3.0, 4.0, 5.0, 1.0]
+  );
+}
+
+#[test]
+fn slice_update_prod_multiplies_region() {
+  // cell [1,0] = 4; 4 * 10 = 40 (Prod reduce); everything else unchanged.
+  // Region is [1:2, 0:1] (row 1, col 0).
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
+  let upd = Array::from_slice::<f32>(&[10.0], &(1, 1)).unwrap();
+  let mut r = a
+    .slice_update_prod(&upd, &[1, 0], &[2, 1], &[1, 1])
+    .unwrap();
+  assert_eq!(r.shape(), vec![2, 3]);
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    vec![1.0, 2.0, 3.0, 40.0, 5.0, 6.0]
+  );
+}
+
+// ===========================================================================
+// slice-update reduce family — typed-error guards through `slice_update_impl`.
+// The reduce variants each pass their own `context_multi` / `context_len`
+// labels, so cover BOTH length-guard branches (start/stop/strides unequal
+// lengths -> MultiLengthMismatch; equal-but-wrong-rank vs src.ndim() ->
+// LengthMismatch) for one representative reduce variant. These are pure
+// validation (no FFI), and the label assertions pin which wrapper is dispatching.
+// ===========================================================================
+
+#[test]
+fn slice_update_max_rejects_unequal_index_lengths() {
+  // start/stop/strides not all the same length -> MultiLengthMismatch before
+  // any rank or FFI check.
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let upd = Array::from_slice::<f32>(&[0.0], &(1, 1)).unwrap();
+  // start len 2, stop len 1, strides len 2.
+  let r = ops::indexing::slice_update_max(&a, &upd, &[0, 0], &[1], &[1, 1]);
+  match r {
+    Err(mlxrs::Error::MultiLengthMismatch(p)) => {
+      assert_eq!(p.context(), "slice_update_max: start/stop/strides");
+      assert_eq!(
+        p.lengths(),
+        &[("start", 2usize), ("stop", 1usize), ("strides", 2usize)]
+      );
+    }
+    other => panic!("expected MultiLengthMismatch (slice_update_max), got {other:?}"),
+  }
+}
+
+#[test]
+fn slice_update_min_rejects_rank_mismatch() {
+  // start/stop/strides all the same length (1) but != src.ndim() (2) ->
+  // LengthMismatch. This is the second guard branch in `slice_update_impl`,
+  // reached only after the equal-length check passes.
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let upd = Array::from_slice::<f32>(&[0.0], &(1, 1)).unwrap();
+  let r = ops::indexing::slice_update_min(&a, &upd, &[0], &[1], &[1]);
+  assert!(
+    matches!(
+      r,
+      Err(mlxrs::Error::LengthMismatch(ref p))
+        if p.context() == "slice_update_min: start/stop/strides length"
+          && p.expected() == 2
+          && p.actual() == 1
+    ),
+    "expected LengthMismatch (slice_update_min); got {r:?}"
+  );
+}
+
+#[test]
+fn slice_update_prod_rejects_rank_mismatch() {
+  // Same rank-mismatch branch via the prod variant, pinning its distinct
+  // `context_len` label.
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let upd = Array::from_slice::<f32>(&[0.0], &(1, 1)).unwrap();
+  let r = ops::indexing::slice_update_prod(&a, &upd, &[0], &[1], &[1]);
+  assert!(
+    matches!(
+      r,
+      Err(mlxrs::Error::LengthMismatch(ref p))
+        if p.context() == "slice_update_prod: start/stop/strides length"
+          && p.expected() == 2
+          && p.actual() == 1
+    ),
+    "expected LengthMismatch (slice_update_prod); got {r:?}"
+  );
+}
+
+// ===========================================================================
+// slice_update_dynamic — runtime data-dependent offset form. `start` is an
+// integer ARRAY of per-`axes` offsets; the placed region's extent matches
+// `update`'s shape (mlx `slice_update(src, update, start, axes)`). Use an
+// `update` whose ndim equals `src.ndim()` so the broadcast/min logic in mlx
+// `ops.cpp` is an identity, making the placement an exact overwrite.
+// ===========================================================================
+
+#[test]
+fn slice_update_dynamic_overwrites_at_runtime_offset() {
+  // 1-D src [10,20,30,40,50]; place [7,8] at runtime offset start=[2] along
+  // axis 0 -> overwrite positions 2,3 -> [10,20,7,8,50].
+  let src = Array::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0, 50.0], &[5i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[7.0, 8.0], &[2i32]).unwrap();
+  let start = Array::from_slice::<i32>(&[2], &[1i32]).unwrap();
+  let mut r = ops::indexing::slice_update_dynamic(&src, &upd, &start, &[0]).unwrap();
+  assert_eq!(r.shape(), vec![5]);
+  assert_eq!(r.to_vec::<f32>().unwrap(), vec![10.0, 20.0, 7.0, 8.0, 50.0]);
+}
+
+#[test]
+fn slice_update_dynamic_method_form_2d() {
+  // 2x3 src; overwrite the 1x2 block at runtime offset (row 1, col 0) along
+  // axes [0, 1] with [[70, 80]] -> row 1 cols 0,1 become 70,80.
+  // a = [[1,2,3],[4,5,6]] -> [[1,2,3],[70,80,6]].
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
+  let upd = Array::from_slice::<f32>(&[70.0, 80.0], &(1, 2)).unwrap();
+  let start = Array::from_slice::<i32>(&[1, 0], &[2i32]).unwrap();
+  let mut r = a.slice_update_dynamic(&upd, &start, &[0, 1]).unwrap();
+  assert_eq!(r.shape(), vec![2, 3]);
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    vec![1.0, 2.0, 3.0, 70.0, 80.0, 6.0]
+  );
+}

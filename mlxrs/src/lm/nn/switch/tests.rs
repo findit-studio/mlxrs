@@ -1318,3 +1318,302 @@ fn switch_mlp_sorted_path_top1_explicit_k_routes_each_token_to_its_expert() {
   }
   assert_close(&got, &want);
 }
+
+// ─── QuantizedSwitchLinear::from_parts rank-mismatch coverage ───
+//
+// The dense `SwitchLinear` rank-3-weight rejection is already covered
+// (`switch_linear_from_parts_rejects_2d_weight`); the QUANTIZED constructor
+// has its own independent weight-rank gate (it fires before the U32-dtype
+// gate, so a rank-2 weight of any dtype trips it) plus a scales-rank gate
+// (which fires only after a valid rank-3 U32 weight clears the dtype gate).
+// Both surface as `RankMismatch` with the offending rank/shape. No eval —
+// `from_parts` reads only `shape()` / `dtype()` metadata.
+
+/// Weight-rank gate: a rank-2 `weight` is rejected with `RankMismatch`
+/// before any dtype / scales / mode check. (The U32-dtype gate at
+/// `switch.rs:393` only runs once the rank-3 gate passes, so a plain f32
+/// rank-2 array suffices to exercise the rank arm here.)
+#[test]
+fn quantized_switch_linear_from_parts_rejects_2d_weight() {
+  // `[E*O?, I]` rank-2 — the leading-dim taxonomy is irrelevant; the rank
+  // gate fires first. Scales/biases are placeholders never reached.
+  let bad_weight = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2usize, 2usize)).unwrap();
+  let scales = Array::from_slice::<f32>(&[1.0, 1.0], &(2usize, 1usize)).unwrap();
+  let err =
+    QuantizedSwitchLinear::from_parts(bad_weight, scales, None, None, 64, 4, "affine").unwrap_err();
+  match err {
+    crate::Error::RankMismatch(payload) => {
+      assert_eq!(payload.actual(), 2, "rank-2 weight ⇒ actual rank 2");
+      assert_eq!(payload.actual_shape(), &[2usize, 2]);
+    }
+    other => panic!("expected RankMismatch on rank-2 quantized weight, got {other:?}"),
+  }
+}
+
+/// Scales-rank gate: a rank-3 U32 `weight` (clears the rank + dtype gates)
+/// paired with a rank-2 `scales` is rejected with `RankMismatch` — mlx
+/// `quantize` always emits a `scales` of the SAME rank as `weight`, so a
+/// divergent rank is structurally impossible from a real `quantize` and is
+/// caught at `switch.rs:410`. The weight is constructed directly as `U32`
+/// (no `quantize` call) so the dtype gate passes and the scales-RANK arm —
+/// not a downstream shape/leading-dim check — is what fires.
+#[test]
+fn quantized_switch_linear_from_parts_rejects_scales_rank_mismatch() {
+  // Rank-3 `[E=2, O=2, I_packed=1]` U32 weight — passes the rank gate and
+  // the `Dtype::U32` gate.
+  let u32_weight = Array::from_slice::<u32>(&[0u32, 0, 0, 0], &(2usize, 2usize, 1usize)).unwrap();
+  // Rank-2 `[2, 2]` scales — wrong rank entirely (should be rank-3).
+  let bad_scales = Array::from_slice::<f32>(&[1.0, 1.0, 1.0, 1.0], &(2usize, 2usize)).unwrap();
+  // `affine` + `Some(quant_biases)` would be the valid arity, but the scales
+  // rank gate fires long before the mode-arity check, so the bias/mode args
+  // here are immaterial; use the simplest passing-arity-shape combination.
+  let err = QuantizedSwitchLinear::from_parts(u32_weight, bad_scales, None, None, 64, 4, "mxfp4")
+    .unwrap_err();
+  match err {
+    crate::Error::RankMismatch(payload) => {
+      assert_eq!(payload.actual(), 2, "rank-2 scales ⇒ actual rank 2");
+      assert_eq!(payload.actual_shape(), &[2usize, 2]);
+    }
+    other => panic!("expected RankMismatch on rank-2 scales, got {other:?}"),
+  }
+}
+
+// ─── check_routing_indices direct-call coverage ───
+//
+// `check_routing_indices` is the pre-`expand_dims` shape gate for
+// `SwitchGLU`/`SwitchMLP::forward`. The ambiguous-rank rejections (`[N]` /
+// `[B, S]`) are already covered through `forward`; these call the private
+// helper directly (`use super::*`) to reach the three branches `forward`
+// can't surface:
+//   1. rank-0 `x` → `RankMismatch` (the underflow guard at `switch.rs:708`);
+//   2. same-rank `indices` with EXACTLY ONE differing leading batch dim →
+//      `LengthMismatch` (`switch.rs:754-762`);
+//   3. same-rank `indices` with ≥ 2 differing leading dims → `ShapePairMismatch`
+//      (`switch.rs:763-769`).
+// All read only `shape()` metadata — no eval, no GPU.
+
+/// Rank-0 `x` guard: `check_routing_indices` rejects an empty-shape `x`
+/// (which would underflow the `x_shape[..len-1]` batch slice) with a
+/// `RankMismatch` reporting rank 0. `forward` never produces a rank-0 `x`,
+/// so this branch is only reachable via the direct helper call.
+#[test]
+fn check_routing_indices_rejects_rank0_x() {
+  // Rank-0 (scalar) `x`: empty shape, single element. Built via the
+  // `&[usize]`/`Vec<usize>` shape path (the tuple `IntoShape` impls start at
+  // arity 1, so an empty `Vec` is the rank-0 constructor).
+  let empty_shape: Vec<usize> = Vec::new();
+  let x = Array::from_slice::<f32>(&[5.0f32], &empty_shape).unwrap();
+  assert!(x.shape().is_empty(), "x must be rank-0 for this branch");
+  // `indices` shape is immaterial — the empty-`x` guard fires first.
+  let indices = Array::from_slice::<u32>(&[0u32], &(1usize,)).unwrap();
+  let err = check_routing_indices(&x, &indices).unwrap_err();
+  match err {
+    crate::Error::RankMismatch(payload) => {
+      assert_eq!(payload.actual(), 0, "rank-0 x ⇒ actual rank 0");
+      assert!(
+        payload.actual_shape().is_empty(),
+        "rank-0 x ⇒ empty actual shape, got {:?}",
+        payload.actual_shape()
+      );
+    }
+    other => panic!("expected RankMismatch on rank-0 x, got {other:?}"),
+  }
+}
+
+/// Single-differing-batch-dim case: `x = [B=2, S=3, D=4]` ⇒ batch dims
+/// `[2, 3]`, expected indices rank 3. An `indices` of `[2, 5, 1]` has the
+/// right rank and matches the first batch dim (2) but its second leading dim
+/// (5) differs from `x`'s (3) — EXACTLY ONE diff ⇒ `LengthMismatch` carrying
+/// the `(expected=3, actual=5)` pair (`switch.rs:754-762`).
+#[test]
+fn check_routing_indices_one_differing_batch_dim_is_length_mismatch() {
+  // `x` batch dims are `[2, 3]` (last axis D=4 is the matmul K, excluded).
+  let x = Array::from_slice::<f32>(&[0.0f32; 2 * 3 * 4], &(2usize, 3usize, 4usize)).unwrap();
+  // `indices` rank-3 `[2, 5, 1]`: leading `[2, 5]` vs x_batch `[2, 3]` — only
+  // axis 1 differs. (Values are immaterial; only `shape()` is read.)
+  let indices = Array::from_slice::<u32>(&[0u32; 2 * 5], &(2usize, 5usize, 1usize)).unwrap();
+  let err = check_routing_indices(&x, &indices).unwrap_err();
+  match err {
+    crate::Error::LengthMismatch(payload) => {
+      assert_eq!(payload.expected(), 3, "x's differing batch dim is 3");
+      assert_eq!(payload.actual(), 5, "indices' differing leading dim is 5");
+    }
+    other => panic!("expected LengthMismatch on single differing batch dim, got {other:?}"),
+  }
+}
+
+/// Two-differing-batch-dim case: `x = [B=2, S=3, D=4]` ⇒ batch dims `[2, 3]`.
+/// An `indices` of `[7, 9, 1]` has the right rank but BOTH leading dims
+/// differ (7≠2 and 9≠3) ⇒ `ShapePairMismatch` carrying the full batch-prefix
+/// pair `expected=[2, 3]`, `actual=[7, 9]` (`switch.rs:763-769`).
+#[test]
+fn check_routing_indices_two_differing_batch_dims_is_shape_pair_mismatch() {
+  let x = Array::from_slice::<f32>(&[0.0f32; 2 * 3 * 4], &(2usize, 3usize, 4usize)).unwrap();
+  // `indices` rank-3 `[7, 9, 1]`: leading `[7, 9]` differs from `[2, 3]` in
+  // BOTH positions.
+  let indices = Array::from_slice::<u32>(&[0u32; 7 * 9], &(7usize, 9usize, 1usize)).unwrap();
+  let err = check_routing_indices(&x, &indices).unwrap_err();
+  match err {
+    crate::Error::ShapePairMismatch(payload) => {
+      assert_eq!(payload.expected(), &[2usize, 3], "x batch dims");
+      assert_eq!(payload.actual(), &[7usize, 9], "indices leading dims");
+    }
+    other => panic!("expected ShapePairMismatch on two differing batch dims, got {other:?}"),
+  }
+}
+
+// ─── check_glu_shapes gate/up-mismatch branch ───
+//
+// `SwitchGLU::new`'s existing rejection tests hit the down_proj-inverse and
+// num_experts branches; the FIRST `check_glu_shapes` branch — gate_proj and
+// up_proj must share `[input_dims, hidden_dims]` (`switch.rs:1091-1099`) — is
+// not yet exercised. Build a gate `[E,O,I]` and an up_proj with a different
+// hidden (output) dim so `gh != uh` fires. Shape-metadata only; no eval.
+
+/// `gate_proj` and `up_proj` must share `[input_dims, hidden_dims]`. Here
+/// gate is `[E=2, O=2, I=2]` (hidden=2) and up is `[E=2, O=3, I=2]`
+/// (hidden=3): `gh(2) != uh(3)` ⇒ `ShapePairMismatch` reporting the
+/// `[input, hidden]` pair `[2, 2]` vs `[2, 3]`. down_proj is shaped so it
+/// would clear the later checks, isolating the gate/up branch.
+#[test]
+fn switch_glu_new_rejects_gate_up_hidden_mismatch() {
+  let gate = SwitchLinear::from_parts(all_identity_weight(), None).unwrap(); // [2,2,2]
+  // up_proj `[E=2, O=3, I=2]` — same input_dims (2) but hidden=3 ≠ gate's 2.
+  let up_w = Array::from_slice::<f32>(&[0.0f32; 2 * 3 * 2], &(2usize, 3usize, 2usize)).unwrap();
+  let up = SwitchLinear::from_parts(up_w, None).unwrap();
+  // down_proj would need to be [hidden→input]; supply a benign [2,2,2] — the
+  // gate/up check fires first regardless.
+  let down = SwitchLinear::from_parts(all_identity_weight(), None).unwrap();
+  let err = SwitchGLU::new(gate, up, down, SwitchGLU::default_activation()).unwrap_err();
+  match err {
+    crate::Error::ShapePairMismatch(payload) => {
+      // payload carries `[gi, gh]` vs `[ui, uh]` == `[2, 2]` vs `[2, 3]`.
+      assert_eq!(payload.expected(), &[2usize, 2], "gate [input, hidden]");
+      assert_eq!(payload.actual(), &[2usize, 3], "up [input, hidden]");
+    }
+    other => panic!("expected ShapePairMismatch on gate/up hidden mismatch, got {other:?}"),
+  }
+}
+
+// ─── SwitchMLP::new num_experts branch ───
+//
+// `switch_mlp_new_rejects_mismatched_projection_shapes` hits the
+// fc2-inverse `ShapePairMismatch`; the SECOND `SwitchMLP::new` gate —
+// fc1/fc2 must share num_experts (`switch.rs:1199-1205`, a `LengthMismatch`)
+// — needs fc1/fc2 whose `[input, hidden]`↔`[hidden, input]` inverse matches
+// but whose expert counts differ. Shape-metadata only; no eval.
+
+/// fc1 `[E=2, O=2, I=2]` and fc2 `[E=3, O=2, I=2]`: fc2 IS the
+/// `[hidden→input]` inverse of fc1 (both 2↔2, so the inverse check passes),
+/// but they route different expert populations (2 vs 3) ⇒ `LengthMismatch`
+/// carrying `(expected=2, actual=3)`.
+#[test]
+fn switch_mlp_new_rejects_num_experts_mismatch() {
+  let fc1 = SwitchLinear::from_parts(all_identity_weight(), None).unwrap(); // [2,2,2]
+  // fc2 `[E=3, O=2, I=2]`: input_dims=2, output_dims=2 (inverse of fc1's 2↔2
+  // passes), but num_experts=3 ≠ fc1's 2.
+  let fc2_w = Array::from_slice::<f32>(&[1.0f32; 3 * 2 * 2], &(3usize, 2usize, 2usize)).unwrap();
+  let fc2 = SwitchLinear::from_parts(fc2_w, None).unwrap();
+  let err = SwitchMLP::new(fc1, fc2, SwitchMLP::default_activation()).unwrap_err();
+  match err {
+    crate::Error::LengthMismatch(payload) => {
+      assert_eq!(payload.expected(), 2, "fc1 num_experts");
+      assert_eq!(payload.actual(), 3, "fc2 num_experts");
+    }
+    other => panic!("expected LengthMismatch on fc1/fc2 num_experts, got {other:?}"),
+  }
+}
+
+// ─── Accessor + Debug coverage (SwitchGLU / SwitchMLP) ───
+//
+// The block accessors (`gate_proj`/`up_proj`/`down_proj`, `fc1`/`fc2`) and
+// the hand-written `Debug` impls (which elide the boxed activation as `<fn>`)
+// are pure metadata reads — `Array`'s own `Debug` formats only `shape` /
+// `dtype` (no eval, see `array/conversion.rs:341`), so these run as normal
+// (non-GPU) tests.
+
+/// `SwitchGLU` exposes its three projections via read-only accessors. Each
+/// returns the constructor-installed `SwitchLinear`; verify by reading their
+/// shapes back (`switch.rs:957-968`).
+#[test]
+fn switch_glu_projection_accessors_return_constructed_layers() {
+  // gate/up: [E=2, O=2, I=2]; down: the [hidden→input] inverse (also [2,2,2]).
+  let glu = SwitchGLU::new(
+    SwitchLinear::from_parts(identity_then_swap_weight(), None).unwrap(),
+    SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+    SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+    SwitchGLU::default_activation(),
+  )
+  .unwrap();
+  assert_eq!(glu.gate_proj().weight_ref().shape(), vec![2, 2, 2]);
+  assert_eq!(glu.up_proj().weight_ref().shape(), vec![2, 2, 2]);
+  assert_eq!(glu.down_proj().weight_ref().shape(), vec![2, 2, 2]);
+  // Spot-check the accessors return the EXPECTED layer: gate is the
+  // identity-then-swap stack, so its expert-1 row differs from up/down
+  // (all-identity). num_experts/dims are read through the accessor chain.
+  assert_eq!(glu.gate_proj().num_experts(), 2);
+  assert_eq!(glu.gate_proj().input_dims(), 2);
+  assert_eq!(glu.gate_proj().output_dims(), 2);
+}
+
+/// `SwitchGLU`'s hand-written `Debug` reports the three projections and
+/// elides the activation as `<fn>` (`switch.rs:1056-1063`). Assert the
+/// rendered string names each projection field + the `<fn>` placeholder
+/// without panicking (no eval — `Array`'s Debug is metadata-only).
+#[test]
+fn switch_glu_debug_elides_activation() {
+  let glu = SwitchGLU::new(
+    SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+    SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+    SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+    SwitchGLU::default_activation(),
+  )
+  .unwrap();
+  let rendered = format!("{glu:?}");
+  assert!(rendered.contains("SwitchGLU"), "got {rendered}");
+  assert!(rendered.contains("gate_proj"), "got {rendered}");
+  assert!(rendered.contains("up_proj"), "got {rendered}");
+  assert!(rendered.contains("down_proj"), "got {rendered}");
+  assert!(
+    rendered.contains("<fn>"),
+    "activation must be elided as <fn>, got {rendered}"
+  );
+}
+
+/// `SwitchMLP` exposes its two projections via read-only accessors
+/// (`switch.rs:1214-1221`).
+#[test]
+fn switch_mlp_projection_accessors_return_constructed_layers() {
+  let square: Activation = Box::new(|a: &Array| a.multiply(a));
+  let mlp = SwitchMLP::new(
+    SwitchLinear::from_parts(identity_then_swap_weight(), None).unwrap(),
+    SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+    square,
+  )
+  .unwrap();
+  assert_eq!(mlp.fc1().weight_ref().shape(), vec![2, 2, 2]);
+  assert_eq!(mlp.fc2().weight_ref().shape(), vec![2, 2, 2]);
+  assert_eq!(mlp.fc1().num_experts(), 2);
+  assert_eq!(mlp.fc2().output_dims(), 2);
+}
+
+/// `SwitchMLP`'s hand-written `Debug` reports `fc1` / `fc2` and elides the
+/// activation as `<fn>` (`switch.rs:1281-1287`).
+#[test]
+fn switch_mlp_debug_elides_activation() {
+  let square: Activation = Box::new(|a: &Array| a.multiply(a));
+  let mlp = SwitchMLP::new(
+    SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+    SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+    square,
+  )
+  .unwrap();
+  let rendered = format!("{mlp:?}");
+  assert!(rendered.contains("SwitchMLP"), "got {rendered}");
+  assert!(rendered.contains("fc1"), "got {rendered}");
+  assert!(rendered.contains("fc2"), "got {rendered}");
+  assert!(
+    rendered.contains("<fn>"),
+    "activation must be elided as <fn>, got {rendered}"
+  );
+}

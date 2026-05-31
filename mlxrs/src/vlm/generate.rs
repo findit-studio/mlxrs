@@ -1013,3 +1013,586 @@ fn last_position(logits: &Array) -> Result<Array> {
   let sliced = ops::indexing::slice(logits, &[0, s - 1, 0], &[b, s, v], &[1, 1, 1])?;
   ops::shape::squeeze_axes(&sliced, &[1])
 }
+
+#[cfg(test)]
+mod tests {
+  //! Closed-form coverage for the VLM generation glue:
+  //!
+  //! - [`VlmGenConfig`] accessors (pure getters; no mlx).
+  //! - the [`last_position`] rank / S-axis / V-axis guards (crafted shapes,
+  //!   typed-error matching) plus its happy `[B, S, V] -> [B, V]` contract.
+  //! - the [`VlmDecode`] iterator's deferred-`pending_err` channel and the
+  //!   `last == None` defensive end-of-iteration arm (constructed directly,
+  //!   since this module can reach the private struct + fields).
+  //! - [`VlmDecode::prefill_step`]'s `T == 0` empty-prompt guard, the
+  //!   KV-cache layer-offset-disagreement guard, and the absolute-offset
+  //!   `checked_add` overflow guard — driven through a deterministic
+  //!   in-crate VLM mock + a fixed-offset mock cache so each typed error is
+  //!   exercised against an independent oracle, never the fn under test.
+  //! - the full [`vlm_generate`] vision path's per-image encode-shape
+  //!   contract (a rank-1 `encode_image` output -> `Error::RankMismatch`),
+  //!   driven through a real on-disk PNG so `load_image` / `preprocess`
+  //!   run end-to-end before the shape check fires.
+
+  use super::*;
+  use crate::lm::cache::{CacheConfig, KvCache, MaskMode, make_prompt_cache};
+
+  // ── deterministic in-crate VLM mock ────────────────────────────────────
+  //
+  // Implements both `lm::model::Model` and `vlm::model::Model`. `forward` /
+  // `forward_embeddings` return a fixed `[B, S, V]` (resp. `[1, S, V]`)
+  // logits tile (argmax == last vocab index); `embed_tokens` returns
+  // `[1, T, hidden]` zeros; `encode_image` returns a controllable shape so
+  // the cross-model encode-shape contract can be exercised. The default
+  // `merge_embeddings` + default `forward_embeddings_multimodal` (which
+  // dispatches to `forward_embeddings`) are inherited.
+
+  /// What shape `encode_image` should fabricate for a given preprocessed
+  /// image — drives the per-image shape-contract branches in `vlm_generate`.
+  #[derive(Clone, Copy)]
+  enum EncodeShape {
+    /// A well-formed `[rows, hidden]` feature slab.
+    Rank2 { rows: usize, hidden: usize },
+    /// A malformed rank-1 `[n]` output (violates the `[N, D]` contract).
+    Rank1 { n: usize },
+  }
+
+  struct VlmMock {
+    vocab: usize,
+    hidden: usize,
+    encode: EncodeShape,
+  }
+
+  impl VlmMock {
+    fn new(vocab: usize, hidden: usize) -> Self {
+      Self {
+        vocab,
+        hidden,
+        encode: EncodeShape::Rank2 { rows: 1, hidden },
+      }
+    }
+
+    fn with_encode(mut self, encode: EncodeShape) -> Self {
+      self.encode = encode;
+      self
+    }
+
+    /// `[batch, seq, vocab]` tile of `0..vocab` (argmax == vocab - 1).
+    fn logits(&self, batch: usize, seq: usize) -> Result<Array> {
+      let mut data: Vec<f32> = Vec::with_capacity(batch * seq * self.vocab);
+      for _ in 0..batch * seq {
+        for v in 0..self.vocab {
+          data.push(v as f32);
+        }
+      }
+      Array::from_slice::<f32>(&data, &(batch, seq, self.vocab))
+    }
+  }
+
+  impl crate::lm::model::Model for VlmMock {
+    fn forward(&self, tokens: &Array, _cache: &mut [Box<dyn KvCache>]) -> Result<Array> {
+      let shape = tokens.shape();
+      let (b, s) = match shape.as_slice() {
+        [b, s] => (*b, *s),
+        [s] => (1, *s),
+        _ => (1, 1),
+      };
+      self.logits(b, s)
+    }
+
+    fn forward_embeddings(
+      &self,
+      embeddings: &Array,
+      _cache: &mut [Box<dyn KvCache>],
+    ) -> Result<Array> {
+      // embeddings is [1, S, D]; emit [1, S, V].
+      let shape = embeddings.shape();
+      let s = if shape.len() == 3 { shape[1] } else { 1 };
+      self.logits(1, s)
+    }
+
+    fn supports_input_embeddings(&self) -> bool {
+      true
+    }
+  }
+
+  impl Model for VlmMock {
+    fn embed_tokens(&self, tokens: &Array) -> Result<Array> {
+      let shape = tokens.shape();
+      let t = match shape.as_slice() {
+        [_b, t] => *t,
+        [t] => *t,
+        _ => 1,
+      };
+      let data = vec![0.0_f32; t * self.hidden];
+      Array::from_slice::<f32>(&data, &(1_usize, t, self.hidden))
+    }
+
+    fn encode_image(&self, _image: &Array) -> Result<Array> {
+      match self.encode {
+        EncodeShape::Rank2 { rows, hidden } => {
+          let data = vec![1.0_f32; rows * hidden];
+          Array::from_slice::<f32>(&data, &(rows, hidden))
+        }
+        EncodeShape::Rank1 { n } => {
+          let data = vec![1.0_f32; n];
+          Array::from_slice::<f32>(&data, &(n,))
+        }
+      }
+    }
+  }
+
+  // ── fixed-offset mock cache ─────────────────────────────────────────────
+  //
+  // Only `offset()` is exercised by `prefill_step`'s initial-offset read; the
+  // rest of the `KvCache` surface is inert (the prefill paths under test
+  // either fail before any `update`, or the model mock ignores the cache).
+
+  struct FixedOffsetCache {
+    offset: usize,
+  }
+
+  impl KvCache for FixedOffsetCache {
+    fn offset(&self) -> usize {
+      self.offset
+    }
+    fn update(&mut self, keys: &Array, values: &Array) -> Result<(Array, Array)> {
+      Ok((keys.try_clone()?, values.try_clone()?))
+    }
+    fn state(&self) -> Result<Vec<Array>> {
+      Ok(Vec::new())
+    }
+    fn set_state(&mut self, _state: Vec<Array>) -> Result<()> {
+      Ok(())
+    }
+    fn materialize(&mut self) -> Result<()> {
+      Ok(())
+    }
+    fn make_mask(
+      &self,
+      _n: usize,
+      _window_size: Option<usize>,
+      _return_array: bool,
+    ) -> Result<MaskMode> {
+      Ok(MaskMode::None)
+    }
+    fn nbytes(&self) -> usize {
+      0
+    }
+    fn is_empty(&self) -> bool {
+      self.offset == 0
+    }
+    fn copy(&self) -> Result<Box<dyn KvCache>> {
+      Ok(Box::new(FixedOffsetCache {
+        offset: self.offset,
+      }))
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+      self
+    }
+    fn reference_class_name(&self) -> &'static str {
+      "FixedOffsetCache"
+    }
+  }
+
+  /// Build a bare `VlmDecode` against `model`/`cache` with prefill payload
+  /// fields supplied — the rest defaulted to a benign "ready to poll" state.
+  /// Lets the offset / overflow / empty-prompt prefill branches be reached
+  /// without the (image-file-dependent) `vlm_generate` construction path.
+  fn decode_with<'a>(
+    model: &'a VlmMock,
+    cache: Vec<Box<dyn KvCache>>,
+    prefill_step_size: usize,
+    prompt: Vec<u32>,
+    spans: Vec<(usize, usize)>,
+    slabs: Vec<Array>,
+  ) -> VlmDecode<'a, VlmMock> {
+    VlmDecode {
+      model,
+      cache: RefCell::new(cache),
+      sampler: RefCell::new(Sampler::Argmax),
+      processors: Vec::new(),
+      history: RefCell::new(Vec::new()),
+      eos: Vec::new(),
+      max_tokens: 8,
+      produced: 0,
+      prefill_step_size,
+      last: None,
+      prefilled: false,
+      image_slabs: Some(slabs),
+      image_spans: Some(spans),
+      prompt_history: Some(prompt),
+      pending_err: None,
+      done: false,
+    }
+  }
+
+  // ── VlmGenConfig accessors (lines 198-225) ──────────────────────────────
+
+  /// Every `VlmGenConfig` getter returns exactly what was constructed; the
+  /// `image_marker_id` builder flips the default `None` to `Some`.
+  #[test]
+  fn vlm_gen_config_accessors_roundtrip() {
+    let lm = GenConfig::default().with_max_tokens(7);
+    let cfg = VlmGenConfig::new(lm, 99, 3, MarkerPolicy::Required);
+
+    // lm_ref / lm_mut expose the wrapped GenConfig (198-205).
+    assert_eq!(cfg.lm_ref().max_tokens, 7);
+    assert_eq!(cfg.image_token_id(), 99); // 208-210
+    assert_eq!(cfg.image_marker_id(), None); // 213-216 (default None)
+    assert_eq!(cfg.num_tokens_per_image(), 3); // 218-221
+    assert!(cfg.marker_policy().is_required()); // 223-226
+
+    // with_image_marker_id sets a distinct marker; lm_mut mutates in place.
+    let mut cfg = cfg.with_image_marker_id(Some(42));
+    assert_eq!(cfg.image_marker_id(), Some(42));
+    cfg.lm_mut().max_tokens = 11;
+    assert_eq!(cfg.lm_ref().max_tokens, 11);
+    // Unchanged fields survive the builder.
+    assert_eq!(cfg.image_token_id(), 99);
+    assert_eq!(cfg.num_tokens_per_image(), 3);
+    assert!(cfg.marker_policy().is_required());
+  }
+
+  // ── last_position guards + happy path (lines 988-1015) ──────────────────
+
+  /// Rank != 3 -> `RankMismatch` naming `[B, S, V]`, carrying the observed
+  /// rank + shape (992-997).
+  #[test]
+  fn last_position_rejects_non_rank3() {
+    let two_d = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2_usize, 2)).unwrap();
+    let err = last_position(&two_d).unwrap_err();
+    match err {
+      Error::RankMismatch(p) => {
+        assert!(p.context().contains("rank 3"), "ctx: {}", p.context());
+        assert_eq!(p.actual(), 2, "observed rank carried");
+        assert_eq!(p.actual_shape(), &[2, 2], "observed shape carried");
+      }
+      other => panic!("expected RankMismatch, got {other:?}"),
+    }
+  }
+
+  /// A zero-length S axis -> `OutOfRange` on the S axis (998-1003). Closed
+  /// form: `[1, 0, 4]` has S == 0.
+  #[test]
+  fn last_position_rejects_zero_s_axis() {
+    let data: Vec<f32> = Vec::new();
+    let z = Array::from_slice::<f32>(&data, &(1_usize, 0, 4)).unwrap();
+    let err = last_position(&z).unwrap_err();
+    match err {
+      Error::OutOfRange(p) => {
+        assert!(p.context().contains("S axis"), "ctx: {}", p.context());
+        assert!(
+          p.value().starts_with('0'),
+          "value reports S=0: {}",
+          p.value()
+        );
+      }
+      other => panic!("expected OutOfRange(S), got {other:?}"),
+    }
+  }
+
+  /// A zero-length V axis -> `OutOfRange` on the V axis (1005-1010). Closed
+  /// form: `[1, 2, 0]` has V == 0 (and S == 2 > 0 so the S guard passes).
+  #[test]
+  fn last_position_rejects_zero_v_axis() {
+    let data: Vec<f32> = Vec::new();
+    let z = Array::from_slice::<f32>(&data, &(1_usize, 2, 0)).unwrap();
+    let err = last_position(&z).unwrap_err();
+    match err {
+      Error::OutOfRange(p) => {
+        assert!(p.context().contains("V axis"), "ctx: {}", p.context());
+        assert!(
+          p.value().starts_with('0'),
+          "value reports V=0: {}",
+          p.value()
+        );
+      }
+      other => panic!("expected OutOfRange(V), got {other:?}"),
+    }
+  }
+
+  /// Happy path: `[B, S, V]` -> `[B, V]` keeping the FINAL position.
+  /// Oracle: build `[1, 3, 2]` with per-position rows `[0,1], [2,3], [4,5]`;
+  /// the slice + squeeze must yield exactly the LAST row `[4, 5]` at shape
+  /// `[1, 2]`.
+  #[test]
+  fn last_position_slices_final_position() {
+    // positions 0..3 along S; values per (s): [s*2, s*2+1]. Last = [4,5].
+    let data = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+    let logits = Array::from_slice::<f32>(&data, &(1_usize, 3, 2)).unwrap();
+    let mut out = last_position(&logits).unwrap();
+    assert_eq!(out.shape(), vec![1, 2], "S axis dropped");
+    assert_eq!(
+      out.to_vec::<f32>().unwrap(),
+      vec![4.0, 5.0],
+      "final position kept"
+    );
+  }
+
+  // ── VlmDecode deferred-err + last==None defense (lines 919-921, 948-952) ─
+
+  /// A `pending_err` is yielded as the FIRST `next()` (919-921) and the
+  /// iterator fuses afterwards (the `done` short-circuit at 916-918).
+  #[test]
+  fn vlm_decode_pending_err_is_first_then_fuses() {
+    let model = VlmMock::new(4, 2);
+    let cache: Vec<Box<dyn KvCache>> = Vec::new();
+    let mut it = VlmDecode {
+      model: &model,
+      cache: RefCell::new(cache),
+      sampler: RefCell::new(Sampler::Argmax),
+      processors: Vec::new(),
+      history: RefCell::new(Vec::new()),
+      eos: Vec::new(),
+      max_tokens: 5,
+      produced: 0,
+      prefill_step_size: 1,
+      last: None,
+      prefilled: true, // pending_err short-circuits before any prefill
+      image_slabs: None,
+      image_spans: None,
+      prompt_history: None,
+      pending_err: Some(Error::EmptyInput(EmptyInputPayload::new(
+        "sentinel pending error",
+      ))),
+      done: false,
+    };
+    let err = it.next().expect("yields the pending err").unwrap_err();
+    assert!(
+      matches!(err, Error::EmptyInput(ref p) if p.context().contains("sentinel")),
+      "deferred pending_err surfaced, got {err:?}"
+    );
+    assert!(it.next().is_none(), "fuses after the single deferred Err");
+  }
+
+  /// The defensive `last == None` arm after prefill (948-952): with
+  /// `prefilled == true` but `last == None`, `next()` ends the iterator
+  /// rather than feeding an empty decode window.
+  #[test]
+  fn vlm_decode_prefilled_but_no_last_ends() {
+    let model = VlmMock::new(4, 2);
+    let cache: Vec<Box<dyn KvCache>> = Vec::new();
+    let mut it = VlmDecode {
+      model: &model,
+      cache: RefCell::new(cache),
+      sampler: RefCell::new(Sampler::Argmax),
+      processors: Vec::new(),
+      history: RefCell::new(Vec::new()),
+      eos: Vec::new(),
+      max_tokens: 5,
+      produced: 0,
+      prefill_step_size: 1,
+      last: None,
+      prefilled: true,
+      image_slabs: None,
+      image_spans: None,
+      prompt_history: None,
+      pending_err: None,
+      done: false,
+    };
+    assert!(
+      it.next().is_none(),
+      "prefilled + last==None ends the iterator"
+    );
+    // And it stays fused.
+    assert!(it.next().is_none());
+  }
+
+  // ── prefill_step empty prompt (lines 770-774) ───────────────────────────
+
+  /// `prefill_step` with an empty assembled prompt (T == 0) -> `EmptyInput`
+  /// (no chunk can produce logits).
+  #[test]
+  fn prefill_step_empty_prompt_is_empty_input() {
+    let model = VlmMock::new(4, 2);
+    let cache: Vec<Box<dyn KvCache>> = Vec::new();
+    let it = decode_with(&model, cache, 4, Vec::new(), Vec::new(), Vec::new());
+    let err = it.prefill_step(&[], &[], &[]).unwrap_err();
+    match err {
+      Error::EmptyInput(p) => assert!(
+        p.context().contains("T=0") || p.context().contains("prefill"),
+        "ctx names the empty-prompt prefill: {}",
+        p.context()
+      ),
+      other => panic!("expected EmptyInput, got {other:?}"),
+    }
+  }
+
+  // ── prefill_step layer-offset disagreement (lines 789-811, 798-804) ─────
+
+  /// Two cache layers at DIFFERENT offsets -> `LengthMismatch` BEFORE any
+  /// embed/forward. Oracle: layer 0 fresh (offset 0), layer 1 forced to
+  /// offset 5 — the guard compares layer i to layer 0 and reports
+  /// `expected = layer0_off (0)`, `actual = layer1_off (5)`.
+  #[test]
+  fn prefill_step_rejects_mismatched_layer_offsets() {
+    let model = VlmMock::new(4, 2);
+    let cache: Vec<Box<dyn KvCache>> = vec![
+      Box::new(FixedOffsetCache { offset: 0 }),
+      Box::new(FixedOffsetCache { offset: 5 }),
+    ];
+    let it = decode_with(&model, cache, 4, vec![1, 2, 3], Vec::new(), Vec::new());
+    let err = it.prefill_step(&[1, 2, 3], &[], &[]).unwrap_err();
+    match err {
+      Error::LengthMismatch(p) => {
+        assert!(
+          p.context().contains("offset"),
+          "ctx names the offset disagreement: {}",
+          p.context()
+        );
+        assert_eq!(p.expected(), 0, "layer-0 offset is the reference");
+        assert_eq!(p.actual(), 5, "the disagreeing layer's offset");
+      }
+      other => panic!("expected LengthMismatch(offsets), got {other:?}"),
+    }
+  }
+
+  // ── prefill_step absolute-offset checked_add overflow (lines 873-882) ───
+
+  /// A near-`usize::MAX` restored cache offset overflows once the chunk
+  /// cursor advances past chunk 0. Oracle: single-layer cache at
+  /// `usize::MAX - 1`, `prefill_step_size == 1`, a pure-text 3-token prompt
+  /// (no image spans, so the mock's `forward_embeddings` runs each chunk).
+  /// Chunk 0 cursor 0 -> (MAX-1)+0 ok; chunk 1 cursor 1 -> (MAX-1)+1 ok;
+  /// chunk 2 cursor 2 -> (MAX-1)+2 overflows -> `ArithmeticOverflow`.
+  #[test]
+  fn prefill_step_offset_overflow_is_arithmetic_overflow() {
+    let model = VlmMock::new(4, 2);
+    let cache: Vec<Box<dyn KvCache>> = vec![Box::new(FixedOffsetCache {
+      offset: usize::MAX - 1,
+    })];
+    // Pure-text prompt (no markers/spans) so no merge runs and the mock's
+    // forward_embeddings produces the per-chunk logits.
+    let it = decode_with(&model, cache, 1, vec![10, 11, 12], Vec::new(), Vec::new());
+    let err = it.prefill_step(&[10, 11, 12], &[], &[]).unwrap_err();
+    match err {
+      Error::ArithmeticOverflow(p) => assert!(
+        p.context().contains("cache offset") || p.context().contains("cursor"),
+        "ctx names the offset+cursor add: {}",
+        p.context()
+      ),
+      other => panic!("expected ArithmeticOverflow, got {other:?}"),
+    }
+  }
+
+  // ── vlm_generate per-image encode-shape contract (lines 464-474) ────────
+
+  /// Write a tiny valid PNG to a temp path, then drive the full
+  /// `vlm_generate` vision path with a mock whose `encode_image` returns a
+  /// malformed rank-1 array. The per-image shape check rejects it with
+  /// `Error::RankMismatch` naming the rank-2 `[N, D]` requirement (467-471).
+  /// `load_image` + `preprocess` run end-to-end first (so this is the real
+  /// construction path, not a direct prefill call).
+  #[test]
+  fn vlm_generate_rejects_rank1_encode_output() {
+    // A 2x2 RGB PNG is a valid decode + preprocess input.
+    let dir =
+      std::env::temp_dir().join(format!("mlxrs-vlm-generate-encode-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("tiny.png");
+    let mut buf = ::image::RgbImage::new(2, 2);
+    for y in 0..2 {
+      for x in 0..2 {
+        buf.put_pixel(x, y, ::image::Rgb([128, 64, 200]));
+      }
+    }
+    ::image::DynamicImage::ImageRgb8(buf)
+      .save_with_format(&path, ::image::ImageFormat::Png)
+      .expect("encode tiny PNG");
+
+    let model = VlmMock::new(4, 2).with_encode(EncodeShape::Rank1 { n: 1 });
+    let proc_cfg = ImageProcessorConfig::default();
+    // Prompt: a single marker token (id 7) so insert_image_tokens succeeds
+    // with one image, num_tokens_per_image = 1.
+    let cfg = VlmGenConfig::new(
+      GenConfig::default().with_max_tokens(4),
+      7, // image_token_id == marker_id (single-token marker)
+      1, // num_tokens_per_image
+      MarkerPolicy::Required,
+    );
+    let cache = make_prompt_cache(&CacheConfig {
+      num_hidden_layers: 1,
+      sliding_window: None,
+    });
+    let res = vlm_generate(
+      &model,
+      &proc_cfg,
+      &[7u32],
+      std::slice::from_ref(&path),
+      cache,
+      cfg,
+    );
+
+    // Best-effort cleanup before asserting.
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir(&dir);
+
+    let err = res.err().expect("rank-1 encode_image output must error");
+    match err {
+      Error::RankMismatch(p) => {
+        assert!(
+          p.context().contains("encode_image") && p.context().contains("[N, D]"),
+          "ctx names the encode_image rank-2 contract: {}",
+          p.context()
+        );
+        assert_eq!(p.actual(), 1, "observed rank-1 carried");
+      }
+      other => panic!("expected RankMismatch from the encode-shape check, got {other:?}"),
+    }
+  }
+
+  // ── max_tokens == 0 short-circuit (lines 336-338) ───────────────────────
+
+  /// `max_tokens == 0` returns an empty iterator with NO vision work — even
+  /// with a (nonexistent) image path, because the short-circuit precedes the
+  /// image pipeline. Oracle: zero yielded items, and the bogus path is never
+  /// opened (no error surfaces at construction).
+  #[test]
+  fn vlm_generate_zero_max_tokens_is_empty_no_vision() {
+    let model = VlmMock::new(4, 2);
+    let proc_cfg = ImageProcessorConfig::default();
+    let cfg = VlmGenConfig::new(
+      GenConfig::default().with_max_tokens(0),
+      7,
+      1,
+      MarkerPolicy::Required,
+    );
+    let cache = make_prompt_cache(&CacheConfig {
+      num_hidden_layers: 1,
+      sliding_window: None,
+    });
+    // A path that does not exist: if vision work ran, load_image would error.
+    let bogus = PathBuf::from("/nonexistent/mlxrs-vlm-no-such-image.png");
+    let mut it = vlm_generate(&model, &proc_cfg, &[7u32], &[bogus], cache, cfg)
+      .expect("max_tokens==0 short-circuits to Ok(empty) before any vision work");
+    assert!(it.next().is_none(), "zero-budget run yields nothing");
+  }
+
+  // ── invalid cfg is eager Err (lines 323) ────────────────────────────────
+
+  /// An invalid `cfg.lm` (negative temp) is an EAGER `Err` from
+  /// `vlm_generate` (the `cfg.lm.validate()?` gate at construction), before
+  /// the max_tokens / zero-image / multimodal split.
+  #[test]
+  fn vlm_generate_invalid_cfg_is_eager_err() {
+    let model = VlmMock::new(4, 2);
+    let proc_cfg = ImageProcessorConfig::default();
+    let cfg = VlmGenConfig::new(
+      GenConfig::default().with_temp(-1.0),
+      7,
+      1,
+      MarkerPolicy::Required,
+    );
+    let cache: Vec<Box<dyn KvCache>> = Vec::new();
+    let res = vlm_generate(&model, &proc_cfg, &[7u32], &[], cache, cfg);
+    match res.err().expect("invalid temp must be an eager Err") {
+      Error::OutOfRange(p) => assert!(
+        p.context().contains("temp"),
+        "eager validate() surfaced temp range error: {}",
+        p.context()
+      ),
+      other => panic!("expected eager OutOfRange(temp), got {other:?}"),
+    }
+  }
+}

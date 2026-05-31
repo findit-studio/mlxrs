@@ -984,3 +984,6 @@ pub(crate) fn create_causal_mask_batched(
   }
   Ok(mask)
 }
+
+#[cfg(test)]
+mod tests;
