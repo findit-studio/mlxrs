@@ -2476,4 +2476,168 @@ mod tests {
     assert!(cfg.normalize());
     assert_eq!(cfg.dimension(), None);
   }
+
+  // ─────────────── expect()/EOF + escape-decode residual coverage ──────
+  //
+  // The remaining gaps the structural/error tests above do not reach:
+  // `expect`'s reached-end-of-input arm, the KNOWN-key slow-path string
+  // decoder's simple-escape + surrogate + invalid-escape + unterminated-
+  // escape arms (`parse_string_with_escapes`), the unknown-key
+  // `skip_string` unterminated-escape arm, and the lowercase-hex digit
+  // branch of `parse_unicode_escape`.
+
+  #[test]
+  fn parse_pooling_json_expect_colon_reached_eof() {
+    // After a complete object key, EOF before the `:` → `expect(b':')`'s
+    // `None` (reached-end-of-input) arm. Input `{"k"` ends right after the
+    // closing quote of the key, so `skip_ws` then `peek()` yields `None`.
+    // `parse_string` for the key succeeds (escape-free `"k"`), so the EOF is
+    // observed by `expect`, not by the string scanner.
+    let err = parse_pooling_json(r#"{"k""#).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("expected ':'") && msg.contains("reached end of input"),
+      "expected colon-EOF error from expect(), got: {msg}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_known_key_string_simple_escapes_decoded() {
+    // A KNOWN key (`pooling_mode`) whose string value BEGINS with `\`
+    // forces `parse_string`'s slow path (`parse_string_with_escapes`).
+    // Each simple two-char escape arm is exercised: `\/` → `/`, `\b` →
+    // 0x08, `\f` → 0x0C, `\r` → CR, `\t` → TAB (plus a leading `\n` to be
+    // sure the very first needle is a backslash). The decoded payload is
+    // retained verbatim as the `JVal::Str` (the resolver would reject it
+    // as an unknown mode, but we assert the PARSER output, not the
+    // resolver, by going through `parse_pooling_json` directly).
+    let pairs = parse_pooling_json(r#"{"pooling_mode": "\n\/\b\f\r\t"}"#).unwrap();
+    assert_eq!(pairs.len(), 1);
+    match &pairs[0].1 {
+      super::JVal::Str(s) => {
+        assert_eq!(
+          s.as_str(),
+          "\n/\u{08}\u{0C}\r\t",
+          "decoded escape bytes mismatch"
+        );
+      }
+      other => panic!("expected Str, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn parse_pooling_json_known_key_string_lowercase_hex_unicode_escape() {
+    // The literal escape `«` uses LOWERCASE hex digits `a`/`b`,
+    // exercising `parse_unicode_escape`'s `b'a'..=b'f'` arm (the existing
+    // `é` test only hits the uppercase `A`..=`F` arm + digits). The
+    // JSON content is built from a normal (non-raw) string so the `\u`
+    // escape is unambiguous SOURCE bytes (`\`,`u`,`0`,`0`,`a`,`b`) — a raw
+    // multibyte `«` in the source would skip the escape branch entirely via
+    // the fast path. U+00AB decodes to « (LEFT-POINTING DOUBLE ANGLE
+    // QUOTATION MARK); the leading `x` forces the slow-path decoder.
+    let json = "{\"pooling_mode\": \"x\\u00abz\"}";
+    let pairs = parse_pooling_json(json).unwrap();
+    match &pairs[0].1 {
+      super::JVal::Str(s) => assert_eq!(s.as_str(), "x\u{00AB}z"),
+      other => panic!("expected Str, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn parse_pooling_json_known_key_string_raw_4byte_scalar_fast_path() {
+    // A raw 4-byte UTF-8 scalar (`😀`, U+1F600) in the source — NOT an
+    // escape — has no backslash in its body, so `parse_string` takes the
+    // escape-free FAST path: the source slice is borrowed, scanned for
+    // control chars, `from_utf8`-validated, and handed to `SmolStr::new`
+    // unchanged (the slow-path surrogate-pair ESCAPE combine is pinned
+    // separately by `..._handles_utf16_surrogate_pair`). Confirms a
+    // supplementary-plane scalar round-trips through the fast path intact.
+    let pairs = parse_pooling_json(r#"{"pooling_mode": "😀"}"#).unwrap();
+    match &pairs[0].1 {
+      super::JVal::Str(s) => assert_eq!(s.as_str(), "\u{1F600}"),
+      other => panic!("expected Str, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn parse_pooling_json_known_key_string_high_surrogate_not_followed_by_escape() {
+    // KNOWN-key slow path: a high surrogate `\uD83D` followed by a plain
+    // char (not `\u`) → `parse_string_with_escapes`'s
+    // "expected low surrogate" arm (the `self.bump() != Some(b'\\')` guard).
+    let err = parse_pooling_json(r#"{"pooling_mode": "\uD83Dx"}"#).unwrap_err();
+    assert!(
+      format!("{err}").contains("expected low surrogate"),
+      "expected high-surrogate-without-low error (parse_string slow path), got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_known_key_string_high_surrogate_then_out_of_range_low() {
+    // KNOWN-key slow path: a high surrogate `\uD83D` immediately followed by
+    // a SECOND well-formed `\u` escape whose value is NOT in the
+    // low-surrogate range `0xDC00..=0xDFFF` → the
+    // "expected low surrogate but got U+...." arm of
+    // `parse_string_with_escapes` (distinct from the high-surrogate-not-
+    // followed-by-`\u` arm above). The `A` second escape passes the
+    // `bump()==\\` and `bump()==u` guards but decodes to 'A' (0x0041), a
+    // valid BMP scalar outside the low-surrogate range. The JSON content is
+    // built from a normal (non-raw) string so the two `\u` escapes are
+    // unambiguous source bytes.
+    let json = "{\"pooling_mode\": \"\\uD83D\\u0041\"}";
+    let err = parse_pooling_json(json).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("expected low surrogate but got") && msg.contains("U+0041"),
+      "expected out-of-range-low-surrogate error citing U+0041, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_known_key_string_unpaired_low_surrogate() {
+    // KNOWN-key slow path: a lone low surrogate `\uDC00` (not preceded by a
+    // high surrogate) → `parse_string_with_escapes`'s
+    // "unpaired low surrogate" arm. A leading `\n` guarantees the slow path
+    // is taken (first needle is a backslash).
+    let err = parse_pooling_json(r#"{"pooling_mode": "\n\uDC00"}"#).unwrap_err();
+    assert!(
+      format!("{err}").contains("unpaired low surrogate"),
+      "expected unpaired-low-surrogate error (parse_string slow path), got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_known_key_string_invalid_escape() {
+    // KNOWN-key slow path: `\x` is not a valid JSON escape →
+    // `parse_string_with_escapes`'s `other =>` invalid-escape arm.
+    let err = parse_pooling_json(r#"{"pooling_mode": "a\xb"}"#).unwrap_err();
+    assert!(
+      format!("{err}").contains("invalid escape sequence"),
+      "expected invalid-escape error (parse_string slow path), got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_known_key_string_unterminated_escape_eof() {
+    // KNOWN-key slow path: a backslash as the final byte before EOF (no
+    // escape character follows) → `parse_string_with_escapes`'s
+    // unterminated-escape arm (the inner `bump()` returns `None`). A
+    // leading `\n` forces the slow path; the trailing `\` then hits EOF.
+    let err = parse_pooling_json("{\"pooling_mode\": \"\\n\\").unwrap_err();
+    assert!(
+      format!("{err}").contains("unterminated escape"),
+      "expected unterminated-escape error (parse_string slow path), got: {err}"
+    );
+  }
+
+  #[test]
+  fn parse_pooling_json_unknown_key_string_unterminated_escape_eof() {
+    // UNKNOWN-key `skip_string`: a backslash as the final byte before EOF →
+    // `skip_string`'s unterminated-escape arm (mirrors the KNOWN-key path
+    // above but on the non-materializing scanner).
+    let err = parse_pooling_json("{\"future_field\": \"a\\").unwrap_err();
+    assert!(
+      format!("{err}").contains("unterminated escape"),
+      "expected unterminated-escape error (skip_string), got: {err}"
+    );
+  }
 }

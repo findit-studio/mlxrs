@@ -3756,3 +3756,174 @@ fn transform_awq_weights_zero_point_true_without_qzeros_uses_symmetric() {
     );
   }
 }
+
+// ──────────────── quantize_weights / dequantize_weights: scale-only (mxfp4) ────────────────
+
+/// Quantizing a FRESH dense weight under a scale-only mode (`mxfp4`)
+/// exercises the writeback branch the affine round-trip never reaches:
+/// `mlx.core.quantize` in `mxfp4` mode returns `(w_q, scales)` with
+/// `biases == None` (`mlx/ops.cpp:4890,4898-4904`), so `quantize_weights`
+/// must emit `<path>.weight` + `<path>.scales` and SKIP the `.biases`
+/// insert (the `if let Some(b) = biases` false arm of pass 2). The
+/// existing eligible-weights / round-trip fixtures all use `affine`
+/// (biases `Some`), so this is the only fixture that drives the
+/// no-biases writeback. `mxfp4` requires `group_size = 32`, `bits = 4`
+/// (mlx `quantization_params_from_mode`; mirrored by `convert.rs`'s
+/// per-mode group_size table). Runs the real mlx `fp_quantize` kernel
+/// (Metal + CPU fallback), like the existing affine round-trip test.
+#[test]
+fn quantize_weights_scale_only_mxfp4_emits_weight_and_scales_no_biases() {
+  let group_size = 32_usize;
+  let n_rows = 4_usize;
+  // A modestly-varying ramp so the quant grid spans a useful range (a
+  // constant tensor is a degenerate case for a float scale).
+  let data: Vec<f32> = (0..n_rows * group_size)
+    .map(|i| (i as f32 / 64.0) - 1.0)
+    .collect();
+  let w = arr_f32(&data, &[n_rows, group_size]);
+  let mut weights: Weights = HashMap::new();
+  weights.insert("model.proj.weight".to_string(), w);
+
+  let cfg = PerLayerQuantization::from_global(Quantization {
+    group_size: group_size as i32,
+    bits: 4,
+    mode: QuantMode::Mxfp4,
+  });
+
+  let out = quantize_weights(weights, &cfg, &default_eligible).expect("mxfp4 quantize");
+  // `.weight` is the packed uint32 matrix; `.scales` is present.
+  let w_q = out.get("model.proj.weight").expect(".weight");
+  assert_eq!(
+    w_q.dtype().unwrap(),
+    Dtype::U32,
+    "mxfp4-packed `.weight` must be uint32"
+  );
+  let scales = out.get("model.proj.scales").expect(".scales");
+  // One group per row (last / group_size = 32 / 32 = 1).
+  assert_eq!(scales.shape(), vec![n_rows, 1]);
+  // The load-bearing assertion: a scale-only mode emits NO `.biases`.
+  assert!(
+    !out.contains_key("model.proj.biases"),
+    "mxfp4 is scale-only: `quantize_weights` must NOT emit a `.biases` entry"
+  );
+}
+
+/// Full scale-only round-trip THROUGH the two public functions: a fresh
+/// dense weight is quantized with `mxfp4` via `quantize_weights`, then
+/// reconstructed via `dequantize_weights`. This exercises the
+/// `dequantize_weights` arms the affine round-trip never reaches — the
+/// `(Mxfp4, None)` valid-arity fall-through (no biases required) and the
+/// `ops::quantized::dequantize` call with `b_opt = None`. The
+/// reconstruction is asserted on shape/dtype plus a loose value-recovery
+/// band (mxfp4 is lossy; per the existing round-trip precedent the test
+/// pins the loader PLUMBING — predicate, scale-only writeback, dequantize
+/// inverse — not the float quantizer's exact accuracy, which is mlx-c's).
+#[test]
+fn quantize_then_dequantize_mxfp4_scale_only_roundtrips() {
+  let group_size = 32_usize;
+  let n_rows = 4_usize;
+  let data: Vec<f32> = (0..n_rows * group_size)
+    .map(|i| (i as f32 / 64.0) - 1.0)
+    .collect();
+  let w = arr_f32(&data, &[n_rows, group_size]);
+  let mut weights: Weights = HashMap::new();
+  weights.insert("model.proj.weight".to_string(), w);
+
+  let cfg = PerLayerQuantization::from_global(Quantization {
+    group_size: group_size as i32,
+    bits: 4,
+    mode: QuantMode::Mxfp4,
+  });
+
+  let quantized = quantize_weights(weights, &cfg, &default_eligible).expect("mxfp4 quantize");
+  // The quantized map has no `.biases` (scale-only) — dequantize must
+  // resolve the `(Mxfp4, None)` valid-arity arm and forward `None` biases.
+  assert!(!quantized.contains_key("model.proj.biases"));
+  let dequantized = dequantize_weights(quantized, &cfg).expect("mxfp4 dequantize");
+
+  let deq = dequantized
+    .get("model.proj.weight")
+    .expect("round-tripped .weight")
+    .try_clone()
+    .unwrap();
+  assert_eq!(deq.shape(), vec![n_rows, group_size]);
+  // mxfp4 dequantize yields BF16 (mlx's mxfp4 output dtype), not the F32
+  // input dtype — pin that contract, then cast to read the values.
+  assert_eq!(deq.dtype().unwrap(), Dtype::BF16);
+  let mut deq_f32 = deq.astype(Dtype::F32).unwrap();
+  let deq_vec: Vec<f32> = deq_f32.to_vec().unwrap();
+  // Loose band keyed off the input magnitude — mxfp4 reconstructs a
+  // smooth [-1, 1) ramp coarsely but the plumbing (not the kernel
+  // accuracy) is what is under test here.
+  let max_abs = data.iter().fold(0.0_f32, |m, &v| m.max(v.abs()));
+  for (g, e) in deq_vec.iter().zip(data.iter()) {
+    assert!(
+      (g - e).abs() <= 0.25 * max_abs + 1e-3,
+      "mxfp4 round-trip drift too large: got={g} want={e}"
+    );
+  }
+}
+
+// ──────────────── affine quant closed-form oracle (through the public fns) ────────────────
+
+/// Closed-form affine oracle through the public quantize/dequantize
+/// pair. Each `group_size = 64` group is filled with values lying EXACTLY
+/// on a 4-bit affine grid: the codes cycle `0, 1, 2, … 15` (four
+/// repeats), so the per-group min is `0` and the max is `15`. Under the
+/// standard mlx affine convention `scale = (max - min) / (2^bits - 1) =
+/// (15 - 0) / 15 = 1.0`, `bias = min = 0`, every value is an exact
+/// integer code `q ∈ [0, 15]` and the round-trip (`dequant = q * scale +
+/// bias`) is LOSSLESS — each reconstructed value equals its original
+/// integer code.
+///
+/// The oracle is independent and convention-robust: the 16 distinct
+/// values populate all 16 levels of the 4-bit grid, so they can ONLY
+/// reconstruct losslessly if the per-group scale/bias plumbing in
+/// `quantize_weights` / `dequantize_weights` is correct (a wrong
+/// scale or bias would collapse distinct codes and blow the tight
+/// 1e-3 tolerance). The expected values are computed HERE from the grid
+/// arithmetic, never by calling the function under test.
+#[test]
+fn quantize_then_dequantize_affine_on_grid_recovers_values() {
+  let group_size = 64_usize;
+  let n_rows = 2_usize;
+  // On-grid values: 0..16 repeated to fill each group_size-wide row, so
+  // every group's [min, max] = [0, 15] ⇒ scale = 1.0, bias = 0.
+  let data: Vec<f32> = (0..n_rows * group_size).map(|i| (i % 16) as f32).collect();
+  let w = arr_f32(&data, &[n_rows, group_size]);
+  let mut weights: Weights = HashMap::new();
+  weights.insert("model.grid.weight".to_string(), w);
+
+  let cfg = PerLayerQuantization::from_global(Quantization::affine(group_size as i32, 4));
+
+  let quantized = quantize_weights(weights, &cfg, &default_eligible).expect("affine quantize");
+  // Affine emits the full triple; one group per row.
+  assert_eq!(
+    quantized.get("model.grid.scales").expect(".scales").shape(),
+    vec![n_rows, 1]
+  );
+  assert_eq!(
+    quantized
+      .get("model.grid.biases")
+      .expect(".biases (affine)")
+      .shape(),
+    vec![n_rows, 1]
+  );
+
+  let dequantized = dequantize_weights(quantized, &cfg).expect("affine dequantize");
+  let mut deq = dequantized
+    .get("model.grid.weight")
+    .expect("round-tripped .weight")
+    .try_clone()
+    .unwrap();
+  assert_eq!(deq.shape(), vec![n_rows, group_size]);
+  let deq_vec: Vec<f32> = deq.to_vec().unwrap();
+  // On-grid ⇒ lossless: every reconstructed value equals its integer
+  // code (the hand-derived q * 1.0 + 0.0).
+  for (g, e) in deq_vec.iter().zip(data.iter()) {
+    assert!(
+      (g - e).abs() < 1e-3,
+      "on-grid affine value must round-trip losslessly: got={g} want={e}"
+    );
+  }
+}

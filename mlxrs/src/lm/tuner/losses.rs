@@ -1565,6 +1565,30 @@ mod tests {
   }
 
   #[test]
+  fn n_outs_of_rejects_zero_last_dim() {
+    // A `[2, 0]` shape has a valid rank but a zero-width last axis, so the
+    // last-dim `v == 0` guard fires (BEFORE the `total / v` division that
+    // would otherwise divide by zero). The public path rejects this earlier
+    // in `validate_inputs`, so this defensive branch is only reachable by
+    // calling `n_outs_of` directly. The error payload is fully known from
+    // the contract — context / requirement / value are fixed strings, not
+    // derived from the function's computation.
+    let a = Array::ones::<f32>(&[2, 0]).unwrap();
+    let err = n_outs_of(&a).unwrap_err();
+    match err {
+      Error::OutOfRange(p) => {
+        assert_eq!(
+          p.context(),
+          "mlxrs::lm::tuner::losses: logits last dimension"
+        );
+        assert_eq!(p.requirement(), "must be > 0");
+        assert_eq!(p.value(), "0");
+      }
+      other => panic!("expected OutOfRange for zero last dim, got: {other:?}"),
+    }
+  }
+
+  #[test]
   fn vocab_of_returns_last_dim_as_i32() {
     let a = Array::ones::<f32>(&[2, 4, 128]).unwrap();
     assert_eq!(vocab_of(&a).unwrap(), 128);
@@ -1704,6 +1728,37 @@ mod tests {
         assert_eq!(p.actual_shape(), &[4]);
       }
       other => panic!("expected RankMismatch on logits_p, got: {other:?}"),
+    }
+  }
+
+  #[test]
+  fn validate_inputs_rejects_zero_last_dim() {
+    // Equal-shape `[1, 0]` arrays pass the rank (>= 2) and shape-equality
+    // gates, then hit the last-dim `last == 0` guard with the `ctx_last`
+    // OutOfRange — BEFORE the i32-overflow loop and the dtype checks, per
+    // the documented validation precedence (step 2 = shape-class errors).
+    // Both inputs share dtype/shape so neither the DtypeMismatch nor the
+    // ShapePairMismatch arm can intercept first.
+    let q = Array::ones::<f32>(&[1, 0]).unwrap();
+    let p = Array::ones::<f32>(&[1, 0]).unwrap();
+    let err = validate_inputs(
+      &q,
+      &p,
+      "ctx_q rank",
+      "ctx_p rank",
+      "ctx_pair",
+      "ctx_last",
+      "ctx_dim",
+      "ctx_dtype",
+    )
+    .unwrap_err();
+    match err {
+      Error::OutOfRange(p) => {
+        assert_eq!(p.context(), "ctx_last");
+        assert_eq!(p.requirement(), "must be > 0");
+        assert_eq!(p.value(), "0");
+      }
+      other => panic!("expected OutOfRange for zero last dim, got: {other:?}"),
     }
   }
 

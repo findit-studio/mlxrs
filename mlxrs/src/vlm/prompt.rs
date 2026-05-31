@@ -3158,4 +3158,180 @@ mod tests {
       content: MessageContent::Text(text.to_string()),
     })
   }
+
+  // ── const-table sort invariants ─────────────────────────────────────────
+  //
+  // `for_model` (binary_search_by over MODEL_CONFIG) and `format_message`
+  // (binary_search over SINGLE_IMAGE_ONLY_MODELS and VIDEO_FORMAT_MODELS) all
+  // assume their tables are sorted lexicographically by key. An unsorted
+  // insertion in a future edit would silently break those lookups (a present
+  // model would `Err(MissingKey)` / a single-image model would skip its
+  // guard) WITHOUT a compile error. Pin the invariant with a closed-form
+  // monotonicity check (independent of the production binary-search code).
+
+  #[test]
+  fn model_config_keys_strictly_sorted_and_unique() {
+    for pair in MODEL_CONFIG.windows(2) {
+      let (a, _) = pair[0];
+      let (b, _) = pair[1];
+      assert!(
+        a < b,
+        "MODEL_CONFIG must be strictly ascending for binary_search_by: {a:?} !< {b:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn single_image_only_models_strictly_sorted_and_unique() {
+    for pair in SINGLE_IMAGE_ONLY_MODELS.windows(2) {
+      assert!(
+        pair[0] < pair[1],
+        "SINGLE_IMAGE_ONLY_MODELS must be strictly ascending for binary_search: \
+         {:?} !< {:?}",
+        pair[0],
+        pair[1]
+      );
+    }
+  }
+
+  #[test]
+  fn video_format_models_strictly_sorted_and_unique() {
+    for pair in VIDEO_FORMAT_MODELS.windows(2) {
+      assert!(
+        pair[0] < pair[1],
+        "VIDEO_FORMAT_MODELS must be strictly ascending for binary_search: {:?} !< {:?}",
+        pair[0],
+        pair[1]
+      );
+    }
+  }
+
+  // Every MODEL_CONFIG key must resolve through `for_model` to the table's
+  // declared format (round-trips the binary_search lookup against the
+  // independently-iterated table; also confirms lowercased keys are
+  // already-lowercase so `to_lowercase()` is a no-op for the canonical
+  // entries).
+  #[test]
+  fn model_config_every_key_resolves() {
+    for &(key, fmt) in MODEL_CONFIG {
+      let f = MessageFormatter::for_model(key).unwrap();
+      assert_eq!(f.format_type, fmt, "for_model({key:?}) format mismatch");
+      assert_eq!(
+        f.model_name, key,
+        "for_model({key:?}) should lowercase to itself"
+      );
+    }
+  }
+
+  // Every SINGLE_IMAGE_ONLY_MODELS entry that is ALSO in MODEL_CONFIG must
+  // reject num_images>1 (the guard at format_message lines 1452–1463). This
+  // exercises the guard against the actual allow-list rather than a single
+  // hand-picked model.
+  #[test]
+  fn single_image_only_models_reject_multi_image() {
+    for &model in SINGLE_IMAGE_ONLY_MODELS {
+      // Only those present in MODEL_CONFIG are constructible via for_model.
+      if let Ok(f) = MessageFormatter::for_model(model) {
+        let err = f
+          .format_message("hi", &opts_with("user", 2, 0))
+          .unwrap_err();
+        assert!(
+          matches!(err, Error::OutOfRange(_)),
+          "model {model:?} should reject num_images=2, got {err:?}"
+        );
+      }
+    }
+  }
+
+  // ── MESSAGE_FORMAT_VARIANTS ↔ as_str round-trip (no two tags collide) ───
+  //
+  // Independent of `message_format_as_str_all_variants` (which checks fixed
+  // expected strings): here we assert the 15 tags are pairwise-distinct, so
+  // the snake_case mapping is injective (a duplicated tag would make two
+  // formats indistinguishable to a string-driven chat-template renderer).
+  #[test]
+  fn message_format_tags_are_pairwise_distinct() {
+    let tags: Vec<&'static str> = MESSAGE_FORMAT_VARIANTS.iter().map(|f| f.as_str()).collect();
+    for i in 0..tags.len() {
+      for j in (i + 1)..tags.len() {
+        assert_ne!(
+          tags[i], tags[j],
+          "duplicate MessageFormat tag {:?}",
+          tags[i]
+        );
+      }
+    }
+  }
+
+  // ── locate_image_tokens: adjacent-run collapse contract (closed-form) ────
+  //
+  // The module doc states adjacent multi-image placeholders collapse into a
+  // single contiguous run; a single non-marker token between two marker runs
+  // splits them. Hand-written oracle, byte-exact spans.
+  #[test]
+  fn locate_image_tokens_collapse_and_split() {
+    // Two runs separated by one text token (split into two spans).
+    assert_eq!(
+      locate_image_tokens(&[5, 9, 9, 5, 9, 5], 9),
+      vec![(1, 3), (4, 5)]
+    );
+    // A contiguous block of 4 markers is ONE run (collapse), even though it
+    // could represent several images post-tokenization.
+    assert_eq!(locate_image_tokens(&[9, 9, 9, 9], 9), vec![(0, 4)]);
+  }
+
+  // ── build_multimodal_mask: span end == seq_len is in-bounds (boundary) ──
+  //
+  // The end-vs-seq_len check is strict (`e > seq_len` errors), so a span
+  // whose end equals seq_len is valid. Closed-form oracle over the resulting
+  // mask (block_id = [0, 1, 1] for span (1,3) in seq_len=3).
+  #[test]
+  fn mask_span_end_equals_seq_len_is_valid() {
+    let mut mask = build_multimodal_mask(3, &[(1, 3)]).unwrap();
+    assert_eq!(mask.shape(), vec![1, 1, 3, 3]);
+    let v = mask.to_vec::<bool>().unwrap();
+    let block = [0u32, 1, 1];
+    for q in 0..3usize {
+      for k in 0..3usize {
+        let causal = k <= q;
+        let same_img = block[q] != 0 && block[q] == block[k];
+        assert_eq!(v[q * 3 + k], causal || same_img, "mask[{q}][{k}]");
+      }
+    }
+  }
+
+  // ── format_list_with_image: image-first model in a NON-user role ────────
+  //
+  // Distinct from `list_with_image_assistant_role_no_images` (which uses an
+  // image_first=FALSE model, qwen2_vl). Here an image_first=TRUE model
+  // (qwen2_5_vl) in the assistant role takes the `effective_n == 0` →
+  // text_first short-circuit (line 1636 `!image_first || effective_n == 0`),
+  // emitting only the text item with no trailing image push.
+  #[test]
+  fn list_with_image_first_assistant_role_text_only() {
+    let f = MessageFormatter::for_model("qwen2_5_vl").unwrap();
+    let it = items(
+      &f.format_message("hi", &opts_with("assistant", 4, 0))
+        .unwrap(),
+    );
+    assert_eq!(
+      it,
+      vec![ContentItem::Text {
+        text: "hi".to_string()
+      }]
+    );
+  }
+
+  // ── get_message_json: String branch (PromptOnly) via the top-level helper ─
+  //
+  // The existing get_message_json tests only reach the Items branch. Route a
+  // PromptOnly model (florence2) through get_message_json with explicit opts
+  // to cover the FormattedMessage::String return flowing back through the
+  // free function.
+  #[test]
+  fn get_message_json_prompt_only_string_branch() {
+    let opts = opts_with("user", 1, 0);
+    let out = get_message_json("florence2", "describe", Some(&opts)).unwrap();
+    assert_eq!(out, FormattedMessage::String("describe".to_string()));
+  }
 }
