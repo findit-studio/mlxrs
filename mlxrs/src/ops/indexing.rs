@@ -72,6 +72,8 @@ pub fn slice(a: &Array, start: &[i32], stop: &[i32], strides: &[i32]) -> Result<
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.take.html).
 pub fn take(a: &Array, indices: &Array) -> Result<Array> {
+  // Reject Bool indices before the FFI call (see `reject_bool_index`).
+  reject_bool_index("take: index dtype", indices)?;
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
   // early return / panic frees it, then populated by the following call.
@@ -87,6 +89,8 @@ pub fn take(a: &Array, indices: &Array) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.take.html).
 pub fn take_axis(a: &Array, indices: &Array, axis: i32) -> Result<Array> {
+  // Reject Bool indices before the FFI call (see `reject_bool_index`).
+  reject_bool_index("take_axis: index dtype", indices)?;
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
   // early return / panic frees it, then populated by the following call.
@@ -105,6 +109,10 @@ pub fn take_axis(a: &Array, indices: &Array, axis: i32) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.take_along_axis.html).
 pub fn take_along_axis(a: &Array, indices: &Array, axis: i32) -> Result<Array> {
+  // Reject Bool indices before the FFI call (see `reject_bool_index`):
+  // `take_along_axis` builds its `GatherAxis` primitive with no op-build dtype
+  // check, so a Bool index would otherwise be carried into lazy eval.
+  reject_bool_index("take_along_axis: index dtype", indices)?;
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
   // early return / panic frees it, then populated by the following call.
@@ -124,6 +132,10 @@ pub fn take_along_axis(a: &Array, indices: &Array, axis: i32) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.put_along_axis.html).
 pub fn put_along_axis(a: &Array, indices: &Array, values: &Array, axis: i32) -> Result<Array> {
+  // Reject Bool indices before the FFI call (see `reject_bool_index`):
+  // `put_along_axis` builds its `ScatterAxis` primitive with no op-build dtype
+  // check, so a Bool index would otherwise be carried into lazy eval.
+  reject_bool_index("put_along_axis: index dtype", indices)?;
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
   // early return / panic frees it, then populated by the following call.
@@ -156,6 +168,10 @@ pub fn put_along_axis(a: &Array, indices: &Array, values: &Array, axis: i32) -> 
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.scatter_add_axis.html).
 pub fn scatter_add_axis(a: &Array, indices: &Array, values: &Array, axis: i32) -> Result<Array> {
+  // Reject Bool indices before the FFI call (see `reject_bool_index`):
+  // `scatter_add_axis` builds its `ScatterAxis` primitive with no op-build dtype
+  // check, so a Bool index would otherwise be carried into lazy eval.
+  reject_bool_index("scatter_add_axis: index dtype", indices)?;
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
   // early return / panic frees it, then populated by the following call.
@@ -215,6 +231,12 @@ pub fn gather(a: &Array, indices: &[&Array], axes: &[i32], slice_sizes: &[i32]) 
     )));
   }
   crate::shape::validate_dims(slice_sizes)?;
+  // Reject Bool indices before the FFI call (see `reject_bool_index`). Core
+  // `gather` throws `std::invalid_argument` for them (mlx-c catches it), but the
+  // binding guards it here for a uniform typed error across the indexing family.
+  for idx in indices {
+    reject_bool_index("gather: index dtype", idx)?;
+  }
   crate::error::ensure_handler_installed();
   let raw: Vec<mlxrs_sys::mlx_array> = indices.iter().map(|a| a.0).collect();
   // SAFETY: `raw` is a contiguous, live `Vec<mlx_array>` (`mlx_array` is `Copy`);
@@ -268,21 +290,37 @@ pub fn gather(a: &Array, indices: &[&Array], axes: &[i32], slice_sizes: &[i32]) 
 // reachable from a direct argument.
 // ---------------------------------------------------------------------------
 
-/// Reject a Bool-dtype scatter index. mlx core scatter rejects bool indices
-/// with a bare `throw("[scatter] Boolean indices not supported.")` of a string
-/// literal — NOT a `std::exception` — which the mlx-c wrapper's
-/// `catch (std::exception&)` does not catch, so a bool index would unwind
-/// uncaught across the `extern "C"` boundary and terminate the process instead
-/// of returning an error. Guard it binding-side with a typed error. (Float /
-/// inexact indices are thrown as `std::invalid_argument`, which mlx-c DOES catch
-/// and surface via `check()`, so only Bool needs this pre-FFI guard; the mlx-c
-/// `catch (std::exception&)` narrowness is an upstream concern.) `dtype()` is a
-/// cheap metadata read — no eval — unlike index-value bounds checking.
-fn reject_bool_index(idx: &Array) -> Result<()> {
+/// Reject a Bool-dtype index for the gather/scatter indexing family. The
+/// motivating hazard is `mlx::core::scatter`, which rejects bool indices with a
+/// bare `throw("[scatter] Boolean indices not supported.")` of a string literal
+/// — NOT a `std::exception` — which the mlx-c wrapper's `catch (std::exception&)`
+/// does not catch, so a bool index would unwind uncaught across the `extern "C"`
+/// boundary and terminate the process instead of returning an error. Guard it
+/// binding-side with a typed error.
+///
+/// The audit of the merged indexing wrappers against vendored `mlx/ops.cpp`
+/// found two behaviours at op-construction time:
+///   - `gather` (and therefore `take` / `take_axis`, which delegate to it)
+///     throws `std::invalid_argument` for bool indices, which mlx-c DOES catch
+///     and surface via `check()`.
+///   - `take_along_axis` / `put_along_axis` / `scatter_add_axis` build their
+///     `GatherAxis` / `ScatterAxis` primitive with NO op-build dtype check at
+///     all, so a Bool index is not rejected at the binding boundary and is
+///     instead carried into lazy eval (where bool indices are semantically
+///     invalid and unguarded).
+///
+/// Bool indices are meaningless for every integer-gather/scatter op, so this
+/// guard is applied uniformly to all of them: the scatter paths (the
+/// const-char*-thrower) for soundness, and the gather/take family for a
+/// consistent typed `Err` instead of a deeper/less-precise failure. The mlx-c
+/// `catch (std::exception&)` narrowness — and the const-char* throw itself — are
+/// upstream concerns. `dtype()` is a cheap metadata read — no eval — unlike
+/// index-value bounds checking. `context` names the calling op in the error.
+fn reject_bool_index(context: &'static str, idx: &Array) -> Result<()> {
   if idx.dtype()? == Dtype::Bool {
     return Err(Error::InvariantViolation(InvariantViolationPayload::new(
-      "scatter: index dtype",
-      "indices must not be Bool (mlx scatter throws an uncaught C++ exception for bool indices)",
+      context,
+      "indices must not be Bool (Bool indices are not supported by mlx indexing ops)",
     )));
   }
   Ok(())
@@ -329,7 +367,7 @@ fn scatter_multi(
   // Reject Bool indices before the FFI call: mlx core throws an uncaught
   // (non-std::exception) C++ exception for them — see `reject_bool_index`.
   for idx in indices {
-    reject_bool_index(idx)?;
+    reject_bool_index("scatter: index dtype", idx)?;
   }
   crate::error::ensure_handler_installed();
   let raw: Vec<mlxrs_sys::mlx_array> = indices.iter().map(|a| a.0).collect();
@@ -478,7 +516,7 @@ fn scatter_single(
 ) -> Result<Array> {
   // Reject Bool indices before the FFI call (see `reject_bool_index`): mlx core
   // throws an uncaught (non-std::exception) C++ exception for them.
-  reject_bool_index(indices)?;
+  reject_bool_index("scatter: index dtype", indices)?;
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
   // early return / panic frees it, then populated by the following call.

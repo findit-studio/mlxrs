@@ -304,3 +304,87 @@ fn scatter_rejects_bool_index() {
     other => panic!("expected InvariantViolation for bool index (single), got {other:?}"),
   }
 }
+
+#[test]
+fn take_rejects_bool_index() {
+  // mlx routes `take`'s bool check through core `gather` (a std::exception that
+  // mlx-c WOULD catch); the binding still rejects it pre-FFI with a typed error
+  // for a uniform indexing-family contract — see `reject_bool_index`.
+  let a = Array::from_slice::<f32>(&[10.0, 20.0, 30.0], &[3i32]).unwrap();
+  let bool_idx = Array::from_slice::<bool>(&[true], &[1i32]).unwrap();
+  match ops::indexing::take(&a, &bool_idx) {
+    Err(mlxrs::Error::InvariantViolation(p)) => assert_eq!(p.context(), "take: index dtype"),
+    other => panic!("expected InvariantViolation for bool index (take), got {other:?}"),
+  }
+}
+
+#[test]
+fn take_axis_rejects_bool_index() {
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let bool_idx = Array::from_slice::<bool>(&[true], &[1i32]).unwrap();
+  match ops::indexing::take_axis(&a, &bool_idx, 0) {
+    Err(mlxrs::Error::InvariantViolation(p)) => assert_eq!(p.context(), "take_axis: index dtype"),
+    other => panic!("expected InvariantViolation for bool index (take_axis), got {other:?}"),
+  }
+}
+
+#[test]
+fn take_along_axis_rejects_bool_index() {
+  // `take_along_axis` builds its `GatherAxis` primitive with NO op-build dtype
+  // check, so without this guard a Bool index reaches lazy eval; the binding
+  // rejects it pre-FFI with a typed error.
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let bool_idx = Array::from_slice::<bool>(&[true, false], &(2, 1)).unwrap();
+  match ops::indexing::take_along_axis(&a, &bool_idx, 1) {
+    Err(mlxrs::Error::InvariantViolation(p)) => {
+      assert_eq!(p.context(), "take_along_axis: index dtype")
+    }
+    other => panic!("expected InvariantViolation for bool index (take_along_axis), got {other:?}"),
+  }
+}
+
+#[test]
+fn put_along_axis_rejects_bool_index() {
+  // `put_along_axis` builds its `ScatterAxis` primitive with NO op-build dtype
+  // check, so without this guard a Bool index reaches lazy eval.
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let bool_idx = Array::from_slice::<bool>(&[true, false], &(2, 1)).unwrap();
+  let vals = Array::from_slice::<f32>(&[9.0, 9.0], &(2, 1)).unwrap();
+  match ops::indexing::put_along_axis(&a, &bool_idx, &vals, 1) {
+    Err(mlxrs::Error::InvariantViolation(p)) => {
+      assert_eq!(p.context(), "put_along_axis: index dtype")
+    }
+    other => panic!("expected InvariantViolation for bool index (put_along_axis), got {other:?}"),
+  }
+}
+
+#[test]
+fn scatter_add_axis_rejects_bool_index() {
+  // `scatter_add_axis` builds its `ScatterAxis` primitive with NO op-build dtype
+  // check, so without this guard a Bool index reaches lazy eval.
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let bool_idx = Array::from_slice::<bool>(&[true, false], &(2, 1)).unwrap();
+  let vals = Array::from_slice::<f32>(&[9.0, 9.0], &(2, 1)).unwrap();
+  match ops::indexing::scatter_add_axis(&a, &bool_idx, &vals, 1) {
+    Err(mlxrs::Error::InvariantViolation(p)) => {
+      assert_eq!(p.context(), "scatter_add_axis: index dtype")
+    }
+    other => {
+      panic!("expected InvariantViolation for bool index (scatter_add_axis), got {other:?}")
+    }
+  }
+}
+
+#[test]
+fn gather_rejects_bool_index() {
+  // Core `gather` throws `std::invalid_argument` for bool indices (mlx-c WOULD
+  // catch it); the binding still guards it pre-FFI for a uniform typed error
+  // across the indexing family. The length/slice-size guards pass first so the
+  // bool guard is what fires.
+  let a = Array::from_slice::<f32>(&[100.0, 200.0, 300.0], &[3i32]).unwrap();
+  let bool_idx = Array::from_slice::<bool>(&[true], &[1i32]).unwrap();
+  match ops::indexing::gather(&a, &[&bool_idx], &[0], &[1]) {
+    Err(mlxrs::Error::InvariantViolation(p)) => assert_eq!(p.context(), "gather: index dtype"),
+    other => panic!("expected InvariantViolation for bool index (gather), got {other:?}"),
+  }
+}
