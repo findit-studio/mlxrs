@@ -9,12 +9,33 @@
 //!
 //! Mirrors `mlx.core.{conv1d, conv2d, conv3d, conv_transpose1d,
 //! conv_transpose2d, conv_transpose3d, conv_general}`.
+//!
+//! Soundness: MLX divides by `groups` (`in.shape % groups`) and, for the
+//! forward convolutions, by `stride` (output-shape computation), so a value
+//! below 1 from this safe API would be a C++ integer division by zero. The
+//! wrappers reject non-positive `groups`/`stride` with a typed error first.
+//! [`conv_general`] additionally validates each spatial-parameter slice length,
+//! since MLX broadcasts a length-0/1 slice but indexes a longer one in
+//! `[0, spatial_rank)` — any other length would read past the C++ vector.
 
 use crate::{
   array::Array,
-  error::{Result, check},
+  error::{Error, OutOfRangePayload, Result, check},
   stream::default_stream,
 };
+use smol_str::format_smolstr;
+
+/// Reject a `stride`/`groups` value below 1 (a C++ division-by-zero guard).
+fn require_positive(context: &'static str, value: i32) -> Result<()> {
+  if value < 1 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      context,
+      "must be >= 1",
+      format_smolstr!("{value}"),
+    )));
+  }
+  Ok(())
+}
 
 /// 1-D convolution. `input` is `(N, L, C_in)`, `weight` is
 /// `(C_out, K, C_in / groups)`; returns `(N, L_out, C_out)`.
@@ -28,6 +49,8 @@ pub fn conv1d(
   dilation: i32,
   groups: i32,
 ) -> Result<Array> {
+  require_positive("conv1d stride", stride)?;
+  require_positive("conv1d groups", groups)?;
   // SAFETY: fresh out-param handle, wrapped in the RAII newtype first so an
   // early return frees it.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
@@ -61,6 +84,9 @@ pub fn conv2d(
   dilation: (i32, i32),
   groups: i32,
 ) -> Result<Array> {
+  require_positive("conv2d stride", stride.0)?;
+  require_positive("conv2d stride", stride.1)?;
+  require_positive("conv2d groups", groups)?;
   // SAFETY: fresh out-param handle, RAII-wrapped before the populating call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   // SAFETY: borrowed handles live for the call; `out.0` freshly allocated above
@@ -95,6 +121,10 @@ pub fn conv3d(
   dilation: (i32, i32, i32),
   groups: i32,
 ) -> Result<Array> {
+  require_positive("conv3d stride", stride.0)?;
+  require_positive("conv3d stride", stride.1)?;
+  require_positive("conv3d stride", stride.2)?;
+  require_positive("conv3d groups", groups)?;
   // SAFETY: fresh out-param handle, RAII-wrapped before the populating call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   // SAFETY: borrowed handles live for the call; `out.0` freshly allocated above
@@ -133,6 +163,9 @@ pub fn conv_transpose1d(
   output_padding: i32,
   groups: i32,
 ) -> Result<Array> {
+  // Transposed conv multiplies (does not divide) by stride, so only `groups`
+  // is a division-by-zero risk here.
+  require_positive("conv_transpose1d groups", groups)?;
   // SAFETY: fresh out-param handle, RAII-wrapped before the populating call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   // SAFETY: borrowed handles live for the call; `out.0` freshly allocated above
@@ -165,6 +198,7 @@ pub fn conv_transpose2d(
   output_padding: (i32, i32),
   groups: i32,
 ) -> Result<Array> {
+  require_positive("conv_transpose2d groups", groups)?;
   // SAFETY: fresh out-param handle, RAII-wrapped before the populating call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   // SAFETY: borrowed handles live for the call; `out.0` freshly allocated above
@@ -201,6 +235,7 @@ pub fn conv_transpose3d(
   output_padding: (i32, i32, i32),
   groups: i32,
 ) -> Result<Array> {
+  require_positive("conv_transpose3d groups", groups)?;
   // SAFETY: fresh out-param handle, RAII-wrapped before the populating call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   // SAFETY: borrowed handles live for the call; `out.0` freshly allocated above
@@ -232,8 +267,10 @@ pub fn conv_transpose3d(
 /// General N-D convolution — the primitive `conv1d`/`conv2d`/`conv3d` build on.
 ///
 /// Each slice carries one value per spatial axis (`stride`, `kernel_dilation`,
-/// `input_dilation`) or per side (`padding_lo`, `padding_hi`). `flip` selects a
-/// true convolution (kernel flipped) over the default cross-correlation.
+/// `input_dilation`) or per side (`padding_lo`, `padding_hi`); a length of 0 or
+/// 1 is broadcast across the spatial axes, otherwise the length must equal the
+/// input spatial rank. `flip` selects a true convolution (kernel flipped) over
+/// the default cross-correlation.
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.conv_general.html).
 #[allow(clippy::too_many_arguments)]
@@ -248,11 +285,36 @@ pub fn conv_general(
   groups: i32,
   flip: bool,
 ) -> Result<Array> {
+  require_positive("conv_general groups", groups)?;
+  // MLX broadcasts a length-0 or length-1 spatial slice, but uses a longer one
+  // as-is and then indexes it in `[0, spatial_rank)`, so any other length reads
+  // past the C++ vector. Spatial rank is `ndim - 2` (channels-last).
+  let spatial_rank = input.shape().len().saturating_sub(2);
+  for (context, slice) in [
+    ("conv_general stride", stride),
+    ("conv_general padding_lo", padding_lo),
+    ("conv_general padding_hi", padding_hi),
+    ("conv_general kernel_dilation", kernel_dilation),
+    ("conv_general input_dilation", input_dilation),
+  ] {
+    if !(slice.is_empty() || slice.len() == 1 || slice.len() == spatial_rank) {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        context,
+        "length must be 0, 1, or the input spatial rank",
+        format_smolstr!("{}", slice.len()),
+      )));
+    }
+  }
+  // stride is divided in the output-shape computation; reject non-positive.
+  for &s in stride {
+    require_positive("conv_general stride", s)?;
+  }
   // SAFETY: fresh out-param handle, RAII-wrapped before the populating call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   // SAFETY: each `as_ptr()`/`len()` pair describes a slice valid for the whole
-  // call; mlx-c copies the spatial-param arrays rather than retaining them.
-  // `out.0` was freshly allocated above and is written here; rc via `check`.
+  // call (lengths validated above); mlx-c copies the spatial-param arrays rather
+  // than retaining them. `out.0` was freshly allocated above and is written
+  // here; rc via `check`.
   check(unsafe {
     mlxrs_sys::mlx_conv_general(
       &mut out.0,
@@ -279,7 +341,7 @@ pub fn conv_general(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{Array, Result};
+  use crate::{Array, Result, error::Error};
 
   #[test]
   fn conv1d_cross_correlation_closed_form() -> Result<()> {
@@ -344,5 +406,46 @@ mod tests {
     let out = conv_transpose1d(&input, &weight, 1, 0, 1, 0, 1)?;
     assert_eq!(out.shape(), vec![1, 3, 1]);
     Ok(())
+  }
+
+  #[test]
+  fn conv1d_rejects_non_positive_groups() {
+    // groups = 0 would reach C++ `in.shape % groups` (division by zero); negative
+    // groups is equally invalid. Both must be a typed Err, never UB.
+    let input = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[1, 4, 1]).unwrap();
+    let weight = Array::from_slice::<f32>(&[1.0, 0.0, -1.0], &[1, 3, 1]).unwrap();
+    let zero = conv1d(&input, &weight, 1, 0, 1, 0).expect_err("groups=0 must be rejected");
+    assert!(matches!(zero, Error::OutOfRange(_)), "got {zero:?}");
+    let neg = conv1d(&input, &weight, 1, 0, 1, -1).expect_err("negative groups must be rejected");
+    assert!(matches!(neg, Error::OutOfRange(_)), "got {neg:?}");
+  }
+
+  #[test]
+  fn conv1d_rejects_zero_stride() {
+    // stride = 0 would divide by zero in the output-shape computation.
+    let input = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[1, 4, 1]).unwrap();
+    let weight = Array::from_slice::<f32>(&[1.0, 0.0, -1.0], &[1, 3, 1]).unwrap();
+    let err = conv1d(&input, &weight, 0, 0, 1, 1).expect_err("stride=0 must be rejected");
+    assert!(matches!(err, Error::OutOfRange(_)), "got {err:?}");
+  }
+
+  #[test]
+  fn conv_general_rejects_mismatched_slice_length() {
+    // 1-D input (spatial rank 1); a length-2 stride slice would index past the
+    // C++ vector. Must be rejected before the FFI.
+    let input = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[1, 4, 1]).unwrap();
+    let weight = Array::from_slice::<f32>(&[1.0, 0.0, -1.0], &[1, 3, 1]).unwrap();
+    let err = conv_general(&input, &weight, &[1, 1], &[0], &[0], &[1], &[1], 1, false)
+      .expect_err("len-2 spatial slice on a 1-D conv must be rejected");
+    assert!(matches!(err, Error::OutOfRange(_)), "got {err:?}");
+  }
+
+  #[test]
+  fn conv_general_rejects_non_positive_groups() {
+    let input = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[1, 4, 1]).unwrap();
+    let weight = Array::from_slice::<f32>(&[1.0, 0.0, -1.0], &[1, 3, 1]).unwrap();
+    let err = conv_general(&input, &weight, &[1], &[0], &[0], &[1], &[1], 0, false)
+      .expect_err("groups=0 must be rejected");
+    assert!(matches!(err, Error::OutOfRange(_)), "got {err:?}");
   }
 }
