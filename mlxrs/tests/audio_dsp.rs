@@ -8,8 +8,8 @@ use std::f32::consts::PI;
 use mlxrs::{
   Array, Dtype,
   audio::dsp::{
-    LogFloor, WindowPad, hann_window, log_mel_spectrogram, log_mel_spectrogram_with,
-    mel_filter_bank, mel_spectrogram, stft,
+    LogFloor, MelPrecision, WindowPad, hann_window, log_mel_spectrogram, log_mel_spectrogram_with,
+    mel_filter_bank, mel_filter_bank_with, mel_spectrogram, stft,
   },
 };
 
@@ -188,6 +188,91 @@ fn mel_filter_bank_values_are_nonneg() {
   for v in bank.to_vec::<f32>().unwrap() {
     assert!(v >= 0.0, "negative mel weight: {v}");
   }
+}
+
+// ---- precise (f64) mel filterbank (#291) ---------------------------------
+
+/// The precise (f64) bank has the same `(n_mels, n_freqs)` shape as the f32
+/// path. `mel_filter_bank_with(.., Standard)` is also the same shape as the
+/// shorthand `mel_filter_bank`.
+#[test]
+fn mel_filter_bank_precise_shape_matches() {
+  let std_bank = mel_filter_bank_with(80, 400, 16_000, 0.0, None, MelPrecision::Standard).unwrap();
+  let precise = mel_filter_bank_with(80, 400, 16_000, 0.0, None, MelPrecision::Precise).unwrap();
+  assert_eq!(std_bank.shape(), vec![80, 201]);
+  assert_eq!(precise.shape(), vec![80, 201]);
+}
+
+/// `mel_filter_bank_with(.., Standard)` is byte-identical to the historic
+/// `mel_filter_bank` shorthand (the f32 path is unchanged by #291).
+#[test]
+fn mel_filter_bank_with_standard_matches_shorthand() {
+  let mut shorthand = mel_filter_bank(80, 400, 16_000, 0.0, None).unwrap();
+  let mut with_std =
+    mel_filter_bank_with(80, 400, 16_000, 0.0, None, MelPrecision::Standard).unwrap();
+  assert_eq!(
+    shorthand.to_vec::<f32>().unwrap(),
+    with_std.to_vec::<f32>().unwrap(),
+    "Standard precision must match the f32 shorthand bit-for-bit"
+  );
+}
+
+/// The whole point of the precise mode: the f64-computed bank is NOT
+/// bit-identical to the f32 bank (it tracks a float64 reference more
+/// closely), yet stays within a small tolerance of it — the f32 path drifts
+/// only ~5e-6 from the precise reference, so the two banks must be close.
+#[test]
+fn mel_filter_bank_precise_differs_but_close() {
+  let mut std_bank =
+    mel_filter_bank_with(80, 400, 16_000, 0.0, None, MelPrecision::Standard).unwrap();
+  let mut precise =
+    mel_filter_bank_with(80, 400, 16_000, 0.0, None, MelPrecision::Precise).unwrap();
+  let s = std_bank.to_vec::<f32>().unwrap();
+  let p = precise.to_vec::<f32>().unwrap();
+  assert_eq!(s.len(), p.len(), "shape mismatch between precisions");
+
+  // NOT bit-identical — at least one cell must differ (the precise path
+  // recomputes the divisions / mel scale in f64, so rounding diverges).
+  assert!(
+    s.iter().zip(&p).any(|(a, b)| a.to_bits() != b.to_bits()),
+    "precise bank must differ from the f32 bank (otherwise the f64 path is a no-op)"
+  );
+
+  // ...but close: the f32 path is documented to drift only ~5e-6 from the
+  // float64 reference. 1e-4 is a comfortable ceiling on the [0, 1] weights.
+  let max_abs = s
+    .iter()
+    .zip(&p)
+    .map(|(a, b)| (a - b).abs())
+    .fold(0.0_f32, f32::max);
+  assert!(
+    max_abs < 1e-4,
+    "precise vs f32 max abs diff {max_abs} exceeds 1e-4"
+  );
+}
+
+/// The precise bank stays non-negative (the triangular filter clamps via
+/// `.max(0.0)` in f64 just as the f32 path does).
+#[test]
+fn mel_filter_bank_precise_values_are_nonneg() {
+  let mut bank = mel_filter_bank_with(8, 64, 16_000, 0.0, None, MelPrecision::Precise).unwrap();
+  for v in bank.to_vec::<f32>().unwrap() {
+    assert!(v >= 0.0, "negative precise mel weight: {v}");
+  }
+}
+
+/// The precise path enforces the same validation as the f32 path (shared
+/// guards in `mel_filter_bank_with`).
+#[test]
+fn mel_filter_bank_precise_rejects_invalid_inputs() {
+  assert!(matches!(
+    mel_filter_bank_with(0, 400, 16_000, 0.0, None, MelPrecision::Precise),
+    Err(mlxrs::Error::InvariantViolation(_))
+  ));
+  assert!(matches!(
+    mel_filter_bank_with(40, 400, 16_000, 1000.0, Some(500.0), MelPrecision::Precise),
+    Err(mlxrs::Error::OutOfRange(_))
+  ));
 }
 
 #[test]
