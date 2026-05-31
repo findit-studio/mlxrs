@@ -2306,7 +2306,73 @@ fn mel_to_hz(mel: f32) -> f32 {
   MEL_HZ_BREAK * (MEL_LOG_BASE.powf(mel / MEL_HZ_DIV) - 1.0)
 }
 
-/// Triangular mel filterbank matrix of shape `(n_mels, n_fft / 2 + 1)`.
+/// HTK mel scale in `f64` — the precise ([`MelPrecision::Precise`]) twin of
+/// [`hz_to_mel`]. Identical formula, evaluated in double precision so the mel
+/// grid matches a torchaudio float64 reference to ~1 ULP rather than drifting
+/// ~5e-6 in the f32 path. The constants are the same literals widened to `f64`.
+#[inline]
+fn hz_to_mel_f64(hz: f64) -> f64 {
+  f64::from(MEL_HZ_DIV) * (1.0 + hz / f64::from(MEL_HZ_BREAK)).log10()
+}
+
+/// Inverse HTK mel scale in `f64` — the precise ([`MelPrecision::Precise`])
+/// twin of [`mel_to_hz`]. Identical formula, double precision (see
+/// [`hz_to_mel_f64`]).
+#[inline]
+fn mel_to_hz_f64(mel: f64) -> f64 {
+  f64::from(MEL_HZ_BREAK) * (f64::from(MEL_LOG_BASE).powf(mel / f64::from(MEL_HZ_DIV)) - 1.0)
+}
+
+/// Computation precision for [`mel_filter_bank_with`] / the precise mel
+/// filterbank path.
+///
+/// The default [`MelPrecision::Standard`] path builds the frequency grid, the
+/// HTK mel grid, and the triangular filters in `f32` (the historic mlxrs
+/// behavior; bit-for-bit unchanged and routed through the
+/// [`crate::simd::audio::mel_triangle`] SIMD kernel). [`MelPrecision::Precise`]
+/// performs the same arithmetic in `f64` on the CPU and casts the final
+/// `(n_mels, n_freqs)` bank back to `f32` before returning the [`Array`].
+///
+/// # Why a precise mode
+///
+/// The default f32 filterbank drifts by roughly `5e-6` from a torchaudio
+/// float64 reference (accumulated rounding in the `linspace` / mel-scale /
+/// triangle divisions). For most pipelines that is negligible, but it is
+/// enough to perturb the CTC decode of numerically-sensitive models. Mirrors
+/// `mlx-audio`'s `mel_filters(..., precise=True)`: compute in float64, then
+/// cast to f32. The cost is a one-time CPU build on a cache miss; the runtime
+/// (the cached `mel_bank @ power` matmul) is unaffected.
+///
+/// `MelPrecision` is a typed flag rather than a `precise: bool` so the choice
+/// is self-documenting at the call site and so the per-thread filterbank cache
+/// can key on it directly (an f32 bank and an f64 bank for otherwise-identical
+/// parameters are distinct entries — see [`mel_filter_bank_cached_with`]).
+#[derive(
+  Debug, Clone, Copy, PartialEq, Eq, Hash, Default, derive_more::Display, derive_more::IsVariant,
+)]
+#[display("{}", self.as_str())]
+pub enum MelPrecision {
+  /// Build the filterbank in `f32` (historic mlxrs default; bit-identical to
+  /// pre-#291 behavior, SIMD-accelerated triangle construction).
+  #[default]
+  Standard,
+  /// Build the filterbank in `f64` on the CPU, then cast the final bank to
+  /// `f32`. Closer to a torchaudio float64 reference (~1 ULP vs ~5e-6).
+  Precise,
+}
+
+impl MelPrecision {
+  /// The canonical lowercase string representation (`standard`/`precise`).
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Standard => "standard",
+      Self::Precise => "precise",
+    }
+  }
+}
+
+/// Triangular mel filterbank matrix of shape `(n_mels, n_fft / 2 + 1)` built
+/// in `f32` ([`MelPrecision::Standard`]).
 ///
 /// Faithful port of `mlx_audio.dsp.mel_filters(sample_rate, n_fft, n_mels,
 /// f_min, f_max, norm=None, mel_scale="htk")` — the HTK formula only;
@@ -2316,6 +2382,11 @@ fn mel_to_hz(mel: f32) -> f32 {
 /// builds frequency points via `mx.linspace(0, sample_rate // 2, n_freqs)`
 /// which integer-divides the Nyquist — we mirror that exactly (using
 /// `sample_rate as f32 / 2.0` would drift by 0.5 for odd sample rates).
+///
+/// This is the historic mlxrs default; the result is bit-for-bit identical to
+/// pre-#291 behavior. For a float64 computation that tracks a torchaudio
+/// reference more closely, see [`mel_filter_bank_with`] with
+/// [`MelPrecision::Precise`].
 ///
 /// # Errors
 /// - Typed errors: [`Error::InvariantViolation`] if `n_fft == 0` or `n_mels == 0`;
@@ -2327,6 +2398,45 @@ pub fn mel_filter_bank(
   sample_rate: u32,
   f_min: f32,
   f_max: Option<f32>,
+) -> Result<Array> {
+  mel_filter_bank_with(
+    n_mels,
+    n_fft,
+    sample_rate,
+    f_min,
+    f_max,
+    MelPrecision::Standard,
+  )
+}
+
+/// Triangular mel filterbank matrix of shape `(n_mels, n_fft / 2 + 1)`,
+/// choosing the computation precision via [`MelPrecision`].
+///
+/// [`MelPrecision::Standard`] is identical to [`mel_filter_bank`] (f32, SIMD
+/// triangle construction). [`MelPrecision::Precise`] builds the frequency
+/// grid, the HTK mel grid, and the triangular filters in `f64` on the CPU,
+/// then casts the final `(n_mels, n_freqs)` bank back to `f32` — the same
+/// float64-then-cast strategy used by [`lfilter`] and by
+/// `mlx-audio`'s `mel_filters(..., precise=True)`. The default f32 path drifts
+/// ~`5e-6` from a torchaudio float64 reference; the precise path closes that
+/// to ~1 ULP (enough to stabilize CTC decode in numerically-sensitive
+/// models). The precise build is a one-time CPU cost on a cache miss (see
+/// [`mel_filter_bank_cached_with`]); the runtime matmul is unaffected.
+///
+/// The HTK formula, the integer-divided Nyquist (`sample_rate / 2`), the
+/// validation, and the work/allocation caps are all identical across
+/// precisions — only the per-element dtype of the intermediate frequency /
+/// mel / triangle arithmetic differs.
+///
+/// # Errors
+/// - Same as [`mel_filter_bank`].
+pub fn mel_filter_bank_with(
+  n_mels: usize,
+  n_fft: usize,
+  sample_rate: u32,
+  f_min: f32,
+  f_max: Option<f32>,
+  precision: MelPrecision,
 ) -> Result<Array> {
   if n_fft == 0 {
     return Err(Error::InvariantViolation(InvariantViolationPayload::new(
@@ -2394,6 +2504,27 @@ pub fn mel_filter_bank(
       format_smolstr!("{n_freqs}"),
     ))
   })?;
+
+  // Precise (f64) path: build the frequency grid, the mel grid, and the
+  // triangular filters entirely in `f64`, then cast the final
+  // `(n_mels, n_freqs)` bank to `f32` before handing it to mlx — the same
+  // float64-then-cast strategy as `lfilter`. Validation, the sizing caps,
+  // and the i32 shape bounds above are shared with the f32 path; only the
+  // intermediate dtype differs. The f32 path below stays bit-for-bit
+  // unchanged (and SIMD-accelerated) so existing callers are unaffected.
+  if precision.is_precise() {
+    return mel_filter_bank_f64(
+      n_mels,
+      n_freqs,
+      n_pts,
+      bank_len,
+      n_mels_i32,
+      n_freqs_i32,
+      sample_rate,
+      f_min,
+      f_max,
+    );
+  }
 
   // `all_freqs[i] = i * (sample_rate / 2) / (n_freqs - 1)` for the python
   // `mx.linspace(0, sample_rate // 2, n_freqs)` form. Build CPU-side;
@@ -2474,6 +2605,124 @@ pub fn mel_filter_bank(
   Array::from_slice::<f32>(&bank, &[n_mels_i32, n_freqs_i32])
 }
 
+/// Precise (`f64`) filterbank construction for [`mel_filter_bank_with`] with
+/// [`MelPrecision::Precise`]. Mirrors the f32 path's frequency / mel / triangle
+/// math line-for-line in double precision, then casts the final
+/// `(n_mels, n_freqs)` bank to `f32` (the `lfilter` float64-then-cast idiom).
+///
+/// All arguments are the already-validated, already-bounded values computed by
+/// the public wrapper: `n_freqs == n_fft / 2 + 1`, `n_pts == n_mels + 2`,
+/// `bank_len == n_mels * n_freqs` (checked, no overflow), and `n_mels_i32` /
+/// `n_freqs_i32` the i32 shape; `f_max` is the resolved (`None` → Nyquist)
+/// value. Re-validating here would duplicate the wrapper's guards, so this
+/// helper is private and trusts its caller's invariants.
+///
+/// # Errors
+/// - [`Error::AllocFailure`] if any of the three `f64` reservations or the
+///   final `f32` cast reservation fails.
+#[allow(clippy::too_many_arguments)]
+fn mel_filter_bank_f64(
+  n_mels: usize,
+  n_freqs: usize,
+  n_pts: usize,
+  bank_len: usize,
+  n_mels_i32: i32,
+  n_freqs_i32: i32,
+  sample_rate: u32,
+  f_min: f32,
+  f_max: f32,
+) -> Result<Array> {
+  // `all_freqs[i] = i * (sample_rate / 2) / (n_freqs - 1)` in f64 — the
+  // f32 path's `mx.linspace(0, sample_rate // 2, n_freqs)` form widened.
+  // The integer-divided Nyquist (`sample_rate / 2`, NOT `/ 2.0`) is kept
+  // identical to the f32 path so only the floating arithmetic precision
+  // differs, never the grid definition.
+  let nyq = f64::from(sample_rate / 2);
+  let denom = (n_freqs as f64 - 1.0).max(1.0);
+  let mut all_freqs: Vec<f64> = Vec::new();
+  all_freqs.try_reserve_exact(n_freqs).map_err(|e| {
+    Error::AllocFailure(AllocFailurePayload::new(
+      "mel_filter_bank: all_freqs reservation (precise)",
+      "f64 elements",
+      n_freqs as u64,
+      e,
+    ))
+  })?;
+  for i in 0..n_freqs {
+    all_freqs.push(i as f64 * nyq / denom);
+  }
+
+  // Mel grid: `n_mels + 2` points, evaluated in f64 (mirrors the f32 path).
+  let m_min = hz_to_mel_f64(f64::from(f_min));
+  let m_max = hz_to_mel_f64(f64::from(f_max));
+  let m_denom = (n_pts as f64 - 1.0).max(1.0);
+  let mut f_pts: Vec<f64> = Vec::new();
+  f_pts.try_reserve_exact(n_pts).map_err(|e| {
+    Error::AllocFailure(AllocFailurePayload::new(
+      "mel_filter_bank: f_pts reservation (precise)",
+      "f64 elements",
+      n_pts as u64,
+      e,
+    ))
+  })?;
+  for i in 0..n_pts {
+    let m = m_min + (m_max - m_min) * (i as f64) / m_denom;
+    f_pts.push(mel_to_hz_f64(m));
+  }
+
+  // Triangular filters in f64. Mirrors the SCALAR reference
+  // (`simd::audio::mel_triangle::mel_filter_bank_rows_scalar`) exactly
+  // modulo dtype: per row, `up = (freq - left) / lc`,
+  // `down = (right - freq) / cr`, `v = up.min(down).max(0.0)`, and a
+  // zero-width triangle (`lc <= 0.0` or `cr <= 0.0`) writes 0.0 across the
+  // row. The direct `(freq - left) / lc` form (not the f32 SIMD kernel's
+  // algebraically-equal `freq * inv_lc - left_over_lc` rearrangement) is
+  // the canonical computation a torchaudio float64 reference performs.
+  let mut bank: Vec<f64> = Vec::new();
+  bank.try_reserve_exact(bank_len).map_err(|e| {
+    Error::AllocFailure(AllocFailurePayload::new(
+      "mel_filter_bank: bank reservation (precise)",
+      "f64 elements",
+      bank_len as u64,
+      e,
+    ))
+  })?;
+  for m in 0..n_mels {
+    let left = f_pts[m];
+    let center = f_pts[m + 1];
+    let right = f_pts[m + 2];
+    let lc = center - left;
+    let cr = right - center;
+    if lc <= 0.0 || cr <= 0.0 {
+      // Zero-width triangle — the whole row is 0.0.
+      bank.resize(bank.len() + n_freqs, 0.0);
+      continue;
+    }
+    for &freq in &all_freqs {
+      let up = (freq - left) / lc;
+      let down = (right - freq) / cr;
+      bank.push(up.min(down).max(0.0));
+    }
+  }
+
+  // Cast the f64 bank down to f32 for the mlxrs audio dtype (mirrors
+  // `lfilter`'s `for v in &y_f64 { y.push(*v as f32) }` boundary).
+  let mut bank_f32: Vec<f32> = Vec::new();
+  bank_f32.try_reserve_exact(bank_len).map_err(|e| {
+    Error::AllocFailure(AllocFailurePayload::new(
+      "mel_filter_bank: bank f32 cast reservation (precise)",
+      "f32 elements",
+      bank_len as u64,
+      e,
+    ))
+  })?;
+  for &v in &bank {
+    bank_f32.push(v as f32);
+  }
+
+  Array::from_slice::<f32>(&bank_f32, &[n_mels_i32, n_freqs_i32])
+}
+
 /// Maximum number of `(sample_rate, n_fft, n_mels, f_min, f_max)` triples kept
 /// per thread by [`mel_filter_bank_cached`]. A handful covers every realistic
 /// pipeline (one front-end per loaded model, occasionally a second per
@@ -2494,6 +2743,14 @@ pub const MEL_FILTER_CACHE_CAP: usize = 8;
 /// the explicitly-passed value `Some(sample_rate / 2)` (the two compute
 /// to byte-identical banks, but caching them separately keeps the
 /// cache transparent — never silently aliasing two distinct API calls).
+///
+/// `precision` ([`MelPrecision`]) is part of the key so an f32
+/// ([`MelPrecision::Standard`]) bank and an f64 ([`MelPrecision::Precise`])
+/// bank built from otherwise-identical parameters never collide — the two are
+/// numerically different matrices (the whole point of the precise mode), so
+/// returning one for a request for the other would be a silent correctness
+/// bug. `MelPrecision` is `Eq + Hash` (no float payload), so it participates
+/// in the derived `PartialEq`/`Eq` directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MelFilterCacheKey {
   n_mels: usize,
@@ -2501,16 +2758,25 @@ struct MelFilterCacheKey {
   sample_rate: u32,
   f_min_bits: u32,
   f_max_bits: Option<u32>,
+  precision: MelPrecision,
 }
 
 impl MelFilterCacheKey {
-  fn new(n_mels: usize, n_fft: usize, sample_rate: u32, f_min: f32, f_max: Option<f32>) -> Self {
+  fn new(
+    n_mels: usize,
+    n_fft: usize,
+    sample_rate: u32,
+    f_min: f32,
+    f_max: Option<f32>,
+    precision: MelPrecision,
+  ) -> Self {
     Self {
       n_mels,
       n_fft,
       sample_rate,
       f_min_bits: f_min.to_bits(),
       f_max_bits: f_max.map(f32::to_bits),
+      precision,
     }
   }
 }
@@ -2553,11 +2819,16 @@ thread_local! {
 /// exactly (the first call delegates through it); a cached hit returns
 /// the same `Array` value-for-value.
 ///
+/// Caches the [`MelPrecision::Standard`] (f32) bank. For the precise (f64)
+/// bank — cached under a distinct key so the two never collide — use
+/// [`mel_filter_bank_cached_with`].
+///
 /// # Errors
 /// - Same as [`mel_filter_bank`].
 ///
 /// # See also
 /// - [`mel_filter_bank`] — the uncached construction path.
+/// - [`mel_filter_bank_cached_with`] — precision-selecting cached variant.
 /// - [`clear_mel_filter_cache`] — empties the per-thread cache (test /
 ///   memory-pressure use).
 pub fn mel_filter_bank_cached(
@@ -2567,7 +2838,43 @@ pub fn mel_filter_bank_cached(
   f_min: f32,
   f_max: Option<f32>,
 ) -> Result<Array> {
-  let key = MelFilterCacheKey::new(n_mels, n_fft, sample_rate, f_min, f_max);
+  mel_filter_bank_cached_with(
+    n_mels,
+    n_fft,
+    sample_rate,
+    f_min,
+    f_max,
+    MelPrecision::Standard,
+  )
+}
+
+/// Cached variant of [`mel_filter_bank_with`] — the precision-selecting twin of
+/// [`mel_filter_bank_cached`].
+///
+/// Identical caching semantics (per-thread LRU bounded at
+/// [`MEL_FILTER_CACHE_CAP`], `try_clone` on hit, no caching of a failed build)
+/// but the cache key includes the [`MelPrecision`], so an f32
+/// ([`MelPrecision::Standard`]) bank and an f64 ([`MelPrecision::Precise`])
+/// bank for otherwise-identical `(n_mels, n_fft, sample_rate, f_min, f_max)`
+/// parameters occupy **distinct** cache slots and never alias. A miss builds
+/// via [`mel_filter_bank_with`] (so the precise path's one-time f64 build cost
+/// is paid once per parameter set, then memoized like the f32 path).
+///
+/// # Errors
+/// - Same as [`mel_filter_bank`].
+///
+/// # See also
+/// - [`mel_filter_bank_with`] — the uncached, precision-selecting path.
+/// - [`mel_filter_bank_cached`] — the [`MelPrecision::Standard`] shorthand.
+pub fn mel_filter_bank_cached_with(
+  n_mels: usize,
+  n_fft: usize,
+  sample_rate: u32,
+  f_min: f32,
+  f_max: Option<f32>,
+  precision: MelPrecision,
+) -> Result<Array> {
+  let key = MelFilterCacheKey::new(n_mels, n_fft, sample_rate, f_min, f_max, precision);
 
   // Fast path: lookup + move-to-front for LRU semantics.
   let hit = MEL_FILTER_CACHE.with(|cell| -> Result<Option<Array>> {
@@ -2591,7 +2898,7 @@ pub fn mel_filter_bank_cached(
   // recoverable typed error (invalid params, work cap, etc.); we
   // propagate that error WITHOUT touching the cache, so a failed call
   // cannot poison the cache with an absent or invalid entry.
-  let bank = mel_filter_bank(n_mels, n_fft, sample_rate, f_min, f_max)?;
+  let bank = mel_filter_bank_with(n_mels, n_fft, sample_rate, f_min, f_max, precision)?;
 
   // Cache the just-built bank. Hold a `try_clone` for the caller so the
   // cached entry is independent. Eviction when full: drop the LRU
@@ -6134,6 +6441,93 @@ mod tests {
     clear_mel_filter_cache();
   }
 
+  // ---- precise (f64) cached mel filterbank (#291) --------------------------
+
+  /// The cached precise path returns the same bank as the UNcached precise
+  /// path (memoization is transparent).
+  #[test]
+  fn mel_filter_bank_cached_precise_matches_uncached_precise() {
+    clear_mel_filter_cache();
+    let plain = mel_filter_bank_with(80, 400, 16_000, 0.0, None, MelPrecision::Precise).unwrap();
+    let cached =
+      mel_filter_bank_cached_with(80, 400, 16_000, 0.0, None, MelPrecision::Precise).unwrap();
+    assert_eq!(
+      to_vec(&plain),
+      to_vec(&cached),
+      "cached precise bank must match the uncached precise bank value-for-value"
+    );
+    clear_mel_filter_cache();
+  }
+
+  /// The precise (f64) and standard (f32) banks for IDENTICAL parameters are
+  /// cached under DISTINCT keys — no collision. After fetching both, the
+  /// cache holds two entries, and each precision returns its own (different)
+  /// bank rather than aliasing the other.
+  #[test]
+  fn mel_filter_bank_cached_precision_does_not_collide() {
+    clear_mel_filter_cache();
+    let std_bank =
+      mel_filter_bank_cached_with(80, 400, 16_000, 0.0, None, MelPrecision::Standard).unwrap();
+    let precise =
+      mel_filter_bank_cached_with(80, 400, 16_000, 0.0, None, MelPrecision::Precise).unwrap();
+
+    // Two distinct cache entries for the same (n_mels, n_fft, sample_rate,
+    // f_min, f_max) at different precisions — the key includes precision.
+    let len = MEL_FILTER_CACHE.with(|cell| cell.borrow().len());
+    assert_eq!(
+      len, 2,
+      "standard and precise banks for identical params must occupy distinct cache slots"
+    );
+
+    // The two banks differ (the f64 path is not a no-op) — proving the cache
+    // returned the precision-correct entry, not a collision.
+    assert_ne!(
+      to_vec(&std_bank),
+      to_vec(&precise),
+      "precise cache hit must not alias the standard bank"
+    );
+
+    // A repeat fetch of each precision still resolves to its own bank.
+    let std_again =
+      mel_filter_bank_cached_with(80, 400, 16_000, 0.0, None, MelPrecision::Standard).unwrap();
+    let precise_again =
+      mel_filter_bank_cached_with(80, 400, 16_000, 0.0, None, MelPrecision::Precise).unwrap();
+    assert_eq!(to_vec(&std_bank), to_vec(&std_again));
+    assert_eq!(to_vec(&precise), to_vec(&precise_again));
+    // Still exactly two entries (the repeats were hits, not new inserts).
+    let len2 = MEL_FILTER_CACHE.with(|cell| cell.borrow().len());
+    assert_eq!(len2, 2, "repeat fetches must hit, not insert new entries");
+    clear_mel_filter_cache();
+  }
+
+  /// The cache KEY itself distinguishes precision: two keys equal in every
+  /// parameter but precision are unequal (the structural guarantee behind
+  /// the no-collision behavior above).
+  #[test]
+  fn mel_filter_cache_key_distinguishes_precision() {
+    let std_key = MelFilterCacheKey::new(80, 400, 16_000, 0.0, None, MelPrecision::Standard);
+    let precise_key = MelFilterCacheKey::new(80, 400, 16_000, 0.0, None, MelPrecision::Precise);
+    assert_ne!(
+      std_key, precise_key,
+      "cache keys differing only in precision must be unequal"
+    );
+  }
+
+  /// `mel_filter_bank_cached` (no precision arg) is the `Standard` shorthand:
+  /// it shares the cache slot with `mel_filter_bank_cached_with(.., Standard)`.
+  #[test]
+  fn mel_filter_bank_cached_shorthand_is_standard() {
+    clear_mel_filter_cache();
+    let shorthand = mel_filter_bank_cached(80, 400, 16_000, 0.0, None).unwrap();
+    let with_std =
+      mel_filter_bank_cached_with(80, 400, 16_000, 0.0, None, MelPrecision::Standard).unwrap();
+    assert_eq!(to_vec(&shorthand), to_vec(&with_std));
+    // Both resolved to the SAME cache slot — only one entry exists.
+    let len = MEL_FILTER_CACHE.with(|cell| cell.borrow().len());
+    assert_eq!(len, 1, "shorthand and Standard must share one cache slot");
+    clear_mel_filter_cache();
+  }
+
   // ---- magic constants are named ---------------------------
 
   /// Pin the exact named-constant values that mlx-audio expects by
@@ -6160,6 +6554,20 @@ mod tests {
     assert_eq!(LogFloor::Custom(f32::NAN).value(), f32::MIN_POSITIVE);
     assert_eq!(LogFloor::Custom(-1.0).value(), f32::MIN_POSITIVE);
     assert_eq!(LogFloor::Custom(0.0).value(), f32::MIN_POSITIVE);
+  }
+
+  /// `MelPrecision` surface: default is `Standard`, `as_str` /
+  /// `Display` match the lowercase names, and the `IsVariant` predicates
+  /// discriminate the two variants.
+  #[test]
+  fn mel_precision_surface() {
+    assert_eq!(MelPrecision::default(), MelPrecision::Standard);
+    assert_eq!(MelPrecision::Standard.as_str(), "standard");
+    assert_eq!(MelPrecision::Precise.as_str(), "precise");
+    assert_eq!(MelPrecision::Precise.to_string(), "precise");
+    assert!(MelPrecision::Standard.is_standard());
+    assert!(MelPrecision::Precise.is_precise());
+    assert!(!MelPrecision::Standard.is_precise());
   }
 
   // ---- StftConfig + stft_with_config + stft_aligned (#134) -----------------
