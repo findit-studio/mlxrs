@@ -292,8 +292,8 @@ where
   // on this thread).
   if guard.0.ctx.is_null() {
     let last = crate::error::take_last();
-    return Err(last.unwrap_or(Error::Backend(
-      "mlx_map_string_to_array_new() returned NULL sentinel (allocation failure)".into(),
+    return Err(last.unwrap_or(Error::FfiNullHandle(
+      crate::error::FfiNullHandlePayload::new("mlx_map_string_to_array_new"),
     )));
   }
   for (k, v) in arrays {
@@ -346,8 +346,8 @@ fn build_string_map(meta: &HashMap<String, String>) -> Result<mlxrs_sys::mlx_map
   // poison the next unrelated mlx-c call on this thread).
   if guard.0.ctx.is_null() {
     let last = crate::error::take_last();
-    return Err(last.unwrap_or(Error::Backend(
-      "mlx_map_string_to_string_new() returned NULL sentinel (allocation failure)".into(),
+    return Err(last.unwrap_or(Error::FfiNullHandle(
+      crate::error::FfiNullHandlePayload::new("mlx_map_string_to_string_new"),
     )));
   }
   for (k, v) in meta {
@@ -667,8 +667,8 @@ where
   // declaration order); `state` is Drop-less.
   if writer_guard.0.ctx.is_null() {
     let last = crate::error::take_last();
-    return Err(last.unwrap_or(Error::Backend(
-      "mlx_io_writer_new() returned NULL sentinel (allocation failure)".into(),
+    return Err(last.unwrap_or(Error::FfiNullHandle(
+      crate::error::FfiNullHandlePayload::new("mlx_io_writer_new"),
     )));
   }
   // Now that every fallible Rust- and FFI-level setup step has confirmed
