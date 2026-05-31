@@ -5,7 +5,9 @@ edition.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/mlxrs"
-description = "MLX, MLX-LM, and MLX-VLM for Rust"
+description = "Safe Rust bindings for Apple's MLX array framework, with LM, VLM, audio, and embeddings support"
+keywords = ["mlx", "apple-silicon", "machine-learning", "metal", "llm"]
+categories = ["science", "api-bindings", "external-ffi-bindings", "mathematics"]
 license.workspace = true
 rust-version.workspace = true
 

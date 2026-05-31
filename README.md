@@ -3,7 +3,7 @@
 </div>
 <div align="center">
 
-MLX, MLX-LM, and MLX-VLM for Rust
+Safe Rust bindings for Apple MLX — core arrays &amp; ops, plus LM, VLM, audio, and embeddings
 
 [<img alt="github" src="https://img.shields.io/badge/github-findit--ai/mlxrs-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
 <img alt="LoC" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fal8n%2F327b2a8aef9003246e45c6e47fe63937%2Fraw%2Fmlxrs" height="22">
@@ -16,6 +16,19 @@ MLX, MLX-LM, and MLX-VLM for Rust
 <img alt="license" src="https://img.shields.io/badge/License-Apache%202.0/MIT-blue.svg?style=for-the-badge&fontColor=white&logoColor=f5c076&logo=data:image/svg+xml;base64,PCFET0NUWVBFIHN2ZyBQVUJMSUMgIi0vL1czQy8vRFREIFNWRyAxLjEvL0VOIiAiaHR0cDovL3d3dy53My5vcmcvR3JhcGhpY3MvU1ZHLzEuMS9EVEQvc3ZnMTEuZHRkIj4KDTwhLS0gVXBsb2FkZWQgdG86IFNWRyBSZXBvLCB3d3cuc3ZncmVwby5jb20sIFRyYW5zZm9ybWVkIGJ5OiBTVkcgUmVwbyBNaXhlciBUb29scyAtLT4KPHN2ZyBmaWxsPSIjZmZmZmZmIiBoZWlnaHQ9IjgwMHB4IiB3aWR0aD0iODAwcHgiIHZlcnNpb249IjEuMSIgaWQ9IkNhcGFfMSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIiB4bWxuczp4bGluaz0iaHR0cDovL3d3dy53My5vcmcvMTk5OS94bGluayIgdmlld0JveD0iMCAwIDI3Ni43MTUgMjc2LjcxNSIgeG1sOnNwYWNlPSJwcmVzZXJ2ZSIgc3Ryb2tlPSIjZmZmZmZmIj4KDTxnIGlkPSJTVkdSZXBvX2JnQ2FycmllciIgc3Ryb2tlLXdpZHRoPSIwIi8+Cg08ZyBpZD0iU1ZHUmVwb190cmFjZXJDYXJyaWVyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz4KDTxnIGlkPSJTVkdSZXBvX2ljb25DYXJyaWVyIj4gPGc+IDxwYXRoIGQ9Ik0xMzguMzU3LDBDNjIuMDY2LDAsMCw2Mi4wNjYsMCwxMzguMzU3czYyLjA2NiwxMzguMzU3LDEzOC4zNTcsMTM4LjM1N3MxMzguMzU3LTYyLjA2NiwxMzguMzU3LTEzOC4zNTcgUzIxNC42NDgsMCwxMzguMzU3LDB6IE0xMzguMzU3LDI1OC43MTVDNzEuOTkyLDI1OC43MTUsMTgsMjA0LjcyMywxOCwxMzguMzU3UzcxLjk5MiwxOCwxMzguMzU3LDE4IHMxMjAuMzU3LDUzLjk5MiwxMjAuMzU3LDEyMC4zNTdTMjA0LjcyMywyNTguNzE1LDEzOC4zNTcsMjU4LjcxNXoiLz4gPHBhdGggZD0iTTE5NC43OTgsMTYwLjkwM2MtNC4xODgtMi42NzctOS43NTMtMS40NTQtMTIuNDMyLDIuNzMyYy04LjY5NCwxMy41OTMtMjMuNTAzLDIxLjcwOC0zOS42MTQsMjEuNzA4IGMtMjUuOTA4LDAtNDYuOTg1LTIxLjA3OC00Ni45ODUtNDYuOTg2czIxLjA3Ny00Ni45ODYsNDYuOTg1LTQ2Ljk4NmMxNS42MzMsMCwzMC4yLDcuNzQ3LDM4Ljk2OCwyMC43MjMgYzIuNzgyLDQuMTE3LDguMzc1LDUuMjAxLDEyLjQ5NiwyLjQxOGM0LjExOC0yLjc4Miw1LjIwMS04LjM3NywyLjQxOC0xMi40OTZjLTEyLjExOC0xNy45MzctMzIuMjYyLTI4LjY0NS01My44ODItMjguNjQ1IGMtMzUuODMzLDAtNjQuOTg1LDI5LjE1Mi02NC45ODUsNjQuOTg2czI5LjE1Miw2NC45ODYsNjQuOTg1LDY0Ljk4NmMyMi4yODEsMCw0Mi43NTktMTEuMjE4LDU0Ljc3OC0zMC4wMDkgQzIwMC4yMDgsMTY5LjE0NywxOTguOTg1LDE2My41ODIsMTk0Ljc5OCwxNjAuOTAzeiIvPiA8L2c+IDwvZz4KDTwvc3ZnPg==" height="22">
 
 </div>
+
+## Overview
+
+`mlxrs` provides safe, idiomatic Rust bindings to [MLX](https://github.com/ml-explore/mlx) —
+Apple's array framework for machine learning on Apple silicon — through the
+[`mlx-c`](https://github.com/ml-explore/mlx-c) FFI layer. As in MLX, operations build a
+**lazy** computation graph and run only when a result is read (`to_vec`, `item`) or
+`eval` is called, preserving the unified-memory CPU/GPU execution model.
+
+On top of the core `Array` / `Dtype` / `ops` surface, optional features port the
+higher-level support of MLX's companion projects — `mlx-lm`, `mlx-vlm`, `mlx-audio`,
+and `mlx-embeddings` (loaders, tokenizers, KV-caches, samplers, quantization,
+generation loops, audio DSP, pooling).
 
 ## Installation
 
@@ -52,6 +65,42 @@ mlxrs = { version = "0.1", features = ["audio"] }
 mlxrs = { version = "0.1", features = ["embeddings"] }
 ```
 
+## Quick start
+
+```rust
+use mlxrs::Array;
+
+fn main() -> mlxrs::Result<()> {
+    let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3])?;
+    let b = Array::from_slice::<f32>(&[10.0, 20.0, 30.0], &[3])?;
+
+    // Ops build a lazy graph; reading the result forces evaluation.
+    let mut c = a.add(&b)?;
+    assert_eq!(c.to_vec::<f32>()?, vec![11.0, 22.0, 33.0]);
+
+    Ok(())
+}
+```
+
+The fallible `a.add(&b)?` form is always available; operator overloads
+(`&a + &b`) are opt-in behind `unstable-ops-overload` (see Caveats).
+
+## Features
+
+Higher-level surfaces are off by default — enable what you need:
+
+- **`lm`** — language models: tokenizers (BPE / SPM / chat templates / tool
+  parsing), KV-caches, samplers + logits processors, quantization, LoRA/DoRA,
+  optimizers, and the generation loop.
+- **`vlm`** — vision-language models (implies `lm`): image preprocessing, prompt
+  assembly, multimodal generation.
+- **`audio`** — audio (implies `lm`): STFT/mel DSP, WAV I/O, STT/TTS, playback.
+- **`embeddings`** — embedding-model loading, pooling, and the encode pipeline.
+
+Finer-grained flags (individual `tokenizer-*`, `gguf`, `llguidance`,
+`unstable-ops-overload`) are listed in [`mlxrs/Cargo.toml`](mlxrs/Cargo.toml) and
+the [API docs][doc-url].
+
 ## Platform support
 
 mlxrs targets `aarch64-apple-darwin` (Apple silicon). Other platforms
@@ -63,9 +112,9 @@ mlxrs targets `aarch64-apple-darwin` (Apple silicon). Other platforms
   C++ `array_desc` is shared by `Array::try_clone` (refcount-bumped) and
   mutates non-atomic state internally, so cross-thread sharing is unsound
   without external synchronization. `Array` does **not** implement `Clone`;
-  the only duplication is the fallible `try_clone`. A future `SharedArray`
-  newtype (`Arc<Mutex<Array>>`-style) with a documented cross-thread contract
-  is planned.
+  the only duplication is the fallible `try_clone`. There is no shared-array
+  wrapper — to use array data on another thread, extract owned data via
+  `to_vec` / `item` (which yield `Send` values) and move that.
 - **GPU work is single-stream serialized per thread** — the internal
   default-stream is per-thread and maps to one Metal command queue per
   thread. mlxrs exposes a public `Stream`/`Device` API; note `Stream` is a
@@ -77,8 +126,9 @@ mlxrs targets `aarch64-apple-darwin` (Apple silicon). Other platforms
   (a worker's last mlx action before it exits), not per-value lifetime
   control.
 - **Async Metal kernel failures bypass `Result` and abort the process** —
-  the rc/sentinel chain only catches synchronous errors. Recovery via a
-  `set_terminate` shim is planned.
+  the rc/sentinel chain only catches synchronous errors. A `set_terminate`-style
+  recovery shim is not implementable (mlx-c exposes no hook); only diagnostics
+  are planned.
 - **Each thread that calls into mlxrs allocates a GPU stream that lives
   until process exit.** mlxrs is designed for a small, long-lived worker
   pool — patterns that spawn a fresh OS thread per request will accumulate
