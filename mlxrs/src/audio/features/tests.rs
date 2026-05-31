@@ -6,7 +6,14 @@ use crate::Dtype;
 const F32_TOL: f32 = 1e-5;
 
 fn to_vec(a: &Array) -> Vec<f32> {
-  a.try_clone().unwrap().to_vec::<f32>().unwrap()
+  // Materialize first: some helpers (e.g. `reverse_1d`) return strided
+  // negative-step views, and `Array::to_vec` rejects non-contiguous storage
+  // (`Error::NonContiguous`). `contiguous` is a no-op for already-contiguous
+  // inputs, so this is safe for every caller.
+  crate::ops::shape::contiguous(a, false)
+    .unwrap()
+    .to_vec::<f32>()
+    .unwrap()
 }
 
 // ---- mel scale parity ---------------------------------------------------
@@ -1567,4 +1574,517 @@ fn strided_no_snip_edges_rejects_degenerate_overread() {
     payload.context(),
     payload.requirement()
   );
+}
+
+// ---- enum string + Display + variant-predicate surface ----------------
+//
+// `KaldiWindow` / `DeltaPadMode` derive `derive_more::Display` (rendering
+// `as_str()`) and `derive_more::IsVariant`. These pin the canonical lowercase
+// `win_type` / `mode` strings (the mlx-audio argument spelling) and the
+// generated predicates / Display so a renamed variant or a broken `as_str`
+// arm is caught.
+
+#[test]
+fn kaldi_window_as_str_and_display_are_canonical() {
+  // `as_str` (const fn) must match the mlx-audio `win_type` spelling exactly,
+  // and `Display` (via derive_more) must render the same string.
+  for (w, s) in [
+    (KaldiWindow::Hamming, "hamming"),
+    (KaldiWindow::Hanning, "hanning"),
+    (KaldiWindow::Povey, "povey"),
+    (KaldiWindow::Rectangular, "rectangular"),
+  ] {
+    assert_eq!(w.as_str(), s, "{w:?}.as_str()");
+    assert_eq!(w.to_string(), s, "{w:?} Display");
+  }
+  // Default is Hamming (the reference's `compute_fbank_kaldi` default).
+  assert_eq!(KaldiWindow::default(), KaldiWindow::Hamming);
+}
+
+#[test]
+fn kaldi_window_variant_predicates() {
+  // `derive_more::IsVariant` generates `is_*`; each true exactly for its arm.
+  assert!(KaldiWindow::Hamming.is_hamming());
+  assert!(!KaldiWindow::Hamming.is_hanning());
+  assert!(KaldiWindow::Hanning.is_hanning());
+  assert!(KaldiWindow::Povey.is_povey());
+  assert!(KaldiWindow::Rectangular.is_rectangular());
+  assert!(!KaldiWindow::Rectangular.is_povey());
+}
+
+#[test]
+fn delta_pad_mode_as_str_and_display_and_predicates() {
+  // `as_str` arms + Display rendering + IsVariant predicates for the
+  // `edge`/`constant` mlx-audio `mode` spelling.
+  assert_eq!(DeltaPadMode::Edge.as_str(), "edge");
+  assert_eq!(DeltaPadMode::Constant.as_str(), "constant");
+  assert_eq!(DeltaPadMode::Edge.to_string(), "edge");
+  assert_eq!(DeltaPadMode::Constant.to_string(), "constant");
+  assert!(DeltaPadMode::Edge.is_edge());
+  assert!(!DeltaPadMode::Edge.is_constant());
+  assert!(DeltaPadMode::Constant.is_constant());
+  // Default is Edge (kaldi-asr delta edge replication).
+  assert_eq!(DeltaPadMode::default(), DeltaPadMode::Edge);
+}
+
+// ---- get_mel_banks_kaldi: high_freq resolution branches ---------------
+
+#[test]
+fn mel_banks_kaldi_positive_high_freq_used_verbatim() {
+  // `high_freq > 0.0` takes the else branch (used verbatim, NOT
+  // Nyquist-relative). With sample_freq=16000 (nyquist=8000) and
+  // high_freq=4000, the highest mel center must sit BELOW 4000 (the band is
+  // capped at the explicit high_freq, not at Nyquist). Contrast with the
+  // `high_freq <= 0.0` tests where centers extend toward 8000.
+  let (_, centers) = get_mel_banks_kaldi(40, 512, 16_000.0, 20.0, 4000.0).unwrap();
+  let c = to_vec(&centers);
+  assert!(
+    c[c.len() - 1] < 4000.0,
+    "explicit high_freq=4000 must cap the top center below 4000, got {}",
+    c[c.len() - 1]
+  );
+  // And it should clearly exceed the half-band midpoint (the band really does
+  // span up to ~4000, not collapse), so the top center is well above 1500 Hz.
+  assert!(
+    c[c.len() - 1] > 1500.0,
+    "top center {} should approach the explicit high_freq",
+    c[c.len() - 1]
+  );
+}
+
+#[test]
+fn mel_banks_kaldi_rejects_high_freq_above_nyquist() {
+  // Positive high_freq > nyquist (8000) with a valid low_freq exercises the
+  // `high_freq > 0 && high_freq <= nyquist` failure branch specifically
+  // (distinct from the low_freq and low>=high branches).
+  let err = get_mel_banks_kaldi(40, 512, 16_000.0, 20.0, 9000.0)
+    .expect_err("high_freq above nyquist must be rejected");
+  let Error::OutOfRange(p) = &err else {
+    panic!("expected OutOfRange, got {err:?}");
+  };
+  assert_eq!(
+    p.context(),
+    "get_mel_banks_kaldi: high_freq",
+    "expected the high_freq range branch, got context {:?}",
+    p.context()
+  );
+}
+
+#[test]
+fn mel_banks_kaldi_rejects_low_freq_ge_high_freq_both_valid() {
+  // low_freq and high_freq are EACH individually valid (0 <= low < nyquist,
+  // 0 < high <= nyquist) but low >= high — the dedicated `low_freq >=
+  // high_freq` branch (NOT the low_freq-vs-nyquist nor high_freq-vs-nyquist
+  // branches). low=4000 (< 8000, valid), high=2000 (positive, <= 8000, valid),
+  // 4000 >= 2000.
+  let err = get_mel_banks_kaldi(40, 512, 16_000.0, 4000.0, 2000.0)
+    .expect_err("low_freq >= high_freq must be rejected");
+  let Error::OutOfRange(p) = &err else {
+    panic!("expected OutOfRange, got {err:?}");
+  };
+  assert_eq!(
+    p.context(),
+    "get_mel_banks_kaldi: low_freq",
+    "expected the low>=high branch context"
+  );
+  assert_eq!(p.requirement(), "must be < high_freq");
+}
+
+#[test]
+fn mel_banks_kaldi_rejects_zero_n_fft_padded() {
+  // n_fft_padded == 0 hits the `== 0 || !is_multiple_of(2)` branch.
+  let err = get_mel_banks_kaldi(40, 0, 16_000.0, 20.0, 0.0)
+    .expect_err("zero n_fft_padded must be rejected");
+  let Error::OutOfRange(p) = &err else {
+    panic!("expected OutOfRange, got {err:?}");
+  };
+  assert_eq!(p.context(), "get_mel_banks_kaldi: n_fft_padded");
+}
+
+#[test]
+fn mel_banks_kaldi_rejects_nonfinite_sample_freq() {
+  // NaN / inf sample_freq must be rejected by the finite-and-positive guard.
+  for bad in [f32::NAN, f32::INFINITY, -1.0_f32] {
+    let err = get_mel_banks_kaldi(40, 512, bad, 20.0, 0.0)
+      .expect_err("non-finite/negative sample_freq must be rejected");
+    assert!(
+      matches!(err, Error::OutOfRange(_)),
+      "sample_freq={bad} expected OutOfRange, got {err:?}"
+    );
+  }
+}
+
+#[test]
+fn mel_banks_kaldi_cap_rejects_oversized_bank() {
+  // `bank_len = num_bins * (n_fft_padded / 2)` must be capped at
+  // MAX_FBANK_WORK (64 Mi). Choose num_bins and n_fft_padded so the product
+  // exceeds 64 Mi while each factor fits in i32. num_bins = 4096,
+  // n_fft_padded = 65536 → num_fft_bins = 32768; 4096 * 32768 = 128 Mi > cap.
+  let err = get_mel_banks_kaldi(4096, 65_536, 16_000.0, 20.0, 0.0)
+    .expect_err("oversized bank_len must be capped");
+  let Error::CapExceeded(p) = &err else {
+    panic!("expected CapExceeded, got {err:?}");
+  };
+  assert_eq!(p.cap_name(), "MAX_FBANK_WORK");
+  assert!(
+    p.observed() > p.cap(),
+    "observed {} must exceed cap {}",
+    p.observed(),
+    p.cap()
+  );
+}
+
+// ---- build_kaldi_window (private) error + Povey shape ------------------
+
+#[test]
+fn build_kaldi_window_rejects_too_small() {
+  // win_size < 2 is rejected (the periodic `win_size - 1` denominator needs
+  // at least 2 samples). Exercised directly on the private helper.
+  for bad in [0_usize, 1] {
+    let err =
+      build_kaldi_window(KaldiWindow::Hamming, bad).expect_err("win_size < 2 must be rejected");
+    let Error::OutOfRange(p) = &err else {
+      panic!("expected OutOfRange, got {err:?}");
+    };
+    assert_eq!(p.context(), "build_kaldi_window: win_size");
+  }
+}
+
+#[test]
+fn build_kaldi_window_povey_closed_form() {
+  // Povey window = (0.5 - 0.5*cos(2*pi*n/(N-1)))^0.85. For N=4 (denom=3):
+  //   n=0: (0.5 - 0.5*cos(0))^0.85         = 0^0.85          = 0
+  //   n=1: (0.5 - 0.5*cos(2pi/3))^0.85     = (0.5+0.25)^0.85 = 0.75^0.85
+  //   n=2: (0.5 - 0.5*cos(4pi/3))^0.85     = 0.75^0.85
+  //   n=3: (0.5 - 0.5*cos(2pi))^0.85       = 0^0.85          = 0
+  let w = build_kaldi_window(KaldiWindow::Povey, 4).unwrap();
+  assert_eq!(w.shape(), vec![4]);
+  let v = to_vec(&w);
+  let mid = 0.75_f32.powf(0.85);
+  let want = [0.0_f32, mid, mid, 0.0];
+  for (i, (&g, &e)) in v.iter().zip(want.iter()).enumerate() {
+    assert!((g - e).abs() < F32_TOL, "povey[{i}]: got {g}, want {e}");
+  }
+}
+
+#[test]
+fn build_kaldi_window_rectangular_is_all_ones() {
+  // Rectangular = constant 1.0 (no windowing).
+  let w = build_kaldi_window(KaldiWindow::Rectangular, 5).unwrap();
+  let v = to_vec(&w);
+  assert_eq!(v, vec![1.0_f32; 5]);
+}
+
+#[test]
+fn build_kaldi_window_hanning_closed_form() {
+  // Hanning = 0.5 - 0.5*cos(2*pi*n/(N-1)). For N=5 (denom=4):
+  //   n=0: 0; n=1: 0.5 - 0.5*cos(pi/2) = 0.5; n=2: 0.5 - 0.5*cos(pi) = 1.0;
+  //   n=3: 0.5; n=4: 0.
+  let w = build_kaldi_window(KaldiWindow::Hanning, 5).unwrap();
+  let v = to_vec(&w);
+  let want = [0.0_f32, 0.5, 1.0, 0.5, 0.0];
+  for (i, (&g, &e)) in v.iter().zip(want.iter()).enumerate() {
+    assert!((g - e).abs() < F32_TOL, "hanning[{i}]: got {g}, want {e}");
+  }
+}
+
+// ---- reverse_1d (private) ----------------------------------------------
+
+#[test]
+fn reverse_1d_basic_reverses_including_index_zero() {
+  // The `stop = -(len + 1)` sentinel must include index 0 (the descending
+  // traversal len-1 .. 0). [10, 20, 30, 40] -> [40, 30, 20, 10].
+  let a = Array::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4]).unwrap();
+  let r = reverse_1d(&a).unwrap();
+  assert_eq!(r.shape(), vec![4]);
+  assert_eq!(to_vec(&r), vec![40.0, 30.0, 20.0, 10.0]);
+}
+
+#[test]
+fn reverse_1d_single_element() {
+  // len==1 is a non-empty edge case (not the EmptyInput branch).
+  let a = Array::from_slice::<f32>(&[7.0], &[1]).unwrap();
+  let r = reverse_1d(&a).unwrap();
+  assert_eq!(to_vec(&r), vec![7.0]);
+}
+
+#[test]
+fn reverse_1d_rejects_non_1d() {
+  // 2-D input -> RankMismatch (the `shape.len() != 1` branch).
+  let a = Array::zeros::<f32>(&[2_i32, 3_i32]).unwrap();
+  let err = reverse_1d(&a).expect_err("2-D input must be rejected");
+  let Error::RankMismatch(p) = &err else {
+    panic!("expected RankMismatch, got {err:?}");
+  };
+  assert_eq!(p.actual(), 2, "observed rank");
+  assert_eq!(p.context(), "reverse_1d: expected 1-D input");
+}
+
+#[test]
+fn reverse_1d_rejects_empty() {
+  // A length-0 1-D array hits the EmptyInput branch.
+  let a = Array::zeros::<f32>(&[0_i32]).unwrap();
+  let err = reverse_1d(&a).expect_err("empty input must be rejected");
+  assert!(
+    matches!(err, Error::EmptyInput(_)),
+    "expected EmptyInput, got {err:?}"
+  );
+}
+
+// ---- strided_frames_snip_edges (private) -------------------------------
+
+#[test]
+fn strided_frames_snip_edges_basic_frames() {
+  // Closed-form snip_edges=true framing: waveform [0..7], win_size=4,
+  // win_inc=2, num_frames = 1 + (8-4)/2 = 3.
+  //   frame0 = wf[0..4] = [0,1,2,3]
+  //   frame1 = wf[2..6] = [2,3,4,5]
+  //   frame2 = wf[4..8] = [4,5,6,7]
+  let wf: Vec<f32> = (0..8).map(|v| v as f32).collect();
+  let x = Array::from_slice::<f32>(&wf, &[8]).unwrap();
+  let frames = strided_frames_snip_edges(&x, 4, 2, 3).unwrap();
+  assert_eq!(frames.shape(), vec![3, 4]);
+  let got = to_vec_2d(&frames, 3, 4);
+  let want = [
+    [0.0_f32, 1.0, 2.0, 3.0],
+    [2.0, 3.0, 4.0, 5.0],
+    [4.0, 5.0, 6.0, 7.0],
+  ];
+  assert_eq!(got, want, "snip_edges=true framing mismatch");
+}
+
+#[test]
+fn strided_frames_snip_edges_rejects_overread() {
+  // last_index = (num_frames-1)*win_inc + win_size must be <= waveform_len.
+  // waveform_len=5, num_frames=3, win_inc=2, win_size=4 → last = 2*2+4 = 8 > 5.
+  let wf: Vec<f32> = (0..5).map(|v| v as f32).collect();
+  let x = Array::from_slice::<f32>(&wf, &[5]).unwrap();
+  let err =
+    strided_frames_snip_edges(&x, 4, 2, 3).expect_err("overreading the waveform must be rejected");
+  let Error::OutOfRange(p) = &err else {
+    panic!("expected OutOfRange, got {err:?}");
+  };
+  assert!(
+    p.value().contains("last_index=8") && p.value().contains("waveform_len=5"),
+    "expected the overread diagnostic, got value {:?}",
+    p.value()
+  );
+}
+
+// ---- strided_frames_no_snip_edges (private) extra branches -------------
+
+#[test]
+fn strided_no_snip_edges_rejects_non_1d() {
+  // 2-D waveform -> RankMismatch (`shape.len() != 1`).
+  let a = Array::zeros::<f32>(&[2_i32, 4_i32]).unwrap();
+  let err = strided_frames_no_snip_edges(&a, 4, 2, 2).expect_err("2-D waveform must be rejected");
+  let Error::RankMismatch(p) = &err else {
+    panic!("expected RankMismatch, got {err:?}");
+  };
+  assert_eq!(
+    p.context(),
+    "strided_frames_no_snip_edges: expected 1-D waveform"
+  );
+  assert_eq!(p.actual(), 2);
+}
+
+#[test]
+fn strided_no_snip_edges_zero_frames_returns_empty() {
+  // num_frames == 0 short-circuits to a (0, 0) empty array.
+  let wf: Vec<f32> = (0..4).map(|v| v as f32).collect();
+  let x = Array::from_slice::<f32>(&wf, &[4]).unwrap();
+  let frames = strided_frames_no_snip_edges(&x, 2, 2, 0).unwrap();
+  assert_eq!(frames.shape(), vec![0, 0]);
+}
+
+#[test]
+fn strided_no_snip_edges_pad_gt1_rejects_signal_shorter_than_pad() {
+  // pad > 1 needs n >= pad + 1 (the reflect bookends must fit). win_size=8,
+  // win_inc=2 → pad = 4 - 1 = 3, so need n >= 4. A length-3 signal fails.
+  let wf: Vec<f32> = (0..3).map(|v| v as f32).collect();
+  let x = Array::from_slice::<f32>(&wf, &[3]).unwrap();
+  // num_frames irrelevant — the pad-fit check happens during buffer build.
+  let err = strided_frames_no_snip_edges(&x, 8, 2, 2)
+    .expect_err("signal shorter than the reflect pad must be rejected");
+  let Error::OutOfRange(p) = &err else {
+    panic!("expected OutOfRange, got {err:?}");
+  };
+  assert_eq!(p.requirement(), "must be >= pad + 1");
+  assert!(
+    p.value().contains("n=3") && p.value().contains("pad=3"),
+    "expected n/pad diagnostic, got {:?}",
+    p.value()
+  );
+}
+
+#[test]
+fn strided_no_snip_edges_rejects_abs_pad_gt_n() {
+  // pad <= 0 branch: |pad| > n must be rejected (win_inc >> win_size on a
+  // tiny signal). win_size=2 (→ win_size/2 = 1), win_inc=200 (→ win_inc/2 =
+  // 100) → pad = 1 - 100 = -99, abs_pad = 99. A length-5 signal: 99 > 5.
+  let wf: Vec<f32> = (0..5).map(|v| v as f32).collect();
+  let x = Array::from_slice::<f32>(&wf, &[5]).unwrap();
+  // m = (5 + 100) / 200 = 0 frames — but the helper does NOT short-circuit on
+  // m==0 alone for the pad<=0 buffer build... we still pass a nonzero
+  // num_frames so we reach the abs_pad check before the strided-read bound.
+  let err = strided_frames_no_snip_edges(&x, 2, 200, 1)
+    .expect_err("|pad| larger than the signal must be rejected");
+  let Error::OutOfRange(p) = &err else {
+    panic!("expected OutOfRange, got {err:?}");
+  };
+  assert_eq!(p.requirement(), "must be <= waveform len");
+  assert!(
+    p.value().contains("abs_pad=99") && p.value().contains("n=5"),
+    "expected abs_pad/n diagnostic, got {:?}",
+    p.value()
+  );
+}
+
+// ---- compute_fbank_kaldi additional validation + small paths ----------
+
+#[test]
+fn compute_fbank_kaldi_rejects_win_len_below_two() {
+  // win_len < 2 → OutOfRange (distinct from win_inc==0 / rank checks).
+  let x = Array::from_slice::<f32>(&[0.0_f32; 8], &[8_i32]).unwrap();
+  let err = compute_fbank_kaldi(
+    &x,
+    16_000,
+    1,
+    1,
+    4,
+    KaldiWindow::Rectangular,
+    0.0,
+    0.0,
+    true,
+    0.0,
+    0.0,
+    None,
+  )
+  .expect_err("win_len < 2 must be rejected");
+  let Error::OutOfRange(p) = &err else {
+    panic!("expected OutOfRange, got {err:?}");
+  };
+  assert_eq!(p.context(), "compute_fbank_kaldi: win_len");
+}
+
+#[test]
+fn compute_fbank_kaldi_rejects_win_len_over_decoded_samples_cap() {
+  // win_len > MAX_DECODED_SAMPLES hits the win_len cap branch. Use a lazy
+  // zeros input so no host buffer materializes; win_len just over the cap.
+  let cap = crate::audio::io::MAX_DECODED_SAMPLES;
+  // Build a small real waveform — the win_len cap is checked from the scalar
+  // arg before any framing, so the array size is irrelevant.
+  let x = Array::from_slice::<f32>(&[0.0_f32; 8], &[8_i32]).unwrap();
+  let err = compute_fbank_kaldi(
+    &x,
+    16_000,
+    cap + 1, // win_len just over the cap
+    160,
+    4,
+    KaldiWindow::Rectangular,
+    0.0,
+    0.0,
+    true,
+    0.0,
+    0.0,
+    None,
+  )
+  .expect_err("win_len over MAX_DECODED_SAMPLES must be rejected");
+  let Error::CapExceeded(p) = &err else {
+    panic!("expected CapExceeded, got {err:?}");
+  };
+  assert_eq!(p.cap_name(), "MAX_DECODED_SAMPLES");
+  assert_eq!(p.context(), "compute_fbank_kaldi: win_len exceeds cap");
+}
+
+#[test]
+fn compute_fbank_kaldi_snip_edges_false_zero_frames_returns_empty() {
+  // snip_edges=false with `m = (n + win_inc/2)/win_inc == 0` returns a
+  // (0, num_mels) empty array. samples_len=1, win_inc=4 → (1 + 2)/4 = 0.
+  let x = Array::from_slice::<f32>(&[0.5_f32], &[1_i32]).unwrap();
+  let out = compute_fbank_kaldi(
+    &x,
+    16_000,
+    2, // win_len = 2 (>= 2, <= cap)
+    4, // win_inc = 4 → m = (1 + 2)/4 = 0
+    7, // num_mels = 7 → expect (0, 7)
+    KaldiWindow::Rectangular,
+    0.0,
+    0.0,
+    false, // snip_edges = false
+    0.0,
+    0.0,
+    None,
+  )
+  .unwrap();
+  assert_eq!(out.shape(), vec![0, 7]);
+}
+
+// ---- compute_deltas_kaldi additional branches -------------------------
+
+#[test]
+fn compute_deltas_kaldi_rejects_rank_zero_scalar() {
+  // A rank-0 (scalar) specgram has no time axis → RankMismatch. win_length is
+  // valid (5) so the rank check (not the win_length checks) fires.
+  let scalar = Array::full::<f32>(&[0_i32; 0], 3.0).unwrap();
+  assert!(scalar.shape().is_empty(), "scalar must be rank-0");
+  let err = compute_deltas_kaldi(&scalar, 5, DeltaPadMode::Edge)
+    .expect_err("rank-0 specgram must be rejected");
+  let Error::RankMismatch(p) = &err else {
+    panic!("expected RankMismatch, got {err:?}");
+  };
+  assert_eq!(p.actual(), 0, "rank-0 reported");
+  assert_eq!(
+    p.context(),
+    "compute_deltas_kaldi: specgram must have rank >= 1 (a time axis)"
+  );
+}
+
+#[test]
+fn compute_deltas_kaldi_time_zero_returns_empty_same_shape() {
+  // time == 0 ⇒ total == 0 ⇒ the output is the same empty shape (no deltas).
+  // Shape (2, 0): rank-2, last axis (time) == 0.
+  let x = Array::zeros::<f32>(&[2_i32, 0_i32]).unwrap();
+  let out = compute_deltas_kaldi(&x, 5, DeltaPadMode::Edge).unwrap();
+  assert_eq!(out.shape(), vec![2, 0], "time==0 preserves the empty shape");
+}
+
+#[test]
+fn compute_deltas_kaldi_rejects_total_over_cap() {
+  // `total` (== num_features * time) over MAX_FBANK_WORK must be rejected by
+  // the element-count cap, BEFORE the padded-work cap. Shape
+  // (MAX_FBANK_WORK + 1,) is a 1-D input: time = total = cap + 1 > cap.
+  // `Array::zeros` is lazy — the cap engages on the shape alone.
+  let total = MAX_FBANK_WORK + 1;
+  let total_i32 = i32::try_from(total).unwrap();
+  let x = Array::zeros::<f32>(&[total_i32]).unwrap();
+  let err = compute_deltas_kaldi(&x, 5, DeltaPadMode::Edge)
+    .expect_err("total over MAX_FBANK_WORK must be rejected");
+  let Error::CapExceeded(p) = &err else {
+    panic!("expected CapExceeded, got {err:?}");
+  };
+  assert_eq!(p.cap_name(), "MAX_FBANK_WORK");
+  assert_eq!(
+    p.context(),
+    "compute_deltas_kaldi: element count exceeds work cap"
+  );
+}
+
+#[test]
+fn compute_deltas_kaldi_constant_mode_1d_ramp_interior_unit_slope() {
+  // Constant (zero) pad mode on a 1-D ramp: the deep interior (clear of the
+  // n=2 zero-pad on each edge) still has unit-slope derivative 1.0. This
+  // covers the DeltaPadMode::Constant arm on a 1-D (num_features==1) input.
+  let ramp: Vec<f32> = (0..9).map(|n| n as f32).collect();
+  let x = Array::from_slice::<f32>(&ramp, &[9]).unwrap();
+  let d = compute_deltas_kaldi(&x, 5, DeltaPadMode::Constant).unwrap();
+  assert_eq!(d.shape(), vec![9]);
+  let got = to_vec(&d);
+  // Interior indices 2..=6 are unaffected by the zero pad (n=2).
+  for (i, &g) in got.iter().enumerate().take(7).skip(2) {
+    assert!(
+      (g - 1.0).abs() < F32_TOL,
+      "constant-pad ramp delta[{i}]: got {g}, want 1.0"
+    );
+  }
 }

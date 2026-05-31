@@ -2190,3 +2190,515 @@ fn reflect_pad_1d_matches_python_reference_construction() {
   ];
   assert_eq!(v, expected);
 }
+
+// ---- coverage: enum string/Display surfaces -----------------------------
+
+/// `WindowPad::as_str` / `Display` map both variants to their canonical
+/// lowercase names (covers both match arms of `as_str`).
+#[test]
+fn window_pad_as_str_and_display_both_variants() {
+  assert_eq!(WindowPad::Right.as_str(), "right");
+  assert_eq!(WindowPad::Center.as_str(), "center");
+  // `derive_more::Display` forwards to `as_str`.
+  assert_eq!(WindowPad::Right.to_string(), "right");
+  assert_eq!(WindowPad::Center.to_string(), "center");
+  // `derive_more::IsVariant` predicates.
+  assert!(WindowPad::Right.is_right());
+  assert!(WindowPad::Center.is_center());
+  assert!(!WindowPad::Right.is_center());
+  // Default is Right (the mlx-audio short-window placement).
+  assert_eq!(WindowPad::default(), WindowPad::Right);
+}
+
+/// `PadMode::as_str` / `Display` — the single `Reflect` variant maps to
+/// `"reflect"` (covers the lone match arm + the `Default`).
+#[test]
+fn pad_mode_as_str_and_display() {
+  assert_eq!(PadMode::Reflect.as_str(), "reflect");
+  assert_eq!(PadMode::Reflect.to_string(), "reflect");
+  assert!(PadMode::Reflect.is_reflect());
+  assert_eq!(PadMode::default(), PadMode::Reflect);
+}
+
+// ---- coverage: Spectrum::from_parts num_frames == 0 ---------------------
+
+/// `Spectrum::from_parts` rejects a 2-D `Complex64` array with ZERO frames
+/// (`shape[0] == 0`) — the dedicated `num_frames == 0` invariant branch,
+/// reached only after the n_fft / hop / win checks pass. n_fft=8 ⇒ n_freqs
+/// must be 5, so shape `[0, 5]` is otherwise-consistent: only the empty
+/// frame axis is wrong.
+#[test]
+fn spectrum_from_parts_rejects_zero_frames() {
+  let empty = Array::zeros::<f32>(&[0i32, 5i32])
+    .unwrap()
+    .astype(Dtype::Complex64)
+    .unwrap();
+  let res = Spectrum::from_parts(empty, 8, 4, 8, WindowPad::Center, true);
+  assert!(
+    matches!(res, Err(Error::InvariantViolation(_))),
+    "zero-frame spectrum must be rejected by the num_frames invariant, got {res:?}"
+  );
+}
+
+// ---- coverage: place_window error branches (direct) ---------------------
+
+/// `place_window` (the shared analysis/synthesis window placer) rejects a
+/// non-1-D window, a length that disagrees with `win_length`, and
+/// `win_length > n_fft` — the three up-front guards. Driven directly (it is
+/// the single source of truth `stft`/`istft` both route through).
+#[test]
+fn place_window_rejects_bad_shape_len_and_win_gt_nfft() {
+  // Non-1-D window → RankMismatch.
+  let w_2d = Array::from_slice::<f32>(&[1.0_f32, 2.0, 3.0, 4.0], &[2i32, 2i32]).unwrap();
+  assert!(matches!(
+    place_window("test", &w_2d, 4, 8, WindowPad::Right),
+    Err(Error::RankMismatch(_))
+  ));
+
+  // 1-D window whose length != win_length → LengthMismatch (expected
+  // win_length=5, actual 3).
+  let w_short = Array::from_slice::<f32>(&[1.0_f32, 2.0, 3.0], &[3i32]).unwrap();
+  let res = place_window("test", &w_short, 5, 8, WindowPad::Right);
+  let Err(Error::LengthMismatch(payload)) = &res else {
+    panic!("length disagreement must be LengthMismatch, got {res:?}");
+  };
+  assert_eq!(payload.expected(), 5);
+  assert_eq!(payload.actual(), 3);
+
+  // win_length > n_fft → OutOfRange (a window wider than the frame).
+  let w_ok = Array::from_slice::<f32>(&[1.0_f32; 8], &[8i32]).unwrap();
+  assert!(matches!(
+    place_window("test", &w_ok, 8, 4, WindowPad::Right),
+    Err(Error::OutOfRange(_))
+  ));
+}
+
+/// `place_window` with `win_length == n_fft` is the no-op clone fast path
+/// (no padding); `win_length < n_fft` Right- and Center-pads to exactly
+/// `n_fft` with the window in the documented position. Closed-form on a
+/// length-2 window placed in a width-4 frame.
+#[test]
+fn place_window_pads_right_and_center_closed_form() {
+  let w = Array::from_slice::<f32>(&[1.0_f32, 2.0], &[2i32]).unwrap();
+  // win == n_fft: clone, unchanged.
+  let full = place_window("t", &w, 2, 2, WindowPad::Right).unwrap();
+  assert_eq!(to_vec(&full), vec![1.0, 2.0]);
+  // Right: [w, zeros] → [1, 2, 0, 0].
+  let right = place_window("t", &w, 2, 4, WindowPad::Right).unwrap();
+  assert_eq!(to_vec(&right), vec![1.0, 2.0, 0.0, 0.0]);
+  // Center: total=2, low=1, high=1 → [0, 1, 2, 0].
+  let center = place_window("t", &w, 2, 4, WindowPad::Center).unwrap();
+  assert_eq!(to_vec(&center), vec![0.0, 1.0, 2.0, 0.0]);
+}
+
+/// `frame_window` builds the symmetric Hann of `win_length` and places it
+/// into the `n_fft` frame. Closed-form: Hann(4) = [0, 0.75, 0.75, 0] (from
+/// `0.5*(1-cos(2πk/3))`), center-padded into width 6 → [0, 0, 0.75, 0.75,
+/// 0, 0] (total=2, low=1, high=1).
+#[test]
+fn frame_window_center_padded_closed_form() {
+  let fw = frame_window(4, 6, WindowPad::Center).unwrap();
+  let v = to_vec(&fw);
+  let expected = [0.0_f32, 0.0, 0.75, 0.75, 0.0, 0.0];
+  assert_eq!(v.len(), 6);
+  for (i, (g, e)) in v.iter().zip(expected.iter()).enumerate() {
+    assert!(
+      (g - e).abs() < WIN_TOL,
+      "frame_window[{i}]: got {g}, want {e}"
+    );
+  }
+}
+
+// ---- coverage: symmetric_window cap + reflect_pad rank --------------------
+
+/// The window family rejects `n` above the
+/// [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) cap with
+/// `Error::CapExceeded` — the check fires BEFORE the SIMD `Vec` is
+/// allocated, so passing `cap + 1` is cheap. Exercised through every public
+/// window so the shared `symmetric_window` cap branch is covered once.
+#[test]
+fn windows_reject_n_above_decoded_cap() {
+  let over = crate::audio::io::MAX_DECODED_SAMPLES + 1;
+  for r in [
+    hann_window(over),
+    hamming_window(over),
+    blackman_window(over),
+    bartlett_window(over),
+  ] {
+    let Err(Error::CapExceeded(payload)) = &r else {
+      panic!("n above the decoded-sample cap must be CapExceeded, got {r:?}");
+    };
+    assert_eq!(payload.observed(), over as u64);
+    assert_eq!(payload.cap(), crate::audio::io::MAX_DECODED_SAMPLES as u64);
+  }
+}
+
+/// `reflect_pad_1d` rejects a non-1-D input with `Error::RankMismatch`
+/// (the rank guard) before any slicing.
+#[test]
+fn reflect_pad_1d_rejects_non_1d() {
+  let arr_2d = Array::from_slice::<f32>(&[1.0_f32, 2.0, 3.0, 4.0], &[2i32, 2i32]).unwrap();
+  assert!(matches!(
+    reflect_pad_1d(&arr_2d, 1),
+    Err(Error::RankMismatch(_))
+  ));
+}
+
+/// `reflect_pad_1d` rejects `padding >= len` (not enough samples to
+/// reflect) with `Error::OutOfRange`.
+#[test]
+fn reflect_pad_1d_rejects_padding_too_large() {
+  let arr = Array::from_slice::<f32>(&[1.0_f32, 2.0, 3.0], &[3i32]).unwrap();
+  // padding == len (3) needs samples[len-padding-1] = samples[-1] → reject.
+  assert!(matches!(reflect_pad_1d(&arr, 3), Err(Error::OutOfRange(_))));
+}
+
+// ---- coverage: stft input validation branches ---------------------------
+
+/// `stft` rejects `win_length == 0` (the `Some(0)` invariant) and a non-1-D
+/// `samples` input (the rank guard) with their typed errors.
+#[test]
+fn stft_rejects_zero_win_length_and_non_1d_input() {
+  let buf = signal_16();
+  let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
+  // win_length == 0 → InvariantViolation.
+  assert!(matches!(
+    stft(&x, 8, 4, Some(0), WindowPad::Right),
+    Err(Error::InvariantViolation(_))
+  ));
+  // Non-1-D samples → RankMismatch.
+  let x_2d = Array::from_slice::<f32>(&buf, &[4i32, 4i32]).unwrap();
+  assert!(matches!(
+    stft(&x_2d, 8, 4, None, WindowPad::Right),
+    Err(Error::RankMismatch(_))
+  ));
+  // hop_length == 0 → InvariantViolation (the hop guard).
+  assert!(matches!(
+    stft(&x, 8, 0, None, WindowPad::Right),
+    Err(Error::InvariantViolation(_))
+  ));
+  // n_fft == 0 → InvariantViolation.
+  assert!(matches!(
+    stft(&x, 0, 4, None, WindowPad::Right),
+    Err(Error::InvariantViolation(_))
+  ));
+}
+
+/// `stft` on an input too short for the centering reflect pad returns
+/// `Error::OutOfRange`. With `center=true` the pad is `n_fft/2 = 32`
+/// samples per side, which requires `len >= padding + 1 = 33`; a 3-sample
+/// input fails that in `reflect_pad_1d`, propagating the short-input
+/// rejection out of `stft`.
+#[test]
+fn stft_rejects_input_too_short_for_one_frame() {
+  let tiny = Array::from_slice::<f32>(&[0.1_f32, 0.2, 0.3], &[3i32]).unwrap();
+  assert!(matches!(
+    stft(&tiny, 64, 16, None, WindowPad::Right),
+    Err(Error::OutOfRange(_))
+  ));
+}
+
+// ---- coverage: istft / ISTFTCache length-out-of-range branches ----------
+
+/// `istft` on a `center = false` spectrum with `length > t` hits the
+/// `(false, Some(len))` `len > t` branch (BEFORE the coverage guard, which
+/// the existing `center=false` test reaches with a small in-range length).
+/// n_fft=8, hop=4, 5 frames ⇒ t = 24; length = 1000 > 24.
+#[test]
+fn istft_center_false_length_gt_t_rejected() {
+  let buf = signal_16();
+  let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
+  let spec = stft(&x, 8, 4, Some(8), WindowPad::Center).unwrap();
+  let spec_no_center = Spectrum::from_parts(
+    spec.data_ref().try_clone().unwrap(),
+    8,
+    4,
+    8,
+    WindowPad::Center,
+    false,
+  )
+  .unwrap();
+  assert!(matches!(
+    istft(&spec_no_center, Some(1000)),
+    Err(Error::OutOfRange(_))
+  ));
+}
+
+/// `ISTFTCache::istft` mirrors the free `istft`'s length-range rejections:
+/// `center = true` with `pad + length > t`, and `center = false` with
+/// `length > t`. Both go through the cached path's own `(true,Some)` /
+/// `(false,Some)` arms.
+#[test]
+fn istft_cache_rejects_length_out_of_range_both_center_modes() {
+  let buf = signal_16();
+  let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
+  // center = true (the stft default): t = 24, pad = 4; pad + 1000 > 24.
+  let spec = stft(&x, 8, 4, Some(8), WindowPad::Center).unwrap();
+  let mut cache = ISTFTCache::new();
+  assert!(matches!(
+    cache.istft(&spec, Some(1000)),
+    Err(Error::OutOfRange(_))
+  ));
+  // center = false: length 1000 > t = 24.
+  let spec_no_center = Spectrum::from_parts(
+    spec.data_ref().try_clone().unwrap(),
+    8,
+    4,
+    8,
+    WindowPad::Center,
+    false,
+  )
+  .unwrap();
+  let mut cache2 = ISTFTCache::new();
+  assert!(matches!(
+    cache2.istft(&spec_no_center, Some(1000)),
+    Err(Error::OutOfRange(_))
+  ));
+}
+
+/// `ISTFTCache::default()` is a fresh empty cache, equivalent to
+/// `ISTFTCache::new()` (covers the `Default` impl).
+#[test]
+fn istft_cache_default_is_empty() {
+  let cache = ISTFTCache::default();
+  assert!(cache.is_empty());
+  assert_eq!(cache.len(), 0);
+}
+
+// ---- coverage: mel_filter_bank validation + closed-form ------------------
+
+/// `mel_filter_bank` validation branches: `n_mels == 0` /
+/// `sample_rate == 0` → `InvariantViolation`; `f_min < 0` and
+/// `f_max <= f_min` → `OutOfRange`. (`n_fft == 0` is already covered by
+/// `mel_filter_bank_cached_propagates_errors`.)
+#[test]
+fn mel_filter_bank_rejects_invalid_params() {
+  // n_mels == 0.
+  assert!(matches!(
+    mel_filter_bank(0, 400, 16_000, 0.0, None),
+    Err(Error::InvariantViolation(_))
+  ));
+  // sample_rate == 0.
+  assert!(matches!(
+    mel_filter_bank(80, 400, 0, 0.0, None),
+    Err(Error::InvariantViolation(_))
+  ));
+  // f_min < 0.
+  assert!(matches!(
+    mel_filter_bank(80, 400, 16_000, -1.0, None),
+    Err(Error::OutOfRange(_))
+  ));
+  // f_max <= f_min (here f_max == f_min == 1000).
+  assert!(matches!(
+    mel_filter_bank(80, 400, 16_000, 1000.0, Some(1000.0)),
+    Err(Error::OutOfRange(_))
+  ));
+}
+
+/// Closed-form HTK triangular filterbank for a tiny case: `n_mels = 1`,
+/// `n_fft = 4` (⇒ `n_freqs = 3`), `sample_rate = 8` (⇒ Nyquist = 4).
+///
+/// - `all_freqs = [0, 2, 4]` (linspace(0, 4, 3)).
+/// - mel grid points = `mel_to_hz(linspace(mel(0), mel(4), 3))` →
+///   `[0, fc, 4]` with `fc = mel_to_hz(mel(4) / 2)`.
+/// - The single triangle (left=0, center=fc, right=4) evaluates to
+///   `[0, min(2/fc, 2/(4 - fc)), 0]`.
+///
+/// `fc` is recomputed here from the documented HTK formula in f64
+/// (`mel = 2595 log10(1 + hz/700)`, inverse `hz = 700 (10^(mel/2595) - 1)`)
+/// — an INDEPENDENT closed form, not a call to the module's `mel_to_hz`.
+#[test]
+fn mel_filter_bank_single_triangle_closed_form() {
+  // Independent HTK mel forward/inverse in f64.
+  let hz_to_mel = |hz: f64| 2595.0 * (1.0 + hz / 700.0).log10();
+  let mel_to_hz = |mel: f64| 700.0 * (10f64.powf(mel / 2595.0) - 1.0);
+  let m_max = hz_to_mel(4.0);
+  let fc = mel_to_hz(m_max / 2.0); // center frequency in Hz
+  let mid = (2.0 / fc).min(2.0 / (4.0 - fc)); // triangle value at freq = 2
+  let expected = [0.0_f32, mid as f32, 0.0_f32];
+
+  let bank = mel_filter_bank(1, 4, 8, 0.0, None).unwrap();
+  assert_eq!(
+    bank.shape(),
+    vec![1, 3],
+    "bank shape must be (n_mels, n_freqs)"
+  );
+  let v = to_vec(&bank);
+  // 3e-5: the implementation computes `fc` in f32 (vs the f64 oracle here)
+  // and the SIMD triangle kernel uses an algebraically-equal rearrangement,
+  // so a few ULPs of slack on the order-1 triangle value is expected.
+  for (i, (g, e)) in v.iter().zip(expected.iter()).enumerate() {
+    assert!(
+      (g - e).abs() < 3e-5,
+      "mel_filter_bank[{i}]: got {g}, want {e} (fc={fc})"
+    );
+  }
+}
+
+/// The precise (f64) filterbank matches the SAME independent closed form as
+/// the standard path on the tiny single-triangle case (it routes through
+/// `mel_filter_bank_f64`, exercising its frequency / mel / triangle build).
+#[test]
+fn mel_filter_bank_precise_single_triangle_closed_form() {
+  let hz_to_mel = |hz: f64| 2595.0 * (1.0 + hz / 700.0).log10();
+  let mel_to_hz = |mel: f64| 700.0 * (10f64.powf(mel / 2595.0) - 1.0);
+  let m_max = hz_to_mel(4.0);
+  let fc = mel_to_hz(m_max / 2.0);
+  let mid = (2.0 / fc).min(2.0 / (4.0 - fc));
+  let expected = [0.0_f32, mid as f32, 0.0_f32];
+
+  let bank = mel_filter_bank_with(1, 4, 8, 0.0, None, MelPrecision::Precise).unwrap();
+  assert_eq!(bank.shape(), vec![1, 3]);
+  let v = to_vec(&bank);
+  // The precise path computes in f64 then casts to f32, so it tracks the
+  // f64 oracle to ~1 ULP after the final cast; keep a small f32 slack.
+  for (i, (g, e)) in v.iter().zip(expected.iter()).enumerate() {
+    assert!(
+      (g - e).abs() < 1e-5,
+      "precise mel_filter_bank[{i}]: got {g}, want {e}"
+    );
+  }
+}
+
+/// `hz_to_mel` / `mel_to_hz` (and their f64 twins) are exact inverses of
+/// each other and match the documented HTK formula at a known point.
+/// `hz = 1000` → `mel = 2595 * log10(1 + 1000/700) ≈ 999.986`; round-tripping
+/// back recovers 1000.
+#[test]
+fn hz_mel_round_trip_and_known_value() {
+  // Independent HTK forward value at 1000 Hz.
+  let mel_1000_ref = 2595.0_f32 * (1.0_f32 + 1000.0 / 700.0).log10();
+  let mel_1000 = hz_to_mel(1000.0);
+  assert!(
+    (mel_1000 - mel_1000_ref).abs() < 1e-2,
+    "hz_to_mel(1000) = {mel_1000}, ref {mel_1000_ref}"
+  );
+  // Round trip f32.
+  let back = mel_to_hz(hz_to_mel(1000.0));
+  assert!((back - 1000.0).abs() < 0.1, "hz->mel->hz: got {back}");
+  // f64 twins round-trip much tighter.
+  let back_f64 = mel_to_hz_f64(hz_to_mel_f64(1000.0));
+  assert!(
+    (back_f64 - 1000.0).abs() < 1e-6,
+    "f64 hz->mel->hz: got {back_f64}"
+  );
+}
+
+// ---- coverage: log_mel_spectrogram floor application ---------------------
+
+/// `log_mel_spectrogram` is `log(max(mel, 1e-10))` (default Whisper floor),
+/// and `log_mel_spectrogram_with(LogFloor::Custom(huge))` floors EVERY cell
+/// to that custom value — so a tiny / silent mel becomes `log(floor)`
+/// everywhere. Use a silent input so the mel is ~0 and the floor dominates:
+/// `log_mel == log(floor)` for every cell.
+#[test]
+fn log_mel_spectrogram_applies_floor_on_silence() {
+  // 64 samples of silence → mel ≈ 0 everywhere, so the floor dominates.
+  let zeros = vec![0.0_f32; 64];
+  let x = Array::from_slice::<f32>(&zeros, &[64i32]).unwrap();
+  let n_fft = 16usize;
+  let hop = 8usize;
+  let n_mels = 4usize;
+  let sr = 16_000u32;
+
+  // Default floor = Whisper 1e-10 ⇒ every cell == log(1e-10).
+  let lm = to_vec(&log_mel_spectrogram(&x, n_fft, hop, None, n_mels, sr, 0.0, None).unwrap());
+  let want_default = (1e-10_f32).ln();
+  assert!(!lm.is_empty(), "log-mel must be non-empty");
+  for (i, &g) in lm.iter().enumerate() {
+    assert!(
+      (g - want_default).abs() < 1e-3,
+      "log_mel[{i}] on silence must equal log(1e-10) = {want_default}, got {g}"
+    );
+  }
+
+  // Explicit custom floor (1e-3) ⇒ every cell == log(1e-3).
+  let custom = LogFloor::Custom(1e-3);
+  let lm_c =
+    to_vec(&log_mel_spectrogram_with(&x, n_fft, hop, None, n_mels, sr, 0.0, None, custom).unwrap());
+  let want_custom = (1e-3_f32).ln();
+  for (i, &g) in lm_c.iter().enumerate() {
+    assert!(
+      (g - want_custom).abs() < 1e-4,
+      "log_mel_with(Custom(1e-3))[{i}] on silence must equal log(1e-3) = {want_custom}, got {g}"
+    );
+  }
+}
+
+// ---- coverage: BiquadKind::as_str ----------------------------------------
+
+/// `BiquadKind::as_str` maps both RBJ shapes to their snake-case names.
+#[test]
+fn biquad_kind_as_str_both_variants() {
+  assert_eq!(BiquadKind::HighShelf.as_str(), "high_shelf");
+  assert_eq!(BiquadKind::HighPass.as_str(), "high_pass");
+  assert!(BiquadKind::HighShelf.is_high_shelf());
+  assert!(BiquadKind::HighPass.is_high_pass());
+}
+
+// ---- coverage: integrated_loudness extra validation ----------------------
+
+/// `integrated_loudness` rejects a 2-D input with ZERO channels (shape
+/// `[n, 0]`) via the `n_channels == 0` `EmptyInput` branch.
+#[test]
+fn integrated_loudness_rejects_zero_channels() {
+  let rate = 48_000u32;
+  // A (24000, 0) lazy array: 0 channels.
+  let x = Array::zeros::<f32>(&[24_000i32, 0i32]).unwrap();
+  assert!(matches!(
+    integrated_loudness(&x, rate, 0.4, 0.75),
+    Err(Error::EmptyInput(_))
+  ));
+}
+
+/// `integrated_loudness` rejects `block_size * rate < 1` sample (a block
+/// smaller than a single sample) via the `block_samples >= 1` guard. Use a
+/// finite but sub-sample block (block_size = 1e-9 s at 48 kHz ⇒ 4.8e-5
+/// samples < 1).
+#[test]
+fn integrated_loudness_rejects_sub_sample_block() {
+  let rate = 48_000u32;
+  let x = sine_mono(1000.0, 0.5, rate, 1.0);
+  let res = integrated_loudness(&x, rate, 1e-9, 0.75);
+  assert!(
+    matches!(res, Err(Error::OutOfRange(_))),
+    "a block smaller than one sample must be rejected, got {res:?}"
+  );
+}
+
+// ---- coverage: normalize_peak empty / NaN-input branches -----------------
+
+/// `normalize_peak` on an empty array returns `Error::EmptyInput` (max over
+/// an empty array is undefined) — the size-0 guard, distinct from the
+/// all-silence `OutOfRange` path.
+#[test]
+fn normalize_peak_rejects_empty_input() {
+  let empty = Array::zeros::<f32>(&[0i32]).unwrap();
+  assert!(matches!(
+    normalize_peak(&empty, 0.0),
+    Err(Error::EmptyInput(_))
+  ));
+}
+
+/// `normalize_peak` rejects an input whose peak `max(|data|)` is NON-FINITE
+/// (a NaN or infinite SAMPLE in the data) via the `current_peak.is_finite()`
+/// guard — a finite `target_peak_db` but a non-finite measured peak.
+#[test]
+fn normalize_peak_rejects_non_finite_input_sample() {
+  // An infinite sample makes max(|data|) == +inf.
+  let with_inf = Array::from_slice::<f32>(&[0.5_f32, f32::INFINITY, -0.25], &[3i32]).unwrap();
+  assert!(
+    matches!(
+      normalize_peak(&with_inf, 0.0),
+      Err(Error::NonFiniteScalar(_))
+    ),
+    "an infinite input sample must be rejected via the current-peak finiteness guard"
+  );
+  // A NaN sample: max(|NaN|) is NaN under mlx's max reduction — also
+  // non-finite, so it must reject too.
+  let with_nan = Array::from_slice::<f32>(&[0.5_f32, f32::NAN, -0.25], &[3i32]).unwrap();
+  assert!(matches!(
+    normalize_peak(&with_nan, 0.0),
+    Err(Error::NonFiniteScalar(_))
+  ));
+}

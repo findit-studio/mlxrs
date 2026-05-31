@@ -4784,3 +4784,1319 @@ fn try_parse_one_call_context_predicate_matches_recognizer_per_parser() {
     }
   }
 }
+
+// ========================================================================
+// Batch-parse + pure-helper coverage.
+//
+// The streaming tests above exercise `try_parse_one_call` and
+// `ToolCallProcessor` thoroughly. The tests below close the remaining gaps
+// in the PURE-LOGIC surface: each parser's `parse()` batch path, the
+// literal/value coercion helpers (`literal_eval`, `deserialize`,
+// `convert_param_value`, `schema_types`, `convert_with_types`), the
+// extraction helpers (`find_pythonic_call`, `parse_kw_args`, `find_all`,
+// `find_kv_pairs`, `gemma_call`, `gemma4_calls`, `gemma4_args_to_json`,
+// `glm_parse_json`, `glm_parse_plain`, `extract_name`, `balanced_brace_end`,
+// `utf8_char_width`, `pythonic_call_close`, `xml_value_aware_end_tag_scan`),
+// the selection functions (`parser_by_name`, `infer_tool_parser`) and the
+// default `parse` loop (`default_parse_via_try_parse_one_call`). Oracles are
+// closed-form: every expected value is hand-written from the documented
+// grammar, never produced by calling the function under test.
+// ========================================================================
+
+// --- literal_eval: every coercion branch --------------------------------
+
+#[test]
+fn literal_eval_json_first() {
+  // Bare JSON values are parsed by serde first (line ~545).
+  assert_eq!(literal_eval("42"), serde_json::json!(42));
+  assert_eq!(literal_eval("3.5"), serde_json::json!(3.5));
+  assert_eq!(literal_eval(r#"{"a":1}"#), serde_json::json!({"a": 1}));
+  assert_eq!(literal_eval("[1,2]"), serde_json::json!([1, 2]));
+  // Surrounding whitespace is trimmed before parsing.
+  assert_eq!(literal_eval("  7  "), serde_json::json!(7));
+}
+
+#[test]
+fn literal_eval_python_bool_none() {
+  // Python literals that are not JSON: True / False / None.
+  assert_eq!(literal_eval("True"), Value::Bool(true));
+  assert_eq!(literal_eval("False"), Value::Bool(false));
+  assert_eq!(literal_eval("None"), Value::Null);
+  // Lowercase JSON spellings also map (covered by the explicit match arm).
+  assert_eq!(literal_eval("true"), Value::Bool(true));
+  assert_eq!(literal_eval("null"), Value::Null);
+}
+
+#[test]
+fn literal_eval_single_and_double_quoted_strings() {
+  // Single-quoted: serde rejects, the quote-strip arm (line ~554) unwraps.
+  assert_eq!(literal_eval("'hello'"), Value::String("hello".to_owned()));
+  // A bare double-quoted string IS valid JSON, so it round-trips identically.
+  assert_eq!(literal_eval(r#""hi""#), Value::String("hi".to_owned()));
+  // Empty single-quoted string (len == 2 boundary).
+  assert_eq!(literal_eval("''"), Value::String(String::new()));
+}
+
+#[test]
+fn literal_eval_bare_int_and_float_non_json() {
+  // `+5` is NOT valid JSON (no leading `+`) but parses as i64 (line ~559).
+  assert_eq!(literal_eval("+5"), serde_json::json!(5));
+  // `+1.5` fails JSON and i64, parses as f64 (line ~562-565).
+  assert_eq!(literal_eval("+1.5"), serde_json::json!(1.5));
+  // A leading-zero-padded int `007` is rejected by serde JSON but parses i64.
+  assert_eq!(literal_eval("007"), serde_json::json!(7));
+}
+
+#[test]
+fn literal_eval_python_container_quote_swap() {
+  // Python list with single quotes: serde fails, the bracket/quote-swap arm
+  // (line ~568-581) replaces `'`->`"` and parses.
+  assert_eq!(literal_eval("['a', 'b']"), serde_json::json!(["a", "b"]));
+  // Python tuple `(...)` is rewritten to a JSON array `[...]`.
+  assert_eq!(literal_eval("(1, 2)"), serde_json::json!([1, 2]));
+  // Python dict with single-quoted keys + `True`/`None` tokens swapped.
+  assert_eq!(
+    literal_eval("{'ok': True, 'x': None}"),
+    serde_json::json!({"ok": true, "x": null})
+  );
+}
+
+#[test]
+fn literal_eval_unparseable_falls_back_to_string() {
+  // Fails JSON, bool/none, quote-strip, int, float, and the bracket swap
+  // (no enclosing bracket): the final fallback returns the trimmed string
+  // (line ~583).
+  assert_eq!(literal_eval("foo bar"), Value::String("foo bar".to_owned()));
+  // A bracketed value whose swap still fails JSON also lands on the string
+  // fallback (e.g. an unbalanced bracket).
+  assert_eq!(literal_eval("[oops"), Value::String("[oops".to_owned()));
+}
+
+#[test]
+fn deserialize_json_then_literal() {
+  // `deserialize` is JSON-first, then `literal_eval`.
+  assert_eq!(deserialize(r#"{"a":1}"#), serde_json::json!({"a": 1}));
+  // Single-quoted Python string: JSON fails, literal_eval unwraps.
+  assert_eq!(deserialize("'x'"), Value::String("x".to_owned()));
+  // Unparseable: literal_eval's string fallback.
+  assert_eq!(deserialize("plain"), Value::String("plain".to_owned()));
+}
+
+// --- convert_param_value: type-directed coercion (qwen3_coder) ----------
+
+/// Build a minimal `properties` map for one parameter with the given JSON
+/// `type` string, wrapped as a `tools` array so `tool_properties` resolves it.
+fn tools_with_param_type(func: &str, param: &str, ty: &str) -> Value {
+  serde_json::json!([{
+    "function": {
+      "name": func,
+      "parameters": { "properties": { param: { "type": ty } } }
+    }
+  }])
+}
+
+#[test]
+fn convert_param_value_no_props_is_string() {
+  // No props at all → raw string (line ~1370-1372).
+  assert_eq!(
+    convert_param_value("5", "n", None),
+    Value::String("5".to_owned())
+  );
+}
+
+#[test]
+fn convert_param_value_null_literal() {
+  // Case-insensitive `null` → Value::Null regardless of schema (line ~1367).
+  assert_eq!(convert_param_value("NULL", "x", None), Value::Null);
+  assert_eq!(convert_param_value("null", "x", None), Value::Null);
+}
+
+#[test]
+fn convert_param_value_missing_schema_for_name() {
+  // props present but the param name is absent → raw string (line ~1373-1375).
+  let props = serde_json::json!({ "other": { "type": "string" } });
+  let map = props.as_object().unwrap();
+  assert_eq!(
+    convert_param_value("v", "missing", Some(map)),
+    Value::String("v".to_owned())
+  );
+}
+
+#[test]
+fn convert_param_value_typed_branches() {
+  // Helper: pull the single param's schema map out of a tools array.
+  fn props_for(tools: &Value, func: &str) -> serde_json::Map<String, Value> {
+    tools
+      .as_array()
+      .unwrap()
+      .iter()
+      .find(|t| t["function"]["name"] == func)
+      .unwrap()["function"]["parameters"]["properties"]
+      .as_object()
+      .unwrap()
+      .clone()
+  }
+
+  // string-family type → raw string (line ~1385).
+  let t = tools_with_param_type("f", "p", "string");
+  let p = props_for(&t, "f");
+  assert_eq!(
+    convert_param_value("hello", "p", Some(&p)),
+    Value::String("hello".to_owned())
+  );
+
+  // int-family → parse i64 (line ~1387-1394).
+  let t = tools_with_param_type("f", "p", "int");
+  let p = props_for(&t, "f");
+  assert_eq!(
+    convert_param_value("12", "p", Some(&p)),
+    serde_json::json!(12)
+  );
+  // int-family parse failure → string fallback.
+  assert_eq!(
+    convert_param_value("nope", "p", Some(&p)),
+    Value::String("nope".to_owned())
+  );
+
+  // number/float → ALWAYS a JSON float, never promoted to int (line ~1404-1409).
+  let t = tools_with_param_type("f", "p", "number");
+  let p = props_for(&t, "f");
+  assert_eq!(
+    convert_param_value("2.5", "p", Some(&p)),
+    serde_json::json!(2.5)
+  );
+  // Non-finite has no JSON representation → string fallback (line ~1408).
+  assert_eq!(
+    convert_param_value("NaN", "p", Some(&p)),
+    Value::String("NaN".to_owned())
+  );
+
+  // boolean → case-insensitive true/anything-else (line ~1410-1411).
+  let t = tools_with_param_type("f", "p", "boolean");
+  let p = props_for(&t, "f");
+  assert_eq!(
+    convert_param_value("TRUE", "p", Some(&p)),
+    Value::Bool(true)
+  );
+  assert_eq!(convert_param_value("no", "p", Some(&p)), Value::Bool(false));
+
+  // object/array/dict/list → JSON parse, else literal_eval (line ~1412-1414).
+  let t = tools_with_param_type("f", "p", "object");
+  let p = props_for(&t, "f");
+  assert_eq!(
+    convert_param_value(r#"{"k":1}"#, "p", Some(&p)),
+    serde_json::json!({"k": 1})
+  );
+  // Unparseable object body falls back to literal_eval (→ string here).
+  assert_eq!(
+    convert_param_value("plain", "p", Some(&p)),
+    Value::String("plain".to_owned())
+  );
+
+  // unknown type → literal_eval (line ~1416).
+  let t = tools_with_param_type("f", "p", "weird");
+  let p = props_for(&t, "f");
+  assert_eq!(
+    convert_param_value("True", "p", Some(&p)),
+    Value::Bool(true)
+  );
+}
+
+// --- schema_types + convert_with_types (minimax_m2) ---------------------
+
+#[test]
+fn schema_types_variants() {
+  // Single string type.
+  assert_eq!(
+    schema_types(&serde_json::json!({"type": "integer"})),
+    vec!["integer".to_owned()]
+  );
+  // Array of types (sorted via BTreeSet).
+  assert_eq!(
+    schema_types(&serde_json::json!({"type": ["string", "null"]})),
+    vec!["null".to_owned(), "string".to_owned()]
+  );
+  // enum values map to their JSON-shape type names.
+  assert_eq!(
+    schema_types(&serde_json::json!({"enum": [1, "a", true, null]})),
+    vec![
+      "boolean".to_owned(),
+      "integer".to_owned(),
+      "null".to_owned(),
+      "string".to_owned()
+    ]
+  );
+  // anyOf/oneOf/allOf recursion.
+  assert_eq!(
+    schema_types(&serde_json::json!({
+      "anyOf": [{"type": "integer"}, {"type": "boolean"}]
+    })),
+    vec!["boolean".to_owned(), "integer".to_owned()]
+  );
+  // Empty / non-object schema → default ["string"].
+  assert_eq!(
+    schema_types(&serde_json::json!({})),
+    vec!["string".to_owned()]
+  );
+  assert_eq!(
+    schema_types(&serde_json::json!(123)),
+    vec!["string".to_owned()]
+  );
+}
+
+#[test]
+fn convert_with_types_branches() {
+  // null literal short-circuits regardless of types (line ~2100).
+  assert_eq!(
+    convert_with_types("null", &["integer".to_owned()]),
+    Value::Null
+  );
+  // type-set contains null OR value is none/nil (line ~2105).
+  assert_eq!(
+    convert_with_types("nil", &["string".to_owned()]),
+    Value::Null
+  );
+  assert_eq!(convert_with_types("x", &["null".to_owned()]), Value::Null);
+  // integer parse.
+  assert_eq!(
+    convert_with_types("7", &["integer".to_owned()]),
+    serde_json::json!(7)
+  );
+  // number → JSON float, never int promotion.
+  assert_eq!(
+    convert_with_types("2.0", &["number".to_owned()]),
+    serde_json::json!(2.0)
+  );
+  // boolean true/false synonyms.
+  assert_eq!(
+    convert_with_types("yes", &["boolean".to_owned()]),
+    Value::Bool(true)
+  );
+  assert_eq!(
+    convert_with_types("off", &["boolean".to_owned()]),
+    Value::Bool(false)
+  );
+  // object/array → JSON parse.
+  assert_eq!(
+    convert_with_types("[1,2]", &["array".to_owned()]),
+    serde_json::json!([1, 2])
+  );
+  // The union is walked in a FIXED priority order
+  // (integer, int, number, float, boolean, bool, object, array, string, ...),
+  // so `integer` is tried before `string`: a parseable int returns a number
+  // even when `string` is also in the union.
+  assert_eq!(
+    convert_with_types("42", &["string".to_owned(), "integer".to_owned()]),
+    serde_json::json!(42),
+    "integer is visited before string in the priority order"
+  );
+  // A non-numeric value with the same union falls through `integer` (parse
+  // fails, no early return) and lands on the `string` branch.
+  assert_eq!(
+    convert_with_types("xyz", &["string".to_owned(), "integer".to_owned()]),
+    Value::String("xyz".to_owned()),
+    "integer parse fails → falls through to the string branch"
+  );
+  // No recognised type at all → final serde-or-string fallback (line ~2154).
+  assert_eq!(
+    convert_with_types("bare", &["unknown_type".to_owned()]),
+    Value::String("bare".to_owned())
+  );
+  assert_eq!(
+    convert_with_types("99", &["unknown_type".to_owned()]),
+    serde_json::json!(99),
+    "no recognised type → final serde fallback parses the JSON number"
+  );
+}
+
+#[test]
+fn extract_name_quote_stripping() {
+  assert_eq!(extract_name(r#""foo""#), "foo");
+  assert_eq!(extract_name("'bar'"), "bar");
+  assert_eq!(extract_name("  baz  "), "baz", "trimmed, no quotes");
+  // A single stray quote is not a matched pair → returned verbatim (trimmed).
+  assert_eq!(extract_name(r#""x"#), r#""x"#);
+}
+
+// --- find_pythonic_call + parse_kw_args ---------------------------------
+
+#[test]
+fn find_pythonic_call_extracts_first() {
+  // First `[name(...)]`; args region is everything up to `)]`.
+  assert_eq!(
+    find_pythonic_call("[echo(a=1, b=2)]"),
+    Some(("echo".to_owned(), "a=1, b=2".to_owned()))
+  );
+  // Leading text before the call is skipped.
+  assert_eq!(
+    find_pythonic_call("noise [f()] tail"),
+    Some(("f".to_owned(), String::new()))
+  );
+  // No call form at all.
+  assert_eq!(find_pythonic_call("plain text"), None);
+  // `[` without an immediate name+`(` is not a call start.
+  assert_eq!(find_pythonic_call("[ not_a_call ]"), None);
+}
+
+#[test]
+fn parse_kw_args_quoted_unquoted_and_unterminated() {
+  // Mixed quoted + unquoted values.
+  assert_eq!(
+    parse_kw_args(r#"a="x", b=2, c=hello"#).unwrap(),
+    vec![
+      ("a".to_owned(), "x".to_owned()),
+      ("b".to_owned(), "2".to_owned()),
+      ("c".to_owned(), "hello".to_owned()),
+    ]
+  );
+  // Empty input → no pairs.
+  assert!(parse_kw_args("").unwrap().is_empty());
+  // No `=` at all → loop breaks immediately, no pairs (line ~925-926).
+  assert!(parse_kw_args("garbage").unwrap().is_empty());
+  // Unterminated quote keeps the remainder as the value (line ~945-946).
+  assert_eq!(
+    parse_kw_args(r#"a="unterminated"#).unwrap(),
+    vec![("a".to_owned(), "unterminated".to_owned())]
+  );
+  // Whitespace before a non-ASCII value must not panic on a UTF-8 boundary.
+  assert_eq!(
+    parse_kw_args(r#"city=  "é""#).unwrap(),
+    vec![("city".to_owned(), "é".to_owned())]
+  );
+}
+
+// --- find_all + find_kv_pairs -------------------------------------------
+
+#[test]
+fn find_all_basic_and_unclosed() {
+  assert_eq!(
+    find_all("<a>1</a><a>2</a>", "<a>", "</a>"),
+    vec!["1".to_owned(), "2".to_owned()]
+  );
+  // An open with no matching close terminates the scan (line ~1431).
+  assert_eq!(
+    find_all("<a>1</a><a>dangling", "<a>", "</a>"),
+    vec!["1".to_owned()]
+  );
+  // No open at all → empty.
+  assert!(find_all("nothing here", "<a>", "</a>").is_empty());
+}
+
+#[test]
+fn find_kv_pairs_basic_and_truncated() {
+  assert_eq!(
+    find_kv_pairs(
+      "<k>a</k><v>1</v><k>b</k><v>2</v>",
+      "<k>",
+      "</k>",
+      "<v>",
+      "</v>"
+    ),
+    vec![
+      ("a".to_owned(), "1".to_owned()),
+      ("b".to_owned(), "2".to_owned())
+    ]
+  );
+  // A key with no value tag stops the scan (the value-open `find` fails).
+  assert_eq!(
+    find_kv_pairs("<k>a</k>no value", "<k>", "</k>", "<v>", "</v>"),
+    Vec::<(String, String)>::new()
+  );
+}
+
+// --- glm_parse_json + glm_parse_plain (glm47 fallbacks) -----------------
+
+#[test]
+fn glm_parse_json_shapes() {
+  // {name, arguments}
+  assert_eq!(
+    glm_parse_json(r#"{"name":"f","arguments":{"x":1}}"#, None),
+    Some(ToolCall::new_nameless_id("f", serde_json::json!({"x": 1})))
+  );
+  // {function, arguments} alias for the name key.
+  assert_eq!(
+    glm_parse_json(r#"{"function":"g","arguments":{}}"#, None),
+    Some(ToolCall::new_nameless_id("g", serde_json::json!({})))
+  );
+  // {tool: {name, arguments}} nested shape.
+  assert_eq!(
+    glm_parse_json(r#"{"tool":{"name":"h","arguments":{"a":2}}}"#, None),
+    Some(ToolCall::new_nameless_id("h", serde_json::json!({"a": 2})))
+  );
+  // Top-level array → first object is taken.
+  assert_eq!(
+    glm_parse_json(r#"[{"name":"arr","arguments":{}}]"#, None),
+    Some(ToolCall::new_nameless_id("arr", serde_json::json!({})))
+  );
+  // No name → None.
+  assert_eq!(glm_parse_json(r#"{"arguments":{}}"#, None), None);
+  // A `tool` object with no `arguments` key → arguments defaults to the empty
+  // object (the `None =>` arm). NB the top-level `{"name",...}` shape requires
+  // BOTH `name` and `arguments`, so `{"name":"k"}` alone parses to None; the
+  // `tool`-wrapped form is what reaches the default-empty-arguments arm.
+  assert_eq!(
+    glm_parse_json(r#"{"tool":{"name":"k"}}"#, None),
+    Some(ToolCall::new_nameless_id("k", serde_json::json!({})))
+  );
+  // arguments as a JSON-encoded string → deserialized (line ~1642-1643).
+  assert_eq!(
+    glm_parse_json(r#"{"name":"k","arguments":"{\"z\":3}"}"#, None),
+    Some(ToolCall::new_nameless_id("k", serde_json::json!({"z": 3})))
+  );
+  // arguments present but not an object (and not a string) → None (line ~1652).
+  assert_eq!(glm_parse_json(r#"{"name":"k","arguments":5}"#, None), None);
+  // Not JSON at all → None.
+  assert_eq!(glm_parse_json("not json", None), None);
+}
+
+#[test]
+fn glm_parse_plain_shapes() {
+  // Empty / whitespace → None (line ~1658).
+  assert_eq!(glm_parse_plain("   ", None), None);
+  // First line is the name, remainder is a JSON object body (line ~1661-1670).
+  assert_eq!(
+    glm_parse_plain("myfunc\n{\"a\":1}", None),
+    Some(ToolCall::new_nameless_id(
+      "myfunc",
+      serde_json::json!({"a": 1})
+    ))
+  );
+  // Single token, no args → empty-object call (line ~1679-1681).
+  assert_eq!(
+    glm_parse_plain("solo", None),
+    Some(ToolCall::new_nameless_id("solo", serde_json::json!({})))
+  );
+  // `name <json-object>` after a space split → object args (line ~1682-1685).
+  assert_eq!(
+    glm_parse_plain(r#"f {"k":2}"#, None),
+    Some(ToolCall::new_nameless_id("f", serde_json::json!({"k": 2})))
+  );
+  // `name key=value key=value` → parsed pairs (line ~1687-1709).
+  assert_eq!(
+    glm_parse_plain("f a=1 b=2", None),
+    Some(ToolCall::new_nameless_id(
+      "f",
+      serde_json::json!({"a": 1, "b": 2})
+    ))
+  );
+  // A malformed token (no `=`) makes the kv path bail, so the whole rest is
+  // surfaced as `{"raw": ...}` (line ~1701-1714).
+  assert_eq!(
+    glm_parse_plain("f a=1 bad", None),
+    Some(ToolCall::new_nameless_id(
+      "f",
+      serde_json::json!({"raw": "a=1 bad"})
+    ))
+  );
+}
+
+// --- gemma_call + gemma4 helpers ----------------------------------------
+
+#[test]
+fn gemma_call_first_call_and_rejects() {
+  assert_eq!(
+    gemma_call("call:foo{a:1}", false),
+    Some(("foo".to_owned(), "a:1".to_owned()))
+  );
+  // `call:` without an immediate `{` after the name is not a call start.
+  assert_eq!(gemma_call("call:foo bar", false), None);
+  // No `call:` marker at all.
+  assert_eq!(gemma_call("nothing", false), None);
+}
+
+#[test]
+fn gemma4_calls_walks_blocks() {
+  // Two back-to-back calls; braces balanced.
+  assert_eq!(
+    gemma4_calls("call:a{x:1}call:b{y:2}"),
+    vec![
+      ("a".to_owned(), "{x:1}".to_owned()),
+      ("b".to_owned(), "{y:2}".to_owned())
+    ]
+  );
+  // A `call:` with no `{` body is skipped, the next valid one is found.
+  assert_eq!(
+    gemma4_calls("call:skip then call:c{z:3}"),
+    vec![("c".to_owned(), "{z:3}".to_owned())]
+  );
+  // No call at all.
+  assert!(gemma4_calls("plain").is_empty());
+}
+
+#[test]
+fn gemma4_args_to_json_quotes_keys_and_restores_strings() {
+  // Bare keys get quoted; `<|"|>STR<|"|>` becomes a JSON string. A `}` inside
+  // the string region does not close the object. The bare-key rewrite
+  // requires the key to IMMEDIATELY follow `{` or `,` (no whitespace), so a
+  // second key sits directly after the comma.
+  let json = gemma4_args_to_json(r#"{k: <|"|>v}x<|"|>,n: 2}"#);
+  let parsed: Value = serde_json::from_str(&json).expect("valid JSON output");
+  assert_eq!(parsed, serde_json::json!({"k": "v}x", "n": 2}));
+  // A single-key body with a `<|"|>` string carrying a `}` literal also
+  // round-trips (the string region is opaque to brace matching).
+  let json2 = gemma4_args_to_json(r#"{s: <|"|>a}b<|"|>}"#);
+  let parsed2: Value = serde_json::from_str(&json2).expect("valid JSON output");
+  assert_eq!(parsed2, serde_json::json!({"s": "a}b"}));
+}
+
+#[test]
+fn balanced_brace_end_and_utf8_width() {
+  // Smallest object.
+  assert_eq!(balanced_brace_end("{}"), Some(1));
+  // Nested + a `}` inside a `<|"|>` literal must not close early.
+  assert_eq!(balanced_brace_end(r#"{a:{b:1}}"#), Some(8));
+  // `{s:<|"|>}<|"|>}` — the `<|"|>}<|"|>` region (open at byte 3, close
+  // ending at byte 13) is skipped whole, so the `}` at byte 8 does NOT close
+  // the object; the real closing `}` is at byte 14.
+  assert_eq!(
+    balanced_brace_end(r#"{s:<|"|>}<|"|>}"#),
+    Some(14),
+    "the `}}` inside the <|\"|> literal is skipped; the real close is last"
+  );
+  // Not starting with `{` → None.
+  assert_eq!(balanced_brace_end("x{}"), None);
+  // Never closes → None.
+  assert_eq!(balanced_brace_end("{a:1"), None);
+
+  // utf8_char_width: ASCII=1, 2/3/4-byte leads, stray continuation byte → 1.
+  assert_eq!(utf8_char_width(b'a'), 1);
+  assert_eq!(utf8_char_width(0xC3), 2);
+  assert_eq!(utf8_char_width(0xE2), 3);
+  assert_eq!(utf8_char_width(0xF0), 4);
+  assert_eq!(
+    utf8_char_width(0x80),
+    1,
+    "stray continuation byte advances 1"
+  );
+}
+
+// --- pythonic_call_close: the no-`)` re-scan + depth-underflow branches --
+
+#[test]
+fn pythonic_call_close_variants() {
+  // Simple close.
+  let s = "[f(a=1)]";
+  assert_eq!(pythonic_call_close(s), Some(s.len()));
+  // No `[` → None.
+  assert_eq!(pythonic_call_close("plain"), None);
+  // A `)]` literal inside a single-quoted string does NOT close the call.
+  let q = "[echo(s=')]')]";
+  assert_eq!(pythonic_call_close(q), Some(q.len()));
+  // First bracket pair closes WITHOUT a preceding `)`, so the scanner skips
+  // ahead to the next `[name(...)]` (line ~3568-3589).
+  let rescan = "[bad][g(x=1)]";
+  assert_eq!(pythonic_call_close(rescan), Some(rescan.len()));
+  // A non-call `[...]` with no following `[` → the re-scan runs off the end
+  // and returns None (line ~3581-3583).
+  assert_eq!(pythonic_call_close("[just text]"), None);
+}
+
+// --- qwen_function_open_at: boundary / malformed-name rejections ---------
+
+#[test]
+fn qwen_function_open_at_boundaries() {
+  // Too short for the `<function=` needle (line ~1305-1307).
+  assert_eq!(qwen_function_open_at("<fun", 0), None);
+  // Wrong literal at the offset (line ~1308-1310).
+  assert_eq!(qwen_function_open_at("xxfunction=f>", 0), None);
+  // Valid open: returns (name_start, after_close_bracket).
+  // `<function=` is 10 bytes, name `foo` 3 bytes, `>` at 13, after = 14.
+  assert_eq!(qwen_function_open_at("<function=foo>", 0), Some((10, 14)));
+  // Empty name `<function=>` → None.
+  assert_eq!(qwen_function_open_at("<function=>", 0), None);
+  // Name runs to end of buffer with no `>` → None.
+  assert_eq!(qwen_function_open_at("<function=foo", 0), None);
+}
+
+// --- xml_value_aware_end_tag_scan: value-skip + not-found branches -------
+
+#[test]
+fn xml_value_aware_end_tag_scan_branches() {
+  // End-tag before any value region → found immediately.
+  assert_eq!(
+    xml_value_aware_end_tag_scan("END rest", "<v>", "</v>", "END"),
+    Some(0)
+  );
+  // A value region opens before the end-tag candidate; its body (which holds
+  // an in-value `END` literal) is skipped, and the real `END` after the
+  // value close is returned.
+  let s = "<v>inner END</v>END";
+  let expected = s.find("</v>").unwrap() + "</v>".len();
+  assert_eq!(
+    xml_value_aware_end_tag_scan(s, "<v>", "</v>", "END"),
+    Some(expected)
+  );
+  // A value opens but never closes → None (in-value body still streaming).
+  assert_eq!(
+    xml_value_aware_end_tag_scan("<v>unterminated END", "<v>", "</v>", "END"),
+    None
+  );
+  // Neither value nor end-tag present → None.
+  assert_eq!(
+    xml_value_aware_end_tag_scan("plain bytes", "<v>", "</v>", "END"),
+    None
+  );
+}
+
+// --- balanced_json_{array,object}_prefix: extra-close + leading-skip -----
+// NOTE: the `depth < 0` arms (object line ~3413-3416, array line ~3472-3475)
+// are defensive and structurally UNREACHABLE through normal scanning — the
+// scan returns at the FIRST `depth == 0`, so a trailing extra `]`/`}` is
+// never processed and depth can never reach -1. These tests therefore cover
+// the first-balanced-close return and the leading-byte-skip, not the
+// dead underflow arms.
+
+#[test]
+fn balanced_json_array_prefix_extra_close_and_leading_skip() {
+  // The first balanced `[...]` returns immediately; the trailing extra `]`
+  // is left as suffix and never drives depth negative.
+  assert_eq!(balanced_json_array_prefix("[]]"), Some((0, 2)));
+  // Leading `]` before any `[` is ignored (scan starts at first `[`).
+  assert_eq!(balanced_json_array_prefix("][1]"), Some((1, 4)));
+}
+
+#[test]
+fn balanced_json_object_prefix_extra_close_is_suffix() {
+  // Scan starts at `{`, closes at the first balanced `}`. A bare extra `}`
+  // after the complete object is suffix (never processed).
+  assert_eq!(balanced_json_object_prefix("{}}"), Some((0, 2)));
+}
+
+// --- batch parse() per parser: closed-form oracles ----------------------
+
+#[test]
+fn parse_json_tools_batch() {
+  let out = JsonTools
+    .parse(r#"{"name":"get_time","arguments":{"tz":"UTC"}}"#, None)
+    .unwrap();
+  assert_eq!(
+    out,
+    vec![ToolCall::new_nameless_id(
+      "get_time",
+      serde_json::json!({"tz": "UTC"})
+    )]
+  );
+  // Missing name → typed tokenizer error (not a panic).
+  let e = JsonTools.parse(r#"{"arguments":{}}"#, None).unwrap_err();
+  assert!(
+    matches!(e, Error::Tokenizer(_)),
+    "missing-name is a Tokenizer error"
+  );
+  // Invalid JSON → typed tokenizer error.
+  assert!(matches!(
+    JsonTools.parse("not json", None).unwrap_err(),
+    Error::Tokenizer(_)
+  ));
+  // arguments omitted → Null arguments (line ~693).
+  assert_eq!(
+    JsonTools.parse(r#"{"name":"f"}"#, None).unwrap(),
+    vec![ToolCall::new_nameless_id("f", Value::Null)]
+  );
+}
+
+#[test]
+fn parse_pythonic_batch() {
+  let out = Pythonic
+    .parse(r#"[echo(a="x", b=2, c=True)]"#, None)
+    .unwrap();
+  assert_eq!(
+    out,
+    vec![ToolCall::new_nameless_id(
+      "echo",
+      serde_json::json!({"a": "x", "b": 2, "c": true})
+    )]
+  );
+  // No call form → "No function provided." tokenizer error.
+  assert!(matches!(
+    Pythonic.parse("nope", None).unwrap_err(),
+    Error::Tokenizer(_)
+  ));
+}
+
+#[test]
+fn parse_mistral_batch_and_errors() {
+  let out = Mistral
+    .parse(r#"get_weather[ARGS]{"city":"Tokyo"}"#, None)
+    .unwrap();
+  assert_eq!(
+    out,
+    vec![ToolCall::new_nameless_id(
+      "get_weather",
+      serde_json::json!({"city": "Tokyo"})
+    )]
+  );
+  // No `[ARGS]` (line ~982-983).
+  assert!(matches!(
+    Mistral.parse("nothing", None).unwrap_err(),
+    Error::Tokenizer(_)
+  ));
+  // `[ARGS]` but no `{` after it (line ~987-988).
+  assert!(matches!(
+    Mistral.parse("f[ARGS] no-json", None).unwrap_err(),
+    Error::Tokenizer(_)
+  ));
+  // `[ARGS]{...}` but invalid JSON (line ~990).
+  assert!(matches!(
+    Mistral.parse("f[ARGS]{bad}", None).unwrap_err(),
+    Error::Tokenizer(_)
+  ));
+}
+
+#[test]
+fn parse_qwen3_coder_batch_with_types() {
+  // Parameter values coerced via the provided schema (int + string).
+  let tools = serde_json::json!([{
+    "function": {
+      "name": "f",
+      "parameters": { "properties": {
+        "n": { "type": "integer" },
+        "s": { "type": "string" }
+      } }
+    }
+  }]);
+  let out = Qwen3Coder
+    .parse(
+      "<function=f><parameter=n>42</parameter><parameter=s>hi</parameter></function>",
+      Some(&tools),
+    )
+    .unwrap();
+  assert_eq!(
+    out,
+    vec![ToolCall::new_nameless_id(
+      "f",
+      serde_json::json!({"n": 42, "s": "hi"})
+    )]
+  );
+  // A leading/trailing newline inside a parameter value is stripped
+  // (line ~1139-1144).
+  let out2 = Qwen3Coder
+    .parse(
+      "<function=g><parameter=p>\nval\n</parameter></function>",
+      None,
+    )
+    .unwrap();
+  assert_eq!(
+    out2,
+    vec![ToolCall::new_nameless_id(
+      "g",
+      serde_json::json!({"p": "val"})
+    )]
+  );
+  // No `<function=` → "No function provided." (line ~1117-1118).
+  assert!(matches!(
+    Qwen3Coder.parse("plain", None).unwrap_err(),
+    Error::Tokenizer(_)
+  ));
+  // `<function=f>` with no `</function>` close → error (line ~1122-1124).
+  assert!(matches!(
+    Qwen3Coder
+      .parse("<function=f><parameter=p>v</parameter>", None)
+      .unwrap_err(),
+    Error::Tokenizer(_)
+  ));
+}
+
+#[test]
+fn parse_glm47_batch_all_three_shapes() {
+  // (1) XML-style with string-typed arg coerced to a string.
+  let tools = serde_json::json!([{
+    "function": {
+      "name": "echo",
+      "parameters": { "properties": { "s": { "type": "string" } } }
+    }
+  }]);
+  let out = Glm47
+    .parse(
+      "echo<arg_key>s</arg_key><arg_value>123</arg_value>",
+      Some(&tools),
+    )
+    .unwrap();
+  assert_eq!(
+    out,
+    vec![ToolCall::new_nameless_id(
+      "echo",
+      serde_json::json!({"s": "123"})
+    )],
+    "string-typed arg stays a string even though `123` looks numeric"
+  );
+  // (2) JSON-object fallback.
+  let out = Glm47
+    .parse(r#"{"name":"f","arguments":{"x":1}}"#, None)
+    .unwrap();
+  assert_eq!(
+    out,
+    vec![ToolCall::new_nameless_id("f", serde_json::json!({"x": 1}))]
+  );
+  // (3) plain fallback → name + raw rest.
+  let out = Glm47.parse("toolname key=val", None).unwrap();
+  assert_eq!(
+    out,
+    vec![ToolCall::new_nameless_id(
+      "toolname",
+      serde_json::json!({"key": "val"})
+    )]
+  );
+  // (4) unknown shape (empty) → the catch-all "unknown" call (line ~1538-1541).
+  let out = Glm47.parse("", None).unwrap();
+  assert_eq!(
+    out,
+    vec![ToolCall::new_nameless_id(
+      "unknown",
+      serde_json::json!({"raw": ""})
+    )]
+  );
+}
+
+#[test]
+fn parse_glm47_xml_non_string_arg_is_deserialized() {
+  // No schema → numeric-looking arg values get `deserialize`d (→ number).
+  let out = Glm47
+    .parse("f<arg_key>n</arg_key><arg_value>7</arg_value>", None)
+    .unwrap();
+  assert_eq!(
+    out,
+    vec![ToolCall::new_nameless_id("f", serde_json::json!({"n": 7}))]
+  );
+}
+
+#[test]
+fn parse_kimi_k2_batch_single_and_multi() {
+  // Single block (no find_all matches → parse_single fallback, line ~1775-1776).
+  let single = "functions.weather:0<|tool_call_argument_begin|>{\"city\":\"NYC\"}";
+  let out = KimiK2.parse(single, None).unwrap();
+  assert_eq!(
+    out,
+    vec![ToolCall::new(
+      "weather",
+      serde_json::json!({"city": "NYC"}),
+      Some("functions.weather:0".to_owned())
+    )]
+  );
+  // Multi-block via the section wrappers.
+  let multi = concat!(
+    "<|tool_call_begin|>functions.a:0<|tool_call_argument_begin|>{}<|tool_call_end|>",
+    "<|tool_call_begin|>functions.b:1<|tool_call_argument_begin|>{}<|tool_call_end|>",
+  );
+  let out = KimiK2.parse(multi, None).unwrap();
+  assert_eq!(out.len(), 2);
+  assert_eq!(out[0].name(), "a");
+  assert_eq!(out[0].id(), Some("functions.a:0"));
+  assert_eq!(out[1].name(), "b");
+  assert_eq!(out[1].id(), Some("functions.b:1"));
+  // Name without the `functions.` prefix is kept as-is.
+  let bare = "weather:3<|tool_call_argument_begin|>{}";
+  let out = KimiK2.parse(bare, None).unwrap();
+  assert_eq!(out[0].name(), "weather");
+  assert_eq!(out[0].id(), Some("weather:3"));
+}
+
+#[test]
+fn parse_kimi_k2_single_errors() {
+  // No `<|tool_call_argument_begin|>` → error (line ~1752-1754).
+  assert!(matches!(
+    KimiK2.parse("no-arg-begin", None).unwrap_err(),
+    Error::Tokenizer(_)
+  ));
+  // No `:` in the head → error (line ~1757-1759).
+  assert!(matches!(
+    KimiK2
+      .parse("functions.noindex<|tool_call_argument_begin|>{}", None)
+      .unwrap_err(),
+    Error::Tokenizer(_)
+  ));
+  // Non-numeric index after `:` → error (line ~1760-1762).
+  assert!(matches!(
+    KimiK2
+      .parse("functions.f:notnum<|tool_call_argument_begin|>{}", None)
+      .unwrap_err(),
+    Error::Tokenizer(_)
+  ));
+}
+
+#[test]
+fn parse_longcat_batch() {
+  // JSON fast-path: name/arguments surfaced.
+  let out = Longcat
+    .parse(r#"{"name":"f","arguments":{"x":1}}"#, None)
+    .unwrap();
+  assert_eq!(
+    out,
+    vec![ToolCall::new_nameless_id("f", serde_json::json!({"x": 1}))]
+  );
+  // JSON fast-path with NO `arguments` key → the whole object is the args
+  // and name defaults to "" (line ~1953-1962).
+  let out = Longcat.parse(r#"{"other":2}"#, None).unwrap();
+  assert_eq!(
+    out,
+    vec![ToolCall::new_nameless_id(
+      "",
+      serde_json::json!({"other": 2})
+    )]
+  );
+  // XML-style.
+  let out = Longcat
+    .parse(
+      "f<longcat_arg_key>k</longcat_arg_key><longcat_arg_value>1</longcat_arg_value>",
+      None,
+    )
+    .unwrap();
+  assert_eq!(
+    out,
+    vec![ToolCall::new_nameless_id("f", serde_json::json!({"k": 1}))]
+  );
+  // Neither JSON nor `<longcat_arg_key>` → error (line ~1964-1966).
+  assert!(matches!(
+    Longcat.parse("plain text", None).unwrap_err(),
+    Error::Tokenizer(_)
+  ));
+}
+
+#[test]
+fn parse_minimax_m2_batch() {
+  // Two invokes, with a typed parameter (integer coercion via schema).
+  let tools = serde_json::json!([{
+    "function": {
+      "name": "a",
+      "parameters": { "properties": { "p": { "type": "integer" } } }
+    }
+  }]);
+  let text = concat!(
+    r#"<invoke name="a"><parameter name="p">5</parameter></invoke>"#,
+    r#"<invoke name="b"></invoke>"#,
+  );
+  let out = MinimaxM2.parse(text, Some(&tools)).unwrap();
+  assert_eq!(out.len(), 2);
+  assert_eq!(out[0].name(), "a");
+  assert_eq!(*out[0].arguments(), serde_json::json!({"p": 5}));
+  assert_eq!(out[1].name(), "b");
+  assert_eq!(*out[1].arguments(), serde_json::json!({}));
+  // No invoke at all → error (line ~2160-2161).
+  assert!(matches!(
+    MinimaxM2.parse("no invokes", None).unwrap_err(),
+    Error::Tokenizer(_)
+  ));
+}
+
+#[test]
+fn parse_function_gemma_batch() {
+  // Escaped string value + a plain JSON value.
+  let out = FunctionGemma
+    .parse("call:f{k:<escape>hi there<escape>,n:2}", None)
+    .unwrap();
+  assert_eq!(
+    out,
+    vec![ToolCall::new_nameless_id(
+      "f",
+      serde_json::json!({"k": "hi there", "n": 2})
+    )]
+  );
+  // A non-JSON unquoted value is kept as a string (line ~2341-2342).
+  let out = FunctionGemma.parse("call:g{k:bareword}", None).unwrap();
+  assert_eq!(
+    out,
+    vec![ToolCall::new_nameless_id(
+      "g",
+      serde_json::json!({"k": "bareword"})
+    )]
+  );
+  // No `call:NAME{` → "No function provided." (line ~2303-2304).
+  assert!(matches!(
+    FunctionGemma.parse("plain", None).unwrap_err(),
+    Error::Tokenizer(_)
+  ));
+}
+
+#[test]
+fn parse_gemma4_batch_and_errors() {
+  // Bare keys + a `<|"|>` string + a number. The second key follows the comma
+  // directly (the bare-key rewrite requires no whitespace before the key).
+  let out = Gemma4
+    .parse(r#"call:f{k: <|"|>hello<|"|>,n: 3}"#, None)
+    .unwrap();
+  assert_eq!(
+    out,
+    vec![ToolCall::new_nameless_id(
+      "f",
+      serde_json::json!({"k": "hello", "n": 3})
+    )]
+  );
+  // No call → "No function provided." (line ~2513-2514).
+  assert!(matches!(
+    Gemma4.parse("plain", None).unwrap_err(),
+    Error::Tokenizer(_)
+  ));
+  // A call whose args body is not valid JSON after rewriting → error
+  // (line ~2519-2520).
+  assert!(matches!(
+    Gemma4.parse("call:f{!bad!}", None).unwrap_err(),
+    Error::Tokenizer(_)
+  ));
+}
+
+// --- default parse() loop (default_parse_via_try_parse_one_call) --------
+
+/// A test parser that does NOT override the trait `parse`, so calling
+/// `parse` exercises [`default_parse_via_try_parse_one_call`]. Each
+/// `try_parse_one_call` peels one `(name)` token: `(a)(b)` → two calls.
+/// `(0width)` exercises the defensive zero-width break.
+struct DefaultParseProbe {
+  /// When true, `try_parse_one_call` reports `end_pos == 0` for the first
+  /// token to exercise the zero-width-advance defensive break.
+  zero_width: bool,
+}
+
+impl ToolParser for DefaultParseProbe {
+  // `parse` intentionally NOT overridden → default loop is used.
+  fn name(&self) -> &'static str {
+    "default_parse_probe"
+  }
+  fn tool_call_start(&self) -> &'static str {
+    "("
+  }
+  fn tool_call_end(&self) -> &'static str {
+    ")"
+  }
+  fn try_parse_one_call(
+    &self,
+    buffer: &str,
+    _tools: Option<&Value>,
+  ) -> Result<Option<(Vec<ToolCall>, usize)>, Error> {
+    let Some(open) = buffer.find('(') else {
+      return Ok(None);
+    };
+    let Some(close_rel) = buffer[open + 1..].find(')') else {
+      return Ok(None);
+    };
+    let name = buffer[open + 1..open + 1 + close_rel].to_owned();
+    let end_pos = if self.zero_width {
+      0
+    } else {
+      open + 1 + close_rel + 1
+    };
+    Ok(Some((
+      vec![ToolCall::new_nameless_id(name, serde_json::json!({}))],
+      end_pos,
+    )))
+  }
+}
+
+#[test]
+fn default_parse_loop_extracts_back_to_back_via_trait_default() {
+  // The DEFAULT trait `parse` (which loops on `try_parse_one_call`) peels
+  // two back-to-back `(name)` tokens.
+  let probe = DefaultParseProbe { zero_width: false };
+  let out = probe.parse("(a)(b)", None).unwrap();
+  assert_eq!(out.len(), 2);
+  assert_eq!(out[0].name(), "a");
+  assert_eq!(out[1].name(), "b");
+  // No token at all → the loop's `None` break yields an empty result
+  // (line ~258).
+  assert!(probe.parse("no tokens", None).unwrap().is_empty());
+}
+
+#[test]
+fn default_parse_loop_zero_width_advance_breaks() {
+  // A `try_parse_one_call` that returns `end_pos == 0` would loop forever;
+  // the default loop defensively breaks (line ~249-254). The `break` runs
+  // BEFORE `out.extend(calls)`, so the zero-width batch is discarded and the
+  // result is empty — the contract is "no progress, stop", not "keep this
+  // batch".
+  let probe = DefaultParseProbe { zero_width: true };
+  let out = probe.parse("(a)(b)", None).unwrap();
+  assert!(
+    out.is_empty(),
+    "zero-width advance breaks before extending, so no calls are collected"
+  );
+}
+
+// --- selection: parser_by_name + infer_tool_parser ----------------------
+
+#[test]
+fn parser_by_name_known_and_unknown() {
+  for name in [
+    "json_tools",
+    "pythonic",
+    "mistral",
+    "qwen3_coder",
+    "glm47",
+    "kimi_k2",
+    "longcat",
+    "minimax_m2",
+    "function_gemma",
+    "gemma4",
+  ] {
+    let p = parser_by_name(name).unwrap_or_else(|| panic!("known parser {name}"));
+    assert_eq!(p.name(), name, "boxed parser reports its own name");
+  }
+  assert!(parser_by_name("does_not_exist").is_none());
+}
+
+#[test]
+fn infer_tool_parser_select_rules() {
+  // None template → None.
+  assert_eq!(infer_tool_parser(None), None);
+  // minimax_m2: `all = ["<minimax:tool_call>"]`.
+  assert_eq!(
+    infer_tool_parser(Some("uses <minimax:tool_call> here")),
+    Some("minimax_m2")
+  );
+  // gemma4: needs BOTH `<|tool_call>` and `<tool_call|>`.
+  assert_eq!(
+    infer_tool_parser(Some("a <|tool_call> b <tool_call|> c")),
+    Some("gemma4")
+  );
+  // function_gemma: `<start_function_call>`.
+  assert_eq!(
+    infer_tool_parser(Some("<start_function_call>")),
+    Some("function_gemma")
+  );
+  // longcat.
+  assert_eq!(
+    infer_tool_parser(Some("<longcat_tool_call>")),
+    Some("longcat")
+  );
+  // glm47: `<arg_key>`.
+  assert_eq!(
+    infer_tool_parser(Some("has <arg_key> token")),
+    Some("glm47")
+  );
+  // pythonic: `<|tool_list_start|>`.
+  assert_eq!(
+    infer_tool_parser(Some("<|tool_list_start|>")),
+    Some("pythonic")
+  );
+  // qwen3_coder: any_of with the `<tool_call>\n<function=` literal.
+  assert_eq!(
+    infer_tool_parser(Some("<tool_call>\n<function=")),
+    Some("qwen3_coder")
+  );
+  // kimi_k2.
+  assert_eq!(
+    infer_tool_parser(Some("<|tool_calls_section_begin|>")),
+    Some("kimi_k2")
+  );
+  // mistral.
+  assert_eq!(infer_tool_parser(Some("[TOOL_CALLS]")), Some("mistral"));
+  // json_tools: needs BOTH `<tool_call>` and `tool_call.name`.
+  assert_eq!(
+    infer_tool_parser(Some("<tool_call> ... tool_call.name")),
+    Some("json_tools")
+  );
+  // A template matching no rule → None.
+  assert_eq!(infer_tool_parser(Some("no markers at all")), None);
+}
+
+#[test]
+fn infer_tool_parser_first_rule_wins() {
+  // minimax_m2 precedes gemma4 in the table; a template carrying BOTH
+  // minimax_m2's marker and gemma4's pair must select minimax_m2 (the
+  // declaration-order if/elif semantics).
+  let ct = "<minimax:tool_call> <|tool_call> <tool_call|>";
+  assert_eq!(infer_tool_parser(Some(ct)), Some("minimax_m2"));
+}
+
+// --- marker lookup + ToolCall accessors ---------------------------------
+
+#[test]
+fn parser_marker_lookup() {
+  // tool_call_start / tool_call_end resolve from the generated table.
+  assert_eq!(JsonTools.tool_call_start(), "<tool_call>");
+  assert_eq!(JsonTools.tool_call_end(), "</tool_call>");
+  assert_eq!(Pythonic.tool_call_start(), "<|tool_call_start|>");
+  assert_eq!(Pythonic.tool_call_end(), "<|tool_call_end|>");
+  // Mistral has an empty end marker.
+  assert_eq!(Mistral.tool_call_start(), "[TOOL_CALLS]");
+  assert_eq!(Mistral.tool_call_end(), "");
+}
+
+#[test]
+fn tool_call_public_accessors() {
+  let tc = ToolCall::new(
+    "fname",
+    serde_json::json!({"a": 1}),
+    Some("id-7".to_owned()),
+  );
+  assert_eq!(tc.name(), "fname");
+  assert_eq!(*tc.arguments(), serde_json::json!({"a": 1}));
+  assert_eq!(tc.id(), Some("id-7"));
+  // new_nameless_id leaves id as None.
+  let tc2 = ToolCall::new_nameless_id("g", Value::Null);
+  assert_eq!(tc2.id(), None);
+}
+
+// --- processor: process_eos pending_display clear + recover_at_cap paths -
+
+#[test]
+fn process_eos_clears_pending_display_in_potential_state() {
+  // Enter PotentialToolCall with leading prose parked in `pending_display`
+  // (and only the ambiguous `<` prefix in `tool_call_buffer`). EOS runs
+  // `parse_eos` over the unparseable `<` (yielding nothing) and clears
+  // `pending_display` so the leading prose cannot leak into a later
+  // generation on a reused processor (line ~2992-2995). State returns to
+  // Normal with empty buffers.
+  let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+  let _ = p.process_chunk("leading <");
+  assert_eq!(p.state, State::PotentialToolCall);
+  assert!(!p.pending_display.is_empty());
+  p.process_eos();
+  assert!(
+    p.pending_display.is_empty(),
+    "pending_display cleared at EOS"
+  );
+  assert!(p.tool_call_buffer.is_empty(), "buffer cleared at EOS");
+  assert_eq!(p.state, State::Normal);
+  assert!(p.tool_calls.is_empty());
+}
+
+#[test]
+fn recover_at_cap_collecting_drops_runaway_tool_buffer() {
+  // A processor in CollectingToolCall on a never-terminating body: the
+  // pre-confirmation prose is flushed at confirmation (so the FIRST chunk
+  // returns it), and the runaway tool buffer is dropped at the cap
+  // (recover_at_cap, CollectingToolCall arm, line ~3026-3038) — never parsed
+  // into a call.
+  let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+  // Leading prose + a confirmed start tag, then a runaway body. The prose is
+  // returned here at start-tag confirmation.
+  let first = p.process_chunk(r#"prose <tool_call>{"name":"x""#);
+  assert_eq!(
+    first.as_deref(),
+    Some("prose "),
+    "pre-confirmation prose flushed at start-tag confirmation"
+  );
+  assert_eq!(p.state, State::CollectingToolCall);
+  assert!(
+    p.pending_display.is_empty(),
+    "prose moved out of pending_display"
+  );
+  let big = "z".repeat(64 * 1024);
+  let bound = MAX_TOOL_CALL_BUFFER_BYTES + big.len();
+  for _ in 0..8 {
+    let _ = p.process_chunk(&big);
+    // Bounded at every step (tracks the cap, never the total fed).
+    assert!(p.tool_call_buffer.len() <= bound);
+  }
+  assert_eq!(
+    p.tool_call_buffer.len(),
+    0,
+    "runaway tool buffer dropped at cap"
+  );
+  assert!(
+    p.tool_calls.is_empty(),
+    "runaway content never became a call"
+  );
+}
+
+#[test]
+fn process_eos_noop_when_already_normal() {
+  // EOS while in `Normal` (e.g. after a clean passthrough) returns early
+  // without touching anything (line ~2975-2977).
+  let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+  assert_eq!(p.process_chunk("plain").as_deref(), Some("plain"));
+  assert_eq!(p.state, State::Normal);
+  p.process_eos();
+  assert_eq!(p.state, State::Normal);
+  assert!(p.tool_calls.is_empty());
+  assert!(p.tool_call_buffer.is_empty());
+  assert!(p.pending_display.is_empty());
+}

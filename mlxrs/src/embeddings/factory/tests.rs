@@ -1382,3 +1382,612 @@ fn load_pooling_validated_before_heavy_io() {
     "pooling must be validated before the weight load; got: {msg}"
   );
 }
+
+// ───────────── EmbeddingModelConfiguration constructor + accessors ─────────────
+//
+// `from_directory` / `from_id` are exercised by the load tests above; the
+// explicit `new(id, tokenizer_source)` constructor and the `id()` /
+// `tokenizer_source()` borrowing accessors are covered here directly.
+
+#[test]
+fn configuration_new_exposes_id_and_tokenizer_source() {
+  // The explicit `new(id, tokenizer_source)` constructor with BOTH a present
+  // and an absent tokenizer source, plus the `id()` / `tokenizer_source()`
+  // accessors. The expected values are built by hand (NOT via the fn under
+  // test), then compared.
+  let id = EmbeddingIdentifier::Directory(PathBuf::from("/models/enc"));
+  let tok = PathBuf::from("/tok/dir");
+  let cfg = EmbeddingModelConfiguration::new(id.clone(), Some(tok.clone()));
+  // `id()` returns the exact identifier handed in.
+  assert_eq!(cfg.id(), &id);
+  assert!(cfg.id().is_directory());
+  // `tokenizer_source()` returns `Some(&Path)` borrowing the supplied dir.
+  assert_eq!(cfg.tokenizer_source(), Some(tok.as_path()));
+  // With a separate tokenizer source, `tokenizer_directory()` is that source,
+  // not the model directory.
+  assert_eq!(cfg.tokenizer_directory(), tok.as_path());
+  assert_eq!(cfg.model_directory(), Path::new("/models/enc"));
+
+  // `new(.., None)` ⇒ no tokenizer source ⇒ tokenizer dir falls back to the
+  // model directory.
+  let id2 = EmbeddingIdentifier::Id("org/name".to_owned());
+  let cfg2 = EmbeddingModelConfiguration::new(id2.clone(), None);
+  assert_eq!(cfg2.id(), &id2);
+  assert!(cfg2.id().is_id());
+  assert_eq!(cfg2.tokenizer_source(), None);
+  // An `Id` is treated as a local path (no Hub download).
+  assert_eq!(cfg2.model_directory(), Path::new("org/name"));
+  assert_eq!(cfg2.tokenizer_directory(), Path::new("org/name"));
+}
+
+// ───────────── LoadedEmbeddingModel constructor + accessors ─────────────
+
+#[test]
+fn loaded_embedding_model_accessors_return_components() {
+  // `LoadedEmbeddingModel::new` + the `model_type()` / `config_json()` /
+  // `weights_ref()` accessors, with hand-built inputs.
+  let mut weights: EmbeddingWeights = HashMap::new();
+  weights.insert(
+    "enc.weight".to_owned(),
+    Array::from_slice::<f32>(&[1.0, 2.0], &(2usize,)).unwrap(),
+  );
+  let loaded = LoadedEmbeddingModel::new(
+    "bert".to_owned(),
+    r#"{"model_type": "bert"}"#.to_owned(),
+    weights,
+  );
+  assert_eq!(loaded.model_type(), "bert");
+  assert_eq!(loaded.config_json(), r#"{"model_type": "bert"}"#);
+  assert!(loaded.weights_ref().contains_key("enc.weight"));
+  assert_eq!(loaded.weights_ref().len(), 1);
+}
+
+// ───────────── EmbeddingModelTypeRegistry::create ─────────────
+//
+// The happy `create` path is exercised end-to-end by `load`'s dispatch test;
+// the two direct `create` outcomes — a registered constructor invoked, and an
+// unregistered model type rejected — are covered here against the registry
+// directly (no `load`, no directory).
+
+#[test]
+fn create_invokes_registered_constructor() {
+  let registry = EmbeddingModelTypeRegistry::new().with("mockemb", mock_constructor());
+  let mut weights: EmbeddingWeights = HashMap::new();
+  weights.insert(
+    "mock.weight".to_owned(),
+    Array::from_slice::<f32>(&[1.0, 2.0], &(2usize,)).unwrap(),
+  );
+  // `model_type` is already-canonical here (as `load` would hand it).
+  let loaded =
+    LoadedEmbeddingModel::new("mockemb".to_owned(), mock_config_json("mockemb"), weights);
+  let model = registry
+    .create(&loaded)
+    .expect("registered type must construct");
+  let ids = Array::from_slice::<i32>(&[0, 1], &(1usize, 2)).unwrap();
+  let mask = Array::from_slice::<f32>(&[1.0, 1.0], &(1usize, 2)).unwrap();
+  let out = model.forward(&ids, &mask).unwrap();
+  assert_eq!(out.last_hidden_state().shape(), vec![1, 2, 4]);
+}
+
+#[test]
+fn create_rejects_unregistered_model_type() {
+  // `create` on a `LoadedEmbeddingModel` whose `model_type` is not registered
+  // is a recoverable `UnknownEnumValue` carrying the rejected type in `value`,
+  // NOT a panic. (Distinct from `load`'s step-2 pre-flight reject — this is the
+  // registry's own `create` guard at the construction seam.)
+  let registry = EmbeddingModelTypeRegistry::new().with("mockemb", mock_constructor());
+  let mut weights: EmbeddingWeights = HashMap::new();
+  weights.insert(
+    "x.weight".to_owned(),
+    Array::from_slice::<f32>(&[1.0], &(1usize,)).unwrap(),
+  );
+  let loaded = LoadedEmbeddingModel::new("nope".to_owned(), mock_config_json("nope"), weights);
+  let Err(err) = registry.create(&loaded) else {
+    panic!("an unregistered model_type must be a recoverable error");
+  };
+  let Error::UnknownEnumValue(payload) = &err else {
+    panic!("expected Error::UnknownEnumValue; got {err:?}");
+  };
+  assert_eq!(
+    payload.value(),
+    "nope",
+    "the rejected model type must be carried in the payload value"
+  );
+  // The registry's keys are runtime-keyed and cannot satisfy `&'static`, so the
+  // supported list is intentionally empty.
+  assert!(payload.supported().is_empty());
+  let msg = err.to_string();
+  assert!(msg.contains("no constructor registered"), "got: {msg}");
+  assert!(msg.contains("nope"), "error should name the type: {msg}");
+}
+
+// ───────────── path_has_hidden_component direct unit tests ─────────────
+//
+// The hidden-component exclusion is exercised end-to-end by the glob tests;
+// its two defensive branches — a glob result NOT under `root` (the
+// `strip_prefix` `Err` arm) and a non-`Normal` path component below `root` —
+// are unreachable through `glob` in practice, so they are covered here by
+// calling `path_has_hidden_component` directly with hand-built paths.
+
+#[test]
+fn path_has_hidden_component_not_under_root_is_false() {
+  // `strip_prefix` fails (the path is not under `root`) ⇒ conservatively
+  // treated as "no hidden component" ⇒ false. (Unreachable via `glob`, which
+  // only yields paths under the normalized root.)
+  let root = Path::new("/models/enc");
+  // Genuinely not under root, despite a `.`-prefixed component.
+  assert!(!path_has_hidden_component(
+    Path::new("/other/.hidden/model.safetensors"),
+    root
+  ));
+  // A `.`-prefixed component in the ROOT itself is below the strip boundary,
+  // so it must NOT count as hidden either.
+  assert!(!path_has_hidden_component(
+    Path::new("/models/enc/model.safetensors"),
+    Path::new("/models/.enc")
+  ));
+}
+
+#[test]
+fn path_has_hidden_component_ignores_non_normal_components() {
+  // A non-`Normal` component (`..`) strictly below `root` must hit the
+  // non-`Normal` arm (returning `false` for that component) and, with no
+  // `.`-prefixed `Normal` component present, yield `false` overall.
+  let root = Path::new("/models/enc");
+  assert!(!path_has_hidden_component(
+    Path::new("/models/enc/sub/../model.safetensors"),
+    root
+  ));
+  // But a real `.`-prefixed `Normal` component below root IS hidden — proving
+  // the `..` arm did not mask a genuine hidden component alongside it.
+  assert!(path_has_hidden_component(
+    Path::new("/models/enc/sub/../.cache/model.safetensors"),
+    root
+  ));
+}
+
+// ───────────── glob_root direct unit tests ─────────────
+//
+// `glob_root` re-spells `dir` into the path shape `glob` yields matches in
+// (dropping `.` segments, keeping a leading root/prefix + `..` + names).
+
+#[test]
+fn glob_root_drops_curdir_and_keeps_structure() {
+  // `.` / `./` collapse to the empty path (the identity strip prefix).
+  assert_eq!(glob_root(Path::new(".")), PathBuf::new());
+  assert_eq!(glob_root(Path::new("./")), PathBuf::new());
+  // A leading `./` and any interior `.` segment are dropped; names survive.
+  assert_eq!(glob_root(Path::new("./sub")), PathBuf::from("sub"));
+  assert_eq!(glob_root(Path::new("a/./b")), PathBuf::from("a/b"));
+  // An absolute path stays absolute (the `RootDir` component is kept).
+  assert_eq!(
+    glob_root(Path::new("/models/enc")),
+    PathBuf::from("/models/enc")
+  );
+  // `..` (ParentDir) segments are preserved verbatim.
+  assert_eq!(
+    glob_root(Path::new("../models/enc")),
+    PathBuf::from("../models/enc")
+  );
+  // An empty `strip_prefix` identity check: a relative glob-shaped result
+  // strips cleanly against the empty root.
+  assert!(
+    Path::new("model.safetensors")
+      .strip_prefix(glob_root(Path::new(".")))
+      .is_ok()
+  );
+}
+
+// ───────────── scan_non_utf8_shards unrecognized-suffix branch ─────────────
+
+#[test]
+fn scan_non_utf8_shards_ignores_unrecognized_suffix() {
+  // An unrecognized `pattern_suffix` is a caller bug, not untrusted input —
+  // the preflight conservatively scans NOTHING and returns `Ok(())`. The dir
+  // need not exist (the suffix dispatch returns before any `read_dir`).
+  assert!(scan_non_utf8_shards(Path::new("/nonexistent-xyz"), "not-a-known-suffix").is_ok());
+  assert!(scan_non_utf8_shards(Path::new("/nonexistent-xyz"), "").is_ok());
+}
+
+#[test]
+fn scan_non_utf8_shards_unreadable_dir_is_suppressed() {
+  // A `read_dir` that fails (here: the dir does not exist) is SKIPPED, not an
+  // error — mirroring `glob`'s `scandir` OSError suppression. Uses a recognized
+  // suffix so dispatch proceeds to the `read_dir`.
+  assert!(scan_non_utf8_shards(Path::new("/no/such/dir-xyz"), "**/model*.safetensors").is_ok());
+  // An EMPTY but real directory has no entries to flag.
+  let dir = fresh_dir("scan-empty");
+  assert!(scan_non_utf8_shards(&dir, "**/model*.safetensors").is_ok());
+  assert!(scan_non_utf8_shards(&dir, "weight*.safetensors").is_ok());
+}
+
+// ───────────── collect_glob_shards nested-prefix derivation ─────────────
+//
+// `load_weights`' nested-prefix behaviour is covered above; here the prefix
+// derivation in `collect_glob_shards` is asserted DIRECTLY on the returned
+// `DiscoveredShard`s — a genuine root shard yields `prefix == None`, a nested
+// shard yields `Some(immediate_parent_name)`.
+
+#[test]
+fn collect_glob_shards_derives_root_and_nested_prefixes() {
+  let dir = fresh_dir("collect-prefix");
+  write_one_tensor(&dir.join("model.safetensors"), "root.w");
+  let vision = dir.join("vision_model");
+  std::fs::create_dir_all(&vision).unwrap();
+  write_one_tensor(&vision.join("model.safetensors"), "enc.w");
+
+  let shards =
+    collect_glob_shards(&dir, "**/model*.safetensors").expect("glob must collect both shards");
+  assert_eq!(
+    shards.len(),
+    2,
+    "a root + a nested shard must be discovered"
+  );
+  // Sorted by full path: the root `model.safetensors` sorts before
+  // `vision_model/model.safetensors` lexically, but assert by matching paths
+  // rather than relying on order.
+  let root = shards
+    .iter()
+    .find(|s| s.path == dir.join("model.safetensors"))
+    .expect("the root shard must be present");
+  assert_eq!(
+    root.prefix, None,
+    "a genuine root shard keeps its keys verbatim (no prefix)"
+  );
+  let nested = shards
+    .iter()
+    .find(|s| s.path == vision.join("model.safetensors"))
+    .expect("the nested shard must be present");
+  assert_eq!(
+    nested.prefix.as_deref(),
+    Some("vision_model"),
+    "a nested shard's prefix is the IMMEDIATE parent folder name"
+  );
+}
+
+// ───────────── read_optional_pooling parent-probe branches ─────────────
+//
+// `read_optional_pooling` is exercised for the present-config and absent-dir
+// cases by the `load` tests; its parent-`1_Pooling` disambiguation branches —
+// reached only when the CHILD `config.json` lstat returns `NotFound` — are
+// covered here directly.
+
+#[test]
+fn read_optional_pooling_absent_pooling_dir_is_none() {
+  // No `1_Pooling` at all: the child lstat is `NotFound`, the parent lstat is
+  // also `NotFound` ⇒ genuinely absent ⇒ `Ok(None)`.
+  let dir = fresh_dir("pool-absent");
+  assert!(
+    read_optional_pooling(&dir)
+      .expect("absent pooling dir must be Ok")
+      .is_none()
+  );
+}
+
+#[test]
+fn read_optional_pooling_real_dir_without_config_is_none() {
+  // A real `1_Pooling/` directory that ships NO `config.json`: child lstat is
+  // `NotFound`, parent lstat is `Ok` on a real directory ⇒ the "empty pooling
+  // dir" case ⇒ `Ok(None)` (the parent-`Ok(_)` arm at the bottom of the inner
+  // match).
+  let dir = fresh_dir("pool-empty");
+  std::fs::create_dir_all(dir.join("1_Pooling")).unwrap();
+  assert!(
+    read_optional_pooling(&dir)
+      .expect("a real but empty 1_Pooling dir must be Ok(None)")
+      .is_none()
+  );
+}
+
+#[cfg(unix)]
+#[test]
+fn read_optional_pooling_symlink_to_real_dir_without_config_is_none() {
+  // `1_Pooling` is a SYMLINK to a real directory that has no `config.json`:
+  // child lstat `NotFound`, parent lstat `Ok` as a SYMLINK, and the followed
+  // `metadata` resolves to a real directory ⇒ treat the missing child as the
+  // empty-pooling case ⇒ `Ok(None)`.
+  let dir = fresh_dir("pool-symlink-dir");
+  let real = dir.join("real_pooling");
+  std::fs::create_dir_all(&real).unwrap();
+  std::os::unix::fs::symlink(&real, dir.join("1_Pooling")).unwrap();
+  assert!(
+    read_optional_pooling(&dir)
+      .expect("a symlinked-to-real-dir 1_Pooling without config must be Ok(None)")
+      .is_none()
+  );
+}
+
+#[cfg(unix)]
+#[test]
+fn read_optional_pooling_dangling_symlink_parent_fails_closed() {
+  // `1_Pooling` is a DANGLING symlink (target dir does not exist): the child
+  // lstat is `NotFound` (the parent component cannot resolve), and the parent
+  // lstat is `Ok` as a SYMLINK whose followed `metadata` FAILS to resolve ⇒
+  // fail closed with a typed `Error::FileIo` naming the broken parent, NOT a
+  // silent `Ok(None)` that would degrade to default pooling.
+  let dir = fresh_dir("pool-dangling-parent");
+  std::os::unix::fs::symlink(dir.join("does-not-exist"), dir.join("1_Pooling")).unwrap();
+
+  let Err(err) = read_optional_pooling(&dir) else {
+    panic!("a dangling 1_Pooling symlink must fail closed, not be Ok(None)");
+  };
+  let Error::FileIo(payload) = &err else {
+    panic!("expected Error::FileIo; got {err:?}");
+  };
+  assert_eq!(payload.op(), FileOp::Stat);
+  assert!(
+    payload.path().ends_with("1_Pooling"),
+    "the error must name the broken parent path; got {}",
+    payload.path().display()
+  );
+}
+
+#[cfg(unix)]
+#[test]
+fn read_optional_pooling_symlink_to_file_fails_on_child_probe() {
+  // `1_Pooling` is a SYMLINK whose target is a regular FILE (not a directory).
+  // The CHILD `1_Pooling/config.json` lstat follows the `1_Pooling` symlink to
+  // the file and then cannot resolve `config.json` UNDER a non-directory, so
+  // the kernel returns `ENOTDIR` — which is NOT `NotFound`. That falls to the
+  // outer "pooling config presence probe failed" arm: a present-but-
+  // unresolvable config must fail closed with a typed `Error::FileIo`, never a
+  // silent `Ok(None)` that would degrade to default pooling. (This is the
+  // observed kernel behaviour; the inner parent-symlink-to-non-dir arm is
+  // unreachable for this layout because the child never reports `NotFound`.)
+  let dir = fresh_dir("pool-symlink-file");
+  let target = dir.join("a_file");
+  std::fs::write(&target, b"not a directory").unwrap();
+  std::os::unix::fs::symlink(&target, dir.join("1_Pooling")).unwrap();
+
+  let Err(err) = read_optional_pooling(&dir) else {
+    panic!("a 1_Pooling symlink to a file must fail closed, not be Ok(None)");
+  };
+  let Error::FileIo(payload) = &err else {
+    panic!("expected Error::FileIo; got {err:?}");
+  };
+  assert_eq!(payload.op(), FileOp::Stat);
+  // The error names the CHILD config.json path (the failing presence probe).
+  assert!(
+    payload.path().ends_with("config.json"),
+    "the error must name the probed child path; got {}",
+    payload.path().display()
+  );
+  assert!(
+    err.to_string().contains("presence probe failed"),
+    "the error should explain the failed presence probe; got: {err}"
+  );
+}
+
+// ───────────── read_model_type error branches ─────────────
+//
+// The happy `read_model_type` path is covered by `load`'s dispatch tests; the
+// non-regular-handle, non-UTF-8-bytes, and invalid-JSON (`Error::Parse`)
+// branches plus the typed missing-field error are covered here directly.
+
+#[test]
+fn read_model_type_rejects_non_regular_config_handle() {
+  // `config.json` is a DIRECTORY (a non-regular entry). The open succeeds, then
+  // the post-open `is_file()` fstat rejects it with a typed `Error::FileIo`
+  // BEFORE any read — closing the stat-then-read TOCTOU window. (Works on every
+  // platform — no FIFO/symlink needed.)
+  let dir = fresh_dir("config-is-dir");
+  std::fs::create_dir_all(dir.join("config.json")).unwrap();
+
+  let Err(err) = read_model_type(&dir) else {
+    panic!("a directory `config.json` must be rejected");
+  };
+  let Error::FileIo(payload) = &err else {
+    panic!("expected Error::FileIo; got {err:?}");
+  };
+  assert_eq!(payload.op(), FileOp::Stat);
+  assert!(
+    err.to_string().contains("not a regular file"),
+    "the error should explain the non-regular handle; got: {err}"
+  );
+}
+
+#[test]
+fn read_model_type_rejects_non_utf8_bytes() {
+  // A `config.json` whose bytes are not valid UTF-8 ⇒ a recoverable
+  // `Error::Parse` (the `String::from_utf8` guard), never a panic.
+  let dir = fresh_dir("config-non-utf8");
+  std::fs::write(dir.join("config.json"), [0xFF, 0xFE, 0x00, 0x01]).unwrap();
+
+  let Err(err) = read_model_type(&dir) else {
+    panic!("non-UTF-8 config bytes must error");
+  };
+  assert!(
+    matches!(err, Error::Parse(_)),
+    "expected Error::Parse; got {err:?}"
+  );
+  assert!(
+    err.to_string().contains("not valid UTF-8"),
+    "the error should explain the UTF-8 failure; got: {err}"
+  );
+}
+
+#[test]
+fn read_model_type_wraps_invalid_json_as_parse_error() {
+  // A structurally malformed `config.json` ⇒ the `extract_string_field` error
+  // is wrapped as a recoverable `Error::Parse` ("invalid model config"), not a
+  // panic and not a raw `String` leak.
+  let dir = fresh_dir("config-bad-json");
+  std::fs::write(dir.join("config.json"), b"{ this is not json").unwrap();
+
+  let Err(err) = read_model_type(&dir) else {
+    panic!("malformed config.json must error");
+  };
+  assert!(
+    matches!(err, Error::Parse(_)),
+    "expected Error::Parse; got {err:?}"
+  );
+  assert!(
+    err.to_string().contains("invalid model config"),
+    "the error should name the invalid config; got: {err}"
+  );
+}
+
+#[test]
+fn read_model_type_missing_field_is_typed_error() {
+  // A well-formed `config.json` with NO `model_type` key ⇒ a typed
+  // `Error::MissingField` naming `config.json` / `model_type` (the
+  // `extract_string_field` `Ok(None)` → `ok_or_else` path).
+  let dir = fresh_dir("config-no-model-type");
+  std::fs::write(
+    dir.join("config.json"),
+    r#"{"hidden_size": 8, "vocab_size": 5}"#,
+  )
+  .unwrap();
+
+  let Err(err) = read_model_type(&dir) else {
+    panic!("a config without model_type must error");
+  };
+  let Error::MissingField(payload) = &err else {
+    panic!("expected Error::MissingField; got {err:?}");
+  };
+  assert_eq!(payload.type_name(), "config.json");
+  assert_eq!(payload.field(), "model_type");
+}
+
+#[test]
+fn read_model_type_canonicalizes_and_returns_raw_body() {
+  // The success path: a `-`-spelled `model_type` is canonicalized via
+  // `remap_model_type` (`xlm-roberta` → `xlm_roberta`) and the VERBATIM JSON
+  // body is returned alongside it. The expected canonical id is computed
+  // independently (the `-`→`_` rule), NOT by calling `read_model_type`.
+  let dir = fresh_dir("config-canon");
+  let body = mock_config_json("xlm-roberta");
+  std::fs::write(dir.join("config.json"), &body).unwrap();
+
+  let (model_type, raw) = read_model_type(&dir).expect("a valid config must read");
+  assert_eq!(model_type, "xlm_roberta");
+  assert_eq!(raw, body, "the verbatim config body must be returned");
+}
+
+// ───────────── extract_string_field / JsonCursor branch coverage ─────────────
+//
+// The strict-JSON scanner's public behaviour is broadly covered above; these
+// add the few remaining structural branches (the object-separator error arm,
+// end-of-input arms, the full `\u` escape + surrogate machinery, and the
+// nested skip_object / skip_array / expect_lit paths) exercised through the
+// public `extract_string_field` entry point against hand-built inputs.
+
+#[test]
+fn extract_rejects_unexpected_byte_after_pair() {
+  // After a `"key": value` pair the next byte must be `,` or `}`; any other
+  // byte (here `;`) is the "expected `,` or `}`" error arm.
+  let r = extract_string_field(r#"{"model_type": "bert"; "x": 1}"#, "model_type");
+  assert!(r.is_err(), "a stray separator byte must be rejected");
+  let msg = r.unwrap_err();
+  assert!(
+    msg.contains("expected `,` or `}`"),
+    "the error should name the separator expectation; got: {msg}"
+  );
+}
+
+#[test]
+fn extract_full_unicode_escape_machinery() {
+  // Drive every `\u` branch of `parse_string` through `extract_string_field`:
+  //  - a plain BMP `\u` scalar,
+  //  - a valid surrogate PAIR (😀 = U+1F600 = 😀),
+  //  - every simple escape (`\" \\ \/ \b \f \n \r \t`),
+  // all in the MATCHED value so the decoded string is asserted.
+  let src = r#"{"model_type": "A😀\"\\\/\b\f\n\r\t"}"#;
+  let got = extract_string_field(src, "model_type")
+    .unwrap()
+    .expect("the escaped string value must decode");
+  let expected = format!("A\u{1F600}\"\\/{}{}\n\r\t", '\u{08}', '\u{0C}');
+  assert_eq!(got, expected, "all JSON escapes must decode correctly");
+}
+
+#[test]
+fn extract_rejects_surrogate_and_escape_errors() {
+  // The surrogate/escape error arms of `parse_string`, each via the matched
+  // value:
+  //  - an unpaired HIGH surrogate (no following `\u`),
+  let cases = [
+    r#"{"model_type": "\uD83D"}"#,       // high surrogate, then string ends
+    r#"{"model_type": "\uD83Dx"}"#,      // high surrogate not followed by `\`
+    r#"{"model_type": "\uD83D\nABCD"}"#, // high + `\` but next escape is not `u`
+    r#"{"model_type": "\uD83D\u0041"}"#, // high + valid `\u` that is NOT a low surrogate
+    r#"{"model_type": "\uDC00"}"#,       // lone LOW surrogate
+    r#"{"model_type": "\q"}"#,           // invalid escape char
+    r#"{"model_type": "\uZZZZ"}"#,       // invalid hex digit in `\u`
+    r#"{"model_type": "\u00"}"#,         // truncated `\u` (only 2 hex digits)
+    "{\"model_type\": \"ab\u{0001}\"}",  // raw control byte in a string
+    r#"{"model_type": "\"#,              // unterminated escape at end of input
+    r#"{"model_type": "unterminated"#,   // unterminated string (no closing `"`)
+  ];
+  for bad in cases {
+    assert!(
+      extract_string_field(bad, "model_type").is_err(),
+      "a surrogate/escape/control error must be rejected: {bad:?}"
+    );
+  }
+}
+
+#[test]
+fn extract_skips_nested_objects_arrays_and_literals() {
+  // The value-SKIP path (`skip_value` → `skip_object` / `skip_array` /
+  // `expect_lit`) for a NON-matching key, followed by the matched key. Covers:
+  //  - a nested empty object `{}` and empty array `[]`,
+  //  - a populated nested object and array (with trailing keys after them),
+  //  - `true` / `false` / `null` literals,
+  //  - separators INSIDE the skipped structures.
+  let src = r#"{
+      "empty_obj": {},
+      "empty_arr": [],
+      "obj": {"a": 1, "b": [true, false, null], "c": {"d": "e"}},
+      "arr": [1, {"x": 2}, [3, 4], "s"],
+      "t": true,
+      "f": false,
+      "z": null,
+      "model_type": "deepskip"
+    }"#;
+  assert_eq!(
+    extract_string_field(src, "model_type").unwrap(),
+    Some("deepskip".to_owned())
+  );
+}
+
+#[test]
+fn extract_rejects_invalid_literal_and_eoi_arms() {
+  // The remaining `JsonCursor` error arms reached via the value-skip of a
+  // non-matching key:
+  let cases = [
+    r#"{"x": tru}"#,               // invalid `true` literal (expect_lit mismatch)
+    r#"{"x": nul}"#,               // invalid `null` literal
+    r#"{"x": fa}"#,                // invalid `false` literal
+    r#"{"x": @}"#,                 // a byte where a JSON value was expected
+    r#"{"x": "#,                   // end-of-input where a value was expected
+    r#"{"x": [1, 2"#,              // unterminated nested array (EOI in array)
+    r#"{"x": {"a": 1"#,            // unterminated nested object (EOI in object)
+    r#"{"x": [1; 2]}"#,            // bad separator inside an array
+    r#"{"x": [1, ]}"#,             // trailing comma inside an array
+    r#"{"x": {"a": 1 ; "b": 2}}"#, // bad separator inside a nested object
+    r#"{"x": {"a": 1,}}"#,         // trailing comma inside a nested object
+    r#"{"x" 1}"#,                  // missing `:` after a non-matching key
+  ];
+  for bad in cases {
+    assert!(
+      extract_string_field(bad, "model_type").is_err(),
+      "a malformed value-skip input must be rejected: {bad:?}"
+    );
+  }
+}
+
+#[test]
+fn json_cursor_expect_reports_end_of_input() {
+  // `JsonCursor::expect` on an empty buffer hits the `None` "reached end of
+  // input" arm. Driven through the public scanner: an empty document fails the
+  // very first `expect(b'{')`.
+  let r = extract_string_field("", "model_type");
+  assert!(r.is_err(), "an empty document must error");
+  let msg = r.unwrap_err();
+  assert!(
+    msg.contains("reached end of input"),
+    "expect should report end-of-input; got: {msg}"
+  );
+  // Whitespace-only is likewise end-of-input after `skip_ws`.
+  assert!(extract_string_field("   \n\t ", "model_type").is_err());
+}
