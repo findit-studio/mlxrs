@@ -1991,3 +1991,91 @@ fn json_cursor_expect_reports_end_of_input() {
   // Whitespace-only is likewise end-of-input after `skip_ws`.
   assert!(extract_string_field("   \n\t ", "model_type").is_err());
 }
+
+// ───────────── \u-escape SUCCESS decode paths ─────────────
+//
+// The existing escape tests cover the simple escapes, RAW multi-byte UTF-8
+// codepoints copied verbatim (a literal emoji in source), and every `\u`
+// ERROR arm -- but NOT the *successful* `\u` decode branches. The remaining
+// uncovered `parse_string` / `parse_hex4` arms are:
+//   - a BMP `\uXXXX` scalar (non-surrogate `char::from_u32` + the `push`
+//     closure),
+//   - a VALID UTF-16 surrogate PAIR `\uXXXX\uXXXX` (the high/low pairing, the
+//     `0x10000 + ((cp-0xD800)<<10) + (low-0xDC00)` combine, `char::from_u32`,
+//     and `push`),
+//   - the lowercase `b'a'..=b'f'` hex-nibble branch of `parse_hex4`.
+//
+// The JSON inputs are written as ORDINARY (non-raw) Rust string literals so
+// the embedded `\\u` is the two source bytes backslash + `u` that
+// `parse_string` must INTERPRET -- not a Rust-level escape, and not a raw
+// multi-byte codepoint (which would exercise the verbatim-copy branch
+// instead). The expected decoded value is built INDEPENDENTLY from a Rust
+// scalar literal (`\u{..}`), never via the scanner under test.
+
+#[test]
+fn extract_decodes_bmp_unicode_escape_success() {
+  // A successful BMP `\u` scalar (non-surrogate). Lowercase hex `é` must
+  // decode to U+00E9: the `char::from_u32` + `push` success arm of
+  // `parse_string`, plus the lowercase `b'a'..=b'f'` nibble branch of
+  // `parse_hex4`. The JSON source bytes are `{"model_type": "café"}`.
+  let got = extract_string_field("{\"model_type\": \"caf\\u00e9\"}", "model_type")
+    .unwrap()
+    .expect("a BMP \\u escape value must decode");
+  assert_eq!(
+    got, "caf\u{00e9}",
+    "lowercase \\u00e9 must decode to U+00E9"
+  );
+
+  // Uppercase hex for the SAME scalar decodes identically -- covers the
+  // `b'A'..=b'F'` nibble branch alongside the lowercase one above.
+  let got_upper = extract_string_field("{\"model_type\": \"caf\\u00E9\"}", "model_type")
+    .unwrap()
+    .expect("an uppercase \\u escape value must decode");
+  assert_eq!(
+    got_upper, "caf\u{00e9}",
+    "uppercase \\u00E9 must decode to U+00E9"
+  );
+
+  // An all-digit `A` escape decodes to ASCII 'A' via the same success
+  // arm -- the `b'0'..=b'9'` nibble path (distinct from the a-f / A-F branches).
+  let got_ascii = extract_string_field("{\"model_type\": \"\\u0041BC\"}", "model_type")
+    .unwrap()
+    .expect("a \\u0041 escape must decode to 'A'");
+  assert_eq!(got_ascii, "ABC", "\\u0041 must decode to ASCII 'A'");
+}
+
+#[test]
+fn extract_decodes_valid_surrogate_pair_success() {
+  // A VALID UTF-16 surrogate pair `😀` must decode to U+1F600: the
+  // high-surrogate detect, the low-surrogate pairing, the
+  // `0x10000 + ((cp-0xD800)<<10) + (low-0xDC00)` combine, `char::from_u32`,
+  // and the `push` closure -- the one set of arms the existing tests miss
+  // (they use a RAW emoji, the verbatim-copy branch, or unpaired/invalid
+  // surrogate ERROR arms). The expected scalar is the independent Rust literal
+  // `\u{1F600}`.
+  let got = extract_string_field("{\"model_type\": \"x\\uD83D\\uDE00y\"}", "model_type")
+    .unwrap()
+    .expect("a valid surrogate pair must decode");
+  assert_eq!(got, "x\u{1F600}y", "\\uD83D\\uDE00 must decode to U+1F600");
+
+  // The SAME pair in LOWERCASE hex decodes identically, exercising the
+  // lowercase `b'a'..=b'f'` nibble branch on the surrogate path too.
+  let got_lower = extract_string_field("{\"model_type\": \"\\ud83d\\ude00\"}", "model_type")
+    .unwrap()
+    .expect("a lowercase-hex surrogate pair must decode");
+  assert_eq!(
+    got_lower, "\u{1F600}",
+    "lowercase surrogate pair must decode to U+1F600"
+  );
+
+  // The smallest astral scalar requiring a pair: `𐀀` -> U+10000.
+  // Confirms the combine arithmetic at the low boundary (cp-0xD800 == 0,
+  // low-0xDC00 == 0).
+  let got_min = extract_string_field("{\"model_type\": \"\\uD800\\uDC00\"}", "model_type")
+    .unwrap()
+    .expect("the minimal astral surrogate pair must decode");
+  assert_eq!(
+    got_min, "\u{10000}",
+    "\\uD800\\uDC00 must decode to U+10000"
+  );
+}

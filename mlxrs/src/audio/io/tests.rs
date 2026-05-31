@@ -1363,3 +1363,399 @@ fn fsync_parent_dir_handles_all_parent_branches_without_panic() {
   fsync_parent_dir(&path);
   // Reaching here without a panic is the assertion.
 }
+
+// ---- multi-bit-depth WAV decode: push_samples integer/float arms -------
+//
+// The existing round-trip test only exercises the 16-bit PCM path (the
+// `GenericAudioBufferRef::S16` arm). The builders below construct
+// fully-valid RIFF/WAVE files at OTHER bit depths so the remaining
+// `push_samples` arms and `int_divisor` widths are decoded through the
+// real `load_audio` → symphonia → `push_samples` pipeline.
+//
+// Format-tag / bit-depth → codec → `GenericAudioBufferRef` variant
+// (verified against symphonia-format-riff 0.6 `read_pcm_fmt` /
+// `read_ieee_fmt` + symphonia-codec-pcm 0.6 `try_new`):
+//   PCM   (0x0001)  8-bit  → CODEC_ID_PCM_U8    → U8  arm
+//   PCM   (0x0001) 24-bit  → CODEC_ID_PCM_S24LE → S24 arm (int_divisor(24))
+//   PCM   (0x0001) 32-bit  → CODEC_ID_PCM_S32LE → S32 arm (int_divisor(32))
+//   IEEE  (0x0003) 32-bit  → CODEC_ID_PCM_F32LE → F32 arm (check_finite)
+//   IEEE  (0x0003) 64-bit  → CODEC_ID_PCM_F64LE → F64 arm
+//
+// The U16/U24/U32/S8 arms are NOT reachable through a WAV container
+// (WAV PCM is U8 for 8-bit and signed for 16/24/32-bit; the unsigned
+// 16/24/32-bit and signed-8-bit variants only arise from formats whose
+// decoders are not enabled here, e.g. AIFF S8) — see the report.
+//
+// Oracle discipline: every expected sample is hand-computed from the
+// raw bytes written into the WAV body, never produced by calling
+// `load_audio`. For an all-silence body each format's "zero codepoint"
+// (PCM-U8 midpoint 0x80, signed/float exact-0 byte patterns) decodes to
+// exactly 0.0; the exact-value oracles use byte patterns whose decoded
+// f32 is a power-of-two multiple (bit-exact under the `/2^(bits-1)` and
+// `s as f32` paths).
+
+/// Build a fully-valid 16-byte-fmt RIFF/WAVE file with the given format
+/// tag, bit depth, channel count, and sample rate, carrying `body` as
+/// the raw little-endian PCM/float data-chunk payload. Independent of
+/// the code under test — a hand-assembled header, not a `save_wav`
+/// call. `body.len()` must be a whole number of frames
+/// (`channels * bits/8`) so the decoded count equals the
+/// header-declared `num_frames` (otherwise `load_audio`'s exact-count
+/// cross-check would fire — which is the point: a faithful container
+/// never trips it).
+fn build_wav(format_tag: u16, bits: u16, channels: u16, sample_rate: u32, body: &[u8]) -> Vec<u8> {
+  let block_align: u16 = channels * (bits / 8);
+  let data_size: u32 = u32::try_from(body.len()).expect("body fits u32");
+  let byte_rate: u32 = sample_rate * u32::from(block_align);
+  let file_size_minus_8: u32 = 36 + data_size;
+  let mut v = Vec::with_capacity(44 + body.len());
+  v.extend_from_slice(b"RIFF");
+  v.extend_from_slice(&file_size_minus_8.to_le_bytes());
+  v.extend_from_slice(b"WAVE");
+  v.extend_from_slice(b"fmt ");
+  v.extend_from_slice(&16u32.to_le_bytes()); // 16-byte fmt chunk
+  v.extend_from_slice(&format_tag.to_le_bytes()); // 1 = PCM, 3 = IEEE float
+  v.extend_from_slice(&channels.to_le_bytes());
+  v.extend_from_slice(&sample_rate.to_le_bytes());
+  v.extend_from_slice(&byte_rate.to_le_bytes());
+  v.extend_from_slice(&block_align.to_le_bytes());
+  v.extend_from_slice(&bits.to_le_bytes());
+  v.extend_from_slice(b"data");
+  v.extend_from_slice(&data_size.to_le_bytes());
+  v.extend_from_slice(body);
+  v
+}
+
+/// 8-bit PCM WAV (format tag 1) decodes through the `U8` arm:
+/// `out = (i16::from(byte) - 128) / 128.0`. Covers the U8 arm
+/// (io.rs:915-925) and `int_divisor(8)` (io.rs:865).
+///
+/// Oracle (hand-computed from the raw bytes, NOT from `load_audio`):
+///   0x80 (128) -> (128-128)/128 =  0.0   (silence / offset-binary midpoint)
+///   0xC0 (192) -> (192-128)/128 =  0.5
+///   0x40 ( 64) -> ( 64-128)/128 = -0.5
+///   0xFF (255) -> (255-128)/128 =  0.9921875
+///   0x00 (  0) -> (  0-128)/128 = -1.0
+#[test]
+fn load_audio_u8_pcm_decodes_through_u8_arm() {
+  let dir = audio_temp_dir("audio_u8_pcm");
+  let path = dir.join("u8.wav");
+  let body: [u8; 5] = [0x80, 0xC0, 0x40, 0xFF, 0x00];
+  fs::write(&path, build_wav(1, 8, 1, 8_000, &body)).expect("write u8 WAV");
+  let (decoded, sr) = load_audio(&path).expect("8-bit PCM WAV must decode through the U8 arm");
+  assert_eq!(sr, 8_000, "sample-rate mismatch");
+  let expected = [0.0_f32, 0.5, -0.5, 127.0 / 128.0, -1.0];
+  assert_eq!(decoded.len(), expected.len(), "U8 frame-count mismatch");
+  for (i, (&got, &exp)) in decoded.iter().zip(expected.iter()).enumerate() {
+    assert_eq!(
+      got.to_bits(),
+      exp.to_bits(),
+      "U8 decode mismatch at {i}: got {got}, expected {exp}"
+    );
+  }
+}
+
+/// 24-bit PCM WAV (format tag 1) decodes through the `S24` arm:
+/// `out = i24_value * (1.0 / 2^23)`. Covers `int_divisor(24)`
+/// (io.rs:867) and the S24 decode arm body.
+///
+/// Oracle: each 3-byte LE group encodes a signed 24-bit value `v`;
+/// `read_i24` sign-extends it and the codec stores `i24(v)` (the
+/// `read_i24() << 8` left-shift is undone by the `i24::from(.. >> 8)`
+/// conversion). `inner()` yields `v`, normalized by `1/2^23`:
+///   [0x00,0x00,0x00] -> v=0          ->  0.0
+///   [0x00,0x00,0x40] -> v=0x40_0000  ->  2^22 / 2^23 =  0.5
+///   [0x00,0x00,0xC0] -> v=-0x40_0000 -> -2^22 / 2^23 = -0.5
+/// (0x40_0000 = 4_194_304 = 2^22; 0xC0_0000 sign-extends to -4_194_304.)
+#[test]
+fn load_audio_s24_pcm_decodes_through_s24_arm() {
+  let dir = audio_temp_dir("audio_s24_pcm");
+  let path = dir.join("s24.wav");
+  // 3 frames (mono, 3 bytes each).
+  let body: [u8; 9] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0xC0];
+  fs::write(&path, build_wav(1, 24, 1, 16_000, &body)).expect("write s24 WAV");
+  let (decoded, sr) = load_audio(&path).expect("24-bit PCM WAV must decode through the S24 arm");
+  assert_eq!(sr, 16_000, "sample-rate mismatch");
+  let expected = [0.0_f32, 0.5, -0.5];
+  assert_eq!(decoded.len(), expected.len(), "S24 frame-count mismatch");
+  for (i, (&got, &exp)) in decoded.iter().zip(expected.iter()).enumerate() {
+    assert_eq!(
+      got.to_bits(),
+      exp.to_bits(),
+      "S24 decode mismatch at {i}: got {got}, expected {exp}"
+    );
+  }
+}
+
+/// 32-bit PCM WAV (format tag 1) decodes through the `S32` arm:
+/// `out = i32_value * (1.0 / 2^31)`. Covers `int_divisor(32)`
+/// (io.rs:868) and the S32 decode arm body.
+///
+/// Oracle: each 4-byte LE group is a signed 32-bit value `v`,
+/// normalized by `1/2^31`:
+///   0x0000_0000 -> v=0          ->  0.0
+///   0x4000_0000 -> v=2^30       ->  2^30 / 2^31 =  0.5
+///   0xC000_0000 -> v=-2^30      -> -2^30 / 2^31 = -0.5
+#[test]
+fn load_audio_s32_pcm_decodes_through_s32_arm() {
+  let dir = audio_temp_dir("audio_s32_pcm");
+  let path = dir.join("s32.wav");
+  let mut body: Vec<u8> = Vec::new();
+  body.extend_from_slice(&0i32.to_le_bytes());
+  body.extend_from_slice(&(1i32 << 30).to_le_bytes()); // 2^30
+  body.extend_from_slice(&(-(1i32 << 30)).to_le_bytes()); // -2^30
+  fs::write(&path, build_wav(1, 32, 1, 44_100, &body)).expect("write s32 WAV");
+  let (decoded, sr) = load_audio(&path).expect("32-bit PCM WAV must decode through the S32 arm");
+  assert_eq!(sr, 44_100, "sample-rate mismatch");
+  let expected = [0.0_f32, 0.5, -0.5];
+  assert_eq!(decoded.len(), expected.len(), "S32 frame-count mismatch");
+  for (i, (&got, &exp)) in decoded.iter().zip(expected.iter()).enumerate() {
+    assert_eq!(
+      got.to_bits(),
+      exp.to_bits(),
+      "S32 decode mismatch at {i}: got {got}, expected {exp}"
+    );
+  }
+}
+
+/// 32-bit IEEE-float WAV (format tag 3) decodes through the `F32` arm
+/// (pass-through, no divisor). Covers the F32 decode arm
+/// (io.rs:903-908) — which the existing PCM-16 round-trip never
+/// exercises — and the `check_finite` Ok path.
+///
+/// Oracle: the body is raw little-endian IEEE-754 f32, passed through
+/// unchanged.
+#[test]
+fn load_audio_f32_ieee_decodes_through_f32_arm() {
+  let dir = audio_temp_dir("audio_f32_ieee");
+  let path = dir.join("f32.wav");
+  let samples = [0.0_f32, 0.5, -0.5, 0.25, -1.0];
+  let mut body: Vec<u8> = Vec::new();
+  for &s in &samples {
+    body.extend_from_slice(&s.to_le_bytes());
+  }
+  fs::write(&path, build_wav(3, 32, 1, 48_000, &body)).expect("write f32 IEEE WAV");
+  let (decoded, sr) = load_audio(&path).expect("32-bit IEEE-float WAV must decode through F32 arm");
+  assert_eq!(sr, 48_000, "sample-rate mismatch");
+  assert_eq!(decoded.len(), samples.len(), "F32 frame-count mismatch");
+  for (i, (&got, &exp)) in decoded.iter().zip(samples.iter()).enumerate() {
+    assert_eq!(
+      got.to_bits(),
+      exp.to_bits(),
+      "F32 pass-through mismatch at {i}: got {got}, expected {exp}"
+    );
+  }
+}
+
+/// 64-bit IEEE-float WAV (format tag 3) decodes through the `F64` arm:
+/// `out = (f64_sample as f32)`. Covers the F64 decode arm (io.rs:909-914).
+///
+/// Oracle: the body is raw little-endian IEEE-754 f64; each value is
+/// chosen exactly representable in f32 (powers of two / small dyadic
+/// rationals) so the `as f32` narrowing is bit-exact.
+#[test]
+fn load_audio_f64_ieee_decodes_through_f64_arm() {
+  let dir = audio_temp_dir("audio_f64_ieee");
+  let path = dir.join("f64.wav");
+  let samples_f64 = [0.0_f64, 0.5, -0.5, 0.125, -0.75];
+  let mut body: Vec<u8> = Vec::new();
+  for &s in &samples_f64 {
+    body.extend_from_slice(&s.to_le_bytes());
+  }
+  fs::write(&path, build_wav(3, 64, 1, 22_050, &body)).expect("write f64 IEEE WAV");
+  let (decoded, sr) = load_audio(&path).expect("64-bit IEEE-float WAV must decode through F64 arm");
+  assert_eq!(sr, 22_050, "sample-rate mismatch");
+  let expected: Vec<f32> = samples_f64.iter().map(|&s| s as f32).collect();
+  assert_eq!(decoded.len(), expected.len(), "F64 frame-count mismatch");
+  for (i, (&got, &exp)) in decoded.iter().zip(expected.iter()).enumerate() {
+    assert_eq!(
+      got.to_bits(),
+      exp.to_bits(),
+      "F64 narrowing mismatch at {i}: got {got}, expected {exp}"
+    );
+  }
+}
+
+/// A WAV whose fmt chunk declares IMA ADPCM (format tag 0x0011) probes
+/// successfully (the RIFF reader parses the ADPCM fmt chunk and assigns
+/// the ADPCM codec id) but FAILS at `make_audio_decoder` — the `pcm`
+/// feature registers only PCM codecs, so there is no ADPCM decoder to
+/// build. That surfaces as `Error::Parse` from the
+/// `make_audio_decoder` arm (io.rs:526-529).
+///
+/// The fmt chunk is hand-assembled to satisfy symphonia's
+/// `read_adpcm_fmt` requirements (bits_per_sample == 4, fmt len >= 20,
+/// IMA `cbSize` extension == 2 with 2 bytes of extra data) so the probe
+/// reaches the track-creation stage; only the decoder build fails.
+#[test]
+fn load_audio_ima_adpcm_wav_fails_at_make_decoder_with_parse() {
+  let dir = audio_temp_dir("audio_ima_adpcm");
+  let path = dir.join("adpcm.wav");
+
+  // Hand-assemble a 20-byte WAVEFORMATEX fmt chunk for IMA ADPCM:
+  //   audioFormat = 0x0011 (WAVE_FORMAT_ADPCM_IMA)
+  //   channels = 1, sampleRate = 8000, byteRate, blockAlign,
+  //   bitsPerSample = 4, cbSize = 2, wSamplesPerBlock = <2 bytes>.
+  const FMT_LEN: u32 = 20;
+  let channels: u16 = 1;
+  let sample_rate: u32 = 8_000;
+  let block_align: u16 = 256; // arbitrary valid ADPCM block size
+  let bits: u16 = 4;
+  // A tiny data chunk (content is irrelevant — the decoder build fails
+  // before any packet is decoded).
+  let data: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
+  let data_size: u32 = data.len() as u32;
+  let byte_rate: u32 = sample_rate; // nominal; symphonia only logs mismatches
+  let file_size_minus_8: u32 = 4 /*WAVE*/ + (8 + FMT_LEN) + (8 + data_size);
+
+  let mut v: Vec<u8> = Vec::new();
+  v.extend_from_slice(b"RIFF");
+  v.extend_from_slice(&file_size_minus_8.to_le_bytes());
+  v.extend_from_slice(b"WAVE");
+  v.extend_from_slice(b"fmt ");
+  v.extend_from_slice(&FMT_LEN.to_le_bytes());
+  v.extend_from_slice(&0x0011u16.to_le_bytes()); // WAVE_FORMAT_ADPCM_IMA
+  v.extend_from_slice(&channels.to_le_bytes());
+  v.extend_from_slice(&sample_rate.to_le_bytes());
+  v.extend_from_slice(&byte_rate.to_le_bytes());
+  v.extend_from_slice(&block_align.to_le_bytes());
+  v.extend_from_slice(&bits.to_le_bytes()); // 16 bytes of WAVEFORMATEX so far
+  v.extend_from_slice(&2u16.to_le_bytes()); // cbSize = 2 (IMA requires exactly 2)
+  v.extend_from_slice(&505u16.to_le_bytes()); // wSamplesPerBlock (2 bytes of extra)
+  v.extend_from_slice(b"data");
+  v.extend_from_slice(&data_size.to_le_bytes());
+  v.extend_from_slice(&data);
+
+  fs::write(&path, &v).expect("write IMA ADPCM WAV");
+  let r = load_audio(&path);
+  assert!(
+    matches!(r, Err(Error::Parse(_))),
+    "an undecodable IMA ADPCM WAV must surface Error::Parse \
+       (probe succeeds, make_audio_decoder fails), got {r:?}"
+  );
+}
+
+/// A non-finite (NaN) sample in an IEEE-float WAV is rejected by the
+/// `check_finite` guard with `Error::NonFiniteScalar` — a NaN/inf in the
+/// decoded PCM would silently poison downstream DSP. Covers the
+/// `check_finite` Err arm (io.rs:852-854) through the F32 decode path.
+///
+/// The NaN is hand-encoded as the raw f32 bit pattern in the WAV body
+/// (`f32::NAN.to_le_bytes()`), so the rejection is driven by real
+/// decoded bytes, not a synthetic in-memory sample.
+#[test]
+fn load_audio_non_finite_float_sample_is_non_finite_scalar() {
+  let dir = audio_temp_dir("audio_f32_nan");
+  let path = dir.join("nan.wav");
+  // First sample finite, second a NaN — so the guard fires mid-buffer.
+  let mut body: Vec<u8> = Vec::new();
+  body.extend_from_slice(&0.25_f32.to_le_bytes());
+  body.extend_from_slice(&f32::NAN.to_le_bytes());
+  fs::write(&path, build_wav(3, 32, 1, 16_000, &body)).expect("write NaN-bearing f32 WAV");
+  let r = load_audio(&path);
+  assert!(
+    matches!(r, Err(Error::NonFiniteScalar(_))),
+    "a NaN PCM sample must be rejected with NonFiniteScalar, got {r:?}"
+  );
+}
+
+/// An infinity (+inf) f32 sample is likewise rejected by `check_finite`
+/// (io.rs:852-854) — `is_finite()` covers both NaN and ±inf.
+#[test]
+fn load_audio_infinite_float_sample_is_non_finite_scalar() {
+  let dir = audio_temp_dir("audio_f32_inf");
+  let path = dir.join("inf.wav");
+  let mut body: Vec<u8> = Vec::new();
+  body.extend_from_slice(&f32::INFINITY.to_le_bytes());
+  fs::write(&path, build_wav(3, 32, 1, 16_000, &body)).expect("write +inf f32 WAV");
+  let r = load_audio(&path);
+  assert!(
+    matches!(r, Err(Error::NonFiniteScalar(_))),
+    "a +inf PCM sample must be rejected with NonFiniteScalar, got {r:?}"
+  );
+}
+
+// ---- CapStrategy::resolve: duration-cap arithmetic + saturation -------
+
+/// `CapStrategy::SrcRateMaxSeconds::resolve` clamps the
+/// `src_sr * max_seconds` product to `MAX_DECODED_SAMPLES` and, on a
+/// non-finite product (the defensive guard for a future caller that
+/// bypasses the public `load_audio_with_max_seconds` validation),
+/// falls back to `MAX_DECODED_SAMPLES`. Covers the non-finite
+/// fallback arm (io.rs:744) plus the finite/clamping arms.
+///
+/// Called directly on the private enum (in-module test) so the
+/// validated public entry point doesn't shadow the defensive branch.
+/// Oracle is hand-computed: the products are exact integers in f64.
+#[test]
+fn cap_strategy_resolve_src_rate_max_seconds_arithmetic_and_saturation() {
+  // Finite, well under the cap: 16_000 Hz * 2.0 s = 32_000 samples.
+  assert_eq!(
+    CapStrategy::SrcRateMaxSeconds(2.0).resolve(16_000),
+    32_000,
+    "src_sr * max_seconds must be the in-cap product"
+  );
+
+  // Finite but the product exceeds the global ceiling -> clamp to
+  // MAX_DECODED_SAMPLES. 1_000_000 Hz * 1_000_000 s = 1e12 >> 64 Mi.
+  assert_eq!(
+    CapStrategy::SrcRateMaxSeconds(1_000_000.0).resolve(1_000_000),
+    MAX_DECODED_SAMPLES,
+    "an over-ceiling product must clamp to MAX_DECODED_SAMPLES"
+  );
+
+  // Non-finite product (NaN) -> the defensive else-branch returns
+  // MAX_DECODED_SAMPLES (io.rs:744). The public entry validates
+  // max_seconds first, so this branch is only reachable by calling
+  // resolve directly.
+  assert_eq!(
+    CapStrategy::SrcRateMaxSeconds(f32::NAN).resolve(16_000),
+    MAX_DECODED_SAMPLES,
+    "a NaN product must fall back to MAX_DECODED_SAMPLES, not panic/wrap"
+  );
+
+  // +inf product -> same defensive fallback (is_finite() is false).
+  assert_eq!(
+    CapStrategy::SrcRateMaxSeconds(f32::INFINITY).resolve(16_000),
+    MAX_DECODED_SAMPLES,
+    "an +inf product must fall back to MAX_DECODED_SAMPLES"
+  );
+
+  // The explicit-cap arm clamps to the global ceiling too (the
+  // MaxSamples branch of resolve).
+  assert_eq!(
+    CapStrategy::MaxSamples(usize::MAX).resolve(16_000),
+    MAX_DECODED_SAMPLES,
+    "MaxSamples(usize::MAX) must clamp to the global ceiling"
+  );
+  assert_eq!(
+    CapStrategy::MaxSamples(1234).resolve(16_000),
+    1234,
+    "an in-ceiling MaxSamples must pass through unchanged"
+  );
+}
+
+/// `open_excl_tempfile` against a destination whose PARENT directory
+/// does not exist makes `OpenOptions::create_new` fail with a
+/// non-`AlreadyExists` error (`NotFound`), exercising the generic
+/// create-failure arm that returns `Error::FileIo` with
+/// `FileOp::Create` (io.rs:1937-1944) — distinct from the
+/// retry-exhaustion arm (which the zero-retry test already covers).
+#[test]
+fn open_excl_tempfile_nonexistent_parent_is_fileio_create_error() {
+  // A parent dir that does not exist on disk -> create_new fails with
+  // NotFound, NOT AlreadyExists, so the generic `Err(e)` arm fires on
+  // the very first retry.
+  let missing_parent = Path::new("/mlxrs_no_such_parent_dir_for_tempfile_test_zzz/dest.wav");
+  let r = open_excl_tempfile(missing_parent, 4);
+  match r {
+    Err(Error::FileIo(p)) => {
+      assert_eq!(
+        p.op(),
+        FileOp::Create,
+        "a non-AlreadyExists create failure must carry FileOp::Create"
+      );
+    }
+    other => panic!("expected FileIo(Create) for a missing parent dir, got {other:?}"),
+  }
+}

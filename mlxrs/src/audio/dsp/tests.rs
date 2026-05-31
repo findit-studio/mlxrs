@@ -2702,3 +2702,159 @@ fn normalize_peak_rejects_non_finite_input_sample() {
     Err(Error::NonFiniteScalar(_))
   ));
 }
+
+// ---- coverage: stft_aligned (center == false) FORWARD compute ------------
+//
+// The existing `stft_aligned_carries_center_false` test only reads metadata
+// (`center()`, `num_frames()`) off the Spectrum — mlx is lazy, so the
+// center=false framing → window-multiply → rfft graph is BUILT but never
+// EVALUATED there. The tests below materialize the aligned transform data
+// (forcing the eval of the `else { samples.try_clone() }` framing branch of
+// `stft_with_config`) and assert it against an INDEPENDENT closed-form DFT.
+
+/// `stft_aligned` (center=false) on a single full-width frame: a DC (all-ones)
+/// signal of exactly `n_fft` samples, no padding, hop=n_fft ⇒ exactly one
+/// frame. The transform is then a single windowed DFT, hand-derivable in
+/// closed form from the (independently-known) symmetric Hann window.
+///
+/// n_fft=4 ⇒ Hann(4) = [0, 0.75, 0.75, 0] (from `0.5*(1-cos(2πk/3))`). The
+/// windowed frame is `[0, 0.75, 0.75, 0]` (DC × window). Its one-sided DFT
+/// (rfft, `FftNorm::Backward` ⇒ NO forward scaling) is:
+///   bin0 (DC)      = 0 + 0.75 + 0.75 + 0           = 1.5
+///   bin1           = -0.75 - 0.75i  ⇒ |bin1| = 0.75√2 = 1.06066
+///   bin2 (Nyquist) = 0 - 0.75 + 0.75 - 0           = 0
+/// These magnitudes are computed here from the Hann closed form + the DFT
+/// definition, NOT from any call to `stft`/`stft_aligned`.
+#[test]
+fn stft_aligned_single_frame_dc_matches_closed_form_dft() {
+  let dc = [1.0_f32, 1.0, 1.0, 1.0];
+  let x = Array::from_slice::<f32>(&dc, &[4i32]).unwrap();
+  // center=false, win=n_fft=4, hop=4 ⇒ one full-width frame, no padding.
+  let spec = stft_aligned(&x, 4, 4, Some(4), WindowPad::Right).unwrap();
+  assert!(!spec.center(), "stft_aligned must carry center == false");
+  assert_eq!(spec.num_frames(), 1, "n_fft samples, hop=n_fft ⇒ one frame");
+  assert_eq!(
+    spec.data_ref().shape(),
+    vec![1, 3],
+    "(num_frames, n_fft/2+1)"
+  );
+  // Materialize the magnitude spectrum (forces the center=false framing /
+  // window-multiply / rfft graph to actually evaluate).
+  let mag = to_vec(&spec.data_ref().abs().unwrap());
+  let expected = [1.5_f32, 0.75 * std::f32::consts::SQRT_2, 0.0];
+  assert_eq!(mag.len(), 3);
+  for (i, (g, e)) in mag.iter().zip(expected.iter()).enumerate() {
+    assert!(
+      (g - e).abs() < 1e-5,
+      "aligned DC |bin{i}|: got {g}, want {e} (diff {})",
+      (g - e).abs()
+    );
+  }
+}
+
+/// `stft_aligned` (center=false) framing differs from the centered `stft` for
+/// the SAME signal: the aligned path frames directly over the raw samples
+/// (frame 0 = samples[0..n_fft]) while the centered path reflect-pads first
+/// (frame 0 straddles the reflected prefix). Materializing BOTH transforms
+/// and asserting they differ exercises the aligned forward compute end-to-end
+/// and pins that `center=false` is not silently treated as centered.
+#[test]
+fn stft_aligned_data_differs_from_centered_stft() {
+  let buf = signal_16();
+  let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
+  let aligned = stft_aligned(&x, 8, 4, Some(8), WindowPad::Right).unwrap();
+  let centered = stft(&x, 8, 4, Some(8), WindowPad::Right).unwrap();
+  // Both magnitude spectra are materialized here.
+  let a = to_vec(&aligned.data_ref().abs().unwrap());
+  let c = to_vec(&centered.data_ref().abs().unwrap());
+  // The centered path has more frames (reflect pad adds n_fft samples), so the
+  // flattened lengths already differ; compare the overlapping frame-0 region
+  // (the first n_freqs=5 bins) which must differ because frame 0 sees a
+  // different windowed signal (raw samples vs reflected-prefix straddle).
+  let n_freqs = aligned.n_freqs();
+  assert_eq!(n_freqs, 5);
+  let max_diff = a[..n_freqs]
+    .iter()
+    .zip(c[..n_freqs].iter())
+    .map(|(g, e)| (g - e).abs())
+    .fold(0.0_f32, f32::max);
+  assert!(
+    max_diff > 1e-4,
+    "aligned frame-0 spectrum must differ from the centered (reflect-padded) \
+       frame-0 spectrum (max diff was {max_diff})"
+  );
+}
+
+/// `istft` on a `stft_aligned` (center=false) Spectrum reaches the
+/// `(false, ..)` trim arms with REAL aligned transform data (existing
+/// center=false istft tests wrap a center=TRUE stft's data via `from_parts`,
+/// so this is the first time the inverse pipeline — irfft + overlap-add +
+/// coverage guard — runs on data produced by the center=false FORWARD path).
+///
+/// For `center=false` the requested region always starts at raw OLA index 0,
+/// which for the symmetric Hann window has window-sum 0 (Hann[0] == 0), so the
+/// coverage guard MUST reject both `length=None` (full raw OLA, `[0..t]`) and
+/// an explicit `length` (`[0..n]`) — exactly the un-recoverable zero-coverage
+/// head. Asserting the `Err` directly (no masked sample).
+#[test]
+fn istft_on_stft_aligned_rejects_zero_coverage_head() {
+  let buf = signal_16();
+  let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
+  // win == n_fft so the only reason to reject is the zero-coverage head, not
+  // the Right-short-window rule.
+  let aligned = stft_aligned(&x, 8, 4, Some(8), WindowPad::Right).unwrap();
+  assert!(!aligned.center());
+  for len in [None, Some(6usize)] {
+    let res = istft(&aligned, len);
+    assert!(
+      matches!(res, Err(Error::OutOfRange(_))),
+      "center=false istft (length={len:?}) on real stft_aligned data includes \
+         the zero-coverage OLA index 0 and must hit the coverage guard, got {res:?}"
+    );
+  }
+}
+
+// ---- coverage: istft single-frame EMPTY requested region -----------------
+
+/// A single centered even-`n_fft` frame collapses the `(center=true,
+/// length=None)` requested region `[pad .. t - pad]` to EMPTY (`pad == t/2`):
+/// the coverage-guard reduction (undefined over an empty array) is SKIPPED
+/// (`start_usize < stop_usize` is false) and `istft` returns a zero-length
+/// signal. This is the only path that exercises that skip branch — every
+/// round-trip test has a non-empty multi-frame region.
+///
+/// Construction: a 5-sample signal with n_fft=8 (pad=4) and hop=6 frames to
+/// exactly ONE frame (`num_frames = 1 + (5+8-8)/6 = 1 + 0 = 1`), so
+/// `t = (1-1)*6 + 8 = 8`, `pad = 4`, region `[4 .. 4]` is empty.
+#[test]
+fn istft_single_centered_frame_empty_region_is_zero_length() {
+  let sig = [0.2_f32, -0.4, 0.6, -0.1, 0.3];
+  let x = Array::from_slice::<f32>(&sig, &[5i32]).unwrap();
+  let spec = stft(&x, 8, 6, Some(8), WindowPad::Center).unwrap();
+  assert_eq!(spec.num_frames(), 1, "this geometry must produce ONE frame");
+  let rec = istft(&spec, None).unwrap();
+  // Empty requested region ([pad .. t-pad] collapses) ⇒ zero-length output.
+  // Use the &self size/shape accessors (no eval needed) to avoid materializing
+  // an empty array.
+  assert_eq!(
+    rec.size(),
+    0,
+    "single centered frame ⇒ empty centered region"
+  );
+  assert_eq!(
+    rec.shape(),
+    vec![0],
+    "empty region must be a 0-length 1-D array"
+  );
+
+  // The SAME single-frame spectrum with an explicit in-range length exercises
+  // the `(true, Some)` arm on a single frame (non-empty region [pad..pad+n]):
+  // n=2 ⇒ region [4..6], whose Hann window-sums (single frame, wsum=w²) at
+  // indices 4,5 are strictly positive, so the coverage guard passes.
+  let rec2 = istft(&spec, Some(2)).unwrap();
+  assert_eq!(
+    rec2.size(),
+    2,
+    "explicit length=2 on a single frame ⇒ 2 samples"
+  );
+}

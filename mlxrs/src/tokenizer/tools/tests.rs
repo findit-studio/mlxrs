@@ -6100,3 +6100,595 @@ fn process_eos_noop_when_already_normal() {
   assert!(p.tool_call_buffer.is_empty());
   assert!(p.pending_display.is_empty());
 }
+
+// ========================================================================
+// Residual-branch coverage.
+//
+// The blocks above cover the streaming hot path, the batch `parse()` of
+// every parser, and the literal/value-coercion helpers. The tests below
+// close the remaining scattered branches: each parser's
+// `try_parse_one_call` "start tag not yet in the buffer" early return
+// (`locate_tagged_payload` → `Ok(None)`), the multi-block walkers'
+// no-more-opener arms, a handful of helper edge branches, and the
+// closed-but-malformed end-position helpers exercised directly so the
+// empty-tag and not-found arms are pinned at the unit level. Every
+// expected value is a hand-written closed-form oracle.
+// ========================================================================
+
+// --- try_parse_one_call: start-tag-absent → Ok(None) (per parser) -------
+
+#[test]
+fn try_parse_one_call_start_tag_absent_returns_none_per_parser() {
+  // For every parser, `try_parse_one_call` on a buffer that does NOT yet
+  // contain the parser's `tool_call_start` must return `Ok(None)`
+  // (`locate_tagged_payload` returns `None` → the early `Ok(None)` arm).
+  // The buffer is plain prose with no start-tag substring for any parser.
+  let no_tag = "just some streamed prose with no start tag";
+  let parsers: Vec<(&'static str, Box<dyn ToolParser>)> = vec![
+    ("json_tools", Box::new(JsonTools)),
+    ("pythonic", Box::new(Pythonic)),
+    ("qwen3_coder", Box::new(Qwen3Coder)),
+    ("glm47", Box::new(Glm47)),
+    ("longcat", Box::new(Longcat)),
+    ("kimi_k2", Box::new(KimiK2)),
+    ("minimax_m2", Box::new(MinimaxM2)),
+    ("function_gemma", Box::new(FunctionGemma)),
+    ("gemma4", Box::new(Gemma4)),
+  ];
+  for (label, parser) in parsers {
+    let r = parser
+      .try_parse_one_call(no_tag, None)
+      .unwrap_or_else(|e| panic!("{label}: errored: {e}"));
+    assert!(
+      r.is_none(),
+      "{label}: start tag absent must yield Ok(None) (got {r:?})",
+    );
+  }
+}
+
+#[test]
+fn try_parse_one_call_mistral_start_tag_absent_returns_none() {
+  // Mistral's empty `tool_call_end` means `locate_tagged_payload` still
+  // gates on the non-empty start tag `[TOOL_CALLS]`. With the start tag
+  // absent the early `Ok(None)` arm fires (line ~1012).
+  let r = Mistral
+    .try_parse_one_call("no tool call markers here", None)
+    .expect("Ok");
+  assert!(r.is_none(), "mistral start tag absent → Ok(None)");
+}
+
+// --- multi-block walkers: opener-without-end then no-more-opener arms ----
+
+#[test]
+fn try_parse_one_call_kimi_k2_open_block_without_section_end_stays_none() {
+  // A COMPLETE inner block (`<|tool_call_begin|>…{}<|tool_call_end|>`) but
+  // NO section end yet. First loop iteration takes the `(None, Some(o))`
+  // arm (no section end, opener present), advances the cursor past the
+  // balanced `{}` args and the inner `<|tool_call_end|>`; the second
+  // iteration finds neither a section end nor a further opener and takes
+  // the `(None, None) => Ok(None)` arm (lines ~1829-1830).
+  let buf = concat!(
+    "<|tool_calls_section_begin|>",
+    "<|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>{}<|tool_call_end|>",
+  );
+  let r = KimiK2.try_parse_one_call(buf, None).expect("Ok");
+  assert!(
+    r.is_none(),
+    "kimi_k2 complete inner block without section end keeps collecting (Ok(None))",
+  );
+}
+
+#[test]
+fn try_parse_one_call_kimi_k2_balanced_args_without_inner_end_stays_none() {
+  // Opener + `<|tool_call_argument_begin|>` + a balanced `{}` args object,
+  // but NO inner `<|tool_call_end|>` and NO section end. The Object arm
+  // balances the args, then the `args_region[obj_end..].find(call_end)`
+  // fails → `r13_plain()` (line ~1856); with the section end-tag absent,
+  // `closed_but_malformed_end_pos` returns None → `Ok(None)`.
+  let buf = concat!(
+    "<|tool_calls_section_begin|>",
+    "<|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>{}",
+  );
+  let r = KimiK2.try_parse_one_call(buf, None).expect("Ok");
+  assert!(
+    r.is_none(),
+    "kimi_k2 balanced args but no inner end + no section end → Ok(None)",
+  );
+}
+
+#[test]
+fn try_parse_one_call_minimax_m2_open_invoke_without_section_end_stays_none() {
+  // `<invoke name="f">…</invoke>` complete but NO section end. First
+  // iteration matches `(None, Some(o))` (no section end, opener present),
+  // advances past the matching `</invoke>`; the next iteration finds
+  // neither end nor opener → `(None, None) => Ok(None)` (lines ~2225-2226).
+  let buf = concat!(
+    "<minimax:tool_call>",
+    r#"<invoke name="f"><parameter name="p">v</parameter></invoke>"#,
+  );
+  let r = MinimaxM2.try_parse_one_call(buf, None).expect("Ok");
+  assert!(
+    r.is_none(),
+    "minimax_m2 complete invoke without section end → Ok(None)",
+  );
+}
+
+#[test]
+fn try_parse_one_call_gemma4_call_without_section_end_stays_none() {
+  // `call:f{…}` complete but NO section end. The walker matches
+  // `(None, Some(c))` (no section end, `call:` present), advances past the
+  // brace-balanced body; the next iteration finds neither end nor `call:`
+  // → `(None, None) => Ok(None)` (lines ~2554-2556).
+  let buf = r#"<|tool_call>call:f{"k":"v"}"#;
+  let r = Gemma4.try_parse_one_call(buf, None).expect("Ok");
+  assert!(
+    r.is_none(),
+    "gemma4 complete call without section end → Ok(None)",
+  );
+}
+
+#[test]
+fn try_parse_one_call_gemma4_marker_without_open_brace_skips_then_none() {
+  // `call:` markers whose name is NOT immediately followed by `{` must be
+  // SKIPPED (the `j >= bytes.len() || bytes[j] != b'{'` branch advances
+  // `cursor = after_marker; continue;`, lines ~2564-2566). With no section
+  // end and no valid `call:name{` opener the walker eventually hits
+  // `(None, None) => Ok(None)`.
+  let buf = "<|tool_call>call:f no brace here";
+  let r = Gemma4.try_parse_one_call(buf, None).expect("Ok");
+  assert!(
+    r.is_none(),
+    "gemma4 `call:` without `{{` is skipped, no section end → Ok(None)",
+  );
+}
+
+// --- closed_but_malformed_end_pos* helpers: empty-tag + not-found arms ---
+
+#[test]
+fn closed_but_malformed_end_pos_empty_and_absent() {
+  // Empty end_tag → None (the mistral short-circuit guard, line ~318).
+  assert_eq!(closed_but_malformed_end_pos("anything", 0, ""), None);
+  // End_tag genuinely absent in `buffer[payload_at..]` → None.
+  assert_eq!(
+    closed_but_malformed_end_pos("no marker here", 0, "</tool_call>"),
+    None
+  );
+  // Present after payload_at: returns one past the end tag.
+  let s = "head</tc>tail";
+  assert_eq!(
+    closed_but_malformed_end_pos(s, 0, "</tc>"),
+    Some(s.find("</tc>").unwrap() + "</tc>".len())
+  );
+  // payload_at offset is honoured: a match BEFORE payload_at is ignored,
+  // only the one at/after it counts.
+  let t = "</tc>AAA</tc>";
+  let second = t.rfind("</tc>").unwrap();
+  assert_eq!(
+    closed_but_malformed_end_pos(t, 5, "</tc>"),
+    Some(second + "</tc>".len()),
+    "the match at offset 0 is before payload_at=5 and is skipped"
+  );
+}
+
+#[test]
+fn closed_but_malformed_end_pos_value_aware_empty_and_absent() {
+  // Any empty arg → None (the early guard, line ~339).
+  assert_eq!(
+    closed_but_malformed_end_pos_value_aware("x", 0, "", "<v>", "</v>"),
+    None
+  );
+  assert_eq!(
+    closed_but_malformed_end_pos_value_aware("x", 0, "END", "", "</v>"),
+    None
+  );
+  assert_eq!(
+    closed_but_malformed_end_pos_value_aware("x", 0, "END", "<v>", ""),
+    None
+  );
+  // End-tag OUTSIDE every value region → its position one past the tag.
+  let s = "<v>inner END</v> END tail";
+  let want = s.rfind("END").unwrap() + "END".len();
+  assert_eq!(
+    closed_but_malformed_end_pos_value_aware(s, 0, "END", "<v>", "</v>"),
+    Some(want),
+    "the in-value END is skipped; the outside-value END closes",
+  );
+  // An UNTERMINATED value region swallows the rest of the buffer; any
+  // in-region end-tag is in-value text → None (line ~362, the final
+  // `None`, via the `?` on the missing value close).
+  assert_eq!(
+    closed_but_malformed_end_pos_value_aware("<v>unterminated END", 0, "END", "<v>", "</v>"),
+    None
+  );
+  // Neither value region nor end-tag present → the loop runs off the end
+  // → None (line ~362).
+  assert_eq!(
+    closed_but_malformed_end_pos_value_aware("plain bytes only", 0, "END", "<v>", "</v>"),
+    None
+  );
+}
+
+#[test]
+fn closed_but_malformed_end_pos_quote_aware_empty_escape_and_absent() {
+  // Empty end_tag → None (line ~391).
+  assert_eq!(
+    closed_but_malformed_end_pos_quote_aware("x", 0, "", b"\""),
+    None
+  );
+  // End-tag OUTSIDE any quoted region → one past the tag.
+  let s = r#"{"s":"END"}END"#;
+  let want = s.rfind("END").unwrap() + "END".len();
+  assert_eq!(
+    closed_but_malformed_end_pos_quote_aware(s, 0, "END", b"\""),
+    Some(want),
+    "the in-string END is skipped; the outside-string END closes",
+  );
+  // An ESCAPED quote inside the string keeps string state (the `\\"`
+  // escape branch, lines ~403-405): the `"` after `\"` does NOT close the
+  // string, so the END inside it stays in-string and the real close is the
+  // END after the string terminator.
+  let esc = r#""a\"END\"b"END"#;
+  let want_esc = esc.rfind("END").unwrap() + "END".len();
+  assert_eq!(
+    closed_but_malformed_end_pos_quote_aware(esc, 0, "END", b"\""),
+    Some(want_esc),
+    "escaped quote does not end the string; in-string END is skipped",
+  );
+  // Still-open quoted region with the only end-tag candidate inside it
+  // → None (genuinely mid-streaming).
+  assert_eq!(
+    closed_but_malformed_end_pos_quote_aware(r#"{"s":"END"#, 0, "END", b"\""),
+    None
+  );
+}
+
+#[test]
+fn bound_context_or_plain_end_empty_tag_and_arms() {
+  // Empty end_tag → None (line ~461).
+  assert_eq!(bound_context_or_plain_end("anything", "", |_| true), None);
+  // End_tag absent → None (the `payload.find(end_tag)?`).
+  assert_eq!(
+    bound_context_or_plain_end("no end here", "</tc>", |_| true),
+    None
+  );
+  // Context proven (predicate true) → Some(None): caller runs its
+  // syntax-aware scan over the full payload.
+  assert_eq!(
+    bound_context_or_plain_end("body</tc>rest", "</tc>", |_| true),
+    Some(None)
+  );
+  // Context NOT proven (predicate false) → Some(Some(end_pos)) where
+  // end_pos is one past the FIRST end_tag.
+  let s = "body</tc>rest";
+  let first_end = s.find("</tc>").unwrap() + "</tc>".len();
+  assert_eq!(
+    bound_context_or_plain_end(s, "</tc>", |_| false),
+    Some(Some(first_end))
+  );
+}
+
+#[test]
+fn xml_value_aware_end_tag_scan_value_open_without_end_tag_then_unterminated() {
+  // A value region opens and there is NO end-tag candidate anywhere
+  // (`(Some(v), None)` arm, lines ~3645-3651): the region is skipped, and
+  // since no end-tag follows the scan returns None.
+  assert_eq!(
+    xml_value_aware_end_tag_scan("<v>body</v> nothing", "<v>", "</v>", "END"),
+    None,
+    "value region with no end-tag candidate → None",
+  );
+  // A value opens before the end-tag but never closes (`(Some(v), None)`
+  // arm with a missing `value_close` → the `?` returns None).
+  assert_eq!(
+    xml_value_aware_end_tag_scan("<v>unterminated forever", "<v>", "</v>", "END"),
+    None
+  );
+}
+
+// --- locate_tagged_payload: empty start tag + present/absent ------------
+
+#[test]
+fn locate_tagged_payload_empty_present_absent() {
+  // Empty start tag → None (line ~275).
+  assert_eq!(locate_tagged_payload("anything", ""), None);
+  // Present: returns (one-past-start-tag, payload slice).
+  let s = "pre<tool_call>body";
+  let (at, payload) = locate_tagged_payload(s, "<tool_call>").expect("found");
+  assert_eq!(at, "pre<tool_call>".len());
+  assert_eq!(payload, "body");
+  // Absent → None.
+  assert_eq!(locate_tagged_payload("no tag", "<tool_call>"), None);
+}
+
+// --- pythonic_call_close: escaped quote inside the string ---------------
+
+#[test]
+fn pythonic_call_close_escaped_quote_in_string() {
+  // A backslash-escaped quote inside the single-quoted string keeps string
+  // state (the `b == b'\\' => escaped = true` branch, lines ~3549-3551):
+  // the escaped `'` does NOT end the string, so the `)]` inside it does not
+  // close the call. The real close is the trailing `)]`.
+  let s = r#"[echo(s='a\'b)]c')]"#;
+  assert_eq!(
+    pythonic_call_close(s),
+    Some(s.len()),
+    "escaped quote keeps the string open; the in-string `)]` is skipped",
+  );
+  // Double-quoted analogue.
+  let d = r#"[echo(s="x\")]y")]"#;
+  assert_eq!(pythonic_call_close(d), Some(d.len()));
+}
+
+// --- glm_parse_json: name-as-object nested shape ------------------------
+
+#[test]
+fn glm_parse_json_name_is_object_pulls_nested_arguments() {
+  // The `tool` wrapper supplies a `name` that is itself an OBJECT and NO
+  // top-level `arguments`. The `if let Some(Value::Object(nm)) = &name`
+  // block (lines ~1636-1640) then pulls `arguments` from the nested object
+  // (the `arguments.is_none()` branch, line ~1638) and replaces `name`
+  // with the nested `name` (line ~1640).
+  assert_eq!(
+    glm_parse_json(
+      r#"{"tool":{"name":{"name":"inner","arguments":{"c":3}}}}"#,
+      None
+    ),
+    Some(ToolCall::new_nameless_id(
+      "inner",
+      serde_json::json!({"c": 3})
+    ))
+  );
+  // Top-level `{name: <object>, arguments: <object>}`: `name` is an object,
+  // `arguments` already present (so line ~1638 is skipped), `name` replaced
+  // by the nested `name` (line ~1640).
+  assert_eq!(
+    glm_parse_json(r#"{"name":{"name":"deep"},"arguments":{"a":1}}"#, None),
+    Some(ToolCall::new_nameless_id(
+      "deep",
+      serde_json::json!({"a": 1})
+    ))
+  );
+}
+
+// --- glm_parse_plain: key=value with a string-typed schema arg ----------
+
+#[test]
+fn glm_parse_plain_key_value_with_string_typed_arg() {
+  // `name key=value` where `key` is declared `string` in the schema → the
+  // value is kept as a raw string instead of being `deserialize`d (the
+  // `string_args.contains(&key)` branch, line ~1696). A numeric-looking
+  // value `1` therefore stays the string "1".
+  let tools = serde_json::json!([{
+    "function": {
+      "name": "f",
+      "parameters": { "properties": { "s": { "type": "string" } } }
+    }
+  }]);
+  assert_eq!(
+    glm_parse_plain("f s=1", Some(&tools)),
+    Some(ToolCall::new_nameless_id(
+      "f",
+      serde_json::json!({"s": "1"})
+    )),
+    "string-typed key=value stays a string",
+  );
+}
+
+// --- find_kv_pairs: value-open present but value-close missing ----------
+
+#[test]
+fn find_kv_pairs_value_open_without_close_breaks() {
+  // A key/value pair where the value-OPEN tag is found but its CLOSE tag
+  // is missing terminates the scan with whatever pairs were already
+  // collected (the `text[vabs..].find(vc)` → `None` → `break`, line
+  // ~1733). The first complete pair is returned, the truncated one is
+  // dropped.
+  assert_eq!(
+    find_kv_pairs(
+      "<k>a</k><v>1</v><k>b</k><v>dangling",
+      "<k>",
+      "</k>",
+      "<v>",
+      "</v>"
+    ),
+    vec![("a".to_owned(), "1".to_owned())],
+    "the second value never closes → scan stops after the first pair",
+  );
+}
+
+// --- schema_types: enum float / array / object JSON-shape names ---------
+
+#[test]
+fn schema_types_enum_float_array_object_shapes() {
+  // The enum-value → type-name map (lines ~2069-2076) needs a FLOAT
+  // (`Value::Number(_)` non-integer → "number", line ~2073), an ARRAY
+  // (→ "array", line ~2075) and an OBJECT (→ "object", line ~2076) to
+  // cover the arms the existing integer/string/bool/null test misses.
+  assert_eq!(
+    schema_types(&serde_json::json!({"enum": [1.5, [1, 2], {"k": 1}]})),
+    vec!["array".to_owned(), "number".to_owned(), "object".to_owned()],
+    "float→number, list→array, dict→object (BTreeSet-sorted)",
+  );
+}
+
+// --- normalize_arguments: string-typed coercion of a non-string value ---
+
+#[test]
+fn normalize_arguments_string_typed_value_is_stringified() {
+  // `normalize_arguments` (used by glm47's JSON/plain fallbacks) coerces a
+  // value whose key is declared `string` in the schema: a non-string value
+  // is rendered via `to_string()` (the `other => Value::String(...)`
+  // branch, lines ~1606-1610). A NON-string-typed key whose value IS a
+  // string is `deserialize`d; a non-string-typed non-string value passes
+  // through unchanged.
+  let tools = serde_json::json!([{
+    "function": {
+      "name": "f",
+      "parameters": { "properties": { "s": { "type": "string" } } }
+    }
+  }]);
+  let mut args = serde_json::Map::new();
+  // string-typed key, numeric value → stringified to "5".
+  args.insert("s".to_owned(), serde_json::json!(5));
+  // non-string-typed key, string value → deserialized to a number.
+  args.insert("n".to_owned(), serde_json::json!("7"));
+  // non-string-typed key, non-string value → passes through unchanged.
+  args.insert("b".to_owned(), serde_json::json!(true));
+  let out = normalize_arguments("f", &args, Some(&tools));
+  assert_eq!(out.get("s"), Some(&Value::String("5".to_owned())));
+  assert_eq!(out.get("n"), Some(&serde_json::json!(7)));
+  assert_eq!(out.get("b"), Some(&serde_json::json!(true)));
+}
+
+// --- minimax_m2 parse: a parameter with no `>` is skipped ---------------
+
+#[test]
+fn parse_minimax_m2_parameter_without_gt_is_skipped() {
+  // Inside `<invoke …>`, a `<parameter name=…` fragment with NO closing
+  // `>` before the `</parameter>` is skipped (`pm.find('>')` → None →
+  // `continue`, lines ~2170-2173). The well-formed parameter is still
+  // captured; the malformed one contributes nothing.
+  let text = concat!(
+    r#"<invoke name="f">"#,
+    // malformed parameter: no `>` between the name and the close tag.
+    r#"<parameter name="bad"</parameter>"#,
+    r#"<parameter name="ok">v</parameter>"#,
+    r#"</invoke>"#,
+  );
+  let out = MinimaxM2.parse(text, None).unwrap();
+  assert_eq!(out.len(), 1);
+  assert_eq!(out[0].name(), "f");
+  assert_eq!(
+    *out[0].arguments(),
+    serde_json::json!({"ok": "v"}),
+    "the `>`-less parameter is skipped; only the well-formed one is kept",
+  );
+}
+
+// --- qwen3_coder try_parse_one_call: bounded body, valid opener, no
+//     `</function>` close (forward-scan exhausts) ------------------------
+
+#[test]
+fn try_parse_one_call_qwen3_coder_valid_opener_without_function_close_is_bounded_empty() {
+  // The body has a VALID `<function=f>` opener and a complete
+  // `<parameter=p>v</parameter>` region, but NO `</function>` before the
+  // wrapper `</tool_call>` close. `bound_section` (via the value-aware
+  // scan that skips the parameter region) finds the wrapper close, then
+  // the forward-scan over the bounded prefix consumes the parameter
+  // region and exhausts with no `</function>` candidate — the
+  // `(None, _) => break None` arm (line ~1244) → `fn_close_found.is_none()`
+  // → `Ok(Some((Vec::new(), end_pos)))` (line ~1269). The processor then
+  // surfaces the same-chunk suffix.
+  let buf = "<tool_call><function=f><parameter=p>v</parameter></tool_call>visible";
+  let (calls, end_pos) = Qwen3Coder
+    .try_parse_one_call(buf, None)
+    .expect("Ok")
+    .expect("Some — wrapper close is in the buffer");
+  assert_eq!(calls.len(), 0, "no `</function>` close → zero calls");
+  assert!(
+    buf[..end_pos].ends_with("</tool_call>"),
+    "end_pos lands one past the wrapper close",
+  );
+  // End-to-end: the malformed-but-bounded section drops, the suffix
+  // `visible` reaches display.
+  let (display, c) = run_with_parser(Box::new(Qwen3Coder), &[buf]);
+  assert_eq!(c.len(), 0);
+  assert_eq!(display, "visible", "same-chunk suffix survives");
+}
+
+// --- qwen3_coder parse: a parameter with no `>` is skipped --------------
+
+#[test]
+fn parse_qwen3_coder_parameter_without_gt_is_skipped() {
+  // qwen3_coder's `parse` mirrors the minimax skip: a `<parameter=` capture
+  // with no `>` inside it is skipped (`cap.find('>')` → None → `continue`,
+  // line ~1135). The well-formed parameter is still parsed.
+  let text = concat!(
+    "<function=f>",
+    // The first capture between `<parameter=` and `</parameter>` is just
+    // `nogt` with no `>` inside it → skipped.
+    "<parameter=nogt</parameter>",
+    "<parameter=p>v</parameter>",
+    "</function>",
+  );
+  let out = Qwen3Coder.parse(text, None).unwrap();
+  assert_eq!(out.len(), 1);
+  assert_eq!(out[0].name(), "f");
+  assert_eq!(
+    *out[0].arguments(),
+    serde_json::json!({"p": "v"}),
+    "the `>`-less parameter capture is skipped",
+  );
+}
+
+// --- function_gemma parse: trailing comma / boundary value arms ---------
+
+#[test]
+fn parse_function_gemma_value_to_end_and_no_colon_break() {
+  // An unquoted value that runs to the END of the args (no trailing `,`)
+  // exercises the `split < args_str.len()` false branch → `args_str` set
+  // to empty (lines ~2336-2340). Two keys: the first has a trailing comma,
+  // the second runs to end-of-body.
+  let out = FunctionGemma.parse("call:f{a:1,b:2}", None).unwrap();
+  assert_eq!(
+    out,
+    vec![ToolCall::new_nameless_id(
+      "f",
+      serde_json::json!({"a": 1, "b": 2})
+    )]
+  );
+  // A non-empty body fragment with no `:` terminates the arg loop (the
+  // `args_str.find(':')` → `None => break`, line ~2310): `call:g{nocolon}`
+  // enters the loop with `nocolon`, finds no `:`, and breaks with no args.
+  let out = FunctionGemma.parse("call:g{nocolon}", None).unwrap();
+  assert_eq!(
+    out,
+    vec![ToolCall::new_nameless_id("g", serde_json::json!({}))],
+    "non-empty body with no `:` → break → empty arguments",
+  );
+}
+
+// --- recover_at_cap: PotentialToolCall flushes pending + tool buffer -----
+
+#[test]
+fn recover_at_cap_potential_state_flushes_pending_and_prefix() {
+  // In `PotentialToolCall` at the cap, BOTH `pending_display` (leading
+  // prose) AND `tool_call_buffer` (the ambiguous tag-prefix) are flushed
+  // back as display text in stream order (recover_at_cap's
+  // `!drop_tool_buffer` arm, lines ~3031-3037, via the strict-prefix
+  // `cap_recover_into` at ~3267).
+  //
+  // Reaching this arm requires `pending_display` ALONE to exceed the cap
+  // while `tool_call_buffer` is still a valid strict prefix of the start
+  // tag (which can only be the few bytes of the tag). `pending_display`
+  // only grows in `Normal` when a chunk has leading text before its first
+  // start char — so the leading prose and the start char must arrive in
+  // ONE chunk: a huge prose followed by a single `<` (a strict prefix of
+  // `<tool_call>`).
+  let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+  let huge_prose = "p".repeat(MAX_TOOL_CALL_BUFFER_BYTES + 1024);
+  // One chunk: `huge_prose` (→ pending_display) + `<` (→ tool_call_buffer,
+  // a strict prefix). The combined size already exceeds the cap, so the
+  // strict-prefix branch's `cap_recover_into` trips recovery on this chunk.
+  let out = p.process_chunk(&format!("{huge_prose}<"));
+  // recover_at_cap (PotentialToolCall arm) flushes pending_display THEN the
+  // `<` prefix bytes as display, in stream order, and resets to Normal.
+  let displayed = out.expect("cap recovery flushes the buffered bytes as display");
+  assert!(
+    displayed.starts_with(&huge_prose),
+    "leading prose is flushed first (stream order)",
+  );
+  assert!(
+    displayed.ends_with('<'),
+    "the ambiguous `<` prefix is flushed after the prose (not dropped)",
+  );
+  assert_eq!(displayed.len(), huge_prose.len() + 1);
+  assert_eq!(p.state, State::Normal, "reset to Normal after cap recovery");
+  assert_eq!(p.tool_call_buffer.len(), 0);
+  assert_eq!(p.pending_display.len(), 0);
+  // The processor is reusable: a fresh valid call still parses.
+  let out2 = p.process_chunk(r#"<tool_call>{"name":"ok","arguments":{}}</tool_call>"#);
+  assert_eq!(out2, None);
+  assert_eq!(p.tool_calls.len(), 1);
+  assert_eq!(p.tool_calls[0].name(), "ok");
+}

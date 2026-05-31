@@ -2088,3 +2088,277 @@ fn compute_deltas_kaldi_constant_mode_1d_ramp_interior_unit_slope() {
     );
   }
 }
+
+// ---- overflow / i32 / i64 conversion guards (scalar-arg driven) --------
+//
+// The following exercise the cold error closures that only fire when a SCALAR
+// argument (not an array dimension) exceeds a `usize`-multiply / `i32` / `i64`
+// bound. Array dimensions are bounded by `i32::MAX` (mlx shapes are `&[i32]`),
+// so these branches are unreachable through a constructed `Array`; they are
+// reached only by handing the (free `usize`) scalar parameters pathological
+// values directly to the public / private functions. No allocation occurs —
+// every guard fires BEFORE the function touches the FFI / host buffers.
+
+#[test]
+fn mel_banks_kaldi_num_bins_times_fft_bins_overflows_usize() {
+  // `bank_len = num_bins * num_fft_bins` with `num_fft_bins = n_fft_padded/2`.
+  // `num_bins = 1<<40`, `n_fft_padded = 1<<26` ⇒ `num_fft_bins = 1<<25`, and
+  // `(1<<40) * (1<<25) = 1<<65` overflows `usize` (2^64). The `checked_mul`
+  // closure (the ArithmeticOverflow path) fires BEFORE the cap / i32 checks.
+  // All freq args are valid so we reach the multiply: nyquist = 8000,
+  // high_freq=0.0 → 8000, low=20 (0<=20<8000), 20<8000.
+  let num_bins = 1_usize << 40;
+  let n_fft_padded = 1_usize << 26; // even, non-zero
+  let num_fft_bins = n_fft_padded / 2; // 1<<25
+  // Independent oracle: the product genuinely overflows usize.
+  assert!(
+    num_bins.checked_mul(num_fft_bins).is_none(),
+    "test premise: num_bins * num_fft_bins must overflow usize"
+  );
+  let err = get_mel_banks_kaldi(num_bins, n_fft_padded, 16_000.0, 20.0, 0.0)
+    .expect_err("num_bins * num_fft_bins overflow must be rejected");
+  let Error::ArithmeticOverflow(p) = &err else {
+    panic!("expected ArithmeticOverflow, got {err:?}");
+  };
+  assert_eq!(p.op_type(), "usize");
+  assert!(
+    p.context()
+      .contains("get_mel_banks_kaldi: num_bins * num_fft_bins"),
+    "expected the num_bins*num_fft_bins overflow context, got {:?}",
+    p.context()
+  );
+  // Operands carry the offending runtime values by name.
+  let names: Vec<&str> = p.operands().iter().map(|(n, _)| *n).collect();
+  assert!(
+    names.contains(&"num_bins") && names.contains(&"num_fft_bins"),
+    "expected num_bins + num_fft_bins operands, got {names:?}"
+  );
+}
+
+#[test]
+fn build_kaldi_window_rejects_win_size_over_i32() {
+  // `win_size` is a free `usize`; a value > i32::MAX fails the `i32::try_from`
+  // BEFORE any reservation / SIMD kernel runs (the check is line-order first),
+  // so no allocation is attempted. `>= 2` so the small-window guard passes.
+  let win_size = (i32::MAX as usize) + 1;
+  assert!(i32::try_from(win_size).is_err(), "test premise: > i32::MAX");
+  let err = build_kaldi_window(KaldiWindow::Hamming, win_size)
+    .expect_err("win_size over i32::MAX must be rejected");
+  let Error::OutOfRange(p) = &err else {
+    panic!("expected OutOfRange, got {err:?}");
+  };
+  assert_eq!(p.context(), "build_kaldi_window: win_size");
+  assert!(
+    p.requirement().contains("fit in i32"),
+    "expected the i32-fit requirement, got {:?}",
+    p.requirement()
+  );
+}
+
+#[test]
+fn strided_frames_snip_edges_last_index_overflows_usize() {
+  // `last_index = (num_frames - 1) * win_inc + win_size` is computed with
+  // checked arithmetic over the free `usize` scalars. `num_frames = 2`,
+  // `win_inc = usize::MAX` ⇒ `1 * usize::MAX` then `+ win_size` overflows.
+  // The waveform array itself is small (the overflow is in the scalar math,
+  // evaluated before the array is read).
+  let x = Array::from_slice::<f32>(&[0.0_f32; 4], &[4_i32]).unwrap();
+  // Independent oracle: the reachable-index arithmetic overflows usize.
+  assert!(
+    1_usize
+      .checked_mul(usize::MAX)
+      .and_then(|v| v.checked_add(10))
+      .is_none(),
+    "test premise: (num_frames-1)*win_inc + win_size must overflow usize"
+  );
+  let err = strided_frames_snip_edges(&x, 10, usize::MAX, 2)
+    .expect_err("reachable-index overflow must be rejected");
+  let Error::ArithmeticOverflow(p) = &err else {
+    panic!("expected ArithmeticOverflow, got {err:?}");
+  };
+  assert_eq!(p.op_type(), "usize");
+  assert!(
+    p.context()
+      .contains("strided_frames_snip_edges: reachable element range"),
+    "expected the reachable-range overflow context, got {:?}",
+    p.context()
+  );
+}
+
+#[test]
+fn strided_frames_snip_edges_rejects_num_frames_over_i32() {
+  // `num_frames > i32::MAX` reaches the `num_frames` i32 conversion ONLY when
+  // the `last_index <= waveform_len` bound passes first. With `win_inc = 0`,
+  // `last_index = (num_frames-1)*0 + win_size = win_size`; choose `win_size = 4`
+  // and a length-5 waveform so `4 <= 5` passes, then the huge `num_frames`
+  // hits the i32 guard. No array of `num_frames` size is built — `num_frames`
+  // is a free scalar.
+  let x = Array::from_slice::<f32>(&[0.0_f32; 5], &[5_i32]).unwrap();
+  let num_frames = (i32::MAX as usize) + 1;
+  let err = strided_frames_snip_edges(&x, 4, 0, num_frames)
+    .expect_err("num_frames over i32::MAX must be rejected");
+  let Error::OutOfRange(p) = &err else {
+    panic!("expected OutOfRange, got {err:?}");
+  };
+  assert_eq!(p.context(), "strided_frames_snip_edges: num_frames");
+}
+
+#[test]
+fn strided_frames_snip_edges_rejects_win_inc_over_i64() {
+  // `win_inc > i64::MAX` (it is a `usize`; on 64-bit, usize::MAX > i64::MAX)
+  // reaches the `win_inc` i64 conversion only after the earlier guards pass.
+  // With `num_frames = 1`, the multiply `(1-1)*win_inc = 0` does NOT overflow
+  // and `last_index = win_size = 4 <= waveform_len`, num_frames(1)/win_size(4)
+  // fit i32 — so the i64 win_inc guard is the one that fires.
+  let x = Array::from_slice::<f32>(&[0.0_f32; 8], &[8_i32]).unwrap();
+  let win_inc = (i64::MAX as usize) + 1;
+  assert!(i64::try_from(win_inc).is_err(), "test premise: > i64::MAX");
+  let err = strided_frames_snip_edges(&x, 4, win_inc, 1)
+    .expect_err("win_inc over i64::MAX must be rejected");
+  let Error::OutOfRange(p) = &err else {
+    panic!("expected OutOfRange, got {err:?}");
+  };
+  assert_eq!(p.context(), "strided_frames_snip_edges: win_inc");
+  assert!(
+    p.requirement().contains("fit in i64"),
+    "expected the i64-fit requirement, got {:?}",
+    p.requirement()
+  );
+}
+
+#[test]
+fn strided_no_snip_edges_last_index_overflows_usize() {
+  // Reach the post-`padded`-build `last_index` overflow closure: build a VALID
+  // reflect buffer (win_size=4, win_inc=2, n=10 ⇒ pad=1, padded len 20), then
+  // a `num_frames = usize::MAX` so `(num_frames-1)*win_inc` overflows usize.
+  // `num_frames` does not affect the padded-buffer build (only win_size/win_inc/
+  // n do), so the helper reaches line ~797 with the valid buffer and overflows.
+  let wf: Vec<f32> = (0..10).map(|v| v as f32).collect();
+  let x = Array::from_slice::<f32>(&wf, &[10_i32]).unwrap();
+  // Independent oracle: (usize::MAX - 1) * 2 overflows usize.
+  assert!(
+    (usize::MAX - 1).checked_mul(2).is_none(),
+    "test premise: (num_frames-1)*win_inc must overflow usize"
+  );
+  let err = strided_frames_no_snip_edges(&x, 4, 2, usize::MAX)
+    .expect_err("reachable-index overflow must be rejected");
+  let Error::ArithmeticOverflow(p) = &err else {
+    panic!("expected ArithmeticOverflow, got {err:?}");
+  };
+  assert_eq!(p.op_type(), "usize");
+  assert!(
+    p.context()
+      .contains("strided_frames_no_snip_edges: reachable element range"),
+    "expected the reachable-range overflow context, got {:?}",
+    p.context()
+  );
+}
+
+#[test]
+fn strided_no_snip_edges_rejects_num_frames_over_i32() {
+  // `num_frames > i32::MAX` reaches the `num_frames` i32 conversion only when
+  // `last_index <= padded_len` passes. With `win_inc = 0`, `last_index =
+  // (num_frames-1)*0 + win_size = win_size = 4`; a length-10 waveform with
+  // win_size=4, win_inc=0 ⇒ pad = 4/2 - 0/2 = 2 (the pad>1 path) builds a
+  // padded buffer of length 2+10+2 = 14, so 4 <= 14 passes and the huge
+  // `num_frames` hits the i32 guard. `num_frames` is a free scalar (no array
+  // of that size is built).
+  let wf: Vec<f32> = (0..10).map(|v| v as f32).collect();
+  let x = Array::from_slice::<f32>(&wf, &[10_i32]).unwrap();
+  let num_frames = (i32::MAX as usize) + 1;
+  let err = strided_frames_no_snip_edges(&x, 4, 0, num_frames)
+    .expect_err("num_frames over i32::MAX must be rejected");
+  let Error::OutOfRange(p) = &err else {
+    panic!("expected OutOfRange, got {err:?}");
+  };
+  assert_eq!(p.context(), "strided_frames_no_snip_edges: num_frames");
+}
+
+#[test]
+fn compute_fbank_kaldi_rejects_num_mels_over_i32() {
+  // `num_mels > i32::MAX` reaches the `num_mels_i32` conversion — it is the
+  // first thing converted after the (all-passing) scalar validation. Every
+  // other arg is valid (rank-1, sample_rate>0, win_len>=2 & <=cap, win_inc>0,
+  // dither=0, preemph in [0,1], samples_len<=cap), so the num_mels i32 guard
+  // is the one that fires. The waveform is a small real buffer; num_mels is a
+  // free scalar (no `(.., num_mels)` array is built before the guard).
+  let x = Array::from_slice::<f32>(&[0.0_f32; 8], &[8_i32]).unwrap();
+  let num_mels = (i32::MAX as usize) + 1;
+  let err = compute_fbank_kaldi(
+    &x,
+    16_000,
+    4,
+    2,
+    num_mels,
+    KaldiWindow::Rectangular,
+    0.0,
+    0.0,
+    true,
+    0.0,
+    0.0,
+    None,
+  )
+  .expect_err("num_mels over i32::MAX must be rejected");
+  let Error::OutOfRange(p) = &err else {
+    panic!("expected OutOfRange, got {err:?}");
+  };
+  assert_eq!(p.context(), "compute_fbank_kaldi: num_mels");
+}
+
+#[test]
+fn compute_fbank_kaldi_frame_work_cap_rejects_large_framed_matrix() {
+  // The FIRST work cap is `frame_work = num_frames * n_fft_padded`. Choose
+  // params so it exceeds MAX_FBANK_WORK (64 Mi) while `out_elems`,
+  // `output_elems`, `mel_padded_elems` (checked AFTER) stay under it — so
+  // `frame_work` is the binding cap. `samples_len = 200_000`, `win_len = 1000`
+  // (n_fft_padded = next_pow2(1000) = 1024), `win_inc = 1`, snip_edges=true:
+  //   num_frames  = 1 + (200000 - 1000)/1 = 199_001
+  //   frame_work  = 199_001 * 1024 ≈ 203 Mi  > 64 Mi cap  (REJECT here)
+  //   out_elems   = 199_001 * (1024/2+1) (only reached if frame_work passed)
+  //   output_elems= 199_001 * 4 ≈ 796 K      <= cap
+  // `Array::zeros` is lazy and `contiguous` runs AFTER the caps, so no host
+  // buffer is materialized — the cap rejects on scalar framing math alone.
+  let samples_len = 200_000;
+  let n_fft_padded = 1024_usize; // next_pow2(1000)
+  let num_frames = 1 + (samples_len - 1000); // win_inc = 1 → 199_001
+  // Independent oracle: frame_work > cap, output_elems <= cap.
+  assert!(
+    num_frames * n_fft_padded > MAX_FBANK_WORK,
+    "test premise: frame_work must exceed the cap"
+  );
+  assert!(
+    num_frames * 4 <= MAX_FBANK_WORK,
+    "test premise: output_elems must stay under the cap so frame_work is binding"
+  );
+  let x = Array::zeros::<f32>(&[i32::try_from(samples_len).unwrap()]).unwrap();
+  let err = compute_fbank_kaldi(
+    &x,
+    16_000,
+    1000, // win_len → n_fft_padded = 1024
+    1,    // win_inc = 1 → maximal num_frames
+    4,    // num_mels small → output_elems tiny
+    KaldiWindow::Rectangular,
+    0.0,
+    0.0,
+    true,
+    0.0,
+    0.0,
+    None,
+  )
+  .expect_err("frame_work over MAX_FBANK_WORK must be rejected");
+  let Error::CapExceeded(p) = &err else {
+    panic!("expected CapExceeded, got {err:?}");
+  };
+  assert_eq!(p.cap_name(), "MAX_FBANK_WORK");
+  assert!(
+    p.context().contains("frame work"),
+    "expected the frame-work cap context, got {:?}",
+    p.context()
+  );
+  assert!(
+    p.observed() > p.cap(),
+    "observed {} must exceed cap {}",
+    p.observed(),
+    p.cap()
+  );
+}

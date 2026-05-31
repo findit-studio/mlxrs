@@ -1302,3 +1302,6 @@ pub fn save_gguf(
   drop(guard);
   Ok(())
 }
+
+#[cfg(test)]
+mod tests;
