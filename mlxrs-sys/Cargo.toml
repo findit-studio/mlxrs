@@ -9,6 +9,11 @@ license.workspace = true
 rust-version.workspace = true
 links = "mlxc"
 
+# docs.rs builds for the Apple target (the build script no-ops there via the
+# DOCS_RS env var — see build.rs).
+[package.metadata.docs.rs]
+default-target = "aarch64-apple-darwin"
+
 [build-dependencies]
 cmake.workspace = true
 walkdir.workspace = true

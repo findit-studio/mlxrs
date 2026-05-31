@@ -46,6 +46,15 @@ fn main() {
   println!("cargo:rerun-if-changed=vendor/gguflib");
   println!("cargo:rerun-if-changed=shim/mlxrs_shim.cpp");
 
+  // docs.rs builds on a non-Apple host (x86_64-linux) and only needs the crate
+  // to *compile* — rustdoc never links the native library. Skip the target gate
+  // + the cmake/native build there; the pre-committed bindings are enough for
+  // `cargo doc`. `[package.metadata.docs.rs] default-target` points docs.rs at
+  // the Apple target so the rendered docs still reflect the real platform.
+  if env::var_os("DOCS_RS").is_some() {
+    return;
+  }
+
   // Target check — M1 is macOS arm64 only.
   let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
   let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
