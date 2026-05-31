@@ -249,8 +249,8 @@ pub fn gather(a: &Array, indices: &[&Array], axes: &[i32], slice_sizes: &[i32]) 
     return Err(
       crate::error::LAST
         .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend(
-          "mlx_vector_array_new_data returned NULL".into(),
+        .unwrap_or(Error::FfiNullHandle(
+          crate::error::FfiNullHandlePayload::new("mlx_vector_array_new_data"),
         )),
     );
   }
@@ -381,8 +381,8 @@ fn scatter_multi(
     return Err(
       crate::error::LAST
         .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend(
-          "mlx_vector_array_new_data returned NULL".into(),
+        .unwrap_or(Error::FfiNullHandle(
+          crate::error::FfiNullHandlePayload::new("mlx_vector_array_new_data"),
         )),
     );
   }

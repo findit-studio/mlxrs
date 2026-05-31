@@ -125,8 +125,8 @@ impl Closure {
       // catch arm somehow surfaced NULL — not currently observed in any
       // mlx-c codepath but a defensive consideration). Leak is strictly
       // preferable to UAF.
-      return Err(crate::error::take_last().unwrap_or(Error::Backend(
-        "mlx_closure_new_func_payload returned NULL ctx".into(),
+      return Err(crate::error::take_last().unwrap_or(Error::FfiNullHandle(
+        crate::error::FfiNullHandlePayload::new("mlx_closure_new_func_payload"),
       )));
     }
     Ok(Self { inner })
@@ -351,8 +351,8 @@ fn write_outputs(out: *mut mlxrs_sys::mlx_vector_array, outputs: &[Array]) -> Re
   }
   // SAFETY: post-write null-check — the constructor is fallible.
   if unsafe { (*out).ctx.is_null() } && !outputs.is_empty() {
-    return Err(crate::error::take_last().unwrap_or(Error::Backend(
-      "mlx_vector_array_new_data returned NULL ctx in closure trampoline".into(),
+    return Err(crate::error::take_last().unwrap_or(Error::FfiNullHandle(
+      crate::error::FfiNullHandlePayload::new("mlx_vector_array_new_data"),
     )));
   }
   Ok(())
@@ -375,8 +375,8 @@ pub(crate) fn vector_array_from_borrow(arrays: &[&Array]) -> Result<VectorArrayG
   // copies into the new vector, refcount-bumping each).
   let vec = unsafe { mlxrs_sys::mlx_vector_array_new_data(data_ptr, raw.len()) };
   if vec.ctx.is_null() {
-    return Err(crate::error::take_last().unwrap_or(Error::Backend(
-      "mlx_vector_array_new_data returned NULL ctx".into(),
+    return Err(crate::error::take_last().unwrap_or(Error::FfiNullHandle(
+      crate::error::FfiNullHandlePayload::new("mlx_vector_array_new_data"),
     )));
   }
   Ok(VectorArrayGuard(vec))
@@ -396,8 +396,8 @@ pub(crate) fn vector_array_from_slice(arrays: &[Array]) -> Result<VectorArrayGua
   // borrowed handles live for this call; mlx-c copies into the new vector.
   let vec = unsafe { mlxrs_sys::mlx_vector_array_new_data(data_ptr, raw.len()) };
   if vec.ctx.is_null() {
-    return Err(crate::error::take_last().unwrap_or(Error::Backend(
-      "mlx_vector_array_new_data returned NULL ctx".into(),
+    return Err(crate::error::take_last().unwrap_or(Error::FfiNullHandle(
+      crate::error::FfiNullHandlePayload::new("mlx_vector_array_new_data"),
     )));
   }
   Ok(VectorArrayGuard(vec))
@@ -499,8 +499,8 @@ where
     // reclaim manually — that would be a double-free / UAF. Same
     // rationale as `Closure::new` above: accept a (tiny) leak on the
     // unobserved-NULL path over a deterministic UAF.
-    return Err(crate::error::take_last().unwrap_or(Error::Backend(
-      "mlx_closure_custom_new_func_payload returned NULL ctx".into(),
+    return Err(crate::error::take_last().unwrap_or(Error::FfiNullHandle(
+      crate::error::FfiNullHandlePayload::new("mlx_closure_custom_new_func_payload"),
     )));
   }
   Ok(ClosureCustomGuard(inner))

@@ -470,7 +470,7 @@ impl Stream {
       // The C++ clear_streams() threw before tearing anything down (it just
       // clears a map; throwing is not expected). Leave the thread usable —
       // do NOT poison it — and surface the error.
-      return Err(crate::Error::Backend(
+      return Err(crate::Error::MlxC(
         "mlxrs_shim_clear_streams: mlx::core::clear_streams() threw".into(),
       ));
     }
@@ -576,6 +576,23 @@ impl PartialEq for Stream {
 
 impl Eq for Stream {}
 
+/// RAII guard that frees an `mlx_string` on drop — mirrors `device.rs`'s
+/// `StringGuard` so `Stream`'s `Debug` does not hand-roll `mlx_string_free`.
+struct StringGuard(mlxrs_sys::mlx_string);
+
+impl Drop for StringGuard {
+  fn drop(&mut self) {
+    // SAFETY: frees a handle this guard owns exactly once. Runs during `Drop`
+    // / unwind / thread teardown: must not touch TLS, call `check()`, panic,
+    // or unwind across `extern "C"`; the rc is discarded silently per the
+    // crate's Drop convention. `mlx_string_free` is a defined no-op on a NULL
+    // ctx (sentinel-handle pattern).
+    unsafe {
+      let _ = mlxrs_sys::mlx_string_free(self.0);
+    }
+  }
+}
+
 impl std::fmt::Debug for Stream {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     // Reaches fallible mlx-c (mlx_stream_tostring); the error.rs contract
@@ -590,37 +607,29 @@ impl std::fmt::Debug for Stream {
     // state) remain poison-guarded.
     crate::error::ensure_handler_installed();
     // SAFETY: `mlx_string_new()` returns a fresh empty out-param `mlx_string`
-    // (NULL ctx) per the mlx-c convention; populated by the following call
-    // and freed via the local guard / explicit `mlx_string_free`.
-    let mut s = unsafe { mlxrs_sys::mlx_string_new() };
-    // SAFETY: `self.0` is a valid borrowed handle; `s` is a fresh `mlx_string`
-    // out-param freed via the local guard/explicit free; mlx-c writes the
-    // formatted string into it and the rc is surfaced (checked below).
-    let rc = unsafe { mlxrs_sys::mlx_stream_tostring(&mut s, self.0) };
-    let result = if rc == 0 {
-      // SAFETY: `s` is a live `mlx_string` (freed only after this borrow); mlx-c
-      // returns its internal NUL-terminated buffer, valid until the string is
-      // freed. The returned pointer is NULL-checked before use.
-      let p = unsafe { mlxrs_sys::mlx_string_data(s) };
+    // (NULL ctx) per the mlx-c convention; populated by the following call and
+    // freed by the `StringGuard` RAII drop at end of scope (no manual free).
+    let mut guard = StringGuard(unsafe { mlxrs_sys::mlx_string_new() });
+    // SAFETY: `self.0` is a valid borrowed handle; `&mut guard.0` is the fresh
+    // `mlx_string` out-param; mlx-c writes the formatted string into it and the
+    // rc is surfaced (checked below).
+    let rc = unsafe { mlxrs_sys::mlx_stream_tostring(&mut guard.0, self.0) };
+    if rc == 0 {
+      // SAFETY: `guard.0` is a live `mlx_string` (freed only when `guard` drops
+      // at end of scope); mlx-c returns its internal NUL-terminated buffer. The
+      // returned pointer is NULL-checked before use.
+      let p = unsafe { mlxrs_sys::mlx_string_data(guard.0) };
       if p.is_null() {
         write!(f, "Stream(<unprintable>)")
       } else {
-        // SAFETY: the pointer was NULL-checked just above and points into the live
-        // `mlx_string` (still owned here, freed only after this borrow); the C
-        // string is NUL-terminated by mlx-c.
+        // SAFETY: the pointer was NULL-checked just above and points into the
+        // live `mlx_string` (owned by `guard`); the C string is NUL-terminated
+        // by mlx-c.
         let cs = unsafe { CStr::from_ptr(p) };
         write!(f, "Stream({})", cs.to_string_lossy())
       }
     } else {
       write!(f, "Stream(<unprintable>)")
-    };
-    // SAFETY: frees a handle this guard owns exactly once. Runs during `Drop` /
-    // thread teardown: must not touch TLS, call `check()`, panic, or unwind
-    // across `extern "C"`; the rc is discarded silently per the crate's
-    // Drop convention.
-    unsafe {
-      let _ = mlxrs_sys::mlx_string_free(s);
     }
-    result
   }
 }
