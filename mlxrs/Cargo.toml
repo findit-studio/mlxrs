@@ -5,7 +5,9 @@ edition.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/mlxrs"
-description = "MLX, MLX-LM, and MLX-VLM for Rust"
+description = "Safe Rust bindings for Apple's MLX array framework, with LM, VLM, audio, and embeddings support"
+keywords = ["mlx", "apple-silicon", "machine-learning", "metal", "llm"]
+categories = ["science", "api-bindings", "external-ffi-bindings", "mathematics"]
 license.workspace = true
 rust-version.workspace = true
 
@@ -23,32 +25,22 @@ tokenizer-tools      = ["tokenizer-config", "dep:serde_json"]                   
 
 embeddings           = ["tokenizer", "dep:memspan", "dep:glob"]
 lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm", "tokenizer-bpe", "tokenizer-chat", "tokenizer-deepseek-v32", "tokenizer-tools", "dep:regex"]
-# Grammar-constrained logits processing (`build_json_schema_logits_processor` /
-# `LLGuidanceLogitsProcessor`, the `lm::structured` module — port of
-# `mlx_vlm/structured.py`'s LLGuidance-backed sampler). Pulls in the
-# `llguidance` Rust crate + `toktrie_hf_tokenizers` (HF tokenizer → byte trie
-# adapter). Gated separately so the default `lm` build doesn't pay the
-# grammar-engine compile cost; callers who need structured outputs opt in.
 llguidance           = ["lm", "dep:llguidance", "dep:toktrie_hf_tokenizers", "dep:serde_json"]
 vlm                  = ["lm", "dep:image"]
 audio                = ["lm", "dep:symphonia", "dep:cpal", "dep:unicode-normalization", "dep:xattr"]
 unstable-ops-overload = []
-gguf                 = [] # GGUF load/save (mlx-c `mlx_io_gguf*`). OFF: mlxrs-sys does not yet link gguflib.
+gguf                 = []
 
 [dependencies]
 mlxrs-sys.workspace = true
 thiserror.workspace = true
 half.workspace = true
 smallvec.workspace = true
-# Small-string-optimized inline storage for short Error payload strings
-# (most error messages fit inline without a heap allocation). Always-on
-# because the typed Error variants in `error.rs` carry SmolStr fields and
-# the Error enum is in the core (no-feature) surface.
 smol_str = "0.3"
 static_assertions.workspace = true
 ctor.workspace = true
 derive_more.workspace = true
-libc = "0.2"                          # SIGABRT diagnostics handler (diagnostics.rs)
+libc = "0.2" # SIGABRT diagnostics handler (diagnostics.rs)
 tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
 minijinja = { version = "2", features = ["loader", "json", "loop_controls", "builtins", "preserve_order"], optional = true }
 minijinja-contrib = { version = "2", features = ["pycompat"], optional = true }
@@ -58,26 +50,6 @@ memspan = { version = "0.1", optional = true }
 glob = { version = "0.3", optional = true }
 jiff = { version = "0.2", optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
-# Multi-format audio decoder (pure-Rust, actively maintained).
-# `default-features = false` keeps the dep tree minimal — we enable
-# exactly the codecs/containers `mlx_audio.audio_io.read` decodes
-# without an external `ffmpeg` process:
-#   - `wav`  + `pcm`    — RIFF/WAVE container + PCM codec (WAV)
-#   - `mp3`             — MPEG-1/2 Layer III (`symphonia-bundle-mp3`)
-#   - `flac`            — FLAC (`symphonia-bundle-flac`)
-#   - `ogg` + `vorbis`  — OGG container + Vorbis codec (the `.ogg`/
-#                         `vorbis` arm of mlx-audio's miniaudio path).
-#                         BOTH are required: `ogg` is the container
-#                         demuxer, `vorbis` is the audio codec.
-# mlx-audio additionally routes M4A/AAC/Opus/WebM through an external
-# `ffmpeg` subprocess; Opus in particular has NO pure-Rust symphonia
-# codec in 0.6.0 (no `opus` feature, no `symphonia-codec-opus` crate —
-# it remains an open upstream issue), and the alternatives all need a
-# heavy `libopus`/`ffmpeg` C dependency. Per the minimal-deps project
-# rule those formats are deliberately scoped OUT of mlxrs's in-process
-# decoder — see `audio/io.rs` and `audio/mod.rs` for the fence.
-# The WAV *encoder* side is roll-our-own (~80 LOC in
-# audio/io.rs::save_wav); symphonia has no public encoder API.
 symphonia = { version = "0.6", optional = true, default-features = false, features = [
   "wav",
   "pcm",
@@ -86,42 +58,12 @@ symphonia = { version = "0.6", optional = true, default-features = false, featur
   "ogg",
   "vorbis",
 ] }
-# Cross-platform device-audio output (A11 `audio::playback`). cpal is the
-# de-facto pure-Rust audio I/O crate (CoreAudio on macOS, WASAPI on
-# Windows, ALSA on Linux); it mirrors the cpal-equivalent of the
-# `AVAudioEngine` + `AVAudioPlayerNode` pattern the Swift
-# `MLXAudioCore.AudioPlayer` uses (Host → Device → StreamConfig →
-# Stream + a callback that pulls samples from a thread-safe queue).
-# `default-features` are already minimal (no `jack`/`asio`/wasm-bindgen
-# / audioworklet); we don't enable any of the optional backends.
 cpal = { version = "0.17", optional = true }
-# Unicode NFC composition for the TTS text frontend (BasicTextProcessor).
-# mlx-audio-swift's TTS text frontends apply NFC + lowercase + whitespace
-# collapse; std covers the latter two but NFC needs a Unicode table. The
-# `unicode-normalization` crate is the de-facto choice (used by `regex`,
-# `unicode-segmentation`, &c.); zero runtime deps.
 unicode-normalization = { version = "0.1", optional = true }
 regex = { version = "1", optional = true, default-features = false, features = ["std", "perf"] }
-# Grammar-constrained decoding backend (V6 — `lm::structured`). `default-features
-# = false` strips `rayon` (parallel mask compute — orthogonal to our single-
-# matcher per-step path) and `lark`/`referencing`; the `lark` feature is
-# re-enabled because `GrammarSpec::Lark` accepts Lark source. No GPU /
-# pyo3 / cbindgen / wasm features pulled in.
 llguidance = { version = "1.7", optional = true, default-features = false, features = ["lark", "referencing"] }
 toktrie_hf_tokenizers = { version = "1.7", optional = true }
 
-# Unix-only dependencies. `xattr-1.x` imports `std::os::unix::io`
-# unconditionally and its supported-platform list is Unix-only — the
-# crate does NOT compile on Windows. We therefore declare it under
-# `[target.'cfg(unix)'.dependencies]` so the `audio` feature's
-# `dep:xattr` directive resolves to a no-op on Windows (the dep is
-# absent from the resolved set, and Cargo silently drops `dep:xattr`
-# rather than erroring). On Unix targets `dep:xattr` activates this
-# optional dependency normally. The `use xattr` import in
-# `audio/io.rs` is correspondingly gated behind `#[cfg(unix)]`, and
-# Windows builds use local no-op stubs for
-# `capture_xattrs`/`restore_xattrs`. Loose `"1"` per the project
-# rule "No dependency pinning" — semver-major matches 1.x.
 [target.'cfg(unix)'.dependencies]
 xattr = { version = "1", optional = true }
 
@@ -154,48 +96,31 @@ harness = false
 name = "linalg"
 harness = false
 
-# C6 verify-before-claim bench — gated on the `vlm` feature so a
-# default-feature build skips it (the dispatcher lives behind the
-# `vlm` feature gate; see `simd::vlm` cfg in `mlxrs/src/simd/mod.rs`).
 [[bench]]
 name = "simd_pad_canvas_fill"
 harness = false
 required-features = ["vlm"]
 
-# C4 verify-before-claim bench — gated on the `vlm` feature for the
-# same reason (dispatcher lives behind the `vlm` feature gate).
 [[bench]]
 name = "simd_bgr_widen"
 harness = false
 required-features = ["vlm"]
 
-# C7 quantize bench — gated on the `audio` feature (dispatcher lives
-# behind the `audio` feature gate). Report-only per the user directive
-# 2026-05-23 (project memory rule "SIMD ship NEON regardless").
 [[bench]]
 name = "simd_quantize"
 harness = false
 required-features = ["audio"]
 
-# C3 RGB widen bench — gated on the `vlm` feature.
 [[bench]]
 name = "simd_rgb_widen"
 harness = false
 required-features = ["vlm"]
 
-# C1 PCM decode bench — gated on the `audio` feature.
 [[bench]]
 name = "simd_pcm_decode"
 harness = false
 required-features = ["audio"]
 
-# C9 lfilter bench-driven attempt — gated on the `audio` feature
-# (kernel lives behind the same feature gate). Unlike other
-# simd_*.rs benches, this one IS the ship decision per user directive
-# 2026-05-24 (C9 is the documented exception to the "SIMD ship NEON
-# regardless" rule, because the IIR recurrence is purely serial and
-# a NEON arm is only worth shipping if it empirically beats the
-# generic loop).
 [[bench]]
 name = "simd_lfilter"
 harness = false

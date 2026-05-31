@@ -1,21 +1,4 @@
-//! mlxrs — safe Rust bindings for [MLX](https://github.com/ml-explore/mlx) on Apple silicon.
-//!
-//! M1 ships `Array` + `Dtype` + `Error` + a subset of `ops.h`.
-//!
-//! ## Caveats
-//! - `Array` is **`!Send` and `!Sync`** — single-thread use only, like MLX's
-//!   own C++/Python/Swift APIs (which deliberately do not share arrays across
-//!   threads). The underlying C++ `array_desc` is refcount-shared by
-//!   [`Array::try_clone`] and mutates non-atomic state internally, and mlx's
-//!   `eval` is itself not concurrency-safe. `Array` therefore does **not**
-//!   implement `Clone` (the only duplication is the fallible `try_clone`).
-//!   There is **no shared-array wrapper**: to use array
-//!   data on another thread, extract owned data via [`Array::to_vec`] /
-//!   [`Array::item`] (which yield `Send` values) and move that.
-//! - **Async Metal kernel failures bypass `Result<T, Error>` and abort the
-//!   process.** The rc/sentinel chain only catches synchronous errors. A
-//!   `set_terminate`-style recovery shim is **not implementable** (mlx-c
-//!   exposes no hook) and is deferred to M3+ (diagnostics-only is planned).
+#![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
 #![cfg_attr(not(test), deny(missing_docs))]

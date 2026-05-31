@@ -1,32 +1,51 @@
 # Changelog
 
-## [0.1.0] — 2026-05-16 (M1: FFI + safe Array/ops core)
+## [0.1.0] — 2026-05-31
+
+First release. Safe Rust bindings for Apple's MLX array framework on Apple
+silicon (`aarch64-apple-darwin`) via the `mlx-c` FFI layer, plus opt-in
+higher-level support surfaces ported from MLX's companion projects.
 
 ### Added
 
-- **`mlxrs-sys` 0.1.0** — pre-committed bindgen output for `mlx-c` (post-v0.6.0 main HEAD; ~30 KLoC). Builds vendored mlx-c via cmake-rs; links libmlxc + libmlx + Metal/Accelerate. `aarch64-apple-darwin` only.
-- **`mlxrs` 0.1.0** — safe-layer over the C FFI:
-  - `Array` RAII handle, `Dtype` enum (14 variants), `Element` trait with impls for `bool`, `i32`, `u32`, `f32`, `half::f16` (extended types in M2).
-  - Lazy evaluation (`Array::eval`); implicit eval in data accessors (`item`, `to_vec`, `as_slice`).
-  - `Array` is `!Send + !Sync` — single-thread use only. M2 will provide `SharedArray` for cross-thread.
-  - Internal per-thread default-stream singleton; M2 lifts `Stream` to public API.
-  - 76 ops wrapped across `arithmetic`, `reduction`, `comparison`, `logical`, `shape`, `indexing`, `linalg_basic`, `misc`. Long-tail ops (var/std/all/any/logsumexp/etc.) deferred to M2.
-  - Operator overloads (`&a + &b`, `-&a`, …) gated behind `unstable-ops-overload` feature, OFF by default; panic on shape/dtype error. Library authors must NEVER enable transitively.
-  - Feature stubs: `lm` (M3), `vlm` (M4), `audio` (M5; implies `lm`), `embeddings` (M3). Per-model architectures land per-usecase, not bulk-ported from the upstream Python projects.
-- **xtask `regen-bindings`** subcommand for re-running bindgen against the vendored mlx-c headers.
-- **CI** — per-crate workflows (`mlxrs-sys.yml`, `mlxrs.yml`) including matrix feature builds, clippy/fmt/docs gates, and a bindings-drift gate. Plus `dep-watch.yml` weekly Mon 06:00 UTC cron — `cargo update --recursive` + workspace test, with auto-managed tracking issue on failure.
-- **Goal-7 perf-floor smoke test** (`mlxrs/tests/perf_floor.rs`) — `#[ignore]` by default; explicit `cargo test --release --test perf_floor -- --ignored` invocation.
+#### Core
+
+- **`mlxrs-sys`** — pre-committed bindgen output for `mlx-c`. Builds vendored mlx-c (+ gguflib) via cmake-rs; links libmlxc + libmlx + Metal/Accelerate.
+- **`Array`** RAII handle, the `Dtype` enum, and the `Element` trait (bool, integer, and float / half / bfloat / complex element types).
+- **Lazy evaluation** (`Array::eval`) — reading data via `item` / `to_vec` forces evaluation. `Array` does **not** implement `Clone` (the only duplication is the fallible `try_clone`) and is `!Send + !Sync` (single-thread, like MLX's own APIs); move results across threads as owned data from `to_vec` / `item`.
+- **Ops** across `arithmetic`, `reduction`, `comparison`, `logical`, `shape`, `indexing`, `linalg`, `fft`, `fast`, and `misc`, plus `transforms` (autodiff + graph transformations) and a `memory` API.
+- **Public `Stream` / `Device` API** — thread-affine, non-RAII handles for explicit stream/device placement.
+- **`io`** — safetensors and GGUF load/save.
+- **`simd`** — arch-gated NEON kernels (with scalar fallbacks) for hot image/audio paths.
+- **Operator overloads** (`&a + &b`, `-&a`, …) gated behind the off-by-default `unstable-ops-overload` feature; they **panic** on shape/dtype error, so library authors must never enable them transitively — the fallible `a.add(&b)?` form is the load-bearing API.
+
+#### Optional feature surfaces (off by default)
+
+- **`lm`** — language models: HF tokenizers (BPE / SentencePiece / chat templates / tool-call parsing), KV-caches (rotating / chunked / batched / quantized), samplers + logits processors, quantization, LoRA / DoRA, optimizers (Adam, AdamW, Adamax, Adafactor, Muon, SGD, Lion, Adadelta, RMSprop), and the generation loop + chat session.
+- **`vlm`** — vision-language models (implies `lm`): image preprocessing, prompt assembly, multimodal generation.
+- **`audio`** — audio (implies `lm`): STFT / mel DSP, WAV I/O, STT / TTS serializers, playback.
+- **`embeddings`** — embedding-model loading, pooling modes, and the encode pipeline.
+- **`llguidance`** — grammar-constrained / structured decoding.
+- **`gguf`** — GGUF load/save (gguflib is vendored + statically linked by `mlxrs-sys`).
+- Finer-grained `tokenizer-*` flags expose individual tokenizer pieces without the full `lm` surface.
+
+#### Tooling & CI
+
+- **xtask `regen-bindings`** — re-run bindgen against the vendored mlx-c headers.
+- Per-crate CI (`mlxrs-sys.yml`, `mlxrs.yml`) with matrix feature builds, clippy / fmt / docs gates, a bindings-drift gate, a coverage job, and a weekly `dep-watch.yml` dependency cron.
+- Extensive unit-test coverage (~90% of the testable surface; device-bound playback / Metal-kernel dispatch and unreachable defensive guards are excluded).
 
 ### Architecture decisions
 
-- **No dependency pinning** in any manifest (loose semver only); `Cargo.lock` is gitignored. Reproducibility check is the weekly `dep-watch.yml` cron, not a checked-in lockfile.
-- **Pre-committed bindings + drift CI gate** anchor binding stability — `regen-bindings` must be re-run + committed when the mlx-c submodule moves.
-- **Async Metal kernel failures intentionally abort the process.** The `rc`/sentinel chain only catches synchronous errors. M2 will add a `set_terminate` shim for recovery.
-- **No per-model architecture porting** from `mlx-lm`/`mlx-vlm`/`mlx-audio`/`mlx-embeddings` — M3-M5 ship the support surface (loaders, tokenizers, processors, generation loops); model implementations are added per-usecase.
+- **`aarch64-apple-darwin` only.** Other targets (`x86_64-apple-darwin`, Linux + CUDA, distributed) are roadmapped.
+- **No dependency pinning** in any manifest (loose semver only); `Cargo.lock` is gitignored. The reproducibility check is the weekly `dep-watch.yml` cron, not a checked-in lockfile.
+- **Pre-committed bindings + a drift CI gate** anchor binding stability — `regen-bindings` must be re-run + committed when the mlx-c submodule moves.
+- **Async Metal kernel failures intentionally abort the process.** The rc/sentinel chain only catches synchronous errors; a `set_terminate`-style recovery shim is not implementable (mlx-c exposes no hook), and only diagnostics are planned.
+- **No per-model architectures are bundled** — the `lm` / `vlm` / `audio` / `embeddings` features ship the support surface (loaders, tokenizers, caches, samplers, processors, generation loops, audio I/O), not specific model implementations; those are added per use-case.
 
 ### Safety audits
 
-- Phase-3 entry refcount audit (`docs/audits/send-soundness.md`, local-only) — verified MLX `array_desc_` is `std::shared_ptr` with atomic refcount, but per-clone Send is unsound because `set_status` mutates non-atomic state through `const`. Final design is `!Send + !Sync`.
-- Codex adversarial reviews on every PR (4-9): caught and fixed empty-slice dangling-pointer UB across `slice`/`sum_axes`/`concatenate`/`gather`/`pad`/shape-taking ops; introduced `dim_ptr`/`data_ptr`/per-`Element` `sentinel_ptr` helpers; sealed `IntoShape`; centralized `validate_dims` at every FFI boundary; `to_vec`/`as_slice` short-circuit on zero-element arrays; `mean_axes`/`max_axes`/`min_axes` route empty-axes through MLX (dtype/zero-size contract); `clip_with_scalar`/`full_like` checked-scalar guard.
+- Entry refcount audit (`docs/audits/send-soundness.md`, local-only) — verified MLX `array_desc_` is a `std::shared_ptr` with an atomic refcount, but per-clone `Send` is unsound because `set_status` mutates non-atomic state through `const`. Final design is `!Send + !Sync`.
+- Adversarial code review on every PR — caught and fixed empty-slice dangling-pointer UB across `slice` / `sum_axes` / `concatenate` / `gather` / `pad` / shape-taking ops; introduced `dim_ptr` / `data_ptr` / per-`Element` `sentinel_ptr` helpers; sealed `IntoShape`; centralized `validate_dims` at every FFI boundary; routed empty-axes reductions through MLX; and added bounded overflow / cap guards on FFI op wrappers that reach unchecked C++ arithmetic.
 
-[0.1.0]: https://github.com/Findit-AI/mlxrs/releases/tag/m1-complete
+[0.1.0]: https://github.com/Findit-AI/mlxrs/releases/tag/v0.1.0
