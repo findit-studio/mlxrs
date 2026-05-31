@@ -197,8 +197,8 @@ pub fn concatenate(arrays: &[&Array], axis: i32) -> Result<Array> {
     return Err(
       crate::error::LAST
         .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend(
-          "mlx_vector_array_new_data returned NULL".into(),
+        .unwrap_or(Error::FfiNullHandle(
+          crate::error::FfiNullHandlePayload::new("mlx_vector_array_new_data"),
         )),
     );
   }
@@ -334,8 +334,8 @@ pub fn stack(arrays: &[&Array]) -> Result<Array> {
     return Err(
       crate::error::LAST
         .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend(
-          "mlx_vector_array_new_data returned NULL".into(),
+        .unwrap_or(Error::FfiNullHandle(
+          crate::error::FfiNullHandlePayload::new("mlx_vector_array_new_data"),
         )),
     );
   }
@@ -371,8 +371,8 @@ pub fn stack_axis(arrays: &[&Array], axis: i32) -> Result<Array> {
     return Err(
       crate::error::LAST
         .with(|c| c.borrow_mut().take())
-        .unwrap_or(Error::Backend(
-          "mlx_vector_array_new_data returned NULL".into(),
+        .unwrap_or(Error::FfiNullHandle(
+          crate::error::FfiNullHandlePayload::new("mlx_vector_array_new_data"),
         )),
     );
   }
