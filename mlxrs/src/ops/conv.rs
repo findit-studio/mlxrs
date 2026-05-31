@@ -10,13 +10,13 @@
 //! Mirrors `mlx.core.{conv1d, conv2d, conv3d, conv_transpose1d,
 //! conv_transpose2d, conv_transpose3d, conv_general}`.
 //!
-//! Soundness: MLX divides by `groups` (`in.shape % groups`) and, for the
-//! forward convolutions, by `stride` (output-shape computation), so a value
-//! below 1 from this safe API would be a C++ integer division by zero. The
-//! wrappers reject non-positive `groups`/`stride` with a typed error first.
-//! [`conv_general`] additionally validates each spatial-parameter slice length,
-//! since MLX broadcasts a length-0/1 slice but indexes a longer one in
-//! `[0, spatial_rank)` — any other length would read past the C++ vector.
+//! Soundness: MLX divides by `groups` (`in.shape % groups`) and by `stride`
+//! (forward output-shape), and computes the channel check and the per-axis
+//! output shape in **int32 before it can raise an error**. So a value below 1,
+//! a mismatched [`conv_general`] slice length, or extreme
+//! `dilation`/`padding`/`stride`/`output_padding`/`groups` would otherwise be a
+//! C++ division-by-zero, out-of-bounds read, or signed-overflow UB reachable
+//! from safe Rust. Each wrapper rejects these with a typed error before the FFI.
 
 use crate::{
   array::Array,
@@ -37,6 +37,106 @@ fn require_positive(context: &'static str, value: i32) -> Result<()> {
   Ok(())
 }
 
+/// Typed error for a convolution whose parameters would overflow MLX's internal
+/// int32 shape arithmetic.
+fn conv_overflow_err(context: &'static str) -> Error {
+  Error::OutOfRange(OutOfRangePayload::new(
+    context,
+    "parameters overflow MLX int32 convolution shape arithmetic",
+    "overflow",
+  ))
+}
+
+/// Verify MLX's int32 convolution shape arithmetic cannot overflow for these
+/// inputs. MLX evaluates the channel check (`groups * C_in_per_group`) and the
+/// per-axis output shape in int32 *before* it can return an error, so without
+/// this a safe call with extreme `dilation`/`padding`/`stride`/`output_padding`/
+/// `groups` would be C++ signed-overflow UB. Spatial parameter slices follow the
+/// MLX broadcast rule: length 0 → the default, length 1 → all axes, else
+/// per-axis. `output_padding = Some` selects the transposed-conv formula (which
+/// multiplies by stride); `None` is the forward formula (whose dilated input
+/// extent uses `input_dilation`, and which divides by `stride` — callers must
+/// ensure `stride >= 1` first, which [`require_positive`] does).
+#[allow(clippy::too_many_arguments)]
+fn check_conv_no_overflow(
+  context: &'static str,
+  input: &Array,
+  weight: &Array,
+  stride: &[i32],
+  pad_lo: &[i32],
+  pad_hi: &[i32],
+  kernel_dilation: &[i32],
+  input_dilation: &[i32],
+  output_padding: Option<&[i32]>,
+  groups: i32,
+) -> Result<()> {
+  fn param(slice: &[i32], axis: usize, default: i32) -> i32 {
+    match slice.len() {
+      0 => default,
+      1 => slice[0],
+      _ => slice[axis],
+    }
+  }
+  let in_shape = input.shape();
+  let wt_shape = weight.shape();
+  // groups * C_in_per_group (the channel-consistency check).
+  if let Some(&channels) = wt_shape.last() {
+    let channels = i32::try_from(channels).map_err(|_| conv_overflow_err(context))?;
+    groups
+      .checked_mul(channels)
+      .ok_or_else(|| conv_overflow_err(context))?;
+  }
+  let nd = in_shape.len();
+  if nd < 2 || wt_shape.len() != nd {
+    // Wrong rank for a convolution — let MLX surface the shape error.
+    return Ok(());
+  }
+  for axis in 0..nd - 2 {
+    let in_d = i32::try_from(in_shape[axis + 1]).map_err(|_| conv_overflow_err(context))?;
+    let wt_d = i32::try_from(wt_shape[axis + 1]).map_err(|_| conv_overflow_err(context))?;
+    let plo = param(pad_lo, axis, 0);
+    let phi = param(pad_hi, axis, 0);
+    // Dilated kernel size: dilation * (kernel - 1) + 1. MLX computes this in
+    // int32, so it must not overflow even before it is combined further.
+    let eff_k = param(kernel_dilation, axis, 1)
+      .checked_mul(wt_d.saturating_sub(1))
+      .and_then(|x| x.checked_add(1))
+      .ok_or_else(|| conv_overflow_err(context))?;
+    match output_padding {
+      None => {
+        // Forward: out = (eff_in + pad_lo + pad_hi - eff_k) / stride + 1,
+        // where eff_in = (in - 1) * input_dilation + 1.
+        let eff_in = in_d
+          .saturating_sub(1)
+          .checked_mul(param(input_dilation, axis, 1))
+          .and_then(|x| x.checked_add(1))
+          .ok_or_else(|| conv_overflow_err(context))?;
+        eff_in
+          .checked_add(plo)
+          .and_then(|x| x.checked_add(phi))
+          .and_then(|x| x.checked_sub(eff_k))
+          .and_then(|x| x.checked_div(param(stride, axis, 1)))
+          .and_then(|x| x.checked_add(1))
+          .ok_or_else(|| conv_overflow_err(context))?;
+      }
+      Some(out_pad) => {
+        // Transpose: out = (in - 1) * stride + eff_k + output_padding
+        //                  - pad_lo - pad_hi   (the formula's trailing +1 and
+        // the eff_k's -1 cancel).
+        in_d
+          .saturating_sub(1)
+          .checked_mul(param(stride, axis, 1))
+          .and_then(|x| x.checked_add(eff_k))
+          .and_then(|x| x.checked_add(param(out_pad, axis, 0)))
+          .and_then(|x| x.checked_sub(plo))
+          .and_then(|x| x.checked_sub(phi))
+          .ok_or_else(|| conv_overflow_err(context))?;
+      }
+    }
+  }
+  Ok(())
+}
+
 /// 1-D convolution. `input` is `(N, L, C_in)`, `weight` is
 /// `(C_out, K, C_in / groups)`; returns `(N, L_out, C_out)`.
 ///
@@ -51,6 +151,18 @@ pub fn conv1d(
 ) -> Result<Array> {
   require_positive("conv1d stride", stride)?;
   require_positive("conv1d groups", groups)?;
+  check_conv_no_overflow(
+    "conv1d",
+    input,
+    weight,
+    &[stride],
+    &[padding],
+    &[padding],
+    &[dilation],
+    &[],
+    None,
+    groups,
+  )?;
   // SAFETY: fresh out-param handle, wrapped in the RAII newtype first so an
   // early return frees it.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
@@ -87,6 +199,18 @@ pub fn conv2d(
   require_positive("conv2d stride", stride.0)?;
   require_positive("conv2d stride", stride.1)?;
   require_positive("conv2d groups", groups)?;
+  check_conv_no_overflow(
+    "conv2d",
+    input,
+    weight,
+    &[stride.0, stride.1],
+    &[padding.0, padding.1],
+    &[padding.0, padding.1],
+    &[dilation.0, dilation.1],
+    &[],
+    None,
+    groups,
+  )?;
   // SAFETY: fresh out-param handle, RAII-wrapped before the populating call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   // SAFETY: borrowed handles live for the call; `out.0` freshly allocated above
@@ -125,6 +249,18 @@ pub fn conv3d(
   require_positive("conv3d stride", stride.1)?;
   require_positive("conv3d stride", stride.2)?;
   require_positive("conv3d groups", groups)?;
+  check_conv_no_overflow(
+    "conv3d",
+    input,
+    weight,
+    &[stride.0, stride.1, stride.2],
+    &[padding.0, padding.1, padding.2],
+    &[padding.0, padding.1, padding.2],
+    &[dilation.0, dilation.1, dilation.2],
+    &[],
+    None,
+    groups,
+  )?;
   // SAFETY: fresh out-param handle, RAII-wrapped before the populating call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   // SAFETY: borrowed handles live for the call; `out.0` freshly allocated above
@@ -164,8 +300,20 @@ pub fn conv_transpose1d(
   groups: i32,
 ) -> Result<Array> {
   // Transposed conv multiplies (does not divide) by stride, so only `groups`
-  // is a division-by-zero risk here.
+  // is a division-by-zero risk here; the overflow check covers the rest.
   require_positive("conv_transpose1d groups", groups)?;
+  check_conv_no_overflow(
+    "conv_transpose1d",
+    input,
+    weight,
+    &[stride],
+    &[padding],
+    &[padding],
+    &[dilation],
+    &[],
+    Some(&[output_padding]),
+    groups,
+  )?;
   // SAFETY: fresh out-param handle, RAII-wrapped before the populating call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   // SAFETY: borrowed handles live for the call; `out.0` freshly allocated above
@@ -199,6 +347,18 @@ pub fn conv_transpose2d(
   groups: i32,
 ) -> Result<Array> {
   require_positive("conv_transpose2d groups", groups)?;
+  check_conv_no_overflow(
+    "conv_transpose2d",
+    input,
+    weight,
+    &[stride.0, stride.1],
+    &[padding.0, padding.1],
+    &[padding.0, padding.1],
+    &[dilation.0, dilation.1],
+    &[],
+    Some(&[output_padding.0, output_padding.1]),
+    groups,
+  )?;
   // SAFETY: fresh out-param handle, RAII-wrapped before the populating call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   // SAFETY: borrowed handles live for the call; `out.0` freshly allocated above
@@ -236,6 +396,18 @@ pub fn conv_transpose3d(
   groups: i32,
 ) -> Result<Array> {
   require_positive("conv_transpose3d groups", groups)?;
+  check_conv_no_overflow(
+    "conv_transpose3d",
+    input,
+    weight,
+    &[stride.0, stride.1, stride.2],
+    &[padding.0, padding.1, padding.2],
+    &[padding.0, padding.1, padding.2],
+    &[dilation.0, dilation.1, dilation.2],
+    &[],
+    Some(&[output_padding.0, output_padding.1, output_padding.2]),
+    groups,
+  )?;
   // SAFETY: fresh out-param handle, RAII-wrapped before the populating call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   // SAFETY: borrowed handles live for the call; `out.0` freshly allocated above
@@ -309,6 +481,18 @@ pub fn conv_general(
   for &s in stride {
     require_positive("conv_general stride", s)?;
   }
+  check_conv_no_overflow(
+    "conv_general",
+    input,
+    weight,
+    stride,
+    padding_lo,
+    padding_hi,
+    kernel_dilation,
+    input_dilation,
+    None,
+    groups,
+  )?;
   // SAFETY: fresh out-param handle, RAII-wrapped before the populating call.
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   // SAFETY: each `as_ptr()`/`len()` pair describes a slice valid for the whole
@@ -446,6 +630,68 @@ mod tests {
     let weight = Array::from_slice::<f32>(&[1.0, 0.0, -1.0], &[1, 3, 1]).unwrap();
     let err = conv_general(&input, &weight, &[1], &[0], &[0], &[1], &[1], 0, false)
       .expect_err("groups=0 must be rejected");
+    assert!(matches!(err, Error::OutOfRange(_)), "got {err:?}");
+  }
+
+  #[test]
+  fn conv1d_rejects_overflowing_dilation() {
+    // dilation * (K - 1) = i32::MAX * 2 overflows MLX's int32 shape arithmetic.
+    let input = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[1, 4, 1]).unwrap();
+    let weight = Array::from_slice::<f32>(&[1.0, 0.0, -1.0], &[1, 3, 1]).unwrap();
+    let err = conv1d(&input, &weight, 1, 0, i32::MAX, 1)
+      .expect_err("overflowing dilation must be rejected");
+    assert!(matches!(err, Error::OutOfRange(_)), "got {err:?}");
+  }
+
+  #[test]
+  fn conv1d_rejects_overflowing_padding() {
+    // in + pad_lo + pad_hi overflows when padding is i32::MAX.
+    let input = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[1, 4, 1]).unwrap();
+    let weight = Array::from_slice::<f32>(&[1.0, 0.0, -1.0], &[1, 3, 1]).unwrap();
+    let err =
+      conv1d(&input, &weight, 1, i32::MAX, 1, 1).expect_err("overflowing padding must be rejected");
+    assert!(matches!(err, Error::OutOfRange(_)), "got {err:?}");
+  }
+
+  #[test]
+  fn conv1d_rejects_overflowing_groups() {
+    // weight C_in_per_group = 2; groups = i32::MAX ⇒ groups * 2 overflows the
+    // channel-consistency check before MLX can raise the channel error.
+    let input = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[1, 2, 2]).unwrap();
+    let weight = Array::from_slice::<f32>(&[1.0, 1.0], &[1, 1, 2]).unwrap();
+    let err =
+      conv1d(&input, &weight, 1, 0, 1, i32::MAX).expect_err("overflowing groups must be rejected");
+    assert!(matches!(err, Error::OutOfRange(_)), "got {err:?}");
+  }
+
+  #[test]
+  fn conv_transpose1d_rejects_overflowing_output_padding() {
+    // (in-1)*stride + dk + output_padding + 1 overflows when output_padding is
+    // i32::MAX.
+    let input = Array::from_slice::<f32>(&[1.0, 2.0], &[1, 2, 1]).unwrap();
+    let weight = Array::from_slice::<f32>(&[1.0, 1.0], &[1, 2, 1]).unwrap();
+    let err = conv_transpose1d(&input, &weight, 1, 0, 1, i32::MAX, 1)
+      .expect_err("overflowing output_padding must be rejected");
+    assert!(matches!(err, Error::OutOfRange(_)), "got {err:?}");
+  }
+
+  #[test]
+  fn conv_general_rejects_overflowing_dilation() {
+    // kernel_dilation * (K - 1) overflows.
+    let input = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[1, 4, 1]).unwrap();
+    let weight = Array::from_slice::<f32>(&[1.0, 0.0, -1.0], &[1, 3, 1]).unwrap();
+    let err = conv_general(
+      &input,
+      &weight,
+      &[1],
+      &[0],
+      &[0],
+      &[i32::MAX],
+      &[1],
+      1,
+      false,
+    )
+    .expect_err("overflowing kernel_dilation must be rejected");
     assert!(matches!(err, Error::OutOfRange(_)), "got {err:?}");
   }
 }
