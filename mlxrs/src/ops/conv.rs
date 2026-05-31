@@ -153,6 +153,58 @@ fn check_conv_no_overflow(
     fits(context, numer / strd + 1)?;
     Ok(())
   }
+  // conv_transpose_general prelude for one axis. Returns the (padding_lo,
+  // padding_hi) it derives and feeds into the nested forward conv_general.
+  fn check_transpose_prelude_axis(
+    context: &'static str,
+    in_d: i128,
+    wt_d: i128,
+    pad: i128,
+    dil: i128,
+    strd: i128,
+    op: i128,
+  ) -> Result<(i128, i128)> {
+    let dwt = dil * (wt_d - 1);
+    fits(context, dwt)?;
+    let wt_size = dwt + 1;
+    fits(context, wt_size)?;
+    let t = wt_size - pad;
+    fits(context, t)?;
+    let padding_lo = t - 1;
+    fits(context, padding_lo)?;
+    let t = (in_d - 1) * strd;
+    fits(context, t)?;
+    let two_pad = 2 * pad;
+    fits(context, two_pad)?;
+    let t = t - two_pad;
+    fits(context, t)?;
+    let t = t + dwt; // + dil * (wt - 1)
+    fits(context, t)?;
+    let conv_output_shape = t + 1;
+    fits(context, conv_output_shape)?;
+    let t = strd * (in_d - 1);
+    fits(context, t)?;
+    let out_size = t + 1;
+    fits(context, out_size)?;
+    let t = conv_output_shape - out_size; // in_size == conv_output_shape
+    fits(context, t)?;
+    let t = t + pad;
+    fits(context, t)?;
+    let padding_hi = t + op;
+    fits(context, padding_hi)?;
+    Ok((padding_lo, padding_hi))
+  }
+  // When negative padding triggers MLX's `slice`, `normalize_slice` runs over
+  // EVERY dimension (batch/channel too, not just spatial) computing
+  // `(ed - st + stride - 1)`; for the conv slice (stride 1) the intermediate is
+  // `dim + 1`, which overflows iff a dimension is i32::MAX. Reject that.
+  fn check_slice_all_dims(context: &'static str, shape: &[usize]) -> Result<()> {
+    for &d in shape {
+      let d = i128::from(i32::try_from(d).map_err(|_| conv_overflow_err(context))?);
+      fits(context, d + 1)?;
+    }
+    Ok(())
+  }
   let in_shape = input.shape();
   let wt_shape = weight.shape();
   // run_conv_checks: groups * C_in_per_group.
@@ -161,58 +213,61 @@ fn check_conv_no_overflow(
     fits(context, groups as i128 * channels as i128)?;
   }
   let nd = in_shape.len();
-  if nd < 2 || wt_shape.len() != nd {
-    // Wrong rank for a convolution — let MLX surface the shape error.
-    return Ok(());
-  }
-  for axis in 0..nd - 2 {
-    let in_d =
-      i128::from(i32::try_from(in_shape[axis + 1]).map_err(|_| conv_overflow_err(context))?);
-    let wt_d =
-      i128::from(i32::try_from(wt_shape[axis + 1]).map_err(|_| conv_overflow_err(context))?);
-    let plo = i128::from(param(pad_lo, axis, 0));
-    let phi = i128::from(param(pad_hi, axis, 0));
-    let dil = i128::from(param(kernel_dilation, axis, 1));
-    let strd = i128::from(param(stride, axis, 1));
-    match output_padding {
-      None => {
+  match output_padding {
+    None => {
+      // MLX's forward conv_general rejects an invalid rank before any per-axis
+      // arithmetic, so only a valid rank can overflow here.
+      if nd < 2 || wt_shape.len() != nd {
+        return Ok(());
+      }
+      // Negative padding on any spatial axis makes MLX slice every dimension.
+      if (0..nd - 2).any(|i| param(pad_lo, i, 0) < 0 || param(pad_hi, i, 0) < 0) {
+        check_slice_all_dims(context, &in_shape)?;
+      }
+      for axis in 0..nd - 2 {
+        let in_d =
+          i128::from(i32::try_from(in_shape[axis + 1]).map_err(|_| conv_overflow_err(context))?);
+        let wt_d =
+          i128::from(i32::try_from(wt_shape[axis + 1]).map_err(|_| conv_overflow_err(context))?);
+        let plo = i128::from(param(pad_lo, axis, 0));
+        let phi = i128::from(param(pad_hi, axis, 0));
+        let dil = i128::from(param(kernel_dilation, axis, 1));
         let idil = i128::from(param(input_dilation, axis, 1));
+        let strd = i128::from(param(stride, axis, 1));
         check_forward_axis(context, in_d, wt_d, plo, phi, dil, idil, strd)?;
       }
-      Some(out_pad) => {
-        // conv_transpose_general prelude (padding symmetric, so pad == pad_lo).
-        let pad = plo;
-        let op = i128::from(param(out_pad, axis, 0));
-        let dwt = dil * (wt_d - 1);
-        fits(context, dwt)?;
-        let wt_size = dwt + 1;
-        fits(context, wt_size)?;
-        let t = wt_size - pad;
-        fits(context, t)?;
-        let padding_lo = t - 1;
-        fits(context, padding_lo)?;
-        let t = (in_d - 1) * strd;
-        fits(context, t)?;
-        let two_pad = 2 * pad;
-        fits(context, two_pad)?;
-        let t = t - two_pad;
-        fits(context, t)?;
-        let t = t + dwt; // + dil * (wt - 1)
-        fits(context, t)?;
-        let conv_output_shape = t + 1;
-        fits(context, conv_output_shape)?;
-        let t = strd * (in_d - 1);
-        fits(context, t)?;
-        let out_size = t + 1;
-        fits(context, out_size)?;
-        let t = conv_output_shape - out_size; // in_size == conv_output_shape
-        fits(context, t)?;
-        let t = t + pad;
-        fits(context, t)?;
-        let padding_hi = t + op;
-        fits(context, padding_hi)?;
-        // Nested conv_general (forward; stride 1, input_dilation = stride).
-        check_forward_axis(context, in_d, wt_d, padding_lo, padding_hi, dil, strd, 1)?;
+    }
+    Some(out_pad) => {
+      // MLX's conv_transpose_general runs its prelude over the wrapper arity
+      // BEFORE the nested conv_general's rank check, so check the prelude over
+      // every axis whose dimensions exist, regardless of rank validity.
+      let arity = stride.len();
+      let rank_valid = wt_shape.len() == nd && nd == arity + 2;
+      let mut nested_has_neg = false;
+      for i in 0..arity {
+        if 1 + i >= in_shape.len() || 1 + i >= wt_shape.len() {
+          continue; // dimension absent → MLX raises a rank error, not UB
+        }
+        let in_d =
+          i128::from(i32::try_from(in_shape[1 + i]).map_err(|_| conv_overflow_err(context))?);
+        let wt_d =
+          i128::from(i32::try_from(wt_shape[1 + i]).map_err(|_| conv_overflow_err(context))?);
+        let pad = i128::from(param(pad_lo, i, 0));
+        let dil = i128::from(param(kernel_dilation, i, 1));
+        let strd = i128::from(param(stride, i, 1));
+        let op = i128::from(param(out_pad, i, 0));
+        let (padding_lo, padding_hi) =
+          check_transpose_prelude_axis(context, in_d, wt_d, pad, dil, strd, op)?;
+        if padding_lo < 0 || padding_hi < 0 {
+          nested_has_neg = true;
+        }
+        if rank_valid {
+          // Nested conv_general (forward; stride 1, input_dilation = stride).
+          check_forward_axis(context, in_d, wt_d, padding_lo, padding_hi, dil, strd, 1)?;
+        }
+      }
+      if rank_valid && nested_has_neg {
+        check_slice_all_dims(context, &in_shape)?;
       }
     }
   }
@@ -847,5 +902,31 @@ mod tests {
     )
     .expect("valid negative-padding crop must not be falsely rejected");
     assert_eq!(out.shape(), vec![1, 1, 1]);
+  }
+
+  #[test]
+  fn conv_transpose1d_rejects_rank_invalid_prelude_overflow() {
+    // Rank-2 input/weight is invalid for conv_transpose1d, but MLX runs its
+    // prelude (1 + dilation*(weight.shape(1)-1)) over the wrapper arity BEFORE
+    // rejecting the rank, so dilation=i32::MAX overflows first. The guard must
+    // check the prelude regardless of rank (Codex round-5 counterexample).
+    let input = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[1, 3]).unwrap();
+    let weight = Array::from_slice::<f32>(&[1.0, 1.0, 1.0], &[1, 3]).unwrap();
+    let err = conv_transpose1d(&input, &weight, 1, 0, i32::MAX, 0, 1)
+      .expect_err("rank-invalid transpose prelude overflow must be rejected");
+    assert!(matches!(err, Error::OutOfRange(_)), "got {err:?}");
+  }
+
+  #[test]
+  fn conv_general_rejects_slice_overflow_on_huge_dim() {
+    // A lazy array can carry an i32::MAX-length axis without allocating. Negative
+    // padding makes MLX slice EVERY dimension, computing `dim + 1`, which
+    // overflows for the i32::MAX batch axis. The guard must reject before the FFI
+    // (Codex round-5 counterexample).
+    let input = Array::zeros::<f32>(&[i32::MAX, 2, 1]).unwrap();
+    let weight = Array::from_slice::<f32>(&[1.0], &[1, 1, 1]).unwrap();
+    let err = conv_general(&input, &weight, &[1], &[0], &[-1], &[1], &[1], 1, false)
+      .expect_err("i32::MAX dim + negative-padding slice overflow must be rejected");
+    assert!(matches!(err, Error::OutOfRange(_)), "got {err:?}");
   }
 }
