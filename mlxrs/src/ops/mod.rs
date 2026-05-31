@@ -3,6 +3,7 @@
 
 pub mod arithmetic;
 pub mod comparison;
+pub mod conv;
 pub mod fast;
 pub mod fft;
 pub mod indexing;
