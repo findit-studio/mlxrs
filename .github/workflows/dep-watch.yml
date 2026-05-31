@@ -66,8 +66,18 @@ jobs:
       - name: cargo build --workspace
         run: cargo build --workspace
 
-      - name: cargo test --workspace
-        run: cargo test --workspace
+      # Skip `into_shape_is_sealed` (mlxrs/tests/thread_safety.rs) — the lone
+      # remaining trybuild UI test. trybuild compares the EXACT rustc
+      # diagnostic text, which drifts with every `rustup update nightly` this
+      # job runs; that is toolchain-diagnostic noise, NOT the dependency-API
+      # breakage this canary exists to catch, and it was the sole cause of the
+      # #237 false positive (the real tests in that run all passed). The
+      # `IntoShape` sealing is structurally enforced by the crate-private
+      # `Sealed` supertrait, and the snapshot is still exercised + maintained
+      # against the PR toolchain in mlxrs.yml. (The earlier no_send/no_sync UI
+      # tests were dropped outright for the same brittleness.)
+      - name: cargo test --workspace (skip toolchain-pinned UI snapshot)
+        run: cargo test --workspace -- --skip into_shape_is_sealed
 
       - name: On failure, manage tracking issue
         if: failure() && github.event_name == 'schedule'
