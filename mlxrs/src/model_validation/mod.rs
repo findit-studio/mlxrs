@@ -319,15 +319,19 @@ pub fn require_cardinality(field: &'static str, count: i64, max_cap: u64) -> Res
 ///
 /// Returns [`Error::DivisibilityConstraint`] naming both operands and their
 /// values when `a` is not a multiple of `b`. A **zero or negative divisor** is
-/// rejected first as [`Error::OutOfRange`] (a `% 0` would panic), so this is
-/// safe on an unvalidated config pair. Mirrors LFM2's `head_dim` / GQA-grouping
-/// divisibility gates.
+/// rejected first as [`Error::OutOfRange`] (a `% 0` would panic), and a
+/// **negative dividend** is likewise rejected as [`Error::OutOfRange`] (the
+/// dividend is a config dimension, non-negative by construction, and would
+/// otherwise be misreported as a huge `u64` in the constraint payload), so this
+/// is safe on an unvalidated config pair. Mirrors LFM2's `head_dim` /
+/// GQA-grouping divisibility gates.
 ///
 /// ```
 /// use mlxrs::model_validation::require_divisible;
 /// assert!(require_divisible("hidden_size", 768, "num_heads", 12).is_ok());
 /// assert!(require_divisible("hidden_size", 768, "num_heads", 5).is_err());
 /// assert!(require_divisible("hidden_size", 768, "num_heads", 0).is_err());
+/// assert!(require_divisible("hidden_size", -768, "num_heads", 12).is_err());
 /// ```
 pub fn require_divisible(a_name: &'static str, a: i32, b_name: &'static str, b: i32) -> Result<()> {
   if b <= 0 {
@@ -337,6 +341,7 @@ pub fn require_divisible(a_name: &'static str, a: i32, b_name: &'static str, b: 
       format_smolstr!("{b}"),
     )));
   }
+  require_non_negative_operand(a_name, a)?;
   if a % b != 0 {
     return Err(Error::DivisibilityConstraint(
       DivisibilityConstraintPayload::new(
@@ -386,6 +391,25 @@ pub fn require_even(field: &'static str, value: i32) -> Result<()> {
 // `adjusted_ff_dim` checked-step arithmetic and Wav2Vec2's
 // `num_heads * head_dim` guard.
 
+/// Reject a negative operand before it reaches a `u64` error payload.
+///
+/// The overflow / divisibility payloads carry their operands as `u64`, so a
+/// negative `i32` would be reported as its huge two's-complement value
+/// (`i32::MIN` → `4294967296`-ish). These helpers operate on config
+/// dimensions / counts, which are non-negative by construction, so a negative
+/// operand is itself out of range and is rejected as [`Error::OutOfRange`]
+/// (carrying the true signed value) before any payload is built.
+fn require_non_negative_operand(name: &'static str, value: i32) -> Result<()> {
+  if value < 0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      name,
+      "must be a non-negative dimension (>= 0)",
+      format_smolstr!("{value}"),
+    )));
+  }
+  Ok(())
+}
+
 /// Multiply two config-derived `i32` dimensions, returning
 /// [`Error::ArithmeticOverflow`] on overflow.
 ///
@@ -393,10 +417,16 @@ pub fn require_even(field: &'static str, value: i32) -> Result<()> {
 /// `b_name` label the operands so the overflow payload carries the runtime
 /// values. The non-overflow result is the exact `i32` product.
 ///
+/// Operands are config dimensions and must be **non-negative**: a negative
+/// operand is rejected as [`Error::OutOfRange`] (naming it and its true value)
+/// before any overflow check, so the overflow payload's `u64` operands always
+/// hold the real values.
+///
 /// ```
 /// use mlxrs::model_validation::checked_mul;
 /// assert_eq!(checked_mul("embed", "heads", 12, "head_dim", 64).unwrap(), 768);
 /// assert!(checked_mul("embed", "heads", i32::MAX, "head_dim", 2).is_err());
+/// assert!(checked_mul("embed", "heads", -1, "head_dim", 64).is_err());
 /// ```
 pub fn checked_mul(
   context: &'static str,
@@ -405,6 +435,8 @@ pub fn checked_mul(
   b_name: &'static str,
   b: i32,
 ) -> Result<i32> {
+  require_non_negative_operand(a_name, a)?;
+  require_non_negative_operand(b_name, b)?;
   a.checked_mul(b).ok_or_else(|| {
     Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
       context,
@@ -418,12 +450,16 @@ pub fn checked_mul(
 /// [`Error::ArithmeticOverflow`] on overflow.
 ///
 /// The additive companion to [`checked_mul`] — e.g. for `vocab_size +
-/// num_added_tokens` or an accumulated sequence offset.
+/// num_added_tokens` or an accumulated sequence offset. Both operands are
+/// non-negative dimensions; a negative one is rejected as
+/// [`Error::OutOfRange`] before the overflow check (same rationale as
+/// [`checked_mul`]).
 ///
 /// ```
 /// use mlxrs::model_validation::checked_add;
 /// assert_eq!(checked_add("vocab", "base", 32000, "added", 100).unwrap(), 32100);
 /// assert!(checked_add("vocab", "base", i32::MAX, "added", 1).is_err());
+/// assert!(checked_add("vocab", "base", i32::MIN, "added", 0).is_err());
 /// ```
 pub fn checked_add(
   context: &'static str,
@@ -432,6 +468,8 @@ pub fn checked_add(
   b_name: &'static str,
   b: i32,
 ) -> Result<i32> {
+  require_non_negative_operand(a_name, a)?;
+  require_non_negative_operand(b_name, b)?;
   a.checked_add(b).ok_or_else(|| {
     Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
       context,
@@ -518,6 +556,13 @@ where
 ///
 /// On collision the existing entry is left untouched and `value` is dropped.
 ///
+/// Allocation-disciplined like the rest of the toolkit: the duplicate is
+/// detected with a non-allocating membership check (so a collision never grows
+/// the map), and the vacant path **fallibly reserves** one slot via
+/// `HashMap::try_reserve` — mapped to [`Error::AllocFailure`] — *before* the
+/// insert, so a sanitize pass with many unique rewritten keys recovers
+/// gracefully on allocator failure instead of aborting on `HashMap` growth.
+///
 /// ```
 /// use std::collections::HashMap;
 /// use mlxrs::model_validation::insert_unique;
@@ -532,15 +577,23 @@ pub fn insert_unique<V>(
   value: V,
   context: &'static str,
 ) -> Result<()> {
-  match map.entry(key) {
-    std::collections::hash_map::Entry::Occupied(e) => Err(Error::KeyCollision(
-      KeyCollisionPayload::new(context, e.key().as_str()),
-    )),
-    std::collections::hash_map::Entry::Vacant(e) => {
-      e.insert(value);
-      Ok(())
-    }
+  // Detect the duplicate WITHOUT allocating: a collision must not grow the map.
+  if map.contains_key(&key) {
+    return Err(Error::KeyCollision(KeyCollisionPayload::new(context, key)));
   }
+  // Vacant path: reserve the one slot fallibly so a map-growth allocator
+  // failure surfaces as a typed `AllocFailure` instead of aborting. After a
+  // successful `try_reserve(1)` the new-key `insert` cannot reallocate.
+  map.try_reserve(1).map_err(|e| {
+    Error::AllocFailure(AllocFailurePayload::new(
+      "model_validation::insert_unique",
+      context,
+      1,
+      e,
+    ))
+  })?;
+  map.insert(key, value);
+  Ok(())
 }
 
 // ════════════════════════ 6. config-gated optional weight ══════════════════

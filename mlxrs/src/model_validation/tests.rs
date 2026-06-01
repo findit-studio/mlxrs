@@ -216,6 +216,19 @@ fn require_divisible_accepts_multiple_rejects_remainder_and_bad_divisor() {
       other => panic!("expected OutOfRange for divisor {bad}, got {other:?}"),
     }
   }
+
+  // a negative dividend (with a valid divisor) is rejected as OutOfRange naming
+  // the dividend and carrying its TRUE value — not misreported as a huge `u64`
+  // in a DivisibilityConstraint payload.
+  for bad in [-768, i32::MIN] {
+    match require_divisible("hidden_size", bad, "num_heads", 12).unwrap_err() {
+      Error::OutOfRange(p) => {
+        assert_eq!(p.context(), "hidden_size");
+        assert!(p.value().contains(&bad.to_string()), "got {}", p.value());
+      }
+      other => panic!("expected OutOfRange for dividend {bad}, got {other:?}"),
+    }
+  }
 }
 
 #[test]
@@ -244,7 +257,6 @@ fn checked_mul_returns_product_or_overflow() {
     768
   );
   assert_eq!(checked_mul("z", "a", 0, "b", i32::MAX).unwrap(), 0);
-  assert_eq!(checked_mul("neg", "a", -2, "b", 3).unwrap(), -6);
 
   match checked_mul("embed", "heads", i32::MAX, "head_dim", 2).unwrap_err() {
     Error::ArithmeticOverflow(p) => {
@@ -261,6 +273,36 @@ fn checked_mul_returns_product_or_overflow() {
 }
 
 #[test]
+fn checked_mul_rejects_negative_operands_before_overflow() {
+  // A negative operand is a non-negative-dimension violation, rejected as
+  // OutOfRange naming the operand — NOT reported as a wrapped `u64` overflow.
+  match checked_mul("embed", "heads", -1, "head_dim", 64).unwrap_err() {
+    Error::OutOfRange(p) => {
+      assert_eq!(p.context(), "heads");
+      assert!(p.value().contains("-1"), "got {}", p.value());
+    }
+    other => panic!("expected OutOfRange for negative a, got {other:?}"),
+  }
+  // `i32::MIN` must surface its TRUE value, not the two's-complement `u64`.
+  match checked_mul("embed", "heads", i32::MIN, "head_dim", 2).unwrap_err() {
+    Error::OutOfRange(p) => {
+      assert_eq!(p.context(), "heads");
+      assert!(
+        p.value().contains(&i32::MIN.to_string()),
+        "got {}",
+        p.value()
+      );
+    }
+    other => panic!("expected OutOfRange for i32::MIN, got {other:?}"),
+  }
+  // A negative second operand is rejected naming `b`.
+  match checked_mul("embed", "heads", 12, "head_dim", -64).unwrap_err() {
+    Error::OutOfRange(p) => assert_eq!(p.context(), "head_dim"),
+    other => panic!("expected OutOfRange for negative b, got {other:?}"),
+  }
+}
+
+#[test]
 fn checked_add_returns_sum_or_overflow() {
   assert_eq!(
     checked_add("vocab", "base", 32000, "added", 100).unwrap(),
@@ -273,8 +315,27 @@ fn checked_add_returns_sum_or_overflow() {
     }
     other => panic!("expected ArithmeticOverflow, got {other:?}"),
   }
-  // negative-side overflow is caught too
-  assert!(checked_add("x", "a", i32::MIN, "b", -1).is_err());
+}
+
+#[test]
+fn checked_add_rejects_negative_operands() {
+  // `i32::MIN` operand → OutOfRange carrying its true value (not a wrapped u64).
+  match checked_add("vocab", "base", i32::MIN, "added", 0).unwrap_err() {
+    Error::OutOfRange(p) => {
+      assert_eq!(p.context(), "base");
+      assert!(
+        p.value().contains(&i32::MIN.to_string()),
+        "got {}",
+        p.value()
+      );
+    }
+    other => panic!("expected OutOfRange for i32::MIN, got {other:?}"),
+  }
+  // A negative second operand is rejected naming `added`, before any overflow.
+  match checked_add("vocab", "base", 32000, "added", -1).unwrap_err() {
+    Error::OutOfRange(p) => assert_eq!(p.context(), "added"),
+    other => panic!("expected OutOfRange for negative b, got {other:?}"),
+  }
 }
 
 // ─────────────────────────── 4. fallible allocation ────────────────────────
@@ -329,6 +390,30 @@ fn insert_unique_inserts_first_rejects_duplicate() {
   // the original value is preserved; the colliding value is dropped
   assert_eq!(m["encoder.weight"], 1);
   assert_eq!(m.len(), 2);
+}
+
+#[test]
+fn insert_unique_reserves_on_vacant_path_and_not_on_collision() {
+  // Many unique rewritten keys drive the fallible reserve-then-insert path:
+  // each vacant insert `try_reserve(1)`s before inserting, so capacity grows
+  // to fit and every value lands.
+  let mut m: HashMap<String, u32> = HashMap::new();
+  for i in 0..64u32 {
+    assert!(insert_unique(&mut m, format!("layers.{i}.weight"), i, "sanitize").is_ok());
+  }
+  assert_eq!(m.len(), 64);
+  assert!(m.capacity() >= 64);
+  assert_eq!(m["layers.63.weight"], 63);
+
+  // A collision is detected WITHOUT allocating: re-inserting an existing key
+  // must neither grow capacity nor change length (the membership check short-
+  // circuits before any `try_reserve`).
+  let cap_before = m.capacity();
+  let len_before = m.len();
+  assert!(insert_unique(&mut m, "layers.0.weight".to_string(), 999, "sanitize").is_err());
+  assert_eq!(m.capacity(), cap_before, "collision path must not reserve");
+  assert_eq!(m.len(), len_before);
+  assert_eq!(m["layers.0.weight"], 0); // original survives
 }
 
 // ──────────────────── 6. config-gated optional weight ──────────────────────
