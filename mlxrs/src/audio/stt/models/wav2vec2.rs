@@ -38,11 +38,15 @@ use crate::{
   error::{
     CapExceededPayload, Error, InvariantViolationPayload, LengthMismatchPayload,
     MalformedDataPayload, MissingKeyPayload, OutOfRangePayload, ParsePayload, RankMismatchPayload,
-    Result, UnknownEnumValuePayload,
+    Result,
   },
   lm::nn::{
     attention::{Mask, scaled_dot_product_attention},
     norm::{GroupNorm, LayerNorm},
+  },
+  model_validation::{
+    checked_mul, insert_unique, pin_bool, pin_f64, pin_i32, pin_i32_slice, pin_str,
+    require_divisible, require_positive,
   },
   ops,
 };
@@ -88,6 +92,11 @@ pub struct Wav2Vec2Config {
   /// only scheme this port supports — see [`Wav2Vec2Config::is_group_norm`]).
   #[serde(default = "default_feat_extract_norm")]
   pub feat_extract_norm: String,
+  /// Hidden activation. `base-960h` is `"gelu"` — the only activation this
+  /// port wires (every block hardcodes GELU), so a deviating value is
+  /// rejected by [`Wav2Vec2Config::validate`].
+  #[serde(default = "default_hidden_act")]
+  pub hidden_act: String,
   /// Per-conv-layer output channel widths (length `num_feat_extract_layers`).
   #[serde(default = "default_conv_dim")]
   pub conv_dim: Vec<i32>,
@@ -151,6 +160,10 @@ fn default_feat_extract_norm() -> String {
   "group".to_string()
 }
 #[cfg(feature = "wav2vec2")]
+fn default_hidden_act() -> String {
+  "gelu".to_string()
+}
+#[cfg(feature = "wav2vec2")]
 fn default_conv_dim() -> Vec<i32> {
   vec![512, 512, 512, 512, 512, 512, 512]
 }
@@ -190,6 +203,10 @@ fn default_num_feat_extract_layers() -> i32 {
 // against the two drifting.
 #[cfg(feature = "wav2vec2")]
 const BASE_960H_MODEL_TYPE: &str = "wav2vec2";
+#[cfg(feature = "wav2vec2")]
+const BASE_960H_HIDDEN_ACT: &str = "gelu";
+#[cfg(feature = "wav2vec2")]
+const BASE_960H_LAYER_NORM_EPS: f32 = 1e-5;
 #[cfg(feature = "wav2vec2")]
 const BASE_960H_VOCAB_SIZE: i32 = 32;
 #[cfg(feature = "wav2vec2")]
@@ -282,96 +299,103 @@ impl Wav2Vec2Config {
   ///   corrupt `num_hidden_layers` can never reach the per-layer allocation
   ///   loop).
   pub fn validate(&self) -> Result<()> {
-    if !self.is_group_norm() {
-      return Err(Error::UnknownEnumValue(UnknownEnumValuePayload::new(
-        "Wav2Vec2Config: feat_extract_norm",
-        self.feat_extract_norm.as_str(),
-        &["group"],
-      )));
-    }
-    if self.do_stable_layer_norm {
-      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
-        "Wav2Vec2Config: do_stable_layer_norm",
-        "must be false (only the base-960h post-norm arm is supported)",
-      )));
-    }
+    // Feature-encoder normalization scheme: only the group-norm arm is wired.
+    pin_str(
+      "Wav2Vec2Config: feat_extract_norm",
+      self.feat_extract_norm.as_str(),
+      &["group"],
+    )?;
+    // Hidden activation: every block hardcodes GELU, so a deviating value
+    // would run a different (unsupported) graph silently.
+    pin_str(
+      "Wav2Vec2Config: hidden_act",
+      self.hidden_act.as_str(),
+      &[BASE_960H_HIDDEN_ACT],
+    )?;
+    // Only the base-960h post-norm arm is wired.
+    pin_bool(
+      "Wav2Vec2Config: do_stable_layer_norm",
+      self.do_stable_layer_norm,
+      false,
+    )?;
     // `ConvLayer` has no bias field and `forward` calls `conv1d` without
     // adding one, so a `conv_bias == true` checkpoint would load (the bias
     // tensors becoming unconsumed, silently-dropped keys) and run wrong.
-    if self.conv_bias {
-      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
-        "Wav2Vec2Config: conv_bias",
-        "must be false (the base-960h feature-encoder convolutions are bias-free; this port adds no conv bias)",
-      )));
-    }
-    if self.model_type != BASE_960H_MODEL_TYPE {
-      return Err(Error::UnknownEnumValue(UnknownEnumValuePayload::new(
-        "Wav2Vec2Config: model_type",
-        self.model_type.as_str(),
-        &["wav2vec2"],
-      )));
-    }
+    pin_bool("Wav2Vec2Config: conv_bias", self.conv_bias, false)?;
+    pin_str(
+      "Wav2Vec2Config: model_type",
+      self.model_type.as_str(),
+      &[BASE_960H_MODEL_TYPE],
+    )?;
     // Architecture-defining scalars: the port builds exactly the base-960h
     // graph and reads weight shapes from the checkpoint, so any deviation is a
     // different (unsupported) architecture. Pinning the *counts*
     // (num_hidden_layers / num_feat_extract_layers) to their exact value also
     // bounds them, so an oversized count is rejected here, before the
     // per-layer allocation loops in the builders.
-    check_eq_i32(
+    pin_i32(
       "Wav2Vec2Config: hidden_size",
       self.hidden_size,
       BASE_960H_HIDDEN_SIZE,
     )?;
-    check_eq_i32(
+    pin_i32(
       "Wav2Vec2Config: num_hidden_layers",
       self.num_hidden_layers,
       BASE_960H_NUM_HIDDEN_LAYERS,
     )?;
-    check_eq_i32(
+    pin_i32(
       "Wav2Vec2Config: num_attention_heads",
       self.num_attention_heads,
       BASE_960H_NUM_ATTENTION_HEADS,
     )?;
-    check_eq_i32(
+    pin_i32(
       "Wav2Vec2Config: intermediate_size",
       self.intermediate_size,
       BASE_960H_INTERMEDIATE_SIZE,
     )?;
-    check_eq_i32(
+    pin_i32(
       "Wav2Vec2Config: vocab_size",
       self.vocab_size,
       BASE_960H_VOCAB_SIZE,
     )?;
-    check_eq_i32(
+    pin_i32(
       "Wav2Vec2Config: num_conv_pos_embeddings",
       self.num_conv_pos_embeddings,
       BASE_960H_NUM_CONV_POS_EMBEDDINGS,
     )?;
-    check_eq_i32(
+    pin_i32(
       "Wav2Vec2Config: num_conv_pos_embedding_groups",
       self.num_conv_pos_embedding_groups,
       BASE_960H_NUM_CONV_POS_EMBEDDING_GROUPS,
     )?;
-    check_eq_i32(
+    pin_i32(
       "Wav2Vec2Config: num_feat_extract_layers",
       self.num_feat_extract_layers,
       BASE_960H_NUM_FEAT_EXTRACT_LAYERS,
+    )?;
+    // `eps` shared by every LayerNorm and the L0 GroupNorm: a deviating value
+    // silently runs a numerically different graph. Compared in f64 (the f32
+    // field widened losslessly against the same-widened reference constant).
+    pin_f64(
+      "Wav2Vec2Config: layer_norm_eps",
+      f64::from(self.layer_norm_eps),
+      f64::from(BASE_960H_LAYER_NORM_EPS),
     )?;
     // The conv stack arrays: pin each to the base-960h shape/values. (Only
     // `conv_dim[0]` and `conv_stride[i]` are actually consumed by the port —
     // `conv_kernel` is implied by each checkpoint tensor — but a deviation in
     // any of the three is a different architecture, so all three are pinned.)
-    check_eq_conv_array(
+    pin_i32_slice(
       "Wav2Vec2Config: conv_dim",
       &self.conv_dim,
       &BASE_960H_CONV_DIM,
     )?;
-    check_eq_conv_array(
+    pin_i32_slice(
       "Wav2Vec2Config: conv_stride",
       &self.conv_stride,
       &BASE_960H_CONV_STRIDE,
     )?;
-    check_eq_conv_array(
+    pin_i32_slice(
       "Wav2Vec2Config: conv_kernel",
       &self.conv_kernel,
       &BASE_960H_CONV_KERNEL,
@@ -381,62 +405,18 @@ impl Wav2Vec2Config {
 
   /// Per-head dimension `hidden_size / num_attention_heads`.
   fn head_dim(&self) -> Result<i32> {
-    if self.num_attention_heads <= 0 {
-      return Err(Error::OutOfRange(OutOfRangePayload::new(
-        "Wav2Vec2Config: num_attention_heads",
-        "must be positive (> 0)",
-        format_smolstr!("{}", self.num_attention_heads),
-      )));
-    }
-    if self.hidden_size % self.num_attention_heads != 0 {
-      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
-        "Wav2Vec2Config: hidden_size / num_attention_heads",
-        "hidden_size must be divisible by num_attention_heads",
-      )));
-    }
+    require_positive(
+      "Wav2Vec2Config: num_attention_heads",
+      self.num_attention_heads,
+    )?;
+    require_divisible(
+      "Wav2Vec2Config: hidden_size",
+      self.hidden_size,
+      "Wav2Vec2Config: num_attention_heads",
+      self.num_attention_heads,
+    )?;
     Ok(self.hidden_size / self.num_attention_heads)
   }
-}
-
-/// Reject a scalar config field whose value deviates from the single
-/// architecture this port implements, naming the field, the offending value,
-/// and the required base-960h value. Used by [`Wav2Vec2Config::validate`] to
-/// pin every architecture-defining scalar.
-#[cfg(feature = "wav2vec2")]
-fn check_eq_i32(field: &'static str, actual: i32, expected: i32) -> Result<()> {
-  if actual != expected {
-    return Err(Error::OutOfRange(OutOfRangePayload::new(
-      field,
-      "must match the base-960h architecture (this port supports only facebook/wav2vec2-base-960h)",
-      format_smolstr!("{actual} (expected {expected})"),
-    )));
-  }
-  Ok(())
-}
-
-/// Reject a conv-stack array (`conv_dim` / `conv_stride` / `conv_kernel`) that
-/// deviates from base-960h: a wrong length is [`Error::LengthMismatch`]; the
-/// first deviating element is [`Error::OutOfRange`] naming its index, value,
-/// and the expected value. Used by [`Wav2Vec2Config::validate`].
-#[cfg(feature = "wav2vec2")]
-fn check_eq_conv_array(field: &'static str, actual: &[i32], expected: &[i32]) -> Result<()> {
-  if actual.len() != expected.len() {
-    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
-      field,
-      expected.len(),
-      actual.len(),
-    )));
-  }
-  for (i, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
-    if a != e {
-      return Err(Error::OutOfRange(OutOfRangePayload::new(
-        field,
-        "must match the base-960h architecture (this port supports only facebook/wav2vec2-base-960h)",
-        format_smolstr!("element {i} = {a} (expected {e})"),
-      )));
-    }
-  }
-  Ok(())
 }
 
 // ───────────────────────────── sanitize ─────────────────────────────
@@ -460,6 +440,13 @@ fn check_eq_conv_array(field: &'static str, actual: &[i32], expected: &[i32]) ->
 ///    `masked_spec_embed`.
 /// 5. **Keep** `lm_head.*` — the CTC head (the backbone's own `sanitize`
 ///    drops it; this composed model needs it).
+/// 6. **Reject a duplicate** destination key with [`Error::KeyCollision`]
+///    (via [`crate::model_validation::insert_unique`]) rather than silently
+///    overwriting — e.g. a checkpoint carrying both the prefixed and
+///    unprefixed form of a key (rule 1), or both
+///    `parametrizations.weight.original0` and a legacy `weight_g` (rule 3),
+///    which would otherwise let an arbitrary (per-run nondeterministic)
+///    survivor win since the source is a `HashMap`.
 ///
 /// [san]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/mms/mms.py#L107-L128
 /// [san-bb]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/wav2vec/wav2vec.py#L723
@@ -493,7 +480,14 @@ pub fn sanitize(weights: HashMap<String, Array>) -> Result<HashMap<String, Array
       continue;
     }
 
-    out.insert(k, v);
+    // 6. Insert, rejecting a duplicate destination key with a typed error
+    //    rather than letting an arbitrary survivor silently overwrite the
+    //    other. Two source keys can collide here — e.g. a checkpoint carrying
+    //    both the prefixed `wav2vec2.<x>` and unprefixed `<x>` forms (rule 1),
+    //    or both `parametrizations.weight.original0` and the legacy `weight_g`
+    //    (rule 3) — and the source is a `HashMap`, so the surviving tensor
+    //    would otherwise be per-run nondeterministic.
+    insert_unique(&mut out, k, v, "Wav2Vec2 sanitize")?;
   }
   Ok(out)
 }
@@ -942,13 +936,13 @@ impl Attention {
 
     // (B, n_heads, T, head_dim) → (B, T, C).
     let attn = ops::shape::transpose_axes(&attn, &[0, 2, 1, 3])?;
-    let embed_dim = self.num_heads.checked_mul(self.head_dim).ok_or_else(|| {
-      Error::OutOfRange(OutOfRangePayload::new(
-        "Attention: num_heads * head_dim",
-        "overflows i32",
-        "overflow",
-      ))
-    })?;
+    let embed_dim = checked_mul(
+      "Attention: num_heads * head_dim",
+      "num_heads",
+      self.num_heads,
+      "head_dim",
+      self.head_dim,
+    )?;
     let attn = ops::shape::reshape(&attn, &[bsz, tgt_len, embed_dim])?;
     linear(&attn, &self.out_weight, Some(&self.out_bias))
   }

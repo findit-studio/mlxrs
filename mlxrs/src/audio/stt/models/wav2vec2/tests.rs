@@ -267,6 +267,57 @@ fn sanitize_conv_axis_swap_values() {
   );
 }
 
+#[test]
+fn sanitize_rejects_prefixed_unprefixed_collision() {
+  // A checkpoint carrying BOTH the prefixed (`wav2vec2.lm_head.weight`, which
+  // rule 1 strips to `lm_head.weight`) and the unprefixed (`lm_head.weight`)
+  // form maps two source keys onto the same destination. The source is a
+  // `HashMap`, so a bare overwrite would keep an arbitrary (per-run
+  // nondeterministic) survivor; sanitize must instead reject it with a typed
+  // KeyCollision regardless of HashMap visitation order.
+  let mut weights: HashMap<String, Array> = HashMap::new();
+  weights.insert(
+    "wav2vec2.lm_head.weight".to_string(),
+    Array::from_slice::<f32>(&[1.0, 2.0], &[2, 1]).unwrap(),
+  );
+  weights.insert(
+    "lm_head.weight".to_string(),
+    Array::from_slice::<f32>(&[3.0, 4.0], &[2, 1]).unwrap(),
+  );
+  match sanitize(weights) {
+    Err(Error::KeyCollision(p)) => {
+      assert_eq!(p.context(), "Wav2Vec2 sanitize");
+      assert_eq!(p.key(), "lm_head.weight");
+    }
+    other => panic!("expected KeyCollision for prefixed+unprefixed lm_head, got {other:?}"),
+  }
+}
+
+#[test]
+fn sanitize_rejects_parametrization_legacy_weight_g_collision() {
+  // A checkpoint carrying both `...conv.parametrizations.weight.original0`
+  // (rule 3 renames it to `...conv.weight_g`) and a legacy `...conv.weight_g`
+  // (rule 2, axis-swapped) also collides on the same destination key. Both
+  // forms are rank-3 (they take the conv axis-swap path); the collision is a
+  // typed KeyCollision, never a silent overwrite.
+  let mut weights: HashMap<String, Array> = HashMap::new();
+  weights.insert(
+    "encoder.pos_conv_embed.conv.parametrizations.weight.original0".to_string(),
+    Array::from_slice::<f32>(&[1.0, 1.0, 1.0, 1.0, 1.0, 1.0], &[2, 1, 3]).unwrap(),
+  );
+  weights.insert(
+    "encoder.pos_conv_embed.conv.weight_g".to_string(),
+    Array::from_slice::<f32>(&[2.0, 2.0, 2.0, 2.0, 2.0, 2.0], &[2, 1, 3]).unwrap(),
+  );
+  match sanitize(weights) {
+    Err(Error::KeyCollision(p)) => {
+      assert_eq!(p.context(), "Wav2Vec2 sanitize");
+      assert_eq!(p.key(), "encoder.pos_conv_embed.conv.weight_g");
+    }
+    other => panic!("expected KeyCollision for original0 + legacy weight_g, got {other:?}"),
+  }
+}
+
 // ───────────────────────── config parse ─────────────────────────
 
 #[test]
@@ -286,6 +337,8 @@ fn config_parses_base_960h_defaults_and_ignores_unknown() {
   assert_eq!(config.num_conv_pos_embeddings, 128);
   assert_eq!(config.num_conv_pos_embedding_groups, 16);
   assert!(config.is_group_norm());
+  assert_eq!(config.hidden_act, "gelu");
+  assert!((config.layer_norm_eps - 1e-5).abs() < 1e-12);
   assert!(!config.do_stable_layer_norm);
   assert!(!config.conv_bias);
 }
@@ -442,6 +495,73 @@ fn config_validate_rejects_deviating_conv_array() {
 }
 
 #[test]
+fn config_validate_rejects_deviating_layer_norm_eps() {
+  // `layer_norm_eps` is shared by every LayerNorm and the L0 GroupNorm, so a
+  // deviating value silently runs a numerically different graph. `validate`
+  // must reject it with a typed OutOfRange naming the field + the offending
+  // and expected values (the helper widens the f32 field to f64 for the
+  // compare, so the message carries the f64 forms).
+  let bad = Wav2Vec2Config::from_json(r#"{"layer_norm_eps": 1e-6}"#).unwrap();
+  // The parsed field is the deviating value.
+  assert!((bad.layer_norm_eps - 1e-6).abs() < 1e-12);
+  match bad.validate() {
+    Err(Error::OutOfRange(p)) => {
+      assert!(
+        p.context().contains("layer_norm_eps"),
+        "context should name layer_norm_eps, got {:?}",
+        p.context()
+      );
+      // The value names both the offending eps and the expected base-960h one.
+      assert!(
+        p.value().contains("expected"),
+        "value should name the expected eps, got {:?}",
+        p.value()
+      );
+    }
+    other => panic!("expected OutOfRange for a deviating layer_norm_eps, got {other:?}"),
+  }
+}
+
+#[test]
+fn config_validate_rejects_non_finite_layer_norm_eps() {
+  // An eps that overflows f32 to a non-finite value must never be accepted: it
+  // would otherwise drive a non-finite normalization denominator. Whether the
+  // over-range literal is caught at parse time (serde) or at validate time
+  // (the helper's NonFiniteScalar branch, when the f64→f32 cast saturates to
+  // infinity), the config must be rejected — never produce a usable model.
+  match Wav2Vec2Config::from_json(r#"{"layer_norm_eps": 1e40}"#) {
+    Err(Error::Parse(_)) => {}
+    Ok(cfg) => {
+      // Parsed: the cast saturated to a non-finite f32; validate rejects it.
+      assert!(
+        !cfg.layer_norm_eps.is_finite(),
+        "1e40 should overflow f32 to a non-finite value, got {}",
+        cfg.layer_norm_eps
+      );
+      assert!(matches!(cfg.validate(), Err(Error::NonFiniteScalar(_))));
+    }
+    other => panic!("expected Parse error or a non-finite eps rejected by validate, got {other:?}"),
+  }
+}
+
+#[test]
+fn config_validate_rejects_deviating_hidden_act() {
+  // The port hardcodes GELU in every block, so a config whose `hidden_act`
+  // names a different activation would silently run a different graph.
+  // `validate` must reject it with a typed UnknownEnumValue carrying the
+  // offending value and the supported set.
+  let relu = Wav2Vec2Config::from_json(r#"{"hidden_act": "relu"}"#).unwrap();
+  assert_eq!(relu.hidden_act, "relu");
+  match relu.validate() {
+    Err(Error::UnknownEnumValue(p)) => {
+      assert_eq!(p.value(), "relu");
+      assert_eq!(p.supported(), &["gelu"]);
+    }
+    other => panic!("expected UnknownEnumValue for a deviating hidden_act, got {other:?}"),
+  }
+}
+
+#[test]
 fn base_960h_constants_match_defaults() {
   // The validate() pin-constants and the serde `default_*` fns must agree:
   // a default-constructed config (the base-960h checkpoint) must pass
@@ -465,6 +585,8 @@ fn base_960h_constants_match_defaults() {
   assert_eq!(defaults.conv_stride, vec![5, 2, 2, 2, 2, 2, 2]);
   assert_eq!(defaults.conv_kernel, vec![10, 3, 3, 3, 3, 2, 2]);
   assert_eq!(defaults.model_type(), "wav2vec2");
+  assert_eq!(defaults.hidden_act, "gelu");
+  assert!((defaults.layer_norm_eps - 1e-5).abs() < 1e-12);
 }
 
 // ───────────────────────── test 2: feature-encoder time chain ─────────────────────────
