@@ -124,6 +124,89 @@ const MAX_CONFIG_CARDINALITY: i32 = 4096;
 /// allocation that aborts before the first typed error.
 const MAX_CONV_L_CACHE: i32 = 256;
 
+/// Maximum number of elements a per-layer config sequence (`full_attn_idxs`,
+/// `layer_types`) may *materialize* during deserialization: the
+/// [`MAX_CONFIG_CARDINALITY`] cap plus one. The over-cap case is still rejected
+/// by the [`require_cardinality`] checks in
+/// [`TextConfig::attention_layer_indices`] — this bound exists only so a hostile
+/// `config.json` with a multi-million-element array cannot drive unbounded `Vec`
+/// growth inside `serde_json` *before* that typed cap runs. Admitting exactly
+/// `cap + 1` keeps the boundary the accessor already tests (`cap + 1` parses,
+/// then surfaces a recoverable [`Error::CapExceeded`]); a strictly larger array
+/// is rejected by [`deserialize_bounded_opt_vec`] as a serde error (→
+/// [`Error::Parse`]) the moment the `cap + 2`th element appears, so the `Vec`
+/// never allocates past `cap + 1` regardless of the JSON array's length.
+const MAX_CONFIG_SEQ_LEN: usize = MAX_CONFIG_CARDINALITY as usize + 1;
+
+/// A `Vec<T>` whose [`Deserialize`] refuses to grow past [`MAX_CONFIG_SEQ_LEN`]
+/// elements, mirroring `lora.rs`'s `OrderedPattern` newtype-plus-visitor idiom.
+///
+/// Unlike a plain `Vec<T>` deserialize (which drains the whole JSON array into
+/// memory before any cap runs), the visitor stops the moment a sequence yields
+/// more than the cap: it never pushes the offending element, so a multi-million
+/// element array allocates at most `cap + 1` slots, then errors. The error is an
+/// [`invalid_length`](serde::de::Error::invalid_length), which `serde_json`
+/// surfaces as the `Err` [`TextConfig::from_json`] maps to [`Error::Parse`].
+struct BoundedSeq<T>(Vec<T>);
+
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for BoundedSeq<T> {
+  fn deserialize<D: serde::Deserializer<'de>>(
+    deserializer: D,
+  ) -> std::result::Result<Self, D::Error> {
+    struct BoundedVisitor<T>(std::marker::PhantomData<T>);
+
+    impl<'de, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for BoundedVisitor<T> {
+      type Value = Vec<T>;
+
+      fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+          f,
+          "a per-layer config array of at most {MAX_CONFIG_SEQ_LEN} elements"
+        )
+      }
+
+      fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut seq: A,
+      ) -> std::result::Result<Self::Value, A::Error> {
+        // Reserve no more than the cap even when the deserializer reports a huge
+        // `size_hint`, so a hostile length hint cannot pre-allocate past the cap.
+        let cap_hint = seq.size_hint().unwrap_or(0).min(MAX_CONFIG_SEQ_LEN);
+        let mut out: Vec<T> = Vec::with_capacity(cap_hint);
+        while let Some(elem) = seq.next_element::<T>()? {
+          if out.len() >= MAX_CONFIG_SEQ_LEN {
+            // The `cap + 2`th element just arrived. Reject *before* pushing it so
+            // the `Vec` never exceeds `cap + 1`; do not keep draining `seq`.
+            return Err(serde::de::Error::invalid_length(out.len() + 1, &self));
+          }
+          out.push(elem);
+        }
+        Ok(out)
+      }
+    }
+
+    deserializer
+      .deserialize_seq(BoundedVisitor(std::marker::PhantomData))
+      .map(BoundedSeq)
+  }
+}
+
+/// `#[serde(deserialize_with)]` shim for the `Option<Vec<T>>` config fields
+/// (`full_attn_idxs`, `layer_types`): deserialize an `Option<BoundedSeq<T>>` so
+/// `null` / an absent key stays `None`, and a present array is length-bounded by
+/// [`BoundedSeq`] during parsing. Unwraps the newtype back to the plain
+/// `Option<Vec<T>>` the struct stores.
+fn deserialize_bounded_opt_vec<'de, D, T>(
+  deserializer: D,
+) -> std::result::Result<Option<Vec<T>>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+  T: serde::Deserialize<'de>,
+{
+  let opt: Option<BoundedSeq<T>> = serde::Deserialize::deserialize(deserializer)?;
+  Ok(opt.map(|b| b.0))
+}
+
 // ───────────────────────── config ─────────────────────────
 
 /// LFM2 text-model configuration — mirrors `mlx-vlm`'s `lfm2_vl/config.py`
@@ -192,12 +275,22 @@ pub struct TextConfig {
   /// Explicit per-layer kind list (`"full_attention"` vs the conv default).
   /// `None` ⇒ every layer is a conv layer unless [`full_attn_idxs`] names it.
   ///
+  /// Length-bounded during deserialization (via the private
+  /// `deserialize_bounded_opt_vec` shim) so a hostile array cannot over-allocate
+  /// before the
+  /// [`attention_layer_indices`](TextConfig::attention_layer_indices) cap runs.
+  ///
   /// [`full_attn_idxs`]: TextConfig::full_attn_idxs
-  #[serde(default)]
+  #[serde(default, deserialize_with = "deserialize_bounded_opt_vec")]
   pub layer_types: Option<Vec<String>>,
   /// Explicit attention-layer index list. When present it is authoritative;
   /// otherwise it is derived from `layer_types` (`__post_init__`).
-  #[serde(default)]
+  ///
+  /// Length-bounded during deserialization (via the private
+  /// `deserialize_bounded_opt_vec` shim) so a hostile array cannot over-allocate
+  /// before the
+  /// [`attention_layer_indices`](TextConfig::attention_layer_indices) cap runs.
+  #[serde(default, deserialize_with = "deserialize_bounded_opt_vec")]
   pub full_attn_idxs: Option<Vec<i32>>,
 }
 

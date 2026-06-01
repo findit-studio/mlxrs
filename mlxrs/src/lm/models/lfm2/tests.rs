@@ -439,6 +439,57 @@ fn attention_indices_reject_over_cap_layer_types() {
 }
 
 #[test]
+fn from_json_rejects_oversized_full_attn_idxs_during_deserialization() {
+  // An array strictly longer than `MAX_CONFIG_CARDINALITY + 1` must be rejected
+  // *while parsing* (the `BoundedSeq` visitor stops growing the `Vec` at the cap
+  // rather than draining millions of elements into memory), so `from_json`
+  // itself fails with a typed `Error::Parse` — the `attention_layer_indices`
+  // `CapExceeded` path is never reached because the value never fully
+  // deserializes. The element count is `cap + 2` so it is the smallest array the
+  // deserializer rejects; entries are `0` (in range) to isolate the *length*
+  // bound from any per-index check.
+  let over = (MAX_CONFIG_CARDINALITY as usize) + 2;
+  let idxs = vec!["0"; over].join(",");
+  let json = format!(r#"{{"num_hidden_layers": 2, "full_attn_idxs": [{idxs}]}}"#);
+  assert!(matches!(TextConfig::from_json(&json), Err(Error::Parse(_))));
+  // The boundary the accessor tests (`cap + 1`) still deserializes — the
+  // deserializer admits exactly `cap + 1`, leaving the over-cap rejection to the
+  // `require_cardinality` check in `attention_layer_indices` (a recoverable
+  // `CapExceeded`), so the two guards compose without a gap.
+  let boundary = (MAX_CONFIG_CARDINALITY as usize) + 1;
+  let b_idxs = vec!["0"; boundary].join(",");
+  let b_json = format!(r#"{{"num_hidden_layers": 2, "full_attn_idxs": [{b_idxs}]}}"#);
+  let b_cfg = TextConfig::from_json(&b_json).unwrap();
+  assert!(matches!(
+    b_cfg.attention_layer_indices(),
+    Err(Error::CapExceeded(_))
+  ));
+}
+
+#[test]
+fn from_json_rejects_oversized_layer_types_during_deserialization() {
+  // The `layer_types` field is bounded the same way: an array longer than
+  // `cap + 1` is rejected by the `BoundedSeq` visitor during parsing, so
+  // `from_json` returns a typed `Error::Parse` before the `"full_attention"`
+  // collect can run. Entries are `"conv"` so no attention index would ever be
+  // produced — this isolates the deserialize-time length bound.
+  let over = (MAX_CONFIG_CARDINALITY as usize) + 2;
+  let types = vec!["\"conv\""; over].join(",");
+  let json = format!(r#"{{"num_hidden_layers": 2, "layer_types": [{types}]}}"#);
+  assert!(matches!(TextConfig::from_json(&json), Err(Error::Parse(_))));
+  // `cap + 1` still parses, deferring the over-cap rejection to the
+  // `require_cardinality` check in `attention_layer_indices`.
+  let boundary = (MAX_CONFIG_CARDINALITY as usize) + 1;
+  let b_types = vec!["\"conv\""; boundary].join(",");
+  let b_json = format!(r#"{{"num_hidden_layers": 2, "layer_types": [{b_types}]}}"#);
+  let b_cfg = TextConfig::from_json(&b_json).unwrap();
+  assert!(matches!(
+    b_cfg.attention_layer_indices(),
+    Err(Error::CapExceeded(_))
+  ));
+}
+
+#[test]
 fn validate_rejects_zero_negative_nondivisible_and_oversized() {
   // A divisible base (hidden 8 / heads 2 = head_dim 4; heads 2 / kv 2) so each
   // case below isolates a single malformed field on an otherwise-sound config.
