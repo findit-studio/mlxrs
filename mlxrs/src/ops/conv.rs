@@ -182,15 +182,22 @@ fn check_conv_no_overflow(
     fits(context, groups as i128 * channels as i128)?;
   }
   let nd = in_shape.len();
-  // Well-formedness gate (both paths). MLX indexes the weight and every spatial
-  // parameter slice BY SPATIAL AXIS in its shape arithmetic and negative-padding
-  // normalization — for forward conv_general, and for the inner conv_general that
-  // conv_transpose_general feeds. A weight rank below the input rank, or a slice
-  // whose length is not 0, 1, or the input spatial rank, makes MLX read a C++
-  // vector out of bounds before its own validation. A valid convolution always
-  // has matching ranks and broadcastable slices, so reject the rest up front.
-  if nd < 2 {
-    return Ok(());
+  // Well-formedness gate (both paths), so MLX only runs its shape arithmetic on a
+  // convolution it can actually index. MLX allows 1-3 spatial dims, i.e. an input
+  // rank of 3, 4, or 5, with a weight of the same rank and spatial parameter
+  // slices that broadcast to the spatial rank (length 0, 1, or the spatial rank).
+  // It indexes the weight and those slices BY SPATIAL AXIS in forward
+  // conv_general and in the inner conv_general that conv_transpose_general feeds —
+  // and the transposed prelude does so over the weight and parameters BEFORE the
+  // nested rank check. So a rank outside 3-5, a mismatched weight rank, or a
+  // non-broadcastable slice would be a C++ out-of-bounds read or signed overflow;
+  // reject all three up front rather than defer to MLX.
+  if !(3..=5).contains(&nd) {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      context,
+      "input rank must be 3, 4, or 5 (1 to 3 spatial dims)",
+      format_smolstr!("rank {nd}"),
+    )));
   }
   if wt_shape.len() != nd {
     return Err(Error::OutOfRange(OutOfRangePayload::new(
@@ -976,8 +983,8 @@ mod tests {
 
   #[test]
   fn conv3d_rejects_mismatched_input_rank_without_panic() {
-    // conv3d on a rank-6 input/weight has spatial rank 4 but only 3 stride/
-    // padding values; same guard, no panic (Codex round-10).
+    // A rank-6 input is above the valid 3-5 range (MLX allows 1-3 spatial dims);
+    // the rank gate rejects it before the FFI, no panic.
     let input = Array::zeros::<f32>(&[1, 2, 2, 2, 2, 1]).unwrap();
     let weight = Array::zeros::<f32>(&[1, 2, 2, 2, 2, 1]).unwrap();
     assert!(conv3d(&input, &weight, (1, 1, 1), (0, 0, 0), (1, 1, 1), 1).is_err());
@@ -996,8 +1003,7 @@ mod tests {
 
   #[test]
   fn conv_transpose3d_rejects_mismatched_input_rank_without_panic() {
-    // conv_transpose3d on a rank-6 input/weight has spatial rank 4 but only 3
-    // parameter values; same transposed out-of-bounds class (round-11).
+    // A rank-6 input is above the valid 3-5 range; same rank gate, no panic.
     let input = Array::zeros::<f32>(&[1, 2, 2, 2, 2, 1]).unwrap();
     let weight = Array::zeros::<f32>(&[1, 2, 2, 2, 2, 1]).unwrap();
     assert!(
@@ -1022,5 +1028,19 @@ mod tests {
     let input = Array::zeros::<f32>(&[1, 4, 4, 1]).unwrap();
     let weight = Array::zeros::<f32>(&[2, 1]).unwrap();
     assert!(conv2d(&input, &weight, (1, 1), (0, 0), (1, 1), 1).is_err());
+  }
+
+  #[test]
+  fn conv_transpose1d_rejects_low_rank_inputs_without_overflow() {
+    // Ranks below the valid 3-5 range. MLX's conv_transpose_general prelude
+    // computes 1 + dilation * (weight_dim - 1) over the weight before the nested
+    // conv_general validates the rank, so an extreme dilation would be a C++
+    // overflow. The rank gate rejects rank 0 and rank 1 before the FFI (round-12).
+    let weight = Array::zeros::<f32>(&[1, 3, 1]).unwrap();
+    let scalar_shape: [i32; 0] = [];
+    let rank0 = Array::zeros::<f32>(&scalar_shape).unwrap();
+    assert!(conv_transpose1d(&rank0, &weight, 1, 0, i32::MAX, 0, 1).is_err());
+    let rank1 = Array::zeros::<f32>(&[1]).unwrap();
+    assert!(conv_transpose1d(&rank1, &weight, 1, 0, i32::MAX, 0, 1).is_err());
   }
 }
