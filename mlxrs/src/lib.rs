@@ -20,6 +20,7 @@ pub mod ffi;
 /// Model IO — safetensors + GGUF load/save (local files only).
 pub mod io;
 pub mod memory;
+pub mod model_validation;
 pub mod ops;
 pub mod shape;
 /// Hand-written `core::arch` SIMD kernels for the host-CPU numeric
