@@ -142,9 +142,12 @@ const MAX_CONFIG_SEQ_LEN: usize = MAX_CONFIG_CARDINALITY as usize + 1;
 /// elements, mirroring `lora.rs`'s `OrderedPattern` newtype-plus-visitor idiom.
 ///
 /// Unlike a plain `Vec<T>` deserialize (which drains the whole JSON array into
-/// memory before any cap runs), the visitor stops the moment a sequence yields
-/// more than the cap: it never pushes the offending element, so a multi-million
-/// element array allocates at most `cap + 1` slots, then errors. The error is an
+/// memory before any cap runs), the visitor pins its backing capacity at the
+/// ceiling ([`Vec::with_capacity`] `== MAX_CONFIG_SEQ_LEN`), so `push` never
+/// reallocates past the cap even though `serde_json` supplies no `size_hint`.
+/// Once `cap + 1` elements are stored it probes one more element as
+/// [`IgnoredAny`](serde::de::IgnoredAny) — an over-cap `String`/value is detected
+/// without ever being materialized as `T` — and rejects with an
 /// [`invalid_length`](serde::de::Error::invalid_length), which `serde_json`
 /// surfaces as the `Err` [`TextConfig::from_json`] maps to [`Error::Parse`].
 struct BoundedSeq<T>(Vec<T>);
@@ -169,17 +172,28 @@ impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for BoundedSeq<T> 
         self,
         mut seq: A,
       ) -> std::result::Result<Self::Value, A::Error> {
-        // Reserve no more than the cap even when the deserializer reports a huge
-        // `size_hint`, so a hostile length hint cannot pre-allocate past the cap.
-        let cap_hint = seq.size_hint().unwrap_or(0).min(MAX_CONFIG_SEQ_LEN);
-        let mut out: Vec<T> = Vec::with_capacity(cap_hint);
-        while let Some(elem) = seq.next_element::<T>()? {
-          if out.len() >= MAX_CONFIG_SEQ_LEN {
-            // The `cap + 2`th element just arrived. Reject *before* pushing it so
-            // the `Vec` never exceeds `cap + 1`; do not keep draining `seq`.
-            return Err(serde::de::Error::invalid_length(out.len() + 1, &self));
+        // Pin capacity at the ceiling: `push` never reallocates past it, and
+        // `serde_json`'s missing `size_hint` can no longer drive doubling beyond
+        // the cap. A constant `with_capacity` also closes the malicious-`size_hint`
+        // concern outright (no hint is consulted).
+        let mut out: Vec<T> = Vec::with_capacity(MAX_CONFIG_SEQ_LEN);
+        loop {
+          if out.len() == MAX_CONFIG_SEQ_LEN {
+            // At the ceiling: a further element means the source array is over-cap.
+            // Probe it as `IgnoredAny` so an over-cap `String`/value is *not*
+            // materialized as `T` before the length check rejects it.
+            if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+              return Err(serde::de::Error::invalid_length(
+                MAX_CONFIG_SEQ_LEN + 1,
+                &"a config list within the cardinality cap",
+              ));
+            }
+            break;
           }
-          out.push(elem);
+          match seq.next_element::<T>()? {
+            Some(v) => out.push(v),
+            None => break,
+          }
         }
         Ok(out)
       }

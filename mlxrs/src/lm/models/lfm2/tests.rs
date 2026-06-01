@@ -490,6 +490,75 @@ fn from_json_rejects_oversized_layer_types_during_deserialization() {
 }
 
 #[test]
+fn bounded_seq_at_cap_parses_and_capacity_is_bounded() {
+  // Exactly `MAX_CONFIG_SEQ_LEN` elements deserialize successfully through the
+  // `BoundedSeq` visitor, and — the regression Codex asked for — the backing
+  // `Vec`'s capacity never exceeds the cap even though `serde_json` supplies no
+  // `size_hint` (the visitor pins `with_capacity(MAX_CONFIG_SEQ_LEN)`, so `push`
+  // cannot drive geometric doubling past the ceiling).
+  let idxs = vec!["0"; MAX_CONFIG_SEQ_LEN].join(",");
+  let json = format!("[{idxs}]");
+  let parsed: BoundedSeq<i32> = serde_json::from_str(&json).unwrap();
+  assert_eq!(parsed.0.len(), MAX_CONFIG_SEQ_LEN);
+  assert!(
+    parsed.0.capacity() <= MAX_CONFIG_SEQ_LEN,
+    "capacity {} exceeded the cap {MAX_CONFIG_SEQ_LEN}",
+    parsed.0.capacity()
+  );
+
+  // Same guarantee for the `String` element type whose over-cap surplus the fix
+  // must avoid materializing: capacity stays pinned at the ceiling.
+  let types = vec!["\"conv\""; MAX_CONFIG_SEQ_LEN].join(",");
+  let s_json = format!("[{types}]");
+  let s_parsed: BoundedSeq<String> = serde_json::from_str(&s_json).unwrap();
+  assert_eq!(s_parsed.0.len(), MAX_CONFIG_SEQ_LEN);
+  assert!(
+    s_parsed.0.capacity() <= MAX_CONFIG_SEQ_LEN,
+    "string-seq capacity {} exceeded the cap {MAX_CONFIG_SEQ_LEN}",
+    s_parsed.0.capacity()
+  );
+}
+
+#[test]
+fn bounded_seq_rejects_surplus_without_materializing() {
+  // One element past the ceiling (`MAX_CONFIG_SEQ_LEN + 1`, i.e. `cap + 2`) is
+  // rejected at parse by the visitor's `IgnoredAny` probe — the surplus element
+  // is *never* deserialized as `T`. Deserializing `BoundedSeq` directly surfaces
+  // the visitor's typed serde error (which `from_json` maps to `Error::Parse`).
+  let over = MAX_CONFIG_SEQ_LEN + 1;
+  let idxs = vec!["0"; over].join(",");
+  let json = format!("[{idxs}]");
+  assert!(serde_json::from_str::<BoundedSeq<i32>>(&json).is_err());
+
+  // The surplus `String` is not allocated: a value `serde_json` could not parse
+  // *as a `String`* (a bare number) in the surplus slot is still rejected as an
+  // over-length array, not a type error — proof the probe runs as `IgnoredAny`
+  // before any `String` materialization is attempted at the ceiling.
+  let mut elems = vec!["\"conv\""; MAX_CONFIG_SEQ_LEN];
+  elems.push("123");
+  let s_json = format!("[{}]", elems.join(","));
+  assert!(serde_json::from_str::<BoundedSeq<String>>(&s_json).is_err());
+}
+
+#[test]
+fn bounded_opt_fields_handle_null_and_absent() {
+  // Explicit JSON `null` → `None` through the `Option` shim (the
+  // `deserialize_bounded_opt_vec` wrapper handles `null` without entering the
+  // sequence visitor or panicking).
+  let null_json = r#"{"num_hidden_layers": 2,
+    "full_attn_idxs": null, "layer_types": null}"#;
+  let null_cfg = TextConfig::from_json(null_json).unwrap();
+  assert!(null_cfg.full_attn_idxs.is_none());
+  assert!(null_cfg.layer_types.is_none());
+
+  // Absent fields → `None` via `#[serde(default)]` (the `deserialize_with` shim
+  // is not even invoked for a missing key).
+  let absent_cfg = TextConfig::from_json(r#"{"num_hidden_layers": 2}"#).unwrap();
+  assert!(absent_cfg.full_attn_idxs.is_none());
+  assert!(absent_cfg.layer_types.is_none());
+}
+
+#[test]
 fn validate_rejects_zero_negative_nondivisible_and_oversized() {
   // A divisible base (hidden 8 / heads 2 = head_dim 4; heads 2 / kv 2) so each
   // case below isolates a single malformed field on an otherwise-sound config.
