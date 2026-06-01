@@ -712,6 +712,60 @@ fn greedy_caps_total_at_max_context_accounting_for_prompt() {
 }
 
 #[test]
+fn greedy_caller_max_new_tokens_caps_below_context() {
+  // Option 3: a never-eot model with default `max_context` (448) would run to
+  // 448 generated tokens; `with_max_new_tokens(5)` lowers the loop bound so it
+  // stops at EXACTLY 5 generated tokens (the caller limit, not `max_context`).
+  let model = NeverStops {
+    vocab: 4,
+    prompt: vec![],
+    max_ctx: DEFAULT_MAX_DECODE_STEPS,
+  };
+  let opts = TranscribeOptions::default().with_max_new_tokens(5);
+  let out = greedy_transcribe(&model, &speech_waveform(), &opts).expect("greedy transcribe");
+  // Decoded ids are 5 class-1 tokens -> "1 1 1 1 1".
+  assert_eq!(out.text(), "1 1 1 1 1");
+  assert_eq!(out.text().split_whitespace().count(), 5);
+}
+
+#[test]
+fn greedy_caller_max_new_tokens_clamps_to_remaining_context() {
+  // A caller limit LARGER than the remaining context is harmlessly clamped to
+  // the context: prompt(3) + generated must still never exceed max_context(10),
+  // so even `with_max_new_tokens(1000)` yields only `10 - 3 = 7` tokens.
+  let max_ctx = 10;
+  let prompt = vec![20, 21, 22];
+  let model = NeverStops {
+    vocab: 4,
+    prompt: prompt.clone(),
+    max_ctx,
+  };
+  let opts = TranscribeOptions::default().with_max_new_tokens(1000);
+  let out = greedy_transcribe(&model, &speech_waveform(), &opts).expect("greedy transcribe");
+  let n_generated = max_ctx - prompt.len(); // 7
+  assert_eq!(out.text().split_whitespace().count(), n_generated);
+  assert_eq!(prompt.len() + n_generated, max_ctx);
+}
+
+#[test]
+fn greedy_max_new_tokens_none_falls_back_to_max_context() {
+  // `max_new_tokens == None` (the default) uses the full `max_context`: a
+  // never-eot model decodes exactly `max_context` tokens, identical to the
+  // no-caller-limit `greedy_stops_at_max_context_with_empty_prompt` behaviour.
+  // This pins the `map_or(cap_new, …)` fallback explicitly.
+  let max_ctx = 12;
+  let model = NeverStops {
+    vocab: 4,
+    prompt: vec![],
+    max_ctx,
+  };
+  let opts = TranscribeOptions::default();
+  assert_eq!(opts.max_new_tokens(), None);
+  let out = greedy_transcribe(&model, &speech_waveform(), &opts).expect("greedy transcribe");
+  assert_eq!(out.text().split_whitespace().count(), max_ctx);
+}
+
+#[test]
 fn greedy_rejects_prompt_at_or_over_max_context() {
   // initial_tokens length >= max_context leaves no room to decode -> typed
   // OutOfRange (the prompt-exceeds-context guard).
@@ -1169,4 +1223,54 @@ fn rank2_waveform_is_rejected_by_helpers() {
     resample_waveform(&stereo, 16_000, 8_000),
     Err(Error::RankMismatch(_))
   ));
+}
+
+// ===========================================================================
+// Autoregressive cumulative decode-work budget (Option 1) — the pure
+// `accumulate_decode_work` helper, the cheap & deterministic proof of the
+// budget arithmetic (a real loop tripping `MAX_AR_DECODE_WORK` would have to
+// argmax 256 Mi elements — exactly what this helper exists to avoid testing).
+// ===========================================================================
+
+#[test]
+fn accumulate_decode_work_sums_below_budget() {
+  // Below the budget, each call returns the running sum (and never errors).
+  let mut work = 0usize;
+  work = accumulate_decode_work(work, 1000).expect("step 1 under budget");
+  assert_eq!(work, 1000);
+  work = accumulate_decode_work(work, 50_000).expect("step 2 under budget");
+  assert_eq!(work, 51_000);
+  work = accumulate_decode_work(work, 0).expect("a zero-vocab step is a no-op");
+  assert_eq!(work, 51_000);
+}
+
+#[test]
+fn accumulate_decode_work_allows_exactly_the_budget() {
+  // The budget is inclusive: a total of EXACTLY MAX_AR_DECODE_WORK is Ok; the
+  // very next non-zero element tips it over and errors.
+  let at_budget = accumulate_decode_work(0, MAX_AR_DECODE_WORK).expect("exactly the budget is Ok");
+  assert_eq!(at_budget, MAX_AR_DECODE_WORK);
+  let err = accumulate_decode_work(at_budget, 1).unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)));
+}
+
+#[test]
+fn accumulate_decode_work_rejects_over_budget() {
+  // A running total that would exceed MAX_AR_DECODE_WORK is a typed OutOfRange.
+  let err = accumulate_decode_work(MAX_AR_DECODE_WORK - 5, 6).unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)));
+  // One step whose own vocab alone exceeds the budget is rejected from zero.
+  let err_single = accumulate_decode_work(0, MAX_AR_DECODE_WORK + 1).unwrap_err();
+  assert!(matches!(err_single, Error::OutOfRange(_)));
+}
+
+#[test]
+fn accumulate_decode_work_rejects_usize_overflow() {
+  // A `checked_add` overflow (work near usize::MAX) is a typed OutOfRange, not
+  // a wrap-around: the guard caps the cumulative work even against a pathologic
+  // accumulator value.
+  let err = accumulate_decode_work(usize::MAX, 1).unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)));
+  let err2 = accumulate_decode_work(usize::MAX - 3, 10).unwrap_err();
+  assert!(matches!(err2, Error::OutOfRange(_)));
 }

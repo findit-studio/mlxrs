@@ -82,6 +82,30 @@ pub const MAX_LOGITS_ELEMENTS: usize = 64 * 1024 * 1024;
 /// bounded infallible `push` is acceptable.
 pub const MAX_DECODE_CONTEXT: usize = 128 * 1024;
 
+/// An absolute backstop on the CUMULATIVE driver `argmax` work across a whole
+/// autoregressive decode — the sum of every step's vocab-axis length —
+/// `256 Mi` (`268_435_456`) logits-vocab elements.
+///
+/// The other [`greedy_transcribe`] guards bound each step INDIVIDUALLY (the
+/// per-step vocab cap [`MAX_LOGITS_VOCAB`]) and the trip count
+/// (`max_context - prompt_len`, with `max_context` capped against
+/// [`MAX_DECODE_CONTEXT`]); their product is the worst-case cumulative work.
+/// That product (`128 Ki` steps x `256 Ki` vocab = `32 Gi` elements) is a far
+/// larger argmax budget than any real decode needs, so even with a caller that
+/// sets no [`TranscribeOptions::max_new_tokens`] and a model that never emits
+/// [`AutoregressiveStt::eot`], the loop can still spend the full context worth
+/// of large-vocab argmaxes. This cap bounds that cumulative work directly: the
+/// loop maintains a running sum of the per-step vocab lengths (in the
+/// `accumulate_decode_work` helper) and aborts with a typed
+/// [`Error::OutOfRange`] the step the sum would exceed this budget, BEFORE that
+/// step's `argmax`.
+///
+/// `256 Mi` is generous for any real STT model: Whisper's worst case is its
+/// `448`-slot context x a ~`52 K` vocab ≈ `23 Mi` cumulative elements, so this
+/// budget is ~`11x` that headroom — a real decoder stays well under it — while
+/// still bounding the never-eot, no-caller-limit denial-of-service.
+pub const MAX_AR_DECODE_WORK: usize = 256 * 1024 * 1024;
+
 /// Validate a mono `audio` waveform's METADATA — rank, length, cap — WITHOUT
 /// materializing it, returning its sample count.
 ///
@@ -387,13 +411,27 @@ pub fn greedy_ctc_transcribe<M: CtcModel + ?Sized>(
 /// generates AT MOST `max_context - prompt.len()` new tokens, so
 /// `prompt + generated` never exceeds the decoder's total positional context
 /// (a prompt that already meets or exceeds `max_context` is a typed
-/// [`Error::OutOfRange`] — there is no room left to decode). The model-provided
-/// `max_context` is itself capped against [`MAX_DECODE_CONTEXT`] BEFORE the loop
-/// (a typed [`Error::OutOfRange`]), so an absurd value can neither drive an
+/// [`Error::OutOfRange`] — there is no room left to decode). A caller may lower
+/// that bound further via [`TranscribeOptions::max_new_tokens`]: the loop then
+/// generates at most `min(max_context - prompt.len(), max_new_tokens)` (a
+/// caller limit larger than the remaining context is harmlessly clamped to the
+/// context; `None` uses the full context). The model-provided `max_context` is
+/// itself capped against [`MAX_DECODE_CONTEXT`] BEFORE the loop (a typed
+/// [`Error::OutOfRange`]), so an absurd value can neither drive an
 /// effectively-unbounded loop nor an unbounded generated-token `Vec` (its
 /// growth is then bounded by `max_context`, so the per-step `push` is a bounded
 /// infallible append). Each step's `(vocab,)` logits width is likewise capped
 /// against [`MAX_LOGITS_VOCAB`] before its `argmax`.
+///
+/// As an absolute backstop independent of the caller, the CUMULATIVE driver
+/// `argmax` work — the running sum of every step's vocab-axis length — is
+/// bounded by [`MAX_AR_DECODE_WORK`] (via the `accumulate_decode_work` helper),
+/// checked each step BEFORE that step's `argmax`. This bounds the total argmax
+/// work a
+/// never-eot model can drive even when the caller sets no `max_new_tokens`
+/// (the per-step vocab cap x the `max_context` trip count is otherwise a large
+/// cumulative budget); over-budget (or a `usize` overflow of the accumulator)
+/// is a typed [`Error::OutOfRange`].
 ///
 /// Because the [`AutoregressiveStt`] surface carries no detokenizer, the
 /// returned [`Transcription`]'s text is the decoded token-id sequence (the
@@ -457,8 +495,19 @@ pub fn greedy_transcribe<M: AutoregressiveStt + ?Sized>(
   // that step's own vocab axis.
   let eot = m.eot();
 
-  // At most this many new tokens, so the total never exceeds `max_ctx`.
-  let max_new = max_ctx - prompt_len;
+  // The decoder-context bound on new tokens, so the total never exceeds
+  // `max_ctx`. A caller-supplied `max_new_tokens` further lowers it (clamped to
+  // this bound, so a caller limit larger than the remaining context is
+  // harmlessly capped to the context).
+  let cap_new = max_ctx - prompt_len;
+  let max_new = opts.max_new_tokens().map_or(cap_new, |n| n.min(cap_new));
+
+  // Cumulative driver-`argmax` work (sum of every step's vocab length). The
+  // per-step vocab cap + the `max_new` trip count already bound this, but their
+  // PRODUCT can still be a huge cumulative argmax budget for a never-eot model
+  // with no caller limit; this accumulator caps the cumulative work directly
+  // (checked each step BEFORE that step's argmax, see `accumulate_decode_work`).
+  let mut decode_work: usize = 0;
 
   for _ in 0..max_new {
     let logits = m.decode_step(&mut cache, &enc, &tokens)?;
@@ -512,6 +561,15 @@ pub fn greedy_transcribe<M: AutoregressiveStt + ?Sized>(
       )));
     }
 
+    // Accumulate this step's `argmax` cost into the cumulative decode-work
+    // budget BEFORE the `argmax` below. Even with every per-step + trip-count
+    // guard above, a never-eot model and a caller that set no `max_new_tokens`
+    // could otherwise spend `max_context` steps x a large per-step vocab of
+    // cumulative argmax work; `accumulate_decode_work` caps that running sum
+    // against `MAX_AR_DECODE_WORK` and returns a typed error (on over-budget or
+    // `usize` overflow) so the loop aborts here rather than at `max_context`.
+    decode_work = accumulate_decode_work(decode_work, vocab_len)?;
+
     // Greedy argmax over the vocab axis; the only materialization.
     let mut next_arr = ops::misc::argmax(&logits, None, false)?;
     let next: u32 = next_arr.item::<u32>()?;
@@ -528,6 +586,32 @@ pub fn greedy_transcribe<M: AutoregressiveStt + ?Sized>(
   let language = opts.language().map(str::to_owned);
   let segments = vec![Segment::new(text.clone(), 0.0, 0.0)];
   Ok(Transcription::new(text, language, segments))
+}
+
+/// Add one decode step's vocab-axis length `step_vocab` to the running
+/// cumulative-`argmax`-work accumulator `work`, enforcing the
+/// [`MAX_AR_DECODE_WORK`] backstop.
+///
+/// Returns the new accumulated total on success, or a typed
+/// [`Error::OutOfRange`] when the addition overflows `usize` OR the new total
+/// would exceed [`MAX_AR_DECODE_WORK`]. [`greedy_transcribe`] calls this each
+/// step with that step's vocab length (read off the lazy [`Array::shape`]) and
+/// aborts on the error BEFORE the step's `argmax`, so the cumulative driver
+/// argmax work is bounded even when the caller sets no
+/// [`TranscribeOptions::max_new_tokens`] and the model never emits
+/// [`AutoregressiveStt::eot`].
+///
+/// Factored out as a pure function so the budget arithmetic is unit-testable
+/// without running a real (giant) decode loop.
+fn accumulate_decode_work(work: usize, step_vocab: usize) -> Result<usize> {
+  match work.checked_add(step_vocab) {
+    Some(total) if total <= MAX_AR_DECODE_WORK => Ok(total),
+    _ => Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt greedy_transcribe: cumulative decode work (sum of per-step vocab lengths)",
+      "must not overflow and must not exceed MAX_AR_DECODE_WORK (256 Mi)",
+      work.to_string(),
+    ))),
+  }
 }
 
 /// Render a decoded token-id sequence as a space-separated decimal string —

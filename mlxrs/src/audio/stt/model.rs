@@ -217,11 +217,17 @@ pub struct TranscribeOptions {
   temperature: f32,
   /// Suppress timestamp tokens / segment time spans when `true`.
   no_timestamps: bool,
+  /// Caps the number of generated tokens; `None` uses the model's
+  /// [`AutoregressiveStt::max_context`]. A caller-supplied limit larger than
+  /// the model's remaining context is harmlessly clamped to the context.
+  max_new_tokens: Option<usize>,
 }
 
 impl TranscribeOptions {
   /// A new options bundle with auto-detect language, [`Task::Transcribe`],
-  /// greedy (`temperature == 0.0`) decoding, and timestamps enabled.
+  /// greedy (`temperature == 0.0`) decoding, timestamps enabled, and no
+  /// generated-token cap (the decode loop is bounded only by the model's
+  /// [`AutoregressiveStt::max_context`]).
   #[inline(always)]
   pub const fn new() -> Self {
     Self {
@@ -229,6 +235,7 @@ impl TranscribeOptions {
       task: Task::Transcribe,
       temperature: 0.0,
       no_timestamps: false,
+      max_new_tokens: None,
     }
   }
 
@@ -358,6 +365,56 @@ impl TranscribeOptions {
   #[inline(always)]
   pub const fn clear_no_timestamps(&mut self) -> &mut Self {
     self.no_timestamps = false;
+    self
+  }
+
+  /// The caller-supplied cap on the number of generated tokens; `None` uses
+  /// the model's [`AutoregressiveStt::max_context`].
+  #[inline(always)]
+  pub const fn max_new_tokens(&self) -> Option<usize> {
+    self.max_new_tokens
+  }
+
+  /// Set the generated-token cap. `None` uses the model's
+  /// [`AutoregressiveStt::max_context`]; a value larger than the model's
+  /// remaining context is harmlessly clamped to the context.
+  #[inline(always)]
+  pub const fn set_max_new_tokens(&mut self, n: usize) -> &mut Self {
+    self.max_new_tokens = Some(n);
+    self
+  }
+
+  /// Return `self` with the generated-token cap set. A value larger than the
+  /// model's remaining context is harmlessly clamped to the context.
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_max_new_tokens(mut self, n: usize) -> Self {
+    self.max_new_tokens = Some(n);
+    self
+  }
+
+  /// Assign the raw generated-token cap wrapper (`None` ⇒ the model's
+  /// [`AutoregressiveStt::max_context`]).
+  #[inline(always)]
+  pub const fn update_max_new_tokens(&mut self, max_new_tokens: Option<usize>) -> &mut Self {
+    self.max_new_tokens = max_new_tokens;
+    self
+  }
+
+  /// Return `self` with the raw generated-token cap wrapper assigned (`None` ⇒
+  /// the model's [`AutoregressiveStt::max_context`]).
+  #[must_use]
+  #[inline(always)]
+  pub const fn maybe_max_new_tokens(mut self, max_new_tokens: Option<usize>) -> Self {
+    self.max_new_tokens = max_new_tokens;
+    self
+  }
+
+  /// Clear the generated-token cap (revert to the model's
+  /// [`AutoregressiveStt::max_context`]).
+  #[inline(always)]
+  pub const fn clear_max_new_tokens(&mut self) -> &mut Self {
+    self.max_new_tokens = None;
     self
   }
 }
