@@ -433,13 +433,14 @@ fn default_config_passes_validation() {
 #[test]
 fn validate_rejects_huge_layer_and_head_counts() {
   // A cardinality field past the realistic 4096 cap would size a multi-GB
-  // per-layer Vec / cache before the first missing-key error; it must be a
-  // recoverable OutOfRange at config time.
+  // per-layer Vec / cache before the first missing-key error; the shared
+  // `require_cardinality` guard rejects it as a recoverable CapExceeded at
+  // config time.
   let huge_layers = r#"{"num_hidden_layers": 16777216, "hidden_size": 8,
     "num_attention_heads": 2, "num_key_value_heads": 2}"#;
   assert!(matches!(
     TextConfig::from_json(huge_layers),
-    Err(Error::OutOfRange(_))
+    Err(Error::CapExceeded(_))
   ));
   // The head counts are cardinalities too (they bound per-head reshapes and
   // the cap keeps them realistic). 8192 > 4096.
@@ -447,7 +448,7 @@ fn validate_rejects_huge_layer_and_head_counts() {
     "hidden_size": 8192, "num_hidden_layers": 2}"#;
   assert!(matches!(
     TextConfig::from_json(huge_heads),
-    Err(Error::OutOfRange(_))
+    Err(Error::CapExceeded(_))
   ));
   // The cap boundary: exactly 4096 layers is accepted (within cap), 4097 is
   // not — isolating the off-by-one. `hidden_size`/heads kept sound + even
@@ -459,7 +460,7 @@ fn validate_rejects_huge_layer_and_head_counts() {
     "num_attention_heads": 2, "num_key_value_heads": 2}"#;
   assert!(matches!(
     TextConfig::from_json(over_cap),
-    Err(Error::OutOfRange(_))
+    Err(Error::CapExceeded(_))
   ));
 }
 
