@@ -907,6 +907,265 @@ fn linear_with_and_without_bias() {
   assert_eq!(yb.to_vec::<f32>().unwrap(), vec![11.0, 22.0]);
 }
 
+// ───────────────────────── weight-shape validation ─────────────────────────
+
+/// A lazy zero tensor of the given shape — cheap (no materialization) because
+/// `from_weights` only reads `shape()` and composes lazy ops; nothing is
+/// evaluated during construction.
+fn zeros(shape: &[i32]) -> Array {
+  Array::zeros::<f32>(&shape).unwrap()
+}
+
+/// Build a complete `base-960h` **post-sanitize** weight map (the exact layout
+/// `from_weights` consumes), every tensor at its correct base-960h shape. Used
+/// as the baseline the drift tests mutate one tensor of. All tensors are lazy
+/// zeros, so the whole map costs only metadata.
+///
+/// Shapes are written out longhand (not read from the code under test) so a
+/// regression in the production expected-shape derivation cannot also silently
+/// shift this oracle.
+fn base_960h_weights() -> HashMap<String, Array> {
+  let mut w: HashMap<String, Array> = HashMap::new();
+  // Feature encoder: L0 is (512, 10, 1) + a (512,) GroupNorm affine; L1-6 are
+  // (512, k, 512) with kernels [3,3,3,3,2,2].
+  let kernels = [10i32, 3, 3, 3, 3, 2, 2];
+  for (i, &k) in kernels.iter().enumerate() {
+    let in_ch = if i == 0 { 1 } else { 512 };
+    w.insert(
+      format!("feature_extractor.conv_layers.{i}.conv.weight"),
+      zeros(&[512, k, in_ch]),
+    );
+  }
+  w.insert(
+    "feature_extractor.conv_layers.0.layer_norm.weight".to_string(),
+    zeros(&[512]),
+  );
+  w.insert(
+    "feature_extractor.conv_layers.0.layer_norm.bias".to_string(),
+    zeros(&[512]),
+  );
+  // Feature projection: LayerNorm(512), Linear(512 -> 768).
+  w.insert(
+    "feature_projection.layer_norm.weight".to_string(),
+    zeros(&[512]),
+  );
+  w.insert(
+    "feature_projection.layer_norm.bias".to_string(),
+    zeros(&[512]),
+  );
+  w.insert(
+    "feature_projection.projection.weight".to_string(),
+    zeros(&[768, 512]),
+  );
+  w.insert(
+    "feature_projection.projection.bias".to_string(),
+    zeros(&[768]),
+  );
+  // Positional conv: weight_g (1, 128, 1), weight_v (768, 128, 48), bias (768,).
+  w.insert(
+    "encoder.pos_conv_embed.conv.weight_g".to_string(),
+    zeros(&[1, 128, 1]),
+  );
+  w.insert(
+    "encoder.pos_conv_embed.conv.weight_v".to_string(),
+    zeros(&[768, 128, 48]),
+  );
+  w.insert(
+    "encoder.pos_conv_embed.conv.bias".to_string(),
+    zeros(&[768]),
+  );
+  w.insert("encoder.layer_norm.weight".to_string(), zeros(&[768]));
+  w.insert("encoder.layer_norm.bias".to_string(), zeros(&[768]));
+  // 12 encoder layers.
+  for i in 0..12 {
+    let p = format!("encoder.layers.{i}");
+    for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+      w.insert(format!("{p}.attention.{proj}.weight"), zeros(&[768, 768]));
+      w.insert(format!("{p}.attention.{proj}.bias"), zeros(&[768]));
+    }
+    w.insert(format!("{p}.layer_norm.weight"), zeros(&[768]));
+    w.insert(format!("{p}.layer_norm.bias"), zeros(&[768]));
+    w.insert(
+      format!("{p}.feed_forward.intermediate_dense.weight"),
+      zeros(&[3072, 768]),
+    );
+    w.insert(
+      format!("{p}.feed_forward.intermediate_dense.bias"),
+      zeros(&[3072]),
+    );
+    w.insert(
+      format!("{p}.feed_forward.output_dense.weight"),
+      zeros(&[768, 3072]),
+    );
+    w.insert(format!("{p}.feed_forward.output_dense.bias"), zeros(&[768]));
+    w.insert(format!("{p}.final_layer_norm.weight"), zeros(&[768]));
+    w.insert(format!("{p}.final_layer_norm.bias"), zeros(&[768]));
+  }
+  // CTC head: Linear(768 -> 32).
+  w.insert("lm_head.weight".to_string(), zeros(&[32, 768]));
+  w.insert("lm_head.bias".to_string(), zeros(&[32]));
+  w
+}
+
+fn base_960h_config() -> Wav2Vec2Config {
+  Wav2Vec2Config::from_json("{}").unwrap()
+}
+
+/// Assert a `from_weights` result is the shape gate's typed rejection — an
+/// [`Error::LayerKeyed`] naming `key` whose inner error is an
+/// [`Error::ShapePairMismatch`] — and return that inner payload for further
+/// shape assertions. `Wav2Vec2Ctc` is not `Debug` (it holds `Array`s), so the
+/// `Ok` arm is reported without formatting the model.
+fn expect_shape_rejection(
+  result: Result<Wav2Vec2Ctc>,
+  key: &str,
+) -> crate::error::ShapePairMismatchPayload {
+  match result {
+    Err(Error::LayerKeyed(p)) => {
+      assert_eq!(p.layer(), key, "rejection should name the offending tensor");
+      match p.inner() {
+        Error::ShapePairMismatch(sp) => sp.clone(),
+        other => panic!("expected inner ShapePairMismatch for `{key}`, got {other:?}"),
+      }
+    }
+    Err(other) => panic!("expected LayerKeyed(ShapePairMismatch) for `{key}`, got {other:?}"),
+    Ok(_) => panic!("expected a shape rejection for `{key}`, but from_weights built a model"),
+  }
+}
+
+#[test]
+fn from_weights_accepts_correctly_shaped_base_960h() {
+  // The complete, correctly-shaped base-960h weight set must build a model
+  // (the both-directions baseline for the drift rejections below). Construction
+  // is lazy, so this never materializes the ~hundreds-of-MB graph.
+  let model = Wav2Vec2Ctc::from_weights(base_960h_config(), base_960h_weights(), Vocab::default());
+  assert!(
+    model.is_ok(),
+    "a fully base-960h-shaped weight set must build a model"
+  );
+}
+
+#[test]
+fn from_weights_rejects_wrong_lm_head_output_dim() {
+  // A hostile `lm_head.weight` with a huge output dim passes the config gate
+  // (vocab_size is a config field, pinned to 32 — but the tensor itself is read
+  // from the checkpoint) yet would drive a huge logits allocation at forward
+  // time. It must be rejected by the shape gate, before any forward, with a
+  // typed ShapePairMismatch naming the offending tensor via LayerKeyed.
+  let mut weights = base_960h_weights();
+  // 1,000,000 output rows instead of vocab_size (32); inner dim still correct.
+  weights.insert("lm_head.weight".to_string(), zeros(&[1_000_000, 768]));
+  let result = Wav2Vec2Ctc::from_weights(base_960h_config(), weights, Vocab::default());
+  let sp = expect_shape_rejection(result, "lm_head.weight");
+  // The expected shape is the base-960h (vocab_size, hidden_size); the observed
+  // is the hostile oversized one. Both computed here, not by the code under test.
+  assert_eq!(sp.expected(), &[32usize, 768]);
+  assert_eq!(sp.actual(), &[1_000_000usize, 768]);
+}
+
+#[test]
+fn from_weights_rejects_wrong_conv_kernel_size() {
+  // A feature-encoder conv weight whose kernel axis differs from the base-960h
+  // value silently changes the receptive field. L0's kernel is 10; a tensor
+  // with kernel 7 must be rejected by the shape gate (the feature encoder is
+  // built first, so this fails before any other tensor / any forward).
+  let mut weights = base_960h_weights();
+  // (512, 7, 1) instead of the base-960h (512, 10, 1).
+  weights.insert(
+    "feature_extractor.conv_layers.0.conv.weight".to_string(),
+    zeros(&[512, 7, 1]),
+  );
+  let result = Wav2Vec2Ctc::from_weights(base_960h_config(), weights, Vocab::default());
+  let sp = expect_shape_rejection(result, "feature_extractor.conv_layers.0.conv.weight");
+  assert_eq!(sp.expected(), &[512usize, 10, 1]);
+  assert_eq!(sp.actual(), &[512usize, 7, 1]);
+}
+
+#[test]
+fn from_weights_rejects_wrong_rank_tensor() {
+  // A consumed tensor with the wrong RANK (here a 2-D attention weight given as
+  // 3-D) is rejected by the same gate — the length comparison pins the rank, so
+  // a rank drift never slips through as a "close enough" shape.
+  let mut weights = base_960h_weights();
+  weights.insert(
+    "encoder.layers.0.attention.q_proj.weight".to_string(),
+    zeros(&[768, 768, 1]),
+  );
+  let result = Wav2Vec2Ctc::from_weights(base_960h_config(), weights, Vocab::default());
+  let sp = expect_shape_rejection(result, "encoder.layers.0.attention.q_proj.weight");
+  // Rank pinned: expected the rank-2 (hidden, hidden), observed the rank-3 drift.
+  assert_eq!(sp.expected(), &[768usize, 768]);
+  assert_eq!(sp.actual(), &[768usize, 768, 1]);
+}
+
+#[test]
+fn from_weights_rejects_wrong_pos_conv_weight_v() {
+  // The positional conv weight_v controls the positional receptive field; a
+  // deviating kernel/channel axis must be rejected (here kernel 64 instead of
+  // the base-960h 128).
+  let mut weights = base_960h_weights();
+  weights.insert(
+    "encoder.pos_conv_embed.conv.weight_v".to_string(),
+    zeros(&[768, 64, 48]),
+  );
+  let result = Wav2Vec2Ctc::from_weights(base_960h_config(), weights, Vocab::default());
+  let sp = expect_shape_rejection(result, "encoder.pos_conv_embed.conv.weight_v");
+  assert_eq!(sp.expected(), &[768usize, 128, 48]);
+  assert_eq!(sp.actual(), &[768usize, 64, 48]);
+}
+
+#[test]
+fn from_weights_rejects_wrong_feed_forward_dim() {
+  // The feed-forward intermediate weight is (intermediate_size, hidden_size) =
+  // (3072, 768); a deviating intermediate dim runs a different MLP and must be
+  // rejected.
+  let mut weights = base_960h_weights();
+  weights.insert(
+    "encoder.layers.3.feed_forward.intermediate_dense.weight".to_string(),
+    zeros(&[4096, 768]),
+  );
+  let result = Wav2Vec2Ctc::from_weights(base_960h_config(), weights, Vocab::default());
+  let sp = expect_shape_rejection(
+    result,
+    "encoder.layers.3.feed_forward.intermediate_dense.weight",
+  );
+  assert_eq!(sp.expected(), &[3072usize, 768]);
+  assert_eq!(sp.actual(), &[4096usize, 768]);
+}
+
+#[test]
+fn expect_shape_matches_and_mismatches() {
+  // Direct unit coverage of the shape-check helper: a correct shape passes; a
+  // wrong dim, a wrong rank, and the OOM-relevant oversized output dim each
+  // produce a LayerKeyed(ShapePairMismatch) carrying both full shapes.
+  let t = zeros(&[32, 768]);
+  assert!(expect_shape(&t, "lm_head.weight", "ctc head", &[32, 768]).is_ok());
+  // Wrong inner dim.
+  match expect_shape(&t, "lm_head.weight", "ctc head", &[32, 769]) {
+    Err(Error::LayerKeyed(p)) => {
+      assert_eq!(p.layer(), "lm_head.weight");
+      match p.inner() {
+        Error::ShapePairMismatch(sp) => {
+          assert_eq!(sp.expected(), &[32usize, 769]);
+          assert_eq!(sp.actual(), &[32usize, 768]);
+        }
+        other => panic!("expected ShapePairMismatch, got {other:?}"),
+      }
+    }
+    other => panic!("expected LayerKeyed for a wrong dim, got {other:?}"),
+  }
+  // Wrong rank (expecting rank-3 for a rank-2 tensor).
+  assert!(matches!(
+    expect_shape(&t, "lm_head.weight", "ctc head", &[32, 768, 1]),
+    Err(Error::LayerKeyed(_))
+  ));
+  // Oversized output dim (the OOM guard).
+  assert!(matches!(
+    expect_shape(&t, "lm_head.weight", "ctc head", &[1_000_000, 768]),
+    Err(Error::LayerKeyed(_))
+  ));
+}
+
 // ───────────────────────── loader error paths ─────────────────────────
 
 #[test]

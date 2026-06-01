@@ -36,9 +36,9 @@ use smol_str::format_smolstr;
 use crate::{
   array::Array,
   error::{
-    CapExceededPayload, Error, InvariantViolationPayload, LengthMismatchPayload,
+    CapExceededPayload, Error, InvariantViolationPayload, LayerKeyedPayload, LengthMismatchPayload,
     MalformedDataPayload, MissingKeyPayload, OutOfRangePayload, ParsePayload, RankMismatchPayload,
-    Result,
+    Result, ShapePairMismatchPayload,
   },
   lm::nn::{
     attention::{Mask, scaled_dot_product_attention},
@@ -800,6 +800,70 @@ fn take(weights: &mut HashMap<String, Array>, key: &str) -> Result<Array> {
     .ok_or_else(|| Error::MissingKey(MissingKeyPayload::new("Wav2Vec2Ctc::from_weights", key)))
 }
 
+/// Assert a checkpoint tensor's shape (rank + every dimension) equals the
+/// `expected` shape the base-960h architecture requires, before it is stored
+/// or fed to any op.
+///
+/// `from_weights` reads each layer's shape from the checkpoint, not from the
+/// config, so a corrupt / hostile tensor that survives the config gate could
+/// otherwise run a *different* graph (a conv weight with a different kernel
+/// axis → a different receptive field) or drive an oversized allocation (an
+/// `lm_head.weight` with a huge output dim → huge logits). Pinning every
+/// consumed tensor to its exact base-960h shape closes that whole dimension:
+/// a mismatch fails fast with a typed error here, before any forward op.
+///
+/// The expected dims are computed from the (already-`validate`d, hence pinned
+/// to base-960h) [`Wav2Vec2Config`] and are non-negative by construction. The
+/// rank is checked by the length comparison, so this single helper covers both
+/// the rank and the exact-shape requirements. On mismatch returns an
+/// [`Error::ShapePairMismatch`] carrying both full shapes, wrapped in an
+/// [`Error::LayerKeyed`] naming the offending tensor `key` (the dynamic per-
+/// layer key the `&'static` `descriptor` cannot carry).
+#[cfg(feature = "wav2vec2")]
+fn expect_shape(
+  tensor: &Array,
+  key: &str,
+  descriptor: &'static str,
+  expected: &[i32],
+) -> Result<()> {
+  let actual = tensor.shape();
+  // Compare in i64 so the usize dims and the i32 expectations both widen
+  // losslessly (real MLX dims are i32-bounded); the length check also pins the
+  // rank. A negative expected dim is a builder bug and never matches.
+  let matches = actual.len() == expected.len()
+    && actual
+      .iter()
+      .zip(expected.iter())
+      .all(|(&a, &e)| e >= 0 && a as i64 == i64::from(e));
+  if !matches {
+    let expected_usize: Vec<usize> = expected.iter().map(|&e| e.max(0) as usize).collect();
+    return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+      key,
+      Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+        descriptor,
+        expected_usize,
+        actual,
+      )),
+    )));
+  }
+  Ok(())
+}
+
+/// [`take`] a weight by key, then assert its shape equals `expected` via
+/// [`expect_shape`] — the fused fetch-and-shape-check the builders use for
+/// every tensor stored verbatim, so a consumed tensor can never skip the gate.
+#[cfg(feature = "wav2vec2")]
+fn take_shaped(
+  weights: &mut HashMap<String, Array>,
+  key: &str,
+  descriptor: &'static str,
+  expected: &[i32],
+) -> Result<Array> {
+  let tensor = take(weights, key)?;
+  expect_shape(&tensor, key, descriptor, expected)?;
+  Ok(tensor)
+}
+
 // ───────────────────────── feature encoder ─────────────────────────
 
 /// A single feature-encoder convolution layer. Conv weight is channels-last
@@ -1159,6 +1223,15 @@ impl Wav2Vec2Ctc {
   /// arm (i.e. `base-960h`) is supported; any other config is rejected.
   /// Every weight key the architecture needs must be present, else
   /// [`Error::MissingKey`].
+  ///
+  /// Beyond the config gate, **every consumed tensor's shape is pinned to its
+  /// exact base-960h dimensions** before it is stored or
+  /// fed to any op: a corrupt or hostile checkpoint that passes config
+  /// validation but carries a wrong-shaped tensor — a conv weight with a
+  /// different kernel axis (a different receptive field), or an `lm_head.weight`
+  /// with a huge output dim (a huge-logits allocation) — is rejected here with a
+  /// typed [`Error::ShapePairMismatch`] (wrapped in [`Error::LayerKeyed`] naming
+  /// the tensor), before any forward pass.
   pub fn from_weights(
     config: Wav2Vec2Config,
     mut weights: HashMap<String, Array>,
@@ -1172,8 +1245,21 @@ impl Wav2Vec2Ctc {
     let feature_encoder = build_feature_encoder(&config, &mut weights)?;
     let feature_projection = build_feature_projection(&config, &mut weights)?;
     let encoder = build_encoder(&config, &mut weights)?;
-    let lm_head_weight = take(&mut weights, "lm_head.weight")?;
-    let lm_head_bias = take(&mut weights, "lm_head.bias")?;
+    // CTC head Linear (out, in) = (vocab_size, hidden_size); bias (vocab_size,).
+    // Pinning the exact shape is the key allocation guard: an oversized output
+    // dim here would otherwise drive a huge logits tensor at forward time.
+    let lm_head_weight = take_shaped(
+      &mut weights,
+      "lm_head.weight",
+      "CTC head weight (vocab_size, hidden_size)",
+      &[config.vocab_size, config.hidden_size],
+    )?;
+    let lm_head_bias = take_shaped(
+      &mut weights,
+      "lm_head.bias",
+      "CTC head bias (vocab_size)",
+      &[config.vocab_size],
+    )?;
 
     Ok(Self {
       config,
@@ -1366,14 +1452,33 @@ fn build_feature_encoder(
   let mut conv_layers = Vec::with_capacity(n_usize);
   for i in 0..n_usize {
     let prefix = format!("feature_extractor.conv_layers.{i}");
-    let weight = take(weights, &format!("{prefix}.conv.weight"))?;
+    // Post-sanitize channels-last conv weight is (out, k, in): out = conv_dim[i],
+    // k = conv_kernel[i], in = 1 for L0 else conv_dim[i - 1]. A deviating kernel
+    // axis would silently change the receptive field, so pin the exact shape.
+    let in_ch = if i == 0 { 1 } else { config.conv_dim[i - 1] };
+    let weight = take_shaped(
+      weights,
+      &format!("{prefix}.conv.weight"),
+      "feature-encoder conv weight (out, k, in)",
+      &[config.conv_dim[i], config.conv_kernel[i], in_ch],
+    )?;
     let stride = config.conv_stride[i];
     // L0 carries an affine pytorch-compatible GroupNorm with
     // num_groups == dims == conv_dim[0]; L1-6 have no norm.
     let group_norm = if i == 0 {
       let dims = config.conv_dim[0];
-      let gn_weight = take(weights, &format!("{prefix}.layer_norm.weight"))?;
-      let gn_bias = take(weights, &format!("{prefix}.layer_norm.bias"))?;
+      let gn_weight = take_shaped(
+        weights,
+        &format!("{prefix}.layer_norm.weight"),
+        "feature-encoder L0 GroupNorm weight (conv_dim[0])",
+        &[dims],
+      )?;
+      let gn_bias = take_shaped(
+        weights,
+        &format!("{prefix}.layer_norm.bias"),
+        "feature-encoder L0 GroupNorm bias (conv_dim[0])",
+        &[dims],
+      )?;
       Some(GroupNorm::with_affine(
         dims,
         dims,
@@ -1399,11 +1504,40 @@ fn build_feature_projection(
   config: &Wav2Vec2Config,
   weights: &mut HashMap<String, Array>,
 ) -> Result<FeatureProjection> {
-  let ln_weight = take(weights, "feature_projection.layer_norm.weight")?;
-  let ln_bias = take(weights, "feature_projection.layer_norm.bias")?;
+  // The feature encoder's last conv width (conv_dim[-1]) is the projection's
+  // input dim and the pre-norm's normalized dim.
+  let conv_dim_last = *config.conv_dim.last().ok_or_else(|| {
+    Error::InvariantViolation(InvariantViolationPayload::new(
+      "Wav2Vec2Config: conv_dim",
+      "must be non-empty (the projection reads conv_dim[-1])",
+    ))
+  })?;
+  let ln_weight = take_shaped(
+    weights,
+    "feature_projection.layer_norm.weight",
+    "feature_projection LayerNorm weight (conv_dim[-1])",
+    &[conv_dim_last],
+  )?;
+  let ln_bias = take_shaped(
+    weights,
+    "feature_projection.layer_norm.bias",
+    "feature_projection LayerNorm bias (conv_dim[-1])",
+    &[conv_dim_last],
+  )?;
   let layer_norm = LayerNorm::new(Some(ln_weight), Some(ln_bias), config.layer_norm_eps);
-  let proj_weight = take(weights, "feature_projection.projection.weight")?;
-  let proj_bias = take(weights, "feature_projection.projection.bias")?;
+  // HF Linear weight is (out, in) = (hidden_size, conv_dim[-1]); bias (hidden_size,).
+  let proj_weight = take_shaped(
+    weights,
+    "feature_projection.projection.weight",
+    "feature_projection projection weight (hidden_size, conv_dim[-1])",
+    &[config.hidden_size, conv_dim_last],
+  )?;
+  let proj_bias = take_shaped(
+    weights,
+    "feature_projection.projection.bias",
+    "feature_projection projection bias (hidden_size)",
+    &[config.hidden_size],
+  )?;
   Ok(FeatureProjection {
     layer_norm,
     proj_weight,
@@ -1415,12 +1549,39 @@ fn build_feature_projection(
 #[cfg(feature = "wav2vec2")]
 fn build_encoder(config: &Wav2Vec2Config, weights: &mut HashMap<String, Array>) -> Result<Encoder> {
   // Positional conv embedding: reconstruct the fused weight-normalized kernel
-  // once, then a plain grouped conv at forward time.
-  let weight_g = take(weights, "encoder.pos_conv_embed.conv.weight_g")?;
-  let weight_v = take(weights, "encoder.pos_conv_embed.conv.weight_v")?;
-  let pos_weight = reconstruct_wn_weight(&weight_g, &weight_v)?;
-  let pos_bias = take(weights, "encoder.pos_conv_embed.conv.bias")?;
+  // once, then a plain grouped conv at forward time. Post-sanitize MLX layout
+  // (out, k, in/groups): weight_v is (hidden_size, num_conv_pos_embeddings,
+  // hidden_size / num_conv_pos_embedding_groups); weight_g is the per-kernel
+  // magnitude (1, num_conv_pos_embeddings, 1); bias is (hidden_size,). A
+  // deviating kernel axis here would silently change the positional receptive
+  // field, so pin every exact shape.
   let kernel = config.num_conv_pos_embeddings;
+  require_divisible(
+    "Wav2Vec2Config: hidden_size",
+    config.hidden_size,
+    "Wav2Vec2Config: num_conv_pos_embedding_groups",
+    config.num_conv_pos_embedding_groups,
+  )?;
+  let pos_in_per_group = config.hidden_size / config.num_conv_pos_embedding_groups;
+  let weight_g = take_shaped(
+    weights,
+    "encoder.pos_conv_embed.conv.weight_g",
+    "positional conv weight_g (1, num_conv_pos_embeddings, 1)",
+    &[1, kernel, 1],
+  )?;
+  let weight_v = take_shaped(
+    weights,
+    "encoder.pos_conv_embed.conv.weight_v",
+    "positional conv weight_v (hidden_size, num_conv_pos_embeddings, hidden_size / groups)",
+    &[config.hidden_size, kernel, pos_in_per_group],
+  )?;
+  let pos_weight = reconstruct_wn_weight(&weight_g, &weight_v)?;
+  let pos_bias = take_shaped(
+    weights,
+    "encoder.pos_conv_embed.conv.bias",
+    "positional conv bias (hidden_size)",
+    &[config.hidden_size],
+  )?;
   let pos_conv_embed = PositionalConvEmbedding {
     weight: pos_weight,
     bias: pos_bias,
@@ -1429,8 +1590,18 @@ fn build_encoder(config: &Wav2Vec2Config, weights: &mut HashMap<String, Array>) 
     num_pad_remove: if kernel % 2 == 0 { 1 } else { 0 },
   };
 
-  let ln_weight = take(weights, "encoder.layer_norm.weight")?;
-  let ln_bias = take(weights, "encoder.layer_norm.bias")?;
+  let ln_weight = take_shaped(
+    weights,
+    "encoder.layer_norm.weight",
+    "encoder LayerNorm weight (hidden_size)",
+    &[config.hidden_size],
+  )?;
+  let ln_bias = take_shaped(
+    weights,
+    "encoder.layer_norm.bias",
+    "encoder LayerNorm bias (hidden_size)",
+    &[config.hidden_size],
+  )?;
   let layer_norm = LayerNorm::new(Some(ln_weight), Some(ln_bias), config.layer_norm_eps);
 
   let num_layers = config.num_hidden_layers;
@@ -1443,42 +1614,121 @@ fn build_encoder(config: &Wav2Vec2Config, weights: &mut HashMap<String, Array>) 
   }
   let head_dim = config.head_dim()?;
   let scaling = (head_dim as f32).powf(-0.5);
+  // Per-layer expected shapes (all base-960h, pinned by `validate`): every
+  // attention projection is a square (hidden_size, hidden_size) Linear with a
+  // (hidden_size,) bias; the LayerNorms are (hidden_size,); the feed-forward is
+  // (intermediate_size, hidden_size) + (hidden_size, intermediate_size) Linears
+  // with their respective biases.
+  let hs = config.hidden_size;
+  let inter = config.intermediate_size;
+  let attn_proj = [hs, hs];
   let mut layers = Vec::with_capacity(num_layers as usize);
   for i in 0..num_layers {
     let prefix = format!("encoder.layers.{i}");
     let attention = Attention {
-      q_weight: take(weights, &format!("{prefix}.attention.q_proj.weight"))?,
-      q_bias: take(weights, &format!("{prefix}.attention.q_proj.bias"))?,
-      k_weight: take(weights, &format!("{prefix}.attention.k_proj.weight"))?,
-      k_bias: take(weights, &format!("{prefix}.attention.k_proj.bias"))?,
-      v_weight: take(weights, &format!("{prefix}.attention.v_proj.weight"))?,
-      v_bias: take(weights, &format!("{prefix}.attention.v_proj.bias"))?,
-      out_weight: take(weights, &format!("{prefix}.attention.out_proj.weight"))?,
-      out_bias: take(weights, &format!("{prefix}.attention.out_proj.bias"))?,
+      q_weight: take_shaped(
+        weights,
+        &format!("{prefix}.attention.q_proj.weight"),
+        "attention q_proj weight (hidden_size, hidden_size)",
+        &attn_proj,
+      )?,
+      q_bias: take_shaped(
+        weights,
+        &format!("{prefix}.attention.q_proj.bias"),
+        "attention q_proj bias (hidden_size)",
+        &[hs],
+      )?,
+      k_weight: take_shaped(
+        weights,
+        &format!("{prefix}.attention.k_proj.weight"),
+        "attention k_proj weight (hidden_size, hidden_size)",
+        &attn_proj,
+      )?,
+      k_bias: take_shaped(
+        weights,
+        &format!("{prefix}.attention.k_proj.bias"),
+        "attention k_proj bias (hidden_size)",
+        &[hs],
+      )?,
+      v_weight: take_shaped(
+        weights,
+        &format!("{prefix}.attention.v_proj.weight"),
+        "attention v_proj weight (hidden_size, hidden_size)",
+        &attn_proj,
+      )?,
+      v_bias: take_shaped(
+        weights,
+        &format!("{prefix}.attention.v_proj.bias"),
+        "attention v_proj bias (hidden_size)",
+        &[hs],
+      )?,
+      out_weight: take_shaped(
+        weights,
+        &format!("{prefix}.attention.out_proj.weight"),
+        "attention out_proj weight (hidden_size, hidden_size)",
+        &attn_proj,
+      )?,
+      out_bias: take_shaped(
+        weights,
+        &format!("{prefix}.attention.out_proj.bias"),
+        "attention out_proj bias (hidden_size)",
+        &[hs],
+      )?,
       num_heads: config.num_attention_heads,
       head_dim,
       scaling,
     };
-    let el_ln_weight = take(weights, &format!("{prefix}.layer_norm.weight"))?;
-    let el_ln_bias = take(weights, &format!("{prefix}.layer_norm.bias"))?;
+    let el_ln_weight = take_shaped(
+      weights,
+      &format!("{prefix}.layer_norm.weight"),
+      "encoder-layer LayerNorm weight (hidden_size)",
+      &[hs],
+    )?;
+    let el_ln_bias = take_shaped(
+      weights,
+      &format!("{prefix}.layer_norm.bias"),
+      "encoder-layer LayerNorm bias (hidden_size)",
+      &[hs],
+    )?;
     let layer_norm_l = LayerNorm::new(Some(el_ln_weight), Some(el_ln_bias), config.layer_norm_eps);
     let feed_forward = FeedForward {
-      intermediate_weight: take(
+      intermediate_weight: take_shaped(
         weights,
         &format!("{prefix}.feed_forward.intermediate_dense.weight"),
+        "feed_forward intermediate weight (intermediate_size, hidden_size)",
+        &[inter, hs],
       )?,
-      intermediate_bias: take(
+      intermediate_bias: take_shaped(
         weights,
         &format!("{prefix}.feed_forward.intermediate_dense.bias"),
+        "feed_forward intermediate bias (intermediate_size)",
+        &[inter],
       )?,
-      output_weight: take(
+      output_weight: take_shaped(
         weights,
         &format!("{prefix}.feed_forward.output_dense.weight"),
+        "feed_forward output weight (hidden_size, intermediate_size)",
+        &[hs, inter],
       )?,
-      output_bias: take(weights, &format!("{prefix}.feed_forward.output_dense.bias"))?,
+      output_bias: take_shaped(
+        weights,
+        &format!("{prefix}.feed_forward.output_dense.bias"),
+        "feed_forward output bias (hidden_size)",
+        &[hs],
+      )?,
     };
-    let fln_weight = take(weights, &format!("{prefix}.final_layer_norm.weight"))?;
-    let fln_bias = take(weights, &format!("{prefix}.final_layer_norm.bias"))?;
+    let fln_weight = take_shaped(
+      weights,
+      &format!("{prefix}.final_layer_norm.weight"),
+      "encoder-layer final LayerNorm weight (hidden_size)",
+      &[hs],
+    )?;
+    let fln_bias = take_shaped(
+      weights,
+      &format!("{prefix}.final_layer_norm.bias"),
+      "encoder-layer final LayerNorm bias (hidden_size)",
+      &[hs],
+    )?;
     let final_layer_norm = LayerNorm::new(Some(fln_weight), Some(fln_bias), config.layer_norm_eps);
     layers.push(EncoderLayer {
       attention,
