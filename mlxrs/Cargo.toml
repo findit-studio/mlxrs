@@ -27,7 +27,9 @@ embeddings           = ["tokenizer", "dep:memspan", "dep:glob"]
 lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm", "tokenizer-bpe", "tokenizer-chat", "tokenizer-deepseek-v32", "tokenizer-tools", "dep:regex"]
 llguidance           = ["lm", "dep:llguidance", "dep:toktrie_hf_tokenizers", "dep:serde_json"]
 vlm                  = ["lm", "dep:image"]
+lfm2-vl              = ["vlm"]                                                     # LFM2 hybrid conv+attention LM + (later) the LFM2.5-VL vision-language wrapper
 audio                = ["lm", "dep:symphonia", "dep:cpal", "dep:unicode-normalization", "dep:xattr"]
+wav2vec2             = ["audio", "dep:serde", "dep:serde_json"]                    # wav2vec2 CTC speech model (facebook/wav2vec2-base-960h): config + sanitize + char vocab.json
 unstable-ops-overload = []
 gguf                 = []
 
