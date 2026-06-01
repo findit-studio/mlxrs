@@ -75,6 +75,7 @@ libc = "0.2" # SIGABRT child-process test (tests/diagnostics.rs)
 
 [package.metadata.docs.rs]
 all-features = true
+default-target = "aarch64-apple-darwin"
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lints]
