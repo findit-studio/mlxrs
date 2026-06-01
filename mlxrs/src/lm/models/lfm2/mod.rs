@@ -47,8 +47,9 @@ use crate::{
   array::Array,
   dtype::Dtype,
   error::{
-    DivisibilityConstraintPayload, Error, InvariantViolationPayload, LengthMismatchPayload,
-    MissingKeyPayload, OutOfRangePayload, ParsePayload, Result,
+    AllocFailurePayload, DivisibilityConstraintPayload, Error, InvariantViolationPayload,
+    KeyCollisionPayload, LengthMismatchPayload, MissingKeyPayload, NonFiniteScalarPayload,
+    OutOfRangePayload, ParsePayload, Result,
   },
   lm::{
     cache::{ArraysCache, KvCache, MaskMode, StandardKvCache},
@@ -77,16 +78,28 @@ use smol_str::format_smolstr;
 /// `mlx_pad`'s constant-fill mode string.
 const PAD_CONSTANT: &CStr = c"constant";
 
-/// Inclusive upper bound for every dimension-like [`TextConfig`] field
-/// (`hidden_size`, head counts, layer count, `vocab_size`, the MLP widths,
-/// `conv_L_cache`). `2^24` is far above any real LFM2 checkpoint (the largest
-/// real value, `vocab_size`, is ~10^5) yet small enough that the downstream
-/// `i32` shape arithmetic — the `2 * block_ff_dim` and
-/// `block_multiple_of * ceil(..)` of [`adjusted_ff_dim`], the per-head
-/// reshapes, and the vocab-width logits projection — cannot overflow `i32`.
-/// Rejecting an oversized field here keeps a malformed config a recoverable
-/// [`Error::OutOfRange`] instead of a wrapping multiply downstream.
+/// Inclusive upper bound for every *width*-like [`TextConfig`] field
+/// (`hidden_size`, `vocab_size`, the MLP widths, `conv_L_cache`). `2^24` is far
+/// above any real LFM2 checkpoint (the largest real value, `vocab_size`, is
+/// ~10^5) yet small enough that the downstream `i32` shape arithmetic — the
+/// `2 * block_ff_dim` and `block_multiple_of * ceil(..)` of [`adjusted_ff_dim`],
+/// the per-head reshapes, and the vocab-width logits projection — cannot
+/// overflow `i32`. Rejecting an oversized field here keeps a malformed config a
+/// recoverable [`Error::OutOfRange`] instead of a wrapping multiply downstream.
 const MAX_CONFIG_DIM: i32 = 1 << 24;
+
+/// Inclusive upper bound for every *cardinality*-like [`TextConfig`] field —
+/// `num_hidden_layers` (a per-layer `Vec` of heavyweight
+/// [`Lfm2DecoderLayer`]s is reserved up front) and the head counts. Unlike the
+/// width fields these size *eager allocations* (the decoder-layer `Vec`, the
+/// per-layer cache), so the overflow-safe `2^24` width cap is far too loose:
+/// `2^24` layers would request a multi-gigabyte `Vec` before the first
+/// missing-key error. The largest real LFM2 has tens of layers and ~10^1 heads;
+/// `4096` is generous headroom yet keeps a malformed cardinality a recoverable
+/// [`Error::OutOfRange`] (or, if it still slips through, a recoverable
+/// [`Error::AllocFailure`] from the `try_reserve`d layer `Vec`) rather than an
+/// allocator abort.
+const MAX_CONFIG_CARDINALITY: i32 = 4096;
 
 // ───────────────────────── config ─────────────────────────
 
@@ -246,33 +259,63 @@ impl TextConfig {
   ///
   /// `block_multiple_of` must be `>= 1` (it is the rounding divisor in the
   /// `auto_adjust_ff_dim` reduction; a zero divisor would divide-by-zero).
+  ///
+  /// Beyond the per-field bounds:
+  ///
+  /// - the derived `head_dim` must be **even** — LFM2 builds
+  ///   [`Rope::new(head_dim)`](crate::lm::nn::rope::Rope::new), whose rotation
+  ///   pairs feature `k` with `k + head_dim/2`; an odd `head_dim` loads but
+  ///   only fails inside the forward pass.
+  /// - `block_ffn_dim_multiplier` must be **finite and positive**, and the
+  ///   resulting `auto_adjust_ff_dim` width must itself stay within the width
+  ///   cap — a huge multiplier would otherwise saturate / overflow the `i32`
+  ///   MLP-width arithmetic at load time.
+  ///
   /// Returns the first violation as [`Error::OutOfRange`] /
-  /// [`Error::DivisibilityConstraint`]; `Ok(())` when every field is sound.
+  /// [`Error::DivisibilityConstraint`] / [`Error::NonFiniteScalar`]; `Ok(())`
+  /// when every field is sound.
   pub fn validate(&self) -> Result<()> {
-    // Every dimension-like field: positive and within the overflow-safe cap.
-    let dims: [(&'static str, i32); 9] = [
+    // Width-like fields: positive and within the overflow-safe `2^24` cap.
+    let widths: [(&'static str, i32); 5] = [
       ("hidden_size", self.hidden_size),
-      ("num_hidden_layers", self.num_hidden_layers),
-      ("num_attention_heads", self.num_attention_heads),
-      ("num_key_value_heads", self.num_key_value_heads),
       ("vocab_size", self.vocab_size),
       ("block_dim", self.block_dim),
       ("block_ff_dim", self.block_ff_dim),
-      ("block_multiple_of", self.block_multiple_of),
       ("conv_L_cache", self.conv_l_cache),
     ];
-    for (name, value) in dims {
-      if value <= 0 {
-        return Err(Error::OutOfRange(OutOfRangePayload::new(
-          "TextConfig::validate",
-          "must be a positive integer",
-          format_smolstr!("{name}={value}"),
-        )));
-      }
+    for (name, value) in widths {
+      Self::check_positive(name, value)?;
       if value > MAX_CONFIG_DIM {
         return Err(Error::OutOfRange(OutOfRangePayload::new(
           "TextConfig::validate",
           "must be <= 2^24 (oversized / overflow-prone dimension)",
+          format_smolstr!("{name}={value}"),
+        )));
+      }
+    }
+    // `block_multiple_of` is a width-arithmetic divisor: positive (a zero would
+    // divide-by-zero in `adjusted_ff_dim`) and within the width cap.
+    Self::check_positive("block_multiple_of", self.block_multiple_of)?;
+    if self.block_multiple_of > MAX_CONFIG_DIM {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "TextConfig::validate",
+        "must be <= 2^24 (oversized / overflow-prone dimension)",
+        format_smolstr!("block_multiple_of={}", self.block_multiple_of),
+      )));
+    }
+    // Cardinality-like fields size eager allocations (the decoder-layer `Vec`,
+    // the per-layer cache), so they take the much smaller realistic cap.
+    let cardinalities: [(&'static str, i32); 3] = [
+      ("num_hidden_layers", self.num_hidden_layers),
+      ("num_attention_heads", self.num_attention_heads),
+      ("num_key_value_heads", self.num_key_value_heads),
+    ];
+    for (name, value) in cardinalities {
+      Self::check_positive(name, value)?;
+      if value > MAX_CONFIG_CARDINALITY {
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "TextConfig::validate",
+          "must be <= 4096 (oversized layer/head count — would over-allocate)",
           format_smolstr!("{name}={value}"),
         )));
       }
@@ -289,6 +332,20 @@ impl TextConfig {
         ),
       ));
     }
+    // RoPE rotates feature `k` with `k + head_dim/2`, so `head_dim` must be
+    // even; an odd one loads but only fails inside the attention forward pass.
+    let head_dim = self.head_dim();
+    if head_dim % 2 != 0 {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "TextConfig::validate (RoPE head_dim)",
+        "head_dim (= hidden_size / num_attention_heads) must be even",
+        format_smolstr!(
+          "head_dim={head_dim} (hidden_size={}, num_attention_heads={})",
+          self.hidden_size,
+          self.num_attention_heads
+        ),
+      )));
+    }
     // GQA: query heads must be an integer multiple of key/value heads.
     if self.num_attention_heads % self.num_key_value_heads != 0 {
       return Err(Error::DivisibilityConstraint(
@@ -300,6 +357,49 @@ impl TextConfig {
           self.num_key_value_heads as u64,
         ),
       ));
+    }
+    // The SwiGLU `auto_adjust_ff_dim` multiplier is a free-floating f32: reject
+    // a non-finite / non-positive value, then run the reduction eagerly so a
+    // multiplier that would saturate / overflow the i32 MLP-width arithmetic is
+    // a config-time error and the resulting width stays within the cap.
+    if !self.block_ffn_dim_multiplier.is_finite() {
+      return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+        "TextConfig::validate (block_ffn_dim_multiplier)",
+        f64::from(self.block_ffn_dim_multiplier),
+      )));
+    }
+    if self.block_ffn_dim_multiplier <= 0.0 {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "TextConfig::validate (block_ffn_dim_multiplier)",
+        "must be a positive float",
+        format_smolstr!("block_ffn_dim_multiplier={}", self.block_ffn_dim_multiplier),
+      )));
+    }
+    let adjusted = adjusted_ff_dim(
+      self.block_ff_dim,
+      self.block_multiple_of,
+      self.block_auto_adjust_ff_dim,
+      self.block_ffn_dim_multiplier,
+    )?;
+    if adjusted > MAX_CONFIG_DIM {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "TextConfig::validate (adjusted feed-forward width)",
+        "auto_adjust_ff_dim result must be <= 2^24",
+        format_smolstr!("adjusted_ff_dim={adjusted}"),
+      )));
+    }
+    Ok(())
+  }
+
+  /// Reject a non-positive dimension-like field as a typed
+  /// [`Error::OutOfRange`].
+  fn check_positive(name: &'static str, value: i32) -> Result<()> {
+    if value <= 0 {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "TextConfig::validate",
+        "must be a positive integer",
+        format_smolstr!("{name}={value}"),
+      )));
     }
     Ok(())
   }
@@ -351,17 +451,47 @@ fn is_attention_layer(attn_idxs: &[i32], idx: i32) -> bool {
 /// `ff = round_up(multiplier * (2/3 * ff_dim), multiple_of)` (multiplier
 /// applied only when `> 0`). Returns `ff_dim` unchanged when `adjust` is
 /// false. All integer arithmetic mirrors Python's truncating `int(...)`.
-fn adjusted_ff_dim(ff_dim: i32, multiple_of: i32, adjust: bool, multiplier: f32) -> i32 {
+///
+/// Every step is **checked**: `multiplier` is a free-floating `f32` from the
+/// config, so a large value (or one that, multiplied in, exceeds `i32`) would
+/// saturate the `as i32` cast to `i32::MAX` and then wrap (or panic) on the
+/// `ff + multiple_of - 1` round-up. A saturating / wrapping result is reported
+/// as a typed [`Error::OutOfRange`] (rather than a silently-wrong width or an
+/// overflow panic). [`TextConfig::validate`] runs this eagerly so the failure
+/// surfaces at config time, not mid-load. `multiplier` is assumed already
+/// validated finite + positive by the caller; `multiple_of >= 1` likewise.
+fn adjusted_ff_dim(ff_dim: i32, multiple_of: i32, adjust: bool, multiplier: f32) -> Result<i32> {
   if !adjust {
-    return ff_dim;
+    return Ok(ff_dim);
   }
+  let out_of_range = |what: &'static str| {
+    Error::OutOfRange(OutOfRangePayload::new(
+      "adjusted_ff_dim (auto_adjust_ff_dim overflowed i32)",
+      what,
+      format_smolstr!("ff_dim={ff_dim}, multiple_of={multiple_of}, multiplier={multiplier}"),
+    ))
+  };
   // `int(2 * ff_dim / 3)` — Python truncates toward zero.
-  let mut ff = (2 * ff_dim) / 3;
+  let two_ff = ff_dim
+    .checked_mul(2)
+    .ok_or_else(|| out_of_range("2 * ff_dim must not overflow i32"))?;
+  let base = two_ff / 3;
   // `int(ffn_dim_multiplier * ff_dim)` — mlx-lm always applies this when the
-  // multiplier is not None; the VL config defaults it to 1.0.
-  ff = (multiplier * ff as f32) as i32;
+  // multiplier is not None; the VL config defaults it to 1.0. The product is
+  // computed in f64 and range-checked before the truncating cast so a large
+  // multiplier becomes a typed error rather than an `i32::MAX` saturation.
+  let scaled_f = f64::from(multiplier) * f64::from(base);
+  if !(scaled_f >= 0.0 && scaled_f <= f64::from(i32::MAX)) {
+    return Err(out_of_range("multiplier * (2/3 * ff_dim) must fit in i32"));
+  }
+  let ff = scaled_f as i32;
   // `multiple_of * ((ff + multiple_of - 1) // multiple_of)` — round up.
-  multiple_of * ((ff + multiple_of - 1) / multiple_of)
+  let bumped = ff
+    .checked_add(multiple_of - 1)
+    .ok_or_else(|| out_of_range("ff + multiple_of - 1 must not overflow i32"))?;
+  multiple_of
+    .checked_mul(bumped / multiple_of)
+    .ok_or_else(|| out_of_range("multiple_of * ceil(ff / multiple_of) must not overflow i32"))
 }
 
 // ───────────────────────── attention ─────────────────────────
@@ -848,13 +978,34 @@ fn take_weight(
   })
 }
 
-/// Pull an optional weight (bias) out of the map by `name` — `None` when the
-/// checkpoint omits it (`bias=False` layers).
-fn take_optional(
+/// Pull a `conv_bias`-gated bias tensor out of the map by `name`.
+///
+/// `bias_enabled` is `config.conv_bias`, which `lfm2.py` uses as the `bias=`
+/// flag when constructing the conv and its `in_proj` / `out_proj`. It is
+/// authoritative:
+///
+/// - `true` ⇒ the bias is **required**; absence is a typed
+///   [`Error::MissingKey`] rather than a silent run-without-bias.
+/// - `false` ⇒ the bias must be **absent**; a present key is a typed
+///   [`Error::KeyCollision`] (the checkpoint contradicts the config) rather
+///   than a stray bias silently applied.
+fn take_conv_bias(
   weights: &mut std::collections::HashMap<String, Array>,
   name: &str,
-) -> Option<Array> {
-  weights.remove(name)
+  bias_enabled: bool,
+) -> Result<Option<Array>> {
+  match (bias_enabled, weights.remove(name)) {
+    (true, Some(bias)) => Ok(Some(bias)),
+    (true, None) => Err(Error::MissingKey(MissingKeyPayload::new(
+      "LFM2 conv bias (conv_bias=true requires this bias)",
+      format_smolstr!("{name}"),
+    ))),
+    (false, None) => Ok(None),
+    (false, Some(_)) => Err(Error::KeyCollision(KeyCollisionPayload::new(
+      "LFM2 conv bias (conv_bias=false forbids a bias tensor)",
+      format_smolstr!("{name}"),
+    ))),
+  }
 }
 
 impl Lfm2 {
@@ -883,7 +1034,21 @@ impl Lfm2 {
       eps,
     );
 
-    let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
+    // `num_hidden_layers` is bounded by `MAX_CONFIG_CARDINALITY` in `validate`,
+    // but reserve via `try_reserve` so even a within-cap heavyweight per-layer
+    // `Vec` that the allocator cannot satisfy is a recoverable error rather
+    // than `with_capacity`'s abort.
+    let mut layers: Vec<Lfm2DecoderLayer> = Vec::new();
+    layers
+      .try_reserve_exact(config.num_hidden_layers as usize)
+      .map_err(|e| {
+        Error::AllocFailure(AllocFailurePayload::new(
+          "Lfm2::from_weights: decoder layers",
+          "Lfm2DecoderLayer",
+          config.num_hidden_layers as u64,
+          e,
+        ))
+      })?;
     for i in 0..config.num_hidden_layers {
       let p = format!("model.layers.{i}");
       let operator_norm = RMSNorm::new(
@@ -895,13 +1060,8 @@ impl Lfm2 {
         eps,
       );
 
-      let ff_dim = adjusted_ff_dim(
-        config.block_ff_dim,
-        config.block_multiple_of,
-        config.block_auto_adjust_ff_dim,
-        config.block_ffn_dim_multiplier,
-      );
-      let _ = ff_dim; // dims are validated by the loaded weight shapes
+      // The feed-forward width is validated eagerly in `validate` (and again by
+      // the loaded weight shapes), so no per-layer recomputation is needed here.
       let feed_forward = Mlp {
         w1: Linear::new(
           take_weight(&mut weights, &format!("{p}.feed_forward.w1.weight"))?,
@@ -951,19 +1111,27 @@ impl Lfm2 {
         })
       } else {
         let c = format!("{p}.conv");
+        let conv_weight = take_weight(&mut weights, &format!("{c}.conv.weight"))?;
+        let in_weight = take_weight(&mut weights, &format!("{c}.in_proj.weight"))?;
+        let out_weight = take_weight(&mut weights, &format!("{c}.out_proj.weight"))?;
+        // `conv_bias` is authoritative (`lfm2.py` builds the conv + its two
+        // projections with `bias=config.conv_bias`): when set, all three bias
+        // tensors are required; when unset, none may be present (a stray bias
+        // key would otherwise be silently applied).
+        let conv_bias = take_conv_bias(&mut weights, &format!("{c}.conv.bias"), config.conv_bias)?;
+        let in_bias = take_conv_bias(&mut weights, &format!("{c}.in_proj.bias"), config.conv_bias)?;
+        let out_bias = take_conv_bias(
+          &mut weights,
+          &format!("{c}.out_proj.bias"),
+          config.conv_bias,
+        )?;
         Mixer::Conv(ShortConv {
           hidden_size: config.hidden_size,
           l_cache: config.conv_l_cache,
-          conv_weight: take_weight(&mut weights, &format!("{c}.conv.weight"))?,
-          conv_bias: take_optional(&mut weights, &format!("{c}.conv.bias")),
-          in_proj: Linear::new(
-            take_weight(&mut weights, &format!("{c}.in_proj.weight"))?,
-            take_optional(&mut weights, &format!("{c}.in_proj.bias")),
-          ),
-          out_proj: Linear::new(
-            take_weight(&mut weights, &format!("{c}.out_proj.weight"))?,
-            take_optional(&mut weights, &format!("{c}.out_proj.bias")),
-          ),
+          conv_weight,
+          conv_bias,
+          in_proj: Linear::new(in_weight, in_bias),
+          out_proj: Linear::new(out_weight, out_bias),
         })
       };
 

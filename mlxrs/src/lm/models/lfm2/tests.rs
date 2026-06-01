@@ -430,19 +430,103 @@ fn default_config_passes_validation() {
   assert!(TextConfig::from_json("{}").unwrap().validate().is_ok());
 }
 
+#[test]
+fn validate_rejects_huge_layer_and_head_counts() {
+  // A cardinality field past the realistic 4096 cap would size a multi-GB
+  // per-layer Vec / cache before the first missing-key error; it must be a
+  // recoverable OutOfRange at config time.
+  let huge_layers = r#"{"num_hidden_layers": 16777216, "hidden_size": 8,
+    "num_attention_heads": 2, "num_key_value_heads": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(huge_layers),
+    Err(Error::OutOfRange(_))
+  ));
+  // The head counts are cardinalities too (they bound per-head reshapes and
+  // the cap keeps them realistic). 8192 > 4096.
+  let huge_heads = r#"{"num_attention_heads": 8192, "num_key_value_heads": 8192,
+    "hidden_size": 8192, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(huge_heads),
+    Err(Error::OutOfRange(_))
+  ));
+  // The cap boundary: exactly 4096 layers is accepted (within cap), 4097 is
+  // not — isolating the off-by-one. `hidden_size`/heads kept sound + even
+  // head_dim.
+  let at_cap = r#"{"num_hidden_layers": 4096, "hidden_size": 8,
+    "num_attention_heads": 2, "num_key_value_heads": 2}"#;
+  assert!(TextConfig::from_json(at_cap).unwrap().validate().is_ok());
+  let over_cap = r#"{"num_hidden_layers": 4097, "hidden_size": 8,
+    "num_attention_heads": 2, "num_key_value_heads": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(over_cap),
+    Err(Error::OutOfRange(_))
+  ));
+}
+
+#[test]
+fn validate_rejects_odd_rope_head_dim() {
+  // hidden=6, heads=2 -> head_dim=3 (odd). RoPE pairs feature k with
+  // k + head_dim/2, so an odd head_dim loads but only fails in the forward
+  // pass; validate must reject it eagerly. (6 % 2 == 0 so the divisibility
+  // check passes — this isolates the even-head_dim rule.)
+  let odd = r#"{"hidden_size": 6, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(odd),
+    Err(Error::OutOfRange(_))
+  ));
+  // An even head_dim (hidden=8, heads=2 -> 4) passes.
+  let even = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(TextConfig::from_json(even).unwrap().validate().is_ok());
+}
+
+#[test]
+fn validate_rejects_unbounded_ffn_multiplier() {
+  // A huge `block_ffn_dim_multiplier` overflows the i32 MLP-width arithmetic
+  // in adjusted_ff_dim (which `from_weights` calls). It must be a recoverable
+  // config-time error, not a saturating cast + overflow panic. (Sound base
+  // config so the multiplier is the only malformed field.)
+  let huge = r#"{"block_ffn_dim_multiplier": 1e30, "hidden_size": 8,
+    "num_attention_heads": 2, "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(huge),
+    Err(Error::OutOfRange(_))
+  ));
+  // A non-finite multiplier (NaN / Inf) must be a NonFiniteScalar. serde's
+  // JSON grammar has no NaN/Inf literal, so the field is set directly on an
+  // otherwise-valid parsed config and validate() called.
+  let base = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  let mut nan_cfg = TextConfig::from_json(base).unwrap();
+  nan_cfg.block_ffn_dim_multiplier = f32::NAN;
+  assert!(matches!(nan_cfg.validate(), Err(Error::NonFiniteScalar(_))));
+  let mut inf_cfg = TextConfig::from_json(base).unwrap();
+  inf_cfg.block_ffn_dim_multiplier = f32::INFINITY;
+  assert!(matches!(inf_cfg.validate(), Err(Error::NonFiniteScalar(_))));
+  // A non-positive multiplier is rejected too (it would zero / negate the MLP
+  // width).
+  let neg = r#"{"block_ffn_dim_multiplier": -1.0, "hidden_size": 8,
+    "num_attention_heads": 2, "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(neg),
+    Err(Error::OutOfRange(_))
+  ));
+}
+
 // ───────────────────────── cache cardinality ─────────────────────────
 
-/// Build a tiny all-conv 2-layer [`Lfm2`] (`hidden=4`, `vocab=8`, `K=3`,
-/// `ff=8`, no `auto_adjust_ff_dim`). All-conv keeps the per-layer weight set
-/// to the conv + MLP + norms (no attention QK-norm / RoPE projections), which
-/// is enough to exercise the forward-pass cache-cardinality guard.
-fn tiny_all_conv_model() -> Lfm2 {
+/// The tiny all-conv config JSON (`hidden=4`, `vocab=8`, `K=3`, `ff=8`, no
+/// `auto_adjust_ff_dim`, 2 layers) shared by the cardinality / conv-bias load
+/// tests. `conv_bias` is templated in by [`tiny_all_conv_weights`].
+const TINY_ALL_CONV_DIMS: (usize, usize, usize, usize) = (4, 8, 8, 3);
+
+/// Build the flat weight map for a tiny all-conv 2-layer LFM2. When
+/// `with_conv_bias` is set, each conv layer also carries `conv.bias`,
+/// `in_proj.bias`, and `out_proj.bias` (the three `conv_bias`-gated tensors).
+fn tiny_all_conv_weights(with_conv_bias: bool) -> std::collections::HashMap<String, Array> {
   use std::collections::HashMap;
-  let json = r#"{"hidden_size": 4, "num_attention_heads": 2,
-    "num_key_value_heads": 2, "num_hidden_layers": 2, "vocab_size": 8,
-    "conv_L_cache": 3, "block_auto_adjust_ff_dim": false, "block_ff_dim": 8}"#;
-  let cfg = TextConfig::from_json(json).unwrap();
-  let (hidden, vocab, ff, k) = (4usize, 8usize, 8usize, 3usize);
+  let (hidden, vocab, ff, k) = TINY_ALL_CONV_DIMS;
 
   // A deterministic `(rows, cols)` weight whose entries are tiny and distinct.
   let mat = |rows: usize, cols: usize| -> Array {
@@ -472,8 +556,34 @@ fn tiny_all_conv_model() -> Lfm2 {
     );
     w.insert(format!("{p}.conv.in_proj.weight"), mat(3 * hidden, hidden));
     w.insert(format!("{p}.conv.out_proj.weight"), mat(hidden, hidden));
+    if with_conv_bias {
+      // `conv.bias` is per-channel `(hidden,)`; the projection biases match
+      // their output widths (`in_proj` -> 3*hidden, `out_proj` -> hidden).
+      w.insert(format!("{p}.conv.conv.bias"), vecn(hidden));
+      w.insert(format!("{p}.conv.in_proj.bias"), vecn(3 * hidden));
+      w.insert(format!("{p}.conv.out_proj.bias"), vecn(hidden));
+    }
   }
-  Lfm2::from_weights(cfg, w).unwrap()
+  w
+}
+
+/// The tiny all-conv config with the given `conv_bias` flag.
+fn tiny_all_conv_config(conv_bias: bool) -> TextConfig {
+  let json = format!(
+    r#"{{"hidden_size": 4, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "vocab_size": 8,
+    "conv_L_cache": 3, "block_auto_adjust_ff_dim": false, "block_ff_dim": 8,
+    "conv_bias": {conv_bias}}}"#
+  );
+  TextConfig::from_json(&json).unwrap()
+}
+
+/// Build a tiny all-conv 2-layer [`Lfm2`] (`conv_bias=false`, no biases).
+/// All-conv keeps the per-layer weight set to the conv + MLP + norms (no
+/// attention QK-norm / RoPE projections), which is enough to exercise the
+/// forward-pass cache-cardinality guard.
+fn tiny_all_conv_model() -> Lfm2 {
+  Lfm2::from_weights(tiny_all_conv_config(false), tiny_all_conv_weights(false)).unwrap()
 }
 
 #[test]
@@ -516,10 +626,95 @@ fn adjusted_ff_dim_matches_reference_formula() {
   // block_ff_dim=6656, multiple_of=256, multiplier=1.0, adjust=true:
   //   int(2*6656/3)=4437; int(1.0*4437)=4437;
   //   256 * ceil(4437/256) = 256 * 18 = 4608.
-  assert_eq!(adjusted_ff_dim(6656, 256, true, 1.0), 4608);
+  assert_eq!(adjusted_ff_dim(6656, 256, true, 1.0).unwrap(), 4608);
   // adjust=false returns ff_dim unchanged.
-  assert_eq!(adjusted_ff_dim(6656, 256, false, 1.0), 6656);
+  assert_eq!(adjusted_ff_dim(6656, 256, false, 1.0).unwrap(), 6656);
   // A non-unit multiplier: int(2*3000/3)=2000; int(0.5*2000)=1000;
   //   128 * ceil(1000/128) = 128 * 8 = 1024.
-  assert_eq!(adjusted_ff_dim(3000, 128, true, 0.5), 1024);
+  assert_eq!(adjusted_ff_dim(3000, 128, true, 0.5).unwrap(), 1024);
+}
+
+#[test]
+fn adjusted_ff_dim_rejects_overflowing_multiplier() {
+  // A huge multiplier would saturate `(multiplier * base) as i32` to i32::MAX
+  // and then overflow the `ff + multiple_of - 1` round-up. It must instead be
+  // a recoverable OutOfRange, never a panic or a silently-wrapped width.
+  assert!(matches!(
+    adjusted_ff_dim(6656, 256, true, 1e30),
+    Err(Error::OutOfRange(_))
+  ));
+  // A multiplier just past the i32 ceiling for this base (base = 2*6656/3 =
+  // 4437; 4437 * multiplier > i32::MAX) is likewise rejected.
+  let just_over = (i32::MAX as f32 / 4437.0) * 2.0;
+  assert!(matches!(
+    adjusted_ff_dim(6656, 256, true, just_over),
+    Err(Error::OutOfRange(_))
+  ));
+}
+
+// ───────────────────────── conv_bias gating ─────────────────────────
+
+#[test]
+fn conv_bias_true_loads_with_all_biases() {
+  use crate::lm::model::Model as _;
+  // conv_bias=true + all three bias tensors present per conv layer: loads and
+  // runs (the bias is honored, not silently dropped).
+  let model = Lfm2::from_weights(tiny_all_conv_config(true), tiny_all_conv_weights(true)).unwrap();
+  let tokens = Array::from_slice::<i32>(&[1, 3], &(1usize, 2usize)).unwrap();
+  let mut cache = model.make_cache();
+  let logits = model.forward(&tokens, &mut cache).unwrap();
+  assert_eq!(logits.shape(), vec![1, 2, 8]);
+}
+
+#[test]
+fn conv_bias_true_missing_bias_is_missing_key() {
+  // conv_bias=true but a required bias tensor is absent: must be a typed
+  // MissingKey (a silent run-without-bias would diverge from the reference).
+  // Drop one bias from an otherwise-complete biased weight map.
+  let mut w = tiny_all_conv_weights(true);
+  assert!(w.remove("model.layers.0.conv.conv.bias").is_some());
+  assert!(matches!(
+    Lfm2::from_weights(tiny_all_conv_config(true), w),
+    Err(Error::MissingKey(_))
+  ));
+
+  // Likewise for a missing projection bias.
+  let mut w = tiny_all_conv_weights(true);
+  assert!(w.remove("model.layers.1.conv.in_proj.bias").is_some());
+  assert!(matches!(
+    Lfm2::from_weights(tiny_all_conv_config(true), w),
+    Err(Error::MissingKey(_))
+  ));
+}
+
+#[test]
+fn conv_bias_false_extra_bias_is_key_collision() {
+  // conv_bias=false but a bias tensor IS present: must be a typed KeyCollision
+  // (the stray bias would otherwise be silently applied). Add one bias to an
+  // otherwise-biasless weight map.
+  let mut w = tiny_all_conv_weights(false);
+  let vecn = |n: usize| -> Array {
+    let data: Vec<f32> = (0..n).map(|i| 1.0 + i as f32 * 0.1).collect();
+    Array::from_slice::<f32>(&data, &(n,)).unwrap()
+  };
+  w.insert("model.layers.0.conv.conv.bias".to_string(), vecn(4));
+  assert!(matches!(
+    Lfm2::from_weights(tiny_all_conv_config(false), w),
+    Err(Error::KeyCollision(_))
+  ));
+
+  // A stray projection bias is likewise rejected.
+  let mut w = tiny_all_conv_weights(false);
+  w.insert("model.layers.1.conv.out_proj.bias".to_string(), vecn(4));
+  assert!(matches!(
+    Lfm2::from_weights(tiny_all_conv_config(false), w),
+    Err(Error::KeyCollision(_))
+  ));
+}
+
+#[test]
+fn conv_bias_false_no_bias_loads() {
+  // The complement of the collision case: conv_bias=false + no bias tensors is
+  // the normal biasless path and loads cleanly.
+  assert!(Lfm2::from_weights(tiny_all_conv_config(false), tiny_all_conv_weights(false)).is_ok());
 }
