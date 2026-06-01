@@ -97,6 +97,12 @@ pub struct Wav2Vec2Config {
   /// rejected by [`Wav2Vec2Config::validate`].
   #[serde(default = "default_hidden_act")]
   pub hidden_act: String,
+  /// Feature-encoder conv activation. `base-960h` is `"gelu"` — every
+  /// feature-encoder conv layer hardcodes GELU, so a deviating value would
+  /// silently run a different feature encoder and is rejected by
+  /// [`Wav2Vec2Config::validate`].
+  #[serde(default = "default_feat_extract_activation")]
+  pub feat_extract_activation: String,
   /// Per-conv-layer output channel widths (length `num_feat_extract_layers`).
   #[serde(default = "default_conv_dim")]
   pub conv_dim: Vec<i32>,
@@ -125,6 +131,29 @@ pub struct Wav2Vec2Config {
   /// (see module docs).
   #[serde(default)]
   pub do_stable_layer_norm: bool,
+  /// Whether a convolutional adapter network is stacked on top of the encoder.
+  /// `base-960h`: `false`. When `true`, HF inserts a `Wav2Vec2Adapter` stack
+  /// that re-shapes the encoder output to `output_hidden_size` and the CTC head
+  /// reads from *that* dimension — a graph this port does not wire — so a
+  /// `true` checkpoint would load and run silently wrong. Rejected by
+  /// [`Wav2Vec2Config::validate`].
+  #[serde(default)]
+  pub add_adapter: bool,
+  /// Per-attention-block adapter dimension. `base-960h`: absent / `null`. When
+  /// set, HF adds a `Wav2Vec2AttnAdapterLayer` to every encoder layer whose
+  /// output is **added** to the hidden states — an extra graph term this port
+  /// does not wire — so a non-`null` value would load and run silently wrong.
+  /// Modeled as `Option<i32>` (absent ⇒ `None`) and rejected unless `None` by
+  /// [`Wav2Vec2Config::validate`].
+  #[serde(default)]
+  pub adapter_attn_dim: Option<i32>,
+  /// CTC blank-token id. `base-960h`: `0`. Greedy CTC decoding drops exactly
+  /// this id (the port hardcodes `CTC_BLANK = 0`), so a checkpoint declaring a
+  /// different blank would collapse the per-frame argmax against the wrong
+  /// token and decode silently wrong. Pinned to `0` by
+  /// [`Wav2Vec2Config::validate`].
+  #[serde(default = "default_pad_token_id")]
+  pub pad_token_id: i32,
 }
 
 #[cfg(feature = "wav2vec2")]
@@ -164,6 +193,10 @@ fn default_hidden_act() -> String {
   "gelu".to_string()
 }
 #[cfg(feature = "wav2vec2")]
+fn default_feat_extract_activation() -> String {
+  "gelu".to_string()
+}
+#[cfg(feature = "wav2vec2")]
 fn default_conv_dim() -> Vec<i32> {
   vec![512, 512, 512, 512, 512, 512, 512]
 }
@@ -187,6 +220,10 @@ fn default_num_conv_pos_embedding_groups() -> i32 {
 fn default_num_feat_extract_layers() -> i32 {
   7
 }
+#[cfg(feature = "wav2vec2")]
+fn default_pad_token_id() -> i32 {
+  0
+}
 
 // ── base-960h architecture constants ──
 //
@@ -205,6 +242,10 @@ fn default_num_feat_extract_layers() -> i32 {
 const BASE_960H_MODEL_TYPE: &str = "wav2vec2";
 #[cfg(feature = "wav2vec2")]
 const BASE_960H_HIDDEN_ACT: &str = "gelu";
+#[cfg(feature = "wav2vec2")]
+const BASE_960H_FEAT_EXTRACT_ACTIVATION: &str = "gelu";
+#[cfg(feature = "wav2vec2")]
+const BASE_960H_PAD_TOKEN_ID: i32 = 0;
 #[cfg(feature = "wav2vec2")]
 const BASE_960H_LAYER_NORM_EPS: f32 = 1e-5;
 #[cfg(feature = "wav2vec2")]
@@ -282,11 +323,24 @@ impl Wav2Vec2Config {
   /// Rejected (each as a typed error, never a panic or a silent mis-load):
   /// - `feat_extract_norm != "group"` ([`Error::UnknownEnumValue`]) — only the
   ///   group-norm feature-encoder arm is wired;
+  /// - `hidden_act != "gelu"` / `feat_extract_activation != "gelu"`
+  ///   ([`Error::UnknownEnumValue`]) — every transformer block and every
+  ///   feature-encoder conv hardcodes GELU, so a deviating activation would run
+  ///   a different graph silently;
   /// - `do_stable_layer_norm == true` ([`Error::InvariantViolation`]) — only
   ///   the post-norm arm is wired;
+  /// - `add_adapter == true` ([`Error::InvariantViolation`]) — the post-encoder
+  ///   convolutional adapter stack (which re-shapes the CTC head's input to
+  ///   `output_hidden_size`) is not wired;
+  /// - `adapter_attn_dim` set ([`Error::InvariantViolation`]) — the per-layer
+  ///   attention adapter (whose output is added to the hidden states) is not
+  ///   wired, so a non-`null` value would add a missing graph term silently;
   /// - `conv_bias == true` ([`Error::InvariantViolation`]) — the feature-encoder
   ///   conv layers store no bias and never add one, so a biased checkpoint
   ///   would run silently wrong;
+  /// - `pad_token_id != 0` ([`Error::OutOfRange`]) — greedy CTC decoding drops
+  ///   exactly id `0` (the hardcoded `CTC_BLANK`), so a different declared blank
+  ///   would collapse the argmax against the wrong token;
   /// - `model_type != "wav2vec2"` ([`Error::UnknownEnumValue`]);
   /// - any of `hidden_size`, `num_hidden_layers`, `num_attention_heads`,
   ///   `intermediate_size`, `vocab_size`, `num_conv_pos_embeddings`,
@@ -312,12 +366,34 @@ impl Wav2Vec2Config {
       self.hidden_act.as_str(),
       &[BASE_960H_HIDDEN_ACT],
     )?;
+    // Feature-encoder conv activation: every `ConvLayer` hardcodes GELU too, so
+    // a deviating value would silently run a different feature encoder.
+    pin_str(
+      "Wav2Vec2Config: feat_extract_activation",
+      self.feat_extract_activation.as_str(),
+      &[BASE_960H_FEAT_EXTRACT_ACTIVATION],
+    )?;
     // Only the base-960h post-norm arm is wired.
     pin_bool(
       "Wav2Vec2Config: do_stable_layer_norm",
       self.do_stable_layer_norm,
       false,
     )?;
+    // The post-encoder convolutional adapter stack is not wired: when `true`,
+    // HF re-shapes the encoder output (to `output_hidden_size`) before the CTC
+    // head, a graph this port does not build, so the head would read the wrong
+    // dimension and run silently wrong.
+    pin_bool("Wav2Vec2Config: add_adapter", self.add_adapter, false)?;
+    // The per-attention-block adapter is not wired: when `adapter_attn_dim` is
+    // set, HF adds a `Wav2Vec2AttnAdapterLayer` to every encoder layer whose
+    // output is *added* to the hidden states — an extra term this port omits.
+    // Only the absent (`None`) form is supported.
+    if self.adapter_attn_dim.is_some() {
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "Wav2Vec2Config: adapter_attn_dim",
+        "must be absent (null) — the per-layer attention adapter is not wired",
+      )));
+    }
     // `ConvLayer` has no bias field and `forward` calls `conv1d` without
     // adding one, so a `conv_bias == true` checkpoint would load (the bias
     // tensors becoming unconsumed, silently-dropped keys) and run wrong.
@@ -357,6 +433,14 @@ impl Wav2Vec2Config {
       "Wav2Vec2Config: vocab_size",
       self.vocab_size,
       BASE_960H_VOCAB_SIZE,
+    )?;
+    // CTC blank id: greedy decode hardcodes `CTC_BLANK = 0`, so a checkpoint
+    // declaring a different blank would collapse the per-frame argmax against
+    // the wrong token. Pin it to the base-960h value (`0`).
+    pin_i32(
+      "Wav2Vec2Config: pad_token_id",
+      self.pad_token_id,
+      BASE_960H_PAD_TOKEN_ID,
     )?;
     pin_i32(
       "Wav2Vec2Config: num_conv_pos_embeddings",
@@ -498,6 +582,13 @@ pub fn sanitize(weights: HashMap<String, Array>) -> Result<HashMap<String, Array
 /// drops this token and collapses runs.
 #[cfg(feature = "wav2vec2")]
 const CTC_BLANK: u32 = 0;
+
+// The greedy decoder hardcodes `CTC_BLANK` while `validate` pins the config's
+// `pad_token_id` to `BASE_960H_PAD_TOKEN_ID`; the two encode the same blank id
+// and must agree. This const assertion makes a future edit to either fail to
+// compile rather than let a pinned-but-unused blank silently drift.
+#[cfg(feature = "wav2vec2")]
+const _: () = assert!(CTC_BLANK == BASE_960H_PAD_TOKEN_ID as u32);
 
 /// Greedy CTC collapse of a single per-frame argmax sequence — pure Rust over
 /// `&[u32]`, the inner loop of mlx-audio's `Model._ctc_decode`

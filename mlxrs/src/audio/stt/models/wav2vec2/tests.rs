@@ -338,9 +338,13 @@ fn config_parses_base_960h_defaults_and_ignores_unknown() {
   assert_eq!(config.num_conv_pos_embedding_groups, 16);
   assert!(config.is_group_norm());
   assert_eq!(config.hidden_act, "gelu");
+  assert_eq!(config.feat_extract_activation, "gelu");
   assert!((config.layer_norm_eps - 1e-5).abs() < 1e-12);
   assert!(!config.do_stable_layer_norm);
   assert!(!config.conv_bias);
+  assert!(!config.add_adapter);
+  assert_eq!(config.adapter_attn_dim, None);
+  assert_eq!(config.pad_token_id, 0);
 }
 
 #[test]
@@ -562,6 +566,143 @@ fn config_validate_rejects_deviating_hidden_act() {
 }
 
 #[test]
+fn config_validate_rejects_deviating_feat_extract_activation() {
+  // The feature-encoder convs hardcode GELU, so a config naming a different
+  // `feat_extract_activation` would silently run a different feature encoder.
+  // Rejected with a typed UnknownEnumValue carrying the value + supported set.
+  let relu = Wav2Vec2Config::from_json(r#"{"feat_extract_activation": "relu"}"#).unwrap();
+  assert_eq!(relu.feat_extract_activation, "relu");
+  match relu.validate() {
+    Err(Error::UnknownEnumValue(p)) => {
+      assert_eq!(p.value(), "relu");
+      assert_eq!(p.supported(), &["gelu"]);
+    }
+    other => {
+      panic!("expected UnknownEnumValue for a deviating feat_extract_activation, got {other:?}")
+    }
+  }
+}
+
+#[test]
+fn config_validate_rejects_add_adapter() {
+  // `add_adapter == true` stacks a post-encoder conv adapter (re-shaping the
+  // CTC head's input dim) that this port does not wire, so the head would read
+  // the wrong dimension. `validate` must reject it with a typed
+  // InvariantViolation naming the field, BEFORE any tensor is built.
+  let cfg = Wav2Vec2Config::from_json(r#"{"add_adapter": true}"#).unwrap();
+  assert!(cfg.add_adapter);
+  match cfg.validate() {
+    Err(Error::InvariantViolation(p)) => {
+      assert!(
+        p.context().contains("add_adapter"),
+        "context should name add_adapter, got {:?}",
+        p.context()
+      );
+    }
+    other => panic!("expected InvariantViolation for add_adapter = true, got {other:?}"),
+  }
+}
+
+#[test]
+fn config_validate_rejects_adapter_attn_dim() {
+  // A set `adapter_attn_dim` adds a per-layer attention adapter (its output
+  // added to the hidden states) that this port omits, so a non-null value
+  // would silently drop a graph term. Only the absent (`None`) form is
+  // supported; a set value is a typed InvariantViolation naming the field.
+  let cfg = Wav2Vec2Config::from_json(r#"{"adapter_attn_dim": 16}"#).unwrap();
+  assert_eq!(cfg.adapter_attn_dim, Some(16));
+  match cfg.validate() {
+    Err(Error::InvariantViolation(p)) => {
+      assert!(
+        p.context().contains("adapter_attn_dim"),
+        "context should name adapter_attn_dim, got {:?}",
+        p.context()
+      );
+    }
+    other => panic!("expected InvariantViolation for a set adapter_attn_dim, got {other:?}"),
+  }
+  // An explicit `null` is equivalent to absent and validates (the base-960h
+  // form), so a checkpoint that spells out the default is still accepted.
+  let explicit_null = Wav2Vec2Config::from_json(r#"{"adapter_attn_dim": null}"#).unwrap();
+  assert_eq!(explicit_null.adapter_attn_dim, None);
+  assert!(explicit_null.validate().is_ok());
+}
+
+#[test]
+fn config_validate_rejects_deviating_pad_token_id() {
+  // The greedy CTC decoder hardcodes blank id 0 (`CTC_BLANK`); a checkpoint
+  // declaring a different `pad_token_id` would collapse the argmax against the
+  // wrong token. `validate` must reject it with a typed OutOfRange naming the
+  // field + the offending and expected (0) values.
+  let cfg = Wav2Vec2Config::from_json(r#"{"pad_token_id": 1}"#).unwrap();
+  assert_eq!(cfg.pad_token_id, 1);
+  match cfg.validate() {
+    Err(Error::OutOfRange(p)) => {
+      assert!(
+        p.context().contains("pad_token_id"),
+        "context should name pad_token_id, got {:?}",
+        p.context()
+      );
+      assert!(
+        p.value().contains('1') && p.value().contains('0'),
+        "value should name the offending id and the expected one, got {:?}",
+        p.value()
+      );
+    }
+    other => panic!("expected OutOfRange for a deviating pad_token_id, got {other:?}"),
+  }
+}
+
+/// Parametric drift-guard: each architecture / graph-affecting field, when set
+/// to a value that deviates from `base-960h`, makes `validate()` reject the
+/// config — so no deviating checkpoint can load and run silently wrong. The
+/// companion `config_validate_accepts_base_960h` /
+/// `base_960h_constants_match_defaults` tests assert the all-default config
+/// still passes, completing the both-directions guard.
+#[test]
+fn config_validate_rejects_every_graph_affecting_deviation() {
+  // (config-json overriding ONE field to a deviating value) — each must error.
+  let deviations: &[&str] = &[
+    r#"{"model_type": "hubert"}"#,
+    r#"{"hidden_size": 1024}"#,
+    r#"{"num_hidden_layers": 24}"#,
+    r#"{"num_attention_heads": 16}"#,
+    r#"{"intermediate_size": 4096}"#,
+    r#"{"vocab_size": 33}"#,
+    r#"{"pad_token_id": 1}"#,
+    r#"{"layer_norm_eps": 1e-6}"#,
+    r#"{"feat_extract_norm": "layer"}"#,
+    r#"{"hidden_act": "relu"}"#,
+    r#"{"feat_extract_activation": "relu"}"#,
+    r#"{"do_stable_layer_norm": true}"#,
+    r#"{"conv_bias": true}"#,
+    r#"{"add_adapter": true}"#,
+    r#"{"adapter_attn_dim": 16}"#,
+    r#"{"num_conv_pos_embeddings": 64}"#,
+    r#"{"num_conv_pos_embedding_groups": 8}"#,
+    r#"{"num_feat_extract_layers": 8}"#,
+    r#"{"conv_dim": [512, 512, 512, 512, 512, 512, 256]}"#,
+    r#"{"conv_stride": [5, 3, 2, 2, 2, 2, 2]}"#,
+    r#"{"conv_kernel": [10, 3, 3, 3, 3, 2, 3]}"#,
+  ];
+  for json in deviations {
+    let cfg = Wav2Vec2Config::from_json(json).unwrap();
+    assert!(
+      cfg.validate().is_err(),
+      "a deviating config must be rejected by validate(), but this one passed: {json}"
+    );
+  }
+  // Each deviation overrides exactly one field of the otherwise-default
+  // (base-960h) config, so the un-overridden baseline must itself validate —
+  // proving the rejections above are caused by the override, not a baseline
+  // that already fails.
+  assert!(
+    Wav2Vec2Config::from_json("{}").unwrap().validate().is_ok(),
+    "the all-default base-960h config must pass validate()"
+  );
+}
+
+#[test]
 fn base_960h_constants_match_defaults() {
   // The validate() pin-constants and the serde `default_*` fns must agree:
   // a default-constructed config (the base-960h checkpoint) must pass
@@ -586,7 +727,11 @@ fn base_960h_constants_match_defaults() {
   assert_eq!(defaults.conv_kernel, vec![10, 3, 3, 3, 3, 2, 2]);
   assert_eq!(defaults.model_type(), "wav2vec2");
   assert_eq!(defaults.hidden_act, "gelu");
+  assert_eq!(defaults.feat_extract_activation, "gelu");
   assert!((defaults.layer_norm_eps - 1e-5).abs() < 1e-12);
+  assert!(!defaults.add_adapter);
+  assert_eq!(defaults.adapter_attn_dim, None);
+  assert_eq!(defaults.pad_token_id, 0);
 }
 
 // ───────────────────────── test 2: feature-encoder time chain ─────────────────────────
