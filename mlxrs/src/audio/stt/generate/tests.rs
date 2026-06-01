@@ -214,6 +214,92 @@ fn ctc_rejects_blank_id_outside_vocab() {
   assert!(matches!(err_far, Error::OutOfRange(_)));
 }
 
+/// A CTC mock whose `blank_id` is STATEFUL: the first call returns
+/// `first_blank`, every later call returns `later_blank`. Both go through the
+/// `&self` method (a `Cell` provides the interior mutability), modelling a
+/// hostile/buggy model that could answer the driver's range check and its
+/// collapse with different blank ids. `from_argmax`-style fixed logits and the
+/// `(b'a' + i)` `decode_ids` map make the collapsed text a direct oracle.
+struct StatefulBlankCtc {
+  logits: Array,
+  first_blank: u32,
+  later_blank: u32,
+  calls: Cell<u32>,
+}
+
+impl StatefulBlankCtc {
+  fn from_argmax(
+    argmax_per_frame: &[u32],
+    vocab: usize,
+    first_blank: u32,
+    later_blank: u32,
+  ) -> Self {
+    let t = argmax_per_frame.len();
+    let mut data = vec![0.0_f32; t * vocab];
+    for (frame, &cls) in argmax_per_frame.iter().enumerate() {
+      data[frame * vocab + cls as usize] = 1.0;
+    }
+    let logits = Array::from_slice::<f32>(&data, &[t as i32, vocab as i32]).unwrap();
+    Self {
+      logits,
+      first_blank,
+      later_blank,
+      calls: Cell::new(0),
+    }
+  }
+}
+
+impl CtcModel for StatefulBlankCtc {
+  fn logits(&self, _waveform: &Array) -> Result<Array> {
+    self.logits.try_clone()
+  }
+  fn blank_id(&self) -> u32 {
+    let n = self.calls.get();
+    self.calls.set(n + 1);
+    if n == 0 {
+      self.first_blank
+    } else {
+      self.later_blank
+    }
+  }
+  fn decode_ids(&self, ids: &[u32]) -> String {
+    ids.iter().map(|&i| (b'a' + i as u8) as char).collect()
+  }
+}
+
+#[test]
+fn ctc_blank_id_read_once_collapse_uses_validated_value() {
+  // TOCTOU guard: `blank_id` is `&self`, so a model could return an in-range
+  // blank to the driver's range check and a DIFFERENT blank to the collapse.
+  // The driver must read `blank_id` EXACTLY ONCE and collapse against that
+  // first (validated) value.
+  //
+  // Frames argmax (vocab 4): [0, 1, 2] — no consecutive dups.
+  //   first_blank = 1 (validated, in range): drop id 1 -> survivors [0, 2] -> "ac".
+  //   later_blank = 0 (the value a SECOND `blank_id` call would return): if the
+  //   collapse re-read `blank_id`, it would drop id 0 -> survivors [1, 2] -> "bc".
+  // Asserting "ac" proves the cached, validated blank (1) drove the collapse,
+  // and that exactly one `blank_id` call was made.
+  let model = StatefulBlankCtc::from_argmax(&[0, 1, 2], 4, 1, 0);
+  let out = greedy_ctc_transcribe(&model, &dummy_waveform(), &TranscribeOptions::new())
+    .expect("ctc transcribe");
+  assert_eq!(out.text(), "ac");
+  // Exactly one `blank_id` call: the validated read IS the used read.
+  assert_eq!(model.calls.get(), 1);
+}
+
+#[test]
+fn ctc_stateful_blank_first_read_out_of_range_is_rejected() {
+  // The validated value is the FIRST read: if that first `blank_id` is out of
+  // range, the driver rejects with a typed OutOfRange even though a later read
+  // would have been in range — the guard never trusts a second read.
+  // vocab 3 (valid 0..=2); first_blank = 3 (out of range), later_blank = 0.
+  let model = StatefulBlankCtc::from_argmax(&[0, 1, 2], 3, 3, 0);
+  let err =
+    greedy_ctc_transcribe(&model, &dummy_waveform(), &TranscribeOptions::new()).unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)));
+}
+
 // ===========================================================================
 // Autoregressive family — the `greedy_transcribe` loop.
 // ===========================================================================
@@ -494,6 +580,58 @@ fn greedy_rejects_non_rank1_decode_logits() {
   }
   let err = greedy_transcribe(&BadStep, &speech_waveform(), &TranscribeOptions::new()).unwrap_err();
   assert!(matches!(err, Error::RankMismatch(_)));
+}
+
+/// An autoregressive mock whose `eot` id is OUT OF RANGE for its decode
+/// logits. `decode_step` always argmaxes class `1` (in range, so the loop is
+/// well-formed and reaches the eot range check), but `eot()` reports `vocab`
+/// (one past the last valid class). A `Cell` records how many times `eot()` was
+/// called, to confirm the driver reads it exactly once.
+struct EotOutOfRange {
+  vocab: usize,
+  eot_calls: Cell<u32>,
+}
+
+impl AutoregressiveStt for EotOutOfRange {
+  type Cache = ();
+  fn encode(&self, mel: &Array) -> Result<Array> {
+    mel.try_clone()
+  }
+  fn new_cache(&self) {}
+  fn decode_step(&self, _c: &mut (), _e: &Array, _t: &[u32]) -> Result<Array> {
+    // Argmax is class 1, always in range — the `(vocab,)` row is well-formed,
+    // so the loop reaches the cached-eot range check rather than failing on
+    // shape.
+    let mut row = vec![0.0_f32; self.vocab];
+    row[1] = 1.0;
+    Array::from_slice::<f32>(&row, &[self.vocab as i32])
+  }
+  fn initial_tokens(&self, _o: &TranscribeOptions) -> Result<Vec<u32>> {
+    Ok(vec![0])
+  }
+  fn eot(&self) -> u32 {
+    self.eot_calls.set(self.eot_calls.get() + 1);
+    // One past the last valid class -> can never be produced by argmax.
+    self.vocab as u32
+  }
+}
+
+#[test]
+fn greedy_rejects_eot_outside_vocab() {
+  // An `eot` >= the decode_step vocab size can never equal a per-frame argmax,
+  // so the greedy loop's `next == eot` stop would never fire and the loop would
+  // run to `max_context`, returning bogus full-length output. The driver
+  // range-checks the cached `eot` against the actual logits vocab the first
+  // step and rejects out-of-range with a typed OutOfRange.
+  // vocab = 4 (valid ids 0..=3), eot() = 4 (out of range).
+  let model = EotOutOfRange {
+    vocab: 4,
+    eot_calls: Cell::new(0),
+  };
+  let err = greedy_transcribe(&model, &speech_waveform(), &TranscribeOptions::new()).unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)));
+  // `eot` is read exactly once (cached in a local), not per loop iteration.
+  assert_eq!(model.eot_calls.get(), 1);
 }
 
 /// A tracker mock that records whether its `log_mel` and `encode` frontend

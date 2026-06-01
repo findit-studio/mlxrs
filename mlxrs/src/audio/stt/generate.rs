@@ -197,17 +197,23 @@ pub fn greedy_ctc_transcribe<M: CtcModel + ?Sized>(
       "stt CtcModel::logits returned an empty vocab axis (vocab == 0)",
     )));
   }
-  // Blank id must index into the vocab axis: a `blank_id` outside `[0, vocab)`
+  // Read the model-provided blank id EXACTLY ONCE: `blank_id` is `&self`, so an
+  // interior-mutability model could otherwise return one value to the range
+  // check below and a different one to the collapse — a TOCTOU that smuggles an
+  // unvalidated blank into the decode. The single cached `blank` is the value
+  // both validated and used.
+  let blank = model.blank_id();
+  // The blank id must index into the vocab axis: a `blank` outside `[0, vocab)`
   // can never equal a per-frame `argmax` (which is always in range), so its
   // blank frames would survive the collapse and be fed to the infallible
   // `decode_ids` — silent bad text (or an index panic in a real vocab map).
-  // Reject it up front with a typed error.
-  if (model.blank_id() as usize) >= shape[1] {
+  // Reject it up front with a typed error carrying the cached value.
+  if (blank as usize) >= shape[1] {
     return Err(Error::OutOfRange(OutOfRangePayload::new(
       "stt CtcModel::blank_id",
       "must be < the logits vocab size (a blank id outside the vocab axis \
          leaves blank frames un-collapsed)",
-      model.blank_id().to_string(),
+      blank.to_string(),
     )));
   }
   // Empty time axis `(0, vocab)`: no frames to collapse → an empty
@@ -225,7 +231,8 @@ pub fn greedy_ctc_transcribe<M: CtcModel + ?Sized>(
   let ids = frame_ids.to_vec::<u32>()?;
 
   // Greedy CTC collapse: drop consecutive duplicates, then drop the blank.
-  let blank = model.blank_id();
+  // Reuses the `blank` validated above — never re-calls `model.blank_id()`, so
+  // the collapsed-out id is exactly the one that passed the range check.
   let mut collapsed: Vec<u32> = Vec::new();
   let mut prev: Option<u32> = None;
   for &id in &ids {
@@ -252,7 +259,10 @@ pub fn greedy_ctc_transcribe<M: CtcModel + ?Sized>(
 /// 4. [`AutoregressiveStt::initial_tokens`] — the prompt prefix to seed from.
 /// 5. Greedy loop: [`AutoregressiveStt::decode_step`] → `(vocab,)` next-token
 ///    logits, take `argmax`, stop at [`AutoregressiveStt::eot`], else append
-///    and continue.
+///    and continue. The [`AutoregressiveStt::eot`] id is read once and
+///    range-checked against the decoder's actual vocab axis the first step (an
+///    `eot` outside `[0, vocab)` can never be produced by `argmax`, so it is a
+///    typed [`Error::OutOfRange`] rather than a never-stopping loop).
 ///
 /// The loop is bounded by the model's [`AutoregressiveStt::max_context`]: it
 /// generates AT MOST `max_context - prompt.len()` new tokens, so
@@ -302,7 +312,18 @@ pub fn greedy_transcribe<M: AutoregressiveStt + ?Sized>(
   let mel = m.log_mel(audio)?;
   let enc = m.encode(&mel)?;
   let mut cache = m.new_cache();
+  // Read the model-provided end-of-transcript id EXACTLY ONCE. `eot` is `&self`
+  // and the loop compares every `argmax` against it; capturing it in a local
+  // means a later mutation of the model can't swap the stop token mid-decode.
+  // It is range-checked below once the vocab axis is known.
   let eot = m.eot();
+  // Range-check `eot` against the ACTUAL logits vocab the first time we see it.
+  // `eot` is captured before any `decode_step`, so the vocab length is unknown
+  // here; an `eot >= vocab` can never equal a per-frame `argmax` (always in
+  // `0..vocab`), so the loop would silently never stop and return bogus
+  // full-length output. We validate it against the first step's `(vocab,)` row
+  // and reject out-of-range with a typed error before relying on it to stop.
+  let mut eot_checked = false;
 
   // At most this many new tokens, so the total never exceeds `max_ctx`.
   let max_new = max_ctx - prompt_len;
@@ -321,10 +342,28 @@ pub fn greedy_transcribe<M: AutoregressiveStt + ?Sized>(
         shape,
       )));
     }
-    if shape[0] == 0 {
+    let vocab_len = shape[0];
+    if vocab_len == 0 {
       return Err(Error::EmptyInput(EmptyInputPayload::new(
         "stt AutoregressiveStt::decode_step returned an empty vocab axis (vocab == 0)",
       )));
+    }
+
+    // Now the vocab axis is known: range-check the cached `eot` once. An
+    // `eot >= vocab_len` could never be produced by `argmax`, so the loop's
+    // `next == eot` stop condition would never fire — reject it with a typed
+    // error instead of running to `max_context` and returning bogus output.
+    if !eot_checked {
+      if (eot as usize) >= vocab_len {
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "stt AutoregressiveStt::eot",
+          "must be < the decode_step logits vocab size (an eot outside the \
+             vocab axis can never be produced by argmax, so the greedy loop \
+             would never stop)",
+          eot.to_string(),
+        )));
+      }
+      eot_checked = true;
     }
 
     // Greedy argmax over the vocab axis; the only materialization.
