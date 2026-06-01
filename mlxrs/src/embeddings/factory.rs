@@ -378,6 +378,38 @@ impl EmbeddingModelTypeRegistry {
     self
   }
 
+  /// Register the **feature-gated built-in** embedding-model architectures
+  /// this crate ships, returning `self` for chaining.
+  ///
+  /// Per the project's no-model-arch rule the registry is normally empty (an
+  /// extension point callers register into), but a handful of self-contained
+  /// embedding models live in-tree behind a cargo feature. This registers each
+  /// enabled one under its canonical `model_type`:
+  ///
+  /// - `"siglip"` → [`crate::embeddings::siglip2_naflex::Siglip2NaflexModel`]
+  ///   (when the `siglip2-naflex` feature is on).
+  ///
+  /// With no model features enabled this is a no-op (equivalent to
+  /// [`new`](Self::new)). A caller that wants only its own architectures can
+  /// skip this and use [`register`](Self::register) / [`with`](Self::with)
+  /// directly.
+  #[must_use]
+  pub fn with_builtin_models(self) -> Self {
+    // `mut` is bound only inside the feature arm so the signature stays
+    // warning-free when no model feature is enabled (an unconditional
+    // `mut self` would be an unused-mut under `-D warnings` in the per-feature
+    // isolation build, where the registration body compiles to nothing).
+    #[cfg(feature = "siglip2-naflex")]
+    let this = {
+      let mut this = self;
+      crate::embeddings::siglip2_naflex::register(&mut this);
+      this
+    };
+    #[cfg(not(feature = "siglip2-naflex"))]
+    let this = self;
+    this
+  }
+
   /// `true` if a constructor is registered for `model_type` (after
   /// [`remap_model_type`]).
   pub fn contains(&self, model_type: &str) -> bool {
