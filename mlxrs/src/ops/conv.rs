@@ -182,11 +182,28 @@ fn check_conv_no_overflow(
       if nd < 2 || wt_shape.len() != nd {
         return Ok(());
       }
-      let slice_runs = (0..nd - 2).any(|i| param(pad_lo, i, 0) < 0 || param(pad_hi, i, 0) < 0);
+      let spatial_rank = nd - 2;
+      // A malformed call whose spatial parameter slices are not broadcastable to
+      // the input spatial rank (e.g. conv2d on a rank-5 input: a length-2 slice
+      // cannot index axis 2) must be rejected here — both to avoid panicking the
+      // per-axis loop, and because MLX itself indexes those slices out of bounds
+      // in its negative-padding normalization before its own length check.
+      if [stride, pad_lo, pad_hi, kernel_dilation, input_dilation]
+        .into_iter()
+        .any(|s| !(s.is_empty() || s.len() == 1 || s.len() == spatial_rank))
+      {
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          context,
+          "input spatial rank does not match the spatial parameters",
+          format_smolstr!("spatial rank {spatial_rank}"),
+        )));
+      }
+      let slice_runs =
+        (0..spatial_rank).any(|i| param(pad_lo, i, 0) < 0 || param(pad_hi, i, 0) < 0);
       if slice_runs {
         check_nonspatial_slice(context, &in_shape)?;
       }
-      for axis in 0..nd - 2 {
+      for axis in 0..spatial_rank {
         let in_d =
           i128::from(i32::try_from(in_shape[axis + 1]).map_err(|_| conv_overflow_err(context))?);
         let wt_d =
@@ -927,5 +944,24 @@ mod tests {
     let input = Array::zeros::<f32>(&[1, 0, 1]).unwrap();
     let weight = Array::from_slice::<f32>(&[1.0], &[1, 1, 1]).unwrap();
     let _ = conv1d(&input, &weight, 1, 0, 1, 1);
+  }
+
+  #[test]
+  fn conv2d_rejects_mismatched_input_rank_without_panic() {
+    // conv2d on a rank-5 input/weight has spatial rank 3 but only 2 stride/
+    // padding values; the forward guard must not index past the length-2 slices.
+    // It skips the mirror and MLX surfaces the rank error (Codex round-10).
+    let input = Array::zeros::<f32>(&[1, 2, 2, 2, 1]).unwrap();
+    let weight = Array::zeros::<f32>(&[1, 2, 2, 2, 1]).unwrap();
+    assert!(conv2d(&input, &weight, (1, 1), (0, 0), (1, 1), 1).is_err());
+  }
+
+  #[test]
+  fn conv3d_rejects_mismatched_input_rank_without_panic() {
+    // conv3d on a rank-6 input/weight has spatial rank 4 but only 3 stride/
+    // padding values; same guard, no panic (Codex round-10).
+    let input = Array::zeros::<f32>(&[1, 2, 2, 2, 2, 1]).unwrap();
+    let weight = Array::zeros::<f32>(&[1, 2, 2, 2, 2, 1]).unwrap();
+    assert!(conv3d(&input, &weight, (1, 1, 1), (0, 0, 0), (1, 1, 1), 1).is_err());
   }
 }
