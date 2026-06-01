@@ -31,6 +31,7 @@ lfm2-vl              = ["vlm"]                                                  
 audio                = ["lm", "dep:symphonia", "dep:cpal", "dep:unicode-normalization", "dep:xattr"]
 wav2vec2             = ["audio", "dep:serde", "dep:serde_json"]                    # wav2vec2 CTC speech model (facebook/wav2vec2-base-960h): config + sanitize + char vocab.json
 siglip2-naflex       = ["embeddings", "vlm", "dep:serde", "dep:serde_json"]        # SigLIP2 NaFlex dual-tower embeddings (google/siglip2-base-patch16-naflex): config + NaFlex preprocessing (reuses vlm::resize NEON)
+whisper              = ["audio", "tokenizer-bpe", "dep:flate2"]                    # OpenAI Whisper STT (audio front-end + GPT-2 byte-level BPE tokenizer; flate2 for the decode compression-ratio heuristic)
 unstable-ops-overload = []
 gguf                 = []
 
@@ -62,6 +63,7 @@ symphonia = { version = "0.6", optional = true, default-features = false, featur
   "vorbis",
 ] }
 cpal = { version = "0.17", optional = true }
+flate2 = { version = "1", optional = true } # zlib DEFLATE for the Whisper decode compression-ratio fallback heuristic
 unicode-normalization = { version = "0.1", optional = true }
 regex = { version = "1", optional = true, default-features = false, features = ["std", "perf"] }
 llguidance = { version = "1.7", optional = true, default-features = false, features = ["lark", "referencing"] }
