@@ -6,11 +6,11 @@ use super::*;
 /// `config.json` (only the fields the port reads; unmodeled keys are
 /// included to exercise the forward-compatible parse).
 const BASE_CONFIG_JSON: &str = r#"{
-  "model_type": "siglip",
+  "model_type": "siglip2",
   "num_labels": 0,
   "some_unmodeled_top_level_key": [1, 2, 3],
   "text_config": {
-    "model_type": "siglip_text_model",
+    "model_type": "siglip2_text_model",
     "vocab_size": 32000,
     "max_position_embeddings": 64,
     "hidden_size": 768,
@@ -21,7 +21,7 @@ const BASE_CONFIG_JSON: &str = r#"{
     "unmodeled_text_key": "ignored"
   },
   "vision_config": {
-    "model_type": "siglip_vision_model",
+    "model_type": "siglip2_vision_model",
     "image_size": 256,
     "patch_size": 16,
     "num_channels": 3,
@@ -39,11 +39,11 @@ const BASE_CONFIG_JSON: &str = r#"{
 #[test]
 fn from_json_round_trip_base_naflex() {
   let cfg = Siglip2NaflexConfig::from_json(BASE_CONFIG_JSON).unwrap();
-  assert_eq!(cfg.model_type(), "siglip");
+  assert_eq!(cfg.model_type(), "siglip2");
   assert_eq!(cfg.num_labels, 0);
 
   let t = &cfg.text_config;
-  assert_eq!(t.model_type(), "siglip_text_model");
+  assert_eq!(t.model_type(), "siglip2_text_model");
   assert_eq!(t.vocab_size, 32000);
   assert_eq!(t.max_position_embeddings, 64);
   assert_eq!(t.hidden_size, 768);
@@ -56,7 +56,7 @@ fn from_json_round_trip_base_naflex() {
   assert_eq!(t.projection_size(), 768);
 
   let v = &cfg.vision_config;
-  assert_eq!(v.model_type(), "siglip_vision_model");
+  assert_eq!(v.model_type(), "siglip2_vision_model");
   assert_eq!(v.image_size, 256);
   assert_eq!(v.patch_size, 16);
   assert_eq!(v.num_channels, 3);
@@ -77,7 +77,7 @@ fn defaults_fill_absent_fields() {
   // base-naflex value.
   let cfg =
     Siglip2NaflexConfig::from_json(r#"{ "text_config": {}, "vision_config": {} }"#).unwrap();
-  assert_eq!(cfg.model_type(), "siglip");
+  assert_eq!(cfg.model_type(), "siglip2");
   assert_eq!(cfg.text_config.hidden_size, 768);
   assert_eq!(cfg.text_config.vocab_size, 32000);
   assert_eq!(cfg.vision_config.patch_size, 16);
@@ -109,7 +109,7 @@ fn defaults_match_named_constants() {
 
 #[test]
 fn validate_rejects_wrong_top_level_model_type() {
-  let json = BASE_CONFIG_JSON.replace(r#""model_type": "siglip""#, r#""model_type": "clip""#);
+  let json = BASE_CONFIG_JSON.replace(r#""model_type": "siglip2""#, r#""model_type": "clip""#);
   let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
   let err = cfg.validate().unwrap_err();
   assert!(matches!(err, Error::UnknownEnumValue(_)), "got {err}");
@@ -118,7 +118,7 @@ fn validate_rejects_wrong_top_level_model_type() {
 #[test]
 fn validate_rejects_wrong_vision_model_type() {
   let json = BASE_CONFIG_JSON.replace(
-    r#""model_type": "siglip_vision_model""#,
+    r#""model_type": "siglip2_vision_model""#,
     r#""model_type": "clip_vision_model""#,
   );
   let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
@@ -206,8 +206,9 @@ fn malformed_json_maps_to_parse_error() {
 
 #[test]
 fn sub_config_from_json_parses_standalone() {
-  let v = VisionConfig::from_json(r#"{ "model_type": "siglip_vision_model", "num_patches": 256 }"#)
-    .unwrap();
+  let v =
+    VisionConfig::from_json(r#"{ "model_type": "siglip2_vision_model", "num_patches": 256 }"#)
+      .unwrap();
   assert_eq!(v.num_patches().unwrap(), 256);
   v.validate().unwrap();
 

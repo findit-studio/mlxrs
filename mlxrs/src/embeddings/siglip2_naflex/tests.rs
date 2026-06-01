@@ -37,10 +37,10 @@ const PROJ: i32 = 8;
 fn tiny_config_json() -> String {
   format!(
     r#"{{
-      "model_type": "siglip",
+      "model_type": "siglip2",
       "num_labels": 0,
       "text_config": {{
-        "model_type": "siglip_text_model",
+        "model_type": "siglip2_text_model",
         "vocab_size": {VOCAB},
         "max_position_embeddings": {MAX_POS},
         "hidden_size": {HIDDEN},
@@ -50,7 +50,7 @@ fn tiny_config_json() -> String {
         "layer_norm_eps": 1e-6
       }},
       "vision_config": {{
-        "model_type": "siglip_vision_model",
+        "model_type": "siglip2_vision_model",
         "image_size": 4,
         "patch_size": {PATCH},
         "num_channels": {CHANNELS},
@@ -386,7 +386,7 @@ fn register_adds_siglip_constructor() {
 fn with_builtin_models_registers_siglip() {
   let registry = EmbeddingModelTypeRegistry::new().with_builtin_models();
   assert!(
-    registry.contains("siglip"),
+    registry.contains("siglip2"),
     "with_builtin_models must register the siglip2-naflex model"
   );
 }
@@ -408,7 +408,7 @@ fn constructor_builds_model_from_loaded() {
     };
     raw.insert(raw_key, v);
   }
-  let loaded = LoadedEmbeddingModel::new("siglip".to_string(), tiny_config_json(), raw);
+  let loaded = LoadedEmbeddingModel::new("siglip2".to_string(), tiny_config_json(), raw);
   let ctor = constructor();
   let model = ctor(&loaded).expect("constructor must build the model");
   // The constructed model satisfies EmbeddingModel::forward (text tower).

@@ -86,7 +86,7 @@ use crate::{
 
 /// The top-level architecture id this model registers under.
 #[cfg(feature = "siglip2-naflex")]
-pub const MODEL_TYPE: &str = "siglip";
+pub const MODEL_TYPE: &str = "siglip2";
 
 /// SigLIP2 NaFlex dual-tower embeddings model
 /// (`google/siglip2-base-patch16-naflex`).
@@ -326,7 +326,7 @@ pub fn constructor() -> EmbeddingModelConstructor {
   )
 }
 
-/// Register [`Siglip2NaflexModel`] under [`MODEL_TYPE`] (`"siglip"`) into
+/// Register [`Siglip2NaflexModel`] under [`MODEL_TYPE`] (`"siglip2"`) into
 /// `registry`, returning any constructor it displaced.
 ///
 /// The registry is the documented architecture extension point (per-model

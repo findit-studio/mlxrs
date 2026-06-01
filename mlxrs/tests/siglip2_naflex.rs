@@ -11,14 +11,14 @@
 //!
 //! ## Why `#[ignore]` + skip-when-absent
 //!
-//! The checkpoint weights live in the **gitignored** `/models/siglip2/`
+//! The checkpoint weights live in the **gitignored** `/models/siglip2-naflex/`
 //! directory (never committed — model weights are out-of-tree per the project
 //! convention), so this test cannot run in a clean checkout / CI without the
 //! weights present. It is therefore:
 //!
 //! - `#[ignore]` — excluded from the default `cargo test` run; opt in with
 //!   `cargo test --features siglip2-naflex -- --ignored siglip2_oracle`;
-//! - **skip-clean** — if `models/siglip2/` (or the override env var
+//! - **skip-clean** — if `models/siglip2-naflex/` (or the override env var
 //!   `MLXRS_SIGLIP2_MODEL_DIR`) is absent, the test prints a skip line and
 //!   returns `Ok` rather than failing, so a developer without the weights is
 //!   not blocked.
@@ -63,17 +63,17 @@ const CHANNELS: u32 = 3;
 const TEXT_SEQ_LEN: usize = 64;
 
 /// Resolve the model directory: `MLXRS_SIGLIP2_MODEL_DIR` if set, else the
-/// gitignored in-repo `models/siglip2/`. Returns `None` (→ skip) if absent.
+/// gitignored in-repo `models/siglip2-naflex/`. Returns `None` (→ skip) if absent.
 fn model_dir() -> Option<PathBuf> {
   if let Ok(dir) = std::env::var("MLXRS_SIGLIP2_MODEL_DIR") {
     let p = PathBuf::from(dir);
     return p.is_dir().then_some(p);
   }
   // The crate root is `mlxrs/`; the gitignored weights live at the workspace
-  // root `models/siglip2/`.
+  // root `models/siglip2-naflex/`.
   let candidates = [
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../models/siglip2"),
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/siglip2"),
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../models/siglip2-naflex"),
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/siglip2-naflex"),
   ];
   candidates.into_iter().find(|p| p.is_dir())
 }
@@ -209,11 +209,11 @@ fn parse_npy_shape(header: &str) -> Vec<usize> {
 }
 
 #[test]
-#[ignore = "requires the gitignored google/siglip2-base-patch16-naflex weights in models/siglip2/"]
+#[ignore = "requires the gitignored google/siglip2-base-patch16-naflex weights in models/siglip2-naflex/"]
 fn siglip2_oracle_image_parity() {
   let Some(dir) = model_dir() else {
     eprintln!(
-      "skipping siglip2_oracle_image_parity: models/siglip2/ absent \
+      "skipping siglip2_oracle_image_parity: models/siglip2-naflex/ absent \
        (set MLXRS_SIGLIP2_MODEL_DIR to run)"
     );
     return;
@@ -260,11 +260,11 @@ fn siglip2_oracle_image_parity() {
 }
 
 #[test]
-#[ignore = "requires the gitignored google/siglip2-base-patch16-naflex weights in models/siglip2/"]
+#[ignore = "requires the gitignored google/siglip2-base-patch16-naflex weights in models/siglip2-naflex/"]
 fn siglip2_oracle_text_parity() {
   let Some(dir) = model_dir() else {
     eprintln!(
-      "skipping siglip2_oracle_text_parity: models/siglip2/ absent \
+      "skipping siglip2_oracle_text_parity: models/siglip2-naflex/ absent \
        (set MLXRS_SIGLIP2_MODEL_DIR to run)"
     );
     return;

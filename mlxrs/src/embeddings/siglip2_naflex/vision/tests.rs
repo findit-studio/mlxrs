@@ -28,7 +28,7 @@ const PATCH_FEAT: i32 = PATCH * PATCH * CHANNELS; // 12
 fn tiny_vision_config(use_head: bool) -> VisionConfig {
   let json = format!(
     r#"{{
-      "model_type": "siglip_vision_model",
+      "model_type": "siglip2_vision_model",
       "image_size": 4,
       "patch_size": {PATCH},
       "num_channels": {CHANNELS},
@@ -357,7 +357,7 @@ fn from_weights_rejects_oversize_num_hidden_layers() {
   // `from_weights` itself.
   let json = format!(
     r#"{{
-      "model_type": "siglip_vision_model",
+      "model_type": "siglip2_vision_model",
       "image_size": 4,
       "patch_size": {PATCH},
       "num_channels": {CHANNELS},

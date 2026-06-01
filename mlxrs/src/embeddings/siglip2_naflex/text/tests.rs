@@ -22,7 +22,7 @@ const PROJ: i32 = 8;
 fn tiny_text_config() -> TextConfig {
   let json = format!(
     r#"{{
-      "model_type": "siglip_text_model",
+      "model_type": "siglip2_text_model",
       "vocab_size": {VOCAB},
       "max_position_embeddings": {MAX_POS},
       "hidden_size": {HIDDEN},
@@ -168,7 +168,7 @@ fn from_weights_rejects_oversize_num_hidden_layers() {
   // per-layer reservation/loop — never a `with_capacity` abort.
   let json = format!(
     r#"{{
-      "model_type": "siglip_text_model",
+      "model_type": "siglip2_text_model",
       "vocab_size": {VOCAB},
       "max_position_embeddings": {MAX_POS},
       "hidden_size": {HIDDEN},

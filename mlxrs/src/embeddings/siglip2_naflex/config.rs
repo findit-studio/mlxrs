@@ -43,7 +43,7 @@ const MAX_CARDINALITY: u64 = 4096;
 #[cfg_attr(docsrs, doc(cfg(feature = "siglip2-naflex")))]
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct TextConfig {
-  /// Architecture id (`"siglip_text_model"`).
+  /// Architecture id (`"siglip2_text_model"`).
   #[serde(default = "default_text_model_type")]
   model_type: String,
   /// Token-embedding table size / the text-tower vocabulary.
@@ -92,7 +92,7 @@ pub struct TextConfig {
 #[cfg_attr(docsrs, doc(cfg(feature = "siglip2-naflex")))]
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct VisionConfig {
-  /// Architecture id (`"siglip_vision_model"`).
+  /// Architecture id (`"siglip2_vision_model"`).
   #[serde(default = "default_vision_model_type")]
   model_type: String,
   /// Nominal square image size. For NaFlex this is **not** the runtime
@@ -153,7 +153,7 @@ pub struct Siglip2NaflexConfig {
   pub text_config: TextConfig,
   /// Vision-tower config (`vision_config`).
   pub vision_config: VisionConfig,
-  /// Top-level architecture id (`"siglip"`).
+  /// Top-level architecture id (`"siglip2"`).
   #[serde(default = "default_model_type")]
   model_type: String,
   /// Number of classifier labels. `0` ⇒ the contrastive dual-tower path
@@ -168,15 +168,15 @@ pub struct Siglip2NaflexConfig {
 
 #[cfg(feature = "siglip2-naflex")]
 fn default_model_type() -> String {
-  "siglip".to_string()
+  "siglip2".to_string()
 }
 #[cfg(feature = "siglip2-naflex")]
 fn default_text_model_type() -> String {
-  "siglip_text_model".to_string()
+  "siglip2_text_model".to_string()
 }
 #[cfg(feature = "siglip2-naflex")]
 fn default_vision_model_type() -> String {
-  "siglip_vision_model".to_string()
+  "siglip2_vision_model".to_string()
 }
 #[cfg(feature = "siglip2-naflex")]
 fn default_text_vocab_size() -> i32 {
@@ -255,7 +255,7 @@ impl TextConfig {
   /// Reject a structurally invalid text config with a typed error before
   /// any tensor is built.
   ///
-  /// Pins `model_type` to `"siglip_text_model"`; requires every
+  /// Pins `model_type` to `"siglip2_text_model"`; requires every
   /// dimension / count positive; bounds the layer + head counts and
   /// `max_position_embeddings` by `MAX_CARDINALITY`; and requires
   /// `hidden_size` divisible by `num_attention_heads` (the per-head split)
@@ -264,7 +264,7 @@ impl TextConfig {
     pin_str(
       "TextConfig: model_type",
       self.model_type.as_str(),
-      &["siglip_text_model"],
+      &["siglip2_text_model"],
     )?;
     require_positive("TextConfig: vocab_size", self.vocab_size)?;
     // `max_position_embeddings` sizes the position-embedding table (a
@@ -377,7 +377,7 @@ impl VisionConfig {
   /// Reject a structurally invalid vision config with a typed error
   /// before any tensor is built.
   ///
-  /// Pins `model_type` to `"siglip_vision_model"` and `num_channels` to
+  /// Pins `model_type` to `"siglip2_vision_model"` and `num_channels` to
   /// `3`; requires every dimension / count positive; bounds the layer +
   /// head counts and `image_size` by `MAX_CARDINALITY`; requires
   /// `hidden_size` divisible by `num_attention_heads`; bounds the resolved
@@ -388,7 +388,7 @@ impl VisionConfig {
     pin_str(
       "VisionConfig: model_type",
       self.model_type.as_str(),
-      &["siglip_vision_model"],
+      &["siglip2_vision_model"],
     )?;
     // The patch-embed + flatten path is hardcoded to RGB (3 channels);
     // a deviating count would silently mis-shape the flattened patch row.
@@ -466,14 +466,14 @@ impl Siglip2NaflexConfig {
 
   /// Validate both towers and the top-level fields.
   ///
-  /// Pins the top-level `model_type` to `"siglip"`, requires
+  /// Pins the top-level `model_type` to `"siglip2"`, requires
   /// `num_labels >= 0`, and validates each tower config (see
   /// [`TextConfig::validate`] / [`VisionConfig::validate`]).
   pub fn validate(&self) -> Result<()> {
     pin_str(
       "Siglip2NaflexConfig: model_type",
       self.model_type.as_str(),
-      &["siglip"],
+      &["siglip2"],
     )?;
     if self.num_labels < 0 {
       return Err(Error::OutOfRange(crate::error::OutOfRangePayload::new(
