@@ -52,12 +52,24 @@
 
 use crate::{
   array::Array,
+  embeddings::siglip2_naflex::config::MAX_PIXEL_ELEMENTS,
   error::{
-    ArithmeticOverflowPayload, CapExceededPayload, Error, LengthMismatchPayload, OutOfRangePayload,
-    Result,
+    ArithmeticOverflowPayload, CapExceededPayload, Error, InvariantViolationPayload,
+    LengthMismatchPayload, OutOfRangePayload, Result,
   },
+  model_validation::reserve_or_error,
   vlm::image::{ResizeFilter, resize},
 };
+
+/// The fixed channel count of the patchify path. The SigLIP2 NaFlex
+/// preprocessing normalizes per-RGB-channel and flattens into
+/// `num_channels * patch_size^2` rows; only the 3-channel (RGB) path is wired,
+/// and the config validator pins `num_channels == 3`. The exported
+/// [`preprocess`] re-checks this (it bypasses config validation) and derives
+/// every patchify stride from the actual RGB buffer format rather than the raw
+/// `num_channels` parameter, so a non-3 argument is a typed error, never an
+/// out-of-bounds slice into the always-3-channel resized buffer.
+const RGB_CHANNELS: u32 = 3;
 
 /// Tolerance for the [`patch_grid`] binary-search termination. Mirrors
 /// the `siglip2-naflex` crate's `SCALE_EPS` (= the upstream
@@ -159,7 +171,7 @@ fn require_positive_u32(context: &'static str, value: u32) -> Result<()> {
 /// `rgb` is `width * height * 3` row-major interleaved RGB bytes (no row
 /// padding). `patch_size`, `num_channels`, and `max_num_patches` come
 /// from the validated [`crate::embeddings::siglip2_naflex::config::VisionConfig`]
-/// (`num_channels` is `3` here — the patchify path is RGB).
+/// (`num_channels` must be `3` — the patchify path is RGB-only).
 ///
 /// Returns the flattened `(max_num_patches, P^2 * C)` pixel tensor plus
 /// the attention mask and spatial shapes (see [`NaflexInputs`]).
@@ -167,11 +179,21 @@ fn require_positive_u32(context: &'static str, value: u32) -> Result<()> {
 /// ## Errors
 /// - `width == 0` / `height == 0` / `patch_size == 0` /
 ///   `max_num_patches == 0` → [`Error::OutOfRange`].
+/// - `num_channels != 3` → [`Error::InvariantViolation`] (the patchify path
+///   is RGB-only; the resized buffer is always 3-channel, so a different
+///   stride would slice out of bounds). The exported entry point re-checks
+///   this even though the config validator pins it.
 /// - `width * height * 3` overflows `usize`, or `rgb.len()` disagrees with
 ///   it → [`Error::ArithmeticOverflow`] / [`Error::LengthMismatch`].
+/// - the `pixel_values` element count `max_num_patches * (3 * patch_size^2)`
+///   exceeds the `MAX_PIXEL_ELEMENTS` product cap (a hostile
+///   `patch_size`/`max_num_patches` pair each within its own cap but whose
+///   product is oversized) → [`Error::CapExceeded`].
 /// - the selected grid `H_p * W_p` exceeds `max_num_patches` (an
 ///   adversarial dimension whose feasible scale range is below the search
 ///   floor) → [`Error::CapExceeded`].
+/// - a within-cap but heavyweight `pixel_values` / mask reservation the
+///   allocator cannot satisfy → [`Error::AllocFailure`].
 /// - underlying [`crate::vlm::image::resize`] / [`Array::from_slice`]
 ///   errors propagate.
 pub fn preprocess(
@@ -185,14 +207,30 @@ pub fn preprocess(
   require_positive_u32("siglip2 preprocess: width", width)?;
   require_positive_u32("siglip2 preprocess: height", height)?;
   require_positive_u32("siglip2 preprocess: patch_size", patch_size)?;
-  require_positive_u32("siglip2 preprocess: num_channels", num_channels)?;
   require_positive_u32("siglip2 preprocess: max_num_patches", max_num_patches)?;
+  // The patchify path is RGB-only: it constructs a 3-channel `RgbImage`,
+  // resizes into an always-3-channel buffer, and uses the channel count as the
+  // patchify stride into that buffer. A `num_channels != 3` (the exported entry
+  // bypasses the config's `num_channels == 3` pin) would slice the 3-channel
+  // resized buffer with a wrong stride and read out of bounds — reject it as a
+  // typed error before any sizing. Every stride below is derived from
+  // `RGB_CHANNELS`, not the raw parameter, so the patchify cannot go OOB.
+  if num_channels != RGB_CHANNELS {
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "siglip2 preprocess: num_channels",
+      "must be 3 (the patchify path is RGB-only)",
+    )));
+  }
 
   // Expected RGB byte count, overflow-checked (a `u32`-product can wrap
-  // `usize` on 32-bit hosts; checked everywhere for host-independence).
+  // `usize` on 32-bit hosts; checked everywhere for host-independence). The
+  // channel factor is the fixed `RGB_CHANNELS` (== `num_channels`, verified
+  // above), so the slice-length contract matches the always-3-channel buffer
+  // every stride below indexes.
+  let channels = RGB_CHANNELS as usize;
   let expected_rgb_len = (width as usize)
     .checked_mul(height as usize)
-    .and_then(|wh| wh.checked_mul(num_channels as usize))
+    .and_then(|wh| wh.checked_mul(channels))
     .ok_or_else(|| {
       Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
         "siglip2 preprocess: rgb byte count (width * height * channels)",
@@ -205,6 +243,50 @@ pub fn preprocess(
       "siglip2 preprocess: rgb slice length vs width*height*channels",
       expected_rgb_len,
       rgb.len(),
+    )));
+  }
+
+  // Per-patch flattened width = C * P^2; the `pixel_values` element count is
+  // `max_num_patches * per_patch`. Both factors can be within their own config
+  // cap yet their product oversized (a `patch_size` near 591 keeps `per_patch`
+  // just under the width cap while `max_num_patches = 4096` passes the
+  // cardinality cap → ~4.29e9 f32 / ~16 GiB). Compute both (overflow-checked so
+  // a hostile config cannot wrap the allocation size) and cap the product by
+  // `MAX_PIXEL_ELEMENTS` BEFORE any allocation — this also bounds the
+  // intermediate resize buffer, whose `h_p*w_p*patch_size^2*3 <= total_floats`.
+  // Mirrors `VisionConfig::validate` (the exported entry bypasses it).
+  let p = patch_size as usize;
+  let per_patch = p
+    .checked_mul(p)
+    .and_then(|pp| pp.checked_mul(channels))
+    .ok_or_else(|| {
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "siglip2 preprocess: per-patch width (patch_size^2 * channels)",
+        "usize",
+        [
+          ("patch_size", u64::from(patch_size)),
+          ("channels", RGB_CHANNELS as u64),
+        ],
+      ))
+    })?;
+  let total_floats = (max_num_patches as usize)
+    .checked_mul(per_patch)
+    .ok_or_else(|| {
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "siglip2 preprocess: pixel_values size (max_num_patches * per_patch)",
+        "usize",
+        [
+          ("max_num_patches", u64::from(max_num_patches)),
+          ("per_patch", per_patch as u64),
+        ],
+      ))
+    })?;
+  if total_floats as u64 > MAX_PIXEL_ELEMENTS as u64 {
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "siglip2 preprocess: pixel_values element count (max_num_patches * patch_feature_dim)",
+      "MAX_PIXEL_ELEMENTS",
+      MAX_PIXEL_ELEMENTS as u64,
+      total_floats as u64,
     )));
   }
 
@@ -259,8 +341,8 @@ pub fn preprocess(
   //    Build a borrowed-free owned RgbImage over the caller's bytes
   //    (image 0.25's `from_raw` needs an owned container), then resize.
   //    Only the RGB (3-channel) path is wired (the patchify normalize is
-  //    per-RGB-channel); `num_channels` is pinned to 3 by the config
-  //    validator, so a non-3 value cannot reach here through the model.
+  //    per-RGB-channel); `num_channels` was verified `== 3` above and every
+  //    stride below derives from the resulting 3-channel `to_rgb8()` buffer.
   let src_buf: Vec<u8> = rgb.to_vec();
   let src_img: ::image::RgbImage = ::image::ImageBuffer::from_raw(width, height, src_buf)
     .ok_or_else(|| {
@@ -275,40 +357,27 @@ pub fn preprocess(
   let resized_dyn = resize(&src_dyn, (h_res, w_res), ResizeFilter::Bilinear)?;
   let resized = resized_dyn.to_rgb8();
 
-  // 3. Normalize + patchify into the fixed (max_num_patches, P^2*C)
-  //    buffer, zero-padded past the active rows.
-  let p = patch_size as usize;
-  let c = num_channels as usize;
-  // Per-patch flattened width = P*P*C; total floats = max_num_patches *
-  // that. Both checked so a hostile config cannot wrap the allocation.
-  let per_patch = p
-    .checked_mul(p)
-    .and_then(|pp| pp.checked_mul(c))
-    .ok_or_else(|| {
-      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
-        "siglip2 preprocess: per-patch width (patch_size^2 * channels)",
-        "usize",
-        [
-          ("patch_size", u64::from(patch_size)),
-          ("channels", u64::from(num_channels)),
-        ],
-      ))
-    })?;
-  let total_floats = (max_num_patches as usize)
-    .checked_mul(per_patch)
-    .ok_or_else(|| {
-      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
-        "siglip2 preprocess: pixel_values size (max_num_patches * per_patch)",
-        "usize",
-        [
-          ("max_num_patches", u64::from(max_num_patches)),
-          ("per_patch", per_patch as u64),
-        ],
-      ))
-    })?;
+  // 3. Normalize + patchify into the fixed (max_num_patches, P^2*C) buffer,
+  //    zero-padded past the active rows. `per_patch` / `total_floats` were
+  //    overflow-checked AND product-capped above. Build the buffer FALLIBLY
+  //    (`reserve_or_error` → typed `AllocFailure`) then zero-fill via `resize`
+  //    (which cannot reallocate — the exact capacity is already reserved),
+  //    replacing the infallible `vec![0.0; total_floats]` that aborts on a
+  //    within-cap but heavyweight request. The padding rows past the active
+  //    `H_p*W_p` patches stay at the zero fill.
+  let mut pixel_values: Vec<f32> = Vec::new();
+  reserve_or_error(
+    &mut pixel_values,
+    "siglip2 pixel_values f32 elements",
+    total_floats,
+  )?;
+  pixel_values.resize(total_floats, 0.0f32);
 
-  let mut pixel_values = vec![0.0f32; total_floats];
   let resized_buf = resized.as_raw();
+  // Every stride is derived from the actual RGB buffer format (`channels` ==
+  // `RGB_CHANNELS` == 3), never the raw `num_channels` parameter, so the
+  // patchify cannot index past the always-3-channel `resized_buf`.
+  let c = channels;
   let src_row_stride = (w_res as usize) * c; // bytes per resized row
   let row_bytes = p * c; // bytes per patch row (16*3 = 48)
   let h_p_us = h_p as usize;
@@ -336,9 +405,18 @@ pub fn preprocess(
     }
   }
 
-  // 4. Side outputs.
+  // 4. Side outputs. The mask is `max_num_patches` i32 (bounded by the
+  //    cardinality cap, but reserved fallibly for the same recover-don't-abort
+  //    discipline as `pixel_values`); `resize` zero-fills within the reserved
+  //    capacity, then the first `n_active` slots are set to 1.
   let n_active = grid_patches as usize; // <= max_num_patches (checked above)
-  let mut mask = vec![0i32; max_num_patches as usize];
+  let mut mask: Vec<i32> = Vec::new();
+  reserve_or_error(
+    &mut mask,
+    "siglip2 pixel_attention_mask i32 elements",
+    max_num_patches as usize,
+  )?;
+  mask.resize(max_num_patches as usize, 0i32);
   for slot in mask.iter_mut().take(n_active) {
     *slot = 1;
   }

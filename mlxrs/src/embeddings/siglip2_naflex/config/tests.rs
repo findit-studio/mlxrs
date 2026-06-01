@@ -312,6 +312,30 @@ fn validate_rejects_oversize_patch_feature_dim() {
 }
 
 #[test]
+fn validate_rejects_oversize_pixel_values_product() {
+  // `patch_size = 591` keeps `patch_feature_dim = 3 * 591^2 = 1_047_843` just
+  // under the `1 << 20` width cap, and `max_num_patches = 256` is within the
+  // cardinality cap — each per-axis bound is satisfied — yet their product
+  // `268_247_808` exceeds the `1 << 26` `MAX_PIXEL_ELEMENTS` cap (the per-image
+  // `pixel_values` buffer would be ~1 GiB of f32). The product guard must
+  // reject it with a typed `CapExceeded` (`num_patches` is set explicitly so
+  // only the `patch_size` change is under test).
+  let json = BASE_CONFIG_JSON.replace(r#""patch_size": 16"#, r#""patch_size": 591"#);
+  let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
+  // Sanity: each per-axis cap is individually satisfied at patch_size 591.
+  assert_eq!(cfg.vision_config.patch_feature_dim().unwrap(), 3 * 591 * 591);
+  assert_eq!(cfg.vision_config.max_num_patches(), 256);
+  let err = cfg.validate().unwrap_err();
+  match err {
+    Error::CapExceeded(p) => {
+      assert_eq!(p.cap(), 1 << 26, "cap value");
+      assert_eq!(p.observed(), 256 * 3 * 591 * 591, "observed product");
+    }
+    _ => panic!("expected CapExceeded for the pixel_values product, got {err}"),
+  }
+}
+
+#[test]
 fn validate_rejects_oversize_image_size() {
   // A hostile `image_size` would inflate the `(image_size/patch_size)^2`
   // num_patches fallback; the cardinality cap rejects an over-cap value.

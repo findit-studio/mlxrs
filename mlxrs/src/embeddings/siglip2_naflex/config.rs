@@ -49,6 +49,29 @@ const MAX_CARDINALITY: u64 = 4096;
 /// Mirrors the LFM2 config's `MAX_CONFIG_DIM` width-cap discipline.
 const MAX_CONFIG_DIM: i32 = 1 << 20;
 
+/// Inclusive upper bound on the **product** `max_num_patches *
+/// patch_feature_dim` — the element count of the
+/// `(max_num_patches, num_channels * patch_size^2)` `pixel_values` buffer the
+/// [`crate::embeddings::siglip2_naflex::processing`] stage allocates per image.
+///
+/// `max_num_patches` (a cardinality, capped at [`MAX_CARDINALITY`] = 4096) and
+/// `patch_feature_dim` (a width, capped at [`MAX_CONFIG_DIM`] = 1 Mi) are each
+/// bounded **independently**, but their product is not: a `patch_size` near
+/// `591` yields `patch_feature_dim = 3 * 591^2 ~= 1.05M` (just under the width
+/// cap) while `max_num_patches = 4096` passes the cardinality cap, so the
+/// product reaches `~4.29e9` f32 (~16 GiB) — an infallible allocation toward an
+/// abort even though every per-axis cap is satisfied. This is the same
+/// per-axis-bounded-but-product-unbounded mode already guarded for the CTC
+/// logits and the mel frontend. The real `google/siglip2-base-patch16-naflex`
+/// product is `256 * 768 = 196_608`; `1 << 26` (`67_108_864`, a 256 MiB f32
+/// ceiling) is ~340x that — generous for any legitimate NaFlex budget — while
+/// turning a hostile `(patch_size, max_num_patches)` pair into a recoverable
+/// [`Error::CapExceeded`] instead of a multi-GiB abort. Checked in both
+/// [`VisionConfig::validate`] and at the top of
+/// [`crate::embeddings::siglip2_naflex::processing::preprocess`] (the exported
+/// `preprocess` bypasses config validation).
+pub(crate) const MAX_PIXEL_ELEMENTS: i64 = 1 << 26;
+
 // ════════════════════════════════ TextConfig ═══════════════════════════════
 
 /// SigLIP2 text-tower configuration. Defaults match
@@ -487,11 +510,28 @@ impl VisionConfig {
     // `max_num_patches * patch_feature_dim` buffer; bound the derived product by
     // the same width cap (not merely overflow-check it) so a hostile
     // `patch_size` cannot drive an oversized preprocessing / matmul allocation.
+    let patch_feature_dim = self.patch_feature_dim()?;
     require_in_range(
       "VisionConfig: patch_feature_dim (num_channels * patch_size^2)",
-      self.patch_feature_dim()?,
+      patch_feature_dim,
       1,
       MAX_CONFIG_DIM,
+    )?;
+    // Cap the PRODUCT `max_num_patches * patch_feature_dim` — the element count
+    // of the per-image `pixel_values` buffer the preprocessing stage allocates.
+    // `max_num_patches` and `patch_feature_dim` are each within their own cap
+    // above, but a `patch_size` near 591 keeps `patch_feature_dim` just under
+    // the width cap while `max_num_patches = 4096` passes the cardinality cap,
+    // so the product (~4.29e9 f32 / ~16 GiB) would drive an oversized
+    // allocation toward an abort. Both operands are non-negative i32 within
+    // their caps, so the i64 product cannot overflow; bound it by
+    // `MAX_PIXEL_ELEMENTS` so a hostile pair is a recoverable
+    // [`Error::CapExceeded`]. Mirrors the processing stage's identical pre-alloc
+    // guard (the exported `preprocess` bypasses this validator).
+    require_cardinality(
+      "VisionConfig: pixel_values element count (max_num_patches * patch_feature_dim)",
+      i64::from(self.max_num_patches()) * i64::from(patch_feature_dim),
+      MAX_PIXEL_ELEMENTS as u64,
     )?;
     Ok(())
   }

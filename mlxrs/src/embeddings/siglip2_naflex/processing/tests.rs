@@ -212,6 +212,48 @@ fn rejects_wrong_rgb_length() {
 }
 
 #[test]
+fn rejects_non_rgb_channels() {
+  // The exported `preprocess` bypasses the config's `num_channels == 3` pin.
+  // A direct 4-channel call must be rejected with a typed `InvariantViolation`
+  // BEFORE any sizing — it would otherwise stride the always-3-channel resized
+  // buffer with 4-channel offsets and read out of bounds. A 1-channel call is
+  // rejected the same way (the path is strictly RGB, not merely positive).
+  let rgb4 = vec![0u8; (16 * 16 * 4) as usize];
+  let err = preprocess(&rgb4, 16, 16, PATCH, 4, M).unwrap_err();
+  assert!(
+    matches!(err, Error::InvariantViolation(_)),
+    "num_channels=4: got {err}"
+  );
+  let rgb1 = vec![0u8; (16 * 16) as usize];
+  let err = preprocess(&rgb1, 16, 16, PATCH, 1, M).unwrap_err();
+  assert!(
+    matches!(err, Error::InvariantViolation(_)),
+    "num_channels=1: got {err}"
+  );
+}
+
+#[test]
+fn rejects_pixel_values_product_over_cap() {
+  // `patch_size = 591` keeps `patch_feature_dim = 3 * 591^2 = 1_047_843` just
+  // under the `1 << 20` width cap, and `max_num_patches = 256` is a real,
+  // within-cardinality budget — yet their product `268_247_808` exceeds the
+  // `1 << 26` `MAX_PIXEL_ELEMENTS` product cap (~1 GiB of f32). The guard must
+  // fire as a typed `CapExceeded` BEFORE the (infallible-in-the-old-code)
+  // allocation, never aborting. The `rgb` slice is a cheap 16x16x3 (the cap
+  // check runs after the length check but before `patch_grid`/resize, so no
+  // large buffer is ever sized).
+  let rgb = vec![0u8; (16 * 16 * 3) as usize];
+  let err = preprocess(&rgb, 16, 16, 591, CHANNELS, M).unwrap_err();
+  match err {
+    Error::CapExceeded(p) => {
+      assert_eq!(p.cap(), 1 << 26, "cap value");
+      assert_eq!(p.observed(), 256 * 3 * 591 * 591, "observed product");
+    }
+    _ => panic!("expected CapExceeded, got {err}"),
+  }
+}
+
+#[test]
 fn rejects_huge_dimensions_overflow() {
   // width near u32::MAX with height 1 overflows the rgb byte-count
   // product on a 32-bit usize *and* would otherwise blow past the budget;
