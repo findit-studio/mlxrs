@@ -8,7 +8,7 @@
 //! language-adapter logic (which is dropped here).
 //!
 //! The model is **not** autoregressive, so it does not implement the
-//! [`crate::audio::stt::model::Model`] trait (encoder + per-token
+//! [`crate::audio::stt::model::AutoregressiveStt`] trait (encoder + per-token
 //! cross-attention `decode_step` + KV cache). Inference is a single forward
 //! over the raw 16 kHz mono waveform producing per-frame logits `(B, T', V)`,
 //! followed by a greedy CTC collapse over a character vocabulary. The public

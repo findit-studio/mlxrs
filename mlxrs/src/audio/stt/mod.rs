@@ -35,11 +35,12 @@ pub mod load;
 pub mod model;
 /// Concrete STT model implementations (feature-gated per architecture).
 ///
-/// Unlike the architecture-agnostic [`model::Model`] trait — which user code
-/// implements for autoregressive cross-attention / joint decoders (whisper,
-/// parakeet, …) — the models here are the small number of non-AR / CTC
-/// architectures mlxrs ports directly because they do not fit that trait's
-/// `encode_audio` + per-token `decode_step` + KV-cache shape. Each is behind
+/// Unlike the autoregressive [`AutoregressiveStt`](model::AutoregressiveStt)
+/// family trait — which encoder/decoder models implement (whisper, parakeet,
+/// …) — the models here are the small number of non-AR / CTC architectures,
+/// which fit the [`CtcModel`](model::CtcModel) family (or expose an inherent
+/// CTC API) rather than that trait's `encode` + per-token `decode_step` +
+/// KV-cache shape. Each is behind
 /// its own cargo feature.
 #[cfg(feature = "wav2vec2")]
 #[cfg_attr(docsrs, doc(cfg(feature = "wav2vec2")))]
