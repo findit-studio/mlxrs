@@ -36,8 +36,9 @@ use smol_str::format_smolstr;
 use crate::{
   array::Array,
   error::{
-    Error, InvariantViolationPayload, LengthMismatchPayload, MissingKeyPayload, OutOfRangePayload,
-    ParsePayload, RankMismatchPayload, Result,
+    CapExceededPayload, Error, InvariantViolationPayload, LengthMismatchPayload,
+    MalformedDataPayload, MissingKeyPayload, OutOfRangePayload, ParsePayload, RankMismatchPayload,
+    Result, UnknownEnumValuePayload,
   },
   lm::nn::{
     attention::{Mask, scaled_dot_product_attention},
@@ -208,6 +209,39 @@ impl Wav2Vec2Config {
     self.feat_extract_norm == "group"
   }
 
+  /// Reject any config outside the single architecture arm this port
+  /// implements (`facebook/wav2vec2-base-960h`) with a typed error, **before**
+  /// any tensor is allocated.
+  ///
+  /// The port wires only the post-norm / group-norm feature-encoder arm; a
+  /// checkpoint requesting the pre-norm (`do_stable_layer_norm == true`) or a
+  /// non-`"group"` `feat_extract_norm` arm would otherwise be loaded into the
+  /// wrong graph and silently produce incorrect output. This is the single
+  /// validation gate called at the top of [`Wav2Vec2Ctc::from_weights`] (and
+  /// eagerly in [`Wav2Vec2Ctc::load`], so a mismatch fails fast before the
+  /// weights are even read).
+  ///
+  /// Returns:
+  /// - [`Error::UnknownEnumValue`] if `feat_extract_norm != "group"` (the
+  ///   supported set is just `["group"]`);
+  /// - [`Error::InvariantViolation`] if `do_stable_layer_norm == true`.
+  pub fn validate(&self) -> Result<()> {
+    if !self.is_group_norm() {
+      return Err(Error::UnknownEnumValue(UnknownEnumValuePayload::new(
+        "Wav2Vec2Config: feat_extract_norm",
+        self.feat_extract_norm.as_str(),
+        &["group"],
+      )));
+    }
+    if self.do_stable_layer_norm {
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "Wav2Vec2Config: do_stable_layer_norm",
+        "must be false (only the base-960h post-norm arm is supported)",
+      )));
+    }
+    Ok(())
+  }
+
   /// Per-head dimension `hidden_size / num_attention_heads`.
   fn head_dim(&self) -> Result<i32> {
     if self.num_attention_heads <= 0 {
@@ -344,6 +378,16 @@ pub struct Vocab {
   id_to_token: Vec<Option<String>>,
 }
 
+/// Upper bound on a `vocab.json` token id, gating the `id → token` slot
+/// allocation. The id table is a dense `Vec` indexed by id, so a single
+/// enormous id (e.g. `i64::MAX`) would otherwise drive a multi-exabyte
+/// `vec![None; len]` and abort the process. `base-960h` has 32 ids and the
+/// largest real Wav2Vec2/MMS character vocabularies are a few thousand; this
+/// cap is far above any legitimate vocabulary while still rejecting a hostile
+/// or corrupt id before allocation.
+#[cfg(feature = "wav2vec2")]
+const MAX_VOCAB_ID: i64 = 1 << 20;
+
 #[cfg(feature = "wav2vec2")]
 #[cfg_attr(docsrs, doc(cfg(feature = "wav2vec2")))]
 impl Vocab {
@@ -353,38 +397,61 @@ impl Vocab {
   /// Mirrors mlx-audio's `model._vocab = {v: k for k, v in vocab.items()}`
   /// ([mms.py:155][voc]). The nested-`{lang: {...}}` MMS multilingual form is
   /// **not** handled (`base-960h` is monolingual); a nested object is a parse
-  /// error. A negative id is rejected.
+  /// error.
+  ///
+  /// Malformed ids are rejected with a typed error rather than panicking or
+  /// silently corrupting the table:
+  /// - a **negative** id is rejected ([`Error::OutOfRange`]); a non-empty map
+  ///   whose ids are *all* negative is [`Error::MalformedData`] (distinct from
+  ///   the legitimately empty `{}` map, which yields an empty [`Vocab`]);
+  /// - an id exceeding the internal `MAX_VOCAB_ID` cap is rejected
+  ///   ([`Error::CapExceeded`]) **before** the `id → token` table is
+  ///   allocated, so an enormous id can never drive an out-of-memory abort.
   ///
   /// [voc]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/mms/mms.py#L155
   pub fn from_json(json: &str) -> Result<Self> {
     let map: HashMap<String, i64> = serde_json::from_str(json)
       .map_err(|e| Error::Parse(ParsePayload::new("Vocab::from_json", "vocab.json", e)))?;
-    let max_id = map.values().copied().max().unwrap_or(-1);
-    if max_id < 0 {
-      // Empty vocab (or all-negative, rejected next) → no slots.
+    if map.is_empty() {
+      // Legitimately empty vocabulary → no slots (forward still works,
+      // transcribe errors with a clear message).
       return Ok(Self {
         id_to_token: Vec::new(),
       });
     }
-    let len = usize::try_from(max_id)
-      .map_err(|_| {
-        Error::OutOfRange(OutOfRangePayload::new(
-          "Vocab::from_json: token id",
-          "must be a non-negative i64 that fits usize",
-          format_smolstr!("{max_id}"),
-        ))
-      })?
-      .saturating_add(1);
+    let max_id = map.values().copied().max().unwrap_or(-1);
+    if max_id < 0 {
+      // A non-empty map with no non-negative id is malformed (every entry's
+      // id is negative) — reject rather than silently inverting to an empty
+      // table, which would lose the whole vocabulary.
+      return Err(Error::MalformedData(MalformedDataPayload::new(
+        "Vocab::from_json",
+        "vocab.json has entries but every token id is negative",
+      )));
+    }
+    // Cap the maximum id BEFORE allocating the dense table so an enormous id
+    // cannot drive a multi-exabyte allocation / OOM abort.
+    if max_id > MAX_VOCAB_ID {
+      return Err(Error::CapExceeded(CapExceededPayload::new(
+        "Vocab::from_json: token id",
+        "MAX_VOCAB_ID",
+        MAX_VOCAB_ID as u64,
+        max_id as u64,
+      )));
+    }
+    // `max_id` is in `0..=MAX_VOCAB_ID`, so `+ 1` fits usize on every target.
+    let len = max_id as usize + 1;
     let mut id_to_token: Vec<Option<String>> = vec![None; len];
     for (token, id) in map {
-      let idx = usize::try_from(id).map_err(|_| {
-        Error::OutOfRange(OutOfRangePayload::new(
+      if id < 0 {
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
           "Vocab::from_json: token id",
           "must be non-negative",
           format_smolstr!("{id}"),
-        ))
-      })?;
-      id_to_token[idx] = Some(token);
+        )));
+      }
+      // `0 <= id <= max_id <= MAX_VOCAB_ID`, so the index is in bounds.
+      id_to_token[id as usize] = Some(token);
     }
     Ok(Self { id_to_token })
   }
@@ -819,20 +886,10 @@ impl Wav2Vec2Ctc {
     mut weights: HashMap<String, Array>,
     vocab: Vocab,
   ) -> Result<Self> {
-    if !config.is_group_norm() {
-      return Err(Error::OutOfRange(OutOfRangePayload::new(
-        "Wav2Vec2Ctc: feat_extract_norm",
-        "only \"group\" is supported (base-960h)",
-        format_smolstr!("{}", config.feat_extract_norm),
-      )));
-    }
-    if config.do_stable_layer_norm {
-      return Err(Error::OutOfRange(OutOfRangePayload::new(
-        "Wav2Vec2Ctc: do_stable_layer_norm",
-        "only false (post-norm) is supported",
-        "true",
-      )));
-    }
+    // Single config-validation gate: reject any unsupported architecture arm
+    // (non-"group" feat_extract_norm, or the pre-norm stable-layer-norm arm)
+    // BEFORE any tensor is built.
+    config.validate()?;
 
     let feature_encoder = build_feature_encoder(&config, &mut weights)?;
     let feature_projection = build_feature_projection(&config, &mut weights)?;
@@ -948,6 +1005,10 @@ impl Wav2Vec2Ctc {
     let dir = crate::audio::load::get_model_path(path)?;
     let config_json = crate::audio::load::load_config(&dir)?;
     let config = Wav2Vec2Config::from_json(&config_json)?;
+    // Reject an unsupported architecture arm before reading the (large)
+    // weights file — `from_weights` re-checks, but failing here avoids the
+    // safetensors read on a config this port cannot serve.
+    config.validate()?;
 
     let weights_path = dir.join("model.safetensors");
     if !weights_path.is_file() {

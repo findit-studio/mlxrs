@@ -92,6 +92,61 @@ fn vocab_empty_is_empty() {
   assert_eq!(vocab.tokens_to_text(&[0, 1, 2]), "");
 }
 
+#[test]
+fn vocab_rejects_enormous_id_before_allocating() {
+  // A single enormous id (here i64::MAX) would, if used as a dense-table
+  // length, drive a multi-exabyte `vec![None; len]` and abort the process.
+  // It must instead be rejected with a typed CapExceeded — and the observed
+  // value carried in the payload must equal the offending id, computed here
+  // independently of the implementation.
+  let json = format!(r#"{{"<pad>": 0, "X": {}}}"#, i64::MAX);
+  match Vocab::from_json(&json) {
+    Err(Error::CapExceeded(p)) => {
+      assert_eq!(p.observed(), i64::MAX as u64);
+      assert_eq!(p.cap(), (1u64 << 20));
+    }
+    other => panic!("expected CapExceeded for an enormous id, got {other:?}"),
+  }
+  // An id one past the cap is rejected; the cap itself (2^20) is accepted.
+  let over = format!(r#"{{"A": {}}}"#, (1i64 << 20) + 1);
+  assert!(matches!(
+    Vocab::from_json(&over),
+    Err(Error::CapExceeded(_))
+  ));
+  let at_cap = format!(r#"{{"A": {}}}"#, 1i64 << 20);
+  let vocab = Vocab::from_json(&at_cap).unwrap();
+  // Highest id is exactly 2^20 -> 2^20 + 1 slots, only the top one populated.
+  assert_eq!(vocab.len(), (1usize << 20) + 1);
+  assert_eq!(vocab.token(1 << 20), Some("A"));
+}
+
+#[test]
+fn vocab_rejects_all_negative_ids() {
+  // A NON-EMPTY map whose every id is negative is malformed: inverting it
+  // would silently drop the entire vocabulary. It must be a typed
+  // MalformedData, distinct from the legitimately-empty `{}` (which is Ok).
+  let all_neg = r#"{"A": -1, "B": -3}"#;
+  assert!(matches!(
+    Vocab::from_json(all_neg),
+    Err(Error::MalformedData(_))
+  ));
+  // A single negative id is likewise malformed when it is the only entry.
+  let one_neg = r#"{"A": -1}"#;
+  assert!(matches!(
+    Vocab::from_json(one_neg),
+    Err(Error::MalformedData(_))
+  ));
+}
+
+#[test]
+fn vocab_rejects_negative_id_mixed_with_valid() {
+  // A negative id alongside valid ones (so max_id >= 0, the table IS
+  // allocated) is rejected per-entry with OutOfRange rather than silently
+  // skipped or panicking on a wrapped index.
+  let mixed = r#"{"<pad>": 0, "A": 1, "BAD": -2}"#;
+  assert!(matches!(Vocab::from_json(mixed), Err(Error::OutOfRange(_))));
+}
+
 // ───────────────────────── test 6: sanitize ─────────────────────────
 
 #[test]
@@ -213,6 +268,37 @@ fn config_head_dim() {
   let config =
     Wav2Vec2Config::from_json(r#"{"hidden_size": 768, "num_attention_heads": 12}"#).unwrap();
   assert_eq!(config.head_dim().unwrap(), 64);
+}
+
+#[test]
+fn config_validate_accepts_base_960h() {
+  // The base-960h defaults (feat_extract_norm == "group",
+  // do_stable_layer_norm == false) are the one supported arm.
+  let config = Wav2Vec2Config::from_json(r#"{"model_type": "wav2vec2"}"#).unwrap();
+  assert!(config.validate().is_ok());
+}
+
+#[test]
+fn config_validate_rejects_unsupported_arms() {
+  // (a) The pre-norm stable-layer-norm arm is not ported -> InvariantViolation.
+  let stable = Wav2Vec2Config::from_json(r#"{"do_stable_layer_norm": true}"#).unwrap();
+  match stable.validate() {
+    Err(Error::InvariantViolation(p)) => {
+      assert!(p.context().contains("do_stable_layer_norm"));
+    }
+    other => panic!("expected InvariantViolation for stable layer norm, got {other:?}"),
+  }
+
+  // (b) A non-"group" feat_extract_norm is not ported -> UnknownEnumValue,
+  // and the payload carries the rejected value + the supported set.
+  let layer = Wav2Vec2Config::from_json(r#"{"feat_extract_norm": "layer"}"#).unwrap();
+  match layer.validate() {
+    Err(Error::UnknownEnumValue(p)) => {
+      assert_eq!(p.value(), "layer");
+      assert_eq!(p.supported(), &["group"]);
+    }
+    other => panic!("expected UnknownEnumValue for feat_extract_norm, got {other:?}"),
+  }
 }
 
 // ───────────────────────── test 2: feature-encoder time chain ─────────────────────────
