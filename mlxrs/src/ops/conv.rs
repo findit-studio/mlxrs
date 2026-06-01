@@ -49,28 +49,30 @@ fn conv_overflow_err(context: &'static str) -> Error {
 }
 
 /// Verify MLX cannot mishandle its int32 convolution shape arithmetic for these
-/// inputs — neither overflowing it nor indexing a shape vector out of bounds,
-/// both of which would be C++ UB reachable from safe Rust.
+/// inputs — neither indexing a shape vector out of bounds nor overflowing the
+/// arithmetic, both of which would be C++ UB reachable from safe Rust.
 ///
-/// **Well-formedness.** MLX indexes the weight and every spatial parameter slice
-/// (stride, padding, dilation, and the transposed output_padding) BY SPATIAL AXIS
-/// in its shape arithmetic and negative-padding normalization, before its own
-/// length checks. A weight rank below the input rank, or a slice whose length is
-/// not 0, 1, or the input spatial rank, would make it read a vector out of
-/// bounds, so such malformed calls are rejected up front.
+/// **Well-formedness** (prevents out-of-bounds reads). MLX allows 1-3 spatial
+/// dims, i.e. an input rank of 3, 4, or 5, with a weight of the same rank and
+/// spatial parameter slices (stride, padding, dilation, and the transposed
+/// output_padding) that broadcast to the spatial rank: length 0, 1, or the
+/// spatial rank. MLX indexes the weight and those slices BY SPATIAL AXIS in
+/// forward conv_general and in the inner conv_general that conv_transpose_general
+/// feeds — the transposed prelude even does so over the weight and parameters
+/// before the nested rank check. So a rank outside 3-5, a mismatched weight rank,
+/// or a non-broadcastable slice would read a vector out of bounds.
 ///
-/// **Overflow.** MLX builds the shape arithmetic as sums of products of one
-/// spatial PARAMETER and one input/weight DIMENSION (it never multiplies two
-/// dimensions; element counts are 64-bit). The **forward** path's per-axis
-/// arithmetic is fully known (negative-padding slice + `conv_out_shape`), so it
-/// is mirrored exactly in `i128` — large unit-parameter dimensions are accepted
-/// up to the real int32 limit. The **transposed** path's prelude feeds a nested
-/// `conv_general` that broadcasts and re-derives padding across the input's
-/// spatial rank, which is not statement-completable, so it uses a conservative
-/// term-count bound: MLX's deepest accumulation reaches at most ~6
-/// parameter*dimension products, so it rejects when `6*max_param*max_dim` (plus
-/// linear terms) exceeds `i32` — conservative only for axes above ~350M elements,
-/// not realistic transposed-conv inputs.
+/// **Overflow** (prevents int32 signed overflow). MLX builds its shape arithmetic
+/// and 2-D/3-D backend setup (output shape, negative-padding, and the lcm and
+/// jump-table math) as short sums of products of at most two factors drawn from
+/// the parameters and the input/weight dimensions; element counts are 64-bit, and
+/// an lcm of two parameters is at most their product. Its deepest accumulation
+/// reaches about six such products. So if six times the largest parameter times
+/// the larger of (largest parameter, largest dimension), plus the linear terms,
+/// fits `i32`, none of that math can overflow — regardless of MLX's statement
+/// order. This single conservative bound is exact for every realistic
+/// convolution; it rejects only physically-unreasonable parameters (a
+/// dilation/stride/padding above ~18900) or a single axis above ~350M elements.
 #[allow(clippy::too_many_arguments)]
 fn check_conv_no_overflow(
   context: &'static str,
@@ -84,103 +86,8 @@ fn check_conv_no_overflow(
   output_padding: Option<&[i32]>,
   groups: i32,
 ) -> Result<()> {
-  fn param(slice: &[i32], axis: usize, default: i32) -> i32 {
-    match slice.len() {
-      0 => default,
-      1 => slice[0],
-      _ => slice[axis],
-    }
-  }
-  fn fits(context: &'static str, value: i128) -> Result<()> {
-    if (i32::MIN as i128..=i32::MAX as i128).contains(&value) {
-      Ok(())
-    } else {
-      Err(conv_overflow_err(context))
-    }
-  }
-  // One forward conv_general axis, recomputed in i128: the negative-padding
-  // normalization + slice (numpy index wrap, then clamp to [0, in]), then
-  // conv_out_shape on the sliced length. The forward arithmetic is fully known
-  // per-axis, so it is checked exactly — large unit-parameter dimensions pass up
-  // to the real int32 limit.
-  #[allow(clippy::too_many_arguments)]
-  fn check_forward_axis(
-    context: &'static str,
-    in_d: i128,
-    wt_d: i128,
-    plo: i128,
-    phi: i128,
-    dil: i128,
-    idil: i128,
-    strd: i128,
-    slice_runs: bool,
-  ) -> Result<()> {
-    let dwt = dil * (wt_d - 1);
-    fits(context, dwt)?;
-    let kd = dwt + 1;
-    fits(context, kd)?;
-    let start = if plo < 0 { -plo } else { 0 };
-    if plo < 0 {
-      fits(context, start)?;
-    }
-    let stop = if phi < 0 { in_d + phi } else { in_d };
-    if phi < 0 {
-      fits(context, stop)?;
-    }
-    let s = if start < 0 {
-      let wrapped = start + in_d;
-      fits(context, wrapped)?;
-      wrapped
-    } else {
-      start
-    };
-    let e = if stop < 0 {
-      let wrapped = stop + in_d;
-      fits(context, wrapped)?;
-      wrapped
-    } else {
-      stop
-    };
-    let st = s.clamp(0, in_d);
-    let ed = e.clamp(0, in_d).max(st);
-    let sliced_in = ed - st;
-    if slice_runs {
-      fits(context, sliced_in + 1)?;
-    }
-    let din = idil * (sliced_in - 1);
-    fits(context, din)?;
-    let id = din + 1;
-    fits(context, id)?;
-    let pad_sum = plo.max(0) + phi.max(0);
-    fits(context, pad_sum)?;
-    let t = id + pad_sum;
-    fits(context, t)?;
-    let numer = t - kd;
-    fits(context, numer)?;
-    fits(context, numer / strd + 1)?;
-    Ok(())
-  }
-  // The negative-padding slice runs over every dimension; the untouched batch
-  // and channel axes keep their full length, so check their `dim + 1` slice
-  // intermediate (spatial axes are checked on their sliced length above).
-  fn check_nonspatial_slice(context: &'static str, shape: &[usize]) -> Result<()> {
-    if let Some(&batch) = shape.first() {
-      let batch = i128::from(i32::try_from(batch).map_err(|_| conv_overflow_err(context))?);
-      fits(context, batch + 1)?;
-    }
-    if let Some(&channels) = shape.last() {
-      let channels = i128::from(i32::try_from(channels).map_err(|_| conv_overflow_err(context))?);
-      fits(context, channels + 1)?;
-    }
-    Ok(())
-  }
   let in_shape = input.shape();
   let wt_shape = weight.shape();
-  // run_conv_checks: groups * C_in_per_group.
-  if let Some(&channels) = wt_shape.last() {
-    let channels = i32::try_from(channels).map_err(|_| conv_overflow_err(context))?;
-    fits(context, groups as i128 * channels as i128)?;
-  }
   let nd = in_shape.len();
   // Well-formedness gate (both paths), so MLX only runs its shape arithmetic on a
   // convolution it can actually index. MLX allows 1-3 spatial dims, i.e. an input
@@ -218,59 +125,32 @@ fn check_conv_no_overflow(
       format_smolstr!("spatial rank {spatial_rank}"),
     )));
   }
-  match output_padding {
-    None => {
-      // Forward conv_general: the per-axis arithmetic is fully known, so mirror
-      // it exactly. The well-formedness gate guarantees the loop can index every
-      // slice and weight axis.
-      let slice_runs =
-        (0..spatial_rank).any(|i| param(pad_lo, i, 0) < 0 || param(pad_hi, i, 0) < 0);
-      if slice_runs {
-        check_nonspatial_slice(context, &in_shape)?;
-      }
-      for axis in 0..spatial_rank {
-        let in_d =
-          i128::from(i32::try_from(in_shape[axis + 1]).map_err(|_| conv_overflow_err(context))?);
-        let wt_d =
-          i128::from(i32::try_from(wt_shape[axis + 1]).map_err(|_| conv_overflow_err(context))?);
-        let plo = i128::from(param(pad_lo, axis, 0));
-        let phi = i128::from(param(pad_hi, axis, 0));
-        let dil = i128::from(param(kernel_dilation, axis, 1));
-        let idil = i128::from(param(input_dilation, axis, 1));
-        let strd = i128::from(param(stride, axis, 1));
-        check_forward_axis(context, in_d, wt_d, plo, phi, dil, idil, strd, slice_runs)?;
-      }
-    }
-    Some(out_pad) => {
-      // Transposed conv: its prelude feeds a nested conv_general that broadcasts
-      // and re-derives padding across the input's spatial rank, which is not
-      // statement-completable. Bound it: MLX's deepest int32 accumulation reaches
-      // at most ~6 parameter*dimension products plus linear terms (conservative
-      // only for >~350M-element axes, not realistic transposed-conv inputs).
-      let max_dim = in_shape
-        .iter()
-        .chain(wt_shape.iter())
-        .map(|&d| d as i128)
-        .max()
-        .unwrap_or(0);
-      let max_param = [
-        stride,
-        pad_lo,
-        pad_hi,
-        kernel_dilation,
-        input_dilation,
-        out_pad,
-      ]
-      .into_iter()
-      .flatten()
-      .chain(std::iter::once(&groups))
-      .map(|&p| i128::from(p).abs())
-      .max()
-      .unwrap_or(0);
-      if 6 * max_param * max_dim + 32 * max_param + 64 > i128::from(i32::MAX) {
-        return Err(conv_overflow_err(context));
-      }
-    }
+  // Overflow bound: MLX builds its shape arithmetic and 2-D/3-D backend setup
+  // (output shape, negative-padding, and the lcm/jump-table math) as short sums
+  // of products of at most two factors drawn from the parameters and the
+  // input/weight dimensions; element counts are 64-bit and an lcm of two
+  // parameters is at most their product. Its deepest accumulation reaches about
+  // six such products, so if six times the largest parameter times the larger of
+  // (largest parameter, largest dimension), plus the linear terms, fits i32, none
+  // of that math can overflow. The channel check groups * C_in is one such
+  // product and is covered too. Conservative only for an absurd parameter (above
+  // ~18900) or a single axis above ~350M elements.
+  let max_dim = in_shape
+    .iter()
+    .chain(wt_shape.iter())
+    .map(|&d| d as i128)
+    .max()
+    .unwrap_or(0);
+  let max_param = [stride, pad_lo, pad_hi, kernel_dilation, input_dilation]
+    .into_iter()
+    .chain(output_padding)
+    .flatten()
+    .chain(std::iter::once(&groups))
+    .map(|&p| i128::from(p).abs())
+    .max()
+    .unwrap_or(0);
+  if 6 * max_param * max_param.max(max_dim) + 32 * max_param + 64 > i128::from(i32::MAX) {
+    return Err(conv_overflow_err(context));
   }
   Ok(())
 }
@@ -839,7 +719,7 @@ mod tests {
   fn conv_general_rejects_canceling_padding() {
     // padding_lo = i32::MIN and padding_hi = i32::MAX cancel in the final output
     // size, but MLX normalizes negative padding via `0 - padding_lo` first, which
-    // overflows. Must be rejected (Codex round-3 counterexample).
+    // overflows. Must be rejected.
     let input = Array::from_slice::<f32>(&[1.0, 2.0], &[1, 2, 1]).unwrap();
     let weight = Array::from_slice::<f32>(&[1.0], &[1, 1, 1]).unwrap();
     let err = conv_general(
@@ -860,8 +740,7 @@ mod tests {
   #[test]
   fn conv_transpose1d_rejects_overflowing_padding() {
     // MLX's transpose prelude computes `2 * padding`, which overflows at
-    // padding = 1.5e9 even though the final output size stays in range (Codex
-    // round-3 counterexample).
+    // padding = 1.5e9 even though the final output size stays in range.
     let input = Array::from_slice::<f32>(&[1.0], &[1, 1, 1]).unwrap();
     let weight = Array::from_slice::<f32>(&[1.0], &[1, 1, 1]).unwrap();
     let err = conv_transpose1d(&input, &weight, 1, 1_500_000_000, 1, 0, 1)
@@ -873,7 +752,7 @@ mod tests {
   fn conv_general_all_empty_slices_uses_defaults() {
     // Empty spatial slices select MLX defaults (stride 1, no padding, dilation 1)
     // and must cross the FFI through dim_ptr, not a dangling empty-slice pointer
-    // (Codex round-4 finding). The result matches conv1d with the same defaults.
+    // The result matches conv1d with the same defaults.
     let input = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[1, 4, 1]).unwrap();
     let weight = Array::from_slice::<f32>(&[1.0, 0.0, -1.0], &[1, 3, 1]).unwrap();
     let mut out = conv_general(&input, &weight, &[], &[], &[], &[], &[], 1, false)
@@ -896,10 +775,10 @@ mod tests {
 
   #[test]
   fn conv_transpose1d_rejects_rank_invalid_prelude_overflow() {
-    // Rank-2 input/weight is invalid for conv_transpose1d, but MLX runs its
-    // prelude (1 + dilation*(weight.shape(1)-1)) over the wrapper arity BEFORE
-    // rejecting the rank, so dilation=i32::MAX overflows first. The guard must
-    // check the prelude regardless of rank (Codex round-5 counterexample).
+    // Rank-2 is below the valid 3-5 range, so the rank gate rejects it before the
+    // FFI — foreclosing MLX's transposed prelude, which would otherwise run
+    // 1 + dilation*(weight_dim - 1) over the wrapper arity and overflow on
+    // dilation = i32::MAX before validating the rank.
     let input = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[1, 3]).unwrap();
     let weight = Array::from_slice::<f32>(&[1.0, 1.0, 1.0], &[1, 3]).unwrap();
     let err = conv_transpose1d(&input, &weight, 1, 0, i32::MAX, 0, 1)
@@ -909,10 +788,9 @@ mod tests {
 
   #[test]
   fn conv_general_rejects_slice_overflow_on_huge_dim() {
-    // A lazy array can carry an i32::MAX-length axis without allocating. Negative
-    // padding makes MLX slice EVERY dimension, computing `dim + 1`, which
-    // overflows for the i32::MAX batch axis. The guard must reject before the FFI
-    // (Codex round-5 counterexample).
+    // A lazy array can carry an i32::MAX-length axis without allocating. MLX would
+    // slice every dimension and run shape arithmetic over the i32::MAX batch axis;
+    // the conservative bound (6 * max_dim) rejects it before the FFI.
     let input = Array::zeros::<f32>(&[i32::MAX, 2, 1]).unwrap();
     let weight = Array::from_slice::<f32>(&[1.0], &[1, 1, 1]).unwrap();
     let err = conv_general(&input, &weight, &[1], &[0], &[-1], &[1], &[1], 1, false)
@@ -921,25 +799,24 @@ mod tests {
   }
 
   #[test]
-  fn conv_general_allows_cropped_huge_spatial_axis() {
-    // The exact forward mirror accepts a [1, i32::MAX, 1] input cropped by 1
-    // (padding_hi = -1): the spatial axis slices to i32::MAX - 1, so all forward
-    // shape arithmetic stays in range. Only an untouched batch/channel axis at
-    // i32::MAX overflows the slice (see the rejection test below).
+  fn conv_general_rejects_huge_spatial_axis_conservatively() {
+    // The conservative bound rejects a [1, i32::MAX, 1] input even though MLX's
+    // forward arithmetic would not overflow here (the axis crops to i32::MAX - 1):
+    // 6 * max_dim exceeds i32 once any dimension nears i32::MAX. This is the
+    // accepted over-rejection of single axes above ~350M elements, which are not
+    // usable convolutions.
     let input = Array::zeros::<f32>(&[1, i32::MAX, 1]).unwrap();
     let weight = Array::from_slice::<f32>(&[1.0], &[1, 1, 1]).unwrap();
-    assert!(
-      conv_general(&input, &weight, &[1], &[0], &[-1], &[1], &[1], 1, false).is_ok(),
-      "a cropped i32::MAX spatial axis must not be falsely rejected"
-    );
+    let err = conv_general(&input, &weight, &[1], &[0], &[-1], &[1], &[1], 1, false)
+      .expect_err("an axis near i32::MAX is conservatively rejected");
+    assert!(matches!(err, Error::OutOfRange(_)), "got {err:?}");
   }
 
   #[test]
   fn conv_transpose1d_rejects_4d_broadcast_overflow() {
     // A 4D conv_transpose1d broadcasts dilation to the extra spatial axis MLX
     // derives from the input. The bound rejects it because the parameter
-    // magnitude alone is i32::MAX, regardless of which axis it lands on (Codex
-    // round-7 counterexample, which the statement-mirror missed).
+    // magnitude alone is i32::MAX, regardless of which axis it lands on.
     let input = Array::zeros::<f32>(&[1, 1, 1, 1]).unwrap();
     let weight = Array::zeros::<f32>(&[1, 1, 3, 1]).unwrap();
     let err = conv_transpose1d(&input, &weight, 1, 0, i32::MAX, 0, 1)
@@ -950,9 +827,8 @@ mod tests {
   #[test]
   fn conv_general_accepts_large_unit_parameter_dim() {
     // A 1-D unit-kernel conv on a ~134M-element axis (512 MiB f32, allocatable)
-    // has no int32 shape overflow, so the affine bound must accept it — large
-    // dimensions with default parameters are not rejected (Codex round-8
-    // acceptance regression).
+    // has no int32 shape overflow, so the conservative bound must accept it —
+    // large dimensions with default parameters are not rejected.
     let input = Array::zeros::<f32>(&[1, 134_217_728, 1]).unwrap();
     let weight = Array::from_slice::<f32>(&[1.0], &[1, 1, 1]).unwrap();
     assert!(
@@ -965,7 +841,7 @@ mod tests {
   fn conv1d_handles_zero_length_axis_without_panic() {
     // A zero-length spatial axis must not panic the guard (the max-dimension scan
     // and i128 arithmetic stay valid); MLX surfaces the empty-conv shape error
-    // through `check` (Codex round-8 zero-dimension regression).
+    // through `check`.
     let input = Array::zeros::<f32>(&[1, 0, 1]).unwrap();
     let weight = Array::from_slice::<f32>(&[1.0], &[1, 1, 1]).unwrap();
     let _ = conv1d(&input, &weight, 1, 0, 1, 1);
@@ -973,9 +849,9 @@ mod tests {
 
   #[test]
   fn conv2d_rejects_mismatched_input_rank_without_panic() {
-    // conv2d on a rank-5 input/weight has spatial rank 3 but only 2 stride/
-    // padding values; the forward guard must not index past the length-2 slices.
-    // It skips the mirror and MLX surfaces the rank error (Codex round-10).
+    // conv2d on a rank-5 input/weight has spatial rank 3 but supplies only 2
+    // spatial parameters, so the slices are not broadcastable to that rank; the
+    // well-formedness gate rejects it before the FFI.
     let input = Array::zeros::<f32>(&[1, 2, 2, 2, 1]).unwrap();
     let weight = Array::zeros::<f32>(&[1, 2, 2, 2, 1]).unwrap();
     assert!(conv2d(&input, &weight, (1, 1), (0, 0), (1, 1), 1).is_err());
@@ -995,7 +871,7 @@ mod tests {
     // conv_transpose2d on a rank-5 input/weight has spatial rank 3 but only 2
     // stride/padding/dilation/output_padding values. The transposed prelude
     // would feed MLX's inner conv_general a length-2 negative padding it indexes
-    // at axis 2 out of bounds; the gate rejects it before the FFI (round-11).
+    // at axis 2 out of bounds; the gate rejects it before the FFI.
     let input = Array::zeros::<f32>(&[1, 2, 2, 2, 1]).unwrap();
     let weight = Array::zeros::<f32>(&[1, 2, 2, 2, 1]).unwrap();
     assert!(conv_transpose2d(&input, &weight, (1, 1), (1, 1), (1, 1), (0, 0), 1).is_err());
@@ -1035,7 +911,7 @@ mod tests {
     // Ranks below the valid 3-5 range. MLX's conv_transpose_general prelude
     // computes 1 + dilation * (weight_dim - 1) over the weight before the nested
     // conv_general validates the rank, so an extreme dilation would be a C++
-    // overflow. The rank gate rejects rank 0 and rank 1 before the FFI (round-12).
+    // overflow. The rank gate rejects rank 0 and rank 1 before the FFI.
     let weight = Array::zeros::<f32>(&[1, 3, 1]).unwrap();
     let scalar_shape: [i32; 0] = [];
     let rank0 = Array::zeros::<f32>(&scalar_shape).unwrap();
