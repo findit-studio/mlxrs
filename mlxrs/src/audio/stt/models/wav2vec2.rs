@@ -298,7 +298,7 @@ const CTC_BLANK: u32 = 0;
 /// ([mms.py:33-45][dec]).
 ///
 /// Emits a token only when it differs from the immediately preceding frame's
-/// token **and** is not the [blank](CTC_BLANK): `token != prev && token != 0`.
+/// token **and** is not the blank token (`CTC_BLANK`): `token != prev && token != 0`.
 /// `prev` is updated on **every** frame (including blanks), so a blank breaks
 /// a run — `[5, 5, 0, 5]` decodes to `[5, 5]` (the blank separates the two
 /// runs of `5`), while `[5, 5, 5]` collapses to `[5]`.

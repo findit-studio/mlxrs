@@ -7,7 +7,7 @@
 //! whose inference is a single forward over the raw waveform followed by a
 //! greedy per-frame collapse, so each exposes its own inherent API instead.
 //!
-//! - [`wav2vec2`] — Wav2Vec2 CTC (`facebook/wav2vec2-base-960h`): a
+//! - `wav2vec2` — Wav2Vec2 CTC (`facebook/wav2vec2-base-960h`): a
 //!   convolutional feature encoder + transformer + per-frame CTC head,
 //!   decoded by greedy collapse over a character vocabulary.
 
