@@ -30,7 +30,7 @@ use crate::{
 /// legitimate depth while still bounding the per-layer allocation loop a
 /// hostile `num_hidden_layers` could otherwise drive. Matches the LFM2
 /// config's `MAX_CONFIG_CARDINALITY` intent.
-const MAX_CARDINALITY: u64 = 4096;
+pub(crate) const MAX_CARDINALITY: u64 = 4096;
 
 /// Inclusive upper bound on every *width*-like config field — `vocab_size`,
 /// `hidden_size`, `intermediate_size`, the text `projection_size`, the vision
@@ -47,7 +47,7 @@ const MAX_CARDINALITY: u64 = 4096;
 /// while keeping a malformed width a recoverable [`Error::OutOfRange`] /
 /// [`Error::CapExceeded`] instead of an oversized allocation toward an abort.
 /// Mirrors the LFM2 config's `MAX_CONFIG_DIM` width-cap discipline.
-const MAX_CONFIG_DIM: i32 = 1 << 20;
+pub(crate) const MAX_CONFIG_DIM: i32 = 1 << 20;
 
 /// Inclusive upper bound on the **product** `max_num_patches *
 /// patch_feature_dim` — the element count of the

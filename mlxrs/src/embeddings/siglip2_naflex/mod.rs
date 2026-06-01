@@ -44,7 +44,7 @@
 //! embeddings and [`logits`](Siglip2NaflexModel::logits) computing the
 //! `logit_scale` / `logit_bias` contrastive similarity. It implements the golden
 //! embedding traits — [`Embed<TextInput>`](crate::embeddings::Embed) +
-//! `Embed<ImageInput>` + [`Contrastive`](crate::embeddings::Contrastive) — and
+//! `Embed<ImageInput>` + [`Contrastive`] — and
 //! answers the load factory's [`crate::embeddings::EmbeddingModel`] umbrella
 //! (text + contrastive accessors; the image tower is reached by downcast), so it
 //! registers into the [`crate::embeddings::EmbeddingModelTypeRegistry`] via

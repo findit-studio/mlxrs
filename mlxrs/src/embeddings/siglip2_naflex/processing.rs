@@ -57,7 +57,7 @@ use crate::{
     ArithmeticOverflowPayload, CapExceededPayload, Error, InvariantViolationPayload,
     LengthMismatchPayload, OutOfRangePayload, Result,
   },
-  model_validation::reserve_or_error,
+  model_validation::{Extent, elem_count, reserve_or_error},
   vlm::image::{ResizeFilter, resize},
 };
 
@@ -70,6 +70,18 @@ use crate::{
 /// `num_channels` parameter, so a non-3 argument is a typed error, never an
 /// out-of-bounds slice into the always-3-channel resized buffer.
 const RGB_CHANNELS: u32 = 3;
+
+/// Per-axis cap on the source image `width` / `height` (px). A single absurd
+/// dimension is rejected at [`Extent`] construction, before it reaches the
+/// source-clone sizing.
+const MAX_SOURCE_DIM: usize = 1 << 16;
+
+/// Total-element cap on the decoded source RGB buffer
+/// (`width * height * channels` bytes, ~512 MiB). Independent of the output
+/// patch budget ([`MAX_PIXEL_ELEMENTS`]): the source can dwarf the resized
+/// output (a large image downscaled to a few patches), so it carries its own
+/// magnitude bound so a hostile caller cannot force an unbounded source clone.
+const MAX_SOURCE_PIXELS: usize = 1 << 29;
 
 /// Tolerance for the [`patch_grid`] binary-search termination. Mirrors
 /// the `siglip2-naflex` crate's `SCALE_EPS` (= the upstream
@@ -183,8 +195,11 @@ fn require_positive_u32(context: &'static str, value: u32) -> Result<()> {
 ///   is RGB-only; the resized buffer is always 3-channel, so a different
 ///   stride would slice out of bounds). The exported entry point re-checks
 ///   this even though the config validator pins it.
-/// - `width * height * 3` overflows `usize`, or `rgb.len()` disagrees with
-///   it → [`Error::ArithmeticOverflow`] / [`Error::LengthMismatch`].
+/// - `width` / `height` exceeds the per-axis cap `MAX_SOURCE_DIM`, or
+///   `width * height * 3` overflows `usize` or exceeds the source-bytes cap
+///   `MAX_SOURCE_PIXELS`, or `rgb.len()` disagrees with the byte count →
+///   [`Error::CapExceeded`] / [`Error::ArithmeticOverflow`] /
+///   [`Error::LengthMismatch`].
 /// - the `pixel_values` element count `max_num_patches * (3 * patch_size^2)`
 ///   exceeds the `MAX_PIXEL_ELEMENTS` product cap (a hostile
 ///   `patch_size`/`max_num_patches` pair each within its own cap but whose
@@ -222,22 +237,32 @@ pub fn preprocess(
     )));
   }
 
-  // Expected RGB byte count, overflow-checked (a `u32`-product can wrap
-  // `usize` on 32-bit hosts; checked everywhere for host-independence). The
-  // channel factor is the fixed `RGB_CHANNELS` (== `num_channels`, verified
-  // above), so the slice-length contract matches the always-3-channel buffer
-  // every stride below indexes.
+  // Expected RGB byte count via the resource layer: each axis is an `Extent`
+  // (per-axis capped at construction) and `elem_count` is the checked product
+  // against the total source-bytes cap `MAX_SOURCE_PIXELS`. This bounds the
+  // SOURCE magnitude — independent of the output patch budget — so a hostile
+  // `width` / `height` cannot drive the source clone below to an unbounded
+  // duplicate. The channel factor is the fixed `RGB_CHANNELS` (== `num_channels`,
+  // verified above), so the slice-length contract matches the always-3-channel
+  // buffer every stride below indexes.
   let channels = RGB_CHANNELS as usize;
-  let expected_rgb_len = (width as usize)
-    .checked_mul(height as usize)
-    .and_then(|wh| wh.checked_mul(channels))
-    .ok_or_else(|| {
-      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
-        "siglip2 preprocess: rgb byte count (width * height * channels)",
-        "usize",
-        [("width", u64::from(width)), ("height", u64::from(height))],
-      ))
-    })?;
+  let expected_rgb_len = elem_count(
+    "siglip2 preprocess: rgb byte count (width * height * channels)",
+    &[
+      Extent::new("siglip2 preprocess: width", width as usize, MAX_SOURCE_DIM)?,
+      Extent::new(
+        "siglip2 preprocess: height",
+        height as usize,
+        MAX_SOURCE_DIM,
+      )?,
+      Extent::new(
+        "siglip2 preprocess: channels",
+        channels,
+        RGB_CHANNELS as usize,
+      )?,
+    ],
+    MAX_SOURCE_PIXELS,
+  )?;
   if rgb.len() != expected_rgb_len {
     return Err(Error::LengthMismatch(LengthMismatchPayload::new(
       "siglip2 preprocess: rgb slice length vs width*height*channels",
@@ -343,7 +368,17 @@ pub fn preprocess(
   //    Only the RGB (3-channel) path is wired (the patchify normalize is
   //    per-RGB-channel); `num_channels` was verified `== 3` above and every
   //    stride below derives from the resulting 3-channel `to_rgb8()` buffer.
-  let src_buf: Vec<u8> = rgb.to_vec();
+  // Fallible source clone: `image::ImageBuffer::from_raw` needs an owned
+  // container, but a bare `rgb.to_vec()` aborts on a within-cap-but-heavyweight
+  // duplicate. Reserve fallibly (typed `AllocFailure`) into the exact,
+  // already-capped `expected_rgb_len`, then copy — no infallible duplicate.
+  let mut src_buf: Vec<u8> = Vec::new();
+  reserve_or_error(
+    &mut src_buf,
+    "siglip2 preprocess: source RGB clone",
+    expected_rgb_len,
+  )?;
+  src_buf.extend_from_slice(rgb);
   let src_img: ::image::RgbImage = ::image::ImageBuffer::from_raw(width, height, src_buf)
     .ok_or_else(|| {
       Error::LengthMismatch(LengthMismatchPayload::new(

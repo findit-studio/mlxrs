@@ -67,19 +67,19 @@ use crate::{
   array::Array,
   dtype::Dtype,
   embeddings::siglip2_naflex::{
-    config::VisionConfig,
+    config::{MAX_CARDINALITY, MAX_CONFIG_DIM, VisionConfig},
     processing::NaflexInputs,
     shared::{
       EncoderLayer, LayerDims, Mlp, build_layer_norm, dim_i32, expect_shape, linear, take,
       take_shaped,
     },
   },
-  error::{Error, OutOfRangePayload, RankMismatchPayload, Result},
+  error::{CapExceededPayload, Error, OutOfRangePayload, RankMismatchPayload, Result},
   lm::nn::{
     attention::{Mask, scaled_dot_product_attention},
     norm::LayerNorm,
   },
-  model_validation::{checked_mul, require_positive, reserve_or_error},
+  model_validation::{Extent, checked_mul, require_positive, reserve_or_error},
   ops,
 };
 
@@ -214,6 +214,14 @@ pub struct VisionTower {
   /// The attention-pool head, present iff `config.vision_use_head`.
   head: Option<AttentionPoolHead>,
   hidden: i32,
+  /// The loaded config's runtime patch budget (`max_num_patches`), as a
+  /// cap-proven [`Extent`]. [`forward`](Self::forward) pins the runtime input's
+  /// patch count to this before any embed / interp / attention (untrusted
+  /// `NaflexInputs` has no validating constructor).
+  max_num_patches: Extent,
+  /// The loaded config's per-patch feature width (`P^2 * C`) as an [`Extent`];
+  /// `forward` pins the runtime `pixel_values` last axis to it.
+  patch_feature_dim: Extent,
 }
 
 #[cfg(feature = "siglip2-naflex")]
@@ -247,6 +255,20 @@ impl VisionTower {
     let eps = dims.eps;
     let num_positions = config.num_patches()?;
     let patch_feat = config.patch_feature_dim()?; // P^2 * C
+    // The loaded config's runtime budget, as cap-proven `Extent`s — `forward`
+    // pins the untrusted runtime `NaflexInputs` against these. `config.validate`
+    // above already bounded both, so these `Extent`s are the type-level proof a
+    // stored budget cannot be over-cap.
+    let max_num_patches = Extent::new(
+      "VisionConfig: max_num_patches",
+      config.max_num_patches() as usize,
+      MAX_CARDINALITY as usize,
+    )?;
+    let patch_feature_dim = Extent::new(
+      "VisionConfig: patch_feature_dim",
+      patch_feat as usize,
+      MAX_CONFIG_DIM as usize,
+    )?;
 
     // ── patch embedding (the Conv2d-as-Linear kernel) ──
     let patch_weight_raw = take(weights, "embeddings.patch_embedding.weight")?;
@@ -305,6 +327,8 @@ impl VisionTower {
       post_layernorm,
       head,
       hidden,
+      max_num_patches,
+      patch_feature_dim,
     })
   }
 
@@ -344,6 +368,30 @@ impl VisionTower {
         "siglip2 vision: pixel_attention_mask length vs pixel_values patch dim",
         "must equal the pixel_values leading patch dimension",
         smol_str::format_smolstr!("{mask_len} != {patch_dim}"),
+      )));
+    }
+
+    // Pin the runtime input to the loaded config's budget. `NaflexInputs` is a
+    // public, all-pub-fields struct with no validating constructor, so a
+    // hand-built input (or an over-budget `preprocess` call) can carry a patch
+    // cardinality / feature width above what the config was validated for —
+    // driving the position-embed scatter + the O(patch^2) SDPA unbounded. The
+    // stored `Extent`s are the loaded config's caps; gate the runtime dims
+    // against them ONCE here, before any embed / interp / mask-alloc / attention.
+    if patch_dim > self.max_num_patches.get() {
+      return Err(Error::CapExceeded(CapExceededPayload::new(
+        "siglip2 vision: runtime patch count vs loaded max_num_patches",
+        "max_num_patches",
+        self.max_num_patches.get() as u64,
+        patch_dim as u64,
+      )));
+    }
+    let feat_dim = inputs.pixel_values.shape().get(1).copied().unwrap_or(0);
+    if feat_dim != self.patch_feature_dim.get() {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "siglip2 vision: runtime patch feature width vs loaded patch_feature_dim",
+        "must equal the loaded config's P^2 * C",
+        smol_str::format_smolstr!("{feat_dim} != {}", self.patch_feature_dim.get()),
       )));
     }
 

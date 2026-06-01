@@ -254,19 +254,29 @@ fn rejects_pixel_values_product_over_cap() {
 }
 
 #[test]
-fn rejects_huge_dimensions_overflow() {
-  // width near u32::MAX with height 1 overflows the rgb byte-count
-  // product on a 32-bit usize *and* would otherwise blow past the budget;
-  // with an empty slice the length check or overflow check fires first.
-  // Use a value that forces the `width*height*3` usize product to be
-  // checked: on 64-bit this won't overflow usize, so instead assert the
-  // length-mismatch path (empty slice) rejects it cleanly rather than
-  // panicking.
+fn rejects_oversize_source_dimension() {
+  // A `width` far above the per-axis source cap `MAX_SOURCE_DIM` is rejected at
+  // `Extent` construction with `CapExceeded` — before the byte-count product,
+  // the slice-length check, or any allocation. (The old `width*height*3`
+  // usize-overflow path is now unreachable: the per-axis cap bounds each
+  // dimension well below the overflow boundary.)
   let err = preprocess(&[], u32::MAX, 1, PATCH, CHANNELS, M).unwrap_err();
-  // Either ArithmeticOverflow (32-bit usize) or LengthMismatch (64-bit,
-  // empty slice != huge expected) — both are typed, neither panics.
-  assert!(
-    matches!(err, Error::ArithmeticOverflow(_) | Error::LengthMismatch(_)),
-    "got {err}"
-  );
+  match err {
+    Error::CapExceeded(p) => assert_eq!(p.observed(), u32::MAX as u64, "observed width"),
+    _ => panic!("expected CapExceeded, got {err}"),
+  }
+}
+
+#[test]
+fn rejects_oversize_source_product() {
+  // Both axes are within the per-axis cap (65536 == MAX_SOURCE_DIM), but their
+  // byte-count product `65536 * 65536 * 3` (~12.9G) blows past the source-bytes
+  // cap `MAX_SOURCE_PIXELS`. The checked product (`elem_count`) rejects it with
+  // `CapExceeded` before the slice-length check or any clone — the product is
+  // the magnitude the per-axis caps do not bound.
+  let err = preprocess(&[], 1 << 16, 1 << 16, PATCH, CHANNELS, M).unwrap_err();
+  match err {
+    Error::CapExceeded(_) => {}
+    _ => panic!("expected CapExceeded, got {err}"),
+  }
 }
