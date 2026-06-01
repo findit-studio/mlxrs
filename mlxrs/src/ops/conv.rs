@@ -17,6 +17,15 @@
 //! `dilation`/`padding`/`stride`/`output_padding`/`groups` would otherwise be a
 //! C++ division-by-zero, out-of-bounds read, or signed-overflow UB reachable
 //! from safe Rust. Each wrapper rejects these with a typed error before the FFI.
+//!
+//! Limitation: MLX's metal backend additionally forms its implicit-GEMM
+//! dimensions — `batch * output_height * output_width` and `kernel_volume *
+//! channels_per_group` — in int32. These overflow only for a convolution whose
+//! batch times output-spatial size exceeds about 2.1 billion elements, i.e. a
+//! multi-gigabyte tensor that is not a usable convolution. Guarding them
+//! precisely would require recomputing the output shape, so it is deferred
+//! (Findit-AI/mlxrs#306); the underlying fix is upstream (widening MLX's conv
+//! shape and GEMM arithmetic to int64).
 
 use crate::{
   array::Array,
@@ -73,6 +82,9 @@ fn conv_overflow_err(context: &'static str) -> Error {
 /// order. This single conservative bound is exact for every realistic
 /// convolution; it rejects only physically-unreasonable parameters (a
 /// dilation/stride/padding above ~18900) or a single axis above ~350M elements.
+/// It does not cover MLX's metal-backend GEMM dimensions (products of output
+/// dimensions), which overflow int32 only for multi-gigabyte convolutions — an
+/// upstream limitation deferred to Findit-AI/mlxrs#306.
 #[allow(clippy::too_many_arguments)]
 fn check_conv_no_overflow(
   context: &'static str,
