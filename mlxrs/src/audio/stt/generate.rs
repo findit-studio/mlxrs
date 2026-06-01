@@ -197,6 +197,19 @@ pub fn greedy_ctc_transcribe<M: CtcModel + ?Sized>(
       "stt CtcModel::logits returned an empty vocab axis (vocab == 0)",
     )));
   }
+  // Blank id must index into the vocab axis: a `blank_id` outside `[0, vocab)`
+  // can never equal a per-frame `argmax` (which is always in range), so its
+  // blank frames would survive the collapse and be fed to the infallible
+  // `decode_ids` — silent bad text (or an index panic in a real vocab map).
+  // Reject it up front with a typed error.
+  if (model.blank_id() as usize) >= shape[1] {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt CtcModel::blank_id",
+      "must be < the logits vocab size (a blank id outside the vocab axis \
+         leaves blank frames un-collapsed)",
+      model.blank_id().to_string(),
+    )));
+  }
   // Empty time axis `(0, vocab)`: no frames to collapse → an empty
   // transcription (an explicit, non-panicking definition).
   if shape[0] == 0 {
@@ -262,13 +275,16 @@ pub fn greedy_transcribe<M: AutoregressiveStt + ?Sized>(
   audio: &Array,
   opts: &TranscribeOptions,
 ) -> Result<Transcription> {
-  let mel = m.log_mel(audio)?;
-  let enc = m.encode(&mel)?;
-  let mut cache = m.new_cache();
+  // Driver-owned preflight, BEFORE any model frontend call. `log_mel` is
+  // overrideable, so a custom frontend that skips its own waveform validation
+  // could otherwise eval/copy a rank-2 / empty / oversized `Array` before this
+  // shared gate; and an over-context prompt must be rejected before the full
+  // frontend + encode is spent. So validate the waveform metadata and the
+  // prompt length here — ahead of `log_mel`, `encode`, and `new_cache`.
+  validate_waveform(audio)?;
 
   let mut tokens = m.initial_tokens(opts)?;
   let prompt_len = tokens.len();
-  let eot = m.eot();
 
   // Bound `prompt + generated` by the decoder's TOTAL context: a prompt that
   // already fills (or overflows) `max_context` leaves no room to decode.
@@ -281,6 +297,13 @@ pub fn greedy_transcribe<M: AutoregressiveStt + ?Sized>(
       prompt_len.to_string(),
     )));
   }
+
+  // Gates passed: run the model frontend → encode → fresh cache, then decode.
+  let mel = m.log_mel(audio)?;
+  let enc = m.encode(&mel)?;
+  let mut cache = m.new_cache();
+  let eot = m.eot();
+
   // At most this many new tokens, so the total never exceeds `max_ctx`.
   let max_new = max_ctx - prompt_len;
 

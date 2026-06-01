@@ -193,6 +193,27 @@ fn ctc_rejects_empty_waveform() {
   assert!(matches!(err, Error::EmptyInput(_)));
 }
 
+#[test]
+fn ctc_rejects_blank_id_outside_vocab() {
+  // A `blank_id` >= the logits vocab size can never equal a per-frame argmax,
+  // so its "blank" frames would survive the collapse and feed `decode_ids` ->
+  // silent bad text. The driver rejects it with a typed OutOfRange BEFORE the
+  // argmax/collapse. vocab = 3 (valid ids 0..=2), blank_id = 3 (out of range).
+  let model = MockCtcModel::from_argmax(&[0, 1, 2], 3, 3);
+  // Routes through the model's own `Transcribe` impl (delegating to
+  // `greedy_ctc_transcribe`), confirming the guard fires on the public path.
+  let err = model
+    .transcribe(&dummy_waveform(), &TranscribeOptions::new())
+    .unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)));
+
+  // Also reject a blank id far past the vocab axis, via the free function.
+  let model_far = MockCtcModel::from_argmax(&[0, 1], 3, 99);
+  let err_far =
+    greedy_ctc_transcribe(&model_far, &dummy_waveform(), &TranscribeOptions::new()).unwrap_err();
+  assert!(matches!(err_far, Error::OutOfRange(_)));
+}
+
 // ===========================================================================
 // Autoregressive family — the `greedy_transcribe` loop.
 // ===========================================================================
@@ -473,6 +494,112 @@ fn greedy_rejects_non_rank1_decode_logits() {
   }
   let err = greedy_transcribe(&BadStep, &speech_waveform(), &TranscribeOptions::new()).unwrap_err();
   assert!(matches!(err, Error::RankMismatch(_)));
+}
+
+/// A tracker mock that records whether its `log_mel` and `encode` frontend
+/// hooks were reached, to prove the driver-owned preflight (waveform metadata +
+/// prompt-vs-context) runs BEFORE any model frontend call. `prompt` and
+/// `max_ctx` are parameterized to drive the prompt-over-context gate; the
+/// decode loop itself is irrelevant here (the preflight rejects before it).
+struct FrontendTracker {
+  prompt: Vec<u32>,
+  max_ctx: usize,
+  log_mel_called: Cell<bool>,
+  encode_called: Cell<bool>,
+}
+
+impl FrontendTracker {
+  fn new(prompt: Vec<u32>, max_ctx: usize) -> Self {
+    Self {
+      prompt,
+      max_ctx,
+      log_mel_called: Cell::new(false),
+      encode_called: Cell::new(false),
+    }
+  }
+}
+
+impl AutoregressiveStt for FrontendTracker {
+  type Cache = ();
+
+  // Override `log_mel` to RECORD the call (and otherwise behave as the default
+  // would): if the driver's preflight precedes the frontend, a rejected input
+  // never sets this flag.
+  fn log_mel(&self, audio: &Array) -> Result<Array> {
+    self.log_mel_called.set(true);
+    default_log_mel(&self.mel_config(), audio)
+  }
+  fn encode(&self, mel: &Array) -> Result<Array> {
+    self.encode_called.set(true);
+    mel.try_clone()
+  }
+  fn new_cache(&self) {}
+  fn decode_step(&self, _c: &mut (), _e: &Array, _t: &[u32]) -> Result<Array> {
+    // eot is class 0 and argmax is class 0 here -> immediate stop (only reached
+    // when the preflight passes).
+    let mut row = vec![0.0_f32; 4];
+    row[0] = 1.0;
+    Array::from_slice::<f32>(&row, &[4])
+  }
+  fn initial_tokens(&self, _o: &TranscribeOptions) -> Result<Vec<u32>> {
+    Ok(self.prompt.clone())
+  }
+  fn eot(&self) -> u32 {
+    0
+  }
+  fn max_context(&self) -> usize {
+    self.max_ctx
+  }
+}
+
+#[test]
+fn greedy_preflight_rejects_rank2_waveform_before_log_mel() {
+  // A rank-2 waveform is rejected by the driver-owned `validate_waveform` gate
+  // BEFORE the (overrideable) `log_mel` frontend is ever called.
+  let model = FrontendTracker::new(vec![], DEFAULT_MAX_DECODE_STEPS);
+  let stereo = Array::from_slice::<f32>(&[0.1_f32, 0.2, 0.3, 0.4], &[2, 2]).unwrap();
+  let err = greedy_transcribe(&model, &stereo, &TranscribeOptions::new()).unwrap_err();
+  assert!(matches!(err, Error::RankMismatch(_)));
+  // The frontend was never reached.
+  assert!(!model.log_mel_called.get());
+  assert!(!model.encode_called.get());
+}
+
+#[test]
+fn greedy_preflight_rejects_empty_waveform_before_log_mel() {
+  // An empty waveform is rejected by the driver-owned gate before `log_mel`.
+  let model = FrontendTracker::new(vec![], DEFAULT_MAX_DECODE_STEPS);
+  let empty = Array::from_slice::<f32>(&[] as &[f32], &[0]).unwrap();
+  let err = greedy_transcribe(&model, &empty, &TranscribeOptions::new()).unwrap_err();
+  assert!(matches!(err, Error::EmptyInput(_)));
+  assert!(!model.log_mel_called.get());
+  assert!(!model.encode_called.get());
+}
+
+#[test]
+fn greedy_preflight_rejects_over_context_prompt_before_frontend() {
+  // A prompt whose length >= max_context is rejected (OutOfRange) BEFORE the
+  // frontend + encode run, so neither `log_mel` nor `encode` is reached (the
+  // call-tracker proves the prompt gate precedes the frontend).
+  let max_ctx = 4;
+  let model = FrontendTracker::new(vec![1, 2, 3, 4], max_ctx);
+  let err = greedy_transcribe(&model, &speech_waveform(), &TranscribeOptions::new()).unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)));
+  assert!(!model.log_mel_called.get());
+  assert!(!model.encode_called.get());
+}
+
+#[test]
+fn greedy_preflight_runs_frontend_when_gates_pass() {
+  // Control: a valid waveform + in-range prompt DOES reach the frontend, so the
+  // tracker is not a false-negative (the flags can be set).
+  let model = FrontendTracker::new(vec![], DEFAULT_MAX_DECODE_STEPS);
+  let out = greedy_transcribe(&model, &speech_waveform(), &TranscribeOptions::new())
+    .expect("greedy transcribe");
+  // Immediate eot -> empty decoded text.
+  assert_eq!(out.text(), "");
+  assert!(model.log_mel_called.get());
+  assert!(model.encode_called.get());
 }
 
 // ===========================================================================
