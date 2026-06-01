@@ -19,10 +19,14 @@ use mlxrs::{
     dsp::LogFloor,
     io::{load_audio, save_wav},
     stt::{
-      generate::{DEFAULT_MAX_DECODE_STEPS, default_log_mel, greedy_transcribe, resample_waveform},
+      generate::{
+        DEFAULT_MAX_DECODE_STEPS, default_log_mel, greedy_ctc_transcribe, greedy_transcribe,
+        resample_waveform,
+      },
       load::load,
       model::{
-        AutoregressiveStt, CtcModel, MelConfig, Task, Transcribe, TranscribeOptions, Transcription,
+        AutoregressiveStt, CtcModel, MelConfig, Task, Transcribe, TranscribeExt, TranscribeOptions,
+        Transcription,
       },
     },
   },
@@ -92,8 +96,17 @@ impl CtcModel for MockCtcModel {
   }
 }
 
+/// A CTC model opts into the universal contract by delegating to
+/// `greedy_ctc_transcribe` from its own `Transcribe` impl (symmetric with the
+/// autoregressive `greedy_transcribe`).
+impl Transcribe for MockCtcModel {
+  fn transcribe(&self, audio: &Array, opts: &TranscribeOptions) -> mlxrs::Result<Transcription> {
+    greedy_ctc_transcribe(self, audio, opts)
+  }
+}
+
 #[test]
-fn ctc_blanket_transcribes_via_universal_contract() {
+fn ctc_transcribes_via_universal_contract() {
   // a a _ a b b _ c  →  collapse dups: a _ a b _ c  →  drop blank: a a b c
   let blank = 3;
   let model = MockCtcModel::from_argmax(&[0, 0, blank, 0, 1, 1, blank, 2], 4, blank);
@@ -108,9 +121,9 @@ fn ctc_blanket_transcribes_via_universal_contract() {
 }
 
 #[test]
-fn ctc_blanket_works_through_trait_object() {
-  // The universal contract is object-safe: a `&dyn Transcribe` drives the
-  // CTC blanket impl.
+fn ctc_works_through_trait_object() {
+  // The universal contract is object-safe: a `&dyn Transcribe` drives the CTC
+  // model's `Transcribe` impl.
   let model = MockCtcModel::from_argmax(&[1, 1, 0], 3, 0);
   let audio = wav_waveform("ctc_dyn", 16_000, ONE_SECOND_16K);
   let dynm: &dyn Transcribe = &model;
@@ -119,6 +132,11 @@ fn ctc_blanket_works_through_trait_object() {
     .expect("dyn transcribe");
   // frames 1 1 0 → collapse → 1 0 → drop blank(0) → 1 → 'b'.
   assert_eq!(out.text(), "b");
+
+  // The `TranscribeExt` blanket conveniences are available on `dyn Transcribe`
+  // too (object-safe core + extension trait): `transcribe_audio` == default opts.
+  let out_ext = dynm.transcribe_audio(&audio).expect("dyn transcribe_audio");
+  assert_eq!(out_ext.text(), "b");
 }
 
 // ────────────────────── Autoregressive family fixture ──────────────────────
@@ -243,7 +261,9 @@ fn autoregressive_immediate_eot_is_empty() {
 
 #[test]
 fn autoregressive_bounds_runaway_decode_at_cap() {
-  // A model that never emits eot must terminate at DEFAULT_MAX_DECODE_STEPS.
+  // A model that never emits eot must terminate at its `max_context`. With an
+  // empty prompt and the default 448-slot context, the loop decodes exactly
+  // DEFAULT_MAX_DECODE_STEPS tokens (total == max_context).
   struct NeverStops;
   impl AutoregressiveStt for NeverStops {
     type Cache = ();
@@ -255,7 +275,7 @@ fn autoregressive_bounds_runaway_decode_at_cap() {
       Array::from_slice::<f32>(&[0.0_f32, 1.0, 0.0, 0.0], &[4]) // argmax 1
     }
     fn initial_tokens(&self, _o: &TranscribeOptions) -> mlxrs::Result<Vec<u32>> {
-      Ok(vec![5])
+      Ok(vec![]) // empty prompt: the full context is available to generate
     }
     fn eot(&self) -> u32 {
       0 // never produced (argmax is always 1)
@@ -267,6 +287,67 @@ fn autoregressive_bounds_runaway_decode_at_cap() {
     .collect::<Vec<_>>()
     .join(" ");
   assert_eq!(out.text(), want);
+}
+
+#[test]
+fn autoregressive_caps_total_at_max_context_with_prompt() {
+  // A model whose `max_context` override accounts for the prompt: prompt(2) +
+  // generated must never exceed max_context(8), so at most 6 tokens decode.
+  struct CappedNeverStops;
+  impl AutoregressiveStt for CappedNeverStops {
+    type Cache = ();
+    fn encode(&self, mel: &Array) -> mlxrs::Result<Array> {
+      mel.try_clone()
+    }
+    fn new_cache(&self) {}
+    fn decode_step(&self, _c: &mut (), _e: &Array, _t: &[u32]) -> mlxrs::Result<Array> {
+      Array::from_slice::<f32>(&[0.0_f32, 1.0, 0.0, 0.0], &[4]) // argmax 1, eot=0 never produced
+    }
+    fn initial_tokens(&self, _o: &TranscribeOptions) -> mlxrs::Result<Vec<u32>> {
+      Ok(vec![30, 31])
+    }
+    fn eot(&self) -> u32 {
+      0
+    }
+    fn max_context(&self) -> usize {
+      8
+    }
+  }
+  let audio = wav_waveform("runaway_capped", 16_000, ONE_SECOND_16K);
+  let out =
+    greedy_transcribe(&CappedNeverStops, &audio, &TranscribeOptions::new()).expect("transcribe");
+  // 8 - prompt(2) = 6 generated tokens; total 8 == max_context.
+  let want = std::iter::repeat_n("1", 6).collect::<Vec<_>>().join(" ");
+  assert_eq!(out.text(), want);
+  assert_eq!(out.text().split_whitespace().count(), 6);
+}
+
+#[test]
+fn autoregressive_rejects_prompt_over_max_context() {
+  // initial_tokens >= max_context -> typed OutOfRange (no room to decode).
+  struct OverPrompt;
+  impl AutoregressiveStt for OverPrompt {
+    type Cache = ();
+    fn encode(&self, mel: &Array) -> mlxrs::Result<Array> {
+      mel.try_clone()
+    }
+    fn new_cache(&self) {}
+    fn decode_step(&self, _c: &mut (), _e: &Array, _t: &[u32]) -> mlxrs::Result<Array> {
+      Array::from_slice::<f32>(&[0.0_f32, 1.0], &[2])
+    }
+    fn initial_tokens(&self, _o: &TranscribeOptions) -> mlxrs::Result<Vec<u32>> {
+      Ok(vec![1, 2, 3, 4]) // == max_context
+    }
+    fn eot(&self) -> u32 {
+      0
+    }
+    fn max_context(&self) -> usize {
+      4
+    }
+  }
+  let audio = wav_waveform("over_prompt", 16_000, ONE_SECOND_16K);
+  let err = greedy_transcribe(&OverPrompt, &audio, &TranscribeOptions::new()).unwrap_err();
+  assert!(matches!(err, mlxrs::Error::OutOfRange(_)));
 }
 
 // ───────────────────────── shared waveform helpers ─────────────────────────

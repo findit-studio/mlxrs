@@ -10,8 +10,10 @@
 //!   or via one of the family drivers in [`super::generate`]).
 //! - [`CtcModel`] — the non-autoregressive CTC family (wav2vec2 and future
 //!   CTC architectures): one encoder forward producing per-frame logits, then
-//!   a greedy blank-collapse. Gets [`Transcribe`] for free via the blanket
-//!   `impl<M: CtcModel> Transcribe for M` in [`super::generate`].
+//!   a greedy blank-collapse. A model opts into the greedy decode by
+//!   delegating to [`super::generate::greedy_ctc_transcribe`] from its own
+//!   [`Transcribe`] impl (symmetric with [`super::generate::greedy_transcribe`]
+//!   for [`AutoregressiveStt`]).
 //! - [`AutoregressiveStt`] — the encoder/decoder family (Whisper and future
 //!   attention STT). Its associated [`AutoregressiveStt::Cache`] type carries
 //!   the per-model, caller-held decode state, so the cache is a value owned by
@@ -28,12 +30,17 @@ use crate::{array::Array, audio::dsp, error::Result};
 
 /// The universal speech-to-text contract: audio waveform in, text out.
 ///
-/// Every STT model implements this — CTC models receive it from the blanket
-/// `impl<M: CtcModel> Transcribe for M` in [`super::generate`]; autoregressive
-/// models implement it directly (a simple one forwarding to
-/// [`super::generate::greedy_transcribe`], a complex one — e.g. Whisper —
-/// running its own decoding procedure that still reuses its
-/// [`AutoregressiveStt`] hooks internally).
+/// This is the **object-safe core** — a single dyn-compatible method — so a
+/// loaded model can be handed around as `Box<dyn Transcribe>` / `&dyn
+/// Transcribe`. Every STT model implements it directly: a CTC model forwards
+/// to [`super::generate::greedy_ctc_transcribe`], a simple autoregressive one
+/// forwards to [`super::generate::greedy_transcribe`], and a complex one (e.g.
+/// Whisper) runs its own decoding procedure that still reuses its
+/// [`AutoregressiveStt`] hooks internally.
+///
+/// Ergonomic conveniences (default-options helpers) live on the
+/// [`TranscribeExt`] extension trait, which is blanket-implemented for every
+/// `Transcribe` (including `dyn Transcribe`) so this core stays object-safe.
 ///
 /// `audio` is a mono waveform [`Array`] (the [`crate::audio::io::load_audio`]
 /// output, resampled to the model's expected rate). The model's frontend
@@ -44,14 +51,29 @@ pub trait Transcribe {
   fn transcribe(&self, audio: &Array, opts: &TranscribeOptions) -> Result<Transcription>;
 }
 
+/// Ergonomic, dyn-friendly conveniences over [`Transcribe`]. Auto-implemented
+/// for every `Transcribe` (including `dyn Transcribe`), so the core stays
+/// object-safe while callers get generic conveniences.
+pub trait TranscribeExt: Transcribe {
+  /// Transcribe a waveform with default options.
+  fn transcribe_audio(&self, audio: &Array) -> Result<Transcription> {
+    self.transcribe(audio, &TranscribeOptions::default())
+  }
+}
+
+impl<T: Transcribe + ?Sized> TranscribeExt for T {}
+
 /// The CTC family: non-autoregressive models that emit per-frame logits in a
 /// single encoder forward, then collapse them greedily.
 ///
-/// A CTC model supplies the three pieces the greedy-collapse driver (the
-/// blanket `impl<M: CtcModel> Transcribe for M` in [`super::generate`]) needs:
-/// the per-frame logits, the blank id to collapse against, and the
-/// vocabulary map from collapsed ids to text. No CTC model needs to override
-/// the driver, so the blanket impl is safe (no coherence conflict).
+/// A CTC model supplies the three pieces the greedy-collapse driver
+/// ([`super::generate::greedy_ctc_transcribe`]) needs: the per-frame logits,
+/// the blank id to collapse against, and the vocabulary map from collapsed ids
+/// to text. A model opts into greedy transcription by delegating to
+/// [`super::generate::greedy_ctc_transcribe`] from its own [`Transcribe`] impl
+/// — symmetric with [`super::generate::greedy_transcribe`] for
+/// [`AutoregressiveStt`], and leaving the [`Transcribe`] slot free for a model
+/// that needs a custom decode.
 pub trait CtcModel {
   /// Per-frame logits of shape `(T', vocab)` — one row of class scores per
   /// encoder time frame — for the mono `waveform`.
@@ -125,6 +147,18 @@ pub trait AutoregressiveStt {
 
   /// The end-of-transcript token id the decode loop stops on.
   fn eot(&self) -> u32;
+
+  /// The TOTAL decoder context size in tokens — prompt prefix
+  /// ([`Self::initial_tokens`]) plus every generated token. The greedy driver
+  /// ([`super::generate::greedy_transcribe`]) never lets `prompt + generated`
+  /// exceed this, so the model's decoder is never fed a sequence longer than
+  /// its positional context.
+  ///
+  /// The default is Whisper's `448`-slot text-decoder context; a model with a
+  /// larger or smaller decoder overrides it.
+  fn max_context(&self) -> usize {
+    super::generate::DEFAULT_MAX_DECODE_STEPS
+  }
 
   /// The mel-spectrogram extraction config this model's [`Self::log_mel`]
   /// default uses.

@@ -1,6 +1,7 @@
-//! Tests for the STT decoding drivers: the CTC greedy-collapse blanket impl
-//! and the autoregressive [`greedy_transcribe`] loop, plus the shared waveform
-//! helpers ([`default_log_mel`], [`resample_waveform`], non-empty validation).
+//! Tests for the STT decoding drivers: the CTC greedy-collapse driver
+//! ([`greedy_ctc_transcribe`]) and the autoregressive [`greedy_transcribe`]
+//! loop, plus the shared waveform helpers ([`default_log_mel`],
+//! [`resample_waveform`], the metadata validation gate).
 //!
 //! Oracles are computed from the TEST INPUTS (the scripted token sequences,
 //! the hand-built logits), never from the code under test.
@@ -11,18 +12,22 @@ use super::*;
 use crate::{
   audio::{
     dsp::LogFloor,
-    stt::model::{AutoregressiveStt, CtcModel, MelConfig, Task, Transcribe, TranscribeOptions},
+    stt::model::{
+      AutoregressiveStt, CtcModel, MelConfig, Task, Transcribe, TranscribeOptions, Transcription,
+    },
   },
   error::Error,
 };
 
 // ===========================================================================
-// CTC family — the blanket `impl<M: CtcModel> Transcribe`.
+// CTC family — the `greedy_ctc_transcribe` free function, delegated to from a
+// model's own `Transcribe` impl.
 // ===========================================================================
 
 /// A CTC mock returning a fixed `(T', vocab)` logit grid. `decode_ids` maps
 /// each surviving id `i` to the character `(b'a' + i)` so the collapsed text
-/// is a directly-checkable oracle.
+/// is a directly-checkable oracle. Opts into the greedy decode by delegating
+/// to `greedy_ctc_transcribe` from its own `Transcribe` impl.
 struct MockCtcModel {
   logits: Array,
   blank_id: u32,
@@ -54,12 +59,18 @@ impl CtcModel for MockCtcModel {
   }
 }
 
+impl Transcribe for MockCtcModel {
+  fn transcribe(&self, audio: &Array, opts: &TranscribeOptions) -> Result<Transcription> {
+    greedy_ctc_transcribe(self, audio, opts)
+  }
+}
+
 fn dummy_waveform() -> Array {
   Array::from_slice::<f32>(&[0.1_f32, -0.2, 0.3, -0.4], &[4]).unwrap()
 }
 
 #[test]
-fn ctc_blanket_collapses_dups_and_blanks() {
+fn ctc_collapses_dups_and_blanks() {
   // vocab 4, blank = 3. Frame argmax sequence (a=0, b=1, c=2, _=blank):
   //   a a _ a b b _ c
   // CTC greedy: collapse consecutive dups -> a _ a b _ c ; drop blank -> a a b c.
@@ -67,6 +78,8 @@ fn ctc_blanket_collapses_dups_and_blanks() {
   let frames = [0, 0, blank, 0, 1, 1, blank, 2];
   let model = MockCtcModel::from_argmax(&frames, 4, blank);
 
+  // Routes through the model's own `Transcribe` impl (delegating to
+  // `greedy_ctc_transcribe`).
   let out = model
     .transcribe(&dummy_waveform(), &TranscribeOptions::new())
     .expect("ctc transcribe");
@@ -79,7 +92,7 @@ fn ctc_blanket_collapses_dups_and_blanks() {
 }
 
 #[test]
-fn ctc_blanket_all_blank_is_empty() {
+fn ctc_all_blank_is_empty() {
   let blank = 0;
   let frames = [0, 0, 0];
   let model = MockCtcModel::from_argmax(&frames, 2, blank);
@@ -92,12 +105,38 @@ fn ctc_blanket_all_blank_is_empty() {
 }
 
 #[test]
-fn ctc_blanket_rejects_non_rank2_logits() {
+fn ctc_rejects_non_rank2_logits() {
   // A model handing back rank-1 logits is a per-model defect -> typed error.
-  struct BadCtc;
-  impl CtcModel for BadCtc {
+  let err =
+    greedy_ctc_transcribe(&BadCtc, &dummy_waveform(), &TranscribeOptions::new()).unwrap_err();
+  assert!(matches!(err, Error::RankMismatch(_)));
+}
+
+/// A CTC mock whose `logits` shape is parameterized, to drive the encoder-
+/// output shape guards (rank, empty-vocab, empty-time) in `greedy_ctc_transcribe`.
+struct BadCtc;
+impl CtcModel for BadCtc {
+  fn logits(&self, _waveform: &Array) -> Result<Array> {
+    // Rank-1 -> typed RankMismatch.
+    Array::from_slice::<f32>(&[0.0_f32, 1.0], &[2])
+  }
+  fn blank_id(&self) -> u32 {
+    0
+  }
+  fn decode_ids(&self, _ids: &[u32]) -> String {
+    String::new()
+  }
+}
+
+#[test]
+fn ctc_rejects_empty_vocab_axis() {
+  // `(T', 0)` logits: argmax over an empty vocab axis is undefined -> typed
+  // EmptyInput (mirrors the autoregressive empty-vocab guard).
+  struct EmptyVocabCtc;
+  impl CtcModel for EmptyVocabCtc {
     fn logits(&self, _waveform: &Array) -> Result<Array> {
-      Array::from_slice::<f32>(&[0.0_f32, 1.0], &[2])
+      // 3 frames, 0-wide vocab.
+      Array::from_slice::<f32>(&[] as &[f32], &[3, 0])
     }
     fn blank_id(&self) -> u32 {
       0
@@ -106,10 +145,52 @@ fn ctc_blanket_rejects_non_rank2_logits() {
       String::new()
     }
   }
-  let err = BadCtc
-    .transcribe(&dummy_waveform(), &TranscribeOptions::new())
+  let err = greedy_ctc_transcribe(&EmptyVocabCtc, &dummy_waveform(), &TranscribeOptions::new())
     .unwrap_err();
+  assert!(matches!(err, Error::EmptyInput(_)));
+}
+
+#[test]
+fn ctc_empty_time_axis_is_empty_transcription() {
+  // `(0, vocab)` logits: no frames -> an explicit empty transcription (not a
+  // panic, not an error).
+  struct EmptyTimeCtc;
+  impl CtcModel for EmptyTimeCtc {
+    fn logits(&self, _waveform: &Array) -> Result<Array> {
+      Array::from_slice::<f32>(&[] as &[f32], &[0, 4])
+    }
+    fn blank_id(&self) -> u32 {
+      0
+    }
+    fn decode_ids(&self, _ids: &[u32]) -> String {
+      // Must never be called with a non-empty id slice here.
+      String::new()
+    }
+  }
+  let out = greedy_ctc_transcribe(&EmptyTimeCtc, &dummy_waveform(), &TranscribeOptions::new())
+    .expect("empty-time CTC is an empty transcription");
+  assert_eq!(out.text(), "");
+  assert_eq!(out.segments_slice().len(), 1);
+  assert_eq!(out.segments_slice()[0].text(), "");
+}
+
+#[test]
+fn ctc_rejects_rank2_waveform() {
+  // A 2-D waveform is rejected (RankMismatch) BEFORE the encoder forward — it
+  // is NOT silently flattened to mono.
+  let model = MockCtcModel::from_argmax(&[0, 1], 3, 2);
+  let stereo = Array::from_slice::<f32>(&[0.1_f32, 0.2, 0.3, 0.4], &[2, 2]).unwrap();
+  let err = greedy_ctc_transcribe(&model, &stereo, &TranscribeOptions::new()).unwrap_err();
   assert!(matches!(err, Error::RankMismatch(_)));
+}
+
+#[test]
+fn ctc_rejects_empty_waveform() {
+  // An empty waveform is rejected (EmptyInput) BEFORE the encoder forward.
+  let model = MockCtcModel::from_argmax(&[0, 1], 3, 2);
+  let empty = Array::from_slice::<f32>(&[] as &[f32], &[0]).unwrap();
+  let err = greedy_ctc_transcribe(&model, &empty, &TranscribeOptions::new()).unwrap_err();
+  assert!(matches!(err, Error::EmptyInput(_)));
 }
 
 // ===========================================================================
@@ -261,41 +342,113 @@ fn greedy_threads_language_from_options() {
   assert_eq!(out.text(), "1");
 }
 
+/// A model that NEVER emits eot (argmax is always class 1, eot is class 0), so
+/// the greedy loop only terminates at the `max_context` bound. `prompt` and
+/// `max_ctx` are parameterized to exercise the total-context cap.
+struct NeverStops {
+  vocab: usize,
+  prompt: Vec<u32>,
+  max_ctx: usize,
+}
+impl AutoregressiveStt for NeverStops {
+  type Cache = ();
+  fn encode(&self, mel: &Array) -> Result<Array> {
+    mel.try_clone()
+  }
+  fn new_cache(&self) {}
+  fn decode_step(&self, _c: &mut (), _e: &Array, _t: &[u32]) -> Result<Array> {
+    // Always argmax class 1; eot is class 0 -> never reached.
+    let mut row = vec![0.0_f32; self.vocab];
+    row[1] = 1.0;
+    Array::from_slice::<f32>(&row, &[self.vocab as i32])
+  }
+  fn initial_tokens(&self, _o: &TranscribeOptions) -> Result<Vec<u32>> {
+    Ok(self.prompt.clone())
+  }
+  fn eot(&self) -> u32 {
+    0
+  }
+  fn max_context(&self) -> usize {
+    self.max_ctx
+  }
+}
+
 #[test]
-fn greedy_stops_at_max_decode_steps() {
-  // A model that NEVER emits eot (eot id is unreachable: every script slot is
-  // a distinct in-vocab token, and past the script we emit `script.last`,
-  // never `eot`). The loop must terminate at the cap.
-  struct NeverStops {
-    vocab: usize,
-  }
-  impl AutoregressiveStt for NeverStops {
-    type Cache = ();
-    fn encode(&self, mel: &Array) -> Result<Array> {
-      mel.try_clone()
-    }
-    fn new_cache(&self) {}
-    fn decode_step(&self, _c: &mut (), _e: &Array, _t: &[u32]) -> Result<Array> {
-      // Always argmax class 1; eot is class 0 -> never reached.
-      let mut row = vec![0.0_f32; self.vocab];
-      row[1] = 1.0;
-      Array::from_slice::<f32>(&row, &[self.vocab as i32])
-    }
-    fn initial_tokens(&self, _o: &TranscribeOptions) -> Result<Vec<u32>> {
-      Ok(vec![7])
-    }
-    fn eot(&self) -> u32 {
-      0
-    }
-  }
-  let model = NeverStops { vocab: 4 };
+fn greedy_stops_at_max_context_with_empty_prompt() {
+  // Empty prompt + default `max_context` (448): the runaway loop decodes
+  // exactly DEFAULT_MAX_DECODE_STEPS class-1 tokens (total == max_context).
+  let model = NeverStops {
+    vocab: 4,
+    prompt: vec![],
+    max_ctx: DEFAULT_MAX_DECODE_STEPS,
+  };
   let out = greedy_transcribe(&model, &speech_waveform(), &TranscribeOptions::new())
     .expect("greedy transcribe");
-  // Exactly DEFAULT_MAX_DECODE_STEPS class-1 tokens decoded.
   let want: String = std::iter::repeat_n("1", DEFAULT_MAX_DECODE_STEPS)
     .collect::<Vec<_>>()
     .join(" ");
   assert_eq!(out.text(), want);
+}
+
+#[test]
+fn greedy_caps_total_at_max_context_accounting_for_prompt() {
+  // A non-empty prompt eats into the budget: prompt(3) + generated must never
+  // exceed `max_context`(10), so at most 7 new tokens are decoded.
+  let max_ctx = 10;
+  let prompt = vec![20, 21, 22];
+  let model = NeverStops {
+    vocab: 4,
+    prompt: prompt.clone(),
+    max_ctx,
+  };
+  let out = greedy_transcribe(&model, &speech_waveform(), &TranscribeOptions::new())
+    .expect("greedy transcribe");
+  // Oracle: max_ctx - prompt.len() = 10 - 3 = 7 generated tokens, all class 1.
+  let n_generated = max_ctx - prompt.len();
+  let want: String = std::iter::repeat_n("1", n_generated)
+    .collect::<Vec<_>>()
+    .join(" ");
+  assert_eq!(out.text(), want);
+  // The decoded count (7) + prompt (3) == max_context (10): the total never
+  // exceeds the decoder's context.
+  assert_eq!(out.text().split_whitespace().count(), n_generated);
+  assert_eq!(prompt.len() + n_generated, max_ctx);
+}
+
+#[test]
+fn greedy_rejects_prompt_at_or_over_max_context() {
+  // initial_tokens length >= max_context leaves no room to decode -> typed
+  // OutOfRange (the prompt-exceeds-context guard).
+  let max_ctx = 4;
+  // Prompt length == max_context (the boundary): rejected.
+  let model_eq = NeverStops {
+    vocab: 4,
+    prompt: vec![1, 2, 3, 4],
+    max_ctx,
+  };
+  let err =
+    greedy_transcribe(&model_eq, &speech_waveform(), &TranscribeOptions::new()).unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)));
+
+  // Prompt length > max_context: also rejected.
+  let model_over = NeverStops {
+    vocab: 4,
+    prompt: vec![1, 2, 3, 4, 5],
+    max_ctx,
+  };
+  let err =
+    greedy_transcribe(&model_over, &speech_waveform(), &TranscribeOptions::new()).unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)));
+}
+
+#[test]
+fn greedy_rejects_rank2_waveform_via_default_log_mel() {
+  // A 2-D waveform reaches `default_log_mel` (the default `log_mel`) and is
+  // rejected (RankMismatch) before any feature extraction — not flattened.
+  let model = MockSttModel::new(vec![1], vec![0], 7, 8);
+  let stereo = Array::from_slice::<f32>(&[0.1_f32, 0.2, 0.3, 0.4], &[2, 2]).unwrap();
+  let err = greedy_transcribe(&model, &stereo, &TranscribeOptions::new()).unwrap_err();
+  assert!(matches!(err, Error::RankMismatch(_)));
 }
 
 #[test]
@@ -422,5 +575,20 @@ fn empty_waveform_is_rejected_by_helpers_and_autoregressive_driver() {
   assert!(matches!(
     greedy_transcribe(&ar, &empty, &TranscribeOptions::new()),
     Err(Error::EmptyInput(_))
+  ));
+}
+
+#[test]
+fn rank2_waveform_is_rejected_by_helpers() {
+  // A 2-D waveform is rejected (RankMismatch) by the shared metadata gate —
+  // BEFORE any materialization — so it is never silently flattened to mono.
+  let stereo = Array::from_slice::<f32>(&[0.1_f32, 0.2, 0.3, 0.4], &[2, 2]).unwrap();
+  assert!(matches!(
+    default_log_mel(&MelConfig::whisper_default(), &stereo),
+    Err(Error::RankMismatch(_))
+  ));
+  assert!(matches!(
+    resample_waveform(&stereo, 16_000, 8_000),
+    Err(Error::RankMismatch(_))
   ));
 }

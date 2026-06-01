@@ -5,9 +5,10 @@
 //! contract, and the two family traits [`CtcModel`](model::CtcModel)
 //! (non-autoregressive, e.g. wav2vec2) and
 //! [`AutoregressiveStt`](model::AutoregressiveStt) (encoder/decoder, e.g.
-//! whisper). [`generate`] holds the shared decoding drivers: the blanket
-//! `impl<M: CtcModel> Transcribe` (greedy CTC collapse) and the
-//! [`greedy_transcribe`](generate::greedy_transcribe) free function (the
+//! whisper). [`generate`] holds the shared decoding drivers, each a free
+//! function a model calls from its own [`Transcribe`](model::Transcribe) impl:
+//! [`greedy_ctc_transcribe`](generate::greedy_ctc_transcribe) (greedy CTC
+//! collapse) and [`greedy_transcribe`](generate::greedy_transcribe) (the
 //! generic autoregressive greedy loop).
 //!
 //! Per the project's no-per-model-arch rule, mlxrs ships **no** concrete STT
