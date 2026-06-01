@@ -108,6 +108,9 @@ pub mod fast;
 pub mod model;
 pub mod normalize;
 pub mod pooling;
+#[cfg(feature = "siglip2-naflex")]
+#[cfg_attr(docsrs, doc(cfg(feature = "siglip2-naflex")))]
+pub mod siglip2_naflex;
 pub mod similarity;
 
 use crate::{array::Array, error::Result, ops::misc::astype};
