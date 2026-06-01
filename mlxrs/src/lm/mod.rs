@@ -45,6 +45,17 @@ pub mod gguf;
 pub mod load;
 pub mod lora;
 pub mod model;
+/// Concrete decoder-model architectures.
+///
+/// Per the project's model-support phase (post-0.1.0), named models are
+/// ported here (loaders/blocks/forward) rather than excluded by the general
+/// no-per-model-arch rule. Each is feature-gated to its own model feature so
+/// the default build never pays its compile cost.
+///
+/// - [`lfm2`](crate::lm::models::lfm2) — the LFM2 hybrid conv+attention LM
+///   (`mlx-lm/mlx_lm/models/lfm2.py`), the dependency of the LFM2.5-VL
+///   vision-language model. Gated on `lfm2-vl`.
+pub mod models;
 pub mod nn;
 pub mod perplexity;
 pub mod quant;
