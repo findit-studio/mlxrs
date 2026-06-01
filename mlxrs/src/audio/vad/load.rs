@@ -62,7 +62,7 @@ pub const MODEL_REMAPPING: &[(&str, &str)] =
 ///
 /// `&self` because weights are immutable after load (matching every
 /// other audio-domain trait in mlxrs — [`crate::audio::tts::model::TtsModel`]
-/// / [`crate::audio::stt::model::Model`] — and mlx-audio's `nn.Module`
+/// / [`crate::audio::stt::model::Transcribe`] — and mlx-audio's `nn.Module`
 /// for inference).
 ///
 /// [vad-generate]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/vad/models/silero_vad/silero_vad.py#L243-L266

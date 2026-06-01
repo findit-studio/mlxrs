@@ -17,7 +17,7 @@
 //! → `vibevoice_asr`, `qwen3_asr`, `canary`, `moonshine`, `mms`,
 //! `granite_speech`, `qwen2_audio`) into
 //! `mlx_audio.stt.models.<arch>`; per the no-per-model-arch rule
-//! mlxrs returns a [`crate::audio::stt::model::Model`] trait object the
+//! mlxrs returns a [`crate::audio::stt::model::Transcribe`] trait object the
 //! per-architecture loader's caller constructs.
 //!
 //! [stt-utils]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/utils.py
@@ -28,7 +28,7 @@
 use crate::{
   audio::{
     load::{LoadedAudioModel, base_load_model},
-    stt::model::Model as SttModel,
+    stt::model::Transcribe,
   },
   error::Result,
 };
@@ -67,7 +67,7 @@ pub const MODEL_REMAPPING: &[(&str, &str)] = &[
   ("qwen2_audio", "qwen2_audio"),
 ];
 
-/// Construct a [`SttModel`] from a local on-disk model directory —
+/// Construct a [`Transcribe`] STT model from a local on-disk model directory —
 /// faithful 1:1 of `mlx_audio.stt.utils.load_model`
 /// ([stt-utils.py:64-89][stt-utils-loadmodel]).
 ///
@@ -75,7 +75,9 @@ pub const MODEL_REMAPPING: &[(&str, &str)] = &[
 /// [`crate::audio::load::base_load_model`] factory. The returned bundle
 /// is handed to the caller-supplied `constructor` closure (per the
 /// no per-model arch porting rule mlxrs does not bundle a
-/// built-in registry).
+/// built-in registry). The constructor returns the universal
+/// [`Transcribe`] contract; whether the concrete model is CTC or
+/// autoregressive is its own detail.
 ///
 /// `path` is the local on-disk path (a `hf://…` / `org/name` repo id is
 /// rejected by [`crate::audio::load::get_model_path`] with a clear
@@ -88,9 +90,9 @@ pub const MODEL_REMAPPING: &[(&str, &str)] = &[
 /// error → caller-defined.
 ///
 /// [stt-utils-loadmodel]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/utils.py#L64-L89
-pub fn load_model<F>(path: &str, constructor: F) -> Result<Box<dyn SttModel>>
+pub fn load_model<F>(path: &str, constructor: F) -> Result<Box<dyn Transcribe>>
 where
-  F: FnOnce(LoadedAudioModel) -> Result<Box<dyn SttModel>>,
+  F: FnOnce(LoadedAudioModel) -> Result<Box<dyn Transcribe>>,
 {
   let bundle = base_load_model(path)?;
   constructor(bundle)
@@ -101,9 +103,9 @@ where
 /// Thin alias over [`load_model`].
 ///
 /// [stt-utils-load]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/utils.py#L92-L115
-pub fn load<F>(path: &str, constructor: F) -> Result<Box<dyn SttModel>>
+pub fn load<F>(path: &str, constructor: F) -> Result<Box<dyn Transcribe>>
 where
-  F: FnOnce(LoadedAudioModel) -> Result<Box<dyn SttModel>>,
+  F: FnOnce(LoadedAudioModel) -> Result<Box<dyn Transcribe>>,
 {
   load_model(path, constructor)
 }
@@ -113,37 +115,19 @@ mod tests {
   use super::*;
   use crate::{
     array::Array,
-    audio::stt::model::MelConfig,
-    error::{Error, InvariantViolationPayload},
-    lm::{cache::KvCache, model::Model as LmModel},
+    audio::stt::model::{TranscribeOptions, Transcription},
   };
   use std::{fs, path::PathBuf};
 
-  /// A fake STT model. The `Model` super-trait (`crate::lm::model::Model`)
-  /// is impl'd minimally so the test can construct one.
+  /// A fake STT model implementing the universal [`Transcribe`] contract
+  /// directly (the family-trait wiring is exercised in `generate`'s tests);
+  /// here it returns a fixed transcription so the factory path can be tested
+  /// through a trait object.
   struct FakeStt;
 
-  impl LmModel for FakeStt {
-    fn forward(&self, _tokens: &Array, _cache: &mut [Box<dyn KvCache>]) -> Result<Array> {
-      Err(Error::InvariantViolation(InvariantViolationPayload::new(
-        "FakeStt::forward",
-        "test stub — unreachable in this test",
-      )))
-    }
-  }
-
-  impl SttModel for FakeStt {
-    fn encode_audio(&self, _mel: &Array) -> Result<Array> {
-      Array::from_slice::<f32>(&[0.0_f32; 4], &(1, 4))
-    }
-    fn mel_config(&self) -> MelConfig {
-      MelConfig::whisper_default()
-    }
-    fn bos_token(&self) -> u32 {
-      50258 // whisper's <|startoftranscript|>
-    }
-    fn eos_token(&self) -> u32 {
-      50257 // whisper's <|endoftext|>
+  impl Transcribe for FakeStt {
+    fn transcribe(&self, _audio: &Array, _opts: &TranscribeOptions) -> Result<Transcription> {
+      Ok(Transcription::new("fake transcript", None, Vec::new()))
     }
   }
 
@@ -158,9 +142,9 @@ mod tests {
     dir
   }
 
-  /// Factory + smoke test: constructor receives the resolved bundle;
-  /// trait object's metadata is functional (the per-model decode
-  /// branches stay per-arch).
+  /// Factory + smoke test: the constructor receives the resolved bundle and
+  /// the returned [`Transcribe`] trait object is functional (the per-model
+  /// decode branches stay per-arch in user code).
   #[test]
   fn load_stt_constructs_via_factory() {
     let dir = temp_dir("constructs_via_factory");
@@ -175,8 +159,10 @@ mod tests {
     .expect("load constructs via the supplied factory");
 
     assert_eq!(captured.into_inner().unwrap(), dir);
-    assert_eq!(model.bos_token(), 50258);
-    assert_eq!(model.eos_token(), 50257);
-    assert_eq!(model.mel_config().sample_rate(), 16_000);
+    let audio = Array::from_slice::<f32>(&[0.0_f32; 4], &[4]).unwrap();
+    let out = model
+      .transcribe(&audio, &TranscribeOptions::new())
+      .expect("trait object transcribe");
+    assert_eq!(out.text(), "fake transcript");
   }
 }

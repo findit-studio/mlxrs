@@ -1,6 +1,7 @@
 //! The architecture-agnostic [`TtsModel`] seam for `mlxrs::audio::tts` — the
-//! text-to-speech analogue of [`crate::audio::stt::model::Model`], mirroring
-//! mlx-audio's TTS model surface (the per-model `Model.generate` shape every
+//! text-to-speech analogue of [`crate::audio::stt::model::Transcribe`],
+//! mirroring mlx-audio's TTS model surface (the per-model `Model.generate`
+//! shape every
 //! `tts/models/*` architecture exposes — kokoro, csm, bark, qwen3-tts, …)
 //! and mlx-audio-swift's [`SpeechGenerationModel`][swift-gen] protocol.
 //!
@@ -51,9 +52,9 @@ use super::generate::{TtsGenConfig, TtsSegment};
 ///
 /// - `&self` everywhere — weights are immutable after load, so TTS synthesis
 ///   never needs `&mut` on the model (matching mlx-audio's `nn.Module` for
-///   inference, and the same `&self` choice
-///   [`crate::audio::stt::model::Model`] makes). One model can back many
-///   concurrent synthesis runs.
+///   inference, and the same `&self` choice the STT
+///   [`crate::audio::stt::model::Transcribe`] contract makes). One model can
+///   back many concurrent synthesis runs.
 /// - [`TtsModel::synthesize_segment`] runs **once per text segment** — the
 ///   mlx-audio per-model `generate` loop's `for segment_idx, … in
 ///   enumerate(pipeline(text, …))` body (kokoro `kokoro.py`, llama
@@ -84,10 +85,11 @@ pub trait TtsModel {
   /// [`TextProcessor`](super::TextProcessor) hook. The driver passes the
   /// segment text through unchanged; it does not phonemize.
   ///
-  /// Default impl is unsupported (`Err(Error::InvariantViolation)`) — every concrete
-  /// TTS model MUST override it, mirroring
-  /// [`crate::audio::stt::model::Model::decode_step`]'s
-  /// per-model-override default.
+  /// Default impl is unsupported (`Err(Error::InvariantViolation)`) — every
+  /// concrete TTS model MUST override it, the same per-model-override
+  /// requirement the STT
+  /// [`crate::audio::stt::model::AutoregressiveStt::decode_step`] hook places
+  /// on per-model decoders.
   fn synthesize_segment(&self, segment: &TtsSegment<'_>) -> Result<Array> {
     let _ = segment;
     Err(Error::InvariantViolation(InvariantViolationPayload::new(

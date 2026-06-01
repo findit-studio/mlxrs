@@ -187,10 +187,10 @@ pub fn load_audio_into(path: &Path, out: &mut Vec<f32>) -> Result<u32> {
 /// Load a mono audio file enforcing `max_samples` BEFORE allocating the
 /// decoded sample buffer.
 ///
-/// Layered-cap variant of [`load_audio`] for callers (e.g.
-/// `audio::stt::generate::stt_generate`) that need to reject an
-/// oversized input strictly **before** the load-stage allocation rather
-/// than after. The behavior is identical to [`load_audio`] except:
+/// Layered-cap variant of [`load_audio`] for callers (e.g. an STT
+/// preprocessing front-end) that need to reject an oversized input strictly
+/// **before** the load-stage allocation rather than after. The behavior is
+/// identical to [`load_audio`] except:
 ///
 /// - The container-declared frame count (`Track::num_frames` for WAV /
 ///   FLAC-with-STREAMINFO — the formats whose header carries an exact

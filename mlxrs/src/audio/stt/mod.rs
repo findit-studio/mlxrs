@@ -1,32 +1,33 @@
-//! Speech-to-text (STT) — the architecture-agnostic generation seam.
+//! Speech-to-text (STT) — the architecture-agnostic trait seam.
 //!
-//! Ports the *shape* of mlx-audio's STT surface
-//! ([`stt/models/base.py`][stt-base] + [`stt/generate.py`][stt-gen]) — the
-//! [`Model`](model::Model) trait every concrete STT architecture
-//! (whisper / parakeet / canary / …) implements, and the
-//! [`stt_generate`](generate::stt_generate) Iterator that drives it.
+//! [`model`] defines the three-layer trait architecture every concrete STT
+//! model conforms to: the universal [`Transcribe`](model::Transcribe)
+//! contract, and the two family traits [`CtcModel`](model::CtcModel)
+//! (non-autoregressive, e.g. wav2vec2) and
+//! [`AutoregressiveStt`](model::AutoregressiveStt) (encoder/decoder, e.g.
+//! whisper). [`generate`] holds the shared decoding drivers: the blanket
+//! `impl<M: CtcModel> Transcribe` (greedy CTC collapse) and the
+//! [`greedy_transcribe`](generate::greedy_transcribe) free function (the
+//! generic autoregressive greedy loop).
 //!
-//! Per the project's no per-model arch porting rule, mlxrs ships
-//! **no** concrete STT model implementations: those (the conv subsampling +
-//! transformer for whisper, the conformer + RNN-T joint for parakeet, etc.)
-//! live in user code on top of this trait. The two submodules here are the
-//! shared support surface every per-model STT decoder reuses.
+//! Per the project's no-per-model-arch rule, mlxrs ships **no** concrete STT
+//! model implementations: those (the conv subsampling + transformer for
+//! whisper, the conformer for parakeet, etc.) live in user code on top of
+//! these traits. The submodules here are the shared support surface every
+//! per-model STT decoder reuses.
 //!
 //! ## Pipeline
 //!
-//! 1. [`crate::audio::io::load_audio`] — mono `Vec<f32>` in `[-1, 1]`.
-//! 2. Optional [`crate::audio::io::resample_linear`] when the source rate
-//!    differs from [`model::Model::mel_config`].
-//! 3. [`generate::SttGenConfig::max_audio_seconds`] cap (BEFORE allocation).
-//! 4. [`crate::audio::dsp::log_mel_spectrogram`] — `(n_mels, T)`.
-//! 5. [`model::Model::encode_audio`] — one pass; states cached on the loop.
-//! 6. Token-by-token [`model::Model::decode_step`] (seeded by
-//!    [`model::Model::bos_token`]); sampled via the LM loop's
-//!    [`crate::lm::generate::make_sampler`] /
-//!    [`crate::lm::generate::make_logits_processors`] chain.
-//!
-//! [stt-base]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/base.py
-//! [stt-gen]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/generate.py
+//! 1. [`crate::audio::io::load_audio`] — mono `Vec<f32>` waveform in `[-1, 1]`,
+//!    built into an [`crate::array::Array`].
+//! 2. Optional [`generate::resample_waveform`] when the source rate differs
+//!    from the model's [`model::MelConfig::sample_rate`].
+//! 3. The model's frontend ([`model::AutoregressiveStt::log_mel`] /
+//!    [`model::CtcModel::logits`]) → features.
+//! 4. The family driver: per-frame greedy collapse (CTC) or the token-by-token
+//!    greedy loop ([`generate::greedy_transcribe`]) for a simple autoregressive
+//!    model — a complex model (whisper) runs its own
+//!    [`Transcribe`](model::Transcribe) procedure reusing the same hooks.
 
 pub mod generate;
 pub mod load;

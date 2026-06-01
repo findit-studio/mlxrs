@@ -33,10 +33,12 @@
 //!   `Fn(&str, &str) -> Result<String>` backend closure.
 //!
 //! This mirrors the existing [`crate::audio::stt`] STT support surface:
-//! `stt` ships the [`Model`](crate::audio::stt::model::Model) trait + the
-//! [`stt_generate`](crate::audio::stt::generate::stt_generate) loop, NOT
-//! whisper-the-model; `tts` ships the [`TtsModel`](model::TtsModel) trait +
-//! the [`tts_generate`](generate::tts_generate) loop, NOT kokoro-the-model.
+//! `stt` ships the [`Transcribe`](crate::audio::stt::model::Transcribe)
+//! contract + the family drivers
+//! ([`greedy_transcribe`](crate::audio::stt::generate::greedy_transcribe) and
+//! the CTC blanket impl), NOT whisper-the-model; `tts` ships the
+//! [`TtsModel`](model::TtsModel) trait + the
+//! [`tts_generate`](generate::tts_generate) loop, NOT kokoro-the-model.
 //!
 //! ## Out of scope — per-model architectures
 //!

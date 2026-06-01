@@ -29,7 +29,7 @@
 //!   [`orchestrator::TtsStreamAdapter`] the orchestrator needs (a
 //!   streaming view over the whole-utterance shapes the existing
 //!   [`crate::audio::vad::VadModel`] /
-//!   [`crate::audio::stt::model::Model`] /
+//!   [`crate::audio::stt::model::Transcribe`] /
 //!   [`crate::lm::model::Model`] /
 //!   [`crate::audio::tts::model::TtsModel`] trait surfaces
 //!   expose).
@@ -57,7 +57,7 @@
 //!   `AudioOutputStream` classes** — these wrap concrete
 //!   architectures (Voxtral STT, Silero VAD, etc.). mlxrs's no-arch
 //!   rule pushes them to user code; the orchestrator instead consumes
-//!   the architecture-agnostic [`crate::audio::stt::model::Model`] /
+//!   the architecture-agnostic [`crate::audio::stt::model::Transcribe`] /
 //!   [`crate::audio::vad::VadModel`] /
 //!   [`crate::audio::tts::model::TtsModel`] / [`crate::lm::model::Model`]
 //!   / [`crate::audio::playback::AudioOutputStream`] trait surfaces.

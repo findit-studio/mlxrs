@@ -13,9 +13,9 @@
 //! [`tts_generate`] composes text segmentation, the
 //! [`super::model::TtsModel`] trait, and audio-chunk assembly into one
 //! [`Iterator<Item = Result<AudioChunk>>`][iter] — the streaming analogue of
-//! mlx-audio's `for result in model.generate(...)` loop, mirroring the
-//! per-step iterator contract [`crate::audio::stt::generate::SttGenerator`]
-//! exposes (so a caller familiar with the STT loop sees no new shape).
+//! mlx-audio's `for result in model.generate(...)` loop (a per-step iterator
+//! contract, so a caller familiar with the LM/VLM streaming loops sees no new
+//! shape).
 //!
 //! No implicit eval: the driver never materializes the per-segment audio
 //! [`Array`] — it forwards each segment's tensor straight into an
@@ -69,15 +69,13 @@ pub const DEFAULT_STREAMING_INTERVAL: f32 = 2.0;
 /// Maximum input-text length (UTF-8 bytes) [`tts_generate`] accepts before
 /// rejecting up front — `1_048_576` (1 MiB).
 ///
-/// A pre-allocation safety cap mirroring the STT loop's
-/// [`SttGenConfig::max_audio_seconds`][stt-cap] philosophy: a crafted /
-/// fuzzed multi-MB text blob would otherwise drive the per-segment split
-/// (and every per-model `synthesize_segment` allocation) without bound.
-/// 1 MiB of text is far longer than any realistic single TTS request
-/// (~150k words). Inputs above this return a recoverable [`Error::CapExceeded`]
-/// from the [`tts_generate`] constructor, before any segmentation work.
-///
-/// [stt-cap]: crate::audio::stt::generate::SttGenConfig::max_audio_seconds
+/// A pre-allocation safety cap following the same bounded-input philosophy
+/// as the rest of the audio pipeline: a crafted / fuzzed multi-MB text blob
+/// would otherwise drive the per-segment split (and every per-model
+/// `synthesize_segment` allocation) without bound. 1 MiB of text is far
+/// longer than any realistic single TTS request (~150k words). Inputs above
+/// this return a recoverable [`Error::CapExceeded`] from the [`tts_generate`]
+/// constructor, before any segmentation work.
 pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
 /// Output audio container format — mlx-audio `generate_audio`'s
@@ -156,9 +154,8 @@ impl TextSegmentation {
 /// sampling knobs (`temperature`, `top_p`, `repetition_penalty`, …) are a
 /// flat subset of mlx-audio's `generate_audio` kwargs — the TTS driver does
 /// not itself run a token sampler (per-model `synthesize_segment` owns the
-/// decode loop), so unlike [`crate::audio::stt::generate::SttGenConfig`]
-/// (which composes the full LM [`crate::lm::generate::GenConfig`]) this is a
-/// plain knob bundle the per-model code reads.
+/// decode loop), so this is a plain knob bundle the per-model code reads
+/// rather than a wrapper around the LM [`crate::lm::generate::GenConfig`].
 ///
 /// All fields are private; construct via [`TtsGenConfig::new`] (all
 /// defaults) or chain [`with_voice`](TtsGenConfig::with_voice),
@@ -888,10 +885,11 @@ fn push_if_nonblank(out: &mut Vec<(usize, usize)>, text: &str, start: usize, end
 /// input text + the config, owns the per-segment range list and a cursor,
 /// and yields one [`AudioChunk`] per text segment.
 ///
-/// Lifetime `'a` ties to all three borrows (model, text, config) — the
-/// same borrow pattern [`crate::audio::stt::generate::SttGenerator`] uses
-/// for the model. No per-segment [`String`] is allocated: each
-/// [`TtsSegment`]'s `&str` fields are slices of the borrowed text/config.
+/// Lifetime `'a` ties to all three borrows (model, text, config) — the same
+/// model-borrow pattern the LM-side generator returned by
+/// [`crate::lm::generate::generate_step`] uses. No per-segment [`String`] is
+/// allocated: each [`TtsSegment`]'s `&str` fields are slices of the borrowed
+/// text/config.
 ///
 /// The iterator **fuses**: after it yields `Err` (a segment's
 /// `synthesize_segment` failed, or the model returned a malformed tensor)
