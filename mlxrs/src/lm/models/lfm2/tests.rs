@@ -262,6 +262,37 @@ fn shortconv_decode_in_two_chunks_matches_prefill() {
   assert_close(&decoded, &prefill_v);
 }
 
+#[test]
+fn shortconv_decode_with_cache_lengths_matches_prefill() {
+  // Exercises the `cache.lengths`-set decode branch — the one that builds the
+  // host `lengths_positions` index and stashes via `take_along_axis` (the path
+  // the cap + checked host alloc protect). With a single batch row whose length
+  // covers the whole sequence, `clip(length, 0, t)` keeps exactly the trailing
+  // `n_keep` frames, so the per-step decode stream must still equal the prefill
+  // output position-for-position.
+  let (in_w, conv_w, out_w, hidden, k) = sample_weights();
+  let conv = make_shortconv(&in_w, &conv_w, &out_w, hidden, k);
+  let x = sample_input();
+  let arr = x_to_array(&x);
+
+  let mut prefill = conv.forward(&arr, None, None).unwrap();
+  let prefill_v = prefill.to_vec::<f32>().unwrap();
+
+  let mut cache = ArraysCache::new(1);
+  let mut decoded: Vec<f32> = Vec::new();
+  // `prepare` sets `cache.lengths`; mlx-lm's `advance` decrements it per step,
+  // so seed it with the full remaining length before each token.
+  let total = x[0].len() as i32;
+  for (step, token) in x[0].iter().enumerate() {
+    cache.prepare(&[total - step as i32]);
+    let s: Vec<f32> = token.iter().map(|&v| v as f32).collect();
+    let step_arr = Array::from_slice::<f32>(&s, &(1usize, 1usize, hidden)).unwrap();
+    let mut out = conv.forward(&step_arr, None, Some(&mut cache)).unwrap();
+    decoded.extend(out.to_vec::<f32>().unwrap());
+  }
+  assert_close(&decoded, &prefill_v);
+}
+
 // ───────────────────────── sanitize ─────────────────────────
 
 #[test]
@@ -513,6 +544,99 @@ fn validate_rejects_unbounded_ffn_multiplier() {
     TextConfig::from_json(neg),
     Err(Error::OutOfRange(_))
   ));
+}
+
+#[test]
+fn validate_bounds_conv_l_cache_as_a_cardinality() {
+  // `conv_L_cache` sizes runtime allocations (the conv-state array's middle
+  // axis, the prefill left-pad, and a host `B * (conv_L_cache - 1)` index Vec),
+  // so it takes the tight `MAX_CONV_L_CACHE` (256) cardinality cap, NOT the
+  // loose 2^24 width cap. A value past the cap would otherwise drive a ~16M-wide
+  // pad / a `B`-multiplied gigabyte host allocation before any typed error.
+  let with_conv = |v: &str| {
+    format!(
+      r#"{{"conv_L_cache": {v}, "hidden_size": 8, "num_attention_heads": 2,
+        "num_key_value_heads": 2, "num_hidden_layers": 2}}"#
+    )
+  };
+
+  // The cap boundary: exactly MAX_CONV_L_CACHE is accepted, one past it is a
+  // recoverable CapExceeded — isolating the off-by-one.
+  assert!(
+    TextConfig::from_json(&with_conv(&MAX_CONV_L_CACHE.to_string()))
+      .unwrap()
+      .validate()
+      .is_ok()
+  );
+  assert!(matches!(
+    TextConfig::from_json(&with_conv(&(MAX_CONV_L_CACHE + 1).to_string())),
+    Err(Error::CapExceeded(_))
+  ));
+  // A value far past the old 2^24 width cap (which used to admit it) is now
+  // rejected as CapExceeded, not OutOfRange.
+  assert!(matches!(
+    TextConfig::from_json(&with_conv("1000000")),
+    Err(Error::CapExceeded(_))
+  ));
+  // The cardinality contract also rejects a non-positive window as OutOfRange
+  // (a zero / negative kernel is structurally invalid, not merely over-cap).
+  assert!(matches!(
+    TextConfig::from_json(&with_conv("0")),
+    Err(Error::OutOfRange(_))
+  ));
+  assert!(matches!(
+    TextConfig::from_json(&with_conv("-1")),
+    Err(Error::OutOfRange(_))
+  ));
+  // The realistic default (3) and a small explicit window stay valid.
+  assert!(
+    TextConfig::from_json(&with_conv("3"))
+      .unwrap()
+      .validate()
+      .is_ok()
+  );
+}
+
+// ───────────────────────── conv host index build ─────────────────────────
+
+#[test]
+fn lengths_positions_builds_clamped_index_rows() {
+  // `lengths_positions(ends, n_keep)` materializes the `[B, n_keep, 1]` index
+  // `(ends[:, None] + arange(n_keep))[..., None]` consumed by the cached-state
+  // `take_along_axis`. Verify the closed form directly (independent of the code
+  // under test): row `b` is `ends[b], ends[b]+1, .., ends[b]+n_keep-1`.
+  let ends = [0_i32, 2, 5];
+  let n_keep = 2;
+  let mut idx = lengths_positions(&ends, n_keep).unwrap();
+  assert_eq!(idx.shape(), vec![3, 2, 1]);
+  assert_eq!(idx.to_vec::<i32>().unwrap(), vec![0, 1, 2, 3, 5, 6]);
+
+  // `n_keep == 0` (a `conv_L_cache == 1` pointwise kernel) yields an empty
+  // `[B, 0, 1]` index with no host allocation driven past zero.
+  let mut empty = lengths_positions(&ends, 0).unwrap();
+  assert_eq!(empty.shape(), vec![3, 0, 1]);
+  assert!(empty.to_vec::<i32>().unwrap().is_empty());
+}
+
+#[test]
+fn lengths_positions_host_build_is_bounded_by_the_cap() {
+  // The host index Vec is sized `B * (conv_L_cache - 1)`. The `conv_L_cache`
+  // cardinality cap keeps the per-batch multiplier a small constant, so even a
+  // large (but realistic) batch cannot drive an unbounded allocation: the
+  // capacity computation is a checked `usize` multiply and the buffer is
+  // fallibly reserved. Drive the largest within-cap window over a non-trivial
+  // batch and confirm the closed-form shape / first-row contents.
+  let n_keep = MAX_CONV_L_CACHE - 1; // the widest window the cap admits
+  let batch = 64;
+  let ends: Vec<i32> = (0..batch).collect();
+  let mut idx = lengths_positions(&ends, n_keep).unwrap();
+  assert_eq!(idx.shape(), vec![batch as usize, n_keep as usize, 1]);
+  let flat = idx.to_vec::<i32>().unwrap();
+  assert_eq!(flat.len(), batch as usize * n_keep as usize);
+  // Row 0 is `0, 1, .., n_keep-1`; row 1 starts at `ends[1] == 1`.
+  assert_eq!(flat[0], 0);
+  assert_eq!(flat[n_keep as usize - 1], n_keep - 1);
+  assert_eq!(flat[n_keep as usize], 1);
 }
 
 // ───────────────────────── cache cardinality ─────────────────────────

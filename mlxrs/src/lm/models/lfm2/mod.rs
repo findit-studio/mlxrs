@@ -47,8 +47,8 @@ use crate::{
   array::Array,
   dtype::Dtype,
   error::{
-    Error, InvariantViolationPayload, LengthMismatchPayload, MissingKeyPayload,
-    NonFiniteScalarPayload, OutOfRangePayload, ParsePayload, Result,
+    ArithmeticOverflowPayload, Error, InvariantViolationPayload, LengthMismatchPayload,
+    MissingKeyPayload, NonFiniteScalarPayload, OutOfRangePayload, ParsePayload, Result,
   },
   lm::{
     cache::{ArraysCache, KvCache, MaskMode, StandardKvCache},
@@ -83,13 +83,17 @@ use crate::model_validation::{
 const PAD_CONSTANT: &CStr = c"constant";
 
 /// Inclusive upper bound for every *width*-like [`TextConfig`] field
-/// (`hidden_size`, `vocab_size`, the MLP widths, `conv_L_cache`). `2^24` is far
-/// above any real LFM2 checkpoint (the largest real value, `vocab_size`, is
-/// ~10^5) yet small enough that the downstream `i32` shape arithmetic — the
-/// `2 * block_ff_dim` and `block_multiple_of * ceil(..)` of [`adjusted_ff_dim`],
-/// the per-head reshapes, and the vocab-width logits projection — cannot
-/// overflow `i32`. Rejecting an oversized field here keeps a malformed config a
-/// recoverable [`Error::OutOfRange`] instead of a wrapping multiply downstream.
+/// (`hidden_size`, `vocab_size`, the MLP widths). `2^24` is far above any real
+/// LFM2 checkpoint (the largest real value, `vocab_size`, is ~10^5) yet small
+/// enough that the downstream `i32` shape arithmetic — the `2 * block_ff_dim`
+/// and `block_multiple_of * ceil(..)` of [`adjusted_ff_dim`], the per-head
+/// reshapes, and the vocab-width logits projection — cannot overflow `i32`.
+/// Rejecting an oversized field here keeps a malformed config a recoverable
+/// [`Error::OutOfRange`] instead of a wrapping multiply downstream.
+///
+/// `conv_L_cache` is deliberately **not** in this set: it sizes runtime
+/// allocations rather than just a width, so it takes the far smaller
+/// [`MAX_CONV_L_CACHE`] cardinality cap instead.
 const MAX_CONFIG_DIM: i32 = 1 << 24;
 
 /// Inclusive upper bound for every *cardinality*-like [`TextConfig`] field —
@@ -104,6 +108,21 @@ const MAX_CONFIG_DIM: i32 = 1 << 24;
 /// [`Error::AllocFailure`] from the `try_reserve`d layer `Vec`) rather than an
 /// allocator abort.
 const MAX_CONFIG_CARDINALITY: i32 = 4096;
+
+/// Inclusive upper bound for `conv_L_cache`, the short-convolution
+/// kernel / cache window. Unlike the width fields it never names a matmul axis;
+/// it directly **sizes allocations** — the recurrent conv-state array's middle
+/// axis (`conv_L_cache - 1`), the prefill left-pad width, and (via
+/// [`lengths_positions`]) a host `B * (conv_L_cache - 1)` index `Vec`. The
+/// `2^24` width cap would let one field drive a ~16M-wide pad / a `B`-multiplied
+/// gigabyte host allocation, so it takes a dedicated, much tighter cap.
+///
+/// Real LFM2 kernels are single-digit (`conv_L_cache == 3`); `256` is far
+/// beyond any plausible short-conv window yet bounds the cache-state width and
+/// the per-batch host index build to a small constant factor, keeping an
+/// oversized value a recoverable [`Error::CapExceeded`] rather than an
+/// allocation that aborts before the first typed error.
+const MAX_CONV_L_CACHE: i32 = 256;
 
 // ───────────────────────── config ─────────────────────────
 
@@ -251,9 +270,12 @@ impl TextConfig {
   /// forward pass. Mirrors the eager `validate()` discipline of
   /// [`crate::lm::generate::GenConfig`].
   ///
-  /// Every dimension-like field must be a positive integer no larger than
-  /// `2^24` (so the downstream `i32` shape arithmetic cannot overflow), and
-  /// the two derived ratios must divide exactly:
+  /// Every width-like field must be a positive integer no larger than `2^24`
+  /// (so the downstream `i32` shape arithmetic cannot overflow); the
+  /// cardinality fields that size eager allocations (`num_hidden_layers`, the
+  /// head counts) and `conv_L_cache` (which sizes the conv-state / pad / host
+  /// index allocations) take their own far tighter caps. The two derived ratios
+  /// must divide exactly:
   ///
   /// - `hidden_size` must be divisible by `num_attention_heads` — otherwise
   ///   [`head_dim`](TextConfig::head_dim) truncates and the per-head reshape
@@ -287,7 +309,6 @@ impl TextConfig {
       ("vocab_size", self.vocab_size),
       ("block_dim", self.block_dim),
       ("block_ff_dim", self.block_ff_dim),
-      ("conv_L_cache", self.conv_l_cache),
       // `block_multiple_of` is a width-arithmetic divisor: positive (a zero
       // would divide-by-zero in `adjusted_ff_dim`) and within the width cap.
       ("block_multiple_of", self.block_multiple_of),
@@ -305,6 +326,17 @@ impl TextConfig {
     ] {
       require_cardinality(name, i64::from(value), MAX_CONFIG_CARDINALITY as u64)?;
     }
+    // `conv_L_cache` sizes runtime allocations — the conv-state array's middle
+    // axis (`conv_L_cache - 1`), the prefill left-pad, and the host
+    // `B * (conv_L_cache - 1)` index `Vec` of [`ShortConv::forward`] — so it
+    // takes its own tight [`MAX_CONV_L_CACHE`] cardinality cap (positive, and
+    // small enough that no single field can drive an oversized allocation),
+    // not the loose `2^24` width cap.
+    require_cardinality(
+      "conv_L_cache",
+      i64::from(self.conv_l_cache),
+      MAX_CONV_L_CACHE as u64,
+    )?;
     // head_dim = hidden_size / num_attention_heads must divide exactly.
     require_divisible(
       "hidden_size",
@@ -528,6 +560,10 @@ fn mask_mode_to_mask(mode: &MaskMode) -> Mask<'_> {
 #[derive(Debug)]
 struct ShortConv {
   hidden_size: i32,
+  /// The conv kernel / cache window (`conv_L_cache`); the recurrent state keeps
+  /// `l_cache - 1` frames. Bounded by [`MAX_CONV_L_CACHE`] at config time, so
+  /// every allocation it sizes (the conv-state array, the prefill pad, the host
+  /// index `Vec`) stays small.
   l_cache: i32,
   /// Depthwise conv weight, `(hidden, K, 1)` (MLX channels-last layout, the
   /// transposed form [`Lfm2::sanitize`] produces from PyTorch's
@@ -638,16 +674,47 @@ impl ShortConv {
 }
 
 /// `(ends[:, None] + arange(n_keep))[..., None]` as an `I32` `[B, n_keep, 1]`
-/// index array for `take_along_axis(_, axis=1)`. `n_keep` is `L_cache - 1`
-/// (tiny), so the row is materialized directly.
+/// index array for `take_along_axis(_, axis=1)`.
+///
+/// `n_keep` is `conv_L_cache - 1`, bounded small by [`MAX_CONV_L_CACHE`]; `ends`
+/// is one entry per batch row. The host buffer is sized `B * n_keep` — both
+/// factors are non-negative (`n_keep >= 0` since `conv_L_cache >= 1`), but the
+/// element count is still **checked** and **fallibly reserved** so no
+/// config / batch combination can drive an unbounded allocation that aborts
+/// before a typed error: the `B * n_keep` product goes through `usize`
+/// [`checked_mul`]-style overflow detection, [`reserve_or_error`] turns an
+/// allocator failure into [`Error::AllocFailure`], and each `e + k` index goes
+/// through [`checked_add`] so a near-`i32::MAX` clamped length cannot wrap.
 fn lengths_positions(ends: &[i32], n_keep: i32) -> Result<Array> {
-  let mut data = Vec::with_capacity(ends.len() * n_keep as usize);
+  // `n_keep >= 0` (guaranteed by the `conv_L_cache >= 1` cap) so the cast is
+  // lossless; size the host index buffer with a checked `usize` multiply.
+  let n_keep_usize = n_keep as usize;
+  let capacity = ends.len().checked_mul(n_keep_usize).ok_or_else(|| {
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "lengths_positions: B * (conv_L_cache - 1) index count",
+      "usize",
+      [
+        ("batch", ends.len() as u64),
+        ("n_keep", n_keep_usize as u64),
+      ],
+    ))
+  })?;
+  let mut data: Vec<i32> = Vec::new();
+  reserve_or_error(&mut data, "conv cache position index", capacity)?;
   for &e in ends {
     for k in 0..n_keep {
-      data.push(e + k);
+      // `e` is a length clamped to `[0, t]`; `k < n_keep`. Both non-negative,
+      // but guard the sum so a near-`i32::MAX` clamp cannot wrap into UB.
+      data.push(checked_add(
+        "lengths_positions: end + offset",
+        "end",
+        e,
+        "offset",
+        k,
+      )?);
     }
   }
-  Array::from_slice::<i32>(&data, &(ends.len(), n_keep as usize, 1usize))
+  Array::from_slice::<i32>(&data, &(ends.len(), n_keep_usize, 1usize))
 }
 
 /// A zeros array of the given shape cast to `dtype` (the conv state's dtype
