@@ -39,6 +39,32 @@ use super::model::{
 /// and the decoder is never fed past its positional context.
 pub const DEFAULT_MAX_DECODE_STEPS: usize = 448;
 
+/// A generous-but-bounded sanity cap on a model-provided logits VOCAB axis,
+/// `1 Mi` (`1_048_576`).
+///
+/// Both drivers take a per-position `argmax` over the vocab axis of logits the
+/// model returns; the axis length is read off the lazy array's [`Array::shape`]
+/// (no `eval`) so an absurd width can be rejected with a typed
+/// [`Error::OutOfRange`] *before* the `argmax`/materialization. Real speech
+/// vocabularies are at most ~256 K tokens, so `1 Mi` is a wide margin that
+/// admits every real model yet rejects a denial-of-service shape (a lazily-
+/// shaped `(T, huge_vocab)` that would otherwise materialize multi-GB of
+/// intermediate logits before any error).
+pub const MAX_LOGITS_VOCAB: usize = 1024 * 1024;
+
+/// A generous-but-bounded sanity cap on a model-provided
+/// [`AutoregressiveStt::max_context`], `1 Mi` (`1_048_576`).
+///
+/// [`greedy_transcribe`] derives its decode-loop bound (`max_context -
+/// prompt_len`) and the generated-token `Vec`'s growth from `max_context`. A
+/// model is free to report any `max_context`, so an absurd value would make the
+/// loop effectively unbounded and drive an infallible-`push` `Vec` toward OOM
+/// (a never-eot model). Real decoder contexts are at most ~128 K positions, so
+/// `1 Mi` is a wide margin that admits every real decoder yet rejects an absurd
+/// value — and, once capped, the generated-token `Vec` is itself bounded by
+/// `max_context`, so its bounded infallible `push` is acceptable.
+pub const MAX_DECODE_CONTEXT: usize = 1024 * 1024;
+
 /// Validate a mono `audio` waveform's METADATA — rank, length, cap — WITHOUT
 /// materializing it, returning its sample count.
 ///
@@ -170,6 +196,13 @@ pub fn default_log_mel(cfg: &MelConfig, audio: &Array) -> Result<Array> {
 /// a typed [`Error::EmptyInput`] (mirroring the autoregressive guard). An empty
 /// TIME axis (`T' == 0`) is well-defined — an empty [`Transcription`] (no ids
 /// survive to collapse) — not an error.
+///
+/// Both model-provided logits magnitudes are also capped — off the lazy
+/// [`Array::shape`], so a denial-of-service shape is rejected BEFORE any
+/// `argmax`/`to_vec` materialization: the time axis `T'` against
+/// [`crate::audio::io::MAX_DECODED_SAMPLES`] (a valid model emits no more frames
+/// than input samples) and the vocab axis against [`MAX_LOGITS_VOCAB`], each a
+/// typed [`Error::OutOfRange`].
 pub fn greedy_ctc_transcribe<M: CtcModel + ?Sized>(
   model: &M,
   audio: &Array,
@@ -188,6 +221,30 @@ pub fn greedy_ctc_transcribe<M: CtcModel + ?Sized>(
       "stt CtcModel::logits must be rank 2 (shape [T', vocab])",
       shape.len() as u32,
       shape,
+    )));
+  }
+  // Cap the model-provided TIME axis `T'` (frame count) BEFORE the `argmax` +
+  // `to_vec::<u32>()` below. `shape` is read off the lazy array's metadata (no
+  // `eval`), so a model returning a lazily-shaped `(huge_T', vocab)` is rejected
+  // here with NO allocation — rather than materializing one `u32` per frame
+  // (an OOM). A valid model emits no more frames than it had input samples, so
+  // the input-sample cap is the natural bound on `T'`.
+  if shape[0] > audio_io::MAX_DECODED_SAMPLES {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt CtcModel::logits time axis (T', frame count)",
+      "must not exceed MAX_DECODED_SAMPLES (64 Mi — a valid model emits no more \
+         frames than input samples)",
+      shape[0].to_string(),
+    )));
+  }
+  // Cap the model-provided VOCAB axis BEFORE the `argmax`, so a lazily-shaped
+  // `(T', huge_vocab)` is rejected with no materialization of the argmax over a
+  // multi-GB-wide axis.
+  if shape[1] > MAX_LOGITS_VOCAB {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt CtcModel::logits vocab axis",
+      "must not exceed MAX_LOGITS_VOCAB (1 Mi)",
+      shape[1].to_string(),
     )));
   }
   // Empty vocab axis: argmax over an empty axis is undefined — typed error
@@ -275,7 +332,13 @@ pub fn greedy_ctc_transcribe<M: CtcModel + ?Sized>(
 /// generates AT MOST `max_context - prompt.len()` new tokens, so
 /// `prompt + generated` never exceeds the decoder's total positional context
 /// (a prompt that already meets or exceeds `max_context` is a typed
-/// [`Error::OutOfRange`] — there is no room left to decode).
+/// [`Error::OutOfRange`] — there is no room left to decode). The model-provided
+/// `max_context` is itself capped against [`MAX_DECODE_CONTEXT`] BEFORE the loop
+/// (a typed [`Error::OutOfRange`]), so an absurd value can neither drive an
+/// effectively-unbounded loop nor an unbounded generated-token `Vec` (its
+/// growth is then bounded by `max_context`, so the per-step `push` is a bounded
+/// infallible append). Each step's `(vocab,)` logits width is likewise capped
+/// against [`MAX_LOGITS_VOCAB`] before its `argmax`.
 ///
 /// Because the [`AutoregressiveStt`] surface carries no detokenizer, the
 /// returned [`Transcription`]'s text is the decoded token-id sequence (the
@@ -306,6 +369,19 @@ pub fn greedy_transcribe<M: AutoregressiveStt + ?Sized>(
   // Bound `prompt + generated` by the decoder's TOTAL context: a prompt that
   // already fills (or overflows) `max_context` leaves no room to decode.
   let max_ctx = m.max_context();
+  // Cap the model-provided `max_context` BEFORE deriving `max_new` / entering
+  // the loop. `max_context` is model-provided and otherwise only compared to
+  // `prompt_len`, so an absurd value makes `max_new = max_ctx - prompt_len` an
+  // effectively unbounded decode with infallible `tokens.push` growth — an OOM
+  // (a never-eot model). Rejecting it here with a typed error bounds both the
+  // loop trip count and the generated-token `Vec` by `MAX_DECODE_CONTEXT`.
+  if max_ctx > MAX_DECODE_CONTEXT {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt AutoregressiveStt::max_context",
+      "must not exceed MAX_DECODE_CONTEXT (1 Mi)",
+      max_ctx.to_string(),
+    )));
+  }
   if prompt_len >= max_ctx {
     return Err(Error::OutOfRange(OutOfRangePayload::new(
       "stt greedy_transcribe: initial_tokens prompt length",
@@ -347,6 +423,18 @@ pub fn greedy_transcribe<M: AutoregressiveStt + ?Sized>(
     if vocab_len == 0 {
       return Err(Error::EmptyInput(EmptyInputPayload::new(
         "stt AutoregressiveStt::decode_step returned an empty vocab axis (vocab == 0)",
+      )));
+    }
+    // Cap THIS step's model-provided vocab axis BEFORE the `argmax` below, so a
+    // lazily-shaped `(huge_vocab,)` row is rejected with no materialization of
+    // an argmax over a multi-GB-wide axis. Re-checked per step (like the `eot`
+    // range check) so an interior-mutable model that returns an absurd width on
+    // a later step is still caught.
+    if vocab_len > MAX_LOGITS_VOCAB {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "stt AutoregressiveStt::decode_step vocab axis",
+        "must not exceed MAX_LOGITS_VOCAB (1 Mi)",
+        vocab_len.to_string(),
       )));
     }
 

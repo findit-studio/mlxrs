@@ -378,6 +378,60 @@ fn ctc_stateful_blank_first_read_out_of_range_is_rejected() {
   assert!(matches!(err, Error::OutOfRange(_)));
 }
 
+/// A CTC mock whose `logits` is a LAZILY-shaped `(t, vocab)` `zeros` grid — the
+/// shape is carried on the lazy array's metadata with NO host materialization,
+/// so an oversized `t` or `vocab` is realized only as a `shape`, never as bytes.
+/// Drives the model-provided-magnitude caps (time axis, vocab axis).
+struct LazyShapeCtc {
+  logits: Array,
+}
+
+impl LazyShapeCtc {
+  fn new(t: i32, vocab: i32) -> Self {
+    // `Array::zeros` builds a lazy node: the `(t, vocab)` shape exists without
+    // materializing `t * vocab` floats, so a multi-Gi grid costs nothing here.
+    Self {
+      logits: Array::zeros::<f32>(&[t, vocab]).unwrap(),
+    }
+  }
+}
+
+impl CtcModel for LazyShapeCtc {
+  fn logits(&self, _waveform: &Array) -> Result<Array> {
+    self.logits.try_clone()
+  }
+  fn blank_id(&self) -> u32 {
+    0
+  }
+  fn decode_ids(&self, _ids: &[u32]) -> String {
+    String::new()
+  }
+}
+
+#[test]
+fn ctc_rejects_oversized_time_axis_before_materializing() {
+  // A model returning a LAZILY-shaped `(MAX_DECODED_SAMPLES + 1, vocab)` logits
+  // would, if un-capped, take an argmax + `to_vec::<u32>()` of one u32 per frame
+  // -> a multi-GB OOM. The driver caps the time axis `T'` off the lazy `.shape()`
+  // and rejects with a typed OutOfRange BEFORE the argmax/to_vec — so this test
+  // allocates nothing (the `zeros` grid is never materialized).
+  let model = LazyShapeCtc::new((audio_io::MAX_DECODED_SAMPLES + 1) as i32, 4);
+  let err =
+    greedy_ctc_transcribe(&model, &dummy_waveform(), &TranscribeOptions::new()).unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)));
+}
+
+#[test]
+fn ctc_rejects_oversized_vocab_axis_before_materializing() {
+  // A LAZILY-shaped `(T, MAX_LOGITS_VOCAB + 1)` logits: the argmax over a
+  // multi-Gi-wide vocab axis is rejected off the lazy `.shape()` with a typed
+  // OutOfRange before any materialization. Small `T` so only the vocab cap fires.
+  let model = LazyShapeCtc::new(2, (MAX_LOGITS_VOCAB + 1) as i32);
+  let err =
+    greedy_ctc_transcribe(&model, &dummy_waveform(), &TranscribeOptions::new()).unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)));
+}
+
 // ===========================================================================
 // Autoregressive family — the `greedy_transcribe` loop.
 // ===========================================================================
@@ -778,6 +832,62 @@ fn greedy_revalidates_eot_against_each_step_vocab() {
   // counter therefore advanced past both (2), proving the FIRST step did NOT
   // error and the per-step re-check is what caught it.
   assert_eq!(model.step.get(), 2);
+}
+
+#[test]
+fn greedy_rejects_oversized_max_context_before_loop() {
+  // A model reporting an absurd `max_context` (> MAX_DECODE_CONTEXT) would make
+  // `max_new = max_ctx - prompt_len` an effectively unbounded decode loop with
+  // infallible `tokens.push` growth -> OOM (a never-eot model). The driver caps
+  // `max_context` against MAX_DECODE_CONTEXT BEFORE deriving `max_new` / entering
+  // the loop and rejects with a typed OutOfRange — so the loop never runs and
+  // no oversized token `Vec` is grown.
+  let model = NeverStops {
+    vocab: 4,
+    prompt: vec![],
+    max_ctx: MAX_DECODE_CONTEXT + 1,
+  };
+  let err = greedy_transcribe(&model, &speech_waveform(), &TranscribeOptions::new()).unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)));
+}
+
+/// An autoregressive mock whose `decode_step` returns a LAZILY-shaped
+/// `(MAX_LOGITS_VOCAB + 1,)` `zeros` row — its width is on the lazy array's
+/// metadata with NO host materialization — to drive the per-step vocab cap.
+struct OversizedVocabStep;
+
+impl AutoregressiveStt for OversizedVocabStep {
+  type Cache = ();
+  fn encode(&self, mel: &Array) -> Result<Array> {
+    mel.try_clone()
+  }
+  fn new_cache(&self) {}
+  fn decode_step(&self, _c: &mut (), _e: &Array, _t: &[u32]) -> Result<Array> {
+    // Lazy `(MAX_LOGITS_VOCAB + 1,)` zeros: an absurd vocab width that exists as
+    // a shape only (no allocation of that many floats).
+    Array::zeros::<f32>(&[(MAX_LOGITS_VOCAB + 1) as i32])
+  }
+  fn initial_tokens(&self, _o: &TranscribeOptions) -> Result<Vec<u32>> {
+    Ok(vec![0])
+  }
+  fn eot(&self) -> u32 {
+    99
+  }
+}
+
+#[test]
+fn greedy_rejects_oversized_step_vocab_before_materializing() {
+  // A `decode_step` returning a LAZILY-shaped `(MAX_LOGITS_VOCAB + 1,)` row would,
+  // if un-capped, take an argmax over a multi-Gi-wide vocab axis -> OOM. The
+  // driver caps the step's vocab off the lazy `.shape()` and rejects with a typed
+  // OutOfRange BEFORE the argmax — so this test allocates nothing.
+  let err = greedy_transcribe(
+    &OversizedVocabStep,
+    &speech_waveform(),
+    &TranscribeOptions::new(),
+  )
+  .unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)));
 }
 
 /// A tracker mock that records whether its `log_mel` and `encode` frontend
