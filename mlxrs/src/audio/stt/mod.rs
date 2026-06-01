@@ -31,6 +31,17 @@
 pub mod generate;
 pub mod load;
 pub mod model;
+/// Concrete STT model implementations (feature-gated per architecture).
+///
+/// Unlike the architecture-agnostic [`model::Model`] trait — which user code
+/// implements for autoregressive cross-attention / joint decoders (whisper,
+/// parakeet, …) — the models here are the small number of non-AR / CTC
+/// architectures mlxrs ports directly because they do not fit that trait's
+/// `encode_audio` + per-token `decode_step` + KV-cache shape. Each is behind
+/// its own cargo feature.
+#[cfg(feature = "wav2vec2")]
+#[cfg_attr(docsrs, doc(cfg(feature = "wav2vec2")))]
+pub mod models;
 pub mod serializers;
 /// Streaming STT — incremental encoder + orchestration. Ports
 /// `mlx-audio-swift/Sources/MLXAudioSTT/Streaming/`.
