@@ -147,6 +147,33 @@ fn vocab_rejects_negative_id_mixed_with_valid() {
   assert!(matches!(Vocab::from_json(mixed), Err(Error::OutOfRange(_))));
 }
 
+#[test]
+fn vocab_rejects_duplicate_ids() {
+  // Two distinct tokens mapping to the SAME id is malformed: the source is a
+  // HashMap, so a bare slot overwrite would keep an arbitrary (per-run
+  // nondeterministic) survivor and silently corrupt the vocabulary. It must be
+  // a typed MalformedData, never a silent overwrite.
+  let dup = r#"{"A": 1, "B": 1}"#;
+  match Vocab::from_json(dup) {
+    Err(Error::MalformedData(p)) => {
+      assert_eq!(p.context(), "Vocab::from_json");
+      assert!(
+        p.detail().contains("same id"),
+        "detail should describe the duplicate-id condition, got {:?}",
+        p.detail()
+      );
+    }
+    other => panic!("expected MalformedData for duplicate ids, got {other:?}"),
+  }
+  // A duplicate at id 0 (two tokens both claiming the blank slot) is likewise
+  // rejected, regardless of which token the HashMap happens to visit first.
+  let dup0 = r#"{"<pad>": 0, "<s>": 0, "A": 1}"#;
+  assert!(matches!(
+    Vocab::from_json(dup0),
+    Err(Error::MalformedData(_))
+  ));
+}
+
 // ───────────────────────── test 6: sanitize ─────────────────────────
 
 #[test]
@@ -299,6 +326,145 @@ fn config_validate_rejects_unsupported_arms() {
     }
     other => panic!("expected UnknownEnumValue for feat_extract_norm, got {other:?}"),
   }
+}
+
+#[test]
+fn config_validate_rejects_conv_bias() {
+  // The port's ConvLayer stores no bias and `forward` adds none, so a
+  // `conv_bias == true` checkpoint would load (its bias tensors silently
+  // dropped) and run wrong. `validate` must reject it BEFORE any tensor is
+  // built, with a typed InvariantViolation naming the field.
+  let biased = Wav2Vec2Config::from_json(r#"{"conv_bias": true}"#).unwrap();
+  assert!(biased.conv_bias);
+  match biased.validate() {
+    Err(Error::InvariantViolation(p)) => {
+      assert!(
+        p.context().contains("conv_bias"),
+        "context should name conv_bias, got {:?}",
+        p.context()
+      );
+    }
+    other => panic!("expected InvariantViolation for conv_bias = true, got {other:?}"),
+  }
+}
+
+#[test]
+fn config_validate_rejects_oversized_count() {
+  // An unbounded count must not pass validate only to blow up later at the
+  // per-layer allocation loop. Pinning num_hidden_layers to its base-960h
+  // value (12) bounds it: an oversized count is rejected here, before the
+  // builder's `Vec::with_capacity(num_layers)` / weight-fetch loop. The
+  // OutOfRange payload names the offending value and the expected one.
+  let oversized = Wav2Vec2Config::from_json(r#"{"num_hidden_layers": 1000000}"#).unwrap();
+  match oversized.validate() {
+    Err(Error::OutOfRange(p)) => {
+      assert!(
+        p.context().contains("num_hidden_layers"),
+        "context should name num_hidden_layers, got {:?}",
+        p.context()
+      );
+      // The value carries both the offending count and the base-960h expectation.
+      assert!(
+        p.value().contains("1000000") && p.value().contains("12"),
+        "value should name the offending count and the expected one, got {:?}",
+        p.value()
+      );
+    }
+    other => panic!("expected OutOfRange for an oversized num_hidden_layers, got {other:?}"),
+  }
+}
+
+#[test]
+fn config_validate_rejects_deviating_dimension() {
+  // A scalar architecture field that deviates from base-960h is a different
+  // (unsupported) architecture — the port reads weight shapes from the
+  // checkpoint, so it would load-and-run silently wrong. Reject with a typed
+  // OutOfRange naming the field + value.
+  let wide = Wav2Vec2Config::from_json(r#"{"hidden_size": 1024}"#).unwrap();
+  match wide.validate() {
+    Err(Error::OutOfRange(p)) => {
+      assert!(
+        p.context().contains("hidden_size"),
+        "context should name hidden_size, got {:?}",
+        p.context()
+      );
+      assert!(
+        p.value().contains("1024") && p.value().contains("768"),
+        "value should name the offending dim and the expected one, got {:?}",
+        p.value()
+      );
+    }
+    other => panic!("expected OutOfRange for a deviating hidden_size, got {other:?}"),
+  }
+}
+
+#[test]
+fn config_validate_rejects_deviating_conv_array() {
+  // A conv-stack array that deviates from base-960h is rejected: a wrong
+  // length is LengthMismatch; a wrong element is OutOfRange naming the index +
+  // value + expectation.
+  //
+  // (a) Deviating element (same length, one stride changed 2 -> 3 at index 1).
+  let bad_elem = Wav2Vec2Config::from_json(r#"{"conv_stride": [5, 3, 2, 2, 2, 2, 2]}"#).unwrap();
+  match bad_elem.validate() {
+    Err(Error::OutOfRange(p)) => {
+      assert!(
+        p.context().contains("conv_stride"),
+        "context should name conv_stride, got {:?}",
+        p.context()
+      );
+      // index 1, offending value 3, expected 2.
+      assert!(
+        p.value().contains("element 1")
+          && p.value().contains("= 3")
+          && p.value().contains("expected 2"),
+        "value should name the index, value, and expectation, got {:?}",
+        p.value()
+      );
+    }
+    other => panic!("expected OutOfRange for a deviating conv_stride element, got {other:?}"),
+  }
+
+  // (b) Wrong length (a 6-element conv_kernel instead of 7) -> LengthMismatch.
+  let bad_len = Wav2Vec2Config::from_json(r#"{"conv_kernel": [10, 3, 3, 3, 3, 2]}"#).unwrap();
+  match bad_len.validate() {
+    Err(Error::LengthMismatch(p)) => {
+      assert!(
+        p.context().contains("conv_kernel"),
+        "context should name conv_kernel, got {:?}",
+        p.context()
+      );
+      assert_eq!(p.expected(), 7);
+      assert_eq!(p.actual(), 6);
+    }
+    other => panic!("expected LengthMismatch for a wrong-length conv_kernel, got {other:?}"),
+  }
+}
+
+#[test]
+fn base_960h_constants_match_defaults() {
+  // The validate() pin-constants and the serde `default_*` fns must agree:
+  // a default-constructed config (the base-960h checkpoint) must pass
+  // validate(). This guards against the two sources of truth drifting — if
+  // they did, the all-defaults config below would fail to validate.
+  let defaults = Wav2Vec2Config::from_json("{}").unwrap();
+  assert!(
+    defaults.validate().is_ok(),
+    "the all-default (base-960h) config must pass the validate() pins"
+  );
+  // Spot-check the exact base-960h values the pins enforce.
+  assert_eq!(defaults.hidden_size, 768);
+  assert_eq!(defaults.num_hidden_layers, 12);
+  assert_eq!(defaults.num_attention_heads, 12);
+  assert_eq!(defaults.intermediate_size, 3072);
+  assert_eq!(defaults.vocab_size, 32);
+  assert_eq!(defaults.num_conv_pos_embeddings, 128);
+  assert_eq!(defaults.num_conv_pos_embedding_groups, 16);
+  assert_eq!(defaults.num_feat_extract_layers, 7);
+  assert_eq!(defaults.conv_dim, vec![512, 512, 512, 512, 512, 512, 512]);
+  assert_eq!(defaults.conv_stride, vec![5, 2, 2, 2, 2, 2, 2]);
+  assert_eq!(defaults.conv_kernel, vec![10, 3, 3, 3, 3, 2, 2]);
+  assert_eq!(defaults.model_type(), "wav2vec2");
 }
 
 // ───────────────────────── test 2: feature-encoder time chain ─────────────────────────

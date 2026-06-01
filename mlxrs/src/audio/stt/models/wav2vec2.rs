@@ -175,6 +175,44 @@ fn default_num_feat_extract_layers() -> i32 {
   7
 }
 
+// ── base-960h architecture constants ──
+//
+// This port wires `facebook/wav2vec2-base-960h`'s *exact* graph: the builders
+// read every weight tensor by its fixed key and infer each layer's shape from
+// the checkpoint tensor (not from these fields), and `ConvLayer`/`Attention`/
+// the CTC head hardcode the base-960h topology. A config whose architecture
+// fields deviate would therefore be loaded into the wrong (or a silently
+// bias-less) graph. `validate` pins each architecture-defining field to its
+// base-960h value so a deviating checkpoint fails fast with a typed error
+// before any tensor is built — rather than loading and running silently wrong.
+// These mirror the `default_*` fns above (the single source of truth for the
+// `base-960h` values); the `base_960h_constants_match_defaults` test guards
+// against the two drifting.
+#[cfg(feature = "wav2vec2")]
+const BASE_960H_MODEL_TYPE: &str = "wav2vec2";
+#[cfg(feature = "wav2vec2")]
+const BASE_960H_VOCAB_SIZE: i32 = 32;
+#[cfg(feature = "wav2vec2")]
+const BASE_960H_HIDDEN_SIZE: i32 = 768;
+#[cfg(feature = "wav2vec2")]
+const BASE_960H_NUM_HIDDEN_LAYERS: i32 = 12;
+#[cfg(feature = "wav2vec2")]
+const BASE_960H_NUM_ATTENTION_HEADS: i32 = 12;
+#[cfg(feature = "wav2vec2")]
+const BASE_960H_INTERMEDIATE_SIZE: i32 = 3072;
+#[cfg(feature = "wav2vec2")]
+const BASE_960H_NUM_CONV_POS_EMBEDDINGS: i32 = 128;
+#[cfg(feature = "wav2vec2")]
+const BASE_960H_NUM_CONV_POS_EMBEDDING_GROUPS: i32 = 16;
+#[cfg(feature = "wav2vec2")]
+const BASE_960H_NUM_FEAT_EXTRACT_LAYERS: i32 = 7;
+#[cfg(feature = "wav2vec2")]
+const BASE_960H_CONV_DIM: [i32; 7] = [512, 512, 512, 512, 512, 512, 512];
+#[cfg(feature = "wav2vec2")]
+const BASE_960H_CONV_STRIDE: [i32; 7] = [5, 2, 2, 2, 2, 2, 2];
+#[cfg(feature = "wav2vec2")]
+const BASE_960H_CONV_KERNEL: [i32; 7] = [10, 3, 3, 3, 3, 2, 2];
+
 #[cfg(feature = "wav2vec2")]
 #[cfg_attr(docsrs, doc(cfg(feature = "wav2vec2")))]
 impl Wav2Vec2Config {
@@ -209,22 +247,40 @@ impl Wav2Vec2Config {
     self.feat_extract_norm == "group"
   }
 
-  /// Reject any config outside the single architecture arm this port
-  /// implements (`facebook/wav2vec2-base-960h`) with a typed error, **before**
-  /// any tensor is allocated.
+  /// Reject any config this port cannot run **exactly**, with a typed error,
+  /// **before** any tensor is allocated or any weight is read.
   ///
-  /// The port wires only the post-norm / group-norm feature-encoder arm; a
-  /// checkpoint requesting the pre-norm (`do_stable_layer_norm == true`) or a
-  /// non-`"group"` `feat_extract_norm` arm would otherwise be loaded into the
-  /// wrong graph and silently produce incorrect output. This is the single
-  /// validation gate called at the top of [`Wav2Vec2Ctc::from_weights`] (and
-  /// eagerly in [`Wav2Vec2Ctc::load`], so a mismatch fails fast before the
-  /// weights are even read).
+  /// This port wires `facebook/wav2vec2-base-960h`'s exact architecture and
+  /// nothing else: the builders read every weight tensor by its fixed key and
+  /// take each layer's shape from the checkpoint tensor, while the (bias-free)
+  /// feature-encoder conv layers, the attention, the post-norm encoder, and the
+  /// CTC head hardcode the base-960h topology.
+  /// A config that deviates in *any* architecture-defining field would
+  /// otherwise be loaded into the wrong — or a silently bias-less — graph and
+  /// produce incorrect output without erroring. `validate` is the single gate
+  /// (called at the top of [`Wav2Vec2Ctc::from_weights`], and eagerly in
+  /// [`Wav2Vec2Ctc::load`] so a mismatch fails before the weights file is even
+  /// read) that pins every such field to its base-960h value.
   ///
-  /// Returns:
-  /// - [`Error::UnknownEnumValue`] if `feat_extract_norm != "group"` (the
-  ///   supported set is just `["group"]`);
-  /// - [`Error::InvariantViolation`] if `do_stable_layer_norm == true`.
+  /// Rejected (each as a typed error, never a panic or a silent mis-load):
+  /// - `feat_extract_norm != "group"` ([`Error::UnknownEnumValue`]) — only the
+  ///   group-norm feature-encoder arm is wired;
+  /// - `do_stable_layer_norm == true` ([`Error::InvariantViolation`]) — only
+  ///   the post-norm arm is wired;
+  /// - `conv_bias == true` ([`Error::InvariantViolation`]) — the feature-encoder
+  ///   conv layers store no bias and never add one, so a biased checkpoint
+  ///   would run silently wrong;
+  /// - `model_type != "wav2vec2"` ([`Error::UnknownEnumValue`]);
+  /// - any of `hidden_size`, `num_hidden_layers`, `num_attention_heads`,
+  ///   `intermediate_size`, `vocab_size`, `num_conv_pos_embeddings`,
+  ///   `num_conv_pos_embedding_groups`, `num_feat_extract_layers`, or the
+  ///   `conv_dim` / `conv_stride` / `conv_kernel` arrays not matching the
+  ///   base-960h architecture ([`Error::InvariantViolation`] for the scalars,
+  ///   [`Error::LengthMismatch`] for a wrong-length conv array, and
+  ///   [`Error::OutOfRange`] naming the first deviating conv element) — pinning
+  ///   the counts to their exact base-960h value also bounds them (a hostile or
+  ///   corrupt `num_hidden_layers` can never reach the per-layer allocation
+  ///   loop).
   pub fn validate(&self) -> Result<()> {
     if !self.is_group_norm() {
       return Err(Error::UnknownEnumValue(UnknownEnumValuePayload::new(
@@ -239,6 +295,87 @@ impl Wav2Vec2Config {
         "must be false (only the base-960h post-norm arm is supported)",
       )));
     }
+    // `ConvLayer` has no bias field and `forward` calls `conv1d` without
+    // adding one, so a `conv_bias == true` checkpoint would load (the bias
+    // tensors becoming unconsumed, silently-dropped keys) and run wrong.
+    if self.conv_bias {
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "Wav2Vec2Config: conv_bias",
+        "must be false (the base-960h feature-encoder convolutions are bias-free; this port adds no conv bias)",
+      )));
+    }
+    if self.model_type != BASE_960H_MODEL_TYPE {
+      return Err(Error::UnknownEnumValue(UnknownEnumValuePayload::new(
+        "Wav2Vec2Config: model_type",
+        self.model_type.as_str(),
+        &["wav2vec2"],
+      )));
+    }
+    // Architecture-defining scalars: the port builds exactly the base-960h
+    // graph and reads weight shapes from the checkpoint, so any deviation is a
+    // different (unsupported) architecture. Pinning the *counts*
+    // (num_hidden_layers / num_feat_extract_layers) to their exact value also
+    // bounds them, so an oversized count is rejected here, before the
+    // per-layer allocation loops in the builders.
+    check_eq_i32(
+      "Wav2Vec2Config: hidden_size",
+      self.hidden_size,
+      BASE_960H_HIDDEN_SIZE,
+    )?;
+    check_eq_i32(
+      "Wav2Vec2Config: num_hidden_layers",
+      self.num_hidden_layers,
+      BASE_960H_NUM_HIDDEN_LAYERS,
+    )?;
+    check_eq_i32(
+      "Wav2Vec2Config: num_attention_heads",
+      self.num_attention_heads,
+      BASE_960H_NUM_ATTENTION_HEADS,
+    )?;
+    check_eq_i32(
+      "Wav2Vec2Config: intermediate_size",
+      self.intermediate_size,
+      BASE_960H_INTERMEDIATE_SIZE,
+    )?;
+    check_eq_i32(
+      "Wav2Vec2Config: vocab_size",
+      self.vocab_size,
+      BASE_960H_VOCAB_SIZE,
+    )?;
+    check_eq_i32(
+      "Wav2Vec2Config: num_conv_pos_embeddings",
+      self.num_conv_pos_embeddings,
+      BASE_960H_NUM_CONV_POS_EMBEDDINGS,
+    )?;
+    check_eq_i32(
+      "Wav2Vec2Config: num_conv_pos_embedding_groups",
+      self.num_conv_pos_embedding_groups,
+      BASE_960H_NUM_CONV_POS_EMBEDDING_GROUPS,
+    )?;
+    check_eq_i32(
+      "Wav2Vec2Config: num_feat_extract_layers",
+      self.num_feat_extract_layers,
+      BASE_960H_NUM_FEAT_EXTRACT_LAYERS,
+    )?;
+    // The conv stack arrays: pin each to the base-960h shape/values. (Only
+    // `conv_dim[0]` and `conv_stride[i]` are actually consumed by the port —
+    // `conv_kernel` is implied by each checkpoint tensor — but a deviation in
+    // any of the three is a different architecture, so all three are pinned.)
+    check_eq_conv_array(
+      "Wav2Vec2Config: conv_dim",
+      &self.conv_dim,
+      &BASE_960H_CONV_DIM,
+    )?;
+    check_eq_conv_array(
+      "Wav2Vec2Config: conv_stride",
+      &self.conv_stride,
+      &BASE_960H_CONV_STRIDE,
+    )?;
+    check_eq_conv_array(
+      "Wav2Vec2Config: conv_kernel",
+      &self.conv_kernel,
+      &BASE_960H_CONV_KERNEL,
+    )?;
     Ok(())
   }
 
@@ -259,6 +396,47 @@ impl Wav2Vec2Config {
     }
     Ok(self.hidden_size / self.num_attention_heads)
   }
+}
+
+/// Reject a scalar config field whose value deviates from the single
+/// architecture this port implements, naming the field, the offending value,
+/// and the required base-960h value. Used by [`Wav2Vec2Config::validate`] to
+/// pin every architecture-defining scalar.
+#[cfg(feature = "wav2vec2")]
+fn check_eq_i32(field: &'static str, actual: i32, expected: i32) -> Result<()> {
+  if actual != expected {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      field,
+      "must match the base-960h architecture (this port supports only facebook/wav2vec2-base-960h)",
+      format_smolstr!("{actual} (expected {expected})"),
+    )));
+  }
+  Ok(())
+}
+
+/// Reject a conv-stack array (`conv_dim` / `conv_stride` / `conv_kernel`) that
+/// deviates from base-960h: a wrong length is [`Error::LengthMismatch`]; the
+/// first deviating element is [`Error::OutOfRange`] naming its index, value,
+/// and the expected value. Used by [`Wav2Vec2Config::validate`].
+#[cfg(feature = "wav2vec2")]
+fn check_eq_conv_array(field: &'static str, actual: &[i32], expected: &[i32]) -> Result<()> {
+  if actual.len() != expected.len() {
+    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+      field,
+      expected.len(),
+      actual.len(),
+    )));
+  }
+  for (i, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
+    if a != e {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        field,
+        "must match the base-960h architecture (this port supports only facebook/wav2vec2-base-960h)",
+        format_smolstr!("element {i} = {a} (expected {e})"),
+      )));
+    }
+  }
+  Ok(())
 }
 
 // ───────────────────────────── sanitize ─────────────────────────────
@@ -406,7 +584,11 @@ impl Vocab {
   ///   the legitimately empty `{}` map, which yields an empty [`Vocab`]);
   /// - an id exceeding the internal `MAX_VOCAB_ID` cap is rejected
   ///   ([`Error::CapExceeded`]) **before** the `id → token` table is
-  ///   allocated, so an enormous id can never drive an out-of-memory abort.
+  ///   allocated, so an enormous id can never drive an out-of-memory abort;
+  /// - two distinct tokens claiming the **same** id is rejected
+  ///   ([`Error::MalformedData`]); the source is a `HashMap`, so silently
+  ///   overwriting one slot would pick an arbitrary (per-run nondeterministic)
+  ///   survivor and corrupt the vocabulary.
   ///
   /// [voc]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/mms/mms.py#L155
   pub fn from_json(json: &str) -> Result<Self> {
@@ -451,7 +633,18 @@ impl Vocab {
         )));
       }
       // `0 <= id <= max_id <= MAX_VOCAB_ID`, so the index is in bounds.
-      id_to_token[id as usize] = Some(token);
+      let slot = &mut id_to_token[id as usize];
+      if slot.is_some() {
+        // Two distinct tokens claim the same id. The source is a `HashMap`, so
+        // a bare `slot = Some(token)` would let an arbitrary survivor (per-run
+        // nondeterministic) silently overwrite the other — corrupting the
+        // vocabulary. Reject it instead.
+        return Err(Error::MalformedData(MalformedDataPayload::new(
+          "Vocab::from_json",
+          "vocab.json maps two distinct tokens to the same id",
+        )));
+      }
+      *slot = Some(token);
     }
     Ok(Self { id_to_token })
   }
