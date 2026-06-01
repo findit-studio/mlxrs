@@ -174,6 +174,84 @@ fn ctc_empty_time_axis_is_empty_transcription() {
   assert_eq!(out.segments_slice()[0].text(), "");
 }
 
+/// A CTC mock whose `decode_ids(&[])` (the EMPTY id slice) returns a non-empty
+/// sentinel `"<empty>"`. Its `logits` shape is scriptable so one model instance
+/// drives both the empty-time `(0, vocab)` and the all-blank `(T>0, vocab)`
+/// collapse paths; both must collapse to zero surviving ids and so must reach
+/// `decode_ids(&[])`, proving the two "no surviving ids" paths render the SAME
+/// text rather than one hard-coding `String::new()`.
+struct SentinelCtc {
+  logits: Array,
+  blank_id: u32,
+}
+
+impl SentinelCtc {
+  /// All-blank grid: `t` frames, `vocab`-wide, every frame's argmax == `blank`
+  /// (so the collapse drops every id and the survivor set is empty). `t == 0`
+  /// yields the empty-time `(0, vocab)` grid.
+  fn all_blank(t: usize, vocab: usize, blank: u32) -> Self {
+    let mut data = vec![0.0_f32; t * vocab];
+    for frame in 0..t {
+      data[frame * vocab + blank as usize] = 1.0;
+    }
+    let logits = Array::from_slice::<f32>(&data, &[t as i32, vocab as i32]).unwrap();
+    Self {
+      logits,
+      blank_id: blank,
+    }
+  }
+}
+
+impl CtcModel for SentinelCtc {
+  fn logits(&self, _waveform: &Array) -> Result<Array> {
+    self.logits.try_clone()
+  }
+  fn blank_id(&self) -> u32 {
+    self.blank_id
+  }
+  fn decode_ids(&self, ids: &[u32]) -> String {
+    // A model whose detokenizer emits a sentinel for the empty id sequence: if
+    // the empty-time branch hard-coded `String::new()` instead of routing
+    // through here, the two empty-collapse paths would disagree.
+    if ids.is_empty() {
+      "<empty>".to_string()
+    } else {
+      ids.iter().map(|&i| (b'a' + i as u8) as char).collect()
+    }
+  }
+}
+
+#[test]
+fn ctc_empty_time_and_all_blank_render_identical_via_decode_ids() {
+  // Two semantically-identical "no surviving ids" inputs must produce the SAME
+  // transcript because BOTH route their empty collapse through
+  // `decode_ids(&[])`:
+  //   (a) empty-time `(0, vocab)` — no frames at all.
+  //   (b) all-blank `(T>0, vocab)` — frames exist but every argmax is the blank
+  //       id, so the collapse leaves zero survivors.
+  // With a model whose `decode_ids(&[])` returns the sentinel "<empty>", both
+  // paths must yield "<empty>" (NOT an empty string for the empty-time path).
+  let blank = 0;
+  let vocab = 4;
+
+  let empty_time = SentinelCtc::all_blank(0, vocab, blank);
+  let out_empty = greedy_ctc_transcribe(&empty_time, &dummy_waveform(), &TranscribeOptions::new())
+    .expect("empty-time CTC");
+
+  let all_blank = SentinelCtc::all_blank(5, vocab, blank);
+  let out_blank = greedy_ctc_transcribe(&all_blank, &dummy_waveform(), &TranscribeOptions::new())
+    .expect("all-blank CTC");
+
+  // Both reach `decode_ids(&[])` -> the sentinel, and they agree.
+  assert_eq!(out_empty.text(), "<empty>");
+  assert_eq!(out_blank.text(), "<empty>");
+  assert_eq!(out_empty.text(), out_blank.text());
+  // The single untimed segment carries the same sentinel text.
+  assert_eq!(out_empty.segments_slice().len(), 1);
+  assert_eq!(out_empty.segments_slice()[0].text(), "<empty>");
+  assert_eq!(out_blank.segments_slice()[0].text(), "<empty>");
+}
+
 #[test]
 fn ctc_rejects_rank2_waveform() {
   // A 2-D waveform is rejected (RankMismatch) BEFORE the encoder forward — it
@@ -632,6 +710,74 @@ fn greedy_rejects_eot_outside_vocab() {
   assert!(matches!(err, Error::OutOfRange(_)));
   // `eot` is read exactly once (cached in a local), not per loop iteration.
   assert_eq!(model.eot_calls.get(), 1);
+}
+
+/// An autoregressive mock whose per-step logits WIDTH is scripted, to prove the
+/// `eot` range-check re-runs against EVERY step's vocab (not once via a latch).
+/// Step `k` (0-based) returns a `(widths[k],)` one-hot row whose argmax is class
+/// `1` (always in range, so the loop reaches the eot check and never stops on
+/// `next == eot`). A `Cell` advances the step index. With `eot` between two
+/// widths (e.g. `eot = 4`, widths `[5, 3]`), step 0 passes (`4 < 5`) but step 1
+/// is out of range (`4 >= 3`) — a one-shot latch would miss it and loop to
+/// `max_context`.
+struct ShrinkingVocab {
+  widths: Vec<usize>,
+  eot: u32,
+  step: Cell<usize>,
+}
+
+impl AutoregressiveStt for ShrinkingVocab {
+  type Cache = ();
+  fn encode(&self, mel: &Array) -> Result<Array> {
+    mel.try_clone()
+  }
+  fn new_cache(&self) {}
+  fn decode_step(&self, _c: &mut (), _e: &Array, _t: &[u32]) -> Result<Array> {
+    let k = self.step.get();
+    self.step.set(k + 1);
+    // Past the script, keep the last width (the loop should already have
+    // errored on the shrunk step, so this is only a safety net).
+    let vocab = self
+      .widths
+      .get(k)
+      .copied()
+      .unwrap_or(*self.widths.last().unwrap());
+    let mut row = vec![0.0_f32; vocab];
+    // argmax class 1 — in range for every scripted width (all >= 2), so the
+    // loop never stops via the argmax and always reaches the eot range-check.
+    row[1] = 1.0;
+    Array::from_slice::<f32>(&row, &[vocab as i32])
+  }
+  fn initial_tokens(&self, _o: &TranscribeOptions) -> Result<Vec<u32>> {
+    Ok(vec![0])
+  }
+  fn eot(&self) -> u32 {
+    self.eot
+  }
+}
+
+#[test]
+fn greedy_revalidates_eot_against_each_step_vocab() {
+  // FIX: the `eot` range-check runs per step, not once. A model whose vocab
+  // SHRINKS on a later step (passing the check on the first, larger step) must
+  // still be rejected when `eot` falls out of the smaller step's range —
+  // otherwise `next == eot` can never fire and the loop runs to `max_context`.
+  //
+  // eot = 4; step 0 width 5 (4 < 5, passes); step 1 width 3 (4 >= 3, rejected).
+  let model = ShrinkingVocab {
+    widths: vec![5, 3],
+    eot: 4,
+    step: Cell::new(0),
+  };
+  let err = greedy_transcribe(&model, &speech_waveform(), &TranscribeOptions::new()).unwrap_err();
+  // Rejected with the typed OutOfRange at the shrunk step (NOT run to
+  // max_context returning bogus output).
+  assert!(matches!(err, Error::OutOfRange(_)));
+  // The loop reached exactly step 1 (the second `decode_step`) before erroring:
+  // step 0 passed the check, step 1's row was produced then rejected. The step
+  // counter therefore advanced past both (2), proving the FIRST step did NOT
+  // error and the per-step re-check is what caught it.
+  assert_eq!(model.step.get(), 2);
 }
 
 /// A tracker mock that records whether its `log_mel` and `encode` frontend

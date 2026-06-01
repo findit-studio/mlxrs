@@ -217,13 +217,17 @@ pub fn greedy_ctc_transcribe<M: CtcModel + ?Sized>(
     )));
   }
   // Empty time axis `(0, vocab)`: no frames to collapse → an empty
-  // transcription (an explicit, non-panicking definition).
+  // transcription (an explicit, non-panicking definition). Route the empty
+  // collapse through `decode_ids(&[])` — exactly as the all-blank path below
+  // does — so the two semantically-identical "no surviving ids" inputs produce
+  // identical text (a model whose `decode_ids(&[])` emits a sentinel must not
+  // disagree between an empty-time and an all-blank input). The blank-id range
+  // check above already precedes this branch, so reaching `decode_ids` here is
+  // sound.
   if shape[0] == 0 {
-    return Ok(Transcription::new(
-      String::new(),
-      None,
-      vec![Segment::new(String::new(), 0.0, 0.0)],
-    ));
+    let text = model.decode_ids(&[]);
+    let segments = vec![Segment::new(text.clone(), 0.0, 0.0)];
+    return Ok(Transcription::new(text, None, segments));
   }
 
   // Per-frame argmax over the vocab axis → `(T',)` class ids.
@@ -260,9 +264,12 @@ pub fn greedy_ctc_transcribe<M: CtcModel + ?Sized>(
 /// 5. Greedy loop: [`AutoregressiveStt::decode_step`] → `(vocab,)` next-token
 ///    logits, take `argmax`, stop at [`AutoregressiveStt::eot`], else append
 ///    and continue. The [`AutoregressiveStt::eot`] id is read once and
-///    range-checked against the decoder's actual vocab axis the first step (an
-///    `eot` outside `[0, vocab)` can never be produced by `argmax`, so it is a
-///    typed [`Error::OutOfRange`] rather than a never-stopping loop).
+///    range-checked against EVERY step's actual vocab axis (an `eot` outside
+///    `[0, vocab)` can never be produced by `argmax`, so it is a typed
+///    [`Error::OutOfRange`] rather than a never-stopping loop). The check runs
+///    per step — not once — so an interior-mutable model that shrinks its vocab
+///    on a later step (making `eot` out of range there) is still rejected
+///    rather than looping to `max_context`.
 ///
 /// The loop is bounded by the model's [`AutoregressiveStt::max_context`]: it
 /// generates AT MOST `max_context - prompt.len()` new tokens, so
@@ -315,15 +322,9 @@ pub fn greedy_transcribe<M: AutoregressiveStt + ?Sized>(
   // Read the model-provided end-of-transcript id EXACTLY ONCE. `eot` is `&self`
   // and the loop compares every `argmax` against it; capturing it in a local
   // means a later mutation of the model can't swap the stop token mid-decode.
-  // It is range-checked below once the vocab axis is known.
+  // The VALUE is read once here; its range-check (below) runs per step against
+  // that step's own vocab axis.
   let eot = m.eot();
-  // Range-check `eot` against the ACTUAL logits vocab the first time we see it.
-  // `eot` is captured before any `decode_step`, so the vocab length is unknown
-  // here; an `eot >= vocab` can never equal a per-frame `argmax` (always in
-  // `0..vocab`), so the loop would silently never stop and return bogus
-  // full-length output. We validate it against the first step's `(vocab,)` row
-  // and reject out-of-range with a typed error before relying on it to stop.
-  let mut eot_checked = false;
 
   // At most this many new tokens, so the total never exceeds `max_ctx`.
   let max_new = max_ctx - prompt_len;
@@ -349,21 +350,23 @@ pub fn greedy_transcribe<M: AutoregressiveStt + ?Sized>(
       )));
     }
 
-    // Now the vocab axis is known: range-check the cached `eot` once. An
-    // `eot >= vocab_len` could never be produced by `argmax`, so the loop's
+    // Range-check the cached `eot` against THIS step's vocab axis, every step.
+    // An `eot >= vocab_len` could never be produced by `argmax`, so the loop's
     // `next == eot` stop condition would never fire — reject it with a typed
     // error instead of running to `max_context` and returning bogus output.
-    if !eot_checked {
-      if (eot as usize) >= vocab_len {
-        return Err(Error::OutOfRange(OutOfRangePayload::new(
-          "stt AutoregressiveStt::eot",
-          "must be < the decode_step logits vocab size (an eot outside the \
-             vocab axis can never be produced by argmax, so the greedy loop \
-             would never stop)",
-          eot.to_string(),
-        )));
-      }
-      eot_checked = true;
+    // Re-checking per step (not once via a latch) defends against an
+    // interior-mutable model that returns a large vocab on an early step
+    // (passing) then a SMALLER vocab on a later step where `eot` is out of
+    // range. It is a single `usize` compare per step (negligible); a
+    // consistent-vocab model never triggers it.
+    if (eot as usize) >= vocab_len {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "stt AutoregressiveStt::eot",
+        "must be < the decode_step logits vocab size (an eot outside the \
+           vocab axis can never be produced by argmax, so the greedy loop \
+           would never stop)",
+        eot.to_string(),
+      )));
     }
 
     // Greedy argmax over the vocab axis; the only materialization.
