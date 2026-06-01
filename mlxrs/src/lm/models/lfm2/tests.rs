@@ -400,6 +400,45 @@ fn attention_index_out_of_range_rejected() {
 }
 
 #[test]
+fn attention_indices_reject_over_cap_full_attn_idxs() {
+  // A tiny `num_hidden_layers` paired with a `full_attn_idxs` longer than the
+  // realistic `MAX_CONFIG_CARDINALITY` cap would drive a large host allocation
+  // (the wholesale clone) before any index is range-checked. The length is
+  // bounded up front and rejected as a recoverable CapExceeded. Every entry is
+  // in range (`0`), so this isolates the *length* guard from the per-index one.
+  let over = (MAX_CONFIG_CARDINALITY as usize) + 1;
+  let idxs = vec!["0"; over].join(",");
+  let json = format!(r#"{{"num_hidden_layers": 2, "full_attn_idxs": [{idxs}]}}"#);
+  let cfg = TextConfig::from_json(&json).unwrap();
+  assert!(matches!(
+    cfg.attention_layer_indices(),
+    Err(Error::CapExceeded(_))
+  ));
+  // Exactly at the cap is admitted (the length guard alone passes); every entry
+  // is index 0 so the per-index range check also passes.
+  let at = vec!["0"; MAX_CONFIG_CARDINALITY as usize].join(",");
+  let at_json = format!(r#"{{"num_hidden_layers": 2, "full_attn_idxs": [{at}]}}"#);
+  let at_cfg = TextConfig::from_json(&at_json).unwrap();
+  assert!(at_cfg.attention_layer_indices().is_ok());
+}
+
+#[test]
+fn attention_indices_reject_over_cap_layer_types() {
+  // The `layer_types` collect path is bounded the same way: a per-layer list
+  // longer than the cap is a recoverable CapExceeded before the
+  // `"full_attention"` filter allocates. Entries are all `"conv"` so no index
+  // is ever produced — this isolates the source-length guard.
+  let over = (MAX_CONFIG_CARDINALITY as usize) + 1;
+  let types = vec!["\"conv\""; over].join(",");
+  let json = format!(r#"{{"num_hidden_layers": 2, "layer_types": [{types}]}}"#);
+  let cfg = TextConfig::from_json(&json).unwrap();
+  assert!(matches!(
+    cfg.attention_layer_indices(),
+    Err(Error::CapExceeded(_))
+  ));
+}
+
+#[test]
 fn validate_rejects_zero_negative_nondivisible_and_oversized() {
   // A divisible base (hidden 8 / heads 2 = head_dim 4; heads 2 / kv 2) so each
   // case below isolates a single malformed field on an otherwise-sound config.
@@ -601,19 +640,28 @@ fn validate_bounds_conv_l_cache_as_a_cardinality() {
 
 #[test]
 fn lengths_positions_builds_clamped_index_rows() {
-  // `lengths_positions(ends, n_keep)` materializes the `[B, n_keep, 1]` index
-  // `(ends[:, None] + arange(n_keep))[..., None]` consumed by the cached-state
-  // `take_along_axis`. Verify the closed form directly (independent of the code
-  // under test): row `b` is `ends[b], ends[b]+1, .., ends[b]+n_keep-1`.
-  let ends = [0_i32, 2, 5];
+  // `lengths_positions(lengths, t, n_keep)` materializes the `[B, n_keep, 1]`
+  // index `(clip(lengths, 0, t)[:, None] + arange(n_keep))[..., None]` consumed
+  // by the cached-state `take_along_axis`. Verify the closed form directly
+  // (independent of the code under test): row `b` is
+  // `clip(lengths[b],0,t), .., clip(lengths[b],0,t)+n_keep-1`. Here `t == 5` is
+  // at/above every length, so the clamp is a no-op.
+  let lengths = [0_i32, 2, 5];
+  let t = 5;
   let n_keep = 2;
-  let mut idx = lengths_positions(&ends, n_keep).unwrap();
+  let mut idx = lengths_positions(&lengths, t, n_keep).unwrap();
   assert_eq!(idx.shape(), vec![3, 2, 1]);
   assert_eq!(idx.to_vec::<i32>().unwrap(), vec![0, 1, 2, 3, 5, 6]);
 
+  // The `clip(_, 0, t)` is folded into the build: a length above `t` is clamped
+  // down to `t`, a negative one up to `0`. With `t == 3`, `5 -> 3` and `-1 -> 0`.
+  let clamped = [-1_i32, 2, 5];
+  let mut clipped = lengths_positions(&clamped, 3, n_keep).unwrap();
+  assert_eq!(clipped.to_vec::<i32>().unwrap(), vec![0, 1, 2, 3, 3, 4]);
+
   // `n_keep == 0` (a `conv_L_cache == 1` pointwise kernel) yields an empty
   // `[B, 0, 1]` index with no host allocation driven past zero.
-  let mut empty = lengths_positions(&ends, 0).unwrap();
+  let mut empty = lengths_positions(&lengths, t, 0).unwrap();
   assert_eq!(empty.shape(), vec![3, 0, 1]);
   assert!(empty.to_vec::<i32>().unwrap().is_empty());
 }
@@ -628,8 +676,9 @@ fn lengths_positions_host_build_is_bounded_by_the_cap() {
   // batch and confirm the closed-form shape / first-row contents.
   let n_keep = MAX_CONV_L_CACHE - 1; // the widest window the cap admits
   let batch = 64;
-  let ends: Vec<i32> = (0..batch).collect();
-  let mut idx = lengths_positions(&ends, n_keep).unwrap();
+  let lengths: Vec<i32> = (0..batch).collect();
+  // `t` at/above every length so the folded clamp is a no-op for this shape check.
+  let mut idx = lengths_positions(&lengths, batch, n_keep).unwrap();
   assert_eq!(idx.shape(), vec![batch as usize, n_keep as usize, 1]);
   let flat = idx.to_vec::<i32>().unwrap();
   assert_eq!(flat.len(), batch as usize * n_keep as usize);
@@ -637,6 +686,39 @@ fn lengths_positions_host_build_is_bounded_by_the_cap() {
   assert_eq!(flat[0], 0);
   assert_eq!(flat[n_keep as usize - 1], n_keep - 1);
   assert_eq!(flat[n_keep as usize], 1);
+}
+
+#[test]
+fn shortconv_lengths_mismatch_with_batch_is_rejected() {
+  // `cache.lengths` must carry exactly one entry per batch row. A mismatched
+  // length would otherwise build a host index whose batch axis disagrees with
+  // `Bx` and fail deep inside `take_along_axis`; `ShortConv::forward` rejects it
+  // up front as a typed LengthMismatch. The input is batch 1, so a 2-entry (and
+  // a 0-entry) `lengths` are both mismatches.
+  let (in_w, conv_w, out_w, hidden, k) = sample_weights();
+  let conv = make_shortconv(&in_w, &conv_w, &out_w, hidden, k);
+  let x = sample_input(); // batch 1, L 5, hidden 2
+  let arr = x_to_array(&x);
+  let t = x[0].len() as i32;
+
+  let mut too_many = ArraysCache::new(1);
+  too_many.prepare(&[t, t]); // 2 entries vs batch 1
+  assert!(matches!(
+    conv.forward(&arr, None, Some(&mut too_many)),
+    Err(Error::LengthMismatch(_))
+  ));
+
+  let mut too_few = ArraysCache::new(1);
+  too_few.prepare(&[]); // 0 entries vs batch 1
+  assert!(matches!(
+    conv.forward(&arr, None, Some(&mut too_few)),
+    Err(Error::LengthMismatch(_))
+  ));
+
+  // The matching-length path (1 entry, batch 1) is accepted.
+  let mut ok = ArraysCache::new(1);
+  ok.prepare(&[t]);
+  assert!(conv.forward(&arr, None, Some(&mut ok)).is_ok());
 }
 
 // ───────────────────────── cache cardinality ─────────────────────────

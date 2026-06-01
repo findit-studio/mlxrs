@@ -397,31 +397,76 @@ impl TextConfig {
   /// `layer_types` entry is `"full_attention"`, else (no `layer_types`) the
   /// empty set — every layer is a conv layer.
   ///
-  /// Indices outside `[0, num_hidden_layers)` are rejected (a malformed
-  /// config would otherwise mis-key the cache / mask precomputation).
+  /// Each source list is a per-layer description, so its length is bounded by
+  /// the realistic `MAX_CONFIG_CARDINALITY` cap **before** the derived `Vec` is
+  /// built: a malformed config (a tiny `num_hidden_layers` paired with a huge
+  /// `full_attn_idxs` / `layer_types`) would otherwise drive a large host
+  /// allocation — the wholesale clone of `full_attn_idxs`, or the
+  /// `"full_attention"` collect over `layer_types` — before any index is
+  /// range-checked. An over-cap length is a recoverable [`Error::CapExceeded`];
+  /// the derived `Vec` is then [`reserve_or_error`]'d and each index validated
+  /// against `[0, num_hidden_layers)` as it is appended (an out-of-range index
+  /// is [`Error::OutOfRange`], since it would otherwise mis-key the cache / mask
+  /// precomputation).
   pub fn attention_layer_indices(&self) -> Result<Vec<i32>> {
     let n = self.num_hidden_layers;
-    let idxs = match (&self.full_attn_idxs, &self.layer_types) {
-      (Some(explicit), _) => explicit.clone(),
-      (None, Some(types)) => types
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| t.as_str() == "full_attention")
-        .map(|(i, _)| i as i32)
-        .collect(),
-      (None, None) => Vec::new(),
-    };
-    for &i in &idxs {
-      if i < 0 || i >= n {
-        return Err(Error::OutOfRange(OutOfRangePayload::new(
-          "TextConfig: attention layer index (must be in [0, num_hidden_layers))",
-          "in [0, num_hidden_layers)",
-          format_smolstr!("idx={i}, num_hidden_layers={n}"),
-        )));
+    let mut idxs: Vec<i32> = Vec::new();
+    match (&self.full_attn_idxs, &self.layer_types) {
+      (Some(explicit), _) => {
+        // Bound the source length before cloning so a hostile `full_attn_idxs`
+        // cannot over-allocate; an empty list (no attention layers) is valid
+        // and needs no cap check.
+        if !explicit.is_empty() {
+          require_cardinality(
+            "full_attn_idxs length",
+            explicit.len() as i64,
+            MAX_CONFIG_CARDINALITY as u64,
+          )?;
+          reserve_or_error(&mut idxs, "attention layer index", explicit.len())?;
+        }
+        for &i in explicit {
+          idxs.push(checked_attention_index(i, n)?);
+        }
       }
+      (None, Some(types)) => {
+        // Bound the per-layer list length before the `"full_attention"` collect
+        // so a hostile `layer_types` cannot over-allocate. The enumerate index
+        // stays within `i32` because the cap (`4096`) is well below `i32::MAX`.
+        if !types.is_empty() {
+          require_cardinality(
+            "layer_types length",
+            types.len() as i64,
+            MAX_CONFIG_CARDINALITY as u64,
+          )?;
+          reserve_or_error(&mut idxs, "attention layer index", types.len())?;
+        }
+        for (i, t) in types.iter().enumerate() {
+          if t.as_str() == "full_attention" {
+            idxs.push(checked_attention_index(i as i32, n)?);
+          }
+        }
+      }
+      (None, None) => {}
     }
     Ok(idxs)
   }
+}
+
+/// Validate one attention-layer index against `[0, num_hidden_layers)`,
+/// returning it unchanged when in range and [`Error::OutOfRange`] otherwise.
+///
+/// Used by [`TextConfig::attention_layer_indices`] to reject an out-of-range
+/// index **as it is appended** (a malformed index would otherwise mis-key the
+/// cache / mask precomputation).
+fn checked_attention_index(idx: i32, num_hidden_layers: i32) -> Result<i32> {
+  if idx < 0 || idx >= num_hidden_layers {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "TextConfig: attention layer index (must be in [0, num_hidden_layers))",
+      "in [0, num_hidden_layers)",
+      format_smolstr!("idx={idx}, num_hidden_layers={num_hidden_layers}"),
+    )));
+  }
+  Ok(idx)
 }
 
 /// Whether layer `idx` is an attention layer, given the sorted attention
@@ -627,10 +672,21 @@ impl ShortConv {
         // `cache.lengths` via `take_along_axis` when set.
         let new_state = match cache.lengths() {
           Some(lengths) => {
-            // `ends = clip(lengths, 0, t); positions = (ends[:,None] +
-            // arange(n_keep))[...,None]`.
-            let ends: Vec<i32> = lengths.iter().map(|&v| v.clamp(0, t)).collect();
-            let positions = lengths_positions(&ends, n_keep)?;
+            // `positions = (clip(lengths, 0, t)[:, None] +
+            // arange(n_keep))[..., None]`. `lengths` must carry exactly one
+            // entry per batch row; a mismatch would otherwise build an index
+            // whose batch axis disagrees with `Bx` and fail deep inside
+            // `take_along_axis` instead of as a typed error here.
+            if lengths.len() != batch as usize {
+              return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+                "ShortConv::forward: cache.lengths length vs batch",
+                batch as usize,
+                lengths.len(),
+              )));
+            }
+            // The clamp is folded into the checked/reserved host-index loop so
+            // no separate (infallible) `ends` buffer is allocated first.
+            let positions = lengths_positions(lengths, t, n_keep)?;
             take_along_axis(&bx_cat, &positions, 1)?
           }
           None => {
@@ -673,48 +729,54 @@ impl ShortConv {
   }
 }
 
-/// `(ends[:, None] + arange(n_keep))[..., None]` as an `I32` `[B, n_keep, 1]`
-/// index array for `take_along_axis(_, axis=1)`.
+/// `(clip(lengths, 0, t)[:, None] + arange(n_keep))[..., None]` as an `I32`
+/// `[B, n_keep, 1]` index array for `take_along_axis(_, axis=1)`.
 ///
-/// `n_keep` is `conv_L_cache - 1`, bounded small by [`MAX_CONV_L_CACHE`]; `ends`
-/// is one entry per batch row. The host buffer is sized `B * n_keep` — both
-/// factors are non-negative (`n_keep >= 0` since `conv_L_cache >= 1`), but the
-/// element count is still **checked** and **fallibly reserved** so no
-/// config / batch combination can drive an unbounded allocation that aborts
-/// before a typed error: the `B * n_keep` product goes through `usize`
-/// [`checked_mul`]-style overflow detection, [`reserve_or_error`] turns an
-/// allocator failure into [`Error::AllocFailure`], and each `e + k` index goes
-/// through [`checked_add`] so a near-`i32::MAX` clamped length cannot wrap.
-fn lengths_positions(ends: &[i32], n_keep: i32) -> Result<Array> {
+/// `n_keep` is `conv_L_cache - 1`, bounded small by [`MAX_CONV_L_CACHE`];
+/// `lengths` is one entry per batch row (the caller has already asserted
+/// `lengths.len() == batch`). The per-row clamp `clip(lengths, 0, t)` is folded
+/// into the build loop so no separate (infallible) `ends` buffer is allocated
+/// first. The host buffer is sized `B * n_keep` — both factors are non-negative
+/// (`n_keep >= 0` since `conv_L_cache >= 1`), but the element count is still
+/// **checked** and **fallibly reserved** so no config / batch combination can
+/// drive an unbounded allocation that aborts before a typed error: the
+/// `B * n_keep` product goes through `usize` [`checked_mul`]-style overflow
+/// detection, [`reserve_or_error`] turns an allocator failure into
+/// [`Error::AllocFailure`], and each clamped `end + k` index goes through
+/// [`checked_add`] so a near-`i32::MAX` clamped length cannot wrap.
+fn lengths_positions(lengths: &[i32], t: i32, n_keep: i32) -> Result<Array> {
   // `n_keep >= 0` (guaranteed by the `conv_L_cache >= 1` cap) so the cast is
   // lossless; size the host index buffer with a checked `usize` multiply.
   let n_keep_usize = n_keep as usize;
-  let capacity = ends.len().checked_mul(n_keep_usize).ok_or_else(|| {
+  let capacity = lengths.len().checked_mul(n_keep_usize).ok_or_else(|| {
     Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
       "lengths_positions: B * (conv_L_cache - 1) index count",
       "usize",
       [
-        ("batch", ends.len() as u64),
+        ("batch", lengths.len() as u64),
         ("n_keep", n_keep_usize as u64),
       ],
     ))
   })?;
   let mut data: Vec<i32> = Vec::new();
   reserve_or_error(&mut data, "conv cache position index", capacity)?;
-  for &e in ends {
+  for &length in lengths {
+    // `clip(length, 0, t)` — `t = x.shape[1] >= 0`, so the clamp result is in
+    // `[0, t]` and thus non-negative.
+    let end = length.clamp(0, t);
     for k in 0..n_keep {
-      // `e` is a length clamped to `[0, t]`; `k < n_keep`. Both non-negative,
-      // but guard the sum so a near-`i32::MAX` clamp cannot wrap into UB.
+      // `end` is clamped to `[0, t]`; `k < n_keep`. Both non-negative, but
+      // guard the sum so a near-`i32::MAX` clamp cannot wrap into UB.
       data.push(checked_add(
         "lengths_positions: end + offset",
         "end",
-        e,
+        end,
         "offset",
         k,
       )?);
     }
   }
-  Array::from_slice::<i32>(&data, &(ends.len(), n_keep_usize, 1usize))
+  Array::from_slice::<i32>(&data, &(lengths.len(), n_keep_usize, 1usize))
 }
 
 /// A zeros array of the given shape cast to `dtype` (the conv state's dtype
