@@ -77,7 +77,7 @@ use glob::{MatchOptions, glob_with};
 use crate::error::RankMismatchPayload;
 use crate::{
   array::Array,
-  embeddings::{config::StPoolingConfig, model::EmbeddingModel},
+  embeddings::{config::StPoolingConfig, embed::EmbeddingModel},
   error::{
     CapExceededPayload, EmptyInputPayload, Error, FileIoPayload, FileOp, MissingFieldPayload,
     ParsePayload, Result, UnknownEnumValuePayload,

@@ -323,7 +323,10 @@ fn validate_rejects_oversize_pixel_values_product() {
   let json = BASE_CONFIG_JSON.replace(r#""patch_size": 16"#, r#""patch_size": 591"#);
   let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
   // Sanity: each per-axis cap is individually satisfied at patch_size 591.
-  assert_eq!(cfg.vision_config.patch_feature_dim().unwrap(), 3 * 591 * 591);
+  assert_eq!(
+    cfg.vision_config.patch_feature_dim().unwrap(),
+    3 * 591 * 591
+  );
   assert_eq!(cfg.vision_config.max_num_patches(), 256);
   let err = cfg.validate().unwrap_err();
   match err {

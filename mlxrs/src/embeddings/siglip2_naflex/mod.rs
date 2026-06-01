@@ -42,10 +42,13 @@
 //! [`encode_image`](Siglip2NaflexModel::encode_image) /
 //! [`encode_text`](Siglip2NaflexModel::encode_text) producing L2-normalized
 //! embeddings and [`logits`](Siglip2NaflexModel::logits) computing the
-//! `logit_scale` / `logit_bias` contrastive similarity. The model also
-//! implements [`crate::embeddings::EmbeddingModel`] (its `forward` runs the
-//! text tower) so it registers into the
-//! [`crate::embeddings::EmbeddingModelTypeRegistry`] via [`register`].
+//! `logit_scale` / `logit_bias` contrastive similarity. It implements the golden
+//! embedding traits — [`Embed<TextInput>`](crate::embeddings::Embed) +
+//! `Embed<ImageInput>` + [`Contrastive`](crate::embeddings::Contrastive) — and
+//! answers the load factory's [`crate::embeddings::EmbeddingModel`] umbrella
+//! (text + contrastive accessors; the image tower is reached by downcast), so it
+//! registers into the [`crate::embeddings::EmbeddingModelTypeRegistry`] via
+//! [`register`].
 
 #[cfg(feature = "siglip2-naflex")]
 #[cfg_attr(docsrs, doc(cfg(feature = "siglip2-naflex")))]
@@ -73,8 +76,9 @@ use std::collections::HashMap;
 use crate::{
   array::Array,
   embeddings::{
-    EmbeddingModel, EmbeddingModelConstructor, EmbeddingModelOutput, EmbeddingModelTypeRegistry,
-    LoadedEmbeddingModel, SWIFT_L2_EPS, l2_normalize_eps,
+    Contrastive, Embed, Embedding, EmbeddingModel, EmbeddingModelConstructor,
+    EmbeddingModelTypeRegistry, LoadedEmbeddingModel, SWIFT_L2_EPS, TextEmbedder, TextInput,
+    l2_normalize_eps,
     siglip2_naflex::{
       config::Siglip2NaflexConfig, processing::NaflexInputs, shared::take_shaped, text::TextTower,
       vision::VisionTower,
@@ -338,24 +342,62 @@ pub fn register(registry: &mut EmbeddingModelTypeRegistry) -> Option<EmbeddingMo
   registry.register(MODEL_TYPE, constructor())
 }
 
-/// The text-tower forward seam: SigLIP2's text encoder maps a `(batch,
-/// seq_len)` token-id batch to its sticky-EOS pooled projection.
+/// SigLIP2's image input modality for [`Embed`]: a preprocessed NaFlex image
+/// ([`NaflexInputs`]).
 ///
-/// `forward`'s `last_hidden_state` is the projected pooled embedding lifted to
-/// `(batch, 1, projection_size)` (the `EmbeddingModelOutput` contract requires
-/// a rank-3 hidden state), with the same vector also exposed as
-/// `pooled_output`. `attention_mask` is ignored: SigLIP's sticky-EOS pooling
-/// reads the last position regardless (it pads with a real token and does not
-/// mask), matching `siglip.py`'s `attention_mask=None` text path.
+/// Image inputs are model-defined — a fixed-resolution model would use a
+/// different type — so SigLIP owns this newtype; there is no universal
+/// `dyn ImageEmbedder`. Reach the image tower from a loaded
+/// [`crate::embeddings::EmbeddingModel`] by downcasting to [`Siglip2NaflexModel`]
+/// and calling [`encode_image`](Siglip2NaflexModel::encode_image) (or this
+/// `Embed` impl).
+#[cfg(feature = "siglip2-naflex")]
+pub struct ImageInput<'a>(pub &'a NaflexInputs);
+
+/// Text tower as the universal text modality: a `(batch, seq_len)` token-id
+/// batch → its L2-normalized text embedding (the sticky-EOS pooled projection —
+/// SigLIP's real text feature, not a generic pool). The padding mask is unused
+/// (sticky-EOS reads the last position regardless), matching `siglip.py`'s
+/// `attention_mask=None` text path.
+#[cfg(feature = "siglip2-naflex")]
+impl<'a> Embed<TextInput<'a>> for Siglip2NaflexModel {
+  type Output = Embedding;
+  fn embed(&self, input: TextInput<'a>) -> Result<Embedding> {
+    Ok(Embedding::new(self.encode_text(input.token_ids())?))
+  }
+}
+
+/// Vision tower: a preprocessed NaFlex image → its L2-normalized image embedding.
+#[cfg(feature = "siglip2-naflex")]
+impl<'a> Embed<ImageInput<'a>> for Siglip2NaflexModel {
+  type Output = Embedding;
+  fn embed(&self, input: ImageInput<'a>) -> Result<Embedding> {
+    Ok(Embedding::new(self.encode_image(input.0)?))
+  }
+}
+
+/// Contrastive similarity — `logits_per_text` over the two already-L2-normalized
+/// embeddings (`exp(logit_scale) * text @ image.T + logit_bias`).
+#[cfg(feature = "siglip2-naflex")]
+impl Contrastive for Siglip2NaflexModel {
+  fn similarity(&self, text: &Embedding, image: &Embedding) -> Result<Array> {
+    self.logits(text.array(), image.array())
+  }
+}
+
+/// SigLIP2 answers the load factory umbrella's universal text + contrastive
+/// capabilities; its image tower (a model-defined input) is reached by downcast
+/// via [`as_any`](crate::embeddings::EmbeddingModel::as_any).
 #[cfg(feature = "siglip2-naflex")]
 impl EmbeddingModel for Siglip2NaflexModel {
-  fn forward(&self, input_ids: &Array, _attention_mask: &Array) -> Result<EmbeddingModelOutput> {
-    // The text tower already returns the pooled (batch, projection_size)
-    // embedding. Expose it as both the pooled output and (lifted to rank-3)
-    // the last_hidden_state the EmbeddingModelOutput contract requires.
-    let pooled = self.text.forward(input_ids)?;
-    let last_hidden = ops::shape::expand_dims_axes(&pooled, &[1])?; // (B, 1, dim)
-    Ok(EmbeddingModelOutput::new(last_hidden, Some(pooled)))
+  fn as_text_embedder(&self) -> Option<&dyn TextEmbedder> {
+    Some(self)
+  }
+  fn as_contrastive(&self) -> Option<&dyn Contrastive> {
+    Some(self)
+  }
+  fn as_any(&self) -> &dyn std::any::Any {
+    self
   }
 }
 

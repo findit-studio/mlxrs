@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use super::*;
 use crate::embeddings::{
-  EmbeddingModel, EmbeddingModelTypeRegistry, LoadedEmbeddingModel,
+  EmbeddingModelTypeRegistry, LoadedEmbeddingModel, TextEmbedder,
   siglip2_naflex::processing::preprocess,
 };
 
@@ -287,14 +287,22 @@ fn logits_apply_scale_and_bias() {
 }
 
 #[test]
-fn embedding_model_forward_runs_text_tower() {
-  // The EmbeddingModel trait impl forwards the text tower; pooled_output is
-  // (batch, projection_size) and last_hidden_state is (batch, 1, projection).
+fn text_embedder_runs_text_tower() {
+  // The model is its own universal `TextEmbedder` (via `Embed<TextInput>`): the
+  // text-tower path yields the `(batch, projection)` L2-normalized text
+  // embedding (== the model's `encode_text`). The optional padding mask is
+  // unused by the sticky-EOS pooling, so it is `None` here.
   let model = tiny_model();
-  let mask = Array::from_slice::<f32>(&[1.0; 4], &(1usize, 4usize)).unwrap();
-  let out = model.forward(&ids(1, 4), &mask).unwrap();
-  assert_eq!(out.last_hidden_state().shape(), vec![1, 1, PROJ as usize]);
-  assert_eq!(out.pooled_output().unwrap().shape(), vec![1, PROJ as usize]);
+  let emb = model.embed_text(&ids(1, 4), None).unwrap();
+  assert_eq!(emb.array().shape(), vec![1, PROJ as usize]);
+  // The returned text embedding is L2-normalized (the SigLIP text feature).
+  let flat = eval_to_vec(emb.array());
+  let norms = row_norms(&flat, 1, PROJ as usize);
+  assert!(
+    (norms[0] - 1.0).abs() < 1e-4,
+    "text embedding must be L2-normalized: norm = {}",
+    norms[0]
+  );
 }
 
 #[test]
@@ -411,8 +419,12 @@ fn constructor_builds_model_from_loaded() {
   let loaded = LoadedEmbeddingModel::new("siglip2".to_string(), tiny_config_json(), raw);
   let ctor = constructor();
   let model = ctor(&loaded).expect("constructor must build the model");
-  // The constructed model satisfies EmbeddingModel::forward (text tower).
-  let mask = Array::from_slice::<f32>(&[1.0; 4], &(1usize, 4usize)).unwrap();
-  let out = model.forward(&ids(1, 4), &mask).unwrap();
-  assert_eq!(out.pooled_output().unwrap().shape(), vec![1, PROJ as usize]);
+  // The constructed model answers the umbrella's universal text capability; its
+  // `embed_text` runs the text tower to a `(batch, projection)` embedding.
+  let emb = model
+    .as_text_embedder()
+    .expect("siglip exposes the universal text embedder")
+    .embed_text(&ids(1, 4), None)
+    .unwrap();
+  assert_eq!(emb.array().shape(), vec![1, PROJ as usize]);
 }

@@ -84,28 +84,27 @@
 //!   (dot-product) and
 //!   [`score_multi_vector`](crate::embeddings::score_multi_vector)
 //!   (MaxSim / late-interaction).
-//! - Orchestration: the
-//!   [`EmbeddingModel`](crate::embeddings::EmbeddingModel) trait +
-//!   [`EmbeddingModelOutput`](crate::embeddings::EmbeddingModelOutput)
-//!   (the forward-pass seam; python `BaseModelOutput`, swift
-//!   `EmbeddingModelOutput`) and the
+//! - Golden trait architecture (the embedding-model seam):
+//!   [`Embed<Input>`](crate::embeddings::Embed) — the unified core, generic over
+//!   the input modality with the output associated — plus the object-safe
+//!   [`TextEmbedder`](crate::embeddings::TextEmbedder) handle, the
+//!   [`Contrastive`](crate::embeddings::Contrastive) /
+//!   [`LateInteraction`](crate::embeddings::LateInteraction) capability traits,
+//!   the [`TokenEncoder`](crate::embeddings::TokenEncoder) sentence-encoder
+//!   family + [`pool_embed`](crate::embeddings::pool_embed) driver, and the
+//!   [`EmbeddingModel`](crate::embeddings::EmbeddingModel) load-factory umbrella
+//!   (capability accessors over the above). The
 //!   [`encode`](crate::embeddings::encode()) entry +
-//!   [`EncodeConfig`](crate::embeddings::EncodeConfig) (tokenize → pad +
-//!   attention mask → `forward` → optional
-//!   [`pool`](crate::embeddings::pool) / post-processing; typically
-//!   returns pooled rank-2 embeddings `(batch, dim)`, but
-//!   [`PoolingStrategy::None`](crate::embeddings::PoolingStrategy::None)
-//!   can preserve rank-3 hidden states `(batch, seq_len, dim)`, and the
-//!   `pooled_output` fast-path can also return rank-2 output; mirrors
-//!   python `utils.generate` + swift
+//!   [`EncodeConfig`](crate::embeddings::EncodeConfig) tokenize a batch and call
+//!   the model's text embedding (mirrors python `utils.generate` + swift
 //!   `EmbedderModelContainer.perform`).
 
 pub mod colvision;
 pub mod config;
+pub mod embed;
 pub mod encode;
 pub mod factory;
 pub mod fast;
-pub mod model;
 pub mod normalize;
 pub mod pooling;
 #[cfg(feature = "siglip2-naflex")]
@@ -152,6 +151,10 @@ pub use config::{
   StPoolingConfig, pooling_from_st_config_bytes, pooling_from_st_config_path,
   pooling_from_st_config_str,
 };
+pub use embed::{
+  Contrastive, Embed, Embedding, EmbeddingModel, LateInteraction, MultiVector, TextEmbedder,
+  TextInput, TokenEncoder, pool_embed,
+};
 pub use encode::{EncodeConfig, encode};
 pub use factory::{
   EmbeddingIdentifier, EmbeddingModelConfiguration, EmbeddingModelConstructor,
@@ -159,7 +162,6 @@ pub use factory::{
   remap_model_type,
 };
 pub use fast::{layer_norm, rms_norm};
-pub use model::{EmbeddingModel, EmbeddingModelOutput};
 pub use normalize::{
   DEFAULT_NORMALIZE_EPS, SWIFT_L2_EPS, l2_normalize, l2_normalize_eps, normalize,
 };

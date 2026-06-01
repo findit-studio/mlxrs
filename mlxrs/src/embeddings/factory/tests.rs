@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
-use crate::embeddings::model::EmbeddingModelOutput;
+use crate::embeddings::{Embed, Embedding, TextEmbedder, TextInput};
 
 /// A minimal `config.json` for the mock architecture. `model_type` is the
 /// registry-dispatch key; `mock_extra` is a model-specific key the
@@ -26,29 +26,44 @@ fn mock_config_json(model_type: &str) -> String {
   )
 }
 
-/// A trivial [`EmbeddingModel`] the mock constructor returns. `forward`
-/// returns a fixed `(batch, seq, hidden)` zero hidden-state (dispatch is
-/// what these tests prove, not the encoder math).
+/// A trivial [`EmbeddingModel`] the mock constructor returns. It embeds text
+/// via the universal [`Embed<TextInput>`] (→ a fixed `(batch, hidden)` zero
+/// embedding — dispatch is what these tests prove, not the encoder math) and so
+/// answers the umbrella's [`as_text_embedder`](EmbeddingModel::as_text_embedder).
 struct MockLoadedEmbedding {
   hidden: usize,
 }
 
-impl EmbeddingModel for MockLoadedEmbedding {
-  fn forward(&self, input_ids: &Array, _attention_mask: &Array) -> Result<EmbeddingModelOutput> {
-    let (batch, seq) = match input_ids.shape().as_slice() {
-      [b, s] => (*b, *s),
+impl<'a> Embed<TextInput<'a>> for MockLoadedEmbedding {
+  type Output = Embedding;
+
+  fn embed(&self, input: TextInput<'a>) -> Result<Embedding> {
+    let batch = match input.token_ids().shape().as_slice() {
+      [b, _seq] => *b,
       _ => {
-        let shape = input_ids.shape();
+        let shape = input.token_ids().shape();
         return Err(Error::RankMismatch(RankMismatchPayload::new(
-          "MockLoadedEmbedding::forward expects rank-2 (batch, seq) ids",
+          "MockLoadedEmbedding expects rank-2 (batch, seq) ids",
           shape.len() as u32,
           shape,
         )));
       }
     };
-    let data = vec![0.0_f32; batch * seq * self.hidden];
-    let last_hidden_state = Array::from_slice::<f32>(&data, &(batch, seq, self.hidden))?;
-    Ok(EmbeddingModelOutput::from_hidden_state(last_hidden_state))
+    let data = vec![0.0_f32; batch * self.hidden];
+    Ok(Embedding::new(Array::from_slice::<f32>(
+      &data,
+      &(batch, self.hidden),
+    )?))
+  }
+}
+
+impl EmbeddingModel for MockLoadedEmbedding {
+  fn as_text_embedder(&self) -> Option<&dyn TextEmbedder> {
+    Some(self)
+  }
+
+  fn as_any(&self) -> &dyn std::any::Any {
+    self
   }
 }
 
@@ -157,11 +172,17 @@ fn load_dispatches_to_registered_mock_and_returns_context() {
   // No `1_Pooling/config.json` was written → pooling is None.
   assert!(ctx.pooling.is_none());
 
-  // The constructed model is the mock: drive one forward to confirm wiring.
+  // The constructed model is the mock: drive one text embedding through the
+  // umbrella's universal text capability to confirm wiring (hidden = 4).
   let ids = Array::from_slice::<i32>(&[0, 1, 2], &(1usize, 3)).unwrap();
   let mask = Array::from_slice::<f32>(&[1.0, 1.0, 1.0], &(1usize, 3)).unwrap();
-  let out = ctx.model.forward(&ids, &mask).unwrap();
-  assert_eq!(out.last_hidden_state().shape(), vec![1, 3, 4]);
+  let emb = ctx
+    .model
+    .as_text_embedder()
+    .expect("the mock answers the universal text capability")
+    .embed_text(&ids, Some(&mask))
+    .unwrap();
+  assert_eq!(emb.array().shape(), vec![1, 4]);
 
   // The tokenizer loaded from the same directory.
   let tok_ids = ctx.tokenizer.encode("a b c", false).unwrap();
@@ -1465,8 +1486,12 @@ fn create_invokes_registered_constructor() {
     .expect("registered type must construct");
   let ids = Array::from_slice::<i32>(&[0, 1], &(1usize, 2)).unwrap();
   let mask = Array::from_slice::<f32>(&[1.0, 1.0], &(1usize, 2)).unwrap();
-  let out = model.forward(&ids, &mask).unwrap();
-  assert_eq!(out.last_hidden_state().shape(), vec![1, 2, 4]);
+  let emb = model
+    .as_text_embedder()
+    .expect("the mock answers the universal text capability")
+    .embed_text(&ids, Some(&mask))
+    .unwrap();
+  assert_eq!(emb.array().shape(), vec![1, 4]);
 }
 
 #[test]

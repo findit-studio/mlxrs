@@ -1,98 +1,68 @@
 //! The `encode` entry — tokenize a batch of texts, pad to the batch's max
-//! length, run an [`EmbeddingModel`], pool, and optionally L2-normalize into a
+//! length, and run them through a model's universal text embedding into a
 //! `(batch, dim)` embedding matrix.
 //!
-//! Ports the orchestration of:
-//! - python `mlx-embeddings` `utils.py::generate` (tokenize via the processor
-//!   with `padding` / `truncation` / `max_length`, run the model, return the
-//!   embeddings) cross-referenced with `models/pooling.py::pool_by_config` and
-//!   `models/base.py::normalize_embeddings`;
-//! - swift `MLXEmbedders` `EmbedderModelContainer.perform` (encode each text →
-//!   pad to the batch max → build the mask → `model(padded, …, attentionMask:
-//!   mask)` → `pooling(output, normalize: …)` → `eval`).
+//! Ports the orchestration of python `mlx-embeddings` `utils.py::generate`
+//! (tokenize with padding / truncation / `max_length`, run the model, return the
+//! embeddings) and swift `MLXEmbedders` `EmbedderModelContainer.perform` (encode
+//! each text → pad to the batch max → build the mask → run the model → `eval`).
 //!
-//! Unlike python, where the per-architecture model returns an already pooled +
-//! normalized `text_embeds`, mlxrs pools *externally* with the existing
-//! [`pool`] dispatcher (the no-model-arch rule keeps per-model heads out of
-//! scope), exactly as swift's container does. Tokenization is local-only via
-//! the existing [`Tokenizer`]; pooling and normalization reuse
-//! [`crate::embeddings::pool`] — nothing here re-implements them.
+//! Pooling and normalization are the **model's** concern now: a sentence-encoder
+//! owns its [`PoolingStrategy`](crate::embeddings::PoolingStrategy) (resolved at
+//! load from `1_Pooling/config.json`) and applies it inside its
+//! [`TextEmbedder::embed_text`] via
+//! [`pool_embed`](crate::embeddings::pool_embed); a dual-tower model's text tower
+//! embeds directly. So `encode` is thin — it tokenizes a batch and calls
+//! `embed_text`. The pooling / normalization / similarity helpers remain public
+//! drivers a model composes; `encode` itself no longer pools.
 
 use crate::{
   array::Array,
   error::{
-    ArithmeticOverflowPayload, Error, LengthMismatchPayload, OutOfRangePayload,
-    RankMismatchPayload, Result, ShapePairMismatchPayload, try_with_capacity,
+    ArithmeticOverflowPayload, Error, LengthMismatchPayload, OutOfRangePayload, Result,
+    try_with_capacity,
   },
   tokenizer::{EncodeOptions, Tokenizer},
 };
 
-use super::{PoolingStrategy, model::EmbeddingModel, pool, pool_post};
+use super::embed::TextEmbedder;
 
-/// Configuration for [`encode`].
+/// Configuration for [`encode`] — the tokenization knobs.
 ///
-/// Defaults mirror python `generate` (`max_length = 512`, padding +
-/// truncation on, special tokens added) composed with swift's
-/// `pooling(output, normalize: true)`: [`mean`](PoolingStrategy::Mean)
-/// pooling, L2-normalized output.
+/// Defaults mirror python `generate` (`max_length = 512`, padding + truncation
+/// on, special tokens added). Pooling / normalization are no longer here: the
+/// model owns them (see the module docs).
 ///
 /// Build via [`EncodeConfig::new`] and chain `with_*` setters:
 ///
 /// ```rust,ignore
-/// let cfg = EncodeConfig::new()
-///   .with_strategy(PoolingStrategy::Cls)
-///   .with_normalize(false);
+/// let cfg = EncodeConfig::new().with_max_length(Some(256));
 /// ```
 #[derive(Debug, Clone)]
 pub struct EncodeConfig {
-  /// Pooling strategy applied to the model's `(batch, seq_len, hidden)`
-  /// hidden states (the existing [`PoolingStrategy`] / [`pool`] dispatcher).
-  /// Default [`PoolingStrategy::Mean`] (python `generate`'s `text_embeds` is
-  /// "mean pooled and normalized"; swift container default).
-  strategy: PoolingStrategy,
-  /// L2-normalize the pooled vectors (python `normalize_embeddings`, swift
-  /// `pooling(_, normalize: true)`). Default `true`.
-  normalize: bool,
   /// Add the tokenizer's special tokens (BOS/EOS/sep) when encoding, as in
   /// python `processor(..., add_special_tokens=True)` (the transformers
   /// default) and swift `tokenizer.encode(text:, addSpecialTokens: true)`.
   /// Default `true`.
   add_special_tokens: bool,
-  /// Per-sequence hard token cap (python `truncation=True`,
-  /// `max_length=512`): each text is right-truncated (keep the head, drop the
-  /// tail) to at most this many ids *before* batch padding. `None` disables
-  /// truncation. Default `Some(512)`.
+  /// Per-sequence hard token cap (python `truncation=True`, `max_length=512`):
+  /// each text is right-truncated (keep the head, drop the tail) to at most
+  /// this many ids *before* batch padding. `None` disables truncation. Default
+  /// `Some(512)`.
   max_length: Option<usize>,
-  /// Token id written into padding positions. The attention mask is `0`
-  /// there, so this value never reaches the pooled output — it exists only so
-  /// the padded `(batch, seq_len)` id tensor is well-formed (swift pads with
-  /// `0`). Default `0`.
+  /// Token id written into padding positions. The attention mask is `0` there,
+  /// so this value never reaches the embedding — it exists only so the padded
+  /// `(batch, seq_len)` id tensor is well-formed (swift pads with `0`). Default
+  /// `0`.
   pad_token_id: u32,
-  /// Optional matryoshka last-dim truncation forwarded to [`pool`] (swift
-  /// `Pooling.dimension`). `None` keeps the model's full hidden width.
-  /// Default `None`.
-  dimension: Option<usize>,
-  /// Apply a fused LayerNorm to the pooled vector before truncation /
-  /// normalization (swift `applyLayerNorm:`), forwarded to [`pool`]. Default
-  /// `false`.
-  apply_layer_norm: bool,
-  /// Apply a fused RMSNorm to the pooled vector (mlx-c-surfaced variant;
-  /// ignored if `apply_layer_norm` is also set), forwarded to [`pool`].
-  /// Default `false`.
-  apply_rms_norm: bool,
 }
 
 impl Default for EncodeConfig {
   fn default() -> Self {
     Self {
-      strategy: PoolingStrategy::Mean,
-      normalize: true,
       add_special_tokens: true,
       max_length: Some(512),
       pad_token_id: 0,
-      dimension: None,
-      apply_layer_norm: false,
-      apply_rms_norm: false,
     }
   }
 }
@@ -105,18 +75,6 @@ impl EncodeConfig {
 
   // ── builders ──────────────────────────────────────────────────────────
 
-  /// Set the pooling [`strategy`](Self::strategy).
-  #[must_use]
-  pub fn with_strategy(mut self, v: PoolingStrategy) -> Self {
-    self.strategy = v;
-    self
-  }
-  /// Set the [`normalize`](Self::normalize) flag.
-  #[must_use]
-  pub fn with_normalize(mut self, v: bool) -> Self {
-    self.normalize = v;
-    self
-  }
   /// Set the [`add_special_tokens`](Self::add_special_tokens) flag.
   #[must_use]
   pub fn with_add_special_tokens(mut self, v: bool) -> Self {
@@ -135,37 +93,9 @@ impl EncodeConfig {
     self.pad_token_id = v;
     self
   }
-  /// Set the matryoshka [`dimension`](Self::dimension) truncation.
-  #[must_use]
-  pub fn with_dimension(mut self, v: Option<usize>) -> Self {
-    self.dimension = v;
-    self
-  }
-  /// Set the [`apply_layer_norm`](Self::apply_layer_norm) flag.
-  #[must_use]
-  pub fn with_apply_layer_norm(mut self, v: bool) -> Self {
-    self.apply_layer_norm = v;
-    self
-  }
-  /// Set the [`apply_rms_norm`](Self::apply_rms_norm) flag.
-  #[must_use]
-  pub fn with_apply_rms_norm(mut self, v: bool) -> Self {
-    self.apply_rms_norm = v;
-    self
-  }
 
   // ── accessors ─────────────────────────────────────────────────────────
 
-  /// The pooling strategy.
-  #[inline(always)]
-  pub fn strategy(&self) -> PoolingStrategy {
-    self.strategy
-  }
-  /// Whether the pooled vectors are L2-normalized.
-  #[inline(always)]
-  pub fn normalize(&self) -> bool {
-    self.normalize
-  }
   /// Whether special tokens are added when encoding.
   #[inline(always)]
   pub fn add_special_tokens(&self) -> bool {
@@ -181,21 +111,6 @@ impl EncodeConfig {
   pub fn pad_token_id(&self) -> u32 {
     self.pad_token_id
   }
-  /// Matryoshka output dimension cap. `None` keeps the model's full width.
-  #[inline(always)]
-  pub fn dimension(&self) -> Option<usize> {
-    self.dimension
-  }
-  /// Whether a fused LayerNorm is applied to the pooled vector.
-  #[inline(always)]
-  pub fn apply_layer_norm(&self) -> bool {
-    self.apply_layer_norm
-  }
-  /// Whether a fused RMSNorm is applied to the pooled vector.
-  #[inline(always)]
-  pub fn apply_rms_norm(&self) -> bool {
-    self.apply_rms_norm
-  }
 }
 
 /// Tokenize `texts`, right-pad each id row to the batch's max length with
@@ -204,12 +119,11 @@ impl EncodeConfig {
 ///
 /// Returns `(input_ids, attention_mask, seq_len)`:
 /// - `input_ids` — `(batch, seq_len)` `i32` array (right-padded). `I32` is
-///   MLX's default index dtype for the embedding `take` / gather an
-///   [`EmbeddingModel`] performs (matching `lm/generate.rs::token_window`),
-///   so the lookup never has to cast. Each `u32` id is converted with a
-///   CHECKED `i32::try_from` (a token id `> i32::MAX` — realistically never —
-///   yields a recoverable [`Error::OutOfRange`] rather than silently
-///   wrapping negative);
+///   MLX's default index dtype for the embedding `take` / gather a model
+///   performs (matching `lm/generate.rs::token_window`), so the lookup never
+///   has to cast. Each `u32` id is converted with a CHECKED `i32::try_from`
+///   (a token id `> i32::MAX` — realistically never — yields a recoverable
+///   [`Error::OutOfRange`] rather than silently wrapping negative);
 /// - `attention_mask` — `(batch, seq_len)` `f32` array (`1.0` / `0.0`);
 /// - `seq_len` — the batch max length (after per-text truncation).
 ///
@@ -326,44 +240,36 @@ fn tokenize_and_pad(
 ///    right-truncate to `cfg.max_length`;
 /// 2. right-pad every id row to the batch's max length and build the matching
 ///    `(batch, seq_len)` attention mask (`1` real, `0` pad);
-/// 3. run `model.forward(input_ids, attention_mask)` → hidden states (and an
-///    optional model-provided `pooled_output`);
-/// 4. pool with `cfg.strategy` and apply `cfg.{apply_layer_norm,
-///    apply_rms_norm, dimension, normalize}` via the existing [`pool`]
-///    dispatcher. For [`PoolingStrategy::Cls`] / [`PoolingStrategy::None`],
-///    if the model returned a `pooled_output` (a trained BERT-style pooler
-///    head) it is used directly — the configured normalize / dimension /
-///    layer-norm tail still applies via [`pool_post`] — matching swift's
-///    `inputs.pooledOutput ?? hiddenStates…`; otherwise the hidden-states
-///    pooling path is taken as before.
+/// 3. call `model.embed_text(input_ids, Some(attention_mask))` — the model
+///    applies its own pooling / normalization (a sentence-encoder via its
+///    configured [`PoolingStrategy`](crate::embeddings::PoolingStrategy) inside
+///    [`pool_embed`](crate::embeddings::pool_embed); a dual-tower text tower
+///    directly).
 ///
-/// The returned array is usually `(batch, dim)`. If `cfg.strategy` is
-/// [`PoolingStrategy::None`] and the model does not provide a
-/// `pooled_output`, the hidden states are passed through and the result is
-/// `(batch, seq_len, dim)` instead; if a `pooled_output` is present, that
-/// fast-path still returns a rank-2 `(batch, dim)` array. **No implicit eval**:
-/// the result is a lazy graph node; the caller evaluates (or reads it) when
-/// ready.
+/// The returned array is the model's text embedding, conventionally
+/// `(batch, dim)` and L2-normalized. **No implicit eval**: the result is a lazy
+/// graph node; the caller evaluates (or reads it) when ready.
 ///
-/// An empty `texts` slice returns a `(0, …)` array (zero-row batch). The
-/// pooling stage receives the model's hidden states unchanged from the
-/// reference behavior — mask-aware poolers exclude the padded tail.
+/// An empty `texts` slice produces a `(0, seq_len)` id batch; the model's
+/// `embed_text` returns the correspondingly zero-row embedding.
 ///
-/// - `model` — any [`EmbeddingModel`] (trait object: one call site, many
-///   architectures);
+/// - `model` — any [`TextEmbedder`] (every text-capable model is one via the
+///   [`Embed<TextInput>`](crate::embeddings::Embed) projection; reach it from a
+///   loaded [`EmbeddingModel`](crate::embeddings::EmbeddingModel) via
+///   [`as_text_embedder`](crate::embeddings::EmbeddingModel::as_text_embedder));
 /// - `tokenizer` — the loaded [`Tokenizer`] (local-only; no network);
 /// - `texts` — the batch to encode;
-/// - `cfg` — pooling / normalization / tokenization knobs ([`EncodeConfig`]).
+/// - `cfg` — tokenization knobs ([`EncodeConfig`]).
 pub fn encode(
-  model: &dyn EmbeddingModel,
+  model: &dyn TextEmbedder,
   tokenizer: &Tokenizer,
   texts: &[&str],
   cfg: &EncodeConfig,
 ) -> Result<Array> {
   // Fail fast on a cleared/poisoned worker thread (and install the mlx-c error
-  // handler) before any work, since `model.forward` + the pooling ops touch
-  // per-thread stream/TLS state. Mirrors the crate's other safe entry points
-  // (e.g. `stream::default_stream`), which install the handler before asserting.
+  // handler) before any work, since `embed_text` touches per-thread stream/TLS
+  // state. Mirrors the crate's other safe entry points (e.g.
+  // `stream::default_stream`), which install the handler before asserting.
   crate::error::ensure_handler_installed();
   crate::stream::assert_streams_not_cleared();
   let (input_ids, attention_mask, _seq_len) = tokenize_and_pad(
@@ -373,81 +279,8 @@ pub fn encode(
     cfg.max_length,
     cfg.pad_token_id,
   )?;
-
-  let output = model.forward(&input_ids, &attention_mask)?;
-
-  // swift `Pooling.callAsFunction`: the `.cls` and `.none` strategies use the
-  // model's own `pooledOutput` when present (a trained BERT-style pooler head)
-  // — `inputs.pooledOutput ?? hiddenStates…` — falling back to hidden-states
-  // pooling only when the model emits none. The other strategies always pool
-  // hidden states. Either way the normalize / dimension / layer-norm tail is
-  // applied identically (here via `pool_post`, the shared tail of `pool`).
-  let (last_hidden_state, pooled_output) = output.into_parts();
-  if matches!(cfg.strategy, PoolingStrategy::Cls | PoolingStrategy::None)
-    && let Some(pooled) = pooled_output
-  {
-    // This path bypasses the hidden-state poolers' rank/mask guards
-    // (`validate_token_embeddings_*` in `pooling.rs`), so validate the
-    // model-provided pooler here with the same panic→`Err` discipline: it
-    // must be exactly rank-2 `(batch, hidden)` whose batch covers the
-    // request. A squeezed `[hidden]` or a stale `[1, hidden]` pooler for a
-    // multi-text batch would otherwise be normalized / truncated and
-    // returned as if it covered every text — silent wrong/missing
-    // embeddings rather than a recoverable shape error.
-    let pooled_shape = pooled.shape();
-    if pooled_shape.len() != 2 {
-      return Err(Error::RankMismatch(RankMismatchPayload::new(
-        "encode: model pooled_output must be rank-2 (batch, hidden)",
-        pooled_shape.len() as u32,
-        pooled_shape,
-      )));
-    }
-    if pooled_shape[0] != texts.len() {
-      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
-        "encode: model pooled_output batch must match texts",
-        texts.len(),
-        pooled_shape[0],
-      )));
-    }
-    // The pooler's hidden width must match the hidden states' (`(batch,
-    // seq_len, hidden)`): a pooler emitting a different width than the model's
-    // hidden dim would otherwise be normalized / truncated and returned as
-    // embeddings of an unexpected dimension. This fast-path bypasses the
-    // hidden-state poolers' rank-3 guard, so confirm `last_hidden_state` is
-    // rank-3 before indexing its hidden axis (same panic→`Err` discipline).
-    let hidden_shape = last_hidden_state.shape();
-    if hidden_shape.len() != 3 {
-      return Err(Error::RankMismatch(RankMismatchPayload::new(
-        "encode: model last_hidden_state must be rank-3 (batch, seq_len, hidden)",
-        hidden_shape.len() as u32,
-        hidden_shape,
-      )));
-    }
-    if pooled_shape[1] != hidden_shape[2] {
-      return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
-        "encode: model pooled_output hidden width must match last_hidden_state hidden",
-        pooled_shape,
-        hidden_shape,
-      )));
-    }
-    return pool_post(
-      pooled,
-      cfg.normalize,
-      cfg.dimension,
-      cfg.apply_layer_norm,
-      cfg.apply_rms_norm,
-    );
-  }
-
-  pool(
-    &last_hidden_state,
-    &attention_mask,
-    cfg.strategy,
-    cfg.normalize,
-    cfg.dimension,
-    cfg.apply_layer_norm,
-    cfg.apply_rms_norm,
-  )
+  let embedding = model.embed_text(&input_ids, Some(&attention_mask))?;
+  Ok(embedding.into_array())
 }
 
 #[cfg(test)]

@@ -1,36 +1,36 @@
-//! Hand-traced `encode` tests over a [`MockEmbeddingModel`]: a real
+//! Hand-traced `encode` tests over a deterministic text-embedder mock: a real
 //! tokenizer encodes a 2-text batch, the padding / mask logic is asserted
-//! explicitly, and mean / cls pooling + L2-normalization are checked against
-//! values computed by hand from the canned hidden states.
+//! explicitly via `tokenize_and_pad`, and the thin `encode` pipeline is shown to
+//! forward the tokenized + padded id batch to the model's `embed_text` verbatim.
+//!
+//! Pooling / normalization moved into the model (`pool` / `pool_embed`, covered
+//! by `embeddings::pooling`'s tests), so `encode` no longer pools — these tests
+//! cover only the tokenize → pad → `embed_text` orchestration it still owns.
 
 use super::*;
-use crate::embeddings::model::{EmbeddingModel, EmbeddingModelOutput, MockEmbeddingModel};
+use crate::{
+  dtype::Dtype,
+  embeddings::{Embed, Embedding, TextInput},
+};
 
 const TOL: f32 = 1e-5;
 
-/// A model that returns hidden states like [`MockEmbeddingModel`] but emits a
-/// **caller-supplied raw `pooled_output` array** verbatim — so a test can
-/// inject a deliberately malformed pooler (wrong rank or wrong batch) that
-/// [`MockEmbeddingModel::with_pooled`] (which always tiles to a well-formed
-/// `(batch, hidden)`) cannot produce. Used to exercise the encode-side
-/// `pooled_output` shape guard.
-struct RawPooledModel {
-  inner: MockEmbeddingModel,
-  /// The exact `(hidden,)`-flat data and shape to return as `pooled_output`.
-  pooled_data: Vec<f32>,
-  pooled_shape: Vec<usize>,
-}
+/// A deterministic text-embedder mock: its "embedding" is the model input's
+/// `(batch, seq_len)` token-id matrix cast to `f32`, returned verbatim. Because
+/// the output is exactly the padded id batch, a test can build the expected
+/// embedding by hand from the known tokenization (an independent oracle) and
+/// assert `encode` forwards that batch to `embed_text` unchanged. It implements
+/// [`Embed<TextInput>`] (so it is a [`TextEmbedder`] via the blanket projection)
+/// and is passed to `encode` as `&dyn TextEmbedder`.
+struct IdentityTextEmbedder;
 
-impl EmbeddingModel for RawPooledModel {
-  fn forward(&self, input_ids: &Array, attention_mask: &Array) -> Result<EmbeddingModelOutput> {
-    let out = self.inner.forward(input_ids, attention_mask)?;
-    let pooled = Array::from_slice::<f32>(&self.pooled_data, &self.pooled_shape.as_slice())?;
-    // Use `into_parts()` to move the inner `last_hidden_state` Array out
-    // (avoids the `try_clone()?` allocation that the borrowed-accessor
-    // path would otherwise require). Drops the inner `pooled_output`
-    // since this helper overrides it with `pooled`.
-    let (last_hidden_state, _) = out.into_parts();
-    Ok(EmbeddingModelOutput::new(last_hidden_state, Some(pooled)))
+impl<'a> Embed<TextInput<'a>> for IdentityTextEmbedder {
+  type Output = Embedding;
+
+  fn embed(&self, input: TextInput<'a>) -> Result<Embedding> {
+    // The padded `(batch, seq_len)` `I32` ids cast to `f32`, verbatim — no
+    // pooling. `encode`'s returned array is therefore exactly this matrix.
+    Ok(Embedding::new(input.token_ids().astype(Dtype::F32)?))
   }
 }
 
@@ -156,62 +156,57 @@ fn tokenize_and_pad_truncates_to_max_length() {
   assert_eq!(mask.to_vec::<f32>().unwrap(), vec![1.0, 1.0, 1.0, 1.0]);
 }
 
-#[test]
-fn encode_mean_pool_normalized_two_text_batch() {
-  let tok = word_tokenizer();
-  // Canned per-position hidden rows (hidden = 2):
-  //   pos0 = [1, 0], pos1 = [0, 1], pos2 = [1, 1]
-  let model = MockEmbeddingModel::new(vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]]);
+// ---- encode forwards the tokenized + padded batch to the model verbatim ----
 
-  // "a b c" -> 3 real tokens (pos0,1,2); "d e" -> 2 real (pos0,1) + 1 pad.
+#[test]
+fn encode_forwards_padded_id_batch_to_embed_text() {
+  // `encode` is thin: tokenize → right-pad → `embed_text`. With the identity
+  // mock (embedding == the padded id matrix as f32), `encode`'s output must be
+  // exactly the `(batch, seq_len)` padded ids the tokenizer produced. The
+  // oracle is built by hand from the known tokenization, NOT from
+  // `tokenize_and_pad`: "a b c" -> [0,1,2], "d e" -> [3,4] + one pad cell
+  // (pad_token_id = 7) → seq_len = 3, padded rows [[0,1,2],[3,4,7]].
+  let tok = word_tokenizer();
+  let model = IdentityTextEmbedder;
   let cfg = EncodeConfig::new()
     .with_add_special_tokens(false)
-    .with_strategy(PoolingStrategy::Mean)
-    .with_normalize(true);
+    .with_pad_token_id(7);
   let mut emb = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap();
-  assert_eq!(emb.shape(), vec![2, 2]);
-  let v = emb.to_vec::<f32>().unwrap();
-
-  // Row 0 mean over pos0,1,2 = ([1,0]+[0,1]+[1,1])/3 = [2/3, 2/3];
-  // L2-normalized = [1/√2, 1/√2].
-  let inv_sqrt2 = 1.0 / 2.0_f32.sqrt();
-  assert!(vclose(&v[0..2], &[inv_sqrt2, inv_sqrt2]));
-
-  // Row 1 mean over pos0,1 (pad excluded by mask) = ([1,0]+[0,1])/2 = [0.5,0.5];
-  // L2-normalized = [1/√2, 1/√2].
-  assert!(vclose(&v[2..4], &[inv_sqrt2, inv_sqrt2]));
+  assert_eq!(emb.shape(), vec![2, 3]);
+  // Exactly the padded id batch (the pad cell id = 7), cast to f32, verbatim.
+  assert!(vclose(
+    &emb.to_vec::<f32>().unwrap(),
+    &[0.0, 1.0, 2.0, 3.0, 4.0, 7.0]
+  ));
 }
 
 #[test]
-fn encode_mean_pool_unnormalized_excludes_padding() {
+fn encode_truncates_then_forwards_to_embed_text() {
+  // The `max_length` truncation happens in the tokenize step, so the model
+  // sees the truncated + padded batch. max_length = 2 trims "a b c" to [0,1];
+  // "d e" stays [3,4]. No padding is needed (both rows length 2), so the
+  // oracle is the rank-2 `(2, 2)` matrix [[0,1],[3,4]] cast to f32.
   let tok = word_tokenizer();
-  let model = MockEmbeddingModel::new(vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]]);
+  let model = IdentityTextEmbedder;
   let cfg = EncodeConfig::new()
     .with_add_special_tokens(false)
-    .with_strategy(PoolingStrategy::Mean)
-    .with_normalize(false);
+    .with_max_length(Some(2));
   let mut emb = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap();
-  let v = emb.to_vec::<f32>().unwrap();
-  // Row 0: [2/3, 2/3] ; Row 1: [0.5, 0.5] (pad position excluded).
-  assert!(vclose(&v[0..2], &[2.0 / 3.0, 2.0 / 3.0]));
-  assert!(vclose(&v[2..4], &[0.5, 0.5]));
+  assert_eq!(emb.shape(), vec![2, 2]);
+  assert!(vclose(&emb.to_vec::<f32>().unwrap(), &[0.0, 1.0, 3.0, 4.0]));
 }
 
 #[test]
-fn encode_cls_pool_selects_first_real_token() {
+fn encode_empty_batch_forwards_zero_row_embedding() {
+  // An empty `texts` slice produces a `(0, 0)` id batch; the identity mock
+  // returns it verbatim, so `encode` yields a zero-row `(0, 0)` embedding (no
+  // panic, no implicit row). seq_len = 0 because there are no rows.
   let tok = word_tokenizer();
-  // pos0 distinctive so CLS (first real token) is identifiable.
-  let model = MockEmbeddingModel::new(vec![vec![9.0, 3.0], vec![0.0, 1.0], vec![1.0, 1.0]]);
-  let cfg = EncodeConfig::new()
-    .with_add_special_tokens(false)
-    .with_strategy(PoolingStrategy::Cls)
-    .with_normalize(false);
-  let mut emb = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap();
-  assert_eq!(emb.shape(), vec![2, 2]);
-  let v = emb.to_vec::<f32>().unwrap();
-  // Both rows are right-padded, so the first real token is pos0 = [9, 3].
-  assert!(vclose(&v[0..2], &[9.0, 3.0]));
-  assert!(vclose(&v[2..4], &[9.0, 3.0]));
+  let model = IdentityTextEmbedder;
+  let cfg = EncodeConfig::new().with_add_special_tokens(false);
+  let mut emb = encode(&model, &tok, &[], &cfg).unwrap();
+  assert_eq!(emb.shape(), vec![0, 0]);
+  assert!(emb.to_vec::<f32>().unwrap().is_empty());
 }
 
 // ---- Regression: tokenizer-applied padding must be masked ----
@@ -262,286 +257,35 @@ fn tokenize_and_pad_padded_tokenizer_matches_unpadded() {
   );
 }
 
-/// End-to-end: mean-pooled embeddings must be identical whether the
-/// tokenizer has padding enabled or disabled. The pad id is a *real* vocab
-/// id (`4` = "e", hidden row `[1,1]`), so a buggy mask-`1` pad cell would
-/// pull that row into the mean and diverge — this asserts it does not.
-#[test]
-fn encode_mean_pool_invariant_to_tokenizer_padding() {
-  let canned = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]];
-  let model_a = MockEmbeddingModel::new(canned.clone());
-  let model_b = MockEmbeddingModel::new(canned);
-  let cfg = EncodeConfig::new()
-    .with_add_special_tokens(false)
-    .with_strategy(PoolingStrategy::Mean)
-    .with_normalize(false);
-
-  let mut emb_unpadded = encode(&model_a, &word_tokenizer(), &["a b c", "d e"], &cfg).unwrap();
-  let mut emb_padded = encode(&model_b, &padded_word_tokenizer(), &["a b c", "d e"], &cfg).unwrap();
-  assert_eq!(emb_unpadded.shape(), emb_padded.shape());
-  let vu = emb_unpadded.to_vec::<f32>().unwrap();
-  let vp = emb_padded.to_vec::<f32>().unwrap();
-  assert!(vclose(&vu, &vp), "padded={vp:?} unpadded={vu:?}");
-  // Hand-checked unpadded values: row0 = [2/3,2/3], row1 = [0.5,0.5].
-  assert!(vclose(&vp[0..2], &[2.0 / 3.0, 2.0 / 3.0]));
-  assert!(vclose(&vp[2..4], &[0.5, 0.5]));
-}
-
-// ---- Regression: Cls/None honor the model's pooled_output ----
-
-/// `Cls` strategy with a model-provided `pooled_output` must return that
-/// trained pooler vector (swift `inputs.pooledOutput ?? …`), NOT the
-/// hidden-states CLS token. The pooled rows are made distinct from every
-/// canned hidden row so the source is unambiguous.
-#[test]
-fn encode_cls_uses_model_pooled_output_when_present() {
-  let tok = word_tokenizer();
-  // Hidden CLS (first real token) would be [9, 3]; the pooler emits [7, 5]
-  // for item 0 and [6, 4] for item 1 — neither equals any hidden row.
-  let model = MockEmbeddingModel::new(vec![vec![9.0, 3.0], vec![0.0, 1.0], vec![1.0, 1.0]])
-    .with_pooled(vec![vec![7.0, 5.0], vec![6.0, 4.0]]);
-  let cfg = EncodeConfig::new()
-    .with_add_special_tokens(false)
-    .with_strategy(PoolingStrategy::Cls)
-    .with_normalize(false);
-  let mut emb = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap();
-  assert_eq!(emb.shape(), vec![2, 2]);
-  let v = emb.to_vec::<f32>().unwrap();
-  assert!(
-    vclose(&v[0..2], &[7.0, 5.0]),
-    "expected pooled row 0, got {:?}",
-    &v[0..2]
-  );
-  assert!(
-    vclose(&v[2..4], &[6.0, 4.0]),
-    "expected pooled row 1, got {:?}",
-    &v[2..4]
-  );
-}
-
-/// The `pooled_output` path still honors the normalize / dimension tail
-/// (`pool_post`): L2-normalizing item 0's pooler row `[3, 4]` → `[0.6, 0.8]`.
-#[test]
-fn encode_cls_pooled_output_applies_normalize_and_dimension() {
-  let tok = word_tokenizer();
-  let model =
-    MockEmbeddingModel::new(vec![vec![9.0, 3.0], vec![0.0, 1.0]]).with_pooled(vec![vec![3.0, 4.0]]);
-  let cfg = EncodeConfig::new()
-    .with_add_special_tokens(false)
-    .with_strategy(PoolingStrategy::Cls)
-    .with_normalize(true);
-  let mut emb = encode(&model, &tok, &["a b", "a b"], &cfg).unwrap();
-  let v = emb.to_vec::<f32>().unwrap();
-  // Both batch items reuse the single pooler row [3,4]; ‖[3,4]‖ = 5.
-  assert!(vclose(&v[0..2], &[0.6, 0.8]));
-  assert!(vclose(&v[2..4], &[0.6, 0.8]));
-}
-
-/// When the model emits NO `pooled_output`, `Cls` falls back to the
-/// hidden-states (mask-aware) CLS path unchanged — guards the `??` fallback.
-#[test]
-fn encode_cls_falls_back_to_hidden_states_without_pooled_output() {
-  let tok = word_tokenizer();
-  let model = MockEmbeddingModel::new(vec![vec![9.0, 3.0], vec![0.0, 1.0], vec![1.0, 1.0]]);
-  assert!(model.pooled.is_none());
-  let cfg = EncodeConfig::new()
-    .with_add_special_tokens(false)
-    .with_strategy(PoolingStrategy::Cls)
-    .with_normalize(false);
-  let mut emb = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap();
-  let v = emb.to_vec::<f32>().unwrap();
-  // Hidden-states CLS = first real token = pos0 = [9, 3] for both rows.
-  assert!(vclose(&v[0..2], &[9.0, 3.0]));
-  assert!(vclose(&v[2..4], &[9.0, 3.0]));
-}
-
-// ---- Regression: validate pooled_output shape before bypassing pooling ----
-
-/// Build a [`RawPooledModel`] over the standard 3-position canned hidden
-/// states, emitting `pooled_data` reshaped to `pooled_shape` verbatim.
-fn raw_pooled_model(pooled_data: Vec<f32>, pooled_shape: Vec<usize>) -> RawPooledModel {
-  RawPooledModel {
-    inner: MockEmbeddingModel::new(vec![vec![9.0, 3.0], vec![0.0, 1.0], vec![1.0, 1.0]]),
-    pooled_data,
-    pooled_shape,
-  }
-}
-
-/// A rank-1 (squeezed `[hidden]`) `pooled_output` must be rejected with
-/// [`Error::RankMismatch`] for `Cls` — not normalized and returned as if it
-/// covered the batch. Without the guard a custom / version-skewed model that
-/// squeezed a batch-1 pooler would silently yield a wrong-shape embedding.
-#[test]
-fn encode_cls_rejects_wrong_rank_pooled_output() {
-  let tok = word_tokenizer();
-  // Squeezed rank-1 [hidden] pooler instead of (batch, hidden).
-  let model = raw_pooled_model(vec![7.0, 5.0], vec![2]);
-  let cfg = EncodeConfig::new()
-    .with_add_special_tokens(false)
-    .with_strategy(PoolingStrategy::Cls)
-    .with_normalize(false);
-  let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
-  assert!(
-    matches!(err, Error::RankMismatch(ref p) if p.actual() == 1),
-    "expected RankMismatch(actual=1), got {err:?}"
-  );
-}
-
-/// Same wrong-rank guard for the `None` strategy's `pooled_output` bypass.
-#[test]
-fn encode_none_rejects_wrong_rank_pooled_output() {
-  let tok = word_tokenizer();
-  let model = raw_pooled_model(vec![7.0, 5.0], vec![2]);
-  let cfg = EncodeConfig::new()
-    .with_add_special_tokens(false)
-    .with_strategy(PoolingStrategy::None)
-    .with_normalize(false);
-  let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
-  assert!(
-    matches!(err, Error::RankMismatch(ref p) if p.actual() == 1),
-    "expected RankMismatch(actual=1), got {err:?}"
-  );
-}
-
-/// A stale `[1, hidden]` `pooled_output` for a 2-text batch must be rejected
-/// with [`Error::LengthMismatch`] for `Cls` — the batch dim (1) does not
-/// cover the request (2), so normalizing / returning it would silently drop a
-/// text.
-#[test]
-fn encode_cls_rejects_wrong_batch_pooled_output() {
-  let tok = word_tokenizer();
-  // (1, hidden) pooler for a 2-text batch.
-  let model = raw_pooled_model(vec![7.0, 5.0], vec![1, 2]);
-  let cfg = EncodeConfig::new()
-    .with_add_special_tokens(false)
-    .with_strategy(PoolingStrategy::Cls)
-    .with_normalize(false);
-  let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
-  assert!(
-    matches!(err, Error::LengthMismatch(_)),
-    "expected LengthMismatch, got {err:?}"
-  );
-}
-
-/// Same wrong-batch guard for the `None` strategy's `pooled_output` bypass.
-#[test]
-fn encode_none_rejects_wrong_batch_pooled_output() {
-  let tok = word_tokenizer();
-  let model = raw_pooled_model(vec![7.0, 5.0], vec![1, 2]);
-  let cfg = EncodeConfig::new()
-    .with_add_special_tokens(false)
-    .with_strategy(PoolingStrategy::None)
-    .with_normalize(false);
-  let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
-  assert!(
-    matches!(err, Error::LengthMismatch(_)),
-    "expected LengthMismatch, got {err:?}"
-  );
-}
-
-/// A correctly-ranked, correctly-batched `pooled_output` whose hidden width
-/// differs from `last_hidden_state`'s hidden dim must be rejected with
-/// [`Error::ShapePairMismatch`] for `Cls` — otherwise it would be normalized
-/// / truncated and returned as embeddings of an unexpected dimension. The
-/// canned hidden states are `(.., .., 2)`, so a `(2, 3)` pooler is
-/// wrong-width while still passing the rank-2 and batch checks.
-#[test]
-fn encode_cls_rejects_wrong_hidden_width_pooled_output() {
-  let tok = word_tokenizer();
-  // (batch=2, hidden=3) pooler, but the model's hidden dim is 2.
-  let model = raw_pooled_model(vec![7.0, 5.0, 1.0, 6.0, 4.0, 2.0], vec![2, 3]);
-  let cfg = EncodeConfig::new()
-    .with_add_special_tokens(false)
-    .with_strategy(PoolingStrategy::Cls)
-    .with_normalize(false);
-  let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
-  assert!(
-    matches!(err, Error::ShapePairMismatch(_)),
-    "expected ShapePairMismatch, got {err:?}"
-  );
-}
-
-/// Same wrong-hidden-width guard for the `None` strategy's `pooled_output`
-/// bypass.
-#[test]
-fn encode_none_rejects_wrong_hidden_width_pooled_output() {
-  let tok = word_tokenizer();
-  let model = raw_pooled_model(vec![7.0, 5.0, 1.0, 6.0, 4.0, 2.0], vec![2, 3]);
-  let cfg = EncodeConfig::new()
-    .with_add_special_tokens(false)
-    .with_strategy(PoolingStrategy::None)
-    .with_normalize(false);
-  let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
-  assert!(
-    matches!(err, Error::ShapePairMismatch(_)),
-    "expected ShapePairMismatch, got {err:?}"
-  );
-}
-
-/// A correctly-shaped `(batch, hidden)` raw `pooled_output` still passes the
-/// guard and is returned (sanity: the guard rejects only malformed shapes,
-/// not the valid path that the `with_pooled` tests already cover).
-#[test]
-fn encode_cls_accepts_correct_shape_raw_pooled_output() {
-  let tok = word_tokenizer();
-  let model = raw_pooled_model(vec![7.0, 5.0, 6.0, 4.0], vec![2, 2]);
-  let cfg = EncodeConfig::new()
-    .with_add_special_tokens(false)
-    .with_strategy(PoolingStrategy::Cls)
-    .with_normalize(false);
-  let mut emb = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap();
-  assert_eq!(emb.shape(), vec![2, 2]);
-  let v = emb.to_vec::<f32>().unwrap();
-  assert!(vclose(&v[0..2], &[7.0, 5.0]));
-  assert!(vclose(&v[2..4], &[6.0, 4.0]));
-}
-
 // ---- EncodeConfig builders + accessors (round-trip) ----
 
 /// Every `with_*` builder must persist its value and every accessor must
-/// return it. Covers the builders/accessors the orchestration tests above do
-/// not already touch (`with_max_length` / `with_pad_token_id` /
-/// `with_dimension` / `with_apply_layer_norm` / `with_apply_rms_norm` and all
-/// eight getters), and pins the documented defaults.
+/// return it, across the three surviving tokenization knobs
+/// (`add_special_tokens` / `max_length` / `pad_token_id`), and the documented
+/// defaults are pinned. (Pooling / normalization config moved into the model,
+/// so `EncodeConfig` no longer carries `strategy` / `normalize` / `dimension`
+/// / `apply_*_norm`.)
 #[test]
 fn encode_config_builders_and_accessors_round_trip() {
   // Documented defaults (mirrors `EncodeConfig::default`).
   let d = EncodeConfig::new();
-  assert_eq!(d.strategy(), PoolingStrategy::Mean);
-  assert!(d.normalize());
   assert!(d.add_special_tokens());
   assert_eq!(d.max_length(), Some(512));
   assert_eq!(d.pad_token_id(), 0);
-  assert_eq!(d.dimension(), None);
-  assert!(!d.apply_layer_norm());
-  assert!(!d.apply_rms_norm());
 
   // Override every field to a non-default value and read it back.
   let cfg = EncodeConfig::new()
-    .with_strategy(PoolingStrategy::Max)
-    .with_normalize(false)
     .with_add_special_tokens(false)
     .with_max_length(None)
-    .with_pad_token_id(7)
-    .with_dimension(Some(3))
-    .with_apply_layer_norm(true)
-    .with_apply_rms_norm(true);
-  assert_eq!(cfg.strategy(), PoolingStrategy::Max);
-  assert!(!cfg.normalize());
+    .with_pad_token_id(7);
   assert!(!cfg.add_special_tokens());
   assert_eq!(cfg.max_length(), None);
   assert_eq!(cfg.pad_token_id(), 7);
-  assert_eq!(cfg.dimension(), Some(3));
-  assert!(cfg.apply_layer_norm());
-  assert!(cfg.apply_rms_norm());
 
-  // `with_max_length(Some(n))` and `with_dimension(Some(n))` carry the inner
-  // value (the `None` arm is covered above).
-  let some = EncodeConfig::new()
-    .with_max_length(Some(8))
-    .with_dimension(Some(16));
+  // `with_max_length(Some(n))` carries the inner value (the `None` arm is
+  // covered above).
+  let some = EncodeConfig::new().with_max_length(Some(8));
   assert_eq!(some.max_length(), Some(8));
-  assert_eq!(some.dimension(), Some(16));
 }
 
 // ---- tokenize_and_pad: id-overflow guards ----
@@ -605,7 +349,7 @@ fn tokenize_and_pad_rejects_token_id_above_i32_max() {
 #[test]
 fn encode_rejects_token_id_above_i32_max() {
   let tok = huge_id_tokenizer();
-  let model = MockEmbeddingModel::new(vec![vec![1.0, 0.0]]);
+  let model = IdentityTextEmbedder;
   let cfg = EncodeConfig::new().with_add_special_tokens(false);
   let err = encode(&model, &tok, &["big"], &cfg).unwrap_err();
   assert!(
@@ -637,7 +381,7 @@ fn tokenize_and_pad_rejects_pad_token_id_above_i32_max() {
 #[test]
 fn encode_rejects_pad_token_id_above_i32_max() {
   let tok = word_tokenizer();
-  let model = MockEmbeddingModel::new(vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+  let model = IdentityTextEmbedder;
   let cfg = EncodeConfig::new()
     .with_add_special_tokens(false)
     .with_pad_token_id(0x8000_0000);
@@ -645,91 +389,5 @@ fn encode_rejects_pad_token_id_above_i32_max() {
   assert!(
     matches!(err, Error::OutOfRange(ref p) if p.context() == "encode: pad_token_id"),
     "expected OutOfRange(pad_token_id), got {err:?}"
-  );
-}
-
-// ---- pooled_output fast-path: last_hidden_state rank-3 guard ----
-
-/// A model returning a caller-supplied `last_hidden_state` AND `pooled_output`
-/// of exact shapes (no tiling / reshaping). Lets a test drive the pooled-output
-/// fast-path with a `last_hidden_state` of arbitrary rank to exercise the
-/// rank-3 guard that [`RawPooledModel`] (which always forwards
-/// [`MockEmbeddingModel`]'s rank-3 hidden states) cannot reach.
-struct RawShapeModel {
-  hidden_data: Vec<f32>,
-  hidden_shape: Vec<usize>,
-  pooled_data: Vec<f32>,
-  pooled_shape: Vec<usize>,
-}
-
-impl EmbeddingModel for RawShapeModel {
-  fn forward(&self, _input_ids: &Array, _attention_mask: &Array) -> Result<EmbeddingModelOutput> {
-    let last_hidden_state =
-      Array::from_slice::<f32>(&self.hidden_data, &self.hidden_shape.as_slice())?;
-    let pooled = Array::from_slice::<f32>(&self.pooled_data, &self.pooled_shape.as_slice())?;
-    Ok(EmbeddingModelOutput::new(last_hidden_state, Some(pooled)))
-  }
-}
-
-/// In the `Cls` pooled-output fast-path, after the pooler passes the rank-2 and
-/// batch checks, a `last_hidden_state` that is NOT rank-3 must be rejected with
-/// [`Error::RankMismatch`] (the guard at the hidden-axis-width comparison).
-/// Here the pooler is a valid `(2, 2)` for the 2-text batch, but the hidden
-/// states are rank-2 `(2, 2)` — so the width comparison cannot index axis 2
-/// and the rank check fires first.
-#[test]
-fn encode_cls_rejects_non_rank3_hidden_state_in_pooled_path() {
-  let tok = word_tokenizer();
-  let model = RawShapeModel {
-    // Rank-2 hidden states (missing the seq_len axis).
-    hidden_data: vec![1.0, 2.0, 3.0, 4.0],
-    hidden_shape: vec![2, 2],
-    // Valid rank-2 pooler covering the 2-text batch.
-    pooled_data: vec![7.0, 5.0, 6.0, 4.0],
-    pooled_shape: vec![2, 2],
-  };
-  let cfg = EncodeConfig::new()
-    .with_add_special_tokens(false)
-    .with_strategy(PoolingStrategy::Cls)
-    .with_normalize(false);
-  let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
-  match err {
-    Error::RankMismatch(p) => {
-      assert_eq!(
-        p.context(),
-        "encode: model last_hidden_state must be rank-3 (batch, seq_len, hidden)"
-      );
-      assert_eq!(p.actual(), 2);
-    }
-    other => panic!("expected RankMismatch(last_hidden_state), got {other:?}"),
-  }
-}
-
-/// Same rank-3-hidden-state guard for the `None` strategy's pooled-output
-/// bypass: a rank-1 `last_hidden_state` alongside a valid `(2, 2)` pooler is a
-/// [`Error::RankMismatch`].
-#[test]
-fn encode_none_rejects_non_rank3_hidden_state_in_pooled_path() {
-  let tok = word_tokenizer();
-  let model = RawShapeModel {
-    // Rank-1 hidden states.
-    hidden_data: vec![1.0, 2.0, 3.0, 4.0],
-    hidden_shape: vec![4],
-    pooled_data: vec![7.0, 5.0, 6.0, 4.0],
-    pooled_shape: vec![2, 2],
-  };
-  let cfg = EncodeConfig::new()
-    .with_add_special_tokens(false)
-    .with_strategy(PoolingStrategy::None)
-    .with_normalize(false);
-  let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
-  assert!(
-    matches!(
-      err,
-      Error::RankMismatch(ref p)
-        if p.context() == "encode: model last_hidden_state must be rank-3 (batch, seq_len, hidden)"
-        && p.actual() == 1
-    ),
-    "expected RankMismatch(last_hidden_state, actual=1), got {err:?}"
   );
 }
