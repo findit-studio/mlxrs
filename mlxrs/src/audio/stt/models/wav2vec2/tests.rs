@@ -387,3 +387,34 @@ fn linear_with_and_without_bias() {
   let mut yb = linear(&x, &w, Some(&bias)).unwrap();
   assert_eq!(yb.to_vec::<f32>().unwrap(), vec![11.0, 22.0]);
 }
+
+// ───────────────────────── loader error paths ─────────────────────────
+
+#[test]
+fn load_rejects_missing_local_directory() {
+  // A non-existent local path is a clear MissingKey, never a panic / network
+  // attempt.
+  let missing = format!("/nonexistent/mlxrs_wav2vec2_{}/model", std::process::id());
+  assert!(matches!(
+    Wav2Vec2Ctc::load(&missing),
+    Err(Error::MissingKey(_))
+  ));
+}
+
+#[test]
+fn load_errors_when_safetensors_absent() {
+  // A directory with a valid config.json but no model.safetensors is a clear
+  // MissingKey (sharded checkpoints are not handled by this single-file path).
+  let dir = std::env::temp_dir().join(format!("mlxrs_wav2vec2_load_no_st_{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  std::fs::write(dir.join("config.json"), r#"{"model_type": "wav2vec2"}"#).unwrap();
+  let err = Wav2Vec2Ctc::load(&dir.to_string_lossy());
+  let _ = std::fs::remove_dir_all(&dir);
+  // `Wav2Vec2Ctc` is not `Debug` (it holds `Array`s), so assert on the variant
+  // without formatting the `Ok` payload.
+  assert!(
+    matches!(err, Err(Error::MissingKey(_))),
+    "expected MissingKey for a dir with no model.safetensors"
+  );
+}

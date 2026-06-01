@@ -929,6 +929,48 @@ impl Wav2Vec2Ctc {
     let tokens = ctc_greedy_collapse(first_row);
     Ok(self.vocab.tokens_to_text(&tokens).trim().to_string())
   }
+
+  /// Load a model from a local on-disk directory — the convenience entry
+  /// point mirroring mlx-audio's `stt.load` for this architecture.
+  ///
+  /// Resolves `path` via [`crate::audio::load::get_model_path`] (local-only;
+  /// a Hub id is rejected per the project's no-network policy), reads and
+  /// parses `config.json`, loads + [`sanitize`]s the single un-sharded
+  /// `model.safetensors`, and reads the character `vocab.json` (so
+  /// [`Wav2Vec2Ctc::transcribe`] works). `vocab.json` is optional — if absent
+  /// the model still loads and [`Wav2Vec2Ctc::forward`] works, but
+  /// `transcribe` then errors.
+  ///
+  /// Only the single-file `model.safetensors` layout (the `base-960h`
+  /// checkpoint) is handled here; sharded checkpoints are not (a missing file
+  /// is a clear [`Error::MissingKey`]).
+  pub fn load(path: &str) -> Result<Self> {
+    let dir = crate::audio::load::get_model_path(path)?;
+    let config_json = crate::audio::load::load_config(&dir)?;
+    let config = Wav2Vec2Config::from_json(&config_json)?;
+
+    let weights_path = dir.join("model.safetensors");
+    if !weights_path.is_file() {
+      return Err(Error::MissingKey(MissingKeyPayload::new(
+        "Wav2Vec2Ctc::load: model.safetensors not found (sharded checkpoints unsupported)",
+        format_smolstr!("{}", weights_path.display()),
+      )));
+    }
+    let raw = crate::io::load_safetensors(&weights_path)?;
+    let weights = sanitize(raw)?;
+
+    // vocab.json is optional; an absent file leaves an empty Vocab (forward
+    // still works, transcribe then errors with a clear message). Reuse the
+    // shared bounded reader so a hostile directory can't OOM the loader.
+    let vocab_path = dir.join("vocab.json");
+    let vocab = match crate::lm::load::read_bounded_config_file(&vocab_path, "wav2vec2 vocab.json")?
+    {
+      Some(body) => Vocab::from_json(&body)?,
+      None => Vocab::default(),
+    };
+
+    Self::from_weights(config, weights, vocab)
+  }
 }
 
 /// Zero-mean / unit-variance waveform normalization, HF's
