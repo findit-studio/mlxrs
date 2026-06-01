@@ -1046,6 +1046,46 @@ fn from_weights_accepts_correctly_shaped_base_960h() {
 }
 
 #[test]
+fn forward_rejects_over_cap_waveform_length() {
+  // The inherent `forward` path has no STT-pipeline `max_audio_seconds` cap, so
+  // an over-long waveform would otherwise drive the O(T) conv feature maps and
+  // — after the ~320x downsampling — the transformer's O(T'^2) self-attention
+  // without bound (a process-level OOM / DoS). The length guard must reject a
+  // waveform whose last axis exceeds `MAX_INPUT_SAMPLES` up front, BEFORE the
+  // conv stack, with a recoverable typed `OutOfRange` (so the ~3.8 MB zeros
+  // input below never reaches any forward allocation).
+  let model =
+    Wav2Vec2Ctc::from_weights(base_960h_config(), base_960h_weights(), Vocab::default()).unwrap();
+
+  // One sample over the cap: rejected at the guard (a shape read), not run.
+  let over_cap = zeros(&[(Wav2Vec2Ctc::MAX_INPUT_SAMPLES + 1) as i32]);
+  let err = model.forward(&over_cap);
+  assert!(
+    matches!(err, Err(Error::OutOfRange(_))),
+    "an over-cap waveform must be rejected with OutOfRange"
+  );
+
+  // A normal 1 s waveform (16 000 samples) is well under the cap, so the guard
+  // must NOT trip: `forward` builds its lazy graph and returns without the cap
+  // error (the result is left lazy — no eval — so this stays cheap).
+  let one_second = zeros(&[Wav2Vec2Ctc::SAMPLE_RATE as i32]);
+  assert!(
+    !matches!(model.forward(&one_second), Err(Error::OutOfRange(_))),
+    "a 1 s waveform must not be rejected by the length cap"
+  );
+}
+
+#[test]
+fn forward_rejects_over_cap_batched_waveform() {
+  // Last axis == cap, but a batch dimension pushes the TOTAL over the cap: the
+  // old per-axis check missed this; the total-element cap catches it.
+  let model =
+    Wav2Vec2Ctc::from_weights(base_960h_config(), base_960h_weights(), Vocab::default()).unwrap();
+  let over = zeros(&[2, Wav2Vec2Ctc::MAX_INPUT_SAMPLES as i32]);
+  assert!(matches!(model.forward(&over), Err(Error::OutOfRange(_))));
+}
+
+#[test]
 fn from_weights_rejects_wrong_lm_head_output_dim() {
   // A hostile `lm_head.weight` with a huge output dim passes the config gate
   // (vocab_size is a config field, pinned to 32 — but the tensor itself is read

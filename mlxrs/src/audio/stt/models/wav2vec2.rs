@@ -1215,6 +1215,41 @@ impl Wav2Vec2Ctc {
   /// `Model.sample_rate`.
   pub const SAMPLE_RATE: u32 = 16_000;
 
+  /// Conservative upper bound on the TOTAL input element count (batch x time)
+  /// for the inherent [`Wav2Vec2Ctc::forward`] / [`Wav2Vec2Ctc::transcribe`]
+  /// path: 60 s at [`Wav2Vec2Ctc::SAMPLE_RATE`] (960 000 samples) for the common
+  /// mono single-utterance case. The inherent path has no STT-pipeline
+  /// `max_audio_seconds` cap, so an over-large waveform — a long single sequence
+  /// OR a large batch — would otherwise drive the O(N) convolutional feature
+  /// maps and, after the ~320x feature-encoder downsampling, the transformer's
+  /// quadratic self-attention without bound (a process-level OOM / DoS). Inputs
+  /// whose total element count exceeds this are rejected up front with a
+  /// recoverable [`Error::OutOfRange`]; process longer / larger audio in chunks.
+  pub const MAX_INPUT_SAMPLES: usize = Self::SAMPLE_RATE as usize * 60;
+
+  /// Reject an over-cap input waveform before any allocation (see
+  /// [`Wav2Vec2Ctc::MAX_INPUT_SAMPLES`]). `waveform` is `(T,)` or `(B, T)`; the
+  /// last axis is the sample count.
+  fn ensure_input_within_cap(waveform: &Array) -> Result<()> {
+    // Total element count across all axes (batch x time). A checked product so a
+    // pathological shape that would overflow usize saturates to usize::MAX and
+    // takes the rejected path rather than wrapping to a small value.
+    let total = waveform
+      .shape()
+      .iter()
+      .copied()
+      .try_fold(1usize, usize::checked_mul)
+      .unwrap_or(usize::MAX);
+    if total > Self::MAX_INPUT_SAMPLES {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "Wav2Vec2Ctc inherent path: total input samples (batch x time)",
+        "must not exceed MAX_INPUT_SAMPLES (60 s at 16 kHz); process longer or larger audio in chunks",
+        total.to_string(),
+      )));
+    }
+    Ok(())
+  }
+
   /// Build a model from a parsed [`Wav2Vec2Config`], the **sanitized** weight
   /// map (run [`sanitize`] first), and an optional [`Vocab`] (for
   /// [`Wav2Vec2Ctc::transcribe`]).
@@ -1292,6 +1327,7 @@ impl Wav2Vec2Ctc {
   /// [`Wav2Vec2Ctc::transcribe`] for the full normalize → forward → decode
   /// path. Returns a lazy [`Array`] (no implicit eval).
   pub fn forward(&self, waveform: &Array) -> Result<Array> {
+    Self::ensure_input_within_cap(waveform)?;
     let input_values = match waveform.ndim() {
       1 => ops::shape::expand_dims_axes(waveform, &[0])?,
       _ => waveform.try_clone()?,
@@ -1322,6 +1358,7 @@ impl Wav2Vec2Ctc {
   /// `waveform` is `(T,)` or `(B, T)`; only the first batch element's
   /// transcript is returned (matching the reference's `decoded[0]`).
   pub fn transcribe(&self, waveform: &Array) -> Result<String> {
+    Self::ensure_input_within_cap(waveform)?;
     if self.vocab.is_empty() {
       return Err(Error::InvariantViolation(InvariantViolationPayload::new(
         "Wav2Vec2Ctc::transcribe",
