@@ -1,706 +1,799 @@
-//! End-to-end STT generation: load audio → optional resample → log-mel
-//! spectrogram → encoder → token-by-token cross-attention decode loop.
+//! Shared STT decoding drivers for the [`super::model`] trait architecture.
 //!
-//! Ported in shape from mlx-audio's [`stt/generate.py`][stt-gen] (the model-
-//! agnostic top-level entry point) and the per-model decode loops
-//! ([`whisper/whisper.py`][whisper], [`parakeet/parakeet.py`][parakeet] —
-//! consulted for the cross-attention shape, NOT for the per-model
-//! algorithm: greedy / beam / RNN-T expansion / segment alignment etc. live
-//! in per-model code per the
-//! `project_no_per_model_arch_porting` rule).
+//! Two families share one decoding seam each, both producing a
+//! [`Transcription`] through the universal [`Transcribe`](super::model::Transcribe) contract. Each is a
+//! free function a model calls from inside its own [`Transcribe`](super::model::Transcribe) impl — never
+//! a blanket impl (a blanket would occupy the [`Transcribe`](super::model::Transcribe) slot for *every*
+//! model in the family, so a model could never supply a custom decode, which
+//! Rust coherence forbids without specialization):
 //!
-//! [`stt_generate`] composes [`crate::audio::io::load_audio`],
-//! [`crate::audio::io::resample_linear`],
-//! [`crate::audio::dsp::log_mel_spectrogram`], the
-//! [`super::model::Model`] trait, and the LM's sampler / logits-processor
-//! chain ([`crate::lm::generate::make_sampler`] /
-//! [`crate::lm::generate::make_logits_processors`]) into one
-//! [`Iterator<Item = Result<crate::lm::generate::GenStep>>`][iter] — the
-//! same step-by-step contract the [LM loop][crate::lm::generate::generate_step]
-//! exposes, so callers familiar with the LM loop see no new step shape.
+//! - **CTC** — [`greedy_ctc_transcribe`]: one encoder forward, a per-frame
+//!   `argmax`, a greedy blank-collapse, and the model's vocabulary map.
+//! - **Autoregressive** — [`greedy_transcribe`]: the model's frontend +
+//!   encoder, a fresh per-call cache, and a token-by-token greedy `argmax`
+//!   loop bounded by the decoder's [`AutoregressiveStt::max_context`].
+//!
+//! The shared waveform helpers ([`default_log_mel`], [`resample_waveform`],
+//! and the non-empty-waveform validation both drivers run) live here so the
+//! load/validation/feature-extraction logic is implemented once.
 //!
 //! No implicit eval: every `Array` op is a pure [`crate::ops`] composition
-//! returning `Result`; the only materialization is the token boundary
-//! `.item::<u32>()` the inner LM-side generator handles —
-//! [`stt_generate`] never materializes the encoder states or the logits
-//! itself.
-//!
-//! ## `wired_limit` / generation-stats parity
-//!
-//! mlx-audio's `generate_transcription` (`stt/generate.py:272-413`) wraps
-//! per-model decoding in a `wired_limit(model, [generation_stream])` context
-//! manager and emits per-run `STTOutput` timing fields (`prompt_tokens`,
-//! `generation_tokens`, `prompt_tps`, `generation_tps`, `total_time`).
-//! mlxrs's [`stt_generate`] is the **iterator-shaped** analogue (mirroring
-//! [`crate::lm::generate::generate_step`], NOT the higher-level
-//! [`crate::lm::generate::stream_generate`] that aggregates into
-//! [`crate::lm::generate::GenerationResponse`]); both `wired_limit`
-//! integration and per-run [`crate::lm::generate::GenerationStats`]-shaped
-//! aggregation are intentionally deferred to a coordinated LM/STT follow-up
-//! (mlxrs-safe has no `set_wired_limit` wrapper yet — `mlxrs_sys::
-//! mlx_set_wired_limit` exists but no `crate::memory::set_wired_limit`
-//! surface fn does, and `mlx_device_info_get` for
-//! `max_recommended_working_set_size` is also un-wrapped — both gaps are
-//! shared with the LM side and live with the LM L6 follow-up). The
-//! detailed audit + rationale is in [`super::serializers`] — that module's
-//! header carries the canonical write-up so this loop's doc stays focused
-//! on the decode-step contract.
-//!
-//! [stt-gen]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/generate.py
-//! [whisper]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/whisper/whisper.py
-//! [parakeet]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/parakeet/parakeet.py
-//! [iter]: core::iter::Iterator
-
-use std::path::Path;
-
-use smol_str::format_smolstr;
+//! returning `Result`; the only materializations are the token boundaries (the
+//! `argmax` read-outs) the drivers perform explicitly.
 
 use crate::{
   array::Array,
   audio::{dsp, io as audio_io},
   error::{
-    EmptyInputPayload, Error, LengthMismatchPayload, OutOfRangePayload, RankMismatchPayload,
-    Result, try_extend_from_slice,
-  },
-  lm::{
-    cache::KvCache,
-    generate::{
-      FinishReason, GenConfig, GenStep, LogitsProcessor, Sampler, make_logits_processors,
-      make_sampler,
-    },
+    ArithmeticOverflowPayload, EmptyInputPayload, Error, InvariantViolationPayload,
+    OutOfRangePayload, RankMismatchPayload, Result,
   },
   ops,
 };
 
-/// Default maximum audio duration accepted by [`stt_generate`] when no
-/// override is supplied — `30.0` seconds, mlx-audio whisper's per-segment
-/// context size.
-pub const DEFAULT_MAX_AUDIO_SECONDS: f32 = 30.0;
+use super::model::{
+  AutoregressiveStt, CtcModel, MelConfig, Segment, TranscribeOptions, Transcription,
+};
 
-/// STT generation config — wraps [`crate::lm::generate::GenConfig`] with
-/// audio-specific knobs.
+/// The default TOTAL decoder context — the [`AutoregressiveStt::max_context`]
+/// default — `448`, Whisper's text-decoder context size. [`greedy_transcribe`]
+/// bounds `prompt + generated` by the model's `max_context`, so a model that
+/// never emits its end-of-transcript token cannot drive an unbounded decode
+/// and the decoder is never fed past its positional context.
+pub const DEFAULT_MAX_DECODE_STEPS: usize = 448;
+
+/// A generous-but-bounded sanity cap on a model-provided logits VOCAB axis,
+/// `256 Ki` (`262_144`).
 ///
-/// Composition (not inheritance) lets the LM loop's sampler / penalty /
-/// max-tokens knobs be reused verbatim without re-declaring every field; the
-/// audio-specific fields are pre-allocation safety knobs:
+/// Both drivers take a per-position `argmax` over the vocab axis of logits the
+/// model returns; the axis length is read off the lazy array's [`Array::shape`]
+/// (no `eval`) so an absurd width can be rejected with a typed
+/// [`Error::OutOfRange`] *before* the `argmax`/materialization. Real speech
+/// vocabularies are at most ~256 K tokens, so `256 Ki` admits every real model
+/// yet rejects a denial-of-service shape (a lazily-shaped `(T, huge_vocab)` that
+/// would otherwise materialize multi-GB of intermediate logits before any
+/// error).
+pub const MAX_LOGITS_VOCAB: usize = 256 * 1024;
+
+/// A bound on the TOTAL element count of a model-provided CTC logits grid,
+/// `64 Mi` (`67_108_864`) — the materialization budget for the whole
+/// `(T', vocab)` tensor [`greedy_ctc_transcribe`] reads.
 ///
-/// - `auto_resample` — if the WAV's source sample rate differs from
-///   [`super::model::Model::mel_config`]'s `sample_rate`, run a
-///   [`crate::audio::io::resample_linear`] pass before mel-spec extraction.
-///   Default `true` — matches the standard mlx-audio whisper preprocessing
-///   path (which assumes a 16 kHz input and resamples otherwise).
-/// - `max_audio_seconds` — reject inputs longer than this (recoverable
-///   [`Error::OutOfRange`]). Default [`DEFAULT_MAX_AUDIO_SECONDS`] = 30 s. The
-///   check runs against the **source** duration immediately after
-///   `load_audio`, BEFORE the resample, mel-spectrogram, and encoder passes
-///   allocate — so a crafted / fuzz input claiming long audio cannot drive
-///   a multi-GB allocation through the STT pipeline. The **load-stage
-///   ceiling** is a separate cap inside `audio::io::load_audio`
-///   (`MAX_DECODED_SAMPLES` = 64 Mi samples ≈ 256 MiB, ~17 min of 16 kHz
-///   mono) — `max_audio_seconds` is the layered STT-pipeline cap on top
-///   of that, NOT a replacement for it.
+/// The per-axis caps ([`MAX_LOGITS_VOCAB`] and the time axis against
+/// [`crate::audio::io::MAX_DECODED_SAMPLES`]) bound each dimension
+/// INDEPENDENTLY, but not their product: a lazily-shaped `(T', vocab)` whose
+/// dimensions are each individually under their cap can still have a product of
+/// terabytes of elements (cheap O(1) lazy metadata via broadcast / outer
+/// product), which the `argmax` + `to_vec::<u32>()` would then force `eval` to
+/// materialize — a driver-triggered OOM. So [`greedy_ctc_transcribe`] also
+/// checks `T' * vocab` (a `checked_mul` off the lazy [`Array::shape`], before
+/// any `eval`) against this budget. A real CTC logits is tiny — ~`T'`(~1500 for
+/// 30 s of audio) x `vocab`(~32) ≈ 48 K elements — so `64 Mi` is a wide margin
+/// that admits every real model yet rejects the product-overflow shape.
+pub const MAX_LOGITS_ELEMENTS: usize = 64 * 1024 * 1024;
+
+/// A generous-but-bounded sanity cap on a model-provided
+/// [`AutoregressiveStt::max_context`], `128 Ki` (`131_072`).
 ///
-/// ?DEFERRED: renaming `SttGenConfig` → `GenConfig` (shadows
-/// `mlxrs::lm::generate::GenConfig` which is already widely used).
-pub struct SttGenConfig {
-  /// LM loop config (sampler, max tokens, prefill chunk size, …).
-  lm: GenConfig,
-  /// Resample the input WAV to [`super::model::Model::mel_config`]'s
-  /// `sample_rate` when the source rate differs. Default `true`.
-  auto_resample: bool,
-  /// Maximum accepted audio duration in seconds; inputs longer than this
-  /// return [`Error::OutOfRange`] **before** mel-spectrogram allocation.
-  /// Default [`DEFAULT_MAX_AUDIO_SECONDS`] (30 s, mlx-audio whisper segment).
-  max_audio_seconds: f32,
-}
+/// [`greedy_transcribe`] derives its decode-loop bound (`max_context -
+/// prompt_len`) and the generated-token `Vec`'s growth from `max_context`. A
+/// model is free to report any `max_context`, so an absurd value would make the
+/// loop effectively unbounded and drive an infallible-`push` `Vec` toward OOM
+/// (a never-eot model). Real decoder contexts are at most ~128 K positions, so
+/// `128 Ki` admits every real decoder yet rejects an absurd value — and, once
+/// capped, the generated-token `Vec` is itself bounded by `max_context`, so its
+/// bounded infallible `push` is acceptable.
+pub const MAX_DECODE_CONTEXT: usize = 128 * 1024;
 
-impl SttGenConfig {
-  /// Construct a [`SttGenConfig`] from all fields.
-  pub fn new(lm: GenConfig, auto_resample: bool, max_audio_seconds: f32) -> Self {
-    Self {
-      lm,
-      auto_resample,
-      max_audio_seconds,
-    }
-  }
+/// An absolute backstop on the CUMULATIVE driver `argmax` work across a whole
+/// autoregressive decode — the sum of every step's vocab-axis length —
+/// `256 Mi` (`268_435_456`) logits-vocab elements.
+///
+/// The other [`greedy_transcribe`] guards bound each step INDIVIDUALLY (the
+/// per-step vocab cap [`MAX_LOGITS_VOCAB`]) and the trip count
+/// (`max_context - prompt_len`, with `max_context` capped against
+/// [`MAX_DECODE_CONTEXT`]); their product is the worst-case cumulative work.
+/// That product (`128 Ki` steps x `256 Ki` vocab = `32 Gi` elements) is a far
+/// larger argmax budget than any real decode needs, so even with a caller that
+/// sets no [`TranscribeOptions::max_new_tokens`] and a model that never emits
+/// [`AutoregressiveStt::eot`], the loop can still spend the full context worth
+/// of large-vocab argmaxes. This cap bounds that cumulative work directly: the
+/// loop maintains a running sum of the per-step vocab lengths (in the
+/// `accumulate_decode_work` helper) and aborts with a typed
+/// [`Error::OutOfRange`] the step the sum would exceed this budget, BEFORE that
+/// step's `argmax`.
+///
+/// `256 Mi` is generous for any real STT model: Whisper's worst case is its
+/// `448`-slot context x a ~`52 K` vocab ≈ `23 Mi` cumulative elements, so this
+/// budget is ~`11x` that headroom — a real decoder stays well under it — while
+/// still bounding the never-eot, no-caller-limit denial-of-service.
+pub const MAX_AR_DECODE_WORK: usize = 256 * 1024 * 1024;
 
-  /// Borrow the inner LM loop config.
-  #[inline(always)]
-  pub fn lm(&self) -> &GenConfig {
-    &self.lm
-  }
+/// A generous-but-bounded sanity cap on a model-provided
+/// [`MelConfig::n_mels`], `4 Ki` (`4096`) filterbank bins.
+///
+/// [`default_log_mel`] forwards the model's [`MelConfig`] straight into the
+/// DSP mel front end, where `n_mels` sizes BOTH the `(n_mels, n_freqs)`
+/// filterbank `Vec` and the materialized `(n_mels, num_frames)` mel-output
+/// tensor. `n_mels` is model-provided (read off [`MelConfig::n_mels`]), so a
+/// hostile model could report an absurd value and force a multi-GB filterbank
+/// (and a far larger output tensor) before any of the decode-stage budgets
+/// apply. Real mel front ends are small — Whisper uses `80`, canary `128` — so
+/// `4 Ki` admits every real model yet rejects a denial-of-service width. This
+/// is the per-axis cap; the two product caps ([`MAX_MEL_ELEMENTS`]) bound the
+/// derived tensors whose axes each individually pass.
+pub const MAX_MEL_BINS: usize = 4 * 1024;
 
-  /// Mutably borrow the inner LM loop config.
-  #[inline(always)]
-  pub fn lm_mut(&mut self) -> &mut GenConfig {
-    &mut self.lm
-  }
+/// A bound on the element count of EITHER materialized mel tensor a
+/// [`default_log_mel`] call produces — the `(n_mels, n_freqs)` filterbank or
+/// the `(n_mels, num_frames)` mel output — `64 Mi` (`67_108_864`) elements.
+/// Mirrors [`MAX_LOGITS_ELEMENTS`] (the CTC product budget).
+///
+/// The per-axis [`MAX_MEL_BINS`] cap bounds `n_mels` alone, but NOT its
+/// products: a model whose `n_mels` and `n_fft` each individually pass can
+/// still drive a filterbank (`n_mels * n_freqs`, with `n_freqs = n_fft/2 + 1`)
+/// or a mel output (`n_mels * num_frames`) of terabytes of elements — both of
+/// which the DSP would `eval`/materialize, a driver-triggered OOM. So
+/// [`default_log_mel`] checks BOTH products (via `checked_mul` off the
+/// model-provided [`MelConfig`] fields and a safe upper bound on the STFT frame
+/// count, before any DSP work) against this budget. A real mel front end is
+/// tiny — Whisper's filterbank is `80 * 201 ≈ 16 K` and its 30 s output
+/// `80 * ~3000 ≈ 240 K` elements — so `64 Mi` is a wide margin that admits every
+/// real model yet rejects the product-overflow shape.
+pub const MAX_MEL_ELEMENTS: usize = 64 * 1024 * 1024;
 
-  /// Whether to auto-resample the input WAV.
-  #[inline(always)]
-  pub fn auto_resample(&self) -> bool {
-    self.auto_resample
-  }
-
-  /// Maximum accepted audio duration in seconds.
-  #[inline(always)]
-  pub fn max_audio_seconds(&self) -> f32 {
-    self.max_audio_seconds
-  }
-
-  /// Consume and return the inner [`GenConfig`].
-  pub fn into_lm(self) -> GenConfig {
-    self.lm
-  }
-
-  /// Return `self` with the LM config replaced.
-  pub fn with_lm(self, lm: GenConfig) -> Self {
-    Self { lm, ..self }
-  }
-
-  /// Return `self` with `auto_resample` replaced.
-  pub fn with_auto_resample(self, auto_resample: bool) -> Self {
-    Self {
-      auto_resample,
-      ..self
-    }
-  }
-
-  /// Return `self` with `max_audio_seconds` replaced.
-  pub fn with_max_audio_seconds(self, max_audio_seconds: f32) -> Self {
-    Self {
-      max_audio_seconds,
-      ..self
-    }
-  }
-}
-
-impl Default for SttGenConfig {
-  fn default() -> Self {
-    Self {
-      lm: GenConfig::default(),
-      auto_resample: true,
-      max_audio_seconds: DEFAULT_MAX_AUDIO_SECONDS,
-    }
-  }
-}
-
-/// Build the `Array` mel-spectrogram from a WAV file path, validating the
-/// duration cap **before** the mel-spectrogram allocation. Used by both
-/// [`stt_generate`] and [`encode_audio_file`] so the load → resample →
-/// max-seconds-check → log-mel pipeline is implemented once.
-fn audio_path_to_mel<M: super::model::Model>(
-  model: &M,
-  audio_path: &Path,
-  cfg: &SttGenConfig,
-) -> Result<Array> {
-  // 0. Validate `max_audio_seconds` UP FRONT — before any filesystem or
-  //    decode work — so a malformed cap (NaN / ±inf / zero / negative)
-  //    surfaces as the recoverable `Err` the public docs promise and a
-  //    `samples.len() / sample_rate <= 0.0` comparison can't silently
-  //    reject every input.
-  //
-  //    Two positive guards (`is_finite() && > 0.0`) instead of the
-  //    NaN-catching `!(x > 0.0)`: clippy's `neg_cmp_op_on_partial_ord`
-  //    forbids the negated-comparison shorthand on `f32` because NaN
-  //    makes the negated form non-trivially equivalent. `is_finite()`
-  //    covers both NaN and ±inf, `> 0.0` covers zero/negative.
-  if !cfg.max_audio_seconds().is_finite() || cfg.max_audio_seconds() <= 0.0 {
-    return Err(Error::OutOfRange(OutOfRangePayload::new(
-      "stt_generate: max_audio_seconds",
-      "must be a finite value > 0",
-      format!("{}", cfg.max_audio_seconds()),
+/// Validate a mono `audio` waveform's METADATA — rank, length, cap — WITHOUT
+/// materializing it, returning its sample count.
+///
+/// The shared waveform gate both decode families run. Inspecting
+/// [`Array::shape`] (a `Vec<usize>` read off the lazy array's metadata, no
+/// `eval`) lets a malformed waveform be rejected with a typed error *before*
+/// any unbounded `to_vec` allocation or graph evaluation:
+///
+/// - rank `!= 1` ⇒ [`Error::RankMismatch`] (a 2-D input is NOT silently
+///   flattened to mono; the model decides how to lay out multi-channel audio).
+/// - `0` samples ⇒ [`Error::EmptyInput`] (a zero-sample waveform fabricates a
+///   zero-frame feature map concrete encoders assume is non-empty).
+/// - `> MAX_DECODED_SAMPLES` ⇒ [`Error::OutOfRange`] (the same load-stage cap
+///   [`crate::audio::io::load_audio`] enforces, so an oversized lazily-shaped
+///   array can't drive a multi-GB materialization here).
+fn validate_waveform(audio: &Array) -> Result<usize> {
+  let shape = audio.shape();
+  if shape.len() != 1 {
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "stt: audio waveform must be rank 1 (a mono [samples] array; \
+         multi-channel audio is the model frontend's concern)",
+      shape.len() as u32,
+      shape,
     )));
   }
-
-  // 1. Load. `load_audio` decodes WAV / MP3 / FLAC / OGG-Vorbis (the
-  //    format is auto-detected from the file content). The mlxrs
-  //    pipeline uses a **layered resource cap**:
-  //    - `load_audio` rejects upfront when a container's declared frame
-  //      count exceeds `MAX_DECODED_SAMPLES` = 64 Mi samples ≈ 256 MiB
-  //      at 4 B / f32 (~17 minutes of 16 kHz mono, ~25 minutes of
-  //      44.1 kHz mono), and caps the running decoded length at that
-  //      same ceiling for compressed inputs that omit / under-estimate
-  //      their length. That is the absolute load-stage ceiling.
-  //    - `max_audio_seconds` (default 30 s, the whisper segment size)
-  //      is the STT-pipeline cap; it rejects audio whose source
-  //      duration exceeds the per-utterance limit before the resample
-  //      + mel + encode passes allocate.
-  //
-  //    The layered cap is applied at the LOAD stage via
-  //    `load_audio_with_max_seconds`: it probes the container's source
-  //    sample rate FIRST, then enforces the load-stage cap as
-  //    `src_sr * max_audio_seconds` (clamped to
-  //    `MAX_DECODED_SAMPLES`). For exact-count formats (WAV / FLAC-with-
-  //    STREAMINFO) whose container header declares a sample-exact total
-  //    the rejection fires BEFORE allocating the sample buffer; for
-  //    lossy formats (MP3 / OGG-Vorbis / FLAC-without-STREAMINFO) the
-  //    cap also bounds the per-decoded-buffer push, so the wall-time
-  //    cost of partial decode is bounded by `max_audio_seconds *
-  //    src_sr` worth of decoded f32 frames, not the full 256 MiB
-  //    load-stage ceiling.
-  //
-  //    Source-rate cap (NOT target-rate): deriving the cap from the
-  //    model's target sample rate would spuriously reject valid
-  //    auto-resample inputs whose
-  //    `src_sr > target_sr` (e.g. a 1.0 s 44.1 kHz WAV at a 16 kHz
-  //    model with `max_audio_seconds = 1.0` — declared 44 100 source
-  //    samples vs `target_sr * 1.0 = 16 000` cap). Probing the source
-  //    rate first and capping by `src_sr * max_audio_seconds` keeps
-  //    every input whose source duration is `<= max_audio_seconds`
-  //    decodable regardless of the model's resample target.
-  //    Closes the layered-cap gap.
-  //
-  // Snapshot the model's mel config ONCE: the same
-  // `mc` drives the resample target rate (step 3) and the log-mel
-  // parameters (step 6). Calling `model.mel_config()` multiple times
-  // risks subtle skew if a model computes it dynamically. The load-
-  // stage cap is now source-rate-driven (handled inside
-  // `load_audio_with_max_seconds`), so `mc.sample_rate` no longer
-  // appears in the load-stage budget here.
-  let mc = model.mel_config();
-  let (samples, src_sr) =
-    audio_io::load_audio_with_max_seconds(audio_path, cfg.max_audio_seconds())?;
-
-  // 2. Duration cap — checked against the **source** duration (load_audio's
-  //    `samples.len() / src_sr`) BEFORE resampling allocates a second
-  //    buffer. The source duration is the ground truth: resampling can
-  //    only refactor the same audio span into a different sample count, so
-  //    a long-source over-cap input MUST reject here, before the resample
-  //    pass. Avoids a post-resample-only check: a source
-  //    just-over-cap could be truncated by `resample_linear`'s
-  //    `floor(in * to / from)` and silently pass.
-  //
-  //    f64 arithmetic for the comparison (cap is `f32`, but the
-  //    `samples_len * sr` product can reach `~10^14` at the load_audio cap;
-  //    `f64` mantissa carries it exactly, `f32` would round it). The
-  //    `> cfg.max_audio_seconds as f64` lift keeps both sides in f64 for
-  //    the comparison.
-  let cap_f64 = f64::from(cfg.max_audio_seconds());
-  let src_duration = samples.len() as f64 / f64::from(src_sr);
-  if src_duration > cap_f64 {
-    return Err(Error::OutOfRange(OutOfRangePayload::new(
-      "stt_generate: audio duration (rejected before resample / mel-spec allocation)",
-      "must be <= `max_audio_seconds` cap",
-      format_smolstr!(
-        "duration={src_duration:.3}s, src_sample_rate={src_sr}, samples={}, cap={:.3}s",
-        samples.len(),
-        cfg.max_audio_seconds()
-      ),
-    )));
-  }
-
-  // `mc` was snapshotted ONCE above (calling
-  // `model.mel_config()` twice risks subtle skew if a model computes it
-  // dynamically, and duplicates the work). It drives the resample target
-  // rate (step 3) and the log-mel parameters (step 6). The load-stage
-  // cap is now source-rate-driven and lives inside
-  // `audio_io::load_audio_with_max_seconds`, so `mc.sample_rate` no
-  // longer participates in the load budget.
-
-  // 3. Resample. `mc.sample_rate` is what the model's feature extractor
-  //    was trained on; `resample_linear` is a verbatim copy when the
-  //    rates match (no FP drift) and a naive linear pass otherwise (the
-  //    `mlx-audio` default for Whisper-style models). `auto_resample` off
-  //    + mismatched rates surfaces as a recoverable `Error::OutOfRange` so a
-  //    misconfigured pipeline cannot silently feed wrong-rate mels to the
-  //    model.
-  let target_sr = mc.sample_rate();
-  let samples: Vec<f32> = if src_sr == target_sr {
-    samples
-  } else if cfg.auto_resample() {
-    audio_io::resample_linear(&samples, src_sr, target_sr)?
-  } else {
-    return Err(Error::OutOfRange(OutOfRangePayload::new(
-      "stt_generate: audio sample rate (auto_resample=false)",
-      "must equal model.mel_config().sample_rate (or enable auto_resample / pre-resample)",
-      format_smolstr!("src_sr={src_sr}, target_sr={target_sr}"),
-    )));
-  };
-
-  // 4. Reject empty (or otherwise too-short-to-frame) audio. Fabricating
-  //    an `[n_mels, 0]` zero-frame mel would silently feed an invalid
-  //    shape into `model.encode_audio` — concrete encoders can reasonably
-  //    assume at least one frame and panic / fail deep in per-model code
-  //    on a zero-T input. Surface the empty-WAV case as a clear pipeline
-  //    `Error::EmptyInput` here; too-short-but-non-
-  //    empty inputs are caught downstream by `log_mel_spectrogram`'s own
-  //    reflect-pad guards, which already return a recoverable `Err` with
-  //    a descriptive message.
-  if samples.is_empty() {
+  let len = shape[0];
+  if len == 0 {
     return Err(Error::EmptyInput(EmptyInputPayload::new(
-      "stt_generate: audio input (0 samples after load/resample; \
-         `model.encode_audio` requires at least one mel frame — provide a non-empty WAV)",
+      "stt: audio waveform (0 samples; the model frontend requires at least \
+         one sample — provide a non-empty waveform)",
     )));
   }
+  if len > audio_io::MAX_DECODED_SAMPLES {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt: audio waveform length",
+      "must not exceed MAX_DECODED_SAMPLES (64 Mi samples)",
+      len.to_string(),
+    )));
+  }
+  Ok(len)
+}
 
-  // 5. Build an Array from the f32 buffer. `samples.len()` fits i32 because
-  //    `load_audio`'s `MAX_DECODED_SAMPLES = 64 Mi` and `resample_linear`'s
-  //    `MAX_RESAMPLED_SAMPLES = 64 Mi` are both well below `i32::MAX`.
-  let n_samples = i32::try_from(samples.len()).map_err(|_| {
+/// Read the mono waveform samples out of an `audio` [`Array`] after validating
+/// its metadata ([`validate_waveform`]).
+///
+/// The metadata gate runs FIRST, so an empty / oversized / multi-rank waveform
+/// is rejected with a typed error before the `to_vec` forces an `eval` + an
+/// (otherwise unbounded) `Vec` allocation. Reads through [`Array::try_clone`]
+/// so the caller's shared `&Array` borrow is preserved (the `to_vec` eval
+/// needs `&mut`).
+fn waveform_samples(audio: &Array) -> Result<Vec<f32>> {
+  validate_waveform(audio)?;
+  let samples = audio.try_clone()?.to_vec::<f32>()?;
+  Ok(samples)
+}
+
+/// Resample a mono waveform [`Array`] from `from_rate` to `to_rate`.
+///
+/// A shared helper for models whose source audio rate differs from their
+/// [`MelConfig::sample_rate`]: the trait input to [`Transcribe::transcribe`](super::model::Transcribe::transcribe)
+/// is a bare waveform [`Array`] carrying no sample rate, so a model that wants
+/// the standard Whisper-style resample-on-mismatch runs this inside its
+/// [`AutoregressiveStt::log_mel`] (or before calling [`Transcribe::transcribe`](super::model::Transcribe::transcribe))
+/// once it knows the source rate.
+///
+/// `from_rate == to_rate` is a verbatim copy (no FP drift), matching
+/// [`crate::audio::io::resample_linear`]. The non-empty-waveform validation is
+/// applied first.
+pub fn resample_waveform(audio: &Array, from_rate: u32, to_rate: u32) -> Result<Array> {
+  let samples = waveform_samples(audio)?;
+  let resampled = audio_io::resample_linear(&samples, from_rate, to_rate)?;
+  let n = i32::try_from(resampled.len()).map_err(|_| {
     Error::OutOfRange(OutOfRangePayload::new(
-      "stt_generate: samples.len()",
+      "stt resample_waveform: resampled length",
       "must fit in i32 (i32::MAX = 2147483647)",
-      format_smolstr!("{}", samples.len()),
+      resampled.len().to_string(),
     ))
   })?;
-  let samples_arr = Array::from_slice::<f32>(&samples, &[n_samples])?;
+  Array::from_slice::<f32>(&resampled, &[n])
+}
 
-  // 6. log-mel spectrogram. Output shape `(n_mels, T)` per the
-  //    mlx-audio / Whisper canonical layout — fed straight into
-  //    `model.encode_audio`. Threads `mc.log_floor` through the
-  //    `_with` variant so a Kaldi/Custom-floor model (custom `LogFloor`)
-  //    is encoded with its own floor instead of the hard-coded Whisper
-  //    `1e-10`. Reuses the `mc` snapshot
-  //    taken once at the top of this function.
+/// The default log-mel frontend for [`AutoregressiveStt::log_mel`]: validate a
+/// non-empty waveform, then run [`crate::audio::dsp::log_mel_spectrogram_with`]
+/// with `cfg`'s parameters (including its [`crate::audio::dsp::LogFloor`]).
+///
+/// Output shape `(n_mels, T)` — the mlx-audio / Whisper canonical layout fed
+/// straight into [`AutoregressiveStt::encode`]. Assumes `audio` is already at
+/// `cfg`'s [`MelConfig::sample_rate`]; a model resampling a different source
+/// rate does so (e.g. via [`resample_waveform`]) before calling this.
+///
+/// The model-provided [`MelConfig`] magnitudes are capped BEFORE the DSP call —
+/// off the plain config fields, so a denial-of-service config is rejected with a
+/// typed error with NO mel materialization (the model's `n_mels` sizes both the
+/// filterbank and the mel output, neither of which the decode-stage budgets
+/// bound):
+///
+/// - `n_mels == 0` ⇒ [`Error::InvariantViolation`] (a degenerate filterbank);
+///   `n_mels > MAX_MEL_BINS` ⇒ [`Error::OutOfRange`];
+/// - `n_fft == 0` / `hop_length == 0` ⇒ [`Error::InvariantViolation`] (so the
+///   derived frame bounds are well-defined);
+/// - the filterbank PRODUCT `n_mels * n_freqs` (with `n_freqs = n_fft/2 + 1`)
+///   and the mel-output PRODUCT `n_mels * num_frames` (with a SAFE upper bound
+///   on the STFT frame count derived from the validated sample count) each
+///   against [`MAX_MEL_ELEMENTS`] via `checked_mul` — so a config whose axes
+///   each individually pass but whose product is terabytes of elements is still
+///   rejected with no allocation.
+pub fn default_log_mel(cfg: &MelConfig, audio: &Array) -> Result<Array> {
+  // Validate the waveform metadata first (rank/non-empty/cap); the returned
+  // sample count bounds the mel-output frame count below.
+  let samples = validate_waveform(audio)?;
+
+  // Cap the model-provided `MelConfig` magnitudes BEFORE forwarding them to the
+  // DSP. `default_log_mel` hands `cfg`'s fields straight into the mel front end,
+  // where `n_mels` sizes BOTH the `(n_mels, n_freqs)` filterbank `Vec` and the
+  // materialized `(n_mels, num_frames)` mel output. The decode-stage budgets
+  // (vocab/context/decode-work) only apply AFTER the encoder consumes this mel,
+  // so without a driver-owned cap here a hostile model could report an absurd
+  // `n_mels` (or an `n_mels`/`n_fft` pair whose products are huge) and force a
+  // multi-GB filterbank / terabyte-scale mel output before any later guard runs
+  // — the same per-axis-bounded-but-product-unbounded mode the CTC
+  // `MAX_LOGITS_ELEMENTS` guard already defends. All reads are off the plain
+  // `MelConfig` values (no `eval`); arithmetic is `checked_*`.
+  let n_mels = cfg.n_mels();
+  let n_fft = cfg.n_fft();
+  let hop_length = cfg.hop_length();
+
+  // (1) A zero-bin filterbank is a degenerate config (no mel bands); reject it
+  // up front so the products below are well-defined.
+  if n_mels == 0 {
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "stt default_log_mel: MelConfig n_mels",
+      "must be > 0 (a zero-bin mel filterbank is degenerate)",
+    )));
+  }
+  // (1) Per-axis cap on the filterbank bin count.
+  if n_mels > MAX_MEL_BINS {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt default_log_mel: MelConfig n_mels",
+      "must not exceed MAX_MEL_BINS (4 Ki)",
+      n_mels.to_string(),
+    )));
+  }
+  // (2) `n_fft == 0` / `hop_length == 0` make the derived frame bounds below
+  // undefined (a div-by-zero hop / a degenerate FFT). Reject them here — ahead
+  // of the DSP, which rejects them too — so the product bounds are well-defined.
+  if n_fft == 0 {
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "stt default_log_mel: MelConfig n_fft",
+      "must be > 0",
+    )));
+  }
+  if hop_length == 0 {
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "stt default_log_mel: MelConfig hop_length",
+      "must be > 0",
+    )));
+  }
+  // One-sided real-FFT bin count: `n_freqs == n_fft / 2 + 1` (the filterbank's
+  // free axis). `n_fft / 2 + 1` cannot overflow `usize` (`n_fft / 2 <= n_fft`).
+  let n_freqs = n_fft / 2 + 1;
+
+  // (3) FILTERBANK-product guard: bound the `(n_mels, n_freqs)` filterbank Vec
+  // the DSP materializes. The per-axis `n_mels` cap above does NOT bound this
+  // product — a legal `n_mels` paired with a large (legal) `n_fft` still yields
+  // a multi-Gi filterbank. `checked_mul` off the plain config values rejects an
+  // overflow or an over-budget product BEFORE the DSP builds the bank.
+  let filterbank_elems = n_mels.checked_mul(n_freqs).ok_or_else(|| {
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "stt default_log_mel: mel filterbank element count (n_mels * n_freqs)",
+      "usize",
+      [("n_mels", n_mels as u64), ("n_freqs", n_freqs as u64)],
+    ))
+  })?;
+  if filterbank_elems > MAX_MEL_ELEMENTS {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt default_log_mel: mel filterbank element count (n_mels * n_freqs)",
+      "must not exceed MAX_MEL_ELEMENTS (64 Mi)",
+      filterbank_elems.to_string(),
+    )));
+  }
+
+  // (4) MEL-OUTPUT-product guard: bound the `(n_mels, num_frames)` mel tensor
+  // the DSP materializes. The DSP's centered STFT (`mlx_audio.dsp.stft`
+  // default, see `dsp::stft_with_config`) reflect-pads the signal by `n_fft / 2`
+  // each side, so its actual frame count is `num_frames = 1 + samples /
+  // hop_length`. We compute a SAFE upper bound from the driver's own values —
+  // `num_frames_ub = 1 + (samples + n_fft) / hop_length` — which is `>= ` that
+  // actual count (the `+ n_fft` slack only inflates it), so the product bound is
+  // never an under-estimate. `checked_*` throughout: an overflow is a typed
+  // error, never a wrap.
+  let padded_ub = samples.checked_add(n_fft).ok_or_else(|| {
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "stt default_log_mel: padded length upper bound (samples + n_fft)",
+      "usize",
+      [("samples", samples as u64), ("n_fft", n_fft as u64)],
+    ))
+  })?;
+  // `+ 1` cannot overflow: `padded_ub / hop_length <= padded_ub < usize::MAX`
+  // once `samples + n_fft` did not overflow above.
+  let num_frames_ub = padded_ub / hop_length + 1;
+  let mel_output_elems = n_mels.checked_mul(num_frames_ub).ok_or_else(|| {
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "stt default_log_mel: mel output element count (n_mels * num_frames)",
+      "usize",
+      [
+        ("n_mels", n_mels as u64),
+        ("num_frames_ub", num_frames_ub as u64),
+      ],
+    ))
+  })?;
+  if mel_output_elems > MAX_MEL_ELEMENTS {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt default_log_mel: mel output element count (n_mels * num_frames)",
+      "must not exceed MAX_MEL_ELEMENTS (64 Mi)",
+      mel_output_elems.to_string(),
+    )));
+  }
+
+  // Gates passed: hand the ORIGINAL lazy `&Array` straight to
+  // `log_mel_spectrogram_with` — it accepts an `Array` and runs its own
+  // pre-eval guards, so there is no `to_vec` + rebuild round-trip (no forced
+  // materialization, no extra `Vec`).
   dsp::log_mel_spectrogram_with(
-    &samples_arr,
-    mc.n_fft(),
-    mc.hop_length(),
-    mc.win_length(),
-    mc.n_mels(),
-    mc.sample_rate(),
-    mc.f_min(),
-    mc.f_max(),
-    mc.log_floor(),
+    audio,
+    cfg.n_fft(),
+    cfg.hop_length(),
+    cfg.win_length(),
+    cfg.n_mels(),
+    cfg.sample_rate(),
+    cfg.f_min(),
+    cfg.f_max(),
+    cfg.log_floor(),
   )
 }
 
-/// The [`Iterator`] returned by [`stt_generate`]: borrows the model and
-/// owns the encoder states, the per-layer KV cache, the sampler, the
-/// logits processors, and the running token / step counters. Yields one
-/// [`GenStep`] per decode step (the same step type the [LM
-/// loop][crate::lm::generate] yields, so callers familiar with the LM loop
-/// see no new step shape).
+/// The CTC greedy-collapse driver, callable from a model's own [`Transcribe`](super::model::Transcribe)
+/// impl.
 ///
-/// Lifetime `'a` ties to the borrowed model (same pattern as the LM-side
-/// generator returned by [`crate::lm::generate::generate_step`]); the
-/// cache is owned so the iterator fully owns the in-flight decode state.
+/// One encoder forward ([`CtcModel::logits`]) produces `(T', vocab)` per-frame
+/// logits; the driver takes a per-frame `argmax`, collapses consecutive
+/// duplicate ids and drops the blank id ([`CtcModel::blank_id`]) — the
+/// standard CTC greedy decode — then maps the surviving ids to text via
+/// [`CtcModel::decode_ids`]. The result is a single untimed [`Segment`]
+/// spanning the whole utterance (CTC carries no per-frame time bounds through
+/// this trait).
 ///
-/// The iterator **fuses**: after it yields `Err` (a step failed) or
-/// finishes (eos / `max_tokens`) every further `next()` is `None` — never a
-/// panic, never a re-entry into the model (the same `done` flag pattern the
-/// LM loop uses).
-pub struct SttGenerator<'a, M> {
-  model: &'a M,
-  /// The output of [`super::model::Model::encode_audio`] — passed
-  /// unchanged into every [`super::model::Model::decode_step`] call (one
-  /// encode pass per utterance, faithful to mlx-audio whisper's
-  /// `audio_features = self.encoder(mel)` once before the decoding loop).
-  encoder_states: Array,
-  /// One [`KvCache`] per decoder layer (typically the LM
-  /// [`crate::lm::cache::make_prompt_cache`] output for a whisper-style
-  /// self-attention decoder; per-model code may pre-populate cross-attn
-  /// caches here too — the trait is opaque to the cache list's shape).
-  cache: Vec<Box<dyn KvCache>>,
-  sampler: Sampler,
-  processors: Vec<LogitsProcessor>,
-  /// The running token history fed to the logits processors (mirrors the
-  /// LM loop's `history` Vec — extended with each step's input token before
-  /// processors run, so penalty processors see the same history shape).
-  history: Vec<u32>,
-  /// The most-recently sampled token; seeded with
-  /// [`super::model::Model::bos_token`] on the first step (mlx-audio
-  /// whisper's `tokens[0] == sot`).
-  last: u32,
-  /// Tokens yielded so far (LM-loop equivalent of `n`); generation ends at
-  /// `max_tokens`.
-  produced: usize,
-  max_tokens: usize,
-  /// Stop-token set: per-model `eos_token()` plus any caller override via
-  /// [`GenConfig::with_eos`][crate::lm::generate::GenConfig::with_eos]
-  /// (the union, so a caller can add task-specific stop tokens — e.g.
-  /// whisper's `<|endoftext|>` plus a custom timestamp-end marker — without
-  /// dropping the model's own EOS).
-  eos: Vec<u32>,
-  /// Fused: set after a yielded `Err` or a finish so the iterator never
-  /// re-enters the model.
-  done: bool,
+/// NOT a blanket impl: a blanket `impl<M: CtcModel> Transcribe` would occupy
+/// the [`Transcribe`](super::model::Transcribe) slot for every CTC model, so a model could never supply
+/// its own [`Transcribe`](super::model::Transcribe) (a conflicting impl Rust coherence rejects). Each
+/// CTC model instead calls this from inside its own [`Transcribe`](super::model::Transcribe) impl —
+/// symmetric with [`greedy_transcribe`] for [`AutoregressiveStt`].
+///
+/// Validates the input waveform metadata (rank / length / cap) before the
+/// encoder forward, and the returned logits' shape `(T', vocab)`: a malformed
+/// rank is a typed [`Error::RankMismatch`]; an empty vocab axis (`vocab == 0`)
+/// a typed [`Error::EmptyInput`] (mirroring the autoregressive guard). An empty
+/// TIME axis (`T' == 0`) is well-defined — an empty [`Transcription`] (no ids
+/// survive to collapse) — not an error.
+///
+/// The model-provided logits magnitudes are also capped — off the lazy
+/// [`Array::shape`], so a denial-of-service shape is rejected BEFORE any
+/// `argmax`/`to_vec` materialization, each a typed [`Error::OutOfRange`]:
+///
+/// - the time axis `T'` against BOTH the validated input sample count (a valid
+///   feature extractor emits no more frames than it had input samples) AND the
+///   absolute [`crate::audio::io::MAX_DECODED_SAMPLES`] cap;
+/// - the vocab axis against [`MAX_LOGITS_VOCAB`];
+/// - the PRODUCT `T' * vocab` (the total elements the `argmax`/`to_vec` would
+///   materialize) against [`MAX_LOGITS_ELEMENTS`], via a `checked_mul` off the
+///   lazy shape — so a `(T', vocab)` whose axes each individually pass their cap
+///   but whose product is terabytes of elements is still rejected with no
+///   allocation.
+pub fn greedy_ctc_transcribe<M: CtcModel + ?Sized>(
+  model: &M,
+  audio: &Array,
+  _opts: &TranscribeOptions,
+) -> Result<Transcription> {
+  // Reject an empty / oversized / multi-rank waveform before the encoder
+  // forward (the CTC frontend can reasonably assume a non-empty mono input).
+  // Keep the validated sample count: a valid feature extractor emits no more
+  // frames `T'` than it had input samples, so `samples` is the natural per-input
+  // bound on the model-provided time axis below.
+  let samples = validate_waveform(audio)?;
+
+  // Per-frame logits `(T', vocab)`; validate the rank so a malformed encoder
+  // output surfaces as a typed error rather than a confusing `argmax` shape.
+  let logits = model.logits(audio)?;
+  let shape = logits.shape();
+  if shape.len() != 2 {
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "stt CtcModel::logits must be rank 2 (shape [T', vocab])",
+      shape.len() as u32,
+      shape,
+    )));
+  }
+  // Cap the model-provided TIME axis `T'` (frame count) BEFORE the `argmax` +
+  // `to_vec::<u32>()` below. `shape` is read off the lazy array's metadata (no
+  // `eval`), so a model returning a lazily-shaped `(huge_T', vocab)` is rejected
+  // here with NO allocation — rather than materializing one `u32` per frame
+  // (an OOM). Two bounds apply: the validated input sample count (a valid
+  // feature extractor emits no more frames than it had input samples, so a
+  // normal-length input cannot be amplified into a huge frame axis) and the
+  // absolute `MAX_DECODED_SAMPLES` cap (a hard ceiling regardless of input).
+  if shape[0] > samples {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt CtcModel::logits time axis (T', frame count)",
+      "must not exceed the input sample count (a valid feature extractor emits \
+         no more frames than input samples)",
+      shape[0].to_string(),
+    )));
+  }
+  if shape[0] > audio_io::MAX_DECODED_SAMPLES {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt CtcModel::logits time axis (T', frame count)",
+      "must not exceed MAX_DECODED_SAMPLES (64 Mi — a valid model emits no more \
+         frames than input samples)",
+      shape[0].to_string(),
+    )));
+  }
+  // Cap the model-provided VOCAB axis BEFORE the `argmax`, so a lazily-shaped
+  // `(T', huge_vocab)` is rejected with no materialization of the argmax over a
+  // multi-GB-wide axis.
+  if shape[1] > MAX_LOGITS_VOCAB {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt CtcModel::logits vocab axis",
+      "must not exceed MAX_LOGITS_VOCAB (256 Ki)",
+      shape[1].to_string(),
+    )));
+  }
+  // Empty vocab axis: argmax over an empty axis is undefined — typed error
+  // (mirrors the `AutoregressiveStt::decode_step` empty-vocab guard).
+  if shape[1] == 0 {
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "stt CtcModel::logits returned an empty vocab axis (vocab == 0)",
+    )));
+  }
+  // Cap the PRODUCT `T' * vocab` BEFORE the `argmax` + `to_vec::<u32>()`. The
+  // two per-axis caps above bound each dimension independently but NOT their
+  // product: a lazily-shaped `(T', vocab)` whose axes each individually pass
+  // (e.g. via broadcast / outer-product, O(1) lazy metadata) can still total
+  // terabytes of elements, which the `argmax`/`to_vec` would force `eval` to
+  // materialize — an OOM. `checked_mul` off the lazy `shape` (no `eval`) rejects
+  // an overflow (`None`) or an over-budget product with a typed error and NO
+  // allocation, so this is the last shape gate before the materialization below.
+  match shape[0].checked_mul(shape[1]) {
+    Some(elements) if elements <= MAX_LOGITS_ELEMENTS => {}
+    _ => {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "stt CtcModel::logits element count (T' * vocab)",
+        "must not overflow and must not exceed MAX_LOGITS_ELEMENTS (64 Mi)",
+        format!("{} * {}", shape[0], shape[1]),
+      )));
+    }
+  }
+  // Read the model-provided blank id EXACTLY ONCE: `blank_id` is `&self`, so an
+  // interior-mutability model could otherwise return one value to the range
+  // check below and a different one to the collapse — a TOCTOU that smuggles an
+  // unvalidated blank into the decode. The single cached `blank` is the value
+  // both validated and used.
+  let blank = model.blank_id();
+  // The blank id must index into the vocab axis: a `blank` outside `[0, vocab)`
+  // can never equal a per-frame `argmax` (which is always in range), so its
+  // blank frames would survive the collapse and be fed to the infallible
+  // `decode_ids` — silent bad text (or an index panic in a real vocab map).
+  // Reject it up front with a typed error carrying the cached value.
+  if (blank as usize) >= shape[1] {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt CtcModel::blank_id",
+      "must be < the logits vocab size (a blank id outside the vocab axis \
+         leaves blank frames un-collapsed)",
+      blank.to_string(),
+    )));
+  }
+  // Empty time axis `(0, vocab)`: no frames to collapse → an empty
+  // transcription (an explicit, non-panicking definition). Route the empty
+  // collapse through `decode_ids(&[])` — exactly as the all-blank path below
+  // does — so the two semantically-identical "no surviving ids" inputs produce
+  // identical text (a model whose `decode_ids(&[])` emits a sentinel must not
+  // disagree between an empty-time and an all-blank input). The blank-id range
+  // check above already precedes this branch, so reaching `decode_ids` here is
+  // sound.
+  if shape[0] == 0 {
+    let text = model.decode_ids(&[]);
+    let segments = vec![Segment::new(text.clone(), 0.0, 0.0)];
+    return Ok(Transcription::new(text, None, segments));
+  }
+
+  // Per-frame argmax over the vocab axis → `(T',)` class ids.
+  let mut frame_ids = ops::misc::argmax(&logits, Some(1), false)?;
+  let ids = frame_ids.to_vec::<u32>()?;
+
+  // Greedy CTC collapse: drop consecutive duplicates, then drop the blank.
+  // Reuses the `blank` validated above — never re-calls `model.blank_id()`, so
+  // the collapsed-out id is exactly the one that passed the range check.
+  let mut collapsed: Vec<u32> = Vec::new();
+  let mut prev: Option<u32> = None;
+  for &id in &ids {
+    if prev != Some(id) {
+      if id != blank {
+        collapsed.push(id);
+      }
+      prev = Some(id);
+    }
+  }
+
+  let text = model.decode_ids(&collapsed);
+  let segments = vec![Segment::new(text.clone(), 0.0, 0.0)];
+  Ok(Transcription::new(text, None, segments))
 }
 
-impl<M: super::model::Model> SttGenerator<'_, M> {
-  /// One decode step — mirrors the LM loop's per-step shape (forward then
-  /// last-position slice then history-accumulate then logits processors
-  /// then `logits - logsumexp` then sampler then `GenStep`) but routes
-  /// through [`super::model::Model::decode_step`] which already returns the
-  /// `[1, V]` last-position logits directly (so no last-position-slice step
-  /// is needed).
-  fn step(&mut self) -> Result<GenStep> {
-    // 1. decode step. The model returns `[1, V]` logits directly — STT
-    //    decoders are autoregressive token-at-a-time, so there is no
-    //    "prefill chunk" / "[B, S, V]" intermediate the LM loop has.
-    let logits = self
-      .model
-      .decode_step(self.last, &self.encoder_states, &mut self.cache)?;
+/// The generic autoregressive greedy decode loop, callable from a model's own
+/// [`Transcribe`](super::model::Transcribe) impl.
+///
+/// Procedure (using only the [`AutoregressiveStt`] hooks):
+/// 1. [`AutoregressiveStt::log_mel`] — the model's frontend → log-mel features.
+/// 2. [`AutoregressiveStt::encode`] — one encoder pass; states reused below.
+/// 3. [`AutoregressiveStt::new_cache`] — a fresh, owned decode cache.
+/// 4. [`AutoregressiveStt::initial_tokens`] — the prompt prefix to seed from.
+/// 5. Greedy loop: [`AutoregressiveStt::decode_step`] → `(vocab,)` next-token
+///    logits, take `argmax`, stop at [`AutoregressiveStt::eot`], else append
+///    and continue. The [`AutoregressiveStt::eot`] id is read once and
+///    range-checked against EVERY step's actual vocab axis (an `eot` outside
+///    `[0, vocab)` can never be produced by `argmax`, so it is a typed
+///    [`Error::OutOfRange`] rather than a never-stopping loop). The check runs
+///    per step — not once — so an interior-mutable model that shrinks its vocab
+///    on a later step (making `eot` out of range there) is still rejected
+///    rather than looping to `max_context`.
+///
+/// The loop is bounded by the model's [`AutoregressiveStt::max_context`]: it
+/// generates AT MOST `max_context - prompt.len()` new tokens, so
+/// `prompt + generated` never exceeds the decoder's total positional context
+/// (a prompt that already meets or exceeds `max_context` is a typed
+/// [`Error::OutOfRange`] — there is no room left to decode). A caller may lower
+/// that bound further via [`TranscribeOptions::max_new_tokens`]: the loop then
+/// generates at most `min(max_context - prompt.len(), max_new_tokens)` (a
+/// caller limit larger than the remaining context is harmlessly clamped to the
+/// context; `None` uses the full context). The model-provided `max_context` is
+/// itself capped against [`MAX_DECODE_CONTEXT`] BEFORE the loop (a typed
+/// [`Error::OutOfRange`]), so an absurd value can neither drive an
+/// effectively-unbounded loop nor an unbounded generated-token `Vec` (its
+/// growth is then bounded by `max_context`, so the per-step `push` is a bounded
+/// infallible append). Each step's `(vocab,)` logits width is likewise capped
+/// against [`MAX_LOGITS_VOCAB`] before its `argmax`.
+///
+/// As an absolute backstop independent of the caller, the CUMULATIVE driver
+/// `argmax` work — the running sum of every step's vocab-axis length — is
+/// bounded by [`MAX_AR_DECODE_WORK`] (via the `accumulate_decode_work` helper),
+/// checked each step BEFORE that step's `argmax`. This bounds the total argmax
+/// work a
+/// never-eot model can drive even when the caller sets no `max_new_tokens`
+/// (the per-step vocab cap x the `max_context` trip count is otherwise a large
+/// cumulative budget); over-budget (or a `usize` overflow of the accumulator)
+/// is a typed [`Error::OutOfRange`].
+///
+/// Because the [`AutoregressiveStt`] surface carries no detokenizer, the
+/// returned [`Transcription`]'s text is the decoded token-id sequence (the
+/// tokens produced *after* the prompt prefix) rendered as a space-separated
+/// decimal string — the deterministic, model-agnostic output the loop itself
+/// controls. A model that detokenizes to natural text implements its own
+/// [`Transcribe`](super::model::Transcribe) (Whisper does), reusing these hooks internally.
+///
+/// NOT a blanket impl: a blanket `impl<M: AutoregressiveStt> Transcribe` would
+/// overlap-conflict with such model-specific impls, which Rust coherence
+/// forbids without specialization.
+pub fn greedy_transcribe<M: AutoregressiveStt + ?Sized>(
+  m: &M,
+  audio: &Array,
+  opts: &TranscribeOptions,
+) -> Result<Transcription> {
+  // Driver-owned preflight, BEFORE any model frontend call. `log_mel` is
+  // overrideable, so a custom frontend that skips its own waveform validation
+  // could otherwise eval/copy a rank-2 / empty / oversized `Array` before this
+  // shared gate; and an over-context prompt must be rejected before the full
+  // frontend + encode is spent. So validate the waveform metadata and the
+  // prompt length here — ahead of `log_mel`, `encode`, and `new_cache`.
+  validate_waveform(audio)?;
 
-    // Validate the returned logits shape `[1, V]` (mirrors the LM loop's
-    // `last_position` rank/zero-axis check). A `decode_step` impl returning
-    // anything else is a per-model defect; surface it as a recoverable
-    // `Err` rather than letting `apply_logit_bias` / `logsumexp` produce a
-    // confusing downstream error.
-    // Split the compound shape gate into typed sub-checks so callers can
-    // discriminate rank mismatch (rank != 2) from batch-size mismatch
-    // (rank 2 but batch != 1) from empty-vocab degeneracy (rank 2, batch
-    // 1, but V == 0). Per the typed-error contract, each failure-class
-    // gets its own variant rather than collapsing to a single OutOfRange.
+  let mut tokens = m.initial_tokens(opts)?;
+  let prompt_len = tokens.len();
+
+  // Bound `prompt + generated` by the decoder's TOTAL context: a prompt that
+  // already fills (or overflows) `max_context` leaves no room to decode.
+  let max_ctx = m.max_context();
+  // Cap the model-provided `max_context` BEFORE deriving `max_new` / entering
+  // the loop. `max_context` is model-provided and otherwise only compared to
+  // `prompt_len`, so an absurd value makes `max_new = max_ctx - prompt_len` an
+  // effectively unbounded decode with infallible `tokens.push` growth — an OOM
+  // (a never-eot model). Rejecting it here with a typed error bounds both the
+  // loop trip count and the generated-token `Vec` by `MAX_DECODE_CONTEXT`.
+  if max_ctx > MAX_DECODE_CONTEXT {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt AutoregressiveStt::max_context",
+      "must not exceed MAX_DECODE_CONTEXT (128 Ki)",
+      max_ctx.to_string(),
+    )));
+  }
+  if prompt_len >= max_ctx {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt greedy_transcribe: initial_tokens prompt length",
+      "must be < the decoder's max_context (prompt exceeds decoder context, \
+         leaving no room to generate)",
+      prompt_len.to_string(),
+    )));
+  }
+
+  // Gates passed: run the model frontend → encode → fresh cache, then decode.
+  let mel = m.log_mel(audio)?;
+  let enc = m.encode(&mel)?;
+  let mut cache = m.new_cache();
+  // Read the model-provided end-of-transcript id EXACTLY ONCE. `eot` is `&self`
+  // and the loop compares every `argmax` against it; capturing it in a local
+  // means a later mutation of the model can't swap the stop token mid-decode.
+  // The VALUE is read once here; its range-check (below) runs per step against
+  // that step's own vocab axis.
+  let eot = m.eot();
+
+  // The decoder-context bound on new tokens, so the total never exceeds
+  // `max_ctx`. A caller-supplied `max_new_tokens` further lowers it (clamped to
+  // this bound, so a caller limit larger than the remaining context is
+  // harmlessly capped to the context).
+  let cap_new = max_ctx - prompt_len;
+  let max_new = opts.max_new_tokens().map_or(cap_new, |n| n.min(cap_new));
+
+  // Cumulative driver-`argmax` work (sum of every step's vocab length). The
+  // per-step vocab cap + the `max_new` trip count already bound this, but their
+  // PRODUCT can still be a huge cumulative argmax budget for a never-eot model
+  // with no caller limit; this accumulator caps the cumulative work directly
+  // (checked each step BEFORE that step's argmax, see `accumulate_decode_work`).
+  let mut decode_work: usize = 0;
+
+  for _ in 0..max_new {
+    let logits = m.decode_step(&mut cache, &enc, &tokens)?;
+
+    // Validate the `(vocab,)` next-token logits shape so a malformed
+    // `decode_step` surfaces as a typed error rather than a confusing
+    // `argmax`/`item` failure downstream.
     let shape = logits.shape();
-    if shape.len() != 2 {
-      let actual = shape.len() as u32;
+    if shape.len() != 1 {
       return Err(Error::RankMismatch(RankMismatchPayload::new(
-        "stt_generate: `decode_step` returned logits must be rank 2 (shape [1, V])",
-        actual,
+        "stt AutoregressiveStt::decode_step must return rank-1 next-token logits (shape [vocab])",
+        shape.len() as u32,
         shape,
       )));
     }
-    if shape[0] != 1 {
-      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
-        "stt_generate: `decode_step` returned logits batch dim (must be 1; only single-utterance decoding is supported)",
-        1,
-        shape[0],
-      )));
-    }
-    if shape[1] == 0 {
+    let vocab_len = shape[0];
+    if vocab_len == 0 {
       return Err(Error::EmptyInput(EmptyInputPayload::new(
-        "stt_generate: `decode_step` returned logits vocab dim (V == 0)",
+        "stt AutoregressiveStt::decode_step returned an empty vocab axis (vocab == 0)",
+      )));
+    }
+    // Cap THIS step's model-provided vocab axis BEFORE the `argmax` below, so a
+    // lazily-shaped `(huge_vocab,)` row is rejected with no materialization of
+    // an argmax over a multi-GB-wide axis. Re-checked per step (like the `eot`
+    // range check) so an interior-mutable model that returns an absurd width on
+    // a later step is still caught.
+    if vocab_len > MAX_LOGITS_VOCAB {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "stt AutoregressiveStt::decode_step vocab axis",
+        "must not exceed MAX_LOGITS_VOCAB (256 Ki)",
+        vocab_len.to_string(),
       )));
     }
 
-    // 2. accumulate the step's *input* token (the previously-sampled
-    //    token, i.e. `self.last`) into the running history before running
-    //    processors — same shape as the LM loop's
-    //    `history.extend_from_slice(input)` + per-processor application
-    //    over the FULL history on RAW logits.
-    let mut logits = logits;
-    if !self.processors.is_empty() {
-      try_extend_from_slice(&mut self.history, &[self.last])?;
-      for p in &self.processors {
-        logits = p.apply(&self.history, &logits)?;
-      }
+    // Range-check the cached `eot` against THIS step's vocab axis, every step.
+    // An `eot >= vocab_len` could never be produced by `argmax`, so the loop's
+    // `next == eot` stop condition would never fire — reject it with a typed
+    // error instead of running to `max_context` and returning bogus output.
+    // Re-checking per step (not once via a latch) defends against an
+    // interior-mutable model that returns a large vocab on an early step
+    // (passing) then a SMALLER vocab on a later step where `eot` is out of
+    // range. It is a single `usize` compare per step (negligible); a
+    // consistent-vocab model never triggers it.
+    if (eot as usize) >= vocab_len {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "stt AutoregressiveStt::eot",
+        "must be < the decode_step logits vocab size (an eot outside the \
+           vocab axis can never be produced by argmax, so the greedy loop \
+           would never stop)",
+        eot.to_string(),
+      )));
     }
 
-    // 3. `logprobs = logits - logsumexp(logits, keepdims=True)` — the exact
-    //    LM-loop normalization (mlx-lm's `generate_step` line 416).
-    let lse = ops::reduction::logsumexp(&logits, true)?;
-    let logprobs = ops::arithmetic::subtract(&logits, &lse)?;
+    // Accumulate this step's `argmax` cost into the cumulative decode-work
+    // budget BEFORE the `argmax` below. Even with every per-step + trip-count
+    // guard above, a never-eot model and a caller that set no `max_new_tokens`
+    // could otherwise spend `max_context` steps x a large per-step vocab of
+    // cumulative argmax work; `accumulate_decode_work` caps that running sum
+    // against `MAX_AR_DECODE_WORK` and returns a typed error (on over-budget or
+    // `usize` overflow) so the loop aborts here rather than at `max_context`.
+    decode_work = accumulate_decode_work(decode_work, vocab_len)?;
 
-    // 4. sample. The sampler chain is built by `make_sampler` from
-    //    `self.lm` (the LM loop's exact sampler composition); the default
-    //    `temp == 0` resolves to the deterministic argmax sampler.
-    let mut sampled = self.sampler.sample(&logprobs)?;
+    // Greedy argmax over the vocab axis; the only materialization.
+    let mut next_arr = ops::misc::argmax(&logits, None, false)?;
+    let next: u32 = next_arr.item::<u32>()?;
 
-    // 5. token boundary — the only materialization (LM loop's `y.item()`).
-    //    `argmax` / `categorical` both yield `U32`.
-    let token: u32 = sampled.item::<u32>()?;
+    if next == eot {
+      break;
+    }
+    tokens.push(next);
+  }
 
-    // mlx-lm returns `logprobs.squeeze(0)` ⇒ `[V]` vector. Kept lazy.
-    // L3 `GenStep.logprobs` is `Option<Array>`: audio STT has not adopted
-    // the [`crate::lm::generate::GenConfig::collect_logprobs`] opt-in,
-    // so we always emit `Some` to preserve the prior unconditional yield.
-    let logprobs = ops::shape::squeeze_axes(&logprobs, &[0])?;
-    // #114: provisional `step_index`/`finish_reason` — the iterator
-    // overrides `finish_reason` to `Some("stop")` on the EOS step,
-    // mirroring `lm::generate::Generator::step` + its `Iterator::next`.
-    Ok(GenStep {
-      token,
-      logprobs: Some(logprobs),
-      step_index: self.produced,
-      finish_reason: None,
-    })
+  // The decoded ids are everything after the prompt prefix.
+  let decoded = &tokens[prompt_len..];
+  let text = render_token_ids(decoded);
+  let language = opts.language().map(str::to_owned);
+  let segments = vec![Segment::new(text.clone(), 0.0, 0.0)];
+  Ok(Transcription::new(text, language, segments))
+}
+
+/// Add one decode step's vocab-axis length `step_vocab` to the running
+/// cumulative-`argmax`-work accumulator `work`, enforcing the
+/// [`MAX_AR_DECODE_WORK`] backstop.
+///
+/// Returns the new accumulated total on success, or a typed
+/// [`Error::OutOfRange`] when the addition overflows `usize` OR the new total
+/// would exceed [`MAX_AR_DECODE_WORK`]. [`greedy_transcribe`] calls this each
+/// step with that step's vocab length (read off the lazy [`Array::shape`]) and
+/// aborts on the error BEFORE the step's `argmax`, so the cumulative driver
+/// argmax work is bounded even when the caller sets no
+/// [`TranscribeOptions::max_new_tokens`] and the model never emits
+/// [`AutoregressiveStt::eot`].
+///
+/// Factored out as a pure function so the budget arithmetic is unit-testable
+/// without running a real (giant) decode loop.
+fn accumulate_decode_work(work: usize, step_vocab: usize) -> Result<usize> {
+  match work.checked_add(step_vocab) {
+    Some(total) if total <= MAX_AR_DECODE_WORK => Ok(total),
+    _ => Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt greedy_transcribe: cumulative decode work (sum of per-step vocab lengths)",
+      "must not overflow and must not exceed MAX_AR_DECODE_WORK (256 Mi)",
+      work.to_string(),
+    ))),
   }
 }
 
-impl<M: super::model::Model> Iterator for SttGenerator<'_, M> {
-  type Item = Result<GenStep>;
-
-  fn next(&mut self) -> Option<Self::Item> {
-    // Fused: a prior Err or a finish ends iteration permanently — no
-    // panic, no re-entry into the model.
-    if self.done {
-      return None;
+/// Render a decoded token-id sequence as a space-separated decimal string —
+/// the model-agnostic text [`greedy_transcribe`] produces when the
+/// [`AutoregressiveStt`] surface carries no detokenizer (real models override
+/// [`Transcribe`](super::model::Transcribe) to emit natural text).
+fn render_token_ids(ids: &[u32]) -> String {
+  use std::fmt::Write as _;
+  let mut out = String::new();
+  for (i, id) in ids.iter().enumerate() {
+    if i != 0 {
+      out.push(' ');
     }
-
-    // Exactly `max_tokens` tokens (LM loop's "length" finish):
-    // `if n == max_tokens: break` BEFORE the yield.
-    if self.produced >= self.max_tokens {
-      self.done = true;
-      return None;
-    }
-
-    match self.step() {
-      Ok(mut step) => {
-        self.produced += 1;
-        let token = step.token;
-        self.last = token;
-        // Same "yield EOS then fuse" pattern the LM loop uses — the EOS
-        // token IS yielded so callers can decode it through their own
-        // detokenizer; iteration ends after.
-        if self.eos.contains(&token) {
-          self.done = true;
-          // #114: "stop" reason on the EOS step (mirrors
-          // `lm::generate::Generator::next` + VLM).
-          step.finish_reason = Some(FinishReason::Eos);
-        }
-        Some(Ok(step))
-      }
-      Err(e) => {
-        // A step error is yielded once, then the iterator ends.
-        self.done = true;
-        Some(Err(e))
-      }
-    }
+    // `write!` formats the integer in place (no per-element `String` alloc);
+    // writing to a `String` is infallible, so the `Result` is discarded.
+    let _ = write!(out, "{id}");
   }
+  out
 }
 
-/// Start an end-to-end STT generation run.
-///
-/// Pipeline (mlx-audio whisper / parakeet shape):
-/// 1. [`crate::audio::io::load_audio`] (mono `Vec<f32>` in `[-1, 1]`).
-/// 2. Optional [`crate::audio::io::resample_linear`] when the source sample
-///    rate differs from [`super::model::Model::mel_config`]'s `sample_rate`
-///    (gated by [`SttGenConfig::auto_resample`]).
-/// 3. [`SttGenConfig::max_audio_seconds`] cap (checked BEFORE the mel-
-///    spectrogram allocation; rejects crafted long-duration inputs).
-/// 4. [`crate::audio::dsp::log_mel_spectrogram`] using the model's
-///    [`super::model::Model::mel_config`]; output shape `(n_mels, T)`.
-/// 5. [`super::model::Model::encode_audio`] — one pass, cached on the
-///    returned [`SttGenerator`].
-/// 6. Token-by-token decode via [`super::model::Model::decode_step`] (seeded
-///    with [`super::model::Model::bos_token`]); sampled via the LM loop's
-///    [`make_sampler`] / [`make_logits_processors`] chain — so every LM
-///    sampler / penalty knob is available verbatim through
-///    [`SttGenConfig::lm`].
-///
-/// Returns an [`Iterator`]`<Item = Result<GenStep>>` — the same per-step
-/// contract the LM loop returns. Iteration ends on the EOS token (the
-/// union of [`super::model::Model::eos_token`] and the eos override set via
-/// [`GenConfig::with_eos`][crate::lm::generate::GenConfig::with_eos]; the
-/// EOS token IS yielded as the final step) or after
-/// [`GenConfig::max_tokens`][crate::lm::generate::GenConfig::max_tokens]
-/// tokens have been produced.
-///
-/// Any step error is yielded once as `Err`, after which the iterator ends
-/// (no panic, no re-entry into the model — the same fused-iterator
-/// contract the LM loop guarantees).
-///
-/// `cache` is the per-layer KV cache (typically
-/// [`crate::lm::cache::make_prompt_cache`] for self-attention-only
-/// decoders; per-model code that pre-populates cross-attention caches
-/// passes them here). The `'a` lifetime on the model borrow + the owned
-/// cache means no aliasing.
-pub fn stt_generate<'a, M: super::model::Model>(
-  model: &'a M,
-  audio_path: &Path,
-  cache: Vec<Box<dyn KvCache>>,
-  cfg: SttGenConfig,
-) -> Result<SttGenerator<'a, M>> {
-  // Eager scalar-bound validation of every sampler /
-  // logits-processor knob in `cfg.lm` BEFORE the audio pipeline runs
-  // (see #136). The sampler-
-  // build path catches only a SUBSET of bounds at build time (the
-  // per-primitive validations in `crate::lm::sample::apply_*` only fire
-  // when the closure runs against logits), so an invalid `cfg` would
-  // pass the constructor + run the entire audio load + resample + mel +
-  // encode pipeline before erroring on the first decode step.
-  // `cfg.lm.validate()` collapses that window — a misconfigured
-  // sampler / penalty fails fast from the constructor without paying
-  // the audio / encode cost, mirroring the same eager gate
-  // [`crate::lm::generate::generate_step`] uses (one coordinated
-  // change, both loops uniformly).
-  cfg.lm().validate()?;
-
-  // Build the sampler / logits-processor chain FIRST — BEFORE the
-  // expensive audio load + resample + mel + `encode_audio` pipeline, so a
-  // gen config that `make_sampler` / `make_logits_processors` rejects at
-  // BUILD time (e.g. a logit_bias index/value-arity mismatch) fails fast
-  // from the constructor without paying the audio/encode cost.
-  // The eager `cfg.lm().validate()` above covers every scalar
-  // sampler / processor bound; the closure-build path still catches the
-  // dynamic-bound + `make_sampler`-internal constraints (e.g. a
-  // logit_bias `(indices, values)` arity check the eager pass can't
-  // perform without rebuilding the same vectors). Built by reference
-  // from `cfg.lm()` so `cfg` stays intact for `audio_path_to_mel`; the
-  // owned fields are moved out afterward.
-  let (sampler, processors) = {
-    let lm = cfg.lm();
-    let sampler = make_sampler(
-      lm.temp,
-      lm.top_p,
-      lm.min_p,
-      lm.min_tokens_to_keep,
-      lm.top_k,
-      lm.xtc_probability,
-      lm.xtc_threshold,
-      &lm.xtc_special_tokens,
-      lm.seed,
-    )?;
-    let processors = make_logits_processors(
-      &lm.logit_bias,
-      lm.repetition_penalty,
-      lm.repetition_context_size,
-      lm.presence_penalty,
-      lm.presence_context_size,
-      lm.frequency_penalty,
-      lm.frequency_context_size,
-    )?;
-    (sampler, processors)
-  };
-
-  // Now the (potentially expensive) audio pipeline — steps 1-6 of the doc
-  // above. Eager (not deferred) so audio errors surface as the
-  // constructor's `Result` ("WAV file not found" / "audio too long")
-  // without the caller having to poll `.next()`.
-  let mel = audio_path_to_mel(model, audio_path, &cfg)?;
-  let encoder_states = model.encode_audio(&mel)?;
-
-  // Move the owned LM fields out of `cfg` for the iterator (the eos
-  // override `Vec<u32>` consumed without a clone — by-value-consume style
-  // matching the LM `generate_step`). The earlier `cfg.lm()` borrow + the
-  // `&cfg` audio borrow have both ended, so this partial move is sound.
-  // Consume cfg into its constituent parts now that the audio borrows are done.
-  let lm = cfg.into_lm();
-  let max_tokens = lm.max_tokens;
-  let cfg_eos = lm.eos;
-
-  // EOS union: model.eos_token() ∪ cfg.lm.eos. The model's EOS is always
-  // a stop token (no way for the caller to opt out — the model's own
-  // identity); the LM `eos` override adds any extras (custom timestamp /
-  // task tokens) without dropping the model's identity. `cfg_eos` is the
-  // moved-out `Vec<u32>` (no clone, no per-call alloc).
-  let model_eos = model.eos_token();
-  let mut eos: Vec<u32> = cfg_eos;
-  if !eos.contains(&model_eos) {
-    eos.push(model_eos);
-  }
-
-  Ok(SttGenerator {
-    model,
-    encoder_states,
-    cache,
-    sampler,
-    processors,
-    history: Vec::new(),
-    last: model.bos_token(),
-    produced: 0,
-    max_tokens,
-    eos,
-    done: false,
-  })
-}
-
-/// Encode `audio_path` into the model's encoder hidden states.
-///
-/// Runs steps 1-5 of [`stt_generate`]'s pipeline (load → optional resample →
-/// duration cap → log-mel spectrogram → [`super::model::Model::encode_audio`])
-/// and returns the resulting encoder states. Useful for callers that want
-/// to run multi-pass decoding (e.g. beam search across multiple hypotheses)
-/// without re-encoding the same audio for every pass, or that want to cache
-/// the encoder output across multiple [`stt_generate`] runs sharing the same
-/// input.
-pub fn encode_audio_file<M: super::model::Model>(
-  model: &M,
-  audio_path: &Path,
-  cfg: &SttGenConfig,
-) -> Result<Array> {
-  let mel = audio_path_to_mel(model, audio_path, cfg)?;
-  model.encode_audio(&mel)
-}
+#[cfg(test)]
+mod tests;

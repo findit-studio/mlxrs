@@ -835,19 +835,13 @@ impl GenConfig {
   /// [`make_sampler`] / [`make_logits_processors`] build closures whose
   /// purely-scalar bounds (`temp < 0`, `min_p > 1`, `xtc_probability` out
   /// of range, a negative `repetition_penalty`, …) are checked INSIDE the
-  /// closure when it first runs against logits. So both
-  /// [`generate_step`] (LM) and [`crate::audio::stt::generate::stt_generate`]
-  /// (STT) had a window where an invalid `cfg` could pass the constructor
-  /// then run an entire prompt prefill (LM) — or an audio load, resample,
-  /// log-mel, and encoder pass (STT) — **before** surfacing the scalar-
-  /// bound `Err` on the first decode step. `validate()` collapses that
-  /// window: LM's [`generate_step`] calls it before any model work (the
-  /// `Err` becomes the iterator's first `pending_err` yield, like a
-  /// sampler-construction error); STT's
-  /// [`crate::audio::stt::generate::stt_generate`] calls it at the top of
-  /// the constructor (before the expensive audio pipeline runs), so a
-  /// misconfigured `cfg` fails fast in both loops with the same `Err`
-  /// regardless of which entry point the caller invokes.
+  /// closure when it first runs against logits. So [`generate_step`] had a
+  /// window where an invalid `cfg` could pass the constructor then run an
+  /// entire prompt prefill **before** surfacing the scalar-bound `Err` on
+  /// the first decode step. `validate()` collapses that window:
+  /// [`generate_step`] calls it before any model work (the `Err` becomes the
+  /// iterator's first `pending_err` yield, like a sampler-construction
+  /// error), so a misconfigured `cfg` fails fast.
   ///
   /// # Defense in depth
   ///

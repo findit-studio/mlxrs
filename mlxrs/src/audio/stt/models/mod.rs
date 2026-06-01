@@ -2,7 +2,7 @@
 //!
 //! Each architecture here is ported directly (weights, layer order, numerics)
 //! rather than left to user code, because it does not fit the autoregressive
-//! [`crate::audio::stt::model::Model`] trait (encoder + per-token
+//! [`crate::audio::stt::model::AutoregressiveStt`] trait (encoder + per-token
 //! cross-attention `decode_step` + KV cache). They are CTC / non-AR models
 //! whose inference is a single forward over the raw waveform followed by a
 //! greedy per-frame collapse, so each exposes its own inherent API instead.

@@ -16,7 +16,7 @@
 //!
 //! mlxrs's audio + lm trait surfaces already expose
 //! architecture-agnostic seams ([`crate::audio::vad::VadModel`] /
-//! [`crate::audio::stt::model::Model`] / [`crate::lm::model::Model`] /
+//! [`crate::audio::stt::model::Transcribe`] / [`crate::lm::model::Model`] /
 //! [`crate::audio::tts::model::TtsModel`]), but their signatures speak
 //! in **whole-utterance** terms (full audio → tokens) — the
 //! orchestrator's per-frame loop needs a streaming-shaped view
@@ -76,9 +76,8 @@ pub trait VadFrameAdapter {
   fn is_speech(&mut self, frame: &[f32]) -> Result<bool>;
 }
 
-/// Per-turn STT adapter — the streaming shape
-/// [`crate::audio::stt::model::Model`]'s
-/// `encode_audio` + `decode_step` contract can't express directly.
+/// Per-turn STT adapter — the per-turn shape the orchestrator drives on top
+/// of the whole-utterance [`crate::audio::stt::model::Transcribe`] contract.
 ///
 /// `transcribe_turn` consumes the full audio of one user turn
 /// (the concatenated chunker output between VAD start-of-speech
@@ -86,8 +85,8 @@ pub trait VadFrameAdapter {
 /// text.
 ///
 /// The default implementor is in user code (a struct wrapping a
-/// loaded whisper / parakeet / Voxtral STT `dyn Model` that drives
-/// `crate::audio::stt::stt_generate` to completion).
+/// loaded whisper / parakeet / Voxtral STT `dyn Transcribe` whose
+/// `transcribe` it drives per turn).
 pub trait SttTurnAdapter {
   /// Transcribe one full turn's audio.
   ///

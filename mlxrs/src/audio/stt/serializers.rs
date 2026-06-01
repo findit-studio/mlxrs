@@ -2,11 +2,11 @@
 //! mlx-audio's [`stt/generate.py`][stt-gen] (`save_as_txt` / `save_as_srt` /
 //! `save_as_vtt` / `save_as_json` plus the `format_timestamp` /
 //! `format_vtt_timestamp` helpers, lines 104-225). The serializer surface is
-//! the model-agnostic counterpart of the [`super::generate::stt_generate`]
-//! decode loop: a concrete per-model decoder (whisper / parakeet / canary /
-//! …) terminates by building a [`Transcript`] from its sampled tokens +
-//! per-segment timing info, and the user then writes that [`Transcript`] to
-//! disk in whichever format their downstream tool consumes.
+//! the model-agnostic counterpart of the [`super::generate`] decode drivers:
+//! a concrete per-model decoder (whisper / parakeet / canary / …) terminates
+//! by building a [`Transcript`] from its sampled tokens + per-segment timing
+//! info, and the user then writes that [`Transcript`] to disk in whichever
+//! format their downstream tool consumes.
 //!
 //! ## Reference shape
 //!
@@ -42,15 +42,17 @@
 //! Rust-ergonomic because downstream tooling (CLI wrappers, batch scripts)
 //! already passes the base path without extension.
 //!
-//! ## `wired_limit` / generation-stats parity audit on `stt/generate.rs`
+//! ## `wired_limit` / generation-stats parity audit
 //!
 //! mlx-audio's `generate_transcription` (`stt/generate.py:272-413`) wraps the
 //! per-model decoder call in a `wired_limit(model, [generation_stream])`
 //! context manager (`stt/generate.py:232-269`) that calls
 //! `mx.set_wired_limit(max_recommended_working_set_size)` for the duration of
-//! the decode + restores the old limit on exit. mlxrs's
-//! [`super::generate::stt_generate`] (issue [#176][a13]) does **not**
-//! integrate `wired_limit` for two reasons:
+//! the decode + restores the old limit on exit, and reports per-run
+//! [`GenerationStats`][gs]-shaped timing — `total_time`, `prompt_tokens`,
+//! `generation_tokens`, `prompt_tps`, `generation_tps` — packed into the
+//! per-model `STTOutput` dataclass. mlxrs's [`super::generate`] drivers (issue
+//! [#176][a13]) integrate **neither** yet:
 //!
 //! 1. **No mlxrs-safe wrapper for `mlx_set_wired_limit` exists yet.** The
 //!    `mlxrs-sys` FFI exposes
@@ -60,36 +62,14 @@
 //!    `max_recommended_working_set_size`) also has no safe wrapper. Both are
 //!    LM-side `wired_limit` integration prerequisites (`mlx-lm/generate.py`
 //!    has the identical context manager) and live with the LM L6 follow-up,
-//!    NOT this STT-serializers port. The STT loop will integrate
+//!    NOT this STT-serializers port. The STT drivers will integrate
 //!    `wired_limit` once the LM loop does — the same shared support surface,
 //!    threaded behind whatever safe API the LM L6 lands.
-//! 2. **mlxrs's STT loop is iterator-shaped, not a single-call wrapper.**
-//!    [`super::generate::stt_generate`] returns an `Iterator<Item =
-//!    Result<GenStep>>` (mirroring the LM
-//!    [`crate::lm::generate::generate_step`] shape), so the analogue of
-//!    python's `with wired_limit(model, [stream]): ... decode ...` is the
-//!    caller wrapping their `.collect()` (or per-step `.next()` loop) in a
-//!    `WiredLimitGuard` — the same caller-driven pattern
-//!    `crate::lm::generate::stream_generate` will use once the LM L6 FFI
-//!    surface is in place. A single per-call `wired_limit` integration
-//!    inside `stt_generate` would lock the limit only while the constructor
-//!    runs, NOT while the iterator is being driven — which would be worse
-//!    than no integration (a misleading "we set the wired limit" claim that
-//!    silently doesn't cover the decode work).
-//!
-//! Similarly, mlx-audio's `generate_transcription` reports per-run
-//! [`GenerationStats`][gs]-shaped timing — `total_time`, `prompt_tokens`,
-//! `generation_tokens`, `prompt_tps`, `generation_tps` — packed into the
-//! per-model `STTOutput` dataclass. mlxrs's
-//! [`super::generate::stt_generate`] returns the lower-level per-step
-//! [`crate::lm::generate::GenStep`] iterator, mirroring
-//! [`crate::lm::generate::generate_step`] (NOT the higher-level
-//! [`crate::lm::generate::stream_generate`] that aggregates into
-//! [`crate::lm::generate::GenerationResponse`] with the `prompt_tps` /
-//! `generation_tps` fields). A `GenerationStats`-shaped aggregator wrapper
-//! around `stt_generate` is the natural follow-up to ship alongside the
-//! `wired_limit` integration (the same wrapping idiom both loops will
-//! share); it doesn't belong in the per-step iterator itself.
+//! 2. **Generation-stats aggregation is deferred too.** A
+//!    [`GenerationStats`][gs]-shaped timing aggregator is the natural
+//!    follow-up to ship alongside the `wired_limit` integration (the same
+//!    shared support surface both loops will use); it doesn't belong in the
+//!    decode drivers themselves.
 //!
 //! [stt-gen]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/generate.py
 //! [palign]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/parakeet/alignment.py
