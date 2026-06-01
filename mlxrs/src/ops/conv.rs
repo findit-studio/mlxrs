@@ -105,6 +105,7 @@ fn check_conv_no_overflow(
     dil: i128,
     idil: i128,
     strd: i128,
+    slice_runs: bool,
   ) -> Result<()> {
     // Dilated kernel extent: dil * (wt - 1) + 1.
     let dwt = dil * (wt_d - 1);
@@ -138,6 +139,11 @@ fn check_conv_no_overflow(
     let st = s.clamp(0, in_d);
     let ed = e.clamp(0, in_d).max(st);
     let sliced_in = ed - st;
+    if slice_runs {
+      // normalize_slice out_shape for this axis is ed - st + stride - 1 (stride
+      // 1 for the conv slice); the `ed - st + 1` intermediate must fit i32.
+      fits(context, sliced_in + 1)?;
+    }
     // conv_out_shape: id = idil * (sliced - 1) + 1;
     // out = (id + pad_lo + pad_hi - kd) / stride + 1, negatives normalized to 0.
     let din = idil * (sliced_in - 1);
@@ -195,13 +201,18 @@ fn check_conv_no_overflow(
     Ok((padding_lo, padding_hi))
   }
   // When negative padding triggers MLX's `slice`, `normalize_slice` runs over
-  // EVERY dimension (batch/channel too, not just spatial) computing
-  // `(ed - st + stride - 1)`; for the conv slice (stride 1) the intermediate is
-  // `dim + 1`, which overflows iff a dimension is i32::MAX. Reject that.
-  fn check_slice_all_dims(context: &'static str, shape: &[usize]) -> Result<()> {
-    for &d in shape {
-      let d = i128::from(i32::try_from(d).map_err(|_| conv_overflow_err(context))?);
-      fits(context, d + 1)?;
+  // EVERY dimension computing `(ed - st + stride - 1)`. The spatial axes are
+  // checked per-axis on their *sliced* length inside `check_forward_axis`; the
+  // untouched batch and channel axes keep their full length, so their `dim + 1`
+  // intermediate (stride 1) overflows iff that dimension is i32::MAX.
+  fn check_nonspatial_slice(context: &'static str, shape: &[usize]) -> Result<()> {
+    if let Some(&batch) = shape.first() {
+      let batch = i128::from(i32::try_from(batch).map_err(|_| conv_overflow_err(context))?);
+      fits(context, batch + 1)?;
+    }
+    if let Some(&channels) = shape.last() {
+      let channels = i128::from(i32::try_from(channels).map_err(|_| conv_overflow_err(context))?);
+      fits(context, channels + 1)?;
     }
     Ok(())
   }
@@ -221,8 +232,9 @@ fn check_conv_no_overflow(
         return Ok(());
       }
       // Negative padding on any spatial axis makes MLX slice every dimension.
-      if (0..nd - 2).any(|i| param(pad_lo, i, 0) < 0 || param(pad_hi, i, 0) < 0) {
-        check_slice_all_dims(context, &in_shape)?;
+      let slice_runs = (0..nd - 2).any(|i| param(pad_lo, i, 0) < 0 || param(pad_hi, i, 0) < 0);
+      if slice_runs {
+        check_nonspatial_slice(context, &in_shape)?;
       }
       for axis in 0..nd - 2 {
         let in_d =
@@ -234,7 +246,7 @@ fn check_conv_no_overflow(
         let dil = i128::from(param(kernel_dilation, axis, 1));
         let idil = i128::from(param(input_dilation, axis, 1));
         let strd = i128::from(param(stride, axis, 1));
-        check_forward_axis(context, in_d, wt_d, plo, phi, dil, idil, strd)?;
+        check_forward_axis(context, in_d, wt_d, plo, phi, dil, idil, strd, slice_runs)?;
       }
     }
     Some(out_pad) => {
@@ -243,6 +255,8 @@ fn check_conv_no_overflow(
       // every axis whose dimensions exist, regardless of rank validity.
       let arity = stride.len();
       let rank_valid = wt_shape.len() == nd && nd == arity + 2;
+      // Pass 1: check the prelude over every existing axis and learn whether the
+      // nested conv_general's slice runs (any derived padding is negative).
       let mut nested_has_neg = false;
       for i in 0..arity {
         if 1 + i >= in_shape.len() || 1 + i >= wt_shape.len() {
@@ -261,13 +275,37 @@ fn check_conv_no_overflow(
         if padding_lo < 0 || padding_hi < 0 {
           nested_has_neg = true;
         }
-        if rank_valid {
-          // Nested conv_general (forward; stride 1, input_dilation = stride).
-          check_forward_axis(context, in_d, wt_d, padding_lo, padding_hi, dil, strd, 1)?;
-        }
       }
-      if rank_valid && nested_has_neg {
-        check_slice_all_dims(context, &in_shape)?;
+      // Pass 2: the nested forward conv_general (only when the rank is valid, so
+      // every `1 + i` index exists). Re-derives the prelude padding.
+      if rank_valid {
+        if nested_has_neg {
+          check_nonspatial_slice(context, &in_shape)?;
+        }
+        for i in 0..arity {
+          let in_d =
+            i128::from(i32::try_from(in_shape[1 + i]).map_err(|_| conv_overflow_err(context))?);
+          let wt_d =
+            i128::from(i32::try_from(wt_shape[1 + i]).map_err(|_| conv_overflow_err(context))?);
+          let pad = i128::from(param(pad_lo, i, 0));
+          let dil = i128::from(param(kernel_dilation, i, 1));
+          let strd = i128::from(param(stride, i, 1));
+          let op = i128::from(param(out_pad, i, 0));
+          let (padding_lo, padding_hi) =
+            check_transpose_prelude_axis(context, in_d, wt_d, pad, dil, strd, op)?;
+          // Nested conv_general (forward; stride 1, input_dilation = stride).
+          check_forward_axis(
+            context,
+            in_d,
+            wt_d,
+            padding_lo,
+            padding_hi,
+            dil,
+            strd,
+            1,
+            nested_has_neg,
+          )?;
+        }
       }
     }
   }
@@ -928,5 +966,20 @@ mod tests {
     let err = conv_general(&input, &weight, &[1], &[0], &[-1], &[1], &[1], 1, false)
       .expect_err("i32::MAX dim + negative-padding slice overflow must be rejected");
     assert!(matches!(err, Error::OutOfRange(_)), "got {err:?}");
+  }
+
+  #[test]
+  fn conv_general_allows_cropped_huge_spatial_axis() {
+    // A lazy [1, i32::MAX, 1] input cropped by 1 (padding_hi = -1) is valid: the
+    // spatial axis slices to i32::MAX - 1, so MLX's shape setup stays in range.
+    // The guard must NOT reject it just because the original spatial dim is
+    // i32::MAX — only untouched batch/channel axes at i32::MAX overflow the slice
+    // (Codex round-6 counterexample).
+    let input = Array::zeros::<f32>(&[1, i32::MAX, 1]).unwrap();
+    let weight = Array::from_slice::<f32>(&[1.0], &[1, 1, 1]).unwrap();
+    assert!(
+      conv_general(&input, &weight, &[1], &[0], &[-1], &[1], &[1], 1, false).is_ok(),
+      "cropped i32::MAX spatial axis must not be falsely rejected"
+    );
   }
 }
