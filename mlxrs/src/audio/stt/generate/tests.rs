@@ -1226,6 +1226,160 @@ fn rank2_waveform_is_rejected_by_helpers() {
 }
 
 // ===========================================================================
+// `default_log_mel` MelConfig magnitude caps — close the LAST resource-
+// magnitude path (the mel front end). A hostile model's `MelConfig` is read
+// off plain fields and guarded BEFORE any DSP work, so a denial-of-service
+// `n_mels` / product is rejected with a typed error and NO mel materialization.
+// (`MelConfig::new` order: n_fft, hop_length, win_length, n_mels, sample_rate,
+// f_min, f_max, log_floor.)
+// ===========================================================================
+
+/// A lazily-shaped `(len,)` `zeros` waveform: the sample count exists on the
+/// lazy array's metadata (which `validate_waveform` + the mel caps read off
+/// `.shape()`, no `eval`), so a large `len` costs nothing here — nothing is
+/// materialized when the cap rejects the config before the DSP call.
+fn lazy_waveform(len: usize) -> Array {
+  Array::zeros::<f32>(&[len as i32]).unwrap()
+}
+
+#[test]
+fn default_log_mel_rejects_n_mels_over_max_bins() {
+  // A model whose `MelConfig` reports `n_mels = MAX_MEL_BINS + 1` would size a
+  // multi-GB filterbank (and a far larger mel output) before any decode-stage
+  // budget applies. The per-axis cap rejects it with a typed OutOfRange off the
+  // plain config field — no DSP work, no materialization. A tiny lazy waveform
+  // so nothing heavy could run even if the guard were absent.
+  let cfg = MelConfig::new(
+    400,
+    160,
+    None,
+    MAX_MEL_BINS + 1,
+    16_000,
+    0.0,
+    None,
+    LogFloor::Whisper,
+  );
+  // Direct helper path.
+  let err = default_log_mel(&cfg, &lazy_waveform(16)).unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)));
+
+  // Same rejection through the model's DEFAULT `log_mel` (which forwards
+  // `mel_config()` into `default_log_mel`) — the reachable production path.
+  let model = MockSttModel::new(vec![], vec![0], 7, 8).with_mel_config(cfg);
+  let err_via_model = model.log_mel(&lazy_waveform(16)).unwrap_err();
+  assert!(matches!(err_via_model, Error::OutOfRange(_)));
+}
+
+#[test]
+fn default_log_mel_rejects_zero_n_mels() {
+  // A zero-bin filterbank is a degenerate config — typed InvariantViolation,
+  // before the products (which would otherwise be trivially zero).
+  let cfg = MelConfig::new(400, 160, None, 0, 16_000, 0.0, None, LogFloor::Whisper);
+  let err = default_log_mel(&cfg, &lazy_waveform(16)).unwrap_err();
+  assert!(matches!(err, Error::InvariantViolation(_)));
+}
+
+#[test]
+fn default_log_mel_rejects_filterbank_product_over_budget() {
+  // The FILTERBANK-product guard: `n_mels` and `n_fft` each individually legal
+  // (`n_mels == MAX_MEL_BINS`, passing the per-axis cap; `n_fft` is unbounded by
+  // the driver), but `n_mels * n_freqs` exceeds MAX_MEL_ELEMENTS. With
+  // `n_fft = 32768`, `n_freqs = 32768/2 + 1 = 16385`, so the bank is
+  // `4096 * 16385 = 67_112_960 > 64 Mi` — a multi-Gi filterbank the DSP would
+  // build. The guard rejects it off the plain config (a `checked_mul`) BEFORE
+  // the bank is built; a tiny lazy waveform keeps the (later) output product
+  // small so it is unambiguously the FILTERBANK guard that fires first.
+  let n_mels = MAX_MEL_BINS; // 4096, passes the per-axis cap (== bound, not >).
+  let n_fft = 32_768_usize; // n_freqs = 16385.
+  let n_freqs = n_fft / 2 + 1;
+  assert!(n_mels <= MAX_MEL_BINS, "n_mels within the per-axis cap");
+  assert!(
+    n_mels.checked_mul(n_freqs).unwrap() > MAX_MEL_ELEMENTS,
+    "filterbank product exceeds the element budget"
+  );
+  let cfg = MelConfig::new(
+    n_fft,
+    160,
+    None,
+    n_mels,
+    16_000,
+    0.0,
+    None,
+    LogFloor::Whisper,
+  );
+  let err = default_log_mel(&cfg, &lazy_waveform(16)).unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)));
+}
+
+#[test]
+fn default_log_mel_rejects_mel_output_product_over_budget() {
+  // The MEL-OUTPUT-product guard: a moderate `n_mels` + tiny `hop` + a largish-
+  // but-legal waveform whose `n_mels * num_frames_ub` exceeds MAX_MEL_ELEMENTS,
+  // while the FILTERBANK product stays UNDER budget (so it is unambiguously the
+  // output guard that fires). `n_mels = 4096`, `n_fft = 400` (n_freqs = 201, so
+  // filterbank `4096 * 201 = 823_296 < 64 Mi`), `hop = 1`, and `samples = 20000`
+  // (a LAZY zeros waveform, far under MAX_DECODED_SAMPLES). The driver's safe
+  // frame upper bound is `num_frames_ub = 1 + (20000 + 400) / 1 = 20401`, so the
+  // output is `4096 * 20401 = 83_562_496 > 64 Mi` — the DSP would materialize a
+  // 64-Mi+ mel tensor. The guard rejects it off the config + sample count BEFORE
+  // any DSP work; this test allocates nothing (the zeros waveform is never
+  // realized).
+  let n_mels = MAX_MEL_BINS; // 4096.
+  let n_fft = 400_usize;
+  let hop = 1_usize;
+  let samples = 20_000_usize;
+  // Filterbank stays under budget so the output guard is the one under test.
+  let n_freqs = n_fft / 2 + 1;
+  assert!(
+    n_mels.checked_mul(n_freqs).unwrap() <= MAX_MEL_ELEMENTS,
+    "filterbank product is under budget (so the OUTPUT guard fires, not it)"
+  );
+  let num_frames_ub = (samples + n_fft) / hop + 1;
+  assert!(
+    n_mels.checked_mul(num_frames_ub).unwrap() > MAX_MEL_ELEMENTS,
+    "mel output product exceeds the element budget"
+  );
+  assert!(
+    samples <= audio_io::MAX_DECODED_SAMPLES,
+    "waveform length under the absolute sample cap"
+  );
+  let cfg = MelConfig::new(
+    n_fft,
+    hop,
+    None,
+    n_mels,
+    16_000,
+    0.0,
+    None,
+    LogFloor::Whisper,
+  );
+  let err = default_log_mel(&cfg, &lazy_waveform(samples)).unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)));
+}
+
+#[test]
+fn default_log_mel_accepts_normal_whisper_config() {
+  // The accept path: a normal Whisper-like config (n_mels=80, n_fft=400,
+  // hop=160) with a small REAL waveform still produces a mel without error, and
+  // in the canonical `(n_mels, T)` layout — the new caps do not regress any
+  // valid config.
+  let cfg = MelConfig::new(400, 160, None, 80, 16_000, 0.0, None, LogFloor::Whisper);
+  let mel = default_log_mel(&cfg, &speech_waveform()).expect("normal whisper config must pass");
+  let shape = mel.shape();
+  assert_eq!(shape.len(), 2, "mel is rank-2 (n_mels, T)");
+  assert_eq!(shape[0], 80, "leading axis is n_mels");
+  assert!(shape[1] >= 1, "at least one STFT frame");
+
+  // The Whisper preset (same params) must pass identically through the model's
+  // default `log_mel`, confirming the production path is not gated either.
+  let model = MockSttModel::new(vec![], vec![0], 7, 8).with_mel_config(cfg);
+  let mel_via_model = model
+    .log_mel(&speech_waveform())
+    .expect("whisper config via model.log_mel must pass");
+  assert_eq!(mel_via_model.shape(), shape);
+}
+
+// ===========================================================================
 // Autoregressive cumulative decode-work budget (Option 1) — the pure
 // `accumulate_decode_work` helper, the cheap & deterministic proof of the
 // budget arithmetic (a real loop tripping `MAX_AR_DECODE_WORK` would have to

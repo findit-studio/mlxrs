@@ -24,7 +24,10 @@
 use crate::{
   array::Array,
   audio::{dsp, io as audio_io},
-  error::{EmptyInputPayload, Error, OutOfRangePayload, RankMismatchPayload, Result},
+  error::{
+    ArithmeticOverflowPayload, EmptyInputPayload, Error, InvariantViolationPayload,
+    OutOfRangePayload, RankMismatchPayload, Result,
+  },
   ops,
 };
 
@@ -105,6 +108,39 @@ pub const MAX_DECODE_CONTEXT: usize = 128 * 1024;
 /// budget is ~`11x` that headroom — a real decoder stays well under it — while
 /// still bounding the never-eot, no-caller-limit denial-of-service.
 pub const MAX_AR_DECODE_WORK: usize = 256 * 1024 * 1024;
+
+/// A generous-but-bounded sanity cap on a model-provided
+/// [`MelConfig::n_mels`], `4 Ki` (`4096`) filterbank bins.
+///
+/// [`default_log_mel`] forwards the model's [`MelConfig`] straight into the
+/// DSP mel front end, where `n_mels` sizes BOTH the `(n_mels, n_freqs)`
+/// filterbank `Vec` and the materialized `(n_mels, num_frames)` mel-output
+/// tensor. `n_mels` is model-provided (read off [`MelConfig::n_mels`]), so a
+/// hostile model could report an absurd value and force a multi-GB filterbank
+/// (and a far larger output tensor) before any of the decode-stage budgets
+/// apply. Real mel front ends are small — Whisper uses `80`, canary `128` — so
+/// `4 Ki` admits every real model yet rejects a denial-of-service width. This
+/// is the per-axis cap; the two product caps ([`MAX_MEL_ELEMENTS`]) bound the
+/// derived tensors whose axes each individually pass.
+pub const MAX_MEL_BINS: usize = 4 * 1024;
+
+/// A bound on the element count of EITHER materialized mel tensor a
+/// [`default_log_mel`] call produces — the `(n_mels, n_freqs)` filterbank or
+/// the `(n_mels, num_frames)` mel output — `64 Mi` (`67_108_864`) elements.
+/// Mirrors [`MAX_LOGITS_ELEMENTS`] (the CTC product budget).
+///
+/// The per-axis [`MAX_MEL_BINS`] cap bounds `n_mels` alone, but NOT its
+/// products: a model whose `n_mels` and `n_fft` each individually pass can
+/// still drive a filterbank (`n_mels * n_freqs`, with `n_freqs = n_fft/2 + 1`)
+/// or a mel output (`n_mels * num_frames`) of terabytes of elements — both of
+/// which the DSP would `eval`/materialize, a driver-triggered OOM. So
+/// [`default_log_mel`] checks BOTH products (via `checked_mul` off the
+/// model-provided [`MelConfig`] fields and a safe upper bound on the STFT frame
+/// count, before any DSP work) against this budget. A real mel front end is
+/// tiny — Whisper's filterbank is `80 * 201 ≈ 16 K` and its 30 s output
+/// `80 * ~3000 ≈ 240 K` elements — so `64 Mi` is a wide margin that admits every
+/// real model yet rejects the product-overflow shape.
+pub const MAX_MEL_ELEMENTS: usize = 64 * 1024 * 1024;
 
 /// Validate a mono `audio` waveform's METADATA — rank, length, cap — WITHOUT
 /// materializing it, returning its sample count.
@@ -195,12 +231,139 @@ pub fn resample_waveform(audio: &Array, from_rate: u32, to_rate: u32) -> Result<
 /// straight into [`AutoregressiveStt::encode`]. Assumes `audio` is already at
 /// `cfg`'s [`MelConfig::sample_rate`]; a model resampling a different source
 /// rate does so (e.g. via [`resample_waveform`]) before calling this.
+///
+/// The model-provided [`MelConfig`] magnitudes are capped BEFORE the DSP call —
+/// off the plain config fields, so a denial-of-service config is rejected with a
+/// typed error with NO mel materialization (the model's `n_mels` sizes both the
+/// filterbank and the mel output, neither of which the decode-stage budgets
+/// bound):
+///
+/// - `n_mels == 0` ⇒ [`Error::InvariantViolation`] (a degenerate filterbank);
+///   `n_mels > MAX_MEL_BINS` ⇒ [`Error::OutOfRange`];
+/// - `n_fft == 0` / `hop_length == 0` ⇒ [`Error::InvariantViolation`] (so the
+///   derived frame bounds are well-defined);
+/// - the filterbank PRODUCT `n_mels * n_freqs` (with `n_freqs = n_fft/2 + 1`)
+///   and the mel-output PRODUCT `n_mels * num_frames` (with a SAFE upper bound
+///   on the STFT frame count derived from the validated sample count) each
+///   against [`MAX_MEL_ELEMENTS`] via `checked_mul` — so a config whose axes
+///   each individually pass but whose product is terabytes of elements is still
+///   rejected with no allocation.
 pub fn default_log_mel(cfg: &MelConfig, audio: &Array) -> Result<Array> {
-  // Validate the waveform metadata first (rank/non-empty/cap), then hand the
-  // ORIGINAL lazy `&Array` straight to `log_mel_spectrogram_with` — it accepts
-  // an `Array` and runs its own pre-eval guards, so there is no `to_vec` +
-  // rebuild round-trip (no forced materialization, no extra `Vec`).
-  validate_waveform(audio)?;
+  // Validate the waveform metadata first (rank/non-empty/cap); the returned
+  // sample count bounds the mel-output frame count below.
+  let samples = validate_waveform(audio)?;
+
+  // Cap the model-provided `MelConfig` magnitudes BEFORE forwarding them to the
+  // DSP. `default_log_mel` hands `cfg`'s fields straight into the mel front end,
+  // where `n_mels` sizes BOTH the `(n_mels, n_freqs)` filterbank `Vec` and the
+  // materialized `(n_mels, num_frames)` mel output. The decode-stage budgets
+  // (vocab/context/decode-work) only apply AFTER the encoder consumes this mel,
+  // so without a driver-owned cap here a hostile model could report an absurd
+  // `n_mels` (or an `n_mels`/`n_fft` pair whose products are huge) and force a
+  // multi-GB filterbank / terabyte-scale mel output before any later guard runs
+  // — the same per-axis-bounded-but-product-unbounded mode the CTC
+  // `MAX_LOGITS_ELEMENTS` guard already defends. All reads are off the plain
+  // `MelConfig` values (no `eval`); arithmetic is `checked_*`.
+  let n_mels = cfg.n_mels();
+  let n_fft = cfg.n_fft();
+  let hop_length = cfg.hop_length();
+
+  // (1) A zero-bin filterbank is a degenerate config (no mel bands); reject it
+  // up front so the products below are well-defined.
+  if n_mels == 0 {
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "stt default_log_mel: MelConfig n_mels",
+      "must be > 0 (a zero-bin mel filterbank is degenerate)",
+    )));
+  }
+  // (1) Per-axis cap on the filterbank bin count.
+  if n_mels > MAX_MEL_BINS {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt default_log_mel: MelConfig n_mels",
+      "must not exceed MAX_MEL_BINS (4 Ki)",
+      n_mels.to_string(),
+    )));
+  }
+  // (2) `n_fft == 0` / `hop_length == 0` make the derived frame bounds below
+  // undefined (a div-by-zero hop / a degenerate FFT). Reject them here — ahead
+  // of the DSP, which rejects them too — so the product bounds are well-defined.
+  if n_fft == 0 {
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "stt default_log_mel: MelConfig n_fft",
+      "must be > 0",
+    )));
+  }
+  if hop_length == 0 {
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "stt default_log_mel: MelConfig hop_length",
+      "must be > 0",
+    )));
+  }
+  // One-sided real-FFT bin count: `n_freqs == n_fft / 2 + 1` (the filterbank's
+  // free axis). `n_fft / 2 + 1` cannot overflow `usize` (`n_fft / 2 <= n_fft`).
+  let n_freqs = n_fft / 2 + 1;
+
+  // (3) FILTERBANK-product guard: bound the `(n_mels, n_freqs)` filterbank Vec
+  // the DSP materializes. The per-axis `n_mels` cap above does NOT bound this
+  // product — a legal `n_mels` paired with a large (legal) `n_fft` still yields
+  // a multi-Gi filterbank. `checked_mul` off the plain config values rejects an
+  // overflow or an over-budget product BEFORE the DSP builds the bank.
+  let filterbank_elems = n_mels.checked_mul(n_freqs).ok_or_else(|| {
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "stt default_log_mel: mel filterbank element count (n_mels * n_freqs)",
+      "usize",
+      [("n_mels", n_mels as u64), ("n_freqs", n_freqs as u64)],
+    ))
+  })?;
+  if filterbank_elems > MAX_MEL_ELEMENTS {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt default_log_mel: mel filterbank element count (n_mels * n_freqs)",
+      "must not exceed MAX_MEL_ELEMENTS (64 Mi)",
+      filterbank_elems.to_string(),
+    )));
+  }
+
+  // (4) MEL-OUTPUT-product guard: bound the `(n_mels, num_frames)` mel tensor
+  // the DSP materializes. The DSP's centered STFT (`mlx_audio.dsp.stft`
+  // default, see `dsp::stft_with_config`) reflect-pads the signal by `n_fft / 2`
+  // each side, so its actual frame count is `num_frames = 1 + samples /
+  // hop_length`. We compute a SAFE upper bound from the driver's own values —
+  // `num_frames_ub = 1 + (samples + n_fft) / hop_length` — which is `>= ` that
+  // actual count (the `+ n_fft` slack only inflates it), so the product bound is
+  // never an under-estimate. `checked_*` throughout: an overflow is a typed
+  // error, never a wrap.
+  let padded_ub = samples.checked_add(n_fft).ok_or_else(|| {
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "stt default_log_mel: padded length upper bound (samples + n_fft)",
+      "usize",
+      [("samples", samples as u64), ("n_fft", n_fft as u64)],
+    ))
+  })?;
+  // `+ 1` cannot overflow: `padded_ub / hop_length <= padded_ub < usize::MAX`
+  // once `samples + n_fft` did not overflow above.
+  let num_frames_ub = padded_ub / hop_length + 1;
+  let mel_output_elems = n_mels.checked_mul(num_frames_ub).ok_or_else(|| {
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "stt default_log_mel: mel output element count (n_mels * num_frames)",
+      "usize",
+      [
+        ("n_mels", n_mels as u64),
+        ("num_frames_ub", num_frames_ub as u64),
+      ],
+    ))
+  })?;
+  if mel_output_elems > MAX_MEL_ELEMENTS {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt default_log_mel: mel output element count (n_mels * num_frames)",
+      "must not exceed MAX_MEL_ELEMENTS (64 Mi)",
+      mel_output_elems.to_string(),
+    )));
+  }
+
+  // Gates passed: hand the ORIGINAL lazy `&Array` straight to
+  // `log_mel_spectrogram_with` — it accepts an `Array` and runs its own
+  // pre-eval guards, so there is no `to_vec` + rebuild round-trip (no forced
+  // materialization, no extra `Vec`).
   dsp::log_mel_spectrogram_with(
     audio,
     cfg.n_fft(),
