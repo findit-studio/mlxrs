@@ -151,10 +151,22 @@ impl TextTower {
   ///
   /// Returns the pooled projected text embedding `(batch, projection_size)` —
   /// `siglip.py`'s `pooled_output = head(x[:, -1, :])` (the sticky-EOS last
-  /// token). `seq_len` must not exceed `max_position_embeddings`.
+  /// token). `seq_len` must be in `1..=max_position_embeddings`.
   pub fn forward(&self, input_ids: &Array) -> Result<Array> {
     let shape = input_ids.shape();
     let seq = dim_i32(&shape, 1, "siglip2 text: seq_len")?;
+    if seq < 1 {
+      // An empty sequence axis has no last token to pool: `index_last(0)` would
+      // build the `[-1]` index and `take_axis` would run on the empty axis (a
+      // backend / negative-index path). Reject it up front, before any
+      // embedding lookup, as a typed error. The sticky-EOS pooling
+      // (`x[:, -1, :]`) is only defined for a non-empty sequence.
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "siglip2 text: seq_len",
+        "must be a positive sequence length (>= 1)",
+        smol_str::format_smolstr!("{seq}"),
+      )));
+    }
     if seq > self.max_position_embeddings {
       // `siglip.py`'s `SiglipTextEmbeddings.__call__` raises when seq_len >
       // max_position_embeddings; surface the same as a recoverable error.

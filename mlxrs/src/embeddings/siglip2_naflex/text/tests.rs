@@ -139,6 +139,23 @@ fn text_tower_rejects_seq_over_max_position() {
 }
 
 #[test]
+fn text_tower_rejects_empty_seq() {
+  // A `(batch, 0)` input has an empty sequence axis: there is no last token to
+  // pool. The tower must reject `seq_len == 0` with a typed `OutOfRange`
+  // BEFORE any embedding lookup or last-token pooling — never fall through to
+  // `index_last(0)` building `[-1]` and a backend / negative-index `take_axis`.
+  let cfg = tiny_text_config();
+  let mut w = tiny_text_weights();
+  let tower = TextTower::from_weights(&cfg, &mut w).unwrap();
+  let empty = Array::from_slice::<i32>(&[], &(2usize, 0usize)).unwrap();
+  let err = tower.forward(&empty).err();
+  assert!(
+    matches!(err, Some(Error::OutOfRange(_))),
+    "empty (batch, 0) sequence must be a typed OutOfRange, got {err:?}"
+  );
+}
+
+#[test]
 fn from_weights_rejects_wrong_token_table_shape() {
   let cfg = tiny_text_config();
   let mut w = tiny_text_weights();

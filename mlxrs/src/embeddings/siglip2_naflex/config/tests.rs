@@ -181,6 +181,137 @@ fn validate_rejects_oversize_max_position_embeddings() {
 }
 
 #[test]
+fn validate_rejects_oversize_text_vocab_size() {
+  // A hostile `vocab_size` sizes the token-embedding table rows; the width cap
+  // (`1 << 20`) rejects an over-cap value as `OutOfRange` (positivity alone is
+  // not a DoS boundary for an attacker-controlled checkpoint).
+  let json = BASE_CONFIG_JSON.replace(r#""vocab_size": 32000"#, r#""vocab_size": 1048577"#);
+  let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
+  let err = cfg.validate().unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)), "got {err}");
+}
+
+#[test]
+fn validate_rejects_oversize_text_hidden_size() {
+  // A hostile text `hidden_size` names a matmul / embedding axis; the width cap
+  // rejects it before any tensor is shaped. `1048584` is over-cap (and the
+  // width check runs before the divisibility check, so divisibility is moot).
+  let json = BASE_CONFIG_JSON.replace(
+    r#""hidden_size": 768,
+    "intermediate_size": 3072,
+    "num_attention_heads": 12,
+    "num_hidden_layers": 12,
+    "layer_norm_eps": 1e-6,
+    "unmodeled_text_key": "ignored""#,
+    r#""hidden_size": 1048584,
+    "intermediate_size": 3072,
+    "num_attention_heads": 12,
+    "num_hidden_layers": 12,
+    "layer_norm_eps": 1e-6,
+    "unmodeled_text_key": "ignored""#,
+  );
+  let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
+  let err = cfg.validate().unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)), "got {err}");
+}
+
+#[test]
+fn validate_rejects_oversize_text_intermediate_size() {
+  // A hostile text `intermediate_size` names the feed-forward matmul axis.
+  let json = BASE_CONFIG_JSON.replace(
+    r#""intermediate_size": 3072,
+    "num_attention_heads": 12,
+    "num_hidden_layers": 12,
+    "layer_norm_eps": 1e-6,
+    "unmodeled_text_key": "ignored""#,
+    r#""intermediate_size": 1048577,
+    "num_attention_heads": 12,
+    "num_hidden_layers": 12,
+    "layer_norm_eps": 1e-6,
+    "unmodeled_text_key": "ignored""#,
+  );
+  let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
+  let err = cfg.validate().unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)), "got {err}");
+}
+
+#[test]
+fn validate_rejects_oversize_text_projection_size() {
+  // `projection_size` (the contrastive head's output width) is `Option`;
+  // an explicit over-cap value must be rejected by the width cap. A standalone
+  // text config keeps the other defaults realistic.
+  let t = TextConfig::from_json(r#"{ "projection_size": 1048577 }"#).unwrap();
+  assert_eq!(t.projection_size(), 1_048_577);
+  let err = t.validate().unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)), "got {err}");
+}
+
+#[test]
+fn validate_rejects_oversize_vision_hidden_size() {
+  // A hostile vision `hidden_size` names the ViT matmul axis.
+  let json = BASE_CONFIG_JSON.replace(
+    r#""hidden_size": 768,
+    "intermediate_size": 3072,
+    "num_attention_heads": 12,
+    "num_hidden_layers": 12,
+    "layer_norm_eps": 1e-6,
+    "vision_use_head": true"#,
+    r#""hidden_size": 1048584,
+    "intermediate_size": 3072,
+    "num_attention_heads": 12,
+    "num_hidden_layers": 12,
+    "layer_norm_eps": 1e-6,
+    "vision_use_head": true"#,
+  );
+  let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
+  let err = cfg.validate().unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)), "got {err}");
+}
+
+#[test]
+fn validate_rejects_oversize_vision_intermediate_size() {
+  // A hostile vision `intermediate_size` names the ViT feed-forward axis.
+  let json = BASE_CONFIG_JSON.replace(
+    r#""intermediate_size": 3072,
+    "num_attention_heads": 12,
+    "num_hidden_layers": 12,
+    "layer_norm_eps": 1e-6,
+    "vision_use_head": true"#,
+    r#""intermediate_size": 1048577,
+    "num_attention_heads": 12,
+    "num_hidden_layers": 12,
+    "layer_norm_eps": 1e-6,
+    "vision_use_head": true"#,
+  );
+  let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
+  let err = cfg.validate().unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)), "got {err}");
+}
+
+#[test]
+fn validate_rejects_oversize_vision_patch_size() {
+  // A hostile `patch_size` (the Conv2d kernel / flattened-patch stride) is
+  // bounded by the width cap directly (before the `patch_feature_dim` product).
+  let json = BASE_CONFIG_JSON.replace(r#""patch_size": 16"#, r#""patch_size": 1048577"#);
+  let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
+  let err = cfg.validate().unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)), "got {err}");
+}
+
+#[test]
+fn validate_rejects_oversize_patch_feature_dim() {
+  // `patch_size` within the per-field cap but whose derived
+  // `num_channels * patch_size^2` product exceeds the width cap must still be
+  // rejected: 3 * 1000^2 = 3_000_000 > 1_048_576, while patch_size 1000 alone
+  // passes the per-field width check. (num_patches is set explicitly to 256 so
+  // the `(image_size/patch_size)^2` fallback is not exercised.)
+  let json = BASE_CONFIG_JSON.replace(r#""patch_size": 16"#, r#""patch_size": 1000"#);
+  let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
+  let err = cfg.validate().unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)), "got {err}");
+}
+
+#[test]
 fn validate_rejects_oversize_image_size() {
   // A hostile `image_size` would inflate the `(image_size/patch_size)^2`
   // num_patches fallback; the cardinality cap rejects an over-cap value.

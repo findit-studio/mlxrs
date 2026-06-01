@@ -89,6 +89,18 @@ use crate::{
 /// well within `i32` for the matmul.
 const MAX_INTERP_DIM: usize = 4096;
 
+/// Upper bound on the element count of a single `(out, in)` weight table.
+///
+/// The per-axis [`MAX_INTERP_DIM`] cap alone permits an `out * in` product up
+/// to `MAX_INTERP_DIM^2` (≈ 16 Mi `f32` ≈ 64 MiB) for one table — large enough
+/// that an infallible `vec![0.0f32; total]` would abort on allocator pressure.
+/// A real position-embed resize is a `16 x 16` grid stretched to a few-thousand
+/// patch grid, so one weight table is at most a few thousand `f32`; `1 << 22`
+/// (4 Mi elements) is far above any legitimate use yet keeps an over-product a
+/// recoverable [`Error::CapExceeded`] *before* the allocation, tighter than the
+/// `MAX_INTERP_DIM^2` the per-axis caps would otherwise allow.
+const MAX_INTERP_WEIGHT_ELEMS: usize = 1 << 22;
+
 /// PyTorch's antialias triangle (tent) filter `f(x) = max(0, 1 - |x|)`
 /// (`HelperInterpLinear::aa_filter` in `aten`'s `UpSampleKernel.cpp`).
 /// Evaluated in `f64` for the host-side weight build; the resulting
@@ -122,7 +134,26 @@ fn build_axis_weights(in_dim: usize, out_dim: usize) -> Result<Vec<f32>> {
       [("out", out_dim as u64), ("in", in_dim as u64)],
     ))
   })?;
-  let mut w = vec![0.0f32; total];
+  // Bound the table element count tighter than the per-axis caps allow
+  // (`MAX_INTERP_DIM^2`): a within-axis but adversarial `(out, in)` pair could
+  // still request a ~16 Mi-element table. Reject an over-product here, before
+  // the allocation, as a typed `CapExceeded`.
+  if total > MAX_INTERP_WEIGHT_ELEMS {
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "bilinear_interpolate: weight-matrix element count (out * in)",
+      "MAX_INTERP_WEIGHT_ELEMS",
+      MAX_INTERP_WEIGHT_ELEMS as u64,
+      total as u64,
+    )));
+  }
+  // Build the zero-initialized weight buffer fallibly: a `vec![0.0f32; total]`
+  // aborts on allocator failure, but at the cap one table is ~16 MiB, so a
+  // within-cap-but-heavyweight reservation that the allocator cannot satisfy
+  // must surface as a typed `AllocFailure` instead. `reserve_or_error` reserves
+  // exactly `total`; `resize` then zero-fills without reallocating.
+  let mut w: Vec<f32> = Vec::new();
+  crate::model_validation::reserve_or_error(&mut w, "f32 interpolation weights", total)?;
+  w.resize(total, 0.0f32);
   let scale = in_dim as f64 / out_dim as f64;
   // interp_size = 2 for linear ⇒ base support = interp_size * 0.5 = 1.0,
   // stretched by `scale` only when downsampling (scale >= 1).
@@ -207,6 +238,10 @@ fn check_dim(context: &'static str, value: usize) -> Result<()> {
 /// - any of `H_in`, `W_in`, `out_h`, `out_w` is `0`, or `out_h` / `out_w`
 ///   exceeds the dense-weight-matrix cap (`MAX_INTERP_DIM`, 4096) →
 ///   [`Error::OutOfRange`] / [`Error::CapExceeded`].
+/// - either axis's `out * in` weight-table element count exceeds the tighter
+///   product cap (`MAX_INTERP_WEIGHT_ELEMS`) → [`Error::CapExceeded`]; or the
+///   (fallible) weight-buffer reservation exceeds available memory →
+///   [`Error::AllocFailure`].
 /// - `grid`'s dtype is non-floating (the triangle weights are fractional;
 ///   an integer grid would truncate every sample) →
 ///   [`Error::UnsupportedDtype`].

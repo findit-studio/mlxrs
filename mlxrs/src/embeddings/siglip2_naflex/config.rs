@@ -20,7 +20,9 @@
 
 use crate::{
   error::{Error, ParsePayload, Result},
-  model_validation::{pin_i32, pin_str, require_cardinality, require_divisible, require_positive},
+  model_validation::{
+    pin_i32, pin_str, require_cardinality, require_divisible, require_in_range, require_positive,
+  },
 };
 
 /// Upper bound on a layer / head cardinality, shared by both towers.
@@ -29,6 +31,23 @@ use crate::{
 /// hostile `num_hidden_layers` could otherwise drive. Matches the LFM2
 /// config's `MAX_CONFIG_CARDINALITY` intent.
 const MAX_CARDINALITY: u64 = 4096;
+
+/// Inclusive upper bound on every *width*-like config field — `vocab_size`,
+/// `hidden_size`, `intermediate_size`, the text `projection_size`, the vision
+/// `patch_size`, and the derived `patch_feature_dim` (`num_channels *
+/// patch_size^2`). Unlike a cardinality (which sizes an eager per-layer `Vec`),
+/// a width names a matmul axis / embedding-table column / preprocessing-buffer
+/// stride, so the `4096` cardinality cap is too tight (a real SigLIP2 vocab is
+/// ~256K). But positivity alone is **not** a DoS boundary: shape-pinning a
+/// consumed tensor against a hostile width still drives a massive expected
+/// tensor / preprocessing buffer (`max_num_patches * patch_size^2 * 3`) /
+/// matmul axis from an attacker-controlled checkpoint before any weight is
+/// read. `1 << 20` (`1048576`) bounds every width — a legitimate SigLIP2
+/// hidden / intermediate is a few thousand and the vocab ~256K, all far below —
+/// while keeping a malformed width a recoverable [`Error::OutOfRange`] /
+/// [`Error::CapExceeded`] instead of an oversized allocation toward an abort.
+/// Mirrors the LFM2 config's `MAX_CONFIG_DIM` width-cap discipline.
+const MAX_CONFIG_DIM: i32 = 1 << 20;
 
 // ════════════════════════════════ TextConfig ═══════════════════════════════
 
@@ -257,16 +276,31 @@ impl TextConfig {
   ///
   /// Pins `model_type` to `"siglip2_text_model"`; requires every
   /// dimension / count positive; bounds the layer + head counts and
-  /// `max_position_embeddings` by `MAX_CARDINALITY`; and requires
-  /// `hidden_size` divisible by `num_attention_heads` (the per-head split)
-  /// and `projection_size` positive.
+  /// `max_position_embeddings` by `MAX_CARDINALITY`; bounds every width-like
+  /// field (`vocab_size`, `hidden_size`, `intermediate_size`,
+  /// `projection_size`) by `MAX_CONFIG_DIM` so a hostile width cannot drive an
+  /// oversized embedding-table / matmul-axis allocation; and requires
+  /// `hidden_size` divisible by `num_attention_heads` (the per-head split).
   pub fn validate(&self) -> Result<()> {
     pin_str(
       "TextConfig: model_type",
       self.model_type.as_str(),
       &["siglip2_text_model"],
     )?;
-    require_positive("TextConfig: vocab_size", self.vocab_size)?;
+    // Width-like fields: positive AND within the width cap. `vocab_size` sizes
+    // the token-embedding table rows; `hidden_size` / `intermediate_size` /
+    // `projection_size` name matmul / embedding axes. `require_in_range(_, 1,
+    // MAX_CONFIG_DIM)` rejects both a non-positive and an oversized value as one
+    // [`Error::OutOfRange`], so a hostile width is recoverable, not an
+    // allocation toward an abort.
+    for (name, value) in [
+      ("TextConfig: vocab_size", self.vocab_size),
+      ("TextConfig: hidden_size", self.hidden_size),
+      ("TextConfig: intermediate_size", self.intermediate_size),
+      ("TextConfig: projection_size", self.projection_size()),
+    ] {
+      require_in_range(name, value, 1, MAX_CONFIG_DIM)?;
+    }
     // `max_position_embeddings` sizes the position-embedding table (a
     // fixed-length per-tower buffer) and is the sequence length the encoder
     // can attend over; bound it so a hostile value cannot drive an oversized
@@ -276,9 +310,6 @@ impl TextConfig {
       i64::from(self.max_position_embeddings),
       MAX_CARDINALITY,
     )?;
-    require_positive("TextConfig: hidden_size", self.hidden_size)?;
-    require_positive("TextConfig: intermediate_size", self.intermediate_size)?;
-    require_positive("TextConfig: projection_size", self.projection_size())?;
     require_cardinality(
       "TextConfig: num_attention_heads",
       i64::from(self.num_attention_heads),
@@ -379,11 +410,15 @@ impl VisionConfig {
   ///
   /// Pins `model_type` to `"siglip2_vision_model"` and `num_channels` to
   /// `3`; requires every dimension / count positive; bounds the layer +
-  /// head counts and `image_size` by `MAX_CARDINALITY`; requires
-  /// `hidden_size` divisible by `num_attention_heads`; bounds the resolved
-  /// `num_patches` and `max_num_patches` (each sizes a fixed-length
-  /// per-image buffer) by `MAX_CARDINALITY`; and validates the
-  /// `patch_feature_dim` arithmetic does not overflow.
+  /// head counts and `image_size` by `MAX_CARDINALITY`; bounds every
+  /// width-like field (`patch_size`, `hidden_size`, `intermediate_size`) and
+  /// the derived `patch_feature_dim` (`num_channels * patch_size^2`) by
+  /// `MAX_CONFIG_DIM` so a hostile width cannot drive an oversized matmul axis /
+  /// preprocessing buffer; requires `hidden_size` divisible by
+  /// `num_attention_heads`; bounds the resolved `num_patches` and
+  /// `max_num_patches` (each sizes a fixed-length per-image buffer) by
+  /// `MAX_CARDINALITY`; and validates the `patch_feature_dim` arithmetic does
+  /// not overflow.
   pub fn validate(&self) -> Result<()> {
     pin_str(
       "VisionConfig: model_type",
@@ -404,9 +439,19 @@ impl VisionConfig {
       i64::from(self.image_size),
       MAX_CARDINALITY,
     )?;
-    require_positive("VisionConfig: patch_size", self.patch_size)?;
-    require_positive("VisionConfig: hidden_size", self.hidden_size)?;
-    require_positive("VisionConfig: intermediate_size", self.intermediate_size)?;
+    // Width-like fields: positive AND within the width cap. `patch_size` is the
+    // Conv2d kernel/stride and drives the `num_channels * patch_size^2`
+    // flattened-patch stride (the preprocessing-row width); `hidden_size` /
+    // `intermediate_size` name matmul axes. A hostile width would otherwise
+    // shape-pin a consumed tensor (or a `max_num_patches * patch_size^2 * 3`
+    // preprocessing buffer) to an oversized allocation.
+    for (name, value) in [
+      ("VisionConfig: patch_size", self.patch_size),
+      ("VisionConfig: hidden_size", self.hidden_size),
+      ("VisionConfig: intermediate_size", self.intermediate_size),
+    ] {
+      require_in_range(name, value, 1, MAX_CONFIG_DIM)?;
+    }
     require_cardinality(
       "VisionConfig: num_attention_heads",
       i64::from(self.num_attention_heads),
@@ -436,8 +481,18 @@ impl VisionConfig {
       i64::from(self.max_num_patches()),
       MAX_CARDINALITY,
     )?;
-    // Pin the flattened-patch-width arithmetic (overflow-checked).
-    self.patch_feature_dim()?;
+    // Pin + cap the flattened-patch-width arithmetic. `patch_feature_dim`
+    // (`num_channels * patch_size^2`) is the stride of every NaFlex
+    // preprocessing row and the patch-embed Linear's input axis, so it sizes a
+    // `max_num_patches * patch_feature_dim` buffer; bound the derived product by
+    // the same width cap (not merely overflow-check it) so a hostile
+    // `patch_size` cannot drive an oversized preprocessing / matmul allocation.
+    require_in_range(
+      "VisionConfig: patch_feature_dim (num_channels * patch_size^2)",
+      self.patch_feature_dim()?,
+      1,
+      MAX_CONFIG_DIM,
+    )?;
     Ok(())
   }
 }

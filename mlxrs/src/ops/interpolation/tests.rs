@@ -294,6 +294,29 @@ fn bilinear_rejects_zero_and_oversize_dims() {
 }
 
 #[test]
+fn bilinear_rejects_over_product_weight_table() {
+  // Each axis is within the per-axis `MAX_INTERP_DIM` (4096) cap, but the
+  // `out * in` weight-table element count exceeds the tighter
+  // `MAX_INTERP_WEIGHT_ELEMS` (4 Mi) product cap: 4096 * 2048 = 8 Mi. The
+  // weight build must reject it with a typed `CapExceeded` BEFORE the
+  // (infallible-`vec!`-would-be) allocation — not abort. The grid is a thin
+  // `(4096, 1, 1)` column so the test stays cheap; the height-axis weight build
+  // errors out before any matmul.
+  let h_in = MAX_INTERP_DIM; // 4096, within the per-axis cap
+  let data = vec![0.0f32; h_in]; // (4096, 1, 1)
+  let grid = Array::from_slice::<f32>(&data, &(h_in, 1, 1)).unwrap();
+  // out_h = 2048: 2048 * 4096 = 8 Mi > MAX_INTERP_WEIGHT_ELEMS (4 Mi).
+  let err = bilinear_interpolate(&grid, MAX_INTERP_DIM / 2, 1).unwrap_err();
+  assert!(
+    matches!(err, Error::CapExceeded(_)),
+    "over-product weight table must be a typed CapExceeded, got {err}"
+  );
+  // Sanity: the product really does exceed the cap while each axis is in range.
+  assert!((MAX_INTERP_DIM / 2) * h_in > MAX_INTERP_WEIGHT_ELEMS);
+  assert!(h_in <= MAX_INTERP_DIM && MAX_INTERP_DIM / 2 <= MAX_INTERP_DIM);
+}
+
+#[test]
 fn bilinear_rejects_integer_grid_dtype() {
   // Build a rank-3 int32 grid; the fractional triangle weights cannot
   // resample it, so the op must reject the dtype.
