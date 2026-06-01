@@ -47,7 +47,8 @@ use crate::{
   array::Array,
   dtype::Dtype,
   error::{
-    Error, InvariantViolationPayload, MissingKeyPayload, OutOfRangePayload, ParsePayload, Result,
+    DivisibilityConstraintPayload, Error, InvariantViolationPayload, LengthMismatchPayload,
+    MissingKeyPayload, OutOfRangePayload, ParsePayload, Result,
   },
   lm::{
     cache::{ArraysCache, KvCache, MaskMode, StandardKvCache},
@@ -75,6 +76,17 @@ use smol_str::format_smolstr;
 
 /// `mlx_pad`'s constant-fill mode string.
 const PAD_CONSTANT: &CStr = c"constant";
+
+/// Inclusive upper bound for every dimension-like [`TextConfig`] field
+/// (`hidden_size`, head counts, layer count, `vocab_size`, the MLP widths,
+/// `conv_L_cache`). `2^24` is far above any real LFM2 checkpoint (the largest
+/// real value, `vocab_size`, is ~10^5) yet small enough that the downstream
+/// `i32` shape arithmetic — the `2 * block_ff_dim` and
+/// `block_multiple_of * ceil(..)` of [`adjusted_ff_dim`], the per-head
+/// reshapes, and the vocab-width logits projection — cannot overflow `i32`.
+/// Rejecting an oversized field here keeps a malformed config a recoverable
+/// [`Error::OutOfRange`] instead of a wrapping multiply downstream.
+const MAX_CONFIG_DIM: i32 = 1 << 24;
 
 // ───────────────────────── config ─────────────────────────
 
@@ -201,15 +213,95 @@ impl TextConfig {
   ///
   /// A serde failure (malformed JSON) maps to [`Error::Parse`]; missing keys
   /// fall back to the reference defaults rather than erroring (mlx-lm
-  /// `from_dict` semantics).
+  /// `from_dict` semantics). The parsed fields are then [`validate`]d so a
+  /// malformed config (zero / negative / non-divisible / oversized dimension)
+  /// is a recoverable error here rather than a panic downstream.
+  ///
+  /// [`validate`]: TextConfig::validate
   pub fn from_json(json: &str) -> Result<TextConfig> {
-    serde_json::from_str(json).map_err(|e| {
+    let cfg: TextConfig = serde_json::from_str(json).map_err(|e| {
       Error::Parse(ParsePayload::new(
         "TextConfig::from_json",
         "LFM2 text config JSON",
         e,
       ))
-    })
+    })?;
+    cfg.validate()?;
+    Ok(cfg)
+  }
+
+  /// Reject a structurally invalid configuration before it can panic the
+  /// forward pass. Mirrors the eager `validate()` discipline of
+  /// [`crate::lm::generate::GenConfig`].
+  ///
+  /// Every dimension-like field must be a positive integer no larger than
+  /// `2^24` (so the downstream `i32` shape arithmetic cannot overflow), and
+  /// the two derived ratios must divide exactly:
+  ///
+  /// - `hidden_size` must be divisible by `num_attention_heads` — otherwise
+  ///   [`head_dim`](TextConfig::head_dim) truncates and the per-head reshape
+  ///   `(B, L, n_heads, head_dim)` disagrees with `q_proj`'s output width.
+  /// - `num_attention_heads` must be divisible by `num_key_value_heads` —
+  ///   the grouped-query head grouping (`lfm2.py:69-70`).
+  ///
+  /// `block_multiple_of` must be `>= 1` (it is the rounding divisor in the
+  /// `auto_adjust_ff_dim` reduction; a zero divisor would divide-by-zero).
+  /// Returns the first violation as [`Error::OutOfRange`] /
+  /// [`Error::DivisibilityConstraint`]; `Ok(())` when every field is sound.
+  pub fn validate(&self) -> Result<()> {
+    // Every dimension-like field: positive and within the overflow-safe cap.
+    let dims: [(&'static str, i32); 9] = [
+      ("hidden_size", self.hidden_size),
+      ("num_hidden_layers", self.num_hidden_layers),
+      ("num_attention_heads", self.num_attention_heads),
+      ("num_key_value_heads", self.num_key_value_heads),
+      ("vocab_size", self.vocab_size),
+      ("block_dim", self.block_dim),
+      ("block_ff_dim", self.block_ff_dim),
+      ("block_multiple_of", self.block_multiple_of),
+      ("conv_L_cache", self.conv_l_cache),
+    ];
+    for (name, value) in dims {
+      if value <= 0 {
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "TextConfig::validate",
+          "must be a positive integer",
+          format_smolstr!("{name}={value}"),
+        )));
+      }
+      if value > MAX_CONFIG_DIM {
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "TextConfig::validate",
+          "must be <= 2^24 (oversized / overflow-prone dimension)",
+          format_smolstr!("{name}={value}"),
+        )));
+      }
+    }
+    // head_dim = hidden_size / num_attention_heads must divide exactly.
+    if self.hidden_size % self.num_attention_heads != 0 {
+      return Err(Error::DivisibilityConstraint(
+        DivisibilityConstraintPayload::new(
+          "TextConfig::validate (head_dim)",
+          "hidden_size",
+          self.hidden_size as u64,
+          "num_attention_heads",
+          self.num_attention_heads as u64,
+        ),
+      ));
+    }
+    // GQA: query heads must be an integer multiple of key/value heads.
+    if self.num_attention_heads % self.num_key_value_heads != 0 {
+      return Err(Error::DivisibilityConstraint(
+        DivisibilityConstraintPayload::new(
+          "TextConfig::validate (GQA grouping)",
+          "num_attention_heads",
+          self.num_attention_heads as u64,
+          "num_key_value_heads",
+          self.num_key_value_heads as u64,
+        ),
+      ));
+    }
+    Ok(())
   }
 
   /// The per-head dimension (`hidden_size / num_attention_heads`).
@@ -605,7 +697,19 @@ impl Lfm2Model {
 
   /// Run the decoder over precomputed `h` (`(B, L, hidden)`), updating each
   /// layer's cache in place; returns the final-normed hidden states.
+  ///
+  /// The per-layer cache must hold exactly one entry per decoder layer (as
+  /// [`Lfm2::make_cache`] builds it). A mismatched count is a recoverable
+  /// [`Error::LengthMismatch`] rather than an out-of-bounds index panic on
+  /// the mask-source lookups / a silently truncated `zip` over the layers.
   fn forward_hidden(&self, h: &Array, cache: &mut [Box<dyn KvCache>]) -> Result<Array> {
+    if cache.len() != self.layers.len() {
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "Lfm2Model::forward: per-layer cache count vs decoder layers",
+        self.layers.len(),
+        cache.len(),
+      )));
+    }
     let n_layers = self.layers.len() as i32;
     let n = h.shape()[1];
     let (fa_idx, conv_idx) = self.mask_source_indices(n_layers);
@@ -768,6 +872,7 @@ impl Lfm2 {
     config: TextConfig,
     mut weights: std::collections::HashMap<String, Array>,
   ) -> Result<Lfm2> {
+    config.validate()?;
     let attn_idxs = config.attention_layer_indices()?;
     let eps = config.norm_eps;
     let head_dim = config.head_dim();

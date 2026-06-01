@@ -323,9 +323,12 @@ fn text_config_defaults_and_overrides() {
   assert!((cfg.rope_theta - 1_000_000.0).abs() < 1.0);
   assert_eq!(cfg.head_dim(), 64);
 
-  // Unmodeled keys are ignored (from_dict semantics); overrides applied.
+  // Unmodeled keys are ignored (from_dict semantics); overrides applied. The
+  // overridden head counts stay GQA-consistent (2 query heads / 2 kv heads) so
+  // the config also passes validation.
   let json = r#"{"hidden_size": 8, "num_attention_heads": 2,
-    "num_hidden_layers": 3, "conv_L_cache": 4, "some_future_key": 99}"#;
+    "num_key_value_heads": 2, "num_hidden_layers": 3, "conv_L_cache": 4,
+    "some_future_key": 99}"#;
   let cfg = TextConfig::from_json(json).unwrap();
   assert_eq!(cfg.hidden_size, 8);
   assert_eq!(cfg.num_attention_heads, 2);
@@ -363,6 +366,149 @@ fn attention_index_out_of_range_rejected() {
   let json = r#"{"num_hidden_layers": 2, "full_attn_idxs": [5]}"#;
   let cfg = TextConfig::from_json(json).unwrap();
   assert!(cfg.attention_layer_indices().is_err());
+}
+
+#[test]
+fn validate_rejects_zero_negative_nondivisible_and_oversized() {
+  // A divisible base (hidden 8 / heads 2 = head_dim 4; heads 2 / kv 2) so each
+  // case below isolates a single malformed field on an otherwise-sound config.
+  let base = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "vocab_size": 16}"#;
+  assert!(TextConfig::from_json(base).unwrap().validate().is_ok());
+
+  // Zero dimension.
+  let zero = r#"{"hidden_size": 0, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(zero),
+    Err(Error::OutOfRange(_))
+  ));
+
+  // Negative dimension.
+  let neg = r#"{"num_hidden_layers": -3}"#;
+  assert!(matches!(
+    TextConfig::from_json(neg),
+    Err(Error::OutOfRange(_))
+  ));
+
+  // hidden_size not divisible by num_attention_heads (head_dim would truncate).
+  let nondiv = r#"{"hidden_size": 10, "num_attention_heads": 4,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(nondiv),
+    Err(Error::DivisibilityConstraint(_))
+  ));
+
+  // num_attention_heads not divisible by num_key_value_heads (GQA grouping).
+  let nondiv_gqa = r#"{"hidden_size": 12, "num_attention_heads": 6,
+    "num_key_value_heads": 4, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(nondiv_gqa),
+    Err(Error::DivisibilityConstraint(_))
+  ));
+
+  // Oversized / overflow-prone dimension (above the 2^24 cap).
+  let oversized = r#"{"vocab_size": 33554432, "hidden_size": 8,
+    "num_attention_heads": 2, "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(oversized),
+    Err(Error::OutOfRange(_))
+  ));
+
+  // block_multiple_of == 0 would divide-by-zero in adjusted_ff_dim.
+  let zero_multiple = r#"{"block_multiple_of": 0, "hidden_size": 8,
+    "num_attention_heads": 2, "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(zero_multiple),
+    Err(Error::OutOfRange(_))
+  ));
+}
+
+#[test]
+fn default_config_passes_validation() {
+  // The reference defaults must themselves be a valid configuration.
+  assert!(TextConfig::from_json("{}").unwrap().validate().is_ok());
+}
+
+// ───────────────────────── cache cardinality ─────────────────────────
+
+/// Build a tiny all-conv 2-layer [`Lfm2`] (`hidden=4`, `vocab=8`, `K=3`,
+/// `ff=8`, no `auto_adjust_ff_dim`). All-conv keeps the per-layer weight set
+/// to the conv + MLP + norms (no attention QK-norm / RoPE projections), which
+/// is enough to exercise the forward-pass cache-cardinality guard.
+fn tiny_all_conv_model() -> Lfm2 {
+  use std::collections::HashMap;
+  let json = r#"{"hidden_size": 4, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "vocab_size": 8,
+    "conv_L_cache": 3, "block_auto_adjust_ff_dim": false, "block_ff_dim": 8}"#;
+  let cfg = TextConfig::from_json(json).unwrap();
+  let (hidden, vocab, ff, k) = (4usize, 8usize, 8usize, 3usize);
+
+  // A deterministic `(rows, cols)` weight whose entries are tiny and distinct.
+  let mat = |rows: usize, cols: usize| -> Array {
+    let data: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.01 - 0.1).collect();
+    Array::from_slice::<f32>(&data, &(rows, cols)).unwrap()
+  };
+  let vecn = |n: usize| -> Array {
+    let data: Vec<f32> = (0..n).map(|i| 1.0 + i as f32 * 0.1).collect();
+    Array::from_slice::<f32>(&data, &(n,)).unwrap()
+  };
+
+  let mut w: HashMap<String, Array> = HashMap::new();
+  w.insert("model.embed_tokens.weight".to_string(), mat(vocab, hidden));
+  w.insert("model.embedding_norm.weight".to_string(), vecn(hidden));
+  for i in 0..2 {
+    let p = format!("model.layers.{i}");
+    w.insert(format!("{p}.operator_norm.weight"), vecn(hidden));
+    w.insert(format!("{p}.ffn_norm.weight"), vecn(hidden));
+    w.insert(format!("{p}.feed_forward.w1.weight"), mat(ff, hidden));
+    w.insert(format!("{p}.feed_forward.w3.weight"), mat(ff, hidden));
+    w.insert(format!("{p}.feed_forward.w2.weight"), mat(hidden, ff));
+    // Conv layer (all-conv model): (hidden, K, 1) depthwise weight + projs.
+    let conv_flat: Vec<f32> = (0..hidden * k).map(|i| (i as f32) * 0.02).collect();
+    w.insert(
+      format!("{p}.conv.conv.weight"),
+      Array::from_slice::<f32>(&conv_flat, &(hidden, k, 1usize)).unwrap(),
+    );
+    w.insert(format!("{p}.conv.in_proj.weight"), mat(3 * hidden, hidden));
+    w.insert(format!("{p}.conv.out_proj.weight"), mat(hidden, hidden));
+  }
+  Lfm2::from_weights(cfg, w).unwrap()
+}
+
+#[test]
+fn forward_rejects_wrong_cardinality_cache() {
+  use crate::lm::model::Model as _;
+  let model = tiny_all_conv_model();
+  // A `[1, 2]` token window — two valid ids into the 8-row embedding table.
+  let tokens = Array::from_slice::<i32>(&[1, 3], &(1usize, 2usize)).unwrap();
+
+  // The correct cache has one entry per layer (2). A 1-entry cache must be a
+  // recoverable LengthMismatch, NOT an out-of-bounds index panic.
+  let mut short = model.make_cache();
+  short.truncate(1);
+  assert_eq!(short.len(), 1);
+  assert!(matches!(
+    model.forward(&tokens, &mut short),
+    Err(Error::LengthMismatch(_))
+  ));
+
+  // An over-long cache (3 entries) is likewise rejected rather than silently
+  // truncated by the layer `zip`.
+  let mut long = model.make_cache();
+  long.push(Box::new(ArraysCache::new(1)));
+  assert_eq!(long.len(), 3);
+  assert!(matches!(
+    model.forward(&tokens, &mut long),
+    Err(Error::LengthMismatch(_))
+  ));
+
+  // The matching-cardinality cache (2 entries) runs without error — the guard
+  // only rejects the mismatched counts.
+  let mut ok = model.make_cache();
+  assert_eq!(ok.len(), 2);
+  let logits = model.forward(&tokens, &mut ok).unwrap();
+  assert_eq!(logits.shape(), vec![1, 2, 8]);
 }
 
 #[test]
