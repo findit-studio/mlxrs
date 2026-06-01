@@ -1,13 +1,17 @@
-//! Tests for [`bicubic_interpolate`].
+//! Tests for [`bilinear_interpolate`] (bilinear + antialias).
 //!
-//! The expected values are derived from the PyTorch
-//! `F.interpolate(mode="bicubic", align_corners=False)` algorithm with
-//! cubic coefficient `a = -0.75`: the half-pixel source map
-//! `src = (j + 0.5) * (in/out) - 0.5`, the four clamped taps
-//! `floor(src) - 1 ..= floor(src) + 2`, the Keys cubic kernel, and edge
-//! replication (off-edge taps fold onto the boundary). They are computed
-//! in closed form (by hand / an independent f64 reference), not by
-//! delegating to the code under test.
+//! The expected values are derived from PyTorch's
+//! `F.interpolate(mode="bilinear", align_corners=False, antialias=True)`
+//! algorithm (the `aa_filter` triangle path of `aten`'s
+//! `UpSampleKernel.cpp`): `scale = in/out`, `center = scale*(i+0.5)`,
+//! `support = scale>=1 ? scale : 1`, `invscale = scale>=1 ? 1/scale : 1`,
+//! the `[0,in]`-clamped tap window `xmin..xmax`, the triangle filter
+//! `f(x)=max(0,1-|x|)` at `(t - center + 0.5)*invscale`, and a per-row
+//! renormalization to sum 1. They are computed in closed form (by hand /
+//! an independent f64 reference), not by delegating to the code under
+//! test. (Byte-exact agreement with the HF oracle weights is confirmed
+//! numerically only by the gated SigLIP2 e2e parity test; these cases pin
+//! the formula.)
 
 use super::*;
 
@@ -20,32 +24,32 @@ fn to_vec(a: &Array) -> Vec<f32> {
 }
 
 /// Independent f64 reference for one resampling axis (the `(out, in)`
-/// weight matrix). Mirrors the algorithm but is written separately so
-/// the test is not comparing the code to itself.
+/// weight matrix). Mirrors PyTorch's antialias linear algorithm but is
+/// written separately so the test is not comparing the code to itself.
 fn ref_axis_weights(in_d: usize, out_d: usize) -> Vec<Vec<f64>> {
-  const A: f64 = -0.75;
-  fn k(t: f64) -> f64 {
-    let x = t.abs();
-    if x <= 1.0 {
-      ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0
-    } else if x < 2.0 {
-      (((x - 5.0) * x + 8.0) * x - 4.0) * A
-    } else {
-      0.0
-    }
+  fn f(x: f64) -> f64 {
+    let x = x.abs();
+    if x < 1.0 { 1.0 - x } else { 0.0 }
   }
   let scale = in_d as f64 / out_d as f64;
-  let in_last = (in_d - 1) as isize;
+  let support = if scale >= 1.0 { scale } else { 1.0 };
+  let invscale = if scale >= 1.0 { 1.0 / scale } else { 1.0 };
+  let in_i = in_d as i64;
   let mut rows = vec![vec![0.0f64; in_d]; out_d];
-  for (j, row) in rows.iter_mut().enumerate() {
-    let src = (j as f64 + 0.5) * scale - 0.5;
-    let base = src.floor();
-    let frac = src - base;
-    let base_i = base as isize;
-    for off in -1isize..=2 {
-      let w = k(frac - off as f64);
-      let tap = (base_i + off).clamp(0, in_last) as usize;
-      row[tap] += w;
+  for (i, row) in rows.iter_mut().enumerate() {
+    let center = scale * (i as f64 + 0.5);
+    let xmin = ((center - support + 0.5).floor() as i64).max(0);
+    let xmax = ((center + support + 0.5).floor() as i64).min(in_i);
+    let mut tot = 0.0;
+    for t in xmin..xmax {
+      let w = f((t as f64 - center + 0.5) * invscale);
+      row[t as usize] = w;
+      tot += w;
+    }
+    if tot != 0.0 {
+      for t in xmin..xmax {
+        row[t as usize] /= tot;
+      }
     }
   }
   rows
@@ -81,11 +85,11 @@ fn ref_resize(grid: &[Vec<f64>], out_h: usize, out_w: usize) -> Vec<Vec<f64>> {
 }
 
 #[test]
-fn bicubic_identity_same_size_is_bit_exact_passthrough() {
+fn bilinear_identity_same_size_is_bit_exact_passthrough() {
   // out == in on both axes: the fast path returns the input unchanged.
   let data: Vec<f32> = (0..(3 * 3 * 2)).map(|i| i as f32 * 0.5 - 1.0).collect();
   let grid = Array::from_slice::<f32>(&data, &(3, 3, 2)).unwrap();
-  let out = bicubic_interpolate(&grid, 3, 3).unwrap();
+  let out = bilinear_interpolate(&grid, 3, 3).unwrap();
   assert_eq!(out.shape(), vec![3, 3, 2]);
   assert_eq!(
     to_vec(&out),
@@ -95,21 +99,21 @@ fn bicubic_identity_same_size_is_bit_exact_passthrough() {
 }
 
 #[test]
-fn bicubic_upsample_2x2_to_4x4_single_channel_matches_hand_computed() {
-  // grid = [[0,1],[2,3]] (single channel). The expected 4x4 is the
-  // closed-form bicubic (a=-0.75, align_corners=False) — note the
-  // characteristic edge overshoot to NEGATIVE values at the corners,
-  // which a=-0.75 bicubic (unlike bilinear) produces.
+fn bilinear_upsample_2x2_to_4x4_single_channel_matches_hand_computed() {
+  // grid = [[0,1],[2,3]] (single channel). Upsampling ⇒ antialias is a
+  // no-op, so this is plain bilinear align_corners=False. The 1-D axis
+  // weights for 2->4 are rows [1,0],[0.75,0.25],[0.25,0.75],[0,1]; the
+  // separable 4x4 below is hand-computed from those.
   let grid = Array::from_slice::<f32>(&[0.0, 1.0, 2.0, 3.0], &(2, 2, 1)).unwrap();
-  let out = bicubic_interpolate(&grid, 4, 4).unwrap();
+  let out = bilinear_interpolate(&grid, 4, 4).unwrap();
   assert_eq!(out.shape(), vec![4, 4, 1]);
   let got = to_vec(&out);
   #[rustfmt::skip]
   let want: [f32; 16] = [
-    -0.316406,  0.015625,  0.5625,    0.894531,
-     0.347656,  0.679688,  1.226563,  1.558594,
-     1.441406,  1.773438,  2.320313,  2.652344,
-     2.105469,  2.4375,     2.984375,  3.316406,
+    0.00, 0.25, 0.75, 1.00,
+    0.50, 0.75, 1.25, 1.50,
+    1.50, 1.75, 2.25, 2.50,
+    2.00, 2.25, 2.75, 3.00,
   ];
   for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
     assert!((g - w).abs() < EPS, "idx {i}: got {g}, want {w}");
@@ -117,27 +121,82 @@ fn bicubic_upsample_2x2_to_4x4_single_channel_matches_hand_computed() {
 }
 
 #[test]
-fn bicubic_downsample_width_ramp_1x4_to_1x2_matches_hand_computed() {
-  // A 1x4 horizontal ramp 0,1,2,3 downsampled to 1x2. Expected from the
-  // a=-0.75 kernel at the two output column centers.
+fn bilinear_downsample_width_ramp_1x4_to_1x2_matches_hand_computed() {
+  // A 1x4 horizontal ramp 0,1,2,3 downsampled to 1x2. scale=2 ⇒ antialias
+  // active: the 4->2 axis weights are row0=[3/7,3/7,1/7,0],
+  // row1=[0,1/7,3/7,3/7]. So out[0] = (0*3+1*3+2*1)/7 = 5/7 = 0.714286,
+  // out[1] = (1*1+2*3+3*3)/7 = 16/7 = 2.285714. (A plain 2-tap bilinear
+  // would give 0.5 and 2.5 — the antialias spreading is what differs.)
   let grid = Array::from_slice::<f32>(&[0.0, 1.0, 2.0, 3.0], &(1, 4, 1)).unwrap();
-  let out = bicubic_interpolate(&grid, 1, 2).unwrap();
+  let out = bilinear_interpolate(&grid, 1, 2).unwrap();
   assert_eq!(out.shape(), vec![1, 2, 1]);
   let got = to_vec(&out);
-  let want = [0.40625f32, 2.59375];
+  let want = [5.0f32 / 7.0, 16.0f32 / 7.0];
   for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
     assert!((g - w).abs() < EPS, "idx {i}: got {g}, want {w}");
   }
 }
 
 #[test]
-fn bicubic_constant_grid_stays_constant_partition_of_unity() {
-  // The bicubic weights are a partition of unity (each output row's four
-  // taps sum to 1), so a constant grid must resample to the same
-  // constant everywhere — independent of the resize ratio.
+fn bilinear_downsample_4x1_to_2x1_height_matches_hand_computed() {
+  // The same antialias downsample on the HEIGHT axis (a 4x1 vertical ramp
+  // -> 2x1), to pin that the row-resample matrix is built the same way.
+  let grid = Array::from_slice::<f32>(&[0.0, 1.0, 2.0, 3.0], &(4, 1, 1)).unwrap();
+  let out = bilinear_interpolate(&grid, 2, 1).unwrap();
+  assert_eq!(out.shape(), vec![2, 1, 1]);
+  let got = to_vec(&out);
+  let want = [5.0f32 / 7.0, 16.0f32 / 7.0];
+  for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+    assert!((g - w).abs() < EPS, "idx {i}: got {g}, want {w}");
+  }
+}
+
+#[test]
+fn bilinear_axis_weight_rows_sum_to_one_up_and_down() {
+  // Every output row's weights sum to ~1 (PyTorch renormalizes), for both
+  // up- and down-sampling ratios.
+  for (in_d, out_d) in [(2usize, 4usize), (3, 6), (16, 27), (16, 12), (4, 2), (8, 3)] {
+    let rows = ref_axis_weights(in_d, out_d);
+    for (j, r) in rows.iter().enumerate() {
+      let s: f64 = r.iter().sum();
+      assert!(
+        (s - 1.0).abs() < 1e-12,
+        "axis_w({in_d},{out_d}) row {j} sum = {s}"
+      );
+    }
+  }
+}
+
+#[test]
+fn bilinear_downsample_axis_weights_match_hand_derived() {
+  // Pin the exact 4->2 antialias axis weights (the canonical downsample
+  // case) against the hand-derived fractions, so a center/support drift is
+  // caught here directly, not only through a resize.
+  let rows = ref_axis_weights(4, 2);
+  #[rustfmt::skip]
+  let want = [
+    [3.0/7.0, 3.0/7.0, 1.0/7.0, 0.0],
+    [0.0,     1.0/7.0, 3.0/7.0, 3.0/7.0],
+  ];
+  for (i, r) in rows.iter().enumerate() {
+    for (j, &v) in r.iter().enumerate() {
+      assert!(
+        (v - want[i][j]).abs() < 1e-12,
+        "4->2 weight [{i}][{j}]: got {v}, want {}",
+        want[i][j]
+      );
+    }
+  }
+}
+
+#[test]
+fn bilinear_constant_grid_stays_constant() {
+  // The weights are a partition of unity (each output row sums to 1), so a
+  // constant grid must resample to the same constant everywhere —
+  // independent of the resize ratio (here a mixed up/down resize).
   let grid = Array::from_slice::<f32>(&[5.0f32; 9], &(3, 3, 1)).unwrap();
-  let out = bicubic_interpolate(&grid, 6, 7).unwrap();
-  assert_eq!(out.shape(), vec![6, 7, 1]);
+  let out = bilinear_interpolate(&grid, 6, 2).unwrap();
+  assert_eq!(out.shape(), vec![6, 2, 1]);
   for (i, v) in to_vec(&out).iter().enumerate() {
     assert!(
       (v - 5.0).abs() < EPS,
@@ -147,23 +206,8 @@ fn bicubic_constant_grid_stays_constant_partition_of_unity() {
 }
 
 #[test]
-fn bicubic_axis_weight_rows_are_partition_of_unity() {
-  // Direct check of the weight build: every output row sums to ~1.0.
-  for (in_d, out_d) in [(2usize, 4usize), (3, 6), (16, 27), (16, 12)] {
-    let rows = ref_axis_weights(in_d, out_d);
-    for (j, r) in rows.iter().enumerate() {
-      let s: f64 = r.iter().sum();
-      assert!(
-        (s - 1.0).abs() < 1e-9,
-        "axis_w({in_d},{out_d}) row {j} sum = {s}"
-      );
-    }
-  }
-}
-
-#[test]
-fn bicubic_multichannel_is_independent_per_channel() {
-  // A 2-channel grid where channel 1 = channel 0 + 10. Bicubic is linear
+fn bilinear_multichannel_is_independent_per_channel() {
+  // A 2-channel grid where channel 1 = channel 0 + 10. Bilinear is linear
   // and per-channel, so the resized channel 1 must equal resized
   // channel 0 + 10 everywhere.
   let mut data = Vec::new();
@@ -172,7 +216,7 @@ fn bicubic_multichannel_is_independent_per_channel() {
     data.push(v + 10.0); // channel 1
   }
   let grid = Array::from_slice::<f32>(&data, &(2, 2, 2)).unwrap();
-  let out = bicubic_interpolate(&grid, 4, 4).unwrap();
+  let out = bilinear_interpolate(&grid, 4, 4).unwrap();
   assert_eq!(out.shape(), vec![4, 4, 2]);
   let got = to_vec(&out);
   for px in 0..16 {
@@ -183,7 +227,7 @@ fn bicubic_multichannel_is_independent_per_channel() {
 }
 
 #[test]
-fn bicubic_matches_independent_f64_reference_on_3x3_to_5x5() {
+fn bilinear_matches_independent_f64_reference_on_3x3_to_5x5() {
   // Cross-check the full op against the independent f64 reference on a
   // non-trivial grid + non-square upsample.
   #[rustfmt::skip]
@@ -194,7 +238,7 @@ fn bicubic_matches_independent_f64_reference_on_3x3_to_5x5() {
   ];
   let flat: Vec<f32> = g.iter().flatten().map(|&v| v as f32).collect();
   let grid = Array::from_slice::<f32>(&flat, &(3, 3, 1)).unwrap();
-  let out = bicubic_interpolate(&grid, 5, 5).unwrap();
+  let out = bilinear_interpolate(&grid, 5, 5).unwrap();
   let got = to_vec(&out);
   let want = ref_resize(&g, 5, 5);
   for i in 0..5 {
@@ -207,20 +251,42 @@ fn bicubic_matches_independent_f64_reference_on_3x3_to_5x5() {
 }
 
 #[test]
-fn bicubic_rejects_non_rank3_grid() {
+fn bilinear_matches_independent_f64_reference_on_5x5_to_3x3_downsample() {
+  // Downsample cross-check (antialias active on both axes) against the
+  // independent f64 reference — the path the plain-bilinear formula would
+  // get wrong.
+  let g: Vec<Vec<f64>> = (0..5)
+    .map(|i| (0..5).map(|j| (i * 5 + j) as f64).collect())
+    .collect();
+  let flat: Vec<f32> = g.iter().flatten().map(|&v| v as f32).collect();
+  let grid = Array::from_slice::<f32>(&flat, &(5, 5, 1)).unwrap();
+  let out = bilinear_interpolate(&grid, 3, 3).unwrap();
+  let got = to_vec(&out);
+  let want = ref_resize(&g, 3, 3);
+  for i in 0..3 {
+    for j in 0..3 {
+      let w = want[i][j] as f32;
+      let gv = got[i * 3 + j];
+      assert!((gv - w).abs() < 1e-4, "({i},{j}): got {gv}, want {w}");
+    }
+  }
+}
+
+#[test]
+fn bilinear_rejects_non_rank3_grid() {
   let g2 = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
-  let err = bicubic_interpolate(&g2, 4, 4).unwrap_err();
+  let err = bilinear_interpolate(&g2, 4, 4).unwrap_err();
   assert!(matches!(err, Error::RankMismatch(_)), "got {err}");
 }
 
 #[test]
-fn bicubic_rejects_zero_and_oversize_dims() {
+fn bilinear_rejects_zero_and_oversize_dims() {
   let grid = Array::from_slice::<f32>(&[1.0f32; 4], &(2, 2, 1)).unwrap();
   // zero output dim
-  let err = bicubic_interpolate(&grid, 0, 4).unwrap_err();
+  let err = bilinear_interpolate(&grid, 0, 4).unwrap_err();
   assert!(matches!(err, Error::OutOfRange(_)), "out_h=0: got {err}");
   // oversize output dim (> MAX_INTERP_DIM)
-  let err = bicubic_interpolate(&grid, 4, MAX_INTERP_DIM + 1).unwrap_err();
+  let err = bilinear_interpolate(&grid, 4, MAX_INTERP_DIM + 1).unwrap_err();
   assert!(
     matches!(err, Error::CapExceeded(_)),
     "out_w huge: got {err}"
@@ -228,10 +294,10 @@ fn bicubic_rejects_zero_and_oversize_dims() {
 }
 
 #[test]
-fn bicubic_rejects_integer_grid_dtype() {
-  // Build a rank-3 int32 grid; the fractional cubic weights cannot
+fn bilinear_rejects_integer_grid_dtype() {
+  // Build a rank-3 int32 grid; the fractional triangle weights cannot
   // resample it, so the op must reject the dtype.
   let g = Array::from_slice::<i32>(&[1, 2, 3, 4], &(2, 2, 1)).unwrap();
-  let err = bicubic_interpolate(&g, 4, 4).unwrap_err();
+  let err = bilinear_interpolate(&g, 4, 4).unwrap_err();
   assert!(matches!(err, Error::UnsupportedDtype(_)), "got {err}");
 }

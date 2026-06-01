@@ -161,6 +161,34 @@ fn from_weights_rejects_wrong_head_shape() {
 }
 
 #[test]
+fn from_weights_rejects_oversize_num_hidden_layers() {
+  // A directly-built (unvalidated) config with a hostile `num_hidden_layers`
+  // reaching the PUBLIC `from_weights` must be rejected with a typed
+  // `CapExceeded` (its idempotent `config.validate()?` guard) BEFORE the
+  // per-layer reservation/loop — never a `with_capacity` abort.
+  let json = format!(
+    r#"{{
+      "model_type": "siglip_text_model",
+      "vocab_size": {VOCAB},
+      "max_position_embeddings": {MAX_POS},
+      "hidden_size": {HIDDEN},
+      "intermediate_size": {INTER},
+      "num_attention_heads": {HEADS},
+      "num_hidden_layers": 1000000,
+      "layer_norm_eps": 1e-6
+    }}"#
+  );
+  let cfg = TextConfig::from_json(&json).unwrap();
+  assert_eq!(cfg.num_hidden_layers, 1_000_000);
+  let mut w = tiny_text_weights();
+  let err = TextTower::from_weights(&cfg, &mut w).err();
+  assert!(
+    matches!(err, Some(Error::CapExceeded(_))),
+    "oversize num_hidden_layers must be a typed CapExceeded, got {err:?}"
+  );
+}
+
+#[test]
 fn from_weights_rejects_missing_final_layer_norm() {
   let cfg = tiny_text_config();
   let mut w = tiny_text_weights();

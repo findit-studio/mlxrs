@@ -1,17 +1,21 @@
 //! Spatial interpolation ops.
 //!
-//! Currently the single primitive [`bicubic_interpolate`] — a separable
-//! bicubic resize of a 2-D spatial grid, matching PyTorch
-//! `torch.nn.functional.interpolate(mode="bicubic", align_corners=False)`
-//! with the Keys cubic convolution coefficient **`a = -0.75`** (PyTorch's
-//! default, which differs from PIL/`Image.BICUBIC`'s `a = -0.5`).
+//! Currently the single primitive [`bilinear_interpolate`] — a separable
+//! **bilinear + antialias** resize of a 2-D spatial grid, matching PyTorch
+//! `torch.nn.functional.interpolate(mode="bilinear", align_corners=False,
+//! antialias=True)` exactly (the antialias triangle-filter path of `aten`'s
+//! `UpSampleKernel.cpp`, not the plain 2-tap align-corners=False kernel).
 //!
 //! This is the resize SigLIP2 NaFlex (and other native-resolution ViTs)
 //! use to stretch a learned position-embedding grid from its trained
 //! square shape (e.g. `16 x 16`) to a per-image patch grid
-//! `(H_patch, W_patch)`. It is placed in [`crate::ops`] — not inside the
-//! model code — so independent vision ports can share the one primitive
-//! without coupling their model implementations.
+//! `(H_patch, W_patch)`. HF's
+//! `Siglip2VisionEmbeddings.resize_positional_embeddings` resizes with
+//! `F.interpolate(..., mode="bilinear", align_corners=False,
+//! antialias=True)`, and the future LFM2.5-VL SigLIP2 vision tower uses the
+//! same kernel, so the primitive lives in [`crate::ops`] — not inside the
+//! model code — so independent vision ports can share it without coupling
+//! their model implementations.
 //!
 //! ## Why on-device (MLX), not a NEON/SIMD kernel
 //!
@@ -21,32 +25,48 @@
 //! CPU/NEON kernel is deliberately **not** used here: the position-embed
 //! grid is already a device [`Array`], so a CPU path would force a
 //! device→host→device round-trip purely to interpolate a tiny grid,
-//! which would dominate the cost. Only the constant cubic-weight tables
+//! which would dominate the cost. Only the constant triangle-weight tables
 //! are built on the host (a few hundred `f32`); the actual resampling is
 //! two device matmuls. (Contrast the NaFlex *image* resize, which starts
 //! from host RGB bytes and therefore correctly reuses the NEON
 //! `vlm::resize`.)
 //!
-//! ## Algorithm (separable bicubic, `a = -0.75`, `align_corners=False`)
+//! ## Algorithm (separable bilinear + antialias, `align_corners=False`)
 //!
-//! Bicubic interpolation is separable: a 2-D resize equals a 1-D resize
-//! along each axis. For an output axis of length `out` resampling an
-//! input axis of length `in`, the source coordinate of output index `j`
-//! is
+//! Bilinear interpolation is separable: a 2-D resize equals a 1-D resize
+//! along each axis. PyTorch's antialias path (the `aa_filter` triangle in
+//! `UpSampleKernel.cpp`) builds, per output index `i` on an axis of length
+//! `out` resampling an input axis of length `in`:
 //!
 //! ```text
-//! src = (j + 0.5) * (in / out) - 0.5
+//! scale    = in / out                              (align_corners=False)
+//! center   = scale * (i + 0.5)                     (NO half-pixel -0.5 shift)
+//! support  = scale >= 1 ? scale : 1                (interp_size = 2 ⇒ *0.5)
+//! invscale = scale >= 1 ? 1 / scale : 1
+//! xmin     = max(floor(center - support + 0.5), 0)
+//! xmax     = min(floor(center + support + 0.5), in)
 //! ```
 //!
-//! (the half-pixel-centered `align_corners=False` map). The four input
-//! taps are `floor(src) - 1 ..= floor(src) + 2`, each weighted by the
-//! Keys cubic kernel evaluated at its signed distance to `src`; source
-//! indices are clamped to `[0, in - 1]` (edge replication — matching
-//! PyTorch, which clamps the gather index rather than zero-padding). The
-//! four weights are **not** renormalized (also matching PyTorch). This
-//! produces a dense `(out, in)` weight matrix `W` per axis, and the
-//! resize is `W_h · X · W_wᵀ` contracted over the two spatial axes via
-//! [`matmul`].
+//! and for each input tap `t` in `xmin..xmax` the (unnormalized) weight is
+//! the triangle filter `f((t - center + 0.5) * invscale)` with
+//! `f(x) = max(0, 1 - |x|)`. The taps are then **renormalized** to sum to
+//! `1` (PyTorch divides each by their total). This produces a dense
+//! `(out, in)` weight matrix `W` per axis, and the resize is
+//! `W_h · X · W_wᵀ` contracted over the two spatial axes via [`matmul`].
+//!
+//! - When **downsampling** (`scale > 1`) the support is stretched by
+//!   `scale`, so the filter averages over a wider neighbourhood — this is
+//!   the antialiasing, and where the result differs from a plain 2-tap
+//!   bilinear.
+//! - When **upsampling** (`scale <= 1`) `support = 1`, `invscale = 1`, and
+//!   the two-tap weights already sum to `1`, so the renormalization is a
+//!   no-op and the result is exactly plain bilinear `align_corners=False`.
+//!
+//! Off-edge taps are excluded by the `[0, in]` clamp on `xmin`/`xmax` (the
+//! kernel narrows the window at the borders and renormalizes the surviving
+//! taps), matching PyTorch. Byte-level agreement with the oracle is
+//! confirmed numerically only by the gated SigLIP2 e2e parity test (the
+//! hand-computed unit cases below pin the weight formula on small grids).
 
 use crate::{
   array::Array,
@@ -59,13 +79,7 @@ use crate::{
   },
 };
 
-/// Keys cubic convolution coefficient used by PyTorch
-/// `F.interpolate(mode="bicubic")`. PIL/`Image.BICUBIC` uses `-0.5`;
-/// SigLIP2 NaFlex resamples its position embeddings with the PyTorch
-/// kernel, so this port pins `-0.75`.
-const CUBIC_A: f64 = -0.75;
-
-/// Upper bound on either output spatial dimension. The bicubic weight
+/// Upper bound on either output spatial dimension. The bilinear weight
 /// matrices are dense (`out * in` `f32`), built on the host before the
 /// device matmuls; this caps the host build (and the device matmul
 /// shapes) so a hostile / mis-derived `(out_h, out_w)` cannot drive an
@@ -75,40 +89,25 @@ const CUBIC_A: f64 = -0.75;
 /// well within `i32` for the matmul.
 const MAX_INTERP_DIM: usize = 4096;
 
-/// The Keys cubic convolution kernel `k(t)` with coefficient `a`
-/// ([`CUBIC_A`]), evaluated at signed distance `t`.
-///
-/// ```text
-/// |t| <= 1:        (a + 2)|t|^3 - (a + 3)|t|^2 + 1
-/// 1 <  |t| < 2:    a|t|^3 - 5a|t|^2 + 8a|t| - 4a
-/// |t| >= 2:        0
-/// ```
-///
-/// This is the standard piecewise cubic PyTorch's bicubic resampler
-/// uses (`aten` `cubic_convolution1/2` with `A = -0.75`). Computed in
-/// `f64` for the host-side weight build; the resulting weights are cast
-/// to the input dtype before the device matmul.
-fn cubic_kernel(t: f64) -> f64 {
-  let x = t.abs();
-  if x <= 1.0 {
-    ((CUBIC_A + 2.0) * x - (CUBIC_A + 3.0)) * x * x + 1.0
-  } else if x < 2.0 {
-    (((x - 5.0) * x + 8.0) * x - 4.0) * CUBIC_A
-  } else {
-    0.0
-  }
+/// PyTorch's antialias triangle (tent) filter `f(x) = max(0, 1 - |x|)`
+/// (`HelperInterpLinear::aa_filter` in `aten`'s `UpSampleKernel.cpp`).
+/// Evaluated in `f64` for the host-side weight build; the resulting
+/// per-axis weights are cast to the grid dtype before the device matmul.
+fn triangle_filter(x: f64) -> f64 {
+  let x = x.abs();
+  if x < 1.0 { 1.0 - x } else { 0.0 }
 }
 
-/// Build the dense `(out, in)` bicubic resampling weight matrix for one
-/// axis, as a row-major `Vec<f32>` of length `out * in`.
+/// Build the dense `(out, in)` bilinear+antialias resampling weight matrix
+/// for one axis, as a row-major `Vec<f32>` of length `out * in`.
 ///
-/// Row `j` (output position) holds the four non-zero cubic weights at
-/// the clamped source taps `floor(src) - 1 ..= floor(src) + 2`, where
-/// `src = (j + 0.5) * scale - 0.5` and `scale = in / out`. Border taps
-/// are clamped to `[0, in - 1]` (edge replication), so a tap that falls
-/// off the edge **accumulates** its weight onto the boundary column
-/// (the `+=`), exactly as PyTorch's clamped-index gather does. Weights
-/// are not renormalized.
+/// Implements PyTorch's `UpSampleKernel.cpp` antialias linear path exactly
+/// (see the module docs): per output row `i`, the source `center =
+/// scale * (i + 0.5)` (no `-0.5` shift — antialias bakes the half-pixel
+/// into the `+0.5` inside the filter argument), a `support` stretched by
+/// `scale` when downsampling, the `[0, in]`-clamped tap window
+/// `xmin..xmax`, the triangle filter at `(t - center + 0.5) * invscale`,
+/// and a per-row renormalization so the surviving taps sum to `1`.
 ///
 /// `in_dim` and `out_dim` are both `>= 1` (guaranteed by the caller).
 fn build_axis_weights(in_dim: usize, out_dim: usize) -> Result<Vec<f32>> {
@@ -118,29 +117,44 @@ fn build_axis_weights(in_dim: usize, out_dim: usize) -> Result<Vec<f32>> {
   // the checked form so the matmul `i32` shape stays honest.
   let total = out_dim.checked_mul(in_dim).ok_or_else(|| {
     Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
-      "bicubic_interpolate: weight-matrix size (out * in)",
+      "bilinear_interpolate: weight-matrix size (out * in)",
       "usize",
       [("out", out_dim as u64), ("in", in_dim as u64)],
     ))
   })?;
   let mut w = vec![0.0f32; total];
   let scale = in_dim as f64 / out_dim as f64;
-  let in_last = (in_dim - 1) as isize;
-  for j in 0..out_dim {
-    let src = (j as f64 + 0.5) * scale - 0.5;
-    let base = src.floor();
-    let frac = src - base; // in [0, 1)
-    let base_i = base as isize;
-    let row = j * in_dim;
-    // Four taps at offsets -1, 0, 1, 2 from `base`. The signed distance
-    // from the tap to `src` is `frac - offset`; the cubic kernel is
-    // even, so the sign is immaterial to `cubic_kernel`.
-    for offset in -1isize..=2 {
-      let weight = cubic_kernel(frac - offset as f64) as f32;
-      let tap = (base_i + offset).clamp(0, in_last) as usize;
-      // `+=`: a clamped (off-edge) tap folds its weight onto the
-      // boundary column, matching PyTorch's clamped-index gather.
-      w[row + tap] += weight;
+  // interp_size = 2 for linear ⇒ base support = interp_size * 0.5 = 1.0,
+  // stretched by `scale` only when downsampling (scale >= 1).
+  let support = if scale >= 1.0 { scale } else { 1.0 };
+  let invscale = if scale >= 1.0 { 1.0 / scale } else { 1.0 };
+  let in_i = in_dim as i64;
+  for i in 0..out_dim {
+    let center = scale * (i as f64 + 0.5);
+    // `floor(... + 0.5)` via i64 truncation of the non-negative arguments
+    // (xmin's argument is clamped to >= 0; center + support + 0.5 > 0).
+    let xmin = ((center - support + 0.5).floor() as i64).max(0);
+    let xmax = ((center + support + 0.5).floor() as i64).min(in_i);
+    let row = i * in_dim;
+    // First pass: unnormalized triangle weights + their total.
+    let mut tot = 0.0f64;
+    let mut t = xmin;
+    while t < xmax {
+      let weight = triangle_filter((t as f64 - center + 0.5) * invscale);
+      w[row + t as usize] = weight as f32;
+      tot += weight;
+      t += 1;
+    }
+    // Second pass: renormalize so the surviving taps sum to 1 (PyTorch
+    // divides each weight by their total). `tot` is > 0 for every valid
+    // (in, out) pair since the center always lands within a tap's support.
+    if tot != 0.0 {
+      let inv_tot = (1.0 / tot) as f32;
+      let mut t = xmin;
+      while t < xmax {
+        w[row + t as usize] *= inv_tot;
+        t += 1;
+      }
     }
   }
   Ok(w)
@@ -166,10 +180,9 @@ fn check_dim(context: &'static str, value: usize) -> Result<()> {
   Ok(())
 }
 
-/// Bicubic-resize a 2-D spatial grid from `(H_in, W_in, C)` to
-/// `(out_h, out_w, C)`, matching PyTorch
-/// `F.interpolate(mode="bicubic", align_corners=False)` with cubic
-/// coefficient `a = -0.75`.
+/// Bilinear-resize (with antialias) a 2-D spatial grid from `(H_in, W_in, C)`
+/// to `(out_h, out_w, C)`, matching PyTorch
+/// `F.interpolate(mode="bilinear", align_corners=False, antialias=True)`.
 ///
 /// `grid` is a rank-3 `(H_in, W_in, C)` float array — the layout SigLIP2
 /// reshapes its `(num_positions, embed_dim)` position-embedding table
@@ -185,58 +198,59 @@ fn check_dim(context: &'static str, value: usize) -> Result<()> {
 /// - `W_h` is the `(out_h, H_in)` row-resampling matrix,
 /// - `W_w` is the `(out_w, W_in)` column-resampling matrix,
 ///
-/// each built from the Keys cubic kernel (`a = -0.75`) at the
-/// `align_corners=False` half-pixel source coordinates (see the module
-/// docs). Both matmuls run on the active MLX device.
+/// each built from the antialias triangle filter at the half-pixel source
+/// coordinates (see the module docs). Both matmuls run on the active MLX
+/// device.
 ///
 /// ## Errors
 /// - `grid` is not rank-3 → [`Error::RankMismatch`].
 /// - any of `H_in`, `W_in`, `out_h`, `out_w` is `0`, or `out_h` / `out_w`
 ///   exceeds the dense-weight-matrix cap (`MAX_INTERP_DIM`, 4096) →
 ///   [`Error::OutOfRange`] / [`Error::CapExceeded`].
-/// - `grid`'s dtype is non-floating (the cubic kernel produces
-///   fractional weights; an integer grid would truncate every sample) →
+/// - `grid`'s dtype is non-floating (the triangle weights are fractional;
+///   an integer grid would truncate every sample) →
 ///   [`Error::UnsupportedDtype`].
 /// - underlying [`matmul`] / [`reshape`] / [`transpose_axes`] /
 ///   [`astype`] errors propagate (e.g. a non-finite grid value flows
 ///   through unchanged — interpolation is linear in the samples).
-pub fn bicubic_interpolate(grid: &Array, out_h: usize, out_w: usize) -> Result<Array> {
+pub fn bilinear_interpolate(grid: &Array, out_h: usize, out_w: usize) -> Result<Array> {
   let shape = grid.shape();
   if shape.len() != 3 {
     return Err(Error::RankMismatch(crate::error::RankMismatchPayload::new(
-      "bicubic_interpolate: grid must be rank-3 (H, W, C)",
+      "bilinear_interpolate: grid must be rank-3 (H, W, C)",
       shape.len() as u32,
       shape,
     )));
   }
   let (h_in, w_in, c) = (shape[0], shape[1], shape[2]);
-  check_dim("bicubic_interpolate: H_in", h_in)?;
-  check_dim("bicubic_interpolate: W_in", w_in)?;
-  check_dim("bicubic_interpolate: out_h", out_h)?;
-  check_dim("bicubic_interpolate: out_w", out_w)?;
+  check_dim("bilinear_interpolate: H_in", h_in)?;
+  check_dim("bilinear_interpolate: W_in", w_in)?;
+  check_dim("bilinear_interpolate: out_h", out_h)?;
+  check_dim("bilinear_interpolate: out_w", out_w)?;
   // The channel axis only needs to be representable in the reshape /
   // matmul `i32` shapes; it is bounded by the same cap so the
   // `(W_in * C)` and `(H_out * C)` flattened operands stay within `i32`.
-  check_dim("bicubic_interpolate: C", c)?;
+  check_dim("bilinear_interpolate: C", c)?;
 
-  // The cubic weights are fractional, so a non-floating grid would lose
+  // The triangle weights are fractional, so a non-floating grid would lose
   // every sample to truncation. Restrict to the float dtypes (the
   // position-embed table is always float).
   let dtype = grid.dtype()?;
   if !matches!(dtype, Dtype::F32 | Dtype::F16 | Dtype::BF16) {
     return Err(Error::UnsupportedDtype(
       crate::error::UnsupportedDtypePayload::new(
-        "bicubic_interpolate: grid dtype",
+        "bilinear_interpolate: grid dtype",
         dtype,
         &[Dtype::F32, Dtype::F16, Dtype::BF16],
       ),
     ));
   }
 
-  // Fast path: identical shape ⇒ the bicubic kernel reduces to identity
-  // weights, but skip the matmuls entirely (and the f32 round-trip a
-  // weight build + cast would introduce) so a no-op resize is exactly
-  // the input. `try_clone` preserves the lazy graph reference.
+  // Fast path: identical shape ⇒ the antialias weights reduce to identity
+  // (scale == 1 ⇒ each row is one-hot), but skip the matmuls entirely (and
+  // the f32 round-trip a weight build + cast would introduce) so a no-op
+  // resize is exactly the input. `try_clone` preserves the lazy graph
+  // reference.
   if h_in == out_h && w_in == out_w {
     return grid.try_clone();
   }

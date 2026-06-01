@@ -37,6 +37,7 @@ use crate::{
   },
   error::{Error, OutOfRangePayload, Result},
   lm::nn::{attention::Mask, norm::LayerNorm},
+  model_validation::reserve_or_error,
   ops,
 };
 
@@ -75,6 +76,11 @@ impl TextTower {
   /// dimensions (typed [`crate::Error::ShapePairMismatch`] wrapped in
   /// [`crate::Error::LayerKeyed`]).
   pub fn from_weights(config: &TextConfig, weights: &mut HashMap<String, Array>) -> Result<Self> {
+    // Idempotent re-validation: `from_weights` is public, so a caller may build
+    // a tower from a directly-constructed (unvalidated) config. This bounds
+    // `num_hidden_layers` (and every other dim) before the per-layer
+    // reservation/loop below.
+    config.validate()?;
     let hidden = config.hidden_size;
     let inter = config.intermediate_size;
     let num_heads = config.num_attention_heads;
@@ -99,7 +105,16 @@ impl TextTower {
       &[max_pos, hidden],
     )?;
 
-    let mut layers = Vec::with_capacity(usize::try_from(config.num_hidden_layers).unwrap_or(0));
+    // `num_hidden_layers` is bounded by `MAX_CARDINALITY` in `validate`, but
+    // reserve fallibly so even a within-cap heavyweight per-layer `Vec` the
+    // allocator cannot satisfy is a recoverable [`Error::AllocFailure`] rather
+    // than `with_capacity`'s abort (the merged LFM2 / Wav2Vec2 pattern).
+    let mut layers: Vec<EncoderLayer> = Vec::new();
+    reserve_or_error(
+      &mut layers,
+      "EncoderLayer",
+      config.num_hidden_layers as usize,
+    )?;
     for i in 0..config.num_hidden_layers {
       layers.push(EncoderLayer::from_weights(weights, "encoder", i, dims)?);
     }

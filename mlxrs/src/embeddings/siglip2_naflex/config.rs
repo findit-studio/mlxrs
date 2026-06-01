@@ -83,7 +83,7 @@ pub struct TextConfig {
 /// Ports `siglip.py`'s `VisionConfig` (lines 29-44). The NaFlex
 /// parameters [`num_patches`](VisionConfig::num_patches) (the learned
 /// position-embedding grid; `256` ⇒ a `16 x 16` grid that
-/// [`crate::ops::interpolation::bicubic_interpolate`] resizes per image)
+/// [`crate::ops::interpolation::bilinear_interpolate`] resizes per image)
 /// and [`max_num_patches`](VisionConfig::max_num_patches) (the per-image
 /// patch budget the [`crate::embeddings::siglip2_naflex::processing`]
 /// stage resizes down to) are both `Option` upstream; the accessors
@@ -256,10 +256,10 @@ impl TextConfig {
   /// any tensor is built.
   ///
   /// Pins `model_type` to `"siglip_text_model"`; requires every
-  /// dimension / count positive; bounds the layer + head counts by
-  /// `MAX_CARDINALITY`; and requires `hidden_size` divisible by
-  /// `num_attention_heads` (the per-head split) and `projection_size`
-  /// positive.
+  /// dimension / count positive; bounds the layer + head counts and
+  /// `max_position_embeddings` by `MAX_CARDINALITY`; and requires
+  /// `hidden_size` divisible by `num_attention_heads` (the per-head split)
+  /// and `projection_size` positive.
   pub fn validate(&self) -> Result<()> {
     pin_str(
       "TextConfig: model_type",
@@ -267,9 +267,14 @@ impl TextConfig {
       &["siglip_text_model"],
     )?;
     require_positive("TextConfig: vocab_size", self.vocab_size)?;
-    require_positive(
+    // `max_position_embeddings` sizes the position-embedding table (a
+    // fixed-length per-tower buffer) and is the sequence length the encoder
+    // can attend over; bound it so a hostile value cannot drive an oversized
+    // table load. Positive + within the shared cardinality cap.
+    require_cardinality(
       "TextConfig: max_position_embeddings",
-      self.max_position_embeddings,
+      i64::from(self.max_position_embeddings),
+      MAX_CARDINALITY,
     )?;
     require_positive("TextConfig: hidden_size", self.hidden_size)?;
     require_positive("TextConfig: intermediate_size", self.intermediate_size)?;
@@ -374,8 +379,8 @@ impl VisionConfig {
   ///
   /// Pins `model_type` to `"siglip_vision_model"` and `num_channels` to
   /// `3`; requires every dimension / count positive; bounds the layer +
-  /// head counts by `MAX_CARDINALITY`; requires `hidden_size`
-  /// divisible by `num_attention_heads`; bounds the resolved
+  /// head counts and `image_size` by `MAX_CARDINALITY`; requires
+  /// `hidden_size` divisible by `num_attention_heads`; bounds the resolved
   /// `num_patches` and `max_num_patches` (each sizes a fixed-length
   /// per-image buffer) by `MAX_CARDINALITY`; and validates the
   /// `patch_feature_dim` arithmetic does not overflow.
@@ -388,7 +393,17 @@ impl VisionConfig {
     // The patch-embed + flatten path is hardcoded to RGB (3 channels);
     // a deviating count would silently mis-shape the flattened patch row.
     pin_i32("VisionConfig: num_channels", self.num_channels, 3)?;
-    require_positive("VisionConfig: image_size", self.image_size)?;
+    // `image_size` feeds the `num_patches` fallback `(image_size / patch_size)^2`
+    // (which sizes the position grid when `num_patches` is absent); bound it by
+    // the shared cardinality cap so that fallback cannot be driven oversized.
+    // Positivity alone would let a pathological `image_size` (with a small
+    // `patch_size`) inflate the resolved patch count before the dedicated
+    // `num_patches` cap below.
+    require_cardinality(
+      "VisionConfig: image_size",
+      i64::from(self.image_size),
+      MAX_CARDINALITY,
+    )?;
     require_positive("VisionConfig: patch_size", self.patch_size)?;
     require_positive("VisionConfig: hidden_size", self.hidden_size)?;
     require_positive("VisionConfig: intermediate_size", self.intermediate_size)?;

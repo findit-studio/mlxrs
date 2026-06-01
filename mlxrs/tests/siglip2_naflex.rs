@@ -1,8 +1,9 @@
 //! Gated end-to-end oracle-parity test for the SigLIP2 NaFlex dual-tower
 //! embeddings model.
 //!
-//! This is the test that ultimately validates the per-image **bicubic
-//! position-embedding resize** + the NaFlex resize fidelity end-to-end: it
+//! This is the test that ultimately validates the per-image **bilinear +
+//! antialias position-embedding resize** + the NaFlex resize fidelity
+//! end-to-end: it
 //! loads the real `google/siglip2-base-patch16-naflex` checkpoint, runs the
 //! crate's preprocessing → `encode_image` / `encode_text`, and compares each
 //! output to the matching PyTorch-reference `.npy` by cosine similarity

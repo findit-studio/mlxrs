@@ -168,6 +168,29 @@ fn validate_rejects_oversize_layer_count() {
 }
 
 #[test]
+fn validate_rejects_oversize_max_position_embeddings() {
+  // A hostile `max_position_embeddings` sizes the text position table; the
+  // cardinality cap rejects an over-cap value (here 1 << 20).
+  let json = BASE_CONFIG_JSON.replace(
+    r#""max_position_embeddings": 64"#,
+    r#""max_position_embeddings": 1048576"#,
+  );
+  let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
+  let err = cfg.validate().unwrap_err();
+  assert!(matches!(err, Error::CapExceeded(_)), "got {err}");
+}
+
+#[test]
+fn validate_rejects_oversize_image_size() {
+  // A hostile `image_size` would inflate the `(image_size/patch_size)^2`
+  // num_patches fallback; the cardinality cap rejects an over-cap value.
+  let json = BASE_CONFIG_JSON.replace(r#""image_size": 256"#, r#""image_size": 1048576"#);
+  let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
+  let err = cfg.validate().unwrap_err();
+  assert!(matches!(err, Error::CapExceeded(_)), "got {err}");
+}
+
+#[test]
 fn validate_rejects_negative_num_labels() {
   let json = BASE_CONFIG_JSON.replace(r#""num_labels": 0"#, r#""num_labels": -1"#);
   let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();

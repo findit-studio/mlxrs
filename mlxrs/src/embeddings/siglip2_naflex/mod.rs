@@ -11,7 +11,7 @@
 //! This is a self-contained embeddings model under
 //! [`crate::embeddings`]; it does **not** depend on the LFM2.5-VL vision
 //! tower. The only shared low-level primitive is
-//! [`crate::ops::interpolation::bicubic_interpolate`] (the per-image
+//! [`crate::ops::interpolation::bilinear_interpolate`] (the per-image
 //! position-embedding resize), which lives in [`crate::ops`] precisely so
 //! it can be reused by an independent vision port without coupling the
 //! model code.
@@ -26,8 +26,8 @@
 //!   normalize/patchify into the flat `(num_patches, P^2 * C)` tensor,
 //!   plus `spatial_shapes` + `pixel_attention_mask`).
 //! - [`vision`] — the NaFlex ViT ([`vision::VisionTower`]): patch-embed
-//!   (Conv2d-as-Linear) + per-image bicubic position resize + masked
-//!   pre-norm encoder + optional attention-pool head.
+//!   (Conv2d-as-Linear) + per-image bilinear+antialias position resize +
+//!   masked pre-norm encoder + optional attention-pool head.
 //! - [`text`] — the text tower ([`text::TextTower`]): token + position
 //!   embedding + pre-norm encoder + final LayerNorm + sticky-EOS pooled
 //!   projection.

@@ -32,18 +32,20 @@
 //! `(hidden, P, P, C)` (rank-4) **or** `(hidden, P^2 * C)` (already-flattened
 //! rank-2) shape so a mis-shaped checkpoint fails fast.
 //!
-//! ## Position embedding — bicubic-resized per image
+//! ## Position embedding — bilinear+antialias-resized per image
 //!
 //! `position_embedding` is an `nn.Embedding(num_positions, hidden)` whose
 //! `num_positions = num_patches = 256` ⇒ a trained `16 x 16` grid. For NaFlex
 //! each image has its own patch grid `(H_p, W_p)` (from `spatial_shapes`), so
-//! the trained grid is bicubic-resized to `(H_p, W_p)` via
-//! [`bicubic_interpolate`](crate::ops::interpolation::bicubic_interpolate)
-//! (PyTorch `F.interpolate(mode="bicubic", align_corners=False)`, `a = -0.75`)
-//! and added to the active patch embeds. Padded patch rows (past `H_p * W_p`)
-//! receive **no** position embedding and are masked out of attention via
-//! `pixel_attention_mask`. This is the native-resolution interpolation HF's
-//! `Siglip2VisionEmbeddings.forward` performs and `siglip.py` stubs out.
+//! the trained grid is resized to `(H_p, W_p)` via
+//! [`bilinear_interpolate`](crate::ops::interpolation::bilinear_interpolate)
+//! (PyTorch `F.interpolate(mode="bilinear", align_corners=False,
+//! antialias=True)`) and added to the active patch embeds. This matches HF's
+//! `Siglip2VisionEmbeddings.resize_positional_embeddings`, the source of the
+//! parity oracle's fixtures (`siglip.py` stubs the interpolation out). Padded
+//! patch rows (past `H_p * W_p`) are filled with the first resized position
+//! (HF's `resized_positional_embeddings[0]`) and masked out of attention via
+//! `pixel_attention_mask`, so their value is immaterial to the output.
 //!
 //! ## Attention masking (NaFlex divergence from `siglip.py`)
 //!
@@ -77,7 +79,7 @@ use crate::{
     attention::{Mask, scaled_dot_product_attention},
     norm::LayerNorm,
   },
-  model_validation::{checked_mul, require_positive},
+  model_validation::{checked_mul, require_positive, reserve_or_error},
   ops,
 };
 
@@ -229,6 +231,11 @@ impl VisionTower {
   /// config validation cannot run a different graph or drive an oversized
   /// allocation.
   pub fn from_weights(config: &VisionConfig, weights: &mut HashMap<String, Array>) -> Result<Self> {
+    // Idempotent re-validation: `from_weights` is public, so a caller may
+    // build a tower from a directly-constructed (unvalidated) config. This
+    // bounds `num_hidden_layers` (and every other dim) before the per-layer
+    // reservation/loop below.
+    config.validate()?;
     let hidden = config.hidden_size;
     let patch = config.patch_size;
     let channels = config.num_channels;
@@ -266,7 +273,16 @@ impl VisionTower {
     let pos_grid_side = isqrt_exact(num_positions, "VisionConfig: num_patches")?;
 
     // ── encoder layers ──
-    let mut layers = Vec::with_capacity(usize::try_from(config.num_hidden_layers).unwrap_or(0));
+    // `num_hidden_layers` is bounded by `MAX_CARDINALITY` in `validate`, but
+    // reserve fallibly so even a within-cap heavyweight per-layer `Vec` the
+    // allocator cannot satisfy is a recoverable [`Error::AllocFailure`] rather
+    // than `with_capacity`'s abort (the merged LFM2 / Wav2Vec2 pattern).
+    let mut layers: Vec<EncoderLayer> = Vec::new();
+    reserve_or_error(
+      &mut layers,
+      "EncoderLayer",
+      config.num_hidden_layers as usize,
+    )?;
     for i in 0..config.num_hidden_layers {
       layers.push(EncoderLayer::from_weights(weights, "encoder", i, dims)?);
     }
@@ -311,14 +327,35 @@ impl VisionTower {
   /// `NaflexInputs` carries a single image's `(max_num_patches, …)` tensors,
   /// unsqueezed to `(1, max_num_patches, …)` here.
   pub fn forward(&self, inputs: &NaflexInputs) -> Result<(Array, Option<Array>)> {
+    // Cross-check the mask length against the patch dim up front: the
+    // `pixel_attention_mask` selects per-patch keys, so a length mismatch with
+    // `pixel_values`' leading patch dim is a malformed input. Reject it with a
+    // crisp typed error here rather than relying on the downstream SDPA
+    // broadcast to reject the resulting `(1,1,1,n)` mask.
+    let patch_dim = inputs.pixel_values.shape().first().copied().unwrap_or(0);
+    let mask_len = inputs
+      .pixel_attention_mask
+      .shape()
+      .first()
+      .copied()
+      .unwrap_or(0);
+    if mask_len != patch_dim {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "siglip2 vision: pixel_attention_mask length vs pixel_values patch dim",
+        "must equal the pixel_values leading patch dimension",
+        smol_str::format_smolstr!("{mask_len} != {patch_dim}"),
+      )));
+    }
+
     // (max_num_patches, P^2*C) → (1, max_num_patches, P^2*C).
     let pixel_values = ops::shape::expand_dims_axes(&inputs.pixel_values, &[0])?;
     // (1, max_num_patches, hidden).
     let patch_embeds = self.patch_embed.forward(&pixel_values)?;
 
-    // Per-image position embedding: read this image's (H_p, W_p), bicubic-
+    // Per-image position embedding: read this image's (H_p, W_p), bilinear-
     // resize the trained square grid to it, scatter into the active patch rows
-    // (the first H_p*W_p), and add. Padded rows get no positional term.
+    // (the first H_p*W_p), and add. Padded rows take the first resized position
+    // (HF) and are masked out of attention anyway.
     let (h_p, w_p) = read_spatial_shape(&inputs.spatial_shapes)?;
     let pos = self.resized_position_embedding(h_p, w_p, &patch_embeds.shape())?;
     let mut h = patch_embeds.add(&pos)?;
@@ -341,10 +378,12 @@ impl VisionTower {
   }
 
   /// Build the per-image positional-embedding term `(1, num_patches, hidden)`:
-  /// bicubic-resize the trained `(pos_grid_side, pos_grid_side, hidden)` grid to
-  /// `(H_p, W_p, hidden)`, flatten to `(H_p*W_p, hidden)`, and right-pad with
-  /// zero rows to `num_patches` so padded patches receive no positional term
-  /// (their attention is masked out anyway).
+  /// bilinear+antialias-resize the trained `(pos_grid_side, pos_grid_side,
+  /// hidden)` grid to `(H_p, W_p, hidden)`, flatten to `(H_p*W_p, hidden)`, and
+  /// right-pad to `num_patches` by repeating the first resized position
+  /// (matching HF's `resized_positional_embeddings[0]` padding). The padded
+  /// patches' attention is masked out, so the padding value is immaterial to
+  /// the output; it is filled faithfully nonetheless.
   fn resized_position_embedding(
     &self,
     h_p: i32,
@@ -372,23 +411,27 @@ impl VisionTower {
       )));
     }
 
-    // (num_positions, hidden) → (side, side, hidden) → bicubic (H_p, W_p, hidden).
+    // (num_positions, hidden) → (side, side, hidden) → bilinear+antialias
+    // (H_p, W_p, hidden).
     let side = self.pos_grid_side as usize;
     let hidden = self.hidden as usize;
     let grid = ops::shape::reshape(&self.position_embedding, &(side, side, hidden))?;
     let resized =
-      crate::ops::interpolation::bicubic_interpolate(&grid, h_p as usize, w_p as usize)?;
+      crate::ops::interpolation::bilinear_interpolate(&grid, h_p as usize, w_p as usize)?;
     // (H_p, W_p, hidden) → (H_p*W_p, hidden).
     let active_pos = ops::shape::reshape(&resized, &[active, self.hidden])?;
 
-    // Right-pad with zero rows to (num_patches, hidden). A concatenate of the
-    // active rows with a zero block is the mask-padded-positions form (padded
-    // rows contribute 0 to the add).
+    // Right-pad to (num_patches, hidden) by repeating the FIRST resized
+    // position (`resized_embeddings[0]`), matching HF's
+    // `resize_positional_embeddings`. The padded rows' attention is masked out
+    // by `pixel_attention_mask`, so this value is immaterial to the output; it
+    // is filled faithfully nonetheless (rather than with zeros).
     let padded = if active < num_patches {
       let pad_rows = num_patches - active;
-      let zeros = Array::zeros::<f32>(&(pad_rows as usize, hidden))?;
-      let zeros = ops::misc::astype(&zeros, active_pos.dtype()?)?;
-      ops::shape::concatenate(&[&active_pos, &zeros], 0)?
+      // active_pos[0:1] → broadcast to (pad_rows, hidden).
+      let first = ops::indexing::take_axis(&active_pos, &index_zero()?, 0)?; // (1, hidden)
+      let pad_block = ops::shape::broadcast_to(&first, &[pad_rows, self.hidden])?;
+      ops::shape::concatenate(&[&active_pos, &pad_block], 0)?
     } else {
       active_pos
     };
@@ -554,7 +597,7 @@ fn index_zero() -> Result<Array> {
 
 /// Read this image's `(H_p, W_p)` from the `(2,)` i32 `spatial_shapes`.
 /// Evaluates the tiny 2-element array to host integers (the resize geometry is
-/// host-side: the bicubic weight matrices are built on the host).
+/// host-side: the bilinear weight matrices are built on the host).
 #[cfg(feature = "siglip2-naflex")]
 fn read_spatial_shape(spatial_shapes: &Array) -> Result<(i32, i32)> {
   let shape = spatial_shapes.shape();

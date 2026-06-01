@@ -4,7 +4,7 @@
 //! `layers = 1`, `patch = 2`, `num_patches = 4` (a `2 x 2` trained position
 //! grid) vision tower is built from synthetic weights and exercised through
 //! the public [`VisionTower`] surface. These pin the output shapes, the
-//! per-image bicubic pos-embed resize path, the attention-pool head shape, and
+//! per-image bilinear pos-embed resize path, the attention-pool head shape, and
 //! a couple of consumed-weight shape-mismatch rejections. Numeric parity is
 //! covered by the gated e2e oracle in the crate-level `tests/`.
 
@@ -190,8 +190,8 @@ fn vision_tower_output_shapes_square_grid() {
 #[test]
 fn vision_tower_output_shapes_below_budget_grid() {
   // A genuinely below-budget grid (H_p*W_p < NUM_PATCHES) exercises the
-  // per-image bicubic resize to a NON-square grid AND the zero-padding of the
-  // padded patch rows. NaFlex's preprocessing tends to upsample to FILL the
+  // per-image bilinear resize to a NON-square grid AND the first-row padding of
+  // the padded patch rows. NaFlex's preprocessing tends to upsample to FILL the
   // budget, so a below-budget input is built directly here: a (1, 3) grid =
   // 3 active patches out of the 4-patch budget. The `pixel_values` /
   // `pixel_attention_mask` / `spatial_shapes` are constructed to match.
@@ -255,10 +255,12 @@ fn vision_tower_headless_has_no_pooled_output() {
 }
 
 #[test]
-fn pos_embed_resize_produces_active_grid_times_hidden() {
-  // Directly probe the bicubic resize: resizing the trained 2x2 grid to a 1x2
+fn pos_embed_resize_produces_active_grid_with_first_row_padding() {
+  // Directly probe the bilinear resize: resizing the trained 2x2 grid to a 1x2
   // active grid must produce (1*2, hidden) active rows, padded to
-  // (num_patches, hidden), lifted to (1, num_patches, hidden).
+  // (num_patches, hidden), lifted to (1, num_patches, hidden). The padded rows
+  // (2..4) take the FIRST resized position (HF's resized_embeddings[0]), not
+  // zeros.
   let cfg = tiny_vision_config(true);
   let mut w = tiny_vision_weights(true);
   let tower = VisionTower::from_weights(&cfg, &mut w).unwrap();
@@ -269,16 +271,17 @@ fn pos_embed_resize_produces_active_grid_times_hidden() {
     eval_shape(&pos),
     vec![1, NUM_PATCHES as usize, HIDDEN as usize]
   );
-  // The first 1*2 = 2 patch rows are the resized (active) positions; rows 2..4
-  // are zero padding.
   let flat = eval_to_vec(&pos);
   let h = HIDDEN as usize;
+  // Every padded row equals the first active row (the first resized position).
   for padded_row in 2..NUM_PATCHES as usize {
     for j in 0..h {
-      assert_eq!(
+      assert!(
+        (flat[padded_row * h + j] - flat[j]).abs() < 1e-6,
+        "padded pos row {padded_row} idx {j} must equal resized[0]: \
+         got {} want {}",
         flat[padded_row * h + j],
-        0.0,
-        "padded pos row {padded_row} idx {j}"
+        flat[j]
       );
     }
   }
@@ -291,7 +294,7 @@ fn pos_embed_resize_produces_active_grid_times_hidden() {
 
 #[test]
 fn pos_embed_resize_identity_when_grid_matches_trained() {
-  // Resizing the 2x2 trained grid to a 2x2 active grid is the bicubic
+  // Resizing the 2x2 trained grid to a 2x2 active grid is the bilinear
   // identity fast-path (out == in): the active rows equal the trained table.
   let cfg = tiny_vision_config(true);
   let mut w = tiny_vision_weights(true);
@@ -342,6 +345,70 @@ fn from_weights_rejects_missing_attention_weight() {
   w.remove("encoder.layers.0.self_attn.q_proj.weight");
   let err = VisionTower::from_weights(&cfg, &mut w);
   assert!(err.is_err(), "missing attention weight must be rejected");
+}
+
+#[test]
+fn from_weights_rejects_oversize_num_hidden_layers() {
+  // A directly-built (unvalidated) config with a hostile `num_hidden_layers`
+  // reaching the PUBLIC `from_weights` must be rejected with a typed
+  // `CapExceeded` (its idempotent `config.validate()?` guard) BEFORE the
+  // per-layer reservation/loop — never a `with_capacity` abort. Build the
+  // config WITHOUT the helper's `.validate()` so the cap is exercised by
+  // `from_weights` itself.
+  let json = format!(
+    r#"{{
+      "model_type": "siglip_vision_model",
+      "image_size": 4,
+      "patch_size": {PATCH},
+      "num_channels": {CHANNELS},
+      "hidden_size": {HIDDEN},
+      "intermediate_size": {INTER},
+      "num_attention_heads": {HEADS},
+      "num_hidden_layers": 1000000,
+      "layer_norm_eps": 1e-6,
+      "vision_use_head": true,
+      "num_patches": {NUM_PATCHES},
+      "max_num_patches": {NUM_PATCHES}
+    }}"#
+  );
+  let cfg = VisionConfig::from_json(&json).unwrap();
+  let mut w = tiny_vision_weights(true);
+  assert_eq!(cfg.num_hidden_layers, 1_000_000); // hostile value is present
+  let err = VisionTower::from_weights(&cfg, &mut w).err();
+  assert!(
+    matches!(err, Some(Error::CapExceeded(_))),
+    "oversize num_hidden_layers must be a typed CapExceeded, got {err:?}"
+  );
+}
+
+#[test]
+fn forward_rejects_mask_length_patch_dim_mismatch() {
+  // A `NaflexInputs` whose `pixel_attention_mask` length disagrees with the
+  // `pixel_values` leading patch dim is malformed; `forward` must reject it
+  // with the typed cross-check error (not rely on the SDPA broadcast).
+  let cfg = tiny_vision_config(true);
+  let mut w = tiny_vision_weights(true);
+  let tower = VisionTower::from_weights(&cfg, &mut w).unwrap();
+
+  // pixel_values: (NUM_PATCHES, PATCH_FEAT); mask: deliberately one element
+  // too short (NUM_PATCHES - 1); spatial_shapes a valid 2x2 grid.
+  let per_patch = PATCH_FEAT as usize;
+  let pv = vec![0.01f32; NUM_PATCHES as usize * per_patch];
+  let pixel_values = Array::from_slice::<f32>(&pv, &(NUM_PATCHES as usize, per_patch)).unwrap();
+  let short_mask = vec![1i32; NUM_PATCHES as usize - 1];
+  let pixel_attention_mask =
+    Array::from_slice::<i32>(&short_mask, &(NUM_PATCHES as usize - 1,)).unwrap();
+  let spatial_shapes = Array::from_slice::<i32>(&[2, 2], &(2usize,)).unwrap();
+  let inputs = NaflexInputs {
+    pixel_values,
+    pixel_attention_mask,
+    spatial_shapes,
+  };
+  let res = tower.forward(&inputs);
+  assert!(
+    matches!(res, Err(Error::OutOfRange(_))),
+    "mask/patch-dim mismatch must be a typed OutOfRange, got {res:?}"
+  );
 }
 
 #[test]

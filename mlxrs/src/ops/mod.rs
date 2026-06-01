@@ -1,6 +1,6 @@
 //! Free-fn form of mlx-c ops. Each submodule corresponds to an ops group,
 //! covering the full `ops.h` surface, plus a few composed primitives MLX
-//! has no single op for (e.g. [`interpolation::bicubic_interpolate`]).
+//! has no single op for (e.g. [`interpolation::bilinear_interpolate`]).
 
 pub mod arithmetic;
 pub mod comparison;
