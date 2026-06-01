@@ -65,8 +65,16 @@ impl Transcribe for MockCtcModel {
   }
 }
 
+/// A non-empty mono placeholder waveform for the CTC mocks. Its CONTENT is never
+/// inspected (every CTC mock's `logits` ignores the waveform and returns its own
+/// scripted grid); it only needs to pass `validate_waveform` and to carry enough
+/// samples that a mock's hand-built logits frame count `T'` satisfies the
+/// driver's `T' <= input samples` tie (the largest functional grid here is 8
+/// frames). 64 samples is a comfortable margin; tests that specifically exercise
+/// the `T' > samples` rejection build their own small waveform inline.
 fn dummy_waveform() -> Array {
-  Array::from_slice::<f32>(&[0.1_f32, -0.2, 0.3, -0.4], &[4]).unwrap()
+  let data: Vec<f32> = (0..64).map(|i| ((i as f32) * 0.1).sin()).collect();
+  Array::from_slice::<f32>(&data, &[data.len() as i32]).unwrap()
 }
 
 #[test]
@@ -412,9 +420,12 @@ impl CtcModel for LazyShapeCtc {
 fn ctc_rejects_oversized_time_axis_before_materializing() {
   // A model returning a LAZILY-shaped `(MAX_DECODED_SAMPLES + 1, vocab)` logits
   // would, if un-capped, take an argmax + `to_vec::<u32>()` of one u32 per frame
-  // -> a multi-GB OOM. The driver caps the time axis `T'` off the lazy `.shape()`
-  // and rejects with a typed OutOfRange BEFORE the argmax/to_vec — so this test
-  // allocates nothing (the `zeros` grid is never materialized).
+  // -> a multi-GB OOM. An absurd time axis `T'` of `MAX_DECODED_SAMPLES + 1` far
+  // exceeds the `dummy_waveform()` input sample count (and the absolute cap), so
+  // the driver rejects it off the lazy `.shape()` with a typed OutOfRange BEFORE the
+  // argmax/to_vec — this test allocates nothing (the `zeros` grid is never
+  // materialized). The dedicated input-tie and absolute-cap relationship is
+  // covered by `ctc_rejects_time_axis_exceeding_input_samples`.
   let model = LazyShapeCtc::new((audio_io::MAX_DECODED_SAMPLES + 1) as i32, 4);
   let err =
     greedy_ctc_transcribe(&model, &dummy_waveform(), &TranscribeOptions::new()).unwrap_err();
@@ -429,6 +440,52 @@ fn ctc_rejects_oversized_vocab_axis_before_materializing() {
   let model = LazyShapeCtc::new(2, (MAX_LOGITS_VOCAB + 1) as i32);
   let err =
     greedy_ctc_transcribe(&model, &dummy_waveform(), &TranscribeOptions::new()).unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)));
+}
+
+#[test]
+fn ctc_rejects_oversized_element_product_before_materializing() {
+  // The PRODUCT guard: a LAZILY-shaped `(8193, 8192)` logits whose axes EACH
+  // individually pass their per-axis cap — time `8193 <= input samples`
+  // (16384 here) and `<= MAX_DECODED_SAMPLES`; vocab `8192 <= MAX_LOGITS_VOCAB`
+  // (256 Ki) — but whose product `8193 * 8192 = 67_117_056 > MAX_LOGITS_ELEMENTS`
+  // (64 Mi). Without the product guard the `argmax` + `to_vec::<u32>()` would
+  // force `eval` of a 64-Mi-element tensor (an OOM); with it, the driver rejects
+  // off the lazy `.shape()` (a `checked_mul`) BEFORE any materialization, so this
+  // test allocates nothing (the `zeros` grid is never realized). The input is
+  // 16384 samples so the time axis passes the T'-vs-input tie and the PRODUCT
+  // guard is what fires.
+  let t = 8193_usize;
+  let vocab = 8192_usize;
+  assert!(
+    t <= audio_io::MAX_DECODED_SAMPLES,
+    "time axis under absolute cap"
+  );
+  assert!(vocab <= MAX_LOGITS_VOCAB, "vocab axis under per-axis cap");
+  assert!(
+    t.checked_mul(vocab).unwrap() > MAX_LOGITS_ELEMENTS,
+    "product exceeds the element budget"
+  );
+  let input: Vec<f32> = vec![0.0_f32; 16_384];
+  let waveform = Array::from_slice::<f32>(&input, &[input.len() as i32]).unwrap();
+  let model = LazyShapeCtc::new(t as i32, vocab as i32);
+  let err = greedy_ctc_transcribe(&model, &waveform, &TranscribeOptions::new()).unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)));
+}
+
+#[test]
+fn ctc_rejects_time_axis_exceeding_input_samples() {
+  // The T'-vs-input tie: a model whose logits time axis `T'` exceeds the
+  // validated input sample count — but is well under MAX_DECODED_SAMPLES — is
+  // rejected with a typed OutOfRange, so a normal-length input cannot be
+  // amplified into a huge frame axis. A dedicated 4-sample input here; the model
+  // returns `(8, vocab)` lazy logits (`T' = 8 > 4` samples, yet `8` is tiny vs
+  // the absolute cap and the product `8 * 4 = 32` is far under the element
+  // budget), so the input-tie guard — not the absolute or product cap — is what
+  // fires. The `zeros` grid is never materialized (rejected off `.shape()`).
+  let small_input = Array::from_slice::<f32>(&[0.1_f32, -0.2, 0.3, -0.4], &[4]).unwrap();
+  let model = LazyShapeCtc::new(8, 4);
+  let err = greedy_ctc_transcribe(&model, &small_input, &TranscribeOptions::new()).unwrap_err();
   assert!(matches!(err, Error::OutOfRange(_)));
 }
 

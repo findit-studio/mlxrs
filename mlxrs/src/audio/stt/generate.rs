@@ -40,30 +40,47 @@ use super::model::{
 pub const DEFAULT_MAX_DECODE_STEPS: usize = 448;
 
 /// A generous-but-bounded sanity cap on a model-provided logits VOCAB axis,
-/// `1 Mi` (`1_048_576`).
+/// `256 Ki` (`262_144`).
 ///
 /// Both drivers take a per-position `argmax` over the vocab axis of logits the
 /// model returns; the axis length is read off the lazy array's [`Array::shape`]
 /// (no `eval`) so an absurd width can be rejected with a typed
 /// [`Error::OutOfRange`] *before* the `argmax`/materialization. Real speech
-/// vocabularies are at most ~256 K tokens, so `1 Mi` is a wide margin that
-/// admits every real model yet rejects a denial-of-service shape (a lazily-
-/// shaped `(T, huge_vocab)` that would otherwise materialize multi-GB of
-/// intermediate logits before any error).
-pub const MAX_LOGITS_VOCAB: usize = 1024 * 1024;
+/// vocabularies are at most ~256 K tokens, so `256 Ki` admits every real model
+/// yet rejects a denial-of-service shape (a lazily-shaped `(T, huge_vocab)` that
+/// would otherwise materialize multi-GB of intermediate logits before any
+/// error).
+pub const MAX_LOGITS_VOCAB: usize = 256 * 1024;
+
+/// A bound on the TOTAL element count of a model-provided CTC logits grid,
+/// `64 Mi` (`67_108_864`) — the materialization budget for the whole
+/// `(T', vocab)` tensor [`greedy_ctc_transcribe`] reads.
+///
+/// The per-axis caps ([`MAX_LOGITS_VOCAB`] and the time axis against
+/// [`crate::audio::io::MAX_DECODED_SAMPLES`]) bound each dimension
+/// INDEPENDENTLY, but not their product: a lazily-shaped `(T', vocab)` whose
+/// dimensions are each individually under their cap can still have a product of
+/// terabytes of elements (cheap O(1) lazy metadata via broadcast / outer
+/// product), which the `argmax` + `to_vec::<u32>()` would then force `eval` to
+/// materialize — a driver-triggered OOM. So [`greedy_ctc_transcribe`] also
+/// checks `T' * vocab` (a `checked_mul` off the lazy [`Array::shape`], before
+/// any `eval`) against this budget. A real CTC logits is tiny — ~`T'`(~1500 for
+/// 30 s of audio) x `vocab`(~32) ≈ 48 K elements — so `64 Mi` is a wide margin
+/// that admits every real model yet rejects the product-overflow shape.
+pub const MAX_LOGITS_ELEMENTS: usize = 64 * 1024 * 1024;
 
 /// A generous-but-bounded sanity cap on a model-provided
-/// [`AutoregressiveStt::max_context`], `1 Mi` (`1_048_576`).
+/// [`AutoregressiveStt::max_context`], `128 Ki` (`131_072`).
 ///
 /// [`greedy_transcribe`] derives its decode-loop bound (`max_context -
 /// prompt_len`) and the generated-token `Vec`'s growth from `max_context`. A
 /// model is free to report any `max_context`, so an absurd value would make the
 /// loop effectively unbounded and drive an infallible-`push` `Vec` toward OOM
 /// (a never-eot model). Real decoder contexts are at most ~128 K positions, so
-/// `1 Mi` is a wide margin that admits every real decoder yet rejects an absurd
-/// value — and, once capped, the generated-token `Vec` is itself bounded by
-/// `max_context`, so its bounded infallible `push` is acceptable.
-pub const MAX_DECODE_CONTEXT: usize = 1024 * 1024;
+/// `128 Ki` admits every real decoder yet rejects an absurd value — and, once
+/// capped, the generated-token `Vec` is itself bounded by `max_context`, so its
+/// bounded infallible `push` is acceptable.
+pub const MAX_DECODE_CONTEXT: usize = 128 * 1024;
 
 /// Validate a mono `audio` waveform's METADATA — rank, length, cap — WITHOUT
 /// materializing it, returning its sample count.
@@ -197,12 +214,19 @@ pub fn default_log_mel(cfg: &MelConfig, audio: &Array) -> Result<Array> {
 /// TIME axis (`T' == 0`) is well-defined — an empty [`Transcription`] (no ids
 /// survive to collapse) — not an error.
 ///
-/// Both model-provided logits magnitudes are also capped — off the lazy
+/// The model-provided logits magnitudes are also capped — off the lazy
 /// [`Array::shape`], so a denial-of-service shape is rejected BEFORE any
-/// `argmax`/`to_vec` materialization: the time axis `T'` against
-/// [`crate::audio::io::MAX_DECODED_SAMPLES`] (a valid model emits no more frames
-/// than input samples) and the vocab axis against [`MAX_LOGITS_VOCAB`], each a
-/// typed [`Error::OutOfRange`].
+/// `argmax`/`to_vec` materialization, each a typed [`Error::OutOfRange`]:
+///
+/// - the time axis `T'` against BOTH the validated input sample count (a valid
+///   feature extractor emits no more frames than it had input samples) AND the
+///   absolute [`crate::audio::io::MAX_DECODED_SAMPLES`] cap;
+/// - the vocab axis against [`MAX_LOGITS_VOCAB`];
+/// - the PRODUCT `T' * vocab` (the total elements the `argmax`/`to_vec` would
+///   materialize) against [`MAX_LOGITS_ELEMENTS`], via a `checked_mul` off the
+///   lazy shape — so a `(T', vocab)` whose axes each individually pass their cap
+///   but whose product is terabytes of elements is still rejected with no
+///   allocation.
 pub fn greedy_ctc_transcribe<M: CtcModel + ?Sized>(
   model: &M,
   audio: &Array,
@@ -210,7 +234,10 @@ pub fn greedy_ctc_transcribe<M: CtcModel + ?Sized>(
 ) -> Result<Transcription> {
   // Reject an empty / oversized / multi-rank waveform before the encoder
   // forward (the CTC frontend can reasonably assume a non-empty mono input).
-  validate_waveform(audio)?;
+  // Keep the validated sample count: a valid feature extractor emits no more
+  // frames `T'` than it had input samples, so `samples` is the natural per-input
+  // bound on the model-provided time axis below.
+  let samples = validate_waveform(audio)?;
 
   // Per-frame logits `(T', vocab)`; validate the rank so a malformed encoder
   // output surfaces as a typed error rather than a confusing `argmax` shape.
@@ -227,8 +254,18 @@ pub fn greedy_ctc_transcribe<M: CtcModel + ?Sized>(
   // `to_vec::<u32>()` below. `shape` is read off the lazy array's metadata (no
   // `eval`), so a model returning a lazily-shaped `(huge_T', vocab)` is rejected
   // here with NO allocation — rather than materializing one `u32` per frame
-  // (an OOM). A valid model emits no more frames than it had input samples, so
-  // the input-sample cap is the natural bound on `T'`.
+  // (an OOM). Two bounds apply: the validated input sample count (a valid
+  // feature extractor emits no more frames than it had input samples, so a
+  // normal-length input cannot be amplified into a huge frame axis) and the
+  // absolute `MAX_DECODED_SAMPLES` cap (a hard ceiling regardless of input).
+  if shape[0] > samples {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "stt CtcModel::logits time axis (T', frame count)",
+      "must not exceed the input sample count (a valid feature extractor emits \
+         no more frames than input samples)",
+      shape[0].to_string(),
+    )));
+  }
   if shape[0] > audio_io::MAX_DECODED_SAMPLES {
     return Err(Error::OutOfRange(OutOfRangePayload::new(
       "stt CtcModel::logits time axis (T', frame count)",
@@ -243,7 +280,7 @@ pub fn greedy_ctc_transcribe<M: CtcModel + ?Sized>(
   if shape[1] > MAX_LOGITS_VOCAB {
     return Err(Error::OutOfRange(OutOfRangePayload::new(
       "stt CtcModel::logits vocab axis",
-      "must not exceed MAX_LOGITS_VOCAB (1 Mi)",
+      "must not exceed MAX_LOGITS_VOCAB (256 Ki)",
       shape[1].to_string(),
     )));
   }
@@ -253,6 +290,24 @@ pub fn greedy_ctc_transcribe<M: CtcModel + ?Sized>(
     return Err(Error::EmptyInput(EmptyInputPayload::new(
       "stt CtcModel::logits returned an empty vocab axis (vocab == 0)",
     )));
+  }
+  // Cap the PRODUCT `T' * vocab` BEFORE the `argmax` + `to_vec::<u32>()`. The
+  // two per-axis caps above bound each dimension independently but NOT their
+  // product: a lazily-shaped `(T', vocab)` whose axes each individually pass
+  // (e.g. via broadcast / outer-product, O(1) lazy metadata) can still total
+  // terabytes of elements, which the `argmax`/`to_vec` would force `eval` to
+  // materialize — an OOM. `checked_mul` off the lazy `shape` (no `eval`) rejects
+  // an overflow (`None`) or an over-budget product with a typed error and NO
+  // allocation, so this is the last shape gate before the materialization below.
+  match shape[0].checked_mul(shape[1]) {
+    Some(elements) if elements <= MAX_LOGITS_ELEMENTS => {}
+    _ => {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "stt CtcModel::logits element count (T' * vocab)",
+        "must not overflow and must not exceed MAX_LOGITS_ELEMENTS (64 Mi)",
+        format!("{} * {}", shape[0], shape[1]),
+      )));
+    }
   }
   // Read the model-provided blank id EXACTLY ONCE: `blank_id` is `&self`, so an
   // interior-mutability model could otherwise return one value to the range
@@ -378,7 +433,7 @@ pub fn greedy_transcribe<M: AutoregressiveStt + ?Sized>(
   if max_ctx > MAX_DECODE_CONTEXT {
     return Err(Error::OutOfRange(OutOfRangePayload::new(
       "stt AutoregressiveStt::max_context",
-      "must not exceed MAX_DECODE_CONTEXT (1 Mi)",
+      "must not exceed MAX_DECODE_CONTEXT (128 Ki)",
       max_ctx.to_string(),
     )));
   }
@@ -433,7 +488,7 @@ pub fn greedy_transcribe<M: AutoregressiveStt + ?Sized>(
     if vocab_len > MAX_LOGITS_VOCAB {
       return Err(Error::OutOfRange(OutOfRangePayload::new(
         "stt AutoregressiveStt::decode_step vocab axis",
-        "must not exceed MAX_LOGITS_VOCAB (1 Mi)",
+        "must not exceed MAX_LOGITS_VOCAB (256 Ki)",
         vocab_len.to_string(),
       )));
     }
