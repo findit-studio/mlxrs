@@ -73,10 +73,13 @@ fn check_conv_no_overflow(
   output_padding: Option<&[i32]>,
   groups: i32,
 ) -> Result<()> {
-  // Bounds the deepest MLX conv shape formula (the transpose prelude feeding a
-  // nested conv_general): on the order of ten parameter*dimension products plus
-  // linear terms, so a 16x margin is comfortably conservative.
-  const MARGIN: i128 = 16;
+  // MLX builds its int32 conv shape arithmetic as sums of products of one spatial
+  // parameter and one input/weight dimension. The deepest running accumulation —
+  // the transpose prelude's nested conv_general numerator
+  // (id + padding_lo + padding_hi - kd) — reaches at most ~6 such products plus a
+  // few parameter-linear and constant terms, so an affine term-count bound is
+  // both complete and tight: a flat margin would needlessly reject large
+  // unit-parameter convolutions whose products are only dimension * 1.
   let in_shape = input.shape();
   let wt_shape = weight.shape();
   let max_dim = in_shape
@@ -99,7 +102,7 @@ fn check_conv_no_overflow(
   .map(|&p| i128::from(p).abs())
   .max()
   .unwrap_or(0);
-  if max_param * max_dim * MARGIN > i128::from(i32::MAX) {
+  if 6 * max_param * max_dim + 32 * max_param + 64 > i128::from(i32::MAX) {
     return Err(conv_overflow_err(context));
   }
   Ok(())
@@ -773,5 +776,29 @@ mod tests {
     let err = conv_transpose1d(&input, &weight, 1, 0, i32::MAX, 0, 1)
       .expect_err("4D transpose broadcast overflow must be rejected");
     assert!(matches!(err, Error::OutOfRange(_)), "got {err:?}");
+  }
+
+  #[test]
+  fn conv_general_accepts_large_unit_parameter_dim() {
+    // A 1-D unit-kernel conv on a ~134M-element axis (512 MiB f32, allocatable)
+    // has no int32 shape overflow, so the affine bound must accept it — large
+    // dimensions with default parameters are not rejected (Codex round-8
+    // acceptance regression).
+    let input = Array::zeros::<f32>(&[1, 134_217_728, 1]).unwrap();
+    let weight = Array::from_slice::<f32>(&[1.0], &[1, 1, 1]).unwrap();
+    assert!(
+      conv_general(&input, &weight, &[1], &[0], &[0], &[1], &[1], 1, false).is_ok(),
+      "a large unit-parameter convolution must not be falsely rejected"
+    );
+  }
+
+  #[test]
+  fn conv1d_handles_zero_length_axis_without_panic() {
+    // A zero-length spatial axis must not panic the guard (the max-dimension scan
+    // and i128 arithmetic stay valid); MLX surfaces the empty-conv shape error
+    // through `check` (Codex round-8 zero-dimension regression).
+    let input = Array::zeros::<f32>(&[1, 0, 1]).unwrap();
+    let weight = Array::from_slice::<f32>(&[1.0], &[1, 1, 1]).unwrap();
+    let _ = conv1d(&input, &weight, 1, 0, 1, 1);
   }
 }
