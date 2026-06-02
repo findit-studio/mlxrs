@@ -35,6 +35,7 @@ whisper              = ["audio", "tokenizer-bpe", "dep:flate2"]                 
 embeddinggemma       = ["embeddings", "lm", "dep:serde", "dep:serde_json"]         # EmbeddingGemma sentence-encoder (google/embeddinggemma-300m): Gemma3 bidirectional backbone + mean pooling + Dense projection head
 unstable-ops-overload = []
 gguf                 = []
+npz                  = ["dep:zip", "dep:memmapix"]                                # NumPy .npy (single array) + .npz (ZIP of <name>.npy members); mirrors mx.save/savez/savez_compressed (stored + deflate). memmapix memory-maps the file on load (peak ~3x→~1x)
 
 [dependencies]
 mlxrs-sys.workspace = true
@@ -69,6 +70,8 @@ unicode-normalization = { version = "0.1", optional = true }
 regex = { version = "1", optional = true, default-features = false, features = ["std", "perf"] }
 llguidance = { version = "1.7", optional = true, default-features = false, features = ["lark", "referencing"] }
 toktrie_hf_tokenizers = { version = "1.7", optional = true }
+zip = { version = "2", optional = true, default-features = false, features = ["deflate"] } # NumPy .npz ZIP read/write (stored + DEFLATE members) for the `npz` feature
+memmapix = { version = "0.9", optional = true } # memory-map .npy / .npz files on load (peak load memory ~3x→~1x); memmap2-compatible API
 
 [target.'cfg(unix)'.dependencies]
 xattr = { version = "1", optional = true }
