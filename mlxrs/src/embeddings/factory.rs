@@ -316,17 +316,27 @@ impl LoadedEmbeddingModel {
 
 /// A registered embedding-model constructor: assemble an [`EmbeddingModel`]
 /// from the already-resolved [`LoadedEmbeddingModel`] (model type + raw config
-/// JSON + weights).
+/// JSON + weights) **and** the optional parsed deployment pooling config (the
+/// `1_Pooling/config.json` [`StPoolingConfig`], `None` when absent).
 ///
 /// Mirrors mlx-swift-lm's `EmbedderTypeRegistry` creator `(Data) throws ->
 /// EmbeddingModel` — but receives the *already-loaded* weights too (so a
-/// per-usecase architecture never re-globs/re-reads the directory) and returns
-/// a [`Result`] (Rust's `throws`). `Send + Sync` so a registry can be shared
-/// across threads (e.g. a `static` shared registry, as mlx-swift-lm's
+/// per-usecase architecture never re-globs/re-reads the directory) and the
+/// parsed pooling config, so a sentence-encoder **bakes** its
+/// [`PoolingConfig`](crate::embeddings::PoolingConfig) at construction
+/// (resolving normalize / matryoshka dimension / pooling strategy once) rather
+/// than re-deriving it on every encode. A model that does not need it (a
+/// dual-tower model that bakes its own fixed pooling) ignores the argument.
+/// Returns a [`Result`] (Rust's `throws`). `Send + Sync` so a registry can be
+/// shared across threads (e.g. a `static` shared registry, as mlx-swift-lm's
 /// `EmbedderTypeRegistry.shared` is). The constructor itself does **no** I/O;
 /// the directory was already read by [`load()`].
-pub type EmbeddingModelConstructor =
-  Box<dyn Fn(&LoadedEmbeddingModel) -> Result<Box<dyn EmbeddingModel>> + Send + Sync + 'static>;
+pub type EmbeddingModelConstructor = Box<
+  dyn Fn(&LoadedEmbeddingModel, Option<&StPoolingConfig>) -> Result<Box<dyn EmbeddingModel>>
+    + Send
+    + Sync
+    + 'static,
+>;
 
 /// A `model_type: String` → [`EmbeddingModelConstructor`] table, the load
 /// factory's architecture **extension point**.
@@ -422,7 +432,16 @@ impl EmbeddingModelTypeRegistry {
   /// canonicalized (see [`load()`]); an unregistered id is a recoverable
   /// [`Error::Backend`] (mlx-swift-lm's `unsupportedModelType`, mlx-embeddings'
   /// `ValueError("Model type … not supported.")`).
-  pub fn create(&self, loaded: &LoadedEmbeddingModel) -> Result<Box<dyn EmbeddingModel>> {
+  ///
+  /// `pooling` is the parsed `1_Pooling/config.json` (`None` when absent),
+  /// threaded to the constructor so a sentence-encoder bakes its
+  /// [`PoolingConfig`](crate::embeddings::PoolingConfig) at construction; a model
+  /// that bakes its own pooling ignores it.
+  pub fn create(
+    &self,
+    loaded: &LoadedEmbeddingModel,
+    pooling: Option<&StPoolingConfig>,
+  ) -> Result<Box<dyn EmbeddingModel>> {
     let constructor = self.creators.get(&loaded.model_type).ok_or_else(|| {
       // The registry's contents are runtime-keyed; carry the rejected
       // model_type in the payload's `value` and leave the `supported` list
@@ -436,7 +455,7 @@ impl EmbeddingModelTypeRegistry {
         &[],
       ))
     })?;
-    constructor(loaded)
+    constructor(loaded, pooling)
   }
 }
 
@@ -461,9 +480,10 @@ pub struct LoadedEmbeddingContext {
   /// The parsed `1_Pooling/config.json`, if the model directory carries one
   /// (a `sentence-transformers` pooling layout — mlx-embeddings
   /// `_read_pooling_config`; mlx-swift-lm `loadPooling`). `None` when no
-  /// `1_Pooling/config.json` is present; the caller then falls back to the
-  /// model's own pooling strategy or an [`crate::embeddings::EncodeConfig`]
-  /// default.
+  /// `1_Pooling/config.json` is present. It is also threaded to the model's
+  /// constructor (see [`EmbeddingModelConstructor`]) so a sentence-encoder bakes
+  /// its [`PoolingConfig`](crate::embeddings::PoolingConfig); a model that bakes
+  /// its own pooling ignores it.
   pub pooling: Option<StPoolingConfig>,
 }
 
@@ -617,9 +637,13 @@ pub fn load(
     ))
   })?;
 
-  // (7) Construct via the registry (already validated as registered in step 2).
+  // (7) Construct via the registry (already validated as registered in step 2),
+  // threading the parsed `1_Pooling/config.json` (step 3) so a sentence-encoder
+  // bakes its pooling config at construction. `pooling.as_ref()` borrows it for
+  // the constructor; the owned `pooling` is moved into the returned context
+  // below.
   let loaded = LoadedEmbeddingModel::new(model_type, config_json, weights);
-  let model = registry.create(&loaded)?;
+  let model = registry.create(&loaded, pooling.as_ref())?;
 
   Ok(LoadedEmbeddingContext {
     model,

@@ -166,13 +166,65 @@ fn pixel_values_shape_and_normalization_and_zero_padding() {
 }
 
 #[test]
-fn normalize_row_endpoints() {
-  // 0 -> -1, 255 -> 1 (the [-1, 1] SigLIP range).
+fn normalize_row_rgba_endpoints_and_drops_alpha() {
+  // 0 -> -1, 255 -> 1 (the [-1, 1] SigLIP range). The source is RGBA: the
+  // alpha byte (here 77) must be dropped, never appearing in the RGB output.
   let mut dst = [0.0f32; 3];
-  normalize_row(&[0, 128, 255], &mut dst);
+  normalize_row_rgba(&[0, 128, 255, 77], &mut dst);
   assert!((dst[0] - (-1.0)).abs() < 1e-6);
   assert!((dst[1] - (128.0 / 127.5 - 1.0)).abs() < 1e-6);
   assert!((dst[2] - 1.0).abs() < 1e-6, "255 -> {}", dst[2]);
+}
+
+#[test]
+fn normalize_row_rgba_multi_pixel_skips_each_alpha() {
+  // Two RGBA pixels: the per-pixel alpha (9, 200) is skipped and the RGB
+  // triples land contiguously in the 3-channel output row.
+  let mut dst = [0.0f32; 6];
+  normalize_row_rgba(&[10, 20, 30, 9, 40, 50, 60, 200], &mut dst);
+  for (i, &v) in [10u8, 20, 30, 40, 50, 60].iter().enumerate() {
+    let want = f32::from(v) / 127.5 - 1.0;
+    assert!(
+      (dst[i] - want).abs() < 1e-6,
+      "dst[{i}]={} want {want}",
+      dst[i]
+    );
+  }
+}
+
+#[test]
+fn pixel_values_uniform_image_after_resize_drops_alpha_correctly() {
+  // A uniform 32x32 image (every pixel R=10,G=20,B=30) is RESIZED (here scaled
+  // up to fill the 256-patch budget → a 16x16 patch / 256x256 px grid), so the
+  // patchify reads the RGBA8 buffer the resize kernel produces (NOT the source
+  // bytes). A uniform image resizes to the same uniform color, so EVERY active
+  // RGB float must be exactly the normalized R/G/B — proving the RGBA→RGB
+  // alpha-drop patchify (replacing the owned `to_rgb8()` copy) reads the right
+  // 3 of every 4 bytes and never leaks the (255) alpha byte into a colour slot.
+  let rgb: Vec<u8> = std::iter::repeat_n([10u8, 20, 30], 32 * 32)
+    .flatten()
+    .collect();
+  let out = preprocess(&rgb, 32, 32, PATCH, CHANNELS, M).unwrap();
+  let ss = to_vec_i32(&out.spatial_shapes);
+  // 32x32 scales up to fill the budget → 16x16 patches (256 active, the full M).
+  assert_eq!(ss, vec![16, 16], "32x32 → 16x16 patch grid (fills budget)");
+  let pv = to_vec_f32(&out.pixel_values);
+  let r = 10.0f32 / 127.5 - 1.0;
+  let g = 20.0f32 / 127.5 - 1.0;
+  let b = 30.0f32 / 127.5 - 1.0;
+  let n_active = (ss[0] * ss[1]) as usize; // 256 patches
+  for patch_i in 0..n_active {
+    for px in 0..(PATCH * PATCH) as usize {
+      let base = patch_i * 768 + px * 3;
+      assert!(
+        (pv[base] - r).abs() < 1e-5,
+        "patch {patch_i} px {px} R = {}",
+        pv[base]
+      );
+      assert!((pv[base + 1] - g).abs() < 1e-5, "patch {patch_i} px {px} G");
+      assert!((pv[base + 2] - b).abs() < 1e-5, "patch {patch_i} px {px} B");
+    }
+  }
 }
 
 #[test]

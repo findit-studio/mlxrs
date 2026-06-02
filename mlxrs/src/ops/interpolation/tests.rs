@@ -317,6 +317,60 @@ fn bilinear_rejects_over_product_weight_table() {
 }
 
 #[test]
+fn bilinear_rejects_over_product_resample_tensor() {
+  // Each axis is within the per-axis `MAX_INTERP_DIM` (4096) cap AND each weight
+  // table (`out * in`) is within `MAX_INTERP_WEIGHT_ELEMS` (4 Mi), yet a resample
+  // TENSOR `dim * dim * C` blows past `MAX_INTERP_RESAMPLE_ELEMS` (64 Mi): with a
+  // tiny `(2, 2, 64)` grid, `out_h = out_w = MAX_INTERP_DIM` makes the
+  // column-resample / output product `out * out * C` ≈ 1.07e9 elements. The op
+  // must reject it with a typed `CapExceeded` BEFORE any device array / matmul is
+  // built — the grid stays a negligible 256 f32 so the rejection is the only
+  // allocation. This is the hole the per-axis + per-table caps missed.
+  let c = 64usize;
+  let data = vec![0.0f32; 2 * 2 * c]; // (2, 2, 64) — tiny, 256 f32
+  let grid = Array::from_slice::<f32>(&data, &(2, 2, c)).unwrap();
+  let err = bilinear_interpolate(&grid, MAX_INTERP_DIM, MAX_INTERP_DIM).unwrap_err();
+  assert!(
+    matches!(err, Error::CapExceeded(_)),
+    "over-product resample tensor must be a typed CapExceeded, got {err}"
+  );
+  // Sanity: every AXIS is in range and every WEIGHT TABLE is within its cap, but
+  // the resample tensor product exceeds the resample cap — so this is exclusively
+  // the resample-product guard firing (not the per-axis or weight-table caps).
+  assert!(c <= MAX_INTERP_DIM, "channel axis within the per-axis cap");
+  assert!(
+    MAX_INTERP_DIM * MAX_INTERP_DIM * c > MAX_INTERP_RESAMPLE_ELEMS,
+    "the resample tensor product really does exceed the resample cap"
+  );
+}
+
+#[test]
+fn bilinear_rejects_row_resample_product_with_tiny_height() {
+  // The FIRST matmul output is `(out_h, W_in * C)` — `out_h * W_in * C` elements.
+  // The spec's adversarial shape is `H_in = W_in = 4096, out_h = out_w = 1024,
+  // C = 4096`, where that product ≈ 1.7e10. Reproduce the row-resample blow-up
+  // cheaply by keeping `H_in = 1` (so the grid is only `W_in * C` elements) while
+  // `W_in * C` stays large: `(1, 4096, 16)` grid with `out_h = 4096` gives a
+  // row-resample product `4096 * 4096 * 16` ≈ 268 Mi > 64 Mi, rejected before the
+  // matmul — but the grid is just 64 Ki f32.
+  let w_in = MAX_INTERP_DIM; // 4096
+  let c = 16usize;
+  let data = vec![0.0f32; w_in * c]; // (1, 4096, 16) — 64 Ki f32
+  let grid = Array::from_slice::<f32>(&data, &(1, w_in, c)).unwrap();
+  // out_h large, out_w = 1 (so the output / column products stay small and the
+  // ROW-resample product is the one that trips).
+  let err = bilinear_interpolate(&grid, MAX_INTERP_DIM, 1).unwrap_err();
+  assert!(
+    matches!(err, Error::CapExceeded(_)),
+    "over-product row-resample tensor must be a typed CapExceeded, got {err}"
+  );
+  // Sanity: the row-resample product (out_h * W_in * C) exceeds the cap while the
+  // weight tables (out_h * H_in = 4096*1, out_w * W_in = 1*4096) are within theirs.
+  assert!(MAX_INTERP_DIM * w_in * c > MAX_INTERP_RESAMPLE_ELEMS);
+  assert!(MAX_INTERP_DIM <= MAX_INTERP_WEIGHT_ELEMS && w_in <= MAX_INTERP_WEIGHT_ELEMS);
+}
+
+#[test]
 fn bilinear_rejects_integer_grid_dtype() {
   // Build a rank-3 int32 grid; the fractional triangle weights cannot
   // resample it, so the op must reject the dtype.

@@ -19,9 +19,9 @@ use std::{
 use mlxrs::{
   Array, Error,
   embeddings::{
-    Embed, Embedding, EmbeddingModel, EmbeddingModelConfiguration, EmbeddingModelConstructor,
-    EmbeddingModelTypeRegistry, EmbeddingWeights, LoadedEmbeddingModel, PoolingStrategy,
-    TextEmbedder, TextInput, load, remap_model_type,
+    Embedding, EmbeddingModel, EmbeddingModelConfiguration, EmbeddingModelConstructor,
+    EmbeddingModelTypeRegistry, EmbeddingWeights, LoadedEmbeddingModel, Padding, PoolingStrategy,
+    StPoolingConfig, TextEmbedder, TextEncoding, load, remap_model_type,
   },
   error::{FileOp, RankMismatchPayload},
   io,
@@ -42,19 +42,25 @@ fn config_json(model_type: &str) -> String {
 }
 
 /// A trivial public-surface [`EmbeddingModel`] the mock constructor returns. It
-/// embeds text via the universal [`Embed<TextInput>`] (→ a fixed `(batch, 4)`
+/// implements the model-owned [`TextEmbedder`] directly (→ a fixed `(batch, 4)`
 /// zero embedding) and so answers the umbrella's
 /// [`as_text_embedder`](EmbeddingModel::as_text_embedder).
 struct MockEmbedding;
 
-impl<'a> Embed<TextInput<'a>> for MockEmbedding {
-  type Output = Embedding;
+impl TextEmbedder for MockEmbedding {
+  fn text_encoding(&self) -> TextEncoding {
+    TextEncoding::new(
+      true,
+      Some(512),
+      Padding::DynamicRightPad { pad_token_id: 0 },
+    )
+  }
 
-  fn embed(&self, input: TextInput<'a>) -> Result<Embedding, Error> {
-    let batch = match input.token_ids().shape().as_slice() {
+  fn embed_text(&self, input_ids: &Array, _attention_mask: &Array) -> Result<Embedding, Error> {
+    let batch = match input_ids.shape().as_slice() {
       [b, _seq] => *b,
       _ => {
-        let shape = input.token_ids().shape();
+        let shape = input_ids.shape();
         return Err(Error::RankMismatch(RankMismatchPayload::new(
           "MockEmbedding expects rank-2 (batch, seq) ids",
           shape.len() as u32,
@@ -82,7 +88,9 @@ impl EmbeddingModel for MockEmbedding {
 
 fn mock_constructor() -> EmbeddingModelConstructor {
   Box::new(
-    |loaded: &LoadedEmbeddingModel| -> Result<Box<dyn EmbeddingModel>, Error> {
+    |loaded: &LoadedEmbeddingModel,
+     _pooling: Option<&StPoolingConfig>|
+     -> Result<Box<dyn EmbeddingModel>, Error> {
       assert!(!loaded.weights_ref().is_empty());
       Ok(Box::new(MockEmbedding))
     },
@@ -141,7 +149,7 @@ fn load_produces_context_via_public_surface() {
     .model
     .as_text_embedder()
     .expect("the mock answers the universal text capability")
-    .embed_text(&ids, Some(&mask))
+    .embed_text(&ids, &mask)
     .unwrap();
   assert_eq!(emb.array().shape(), vec![1, 4]);
 
@@ -834,7 +842,9 @@ fn capturing_constructor(
   slot: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 ) -> EmbeddingModelConstructor {
   Box::new(
-    move |loaded: &LoadedEmbeddingModel| -> Result<Box<dyn EmbeddingModel>, Error> {
+    move |loaded: &LoadedEmbeddingModel,
+          _pooling: Option<&StPoolingConfig>|
+          -> Result<Box<dyn EmbeddingModel>, Error> {
       let mut keys: Vec<String> = loaded.weights_ref().keys().cloned().collect();
       keys.sort();
       *slot.lock().unwrap() = keys;

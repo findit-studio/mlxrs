@@ -156,6 +156,24 @@ fn text_tower_rejects_empty_seq() {
 }
 
 #[test]
+fn text_tower_rejects_non_rank2_input_ids() {
+  // The public `encode_text` / `embed_text` accept an untrusted array. A rank-3
+  // `input_ids` must be rejected with a typed `RankMismatch` BEFORE any op — a
+  // `shape[1]`-only read would otherwise gather a different-rank graph. Pins the
+  // same exact-shape discipline as the vision tower's runtime gate.
+  let cfg = tiny_text_config();
+  let mut w = tiny_text_weights();
+  let tower = TextTower::from_weights(&cfg, &mut w).unwrap();
+  // (1, 2, 3) i32 — a rank-3 input.
+  let bad = Array::from_slice::<i32>(&[0, 1, 2, 3, 4, 5], &(1usize, 2usize, 3usize)).unwrap();
+  let err = tower.forward(&bad).err();
+  assert!(
+    matches!(err, Some(Error::RankMismatch(_))),
+    "rank-3 input_ids must be a typed RankMismatch, got {err:?}"
+  );
+}
+
+#[test]
 fn from_weights_rejects_wrong_token_table_shape() {
   let cfg = tiny_text_config();
   let mut w = tiny_text_weights();

@@ -385,7 +385,9 @@ fn from_weights_rejects_oversize_num_hidden_layers() {
 fn forward_rejects_mask_length_patch_dim_mismatch() {
   // A `NaflexInputs` whose `pixel_attention_mask` length disagrees with the
   // `pixel_values` leading patch dim is malformed; `forward` must reject it
-  // with the typed cross-check error (not rely on the SDPA broadcast).
+  // with the typed exact-shape pin (not rely on the SDPA broadcast). The mask is
+  // rank-1 with a wrong length, so it is a ShapePairMismatch against the
+  // expected `(patch_dim,)`.
   let cfg = tiny_vision_config(true);
   let mut w = tiny_vision_weights(true);
   let tower = VisionTower::from_weights(&cfg, &mut w).unwrap();
@@ -406,8 +408,141 @@ fn forward_rejects_mask_length_patch_dim_mismatch() {
   };
   let res = tower.forward(&inputs);
   assert!(
-    matches!(res, Err(Error::OutOfRange(_))),
-    "mask/patch-dim mismatch must be a typed OutOfRange, got {res:?}"
+    matches!(res, Err(Error::ShapePairMismatch(_))),
+    "mask/patch-dim length mismatch must be a typed ShapePairMismatch, got {res:?}"
+  );
+}
+
+/// Build the tiny tower once for a runtime-gate rejection test.
+fn tiny_tower() -> VisionTower {
+  let cfg = tiny_vision_config(true);
+  let mut w = tiny_vision_weights(true);
+  VisionTower::from_weights(&cfg, &mut w).unwrap()
+}
+
+#[test]
+fn forward_rejects_rank3_pixel_values() {
+  // A rank-3 `pixel_values` (an extra leading axis) must be rejected as a typed
+  // RankMismatch BEFORE any op — a leading-dim-only gate would wave it through
+  // (treating `shape[0]` as the patch dim) into the patch-embed / SDPA graph.
+  let tower = tiny_tower();
+  let per_patch = PATCH_FEAT as usize;
+  let pv = vec![0.01f32; NUM_PATCHES as usize * per_patch];
+  let pixel_values =
+    Array::from_slice::<f32>(&pv, &(1usize, NUM_PATCHES as usize, per_patch)).unwrap();
+  let pixel_attention_mask =
+    Array::from_slice::<i32>(&vec![1i32; NUM_PATCHES as usize], &(NUM_PATCHES as usize,)).unwrap();
+  let spatial_shapes = Array::from_slice::<i32>(&[2, 2], &(2usize,)).unwrap();
+  let inputs = NaflexInputs {
+    pixel_values,
+    pixel_attention_mask,
+    spatial_shapes,
+  };
+  let res = tower.forward(&inputs);
+  assert!(
+    matches!(res, Err(Error::RankMismatch(_))),
+    "rank-3 pixel_values must be a typed RankMismatch, got {res:?}"
+  );
+}
+
+#[test]
+fn forward_rejects_wrong_pixel_values_feature_width() {
+  // A rank-2 `pixel_values` whose last axis != the loaded patch_feature_dim is a
+  // typed ShapePairMismatch (the full-shape pin), not a silent wrong matmul.
+  let tower = tiny_tower();
+  let bad_feat = PATCH_FEAT as usize + 1;
+  let pv = vec![0.01f32; NUM_PATCHES as usize * bad_feat];
+  let pixel_values = Array::from_slice::<f32>(&pv, &(NUM_PATCHES as usize, bad_feat)).unwrap();
+  let pixel_attention_mask =
+    Array::from_slice::<i32>(&vec![1i32; NUM_PATCHES as usize], &(NUM_PATCHES as usize,)).unwrap();
+  let spatial_shapes = Array::from_slice::<i32>(&[2, 2], &(2usize,)).unwrap();
+  let inputs = NaflexInputs {
+    pixel_values,
+    pixel_attention_mask,
+    spatial_shapes,
+  };
+  let res = tower.forward(&inputs);
+  assert!(
+    matches!(res, Err(Error::ShapePairMismatch(_))),
+    "wrong pixel_values feature width must be a typed ShapePairMismatch, got {res:?}"
+  );
+}
+
+#[test]
+fn forward_rejects_rank2_pixel_attention_mask_with_trailing_axis() {
+  // A `pixel_attention_mask` shaped `(patch_dim, huge)` (a trailing junk axis,
+  // correct leading dim) must be rejected by the exact rank-1 pin — a
+  // leading-dim-only check would pass it (`shape[0] == patch_dim`) into the SDPA
+  // mask path. The extra/rank-mismatched-axis evasion the exact gate closes.
+  let tower = tiny_tower();
+  let per_patch = PATCH_FEAT as usize;
+  let pv = vec![0.01f32; NUM_PATCHES as usize * per_patch];
+  let pixel_values = Array::from_slice::<f32>(&pv, &(NUM_PATCHES as usize, per_patch)).unwrap();
+  // (NUM_PATCHES, 5) mask: leading dim matches the patch dim, trailing junk axis.
+  let bad_mask = vec![1i32; NUM_PATCHES as usize * 5];
+  let pixel_attention_mask =
+    Array::from_slice::<i32>(&bad_mask, &(NUM_PATCHES as usize, 5usize)).unwrap();
+  let spatial_shapes = Array::from_slice::<i32>(&[2, 2], &(2usize,)).unwrap();
+  let inputs = NaflexInputs {
+    pixel_values,
+    pixel_attention_mask,
+    spatial_shapes,
+  };
+  let res = tower.forward(&inputs);
+  assert!(
+    matches!(res, Err(Error::RankMismatch(_))),
+    "rank-2 pixel_attention_mask (trailing junk axis) must be a typed RankMismatch, got {res:?}"
+  );
+}
+
+#[test]
+fn forward_rejects_wrong_rank_spatial_shapes() {
+  // `spatial_shapes` must be exactly rank-1 `(2,)`. A rank-2 (or wrong-length)
+  // shape is rejected at the gate, before any op — not only later in the
+  // host-side `read_spatial_shape`.
+  let tower = tiny_tower();
+  let per_patch = PATCH_FEAT as usize;
+  let pv = vec![0.01f32; NUM_PATCHES as usize * per_patch];
+  let pixel_values = Array::from_slice::<f32>(&pv, &(NUM_PATCHES as usize, per_patch)).unwrap();
+  let pixel_attention_mask =
+    Array::from_slice::<i32>(&vec![1i32; NUM_PATCHES as usize], &(NUM_PATCHES as usize,)).unwrap();
+  // (1, 2) spatial_shapes (rank-2) instead of (2,).
+  let spatial_shapes = Array::from_slice::<i32>(&[2, 2], &(1usize, 2usize)).unwrap();
+  let inputs = NaflexInputs {
+    pixel_values,
+    pixel_attention_mask,
+    spatial_shapes,
+  };
+  let res = tower.forward(&inputs);
+  assert!(
+    matches!(res, Err(Error::RankMismatch(_))),
+    "wrong-rank spatial_shapes must be a typed RankMismatch, got {res:?}"
+  );
+}
+
+#[test]
+fn forward_rejects_patch_dim_above_max_num_patches() {
+  // A runtime patch count above the loaded `max_num_patches` budget is the DoS
+  // boundary: it must surface as the dedicated CapExceeded (not a generic shape
+  // mismatch), before the position-embed scatter / O(patch^2) SDPA. Build a
+  // `(NUM_PATCHES + 1, PATCH_FEAT)` pixel tensor with a matching-length mask so
+  // the only violated bound is the patch-count cap.
+  let tower = tiny_tower();
+  let over = NUM_PATCHES as usize + 1;
+  let per_patch = PATCH_FEAT as usize;
+  let pv = vec![0.01f32; over * per_patch];
+  let pixel_values = Array::from_slice::<f32>(&pv, &(over, per_patch)).unwrap();
+  let pixel_attention_mask = Array::from_slice::<i32>(&vec![1i32; over], &(over,)).unwrap();
+  let spatial_shapes = Array::from_slice::<i32>(&[2, 2], &(2usize,)).unwrap();
+  let inputs = NaflexInputs {
+    pixel_values,
+    pixel_attention_mask,
+    spatial_shapes,
+  };
+  let res = tower.forward(&inputs);
+  assert!(
+    matches!(res, Err(Error::CapExceeded(_))),
+    "patch_dim > max_num_patches must be a typed CapExceeded, got {res:?}"
   );
 }
 
@@ -437,4 +572,73 @@ fn patch_embed_accepts_conv2d_rank4_weight() {
     eval_shape(&last_hidden),
     vec![1, NUM_PATCHES as usize, HIDDEN as usize]
   );
+}
+
+#[test]
+fn patch_embed_accepts_raw_pytorch_conv2d_weight_same_as_channels_last() {
+  // A RAW PyTorch / HF Conv2d patch weight is `(hidden, C, P, P)`
+  // (`nn.Conv2d`'s `(out, in, kH, kW)`). It must be accepted and produce the
+  // SAME patch projection as the equivalent MLX channels-last `(hidden, P, P, C)`
+  // weight (the loader transposes `[0, 2, 3, 1]` internally). Oracle: build the
+  // channels-last weight, transpose it to the PyTorch layout for the second
+  // tower, and assert both towers' `last_hidden` match — proving the raw HF
+  // checkpoint layout is loaded equivalently (the channels-last comparison is the
+  // independent reference, not the code under test).
+  let cfg = tiny_vision_config(true);
+
+  // The MLX channels-last conv weight (hidden, P, P, C), shared by both towers.
+  let channels_last = Array::from_slice::<f32>(
+    &(0..(HIDDEN * PATCH * PATCH * CHANNELS) as usize)
+      .map(|n| ((n % 7) as f32) * 0.013 + 0.002)
+      .collect::<Vec<_>>(),
+    &(
+      HIDDEN as usize,
+      PATCH as usize,
+      PATCH as usize,
+      CHANNELS as usize,
+    ),
+  )
+  .unwrap();
+
+  // Tower A: channels-last weight loaded directly.
+  let mut wa = tiny_vision_weights(true);
+  wa.insert(
+    "embeddings.patch_embedding.weight".to_string(),
+    channels_last.try_clone().unwrap(),
+  );
+  let tower_a = VisionTower::from_weights(&cfg, &mut wa).unwrap();
+
+  // Tower B: the SAME weight transposed to the raw PyTorch `(hidden, C, P, P)`
+  // layout (the inverse of the loader's `[0, 2, 3, 1]`: channels-last
+  // `(hidden, P, P, C)` -> PyTorch `(hidden, C, P, P)` is `transpose(0, 3, 1, 2)`).
+  let mut pytorch = ops::shape::transpose_axes(&channels_last, &[0, 3, 1, 2]).unwrap();
+  pytorch.eval().unwrap();
+  assert_eq!(
+    pytorch.shape(),
+    vec![
+      HIDDEN as usize,
+      CHANNELS as usize,
+      PATCH as usize,
+      PATCH as usize
+    ],
+    "the second tower's weight is in raw PyTorch (hidden, C, P, P) layout"
+  );
+  let mut wb = tiny_vision_weights(true);
+  wb.insert("embeddings.patch_embedding.weight".to_string(), pytorch);
+  let tower_b = VisionTower::from_weights(&cfg, &mut wb).unwrap();
+
+  // Both towers must produce the identical patch projection.
+  let inputs = tiny_inputs(4, 4);
+  let (last_a, _) = tower_a.forward(&inputs).unwrap();
+  let (last_b, _) = tower_b.forward(&inputs).unwrap();
+  assert_eq!(eval_shape(&last_a), eval_shape(&last_b));
+  let va = eval_to_vec(&last_a);
+  let vb = eval_to_vec(&last_b);
+  assert_eq!(va.len(), vb.len());
+  for (i, (a, b)) in va.iter().zip(vb.iter()).enumerate() {
+    assert!(
+      (a - b).abs() < 1e-5,
+      "raw-PyTorch vs channels-last patch projection diverge at {i}: {a} vs {b}"
+    );
+  }
 }

@@ -43,12 +43,12 @@
 //! [`encode_text`](Siglip2NaflexModel::encode_text) producing L2-normalized
 //! embeddings and [`logits`](Siglip2NaflexModel::logits) computing the
 //! `logit_scale` / `logit_bias` contrastive similarity. It implements the golden
-//! embedding traits — [`Embed<TextInput>`](crate::embeddings::Embed) +
-//! `Embed<ImageInput>` + [`Contrastive`] — and
-//! answers the load factory's [`crate::embeddings::EmbeddingModel`] umbrella
-//! (text + contrastive accessors; the image tower is reached by downcast), so it
-//! registers into the [`crate::embeddings::EmbeddingModelTypeRegistry`] via
-//! [`register`].
+//! embedding seams — the model-implemented [`TextEmbedder`] (owning its
+//! fixed-length tokenization + sticky-EOS pooling), `Embed<ImageInput>`, and
+//! [`Contrastive`] — and answers the load factory's
+//! [`crate::embeddings::EmbeddingModel`] umbrella (text + contrastive accessors;
+//! the image tower is reached by downcast), so it registers into the
+//! [`crate::embeddings::EmbeddingModelTypeRegistry`] via [`register`].
 
 #[cfg(feature = "siglip2-naflex")]
 #[cfg_attr(docsrs, doc(cfg(feature = "siglip2-naflex")))]
@@ -77,14 +77,15 @@ use crate::{
   array::Array,
   embeddings::{
     Contrastive, Embed, Embedding, EmbeddingModel, EmbeddingModelConstructor,
-    EmbeddingModelTypeRegistry, LoadedEmbeddingModel, SWIFT_L2_EPS, TextEmbedder, TextInput,
-    l2_normalize_eps,
+    EmbeddingModelTypeRegistry, LoadedEmbeddingModel, Padding, SWIFT_L2_EPS, StPoolingConfig,
+    TextEmbedder, TextEncoding, l2_normalize_eps,
     siglip2_naflex::{
       config::Siglip2NaflexConfig, processing::NaflexInputs, shared::take_shaped, text::TextTower,
       vision::VisionTower,
     },
   },
-  error::{Error, InvariantViolationPayload, Result},
+  error::{AllocFailurePayload, Error, InvariantViolationPayload, OutOfRangePayload, Result},
+  model_validation::reserve_or_error,
   ops,
 };
 
@@ -120,6 +121,39 @@ impl Siglip2NaflexModel {
   /// it pins the intent.
   const NORMALIZE_EPS: f32 = SWIFT_L2_EPS;
 
+  /// The token id the SigLIP2 processor right-pads text to its fixed sequence
+  /// length with — the canonical SigLIP sentencepiece pad/EOS id (`1`). The
+  /// sticky-EOS pooling reads a fixed last position regardless of the mask, so
+  /// a shorter prompt's trailing positions hold this pad id (which is exactly
+  /// what the reference processor produces); it is a real, *unmasked* position.
+  const TEXT_PAD_TOKEN_ID: u32 = 1;
+
+  /// The SigLIP2 sentencepiece `<eos>` id (`1`). The text tower pools the
+  /// **last** position under the sticky-EOS invariant ("last token is always
+  /// EOS"), so an **overlength** prompt must keep the EOS at its final position
+  /// rather than a content token. The HF SigLIP processor enforces this by
+  /// head-truncating to `max_length - n_added_tokens` and then appending the
+  /// EOS via its post-processor template; this is the id the generic
+  /// fixed-length builder forces into the last slot on truncation
+  /// ([`Padding::FixedLength::eos_token_id`]). It coincides with
+  /// [`TEXT_PAD_TOKEN_ID`](Self::TEXT_PAD_TOKEN_ID) for SigLIP (both `1`) but is
+  /// conceptually the EOS, not the pad fill.
+  const TEXT_EOS_TOKEN_ID: u32 = 1;
+
+  /// The fixed text sequence length the SigLIP2 processor pads / truncates every
+  /// prompt to — the text tower's `max_position_embeddings` (the sticky-EOS
+  /// sequence length whose last position the tower pools). Read from the parsed
+  /// config so it tracks the checkpoint rather than a hard-coded literal.
+  fn text_seq_len(&self) -> Result<usize> {
+    usize::try_from(self.config.text_config.max_position_embeddings).map_err(|_| {
+      Error::OutOfRange(OutOfRangePayload::new(
+        "Siglip2NaflexModel::text_seq_len",
+        "text_config.max_position_embeddings must be a non-negative sequence length",
+        smol_str::format_smolstr!("{}", self.config.text_config.max_position_embeddings),
+      ))
+    })
+  }
+
   /// Build a model from a parsed [`Siglip2NaflexConfig`] and the **sanitized**
   /// weight map (run [`sanitize`] first).
   ///
@@ -147,8 +181,8 @@ impl Siglip2NaflexModel {
     // Strip the tower-namespace prefixes the sanitized map carries
     // (`vision_model.vision_model.` / `text_model.text_model.`) and build each
     // tower from its own sub-map, then read the top-level contrastive params.
-    let mut vision_weights = strip_prefix(&mut weights, "vision_model.vision_model.");
-    let mut text_weights = strip_prefix(&mut weights, "text_model.text_model.");
+    let mut vision_weights = strip_prefix(&mut weights, "vision_model.vision_model.")?;
+    let mut text_weights = strip_prefix(&mut weights, "text_model.text_model.")?;
 
     let vision = VisionTower::from_weights(&config.vision_config, &mut vision_weights)?;
     let text = TextTower::from_weights(&config.text_config, &mut text_weights)?;
@@ -225,23 +259,133 @@ impl Siglip2NaflexModel {
   }
 }
 
+/// Fallibly build the concatenation of `parts` into a freshly-reserved
+/// [`String`], turning an allocator failure into a typed [`Error::AllocFailure`]
+/// instead of the abort `String::push_str` / `format!` would raise on growth.
+///
+/// Every per-key rewrite here (tower namespacing, the `in_proj` rename, prefix
+/// stripping, the constructor's key clone) is sized by a **checkpoint-controlled**
+/// key, so each new key `String` is built through this one fallible path rather
+/// than an infallible `format!` / `to_string` / `clone` — a hostile checkpoint
+/// with enormous keys surfaces a recoverable error instead of aborting. The
+/// reservation is exact (the total of `parts`' byte lengths), so the pushes
+/// cannot reallocate. An overflowing total length is itself an allocation the
+/// reservation rejects (a `String` cannot exceed `isize::MAX` bytes).
+#[cfg(feature = "siglip2-naflex")]
+fn fallible_concat(context: &'static str, parts: &[&str]) -> Result<String> {
+  let total = parts
+    .iter()
+    .fold(0usize, |acc, p| acc.saturating_add(p.len()));
+  let mut out = String::new();
+  out.try_reserve_exact(total).map_err(|e| {
+    Error::AllocFailure(AllocFailurePayload::new(
+      "Siglip2 key rewrite",
+      context,
+      total as u64,
+      e,
+    ))
+  })?;
+  for p in parts {
+    out.push_str(p);
+  }
+  Ok(out)
+}
+
+/// Fallibly clone `s` into an owned [`String`] (the single-part `fallible_concat`),
+/// surfacing a typed [`Error::AllocFailure`] on allocator failure rather than the
+/// abort `str::to_string` / `String::clone` would raise.
+#[cfg(feature = "siglip2-naflex")]
+fn fallible_clone_str(context: &'static str, s: &str) -> Result<String> {
+  fallible_concat(context, &[s])
+}
+
+/// Fallibly replace every non-overlapping occurrence of `from` in `s` with `to`
+/// (the [`str::replace`] semantics), building the result through the fallible
+/// allocation path ([`Error::AllocFailure`] on allocator failure) rather than the
+/// infallible `str::replace`. Used for the checkpoint-controlled `in_proj` key
+/// rename so a hostile key cannot abort on the rewrite allocation.
+#[cfg(feature = "siglip2-naflex")]
+fn fallible_replace(context: &'static str, s: &str, from: &str, to: &str) -> Result<String> {
+  let count = s.matches(from).count();
+  if count == 0 {
+    // No occurrence: the result is `s` unchanged (still fallibly owned).
+    return fallible_clone_str(context, s);
+  }
+  // `str::split(from)` yields `count + 1` pieces joined by `to`; the exact output
+  // length is `s.len() - count*from.len() + count*to.len()`. `count*from.len() <=
+  // s.len()` (non-overlapping matches lie within `s`), so the subtraction cannot
+  // underflow; the additions saturate defensively.
+  let removed = count.saturating_mul(from.len());
+  let added = count.saturating_mul(to.len());
+  let new_len = s.len().saturating_sub(removed).saturating_add(added);
+  let mut out = String::new();
+  out.try_reserve_exact(new_len).map_err(|e| {
+    Error::AllocFailure(AllocFailurePayload::new(
+      "Siglip2 key rewrite",
+      context,
+      new_len as u64,
+      e,
+    ))
+  })?;
+  for (i, piece) in s.split(from).enumerate() {
+    if i != 0 {
+      out.push_str(to);
+    }
+    out.push_str(piece);
+  }
+  Ok(out)
+}
+
 /// Strip every key with `prefix` from `weights` into a new map (with the prefix
 /// removed), leaving the non-matching keys in place. Used to split the
 /// sanitized dual-tower map into per-tower sub-maps.
+///
+/// Both the matched-key `Vec` and the destination `HashMap` are sized by the
+/// (checkpoint-controlled) matching-key count, so each is reserved **fallibly**
+/// via [`crate::model_validation::reserve_or_error`] — a within-cap but
+/// heavyweight reservation surfaces as a typed [`Error::AllocFailure`] rather
+/// than the abort `Vec::with_capacity` / `HashMap::with_capacity` would raise on
+/// a hostile checkpoint with an enormous key set. Both the full matched key (the
+/// owned key needed to `remove` the entry) and the prefix-stripped destination
+/// key are built through the fallible `fallible_clone_str` path (not an
+/// infallible `String::clone` / `to_string`), so every owned key allocation
+/// sized by a checkpoint key surfaces a typed [`Error::AllocFailure`].
 #[cfg(feature = "siglip2-naflex")]
-fn strip_prefix(weights: &mut HashMap<String, Array>, prefix: &str) -> HashMap<String, Array> {
-  let keys: Vec<String> = weights
-    .keys()
-    .filter(|k| k.starts_with(prefix))
-    .cloned()
-    .collect();
-  let mut out = HashMap::with_capacity(keys.len());
+fn strip_prefix(
+  weights: &mut HashMap<String, Array>,
+  prefix: &str,
+) -> Result<HashMap<String, Array>> {
+  let matching = weights.keys().filter(|k| k.starts_with(prefix)).count();
+  let mut keys: Vec<String> = Vec::new();
+  reserve_or_error(
+    &mut keys,
+    "Siglip2 strip_prefix: matched key list",
+    matching,
+  )?;
+  // Build the matched-key list through the fallible String path: the full key
+  // clone (needed to `remove` the entry below) is sized by the
+  // checkpoint-controlled source key, so an enormous key surfaces a typed
+  // `AllocFailure` instead of the abort `String::clone` would raise. The Vec is
+  // already reserved to `matching`, so the push cannot reallocate.
+  for k in weights.keys().filter(|k| k.starts_with(prefix)) {
+    keys.push(fallible_clone_str("strip_prefix: matched key", k)?);
+  }
+  let mut out: HashMap<String, Array> = HashMap::new();
+  reserve_or_error(
+    &mut out,
+    "Siglip2 strip_prefix: per-tower sub-map",
+    keys.len(),
+  )?;
   for k in keys {
     if let Some(v) = weights.remove(&k) {
-      out.insert(k[prefix.len()..].to_string(), v);
+      // The stripped key is sized by the (checkpoint-controlled) source key, so
+      // build it through the fallible String path (typed `AllocFailure`) rather
+      // than an infallible `to_string`.
+      let stripped = fallible_clone_str("strip_prefix: stripped key", &k[prefix.len()..])?;
+      out.insert(stripped, v);
     }
   }
-  out
+  Ok(out)
 }
 
 /// Rewrite a raw `google/siglip2-base-patch16-naflex` checkpoint into the
@@ -266,33 +410,60 @@ fn strip_prefix(weights: &mut HashMap<String, Array>, prefix: &str) -> HashMap<S
 ///    arbitrary (per-run nondeterministic) survivor silently overwrite the
 ///    other.
 ///
-/// The patch-embed Conv2d→channels-last transpose is **not** done here: the
-/// NaFlex patch embed is a [`vision::VisionTower`] Linear over pre-flattened
-/// patches, and [`vision`]'s `reshape_patch_weight` accepts both the
-/// channels-last `(hidden, P, P, C)` and the flattened `(hidden, P^2 * C)`
-/// forms, pinning the shape either way.
+/// The rewritten keys (rules 1 and 2) are each built through the fallible
+/// `fallible_concat` / `fallible_replace` path (typed [`Error::AllocFailure`]),
+/// not an infallible `format!` / `str::replace`, so a hostile checkpoint with
+/// enormous keys cannot abort on a per-key rewrite allocation; the destination
+/// map reserve and each `insert_unique` slot are fallible too.
+///
+/// The patch-embed Conv2d→channels-last transpose is **not** done here (the key
+/// names need no rewrite): the NaFlex patch embed is a [`vision::VisionTower`]
+/// Linear over pre-flattened patches, and [`vision`]'s `reshape_patch_weight`
+/// handles every checkpoint layout — the MLX channels-last `(hidden, P, P, C)`,
+/// the raw PyTorch / HF `(hidden, C, P, P)` (`nn.Conv2d`'s `(out, in, kH, kW)`,
+/// transposed `[0, 2, 3, 1]` to channels-last there), and the already-flattened
+/// `(hidden, P^2 * C)` — pinning the shape in every case.
 #[cfg(feature = "siglip2-naflex")]
 #[cfg_attr(docsrs, doc(cfg(feature = "siglip2-naflex")))]
 pub fn sanitize(weights: HashMap<String, Array>) -> Result<HashMap<String, Array>> {
-  let mut out = HashMap::with_capacity(weights.len());
+  // The destination map is sized by the (checkpoint-controlled) source key
+  // count; reserve it FALLIBLY (typed `AllocFailure`) rather than via
+  // `HashMap::with_capacity`, which aborts on a hostile checkpoint whose key set
+  // is large enough to exhaust the allocator. (`insert_unique` below reserves
+  // each new slot fallibly too, but pre-sizing once avoids repeated growth.)
+  let mut out: HashMap<String, Array> = HashMap::new();
+  reserve_or_error(&mut out, "Siglip2 sanitize: destination map", weights.len())?;
   for (mut k, v) in weights {
     // 3. Drop the non-parameter position_ids buffers.
     if k.contains("position_ids") {
       continue;
     }
 
-    // 1. Namespace each tower (one level deeper) if not already nested.
+    // 1. Namespace each tower (one level deeper) if not already nested. The
+    //    re-prefixed key is sized by the (checkpoint-controlled) source key, so
+    //    build it through the fallible String path (typed `AllocFailure`) rather
+    //    than an infallible `format!`.
     if k.starts_with("text_model.") && !k.starts_with("text_model.text_model.") {
-      k = format!("text_model.{k}");
+      k = fallible_concat("sanitize: text_model namespace", &["text_model.", &k])?;
     } else if k.starts_with("vision_model.") && !k.starts_with("vision_model.vision_model.") {
-      k = format!("vision_model.{k}");
+      k = fallible_concat("sanitize: vision_model namespace", &["vision_model.", &k])?;
     }
 
-    // 2. The MultiheadAttention combined-QKV parameter rename.
+    // 2. The MultiheadAttention combined-QKV parameter rename (fallible replace).
     if k.contains("in_proj_weight") {
-      k = k.replace("in_proj_weight", "in_proj.weight");
+      k = fallible_replace(
+        "sanitize: in_proj.weight rename",
+        &k,
+        "in_proj_weight",
+        "in_proj.weight",
+      )?;
     } else if k.contains("in_proj_bias") {
-      k = k.replace("in_proj_bias", "in_proj.bias");
+      k = fallible_replace(
+        "sanitize: in_proj.bias rename",
+        &k,
+        "in_proj_bias",
+        "in_proj.bias",
+      )?;
     }
 
     // 4. Insert, rejecting a duplicate destination key with a typed error.
@@ -308,20 +479,42 @@ pub fn sanitize(weights: HashMap<String, Array>) -> Result<HashMap<String, Array
 /// The constructor parses the raw `config.json`, [`sanitize`]s a *cheap clone*
 /// of the loaded weight map (mlx [`Array`] is a refcounted handle, so the
 /// clone shares the device buffers — no data copy), and builds the model. The
-/// `config.json` parse uses the `siglip2-naflex` feature's `serde_json` (the
-/// `embeddings` base feature is otherwise `serde_json`-free; this model gates
-/// it on).
+/// map reserve and each cloned key `String` are built through the fallible path
+/// (typed [`Error::AllocFailure`] via [`reserve_or_error`] / `fallible_clone_str`),
+/// not an infallible `with_capacity` / `clone`, so a hostile loaded map cannot
+/// abort during the clone. The `config.json` parse uses the `siglip2-naflex`
+/// feature's `serde_json` (the `embeddings` base feature is otherwise
+/// `serde_json`-free; this model gates it on).
+///
+/// The parsed `1_Pooling/config.json` (`_pooling`) is **ignored**: SigLIP is a
+/// dual-tower contrastive model that bakes its own fixed sticky-EOS text pooling
+/// and fixed-length padding (see [`TextEmbedder`]); it does not consume a
+/// sentence-encoder pooling config.
 #[cfg(feature = "siglip2-naflex")]
 #[cfg_attr(docsrs, doc(cfg(feature = "siglip2-naflex")))]
 pub fn constructor() -> EmbeddingModelConstructor {
   Box::new(
-    |loaded: &LoadedEmbeddingModel| -> Result<Box<dyn EmbeddingModel>> {
+    |loaded: &LoadedEmbeddingModel,
+     _pooling: Option<&StPoolingConfig>|
+     -> Result<Box<dyn EmbeddingModel>> {
       let config = Siglip2NaflexConfig::from_json(loaded.config_json())?;
       // mlx `Array` is a cheap refcounted handle; `try_clone` shares the device
       // buffer (no copy). Clone the loaded map into an owned, sanitizable map.
-      let mut raw = HashMap::with_capacity(loaded.weights_ref().len());
+      // The map is sized by the loaded (checkpoint-controlled) key count, so
+      // reserve it FALLIBLY (typed `AllocFailure`) rather than via
+      // `HashMap::with_capacity`, which aborts under allocator pressure.
+      let mut raw: HashMap<String, Array> = HashMap::new();
+      reserve_or_error(
+        &mut raw,
+        "Siglip2 constructor: sanitizable weight-map clone",
+        loaded.weights_ref().len(),
+      )?;
       for (k, v) in loaded.weights_ref() {
-        raw.insert(k.clone(), v.try_clone()?);
+        // The cloned key is sized by the (checkpoint-controlled) loaded key, so
+        // build it through the fallible String path (typed `AllocFailure`)
+        // rather than an infallible `clone`.
+        let key = fallible_clone_str("constructor: weight-map key clone", k)?;
+        raw.insert(key, v.try_clone()?);
       }
       let weights = sanitize(raw)?;
       let model = Siglip2NaflexModel::from_weights(config, weights)?;
@@ -354,16 +547,67 @@ pub fn register(registry: &mut EmbeddingModelTypeRegistry) -> Option<EmbeddingMo
 #[cfg(feature = "siglip2-naflex")]
 pub struct ImageInput<'a>(pub &'a NaflexInputs);
 
-/// Text tower as the universal text modality: a `(batch, seq_len)` token-id
-/// batch → its L2-normalized text embedding (the sticky-EOS pooled projection —
-/// SigLIP's real text feature, not a generic pool). The padding mask is unused
-/// (sticky-EOS reads the last position regardless), matching `siglip.py`'s
-/// `attention_mask=None` text path.
+/// Text tower as the universal text seam ([`TextEmbedder`]). SigLIP owns both
+/// text stages a generic pipeline cannot standardize:
+///
+/// - [`text_encoding`](TextEmbedder::text_encoding) declares the SigLIP2
+///   processor's **fixed-length** input scheme ([`Padding::FixedLength`]):
+///   tokenize with special tokens, then pad/truncate every prompt to the text
+///   tower's `max_position_embeddings` with the SigLIP pad id, with an all-`1`
+///   mask, and an `eos_token_id` so an overlength prompt keeps the EOS at its
+///   final position on truncation (HF truncate-then-append-EOS — the sticky-EOS
+///   pooler must never see a content token in its last slot). The generic
+///   [`encode`](crate::embeddings::encode()) pipeline applies exactly this — so
+///   a mixed-length batch never pools a foreign dynamic-pad position (the bug a
+///   generic mask-aware right-pad would introduce against a fixed-position
+///   pooler), and an overlength prompt is byte-identical to the SigLIP
+///   processor's truncated ids.
+/// - [`embed_text`](TextEmbedder::embed_text) runs the sticky-EOS pooled
+///   projection (SigLIP's real text feature, not a generic pool) via
+///   [`encode_text`](Self::encode_text). The mask is unused — sticky-EOS reads a
+///   fixed last position regardless, matching `siglip.py`'s `attention_mask=None`
+///   text path.
 #[cfg(feature = "siglip2-naflex")]
-impl<'a> Embed<TextInput<'a>> for Siglip2NaflexModel {
-  type Output = Embedding;
-  fn embed(&self, input: TextInput<'a>) -> Result<Embedding> {
-    Ok(Embedding::new(self.encode_text(input.token_ids())?))
+impl TextEmbedder for Siglip2NaflexModel {
+  fn text_encoding(&self) -> TextEncoding {
+    // The fixed sequence length is the text tower's `max_position_embeddings`
+    // (the sticky-EOS length). `text_seq_len()` is fallible only on a
+    // (config-validation-rejected) negative value; fall back to the conversion's
+    // saturated value so this infallible accessor never panics — a real
+    // checkpoint always yields the true positive length.
+    let length = self
+      .text_seq_len()
+      .unwrap_or_else(|_| self.config.text_config.max_position_embeddings.max(0) as usize);
+    // The tokenizer's per-text truncation cap is NOT set here: the
+    // `Padding::FixedLength` scheme is itself the truncation cap, and the generic
+    // pipeline derives the effective cap centrally from it (the fixed `length`,
+    // `+ 1` for the sticky-EOS slot so the trailing EOS survives a genuine
+    // truncation). Leaving `max_length = None` means the cap is the padding mode's
+    // own contract, not an optional field this model must remember to set; the
+    // central derivation yields exactly `length + 1` for this sticky-EOS scheme,
+    // so the behaviour is identical to setting it explicitly here.
+    TextEncoding::new(
+      // SigLIP2's processor encodes with special tokens, then pads/truncates to
+      // the fixed length. The fixed `length` is the effective output cap and the
+      // generic pipeline derives the slightly-larger tokenizer truncation cap
+      // (`length + 1`) from it centrally (the final fixed-length truncation still
+      // runs after it).
+      true,
+      None,
+      Padding::FixedLength {
+        length,
+        pad_token_id: Self::TEXT_PAD_TOKEN_ID,
+        // Preserve the sticky-EOS invariant on overlength prompts: a truncated
+        // row keeps its head to `length - 1` and the EOS is forced into the
+        // last position (HF truncate-then-append-EOS), so the pooled last slot
+        // is never a content token. A within-length prompt is unaffected.
+        eos_token_id: Some(Self::TEXT_EOS_TOKEN_ID),
+      },
+    )
+  }
+
+  fn embed_text(&self, input_ids: &Array, _attention_mask: &Array) -> Result<Embedding> {
+    Ok(Embedding::new(self.encode_text(input_ids)?))
   }
 }
 

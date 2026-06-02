@@ -72,6 +72,7 @@ use crate::{
   array::Array,
   dtype::Dtype,
   error::{ArithmeticOverflowPayload, CapExceededPayload, Error, OutOfRangePayload, Result},
+  model_validation::{Extent, elem_count},
   ops::{
     linalg_basic::matmul,
     misc::astype,
@@ -100,6 +101,23 @@ const MAX_INTERP_DIM: usize = 4096;
 /// recoverable [`Error::CapExceeded`] *before* the allocation, tighter than the
 /// `MAX_INTERP_DIM^2` the per-axis caps would otherwise allow.
 const MAX_INTERP_WEIGHT_ELEMS: usize = 1 << 22;
+
+/// Upper bound on the element count of any **resample intermediate / output**
+/// (a `dim * dim * C` device tensor in the separable matmul chain).
+///
+/// The per-axis [`MAX_INTERP_DIM`] and per-table [`MAX_INTERP_WEIGHT_ELEMS`]
+/// caps bound the *weight matrices* but not the resampled tensors that thread the
+/// channel axis `C` through the two matmuls: with each axis individually within
+/// `MAX_INTERP_DIM` (e.g. `H_in = W_in = 4096`, `out_h = out_w = 1024`,
+/// `C = 4096`) the first matmul output `out_h * W_in * C` is already ≈ 17 G
+/// elements — an unbounded device allocation. This bounds each of the three
+/// `*_count` products (row-resample, column-resample, final output) before any
+/// device graph is built. A real position-embed resize is a `16 x 16 x hidden`
+/// grid stretched to a few-thousand-patch grid (a few million elements at most),
+/// so `1 << 26` (64 Mi elements ≈ 256 MiB `f32`) is far above any legitimate use
+/// yet rejects the adversarial product as a typed [`Error::CapExceeded`] before
+/// the matmul.
+const MAX_INTERP_RESAMPLE_ELEMS: usize = 1 << 26;
 
 /// PyTorch's antialias triangle (tent) filter `f(x) = max(0, 1 - |x|)`
 /// (`HelperInterpLinear::aa_filter` in `aten`'s `UpSampleKernel.cpp`).
@@ -242,6 +260,11 @@ fn check_dim(context: &'static str, value: usize) -> Result<()> {
 ///   product cap (`MAX_INTERP_WEIGHT_ELEMS`) → [`Error::CapExceeded`]; or the
 ///   (fallible) weight-buffer reservation exceeds available memory →
 ///   [`Error::AllocFailure`].
+/// - any resample tensor's element count — the row-resample `out_h * W_in * C`,
+///   the column-resample `out_w * out_h * C`, or the output `out_h * out_w * C`
+///   — exceeds the resample cap (`MAX_INTERP_RESAMPLE_ELEMS`), even though every
+///   axis is within `MAX_INTERP_DIM` → [`Error::CapExceeded`] (rejected before
+///   any device array / matmul is built).
 /// - `grid`'s dtype is non-floating (the triangle weights are fractional;
 ///   an integer grid would truncate every sample) →
 ///   [`Error::UnsupportedDtype`].
@@ -266,6 +289,35 @@ pub fn bilinear_interpolate(grid: &Array, out_h: usize, out_w: usize) -> Result<
   // matmul `i32` shapes; it is bounded by the same cap so the
   // `(W_in * C)` and `(H_out * C)` flattened operands stay within `i32`.
   check_dim("bilinear_interpolate: C", c)?;
+
+  // Bound the three resample TENSORS (not just the weight tables): the
+  // per-axis caps leave `dim * dim * C` unbounded — e.g. each axis within
+  // `MAX_INTERP_DIM` still makes the first matmul output `out_h * W_in * C`
+  // ≈ 17 G elements. `check_dim` already proved every axis is `<= MAX_INTERP_DIM`,
+  // so each is a valid `Extent`; `elem_count` is the checked product against the
+  // resample cap. Reject an over-product as a typed `CapExceeded` BEFORE any
+  // device array / matmul is constructed.
+  let ext = |v: usize| Extent::new("bilinear_interpolate: spatial dim", v, MAX_INTERP_DIM);
+  let (w_in_e, c_e) = (ext(w_in)?, ext(c)?);
+  let (out_h_e, out_w_e) = (ext(out_h)?, ext(out_w)?);
+  // Row resample output `(out_h, W_in * C)`.
+  elem_count(
+    "bilinear_interpolate: row-resample elements (out_h * W_in * C)",
+    &[out_h_e, w_in_e, c_e],
+    MAX_INTERP_RESAMPLE_ELEMS,
+  )?;
+  // Column resample output `(out_w, out_h * C)`.
+  elem_count(
+    "bilinear_interpolate: column-resample elements (out_w * out_h * C)",
+    &[out_w_e, out_h_e, c_e],
+    MAX_INTERP_RESAMPLE_ELEMS,
+  )?;
+  // Final output `(out_h, out_w, C)`.
+  elem_count(
+    "bilinear_interpolate: output elements (out_h * out_w * C)",
+    &[out_h_e, out_w_e, c_e],
+    MAX_INTERP_RESAMPLE_ELEMS,
+  )?;
 
   // The triangle weights are fractional, so a non-floating grid would lose
   // every sample to truncation. Restrict to the float dtypes (the

@@ -21,16 +21,18 @@
 //! patch embed here is `pixel_values @ W_flat^T + bias` — a single matmul, no
 //! Conv2d.
 //!
-//! The checkpoint weight key is `…embeddings.patch_embedding.weight`. The
-//! `Model.sanitize` step (ported in [`super::sanitize`]) transposes a PyTorch
-//! Conv2d weight `(out, in, kH, kW)` to MLX channels-last `(out, kH, kW, in)`.
-//! The NaFlex preprocessing flattens each patch in `(row, col,
-//! channel-innermost)` order — i.e. `(kH, kW, C)` — so the matmul weight is
-//! that `(out, kH, kW, in)` tensor reshaped to `(out, kH * kW * in) = (hidden,
-//! P^2 * C)`, row-for-row aligned with the preprocessing's flattened patch
-//! rows. The patch-weight reshape pins the consumed tensor to exactly the
-//! `(hidden, P, P, C)` (rank-4) **or** `(hidden, P^2 * C)` (already-flattened
-//! rank-2) shape so a mis-shaped checkpoint fails fast.
+//! The checkpoint weight key is `…embeddings.patch_embedding.weight`. A PyTorch
+//! Conv2d weight is `(out, in, kH, kW) = (hidden, C, P, P)`; MLX is channels-last
+//! `(out, kH, kW, in) = (hidden, P, P, C)`. The NaFlex preprocessing flattens
+//! each patch in `(row, col, channel-innermost)` order — i.e. `(kH, kW, C)` — so
+//! the matmul weight is that `(out, kH, kW, in)` tensor reshaped to
+//! `(out, kH * kW * in) = (hidden, P^2 * C)`, row-for-row aligned with the
+//! preprocessing's flattened patch rows. `reshape_patch_weight` accepts every
+//! layout a real checkpoint ships — the MLX channels-last `(hidden, P, P, C)`,
+//! the **raw PyTorch / HF** `(hidden, C, P, P)` (transposed `[0, 2, 3, 1]` to
+//! channels-last, the way the crate's other Conv loaders convert PyTorch
+//! kernels), and the already-flattened `(hidden, P^2 * C)` — pinning the consumed
+//! tensor's exact dims in every case so a mis-shaped checkpoint fails fast.
 //!
 //! ## Position embedding — bilinear+antialias-resized per image
 //!
@@ -74,7 +76,10 @@ use crate::{
       take_shaped,
     },
   },
-  error::{CapExceededPayload, Error, OutOfRangePayload, RankMismatchPayload, Result},
+  error::{
+    CapExceededPayload, Error, OutOfRangePayload, RankMismatchPayload, Result,
+    ShapePairMismatchPayload,
+  },
   lm::nn::{
     attention::{Mask, scaled_dot_product_attention},
     norm::LayerNorm,
@@ -351,33 +356,31 @@ impl VisionTower {
   /// `NaflexInputs` carries a single image's `(max_num_patches, …)` tensors,
   /// unsqueezed to `(1, max_num_patches, …)` here.
   pub fn forward(&self, inputs: &NaflexInputs) -> Result<(Array, Option<Array>)> {
-    // Cross-check the mask length against the patch dim up front: the
-    // `pixel_attention_mask` selects per-patch keys, so a length mismatch with
-    // `pixel_values`' leading patch dim is a malformed input. Reject it with a
-    // crisp typed error here rather than relying on the downstream SDPA
-    // broadcast to reject the resulting `(1,1,1,n)` mask.
-    let patch_dim = inputs.pixel_values.shape().first().copied().unwrap_or(0);
-    let mask_len = inputs
-      .pixel_attention_mask
-      .shape()
-      .first()
-      .copied()
-      .unwrap_or(0);
-    if mask_len != patch_dim {
-      return Err(Error::OutOfRange(OutOfRangePayload::new(
-        "siglip2 vision: pixel_attention_mask length vs pixel_values patch dim",
-        "must equal the pixel_values leading patch dimension",
-        smol_str::format_smolstr!("{mask_len} != {patch_dim}"),
+    // Pin EVERY runtime input to its EXACT shape before any op. `NaflexInputs`
+    // is a public, all-pub-fields struct with no validating constructor, so a
+    // hand-built input (or an over-budget `preprocess` call) can carry not just
+    // a too-large patch dim but a wrong *rank* (a rank-3 `pixel_values`) or a
+    // trailing junk axis (a `(patch_dim, huge)` mask) that a leading-dim-only
+    // check waves through into the position-embed scatter / the O(patch^2)
+    // SDPA. Checking the full runtime shapes here (rank + every dim) — against
+    // the stored config `Extent`s — rejects all of those as crisp typed errors
+    // up front, rather than relying on a downstream op's incidental broadcast.
+    let pv_shape = inputs.pixel_values.shape();
+    // `pixel_values` is rank-2 `(patch_dim, patch_feature_dim)`. Read the patch
+    // dim from a *verified* rank-2 shape, so a rank-3 input is rejected (not
+    // silently treated as `shape[0]`).
+    if pv_shape.len() != 2 {
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        "siglip2 vision: pixel_values must be rank-2 (patch_dim, patch_feature_dim)",
+        pv_shape.len() as u32,
+        pv_shape,
       )));
     }
+    let patch_dim = pv_shape[0];
 
-    // Pin the runtime input to the loaded config's budget. `NaflexInputs` is a
-    // public, all-pub-fields struct with no validating constructor, so a
-    // hand-built input (or an over-budget `preprocess` call) can carry a patch
-    // cardinality / feature width above what the config was validated for —
-    // driving the position-embed scatter + the O(patch^2) SDPA unbounded. The
-    // stored `Extent`s are the loaded config's caps; gate the runtime dims
-    // against them ONCE here, before any embed / interp / mask-alloc / attention.
+    // Cap the runtime patch count against the loaded budget BEFORE pinning the
+    // exact shape, so an over-cap patch dim surfaces as the dedicated
+    // `CapExceeded` (the DoS boundary) rather than a generic shape mismatch.
     if patch_dim > self.max_num_patches.get() {
       return Err(Error::CapExceeded(CapExceededPayload::new(
         "siglip2 vision: runtime patch count vs loaded max_num_patches",
@@ -386,14 +389,29 @@ impl VisionTower {
         patch_dim as u64,
       )));
     }
-    let feat_dim = inputs.pixel_values.shape().get(1).copied().unwrap_or(0);
-    if feat_dim != self.patch_feature_dim.get() {
-      return Err(Error::OutOfRange(OutOfRangePayload::new(
-        "siglip2 vision: runtime patch feature width vs loaded patch_feature_dim",
-        "must equal the loaded config's P^2 * C",
-        smol_str::format_smolstr!("{feat_dim} != {}", self.patch_feature_dim.get()),
-      )));
-    }
+
+    // `pixel_values` last axis must equal the loaded `patch_feature_dim` (the
+    // patch-embed Linear's input width). Pins the full `(patch_dim, P^2*C)`.
+    expect_runtime_shape(
+      &pv_shape,
+      "siglip2 vision: pixel_values shape (patch_dim, patch_feature_dim)",
+      &[patch_dim, self.patch_feature_dim.get()],
+    )?;
+    // `pixel_attention_mask` is exactly rank-1 `(patch_dim,)` — a trailing junk
+    // axis (`(patch_dim, huge)`) or a length mismatch is rejected here, not by
+    // the SDPA broadcast on the resulting `(1,1,1,n)` mask.
+    expect_runtime_shape(
+      &inputs.pixel_attention_mask.shape(),
+      "siglip2 vision: pixel_attention_mask shape (patch_dim,)",
+      &[patch_dim],
+    )?;
+    // `spatial_shapes` is exactly rank-1 `(2,)` — `[H_p, W_p]`. Pinned here
+    // before any op (the host-side `read_spatial_shape` re-checks defensively).
+    expect_runtime_shape(
+      &inputs.spatial_shapes.shape(),
+      "siglip2 vision: spatial_shapes shape (2,)",
+      &[2],
+    )?;
 
     // (max_num_patches, P^2*C) → (1, max_num_patches, P^2*C).
     let pixel_values = ops::shape::expand_dims_axes(&inputs.pixel_values, &[0])?;
@@ -490,6 +508,32 @@ impl VisionTower {
 
 // ───────────────────────── builders / helpers ─────────────────────────
 
+/// Assert a runtime input's shape (rank + every dimension) equals `expected`
+/// exactly, before any op consumes it. A wrong rank is [`Error::RankMismatch`];
+/// a right-rank shape whose dims disagree is [`Error::ShapePairMismatch`] (both
+/// full shapes). This is the runtime-input analogue of the load-time
+/// [`expect_shape`] (which pins consumed *weights*): the untrusted
+/// [`NaflexInputs`] has no validating constructor, so [`VisionTower::forward`]
+/// pins each tensor's exact shape here rather than trusting a leading-dim check.
+#[cfg(feature = "siglip2-naflex")]
+fn expect_runtime_shape(actual: &[usize], context: &'static str, expected: &[usize]) -> Result<()> {
+  if actual.len() != expected.len() {
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      context,
+      actual.len() as u32,
+      actual.to_vec(),
+    )));
+  }
+  if actual != expected {
+    return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+      context,
+      expected.to_vec(),
+      actual.to_vec(),
+    )));
+  }
+  Ok(())
+}
+
 /// Build an additive attention key-mask `(1, 1, 1, num_patches)` from the
 /// `(max_num_patches,)` `pixel_attention_mask` (`1` real, `0` padded): real →
 /// `0.0`, padded → `-inf`, so SDPA's softmax zeroes padded keys.
@@ -507,10 +551,24 @@ fn build_attention_mask(pixel_attention_mask: &Array) -> Result<Array> {
   ops::shape::reshape(&additive, &[1, 1, 1, n])
 }
 
-/// Reshape the sanitized patch-embed weight into the flattened Linear kernel
-/// `(hidden, P^2 * C)`. Accepts either the channels-last Conv2d form
-/// `(hidden, P, P, C)` (rank-4) or an already-flattened `(hidden, P^2 * C)`
-/// (rank-2); any other shape is a typed error.
+/// Reshape the patch-embed weight into the flattened Linear kernel
+/// `(hidden, P^2 * C)`. Accepts three checkpoint layouts (rank disambiguated, and
+/// the rank-4 layout disambiguated by its exact dims against the config):
+///
+/// 1. the MLX channels-last Conv2d form `(hidden, P, P, C)` — flatten the
+///    trailing three axes directly (the form the e2e fixtures carry);
+/// 2. the **raw PyTorch / HF** Conv2d form `(hidden, C, P, P)` (`nn.Conv2d`'s
+///    `(out, in, kH, kW)`) — transpose `[0, 2, 3, 1]` to channels-last
+///    `(hidden, P, P, C)`, then flatten. This mirrors how the crate's other
+///    Conv loaders convert PyTorch's channels-first kernels to MLX channels-last
+///    (the wav2vec2 audio encoder's conv1d axis-swap, and the vlm
+///    `reshape(1,h,w,3).transpose(0,3,1,2)` image path);
+/// 3. an already-flattened `(hidden, P^2 * C)` (rank-2).
+///
+/// Any other shape is a typed error. When `P == C` the two rank-4 layouts are
+/// shape-identical; the channels-last interpretation (no transpose) is chosen,
+/// matching the MLX-native / fixture layout (a square `P == C` kernel is not a
+/// real SigLIP2 configuration — base is `P = 16`, `C = 3`).
 #[cfg(feature = "siglip2-naflex")]
 fn reshape_patch_weight(
   raw: &Array,
@@ -522,14 +580,41 @@ fn reshape_patch_weight(
   let shape = raw.shape();
   match shape.len() {
     4 => {
-      // (hidden, P, P, C) — pin then flatten the trailing three axes.
-      expect_shape(
-        raw,
-        "embeddings.patch_embedding.weight",
-        "vision patch-embed conv weight (hidden, P, P, C)",
-        &[hidden, patch, patch, channels],
-      )?;
-      ops::shape::reshape(raw, &[hidden, patch_feat])
+      // Disambiguate the two rank-4 layouts by exact dims against the config (no
+      // heuristic): channels-last `(hidden, P, P, C)` is the MLX-native form and
+      // is preferred; the raw PyTorch `(hidden, C, P, P)` is transposed to it.
+      let channels_last = [hidden, patch, patch, channels];
+      let pytorch = [hidden, channels, patch, patch];
+      let dims_eq = |expected: &[i32; 4]| {
+        shape.len() == 4
+          && shape
+            .iter()
+            .zip(expected.iter())
+            .all(|(&a, &e)| e >= 0 && a as i64 == i64::from(e))
+      };
+      if dims_eq(&channels_last) {
+        // (hidden, P, P, C) — flatten the trailing three axes directly.
+        ops::shape::reshape(raw, &[hidden, patch_feat])
+      } else if dims_eq(&pytorch) {
+        // Raw PyTorch `(hidden, C, P, P)` -> channels-last `(hidden, P, P, C)`
+        // (`transpose(0, 2, 3, 1)`), then flatten to the Linear kernel. The
+        // transpose makes the flattened rows align with the preprocessing's
+        // `(row, col, channel-innermost)` patch flattening.
+        let channels_last = ops::shape::transpose_axes(raw, &[0, 2, 3, 1])?;
+        ops::shape::reshape(&channels_last, &[hidden, patch_feat])
+      } else {
+        // Rank-4 but neither layout's dims match — pin against the channels-last
+        // form for a crisp `(hidden, P, P, C)` shape error (both full shapes).
+        expect_shape(
+          raw,
+          "embeddings.patch_embedding.weight",
+          "vision patch-embed conv weight (hidden, P, P, C) or raw PyTorch (hidden, C, P, P)",
+          &channels_last,
+        )?;
+        // `expect_shape` always errors here (the dims did not match); the flatten
+        // is unreachable but keeps the arm's type as the flattened kernel.
+        ops::shape::reshape(raw, &[hidden, patch_feat])
+      }
     }
     2 => {
       // Already flattened (hidden, P^2 * C).
@@ -542,7 +627,7 @@ fn reshape_patch_weight(
       raw.try_clone()
     }
     _ => Err(Error::RankMismatch(RankMismatchPayload::new(
-      "embeddings.patch_embedding.weight must be rank-4 (hidden, P, P, C) or rank-2 (hidden, P^2*C)",
+      "embeddings.patch_embedding.weight must be rank-4 (hidden, P, P, C) / (hidden, C, P, P) or rank-2 (hidden, P^2*C)",
       shape.len() as u32,
       shape,
     ))),

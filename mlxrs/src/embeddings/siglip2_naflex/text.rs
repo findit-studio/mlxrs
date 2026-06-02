@@ -35,7 +35,7 @@ use crate::{
     config::TextConfig,
     shared::{EncoderLayer, LayerDims, build_layer_norm, dim_i32, linear, take_shaped},
   },
-  error::{Error, OutOfRangePayload, Result},
+  error::{Error, OutOfRangePayload, RankMismatchPayload, Result},
   lm::nn::{attention::Mask, norm::LayerNorm},
   model_validation::reserve_or_error,
   ops,
@@ -154,6 +154,20 @@ impl TextTower {
   /// token). `seq_len` must be in `1..=max_position_embeddings`.
   pub fn forward(&self, input_ids: &Array) -> Result<Array> {
     let shape = input_ids.shape();
+    // Pin `input_ids` to EXACTLY rank-2 `(batch, seq_len)` before any op. The
+    // public `encode_text` / `embed_text` accept an untrusted array, and the
+    // sticky-EOS pooling + the position-row slice are only defined for a rank-2
+    // batch: a rank-3+ input would otherwise pass the `shape[1]` read and gather
+    // a different-rank graph (`(B, L, X, hidden)`), and a rank-<2 input would
+    // index past its own rank. Reject anything but rank-2 up front, mirroring
+    // the vision tower's runtime-input shape gate.
+    if shape.len() != 2 {
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        "siglip2 text: input_ids must be rank-2 (batch, seq_len)",
+        shape.len() as u32,
+        shape,
+      )));
+    }
     let seq = dim_i32(&shape, 1, "siglip2 text: seq_len")?;
     if seq < 1 {
       // An empty sequence axis has no last token to pool: `index_last(0)` would

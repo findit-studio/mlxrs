@@ -86,18 +86,21 @@
 //!   (MaxSim / late-interaction).
 //! - Golden trait architecture (the embedding-model seam):
 //!   [`Embed<Input>`](crate::embeddings::Embed) — the unified core, generic over
-//!   the input modality with the output associated — plus the object-safe
-//!   [`TextEmbedder`](crate::embeddings::TextEmbedder) handle, the
+//!   the input modality with the output associated — plus the model-implemented
+//!   object-safe [`TextEmbedder`](crate::embeddings::TextEmbedder) handle (a
+//!   model owns its [`TextEncoding`](crate::embeddings::TextEncoding) /
+//!   [`Padding`](crate::embeddings::Padding) and its forward+pool), the
 //!   [`Contrastive`](crate::embeddings::Contrastive) /
 //!   [`LateInteraction`](crate::embeddings::LateInteraction) capability traits,
 //!   the [`TokenEncoder`](crate::embeddings::TokenEncoder) sentence-encoder
-//!   family + [`pool_embed`](crate::embeddings::pool_embed) driver, and the
+//!   family + [`pool_embed`](crate::embeddings::pool_embed) driver (which applies
+//!   the baked [`PoolingConfig`](crate::embeddings::PoolingConfig)), and the
 //!   [`EmbeddingModel`](crate::embeddings::EmbeddingModel) load-factory umbrella
 //!   (capability accessors over the above). The
-//!   [`encode`](crate::embeddings::encode()) entry +
-//!   [`EncodeConfig`](crate::embeddings::EncodeConfig) tokenize a batch and call
-//!   the model's text embedding (mirrors python `utils.generate` + swift
-//!   `EmbedderModelContainer.perform`).
+//!   [`encode`](crate::embeddings::encode()) entry reads the model's
+//!   [`TextEncoding`](crate::embeddings::TextEncoding), tokenizes + pads a batch,
+//!   and calls the model's text embedding (mirrors python `utils.generate` +
+//!   swift `EmbedderModelContainer.perform`).
 
 pub mod colvision;
 pub mod config;
@@ -152,10 +155,10 @@ pub use config::{
   pooling_from_st_config_str,
 };
 pub use embed::{
-  Contrastive, Embed, Embedding, EmbeddingModel, LateInteraction, MultiVector, TextEmbedder,
-  TextInput, TokenEncoder, pool_embed,
+  Contrastive, Embed, Embedding, EmbeddingModel, LateInteraction, MultiVector, Padding,
+  PoolingConfig, TextEmbedder, TextEncoding, TokenEncoder, pool_embed,
 };
-pub use encode::{EncodeConfig, encode};
+pub use encode::encode;
 pub use factory::{
   EmbeddingIdentifier, EmbeddingModelConfiguration, EmbeddingModelConstructor,
   EmbeddingModelTypeRegistry, EmbeddingWeights, LoadedEmbeddingContext, LoadedEmbeddingModel, load,

@@ -46,8 +46,11 @@ use std::path::{Path, PathBuf};
 
 use mlxrs::{
   array::Array,
-  embeddings::siglip2_naflex::{
-    Siglip2NaflexModel, config::Siglip2NaflexConfig, processing::preprocess, sanitize,
+  embeddings::{
+    EmbeddingModel,
+    siglip2_naflex::{
+      Siglip2NaflexModel, config::Siglip2NaflexConfig, processing::preprocess, sanitize,
+    },
   },
 };
 
@@ -312,6 +315,85 @@ fn siglip2_oracle_text_parity() {
   eprintln!(
     "siglip2_oracle_text_parity: {} prompts >= {COSINE_FLOOR}",
     prompts.len()
+  );
+}
+
+/// The SigLIP2 `<eos>` token id (the sticky-EOS pooled position). The text
+/// tower pools the LAST position; an overlength prompt must end in this id.
+const EOS_TOKEN_ID: i32 = 1;
+
+#[test]
+#[ignore = "requires the gitignored google/siglip2-base-patch16-naflex weights in models/siglip2-naflex/"]
+fn siglip2_oracle_text_overlength_eos_preserving_truncation() {
+  // Regression for the sticky-EOS overlength-truncation contract (the
+  // `Padding::FixedLength { eos_token_id }` fix). A prompt longer than the fixed
+  // text sequence length must be truncated EOS-preserving — the pooled last
+  // position is the `<eos>`, never a content token — exactly as the native
+  // SigLIP processor does (HF truncate-then-append-EOS). This drives the REAL
+  // generic `encode` pipeline (tokenize → fixed-length pad/truncate → the text
+  // tower) and compares it to the native processor's ids + embedding.
+  let Some(dir) = model_dir() else {
+    eprintln!(
+      "skipping siglip2_oracle_text_overlength_eos_preserving_truncation: \
+       models/siglip2-naflex/ absent (set MLXRS_SIGLIP2_MODEL_DIR to run)"
+    );
+    return;
+  };
+  let model = load_model(&dir);
+  let tokenizer = mlxrs::tokenizer::Tokenizer::from_path(&dir, None).expect("load tokenizer");
+
+  // A prompt comfortably longer than the 64-token fixed length.
+  let long_prompt = "a photograph of a sunset over the ocean with boats and birds \
+    and clouds and waves and a lighthouse and distant mountains and a long pier \
+    stretching far into the calm reflective water under a dramatic colorful sky"
+    .repeat(4);
+
+  // Native processor ids: the real tokenizer.json carries truncation
+  // (Right, max_length=64) + an `<eos>` post-processor, so `encode(.., true)`
+  // head-truncates content and appends the EOS — the native SigLIP processor
+  // output. For an overlength prompt this is exactly 64 ids ending in `<eos>`.
+  let native_ids = tokenizer
+    .encode(&long_prompt, true)
+    .expect("encode long prompt");
+  assert_eq!(
+    native_ids.len(),
+    TEXT_SEQ_LEN,
+    "native processor truncates the overlength prompt to the fixed length"
+  );
+  assert_eq!(
+    *native_ids.last().expect("non-empty") as i32,
+    EOS_TOKEN_ID,
+    "native processor keeps the EOS at the last position (sticky-EOS)"
+  );
+
+  // Generic pipeline: `encode` reads the model's `TextEncoding`
+  // (FixedLength { length: 64, eos_token_id: Some(1) }), tokenizes + pads/
+  // truncates, and runs the text tower — the same EOS-preserving truncation.
+  let generic = to_vec(
+    mlxrs::embeddings::encode(
+      model.as_text_embedder().expect("siglip is a text embedder"),
+      &tokenizer,
+      &[long_prompt.as_str()],
+    )
+    .expect("generic encode"),
+  );
+
+  // Native embedding: run the text tower directly on the native processor ids.
+  let native_i32: Vec<i32> = native_ids.iter().map(|&u| u as i32).collect();
+  let native_arr =
+    Array::from_slice::<i32>(&native_i32, &(1usize, TEXT_SEQ_LEN)).expect("native ids array");
+  let native = to_vec(model.encode_text(&native_arr).expect("encode_text native"));
+
+  // The generic pipeline must reproduce the native processor's embedding for the
+  // overlength prompt (byte-identical truncated ids → identical pooled output).
+  assert_eq!(generic.len(), native.len(), "embedding dim mismatch");
+  let cos = cosine(&generic, &native);
+  assert!(
+    cos >= COSINE_FLOOR,
+    "overlength generic vs native processor: cosine {cos} < floor {COSINE_FLOOR}"
+  );
+  eprintln!(
+    "siglip2_oracle_text_overlength_eos_preserving_truncation: cosine {cos} >= {COSINE_FLOOR}"
   );
 }
 

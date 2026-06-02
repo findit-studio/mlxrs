@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use super::*;
 use crate::embeddings::{
-  EmbeddingModelTypeRegistry, LoadedEmbeddingModel, TextEmbedder,
+  EmbeddingModelTypeRegistry, LoadedEmbeddingModel, Padding, TextEmbedder,
   siglip2_naflex::processing::preprocess,
 };
 
@@ -205,6 +205,14 @@ fn ids(batch: usize, seq: usize) -> Array {
   Array::from_slice::<i32>(&data, &(batch, seq)).unwrap()
 }
 
+/// An all-`1` `(batch, seq)` `f32` attention mask — the
+/// [`Padding::FixedLength`] scheme SigLIP declares. SigLIP's `embed_text`
+/// ignores the mask (sticky-EOS reads a fixed position), so any valid
+/// `(batch, seq)` mask is accepted; this matches what `encode` would build.
+fn mask(batch: usize, seq: usize) -> Array {
+  Array::from_slice::<f32>(&vec![1.0_f32; batch * seq], &(batch, seq)).unwrap()
+}
+
 fn eval_to_vec(a: &Array) -> Vec<f32> {
   let mut a = a.try_clone().unwrap();
   a.eval().unwrap();
@@ -288,12 +296,12 @@ fn logits_apply_scale_and_bias() {
 
 #[test]
 fn text_embedder_runs_text_tower() {
-  // The model is its own universal `TextEmbedder` (via `Embed<TextInput>`): the
-  // text-tower path yields the `(batch, projection)` L2-normalized text
-  // embedding (== the model's `encode_text`). The optional padding mask is
-  // unused by the sticky-EOS pooling, so it is `None` here.
+  // The model is its own universal `TextEmbedder`: the text-tower path yields
+  // the `(batch, projection)` L2-normalized text embedding (== the model's
+  // `encode_text`). The padding mask is unused by the sticky-EOS pooling, so an
+  // all-`1` mask (the FixedLength scheme) is supplied and ignored.
   let model = tiny_model();
-  let emb = model.embed_text(&ids(1, 4), None).unwrap();
+  let emb = model.embed_text(&ids(1, 4), &mask(1, 4)).unwrap();
   assert_eq!(emb.array().shape(), vec![1, PROJ as usize]);
   // The returned text embedding is L2-normalized (the SigLIP text feature).
   let flat = eval_to_vec(emb.array());
@@ -302,6 +310,38 @@ fn text_embedder_runs_text_tower() {
     (norms[0] - 1.0).abs() < 1e-4,
     "text embedding must be L2-normalized: norm = {}",
     norms[0]
+  );
+}
+
+#[test]
+fn text_encoding_declares_fixed_length_sticky_eos_scheme() {
+  // SigLIP's `TextEncoding` must declare the fixed-length processor scheme the
+  // sticky-EOS tower needs: special tokens on, and `FixedLength` padding to the
+  // text tower's `max_position_embeddings` with the SigLIP pad id `1`, an
+  // all-`1`-mask scheme, and `eos_token_id = Some(1)` so an overlength prompt
+  // keeps the EOS at its final position on truncation (sticky-EOS pooling). The
+  // tokenizer truncation cap is NOT carried in `max_length` here: the
+  // `FixedLength` scheme is itself the truncation cap, and the generic pipeline
+  // derives the effective cap (`length + 1` for this sticky-EOS scheme) CENTRALLY
+  // from the padding mode — so the cap does not depend on this model remembering
+  // to set `max_length`. The fixed length is read from the config (`MAX_POS`
+  // here), NOT hard-coded — so it tracks the checkpoint.
+  let model = tiny_model();
+  let enc = model.text_encoding();
+  assert!(enc.add_special_tokens, "siglip encodes with special tokens");
+  assert_eq!(
+    enc.max_length, None,
+    "the tokenizer cap is derived centrally from the FixedLength scheme, not \
+     carried in an optional per-model max_length field"
+  );
+  assert_eq!(
+    enc.padding,
+    Padding::FixedLength {
+      length: MAX_POS as usize,
+      pad_token_id: 1,
+      eos_token_id: Some(1),
+    },
+    "siglip pads/truncates to max_position_embeddings with pad id 1, all-1 mask, EOS-preserving truncation"
   );
 }
 
@@ -382,6 +422,125 @@ fn sanitize_is_idempotent_for_already_nested_keys() {
 }
 
 #[test]
+fn strip_prefix_splits_and_removes_matching_keys() {
+  // `strip_prefix` (now fallible — both the matched-key `Vec` and the
+  // destination map reserve via `reserve_or_error`) must move every
+  // prefix-matching key into the returned sub-map with the prefix removed, and
+  // leave the non-matching keys in the source. A clean run (not an allocator
+  // failure) returns `Ok` and the exact split.
+  let mut w: HashMap<String, Array> = HashMap::new();
+  w.insert("vision_model.vision_model.a".to_string(), vec1(HIDDEN));
+  w.insert("vision_model.vision_model.b".to_string(), vec1(HIDDEN));
+  w.insert("text_model.text_model.x".to_string(), vec1(HIDDEN));
+  w.insert("logit_scale".to_string(), vec1(1));
+
+  let vision = super::strip_prefix(&mut w, "vision_model.vision_model.").unwrap();
+  assert_eq!(vision.len(), 2, "two vision keys moved out");
+  assert!(vision.contains_key("a") && vision.contains_key("b"));
+  // The matched keys are gone from the source; the others remain.
+  assert!(!w.keys().any(|k| k.starts_with("vision_model.")));
+  assert!(w.contains_key("text_model.text_model.x"));
+  assert!(w.contains_key("logit_scale"));
+
+  // A prefix that matches nothing yields an empty sub-map (the reserve-0 path)
+  // and leaves the source untouched.
+  let before = w.len();
+  let none = super::strip_prefix(&mut w, "no_such_prefix.").unwrap();
+  assert!(none.is_empty(), "no match → empty sub-map");
+  assert_eq!(
+    w.len(),
+    before,
+    "non-matching strip leaves the source intact"
+  );
+}
+
+#[test]
+fn strip_prefix_clones_full_matched_keys_through_fallible_path() {
+  // ROOT-cause regression: `strip_prefix` builds its matched-key list (the FULL
+  // checkpoint keys needed to `remove` each entry) through the fallible
+  // `fallible_clone_str` path — not an infallible `String::clone`. Exercise that
+  // path on a many-key map: every matched FULL key must be cloned + removed, the
+  // stripped key inserted, and the result correct (a clean run returns `Ok`).
+  let mut w: HashMap<String, Array> = HashMap::new();
+  // A wide set of long, prefix-matching keys so the full-key clone loop runs many
+  // times over realistically-sized checkpoint keys.
+  for i in 0..32 {
+    w.insert(
+      format!("vision_model.vision_model.encoder.layers.{i}.self_attn.q_proj.weight"),
+      vec1(HIDDEN),
+    );
+  }
+  w.insert("logit_scale".to_string(), vec1(1));
+
+  let vision = super::strip_prefix(&mut w, "vision_model.vision_model.").unwrap();
+  assert_eq!(
+    vision.len(),
+    32,
+    "all 32 full-key matches were cloned + moved"
+  );
+  // Each entry is present under its STRIPPED key (the prefix removed) ...
+  for i in 0..32 {
+    let stripped = format!("encoder.layers.{i}.self_attn.q_proj.weight");
+    assert!(
+      vision.contains_key(&stripped),
+      "stripped key {stripped} present"
+    );
+  }
+  // ... and every FULL matched key was removed from the source (the removal uses
+  // the fully-cloned key — the path ROOT FIX 2 made fallible).
+  assert!(
+    !w.keys().any(|k| k.starts_with("vision_model.")),
+    "every full matched key was removed from the source"
+  );
+  assert!(w.contains_key("logit_scale"), "non-matching key retained");
+
+  // The full-key clone itself goes through the fallible String path: a clean
+  // clone of a full-length checkpoint key returns `Ok` and is byte-identical.
+  let full = "vision_model.vision_model.encoder.layers.0.self_attn.q_proj.weight";
+  let cloned = super::fallible_clone_str("strip_prefix: matched key", full).unwrap();
+  assert_eq!(
+    cloned, full,
+    "the fallible full-key clone is byte-identical"
+  );
+}
+
+#[test]
+fn sanitize_and_strip_prefix_roundtrip_on_full_fixture() {
+  // Exercise the full fallible allocation path end-to-end on the (larger)
+  // model fixture: un-namespace the post-sanitize map to raw HF keys, re-run
+  // `sanitize` (fallible destination-map reserve + per-key `insert_unique`),
+  // then `strip_prefix` each tower (fallible matched-key `Vec` + sub-map
+  // reserve). The split must reproduce the original per-tower key sets — proving
+  // the reserve-based refactor preserved behavior on a real-sized key count.
+  let post = tiny_model_weights();
+  let mut raw: HashMap<String, Array> = HashMap::new();
+  for (k, v) in post {
+    let raw_key = if let Some(rest) = k.strip_prefix("vision_model.vision_model.") {
+      format!("vision_model.{rest}")
+    } else if let Some(rest) = k.strip_prefix("text_model.text_model.") {
+      format!("text_model.{rest}")
+    } else {
+      k
+    };
+    raw.insert(raw_key, v);
+  }
+  let mut sanitized = sanitize(raw).unwrap();
+  let vision = super::strip_prefix(&mut sanitized, "vision_model.vision_model.").unwrap();
+  let text = super::strip_prefix(&mut sanitized, "text_model.text_model.").unwrap();
+  // The patch-embed weight is a vision key; the token-embedding a text key.
+  assert!(vision.contains_key("embeddings.patch_embedding.weight"));
+  assert!(text.contains_key("embeddings.token_embedding.weight"));
+  // After both strips, only the top-level contrastive params remain.
+  assert!(sanitized.contains_key("logit_scale") && sanitized.contains_key("logit_bias"));
+  assert!(
+    !sanitized
+      .keys()
+      .any(|k| k.starts_with("vision_model.") || k.starts_with("text_model.")),
+    "every tower key was stripped"
+  );
+}
+
+#[test]
 fn register_adds_siglip_constructor() {
   let mut registry = EmbeddingModelTypeRegistry::new();
   assert!(!registry.contains(MODEL_TYPE));
@@ -418,13 +577,14 @@ fn constructor_builds_model_from_loaded() {
   }
   let loaded = LoadedEmbeddingModel::new("siglip2".to_string(), tiny_config_json(), raw);
   let ctor = constructor();
-  let model = ctor(&loaded).expect("constructor must build the model");
+  // SigLIP bakes its own pooling, so the constructor ignores the pooling config.
+  let model = ctor(&loaded, None).expect("constructor must build the model");
   // The constructed model answers the umbrella's universal text capability; its
   // `embed_text` runs the text tower to a `(batch, projection)` embedding.
   let emb = model
     .as_text_embedder()
     .expect("siglip exposes the universal text embedder")
-    .embed_text(&ids(1, 4), None)
+    .embed_text(&ids(1, 4), &mask(1, 4))
     .unwrap();
   assert_eq!(emb.array().shape(), vec![1, PROJ as usize]);
 }

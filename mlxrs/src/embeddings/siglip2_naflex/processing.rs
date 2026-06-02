@@ -22,7 +22,9 @@
 //!    `(H_p * patch_size, W_p * patch_size)` via the NEON-accelerated,
 //!    PIL-bit-exact [`crate::vlm::image::resize`] with
 //!    [`ResizeFilter::Bilinear`] (PIL `Image.BILINEAR`, the upstream HF
-//!    SigLIP2 processor's resampling filter).
+//!    SigLIP2 processor's resampling filter). `resize` returns an RGBA8
+//!    image; the patchify reads each pixel's leading RGB bytes and skips
+//!    alpha, so no owned 3-channel copy is materialized.
 //! 3. **Normalize + patchify** — map each `u8` channel through
 //!    `x / 127.5 - 1.0` (the SigLIP `(x/255 - 0.5)/0.5` mean/std=0.5
 //!    rescale) and flatten into `(num_patches, P^2 * C)` rows in
@@ -70,6 +72,12 @@ use crate::{
 /// `num_channels` parameter, so a non-3 argument is a typed error, never an
 /// out-of-bounds slice into the always-3-channel resized buffer.
 const RGB_CHANNELS: u32 = 3;
+
+/// The channel count of the resized buffer. [`crate::vlm::image::resize`] always
+/// returns an `ImageRgba8` (4-channel) image; the patchify reads the leading
+/// [`RGB_CHANNELS`] (RGB) bytes of each 4-byte pixel and skips alpha. Kept as a
+/// named constant so the source pixel stride is not a bare literal.
+const RGBA_CHANNELS: u32 = 4;
 
 /// Per-axis cap on the source image `width` / `height` (px). A single absurd
 /// dimension is rejected at [`Extent`] construction, before it reaches the
@@ -366,8 +374,7 @@ pub fn preprocess(
   //    Build a borrowed-free owned RgbImage over the caller's bytes
   //    (image 0.25's `from_raw` needs an owned container), then resize.
   //    Only the RGB (3-channel) path is wired (the patchify normalize is
-  //    per-RGB-channel); `num_channels` was verified `== 3` above and every
-  //    stride below derives from the resulting 3-channel `to_rgb8()` buffer.
+  //    per-RGB-channel); `num_channels` was verified `== 3` above.
   // Fallible source clone: `image::ImageBuffer::from_raw` needs an owned
   // container, but a bare `rgb.to_vec()` aborts on a within-cap-but-heavyweight
   // duplicate. Reserve fallibly (typed `AllocFailure`) into the exact,
@@ -390,7 +397,27 @@ pub fn preprocess(
   let src_dyn = ::image::DynamicImage::ImageRgb8(src_img);
   // `vlm::resize` takes target as (height, width).
   let resized_dyn = resize(&src_dyn, (h_res, w_res), ResizeFilter::Bilinear)?;
-  let resized = resized_dyn.to_rgb8();
+  // `vlm::resize` always returns an `ImageRgba8` (4-channel) `DynamicImage` (its
+  // own fallible kernel projects every source to RGBA8). Patchify directly from
+  // that 4-channel buffer — reading each pixel's leading R/G/B bytes and
+  // skipping alpha — rather than materializing an owned 3-channel `to_rgb8()`
+  // copy: `to_rgb8()` on an already-RGBA8 image allocates a fresh
+  // `h_res * w_res * 3` `RgbImage` over an INFALLIBLE `Vec` that aborts under
+  // allocator pressure (a within-cap but heavyweight resized buffer) — dishonest
+  // against this `Result` signature. Borrowing `as_rgba8()` performs no
+  // allocation, and dropping alpha by reading only the first 3 bytes of each
+  // 4-byte pixel yields byte-identical R/G/B values to `to_rgb8()` (which
+  // likewise only drops alpha from an RGBA8 source — no color-space conversion),
+  // so the e2e pixel parity is preserved.
+  let resized = resized_dyn.as_rgba8().ok_or_else(|| {
+    // `vlm::image::resize` is documented to return `ImageRgba8`; a non-RGBA8
+    // result is an upstream contract break, surfaced as a typed error rather
+    // than an `unwrap` panic.
+    Error::InvariantViolation(InvariantViolationPayload::new(
+      "siglip2 preprocess: resized image format",
+      "vlm::image::resize must return an RGBA8 image (the patchify reads its R/G/B bytes)",
+    ))
+  })?;
 
   // 3. Normalize + patchify into the fixed (max_num_patches, P^2*C) buffer,
   //    zero-padded past the active rows. `per_patch` / `total_floats` were
@@ -409,12 +436,17 @@ pub fn preprocess(
   pixel_values.resize(total_floats, 0.0f32);
 
   let resized_buf = resized.as_raw();
-  // Every stride is derived from the actual RGB buffer format (`channels` ==
-  // `RGB_CHANNELS` == 3), never the raw `num_channels` parameter, so the
-  // patchify cannot index past the always-3-channel `resized_buf`.
-  let c = channels;
-  let src_row_stride = (w_res as usize) * c; // bytes per resized row
-  let row_bytes = p * c; // bytes per patch row (16*3 = 48)
+  // The resized buffer is always 4-channel RGBA8 (the `vlm::resize` contract);
+  // the patchify reads the leading `RGB_CHANNELS` (3) bytes of each 4-byte
+  // pixel and skips alpha. The output stride is `RGB_CHANNELS` (== `channels`,
+  // verified `== 3` above), the source pixel stride is `RGBA_CHANNELS` (4) —
+  // both derived from the actual buffer format, never the raw `num_channels`
+  // parameter, so the patchify cannot index past `resized_buf`.
+  let c = channels; // 3 — output channels per pixel
+  let src_c = RGBA_CHANNELS as usize; // 4 — source bytes per pixel (RGBA)
+  let src_row_stride = (w_res as usize) * src_c; // bytes per resized RGBA row
+  let row_pixels = p; // pixels per patch row
+  let row_bytes = p * c; // RGB bytes per patch row (16*3 = 48)
   let h_p_us = h_p as usize;
   let w_p_us = w_p as usize;
 
@@ -425,15 +457,16 @@ pub fn preprocess(
       for r in 0..p {
         let src_y = py * p + r;
         let src_x = px * p;
-        let src_off = src_y * src_row_stride + src_x * c;
+        let src_off = src_y * src_row_stride + src_x * src_c;
         let dst_off = out_offset + r * row_bytes;
         // `x / 127.5 - 1.0` == `(x/255 - 0.5)/0.5` (SigLIP mean/std 0.5).
-        // A tight per-row scalar loop over `row_bytes` contiguous bytes.
+        // A tight per-row scalar loop over `row_pixels` pixels, reading the
+        // 3 leading RGB bytes of each 4-byte RGBA source pixel (alpha dropped).
         // See the module-level SIMD note: this reuses the same per-row
         // shape as the NEON resize already covered; it is not a separate
         // hot loop worth its own kernel (the resize dominates).
-        normalize_row(
-          &resized_buf[src_off..src_off + row_bytes],
+        normalize_row_rgba(
+          &resized_buf[src_off..src_off + row_pixels * src_c],
           &mut pixel_values[dst_off..dst_off + row_bytes],
         );
       }
@@ -470,16 +503,29 @@ pub fn preprocess(
   })
 }
 
-/// Normalize one contiguous RGB byte row into f32 via `x / 127.5 - 1.0`.
+/// Normalize one contiguous RGBA byte row into a 3-channel RGB f32 row via
+/// `x / 127.5 - 1.0`, dropping the alpha byte of each 4-byte source pixel.
 ///
-/// This is the SigLIP `(x/255 - 0.5) / 0.5` rescale in the FMA-friendly
-/// form. `src` and `dst` have equal length (`patch_size * channels`).
+/// This is the SigLIP `(x/255 - 0.5) / 0.5` rescale in the FMA-friendly form.
+/// `src` is `[RGBA, RGBA, …]` (`p * RGBA_CHANNELS` bytes); `dst` is the matching
+/// `[RGB, RGB, …]` (`p * RGB_CHANNELS` f32). The resize emits RGBA8, so reading
+/// the leading 3 bytes of each pixel is byte-identical to a `to_rgb8()` drop of
+/// the alpha channel (no color-space conversion) — the e2e pixel parity holds.
 #[inline]
-fn normalize_row(src: &[u8], dst: &mut [f32]) {
-  debug_assert_eq!(src.len(), dst.len());
+fn normalize_row_rgba(src: &[u8], dst: &mut [f32]) {
+  const RGB: usize = RGB_CHANNELS as usize;
+  const RGBA: usize = RGBA_CHANNELS as usize;
+  debug_assert_eq!(src.len() % RGBA, 0);
+  debug_assert_eq!(dst.len() % RGB, 0);
+  debug_assert_eq!(src.len() / RGBA, dst.len() / RGB);
   const SCALE: f32 = 1.0 / 127.5;
-  for (s, d) in src.iter().zip(dst.iter_mut()) {
-    *d = f32::from(*s) * SCALE - 1.0;
+  // Per-pixel: copy the 3 RGB bytes, skip alpha. The chunked iteration keeps
+  // the bounds-checks hoisted to the chunk boundary (the lengths are an exact
+  // multiple of the pixel widths by construction).
+  for (src_px, dst_px) in src.chunks_exact(RGBA).zip(dst.chunks_exact_mut(RGB)) {
+    for ch in 0..RGB {
+      dst_px[ch] = f32::from(src_px[ch]) * SCALE - 1.0;
+    }
   }
 }
 
