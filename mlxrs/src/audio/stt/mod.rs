@@ -36,15 +36,18 @@ pub mod model;
 /// Concrete STT model implementations (feature-gated per architecture).
 ///
 /// Hosts both family shapes the trait architecture spans: the CTC / non-AR
-/// architectures (wav2vec2), which fit the [`CtcModel`](model::CtcModel)
-/// family (or expose an inherent CTC API), and the autoregressive
-/// encoder/decoder ones (whisper), which implement
+/// architectures (wav2vec2, the Qwen3-ASR audio tower), which fit the
+/// [`CtcModel`](model::CtcModel) family (or expose an inherent API), and the
+/// autoregressive encoder/decoder ones (whisper), which implement
 /// [`AutoregressiveStt`](model::AutoregressiveStt) (`encode` + per-token
 /// `decode_step` + KV cache) and run their own
 /// [`Transcribe`](model::Transcribe) procedure. Each is behind its own cargo
 /// feature.
-#[cfg(any(feature = "wav2vec2", feature = "whisper"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "wav2vec2", feature = "whisper"))))]
+#[cfg(any(feature = "wav2vec2", feature = "whisper", feature = "qwen3-asr"))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(feature = "wav2vec2", feature = "whisper", feature = "qwen3-asr")))
+)]
 pub mod models;
 pub mod serializers;
 /// Streaming STT — incremental encoder + orchestration. Ports
