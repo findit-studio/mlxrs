@@ -6,6 +6,24 @@ use std::{
   path::{Path, PathBuf},
 };
 
+// ───────────────────────── device-row test helpers ────────────────────────
+
+/// Make a `(n,)` device logits row from a host slice.
+fn row(xs: &[f32]) -> Array {
+  Array::from_slice::<f32>(xs, &[xs.len() as i32]).unwrap()
+}
+
+/// Read a `(n,)` device row back to a host `Vec<f32>`.
+fn host(a: &Array) -> Vec<f32> {
+  a.try_clone().unwrap().to_vec::<f32>().unwrap()
+}
+
+/// Apply a logit filter to a host row, returning the masked host row — the
+/// device round-trip wrapped for the unit tests.
+fn apply_host(f: &dyn LogitFilter, xs: &[f32], tokens: &[u32]) -> Vec<f32> {
+  host(&f.apply(&row(xs), tokens).unwrap())
+}
+
 // ───────────────────────── scalar / helper oracles ────────────────────────
 
 #[test]
@@ -32,28 +50,14 @@ fn compression_ratio_repetitive_is_high() {
 }
 
 #[test]
-fn argmax_slice_picks_first_max() {
-  assert_eq!(argmax_slice(&[1.0, 5.0, 5.0, 2.0]), 1); // ties → lowest index
-  assert_eq!(argmax_slice(&[-3.0, -1.0, -2.0]), 1);
-  assert_eq!(argmax_slice(&[]), 0);
-  // -inf entries are never selected over a finite max.
-  assert_eq!(
-    argmax_slice(&[f32::NEG_INFINITY, 0.0, f32::NEG_INFINITY]),
-    1
-  );
-}
-
-#[test]
-fn max_slice_and_logsumexp_slice() {
-  assert_eq!(max_slice(&[]), f64::NEG_INFINITY);
-  assert_eq!(max_slice(&[1.0, 3.0, 2.0]), 3.0);
-  // logsumexp of all -inf (or empty) is -inf.
+fn logsumexp_slice_handles_empty_and_neg_inf() {
+  // The once-per-utterance detect_language helper: logsumexp of all -inf (or
+  // empty) is -inf; logsumexp([0,0,0]) = ln(3).
   assert_eq!(logsumexp_slice(&[]), f64::NEG_INFINITY);
   assert_eq!(
     logsumexp_slice(&[f32::NEG_INFINITY, f32::NEG_INFINITY]),
     f64::NEG_INFINITY
   );
-  // logsumexp([0,0,0]) = ln(3).
   let lse = logsumexp_slice(&[0.0, 0.0, 0.0]);
   assert!((lse - 3f64.ln()).abs() < 1e-9, "lse={lse}");
 }
@@ -78,47 +82,114 @@ fn mask_range_sets_neg_inf_and_clamps() {
 
 #[test]
 fn suppress_blank_only_at_sample_begin() {
-  // blank_ids = {space_id=5, eot=2}; sample_begin = 3.
+  // blank ids = {space_id=5, eot=2}; sample_begin = 3; n_vocab = 8.
   let filter = SuppressBlank {
     sample_begin: 3,
-    blank_ids: vec![5, 2],
+    mask: scatter_neg_inf_mask(8, &[5, 2]).unwrap(),
   };
-  let mut row = vec![0.0_f32; 8];
   // tokens.len() == sample_begin → mask fires.
-  filter.apply(&mut row, &[1, 2, 3]);
-  assert!(row[5].is_infinite() && row[5] < 0.0);
-  assert!(row[2].is_infinite() && row[2] < 0.0);
-  assert_eq!(row[0], 0.0);
+  let masked = apply_host(&filter, &[0.0_f32; 8], &[1, 2, 3]);
+  assert!(masked[5].is_infinite() && masked[5] < 0.0);
+  assert!(masked[2].is_infinite() && masked[2] < 0.0);
+  assert_eq!(masked[0], 0.0);
 
-  // tokens.len() != sample_begin → no masking.
-  let mut row2 = vec![0.0_f32; 8];
-  filter.apply(&mut row2, &[1, 2, 3, 4]);
-  assert_eq!(row2, vec![0.0_f32; 8]);
+  // tokens.len() != sample_begin → no masking (row returned unchanged).
+  let unmasked = apply_host(&filter, &[0.0_f32; 8], &[1, 2, 3, 4]);
+  assert_eq!(unmasked, vec![0.0_f32; 8]);
 }
 
 #[test]
 fn suppress_blank_ignores_out_of_range_ids() {
-  // An id past the vocab is silently skipped (no panic).
+  // An id past the vocab is silently skipped at mask-build (no panic).
   let filter = SuppressBlank {
     sample_begin: 0,
-    blank_ids: vec![100],
+    mask: scatter_neg_inf_mask(4, &[100]).unwrap(),
   };
-  let mut row = vec![0.0_f32; 4];
-  filter.apply(&mut row, &[]);
-  assert_eq!(row, vec![0.0_f32; 4]);
+  let masked = apply_host(&filter, &[0.0_f32; 4], &[]);
+  assert_eq!(masked, vec![0.0_f32; 4]);
 }
 
 #[test]
 fn suppress_tokens_unconditional() {
-  let filter = SuppressTokens { ids: vec![1, 3] };
-  let mut row = vec![0.0_f32; 5];
+  let filter = SuppressTokens::new(&[1, 3], 5).unwrap();
   // Applies regardless of token history.
-  filter.apply(&mut row, &[9, 9, 9]);
-  assert!(row[1] < 0.0 && row[1].is_infinite());
-  assert!(row[3] < 0.0 && row[3].is_infinite());
-  assert_eq!(row[0], 0.0);
-  assert_eq!(row[2], 0.0);
-  assert_eq!(row[4], 0.0);
+  let masked = apply_host(&filter, &[0.0_f32; 5], &[9, 9, 9]);
+  assert!(masked[1] < 0.0 && masked[1].is_infinite());
+  assert!(masked[3] < 0.0 && masked[3].is_infinite());
+  assert_eq!(masked[0], 0.0);
+  assert_eq!(masked[2], 0.0);
+  assert_eq!(masked[4], 0.0);
+}
+
+#[test]
+fn suppress_masks_overwrite_non_finite_logits_to_neg_inf() {
+  // A suppression mask is a boolean OVERWRITE, not an additive `+ (-inf)`: a
+  // `+inf` or `NaN` logit at a suppressed slot must become a real `-inf`, never
+  // `NaN` (an add would give `(+inf)+(-inf)=NaN` and `NaN+(-inf)=NaN`, which
+  // then poisons argmax / the chosen log-prob). Exercise both a suppress mask
+  // (SuppressTokens / SuppressBlank) and an unsuppressed slot that keeps its
+  // value.
+  // logits: [+inf, NaN, finite, +inf, finite]; suppress ids {0, 1, 3}.
+  let logits = [f32::INFINITY, f32::NAN, 1.5_f32, f32::INFINITY, -2.0_f32];
+
+  let st = SuppressTokens::new(&[0, 1, 3], 5).unwrap();
+  let masked = apply_host(&st, &logits, &[9, 9]);
+  // Every suppressed slot is forced to -inf regardless of its prior value.
+  for &i in &[0usize, 1, 3] {
+    assert!(
+      masked[i].is_infinite() && masked[i] < 0.0,
+      "suppress-tokens slot {i} = {} must be -inf, not NaN",
+      masked[i]
+    );
+  }
+  // Unsuppressed slots are untouched (slot 1 was the only NaN, and it was
+  // suppressed; the surviving finite slots keep their exact values).
+  assert_eq!(masked[2], 1.5);
+  assert_eq!(masked[4], -2.0);
+
+  // Same for the suppress-blank mask, firing at sample_begin.
+  let sb = SuppressBlank {
+    sample_begin: 0,
+    mask: scatter_neg_inf_mask(5, &[0, 1, 3]).unwrap(),
+  };
+  let masked = apply_host(&sb, &logits, &[]);
+  for &i in &[0usize, 1, 3] {
+    assert!(
+      masked[i].is_infinite() && masked[i] < 0.0,
+      "suppress-blank slot {i} = {} must be -inf, not NaN",
+      masked[i]
+    );
+  }
+  assert_eq!(masked[2], 1.5);
+  assert_eq!(masked[4], -2.0);
+}
+
+#[test]
+fn timestamp_deterministic_mask_overwrites_non_finite_to_neg_inf() {
+  // The timestamp rules' deterministic (token-history) mask is likewise a
+  // boolean OVERWRITE: a `+inf` / `NaN` logit at a deterministically-masked slot
+  // becomes a real `-inf`, not `NaN`. At the first sampled position the rule
+  // masks every non-timestamp token `[0, timestamp_begin)`, so put a `+inf` at a
+  // text slot and a `NaN` at no_timestamps and check both land at `-inf`.
+  let f = ts_rules(1, None); // timestamp_begin=14, no_timestamps=12, eot=2
+  let mut xs = [0.0_f32; VOCAB];
+  xs[0] = f32::INFINITY; // a text slot, masked by the first-position rule
+  xs[12] = f32::NAN; // no_timestamps, masked unconditionally
+  xs[5] = f32::INFINITY; // another text slot, masked by the first-position rule
+  let masked = ts_apply(&f, &xs, &[3]); // tokens.len() == sample_begin == 1
+  for &i in &[0usize, 5, 12] {
+    assert!(
+      masked[i].is_infinite() && masked[i] < 0.0,
+      "deterministic-masked slot {i} = {} must be -inf, not NaN",
+      masked[i]
+    );
+  }
+  // No slot anywhere in the row is NaN after the filter (the probability-mass
+  // rule must not have observed a NaN that propagated).
+  assert!(
+    masked.iter().all(|v| !v.is_nan()),
+    "no slot may be NaN after the filter"
+  );
 }
 
 // ───────────────────────── ApplyTimestampRules ────────────────────────────
@@ -133,20 +204,26 @@ fn ts_rules(sample_begin: usize, max_initial: Option<usize>) -> ApplyTimestampRu
     no_timestamps: 12,
     eot: 2,
     max_initial_timestamp_index: max_initial,
+    n_vocab: VOCAB,
   }
 }
 
 const VOCAB: usize = 20;
 
+/// Apply a timestamp-rules filter to a flat-or-given host row, returning the
+/// masked host row.
+fn ts_apply(f: &ApplyTimestampRules, xs: &[f32], tokens: &[u32]) -> Vec<f32> {
+  apply_host(f, xs, tokens)
+}
+
 #[test]
 fn timestamp_rules_always_suppress_no_timestamps() {
   let f = ts_rules(0, None);
-  let mut row = vec![0.0_f32; VOCAB];
   // A non-first step with a non-timestamp last token: only no_timestamps is
   // forced off (besides the probability-mass rule, inert for a flat row).
-  f.apply(&mut row, &[3, 4]); // sample_begin=0 so seq=[3,4]
+  let masked = ts_apply(&f, &[0.0_f32; VOCAB], &[3, 4]); // sample_begin=0 so seq=[3,4]
   assert!(
-    row[12].is_infinite() && row[12] < 0.0,
+    masked[12].is_infinite() && masked[12] < 0.0,
     "no_timestamps masked"
   );
 }
@@ -156,9 +233,8 @@ fn timestamp_rules_first_position_forces_timestamp() {
   // At the first sampled position (tokens.len() == sample_begin) all
   // non-timestamp tokens [0, timestamp_begin) are masked.
   let f = ts_rules(1, None);
-  let mut row = vec![0.0_f32; VOCAB];
-  f.apply(&mut row, &[3]); // len == sample_begin == 1
-  for (i, &v) in row.iter().enumerate().take(14) {
+  let masked = ts_apply(&f, &[0.0_f32; VOCAB], &[3]); // len == sample_begin == 1
+  for (i, &v) in masked.iter().enumerate().take(14) {
     assert!(
       v.is_infinite() && v < 0.0,
       "text/special token {i} masked at first pos"
@@ -168,7 +244,7 @@ fn timestamp_rules_first_position_forces_timestamp() {
   // row where timestamp mass ln(6) > max_text -inf → also forces, so check a
   // single timestamp survives only if mass rule didn't fire). With a flat row,
   // the [0, ts_begin) region is already fully masked, so this is consistent.
-  assert!(row[14].is_finite() || row[14] == f32::NEG_INFINITY);
+  assert!(masked[14].is_finite() || masked[14] == f32::NEG_INFINITY);
 }
 
 #[test]
@@ -176,10 +252,9 @@ fn timestamp_rules_max_initial_timestamp_caps_high_timestamps() {
   // At the first position with max_initial_timestamp_index = 2, timestamps
   // beyond timestamp_begin + 2 = 16 are masked (positions 17..20).
   let f = ts_rules(1, Some(2));
-  let mut row = vec![0.0_f32; VOCAB];
-  f.apply(&mut row, &[3]);
+  let masked = ts_apply(&f, &[0.0_f32; VOCAB], &[3]);
   // 17,18,19 masked by the cap.
-  for (i, &v) in row.iter().enumerate().skip(17) {
+  for (i, &v) in masked.iter().enumerate().skip(17) {
     assert!(v.is_infinite() && v < 0.0, "ts {i} capped");
   }
 }
@@ -189,14 +264,13 @@ fn timestamp_rules_pair_after_two_timestamps_forbids_more_timestamps() {
   // last and penultimate are both timestamps → next must be non-timestamp:
   // mask [timestamp_begin, vocab). sample_begin = 0 so seq = full tokens.
   let f = ts_rules(0, None);
-  let mut row = vec![0.0_f32; VOCAB];
   // seq ends [..., 15(ts), 16(ts)] → both timestamps.
-  f.apply(&mut row, &[3, 15, 16]);
-  for (i, &v) in row.iter().enumerate().skip(14) {
+  let masked = ts_apply(&f, &[0.0_f32; VOCAB], &[3, 15, 16]);
+  for (i, &v) in masked.iter().enumerate().skip(14) {
     assert!(v.is_infinite() && v < 0.0, "timestamp {i} masked");
   }
   // text token 3 stays finite (it is allowed next).
-  assert!(row[3].is_finite());
+  assert!(masked[3].is_finite());
 }
 
 #[test]
@@ -204,11 +278,10 @@ fn timestamp_rules_single_trailing_timestamp_forbids_text() {
   // last is a timestamp, penultimate is NOT → cannot be a normal text token:
   // mask [0, eot). seq = [3(text), 15(ts)].
   let f = ts_rules(0, None);
-  let mut row = vec![0.0_f32; VOCAB];
-  f.apply(&mut row, &[3, 15]);
+  let masked = ts_apply(&f, &[0.0_f32; VOCAB], &[3, 15]);
   // [0, eot=2) masked.
-  assert!(row[0].is_infinite() && row[0] < 0.0);
-  assert!(row[1].is_infinite() && row[1] < 0.0);
+  assert!(masked[0].is_infinite() && masked[0] < 0.0);
+  assert!(masked[1].is_infinite() && masked[1] < 0.0);
   // eot itself (index 2) is allowed (the boundary is exclusive).
   // (eot may still be affected by the prob-mass rule, but not by this clause.)
 }
@@ -220,10 +293,9 @@ fn timestamp_rules_monotonic_forbids_smaller_timestamps() {
   // `+1` applies, masking [timestamp_begin, 17 + 1) = 14..18. The next
   // timestamp must be strictly greater than the last seen 17. seq = [3, 17, 5].
   let f = ts_rules(0, None);
-  let mut row = vec![0.0_f32; VOCAB];
-  f.apply(&mut row, &[3, 17, 5]);
+  let masked = ts_apply(&f, &[0.0_f32; VOCAB], &[3, 17, 5]);
   // timestamps 14..18 masked (<= the last seen 17).
-  for (i, &v) in row.iter().enumerate().take(18).skip(14) {
+  for (i, &v) in masked.iter().enumerate().take(18).skip(14) {
     assert!(v.is_infinite() && v < 0.0, "ts {i} <= last masked");
   }
 }
@@ -236,16 +308,15 @@ fn timestamp_rules_zero_closing_timestamp_forces_nonzero_length() {
   // [timestamp_begin, 14 + 1) = {14} is masked, so <|0.00|> itself is forbidden
   // and the next timestamp must be > 0.00. seq = [14(ts), 12(text), 0(text)].
   let f = ts_rules(0, None);
-  let mut row = vec![0.0_f32; VOCAB];
-  f.apply(&mut row, &[14, 12, 0]);
+  let masked = ts_apply(&f, &[0.0_f32; VOCAB], &[14, 12, 0]);
   // <|0.00|> (id 14) is masked — no zero-length closing segment.
   assert!(
-    row[14].is_infinite() && row[14] < 0.0,
+    masked[14].is_infinite() && masked[14] < 0.0,
     "<|0.00|> must be masked to force nonzero segment length"
   );
   // A later timestamp (id 15 = <|0.02|>) remains legal (only [14,15) masked).
   assert!(
-    row[15].is_finite(),
+    masked[15].is_finite(),
     "the next timestamp <|0.02|> stays legal"
   );
 }
@@ -257,10 +328,12 @@ fn timestamp_rules_single_trailing_timestamp_allows_same_close() {
   // applied, so [timestamp_begin, 15) is masked but 15 itself stays legal.
   // seq = [3(text), 15(ts)] → last_was_timestamp, !penultimate_was_timestamp.
   let f = ts_rules(0, None);
-  let mut row = vec![0.0_f32; VOCAB];
-  f.apply(&mut row, &[3, 15]);
+  let masked = ts_apply(&f, &[0.0_f32; VOCAB], &[3, 15]);
   // 14 masked (smaller than 15); 15 itself NOT masked by the monotonicity rule.
-  assert!(row[14].is_infinite() && row[14] < 0.0, "ts 14 < 15 masked");
+  assert!(
+    masked[14].is_infinite() && masked[14] < 0.0,
+    "ts 14 < 15 masked"
+  );
   // (Note: the [0, eot) clause already masked text tokens since last_was_ts &&
   // !penultimate_was_ts; the monotonicity rule leaves 15 reachable.)
 }
@@ -272,18 +345,65 @@ fn timestamp_rules_probability_mass_forces_timestamp() {
   // region huge logits, the text region small ones, with a NON-timestamp
   // last token (so the pair clauses don't already mask everything).
   let f = ts_rules(0, None);
-  let mut row = vec![0.0_f32; VOCAB];
-  for v in row.iter_mut().take(14) {
-    *v = 0.0; // text logits
+  let mut input = vec![0.0_f32; VOCAB];
+  for v in input.iter_mut().skip(14) {
+    *v = 10.0; // dominant timestamp logits (text region stays 0.0)
   }
-  for v in row.iter_mut().skip(14) {
-    *v = 10.0; // dominant timestamp logits
-  }
-  f.apply(&mut row, &[3, 4]); // last token 4 is text (not a timestamp)
-  for (i, &v) in row.iter().enumerate().take(14) {
+  let masked = ts_apply(&f, &input, &[3, 4]); // last token 4 is text (not a timestamp)
+  for (i, &v) in masked.iter().enumerate().take(14) {
     assert!(
       v.is_infinite() && v < 0.0,
       "text {i} masked by prob-mass rule"
+    );
+  }
+}
+
+#[test]
+fn timestamp_rules_pos_inf_timestamp_does_not_force_all_text_masked() {
+  // The probability-mass rule must mirror the reference LITERALLY:
+  //   logprobs = logits - logsumexp(logits, axis=-1)   (over the full vocab)
+  //   force    = logprobs[ts_begin:].logsumexp() > logprobs[:ts_begin].max()
+  // With a `+inf` timestamp logit (and FINITE text), the full-row
+  // `logsumexp(logits)` is `+inf`, so that slot's logprob is `+inf - +inf =
+  // NaN`; `timestamp_logprob` is then NaN and `NaN > max_text` is FALSE — so
+  // NO timestamp is forced and the finite text tokens are preserved. The
+  // algebraically-cancelled form (`logsumexp(masked[ts:]) > max(masked[:ts])`)
+  // would instead see `+inf > finite` and wrongly mask EVERY text token; this
+  // asserts the literal (reference) behavior.
+  let f = ts_rules(0, None);
+  let mut input = vec![0.0_f32; VOCAB]; // finite text region (indices 0..14)
+  input[15] = f32::INFINITY; // a single `+inf` timestamp logit
+  // Last token 4 is text (not a timestamp) so the pair clauses do not mask.
+  let masked = ts_apply(&f, &input, &[3, 4]);
+  // Text tokens [0, timestamp_begin) keep their finite (`0.0`) values — the
+  // NaN comparison is false, so the prob-mass rule does NOT force a timestamp.
+  for (i, &v) in masked.iter().enumerate().take(14) {
+    if i == f.no_timestamps as usize {
+      continue; // no_timestamps (id 12) is always deterministically suppressed.
+    }
+    assert!(
+      v == 0.0,
+      "text {i} = {v} must stay finite (no force on a NaN comparison)"
+    );
+  }
+}
+
+#[test]
+fn timestamp_rules_nan_timestamp_does_not_force_all_text_masked() {
+  // A `NaN` timestamp logit propagates through `logsumexp(logits)` (NaN
+  // dominates), so the whole `logprobs` row is NaN; `timestamp_logprob` is NaN
+  // and `NaN > max_text` is FALSE — again no force, finite text preserved.
+  let f = ts_rules(0, None);
+  let mut input = vec![0.0_f32; VOCAB];
+  input[16] = f32::NAN; // a single `NaN` timestamp logit
+  let masked = ts_apply(&f, &input, &[3, 4]); // last token 4 is text
+  for (i, &v) in masked.iter().enumerate().take(14) {
+    if i == f.no_timestamps as usize {
+      continue; // no_timestamps deterministically suppressed.
+    }
+    assert!(
+      v == 0.0,
+      "text {i} = {v} must stay finite (no force on a NaN comparison)"
     );
   }
 }
@@ -341,7 +461,7 @@ fn disabled_thresholds_never_trigger() {
 fn greedy_decoder_argmax_and_logprob() {
   let mut d = GreedyDecoder::new(0.0, /* eot */ 2, 0).unwrap();
   // logits favoring index 3; last_token != eot so logprob accumulates.
-  let logits = vec![0.0, 0.0, 0.0, 5.0, 0.0];
+  let logits = row(&[0.0, 0.0, 0.0, 5.0, 0.0]);
   let (next, completed) = d.update(&logits, /* last */ 1).unwrap();
   assert_eq!(next, 3);
   assert!(!completed);
@@ -356,7 +476,7 @@ fn greedy_decoder_argmax_and_logprob() {
 #[test]
 fn greedy_decoder_eot_sticks_and_stops_logprob() {
   let mut d = GreedyDecoder::new(0.0, 2, 0).unwrap();
-  let logits = vec![0.0, 0.0, 0.0, 5.0, 0.0];
+  let logits = row(&[0.0, 0.0, 0.0, 5.0, 0.0]);
   // last_token == eot → next forced to eot, logprob NOT accumulated.
   let (next, completed) = d.update(&logits, /* last */ 2).unwrap();
   assert_eq!(next, 2);
@@ -368,10 +488,369 @@ fn greedy_decoder_eot_sticks_and_stops_logprob() {
 fn greedy_decoder_completes_on_argmax_eot() {
   let mut d = GreedyDecoder::new(0.0, 2, 0).unwrap();
   // argmax is the eot id itself.
-  let logits = vec![0.0, 0.0, 9.0, 0.0];
+  let logits = row(&[0.0, 0.0, 9.0, 0.0]);
   let (next, completed) = d.update(&logits, /* last */ 1).unwrap();
   assert_eq!(next, 2);
   assert!(completed);
+}
+
+// ───────────────────── device-vs-scalar filter PARITY ─────────────────────
+
+/// An independent **scalar** reference for the full filter chain + greedy
+/// argmax — the host-side oracle the device path is checked against.
+///
+/// It re-implements every rule of the three logit filters over a plain
+/// `Vec<f32>`, in the SAME order the device path applies them (deterministic
+/// masks applied to the logits first, then `ApplyTimestampRules`'s
+/// probability-mass rule reads the already-masked logits), and returns the
+/// argmax index (ties → lowest, matching mlx `argmax`). This is written from
+/// the rule descriptions directly — NOT by calling the code under test — so a
+/// regression in the device filters cannot hide behind a shared helper.
+mod scalar_ref {
+  /// Greedy `argmax` over a host slice (ties → lowest index, `-inf` never
+  /// chosen over a finite max). Empty ⇒ `0`.
+  fn argmax(xs: &[f32]) -> u32 {
+    let mut best = 0u32;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &x) in xs.iter().enumerate() {
+      if x > best_val {
+        best_val = x;
+        best = i as u32;
+      }
+    }
+    best
+  }
+
+  fn mask_range(m: &mut [f32], lo: usize, hi: usize) {
+    let hi = hi.min(m.len());
+    if lo < hi {
+      for s in &mut m[lo..hi] {
+        *s = f32::NEG_INFINITY;
+      }
+    }
+  }
+
+  /// `log(sum(exp))` in f64 over a slice; empty / all `-inf` ⇒ `-inf`.
+  fn logsumexp(xs: &[f32]) -> f64 {
+    let mut mx = f64::NEG_INFINITY;
+    for &x in xs {
+      if (x as f64) > mx {
+        mx = x as f64;
+      }
+    }
+    if !mx.is_finite() {
+      return f64::NEG_INFINITY;
+    }
+    let mut s = 0.0f64;
+    for &x in xs {
+      s += (x as f64 - mx).exp();
+    }
+    mx + s.ln()
+  }
+
+  fn max(xs: &[f32]) -> f64 {
+    let mut mx = f64::NEG_INFINITY;
+    for &x in xs {
+      if (x as f64) > mx {
+        mx = x as f64;
+      }
+    }
+    mx
+  }
+
+  /// The filter configuration the parity test exercises (a faithful mirror of
+  /// the three reference filters' parameters).
+  pub struct Config {
+    pub sample_begin: usize,
+    pub timestamp_begin: u32,
+    pub no_timestamps: u32,
+    pub eot: u32,
+    pub max_initial_timestamp_index: Option<usize>,
+    pub blank_ids: Vec<u32>,
+    pub suppress_ids: Vec<u32>,
+    pub suppress_blank: bool,
+    pub with_timestamps: bool,
+  }
+
+  /// Apply the full filter chain to a host logits row, mutating in place,
+  /// exactly as the device path does (SuppressBlank → SuppressTokens →
+  /// ApplyTimestampRules; the timestamp rules' deterministic masks first, then
+  /// the probability-mass rule over the masked logits).
+  pub fn apply(cfg: &Config, logits: &mut [f32], tokens: &[u32]) {
+    let n_vocab = logits.len();
+    // SuppressBlank.
+    if cfg.suppress_blank && tokens.len() == cfg.sample_begin {
+      for &id in &cfg.blank_ids {
+        if let Some(s) = logits.get_mut(id as usize) {
+          *s = f32::NEG_INFINITY;
+        }
+      }
+    }
+    // SuppressTokens.
+    for &id in &cfg.suppress_ids {
+      if let Some(s) = logits.get_mut(id as usize) {
+        *s = f32::NEG_INFINITY;
+      }
+    }
+    // ApplyTimestampRules.
+    if cfg.with_timestamps {
+      let ts_begin = cfg.timestamp_begin as usize;
+      let eot = cfg.eot as usize;
+      if let Some(s) = logits.get_mut(cfg.no_timestamps as usize) {
+        *s = f32::NEG_INFINITY;
+      }
+      let seq: &[u32] = tokens.get(cfg.sample_begin..).unwrap_or(&[]);
+      let last_was_ts = seq.last().is_some_and(|&t| t >= cfg.timestamp_begin);
+      let penult_was_ts = seq.len() < 2
+        || seq
+          .get(seq.len() - 2)
+          .is_some_and(|&t| t >= cfg.timestamp_begin);
+      if last_was_ts {
+        if penult_was_ts {
+          mask_range(logits, ts_begin, n_vocab);
+        } else {
+          mask_range(logits, 0, eot);
+        }
+      }
+      let mut last_ts: Option<usize> = None;
+      for &v in seq {
+        if (v as usize) >= ts_begin {
+          last_ts = Some(v as usize);
+        }
+      }
+      if let Some(last) = last_ts {
+        let upper = if last_was_ts && !penult_was_ts {
+          last
+        } else {
+          last + 1
+        };
+        mask_range(logits, ts_begin, upper);
+      }
+      if tokens.len() == cfg.sample_begin {
+        mask_range(logits, 0, ts_begin);
+        if let Some(idx) = cfg.max_initial_timestamp_index {
+          mask_range(logits, ts_begin + idx + 1, n_vocab);
+        }
+      }
+      // Probability-mass rule over the ALREADY-MASKED logits.
+      let ts_b = ts_begin.min(n_vocab);
+      if ts_b > 0 && ts_b < n_vocab && logsumexp(&logits[ts_b..]) > max(&logits[..ts_b]) {
+        mask_range(logits, 0, ts_begin);
+      }
+    }
+  }
+
+  /// The selected (argmax) token for a given config + raw logits + token state.
+  pub fn select(cfg: &Config, raw: &[f32], tokens: &[u32]) -> u32 {
+    let mut logits = raw.to_vec();
+    apply(cfg, &mut logits, tokens);
+    argmax(&logits)
+  }
+}
+
+/// Build the device filter chain matching a [`scalar_ref::Config`].
+fn device_filters(cfg: &scalar_ref::Config, n_vocab: usize) -> Vec<Box<dyn LogitFilter>> {
+  let mut filters: Vec<Box<dyn LogitFilter>> = Vec::new();
+  if cfg.suppress_blank {
+    filters.push(Box::new(SuppressBlank {
+      sample_begin: cfg.sample_begin,
+      mask: scatter_neg_inf_mask(n_vocab, &cfg.blank_ids).unwrap(),
+    }));
+  }
+  if !cfg.suppress_ids.is_empty() {
+    filters.push(Box::new(
+      SuppressTokens::new(&cfg.suppress_ids, n_vocab).unwrap(),
+    ));
+  }
+  if cfg.with_timestamps {
+    filters.push(Box::new(ApplyTimestampRules {
+      sample_begin: cfg.sample_begin,
+      timestamp_begin: cfg.timestamp_begin,
+      no_timestamps: cfg.no_timestamps,
+      eot: cfg.eot,
+      max_initial_timestamp_index: cfg.max_initial_timestamp_index,
+      n_vocab,
+    }));
+  }
+  filters
+}
+
+/// Run the DEVICE filter chain + on-device greedy argmax for a raw row +
+/// token state, returning the selected token.
+fn device_select(cfg: &scalar_ref::Config, raw: &[f32], tokens: &[u32], n_vocab: usize) -> u32 {
+  let filters = device_filters(cfg, n_vocab);
+  let mut r = row(raw);
+  for f in &filters {
+    r = f.apply(&r, tokens).unwrap();
+  }
+  // Greedy argmax on device (temperature 0), exactly as the decode loop does.
+  let mut d = GreedyDecoder::new(0.0, cfg.eot, 0).unwrap();
+  let (next, _completed) = d.update(&r, /* last */ cfg.timestamp_begin + 999).unwrap();
+  next
+}
+
+/// A Whisper-shaped parity config: text region `[0, eot)`, specials/timestamps
+/// `>= eot`, `timestamp_begin = 14`, `eot = 2`, `no_timestamps = 12`. Vocab
+/// width 20 (timestamps 14..20). `sample_begin` / `max_initial` are per-case.
+fn parity_cfg(
+  sample_begin: usize,
+  max_initial: Option<usize>,
+  suppress_blank: bool,
+  suppress_ids: Vec<u32>,
+  with_timestamps: bool,
+) -> scalar_ref::Config {
+  scalar_ref::Config {
+    sample_begin,
+    timestamp_begin: 14,
+    no_timestamps: 12,
+    eot: 2,
+    max_initial_timestamp_index: max_initial,
+    blank_ids: vec![13, 2], // a "space"-like id 13 + eot 2
+    suppress_ids,
+    suppress_blank,
+    with_timestamps,
+  }
+}
+
+const PV: usize = 20; // parity vocab width
+
+/// The DEVICE filter chain + greedy argmax must select the SAME token as the
+/// independent scalar reference, across every timestamp-rule edge case (the
+/// sample_begin suppress-blank gating, the pair rules, timestamp monotonicity,
+/// the max_initial cap, and the sum-probability rule) and the suppression
+/// filters. Each `raw` row is deliberately off any knife-edge tie so the f32
+/// device reductions and the f64 scalar reductions agree on the comparison.
+#[test]
+fn device_filters_match_scalar_reference_token_selection() {
+  // A varied, non-flat base row so argmax has a clear winner that the masks
+  // then redirect. Distinct values keep argmax unambiguous.
+  let base: Vec<f32> = (0..PV).map(|i| (i as f32) * 0.37 - 3.0).collect();
+
+  // (config, raw row, token state) cases — each exercises a specific rule.
+  struct Case {
+    name: &'static str,
+    cfg: scalar_ref::Config,
+    raw: Vec<f32>,
+    tokens: Vec<u32>,
+  }
+
+  let mut raw_textwin = base.clone();
+  // Make a text token (id 5) the unmasked argmax winner for the suppress cases.
+  raw_textwin[5] = 50.0;
+
+  // A row where the timestamp mass clearly dominates the text region.
+  let mut raw_tsdom = base.clone();
+  for v in raw_tsdom.iter_mut().take(14) {
+    *v = -10.0;
+  }
+  for v in raw_tsdom.iter_mut().skip(14) {
+    *v = 5.0;
+  }
+
+  // A row where a single text token clearly dominates (timestamp mass low).
+  let mut raw_textdom = vec![-20.0f32; PV];
+  raw_textdom[7] = 30.0; // lone text winner
+
+  let cases = vec![
+    Case {
+      name: "suppress_blank at sample_begin masks blank+eot",
+      cfg: parity_cfg(3, None, true, vec![], false),
+      raw: {
+        // blank id 13 is the would-be winner; suppress_blank must redirect it.
+        let mut r = base.clone();
+        r[13] = 99.0;
+        r[8] = 40.0; // the next-best (non-blank) token
+        r
+      },
+      tokens: vec![1, 2, 3], // len == sample_begin == 3 → gate fires
+    },
+    Case {
+      name: "suppress_blank inert when not at sample_begin",
+      cfg: parity_cfg(3, None, true, vec![], false),
+      raw: {
+        let mut r = base.clone();
+        r[13] = 99.0;
+        r
+      },
+      tokens: vec![1, 2, 3, 4], // len != sample_begin → no gate
+    },
+    Case {
+      name: "suppress_tokens redirects argmax off a suppressed id",
+      cfg: parity_cfg(0, None, false, vec![5, 6], false),
+      raw: raw_textwin.clone(),
+      tokens: vec![3, 4],
+    },
+    Case {
+      name: "timestamp first-position forces a timestamp",
+      cfg: parity_cfg(1, Some(2), false, vec![], true),
+      raw: raw_textwin.clone(),
+      tokens: vec![3], // len == sample_begin == 1 → first sampled pos
+    },
+    Case {
+      name: "timestamp max_initial caps high timestamps",
+      cfg: parity_cfg(1, Some(2), false, vec![], true),
+      raw: {
+        // bias a high timestamp (id 19) that the cap must forbid.
+        let mut r = base.clone();
+        r[19] = 80.0;
+        r[15] = 40.0; // an allowed timestamp under the cap (<= 16)
+        r
+      },
+      tokens: vec![3],
+    },
+    Case {
+      name: "timestamp pair-after-two forbids more timestamps",
+      cfg: parity_cfg(0, None, false, vec![], true),
+      raw: raw_tsdom.clone(),
+      tokens: vec![3, 15, 16], // last two are timestamps
+    },
+    Case {
+      name: "timestamp single-trailing forbids text",
+      cfg: parity_cfg(0, None, false, vec![], true),
+      raw: raw_textwin.clone(),
+      tokens: vec![3, 15], // single trailing timestamp
+    },
+    Case {
+      name: "timestamp monotonicity forbids smaller-or-equal",
+      cfg: parity_cfg(0, None, false, vec![], true),
+      raw: {
+        // The final consumer of `base` — move it (no clone).
+        let mut r = base;
+        r[15] = 60.0; // a too-small timestamp the rule must forbid
+        r[18] = 70.0; // a strictly-greater timestamp that stays legal
+        r
+      },
+      tokens: vec![3, 17, 5], // last seen ts 17 → forbid <= 17
+    },
+    Case {
+      name: "timestamp sum-probability forces a timestamp",
+      cfg: parity_cfg(0, None, false, vec![], true),
+      raw: raw_tsdom.clone(),
+      tokens: vec![3, 4], // non-timestamp last → pair clauses inert
+    },
+    Case {
+      name: "timestamp sum-probability inert when text dominates",
+      cfg: parity_cfg(0, None, false, vec![], true),
+      raw: raw_textdom.clone(),
+      tokens: vec![3, 4],
+    },
+    Case {
+      name: "all three filters composed",
+      cfg: parity_cfg(0, Some(2), true, vec![6, 7], true),
+      raw: raw_tsdom.clone(),
+      tokens: vec![3, 4],
+    },
+  ];
+
+  for case in &cases {
+    let want = scalar_ref::select(&case.cfg, &case.raw, &case.tokens);
+    let got = device_select(&case.cfg, &case.raw, &case.tokens, PV);
+    assert_eq!(
+      got, want,
+      "case '{}': device selected {got}, scalar reference selected {want}",
+      case.name
+    );
+  }
 }
 
 // ───────────────────────── end-to-end greedy decode ───────────────────────

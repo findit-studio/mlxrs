@@ -35,6 +35,18 @@ use super::layers::{BlockKvCache, Embedding, ResidualAttentionBlock};
 /// reference's `kv_cache = [None] * len(self.blocks)`).
 pub(crate) type DecoderKvCache = Vec<BlockKvCache>;
 
+/// The per-layer cross-attention weights of one decoder forward — the
+/// reference's `cross_qk` list (`whisper.py:479-483`), one entry per
+/// transformer block.
+///
+/// Each entry is the block's cross-attention `qk` tensor `(B, H, T, n_audio_ctx)`
+/// (the pre-softmax scaled scores; the alignment signal the later
+/// word-timestamp DTW consumes). Every decoder block carries cross-attention,
+/// so in practice every entry is `Some`; the `Option` mirrors the reference's
+/// `cross_qk = [None] * len(self.blocks)` initialization (a block without
+/// cross-attention would leave its slot `None`).
+pub(crate) type DecoderCrossQk = Vec<Option<Array>>;
+
 /// The Whisper text decoder (`whisper.py:440-486`).
 #[derive(Debug)]
 pub(crate) struct TextDecoder {
@@ -110,7 +122,9 @@ impl TextDecoder {
   /// - `kv_cache`: the incoming per-block cache; `None` on the first step.
   ///
   /// Returns `(logits, updated_cache)` — the vocabulary logits `(B, T,
-  /// n_vocab)` and the per-block cache to thread into the next decode step.
+  /// n_vocab)` and the per-block cache to thread into the next decode step. The
+  /// reference's third `cross_qk` return is dropped on this path;
+  /// [`Self::forward_with_cross_qk`] is the variant that surfaces it.
   ///
   /// # Errors
   /// - [`Error::OutOfRange`] if the positional slice `offset + T` exceeds the
@@ -124,6 +138,46 @@ impl TextDecoder {
     xa: &Array,
     kv_cache: Option<&DecoderKvCache>,
   ) -> Result<(Array, DecoderKvCache)> {
+    let (logits, cache, _cross_qk) = self.run(tokens, xa, kv_cache, false)?;
+    Ok((logits, cache))
+  }
+
+  /// Run the decoder and also surface the per-layer cross-attention weights —
+  /// the full three-tuple return of `TextDecoder.__call__`
+  /// (`whisper.py:464-486`), mirroring the reference's
+  /// `logits_with_cross_qk` (`decoding.py:177-189`).
+  ///
+  /// Returns `(logits, updated_cache, cross_qk)` where `cross_qk` is the
+  /// [`DecoderCrossQk`] list — one cross-attention `qk` tensor `(B, H, T,
+  /// n_audio_ctx)` per decoder block. The weights are the alignment signal the
+  /// later word-timestamp DTW consumes; this method only extracts and exposes
+  /// them.
+  ///
+  /// # Errors
+  /// Same as [`Self::forward`].
+  pub(crate) fn forward_with_cross_qk(
+    &self,
+    tokens: &Array,
+    xa: &Array,
+    kv_cache: Option<&DecoderKvCache>,
+  ) -> Result<(Array, DecoderKvCache, DecoderCrossQk)> {
+    self.run(tokens, xa, kv_cache, true)
+  }
+
+  /// The shared decoder forward, optionally collecting the per-layer cross-
+  /// attention weights. `collect_cross_qk` gates whether each block's
+  /// cross-attention `qk` is retained (it is dropped when `false`, so the
+  /// normal decode path keeps the weights' lifetime to a single block).
+  ///
+  /// # Errors
+  /// See [`Self::forward`].
+  fn run(
+    &self,
+    tokens: &Array,
+    xa: &Array,
+    kv_cache: Option<&DecoderKvCache>,
+    collect_cross_qk: bool,
+  ) -> Result<(Array, DecoderKvCache, DecoderCrossQk)> {
     let offset = Self::cache_offset(kv_cache);
     let seq_len = *tokens.shape().last().unwrap_or(&0);
 
@@ -150,17 +204,39 @@ impl TextDecoder {
       "decoder KV cache",
       self.blocks.len(),
     )?;
+    // Only reserve the cross-qk collector when the caller wants the weights.
+    let mut cross_qk: DecoderCrossQk = Vec::new();
+    if collect_cross_qk {
+      crate::model_validation::reserve_or_error(
+        &mut cross_qk,
+        "decoder cross-attention weights",
+        self.blocks.len(),
+      )?;
+    }
     for (i, block) in self.blocks.iter().enumerate() {
       let block_cache = kv_cache.and_then(|c| c.get(i));
-      let (out, updated) = block.forward(&x, Some(xa), Some(&self.mask), block_cache)?;
-      x = out;
-      new_cache.push(updated);
+      // Branch on `collect_cross_qk` so an ordinary decode takes the plain
+      // `forward` — which never materializes or returns the cross-attention
+      // score tensor past the attention computation — instead of carrying that
+      // `(B, H, T, n_audio_ctx)` tensor live through the residual / MLP only to
+      // drop it. The qk-collecting path keeps the per-layer weights.
+      if collect_cross_qk {
+        let (out, updated, qk) =
+          block.forward_with_cross_qk(&x, Some(xa), Some(&self.mask), block_cache)?;
+        x = out;
+        new_cache.push(updated);
+        cross_qk.push(qk);
+      } else {
+        let (out, updated) = block.forward(&x, Some(xa), Some(&self.mask), block_cache)?;
+        x = out;
+        new_cache.push(updated);
+      }
     }
 
     // Final LayerNorm, then weight-tied logits `token_embedding.as_linear(x)`.
     let x = self.ln.forward(&x)?;
     let logits = self.token_embedding.as_linear(&x)?;
-    Ok((logits, new_cache))
+    Ok((logits, new_cache, cross_qk))
   }
 
   /// Reject a decode window whose absolute span `offset + seq_len` would

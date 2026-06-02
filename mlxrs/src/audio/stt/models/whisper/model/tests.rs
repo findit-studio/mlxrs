@@ -513,6 +513,60 @@ fn decode_step_returns_row_logits_and_advances_cache() {
 }
 
 #[test]
+fn decode_step_with_cross_qk_exposes_per_layer_weights() {
+  // The public cross-attention extraction (`decode_step_with_cross_qk`): the
+  // (1, T, V) logits are byte-identical to the normal `decode_step` last-row
+  // slice, and a per-decoder-layer cross-qk list is returned, each `Some` and
+  // shaped (1, n_head, T, n_audio_ctx) — the attention pattern over the audio
+  // frames the word-timestamp DTW will consume. Only extracted + exposed here.
+  let model = WhisperModel::from_weights(dims(), tiny_weights(), Dtype::F32).unwrap();
+  let enc = model.encode(&tiny_mel()).unwrap();
+
+  // Prefill a 3-token prefix on a fresh cache.
+  let tokens = [0u32, 1, 2];
+  let mut cache = model.new_cache();
+  let (logits, cross_qk) = model
+    .decode_step_with_cross_qk(&mut cache, &enc, &tokens)
+    .unwrap();
+
+  // Full (1, T, V) logits (not the last-row slice).
+  assert_eq!(logits.shape(), vec![1, tokens.len(), TINY.n_vocab]);
+  assert_eq!(
+    cache.len(),
+    tokens.len(),
+    "cache advanced to the prefix length"
+  );
+
+  // One cross-qk per decoder layer (n_text_layer = 1), `Some`, shaped
+  // (B=1, n_head, T, n_audio_ctx).
+  assert_eq!(cross_qk.len(), 1, "one cross-qk per decoder layer");
+  let qk = cross_qk[0]
+    .as_ref()
+    .expect("decoder block cross-qk must be Some");
+  assert_eq!(
+    qk.shape(),
+    vec![1, TINY.n_head, tokens.len(), TINY.n_audio_ctx],
+    "cross-qk shape (B, H, T, n_audio_ctx)"
+  );
+
+  // The last-position row matches `decode_step` exactly (the extraction does
+  // not perturb the normal forward).
+  let mut cache_plain = model.new_cache();
+  let row = model.decode_step(&mut cache_plain, &enc, &tokens).unwrap();
+  let (_, t, v) = (1i32, tokens.len() as i32, TINY.n_vocab as i32);
+  let last_row = crate::ops::indexing::slice(&logits, &[0, t - 1, 0], &[1, t, v], &[1, 1, 1])
+    .unwrap()
+    .reshape(&[v])
+    .unwrap();
+  let want = row.try_clone().unwrap().to_vec::<f32>().unwrap();
+  let got = last_row.try_clone().unwrap().to_vec::<f32>().unwrap();
+  assert_eq!(
+    got, want,
+    "cross-qk path last-row logits == decode_step row"
+  );
+}
+
+#[test]
 fn decode_step_rejects_tokens_shorter_than_cache() {
   // The driver always extends `tokens`; a prefix shorter than the cache (no
   // new tokens) is a misuse, rejected with a typed EmptyInput rather than a

@@ -471,6 +471,123 @@ impl WhisperModel {
     let logits = logits.astype(Dtype::F32)?;
     Ok((logits, new_cache))
   }
+
+  /// Run one decode step like [`AutoregressiveStt::decode_step`], additionally
+  /// returning the per-layer cross-attention weights — the
+  /// `Model.forward_with_cross_qk` / `Inference.logits_with_cross_qk` analogue
+  /// (`whisper.py:614-616`, `decoding.py:177-189`).
+  ///
+  /// This is the extraction point for the cross-attention pattern the
+  /// word-timestamp DTW alignment (and the streaming AlignAtt monitor) consume.
+  /// It only extracts and exposes the weights — nothing downstream in mlxrs yet
+  /// uses them (the DTW alignment is a later phase); a caller can retrieve the
+  /// per-decoder-layer cross-attention for a decode here.
+  ///
+  /// `enc` is the encoder states `(1, n_audio_ctx, n_audio_state)` (extent-
+  /// guarded exactly as [`AutoregressiveStt::decode_step`]); `cache` is the
+  /// caller-owned [`WhisperDecodeCache`], threaded the same way (a fresh cache
+  /// prefills the whole prefix, a warm cache forwards only the new tail).
+  ///
+  /// Returns `(logits, cross_qk)`:
+  /// - `logits` — the full `(1, T, n_vocab)` decoder output (cast to `f32`,
+  ///   matching `Inference.logits`'s `.astype(mx.float32)`); the caller slices
+  ///   the position(s) it needs;
+  /// - `cross_qk` — one cross-attention weight tensor `(1, n_text_head, T,
+  ///   n_audio_ctx)` per decoder layer (`Some` for every block, since every
+  ///   Whisper decoder block carries cross-attention). The `Option` mirrors the
+  ///   reference's `cross_qk = [None] * len(blocks)` per-layer list.
+  ///
+  /// # Errors
+  /// - [`Error::ShapePairMismatch`] if `enc` is not `(1, n_audio_ctx,
+  ///   n_audio_state)`;
+  /// - [`Error::EmptyInput`] if `tokens` is shorter than the cache;
+  /// - [`Error::OutOfRange`] if the token prefix exceeds `max_context` or a
+  ///   dimension overflows `i32`;
+  /// - propagates the decoder forward op errors.
+  pub fn decode_step_with_cross_qk(
+    &self,
+    cache: &mut WhisperDecodeCache,
+    enc: &Array,
+    tokens: &[u32],
+  ) -> Result<(Array, Vec<Option<Array>>)> {
+    // Bound the encoder-states extent and the token prefix BEFORE allocating —
+    // the same guards as `decode_step`, factored into `prepare_decode_input`.
+    let tok = self.prepare_decode_input(cache, enc, tokens)?;
+    let (logits, new_cache, cross_qk) =
+      self
+        .decoder
+        .forward_with_cross_qk(&tok, enc, cache.inner.as_ref())?;
+    // Run EVERY fallible step (the `f32` cast — `Inference.logits`'s
+    // `.astype(mx.float32)`) BEFORE committing the cache, then make the cache
+    // mutation the LAST step. If the cast (an allocation / backend op) failed
+    // after `cache.inner` had already advanced, a retry with the same prefix
+    // would see no new tokens to decode (`prepare_decode_input` would treat the
+    // mutated cache as caught up) and the decode trajectory would be corrupted.
+    // Mirrors the `decode_tokens` path, which casts before returning the cache.
+    let logits = logits.astype(Dtype::F32)?;
+    cache.inner = Some(new_cache);
+    Ok((logits, cross_qk))
+  }
+
+  /// Validate the encoder-states extent + the token-prefix length and build the
+  /// `(1, T_new)` token array for the **new** (uncached) tail — the shared
+  /// front of [`AutoregressiveStt::decode_step`] and
+  /// [`Self::decode_step_with_cross_qk`].
+  ///
+  /// # Errors
+  /// - [`Error::ShapePairMismatch`] if `enc` is not `(1, n_audio_ctx,
+  ///   n_audio_state)`;
+  /// - [`Error::EmptyInput`] if `tokens` is shorter than the cache;
+  /// - [`Error::OutOfRange`] if the token prefix exceeds `max_context` or the
+  ///   new-token window overflows `i32`.
+  fn prepare_decode_input(
+    &self,
+    cache: &WhisperDecodeCache,
+    enc: &Array,
+    tokens: &[u32],
+  ) -> Result<Array> {
+    // Bound the encoder-states extent FIRST — before the token array or the
+    // decoder allocates. A caller can supply any `enc`; the cross-attention
+    // forms its scores from `enc.shape()[1]`, so a longer / batched segment must
+    // be rejected before it can size the cross-attention buffers past the config
+    // caps (which assume a single `[1, n_audio_ctx, n_audio_state]` segment).
+    self.validate_encoder_states(enc)?;
+
+    let cached = cache.len();
+    // Reject a token prefix longer than the decoder context BEFORE building the
+    // token array: the decoder positions `tokens` at `[cached .. tokens.len())`
+    // against the learned `n_text_ctx` positional table, so a prefix exceeding
+    // `max_context` is out of range. Checking the length here makes the typed
+    // error precede the `(1, T)` token allocation and the downstream
+    // `(1, T, n_text_state)` embedding the decoder would otherwise materialize.
+    let max_context = self.max_context();
+    if tokens.len() > max_context {
+      return Err(Error::OutOfRange(crate::error::OutOfRangePayload::new(
+        "WhisperModel::decode_step: token prefix length",
+        "must not exceed max_context (n_text_ctx)",
+        smol_str::format_smolstr!("len={}, max_context={max_context}", tokens.len()),
+      )));
+    }
+    // Forward only the tokens not yet in the cache: the whole prefix on a fresh
+    // cache, else just the new tail.
+    let new_tokens = tokens
+      .get(cached..)
+      .filter(|t| !t.is_empty())
+      .ok_or_else(|| {
+        Error::EmptyInput(crate::error::EmptyInputPayload::new(
+          "WhisperModel::decode_step: tokens prefix must extend the cache (no new \
+           tokens to decode)",
+        ))
+      })?;
+    let t = i32::try_from(new_tokens.len()).map_err(|_| {
+      Error::OutOfRange(crate::error::OutOfRangePayload::new(
+        "WhisperModel::decode_step: new-token window length",
+        "must fit in i32",
+        smol_str::format_smolstr!("{}", new_tokens.len()),
+      ))
+    })?;
+    Array::from_slice::<u32>(new_tokens, &[1, t])
+  }
 }
 
 /// Read and merge every `*.safetensors` in `dir`. `MissingKey` if there is
@@ -1108,53 +1225,19 @@ impl AutoregressiveStt for WhisperModel {
   /// - [`Error::OutOfRange`] if the vocab dimension exceeds `i32::MAX`;
   /// - propagates the embedding / block / LayerNorm / logit op errors.
   fn decode_step(&self, cache: &mut Self::Cache, enc: &Array, tokens: &[u32]) -> Result<Array> {
-    // Bound the encoder-states extent FIRST — before the token array or the
-    // decoder allocates. A caller can supply any `enc`; the cross-attention
-    // forms its scores from `enc.shape()[1]`, so a longer / batched segment must
-    // be rejected before it can size the cross-attention buffers past the config
-    // caps (which assume a single `[1, n_audio_ctx, n_audio_state]` segment).
-    self.validate_encoder_states(enc)?;
-
-    let cached = cache.len();
-    // Reject a token prefix longer than the decoder context BEFORE building the
-    // token array: the decoder positions `tokens` at `[cached .. tokens.len())`
-    // against the learned `n_text_ctx` positional table, so a prefix exceeding
-    // `max_context` is out of range. Checking the length here makes the typed
-    // error precede the `(1, T)` token allocation and the downstream
-    // `(1, T, n_text_state)` embedding the decoder would otherwise materialize.
-    let max_context = self.max_context();
-    if tokens.len() > max_context {
-      return Err(Error::OutOfRange(crate::error::OutOfRangePayload::new(
-        "WhisperModel::decode_step: token prefix length",
-        "must not exceed max_context (n_text_ctx)",
-        smol_str::format_smolstr!("len={}, max_context={max_context}", tokens.len()),
-      )));
-    }
-    // Forward only the tokens not yet in the cache: the whole prefix on a fresh
-    // cache, else just the new tail.
-    let new_tokens = tokens
-      .get(cached..)
-      .filter(|t| !t.is_empty())
-      .ok_or_else(|| {
-        Error::EmptyInput(crate::error::EmptyInputPayload::new(
-          "WhisperModel::decode_step: tokens prefix must extend the cache (no new \
-           tokens to decode)",
-        ))
-      })?;
-    let t = i32::try_from(new_tokens.len()).map_err(|_| {
-      Error::OutOfRange(crate::error::OutOfRangePayload::new(
-        "WhisperModel::decode_step: new-token window length",
-        "must fit in i32",
-        smol_str::format_smolstr!("{}", new_tokens.len()),
-      ))
-    })?;
-    let tok = Array::from_slice::<u32>(new_tokens, &[1, t])?;
+    // Validate the encoder extent + token-prefix length and build the new-tail
+    // `(1, T)` token array (the guards fire before any allocation they size).
+    let tok = self.prepare_decode_input(cache, enc, tokens)?;
 
     let (logits, new_cache) = self.decode_tokens(&tok, enc, cache.inner.as_ref())?;
-    cache.inner = Some(new_cache);
 
     // The decoder returns `[B=1, T, V]`; slice the LAST position and reshape to
-    // the rank-1 `[V]` row the greedy driver reads `argmax` over.
+    // the rank-1 `[V]` row the greedy driver reads `argmax` over. Run every
+    // fallible step (the shape check, the slice, the reshape) BEFORE committing
+    // the cache, so a failure here cannot leave `cache.inner` advanced while an
+    // `Err` is returned (a retry with the same prefix would then see no new
+    // tokens to decode and corrupt the trajectory). The cache mutation is the
+    // LAST step, after the row has been built.
     let shape = logits.shape();
     if shape.len() != 3 || shape[0] != 1 {
       return Err(Error::RankMismatch(RankMismatchPayload::new(
@@ -1167,8 +1250,10 @@ impl AutoregressiveStt for WhisperModel {
     let last = i32::try_from(seq.saturating_sub(1)).map_err(|_| vocab_overflow("T"))?;
     let vi = i32::try_from(v).map_err(|_| vocab_overflow("n_vocab"))?;
     // `logits[0, T-1, :]` → `(V,)`.
-    crate::ops::indexing::slice(&logits, &[0, last, 0], &[1, last + 1, vi], &[1, 1, 1])?
-      .reshape(&[vi])
+    let row = crate::ops::indexing::slice(&logits, &[0, last, 0], &[1, last + 1, vi], &[1, 1, 1])?
+      .reshape(&[vi])?;
+    cache.inner = Some(new_cache);
+    Ok(row)
   }
 
   /// The full start-of-transcript prompt prefix — the Whisper `sot_sequence`
